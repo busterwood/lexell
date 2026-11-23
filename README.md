@@ -64,7 +64,7 @@ fn main() {
 
 The same design runs through the library and LexDB:
 
-- **HTTP and HTTPS server.** One task per connection, with keep-alive, graceful shutdown, and worker processes sharing one port. On one core it serves 1.5 times as many requests a second as Go's `net/http` on one core, with a p99 latency of 0.59 ms against Go's 3.0 ms at 100 clients.
+- **HTTP and HTTPS server.** One task per connection, with keep-alive, graceful shutdown, and worker processes sharing one port. On one core it serves 1.5 times as many requests a second as Go's `net/http` and 1.2 to 1.3 times as many as Node.js, each also on one core. At 100 clients its p99 latency is 0.78 ms, against Node's 0.89 ms and Go's 3.2 ms.
 - **Database clients.** The PostgreSQL, SQL Server, Oracle and Redis clients speak their wire protocols on the event loop, so a query parks only the task that sent it, and their connection pools hand out connections the same way. SQLite has only a blocking C API, so its calls run on a helper thread, which runs only C code, while the task waits.
 - **LexDB.** The database runs every session as a task on one thread. A commit never waits partway through, so no other session can run inside it, and the engine needs no latches on its pages and no locks to keep threads out of each other's way. Commits that arrive in the same turn of the event loop share one flush to disk. Read-only replicas are separate processes that follow the master's log, the same way LexDB uses more cores.
 

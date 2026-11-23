@@ -1,13 +1,13 @@
 # Lexell performance
 
-Measured on 22 November 2026 on `main`: the microbenchmarks at commit 2f7f2246, the decimal
-section at 8fcae995, the JSON section at d08f41f5, the compile-time and regex sections at 236c8513, the others
+Measured on 22 and 23 November 2026 on `main`: the HTTP server section on 23 November at
+5284326a, the microbenchmarks at commit 2f7f2246, the decimal section at 8fcae995, the JSON section at d08f41f5, the compile-time and regex sections at 236c8513, the others
 at 86e20e87 (236c8513 with documentation only).
 Every number compares Lexell only with external tools or databases.
 Lexell's own C backend and earlier builds are not compared.
 
 Host: AMD Ryzen 7 8745HS (8 cores, 16 threads), 46 GB RAM, Linux 7.2 (Arch).
-Versions: rustc and cargo 1.99.1, Go 1.27.3, Java 21.0.13, .NET SDK 10.0.113, Python 3.14.8,
+Versions: rustc and cargo 1.99.1, Go 1.27.3, Node.js 26.13.1, Java 21.0.13, .NET SDK 10.0.113, Python 3.14.8,
 cmark 0.31.2, jq 1.7.1 (built from its tarball with `-O2`) and jq 1.8.2 from the system,
 GNU grep, sort and tail, and eza 0.23.5 from the system.
 
@@ -26,7 +26,7 @@ Method: wall times are best of N; instruction counts are user-mode
 | JSON | Python, jq | Faster to parse, slower to query; faster than jq on every filter |
 | Markdown | cmark | Slightly slower |
 | Decimal | Java, .NET | Faster than .NET on all but 19-digit add; slower than Java on division and comparison |
-| HTTP server | Go net/http | Faster at 1, 10 and 100 clients, about 1.5 times |
+| HTTP server | Go net/http, Node.js | Faster at 1, 10 and 100 clients: about 1.5 times Go's requests a second, 1.2 to 1.3 times Node's |
 | Command-line tools | GNU grep, sort, tail, eza | Faster on grep and eza, slower on sort, level on tail |
 
 ## Compile time
@@ -189,24 +189,31 @@ the same checksum in Lexell and Java (the 19-digit format case also in .NET).
 
 ### HTTP server
 
-Go's `net/http` is the reference: a plain server that answers `GET /` with the
-same body as Lexell's `cmd/httpd.lxl` (native). The Go server runs with
-`GOMAXPROCS=1`. The load client is `cmd/httpload.lxl`: one HTTP/1.1 keep-alive
+Go's `net/http` and Node.js's `http` module are the references: plain servers
+that answer `GET /` with the same body as Lexell's `cmd/httpd.lxl` (native).
+Each runs on one core: the Go server with `GOMAXPROCS=1`, Node in its single
+process. The load client is `cmd/httpload.lxl`: one HTTP/1.1 keep-alive
 connection per client, one request at a time, for 5 seconds each. Run by
-`cmd/http_gate.py --servers native,go --conns 1,10,100 --seconds 5 --idle 10000`,
+`cmd/http_gate.py --servers native,go,node --conns 1,10,100 --seconds 5 --idle 10000`,
 with 10,000 idle connections held open for the memory figures. The server is on
 CPU 0 and the load client on CPU 1, the gate's pinning, not the CPU ranges above.
+The table is the second of two runs; the first agreed within 1% except Lexell
+at 100 clients (144,440 requests a second, p99 2.0 ms), which the second did not
+repeat.
 
-| clients | Lexell native, req/s | Go, req/s | Lexell / Go |
-|---:|---:|---:|---:|
-| 1 | 107,516 | 72,305 | 1.49 |
-| 10 | 177,822 | 118,543 | 1.50 |
-| 100 | 173,043 | 116,162 | 1.49 |
+| clients | Lexell, req/s | Go, req/s | Node.js, req/s | Lexell / Go | Lexell / Node.js |
+|---:|---:|---:|---:|---:|---:|
+| 1 | 107,663 | 72,155 | 83,689 | 1.49 | 1.29 |
+| 10 | 178,337 | 117,085 | 141,524 | 1.52 | 1.26 |
+| 100 | 171,917 | 114,310 | 141,374 | 1.50 | 1.22 |
 
-At 100 clients the p50 latency is 557 µs for Lexell and 806 µs for Go, and the
-p99 is 585 µs and 3,024 µs. The memory per idle connection is 19.6 KB for Lexell
-and 20.4 KB for Go. After the load, the server's RSS is 199 MB for Lexell and
-341 MB for Go.
+| at 100 clients | Lexell | Go | Node.js |
+|---|---:|---:|---:|
+| latency p50 | 555 µs | 817 µs | 682 µs |
+| latency p99 | 778 µs | 3,150 µs | 890 µs |
+| memory per idle connection | 19.6 KB | 20.2 KB | 13.9 KB |
+| server RSS before the idle connections | 7 MB | 10 MB | 52 MB |
+| server RSS after the load | 199 MB | 343 MB | 224 MB |
 
 ## Commands
 
