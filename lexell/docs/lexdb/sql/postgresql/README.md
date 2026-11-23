@@ -84,19 +84,21 @@ This index lists everything the door takes today. Pages not written yet are list
 
 | Type | Names |
 |---|---|
-| Integers | `smallint` (`int2`), `integer` (`int`, `int4`), `bigint` (`int8`), `smallserial`, `serial`, `bigserial` |
-| Exact numbers | `numeric(p, s)`, `decimal(p, s)`: precision up to 38 |
-| Floating point | `real` (`float4`), `double precision` (`float8`), `float(p)` |
-| Text | `text`, `varchar(n)` (`character varying`), `char(n)` (`character`, `bpchar`), `"char"`, `name` |
-| Binary | `bytea` |
-| Boolean | `boolean` (`bool`) |
-| Date and time | `date`, `time(p)`, `timestamp(p)`, `timestamptz`, `interval`. No `time with time zone`. |
-| UUID | `uuid` |
-| Arrays | `type[]` of the types above (one dimension) |
-| Enums | `CREATE TYPE ... AS ENUM` |
-| System | `oid`, `regclass`, `regtype`, `regnamespace`, `regproc`, `regprocedure`, `regrole`, `int2vector`, `oidvector` |
+| [Integers](data-types-numeric.md) | `smallint` (`int2`), `integer` (`int`, `int4`), `bigint` (`int8`), `smallserial`, `serial`, `bigserial` |
+| [Exact numbers](data-types-numeric.md) | `numeric(p, s)`, `decimal(p, s)`: precision up to 38 |
+| [Floating point](data-types-numeric.md) | `real` (`float4`), `double precision` (`float8`), `float(p)` |
+| [Text](data-types-character.md) | `text`, `varchar(n)` (`character varying`), `char(n)` (`character`, `bpchar`), `"char"`, `name` |
+| [Binary](data-types-binary.md) | `bytea` |
+| [Boolean](data-types-boolean.md) | `boolean` (`bool`) |
+| [Date and time](data-types-datetime.md) | `date`, `time(p)`, `timestamp(p)`, `timestamptz`, `interval`. No `time with time zone`. |
+| [UUID](data-types-uuid.md) | `uuid` |
+| [Arrays](data-types-arrays.md) | `type[]` of the types above (one dimension) |
+| [Enums](data-types-enum.md) | `CREATE TYPE ... AS ENUM` |
+| [System](data-types-system.md) | `oid`, `regclass`, `regtype`, `regnamespace`, `regproc`, `regprocedure`, `regrole`, `int2vector`, `oidvector` |
 
-Not available: `json`, `jsonb`, `xml`, `money`, network and geometric types, ranges, domains, composite types.
+Not available: `json`, `jsonb`, `xml`, `money`, `bit`, network and geometric types, ranges, domains, composite types.
+
+Casts, typed constants and the common type of mixed values: [type conversion](type-conversion.md).
 
 ## Functions
 
