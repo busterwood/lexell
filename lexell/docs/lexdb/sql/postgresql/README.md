@@ -15,7 +15,7 @@ This index lists everything the door takes today. Pages not written yet are list
 | [SELECT](select.md) | Queries: [joins](select-join.md), `LATERAL`, [grouping and `GROUPING SETS`](select-group-by.md), [windows](over.md), `DISTINCT ON`, `LIMIT`/`OFFSET`/`FETCH`, `FOR UPDATE`, set operations, [`MATCH_RECOGNIZE`](match-recognize.md). `SELECT ... INTO` makes a table. lexdb's [`WAIT n SECONDS`](select-wait.md) suffix waits for rows. |
 | [VALUES](values.md) | A table of literal rows. |
 | [WITH](with.md) | Common table expressions, `WITH RECURSIVE`, before `SELECT`, `INSERT`, `UPDATE`, `DELETE` or `MERGE`. |
-| EXPLAIN | The plan of a `SELECT`, `UPDATE`, `DELETE` or `MERGE`; `EXPLAIN ANALYZE` of a `SELECT`. |
+| [EXPLAIN](explain.md) | The plan of a `SELECT`, `UPDATE`, `DELETE` or `MERGE`; `EXPLAIN ANALYZE` of a `SELECT`. |
 
 ### Changing data
 
@@ -40,7 +40,7 @@ This index lists everything the door takes today. Pages not written yet are list
 | [ALTER INDEX](alter-index.md), [DROP INDEX](drop-index.md) | Rename; drop. |
 | [CREATE VIEW](create-view.md), [ALTER VIEW](alter-view.md), [DROP VIEW](drop-view.md) | Views (read-only). |
 | [CREATE SEQUENCE](create-sequence.md), [ALTER SEQUENCE](alter-sequence.md), [DROP SEQUENCE](drop-sequence.md) | Sequences. |
-| CREATE SCHEMA, ALTER SCHEMA, DROP SCHEMA | Schemas. |
+| [CREATE SCHEMA](create-schema.md), [ALTER SCHEMA](alter-schema.md), [DROP SCHEMA](drop-schema.md) | Schemas. |
 | CREATE TYPE, ALTER TYPE, DROP TYPE | Enum types. |
 | CREATE FUNCTION, CREATE PROCEDURE, DROP FUNCTION, DROP PROCEDURE | Routines in `LANGUAGE sql` (`AS '...'`, `BEGIN ATOMIC`, `RETURN`). |
 | CALL | Calls a procedure. |
@@ -58,11 +58,11 @@ This index lists everything the door takes today. Pages not written yet are list
 
 | Statement | What it does |
 |---|---|
-| BEGIN, START TRANSACTION | `READ ONLY`, `READ WRITE`, `ISOLATION LEVEL` (every read-write transaction is serializable). |
-| COMMIT, END | |
-| ROLLBACK, ABORT | |
-| SAVEPOINT, RELEASE SAVEPOINT, ROLLBACK TO SAVEPOINT | |
-| SET CONSTRAINTS | |
+| [BEGIN, START TRANSACTION](begin.md) | `READ ONLY`, `READ WRITE`, `ISOLATION LEVEL` (every read-write transaction is serializable). |
+| [COMMIT, END](commit.md) | |
+| [ROLLBACK, ABORT](rollback.md) | |
+| [SAVEPOINT](savepoint.md), [RELEASE SAVEPOINT](release-savepoint.md), [ROLLBACK TO SAVEPOINT](rollback-to-savepoint.md) | |
+| [SET CONSTRAINTS](set-constraints.md) | |
 
 ### Session and server
 
