@@ -270,10 +270,10 @@ GO
 ```text
 Msg 50000, Level 16, State 1, Line 1
 column "sale.region" must appear in the GROUP BY clause or be used in an aggregate function
-Msg 50000, Level 16, State 1, Line 1
+Msg 50000, Level 16, State 1, Line 2
 window functions are not allowed in WHERE
-Msg 195, Level 16, State 1, Line 1
-function stdev with 1 arguments does not exist
+Msg 195, Level 15, State 1, Line 1
+'stdev' is not a recognized built-in function name.
 ```
 
 ## See also
