@@ -41,8 +41,9 @@ PostgreSQL re-run on every suite; results in
   17-19 moved the in-process instructions per select by less than 0.5%; the
   rest of the change is the lexdb work since 2026-11-18.
 - **Updates** at 32 clients 38,700 to 43,500 over the rounds (median 42,300):
-  1.6 times PostgreSQL. Commit latency is unchanged; p99 is still the
-  1.35-1.40 ms of the owned-string migration (2026-11-18 notes, below).
+  1.6 times PostgreSQL. Commit latency p99 was still the 1.35-1.40 ms of the
+  owned-string migration; the checkpoint's steps of one leaf (not two) bring it
+  to 0.97-0.98 ms (the row of the record after this one; lexdb.md 9.136).
 - **TPC-H**: lexdb on one core level with PostgreSQL on four processes in
   total (8,943 against 8,818 ms), geometric mean 0.67 against one core
   (section 1.6).
@@ -477,6 +478,7 @@ below 1 for times.
 
 | date | lexdb | suite | headline | detail |
 |---|---|---|---|---|
+| 2026-11-23 | after 73cea2c1 (one-leaf checkpoint steps) | commit latency (master alone, 8 clients, pinned, two runs each) | p99 1.33-1.37 ms to 0.97-0.98 (steps of 1 leaf, not 2), updates +1.5%; with checkpoints held off p99 0.50 ms; leaf copies for kept versions 9.7% of server CPU | lexdb.md 9.136 |
 | 2026-11-23 | 4506a2e8 | TPC-H derived, SF1, boost off, lexdb (`-O`), PG one core and PG four processes, median of 3 | summed 8,943 ms against PG one core 14,610 and PG four processes 8,818 (level in total); geometric mean 0.67 of one core (wall), 0.63 (CPU), 1.08 of four processes; 17 of 22 level or ahead of one core; worst q20 1.97, q11 1.50 | this page, 1.6 |
 | 2026-11-23 | 4506a2e8 | OLTP, replicas, commit latency, aggregates (pinned) | point selects 92,300 / 164,800 / 160,100/s (+5-10%); 3 replicas 434,000-439,000/s at 32 clients, above PG on four cores (408,400); updates 3,654 / 16,400 / 42,300/s (1.6-2.4 × PG); commit p99 1.35-1.40 ms (unchanged) | this page, 1 |
 | 2026-11-23 | 4506a2e8 | analytic queries (pinned), bulk loads (lexdb and PG; no SQL Server) | 35 queries: lexdb CPU / PG one core 0.54 (0.69 on 11-18 by the same method), wall / PG four processes 1.04; 33 of 35 level or ahead; lexdb CPU -16% since 11-18 (text joins -30%); COPY 0.46 / 1.44 / 6.31 / 2.98 / 4.85 s against PG 0.59 / 1.81 / 4.74 / 1.52 / 5.72 | this page, 1 |

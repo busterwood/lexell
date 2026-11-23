@@ -306,7 +306,8 @@ OLTP (pgbench, prepared statements over Unix sockets, 1M rows, median of three 1
 
 LexDB runs every session on one thread; it scales reads with replica processes, which follow the
 master with a lag of 0.24-0.26 ms at the median and 0.49-0.55 ms at p99 under a mixed load. Its
-commit latency with 8 clients is 0.44 ms at the median and 1.35-1.40 ms at p99.
+commit latency with 8 clients is 0.43 ms at the median and 0.97-0.98 ms at p99 (measured after
+this section's run, with the checkpoint's work in steps of one leaf: 1.35-1.40 ms before).
 
 Analytic queries (35 queries over 1M-row tables: scans, joins, groups, windows; median of 5):
 LexDB's CPU is 0.54 of PostgreSQL's on one core (geometric mean), and its wall time 1.04 of

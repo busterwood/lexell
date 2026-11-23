@@ -12432,7 +12432,15 @@ replica, nothing. Tests settle a table with it (`exec_switch`).
 |---|---:|---:|---:|---:|
 | before (518f8d9d) | 0.42 ms | 0.72-0.76 | 4.2-4.5 | **70** |
 | a cut, steps of 8 leaves | 0.42 ms | 1.42-1.44 | 3.9-4.0 | 7.5 |
-| a cut, steps of 2 leaves (now) | 0.42 ms | 0.88-0.91 | 3.9-4.0 | 8.0-11.9 |
+| a cut, steps of 2 leaves | 0.42 ms | 0.88-0.91 | 3.9-4.0 | 8.0-11.9 |
+| steps of 2, after the owned-string migration (2026-11-23) | 0.43 ms | 1.33-1.37 | 3.7 | 9.8-11.0 |
+| steps of 1 leaf (now, 2026-11-23) | 0.43 ms | 0.97-0.98 | 3.8-3.9 | 8.6-9.1 |
+| checkpoints held off (`LEXDB_CKPT_KB` large: the floor) | 0.43 ms | 0.50 | 1.5-1.9 | 62 |
+
+The migration made a leaf's encode slower, so two leaves' step held more commits past p99;
+one leaf brings p99 back to 0.97 ms (and updates +1.5%). Under this load the store's own leaf
+copies for kept versions (`copyNode` from `willChange`: every value's count raised, a version per
+commit to a leaf before it is durable) are 9.7% of the server's CPU, the checkpoint 8.5%.
 
 Steps of 8 (0.35 ms each) put the encode in more commits' way; 2 is a
 query's turn. CPU an update, the same: 36.2 to 36.4 µs against 36.4 (on 6
