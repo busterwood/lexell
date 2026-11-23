@@ -12,19 +12,28 @@ This index lists everything the door takes today. Pages not written yet are list
 
 | Statement | What it does |
 |---|---|
-| SELECT | `TOP (n) [PERCENT] [WITH TIES]`, joins, `CROSS APPLY` / `OUTER APPLY`, grouping, windows, `OFFSET ... FETCH`, set operations, `SELECT ... INTO`, table hints (read and ignored), `OPTION (MAXRECURSION n)`. |
-| WITH | Common table expressions, recursive ones too. |
-| VALUES | Table value constructors. |
+| [SELECT](select.md) | Queries; table hints (read and ignored), `OPTION (MAXRECURSION n)`. |
+| [TOP](top.md) | `TOP (n) [PERCENT] [WITH TIES]`. |
+| [FROM, JOIN and APPLY](from.md) | Joins, `CROSS APPLY` / `OUTER APPLY`, derived tables, table-valued functions. |
+| [GROUP BY](select-group-by.md) | Grouping, `ROLLUP`, `CUBE`, `GROUPING SETS`, `HAVING`. |
+| [OVER](over.md) | Window functions and the `WINDOW` clause. |
+| [ORDER BY](order-by.md) | Sorting, `OFFSET ... FETCH`. |
+| [SELECT INTO](select-into.md) | A new table from a query. |
+| [UNION, EXCEPT, INTERSECT](set-operators.md) | Set operators. |
+| [WITH](with.md) | Common table expressions, recursive ones too. |
+| [VALUES](values.md) | Table value constructors. |
 
 ### Changing data
 
 | Statement | What it does |
 |---|---|
 | [INSERT](insert.md) | Adds rows; `OUTPUT`, `INSERT ... EXEC`, `DEFAULT VALUES`. |
-| UPDATE | Changes rows; `FROM`, `TOP`, `OUTPUT`, compound assignment (`+=`). |
-| DELETE | Removes rows; `FROM ... JOIN`, `TOP`, `OUTPUT`. |
-| MERGE | Inserts, updates or deletes by a join; `OUTPUT $action`. |
-| TRUNCATE TABLE | Empties a table. |
+| [UPDATE](update.md) | Changes rows; `FROM`, `TOP`, `OUTPUT`, compound assignment (`+=`). |
+| [DELETE](delete.md) | Removes rows; `FROM ... JOIN`, `TOP`, `OUTPUT`. |
+| [MERGE](merge.md) | Inserts, updates or deletes by a join; `OUTPUT $action`. |
+| [TRUNCATE TABLE](truncate-table.md) | Empties a table. |
+| [OUTPUT clause](output.md) | The changed rows, as a result set or into a table. |
+| [SET IDENTITY_INSERT](set-identity-insert.md) | Explicit values for an identity column. |
 | INSERT BULK | The bulk copy protocol's statement (bcp, `SqlBulkCopy`): see [bulk loading](../../bulk-load.md#sql-server-bulk-copy). |
 
 ### Tables, indexes and other objects
