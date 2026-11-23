@@ -97,7 +97,7 @@ GO
 ```text
 Msg 50000, Level 16, State 1, Line 1
 schema "sales" already exists
-Msg 50000, Level 16, State 1, Line 1
+Msg 50000, Level 16, State 1, Line 2
 role "dbo" does not exist
 Msg 50000, Level 16, State 1, Line 1
 lexdb: ALTER SCHEMA takes RENAME TO only
