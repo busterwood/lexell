@@ -47,6 +47,7 @@ import "../../../cmd/lexdb_tds"
 
 const QUERIES = "@once create table fq (id int identity primary key, v int)\n@once insert into fq (v) values (1), (2)\n@once create table fx (id int primary key)\n@once insert into fx values (1)\nsp_executesql N'SET FMTONLY ON SELECT * FROM [fq] '\nselect count(*) as n from fq\nexec sp_executesql N'SET FMTONLY ON SELECT * FROM [fq] '; select count(*) as n from fq\nexec ('set fmtonly on select * from fq'); select count(*) as n from fq\nexec sp_executesql N'set fmtonly on select * from fq set fmtonly off'; select count(*) as n from fq\nexec sp_executesql N'select count(*) as inner_n from fq set fmtonly on'; select count(*) as n from fq\nset fmtonly on; select * from fq; set fmtonly off; select count(*) as n from fq\nexec sp_executesql N'set nocount on'; update fq set v = v where id = 1\nexec sp_executesql N'set nocount on; update fq set v = v where id = 1'\nexec sp_executesql N'set rowcount 1'; select v from fq order by v\nexec sp_executesql N'set rowcount 1; select v from fq order by v'\nexec sp_executesql N'set quoted_identifier off'; select \"a\" as x\nexec sp_executesql N'set identity_insert fq on'; insert into fq (id, v) values (100, 5)\n@once exec sp_executesql N'set implicit_transactions on'; insert into fx values (5); select @@trancount as tc\n@once delete from fx where id = 5\n@once exec sp_executesql N'set xact_abort on'; begin tran; insert into fx values (1)\n@once select @@trancount as tc; if @@trancount > 0 rollback\n@once create procedure p_fmt as begin set fmtonly on; select * from fq end\nexec p_fmt; select count(*) as n from fq\n@once create procedure p_nc as set nocount on\nexec p_nc; update fq set v = v where id = 1\n@once create procedure p_ii as set identity_insert fq on\nexec p_ii; insert into fq (id, v) values (101, 5)\n@once create procedure p_it as set implicit_transactions on\n@once exec p_it; insert into fx values (6); select @@trancount as tc\n@once delete from fx where id = 6\nselect count(*) as n from fq"
 const BOTH = true   // each batch twice against lexdb, SET lexdb_batch = off and on
+const MSGS = false   // an error with its line and text, not its number alone
 
 fn rows(r: &sqlserver.Rows): str {
     var names: []str = []
@@ -84,7 +85,13 @@ fn show(c: mut &sqlserver.Conn, q: &str, only: bool): str {
             if len(parts) == 0 { return "ok" }
             return strings.join(&parts, " / ")
         }
-        Err(e) { return "error " + e.code.toStr() }
+        Err(e) {
+            if MSGS {
+                let ms = c.errors()
+                if len(ms) > 0 { return "error " + ms[0].number.toStr() + " line " + ms[0].line.toStr() + ": " + ms[0].text }
+            }
+            return "error " + e.code.toStr()
+        }
     }
 }
 
@@ -101,7 +108,7 @@ fn asUser(dsn: &str, u: &str): str {
     return strings.join(&parts, ";")
 }
 
-// A line may start with markers: "@once " (in a BOTH suite, run once: setup and writes kept),
+// A line may start with markers: "@lines " (\n in it is a newline: a batch of several lines), "@once " (in a BOTH suite, run once: setup and writes kept),
 // "@sets " (result sets only), "@as NAME " (run as that login, a connection of its own), "@oracle "
 // (only on the SQL Server oracle: "ok" on lexdb), "@lexdb " (only on lexdb).
 fn batches(dsn: &str, oracle: bool) {
@@ -118,7 +125,10 @@ fn batches(dsn: &str, oracle: bool) {
                 var skip = false
                 var single = false
                 while strings.startsWith(&q, "@") {
-                    if strings.startsWith(&q, "@once ") {
+                    if strings.startsWith(&q, "@lines ") {
+                        // a batch of several lines: \n in the line is a newline
+                        q = strings.replaceAll(&q[7..len(q)], "\\n", "\n")
+                    } else if strings.startsWith(&q, "@once ") {
                         single = true
                         q = q[6..len(q)].toStr()
                     } else if strings.startsWith(&q, "@sets ") {
