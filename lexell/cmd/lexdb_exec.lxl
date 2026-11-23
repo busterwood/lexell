@@ -1058,6 +1058,7 @@ pub type Limits = value record {
     pub rules: bool             // SET lexdb_planner = rules: kept with the others for a block's ROLLBACK (optimizer 20)
     pub auto: bool              // SET lexdb_autoanalyze: the session's changes counted for the automatic statistics (optimizer 44)
     pub rdel: bool              // SET lexdb_range_delete: a DELETE of a key range may drop its subtrees (design/lexdb-bulkdelete.md)
+    pub sid: int                // the session's number: its cancel requests (lexdb_base.askCancel, 9.138)
 }
 
 fn (rs: mut &Run) limit(l: &Limits) {
@@ -1065,6 +1066,7 @@ fn (rs: mut &Run) limit(l: &Limits) {
     rs.maxSteps = l.steps
     rs.bud.maxHeld = l.mem
     rs.bud.deadline = l.deadline
+    rs.bud.sid = l.sid
     rs.batch = l.batch
 }
 
@@ -2871,6 +2873,7 @@ fn runChild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
     rs.maxSteps = parent.maxSteps
     rs.bud.maxHeld = parent.bud.maxHeld
     rs.bud.deadline = parent.bud.deadline
+    rs.bud.sid = parent.bud.sid
     rs.batch = parent.batch
     rs.writes = parent.writes
     rs.bud.held = parent.bud.held
@@ -12127,7 +12130,7 @@ fn (s: mut &Session) restore() {
 // The limits for a statement starting now.
 fn (s: &Session) limits(): Limits {
     let dl = if s.timeoutMs > 0 { time.monotonicNs() + s.timeoutMs * 1000000 } else { 0 }
-    return Limits{rounds: s.maxRecursion, steps: s.maxSteps, mem: s.maxMem, deadline: dl, batch: s.batch, rules: s.rules, auto: s.auto, rdel: s.rdel}
+    return Limits{rounds: s.maxRecursion, steps: s.maxSteps, mem: s.maxMem, deadline: dl, batch: s.batch, rules: s.rules, auto: s.auto, rdel: s.rdel, sid: s.id}
 }
 
 // A setting's value: a number (statement_timeout in ms, max_statement_mem
@@ -12765,7 +12768,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 s.failed = false
                 s.fresh = true
                 s.saves = []
-                s.saved = [Limits{rounds: s.maxRecursion, steps: s.maxSteps, mem: s.maxMem, deadline: s.timeoutMs, batch: s.batch, rules: s.rules, auto: s.auto, rdel: s.rdel}]
+                s.saved = [Limits{rounds: s.maxRecursion, steps: s.maxSteps, mem: s.maxMem, deadline: s.timeoutMs, batch: s.batch, rules: s.rules, auto: s.auto, rdel: s.rdel, sid: s.id}]
                 var p: []str = []
                 for n in s.path { append(mut &p, n.clone()) }
                 s.savedPath = [p]
@@ -17108,6 +17111,8 @@ fn regCast(v: &Val, oid: int, se: &Option[SeqEnv]): Result[Val, DbErr] {
         }
         if many == 1 { return Ok(Val.Reg(strings.parseIntOpt(&hit).unwrapOr(0), shown)) }
         if many > 1 { return Err(e("42725", &("more than one function named \"" + name + "\""))) }
+        // the arrays' input function, as pg_type.typinput shows it (pgjdbc's TypeInfoCache asks typinput = 'pg_catalog.array_in'::regproc)
+        if nm == "array_in" || nm == "pg_catalog.array_in" { return Ok(Val.Reg(750, "array_in")) }
     }
     match num {
         Some(n) { return Ok(Val.Reg(n, relShown(&q, n).unwrapOr(n.toStr()))) }
@@ -17280,6 +17285,15 @@ fn callCat(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
     if name == "current_schema" && n == 0 {
         for l in catLines(se, &"p") { return Ok(Some(Val.Text(l[0].clone()))) }
         return Ok(Some(Val.Text("public")))
+    }
+    // current_schemas(include_implicit): the search path, pg_catalog first if asked (pgjdbc's TypeInfoCache reads it)
+    if name == "current_schemas" && n == 1 {
+        if lexdb_ops.isNull(&vs[0]) { return Ok(Some(Val.Null)) }
+        var names: []Val = []
+        if lexdb_sql.text(&vs[0]) == "t" { append(mut &names, Val.Text("pg_catalog")) }
+        for l in catLines(se, &"p") { if l[0] != "pg_catalog" { append(mut &names, Val.Text(l[0].clone())) } }
+        if len(names) == 0 || (len(names) == 1 && lexdb_sql.text(&vs[0]) == "t") { append(mut &names, Val.Text("public")) }
+        return Ok(Some(Val.Text(lexdb_ops.arrayText(&names))))
     }
     if name == "pg_get_userbyid" && n == 1 {
         if lexdb_ops.isNull(&vs[0]) { return Ok(Some(Val.Null)) }

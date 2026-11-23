@@ -1,14 +1,16 @@
 // lexdb: the PostgreSQL wire protocol, version 3.0, server side
 // (design/lexdb.md 4.7). One task per connection.
 //
-// Startup: an SSLRequest or GSSENCRequest is answered 'N' (no TLS yet), a
-// CancelRequest is ignored, and a StartupMessage is accepted without a
-// password (trust: listen on loopback until authentication is built). Then
+// Startup: an SSLRequest or GSSENCRequest is answered 'N' (or 'S' with TLS),
+// a CancelRequest with a session's BackendKeyData stops the statement it
+// runs (57014, 9.138), and a StartupMessage is accepted as configure set
+// the authentication (trust or SCRAM). Then
 // the simple query protocol (several statements in one Query), and the
 // extended one: Parse, Bind, Describe, Execute, Close, Sync and Flush.
 // After an error in the extended protocol the messages up to Sync are
-// skipped, as PostgreSQL does. Results are text; parameters may be text or
-// binary integers, booleans and text.
+// skipped, as PostgreSQL does. Results are text, or binary for the columns a
+// Bind asks for; parameters text or binary (lexdb_pgbin: PostgreSQL's
+// binary formats, kept out of the text path's functions).
 import "net"
 import "fs"
 import "task"
@@ -28,9 +30,11 @@ import "./lexdb_float"
 import "./lexdb_time"
 import "./lexdb_auth"
 import "tls"
+import "crypto"
 import "./lexdb_parse"
 import "./lexdb_census"
 import "./lexdb_standby"
+import "./lexdb_pgbin"
 
 type Val = lexdb_sql.Val
 
@@ -54,6 +58,7 @@ type Prepared = record {
 type Portal = record {
     stmt: str
     params: []Val
+    fmts: []int                 // its result columns' format codes when one is binary (lexdb_pgbin); [] all text
 }
 
 type Wire = record {
@@ -612,6 +617,30 @@ fn (w: mut &Wire) runStreamed(s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
     return r
 }
 
+// runStreamed for a portal with binary columns (fmts, lexdb_pgbin): its rows
+// in their formats; its RowDescription comes from Describe.
+fn (w: mut &Wire) runStreamedBin(s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &lexdb_exec.PlanCache,
+                                 check: &Option[[]lexdb_bind.OutCol], fmts: &[]int): Result[lexdb_exec.Res, lexdb_base.DbErr] {
+    let zone = w.sess.zone()
+    w.streamed = false
+    var sess = replace(mut &w.sess, lexdb_exec.parkedSession(w.st.share()))
+    let r = sess.runRows(s, params, ptypes, pc, fn(cols: &[]lexdb_bind.OutCol, row: &[]Val, ob: &lexdb_rows.OutBatch, start: bool): bool {
+        if start {
+            match check {
+                Some(want) { if !sameCols(cols, want) { return false } }
+                None {}
+            }
+            w.streamed = true
+            return true
+        }
+        if ob.n > 0 { lexdb_pgbin.dataBatch(mut &w.out, ob, cols, fmts, &zone) } else { lexdb_pgbin.dataRow(mut &w.out, row, cols, fmts, &zone) }
+        if len(w.out) > 65536 { return w.flush().isOk() }
+        return true
+    })
+    let parked = replace(mut &w.sess, sess)
+    return r
+}
+
 fn (w: mut &Wire) complete(tag: &str) {
     w.sendNotices()
     var b = ""
@@ -720,6 +749,8 @@ fn (w: &Wire) hasMsg(): bool {
 // ---- the simple query protocol
 
 fn (w: mut &Wire) query(sql: &str): Result[Unit, io.IoError] {
+    // a cancel request that came while the session was idle stops nothing (PostgreSQL's, 9.138)
+    if lexdb_base.cancelPending() { let late = lexdb_base.takeCancel(w.sess.number()) }
     // census: lexdb_census.statement(sql)
     match lexdb_parse.parse(sql) {
         Err(e) { w.error(&e) }
@@ -793,52 +824,6 @@ fn (w: mut &Wire) parseMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbE
     return Ok(Unit{})
 }
 
-// A binary array parameter (one dimension, of the types binParam takes) as
-// its text form, as the executor holds arrays (9.27).
-fn binArray(data: &str, elem: int): Result[str, lexdb_base.DbErr] {
-    let bad = lexdb_base.err("22P03", "invalid binary array parameter")
-    if len(data) < 12 { return Err(bad) }
-    let ndim = binary.readI32BEStr(data, 0)
-    if ndim == 0 { return Ok("{}") }
-    if ndim != 1 { return Err(lexdb_base.err("0A000", "lexdb: arrays of more than one dimension are not supported")) }
-    if len(data) < 20 { return Err(bad) }
-    let n = binary.readI32BEStr(data, 12)
-    var at = 20
-    var vals: []lexdb_sql.Val = []
-    for i in 0..n {
-        if at + 4 > len(data) { return Err(bad) }
-        let l = binary.readI32BEStr(data, at)
-        at += 4
-        if l < 0 {
-            append(mut &vals, lexdb_sql.Val.Null)
-            continue
-        }
-        if at + l > len(data) { return Err(bad) }
-        let t = try binParam(&data[at..at + l], elem)
-        at += l
-        if elem == lexdb_sql.OID_TEXT || elem == lexdb_sql.OID_VARCHAR || elem == lexdb_sql.OID_BPCHAR {
-            append(mut &vals, lexdb_sql.Val.Text(t))
-        } else if elem == lexdb_sql.OID_BOOL {
-            append(mut &vals, lexdb_sql.Val.Bool(t == "t"))
-        } else {
-            append(mut &vals, lexdb_sql.Val.Int(strings.parseIntOpt(&t).unwrapOr(0)))
-        }
-    }
-    return Ok(lexdb_ops.arrayText(&vals))
-}
-
-fn binParam(data: &str, oid: int): Result[str, lexdb_base.DbErr] {
-    if oid == lexdb_sql.OID_INT8 && len(data) == 8 { return Ok(binary.readI64BEStr(data, 0).toStr()) }
-    if oid == lexdb_sql.OID_INT4 && len(data) == 4 { return Ok(binary.readI32BEStr(data, 0).toStr()) }
-    if oid == lexdb_sql.OID_INT2 && len(data) == 2 { return Ok(binary.readI16BEStr(data, 0).toStr()) }
-    if oid == lexdb_sql.OID_BOOL && len(data) == 1 { return Ok(if data[0] != 0 { "t" } else { "f" }) }
-    if oid == lexdb_sql.OID_FLOAT8 && len(data) == 8 { return Ok(lexdb_float.fmt8(math.fromBits(binary.readI64BEStr(data, 0)))) }
-    if oid == lexdb_sql.OID_FLOAT4 && len(data) == 4 { return Ok(lexdb_float.fmt4(math.fromBits32Int(binary.readU32BEStr(data, 0)))) }
-    if oid == lexdb_sql.OID_TEXT || oid == lexdb_sql.OID_VARCHAR || oid == lexdb_sql.OID_BPCHAR { return Ok(data.clone()) }
-    if lexdb_sql.elemOid(oid) > 0 { return binArray(data, lexdb_sql.elemOid(oid)) }
-    return Err(lexdb_base.err("0A000", &("lexdb: a binary parameter of type " + oid.toStr() + " is not supported")))
-}
-
 fn (w: mut &Wire) bindMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbErr] {
     var r = Rd{s: body.clone(), at: 0, bad: false}
     let portal = r.cstr()
@@ -860,10 +845,12 @@ fn (w: mut &Wire) bindMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbEr
         append(mut &isBin, f == 1)
     }
     let nr = r.i16()
-    for i in 0..nr {
-        if r.i16() != 0 { return Err(lexdb_base.err("0A000", "lexdb: results in binary are not supported")) }
-    }
+    let fmtAt = r.at
+    var anyBin = false
+    for i in 0..nr { if r.i16() != 0 { anyBin = true } }
     if r.bad { return Err(protoErr("invalid Bind message")) }
+    var rfmts: []int = []
+    if anyBin { rfmts = try lexdb_pgbin.formats(body, fmtAt, nr) }
     if !ps.stmts.has(&name) {
         return Err(lexdb_base.err("26000", &("prepared statement \"" + name + "\" does not exist")))
     }
@@ -876,7 +863,7 @@ fn (w: mut &Wire) bindMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbEr
             Some(d) {
                 if isBin[i] {
                     let oid = if i < len(p.ptypes) { p.ptypes[i] } else { lexdb_sql.OID_TEXT }
-                    append(mut &texts, Some(try binParam(&d, oid)))
+                    append(mut &texts, Some(try lexdb_pgbin.param(&d, oid)))
                 } else {
                     append(mut &texts, Some(d.clone()))
                 }
@@ -891,7 +878,7 @@ fn (w: mut &Wire) bindMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbEr
     }
     vals = try w.sess.paramVals(&texts, &p.ptypes)
     }
-    ps.portals.put(portal, Portal{stmt: name, params: vals})
+    ps.portals.put(portal, Portal{stmt: name, params: vals, fmts: rfmts})
     w.empty('2')
     return Ok(Unit{})
 }
@@ -902,9 +889,11 @@ fn (w: mut &Wire) describeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.
     let name = r.cstr()
     if r.bad { return Err(protoErr("invalid Describe message")) }
     var stmtName = name.clone()
+    var bin = false
     if kind == "P" {
         if !ps.portals.has(&name) { return Err(lexdb_base.err("34000", &("portal \"" + name + "\" does not exist"))) }
         stmtName = ps.portals.at(name).stmt.clone()
+        bin = len(ps.portals.at(name).fmts) > 0
     }
     if !ps.stmts.has(&stmtName) {
         return Err(lexdb_base.err("26000", &("prepared statement \"" + stmtName + "\" does not exist")))
@@ -924,7 +913,7 @@ fn (w: mut &Wire) describeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.
     // execution, so the columns are kept while the catalog is unchanged.
     let now = w.st.changes()
     if p.colsAt == now && p.pathAt == w.sess.pathVersion() {
-        w.rowDesc(&p.cols)
+        if bin { w.msg('T', &lexdb_pgbin.rowDesc(&p.cols, &ps.portals.at(name).fmts)) } else { w.rowDesc(&p.cols) }
         return Ok(Unit{})
     }
     let cols = try w.sess.describe(&p.stmts[0], &p.ptypes)
@@ -933,7 +922,7 @@ fn (w: mut &Wire) describeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.
         w.empty('n')
         return Ok(Unit{})
     }
-    w.rowDesc(&cols)
+    if bin { w.msg('T', &lexdb_pgbin.rowDesc(&cols, &ps.portals.at(name).fmts)) } else { w.rowDesc(&cols) }
     let m = ps.stmts.atMut(stmtName)
     m.cols = cols
     m.colsAt = now
@@ -947,6 +936,7 @@ fn (w: mut &Wire) executeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.D
     let maxRows = r.i32()
     if r.bad { return Err(protoErr("invalid Execute message")) }
     if !ps.portals.has(&portal) { return Err(lexdb_base.err("34000", &("portal \"" + portal + "\" does not exist"))) }
+    if lexdb_base.cancelPending() { let late = lexdb_base.takeCancel(w.sess.number()) }
     let name = ps.portals.at(portal).stmt.clone()
     if len(ps.stmts.at(name).stmts) == 0 {
         w.empty('I')
@@ -972,7 +962,10 @@ fn (w: mut &Wire) executeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.D
     if res.hasRows && p.colsAt >= 0 && !sameCols(&res.cols, &p.cols) {
         return Err(lexdb_base.err("0A000", "cached plan must not change result type"))
     }
-    if res.hasRows { w.dataRows(&res.rows, &res.cols) }
+    if res.hasRows {
+        let fmts = &ps.portals.at(portal).fmts
+        if len(fmts) > 0 { lexdb_pgbin.dataRows(mut &w.out, &res.rows, &res.cols, fmts, &w.sess.zone()) } else { w.dataRows(&res.rows, &res.cols) }
+    }
     w.complete(&res.tag)
     return Ok(Unit{})
 }
@@ -994,6 +987,7 @@ fn (w: mut &Wire) runPortal(ps: &Ps, portal: &str, name: &str, plan: mut &lexdb_
             for c in p.cols { append(mut &cs, c.clone()) }
             check = Some(cs)
         }
+        if len(po.fmts) > 0 { return w.runStreamedBin(&p.stmts[0], &po.params, &p.ptypes, plan, &check, &po.fmts) }
         return w.runStreamed(&p.stmts[0], &po.params, &p.ptypes, plan, false, &check)
     }
     return w.sess.runCached(&p.stmts[0], &po.params, &p.ptypes, plan)
@@ -1031,7 +1025,11 @@ fn startup(w: mut &Wire, ctx: &[]tls.Context): Result[bool, io.IoError] {
                     try w.c.writeStr("N")
                     continue
                 }
-                if code == CANCEL_REQUEST { return Ok(false) }
+                if code == CANCEL_REQUEST {
+                    // answered by closing the connection, whether it matched or not (PostgreSQL's)
+                    if len(m.body) == 12 { cancelSession(&w.st, binary.readI32BEStr(&m.body, 4), binary.readU32BEStr(&m.body, 8)) }
+                    return Ok(false)
+                }
                 if code != PROTOCOL_3 {
                     w.error(&lexdb_base.err("0A000", &("unsupported frontend protocol " + (code >> 16).toStr() + "." + (code & 0xFFFF).toStr())))
                     try w.flush()
@@ -1079,9 +1077,15 @@ fn startup(w: mut &Wire, ctx: &[]tls.Context): Result[bool, io.IoError] {
                 let tzs = w.tzShown.clone()
                 w.paramStatus("TimeZone", &tzs)
                 w.paramStatus("application_name", "")
+                // BackendKeyData: the session's number (pg_backend_pid) and a random secret, kept for a CancelRequest
+                let secret = match crypto.randomBytes(4) {
+                    Ok(x) { binary.readU32BEStr(&x, 0) }
+                    Err(_) { 0 }
+                }
+                w.st.memo.put(&cancelKey(w.sess.number()), &secret.toStr())
                 var k = ""
-                binary.addU32BE(mut &k, 1)
-                binary.addU32BE(mut &k, 0)
+                binary.addU32BE(mut &k, w.sess.number())
+                binary.addU32BE(mut &k, secret)
                 w.msg('K', &k)
                 w.ready()
                 try w.flush()
@@ -1090,6 +1094,20 @@ fn startup(w: mut &Wire, ctx: &[]tls.Context): Result[bool, io.IoError] {
         }
     }
     return Ok(false)
+}
+
+// ---- cancel requests (9.138)
+
+// The memo's key of a session's cancel secret (BackendKeyData).
+fn cancelKey(sid: int): str { return "\x00pgcancel\x00" + sid.toStr() }
+
+// A CancelRequest: session pid is asked to stop its statement if secret is
+// its own.
+fn cancelSession(st: &lexdb_store.Store, pid: int, secret: int) {
+    match st.memo.get(&cancelKey(pid)) {
+        Some(v) { if v == secret.toStr() { lexdb_base.askCancel(pid) } }
+        None {}
+    }
 }
 
 // ---- authentication (9.81): as configure set it (the store's memo), by
@@ -1279,6 +1297,8 @@ pub fn serve(a: ConnArg): int {
             }
         }
     }
+    w.st.memo.del(&cancelKey(w.sess.number()))
+    if lexdb_base.cancelPending() { let late = lexdb_base.takeCancel(w.sess.number()) }
     w.sess.close()
     return 0
 }

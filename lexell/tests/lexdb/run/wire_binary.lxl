@@ -1,0 +1,307 @@
+// lexdb_wire and lexdb_pgbin: binary parameters and binary result columns,
+// as pgjdbc sends and asks for them with its default settings (design/
+// lexdb.md 9.138). A raw client: Parse an INSERT of every type with its
+// parameters' types, Bind it with binary parameters (PostgreSQL's send
+// formats: the bytes below are numeric_send, uuid_send, ... of PostgreSQL
+// 19), NULLs and text ones; then a SELECT bound with every result column
+// binary (Describe portal shows format 1), with batches on and off, one
+// with the formats mixed, an INSERT ... RETURNING in binary (the rows not
+// streamed), the text results of the same SELECT (the session's TimeZone
+// is New York: a timestamptz's text is in it, its binary is UTC), and a
+// format code 2 (22023). Each value is shown in hex. Run with
+// LEXDB_PG_PORT set, the program talks to that PostgreSQL instead (user
+// postgres, database postgres): its output is the same.
+// expect: insert: C INSERT 0 1 | C INSERT 0 1 | C INSERT 0 1
+// expect: describe: id/1 n/1 u/1 b/1 d/1 t/1 ts/1 tz/1 iv/1 f/1 r/1 s/1 l/1 bo/1 tx/1 ia/1 ta/1
+// expect: binary: D 00000001 0003000140000003000109291a7c a0eebc999c0b4ef8bb6d6bb9bd380a11 0001ff 0000265f 00000008672953a0 fffffffffc7d9d80 000303ed6cf10800 000000036c966ee0000000030000000e 3fb999999999999a 40200000 fff9 0000000218711a01 01 68c3a96c6c6f 00000001000000010000001700000003000000010000000400000001ffffffff00000004fffffffd 0000000100000000000000190000000200000001000000016100000003622063 | D 00000002 0003000100000003000a00001388 NULL NULL 7fffffff NULL 8000000000000000 NULL NULL NULL NULL NULL NULL NULL NULL 000000000000000000000017 NULL | D 00000003 0000000000000003 NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL 00 NULL NULL NULL | C SELECT 3
+// expect: batches off: D 00000001 0003000140000003000109291a7c a0eebc999c0b4ef8bb6d6bb9bd380a11 0001ff 0000265f 00000008672953a0 fffffffffc7d9d80 000303ed6cf10800 000000036c966ee0000000030000000e 3fb999999999999a 40200000 fff9 0000000218711a01 01 68c3a96c6c6f 00000001000000010000001700000003000000010000000400000001ffffffff00000004fffffffd 0000000100000000000000190000000200000001000000016100000003622063 | D 00000002 0003000100000003000a00001388 NULL NULL 7fffffff NULL 8000000000000000 NULL NULL NULL NULL NULL NULL NULL NULL 000000000000000000000017 NULL | D 00000003 0000000000000003 NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL NULL 00 NULL NULL NULL | C SELECT 3
+// expect: mixed: D 00000001 2d31323334352e363738 a0eebc999c0b4ef8bb6d6bb9bd380a11 5c78303030316666 0000265f 31303a30313a33302e35 fffffffffc7d9d80 323032362d31312d32332030353a30303a30302d3035 000000036c966ee0000000030000000e 302e31 40200000 2d37 0000000218711a01 74 68c3a96c6c6f 7b312c4e554c4c2c2d337d 0000000100000000000000190000000200000001000000016100000003622063 | C SELECT 1
+// expect: returning: D 00000009 0000000000000003 000303ed6cf10800 NULL | C INSERT 0 1
+// expect: text: D 31 2d31323334352e363738 61306565626339392d396330622d346566382d626236642d366262396264333830613131 5c78303030316666 323032362d31312d3233 31303a30313a33302e35 313939392d31322d33312032333a35393a30312e313233343536 323032362d31312d32332030353a30303a30302d3035 3120796561722032206d6f6e73203320646179732030343a30353a30362e37 302e31 322e35 2d37 39303030303030303031 74 68c3a96c6c6f 7b312c4e554c4c2c2d337d 7b612c22622063227d | C SELECT 1
+// expect: format 2: E 22023 unsupported format code: 2
+import "task"
+import "net"
+import "os"
+import "pgwire"
+import "binary"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+
+type Rx = record { buf: []byte }
+
+const HEX: str = "0123456789abcdef"
+
+fn hexOf(b: &[byte]): str {
+    var s = ""
+    for x in b {
+        s.addByte(HEX[int(x) >> 4])
+        s.addByte(HEX[int(x) & 15])
+    }
+    return s
+}
+
+fn unhex(h: &str): str {
+    var s = ""
+    var i = 0
+    while i + 1 < len(h) {
+        s.addByte(byte(strings.indexOf(&HEX, &h[i..i + 1], 0) * 16 + strings.indexOf(&HEX, &h[i + 1..i + 2], 0)))
+        i += 2
+    }
+    return s
+}
+
+// The messages to ReadyForQuery, shown: a RowDescription's names and format codes, a DataRow's values in hex, a
+// CommandComplete's tag, an ErrorResponse's code and message.
+fn readUntilReady(c: &net.Conn, rx: mut &Rx): str {
+    var out: []str = []
+    var chunk = array(65536, byte(0))
+    while true {
+        while len(rx.buf) < 5 || len(rx.buf) < 1 + binary.readI32BE(&rx.buf, 1) {
+            let n = c.read(mut &chunk).unwrap()
+            if n == 0 { return strings.join(&out, " | ") }
+            for i in 0..n { append(mut &rx.buf, chunk[i]) }
+        }
+        let typ = rx.buf[0]
+        let size = binary.readI32BE(&rx.buf, 1)
+        var body: []byte = []
+        for i in 5..1 + size { append(mut &body, rx.buf[i]) }
+        var rest: []byte = []
+        for i in 1 + size..len(rx.buf) { append(mut &rest, rx.buf[i]) }
+        rx.buf = rest
+        if typ == 'T' {
+            var cols: []str = []
+            let n = binary.readU16BE(&body, 0)
+            var at = 2
+            for k in 0..n {
+                let s = at
+                while body[at] != 0 { at += 1 }
+                let name = strFromBytes(&body[s..at])
+                at += 1 + 16
+                append(mut &cols, name + "/" + binary.readU16BE(&body, at).toStr())
+                at += 2
+            }
+            append(mut &out, strings.join(&cols, " "))
+        } else if typ == 'D' {
+            var vals: []str = ["D"]
+            let n = binary.readU16BE(&body, 0)
+            var at = 2
+            for k in 0..n {
+                let l = binary.readI32BE(&body, at)
+                at += 4
+                if l < 0 { append(mut &vals, "NULL") } else {
+                    append(mut &vals, hexOf(&body[at..at + l]))
+                    at += l
+                }
+            }
+            append(mut &out, strings.join(&vals, " "))
+        } else if typ == 'C' {
+            append(mut &out, "C " + strFromBytes(&body[0..len(body) - 1]))
+        } else if typ == 'E' {
+            var code = ""
+            var msg = ""
+            var at = 0
+            while at < len(body) && body[at] != 0 {
+                let f = body[at]
+                let s = at + 1
+                while body[at] != 0 { at += 1 }
+                if f == 'C' { code = strFromBytes(&body[s..at]) }
+                if f == 'M' { msg = strFromBytes(&body[s..at]) }
+                at += 1
+            }
+            append(mut &out, "E " + code + " " + msg)
+        } else if typ == 'Z' {
+            return strings.join(&out, " | ")
+        }
+    }
+    return strings.join(&out, " | ")
+}
+
+fn msg(o: mut &str, typ: byte, body: &str) {
+    o.addByte(typ)
+    binary.addU32BE(o, len(body) + 4)
+    o += body
+}
+
+fn cstr(b: mut &str, s: &str) {
+    b += s
+    b.addByte(0)
+}
+
+fn query(o: mut &str, sql: &str) {
+    var b = ""
+    cstr(mut &b, sql)
+    msg(o, 'Q', &b)
+}
+
+fn parse(o: mut &str, name: &str, sql: &str, oids: &[]int) {
+    var b = ""
+    cstr(mut &b, name)
+    cstr(mut &b, sql)
+    binary.addU16BE(mut &b, len(oids))
+    for x in oids { binary.addU32BE(mut &b, x) }
+    msg(o, 'P', &b)
+}
+
+// Bind: the parameters' format codes, the values (None NULL), the result columns' codes.
+fn bind(o: mut &str, stmt: &str, pf: &[]int, vals: &[]Option[str], rf: &[]int) {
+    var b = ""
+    cstr(mut &b, "")
+    cstr(mut &b, stmt)
+    binary.addU16BE(mut &b, len(pf))
+    for f in pf { binary.addU16BE(mut &b, f) }
+    binary.addU16BE(mut &b, len(vals))
+    for v in vals {
+        match v {
+            Some(x) {
+                binary.addU32BE(mut &b, len(x))
+                b += &x
+            }
+            None { binary.addU32BE(mut &b, 0xFFFFFFFF) }
+        }
+    }
+    binary.addU16BE(mut &b, len(rf))
+    for f in rf { binary.addU16BE(mut &b, f) }
+    msg(o, 'B', &b)
+}
+
+fn describePortal(o: mut &str) {
+    var b = "P"
+    b.addByte(0)
+    msg(o, 'D', &b)
+}
+
+fn execute(o: mut &str) {
+    var b = ""
+    b.addByte(0)
+    binary.addU32BE(mut &b, 0)
+    msg(o, 'E', &b)
+}
+
+fn sync(o: mut &str) { msg(o, 'S', "") }
+
+fn round(c: &net.Conn, rx: mut &Rx, o: &str): str {
+    c.write(o.bytes()).unwrap()
+    return readUntilReady(c, rx)
+}
+
+fn hx(h: &str): Option[str] { return Some(unhex(h)) }
+
+fn tx(t: &str): Option[str] { return Some(t.clone()) }
+
+fn client(addr: str, user: str, db: str) {
+    let c = net.connect(&addr).unwrap()
+    var rx = Rx{buf: []}
+    var so = pgwire.newOut()
+    let settings: []pgwire.Setting = []
+    pgwire.putStartup(mut &so, &user, &db, &settings)
+    c.write(so.bytes()).unwrap()
+    let hello = readUntilReady(&c, mut &rx)
+    var o = ""
+    query(mut &o, "drop table if exists bt")
+    let d0 = round(&c, mut &rx, &o)
+    o = ""
+    query(mut &o, "set timezone = 'America/New_York'")
+    let d1 = round(&c, mut &rx, &o)
+    o = ""
+    query(mut &o, "create table bt (id int primary key, n numeric(12,3), u uuid, b bytea, d date, t time, ts timestamp, tz timestamptz, " +
+                  "iv interval, f float8, r real, s smallint, l bigint, bo boolean, tx text, ia int[], ta text[])")
+    let d2 = round(&c, mut &rx, &o)
+
+    let oids = [23, 1700, 2950, 17, 1082, 1083, 1114, 1184, 1186, 701, 700, 21, 20, 16, 25, 1007, 1009]
+    o = ""
+    parse(mut &o, "ins", "insert into bt values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)", &oids)
+    let row1 = [hx("00000001"), hx("0003000140000003000109291a7c"), hx("a0eebc999c0b4ef8bb6d6bb9bd380a11"), hx("0001ff"), hx("0000265f"),
+                hx("00000008672953a0"), hx("fffffffffc7d9d80"), hx("000303ed6cf10800"), hx("000000036c966ee0000000030000000e"),
+                hx("3fb999999999999a"), hx("40200000"), hx("fff9"), hx("0000000218711a01"), hx("01"), hx("68c3a96c6c6f"),
+                hx("00000001000000010000001700000003000000010000000400000001ffffffff00000004fffffffd"),
+                hx("0000000100000000000000190000000200000001000000016100000003622063")]
+    let none: []int = []
+    bind(mut &o, "ins", &[1], &row1, &none)
+    execute(mut &o)
+    let row2 = [hx("00000002"), hx("0003000100000001000a00001388"), None, None, hx("7fffffff"), None, hx("8000000000000000"), None, None,
+                None, None, None, None, None, None, hx("000000000000000000000017"), None]
+    bind(mut &o, "ins", &[1], &row2, &none)
+    execute(mut &o)
+    let row3 = [tx("3"), tx("0"), None, None, None, None, None, None, None, None, None, None, None, tx("f"), None, None, None]
+    bind(mut &o, "ins", &none, &row3, &none)
+    execute(mut &o)
+    sync(mut &o)
+    println("insert: " + round(&c, mut &rx, &o))
+
+    let noOids: []int = []
+    let noVals: []Option[str] = []
+    o = ""
+    parse(mut &o, "sel", "select * from bt order by id", &noOids)
+    bind(mut &o, "sel", &none, &noVals, &[1])
+    describePortal(mut &o)
+    execute(mut &o)
+    sync(mut &o)
+    let all = round(&c, mut &rx, &o)
+    let cut = strings.indexOf(&all, " | ", 0)
+    println("describe: " + all[0..cut])
+    println("binary: " + all[cut + 3..len(all)])
+
+    o = ""
+    query(mut &o, "set lexdb_batch = off")
+    let d3 = round(&c, mut &rx, &o)
+    o = ""
+    bind(mut &o, "sel", &none, &noVals, &[1])
+    execute(mut &o)
+    sync(mut &o)
+    println("batches off: " + round(&c, mut &rx, &o))
+    o = ""
+    query(mut &o, "set lexdb_batch = on")
+    let d4 = round(&c, mut &rx, &o)
+
+    o = ""
+    parse(mut &o, "one", "select * from bt where id = $1", &[23])
+    bind(mut &o, "one", &[1], &[hx("00000001")], &[1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1])
+    execute(mut &o)
+    sync(mut &o)
+    println("mixed: " + round(&c, mut &rx, &o))
+
+    o = ""
+    parse(mut &o, "ret", "insert into bt (id, n, tz) values ($1, $2, $3) returning id, n, tz, iv", &[23, 1700, 1184])
+    bind(mut &o, "ret", &[1], &[hx("00000009"), hx("0001fffe000000040001"), hx("000303ed6cf10800")], &[1])
+    execute(mut &o)
+    sync(mut &o)
+    println("returning: " + round(&c, mut &rx, &o))
+
+    o = ""
+    bind(mut &o, "one", &none, &[tx("1")], &none)
+    execute(mut &o)
+    sync(mut &o)
+    println("text: " + round(&c, mut &rx, &o))
+
+    o = ""
+    bind(mut &o, "sel", &none, &noVals, &[2])
+    execute(mut &o)
+    sync(mut &o)
+    println("format 2: " + round(&c, mut &rx, &o))
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_wire.acceptLoop, lexdb_wire.AcceptArg{ln: ln, st: st.share()})
+        client(addr, "test", "test")
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    match os.env(&"LEXDB_PG_PORT") {
+        Some(p) {
+            client("127.0.0.1:" + p, "postgres", "postgres")
+            return
+        }
+        None {}
+    }
+    lexdb_store.run(lexdb_disk.sim(9), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

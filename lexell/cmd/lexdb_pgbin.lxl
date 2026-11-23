@@ -1,0 +1,486 @@
+// lexdb: PostgreSQL's binary formats (its types' send and recv functions)
+// for the wire (lexdb_wire, design/lexdb.md 9.138): binary parameters, read
+// into the text the executor takes, and the binary result columns a Bind
+// asks for (pgjdbc does after prepareThreshold runs of a statement). The
+// text path never comes here: a portal with no binary column is written by
+// lexdb_wire's own functions.
+//
+// The formats: bool one byte; int2, int4, int8, oid and the reg types
+// big-endian integers; float4 and float8 IEEE bits; numeric its base-10000
+// digits (ndigits, weight, sign, dscale, then the digits); date the days and
+// time, timestamp and timestamptz the microseconds from 2000-01-01, as
+// lexdb holds them (lexdb_time; infinity a date's int32 limits); interval
+// microseconds, days, months; uuid its 16 bytes; bytea its bytes; an array
+// its dimensions, null flag, element type and elements; text and the
+// other types their bytes.
+import "binary"
+import "math"
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_ops"
+import "./lexdb_float"
+import "./lexdb_time"
+import "./lexdb_bind"
+import "./lexdb_rows"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+
+const HEX: str = "0123456789abcdef"
+
+// ---- parameters: a binary value as its text
+
+fn badBin(oid: int): DbErr {
+    return lexdb_base.err("22P03", &("incorrect binary data format in a parameter of type " + oid.toStr()))
+}
+
+// A binary parameter of type oid as its text form (lexdb_exec.paramVals
+// reads it as a text parameter).
+pub fn param(data: &str, oid: int): Result[str, DbErr] {
+    let n = len(data)
+    if oid == lexdb_sql.OID_INT8 && n == 8 { return Ok(binary.readI64BEStr(data, 0).toStr()) }
+    if oid == lexdb_sql.OID_INT4 && n == 4 { return Ok(binary.readI32BEStr(data, 0).toStr()) }
+    if oid == lexdb_sql.OID_INT2 && n == 2 { return Ok(binary.readI16BEStr(data, 0).toStr()) }
+    if oid == lexdb_sql.OID_BOOL && n == 1 { return Ok(if data[0] != 0 { "t" } else { "f" }) }
+    if oid == lexdb_sql.OID_FLOAT8 && n == 8 { return Ok(lexdb_float.fmt8(math.fromBits(binary.readI64BEStr(data, 0)))) }
+    if oid == lexdb_sql.OID_FLOAT4 && n == 4 { return Ok(lexdb_float.fmt4(math.fromBits32Int(binary.readU32BEStr(data, 0)))) }
+    if oid == lexdb_sql.OID_TEXT || oid == lexdb_sql.OID_VARCHAR || oid == lexdb_sql.OID_BPCHAR || oid == lexdb_sql.OID_NAME ||
+       oid == lexdb_sql.OID_CHAR || oid == lexdb_sql.OID_UNKNOWN { return Ok(data.clone()) }
+    if oid == lexdb_sql.OID_NUMERIC { return numRecv(data) }
+    if oid == lexdb_sql.OID_UUID {
+        if n != 16 { return Err(badBin(oid)) }
+        var s = ""
+        for i in 0..16 {
+            if i == 4 || i == 6 || i == 8 || i == 10 { s.addByte('-') }
+            s.addByte(HEX[int(data[i]) >> 4])
+            s.addByte(HEX[int(data[i]) & 15])
+        }
+        return Ok(s)
+    }
+    if oid == lexdb_sql.OID_BYTEA { return Ok(lexdb_sql.bytesHex(data)) }
+    if oid == lexdb_sql.OID_DATE && n == 4 {
+        let d = binary.readI32BEStr(data, 0)
+        let days = if d == 2147483647 { lexdb_time.INF } else if d == -2147483648 { lexdb_time.NINF } else { d }
+        return Ok(lexdb_time.fmtDate(days))
+    }
+    if oid == lexdb_sql.OID_TIME && n == 8 { return Ok(lexdb_time.fmtTime(binary.readI64BEStr(data, 0))) }
+    if oid == lexdb_sql.OID_TS && n == 8 { return Ok(lexdb_time.fmtTs(binary.readI64BEStr(data, 0))) }
+    if oid == lexdb_sql.OID_TSTZ && n == 8 { return Ok(lexdb_time.fmtTstz(binary.readI64BEStr(data, 0), lexdb_time.utc())) }
+    if oid == lexdb_sql.OID_IVAL && n == 16 {
+        let iv = lexdb_time.Ival{months: binary.readI32BEStr(data, 12), days: binary.readI32BEStr(data, 8), us: binary.readI64BEStr(data, 0)}
+        return Ok(lexdb_time.fmtIval(&iv))
+    }
+    if (oid == lexdb_sql.OID_OID || isRegOid(oid)) && n == 4 { return Ok(binary.readU32BEStr(data, 0).toStr()) }
+    if lexdb_sql.elemOid(oid) > 0 { return arrayRecv(data, lexdb_sql.elemOid(oid)) }
+    if typLen(oid) > 0 && n != typLen(oid) { return Err(badBin(oid)) }
+    return Err(lexdb_base.err("0A000", &("lexdb: a binary parameter of type " + oid.toStr() + " is not supported")))
+}
+
+// A binary array (one dimension) as its text form, as the executor holds
+// arrays (9.27).
+fn arrayRecv(data: &str, elem: int): Result[str, DbErr] {
+    let bad = lexdb_base.err("22P03", "invalid binary array parameter")
+    if len(data) < 12 { return Err(bad) }
+    let ndim = binary.readI32BEStr(data, 0)
+    if ndim == 0 { return Ok("{}") }
+    if ndim != 1 { return Err(lexdb_base.err("0A000", "lexdb: arrays of more than one dimension are not supported")) }
+    if len(data) < 20 { return Err(bad) }
+    let n = binary.readI32BEStr(data, 12)
+    var at = 20
+    var vals: []Val = []
+    for i in 0..n {
+        if at + 4 > len(data) { return Err(bad) }
+        let l = binary.readI32BEStr(data, at)
+        at += 4
+        if l < 0 {
+            append(mut &vals, Val.Null)
+            continue
+        }
+        if at + l > len(data) { return Err(bad) }
+        let t = try param(&data[at..at + l], elem)
+        at += l
+        if elem == lexdb_sql.OID_BOOL { append(mut &vals, Val.Bool(t == "t")) } else { append(mut &vals, Val.Text(t)) }
+    }
+    return Ok(lexdb_ops.arrayText(&vals))
+}
+
+// A binary numeric's text: the integer digits, then dscale fraction digits.
+fn numRecv(data: &str): Result[str, DbErr] {
+    if len(data) < 8 { return Err(badBin(lexdb_sql.OID_NUMERIC)) }
+    let nd = binary.readU16BEStr(data, 0)
+    let weight = binary.readI16BEStr(data, 2)
+    let sign = binary.readU16BEStr(data, 4)
+    let dscale = binary.readU16BEStr(data, 6)
+    if len(data) != 8 + 2 * nd { return Err(badBin(lexdb_sql.OID_NUMERIC)) }
+    if sign == 0xC000 { return Ok("NaN") }
+    if sign == 0xD000 { return Ok("Infinity") }
+    if sign == 0xF000 { return Ok("-Infinity") }
+    var s = ""
+    if sign == 0x4000 { s.addByte('-') }
+    // the digit at position p (0 the first, weight the units' group)
+    if weight < 0 {
+        s.addByte('0')
+    } else {
+        for p in 0..weight + 1 {
+            let d = if p < nd { binary.readU16BEStr(data, 8 + 2 * p) } else { 0 }
+            if p == 0 { s += &d.toStr() } else { addDigits4(mut &s, d) }
+        }
+    }
+    if dscale > 0 {
+        s.addByte('.')
+        var f = ""
+        var p = weight + 1
+        while len(f) < dscale {
+            let d = if p >= 0 && p < nd { binary.readU16BEStr(data, 8 + 2 * p) } else { 0 }
+            addDigits4(mut &f, d)
+            p += 1
+        }
+        s += &f[0..dscale]
+    }
+    return Ok(s)
+}
+
+fn addDigits4(s: mut &str, d: int) {
+    s.addByte(byte(48 + d / 1000 % 10))
+    s.addByte(byte(48 + d / 100 % 10))
+    s.addByte(byte(48 + d / 10 % 10))
+    s.addByte(byte(48 + d % 10))
+}
+
+// ---- results
+
+// The result format codes of a Bind (n of them, at body[at..]), kept when
+// one asks for binary: Ok([]) when all are text. A code other than 0 and 1
+// is an error, as PostgreSQL's.
+pub fn formats(body: &str, at: int, n: int): Result[[]int, DbErr] {
+    var out: []int = []
+    var bin = false
+    for i in 0..n {
+        let f = binary.readI16BEStr(body, at + 2 * i)
+        if f != 0 && f != 1 { return Err(lexdb_base.err("22023", &("unsupported format code: " + f.toStr()))) }
+        if f == 1 { bin = true }
+        append(mut &out, f)
+    }
+    if !bin { return Ok([]) }
+    return Ok(out)
+}
+
+// Column k's format: one code is every column's.
+fn isBin(fmts: &[]int, k: int): bool {
+    if len(fmts) == 1 { return fmts[0] == 1 }
+    return k < len(fmts) && fmts[k] == 1
+}
+
+// A type's length as RowDescription gives it (-1 varying).
+fn typLen(oid: int): int {
+    if oid == lexdb_sql.OID_INT8 || oid == lexdb_sql.OID_FLOAT8 || oid == lexdb_sql.OID_TIME || oid == lexdb_sql.OID_TS ||
+       oid == lexdb_sql.OID_TSTZ { return 8 }
+    if oid == lexdb_sql.OID_INT4 || oid == lexdb_sql.OID_FLOAT4 || oid == lexdb_sql.OID_DATE || oid == lexdb_sql.OID_OID ||
+       isRegOid(oid) { return 4 }
+    if oid == lexdb_sql.OID_INT2 { return 2 }
+    if oid == lexdb_sql.OID_BOOL || oid == lexdb_sql.OID_CHAR { return 1 }
+    if oid == lexdb_sql.OID_UUID || oid == lexdb_sql.OID_IVAL { return 16 }
+    if oid == lexdb_sql.OID_NAME { return 64 }
+    return -1
+}
+
+// A portal's RowDescription body: the columns with their format codes.
+pub fn rowDesc(cols: &[]lexdb_bind.OutCol, fmts: &[]int): str {
+    var b = ""
+    binary.addU16BE(mut &b, len(cols))
+    for k in 0..len(cols) {
+        b += &cols[k].label()
+        b.addByte(0)
+        binary.addU32BE(mut &b, 0)          // table OID
+        binary.addU16BE(mut &b, 0)          // column number
+        binary.addU32BE(mut &b, cols[k].oid)
+        binary.addU16BE(mut &b, typLen(cols[k].oid) & 0xFFFF)
+        binary.addU32BE(mut &b, 0xFFFFFFFF) // typmod -1
+        binary.addU16BE(mut &b, if isBin(fmts, k) { 1 } else { 0 })
+    }
+    return b
+}
+
+// DataRows of rows, columns in the formats fmts asks for, added to out.
+pub fn dataRows(out: mut &str, rows: &[][]Val, cols: &[]lexdb_bind.OutCol, fmts: &[]int, zone: &lexdb_time.Zone) {
+    for r in rows { dataRow(out, r, cols, fmts, zone) }
+}
+
+// A batch's rows (lexdb_rows.OutBatch), as dataRows.
+pub fn dataBatch(out: mut &str, ob: &lexdb_rows.OutBatch, cols: &[]lexdb_bind.OutCol, fmts: &[]int, zone: &lexdb_time.Zone) {
+    let nc = len(ob.kinds)
+    var row: []Val = []
+    for j in 0..ob.n {
+        while len(row) > 0 { let x = pop(mut &row) }
+        for o in 0..nc { append(mut &row, obVal(ob, o, j)) }
+        dataRow(out, &row, cols, fmts, zone)
+    }
+}
+
+// Output o's value at row j of a batch.
+fn obVal(ob: &lexdb_rows.OutBatch, o: int, j: int): Val {
+    let c = ob.src[o]
+    let k = ob.kinds[o]
+    if c < 0 {
+        let x = &ob.ex[o]
+        if x.nul[j] { return Val.Null }
+        return if k == lexdb_rows.BK_BOOL { Val.Bool(x.v[j] == 1) } else { Val.Int(x.v[j]) }
+    }
+    let r = ob.idx[j]
+    if ob.cols[c].nul[r] { return Val.Null }
+    if k == lexdb_rows.BK_INT { return Val.Int(ob.cols[c].v[r]) }
+    if k == lexdb_rows.BK_BOOL { return Val.Bool(ob.cols[c].v[r] == 1) }
+    if k == lexdb_rows.BK_TEXT { return Val.Text(lexdb_rows.obText(ob, o, j).clone()) }
+    return ob.vals[c][r].clone()
+}
+
+pub fn dataRow(out: mut &str, r: &[]Val, cols: &[]lexdb_bind.OutCol, fmts: &[]int, zone: &lexdb_time.Zone) {
+    var b: []byte = withCapacity(64)
+    append(mut &b, byte('D'))
+    binary.appendU32BE(mut &b, 0)
+    binary.appendU16BE(mut &b, len(r))
+    for k in 0..len(r) {
+        let oid = if k < len(cols) { cols[k].oid } else { 0 }
+        match r[k] {
+            Val.Null { binary.appendU32BE(mut &b, 0xFFFFFFFF) }
+            else {
+                if isBin(fmts, k) {
+                    let at = len(b)
+                    binary.appendU32BE(mut &b, 0)
+                    send(mut &b, &r[k], oid, zone)
+                    binary.setU32BE(mut &b, at, len(b) - at - 4)
+                } else {
+                    let x = lexdb_ops.textOut(&r[k], oid, zone)
+                    binary.appendU32BE(mut &b, len(x))
+                    appendStr(mut &b, &x)
+                }
+            }
+        }
+    }
+    binary.setU32BE(mut &b, 1, len(b) - 1)
+    out += strView(mut &b)
+}
+
+// v (not NULL) in column type oid's binary format, added to b.
+fn send(b: mut &[]byte, v: &Val, oid: int, zone: &lexdb_time.Zone) {
+    if sendAs(b, v, oid, zone) { return }
+    // a value not held as its column's type (a text in an int column, ...): made one, then sent
+    let t = lexdb_ops.textOut(v, oid, zone)
+    match lexdb_ops.coerceZ(Val.Text(t.clone()), &lexdb_sql.oidType(oid), zone) {
+        Ok(x) { if sendAs(b, &x, oid, zone) { return } }
+        Err(_) {}
+    }
+    appendStr(b, &t)
+}
+
+// send, when v is held as oid's type: false when it is not.
+fn sendAs(b: mut &[]byte, v: &Val, oid: int, zone: &lexdb_time.Zone): bool {
+    if oid == lexdb_sql.OID_NUMERIC {
+        match v {
+            Val.Num(_) { numSend(b, &lexdb_sql.text(v)) }
+            Val.Int(n) { numSend(b, &n.toStr()) }
+            else { return false }
+        }
+        return true
+    }
+    if lexdb_sql.elemOid(oid) > 0 {
+        match v {
+            Val.Text(t) { return arraySend(b, &t, oid, zone) }
+            else { return false }
+        }
+    }
+    match v {
+        Val.Int(n) {
+            if oid == lexdb_sql.OID_INT8 { binary.appendU64BE(b, n) }
+            else if oid == lexdb_sql.OID_INT4 || oid == lexdb_sql.OID_OID || isRegOid(oid) { binary.appendU32BE(b, n) }
+            else if oid == lexdb_sql.OID_INT2 { binary.appendU16BE(b, n) }
+            else if oid == lexdb_sql.OID_FLOAT8 { binary.appendU64BE(b, math.bitsOf(float(n))) }
+            else if oid == lexdb_sql.OID_FLOAT4 { binary.appendU32BE(b, math.bitsOf32Int(float(n))) }
+            else if textLike(oid) { appendStr(b, &n.toStr()) }
+            else { return false }
+        }
+        Val.Bool(x) {
+            if oid == lexdb_sql.OID_BOOL { append(b, if x { byte(1) } else { byte(0) }) } else if textLike(oid) { appendStr(b, if x { "t" } else { "f" }) } else { return false }
+        }
+        Val.Float(x) {
+            if oid == lexdb_sql.OID_FLOAT8 { binary.appendU64BE(b, math.bitsOf(x)) }
+            else if oid == lexdb_sql.OID_FLOAT4 { binary.appendU32BE(b, math.bitsOf32Int(x)) }
+            else { return false }
+        }
+        Val.Real(x) {
+            if oid == lexdb_sql.OID_FLOAT4 { binary.appendU32BE(b, math.bitsOf32Int(x)) }
+            else if oid == lexdb_sql.OID_FLOAT8 { binary.appendU64BE(b, math.bitsOf(x)) }
+            else { return false }
+        }
+        Val.Date(d) {
+            if oid != lexdb_sql.OID_DATE { return false }
+            binary.appendU32BE(b, if d == lexdb_time.INF { 2147483647 } else if d == lexdb_time.NINF { -2147483648 } else { d })
+        }
+        Val.Time(u) { if oid == lexdb_sql.OID_TIME { binary.appendU64BE(b, u) } else { return false } }
+        Val.Ts(u) { if oid == lexdb_sql.OID_TS { binary.appendU64BE(b, u) } else { return false } }
+        Val.Tstz(u) { if oid == lexdb_sql.OID_TSTZ { binary.appendU64BE(b, u) } else { return false } }
+        Val.Ival(iv) {
+            if oid != lexdb_sql.OID_IVAL { return false }
+            binary.appendU64BE(b, iv.us)
+            binary.appendU32BE(b, iv.days)
+            binary.appendU32BE(b, iv.months)
+        }
+        Val.Uuid(u) {
+            if oid != lexdb_sql.OID_UUID { return false }
+            var hi = -1
+            for i in 0..len(u) {
+                let h = hexVal(u[i])
+                if h < 0 { continue }
+                if hi < 0 { hi = h } else {
+                    append(b, byte(hi * 16 + h))
+                    hi = -1
+                }
+            }
+        }
+        Val.Bytes(x) { if oid == lexdb_sql.OID_BYTEA || textLike(oid) { appendStr(b, &x) } else { return false } }
+        Val.Reg(o, n) {
+            if oid == lexdb_sql.OID_OID || isRegOid(oid) { binary.appendU32BE(b, o) } else if textLike(oid) { appendStr(b, &n) } else { return false }
+        }
+        Val.Text(t) {
+            if oid == lexdb_sql.OID_TSTZ {
+                match lexdb_time.parseTstz(&t, zone) {
+                    Ok(u) { binary.appendU64BE(b, u) }
+                    Err(_) { return false }
+                }
+            } else if textLike(oid) {
+                appendStr(b, &t)
+            } else {
+                return false
+            }
+        }
+        Val.Num(_) { if textLike(oid) { appendStr(b, &lexdb_sql.text(v)) } else { return false } }
+        Val.Null { return false }
+    }
+    return true
+}
+
+// The types whose binary form is their text's bytes: text and the
+// character types, name, "char", unknown, and the types lexdb shows as text
+// (an enum's values, oid 0).
+fn textLike(oid: int): bool {
+    if oid == lexdb_sql.OID_TEXT || oid == lexdb_sql.OID_VARCHAR || oid == lexdb_sql.OID_BPCHAR || oid == lexdb_sql.OID_NAME ||
+       oid == lexdb_sql.OID_CHAR || oid == lexdb_sql.OID_UNKNOWN || oid <= 0 { return true }
+    return !knownBinary(oid)
+}
+
+fn knownBinary(oid: int): bool {
+    return oid == lexdb_sql.OID_BOOL || oid == lexdb_sql.OID_INT2 || oid == lexdb_sql.OID_INT4 || oid == lexdb_sql.OID_INT8 ||
+           oid == lexdb_sql.OID_FLOAT4 || oid == lexdb_sql.OID_FLOAT8 || oid == lexdb_sql.OID_NUMERIC || oid == lexdb_sql.OID_DATE ||
+           oid == lexdb_sql.OID_TIME || oid == lexdb_sql.OID_TS || oid == lexdb_sql.OID_TSTZ || oid == lexdb_sql.OID_IVAL ||
+           oid == lexdb_sql.OID_UUID || oid == lexdb_sql.OID_BYTEA || oid == lexdb_sql.OID_OID || isRegOid(oid) ||
+           lexdb_sql.elemOid(oid) > 0
+}
+
+fn isRegOid(oid: int): bool {
+    return oid == lexdb_sql.OID_REGCLASS || oid == lexdb_sql.OID_REGTYPE || oid == lexdb_sql.OID_REGNAMESPACE || oid == lexdb_sql.OID_REGPROC
+}
+
+fn hexVal(c: byte): int {
+    if c >= '0' && c <= '9' { return int(c) - 48 }
+    if c >= 'a' && c <= 'f' { return int(c) - 87 }
+    if c >= 'A' && c <= 'F' { return int(c) - 55 }
+    return -1
+}
+
+// A numeric's text (as lexdb_sql.text gives it) in the binary format.
+fn numSend(b: mut &[]byte, s: &str) {
+    if s == "NaN" {
+        binary.appendU16BE(b, 0)
+        binary.appendU16BE(b, 0)
+        binary.appendU16BE(b, 0xC000)
+        binary.appendU16BE(b, 0)
+        return
+    }
+    var i = 0
+    var neg = false
+    if len(s) > 0 && (s[0] == '-' || s[0] == '+') {
+        neg = s[0] == '-'
+        i = 1
+    }
+    var ip = ""
+    var fp = ""
+    var inFrac = false
+    while i < len(s) {
+        let c = s[i]
+        if c == '.' { inFrac = true }
+        else if c >= '0' && c <= '9' { if inFrac { fp.addByte(c) } else { ip.addByte(c) } }
+        i += 1
+    }
+    let dscale = len(fp)
+    // the integer digits padded on the left, the fraction's on the right, to groups of 4
+    var digs = ""
+    var pad = (4 - len(ip) % 4) % 4
+    for k in 0..pad { digs.addByte('0') }
+    digs += &ip
+    let intGroups = len(digs) / 4
+    digs += &fp
+    pad = (4 - len(fp) % 4) % 4
+    for k in 0..pad { digs.addByte('0') }
+    var groups: []int = []
+    var g = 0
+    while g < len(digs) {
+        append(mut &groups, (int(digs[g]) - 48) * 1000 + (int(digs[g + 1]) - 48) * 100 + (int(digs[g + 2]) - 48) * 10 + int(digs[g + 3]) - 48)
+        g += 4
+    }
+    var weight = intGroups - 1
+    var first = 0
+    while first < len(groups) && groups[first] == 0 {
+        first += 1
+        weight -= 1
+    }
+    var last = len(groups)
+    while last > first && groups[last - 1] == 0 { last -= 1 }
+    let nd = last - first
+    if nd == 0 { weight = 0 }
+    binary.appendU16BE(b, nd)
+    binary.appendU16BE(b, weight & 0xFFFF)
+    binary.appendU16BE(b, if neg && nd > 0 { 0x4000 } else { 0 })
+    binary.appendU16BE(b, dscale)
+    for k in first..last { binary.appendU16BE(b, groups[k]) }
+}
+
+// An array (held as its text) in the binary format: false when its text
+// does not read.
+fn arraySend(b: mut &[]byte, t: &str, oid: int, zone: &lexdb_time.Zone): bool {
+    let elem = lexdb_sql.elemOid(oid)
+    let parts = match lexdb_ops.arrayParts(t) {
+        Ok(x) { x }
+        Err(_) { return false }
+    }
+    var hasNull = false
+    for p in parts { if p.isNone() { hasNull = true } }
+    binary.appendU32BE(b, if len(parts) == 0 { 0 } else { 1 })
+    binary.appendU32BE(b, if hasNull { 1 } else { 0 })
+    binary.appendU32BE(b, elem)
+    if len(parts) == 0 { return true }
+    binary.appendU32BE(b, len(parts))
+    // int2vector and oidvector count from 0
+    binary.appendU32BE(b, if oid == 22 || oid == 30 { 0 } else { 1 })
+    let ty = lexdb_sql.oidType(elem)
+    for p in parts {
+        match p {
+            None { binary.appendU32BE(b, 0xFFFFFFFF) }
+            Some(x) {
+                let at = len(b)
+                binary.appendU32BE(b, 0)
+                match lexdb_ops.coerceZ(Val.Text(x.clone()), &ty, zone) {
+                    Ok(v) {
+                        match v {
+                            Val.Null { appendStr(b, &x) }
+                            else { send(b, &v, elem, zone) }
+                        }
+                    }
+                    Err(_) { appendStr(b, &x) }
+                }
+                binary.setU32BE(b, at, len(b) - at - 4)
+            }
+        }
+    }
+    return true
+}
