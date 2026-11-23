@@ -152,6 +152,32 @@ smaller differences of its statement.
   `VACUUM FULL`) rewrites row-form leaves as column leaves and gives no space back.
 - **COPY:** `WITH (FORMAT binary)` is 0A000; once, after a COPY error at the end of a psql script, the session gave
   no answer for 120 s (not narrowed down).
+- **Data types** (found writing the type pages):
+  - **Integer constant arithmetic does not overflow:** `2147483647::int + 1` gives 2147483648 (and
+    `32767::smallint + 1::smallint` 32768), while `pg_typeof` says integer. On a column it is 22003, as in PostgreSQL.
+  - **Enums compare as text outside `WHERE` and `ORDER BY`:** with `mood ('sad','ok','happy')`, `SELECT 'ok'::mood <
+    'happy'::mood` gives f; `min`, `max` and `greatest` of enums go by the labels' text. `'angry'::mood` is accepted
+    for a label that does not exist (an `INSERT` of it is 22P02).
+  - `INTERVAL '1' DAY` reads `day` as an alias (one second); `INTERVAL '1-2' YEAR TO MONTH` is 42601.
+  - `'alice'::regrole` is looked up as a function (42883); `pg_proc` holds only the user's functions, so
+    `'now'::regproc` is 42883; `regprocedure` leaves out the argument types.
+  - `pg_typeof` says text for `oid`, `regclass`, `regtype`, `name` and `pg_class.relname`.
+  - `'abc'::"char"` is not cut to one character, a `name` not to 63, and `varchar(0)` is accepted.
+  - `varchar(n)` keeps excess trailing spaces: `'abc   '` into `varchar(3)` is 22001 (PostgreSQL cuts them).
+  - bytea: `substring` and `position` work on the hex text, not the bytes; `get_byte`, `set_byte`, `convert_to`,
+    `convert_from` and `sha256` do not exist; `SET bytea_output = 'escape'` is accepted and output stays hex.
+  - numeric has no `NaN` or `Infinity`, and at most 38 significant digits (22003).
+  - Dates are read in ISO order only (`'01/03/2026'`, `'20260301'`, `'March 1, 2026'` are 22007); `SET DateStyle`
+    and `SET IntervalStyle` are accepted and change nothing; `'allballs'::time` and `'infinity'::interval` are not
+    read.
+  - Typed constants other than the date and time ones (`text '1'`, `int '42'`, `numeric '1.50'`, `bool 'yes'`), `B'101'`,
+    `X'1F'` and `U&'\0041'` are not read.
+  - Arrays: `integer ARRAY`, `SET a[2] = ...`, slices (`a[2:3]`), `ARRAY[[1,2],[3,4]]` are 42601; more than one
+    dimension is 0A000; `'[0:2]={...}'` is 22P02; `a[1]` is named `#elem`; `ARRAY[1, 'x']` is accepted;
+    `'1 2'::int2vector` prints `{1,2}`.
+  - Mixed types are not checked in `CASE`, `UNION` and `coalesce` (`coalesce(1, true)` gives 1; PostgreSQL: 42804).
+  - `1 = 'a'` is 42883 `operator does not exist` (PostgreSQL: 22P02).
+  - Some casts' columns are named differently: `(-2.5)::int` is `?column?`, `42::oid` is `integer`.
 
 
 ## SQL Server door
