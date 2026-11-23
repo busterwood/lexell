@@ -51,6 +51,40 @@ smaller differences of its statement.
   is taken only by a statement that starts with `SELECT`, not after `WITH`.
 - **TRUNCATE:** the foreign key refusal carries its DETAIL and HINT in the message text, and `TRUNCATE ... CASCADE`
   gives no NOTICE naming the tables it adds.
+- **Tables** (found writing the DDL pages):
+  - Two column-level primary keys are not refused: `CREATE TABLE t (a int PRIMARY KEY, b int PRIMARY KEY)` makes
+    one key on (a, b) (PostgreSQL: 42P16).
+  - `ALTER TABLE | VIEW | SEQUENCE ... OWNER TO postgres` is `role "postgres" does not exist`, though `current_user`
+    is `postgres` and `pg_roles` lists it. `OWNER TO` a role made with `CREATE ROLE` works.
+  - `COMMENT ON` is a syntax error.
+  - Syntax errors where PostgreSQL has a feature: `CREATE TABLE t ()`, `LIKE`, `INHERITS`, `PARTITION BY`,
+    `WITH (fillfactor = ...)`, `TABLESPACE`, a column's `PRIMARY KEY INCLUDE (...)` / `DEFERRABLE`,
+    `CREATE TABLE ... AS TABLE t` / `AS EXECUTE`, `ALTER COLUMN ... SET STATISTICS`, `ALTER COLUMN ... TYPE ...
+    COLLATE`. At table level `INCLUDE`, `WITH`, `USING INDEX TABLESPACE` and `DEFERRABLE` on a key are 0A000.
+  - `ALTER COLUMN ... TYPE` without `USING` folds its hint into the message (42804).
+  - `DROP ... CASCADE` gives no NOTICE naming what it drops; the 2BP01 refusals carry their hints in the message.
+- **Views:**
+  - While a view reads table t, `ALTER TABLE t DROP COLUMN` (any column, even one the view does not use) and
+    `ALTER TABLE t SET SCHEMA` are refused (2BP01, "lexdb keeps a view's text"). PostgreSQL refuses only the drop of
+    a column the view uses. The other way round, `ALTER COLUMN ... TYPE` of a column a view uses is allowed, where
+    PostgreSQL refuses it (0A000).
+  - `SELECT *` in a view is expanded when the view is read, not when it is made: a column added to the table later
+    shows in the view.
+  - `pg_get_viewdef`, `pg_views.definition` and `information_schema.views` give the view's text as written (with
+    its `;`), not PostgreSQL's rewritten form.
+  - `CREATE OR REPLACE VIEW` with columns renamed or reordered says `cannot drop columns from view` (PostgreSQL:
+    `cannot change name of view column ...`).
+  - `CREATE RECURSIVE VIEW` and `ALTER VIEW v RENAME COLUMN` are syntax errors.
+- **Sequences:** `DROP SEQUENCE s` succeeds while a column default calls `nextval('s')`, and the next insert fails
+  with `relation "s" does not exist` (PostgreSQL: 2BP01). `DROP SEQUENCE t` of a table is 42P01 `sequence "t" does
+  not exist` (PostgreSQL: 42809 `"t" is not a sequence`).
+- **Indexes:**
+  - `DROP INDEX t_pkey` is 42704 `index "t_pkey" does not exist`, though `pg_indexes` lists it and `ALTER INDEX
+    t_pkey RENAME` works (PostgreSQL: 2BP01, the index belongs to a constraint).
+  - `DROP INDEX` takes one name, without `CASCADE` or `RESTRICT`: `DROP INDEX a, b` is a syntax error.
+  - `pg_indexes.indexdef` shows an expression index on `(n + 1)` as `(((n + 1)))` (PostgreSQL: `((n + 1))`).
+  - `INCLUDE (...)`, `WITH (...)`, `NULLS NOT DISTINCT` and `TABLESPACE` are syntax errors; methods other than
+    btree are 0A000; `CONCURRENTLY` is accepted and changes nothing.
 
 
 ## SQL Server door
