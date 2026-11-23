@@ -68,17 +68,14 @@ same operations and keys, not the same data structure. Both print the same check
 | maps | 368 ms | 671 ms | 0.55 |
 
 A second run of the same build gave every ratio within 0.02 of these, except `tokens`.
-At about 100 ms, its best-of-5 ratio moved between 1.05 and 1.12 from run to run, so its
-row is the best of 15 rounds, alternating with Rust and pinned to one core. Cycles agree:
-505M against Rust's 445M, 1.13.
+At about 100 ms its best-of-5 ratio is not stable, so its row is the best of 15 rounds,
+alternating with Rust and pinned to one core. Cycles agree: 505M against Rust's 445M, 1.13.
 
 `tokens` uses views of the source (identifiers are `&str` slices, and the intern
-table holds them), in both languages, with the same output. The same source
-compiled through the C backend takes 110 ms in the same table; the native build takes
-1.08 times its cycles and 1.15 times its instructions. That gap is the native code
-generator's, not the program's: the token list's header and the identifier slices go
-through the stack frame where Rust keeps them in registers (`lexell/design/opt-experiments.md`,
-section 14).
+table holds them), in both languages, with the same output. The gap to Rust is in the
+native code generator, not the program: the token list's header and the identifier
+slices go through the stack frame where Rust keeps them in registers
+(`lexell/design/opt-experiments.md`, section 14).
 
 ## Applications
 
