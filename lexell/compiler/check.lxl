@@ -2778,6 +2778,7 @@ fn (c: mut &Checker) sFor(s: int) {
 // each turn takes its last element, so at every point it holds exactly the elements not yet taken;
 // break, return and try leave those to its ordinary drop at the end of the statement.
 //     { reverse a; while (a.len > 0) { a.len -= 1; T x = a.data[a.len]; body } }
+// with the reverse two indices i and j = len - 1 - i, i rising and j falling while i < j.
 // SPEC 8: for x in xs, where local xs is an array of owned elements not used after the loop (nor in
 // its body, nor in a loop around it that it is declared outside of), consumes xs as
 // for x in move(xs) does: the node to check instead (else a itself).
@@ -2815,15 +2816,19 @@ fn (c: mut &Checker) forConsume(s: int, v0: Val, et: int) {
     let apn = c.nm(&ap)
     let len = c.x.arrow(apn, "len")
     let data = c.x.par(c.x.pcast(c.x.ptr(ct), c.x.arrow(apn, "data")))
+    // reversed with two indices meeting in the middle (no len / 2 and len - 1 - i per turn)
     let i = c.fresh("i")
     let ixn = c.nm(&i)
-    c.emit(c.x.sfor(c.x.decl(i64, &i, c.lit(0)), c.x.bin("<", ixn, c.x.bin("/", len, c.lit(2))), c.x.post(ixn, "++")))
+    let j = c.fresh("j")
+    let jxn = c.nm(&j)
+    c.emit(c.x.decl(i64, &j, c.x.bin("-", len, c.lit(1))))
+    c.emit(c.x.sfor(c.x.decl(i64, &i, c.lit(0)), c.x.bin("<", ixn, jxn), c.x.post(ixn, "++")))
     c.cx.ind += 1
-    let j = c.x.par(c.x.bin("-", c.x.bin("-", len, c.lit(1)), ixn))
     let sw = c.fresh("sw")
     c.emit(c.x.decl(ct, &sw, c.x.idx(data, ixn)))
-    c.emitx(c.x.asg(c.x.idx(data, ixn), c.x.idx(data, j)))
-    c.emitx(c.x.asg(c.x.idx(data, j), c.nm(&sw)))
+    c.emitx(c.x.asg(c.x.idx(data, ixn), c.x.idx(data, jxn)))
+    c.emitx(c.x.asg(c.x.idx(data, jxn), c.nm(&sw)))
+    c.emitx(c.x.post(jxn, "--"))
     c.cx.ind -= 1
     c.emit(c.x.send())
     c.emit(c.x.swhile(c.x.bin(">", len, c.lit(0))))
@@ -4169,7 +4174,19 @@ fn (c: mut &Checker) xChain(e: int, exp: int, hint: int): Val {
         // binop's operand order and holds: the left operand is held while the right one runs
         let mark = len(c.cx.pending)
         if i == 1 && lv.cat == CAT_PLACE { c.hold(&lv, HM_SHARED, c.newCid(), line) }
-        let r = c.rcRead(c.expr(leaves[i], sema.T_STR))
+        let ip = c.intPart(leaves[i])
+        var r = rv(-1, sema.T_STR)
+        if ip >= 0 {
+            // x.toStr() or intToStr(x) of an int x: the int, evaluated here into a local, as a
+            // part with the int in p, len 2 and cap 1 (no string has cap 1 below len): the
+            // concat writes its text in place (rt_str_concat3 to 8), so it has no string of its
+            // own. A temporary that reads the same later (pureIn) and owns nothing: no drop.
+            let iv = c.rd(c.expr(ip, sema.T_INT))
+            let h = c.holdtmp(iv.c, sema.T_INT)
+            r = val(c.x.par(c.x.clit(c.ct("lxl_str"), c.x.init([c.x.cast(c.ct("char*"), h.c), c.lit(2), c.lit(1)]))), sema.T_STR, CAT_TMP)
+        } else {
+            r = c.rcRead(c.expr(leaves[i], sema.T_STR))
+        }
         c.cutPending(mark)
         if r.t != sema.T_STR {
             c.err(line, "operator + needs operands of the same type, not " + c.tstr(sema.T_STR) + " and " + c.tstr(r.t))
@@ -4178,6 +4195,27 @@ fn (c: mut &Checker) xChain(e: int, exp: int, hint: int): Val {
         append(mut &parts, r)
     }
     return c.concatOf(&parts)
+}
+
+// The int x of a chain part x.toStr() or intToStr(x) (std's, x an int), else -1.
+fn (c: mut &Checker) intPart(e: int): int {
+    if c.kind(e) != sx.N_CALL { return -1 }
+    let f = c.nd(e).a
+    let l = c.nd(e).b
+    if c.kind(f) == sx.N_NAME && c.count(l) == 1 {
+        let name = c.nd(f).s.clone()
+        if name != "intToStr" || c.lookupVar(&name, true) >= 0 || c.isBuiltinHere(&name) || c.pg.lookup(c.cx.mod, &name).k >= 0 {
+            return -1
+        }
+        let a = c.item(l, 0)
+        return if c.peekType(a, sema.T_INT) == sema.T_INT { a } else { -1 }
+    }
+    if c.kind(f) != sx.N_FIELDX || c.nd(f).s != "toStr" || c.count(l) != 0 { return -1 }
+    let m = c.pg.methodOf(sema.T_INT, "toStr")
+    if m < 0 || !c.pg.mods[c.pg.fns[m].mod].isStd { return -1 }
+    let a = c.nd(f).a
+    if c.staticNs(a).k != ST_NONE { return -1 }
+    return if c.peekType(a, -1) == sema.T_INT { a } else { -1 }
 }
 
 // One + of the nested form: v (the operators before) + the right operand of b.

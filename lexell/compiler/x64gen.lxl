@@ -3942,6 +3942,43 @@ fn (g: mut &Gen) fillEntries(s: int, n: int, ents: int) {
             alone[j] = true
         }
     }
+    // an 8-byte word made up of two or more integer constants of less than 8 bytes (with padding
+    // between, none of them alone): their bytes as one 8-byte store, for the same reason. A str
+    // literal's len and cap (an int part of a chain of +, check.lxl xChain) read as one word.
+    var packed: []bool = []                 // the entries stored as part of a word
+    var pwords: []int = []                  // the words' offsets and values, in pairs
+    var j0 = 0
+    while j0 < g.u.listLen(ents) {
+        let e0 = g.u.nodes[g.u.listAt(ents, j0)]
+        let w0 = e0.v - e0.v % 8
+        var ok = e0.v >= 0 && w0 + 8 <= n
+        var cnt = 0
+        var val = 0
+        for i in 0..g.u.listLen(ents) {
+            let o = g.u.nodes[g.u.listAt(ents, i)]
+            if ok && o.v < w0 + 8 && o.v + g.size(o.ty) > w0 {
+                let cv = g.intConst(o.a, o.ty)
+                if i < j0 || o.v < w0 || o.v + g.size(o.ty) > w0 + 8 || g.size(o.ty) >= 8 || cv.c != 0 ||
+                        (len(alone) > 0 && alone[i]) || g.u.nk(o.a) == ir.E_CLIT {
+                    ok = false
+                } else {
+                    let bits = g.size(o.ty) * 8
+                    val = val | ((cv.v & ((1 << bits) - 1)) << ((o.v - w0) * 8))
+                    cnt += 1
+                }
+            }
+        }
+        if ok && cnt >= 2 {
+            if len(packed) == 0 { packed = array(g.u.listLen(ents), false) }
+            for i in 0..g.u.listLen(ents) {
+                let o = g.u.nodes[g.u.listAt(ents, i)]
+                if o.v >= w0 && o.v < w0 + 8 { packed[i] = true }
+            }
+            append(mut &pwords, w0)
+            append(mut &pwords, val)
+        }
+        j0 += 1
+    }
     for j in 0..g.u.listLen(ents) {
         let en = g.u.nodes[g.u.listAt(ents, j)]
         var sz = if len(alone) > 0 && alone[j] { 8 } else { g.size(en.ty) }
@@ -3953,6 +3990,11 @@ fn (g: mut &Gen) fillEntries(s: int, n: int, ents: int) {
             if b >= 0 { cov[b] = true }
             b += 1
         }
+    }
+    var pc = 0
+    while pc < len(pwords) {
+        for b in pwords[pc]..pwords[pc] + 8 { cov[b] = true }
+        pc += 2
     }
     for w in 0..len(full) {
         var all = true
@@ -3980,11 +4022,24 @@ fn (g: mut &Gen) fillEntries(s: int, n: int, ents: int) {
         }
         w = e
     }
+    var pw = 0
+    while pw < len(pwords) {
+        let v = pwords[pw + 1]
+        if x64.fits32(v) {
+            g.a.storeI(8, g.initAt(s + pwords[pw]), v)
+        } else {
+            g.a.movRI(R10, v)
+            g.a.store(8, g.initAt(s + pwords[pw]), R10)
+        }
+        pw += 2
+    }
     for j in 0..g.u.listLen(ents) {
         let en = g.u.nodes[g.u.listAt(ents, j)]
         let t = en.ty
         let x = en.a
-        if g.u.nk(x) == ir.E_STR && g.tk(t) == ir.TY_ARR {
+        if len(packed) > 0 && packed[j] {
+            // stored with its word above
+        } else if g.u.nk(x) == ir.E_STR && g.tk(t) == ir.TY_ARR {
             let str = g.u.strs[g.u.nodes[x].v].clone()
             var cnt = len(str) + 1
             if cnt > g.size(t) { cnt = g.size(t) }

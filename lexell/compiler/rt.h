@@ -373,31 +373,48 @@ static int rt_str_cmp(lxl_str a, lxl_str b) {
     if (c) return c < 0 ? -1 : 1;
     return a.len < b.len ? -1 : a.len > b.len;
 }
-static lxl_str rt_str_concat(lxl_str a, lxl_str b) {
-    if (b.len == 0) return rt_str_dup(a);
-    if (a.len == 0) return rt_str_dup(b);
-    lxl_str s = rt_str_new((int64_t)a.len + b.len);
-    memcpy(s.p, RT_SP(a), (size_t)a.len);
-    memcpy(s.p + a.len, RT_SP(b), (size_t)b.len);
-    return s;
-}
+static lxl_str rt_str_concat(lxl_str a, lxl_str b);
 /* a + b + c ... (3 to 8 parts, check.lxl xChain): the result sized once, each part copied once.
-   As the nested rt_str_concat: a lone non-empty part is duplicated (a static one shared). */
+   As the nested rt_str_concat: a lone non-empty part is duplicated (a static one shared). A part
+   that is an int (x.toStr() or intToStr(x) of an int x) has the int in p, len 2 and cap 1, which
+   no string has (an owned one has cap >= len, a static one cap 0): its text is written straight
+   into the result (native/rt.c, RT_IPART). */
+static char* rt_digits(char* end, u128 v);
+static int rt_ndig64(uint64_t w);
+static lxl_str rt_int_to_str(int64_t v);
+static inline bool rt_ipart(lxl_str x) { return x.len == 2 && x.cap == 1; }
+static inline int64_t rt_ipart_v(lxl_str x) { return (int64_t)(intptr_t)x.p; }
+static inline uint64_t rt_ipart_mag(lxl_str x) { int64_t v = rt_ipart_v(x); return v < 0 ? 0 - (uint64_t)v : (uint64_t)v; }
+static inline int64_t rt_part_len(lxl_str x) {
+    return rt_ipart(x) ? rt_ndig64(rt_ipart_mag(x)) + (rt_ipart_v(x) < 0) : (int64_t)x.len;
+}
 static inline lxl_str rt_str_catv(const lxl_str* ps, int n) {
     int64_t len = 0;
     int nz = 0, last = 0;
     for (int i = 0; i < n; i++) {
-        len += ps[i].len;
+        len += rt_part_len(ps[i]);
         if (ps[i].len) { nz++; last = i; }
     }
-    if (nz <= 1) return rt_str_dup(ps[last]);
+    if (nz <= 1) return rt_ipart(ps[last]) ? rt_int_to_str(rt_ipart_v(ps[last])) : rt_str_dup(ps[last]);
     lxl_str s = rt_str_new(len);
     char* q = s.p;
     for (int i = 0; i < n; i++) {
-        memcpy(q, RT_SP(ps[i]), (size_t)ps[i].len);
-        q += ps[i].len;
+        if (rt_ipart(ps[i])) {
+            int64_t k = rt_part_len(ps[i]);
+            rt_digits(q + k, rt_ipart_mag(ps[i]));
+            if (rt_ipart_v(ps[i]) < 0) q[0] = '-';
+            q += k;
+        } else {
+            memcpy(q, RT_SP(ps[i]), (size_t)ps[i].len);
+            q += ps[i].len;
+        }
     }
     return s;
+}
+/* a + b; either may be an int part (a chain of + joined early to two parts). */
+static lxl_str rt_str_concat(lxl_str a, lxl_str b) {
+    lxl_str ps[2] = {a, b};
+    return rt_str_catv(ps, 2);
 }
 static lxl_str rt_str_concat3(lxl_str a, lxl_str b, lxl_str c) {
     lxl_str ps[3] = {a, b, c};

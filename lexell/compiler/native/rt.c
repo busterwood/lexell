@@ -1178,55 +1178,151 @@ int rt_str_cmp(lxl_str a, lxl_str b) {
     if (c) return c < 0 ? -1 : 1;
     return a.len < b.len ? -1 : a.len > b.len;
 }
-lxl_str rt_str_concat(lxl_str a, lxl_str b) {
-    if (b.len == 0) return rt_str_dup(a);
-    if (a.len == 0) return rt_str_dup(b);
-    lxl_str s = rt_str_new((int64_t)a.len + b.len);
-    memcpy(s.p, RT_SP(a), (size_t)a.len);
-    memcpy(s.p + a.len, RT_SP(b), (size_t)b.len);
-    return s;
-}
 /* a + b + c ... (3 to 8 parts, check.lxl xChain): the result sized once, each part copied once.
-   As the nested rt_str_concat: a lone non-empty part is duplicated (a static one shared). */
-static inline lxl_str rt_str_catv(const lxl_str* ps, int n) {
-    int64_t len = 0;
-    int nz = 0, last = 0;
-    for (int i = 0; i < n; i++) {
-        len += ps[i].len;
-        if (ps[i].len) { nz++; last = i; }
+   As the nested rt_str_concat: a lone non-empty part is duplicated (a static one shared).
+   Written out per arity, scalar, reading each part's p and len (never a part as one 16-byte
+   value: the native caller stores a part passed on the stack as two 8-byte words, and a 16-byte
+   load of them cannot be forwarded), and short parts copied inline (opt-experiments.md, 17). */
+static int rt_ndig64(uint64_t w);
+static char* rt_digits64(char* end, uint64_t w);
+/* A part that is an int (check.lxl xChain: x.toStr() or intToStr(x) of an int x): the int in p,
+   len 2 and cap 1, which no string has (an owned one has cap >= len, a static one cap 0). Its
+   text is written straight into the result: no string of its own. The len and cap word is read
+   as one 8-byte load, as the caller stores it (store forwarding). */
+#define RT_IPART ((uint64_t)1 << 32 | 2)
+static inline __attribute__((always_inline)) bool rt_ipart(lxl_str x) {
+    uint64_t w;
+    __builtin_memcpy(&w, (const char*)&x + 8, 8);
+    return w == RT_IPART;
+}
+static inline __attribute__((always_inline)) uint64_t rt_ipart_mag(lxl_str x) {
+    int64_t v = (int64_t)(intptr_t)x.p;
+    return v < 0 ? 0 - (uint64_t)v : (uint64_t)v;
+}
+/* The length of an int part's text. */
+static __attribute__((noinline)) int64_t rt_ipart_len(lxl_str x) {
+    return rt_ndig64(rt_ipart_mag(x)) + ((intptr_t)x.p < 0);
+}
+static inline __attribute__((always_inline)) int64_t rt_part_len(lxl_str x) {
+    return rt_ipart(x) ? rt_ipart_len(x) : (int64_t)x.len;
+}
+/* A part that is not a string of at most 16 bytes, written at q: an int part's text, or a
+   longer string by memcpy; returns the end. */
+static __attribute__((noinline)) char* rt_cat_slow(char* q, lxl_str x) {
+    if (rt_ipart(x)) {
+        int64_t n = rt_ipart_len(x);
+        rt_digits64(q + n, rt_ipart_mag(x));
+        if ((intptr_t)x.p < 0) q[0] = '-';
+        return q + n;
     }
-    if (nz <= 1) return rt_str_dup(ps[last]);
-    lxl_str s = rt_str_new(len);
-    char* q = s.p;
-    for (int i = 0; i < n; i++) {
-        memcpy(q, RT_SP(ps[i]), (size_t)ps[i].len);
-        q += ps[i].len;
+    memcpy(q, RT_SP(x), x.len);
+    return q + x.len;
+}
+/* Part x written at q; returns the end. A string of at most 16 bytes inline: two overlapping
+   8-byte (or 4-byte) copies, or up to 3 single bytes. */
+static inline __attribute__((always_inline)) char* rt_cat_put(char* q, lxl_str x) {
+    uint32_t n = x.len;
+    if (__builtin_expect(n > 16 || rt_ipart(x), 0)) return rt_cat_slow(q, x);
+    const char* p = RT_SP(x);
+    if (n >= 8) {
+        uint64_t u, v;
+        __builtin_memcpy(&u, p, 8);
+        __builtin_memcpy(&v, p + n - 8, 8);
+        __builtin_memcpy(q, &u, 8);
+        __builtin_memcpy(q + n - 8, &v, 8);
+    } else if (n >= 4) {
+        uint32_t u, v;
+        __builtin_memcpy(&u, p, 4);
+        __builtin_memcpy(&v, p + n - 4, 4);
+        __builtin_memcpy(q, &u, 4);
+        __builtin_memcpy(q + n - 4, &v, 4);
+    } else if (n) {
+        q[0] = p[0];
+        q[n / 2] = p[n / 2];
+        q[n - 1] = p[n - 1];
     }
+    return q + n;
+}
+/* The rare case of at most one non-empty part, out of line. */
+static __attribute__((noinline, cold)) lxl_str rt_cat_lone(lxl_str x) {
+    return rt_ipart(x) ? rt_int_to_str((int64_t)(intptr_t)x.p) : rt_str_dup(x);
+}
+/* a + b; either may be an int part (a chain of + joined early to two parts, check.lxl xChain). */
+lxl_str rt_str_concat(lxl_str a, lxl_str b) {
+    if (b.len == 0) return rt_cat_lone(a);
+    if (a.len == 0) return rt_cat_lone(b);
+    lxl_str s = rt_str_new(rt_part_len(a) + rt_part_len(b));
+    rt_cat_put(rt_cat_put(s.p, a), b);
     return s;
 }
 lxl_str rt_str_concat3(lxl_str a, lxl_str b, lxl_str c) {
-    lxl_str ps[3] = {a, b, c};
-    return rt_str_catv(ps, 3);
+    if (__builtin_expect((a.len != 0) + (b.len != 0) + (c.len != 0) <= 1, 0)) { if (a.len) return rt_cat_lone(a); if (b.len) return rt_cat_lone(b); return rt_cat_lone(c); }
+    lxl_str s = rt_str_new(rt_part_len(a) + rt_part_len(b) + rt_part_len(c));
+    char* q = s.p;
+    q = rt_cat_put(q, a);
+    q = rt_cat_put(q, b);
+    q = rt_cat_put(q, c);
+    return s;
 }
 lxl_str rt_str_concat4(lxl_str a, lxl_str b, lxl_str c, lxl_str d) {
-    lxl_str ps[4] = {a, b, c, d};
-    return rt_str_catv(ps, 4);
+    if (__builtin_expect((a.len != 0) + (b.len != 0) + (c.len != 0) + (d.len != 0) <= 1, 0)) { if (a.len) return rt_cat_lone(a); if (b.len) return rt_cat_lone(b); if (c.len) return rt_cat_lone(c); return rt_cat_lone(d); }
+    lxl_str s = rt_str_new(rt_part_len(a) + rt_part_len(b) + rt_part_len(c) + rt_part_len(d));
+    char* q = s.p;
+    q = rt_cat_put(q, a);
+    q = rt_cat_put(q, b);
+    q = rt_cat_put(q, c);
+    q = rt_cat_put(q, d);
+    return s;
 }
 lxl_str rt_str_concat5(lxl_str a, lxl_str b, lxl_str c, lxl_str d, lxl_str e) {
-    lxl_str ps[5] = {a, b, c, d, e};
-    return rt_str_catv(ps, 5);
+    if (__builtin_expect((a.len != 0) + (b.len != 0) + (c.len != 0) + (d.len != 0) + (e.len != 0) <= 1, 0)) { if (a.len) return rt_cat_lone(a); if (b.len) return rt_cat_lone(b); if (c.len) return rt_cat_lone(c); if (d.len) return rt_cat_lone(d); return rt_cat_lone(e); }
+    lxl_str s = rt_str_new(rt_part_len(a) + rt_part_len(b) + rt_part_len(c) + rt_part_len(d) + rt_part_len(e));
+    char* q = s.p;
+    q = rt_cat_put(q, a);
+    q = rt_cat_put(q, b);
+    q = rt_cat_put(q, c);
+    q = rt_cat_put(q, d);
+    q = rt_cat_put(q, e);
+    return s;
 }
 lxl_str rt_str_concat6(lxl_str a, lxl_str b, lxl_str c, lxl_str d, lxl_str e, lxl_str f) {
-    lxl_str ps[6] = {a, b, c, d, e, f};
-    return rt_str_catv(ps, 6);
+    if (__builtin_expect((a.len != 0) + (b.len != 0) + (c.len != 0) + (d.len != 0) + (e.len != 0) + (f.len != 0) <= 1, 0)) { if (a.len) return rt_cat_lone(a); if (b.len) return rt_cat_lone(b); if (c.len) return rt_cat_lone(c); if (d.len) return rt_cat_lone(d); if (e.len) return rt_cat_lone(e); return rt_cat_lone(f); }
+    lxl_str s = rt_str_new(rt_part_len(a) + rt_part_len(b) + rt_part_len(c) + rt_part_len(d) + rt_part_len(e) + rt_part_len(f));
+    char* q = s.p;
+    q = rt_cat_put(q, a);
+    q = rt_cat_put(q, b);
+    q = rt_cat_put(q, c);
+    q = rt_cat_put(q, d);
+    q = rt_cat_put(q, e);
+    q = rt_cat_put(q, f);
+    return s;
 }
 lxl_str rt_str_concat7(lxl_str a, lxl_str b, lxl_str c, lxl_str d, lxl_str e, lxl_str f, lxl_str g) {
-    lxl_str ps[7] = {a, b, c, d, e, f, g};
-    return rt_str_catv(ps, 7);
+    if (__builtin_expect((a.len != 0) + (b.len != 0) + (c.len != 0) + (d.len != 0) + (e.len != 0) + (f.len != 0) + (g.len != 0) <= 1, 0)) { if (a.len) return rt_cat_lone(a); if (b.len) return rt_cat_lone(b); if (c.len) return rt_cat_lone(c); if (d.len) return rt_cat_lone(d); if (e.len) return rt_cat_lone(e); if (f.len) return rt_cat_lone(f); return rt_cat_lone(g); }
+    lxl_str s = rt_str_new(rt_part_len(a) + rt_part_len(b) + rt_part_len(c) + rt_part_len(d) + rt_part_len(e) + rt_part_len(f) + rt_part_len(g));
+    char* q = s.p;
+    q = rt_cat_put(q, a);
+    q = rt_cat_put(q, b);
+    q = rt_cat_put(q, c);
+    q = rt_cat_put(q, d);
+    q = rt_cat_put(q, e);
+    q = rt_cat_put(q, f);
+    q = rt_cat_put(q, g);
+    return s;
 }
 lxl_str rt_str_concat8(lxl_str a, lxl_str b, lxl_str c, lxl_str d, lxl_str e, lxl_str f, lxl_str g, lxl_str h) {
-    lxl_str ps[8] = {a, b, c, d, e, f, g, h};
-    return rt_str_catv(ps, 8);
+    if (__builtin_expect((a.len != 0) + (b.len != 0) + (c.len != 0) + (d.len != 0) + (e.len != 0) + (f.len != 0) + (g.len != 0) + (h.len != 0) <= 1, 0)) { if (a.len) return rt_cat_lone(a); if (b.len) return rt_cat_lone(b); if (c.len) return rt_cat_lone(c); if (d.len) return rt_cat_lone(d); if (e.len) return rt_cat_lone(e); if (f.len) return rt_cat_lone(f); if (g.len) return rt_cat_lone(g); return rt_cat_lone(h); }
+    lxl_str s = rt_str_new(rt_part_len(a) + rt_part_len(b) + rt_part_len(c) + rt_part_len(d) + rt_part_len(e) + rt_part_len(f) + rt_part_len(g) + rt_part_len(h));
+    char* q = s.p;
+    q = rt_cat_put(q, a);
+    q = rt_cat_put(q, b);
+    q = rt_cat_put(q, c);
+    q = rt_cat_put(q, d);
+    q = rt_cat_put(q, e);
+    q = rt_cat_put(q, f);
+    q = rt_cat_put(q, g);
+    q = rt_cat_put(q, h);
+    return s;
 }
 /* s += b on an owned string (design/consistency.md): appended in place when the buffer has room,
    else into a new buffer of at least twice the capacity, so n appends cost O(total length). A b
@@ -1488,6 +1584,22 @@ static const char rt_dig2[201] =
     "4041424344454647484950515253545556575859"
     "6061626364656667686970717273747576777879"
     "8081828384858687888990919293949596979899";
+/* The decimal digits of w, written backwards before end; returns the first: two digits per
+   division by 100 (a constant divisor: a multiply). */
+static __attribute__((noinline)) char* rt_digits64(char* end, uint64_t w) {
+    for (; w >= 100; w /= 100) {
+        const char* p = rt_dig2 + 2 * (w % 100);
+        *--end = p[1];
+        *--end = p[0];
+    }
+    if (w >= 10) {
+        *--end = rt_dig2[2 * w + 1];
+        *--end = rt_dig2[2 * w];
+    } else {
+        *--end = (char)('0' + (int)w);
+    }
+    return end;
+}
 /* The decimal digits of v, written backwards before end; returns the first. Above 2^64, 19 digits
    at a time from the remainder of a division by 10^19; then 64-bit loops, two digits per division
    by 100 (a constant divisor: a multiply). */
@@ -1501,19 +1613,7 @@ static char* rt_digits(char* end, u128 v) {
         }
         *--end = (char)('0' + (int)r);
     }
-    uint64_t w = (uint64_t)v;
-    for (; w >= 100; w /= 100) {
-        const char* p = rt_dig2 + 2 * (w % 100);
-        *--end = p[1];
-        *--end = p[0];
-    }
-    if (w >= 10) {
-        *--end = rt_dig2[2 * w + 1];
-        *--end = rt_dig2[2 * w];
-    } else {
-        *--end = (char)('0' + (int)w);
-    }
-    return end;
+    return rt_digits64(end, (uint64_t)v);
 }
 /* The number of decimal digits of w (1 for 0): its bit length times log10(2) (1233 / 4096) is
    the number of digits or one less, and one compare with a power of ten settles which. */
@@ -1544,7 +1644,14 @@ static lxl_str rt_mag_to_str(u128 v, bool neg) {
 }
 lxl_str rt_u128_to_str(u128 v) { return rt_mag_to_str(v, false); }
 lxl_str rt_i128_to_str(i128 v) { return rt_mag_to_str(v < 0 ? (u128)0 - (u128)v : (u128)v, v < 0); }
-lxl_str rt_int_to_str(int64_t v) { return rt_i128_to_str(v); }
+lxl_str rt_int_to_str(int64_t v) {
+    uint64_t m = v < 0 ? 0 - (uint64_t)v : (uint64_t)v;
+    int n = rt_ndig64(m) + (v < 0);
+    lxl_str s = rt_str_new(n);
+    rt_digits64(s.p + n, m);
+    if (v < 0) s.p[0] = '-';
+    return s;
+}
 lxl_str rt_u64_to_str(uint64_t v) { return rt_u128_to_str(v); }
 
 /* ------------------------------------------------------------ floats

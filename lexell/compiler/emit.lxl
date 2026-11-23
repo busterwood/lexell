@@ -867,6 +867,76 @@ fn (e: mut &Emitter) rest(t: int): []int {
     return out
 }
 
+// A drop action that pushes itself (a chain type: a list's next node, a tree's children) loops on
+// the last of those pushes instead: that action is the next to run when this one returns (the
+// stack is LIFO, rt_drun), so running it from the top in a loop keeps every drop and free in its
+// order and saves a push, a pop and an indirect call per node. Each push of itself is held in nx
+// and pushed only when another push follows it; what is held at the end is looped on:
+//     while (1) { void* nx = 0; ...  if (nx) rt_dpush(self, nx); nx = X;  ...
+//                 if (nx) { rt_dpush(self, nx); nx = 0; } rt_dpush(other, Y);  ...
+//                 if (!nx) break; p = nx; }
+// Only when every push is a statement of the body itself (not inside a loop of it).
+fn (e: mut &Emitter) selfLoop(n: &str, body: []int): []int {
+    var selfs = 0
+    var nested = false
+    for ln in body {
+        let k = e.pushOf(ln, n)
+        if k == 1 { selfs += 1 }
+        if k == 0 && e.mentions(ln, "rt_dpush") { nested = true }
+    }
+    if selfs == 0 || nested { return body }
+    let nx = e.nm("nx")
+    let flush = e.c.x.if1(nx, e.callS("rt_dpush", [e.nm(n), e.nm("nx")]))
+    var out: []int = [e.c.x.swhile(e.c.x.lit(1)), e.c.x.decl(e.ct("void*"), "nx", e.c.x.lit(0))]
+    for ln in body {
+        let k = e.pushOf(ln, n)
+        if k == 1 {
+            append(mut &out, flush)
+            let arg = e.c.x.listAt(e.c.x.nodes[e.c.x.nodes[ln].a].l, 1)
+            append(mut &out, e.c.x.sx(e.c.x.asg(e.nm("nx"), arg)))
+        } else if k == 2 {
+            append(mut &out, e.c.x.sif(e.nm("nx")))
+            append(mut &out, e.callS("rt_dpush", [e.nm(n), e.nm("nx")]))
+            append(mut &out, e.c.x.sx(e.c.x.asg(e.nm("nx"), e.c.x.lit(0))))
+            append(mut &out, e.c.x.send())
+            append(mut &out, ln)
+        } else {
+            append(mut &out, ln)
+        }
+    }
+    append(mut &out, e.c.x.if1(e.c.x.pre("!", e.nm("nx")), e.c.x.sbreak()))
+    append(mut &out, e.c.x.sx(e.c.x.asg(e.nm("p"), e.nm("nx"))))
+    append(mut &out, e.c.x.send())
+    return out
+}
+
+// Whether line ln is `rt_dpush(f, x);`: 1 when f is self, 2 another, else 0.
+fn (e: &Emitter) pushOf(ln: int, me: &str): int {
+    let x = &e.c.x
+    if x.k(ln) != tm.Z_EXPR { return 0 }
+    let c = x.nodes[ln].a
+    if c < 0 || x.k(c) != tm.X_CALL || x.k(x.nodes[c].a) != tm.X_NAME || x.nodes[x.nodes[c].a].s != "rt_dpush" { return 0 }
+    let f = x.listAt(x.nodes[c].l, 0)
+    return if x.k(f) == tm.X_NAME && x.nodes[f].s == me { 1 } else { 2 }
+}
+
+// Whether node m (a statement or expression) names name anywhere.
+fn (e: &Emitter) mentions(m: int, name: &str): bool {
+    if m < 0 { return false }
+    let x = &e.c.x
+    let nd = &x.nodes[m]
+    if nd.k == tm.X_NAME && nd.s == name { return true }
+    if nd.k == tm.X_HOLE { return false }
+    if e.mentions(nd.a, name) || e.mentions(nd.b, name) || e.mentions(nd.c, name) { return true }
+    if nd.k == tm.Z_FOR1 && e.mentions(nd.v, name) { return true }
+    if nd.l >= 0 {
+        for j in 0..x.listLen(nd.l) {
+            if e.mentions(x.listAt(nd.l, j), name) { return true }
+        }
+    }
+    return false
+}
+
 fn (e: mut &Emitter) glueFn(kind: int, t: int): str {
     let key = t * 16 + kind
     if !e.glue.has(&key) {
@@ -958,6 +1028,7 @@ fn (e: mut &Emitter) makeGlue(kind: int, t: int) {
         if kind == G_DROP {
             e.define(&n, "void", [ct], ["v"], body, -1)
         } else {
+            if kind == G_ACT { body = e.selfLoop(&n, body) }
             e.define(&n, "void", ["void*"], ["p"], body, -1)
         }
         return
