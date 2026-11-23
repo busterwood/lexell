@@ -73,8 +73,7 @@ real
 - `real` arithmetic is done as `float`: `CAST(1 AS real) / 3` is 0.3333333333333333, where SQL Server gives
   0.33333334. A `real` column keeps the 4-byte value.
 - `DATALENGTH` of a number gives sizes that are not SQL Server's (4 for a `tinyint`, 0 for a `real`).
-- `CAST('yes' AS bit)` is 1, not error 245. A string that fails to convert to an integer is 245, but its text may
-  name `bigint` where SQL Server names `int`.
+- `CAST('yes' AS bit)` is 1, not error 245.
 - `SQRT(-1)` is error 50000 (`cannot take square root of a negative number`; SQL Server: 3623 or NULL by session
   setting), and a `float` overflow such as `1e308 * 10` is 8115 with a long message.
 
@@ -298,7 +297,7 @@ x  y  z      w
 (1 row affected)
 
 Msg 245, Level 16, State 1, Line 1
-invalid input syntax for type integer: "abc"
+Conversion failed when converting the varchar value 'abc' to data type int.
 ```
 
 ### J. The decimal quotient under +
