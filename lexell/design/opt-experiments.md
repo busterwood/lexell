@@ -1262,3 +1262,38 @@ Test: tests/run/native_jump_threading: a match in a loop whose cases end in jump
 back to the top, nested loops with break and continue, if chains whose branches all end in
 jumps to one place, and returns from a loop. It runs on --c, --native and -O, and the expected
 output is the previous compiler's.
+
+## 31. Division by constants (Hacker's Delight ch. 10): counted, not built
+
+The native backend divides by every constant with `div`/`idiv`, powers of two included: `x / 2`,
+`x % 8` and `x / 4096` each run a full divide. gcc, LLVM and Rust use a shift with a sign
+correction for those, and a multiply by a reciprocal for other constants. The sources hold about
+650 divisions by literals that are not powers of two (lexdb's date, time and number code: `% 60`,
+`/ 1000000`, `/ 10`) and about 170 by 2 and 8.
+
+**The count** (`ex_div_count` and `ex_div_busy`, the cycles the divider is busy, user mode,
+CPU 2):
+
+| workload | divides | divider busy (share of cycles) |
+|---|---:|---:|
+| compile of the compiler | 122,521 | 0.04% |
+| json / jq / cmark / regex | 19 / 470 / 5,029 / 11,929 | 0.00 / 0.00 / 0.01 / 0.06% |
+| tokens, maps, sort, eza, grep -n | 0 to 318 each | 0.00% |
+| lexdb server, TPC-H SF1 q1-q22 (q18 stopped by max_statement_mem) | 12,962,198 | 0.30% |
+| decimal (all cases) | 119,319,693 | 15.4% |
+
+**Reading.** Outside decimal the ceiling is 0.3% of TPC-H, below "Judging a pass". decimal's
+divides are mostly by variable divisors: `quantize`'s `ac / pow10(k)` and `ac % pow10(k)`, where
+the divisor comes from a table. Its constant ones are `makeDec`'s `x % 10 == 0`, which guards the
+trailing-zero strip.
+
+**The guard tried without.** The strip loop itself already tests divisibility by 10 with the
+inverse of 5 (`INV5`, Granlund and Montgomery). Removing the `% 10` guard, at both sites, cost
++0.59% instructions and +0.82% cycles over the decimal cases, up to +8 to +10% on M6. For a value
+that is not a multiple of 10, the two divides of the guard cost less than the 128-bit multiply.
+The guard stays.
+
+A compiler pass is worth revisiting if a hot loop divides by a constant. The pass would cover
+powers of two by shifts, others by multiply-high, and `x % d == 0` by the inverse. For decimal,
+the lever is `quantize`'s division by a power of ten from a table: a library change
+(decimal-perf-research.md), not this pass.
