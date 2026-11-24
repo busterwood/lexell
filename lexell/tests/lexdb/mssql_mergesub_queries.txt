@@ -1,0 +1,65 @@
+# MERGE's subqueries read the rows as the statement found them (lexdb-robust.md, "MERGE's subqueries"), against SQL Server 2022 (gen_mssql.py ... mergesub):
+# in an UPDATE's SET, a WHEN condition, DELETE, an INSERT's values, WHEN NOT MATCHED BY SOURCE, correlated and not, a source that is the target, NULLs,
+# empty and duplicate sources, text keys, an error in a later row; OUTPUT takes no subquery (10705). Each batch runs with lexdb_batch off and on.
+
+@once CREATE TABLE emp (id int PRIMARY KEY, mgr_id int, salary int)
+@once INSERT INTO emp VALUES (1, NULL, 100), (2, 1, 200), (3, 2, 300), (4, 3, 400)
+@once CREATE TABLE tk (k varchar(10) PRIMARY KEY, v int)
+@once INSERT INTO tk VALUES ('a', 1), ('b', 2), ('c', 3)
+
+# an UPDATE's SET
+BEGIN TRAN; MERGE emp e USING (VALUES (2), (3), (4)) s(id) ON e.id = s.id WHEN MATCHED THEN UPDATE SET salary = (SELECT x.salary + 1 FROM emp x WHERE x.id = e.mgr_id); SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; MERGE emp e USING (SELECT id FROM emp) s ON e.id = s.id WHEN MATCHED THEN UPDATE SET salary = (SELECT SUM(salary) FROM emp); SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (1), (2), (3), (4)) s(id) ON e.id = s.id WHEN MATCHED THEN UPDATE SET salary = salary + (SELECT COUNT(*) FROM emp x WHERE x.salary > e.salary); SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; MERGE emp e USING emp s ON e.id = s.id + 1 WHEN MATCHED THEN UPDATE SET salary = (SELECT x.salary FROM emp x WHERE x.id = s.id); SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; MERGE emp e USING (SELECT id, (SELECT MAX(salary) FROM emp) m FROM emp WHERE id < 3) s ON e.id = s.id WHEN MATCHED THEN UPDATE SET salary = s.m + (SELECT COUNT(*) FROM emp); SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+
+# a WHEN condition
+BEGIN TRAN; MERGE emp e USING (VALUES (2), (3), (4)) s(id) ON e.id = s.id WHEN MATCHED AND (SELECT x.salary FROM emp x WHERE x.id = e.mgr_id) < 300 THEN UPDATE SET salary = salary + 1000; SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (2), (3), (4)) s(id) ON e.id = s.id WHEN MATCHED AND e.salary > (SELECT MIN(salary) FROM emp) THEN DELETE; SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (2), (3), (4)) s(id) ON e.id = s.id WHEN MATCHED AND EXISTS (SELECT 1 FROM emp x WHERE x.mgr_id = e.id) THEN DELETE WHEN MATCHED AND (SELECT COUNT(*) FROM emp) > 3 THEN UPDATE SET salary = 0; SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (2), (3), (4), (5)) s(id) ON e.id = s.id WHEN MATCHED AND e.salary > 250 THEN UPDATE SET salary = (SELECT COUNT(*) FROM emp) WHEN NOT MATCHED AND (SELECT COUNT(*) FROM emp) < 5 THEN INSERT (id, salary) VALUES (s.id, (SELECT COUNT(*) FROM emp)); SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+
+# INSERT's values
+BEGIN TRAN; MERGE emp e USING (VALUES (5), (6), (7)) s(id) ON e.id = s.id WHEN NOT MATCHED THEN INSERT (id, salary) VALUES (s.id, (SELECT COUNT(*) FROM emp)); SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (5), (6), (7)) s(id) ON e.id = s.id WHEN NOT MATCHED THEN INSERT (id, salary) VALUES (s.id, (SELECT COUNT(*) FROM emp x WHERE x.id < s.id)); SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (5), (1), (7)) s(id) ON e.id = s.id WHEN MATCHED THEN UPDATE SET salary = (SELECT COUNT(*) FROM emp) WHEN NOT MATCHED THEN INSERT (id, salary) VALUES (s.id, (SELECT COUNT(*) FROM emp)); SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (5), (6), (7), (2)) s(id) ON e.id = s.id WHEN MATCHED THEN UPDATE SET salary = (SELECT COUNT(*) FROM emp x WHERE x.id <= s.id + 3) WHEN NOT MATCHED THEN INSERT (id, salary) VALUES (s.id, (SELECT COUNT(*) FROM emp x WHERE x.id <= s.id)); SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+
+# WHEN NOT MATCHED BY SOURCE
+BEGIN TRAN; MERGE emp e USING (VALUES (2), (9)) s(id) ON e.id = s.id WHEN NOT MATCHED BY SOURCE THEN UPDATE SET salary = (SELECT COUNT(*) FROM emp x WHERE x.salary >= e.salary); SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (2), (9)) s(id) ON e.id = s.id WHEN NOT MATCHED BY SOURCE AND e.salary > (SELECT MIN(salary) FROM emp) THEN DELETE WHEN NOT MATCHED BY TARGET THEN INSERT (id, salary) VALUES (s.id, (SELECT COUNT(*) FROM emp)); SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+
+# OUTPUT: no subquery there; $action and the rows as they were
+BEGIN TRAN; MERGE emp e USING (VALUES (5), (6)) s(id) ON e.id = s.id WHEN NOT MATCHED THEN INSERT (id, salary) VALUES (s.id, (SELECT COUNT(*) FROM emp)) OUTPUT inserted.id, (SELECT COUNT(*) FROM emp); ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (5), (6)) s(id) ON e.id = s.id WHEN NOT MATCHED THEN INSERT (id, salary) VALUES (s.id, (SELECT COUNT(*) FROM emp x WHERE x.id < s.id)) OUTPUT $action, inserted.id, inserted.salary; ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (2), (3), (4)) s(id) ON e.id = s.id WHEN MATCHED THEN UPDATE SET salary = (SELECT x.salary + 1 FROM emp x WHERE x.id = e.mgr_id) OUTPUT deleted.id, deleted.salary, inserted.salary; ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (2), (3), (4)) s(id) ON e.id = s.id WHEN MATCHED AND EXISTS (SELECT 1 FROM emp x WHERE x.mgr_id = e.id) THEN DELETE OUTPUT deleted.id, $action; ROLLBACK
+
+BEGIN TRAN; UPDATE emp SET salary = 1 OUTPUT inserted.id, (SELECT COUNT(*) FROM emp) WHERE id = 1; ROLLBACK
+BEGIN TRAN; DELETE FROM emp OUTPUT deleted.id, CASE WHEN EXISTS (SELECT 1 FROM emp x WHERE x.mgr_id = deleted.id) THEN 1 ELSE 0 END WHERE id = 1; ROLLBACK
+BEGIN TRAN; INSERT INTO emp (id, salary) OUTPUT inserted.id, inserted.salary + (SELECT 1) VALUES (9, 9); ROLLBACK
+BEGIN TRAN; UPDATE emp SET salary = (SELECT 5) OUTPUT inserted.id, inserted.salary WHERE id IN (SELECT 1); ROLLBACK
+
+# NULLs, empty and duplicate sources
+BEGIN TRAN; MERGE emp e USING (VALUES (1), (2)) s(id) ON e.id = s.id WHEN MATCHED THEN UPDATE SET salary = (SELECT x.salary FROM emp x WHERE x.id = e.mgr_id); SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; MERGE emp e USING (SELECT 1 WHERE 1 = 0) s(id) ON e.id = s.id WHEN MATCHED THEN UPDATE SET salary = (SELECT COUNT(*) FROM emp) WHEN NOT MATCHED THEN INSERT (id) VALUES (s.id); SELECT @@ROWCOUNT; ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (2), (NULL), (4)) s(id) ON e.id = s.id WHEN MATCHED THEN UPDATE SET salary = (SELECT COUNT(*) FROM emp) WHEN NOT MATCHED THEN INSERT (id, salary) VALUES (ISNULL(s.id, 99), (SELECT COUNT(*) FROM emp)); SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (2), (2)) s(id) ON e.id = s.id WHEN MATCHED THEN UPDATE SET salary = (SELECT COUNT(*) FROM emp); ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (2), (2)) s(id) ON e.id = s.id WHEN MATCHED AND (SELECT COUNT(*) FROM emp) > 3 THEN DELETE; SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+
+# text keys
+BEGIN TRAN; MERGE tk t USING (VALUES ('a'), ('b'), ('z')) s(k) ON t.k = s.k WHEN MATCHED THEN UPDATE SET v = (SELECT SUM(v) FROM tk) WHEN NOT MATCHED THEN INSERT (k, v) VALUES (s.k, (SELECT COUNT(*) FROM tk)); SELECT k, v FROM tk ORDER BY k; ROLLBACK
+BEGIN TRAN; MERGE tk t USING (VALUES ('a'), ('c')) s(k) ON t.k = s.k WHEN MATCHED AND (SELECT MAX(v) FROM tk x WHERE x.k <> t.k) > 2 THEN DELETE; SELECT k, v FROM tk ORDER BY k; ROLLBACK
+
+# errors: in a later row, and from a write after a subquery
+BEGIN TRAN; MERGE emp e USING (VALUES (2), (3), (4)) s(id) ON e.id = s.id WHEN MATCHED THEN UPDATE SET salary = (SELECT 1 / (x.salary - 300) FROM emp x WHERE x.id = e.id); ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (2), (3), (4)) s(id) ON e.id = s.id WHEN MATCHED AND (SELECT 1 / (x.salary - 300) FROM emp x WHERE x.id = e.id) > 0 THEN DELETE; ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (5), (5)) s(id) ON e.id = s.id WHEN NOT MATCHED THEN INSERT (id, salary) VALUES (s.id, (SELECT COUNT(*) FROM emp)); ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (2)) s(id) ON e.id = s.id WHEN MATCHED THEN UPDATE SET salary = (SELECT salary FROM emp WHERE id > 1); ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (2)) s(id) ON e.id = s.id WHEN MATCHED THEN UPDATE SET salary = (SELECT salary FROM emp WHERE id > 5); SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+
+# TOP and the plain forms
+BEGIN TRAN; MERGE TOP (2) emp e USING (VALUES (2), (3), (4)) s(id) ON e.id = s.id WHEN MATCHED THEN UPDATE SET salary = (SELECT COUNT(*) FROM emp x WHERE x.salary >= e.salary); SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (2), (3)) s(id) ON e.id = s.id WHEN MATCHED THEN UPDATE SET salary = e.salary + s.id; SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; MERGE emp e USING (VALUES (2), (6)) s(id) ON e.id = s.id WHEN MATCHED THEN UPDATE SET salary = 0 WHEN NOT MATCHED THEN INSERT (id, salary) VALUES (s.id, 9) OUTPUT inserted.id, inserted.salary; ROLLBACK

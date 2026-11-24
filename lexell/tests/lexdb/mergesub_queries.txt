@@ -1,0 +1,64 @@
+# MERGE's subqueries read the rows as the statement found them (lexdb-robust.md, "MERGE's subqueries"), against PostgreSQL 19 (gen_pg.py ... mergesub):
+# in an UPDATE's SET, a WHEN condition, DELETE, an INSERT's values and RETURNING, correlated and not, a source that is the target, NULLs, empty and
+# duplicate sources, text keys, an error in a later row. Each answer with its columns' names; each query runs with lexdb_batch off and on
+# ("@once" lines once, "@tx" ones in a transaction rolled back).
+
+@once create table emp (id int primary key, mgr_id int, salary int)
+@once insert into emp values (1, null, 100), (2, 1, 200), (3, 2, 300), (4, 3, 400)
+@once create table tk (k text primary key, v int)
+@once insert into tk values ('a', 1), ('b', 2), ('c', 3)
+
+# an UPDATE's SET: the rows as the statement found them
+@tx merge into emp e using (values (2), (3), (4)) s(id) on e.id = s.id when matched then update set salary = (select x.salary + 1 from emp x where x.id = e.mgr_id); select id, salary from emp order by id
+@tx merge into emp e using (values (2), (3), (4)) s(id) on e.id = s.id when matched then update set salary = (select x.salary + 1 from emp x where x.id = e.mgr_id) returning e.id, e.salary
+@tx merge into emp e using (select id from emp) s on e.id = s.id when matched then update set salary = (select sum(salary) from emp); select id, salary from emp order by id
+@tx merge into emp e using (values (1), (2), (3), (4)) s(id) on e.id = s.id when matched then update set salary = salary + (select count(*) from emp x where x.salary > e.salary); select id, salary from emp order by id
+@tx merge into emp e using emp s on e.id = s.id + 1 when matched then update set salary = (select x.salary from emp x where x.id = s.id); select id, salary from emp order by id
+@tx merge into emp e using (select id, (select max(salary) from emp) m from emp where id < 3) s on e.id = s.id when matched then update set salary = s.m + (select count(*) from emp); select id, salary from emp order by id
+
+# a WHEN condition
+@tx merge into emp e using (values (2), (3), (4)) s(id) on e.id = s.id when matched and (select x.salary from emp x where x.id = e.mgr_id) < 300 then update set salary = salary + 1000; select id, salary from emp order by id
+@tx merge into emp e using (values (2), (3), (4)) s(id) on e.id = s.id when matched and e.salary > (select min(salary) from emp) then delete; select id, salary from emp order by id
+@tx merge into emp e using (values (2), (3), (4)) s(id) on e.id = s.id when matched and exists (select 1 from emp x where x.mgr_id = e.id) then delete when matched and (select count(*) from emp) > 3 then update set salary = 0; select id, salary from emp order by id
+@tx merge into emp e using (values (2), (3), (4), (5)) s(id) on e.id = s.id when matched and e.salary > 250 then update set salary = (select count(*) from emp) when not matched and (select count(*) from emp) < 5 then insert (id, salary) values (s.id, (select count(*) from emp)); select id, salary from emp order by id
+
+# INSERT's values
+@tx merge into emp e using (values (5), (6), (7)) s(id) on e.id = s.id when not matched then insert (id, salary) values (s.id, (select count(*) from emp)); select id, salary from emp order by id
+@tx merge into emp e using (values (5), (6), (7)) s(id) on e.id = s.id when not matched then insert (id, mgr_id, salary) values (s.id, (select max(id) from emp), (select sum(salary) from emp)); select id, mgr_id, salary from emp order by id
+@tx merge into emp e using (values (5), (1), (7)) s(id) on e.id = s.id when matched then update set salary = (select count(*) from emp) when not matched then insert (id, salary) values (s.id, (select count(*) from emp)); select id, salary from emp order by id
+
+@tx merge into emp e using (values (5), (6), (7)) s(id) on e.id = s.id when not matched then insert (id, salary) values (s.id, (select count(*) from emp x where x.id < s.id)); select id, salary from emp order by id
+@tx merge into emp e using (values (5), (6), (7), (2)) s(id) on e.id = s.id when matched then update set salary = (select count(*) from emp x where x.id <= s.id + 3) when not matched then insert (id, salary) values (s.id, (select count(*) from emp x where x.id <= s.id)); select id, salary from emp order by id
+
+# RETURNING
+@tx merge into emp e using (values (5), (6), (7)) s(id) on e.id = s.id when not matched then insert (id, salary) values (s.id, 1) returning e.id, (select count(*) from emp x where x.id <= e.id) as c
+@tx merge into emp e using (values (2), (3), (4)) s(id) on e.id = s.id when matched then update set salary = 0 returning e.id, e.salary, (select count(*) from emp x where x.salary = 0 or x.id < e.id) as c
+@tx merge into emp e using (values (2), (3), (4)) s(id) on e.id = s.id when matched then delete returning e.id, (select count(*) from emp x where x.id >= e.id) as c
+@tx merge into emp e using (values (5), (6), (7)) s(id) on e.id = s.id when not matched then insert (id, salary) values (s.id, 1) returning e.id, e.salary, (select count(*) from emp) as c
+@tx merge into emp e using (values (2), (3), (4)) s(id) on e.id = s.id when matched then update set salary = salary + 1 returning e.id, e.salary, (select count(*) from emp x where x.salary = 201) as c
+@tx merge into emp e using (values (2), (3), (4)) s(id) on e.id = s.id when matched and exists (select 1 from emp x where x.mgr_id = e.id) then delete returning e.id, (select count(*) from emp) as c
+@tx merge into emp e using (values (3), (5)) s(id) on e.id = s.id when matched then delete when not matched then insert (id, salary) values (s.id, 0) returning e.id, (select count(*) from emp) as c, merge_action() as act
+
+# NULLs, empty and duplicate sources
+@tx merge into emp e using (values (1), (2)) s(id) on e.id = s.id when matched then update set salary = (select x.salary from emp x where x.id = e.mgr_id); select id, salary from emp order by id
+@tx merge into emp e using (select 1 where false) s(id) on e.id = s.id when matched then update set salary = (select count(*) from emp) when not matched then insert (id) values (s.id)
+@tx merge into emp e using (values (2), (null), (4)) s(id) on e.id = s.id when matched then update set salary = (select count(*) from emp) when not matched then insert (id, salary) values (coalesce(s.id, 99), (select count(*) from emp)); select id, salary from emp order by id
+@tx merge into emp e using (values (2), (2)) s(id) on e.id = s.id when matched then update set salary = (select count(*) from emp)
+@tx merge into emp e using (values (2), (2)) s(id) on e.id = s.id when matched then delete returning e.id, (select count(*) from emp)
+
+# text keys
+@tx merge into tk t using (values ('a'), ('b'), ('z')) s(k) on t.k = s.k when matched then update set v = (select sum(v) from tk) when not matched then insert (k, v) values (s.k, (select count(*) from tk)); select k, v from tk order by k
+@tx merge into tk t using (values ('a'), ('c')) s(k) on t.k = s.k when matched and (select max(v) from tk x where x.k <> t.k) > 2 then delete; select k, v from tk order by k
+
+# errors: in a later row, and from a write after a subquery
+@tx merge into emp e using (values (2), (3), (4)) s(id) on e.id = s.id when matched then update set salary = (select 1 / (x.salary - 300) from emp x where x.id = e.id)
+@tx merge into emp e using (values (2), (3), (4)) s(id) on e.id = s.id when matched and (select 1 / (x.salary - 300) from emp x where x.id = e.id) > 0 then delete
+@tx merge into emp e using (values (5), (5)) s(id) on e.id = s.id when not matched then insert (id, salary) values (s.id, (select count(*) from emp))
+@tx merge into emp e using (values (2), (3)) s(id) on e.id = s.id when matched then update set id = e.id + (select count(*) from emp x where x.id = 4)
+@tx merge into emp e using (values (5), (6)) s(id) on e.id = s.id when not matched then insert (id, salary) values (s.id, (select count(*) from emp)) returning e.id, e.salary
+@tx merge into emp e using (values (2)) s(id) on e.id = s.id when matched then update set salary = (select salary from emp where id > 1)
+@tx merge into emp e using (values (2)) s(id) on e.id = s.id when matched then update set salary = (select salary from emp where id > 5)
+
+# the plain forms still work
+@tx merge into emp e using (values (2), (3)) s(id) on e.id = s.id when matched then update set salary = e.salary + s.id; select id, salary from emp order by id
+@tx merge into emp e using (values (2), (6)) s(id) on e.id = s.id when matched then update set salary = 0 when not matched then insert (id, salary) values (s.id, 9) returning e.id, e.salary
