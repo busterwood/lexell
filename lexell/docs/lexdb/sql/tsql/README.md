@@ -41,7 +41,7 @@ This index lists everything the door takes today. Pages not written yet are list
 | Statement | What it does |
 |---|---|
 | [CREATE TABLE](create-table.md) | `IDENTITY(s, i)`, computed columns, constraints, `#temp` tables. |
-| [ALTER TABLE](alter-table.md), [DROP TABLE](drop-table.md) | |
+| [ALTER TABLE](alter-table.md), [DROP TABLE](drop-table.md) | Columns and constraints; `WITH NOCHECK`, `NOCHECK CONSTRAINT`, `CHECK CONSTRAINT`. |
 | [CREATE INDEX](create-index.md), [DROP INDEX](drop-index.md) | Unique, filtered, `INCLUDE`. |
 | [CREATE VIEW](create-view.md) (and `CREATE OR ALTER VIEW`), [ALTER VIEW](alter-view.md), [DROP VIEW](drop-view.md) | |
 | [CREATE PROCEDURE](create-procedure.md) (and `ALTER`, `CREATE OR ALTER`), [DROP PROCEDURE](drop-procedure.md) | Procedures with parameters, `OUTPUT` parameters and return codes. |
