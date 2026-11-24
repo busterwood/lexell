@@ -49,15 +49,15 @@ CORE = {
     "lexdb_memo", "lexdb_newfn", "lexdb_nncon", "lexdb_nnalter", "lexdb_copyjson", "lexdb_oldnew", "lexdb_ops", "lexdb_vec", "lexdb_decfit",
     "lexdb_page", "lexdb_parse", "lexdb_pct", "lexdb_pipe", "lexdb_plan", "lexdb_priv", "lexdb_repl", "lexdb_rows", "lexdb_routine",
     "lexdb_session", "lexdb_setop", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_srf", "lexdb_standby", "lexdb_stats",
-    "lexdb_store", "lexdb_time", "lexdb_tmpstore", "lexdb_udf", "lexdb_window",
+    "lexdb_store", "lexdb_time", "lexdb_tmpstore", "lexdb_tz", "lexdb_udf", "lexdb_window",
 }
 
 PG_DATA = {"lexdb_pgdata"}
 PG_BEHAVIOR = {"lexdb_pg", "lexdb_pgcat"}
 SYS_DATA = {"lexdb_sysdata"}
-SYS_BEHAVIOR = {"lexdb_syscat", "lexdb_tsqlfn", "lexdb_tsqlfmt", "lexdb_tsql", "lexdb_tsqlparse", "lexdb_tsqlfunc", "lexdb_tsqlerr"}
+SYS_BEHAVIOR = {"lexdb_syscat", "lexdb_tsqlfn", "lexdb_tsqltz", "lexdb_tsqlfmt", "lexdb_tsql", "lexdb_tsqlparse", "lexdb_tsqlfunc", "lexdb_tsqlerr"}
 ORA_DATA = {"lexdb_oradata"}
-ORA_BEHAVIOR = {"lexdb_oracat", "lexdb_orafn", "lexdb_oraadm", "lexdb_oratext", "lexdb_plsql", "lexdb_plcall"}
+ORA_BEHAVIOR = {"lexdb_oracat", "lexdb_orafn", "lexdb_oraadm", "lexdb_oratext", "lexdb_oratz", "lexdb_plsql", "lexdb_plcall"}
 PROTO = {"lexdb_wire", "lexdb_pgbin", "lexdb_tds", "lexdb_tns", "lexdb_auth"}
 
 DATA = PG_DATA | SYS_DATA | ORA_DATA
@@ -96,7 +96,7 @@ BELOW_ACCESS = {"lexdb_store", "lexdb_rows", "lexdb_page", "lexdb_cols", "lexdb_
 # the binder and the executor: values, types and the time and number
 # libraries only.
 OPS = "lexdb_ops"
-OPS_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_func", "lexdb_dialect", "lexdb_decfit"}
+OPS_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_func", "lexdb_dialect", "lexdb_decfit", "lexdb_tz"}
 
 # The function library (lexdb_lib, design/lexdb-layers.md 4.4.1, slice 2c
 # item 3) sits beside the value operations, below the binder and the

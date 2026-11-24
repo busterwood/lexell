@@ -1,0 +1,195 @@
+// lexdb_oratz: Oracle's time-zone functions over Val.Tsz, a TIMESTAMP WITH TIME ZONE that keeps its offset (lexdb_tz;
+// design/lexdb-robust.md, item 9): FROM_TZ, AT TIME ZONE, AT LOCAL, TZ_OFFSET, NEW_TIME, SESSIONTIMEZONE's text, the
+// TIMEZONE_* fields of EXTRACT, and the check of a time zone argument. lexdb_orafn dispatches to these and formats and reads
+// the TZH, TZM, TZR and TZD elements of a date format.
+//
+// A value keeps an offset in minutes, not a region: a time zone named by region ('Europe/Berlin') is read at the instant it
+// applies to and kept as the offset it had then, so TZR shows '+01:00', not EUROPE/BERLIN (the loss: the offset a later date
+// in the region would have; the session's own region is a zone with rules, and CURRENT_TIMESTAMP shows its offset).
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_time"
+import "./lexdb_tz"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+
+fn ora(num: int, msg: &str): DbErr { return lexdb_base.err(&("ORA" + strings.padLeft(&(num.toStr()), 5, '0')), msg) }
+
+const MIN_US = 60000000
+
+// An offset written [+-]H[H]:MM: its minutes east; None when the text is not one. Err for an hour or minute out of range
+// (ORA-01874, ORA-01875).
+fn offsetText(s: &str): Result[Option[int], DbErr] {
+    let t = strings.trim(s)
+    if len(t) < 4 || (t[0] != '+' && t[0] != '-') { return Ok(None) }
+    let colon = strings.indexOf(&t, ":", 0)
+    if colon < 2 || colon > 3 || len(t) != colon + 3 { return Ok(None) }
+    var h = 0
+    var m = 0
+    for i in 1..colon {
+        if t[i] < '0' || t[i] > '9' { return Ok(None) }
+        h = h * 10 + (int(t[i]) - int('0'))
+    }
+    for i in colon + 1..len(t) {
+        if t[i] < '0' || t[i] > '9' { return Ok(None) }
+        m = m * 10 + (int(t[i]) - int('0'))
+    }
+    if h > 15 { return Err(ora(1874, "time zone hour must be between -15 and 15")) }
+    if m > 59 || (h == 15 && m > 0) { return Err(ora(1875, "time zone minute must be between -59 and 59")) }
+    let o = h * 60 + m
+    return Ok(Some(if t[0] == '-' { -o } else { o }))
+}
+
+// The offset (minutes east) of the time zone zone names, at instant u: '+05:30', a region ('Europe/Berlin': the offset it has
+// then), or an abbreviation ('EST'); ORA-01882 for a name that is none.
+pub fn zoneAt(zone: &str, u: int): Result[int, DbErr] {
+    match try offsetText(zone) {
+        Some(o) { return Ok(o) }
+        None {}
+    }
+    let name = strings.trim(zone)
+    // (a sign and no H:MM is no zone: '+03', not a POSIX rule)
+    if len(name) > 0 && (name[0] == '+' || name[0] == '-') { return Err(ora(1861, "literal does not match format string")) }
+    match lexdb_time.zoneNamed(&name) {
+        Some(zn) { return Ok(zn.offsetOf(u) / 60) }
+        None {}
+    }
+    match lexdb_time.abbrevOffset(&name) {
+        Some(o) { return Ok(o / 60) }
+        None {}
+    }
+    return Err(ora(1882, "time zone region not found"))
+}
+
+// FROM_TZ(ts, zone): the local time ts as one in the zone (a region's offset is the one in effect at that local time).
+pub fn fromTz(local: int, zone: &str): Result[Val, DbErr] {
+    match try offsetText(zone) {
+        Some(o) { return Ok(Val.Tsz(lexdb_tz.instant(local, o), o)) }
+        None {}
+    }
+    let name = strings.trim(zone)
+    if len(name) > 0 && (name[0] == '+' || name[0] == '-') { return Err(ora(1861, "literal does not match format string")) }
+    match lexdb_time.zoneNamed(&name) {
+        Some(zn) {
+            let u = zn.toUtc(local)
+            return Ok(Val.Tsz(u, zn.offsetOf(u) / 60))
+        }
+        None {}
+    }
+    match lexdb_time.abbrevOffset(&name) {
+        Some(o) { return Ok(Val.Tsz(lexdb_tz.instant(local, o / 60), o / 60)) }
+        None {}
+    }
+    return Err(ora(1882, "time zone region not found"))
+}
+
+// x AT TIME ZONE zone: the same instant with the zone's offset. A timestamp without a zone is read in the session's zone z
+// first.
+pub fn atTimeZone(v: &Val, zone: &str, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let u = try instantOf(v, z)
+    return Ok(Val.Tsz(u, try zoneAt(zone, u)))
+}
+
+// x AT LOCAL: the same instant at the session's zone's offset.
+pub fn atLocal(v: &Val, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let u = try instantOf(v, z)
+    return Ok(Val.Tsz(u, z.offsetOf(u) / 60))
+}
+
+fn instantOf(v: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
+    match v {
+        Val.Tsz(u, _) { return Ok(u) }
+        Val.Tstz(u) { return Ok(u) }
+        Val.Ts(l) { return Ok(lexdb_time.tsToTstz(l, z)) }
+        Val.Date(d) { return Ok(lexdb_time.tsToTstz(lexdb_time.dateToTs(d), z)) }
+        Val.Text(s) {
+            match lexdb_time.parseTsz(&strings.trim(&s), z) {
+                Ok(r) { return Ok(r.us) }
+                Err(_) { return Err(ora(1843, "An invalid month was specified.")) }
+            }
+        }
+        else { return Err(ora(30076, "invalid extract field for extract source")) }
+    }
+}
+
+// CURRENT_TIMESTAMP: now at the session zone's offset; SYSTIMESTAMP: at the database's (UTC).
+pub fn currentTs(z: &lexdb_time.Zone, prec: int): Val {
+    let u = lexdb_time.roundUs(lexdb_time.nowTstz(), prec)
+    return Val.Tsz(u, z.offsetOf(u) / 60)
+}
+
+pub fn sysTs(): Val { return Val.Tsz(lexdb_time.nowTstz(), 0) }
+
+// TZ_OFFSET(zone): '+05:30'; a region's offset is today's.
+pub fn tzOffset(zone: &str, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let o = try zoneAt(zone, lexdb_time.nowTstz())
+    return Ok(Val.Text(lexdb_tz.offText(o)))
+}
+
+// NEW_TIME's zones: Oracle's fixed set, hours east of GMT (NST is -3:30).
+fn newTimeOffset(name: &str): Option[int] {
+    let n = strings.toUpperAscii(name)
+    let names: []str = ["AST", "ADT", "BST", "BDT", "CST", "CDT", "EST", "EDT", "GMT", "HST", "HDT", "MST", "MDT", "NST", "PST", "PDT", "YST", "YDT"]
+    let mins: []int = [-240, -180, -660, -600, -360, -300, -300, -240, 0, -600, -540, -420, -360, -210, -480, -420, -540, -480]
+    for i in 0..len(names) { if names[i] == n { return Some(mins[i]) } }
+    return None
+}
+
+// NEW_TIME(date, from, to): the date-time (local microseconds) in the other zone.
+pub fn newTime(local: int, from: &str, to: &str): Result[Val, DbErr] {
+    match newTimeOffset(from) {
+        Some(a) {
+            match newTimeOffset(to) {
+                Some(b) { return Ok(Val.Ts(local + (b - a) * MIN_US)) }
+                None {}
+            }
+        }
+        None {}
+    }
+    return Err(ora(1857, "not a valid time zone"))
+}
+
+// The zone a timestamp text ends with, when it ends with one: an offset (+16:00: ORA-01874, +02:60: ORA-01875) or a name
+// that is no region or abbreviation (ORA-01882).
+pub fn checkZoneTail(s: &str): Result[Unit, DbErr] {
+    let t = strings.trim(s)
+    let sp = strings.lastIndexOf(&t, " ")
+    if sp < 0 { return Ok(Unit{}) }
+    let tail = t[sp + 1..len(t)].toStr()
+    if len(tail) == 0 { return Ok(Unit{}) }
+    if tail[0] == '+' || tail[0] == '-' {
+        match try offsetText(&tail) {
+            Some(_) { return Ok(Unit{}) }
+            None { return Ok(Unit{}) }
+        }
+    }
+    let low = strings.toLowerAscii(&tail)
+    if low == "am" || low == "pm" || low == "utc" || low == "gmt" || low == "z" || low == "zulu" || len(tail) < 2 || !strings.isLetter(tail[0]) { return Ok(Unit{}) }
+    if lexdb_time.zoneNamed(&tail).isSome() || lexdb_time.abbrevOffset(&tail).isSome() { return Ok(Unit{}) }
+    return Err(ora(1882, "time zone region not found"))
+}
+
+// EXTRACT(TIMEZONE_HOUR | TIMEZONE_MINUTE | TIMEZONE_REGION | TIMEZONE_ABBR FROM x) of a value with an offset; None: not
+// one of those fields. (An offset has no region: UNKNOWN and UNK.)
+pub fn extractTz(field: &str, off: int): Option[Val] {
+    if field == "timezone_hour" { return Some(Val.Num(Decimal.fromInt(off / 60))) }
+    if field == "timezone_minute" { return Some(Val.Num(Decimal.fromInt(off % 60))) }
+    if field == "timezone_region" { return Some(Val.Text("UNKNOWN")) }
+    if field == "timezone_abbr" { return Some(Val.Text("UNK")) }
+    return None
+}
+
+// SESSIONTIMEZONE: '+02:00' for an offset, the name of a region or abbreviation.
+pub fn sessionText(z: &lexdb_time.Zone): str {
+    if z.name == "UTC" || z.name == "Etc/UTC" || z.name == "GMT" { return "+00:00" }
+    if strings.startsWith(&z.name, "<") {
+        let e = strings.indexOf(&z.name, ">", 0)
+        if e > 0 {
+            let t = z.name[1..e].toStr()
+            return if strings.indexOf(&t, ":", 0) < 0 { t + ":00" } else { t }
+        }
+    }
+    return z.name.clone()
+}

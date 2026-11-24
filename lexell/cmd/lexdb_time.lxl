@@ -60,7 +60,7 @@ fn floorDiv(a: int, b: int): int {
     return q
 }
 
-fn floorMod(a: int, b: int): int { return a - floorDiv(a, b) * b }
+pub fn floorMod(a: int, b: int): int { return a - floorDiv(a, b) * b }
 
 // ---- to and from the library's types
 
@@ -862,6 +862,48 @@ pub fn parseTstz(s: &str, z: &Zone): Result[int, lexdb_base.DbErr] {
         }
     }
     return Ok(p.us - p.z.off * SEC_US)
+}
+
+// A timestamp with its offset (lexdb_tz): the instant and the offset in minutes east.
+pub type TszRead = value record { pub us: int; pub off: int }
+
+fn tszOf(us: int, z: &Zone): TszRead { return TszRead{us: us, off: z.offsetOf(us) / 60} }
+
+// A timestamp that keeps its zone's offset (Val.Tsz): the offset given with the text (a numeric one as written, a name's or
+// an abbreviation's at that instant), else the session's zone z at the instant.
+pub fn parseTsz(s: &str, z: &Zone): Result[TszRead, lexdb_base.DbErr] {
+    match fastTs(s, false) {
+        Some(f) {
+            if f.has { return Ok(TszRead{us: f.us - f.off * SEC_US, off: f.off / 60}) }
+            return Ok(tszOf(tsToTstz(f.us, z), z))
+        }
+        None {}
+    }
+    let w = lower(s)
+    match special(&w, false, z) {
+        Some(v) {
+            if v == INF || v == NINF { return Ok(TszRead{us: v, off: 0}) }
+            if w == "now" { return Ok(tszOf(nowTstz(), z)) }
+            return Ok(tszOf(tsToTstz(v, z), z))
+        }
+        None {}
+    }
+    let p = try parseTsText(s, &"timestamp with time zone")
+    if !p.z.has { return Ok(tszOf(tsToTstz(p.us, z), z)) }
+    if p.z.named != "" {
+        match abbrevOffset(&p.z.named) {
+            Some(o) { return Ok(TszRead{us: p.us - o * SEC_US, off: o / 60}) }
+            None {}
+        }
+        match zoneNamed(&p.z.named) {
+            Some(nz) {
+                let u = nz.toUtc(p.us)
+                return Ok(tszOf(u, &nz))
+            }
+            None { return Err(lexdb_base.err("22023", &("time zone \"" + strings.toLowerAscii(&p.z.named) + "\" not recognized"))) }
+        }
+    }
+    return Ok(TszRead{us: p.us - p.z.off * SEC_US, off: p.z.off / 60})
 }
 
 // ---- conversions between the types

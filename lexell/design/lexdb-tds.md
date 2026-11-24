@@ -1186,3 +1186,15 @@ Checked because the Oracle door failed every second run of a prepared DML statem
 (and a batch of 100 three times) through sp_prepexec and sp_execute, with the defaults, `enablePrepareOnFirstPreparedStatementCall=true`, `prepareMethod=prepare` and statement pooling, with a bind
 that changes from int to text every fourth run: no failure, the row counts are the ones the arithmetic gives. No change in this door; not added to `MssqlJdbc` (its prepared cases already run a statement
 more than once).
+
+
+## As built: datetimeoffset keeps its offset
+
+See lexdb-robust.md, "Timestamps that keep their offset". `lexdb_tsqltz` (new) and `lexdb_tsqlfn`: `SWITCHOFFSET` and `TODATETIMEOFFSET` (the offset a '+hh:mm' text or minutes; 9812 beyond 14:00 or for
+a text that is none), `SYSDATETIMEOFFSET`, `AT TIME ZONE` by SQL Server's Windows zone names (a table of about 45, 9820 for another; a datetime2 read in the zone: a time that is twice is its first,
+one that never is moves forward), `DATEPART(tzoffset | tz)` (minutes) and `DATENAME(tzoffset)` (`+02:00`), `DATEADD` (keeps the offset), `DATEDIFF` (by the UTC instants), `YEAR` ... `EOMONTH` (the local
+time), `CAST` and `CONVERT` to a string (`2026-03-15 10:00:00.0000000 +02:00`; styles 0, 100, 9, 109, 13, 113, 20, 120, 21, 121, 126, 127 show the offset, the others the date's alone). TDS type 0x2B
+carries the offset both ways (`lexdb_tds`: UTC time and date, then the offset in minutes; an RPC parameter decodes to a Tsz). Checked: `tds_dto` (89 batches as SQL Server 2022 answers),
+`MssqlJdbc.dto` (OffsetDateTime, `microsoft.sql.DateTimeOffset`; the old KNOWN line is a check now). Left: a string's fractional digits are seven whatever the type's scale (styles 126 and 127 print none,
+three or seven by the value); `FORMAT` of `zzz`; text forms SQL Server reads and lexdb does not (`March 15, 2026 10:00:00 AM +02:00`, `20260315 10:00:00 +02:00`); a VALUES list or derived column typed by
+OID alone is an instant; `MIN` and `MAX` show the last of equal instants' offsets (SQL Server the first); `datetimeoffset - datetimeoffset` and `+ n` are an interval and a text (SQL Server 8117, 206).

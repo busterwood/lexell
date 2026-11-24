@@ -14,6 +14,7 @@ import "math"
 import "./lexdb_base"
 import "./lexdb_sql"
 import "./lexdb_time"
+import "./lexdb_tz"
 import "./lexdb_float"
 import "./lexdb_func"
 import "./lexdb_dialect"
@@ -32,6 +33,7 @@ const HEX_LOW: str = "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\x
 pub fn textZ(v: &Val, z: &lexdb_time.Zone): str {
     match v {
         Val.Tstz(u) { return lexdb_time.fmtTstz(u, z) }
+        Val.Tsz(u, _) { return lexdb_time.fmtTstz(u, z) }
         else { return lexdb_sql.text(v) }
     }
 }
@@ -45,6 +47,7 @@ pub fn textOut(v: &Val, oid: int, z: &lexdb_time.Zone): str {
     if z.isUtc() { return lexdb_sql.text(v) }
     match v {
         Val.Tstz(u) { return lexdb_time.fmtTstz(u, z) }
+        Val.Tsz(u, _) { return lexdb_time.fmtTstz(u, z) }
         Val.Text(t) {
             if oid == lexdb_sql.OID_TSTZ {
                 match lexdb_time.parseTstz(&t, z) {
@@ -543,6 +546,7 @@ pub fn powerOf(a: &Val, b: &Val): Result[Val, DbErr] {
 pub fn coerceTime(v: &Val, t: &lexdb_sql.TypeName, z: &lexdb_time.Zone): Result[Val, DbErr] {
     let k = t.kind
     let p = if t.prec >= 1 && !tsqlDatetime(t) { t.scale } else if t.prec >= 1 { min(t.scale, 6) } else { 6 }
+    if lexdb_sql.isTszType(t) { return lexdb_tz.coerceTsz(v, p, z, t.len == lexdb_sql.TSZ_TSQL) }
     match v {
         Val.Text(s) {
             if k == lexdb_sql.K_DATE { return Ok(Val.Date(try lexdb_time.parseDate(&s, z))) }
@@ -566,6 +570,14 @@ pub fn coerceTime(v: &Val, t: &lexdb_sql.TypeName, z: &lexdb_time.Zone): Result[
         Val.Tstz(u) {
             if k == lexdb_sql.K_TSTZ { return Ok(Val.Tstz(lexdb_time.roundUs(u, p))) }
             let local = lexdb_time.tstzToTs(u, z)
+            if k == lexdb_sql.K_TS { return Ok(Val.Ts(lexdb_time.roundUs(local, p))) }
+            if k == lexdb_sql.K_DATE { return Ok(Val.Date(lexdb_time.tsToDate(local))) }
+            if k == lexdb_sql.K_TIME { return Ok(Val.Time(lexdb_time.roundUs(floorModInt(local, lexdb_time.DAY_US), p))) }
+        }
+        Val.Tsz(u, o) {
+            // a timestamp with its offset made another type: the instant, or its local time in its own offset
+            if k == lexdb_sql.K_TSTZ { return Ok(Val.Tstz(lexdb_time.roundUs(u, p))) }
+            let local = lexdb_tz.local(u, o)
             if k == lexdb_sql.K_TS { return Ok(Val.Ts(lexdb_time.roundUs(local, p))) }
             if k == lexdb_sql.K_DATE { return Ok(Val.Date(lexdb_time.tsToDate(local))) }
             if k == lexdb_sql.K_TIME { return Ok(Val.Time(lexdb_time.roundUs(floorModInt(local, lexdb_time.DAY_US), p))) }
@@ -623,6 +635,7 @@ pub fn asTstz(v: &Val, z: &lexdb_time.Zone): Option[int] {
         Val.Date(d) { return Some(lexdb_time.tsToTstz(lexdb_time.dateToTs(d), z)) }
         Val.Ts(u) { return Some(lexdb_time.tsToTstz(u, z)) }
         Val.Tstz(u) { return Some(u) }
+        Val.Tsz(u, _) { return Some(u) }
         else { return None }
     }
 }
@@ -649,6 +662,7 @@ pub fn compareTime(a: &Val, b: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
         Val.Date(x) { match b { Val.Date(y) { return Ok(x.cmp(&y)) } else {} } }
         Val.Ts(x) { match b { Val.Ts(y) { return Ok(x.cmp(&y)) } else {} } }
         Val.Tstz(x) { match b { Val.Tstz(y) { return Ok(x.cmp(&y)) } else {} } }
+        Val.Tsz(x, _) { match b { Val.Tsz(y, _) { return Ok(x.cmp(&y)) } else {} } }
         Val.Time(x) { match b { Val.Time(y) { return Ok(x.cmp(&y)) } else {} } }
         Val.Ival(x) { match b { Val.Ival(y) { return Ok(lexdb_time.ivalCmp(&x, &y)) } else {} } }
         else {}
@@ -744,6 +758,7 @@ pub fn arithTime(op: int, a: &Val, b: &Val, z: &lexdb_time.Zone): Result[Val, Db
             if plus || minus {
                 match b {
                     Val.Tstz(u2) { if minus { return Ok(Val.Ival(try lexdb_time.tsDiff(u, u2))) } }
+                    Val.Tsz(u2, _) { if minus { return Ok(Val.Ival(try lexdb_time.tsDiff(u, u2))) } }
                     Val.Text(s) {
                         if minus { return arithTime(op, a, &Val.Tstz(try lexdb_time.parseTstz(&s, z)), z) }
                     }
@@ -753,6 +768,26 @@ pub fn arithTime(op: int, a: &Val, b: &Val, z: &lexdb_time.Zone): Result[Val, Db
                     Some(iv) {
                         let x = if minus { lexdb_time.ivalNeg(&iv) } else { iv }
                         return Ok(Val.Tstz(try lexdb_time.tstzPlus(u, &x, z)))
+                    }
+                    None {}
+                }
+            }
+        }
+        Val.Tsz(u, o) {
+            if plus || minus {
+                match b {
+                    Val.Tsz(u2, _) { if minus { return Ok(Val.Ival(try lexdb_time.tsDiff(u, u2))) } }
+                    Val.Tstz(u2) { if minus { return Ok(Val.Ival(try lexdb_time.tsDiff(u, u2))) } }
+                    Val.Text(s) {
+                        if minus { return arithTime(op, a, &Val.Tsz(try lexdb_time.parseTstz(&s, z), o), z) }
+                    }
+                    else {}
+                }
+                match try ivalOfVal(b) {
+                    Some(iv) {
+                        let x = if minus { lexdb_time.ivalNeg(&iv) } else { iv }
+                        // months and days move the local time in the value's own offset; the offset stays
+                        return Ok(Val.Tsz(try lexdb_time.tstzPlus(u, &x, &lexdb_tz.zoneOf(o)), o))
                     }
                     None {}
                 }
@@ -799,6 +834,7 @@ pub fn arithTime(op: int, a: &Val, b: &Val, z: &lexdb_time.Zone): Result[Val, Db
                     Val.Date(_) { return arithTime(op, b, a, z) }
                     Val.Ts(_) { return arithTime(op, b, a, z) }
                     Val.Tstz(_) { return arithTime(op, b, a, z) }
+                    Val.Tsz(_, _) { return arithTime(op, b, a, z) }
                     Val.Time(_) { return arithTime(op, b, a, z) }
                     else {}
                 }
@@ -920,6 +956,7 @@ pub fn kindOid(v: &Val): int {
         Val.Time(_) { return lexdb_sql.OID_TIME }
         Val.Ts(_) { return lexdb_sql.OID_TS }
         Val.Tstz(_) { return lexdb_sql.OID_TSTZ }
+        Val.Tsz(_, _) { return lexdb_sql.OID_TSTZ }
         Val.Ival(_) { return lexdb_sql.OID_IVAL }
         Val.Uuid(_) { return lexdb_sql.OID_UUID }
         Val.Bytes(_) { return lexdb_sql.OID_BYTEA }
@@ -941,6 +978,7 @@ pub fn kindOf(v: &Val): int {
         Val.Time(_) { return lexdb_sql.K_TIME }
         Val.Ts(_) { return lexdb_sql.K_TS }
         Val.Tstz(_) { return lexdb_sql.K_TSTZ }
+        Val.Tsz(_, _) { return lexdb_sql.K_TSTZ }
         Val.Ival(_) { return lexdb_sql.K_IVAL }
         Val.Uuid(_) { return lexdb_sql.K_UUID }
         Val.Bytes(_) { return lexdb_sql.K_BYTEA }
@@ -988,6 +1026,7 @@ fn timeCmpLocal(a: &Val, b: &Val): Option[int] {
         Val.Date(d) { lexdb_time.dateToTs(d) }
         Val.Ts(u) { u }
         Val.Tstz(u) { match b { Val.Tstz(v) { return Some(u.cmp(&v)) } else { return None } } }
+        Val.Tsz(u, _) { match b { Val.Tsz(v, _) { return Some(u.cmp(&v)) } else { return None } } }
         Val.Time(t) { match b { Val.Time(v) { return Some(t.cmp(&v)) } else { return None } } }
         else { return None }
     }
@@ -1287,6 +1326,7 @@ pub fn truth(v: &Val): Option[bool] {
 pub fn isTstz(v: &Val): bool {
     match v {
         Val.Tstz(_) { return true }
+        Val.Tsz(_, _) { return true }
         else { return false }
     }
 }
@@ -1642,6 +1682,7 @@ pub fn keyOfVals(vs: &[]Val, from: int): str {
             Val.Time(n) { out += "m" + n.toStr() }
             Val.Ts(n) { out += "s" + n.toStr() }
             Val.Tstz(n) { out += "u" + n.toStr() }
+            Val.Tsz(n, o) { out += "o" + n.toStr() + "," + o.toStr() }
             else { out += "t" + lexdb_sql.text(&vs[i]) }
         }
     }
@@ -1667,6 +1708,10 @@ pub fn valsOfKey(k: &str): []Val {
         else if tag == 'm' { append(mut &out, Val.Time(strings.parseIntOpt(&rest).unwrapOr(0))) }
         else if tag == 's' { append(mut &out, Val.Ts(strings.parseIntOpt(&rest).unwrapOr(0))) }
         else if tag == 'u' { append(mut &out, Val.Tstz(strings.parseIntOpt(&rest).unwrapOr(0))) }
+        else if tag == 'o' {
+            let c = strings.indexOf(&rest, ",", 0)
+            append(mut &out, Val.Tsz(strings.parseIntOpt(&rest[0..c]).unwrapOr(0), strings.parseIntOpt(&rest[c + 1..len(rest)]).unwrapOr(0)))
+        }
         else { append(mut &out, Val.Text(rest)) }
     }
     return out

@@ -208,6 +208,7 @@ CHECKED = {
     'tns_pkgvar': ('consts', 'QS'),
     'tns_plfunc': ('consts', 'QS'),
     'tns_docbugs': ('consts', 'QS'),
+    'tns_tstz': ('consts', 'QS'),
 }
 
 

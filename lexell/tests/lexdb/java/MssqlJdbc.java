@@ -35,6 +35,7 @@ public class MssqlJdbc {
         run("drop procedure jt_proc"); run("drop function jt_func");
         connect();
         types();
+        dto();
         params();
         batch();
         transactions();
@@ -107,7 +108,7 @@ public class MssqlJdbc {
             Check.eq("varchar", r.getString(9), "alpha"); Check.eq("nvarchar", r.getString(10), "café"); Check.eq("char", r.getString(11), "ab  ");
             Check.eq("date", r.getDate(12).toString(), "2024-02-29"); Check.eq("time", r.getTime(13).toString(), "13:14:15");
             Check.eq("datetime", r.getTimestamp(14).toString(), "2024-02-29 13:14:15.123"); Check.eq("datetime2", r.getTimestamp(15).toString(), "2024-02-29 13:14:15.12345");
-            Check.known("datetimeoffset keeps its offset", r.getObject(16, java.time.OffsetDateTime.class).toString(), "2024-02-29T13:14:15.120+02:00");
+            Check.eq("datetimeoffset keeps its offset", r.getObject(16, java.time.OffsetDateTime.class).toString(), "2024-02-29T13:14:15.120+02:00");
             Check.eq("varbinary", r.getBytes(17), new byte[]{1, 2, (byte) 0xff});
             Check.eq("uniqueidentifier", r.getString(18).toLowerCase(), "12345678-1234-1234-1234-123456789abc");
             Check.eq("bit", r.getBoolean(19), true); Check.eq("nvarchar(max)", r.getString(20).length(), 9000); Check.eq("varbinary(max)", r.getBytes(21).length, 20000);
@@ -133,6 +134,67 @@ public class MssqlJdbc {
     }
 
     // ---- parameters: sp_executesql and a prepared statement run again
+    // ---- datetimeoffset keeps the offset it was written with (design/lexdb-robust.md item 9): the wire type 0x2B, in a column, a
+    // parameter (OffsetDateTime, microsoft.sql.DateTimeOffset) and an expression
+    static void dto() throws Exception {
+        java.time.OffsetDateTime a = java.time.OffsetDateTime.parse("2026-03-15T10:00:00+02:00");
+        java.time.OffsetDateTime b = java.time.OffsetDateTime.parse("2026-03-15T08:00:00Z");
+        java.time.OffsetDateTime d = java.time.OffsetDateTime.parse("2026-03-15T03:00:00.123456-05:30");
+        run("drop table jt_dto");
+        run("create table jt_dto (id int primary key, t datetimeoffset, p datetimeoffset(3))");
+        try (PreparedStatement p = c.prepareStatement("insert into jt_dto (id, t, p) values (?, ?, ?)")) {
+            p.setInt(1, 1); p.setObject(2, a); p.setObject(3, a); Check.eq("insert OffsetDateTime", p.executeUpdate(), 1);
+            p.setInt(1, 2); p.setObject(2, b); p.setObject(3, b); Check.eq("insert UTC", p.executeUpdate(), 1);
+            p.setInt(1, 3); p.setObject(2, d); p.setObject(3, d); Check.eq("insert a negative offset", p.executeUpdate(), 1);
+            p.setInt(1, 4); p.setObject(2, microsoft.sql.DateTimeOffset.valueOf(new java.sql.Timestamp(java.time.OffsetDateTime.parse("2026-03-15T12:00:00+05:30").toInstant().toEpochMilli()), 330)); p.setNull(3, Types.TIMESTAMP_WITH_TIMEZONE);
+            Check.eq("insert DateTimeOffset", p.executeUpdate(), 1);
+        }
+        try (Statement s = c.createStatement(); ResultSet r = s.executeQuery("select id, t, p from jt_dto order by id")) {
+            ResultSetMetaData m = r.getMetaData();
+            Check.eq("dto type name", m.getColumnTypeName(2), "datetimeoffset");
+            Check.eq("dto type", m.getColumnType(2), -155);
+            Check.eq("dto scale", m.getScale(2), 7);
+            Check.eq("dto(3) scale", m.getScale(3), 3);
+            r.next(); Check.eq("offset kept", r.getObject(2, java.time.OffsetDateTime.class).toString(), "2026-03-15T10:00+02:00");
+            Check.eq("p", r.getObject(3, java.time.OffsetDateTime.class).toString(), "2026-03-15T10:00+02:00");
+            r.next(); Check.eq("UTC kept", r.getObject(2, java.time.OffsetDateTime.class).toString(), "2026-03-15T08:00Z");
+            r.next(); Check.eq("negative offset kept", r.getObject(2, java.time.OffsetDateTime.class).toString(), "2026-03-15T03:00:00.123456-05:30");
+            Check.eq("p cut to three digits", r.getObject(3, java.time.OffsetDateTime.class).toString(), "2026-03-15T03:00:00.123-05:30");
+            r.next();
+            microsoft.sql.DateTimeOffset x = (microsoft.sql.DateTimeOffset) r.getObject(2, microsoft.sql.DateTimeOffset.class);
+            Check.eq("DateTimeOffset minutes", x.getMinutesOffset(), 330);
+            Check.eq("DateTimeOffset text", x.toString(), "2026-03-15 12:00:00 +05:30");
+            Check.eq("null", r.getObject(3, java.time.OffsetDateTime.class), null);
+        }
+        try (PreparedStatement p = c.prepareStatement("select count(*) from jt_dto where t = ?")) {
+            p.setObject(1, java.time.OffsetDateTime.parse("2026-03-15T11:00:00+03:00"));
+            try (ResultSet r = p.executeQuery()) { r.next(); Check.eq("equal by instant", r.getInt(1), 2); }
+            p.setObject(1, java.time.OffsetDateTime.parse("2026-03-15T06:30:00Z"));
+            try (ResultSet r = p.executeQuery()) { r.next(); Check.eq("a different instant", r.getInt(1), 1); }
+        }
+        Check.eq("order by instant", rows("select id from jt_dto order by t, id"), List.of("4", "1", "2", "3"));
+        Check.eq("group by instant", rows("select count(*) c from jt_dto group by t order by c"), List.of("1", "1", "2"));
+        Check.eq("switchoffset", rows("select cast(switchoffset(t, '+05:00') as varchar(40)) from jt_dto where id = 1"), List.of("2026-03-15 13:00:00.0000000 +05:00"));
+        Check.eq("datepart tzoffset", rows("select datepart(tzoffset, t) from jt_dto order by id"), List.of("120", "0", "-330", "330"));
+        Check.eq("datename tzoffset", rows("select datename(tzoffset, t) from jt_dto where id = 3"), List.of("-05:30"));
+        Check.eq("todatetimeoffset", rows("select cast(todatetimeoffset(cast('2026-03-15 10:00:00' as datetime2), '-03:00') as varchar(40))"), List.of("2026-03-15 10:00:00.0000000 -03:00"));
+        try (Statement s = c.createStatement(); ResultSet r = s.executeQuery("select switchoffset(sysdatetimeoffset(), '+01:00'), cast('2026-03-15 10:00:00 -04:30' as datetimeoffset)")) {
+            r.next();
+            Check.eq("switchoffset offset", r.getObject(1, java.time.OffsetDateTime.class).getOffset().toString(), "+01:00");
+            Check.eq("literal offset", r.getObject(2, java.time.OffsetDateTime.class).toString(), "2026-03-15T10:00-04:30");
+        }
+        try (PreparedStatement p = c.prepareStatement("select ?, datepart(tzoffset, ?), convert(varchar(40), ?, 126)")) {
+            p.setObject(1, d); p.setObject(2, d); p.setObject(3, d);
+            try (ResultSet r = p.executeQuery()) {
+                r.next();
+                Check.eq("bind kept through the server", r.getObject(1, java.time.OffsetDateTime.class).toString(), "2026-03-15T03:00:00.123456-05:30");
+                Check.eq("bind's tzoffset", r.getInt(2), -330);
+                Check.eq("bind's style 126", r.getString(3), "2026-03-15T03:00:00.1234560-05:30");
+            }
+        }
+        run("drop table jt_dto");
+    }
+
     static void params() throws Exception {
         try (PreparedStatement p = c.prepareStatement("select ?, ?, ?, ?, ?, ?")) {
             p.setInt(1, 7); p.setString(2, "str"); p.setBigDecimal(3, new BigDecimal("1.25")); p.setDate(4, java.sql.Date.valueOf("2020-01-02"));
