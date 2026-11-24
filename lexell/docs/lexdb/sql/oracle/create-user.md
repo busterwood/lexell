@@ -27,7 +27,10 @@ CREATE USER user [ IDENTIFIED BY password ]
 
 - A new user has no rights. `GRANT CREATE SESSION TO user` lets the user log in (it makes the login usable);
   see [GRANT](grant.md).
-- A user is a lexdb role with its own schema. A user and a role cannot share a name (ORA-01920).
+- A user is a lexdb role with its own schema, made by `CREATE USER`. (A login that was made in another door has its
+  schema made at its first Oracle connection.) A user and a role cannot share a name (ORA-01920).
+- The other doors see the user's tables as `schema."NAME"` in the PostgreSQL door and `schema.NAME` in the SQL Server
+  door: see [Schemas](../../connect/oracle.md#schemas).
 - `ALL_USERS` and `DBA_USERS` list only the users that can log in: those granted `CREATE SESSION` or `CONNECT`. A
   user without that grant owns a schema but is not listed (see example A).
 
@@ -87,6 +90,7 @@ ORA-01920: user name 'ANN' conflicts with another user or role name
 CREATE USER hr IDENTIFIED BY pw;
 CREATE TABLE hr.t (a NUMBER);
 INSERT INTO hr.t VALUES (1);
+COMMIT;
 SELECT owner, table_name FROM all_tables WHERE table_name = 'T';
 SELECT * FROM hr.t;
 ```
@@ -97,6 +101,8 @@ User created.
 Table created.
 
 1 row created.
+
+Commit complete.
 
 OWNER TABLE_NAME
 ----- ----------
@@ -111,7 +117,27 @@ A
 1 row selected.
 ```
 
-### D. Options that are accepted
+### D. The other doors see the schema
+
+<!-- example: postgresql -->
+```sql
+SELECT schemaname, tablename FROM pg_tables WHERE schemaname = 'hr';
+SELECT hr."T".a FROM hr."T";
+```
+
+```text
+ schemaname | tablename
+------------+-----------
+ hr         | T
+(1 row)
+
+ a
+---
+ 1
+(1 row)
+```
+
+### E. Options that are accepted
 
 <!-- example: oracle -->
 ```sql
