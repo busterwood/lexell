@@ -75,9 +75,9 @@ The codes are PostgreSQL's, with PostgreSQL's meaning. The first two characters 
 | Code | Name | Cause in lexdb |
 |---|---|---|
 | 23502 | not_null_violation | NULL in a `NOT NULL` column. |
-| 23503 | foreign_key_violation | A row with no parent, or a parent row still referenced. |
+| 23503 | foreign_key_violation | A row with no parent, or a parent row still referenced; `ALTER CONSTRAINT ... ENFORCED` when a row has no parent. |
 | 23505 | unique_violation | A duplicate key in a primary key or unique constraint or index. |
-| 23514 | check_violation | A row a `CHECK` constraint refuses. |
+| 23514 | check_violation | A row a `CHECK` constraint refuses; `ALTER CONSTRAINT ... ENFORCED` when a row breaks it (`is violated by some row`). |
 
 ### Class 25: invalid transaction state
 
@@ -128,7 +128,7 @@ The codes are PostgreSQL's, with PostgreSQL's meaning. The first two characters 
 | 42725 | ambiguous_function | A call that more than one function matches. |
 | 42803 | grouping_error | A column that must be in `GROUP BY`; an aggregate where none is allowed. |
 | 42804 | datatype_mismatch | Values whose types cannot meet: `CASE`, `COALESCE`, `GREATEST`, `UNION` or `VALUES` over a number and a boolean. |
-| 42809 | wrong_object_type | An object of the wrong kind (a view where a table is needed; `ANY` without an array). |
+| 42809 | wrong_object_type | An object of the wrong kind (a view where a table is needed; `ANY` without an array); `ALTER CONSTRAINT ... ENFORCED` of a key. |
 | 42830 | invalid_foreign_key | A foreign key without a matching unique key, or with the wrong number of columns. |
 | 42846 | cannot_coerce | A cast lexdb does not have. |
 | 42883 | undefined_function | A function or operator that does not exist for those argument types. |
@@ -152,7 +152,7 @@ The codes are PostgreSQL's, with PostgreSQL's meaning. The first two characters 
 | 54000 | program_limit_exceeded | A value too large to build. |
 | 54001 | statement_too_complex | A recursive query past `max_recursion` rounds; a function calling itself too deep. |
 | 54011 | too_many_columns | `GROUPING` with 32 or more arguments. |
-| 55000 | object_not_in_prerequisite_state | `currval` or `lastval` before `nextval`; a primary-only function on a replica. |
+| 55000 | object_not_in_prerequisite_state | `currval` or `lastval` before `nextval`; a primary-only function on a replica; `VALIDATE CONSTRAINT` of a constraint that is `NOT ENFORCED`. |
 | 55006 | object_in_use | `DROP ROLE` of the current user. |
 | 55P03 | lock_not_available | `FOR UPDATE NOWAIT` on a locked row. |
 | 57014 | query_canceled | `statement_timeout` passed; `WAIT FOR LSN` timed out. |
@@ -331,6 +331,31 @@ RESET statement_timeout;
 SET
 ERROR:  57014: canceling statement due to statement timeout
 RESET
+```
+
+### H. Constraint states
+
+<!-- example: postgresql -->
+```sql
+\set VERBOSITY verbose
+CREATE TABLE pallet (id int PRIMARY KEY, kg int, CONSTRAINT kg_ck CHECK (kg > 0) NOT ENFORCED);
+INSERT INTO pallet VALUES (1, -1);
+ALTER TABLE pallet ALTER CONSTRAINT kg_ck ENFORCED;
+ALTER TABLE pallet ALTER CONSTRAINT pallet_pkey NOT ENFORCED;
+ALTER TABLE pallet ALTER CONSTRAINT kg_ck DEFERRABLE;
+ALTER TABLE pallet VALIDATE CONSTRAINT kg_ck;
+CREATE TABLE pallet2 (id int PRIMARY KEY NOT ENFORCED);
+```
+
+```text
+CREATE TABLE
+INSERT 0 1
+ERROR:  23514: check constraint "kg_ck" of relation "pallet" is violated by some row
+ERROR:  42809: cannot alter enforceability of constraint "pallet_pkey" of relation "pallet"
+HINT:  Only foreign key and check constraints can change enforceability.
+ERROR:  0A000: lexdb: ALTER CONSTRAINT ... DEFERRABLE is not supported
+ERROR:  55000: cannot validate NOT ENFORCED constraint
+ERROR:  42601: misplaced NOT ENFORCED clause
 ```
 
 ## See also
