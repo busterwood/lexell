@@ -1207,3 +1207,58 @@ read only to build the call's argument.
 on the chain of dependent loads from one node to the next (about 5 cycles a level) and the call
 and return. The argument rule would take another 1%. Java's lead in lists (1.48) is not in the
 saved registers, so section 22's reading of it is corrected here.
+
+## 30. Jumps to a jmp go to its target (as built)
+
+`interp`'s match ended each case with a jump to the end of the match, where the only code was the
+`while true` loop's jump back to its top. So every instruction the interpreter ran took two
+unconditional jumps in a row.
+
+- **The count.** Lexell needed 25.5 instructions, 7.9 branches and 6.85 cycles an interpreted
+  instruction, against Rust's 22.4, 6.0 and 5.9.
+- **Branch misses** were negligible (6,401 in all), so the loop was limited by taken jumps and
+  instructions, not by prediction.
+- **perf20** had counted the general case: 1,019 static sites in the self-build. This loop runs
+  one 170 million times.
+
+**The change** (x64.lxl `thread`, called by `layout` before the reach check):
+
+- **Retargeting.** A jump or jcc to one of the function's labels where a jmp to another of its
+  labels stands now goes to that jmp's target, along a chain of up to 8.
+- **Recognising a jmp.** A jmp is known by its fix-up (op 1, at its position), so bytes that only
+  look like one, such as a jump table's entries, are never followed.
+- **The bypassed jmp** stays where it is: still the target of the code that falls into it, or
+  dead.
+- **The lookup.** The jmps' positions are in code order, so a binary search finds them. A first
+  version used a map per function, which cost +0.14% compile instructions.
+
+In the self-built compiler, jumps whose target is a jmp go from 501 to 45. The 45 left go to
+jmps outside the function or to labels made before it.
+
+| measure (f63b11f7 against this) | instructions | cycles |
+|---|---:|---:|
+| bench interp (`-O`, 4 placements, best of 3) | -3.92% | -26.8% (apart; 1,188.9M to 870.8M) |
+| nbody / closures / matmul / pingpong | 0 / -0.3 / 0 / 0% | 0 / +0.9 / 0 / +0.2%, none apart |
+| perfsuite run suite (4 placements) | -0.01% | +0.11%, none apart |
+| compile of the compiler (binary-search version) | level (5,582.8-5,584.0M against 5,583.7-5,583.9M) | |
+| apps regex / json / jq / cmark / decimal | 0 / 0 / 0 / -0.1 / -0.2% | 0 / -0.1 / +3.2 / -0.3 / -0.1% |
+| TPC-H SF1, server instructions per query (22) | -0.29% geomean (q18 -0.7%) | |
+| lexdb point select (icount6, 2 rounds) | -0.15% (170,562-170,593 against 170,801-170,945) | |
+
+- **jq's +3.2%** came from one placement. At four, its medians are 962.9M against 970.9M, with
+  overlapping ranges (957.7-969.2M against 963.2-978.3M).
+- **interp is now ahead of Rust's port** (1,005M cycles).
+
+**The judgement.** perfsuite's run suite does not contain interp: its frozen inputs predate the
+five programs added on 23 November. So the change does not meet "Judging a pass" as written.
+It was kept because it runs no new instruction anywhere, costs no compile time, and makes one
+program 27% faster.
+
+The first lexdb run had two failures. Three reruns passed 360 of 360, two of them with this
+compiler confirmed by comparing it byte for byte. Another session's lexdb work was running on
+the machine at the time.
+
+Test: tests/run/native_jump_threading: a match in a loop whose cases end in jumps to the jump
+back to the top, nested loops with break and continue, if chains whose branches all end in
+jumps to one place, and returns from a loop. It runs on --c, --native and -O, and the expected
+output is the previous compiler's.

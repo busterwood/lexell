@@ -657,6 +657,46 @@ fn upTo(keys: &[]int, p: int): int {
     return lo
 }
 
+// Jump threading: each jump (from fix-up f0 on) to a label of the function (from first on) where
+// a jmp to another such label stands goes to that jmp's target instead, along a chain of at most 8
+// (a case of a match that jumps to the jmp back to its loop's top: one taken jump instead of two).
+// A jmp is known by its fix-up, so bytes that only look like one (in a jump table) are not.
+fn (a: mut &Asm) thread(f0: int, first: int) {
+    // the jmps to the function's labels, by position (the fix-ups are in the order of the code)
+    var jat: []int = []
+    var jl: []int = []
+    for i in f0..len(a.fixes) {
+        let f = a.fixes[i]
+        if f.op == 1 && f.label >= first {
+            append(mut &jat, f.at - 1)
+            append(mut &jl, f.label)
+        }
+    }
+    if len(jat) == 0 { return }
+    for i in f0..len(a.fixes) {
+        let f = a.fixes[i]
+        if f.op == 0 || f.label < first { continue }
+        var l = f.label
+        var n = 0
+        while n < 8 && a.labels[l] >= 0 {
+            // the jmp at the label's position, if any
+            let p = a.labels[l]
+            var lo = 0
+            var hi = len(jat)
+            while lo < hi {
+                let m = (lo + hi) / 2
+                if jat[m] < p { lo = m + 1 } else { hi = m }
+            }
+            if lo == len(jat) || jat[lo] != p { break }
+            let next = jl[lo]
+            if next == l || next == f.label { break }
+            l = next
+            n += 1
+        }
+        if l != f.label { a.fixes[i].label = l }
+    }
+}
+
 // Lays out a function's code, generated from position start since label first was made, in one
 // pass: the prologue pro inserted at at (where the guards end), the pads before its loops
 // (loopPad; tops[j] and ends[j] the positions of the loops' tops and ends in the order of the
@@ -670,6 +710,7 @@ pub fn (a: mut &Asm) layout(start: int, at: int, pro: &[]byte, tops: &[]int, end
     guards: &[]int, lines: int): int {
     var f0 = len(a.fixes)
     while f0 > 0 && a.fixes[f0 - 1].at >= start { f0 -= 1 }
+    if short { a.thread(f0, first) }
     // the jumps that may be short (fix-up indexes, in the order of the code) and their ends
     var js: []int = []
     var jend: []int = []
