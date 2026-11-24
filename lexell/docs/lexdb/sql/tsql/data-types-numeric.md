@@ -23,8 +23,9 @@ real
 
 `tinyint`, `smallint`, `int`, `bigint`
 : Integers of 1, 2, 4 and 8 bytes. `tinyint` is 0 to 255, `smallint` -32768 to 32767, `int` -2147483648 to
-  2147483647, `bigint` -9223372036854775808 to 9223372036854775807. A value out of range for `smallint`, `int` or
-  `bigint` is error 8115, and so is a sum, difference or product of integers that does not fit (`2147483647 + 1`).
+  2147483647, `bigint` -9223372036854775808 to 9223372036854775807. A number out of range for `tinyint` is error 220
+  (error 244 for a string, NULL for `TRY_CAST`); out of range for `smallint`, `int` or `bigint` it is error 8115, and
+  so is a sum, difference or product of integers that does not fit (`2147483647 + 1`).
 
 `decimal`, `numeric`
 : The same type. An exact decimal number with *precision* significant digits (1 to 38, default 18) and *scale*
@@ -56,8 +57,6 @@ real
 
 ## Differences from SQL Server
 
-- **`tinyint` is not range-checked.** `CAST(256 AS tinyint)` is 256 and `CAST(-1 AS tinyint)` is -1; a column of
-  type `tinyint` stores 256 and -1 as well. (`smallint` is checked: 8115.)
 - **`smallmoney` is `numeric(10,4)`**: it takes up to 999999.9999 where SQL Server stops at 214748.3647, and it
   refuses a larger value with 8115 (`numeric field overflow`). `money` is `numeric(19,4)`, as SQL Server's range
   suggests, but is named `decimal` in `sys.columns` after `SELECT INTO`.
@@ -316,7 +315,7 @@ variable constant quotient
 (1 row affected)
 ```
 
-### K. tinyint is not range-checked
+### K. tinyint and smallint are range-checked
 
 <!-- example: tsql -->
 ```sql
@@ -324,22 +323,44 @@ CREATE TABLE tt (a tinyint, b smallint);
 INSERT INTO tt VALUES (255, 32767), (256, 1), (-1, 1);
 SELECT * FROM tt;
 GO
+INSERT INTO tt VALUES (255, 32767);
 INSERT INTO tt VALUES (1, 32768);
+INSERT INTO tt VALUES ('300', 1);
+SELECT * FROM tt;
+GO
+SELECT CAST(255 AS tinyint) AS ok, TRY_CAST(256 AS tinyint) AS try_cast;
+GO
+SELECT CAST(256 AS tinyint) AS too_big;
 ```
 
 ```text
-(3 rows affected)
+Msg 220, Level 16, State 1, Line 2
+Arithmetic overflow error for data type tinyint, value = 256.
+a b
+- -
 
+(0 rows affected)
+
+(1 row affected)
+
+Msg 8115, Level 16, State 1, Line 2
+Arithmetic overflow error converting expression to data type smallint.
+Msg 244, Level 16, State 1, Line 3
+The conversion of the varchar value '300' overflowed an INT1 column. Use a larger integer column.
 a   b
 --- -----
 255 32767
-256 1
--1  1
 
-(3 rows affected)
+(1 row affected)
 
-Msg 8115, Level 16, State 1, Line 1
-Arithmetic overflow error converting expression to data type smallint.
+ok  try_cast
+--- --------
+255 NULL
+
+(1 row affected)
+
+Msg 220, Level 16, State 1, Line 1
+Arithmetic overflow error for data type tinyint, value = 256.
 ```
 
 ## See also
