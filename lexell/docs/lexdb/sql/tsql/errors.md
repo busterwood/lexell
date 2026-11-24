@@ -116,9 +116,9 @@ feature, the number is **50000**.
 ## Differences from SQL Server
 
 - A few messages differ in wording from SQL Server's (see the examples); the numbers and levels are the ones listed.
-- Error 8115 for a decimal that does not fit says `numeric field overflow: ...` and for an integer says
-  `integer out of range`; SQL Server's `Arithmetic overflow error converting numeric to data type numeric` appears
-  only for some expressions.
+- Error 8115 for an integer that does not fit says SQL Server's `Arithmetic overflow error converting expression to
+  data type int.` (or `smallint`); for a decimal that does not fit it says `numeric field overflow: ...`, where SQL
+  Server says `Arithmetic overflow error converting numeric to data type numeric`.
 - A unique index violation is 2627 (SQL Server: 2601).
 
 ## Examples
@@ -243,7 +243,7 @@ Conversion failed when converting the varchar value 'x' to data type int.
 Msg 241, Level 16, State 1, Line 3
 Conversion failed when converting date and/or time from character string.
 Msg 8115, Level 16, State 1, Line 4
-integer out of range
+Arithmetic overflow error converting expression to data type int.
 Msg 517, Level 16, State 1, Line 5
 date/time field value out of range: "2026-02-30"
 Msg 8114, Level 16, State 1, Line 6
