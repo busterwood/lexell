@@ -40,6 +40,8 @@ parameter:
 - A procedure is called from a block (`my_proc(1, 2);`), with `CALL`, or with `EXEC`: see [CALL](call.md). Arguments
   go by position, or by name (`p_id => 2`) after the positional ones.
 - A procedure may call itself and other procedures.
+- An `OUT` or `IN OUT` argument may be a package variable of another package (`p(pkg.v);`): it is assigned when the
+  call ends, and an error leaves it as it was (see [CREATE PACKAGE](create-package.md), example G).
 - A body that does not compile (a call of a procedure that does not exist, an unknown identifier) does not stop the
   statement: the procedure is stored **invalid**, and SQL\*Plus says "Warning: Procedure created with compilation
   errors." `USER_OBJECTS.STATUS` is `INVALID`, and `USER_ERRORS` and `ALL_ERRORS` hold the `PLS-` errors with their

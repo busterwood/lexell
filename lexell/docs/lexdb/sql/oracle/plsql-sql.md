@@ -40,6 +40,9 @@ COMMIT ;   ROLLBACK [ TO savepoint ] ;   SAVEPOINT name ;
 - DDL (`CREATE TABLE`, ...) is not allowed directly in a block (PLS-00103): write it in `EXECUTE IMMEDIATE`.
 - `SQL%ROWCOUNT` and the other implicit cursor attributes describe the last statement: see [cursors](plsql-cursors.md).
 - `EXECUTE IMMEDIATE` with a bad statement raises the SQL error (for example ORA-00942).
+- A package variable is a target of `SELECT ... INTO`, of `RETURNING ... INTO`, of `EXECUTE IMMEDIATE ... INTO` and of
+  `USING OUT`, from outside the package too. It is assigned when the statement has ended: an error leaves it as it
+  was (example D).
 
 ## Differences from Oracle
 
@@ -124,7 +127,35 @@ dyn 42
 PL/SQL procedure successfully completed.
 ```
 
-### D. Errors
+### D. Package variables as targets
+
+<!-- example: oracle -->
+```sql
+CREATE OR REPLACE PACKAGE acc AS
+  g_name VARCHAR2(20);
+  g_salary NUMBER;
+  g_id NUMBER;
+END acc;
+/
+BEGIN
+  SELECT name INTO acc.g_name FROM emp WHERE id = 3;
+  UPDATE emp SET salary = salary + 1 WHERE id = 3 RETURNING salary INTO acc.g_salary;
+  EXECUTE IMMEDIATE 'SELECT id FROM emp WHERE name = :n' INTO acc.g_id USING acc.g_name;
+  DBMS_OUTPUT.PUT_LINE(acc.g_name || ' ' || acc.g_id || ' ' || acc.g_salary);
+  ROLLBACK;
+END;
+/
+```
+
+```text
+Package created.
+
+cy 3 301
+
+PL/SQL procedure successfully completed.
+```
+
+### E. Errors
 
 <!-- example: oracle -->
 ```sql

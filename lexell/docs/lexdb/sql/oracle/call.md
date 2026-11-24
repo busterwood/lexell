@@ -28,7 +28,8 @@ EXEC[UTE] { procedure | package.procedure } [ ( [ argument [, ...] ] ) ] ;
   A procedure that prints with `DBMS_OUTPUT` shows its output before the client's confirmation.
 - A unit that does not exist is ORA-06550 with PLS-00201 (`identifier ... must be declared`); a wrong number of
   arguments is PLS-00306.
-- In a block, call a unit directly: `p(1);` or `pkg.p(1);`.
+- In a block, call a unit directly: `p(1);` or `pkg.p(1);`. An `OUT` argument may be a package variable
+  (`p(pkg.v);`, see [CREATE PACKAGE](create-package.md), example G).
 
 ## Differences from Oracle
 

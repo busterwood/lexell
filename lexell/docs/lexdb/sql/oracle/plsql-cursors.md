@@ -53,6 +53,8 @@ SQL%FOUND    SQL%NOTFOUND    SQL%ISOPEN    SQL%ROWCOUNT
 
 - A cursor must be closed before it is opened again (`CURSOR_ALREADY_OPEN`); using one that is not open is
   `INVALID_CURSOR`.
+- `FETCH ... INTO` may name a package variable from outside the package (`FETCH c INTO pkg.v;`): see
+  [CREATE PACKAGE](create-package.md), example G.
 - A cursor `FOR` loop is the shortest way to read all rows: no `OPEN`, `FETCH`, `CLOSE` or `%NOTFOUND` test.
 - A client reads the result of a `REF CURSOR` that an `OUT` parameter or a function returns: see
   [CREATE FUNCTION](create-function.md).
