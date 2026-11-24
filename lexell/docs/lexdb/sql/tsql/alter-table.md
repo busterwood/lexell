@@ -34,7 +34,7 @@ ALTER TABLE { database_name.schema_name.table_name | schema_name.table_name | ta
 `ADD CONSTRAINT` *table_constraint*
 : Adds a `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY` or `CHECK` constraint. The existing rows are checked first. A
   `PRIMARY KEY` or `UNIQUE` may be `CLUSTERED` or `NONCLUSTERED` (labels: see [CREATE INDEX](create-index.md)); a
-  table that has a primary key refuses a second one.
+  table that has a primary key refuses a second one (error 1779; `CREATE TABLE` gives 8110).
 
 `ALTER COLUMN` *column_name* *new_data_type*
 : Changes the column's type, and with `NULL` or `NOT NULL` whether it may hold NULL. The rows are converted; a value
@@ -65,8 +65,6 @@ ALTER TABLE { database_name.schema_name.table_name | schema_name.table_name | ta
 - Adding a `NOT NULL` column without a default to a table with rows is error 515 with lexdb's text (SQL Server:
   4901). A column that already exists is 50000 (SQL Server: 2705); dropping an unknown column is 207 (SQL Server:
   4924).
-- A second primary key by `ADD CONSTRAINT` is error 50000 (`multiple primary keys for table "emp" are not allowed`;
-  SQL Server: 8110, which `CREATE TABLE` does give).
 - PostgreSQL's `VALIDATE CONSTRAINT` and `SET SCHEMA` are taken in this door.
 
 ## Examples
@@ -210,8 +208,8 @@ Msg 4902, Level 16, State 1, Line 3
 Cannot find the object "nothere" because it does not exist or you do not have permissions.
 Msg 207, Level 16, State 1, Line 1
 Invalid column name 'nothere'.
-Msg 50000, Level 16, State 1, Line 1
-multiple primary keys for table "emp" are not allowed
+Msg 1779, Level 16, State 1, Line 1
+Table 'emp' already has a primary key defined on it.
 ```
 
 ### G. CLUSTERED and NONCLUSTERED in a constraint
