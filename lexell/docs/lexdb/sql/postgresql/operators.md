@@ -102,8 +102,9 @@ As in PostgreSQL, `-2 ^ 2` is 4 (the minus binds first) and `2 ^ 3 ^ 2` is 64 (l
 
 ## Differences from PostgreSQL
 
-- Arithmetic on bare integer constants does not overflow (`SELECT 2147483647 + 1` is 2147483648); with a cast or on
-  columns it does (22003: see [numeric types](data-types-numeric.md)).
+- Arithmetic on integer constants overflows in a select list (`SELECT 2147483647 + 1` is 22003), as in PostgreSQL; in
+  `WHERE`, `ON`, `HAVING` and `ORDER BY` it is not checked (computed as `bigint`). With a cast or on columns it
+  overflows everywhere (see [numeric types](data-types-numeric.md)).
 - `~~`, `~~*`, `!~~`, `!~~*` (LIKE spelled as operators), `^@` (starts with), `@` (absolute value), `|/` and `||/`
   (roots), `!` (factorial), `OVERLAPS` and the JSON, range, geometric and network operators do not exist.
 - `OPERATOR(pg_catalog.+)` syntax and user-defined operators are not taken.

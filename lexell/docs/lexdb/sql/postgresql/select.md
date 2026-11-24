@@ -99,7 +99,9 @@ A query in parentheses, `( select )`, may stand where a `select` does, and takes
 
 `LIMIT` *count*, `FETCH FIRST` *count* `ROWS ONLY`
 : Returns at most *count* rows. `LIMIT ALL` is no limit. `FETCH` without a count is one row. `WITH TIES` also
-  returns the rows that tie with the last row by `ORDER BY`, and needs an `ORDER BY`.
+  returns the rows that tie with the last row by `ORDER BY`, and needs an `ORDER BY`. A `LIMIT` without `ORDER BY`
+  also ends an endless recursive `WITH` query once it has its rows, when a `WHERE`, a join or a derived table
+  filters them (see [WITH](with.md)).
 
 `OFFSET` *start*
 : Skips *start* rows first.
@@ -267,6 +269,23 @@ SELECT name, dept_id FROM emp ORDER BY dept_id FETCH FIRST 1 ROW WITH TIES;
  ben  |       1
  cy   |       1
 (2 rows)
+```
+
+A `LIMIT` stops a recursive query that has no end of its own, with a `WHERE` on its rows (see [WITH](with.md)):
+
+<!-- example: postgresql -->
+```sql
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n)
+SELECT i FROM n WHERE i % 7 = 0 FETCH FIRST 3 ROWS ONLY;
+```
+
+```text
+ i
+----
+  7
+ 14
+ 21
+(3 rows)
 ```
 
 ### E. Subqueries in FROM, and LATERAL
