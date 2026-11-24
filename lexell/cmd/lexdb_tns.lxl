@@ -130,9 +130,9 @@ const MAX_STRING = 4000                 // a bind buffer over this is a LONG one
 
 // ---- bytes out
 
-type Out = record { b: []byte; sb1u: bool; lobPre: bool }   // sb1u: the client's table has SB1 universal (JDBC): a scale is a signed variable-length integer
+type Out = record { b: []byte; sb1u: bool; lobPre: bool; warn: bool }   // sb1u: the client's table has SB1 universal (JDBC): a scale is a signed variable-length integer
 
-fn newOut(): Out { return Out{b: [], sb1u: false, lobPre: false} }
+fn newOut(): Out { return Out{b: [], sb1u: false, lobPre: false, warn: false} }
 
 fn (o: mut &Out) u8(v: int) { append(mut &o.b, byte(v & 0xff)) }
 fn (o: mut &Out) u16be(v: int) {
@@ -705,8 +705,10 @@ fn rerr(msg: &str): tns.Error { return sqldialect.dbError(sqldialect.E_PROTOCOL,
 
 // A string whose length n was sent before it: python-oracledb follows it with a length byte (or a chunked
 // 0xfe form), JDBC's thin driver sends the bare bytes.
-fn lenStr(c: mut &tns.Cur, d: &str, n: int, what: &str): Result[str, tns.Error] {
-    if c.pos < len(d) && ((int(d[c.pos]) == n && n < 0xfd) || int(d[c.pos]) == 0xfe) {
+// A bare text whose first byte equals its length is not told from a length byte by its bytes (a SELECT of 83 bytes starts
+// with S, 83): the client's table of types says whose it is (jdbc).
+pub fn lenStr(c: mut &tns.Cur, d: &str, n: int, what: &str, jdbc: bool): Result[str, tns.Error] {
+    if c.pos < len(d) && ((int(d[c.pos]) == n && n < 0xfd && !jdbc) || int(d[c.pos]) == 0xfe) {
         return c.bytesOrEmpty(&what)
     }
     if n < 0 || c.pos + n > len(d) {
@@ -720,9 +722,9 @@ fn lenStr(c: mut &tns.Cur, d: &str, n: int, what: &str): Result[str, tns.Error] 
 
 // One request, from the bytes of its packets so far. Err(SHORT) when it
 // goes on in the next one.
-fn parseRequest(d: &str, fv: int, lenient: bool, cursors: &[]Cursor): Result[Req, str] {
+fn parseRequest(d: &str, fv: int, lenient: bool, jdbc: bool, cursors: &[]Cursor): Result[Req, str] {
     var c = tns.cursor(&d)
-    match readRequest(mut &c, d, fv, lenient, cursors) {
+    match readRequest(mut &c, d, fv, lenient, jdbc, cursors) {
         Ok(r) { return Ok(r) }
         Err(e) {
             if c.short { return Err(SHORT) }
@@ -820,7 +822,7 @@ fn readValues(c: mut &tns.Cur, d: &str, meta: &[]BindMeta, sites: &[]tns.Site, k
     return Ok(Unit{})
 }
 
-fn readRequest(c: mut &tns.Cur, d: &str, fv: int, lenient: bool, cursors: &[]Cursor): Result[Req, tns.Error] {
+fn readRequest(c: mut &tns.Cur, d: &str, fv: int, lenient: bool, jdbc: bool, cursors: &[]Cursor): Result[Req, tns.Error] {
     var r = newReq()
     while true {
         let mt = try c.u8("message type")
@@ -831,7 +833,7 @@ fn readRequest(c: mut &tns.Cur, d: &str, fv: int, lenient: bool, cursors: &[]Cur
             if code == FN_SET_SCHEMA {
                 try c.skip(1, "piggyback")
                 let n = try c.ub4("piggyback")
-                if n > 0 { r.schema = try lenStr(mut &c, d, n, "schema") }
+                if n > 0 { r.schema = try lenStr(mut &c, d, n, "schema", jdbc) }
                 r.hasSchema = true
                 continue
             }
@@ -869,7 +871,7 @@ fn readRequest(c: mut &tns.Cur, d: &str, fv: int, lenient: bool, cursors: &[]Cur
                 for k in 0..5 {
                     if (flags & bits[k]) != 0 {
                         r.e2e[k] = "\x01"
-                        if lens[k] > 0 { r.e2e[k] = "\x01" + (try lenStr(mut &c, d, lens[k], "piggyback")) }
+                        if lens[k] > 0 { r.e2e[k] = "\x01" + (try lenStr(mut &c, d, lens[k], "piggyback", jdbc)) }
                     }
                 }
                 continue
@@ -922,7 +924,7 @@ fn readRequest(c: mut &tns.Cur, d: &str, fv: int, lenient: bool, cursors: &[]Cur
             try c.skip(1, "authentication")
             let np = try c.ub4("authentication")
             try c.skip(2, "authentication")
-            if has != 0 && ulen > 0 { r.user = try lenStr(mut &c, d, ulen, "user") }
+            if has != 0 && ulen > 0 { r.user = try lenStr(mut &c, d, ulen, "user", jdbc) }
             if np > 1000 { return Err(rerr("too many authentication pairs")) }
             for i in 0..np {
                 let k = try c.str2("key")
@@ -949,7 +951,7 @@ fn readRequest(c: mut &tns.Cur, d: &str, fv: int, lenient: bool, cursors: &[]Cur
                 try skipSeq(c, "bUbUb")
                 if fv >= 9 { try skipSeq(c, "bU") }
             }
-            if r.parse { r.sql = try lenStr(mut &c, d, sl, "sql") }
+            if r.parse { r.sql = try lenStr(mut &c, d, sl, "sql", jdbc) }
             r.batchErrors = (r.options & OPT_BATCH_ERRORS) != 0
             // the 13 words that follow the text; the second is the runs, the tenth the flags
             // (a request cut in two is waited for, unless the packet was not full: then it is all there is)
@@ -1142,7 +1144,9 @@ fn (c: mut &Conn) endCall(num: int, text: &str, cursor: int, rows: int) {
     c.o.ubs(2)
     c.o.ub(cursor)
     c.o.ub(0)
-    c.o.zeros(6)
+    c.o.zeros(5)
+    c.o.u8(if c.o.warn { 0x21 } else { 0 })     // the warning flags: success with a compilation error (JDBC's SQLWarning, ORA-17110)
+    c.o.warn = false
     c.o.ubs(2)
     c.o.zeros(1)
     c.o.ubs(2)
@@ -1199,8 +1203,22 @@ fn (c: mut &Conn) oraErr(e: &DbErr): OraErr {
     return oraOf(e, &c.user)
 }
 
+// A sequence that is not there (nextval's lookup says "relation"): whether the statement of cursor names it as NAME.NEXTVAL or
+// NAME.CURRVAL, which Oracle answers ORA-02289.
+fn (c: &Conn) seqMissing(e: &DbErr, cursor: int): bool {
+    if e.state != "42P01" || !strings.startsWith(&e.msg, "relation \"") || cursor <= 0 { return false }
+    let ci = c.find(cursor)
+    if ci < 0 { return false }
+    let end = strings.indexOf(&e.msg, "\" does not exist", 10)
+    if end < 0 { return false }
+    let q = strings.toLowerAscii(&c.cursors[ci].sql)
+    let nm = strings.toLowerAscii(&e.msg[10..end].toStr())
+    return strings.contains(&q, &(nm + ".nextval")) || strings.contains(&q, &(nm + ".currval"))
+}
+
 fn (c: mut &Conn) fail(e: &DbErr, cursor: int) {
-    let x = c.oraErr(e)
+    var x = c.oraErr(e)
+    if c.seqMissing(e, cursor) { x = OraErr{num: 2289, text: "sequence does not exist"} }
     c.endCall(x.num, &(oraText(x.num, &x.text)), cursor, 0)
 }
 
@@ -2128,6 +2146,7 @@ fn (c: mut &Conn) execute(rq: &Req) {
     match runs.failed {
         Some(e) {
             var x = c.oraErr(&e)
+            if c.seqMissing(&e, id) { x = OraErr{num: 2289, text: "sequence does not exist"} }
             let jj = c.find(id)
             if x.num == 1400 && jj >= 0 && (strings.startsWith(&strings.toLowerAscii(&(strings.trim(&c.cursors[jj].sql))), "update") || e.context == "update") {
                 x = OraErr{num: 1407, text: "cannot update (" + x.text[strings.indexOf(&x.text, "(", 0) + 1..len(x.text) - 1].toStr() + ") to NULL"}
@@ -2310,7 +2329,8 @@ fn (c: mut &Conn) runPlsql(i: int, rq: &Req) {
     let id = c.cursors[i].id
     let sql0 = &c.cursors[i].sql
     var sql = sql0.clone()
-    if strings.startsWith(&(strings.toUpperAscii(&(strings.trim(sql0)))), "CALL") { sql = lexdb_plsql.callToBlock(sql0) }
+    let isCall = strings.startsWith(&(strings.toUpperAscii(&(strings.trim(sql0)))), "CALL")
+    if isCall { sql = lexdb_plsql.callToBlock(sql0) }
     let eb = lexdb_plsql.execToBlock(sql0)
     if len(eb) > 0 { sql = eb }
     let ns = len(c.cursors[i].sites)
@@ -2332,6 +2352,7 @@ fn (c: mut &Conn) runPlsql(i: int, rq: &Req) {
             return
         }
     }
+    lexdb_plsql.revalidate(mut &c.prog, mut &c.pl, &sql)
     // each run of an array execution (executemany): the block run again with the next row's values; the last run's OUT binds are the call's
     for run in 0..runs {
         var binds: []lexdb_plsql.BindIn = []
@@ -2376,6 +2397,17 @@ fn (c: mut &Conn) runPlsql(i: int, rq: &Req) {
     match res.err {
         Some(e) {
             let fe = lexdb_plsql.finalError(&e)
+            // (CALL of an invalid unit: ORA-06575, where a block gets PLS-00905 inside ORA-06550)
+            let at = strings.indexOf(&fe.text, "PLS-00905: object ", 0)
+            if fe.num == 6550 && at >= 0 && isCall {
+                let rest = fe.text[at + 18..len(fe.text)].toStr()
+                let dot = strings.indexOf(&rest, ".", 0)
+                let sp = strings.indexOf(&rest, " ", 0)
+                if dot >= 0 && sp > dot {
+                    c.failOra(6575, &("Package or function " + rest[dot + 1..sp] + " is in an invalid state"), id)
+                    return
+                }
+            }
             c.endCall(fe.num, &(oraText(fe.num, &fe.text)), id, 0)
             return
         }
@@ -2442,17 +2474,22 @@ fn (c: mut &Conn) unitDdl(ud: int, sql: &str, id: int) {
                 Err(e) { r = Err(e) }
             }
         }
+        else if ud == 3 { r = lexdb_plsql.compileUnit(&c.prog, mut &c.pl, mut &c.sess, sql, c.isSuper()) }
     }
     match r {
         Ok(warn) {
             if warn {
-                // stored, but invalid: ORA-24344 as a warning of the call
-                let wt = oraText(24344, "success with compilation error")
-                c.o.u8(tns.MT_WARNING)
-                c.o.ub(24344)
-                c.o.ub(len(wt))
-                c.o.ub(0)
-                c.o.bytes(&wt)
+                // stored, but invalid: the call's ERROR message carries the warning flags (Oracle sends nothing else; lib/oracle
+                // reads ORA-24344 from a WARNING message, which JDBC would read bare)
+                c.o.warn = true
+                if !c.o.sb1u {
+                    let wt = oraText(24344, "success with compilation error")
+                    c.o.u8(tns.MT_WARNING)
+                    c.o.ub(24344)
+                    c.o.ub(len(wt))
+                    c.o.ub(0)
+                    c.o.bytes(&wt)
+                }
             }
             c.endCall(0, "", id, 0)
         }
@@ -3283,7 +3320,7 @@ fn (c: mut &Conn) requests(): Result[Unit, str] {
         pending = pending + p.data[2..len(p.data)]
         // before the login a request is a few hundred bytes: a small cap, so no one costs the server a 64 MiB re-parse
         if requestTooBig(c.loggedIn, len(pending)) { return Err("a request larger than " + (if c.loggedIn { MAX_REQUEST } else { MAX_PREAUTH_REQUEST }).toStr() + " bytes") }
-        match parseRequest(&pending, c.fv, len(p.data) < c.w.sdu - 24, &c.cursors) {
+        match parseRequest(&pending, c.fv, len(p.data) < c.w.sdu - 24, c.o.sb1u, &c.cursors) {
             Ok(rq) {
                 pending = ""
                 let more = c.dispatch(&rq)

@@ -506,7 +506,7 @@ fn (cx: mut &Cx) newSid(): int {
 
 // ---- the state of a connection's PL/SQL
 
-type Stored = record { owner: str; name: str; kind: str; src: str }
+type Stored = record { owner: str; name: str; kind: str; src: str; err: str }
 
 // An open cursor: the rows its query gave, read as it is fetched.
 type Cur = record { cols: []lexdb_bind.OutCol; rows: [][]Val; pos: int; open: bool }
@@ -575,10 +575,12 @@ fn bumpVer(st: &lexdb_store.Store) { let nv = (memoVer(st) + 1).toStr()
     st.memo.put(&MEMO_VER, &nv) }
 
 // Writes (src nonempty) or deletes (src empty) a unit's source, in a transaction of its own.
-pub fn putSource(st: &lexdb_store.Store, owner: &str, kind: &str, name: &str, src: &str): Result[Unit, DbErr] {
+// (err: the compile error of a unit stored invalid, kept after the source behind a NUL.)
+pub fn putSource(st: &lexdb_store.Store, owner: &str, kind: &str, name: &str, src: &str, err: &str): Result[Unit, DbErr] {
     var t = lexdb_store.begin()
     if len(src) > 0 {
-        match t.put(lexdb_catalog.CATALOG, &(srcKey(owner, kind, name)), src) {
+        let val = if len(err) > 0 { src + "\x00" + err } else { src.toStr() }
+        match t.put(lexdb_catalog.CATALOG, &(srcKey(owner, kind, name)), &val) {
             Ok(_) {}
             Err(e) {
                 st.abort(t)
@@ -603,7 +605,10 @@ fn loadStored(ip: mut &Ip): Result[Unit, DbErr] {
     let r = ip.st.scan(mut &t, lexdb_catalog.CATALOG, SRC_PRE, &(SRC_PRE + "\xff"), fn(en: &lexdb_store.Entry): bool {
         let k = en.key[len(SRC_PRE)..len(en.key)]
         let f = strings.split(&k, "\x00")
-        if len(f) == 3 { append(mut &out, Stored{owner: f[0].toStr(), kind: f[1].toStr(), name: f[2].toStr(), src: en.val.clone()}) }
+        if len(f) == 3 {
+            let at = strings.indexOf(&en.val, "\x00", 0)
+            append(mut &out, Stored{owner: f[0].toStr(), kind: f[1].toStr(), name: f[2].toStr(), src: if at < 0 { en.val.clone() } else { en.val[0..at].toStr() }, err: if at < 0 { "" } else { en.val[at + 1..len(en.val)].toStr() }})
+        }
         return true
     })
     ip.st.abort(t)
@@ -677,9 +682,10 @@ pub type Prog = record {
     ddl: int
     errs: []str
     denied: []str           // "OWNER.NAME" of the standalone units the session's user may not execute (another owner's, not granted to it)
+    revals: []Stored        // stored units that were invalid and compile now: valid again when a block that names one runs
 }
 
-pub fn newProg(): Prog { return Prog{units: [], ver: -1, ddl: -1, errs: [], denied: []} }
+pub fn newProg(): Prog { return Prog{units: [], ver: -1, ddl: -1, errs: [], denied: [], revals: []} }
 
 // Whether the user may not run a unit of its own name (EXECUTE was not granted; the owner's, a superuser's and a package's are free).
 fn (pg: &Prog) deniedUnit(owner: &str, name: &str): bool {
@@ -3799,13 +3805,15 @@ pub fn ensureProg(pg: mut &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session): Re
     var specs: []Stored = []
     var bodies: []Stored = []
     for s in ip.stored {
-        let c = Stored{owner: s.owner.clone(), name: s.name.clone(), kind: s.kind.clone(), src: s.src.clone()}
+        let c = Stored{owner: s.owner.clone(), name: s.name.clone(), kind: s.kind.clone(), src: s.src.clone(), err: s.err.clone()}
         if s.kind == "PROCEDURE" || s.kind == "FUNCTION" { append(mut &srcs, c) }
         else if s.kind == "PACKAGE" { append(mut &specs, c) }
         else if s.kind == "PACKAGE BODY" { append(mut &bodies, c) }
     }
     ip.scache = []
     var units: []PUnit = []
+    var flips: []Stored = []
+    var revals: []Stored = []
     var sigs: []SigEntry = []
     for s in srcs {
         let save = if s.owner != ip.user { sess.actAsSchema(&strings.toLowerAscii(&s.owner)) } else { lexdb_exec.noSave() }
@@ -3832,7 +3840,11 @@ pub fn ensureProg(pg: mut &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session): Re
         let built = compileStored(ip, sess, &s.src, &s.owner, cloneSigs(&sigs), false)
         if s.owner != ip.user { sess.backToSchema(&save) }
         match built {
-            Ok(u) { append(mut &units, u) }
+            Ok(u) {
+                append(mut &units, u)
+                // (a unit stored invalid that compiles now is valid again when it is used: Oracle revalidates it then, `revalidate`)
+                if len(s.err) > 0 { append(mut &revals, Stored{owner: s.owner.clone(), name: s.name.clone(), kind: s.kind.clone(), src: s.src.clone(), err: ""}) }
+            }
             Err(e) {
                 var u = emptyUnit()
                 u.owner = s.owner.clone()
@@ -3840,6 +3852,8 @@ pub fn ensureProg(pg: mut &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session): Re
                 u.kind = if s.kind == "FUNCTION" { U_FUNC } else { U_PROC }
                 u.bad = e.msg.clone()
                 append(mut &units, u)
+                // (a unit whose dependency went: invalid, with its error for USER_ERRORS)
+                if len(s.err) == 0 { append(mut &flips, Stored{owner: s.owner.clone(), name: s.name.clone(), kind: s.kind.clone(), src: s.src.clone(), err: e.msg.clone()}) }
             }
         }
     }
@@ -3862,7 +3876,27 @@ pub fn ensureProg(pg: mut &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session): Re
     pg.ddl = ip.ddl
     ip.keep = len(ip.scache)
     pg.denied = try sess.unitsDenied(&names)
+    pg.revals = revals
+    for f in flips {
+        // (a replica cannot write: its units keep the status they were stored with)
+        match putSource(&ip.st, &f.owner, &f.kind, &f.name, &f.src, &f.err) { Ok(_) {} Err(_) {} }
+    }
     return Ok(Unit{})
+}
+
+// A block or a call is to run: the stored units it names that were invalid and compile now are valid again.
+pub fn revalidate(pg: mut &Prog, ip: mut &Ip, text: &str) {
+    if len(pg.revals) == 0 { return }
+    let up = strings.toUpperAscii(text)
+    var keep: []Stored = []
+    for f in pg.revals {
+        if strings.contains(&up, &f.name) {
+            match putSource(&ip.st, &f.owner, &f.kind, &f.name, &f.src, &"") { Ok(_) {} Err(_) {} }
+        } else {
+            append(mut &keep, Stored{owner: f.owner.clone(), name: f.name.clone(), kind: f.kind.clone(), src: f.src.clone(), err: ""})
+        }
+    }
+    pg.revals = keep
 }
 
 fn sigOfUnit(u: &PUnit): SigEntry {
@@ -3899,6 +3933,19 @@ pub fn finalError(e: &DbErr): FinalErr {
     if len(e.context) > 0 { t = t + "\n" + e.context }
     return FinalErr{num: n, text: t}
 }
+
+// The error of a stored function called from a query, as Oracle's SQL gives it: its number and text with the unit's ORA-06512
+// lines (not the anonymous block's that lexdb calls it through).
+pub fn sqlError(e: &DbErr): DbErr {
+    let fe = finalError(e)
+    var t = strings.trim(&fe.text)
+    let tail = "\nORA-06512: at line 1"
+    if strings.endsWith(&t, tail) { t = t[0..len(t) - len(tail)].toStr() }
+    return lexdb_base.err("ORA" + lexdb_oratext.pad5(fe.num), &t)
+}
+
+// NO_DATA_FOUND: a stored function called from a query that raises it gives NULL.
+pub fn isNoData(e: &DbErr): bool { return errNum(e) == 1403 && errUid(e) == 0 }
 
 fn emptyRes(): BlockRes { return BlockRes{err: None, outs: [], curs: [], implicit: [], rows: 0} }
 
@@ -4040,6 +4087,7 @@ pub fn createUnit(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, text: &
     if h.kind == U_PKG { return createPackage(pg, ip, sess, &src, &toks, &h, replace, super) }
     var u = emptyUnit()
     var warn = false
+    var cerr = ""
     match compileStored(ip, sess, &src, &own, sigsOf(pg), false) {
         Ok(x) { u = x }
         Err(e) {
@@ -4049,6 +4097,7 @@ pub fn createUnit(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, text: &
                 Err(e2) { return Err(e) }
             }
             warn = true
+            cerr = e.msg.clone()
         }
     }
     // stored code lives in a schema: one's own, unless one is a DBA
@@ -4061,7 +4110,7 @@ pub fn createUnit(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, text: &
             if !replace || s.kind != kind { return Err(ora(955, "name is already used by an existing object")) }
         }
     }
-    try putSource(&ip.st, &u.owner, &kind, &u.name, &src)
+    try putSource(&ip.st, &u.owner, &kind, &u.name, &src, &cerr)
     ip.ddl += 1
     return Ok(warn)
 }
@@ -4089,14 +4138,16 @@ fn createPackage(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, src: &st
     if have && !replace { return Err(ora(955, "name is already used by an existing object")) }
     if h.body && len(spec) == 0 { return Err(plErr("ORA06550", &("line 1, column 1:\nPLS-00304: cannot compile body of '" + nm + "' without its specification"))) }
     var warn = false
+    var cerr = ""
     match compilePackage(ip, sess, &owner, &nm, &spec, &body, sigsOf(pg)) {
         Ok(_) {}
         Err(e) {
             if !h.body { return Err(e) }
             warn = true
+            cerr = e.msg.clone()
         }
     }
-    try putSource(&ip.st, &owner, &kind, &nm, src)
+    try putSource(&ip.st, &owner, &kind, &nm, src, &cerr)
     ip.ddl += 1
     forgetPkg(ip, &owner, &nm)
     return Ok(warn)
@@ -4124,13 +4175,42 @@ pub fn dropUnit(ip: mut &Ip, text: &str, super: bool): Result[Unit, DbErr] {
     for i in 0..len(ip.stored) {
         if ip.stored[i].owner == owner && ip.stored[i].name == nm && (ip.stored[i].kind == kw || (kw == "PACKAGE" && ip.stored[i].kind == "PACKAGE BODY")) {
             found = true
-            try putSource(&ip.st, &ip.stored[i].owner, &ip.stored[i].kind, &ip.stored[i].name, &"")
+            try putSource(&ip.st, &ip.stored[i].owner, &ip.stored[i].kind, &ip.stored[i].name, &"", &"")
         }
     }
     if !found { return Err(ora(4043, &("object " + nm + " does not exist"))) }
     ip.ddl += 1
     forgetPkg(ip, &owner, &nm)
     return Ok(Unit{})
+}
+
+// ALTER PROCEDURE | FUNCTION name COMPILE: the unit compiled again, valid or invalid as it comes out (true: invalid, Oracle's
+// warning "success with compilation error"); ORA-04043 for one that does not exist. A package's COMPILE does nothing here.
+pub fn compileUnit(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, text: &str, super: bool): Result[bool, DbErr] {
+    let toks = try lex(text)
+    if len(toks) < 4 { return Err(plErr("42601", "invalid SQL statement")) }
+    let kw = toks[1].up.clone()
+    if kw != "PROCEDURE" && kw != "FUNCTION" { return Ok(false) }
+    var nm = toks[2].up.clone()
+    var owner = ip.user.clone()
+    if len(toks) > 4 && toks[3].up == "." {
+        owner = nm
+        nm = toks[4].up.clone()
+    }
+    if owner != ip.user && !super { return Err(ora(1031, "insufficient privileges")) }
+    try loadStored(ip)
+    var src = ""
+    var found = false
+    for s in ip.stored { if s.owner == owner && s.name == nm && s.kind == kw { src = s.src.clone(); found = true } }
+    if !found { return Err(ora(4043, &("object " + nm + " does not exist"))) }
+    var cerr = ""
+    match compileStored(ip, sess, &src, &owner, sigsOf(pg), false) {
+        Ok(_) {}
+        Err(e) { cerr = e.msg.clone() }
+    }
+    try putSource(&ip.st, &owner, &kw, &nm, &src, &cerr)
+    ip.ddl += 1
+    return Ok(len(cerr) > 0)
 }
 
 // CALL name(args) [INTO :bind] as the block that does it.
@@ -4260,13 +4340,15 @@ pub fn expandCalls(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, text: 
                     let blk = "BEGIN :r__ := " + text[t.s..toks[ni].e] + text[toks[ni + 1].s..toks[close].e] + "; END;"
                     let binds: []BindIn = [BindIn{name: "R__", v: Val.Null, array: false, cursor: false}]
                     let res = runBlock(pg, ip, sess, &blk, &binds, false)
+                    // (NO_DATA_FOUND raised by the function is NULL in a query; any other error ends it with the unit's ORA-06512 lines)
+                    var rv = Val.Null
                     match res.err {
-                        Some(e) { return Err(e.clone()) }
-                        None {}
+                        Some(e) { if !isNoData(&e) { return Err(sqlError(&e)) } }
+                        None { rv = res.outs[0].v.clone() }
                     }
                     sb += text[from..t.s]
                     // in parentheses: a negative number beside a minus would be a comment (a--1)
-                    sb += &("(" + sqlLiteral(&res.outs[0].v) + ")")
+                    sb += &("(" + sqlLiteral(&rv) + ")")
                     from = toks[close].e
                     i = close + 1
                     continue

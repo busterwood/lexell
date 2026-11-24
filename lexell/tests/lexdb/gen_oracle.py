@@ -202,6 +202,7 @@ CHECKED = {
     'tns_decfit': ('consts', 'QS'),
     'tns_winnulls': ('consts', 'QS'),
     'tns_wrong': ('consts', 'QS'),
+    'tns_robust': ('consts', 'QS'),
 }
 
 

@@ -175,7 +175,7 @@ pub fn family(view: &str): Family {
 pub fn isBuilt(base: &str): bool {
     match base.toStr() {
         "TABLES", "TAB_COLUMNS", "TAB_COLS", "INDEXES", "IND_COLUMNS", "IND_EXPRESSIONS", "CONSTRAINTS", "CONS_COLUMNS", "OBJECTS", "SEQUENCES",
-        "VIEWS", "TAB_COMMENTS", "COL_COMMENTS", "TAB_IDENTITY_COLS", "CATALOG", "SOURCE", "PROCEDURES" { return true }
+        "VIEWS", "TAB_COMMENTS", "COL_COMMENTS", "TAB_IDENTITY_COLS", "CATALOG", "SOURCE", "PROCEDURES", "ERRORS" { return true }
         else { return false }
     }
 }
@@ -346,7 +346,7 @@ fn oraDiscCol(base: &str): str {
         "INDEXES" { return "UNIQUENESS" }
         "CONSTRAINTS" { return "CONSTRAINT_TYPE" }
         "OBJECTS", "PROCEDURES" { return "OBJECT_TYPE" }
-        "SOURCE" { return "TYPE" }
+        "SOURCE", "ERRORS" { return "TYPE" }
         "CATALOG", "TAB_COMMENTS" { return "TABLE_TYPE" }
         else { return "" }
     }
@@ -632,7 +632,7 @@ fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role): []OraPend {
         for pr in snap.procs {
             var p = oraPend(&pr.owner, &pr.kind)
             oraObject(mut &p, &pr.name, lexdb_sql.nameOid("p", &(pr.owner + "." + pr.name)), &pr.kind, false)
-            p.s("STATUS", "VALID")
+            p.s("STATUS", if len(pr.err) > 0 { "INVALID" } else { "VALID" })
             p.s("TEMPORARY", "N")
             p.s("SECONDARY", "N")
             p.i("NAMESPACE", 1)
@@ -654,6 +654,56 @@ fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role): []OraPend {
             p.s("DETERMINISTIC", "NO")
             p.s("AUTHID", "DEFINER")
             append(mut &out, p)
+        }
+        return out
+    }
+    if base == "ERRORS" {
+        // a unit stored with compilation errors: PLS-nnnnn at its line and column (and, for an error in a statement, Oracle's
+        // "PL/SQL: Statement ignored" after it); the error is kept as "line L, column C:", a line feed and the PLS text
+        for pr in snap.procs {
+            if len(pr.err) == 0 { continue }
+            var line = 1
+            var col = 1
+            var msg = pr.err.toStr()
+            let nl = strings.indexOf(&pr.err, "\n", 0)
+            if strings.startsWith(&pr.err, "line ") && nl > 0 {
+                let head = pr.err[5..nl].toStr()
+                let comma = strings.indexOf(&head, ", column ", 0)
+                if comma > 0 {
+                    line = strings.parseInt(&(head[0..comma].toStr())).unwrapOr(1)
+                    var cs = head[comma + 9..len(head)].toStr()
+                    if len(cs) > 0 && cs[len(cs) - 1] == ':' { cs = cs[0..len(cs) - 1].toStr() }
+                    col = strings.parseInt(&cs).unwrapOr(1)
+                    msg = pr.err[nl + 1..len(pr.err)].toStr()
+                }
+            }
+            // (the text of a unit starts at its keyword: CREATE OR REPLACE is no part of the first line's columns)
+            if line == 1 {
+                let kw = strings.indexOf(&strings.toUpperAscii(&pr.src), &pr.kind, 0)
+                if kw > 0 && col > kw { col -= kw }
+            }
+            let eol = strings.indexOf(&msg, "\n", 0)
+            if eol > 0 { msg = msg[0..eol].toStr() }
+            var num = 0
+            if strings.startsWith(&msg, "PLS-") && len(msg) >= 9 { num = strings.parseInt(&(msg[4..9].toStr())).unwrapOr(0) }
+            var texts: []str = [msg]
+            var nums: []int = [num]
+            if num == 201 || num == 302 || num == 306 || num == 363 || num == 364 || num == 382 {
+                append(mut &texts, "PL/SQL: Statement ignored")
+                append(mut &nums, 0)
+            }
+            for k in 0..len(texts) {
+                var p = oraPend(&pr.owner, &pr.kind)
+                p.s("NAME", &pr.name)
+                p.s("TYPE", &pr.kind)
+                p.i("SEQUENCE", k + 1)
+                p.i("LINE", line)
+                p.i("POSITION", col)
+                p.s("TEXT", &texts[k])
+                p.s("ATTRIBUTE", "ERROR")
+                p.i("MESSAGE_NUMBER", nums[k])
+                append(mut &out, p)
+            }
         }
         return out
     }

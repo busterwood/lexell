@@ -1,0 +1,191 @@
+// lexdb over TNS: wrong answers and gaps of the Oracle door found writing the user documentation (KNOWN-ISSUES.md, robustness slice), checked against Oracle
+// Database Free 23.26 (gen_oracle.py --check tns_robust: the answers below are Oracle's): an UPDATE's and DELETE's subqueries reading the rows as the
+// statement found them, ROWNUM with aggregates, DISTINCT, in UPDATE and DELETE, the REGEXP_ functions' position, occurrence, match parameter, subexpression
+// and errors, a stored function that raises or hits NO_DATA_FOUND in a query (NULL), CREATE PROCEDURE with an undefined call (stored INVALID, USER_ERRORS,
+// revalidated, ALTER ... COMPILE, CALL: ORA-06575), a one-line CREATE FUNCTION, DROP SEQUENCE under a DEFAULT. Each statement runs with set lexdb_batch = off
+// (the row engine) and on: "same" and the answer, or DIFFERENT and both.
+// expect: setup: 23 statements
+// expect: same: 3 / ID,SALARY = 1|100;2|101;3|201;4|301
+// expect: same: 4 / ID,SALARY = 1|100;2|201;3|302;4|403
+// expect: same: 4 / 2 / ID,SALARY = 1|4;2|4;3|5;4|5
+// expect: same: 0 / ID = 1;2;3;4
+// expect: same: N = 3
+// expect: same: N,S = 5|150
+// expect: same: N = 1
+// expect: same: N = 0
+// expect: same: N = 2
+// expect: same: G,N = 0|1;1|2;2|1
+// expect: same: G,N = 1|2
+// expect: same: G = 1;2
+// expect: same: M = 30
+// expect: same: N = 2
+// expect: same: A,B = NULL|NULL
+// expect: same: 2 / N = 2
+// expect: same: 1 / N = 1
+// expect: same: 3 / N = 6
+// expect: same: 1 / N = 8
+// expect: same: 1 / N = 1
+// expect: same: 0 / N = 0
+// expect: same: 0 / N = 9
+// expect: same: A,B,C,D = '456'|'23'|NULL|'def'
+// expect: same: A,B,C,D = 'World'|NULL|NULL|'World'
+// expect: same: A,B,C,D = '123'|'def'|NULL|'abc-123'
+// expect: same: A,B,C,D,E,F,G = 4|10|7|0|5|5|8
+// expect: same: A,B,C,D,E,F = 4|2|2|1|0|2
+// expect: same: A,B,C,D,E,F,G,H = 'acacac'|'aXcaXcaXc'|'abcaXcabc'|'abcaXcaXc'|'aXcaXcaXc'|'AXCaXc'|'abcabcabc'|'ac'
+// expect: same: A,B,C,D = 'Smith, John'|'a_b_c'|'a[b]c'|'aandb'
+// expect: same: A,B,C,D,E,F = 'line1'|4|NULL|'cd'|NULL|'b'
+// expect: same: A,B = NULL|'ab'
+// expect: same: error 1428
+// expect: same: error 1428
+// expect: same: error 1760
+// expect: same: error 12726
+// expect: same: error 12725
+// expect: same: error 12732
+// expect: same: A = 3
+// expect: same: A = NULL
+// expect: same: A,B,C,D = NULL|NULL|NULL|NULL
+// expect: same: A,B = '1'|3
+// expect: same: A,B = true|false
+// expect: same: A = NULL
+// expect: same: A = NULL;NULL;NULL;NULL
+// expect: same: ID = 1;2;3;4
+// expect: same: A = 1
+// expect: same: error 20001
+// expect: same: error 20001
+// expect: same: A = 7
+// expect: same: 0 / STATUS = 'INVALID' / LINE,POSITION,TEXT,ATTRIBUTE = 1|25|'PLS-00201: identifier ''NOTHERE'' must be declared'|'ERROR';1|25|'PL/SQL: Statement ignored'|'ERROR' / 0
+// expect: same: OBJECT_NAME,STATUS = 'BAD2'|'INVALID'
+// expect: same: LINE,TEXT = 1|'PLS-00201: identifier ''NOTHERE2'' must be declared';1|'PL/SQL: Statement ignored'
+// expect: same: error 6550
+// expect: same: error 6575
+// expect: same: 0 / 0 / STATUS = 'VALID' / N = 0 / 0
+// expect: same: 0 / STATUS = 'INVALID'
+// expect: same: error 4043
+// expect: same: 0 / error 2289 / 0
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+const SETUP = "create table emp (id number(10) primary key, mgr_id number(10), salary number(10))\ninsert into emp values (1, null, 100)\ninsert into emp values (2, 1, 200)\ninsert into emp values (3, 2, 300)\ninsert into emp values (4, 3, 400)\ncreate table rn (id number(10) primary key, g number(10), v number(10))\ninsert into rn values (1, 1, 10)\ninsert into rn values (2, 2, 20)\ninsert into rn values (3, 0, 30)\ninsert into rn values (4, 1, 40)\ninsert into rn values (5, 2, 50)\ninsert into rn values (6, 0, 60)\ninsert into rn values (7, 1, 70)\ninsert into rn values (8, 2, 80)\ninsert into rn values (9, 0, 90)\ncreate or replace function nf(x number) return number is v number; begin select id into v from emp where id = x + 10; return v; end;\ncreate or replace function fb(x number) return number is begin if x > 1 then raise_application_error(-20001, 'too big'); end if; return x; end;\ncreate sequence qs2\ncreate table qt2 (id number default qs2.nextval, v number)\ncreate sequence qs3\ncreate table qt3 (id number default qs3.nextval, v number)\ncreate or replace function one7 return number is begin return 7; end;\ncreate or replace procedure bad2 is begin nothere2(1); end;"
+
+const QS = "update emp e set salary = (select x.salary + 1 from emp x where x.id = e.mgr_id) where mgr_id is not null ;; select id, salary from emp order by id\nupdate emp e set salary = salary + (select count(*) from emp x where x.salary < e.salary) ;; select id, salary from emp order by id\nupdate emp set salary = 5 ;; update emp e set salary = (select count(*) from emp x where x.salary = 5) where id <= 2 ;; select id, salary from emp order by id\ndelete from emp e where exists (select 1 from emp x where x.mgr_id = e.id) and salary >= (select max(salary) from emp) ;; select id from emp order by id\nselect count(*) n from rn where rownum < 4\nselect count(*) n, sum(v) s from rn where rownum <= 5\nselect count(*) n from rn where rownum = 1\nselect count(*) n from rn where rownum > 1\nselect count(*) n from rn where v > 20 and rownum <= 2\nselect g, count(*) n from rn where rownum <= 4 group by g order by g\nselect g, count(*) n from rn where rownum <= 4 group by g having count(*) > 1 order by g\nselect distinct g from rn where rownum <= 2 order by g\nselect max(v) m from rn where rownum <= 3\nselect count(*) n from (select * from rn where rownum < 3)\nselect min(id) a, max(id) b from rn where rownum < 1\nupdate rn set v = 0 where rownum <= 2 ;; select count(*) n from rn where v = 0\nupdate rn set v = -1 where g = 1 and rownum <= 1 ;; select count(*) n from rn where v = -1\ndelete from rn where rownum <= 3 ;; select count(*) n from rn\ndelete from rn where g = 2 and rownum < 2 ;; select count(*) n from rn\nupdate rn set v = 5 where rownum = 1 ;; select count(*) n from rn where v = 5\nupdate rn set v = 6 where rownum > 1 ;; select count(*) n from rn where v = 6\ndelete from rn where rownum < 1 ;; select count(*) n from rn\nselect regexp_substr('abc123def456', '[0-9]+', 1, 2) a, regexp_substr('abc123def456', '[0-9]+', 5) b, regexp_substr('abc123def456', '[0-9]+', 1, 3) c, regexp_substr('abc123def456', '[a-z]+', 4, 1) d from dual\nselect regexp_substr('Hello World', 'WORLD', 1, 1, 'i') a, regexp_substr('Hello World', 'WORLD') b, regexp_substr('Hello World', 'WORLD', 1, 1, 'c') c, regexp_substr('Hello World', 'world', 1, 1, 'i') d from dual\nselect regexp_substr('abc-123-def', '([a-z]+)-([0-9]+)-([a-z]+)', 1, 1, null, 2) a, regexp_substr('abc-123-def', '([a-z]+)-([0-9]+)-([a-z]+)', 1, 1, 'i', 3) b, regexp_substr('abc-123-def', '([a-z]+)-([0-9]+)', 1, 1, 'i', 3) c, regexp_substr('abc-123-def', '([a-z]+)-([0-9]+)', 1, 1, 'i', 0) d from dual\nselect regexp_instr('abc123def456', '[0-9]+') a, regexp_instr('abc123def456', '[0-9]+', 1, 2) b, regexp_instr('abc123def456', '[0-9]+', 1, 1, 1) c, regexp_instr('abc123def456', '[0-9]+', 1, 3) d, regexp_instr('abc123def456', '[0-9]+', 5) e, regexp_instr('abc-123', '([a-z]+)-([0-9]+)', 1, 1, 0, 'i', 2) f, regexp_instr('abc-123', '([a-z]+)-([0-9]+)', 1, 1, 1, 'i', 2) g from dual\nselect regexp_count('abababab', 'ab') a, regexp_count('abababab', 'ab', 4) b, regexp_count('ABab', 'ab', 1, 'i') c, regexp_count('ABab', 'ab') d, regexp_count('abc', 'x') e, regexp_count('aaa', 'a*') f from dual\nselect regexp_replace('abcabcabc', 'b') a, regexp_replace('abcabcabc', 'b', 'X') b, regexp_replace('abcabcabc', 'b', 'X', 1, 2) c, regexp_replace('abcabcabc', 'b', 'X', 4) d, regexp_replace('abcabcabc', 'b', 'X', 1, 0) e, regexp_replace('ABCabc', 'b', 'X', 1, 0, 'i') f, regexp_replace('abcabcabc', 'b', 'X', 1, 5) g, regexp_replace('abc', 'b', null) h from dual\nselect regexp_replace('John Smith', '(\\w+) (\\w+)', '\\2, \\1') a, regexp_replace('a b  c', '\\s+', '_') b, regexp_replace('abc', '(b)', '[\\1]') c, regexp_replace('a&b', '&', 'and') d from dual\nselect regexp_substr('line1' || chr(10) || 'line2', 'line.') a, length(regexp_substr('line1' || chr(10) || 'line2', 'e1.l', 1, 1, 'n')) b, regexp_substr('ab' || chr(10) || 'cd', '^c.', 1, 1) c, regexp_substr('ab' || chr(10) || 'cd', '^c.', 1, 1, 'm') d, regexp_substr('ab' || chr(10) || 'cd', 'b$') e, regexp_substr('ab' || chr(10) || 'cd', 'b$', 1, 1, 'm') f from dual\nselect regexp_substr('a b c', 'a b', 1, 1, 'x') a, regexp_substr('abc', 'a b', 1, 1, 'x') b from dual\nselect regexp_substr('abc', 'b', 0) a from dual\nselect regexp_substr('abc', 'b', 1, 0) a from dual\nselect regexp_substr('abc', 'b', 1, 1, 'z') a from dual\nselect regexp_substr('abc', '[') a from dual\nselect regexp_substr('abc', '(') a from dual\nselect regexp_substr('abc', 'a{2,1}') a from dual\nselect regexp_instr('abc', 'b', 1, 1, 2) a from dual\nselect regexp_substr('abc', 'b', 1, 1, 'i', 10) a from dual\nselect regexp_substr(null, 'b') a, regexp_substr('abc', null) b, regexp_substr('abc', 'b', null) c, regexp_count(null, 'a') d from dual\nselect regexp_substr('é1ü22', '[0-9]+', 2) a, regexp_instr('éé123', '[0-9]+') b from dual\nselect regexp_like('abc', 'B', 'i') a, regexp_like('ab' || chr(10) || 'c', 'b.c') b from dual\nselect nf(1) a from dual\nselect nf(id) a from emp order by id\nselect id from emp where nf(id) is null order by id\nselect fb(1) a from dual\nselect fb(2) a from dual\nselect fb(id) a from emp order by id\nselect one7() a from dual\ncreate or replace procedure bad1 is begin nothere(1); end; ;; select status from user_objects where object_name = 'BAD1' ;; select line, position, text, attribute from user_errors where name = 'BAD1' order by sequence ;; drop procedure bad1\nselect object_name, status from user_objects where object_name = 'BAD2'\nselect line, text from user_errors where name = 'BAD2' order by sequence\nbegin bad2(); end;\ncall bad2()\ncreate or replace procedure nothere2(x number) is begin null; end; ;; begin bad2(); end; ;; select status from user_objects where object_name = 'BAD2' ;; select count(*) n from user_errors where name = 'BAD2' ;; drop procedure nothere2\nalter procedure bad2 compile ;; select status from user_objects where object_name = 'BAD2'\nalter procedure nothere3 compile\ndrop sequence qs2 ;; select qs2.nextval a from dual ;; create sequence qs2"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows; or error and the number.
+fn qtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// A statement: its row count, or error and the number.
+fn xtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.run(&(sql.toStr()), &[]) {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn one(c: mut &oracle.Conn, sql: &str): str {
+    let low = strings.toLowerAscii(sql)
+    if strings.startsWith(&low, "select") || strings.startsWith(&low, "with") { return qtext(c, sql) }
+    return xtext(c, sql)
+}
+
+// A query, or statements ("a ;; b ;; c") in a transaction rolled back: each answer, joined by " / " (after an error, the
+// last part, the check, after the rollback).
+fn answer(c: mut &oracle.Conn, sqls: &str): str {
+    if !strings.contains(sqls, " ;; ") { return one(c, sqls) }
+    let parts = strings.split(sqls, " ;; ")
+    var out: []str = []
+    var failed = false
+    let r = c.transaction(fn(c2: mut &oracle.Conn): Result[int, oracle.Error] {
+        for i in 0..len(parts) {
+            if failed { break }
+            let a = one(c2, &parts[i])
+            if strings.startsWith(&a, "error") { failed = true }
+            append(mut &out, a)
+        }
+        return Err(sqldialect.inputError("rolled back"))
+    })
+    if failed { append(mut &out, one(c, &parts[len(parts) - 1])) }
+    return strings.join(&out, " / ")
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            let text: str = QS
+            for q in strings.lines(&text) {
+                let a = c.run(&("set lexdb_batch = off".toStr()), &[])
+                let off = answer(mut &c, &q)
+                let b = c.run(&("set lexdb_batch = on".toStr()), &[])
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(160), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

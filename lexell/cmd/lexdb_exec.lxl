@@ -3719,6 +3719,10 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     try makeColSeqs(st, txn, mut &t, -1, &s.idOpts)
     for c in t.cols { try defaultSeqs(st, txn, &c) }
     var clustered = ""
+    // (T-SQL: two keys that say CLUSTERED are 8112, the key and a UNIQUE constraint included)
+    var nclu = if s.pkCluster == 1 { 1 } else { 0 }
+    for c in s.cons { if c.cluster == 1 { nclu += 1 } }
+    if nclu > 1 { return Err(e("TS8112", &("Cannot add more than one clustered index for constraints on table '" + base + "'."))) }
     for c in s.cons {
         if c.kind != lexdb_sql.C_FOREIGN {
             let before = len(t.indexes)
@@ -5053,7 +5057,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             if c.cluster == 1 { try clusterClash(&t) }
             let nIdx = len(t.indexes)
             if c.kind == lexdb_sql.C_PRIMARY {
-                try addPrimary(st, txn, mut &t, c, mut &pk)
+                try addPrimary(st, txn, mut &t, c, mut &pk, s.mdialect)
                 if c.cluster == 2 && len(lexdb_catalog.clusterLabel(&t)) == 0 { lexdb_catalog.setCluster(mut &t, lexdb_catalog.CL_NONE) }
             } else if c.kind == lexdb_sql.C_UNIQUE && len(c.index) > 0 {
                 try uniqueUsing(st, txn, mut &t, c)
@@ -5479,9 +5483,13 @@ fn conTaken(t: &Table, name: &str): bool { return hasConName(t, name) || (lexdb_
 
 // ADD [CONSTRAINT name] PRIMARY KEY (cols) | USING INDEX ix: t.pk made
 // those columns (NOT NULL), the hidden key's column dropped.
-fn addPrimary(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint, pk: mut &PkChange): Result[Unit, DbErr] {
+fn addPrimary(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint, pk: mut &PkChange, md: int): Result[Unit, DbErr] {
     let rel = lexdb_sql.baseName(&t.name)
-    if lexdb_catalog.hasPk(t) { return Err(e("42P16", &("multiple primary keys for table \"" + rel + "\" are not allowed"))) }
+    if lexdb_catalog.hasPk(t) {
+        if md == lexdb_sql.MD_TSQL { return Err(e("TS1779", &("Table '" + rel + "' already has a primary key defined on it."))) }
+        if md == lexdb_sql.MD_ORA { return Err(e("ORA02260", "table can have only one primary key")) }
+        return Err(e("42P16", &("multiple primary keys for table \"" + rel + "\" are not allowed")))
+    }
     var cols: []int = []
     var name = c.name.clone()
     if len(c.index) > 0 {
@@ -7040,7 +7048,12 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     // the logical plan (read by nothing yet): the FROM and WHERE part its source
     let lp = lexdb_bind.LPlan.Update(replace(mut &q.lp, lexdb_bind.noPlan()), collections.copyOf(&targets), retBCols(&ret))
     endScope(mut &sc, mut &q)
-    if len(q.subs) > 0 { pipeSubs(mut &q) }
+    // (subqueries: their rows are read as the statement found them, the writes after every row's values)
+    var twoPhase = false
+    if len(q.subs) > 0 {
+        pipeSubs(mut &q)
+        twoPhase = true
+    }
     if win.n > 0 {
         // a batch's rows are found in primary key order, from the key after the last batch's (stage 8): an UPDATE
         // always reads by the key, so that a row it changed is not found again (the Halloween problem across
@@ -7104,6 +7117,40 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     // a joined row: t's columns, then FROM's, which SET, RETURNING and
     // WHERE may read
     let nt = len(t.cols)
+    if twoPhase {
+        // a subquery in SET or RETURNING reads the table as the statement found it, whatever the statement has written by then (as
+        // PostgreSQL, SQL Server and Oracle do): every row's new values first, the writes after; an error of a row's values ends
+        // them, and the rows before it are written first
+        var news: [][]Val = []
+        var failed: Option[DbErr] = None
+        for joined in found {
+            match updNew(st, txn, &q, &m, &sets, &targets, t, &defs, params, &sqe, &joined, mut &rs) {
+                Ok(all) {
+                    match retAddOld(st, txn, &q, &m, params, mut &ret, &all, &joined, mut &rs) {
+                        Ok(_) { append(mut &news, all) }
+                        Err(x) {
+                            failed = Some(x)
+                            break
+                        }
+                    }
+                }
+                Err(x) {
+                    failed = Some(x)
+                    break
+                }
+            }
+        }
+        for k in 0..len(news) {
+            if len(found[k]) == nt { try updRow(st, txn, t, &found[k], &news[k], &fw, mut &later) }
+            else { try updRow(st, txn, t, &rowPrefix(&found[k], nt), &rowPrefix(&news[k], nt), &fw, mut &later) }
+        }
+        match failed {
+            Some(x) { return Err(x) }
+            None {}
+        }
+        try fkFinish(st, txn, &fw, mut &later)
+        return Ok(retRes(ret, &("UPDATE " + len(found).toStr())))
+    }
     for joined in found {
         let env = Env{cols: &q.cols, row: &joined, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
         var all = collections.copyOf(&joined)
@@ -7122,6 +7169,20 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     }
     try fkFinish(st, txn, &fw, mut &later)
     return Ok(retRes(ret, &("UPDATE " + len(found).toStr())))
+}
+
+// An UPDATE's new row for a joined row found: the SET expressions evaluated (updateB's, for a statement with subqueries).
+fn updNew(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, sets: &[]Expr, targets: &[]int, t: &Table, defs: &Defs,
+          params: &[]Val, sqe: &Option[SeqEnv], joined: &[]Val, rs: mut &Run): Result[[]Val, DbErr] {
+    let noAggs: []Val = []
+    let env = Env{cols: &q.cols, row: joined, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: sqe}
+    var all = collections.copyOf(joined)
+    for k in 0..len(sets) {
+        if lexdb_sql.isDefault(&sets[k]) { all[targets[k]] = try defAt(st, txn, defs, t, targets[k]) }
+        else { all[targets[k]] = try lexdb_ops.coerceZ(try evalX(st, txn, q, &sets[k], &env, rs), &t.cols[targets[k]].typ, &txn.sql.zone) }
+    }
+    if len(defs.fill) > 0 { try genFill(t, &defs.fill, mut &all, &txn.sql.zone) }
+    return Ok(all)
 }
 
 fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits): Result[Res, DbErr] {
@@ -7192,8 +7253,10 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let fw = try fkTables(st, txn, t, false, true)
     var later: []FkLater = []
     let nt = len(t.cols)
+    // (a subquery in RETURNING reads the table as the statement found it: every row's RETURNING first)
+    if len(q.subs) > 0 && ret.on { for joined in found { try retAdd(st, txn, &q, &m, params, mut &ret, &joined, mut &rs) } }
     for joined in found {
-        try retAdd(st, txn, &q, &m, params, mut &ret, &joined, mut &rs)
+        if !(len(q.subs) > 0 && ret.on) { try retAdd(st, txn, &q, &m, params, mut &ret, &joined, mut &rs) }
         if len(joined) == nt { try delRow(st, txn, t, &joined, &fw, mut &later) }
         else { try delRow(st, txn, t, &rowPrefix(&joined, nt), &fw, mut &later) }
     }
@@ -15111,7 +15174,10 @@ fn callsSeq(x: &Expr, key: &str): bool {
 
 // The columns whose DEFAULT calls the sequence d (nextval('d')): PostgreSQL refuses to drop it (2BP01); with CASCADE the
 // defaults are dropped, each with its NOTICE.
-fn seqDefaults(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &Seq, cascade: bool): Result[Unit, DbErr] {
+// (Oracle drops it whatever the defaults: a later INSERT finds the sequence gone, ORA-02289; SQL Server's 3729 names the
+// default constraint.)
+fn seqDefaults(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &Seq, cascade: bool, md: int): Result[Unit, DbErr] {
+    if md == lexdb_sql.MD_ORA { return Ok(Unit{}) }
     var detail: []str = []
     for t0 in try allTables(st, txn) {
         var t = t0
@@ -15122,6 +15188,10 @@ fn seqDefaults(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &Seq, casca
                 None { false }
             }
             if !users { continue }
+            if md == lexdb_sql.MD_TSQL && !cascade {
+                let nm = "DF__" + lexdb_sql.baseName(&t.name) + "__" + t.cols[i].name + "__" + strings.padLeft(&(lexdb_sql.nameOid("D", &(t.name + "." + t.cols[i].name)).toStr()), 8, '0')
+                return Err(e("TS3729", &("Cannot DROP SEQUENCE '" + lexdb_sql.baseName(&d.key) + "' because it is being referenced by object '" + nm + "'.")))
+            }
             let what = "default value for column " + t.cols[i].name + " of table " + lexdb_sql.baseName(&t.name)
             if !cascade {
                 append(mut &detail, what + " depends on sequence " + lexdb_sql.baseName(&d.key))
@@ -15151,7 +15221,7 @@ fn dropOneSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     }
     let d = found.unwrap()
     try lexdb_priv.needRelOwner(st, txn, &d.key, &"sequence")
-    try seqDefaults(st, txn, &d, s.cascade)
+    try seqDefaults(st, txn, &d, s.cascade, s.mdialect)
     if len(d.ownerT) > 0 {
         match try byKeyOpt(st, txn, &d.ownerT) {
             Some(t) {
@@ -18044,10 +18114,14 @@ fn sysCall(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
                     return Ok(Some(if len(l) > 0 { Val.Int(strings.parseIntOpt(&l[1]).unwrapOr(1)) } else { Val.Int(4) }))
                 }
                 "execisansinullson", "execisquotedidenton", "isansinullson", "isquotedidenton" { return Ok(if isMod || typ == "U" { flag(true) } else { Some(Val.Null) }) }
-                "tablehasprimarykey", "tablehasindex", "tablehasclustindex" {
+                "tablehasprimarykey", "tablehasindex", "tablehasclustindex", "tablehasuniquecnst" {
                     if typ != "U" { return Ok(Some(Val.Null)) }
                     var has = false
-                    for l in catLines(se, &"I") { if l[0] == id.toStr() && (p == "tablehasindex" || l[3] == "1") { has = true } }
+                    // (an index line: object, name, id, clustered, unique, primary key, unique constraint)
+                    for l in catLines(se, &"I") {
+                        if l[0] == id.toStr() && len(l) >= 7 && (p == "tablehasindex" || (p == "tablehasclustindex" && l[3] == "1") || (p == "tablehasprimarykey" && l[5] == "1") ||
+                                                                  (p == "tablehasuniquecnst" && l[6] == "1")) { has = true }
+                    }
                     return Ok(flag(has))
                 }
                 else { return Ok(Some(Val.Null)) }

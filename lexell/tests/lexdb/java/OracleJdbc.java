@@ -43,6 +43,8 @@ public class OracleJdbc {
         metadata();
         callable();
         cancel();
+        lengths();
+        warnings();
         try { generatedKeys(); } catch (Exception e) { System.out.println("SKIP generatedKeys by column name: " + e.toString().split("\n")[0]); }
         for (String t : new String[]{"JT_CHILD", "JT_ALL", "JT_PARENT", "JT_TX", "JT_MERGE", "JT_BATCH"}) ddl("drop table " + t);
         ddl("drop sequence JT_SEQ");
@@ -420,5 +422,58 @@ public class OracleJdbc {
             Check.yes("cancel: the statement was cancelled or finished (" + code + ")", code == 1013 || code == 0 || code == 17008);
         }
         Check.eq("after cancel", rows("select 1 from dual"), List.of("1"));
+    }
+
+    // ---- statements of every length (a bare text whose first byte is its length was read as a length byte: SELECT of 83 bytes)
+    static void lengths() throws Exception {
+        ddl("create table JT_LEN (a number)");
+        String[][] t = {
+            {"SELECT 1 FROM dual", "q"}, {"select 1 from dual", "q"}, {"WITH x AS (SELECT 1 a FROM dual) SELECT a FROM x", "q"},
+            {"INSERT INTO JT_LEN VALUES (1)", "x"}, {"UPDATE JT_LEN SET a = 2", "x"}, {"DELETE FROM JT_LEN WHERE a = 99", "x"},
+            {"BEGIN NULL; END;", "x"}, {"DECLARE x NUMBER; BEGIN x := 1; END;", "x"},
+            {"CREATE OR REPLACE FUNCTION JT_FF RETURN NUMBER IS BEGIN RETURN 7; END;", "x"}, {"/* c */ SELECT 1 FROM dual", "q"},
+            {"SELECT ? FROM dual", "b"}, {"INSERT INTO JT_LEN VALUES (?)", "bx"}};
+        int[][] spans = {{10, 400}, {8150, 8260}, {16330, 16450}, {32700, 32850}, {65480, 65600}};
+        int bad = 0, total = 0;
+        for (int[] sp : spans) for (int n = sp[0]; n <= sp[1]; n++) for (String[] tt : t) {
+            String base = tt[0];
+            if (base.length() > n) continue;
+            int at = base.lastIndexOf(' ');
+            if (base.endsWith(";") && base.startsWith("CREATE")) at = base.lastIndexOf(" END");
+            String sql = base.substring(0, at) + " ".repeat(n - base.length()) + base.substring(at);
+            total++;
+            try {
+                if (tt[1].startsWith("b")) {
+                    try (PreparedStatement p = c.prepareStatement(sql)) { p.setInt(1, 5); if (tt[1].equals("bx")) p.executeUpdate(); else try (ResultSet r = p.executeQuery()) { r.next(); } }
+                } else if (tt[1].equals("q")) {
+                    try (Statement s = c.createStatement(); ResultSet r = s.executeQuery(sql)) { r.next(); }
+                } else {
+                    try (Statement s = c.createStatement()) { s.execute(sql); }
+                }
+            } catch (SQLException e) { bad++; if (bad < 5) System.out.println("FAIL length " + n + " [" + base + "]: " + e.getMessage().split("\n")[0]); }
+        }
+        Check.eq("statement lengths (" + total + " statements)", bad, 0);
+        ddl("drop table JT_LEN"); ddl("drop function JT_FF");
+    }
+
+    // ---- a unit created with compilation errors: a warning, the connection stays, INVALID and USER_ERRORS; a function that raises in a query
+    static void warnings() throws Exception {
+        try (Statement s = c.createStatement()) {
+            s.execute("create or replace procedure JT_BAD is begin nothere(1); end;");
+            SQLWarning w = s.getWarnings();
+            Check.yes("warning for a unit with compilation errors", w != null);
+        }
+        Check.eq("connection stays", rows("select 1 from dual"), List.of("1"));
+        Check.eq("status", rows("select status from user_objects where object_name = 'JT_BAD'"), List.of("INVALID"));
+        Check.eq("user_errors", rows("select text from user_errors where name = 'JT_BAD' order by sequence"),
+                 List.of("PLS-00201: identifier 'NOTHERE' must be declared", "PL/SQL: Statement ignored"));
+        Check.eq("call of an invalid procedure", Check.errorOf(() -> { try (Statement s = c.createStatement()) { s.execute("call JT_BAD()"); } }), 6575);
+        ddl("drop procedure JT_BAD");
+        ddl("create or replace function JT_ND(x number) return number is v number; begin select 1 into v from dual where 1 = 0; return v; end;");
+        ddl("create or replace function JT_RS(x number) return number is begin raise_application_error(-20001, 'too big'); end;");
+        Check.eq("NO_DATA_FOUND in a query is NULL", rows("select JT_ND(1) from dual"), List.of("null"));
+        Check.eq("a raising function in a query", Check.errorOf(() -> rows("select JT_RS(1) from dual")), 20001);
+        Check.eq("and the connection stays", rows("select 1 from dual"), List.of("1"));
+        ddl("drop function JT_ND"); ddl("drop function JT_RS");
     }
 }
