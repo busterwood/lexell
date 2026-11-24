@@ -371,10 +371,6 @@ smaller differences of its statement.
     `xp_msver` shows the real machine's processor count and memory.
 
 
-- **INFORMATION_SCHEMA lists `NOT NULL` columns as constraints** (found on main 60c08a84, not fixed; a side effect of
-  the PostgreSQL door's NOT NULL rows, main 7b6b1235): `TABLE_CONSTRAINTS` has a `CHECK` row named
-  `table_column_not_null` for each `NOT NULL` column and `CHECK_CONSTRAINTS` a clause `col IS NOT NULL`. SQL Server has
-  none, and the `sys` views of lexdb have none either.
 - **Data types, functions and catalog** (found writing the T-SQL phase 3 pages):
   - **Binary:** `0x00 = 0x0000` is false (SQL Server pads the shorter value); `CAST(0x41 AS bit)` is 50000; a
     `varbinary` variable in an expression (`@v + 0x43`) is 195; `HASHBYTES` does not exist.
