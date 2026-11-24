@@ -50,6 +50,7 @@ import "./lexdb_sort"
 import "./lexdb_fkprobe"
 import "./lexdb_lib"
 import "./lexdb_dialect"
+import "./lexdb_conerr"
 import "./lexdb_locks"
 import "./lexdb_func"
 import "./lexdb_sqlcoll"
@@ -3731,13 +3732,13 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         if c.kind != lexdb_sql.C_FOREIGN {
             let before = len(t.indexes)
             try lexdb_gen.checkConstraint(&t.cols, &c, s.mdialect, &lexdb_sql.baseName(&t.name))
-            try addConstraint(st, txn, mut &t, &c, false)
+            try addConstraint(st, txn, mut &t, &c, false, s.mdialect)
             if c.cluster == 1 && len(t.indexes) > before { clustered = lexdb_sql.baseName(&t.indexes[len(t.indexes) - 1].name) }
         }
     }
     // T-SQL's CLUSTERED and NONCLUSTERED: which key or index is the clustered one (a label: lexdb_catalog.clusterLabel)
     if len(clustered) > 0 { lexdb_catalog.setCluster(mut &t, &clustered) } else if s.pkCluster == 2 && len(t.pk) > 0 { lexdb_catalog.setCluster(mut &t, lexdb_catalog.CL_NONE) }
-    for c in s.cons { if c.kind == lexdb_sql.C_FOREIGN { try lexdb_gen.checkConstraint(&t.cols, &c, s.mdialect, &lexdb_sql.baseName(&t.name)); try addConstraint(st, txn, mut &t, &c, false) } }
+    for c in s.cons { if c.kind == lexdb_sql.C_FOREIGN { try lexdb_gen.checkConstraint(&t.cols, &c, s.mdialect, &lexdb_sql.baseName(&t.name)); try addConstraint(st, txn, mut &t, &c, false, s.mdialect) } }
     t.onCommit = s.onCommit
     if s.onCommit > lexdb_sql.ONC_PRESERVE { append(mut &txn.onCommit, key.clone()) }
     try txn.put(lexdb_catalog.CATALOG, &key, &(lexdb_catalog.encTable(&t)))
@@ -5064,13 +5065,20 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             if c.cluster == 1 { try clusterClash(&t) }
             let nIdx = len(t.indexes)
             if c.kind == lexdb_sql.C_PRIMARY {
-                try addPrimary(st, txn, mut &t, c, mut &pk, s.mdialect)
+                match addPrimary(st, txn, mut &t, c, mut &pk, s.mdialect) {
+                    Ok(_) {}
+                    Err(x) { return Err(if s.mdialect == lexdb_sql.MD_ORA { lexdb_conerr.validateErr(&x, &t, c.kind) } else { x }) }
+                }
                 if c.cluster == 2 && len(lexdb_catalog.clusterLabel(&t)) == 0 { lexdb_catalog.setCluster(mut &t, lexdb_catalog.CL_NONE) }
             } else if c.kind == lexdb_sql.C_UNIQUE && len(c.index) > 0 {
                 try uniqueUsing(st, txn, mut &t, c)
             } else {
                 try lexdb_gen.checkConstraint(&t.cols, c, s.mdialect, &lexdb_sql.baseName(&t.name))
-                try addConstraint(st, txn, mut &t, c, true)
+                match addConstraint(st, txn, mut &t, c, true, s.mdialect) {
+                    Ok(_) {}
+                    // (Oracle's answer to rows that break what is added: ORA-02293, ORA-02298; a row written is ORA-02290, ORA-02291)
+                    Err(x) { return Err(if s.mdialect == lexdb_sql.MD_ORA { lexdb_conerr.validateErr(&x, &t, c.kind) } else { x }) }
+                }
             }
             if c.kind == lexdb_sql.C_UNIQUE && c.cluster == 1 && len(t.indexes) > nIdx { lexdb_catalog.setCluster(mut &t, &lexdb_sql.baseName(&t.indexes[len(t.indexes) - 1].name)) }
         } else if a.kind == lexdb_sql.A_DROP_CON {
@@ -5153,6 +5161,11 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                     continue
                 }
                 return Err(e("42703", &("column \"" + a.name + "\" of relation \"" + rel + "\" does not exist")))
+            }
+            // SQL Server refuses the drop of a column a CHECK reads, Oracle one a multi-column CHECK reads (PostgreSQL drops them)
+            match lexdb_conerr.checkDropErr(&t.checks, &a.name, s.mdialect) {
+                Some(x) { return Err(x) }
+                None {}
             }
             // a key column's drop drops the key, as PostgreSQL's (its
             // index goes with the column)
@@ -5421,7 +5434,8 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         let rr = rewrite(st, txn, mut &t, &changes, &rw, lim)
         let n = match rr {
             Ok(x) { x }
-            Err(bad) { return Err(retypeErr(bad, s.mdialect, &changes, &fromInt4)) }
+            // (Oracle's ADD PRIMARY KEY over rows that repeat the key: ORA-02437)
+            Err(bad) { return Err(if s.mdialect == lexdb_sql.MD_ORA && rw.rekey && bad.state == "23505" { lexdb_conerr.validateErr(&bad, &t, lexdb_sql.C_PRIMARY) } else { retypeErr(bad, s.mdialect, &changes, &fromInt4) }) }
         }
         // the hidden key's sequence goes on after the rows numbered
         if rw.rowid >= 0 {
@@ -5779,7 +5793,10 @@ fn conStateOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table,
         if dia == lexdb_sql.MD_ORA {
             let on = mode & lexdb_sql.CS_OFF == 0
             let up = strings.toUpperAscii(name)
-            if other { return Err(e("ORA02430", &("cannot enable constraint (" + up + ") - no such constraint"))) }
+            // a key is always enabled and validated in lexdb: ENABLE and VALIDATE of it change nothing (Oracle's do the same); DISABLE
+            // and NOVALIDATE would need a table without its key, which lexdb does not have (ORA-03001; Oracle lets a key be disabled)
+            if other && mode & (lexdb_sql.CS_OFF | lexdb_sql.CS_NOVALIDATE) == 0 { return Ok(Unit{}) }
+            if other { return Err(e("0A000", &("lexdb: DISABLE and NOVALIDATE of the primary key or unique constraint " + up + " are not supported"))) }
             return Err(if on { e("ORA02430", &("cannot enable constraint (" + up + ") - no such constraint")) } else { e("ORA02431", &("cannot disable constraint (" + up + ") - no such constraint")) })
         }
         if other {
@@ -6238,11 +6255,11 @@ fn clusterClash(t: &Table): Result[Unit, DbErr] {
     return Err(e("TS1902", &("Cannot create more than one clustered index on table '" + lexdb_sql.baseName(&t.name) + "'. Drop the existing clustered index '" + shown + "' before creating another.")))
 }
 
-fn addConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint, alter: bool): Result[Unit, DbErr] {
+fn addConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint, alter: bool, md: int): Result[Unit, DbErr] {
     // (not valid: ALTER TABLE's NOT VALID, or a state written: PostgreSQL's NOT ENFORCED, Oracle's DISABLE and ENABLE NOVALIDATE, T-SQL's WITH NOCHECK)
     let later = (alter && c.notValid) || c.off || (c.notValid && c.stated)
     if c.kind == lexdb_sql.C_CHECK { return addCheck(st, txn, t, c, later) }
-    if c.kind == lexdb_sql.C_FOREIGN { return addForeign(st, txn, t, c, later) }
+    if c.kind == lexdb_sql.C_FOREIGN { return addForeign(st, txn, t, c, later, alter, md) }
     var cols: []int = []
     for n in c.cols {
         let i = lexdb_bind.colIndex(&t.cols, &n)
@@ -6323,6 +6340,30 @@ fn passes(t: &Table, c: &Check, row: &[]Val): Result[bool, DbErr] {
         else { return Err(e("42804", "argument of CHECK must be type boolean")) }
     }
 }
+
+// UPDATE's CHECKs that failed (x, 23514) where SQL Server and Oracle test only those that read a column the UPDATE sets (PostgreSQL tests
+// them all; a check that reads none of the columns could only fail by a row that was already breaking it, a constraint not validated):
+// the statement runs again, in lexdb_exec.retryLax, with the set columns under laxKey, and the checks tried again here, those that
+// read none of them left out. It is all in the error path: a row that passes its checks never gets here.
+fn laxChecks(st: &lexdb_store.Store, txn: &lexdb_store.Txn, t: &Table, row: &[]Val, x: DbErr): Result[Unit, DbErr] {
+    if x.state != "23514" { return Err(x) }
+    let cols = st.memo.get(&laxKey(txn.sql.sess)).unwrapOr("")
+    if len(cols) == 0 { return Err(x) }
+    let set = strings.split(&cols, "\n")
+    for c in t.checks {
+        var ns: []str = []
+        lexdb_sql.colNames(&c.expr, mut &ns)
+        var reads = false
+        for n in ns { for a in set { if a == n { reads = true } } }
+        if !reads { continue }
+        if !(try passes(t, &c, row)) {
+            return Err(e("23514", &("new row for relation \"" + lexdb_sql.baseName(&t.name) + "\" violates check constraint \"" + c.name + "\"")))
+        }
+    }
+    return Ok(Unit{})
+}
+
+fn laxKey(sess: int): str { return "\x00lax\x00" + sess.toStr() }
 
 // A row to be written, against table t's checks.
 fn checkChecks(t: &Table, row: &[]Val): Result[Unit, DbErr] {
@@ -6551,10 +6592,11 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
                 append(mut &held, collections.copyOf(r))
                 heldBytes += lexdb_pipe.rowBytes(r)
                 if len(held) >= want || heldBytes >= HELD_BYTES {
-                    count += try insertSelRows(st, tx, &t, &targets, &sel.outs, &held, &defs, ovr, &fw, mut &later, mut &up, &env, ret.on, mut &kept)
-                    held = []
+                    // (taken out of held first: a row of it that fails is not written again by the last chunk's flush below)
+                    let chunk = replace(mut &held, [])
                     heldBytes = 0
                     want = min(want * 2, lexdb_rows.BROWS)
+                    count += try insertSelRows(st, tx, &t, &targets, &sel.outs, &chunk, &defs, ovr, &fw, mut &later, mut &up, &env, ret.on, mut &kept)
                 }
                 return Ok(true)
             })
@@ -13245,10 +13287,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits(), pc, input, out, pull, sink)
         s.txn[0].live = false
         if len(s.tmp) == 0 && len(s.txn[0].tmp) > 0 { s.tmp = s.txn[0].tmp.clone() }
-        if r.isErr() {
-            s.failed = true
-            return r
-        }
+        if r.isErr() { return s.failedInBlock(stmt, params, ptypes, pc, input, out, pull, sink, r) }
         return r
     }
     if stmt.waitFor { return s.waitForRun(stmt, params, ptypes, pc) }
@@ -13320,11 +13359,76 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 // stale reads, 9.120) is run again, as one its commit finds is
                 let again = (snap && x.state == "72000") ||
                             (!snap && x.state == lexdb_base.S_CONFLICT && !input.pull && stmt.copy.batchRows == 0)
+                // (an UPDATE of SQL Server or Oracle that a CHECK stopped: run again with the checks that read what it sets, laxChecks)
+                if !snap && x.state == "23514" && stmt.kind == lexdb_sql.S_UPDATE && stmt.mdialect != lexdb_sql.MD_PG && len(s.onCommit) == 0 && tries == 1 {
+                    return s.retryLax(stmt, params, ptypes, pc, x)
+                }
                 if !again || tries >= 10 || input.stream || sent { return Err(x) }
             }
         }
     }
     return Err(e("XX000", "unreachable"))
+}
+
+// A statement of a block that failed (r): the block fails, unless it is an UPDATE of the SQL Server or Oracle door that a CHECK stopped (23514)
+// and the door guards its statements with a savepoint (the TNS door's lxl_stmt): that is undone and the UPDATE run again as retryLax does.
+fn (s: mut &Session) failedInBlock(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache, input: &CopyInput,
+                                   out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart,
+                                   sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool, r: Result[Res, DbErr]): Result[Res, DbErr] {
+    match move(r) {
+        Ok(v) { return Ok(v) }
+        Err(x) {
+            let n = len(s.saves)
+            if x.state == "23514" && stmt.kind == lexdb_sql.S_UPDATE && stmt.mdialect != lexdb_sql.MD_PG && n > 0 && s.saves[n - 1].name == "lxl_stmt" && !s.readOnly {
+                s.txn[0].undoTo(s.saves[n - 1].mark)
+                var names: []str = []
+                for it in stmt.sets { append(mut &names, strings.toLowerAscii(&it.col)) }
+                let key = laxKey(s.id)
+                s.st.memo.put(&key, &strings.join(&names, "\n"))
+                s.txn[0].live = true
+                let again = execIn(&s.st, mut &s.txn[0], stmt, params, ptypes, s.limits(), pc, input, out, pull, sink)
+                s.txn[0].live = false
+                s.st.memo.del(&key)
+                if again.isErr() { s.failed = true }
+                return again
+            }
+            s.failed = true
+            return Err(x)
+        }
+    }
+}
+
+// An UPDATE of the SQL Server or Oracle door that failed with 23514 (first, x), run once more: the columns it sets kept for
+// laxChecks, which tests only the CHECKs that read them. Its own transaction (outside a block, as the statement's first run was).
+fn (s: mut &Session) retryLax(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache, x: DbErr): Result[Res, DbErr] {
+    var names: []str = []
+    for it in stmt.sets { append(mut &names, strings.toLowerAscii(&it.col)) }
+    let key = laxKey(s.id)
+    s.st.memo.put(&key, &strings.join(&names, "\n"))
+    var t = lexdb_store.begin()
+    s.setUp(mut &t)
+    lexdb_stats.chgEnd(&s.st, s.id, false)
+    let ran = execIn(&s.st, mut &t, stmt, params, ptypes, s.limits(), pc, &noInput(), noOut, noPull, noSink)
+    s.st.memo.del(&key)
+    match move(ran) {
+        Ok(r) {
+            s.adopt(&t)
+            match s.st.commit(t) {
+                Ok(_) {
+                    lexdb_stats.chgEnd(&s.st, s.id, s.auto)
+                    return Ok(r)
+                }
+                Err(y) { return Err(y) }
+            }
+        }
+        Err(y) {
+            s.adopt(&t)
+            s.tmpUndo(&t)
+            s.st.abort(t)
+            // (the error the first run gave, when this one is another's)
+            return Err(if y.state == "23514" { y } else { x.clone() })
+        }
+    }
 }
 
 // ---- WAITFOR (SELECT ...) [, TIMEOUT ms] (design/lexdb-events.md)
@@ -13874,7 +13978,10 @@ fn updRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, old: &[]
             return updRow(st, txn, t, old, &fixed, fw, later)
         }
     }
-    try checkChecks(t, row)
+    match checkChecks(t, row) {
+        Ok(_) {}
+        Err(x) { try laxChecks(st, txn, t, row, x) }
+    }
     try checkEnums(st, txn, t, row)
     let c = try lexdb_access.updateRow(st, txn, &lexdb_catalog.relOf(t), old, row,
                                        fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
@@ -14152,11 +14259,11 @@ fn fkFinish(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, fw: &[]Table, lat
 // ---- foreign keys made, dropped, renamed
 
 // Adds foreign key c to table t, the table it references naming t back.
-fn addForeign(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint, later: bool): Result[Unit, DbErr] {
+fn addForeign(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint, later: bool, alter: bool, md: int): Result[Unit, DbErr] {
     let refKey = try catKey(st, txn, &c.refTable, false)
     if later { append(mut &t.invalid, try fkName(st, txn, t, c)) }
     if refKey == t.name {
-        let f = try makeFk(st, txn, t, t, c, &refKey)
+        let f = try makeFk(st, txn, t, t, c, &refKey, alter, md)
         append(mut &t.fks, f)
         if c.off { lexdb_catalog.setOff(t, &t.fks[len(t.fks) - 1].name.clone(), true) }
         addKey(mut &t.refBy, &t.name)
@@ -14169,7 +14276,7 @@ fn addForeign(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, 
                 return Err(e("42P16", &("constraints on " + (if lexdb_catalog.tempRel(&t.name) { "temporary" } else { "permanent" }) + " tables may reference only " +
                              (if lexdb_catalog.tempRel(&t.name) { "temporary" } else { "permanent" }) + " tables")))
             }
-            let f = try makeFk(st, txn, t, &p, c, &refKey)
+            let f = try makeFk(st, txn, t, &p, c, &refKey, alter, md)
             append(mut &t.fks, f)
             if c.off { lexdb_catalog.setOff(t, &t.fks[len(t.fks) - 1].name.clone(), true) }
             var pm = p
@@ -14182,7 +14289,7 @@ fn addForeign(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, 
 
 // Foreign key c of table t to table p, checked, and the rows of t there
 // checked against p.
-fn makeFk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Table, c: &lexdb_sql.Constraint, refKey: &str): Result[ForeignKey, DbErr] {
+fn makeFk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Table, c: &lexdb_sql.Constraint, refKey: &str, alter: bool, md: int): Result[ForeignKey, DbErr] {
     var refCols: []str = []
     if len(c.refCols) == 0 && lexdb_catalog.rowidKeyed(p) {
         return Err(e("42704", &("there is no primary key for referenced table \"" + lexdb_sql.baseName(&p.name) + "\"")))
@@ -14224,6 +14331,8 @@ fn makeFk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Tabl
     for n in c.cols { append(mut &own, n.clone()) }
     let f = ForeignKey{name: name.clone(), cols: own, ref: refKey.clone(), refCols: refCols, onDelete: c.onDelete, onUpdate: c.onUpdate,
                        deferrable: c.deferrable, deferred: c.deferred}
+    // Oracle refuses a second foreign key on the same columns to the same columns (PostgreSQL and SQL Server take it)
+    if md == lexdb_sql.MD_ORA { try lexdb_conerr.dupFk(t, &f, alter) }
     // the rows there (NOT VALID: when validated)
     if !lexdb_base.hasStr(&t.invalid, &name) { try fkRows(st, txn, t, &f, p) }
     return Ok(f)
@@ -14899,7 +15008,10 @@ fn bindSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): R
             }
             continue
         }
-        let d = try needSeq(st, txn, &nameOfText(&n))
+        // (a sequence that is gone is marked as such for the call that reads it: boundSeq; a default's alone, defaultsOf, is no error until a row takes it)
+        let dr = needSeq(st, txn, &nameOfText(&n))
+        if dr.isErr() { st.memo.put(&bindKey(txn.sql.sess, &n), "\x01") }
+        let d = try dr
         // nextval, setval: USAGE or UPDATE; currval: USAGE or SELECT (9.83: checked
         // for the sequences a statement names, not a column's own)
         let w = try lexdb_priv.whoNow(st, txn)
@@ -14921,6 +15033,7 @@ fn boundSeq(q: &SeqEnv, name: &str, f: &str): Result[Seq, DbErr] {
     let no = q.st.memo.get(&stmtKey(q.sess)).unwrapOr("")
     match q.st.memo.get(&bindKey(q.sess, name)) {
         Some(v) {
+            if strings.startsWith(&v, "\x01") { return Err(e("42P01", &("sequence \"" + name + "\" does not exist"))) }
             let i = strings.indexOf(&v, "\n", 0)
             if i > 0 && v[0..i] == no { return Ok(lexdb_catalog.decSeq(&v[i + 1..len(v)])) }
         }
@@ -15154,7 +15267,13 @@ fn defaultsOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Res
         append(mut &d.seqs, sq)
         append(mut &d.exprs, x)
     }
-    if len(names) > 0 { try bindSeqs(st, txn, &names) }
+    if len(names) > 0 {
+        // (a default that names a sequence gone is no error while no row takes it, Oracle's: the call fails where the row takes it)
+        match bindSeqs(st, txn, &names) {
+            Ok(_) {}
+            Err(x) { if x.state != "42P01" { return Err(x) } }
+        }
+    }
     if len(d.gens) > 0 { d.fill = lexdb_gen.fillCols(t) }
     return Ok(d)
 }
@@ -18027,8 +18146,10 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str): Result
     }
     var dbopts = ""
     if rel == "sys.databases" { dbopts = (try st.get(txn, lexdb_catalog.CATALOG, &lexdb_dbopt.KEY)).unwrapOr("") }
+    // (Oracle's NLS views show what ALTER SESSION set)
+    let sets = if rel == "ora.NLS_SESSION_PARAMETERS" || rel == "ora.V_$NLS_PARAMETERS" { st.memo.get(&settingsKey(txn.sql.sess)).unwrapOr("") } else { "" }
     var cq = CatView{snap: snap, roles: roles, sess: txn.sql.sess, mems: mems, used: used, cur: cur, who: who, whoSuper: whoSuper, dbopts: dbopts,
-                     replica: lexdb_standby.isReplica(st)}
+                     replica: lexdb_standby.isReplica(st), sets: sets}
     if strings.startsWith(rel, "sys.") { return lexdb_syscat.viewRows(&cq, &rel[4..len(rel)]) }
     if strings.startsWith(rel, "ora.") { return lexdb_oracat.viewRows(&cq, &rel[4..len(rel)]) }
     var stats: Map[int, TabStat] = newMap()

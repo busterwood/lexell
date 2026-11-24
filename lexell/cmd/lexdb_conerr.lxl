@@ -1,0 +1,85 @@
+// lexdb_conerr: what the products say about constraints where lexdb's one model differs by dialect (checked against PostgreSQL 18,
+// SQL Server 2022 and Oracle Free 23.26): DROP COLUMN of a column a CHECK reads, the same foreign key twice, ADD CONSTRAINT over
+// rows that break it, and the constraint states Oracle's DISABLE and ENABLE name that lexdb does not keep. Each takes the dialect's
+// facts and gives the error to refuse with, or says nothing.
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_catalog"
+
+type DbErr = lexdb_base.DbErr
+
+fn err(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+// The n-th (from 0) double-quoted name of s ("" none).
+fn quoted(s: &str, n: int): str {
+    var from = 0
+    var k = 0
+    while true {
+        let a = strings.indexOf(s, "\"", from)
+        if a < 0 { return "" }
+        let b = strings.indexOf(s, "\"", a + 1)
+        if b < 0 { return "" }
+        if k == n { return s[a + 1..b].toStr() }
+        k += 1
+        from = b + 1
+    }
+    return ""
+}
+
+// DROP COLUMN c of a column a CHECK reads (checked against the products): PostgreSQL drops the column's own checks with it
+// (all that read it, however many columns), so nothing is refused; SQL Server refuses the drop for any check that reads the
+// column (5074, naming the check; it follows with 4922); Oracle drops a check that reads the column alone and refuses one
+// that reads others (ORA-12991).
+pub fn checkDropErr(checks: &[]lexdb_catalog.Check, c: &str, md: int): Option[DbErr] {
+    if md != lexdb_sql.MD_TSQL && md != lexdb_sql.MD_ORA { return None }
+    for ck in checks {
+        var ns: []str = []
+        lexdb_sql.colNames(&ck.expr, mut &ns)
+        var uses = false
+        var others = false
+        for n in ns {
+            if n == c { uses = true } else { others = true }
+        }
+        if !uses { continue }
+        if md == lexdb_sql.MD_TSQL { return Some(err("TS5074", &("The object '" + ck.name + "' is dependent on column '" + c + "'."))) }
+        if others { return Some(err("ORA12991", "column is referenced in a multi-column constraint")) }
+    }
+    return None
+}
+
+// Oracle: foreign key f (to be added to t) the same as one t has (the same columns, the same table and columns referenced; the
+// actions do not matter): ORA-02275 for ALTER TABLE ... ADD, ORA-02274 in CREATE TABLE. PostgreSQL and SQL Server take a second
+// foreign key on the same columns.
+pub fn dupFk(t: &lexdb_catalog.Table, f: &lexdb_catalog.ForeignKey, alter: bool): Result[Unit, DbErr] {
+    for g in t.fks {
+        if g.ref != f.ref || len(g.cols) != len(f.cols) || len(g.refCols) != len(f.refCols) { continue }
+        var same = true
+        for k in 0..len(g.cols) { if g.cols[k] != f.cols[k] { same = false } }
+        for k in 0..len(g.refCols) { if g.refCols[k] != f.refCols[k] { same = false } }
+        if !same { continue }
+        if alter { return Err(err("ORA02275", "such a referential constraint already exists in the table")) }
+        return Err(err("ORA02274", "duplicate referential constraint specifications"))
+    }
+    return Ok(Unit{})
+}
+
+// Oracle: the error of ALTER TABLE ... ADD CONSTRAINT (or ADD COLUMN with one) that found rows breaking it, x the check's 23514, the
+// foreign key's 23503 or a key's 23505 (kind: lexdb_sql.C_*): ORA-02293 and ORA-02298 name the constraint with its owner, the way ENABLE VALIDATE's do (the
+// error of a row written, ORA-02290 and ORA-02291, is another).
+pub fn validateErr(x: &DbErr, t: &lexdb_catalog.Table, kind: int): DbErr {
+    let owner = strings.toUpperAscii(&lexdb_sql.schemaOf(&t.name))
+    // (rows that are not unique: ORA-02437 for a primary key, ORA-02299 for a unique constraint)
+    if x.state == "23505" {
+        let n = strings.toUpperAscii(&quoted(&x.msg, 0))
+        if kind == lexdb_sql.C_PRIMARY { return err("ORA02437", &("cannot validate (" + owner + "." + n + ") - primary key violated")) }
+        return err("ORA02299", &("cannot validate (" + owner + "." + n + ") - duplicate keys found"))
+    }
+    if x.state == "23514" {
+        return err("ORA02293", &("cannot validate (" + owner + "." + strings.toUpperAscii(&quoted(&x.msg, 0)) + ") - check constraint violated"))
+    }
+    if x.state == "23503" && strings.contains(&x.msg, "violates foreign key constraint") {
+        return err("ORA02298", &("cannot validate (" + owner + "." + strings.toUpperAscii(&quoted(&x.msg, 1)) + ") - parent keys not found"))
+    }
+    return x.clone()
+}

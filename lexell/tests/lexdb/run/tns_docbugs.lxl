@@ -1,0 +1,203 @@
+// lexdb over TNS: the bugs the user documentation found in the Oracle door (KNOWN-ISSUES.md, the bug-fix slice), checked against Oracle Database Free 23.26
+// (gen_oracle.py --check tns_docbugs; the known differences are in oracle_known_diffs.txt): an INSERT ... SELECT, UPDATE and MERGE into a table with a
+// foreign key and a CHECK that a row fails part way (ORA-02290, ORA-02291), DROP COLUMN of a column in a multi-column CHECK (ORA-12991) and of one in a
+// single-column CHECK (the check goes), ENABLE and DISABLE of a key, a name not there (ORA-02430, ORA-02431), ADD CONSTRAINT over rows that break it
+// (ORA-02293, ORA-02298, ORA-02437, ORA-02299), a second foreign key on the same columns (ORA-02275 in ALTER TABLE, ORA-02274 in CREATE TABLE), QUALIFY
+// (after CONNECT BY, a number or a text as the condition, FOR UPDATE ORA-01786, ORDER BY or FOR UPDATE before it ORA-03049), a package that has only a
+// specification, SYS_CONTEXT and NLS_SESSION_PARAMETERS after ALTER SESSION SET CURRENT_SCHEMA, NLS_TERRITORY, NLS_LANGUAGE and NLS_DATE_FORMAT, and a
+// DEFAULT that calls a sequence gone (ORA-02289, only for the row that takes the default). Each statement runs with set lexdb_batch = off (the row
+// engine) and on: "same" and the answer, or DIFFERENT and both.
+// expect: setup: 28 statements
+// expect: same: error 2290 / N = 0
+// expect: same: 3000 / error 2290 / N = 0
+// expect: same: 3000 / error 2291 / N = 0
+// expect: same: 3000 / error 2290 / N = 0
+// expect: same: 3000 / error 2290 / N,M = 0|NULL
+// expect: same: 3000 / error 2290 / N = 0
+// expect: same: error 2290 / N = 0
+// expect: same: error 12991
+// expect: same: error 12991
+// expect: same: error 12991
+// expect: same: 0 / 0 / N = 0
+// expect: same: 0 / 0 / N = 0
+// expect: same: error 2430
+// expect: same: error 2431
+// expect: same: 0
+// expect: same: error 3001
+// expect: same: error 2293
+// expect: same: error 2293
+// expect: same: error 2298
+// expect: same: error 2437
+// expect: same: error 2299
+// expect: same: error 2275
+// expect: same: error 2275
+// expect: same: error 2274
+// expect: same: 0 / 0
+// expect: same: ID = 1;2;3;4;5
+// expect: same: ID = 
+// expect: same: ID = 2;3;4;5
+// expect: same: ID = 
+// expect: same: ID = 1;3;5
+// expect: same: ID = 1;2;3;4;5
+// expect: same: ID = 
+// expect: same: error 61800
+// expect: same: G,C = 0|1;1|2;2|2
+// expect: same: ID = 2;3;4;5
+// expect: same: ID,L = 2|2
+// expect: same: error 1786
+// expect: same: error 1786
+// expect: same: error 3049
+// expect: same: error 3049
+// expect: same: error 3049
+// expect: same: error 3048
+// expect: same: 0 / A = 2;5
+// expect: same: 0 / A = 7
+// expect: same: 0 / A = 1;2
+// expect: same: error 6550
+// expect: same: error 6553
+// expect: same: CS,SU = 'APP'|'APP'
+// expect: same: 0 / CS,SS,SU = 'SYSTEM'|'SYSTEM'|'APP' / 0
+// expect: same: CS = 'APP'
+// expect: same: 0 / PARAMETER,VALUE = 'NLS_DATE_FORMAT'|'YYYY';'NLS_TERRITORY'|'AMERICA' / 0
+// expect: same: 0 / PARAMETER,VALUE = 'NLS_CURRENCY'|'€';'NLS_DATE_FORMAT'|'DD.MM.RR';'NLS_ISO_CURRENCY'|'GERMANY';'NLS_NUMERIC_CHARACTERS'|',.';'NLS_TERRITORY'|'GERMANY';'NLS_TIMESTAMP_FORMAT'|'DD.MM.RR HH24:MI:SSXFF';'NLS_TIME_FORMAT'|'HH24:MI:SSXFF' / T,L = 'GERMANY'|'AMERICAN_GERMANY.AL32UTF8' / 0
+// expect: same: 0 / 0 / VALUE = 'DD/MM/RR' / 0
+// expect: same: 0 / PARAMETER,VALUE = 'NLS_DATE_LANGUAGE'|'FRENCH';'NLS_LANGUAGE'|'FRENCH';'NLS_SORT'|'FRENCH' / L,S = 'FRENCH_AMERICA.AL32UTF8'|'FRENCH' / 0
+// expect: same: PARAMETER,VALUE = 'NLS_DATE_FORMAT'|'DD-MON-RR';'NLS_LANGUAGE'|'AMERICAN';'NLS_SORT'|'BINARY';'NLS_TERRITORY'|'AMERICA'
+// expect: same: error 2289 / N = 0
+// expect: same: 1 / ID,V = 5|3
+// expect: same: 1 / ID,V = 6|4
+// expect: same: 1 / ID,V = 7|5
+// expect: same: error 2289 / N = 0
+// expect: same: error 2289 / N = 0
+// expect: same: 1 / 1 / ID,A,B = 1|-1|6;2|5|5
+// expect: same: 1 / error 2290 / ID,A,B = 1|-1|5;2|5|5
+// expect: same: 1 / error 2290 / ID,A,B = 1|-1|5;2|5|5
+// expect: same: 1 / 1 / ID,A,B = 1|-1|5;2|3|7
+// expect: same: 1 / 1 / ID,A,B = 1|4|5;2|5|5
+// expect: same: 1 / 2 / ID,A,B = 1|-1|6;2|5|6
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+const SETUP = "create table p9 (id number constraint p9_pk primary key)\ninsert into p9 values (1)\ninsert into p9 values (2)\ncreate table c9 (id number primary key, pid number references p9 (id), v number check (v > 0))\ncreate table nums as select level i from dual connect by level <= 3000\ncreate table dc1 (a number, b number, c number constraint ckc check (c > 0), constraint ckab check (a < b), constraint ckbc check (b + c > 0))\ncreate table dc2 (id number, v number)\ncreate table dc3 (id number, v number)\ninsert into dc3 values (1, 5)\ncreate table c3 (id number, pid number)\ninsert into c3 values (1, 99)\ncreate table k1 (a number, b number)\ninsert into k1 values (1, 1)\ninsert into k1 values (1, 1)\ncreate table fk1 (id number, pid number, pid2 number, constraint fk1_a foreign key (pid) references p9 (id))\ncreate table pk1 (id number constraint pk1_pk primary key)\ncreate table q (id number, g number)\ninsert into q select level, mod(level, 3) from dual connect by level <= 5\ncreate table pv (a number)\ncreate or replace package pk_only as n number := 5; c constant varchar2(10) := 'hi'; d date := date '2020-01-02'; b boolean := true; end pk_only;\ncreate sequence sq9\ncreate table sd (id number default sq9.nextval, v number)\ndrop sequence sq9\ncreate table u9 (id number primary key, a number, b number)\ninsert into u9 values (1, -1, 5)\ninsert into u9 values (2, 5, 5)\nalter table u9 add constraint cka check (a > 0) enable novalidate\ncreate user system identified by pw"
+
+const QS = "insert into c9 select i + 100, 1, 2000 - i from nums ;; select count(*) n from c9\ninsert into c9 select i, 1, 5 from nums ;; insert into c9 select i + 10000, 1, 2000 - i from nums ;; select count(*) n from c9\ninsert into c9 select i, 1, 5 from nums ;; insert into c9 select i + 10000, 1, 5 from nums where i <= 2000 union all select 20000, 3, 5 from dual ;; select count(*) n from c9\ninsert into c9 select i, 1, 5 from nums ;; update c9 set pid = 2, v = 2000 - id ;; select count(*) n from c9 where pid = 2\ninsert into c9 select i, 1, 5 from nums ;; update c9 set id = id + 5000, v = 2000 - id ;; select count(*) n, min(id) m from c9\ninsert into c9 select i, 1, 5 from nums ;; merge into c9 t using (select i id from nums) s on (t.id = s.id) when matched then update set t.v = 2000 - t.id ;; select count(*) n from c9 where v < 0\nmerge into c9 t using (select i + 3000 id from nums) s on (t.id = s.id) when not matched then insert values (s.id, 1, 3500 - s.id) ;; select count(*) n from c9\nalter table dc1 drop column c\nalter table dc1 drop column b\nalter table dc1 drop column a\nalter table dc2 add (w number check (w > 0)) ;; alter table dc2 drop column w ;; select count(*) n from user_constraints where table_name = 'DC2'\nalter table dc2 add (w number check (w > 0 and w < 100)) ;; alter table dc2 drop column w ;; select count(*) n from user_constraints where table_name = 'DC2'\nalter table k1 enable constraint nosuch\nalter table k1 disable constraint nosuch\nalter table p9 enable constraint p9_pk\nalter table pk1 disable constraint pk1_pk\nalter table dc3 add constraint ck_bad check (v > 100)\nalter table dc3 add constraint ck_bad2 check (v > 100) enable validate\nalter table c3 add constraint fk_bad foreign key (pid) references p9 (id)\nalter table k1 add constraint k1_pk primary key (a)\nalter table k1 add constraint k1_u unique (a)\nalter table fk1 add constraint fk1_b foreign key (pid) references p9 (id)\nalter table fk1 add constraint fk1_b foreign key (pid) references p9 (id) on delete cascade\ncreate table fk2 (id number, pid number, constraint a1 foreign key (pid) references p9 (id), constraint a2 foreign key (pid) references p9 (id))\nalter table fk1 add constraint fk1_c foreign key (pid2) references p9 (id) ;; alter table fk1 drop constraint fk1_c\nselect id from q qualify 1 order by id\nselect id from q qualify 0\nselect id from q qualify id - 1 order by id\nselect id from q qualify null\nselect id from q qualify mod(id, 2) order by id\nselect id from q qualify 'yes' order by id\nselect id from q qualify 'f'\nselect id from q qualify 'a'\nselect g, count(*) c from q group by g qualify c order by g\nselect id from q start with id = 1 connect by prior id + 1 = id qualify id > 1 order by id\nselect id, level l from q start with id = 1 connect by prior id + 1 = id qualify level = 2\nselect id from q qualify id = 1 for update\nselect id from q qualify row_number() over (order by id) = 1 for update\nselect id from q order by id qualify id = 1\nselect id from q for update qualify id = 1\nselect id from q qualify id = 1 connect by prior id = id\nselect id from q group by id qualify id = 1 having id = 1\nbegin insert into pv values (pk_only.n); insert into pv values (length(pk_only.c)); end; ;; select a from pv order by a\nbegin pk_only.n := 7; insert into pv values (pk_only.n); end; ;; select a from pv order by a\nbegin if pk_only.b then insert into pv values (1); end if; insert into pv values (to_number(to_char(pk_only.d, 'DD'))); end; ;; select a from pv order by a\nbegin pk_only.c := 'x'; end;\nselect pk_only.n from dual\nselect sys_context('userenv', 'current_schema') cs, sys_context('userenv', 'session_user') su from dual\nalter session set current_schema = system ;; select sys_context('userenv', 'current_schema') cs, sys_context('userenv', 'session_schema') ss, sys_context('userenv', 'session_user') su from dual ;; alter session set current_schema = app\nselect sys_context('userenv', 'current_schema') cs from dual\nalter session set nls_date_format = 'YYYY' ;; select parameter, value from nls_session_parameters where parameter in ('NLS_DATE_FORMAT', 'NLS_TERRITORY') order by 1 ;; alter session set nls_date_format = 'DD-MON-RR'\nalter session set nls_territory = 'GERMANY' ;; select parameter, value from nls_session_parameters where parameter in ('NLS_CURRENCY', 'NLS_DATE_FORMAT', 'NLS_ISO_CURRENCY', 'NLS_NUMERIC_CHARACTERS', 'NLS_TERRITORY', 'NLS_TIMESTAMP_FORMAT', 'NLS_TIME_FORMAT') order by 1 ;; select sys_context('userenv', 'nls_territory') t, sys_context('userenv', 'language') l from dual ;; alter session set nls_territory = 'AMERICA'\nalter session set nls_date_format = 'YYYY' ;; alter session set nls_territory = 'FRANCE' ;; select value from nls_session_parameters where parameter = 'NLS_DATE_FORMAT' ;; alter session set nls_territory = 'AMERICA'\nalter session set nls_language = 'FRENCH' ;; select parameter, value from nls_session_parameters where parameter in ('NLS_DATE_LANGUAGE', 'NLS_LANGUAGE', 'NLS_SORT') order by 1 ;; select sys_context('userenv', 'language') l, sys_context('userenv', 'nls_sort') s from dual ;; alter session set nls_language = 'AMERICAN'\nselect parameter, value from nls_session_parameters where parameter in ('NLS_DATE_FORMAT', 'NLS_LANGUAGE', 'NLS_SORT', 'NLS_TERRITORY') order by 1\ninsert into sd (v) values (2) ;; select count(*) n from sd\ninsert into sd (id, v) values (5, 3) ;; select id, v from sd\ninsert into sd values (6, 4) ;; select id, v from sd\ninsert into sd (id, v) select 7, 5 from dual ;; select id, v from sd\ninsert into sd (id, v) values (default, 6) ;; select count(*) n from sd\ninsert into sd (v) select 5 from dual ;; select count(*) n from sd\ninsert into pv values (0) ;; update u9 set b = 6 where id = 1 ;; select id, a, b from u9 order by id\ninsert into pv values (0) ;; update u9 set a = -2 where id = 1 ;; select id, a, b from u9 order by id\ninsert into pv values (0) ;; update u9 set a = a where id = 1 ;; select id, a, b from u9 order by id\ninsert into pv values (0) ;; update u9 set a = 3, b = 7 where id = 2 ;; select id, a, b from u9 order by id\ninsert into pv values (0) ;; update u9 set a = 4 where id = 1 ;; select id, a, b from u9 order by id\ninsert into pv values (0) ;; update u9 set b = b + 1 ;; select id, a, b from u9 order by id"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows; or error and the number.
+fn qtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// A statement: its row count, or error and the number.
+fn xtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.run(&(sql.toStr()), &[]) {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn one(c: mut &oracle.Conn, sql: &str): str {
+    let low = strings.toLowerAscii(sql)
+    if strings.startsWith(&low, "select") || strings.startsWith(&low, "with") { return qtext(c, sql) }
+    return xtext(c, sql)
+}
+
+// A query, or statements ("a ;; b ;; c") in a transaction rolled back: each answer, joined by " / " (after an error, the
+// last part, the check, after the rollback).
+fn answer(c: mut &oracle.Conn, sqls: &str): str {
+    if !strings.contains(sqls, " ;; ") { return one(c, sqls) }
+    let parts = strings.split(sqls, " ;; ")
+    var out: []str = []
+    var failed = false
+    let r = c.transaction(fn(c2: mut &oracle.Conn): Result[int, oracle.Error] {
+        for i in 0..len(parts) {
+            if failed { break }
+            let a = one(c2, &parts[i])
+            if strings.startsWith(&a, "error") { failed = true }
+            append(mut &out, a)
+        }
+        return Err(sqldialect.inputError("rolled back"))
+    })
+    if failed { append(mut &out, one(c, &parts[len(parts) - 1])) }
+    return strings.join(&out, " / ")
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            let text: str = QS
+            for q in strings.lines(&text) {
+                let a = c.run(&("set lexdb_batch = off".toStr()), &[])
+                let off = answer(mut &c, &q)
+                let b = c.run(&("set lexdb_batch = on".toStr()), &[])
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(160), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

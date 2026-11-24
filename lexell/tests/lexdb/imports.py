@@ -43,7 +43,7 @@ CMD = os.path.normpath(os.path.join(HERE, "..", "..", "cmd"))
 IMPORT = re.compile(r'import\s+"\./([A-Za-z0-9_]+)"')
 
 CORE = {
-    "lexdb_access", "lexdb_agg", "lexdb_base", "lexdb_bind", "lexdb_catalog", "lexdb_census", "lexdb_cols", "lexdb_dbopt", "lexdb_dialect", "lexdb_disk",
+    "lexdb_access", "lexdb_agg", "lexdb_base", "lexdb_bind", "lexdb_catalog", "lexdb_census", "lexdb_conerr", "lexdb_cols", "lexdb_dbopt", "lexdb_dialect", "lexdb_disk",
     "lexdb_enum", "lexdb_exec", "lexdb_fkprobe", "lexdb_float", "lexdb_func", "lexdb_gen", "lexdb_held", "lexdb_leafk", "lexdb_lib", "lexdb_like",
     "lexdb_locks", "lexdb_match", "lexdb_recur", "lexdb_recrun",
     "lexdb_memo", "lexdb_newfn", "lexdb_oldnew", "lexdb_ops", "lexdb_vec", "lexdb_decfit",

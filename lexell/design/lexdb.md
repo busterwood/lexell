@@ -13050,3 +13050,15 @@ table with none off pays nothing; a foreign key not enforced is kept out of `Tab
 ALTER TABLE grammars make one alteration, `A_CON_STATE`, run by `conState` beside VALIDATE CONSTRAINT. PostgreSQL's NOT ENFORCED and ALTER CONSTRAINT [NOT]
 ENFORCED (`exec_unenf`), T-SQL's WITH NOCHECK, NOCHECK CONSTRAINT, [WITH CHECK] CHECK CONSTRAINT (`tds_unenforced`), Oracle's DISABLE, ENABLE [NO]VALIDATE and
 MODIFY CONSTRAINT (`tns_unenforced`); pg_constraint.conenforced (new in the table), is_disabled and is_not_trusted, STATUS and VALIDATED.
+
+## As built: the bugs the user documentation found (KNOWN-ISSUES.md, 2026-11-24)
+
+- **INSERT ... SELECT into a table with a foreign key and a CHECK that a row fails part way** gave 23505, not 23514. The rows of a chunk (`insertSelRows`,
+  the foreign key's probe ahead) were still in `held` when the chunk's error came out of the row callback, and the flush after the query's end wrote them again
+  (`c9_pkey`, `Key (id)=(1093)`). The chunk is taken out of `held` before it is written. UPDATE and MERGE of the same shape never held a chunk: they were right
+  (`exec_docbugs`, `tds_docbugs`, `tns_docbugs`: 3,000 rows, batches off and on, 23514 / 547 / ORA-02290, 23503 / ORA-02291 for a parent missing at the end).
+- **DROP COLUMN and CHECKs**: PostgreSQL drops every CHECK that reads the column (the check of several columns too), as lexdb did; SQL Server refuses for any check that
+  reads it (5074 naming the check; its 4922 follows, the client's first error is 5074); Oracle drops a check that reads only that column and refuses one that reads
+  others (ORA-12991). `lexdb_conerr.checkDropErr`.
+- **A column constraint written `NOT VALID` with NOT ENFORCED** (before or after it) is 42601 at VALID, as PostgreSQL 18's; a table constraint takes both
+  (`lexdb_parse.notValidSince`: the NOT VALID is looked for in the tokens the constraint read, outside brackets).
