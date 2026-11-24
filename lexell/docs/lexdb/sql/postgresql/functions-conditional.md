@@ -40,13 +40,12 @@ error_on_null ( value ) → type of value
 
 - `CASE` computes only the branch it takes: `CASE WHEN x = 0 THEN 0 ELSE 1 / x END` does not divide by zero.
 - The results of `CASE`, and the arguments of `coalesce`, `greatest` and `least`, are converted to one type (see
-  [type conversion](type-conversion.md)).
+  [type conversion](type-conversion.md)). Types that cannot meet (a number and a boolean) are 42804. `greatest` and
+  `least` of enum values go by the list's order (see [enum types](data-types-enum.md)).
 
 ## Differences from PostgreSQL
 
-- `CASE` and `coalesce` do not check that their results' types can meet: `CASE WHEN false THEN 1 ELSE false END`
-  gives `f` (PostgreSQL: 42804).
-- `greatest` and `least` of enum values compare as text (see [enum types](data-types-enum.md)).
+None known.
 
 ## Examples
 
@@ -158,6 +157,23 @@ SELECT error_on_null(reorder_at) FROM stock WHERE item = 'pad';
 (1 row)
 
 ERROR:  null value not allowed
+```
+
+### G. Types that cannot meet
+
+<!-- example: postgresql -->
+```sql
+SELECT CASE WHEN false THEN 1 ELSE false END;
+SELECT coalesce(1, true);
+SELECT greatest(1, true);
+SELECT coalesce(qty, 'a') FROM stock;
+```
+
+```text
+ERROR:  CASE types boolean and integer cannot be matched
+ERROR:  COALESCE types integer and boolean cannot be matched
+ERROR:  GREATEST types integer and boolean cannot be matched
+ERROR:  invalid input syntax for type integer: "a"
 ```
 
 ## See also
