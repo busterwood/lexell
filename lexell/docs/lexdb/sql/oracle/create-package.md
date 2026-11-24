@@ -31,15 +31,22 @@ END [ package ] ;
 
 ## Remarks
 
+- Each session has its own copy of a package's variables. The first use makes them from their initial values, and the
+  body's initialisation section (`BEGIN` ... at its end) runs then. Another session's assignments are not seen.
+- When a package is compiled again (`CREATE OR REPLACE`), a session that held its state gets **ORA-04068** ("existing
+  state of packages has been discarded") at its next call into the package, once; the call after it runs on fresh
+  variables. Reading or assigning a variable from outside does not raise it.
 - A package's members are called as `package.member`: `pay.give_bonus(1)`, `pay.total()`. Variables and constants
   declared in the specification are shared by the code that uses the package, and keep their values for the session.
 - `USER_OBJECTS` lists both as `PACKAGE` and `PACKAGE BODY`; `USER_SOURCE` has their text.
 
 ## Differences from Oracle
 
-- **Package variables and constants cannot be read from outside the package:** `DBMS_OUTPUT.PUT_LINE(pay.g_count)`
-  and `pay.c_bonus` are ORA-00904 (example C). The package's own code uses them freely. A function in the package
-  can return the value instead.
+- **Package variables are used from PL/SQL, not from a statement of its own.** A block, procedure or function outside
+  the package reads and assigns the package's variables and reads its constants (example C), also inside a SQL
+  statement it runs. A statement sent by itself (`SELECT pay.g_count FROM dual`) is ORA-06553, as in Oracle
+  (example D). Not supported: a package variable as an `INTO` target or an `OUT` argument from outside the package,
+  and a variable of a record or collection type.
 - Collection types and nested subprograms are not supported, as elsewhere in PL/SQL.
 
 ## Examples
@@ -128,29 +135,82 @@ TOTAL_AFTER
 
 ### C. Package variables from outside
 
+A block outside the package reads and assigns the variables of its specification. They belong to the session: they
+keep their values from one block to the next.
+
 <!-- example: oracle -->
 ```sql
 BEGIN
-  DBMS_OUTPUT.PUT_LINE('count ' || pay.g_count);
+  DBMS_OUTPUT.PUT_LINE('count ' || pay.g_count || ', bonus ' || pay.c_bonus);
+  pay.g_count := 100;
+  DBMS_OUTPUT.PUT_LINE('count_given() says ' || pay.count_given());
+  pay.give_bonus(1);
+  pay.g_count := pay.g_count + 5;
+END;
+/
+DECLARE
+  v VARCHAR2(20);
+BEGIN
+  DBMS_OUTPUT.PUT_LINE('count is now ' || pay.g_count);
+  IF pay.g_count > 100 THEN
+    DBMS_OUTPUT.PUT_LINE('over 100');
+  END IF;
+  SELECT name INTO v FROM emp WHERE id = pay.g_count - 104;
+  DBMS_OUTPUT.PUT_LINE('row ' || (pay.g_count - 104) || ' is ' || v);
+  pay.g_count := 0;
+END;
+/
+```
+
+```text
+count 3, bonus 10
+count_given() says 100
+
+PL/SQL procedure successfully completed.
+
+count is now 106
+over 100
+row 2 is bob
+
+PL/SQL procedure successfully completed.
+```
+
+### D. What a variable cannot do
+
+A statement of its own cannot name a package variable (ORA-06553, as in Oracle). A constant cannot be assigned
+(PLS-00363), and a name the package does not have is PLS-00302.
+
+<!-- example: oracle -->
+```sql
+SELECT pay.g_count FROM dual;
+BEGIN
+  pay.c_bonus := 5;
 END;
 /
 BEGIN
-  DBMS_OUTPUT.PUT_LINE('bonus ' || pay.c_bonus);
+  DBMS_OUTPUT.PUT_LINE(pay.nothere);
 END;
 /
 ```
 
 ```text
 ERROR:
-ORA-00904: invalid identifier
-ORA-06512: at line 2
+ORA-06553: PLS-221: 'G_COUNT' is not a procedure or is undefined
 
 ERROR:
-ORA-00904: invalid identifier
-ORA-06512: at line 2
+ORA-06550: line 2, column 3:
+PLS-00363: expression 'PAY.C_BONUS' cannot be used as an assignment target
+ORA-06550: line 2, column 3:
+PL/SQL: Statement ignored
+
+ERROR:
+ORA-06550: line 2, column 28:
+PLS-00302: component 'NOTHERE' must be declared
+ORA-06550: line 2, column 3:
+PL/SQL: Statement ignored
 ```
 
-### D. The dictionary
+### E. The dictionary
 
 <!-- example: oracle -->
 ```sql
