@@ -60,9 +60,11 @@ datetimeoffset [ ( p ) ]
   recognised (error 155), and `SWITCHOFFSET` and `TODATETIMEOFFSET` do not exist.
 - **Only ISO layouts are read.** `'20260315'`, `'March 15, 2026'` and `'03/15/2026'` are error 241, and `SET
   DATEFORMAT` changes nothing. `'2026-03-15T13:45:30'` and `'2026-3-5'` are read.
-- **Date arithmetic on `datetime`.** `datetime + 1` (a day) is error 195. `datetime - datetime` is an interval
-  that prints as `1 day` or `1 day 10:00:00`, where SQL Server gives a datetime. `date + 1` is a date (SQL Server:
-  error 8117) and `date - date` is a number of days (SQL Server: 8117). Use `DATEADD` and `DATEDIFF`.
+- **Date arithmetic.** `datetime + 1`, `datetime - 1`, `1 + datetime` and `datetime - datetime` work as in SQL Server,
+  also with `smalldatetime`: a number is days, and the difference of two datetimes is a datetime counted from
+  1900-01-01 (example H). `date`, `datetime2`, `datetimeoffset` and `time` with a number are error 206, as in SQL
+  Server; they take `DATEADD`. `date - date` is accepted and gives a number of days (SQL Server: 8117), and
+  `GETDATE() - GETDATE()` is an interval (`00:00:00`), not a datetime.
 - `time` from a string with a date (`CAST('2026-03-15 13:45:30' AS time)`) is error 241; SQL Server takes the time
   part.
 - `datetime2(8)` is error 1002.
@@ -222,12 +224,14 @@ SELECT DATEADD(day, 1, CAST('2026-02-28' AS date)) AS next_day,
        DATEADD(month, 1, CAST('2026-01-31' AS date)) AS next_month,
        DATEDIFF(day, '2026-03-15', '2026-03-20') AS days_between;
 GO
-SELECT CAST('2026-03-15' AS datetime) + 1 AS plus_one;
+SELECT CAST('2026-03-15' AS datetime) + 1 AS plus_one, CAST('2026-03-15 12:00' AS datetime) - 1 AS minus_one,
+       CAST('2026-03-15' AS datetime) + 0.5 AS plus_half;
 GO
 SELECT CAST('2026-03-16 10:00' AS datetime) - CAST('2026-03-15' AS datetime) AS difference;
 GO
-SELECT CAST('2026-03-15' AS date) + 1 AS date_plus_one,
-       CAST('2026-03-16' AS date) - CAST('2026-03-15' AS date) AS date_minus_date;
+SELECT CAST('2026-03-15' AS date) + 1 AS date_plus_one;
+GO
+SELECT CAST('2026-03-15 10:00' AS datetime2) + 1 AS datetime2_plus_one;
 ```
 
 ```text
@@ -237,19 +241,22 @@ next_day   next_month days_between
 
 (1 row affected)
 
-Msg 195, Level 15, State 1, Line 1
-operator does not exist: timestamp without time zone + bigint
+plus_one              minus_one             plus_half
+--------------------- --------------------- ---------------------
+2026-03-16 00:00:00.0 2026-03-14 12:00:00.0 2026-03-15 12:00:00.0
+
+(1 row affected)
+
 difference
---------------
-1 day 10:00:00
+---------------------
+1900-01-02 10:00:00.0
 
 (1 row affected)
 
-date_plus_one date_minus_date
-------------- ---------------
-2026-03-16    1
-
-(1 row affected)
+Msg 206, Level 16, State 1, Line 1
+Operand type clash: date is incompatible with int
+Msg 206, Level 16, State 1, Line 1
+Operand type clash: datetime2 is incompatible with int
 ```
 
 ### I. Layouts that are not read
