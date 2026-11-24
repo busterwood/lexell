@@ -1,7 +1,7 @@
 # Known issues
 
 Bugs and gaps found while writing and checking these pages (lexdb built from main at 4fba817b, 2026-11-23; the entries
-that main ca687450, a15b9a64 and 02646472, 2026-11-24, fixed are removed or reworded to what is left). They are not fixed here: the pages
+that main ca687450, a15b9a64, 02646472 and 436468d8, 2026-11-24, fixed are removed or reworded to what is left). They are not fixed here: the pages
 describe what lexdb does. Each "Differences" section of the reference lists the
 smaller differences of its statement.
 
@@ -56,6 +56,16 @@ smaller differences of its statement.
     COLLATE`. At table level `INCLUDE`, `WITH`, `USING INDEX TABLESPACE` and `DEFERRABLE` on a key are 0A000.
   - `ALTER COLUMN ... TYPE` without `USING` folds its hint into the message (42804).
   - `DROP ... CASCADE` gives no NOTICE naming what it drops; the 2BP01 refusals carry their hints in the message.
+- **Constraint states** (`NOT ENFORCED`, `ALTER CONSTRAINT [NOT] ENFORCED`; see [ALTER TABLE](sql/postgresql/alter-table.md)):
+  - `ALTER CONSTRAINT ... DEFERRABLE`, `INITIALLY` and `NOT DEFERRABLE` are 0A000 (PostgreSQL takes them for a foreign
+    key); only `ENFORCED` and `NOT ENFORCED` are taken.
+  - A column constraint written `NOT VALID NOT ENFORCED` is accepted (a syntax error in PostgreSQL).
+- **`INSERT ... SELECT` into a table with a foreign key and a `CHECK` that a row fails part way gives 23505, not 23514**
+  (found on main, not fixed): `CREATE TABLE c9 (id int PRIMARY KEY, pid int REFERENCES p9 (id), v int CHECK (v > 0));
+  INSERT INTO c9 SELECT i + 100, 1, 2000 - i FROM generate_series(1, 3000) i;` says `duplicate key value violates
+  unique constraint "c9_pkey"` (`Key (id)=(1093) already exists`); PostgreSQL says `new row for relation "c9" violates
+  check constraint "c9_v_check"` (23514). Without the foreign key, the error is right. The chunked write of
+  `INSERT ... SELECT` writes the rows before the failing one twice. The table is left empty, as it should be.
 - **Views:**
   - While a view reads table t, `ALTER TABLE t DROP COLUMN` (any column, even one the view does not use) and
     `ALTER TABLE t SET SCHEMA` are refused (2BP01, "lexdb keeps a view's text"). PostgreSQL refuses only the drop of
@@ -263,9 +273,16 @@ smaller differences of its statement.
     key or unique constraint is not found (SQL Server: 3723).
   - `ALTER TABLE t ADD CONSTRAINT df DEFAULT 0 FOR col` is 102; a DEFAULT constraint's own name is not kept (it shows
     as `DF_table_col`), and `DROP CONSTRAINT` finds it by neither name.
-  - `ALTER TABLE` takes one action per statement (`ADD b int, c int` is 50000), and refuses `WITH CHECK ADD`, `WITH
-    NOCHECK ADD`, `NOCHECK CONSTRAINT`, `CHECK CONSTRAINT`, `SET (LOCK_ESCALATION = ...)`, `SWITCH`, `REBUILD` and
-    `DISABLE TRIGGER` (50000).
+  - `ALTER TABLE` takes one action per statement (`ADD b int, c int` is 50000), and refuses `SET (LOCK_ESCALATION =
+    ...)`, `SWITCH`, `REBUILD` and `DISABLE TRIGGER` (50000).
+  - **Constraint states** (`WITH NOCHECK`, `NOCHECK CONSTRAINT`, `CHECK CONSTRAINT`):
+    - The 547 of `ADD` and of `WITH CHECK CHECK CONSTRAINT` says `The INSERT statement conflicted with ...` (a foreign
+      key under `ADD`: `insert or update on table ... violates foreign key constraint`); SQL Server says `The ALTER TABLE
+      statement conflicted with ...`.
+    - lexdb tests every `CHECK` of a row on an `UPDATE`; SQL Server tests only those that read a column the `UPDATE`
+      sets. A row that breaks a constraint that is not trusted fails when any of its columns is updated.
+    - **`ALTER TABLE ... DROP COLUMN` of a column a `CHECK` reads silently drops the check** (SQL Server: error 5074,
+      the column cannot be dropped while a constraint depends on it); `sys.check_constraints` then lists nothing.
   - A column-level `CONSTRAINT fk FOREIGN KEY REFERENCES t (c)` is 102 (without `FOREIGN KEY` it works).
   - `ON [PRIMARY]`, `TEXTIMAGE_ON`, `WITH (...)` index and table options and `ASC` / `DESC` in a key are read and not
     kept. Still syntax errors: `ROWGUIDCOL`, `SPARSE`, `FILESTREAM`, `MASKED WITH`, `NOT FOR REPLICATION`, `GENERATED
@@ -419,14 +436,33 @@ smaller differences of its statement.
     `UPDATE ... FROM`, `DELETE ... USING`, `WITH RECURSIVE`.
   - `TRUNCATE` of a table a foreign key refers to is ORA-03001 (Oracle: ORA-02266); `TRUNCATE ... CASCADE`
     truncates the referencing tables whether or not the key is `ON DELETE CASCADE`; an identity column continues.
+- **QUALIFY** (Oracle 23.26's clause; see [QUALIFY](sql/oracle/qualify.md)):
+  - It is not read after `CONNECT BY` (ORA-00900).
+  - A condition that is a number or a text is read as `WHERE` reads it, which is as no row: `QUALIFY 1` and `QUALIFY
+    id - 1` return no rows (Oracle: not zero is true, so every row for `QUALIFY 1`; ORA-61800 for a text).
+  - `FOR UPDATE` after `QUALIFY` is accepted when the query has no window function and is ORA-03001 when it has one
+    (Oracle: ORA-01786 for both).
+  - `ORDER BY` before `QUALIFY` is ORA-00900 (Oracle: ORA-03049); the text of ORA-03049 is shortened to name the first
+    word of the condition.
+- **Constraint states** (`DISABLE`, `ENABLE [NO]VALIDATE`, `MODIFY CONSTRAINT`; see
+  [ALTER TABLE](sql/oracle/alter-table.md)):
+  - `PRIMARY KEY`, `UNIQUE` and `NOT NULL` cannot be disabled or made `NOVALIDATE`: in a definition it is ORA-00900,
+    and `ALTER TABLE ... DISABLE CONSTRAINT pk` is ORA-02430 (`cannot enable constraint ... no such constraint`; the
+    text says `enable` for `DISABLE` too).
+  - `RELY` and `NORELY` are read and not kept (`USER_CONSTRAINTS.RELY` is empty). `NOT ENFORCED` is ORA-00900 (Oracle
+    23.26 has none: ORA-02000 or ORA-03075).
+  - `ADD CONSTRAINT ... CHECK` over rows that break it is ORA-02290 (Oracle: ORA-02293); a second foreign key on the
+    same columns is accepted (Oracle: ORA-02275).
+  - lexdb tests every `CHECK` of a row on an `UPDATE`; Oracle tests only those that read a column the `UPDATE` sets.
+    A row that breaks a constraint that is not validated fails when any of its columns is updated.
 - **Tables, users and PL/SQL** (found writing the Oracle DDL and PL/SQL pages):
   - `CREATE TABLE`: `INTERVAL` columns, `INVISIBLE`, `TABLESPACE`, storage clauses, `PARTITION BY`,
-    `ORGANIZATION INDEX`, `DEFERRABLE` and `ENABLE`/`VALIDATE` on a constraint are ORA-00900;
+    `ORGANIZATION INDEX` and `DEFERRABLE` are ORA-00900;
     `GENERATED BY DEFAULT ON NULL AS IDENTITY` does not fill a NULL key (ORA-01400); `USER_TAB_COLUMNS` shows a
     `RAW` as `BLOB` and a `TIMESTAMP WITH LOCAL TIME ZONE` as `TIMESTAMP(6) WITH TIME ZONE`.
   - Views are read-only (`INSERT`, `UPDATE`, `DELETE` through a view are ORA-03001); `WITH READ ONLY` and `WITH CHECK
     OPTION` are refused; a view another view reads cannot be dropped (ORA-02449).
-  - `ALTER TABLE ... DISABLE CONSTRAINT`, `READ ONLY` and `ALTER INDEX ... REBUILD` are ORA-03001; `COMMIT COMMENT` and
+  - `ALTER TABLE ... READ ONLY` and `ALTER INDEX ... REBUILD` are ORA-03001; `COMMIT COMMENT` and
     `COMMIT WRITE` are ORA-00900; `COMMENT ON` does not keep the comment and accepts a missing table.
   - An `INSERT` into a table whose column `DEFAULT s.NEXTVAL` calls a dropped sequence is ORA-00942 (also when the
     statement gives the column a value); the error of a missing sequence is ORA-02289.
