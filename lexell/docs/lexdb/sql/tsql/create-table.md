@@ -108,6 +108,9 @@ table_constraint ::=
   and `INFORMATION_SCHEMA`, show the new table.
 - `CREATE TABLE` is transactional: inside a transaction, `ROLLBACK` removes the table.
 - A name already used by a table, view or other object of the schema is error 2714.
+- A `CHECK` or `FOREIGN KEY` is enforced from the moment the table is made. To add one without checking the rows
+  that are there, or to switch one off and on, see [ALTER TABLE](alter-table.md) (`WITH NOCHECK`, `NOCHECK
+  CONSTRAINT`).
 
 ## Differences from SQL Server
 
