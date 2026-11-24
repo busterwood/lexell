@@ -30,12 +30,13 @@ public class OracleJdbc {
         pass = a[2];
         c = DriverManager.getConnection(a[0], a[1], a[2]);
         c.setAutoCommit(true);
-        for (String t : new String[]{"JT_CHILD", "JT_ALL", "JT_PARENT", "JT_TX", "JT_MERGE", "JT_BATCH", "JT_RU", "JT_RUB"}) ddl("drop table " + t);
+        for (String t : new String[]{"JT_CHILD", "JT_ALL", "JT_PARENT", "JT_TX", "JT_MERGE", "JT_BATCH", "JT_RU", "JT_RUB", "JT_TZ"}) ddl("drop table " + t);
         ddl("drop sequence JT_SEQ");
         ddl("drop procedure JT_PROC"); ddl("drop function JT_FUNC"); ddl("drop procedure JT_RU_P"); ddl("drop procedure JT_RU_Q");
         connection();
         types();
         binds();
+        tstz();
         batch();
         reuse();
         transactions();
@@ -48,7 +49,7 @@ public class OracleJdbc {
         warnings();
         storedFunctions();
         try { generatedKeys(); } catch (Exception e) { System.out.println("SKIP generatedKeys by column name: " + e.toString().split("\n")[0]); }
-        for (String t : new String[]{"JT_CHILD", "JT_ALL", "JT_PARENT", "JT_TX", "JT_MERGE", "JT_BATCH", "JT_RU", "JT_RUB"}) ddl("drop table " + t);
+        for (String t : new String[]{"JT_CHILD", "JT_ALL", "JT_PARENT", "JT_TX", "JT_MERGE", "JT_BATCH", "JT_RU", "JT_RUB", "JT_TZ"}) ddl("drop table " + t);
         ddl("drop sequence JT_SEQ");
         ddl("drop procedure JT_PROC"); ddl("drop function JT_FUNC"); ddl("drop procedure JT_RU_P"); ddl("drop procedure JT_RU_Q");
         c.close();
@@ -209,6 +210,81 @@ public class OracleJdbc {
             p.setString(1, "q"); p.setInt(2, 1);
             Check.yes("returning without out is an error", Check.errorOf(() -> p.executeUpdate()) != 0);
         }
+    }
+
+
+    // ---- TIMESTAMP WITH TIME ZONE keeps the offset it was written with (design/lexdb-robust.md item 9): type 181 binds and cells,
+    // OffsetDateTime and oracle.sql.TIMESTAMPTZ
+    static void tstz() throws Exception {
+        java.time.OffsetDateTime a = java.time.OffsetDateTime.parse("2026-03-15T10:00:00+02:00");
+        java.time.OffsetDateTime b = java.time.OffsetDateTime.parse("2026-03-15T08:00:00Z");
+        java.time.OffsetDateTime d = java.time.OffsetDateTime.parse("2026-03-15T03:00:00.123456-05:30");
+        java.time.OffsetDateTime e = java.time.OffsetDateTime.parse("2026-03-15T12:00:00+05:30");
+        ddl("create table JT_TZ (id number primary key, t timestamp with time zone, p timestamp(3) with time zone)");
+        try (PreparedStatement p = c.prepareStatement("insert into JT_TZ (id, t, p) values (?, ?, ?)")) {
+            p.setInt(1, 1); p.setObject(2, a); p.setObject(3, a); Check.eq("insert OffsetDateTime", p.executeUpdate(), 1);
+            p.setInt(1, 2); p.setObject(2, b); p.setObject(3, b); Check.eq("insert UTC", p.executeUpdate(), 1);
+            p.setInt(1, 3); p.setObject(2, d); p.setObject(3, d); Check.eq("insert negative offset", p.executeUpdate(), 1);
+            p.setInt(1, 4); p.setObject(2, e); p.setNull(3, Types.TIMESTAMP_WITH_TIMEZONE); Check.eq("insert, a null", p.executeUpdate(), 1);
+        }
+        try (Statement s = c.createStatement(); ResultSet r = s.executeQuery("select id, t, p from JT_TZ order by id")) {
+            ResultSetMetaData m = r.getMetaData();
+            Check.eq("tstz type name", m.getColumnTypeName(2), "TIMESTAMP WITH TIME ZONE");
+            Check.eq("tstz type", m.getColumnType(2), -101);
+            r.next(); Check.eq("offset kept", r.getObject(2, java.time.OffsetDateTime.class).toString(), "2026-03-15T10:00+02:00");
+            Check.eq("p", r.getObject(3, java.time.OffsetDateTime.class).toString(), "2026-03-15T10:00+02:00");
+            r.next(); Check.eq("UTC kept", r.getObject(2, java.time.OffsetDateTime.class).toString(), "2026-03-15T08:00Z");
+            r.next(); Check.eq("negative offset kept", r.getObject(2, java.time.OffsetDateTime.class).toString(), "2026-03-15T03:00:00.123456-05:30");
+            Check.eq("p cut to the column's three fractional digits", r.getObject(3, java.time.OffsetDateTime.class).toString(), "2026-03-15T03:00:00.123-05:30");
+            r.next(); Check.eq("half-hour offset", r.getObject(2, java.time.OffsetDateTime.class).toString(), "2026-03-15T12:00+05:30");
+            Check.eq("null", r.getObject(3, java.time.OffsetDateTime.class), null);
+        }
+        // oracle.sql.TIMESTAMPTZ: the offset in its bytes (UTC date and time, then the offset: hours + 20, minutes + 60)
+        try (Statement s = c.createStatement(); ResultSet r = s.executeQuery("select t from JT_TZ where id = 3")) {
+            r.next();
+            oracle.sql.TIMESTAMPTZ z = r.getObject(1, oracle.sql.TIMESTAMPTZ.class);
+            byte[] x = z.toBytes();
+            Check.eq("TIMESTAMPTZ bytes length", x.length, 13);
+            Check.eq("TIMESTAMPTZ offset hour byte", x[11] & 0xff, 15);
+            Check.eq("TIMESTAMPTZ offset minute byte", x[12] & 0xff, 30);
+            Check.eq("TIMESTAMPTZ UTC time", (x[4] & 0xff) + ":" + (x[5] & 0xff) + ":" + (x[6] & 0xff), "9:31:1");
+        }
+        // equal by instant whatever the offset, bound as a value
+        try (PreparedStatement p = c.prepareStatement("select count(*) from JT_TZ where t = ?")) {
+            p.setObject(1, java.time.OffsetDateTime.parse("2026-03-15T11:00:00+03:00"));
+            try (ResultSet r = p.executeQuery()) { r.next(); Check.eq("equal by instant", r.getInt(1), 2); }
+            p.setObject(1, java.time.OffsetDateTime.parse("2026-03-15T06:30:00Z"));
+            try (ResultSet r = p.executeQuery()) { r.next(); Check.eq("a different instant", r.getInt(1), 1); }
+        }
+        Check.eq("order by instant", rows("select id from JT_TZ order by t, id"), List.of("4", "1", "2", "3"));
+        Check.eq("group by instant", rows("select count(*) from JT_TZ group by t order by 1"), List.of("1", "1", "2"));
+        // what the server makes
+        try (Statement s = c.createStatement(); ResultSet r = s.executeQuery("select from_tz(timestamp '2026-03-15 10:00:00', '+03:00'), systimestamp, current_timestamp, timestamp '2026-03-15 10:00:00 -04:30' from dual")) {
+            r.next();
+            Check.eq("from_tz offset", r.getObject(1, java.time.OffsetDateTime.class).toString(), "2026-03-15T10:00+03:00");
+            Check.eq("systimestamp offset", r.getObject(2, java.time.OffsetDateTime.class).getOffset().toString(), "Z");
+            Check.eq("literal offset", r.getObject(4, java.time.OffsetDateTime.class).toString(), "2026-03-15T10:00-04:30");
+        }
+        try (Statement s = c.createStatement()) {
+            s.execute("alter session set time_zone = '+02:00'");
+            try (ResultSet r = s.executeQuery("select current_timestamp, sessiontimezone from dual")) {
+                r.next();
+                Check.eq("current_timestamp in the session's zone", r.getObject(1, java.time.OffsetDateTime.class).getOffset().toString(), "+02:00");
+                Check.eq("sessiontimezone", r.getString(2), "+02:00");
+            }
+            s.execute("alter session set time_zone = '+00:00'");
+        }
+        // a bound value read back through the server (an expression over it)
+        try (PreparedStatement p = c.prepareStatement("select ?, to_char(?, 'TZH:TZM'), extract(timezone_hour from ?) from dual")) {
+            p.setObject(1, d); p.setObject(2, d); p.setObject(3, d);
+            try (ResultSet r = p.executeQuery()) {
+                r.next();
+                Check.eq("bind kept through the server", r.getObject(1, java.time.OffsetDateTime.class).toString(), "2026-03-15T03:00:00.123456-05:30");
+                Check.eq("bind's TZH:TZM", r.getString(2), "-05:30");
+                Check.eq("bind's timezone_hour", r.getInt(3), -5);
+            }
+        }
+        ddl("drop table JT_TZ");
     }
 
     // ---- batches

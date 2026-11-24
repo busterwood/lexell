@@ -50,6 +50,7 @@ import "./lexdb_ops"
 import "./lexdb_auth"
 import "./lexdb_wire"
 import "./lexdb_time"
+import "./lexdb_tz"
 import "./lexdb_orafn"
 import "./lexdb_oraadm"
 import "./lexdb_oratext"
@@ -361,6 +362,7 @@ fn fits(kind: int, v: &Val): bool {
         Val.Date(_) { return kind == K_DATE }
         Val.Ts(_) { return kind == K_TS }
         Val.Tstz(_) { return kind == K_TSTZ }
+        Val.Tsz(_, _) { return kind == K_TSTZ }
         Val.Bytes(_) { return kind == K_RAW }
         Val.Uuid(_) { return kind == K_RAW }
         Val.Ival(iv) {
@@ -583,6 +585,13 @@ fn cellBytes(v: &Val, t: &CT, oid: int, sess: &lexdb_exec.Session): Result[str, 
         match v {
             Val.Tstz(us) {
                 match lexdb_time.localOf(us).withOffset(0) {
+                    Some(o) { return Ok(tns.encodeTimestampTz(&o)) }
+                    None {}
+                }
+            }
+            Val.Tsz(us, off) {
+                // the UTC time and the offset the value was written with (13 bytes: the offset in the last two)
+                match lexdb_time.localOf(lexdb_tz.local(us, off)).withOffset(off) {
                     Some(o) { return Ok(tns.encodeTimestampTz(&o)) }
                     None {}
                 }
@@ -1540,7 +1549,7 @@ fn bindVal(m: &BindMeta, raw: &Option[str]): Result[BV, DbErr] {
                     Ok(st) {
                         match lexdb_time.tsOf(st.local) {
                             Some(us) {
-                                if t == tns.T_TIMESTAMP_TZ { return Ok(BV{v: Val.Tstz(us - st.offset * 60000000), oid: lexdb_sql.OID_TSTZ}) }
+                                if t == tns.T_TIMESTAMP_TZ { return Ok(BV{v: Val.Tsz(us - st.offset * 60000000, st.offset), oid: lexdb_sql.OID_TSTZ}) }
                                 return Ok(BV{v: Val.Ts(us), oid: lexdb_sql.OID_TS})
                             }
                             None { return Err(lexdb_base.err("22008", "a date or timestamp bind out of range")) }
@@ -1615,18 +1624,24 @@ fn bytesAs(m: &BindMeta, v: &Val, oid: int, sess: &lexdb_exec.Session): Result[s
     }
     if t == tns.T_DATE || t == tns.T_TIMESTAMP || t == tns.T_TIMESTAMP_LTZ || t == tns.T_TIMESTAMP_TZ {
         var us = 0
+        var off = 0
         var ok = true
         match v {
             Val.Date(d) { us = lexdb_time.dateToTs(d) }
             Val.Ts(x) { us = x }
             Val.Tstz(x) { us = x }
+            Val.Tsz(x, o) {
+                us = x
+                off = o
+            }
             else { ok = false }
         }
         if ok {
-            let l = lexdb_time.localOf(us)
+            // (a value with an offset is shown at it: its local time is what a DATE or TIMESTAMP gets)
+            let l = lexdb_time.localOf(lexdb_tz.local(us, off))
             if t == tns.T_DATE { return Ok(tns.encodeDate(&l)) }
             if t == tns.T_TIMESTAMP || t == tns.T_TIMESTAMP_LTZ { return Ok(tns.encodeTimestamp(&l)) }
-            match l.withOffset(0) {
+            match l.withOffset(off) {
                 Some(o) { return Ok(tns.encodeTimestampTz(&o)) }
                 None {}
             }
@@ -2608,12 +2623,13 @@ fn zoneSetting(v: &str, local: &str): Result[str, DbErr] {
     let sign = len(v) > 0 && (v[0] == '+' || v[0] == '-')
     let body = if sign { v[1..len(v)].toStr() } else { v.toStr() }
     let at = strings.indexOf(&body, ":", 0)
+    if sign && at < 0 { return Err(oraE(1861, "literal does not match format string")) }
     if at > 0 && at < len(body) - 1 {
         let hh = strings.parseIntOpt(&(body[0..at].toStr()))
         let mm = strings.parseIntOpt(&(body[at + 1..len(body)].toStr()))
         if hh.isSome() && mm.isSome() {
             if hh.unwrap() > 15 { return Err(oraE(1874, "time zone hour must be between -15 and 15")) }
-            if mm.unwrap() > 59 { return Err(oraE(1875, "time zone minute must be between 0 and 59")) }
+            if mm.unwrap() > 59 || (hh.unwrap() == 15 && mm.unwrap() > 0) { return Err(oraE(1875, "time zone minute must be between -59 and 59")) }
             return Ok("interval '" + (if v[0] == '-' { "-" } else { "+" }) + body + "' hour to minute")
         }
     }

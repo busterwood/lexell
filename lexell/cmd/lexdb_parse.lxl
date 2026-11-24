@@ -1368,11 +1368,11 @@ fn (p: mut &P) atExpr(): Result[Expr, lexdb_base.DbErr] {
            p.toks[p.pos + 1].text == "local") {
         p.pos += 1
         if p.acceptKw("local") {
-            e = Expr.Call("timezone", [e], false)
+            e = Expr.Call(if p.ora { "#ora_atlocal" } else { "timezone" }, [e], false)
         } else {
             p.pos += 2
             let z = try p.unary()
-            e = Expr.Call("timezone", [z, e], false)
+            e = if p.ora { Expr.Call("#ora_attz", [e, z], false) } else if p.tsql { Expr.Call("#tattz", [e, z], false) } else { Expr.Call("timezone", [z, e], false) }
         }
     }
     return Ok(e)
@@ -2183,12 +2183,21 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 if p.tsql { return Ok(tsqlCast(e, ty, None)) }
                 // Oracle's CAST(x AS BOOLEAN): any number not 0 true, as T-SQL's bit (lexdb_ops.coerce)
                 if p.ora && ty.kind == K_BOOL { return Ok(Expr.Cast(e, TypeName{kind: K_BOOL, oid: OID_BOOL, prec: 0, scale: 0, len: 1})) }
-                if p.ora { return Ok(Expr.Cast(e, ty)) }
+                if p.ora { return Ok(p.oraCast(e, ty)) }
                 return Ok(pgCast(e, ty))
             }
             // the date and time keywords that are not called (9.76)
             "current_date", "current_timestamp", "localtimestamp", "current_time", "localtime" {
                 if p.tsql && t.text == "current_timestamp" { return Ok(Expr.Call("localtimestamp", [], false)) }     // GETDATE()
+                if p.ora && t.text == "current_timestamp" {
+                    // a TIMESTAMP WITH TIME ZONE at the session zone's offset
+                    if p.acceptKw("(") {
+                        let n = try p.intLit()
+                        try p.expectKw(")")
+                        return Ok(Expr.Call("#ora_curts", [Expr.Lit(Val.Int(n))], false))
+                    }
+                    return Ok(Expr.Call("#ora_curts", [], false))
+                }
                 if p.acceptKw("(") {
                     let n = try p.intLit()        // a precision: rounded to it
                     try p.expectKw(")")
@@ -2262,8 +2271,9 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                             if p.ora && t.text == "timestamp" && ty.oid == OID_TS && oraLitZone(&lit) {
                                 var tz = lexdb_sql.timeType(OID_TSTZ)
                                 tz.prec = 1
+                                tz.len = lexdb_sql.TSZ_LEN
                                 tz.scale = ty.scale
-                                return Ok(Expr.Cast(Expr.Lit(Val.Text(lit)), tz))
+                                return Ok(p.oraCast(Expr.Lit(Val.Text(lit)), tz))
                             }
                             return Ok(Expr.Cast(Expr.Lit(Val.Text(lit)), ty2))
                         }
@@ -2641,11 +2651,12 @@ fn tsqlCast(x: Expr, ty: TypeName, style: Option[Expr]): Expr {
             Some(sx) { bst = lexdb_sql.cloneExpr(&sx) }
             None {}
         }
-        v = Expr.Call("#bin2str", if ty.len > 0 { [v, bst, Expr.Lit(Val.Int(ty.len))] } else { [v, bst] }, false)
+        // a date or time as the style writes it first (any other value passes), then the cast's text of what is left
         match replace(mut &sty, None) {
             Some(st) { v = Expr.Call("#datestyle", [v, st], false) }
             None {}
         }
+        v = Expr.Call("#bin2str", if ty.len > 0 { [v, bst, Expr.Lit(Val.Int(ty.len))] } else { [v, bst] }, false)
         if ty.len > 0 {
             let text = TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0}
             v = Expr.Call("left", [Expr.Cast(v, text), Expr.Lit(Val.Int(ty.len))], false)
@@ -2676,6 +2687,7 @@ fn datePart(x: &Expr): Option[Expr] {
         "millisecond", "ms" { "millisecond" }
         "microsecond", "mcs" { "microsecond" }
         "nanosecond", "ns" { "nanosecond" }
+        "tzoffset", "tz" { "tzoffset" }
         else { "" }
     }
     if len(c) == 0 { return None }
@@ -2798,7 +2810,10 @@ fn (p: mut &P) tsqlCall(name: &str, args: []Expr, star: bool): Result[Expr, lexd
                 return Ok(Expr.Call("case", xs, false))
             }
         }
-        "getdate", "sysdatetime", "sysdatetimeoffset" { return Ok(Expr.Call("localtimestamp", [], false)) }
+        "getdate", "sysdatetime" { return Ok(Expr.Call("localtimestamp", [], false)) }
+        "sysdatetimeoffset" { return Ok(Expr.Call("#sysdto", [], false)) }
+        "switchoffset" { if n == 2 { return Ok(Expr.Call("#switchoffset", a, false)) } }
+        "todatetimeoffset" { if n == 2 { return Ok(Expr.Call("#todto", a, false)) } }
         "getutcdate", "sysutcdatetime" { return Ok(Expr.Call("#utcnow", [], false)) }
         "dateadd", "datediff", "datepart", "datename", "datediff_big" {
             if n >= 2 {
@@ -7616,6 +7631,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             if len(q.into) == 0 { return Ok(q) }
             // SELECT ... INTO t: CREATE TABLE t AS the query (9.88)
             var c = lexdb_sql.newStmt(S_CREATE)
+            c.mdialect = p.md()
             c.table = replace(mut &q.into, "")
             c.temp = q.temp
             c.spell = replace(mut &q.spell, "")
@@ -8338,6 +8354,18 @@ fn (p: mut &P) zoneValue(words: bool): Result[str, lexdb_base.DbErr] {
 }
 
 // Whether an Oracle TIMESTAMP literal's text ends in a time zone: +hh:mm, -hh:mm or a name (Europe/Paris, UTC).
+// CAST(e AS t) in the Oracle door: a TIMESTAMP WITH TIME ZONE reads its text as TO_TIMESTAMP_TZ does (the session's NLS
+// format, the zone it names, Oracle's errors for a bad one), then takes the type's fractional digits.
+fn (p: &P) oraCast(e: Expr, ty: TypeName): Expr {
+    if lexdb_sql.isTszType(&ty) { return Expr.Cast(Expr.Call("#ora_totstz", [e], false), ty) }
+    // a date, timestamp or timestamp with a time zone as text is TO_CHAR's: the session's NLS format
+    if ty.kind == K_TEXT && ty.oid != OID_BPCHAR {
+        if len(p.nls) >= 3 { return Expr.Cast(Expr.Call("#ora_tochar1", [e, Expr.Lit(Val.Text(p.nls[0].clone())), Expr.Lit(Val.Text(p.nls[1].clone())), Expr.Lit(Val.Text(p.nls[2].clone()))], false), ty) }
+        return Expr.Cast(Expr.Call("#ora_tochar", [e], false), ty)
+    }
+    return Expr.Cast(e, ty)
+}
+
 fn oraLitZone(s: &str): bool {
     let sp = strings.lastIndexOf(s, " ")
     if sp < 0 { return false }
@@ -8643,6 +8671,7 @@ fn (p: mut &P) tsqlType(w: &str): Result[Option[TypeName], lexdb_base.DbErr] {
             // prec: 1 (the scale given), or SQL Server's datetime or smalldatetime (tsqlCode)
             t.prec = if w == "datetime" { lexdb_dialect.TS_DATETIME } else if w == "smalldatetime" { lexdb_dialect.TS_SMALLDATETIME } else { 1 }
             t.scale = n                     // (lexdb keeps microseconds: 7 rounds as 6; TDS sends the 7)
+            if w == "datetimeoffset" { t.len = lexdb_sql.TSZ_TSQL }       // it keeps each value's offset (Val.Tsz)
             return Ok(Some(t))
         }
         else { return Ok(None) }
@@ -8884,7 +8913,7 @@ fn (p: mut &P) oraPrimary(t: &Tok): Result[Option[Expr], lexdb_base.DbErr] {
     if t.kind != T_IDENT || p.isKw("(") { return Ok(None) }
     match t.text {
         "sysdate", "current_date" { return Ok(Some(sysdateExpr())) }
-        "systimestamp" { return Ok(Some(Expr.Call("current_timestamp", [], false))) }
+        "systimestamp" { return Ok(Some(Expr.Call("#ora_systs", [], false))) }
         "user" { return Ok(Some(Expr.Call("upper", [Expr.Call("current_user", [], false)], false))) }
         "uid" { return Ok(Some(Expr.Lit(Val.Int(1)))) }
         "sessiontimezone" { return Ok(Some(Expr.Call("#ora_sessiontz", [], false))) }
@@ -9120,6 +9149,13 @@ fn (p: mut &P) oraCall(name: &str, args: []Expr, star: bool): Result[Expr, lexdb
         "numtodsinterval" { return Ok(Expr.Call("#ora_numtods", a, false)) }
         "numtoyminterval" { return Ok(Expr.Call("#ora_numtoym", a, false)) }
         "from_tz" { return Ok(Expr.Call("#ora_fromtz", a, false)) }
+        "to_timestamp_tz" {
+            if n > 2 { a = [cloneE(&a[0]), cloneE(&a[1])] }
+            if n == 1 && len(p.nls) >= 3 && len(p.nls[2]) > 0 { a = [cloneE(&a[0]), Expr.Lit(Val.Text(p.nls[2].clone()))] }
+            return Ok(Expr.Call("#ora_totstz", a, false))
+        }
+        "tz_offset" { return Ok(Expr.Call("#ora_tzoffset", a, false)) }
+        "new_time" { return Ok(Expr.Call("#ora_newtime", a, false)) }
         "months_between" { return Ok(Expr.Call("#ora_monthsbetween", a, false)) }
         "last_day" { return Ok(Expr.Call("#ora_lastday", a, false)) }
         "next_day" { return Ok(Expr.Call("#ora_nextday", a, false)) }
@@ -9264,15 +9300,18 @@ fn (p: mut &P) oraType(w: &str): Result[Option[TypeName], lexdb_base.DbErr] {
                 try p.expectKw(")")
             }
             var oid = OID_TS
+            var keeps = false
             if p.acceptKw("with") {
                 let loc = p.acceptKw("local")
                 try p.expectKw("time")
                 try p.expectKw("zone")
                 oid = OID_TSTZ
+                keeps = !loc            // TIMESTAMP WITH TIME ZONE keeps each value's offset (Val.Tsz); the LOCAL one is an instant
             }
             var t = lexdb_sql.timeType(oid)
             t.prec = 1
             t.scale = min(scale, 6)
+            if keeps { t.len = lexdb_sql.TSZ_LEN }
             return Ok(Some(t))
         }
         else { return Ok(None) }
