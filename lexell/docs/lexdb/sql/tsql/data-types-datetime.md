@@ -34,7 +34,9 @@ datetimeoffset [ ( p ) ]
 : A date and time with *p* fractional digits (0 to 7, default 7).
 
 `datetimeoffset(p)`
-: A `datetime2(p)` with a time zone offset. See the differences below.
+: A `datetime2(p)` and the time zone offset it was written with, from `-14:00` to `+14:00` (error 241 beyond):
+  `'2026-03-15 10:00:00 +02:00'` is ten o'clock at `+02:00`, and stays so. A string without an offset is at
+  `+00:00`.
 
 ## Remarks
 
@@ -50,14 +52,28 @@ datetimeoffset [ ( p ) ]
   a valid datetime in range is error 8115.
 - Results print with the fractional digits of their type: `datetime2` and `time` with seven (`13:45:30.1234570`),
   `datetime` with one to three, `date` with none.
+- **datetimeoffset.** Two values are compared by instant: `10:00 +02:00` equals `08:00 +00:00`. `ORDER BY`, `GROUP
+  BY`, `DISTINCT`, joins, `IN` and indexes go by instant too (a unique index takes only one of the two); a group shows
+  the offset of its first row. Each value keeps its own offset: `DATEPART(tzoffset, ...)` gives it in minutes, and
+  `SWITCHOFFSET` moves a value to another (example D). `DATEADD` keeps the offset, and `DATEDIFF` counts between the
+  UTC instants (example K). `CAST` to `datetime2`, `date` or `time` gives the local time; a `datetime2` or `date` cast
+  to `datetimeoffset` is at `+00:00` (use `TODATETIMEOFFSET` to give it an offset). Clients get the offset too (TDS
+  type 0x2B): `getObject(i, OffsetDateTime.class)` in JDBC, `DateTimeOffset` in .NET.
 
 ## Differences from SQL Server
 
 - **Time resolution is a microsecond.** The seventh fractional digit is lost: `'13:45:30.1234567'` is stored as
   `13:45:30.1234570`.
-- **`datetimeoffset` keeps no offset.** The value is converted to UTC when it is stored, and shows as `+00:00`:
-  `'2026-03-15 13:45:30 +05:30'` is `2026-03-15 08:15:30 +00:00`. `DATEPART(tz, ...)` and `tzoffset` are not
-  recognised (error 155), and `SWITCHOFFSET` and `TODATETIMEOFFSET` do not exist.
+- **A `datetimeoffset` as a string has seven fractional digits whatever its scale**: `CAST(x AS varchar(40))` of a
+  `datetimeoffset(0)` is `2026-03-15 10:00:00.0000000 +02:00` (SQL Server: `2026-03-15 10:00:00 +02:00`). The value
+  `SWITCHOFFSET`, `TODATETIMEOFFSET`, `AT TIME ZONE`, `MIN` and `MAX` give is a `datetimeoffset(7)` whatever the
+  scale of their argument (SQL Server keeps it), so clients show it with seven digits.
+- `MIN` and `MAX` of equal instants show the offset of the last row (SQL Server: of the first).
+- A `VALUES` list keeps the instant, not the offset: `(VALUES (CAST('2026-03-15 10:00 +02:00' AS datetimeoffset)))`
+  gives `2026-03-15 08:00:00 +00:00`.
+- `datetimeoffset - datetimeoffset` is an interval (`01:00:00`; SQL Server: error 8117), and a variable plus a number
+  (`@d + 1`) is error 195 (SQL Server: 206).
+- A `datetimeoffset` loaded by bulk copy keeps its instant, not its offset (see [bulk loading](../../bulk-load.md)).
 - **Only ISO layouts are read.** `'20260315'`, `'March 15, 2026'` and `'03/15/2026'` are error 241, and `SET
   DATEFORMAT` changes nothing. `'2026-03-15T13:45:30'` and `'2026-3-5'` are read.
 - **Date arithmetic.** `datetime + 1`, `datetime - 1`, `1 + datetime` and `datetime - datetime` work as in SQL Server,
@@ -137,25 +153,52 @@ Msg 241, Level 16, State 1, Line 1
 Conversion failed when converting date and/or time from character string.
 ```
 
-### D. datetimeoffset is stored as UTC
+### D. datetimeoffset keeps its offset
+
+Four departures at four offsets; three of them are the same instant, 08:00 UTC. They sort, compare and count by
+instant, and each keeps its own offset.
 
 <!-- example: tsql -->
 ```sql
-SELECT CAST('2026-03-15 13:45:30 +05:30' AS datetimeoffset(0)) AS stored,
-       CAST(CAST('2026-03-15 13:45:30 +05:30' AS datetimeoffset) AS datetime2(0)) AS as_datetime2;
+CREATE TABLE departures (id int PRIMARY KEY, city varchar(10), dep datetimeoffset(0));
+INSERT INTO departures VALUES (1, 'Athens', '2026-03-15 10:00:00 +02:00'), (2, 'London', '2026-03-15 08:00:00 +00:00'),
+  (3, 'New York', '2026-03-15 03:00:00 -05:00'), (4, 'Mumbai', '2026-03-15 12:00:00 +05:30');
+SELECT id, city, dep, DATEPART(tzoffset, dep) AS offset_minutes, CAST(SWITCHOFFSET(dep, '+00:00') AS datetime2(0)) AS utc
+FROM departures ORDER BY dep, id;
+SELECT city FROM departures WHERE dep = '2026-03-15 11:00:00 +03:00' ORDER BY id;
+SELECT COUNT(DISTINCT dep) AS instants, COUNT(*) AS n_rows FROM departures;
 GO
-SELECT DATEPART(tzoffset, CAST('2026-03-15 13:45:30 +05:30' AS datetimeoffset)) AS tz;
+SELECT CAST('2026-03-15 10:00:00 +14:01' AS datetimeoffset);
 ```
 
 ```text
-stored                     as_datetime2
--------------------------- -------------------
-2026-03-15 08:15:30 +00:00 2026-03-15 08:15:30
+(4 rows affected)
+
+id city     dep                        offset_minutes utc
+-- -------- -------------------------- -------------- -------------------
+4  Mumbai   2026-03-15 12:00:00 +05:30 330            2026-03-15 06:30:00
+1  Athens   2026-03-15 10:00:00 +02:00 120            2026-03-15 08:00:00
+2  London   2026-03-15 08:00:00 +00:00 0              2026-03-15 08:00:00
+3  New York 2026-03-15 03:00:00 -05:00 -300           2026-03-15 08:00:00
+
+(4 rows affected)
+
+city
+--------
+Athens
+London
+New York
+
+(3 rows affected)
+
+instants n_rows
+-------- ------
+2        4
 
 (1 row affected)
 
-Msg 155, Level 16, State 1, Line 1
-'"tzoffset"' is not a recognized datepart option.
+Msg 241, Level 16, State 1, Line 1
+Conversion failed when converting date and/or time from character string.
 ```
 
 ### E. Conversions between the types
@@ -305,6 +348,24 @@ Msg 1002, Level 16, State 1, Line 1
 Line 1: Specified scale 8 is invalid.
 Msg 195, Level 15, State 1, Line 1
 'isdate' is not a recognized built-in function name.
+```
+
+### K. Arithmetic keeps the offset
+
+<!-- example: tsql -->
+```sql
+SELECT DATEADD(minute, 90, dep) AS plus_90_minutes, DATEADD(month, 1, dep) AS plus_month,
+       DATEDIFF(minute, '2026-03-15 00:00 +00:00', dep) AS minutes_since_utc_midnight,
+       CAST(dep AS datetime2(0)) AS local_time, CAST(dep AS date) AS local_date
+FROM departures WHERE id = 4;
+```
+
+```text
+plus_90_minutes            plus_month                 minutes_since_utc_midnight local_time          local_date
+-------------------------- -------------------------- -------------------------- ------------------- ----------
+2026-03-15 13:30:00 +05:30 2026-04-15 12:00:00 +05:30 390                        2026-03-15 12:00:00 2026-03-15
+
+(1 row affected)
 ```
 
 ## See also
