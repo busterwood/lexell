@@ -31,7 +31,10 @@ SELECT ... FROM { USER_ | ALL_ | DBA_ }{ VIEWS | SEQUENCES | SOURCE | PROCEDURES
 : The parameters of procedures and functions.
 
 `USER_ERRORS`
-: The errors of units that were stored invalid (ORA-24344 warning).
+: The compile errors of units that were stored invalid (example F): `NAME`, `TYPE`, `SEQUENCE`, `LINE`, `POSITION`,
+  `TEXT` (`PLS-00201: identifier 'NOTHERE' must be declared`, then `PL/SQL: Statement ignored`), `ATTRIBUTE` (`ERROR`),
+  `MESSAGE_NUMBER`. `ALL_ERRORS` and `DBA_ERRORS` hold the same rows. A unit with errors is `INVALID` in `USER_OBJECTS`;
+  the rows go when the unit compiles again.
 
 `USER_TRIGGERS`, `USER_SYNONYMS`
 : No rows: lexdb has no triggers and no synonyms.
@@ -191,6 +194,36 @@ TRIGGERS
 SYNONYMS
 --------
        0
+
+1 row selected.
+```
+
+### F. Errors of a unit that does not compile
+
+<!-- example: oracle -->
+```sql
+CREATE PROCEDURE broken AS
+BEGIN
+  nothere(1);
+END;
+/
+SELECT name, type, sequence, line, position, text, attribute, message_number FROM user_errors ORDER BY sequence;
+SELECT object_name, status FROM user_objects WHERE status = 'INVALID';
+```
+
+```text
+Warning: Procedure created with compilation errors.
+
+NAME   TYPE      SEQUENCE LINE POSITION TEXT                                             ATTRIBUTE MESSAGE_NUMBER
+------ --------- -------- ---- -------- ------------------------------------------------ --------- --------------
+BROKEN PROCEDURE        1    3        3 PLS-00201: identifier 'NOTHERE' must be declared ERROR                201
+BROKEN PROCEDURE        2    3        3 PL/SQL: Statement ignored                        ERROR                  0
+
+2 rows selected.
+
+OBJECT_NAME STATUS
+----------- -------
+BROKEN      INVALID
 
 1 row selected.
 ```
