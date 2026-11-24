@@ -679,6 +679,28 @@ __attribute__((noinline)) void* rt_alloc_miss(size_t n) {
     if (rt_check) rt_live_add(1);
     return p;
 }
+/* Size-class allocation thunks for dynamically linked binaries (x64gen inlineRt): leaf fast
+   path on rt_mheap.cur_free[c], tail-calling rt_alloc_miss on miss or when inline_ok is 0. */
+static inline __attribute__((always_inline)) void* rt_alloc_c(int c) {
+    if (__builtin_expect(rt_mheap.inline_ok, 1)) {
+        void* f = rt_mheap.cur_free[c];
+        if (__builtin_expect(f != 0, 1)) {
+            rt_mheap.cur_free[c] = *(void**)f;
+            rt_mheap.cur_live++;
+            return f;
+        }
+    }
+    return rt_alloc_miss((size_t)c * 16 + 8);
+}
+void* rt_alloc_c0(void) { return rt_alloc_c(0); }
+void* rt_alloc_c1(void) { return rt_alloc_c(1); }
+void* rt_alloc_c2(void) { return rt_alloc_c(2); }
+void* rt_alloc_c3(void) { return rt_alloc_c(3); }
+void* rt_alloc_c4(void) { return rt_alloc_c(4); }
+void* rt_alloc_c5(void) { return rt_alloc_c(5); }
+void* rt_alloc_c6(void) { return rt_alloc_c(6); }
+void* rt_alloc_c7(void) { return rt_alloc_c(7); }
+
 void rt_free(void* p) { free_fast(p); if (rt_check) rt_live_add(-1); }
 
 /* Drop actions: drop glue pushes the parts of a value instead of recursing (SPEC 9.4). The
