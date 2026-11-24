@@ -36,6 +36,8 @@ returning_clause:
 
 - The result is `N rows deleted.`; in PL/SQL `SQL%ROWCOUNT` gives the count.
 - `FROM` may be left out: `DELETE emp WHERE id = 4`.
+- `WHERE ROWNUM <= n` limits the statement to the first n rows it finds (example F). A subquery in `RETURNING` sees
+  the table as the statement found it.
 - A row that another table's foreign key points at cannot be removed: ORA-02292. Remove the child rows first, or
   declare the key `ON DELETE CASCADE`.
 - The first `DELETE` begins a transaction, which `COMMIT` or `ROLLBACK` ends. A statement that fails is undone alone.
@@ -46,8 +48,6 @@ returning_clause:
 ## Differences from Oracle
 
 - `DELETE FROM (subquery)`, `PARTITION`, `LOG ERRORS` and `WHERE CURRENT OF` are not supported (ORA-00900).
-- `ROWNUM` in the `WHERE` clause of `DELETE` is not supported (ORA-20000, "window functions are not allowed in
-  DELETE"). Select the keys in a subquery: `WHERE id IN (SELECT id FROM t FETCH FIRST 2 ROWS ONLY)`.
 - `DELETE FROM t USING u WHERE ...` (PostgreSQL's join form) is accepted; Oracle refuses it. Use `EXISTS` or `IN`.
 - `RETURNING ... BULK COLLECT INTO` is not supported, as PL/SQL collections are not.
 - A view cannot be deleted from (ORA-03001): lexdb's views are read-only.
@@ -212,7 +212,6 @@ Rollback complete.
 ```sql
 DELETE FROM nosuch;
 DELETE FROM emp WHERE nosuch = 1;
-DELETE FROM emp WHERE ROWNUM <= 2;
 DELETE FROM (SELECT * FROM emp) WHERE id = 1;
 DELETE FROM emp WHERE id = 1 LOG ERRORS INTO errlog;
 CREATE VIEW ev AS SELECT * FROM emp;
@@ -228,9 +227,6 @@ ERROR:
 ORA-00904: "NOSUCH": invalid identifier
 
 ERROR:
-ORA-20000: window functions are not allowed in DELETE
-
-ERROR:
 ORA-00900: invalid SQL statement
 
 ERROR:
@@ -240,6 +236,36 @@ View created.
 
 ERROR:
 ORA-03001: unimplemented feature: cannot delete from view "ev" (lexdb's views are read-only)
+
+Rollback complete.
+```
+
+### F. ROWNUM
+
+`ROWNUM <= n` in the `WHERE` clause limits the statement to the first n rows it finds.
+
+<!-- example: oracle -->
+```sql
+SELECT COUNT(*) AS before FROM emp;
+DELETE FROM emp WHERE ROWNUM <= 2;
+SELECT COUNT(*) AS after FROM emp;
+ROLLBACK;
+```
+
+```text
+BEFORE
+------
+     5
+
+1 row selected.
+
+2 rows deleted.
+
+AFTER
+-----
+    3
+
+1 row selected.
 
 Rollback complete.
 ```
