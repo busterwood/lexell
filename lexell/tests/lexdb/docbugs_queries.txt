@@ -1,0 +1,53 @@
+# Bugs the user documentation found in the PostgreSQL door (KNOWN-ISSUES.md, the bug-fix slice), against PostgreSQL 18 (gen_pg.py ... docbugs): an
+# INSERT ... SELECT, UPDATE and MERGE into a table with a foreign key and a CHECK that a row fails part way (23514, not 23505: the rows before the
+# failing one were written twice), DROP COLUMN dropping the CHECKs that read the column (one column or several), and a column constraint written
+# NOT VALID, with NOT ENFORCED either side (42601; a table constraint takes both). Each answer with its columns' names; each query runs with
+# lexdb_batch off and on ("@once" lines once).
+
+@once create table p9 (id int primary key)
+@once insert into p9 values (1), (2)
+@once create table c9 (id int primary key, pid int references p9 (id), v int check (v > 0))
+# a row fails part way, a chunk's rows before it written once (a second write of them was 23505)
+insert into c9 select i + 100, 1, 2000 - i from generate_series(1, 3000) i
+select count(*) as n from c9
+@once insert into c9 select i, 1, 5 from generate_series(1, 3000) i
+select count(*) as n from c9
+insert into c9 select i + 10000, 1, 2000 - i from generate_series(1, 3000) i
+select count(*) as n from c9
+# a parent missing at the end
+insert into c9 select i + 10000, 1, 5 from generate_series(1, 2000) i union all select 20000, 3, 5
+select count(*) as n from c9
+update c9 set pid = 2, v = 2000 - id
+select count(*) as n from c9 where pid = 2
+update c9 set id = id + 5000, v = 2000 - id
+select count(*) as n, min(id) as lo from c9
+merge into c9 t using (select i as id from generate_series(1, 3000) i) s on t.id = s.id when matched then update set v = 2000 - t.id, pid = 2
+select count(*) as n from c9 where pid = 2
+merge into c9 t using (select i + 3000 as id from generate_series(1, 3000) i) s on t.id = s.id when not matched then insert values (s.id, 1, 3500 - s.id)
+select count(*) as n from c9
+# without the foreign key
+@once create table c9b (id int primary key, v int check (v > 0))
+insert into c9b select i + 100, 2000 - i from generate_series(1, 3000) i
+select count(*) as n from c9b
+
+# DROP COLUMN drops the checks that read the column, a check of several columns too
+@once create table dc1 (a int, b int, c int check (c > 0), check (a < b), constraint ck3 check (b + c > 0))
+select conname from pg_constraint where conrelid = 'dc1'::regclass order by conname
+@once alter table dc1 drop column c
+select conname from pg_constraint where conrelid = 'dc1'::regclass order by conname
+@once alter table dc1 drop column a
+select conname from pg_constraint where conrelid = 'dc1'::regclass order by conname
+@once insert into dc1 values (-5)
+select b from dc1
+
+# a column constraint takes no NOT VALID, whatever the state words around it
+create table nv1 (id int, v int constraint x check (v > 0) not valid not enforced)
+create table nv2 (id int, v int constraint x check (v > 0) not enforced not valid)
+create table nv3 (id int, v int check (v > 0) not valid)
+create table nv4 (id int primary key, v int references p9 (id) not valid)
+create table nv5 (id int primary key, v int references p9 (id) not enforced not valid)
+@once create table nv6 (id int, v int, constraint x check (v > 0) not valid not enforced)
+@once create table nv7 (id int, v int, constraint x check (v > 0) not enforced not valid)
+select conname, convalidated, conenforced from pg_constraint where conrelid in ('nv6'::regclass, 'nv7'::regclass) order by conrelid, conname
+@once alter table nv6 add column w int check (w > 0)
+select count(*) as n from pg_constraint where conrelid = 'nv6'::regclass

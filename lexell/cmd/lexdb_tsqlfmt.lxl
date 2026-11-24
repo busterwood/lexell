@@ -14,13 +14,119 @@ type DbErr = lexdb_base.DbErr
 
 fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
 
-// A culture's separators.
-type Cul = value record { grp: str; dec: str; de: bool }
+// A culture's numbers: the separators of numbers (grp, dec) and of currency (cgrp, cdec), whether it groups the way India does (the
+// last three digits, then twos), and the patterns of C and P, positive and negative, "{n}" the number.
+type Cul = value record { grp: str; dec: str; cgrp: str; cdec: str; indian: bool; cpos: str; cneg: str; ppos: str; pneg: str }
 
-fn culOf(name: &str): Cul {
+// The cultures SQL Server 2022 knows and lexdb has the numbers of, as it answers FORMAT(x, 'N2' | 'C2' | 'P2', culture) (read from it:
+// the fields are name ; group ; decimal ; currency group ; currency decimal ; India's grouping ; C ; C negative ; P ; P negative,
+// divided by "~"). Another name of the same form (a language, then optional parts) is the invariant culture's: ',' and '.', ¤ for
+// the currency; one that is not of that form is error 9818.
+const NUMCULS: []str = [
+    "en-US~,~.~,~.~0~${n}~(${n})~{n}%~-{n}%",
+    "en-GB~,~.~,~.~0~£{n}~-£{n}~{n}%~-{n}%",
+    "en-AU~,~.~,~.~0~${n}~-${n}~{n}%~-{n}%",
+    "en-CA~,~.~,~.~0~${n}~-${n}~{n}%~-{n}%",
+    "en-IN~,~.~,~.~1~₹ {n}~₹ -{n}~{n}%~-{n}%",
+    "en-IE~,~.~,~.~0~€{n}~-€{n}~{n}%~-{n}%",
+    "en-NZ~,~.~,~.~0~${n}~-${n}~{n}%~-{n}%",
+    "en-ZA~ ~,~ ~,~0~R{n}~-R{n}~{n}%~-{n}%",
+    "de-DE~.~,~.~,~0~{n} €~-{n} €~{n} %~-{n} %",
+    "de-AT~ ~,~.~,~0~€ {n}~-€ {n}~{n} %~-{n} %",
+    "de-CH~’~.~’~.~0~CHF {n}~CHF-{n}~{n}%~-{n}%",
+    "fr-FR~ ~,~ ~,~0~{n} €~-{n} €~{n} %~-{n} %",
+    "fr-CA~ ~,~ ~,~0~{n} $~({n} $)~{n} %~-{n} %",
+    "fr-BE~.~,~.~,~0~{n} €~-{n} €~{n} %~-{n} %",
+    "fr-CH~ ~,~ ~.~0~{n} CHF~-{n} CHF~{n}%~-{n}%",
+    "es-ES~.~,~.~,~0~{n} €~-{n} €~{n} %~-{n} %",
+    "es-MX~,~.~,~.~0~${n}~-${n}~{n} %~-{n} %",
+    "es-AR~.~,~.~,~0~$ {n}~-$ {n}~{n} %~-{n} %",
+    "es-CO~.~,~.~,~0~$ {n}~-$ {n}~{n} %~-{n} %",
+    "it-IT~.~,~.~,~0~{n} €~-{n} €~{n}%~-{n}%",
+    "it-CH~’~.~’~.~0~CHF {n}~CHF-{n}~{n}%~-{n}%",
+    "ja-JP~,~.~,~.~0~¥{n}~-¥{n}~{n}%~-{n}%",
+    "zh-CN~,~.~,~.~0~¥{n}~¥-{n}~{n}%~-{n}%",
+    "zh-TW~,~.~,~.~0~NT${n}~-NT${n}~{n}%~-{n}%",
+    "ko-KR~,~.~,~.~0~₩{n}~-₩{n}~{n}%~-{n}%",
+    "pt-BR~.~,~.~,~0~R$ {n}~-R$ {n}~{n}%~-{n}%",
+    "pt-PT~ ~,~ ~,~0~{n} €~-{n} €~{n}%~-{n}%",
+    "nl-NL~.~,~.~,~0~€ {n}~€ -{n}~{n}%~-{n}%",
+    "nl-BE~.~,~.~,~0~{n} €~-{n} €~{n}%~-{n}%",
+    "sv-SE~ ~,~ ~,~0~{n} kr~-{n} kr~{n} %~-{n} %",
+    "nb-NO~ ~,~ ~,~0~kr {n}~-kr {n}~{n} %~-{n} %",
+    "da-DK~.~,~.~,~0~{n} kr.~-{n} kr.~{n} %~-{n} %",
+    "fi-FI~ ~,~ ~,~0~{n} €~-{n} €~{n} %~-{n} %",
+    "pl-PL~ ~,~ ~,~0~{n} zł~-{n} zł~{n}%~-{n}%",
+    "cs-CZ~ ~,~ ~,~0~{n} Kč~-{n} Kč~{n} %~-{n} %",
+    "ru-RU~ ~,~ ~,~0~{n} ₽~-{n} ₽~{n}%~-{n}%",
+    "tr-TR~.~,~.~,~0~₺{n}~-₺{n}~%{n}~-%{n}",
+    "el-GR~.~,~.~,~0~{n} €~-{n} €~{n}%~-{n}%",
+    "hu-HU~ ~,~ ~,~0~{n} Ft~-{n} Ft~{n}%~-{n}%",
+    "he-IL~,~.~,~.~0~₪ {n}~₪-{n}~{n}%~-{n}%",
+    "ar-SA~,~.~,~.~0~{n} ر.س.‏~-{n} ر.س.‏~{n} %~-{n} %",
+    "th-TH~,~.~,~.~0~฿{n}~-฿{n}~{n}%~-{n}%",
+    "hi-IN~,~.~,~.~1~₹{n}~₹ -{n}~{n}%~-{n}%",
+    "id-ID~.~,~.~,~0~Rp{n}~-Rp{n}~{n}%~-{n}%",
+    "vi-VN~.~,~.~,~0~{n} ₫~-{n} ₫~{n}%~-{n}%",
+    "uk-UA~ ~,~ ~,~0~{n} ₴~-{n} ₴~{n}%~-{n}%",
+    "ro-RO~.~,~.~,~0~{n} lei~-{n} lei~{n} %~-{n} %",
+    "de~.~,~.~,~0~{n} €~-{n} €~{n} %~-{n} %",
+    "fr~ ~,~ ~,~0~{n} €~-{n} €~{n} %~-{n} %",
+    "es~.~,~.~,~0~{n} €~-{n} €~{n} %~-{n} %",
+    "it~.~,~.~,~0~{n} €~-{n} €~{n}%~-{n}%",
+    "ja~,~.~,~.~0~¥{n}~-¥{n}~{n}%~-{n}%",
+    "en~,~.~,~.~0~${n}~(${n})~{n}%~-{n}%",
+    "pt~.~,~.~,~0~R$ {n}~-R$ {n}~{n}%~-{n}%",
+    "nl~.~,~.~,~0~€ {n}~€ -{n}~{n}%~-{n}%",
+    "sv~ ~,~ ~,~0~{n} kr~-{n} kr~{n} %~-{n} %",
+    "ru~ ~,~ ~,~0~{n} ₽~-{n} ₽~{n}%~-{n}%",
+    "zh~,~.~,~.~0~¥{n}~¥-{n}~{n}%~-{n}%",
+    "ko~,~.~,~.~0~₩{n}~-₩{n}~{n}%~-{n}%",
+    "pl~ ~,~ ~,~0~{n} zł~-{n} zł~{n}%~-{n}%",
+    "tr~.~,~.~,~0~₺{n}~-₺{n}~%{n}~-%{n}"
+]
+
+// Whether name has the form of a culture name (SQL Server accepts any such: a language of two or three letters, then parts of
+// letters and digits divided by "-"; 'en_US', 'english', 'x' and '' it refuses with 9818).
+fn cultureForm(name: &str): bool {
+    let parts = strings.split(name, "-")
+    if len(parts) == 0 { return false }
+    for k in 0..len(parts) {
+        let p = &parts[k]
+        if k == 0 && (len(p) < 2 || len(p) > 3) { return false }
+        if len(p) == 0 || len(p) > 8 { return false }
+        for i in 0..len(p) {
+            let c = p[i]
+            let letter = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+            if !(letter || (k > 0 && c >= '0' && c <= '9')) { return false }
+        }
+    }
+    return true
+}
+
+// The numbers of culture name (""): its entry in NUMCULS, or the invariant one for a name of the form; error 9818 for another.
+fn culOf(name: &str): Result[Cul, DbErr] {
+    if !cultureForm(name) {
+        return Err(e("TS9818", &("The culture parameter '" + name + "' provided in the function call is not supported.")))
+    }
     let l = strings.toLowerAscii(name)
-    if l == "de-de" || l == "de" { return Cul{grp: ".", dec: ",", de: true} }
-    return Cul{grp: ",", dec: ".", de: false}
+    for r in NUMCULS {
+        let f = strings.split(&r, "~")
+        if strings.toLowerAscii(&f[0]) == l {
+            return Ok(Cul{grp: f[1].toStr(), dec: f[2].toStr(), cgrp: f[3].toStr(), cdec: f[4].toStr(), indian: f[5] == "1", cpos: f[6].toStr(), cneg: f[7].toStr(),
+                          ppos: f[8].toStr(), pneg: f[9].toStr()})
+        }
+    }
+    return Ok(Cul{grp: ",", dec: ".", cgrp: ",", cdec: ".", indian: false, cpos: "¤{n}", cneg: "(¤{n})", ppos: "{n} %", pneg: "-{n} %"})
+}
+
+// Whether name is one of the cultures whose numbers lexdb has.
+fn numCulture(name: &str): bool {
+    let l = strings.toLowerAscii(name)
+    for r in NUMCULS {
+        if strings.toLowerAscii(&r[0..strings.indexOf(&r, "~", 0)]) == l { return true }
+    }
+    return false
 }
 
 // A culture's dates: the names (months, abbreviated months, days from Sunday, abbreviated days), AM and PM, the date separator and
@@ -39,13 +145,15 @@ const CULTURES: []str = [
     "nl-NL~januari|februari|maart|april|mei|juni|juli|augustus|september|oktober|november|december~jan|feb|mrt|apr|mei|jun|jul|aug|sep|okt|nov|dec~zondag|maandag|dinsdag|woensdag|donderdag|vrijdag|zaterdag~zo|ma|di|wo|do|vr|za~~~-~d-M-yyyy~dddd d MMMM yyyy~HH:mm~HH:mm:ss~d MMMM~MMMM yyyy",
     "pt-BR~janeiro|fevereiro|março|abril|maio|junho|julho|agosto|setembro|outubro|novembro|dezembro~jan|fev|mar|abr|mai|jun|jul|ago|set|out|nov|dez~domingo|segunda-feira|terça-feira|quarta-feira|quinta-feira|sexta-feira|sábado~dom|seg|ter|qua|qui|sex|sáb~~~/~dd/MM/yyyy~dddd, d 'de' MMMM 'de' yyyy~HH:mm~HH:mm:ss~d 'de' MMMM~MMMM 'de' yyyy",
     "ja-JP~1月|2月|3月|4月|5月|6月|7月|8月|9月|10月|11月|12月~1|2|3|4|5|6|7|8|9|10|11|12~日曜日|月曜日|火曜日|水曜日|木曜日|金曜日|土曜日~日|月|火|水|木|金|土~午前~午後~/~yyyy/MM/dd~yyyy'年'M'月'd'日'~H:mm~H:mm:ss~M'月'd'日'~yyyy'年'M'月'",
+    "invariant~January|February|March|April|May|June|July|August|September|October|November|December~Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec~Sunday|Monday|Tuesday|Wednesday|Thursday|Friday|Saturday~Sun|Mon|Tue|Wed|Thu|Fri|Sat~AM~PM~/~MM/dd/yyyy~dddd, dd MMMM yyyy~HH:mm~HH:mm:ss~MMMM dd~yyyy MMMM",
     "sv-SE~januari|februari|mars|april|maj|juni|juli|augusti|september|oktober|november|december~jan|feb|mar|apr|maj|jun|jul|aug|sep|okt|nov|dec~söndag|måndag|tisdag|onsdag|torsdag|fredag|lördag~sön|mån|tis|ons|tor|fre|lör~~~-~yyyy-MM-dd~'den' d MMMM yyyy~HH:mm~HH:mm:ss~'den' d MMMM~MMMM yyyy",
 ]
 
 // The dates of a culture: the first entry of CULTURES named so (a neutral name, de, takes its first specific one); en-US else.
 fn dateCul(name: &str): DCul {
     let l = strings.toLowerAscii(name)
-    var pick = 0
+    // (a culture whose numbers are known and whose dates are not: en-US's, as before; one that is none of them: the invariant's)
+    var pick = if len(l) > 0 && !numCulture(name) { len(CULTURES) - 2 } else { 0 }
     for i in 0..len(CULTURES) {
         let nm = strings.toLowerAscii(&CULTURES[i][0..strings.indexOf(&CULTURES[i], "~", 0)])
         if nm == l || (len(l) == 2 && strings.startsWith(&nm, &(l + "-"))) { pick = i; break }
@@ -71,8 +179,9 @@ pub fn format(vs: &[]Val, z: &lexdb_time.Zone): Result[Val, DbErr] {
         }
     }
     let f = lexdb_sql.text(&vs[1])
-    let cul = culOf(&(if len(vs) > 2 { lexdb_sql.text(&vs[2]) } else { "" }))
-    let dc = dateCul(&(if len(vs) > 2 { lexdb_sql.text(&vs[2]) } else { "" }))
+    let cname = if len(vs) > 2 { lexdb_sql.text(&vs[2]) } else { "en-US" }
+    let cul = try culOf(&cname)
+    let dc = dateCul(&cname)
     match vs[0] {
         Val.Int(n) { return numFormat(&Decimal.fromInt(n), true, &f, &cul, n) }
         Val.Num(d) { return numFormat(&d, false, &f, &cul, 0) }
@@ -137,13 +246,15 @@ fn numFormat(d: &Decimal, isInt: bool, f: &str, cul: &Cul, n: int): Result[Val, 
     }
     if k == 'P' || k == 'p' {
         let x = d.mul(Decimal.fromInt(100))
-        return Ok(Val.Text(fixed(&x, if hasP { p } else { 2 }, true, cul) + (if cul.de { " %" } else { "%" })))
+        let t = fixed(&x.abs(), if hasP { p } else { 2 }, true, cul)
+        let neg = x.isNeg() && t != fixed(&Decimal.zero(), if hasP { p } else { 2 }, true, cul)
+        return Ok(Val.Text(strings.replaceAll(&(if neg { cul.pneg.clone() } else { cul.ppos.clone() }), "{n}", &t)))
     }
     if k == 'C' || k == 'c' {
-        let t = fixed(&d.abs(), if hasP { p } else { 2 }, true, cul)
-        let neg = d.isNeg() && t != fixed(&Decimal.zero(), if hasP { p } else { 2 }, true, cul)
-        if cul.de { return Ok(Val.Text((if neg { "-" } else { "" }) + t + " €")) }
-        return Ok(Val.Text(if neg { "($" + t + ")" } else { "$" + t }))
+        let cc = Cul{grp: cul.cgrp.clone(), dec: cul.cdec.clone(), cgrp: cul.cgrp.clone(), cdec: cul.cdec.clone(), indian: cul.indian, cpos: "", cneg: "", ppos: "", pneg: ""}
+        let t = fixed(&d.abs(), if hasP { p } else { 2 }, true, &cc)
+        let neg = d.isNeg() && t != fixed(&Decimal.zero(), if hasP { p } else { 2 }, true, &cc)
+        return Ok(Val.Text(strings.replaceAll(&(if neg { cul.cneg.clone() } else { cul.cpos.clone() }), "{n}", &t)))
     }
     if k == 'E' || k == 'e' { return Ok(Val.Text(sci(d, if hasP { p } else { 6 }, k == 'E', 3, false, cul))) }
     if k == 'G' || k == 'g' {
@@ -165,11 +276,15 @@ fn parts(d: &Decimal, p: int): []str {
     return [s[0..dot].toStr(), strings.padRight(&(s[dot + 1..len(s)].toStr()), p, '0')]
 }
 
-fn grouped(ip: &str, grp: &str): str {
+fn grouped(ip: &str, grp: &str): str { return groupedBy(ip, grp, false) }
+
+// The digits ip with grp between groups of three, or (indian) between the last three and then twos.
+fn groupedBy(ip: &str, grp: &str, indian: bool): str {
     var out = ""
     let n = len(ip)
     for i in 0..n {
-        if i > 0 && (n - i) % 3 == 0 { out += grp }
+        let left = n - i
+        if i > 0 && (if indian { left == 3 || (left > 3 && (left - 3) % 2 == 0) } else { left % 3 == 0 }) { out += grp }
         out.addByte(ip[i])
     }
     return out
@@ -178,7 +293,7 @@ fn grouped(ip: &str, grp: &str): str {
 // N (group) and F: p decimals, the sign only when what shows is not zero.
 fn fixed(d: &Decimal, p: int, group: bool, cul: &Cul): str {
     let ps = parts(d, p)
-    let ip = if group { grouped(&ps[0], &cul.grp) } else { ps[0].clone() }
+    let ip = if group { groupedBy(&ps[0], &cul.grp, cul.indian) } else { ps[0].clone() }
     let body = ip + (if p > 0 { cul.dec + ps[1] } else { "" })
     var zero = true
     for i in 0..len(ps[0]) { if ps[0][i] != '0' { zero = false } }
@@ -259,22 +374,17 @@ fn general(d: &Decimal, p: int, up: bool, cul: &Cul): str {
     return t
 }
 
-// A custom numeric format (its first section): 0 a digit always shown, # one shown where it is significant, the group
-// separator between the integer part's placeholders, a decimal point, % (the value a hundred times), and the rest
-// (quoted or escaped text too) as written before and after the number.
-fn custom(d0: &Decimal, f0: &str, cul: &Cul): str {
-    var f = f0.toStr()
-    let semi = strings.indexOf(&f, ";", 0)
-    if semi >= 0 { f = f[0..semi].toStr() }
-    var pre = ""
-    var post = ""
-    var intZeros = 0
-    var fracZeros = 0
-    var fracAll = 0
-    var group = false
-    var pct = false
-    var seenPh = false
-    var inFrac = false
+// A custom numeric format (checked against SQL Server 2022): up to three sections divided by ";" (positive, negative, zero; a value that
+// rounds to zero in its section takes the zero one, or the first with two; the negative section shows no sign of its own; an empty one
+// is the first with the sign), each of 0 a digit always shown, # one shown where it is significant, the group separator between the
+// integer part's placeholders, a decimal point, % (the value a hundred times), and the rest (quoted or escaped text too) as written
+// where it stands: the digits go to the placeholders from the right in the integer part (more digits than placeholders go to the
+// leftmost) and from the left in the fraction, the literals between them stay between them.
+type Tk = record { kind: int; text: str }      // kind: 0 a literal, 1 "0", 2 "#", 3 ",", 4 the decimal point, 5 "%"
+
+fn tokens(f: &str): []Tk {
+    var out: []Tk = []
+    var seenDp = false
     var i = 0
     let n = len(f)
     while i < n {
@@ -286,48 +396,187 @@ fn custom(d0: &Decimal, f0: &str, cul: &Cul): str {
                 lit.addByte(f[j])
                 j += 1
             }
-            if seenPh { post += lit } else { pre += lit }
+            append(mut &out, Tk{kind: 0, text: lit})
             i = j + 1
             continue
         }
         if c == '\\' && i + 1 < n {
-            if seenPh { post.addByte(f[i + 1]) } else { pre.addByte(f[i + 1]) }
-            i += 2
+            let ch = firstChar(&(f[i + 1..n].toStr()))
+            append(mut &out, Tk{kind: 0, text: ch.clone()})
+            i += 1 + len(ch)
             continue
         }
-        if c == '0' || c == '#' {
-            seenPh = true
-            if len(post) > 0 { post = "" }
-            if inFrac {
-                fracAll += 1
-                if c == '0' { fracZeros = fracAll }
-            } else if c == '0' { intZeros += 1 }
-        } else if c == '.' {
-            inFrac = true
-            seenPh = true
-        } else if c == ',' {
-            if seenPh && !inFrac { group = true }
-        } else if c == '%' {
-            pct = true
-            if seenPh { post += "%" } else { pre += "%" }
-        } else {
-            if seenPh { post.addByte(c) } else { pre.addByte(c) }
+        if c == '0' { append(mut &out, Tk{kind: 1, text: "0"}) }
+        else if c == '#' { append(mut &out, Tk{kind: 2, text: "#"}) }
+        else if c == ',' { append(mut &out, Tk{kind: 3, text: ","}) }
+        else if c == '.' && !seenDp {
+            seenDp = true
+            append(mut &out, Tk{kind: 4, text: "."})
+        } else if c == '%' { append(mut &out, Tk{kind: 5, text: "%"}) }
+        else {
+            let ch = firstChar(&(f[i..n].toStr()))
+            append(mut &out, Tk{kind: 0, text: ch.clone()})
+            i += len(ch)
+            continue
         }
         i += 1
     }
-    let d = if pct { d0.mul(Decimal.fromInt(100)) } else { d0.clone() }
-    let ps = parts(&d, fracAll)
+    return out
+}
+
+// f's sections (divided by ";" outside quotes).
+fn splitSections(f: &str): []str {
+    var out: []str = []
+    var cur = ""
+    var i = 0
+    let n = len(f)
+    while i < n {
+        let c = f[i]
+        if c == '\'' || c == '"' {
+            var j = i + 1
+            while j < n && f[j] != c { j += 1 }
+            let end = min(j + 1, n)
+            for k in i..end { cur.addByte(f[k]) }
+            i = end
+            continue
+        }
+        if c == '\\' && i + 1 < n {
+            cur.addByte(c)
+            cur.addByte(f[i + 1])
+            i += 2
+            continue
+        }
+        if c == ';' {
+            append(mut &out, cur.clone())
+            cur = ""
+        } else { cur.addByte(c) }
+        i += 1
+    }
+    append(mut &out, cur.clone())
+    return out
+}
+
+// |d0| as section sec shows it: its percent signs multiplied in, and how many fraction placeholders it has.
+type Sec = record { tk: []Tk; d: Decimal; nf: int; fz: int; intZeros: int; group: bool; dpAt: int; firstPh: int }
+
+fn scanSection(d0: &Decimal, sec: &str): Sec {
+    let tk = tokens(sec)
+    var dpAt = -1
+    var firstPh = -1
+    var lastIntPh = -1
+    for i in 0..len(tk) {
+        let k = tk[i].kind
+        if k == 4 && dpAt < 0 { dpAt = i }
+        if k == 1 || k == 2 {
+            if firstPh < 0 { firstPh = i }
+            if dpAt < 0 { lastIntPh = i }
+        }
+    }
+    var pct = 0
+    var group = false
+    var nf = 0
+    var fz = 0
+    var intZeros = 0
+    for i in 0..len(tk) {
+        let k = tk[i].kind
+        if k == 3 && firstPh >= 0 && i > firstPh && i < lastIntPh { group = true }
+        if k == 5 { pct += 1 }
+        if k == 1 || k == 2 {
+            if dpAt >= 0 && i > dpAt {
+                nf += 1
+                if k == 1 { fz = nf }
+            } else if k == 1 { intZeros += 1 }
+        }
+    }
+    var d = d0.abs()
+    for _ in 0..pct { d = d.mul(Decimal.fromInt(100)) }
+    return Sec{tk: tk, d: d, nf: nf, fz: fz, intZeros: intZeros, group: group, dpAt: dpAt, firstPh: firstPh}
+}
+
+// Whether section sec shows d0 as zero (what it rounds to has no digit but zeros).
+fn sectionZero(d0: &Decimal, sec: &str): bool {
+    let sc = scanSection(d0, sec)
+    let ps = parts(&sc.d, sc.nf)
+    for k in 0..len(ps[0]) { if ps[0][k] != '0' { return false } }
+    for k in 0..len(ps[1]) { if ps[1][k] != '0' { return false } }
+    return true
+}
+
+// ch put before out, after the group separator the digits so far call for.
+fn prependDigit(out: &str, ch: &str, cnt: int, group: bool, cul: &Cul): str {
+    var sep = ""
+    if group && cnt > 0 && (if cul.indian { cnt == 3 || (cnt > 3 && (cnt - 3) % 2 == 0) } else { cnt % 3 == 0 }) { sep = cul.grp.clone() }
+    return ch + sep + out
+}
+
+fn renderSection(d0: &Decimal, sec: &str, cul: &Cul): str {
+    let sc = scanSection(d0, sec)
+    let tk = &sc.tk
+    let ps = parts(&sc.d, sc.nf)
     var ip = ps[0].clone()
-    if ip == "0" && intZeros == 0 { ip = "" }
-    ip = strings.padLeft(&ip, intZeros, '0')
-    if group { ip = grouped(&ip, &cul.grp) }
-    var fp = ps[1].clone()
-    while len(fp) > fracZeros && fp[len(fp) - 1] == '0' { fp = fp[0..len(fp) - 1].toStr() }
-    var zero = true
-    for k in 0..len(ps[0]) { if ps[0][k] != '0' { zero = false } }
-    for k in 0..len(ps[1]) { if ps[1][k] != '0' { zero = false } }
-    let body = ip + (if len(fp) > 0 { cul.dec + fp } else { "" })
-    return (if d.isNeg() && !zero { "-" } else { "" }) + pre + body + post
+    if ip == "0" && sc.intZeros == 0 { ip = "" }
+    let full = ps[1].clone()
+    var trim = ps[1].clone()
+    while len(trim) > sc.fz && trim[len(trim) - 1] == '0' { trim = trim[0..len(trim) - 1].toStr() }
+    // the integer part, from its right
+    let nInt = if sc.dpAt >= 0 { sc.dpAt } else { len(tk) }
+    var out = ""
+    var di = len(ip) - 1
+    var cnt = 0
+    for r in 0..nInt {
+        let i = nInt - 1 - r
+        let k = tk[i].kind
+        if k == 1 || k == 2 {
+            if di >= 0 {
+                out = prependDigit(&out, &(ip[di..di + 1].toStr()), cnt, sc.group, cul)
+                cnt += 1
+                di -= 1
+            } else if k == 1 {
+                out = prependDigit(&out, "0", cnt, sc.group, cul)
+                cnt += 1
+            }
+            if i == sc.firstPh {
+                while di >= 0 {
+                    out = prependDigit(&out, &(ip[di..di + 1].toStr()), cnt, sc.group, cul)
+                    cnt += 1
+                    di -= 1
+                }
+            }
+        } else if k == 0 || k == 5 { out = tk[i].text + out }
+    }
+    // the fraction, from its left
+    var fr = ""
+    var printed = 0
+    if sc.dpAt >= 0 {
+        var fi = 0
+        let from = sc.dpAt + 1
+        for i in from..len(tk) {
+            let k = tk[i].kind
+            if k == 1 {
+                fr += (if fi < len(full) { full[fi..fi + 1].toStr() } else { "0" })
+                printed += 1
+                fi += 1
+            } else if k == 2 {
+                if fi < len(trim) {
+                    fr += &(trim[fi..fi + 1].toStr())
+                    printed += 1
+                }
+                fi += 1
+            } else if k == 0 || k == 5 { fr += &tk[i].text }
+        }
+    }
+    return out + (if sc.dpAt >= 0 && printed > 0 { cul.dec.clone() } else { "" }) + fr
+}
+
+fn custom(d0: &Decimal, f0: &str, cul: &Cul): str {
+    let secs = splitSections(f0)
+    let neg = d0.isNeg()
+    var si = 0
+    if len(secs) >= 2 && neg { si = 1 }
+    if sectionZero(d0, &secs[si]) { si = if len(secs) >= 3 { 2 } else { 0 } }
+    if len(secs[si]) == 0 { si = 0 }
+    let auto = si == 0 && neg && !sectionZero(d0, &secs[0])
+    return (if auto { "-" } else { "" }) + renderSection(d0, &secs[si], cul)
 }
 
 // ---- dates and times (en-US)

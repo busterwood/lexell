@@ -205,6 +205,7 @@ CHECKED = {
     'tns_robust': ('consts', 'QS'),
     'tns_mergesub': ('consts', 'QS'),
     'tns_pkgvar': ('consts', 'QS'),
+    'tns_docbugs': ('consts', 'QS'),
 }
 
 

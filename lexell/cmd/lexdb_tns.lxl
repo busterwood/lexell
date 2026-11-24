@@ -2635,6 +2635,13 @@ fn (c: mut &Conn) reapply() {
     let b = c.simple("SELECT set_config('oracle.time_zone', " + lexdb_oraadm.qlit(&tzv) + ", false)")
 }
 
+// NLS parameter k not set apart any more (its setting empty: the SQL reads an empty one as none).
+fn (c: mut &Conn) nlsUnset(k: &str) {
+    if len(c.nls.get(k)) == 0 { return }
+    c.nls.put(k, "")
+    let y = c.simple("SELECT set_config(" + lexdb_oraadm.qlit(&("oracle." + strings.toLowerAscii(k))) + ", '', false)")
+}
+
 // The NLS formats the parser puts in TO_CHAR/TO_DATE/TO_TIMESTAMP without one:
 // date, timestamp, timestamp with time zone; [] when none is set.
 fn (c: &Conn) nlsFormats(): []str {
@@ -2721,13 +2728,30 @@ fn (c: mut &Conn) setParam(name: &str, v: &str, quoted: bool): Result[Unit, DbEr
             if u != "BYTE" && u != "CHAR" { return Err(oraE(12705, "Cannot access NLS data files or invalid environment specified")) }
         }
         let val = if name == "NLS_DATE_FORMAT" || name == "NLS_TIMESTAMP_FORMAT" || name == "NLS_TIMESTAMP_TZ_FORMAT" || name == "NLS_TIME_FORMAT" || name == "NLS_TIME_TZ_FORMAT" || name == "NLS_NUMERIC_CHARACTERS" || name == "NLS_CURRENCY" { v.toStr() } else { strings.toUpperAscii(v) }
+        // a territory sets the formats, the numeric characters and the currencies again, a language the date language and the sort
+        // (what was set before is gone: Oracle Free's ALTER SESSION SET NLS_TERRITORY after NLS_DATE_FORMAT gives the territory's)
+        if name == "NLS_TERRITORY" {
+            for k in ["NLS_DATE_FORMAT", "NLS_TIMESTAMP_FORMAT", "NLS_TIMESTAMP_TZ_FORMAT", "NLS_TIME_FORMAT", "NLS_TIME_TZ_FORMAT", "NLS_NUMERIC_CHARACTERS",
+                      "NLS_CURRENCY", "NLS_DUAL_CURRENCY", "NLS_ISO_CURRENCY"] { c.nlsUnset(k) }
+        }
+        if name == "NLS_LANGUAGE" {
+            for k in ["NLS_DATE_LANGUAGE", "NLS_SORT"] { c.nlsUnset(k) }
+        }
         c.nls.put(name, &val)
         // a territory sets its own defaults for what was not set apart
         if name == "NLS_TERRITORY" {
             match lexdb_oraadm.territoryOf(v) {
-                Some(t) { if len(c.nls.get("NLS_NUMERIC_CHARACTERS")) == 0 { c.nls.put("NLS_NUMERIC_CHARACTERS", &t.numchars) } }
+                Some(t) {
+                    if len(c.nls.get("NLS_NUMERIC_CHARACTERS")) == 0 { c.nls.put("NLS_NUMERIC_CHARACTERS", &t.numchars) }
+                    if len(c.nls.get("NLS_CURRENCY")) == 0 { c.nls.put("NLS_CURRENCY", &t.cur) }
+                }
                 None {}
             }
+        }
+        // a language: its own date language and sort
+        if name == "NLS_LANGUAGE" {
+            c.nls.put("NLS_DATE_LANGUAGE", &val)
+            c.nls.put("NLS_SORT", &lexdb_oraadm.languageSort(&val))
         }
         c.forgetParsed()
         c.reapply()

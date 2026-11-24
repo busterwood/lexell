@@ -21,6 +21,7 @@ import "./lexdb_dialect"
 import "./lexdb_float"
 import "./lexdb_time"
 import "./lexdb_oradata"
+import "./lexdb_oraadm"
 import "./lexdb_sql"
 
 type Val = lexdb_sql.Val
@@ -982,6 +983,64 @@ fn oraTabPrivs(cq: &lexdb_catalog.CatView, view: &str, fam: &Family): [][]Val {
     return out
 }
 
+// NLS_SESSION_PARAMETERS and V$NLS_PARAMETERS as the session has them: what ALTER SESSION set (the settings oracle.nls_*), and
+// what a territory and a language give the others (the formats, the numeric characters, the currencies; the date language and the
+// sort), as Oracle Free does; the rest as recorded.
+fn nlsFollow(rows: [][]Val, sets: &str): [][]Val {
+    var set: Map[str, str] = newMap()
+    for l in strings.split(sets, "\n") {
+        let t = strings.indexOf(&l, "\t", 0)
+        if t > 0 && t + 1 < len(l) && strings.startsWith(&l, "oracle.nls_") { set.put(strings.toUpperAscii(&(l[7..t].toStr())), l[t + 1..len(l)].toStr()) }
+    }
+    if set.size() == 0 { return rows }
+    var derived: Map[str, str] = newMap()
+    match set.get(&"NLS_TERRITORY") {
+        Some(tn) {
+            match lexdb_oraadm.territoryOf(&tn) {
+                Some(t) {
+                    let tm = t.ts[strings.indexOf(&t.ts, " ", 0) + 1..len(t.ts)].toStr()
+                    derived.put("NLS_DATE_FORMAT".toStr(), (t.date).clone())
+                    derived.put("NLS_TIMESTAMP_FORMAT".toStr(), (t.ts).clone())
+                    derived.put("NLS_TIMESTAMP_TZ_FORMAT".toStr(), (t.tstz).clone())
+                    derived.put("NLS_TIME_FORMAT".toStr(), (tm).clone())
+                    derived.put("NLS_TIME_TZ_FORMAT".toStr(), ((tm + " TZR")).clone())
+                    derived.put("NLS_NUMERIC_CHARACTERS".toStr(), (t.numchars).clone())
+                    derived.put("NLS_CURRENCY".toStr(), (t.cur).clone())
+                    derived.put("NLS_DUAL_CURRENCY".toStr(), (t.dual).clone())
+                    derived.put("NLS_ISO_CURRENCY".toStr(), (t.name).clone())
+                }
+                None {}
+            }
+        }
+        None {}
+    }
+    match set.get(&"NLS_LANGUAGE") {
+        Some(l) {
+            derived.put("NLS_DATE_LANGUAGE".toStr(), (l).clone())
+            derived.put("NLS_SORT".toStr(), (lexdb_oraadm.languageSort(&l)).clone())
+        }
+        None {}
+    }
+    var out: [][]Val = []
+    for r in rows {
+        var row = r.clone()
+        if len(row) >= 2 {
+            let n = lexdb_sql.text(&row[0])
+            match set.get(&n) {
+                Some(v) { row[1] = Val.Text(v) }
+                None {
+                    match derived.get(&n) {
+                        Some(v) { row[1] = Val.Text(v) }
+                        None {}
+                    }
+                }
+            }
+        }
+        append(mut &out, row)
+    }
+    return out
+}
+
 pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] {
     if !isView(view) { return Ok([]) }
     if strings.endsWith(view, "_TAB_PRIVS") { return Ok(oraTabPrivs(cq, view, &family(view))) }
@@ -1029,6 +1088,7 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] 
                                     oraNS("DATABASE_ROLE", if cq.replica { "PHYSICAL STANDBY" } else { "PRIMARY" }),
                                     oraNV("CON_ID", iv(0)), oraNS("DB_UNIQUE_NAME", "lexdb")])])
     }
+    if view == "NLS_SESSION_PARAMETERS" || view == "V_$NLS_PARAMETERS" { return Ok(nlsFollow(oraTyped(view, &rows(view, "full")), &cq.sets)) }
     if len(fam.scope) > 0 && isBuilt(&fam.base) {
         let pends = oraBuilt(&snap, &fam.base, &roles)
         return Ok(oraProject(view, &fam, &pends, &userOwner))
