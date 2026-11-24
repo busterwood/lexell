@@ -64,6 +64,8 @@ DELETE FROM [ ONLY ] table_name [ * ] [ [ AS ] alias ]
   transaction block (25001), and cannot have `RETURNING` or `USING` (0A000). A delete that takes the range path
   ignores `batch_rows`.
 - In a transaction block, a `DELETE` keeps a `FOR UPDATE` lock on each row it deletes until the block ends.
+- A subquery in `WHERE` or `RETURNING` sees the table as it was when the statement began, not the rows the statement
+  has already deleted.
 - Inside a read-only transaction, and on a replica, `DELETE` gives 25006.
 
 ## Differences from PostgreSQL
