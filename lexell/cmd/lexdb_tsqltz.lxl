@@ -1,0 +1,228 @@
+// lexdb_tsqltz: T-SQL's datetimeoffset over Val.Tsz (a timestamp that keeps its offset, lexdb_tz; design/lexdb-robust.md, item 9):
+// SWITCHOFFSET, TODATETIMEOFFSET, SYSDATETIMEOFFSET, AT TIME ZONE (by SQL Server's Windows zone names), DATEPART and DATENAME
+// of TZOFFSET, the text a value has (CAST and CONVERT to a string) and the styles that show the offset. lexdb_tsqlfn dispatches
+// to these. SQL Server's errors: 9812 (a bad offset argument), 9820 (a bad zone name), 241.
+//
+// A string's fractional digits are the seven of datetimeoffset(7), whatever the type's scale (lexdb's values do not carry
+// one: a datetimeoffset(3) column shows its three in a result set, which TDS sends with its scale, but as text, by CAST,
+// seven).
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_time"
+import "./lexdb_tz"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+
+fn e(num: int, msg: &str): DbErr { return lexdb_base.err(&("TS" + num.toStr()), msg) }
+
+const MIN_US = 60000000
+
+fn pad(n: int, w: int): str { return strings.padLeft(&(n.toStr()), w, '0') }
+
+// An offset argument (SWITCHOFFSET's, TODATETIMEOFFSET's second): '+05:30' or minutes east; None for NULL. 9812 beyond 14:00 or
+// for a text that is no offset.
+pub fn offsetArg(v: &Val, fname: &str): Result[Option[int], DbErr] {
+    let bad = e(9812, &("The timezone provided to builtin function " + fname + " is invalid."))
+    match v {
+        Val.Null { return Ok(None) }
+        Val.Int(n) {
+            if n > 840 || n < -840 { return Err(bad) }
+            return Ok(Some(n))
+        }
+        Val.Num(d) {
+            match d.toInt(Rounding.TOWARD_ZERO) {
+                Ok(n) {
+                    if n > 840 || n < -840 { return Err(bad) }
+                    return Ok(Some(n))
+                }
+                Err(_) { return Err(bad) }
+            }
+        }
+        Val.Text(s) {
+            let t = strings.trim(&s)
+            if len(t) != 6 || (t[0] != '+' && t[0] != '-') || t[3] != ':' { return Err(bad) }
+            var h = 0
+            var m = 0
+            for i in [1, 2] {
+                if t[i] < '0' || t[i] > '9' { return Err(bad) }
+                h = h * 10 + (int(t[i]) - int('0'))
+            }
+            for i in [4, 5] {
+                if t[i] < '0' || t[i] > '9' { return Err(bad) }
+                m = m * 10 + (int(t[i]) - int('0'))
+            }
+            let o = h * 60 + m
+            if m > 59 || o > 840 { return Err(bad) }
+            return Ok(Some(if t[0] == '-' { -o } else { o }))
+        }
+        else { return Err(bad) }
+    }
+}
+
+// SWITCHOFFSET(x, offset): the same instant at another offset (a datetime2 is read as UTC: its time + 0).
+pub fn switchOffset(x: &Val, off: &Val): Result[Val, DbErr] {
+    let o = match try offsetArg(off, &"switchoffset") { Some(o) { o } None { return Ok(Val.Null) } }
+    match x {
+        Val.Null { return Ok(Val.Null) }
+        Val.Tsz(u, _) { return Ok(Val.Tsz(u, o)) }
+        Val.Tstz(u) { return Ok(Val.Tsz(u, o)) }
+        Val.Ts(l) { return Ok(Val.Tsz(l, o)) }
+        else { return Err(e(8116, "Argument data type is invalid for argument 1 of switchoffset function.")) }
+    }
+}
+
+// TODATETIMEOFFSET(x, offset): the local time x at the offset (a datetimeoffset keeps its time and takes the offset).
+pub fn toDto(x: &Val, off: &Val): Result[Val, DbErr] {
+    let o = match try offsetArg(off, &"todatetimeoffset") { Some(o) { o } None { return Ok(Val.Null) } }
+    match x {
+        Val.Null { return Ok(Val.Null) }
+        Val.Tsz(u, p) { return Ok(Val.Tsz(lexdb_tz.instant(lexdb_tz.local(u, p), o), o)) }
+        Val.Ts(l) { return Ok(Val.Tsz(lexdb_tz.instant(l, o), o)) }
+        Val.Date(d) { return Ok(Val.Tsz(lexdb_tz.instant(lexdb_time.dateToTs(d), o), o)) }
+        else { return Err(e(8116, "Argument data type is invalid for argument 1 of todatetimeoffset function.")) }
+    }
+}
+
+pub fn sysDto(z: &lexdb_time.Zone): Val {
+    let u = lexdb_time.nowTstz()
+    return Val.Tsz(u, z.offsetOf(u) / 60)
+}
+
+// ---- AT TIME ZONE
+
+// SQL Server's Windows zone names and the IANA zone each is. (A name this does not list is 9820; lexdb's own IANA names are
+// refused as SQL Server refuses them, except UTC.)
+const WIN_NAMES: []str = [
+    "UTC", "Etc/UTC", "Greenwich Standard Time", "Atlantic/Reykjavik", "GMT Standard Time", "Europe/London", "W. Europe Standard Time", "Europe/Berlin",
+    "Romance Standard Time", "Europe/Paris", "Central Europe Standard Time", "Europe/Budapest", "Central European Standard Time", "Europe/Warsaw",
+    "E. Europe Standard Time", "Europe/Chisinau", "FLE Standard Time", "Europe/Kiev", "GTB Standard Time", "Europe/Bucharest", "Russian Standard Time", "Europe/Moscow",
+    "Turkey Standard Time", "Europe/Istanbul", "Israel Standard Time", "Asia/Jerusalem", "Egypt Standard Time", "Africa/Cairo", "South Africa Standard Time", "Africa/Johannesburg",
+    "Arab Standard Time", "Asia/Riyadh", "Arabian Standard Time", "Asia/Dubai", "Iran Standard Time", "Asia/Tehran", "Pakistan Standard Time", "Asia/Karachi",
+    "India Standard Time", "Asia/Kolkata", "Nepal Standard Time", "Asia/Kathmandu", "Bangladesh Standard Time", "Asia/Dhaka", "SE Asia Standard Time", "Asia/Bangkok",
+    "China Standard Time", "Asia/Shanghai", "Singapore Standard Time", "Asia/Singapore", "Tokyo Standard Time", "Asia/Tokyo", "Korea Standard Time", "Asia/Seoul",
+    "AUS Eastern Standard Time", "Australia/Sydney", "E. Australia Standard Time", "Australia/Brisbane", "Cen. Australia Standard Time", "Australia/Adelaide",
+    "W. Australia Standard Time", "Australia/Perth", "New Zealand Standard Time", "Pacific/Auckland", "Hawaiian Standard Time", "Pacific/Honolulu",
+    "Alaskan Standard Time", "America/Anchorage", "Pacific Standard Time", "America/Los_Angeles", "Mountain Standard Time", "America/Denver",
+    "US Mountain Standard Time", "America/Phoenix", "Central Standard Time", "America/Chicago", "Eastern Standard Time", "America/New_York",
+    "US Eastern Standard Time", "America/Indianapolis", "Atlantic Standard Time", "America/Halifax", "Newfoundland Standard Time", "America/St_Johns",
+    "E. South America Standard Time", "America/Sao_Paulo", "Argentina Standard Time", "America/Buenos_Aires", "SA Pacific Standard Time", "America/Bogota",
+    "Mexico Standard Time", "America/Mexico_City", "Canada Central Standard Time", "America/Regina", "UTC-11", "Etc/GMT+11", "UTC-02", "Etc/GMT+2", "UTC+12", "Etc/GMT-12",
+]
+
+fn zoneOfName(name: &str): Option[lexdb_time.Zone] {
+    var i = 0
+    while i + 1 < len(WIN_NAMES) {
+        if strings.toLowerAscii(&WIN_NAMES[i]) == strings.toLowerAscii(name) { return lexdb_time.zoneNamed(&WIN_NAMES[i + 1]) }
+        i += 2
+    }
+    return None
+}
+
+// x AT TIME ZONE name: a datetimeoffset switched to the zone; a datetime2 or datetime read in it (a time that is twice, when
+// clocks go back, is its first; one that never is, forward by the change). NULL for a NULL.
+pub fn atTimeZone(x: &Val, name: &Val): Result[Val, DbErr] {
+    match x {
+        Val.Null { return Ok(Val.Null) }
+        else {}
+    }
+    match name {
+        Val.Null { return Ok(Val.Null) }
+        else {}
+    }
+    let nm = lexdb_sql.text(name)
+    let zn = match zoneOfName(&nm) {
+        Some(z) { z }
+        None { return Err(e(9820, &("The time zone parameter '" + nm + "' provided to AT TIME ZONE clause is invalid."))) }
+    }
+    match x {
+        Val.Tsz(u, _) { return Ok(Val.Tsz(u, zn.offsetOf(u) / 60)) }
+        Val.Tstz(u) { return Ok(Val.Tsz(u, zn.offsetOf(u) / 60)) }
+        Val.Ts(l) {
+            let sec = l / 1000000
+            let before = zn.offsetOf(l - 86400000000)
+            let after = zn.offsetOf(l + 86400000000)
+            var u = l - before * 1000000
+            if before != after {
+                let i1 = l - before * 1000000
+                let i2 = l - after * 1000000
+                let v1 = zn.offsetOf(i1) == before
+                let v2 = zn.offsetOf(i2) == after
+                if v1 && v2 { u = if i1 < i2 { i1 } else { i2 } }
+                else if v2 { u = i2 }
+                else if v1 { u = i1 }
+                else { u = i1 }                 // a time that never was: the offset before, so the time moves forward
+            }
+            return Ok(Val.Tsz(u, zn.offsetOf(u) / 60))
+        }
+        else { return Err(e(8116, &("Argument data type " + typeName(x) + " is invalid for argument 1 of AT TIME ZONE function."))) }
+    }
+}
+
+fn typeName(v: &Val): str {
+    match v {
+        Val.Date(_) { return "date" }
+        Val.Time(_) { return "time" }
+        Val.Int(_) { return "int" }
+        Val.Text(_) { return "varchar" }
+        else { return "numeric" }
+    }
+}
+
+// ---- text
+
+// The seven fractional digits (".0000000": lexdb keeps six, the seventh is 0).
+fn frac7(us: int): str { return "." + pad(us, 6) + "0" }
+
+// Styles 126 and 127's fraction: none when it is zero, three digits when whole milliseconds, else seven (SQL Server writes the
+// type's scale; lexdb's values do not carry it).
+fn fracIso(us: int): str {
+    if us == 0 { return "" }
+    if us % 1000 == 0 { return "." + pad(us / 1000, 3) }
+    return frac7(us)
+}
+
+fn dateText(l: int): str {
+    let c = lexdb_time.localOf(l)
+    return pad(c.date.year, 4) + "-" + pad(c.date.month, 2) + "-" + pad(c.date.day, 2)
+}
+
+fn todText(l: int): str {
+    let tod = lexdb_time.floorMod(l, lexdb_time.DAY_US)
+    let s = tod / 1000000
+    return pad(s / 3600, 2) + ":" + pad(s / 60 % 60, 2) + ":" + pad(s % 60, 2)
+}
+
+// CAST of a datetimeoffset to a string: '2026-03-15 10:00:00.0000000 +02:00'.
+pub fn text(u: int, off: int): str {
+    let l = lexdb_tz.local(u, off)
+    return dateText(l) + " " + todText(l) + frac7(lexdb_time.floorMod(l, 1000000)) + " " + lexdb_tz.offText(off)
+}
+
+const MON3: []str = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+
+// CONVERT(string, datetimeoffset, style): the styles that show the offset (0, 100, 9, 109, 13, 113, 120, 121, 126, 127); the
+// others are the date's alone, as for a datetime2 (None: lexdb_tsqlfn's datestyle reads the local time).
+pub fn style(u: int, off: int, st: int): Option[str] {
+    let l = lexdb_tz.local(u, off)
+    let c = lexdb_time.localOf(l)
+    let tod = lexdb_time.floorMod(l, lexdb_time.DAY_US)
+    let hh = tod / 3600000000
+    let mi = tod / 60000000 % 60
+    let ss = tod / 1000000 % 60
+    let f = lexdb_time.floorMod(l, 1000000)
+    let z = lexdb_tz.offText(off)
+    let h12 = if hh % 12 == 0 { 12 } else { hh % 12 }
+    let ap = if hh < 12 { "AM" } else { "PM" }
+    let mon = MON3[c.date.month - 1].toStr()
+    if st == 0 || st == 100 { return Some(mon + " " + strings.padLeft(&(c.date.day.toStr()), 2, ' ') + " " + pad(c.date.year, 4) + " " + strings.padLeft(&(h12.toStr()), 2, ' ') + ":" + pad(mi, 2) + ap + " " + z) }
+    if st == 9 || st == 109 { return Some(mon + " " + strings.padLeft(&(c.date.day.toStr()), 2, ' ') + " " + pad(c.date.year, 4) + " " + strings.padLeft(&(h12.toStr()), 2, ' ') + ":" + pad(mi, 2) + ":" + pad(ss, 2) + frac7(f) + ap + " " + z) }
+    if st == 13 || st == 113 { return Some(pad(c.date.day, 2) + " " + mon + " " + pad(c.date.year, 4) + " " + pad(hh, 2) + ":" + pad(mi, 2) + ":" + pad(ss, 2) + frac7(f) + " " + z) }
+    if st == 20 || st == 120 { return Some(dateText(l) + " " + todText(l) + " " + z) }
+    if st == 21 || st == 121 { return Some(dateText(l) + " " + todText(l) + frac7(f) + " " + z) }
+    if st == 126 { return Some(dateText(l) + "T" + todText(l) + fracIso(f) + z) }
+    if st == 127 { return Some(dateText(u) + "T" + todText(u) + fracIso(lexdb_time.floorMod(u, 1000000)) + "Z") }
+    if st == 108 || st == 8 || st == 24 { return Some(todText(l) + " " + z) }
+    return None
+}

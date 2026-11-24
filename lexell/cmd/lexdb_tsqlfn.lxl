@@ -16,6 +16,8 @@ import "unicode"
 import "./lexdb_base"
 import "./lexdb_sql"
 import "./lexdb_time"
+import "./lexdb_tz"
+import "./lexdb_tsqltz"
 import "./lexdb_tsqlfmt"
 
 type Val = lexdb_sql.Val
@@ -55,7 +57,7 @@ fn uuidOfBytes(raw: &[]byte): str {
 pub fn isTsqlFn(name: &str): bool {
     match name {
         "#len", "#datalength", "charindex", "patindex", "#replaceci", "#stuff", "#round", "#power", "#dateadd", "#datediff",
-        "#datepart", "#datename", "#eomonth", "#datestyle", "#tlike", "#utcnow", "#reverse", "#concat_ws", "#tint", "#bin2str", "#bsub", "#tobin", "#bitint", "#bin2uuid",
+        "#sysdto", "#switchoffset", "#todto", "#tattz", "#datepart", "#datename", "#eomonth", "#datestyle", "#tlike", "#utcnow", "#reverse", "#concat_ws", "#tint", "#bin2str", "#bsub", "#tobin", "#bitint", "#bin2uuid",
         "#bitnot", "#quotename", "#format", "#dtadd", "#dtdiff", "#tbit_count", "#tbit_shl", "#tbit_shr", "#tbit_get", "#tbit_set" { return true }
         else { return false }
     }
@@ -460,11 +462,21 @@ pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], Db
                 else { return Ok(Some(Val.Float(toFloat(&vs[0]).pow(y)))) }
             }
         }
+        "#sysdto" { return Ok(Some(lexdb_tsqltz.sysDto(z))) }
+        "#switchoffset" { return Ok(Some(try lexdb_tsqltz.switchOffset(&vs[0], &vs[1]))) }
+        "#todto" { return Ok(Some(try lexdb_tsqltz.toDto(&vs[0], &vs[1]))) }
+        "#tattz" { return Ok(Some(try lexdb_tsqltz.atTimeZone(&vs[0], &vs[1]))) }
         "#dateadd" { return Ok(Some(try dateadd(&sv(&vs[0]), try intOf(&vs[1], &"dateadd"), &vs[2], z))) }
         "#datediff" { return Ok(Some(Val.Int(try datediff(&sv(&vs[0]), &vs[1], &vs[2], z)))) }
         "#datepart" { return Ok(Some(Val.Int(try datepart(&sv(&vs[0]), &vs[1], z)))) }
         "#datename" {
             let part = sv(&vs[0])
+            if part == "tzoffset" {
+                match vs[1] {
+                    Val.Tsz(_, o) { return Ok(Some(Val.Text(lexdb_tz.offText(o)))) }
+                    else {}
+                }
+            }
             if part == "month" { return Ok(Some(Val.Text(MONTHS[try datepart(&part, &vs[1], z) - 1].toStr()))) }
             if part == "weekday" { return Ok(Some(Val.Text(DAYS[try datepart(&part, &vs[1], z) - 1].toStr()))) }
             return Ok(Some(Val.Text((try datepart(&part, &vs[1], z)).toStr())))
@@ -563,6 +575,7 @@ pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], Db
             // a varbinary as text: its bytes as characters (style 1: 0x and the hex digits, 2: the hex digits); any other value as it is
             // (a uniqueidentifier in upper case, SQL Server's)
             match vs[0] {
+                Val.Tsz(u, o) { return Ok(Some(Val.Text(lexdb_tsqltz.text(u, o)))) }
                 Val.Uuid(u) {
                     if n > 2 && (try intOf(&vs[2], &"convert")) < 36 { return Err(e("TS8170", "Insufficient result space to convert uniqueidentifier value to char.")) }
                     return Ok(Some(Val.Text(strings.toUpperAscii(&u))))
@@ -773,6 +786,7 @@ fn asTs(v: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
         Val.Date(d) { return Ok(lexdb_time.dateToTs(d)) }
         Val.Ts(u) { return Ok(u) }
         Val.Tstz(u) { return Ok(lexdb_time.tstzToTs(u, z)) }
+        Val.Tsz(u, o) { return Ok(lexdb_tz.local(u, o)) }
         Val.Time(u) { return Ok(u - 36524 * lexdb_time.DAY_US) }     // 1900-01-01, as SQL Server's time cast to datetime
         Val.Text(s) {
             match lexdb_time.parseTs(&strings.trim(s), z) {
@@ -823,13 +837,30 @@ fn dateadd(part: &str, n: int, v: &Val, z: &lexdb_time.Zone): Result[Val, DbErr]
             return Ok(Val.Date(lexdb_time.tsToDate(r)))
         }
         Val.Tstz(_) { return Ok(Val.Tstz(lexdb_time.tsToTstz(r, z))) }
+        Val.Tsz(_, o) { return Ok(Val.Tsz(lexdb_tz.instant(r, o), o)) }
         else { return Ok(Val.Ts(r)) }
     }
 }
 
+fn isDto(v: &Val): bool {
+    match v {
+        Val.Tsz(_, _) { return true }
+        else { return false }
+    }
+}
+
+// A datetimeoffset's UTC time; any other value as it is (a datetime2 beside one is read at offset 0).
+fn utcTs(v: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
+    match v {
+        Val.Tsz(u, _) { return Ok(u) }
+        else { return asTs(v, z) }
+    }
+}
+
 fn datediff(part: &str, a: &Val, b: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
-    let x = try asTs(a, z)
-    let y = try asTs(b, z)
+    let dto = isDto(a) || isDto(b)
+    let x = if dto { try utcTs(a, z) } else { try asTs(a, z) }
+    let y = if dto { try utcTs(b, z) } else { try asTs(b, z) }
     let p = ymd(x)
     let q = ymd(y)
     match part.toStr() {
@@ -849,6 +880,15 @@ fn datediff(part: &str, a: &Val, b: &Val, z: &lexdb_time.Zone): Result[int, DbEr
 }
 
 fn datepart(part: &str, v: &Val, z: &lexdb_time.Zone): Result[int, DbErr] {
+    if part == "tzoffset" {
+        match v {
+            Val.Tsz(_, o) { return Ok(o) }
+            Val.Ts(_) { return Ok(0) }
+            Val.Tstz(_) { return Ok(0) }
+            Val.Text(_) { return Ok(0) }
+            else { return Err(e("TS9810", &("The datepart tzoffset is not supported by date function datepart for data type " + (match v { Val.Date(_) { "date" } else { "time" } }) + "."))) }
+        }
+    }
     let us = try asTs(v, z)
     let d = ymd(us)
     let tod = us - dayNo(us) * lexdb_time.DAY_US
@@ -891,6 +931,14 @@ fn datestyle(v: &Val, style: int, z: &lexdb_time.Zone): Result[Option[Val], DbEr
         Val.Date(dd) { us = lexdb_time.dateToTs(dd) }
         Val.Ts(u) { us = u }
         Val.Tstz(u) { us = lexdb_time.tstzToTs(u, z) }
+        Val.Tsz(u, o) {
+            // the styles that show the offset; the others the local time's
+            match lexdb_tsqltz.style(u, o, style) {
+                Some(t) { return Ok(Some(Val.Text(t))) }
+                None {}
+            }
+            us = lexdb_tz.local(u, o)
+        }
         Val.Time(u) { us = u }
         else { return Ok(None) }
     }
