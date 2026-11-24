@@ -164,7 +164,12 @@ public class DocRun {
                     o.add(n == 0 ? "no rows selected" : n + (n == 1 ? " row selected." : " rows selected."));
                 }
             } else {
-                o.add(feedback(sql, plsql, s.getUpdateCount()));
+                String fb = feedback(sql, plsql, s.getUpdateCount());
+                // ORA-17110 is the warning for a unit that compiled with errors: SQL*Plus says so
+                for (SQLWarning w = s.getWarnings(); w != null; w = w.getNextWarning())
+                    if (w.getMessage() != null && w.getMessage().contains("ORA-17110") && fb.matches("(Procedure|Function|Package|Package body|Trigger|Type) (created|altered)\\."))
+                        fb = "Warning: " + fb.substring(0, fb.length() - 1) + " with compilation errors.";
+                o.add(fb);
             }
         } catch (SQLException e) {
             o.add("ERROR:");
