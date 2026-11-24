@@ -1,7 +1,7 @@
 # Known issues
 
 Bugs and gaps found while writing and checking these pages (lexdb built from main at 4fba817b, 2026-11-23; the entries
-that main ca687450, a15b9a64, 02646472 and 436468d8, 2026-11-24, fixed are removed or reworded to what is left). They are not fixed here: the pages
+that main ca687450, a15b9a64, 02646472, 436468d8 and 81ee25d1, 2026-11-24, fixed are removed or reworded to what is left). They are not fixed here: the pages
 describe what lexdb does. Each "Differences" section of the reference lists the
 smaller differences of its statement.
 
@@ -59,13 +59,6 @@ smaller differences of its statement.
 - **Constraint states** (`NOT ENFORCED`, `ALTER CONSTRAINT [NOT] ENFORCED`; see [ALTER TABLE](sql/postgresql/alter-table.md)):
   - `ALTER CONSTRAINT ... DEFERRABLE`, `INITIALLY` and `NOT DEFERRABLE` are 0A000 (PostgreSQL takes them for a foreign
     key); only `ENFORCED` and `NOT ENFORCED` are taken.
-  - A column constraint written `NOT VALID NOT ENFORCED` is accepted (a syntax error in PostgreSQL).
-- **`INSERT ... SELECT` into a table with a foreign key and a `CHECK` that a row fails part way gives 23505, not 23514**
-  (found on main, not fixed): `CREATE TABLE c9 (id int PRIMARY KEY, pid int REFERENCES p9 (id), v int CHECK (v > 0));
-  INSERT INTO c9 SELECT i + 100, 1, 2000 - i FROM generate_series(1, 3000) i;` says `duplicate key value violates
-  unique constraint "c9_pkey"` (`Key (id)=(1093) already exists`); PostgreSQL says `new row for relation "c9" violates
-  check constraint "c9_v_check"` (23514). Without the foreign key, the error is right. The chunked write of
-  `INSERT ... SELECT` writes the rows before the failing one twice. The table is left empty, as it should be.
 - **Views:**
   - While a view reads table t, `ALTER TABLE t DROP COLUMN` (any column, even one the view does not use) and
     `ALTER TABLE t SET SCHEMA` are refused (2BP01, "lexdb keeps a view's text"). PostgreSQL refuses only the drop of
@@ -279,10 +272,9 @@ smaller differences of its statement.
     - The 547 of `ADD` and of `WITH CHECK CHECK CONSTRAINT` says `The INSERT statement conflicted with ...` (a foreign
       key under `ADD`: `insert or update on table ... violates foreign key constraint`); SQL Server says `The ALTER TABLE
       statement conflicted with ...`.
-    - lexdb tests every `CHECK` of a row on an `UPDATE`; SQL Server tests only those that read a column the `UPDATE`
-      sets. A row that breaks a constraint that is not trusted fails when any of its columns is updated.
-    - **`ALTER TABLE ... DROP COLUMN` of a column a `CHECK` reads silently drops the check** (SQL Server: error 5074,
-      the column cannot be dropped while a constraint depends on it); `sys.check_constraints` then lists nothing.
+    - An `UPDATE` tests only the `CHECK`s that read a column it sets (as SQL Server does) outside an explicit
+      transaction; inside `BEGIN TRANSACTION`, and in `MERGE`, lexdb tests every `CHECK` of the row. This shows only
+      for a check that is not trusted: a row that breaks it fails there when any of its columns is updated.
   - A column-level `CONSTRAINT fk FOREIGN KEY REFERENCES t (c)` is 102 (without `FOREIGN KEY` it works).
   - `ON [PRIMARY]`, `TEXTIMAGE_ON`, `WITH (...)` index and table options and `ASC` / `DESC` in a key are read and not
     kept. Still syntax errors: `ROWGUIDCOL`, `SPARSE`, `FILESTREAM`, `MASKED WITH`, `NOT FOR REPLICATION`, `GENERATED
@@ -388,10 +380,10 @@ smaller differences of its statement.
   - **Functions that are lenient:** `IIF(1, 'a', 'b')` gives `b` (SQL Server: 4145); `GREATEST(1)`, `CONCAT('a')`,
     `SUBSTRING('abcdef', 2)` and `LEFT('abc', -1)` are taken (SQL Server: 189, 174, 536); `TRANSLATE('abc', 'abc',
     'xy')` is accepted (9828); `ASCII('')` is 0; `CASE` and `COALESCE` over `1` and `2.5` give `1`, not `1.0`.
-  - **`FORMAT`:** numbers follow `en-US` and `de-DE` only (`FORMAT(1234567.891, 'N2', 'fr-FR')` is `1,234,567.89`),
-    and a culture outside the ten known ones is read as `en-US`; a custom format with sections stops at the first `;`
-    (`FORMAT(-5, '0;(0)')` is -5); literals between digit placeholders are dropped (`FORMAT(123456789,
-    '###-##-####')`).
+  - **`FORMAT`:** dates of cultures other than the ten (en-US, en-GB, de-DE, fr-FR, es-ES, it-IT, nl-NL, pt-BR,
+    ja-JP, sv-SE) are en-US's. A name of the form of a culture that SQL Server does not know gets the invariant
+    culture, as SQL Server 2022 does; a name of the wrong form is error 9818. 61 cultures are known for numbers; a
+    real culture outside them is read as the invariant one.
   - **Conversion errors:** a comparison of a string with a number is 195 (`'abc' = 1`; SQL Server: 245).
   - **Operators:** `!<` and `!>` are 102; `SELECT 1 = 1` and `SELECT NOT 1 = 2` are accepted (SQL Server: 102); `||`
     joins strings.
@@ -437,24 +429,20 @@ smaller differences of its statement.
   - `TRUNCATE` of a table a foreign key refers to is ORA-03001 (Oracle: ORA-02266); `TRUNCATE ... CASCADE`
     truncates the referencing tables whether or not the key is `ON DELETE CASCADE`; an identity column continues.
 - **QUALIFY** (Oracle 23.26's clause; see [QUALIFY](sql/oracle/qualify.md)):
-  - It is not read after `CONNECT BY` (ORA-00900).
-  - A condition that is a number or a text is read as `WHERE` reads it, which is as no row: `QUALIFY 1` and `QUALIFY
-    id - 1` return no rows (Oracle: not zero is true, so every row for `QUALIFY 1`; ORA-61800 for a text).
-  - `FOR UPDATE` after `QUALIFY` is accepted when the query has no window function and is ORA-03001 when it has one
-    (Oracle: ORA-01786 for both).
-  - `ORDER BY` before `QUALIFY` is ORA-00900 (Oracle: ORA-03049); the text of ORA-03049 is shortened to name the first
-    word of the condition.
+  - The ORA-03049 text keeps at most 28 characters of the statement before the word (Oracle cuts differently after a
+    long `CONNECT BY`).
+  - `QUALIFY DATE '...'` is ORA-00932 (Oracle: ORA-03048).
 - **Constraint states** (`DISABLE`, `ENABLE [NO]VALIDATE`, `MODIFY CONSTRAINT`; see
   [ALTER TABLE](sql/oracle/alter-table.md)):
-  - `PRIMARY KEY`, `UNIQUE` and `NOT NULL` cannot be disabled or made `NOVALIDATE`: in a definition it is ORA-00900,
-    and `ALTER TABLE ... DISABLE CONSTRAINT pk` is ORA-02430 (`cannot enable constraint ... no such constraint`; the
-    text says `enable` for `DISABLE` too).
+  - `DISABLE` and `NOVALIDATE` of a `PRIMARY KEY` or `UNIQUE` constraint are refused (ORA-03001; Oracle disables it);
+    `ENABLE` and `VALIDATE` of one are accepted and do nothing. In a definition, `DISABLE` or `NOVALIDATE` of a key
+    or `NOT NULL` is ORA-00900.
   - `RELY` and `NORELY` are read and not kept (`USER_CONSTRAINTS.RELY` is empty). `NOT ENFORCED` is ORA-00900 (Oracle
     23.26 has none: ORA-02000 or ORA-03075).
-  - `ADD CONSTRAINT ... CHECK` over rows that break it is ORA-02290 (Oracle: ORA-02293); a second foreign key on the
-    same columns is accepted (Oracle: ORA-02275).
-  - lexdb tests every `CHECK` of a row on an `UPDATE`; Oracle tests only those that read a column the `UPDATE` sets.
-    A row that breaks a constraint that is not validated fails when any of its columns is updated.
+  - An `UPDATE` tests only the `CHECK`s that read a column it sets (as Oracle does) for a statement after the door's
+    statement savepoint (the second statement of a transaction, and each one after it); a plain single autocommit
+    `UPDATE` on the Oracle door, and `MERGE`, test every `CHECK` of the row. This shows only for a check that is not
+    validated: a row that breaks it fails there when any of its columns is updated.
 - **Tables, users and PL/SQL** (found writing the Oracle DDL and PL/SQL pages):
   - `CREATE TABLE`: `INTERVAL` columns, `INVISIBLE`, `TABLESPACE`, storage clauses, `PARTITION BY`,
     `ORGANIZATION INDEX` and `DEFERRABLE` are ORA-00900;
@@ -464,8 +452,8 @@ smaller differences of its statement.
     OPTION` are refused; a view another view reads cannot be dropped (ORA-02449).
   - `ALTER TABLE ... READ ONLY` and `ALTER INDEX ... REBUILD` are ORA-03001; `COMMIT COMMENT` and
     `COMMIT WRITE` are ORA-00900; `COMMENT ON` does not keep the comment and accepts a missing table.
-  - An `INSERT` into a table whose column `DEFAULT s.NEXTVAL` calls a dropped sequence is ORA-00942 (also when the
-    statement gives the column a value); the error of a missing sequence is ORA-02289.
+  - `USER_TAB_COLUMNS.DATA_DEFAULT` of a column whose default is a sequence shows `nextval('s')` (Oracle:
+    `"APP"."S"."NEXTVAL"`).
   - Sequences: past `MAXVALUE` the error is ORA-20000 (Oracle ORA-08004); `CURRVAL` before `NEXTVAL` is ORA-20000
     (ORA-08002); `ALTER SEQUENCE ... START WITH` is accepted and does nothing; `SESSION` and `SCALE` sequences are ORA-00900.
   - Users: `ALL_USERS` and `DBA_USERS` list only users that can log in (granted `CREATE SESSION`); `ACCOUNT LOCK` removes a
@@ -473,12 +461,12 @@ smaller differences of its statement.
     `DBA_ROLES` are empty; `SESSION_PRIVS`, `SESSION_ROLES` and `USER_ROLE_PRIVS` are recorded samples;
     `USER_TAB_PRIVS_MADE`, `USER_TAB_PRIVS_RECD` and `ROLE_TAB_PRIVS` do not exist; `GRANT bogus_priv TO user` succeeds.
   - `SET TRANSACTION READ ONLY` does not stop changes; `ROLLBACK TO` an unknown savepoint is ORA-20000.
-  - `ALTER SESSION SET NLS_NUMERIC_CHARACTERS` and `NLS_LANGUAGE` change nothing, and `NLS_SESSION_PARAMETERS` and
-    `SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')` do not follow `ALTER SESSION`.
-  - PL/SQL: a package variable cannot be an `INTO` target or an `OUT` argument from outside the package, and a record
-    or collection variable of a package is not supported (scalar variables and constants are read and assigned from
-    outside); a package with only a specification and no body cannot be used: `cnt.n` is PLS-00201 (a body, even
-    one with a single procedure, makes it work); a function without parameters needs brackets in SQL (`SELECT f FROM dual` is ORA-00904); `CALL f()` of
+  - `NLS_NUMERIC_CHARACTERS` and `NLS_LANGUAGE` do not change `TO_CHAR` of numbers or messages;
+    `SYS_CONTEXT('USERENV', 'NLS_CURRENCY')` is `$` until a territory is set.
+  - PL/SQL: a package variable cannot be an `INTO` target or an `OUT` argument from outside the package, and
+    records, subtypes, exceptions and collections in a package are not supported (scalar variables and constants are
+    read and assigned from outside); a package specification that declares procedures or functions needs its body
+    (a call is PLS-00201 without it); a function without parameters needs brackets in SQL (`SELECT f FROM dual` is ORA-00904); `CALL f()` of
     a function is PLS-00201; `TO_NUMBER('abc')` raises `VALUE_ERROR`, not `INVALID_NUMBER`; `LOCK TABLE` in a block,
     `GOTO`, `FORALL` and collections are refused.
 - **Functions** (found writing the Oracle function pages):
