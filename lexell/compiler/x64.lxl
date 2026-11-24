@@ -138,11 +138,18 @@ pub type Asm = record {
     jmpEnd: int             // the end of the last jmp to a label (no label bound since), or -1
     jmpLabel: int
     termEnd: int            // the end of the last ret or jmp (no label bound since), or -1
+    cmpEnd: int             // the end of the last cmp (or jcc after it, no label since), or -1
+    cmpKind: int            // 0: rr, 1: ri, 2: rm, 3: mi
+    cmpSize: int
+    cmpA: int
+    cmpB: int
+    cmpMem: Mem
 }
 
 pub fn newAsm(): Asm {
     return Asm{code: [], labels: [], fixes: [], relocs: [], peep: false, stEnd: -1, stMem: mem(-1, 0), stReg: 0,
-        jmpEnd: -1, jmpLabel: -1, termEnd: -1, nsEnd: -1, nsMem: mem(-1, 0), nsReg: 0, nsTag: -1}
+        jmpEnd: -1, jmpLabel: -1, termEnd: -1, nsEnd: -1, nsMem: mem(-1, 0), nsReg: 0, nsTag: -1,
+        cmpEnd: -1, cmpKind: 0, cmpSize: 0, cmpA: 0, cmpB: 0, cmpMem: mem(-1, 0)}
 }
 
 fn memEq(a: Mem, b: Mem): bool {
@@ -392,12 +399,32 @@ pub fn (a: mut &Asm) lea(dst: int, m: Mem) { a.rm(0, true, 0x8D, dst, m, false) 
 
 // op dst, src (ADD ... CMP).
 pub fn (a: mut &Asm) alu(op: int, size: int, dst: int, src: int) {
+    if a.peep && op == CMP && a.cmpEnd == a.pos() && a.cmpKind == 0 && a.cmpSize == size && a.cmpA == dst && a.cmpB == src {
+        return
+    }
     a.rr(pfxOf(size), size == 8, op * 8 + (if size == 1 { 0 } else { 1 }), src, dst, size == 1, size == 1)
+    if op == CMP {
+        a.cmpEnd = a.pos()
+        a.cmpKind = 0
+        a.cmpSize = size
+        a.cmpA = dst
+        a.cmpB = src
+    }
 }
 
 // op dst, [m].
 pub fn (a: mut &Asm) aluRM(op: int, size: int, dst: int, m: Mem) {
+    if a.peep && op == CMP && a.cmpEnd == a.pos() && a.cmpKind == 2 && a.cmpSize == size && a.cmpA == dst && memEq(a.cmpMem, m) {
+        return
+    }
     a.rm(pfxOf(size), size == 8, op * 8 + (if size == 1 { 2 } else { 3 }), dst, m, size == 1)
+    if op == CMP && m.base != RIP {
+        a.cmpEnd = a.pos()
+        a.cmpKind = 2
+        a.cmpSize = size
+        a.cmpA = dst
+        a.cmpMem = m
+    }
 }
 
 // op [m], src.
@@ -407,6 +434,9 @@ pub fn (a: mut &Asm) aluMR(op: int, size: int, m: Mem, src: int) {
 
 // op dst, imm (size 4 or 8; the immediate fits 32 bits, sign-extended).
 pub fn (a: mut &Asm) aluI(op: int, size: int, dst: int, v: int) {
+    if a.peep && op == CMP && a.cmpEnd == a.pos() && a.cmpKind == 1 && a.cmpSize == size && a.cmpA == dst && a.cmpB == v {
+        return
+    }
     if fits8(v) {
         a.rr(0, size == 8, 0x83, op, dst, false, false)
         a.b(v)
@@ -418,10 +448,20 @@ pub fn (a: mut &Asm) aluI(op: int, size: int, dst: int, v: int) {
         a.rr(0, size == 8, 0x81, op, dst, false, false)
         a.d32(v)
     }
+    if op == CMP {
+        a.cmpEnd = a.pos()
+        a.cmpKind = 1
+        a.cmpSize = size
+        a.cmpA = dst
+        a.cmpB = v
+    }
 }
 
 // op size [m], imm (the immediate fits the operand, or 32 bits sign-extended for size 8).
 pub fn (a: mut &Asm) aluMI(op: int, size: int, m: Mem, v: int) {
+    if a.peep && op == CMP && a.cmpEnd == a.pos() && a.cmpKind == 3 && a.cmpSize == size && a.cmpB == v && memEq(a.cmpMem, m) {
+        return
+    }
     if size == 1 {
         a.rm(0, false, 0x80, op, m, false)
         a.b(v)
@@ -436,6 +476,13 @@ pub fn (a: mut &Asm) aluMI(op: int, size: int, m: Mem, v: int) {
         } else {
             a.d32(v)
         }
+    }
+    if op == CMP && m.base != RIP {
+        a.cmpEnd = a.pos()
+        a.cmpKind = 3
+        a.cmpSize = size
+        a.cmpB = v
+        a.cmpMem = m
     }
 }
 
@@ -616,6 +663,7 @@ pub fn (a: mut &Asm) bind(l: int) {
     a.labels[l] = a.pos()
     a.stEnd = -1
     a.nsEnd = -1
+    a.cmpEnd = -1
 }
 
 // Binds label l again, at p.
@@ -947,14 +995,17 @@ pub fn (a: mut &Asm) replaceJmp(at: int, l: int, bytes: &[]byte, first: int): bo
     a.nsEnd = -1
     a.jmpEnd = -1
     a.termEnd = -1
+    a.cmpEnd = -1
     return true
 }
 
 pub fn (a: mut &Asm) jcc(cc: int, l: int) {
+    let keepCmp = a.cmpEnd == a.pos()
     a.b(0x0F)
     a.b(0x80 + cc)
     append(mut &a.fixes, Fix{at: a.pos(), label: l, base: -1, op: 2})
     a.d32(0)
+    if keepCmp { a.cmpEnd = a.pos() }
 }
 
 // A jump table's entry: the 32-bit offset of label l from label base (bound at the table).
