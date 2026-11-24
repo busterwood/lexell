@@ -37,7 +37,8 @@ END [ function ] ;
   `f()`.
 - A function that reads tables can be called from SQL; one that changes data can be called from PL/SQL.
 - A function that raises an unhandled exception ends the statement that called it with that error (example D, from
-  PL/SQL; see the differences for a query).
+  PL/SQL). Called from a query, a function whose `SELECT ... INTO` finds no row (`NO_DATA_FOUND`) gives NULL, as in
+  Oracle; any other error ends the query with the error and the `ORA-06512` lines of the function (example F).
 - `CALL f(...) INTO :result` calls a function from a client with a bind variable; see [CALL](call.md).
 - The function is listed in `USER_OBJECTS` and `USER_PROCEDURES`: see the
   [data dictionary](data-dictionary-programs.md).
@@ -46,9 +47,6 @@ END [ function ] ;
 
 - **A function with no parameters needs brackets in SQL.** `SELECT f FROM dual` is ORA-00904 (Oracle accepts it);
   write `f()`. Inside PL/SQL both forms work for a package function.
-- **A query that calls a function which raises an exception breaks the client's connection** in the documentation's
-  JDBC checker (the driver throws a `NullPointerException`): `SELECT pay_of(99) FROM dual` with no such row. Call the
-  function from PL/SQL to see the error.
 - Pipelined and table functions, `RESULT_CACHE`, `PARALLEL_ENABLE`, `AGGREGATE USING` and `AUTHID` are not supported.
 - A `SYS_REFCURSOR` result works from PL/SQL; a JDBC client reads it as a cursor.
 
@@ -193,6 +191,46 @@ END;
 total pay 300
 
 PL/SQL procedure successfully completed.
+```
+
+### F. A function that raises, called from a query
+
+`NO_DATA_FOUND` in a function called from a query is NULL for that row. Another error ends the query.
+
+<!-- example: oracle -->
+```sql
+SELECT id, pay_of(id) AS pay, pay_of(id + 1) AS next_pay FROM emp ORDER BY id;
+CREATE OR REPLACE FUNCTION strict_pay (p_id NUMBER) RETURN NUMBER IS
+BEGIN
+  IF p_id > 1 THEN
+    RAISE_APPLICATION_ERROR(-20001, 'id too large');
+  END IF;
+  RETURN p_id;
+END;
+/
+SELECT id, strict_pay(id) AS ok FROM emp WHERE id = 1;
+SELECT id, strict_pay(id) AS ok FROM emp;
+```
+
+```text
+ID PAY NEXT_PAY
+-- --- --------
+ 1 100      200
+ 2 200
+
+2 rows selected.
+
+Function created.
+
+ID OK
+-- --
+ 1  1
+
+1 row selected.
+
+ERROR:
+ORA-20001: id too large
+ORA-06512: at "SA.STRICT_PAY", line 4
 ```
 
 ## See also
