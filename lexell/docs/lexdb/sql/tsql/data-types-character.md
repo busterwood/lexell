@@ -38,6 +38,9 @@ sysname
 - A value longer than the column is refused by `INSERT` and `UPDATE` with error 2628 (`value too long for type
   character varying(n)`). `CAST` and `CONVERT` cut the value to the length instead: `CAST('abcdef' AS varchar(3))`
   is `abc`.
+- `char(n)` and `nchar(n)` are padded with blanks to *n* characters by every conversion to them (`CAST`, `CONVERT`, an
+  `INSERT` or `UPDATE` of a column, an assignment to a variable): `'[' + CAST('ab' AS char(5)) + ']'` is `[ab   ]`.
+  `LEN` leaves the blanks out.
 - `+` joins strings and gives NULL when either side is NULL; `CONCAT` leaves NULLs out. A string that meets a
   number in `+` is converted to a number (`'12' + 1` is 13; `'abc' + 1` is error 245).
 - The default collation is `SQL_Latin1_General_CP1_CI_AS`: comparisons, `ORDER BY`, `DISTINCT`, `GROUP BY` and
@@ -50,16 +53,15 @@ sysname
 
 ## Differences from SQL Server
 
-- **`char(n)` and `nchar(n)` are not padded.** `CAST('ab' AS char(5))` is `ab`, where SQL Server gives `ab` and
-  three spaces. `LEN` is the same either way, but `'[' + CAST('ab' AS char(5)) + ']'` is `[ab]` here.
 - **A variable without a length is not limited.** `DECLARE @n varchar = 'abcdef'` keeps all six characters (SQL
   Server: `a`), and `CAST('abcdef' AS varchar)` is `abcdef` (SQL Server: up to 30 characters).
 - **Assigning a long value to a variable is an error.** `DECLARE @v varchar(10) = 'abcdefghijklmnop'` is error 2628;
   SQL Server cuts the value silently. The variable stays NULL.
 - Error 2628 reads `value too long for type character varying(5)`; SQL Server says `String or binary data would
   be truncated in table ..., column ...`.
-- `DATALENGTH` counts two bytes for every character of every type (`DATALENGTH('ab')` is 4).
-- A hexadecimal literal cast to a string gives a number, not text: see [Binary types](data-types-binary.md).
+- `DATALENGTH` counts two bytes for every character of every type: `DATALENGTH('ab')` is 4, and
+  `DATALENGTH(CAST('ab' AS char(5)))` is 10 (SQL Server: 2 and 5).
+- A binary value cast to a string gives the bytes as characters: see [Binary types](data-types-binary.md).
 - The database and server collation is always `SQL_Latin1_General_CP1_CI_AS`. A collation named in `COLLATE` is
   read for its case sensitivity (`_CS_`) and binary (`_BIN`) markers only.
 
@@ -79,9 +81,9 @@ INSERT INTO s (b) VALUES ('abcdef');
 ```text
 (1 row affected)
 
-a    b    c    d    len_a
----- ---- ---- ---- -----
-[ab] [ab] [ab] [ab] 2
+a       b    c       d    len_a
+------- ---- ------- ---- -----
+[ab   ] [ab] [ab   ] [ab] 2
 
 (1 row affected)
 
@@ -100,7 +102,7 @@ SELECT CAST('abcdef' AS varchar(3)) AS cut, CAST('ab' AS char(5)) + '|' AS padde
 ```text
 cut padded unicode characters
 --- ------ ------- ----------
-abc ab|    日本語     3
+abc ab   | 日本語     3
 
 (1 row affected)
 ```
