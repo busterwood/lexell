@@ -2210,7 +2210,7 @@ fn (g: &Gen) inline128(e: int): bool {
     let name = g.rtName(e)
     let n = g.u.nodes[e]
     let nargs = g.u.listLen(n.b)
-    if (name == "rt_cvs_u128" || name == "rt_cvu_i128") && !g.isExternCall(e) {
+    if (name == "rt_cvs_u128" || name == "rt_cvu_i128" || name == "rt_cvs_i128" || name == "rt_cvu_u128") && !g.isExternCall(e) {
         return nargs == 2 && g.isWhere(g.u.listAt(n.b, 1))
     }
     if strings.endsWith(&name, "_i128") && strings.startsWith(&name, "rt_") && !g.isExternCall(e) {
@@ -2249,6 +2249,7 @@ fn (g: &Gen) placeKind(x: int): bool {
 // Whether the call e of a runtime function is generated inline by inlineRt with no call, and
 // changes no register but rax, rcx and rdx (and the frame).
 fn (g: &Gen) quietRt(e: int): bool {
+    if g.checkedOp(e).k >= 0 { return true }
     let name = g.rtName(e)
     if name == "" { return false }
     let n = g.u.nodes[e]
@@ -7020,6 +7021,11 @@ fn (g: mut &Gen) genCall(e: int) {
             return
         }
     }
+    let chk = g.checkedOp(e)
+    if chk.k >= 0 {
+        g.destUsed = g.genCheckedOp(e, chk, dest)
+        return
+    }
     let inl = g.inlineTarget(e, false, g.loops)
     if inl >= 0 {
         g.genInline(inl, e)
@@ -7814,6 +7820,74 @@ fn (g: mut &Gen) genAsSlice(e: int, dest: x64.Mem): bool {
     return used
 }
 
+// Whether e is a direct call of std's checkedAdd, checkedSub or checkedMul on int, i32, u32 or u64:
+// its kind and operation, else kind -1.
+fn (g: &Gen) checkedOp(e: int): ArOp {
+    let none = ArOp{k: -1, op: 0, wrap: false}
+    let n = g.u.nodes[e]
+    if n.k != ir.E_CALL || g.u.listLen(n.b) != 2 { return none }
+    let c = n.a
+    if g.u.nk(c) != ir.E_DECAY || g.u.nk(g.u.nodes[c].a) != ir.E_FUNC { return none }
+    let f = g.u.nodes[g.u.nodes[c].a].a
+    if f < g.u.nRtFuncs || g.u.funcs[f].isExtern { return none }
+    let nm = &g.u.funcs[f].name
+    if len(nm) < 18 || strByte(nm, 0) != 'f' { return none }
+    let us = strFindByte(nm, 0, '_')
+    if us < 2 { return none }
+    let tail = nm[us..len(nm)]
+    var k = -1
+    var op = -1
+    if tail == "_std_int_checkedAdd" { k = ir.TY_I64; op = ir.OP_ADD }
+    else if tail == "_std_int_checkedSub" { k = ir.TY_I64; op = ir.OP_SUB }
+    else if tail == "_std_int_checkedMul" { k = ir.TY_I64; op = ir.OP_MUL }
+    else if tail == "_std_i32_checkedAdd" { k = ir.TY_I32; op = ir.OP_ADD }
+    else if tail == "_std_i32_checkedSub" { k = ir.TY_I32; op = ir.OP_SUB }
+    else if tail == "_std_i32_checkedMul" { k = ir.TY_I32; op = ir.OP_MUL }
+    else if tail == "_std_u32_checkedAdd" { k = ir.TY_U32; op = ir.OP_ADD }
+    else if tail == "_std_u32_checkedSub" { k = ir.TY_U32; op = ir.OP_SUB }
+    else if tail == "_std_u32_checkedMul" { k = ir.TY_U32; op = ir.OP_MUL }
+    else if tail == "_std_u64_checkedAdd" { k = ir.TY_U64; op = ir.OP_ADD }
+    else if tail == "_std_u64_checkedSub" { k = ir.TY_U64; op = ir.OP_SUB }
+    else if tail == "_std_u64_checkedMul" { k = ir.TY_U64; op = ir.OP_MUL }
+    else { return none }
+    let ps = &g.u.funcs[f].params
+    if len(ps) != 2 || g.tk(g.u.locals[ps[0]].ty) != k || g.tk(g.u.locals[ps[1]].ty) != k { return none }
+    if !g.isAggr(n.ty) || g.size(n.ty) != 16 { return none }
+    return ArOp{k: k, op: op, wrap: false}
+}
+
+// Generates std's checkedAdd/checkedSub/checkedMul inline using hardware overflow/carry flags,
+// storing the Option[T] ({tag: 0 Some / 1 None, val}) into dest (if on the frame) or a temp.
+fn (g: mut &Gen) genCheckedOp(e: int, ar: ArOp, dest: x64.Mem): bool {
+    let n = g.u.nodes[e]
+    let a = g.u.listAt(n.b, 0)
+    let b = g.u.listAt(n.b, 1)
+    let k = ar.k
+    let sz = if k == ir.TY_I64 || k == ir.TY_U64 { 8 } else { 4 }
+    let sgn = k == ir.TY_I64 || k == ir.TY_I32
+    let src = if ar.op == ir.OP_SUB { g.pairSrc(a, b) } else { g.pairSrcC(a, b) }
+    var cc = x64.CC_O
+    if ar.op == ir.OP_MUL {
+        if sgn {
+            g.imulSrc(sz, RAX, src)
+        } else {
+            g.srcRCX(src)
+            g.a.unary(x64.MUL, sz, RCX)
+        }
+    } else {
+        g.aluSrc(if ar.op == ir.OP_ADD { x64.ADD } else { x64.SUB }, sz, RAX, src)
+        if !sgn { cc = x64.CC_B }
+    }
+    let used = dest.base == RBP
+    let d = if used { dest } else { rbp(g.tempFor(n.ty)) }
+    g.a.setcc(cc, RCX)
+    g.a.zx(1, RCX, RCX)
+    g.a.store(8, d, RCX)
+    g.a.store(8, at(d, 8), RAX)
+    if !used { g.a.lea(RAX, d) }
+    return used
+}
+
 // The integer kind and operation of a checked or wrapping runtime arithmetic function
 // (rt_add_int, rt_wmul_u32, ...): kind -1 when name is not one.
 type ArOp = value record {
@@ -7975,6 +8049,11 @@ fn (g: mut &Gen) arithInto(e: int, r: int, gen: bool): bool {
 fn (g: mut &Gen) inlineRt(e: int, name: &str): bool {
     let n = g.u.nodes[e]
     let nargs = g.u.listLen(n.b)
+    if (name == "rt_cvs_i128" || name == "rt_cvu_u128") && nargs == 2 && g.isWhere(g.u.listAt(n.b, 1)) {
+        // i128 to i128 or u128 to u128: always fits
+        g.gen(g.u.listAt(n.b, 0))
+        return true
+    }
     if (name == "rt_cvs_u128" || name == "rt_cvu_i128") && nargs == 2 && g.isWhere(g.u.listAt(n.b, 1)) {
         // i128 to u128 or back: the value must not have the high bit (a negative i128, a u128
         // above i128's maximum)
@@ -7985,6 +8064,16 @@ fn (g: mut &Gen) inlineRt(e: int, name: &str): bool {
     }
     if strings.endsWith(&name, "_u128") && g.inlineU128(e, name[3..len(name) - 5], nargs) { return true }
     if strings.endsWith(&name, "_i128") && g.inlineI128(e, name[3..len(name) - 5], nargs) { return true }
+    if name == "rt_cvs_int" && nargs == 2 && g.isWhere(g.u.listAt(n.b, 1)) && !g.cvInline(e) &&
+        g.is128(g.u.nodes[g.u.listAt(n.b, 0)].ty) && g.u.isSigned(g.u.nodes[g.u.listAt(n.b, 0)].ty) {
+        // i128 to int: high word must equal sign extension of low word
+        g.gen(g.u.listAt(n.b, 0))
+        g.a.movRR(8, RCX, RDX)
+        g.a.cqo()
+        g.a.alu(x64.CMP, 8, RCX, RDX)
+        g.a.jcc(x64.CC_NE, g.stub(10, "conversion out of range", g.u.listAt(n.b, 1)))
+        return true
+    }
     if name == "rt_cvu_u64" && nargs == 2 && g.isWhere(g.u.listAt(n.b, 1)) &&
         g.is128(g.u.nodes[g.u.listAt(n.b, 0)].ty) {
         // u128 to u64: the high word must be zero
