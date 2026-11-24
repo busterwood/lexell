@@ -92,8 +92,9 @@ id name  price
 
 ## The same table from an Oracle client
 
-In the Oracle door a user is a schema. The PostgreSQL door's `public` schema is `PUBLIC`, and its tables are also found
-by their bare names. Under
+In the Oracle door a user is a schema, made at the login's first connection. A bare name is looked for in the login's
+own schema, then in the PostgreSQL door's `public` schema, so `fruit` finds the table above (and the tables the login
+makes there are in its own schema: see [Schemas](connect/oracle.md#schemas)). Under
 `trust` an Oracle login with no password set uses its own user name as the password, as the driver sends it (JDBC
 and SQLcl send it upper-cased):
 
@@ -103,7 +104,7 @@ sql sa/SA@127.0.0.1:1521/lexdb
 
 <!-- example: oracle -->
 ```sql
-SELECT id, name, price FROM public.fruit ORDER BY id;
+SELECT id, name, price FROM fruit ORDER BY id;
 ```
 
 ```text
