@@ -40,6 +40,11 @@ parameter:
 - A procedure is called from a block (`my_proc(1, 2);`), with `CALL`, or with `EXEC`: see [CALL](call.md). Arguments
   go by position, or by name (`p_id => 2`) after the positional ones.
 - A procedure may call itself and other procedures.
+- A body that does not compile (a call of a procedure that does not exist, an unknown identifier) does not stop the
+  statement: the procedure is stored **invalid**, and SQL\*Plus says "Warning: Procedure created with compilation
+  errors." `USER_OBJECTS.STATUS` is `INVALID`, and `USER_ERRORS` and `ALL_ERRORS` hold the `PLS-` errors with their
+  line and position. `CALL` of an invalid procedure is ORA-06575, and a block that names it is ORA-06550 with
+  PLS-00905. [ALTER PROCEDURE ... COMPILE](alter-procedure.md) compiles it again (example F).
 - `USER_OBJECTS` lists the procedure, and `USER_SOURCE` its text: see the
   [data dictionary](data-dictionary-programs.md).
 
@@ -201,6 +206,50 @@ RAISE_PAY   PROCEDURE   VALID
 SWAP        PROCEDURE   VALID
 
 4 rows selected.
+```
+
+### F. A procedure that does not compile
+
+<!-- example: oracle -->
+```sql
+CREATE PROCEDURE report AS
+BEGIN
+  nothere(1);
+END;
+/
+SELECT object_name, status FROM user_objects WHERE object_name = 'REPORT';
+SELECT line, position, text FROM user_errors WHERE name = 'REPORT';
+CALL report();
+BEGIN
+  report;
+END;
+/
+```
+
+```text
+Warning: Procedure created with compilation errors.
+
+OBJECT_NAME STATUS
+----------- -------
+REPORT      INVALID
+
+1 row selected.
+
+LINE POSITION TEXT
+---- -------- ------------------------------------------------
+   3        3 PLS-00201: identifier 'NOTHERE' must be declared
+   3        3 PL/SQL: Statement ignored
+
+2 rows selected.
+
+ERROR:
+ORA-06575: Package or function REPORT is in an invalid state
+
+ERROR:
+ORA-06550: line 2, column 1:
+PLS-00905: object SA.REPORT is invalid
+ORA-06550: line 2, column 1:
+PL/SQL: Statement ignored
 ```
 
 ## See also
