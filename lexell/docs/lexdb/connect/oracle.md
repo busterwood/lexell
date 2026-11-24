@@ -40,9 +40,35 @@ TCP only. There is no separate listener process and no `listener.ora`: lexdb is 
   the name: JDBC and SQLcl upper-case an unquoted user name, so the password of `sa` is `SA` there; Lexell's
   `oracle` module sends the name as written, so it is `sa`. A user with a password set logs in with that password.
 - `SYS` and `AS SYSDBA` logins are refused.
-- **A user is a schema**, as in Oracle. The user `sa` owns schema `SA`, and unqualified names are looked up there.
-  Tables made in the PostgreSQL door's `public` schema are found by their bare name too, or as `PUBLIC.name`. `ALTER SESSION SET
-  CURRENT_SCHEMA` changes the default schema.
+- **A user is a schema**, as in Oracle. A login's first connection makes the schema of its name (`sa` works in schema
+  `SA`). See [Schemas](#schemas) below.
+
+## Schemas
+
+The Oracle door shares one store and one catalog with the other two doors, and looks names up like this:
+
+- A name without a schema is looked for in the login's own schema first, then in `public`, the PostgreSQL door's
+  schema (which the SQL Server door calls `dbo`). `public` takes the part of Oracle's `PUBLIC` synonyms: its tables
+  are found by their bare name, or as `public.name`.
+- A table, view, sequence or program the login makes is made in its own schema. A table of the same name in `public`
+  does not stop it (no ORA-00955), and the login's own table is the one a bare name finds.
+- Another user's objects are `user.name`. `ALTER SESSION SET CURRENT_SCHEMA` changes the default schema.
+
+The other doors see the Oracle door's objects by schema and by the name in upper case, which is how the Oracle door
+stores a name that was not quoted. A table that the login `sa` made with `CREATE TABLE city` is `sa."CITY"` in the
+PostgreSQL door and `sa.CITY` in the SQL Server door; neither finds it as `city` or in `public`/`dbo`. In the other
+direction, a table made in the PostgreSQL or SQL Server door is in `public`, and the Oracle door finds it as `city`
+or `public.city` (its columns come back in lower case, as they were made).
+
+```sql
+-- PostgreSQL door:                     SELECT * FROM sa."CITY";
+-- SQL Server door:                     SELECT * FROM sa.CITY;
+-- Oracle door, a table of public:      SELECT * FROM public.city;
+```
+
+A login's schema is made when the login first connects through the Oracle door, so a role that has not connected
+there has none. Objects that an older lexdb made for the login `sa` stay in `public`, and are still found there.
+`CREATE USER` makes the schema of the new user at once.
 
 ## TCPS (TLS)
 
