@@ -77,6 +77,8 @@ UPDATE
   otherwise.
 - An `IDENTITY` column cannot be updated (error 544). A computed column cannot be set.
 - `@@ROWCOUNT` is the number of rows changed. With `SET NOCOUNT ON` the client gets no `(n rows affected)`.
+- A subquery in `SET` or `OUTPUT` sees the table as it was when the statement began, not the rows the statement has
+  already changed (example D).
 - With `FROM`, a target row that joins to several rows is changed once, with the values of one of them.
 - Every read-write transaction is serializable: an `UPDATE` whose rows another transaction changed and committed
   meanwhile fails with error 1205, to be run again.
@@ -211,6 +213,40 @@ Ann  6405.00 15
 Bob  4200.00 5
 Cid  6405.00 0
 Dee  6405.00 0
+
+(4 rows affected)
+```
+
+A subquery reads the table as the statement found it. Here each employee takes twice the pay of the manager, and the
+managers change in the same statement:
+
+<!-- example: tsql -->
+```sql
+CREATE TABLE dbo.staff (id int PRIMARY KEY, boss int, pay int);
+INSERT dbo.staff VALUES (1, NULL, 100), (2, 1, 200), (3, 2, 300), (4, 3, 400);
+UPDATE s SET pay = (SELECT b.pay * 2 FROM dbo.staff AS b WHERE b.id = s.boss)
+OUTPUT inserted.id, inserted.pay
+FROM dbo.staff AS s WHERE s.boss IS NOT NULL;
+SELECT id, pay FROM dbo.staff ORDER BY id;
+```
+
+```text
+(4 rows affected)
+
+id pay
+-- ---
+2  200
+3  400
+4  600
+
+(3 rows affected)
+
+id pay
+-- ---
+1  100
+2  200
+3  400
+4  600
 
 (4 rows affected)
 ```
