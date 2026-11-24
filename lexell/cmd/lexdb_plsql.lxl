@@ -23,6 +23,7 @@ import "./lexdb_store"
 import "./lexdb_oratext"
 import "./lexdb_time"
 import "./lexdb_parse"
+import "./lexdb_routine"
 
 type DbErr = lexdb_base.DbErr
 type Val = lexdb_sql.Val
@@ -357,7 +358,7 @@ const U_PKG = 4
 const U_VAR = 5         // (a SigEntry only) a package's public variable or constant
 
 // A compiled unit: a block, a procedure or a function.
-type PUnit = record {
+pub type PUnit = record {
     owner: str
     name: str
     kind: int
@@ -534,6 +535,7 @@ pub type Ip = record {
     outOn: bool
     outPart: str            // PUT's partial line
     scache: []Option[Stmt]
+    scalls: []int           // per statement of scache: 0 not looked at, 1 it calls no stored function, 2 it does (lexdb_plcall)
     stored: []Stored
     storedVer: int
     storedOk: bool
@@ -563,7 +565,7 @@ pub type Ip = record {
 }
 
 pub fn newIp(st: lexdb_store.Store): Ip {
-    return Ip{st: st, out: [], outOn: false, outPart: "", scache: [], stored: [], storedVer: -1, storedOk: false,
+    return Ip{st: st, out: [], outOn: false, outPart: "", scache: [], scalls: [], stored: [], storedVer: -1, storedOk: false,
               curs: [], results: [], nls: [], user: "", sqlRows: 0, sqlFound: -1, errCode: 0, errMsg: "", depth: 0, uid: 0, sps: false, sp0: false,
               exitLabel: "", ctl: [], curErr: plErr("", ""), outPos: 0, outBytes: 0, arrOut: [], outLimit: 20000, keep: 0, pkgs: [], ddl: 0, lines: 0}
 }
@@ -1219,6 +1221,25 @@ fn (cx: &Cx) describeText(sess: mut &lexdb_exec.Session, sql: &str): Result[[]le
     if len(stmts) != 1 { return Err(plErr("42601", "SQL command not properly ended")) }
     var pts: []int = []
     for t in cx.slotPt { append(mut &pts, oidOf(&t)) }
+    if len(cx.sigs) > 0 {
+        // a call of a stored function is described as lexdb_plcall will run it: a lookup of the function's type
+        let mapped = lexdb_routine.mapStmt(&stmts[0], fn(x: &lexdb_sql.Expr): Option[lexdb_sql.Expr] {
+            match x {
+                lexdb_sql.Expr.Call(nm, args, star) {
+                    if star || len(nm) == 0 || nm[0] == '#' { return None }
+                    var names: []str = []
+                    for part in strings.split(&strings.replaceAll(&nm, lexdb_sql.QSEP, "."), ".") { append(mut &names, strings.toUpperAscii(&part)) }
+                    let sg = cx.sigOf(&names)
+                    if !sg.found || sg.kind != U_FUNC { return None }
+                    var xs: []lexdb_sql.Expr = [lexdb_sql.Expr.Lit(Val.Text(sg.canon[0] + "." + (if len(sg.canon[1]) > 0 { sg.canon[1] + "." } else { "" }) + sg.canon[2]))]
+                    for a in args { append(mut &xs, lexdb_sql.cloneExpr(&a)) }
+                    return Some(lexdb_sql.Expr.Cast(lexdb_sql.Expr.Call("#plf", xs, false), lexdb_sql.oidType(oidOf(&sg.ret))))
+                }
+                else { return None }
+            }
+        })
+        return sess.describe(&mapped, &pts)
+    }
     return sess.describe(&stmts[0], &pts)
 }
 
@@ -2698,7 +2719,7 @@ const F_EXIT = 1
 const F_CONT = 2
 const F_RET = 3
 
-type Fr = record { vals: []Val; oids: []int; ret: Val; line: int; hasRet: bool }
+pub type Fr = record { vals: []Val; oids: []int; ret: Val; line: int; hasRet: bool }
 
 fn newFr(u: &PUnit): Fr {
     var f = Fr{vals: [], oids: [], ret: Val.Null, line: 0, hasRet: false}
@@ -2899,10 +2920,12 @@ fn ctl(ip: mut &Ip, sess: mut &lexdb_exec.Session, k: int): Result[Unit, DbErr] 
 
 fn ensureStmt(ip: mut &Ip, sid: int, sql: &str): Result[Unit, DbErr] {
     while len(ip.scache) <= sid { append(mut &ip.scache, None) }
+    while len(ip.scalls) <= sid { append(mut &ip.scalls, 0) }
     match ip.scache[sid] {
         Some(_) { return Ok(Unit{}) }
         None {}
     }
+    ip.scalls[sid] = 0
     let text = lexdb_oratext.oracleSql(sql)
     var stmts = try lexdb_parse.oraParseNls(&text, cloneStrs(&ip.nls))
     if len(stmts) != 1 { return Err(plErr("42601", "SQL command not properly ended")) }
@@ -2948,14 +2971,56 @@ fn postRun(ip: mut &Ip, sess: mut &lexdb_exec.Session, write: bool, inTx: bool, 
     }
 }
 
+// The hook lexdb_plcall sets: a statement of a block that calls stored functions, its calls written as lookups and computed first (None: it
+// calls none). lexdb_plcall imports this module, so the module cannot name it.
+var SQL_HOOK: once []fn(&Prog, mut &Ip, mut &lexdb_exec.Session, &PUnit, mut &Fr, &Stmt, &[]Val, &[]int): Result[Option[lexdb_exec.Res], DbErr]
+
+pub fn setSqlHook(f: fn(&Prog, mut &Ip, mut &lexdb_exec.Session, &PUnit, mut &Fr, &Stmt, &[]Val, &[]int): Result[Option[lexdb_exec.Res], DbErr]) {
+    if !SQL_HOOK.isSet() { SQL_HOOK.set([f]) }
+}
+
+// A statement of a block run: through the hook when the program has stored units (one that calls none is run as it is).
+fn runViaHook(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, fr: mut &Fr, st: &Stmt, vals: &[]Val, oids: &[]int): Result[Option[lexdb_exec.Res], DbErr] {
+    if len(pg.units) == 0 || !SQL_HOOK.isSet() { return Ok(None) }
+    return SQL_HOOK.get()[0](pg, ip, sess, u, fr, st, vals, oids)
+}
+
+// The statement of a block (a dynamic one has no number: sid < 0), run with these values.
+fn runStmt(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, fr: mut &Fr, sid: int, st: &Stmt, vals: &[]Val, oids: &[]int): Result[lexdb_exec.Res, DbErr] {
+    if len(pg.units) > 0 && (sid < 0 || ip.scalls[sid] != 1) {
+        // (the statement and its values are copied: a function the hook calls may change the frame and the cache)
+        let st2 = st.clone()
+        let vs = cloneRow(vals)
+        let os = cloneInts(oids)
+        match try runViaHook(pg, ip, sess, u, fr, &st2, &vs, &os) {
+            Some(r) {
+                if sid >= 0 { ip.scalls[sid] = 2 }
+                return Ok(r)
+            }
+            None { if sid >= 0 { ip.scalls[sid] = 1 } }
+        }
+    }
+    return sess.run(st, vals, oids)
+}
+
 // A statement of the unit run with the frame's values: write is a DML statement.
-fn runSql(ip: mut &Ip, sess: mut &lexdb_exec.Session, sid: int, sql: &str, fr: &Fr, write: bool): Result[lexdb_exec.Res, DbErr] {
+fn runSql(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, sid: int, sql: &str, fr: mut &Fr, write: bool): Result[lexdb_exec.Res, DbErr] {
     try ensureStmt(ip, sid, sql)
     let inTx = try preRun(ip, sess, write)
     var r: Result[lexdb_exec.Res, DbErr] = Err(plErr("XX000", ""))
-    match &ip.scache[sid] {
-        Some(s) { r = sess.run(s, &fr.vals, &fr.oids) }
-        None {}
+    if len(pg.units) > 0 && ip.scalls[sid] != 1 {
+        let st = match &ip.scache[sid] {
+            Some(s) { s.clone() }
+            None { lexdb_sql.newStmt(lexdb_sql.S_EMPTY) }
+        }
+        let vs = cloneRow(&fr.vals)
+        let os = cloneInts(&fr.oids)
+        r = runStmt(pg, ip, sess, u, fr, sid, &st, &vs, &os)
+    } else {
+        match &ip.scache[sid] {
+            Some(s) { r = sess.run(s, &fr.vals, &fr.oids) }
+            None {}
+        }
     }
     postRun(ip, sess, write, inTx, r.isOk())
     return r
@@ -3077,7 +3142,7 @@ fn eval(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, x: &P,
         return Ok(v.clone())
     }
     if x.flag { syncSys(ip, fr) }
-    let rr = runSql(ip, sess, x.sid, &x.sql, fr, false)
+    let rr = runSql(pg, ip, sess, u, x.sid, &x.sql, fr, false)
     match rr {
         Ok(_) {}
         Err(e) {
@@ -3364,9 +3429,9 @@ fn exec_forcur(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit,
                 let v = try eval(pg, ip, sess, u, &p.x[i], fr)
                 if i < len(cd.params) { try assign(u, fr, cd.params[i], v) }
             }
-            res = try runSql(ip, sess, cd.q.sid, &cd.q.sql, fr, false)
+            res = try runSql(pg, ip, sess, u, cd.q.sid, &cd.q.sql, fr, false)
         } else {
-            res = try runSql(ip, sess, p.x[0].sid, &p.x[0].sql, fr, false)
+            res = try runSql(pg, ip, sess, u, p.x[0].sid, &p.x[0].sql, fr, false)
         }
         ip.sqlRows = 0
         for ri in 0..len(res.rows) {
@@ -3502,11 +3567,11 @@ fn execSql(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: 
     }
     if sub == SQ_OTHER {
         if strings.startsWith(&(strings.toUpperAscii(&p.sql)), "SET") { return Ok(F_NEXT) }
-        let r = try runSql(ip, sess, p.sid, &p.sql, fr, true)
+        let r = try runSql(pg, ip, sess, u, p.sid, &p.sql, fr, true)
         return Ok(F_NEXT)
     }
     if sub == SQ_DML || sub == SQ_RETURNING {
-        var r = try runSql(ip, sess, p.sid, &p.sql, fr, true)
+        var r = try runSql(pg, ip, sess, u, p.sid, &p.sql, fr, true)
         let n = tagCount(&r.tag)
         ip.sqlRows = n
         ip.sqlFound = if n > 0 { 1 } else { 0 }
@@ -3519,7 +3584,7 @@ fn execSql(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: 
         return Ok(F_NEXT)
     }
     // SELECT ... INTO
-    var r = try runSql(ip, sess, p.sid, &p.sql, fr, false)
+    var r = try runSql(pg, ip, sess, u, p.sid, &p.sql, fr, false)
     if len(r.rows) == 0 {
         ip.sqlRows = 0
         ip.sqlFound = 0
@@ -3615,9 +3680,9 @@ fn openCur(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: 
             let v = try eval(pg, ip, sess, u, &p.x[i], fr)
             if i < len(cd.params) { try assign(u, fr, cd.params[i], v) }
         }
-        res = try runSql(ip, sess, cd.q.sid, &cd.q.sql, fr, false)
+        res = try runSql(pg, ip, sess, u, cd.q.sid, &cd.q.sql, fr, false)
     } else if !p.flag {
-        res = try runSql(ip, sess, p.x[0].sid, &p.x[0].sql, fr, false)
+        res = try runSql(pg, ip, sess, u, p.x[0].sid, &p.x[0].sql, fr, false)
     } else {
         let tv = try eval(pg, ip, sess, u, &p.x[0], fr)
         let text = try dynSql(&tv)
@@ -3626,7 +3691,7 @@ fn openCur(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: 
         let st = try statementOf(&text, &ip.nls)
         let ptypes = usingOids(&vals)
         let inTx = try preRun(ip, sess, false)
-        let r = sess.run(&st, &vals, &ptypes)
+        let r = runStmt(pg, ip, sess, u, fr, -1, &st, &vals, &ptypes)
         postRun(ip, sess, false, inTx, r.isOk())
         res = try r
     }
@@ -3934,7 +3999,7 @@ fn execImm(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: 
         return Ok(F_NEXT)
     }
     let inTx = try preRun(ip, sess, write)
-    let r = sess.run(&st, &vals, &ptypes)
+    let r = runStmt(pg, ip, sess, u, fr, -1, &st, &vals, &ptypes)
     postRun(ip, sess, write, inTx, r.isOk())
     let res = try r
     if write {
@@ -4454,6 +4519,28 @@ pub fn findFunction(pg: &Prog, ip: &Ip, name: &str): Option[FnInfo] {
     if u.kind != U_FUNC || len(u.bad) > 0 { return None }
     let o = oidOf(&u.ret)
     return Some(FnInfo{id: u.owner + "." + (if len(u.pkg) > 0 { u.pkg + "." } else { "" }) + u.name, ret: lexdb_sql.oidType(o), oid: o})
+}
+
+// The unit and the frame of a statement that is not in a block (lexdb_plcall's callers' stand-ins).
+pub fn noUnit(): PUnit { return emptyUnit() }
+
+pub fn noFrame(): Fr { return Fr{vals: [], oids: [], ret: Val.Null, line: 0, hasRet: false} }
+
+// A stored function called with these values from the SQL of a block (its unit u and frame fr), as a call in the block is: its package
+// variables go through the session's copy, and the block's state (cursors, savepoints, depth) is as it was. id: owner.[package.]name.
+pub fn callFunctionIn(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, fr: mut &Fr, id: &str, args: &[]Val): Result[Val, DbErr] {
+    var p = node(K_CALL, fr.line)
+    let parts = strings.split(id, ".")
+    if len(parts) == 2 { p.names = [parts[0].toStr(), "", parts[1].toStr()] } else { p.names = [parts[0].toStr(), parts[1].toStr(), parts[2].toStr()] }
+    for a in args {
+        var x = node(K_EXPR, fr.line)
+        x.isLit = true
+        x.lit = a.clone()
+        append(mut &p.x, x)
+        append(mut &p.names2, "")
+        append(mut &p.slots, -1)
+    }
+    return callUnit(pg, ip, sess, u, &p, fr)
 }
 
 // A stored function called with these values: its result, or the error it raised.

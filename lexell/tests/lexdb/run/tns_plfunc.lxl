@@ -1,0 +1,170 @@
+// lexdb over TNS: stored functions called in the SQL of a PL/SQL block and in INSERT, UPDATE, DELETE and CREATE TABLE AS statements, checked against
+// Oracle Database Free 23.26 (gen_oracle.py --check tns_plfunc: the answers below are Oracle's): SELECT ... INTO, the query of a cursor FOR loop, an
+// explicit cursor, a REF CURSOR and dynamic SQL, INSERT ... VALUES and ... SELECT, UPDATE and DELETE with the call in SET, WHERE or the select list, a
+// standalone function and a package's, a function that runs SQL of its own, calls another or changes a package variable, NULL, bind variables, a function's
+// error, NO_DATA_FOUND (NULL in SQL) and TOO_MANY_ROWS; the same outside a block. A block that is in a transaction rolled back by the test.
+// Each statement runs with set lexdb_batch = off (the row engine) and on: "same" and the answer, or DIFFERENT and both.
+// expect: setup: 13 statements
+// expect: same: 0 / K,V = 2|'into';1|'one'
+// expect: same: 0 / K,V = 1|'one';2|'pkg'
+// expect: same: 0 / K,V = 12|'loop';1|'one'
+// expect: same: 0 / K,V = 10|'loopw';1|'one'
+// expect: same: 0 / K,V = 2|'cursor';1|'one'
+// expect: same: 0 / A,C = 1|20;2|20;3|30
+// expect: same: 0 / K,V = 1|'one';2|'refc'
+// expect: same: 0 / K,V = 4|'dyn';1|'one'
+// expect: same: 0 / K,V = 42|'dynbind';1|'one'
+// expect: same: 0 / K,V = 8|'dynins';1|'one'
+// expect: same: 0 / K,V = 2|'ins1';1|'one'
+// expect: same: 0 / K,V = 6|'ins2';1|'one'
+// expect: same: 0 / K,V = 1|'one';2|'sel';4|'sel'
+// expect: same: 0 / A,C = 1|10;2|40;3|30
+// expect: same: 0 / A,C = 1|20;2|40;3|60
+// expect: same: 0 / A,C = 1|10;2|40;3|30
+// expect: same: 0 / A,C = 1|10;3|30
+// expect: same: 0 / K,V = 2|'one'
+// expect: same: 0 / K,V = 1|'one';1|'rc'
+// expect: same: 0 / K,V = 16|'bind';1|'one'
+// expect: same: 0 / K,V = NULL|'null';1|'one'
+// expect: same: 0 / K,V = 1|'n2';1|'one'
+// expect: same: 0 / K,V = 5|'fg';1|'one'
+// expect: same: 0 / K,V = 1|'one';11|'pk1';11|'pk2'
+// expect: same: 0 / K,V = 1|'one';23|'pk3'
+// expect: same: error 20001
+// expect: same: 0 / K,V = -20001|'err';1|'one'
+// expect: same: 0 / K,V = -1|'nodata';1|'one'
+// expect: same: 0 / K,V = -2|'many';1|'one'
+// expect: same: error 20001
+// expect: same: 3 / K,V = 1|'one';2|'top';4|'top';6|'top'
+// expect: same: 1 / A,C = 1|10;2|40;3|30
+// expect: same: 1 / A,C = 1|10;2|40;3|30
+// expect: same: 1 / A,C = 1|10;3|30
+// expect: same: 3 / X,T = 2|'n1';4|'n2';6|'n3' / 0
+// expect: same: error 20001
+// expect: same: FF(A) = 2;4;6
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+const SETUP = "create table ft (a number, c number)\ncreate table fu (k number, v varchar2(10))\ninsert into ft values (1, 10)\ninsert into ft values (2, 20)\ninsert into ft values (3, 30)\ninsert into fu values (1, 'one')\ncreate or replace function ff(x number) return number is begin return x * 2; end;\ncreate or replace function fg(x number) return number is v number; begin select ff(x) + 1 into v from dual; return v; end;\ncreate or replace function fbad(x number) return number is v varchar2(5); begin select v into v from fu where k = x; return 1; end;\ncreate or replace function fraise(x number) return number is begin if x > 1 then raise_application_error(-20001, 'too big'); end if; return x; end;\ncreate or replace function ftxt(x number) return varchar2 is begin return 'n' || x; end;\ncreate or replace package fk as g number := 0; function bump(x number) return number; function twice(x number) return number; end fk;\ncreate or replace package body fk as function bump(x number) return number is begin g := g + x; return g; end; function twice(x number) return number is begin return x * 2; end; end fk;"
+
+const QS = "declare v number; begin select ff(a) into v from ft where a = 1; insert into fu values (v, 'into'); end; ;; select k, v from fu order by v, k\ndeclare v number; begin select fk.twice(a) into v from ft where a = 1; insert into fu values (v, 'pkg'); end; ;; select k, v from fu order by v, k\ndeclare n number := 0; begin for r in (select ff(a) y from ft order by a) loop n := n + r.y; end loop; insert into fu values (n, 'loop'); end; ;; select k, v from fu order by v, k\ndeclare n number := 0; begin for r in (select ff(a) y from ft where ff(a) > 2 order by a) loop n := n + r.y; end loop; insert into fu values (n, 'loopw'); end; ;; select k, v from fu order by v, k\ndeclare v number; cursor cu is select ff(a) from ft order by a; begin open cu; fetch cu into v; close cu; insert into fu values (v, 'cursor'); end; ;; select k, v from fu order by v, k\ndeclare cursor cu is select a from ft order by a; x number; y number; begin open cu; fetch cu into x; update ft set c = ff(c) where a = x; fetch cu into y; insert into fu values (x * 100 + y, 'open'); close cu; end; ;; select a, c from ft order by a\ndeclare c1 sys_refcursor; v number; begin open c1 for select ff(a) from ft order by 1; fetch c1 into v; insert into fu values (v, 'refc'); close c1; end; ;; select k, v from fu order by v, k\ndeclare v number; begin execute immediate 'select ff(a) from ft where a = 2' into v; insert into fu values (v, 'dyn'); end; ;; select k, v from fu order by v, k\ndeclare v number; begin execute immediate 'select ff(:1) from dual' into v using 21; insert into fu values (v, 'dynbind'); end; ;; select k, v from fu order by v, k\nbegin execute immediate 'insert into fu values (ff(:1), ''dynins'')' using 4; end; ;; select k, v from fu order by v, k\nbegin insert into fu values (ff(1), 'ins1'); end; ;; select k, v from fu order by v, k\nbegin insert into fu values (fk.twice(3), 'ins2'); end; ;; select k, v from fu order by v, k\nbegin insert into fu select ff(a), 'sel' from ft where a < 3; end; ;; select k, v from fu order by v, k\nbegin update ft set c = ff(c) where a = 2; end; ;; select a, c from ft order by a\nbegin update ft set c = fk.twice(c); end; ;; select a, c from ft order by a\nbegin update ft set c = ff(c) where ff(a) = 4; end; ;; select a, c from ft order by a\nbegin delete from ft where ff(a) = 4; end; ;; select a, c from ft order by a\nbegin update fu set k = ff(k) where v = 'one'; end; ;; select k, v from fu order by v, k\ndeclare v number; begin update ft set c = ff(c) where ff(a) = 6; v := sql%rowcount; insert into fu values (v, 'rc'); end; ;; select k, v from fu order by v, k\ndeclare v number := 5; w number; begin select ff(v) + ff(a) into w from ft where a = 3; insert into fu values (w, 'bind'); end; ;; select k, v from fu order by v, k\ndeclare v number; begin select ff(null) into v from dual; insert into fu values (v, 'null'); end; ;; select k, v from fu order by v, k\ndeclare v varchar2(10); begin select ftxt(a) into v from ft where a = 2; insert into fu values (1, v); end; ;; select k, v from fu order by v, k\ndeclare v number; begin select fg(a) into v from ft where a = 2; insert into fu values (v, 'fg'); end; ;; select k, v from fu order by v, k\ndeclare v number; begin fk.g := 0; v := fk.bump(1); insert into fu values (fk.bump(10), 'pk1'); insert into fu values (fk.g, 'pk2'); end; ;; select k, v from fu order by v, k\ndeclare v number; begin fk.g := 20; select fk.bump(a) into v from ft where a = 3; insert into fu values (fk.g, 'pk3'); end; ;; select k, v from fu order by v, k\ndeclare v number; begin select fraise(a) into v from ft where a = 2; end;\ndeclare v number; e number; begin select fraise(a) into v from ft where a = 2; exception when others then e := sqlcode; insert into fu values (e, 'err'); end; ;; select k, v from fu order by v, k\ndeclare v number; begin select fbad(5) into v from dual; insert into fu values (nvl(v, -1), 'nodata'); end; ;; select k, v from fu order by v, k\ndeclare v number; begin select ff(a) into v from ft; exception when too_many_rows then insert into fu values (-2, 'many'); end; ;; select k, v from fu order by v, k\nbegin insert into fu values (fraise(2), 'bad'); end;\ninsert into fu select ff(a), 'top' from ft ;; select k, v from fu order by v, k\nupdate ft set c = ff(c) where a = 2 ;; select a, c from ft order by a\nupdate ft set c = ff(c) where ff(a) = 4 ;; select a, c from ft order by a\ndelete from ft where a = ff(1) ;; select a, c from ft order by a\ncreate table fc as select ff(a) x, ftxt(a) t from ft ;; select x, t from fc order by x ;; drop table fc\ninsert into fu values (fraise(3), 'bad')\nselect ff(a) from ft order by a"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows; or error and the number.
+fn qtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// A statement: its row count, or error and the number.
+fn xtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.run(&(sql.toStr()), &[]) {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn one(c: mut &oracle.Conn, sql: &str): str {
+    let low = strings.toLowerAscii(sql)
+    if strings.startsWith(&low, "select") || strings.startsWith(&low, "with") { return qtext(c, sql) }
+    return xtext(c, sql)
+}
+
+// A query, or statements ("a ;; b ;; c") in a transaction rolled back: each answer, joined by " / " (after an error, the
+// last part, the check, after the rollback).
+fn answer(c: mut &oracle.Conn, sqls: &str): str {
+    if !strings.contains(sqls, " ;; ") { return one(c, sqls) }
+    let parts = strings.split(sqls, " ;; ")
+    var out: []str = []
+    var failed = false
+    let r = c.transaction(fn(c2: mut &oracle.Conn): Result[int, oracle.Error] {
+        for i in 0..len(parts) {
+            if failed { break }
+            let a = one(c2, &parts[i])
+            if strings.startsWith(&a, "error") { failed = true }
+            append(mut &out, a)
+        }
+        return Err(sqldialect.inputError("rolled back"))
+    })
+    if failed { append(mut &out, one(c, &parts[len(parts) - 1])) }
+    return strings.join(&out, " / ")
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            let text: str = QS
+            for q in strings.lines(&text) {
+                let a = c.run(&("set lexdb_batch = off".toStr()), &[])
+                let off = answer(mut &c, &q)
+                let b = c.run(&("set lexdb_batch = on".toStr()), &[])
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(166), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

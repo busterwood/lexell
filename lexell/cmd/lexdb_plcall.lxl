@@ -5,8 +5,11 @@
 // arguments of each call (the block's FROM and the conditions of it that call no function, its select list replaced by the
 // arguments, DISTINCT) gives them; one that missed a combination gives it back and the query is run again. So a function runs once
 // for each distinct combination of arguments in a query, not once for each row (Oracle does not say how often: only that it may be
-// cached for a deterministic function), and not at all for rows no condition leaves. A call in a DML statement, an argument that
-// is an aggregate or calls another stored function, and a call of a function through a database link are not done.
+// cached for a deterministic function), and not at all for rows no condition leaves. The same holds for the SQL of a PL/SQL block (a
+// hook lexdb_plsql runs its statements through: runNested) and for INSERT, UPDATE and DELETE (their arguments are found by a query over
+// the target table and the conditions that call no function; a run that misses a combination ends the statement with an error, as it
+// cannot be run twice). An argument that is an aggregate or calls another stored function, a MERGE that calls a function, and a call
+// of a function through a database link are not done.
 import "strings"
 import "./lexdb_base"
 import "./lexdb_sql"
@@ -104,6 +107,7 @@ fn conjuncts(x: &Expr, out: mut &[]Expr) {
 // calls no function, the arguments as its select list, DISTINCT.
 fn driverOf(t: &Stmt, args: &[]Expr): Stmt {
     var d = t.clone()
+    if t.kind != lexdb_sql.S_SELECT { return driverOfDml(t, args) }
     d.kind = lexdb_sql.S_SELECT
     var items: []lexdb_sql.SelItem = []
     for i in 0..len(args) { append(mut &items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(lexdb_sql.cloneExpr(&args[i])), alias: "a" + i.toStr(), spell: "a" + i.toStr()}) }
@@ -121,6 +125,31 @@ fn driverOf(t: &Stmt, args: &[]Expr): Stmt {
     d.assign = []
     d.where = plain(&t.where)
     for i in 0..len(d.from) { d.from[i].on = plain(&t.from[i].on) }
+    return d
+}
+
+// The same for an INSERT (VALUES: no table), UPDATE or DELETE: the target table, then the statement's own FROM items, under the conditions
+// that call no function.
+fn driverOfDml(t: &Stmt, args: &[]Expr): Stmt {
+    var d = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
+    d.mdialect = t.mdialect
+    d.params = t.params
+    d.subs = t.subs.clone()
+    d.wins = t.wins.clone()
+    d.windows = t.windows.clone()
+    for i in 0..len(args) { append(mut &d.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(lexdb_sql.cloneExpr(&args[i])), alias: "a" + i.toStr(), spell: "a" + i.toStr()}) }
+    d.distinct = true
+    if t.kind == lexdb_sql.S_UPDATE || t.kind == lexdb_sql.S_DELETE {
+        append(mut &d.from, lexdb_sql.FromItem{table: t.table.clone(), alias: if len(t.alias) > 0 { t.alias.clone() } else { lexdb_sql.baseName(&t.table) },
+                                               join: lexdb_sql.J_FIRST, on: None, sub: -1, cols: [], work: -1, lateral: false, using: [], natural: false, comma: false})
+        for i in 0..len(t.from) {
+            var f = t.from[i].clone()
+            f.on = plain(&t.from[i].on)
+            if i == 0 { f.join = lexdb_sql.J_CROSS }
+            append(mut &d.from, f)
+        }
+        d.where = plain(&t.where)
+    }
     return d
 }
 
@@ -157,6 +186,7 @@ fn block(b: &Stmt, pg: &lexdb_plsql.Prog, ip: &lexdb_plsql.Ip, plan: mut &Plan, 
         }
     })
     if len(found) > 0 {
+        if t.kind == lexdb_sql.S_MERGE && failure.isNone() { failure = Some(err("0A000", "lexdb: a stored function called in a MERGE statement is not supported")) }
         if t.setop != 0 && failure.isNone() { failure = Some(err("0A000", "lexdb: a stored function of a column in the ORDER BY of a set operation is not supported")) }
         let driven = !(t.limit.isSome() && len(t.order) == 0)
         for k in 0..len(found) {
@@ -174,7 +204,8 @@ fn block(b: &Stmt, pg: &lexdb_plsql.Prog, ip: &lexdb_plsql.Ip, plan: mut &Plan, 
 
 // The query with each call of a stored function written as a lookup, and what it takes to fill them; None when it calls none.
 pub fn rewrite(pg: &lexdb_plsql.Prog, ip: &lexdb_plsql.Ip, s: &Stmt): Result[Option[Rewritten], DbErr] {
-    if !lexdb_plsql.hasUnits(pg) || s.kind != lexdb_sql.S_SELECT { return Ok(None) }
+    if !lexdb_plsql.hasUnits(pg) { return Ok(None) }
+    if s.kind != lexdb_sql.S_SELECT && s.kind != lexdb_sql.S_INSERT && s.kind != lexdb_sql.S_UPDATE && s.kind != lexdb_sql.S_DELETE && s.kind != lexdb_sql.S_MERGE && s.kind != lexdb_sql.S_CREATE { return Ok(None) }
     var plan = noPlan()
     var failure: Option[DbErr] = None
     let t = block(s, pg, ip, mut &plan, mut &failure)
@@ -194,11 +225,15 @@ fn oidOfSite(plan: &Plan, fnid: &str): int {
 }
 
 // The function computed for one combination of arguments (key: lexdb_ops.keyOfVals), kept for the query: the keys put are noted.
-fn compute(pg: &lexdb_plsql.Prog, ip: mut &lexdb_plsql.Ip, sess: mut &lexdb_exec.Session, plan: &Plan, fnid: &str, key: &str, put: mut &[]str): Result[Unit, DbErr] {
+// nested: the statement is a block's own SQL (unit cu, frame fr): the function is called as a call inside the block, so the block's
+// state (its cursors, savepoints, depth) is not touched; else it is run as a block of its own.
+fn compute(pg: &lexdb_plsql.Prog, ip: mut &lexdb_plsql.Ip, sess: mut &lexdb_exec.Session, cu: &lexdb_plsql.PUnit, fr: mut &lexdb_plsql.Fr, nested: bool,
+           plan: &Plan, fnid: &str, key: &str, put: mut &[]str): Result[Unit, DbErr] {
     if sess.plfHas(fnid, key) { return Ok(Unit{}) }
     let args = lexdb_ops.valsOfKey(key)
     var v = Val.Null
-    match lexdb_plsql.callFunction(pg, ip, sess, fnid, &args) {
+    let called = if nested { lexdb_plsql.callFunctionIn(pg, ip, sess, cu, fr, fnid, &args) } else { lexdb_plsql.callFunction(pg, ip, sess, fnid, &args) }
+    match called {
         Ok(x) { v = x }
         Err(e) {
             // (Oracle's SQL takes NO_DATA_FOUND out of a function as NULL; any other error ends the query with its ORA-06512 lines)
@@ -212,16 +247,23 @@ fn compute(pg: &lexdb_plsql.Prog, ip: mut &lexdb_plsql.Ip, sess: mut &lexdb_exec
     return Ok(Unit{})
 }
 
-fn runIn(pg: &lexdb_plsql.Prog, ip: mut &lexdb_plsql.Ip, sess: mut &lexdb_exec.Session, plan: &Plan, stmt: &Stmt, params: &[]Val, ptypes: &[]int,
-         pc: mut &lexdb_exec.PlanCache, put: mut &[]str): Result[lexdb_exec.Res, DbErr] {
+fn runIn(pg: &lexdb_plsql.Prog, ip: mut &lexdb_plsql.Ip, sess: mut &lexdb_exec.Session, cu: &lexdb_plsql.PUnit, fr: mut &lexdb_plsql.Fr, nested: bool,
+         plan: &Plan, stmt: &Stmt, params: &[]Val, ptypes: &[]int, pc: mut &lexdb_exec.PlanCache, put: mut &[]str): Result[lexdb_exec.Res, DbErr] {
+    let dml = stmt.kind != lexdb_sql.S_SELECT
     // the arguments the queries of the calls give
     for site in plan.sites {
         if !site.hasDriver { continue }
         match sess.run(&site.driver, params, ptypes) {
             Ok(res) {
-                for row in res.rows { try compute(pg, ip, sess, plan, &site.fnid, &lexdb_ops.keyOfVals(&row, 0), put) }
+                for row in res.rows { try compute(pg, ip, sess, cu, fr, nested, plan, &site.fnid, &lexdb_ops.keyOfVals(&row, 0), put) }
             }
-            Err(_) {}           // a shape that is not one (an outer reference): the misses of the run give them
+            Err(e) {
+                // a shape that is not one (an outer reference): the misses of the run give them; a statement that writes cannot be run twice
+                if dml {
+                    if len(stmt.subs) == 0 && len(stmt.inner) == 0 { return Err(e) }
+                    return Err(err("0A000", "lexdb: a stored function called in a subquery that reads the statement's table is not supported in INSERT, UPDATE and DELETE"))
+                }
+            }
         }
     }
     var pass = 0
@@ -230,24 +272,54 @@ fn runIn(pg: &lexdb_plsql.Prog, ip: mut &lexdb_plsql.Ip, sess: mut &lexdb_exec.S
         let r = sess.runCached(stmt, params, ptypes, pc)
         let misses = sess.plfMisses()
         if len(misses) == 0 { return r }
+        if dml { return Err(err("0A000", "lexdb: a stored function in an INSERT, UPDATE or DELETE was called with arguments the statement's rows did not give")) }
         if pass > 50 { return Err(err("54000", "lexdb: the stored functions in the query did not settle")) }
         for m in misses {
             let z = strings.indexOf(&m, "\x00", 0)
-            try compute(pg, ip, sess, plan, &m[0..z], &m[z + 1..len(m)], put)
+            try compute(pg, ip, sess, cu, fr, nested, plan, &m[0..z], &m[z + 1..len(m)], put)
         }
     }
     return Err(err("XX000", "unreachable"))
+}
+
+fn dropAll(sess: mut &lexdb_exec.Session, put: &[]str) {
+    for k in put {
+        let z = strings.indexOf(&k, "\x00", 0)
+        sess.plfDrop(&k[0..z], &k[z + 1..len(k)])
+    }
+    let rest = sess.plfMisses()
 }
 
 // The query run with its functions' values: computed first, and again where a run missed one; the values dropped after.
 pub fn run(pg: &lexdb_plsql.Prog, ip: mut &lexdb_plsql.Ip, sess: mut &lexdb_exec.Session, plan: &Plan, stmt: &Stmt, params: &[]Val, ptypes: &[]int,
            pc: mut &lexdb_exec.PlanCache): Result[lexdb_exec.Res, DbErr] {
     var put: []str = []
-    let r = runIn(pg, ip, sess, plan, stmt, params, ptypes, pc, mut &put)
-    for k in put {
-        let z = strings.indexOf(&k, "\x00", 0)
-        sess.plfDrop(&k[0..z], &k[z + 1..len(k)])
-    }
-    let rest = sess.plfMisses()
+    let cu = lexdb_plsql.noUnit()
+    var fr = lexdb_plsql.noFrame()
+    let r = runIn(pg, ip, sess, &cu, mut &fr, false, plan, stmt, params, ptypes, mut &pc, mut &put)
+    dropAll(sess, &put)
     return r
 }
+
+// A statement of a block (unit u, frame fr) run the same way: None when it calls no stored function (the block runs it as it is).
+pub fn runNested(pg: &lexdb_plsql.Prog, ip: mut &lexdb_plsql.Ip, sess: mut &lexdb_exec.Session, u: &lexdb_plsql.PUnit, fr: mut &lexdb_plsql.Fr,
+                 stmt: &Stmt, params: &[]Val, ptypes: &[]int): Result[Option[lexdb_exec.Res], DbErr] {
+    if !lexdb_plsql.hasUnits(pg) { return Ok(None) }
+    match try rewrite(pg, ip, stmt) {
+        None { return Ok(None) }
+        Some(x0) {
+            var x = x0
+            var pc = lexdb_exec.oneShot()
+            var put: []str = []
+            let r = runIn(pg, ip, sess, u, fr, true, &x.plan, &x.stmt, params, ptypes, mut &pc, mut &put)
+            dropAll(sess, &put)
+            match r {
+                Ok(res) { return Ok(Some(res)) }
+                Err(e) { return Err(e) }
+            }
+        }
+    }
+}
+
+// The hook lexdb_plsql runs the statements of its blocks through.
+pub fn install() { lexdb_plsql.setSqlHook(runNested) }
