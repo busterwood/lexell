@@ -6,13 +6,15 @@
 1. out/lxlc is built from compiler/seed/lxlc.c, as compiler/build.sh does (stage 1);
 2. rt.lxl must be up to date with rt.h (compiler/gen_rt.py --check);
 3. stage 1 builds the current sources (stage 2), stage 2 builds them again (stage 3);
-4. the C of stages 2 and 3 must be identical, and equal to the seed.
+4. the C of stages 2 and 3 must be identical, and equal to the seed;
+5. on x86-64 Linux, stage 1 builds the compiler natively, and that becomes out/lxlc, as
+   compiler/build.sh does: every later step of the gate uses the compiler as it is shipped.
 
 So the seed is the compiler that the sources describe, and it reproduces itself. Every gcc
 build goes through the tools/cbuild.py cache, so when nothing changed the check takes
 seconds. Run compiler/reseed.sh after changing the compiler.
 """
-import json, os, subprocess, sys, tempfile
+import json, os, platform, subprocess, sys, tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 COMP = os.path.normpath(os.path.join(HERE, '..', 'compiler'))
@@ -62,8 +64,17 @@ def main():
         fail("no fixed point: the C of stages 2 and 3 differ")
     if c2 != seed:
         fail("the seed is stale: stage 2's C differs from seed/lxlc.c (run compiler/reseed.sh)")
+    how = 'built from it'
+    if platform.system() == 'Linux' and platform.machine() == 'x86_64':
+        tmp = LXLC + '.native.tmp'
+        r = subprocess.run([LXLC, MAIN, '--native', '-o', tmp], capture_output=True, text=True,
+                           env=dict(os.environ, LXL_LIB=os.path.join(COMP, '..', 'lib')))
+        if r.returncode:
+            fail(f"out/lxlc cannot build the compiler natively:\n{r.stderr.strip()[:2000]}")
+        os.replace(tmp, LXLC)
+        how = 'built from it, then natively by that build (as compiler/build.sh)'
     print(f"seed/lxlc.c: fixed point, stage 2 == stage 3 == seed ({len(seed.encode())} bytes); "
-          f"out/lxlc built from it")
+          f"out/lxlc {how}")
 
 
 if __name__ == '__main__':

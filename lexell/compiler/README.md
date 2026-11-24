@@ -7,7 +7,7 @@ spec ([../SPEC.md](../SPEC.md)) and in the tests together. It compiles itself
 to a fixed point, and its own C is checked in as the seed, so a build needs
 only gcc.
 
-    lexell/compiler/build.sh                                   # out/lxlc from the C seed (gcc only)
+    lexell/compiler/build.sh                                   # out/lxlc from the C seed (gcc only), then natively
     lexell/compiler/reseed.sh                                  # after a compiler change: rebuild seed/lxlc.c, check the fixed point
     python3 lexell/tools/seed_check.py                         # the fixed point without writing the seed (the gate's first step)
     ./lxlc file.lxl [-O] [-o out] [--run] [-L root] [-- args]   # x86-64 ELF, no gcc (default)
@@ -186,15 +186,20 @@ blocks and each task's park location, for the exit 13 and 14 messages.
   the conformance suite, the compiler tests, the library tests and the
   red-team corpora under ASan+UBSan; no leaks (`LXL_CHECK=1`).
 - Seed: `seed/lxlc.c` is the compiler's own C at the fixed point (stage 2 and
-  stage 3 write the same C). `build.sh` builds `out/lxlc` from it with gcc
-  alone; `reseed.sh` rebuilds the seed from the sources with `out/lxlc` and
-  checks the fixed point. Run `reseed.sh` and commit the seed with every
+  stage 3 write the same C). `build.sh` builds it with gcc alone
+  (`out/lxlc.seed`), and on x86-64 Linux that build then compiles the
+  sources natively into `out/lxlc`, so the compiler runs as the native
+  backend compiles it (`LXL_SEED_ONLY=1` keeps the gcc build; so does a
+  failed native build). The gate's first step does the same. `reseed.sh`
+  rebuilds the seed from the sources with `out/lxlc` and checks the fixed
+  point. Run `reseed.sh` and commit the seed with every
   compiler change; the gate fails while the seed is stale. A language change
   the compiler's own source uses takes two rounds: implement it and reseed,
   then use it.
-- Speed: the compiler itself to C (`--emit-c`) in 0.48 s, to a complete
-  native executable in 0.70 s (direct best of 11; `compile.py -n 3` reports
-  0.65 s), both with the gcc-built out/lxlc (2026-11-08).
+- Speed: the compiler itself to C (`--emit-c`) in 0.30 s, to a complete
+  native executable in 0.51 s (best of 11, one core), with the native
+  out/lxlc; the gcc build of the seed is level with it (0.30 s and
+  0.51 s, 2026-11-24).
   A C build is then mostly gcc (9 s for the compiler).
 - By default `lxlc` writes an x86-64 ELF without gcc (design/native.md);
   `--c` selects the C backend. The native output is static, or dynamically linked when the program calls C
