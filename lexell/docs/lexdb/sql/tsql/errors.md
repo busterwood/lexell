@@ -49,7 +49,9 @@ feature, the number is **50000**.
 |---|---|
 | 515 | NULL in a `NOT NULL` column. |
 | 544 | An explicit value for an identity column while `IDENTITY_INSERT` is `OFF`. |
-| 547 | A `CHECK` or `FOREIGN KEY` constraint violated. |
+| 547 | A `CHECK` or `FOREIGN KEY` constraint violated, by a write or by `ALTER TABLE ... WITH CHECK` (`ADD`, `CHECK CONSTRAINT`) over rows that break it. |
+| 4917 | `CHECK CONSTRAINT` or `NOCHECK CONSTRAINT` of a name that is not a constraint of the table. |
+| 11415 | `CHECK CONSTRAINT` or `NOCHECK CONSTRAINT` of a key, which has no such state. |
 | 2627 | A `PRIMARY KEY` or `UNIQUE` constraint violated (a unique index gives the same). |
 | 8110 | A second `PRIMARY KEY` in `CREATE TABLE`. |
 | 1779 | A second `PRIMARY KEY` by `ALTER TABLE`. |
@@ -349,6 +351,38 @@ Msg 50000, Level 16, State 1, Line 1
 column reference "id" is ambiguous
 Msg 50000, Level 16, State 1, Line 1
 lexdb: CREATE TRIGGER is not supported yet (CREATE makes tables, views, indexes, schemas, sequences, types, roles and users)
+```
+
+### I. Constraint states
+
+<!-- example: tsql -->
+```sql
+CREATE TABLE dbo.sh (id int PRIMARY KEY, kg int);
+INSERT INTO dbo.sh VALUES (1, -1);
+GO
+ALTER TABLE dbo.sh ADD CONSTRAINT ck_kg CHECK (kg > 0);
+GO
+ALTER TABLE dbo.sh WITH NOCHECK ADD CONSTRAINT ck_kg CHECK (kg > 0);
+GO
+ALTER TABLE dbo.sh WITH CHECK CHECK CONSTRAINT ck_kg;
+GO
+ALTER TABLE dbo.sh NOCHECK CONSTRAINT nosuch;
+GO
+ALTER TABLE dbo.sh NOCHECK CONSTRAINT sh_pkey;
+GO
+```
+
+```text
+(1 row affected)
+
+Msg 547, Level 16, State 1, Line 1
+The INSERT statement conflicted with the CHECK constraint "ck_kg". The conflict occurred in database "lexdb", table "dbo.sh".
+Msg 547, Level 16, State 1, Line 1
+The INSERT statement conflicted with the CHECK constraint "ck_kg". The conflict occurred in database "lexdb", table "dbo.sh", column 'kg'.
+Msg 4917, Level 16, State 1, Line 1
+Constraint 'nosuch' does not exist.
+Msg 11415, Level 16, State 1, Line 1
+Object 'sh_pkey' cannot be disabled or enabled. This action applies only to foreign key and check constraints.
 ```
 
 ## See also
