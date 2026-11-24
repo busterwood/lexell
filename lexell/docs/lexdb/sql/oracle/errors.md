@@ -44,6 +44,8 @@ it.
 | ORA-02290 | A `CHECK` constraint violated. |
 | ORA-02291 | No parent key for a foreign key. |
 | ORA-02292 | A child row exists for a parent key being deleted. |
+| ORA-30926 | A `MERGE` target row that two source rows match. |
+| ORA-08006 | A `MERGE` row that `DELETE WHERE` has deleted and that a later source row matches. |
 | ORA-02260 | A second `PRIMARY KEY` in `CREATE TABLE`. |
 | ORA-02449 | A table dropped while other tables' foreign keys point at it (use `CASCADE CONSTRAINTS`). |
 | ORA-12899 | A string too long for the column. |
@@ -79,6 +81,9 @@ it.
 | PLS-00201 | An identifier that is not declared: a procedure or variable that does not exist. |
 | ORA-01403 | `SELECT ... INTO` found no row (`NO_DATA_FOUND`). |
 | ORA-01422 | `SELECT ... INTO` found more than one row (`TOO_MANY_ROWS`). |
+| PLS-00302, PLS-00363 | A component the package does not have (`pay.nothere`); a constant used as an assignment target. |
+| ORA-06553 | A statement of its own that names a package variable (`SELECT pay.g_count FROM dual`: PLS-221). |
+| ORA-04068 | A call into a package that another session compiled again since this session made its state. It is raised once; the next call runs on fresh variables. |
 | ORA-06512 | Added after another error: the line of the block where it was raised. |
 | ORA-20000 to ORA-20999 | `RAISE_APPLICATION_ERROR` with your own number; lexdb also uses ORA-20000 for some of its own refusals (a sequence at its limit, a savepoint outside a transaction). |
 | ORA-04042 | `GRANT EXECUTE` on a procedure that does not exist. |
@@ -321,6 +326,25 @@ BEGIN
 END;
 /
 CALL nothere();
+CREATE OR REPLACE PACKAGE cnt AS
+  n NUMBER := 0;
+  PROCEDURE bump;
+END cnt;
+/
+CREATE OR REPLACE PACKAGE BODY cnt AS
+  PROCEDURE bump IS
+  BEGIN
+    n := n + 1;
+  END;
+END cnt;
+/
+SELECT cnt.n FROM dual;
+BEGIN
+  cnt.bump;
+  cnt.n := cnt.n + 10;
+  DBMS_OUTPUT.PUT_LINE('n is ' || cnt.n);
+END;
+/
 ```
 
 ```text
@@ -345,6 +369,17 @@ ORA-06550: line 1, column 7:
 PLS-00201: identifier 'NOTHERE' must be declared
 ORA-06550: line 1, column 7:
 PL/SQL: Statement ignored
+
+Package created.
+
+Package body created.
+
+ERROR:
+ORA-06553: PLS-221: 'N' is not a procedure or is undefined
+
+n is 11
+
+PL/SQL procedure successfully completed.
 ```
 
 ### H. Features that are refused
