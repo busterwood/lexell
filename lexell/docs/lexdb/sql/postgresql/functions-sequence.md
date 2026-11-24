@@ -40,7 +40,8 @@ lastval ( ) → bigint
 
 ## Differences from PostgreSQL
 
-- `DROP SEQUENCE` is not refused while a column default uses the sequence (see [DROP SEQUENCE](drop-sequence.md)).
+- None known. (`DROP SEQUENCE` is refused while a column default uses the sequence, as in PostgreSQL: see
+  [DROP SEQUENCE](drop-sequence.md).)
 
 ## Examples
 
