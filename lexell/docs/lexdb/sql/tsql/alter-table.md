@@ -32,7 +32,9 @@ ALTER TABLE { database_name.schema_name.table_name | schema_name.table_name | ta
 : Adds a computed column, `PERSISTED` or not.
 
 `ADD CONSTRAINT` *table_constraint*
-: Adds a `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY` or `CHECK` constraint. The existing rows are checked first.
+: Adds a `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY` or `CHECK` constraint. The existing rows are checked first. A
+  `PRIMARY KEY` or `UNIQUE` may be `CLUSTERED` or `NONCLUSTERED` (labels: see [CREATE INDEX](create-index.md)); a
+  table that has a primary key refuses a second one.
 
 `ALTER COLUMN` *column_name* *new_data_type*
 : Changes the column's type, and with `NULL` or `NOT NULL` whether it may hold NULL. The rows are converted; a value
@@ -60,10 +62,11 @@ ALTER TABLE { database_name.schema_name.table_name | schema_name.table_name | ta
 - `WITH CHECK` and `WITH NOCHECK` before `ADD`, `CHECK CONSTRAINT` and `NOCHECK CONSTRAINT` (enabling and disabling
   a constraint), `SET (LOCK_ESCALATION = ...)`, `SWITCH`, `REBUILD`, and `ENABLE` and `DISABLE TRIGGER` give the
   same error 50000.
-- `CLUSTERED` and `NONCLUSTERED` in a constraint are error 102, as in `CREATE TABLE`.
 - Adding a `NOT NULL` column without a default to a table with rows is error 515 with lexdb's text (SQL Server:
   4901). A column that already exists is 50000 (SQL Server: 2705); dropping an unknown column is 207 (SQL Server:
   4924).
+- A second primary key by `ADD CONSTRAINT` is error 50000 (`multiple primary keys for table "emp" are not allowed`;
+  SQL Server: 8110, which `CREATE TABLE` does give).
 - PostgreSQL's `VALIDATE CONSTRAINT` and `SET SCHEMA` are taken in this door.
 
 ## Examples
@@ -194,6 +197,8 @@ ALTER TABLE dbo.nothere ADD x int;
 GO
 ALTER TABLE dbo.emp DROP COLUMN nothere;
 GO
+ALTER TABLE dbo.emp ADD CONSTRAINT pk_emp_name PRIMARY KEY (name);
+GO
 ```
 
 ```text
@@ -205,9 +210,28 @@ Msg 4902, Level 16, State 1, Line 3
 Cannot find the object "nothere" because it does not exist or you do not have permissions.
 Msg 207, Level 16, State 1, Line 1
 Invalid column name 'nothere'.
+Msg 50000, Level 16, State 1, Line 1
+multiple primary keys for table "emp" are not allowed
 ```
 
-### G. What lexdb does not take
+### G. CLUSTERED and NONCLUSTERED in a constraint
+
+<!-- example: tsql -->
+```sql
+ALTER TABLE dbo.dept ADD CONSTRAINT uq_dept_name UNIQUE NONCLUSTERED (name);
+SELECT name, type_desc, is_unique, is_primary_key FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.dept') ORDER BY index_id;
+```
+
+```text
+name         type_desc    is_unique is_primary_key
+------------ ------------ --------- --------------
+dept_pkey    CLUSTERED    1         1
+uq_dept_name NONCLUSTERED 1         0
+
+(2 rows affected)
+```
+
+### H. What lexdb does not take
 
 <!-- example: tsql -->
 ```sql
