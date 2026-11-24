@@ -1843,11 +1843,12 @@ pub type Execute = record {
     pub prefetch: int
     pub commit: bool
     pub fetchOnly: bool         // a REF CURSOR's next rows: FETCH alone on cursorId (no SQL)
+    pub valuesOnly: bool        // an open cursor run again with the binds' last types (JDBC): the values, no bind descriptions
 }
 
 // An Execute of sql with binds; no cursor, no fetch-only.
 pub fn newExecute(sql: &str, kind: int, binds: []Bind, prefetch: int, commit: bool): Execute {
-    return Execute{sql: sql.clone(), kind: kind, cursorId: 0, binds: binds, prefetch: prefetch, commit: commit, fetchOnly: false}
+    return Execute{sql: sql.clone(), kind: kind, cursorId: 0, binds: binds, prefetch: prefetch, commit: commit, fetchOnly: false, valuesOnly: false}
 }
 
 fn longBind(b: &Bind, maxString: int): bool { return b.bufferSize > maxString || b.oraType == T_LONG || b.oraType == T_LONG_RAW }
@@ -1872,7 +1873,7 @@ fn putBindValue(m: mut &[]byte, b: &Bind) {
 pub fn executeBody(m: mut &[]byte, e: &Execute, fv: int, maxString: int) {
     let parse = !e.fetchOnly && (e.cursorId == 0 || e.kind == S_DDL)
     let query = e.kind == S_QUERY || e.fetchOnly
-    let nb = if e.fetchOnly { 0 } else { len(e.binds) }
+    let nb = if e.fetchOnly || e.valuesOnly { 0 } else { len(e.binds) }
     var options = if e.fetchOnly { 0 } else { 0x20 }    // EXECUTE
     if parse { options = options | 0x01 }
     if query && e.prefetch > 0 { options = options | 0x40 }
@@ -1936,8 +1937,9 @@ pub fn executeBody(m: mut &[]byte, e: &Execute, fv: int, maxString: int) {
     putUb(m, 0)
     putUb(m, 0)
     putUb(m, 0)
-    if nb == 0 { return }
+    if nb == 0 && !e.valuesOnly { return }
     for b in e.binds {
+        if e.valuesOnly { break }                       // (only the values follow)
         put8(m, b.oraType)
         put8(m, 1)                                      // USE_INDICATORS
         put8(m, 0)
@@ -3095,7 +3097,7 @@ pub fn (s: mut &Session) fetchRaw(cursorId: int, n: int, columns: &[]Column, pre
 pub fn (s: mut &Session) fetchInto(cursorId: int, n: int, ref: bool, r: mut &Reply, w: Where): Result[Unit, Error] {
     var m: []byte = []
     if ref {
-        let e = Execute{sql: "", kind: S_QUERY, cursorId: cursorId, binds: [], prefetch: n, commit: false, fetchOnly: true}
+        let e = Execute{sql: "", kind: S_QUERY, cursorId: cursorId, binds: [], prefetch: n, commit: false, fetchOnly: true, valuesOnly: false}
         s.header(mut &m, FN_EXECUTE)
         executeBody(mut &m, &e, s.fieldVersion, s.maxString)
     } else {
