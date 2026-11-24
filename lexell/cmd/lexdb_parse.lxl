@@ -14,6 +14,7 @@ import "./lexdb_dbopt"
 import "./lexdb_match"
 import "./lexdb_recur"
 import "./lexdb_oldnew"
+import "./lexdb_annot"
 
 // The language model, by name (the parser reads and builds it).
 type TypeName = lexdb_sql.TypeName
@@ -188,6 +189,7 @@ const A_DROP_CON = lexdb_sql.A_DROP_CON
 const A_RENAME_CON = lexdb_sql.A_RENAME_CON
 const A_VALIDATE = lexdb_sql.A_VALIDATE
 const A_CON_STATE = lexdb_sql.A_CON_STATE
+const A_ANNOT = lexdb_sql.A_ANNOT
 const A_ADD_IDENTITY = lexdb_sql.A_ADD_IDENTITY
 const A_SET_IDENTITY = lexdb_sql.A_SET_IDENTITY
 const A_DROP_IDENTITY = lexdb_sql.A_DROP_IDENTITY
@@ -3001,7 +3003,7 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
     }
     s.table = try p.rname()
     s.spell = p.spelled.clone()
-    if p.isKw("as") || p.isKw("on") || (p.isKw("(") && p.nameListThenAs()) { return p.createTableAs(s) }
+    if p.isKw("as") || p.isKw("on") || (p.ora && p.isKw("annotations")) || (p.isKw("(") && p.nameListThenAs()) { return p.createTableAs(s) }
     return p.tableBody(s)
 }
 
@@ -3035,6 +3037,7 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
         } else if len(cname) > 0 || p.isKw("unique") || p.isKw("check") || p.isKw("foreign") || p.isKw("exclude") {
             append(mut &s.cons, try p.tableConstraint(&cname))
         } else {
+            let colAt = p.pos
             let n = try p.name()
             var c = lexdb_sql.noCol()
             c.name = n.clone()
@@ -3098,6 +3101,12 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
                     append(mut &s.cons, fk)
                 } else if p.enforcedNext() {
                     return Err(misplacedState())
+                } else if p.ora && len(cn) == 0 && p.isKw("annotations") {
+                    let annAt = p.pos
+                    p.pos += 1
+                    append(mut &s.alters, try p.annotClause(&n, true))
+                    try p.annotColEnd(colAt, annAt)
+                    break
                 } else if len(cn) > 0 {
                     return Err(near(&p.peek()))
                 } else {
@@ -3112,6 +3121,7 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
     if len(nns) > 0 { try nnCons(mut &s, &nns) }
     try p.tsqlStorage()
     try p.onCommit(mut &s)
+    while p.ora && p.acceptKw("annotations") { append(mut &s.alters, try p.annotClause("", true)) }
     return Ok(s)
 }
 
@@ -3139,7 +3149,7 @@ fn (p: &P) nameListThenAs(): bool {
         let t = p.peekAt(k).clone()
         if t.kind != T_IDENT && t.kind != T_QIDENT { return false }
         let u = p.peekAt(k + 1).clone()
-        if u.kind == T_OP && u.text == ")" { return p.peekAt(k + 2).kind == T_IDENT && (p.peekAt(k + 2).text == "as" || p.peekAt(k + 2).text == "on") }
+        if u.kind == T_OP && u.text == ")" { return p.peekAt(k + 2).kind == T_IDENT && (p.peekAt(k + 2).text == "as" || p.peekAt(k + 2).text == "on" || (p.ora && p.peekAt(k + 2).text == "annotations")) }
         if !(u.kind == T_OP && u.text == ",") { return false }
         k += 2
     }
@@ -3159,6 +3169,7 @@ fn (p: mut &P) createTableAs(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
         try p.expectKw(")")
     }
     try p.onCommit(mut &s)
+    while p.ora && p.acceptKw("annotations") { append(mut &s.alters, try p.annotClause("", true)) }
     try p.expectKw("as")
     var q = try p.query()
     if p.acceptKw("with") {
@@ -3982,6 +3993,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
             // its PRIMARY KEY, UNIQUE, CHECK and REFERENCES: added after it,
             // as ADD CONSTRAINT would (9.85)
             var cons: []Constraint = []
+            var colAnn: []Alter = []
             while true {
                 var cn = ""
                 if p.acceptKw("constraint") { cn = try p.name() }
@@ -4028,6 +4040,10 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                     append(mut &cons, fk)
                 } else if p.enforcedNext() {
                     return Err(misplacedState())
+                } else if p.ora && len(cn) == 0 && p.acceptKw("annotations") {
+                    // (the column's annotations: after it is added)
+                    append(mut &colAnn, try p.annotClause(&a.col.name, true))
+                    break
                 } else if len(cn) > 0 {
                     return Err(near(&p.peek()))
                 } else {
@@ -4037,6 +4053,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
             let added = a.col.name.clone()
             let ifNot = a.ifFlag
             append(mut &s.alters, a)
+            while len(colAnn) > 0 { append(mut &s.alters, pop(mut &colAnn)) }
             // in the order written
             var k = 0
             while k < len(cons) / 2 {
@@ -4065,7 +4082,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
             let paren = p.acceptKw("(")
             while true {
                 let n = try p.name()
-                if p.peek().kind == T_IDENT && !p.isKw("not") && !p.isKw("null") && !p.isKw("default") {
+                if p.peek().kind == T_IDENT && !p.isKw("not") && !p.isKw("null") && !p.isKw("default") && !p.isKw("annotations") {
                     var a = lexdb_sql.alterOf(A_TYPE, &n)
                     a.col.typ = try p.typeName()
                     append(mut &s.alters, a)
@@ -4083,6 +4100,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                     append(mut &s.alters, a)
                     if on { append(mut &s.alters, lexdb_sql.alterOf(A_SET_NOT_NULL, &n)) }
                 }
+                if p.acceptKw("annotations") { append(mut &s.alters, try p.annotClause(&n, false)) }
                 if !(paren && p.acceptKw(",")) { break }
             }
             if paren { try p.expectKw(")") }
@@ -4121,6 +4139,8 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
         } else if p.acceptKw("validate") {
             try p.expectKw("constraint")
             append(mut &s.alters, lexdb_sql.alterOf(A_VALIDATE, &(try p.name())))
+        } else if p.ora && p.acceptKw("annotations") {
+            append(mut &s.alters, try p.annotClause("", false))
         } else if p.acceptKw("alter") {
             if !p.tsql && !p.ora && p.isKw("constraint") {
                 // ALTER CONSTRAINT name [NOT] ENFORCED (PostgreSQL 18, design/lexdb-new-features.md 10.5)
@@ -4296,7 +4316,8 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
         } else {
             return Err(lexdb_base.err("0A000", "lexdb: ALTER TABLE takes ADD, DROP, ALTER COLUMN, VALIDATE CONSTRAINT, RENAME and SET SCHEMA"))
         }
-        if !p.acceptKw(",") { break }
+        // (Oracle's ANNOTATIONS (...) and MODIFY (...) follow another clause without a comma)
+        if !p.acceptKw(",") && !(p.ora && (p.isKw("annotations") || p.isKw("modify"))) { break }
     }
     return Ok(s)
 }
@@ -4856,12 +4877,15 @@ fn (p: mut &P) createView(orReplace: bool, alterOnly: bool): Result[Stmt, lexdb_
     v.spell = p.spelled.clone()
     if p.acceptKw("(") {
         while true {
-            append(mut &v.names, try p.name())
+            let vn = try p.name()
+            append(mut &v.names, vn.clone())
             append(mut &v.spells, p.spelled.clone())
+            if p.ora && p.acceptKw("annotations") { append(mut &v.alters, try p.annotClause(&vn, true)) }
             if !p.acceptKw(",") { break }
         }
         try p.expectKw(")")
     }
+    while p.ora && p.acceptKw("annotations") { append(mut &v.alters, try p.annotClause("", true)) }
     if p.isKw("with") { return Err(lexdb_base.err("0A000", "lexdb: view options (WITH (...)) are not supported")) }
     try p.expectKw("as")
     let start = p.peek().at
@@ -6717,6 +6741,7 @@ fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
         try p.expectKw(")")
     }
     if p.acceptKw("where") { s.where = Some(try p.expr()) }      // a filtered index
+    while p.ora && p.acceptKw("annotations") { append(mut &s.alters, try p.annotClause("", true)) }
     try p.tsqlStorage()
     return Ok(s)
 }
@@ -7704,6 +7729,10 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     v.ifFlag = true
                 }
                 v.table = try p.qname()
+                if p.ora && (p.isKw("annotations") || p.isKw("modify")) {
+                    try p.annotAlters(mut &v, true)
+                    return Ok(v)
+                }
                 if !p.acceptKw("rename") { return Err(lexdb_base.err("0A000", "lexdb: ALTER VIEW supports RENAME TO only")) }
                 try p.expectKw("to")
                 v.index = try p.name()
@@ -7762,6 +7791,10 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     s.index = try p.qname()
                 } else {
                     s.table = try p.name()
+                }
+                if idx && p.ora && p.isKw("annotations") {
+                    try p.annotAlters(mut &s, false)
+                    return Ok(s)
                 }
                 if !p.acceptKw("rename") {
                     return Err(lexdb_base.err("0A000", &("lexdb: ALTER " + (if idx { "INDEX" } else { "SCHEMA" }) + " takes RENAME TO only")))
@@ -10730,4 +10763,126 @@ fn (p: mut &P) qualAliases(x: &Expr, items: &[]SelItem): Result[Expr, lexdb_base
         }
         else { return Ok(lexdb_sql.cloneExpr(x)) }
     }
+}
+
+// ---- Oracle's annotations (design/lexdb-new-features.md 8.5, O21; lexdb_annot keeps them)
+
+// A token as Oracle's annotation errors show it: a word upper-cased.
+fn annotTok(t: &Tok): str { return if t.kind == T_IDENT { strings.toUpperAscii(&t.text) } else { t.text.clone() } }
+
+// ANNOTATIONS (...), after the word: an A_ANNOT alteration of column col ("" the object), its items in to (lexdb_annot.item). In a
+// CREATE statement's (create) there is no DROP or REPLACE (ORA-11555, ORA-11556); a name is an identifier not reserved (ORA-11548),
+// a value a text literal, not empty (ORA-11549).
+fn (p: mut &P) annotClause(col: &str, create: bool): Result[Alter, lexdb_base.DbErr] {
+    if !p.acceptKw("(") { return Err(lexdb_base.err("ORA11546", "missing left parenthesis when specifying ANNOTATIONS")) }
+    if p.isKw(")") { return Err(lexdb_base.err("ORA11551", "missing annotations sequence within the ANNOTATIONS clause")) }
+    var out: []str = []
+    while true {
+        var op = lexdb_annot.OP_PLAIN
+        // IF NOT EXISTS | IF EXISTS after ADD or DROP (a name IF otherwise)
+        let ifNext = p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "if" && p.peekAt(2).kind == T_IDENT &&
+                     (p.peekAt(2).text == "not" || p.peekAt(2).text == "exists")
+        if p.acceptKw("add") {
+            op = lexdb_annot.OP_ADD
+            if ifNext {
+                p.pos += 1
+                if !p.acceptKw("not") { return Err(lexdb_base.err("ORA11543", "Incorrect IF NOT EXISTS clause for CREATE statement.")) }
+                try p.expectKw("exists")
+                op = lexdb_annot.OP_ADD_IF
+            }
+        } else if p.isKw("drop") || p.isKw("replace") {
+            let drop = p.next().text == "drop"
+            if create {
+                return Err(if drop { lexdb_base.err("ORA11555", "DROP annotation is not allowed in a CREATE statement.") }
+                           else { lexdb_base.err("ORA11556", "REPLACE annotation is not allowed in a CREATE statement.") })
+            }
+            op = if drop { lexdb_annot.OP_DROP } else { lexdb_annot.OP_REPLACE }
+            if drop && ifNext {
+                p.pos += 1
+                if p.isKw("not") { return Err(lexdb_base.err("ORA11544", "Incorrect IF EXISTS clause for ALTER/DROP statement.")) }
+                try p.expectKw("exists")
+                op = lexdb_annot.OP_DROP_IF
+            }
+        }
+        let t = p.next()
+        var name = ""
+        if t.kind == T_QIDENT {
+            if len(t.text) == 0 { return Err(lexdb_base.err("ORA01741", "illegal zero-length identifier")) }
+            name = if len(t.spell) > 0 { t.spell.clone() } else { t.text.clone() }      // (a quoted name as written)
+        } else if t.kind == T_IDENT && !lexdb_annot.reserved(&t.text) {
+            name = strings.toUpperAscii(&t.text)
+        } else {
+            return Err(lexdb_annot.errName(&annotTok(&t)))
+        }
+        if len(name) > 1024 {
+            return Err(lexdb_base.err("ORA00972", &("The identifier " + name[0..10] + "..." + name[len(name) - 10..len(name)] + "... exceeds the maximum length of 1024 bytes.")))
+        }
+        var has = false
+        var value = ""
+        let v = p.peek().clone()
+        if v.kind == T_STR {
+            p.pos += 1
+            if len(v.text) == 0 { return Err(lexdb_annot.errValue("")) }
+            if len(v.text) > 4000 {
+                return Err(lexdb_base.err("ORA11545", &("annotation value " + v.text[0..10] + "..." + v.text[len(v.text) - 10..len(v.text)] + "... exceeds 4000 bytes limit")))
+            }
+            has = true
+            value = v.text.clone()
+        } else if !(v.kind == T_OP && (v.text == "," || v.text == ")")) && v.kind != T_EOF {
+            return Err(lexdb_annot.errValue(&annotTok(&v)))
+        }
+        append(mut &out, lexdb_annot.item(&op, &name, has, &value))
+        if p.acceptKw(",") { continue }
+        if p.acceptKw(")") { break }
+        if p.peek().kind == T_EOF { return Err(lexdb_base.err("ORA11547", "missing right parenthesis when specifying ANNOTATIONS")) }
+        return Err(lexdb_base.err("ORA11550", "missing comma between consecutive annotations within ANNOTATIONS"))
+    }
+    var a = lexdb_sql.alterOf(A_ANNOT, col)
+    a.to = strings.join(&out, "\x02")
+    return Ok(a)
+}
+
+// After a column's ANNOTATIONS (the last of its definition): the next column or the end. A column word is ORA-03099 (ORA-03076 after
+// an inline constraint: the tokens from the column's, at, to its ANNOTATIONS', upto), any other ORA-03062.
+fn (p: &P) annotColEnd(at: int, upto: int): Result[Unit, lexdb_base.DbErr] {
+    let t = p.peek().clone()
+    if t.kind == T_OP && (t.text == "," || t.text == ")") { return Ok(Unit{}) }
+    if t.kind == T_IDENT {
+        match t.text.toStr() {
+            "not", "null", "primary", "unique", "check", "references", "constraint", "default", "annotations", "generated", "as", "collate", "enable",
+            "disable" {
+                var inline = false
+                for k in at..upto {
+                    let w = p.toks[k].clone()
+                    if w.kind == T_IDENT && (w.text == "not" || w.text == "primary" || w.text == "unique" || w.text == "check" || w.text == "references" ||
+                                             w.text == "constraint") { inline = true }
+                }
+                if inline { return Err(lexdb_base.err("ORA03076", &("unexpected item " + strings.toUpperAscii(&t.text) + " in a column definition or inline constraint"))) }
+                return Err(lexdb_base.err("ORA03099", &("unexpected item " + strings.toUpperAscii(&t.text) + " in a column definition")))
+            }
+            else {}
+        }
+    }
+    return Err(lexdb_base.err("ORA03062", "missing comma or right parenthesis"))
+}
+
+// ALTER VIEW | INDEX name's clauses: ANNOTATIONS (...) and (a view's: cols) MODIFY [(] col ANNOTATIONS (...) [, ...] [)], in any order.
+fn (p: mut &P) annotAlters(s: mut &Stmt, cols: bool): Result[Unit, lexdb_base.DbErr] {
+    while true {
+        if p.acceptKw("annotations") {
+            append(mut &s.alters, try p.annotClause("", false))
+        } else if cols && p.acceptKw("modify") {
+            let paren = p.acceptKw("(")
+            while true {
+                let n = try p.name()
+                try p.expectKw("annotations")
+                append(mut &s.alters, try p.annotClause(&n, false))
+                if !(paren && p.acceptKw(",")) { break }
+            }
+            if paren { try p.expectKw(")") }
+        } else {
+            break
+        }
+    }
+    return Ok(Unit{})
 }

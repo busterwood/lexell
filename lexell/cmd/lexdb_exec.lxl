@@ -38,6 +38,7 @@ import "./lexdb_catalog"
 import "./lexdb_copyjson"
 import "./lexdb_nncon"
 import "./lexdb_nnalter"
+import "./lexdb_annot"
 import "./lexdb_sql"
 import "./lexdb_plan"
 import "./lexdb_enum"
@@ -3813,6 +3814,7 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     if len(clustered) > 0 { lexdb_catalog.setCluster(mut &t, &clustered) } else if s.pkCluster == 2 && len(t.pk) > 0 { lexdb_catalog.setCluster(mut &t, lexdb_catalog.CL_NONE) }
     for c in s.cons { if c.kind == lexdb_sql.C_FOREIGN { try lexdb_gen.checkConstraint(&t.cols, &c, s.mdialect, &lexdb_sql.baseName(&t.name)); try addConstraint(st, txn, mut &t, &c, false, s.mdialect) } }
     try lexdb_nnalter.createNames(mut &t, &s.names)
+    try lexdb_annot.onCreate(mut &t, &s.alters)
     t.onCommit = s.onCommit
     if s.onCommit > lexdb_sql.ONC_PRESERVE { append(mut &txn.onCommit, key.clone()) }
     try txn.put(lexdb_catalog.CATALOG, &key, &(lexdb_catalog.encTable(&t)))
@@ -4052,6 +4054,7 @@ fn createTableAs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sq
     mk.temp = s.temp
     mk.onCommit = s.onCommit
     mk.spell = s.spell.clone()
+    mk.alters = s.alters.clone()
     for i in 0..len(sel.outs) {
         let n = if i < len(s.names) { s.names[i].clone() } else { sel.outs[i].name.clone() }
         if i >= len(s.names) && sel.outs[i].spell == lexdb_sql.ANON {
@@ -4590,11 +4593,13 @@ fn alterIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     }
     var t = try needTable(st, txn, &owner.unwrap())
     try lexdb_priv.needRelOwner(st, txn, &t.name, &"index")
+    if s.alters[0].kind == lexdb_sql.A_ANNOT { try lexdb_annot.alterIndex(st, txn, mut &t, &ixKey, s, bumpFor); return Ok(tagOnly("ALTER INDEX")) }
     let to = s.alters[0].name.clone()
     let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&ixKey), &to)
     if key == ixKey { return Ok(tagOnly("ALTER INDEX")) }
     if try relExists(st, txn, &key) { return Err(e("42P07", &("relation \"" + to + "\" already exists"))) }
     for k in 0..len(t.indexes) { if t.indexes[k].name == ixKey { t.indexes[k].name = key.clone() } }
+    lexdb_annot.renameIndex(mut &t.invalid, &lexdb_sql.baseName(&ixKey), &to)
     txn.del(lexdb_catalog.CATALOG, &(idxName(&ixKey)))
     try txn.put(lexdb_catalog.CATALOG, &(idxName(&key)), &t.name)
     try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(&t)))
@@ -5176,6 +5181,8 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             try validateConstraint(st, txn, mut &t, &a.name)
         } else if a.kind == lexdb_sql.A_CON_STATE {
             try conState(st, txn, mut &t, &a, s.mdialect)
+        } else if a.kind == lexdb_sql.A_ANNOT {
+            try lexdb_annot.alter(mut &t, a)
         } else if a.kind == lexdb_sql.A_SET_SCHEMA {
             try setSchema(st, txn, mut &t, &a.name)
         } else if a.kind == lexdb_sql.A_ADD {
@@ -5268,6 +5275,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             try fkDropColumn(st, txn, mut &t, &a.name, a.cascade)
             try dropOwnedSeqs(st, txn, &t, &a.name)
             lexdb_nncon.drop(mut &t.invalid, &a.name)
+            lexdb_annot.dropColumn(mut &t.invalid, &a.name)
             try dropColumn(txn, mut &t, at)
         } else if a.kind == lexdb_sql.A_RENAME {
             let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &a.name)
@@ -5309,6 +5317,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                                  &("column \"" + a.to + "\" of relation \"" + rel + "\" already exists")))
                 }
                 lexdb_nnalter.renameColumn(mut &t, &a.name, &a.to)
+                lexdb_annot.renameColumn(mut &t.invalid, &a.name, &a.to)
                 t.cols[i].name = a.to.clone()
                 // a filtered index's predicate names its columns
                 for k in 0..len(t.indexes) {
@@ -5938,7 +5947,7 @@ fn pruneInvalid(t: mut &Table) {
             for c in t.checks { if c.name == on { there = true } }
             for f in t.fks { if f.name == on { there = true } }
         }
-        if there || strings.startsWith(&n, lexdb_catalog.CL_MARK) || strings.startsWith(&n, lexdb_nncon.NN_MARK) { append(mut &keep, n.clone()) }
+        if there || strings.startsWith(&n, lexdb_catalog.CL_MARK) || strings.startsWith(&n, lexdb_nncon.NN_MARK) || strings.startsWith(&n, lexdb_annot.AN_MARK) { append(mut &keep, n.clone()) }
     }
     t.invalid = keep
 }
@@ -6195,6 +6204,7 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     let ix = Index{name: ixKey, tree: st.createTree(txn), cols: cols, unique: s.unique, pred: pred, con: false, opts: collections.copyOf(&s.pk), exprs: exprs}
     try addIndex(st, txn, mut &t, ix)
     if s.cluster == 1 { lexdb_catalog.setCluster(mut &t, &ixBase) }
+    try lexdb_annot.onIndex(mut &t, &ixBase, &s.alters)
     try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(&t)))
     try bumpFor(st, txn, &t.name)
     return Ok(tagOnly("CREATE INDEX"))
@@ -6513,6 +6523,7 @@ fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
             }
             if lexdb_catalog.clusterLabel(&t) == lexdb_sql.baseName(&ixKey) { lexdb_catalog.setCluster(mut &t, if lexdb_catalog.hasPk(&t) { lexdb_catalog.CL_NONE } else { "" }) }
             while len(rev) > 0 { append(mut &t.indexes, pop(mut &rev)) }
+            lexdb_annot.dropIndex(mut &t.invalid, &lexdb_sql.baseName(&ixKey))
             txn.del(lexdb_catalog.CATALOG, &(idxName(&ixKey)))
             try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(&t)))
             try bumpFor(st, txn, &t.name)
@@ -19023,7 +19034,8 @@ fn createView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         }
         None {}
     }
-    try txn.put(lexdb_catalog.CATALOG, &key, &(lexdb_catalog.encView(&cols, &s.index, &deps, &s.spell)))
+    let an = try lexdb_annot.forView(&key, &s.spell, &s.alters, &cols)
+    try txn.put(lexdb_catalog.CATALOG, &key, &(lexdb_catalog.encViewRn(&cols, &s.index, &deps, &s.spell, &[], &an)))
     if old.isNone() { try lexdb_priv.ownNew(st, txn, &lexdb_catalog.relObj(&key)) }
     try bumpFor(st, txn, &key)
     return Ok(tagOnly("CREATE VIEW"))
@@ -19327,7 +19339,7 @@ fn followPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, old: &str): Res
 }
 
 fn putView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, v: &Table, deps: &[]str, rn: &[]str): Result[Unit, DbErr] {
-    try txn.put(lexdb_catalog.CATALOG, &v.name, &(lexdb_catalog.encViewRn(&v.cols, &v.view, deps, &v.spell, rn)))
+    try txn.put(lexdb_catalog.CATALOG, &v.name, &(lexdb_catalog.encViewRn(&v.cols, &v.view, deps, &v.spell, rn, &v.invalid)))
     try bumpFor(st, txn, &v.name)
     return Ok(Unit{})
 }
@@ -19426,7 +19438,7 @@ fn renameView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, name
     let raw = (try st.get(txn, lexdb_catalog.CATALOG, &t.name)).unwrap()
     let v = lexdb_catalog.decView(&t.name, &raw)
     txn.del(lexdb_catalog.CATALOG, &t.name)
-    try txn.put(lexdb_catalog.CATALOG, &to, &(lexdb_catalog.encViewRn(&v.cols, &v.view, &v.deps, spell, &v.rn)))
+    try txn.put(lexdb_catalog.CATALOG, &to, &(lexdb_catalog.encViewRn(&v.cols, &v.view, &v.deps, spell, &v.rn, &v.invalid)))
     try lexdb_priv.moveAcl(st, txn, &lexdb_catalog.relObj(&t.name), &lexdb_catalog.relObj(&to))
     try followApply(st, txn, &plan, &t.name, &to)
     try bumpFor(st, txn, &to)
@@ -19445,6 +19457,7 @@ fn alterView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     }
     let t = found.unwrap()
     if len(t.view) == 0 { return Err(e("42809", &("\"" + lexdb_sql.shown(&s.table) + "\" is not a view"))) }
+    if len(s.alters) > 0 { try lexdb_priv.needRelOwner(st, txn, &t.name, &"view"); try lexdb_annot.alterView(st, txn, &t, s, bumpFor); return Ok(tagOnly("ALTER VIEW")) }
     return renameView(st, txn, &t, &s.index, &"", true, "ALTER VIEW")
 }
 

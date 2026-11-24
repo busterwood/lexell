@@ -1,0 +1,294 @@
+// lexdb_annot: Oracle's annotations (23ai; design/lexdb-new-features.md 8.5, O21), checked against Oracle Free 23.26.3.
+//
+// An annotation is a name and a value (none for a flag) the catalog keeps for a table, a view, an index or one of a table's or a
+// view's columns; nothing reads them but USER_/ALL_/DBA_ANNOTATIONS_USAGE, ANNOTATIONS and ANNOTATION_VALUES (lexdb_oracat). They are
+// entries of the object's Table.invalid (an index's in its table's) with the prefix AN_MARK, which no constraint's name has, so what reads
+// that list as names does not see them (the way CL_MARK, OFF_MARK and NN_MARK keep their labels): AN_MARK, the scope ("" the object,
+// "c:" a column, "i:" an index, each with its name), NUL, the name, NUL, then "v" and the value or "n" for none. A table without
+// annotations has none, so its row layout, its encoding and every read path are as they were; a view keeps the list in its catalog
+// row's last section (lexdb_catalog.encViewRn).
+//
+// The parser (lexdb_parse.annotClause) reads ANNOTATIONS (...) into an Alter of kind A_ANNOT: name the column ("" the object), to the
+// items (item); the statements' code (lexdb_exec) calls this module where a table, view or index is made, altered, renamed or dropped.
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_store"
+import "./lexdb_catalog"
+
+type Table = lexdb_catalog.Table
+type DbErr = lexdb_base.DbErr
+type Alter = lexdb_sql.Alter
+type ColDef = lexdb_sql.ColDef
+
+pub const AN_MARK = "\x00an:"
+
+// The catalog's version bumped for DDL on a relation (lexdb_exec.bumpFor).
+pub type BumpFn = fn(&lexdb_store.Store, mut &lexdb_store.Txn, &str): Result[Unit, DbErr]
+
+// An annotation: its scope ("" the object, "c:" + a column's name, "i:" + an index's), its name as Oracle keeps it (an unquoted
+// one upper-cased), its value (has false: a flag, none).
+pub type Annot = record {
+    pub scope: str
+    pub name: str
+    pub has: bool
+    pub value: str
+}
+
+fn e(code: &str, msg: &str): DbErr { return lexdb_base.err(code, msg) }
+
+fn enc(a: &Annot): str { return AN_MARK + a.scope + "\x00" + a.name + "\x00" + (if a.has { "v" + a.value } else { "n" }) }
+
+// The annotation entry x is, if it is one.
+pub fn decode(x: &str): Option[Annot] {
+    if !strings.startsWith(x, AN_MARK) { return None }
+    let a = len(AN_MARK)
+    let b = strings.indexOf(x, "\x00", a)
+    if b < 0 { return None }
+    let c = strings.indexOf(x, "\x00", b + 1)
+    if c < 0 || c + 1 >= len(x) { return None }
+    return Some(Annot{scope: x[a..b].toStr(), name: x[b + 1..c].toStr(), has: x[c + 1] == 'v', value: x[c + 2..len(x)].toStr()})
+}
+
+// The annotations of an object (its Table.invalid), in the order they were made.
+pub fn all(inv: &[]str): []Annot {
+    var out: []Annot = []
+    if len(inv) == 0 { return out }
+    for x in inv {
+        match decode(&x) {
+            Some(a) { append(mut &out, a) }
+            None {}
+        }
+    }
+    return out
+}
+
+// ---- the clause's items, as the parser writes them into Alter.to: each an operation (OP_*), the name, \x01, then "v" and the value
+// or "n"; \x02 between them.
+
+pub const OP_PLAIN = "p"        // CREATE's name ['v'] (and ADD's there)
+pub const OP_ADD = "a"
+pub const OP_ADD_IF = "A"       // ADD IF NOT EXISTS
+pub const OP_DROP = "d"
+pub const OP_DROP_IF = "D"      // DROP IF EXISTS
+pub const OP_REPLACE = "r"
+
+pub fn item(op: &str, name: &str, has: bool, value: &str): str { return op + name + "\x01" + (if has { "v" + value } else { "n" }) }
+
+type Item = record {
+    op: byte
+    name: str
+    has: bool
+    value: str
+}
+
+fn items(s: &str): []Item {
+    var out: []Item = []
+    var at = 0
+    while at < len(s) {
+        var end = strings.indexOf(s, "\x02", at)
+        if end < 0 { end = len(s) }
+        let m = strings.indexOf(s, "\x01", at)
+        append(mut &out, Item{op: s[at], name: s[at + 1..m].toStr(), has: s[m + 1] == 'v', value: if m + 2 <= end { s[m + 2..end].toStr() } else { "" }})
+        at = end + 1
+    }
+    return out
+}
+
+fn isAdd(op: byte): bool { return op == 'p' || op == 'a' || op == 'A' }
+
+// Oracle's reserved words (V$RESERVED_WORDS' RESERVED = 'Y'), lower case: an unquoted annotation name may not be one (ORA-11548).
+pub fn reserved(w: &str): bool {
+    match w.toStr() {
+        "access", "add", "all", "alter", "and", "any", "as", "asc", "audit", "between", "by", "char", "check", "cluster", "column", "comment",
+        "compress", "connect", "create", "current", "date", "decimal", "default", "delete", "desc", "distinct", "drop", "else", "exclusive",
+        "exists", "file", "float", "for", "from", "grant", "group", "having", "identified", "immediate", "in", "increment", "index", "initial",
+        "insert", "integer", "intersect", "into", "is", "level", "like", "lock", "long", "maxextents", "minus", "mlslabel", "mode", "modify",
+        "noaudit", "nocompress", "not", "nowait", "null", "number", "of", "offline", "on", "online", "option", "or", "order", "pctfree",
+        "prior", "public", "raw", "rename", "resource", "revoke", "row", "rowid", "rownum", "rows", "select", "session", "set", "share",
+        "size", "smallint", "start", "successful", "synonym", "sysdate", "table", "then", "to", "trigger", "uid", "union", "unique", "update",
+        "user", "validate", "values", "varchar", "varchar2", "view", "whenever", "where", "with" { return true }
+        else { return false }
+    }
+}
+
+// ---- the errors
+
+pub fn errName(tok: &str): DbErr { return e("ORA11548", &("missing or invalid annotation name '" + tok + "' in the ANNOTATIONS sequence")) }
+pub fn errValue(tok: &str): DbErr { return e("ORA11549", &("invalid annotation value '" + tok + "' in the ANNOTATIONS sequence")) }
+
+// "the object 'T'" or "the column 'C'".
+fn whatOf(col: bool, shown: &str): str { return (if col { "column '" } else { "object '" }) + shown + "'" }
+
+// ---- one clause applied
+
+// The clause's items (an Alter's to) applied to the annotations of scope, in inv: all of it or, at the first error, nothing. shown is
+// the object's or the column's name as Oracle shows it (col: a column's), for the errors.
+fn apply(inv: mut &[]str, scope: &str, its: &str, col: bool, shown: &str): Result[Unit, DbErr] {
+    let xs = items(its)
+    // the list itself: a name twice is two adds of different values, or ORA-11562 (the same value), or ORA-11602 (a DROP or REPLACE among them)
+    for j in 0..len(xs) {
+        for i in 0..j {
+            if xs[i].name != xs[j].name { continue }
+            if isAdd(xs[i].op) && isAdd(xs[j].op) {
+                if xs[i].has == xs[j].has && xs[i].value == xs[j].value {
+                    return Err(e("ORA11562", &("Duplicate annotation '" + xs[j].name + "' in the ANNOTATIONS clause.")))
+                }
+            } else {
+                return Err(e("ORA11602", &("Cannot combine ADD, DROP, REPLACE operations for the same annotation '" + xs[j].name + "'.")))
+            }
+        }
+    }
+    // each item against the annotations as they were before the statement, in order
+    var pre: []Annot = []
+    for a in all(inv) { if a.scope == scope { append(mut &pre, a) } }
+    var drops: []Item = []          // (has false: every one of the name)
+    var adds: []Annot = []
+    let what = whatOf(col, shown)
+    for x in xs {
+        var named = false
+        var same = false
+        for a in pre {
+            if a.name == x.name {
+                named = true
+                if a.has == x.has && a.value == x.value { same = true }
+            }
+        }
+        if x.op == 'p' || x.op == 'a' {
+            if same { return Err(e(if col { "ORA11560" } else { "ORA11552" }, &("Provided annotation '" + x.name + "' already exists for the " + what + "."))) }
+            append(mut &adds, Annot{scope: scope.toStr(), name: x.name.clone(), has: x.has, value: x.value.clone()})
+        } else if x.op == 'A' {
+            if !same { append(mut &adds, Annot{scope: scope.toStr(), name: x.name.clone(), has: x.has, value: x.value.clone()}) }
+        } else {
+            // DROP n 'v' drops that one, DROP n and REPLACE every one of the name
+            let there = if (x.op == 'd' || x.op == 'D') && x.has { same } else { named }
+            if !there {
+                if x.op == 'D' { continue }
+                return Err(e(if col { "ORA11561" } else { "ORA11553" }, &("Provided annotation '" + x.name + "' does not exist for the " + what + ".")))
+            }
+            append(mut &drops, Item{op: x.op, name: x.name.clone(), has: x.has && x.op != 'r', value: x.value.clone()})
+            if x.op == 'r' { append(mut &adds, Annot{scope: scope.toStr(), name: x.name.clone(), has: x.has, value: x.value.clone()}) }
+        }
+    }
+    var keep: []str = []
+    for en in inv {
+        var gone = false
+        match decode(&en) {
+            Some(a) {
+                if a.scope == scope {
+                    for d in drops { if d.name == a.name && (!d.has || (a.has && a.value == d.value)) { gone = true } }
+                }
+            }
+            None {}
+        }
+        if !gone { append(mut &keep, en.clone()) }
+    }
+    for a in adds { append(mut &keep, enc(&a)) }
+    inv = keep
+    return Ok(Unit{})
+}
+
+// A name as Oracle shows it: one lexdb folded to lower case is its upper case.
+fn up(n: &str): str { return if n == strings.toLowerAscii(n) { strings.toUpperAscii(n) } else { n.toStr() } }
+
+fn tableShown(t: &Table): str { return if len(t.spell) > 0 { t.spell.clone() } else { up(&lexdb_sql.baseName(&t.name)) } }
+
+fn colShown(c: &ColDef): str { return if len(c.spell) > 0 { c.spell.clone() } else { up(&c.name) } }
+
+// A clause on the object or one of its columns (ALTER TABLE | VIEW ... ANNOTATIONS, MODIFY (c ANNOTATIONS ...); CREATE's): ORA-00904
+// for a column it does not have.
+fn applyTo(t: mut &Table, a: &Alter): Result[Unit, DbErr] {
+    if len(a.name) == 0 { return apply(mut &t.invalid, "", &a.to, false, &tableShown(t)) }
+    for c in t.cols {
+        if c.name == a.name && c.name != lexdb_catalog.ROWID { return apply(mut &t.invalid, &("c:" + a.name), &a.to, true, &colShown(&c)) }
+    }
+    return Err(e("ORA00904", &("\"" + up(&a.name) + "\": invalid identifier")))
+}
+
+// ---- the statements
+
+// CREATE TABLE's clauses (the statement's alters: the table's and its columns').
+pub fn onCreate(t: mut &Table, alters: &[]Alter): Result[Unit, DbErr] {
+    for a in alters { if a.kind == lexdb_sql.A_ANNOT { try applyTo(t, &a) } }
+    return Ok(Unit{})
+}
+
+// ALTER TABLE's clause a.
+pub fn alter(t: mut &Table, a: &Alter): Result[Unit, DbErr] { return applyTo(t, a) }
+
+// CREATE VIEW's clauses: the new view's entries (its columns cols).
+pub fn forView(name: &str, spell: &str, alters: &[]Alter, cols: &[]ColDef): Result[[]str, DbErr] {
+    var v = lexdb_catalog.emptyTable(name)
+    if len(alters) == 0 { return Ok([]) }
+    v.spell = spell.toStr()
+    for c in cols { append(mut &v.cols, c.clone()) }
+    try onCreate(mut &v, alters)
+    return Ok(replace(mut &v.invalid, []))
+}
+
+// CREATE INDEX's clauses: index ix (its name, unqualified) of table t (any entries of an index of that name before it gone).
+pub fn onIndex(t: mut &Table, ix: &str, alters: &[]Alter): Result[Unit, DbErr] {
+    dropIndex(mut &t.invalid, ix)
+    for a in alters { if a.kind == lexdb_sql.A_ANNOT { try apply(mut &t.invalid, &("i:" + ix), &a.to, false, &up(ix)) } }
+    return Ok(Unit{})
+}
+
+// ALTER VIEW v ANNOTATIONS (...) | MODIFY (c ANNOTATIONS (...)): the view's row written again with them.
+pub fn alterView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, v0: &Table, s: &lexdb_sql.Stmt, bump: BumpFn): Result[Unit, DbErr] {
+    var v = v0.clone()
+    for a in s.alters { try applyTo(mut &v, &a) }
+    try txn.put(lexdb_catalog.CATALOG, &v.name, &(lexdb_catalog.encViewRn(&v.cols, &v.view, &v.deps, &v.spell, &v.rn, &v.invalid)))
+    return bump(st, txn, &v.name)
+}
+
+// ALTER INDEX ix ANNOTATIONS (...): ix (its catalog key) of table t (its owner checked); t's row written again.
+pub fn alterIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, ixKey: &str, s: &lexdb_sql.Stmt, bump: BumpFn): Result[Unit, DbErr] {
+    let ix = lexdb_sql.baseName(ixKey)
+    for a in s.alters { try apply(mut &t.invalid, &("i:" + ix), &a.to, false, &up(&ix)) }
+    try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(t)))
+    return bump(st, txn, &t.name)
+}
+
+// ---- what follows a column or an index
+
+fn dropScope(inv: mut &[]str, scope: &str) {
+    if len(inv) == 0 { return }
+    var keep: []str = []
+    for x in inv {
+        var gone = false
+        match decode(&x) {
+            Some(a) { gone = a.scope == scope }
+            None {}
+        }
+        if !gone { append(mut &keep, x.clone()) }
+    }
+    inv = keep
+}
+
+fn renameScope(inv: mut &[]str, from: &str, to: &str) {
+    if len(inv) == 0 { return }
+    for k in 0..len(inv) {
+        match decode(&inv[k]) {
+            Some(a) {
+                if a.scope == from {
+                    var b = a.clone()
+                    b.scope = to.toStr()
+                    inv[k] = enc(&b)
+                }
+            }
+            None {}
+        }
+    }
+}
+
+// A column dropped (DROP COLUMN): its annotations go with it.
+pub fn dropColumn(inv: mut &[]str, col: &str) { dropScope(inv, &("c:" + col)) }
+
+// A column renamed: its annotations follow it.
+pub fn renameColumn(inv: mut &[]str, from: &str, to: &str) { renameScope(inv, &("c:" + from), &("c:" + to)) }
+
+// An index dropped (its name, unqualified).
+pub fn dropIndex(inv: mut &[]str, ix: &str) { dropScope(inv, &("i:" + ix)) }
+
+// An index renamed (the names unqualified).
+pub fn renameIndex(inv: mut &[]str, from: &str, to: &str) { renameScope(inv, &("i:" + from), &("i:" + to)) }
