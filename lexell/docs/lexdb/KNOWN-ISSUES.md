@@ -273,8 +273,9 @@ smaller differences of its statement.
       key under `ADD`: `insert or update on table ... violates foreign key constraint`); SQL Server says `The ALTER TABLE
       statement conflicted with ...`.
     - An `UPDATE` tests only the `CHECK`s that read a column it sets (as SQL Server does) outside an explicit
-      transaction; inside `BEGIN TRANSACTION`, and in `MERGE`, lexdb tests every `CHECK` of the row. This shows only
-      for a check that is not trusted: a row that breaks it fails there when any of its columns is updated.
+      transaction; inside `BEGIN TRANSACTION`, in `MERGE`, and in an `UPDATE ... OUTPUT ... INTO` (a table or a table
+      variable), lexdb tests every `CHECK` of the row. This shows only for a check that is not trusted: a row that
+      breaks it fails there when any of its columns is updated.
   - A column-level `CONSTRAINT fk FOREIGN KEY REFERENCES t (c)` is 102 (without `FOREIGN KEY` it works).
   - `ON [PRIMARY]`, `TEXTIMAGE_ON`, `WITH (...)` index and table options and `ASC` / `DESC` in a key are read and not
     kept. Still syntax errors: `ROWGUIDCOL`, `SPARSE`, `FILESTREAM`, `MASKED WITH`, `NOT FOR REPLICATION`, `GENERATED
