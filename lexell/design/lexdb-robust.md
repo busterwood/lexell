@@ -99,15 +99,7 @@ instant and the offset in a second column?? No: store `Val.Tsz` natively, Postgr
 loss: KNOWN-ISSUES "a datetimeoffset is converted to UTC") take it too, in their own slice.
 
 ### PostgreSQL's bare-literal overflow and recursive CTEs (item 13)
-`SELECT 2147483647 + 1` is 22003 in PostgreSQL (two int4 literals) and 2147483648 in lexdb: constant arithmetic of integer literals is bigint.
-The Oracle door's NUMBER literals must stay unlimited, the point path (`id = 5`, `values (1, 2)`) must not slow: the fix belongs in the PostgreSQL
-and T-SQL doors' parse of a binary operator whose both operands are integer literals (fold with int4 range checks, int8 only when a literal
-is itself past int4), not in `binOp`. (Looked at in the leftovers slice: T-SQL already gives 8115 for `SELECT 2147483647 + 1`; for PostgreSQL the check
-would sit in `addExpr` / `mulExpr`, which every `v + 1` goes through, `UPDATE p SET v = v + 1 WHERE id = n` among them: a few instructions on the UPDATE
-by key, so it is not done.) A recursive CTE under LIMIT with WHERE, a join or an outer block (lexdb.md 9.139 records the plain
-case): the LIMIT is pushed into the recursion only when nothing filters the CTE's rows after it; the plan is to push it through a stop
-flag the consumer sets when its own LIMIT is met (`lexdb_recrun` produces row by row), so that a filter, join or outer aggregate on top
-of the CTE sees rows until the consumer is satisfied.
+Built in the second robustness slice (below, "The second slice").
 
 ## The leftovers (2026-11-24)
 
@@ -135,3 +127,67 @@ See lexdb-oracle.md, "As built: package variables". Tests: `tns_pkgvar` (`gen_or
 `CAST` and `CONVERT` of a uniqueidentifier to `binary(n)` / `varbinary(n)` (error 529 since the hex-literal slice; SQL Server's mixed-endian layout: the first three groups
 little-endian), of a binary to uniqueidentifier (padded or cut to 16 bytes), a uniqueidentifier as a string in upper case (8170 for `varchar(n)` under 36);
 `OBJECTPROPERTY(id, 'TableHasNonclustIndex')`. Test: `tds_guidbin`.
+
+## The second slice (2026-11-24)
+
+The planned items of "Plans" and the gaps the last slice left, on `worktree-agent-a9cdc75e89e3586c6` (from main 6275b6eb, tags `rp-base` and `rp`). Each was checked against the
+products (PostgreSQL 19, SQL Server 2022, Oracle Free 23.26) and has a test per door that has the behaviour: `exec_robust2` (`gen_pg.py robust2`), `tds_robust2`
+(`gen_mssql.py robust2`), `tns_robust2` (`gen_oracle.py --check tns_robust2`: 0 differences).
+
+### A recursive CTE under LIMIT with a filter, a join or a derived table
+PostgreSQL and SQL Server make the CTE's rows as the query above it asks for them: `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT i FROM n WHERE i % 7 = 0 LIMIT 3`
+is 7, 14, 21 (`TOP 3` with `OPTION (MAXRECURSION 0)` too; MAXRECURSION counts the levels the rows TOP needs take: 530 when they are further than it). Oracle never stops: ORA-32044
+for every endless recursion under `FETCH FIRST`, a join or a filter (so the Oracle door is left as it is: `lexdb_recprobe.mark` is not asked for a statement of that door).
+lexdb made a CTE's rows whole (rounds, `runRecursive`) before the query read them, so the stop flag the plan called for was not possible. What is built: a query with a LIMIT (and
+OFFSET) and no ORDER BY, grouping, DISTINCT, window, lock or set-returning function in its list, that reads one recursive CTE it alone uses (`Stmt.cteOnce`, `SubPlan.need` -2) as its first
+table, or a plain select of such a query (a derived table), marks that subquery with the rows it needs (`limitQuery`, `lexdb_recprobe.mark`; its joins are inner or left, its conditions
+call no volatile function and no subquery). `runSubs` then runs `probeRecursion` before the subquery: an attempt makes the CTE to a cap of rows (a whole round past it: `runRecursive`
+reads the cap from the run's cache, key `k` and the CTE's number, and notes how it ended under `x`), reads it with the query's levels by the row engine and counts the rows they keep.
+Too few: the cap is doubled (64 first). The attempt that has enough, or in which the recursion ended by itself, leaves its rows in the cache where `runFrom` finds them, and the query
+then runs as always, with batches on or off, to a sink or held. If the CTE's rounds ran out (max_recursion, MAXRECURSION) before the query had its rows, the CTE is run as it was: its
+error. An error of a cap's attempt may come from rows the query would not have read (`1 / (i - 40)` in the recursive part when the query is satisfied at 21): the caps below it are
+tried (a bisection: `lexdb_recprobe.Search`), the smallest that errors gives the error. `limitRecursion` (the plain case, 9.139) took a CTE read twice as read by this query alone:
+`(SELECT * FROM r LIMIT 3) UNION ALL (SELECT * FROM r)` gave the second part three rows; it asks `cteOnce` now. A door's recursion (`runRecursiveAs`: SQL Server's stack spool order, made
+at the end from the rounds' lineage) stops at a cap only while every round has made one row (a chain: its order is the rounds'); a tree runs to MAXRECURSION as before.
+Not done: a join where lexdb's planner reads the other table first (`FROM rt JOIN n`: PostgreSQL stops, lexdb gives 54001), a CTE read by a subquery of the WHERE (`IN (SELECT ...)`),
+an ORDER BY or aggregate over the CTE (PostgreSQL and SQL Server do not stop either), a constant false WHERE (PostgreSQL does not run the CTE at all). The probe runs the query's levels
+once more (EXPLAIN ANALYZE counts them twice).
+
+### PostgreSQL's bare-literal overflow
+`SELECT 2147483647 + 1`, `-2147483648 - 1`, `2147483647 * 2`, `46341 * 46341` and a chain of such (`1 + 2147483647 + 1`) are 22003 `integer out of range`, `9223372036854775807 + 1` and
+`-9223372036854775808 - 1` `bigint out of range` (a literal past int4 is a bigint, a negated literal is a literal: `-2147483648` an integer; `2147483647 + 1::bigint` and `+ 1.0` are
+not errors). Built in `lexdb_litint` (`walk`, `check`), asked by the parser for each expression of a select list in the PostgreSQL door that is not a column (`itemListAssign`), where the
+statement is read (so `WHERE false` does not hide it, as PostgreSQL's planner does not). Where it could not go: a check in `addExpr` / `mulExpr` of the parser costs every statement
+a few instructions whether it has arithmetic or not (the frame of the two functions: +12 instructions of an INSERT by a single added `try`), a call from their loops costs an UPDATE's `v + 1`
+19 instructions, the binder's `intChecked` costs nothing but cannot tell the Oracle door's NUMBER literals from the PostgreSQL door's (no dialect in `Names`), and the Oracle door's
+`2147483647 + 1` is 2147483648. The select list's `else` of the existing `isColExpr` test costs a statement of columns nothing. Not covered: literal arithmetic in WHERE, ON, HAVING,
+ORDER BY, INSERT's values and UPDATE's SET (the column's own range still gives 22003 for the last two). The Oracle door's `9223372036854775807 + 1` is ORA-01426 (Oracle: 9223372036854775808),
+and T-SQL's is 8115 (SQL Server: a numeric, no error): both as before, the literals past int4 being numbers there.
+
+### UPDATE's CHECKs, SQL Server and Oracle
+The retry of the whole statement (`retryLax`, `failedInBlock`, a memo key) is gone, with its gaps (BEGIN TRANSACTION of the T-SQL door, `UPDATE ... OUTPUT ... INTO`, `MERGE`, a single
+autocommit UPDATE of the Oracle door). `updRow`'s check failure tags its error (`LAX` in its `context`; the error path only) and the places that know the columns a statement sets try the
+row again (`laxRow`): `updateB` (the plain UPDATE, UPDATE ... FROM, the two-phase form), `mergeApply` (the clause's targets: `MAct.set`) and `upsertOld`; the checks that read one of the columns are
+tested, and the row is written by `updRow` with a copy of the table that has no other check. PostgreSQL's door gets the error untagged (every check), a cascade's child too.
+SQL Server 2022 and Oracle Free: `SET a = a` fails when a CHECK that is not validated reads `a`, `SET b = ...` does not, in a transaction, with OUTPUT INTO a table or a table variable, in MERGE
+(Oracle's WHERE and DELETE WHERE forms too), in `UPDATE ... FROM` and `UPDATE TOP`; an INSERT tests every check.
+
+### Oracle package variables as targets
+`SELECT ... INTO pkg.v`, `FETCH c INTO pkg.v`, `... RETURNING ... INTO pkg.v`, `EXECUTE IMMEDIATE ... INTO pkg.v` and `USING OUT | IN OUT pkg.v`, and a procedure's OUT and IN OUT arguments
+`proc(pkg.v)` work from outside the package (lexdb-oracle.md, "As built: package variables"). `Cx.target` gives a slot of the statement's own, `Cx.stmt` wraps the statement and the
+`K_PVSET`s that copy the slots to the variables into a block, so an error leaves a variable as it was (Oracle's by-copy OUT). Found on the way, not fixed: `SELECT pkg.f() FROM dual` of a
+function reading a package variable is the plan's constant: a second `SELECT pv.f() FROM dual` after an assignment gives the first answer (the same on main).
+
+### FORMAT in the other 36 cultures
+`lexdb_tsqlfmt.CULTURES` has the dates of every specific culture the table of numbers knows (47 with the ten) except ar-SA (the Hijri calendar): names, abbreviations, AM and PM, the date
+separator and `d D t T M Y` (so `f F g G`) read from SQL Server 2022 with two dates and read off into patterns by a script that reproduces the ten that were there exactly. New: the genitive
+month names (`MMMM` beside a `d` or `dd` of the pattern, outside the quotes: .NET's rule `genitive`; pl, cs, ru, uk, el and fi-FI), the time separator a custom `:` takes (fi-FI and id-ID: `.`),
+and Thai Buddhist years (+543). Test: a batch per culture in `tds_robust2`. A name of two letters takes the first specific culture (`zh` is zh-CN).
+
+### Measured
+In process (`pts.lxl`, 5,000 statements minus none, `LXL_HASH_SEED=1`, two rounds, base = main 6275b6eb): point select 109,187 against 109,168, UPDATE by key 55,289,924 against 55,289,920
+(without and with a CHECK: 55,288,138 / 55,288,134), INSERT 55,290,085 / 55,290,083 and 55,287,197 / 55,287,195.
+Over the wire (`icount6.sh`, 20,000 point selects x 3, base and branch alternated twice): instructions 170,621 and 170,629 against 170,559 and 170,613, cycles 97,814 and 98,147 against 98,544
+and 97,187, L1 i-cache misses 377 and 375 against 404 and 397 (code placement: the instructions are lower, the cycles level), iTLB misses 55 against 33. TPC-H SF1, 22 queries, base and
+branch alternated twice, checksums equal on all 22, best of two: total 8,810 ms against 8,769 ms, no query more than 1.4% slower (q13, within its runs' spread).
+`replica.py` passes.

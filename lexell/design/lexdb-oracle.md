@@ -1149,7 +1149,7 @@ them before any call (`pkgSave`), so a read from outside sees them. In a stateme
 when the statement's text names `pkg.var` of a package that has it (so a table alias named as a package with such a column is the case it gets wrong). Checked against Oracle
 Free by two sessions: a second session reads the initial value, not the first's; the session that makes the body again starts afresh silently; another session's next *call* into the
 package is ORA-04068 once (`pkgStateOf`, `call`: the state discarded when the source changed since it was made) and then runs on a fresh state; a variable read or assigned from
-outside keeps the state it has, with no error. Not done: a package variable as an INTO target or an OUT argument, a record or collection variable, and (as before) a stored
+outside keeps the state it has, with no error. A package variable is an INTO target (`SELECT`, `FETCH`, `RETURNING`, `EXECUTE IMMEDIATE`) and an OUT or IN OUT argument from outside the package too (second robustness slice: `Cx.target` gives the statement a slot of its own and `Cx.stmt` copies it to the variable after the statement ran, so an error leaves the variable as it was; a constant is PLS-00363, a missing name ORA-06550; `tns_robust2`). Not done: a record or collection variable, a function reading a package variable in `SELECT f() FROM dual` (the plan's constant, a second call after an assignment gives the first answer), and (as before) a stored
 function in a DML statement's own text (`INSERT ... VALUES (f())` is ORA-00904: functions are run for a query's rows only). Tests: `tns_pkgvar` (`gen_oracle.py --check`: 0
 differences), `tns_pkgstate`.
 

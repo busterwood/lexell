@@ -1168,10 +1168,7 @@ is_disabled and is_not_trusted. Test `tds_unenforced` (50 batches against SQL Se
 
 `INSERT ... SELECT`, UPDATE and MERGE into a table with a foreign key and a CHECK that a row fails part way: 547 (the chunk's rows were written twice, 2627; see lexdb.md).
 `ALTER TABLE ... DROP COLUMN` of a column a CHECK reads is 5074 (`The object 'ck' is dependent on column 'c'.`), whatever the check reads; the check and the column stay
-(`lexdb_conerr.checkDropErr`). An UPDATE tests only the CHECKs that read a column it sets (SQL Server; lexdb tested all): in the error path only, so the UPDATE by key
-costs nothing more: a row that fails a check (23514) in an UPDATE of this door or Oracle's runs once more (`retryLax`, in a block after the door's savepoint
-`failedInBlock`) with the SET columns under `laxKey`, and `laxChecks` leaves out the checks that read none of them; outside a transaction block, and in a block only
-where a savepoint guards the statement. `FORMAT` (`lexdb_tsqlfmt`): the custom sections `pos;neg;zero` (a value that rounds to zero takes the zero section, the
+(`lexdb_conerr.checkDropErr`). An UPDATE tests only the CHECKs that read a column it sets (SQL Server; lexdb tested all): in the error path only, so the UPDATE by key costs nothing more: a row that fails a check (23514) in an UPDATE of this door or Oracle's is tried again by the statement that knows the columns it sets (`laxRow`, called from `updateB`, `mergeApply` and the upsert: in `BEGIN TRANSACTION`, with `OUTPUT ... INTO`, in `MERGE`), which tests the checks that read one of them. `FORMAT` (`lexdb_tsqlfmt`): the custom sections `pos;neg;zero` (a value that rounds to zero takes the zero section, the
 negative section shows no sign, an empty one is the first with the sign), literals stay where they stand between the digit placeholders (`###-##-####`), the numbers of
 61 cultures as SQL Server 2022 gives them (separators, India's grouping, C and P patterns: `NUMCULS`, read from it), the invariant culture's numbers and dates for a name
 of the form of a culture that SQL Server takes without knowing it (`xx`, `xx-YY`), and error 9818 for a name that is none (`english`, `en_US`, `x`, an empty one;
