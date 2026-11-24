@@ -1362,3 +1362,32 @@ Test: tests/run/native_param_regs. It covers a comparator; six and eight paramet
 two on the stack); an aggregate result in memory; a parameter read after a call; doubles and
 integers mixed; a guard; narrow types; and calls through function values and a closure. It runs
 on --c, --native and -O, and the expected output is the previous compiler's.
+
+## 33. The runtime's swap moves words, not bytes (as built)
+
+**What closures spends its time on.** The closures benchmark sorts records with `sortBy` and a
+closure comparator. `sortBy` sorts an index slice, then moves the elements into place with
+`rt_swap`, and `rt_swap` swapped one byte at a time. For 24- and 32-byte elements, that is 24 to 32
+loads and stores each way, and it accounted for about 9% of the program's instructions.
+
+**The change.** `rt_swap` (native/rt.c) now swaps 8-byte words through `__builtin_memcpy`, which
+works at any alignment, and swaps a tail of fewer than 8 bytes one byte at a time. When the two
+positions are the same, each word is swapped with itself, as before. `rtx.lxl` is regenerated from rt.c.
+
+| measure (2977ded0 against this; perfsuite on the a1c47b3c inputs, 4 placements, CPU 2) | instructions | cycles |
+|---|---:|---:|
+| closures | -8.70% | -5.68% (apart) |
+| run suite | -0.45% | -0.26% |
+| compile suite | 0 | -0.10% |
+| closures `-O`, 3 interleaved rounds | -9.2% | -3.7 to -4.4% (489.4-499.6M to 471.2-477.5M) |
+| apps regex / json / jq / cmark / decimal | 0 | -0.2 / -0.3 / +0.8 / 0 / -0.1%, ranges overlapping |
+| TPC-H SF1, server instructions per query (22) | +0.01% geomean | |
+| lexdb point select (icount6) | level (169,567-169,649 against 169,592-170,501) | one disturbed round on each side |
+
+The gate, the lexdb tests (360), vrgen and loopgen (300 each) and run_native (1,816) all pass.
+
+**What is left in sortBy.** The comparator runs through the index slice, so every comparison
+loads two indices and then two elements from wherever they are. On the benchmark's 200,000
+elements, those loads miss the cache. A sort that moves the elements themselves would need the
+runtime to call the closure, and the C FFI has no closure callbacks. Doing that means a runtime
+or language feature, so it is a design question, not a code-generation change.

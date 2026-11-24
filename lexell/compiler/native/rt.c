@@ -2160,7 +2160,16 @@ void rt_swap(lxl_slice a, int64_t i, int64_t j, size_t size, const char* w) {
     rt_idx(i, a.len, w); rt_idx(j, a.len, w);
     char* p = (char*)a.data + (size_t)i * size;
     char* q = (char*)a.data + (size_t)j * size;
-    for (size_t k = 0; k < size; k++) { char t = p[k]; p[k] = q[k]; q[k] = t; }
+    /* a word at a time (p == q swaps each word with itself), the bytes of a tail one by one */
+    size_t k = 0;
+    for (; k + 8 <= size; k += 8) {
+        uint64_t x, y;
+        __builtin_memcpy(&x, p + k, 8);
+        __builtin_memcpy(&y, q + k, 8);
+        __builtin_memcpy(p + k, &y, 8);
+        __builtin_memcpy(q + k, &x, 8);
+    }
+    for (; k < size; k++) { char t = p[k]; p[k] = q[k]; q[k] = t; }
 }
 lxl_slice rt_as_slice(lxl_arr* a) { return (lxl_slice){a->data, a->len}; }
 lxl_slice rt_sub(lxl_slice s, int64_t lo, int64_t hi, size_t size, const char* w) {
