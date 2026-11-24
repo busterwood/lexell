@@ -13069,3 +13069,11 @@ A recursive CTE under LIMIT, TOP or FETCH FIRST with a WHERE, a join, a left joi
 twice is made whole again (`limitRecursion` had limited the other use too). `SELECT 2147483647 + 1` and the like in a select list are 22003 (`lexdb_litint`; the T-SQL door's 8115 and the
 Oracle door's NUMBER are as before). An UPDATE of the SQL Server and Oracle doors tests only the checks that read a column it sets in every statement form (`laxRow`: the retry of the
 statement is gone). Oracle package variables are INTO and OUT targets (`Cx.target`). T-SQL `FORMAT` has the dates of 46 cultures. Tests: `exec_robust2`, `tds_robust2`, `tns_robust2`.
+
+### 9.144 NOT NULL constraints in PostgreSQL's catalogs, COPY's JSON, ON_ERROR and REJECT_LIMIT (lexdb-new-features.md 11)
+
+`pg_constraint` has a row of contype `n` for each NOT NULL column (`lexdb_nncon`, `lexdb_nnalter`: the names given kept as marker entries in `Table.invalid`, the others
+`table_column_not_null`; `CatSnap.nns`, read by the PostgreSQL door's catalogs only), `pg_get_constraintdef` reads `NOT NULL c`, ALTER TABLE ... DROP CONSTRAINT and RENAME CONSTRAINT act on
+them. `COPY ... TO (FORMAT json [, FORCE_ARRAY])` writes one object a row (`lexdb_copyjson`); `COPY ... FROM` takes `ON_ERROR ignore` (a row a column's type does not take is skipped and
+counted, a NOTICE at the end), `REJECT_LIMIT n` and `LOG_VERBOSITY verbose | silent` in the generic row loop only (the fast path takes no COPY with ON_ERROR). Tests `exec_nncon`, `exec_copyopts`.
+Plan: Oracle annotations (lexdb-new-features.md 8.5).

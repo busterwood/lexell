@@ -55,7 +55,7 @@ Checked on 19.0 unless marked. "P18" etc.: the release that added it.
 | P4 | `WAIT FOR LSN 'lsn' [WITH (MODE 'standby_replay\|standby_write\|standby_flush\|primary_flush', TIMEOUT '...', NO_THROW)]` (P19) | on a primary: `recovery is not in progress` (55000) for the standby modes | as PostgreSQL 19 (lexdb.md 9.137): the options, statuses and errors, checked against a 19.0 primary and standby; lexdb's LSN is the batch number; `pg_current_wal_lsn`, `pg_last_wal_replay_lsn`, `pg_last_wal_receive_lsn`, `pg_is_in_recovery` added (was 42601 at `wait`) | works (replica branch) | M, with the replica work (the user's order) | none (SQL Server and Oracle have no statement for it) | lexdb_standby, lexdb_parse, lexdb_store (Follower.waitApplied) |
 | P5 | `lag/lead/first_value/last_value/nth_value(...) IGNORE NULLS \| RESPECT NULLS OVER (...)` (P19) | NULLs skipped in the frame (lag/lead: in the offset) | as PostgreSQL 19: lag and lead the off'th value not NULL (0 the row's own, a negative offset the other way), first_value, last_value, nth_value over any frame and EXCLUDE; 0A000, 42809 (was 42601 at `nulls`) | works (4e1cf747) | M | SQL Server 2022 (FIRST_VALUE, LAST_VALUE, LAG, LEAD: S15), Oracle (`f(x IGNORE NULLS)` and `f(x) IGNORE NULLS`: O25) | lexdb_parse, lexdb_window |
 | P6 | `CHECK (...) NOT ENFORCED`, `REFERENCES ... NOT ENFORCED` (P18); `ALTER TABLE ... ALTER CONSTRAINT c [NOT] ENFORCED` for CHECK (P19) | rows not checked while not enforced; ENFORCED rechecks (23514 "is violated by some row") | as PostgreSQL 18 and 19: NOT ENFORCED on a CHECK or foreign key (column and table constraints, ADD CONSTRAINT), ALTER CONSTRAINT [NOT] ENFORCED (the rows checked: 23514, 23503), VALIDATE of one not enforced 55000, 42601 on a key, NOT NULL or default, 0A000 on a table key; pg_constraint.conenforced, pg_get_constraintdef, information_schema.table_constraints.enforced (10.8) | works (fe8daf59) | M | Oracle `CHECK (...) DISABLE`, `ENABLE NOVALIDATE` (O26); SQL Server `WITH NOCHECK`, `NOCHECK CONSTRAINT` (S22) | lexdb_parse `stateWord`, lexdb_catalog, lexdb_exec `conState` |
-| P7 | `CONSTRAINT n NOT NULL col` as a table constraint (P18) | a named NOT NULL, kept in pg_constraint (contype `n`, every NOT NULL there, `t_c_not_null` by default), information_schema's CHECK rows, DROP / RENAME CONSTRAINT | the syntax as PostgreSQL 18 (`[CONSTRAINT n] NOT NULL c` in CREATE TABLE and ALTER TABLE ... ADD, 42703, 42601 for two names of a column); the name is not kept, the catalogs list no NOT NULL constraints, DROP CONSTRAINT n 42704 | works (syntax, ec3c5c17) / missing (the catalogs: plan in 8.4) | S (syntax) / M (catalogs) | none | lexdb_parse `nnCons`; lexdb_catalog, lexdb_pgcat |
+| P7 | `CONSTRAINT n NOT NULL col` as a table constraint (P18) | a named NOT NULL, kept in pg_constraint (contype `n`, every NOT NULL there, `t_c_not_null` by default), information_schema's CHECK rows, DROP / RENAME CONSTRAINT | the syntax as PostgreSQL 18 (`[CONSTRAINT n] NOT NULL c` in CREATE TABLE and ALTER TABLE ... ADD, 42703, 42601 for two names of a column); the name is not kept, the catalogs list no NOT NULL constraints, DROP CONSTRAINT n 42704 | works (syntax, ec3c5c17; the catalogs: 11) | S (syntax) / M (catalogs) | none | lexdb_parse `nnCons`; lexdb_catalog, lexdb_pgcat |
 | P8 | `uuidv7([shift interval])`, `uuidv4()` (P18); `uuid_extract_version`, `uuid_extract_timestamp` (P17) | | as PostgreSQL: version 7 with 12 bits of the sub-millisecond, rising within the process; the version and time of versions 1, 4, 7 (NULL for another variant) (was 42883) | works (f8c07339) | S | Oracle `UUID()`, `IS_UUID()` (O14, works); T-SQL NEWID (works) | lexdb_newfn |
 | P9 | `casefold`, `array_sort`, `array_reverse`, `crc32`, `crc32c`, `gamma`, `lgamma` (P18) | | as PostgreSQL but array_sort (lexdb-gaps.md 2.1: 42883 still); gamma and lgamma the C library's (its last digit may differ from another libm's) | works (271ca36e) / missing (array_sort) | S (together) | none | lexdb_newfn |
 | P10 | `reverse(bytea)` (P18) | `\x0102` gives `\x0201` | as PostgreSQL (was `2010x\`, the bytea's text reversed) | works (91781b58) | S | none | lexdb_lib |
@@ -64,7 +64,7 @@ Checked on 19.0 unless marked. "P18" etc.: the release that added it.
 | P13 | named arguments of `regexp_*` (`pattern =>`, P18) | | `function regexp_replace does not accept named arguments` (plan in 9.3) | missing | S | none | lexdb_parse `paramsOf`, lexdb_bind |
 | P14 | `error_on_null(x)` (P19); `random(min, max)` for integers and numerics (P17), dates and timestamps (P19) | | as PostgreSQL: error_on_null (22004), random of integers and numerics (22023; the larger scale); of dates and timestamps 42883 still | works (271ca36e) / missing (random of dates) | S | none | lexdb_newfn |
 | P15 | `encode/decode(..., 'base64url' \| 'base32hex')` (P19) | `Af8` | as PostgreSQL 19 (was 22023 unrecognized encoding) | works (f8c07339) | S | T-SQL `BASE64_ENCODE(x, 1)` url-safe (S7, works) | lexdb_lib, lexdb_newfn |
-| P16 | `COPY ... TO (FORMAT json [, FORCE_ARRAY])` (P19); `ON_ERROR ignore \| set_null`, `REJECT_LIMIT` (P17-19) | one JSON object a line | `COPY format "json" not recognized`; `COPY's option "on_error" is not supported` | missing | M (JSON output is small; ON_ERROR needs the per-row error path of COPY FROM) | none | lexdb COPY (lexdb_exec, lexdb_wire) |
+| P16 | `COPY ... TO (FORMAT json [, FORCE_ARRAY])` (P19); `ON_ERROR ignore \| set_null`, `REJECT_LIMIT` (P17-19) | one JSON object a line | `COPY format "json" not recognized`; `COPY's option "on_error" is not supported` | works but ON_ERROR set_null (11) | M (JSON output is small; ON_ERROR needs the per-row error path of COPY FROM) | none | lexdb COPY (lexdb_exec, lexdb_wire) |
 | P17 | json/jsonb, IS JSON, JSON_TABLE, JSON_VALUE/QUERY/EXISTS (P17), JSON_OBJECT/ARRAY/ARRAYAGG/OBJECTAGG (P16), `json_array()` of no rows `[]` (P19), jsonpath string methods (P19), `json_strip_nulls(.., true)` (P18) | | only `json_build_object` exists (lexdb-gaps.md 2.1) | missing | L (section 6.3) | SQL Server (S10), Oracle (O29) | new lexdb_json |
 | P18 | virtual generated columns, the default kind (P18); `SET EXPRESSION` of a virtual column with a CHECK (P19) | | as PostgreSQL | works | | | |
 | P19 | `MIN/MAX` of arrays (P18); `MERGE ... WHEN NOT MATCHED BY SOURCE ... RETURNING merge_action()` (P17); `GRANT ... GRANTED BY` (P19) | | as PostgreSQL (MERGE RETURNING's rows come in another order without ORDER BY) | works | | | |
@@ -130,7 +130,7 @@ Checked on 2025 RTM-CU10 at level 170 unless marked 2022.
 | O18 | `ANY_VALUE` (21c) | | as Oracle (was ORA-00979) | works (f8c07339) | S | PostgreSQL 16 (P23, works) | lexdb_agg |
 | O19 | `RETURNING OLD c, NEW c INTO :a, :b` for INSERT, UPDATE, DELETE, MERGE (23ai) | INSERT's OLD NULL, DELETE's NEW NULL; OLD/NEW before any column of an expression; ORA-00904 for `old.c` and `OLD f(x)`, ORA-01747 for `OLD *`, ORA-03050 without a column; MERGE with DELETE WHERE ORA-03001; INSERT ... SELECT has no RETURNING (ORA-03049) | as Oracle (ec3c5c17), through the door's RETURNING INTO and in PL/SQL; the two errors of other RETURNINGs (03001, 03049) too (they were accepted) | works (ec3c5c17) | (P2) | PostgreSQL 18 (P2), T-SQL OUTPUT (works) | lexdb_parse |
 | O20 | `DEFAULT ON NULL [FOR INSERT ONLY \| FOR INSERT AND UPDATE] v` (12c; UPDATE 23ai) | a NULL written becomes the default, the column NOT NULL; an UPDATE to NULL ORA-01407 unless FOR INSERT AND UPDATE; USER_TAB_COLUMNS' DEFAULT_ON_NULL, DEFAULT_ON_NULL_UPD | as Oracle (ec3c5c17): INSERT, INSERT ... SELECT, UPDATE, MERGE, ALTER TABLE ADD / MODIFY, the views, ORA-02000, 00936, 30665 | works (ec3c5c17) | S | none | lexdb_parse `oraDefault`, lexdb_exec `onNullFill`, lexdb_oracat |
-| O21 | annotations: `ANNOTATIONS (name 'value', ...)` on tables and columns, `USER_ANNOTATIONS_USAGE` | | ORA-00900 | missing | M: kept in the catalog, listed in the views | none | lexdb_parse, lexdb_oracat |
+| O21 | annotations: `ANNOTATIONS (name 'value', ...)` on tables and columns, `USER_ANNOTATIONS_USAGE` | | ORA-00900 | missing (plan: 8.5) | M: kept in the catalog, listed in the views | none | lexdb_parse, lexdb_oracat |
 | O22 | SQL/PGQ: `CREATE PROPERTY GRAPH`, `GRAPH_TABLE (g MATCH ... WHERE ... COLUMNS (...))`, bounded quantifiers `->{1,2}` | rows as the joins of the pattern; ORA-42421 for an unknown graph | ORA-00900 | missing | L (section 6.3) | none (PostgreSQL 19 has not; SQL Server's MATCH over NODE/EDGE tables is another design) | new lexdb_graph |
 | O23 | `CREATE ASSERTION a CHECK (NOT EXISTS (...) \| ALL (...) SATISFY (...))` (23.26.1) | ORA-08601 `Assertion (APP.A1) violated` at the DML; no aggregates (ORA-08689, ORA-00934); `USER_ASSERTIONS` | ORA-00900 | missing | L (section 6.3: a design note) | none | new lexdb_assert |
 | O24 | `IS [NOT] DISTINCT FROM` | not Oracle's (ORA-00908, 23.26.3) | accepted (lexdb's extension in this door) | works (kept: the user's decision, 2026-11-23) | none: the user wants it in the Oracle door too, as an extension; test tns_distinct | PostgreSQL, T-SQL 2022 | lexdb_parse |
@@ -486,6 +486,30 @@ DROP COLUMN dropping them); (b) the `n` rows in lexdb_pgcat's pg_constraint with
 existing oids do not move), pg_get_constraintdef's `NOT NULL c`, the information_schema rows; (c) DROP / RENAME
 CONSTRAINT finding them; (d) the tests that read pg_constraint without a contype filter (exec_catalog, exec_keyless and
 tds_vscode's) checked again against PostgreSQL 18. No row path is touched: NOT NULL is checked as now.
+
+### 8.5 Plan: Oracle annotations (O21, about a day and a half; not built)
+
+Checked against Oracle Free 23.26.3 (2026-11-24). Annotations are name/value pairs the catalog keeps for an object or one of its columns; nothing reads them but
+the dictionary views. What the product does:
+- Syntax: `ANNOTATIONS (name ['value'], ...)` after the column list of CREATE TABLE and after a column's own definition (`id number ANNOTATIONS (Display 'Id', Hidden)`:
+  after a NOT NULL, not before: ORA-03099 otherwise), on CREATE VIEW (before AS) and CREATE INDEX (after the column list); `ALTER TABLE | VIEW | INDEX t ANNOTATIONS
+  (ADD [IF NOT EXISTS] n ['v'] | DROP [IF EXISTS] n | REPLACE n ['v'], ...)`; `ALTER TABLE | VIEW t MODIFY (col ANNOTATIONS (ADD | DROP | REPLACE ...))`. A name is an
+  identifier (unquoted: upper case, quoted: kept; up to 1024 characters) and may be a keyword except where the parser cannot tell (`LONG`: ORA-11548); a value is a text
+  literal of up to 4000 characters, none for a flag annotation (`Hidden`); an empty value, NULL, `DROP IGNORE` are ORA-11549.
+- A name of a list given twice is kept twice (`A1 'x', A1 'y'`: two rows); ADD of a name that is there adds a second (no error; IF NOT EXISTS does nothing); REPLACE and DROP
+  of a name that is not there are ORA-11553 (`DROP IF EXISTS`: nothing); ADD on a column that does not exist ORA-00904. DDL commits, the annotations go with a table's
+  DROP and follow RENAME.
+- Views: USER_, ALL_ (and DBA_) `ANNOTATIONS_USAGE` (OBJECT_NAME, OBJECT_TYPE `TABLE` | `VIEW` | `INDEX`, COLUMN_NAME null for the object's own, DOMAIN_NAME, DOMAIN_OWNER,
+  [ANNOTATION_OWNER in ALL_ and DBA_], ANNOTATION_NAME, ANNOTATION_VALUE null for a flag), `ANNOTATIONS` (the names in use: ANNOTATION_NAME) and `ANNOTATION_VALUES`
+  (name, value).
+What it takes, as lexdb's other labels are kept (T-SQL's cluster labels, 10.5's unenforced constraints, 8.4's NOT NULL names): entries of `Table.invalid` with a prefix
+(`\x00an:`: scope (the object, `c:` a column, `i:` an index), name, value or none), so the table's row layout, its encoding and every read path stay as they are and
+a table without annotations costs nothing. (a) lexdb_parse: the clause in the Oracle CREATE TABLE / VIEW / INDEX forms and the ALTER forms above (the new `Stmt.alters`
+kinds, one for the object and one for a column, the actions in `Alter.cons`' place or a list of its own); (b) a module `lexdb_annot` for the entries (add, replace, drop,
+the errors above, the rename of a column, the drop of a column or an index) and the exec hooks in createTable, createView, createIndex and alterTable; (c) the views:
+lexdb_oradata templates for the six (tools/gen_oracle_catalog.py makes them from the container) and lexdb_oracat rows, with `USER_` and `ALL_` filtered as the other
+views are; (d) a test `tns_annotations` checked with gen_oracle.py --check. PostgreSQL and SQL Server have no annotations (a column's comment, `COMMENT ON` and
+`sp_addextendedproperty`, is another feature: lexdb-gaps.md).
 
 ## 9. The missing functions and aggregates (as built)
 
@@ -936,3 +960,44 @@ exec_unenf, tds_unenforced, tns_unenforced).
   written twice) where PostgreSQL gives 23514, on main `02646472` as well (`create table c9 (id int primary key, pid int references p9 (id), v int check (v > 0));
   insert into c9 select i + 100, 1, 2000 - i from generate_series(1, 3000) i;`: Key (id)=(1093) already exists): the chunked write of `insertSelRows`
   after a failed row. `exec_unenf` keeps its 3,000-row case on a table with no foreign key.
+
+## 11. PostgreSQL's NOT NULL constraints in the catalogs and COPY's new options (as built, 2026-11-24)
+
+Branch from main `8e7d4006` (commits after `03f140a0`). Each checked against the product first (PostgreSQL 18.6 for P7, `lxl-pg19` 19.0 for COPY's JSON).
+
+**P7 (8.4's plan held).** What PostgreSQL 18 does, beyond 8.4: the default name is `table_column_not_null` of the names as they were written (`M9_A b_not_null`), a number after
+it where the table has a constraint of that name (`t_a_not_null1`; ADD CONSTRAINT of a CHECK or key with a NOT NULL's default name is 42710); the name is fixed when the constraint
+is made, so RENAME TO and RENAME COLUMN leave it (`nt_c_not_null` after `c` became `cc`); a column that is NOT NULL already is not given a second constraint (`ADD CONSTRAINT x NOT NULL
+c` of one that has `n`: 55000 with the name in the DETAIL, the same name nothing; `ALTER COLUMN SET NOT NULL` nothing); a primary key makes its columns NOT NULL and dropping the
+key leaves them so; `DROP CONSTRAINT n` is DROP NOT NULL (42P16 on a key's column, 42601 on an identity column; 42704 for a name that is none, `IF EXISTS` a notice);
+`RENAME CONSTRAINT` (42710 for a taken name, 42704 for none); two names for one column in a column's definition are XX000 "conflicting not-null constraint names", in a table
+constraint 42601; CREATE TABLE with one name twice 42710; ADD COLUMN ... CONSTRAINT n NOT NULL names it. `information_schema.table_constraints` lists them as CHECK,
+`check_constraints` as `col IS NOT NULL` (the raw name), `constraint_column_usage` with their column, `key_column_usage` none; `pg_get_constraintdef` is `NOT NULL col`;
+`connoinherit` is true for primary key, unique and foreign key rows (it was false for all).
+What lexdb did: no row, the names thrown away. Now: `lexdb_nncon` (the names, as entries of `Table.invalid` with the prefix `\x00nn:`, "column NUL name": a table without a given
+name costs nothing, the encoding and the row path are as they were) and `lexdb_nnalter` (what CREATE TABLE and ALTER TABLE do with them: `createNames`, `setNotNull`, `dropByName`,
+`renameByName`, `beforeRenameTable`, `renameColumn`; exec calls them where a table's NOT NULL columns change); the catalog snapshot has the rows as `CatSnap.nns`, which only the
+PostgreSQL door's catalogs (`pg_constraint`, `pg_get_constraintdef`, the three information_schema views) read, so SQL Server's `sys.*` and Oracle's `USER_CONSTRAINTS` are as they were
+(`snap.cons` has none of them). The parser keeps a column's `CONSTRAINT n NOT NULL` and a table constraint's name in `Stmt.names` of a CREATE TABLE (no other use there) and an ALTER's in
+`Alter.to`. `pruneInvalid` keeps the entries. Test `exec_nncon`: 50 statements against PostgreSQL 18, each with batches off and on. Left: `\d+` of psql 18 shows no "Not-null
+constraints:" section: its query joins `a.attnum = c.conkey[1]`, and a hash join on an array subscript (`#elem` gives text, the other side is an integer) finds nothing in lexdb
+(older: the same join on `p` rows); CREATE TABLE ... LIKE is 42601 (not supported at all). Tables without a primary key number a column added later one too high in `conkey` and
+`attnum` (the hidden row id is before it; older).
+Oracle's `USER_CONSTRAINTS` lists a NOT NULL as a C row (`SYS_C...` or the given name, `SEARCH_CONDITION` `"A" IS NOT NULL`, `GENERATED` GENERATED NAME or USER NAME) and `USER_CONS_COLUMNS` a
+row for it; lexdb lists none of them (checked 2026-11-24): not built here.
+
+**P16: COPY.** PostgreSQL 19: `COPY ... TO (FORMAT json [, FORCE_ARRAY [bool]])`, a row an object of the columns' names, values as `to_json` (numbers, booleans, null, arrays as arrays, the rest
+strings; NaN and infinity strings); FORCE_ARRAY: `[`, ` {...}` and `,{...}` lines, `]` (`[` `]` for no rows; none without it); COPY FROM does not read JSON (22023);
+HEADER, QUOTE, ESCAPE, FORCE_* are 0A000 in JSON, DELIMITER and NULL 42601, FORCE_ARRAY outside JSON 22023. PostgreSQL 17-18, for FROM: `ON_ERROR ignore` (a row with a value its column's type
+does not take is skipped; any other error, missing or extra columns, a constraint, ends the COPY; the NOTICE `n rows were skipped due to data type incompatibility` at the end, one for a row
+with `LOG_VERBOSITY verbose` ("skipping row due to data type incompatibility at line n for column "c": "v""), none with `silent`), `REJECT_LIMIT n` (more rows skipped: 22P02 "skipped more than REJECT_LIMIT (n) rows ..."
+with the line; 22023 for n below 1, without ON_ERROR ignore, or with COPY TO), 22023 for a value that is none, 42601 ON_ERROR ignore with BINARY. lexdb: all of it but `ON_ERROR set_null`
+(PostgreSQL 19; 0A000). `lexdb_copyjson` writes the objects (`copyOut`, `copyStream`: one test of `copy.json` a row, COPY TO is no point path); ON_ERROR is in the generic row loop of `copyStmt`, in the
+branch where `insertOne` failed (nothing is added to a row that succeeds), and `fastCopyPlan` takes no COPY with ON_ERROR (a test once a statement). New `CopyOpts` fields (json, forceArray, onErr, reject, verb).
+Test `exec_copyopts` (the answers of PostgreSQL 19 and 18, by hand). Cost: COPY FROM of 1,000,000 rows (4 columns, text format, `--unsafe-no-sync`), base / branch, two rounds each alternated:
+the fast path 534 and 594 ms / 529 and 528 ms, the generic path (a CHECK) 1554 and 1591 ms / 1556 and 1557 ms.
+
+**Cost on the point path.** In process (LXL_HASH_SEED=1, 20,000 prepared statements, `perf stat -e instructions:u`, two rounds): select 32,801, INSERT 224,403, UPDATE by key 207,575 instructions per
+statement, base and branch the same in both rounds. Over the wire (`icount6.sh BIN 3`, points.sql): instructions 169,831 and 169,787 (base), 169,772 and 169,749 (branch); cycles 95,118 and 94,975 / 97,482 and 97,181;
+L1 i-cache misses 281 and 283 / 399 and 401. Cycles move with the code's placement, not its length: the branch of the Oracle work alone (`lexdb_plsql`, `lexdb_plcall`, `lexdb_tns`: nothing of the
+point path) is already at 349 i-cache misses and 96,698 cycles (instructions 169,743), and the same binary with P7 added at 351 and 98,696.
