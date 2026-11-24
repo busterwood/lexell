@@ -84,8 +84,9 @@ select_list:
   `IN`, `NOT IN`, `EXISTS`, and with `ANY`, `SOME` and `ALL` after a comparison. `(a, b) IN (subquery)` takes a
   list of columns. A subquery may use the columns of the query around it.
 - The empty string is NULL, and `||` ignores NULLs, as in Oracle.
-- A table name may carry its owner. The tables that the login `SA` makes are in `PUBLIC` (`PUBLIC.emp`; `sa.emp` is
-  ORA-00942); a user made with `CREATE USER` has a schema of its own. Without an owner the current schema is used.
+- A table name may carry its owner. Every login has a schema of its own, made at its first connection, and the tables it
+  makes are there (`sa.emp`). Without an owner the current schema is searched, then `public`, the PostgreSQL door's
+  schema (`public.emp` names one of its tables).
 - A syntax error is ORA-00900. An unknown column is ORA-00904, an unknown table ORA-00942, a column that is neither
   grouped nor in an aggregate ORA-00979, and a column name that two `FROM` items have is ORA-00918.
 
