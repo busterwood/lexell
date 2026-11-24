@@ -27,7 +27,8 @@ fixed value. Every view except `sys.foreign_key_columns` also has the columns of
   [sys.indexes](catalog-tables.md)), `is_system_named`, `is_enforced`.
 
 `sys.foreign_keys`
-: `referenced_object_id`, `key_index_id`, `is_disabled`, `is_not_trusted`, `delete_referential_action` and
+: `referenced_object_id`, `key_index_id`, `is_disabled` (1 after `NOCHECK CONSTRAINT`), `is_not_trusted` (1 for a key
+  added `WITH NOCHECK`, disabled, or enabled again without `WITH CHECK`), `delete_referential_action` and
   `update_referential_action` (0 no action, 1 cascade, 2 set null, 3 set default) with their `_desc` names,
   `is_system_named`.
 
@@ -37,7 +38,7 @@ fixed value. Every view except `sys.foreign_key_columns` also has the columns of
 
 `sys.check_constraints`
 : `parent_column_id`, `definition` (the condition in SQL Server's bracketed form: `([salary]>=(0))`),
-  `is_disabled`, `is_system_named`.
+  `is_disabled`, `is_not_trusted` (as for a foreign key), `is_system_named`.
 
 `sys.default_constraints`
 : `parent_column_id`, `definition` (`((1000))`), `is_system_named`.
@@ -48,6 +49,10 @@ fixed value. Every view except `sys.foreign_key_columns` also has the columns of
   `parent_object_id = object_id` and `parent_column_id = column_id`.
 - A constraint has the name it was given. An unnamed one gets lexdb's name: `table_pkey` for a primary key,
   `table_column_key` for a unique constraint, `table_column_fkey` for a foreign key.
+
+- A disabled or untrusted `CHECK` or foreign key is not dropped from these views: read `is_disabled` and
+  `is_not_trusted`. They are set by [ALTER TABLE](alter-table.md) (`WITH NOCHECK ADD`, `NOCHECK CONSTRAINT`,
+  `CHECK CONSTRAINT`, `WITH CHECK CHECK CONSTRAINT`).
 
 ## Differences from SQL Server
 
@@ -206,6 +211,67 @@ FROM sys.foreign_keys WHERE parent_object_id = OBJECT_ID('hr.child');
 name               delete_referential_action_desc update_referential_action_desc
 ------------------ ------------------------------ ------------------------------
 child_dept_id_fkey CASCADE                        SET_NULL
+
+(1 row affected)
+```
+
+### F. Disabled and not trusted constraints
+
+<!-- example: tsql -->
+```sql
+CREATE TABLE hr.badge (id int PRIMARY KEY, dept_id int, level int);
+GO
+ALTER TABLE hr.badge WITH NOCHECK ADD CONSTRAINT ck_level CHECK (level > 0);
+ALTER TABLE hr.badge ADD CONSTRAINT fk_badge_dept FOREIGN KEY (dept_id) REFERENCES hr.dept (id);
+GO
+SELECT name, is_disabled, is_not_trusted FROM sys.check_constraints WHERE parent_object_id = OBJECT_ID('hr.badge');
+SELECT name, is_disabled, is_not_trusted FROM sys.foreign_keys WHERE parent_object_id = OBJECT_ID('hr.badge');
+GO
+ALTER TABLE hr.badge NOCHECK CONSTRAINT ALL;
+GO
+SELECT name, is_disabled, is_not_trusted FROM sys.check_constraints WHERE parent_object_id = OBJECT_ID('hr.badge');
+SELECT name, is_disabled, is_not_trusted FROM sys.foreign_keys WHERE parent_object_id = OBJECT_ID('hr.badge');
+GO
+ALTER TABLE hr.badge WITH CHECK CHECK CONSTRAINT ALL;
+GO
+SELECT name, is_disabled, is_not_trusted FROM sys.check_constraints WHERE parent_object_id = OBJECT_ID('hr.badge');
+SELECT name, is_disabled, is_not_trusted FROM sys.foreign_keys WHERE parent_object_id = OBJECT_ID('hr.badge');
+```
+
+```text
+name     is_disabled is_not_trusted
+-------- ----------- --------------
+ck_level 0           1
+
+(1 row affected)
+
+name          is_disabled is_not_trusted
+------------- ----------- --------------
+fk_badge_dept 0           0
+
+(1 row affected)
+
+name     is_disabled is_not_trusted
+-------- ----------- --------------
+ck_level 1           1
+
+(1 row affected)
+
+name          is_disabled is_not_trusted
+------------- ----------- --------------
+fk_badge_dept 1           1
+
+(1 row affected)
+
+name     is_disabled is_not_trusted
+-------- ----------- --------------
+ck_level 0           0
+
+(1 row affected)
+
+name          is_disabled is_not_trusted
+------------- ----------- --------------
+fk_badge_dept 0           0
 
 (1 row affected)
 ```
