@@ -40,6 +40,8 @@ END [ package ] ;
   declared in the specification are shared by the code that uses the package, and keep their values for the session.
 - A package whose specification declares no procedure or function needs no body: its variables and constants are used
   as they are (example F).
+- A package function is called in SQL like a standalone one: in a query, in the SQL of a block and in DML (example
+  H).
 - `USER_OBJECTS` lists both as `PACKAGE` and `PACKAGE BODY`; `USER_SOURCE` has their text.
 
 ## Differences from Oracle
@@ -345,6 +347,70 @@ ORA-06550: line 2, column 17:
 PLS-00363: expression 'ST.C_K' cannot be used as an assignment target
 ORA-06550: line 2, column 3:
 PL/SQL: Statement ignored
+```
+
+### H. A package function in SQL
+
+<!-- example: oracle -->
+```sql
+CREATE OR REPLACE PACKAGE tax AS
+  FUNCTION net (p_gross NUMBER) RETURN NUMBER;
+END tax;
+/
+CREATE OR REPLACE PACKAGE BODY tax AS
+  FUNCTION net (p_gross NUMBER) RETURN NUMBER IS
+  BEGIN
+    RETURN p_gross * 0.75;
+  END;
+END tax;
+/
+SELECT name, tax.net(salary) AS net FROM emp ORDER BY id;
+CREATE TABLE payslip AS SELECT id, tax.net(salary) AS net FROM emp;
+DECLARE
+  v NUMBER;
+BEGIN
+  SELECT tax.net(salary) INTO v FROM emp WHERE id = 2;
+  DBMS_OUTPUT.PUT_LINE('in a block: ' || v);
+  FOR r IN (SELECT id, tax.net(salary) AS n FROM emp ORDER BY id) LOOP
+    DBMS_OUTPUT.PUT_LINE('cursor: ' || r.id || ' ' || r.n);
+  END LOOP;
+END;
+/
+UPDATE payslip SET net = tax.net(net);
+SELECT * FROM payslip ORDER BY id;
+ROLLBACK;
+```
+
+```text
+Package created.
+
+Package body created.
+
+NAME    NET
+---- ------
+ann    97.5
+bob  158.25
+
+2 rows selected.
+
+Table created.
+
+in a block: 158.25
+cursor: 1 97.5
+cursor: 2 158.25
+
+PL/SQL procedure successfully completed.
+
+2 rows updated.
+
+ID      NET
+-- --------
+ 1   73.125
+ 2 118.6875
+
+2 rows selected.
+
+Rollback complete.
 ```
 
 ## See also

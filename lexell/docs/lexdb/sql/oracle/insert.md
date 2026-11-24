@@ -62,6 +62,8 @@ returning_clause:
   fit; a string too long for `VARCHAR2(n)` is ORA-12899. A `DATE` keeps a time of day.
 - A column's `DEFAULT ON NULL` is used when the value given is NULL. Identity columns (`GENERATED ... AS IDENTITY`)
   and sequences (`seq.NEXTVAL`) give keys.
+- `INSERT ... SELECT` and `INSERT ... VALUES` may call a stored function (example H); a stored function in a
+  subquery that reads the table being inserted into (or refers to its columns) is refused (ORA-03001).
 - Constraint errors: ORA-00001 (unique), ORA-01400 (NULL), ORA-02290 (CHECK), ORA-02291 (no parent key).
 - The first `INSERT` begins a transaction, which `COMMIT` or `ROLLBACK` ends. A failed statement is undone alone; the
   transaction and the rows of earlier statements stay.
@@ -243,6 +245,39 @@ INSERT ALL INTO cheap VALUES (40, 'a') INTO cheap VALUES (41, 'b') SELECT * FROM
 ```text
 ERROR:
 ORA-00900: invalid SQL statement
+```
+
+### H. A stored function in INSERT ... SELECT
+
+<!-- example: oracle -->
+```sql
+CREATE OR REPLACE FUNCTION with_vat (p_price NUMBER) RETURN NUMBER IS
+BEGIN
+  RETURN ROUND(p_price * 1.2, 2);
+END;
+/
+CREATE TABLE gross (id NUMBER PRIMARY KEY, price NUMBER);
+INSERT INTO gross SELECT id, with_vat(price) FROM product WHERE price > 0;
+SELECT id, price FROM gross ORDER BY id;
+ROLLBACK;
+```
+
+```text
+Function created.
+
+Table created.
+
+3 rows created.
+
+ID PRICE
+-- -----
+ 1   0.6
+ 2   0.9
+ 3  1.44
+
+3 rows selected.
+
+Rollback complete.
 ```
 
 ## See also

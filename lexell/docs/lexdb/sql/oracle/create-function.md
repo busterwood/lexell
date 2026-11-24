@@ -36,6 +36,9 @@ END [ function ] ;
   `WHERE`, `ORDER BY` and other functions). A function with no parameters is called with empty brackets in SQL:
   `f()`.
 - A function that reads tables can be called from SQL; one that changes data can be called from PL/SQL.
+- The call works in a query sent by itself, in the SQL of a block (`SELECT f(x) INTO`, a cursor, a cursor `FOR` loop,
+  `EXECUTE IMMEDIATE`, the DML of the block) and in `INSERT ... SELECT`, `UPDATE`, `DELETE` and `CREATE TABLE AS`
+  (example G). The function runs once for each distinct set of arguments the statement gives it.
 - A function that raises an unhandled exception ends the statement that called it with that error (example D, from
   PL/SQL). Called from a query, a function whose `SELECT ... INTO` finds no row (`NO_DATA_FOUND`) gives NULL, as in
   Oracle; any other error ends the query with the error and the `ORA-06512` lines of the function (example F).
@@ -47,6 +50,10 @@ END [ function ] ;
 
 - **A function with no parameters needs brackets in SQL.** `SELECT f FROM dual` is ORA-00904 (Oracle accepts it);
   write `f()`. Inside PL/SQL both forms work for a package function.
+- A stored function is refused (ORA-03001, `unimplemented feature`) in a `MERGE`, in a subquery of an `INSERT`,
+  `UPDATE` or `DELETE` that reads the statement's own table or refers to its columns, and with an argument that is an aggregate or another
+  stored function's call (`f(SUM(x))`, `f(g(x))`). `CREATE VIEW` of a query that calls one is ORA-00904 (Oracle
+  allows it). Example H.
 - Pipelined and table functions, `RESULT_CACHE`, `PARALLEL_ENABLE`, `AGGREGATE USING` and `AUTHID` are not supported.
 - A `SYS_REFCURSOR` result works from PL/SQL; a JDBC client reads it as a cursor.
 
@@ -231,6 +238,97 @@ ID OK
 ERROR:
 ORA-20001: id too large
 ORA-06512: at "SA.STRICT_PAY", line 4
+```
+
+### G. A function in the SQL of a block, and in DML
+
+A stored function works in every SQL statement: a query of a block, a cursor, `EXECUTE IMMEDIATE`, `INSERT ... SELECT`,
+`UPDATE`, `DELETE` and `CREATE TABLE AS`.
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE bonus (id NUMBER PRIMARY KEY, amount NUMBER);
+INSERT INTO bonus SELECT id, double_it(salary) FROM emp;
+UPDATE bonus SET amount = double_it(amount) WHERE id = 2;
+CREATE TABLE doubled AS SELECT id, double_it(amount) AS amount FROM bonus;
+DECLARE
+  v NUMBER;
+BEGIN
+  SELECT double_it(salary) INTO v FROM emp WHERE id = 2;
+  DBMS_OUTPUT.PUT_LINE('select into: ' || v);
+  FOR r IN (SELECT name, double_it(salary) AS d FROM emp ORDER BY id) LOOP
+    DBMS_OUTPUT.PUT_LINE('cursor: ' || r.name || ' ' || r.d);
+  END LOOP;
+  EXECUTE IMMEDIATE 'SELECT double_it(salary) FROM emp WHERE id = :1' INTO v USING 1;
+  DBMS_OUTPUT.PUT_LINE('dynamic: ' || v);
+  DELETE FROM bonus WHERE amount > double_it(300);
+  DBMS_OUTPUT.PUT_LINE('deleted: ' || SQL%ROWCOUNT);
+END;
+/
+SELECT * FROM bonus ORDER BY id;
+SELECT * FROM doubled ORDER BY id;
+ROLLBACK;
+```
+
+```text
+Table created.
+
+2 rows created.
+
+1 row updated.
+
+Table created.
+
+select into: 400
+cursor: ann 200
+cursor: bob 400
+dynamic: 200
+deleted: 1
+
+PL/SQL procedure successfully completed.
+
+ID AMOUNT
+-- ------
+ 1    200
+
+1 row selected.
+
+ID AMOUNT
+-- ------
+ 1    400
+ 2   1600
+
+2 rows selected.
+
+Rollback complete.
+```
+
+### H. What is still refused
+
+<!-- example: oracle -->
+```sql
+MERGE INTO bonus b USING emp e ON (b.id = e.id) WHEN MATCHED THEN UPDATE SET b.amount = double_it(e.salary);
+UPDATE bonus SET amount = 0 WHERE EXISTS (SELECT 1 FROM emp e WHERE e.salary > double_it(bonus.amount));
+CREATE VIEW doubled_pay AS SELECT id, double_it(salary) AS pay FROM emp;
+SELECT double_it(SUM(salary)) AS total FROM emp;
+SELECT double_it(double_it(salary)) AS quad FROM emp ORDER BY id;
+```
+
+```text
+ERROR:
+ORA-03001: unimplemented feature: lexdb: a stored function called in a MERGE statement is not supported
+
+ERROR:
+ORA-03001: unimplemented feature: lexdb: a stored function called in a subquery that reads the statement's table is not supported in INSERT, UPDATE and DELETE
+
+ERROR:
+ORA-00904: invalid identifier
+
+ERROR:
+ORA-03001: unimplemented feature: lexdb: an argument of a stored function that is an aggregate or calls a stored function is not supported
+
+ERROR:
+ORA-03001: unimplemented feature: lexdb: an argument of a stored function that is an aggregate or calls a stored function is not supported
 ```
 
 ## See also

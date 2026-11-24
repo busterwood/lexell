@@ -64,6 +64,9 @@ read them, and return no rows).
 
 - Statistics columns (`NUM_ROWS`, `LAST_ANALYZED`, ...) are empty; `DBMS_STATS` calls are accepted and do nothing.
 - Every key index is named after its table (`EMP_PKEY`) where Oracle uses `SYS_Cnnnnnn` for system-generated names.
+- `USER_CONSTRAINTS` and `USER_CONS_COLUMNS` have no rows for `NOT NULL` constraints (Oracle: type `C`, `SEARCH_CONDITION`
+  `"A" IS NOT NULL`); [CREATE TABLE](create-table.md), example K. `USER_ANNOTATIONS_USAGE` does not exist, as annotations are
+  not supported.
 - `USER_INDEXES.COMPRESSION` is `DISABLED` and the storage columns are empty.
 - `USER_SOURCE` and the other program views are on [their own page](data-dictionary-programs.md).
 - Views Oracle has and lexdb has not (`USER_TAB_PRIVS_MADE`, `USER_TAB_PRIVS_RECD`, `ROLE_TAB_PRIVS`) are

@@ -53,6 +53,8 @@ returning_clause:
   changed.
 - The new values of all the rows (and `RETURNING`) are worked out before any row is written, so a subquery in `SET`
   or `RETURNING` sees the table as the statement found it, not its own changes (example G).
+- `SET` and `WHERE` may call a stored function (example J). It is refused (ORA-03001) in a subquery that reads the
+  table being updated or refers to its columns, and with an argument that is an aggregate or another stored function's call.
 - `WHERE ROWNUM <= n` limits the statement to the first n rows it finds (example I).
 - The first `UPDATE` begins a transaction, which `COMMIT` or `ROLLBACK` ends. A statement that fails is undone alone.
 - A value is converted to its column's type, and constraints are checked: ORA-00001 (unique), ORA-01407 (a `NOT
@@ -371,6 +373,49 @@ ID NAME SALARY
  3 Cid    6100
  4 Dee    6100
  5 Eve    3000
+
+5 rows selected.
+
+Rollback complete.
+```
+
+### J. A stored function in SET
+
+<!-- example: oracle -->
+```sql
+CREATE OR REPLACE FUNCTION raised (p_salary NUMBER, p_percent NUMBER) RETURN NUMBER IS
+BEGIN
+  RETURN ROUND(p_salary * (1 + p_percent / 100), 2);
+END;
+/
+UPDATE emp SET salary = raised(salary, 10) WHERE dept_id = 1;
+SELECT name, salary FROM emp WHERE dept_id = 1 ORDER BY id;
+UPDATE emp SET salary = raised(salary, 10) WHERE salary > raised(5000, 10);
+SELECT name, salary FROM emp ORDER BY id;
+ROLLBACK;
+```
+
+```text
+Function created.
+
+2 rows updated.
+
+NAME SALARY
+---- ------
+Ann    5720
+Bob    4510
+
+2 rows selected.
+
+3 rows updated.
+
+NAME SALARY
+---- ------
+Ann    6292
+Bob    4510
+Cid    6710
+Dee    6710
+Eve    3000
 
 5 rows selected.
 

@@ -36,6 +36,7 @@ returning_clause:
 
 - The result is `N rows deleted.`; in PL/SQL `SQL%ROWCOUNT` gives the count.
 - `FROM` may be left out: `DELETE emp WHERE id = 4`.
+- `WHERE` may call a stored function, also in a block (see [CREATE FUNCTION](create-function.md), example G).
 - `WHERE ROWNUM <= n` limits the statement to the first n rows it finds (example F). A subquery in `RETURNING` sees
   the table as the statement found it.
 - A row that another table's foreign key points at cannot be removed: ORA-02292. Remove the child rows first, or

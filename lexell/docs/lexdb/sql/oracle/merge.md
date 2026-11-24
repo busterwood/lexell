@@ -65,6 +65,8 @@ The two `WHEN` clauses may come in either order.
 
 - A `WHEN MATCHED THEN DELETE` without `UPDATE` (standard SQL's form) is not supported (ORA-02000, "missing UPDATE
   keyword").
+- A stored function called in a `MERGE` is not supported (ORA-03001; see [CREATE FUNCTION](create-function.md), example
+  H); it works in `INSERT`, `UPDATE` and `DELETE`.
 - `LOG ERRORS` is not supported (ORA-00900). `RETURNING` after `MERGE` was not tried.
 - A hint after `MERGE` (`/*+ PARALLEL */`) is read as a comment.
 

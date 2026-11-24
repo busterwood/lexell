@@ -40,6 +40,9 @@ COMMIT ;   ROLLBACK [ TO savepoint ] ;   SAVEPOINT name ;
 - DDL (`CREATE TABLE`, ...) is not allowed directly in a block (PLS-00103): write it in `EXECUTE IMMEDIATE`.
 - `SQL%ROWCOUNT` and the other implicit cursor attributes describe the last statement: see [cursors](plsql-cursors.md).
 - `EXECUTE IMMEDIATE` with a bad statement raises the SQL error (for example ORA-00942).
+- A stored function (a standalone one or a package's) may be called in the SQL of a block: `SELECT f(x) INTO`,
+  `EXECUTE IMMEDIATE`, and the `INSERT`, `UPDATE` and `DELETE` of the block (example F). The limits are those of
+  [CREATE FUNCTION](create-function.md) (a `MERGE`, an aggregate as an argument).
 - A package variable is a target of `SELECT ... INTO`, of `RETURNING ... INTO`, of `EXECUTE IMMEDIATE ... INTO` and of
   `USING OUT`, from outside the package too. It is assigned when the statement has ended: an error leaves it as it
   was (example D).
@@ -197,6 +200,40 @@ ORA-06512: at line 2
 ERROR:
 ORA-06550: line 2, column 3:
 PLS-00428: an INTO clause is expected in this SELECT statement
+```
+
+### F. A stored function in the SQL of a block
+
+<!-- example: oracle -->
+```sql
+CREATE OR REPLACE FUNCTION with_bonus (p_salary NUMBER) RETURN NUMBER IS
+BEGIN
+  RETURN p_salary + 50;
+END;
+/
+DECLARE
+  v      NUMBER;
+  v_name VARCHAR2(20);
+BEGIN
+  SELECT with_bonus(salary) INTO v FROM emp WHERE id = 1;
+  DBMS_OUTPUT.PUT_LINE('select into: ' || v);
+  EXECUTE IMMEDIATE 'SELECT name FROM emp WHERE with_bonus(salary) = :1' INTO v_name USING 250;
+  DBMS_OUTPUT.PUT_LINE('dynamic: ' || v_name);
+  UPDATE emp SET salary = with_bonus(salary) WHERE id = 3 RETURNING salary INTO v;
+  DBMS_OUTPUT.PUT_LINE('update: ' || v);
+  ROLLBACK;
+END;
+/
+```
+
+```text
+Function created.
+
+select into: 150
+dynamic: bob
+update: 350
+
+PL/SQL procedure successfully completed.
 ```
 
 ## See also

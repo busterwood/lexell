@@ -55,6 +55,7 @@ SQL%FOUND    SQL%NOTFOUND    SQL%ISOPEN    SQL%ROWCOUNT
   `INVALID_CURSOR`.
 - `FETCH ... INTO` may name a package variable from outside the package (`FETCH c INTO pkg.v;`): see
   [CREATE PACKAGE](create-package.md), example G.
+- The query of a cursor, of a cursor `FOR` loop and of a `REF CURSOR` may call a stored function (example E).
 - A cursor `FOR` loop is the shortest way to read all rows: no `OPEN`, `FETCH`, `CLOSE` or `%NOTFOUND` test.
 - A client reads the result of a `REF CURSOR` that an `OUT` parameter or a function returns: see
   [CREATE FUNCTION](create-function.md).
@@ -176,6 +177,44 @@ END;
 ```text
 updated 2
 found: no
+
+PL/SQL procedure successfully completed.
+```
+
+### E. A stored function in a cursor's query
+
+<!-- example: oracle -->
+```sql
+CREATE OR REPLACE FUNCTION grade (p_salary NUMBER) RETURN VARCHAR2 IS
+BEGIN
+  RETURN CASE WHEN p_salary >= 300 THEN 'high' WHEN p_salary >= 200 THEN 'mid' ELSE 'low' END;
+END;
+/
+DECLARE
+  CURSOR c IS SELECT name, grade(salary) AS g FROM emp ORDER BY id;
+  r c%ROWTYPE;
+BEGIN
+  OPEN c;
+  LOOP
+    FETCH c INTO r;
+    EXIT WHEN c%NOTFOUND;
+    DBMS_OUTPUT.PUT_LINE('explicit: ' || r.name || ' ' || r.g);
+  END LOOP;
+  CLOSE c;
+  FOR r2 IN (SELECT name FROM emp WHERE grade(salary) = 'mid') LOOP
+    DBMS_OUTPUT.PUT_LINE('for loop: ' || r2.name);
+  END LOOP;
+END;
+/
+```
+
+```text
+Function created.
+
+explicit: ann low
+explicit: bob mid
+explicit: cy high
+for loop: bob
 
 PL/SQL procedure successfully completed.
 ```
