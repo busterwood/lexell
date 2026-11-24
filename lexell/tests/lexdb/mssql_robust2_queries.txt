@@ -1,0 +1,83 @@
+# Wrong answers and gaps left by the documentation slices (KNOWN-ISSUES.md, second robustness slice) of the SQL Server door, against SQL Server 2022
+# (gen_mssql.py ... robust2): a recursive CTE under TOP with a WHERE, a join or a derived table, and MAXRECURSION reached or not on the way to the
+# rows TOP needs; integer literals' arithmetic overflowing (8115).
+
+@once CREATE TABLE rt (k int PRIMARY KEY, v varchar(10))
+@once INSERT INTO rt SELECT value, 'v' + CAST(value AS varchar) FROM generate_series(1, 100)
+
+# a recursive CTE under TOP and a WHERE stops when the query has its rows
+WITH n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT TOP 3 i FROM n WHERE i % 7 = 0 OPTION (MAXRECURSION 0)
+WITH n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT TOP 3 i FROM n WHERE i % 7 = 0
+WITH n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT TOP 3 i FROM n WHERE i % 70 = 0
+WITH n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT TOP 1 i FROM n WHERE i % 70 = 0
+WITH n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT TOP 3 i FROM n WHERE i % 7 = 0 OPTION (MAXRECURSION 5)
+WITH n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT TOP 3 i FROM n WHERE i % 7 = 0 OPTION (MAXRECURSION 20)
+WITH n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT TOP 3 i FROM n WHERE i % 7 = 0 OPTION (MAXRECURSION 19)
+WITH n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT TOP 3 i, i * 2 AS d FROM n WHERE i > 100 AND i % 2 = 1 OPTION (MAXRECURSION 0)
+WITH n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 10) SELECT TOP 3 i FROM n WHERE i % 7 = 0
+WITH n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 100) SELECT TOP 30 i FROM n WHERE i % 7 = 0
+WITH n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT TOP 0 i FROM n WHERE i % 7 = 0
+WITH n(i, s) AS (SELECT 1, CAST('a' AS varchar(50)) UNION ALL SELECT i + 1, CAST(s + 'b' AS varchar(50)) FROM n) SELECT TOP 2 i, s FROM n WHERE i % 4 = 0 OPTION (MAXRECURSION 0)
+# ... a join, a left join, a derived table, an outer aggregate over a limited query
+WITH n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT TOP 3 n.i, rt.v FROM n JOIN rt ON rt.k = n.i WHERE n.i % 2 = 0 OPTION (MAXRECURSION 0)
+WITH n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT TOP 3 n.i, rt.v FROM n LEFT JOIN rt ON rt.k = n.i WHERE n.i % 50 = 0 OPTION (MAXRECURSION 0)
+WITH n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT TOP 3 i FROM (SELECT i FROM n WHERE i > 3) s OPTION (MAXRECURSION 0)
+WITH n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT COUNT(*) FROM (SELECT TOP 3 i FROM n WHERE i % 7 = 0) s OPTION (MAXRECURSION 0)
+WITH n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT SUM(i) FROM (SELECT TOP 4 i FROM n WHERE i % 7 = 0) s OPTION (MAXRECURSION 0)
+# ... a CTE read twice needs every row of the second read
+WITH r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 6) SELECT TOP 3 n FROM r WHERE n > 1 UNION ALL SELECT n FROM r
+WITH r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 6) SELECT (SELECT COUNT(*) FROM (SELECT TOP 2 n FROM r WHERE n > 2) x), (SELECT COUNT(*) FROM r)
+# ... an error in a row the query does not read is not raised, in one it reads it is
+WITH n(i) AS (SELECT 1 UNION ALL SELECT CASE WHEN i = 40 THEN 1 / (i - 40) ELSE i + 1 END FROM n) SELECT TOP 3 i FROM n WHERE i % 7 = 0 OPTION (MAXRECURSION 0)
+WITH n(i) AS (SELECT 1 UNION ALL SELECT CASE WHEN i = 40 THEN 1 / (i - 40) ELSE i + 1 END FROM n) SELECT TOP 7 i FROM n WHERE i % 7 = 0 OPTION (MAXRECURSION 0)
+WITH n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT TOP 4 100 / (30 - i) FROM n WHERE i % 7 = 0 OPTION (MAXRECURSION 0)
+WITH n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT TOP 5 100 / (30 - i) FROM n WHERE i % 7 = 0 OPTION (MAXRECURSION 0)
+
+# integer literals' arithmetic (8115 past int, bigint; a number is not checked)
+SELECT 2147483647 + 1
+SELECT 2147483647 + 0
+SELECT -2147483648 - 1
+SELECT 2147483647 * 2
+SELECT 46341 * 46341
+SELECT 46340 * 46340
+SELECT 2147483648 + 1
+SELECT 2147483647 + 1.0
+SELECT CAST(2147483647 AS bigint) + 1
+SELECT 3 * -715827883
+SELECT 1 + 2147483647 + 1
+SELECT 2147483647 - -1
+SELECT 2147483647 + 1 WHERE 1 = 0
+@once CREATE TABLE lit (id int PRIMARY KEY, v int)
+@once INSERT INTO lit VALUES (1, 2147483647)
+BEGIN TRAN; UPDATE lit SET v = v + 1 WHERE id = 1; ROLLBACK
+BEGIN TRAN; UPDATE lit SET v = 2147483647 + 1 WHERE id = 1; ROLLBACK
+SELECT id, v FROM lit
+
+# an UPDATE tests only the CHECKs that read a column it sets: in a transaction, with OUTPUT ... INTO, in MERGE, in a procedure
+@once CREATE TABLE ck (id int PRIMARY KEY, a int, b int, c int)
+@once INSERT INTO ck VALUES (1, -5, 1, 10), (2, 3, 2, 20)
+@once ALTER TABLE ck WITH NOCHECK ADD CONSTRAINT ck_a CHECK (a > 0)
+@once ALTER TABLE ck WITH NOCHECK ADD CONSTRAINT ck_bc CHECK (b < c AND c < 100)
+@once CREATE TABLE ckl (n int)
+BEGIN TRAN; UPDATE ck SET b = 7 WHERE id = 1; SELECT id, a, b, c FROM ck ORDER BY id; ROLLBACK
+BEGIN TRAN; UPDATE ck SET a = a WHERE id = 1; ROLLBACK
+BEGIN TRAN; UPDATE ck SET a = a + 1; ROLLBACK
+BEGIN TRAN; UPDATE ck SET a = 4 WHERE id = 1; SELECT id, a FROM ck ORDER BY id; ROLLBACK
+BEGIN TRAN; UPDATE ck SET b = 50 WHERE id = 2; ROLLBACK
+BEGIN TRAN; UPDATE ck SET c = 200 WHERE id = 2; ROLLBACK
+BEGIN TRAN; UPDATE ck SET b = 1, c = 2 WHERE id = 1; SELECT id, b, c FROM ck ORDER BY id; ROLLBACK
+BEGIN TRAN; UPDATE ck SET b = b + 1; SELECT id, b FROM ck ORDER BY id; ROLLBACK
+BEGIN TRAN; UPDATE ck SET b = 7 WHERE id = 1; UPDATE ck SET a = a WHERE id = 1; ROLLBACK
+UPDATE ck SET b = 7 WHERE id = 1; SELECT id, b FROM ck ORDER BY id
+UPDATE ck SET b = 1 WHERE id = 1
+BEGIN TRAN; DECLARE @o TABLE (id int, b int); UPDATE ck SET b = 9 OUTPUT inserted.id, inserted.b INTO @o WHERE id = 1; SELECT id, b FROM @o; ROLLBACK
+BEGIN TRAN; DECLARE @o TABLE (id int, a int); UPDATE ck SET a = a OUTPUT inserted.id, inserted.a INTO @o WHERE id = 1; SELECT id, a FROM @o; ROLLBACK
+BEGIN TRAN; UPDATE ck SET b = 9 OUTPUT inserted.id INTO ckl WHERE id = 1; SELECT n FROM ckl; ROLLBACK
+BEGIN TRAN; UPDATE ck SET a = a OUTPUT inserted.id INTO ckl WHERE id = 1; SELECT n FROM ckl; ROLLBACK
+BEGIN TRAN; MERGE ck AS t USING (SELECT 1 AS id) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET b = 6; SELECT id, b FROM ck ORDER BY id; ROLLBACK
+BEGIN TRAN; MERGE ck AS t USING (SELECT 1 AS id) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET a = a; ROLLBACK
+BEGIN TRAN; MERGE ck AS t USING (SELECT 1 AS id UNION ALL SELECT 2) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET b = 6; SELECT id, b FROM ck ORDER BY id; ROLLBACK
+BEGIN TRAN; MERGE ck AS t USING (SELECT 3 AS id) AS s ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, a, b, c) VALUES (3, -1, 1, 2); ROLLBACK
+BEGIN TRAN; UPDATE ck SET b = 7 FROM ck JOIN (SELECT 1 AS id) s ON s.id = ck.id; SELECT id, b FROM ck ORDER BY id; ROLLBACK
+BEGIN TRAN; UPDATE ck SET a = a FROM ck JOIN (SELECT 1 AS id) s ON s.id = ck.id; ROLLBACK
+BEGIN TRAN; UPDATE TOP (1) ck SET b = 8; SELECT id, b FROM ck ORDER BY id; ROLLBACK
