@@ -1163,3 +1163,26 @@ Constraint states (O26, commit fe8daf59): `DISABLE`, `ENABLE [VALIDATE | NOVALID
 CONSTRAINT; `ALTER TABLE t ENABLE | DISABLE [VALIDATE | NOVALIDATE] CONSTRAINT c` and `MODIFY CONSTRAINT c ...`; ORA-02293 and ORA-02298 when the rows are checked,
 ORA-02290 and ORA-02291 for new rows, ORA-02430 and ORA-02431 for a name not there; USER_CONSTRAINTS.STATUS and VALIDATED. PRIMARY KEY, UNIQUE and NOT NULL
 cannot be disabled (ORA-00900 as before); 23.26.3 has no NOT ENFORCED. Test `tns_unenforced` (65 statements, 0 differences).
+
+## As built: the bugs the user documentation found (KNOWN-ISSUES.md, 2026-11-24)
+
+- `INSERT ... SELECT`, UPDATE and MERGE with a foreign key and a CHECK failing part way: ORA-02290 / ORA-02291 (the double write, lexdb.md). `DROP COLUMN` of a column in a
+  multi-column CHECK is ORA-12991; a single-column CHECK goes with its column (`lexdb_conerr`). ORA-02293 and ORA-02298 (and ORA-02437 / ORA-02299 for a key) for
+  ADD CONSTRAINT over rows that break it, with `(OWNER.NAME)`; a second foreign key on the same columns and the same referenced columns is ORA-02275 in ALTER TABLE and
+  ORA-02274 in CREATE TABLE (`dupFk`; PostgreSQL and SQL Server take it).
+- ENABLE and VALIDATE of a primary key or UNIQUE change nothing (they are always enabled and validated); DISABLE and NOVALIDATE are ORA-03001, `lexdb: DISABLE and NOVALIDATE of
+  the primary key or unique constraint ... are not supported`: Oracle disables a key, but a lexdb table is stored by its key, so a table without it would be a second layout
+  (not done); a name that is no constraint is ORA-02430 (enable) or ORA-02431 (disable).
+- QUALIFY: read after CONNECT BY; its condition is read as TO_BOOLEAN reads a value (a number is true when not zero, a text 'yes', 't', '1' ... is, ORA-61800 for 'a'), where
+  the condition is not a comparison, AND, OR, NOT, IS NULL, EXISTS or IN already (those stay as they are for the planner); FOR UPDATE after it is ORA-01786; QUALIFY after
+  ORDER BY, FOR UPDATE, or a CONNECT BY after the condition, is ORA-03049 (03048 for HAVING and a bracket), its text the statement up to the word, from a word boundary and at most 28 characters
+  (Oracle cuts differently in a few cases: after a long CONNECT BY it keeps less).
+- A package with only a specification: compiled with an empty body when it declares no procedure or function (`compilePackage`), so its variables and constants are usable; types
+  (records, subtypes, exceptions) in a package are still not supported, with a body or without.
+- `SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA' | 'SESSION_SCHEMA' | 'NLS_TERRITORY' | 'NLS_SORT' | 'NLS_CURRENCY' | 'NLS_DATE_LANGUAGE' | 'LANGUAGE')` read the session's settings
+  (`oracle.*`, kept by `reapply`); `NLS_SESSION_PARAMETERS` and `V$NLS_PARAMETERS` show what ALTER SESSION set and what a territory (formats, numeric characters, currencies:
+  `Terr`, corrected against Oracle: Canada, Australia, India, Sweden, Japan, the Netherlands' name) and a language (date language, sort) give the rest. Setting NLS_TERRITORY or
+  NLS_LANGUAGE forgets what was set apart before it (as Oracle's does). Not done: `NLS_NUMERIC_CHARACTERS` and `NLS_LANGUAGE` in TO_CHAR of numbers and in messages.
+- A DEFAULT that calls a dropped sequence is no error until a row takes the default (ORA-02289 then, `Defs.late`): a statement that gives the column a value, and an UPDATE, are right.
+- UPDATE tests the CHECKs that read a column it sets (see lexdb-tds.md): inside a transaction after the first statement, and by `lxl_stmt`'s savepoint; the first statement of
+  a transaction the door began (a single statement outside a transaction) still tests every check (it has nothing to undo to).
