@@ -1,0 +1,96 @@
+// lexdb_copyjson: COPY ... TO STDOUT (FORMAT json [, FORCE_ARRAY]), PostgreSQL 19 (design/lexdb-new-features.md P16). A row is a JSON object of
+// the columns' names, each value as to_json writes it: numbers as they are, a boolean true or false, NULL null, an array of a type a JSON array,
+// every other type (text, dates, timestamps, uuid, bytea, intervals) its text output as a string. A float's NaN and infinities are strings.
+// COPY FROM does not read JSON (PostgreSQL 19 does not: 0A000).
+import "./lexdb_sql"
+import "./lexdb_ops"
+import "./lexdb_time"
+import "./lexdb_bind"
+
+type Val = lexdb_sql.Val
+type OutCol = lexdb_bind.OutCol
+
+fn hex2(c: int, b: mut &[]byte) {
+    let d = "0123456789abcdef"
+    append(b, d[(c >> 4) & 15])
+    append(b, d[c & 15])
+}
+
+// A text as a JSON string.
+pub fn jstr(t: &str, b: mut &[]byte) {
+    append(b, '"')
+    for k in 0..len(t) {
+        let c = t[k]
+        if c == '"' { appendStr(b, "\\\"") }
+        else if c == '\\' { appendStr(b, "\\\\") }
+        else if c == '\n' { appendStr(b, "\\n") }
+        else if c == '\r' { appendStr(b, "\\r") }
+        else if c == '\t' { appendStr(b, "\\t") }
+        else if c == byte(8) { appendStr(b, "\\b") }
+        else if c == byte(12) { appendStr(b, "\\f") }
+        else if c < byte(32) {
+            appendStr(b, "\\u00")
+            hex2(int(c), b)
+        } else { append(b, c) }
+    }
+    append(b, '"')
+}
+
+fn isNumber(oid: int): bool {
+    return oid == lexdb_sql.OID_INT2 || oid == lexdb_sql.OID_INT4 || oid == lexdb_sql.OID_INT8 || oid == lexdb_sql.OID_NUMERIC || oid == lexdb_sql.OID_OID
+}
+
+fn isFloat(oid: int): bool { return oid == lexdb_sql.OID_FLOAT4 || oid == lexdb_sql.OID_FLOAT8 }
+
+// One value of type oid (its text output t).
+fn scalar(t: &str, oid: int, b: mut &[]byte) {
+    if isNumber(oid) {
+        appendStr(b, t)
+    } else if isFloat(oid) {
+        if t == "NaN" || t == "Infinity" || t == "-Infinity" { jstr(t, b) } else { appendStr(b, t) }
+    } else if oid == lexdb_sql.OID_BOOL {
+        appendStr(b, if t == "t" || t == "true" { "true" } else { "false" })
+    } else {
+        jstr(t, b)
+    }
+}
+
+// An array's text ({1,2,NULL}) as a JSON array of its element type's values.
+fn jarray(t: &str, elem: int, b: mut &[]byte) {
+    match lexdb_ops.arrayParts(t) {
+        Ok(ps) {
+            append(b, '[')
+            var first = true
+            for p in ps {
+                if !first { append(b, ',') }
+                first = false
+                match p {
+                    Some(x) { scalar(&x, elem, b) }
+                    None { appendStr(b, "null") }
+                }
+            }
+            append(b, ']')
+        }
+        Err(_) { jstr(t, b) }
+    }
+}
+
+// A row as one JSON object (without its line end): cols' names, the values' types, the session's zone.
+pub fn object(r: &[]Val, cols: &[]OutCol, z: &lexdb_time.Zone, b: mut &[]byte) {
+    append(b, '{')
+    for k in 0..len(r) {
+        if k > 0 { append(b, ',') }
+        let nm = if k < len(cols) { cols[k].label() } else { "?column?".toStr() }
+        jstr(&nm, b)
+        append(b, ':')
+        if lexdb_ops.isNull(&r[k]) {
+            appendStr(b, "null")
+            continue
+        }
+        let oid = if k < len(cols) { cols[k].oid } else { lexdb_sql.OID_TEXT }
+        let t = lexdb_ops.textOut(&r[k], oid, z)
+        let el = lexdb_sql.elemOid(oid)
+        if el > 0 { jarray(&t, el, b) } else { scalar(&t, oid, b) }
+    }
+    append(b, '}')
+}

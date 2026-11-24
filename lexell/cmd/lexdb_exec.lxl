@@ -35,6 +35,7 @@ import "./lexdb_like"
 import "./lexdb_access"
 import "./lexdb_store"
 import "./lexdb_catalog"
+import "./lexdb_copyjson"
 import "./lexdb_nncon"
 import "./lexdb_nnalter"
 import "./lexdb_sql"
@@ -15858,6 +15859,7 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
                     forceNull: try forced(&s.copy.forceNull, &names, &"FORCE_NULL")}
     var vs: []Val = []
     var count = 0
+    var skipped = 0                         // the rows ON_ERROR ignore skipped
     let where = "COPY " + lexdb_sql.baseName(&s.table) + ", line "
     var noUp = noUpsert()                   // COPY has no ON CONFLICT
     let noCols: []lexdb_sql.ColDef = []
@@ -15963,13 +15965,29 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             Err(x) {
                 // a value not of its column's type (insertOne turns them
                 // first, in order): which column, said as PostgreSQL does
+                var skip = false
                 for k in 0..len(vs) {
                     match lexdb_ops.coerceZ(vs[k].clone(), &t.cols[targets[k]].typ, &txn.sql.zone) {
                         Ok(_) {}
-                        Err(y) { return Err(within(y, &(where + rd.line.toStr() + ", column " + names[k] + ": " + quoted(&lexdb_sql.text(&vs[k]))))) }
+                        Err(y) {
+                            if s.copy.onErr == 0 { return Err(within(y, &(where + rd.line.toStr() + ", column " + names[k] + ": " + quoted(&lexdb_sql.text(&vs[k]))))) }
+                            // ON_ERROR ignore: the row is skipped (a value its column does not take; any other error ends the COPY)
+                            skip = true
+                            if s.copy.verb == 1 {
+                                notice(st, txn, &"00000", &("skipping row due to data type incompatibility at line " + rd.line.toStr() + " for column \"" + names[k] + "\": " +
+                                                            quoted(&lexdb_sql.text(&vs[k]))), &"")
+                            }
+                            break
+                        }
                     }
                 }
-                return Err(within(x, &(where + rd.line.toStr())))
+                if !skip { return Err(within(x, &(where + rd.line.toStr()))) }
+                skipped += 1
+                if s.copy.reject > 0 && skipped > s.copy.reject {
+                    return Err(within(e("22P02", &("skipped more than REJECT_LIMIT (" + s.copy.reject.toStr() + ") rows due to data type incompatibility")),
+                                      &(where + rd.line.toStr() + ": " + quoted(&recordText(&buf, &rd)))))
+                }
+                continue
             }
         }
         count += 1
@@ -15988,6 +16006,9 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     }
     // what follows an end marker (\.) is not read; the wire drops it
     try fkFinish(st, txn, &fw, mut &later)
+    if skipped > 0 && s.copy.verb != 2 {
+        notice(st, txn, &"00000", &(if skipped == 1 { "1 row was skipped due to data type incompatibility" } else { skipped.toStr() + " rows were skipped due to data type incompatibility" }), &"")
+    }
     return Ok(Res{cols: [], rows: [], tag: "COPY " + count.toStr(), hasRows: false, copy: COPY_NONE})
 }
 
@@ -16018,7 +16039,7 @@ type FastCopyPlan = record {
 
 fn fastCopyPlan(t: &Table, targets: &[]int, s: &lexdb_sql.Stmt): Option[FastCopyPlan] {
     if lexdb_gen.anyGen(&t.cols) { return None }          // (a generated column is computed row by row)
-    if s.copy.csv || s.copy.header || s.copy.bulk || s.copy.batchRows > 0 { return None }
+    if s.copy.csv || s.copy.header || s.copy.bulk || s.copy.batchRows > 0 || s.copy.onErr > 0 { return None }
     if s.copy.delim != "\t" || s.copy.null != "\\N" { return None }
     if len(s.copy.forceNotNull) > 0 || len(s.copy.forceNull) > 0 || len(s.copy.forceQuote) > 0 || s.copy.quoteAll { return None }
     if len(t.view) > 0 || len(t.slots) != 0 || len(t.checks) != 0 || len(t.fks) != 0 { return None }
@@ -16744,11 +16765,22 @@ fn copyOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         append(mut &lines, [Val.Text(strFromBytes(&b))])
     }
     let zone = txn.sql.zone.clone()
+    if s.copy.json && s.copy.forceArray { append(mut &lines, [Val.Text("[\n")]) }
+    var first = true
     for r in res.rows {
         replace(mut &b, [])
-        copyLine(&r, &s.copy, &fq, &res.cols, &zone, mut &b)
+        if s.copy.json {
+            // (FORCE_ARRAY: the rows are the elements of one array, a space before the first and a comma before the others)
+            if s.copy.forceArray { append(mut &b, if first { ' ' } else { ',' }) }
+            first = false
+            lexdb_copyjson.object(&r, &res.cols, &zone, mut &b)
+            append(mut &b, '\n')
+        } else {
+            copyLine(&r, &s.copy, &fq, &res.cols, &zone, mut &b)
+        }
         append(mut &lines, [Val.Text(strFromBytes(&b))])
     }
+    if s.copy.json && s.copy.forceArray { append(mut &lines, [Val.Text("]\n")]) }
     let n = len(res.rows)
     return Ok(Res{cols: replace(mut &res.cols, []), rows: lines, tag: "COPY " + n.toStr(), hasRows: false, copy: COPY_OUT})
 }
@@ -16774,9 +16806,20 @@ fn copyStream(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     }
     var count = 0
     let zone = txn.sql.zone.clone()
+    if s.copy.json && s.copy.forceArray {
+        let at = copyMsgStart(mut &b)
+        appendStr(mut &b, "[\n")
+        copyMsgEnd(mut &b, at)
+    }
     try eachRow(st, txn, &sel, params, lim, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
         let at = copyMsgStart(mut &b)
-        copyLine(r, &s.copy, &fq, &sel.outs, &zone, mut &b)
+        if s.copy.json {
+            if s.copy.forceArray { append(mut &b, if count == 0 { ' ' } else { ',' }) }
+            lexdb_copyjson.object(r, &sel.outs, &zone, mut &b)
+            append(mut &b, '\n')
+        } else {
+            copyLine(r, &s.copy, &fq, &sel.outs, &zone, mut &b)
+        }
         copyMsgEnd(mut &b, at)
         count += 1
         if len(b) >= COPY_PART {
@@ -16785,6 +16828,11 @@ fn copyStream(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         }
         return Ok(true)
     })
+    if s.copy.json && s.copy.forceArray {
+        let at = copyMsgStart(mut &b)
+        appendStr(mut &b, "]\n")
+        copyMsgEnd(mut &b, at)
+    }
     if !out(n, &b) { return Err(e("08006", "lexdb: the connection was lost during COPY")) }
     return Ok(Res{cols: [], rows: [], tag: "COPY " + count.toStr(), hasRows: false, copy: COPY_NONE})
 }
