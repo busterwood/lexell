@@ -72,6 +72,10 @@ table_constraint:
   `USER_CONSTRAINTS`.
 - Foreign keys check the parent when a row is inserted (ORA-02291) and when a parent is deleted (ORA-02292, unless
   the key says `ON DELETE`).
+- The table is made in the current schema, the login's own (a login's schema is made at its first connection). A table
+  of the same name in the PostgreSQL door's `public` schema does not stop it, and the new table is the one a bare name
+  finds. The PostgreSQL and SQL Server doors see it by its schema and its upper-case name (`sa."EMP"`), not in
+  `public`; see [Schemas](../../connect/oracle.md#schemas).
 - On a replica, `CREATE GLOBAL TEMPORARY TABLE` is ORA-16000; see [replicas](../../replicas.md).
 
 ## Differences from Oracle
@@ -422,6 +426,84 @@ Table created.
 
 ERROR:
 ORA-01400: cannot insert NULL into ("SA"."U6"."ID")
+```
+
+### K. The same name in the PostgreSQL door and the login's schema
+
+A table that the PostgreSQL door made is in `public`. The Oracle login can make a table of the same name in its own
+schema. A bare name then finds the login's table, and `public.place` the other. The PostgreSQL door sees the Oracle
+table as `sa."PLACE"`.
+
+<!-- example: postgresql -->
+```sql
+CREATE TABLE place (id int, note text);
+INSERT INTO place VALUES (1, 'made in the PostgreSQL door');
+```
+
+```text
+CREATE TABLE
+INSERT 0 1
+```
+
+<!-- example: oracle -->
+```sql
+SELECT note FROM place;
+CREATE TABLE place (id NUMBER, note VARCHAR2(40));
+INSERT INTO place VALUES (2, 'made in the Oracle door');
+COMMIT;
+SELECT note FROM place;
+SELECT note FROM public.place;
+SELECT note FROM sa.place;
+```
+
+```text
+NOTE
+---------------------------
+made in the PostgreSQL door
+
+1 row selected.
+
+Table created.
+
+1 row created.
+
+Commit complete.
+
+NOTE
+-----------------------
+made in the Oracle door
+
+1 row selected.
+
+NOTE
+---------------------------
+made in the PostgreSQL door
+
+1 row selected.
+
+NOTE
+-----------------------
+made in the Oracle door
+
+1 row selected.
+```
+
+<!-- example: postgresql -->
+```sql
+SELECT note FROM place;
+SELECT note FROM sa."PLACE";
+```
+
+```text
+            note
+-----------------------------
+ made in the PostgreSQL door
+(1 row)
+
+          note
+-------------------------
+ made in the Oracle door
+(1 row)
 ```
 
 ## See also
