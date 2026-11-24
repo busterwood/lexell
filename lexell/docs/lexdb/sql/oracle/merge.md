@@ -52,7 +52,10 @@ The two `WHEN` clauses may come in either order.
 
 - The result is `N rows merged.`: the rows updated, deleted and inserted together. In PL/SQL `SQL%ROWCOUNT` gives
   the same count.
-- A target row that two source rows match is ORA-30926.
+- A target row that two source rows match is ORA-30926. A row that `DELETE WHERE` has deleted and that a later source
+  row matches is ORA-08006 (example H).
+- A subquery in a clause (`WHERE`, `SET`, `VALUES`) reads the tables as the statement found them, as in Oracle: it does
+  not see the rows the same `MERGE` has already changed (example G).
 - The columns of the target are named without an alias in `INSERT ( ... )`; `s.id` there is a syntax error.
 - The first `MERGE` begins a transaction, which `COMMIT` or `ROLLBACK` ends. A statement that fails is undone alone.
 - Constraint errors are those of `INSERT` and `UPDATE`.
@@ -62,11 +65,6 @@ The two `WHEN` clauses may come in either order.
 
 - A `WHEN MATCHED THEN DELETE` without `UPDATE` (standard SQL's form) is not supported (ORA-02000, "missing UPDATE
   keyword").
-- **A subquery in a clause reads rows the `MERGE` has already changed.** `UPDATE` and `DELETE` work every row out
-  from the table as the statement found it, as Oracle does; `MERGE` does not yet. `MERGE INTO emp e USING (SELECT
-  id FROM emp WHERE mgr_id IS NOT NULL) s ON (e.id = s.id) WHEN MATCHED THEN UPDATE SET e.salary = (SELECT x.salary
-  * 2 FROM emp x WHERE x.id = e.mgr_id)` over a chain of managers doubles a salary that the same statement has just
-  changed. Use an `UPDATE` where the statement needs the starting rows.
 - `LOG ERRORS` is not supported (ORA-00900). `RETURNING` after `MERGE` was not tried.
 - A hint after `MERGE` (`/*+ PARALLEL */`) is read as a comment.
 
@@ -297,7 +295,68 @@ merged 3
 PL/SQL procedure successfully completed.
 ```
 
-### G. Errors
+### G. A subquery reads the rows as the statement found them
+
+Both matched rows get the same total, the one before the statement changed anything.
+
+<!-- example: oracle -->
+```sql
+SELECT SUM(qty) AS total_before FROM stock;
+MERGE INTO stock s USING delivery d ON (s.id = d.id)
+WHEN MATCHED THEN UPDATE SET s.qty = (SELECT SUM(qty) FROM stock);
+SELECT * FROM stock ORDER BY id;
+ROLLBACK;
+```
+
+```text
+TOTAL_BEFORE
+------------
+          15
+
+1 row selected.
+
+2 rows merged.
+
+ID NAME   QTY
+-- ------ ---
+ 1 pencil  10
+ 2 eraser  15
+ 3 ruler   15
+
+3 rows selected.
+
+Rollback complete.
+```
+
+### H. A source row after DELETE WHERE
+
+The first source row updates row 2 and `DELETE WHERE` removes it. The second source row finds it gone: ORA-08006,
+and the statement changes nothing.
+
+<!-- example: oracle -->
+```sql
+MERGE INTO stock s USING (SELECT 2 AS id FROM dual UNION ALL SELECT 2 FROM dual) d ON (s.id = d.id)
+WHEN MATCHED THEN UPDATE SET s.qty = s.qty + 20 DELETE WHERE (s.qty > 10);
+SELECT * FROM stock ORDER BY id;
+ROLLBACK;
+```
+
+```text
+ERROR:
+ORA-08006: specified row no longer exists
+
+ID NAME   QTY
+-- ------ ---
+ 1 pencil  10
+ 2 eraser   5
+ 3 ruler    0
+
+3 rows selected.
+
+Rollback complete.
+```
+
+### I. Errors
 
 <!-- example: oracle -->
 ```sql
