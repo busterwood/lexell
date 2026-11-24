@@ -1,0 +1,146 @@
+// lexdb_enum: enum types' (CREATE TYPE ... AS ENUM, design/lexdb.md 9.90) order and labels in a SELECT's expressions.
+//
+// A column of an enum type has kind K_ENUM and the type's OID; its values are texts, each one of the type's labels, which order
+// as the labels' places do. A comparison (< <= > >=), ORDER BY, MIN, MAX, GREATEST and LEAST of enum values are made, when the
+// statement is planned, of the labels' places (#enumpos; the planner's `fix`), the least and greatest turned back into a
+// label (#enumat). A cast to an enum type (#enumchk) and a comparison with a constant (= <>) raise 22P02 for a text that is
+// not a label, as PostgreSQL's input function does. The passes run only in a process that has seen an enum type
+// (lexdb_catalog.enumsOn), so a database without them does no work.
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_bind"
+import "./lexdb_catalog"
+import "./lexdb_store"
+
+type Expr = lexdb_sql.Expr
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+
+fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+// The enum type x is of (by its OID): its OID, and its name and labels joined by \x1f.
+pub type EnumOf = record { pub oid: int; pub enc: str }
+
+pub fn enumOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ty: &lexdb_bind.Typing, x: &Expr, cols: &[]lexdb_sql.ColDef): Result[Option[EnumOf], DbErr] {
+    let none: []int = []
+    let o = lexdb_bind.exprOid(x, cols, &none, ty)
+    if o < 16384 { return Ok(None) }
+    match try lexdb_catalog.readEnum(st, txn, o) {
+        Some(en) {
+            var all: []str = [lexdb_sql.baseName(&en.key)]
+            for l in en.labels { append(mut &all, l.clone()) }
+            return Ok(Some(EnumOf{oid: o, enc: strings.join(&all, "\x1f")}))
+        }
+        None { return Ok(None) }
+    }
+}
+
+pub fn enumPos(x: &Expr, enc: &str): Expr { return Expr.Call("#enumpos", [lexdb_sql.cloneExpr(x), Expr.Lit(Val.Text(enc.toStr()))], false) }
+
+// x, as resolved, passed through fix where an enum type has been seen, else as it is.
+pub fn fixIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ty: &lexdb_bind.Typing, x: Expr, cols: &[]lexdb_sql.ColDef): Result[Expr, DbErr] {
+    if !lexdb_catalog.enumsOn() { return Ok(x) }
+    return fix(st, txn, ty, &x, cols)
+}
+
+// An ORDER BY key (a window's) as resolved, passed through fix and, an enum value, taken by its label's place.
+pub fn keyIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ty: &lexdb_bind.Typing, x: Expr, cols: &[]lexdb_sql.ColDef): Result[Expr, DbErr] {
+    if !lexdb_catalog.enumsOn() { return Ok(x) }
+    let f = try fix(st, txn, ty, &x, cols)
+    match try enumOf(st, txn, ty, &f, cols) {
+        Some(en) { return Ok(enumPos(&f, &en.enc)) }
+        None {}
+    }
+    return Ok(f)
+}
+
+// An ORDER BY expression without the place an enum's order made of it (the select list holds the value itself).
+pub fn unplaced(x: &Expr): Expr {
+    match x {
+        Expr.Call(n, args, _) { if n == "#enumpos" && len(args) == 2 { return lexdb_sql.cloneExpr(&args[0]) } }
+        else {}
+    }
+    return lexdb_sql.cloneExpr(x)
+}
+
+fn isOrdering(op: &str): bool { return op == "<" || op == "<=" || op == ">" || op == ">=" }
+
+// A text constant beside an enum value that is not one of the type's labels: 22P02 (PostgreSQL reads the constant as the type).
+fn checkLabel(x: &Expr, enc: &str): Result[Unit, DbErr] {
+    match x {
+        Expr.Lit(v) {
+            match v {
+                Val.Text(t) {
+                    let parts = strings.split(&enc, "\x1f")
+                    for i in 1..len(parts) { if parts[i] == t { return Ok(Unit{}) } }
+                    return Err(e("22P02", &("invalid input value for enum " + parts[0] + ": \"" + t + "\"")))
+                }
+                else {}
+            }
+        }
+        else {}
+    }
+    return Ok(Unit{})
+}
+
+// x, an expression of a statement resolved, with its enum values' comparisons, least and greatest, and casts made as the
+// header says; children first, so an inner cast or MAX is an enum value to its outer comparison.
+pub fn fix(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ty: &lexdb_bind.Typing, x: &Expr, cols: &[]lexdb_sql.ColDef): Result[Expr, DbErr] {
+    match x {
+        Expr.Lit(_) { return Ok(lexdb_sql.cloneExpr(x)) }
+        Expr.Param(_) { return Ok(lexdb_sql.cloneExpr(x)) }
+        Expr.Col(_, _) { return Ok(lexdb_sql.cloneExpr(x)) }
+        Expr.Unary(op, a) { return Ok(Expr.Unary(op.clone(), try fix(st, txn, ty, &a, cols))) }
+        Expr.IsNull(a, neg) { return Ok(Expr.IsNull(try fix(st, txn, ty, &a, cols), neg)) }
+        Expr.Bin(op, a, b) {
+            let fa = try fix(st, txn, ty, &a, cols)
+            let fb = try fix(st, txn, ty, &b, cols)
+            let ordering = isOrdering(&op)
+            if ordering || op == "=" || op == "<>" || op == "!=" {
+                var en = try enumOf(st, txn, ty, &fa, cols)
+                if en.isNone() { en = try enumOf(st, txn, ty, &fb, cols) }
+                match en {
+                    Some(f) {
+                        if ordering { return Ok(Expr.Bin(op.clone(), enumPos(&fa, &f.enc), enumPos(&fb, &f.enc))) }
+                        try checkLabel(&fa, &f.enc)
+                        try checkLabel(&fb, &f.enc)
+                    }
+                    None {}
+                }
+            }
+            return Ok(Expr.Bin(op.clone(), fa, fb))
+        }
+        Expr.Cast(a, t) {
+            let fa = try fix(st, txn, ty, &a, cols)
+            if t.kind == lexdb_sql.K_ENUM {
+                match try lexdb_catalog.readEnum(st, txn, t.oid) {
+                    Some(en) {
+                        var all: []str = [lexdb_sql.baseName(&en.key)]
+                        for l in en.labels { append(mut &all, l.clone()) }
+                        return Ok(Expr.Call("#enumchk", [fa, Expr.Lit(Val.Text(strings.join(&all, "\x1f"))), Expr.Lit(Val.Int(t.oid))], false))
+                    }
+                    None {}
+                }
+            }
+            return Ok(Expr.Cast(fa, t))
+        }
+        Expr.Call(n, args, star) {
+            // (a window call's own aggregate is its definition's)
+            if n == "#win" { return Ok(lexdb_sql.cloneExpr(x)) }
+            var fargs: []Expr = []
+            for a in args { append(mut &fargs, try fix(st, txn, ty, &a, cols)) }
+            if !star && len(fargs) > 0 && ((len(fargs) == 1 && (n == "min" || n == "max")) || n == "greatest" || n == "least") {
+                match try enumOf(st, txn, ty, &fargs[0], cols) {
+                    Some(f) {
+                        var ps: []Expr = []
+                        for a in fargs { append(mut &ps, enumPos(&a, &f.enc)) }
+                        return Ok(Expr.Call("#enumat", [Expr.Call(n.clone(), ps, false), Expr.Lit(Val.Text(f.enc.clone())), Expr.Lit(Val.Int(f.oid))], false))
+                    }
+                    None {}
+                }
+            }
+            return Ok(Expr.Call(n.clone(), fargs, star))
+        }
+    }
+}

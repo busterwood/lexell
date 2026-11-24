@@ -918,7 +918,10 @@ fn (p: mut &P) typeName(): Result[TypeName, lexdb_base.DbErr] {
             if oid == 0 { return Err(lexdb_base.err("0A000", "lexdb: time with time zone is not supported (use timestamptz)")) }
             t.kind = lexdb_sql.timeKind(oid)
             t.oid = oid
-            if w == "interval" { t.prec = 0 }       // fields (interval day to second) are not read
+            if w == "interval" {
+                t.prec = 0
+                if !p.tsql && !p.ora { try p.ivalFields(mut &t) }
+            }
             return Ok(try p.arraySuffix(t))
         }
         "character", "char", "bpchar", "nchar" {
@@ -971,6 +974,51 @@ fn (p: mut &P) typeName(): Result[TypeName, lexdb_base.DbErr] {
 
 // T[]: an array of T (its length, if given, is not kept: PostgreSQL does
 // not check it either); else t.
+// The SQL standard's fields of an interval type, after INTERVAL or after its literal: YEAR, MONTH, DAY, HOUR, MINUTE, SECOND,
+// or one TO a lower one, and a SECOND's (precision): kept in the type's len as lexdb_time's IF_ mask, the precision as the
+// time types' (prec 1, scale n). None given: the type as it is.
+fn (p: &P) ivalField(): int {
+    let t = p.peek()
+    if t.kind != T_IDENT { return 0 }
+    if t.text == "year" { return lexdb_time.IF_YEAR }
+    if t.text == "month" { return lexdb_time.IF_MONTH }
+    if t.text == "day" { return lexdb_time.IF_DAY }
+    if t.text == "hour" { return lexdb_time.IF_HOUR }
+    if t.text == "minute" { return lexdb_time.IF_MINUTE }
+    if t.text == "second" { return lexdb_time.IF_SECOND }
+    return 0
+}
+
+fn (p: mut &P) ivalFields(t: mut &TypeName): Result[Unit, lexdb_base.DbErr] {
+    let first = p.ivalField()
+    if first == 0 { return Ok(Unit{}) }
+    p.pos += 1
+    var mask = first
+    var last = first
+    if p.isKw("to") {
+        p.pos += 1
+        last = p.ivalField()
+        if last == 0 || last <= first || first == lexdb_time.IF_MONTH || first == lexdb_time.IF_SECOND { return Err(near(p.peek())) }
+        p.pos += 1
+        mask = 0
+        var b = first
+        while b <= last {
+            mask = mask | b
+            b = b * 2
+        }
+    }
+    if last == lexdb_time.IF_SECOND && p.isKw("(") {
+        p.pos += 1
+        let n = try p.intLit()
+        if n < 0 || n > 6 { return Err(lexdb_base.err("22023", &("INTERVAL(" + n.toStr() + ") precision must be between 0 and 6"))) }
+        try p.expectKw(")")
+        t.prec = 1
+        t.scale = n
+    }
+    t.len = mask
+    return Ok(Unit{})
+}
+
 fn (p: mut &P) arraySuffix(t: TypeName): Result[TypeName, lexdb_base.DbErr] {
     if p.acceptKw("[") {
         if p.peek().kind == T_NUM { let n = try p.intLit() }
@@ -2170,6 +2218,8 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                     Ok(ty) {
                         if p.peek().kind == T_STR {
                             var lit = p.next().text
+                            var ty2 = ty
+                            if !p.ora && !p.tsql && t.text == "interval" { try p.ivalFields(mut &ty2) }
                             if p.ora && t.text == "interval" {
                                 // INTERVAL '1' DAY, INTERVAL '1-2' YEAR TO MONTH, INTERVAL '1 02:03:04' DAY(2) TO SECOND(3)
                                 let u = p.peek().clone()
@@ -2205,7 +2255,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                                 tz.scale = ty.scale
                                 return Ok(Expr.Cast(Expr.Lit(Val.Text(lit)), tz))
                             }
-                            return Ok(Expr.Cast(Expr.Lit(Val.Text(lit)), ty))
+                            return Ok(Expr.Cast(Expr.Lit(Val.Text(lit)), ty2))
                         }
                     }
                     Err(_) {}
@@ -2901,11 +2951,18 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
             append(mut &nns, (try p.name()) + "\x00" + cname)
         } else if p.acceptKw("primary") {
             try p.expectKw("key")
+            if len(s.pk) > 0 { return Err(p.multiPk(&s.table)) }
             s.pkName = cname
+            s.pkCluster = p.clusterWord()
             try p.expectKw("(")
             append(mut &s.pk, try p.name())
-            while p.acceptKw(",") { append(mut &s.pk, try p.name()) }
+            p.keyOrder()
+            while p.acceptKw(",") {
+                append(mut &s.pk, try p.name())
+                p.keyOrder()
+            }
             try p.expectKw(")")
+            try p.tsqlStorage()
         } else if len(cname) > 0 || p.isKw("unique") || p.isKw("check") || p.isKw("foreign") || p.isKw("exclude") {
             append(mut &s.cons, try p.tableConstraint(&cname))
         } else {
@@ -2927,8 +2984,11 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
                 } else if p.acceptKw("null") {
                 } else if p.acceptKw("primary") {
                     try p.expectKw("key")
+                    if len(s.pk) > 0 { return Err(p.multiPk(&s.table)) }
                     append(mut &s.pk, n.clone())
                     s.pkName = cn
+                    s.pkCluster = p.clusterWord()
+                    try p.tsqlStorage()
                     c.notNull = true
                 } else if p.acceptKw("default") {
                     c.def = Some(try p.oraDefault())
@@ -2940,6 +3000,8 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
                 } else if p.acceptKw("unique") {
                     try p.uniqueTail()
                     var u = lexdb_sql.newConstraint(C_UNIQUE, &cn)
+                    u.cluster = p.clusterWord()
+                    try p.tsqlStorage()
                     append(mut &u.cols, n.clone())
                     append(mut &s.cons, u)
                 } else if p.acceptKw("check") {
@@ -2965,6 +3027,7 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
     }
     try p.expectKw(")")
     if len(nns) > 0 { try nnCons(mut &s, &nns) }
+    try p.tsqlStorage()
     try p.onCommit(mut &s)
     return Ok(s)
 }
@@ -3069,6 +3132,7 @@ fn (p: mut &P) tableConstraint(name: &str): Result[Constraint, lexdb_base.DbErr]
     if p.acceptKw("unique") || p.acceptKw("primary") {
         var c = lexdb_sql.newConstraint(if prim { C_PRIMARY } else { C_UNIQUE }, name)
         if prim { try p.expectKw("key") } else { try p.uniqueTail() }
+        c.cluster = p.clusterWord()
         // ALTER TABLE's ... USING INDEX name (9.117)
         if p.isKw("using") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "index" {
             p.pos += 2
@@ -3077,9 +3141,14 @@ fn (p: mut &P) tableConstraint(name: &str): Result[Constraint, lexdb_base.DbErr]
         }
         try p.expectKw("(")
         append(mut &c.cols, try p.name())
-        while p.acceptKw(",") { append(mut &c.cols, try p.name()) }
+        p.keyOrder()
+        while p.acceptKw(",") {
+            append(mut &c.cols, try p.name())
+            p.keyOrder()
+        }
         try p.expectKw(")")
         try p.indexTail()
+        try p.tsqlStorage()
         if p.isNotValid() { return Err(lexdb_base.err("0A000", &((if prim { "PRIMARY KEY" } else { "UNIQUE" }) + " constraints cannot be marked NOT VALID"))) }
         return Ok(c)
     }
@@ -3096,6 +3165,56 @@ fn (p: &P) isNotValid(): bool {
 fn (p: mut &P) indexTail(): Result[Unit, lexdb_base.DbErr] {
     if p.isKw("include") || p.isKw("with") || p.isKw("using") || p.isKw("deferrable") || p.isKw("initially") {
         return Err(lexdb_base.err("0A000", &("lexdb: a key's " + strings.toUpperAscii(&(p.peek().text)) + " is not supported")))
+    }
+    return Ok(Unit{})
+}
+
+// A second PRIMARY KEY of a table: PostgreSQL's 42P16, SQL Server's 8110, Oracle's ORA-02260.
+fn (p: &P) multiPk(table: &str): lexdb_base.DbErr {
+    let t = lexdb_sql.baseName(table)
+    if p.tsql { return lexdb_base.err("TS8110", &("Cannot add multiple PRIMARY KEY constraints to table '" + t + "'.")) }
+    if p.ora { return lexdb_base.err("ORA02260", "table can have only one primary key") }
+    return lexdb_base.err("42P16", &("multiple primary keys for table \"" + t + "\" are not allowed"))
+}
+
+// T-SQL's ASC or DESC after a key's column: read, not kept (a key's order is its columns').
+fn (p: mut &P) keyOrder() {
+    if p.tsql && (p.isKw("asc") || p.isKw("desc")) { p.pos += 1 }
+}
+
+// T-SQL's CLUSTERED (1) or NONCLUSTERED (2) after PRIMARY KEY, UNIQUE or CREATE [UNIQUE]; 0 neither.
+fn (p: mut &P) clusterWord(): int {
+    if !p.tsql { return 0 }
+    if p.acceptKw("clustered") { return 1 }
+    if p.acceptKw("nonclustered") { return 2 }
+    return 0
+}
+
+// T-SQL's storage clauses after a key, an index or a table: WITH (index options), ON filegroup (or partition scheme(column)),
+// TEXTIMAGE_ON filegroup. Read and not kept: lexdb's storage is its own.
+fn (p: mut &P) tsqlStorage(): Result[Unit, lexdb_base.DbErr] {
+    if !p.tsql { return Ok(Unit{}) }
+    while true {
+        if p.isKw("with") && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(" {
+            p.pos += 2
+            var depth = 1
+            while depth > 0 {
+                let t = p.next()
+                if t.kind == T_EOF { return Err(near(&t)) }
+                if t.kind == T_OP && t.text == "(" { depth += 1 }
+                if t.kind == T_OP && t.text == ")" { depth -= 1 }
+            }
+        } else if (p.isKw("on") && (p.peekAt(1).kind == T_IDENT || p.peekAt(1).kind == T_QIDENT) && p.peekAt(1).text != "commit") ||
+                  (p.isKw("textimage_on") && (p.peekAt(1).kind == T_IDENT || p.peekAt(1).kind == T_QIDENT)) {
+            p.pos += 2
+            if p.isKw("(") {
+                p.pos += 1
+                while !p.isKw(")") && p.peek().kind != T_EOF { p.pos += 1 }
+                try p.expectKw(")")
+            }
+        } else {
+            break
+        }
     }
     return Ok(Unit{})
 }
@@ -6285,6 +6404,7 @@ fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
         try p.expectKw(")")
     }
     if p.acceptKw("where") { s.where = Some(try p.expr()) }      // a filtered index
+    try p.tsqlStorage()
     return Ok(s)
 }
 
@@ -7417,6 +7537,16 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 if p.acceptKw("authorization") { append(mut &s.names, try p.roleSpec()) }
                 return Ok(s)
             }
+            if p.tsql && (p.isKw("clustered") || p.isKw("nonclustered") ||
+                          (p.isKw("unique") && p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "clustered" || p.peekAt(1).text == "nonclustered"))) {
+                // CREATE [UNIQUE] [CLUSTERED | NONCLUSTERED] INDEX
+                let uq = p.acceptKw("unique")
+                let cl = p.clusterWord()
+                try p.expectKw("index")
+                var ci = try p.createIndex(uq)
+                ci.cluster = cl
+                return Ok(ci)
+            }
             if p.acceptKw("index") { return p.createIndex(false) }
             if p.acceptKw("unique") {
                 try p.expectKw("index")
@@ -7489,6 +7619,11 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     s.ifFlag = true
                 }
                 s.index = try p.qname()
+                // T-SQL: DROP INDEX name ON table (the index is in its table's schema)
+                if p.tsql && p.acceptKw("on") {
+                    let tn = try p.qname()
+                    s.index = lexdb_sql.qual(&lexdb_sql.schemaOf(&tn), &lexdb_sql.baseName(&s.index))
+                }
                 return Ok(s)
             }
             if p.acceptKw("type") {

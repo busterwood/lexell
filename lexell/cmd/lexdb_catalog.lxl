@@ -693,6 +693,35 @@ pub fn encTable(t: &Table): str {
     return b
 }
 
+// T-SQL's CLUSTERED and NONCLUSTERED are labels (lexdb's rows are in the primary key's order whatever is said), kept as an entry of
+// Table.invalid (a name no constraint has, so what reads that list does not see it) with the prefix CL_MARK: "" the default (the
+// primary key is the clustered one, a table without one a heap), CL_NONE none (the key NONCLUSTERED), else the clustered index's
+// name (a UNIQUE constraint's or CREATE CLUSTERED INDEX's, without its schema).
+pub const CL_MARK = "\x00cl:"
+pub const CL_NONE = "\x01"
+
+pub fn clusterLabel(t: &Table): str {
+    for x in t.invalid { if strings.startsWith(&x, CL_MARK) { return x[len(CL_MARK)..len(x)].toStr() } }
+    return ""
+}
+
+pub fn setCluster(t: mut &Table, label: &str) {
+    var keep: []str = []
+    for x in t.invalid { if !strings.startsWith(&x, CL_MARK) { append(mut &keep, x.clone()) } }
+    if len(label) > 0 { append(mut &keep, CL_MARK + label) }
+    t.invalid = keep
+}
+
+// The key or index T-SQL calls clustered: CL_PK (the primary key), an index's name, or "" (none: a heap).
+pub const CL_PK = "\x02pk"
+
+pub fn clusteredOf(t: &Table): str {
+    let l = clusterLabel(t)
+    if l == CL_NONE { return "" }
+    if len(l) > 0 { return l }
+    return if hasPk(t) { CL_PK } else { "" }
+}
+
 // The name of table t's primary key constraint (and its index).
 pub fn pkConName(t: &Table): str { return if len(t.pkName) > 0 { t.pkName.clone() } else { lexdb_sql.baseName(&t.name) + "_pkey" } }
 
@@ -823,6 +852,7 @@ pub fn decTable(name: &str, s: &str, parseExpr: &fn(&str): Result[Expr, lexdb_ba
                                     prec: binary.readU32LEStr(s, at + 8), scale: binary.readU32LEStr(s, at + 12),
                                     len: binary.readU32LEStr(s, at + 16)}
         at += 20
+        if ty.kind == lexdb_sql.K_ENUM { enumsSeen = true }
         append(mut &t.cols, spelledCol(&cn, ty, s[at] == 1))
         at += 1
     }
@@ -1092,9 +1122,21 @@ pub fn decEnum(oid: int, v: &str): EnumType {
     return EnumType{key: all[0].clone(), oid: oid, labels: labels}
 }
 
+// Whether an enum type has been seen in this process (CREATE TYPE ... AS ENUM, a table with a column of one, a type read): the
+// statements' enum passes (lexdb_enum) run only then, so a database without enum types does no work for them. The process's tasks
+// share one thread, so a plain flag; it is never cleared.
+var enumsSeen: bool = false
+
+pub fn enumsOn(): bool { return enumsSeen }
+
+pub fn noteEnums() { enumsSeen = true }
+
 pub fn readEnum(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, oid: int): Result[Option[EnumType], lexdb_base.DbErr] {
     match try st.get(txn, CATALOG, &(enumKey(oid))) {
-        Some(v) { return Ok(Some(decEnum(oid, &v))) }
+        Some(v) {
+            enumsSeen = true
+            return Ok(Some(decEnum(oid, &v)))
+        }
         None { return Ok(None) }
     }
 }

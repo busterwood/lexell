@@ -37,6 +37,7 @@ import "./lexdb_store"
 import "./lexdb_catalog"
 import "./lexdb_sql"
 import "./lexdb_plan"
+import "./lexdb_enum"
 import "./lexdb_stats"
 import "./lexdb_bind"
 import "./lexdb_ops"
@@ -1579,7 +1580,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
         match from[k].on {
             Some(on) {
                 // ON sees this table and those before it
-                let r = try enumOrder(st, txn, &(try lexdb_bind.resolve(&on, &q.cols, q.levels[k].first + len(q.levels[k].t.cols), mut &sc.names)), &q.cols)
+                let r = try lexdb_enum.fixIn(st, txn, &typing(), (try lexdb_bind.resolve(&on, &q.cols, q.levels[k].first + len(q.levels[k].t.cols), mut &sc.names)), &q.cols)
                 append(mut &jon, r)
             }
             None {}
@@ -1588,7 +1589,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
             Some(u) {
                 // its names qualified already; resolved as an ON is, for the
                 // types' casts (char(n)'s, 9.94) and enums' order
-                let r = try enumOrder(st, txn, &(try lexdb_bind.resolve(&u, &q.cols, q.levels[k].first + len(q.levels[k].t.cols), mut &sc.names)), &q.cols)
+                let r = try lexdb_enum.fixIn(st, txn, &typing(), (try lexdb_bind.resolve(&u, &q.cols, q.levels[k].first + len(q.levels[k].t.cols), mut &sc.names)), &q.cols)
                 append(mut &jon, r)
             }
             None {}
@@ -1610,7 +1611,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
     match where {
         Some(w0) {
             let w = lexdb_plan.pullCommonOr(w0)
-            let r = try enumOrder(st, txn, &(try lexdb_bind.resolve(&w, &q.cols, len(q.cols), mut &sc.names)), &q.cols)
+            let r = try lexdb_enum.fixIn(st, txn, &typing(), (try lexdb_bind.resolve(&w, &q.cols, len(q.cols), mut &sc.names)), &q.cols)
             lp = lexdb_bind.LPlan.Filter(lp, [r], [])
             hasWhere = true
         }
@@ -2387,9 +2388,16 @@ fn constLit(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
     return castVal(v, t, &none)
 }
 
+// The types of a statement's n parameters, 0 where not given.
+fn scopeTypes(n: int, ptypes: &[]int): []int {
+    if n == 0 { return [] }
+    var pt: []int = withCapacity(n)
+    for i in 0..n { append(mut &pt, if i < len(ptypes) { ptypes[i] } else { 0 }) }
+    return pt
+}
+
 fn newScope(params: &[]Val, ptypes: &[]int): Scope {
-    var pt: []int = []
-    for i in 0..len(params) { append(mut &pt, if i < len(ptypes) { ptypes[i] } else { 0 }) }
+    let pt = scopeTypes(len(params), ptypes)
     return Scope{names: Names{frames: [], base: len(params), ptypes: pt, coll: "", ty: typing(), blank: lexdb_syscat.tsqlBlank, constCast: constLit, colScale: typScale, outScale: exprScale, virt: false}, works: [], asRole: [], whos: [], target: "", looks: [], early: false, locking: false, ordBy: [], ordLim: -1, noRefKeys: false, noLp: false, rn: []}
 }
 
@@ -2577,6 +2585,22 @@ fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     return planSubIn(st, txn, s, params, sc, res)
 }
 
+// A VALUES list's column (its values' types, k to a row) of values that cannot be made one type: PostgreSQL's 42804.
+fn valuesClash(oids: &[]int, k: int): Result[Unit, DbErr] {
+    let ty = typing()
+    for c in 0..k {
+        var os: []int = []
+        var r = c
+        while r < len(oids) {
+            append(mut &os, oids[r])
+            r += k
+        }
+        let cl = lexdb_bind.clashOids(&ty, &os)
+        if len(cl) == 2 { return Err(lexdb_bind.clashErr("VALUES", &cl)) }
+    }
+    return Ok(Unit{})
+}
+
 fn planSubIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
              sc: mut &Scope, res: bool): Result[SubPlan, DbErr] {
     // EXISTS stops at its first row; a scalar subquery at its second, unless
@@ -2601,6 +2625,7 @@ fn planSubIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
         }
         var argOids: []int = []
         if lexdb_bind.pgRules(&sc.names) && strings.startsWith(&s.srf, "#values:") { for o in sel.outs { append(mut &argOids, o.oid) } }
+        if len(argOids) > 0 && s.mdialect == lexdb_sql.MD_PG { try valuesClash(&argOids, strings.parseIntOpt(&s.srf[8..len(s.srf)]).unwrapOr(1)) }
         sel.outs = try srfCols(&s.srf, s.ordin, &sel.outs)
         // a char's value in a text or varchar column of VALUES loses its blanks (PostgreSQL's door)
         for i in 0..len(argOids) {
@@ -3693,7 +3718,17 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     t.tree = st.createTree(txn)
     try makeColSeqs(st, txn, mut &t, -1, &s.idOpts)
     for c in t.cols { try defaultSeqs(st, txn, &c) }
-    for c in s.cons { if c.kind != lexdb_sql.C_FOREIGN { try lexdb_gen.checkConstraint(&t.cols, &c, s.mdialect, &lexdb_sql.baseName(&t.name)); try addConstraint(st, txn, mut &t, &c, false) } }
+    var clustered = ""
+    for c in s.cons {
+        if c.kind != lexdb_sql.C_FOREIGN {
+            let before = len(t.indexes)
+            try lexdb_gen.checkConstraint(&t.cols, &c, s.mdialect, &lexdb_sql.baseName(&t.name))
+            try addConstraint(st, txn, mut &t, &c, false)
+            if c.cluster == 1 && len(t.indexes) > before { clustered = lexdb_sql.baseName(&t.indexes[len(t.indexes) - 1].name) }
+        }
+    }
+    // T-SQL's CLUSTERED and NONCLUSTERED: which key or index is the clustered one (a label: lexdb_catalog.clusterLabel)
+    if len(clustered) > 0 { lexdb_catalog.setCluster(mut &t, &clustered) } else if s.pkCluster == 2 && len(t.pk) > 0 { lexdb_catalog.setCluster(mut &t, lexdb_catalog.CL_NONE) }
     for c in s.cons { if c.kind == lexdb_sql.C_FOREIGN { try lexdb_gen.checkConstraint(&t.cols, &c, s.mdialect, &lexdb_sql.baseName(&t.name)); try addConstraint(st, txn, mut &t, &c, false) } }
     t.onCommit = s.onCommit
     if s.onCommit > lexdb_sql.ONC_PRESERVE { append(mut &txn.onCommit, key.clone()) }
@@ -3749,6 +3784,7 @@ fn createType(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         for j in 0..i { if s.names[j] == s.names[i] { return Err(e("23505", "duplicate key value violates unique constraint \"pg_enum_typid_label_index\"")) } }
     }
     try txn.put(lexdb_catalog.CATALOG, &(lexdb_catalog.enumKey(oid)), &(lexdb_catalog.encEnum(&EnumType{key: key, oid: oid, labels: collections.copyOf(&s.names)})))
+    lexdb_catalog.noteEnums()
     try bumpCatalog(st, txn)
     return Ok(tagOnly("CREATE TYPE"))
 }
@@ -3893,47 +3929,6 @@ fn checkEnums(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row:
         }
     }
     return Ok(Unit{})
-}
-
-// The enum type x is of (by its OID), its name and labels joined by \x1f.
-fn enumOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &Expr, cols: &[]lexdb_sql.ColDef): Result[Option[str], DbErr] {
-    let none: []int = []
-    let o = lexdb_plan.exprOid(x, cols, &none)
-    if o < 16384 || lexdb_pgcat.typeOf(o).isSome() { return Ok(None) }
-    match try lexdb_catalog.readEnum(st, txn, o) {
-        Some(en) {
-            var all: []str = [lexdb_sql.baseName(&en.key)]
-            for l in en.labels { append(mut &all, l.clone()) }
-            return Ok(Some(strings.join(&all, "\x1f")))
-        }
-        None { return Ok(None) }
-    }
-}
-
-fn enumPos(x: &Expr, enc: &str): Expr { return Expr.Call("#enumpos", [lexdb_sql.cloneExpr(x), Expr.Lit(Val.Text(enc.toStr()))], false) }
-
-// x with its comparisons of enum values made comparisons of their labels'
-// places (9.90).
-fn enumOrder(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &Expr, cols: &[]lexdb_sql.ColDef): Result[Expr, DbErr] {
-    match x {
-        Expr.Bin(op, a, b) {
-            if op == "and" || op == "or" {
-                return Ok(Expr.Bin(op.clone(), try enumOrder(st, txn, &a, cols), try enumOrder(st, txn, &b, cols)))
-            }
-            if op == "<" || op == "<=" || op == ">" || op == ">=" {
-                var enc = try enumOf(st, txn, &a, cols)
-                if enc.isNone() { enc = try enumOf(st, txn, &b, cols) }
-                match enc {
-                    Some(en) { return Ok(Expr.Bin(op.clone(), enumPos(&a, &en), enumPos(&b, &en))) }
-                    None {}
-                }
-            }
-            return Ok(lexdb_sql.cloneExpr(x))
-        }
-        Expr.Unary(op, a) { if op == "not" { return Ok(Expr.Unary(op.clone(), try enumOrder(st, txn, &a, cols))) } }
-        else {}
-    }
-    return Ok(lexdb_sql.cloneExpr(x))
 }
 
 // ---- tables without a primary key (9.88)
@@ -5055,18 +5050,25 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             if lexdb_gen.keyOnVirtual(&t.cols, c) {
                 return Err(e("0A000", "lexdb: a primary key or foreign key over a virtual column is made in CREATE TABLE (the row keeps its value)"))
             }
+            if c.cluster == 1 { try clusterClash(&t) }
+            let nIdx = len(t.indexes)
             if c.kind == lexdb_sql.C_PRIMARY {
                 try addPrimary(st, txn, mut &t, c, mut &pk)
+                if c.cluster == 2 && len(lexdb_catalog.clusterLabel(&t)) == 0 { lexdb_catalog.setCluster(mut &t, lexdb_catalog.CL_NONE) }
             } else if c.kind == lexdb_sql.C_UNIQUE && len(c.index) > 0 {
                 try uniqueUsing(st, txn, mut &t, c)
             } else {
                 try lexdb_gen.checkConstraint(&t.cols, c, s.mdialect, &lexdb_sql.baseName(&t.name))
                 try addConstraint(st, txn, mut &t, c, true)
             }
+            if c.kind == lexdb_sql.C_UNIQUE && c.cluster == 1 && len(t.indexes) > nIdx { lexdb_catalog.setCluster(mut &t, &lexdb_sql.baseName(&t.indexes[len(t.indexes) - 1].name)) }
         } else if a.kind == lexdb_sql.A_DROP_CON {
             if lexdb_catalog.hasPk(&t) && a.name == lexdb_catalog.pkConName(&t) {
                 try dropPrimary(st, txn, mut &t, a.cascade, &"")
                 pk.changed = true
+                if lexdb_catalog.clusterLabel(&t) == lexdb_catalog.CL_NONE { lexdb_catalog.setCluster(mut &t, "") }
+            } else if lexdb_catalog.clusterLabel(&t) == a.name && (try dropConstraint(st, txn, mut &t, &a.name, a.cascade)) {
+                lexdb_catalog.setCluster(mut &t, if lexdb_catalog.hasPk(&t) { lexdb_catalog.CL_NONE } else { "" })
             } else if !(try dropConstraint(st, txn, mut &t, &a.name, a.cascade)) {
                 if !a.ifFlag {
                     return Err(e("42704", &("constraint \"" + a.name + "\" of relation \"" + rel + "\" does not exist")))
@@ -5734,7 +5736,7 @@ fn pruneInvalid(t: mut &Table) {
         var there = false
         for c in t.checks { if c.name == n { there = true } }
         for f in t.fks { if f.name == n { there = true } }
-        if there { append(mut &keep, n.clone()) }
+        if there || strings.startsWith(&n, lexdb_catalog.CL_MARK) { append(mut &keep, n.clone()) }
     }
     t.invalid = keep
 }
@@ -5911,6 +5913,7 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     if s.conc && txn.inBlock() { return Err(e("25001", "CREATE INDEX CONCURRENTLY cannot run inside a transaction block")) }
     var t = try needTable(st, txn, &s.table)
     try lexdb_priv.needRelOwner(st, txn, &t.name, &"table")
+    if s.cluster == 1 { try clusterClash(&t) }
     var ixName = s.index.clone()
     if len(ixName) == 0 {
         // CREATE INDEX ON t (...) (9.94): the name PostgreSQL chooses
@@ -5986,8 +5989,10 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         }
         None {}
     }
+    let ixBase = lexdb_sql.baseName(&ixKey)
     let ix = Index{name: ixKey, tree: st.createTree(txn), cols: cols, unique: s.unique, pred: pred, con: false, opts: collections.copyOf(&s.pk), exprs: exprs}
     try addIndex(st, txn, mut &t, ix)
+    if s.cluster == 1 { lexdb_catalog.setCluster(mut &t, &ixBase) }
     try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(&t)))
     try bumpFor(st, txn, &t.name)
     return Ok(tagOnly("CREATE INDEX"))
@@ -6121,6 +6126,14 @@ fn hasConName(t: &Table, name: &str): bool {
 // Adds constraint c to table t (its rows checked against it).
 // alter: ALTER TABLE's (its CHECK and FOREIGN KEY may be NOT VALID: the
 // rows there not checked, 9.117), not CREATE TABLE's.
+// T-SQL's second clustered index on a table: error 1902, naming the first.
+fn clusterClash(t: &Table): Result[Unit, DbErr] {
+    let cl = lexdb_catalog.clusteredOf(t)
+    if len(cl) == 0 { return Ok(Unit{}) }
+    let shown = if cl == lexdb_catalog.CL_PK { lexdb_catalog.pkConName(t) } else { cl.clone() }
+    return Err(e("TS1902", &("Cannot create more than one clustered index on table '" + lexdb_sql.baseName(&t.name) + "'. Drop the existing clustered index '" + shown + "' before creating another.")))
+}
+
 fn addConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint, alter: bool): Result[Unit, DbErr] {
     let later = alter && c.notValid
     if c.kind == lexdb_sql.C_CHECK { return addCheck(st, txn, t, c, later) }
@@ -6266,6 +6279,7 @@ fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
                 let ix = pop(mut &old)
                 if ix.name == ixKey { txn.dropTree(ix.tree) } else { append(mut &rev, ix) }
             }
+            if lexdb_catalog.clusterLabel(&t) == lexdb_sql.baseName(&ixKey) { lexdb_catalog.setCluster(mut &t, if lexdb_catalog.hasPk(&t) { lexdb_catalog.CL_NONE } else { "" }) }
             while len(rev) > 0 { append(mut &t.indexes, pop(mut &rev)) }
             txn.del(lexdb_catalog.CATALOG, &(idxName(&ixKey)))
             try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(&t)))
@@ -6328,7 +6342,7 @@ fn dupKey(t: &Table, row: &[]Val): DbErr {
                                 &("Key (" + strings.join(&names, ", ") + ")=(" + strings.join(&vals, ", ") + ") already exists."), "")
 }
 
-fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
+fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits): Result[Res, DbErr] {
     try notView(st, txn, &s.table, &"insert into")
     try dmlCheck(st, txn, s, &"a")
     let sqe = seqEnv(st, txn)
@@ -6363,7 +6377,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         for r in s.rows { if len(r) > 0 && len(r) < len(targets) { return Err(e("ORA00947", "not enough values")) } }
     }
     // its subqueries are run first; with RETURNING, over the table's columns
-    var sc = newScopeIn(st, txn, params, &[])
+    var sc = newScopeIn(st, txn, params, ptypes)
     let noFrom: []lexdb_sql.FromItem = []
     let noWhere: Option[Expr] = None
     let from = if len(s.items) > 0 { insFrom(s) } else { noFrom }
@@ -6397,8 +6411,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         // (eachRow), so they are not all held first. A query that reads the
         // table it inserts into runs to its end first, so it never reads the
         // rows it inserts.
-        let noTypes: []int = []
-        var ssc = newScopeIn(st, txn, params, &noTypes)
+        var ssc = newScopeIn(st, txn, params, ptypes)
         var sel = try planSelect(st, txn, &s.inner[0], params, mut &ssc)
         // (its rows the pipeline's where it runs them)
         bindSel(mut &sel)
@@ -7000,17 +7013,17 @@ fn storeRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: [
     return Ok(row)
 }
 
-fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
-    if s.copy.batchRows > 0 { return batchDml(st, txn, s, params, lim) }
+fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits): Result[Res, DbErr] {
+    if s.copy.batchRows > 0 { return batchDml(st, txn, s, params, ptypes, lim) }
     var win = noWin()
-    return updateB(st, txn, s, params, lim, mut &win)
+    return updateB(st, txn, s, params, ptypes, lim, mut &win)
 }
 
-fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits, win: mut &Win): Result[Res, DbErr] {
+fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits, win: mut &Win): Result[Res, DbErr] {
     try notView(st, txn, &s.table, &"update")
     try dmlCheck(st, txn, s, &"w")
     let sqe = seqEnv(st, txn)
-    var sc = newScopeIn(st, txn, params, &[])
+    var sc = newScopeIn(st, txn, params, ptypes)
     sc.target = try catKey(st, txn, &s.table, false)
     var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, &newMap(), true, mut &sc, false)
     var targets: []int = []
@@ -7111,16 +7124,16 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     return Ok(retRes(ret, &("UPDATE " + len(found).toStr())))
 }
 
-fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
-    if s.copy.batchRows > 0 { return batchDml(st, txn, s, params, lim) }
+fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits): Result[Res, DbErr] {
+    if s.copy.batchRows > 0 { return batchDml(st, txn, s, params, ptypes, lim) }
     var win = noWin()
-    return deleteB(st, txn, s, params, lim, mut &win)
+    return deleteB(st, txn, s, params, ptypes, lim, mut &win)
 }
 
-fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits, win: mut &Win): Result[Res, DbErr] {
+fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits, win: mut &Win): Result[Res, DbErr] {
     try notView(st, txn, &s.table, &"delete from")
     try dmlCheck(st, txn, s, &"d")
-    var sc = newScopeIn(st, txn, params, &[])
+    var sc = newScopeIn(st, txn, params, ptypes)
     sc.target = try catKey(st, txn, &s.table, false)
     var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, &newMap(), true, mut &sc, false)
     var ret = try retOf(s, &q, mut &sc)
@@ -7275,7 +7288,7 @@ fn batchFail(x: DbErr, total: int, what: &str, n: int): DbErr {
     return within(x, &(if len(x.context) > 0 { x.context + "; " + c } else { c }))
 }
 
-fn batchDml(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
+fn batchDml(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits): Result[Res, DbErr] {
     let del = s.kind == lexdb_sql.S_DELETE
     let what = if del { "DELETE" } else { "UPDATE" }
     if txn.inBlock() { return Err(e("25001", &("lexdb: " + what + " with batch_rows cannot run inside a transaction block"))) }
@@ -7288,7 +7301,7 @@ fn batchDml(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     var total = 0
     var tries = 0
     while true {
-        let r = if del { deleteB(st, txn, s, params, lim, mut &win) } else { updateB(st, txn, s, params, lim, mut &win) }
+        let r = if del { deleteB(st, txn, s, params, ptypes, lim, mut &win) } else { updateB(st, txn, s, params, ptypes, lim, mut &win) }
         match move(r) {
             Ok(res) { if win.done { return Ok(res) } }
             Err(x) {
@@ -7781,11 +7794,11 @@ fn fewSource(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, m
     return materialize(st, txn, q, m, params, rs)
 }
 
-fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, lim: Limits): Result[Res, DbErr] {
+fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits): Result[Res, DbErr] {
     try notView(st, txn, &s.table, &"merge into")
     try mergeCheck(st, txn, s)
     let sqe = seqEnv(st, txn)
-    var sc = newScopeIn(st, txn, params, &[])
+    var sc = newScopeIn(st, txn, params, ptypes)
     sc.target = try catKey(st, txn, &s.table, false)
     let none: Option[Expr] = None
     var q = try buildQuery(st, txn, &mergeFrom(s), &none, params, &s.subs, &newMap(), true, mut &sc, false)
@@ -9953,8 +9966,8 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             else { ok = lexdb_bind.groupKind(&r, &q.cols, &sc.names) }
         }
         append(mut &ordKinds, ok)
-        match try enumOf(st, txn, &r, &q.cols) {
-            Some(en) { append(mut &order, enumPos(&r, &en)) }
+        match try lexdb_enum.enumOf(st, txn, &typing(), &r, &q.cols) {
+            Some(en) { append(mut &order, lexdb_enum.enumPos(&r, &en.enc)) }
             None { append(mut &order, r) }
         }
     }
@@ -9969,8 +9982,8 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         var dt: []str = []
         for d in s.distinctOn {
             var r = try lexdb_bind.resolveOrder(&d, &q.cols, &outs, mut &sc.names)
-            match try enumOf(st, txn, &r, &q.cols) {
-                Some(en) { r = enumPos(&r, &en) }
+            match try lexdb_enum.enumOf(st, txn, &typing(), &r, &q.cols) {
+                Some(en) { r = lexdb_enum.enumPos(&r, &en.enc) }
                 None {}
             }
             append(mut &dt, outText(&r, &exprs, &outs, &q.cols))
@@ -10000,8 +10013,8 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             if skipped { return Err(bad) }
             for k in j..len(dt) { if dt[k] == dt[j] { used[k] = true } }
             var r = try lexdb_bind.resolveOrder(&s.distinctOn[j], &q.cols, &outs, mut &sc.names)
-            match try enumOf(st, txn, &r, &q.cols) {
-                Some(en) { r = enumPos(&r, &en) }
+            match try lexdb_enum.enumOf(st, txn, &typing(), &r, &q.cols) {
+                Some(en) { r = lexdb_enum.enumPos(&r, &en.enc) }
                 None {}
             }
             append(mut &order, r)
@@ -10019,6 +10032,17 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     match s.having {
         Some(h) { having = Some(try lexdb_bind.resolveHaving(&h, &q.cols, &outs, &exprs, mut &sc.names, s.mdialect)) }
         None {}
+    }
+    // enum values' comparisons, least and greatest and casts (lexdb_enum), where the process has seen an enum type
+    let enums = lexdb_catalog.enumsOn()
+    if enums {
+        for i in 0..len(exprs) { exprs[i] = try lexdb_enum.fix(st, txn, &typing(), &exprs[i], &q.cols) }
+        for i in 0..len(groupBy) { groupBy[i] = try lexdb_enum.fix(st, txn, &typing(), &groupBy[i], &q.cols) }
+        for i in 0..len(order) { order[i] = try lexdb_enum.fix(st, txn, &typing(), &order[i], &q.cols) }
+        match having {
+            Some(h) { having = Some(try lexdb_enum.fix(st, txn, &typing(), &h, &q.cols)) }
+            None {}
+        }
     }
     // HAVING as resolved: the plan's Filter's (bh), moved there by the
     // planner's rewrite (collectAggs), which always runs where it is
@@ -10045,11 +10069,11 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             }
             // partitions and the window's order under their collations (L2): by keys
             for x in d.part {
-                let rx = try lexdb_bind.resolve(&x, &q.cols, len(q.cols), mut &sc.names)
+                let rx = try lexdb_enum.fixIn(st, txn, &typing(), try lexdb_bind.resolve(&x, &q.cols, len(q.cols), mut &sc.names), &q.cols)
                 append(mut &r.part, lexdb_bind.collKeyOf(lexdb_bind.exprKind(&rx, &q.cols, &sc.names), rx))
             }
             for o in d.order {
-                let ro = try lexdb_bind.resolve(&o.expr, &q.cols, len(q.cols), mut &sc.names)
+                let ro = try lexdb_enum.keyIn(st, txn, &typing(), try lexdb_bind.resolve(&o.expr, &q.cols, len(q.cols), mut &sc.names), &q.cols)
                 append(mut &r.order, lexdb_sql.WinOrder{expr: lexdb_bind.collKeyOf(lexdb_bind.exprKind(&ro, &q.cols, &sc.names), ro), desc: o.desc, nullsFirst: o.nullsFirst})
             }
             var inDef = false
@@ -10082,7 +10106,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 Expr.Col(n, sl) { if lexdb_bind.colSlot(&q.cols, &n, sl) < 0 { ok = true } }
                 else {}
             }
-            let t = lexdb_sql.exprText(&o)
+            let t = lexdb_sql.exprText(&lexdb_enum.unplaced(&o))
             for x in exprs { if lexdb_sql.exprText(&x) == t { ok = true } }
             if !ok { return Err(e("42P10", "for SELECT DISTINCT, ORDER BY expressions must appear in select list")) }
         }
@@ -10092,6 +10116,10 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     let topN = if s.topMode != 0 { n0 } else { -1 }
     let limit = if s.topMode != 0 { -1 } else { n0 }
     let offset = try lexdb_plan.evalInt(&s.offset, params, "OFFSET", mut &sc.looks)
+    if limit >= 0 && len(q.levels) == 1 && q.levels[0].src >= 0 && s.setop == 0 && len(order) == 0 && !aggQ && !s.distinct && len(s.distinctOn) == 0 &&
+       len(s.from) == 1 && s.where.isNone() && len(wdefs) == 0 {
+        limitRecursion(mut &q, limit + max(offset, 0))
+    }
     var sort = len(order) > 0
     var first = -1
     // The first table's order holds through the joins, unless a RIGHT or
@@ -10455,6 +10483,11 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
             let ro = branchOid(&s.inner[1], &r, i)
             let o = lexdb_bind.commonOid(&ty, &[lo, ro])
             var bits = 0
+            if o == 0 && pg {
+                // of different categories: PostgreSQL's 42804
+                let c = lexdb_bind.clashOids(&ty, &[lo, ro])
+                if len(c) == 2 { return Err(lexdb_bind.clashErr(what, &c)) }
+            }
             if o != 0 {
                 if o != outs[i].oid {
                     outs[i].scale = if r.outs[i].oid == o { r.outs[i].scale } else { -1 }
@@ -10753,6 +10786,18 @@ fn setRes(sel: &Sel, rows: [][]Val, n: int): Res {
     return Res{cols: outs, rows: rows, tag: "SELECT " + n.toStr(), hasRows: true, copy: COPY_NONE}
 }
 
+// A SELECT of a recursive CTE's rows alone (no WHERE, join, grouping or order), with a LIMIT of need rows (the offset's too):
+// the recursion stops when it has made them, as PostgreSQL's lazy scan of the working table does, not at max_recursion
+// (its own limit is that many rows: runRecursive).
+fn limitRecursion(q: mut &Query, need: int) {
+    let i = q.levels[0].src
+    if i >= len(q.subs) || q.subs[i].cte < 0 || q.subs[i].sel.rec < 0 || q.subs[i].sel.setop == 0 || q.subs[i].sel.limit >= 0 || len(q.subs[i].sel.order) > 0 { return }
+    // (the CTE read by this FROM item alone: a second use needs every row)
+    var uses = 0
+    for sp in q.subs { if sp.cte == q.subs[i].cte { uses += 1 } }
+    if uses == 1 && len(q.subs) == 1 { q.subs[i].sel.limit = need }
+}
+
 // A recursive CTE: the first query's rows, then rounds of the second over
 // the rows the last round added (the working table) until a round adds
 // none; with UNION (not ALL), rows seen before are not added.
@@ -10765,12 +10810,15 @@ fn runRecursive(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, lp
     var work = replace(mut &lres.rows, [])
     if !sel.setAll { work = lexdb_setop.distinctRows(work, mut &seen, &sel.outKinds) }
     var out: [][]Val = []
+    // a LIMIT of the query reading it alone (limitRecursion): the rows it needs
+    let need = if sel.limit >= 0 && len(sel.order) == 0 { sel.limit + max(sel.offset, 0) } else { -1 }
     // max_recursion: rounds that add rows (the last round, adding none, is free)
     var rounds = 0
     while len(work) > 0 {
         try rs.bud.tick()
         try rs.bud.hold(lexdb_pipe.rowsBytes(&work) * 2)       // kept in the result and as the working table
         for r in work { append(mut &out, collections.copyOf(&r)) }
+        if need >= 0 && len(out) >= need { break }
         cachePut(mut &rs.cache, key.clone(), work)
         var rres = try runChild(st, txn, &sel.parts[1], rp, -1, rs, 1)
         work = replace(mut &rres.rows, [])
@@ -12445,11 +12493,11 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             return createTable(st, txn, s)
         }
         lexdb_sql.S_DROP { return dropTable(st, txn, s) }
-        lexdb_sql.S_INSERT { return insert(st, txn, s, params, lim) }
+        lexdb_sql.S_INSERT { return insert(st, txn, s, params, ptypes, lim) }
         lexdb_sql.S_SELECT { return select(st, txn, s, params, ptypes, lim, pc, sink) }
-        lexdb_sql.S_UPDATE { return update(st, txn, s, params, lim) }
-        lexdb_sql.S_DELETE { return delete(st, txn, s, params, lim) }
-        lexdb_sql.S_MERGE { return merge(st, txn, s, params, lim) }
+        lexdb_sql.S_UPDATE { return update(st, txn, s, params, ptypes, lim) }
+        lexdb_sql.S_DELETE { return delete(st, txn, s, params, ptypes, lim) }
+        lexdb_sql.S_MERGE { return merge(st, txn, s, params, ptypes, lim) }
         lexdb_sql.S_CREATE_INDEX { return createIndex(st, txn, s) }
         lexdb_sql.S_ANALYZE { return analyzeStmt(st, txn, s, lim) }
         lexdb_sql.S_DROP_INDEX { return dropIndex(st, txn, s) }
@@ -15032,6 +15080,66 @@ fn dropSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     return Ok(tagOnly("DROP SEQUENCE"))
 }
 
+// Whether x calls nextval, currval or setval of the sequence key (by its text: 'name', 'schema.name', a regclass cast of it).
+fn callsSeq(x: &Expr, key: &str): bool {
+    match x {
+        Expr.Call(n, args, _) {
+            if (n == "nextval" || n == "currval" || n == "setval") && len(args) > 0 {
+                var named: Option[str] = lexdb_sql.litText(&args[0])
+                match args[0] {
+                    Expr.Cast(c, _) { named = lexdb_sql.litText(&c) }
+                    else {}
+                }
+                match named {
+                    Some(t) {
+                        let k = nameOfText(&t)
+                        if lexdb_sql.baseName(&k) == lexdb_sql.baseName(key) && lexdb_sql.schemaOf(&k) == lexdb_sql.schemaOf(key) { return true }
+                    }
+                    None {}
+                }
+            }
+            for a in args { if callsSeq(&a, key) { return true } }
+            return false
+        }
+        Expr.Cast(a, _) { return callsSeq(&a, key) }
+        Expr.Unary(_, a) { return callsSeq(&a, key) }
+        Expr.Bin(_, a, b) { return callsSeq(&a, key) || callsSeq(&b, key) }
+        Expr.IsNull(a, _) { return callsSeq(&a, key) }
+        else { return false }
+    }
+}
+
+// The columns whose DEFAULT calls the sequence d (nextval('d')): PostgreSQL refuses to drop it (2BP01); with CASCADE the
+// defaults are dropped, each with its NOTICE.
+fn seqDefaults(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &Seq, cascade: bool): Result[Unit, DbErr] {
+    var detail: []str = []
+    for t0 in try allTables(st, txn) {
+        var t = t0
+        var hit = false
+        for i in 0..len(t.cols) {
+            let users = match t.cols[i].def {
+                Some(x) { callsSeq(&x, &d.key) }
+                None { false }
+            }
+            if !users { continue }
+            let what = "default value for column " + t.cols[i].name + " of table " + lexdb_sql.baseName(&t.name)
+            if !cascade {
+                append(mut &detail, what + " depends on sequence " + lexdb_sql.baseName(&d.key))
+            } else {
+                t.cols[i].def = None
+                hit = true
+                notice(st, txn, &"00000", &("drop cascades to " + what), &"")
+            }
+        }
+        if hit { try putTable(txn, &t) }
+    }
+    if len(detail) > 0 {
+        return Err(lexdb_base.errDetail("2BP01", &("cannot drop sequence " + lexdb_sql.baseName(&d.key) + " because other objects depend on it"),
+                                        &strings.join(&detail, "\n"), "Use DROP ... CASCADE to drop the dependent objects too."))
+    }
+    return Ok(Unit{})
+}
+
 fn dropOneSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, name: &str): Result[Res, DbErr] {
     let found = try findSeq(st, txn, name)
     if found.isNone() {
@@ -15043,6 +15151,7 @@ fn dropOneSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     }
     let d = found.unwrap()
     try lexdb_priv.needRelOwner(st, txn, &d.key, &"sequence")
+    try seqDefaults(st, txn, &d, s.cascade)
     if len(d.ownerT) > 0 {
         match try byKeyOpt(st, txn, &d.ownerT) {
             Some(t) {

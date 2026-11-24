@@ -1,0 +1,107 @@
+# Wrong answers and serious errors found writing the user documentation (KNOWN-ISSUES.md), in the SQL Server door, against SQL Server 2022
+# (gen_mssql.py ... wrong): a variable's quotient under +, integer overflow, RAISERROR's severities, an error that does not leak into the
+# next batch's TRY block, CLUSTERED and NONCLUSTERED, DROP INDEX ... ON, two primary keys.
+
+# a decimal variable divides as a decimal (1 + @p / 100 was 1)
+DECLARE @p decimal(5,2) = 10; SELECT 1 + @p / 100 AS a, @p / 100 AS b, 2 * (@p / 100) AS c, 1 + @p / 3 AS d, @p / @p AS e
+DECLARE @p decimal(5,2); SET @p = 10.456; SELECT @p AS a, 1 + @p / 100 AS b
+DECLARE @p decimal(5,2) = 10, @q int = 3; SELECT @p / @q AS a, 1 + @p / @q AS b
+DECLARE @p decimal(9,4) = 2.5; SELECT 1 + @p / 100 AS a, CAST(1 + @p / 100 AS decimal(10,4)) AS b
+DECLARE @p decimal(5,2) = 10; IF 1 + @p / 100 > 1.05 SELECT 'above' ELSE SELECT 'below'
+@once CREATE TABLE acc (id int PRIMARY KEY, salary decimal(10,2))
+@once INSERT INTO acc VALUES (1, 100), (2, 250.50)
+@once DECLARE @p decimal(5,2) = 10; UPDATE acc SET salary = salary * (1 + @p / 100) WHERE id = 1
+SELECT id, salary FROM acc ORDER BY id
+@once DECLARE @p decimal(5,2) = 3; UPDATE acc SET salary = salary * (1 + @p / 100)
+SELECT id, salary FROM acc ORDER BY id
+@once CREATE PROCEDURE dbo.raise_pct @p decimal(5,2) AS UPDATE acc SET salary = salary * (1 + @p / 100) WHERE id = 2
+@once EXEC dbo.raise_pct 10
+SELECT id, salary FROM acc ORDER BY id
+DECLARE @p decimal(5,2) = 10; SELECT salary * (1 + @p / 100) AS s FROM acc ORDER BY id
+
+# integer arithmetic overflows (8115)
+SELECT 2147483647 + 1
+SELECT CAST(2147483647 AS int) + 1
+SELECT 2147483647 * 2
+SELECT -2147483648 - 1
+SELECT CAST(32767 AS smallint) + CAST(1 AS smallint)
+SELECT CAST(-2147483648 AS int) / -1
+SELECT 2147483648 + 1
+SELECT CAST(2147483647 AS int) + 1 AS x WHERE 1 = 0
+SELECT ABS(CAST(-2147483648 AS int))
+DECLARE @i int = 2147483647; SELECT @i + 1
+DECLARE @i int = 2147483647; SELECT @i - 1 AS ok
+@once CREATE TABLE ov (a int, b smallint)
+@once INSERT INTO ov VALUES (2147483647, 32767)
+SELECT a + 1 FROM ov
+SELECT b + 1 FROM ov
+SELECT b * 2 FROM ov
+SELECT 2147483647 + a FROM ov
+
+# RAISERROR's severities: 19 and above need WITH LOG (2754), SETERROR sets @@ERROR
+RAISERROR('fatal', 19, 1)
+RAISERROR('fatal', 20, 1)
+RAISERROR('fatal', 25, 1)
+RAISERROR('fatal', 26, 1)
+RAISERROR('logged', 19, 1) WITH LOG
+SELECT 1 AS a; RAISERROR('logged', 19, 1) WITH LOG; SELECT 2 AS b
+BEGIN TRY RAISERROR('x', 20, 1) END TRY BEGIN CATCH SELECT ERROR_NUMBER() AS n, ERROR_SEVERITY() AS s END CATCH
+BEGIN TRY RAISERROR('x', 19, 1) WITH LOG END TRY BEGIN CATCH SELECT ERROR_NUMBER() AS n, ERROR_SEVERITY() AS s END CATCH
+BEGIN TRY RAISERROR('x', 18, 1) END TRY BEGIN CATCH SELECT ERROR_NUMBER() AS n, ERROR_SEVERITY() AS s END CATCH
+RAISERROR('x', 5, 1) WITH SETERROR; SELECT @@ERROR AS e
+RAISERROR('x', 5, 1) WITH NOWAIT, SETERROR; SELECT @@ERROR AS e
+RAISERROR('x', 5, 1); SELECT @@ERROR AS e
+RAISERROR('x', 16, 1) WITH LOG
+
+# no TRY or CATCH state is left by a batch for the next one
+@once CREATE TABLE lg (n int, m nvarchar(100))
+@lines BEGIN TRY\n    BEGIN TRY\n        RAISERROR('inner failure', 16, 1);\n    END TRY\n    BEGIN CATCH\n        PRINT 'inner CATCH: ' + ERROR_MESSAGE();\n        THROW;\n    END CATCH;\nEND TRY\nBEGIN CATCH\n    PRINT 'outer CATCH: ' + ERROR_MESSAGE();\nEND CATCH;
+@lines BEGIN TRY\n    SELECT * FROM dbo.nothere;\nEND TRY\nBEGIN CATCH\n    INSERT lg VALUES (ERROR_NUMBER(), ERROR_MESSAGE());\nEND CATCH;
+SELECT COUNT(*) AS n FROM lg
+SELECT ERROR_NUMBER() AS n, ERROR_MESSAGE() AS m
+@lines BEGIN TRY\n    BEGIN TRY\n        THROW 50001, 'inner', 1;\n    END TRY\n    BEGIN CATCH\n        THROW;\n    END CATCH;\nEND TRY\nBEGIN CATCH\n    THROW;\nEND CATCH;
+@lines BEGIN TRY\n    SELECT * FROM dbo.nothere2;\nEND TRY\nBEGIN CATCH\n    INSERT lg VALUES (ERROR_NUMBER(), ERROR_MESSAGE());\nEND CATCH;
+SELECT COUNT(*) AS n FROM lg
+SELECT n, m FROM lg
+
+# CLUSTERED and NONCLUSTERED
+@once CREATE TABLE cl1 (id int NOT NULL, v int, CONSTRAINT pk_cl1 PRIMARY KEY CLUSTERED (id ASC) WITH (PAD_INDEX = OFF, IGNORE_DUP_KEY = OFF) ON [PRIMARY]) ON [PRIMARY]
+@once CREATE TABLE cl2 (id int NOT NULL PRIMARY KEY NONCLUSTERED, v int UNIQUE CLUSTERED)
+@once CREATE TABLE cl3 (id int PRIMARY KEY CLUSTERED, v int UNIQUE NONCLUSTERED, w int)
+@once CREATE TABLE cl4 (id int NOT NULL, v int NOT NULL, CONSTRAINT pk_cl4 PRIMARY KEY NONCLUSTERED (id), CONSTRAINT uq_cl4 UNIQUE CLUSTERED (v DESC))
+@once CREATE TABLE cl5 (id int, v int)
+@once CREATE TABLE cl6 (id int NOT NULL, CONSTRAINT pk_cl6 PRIMARY KEY (id))
+@once CREATE UNIQUE NONCLUSTERED INDEX ix_cl3_w ON cl3 (w) WITH (FILLFACTOR = 80) ON [PRIMARY]
+@once CREATE NONCLUSTERED INDEX ix_cl1_v ON cl1 (v DESC)
+@once CREATE CLUSTERED INDEX ix_cl5 ON cl5 (v)
+@once CREATE UNIQUE CLUSTERED INDEX ix_cl6 ON cl6 (id)
+CREATE CLUSTERED INDEX ix_cl1_c ON cl1 (v)
+CREATE UNIQUE CLUSTERED INDEX ix_cl2_c ON cl2 (id)
+CREATE CLUSTERED INDEX ix_cl3_c ON cl3 (v)
+CREATE CLUSTERED INDEX ix_cl5_c ON cl5 (id)
+SELECT o.name AS t, i.name AS i, i.index_id, i.type, i.type_desc, i.is_unique, i.is_primary_key, i.is_unique_constraint FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name IN ('cl1', 'cl3', 'cl4', 'cl5', 'cl6') AND i.name IN ('pk_cl1', 'ix_cl1_v', 'ix_cl3_w', 'pk_cl4', 'uq_cl4', 'ix_cl5', 'pk_cl6', 'ix_cl6') OR (o.name IN ('cl1', 'cl3', 'cl4', 'cl5', 'cl6') AND i.name IS NULL) ORDER BY o.name, i.index_id
+SELECT o.name AS t, i.type_desc, COUNT(*) AS n FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name IN ('cl2', 'cl3') GROUP BY o.name, i.type_desc ORDER BY o.name, i.type_desc
+SELECT OBJECTPROPERTY(OBJECT_ID('cl1'), 'TableHasClustIndex') AS a, OBJECTPROPERTY(OBJECT_ID('cl5'), 'TableHasClustIndex') AS b
+@once INSERT cl1 VALUES (2, 20), (1, 10)
+SELECT id, v FROM cl1 ORDER BY id
+INSERT cl1 VALUES (1, 99)
+INSERT cl2 VALUES (1, 5), (2, 5)
+@once DROP INDEX ix_cl5 ON cl5
+SELECT o.name AS t, i.index_id, i.type_desc FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name = 'cl5' ORDER BY i.index_id
+@once ALTER TABLE cl5 ADD CONSTRAINT uq_cl5 UNIQUE CLUSTERED (v)
+CREATE CLUSTERED INDEX ix_cl5_d ON cl5 (id)
+@once ALTER TABLE cl5 DROP CONSTRAINT uq_cl5
+SELECT o.name AS t, i.index_id, i.type_desc FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name = 'cl5' ORDER BY i.index_id
+@once CREATE TABLE cl7 (id int NOT NULL, v int)
+@once ALTER TABLE cl7 ADD CONSTRAINT pk_cl7 PRIMARY KEY NONCLUSTERED (id)
+@once CREATE CLUSTERED INDEX ix_cl7 ON cl7 (v)
+SELECT i.name AS i, i.index_id, i.type_desc FROM sys.indexes i WHERE i.object_id = OBJECT_ID('cl7') ORDER BY i.index_id
+DROP INDEX IF EXISTS ix_nothere ON cl7
+@once CREATE TABLE cl8 (id int NOT NULL, v int NOT NULL, w int NOT NULL, CONSTRAINT pk_cl8 PRIMARY KEY CLUSTERED (id, v DESC), CONSTRAINT uq_cl8 UNIQUE NONCLUSTERED (w ASC))
+SELECT i.name AS i, i.type_desc FROM sys.indexes i WHERE i.object_id = OBJECT_ID('cl8') ORDER BY i.index_id
+
+# two primary keys
+CREATE TABLE pk2 (a int PRIMARY KEY, b int PRIMARY KEY)
+CREATE TABLE pk2 (a int PRIMARY KEY, b int, PRIMARY KEY (b))
+CREATE TABLE pk2 (a int NOT NULL, b int NOT NULL, c int NOT NULL, PRIMARY KEY (a, b), CONSTRAINT x PRIMARY KEY (c))
+@once CREATE TABLE pk2 (a int NOT NULL PRIMARY KEY, b int UNIQUE)

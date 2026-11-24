@@ -894,6 +894,106 @@ pub fn tsToDate(us: int): int {
 // "hh:mm[:ss]", or ISO 8601 ("P1Y2M3DT4H5M6S"). Fractions of a unit spill
 // into the smaller units as PostgreSQL's do (a month as 30 days, a day as
 // 24 hours).
+// ---- the SQL standard's interval fields (INTERVAL '1' DAY, INTERVAL '1-2' YEAR TO MONTH, a column interval day to second(3))
+//
+// A type's fields are a mask of IF_* (PostgreSQL's INTERVAL_MASK of YEAR, MONTH, DAY, HOUR, MINUTE and SECOND: YEAR TO MONTH
+// is 3), kept in the interval TypeName's len; 0: any (a plain interval). A text is read in the fields' terms (a bare number
+// in the lowest one's unit: INTERVAL '1' DAY is a day, '1' HOUR TO SECOND a second; '1-2' YEAR TO MONTH a year and two
+// months; '03:04' MINUTE TO SECOND minutes and seconds), and a value loses what is below its lowest field
+// (PostgreSQL's AdjustIntervalForTypmod).
+pub const IF_YEAR = 1
+pub const IF_MONTH = 2
+pub const IF_DAY = 4
+pub const IF_HOUR = 8
+pub const IF_MINUTE = 16
+pub const IF_SECOND = 32
+
+fn plainNumber(t: &str): bool {
+    var k = 0
+    if len(t) > 0 && (t[0] == '-' || t[0] == '+') { k = 1 }
+    var digits = 0
+    var dot = false
+    while k < len(t) {
+        if isDigit(t[k]) { digits += 1 } else if t[k] == '.' && !dot { dot = true } else { return false }
+        k += 1
+    }
+    return digits > 0
+}
+
+fn unitOfMask(mask: int): str {
+    if mask & IF_SECOND != 0 { return "second" }
+    if mask & IF_MINUTE != 0 { return "minute" }
+    if mask & IF_HOUR != 0 { return "hour" }
+    if mask & IF_DAY != 0 { return "day" }
+    if mask & IF_MONTH != 0 { return "month" }
+    return "year"
+}
+
+// s read as an interval with the fields mask (0 any).
+pub fn parseIvalFields(s: &str, mask: int): Result[Ival, lexdb_base.DbErr] {
+    if mask == 0 { return parseIval(s) }
+    let t = strings.trim(s)
+    var text = t.toStr()
+    if plainNumber(&t) {
+        text = t + " " + unitOfMask(mask)
+    } else if mask == (IF_YEAR | IF_MONTH) {
+        // 1-2, -1-2: a year and months (a text with units is read as it is)
+        let sg = if strings.startsWith(&t, "-") { "-" } else { "" }
+        let body = if len(sg) > 0 || strings.startsWith(&t, "+") { t[1..len(t)].toStr() } else { t.toStr() }
+        let dash = strings.indexOf(&body, "-", 1)
+        if dash > 0 && plainNumber(&(body[0..dash].toStr())) && plainNumber(&(body[dash + 1..len(body)].toStr())) {
+            if !strings.contains(&body, ".") && num(&body, dash + 1, len(body)) > 11 {
+                return Err(lexdb_base.err("22015", &("interval field value out of range: \"" + s + "\"")))
+            }
+            text = sg + body[0..dash].toStr() + " year " + sg + body[dash + 1..len(body)].toStr() + " month"
+        } else if !hasLetter(&t) {
+            return Err(bad(&"interval", s))
+        }
+    } else if mask == (IF_MINUTE | IF_SECOND) && strings.contains(&t, ":") && strings.count(&t, ":") == 1 && !strings.contains(&t, " ") {
+        // 03:04: minutes and seconds
+        let sg = if strings.startsWith(&t, "-") { "-" } else { "" }
+        text = sg + "0:" + (if len(sg) > 0 { t[1..len(t)].toStr() } else { t.toStr() })
+    } else if mask == (IF_DAY | IF_HOUR) && !hasLetter(&t) && !strings.contains(&t, ":") {
+        // 1 2: a day and two hours
+        let f = strings.fields(&t)
+        if len(f) == 2 { text = f[0] + " day " + f[1] + " hour" }
+    }
+    let iv = try parseIval(&text)
+    return Ok(adjustFields(&iv, mask, 6))
+}
+
+fn hasLetter(t: &str): bool {
+    for i in 0..len(t) { if (t[i] >= 'a' && t[i] <= 'z') || (t[i] >= 'A' && t[i] <= 'Z') { return true } }
+    return false
+}
+
+// An interval without what is below the fields' lowest, its seconds rounded to prec digits (6 any).
+pub fn adjustFields(iv: &Ival, mask: int, prec: int): Ival {
+    var months = iv.months
+    var days = iv.days
+    var us = iv.us
+    if mask == IF_YEAR {
+        months = (months / 12) * 12
+        days = 0
+        us = 0
+    } else if mask == IF_MONTH || mask == (IF_YEAR | IF_MONTH) {
+        days = 0
+        us = 0
+    } else if mask == IF_DAY {
+        us = 0
+    } else if mask == IF_HOUR || mask == (IF_DAY | IF_HOUR) {
+        us = (us / HOUR_US) * HOUR_US
+    } else if mask == IF_MINUTE || mask == (IF_DAY | IF_HOUR | IF_MINUTE) || mask == (IF_HOUR | IF_MINUTE) {
+        us = (us / MINUTE_US) * MINUTE_US
+    } else if mask != 0 {
+        us = roundUs(us, prec)
+    }
+    return Ival{months: months, days: days, us: us}
+}
+
+const HOUR_US = 3600000000
+const MINUTE_US = 60000000
+
 pub fn parseIval(s: &str): Result[Ival, lexdb_base.DbErr] {
     let t = strings.trim(s)
     if len(t) > 0 && (t[0] == 'P' || t[0] == 'p') {
@@ -947,6 +1047,9 @@ pub fn parseIval(s: &str): Result[Ival, lexdb_base.DbErr] {
         if k < len(tk) {
             numText = tk[0..k].clone()
             unit = tk[k..len(tk)].clone()
+        } else if i + 1 < len(toks) && strings.contains(&toks[i + 1], ":") {
+            // "1 2:03:04": days, then the time
+            unit = "day"
         } else if i + 1 < len(toks) {
             unit = toks[i + 1].clone()
             i += 1
