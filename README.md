@@ -10,12 +10,61 @@ I wanted the quick edit–compile–run loop I remember from Turbo Pascal, with 
 
 ## Performance
 
-- **Compile time.** Hello world compiles in about 14 ms, against Rust's 46 ms, and produces a 20 KB native executable. The nine benchmark programs compile in about 131 ms, 23 times faster than Rust's 3.05 s.
-- **Generated code.** With `-O`, Lexell is faster than Rust on eight of the fourteen microbenchmarks that have a Rust port and level on two more. It runs the allocation benchmark 10 times faster, lists and trees 5.2 times, strings 3.2 times, maps 1.9 times, recursive calls 1.5 times, the sieve 1.4 times and the interpreter loop 1.1 times. Rust is ahead on floating point, matrix multiplication, sorting with closures and the token scanner. Against Java on a warmed-up JVM, Lexell is faster on seven of fifteen: switching between tasks about 6 times (and nearly twice as fast as Go's goroutines), and the interpreter loop, the sieve, the token scanner, sorting with closures, loops and recursive calls by 1.2 to 1.9 times. On fourteen of the fifteen it runs in 2 to 14 MB where the JVM takes 50 MB to 1.4 GB (maps: 180 MB against 2.4 GB). The JVM is ahead on the allocation-heavy programs, arrays, maps and matrix multiplication, and level on floating point.
-- **Other programs.** Lexell is faster than Go's regexp on all eight regex patterns, from twice as fast to several hundred times faster. Its jq is 1.4 to 2.2 times faster than jq 1.7.1 on every filter, with identical output. It parses JSON 2.1 times faster than Python and writes it about 1.4 times faster. Its grep is 1.4 to 1.5 times faster than GNU grep, and its eza lists a tree 3.3 times faster than eza. Lexell is behind cmark on Markdown, Python on JSON queries, Rust's regex crate on most patterns, and GNU sort.
-- **Decimal.** Against Java `BigDecimal`, Lexell parses 38-digit values 4.6 times faster and formats them 3.3 times faster, multiplies 19-digit values 1.5 times faster, and adds 1.1 to 1.35 times faster. Against .NET `System.Decimal`, it divides 4.4 times faster, parses 2.7 times faster, formats 1.7 times faster, compares 1.6 times faster and multiplies 1.2 times faster. Java is ahead on division and comparison, and .NET slightly ahead on 19-digit addition.
+### Compile time
 
-The [performance report](PERFORMANCE.md) gives the full results, workload definitions and reproduction commands. These measurements come from one AMD Ryzen 7 8745HS machine running Linux 7.2 (not WSL2), on 22 November 2026.
+| | Lexell | Rust | Lexell is |
+|---|---:|---:|---:|
+| Hello world (a 20 KB executable) | 14 ms | 46 ms | 3.3× faster |
+| The nine benchmark programs | 131 ms | 3.05 s | 23× faster |
+
+### Generated code
+
+Lexell with `-O` against Rust and against Java on a warmed-up JVM:
+
+| Benchmark | Faster than Rust | Faster than Java |
+|---|---:|---:|
+| Allocation | 10× | |
+| Lists and trees | 5.2× | |
+| Strings | 3.2× | |
+| Maps | 1.9× | |
+| Recursive calls | 1.5× | 1.2× |
+| Sieve | 1.4× | 1.8× |
+| Interpreter loop | 1.1× | 1.9× |
+| Switching between tasks | | 5.9× (1.9× Go) |
+| Token scanner | | 1.6× |
+| Sorting with closures | | 1.5× |
+| Loops | level | 1.3× |
+| Peak memory (14 of 15 programs) | | 2–14 MB against the JVM's 50 MB–1.4 GB |
+
+Rust is ahead on floating point, matrix multiplication, sorting with closures and the token scanner. Java is ahead on the allocation-heavy programs, arrays, maps and matrix multiplication.
+
+### Real programs
+
+| Program | Compared with | Lexell is |
+|---|---|---:|
+| Regex, all eight patterns | Go's regexp | 2× to several hundred× faster |
+| jq, every filter (identical output) | jq 1.7.1 | 1.4–2.2× faster |
+| Tree listing | eza | 3.3× faster |
+| JSON parsing | Python | 2.1× faster |
+| grep | GNU grep | 1.4–1.5× faster |
+| JSON writing | Python | 1.4× faster |
+
+Lexell is behind cmark on Markdown, Python on JSON queries, Rust's regex crate on most patterns, and GNU sort.
+
+### Decimal
+
+| Operation | Faster than Java `BigDecimal` | Faster than .NET `Decimal` |
+|---|---:|---:|
+| Parse | 4.6× (38 digits) | 2.7× |
+| Format | 3.3× (38 digits) | 1.7× |
+| Divide | | 4.4× |
+| Compare | | 1.6× |
+| Multiply | 1.5× (19 digits) | 1.2× |
+| Add | 1.1–1.35× | |
+
+Java is ahead on division and comparison, and .NET is slightly ahead on 19-digit addition.
+
+Measured on one AMD Ryzen 7 8745HS running Linux 7.2, 22 November 2026. The [performance report](PERFORMANCE.md) has every result, what each benchmark does, and how to reproduce them.
 
 ## Concurrency without threads or locks
 
