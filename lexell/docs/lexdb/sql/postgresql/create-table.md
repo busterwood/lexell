@@ -134,8 +134,6 @@ table from a query, see [CREATE TABLE AS](create-table-as.md).
   - `INCLUDE`, `WITH` and `USING INDEX TABLESPACE` on a key, and `DEFERRABLE` on a primary key or a unique
     constraint;
   - `SET NULL (column, ...)` and `SET DEFAULT (column, ...)`.
-- `PRIMARY KEY` on two columns' definitions (`a int PRIMARY KEY, b int PRIMARY KEY`) makes one key of both columns.
-  PostgreSQL refuses it (42P16, `multiple primary keys for table "t" are not allowed`).
 - PostgreSQL 18 lists a `NOT NULL` constraint in `pg_constraint` (`contype` n); lexdb does not (lexdb-gaps.md 2.2).
 - `COLLATE` changes nothing: text compares by bytes.
 - `UNLOGGED` tables are logged, and temporary tables too.
@@ -336,6 +334,7 @@ CREATE TABLE
 ```sql
 CREATE TABLE customer (x int);
 CREATE TABLE dup (a int, a int);
+CREATE TABLE twokeys (a int PRIMARY KEY, b int PRIMARY KEY);
 CREATE TABLE copy (LIKE customer);
 CREATE TABLE doc (body json);
 CREATE TABLE bad (p text REFERENCES customer);
@@ -348,6 +347,7 @@ ROLLBACK;
 ```text
 ERROR:  relation "customer" already exists
 ERROR:  column "a" specified more than once
+ERROR:  multiple primary keys for table "twokeys" are not allowed
 ERROR:  syntax error at or near "like"
 ERROR:  type "json" does not exist
 ERROR:  foreign key constraint "bad_p_fkey" cannot be implemented: Key columns "p" and "id" are of incompatible types: text and integer.
