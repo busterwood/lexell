@@ -110,8 +110,8 @@ ERROR:  cannot drop table customer because other objects depend on it
 DROP TABLE
       conname
 --------------------
- orders_pkey
  orders_id_not_null
+ orders_pkey
 (2 rows)
 
  count
