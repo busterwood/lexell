@@ -946,6 +946,33 @@ fn (g: &Gen) guardTy(t: int, wide: bool): bool {
     return g.u.isScalar(t) && !g.isF(t) && !g.is128(t) && !g.isAggr(t) && (!wide || g.size(t) == 8)
 }
 
+// The register of QUIET_REGS that parameter l of f (an integer or a pointer in one register)
+// arrives in, or -1 (another register, two, the stack, or not a parameter). An aggregate result
+// in memory takes rdi first (its address).
+fn (g: &Gen) arrivesQuiet(f: int, l: int): int {
+    var ni = if g.isAggr(g.retTy) && g.classify(g.retTy)[0] == CL_MEM { 1 } else { 0 }
+    var nx = 0
+    for j in 0..len(g.u.funcs[f].params) {
+        let p = g.u.funcs[f].params[j]
+        let t = g.u.locals[p].ty
+        let cls = g.classify(t)
+        let nInt = countCl(&cls, CL_INT)
+        let nSse = countCl(&cls, CL_SSE)
+        if cls[0] == CL_MEM || ni + nInt > 6 || nx + nSse > 8 {
+            if p == l { return -1 }
+            continue
+        }
+        if p == l {
+            if nInt != 1 || nSse != 0 || g.isAggr(t) || g.is128(t) || g.isF(t) { return -1 }
+            let r = INT_REGS[ni]
+            return if r == RDI || r == RSI || r == R8 || r == R9 { r } else { -1 }
+        }
+        ni += nInt
+        nx += nSse
+    }
+    return -1
+}
+
 // A parameter of 8 bytes that arrives in a register (perhaps under a conversion that changes
 // nothing).
 fn (g: &Gen) guardLeaf(e: int, f: int): bool {
@@ -1098,6 +1125,18 @@ fn (g: mut &Gen) allocRegs(f: int) {
     var given: [][]int = []
     for i in 0..32 { append(mut &given, []) }       // xmm registers at 16 + their number
     var nSaved = 0
+    // first, a parameter that arrives in one of QUIET_REGS stays there when nothing after the entry
+    // (the only loud position of its range: arguments arrive there) changes it: no move in the
+    // prologue, so none of another argument's registers is written, and no slot's store and load
+    for l in g.u.funcs[f].params {
+        if g.weight[l] < 1 || g.bad[l] || g.inner[l] || g.first[l] != 0 || !g.u.isScalar(g.u.locals[l].ty) { continue }
+        let q = g.arrivesQuiet(f, l)
+        if q >= 0 && loudBefore[g.last[l] + 1] == loudBefore[1] &&
+            (!g.any89 || (q != R8 && q != R9) || l89Before[g.last[l] + 1] == l89Before[1]) && g.regFree(&given, q, l) {
+            g.reg[l] = q
+            append(mut &given[q], l)
+        }
+    }
     for l in order {
         if g.isF(g.u.locals[l].ty) { continue }
         if g.is128(g.u.locals[l].ty) {
@@ -1136,6 +1175,7 @@ fn (g: mut &Gen) allocRegs(f: int) {
         var r = -1
         let quiet = g.quietLive(l, &loudBefore) || g.quietTail(l, false)
         let quiet89 = quiet && (!g.any89 || g.quietLive(l, &l89Before) || g.quietTail(l, true))
+        if g.reg[l] >= 0 { continue }       // a parameter kept where it arrives (below)
         if quiet {
             for q in QUIET_REGS {
                 if r < 0 && (quiet89 || (q != R8 && q != R9)) && g.regFree(&given, q, l) { r = q }

@@ -1300,3 +1300,65 @@ A compiler pass is worth revisiting if a hot loop divides by a constant. The pas
 powers of two by shifts, others by multiply-high, and `x % d == 0` by the inverse. For decimal,
 the lever is `quantize`'s division by a power of ten from a table: a library change
 (decimal-perf-research.md), not this pass.
+
+## 32. Parameters stay in the quiet registers they arrive in (as built)
+
+closures' comparators spilled their parameters, as every function did:
+
+```
+mov %rdi,-0x8(%rbp)
+mov %rsi,-0x10(%rbp)
+mov -0x8(%rbp),%rax
+...
+```
+
+The allocator marks the entry (position 0) loud, since the arguments arrive there in rdi, rsi,
+rdx, rcx, r8 and r9. A parameter's range always contains position 0, so a parameter never got a
+quiet register. One named only once or twice is not worth a callee-saved one either, so it went
+to the frame.
+
+**The change** (x64gen `arrivesQuiet` and a pass before the allocation loop):
+
+- **The rule.** A parameter that arrives in rdi, rsi, r8 or r9 (an aggregate result in memory
+  shifts them by one) keeps that register when nothing loud follows in its range. r8 and r9 also
+  need no 128-bit code in the range.
+- **Why it is safe.** No parameter ever takes another parameter's arrival register, so the
+  prologue moves nothing into a register that another argument still holds. `movRR` drops the
+  move to the same register.
+- **The order.** The pass runs before the heaviest-first loop, since staying costs nothing and
+  saves a store and a load. Run inside the loop instead, `byKey`'s second parameter lost rsi to
+  the inlined `cmp`'s locals.
+
+| measure (d6af3e45 against this; perfsuite on the a1c47b3c inputs, 4 placements, CPU 2) | instructions | cycles |
+|---|---:|---:|
+| compile suite | -1.35% | -0.53% (compiler --native apart) |
+| run suite | -0.25% | +0.42% |
+| closures / maps / lists / pingpong | -2.52 / -0.39 / -0.59 / -0.79% | +0.5 / 0 / -0.2 / +6.2% (apart) |
+| wc -w | 0 | +2.1% (apart); `-O`, 4 placements: +3.4% (581.4 to 600.9M) |
+| apps regex / json / jq / cmark / decimal | -0.49 / -0.61 / -0.55 / -0.57 / -0.20% | -0.3 / +1.3 / +1.2 / +0.2 / -0.3%; json at 4 placements +0.5%, overlapping |
+| TPC-H SF1, server instructions per query (22) | -0.78% geomean (every query -0.5 to -1.5%) | |
+| lexdb point select (icount6, 2 rounds) | -0.55% (169,563-169,631 against 170,546-170,564) | +0.6 / 0% |
+| code size: lexdb -O | -12 KB | |
+
+**The two programs that are slower in cycles.**
+
+- **pingpong.** Only one function changed: `gl12_rest`, a drop glue, 8 bytes shorter (no frame,
+  no store of rdi). Yet the program takes 4 to 9% more cycles in every variant tried (default,
+  `LXL_SHORTJ=0`, `LXL_LOOPLINES=64`). Stores that can't forward to the loads that follow
+  (`ls_bad_status2.stli_other`) go from 21.9M to 27.2M, about the cycles lost. The conflicts are
+  spread over the runtime's task-switch code (its register saves and restores), not at one pair
+  of instructions.
+- **wc.** The scan loop is the same instructions. With the shorter prologue it starts 16 bytes
+  before a 64-byte line instead of on one, and it still spans two lines. The loop rule (section 27)
+  places by line count only. Preferring a line-aligned start when the count is the same would be
+  a follow-up to measure.
+
+**The judgement.** Instructions go down nearly everywhere, and the compile suite's cycles agree.
+The run suite's cycles do not (+0.42%), so the change does not strictly meet "cycles must agree
+in sign". It was kept because the two losses come through code it does not touch: one is a
+store-forwarding timing effect in the task switch, the other a loop's placement within a line.
+
+Test: tests/run/native_param_regs. It covers a comparator; six and eight parameters (r8 and r9,
+two on the stack); an aggregate result in memory; a parameter read after a call; doubles and
+integers mixed; a guard; narrow types; and calls through function values and a closure. It runs
+on --c, --native and -O, and the expected output is the previous compiler's.
