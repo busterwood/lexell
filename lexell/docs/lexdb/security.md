@@ -17,7 +17,7 @@ The three doors share one set of roles. A role's password, set in any door, work
 |---|---|---|
 | PostgreSQL | `CREATE ROLE app LOGIN PASSWORD 'secret'` | Under `trust`, a name that is not a role has superuser rights. Under `scram-sha-256` the role needs `LOGIN` and a password (SCRAM-SHA-256; `md5` is not offered). |
 | SQL Server | `CREATE ROLE app LOGIN PASSWORD 'secret'` (PostgreSQL's form, taken in this door) or `CREATE USER` | There is no `CREATE LOGIN`. SQL authentication only: Windows and Entra logins are refused. |
-| Oracle | `CREATE USER app IDENTIFIED BY secret` then `GRANT CREATE SESSION TO app` | A user is a schema. Under `trust`, a user with no password logs in with its own name as the password. `SYS` and `AS SYSDBA` are refused. |
+| Oracle | `CREATE USER app IDENTIFIED BY secret` then `GRANT CREATE SESSION TO app` | A user is a schema, made at its first login. Under `trust`, a user with no password logs in with its own name as the password. `SYS` and `AS SYSDBA` are refused. |
 
 Reference pages: [CREATE ROLE](sql/postgresql/create-role.md) (PostgreSQL), [CREATE USER](sql/tsql/create-user.md) and
 [CREATE ROLE](sql/tsql/create-role.md) (T-SQL), [CREATE USER](sql/oracle/create-user.md) and
