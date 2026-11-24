@@ -2,7 +2,7 @@
 
 Makes a new table.
 
-**Door:** PostgreSQL. **Follows:** PostgreSQL 18.
+**Door:** PostgreSQL. **Follows:** PostgreSQL 18 and 19.
 
 ## Syntax
 
@@ -17,7 +17,7 @@ column_constraint:
     [ CONSTRAINT constraint_name ]
     { NOT NULL
     | NULL
-    | CHECK ( expression ) [ NO INHERIT ]
+    | CHECK ( expression ) [ NO INHERIT ] [ ENFORCED | NOT ENFORCED ]
     | DEFAULT default_expr
     | GENERATED ALWAYS AS ( generation_expr ) [ STORED | VIRTUAL ]
     | GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [ ( sequence_options ) ]
@@ -25,17 +25,18 @@ column_constraint:
     | PRIMARY KEY
     | REFERENCES reftable [ ( refcolumn ) ] [ MATCH SIMPLE ]
         [ ON DELETE referential_action ] [ ON UPDATE referential_action ]
-        [ [ NOT ] DEFERRABLE ] [ INITIALLY { DEFERRED | IMMEDIATE } ] }
+        [ [ NOT ] DEFERRABLE ] [ INITIALLY { DEFERRED | IMMEDIATE } ] [ ENFORCED | NOT ENFORCED ] }
 
 table_constraint:
     [ CONSTRAINT constraint_name ]
-    { CHECK ( expression ) [ NO INHERIT ] [ NOT VALID ]
+    { CHECK ( expression ) [ NO INHERIT ] [ NOT VALID ] [ ENFORCED | NOT ENFORCED ]
     | NOT NULL column_name
     | UNIQUE [ NULLS DISTINCT ] ( column_name [, ... ] )
     | PRIMARY KEY ( column_name [, ... ] )
     | FOREIGN KEY ( column_name [, ... ] ) REFERENCES reftable [ ( refcolumn [, ... ] ) ] [ MATCH SIMPLE ]
         [ ON DELETE referential_action ] [ ON UPDATE referential_action ]
-        [ [ NOT ] DEFERRABLE ] [ INITIALLY { DEFERRED | IMMEDIATE } ] [ NOT VALID ] }
+        [ [ NOT ] DEFERRABLE ] [ INITIALLY { DEFERRED | IMMEDIATE } ] [ NOT VALID ]
+        [ ENFORCED | NOT ENFORCED ] }
 
 referential_action:
     NO ACTION | RESTRICT | CASCADE | SET NULL | SET DEFAULT
@@ -107,6 +108,14 @@ table from a query, see [CREATE TABLE AS](create-table-as.md).
 
 `NOT VALID`
 : For a table's `CHECK` or `FOREIGN KEY`: the constraint applies to new rows; on a new table there are no others.
+
+`ENFORCED`, `NOT ENFORCED`
+: For a `CHECK` or a foreign key. `ENFORCED` is the default. A constraint that is `NOT ENFORCED` is kept and shown in
+  the catalog, but rows are not checked against it: a row that breaks a `CHECK` is taken, and a foreign key does
+  not look at the table it refers to and does not act when a row there is deleted or changed. It is also not valid
+  (`pg_constraint.convalidated` is false). [ALTER TABLE](alter-table.md) `ALTER CONSTRAINT` changes the state. A
+  primary key, a unique constraint, `NOT NULL` and a default have no such state: on a column they are 42601
+  (`misplaced NOT ENFORCED clause`), on a table's primary key or unique constraint 0A000.
 
 `ON COMMIT`
 : For a temporary table: `PRESERVE ROWS` (the default) keeps its rows at each commit; `DELETE ROWS` empties it;
@@ -328,7 +337,54 @@ CREATE TABLE
 (1 row)
 ```
 
-### G. Errors
+### G. Constraints that are not enforced
+
+<!-- example: postgresql -->
+```sql
+CREATE TABLE lot (id int PRIMARY KEY);
+CREATE TABLE crate (
+  id int PRIMARY KEY,
+  weight int CHECK (weight > 0) NOT ENFORCED,
+  lot_id int REFERENCES lot (id) NOT ENFORCED,
+  CONSTRAINT crate_id_ck CHECK (id > 0)
+);
+INSERT INTO crate VALUES (1, -5, 99);
+SELECT * FROM crate;
+INSERT INTO crate VALUES (-2, 10, NULL);
+SELECT conname, contype, conenforced, convalidated, pg_get_constraintdef(oid) AS definition
+FROM pg_constraint WHERE conrelid = 'crate'::regclass ORDER BY conname;
+SELECT constraint_name, constraint_type, enforced FROM information_schema.table_constraints
+WHERE table_name = 'crate' ORDER BY constraint_name;
+```
+
+```text
+CREATE TABLE
+CREATE TABLE
+INSERT 0 1
+ id | weight | lot_id
+----+--------+--------
+  1 |     -5 |     99
+(1 row)
+
+ERROR:  new row for relation "crate" violates check constraint "crate_id_ck"
+      conname       | contype | conenforced | convalidated |                      definition
+--------------------+---------+-------------+--------------+------------------------------------------------------
+ crate_id_ck        | c       | t           | t            | CHECK ((id > 0))
+ crate_lot_id_fkey  | f       | f           | f            | FOREIGN KEY (lot_id) REFERENCES lot(id) NOT ENFORCED
+ crate_pkey         | p       | t           | t            | PRIMARY KEY (id)
+ crate_weight_check | c       | f           | f            | CHECK ((weight > 0)) NOT ENFORCED
+(4 rows)
+
+  constraint_name   | constraint_type | enforced
+--------------------+-----------------+----------
+ crate_id_ck        | CHECK           | YES
+ crate_lot_id_fkey  | FOREIGN KEY     | NO
+ crate_pkey         | PRIMARY KEY     | YES
+ crate_weight_check | CHECK           | NO
+(4 rows)
+```
+
+### H. Errors
 
 <!-- example: postgresql -->
 ```sql
@@ -339,6 +395,9 @@ CREATE TABLE copy (LIKE customer);
 CREATE TABLE doc (body json);
 CREATE TABLE bad (p text REFERENCES customer);
 CREATE TABLE ex (a int, EXCLUDE USING gist (a WITH =));
+CREATE TABLE ne1 (a int PRIMARY KEY NOT ENFORCED);
+CREATE TABLE ne2 (a int, UNIQUE (a) NOT ENFORCED);
+CREATE TABLE ne3 (a int CHECK (a > 0) NOT ENFORCED ENFORCED);
 BEGIN READ ONLY;
 CREATE TABLE ro (a int);
 ROLLBACK;
@@ -352,6 +411,9 @@ ERROR:  syntax error at or near "like"
 ERROR:  type "json" does not exist
 ERROR:  foreign key constraint "bad_p_fkey" cannot be implemented: Key columns "p" and "id" are of incompatible types: text and integer.
 ERROR:  lexdb: EXCLUDE constraints are not supported
+ERROR:  misplaced NOT ENFORCED clause
+ERROR:  UNIQUE constraints cannot be marked NOT ENFORCED
+ERROR:  multiple ENFORCED/NOT ENFORCED clauses not allowed
 BEGIN
 ERROR:  cannot execute CREATE TABLE in a read-only transaction
 ROLLBACK
