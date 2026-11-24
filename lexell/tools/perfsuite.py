@@ -58,9 +58,12 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
-FROZEN = 'af99f933'         # move only on purpose, and say so in PERFORMANCE.md (was 7d519d1
-                            # until the literal suffixes of 2026-11-06)
-BENCH = ['fib', 'loop', 'array', 'alloc', 'lists', 'strings', 'trees', 'tokens', 'sieve', 'maps']
+FROZEN = 'a1c47b3c'         # move only on purpose, and say so in HISTORY.md, "Judging a pass" (was
+                            # 7d519d1 until the literal suffixes of 2026-11-06, then af99f933, which
+                            # predates the lexell/ rename: 5f30415d was given with --frozen until
+                            # a1c47b3c, the first with the five programs added on 2026-11-23)
+BENCH = ['fib', 'loop', 'array', 'alloc', 'lists', 'strings', 'trees', 'tokens', 'sieve', 'maps',
+         'nbody', 'interp', 'closures', 'matmul', 'pingpong']
 TOOLS = ['grep', 'sort', 'wc', 'eza']
 
 

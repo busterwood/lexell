@@ -20,7 +20,8 @@ Others no longer apply: `str` reference counts went away with owned strings
   on the base build only. That alone looked like +4% compile cost, and it was an
   artifact: `-O` is not the default, and perfsuite builds its compilers without it.
 - **perfsuite inputs are frozen at `5f30415d` (`--frozen`).** The script's default,
-  `af99f933`, predates the `lexell/` rename, so `git archive` of it fails.
+  `af99f933`, predates the `lexell/` rename, so `git archive` of it fails. From section 32 on
+  the default is `a1c47b3c`, whose run suite has the five programs added on 23 November.
 - **Point selects** use the in-process harness, `pt.lxl`, from the R3 work:
   20,000 statements, `LXL_HASH_SEED=1`, instructions per statement.
 - **The machine was shared** with another session's suite. Two byte-identical copies
@@ -1252,7 +1253,9 @@ jmps outside the function or to labels made before it.
 **The judgement.** perfsuite's run suite does not contain interp: its frozen inputs predate the
 five programs added on 23 November. So the change does not meet "Judging a pass" as written.
 It was kept because it runs no new instruction anywhere, costs no compile time, and makes one
-program 27% faster.
+program 27% faster. On the inputs frozen at `a1c47b3c` (perfsuite's default since, with the five
+programs in its run suite), f63b11f7 against 7669ea76 gives interp -3.23% instructions and -30.2%
+cycles (apart), the run suite -0.18 / -1.73% and the compile suite +0.03 / +0.04%, so it passes.
 
 The first lexdb run had two failures. Three reruns passed 360 of 360, two of them with this
 compiler confirmed by comparing it byte for byte. Another session's lexdb work was running on

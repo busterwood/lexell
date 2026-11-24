@@ -1650,7 +1650,10 @@ only gains.
 
 It builds both revisions' native compilers from their seeds, then measures
 them on inputs frozen at one revision (`7d519d1`; moved only on purpose,
-with a note here):
+with a note here: to `af99f933` for the literal suffixes of 2026-11-06, given as `5f30415d`
+after the `lexell/` rename, and to `a1c47b3c` on 2026-11-24, whose run suite adds the five
+programs of 23 November: nbody, interp, closures, matmul and pingpong. Results on different
+frozen inputs are not comparable):
 
 - **Compile suite:** the frozen compiler (`--native` and `--emit-c`) and
   the frozen eza, grep and zoxide, compiled by each compiler. This is the
