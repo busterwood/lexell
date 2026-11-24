@@ -41,7 +41,14 @@ constraint states mean.
   statement.
 
 `DROP COLUMN`, `DROP (...)`
-: Removes columns and their data.
+: Removes columns and their data. A `CHECK` that reads only that column goes with it; a `CHECK` that reads other
+  columns too is ORA-12991 (`column is referenced in a multi-column constraint`), and the column stays (example J).
+
+`ADD CONSTRAINT`
+: A `CHECK` that a row breaks is ORA-02293, a foreign key with no parent ORA-02298, a `UNIQUE` or primary key over
+  duplicate values ORA-02299 or ORA-02437, each naming the constraint with its owner (`(SA.NAME)`), unless the state
+  is `ENABLE NOVALIDATE` or `DISABLE` (example I). A second foreign key on the same columns and the same referenced
+  columns is ORA-02275 (ORA-02274 in `CREATE TABLE`).
 
 `DROP CONSTRAINT`
 : Removes a constraint by name.
@@ -53,7 +60,9 @@ constraint states mean.
   the constraint is then also not validated. `DISABLE VALIDATE` checks the rows first, then disables. A bare
   `VALIDATE` or `NOVALIDATE` (only in `MODIFY CONSTRAINT`) changes the validity alone: `VALIDATE` checks the rows,
   `NOVALIDATE` forgets that they were checked. A name that is not a constraint of the table is ORA-02430
-  (`ENABLE`, `VALIDATE`) or ORA-02431 (`DISABLE`).
+  (`ENABLE`, `VALIDATE`) or ORA-02431 (`DISABLE`). A primary key or `UNIQUE` constraint is always enabled and
+  validated: `ENABLE` and `VALIDATE` of one are accepted and change nothing, `DISABLE` and `NOVALIDATE` are
+  ORA-03001.
 
 `RENAME COLUMN`, `RENAME TO`
 : Renames a column, or the table.
@@ -72,13 +81,16 @@ constraint states mean.
 
 - **Not supported (ORA-03001):** `READ ONLY` and `READ WRITE`, and the other clauses of Oracle's `ALTER TABLE`
   (storage, partitions, `MOVE`, `SHRINK`, `ROW MOVEMENT`).
-- **Constraint states** are kept for `CHECK` and foreign key constraints only. `PRIMARY KEY`, `UNIQUE` and `NOT NULL`
-  cannot be disabled: `ENABLE CONSTRAINT` or `DISABLE CONSTRAINT` of one is ORA-02430 (`no such constraint`, its text
-  saying `cannot enable` for both), and `DISABLE` or `NOVALIDATE` in the definition of one is ORA-00900. `RELY` and `NORELY` are read and not kept
-  (`USER_CONSTRAINTS.RELY` is empty). Oracle has no `NOT ENFORCED`; neither has lexdb (ORA-00900).
-- `ADD CONSTRAINT ... CHECK` over rows that break it is ORA-02290 (Oracle: ORA-02293).
-- lexdb tests every `CHECK` of a row on an `UPDATE`; Oracle tests only those that read a column the `UPDATE` sets. A
-  row that does not obey a constraint that is not validated therefore fails when any of its columns is updated.
+- **Constraint states** are kept for `CHECK` and foreign key constraints only. `DISABLE` or `NOVALIDATE` of a
+  `PRIMARY KEY` or `UNIQUE` constraint is ORA-03001, where Oracle disables it (a lexdb table is stored by its key);
+  `ENABLE` and `VALIDATE` of one are accepted and do nothing. `DISABLE` or `NOVALIDATE` in the definition of a key
+  or of `NOT NULL` is ORA-00900. `RELY` and `NORELY` are read and not kept (`USER_CONSTRAINTS.RELY` is empty).
+  Oracle has no `NOT ENFORCED`; neither has lexdb (ORA-00900).
+- An `UPDATE` tests only the `CHECK` constraints that read a column it sets, as Oracle does, for a statement after the
+  door's statement savepoint (the second statement of a transaction, and each one after it). A plain single
+  autocommit `UPDATE`, and `MERGE`, test every `CHECK` of the row. This shows only for a row that breaks a constraint
+  that is not validated: there it fails when any of its columns is updated, where Oracle accepts an update of a
+  column the constraint does not read (example L).
 - `ALTER TABLE ... ALTER COLUMN` (T-SQL and PostgreSQL's form) is ORA-01735.
 
 ## Examples
@@ -475,12 +487,97 @@ ERROR:
 ORA-02431: cannot disable constraint (NOSUCH) - no such constraint
 ```
 
-### I. What lexdb does not take
+### I. ADD CONSTRAINT over rows that break it
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE par (id NUMBER PRIMARY KEY);
+CREATE TABLE kid (id NUMBER PRIMARY KEY, par_id NUMBER, qty NUMBER, tag VARCHAR2(5));
+INSERT INTO par VALUES (1);
+INSERT INTO kid VALUES (1, 1, 5, 'x');
+INSERT INTO kid VALUES (2, 9, -5, 'x');
+COMMIT;
+ALTER TABLE kid ADD CONSTRAINT kid_qty_ck CHECK (qty >= 0);
+ALTER TABLE kid ADD CONSTRAINT kid_fk FOREIGN KEY (par_id) REFERENCES par (id);
+ALTER TABLE kid ADD CONSTRAINT kid_tag_uq UNIQUE (tag);
+ALTER TABLE kid ADD CONSTRAINT kid_qty_nv CHECK (qty >= 0) ENABLE NOVALIDATE;
+UPDATE kid SET par_id = 1, qty = 1, tag = 'y' WHERE id = 2;
+ALTER TABLE kid ADD CONSTRAINT kid_fk FOREIGN KEY (par_id) REFERENCES par (id);
+ALTER TABLE kid ADD CONSTRAINT kid_fk2 FOREIGN KEY (par_id) REFERENCES par (id);
+```
+
+```text
+Table created.
+
+Table created.
+
+1 row created.
+
+1 row created.
+
+1 row created.
+
+Commit complete.
+
+ERROR:
+ORA-02293: cannot validate (SA.KID_QTY_CK) - check constraint violated
+
+ERROR:
+ORA-02298: cannot validate (SA.KID_FK) - parent keys not found
+
+ERROR:
+ORA-02299: cannot validate (SA.KID_TAG_UQ) - duplicate keys found
+
+Table altered.
+
+1 row updated.
+
+Table altered.
+
+ERROR:
+ORA-02275: such a referential constraint already exists in the table
+```
+
+### J. DROP COLUMN and a CHECK
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE stock (id NUMBER PRIMARY KEY, lo NUMBER, hi NUMBER, qty NUMBER,
+  CONSTRAINT stock_range_ck CHECK (lo <= hi), CONSTRAINT stock_qty_ck CHECK (qty >= 0));
+ALTER TABLE stock DROP COLUMN hi;
+ALTER TABLE stock DROP COLUMN qty;
+SELECT constraint_name FROM user_constraints WHERE table_name = 'STOCK' ORDER BY constraint_name;
+ALTER TABLE stock DROP CONSTRAINT stock_range_ck;
+ALTER TABLE stock DROP COLUMN hi;
+```
+
+```text
+Table created.
+
+ERROR:
+ORA-12991: column is referenced in a multi-column constraint
+
+Table altered.
+
+CONSTRAINT_NAME
+---------------
+STOCK_PKEY
+STOCK_RANGE_CK
+
+2 rows selected.
+
+Table altered.
+
+Table altered.
+```
+
+### K. What lexdb does not take
 
 <!-- example: oracle -->
 ```sql
 ALTER TABLE staff READ ONLY;
 ALTER TABLE staff DISABLE CONSTRAINT emp_pkey;
+ALTER TABLE staff ENABLE CONSTRAINT emp_pkey;
 ALTER TABLE staff ALTER COLUMN salary SET DEFAULT 5;
 ```
 
@@ -489,10 +586,58 @@ ERROR:
 ORA-03001: unimplemented feature: lexdb: ALTER TABLE takes ADD, DROP, ALTER COLUMN, VALIDATE CONSTRAINT, RENAME and SET SCHEMA
 
 ERROR:
-ORA-02430: cannot enable constraint (EMP_PKEY) - no such constraint
+ORA-03001: unimplemented feature: lexdb: DISABLE and NOVALIDATE of the primary key or unique constraint EMP_PKEY are not supported
+
+Table altered.
 
 ERROR:
 ORA-01735: invalid ALTER TABLE option
+```
+
+### L. UPDATE and a constraint that is not validated
+
+Row 2 breaks `ck`, which is enabled and not validated. The first statement of a transaction tests every check of the
+row it updates; the statements after it test only the checks that read a column they set:
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE b (id NUMBER PRIMARY KEY, pid NUMBER, qty NUMBER, CONSTRAINT ck CHECK (qty >= 0) DISABLE);
+INSERT INTO b VALUES (1, 1, 10);
+INSERT INTO b VALUES (2, 1, -5);
+COMMIT;
+ALTER TABLE b MODIFY CONSTRAINT ck ENABLE NOVALIDATE;
+UPDATE b SET pid = 2 WHERE id = 2;
+ROLLBACK;
+UPDATE b SET pid = 3 WHERE id = 1;
+UPDATE b SET pid = 4 WHERE id = 2;
+UPDATE b SET qty = -6 WHERE id = 2;
+ROLLBACK;
+```
+
+```text
+Table created.
+
+1 row created.
+
+1 row created.
+
+Commit complete.
+
+Table altered.
+
+ERROR:
+ORA-02290: check constraint violated
+
+Rollback complete.
+
+1 row updated.
+
+1 row updated.
+
+ERROR:
+ORA-02290: check constraint violated
+
+Rollback complete.
 ```
 
 ## See also
