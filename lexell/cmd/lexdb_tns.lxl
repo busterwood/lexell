@@ -1425,8 +1425,9 @@ fn (c: mut &Conn) auth2(rq: &Req) {
             c.user = c.auth.role.clone()
             c.loggedIn = true
             c.localZone = c.sess.zone().name
-            // a user that has a schema of its name works in it
+            // a user works in a schema of its name (made at its first login: Oracle's user is its schema)
             let me = c.user.clone()
+            if !c.schemaExists(&me) { c.ownSchema(&me) }
             if c.schemaExists(&me) { c.nls.schema = me }
             c.reapply()
             var ps: []tns.KeyValue = []
@@ -2549,6 +2550,26 @@ fn (c: mut &Conn) hasRole(n: &str): bool {
         Err(_) {}
     }
     return false
+}
+
+// The login's own schema, made by a superuser when it has none (a role; not on a replica, whose database is read-only).
+fn (c: mut &Conn) ownSchema(n: &str) {
+    if lexdb_standby.isReplica(&c.st) { return }
+    // (a login under trust that has no role: it is a superuser, as lexdb's own role statements take it, and makes its schema itself)
+    if !c.hasRole(n) {
+        let x = c.simple("CREATE SCHEMA " + lexdb_oraadm.qid(n))
+        return
+    }
+    var sup = ""
+    match lexdb_priv.roles(&c.st) {
+        Ok(rs) { for r in rs { if r.superuser && len(sup) == 0 { sup = r.name.clone() } } }
+        Err(_) { return }
+    }
+    // (no superuser role: the schemas' maker is no role at all, which lexdb's role statements take as a superuser)
+    if len(sup) == 0 { sup = "sys" }
+    let prev = c.sess.actAs(&sup)
+    let x = c.simple("CREATE SCHEMA " + lexdb_oraadm.qid(n) + " AUTHORIZATION " + lexdb_oraadm.qid(n))
+    c.sess.backTo(&prev)
 }
 
 fn (c: mut &Conn) schemaExists(n: &str): bool {

@@ -23,11 +23,39 @@ type DbErr = lexdb_base.DbErr
 
 fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
 
+// A uniqueidentifier's 16 bytes as SQL Server stores them: the first three groups little-endian.
+fn uuidBytes(u: &str): []byte {
+    var plain: []byte = []
+    for k in 0..len(u) { if u[k] != '-' { append(mut &plain, byte(u[k])) } }
+    var raw: []byte = []
+    var k = 0
+    while k + 1 < len(plain) {
+        append(mut &raw, byte(hexVal(plain[k]) * 16 + hexVal(plain[k + 1])))
+        k += 2
+    }
+    if len(raw) != 16 { return raw }
+    var out: []byte = []
+    for i in [3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15] { append(mut &out, raw[i]) }
+    return out
+}
+
+// ... and the uuid text (lower case, 36 characters) of such 16 bytes.
+fn uuidOfBytes(raw: &[]byte): str {
+    let order = [3, 2, 1, 0, 5, 4, 7, 6, 8, 9, 10, 11, 12, 13, 14, 15]
+    var s = ""
+    for i in 0..16 {
+        if i == 4 || i == 6 || i == 8 || i == 10 { s = s + "-" }
+        let b = int(raw[order[i]])
+        s = s + "0123456789abcdef"[b / 16..b / 16 + 1] + "0123456789abcdef"[b % 16..b % 16 + 1]
+    }
+    return s
+}
+
 // The names call() takes.
 pub fn isTsqlFn(name: &str): bool {
     match name {
         "#len", "#datalength", "charindex", "patindex", "#replaceci", "#stuff", "#round", "#power", "#dateadd", "#datediff",
-        "#datepart", "#datename", "#eomonth", "#datestyle", "#tlike", "#utcnow", "#reverse", "#concat_ws", "#tint", "#bin2str", "#bsub", "#tobin", "#bitint",
+        "#datepart", "#datename", "#eomonth", "#datestyle", "#tlike", "#utcnow", "#reverse", "#concat_ws", "#tint", "#bin2str", "#bsub", "#tobin", "#bitint", "#bin2uuid",
         "#bitnot", "#quotename", "#format", "#dtadd", "#dtdiff", "#tbit_count", "#tbit_shl", "#tbit_shr", "#tbit_get", "#tbit_set" { return true }
         else { return false }
     }
@@ -519,9 +547,26 @@ pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], Db
                 else { return Ok(Some(vs[0].clone())) }
             }
         }
+        "#bin2uuid" {
+            // CAST of a binary to uniqueidentifier: its bytes (padded with zeros to 16, cut to 16) in SQL Server's layout; any other value as it is
+            match vs[0] {
+                Val.Bytes(b) {
+                    var raw = strToBytes(&b)
+                    while len(raw) < 16 { append(mut &raw, byte(0)) }
+                    while len(raw) > 16 { let dropped = pop(mut &raw) }
+                    return Ok(Some(Val.Uuid(uuidOfBytes(&raw))))
+                }
+                else { return Ok(Some(vs[0].clone())) }
+            }
+        }
         "#bin2str" {
             // a varbinary as text: its bytes as characters (style 1: 0x and the hex digits, 2: the hex digits); any other value as it is
+            // (a uniqueidentifier in upper case, SQL Server's)
             match vs[0] {
+                Val.Uuid(u) {
+                    if n > 2 && (try intOf(&vs[2], &"convert")) < 36 { return Err(e("TS8170", "Insufficient result space to convert uniqueidentifier value to char.")) }
+                    return Ok(Some(Val.Text(strings.toUpperAscii(&u))))
+                }
                 Val.Bytes(b) {
                     let st = if n > 1 { try intOf(&vs[1], &"convert") } else { 0 }
                     if st == 1 || st == 2 { return Ok(Some(Val.Text((if st == 1 { "0x" } else { "" }) + hexUpper(&b)))) }
@@ -559,6 +604,7 @@ pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], Db
                         }
                     } else { raw = strToBytes(&t) }
                 }
+                Val.Uuid(u) { raw = uuidBytes(&u) }
                 Val.Int(x) {
                     let w = if x >= -2147483648 && x <= 2147483647 { 4 } else { 8 }
                     for k in 0..w { append(mut &raw, byte((x >> (8 * (w - 1 - k))) & 0xff)) }
