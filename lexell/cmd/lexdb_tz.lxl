@@ -1,0 +1,78 @@
+// lexdb: a timestamp that keeps the offset it was written with (Val.Tsz: Oracle's TIMESTAMP WITH TIME ZONE and
+// T-SQL's datetimeoffset; design/lexdb-robust.md, item 9). The value is the instant (microseconds since 2000-01-01
+// 00:00 UTC, as Val.Tstz) and the offset east of UTC in minutes. Two values of the same instant are equal whatever
+// their offsets; the offset only decides how a value is shown and what its local fields are. PostgreSQL's timestamptz
+// stays Val.Tstz (the instant, shown in the session's zone): this module is for the doors that keep the offset.
+//
+// The offset arithmetic and the text of a value are here; the Oracle and T-SQL functions that make and read them are
+// lexdb_orafn's and lexdb_tsqlfn's, and call this.
+import "strings"
+import "./lexdb_base"
+import "./lexdb_time"
+import "./lexdb_sql"
+
+type Val = lexdb_sql.Val
+
+const SEC_US = 1000000
+const MIN_US = 60000000
+
+// The widest offset a value may have, in minutes east of UTC either way (Oracle: ORA-01875 outside -15:59 to +15:59; SQL
+// Server's -14:00 to +14:00 is checked by the T-SQL door).
+pub const MAX_OFF = 959
+
+fn pad(n: int, w: int): str { return strings.padLeft(&(n.toStr()), w, '0') }
+
+// An offset as "+02:00" / "-05:30".
+pub fn offText(off: int): str {
+    let a = if off < 0 { -off } else { off }
+    return (if off < 0 { "-" } else { "+" }) + pad(a / 60, 2) + ":" + pad(a % 60, 2)
+}
+
+// The zone of a fixed offset in minutes (lexdb_time's, for its formatting and local fields).
+pub fn zoneOf(off: int): lexdb_time.Zone { return lexdb_time.fixedZone(off * 60) }
+
+// The local time of the value (microseconds since 2000, as a Val.Ts), in its own offset.
+pub fn local(us: int, off: int): int {
+    if us == lexdb_time.INF || us == lexdb_time.NINF { return us }
+    return us + off * MIN_US
+}
+
+// The instant of a local time written with offset off.
+pub fn instant(localUs: int, off: int): int {
+    if localUs == lexdb_time.INF || localUs == lexdb_time.NINF { return localUs }
+    return localUs - off * MIN_US
+}
+
+// The value as PostgreSQL would write a timestamptz in its own offset: "2026-03-15 10:00:00+02" (what Val's text gives).
+pub fn textPg(us: int, off: int): str {
+    let z = zoneOf(off)
+    return lexdb_time.fmtTstz(us, &z)
+}
+
+// ---- conversions to a column that keeps the offset
+
+// v made a timestamp with its offset (precision p: fractional digits), in session zone z: a text is read with the offset it
+// carries (the session's where it has none), a timestamp or date as local time in z, a timestamptz as its instant seen in z.
+pub fn coerceTsz(v: &Val, p: int, z: &lexdb_time.Zone): Result[Val, lexdb_base.DbErr] {
+    match v {
+        Val.Text(s) {
+            let r = try lexdb_time.parseTsz(&s, z)
+            return Ok(Val.Tsz(lexdb_time.roundUs(r.us, p), r.off))
+        }
+        Val.Date(d) {
+            let u = lexdb_time.tsToTstz(lexdb_time.dateToTs(d), z)
+            return Ok(Val.Tsz(u, z.offsetOf(u) / 60))
+        }
+        Val.Ts(l) {
+            let u = lexdb_time.tsToTstz(lexdb_time.roundUs(l, p), z)
+            return Ok(Val.Tsz(u, z.offsetOf(u) / 60))
+        }
+        Val.Tstz(u) {
+            let r = lexdb_time.roundUs(u, p)
+            return Ok(Val.Tsz(r, z.offsetOf(r) / 60))
+        }
+        Val.Tsz(u, o) { return Ok(Val.Tsz(lexdb_time.roundUs(u, p), o)) }
+        else {}
+    }
+    return Err(lexdb_base.err("42846", "cannot cast type to timestamp with time zone"))
+}

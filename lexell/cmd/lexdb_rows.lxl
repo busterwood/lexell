@@ -37,6 +37,7 @@ pub const PK_F8: byte = 11      // 8 bytes: a double's bits
 pub const PK_F4: byte = 12      // 4 bytes: a real's bits
 pub const PK_UUID: byte = 13    // variable: its 16 bytes
 pub const PK_BYTEA: byte = 14   // variable: its bytes
+pub const PK_TSZ: byte = 16     // variable: a timestamp that keeps its offset (Val.Tsz), 10 bytes: the instant and the offset in minutes
 
 // A row's stored form: per column a tag (0 NULL, 1 int, 2 bool, 3 numeric,
 // 4 text) and its value. A row with a text of LONG bytes or more begins with
@@ -99,6 +100,7 @@ pub fn placeKinds(r: &Rows): []byte {
 pub fn placeKind(c: &lexdb_sql.ColDef): byte {
     if c.genKind == lexdb_sql.GEN_VIRTUAL { return PK_NONE }
     let o = c.typ.oid
+    if lexdb_sql.isTszType(&c.typ) { return PK_TSZ }
     var k = PK_TEXT
     if o == lexdb_sql.OID_INT8 { k = PK_INT }
     else if o == lexdb_sql.OID_INT4 { k = PK_INT4 }
@@ -131,7 +133,7 @@ pub fn isIntKind(k: byte): bool { return k == PK_INT || k == PK_INT4 || k == PK_
 pub fn isWordKind(k: byte): bool { return isIntKind(k) || (k >= PK_DATE && k <= PK_F4) }
 
 // A place holding a variable-length value: its end in the fixed part.
-pub fn isVarKind(k: byte): bool { return k == PK_NUM || k == PK_TEXT || k == PK_UUID || k == PK_BYTEA }
+pub fn isVarKind(k: byte): bool { return k == PK_NUM || k == PK_TEXT || k == PK_UUID || k == PK_BYTEA || k == PK_TSZ }
 
 // The word of v for a place of word kind k; None: v is not of k's kind, or
 // does not fit its width.
@@ -196,15 +198,28 @@ fn varBytes(v: &Val, k: byte): Option[str] {
         Val.Num(d) { if k == PK_NUM { return Some(d.toBin()) } }
         Val.Uuid(u) { if k == PK_UUID { return Some(uuidBytes(&u)) } }
         Val.Bytes(x) { if k == PK_BYTEA { return Some(x.clone()) } }
+        Val.Tsz(u, o) { if k == PK_TSZ { return Some(tszBytes(u, o)) } }
         else {}
     }
     return None
+}
+
+// A timestamp with its offset as a place holds it: the instant (8 bytes) and the offset in minutes (2), little-endian.
+fn tszBytes(u: int, o: int): str {
+    var b: []byte = withCapacity(10)
+    binary.appendU64LE(mut &b, u)
+    binary.appendU16LE(mut &b, o & 0xFFFF)
+    return strFromBytes(&b)
 }
 
 // The value of a variable place of kind k: s[a..b].
 pub fn varVal(k: byte, s: &str, a: int, b: int): Result[Val, DbErr] {
     if k == PK_TEXT { return Ok(Val.Text(s[a..b].clone())) }
     if k == PK_BYTEA { return Ok(Val.Bytes(s[a..b].clone())) }
+    if k == PK_TSZ {
+        if b - a != 10 { return Err(lexdb_base.corrupt("a timestamp with a time zone in a row")) }
+        return Ok(Val.Tsz(binary.readI64LEStr(s, a), binary.readI16LEStr(s, a + 8)))
+    }
     if k == PK_UUID {
         if b - a != 16 { return Err(lexdb_base.corrupt("a uuid value in a row")) }
         return Ok(Val.Uuid(uuidText(&s[a..b])))
@@ -669,6 +684,11 @@ fn encVal(b: mut &str, v: &Val) {
             b.addByte(10)
             binary.addU64LE(b, n)
         }
+        Val.Tsz(n, o) {
+            b.addByte(16)
+            binary.addU64LE(b, n)
+            binary.addU16LE(b, o & 0xFFFF)
+        }
         Val.Ival(iv) {
             b.addByte(11)
             binary.addU64LE(b, iv.months)
@@ -700,6 +720,7 @@ fn encVal(b: mut &str, v: &Val) {
 // uuid, a bytea, a double precision or a real.
 pub fn timeVal(s: &str, at: int, tag: byte): Val {
     if tag == 12 { return Val.Uuid(uuidText(&s[at..at + 16])) }
+    if tag == 16 { return Val.Tsz(binary.readI64LEStr(s, at), binary.readI16LEStr(s, at + 8)) }
     if tag == 13 { return Val.Bytes(s[at + 4..at + 4 + binary.readU32LEStr(s, at)].clone()) }
     if tag == 14 { return Val.Float(math.fromBits(binary.readI64LEStr(s, at))) }
     if tag == 15 { return Val.Real(math.fromBits32Int(binary.readU32LEStr(s, at))) }
@@ -724,6 +745,7 @@ pub fn valSize(s: &str, at: int, tag: byte): int {
     if tag == 13 { return 4 + binary.readU32LEStr(s, at) }
     if tag == 14 { return 8 }
     if tag == 15 { return 4 }
+    if tag == 16 { return 10 }
     return -1
 }
 
@@ -850,7 +872,7 @@ pub fn decodeRowNeed(s: &str, n: int, need: &[]bool, missing: &[]Val, lays: &[]F
                     Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
                 }
             }
-        } else if tag >= 7 && tag <= 15 {
+        } else if tag >= 7 && tag <= 16 {
             append(mut &out, timeVal(s, at, tag))
             at += valSize(s, at, tag)
         } else {
@@ -1361,7 +1383,7 @@ pub fn decodeRow(s: &str, r: int, b: mut &Batch, bp: &Projection, rw: &Rows): Re
                     Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
                 }
             }
-        } else if tag >= 7 && tag <= 15 {
+        } else if tag >= 7 && tag <= 16 {
             b.vals[c][r] = timeVal(s, at, tag)
             at += valSize(s, at, tag)
         } else {
