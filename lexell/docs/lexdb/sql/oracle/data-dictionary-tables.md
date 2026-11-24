@@ -20,7 +20,7 @@ read them, and return no rows).
 
 `USER_`, `ALL_` and `DBA_` forms
 : `USER_` views show the objects of the current user, `ALL_` the ones the user may see, and `DBA_` all of them.
-  In lexdb a single user's session sees the same tables in all three; `ALL_` and `DBA_` carry an `OWNER` column.
+  In lexdb a single user's session sees the same tables in all three; `ALL_` and `DBA_` carry an `OWNER` column. `USER_` views list the login's own schema. A table of the PostgreSQL door's `public` schema is in `ALL_` and `DBA_` with the owner `SYS`.
 
 `USER_TABLES` (`TABS`), `ALL_TABLES`, `DBA_TABLES`
 : `TABLE_NAME`, `TABLESPACE_NAME` (`USERS`), `STATUS` (`VALID`), `PCT_FREE`, `TEMPORARY` (`Y` for a global
