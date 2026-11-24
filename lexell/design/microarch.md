@@ -236,6 +236,10 @@ There is no consistent direction; `tokens` prefers 16, `array` 64 by 0.5%,
 `loop` is flat at one cycle an iteration. Increasing the alignment only adds
 int3/nop padding (the compiler is 3 MB). **Keep 16.**
 
+Since 2026-11-24 the jumps are short where they reach, and the inner-loop rule covers loops up
+to 128 bytes (`LOOP_LINES`): the loop is placed to span the fewest lines it can (wc's 84-byte
+loop, opt-experiments.md 27).
+
 ### 3.3 Code placement (`LXL_PADB`, 0..56 bytes before each function)
 
 `loop`: min 1002.8M to 1004.0M cycles across eight placements (0.12%

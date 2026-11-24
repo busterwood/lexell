@@ -75,6 +75,11 @@ const MOVSD = 0x10
 // speed over every shift. int3 pads.
 const FUNC_ALIGN = 64
 
+// An innermost loop of up to this many bytes is placed to span the fewest 64-byte lines its size
+// allows (x64.loopPad; 64 was the rule before jumps were short: 128 measured best with them,
+// design/opt-experiments.md 27).
+const LOOP_LINES = 128
+
 // The generated code starts at a multiple of this, so FUNC_ALIGN holds for absolute addresses.
 const CODE_ALIGN = 64
 
@@ -206,6 +211,8 @@ type Gen = record {
     epiJmps: []int              // ... the positions of the jumps to it
     funcAlign: int              // LXL_FALIGN (default FUNC_ALIGN) and LXL_PADB: the placement experiments
     padBefore: int              // LXL_PADB: bytes before every function's alignment (tools/placement.py)
+    shortJ: bool                // LXL_SHORTJ (default 1): jumps in reach in their 2-byte form (placeCode)
+    loopLines: int              // LXL_LOOPLINES (default LOOP_LINES): placeCode's inner-loop rule
     loopTops: []int             // the labels of the rotated loops' bodies, reached only by jumps
     loopEnds: []int             // and of their ends (right after the back branch)
     entrySym: int
@@ -278,7 +285,7 @@ type Stub = value record {
 fn newGen(u: ir.Ir): Gen {
     var g = Gen{u: u, a: x64.newAsm(), syms: [], rtSym: newMapWith[str, int](fxHashStr), rtLive: [], rtAt: [], rtCodeEnd: 0, rtDataEnd: 0, rtBssEnd: 0, codeBase: 0, funcSym: [], globalSym: [], strSym: newMapWith[str, int](fxHashStr),
         strs: [], flts: [], fltSym: newMap(), funcPos: [], pend: [], pendLo: 0, pendN: 0, order: [], gLive: [], gQueue: [], relocSeen: 0, slots: [], frame: 0, maxFrame: 0, outArgs: 0, declMark: 0, breakL: [], contL: [],
-        caseL: newMap(), retPtr: 0, wideAt: -1, initVia: 0, viaLoaded: false, retTy: 0, epiL: -1, epiJmps: [], loopTops: [], funcAlign: padFromEnv("LXL_FALIGN", FUNC_ALIGN), padBefore: padFromEnv("LXL_PADB", 0), loopEnds: [], entrySym: -1, dyn: false, libs: [], imports: [], importSym: newMapWith[str, int](fxHashStr), stubs: [], grows: [],
+        caseL: newMap(), retPtr: 0, wideAt: -1, initVia: 0, viaLoaded: false, retTy: 0, epiL: -1, epiJmps: [], loopTops: [], funcAlign: padFromEnv("LXL_FALIGN", FUNC_ALIGN), padBefore: padFromEnv("LXL_PADB", 0), shortJ: padFromEnv("LXL_SHORTJ", 1) != 0, loopLines: padFromEnv("LXL_LOOPLINES", LOOP_LINES), loopEnds: [], entrySym: -1, dyn: false, libs: [], imports: [], importSym: newMapWith[str, int](fxHashStr), stubs: [], grows: [],
         stubOf: newMapWith[str, int](fxHashStr), codeEnd: 0, reg: [], freg: [], preg: [], preg2: [], fpLoud: [], fpKeep: newMapWith[str, bool](fxHashStr), uses: [], weight: [], rawW: [], bad: [], touched: [], first: [], last: [],
         noInit: [], inner: [], pts: [], defAt: [], coal: [], coalBy: [], declLoop: [], tmpRegs: [], tmpUsed: 0, unused: false, prevDecl: -1, tailEnd: [], pos: 0, scanExpr: 0, loud: [], loud89: [], loud1011: [], any89: false, regions: [], openLoops: [],
         saved: [], seen: [], stamp: 1, counting: false, scanStack: [], inlStack: [], inlEnd: [], inl: [], curFunc: -1,
@@ -805,10 +812,7 @@ fn (g: mut &Gen) genFunc(f: int) {
         p.fixLabels()
     }
     for i in pushed..len(g.saved) { p.store(8, rbp(g.saved[i]), LOCAL_REGS[i]) }
-    g.placeCode(marker, &p.code, firstLabel)
-    // the guards' jumps past their returns go to the prologue, which now starts where those labels
-    // were bound
-    for i in 0..len(g.guardLabels) { g.a.moveLabel(g.guardLabels[i], marker) }
+    g.placeCode(start, marker, &p.code, firstLabel)
 }
 
 // Shrink-wrapping, the early exits only. The leading statements of a function's body that are
@@ -966,41 +970,22 @@ fn (g: &Gen) guardLeaf(e: int, f: int): bool {
     return false
 }
 
-// Inserts the prologue pro at start and, in the same pass, nops before the body of each rotated
-// loop, as gcc pads (to a multiple of 16 when that takes at most 10 bytes, else of 8): a loop's
-// back branch then fetches a whole block. An innermost loop of 64 bytes or less is moved further,
-// to a multiple of 16 from which it does not cross a 64-byte boundary, so that each iteration
-// runs from one line of the instruction cache (and one of the op cache): the sieve's inner loop,
-// 17 bytes from 48 bytes into a line, ran at about 1.5 times the cycles. The pads follow the jump
-// to the loop's test, so they never run (code reaches the body only by jumps). The code starts at
-// a multiple of 64 and the positions here are final within it, so their remainders are the
-// addresses'.
-fn (g: mut &Gen) placeCode(start: int, pro: &[]byte, firstLabel: int) {
-    var ats: []int = [start]
-    var ns: []int = [len(pro)]
-    var bytes: []byte = []
-    for b in pro { append(mut &bytes, b) }
-    var shift = len(pro)
+// Inserts the prologue pro at start (where the guards end) and, in the same pass, nops before the
+// body of each rotated loop (x64.loopPad, as gcc pads): a loop's back branch then fetches a whole
+// block, and a small inner loop runs from one line. The pads follow the jump to the loop's test,
+// so they never run (code reaches the body only by jumps). The jumps to the function's labels that
+// reach take their 2-byte form (LXL_SHORTJ=0: none do), which moves the code and so the pads; the
+// assembler's layout does all three at once. The code starts at a multiple of 64 and the positions
+// here are final within it, so their remainders are the addresses'. The guards' jumps past their
+// returns go to the prologue, which starts where those labels were bound.
+fn (g: mut &Gen) placeCode(fstart: int, start: int, pro: &[]byte, firstLabel: int) {
+    var tops: []int = []
+    var ends: []int = []
     for j in 0..len(g.loopTops) {
-        // the tops in the order of the code (a loop's top is bound before its inner loops')
-        let at = g.a.labelPos(g.loopTops[j])
-        if at <= ats[len(ats) - 1] { continue }
-        let now = at + shift
-        var pad = (16 - now % 16) % 16
-        if pad > 10 { pad = (8 - now % 8) % 8 }
-        let size = g.a.labelPos(g.loopEnds[j]) - at
-        let inner = j + 1 == len(g.loopTops) || g.a.labelPos(g.loopTops[j + 1]) >= at + size
-        if inner && size <= 64 && (now + pad) % 64 + size > 64 {
-            pad = (16 - now % 16) % 16
-            while (now + pad) % 64 + size > 64 { pad += 16 }
-        }
-        if pad == 0 { continue }
-        append(mut &ats, at)
-        append(mut &ns, pad)
-        for b in x64.nops(pad) { append(mut &bytes, b) }
-        shift += pad
+        append(mut &tops, g.a.labelPos(g.loopTops[j]))
+        append(mut &ends, g.a.labelPos(g.loopEnds[j]))
     }
-    g.a.insertAll(&ats, &ns, &bytes, firstLabel)
+    g.a.layout(fstart, start, pro, &tops, &ends, firstLabel, g.shortJ, &g.guardLabels, g.loopLines)
 }
 
 // Chooses the locals of function f that live in registers (g.reg), and saves the registers.

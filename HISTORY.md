@@ -1663,7 +1663,9 @@ with a note here):
 Each suite is summarised as the geometric mean of new/base. On two builds
 of the same code, instructions are identical and cycles vary by up to ±3%
 on one program and ±0.5% on the means, so instructions decide and cycles
-must agree in sign. A pass is kept when:
+must agree in sign. A change of code shape alone (alignment, jump forms) moves no
+instruction, so it is judged by cycles, measured with `--placements 4 --cpu N` (each program at
+four placements, pinned; design/opt-experiments.md 27). A pass is kept when:
 
 - the run suite gains at least 1% (geometric mean), or 5% on at least two
   programs with none worse than 1%, and the compile suite costs at most

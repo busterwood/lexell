@@ -1015,3 +1015,102 @@ Test: tests/run/drop_local_stack (balanced trees, a left spine of 1,000 nodes, f
 the stack, nodes with strings and arrays, a match whose last arm is untested, a type with a
 drop method whose drops keep their order), the same on --c, --native and -O, no leak under
 LXL_CHECK=1.
+
+## 27. Code layout: measuring over placements, and jumps in their 2-byte form (as built)
+
+**Why the cycles moved.** Most "placement" swings in single perfsuite runs (fib -8.9%, alloc +5.1%
+at equal instructions) were not code placement:
+
+- **The machine.** fib pinned to CPU 2 ran at 2,640M cycles every time; on CPU 4, whose sibling
+  (12) was busy with another session's database containers, at 2,900M. With ASLR off
+  (`setarch -R`) it was as bimodal as with it on.
+- **Unpinned processes.** A process that is not pinned lands on whichever core is free, so best
+  of 5 was a draw between the two levels.
+
+**perfsuite** therefore gained:
+
+- **`--placements N`.** Every program, and the compilers of the compile suite when they are
+  built from revisions or trees, is built with `LXL_PADB` = 0, 64/N, ... and measured at each.
+  Cycles are the median over the placements of each placement's best. Each row adds both sides'
+  spread, and "apart" when the ranges do not overlap.
+- **`--cpu N`** pins every measured command.
+- **The load average** is printed at the start and the end.
+- **A source tree** (a worktree's `lexell/`) can be BASE or NEW, as well as a revision or a
+  compiler's path.
+
+On two known pairs (4 placements, best of 3): the r10/r11 change (f1b607aa) gave fib -1.0% with
+a 10% spread on both sides, not apart (it was -8.9% in one layout). The niche Option (c31e68c9)
+gave lists -17.8% and trees -17.6%, apart. `LXL_PADB` moves functions by whole 64-byte lines,
+because functions are 64-aligned. It samples the placement of functions against each other, not
+of code within a line.
+
+**Every jump was 4-byte.** The assembler emitted every `jcc` as 6 bytes and every `jmp` as 5
+(rel32), where gcc's and LLVM's assemblers use the 2-byte rel8 form for targets within -128..127.
+
+- **How it is built.** `placeCode` now calls `x64.layout`, which does, for each function in one
+  pass:
+  - the prologue's insertion;
+  - the loop-top pads (`loopPad`);
+  - each jump to one of the function's labels in its short form where the target is in reach.
+- **The reach check.** It starts with every jump short and makes long the ones out of reach. It
+  repeats until none is, since a long jump moves others and the pads; a jump only goes from
+  short to long, so it ends.
+- **Moving the code.** The pieces of code between the edits move in place: those moving left
+  from the left, then those moving right from the right. Each byte moves once.
+- **Mapping.** Fix-ups and relocations are mapped with running pointers (they are in code order).
+- **Knobs.** `LXL_SHORTJ=0` keeps the long forms; `LXL_LOOPLINES` sets the loop rule below.
+
+- **Size.** The self-built compiler is 2.1% smaller (3,065,368 to 3,008,192 bytes); lexdb `-O`
+  2.4% (14.41 to 14.07 MB).
+- **Compile cost.** The first version copied each function's code into a new buffer and back,
+  with four binary searches per jump in each round: +1.56% instructions to compile the
+  compiler. The in-place moves and the running pointers brought that to +0.22%.
+
+**The inner-loop rule.** Short jumps alone moved cycles both ways by up to 9% at equal
+instructions:
+
+- **wc +8.4%.** Its 84-byte scan loop went from spanning three lines to spanning three lines
+  with its branches packed into one.
+- **The two halves of the change.** Keeping only the jumps to the trap stubs long, or only
+  those short, each left wc at the long form's speed.
+
+The rule that moved a loop of up to 64 bytes into one line is now: an innermost loop of up to
+`LOOP_LINES` = 128 bytes is placed to span the fewest lines its size allows. On 11 programs:
+
+| variant (against long jumps, 64-byte rule) | geomean | worst |
+|---|---:|---|
+| short jumps, 64 | -0.8% | wc +8.4% |
+| short jumps, 128 | -1.8% | alloc +4.8%, grep -cE +2.8% |
+| short jumps, 192 | -1.2% | alloc +4.8%, trees +3.4% |
+| long jumps, 128 | -0.5% | strings +1.9% |
+
+alloc's loop stores a record's field to the frame and loads it straight back: a forwarding
+chain whose speed follows the instructions' addresses (Zen 4 predicts store-to-load forwarding
+by address), not their lines. The fix there would be the field in a register.
+
+| measure (ec44bc27 against this; perfsuite 4 placements, best of 3, CPU 2) | instructions | cycles |
+|---|---:|---:|
+| run suite | 0.00% | -1.50% |
+| fib / sort / eza -T / trees / tokens / wc -w / grep -n / lists | 0 | -10.3 / -7.0 / -3.4 / -3.1 / -2.7 / -2.6 / -2.6 / -1.7% |
+| alloc / grep -cE | 0 | +8.9 / +2.5% |
+| compile suite | +0.18% | -0.32% |
+| apps regex / json / jq / cmark / decimal | 0 | -0.3 / +0.7 / -2.3 / -0.4 / -0.5% |
+| TPC-H SF1, server instructions per query (22) | 0.00% geomean | |
+| lexdb point select (icount6, 2 alternated rounds) | 171,800-171,870 against 171,800-171,820 | -0.7 / +1.6%; branch misses 449 against 383 |
+
+**The judgement.** Under "Judging a pass" a layout change can only be judged by its cycles:
+the run suite gains 1.5% and the compile suite costs nothing. The point selects keep their
+instructions. Their branch misses rose 17%, at cycles within the two rounds' spread: the same
+placement-sensitive count that moved at c31e68c9 and came back at ec44bc27.
+
+**Still open:**
+- A cold section for the trap stubs.
+- Call-graph function order (section 3's ceiling).
+- Sampling placements within a line, for example functions at 16 with `LXL_PADB` 16/32/48. That
+  would judge code shape over more layouts than the one that ships.
+
+Test: tests/run/native_short_jumps: forward jumps over, and back jumps around, bodies of 1 to 24
+statements, so that the distances cross rel8's reach (the loops switch from all-short to a mix
+between 5 and 6 statements). The bodies have checked jumps to the stubs and padded loop tops.
+The output must equal the script's own simulation. Every build in the suites now uses the
+short forms (vrgen, loopgen, native, the self-build's fixed point).
