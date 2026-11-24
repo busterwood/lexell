@@ -40,6 +40,9 @@ lexdb ./data 127.0.0.1:5432 /run/lexdb      # TCP, and a Unix socket /run/lexdb/
   superuser's rights. Under `--auth scram-sha-256` the user must be a role with `LOGIN` and a password, and the
   password is checked by SCRAM-SHA-256. `md5` and `password` authentication are not offered.
 - `--auth-local` sets the method for Unix socket logins separately.
+- **Schemas.** `search_path` is `public`. A login of the Oracle door has a schema of its name, made at its first Oracle
+  connection, and the tables it makes are there with upper-case names: `SELECT * FROM sa."CITY"` (see the
+  [Oracle door's schemas](oracle.md#schemas)). Tables made in this door are in `public`.
 
 ```sql
 CREATE ROLE app LOGIN PASSWORD 'secret';
