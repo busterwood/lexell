@@ -7315,10 +7315,10 @@ fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
                 }
                 "force_array" {
                     // (PostgreSQL 19) FORMAT json's one array of the rows; a Boolean, true when no value is given
-                    if v.kind == T_IDENT && (v.text == "true" || v.text == "on") { p.pos += 1; s.copy.forceArray = true }
-                    else if v.kind == T_IDENT && (v.text == "false" || v.text == "off") { p.pos += 1; s.copy.forceArray = false }
-                    else if v.kind == T_NUM && (v.text == "1" || v.text == "0") { p.pos += 1; s.copy.forceArray = v.text == "1" }
-                    else if v.kind == T_OP && (v.text == "," || v.text == ")") { s.copy.forceArray = true }
+                    if v.kind == T_IDENT && (v.text == "true" || v.text == "on") { p.pos += 1; s.copy.setForceArray(true) }
+                    else if v.kind == T_IDENT && (v.text == "false" || v.text == "off") { p.pos += 1; s.copy.setForceArray(false) }
+                    else if v.kind == T_NUM && (v.text == "1" || v.text == "0") { p.pos += 1; s.copy.setForceArray(v.text == "1") }
+                    else if v.kind == T_OP && (v.text == "," || v.text == ")") { s.copy.setForceArray(true) }
                     else { return Err(lexdb_base.err("42601", "force_array requires a Boolean value")) }
                     hasForceArray = true
                 }
@@ -7327,8 +7327,8 @@ fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
                     if v.kind != T_IDENT && v.kind != T_STR { return Err(near(&v)) }
                     p.pos += 1
                     let w = strings.toLowerAscii(&v.text)
-                    if w == "ignore" { s.copy.onErr = 1 }
-                    else if w == "stop" { s.copy.onErr = 0 }
+                    if w == "ignore" { s.copy.setOnErr(1) }
+                    else if w == "stop" { s.copy.setOnErr(0) }
                     else if w == "set_null" { return Err(lexdb_base.err("0A000", "lexdb: COPY's ON_ERROR set_null is not supported")) }
                     else { return Err(lexdb_base.err("22023", &("COPY ON_ERROR \"" + v.text + "\" not recognized"))) }
                 }
@@ -7341,16 +7341,16 @@ fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
                     p.pos += 1
                     let n = strings.parseIntOpt(&nv.text).unwrapOr(-1)
                     if neg || n < 1 { return Err(lexdb_base.err("22023", &("REJECT_LIMIT (" + (if neg { "-" } else { "" }) + nv.text + ") must be greater than zero"))) }
-                    s.copy.reject = n
+                    s.copy.setReject(n)
                 }
                 "log_verbosity" {
                     // (PostgreSQL 16, silent: 18) what COPY FROM ... ON_ERROR ignore tells of the rows it skips
                     if v.kind != T_IDENT && v.kind != T_STR { return Err(near(&v)) }
                     p.pos += 1
                     let w = strings.toLowerAscii(&v.text)
-                    if w == "default" { s.copy.verb = 0 }
-                    else if w == "verbose" { s.copy.verb = 1 }
-                    else if w == "silent" { s.copy.verb = 2 }
+                    if w == "default" { s.copy.setVerb(0) }
+                    else if w == "verbose" { s.copy.setVerb(1) }
+                    else if w == "silent" { s.copy.setVerb(2) }
                     else { return Err(lexdb_base.err("22023", &("COPY LOG_VERBOSITY \"" + v.text + "\" not recognized"))) }
                 }
                 "default" {
@@ -7384,13 +7384,13 @@ fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
         }
     }
     if format == "binary" {
-        if s.copy.onErr > 0 { return Err(lexdb_base.err("42601", "only ON_ERROR STOP is allowed in BINARY mode")) }
+        if s.copy.onErr() > 0 { return Err(lexdb_base.err("42601", "only ON_ERROR STOP is allowed in BINARY mode")) }
         return Err(lexdb_base.err("0A000", "lexdb: COPY's binary format is not supported"))
     }
     if format != "" && format != "text" && format != "csv" && format != "json" { return Err(lexdb_base.err("22023", &("COPY format \"" + format + "\" not recognized"))) }
-    if s.copy.onErr > 0 && !s.copy.from { return Err(lexdb_base.err("22023", "COPY ON_ERROR cannot be used with COPY TO")) }
-    if s.copy.reject > 0 && s.copy.onErr == 0 { return Err(lexdb_base.err("22023", "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE")) }
-    if s.copy.reject > 0 && !s.copy.from { return Err(lexdb_base.err("22023", "COPY REJECT_LIMIT cannot be used with COPY TO")) }
+    if s.copy.onErr() > 0 && !s.copy.from { return Err(lexdb_base.err("22023", "COPY ON_ERROR cannot be used with COPY TO")) }
+    if s.copy.reject() > 0 && s.copy.onErr() == 0 { return Err(lexdb_base.err("22023", "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE")) }
+    if s.copy.reject() > 0 && !s.copy.from { return Err(lexdb_base.err("22023", "COPY REJECT_LIMIT cannot be used with COPY TO")) }
     if hasForceArray && format != "json" { return Err(lexdb_base.err("22023", "COPY FORCE_ARRAY requires JSON mode")) }
     if format == "json" {
         if s.copy.from { return Err(lexdb_base.err("22023", "COPY FORMAT JSON is not supported for COPY FROM")) }
@@ -7401,7 +7401,7 @@ fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
         if s.copy.quoteAll || len(s.copy.forceQuote) > 0 || len(s.copy.forceNotNull) > 0 || len(s.copy.forceNull) > 0 {
             return Err(lexdb_base.err("0A000", "cannot specify FORCE_QUOTE, FORCE_NOT_NULL or FORCE_NULL in JSON mode"))
         }
-        s.copy.json = true
+        s.copy.setJson(true)
     }
     s.copy.csv = format == "csv"
     s.copy.delim = delim.unwrapOr(if s.copy.csv { "," } else { "\t" })
