@@ -86,10 +86,6 @@ ALTER TABLE { database_name.schema_name.table_name | schema_name.table_name | ta
 - The error 547 of `ADD` and of `WITH CHECK CHECK CONSTRAINT` says `The INSERT statement conflicted with ...` (a
   foreign key under `ADD`: PostgreSQL's `insert or update on table ... violates foreign key constraint`); SQL Server
   says `The ALTER TABLE statement conflicted with ...`.
-- An `UPDATE` tests only the `CHECK` constraints that read a column it sets, as SQL Server does, outside an explicit
-  transaction. Inside `BEGIN TRANSACTION`, and in `MERGE`, lexdb tests every `CHECK` of the row. This shows only for a
-  row that breaks a constraint that is not trusted: there it fails when any of its columns is updated, where SQL
-  Server accepts an update of a column the constraint does not read (example H).
 - Adding a `NOT NULL` column without a default to a table with rows is error 515 with lexdb's text (SQL Server:
   4901). A column that already exists is 50000 (SQL Server: 2705); dropping an unknown column is 207 (SQL Server:
   4924).
@@ -298,8 +294,8 @@ fk_part 0           1
 
 The first `ADD` failed because row 2 breaks the check; `WITH NOCHECK` added both constraints without looking. They
 are enforced for new rows. Row 2 still breaks the check, but an `UPDATE` tests only the constraints that read a column
-it sets, as SQL Server does: setting `part_id` does not test `ck_qty`, and setting `qty` does. Inside an explicit
-transaction lexdb tests every check of the row (see Differences):
+it sets, as SQL Server does: setting `part_id` does not test `ck_qty`, and setting `qty` does. It is so in an explicit
+transaction, in `MERGE` and with `OUTPUT ... INTO` too:
 
 <!-- example: tsql -->
 ```sql
@@ -317,6 +313,12 @@ BEGIN TRANSACTION;
 UPDATE dbo.bin SET part_id = 1 WHERE id = 2;
 ROLLBACK;
 GO
+MERGE dbo.bin AS t USING (SELECT 2 AS id) AS s ON t.id = s.id WHEN MATCHED THEN UPDATE SET part_id = 1;
+GO
+DECLARE @moved TABLE (id int);
+UPDATE dbo.bin SET part_id = 1 OUTPUT inserted.id INTO @moved WHERE id = 2;
+SELECT id FROM @moved;
+GO
 ```
 
 ```text
@@ -330,8 +332,17 @@ The INSERT statement conflicted with the FOREIGN KEY constraint "fk_part". The c
 
 Msg 547, Level 16, State 1, Line 1
 The UPDATE statement conflicted with the CHECK constraint "ck_qty". The conflict occurred in database "lexdb", table "dbo.bin", column 'qty'.
-Msg 547, Level 16, State 1, Line 2
-The UPDATE statement conflicted with the CHECK constraint "ck_qty". The conflict occurred in database "lexdb", table "dbo.bin", column 'qty'.
+(1 row affected)
+
+(1 row affected)
+
+(1 row affected)
+
+id
+--
+2
+
+(1 row affected)
 ```
 
 `WITH CHECK CHECK CONSTRAINT` checks the rows and makes a constraint trusted, once they pass:

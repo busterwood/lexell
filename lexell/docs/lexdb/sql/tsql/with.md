@@ -42,8 +42,14 @@ AS
 
 - A CTE cannot be the target of `UPDATE` or `DELETE` (error 208, "Invalid object name"); SQL Server changes the
   table under it. Name the table and read the CTE in the `WHERE` clause (example E).
-- A recursive CTE's rows are all kept until the statement ends, so `TOP` does not stop an endless recursion:
-  `MAXRECURSION 0` with no end gives error 50000 when the statement holds more than `max_statement_mem` of rows.
+- A recursive CTE's rows are made before the query reads them, with one exception: a `TOP` query without `ORDER BY`,
+  grouping or `DISTINCT` that reads the CTE as its first table stops an endless recursion when it has its rows, also
+  with a `WHERE`, a join, a left join or a derived table that filters them (example C). `MAXRECURSION` then counts the
+  levels the rows `TOP` needs take: error 530 when they are further than the limit. This holds only for a chain (one
+  row a round); a tree recursion (more than one row a round), a join where lexdb's planner reads the other table
+  first (`FROM t JOIN n`), a subquery in the `WHERE` or the select list, and a `WHERE` that calls `NEWID` or `RAND`
+  run the recursion to `MAXRECURSION` (error 530) or, with `MAXRECURSION 0` and no end, to error 50000 when the
+  statement holds more than `max_statement_mem` of rows.
 - `WITH RECURSIVE` (PostgreSQL's form) is taken; SQL Server refuses it.
 - `WITH XMLNAMESPACES` is not supported.
 
@@ -107,6 +113,9 @@ Eve  2
 
 ### C. MAXRECURSION
 
+The default limit of 100 stops the first query. `TOP` stops an endless recursion (`MAXRECURSION 0`) when it has its
+rows, with a `WHERE` on them; if the rows it needs are further than `MAXRECURSION`, the error is 530.
+
 <!-- example: tsql -->
 ```sql
 WITH n AS (SELECT 1 AS i UNION ALL SELECT i + 1 FROM n WHERE i < 200)
@@ -115,6 +124,12 @@ GO
 WITH n AS (SELECT 1 AS i UNION ALL SELECT i + 1 FROM n WHERE i < 200)
 SELECT MAX(i) AS top_i FROM n
 OPTION (MAXRECURSION 300);
+GO
+WITH n AS (SELECT 1 AS i UNION ALL SELECT i + 1 FROM n)
+SELECT TOP (3) i FROM n WHERE i % 7 = 0 OPTION (MAXRECURSION 0);
+GO
+WITH n AS (SELECT 1 AS i UNION ALL SELECT i + 1 FROM n)
+SELECT TOP (3) i FROM n WHERE i % 700 = 0 OPTION (MAXRECURSION 500);
 ```
 
 ```text
@@ -125,6 +140,17 @@ top_i
 200
 
 (1 row affected)
+
+i
+--
+7
+14
+21
+
+(3 rows affected)
+
+Msg 530, Level 16, State 1, Line 1
+An error occurred during the current command (Done status 0). The statement terminated. The maximum recursion 500 has been exhausted before statement completion.
 ```
 
 ### D. A CTE in INSERT and MERGE

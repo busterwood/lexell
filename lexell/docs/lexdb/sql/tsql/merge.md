@@ -62,6 +62,8 @@ MERGE
 - A subquery in a `WHEN` condition, in `SET` or in `VALUES` reads the tables as the statement found them: it does not see
   the rows the same `MERGE` has already changed (example E). `OUTPUT` takes no subquery (error 10705).
 - `NOT NULL`, `CHECK`, foreign key and unique constraints are checked as for `INSERT`, `UPDATE` and `DELETE`.
+  A `WHEN MATCHED THEN UPDATE` tests only the `CHECK` constraints that read a column it sets, as `UPDATE` does (see
+  [ALTER TABLE](alter-table.md), example H).
 
 ## Differences from SQL Server
 

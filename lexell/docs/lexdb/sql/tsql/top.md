@@ -34,6 +34,8 @@ MERGE TOP ( expression ) ...
 - Without `ORDER BY`, which rows `TOP` returns is not defined. Use `ORDER BY` to say which.
 - In `UPDATE`, `DELETE` and `MERGE`, the rows `TOP` picks are in no order.
 - `TOP (0)` returns no rows, and gives the result's columns.
+- `TOP` without `ORDER BY` ends a recursive CTE that has no end of its own once it has its rows (see [WITH](with.md),
+  example C).
 - A percentage outside 0 to 100 is error 1031.
 - For paging, [`OFFSET ... FETCH`](order-by.md) is the standard form. `SET ROWCOUNT n` limits every `SELECT` of
   the session.
