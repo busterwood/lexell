@@ -357,6 +357,7 @@ pub type PWin = record {
     pub args: [][]BX
     pub offs: [][]Option[BX]
     pub slots: []int
+    pub qual: Option[BX]        // Oracle's QUALIFY (the first call's qual): a row it is not true of is dropped after the calls' values
 }
 
 // A range's bound: ">", ">=", "<" or "<=" its value.
@@ -8480,7 +8481,15 @@ pub fn pipeWin(sel: mut &Sel): Option[PPlan] {
     }
     // (LATERAL levels after the first: their subqueries run per row by the joins' asks, Q8 R4b)
     if sel.q.corr { jp = applySubs(replace(mut &jp, PPlan.Result([]))) }
-    let pw = PWin{wins: sel.wins.clone(), keys: keys, args: args, offs: offs, slots: slots}
+    var qual: Option[BX] = None
+    match sel.wins[0].qual {
+        Some(qe) {
+            qual = winX(&qe, &sel.q)
+            if qual.isNone() { return noWin("a window: QUALIFY does not bind") }
+        }
+        None {}
+    }
+    let pw = PWin{wins: sel.wins.clone(), keys: keys, args: args, offs: offs, slots: slots, qual: qual}
     let proj = PPlan.Project(PPlan.Window(PPlan.Project(jp, ins), Some(pw)), xs)
     // the operators over it as physAbove makes them (EXPLAIN prints them)
     let dist = if sel.distinct { PPlan.Distinct(proj, false, collections.copyOf(&sel.outKinds)) } else { proj }
@@ -8851,6 +8860,8 @@ pub fn aggShape(sel: &Sel): bool {
     let q = &sel.q
     // (window calls over the groups: exec's view over them, as HAVING, Q8 R7)
     if sel.setop != 0 || len(sel.srf) > 0 || (sel.first >= 0 && len(q.levels) != 1) || len(sel.locks) > 0 { return false }
+    // (Oracle's QUALIFY over the groups: the row engine's, as the grouped windows' conditions it needs are evaluated per group)
+    if len(sel.wins) > 0 && sel.wins[0].qual.isSome() { return false }
     // (a correlated subquery's own: its outer values are its parameters;
     // one left per row: an Apply's, Q8 R6, not in a key or argument, not
     // under MIN/MAX by the scan's order, R2's MinMax)
@@ -9000,7 +9011,7 @@ fn grpViews(sel: &Sel, agg: PPlan): PPlan {
             append(mut &args, avs)
             append(mut &offs, os)
         }
-        p = PPlan.Window(p, Some(PWin{wins: sel.wins.clone(), keys: keys, args: args, offs: offs, slots: []}))
+        p = PPlan.Window(p, Some(PWin{wins: sel.wins.clone(), keys: keys, args: args, offs: offs, slots: [], qual: None}))
     }
     // the outputs, then the ORDER BY keys that are not outputs (per set)
     let nk = len(sel.order)

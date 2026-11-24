@@ -10215,6 +10215,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     // collectAggs pass builds its own, else moved after winPlan has read them)
     var wdefs: []lexdb_sql.WinDef = []
     var bw: []lexdb_sql.WinDef = []
+    var qx: Option[Expr] = None             // Oracle's QUALIFY condition (lexdb_parse.oraQualify), over the rows and their calls' values
     if len(s.wins) > 0 {
         if hasWinOpt(&s.where) { return Err(e("42P20", "window functions are not allowed in WHERE")) }
         if hasWinOpt(&s.having) { return Err(e("42P20", "window functions are not allowed in HAVING")) }
@@ -10245,9 +10246,13 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             if hasWin(&r.call) { return Err(e("42P20", "window function calls cannot be nested")) }
             append(mut &wdefs, r)
         }
+        qx = try qualifyOf(st, txn, s, &q, sc)
         var mx: []Expr = []
         for x in exprs { append(mut &mx, winMarks(&x)) }
         rewriteList(mut &exprs, mx, mut &bx, mut &xRewritten)
+        var qm: Option[Expr] = None
+        match qx { Some(x) { qm = Some(winMarks(&x)) } None {} }
+        qx = qm
         var mo: []Expr = []
         for x in order { append(mut &mo, winMarks(&x)) }
         rewriteList(mut &order, mo, mut &bo, mut &oRewritten)
@@ -10258,6 +10263,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     for x in exprs { if lexdb_bind.hasAgg(&x) { aggQ = true } }
     for x in order { if lexdb_bind.hasAgg(&x) { aggQ = true } }
     for d in wdefs { if winHasAgg(&d) { aggQ = true } }
+    match qx { Some(x) { if lexdb_bind.hasAgg(&x) { aggQ = true } } None {} }
     if aggQ && s.lockMode > 0 { return Err(e("0A000", &(lexdb_sql.lockName(s.lockMode) + " is not allowed with aggregate functions"))) }
     if s.distinct {
         // SELECT DISTINCT: ORDER BY may use only what it outputs
@@ -10378,6 +10384,9 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             None {}
         }
         bh = replace(mut &having, rh)
+        var qa: Option[Expr] = None
+        match qx { Some(x) { qa = Some(try collectAggs(&x, mut &specs)) } None {} }
+        qx = qa
         // a window's arguments, partitions and order: over the groups, their
         // aggregates in slots (new definitions; the resolved ones go to bw)
         if len(wdefs) > 0 {
@@ -10424,6 +10433,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             Some(h) { try lexdb_bind.groupedIn(checkGrouped(&h, &gtexts, &okLevels, &q), s) }
             None {}
         }
+        match qx { Some(x) { try lexdb_bind.groupedIn(checkGrouped(&x, &gtexts, &okLevels, &q), s) } None {} }
         for d in wdefs {
             match d.call {
                 Expr.Call(_, args, _) { for a in args { try checkGrouped(&a, &gtexts, &okLevels, &q) } }
@@ -10512,6 +10522,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         for x in order { append(mut &wo, winSlots(&x, nAggs)) }
         rewriteList(mut &order, wo, mut &bo, mut &oRewritten)
         for d in wdefs { append(mut &wins, try winPlan(&d)) }
+        match qx { Some(x) { wins[0].qual = Some(winSlots(&x, nAggs)) } None {} }
         if len(bw) == 0 { bw = replace(mut &wdefs, []) }
     }
     // FOR UPDATE and the like (9.86): each locked table's key read with
@@ -11551,11 +11562,18 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
             append(mut &cxs, if !(q.corr && lexdb_plan.hasCorr(&x)) { lexdb_bind.bindExpr(&x, &q.cols, params, true, &typing()) } else { None })
         }
         let ce = cenvOf(seqEnv(st, txn))
+        // QUALIFY's condition (lexdb_parse.oraQualify), compiled once where it can be
+        var qcx: Option[lexdb_bind.BX] = None
+        match sel.wins[0].qual {
+            Some(qe) { if !(q.corr && lexdb_plan.hasCorr(&qe)) { qcx = lexdb_bind.bindExpr(&qe, &q.cols, params, true, &typing()) } }
+            None {}
+        }
         for bi in 0..len(bases) {
             // the slots: the row's aggregates, then its window values
             var aggs = if len(bases[bi].aggs) == 0 { replace(mut &wv[bi], []) } else { collections.copyOf(&bases[bi].aggs) }
             if len(bases[bi].aggs) > 0 { for v in wv[bi] { append(mut &aggs, v.clone()) } }
             let env = Env{cols: &q.cols, row: &bases[bi].row, aggs: &aggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
+            if sel.wins[0].qual.isSome() && !(try qualifies(st, txn, q, sel, &qcx, &bases[bi].row, &aggs, &env, &ce, rs)) { continue }
             var vals: []Val = []
             for xi in 0..len(sel.exprs) {
                 let c = at[xi]
@@ -16563,6 +16581,34 @@ fn hasWin(x: &Expr): bool {
     }
 }
 
+// Oracle's QUALIFY condition (lexdb_parse.oraQualify keeps it as the window named "#qualify"), resolved over the query's columns
+// as a select item is.
+fn qualifyOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, q: &Query, sc: mut &Scope): Result[Option[Expr], DbErr] {
+    for nw in s.windows {
+        if nw.name != "#qualify" { continue }
+        var x = try lexdb_bind.resolve(&nw.def.call, &q.cols, len(q.cols), mut &sc.names)
+        if lexdb_catalog.enumsOn() { x = try lexdb_enum.fix(st, txn, &typing(), &x, &q.cols) }
+        return Ok(Some(x))
+    }
+    return Ok(None)
+}
+
+// Whether a row (and the window calls' values aggs) passes QUALIFY's condition (the first window's qual): true, as WHERE's.
+fn qualifies(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, sel: &Sel, cx: &Option[lexdb_bind.BX], row: &[]Val, aggs: &[]Val, env: &Env,
+             ce: &Ctx, rs: mut &Run): Result[bool, DbErr] {
+    var v = Val.Null
+    match cx {
+        Some(b) { v = try lexdb_pipe.bxEval(&b, row, aggs, ce) }
+        None {
+            match sel.wins[0].qual {
+                Some(qe) { v = try evalX(st, txn, q, &qe, env, rs) }
+                None {}
+            }
+        }
+    }
+    return Ok(lexdb_ops.truth(&v) == Some(true))
+}
+
 fn hasWinOpt(x: &Option[Expr]): bool {
     match x {
         Some(v) { return hasWin(&v) }
@@ -16694,7 +16740,7 @@ fn winPlan(d: &lexdb_sql.WinDef): Result[WinPlan, DbErr] {
     let base = lexdb_sql.aggBase(&name)
     var w = WinPlan{fname: base.clone(), agg: false, spec: noSpec(), args: [], part: lexdb_sql.cloneAllExpr(&d.part), order: [], desc: [], nullsFirst: [],
                     mode: d.frame.mode, start: d.frame.start, startOff: optClone(&d.frame.startOff), end: d.frame.end,
-                    endOff: optClone(&d.frame.endOff), exclude: d.frame.exclude, nulls: lexdb_window.nullsOf(&name)}
+                    endOff: optClone(&d.frame.endOff), exclude: d.frame.exclude, nulls: lexdb_window.nullsOf(&name), qual: None}
     for o in d.order {
         append(mut &w.order, lexdb_sql.cloneExpr(&o.expr))
         append(mut &w.desc, o.desc)

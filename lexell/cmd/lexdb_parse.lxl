@@ -6021,8 +6021,9 @@ fn (p: mut &P) aliasOf(alias: mut &str, cols: mut &[]str, spelled: bool): Result
         let fetch = t.kind == T_IDENT && t.text == "fetch" && p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "first" || p.peekAt(1).text == "next")
         if !tw && !fetch && !p.waitAhead() && (t.kind == T_QIDENT || (t.kind == T_IDENT && !lexdb_sql.isReserved(&t.text))) {
             // (Oracle: START WITH and CONNECT BY after a table are a hierarchical query's clauses)
-            if !(p.ora && t.kind == T_IDENT && p.peekAt(1).kind == T_IDENT && ((t.text == "start" && p.peekAt(1).text == "with") ||
-                                                                              (t.text == "connect" && p.peekAt(1).text == "by"))) {
+            if !(p.ora && t.kind == T_IDENT && ((p.peekAt(1).kind == T_IDENT && ((t.text == "start" && p.peekAt(1).text == "with") ||
+                                                                               (t.text == "connect" && p.peekAt(1).text == "by"))) ||
+                                                (t.text == "qualify" && p.qualifyClause()))) {
                 let old = replace(alias, t.text.clone())
                 p.pos += 1
                 got = true
@@ -8992,7 +8993,7 @@ fn (p: mut &P) oraRownum(emptied: mut &bool): int {
             } else if t.kind == T_OP && t.text == ";" && depth == 0 { break }
             else if depth == 0 && t.kind == T_IDENT {
                 match t.text {
-                    "group", "order", "having", "union", "except", "intersect", "fetch", "offset", "for", "window", "limit", "connect", "start", "returning", "with" { done = true }
+                    "group", "order", "having", "union", "except", "intersect", "fetch", "offset", "for", "window", "limit", "connect", "start", "returning", "with", "qualify" { done = true }
                     "or" { hasOr = true }
                     "between" { between = true }
                     "and" {
@@ -9684,30 +9685,35 @@ fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
             return p.hierTail(s, rn)
         }
     }
-    if p.acceptKw("group") {
-        try p.expectKw("by")
-        try p.groupBy(mut &s)
-        if len(s.sets) > 0 {
-            // T-SQL's GROUP BY ALL (marked by groupBy): HAVING's aggregates too
-            if p.acceptKw("having") { s.having = Some(try p.expr()) }
-            p.groupAll(mut &s)
+    // (a clause word follows, or the end: the token's kind, read once, tells the common end from the clauses)
+    if p.peek().kind == T_IDENT {
+        if p.acceptKw("group") {
+            try p.expectKw("by")
+            try p.groupBy(mut &s)
+            if len(s.sets) > 0 {
+                // T-SQL's GROUP BY ALL (marked by groupBy): HAVING's aggregates too
+                if p.acceptKw("having") { s.having = Some(try p.expr()) }
+                p.groupAll(mut &s)
+            }
         }
-    }
-    if p.acceptKw("having") {
-        s.mdialect = p.md()
-        s.having = Some(try p.expr())
-    }
-    if p.acceptKw("window") {
-        // WINDOW name AS (spec), ...
-        while true {
-            let n = try p.name()
-            try p.expectKw("as")
-            try p.expectKw("(")
-            let d = try p.winSpec()
-            for w in s.windows { if w.name == n { return Err(lexdb_base.err("42P20", &("window \"" + n + "\" is already defined"))) } }
-            append(mut &s.windows, NamedWin{name: n, def: d})
-            if !p.acceptKw(",") { break }
+        if p.acceptKw("having") {
+            s.mdialect = p.md()
+            s.having = Some(try p.expr())
         }
+        if p.acceptKw("window") {
+            // WINDOW name AS (spec), ...
+            while true {
+                let n = try p.name()
+                try p.expectKw("as")
+                try p.expectKw("(")
+                let d = try p.winSpec()
+                for w in s.windows { if w.name == n { return Err(lexdb_base.err("42P20", &("window \"" + n + "\" is already defined"))) } }
+                append(mut &s.windows, NamedWin{name: n, def: d})
+                if !p.acceptKw(",") { break }
+            }
+        }
+        // Oracle 26ai's QUALIFY (design/lexdb-new-features.md 10.4)
+        if p.ora && p.isKw("qualify") { try p.oraQualify(mut &s) }
     }
     p.rnLimit = rn
     return Ok(s)
@@ -10192,4 +10198,127 @@ fn (p: mut &P) conflictSelect(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     s.conflict = lexdb_sql.CONFLICT_SELECT + lock
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
     return Ok(Unit{})
+}
+
+// At the word QUALIFY after a table: Oracle's clause (not a table alias) when a condition follows; the word alone, or before
+// a word that goes on a FROM list or a query (WHERE, ORDER ...), is an alias (QUALIFY is not a reserved word there).
+fn (p: &P) qualifyClause(): bool {
+    let n = p.peekAt(1)
+    if n.kind == T_EOF { return false }
+    if n.kind == T_OP { return n.text != ")" && n.text != "," && n.text != ";" }
+    if n.kind == T_IDENT {
+        match n.text {
+            "where", "group", "having", "window", "order", "union", "intersect", "except", "minus", "fetch", "offset", "for", "join", "inner", "left", "right",
+            "full", "cross", "natural", "on", "using", "connect", "start", "as", "pivot", "unpivot", "partition", "tablesample", "sample", "match_recognize" { return false }
+            else { return true }
+        }
+    }
+    return true
+}
+
+// Oracle 26ai's QUALIFY cond (design/lexdb-new-features.md O1, 10.4), at QUALIFY after WINDOW: a filter on the rows after the
+// window step, before DISTINCT, ORDER BY and FETCH. The condition may name a select alias (as ORDER BY does: an output's name
+// before a column's, ORA-00960 for a name two outputs have) and hold window calls (numbered in p.wins as the select list's are).
+// The aliases are replaced by their items' expressions here. A query with no window call anywhere has nothing to run after:
+// the condition is a WHERE's (HAVING's, where the query is grouped). With windows it is kept as a window the query does not
+// have, named "#qualify" (no new Stmt field: lexdb_exec.planSelect reads it where it plans the windows).
+// HAVING, WINDOW or QUALIFY after the condition: ORA-03049, at the condition's first word.
+fn (p: mut &P) oraQualify(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    p.pos += 1
+    let first = p.peek().clone()
+    let n0 = len(p.wins)
+    var cond = try p.expr()
+    if p.isKw("having") || p.isKw("window") || p.isKw("qualify") {
+        return Err(lexdb_base.err("ORA03049", &("SQL keyword '" + strings.toUpperAscii(&first.text) + "' is not syntactically valid following 'qualify '")))
+    }
+    s.mdialect = p.md()
+    cond = try p.qualAliases(&cond, &s.items)
+    for i in n0..len(p.wins) {
+        let c = p.wins[i].call.clone()
+        p.wins[i].call = try p.qualAliases(&c, &s.items)
+        for j in 0..len(p.wins[i].part) {
+            let x = p.wins[i].part[j].clone()
+            p.wins[i].part[j] = try p.qualAliases(&x, &s.items)
+        }
+        for j in 0..len(p.wins[i].order) {
+            let x = p.wins[i].order[j].expr.clone()
+            p.wins[i].order[j].expr = try p.qualAliases(&x, &s.items)
+        }
+    }
+    if len(p.wins) > 0 {
+        append(mut &s.windows, NamedWin{name: "#qualify", def: WinDef{call: cond, ref: "", bare: false, part: [], order: [], frame: lexdb_sql.noFrame()}})
+        return Ok(Unit{})
+    }
+    var grouped = len(s.group) > 0 || len(s.gsets) > 0 || s.having.isSome() || aggIn(&cond)
+    for it in s.items { match it.expr { Some(x) { if aggIn(&x) { grouped = true } } None {} } }
+    if grouped {
+        let h = replace(mut &s.having, None)
+        s.having = Some(match h { Some(h2) { Expr.Bin("and", h2, cond) } None { cond } })
+    } else {
+        let w = replace(mut &s.where, None)
+        s.where = Some(match w { Some(w2) { Expr.Bin("and", w2, cond) } None { cond } })
+    }
+    return Ok(Unit{})
+}
+
+// x as a copy of its own, with a copy of each subquery it calls (the subqueries are numbered in the query's list: two calls of
+// one index would be one subquery read twice).
+fn (p: mut &P) dupSubs(x: &Expr): Expr {
+    match x {
+        Expr.Call(n, args, star) {
+            var out: []Expr = []
+            for a in args { append(mut &out, p.dupSubs(&a)) }
+            if (n == "#sub" || n == "#exists" || n == "#in") && len(args) > 0 {
+                let i = lexdb_sql.litInt(&args[0])
+                if i >= 0 && i < len(p.subs) {
+                    append(mut &p.subs, p.subs[i].clone())
+                    out[0] = Expr.Lit(Val.Int(len(p.subs) - 1))
+                }
+            }
+            return Expr.Call(n.clone(), out, star)
+        }
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), p.dupSubs(&a)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), p.dupSubs(&a), p.dupSubs(&b)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(p.dupSubs(&a), neg) }
+        Expr.Cast(a, t) { return Expr.Cast(p.dupSubs(&a), t) }
+        else { return lexdb_sql.cloneExpr(x) }
+    }
+}
+
+// x with each bare name that is a select item's alias made that item's expression; ORA-00960 for a name that two items have
+// (an alias, or a column item's own name).
+fn (p: mut &P) qualAliases(x: &Expr, items: &[]SelItem): Result[Expr, lexdb_base.DbErr] {
+    match x {
+        Expr.Col(n, _) {
+            if strings.contains(&n, ".") { return Ok(lexdb_sql.cloneExpr(x)) }
+            var at = -1
+            for i in 0..len(items) {
+                var nm = items[i].alias.clone()
+                if len(nm) == 0 {
+                    match items[i].expr {
+                        Some(ex) { match ex { Expr.Col(cn, _) { nm = cn[strings.lastIndexOf(&cn, ".") + 1..len(cn)].toStr() } else {} } }
+                        None {}
+                    }
+                }
+                if len(nm) == 0 || nm != n { continue }
+                if at >= 0 { return Err(oraErr(960, "ambiguous column naming in select list")) }
+                at = i
+            }
+            // (a column item without an alias is no alias: the name is a column of the FROM list's, ambiguous or not)
+            if at >= 0 && len(items[at].alias) > 0 {
+                match items[at].expr { Some(ex) { return Ok(p.dupSubs(&ex)) } None {} }
+            }
+            return Ok(lexdb_sql.cloneExpr(x))
+        }
+        Expr.Unary(op, a) { return Ok(Expr.Unary(op.clone(), try p.qualAliases(&a, items))) }
+        Expr.Bin(op, a, b) { return Ok(Expr.Bin(op.clone(), try p.qualAliases(&a, items), try p.qualAliases(&b, items))) }
+        Expr.IsNull(a, neg) { return Ok(Expr.IsNull(try p.qualAliases(&a, items), neg)) }
+        Expr.Cast(a, t) { return Ok(Expr.Cast(try p.qualAliases(&a, items), t)) }
+        Expr.Call(n, args, star) {
+            var out: []Expr = []
+            for a in args { append(mut &out, try p.qualAliases(&a, items)) }
+            return Ok(Expr.Call(n.clone(), out, star))
+        }
+        else { return Ok(lexdb_sql.cloneExpr(x)) }
+    }
 }
