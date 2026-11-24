@@ -2322,6 +2322,21 @@ fn (g: &Gen) memInline(e: int): int {
     return if k.c == 0 && k.v >= 0 && k.v <= 120 { 1 } else { 0 }
 }
 
+// Whether the call e is a drop that inlineRt generates in place: 1 for rt_str_drop(s), nothing
+// when s's cap is 0 (a literal or a view); 2 for rt_arr_free(a), nothing when a's data is null;
+// else rt_free(p) called directly. s or a is a place, read where it is, not copied for a call.
+// One call instead of two and no copy; the position stays loud (a call). Not in a kernel
+// function (rt_str_drop leaves a block another thread owns alone). Else 0.
+fn (g: &Gen) dropInline(e: int): int {
+    if g.kern() { return 0 }
+    let name = g.rtName(e)
+    let n = g.u.nodes[e]
+    if g.u.listLen(n.b) != 1 { return 0 }
+    let a = g.u.listAt(n.b, 0)
+    if !g.placeKind(a) || !g.isAggr(g.u.nodes[a].ty) { return 0 }
+    return if name == "rt_str_drop" { 1 } else if name == "rt_arr_free" { 2 } else { 0 }
+}
+
 // A kernel function (kernel.lxl) may run on a par pool thread: its str counts are changed by the
 // runtime's rt_str_dup and rt_str_drop, which leave a block another thread owns alone
 // (design/parallel.md 2.3, 2.4), not inline.
@@ -8055,6 +8070,25 @@ fn (g: mut &Gen) inlineRt(e: int, name: &str): bool {
         }
         g.a.load(8, RAX, x64.mem(RAX, 0))               // p: the bytes
         if wd { g.a.load(8, dst, x64.memx(RAX, RCX, 1, 0)) } else { g.a.loadZX(1, dst, x64.memx(RAX, RCX, 1, 0)) }
+        return true
+    }
+    let dk = g.dropInline(e)
+    if dk > 0 {
+        // rt_str_drop(s): nothing when s's cap (the word at 12) is 0; rt_arr_free(a): nothing when
+        // a's data is null; else rt_free(p), called directly
+        let m = g.place(g.u.listAt(n.b, 0))
+        let done = g.a.newLabel()
+        if dk == 1 {
+            g.a.aluMI(x64.CMP, 4, at(m, 12), 0)
+            g.a.jcc(x64.CC_E, done)
+            g.a.load(8, RDI, m)
+        } else {
+            g.a.load(8, RDI, m)
+            g.a.test(8, RDI, RDI)
+            g.a.jcc(x64.CC_E, done)
+        }
+        g.callRt("rt_free")
+        g.a.bind(done)
         return true
     }
     let mk = g.memInline(e)

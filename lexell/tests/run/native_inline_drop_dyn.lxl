@@ -1,0 +1,68 @@
+// Strings and arrays dropped in place (x64gen dropInline: the test inline, then rt_free called
+// directly): an owned str freed, a literal or a view (cap 0) left alone, an empty array (no data)
+// left alone; drops in a function's frame, through a pointer (drop glue of records, options and
+// arrays of strings), and of a variable assigned again; enough rounds that blocks fall outside
+// the current 2 MB chunk.
+// This is native_inline_drop in a dynamically linked program (fs, whose blocking externs need libc).
+// expect: 400 2281785 79800 0
+// expect: 4668000 0
+// expect: ok
+import "fs"
+
+type Named = record { name: str; tags: []str; n: int }
+
+fn named(i: int): Named {
+    var tags: []str = []
+    for k in 0..(i % 4) { append(mut &tags, "t" + k.toStr() + "-" + i.toStr()) }
+    return Named{name: "n" + i.toStr(), tags: tags, n: i}
+}
+
+fn keep(rs: &[]Named): int {
+    var s = 0
+    for r in rs { s += len(r.name) + len(r.tags) }
+    return s
+}
+
+fn round(r: int): []int {
+    var names: []Named = []
+    for i in 0..1000 { append(mut &names, named(i + r)) }
+    var lit = "literal"                 // cap 0: no free
+    let whole = "abcdefgh" + r.toStr()
+    let view = whole[1..4]              // a view: no free of its own
+    var total = keep(&names) + len(lit) + len(view)
+    lit = "again" + r.toStr()           // the literal dropped (nothing), an owned one assigned
+    total += len(lit)
+    var opt: Option[Named] = Some(named(r))
+    opt = None                          // the record and its strings dropped through glue
+    let empty: []int = []               // no data: no free
+    var big: []int = []
+    for i in 0..r { append(mut &big, i) }
+    return [total, len(empty), len(big), if opt.isSome() { 1 } else { 0 }]
+}
+
+fn main() {
+    var a = 0
+    var b = 0
+    var c = 0
+    var z = 0
+    for r in 0..400 {
+        let v = round(r)
+        a += v[0]
+        z += v[1] + v[3]
+        b += v[2]
+        c += 1
+    }
+    println(c.toStr() + " " + a.toStr() + " " + b.toStr() + " " + z.toStr())
+    // strings across many chunks: built, kept a while, dropped in another order
+    var keepers: []str = []
+    var bytes = 0
+    for i in 0..1200000 {
+        append(mut &keepers, "k" + (i % 1000).toStr())
+        if len(keepers) == 3000 {
+            for s in &keepers { bytes += len(s) }
+            keepers = []
+        }
+    }
+    println(bytes.toStr() + " " + len(keepers).toStr())
+    println(if fs.isDir("/") { "ok" } else { "no" })
+}

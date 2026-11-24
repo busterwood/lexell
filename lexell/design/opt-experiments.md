@@ -1437,3 +1437,47 @@ instructions.
 **Not built.** Constructor reuse has nothing to work on. A variable-size allocation inline in the
 generated code (the class from the size, then the pop, as with constant sizes) would reach all
 4.8M of the compiler's allocations, not just the pairs. That would be the one to count next.
+
+## 35. String and array drops in place (as built)
+
+**What the profile showed.** In jq, 73% of the calls to `rt_free` came through `rt_str_drop`, and
+15% through `rt_arr_free`. Each drop of a str made two calls. The generated code also copied the
+16-byte value through a temporary into rdi and rsi, and `rt_str_drop` tested the cap and jumped
+on to `rt_free`.
+
+**The change** (x64gen `dropInline`). `rt_str_drop(s)` and `rt_arr_free(a)` of a place are
+generated in place. The code tests s's cap (the 4 bytes at 12) or a's data pointer where the
+value is, skips a literal, a view or an empty array, and otherwise loads the pointer into rdi and
+calls `rt_free` directly. That is one call instead of two, with no copy. The position stays loud
+(a call), so register allocation is unchanged. Kernel functions keep the call.
+
+**Tried and dropped.**
+
+- **The whole of `rt_free`'s inline path at every drop site** (section 19's, the miss out of line
+  with six registers saved). lexdb grew from 14.6 to 18.1 MB, and point selects took 10% more
+  cycles (i-cache, iTLB and branch misses), at 0.3% fewer instructions. A block outside the
+  current chunk, common for long-lived strings, paid the inline test and then the call: maps
+  +0.2% and jq +0.1% in instructions.
+- **Section 19's inline allocation and freeing in dynamically linked programs** (lexdb, jq and
+  the compiler are dynamically linked, so none of them has it). With the compact drops, point
+  selects were -1.3% in instructions but only about -1% in cycles, with 80 more branch misses a
+  statement, against -3.6% and -6.2% without it.
+
+| measure (dc3f17fe against this; perfsuite on the a1c47b3c inputs, 4 placements, CPU 2) | instructions | cycles |
+|---|---:|---:|
+| compile suite | -2.07% | -1.28% (every row apart) |
+| run suite | -0.22% | -0.16% |
+| strings / grep -cw / eza -T | -1.47 / -1.07 / -1.00% | -0.85 / -0.68 / -1.29% |
+| apps regex / json / jq / cmark / decimal | -0.20 / -0.64 / -0.69 / -1.51 / -0.25% | 0 / -1.16 / -1.53 / -1.38 / -0.17% |
+| TPC-H SF1, server instructions per query (22) | -1.19% geomean (no query worse; q2 -3.4%) | |
+| lexdb point select (icount6, 2 rounds) | -3.67% (163,393-163,430 against 169,594-169,621) | -6.4% (90.6-91.6K against 97.2-97.4K) |
+| code size: lexdb -O | -4.3% (14.56 to 13.94 MB) | |
+
+nbody +0.34% in cycles (apart) has the same instructions; it has no drop in its loop, so the
+change there is placement.
+
+The gate, the lexdb tests (363), vrgen and loopgen (300 each) and run_native (1,818) pass.
+
+Tests: tests/run/native_inline_drop, and native_inline_drop_dyn (the same in a dynamically linked
+program). They cover owned strings, literals, views, empty arrays, drops through drop glue, and a
+variable assigned again, over several chunks.
