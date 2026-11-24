@@ -10,6 +10,7 @@ Filters the rows of a query on the result of a window function, after the window
 SELECT [ ALL | DISTINCT ] select_list
     FROM table_reference [, ...]
     [ WHERE condition ]
+    [ START WITH condition ] [ CONNECT BY [ NOCYCLE ] condition ]
     [ GROUP BY group_by_item [, ...] [ HAVING condition ] ]
     [ WINDOW window_name AS ( window_spec ) [, ...] ]
     [ QUALIFY condition ]
@@ -40,21 +41,23 @@ the window functions.
 - The window functions in the condition may be over aggregates of a `GROUP BY` query
   (`QUALIFY RANK() OVER (ORDER BY SUM(salary) DESC) = 1`).
 - A query with no window function at all treats `QUALIFY` as `WHERE`, or as `HAVING` when it has a `GROUP BY`.
-- `HAVING`, `WINDOW` or a second `QUALIFY` after the condition is ORA-03049. `ORDER BY` before `QUALIFY` is
-  ORA-00900.
+- A condition that is not a comparison, `AND`, `OR`, `NOT`, `IS NULL`, `EXISTS` or `IN` is read as `TO_BOOLEAN`
+  reads a value: a number is true when it is not zero, and a text is true for `'yes'`, `'t'`, `'1'` and the like
+  (ORA-61800 for a text such as `'a'`). `QUALIFY 1` keeps every row, `QUALIFY id - 1` every row but one.
+- `QUALIFY` can follow `CONNECT BY` (example K).
+- `HAVING`, `WINDOW` or a second `QUALIFY` after the condition is ORA-03049, and so is `QUALIFY` after `ORDER BY`
+  or `FOR UPDATE`, or a `CONNECT BY` after the condition. The message names the word and up to 28 characters of the
+  statement before it.
+- `FOR UPDATE` after `QUALIFY` is ORA-01786, as `FOR UPDATE` of a query with a window function is.
 - `QUALIFY` is not a reserved word. Where no condition follows it, it is a table alias: `FROM emp qualify`.
 - In a set operation each query has its own `QUALIFY`, and an alias of one is not visible in another.
 
 ## Differences from Oracle
 
 - Oracle added `QUALIFY` in 23.26.0; the 23ai releases before it have none.
-- `QUALIFY` is not read after `CONNECT BY`: a hierarchical query with it is ORA-00900 (example J).
-- A condition that is a number or a text is read as `WHERE` reads it, which is as no row: `QUALIFY 1` and
-  `QUALIFY id - 1` return no rows (Oracle: not zero is true, so `QUALIFY 1` returns every row; a text is ORA-61800).
-  Write the comparison (`QUALIFY id <> 1`).
-- `FOR UPDATE` after `QUALIFY` is accepted when the query has no window function, and is ORA-03001 when it has one
-  (Oracle: ORA-01786 in both cases).
-- The text of ORA-03049 is shorter than Oracle's: it names the first word of the condition, not the whole of it.
+- The ORA-03049 message keeps at most 28 characters of the statement before the word. Oracle cuts differently in a few
+  cases: after a long `CONNECT BY` it keeps less.
+- A condition that is a date (`QUALIFY DATE '2020-01-01'`) is ORA-00932 here; Oracle gives ORA-03048.
 - PostgreSQL and SQL Server have no `QUALIFY`; the same query there is an inline view with a `WHERE`.
 
 ## Examples
@@ -279,6 +282,7 @@ SELECT salary AS x, id AS x FROM emp QUALIFY x > 4000;
 SELECT name FROM emp QUALIFY salary > 4000 HAVING COUNT(*) > 0;
 SELECT name FROM emp QUALIFY salary > 4000 QUALIFY id > 1;
 SELECT name, id FROM emp ORDER BY id QUALIFY id > 1;
+SELECT name FROM emp FOR UPDATE QUALIFY id > 1;
 SELECT e.name FROM emp e, dept d QUALIFY id > 1;
 ```
 
@@ -287,30 +291,44 @@ ERROR:
 ORA-00960: ambiguous column naming in select list
 
 ERROR:
-ORA-03049: SQL keyword 'SALARY' is not syntactically valid following 'qualify '
+ORA-03049: SQL keyword 'SALARY' is not syntactically valid following '...name FROM emp QUALIFY '
 
 ERROR:
-ORA-03049: SQL keyword 'SALARY' is not syntactically valid following 'qualify '
+ORA-03049: SQL keyword 'SALARY' is not syntactically valid following '...name FROM emp QUALIFY '
 
 ERROR:
-ORA-00900: invalid SQL statement
+ORA-03049: SQL keyword 'QUALIFY' is not syntactically valid following '...id FROM emp ORDER BY id '
+
+ERROR:
+ORA-03049: SQL keyword 'QUALIFY' is not syntactically valid following '...name FROM emp FOR UPDATE '
 
 ERROR:
 ORA-00918: column ambiguously defined
 ```
 
-### J. Where lexdb differs
+### J. A condition that is not a comparison
+
+A number is true when it is not zero, a text as `TO_BOOLEAN` reads it:
 
 <!-- example: oracle -->
 ```sql
 SELECT name FROM emp QUALIFY 1;
-SELECT name FROM emp QUALIFY id <> 1 ORDER BY name FOR UPDATE;
-SELECT name FROM emp QUALIFY ROW_NUMBER() OVER (ORDER BY id) = 1 FOR UPDATE;
-SELECT name, LEVEL FROM emp START WITH id = 1 CONNECT BY PRIOR id = mgr_id QUALIFY id > 2;
+SELECT name FROM emp QUALIFY id - 1 ORDER BY name;
+SELECT name FROM emp QUALIFY 0;
+SELECT name FROM emp QUALIFY 'yes' ORDER BY name;
+SELECT name FROM emp QUALIFY 'a';
 ```
 
 ```text
-no rows selected
+NAME
+----
+Ann
+Bob
+Cid
+Dee
+Eve
+
+5 rows selected.
 
 NAME
 ----
@@ -321,11 +339,65 @@ Eve
 
 4 rows selected.
 
-ERROR:
-ORA-03001: unimplemented feature: FOR UPDATE is not allowed with window functions
+no rows selected
+
+NAME
+----
+Ann
+Bob
+Cid
+Dee
+Eve
+
+5 rows selected.
 
 ERROR:
-ORA-00900: invalid SQL statement
+ORA-61800: invalid boolean literal: a
+```
+
+### K. After CONNECT BY, and FOR UPDATE
+
+<!-- example: oracle -->
+```sql
+SELECT name, LEVEL FROM emp START WITH id = 1 CONNECT BY PRIOR id = mgr_id QUALIFY id > 2 ORDER BY id;
+SELECT name, LEVEL FROM emp START WITH id = 1 CONNECT BY PRIOR id = mgr_id
+QUALIFY ROW_NUMBER() OVER (ORDER BY id DESC) = 1;
+SELECT name FROM emp QUALIFY id <> 1 ORDER BY name FOR UPDATE;
+SELECT name FROM emp QUALIFY ROW_NUMBER() OVER (ORDER BY id) = 1 FOR UPDATE;
+```
+
+```text
+NAME LEVEL
+---- -----
+Cid      2
+Dee      3
+Eve      3
+
+3 rows selected.
+
+NAME LEVEL
+---- -----
+Eve      3
+
+1 row selected.
+
+ERROR:
+ORA-01786: FOR UPDATE of this query expression is not allowed
+
+ERROR:
+ORA-01786: FOR UPDATE of this query expression is not allowed
+```
+
+### L. Where lexdb differs
+
+<!-- example: oracle -->
+```sql
+SELECT name FROM emp QUALIFY DATE '2020-01-01';
+```
+
+```text
+ERROR:
+ORA-00932: inconsistent datatypes: expected CHAR got DATE
 ```
 
 ## See also
