@@ -1235,3 +1235,16 @@ NULL: `setNull` with another type) replaces the cursor's, and the values alone a
   rounds, 60,000 statements; main twice, branch twice): instructions 163,357 / 163,362 against 163,377 / 163,451, cycles 90,833 / 92,096 against 90,167 / 91,330, L1 i-cache misses 330 /
   336 against 378 / 380; the control (main with an unused function in lexdb_tns.lxl): 163,470 / 163,345 instructions (main alone ranges 163,319 to 163,532), i-cache 375 / 374: every
   change to the TNS door's file moves the i-cache misses by that much, and the cycles are not slower.
+
+
+## As built: TIMESTAMP WITH TIME ZONE keeps its offset
+
+See lexdb-robust.md, "Timestamps that keep their offset". The Oracle door's `lexdb_oratz` (new) and `lexdb_orafn`: the literal `TIMESTAMP '... +02:00'` and `CAST(x AS TIMESTAMP WITH TIME ZONE)`
+read their text as `TO_TIMESTAMP_TZ` does (`#ora_totstz`: the session's NLS_TIMESTAMP_TZ_FORMAT, then ISO; ORA-01874, 01875 for an hour or minute out of range, 01882 for a zone that is none,
+01861 for `+03`); `FROM_TZ`, `SYS_EXTRACT_UTC`, `x AT TIME ZONE z` and `AT LOCAL` (`#ora_attz`, `#ora_atlocal`: a timestamp without a zone is read in the session's), `TZ_OFFSET`, `NEW_TIME` (Oracle's 18
+abbreviations; ORA-01857), `SYSTIMESTAMP` (offset +00:00) and `CURRENT_TIMESTAMP` (the session zone's), `SESSIONTIMEZONE` (`+02:00`), `EXTRACT` of the UTC fields and of `TIMEZONE_HOUR`,
+`TIMEZONE_MINUTE`, `TIMEZONE_REGION` (`UNKNOWN`), `TIMEZONE_ABBR` (`UNK`); `TO_CHAR` with `TZH`, `TZM`, `TZR`, `TZD` (ORA-01821 on a value without a zone); `TSTZ - TSTZ` is an interval by
+instant; `TSTZ + interval` keeps the offset (months and days by the local time), `TSTZ + n` is a DATE; `CAST` to `VARCHAR2` is `TO_CHAR` (the NLS formats), to `TIMESTAMP` and `DATE` the local
+time. Type 181 carries the offset both ways (the UTC date and time, then the hour + 20 and the minute + 60: `lexdb_tns` encode, bind decode); a named-zone region id (`decodeStamp`) is still an
+error. Checked: `tns_tstz` (113 statements: 109 as Oracle Free answers, 4 listed in oracle_known_diffs.txt), `exec_tstz`, `OracleJdbc.tstz` (OffsetDateTime binds and reads, `oracle.sql.TIMESTAMPTZ`
+bytes). Left: regions; a text inserted into a TSTZ column is not read by the NLS format (as a DATE column's); `TO_CHAR` of an interval is NULL; a TIMESTAMP literal's nine fractional digits.

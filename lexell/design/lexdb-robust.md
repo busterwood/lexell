@@ -191,3 +191,25 @@ Over the wire (`icount6.sh`, 20,000 point selects x 3, base and branch alternate
 and 97,187, L1 i-cache misses 377 and 375 against 404 and 397 (code placement: the instructions are lower, the cycles level), iTLB misses 55 against 33. TPC-H SF1, 22 queries, base and
 branch alternated twice, checksums equal on all 22, best of two: total 8,810 ms against 8,769 ms, no query more than 1.4% slower (q13, within its runs' spread).
 `replica.py` passes.
+
+
+## Timestamps that keep their offset (item 9, as built)
+
+`Val.Tsz(instant, offset)`: the instant as `Val.Tstz` (microseconds since 2000 UTC) and the offset east in minutes, added last in `Val` (the other variants keep their tags). The type of a
+column that keeps it is `TypeName` kind `K_TSTZ`, OID `OID_TSTZ` and `len` 1 (Oracle's `TIMESTAMP WITH TIME ZONE`) or 2 (T-SQL's `datetimeoffset`: offsets within 14:00, 241 beyond):
+`lexdb_sql.isTszType`. The PostgreSQL door's `timestamptz` and Oracle's `TIMESTAMP WITH LOCAL TIME ZONE` stay `len` 0 and `Val.Tstz`; a Tsz seen by the PostgreSQL door is an instant
+(`lexdb_sql.text`, `textOut`, the binary send, `pg_typeof` and the OID are `timestamptz`'s). A `kind` of its own was tried first: it cost the point path instructions in `coerce`'s chain, and a
+fifth term in `isVarKind` stopped the compiler folding the four into a bit test (+8 instructions a point select, +38 an UPDATE), so:
+- **Row form:** a variable place of the uuid's kind (`PK_TSZ` = `PK_UUID`), 10 bytes (the instant, the offset as an int16) where a uuid has 16, told by `varVal` by the length (`tszVal`, off
+  the uuid's path); the tagged form has tag 16 (10 bytes). `placeKind` chooses it from `len`. Column leaves (`lexdb_cols`) hold it as bytes; a tagged tag 16 row is "not convertible", as
+  an unknown tag was. A fast COPY (`fastCopyPlan`) refuses it. Index keys (`encKeyPart`) are the instant alone: equal instants are one key, a unique index refuses the second.
+- **Compare, sort, hash, group, DISTINCT, IN, join:** by instant (`compareTime`, `timeCmpLocal`, `asTstz`, `skIntOf`, `inValKeys` through `encIdxPart`); GROUP BY and DISTINCT show the
+  first row's offset, as Oracle and SQL Server do. Batches: a Tsz column's place is not a kind the batch columns hold, so a scan reads rows (`timeKindOf` refuses it for ranges).
+- **Coercion (`lexdb_tz.coerceTsz`):** a text is read with the offset it carries (the session's zone where it has none; a named zone or abbreviation as the offset it has at that
+  instant); a date or timestamp as local time in the session's zone; a Tstz as its instant seen at the session zone's offset; a Tsz to `timestamp`, `date`, `time` as its own local time.
+  `CREATE TABLE AS` and `SELECT INTO` in these doors make the column a Tsz (`lexdb_sql.madeType`); a VALUES list and a derived column typed by OID alone are an instant (the offset lost).
+- **Storage compatibility:** a column made before has `len` 0 and stays an instant (its cells decode as the instant, shown at the session zone's offset: `+00:00`); a database made by main's
+  binary, closed and killed (WAL replay), opens and reads in the branch's (checked). `ALTER TABLE ... MODIFY (t TIMESTAMP WITH TIME ZONE)` rewrites a column into the new type.
+- **Regions:** offsets only. `lexdb_time` has a zone registry by name (`zoneNamed`) but no table of ids, and a region is not kept in a row: `FROM_TZ(..., 'Europe/Berlin')`, `AT TIME ZONE
+  'Europe/Berlin'`, a literal `... Europe/Berlin` and a session in a region keep the offset the region had at that instant (`TZR` shows `+01:00`, `TZD` is empty, `EXTRACT(TIMEZONE_REGION)` is
+  `UNKNOWN`); Oracle shows `EUROPE/BERLIN`, `CET`, `Europe/Berlin`. (The plan: a negative offset field as an id into a table of region names, the name kept in the row.)
