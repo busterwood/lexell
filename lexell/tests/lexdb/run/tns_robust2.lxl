@@ -1,0 +1,169 @@
+// lexdb over TNS: wrong answers and gaps of the Oracle door left by the documentation slices (KNOWN-ISSUES.md, second robustness slice), checked against Oracle
+// Database Free 23.26 (gen_oracle.py --check tns_robust2: the answers below are Oracle's): a recursive WITH under FETCH FIRST (ORA-32044, as Oracle's), NUMBER
+// literals past int4 and int8 (no range), an UPDATE and a MERGE testing only the CHECKs that read a column they set (a single UPDATE, the second statement of a
+// transaction, MERGE), a package's variables as INTO targets (SELECT, FETCH, RETURNING, EXECUTE IMMEDIATE) and OUT and IN OUT arguments from outside the package.
+// Each statement runs with set lexdb_batch = off (the row engine) and on: "same" and the answer, or DIFFERENT and both.
+// expect: setup: 12 statements
+// expect: same: error 32044
+// expect: same: error 32044
+// expect: same: I = 7;14
+// expect: same: A,B,C,D = 2147483648|-2147483649|2147488281|4294967294
+// expect: same: 1 / ID,A,B,C = 1|-5|7|10;2|3|2|20
+// expect: same: error 2290
+// expect: same: error 2290
+// expect: same: error 2290
+// expect: same: error 2290
+// expect: same: 2 / ID,B = 1|2;2|3
+// expect: same: 1 / 1 / ID,B = 1|7;2|3
+// expect: same: 1 / error 2290 / ID,A,B = 1|-5|1;2|3|2
+// expect: same: 1 / ID,B = 1|6;2|2
+// expect: same: error 2290
+// expect: same: 1 / ID,B = 1|6;2|2
+// expect: same: 2 / ID,B = 1|6;2|6
+// expect: same: error 2290
+// expect: same: 0 / 0 / A,S = 3|'x'
+// expect: same: 0 / 0 / A,S = 2|'b'
+// expect: same: 0 / 0 / A,S = 3|'c'
+// expect: same: 0 / 0 / A,S = 2|'b'
+// expect: same: 0 / 0 / A,S = 1|'z'
+// expect: same: 0 / 0 / A,S = 42|'z'
+// expect: same: 0 / 0 / A,S = 11|'z'
+// expect: same: 0 / 0 / A,S = 42|'out'
+// expect: same: 0 / 0 / A,S = 3|'out'
+// expect: same: 0 / 0 / A,S = 2|'out'
+// expect: same: 0 / 0 / A,S = 42|'out'
+// expect: same: 0 / 0 / A,S = 100|'out'
+// expect: same: 0 / 0 / A,S = 3|'out'
+// expect: same: 0 / 0 / A,S = 5|'out'
+// expect: same: 0 / 0 / A,S = 20|'out'
+// expect: same: error 6550
+// expect: same: error 6550
+// expect: same: error 6550
+// expect: same: error 6550
+// expect: same: error 6502
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+const SETUP = "create table ck (id number(10) primary key, a number(10), b number(10), c number(10))\ninsert into ck values (1, -5, 1, 10)\ninsert into ck values (2, 3, 2, 20)\nalter table ck add constraint ck_a check (a > 0) enable novalidate\nalter table ck add constraint ck_bc check (b < c and c < 100) enable novalidate\ncreate table pt (id number primary key, v varchar2(10))\ninsert into pt values (1, 'a')\ninsert into pt values (2, 'b')\ninsert into pt values (3, 'c')\ncreate table lg (a number, s varchar2(20))\ncreate or replace package pv as g_n number := 0; g_s varchar2(20) := 'x'; k_c constant number := 7; procedure setn(p out number); procedure bump(p in out number); procedure setvc(p out varchar2); function f return number; end;\ncreate or replace package body pv as procedure setn(p out number) is begin p := 42; end; procedure bump(p in out number) is begin p := p + 1; end; procedure setvc(p out varchar2) is begin p := 'out'; end; function f return number is begin return g_n; end; end;"
+
+const QS = "with n(i) as (select 1 from dual union all select i + 1 from n) select i from n where mod(i, 7) = 0 fetch first 3 rows only\nwith n(i) as (select 1 from dual union all select i + 1 from n) select n.i, pt.v from n join pt on pt.id = n.i fetch first 2 rows only\nwith n(i) as (select 1 from dual union all select i + 1 from n where i < 20) select i from n where mod(i, 7) = 0 fetch first 3 rows only\nselect 2147483647 + 1 a, -2147483648 - 1 b, 46341 * 46341 c, 2147483647 * 2 d from dual\nupdate ck set b = 7 where id = 1 ;; select id, a, b, c from ck order by id\nupdate ck set a = a where id = 1\nupdate ck set a = a + 1\nupdate ck set b = 50 where id = 2\nupdate ck set c = 200 where id = 2\nupdate ck set b = b + 1 ;; select id, b from ck order by id\nupdate ck set b = 3 where id = 2 ;; update ck set b = 7 where id = 1 ;; select id, b from ck order by id\nupdate ck set b = 2 where id = 2 ;; update ck set a = a where id = 1 ;; select id, a, b from ck order by id\nmerge into ck t using (select 1 id from dual) s on (t.id = s.id) when matched then update set b = 6 ;; select id, b from ck order by id\nmerge into ck t using (select 1 id from dual) s on (t.id = s.id) when matched then update set a = a\nmerge into ck t using (select 1 id from dual) s on (t.id = s.id) when matched then update set b = 6 where t.a < 0 ;; select id, b from ck order by id\nmerge into ck t using (select 1 id from dual union all select 2 from dual) s on (t.id = s.id) when matched then update set b = 6 ;; select id, b from ck order by id\ninsert into ck values (3, -1, 1, 2)\ndelete from lg ;; begin select count(*) into pv.g_n from pt; insert into lg values (pv.g_n, pv.g_s); end; ;; select a, s from lg\ndelete from lg ;; begin select id, v into pv.g_n, pv.g_s from pt where id = 2; insert into lg values (pv.g_n, pv.g_s); end; ;; select a, s from lg\ndelete from lg ;; declare cursor c is select id, v from pt order by id desc; begin open c; fetch c into pv.g_n, pv.g_s; close c; insert into lg values (pv.g_n, pv.g_s); end; ;; select a, s from lg\ndelete from lg ;; declare c sys_refcursor; begin open c for select id, v from pt order by id; fetch c into pv.g_n, pv.g_s; fetch c into pv.g_n, pv.g_s; close c; insert into lg values (pv.g_n, pv.g_s); end; ;; select a, s from lg\ndelete from lg ;; begin update pt set v = 'z' where id = 1 returning id, v into pv.g_n, pv.g_s; insert into lg values (pv.g_n, pv.g_s); end; ;; select a, s from lg\ndelete from lg ;; begin pv.setn(pv.g_n); insert into lg values (pv.g_n, pv.g_s); end; ;; select a, s from lg\ndelete from lg ;; begin pv.g_n := 10; pv.bump(pv.g_n); insert into lg values (pv.g_n, pv.g_s); end; ;; select a, s from lg\ndelete from lg ;; begin pv.setvc(pv.g_s); pv.setn(pv.g_n); insert into lg values (pv.g_n, pv.g_s); end; ;; select a, s from lg\ndelete from lg ;; begin execute immediate 'select count(*) from pt' into pv.g_n; insert into lg values (pv.g_n, pv.g_s); end; ;; select a, s from lg\ndelete from lg ;; begin execute immediate 'select max(id) from pt where id < :1' into pv.g_n using 3; insert into lg values (pv.g_n, pv.g_s); end; ;; select a, s from lg\ndelete from lg ;; begin execute immediate 'begin pv.setn(:1); end;' using out pv.g_n; insert into lg values (pv.g_n, pv.g_s); end; ;; select a, s from lg\ndelete from lg ;; begin pv.g_n := 99; execute immediate 'begin pv.bump(:1); end;' using in out pv.g_n; insert into lg values (pv.g_n, pv.g_s); end; ;; select a, s from lg\ndelete from lg ;; begin for i in 1..3 loop select count(*) into pv.g_n from pt where id <= i; end loop; insert into lg values (pv.g_n, pv.g_s); end; ;; select a, s from lg\ndelete from lg ;; begin pv.g_n := 5; begin select id into pv.g_n from pt where id > 10; exception when no_data_found then null; end; insert into lg values (pv.g_n, pv.g_s); end; ;; select a, s from lg\ndelete from lg ;; begin pv.g_n := 5; select id into pv.g_n from pt where id = 2; pv.g_n := pv.g_n * 10; insert into lg values (pv.g_n, pv.g_s); end; ;; select a, s from lg\nbegin select count(*) into pv.k_c from pt; end;\nbegin pv.setn(pv.k_c); end;\nbegin select count(*) into pv.nothere from pt; end;\nbegin select count(*) into nothere.g_n from pt; end;\nbegin select v into pv.g_n from pt where id = 3; end;"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows; or error and the number.
+fn qtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// A statement: its row count, or error and the number.
+fn xtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.run(&(sql.toStr()), &[]) {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn one(c: mut &oracle.Conn, sql: &str): str {
+    let low = strings.toLowerAscii(sql)
+    if strings.startsWith(&low, "select") || strings.startsWith(&low, "with") { return qtext(c, sql) }
+    return xtext(c, sql)
+}
+
+// A query, or statements ("a ;; b ;; c") in a transaction rolled back: each answer, joined by " / " (after an error, the
+// last part, the check, after the rollback).
+fn answer(c: mut &oracle.Conn, sqls: &str): str {
+    if !strings.contains(sqls, " ;; ") { return one(c, sqls) }
+    let parts = strings.split(sqls, " ;; ")
+    var out: []str = []
+    var failed = false
+    let r = c.transaction(fn(c2: mut &oracle.Conn): Result[int, oracle.Error] {
+        for i in 0..len(parts) {
+            if failed { break }
+            let a = one(c2, &parts[i])
+            if strings.startsWith(&a, "error") { failed = true }
+            append(mut &out, a)
+        }
+        return Err(sqldialect.inputError("rolled back"))
+    })
+    if failed { append(mut &out, one(c, &parts[len(parts) - 1])) }
+    return strings.join(&out, " / ")
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            let text: str = QS
+            for q in strings.lines(&text) {
+                let a = c.run(&("set lexdb_batch = off".toStr()), &[])
+                let off = answer(mut &c, &q)
+                let b = c.run(&("set lexdb_batch = on".toStr()), &[])
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(160), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

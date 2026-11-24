@@ -13035,8 +13035,7 @@ MERGE's subqueries read the rows as the statement found them in all three doors 
 first connection (lexdb-oracle.md section 22: `CREATE TABLE city` no longer meets the PostgreSQL door's `public.city`, `sa.t` is found); a package's public variables and
 constants are read and assigned from PL/SQL outside the package, per session, with ORA-04068 for a call into a package another session made again (lexdb-oracle.md, "As built:
 package variables"); a uniqueidentifier converts to and from binary again, OUTPUT takes no subquery (10705), a text column of VALUES has the session's collation, OBJECTPROPERTY's
-TableHasNonclustIndex. Not done: PostgreSQL's bare-literal overflow (`SELECT 2147483647 + 1`: the check would cost every `v + 1` of an UPDATE by key instructions), recursive CTEs
-under LIMIT. Point statements (base a15b9a64, in process by `pt2.lxl`, 20,000 statements, `LXL_HASH_SEED=1`, two rounds): select 122,345.01 instructions both, INSERT 55,062,708.50 against 55,062,708.51 and .52, UPDATE by key 55,081,434.34 and .35 against .34 and .41 (the first form of MERGE's dry insert, a check in `insertOne`, cost one instruction an INSERT and went to `conflictOf` and `upsertOld`); over the wire (`icount6.sh`, 3 passes, alternated twice) instructions 170,817 and 170,994 against 170,813 and 170,671, cycles 97,796 and 97,855 against 95,328 and 96,219.
+TableHasNonclustIndex. Not done there, done in 9.143: PostgreSQL's bare-literal overflow, recursive CTEs under LIMIT. Point statements (base a15b9a64, in process by `pt2.lxl`, 20,000 statements, `LXL_HASH_SEED=1`, two rounds): select 122,345.01 instructions both, INSERT 55,062,708.50 against 55,062,708.51 and .52, UPDATE by key 55,081,434.34 and .35 against .34 and .41 (the first form of MERGE's dry insert, a check in `insertOne`, cost one instruction an INSERT and went to `conflictOf` and `upsertOld`); over the wire (`icount6.sh`, 3 passes, alternated twice) instructions 170,817 and 170,994 against 170,813 and 170,671, cycles 97,796 and 97,855 against 95,328 and 96,219.
 
 ### 9.142 QUALIFY and CHECK and foreign key constraints that are not enforced (lexdb-new-features.md 10.8)
 
@@ -13062,3 +13061,11 @@ MODIFY CONSTRAINT (`tns_unenforced`); pg_constraint.conenforced (new in the tabl
   others (ORA-12991). `lexdb_conerr.checkDropErr`.
 - **A column constraint written `NOT VALID` with NOT ENFORCED** (before or after it) is 42601 at VALID, as PostgreSQL 18's; a table constraint takes both
   (`lexdb_parse.notValidSince`: the NOT VALID is looked for in the tokens the constraint read, outside brackets).
+
+### 9.143 The second robustness slice (lexdb-robust.md, "The second slice")
+
+A recursive CTE under LIMIT, TOP or FETCH FIRST with a WHERE, a join, a left join or a derived table over it stops when the query has its rows (`lexdb_recprobe`,
+`probeRecursion`: the CTE made to a cap of rows, doubled until the query's levels keep enough; PostgreSQL 19 and SQL Server 2022 agree, Oracle's ORA-32044 is left), and a CTE read
+twice is made whole again (`limitRecursion` had limited the other use too). `SELECT 2147483647 + 1` and the like in a select list are 22003 (`lexdb_litint`; the T-SQL door's 8115 and the
+Oracle door's NUMBER are as before). An UPDATE of the SQL Server and Oracle doors tests only the checks that read a column it sets in every statement form (`laxRow`: the retry of the
+statement is gone). Oracle package variables are INTO and OUT targets (`Cx.target`). T-SQL `FORMAT` has the dates of 46 cultures. Tests: `exec_robust2`, `tds_robust2`, `tns_robust2`.

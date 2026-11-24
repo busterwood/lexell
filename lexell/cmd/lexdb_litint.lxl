@@ -1,0 +1,118 @@
+// lexdb_litint: PostgreSQL's arithmetic of integer literals, checked as the parser builds it (design/lexdb-robust.md, "Bare-literal overflow").
+// In PostgreSQL a literal is an integer (int4) when it fits one, else a bigint, and `2147483647 + 1` is two integers added: 22003 "integer
+// out of range", `9223372036854775807 + 1` a bigint's "bigint out of range", `-2147483648 - 1` (a negated literal is a literal) and
+// `46341 * 46341` the same, `2147483647 + 1::bigint` and `2147483647 + 1.0` are not (a bigint, a number). The parser asks here for a select list's
+// expressions (lexdb_parse.itemListAssign): once, as the statement is read, and only for an item that is not a column. The T-SQL door's literals are checked by its
+// own typing (8115) and the Oracle door's NUMBER literals have no range.
+import "./lexdb_base"
+import "./lexdb_sql"
+
+type Expr = lexdb_sql.Expr
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+
+// An integer constant: its value and its type, 4 for an int4, 8 for a bigint.
+type Cv = value record { n: int; k: int }
+
+fn kindOf(n: int): int { return if n >= -2147483648 && n <= 2147483647 { 4 } else { 8 } }
+
+// The value of x if it is a literal, a negated literal or + - * of such: those are what PostgreSQL folds as it reads them.
+fn value(x: &Expr): Option[Cv] {
+    match x {
+        Expr.Lit(v) {
+            match v {
+                Val.Int(n) { return Some(Cv{n: n, k: kindOf(n)}) }
+                else { return None }
+            }
+        }
+        Expr.Unary(op, a) {
+            if op != "-" { return None }
+            // (a literal: PostgreSQL negates the constant, whose type is then that of the result; -2147483648 is an integer)
+            match a {
+                Expr.Lit(v) {
+                    match v {
+                        Val.Int(n) {
+                            match (0).checkedSub(n) {
+                                Some(m) { return Some(Cv{n: m, k: kindOf(m)}) }
+                                None { return None }
+                            }
+                        }
+                        // (-9223372036854775808: a number as the lexer reads it, a bigint as PostgreSQL's negated constant)
+                        Val.Num(_) {
+                            if lexdb_sql.text(&v) == "9223372036854775808" { return Some(Cv{n: -9223372036854775807 - 1, k: 8}) }
+                            return None
+                        }
+                        else { return None }
+                    }
+                }
+                else { return None }
+            }
+        }
+        Expr.Bin(op, a, b) {
+            match value(a) {
+                Some(l) {
+                    match value(b) {
+                        Some(r) {
+                            match apply(op, l, r) {
+                                Ok(c) { return c }
+                                Err(_) { return None }
+                            }
+                        }
+                        None { return None }
+                    }
+                }
+                None { return None }
+            }
+        }
+        else { return None }
+    }
+}
+
+// l op r as PostgreSQL's operators of those types: an int4's result must be an int4 (22003 "integer out of range"), a bigint's a bigint.
+fn apply(op: &str, l: Cv, r: Cv): Result[Option[Cv], DbErr] {
+    let k = if l.k == 8 || r.k == 8 { 8 } else { 4 }
+    var res: Option[int] = None
+    if op == "+" { res = l.n.checkedAdd(r.n) } else if op == "-" { res = l.n.checkedSub(r.n) } else if op == "*" { res = l.n.checkedMul(r.n) } else { return Ok(None) }
+    match res {
+        Some(m) {
+            if k == 4 && kindOf(m) == 8 { return Err(lexdb_base.err("22003", "integer out of range")) }
+            return Ok(Some(Cv{n: m, k: k}))
+        }
+        None { return Err(lexdb_base.err("22003", "bigint out of range")) }
+    }
+}
+
+// Whether l op r (op one of + - *) of integer constants overflows its type.
+pub fn check(op: &str, l: &Expr, r: &Expr): Result[Unit, DbErr] {
+    match value(l) {
+        Some(a) {
+            match value(r) {
+                Some(b) {
+                    let c = try apply(op, a, b)
+                    return Ok(Unit{})
+                }
+                None {}
+            }
+        }
+        None {}
+    }
+    return Ok(Unit{})
+}
+
+// Every + - * of integer constants in x (a select list's expression), checked: x itself, or under a sign, a cast, a call's arguments.
+pub fn walk(x: &Expr): Result[Unit, DbErr] {
+    match x {
+        Expr.Bin(op, a, b) {
+            try walk(&a)
+            try walk(&b)
+            return check(&op, &a, &b)
+        }
+        Expr.Unary(_, a) { return walk(&a) }
+        Expr.Cast(a, _) { return walk(&a) }
+        Expr.Call(_, args, _) {
+            for a in args { try walk(&a) }
+            return Ok(Unit{})
+        }
+        else { return Ok(Unit{}) }
+    }
+}

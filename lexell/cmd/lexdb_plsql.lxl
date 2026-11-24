@@ -440,6 +440,7 @@ type Cx = record {
     colScope: []str         // the columns of the tables of the statement being rendered: a name among them is not a variable's (Oracle's scope)
     noSubA: int             // tokens noSubA..noSubB are not substituted (an INSERT's column list)
     noSubB: int
+    post: []P               // K_PVSETs of the statement being compiled: a package variable it takes as a target (INTO, OUT) is set from a slot after it
 }
 
 fn (cx: &Cx) tk(i: int): Tok { return cx.toks[min(i, len(cx.toks) - 1)].clone() }
@@ -1443,6 +1444,31 @@ fn (cx: mut &Cx) target(i: int): Result[Tgt, DbErr] {
     }
     if !cx.ident(i) { return Err(cx.bad(i, "")) }
     let vi = cx.find(&t.up)
+    // a package's public variable (PKG.VAR, OWNER.PKG.VAR) as an INTO target or an OUT argument: the statement sets a slot of its own
+    // and a K_PVSET assigns it to the variable after the statement ran (cx.stmt), as Oracle copies an OUT value back at the call's end
+    if vi < 0 && t.kind == TK_ID && cx.isO(i + 1, ".") && cx.ident(i + 2) && cx.pvarAt(i) >= 0 {
+        var names: []str = [t.up.clone()]
+        var j = i
+        while cx.isO(j + 1, ".") && cx.ident(j + 2) && len(names) < 3 {
+            append(mut &names, cx.tk(j + 2).up)
+            j += 2
+        }
+        let pv = cx.pvarOf(&names)
+        if cx.sigs[pv].konst {
+            return Err(plErr("ORA06550", &("line " + t.line.toStr() + ", column " + t.col.toStr() + ":\nPLS-00363: expression '" + dotted(&names) + "' cannot be used as an assignment target" + cx.ignored())))
+        }
+        let tmp = cx.newSlot(cx.sigs[pv].ret)
+        var set = node(K_PVSET, t.line)
+        append(mut &set.names, cx.sigs[pv].owner.clone())
+        append(mut &set.names, cx.sigs[pv].pkg.clone())
+        set.ival = cx.sigs[pv].slot
+        set.sid = -1
+        var from = node(K_EXPR, t.line)
+        from.slot = tmp
+        append(mut &set.x, from)
+        append(mut &cx.post, set)
+        return Ok(Tgt{slot: tmp, n: 1, pt: cx.sigs[pv].ret, next: j + 1})
+    }
     if vi < 0 { return Err(cx.undeclared(i)) }
     let v = &cx.vars[vi]
     if v.konst {
@@ -1504,8 +1530,21 @@ fn (cx: mut &Cx) sqlNode(ip: mut &Ip, sess: mut &lexdb_exec.Session, a: int, b: 
     return Ok(n)
 }
 
-// A statement at cx.pos, with its label (loops).
+// A statement at cx.pos, with its label (loops). One that takes package variables as targets (cx.post) is a block of itself and the
+// assignments to them: they are made when it ran without an error.
 fn (cx: mut &Cx) stmt(ip: mut &Ip, sess: mut &lexdb_exec.Session, label: &str): Result[P, DbErr] {
+    let outer = replace(mut &cx.post, [])
+    let r = cx.stmt1(ip, sess, label)
+    let mine = replace(mut &cx.post, outer)
+    if len(mine) == 0 { return r }
+    var n = try r
+    var b = node(K_BLOCK, n.line)
+    append(mut &b.body, n)
+    for m in mine { append(mut &b.body, m) }
+    return Ok(b)
+}
+
+fn (cx: mut &Cx) stmt1(ip: mut &Ip, sess: mut &lexdb_exec.Session, label: &str): Result[P, DbErr] {
     let i = cx.pos
     let t = cx.tk(i)
     let line = t.line
@@ -2476,7 +2515,7 @@ fn (cx: mut &Cx) decls(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[[]P, 
 fn newCx(src: &str, toks: []Tok, owner: &str, nls: []str, sigs: []SigEntry, uid: int): Cx {
     var cx = Cx{src: src.toStr(), toks: toks, pos: 0, vars: [], marks: [], slotPt: [], recs: [], curs: [], excs: [], types: [], bindNames: [],
                 bindUse: [], bindSlot: [], nsid: 0, uid: uid, unit: "", owner: owner.toStr(), retPt: pt(PK_ANY), isFunc: false,
-                self: emptyUnit(), hasSelf: false, sigs: sigs, nls: nls, pkg: "", inMember: false, stopAtEnd: false, members: [], ranges: [], pubs: [], specMode: false, stmtLine: 1, stmtCol: 1, uses: false, hoistOk: true, colScope: [], noSubA: -1, noSubB: -1}
+                self: emptyUnit(), hasSelf: false, sigs: sigs, nls: nls, pkg: "", inMember: false, stopAtEnd: false, members: [], ranges: [], pubs: [], specMode: false, stmtLine: 1, stmtCol: 1, uses: false, hoistOk: true, colScope: [], noSubA: -1, noSubB: -1, post: []}
     append(mut &cx.slotPt, pt(PK_INT))
     append(mut &cx.slotPt, pt(PK_BOOL))
     append(mut &cx.slotPt, pt(PK_BOOL))

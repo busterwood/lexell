@@ -1,0 +1,79 @@
+# Wrong answers and gaps left by the documentation slices (KNOWN-ISSUES.md, second robustness slice), in the PostgreSQL door, against
+# PostgreSQL 19 (gen_pg.py ... robust2): a recursive CTE under a LIMIT that a filter, a join or a derived table stands between, integer
+# literals' arithmetic overflowing as PostgreSQL's int4 and int8. Each answer with its columns' names; each query runs with lexdb_batch off
+# and on ("@once" lines once, "@tx" ones in a transaction rolled back).
+
+@once create table rt (k int primary key, v text)
+@once insert into rt select g, 'v' || g from generate_series(1, 100) g
+@once create table nulls (a int, b int)
+@once insert into nulls values (1, null), (null, 2), (3, 3)
+
+# a recursive CTE under a LIMIT and a WHERE stops when the query has its rows
+with recursive n(i) as (select 1 union all select i + 1 from n) select i from n where i % 7 = 0 limit 3
+with recursive n(i) as (select 1 union all select i + 1 from n) select i from n where i % 7 = 0 limit 3 offset 2
+with recursive n(i) as (select 1 union all select i + 1 from n) select i from n where i % 7 = 0 fetch first 3 rows only
+with recursive n(i) as (select 1 union all select i + 1 from n) select i, i * 2 as d from n where i > 100 and i % 2 = 1 limit 2
+with recursive n(i) as (select 1 union all select i + 1 from n) select i from n where i % 7 = 0 limit 0
+with recursive n(i) as (select 1 union all select i + 1 from n) select i from n where i > 300 limit 1
+with recursive n(i) as (select 1 union all select i + 1 from n) select i from n where i > 3 limit 1 offset 70
+with recursive n(i) as (select 1 union all select i + 1 from n where i < 10) select i from n where i % 7 = 0 limit 3
+with recursive n(i) as (select 1 union all select i + 1 from n where i < 100) select i from n where i % 7 = 0 limit 30
+with recursive n(i) as (select 1 union select i + 1 from n) select i from n where i % 5 = 0 limit 3
+with recursive n(i, s) as (select 1, 'a' union all select i + 1, s || 'b' from n) select i, s from n where i % 4 = 0 limit 2
+with recursive n(i, x) as (select 1, 1 union all select i + 1, case when i % 2 = 0 then null else i end from n) select i, x from n where x is null limit 3
+# ... a join, a left join, a derived table, an outer aggregate over a limited query
+with recursive n(i) as (select 1 union all select i + 1 from n) select n.i, rt.v from n join rt on rt.k = n.i where n.i % 2 = 0 limit 3
+with recursive n(i) as (select 1 union all select i + 1 from n) select n.i, rt.v from n left join rt on rt.k = n.i where n.i % 50 = 0 limit 3
+with recursive n(i) as (select 1 union all select i + 1 from n) select n.i, rt.v from n, rt where rt.k = n.i and n.i > 98 limit 2
+with recursive n(i) as (select 1 union all select i + 1 from n) select i from (select i from n where i > 3) s limit 3
+with recursive n(i) as (select 1 union all select i + 1 from n) select j from (select i * 10 as j from n where i % 2 = 0) s where j > 100 limit 2
+with recursive n(i) as (select 1 union all select i + 1 from n) select count(*) from (select i from n where i % 7 = 0 limit 3) s
+with recursive n(i) as (select 1 union all select i + 1 from n) select sum(i) from (select i from n where i % 7 = 0 fetch first 4 rows only) s
+# ... a CTE read twice needs every row of the second read
+with recursive r(n) as (select 1 union all select n + 1 from r where n < 6) (select n from r where n > 1 limit 3) union all (select n from r)
+with recursive r(n) as (select 1 union all select n + 1 from r where n < 6), s as (select n from r) select (select count(*) from (select n from r where n > 2 limit 2) x), (select count(*) from s)
+# ... an error in a row the query does not read is not raised, in one it reads it is
+with recursive n(i) as (select 1 union all select case when i = 40 then 1 / (i - 40) else i + 1 end from n) select i from n where i % 7 = 0 limit 3
+with recursive n(i) as (select 1 union all select case when i = 40 then 1 / (i - 40) else i + 1 end from n) select i from n where i % 7 = 0 limit 7
+with recursive n(i) as (select 1 union all select i + 1 from n) select 100 / (30 - i) from n where i % 7 = 0 limit 4
+with recursive n(i) as (select 1 union all select i + 1 from n) select 100 / (30 - i) from n where i % 7 = 0 limit 5
+# ... the plain cases and the ones that need every row, as before
+with recursive n(i) as (select 1 union all select i + 1 from n) select i from n limit 3
+with recursive n(i) as (select 1 union all select i + 1 from n) select i from n where i > 5 limit 2 offset 1
+
+# integer literals' arithmetic is int4's, bigint's when a literal is past int4: 22003 out of range, as PostgreSQL's planner folds it
+select 2147483647 + 1
+select 2147483647 + 0
+select -2147483648 - 1
+select -2147483648 + 0
+select 2147483647 * 2
+select 46341 * 46341
+select 46340 * 46340
+select 1 + 2147483647 + 1
+select 2147483647 + 0 + 1
+select 2147483647 - -1
+select 1 - -2147483648
+select 3 * -715827883
+select 2147483648 + 1
+select 2147483647 + 1::bigint
+select 2147483647 + 1.0
+select 2147483647::bigint + 1
+select (2147483647 + 1)::bigint
+select 9223372036854775807 + 1
+select 9223372036854775807 * 2
+select -9223372036854775808 - 1
+select 9223372036854775807 - -1
+select 4611686018427387904 * 2
+select 4611686018427387904 + 4611686018427387903
+select 32767 + 1
+select 2147483647 + 1 where false
+select 2147483647 + 1 as x union all select 1
+select i from generate_series(1, 3) i where i + 2147483647 > 0
+select i + 1 from (select 2147483647 as i) s
+@once create table lit (id int primary key, v int)
+@once insert into lit values (1, 2147483647)
+@tx update lit set v = v + 1 where id = 1
+@tx update lit set v = 2147483647 + 1 where id = 1
+@tx insert into lit values (2, 2147483647 + 1)
+select id, v + 0 from lit where id = 1
+select 2147483647 - 1 + 1
