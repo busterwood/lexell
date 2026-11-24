@@ -27,7 +27,8 @@ TCP only. There is no separate listener process and no `listener.ora`: lexdb is 
 - **Transactions** as Oracle's: the first DML begins one, COMMIT or the driver's commit flag (autocommit) ends it,
   DDL commits the open transaction first, and a failed statement is undone alone (the transaction goes on).
 - **Result types.** Integers and numerics as NUMBER, `BINARY_DOUBLE`, `BINARY_FLOAT`, `BOOLEAN` (NUMBER(1) for
-  older clients), DATE, TIMESTAMP, TIMESTAMP WITH TIME ZONE, RAW, VARCHAR2, CLOB and BLOB.
+  older clients), DATE, TIMESTAMP, TIMESTAMP WITH TIME ZONE (with each value's offset: `OffsetDateTime` in JDBC),
+  RAW, VARCHAR2, CLOB and BLOB.
 - **Errors** are ORA- numbers: ORA-00942 for a missing table, ORA-00001 for a duplicate key, ORA-01400 for a NULL
   into a NOT NULL column. A failed statement in a session cursor gives ORA-01403 at its end, as Oracle does.
 

@@ -77,7 +77,8 @@ it.
 | ORA-01920 | A user or role name that is already taken. |
 | ORA-01922 | `DROP USER` of a user who owns objects, without `CASCADE`. |
 | ORA-01435 | `ALTER SESSION SET CURRENT_SCHEMA` to a user that does not exist. |
-| ORA-01821, ORA-01882 | A date format that is not one; a time zone region that does not exist. |
+| ORA-01821, ORA-01882 | A date format that is not one (or a time zone element on a value without a zone); a time zone region that does not exist. |
+| ORA-01857, ORA-01874, ORA-01875 | `NEW_TIME` of a zone that is not one of its abbreviations; a time zone hour beyond 15; a time zone minute beyond 59. |
 | ORA-02248 | An `ALTER SESSION` parameter that does not exist. |
 | ORA-16000 | A change on a read-only replica. |
 | ORA-08177 | A serialization failure: the transaction lost and must be retried. |
