@@ -52,7 +52,6 @@ CASE WHEN condition THEN result [ WHEN ... THEN ... ] [ ELSE result ] END
 ## Differences from Oracle
 
 - `LNNVL` and `NANVL` are not available.
-- `NVL(1, 'x')` is 1; Oracle converts the second argument to the first's type and gives ORA-01722.
 
 ## Examples
 
@@ -152,6 +151,8 @@ JUNIOR_PAY OTHERS
 
 ### E. A mixed-type NVL, and functions that are not available
 
+NVL converts the second argument to the first's type, as Oracle does: `'x'` is not a number, so ORA-01722.
+
 <!-- example: oracle -->
 ```sql
 SELECT NVL(1, 'x') FROM dual;
@@ -160,11 +161,8 @@ SELECT NANVL(1, 0) FROM dual;
 ```
 
 ```text
-NVL(1,'X')
-----------
-         1
-
-1 row selected.
+ERROR:
+ORA-01722: invalid number
 
 ERROR:
 ORA-00904: invalid identifier
