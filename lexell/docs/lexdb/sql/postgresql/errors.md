@@ -52,7 +52,7 @@ The codes are PostgreSQL's, with PostgreSQL's meaning. The first two characters 
 | Code | Name | Cause in lexdb |
 |---|---|---|
 | 22001 | string_data_right_truncation | A value too long for a `varchar(n)` or `char(n)` column. |
-| 22003 | numeric_value_out_of_range | An integer or `numeric` too large for its type or column. |
+| 22003 | numeric_value_out_of_range | An integer or `numeric` too large for its type or column, or an integer sum or product cast to `smallint` or `integer` that overflows. |
 | 22004 | null_value_not_allowed | A NULL where one is not allowed (`error_on_null`, `format('%I', NULL)`, a JSON key). |
 | 22007 | invalid_datetime_format | Text that does not read as a date or time. |
 | 22008 | datetime_field_overflow | A date or time field out of range (`'2026-02-30'`). |
@@ -66,7 +66,7 @@ The codes are PostgreSQL's, with PostgreSQL's meaning. The first two characters 
 | 2201F | invalid_argument_for_power_function | The square root of a negative number; a bad power. |
 | 2201G | invalid_argument_for_width_bucket_function | A bucket count below 1. |
 | 22023 | invalid_parameter_value | A bad argument or setting value (a precision out of range, an unknown `encode` format). |
-| 22P02 | invalid_text_representation | Text that does not read as the type (`'abc'::int`, a bad uuid, a malformed array). |
+| 22P02 | invalid_text_representation | Text that does not read as the type (`'abc'::int`, `1 = 'a'`, a bad uuid, a malformed array, a string that is not a label of an enum). |
 | 22P03 | invalid_binary_representation | A binary parameter of the wrong length. |
 | 22P04 | bad_copy_file_format | Missing or extra columns in a `COPY FROM` line. |
 
@@ -99,7 +99,7 @@ The codes are PostgreSQL's, with PostgreSQL's meaning. The first two characters 
 
 | Code | Name | Cause in lexdb |
 |---|---|---|
-| 2BP01 | dependent_objects_still_exist | `DROP` or `ALTER` of an object that others depend on, without `CASCADE`. |
+| 2BP01 | dependent_objects_still_exist | `DROP` or `ALTER` of an object that others depend on, without `CASCADE` (a sequence a column default calls, for one). |
 | 26000 | invalid_sql_statement_name | A prepared statement name the session does not have (extended protocol). |
 | 34000 | invalid_cursor_name | A portal name the session does not have (extended protocol). |
 | 3B001 | invalid_savepoint_specification | `ROLLBACK TO` or `RELEASE` of a savepoint that does not exist. |
@@ -127,7 +127,7 @@ The codes are PostgreSQL's, with PostgreSQL's meaning. The first two characters 
 | 42712 | duplicate_alias | A table name or alias used twice in `FROM`. |
 | 42725 | ambiguous_function | A call that more than one function matches. |
 | 42803 | grouping_error | A column that must be in `GROUP BY`; an aggregate where none is allowed. |
-| 42804 | datatype_mismatch | Values whose types cannot meet. |
+| 42804 | datatype_mismatch | Values whose types cannot meet: `CASE`, `COALESCE`, `GREATEST`, `UNION` or `VALUES` over a number and a boolean. |
 | 42809 | wrong_object_type | An object of the wrong kind (a view where a table is needed; `ANY` without an array). |
 | 42830 | invalid_foreign_key | A foreign key without a matching unique key, or with the wrong number of columns. |
 | 42846 | cannot_coerce | A cast lexdb does not have. |
@@ -139,7 +139,7 @@ The codes are PostgreSQL's, with PostgreSQL's meaning. The first two characters 
 | 42P07 | duplicate_table | A table, view, index or sequence that already exists. |
 | 42P10 | invalid_column_reference | An `ORDER BY` or `GROUP BY` position past the select list; a bad `ON CONFLICT` target. |
 | 42P13 | invalid_function_definition | `CREATE OR REPLACE FUNCTION` that changes the result type or a parameter's name. |
-| 42P16 | invalid_table_definition | Bad table options: `ON COMMIT` on a permanent table, a temporary table in a permanent schema. |
+| 42P16 | invalid_table_definition | Bad table options: `ON COMMIT` on a permanent table, a temporary table in a permanent schema, a second `PRIMARY KEY`. |
 | 42P17 | invalid_object_definition | A bad generated column. |
 | 42P19 | invalid_recursion | A misplaced recursive reference in `WITH RECURSIVE`. |
 | 42P20 | windowing_error | A bad window frame. |
