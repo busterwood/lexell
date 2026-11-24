@@ -1168,3 +1168,42 @@ written in branches and by compound assignment; floats; a record passed whole to
 function. These stay records: one copied whole and then written, one whose address is passed,
 a record field read whole and member by member, and a str field. It runs on --c, --native and
 -O, and the expected output is the previous compiler's.
+
+## 29. Live ranges that start at a local's first write (built, measured, not kept)
+
+The goal was the lists walk: `sum` saved four callee-saved registers a call, and two of them hold
+values that are never live across its call. One is the match result `t4`, declared without an
+initializer before the inner `if` and first written after the call. The other is the node pointer
+read only to build the call's argument.
+
+**What was built** (x64gen; the patch, its test and the measurements are kept in
+`~/Work/bench-results/2026-11-24-lazy-ranges`):
+
+- **Ranges.** A local declared without an initializer, outside any loop or marked fresh by cse,
+  starts its live range where it is first named after the declaration (`lazyAt`). It is put back
+  at the declaration when that first naming is in a loop the declaration is not in, since its
+  value may then go around the loop.
+- **Calls.** An integer local first set by `l = e;` has `defAt` there, as a declaration with an
+  initializer does, so a call in `e` doesn't cross it: genAssign writes the register last.
+- **The argument rule.** Treating a call's arguments as their locals' last use was not built.
+  The final load of the argument registers is in order, with no conflict handling, and the
+  non-direct arguments' code may use rsi and rdi. A quiet local read as an argument could be
+  overwritten first.
+
+`sum` went from four saved registers to three (`t4` in rsi).
+
+| measure (5dd010ef against this; perfsuite 4 placements, best of 3, CPU 2) | instructions | cycles |
+|---|---:|---:|
+| lists | -0.59% | -0.88% (apart) |
+| every other run-suite program, the apps | 0 | level |
+| run suite / compile suite | -0.04 / +0.07% | -0.08 / +0.20% |
+| TPC-H SF1, server instructions per query (22) | -0.01% geomean | |
+| lexdb point select (icount6, 2 rounds) | -0.06% | |
+
+**Why it was not kept.** It fails "Judging a pass": the run suite gains 0.08%.
+
+**What it showed about lists.** A register's save and restore are two instructions a call: about
+1% of the benchmark for each register. `sum` is 57% of lists' cycles, about 11.7 cycles a node,
+on the chain of dependent loads from one node to the next (about 5 cycles a level) and the call
+and return. The argument rule would take another 1%. Java's lead in lists (1.48) is not in the
+saved registers, so section 22's reading of it is corrected here.
