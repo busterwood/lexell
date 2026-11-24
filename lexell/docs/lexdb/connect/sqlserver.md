@@ -41,7 +41,8 @@ name).
   PostgreSQL door (`CREATE ROLE name LOGIN PASSWORD '...'`) or the Oracle door (`CREATE USER name IDENTIFIED BY ...`).
 - **Database.** `lexdb` or `master`, or none: they are the one database. Another name is refused, as SQL Server
   refuses a database that does not exist.
-- The default schema is `dbo`, which is the PostgreSQL door's `public`.
+- The default schema is `dbo`, which is the PostgreSQL door's `public`. Tables that an Oracle login made are in the
+  login's schema, with upper-case names: `sa.CITY` (see the [Oracle door's schemas](oracle.md#schemas)).
 
 ## Encryption
 
