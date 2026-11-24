@@ -21,6 +21,8 @@ SELECT [ ALL | DISTINCT ] select_list
     [ WHERE condition ]
     [ hierarchical_query_clause ]
     [ GROUP BY group_by_item [, ...] [ HAVING condition ] ]
+    [ WINDOW window_name AS ( window_spec ) [, ...] ]
+    [ QUALIFY condition ]
 
 select_list:
     { * | { table | alias }.* | expr [ [ AS ] alias ] } [, ...]
@@ -50,6 +52,10 @@ select_list:
 `GROUP BY`, `HAVING`
 : Groups the rows and filters the groups. See [GROUP BY](select-group-by.md).
 
+`WINDOW`, `QUALIFY`
+: `WINDOW` names window specifications for the analytic functions. `QUALIFY` keeps the rows for which a condition on
+  window functions is true. See [QUALIFY](qualify.md).
+
 *hierarchical_query_clause*
 : `START WITH` and `CONNECT BY`. See [Hierarchical queries](hierarchical-queries.md).
 
@@ -73,8 +79,9 @@ select_list:
 
 ## Remarks
 
-- The clauses are worked in this order: `FROM`, `WHERE`, `GROUP BY`, `HAVING`, the select list, `DISTINCT`, set
-  operators, `ORDER BY`, `OFFSET` and `FETCH`. `WHERE` cannot use a select-list alias; `ORDER BY` can.
+- The clauses are worked in this order: `FROM`, `WHERE`, `GROUP BY`, `HAVING`, the select list with its window
+  functions, `QUALIFY`, `DISTINCT`, set operators, `ORDER BY`, `OFFSET` and `FETCH`. `WHERE` cannot use a select-list alias;
+  `ORDER BY` and `QUALIFY` can.
 - `ROWNUM` numbers the rows as the query produces them, before `ORDER BY`. `WHERE ROWNUM <= n` (also `< n`, `= 1`)
   is a limit: with `ORDER BY` it takes the first n rows and sorts them. To take the top n of a sorted result, sort in
   an inline view and test `ROWNUM` outside, or use `FETCH FIRST`. `ROWNUM = 2` and `ROWNUM > 1` return no rows.
@@ -615,5 +622,5 @@ ORA-00918: column ambiguously defined
 
 ## See also
 
-[Joins](select-join.md) · [GROUP BY](select-group-by.md) · [Hierarchical queries](hierarchical-queries.md) · [WITH](with.md) ·
+[Joins](select-join.md) · [GROUP BY](select-group-by.md) · [QUALIFY](qualify.md) · [Hierarchical queries](hierarchical-queries.md) · [WITH](with.md) ·
 [MATCH_RECOGNIZE](match-recognize.md) · [INSERT](insert.md) · [UPDATE](update.md) · [DELETE](delete.md) · [MERGE](merge.md)

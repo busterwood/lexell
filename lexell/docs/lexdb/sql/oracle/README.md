@@ -13,6 +13,7 @@ Oracle. Each page names what lexdb lacks or does differently.
 | [SELECT](select.md) | Queries: select list and `DUAL`, `WHERE`, `ORDER BY`, `FETCH FIRST`, `ROWNUM`, set operations, `FOR UPDATE`. |
 | [Joins](select-join.md) | `JOIN ... ON` and `USING`, outer joins, the `(+)` marker, `LATERAL`. |
 | [GROUP BY](select-group-by.md) | Grouping, `ROLLUP`, `CUBE`, `GROUPING SETS`, `GROUP BY ALL`, `HAVING`. |
+| [QUALIFY](qualify.md) | Filters on window functions, after them: `QUALIFY ROW_NUMBER() OVER (...) = 1`; select aliases visible (26ai). |
 | [Hierarchical queries](hierarchical-queries.md) | `START WITH`, `CONNECT BY [NOCYCLE]`, `PRIOR`, `LEVEL`, `CONNECT_BY_ROOT`, `SYS_CONNECT_BY_PATH`, `ORDER SIBLINGS BY`. |
 | [WITH](with.md) | Subquery factoring, recursive `WITH`. |
 | [MATCH_RECOGNIZE](match-recognize.md) | Pattern matching over rows. |
