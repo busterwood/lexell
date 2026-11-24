@@ -57,7 +57,7 @@ column (+)                                  -- the outer join marker
   `IS NULL`, `LIKE`, `BETWEEN`, `IN`; `NOT`; `AND`; `OR`. Use brackets when in doubt.
 - A comparison is a condition, not a value: in a select list use `CASE WHEN ... THEN ... END`, or `TO_BOOLEAN`. A
   `BOOLEAN` column can be a condition on its own.
-- Comparing a string with a number in `WHERE` converts the string: `'12' = 12` is true, and `'abc' = 12` is
+- Comparing a string with a number (in `WHERE` or a `CASE WHEN`) converts the string: `'12' = 12` is true, and `'abc' = 12` is
   ORA-01722.
 - `NOT IN` with a NULL in the list is never true.
 
@@ -65,8 +65,6 @@ column (+)                                  -- the outer join marker
 
 - `IS [NOT] DISTINCT FROM` is a lexdb addition (Oracle 23ai has none).
 - `^=` (not equal) is ORA-00900. `%` works as a remainder and `**` is ORA-00900.
-- A comparison of a string with a number inside a `CASE WHEN` in a select list is ORA-00900 (example H); the same
-  comparison in `WHERE` converts the string.
 
 ## Examples
 
@@ -232,8 +230,11 @@ converted
 ERROR:
 ORA-01722: invalid number
 
-ERROR:
-ORA-00900: invalid SQL statement
+IN_A_CASE
+---------
+equal
+
+1 row selected.
 ```
 
 ### I. The outer join marker
