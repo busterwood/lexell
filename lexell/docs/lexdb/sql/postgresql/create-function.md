@@ -266,9 +266,9 @@ CREATE FUNCTION
      5.5 |     5.5
 (1 row)
 
- ?column?
-----------
-        4
+ int4
+------
+    4
 (1 row)
 ```
 
