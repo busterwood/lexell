@@ -32,9 +32,9 @@ This index lists everything the door takes today. Pages not written yet are list
 
 | Statement | What it does |
 |---|---|
-| [CREATE TABLE](create-table.md) | Tables: temporary and unlogged, constraints, identity, serial and generated columns. |
+| [CREATE TABLE](create-table.md) | Tables: temporary and unlogged, constraints (`NOT VALID`, `NOT ENFORCED`), identity, serial and generated columns. |
 | [CREATE TABLE AS](create-table-as.md) | A table from a query. |
-| [ALTER TABLE](alter-table.md) | Columns, constraints, types, defaults, identity, renames, `SET SCHEMA`, `OWNER TO`. |
+| [ALTER TABLE](alter-table.md) | Columns, constraints (`VALIDATE`, `ALTER CONSTRAINT [NOT] ENFORCED`), types, defaults, identity, renames, `SET SCHEMA`, `OWNER TO`. |
 | [DROP TABLE](drop-table.md) | |
 | [CREATE INDEX](create-index.md) | B-tree indexes, unique, on expressions, partial, `CONCURRENTLY`. |
 | [ALTER INDEX](alter-index.md), [DROP INDEX](drop-index.md) | Rename; drop. |

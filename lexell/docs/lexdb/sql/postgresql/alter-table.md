@@ -2,7 +2,7 @@
 
 Changes a table's columns, constraints, name or schema.
 
-**Door:** PostgreSQL. **Follows:** PostgreSQL 18.
+**Door:** PostgreSQL. **Follows:** PostgreSQL 18, and 19 for `ALTER CONSTRAINT ... ENFORCED`.
 
 ## Syntax
 
@@ -29,6 +29,7 @@ action:
     | ADD table_constraint
     | ADD [ CONSTRAINT constraint_name ] NOT NULL column_name
     | VALIDATE CONSTRAINT constraint_name
+    | ALTER CONSTRAINT constraint_name { ENFORCED | NOT ENFORCED }
     | DROP CONSTRAINT [ IF EXISTS ] constraint_name [ RESTRICT | CASCADE ]
 ```
 
@@ -74,7 +75,15 @@ action:
   applies to new rows only, until `VALIDATE CONSTRAINT`.
 
 `VALIDATE CONSTRAINT`
-: Checks a `NOT VALID` constraint against the rows, and marks it valid.
+: Checks a `NOT VALID` constraint against the rows, and marks it valid. A constraint that is `NOT ENFORCED` cannot
+  be validated (55000): make it `ENFORCED` first.
+
+`ALTER CONSTRAINT` ... `ENFORCED`, `NOT ENFORCED`
+: Changes whether a `CHECK` or `FOREIGN KEY` constraint is enforced. `ENFORCED` checks every row first, as `ADD`
+  does (a `CHECK` that a row fails is 23514, a foreign key 23503); if all pass, the constraint is enforced and valid.
+  `NOT ENFORCED` stops the checking of new and changed rows; the constraint is then also not valid. A constraint
+  that is in the state asked for is left as it is. A primary key, a unique constraint and a `NOT NULL` cannot
+  change: that is 42809.
 
 `DROP CONSTRAINT`
 : Removes a constraint, and the index of a unique or primary key.
@@ -96,12 +105,20 @@ action:
 - Adding, dropping or changing the primary key, and changing a column's type, rewrite the table: 1 million rows take
   some seconds (lexdb-gaps.md 2.2).
 - Inside a read-only transaction, and on a replica, `ALTER TABLE` gives 25006.
+- A constraint that is not enforced is kept in the catalog and can be renamed and dropped like any other. The state
+  shows in `pg_constraint.conenforced` and `convalidated`, in the text `pg_get_constraintdef` gives, and in
+  `information_schema.table_constraints.enforced` (see [Catalog: constraints](catalog-constraints.md)).
+- A foreign key that is not enforced does not check the table it refers to, and does not act on it: deleting the
+  parent row neither refuses (23503) nor cascades.
+- `ALTER CONSTRAINT` takes the name of a constraint of the table (42704 for another name).
 
 ## Differences from PostgreSQL
 
 - Not supported: `ALTER COLUMN ... SET STATISTICS` and `COLLATE` in `ALTER COLUMN ... TYPE` (42601); `SET ( storage_parameter )`, `ENABLE` and `DISABLE TRIGGER`, `CLUSTER ON`, `SET LOGGED`,
   `SET TABLESPACE`, `ATTACH` and `DETACH PARTITION`, `INHERIT`, row security, `REPLICA IDENTITY` (0A000, `lexdb:
   ALTER TABLE takes ADD, DROP, ALTER COLUMN, VALIDATE CONSTRAINT, RENAME and SET SCHEMA`).
+- `ALTER CONSTRAINT ... DEFERRABLE`, `INITIALLY DEFERRED` and `NOT DEFERRABLE` are 0A000 (`lexdb: ALTER
+  CONSTRAINT ... DEFERRABLE is not supported`); only `ENFORCED` and `NOT ENFORCED` are taken.
 - While a view reads the table, `DROP COLUMN` of any of its columns and `SET SCHEMA` are refused (2BP01, `cannot
   alter table t because view v depends on it (lexdb keeps a view's text: drop the view, then make it again)`).
   PostgreSQL refuses only the drop of a column the view uses, and moves the table with the view following it. A
@@ -311,7 +328,109 @@ ROLLBACK
 (1 row)
 ```
 
-### H. Errors
+### H. Constraints that are not enforced
+
+<!-- example: postgresql -->
+```sql
+CREATE TABLE team (id int PRIMARY KEY, name text);
+CREATE TABLE member (id int PRIMARY KEY, team_id int, age int,
+  CONSTRAINT member_age_ck CHECK (age >= 0) NOT ENFORCED,
+  CONSTRAINT member_team_fk FOREIGN KEY (team_id) REFERENCES team (id) NOT ENFORCED);
+INSERT INTO team VALUES (1, 'red');
+INSERT INTO member VALUES (1, 1, 30), (2, 7, -2);
+SELECT conname, conenforced, convalidated FROM pg_constraint
+WHERE conrelid = 'member'::regclass AND contype <> 'p' ORDER BY conname;
+```
+
+```text
+CREATE TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 2
+    conname     | conenforced | convalidated
+----------------+-------------+--------------
+ member_age_ck  | f           | f
+ member_team_fk | f           | f
+(2 rows)
+```
+
+Both rows were taken, though row 2 breaks both constraints. `ENFORCED` checks the rows first, and refuses while one
+breaks the constraint:
+
+<!-- example: postgresql -->
+```sql
+ALTER TABLE member ALTER CONSTRAINT member_age_ck ENFORCED;
+ALTER TABLE member ALTER CONSTRAINT member_team_fk ENFORCED;
+UPDATE member SET age = 0, team_id = 1 WHERE id = 2;
+ALTER TABLE member ALTER CONSTRAINT member_age_ck ENFORCED;
+ALTER TABLE member ALTER CONSTRAINT member_team_fk ENFORCED;
+INSERT INTO member VALUES (3, 9, 5);
+INSERT INTO member VALUES (3, 1, -1);
+```
+
+```text
+ERROR:  check constraint "member_age_ck" of relation "member" is violated by some row
+ERROR:  insert or update on table "member" violates foreign key constraint "member_team_fk"
+DETAIL:  Key (team_id)=(7) is not present in table "team".
+UPDATE 1
+ALTER TABLE
+ALTER TABLE
+ERROR:  insert or update on table "member" violates foreign key constraint "member_team_fk"
+DETAIL:  Key (team_id)=(9) is not present in table "team".
+ERROR:  new row for relation "member" violates check constraint "member_age_ck"
+```
+
+`NOT ENFORCED` lets the rows in again, and the constraint is not valid until it is enforced:
+
+<!-- example: postgresql -->
+```sql
+ALTER TABLE member ALTER CONSTRAINT member_age_ck NOT ENFORCED;
+INSERT INTO member VALUES (3, 1, -1);
+SELECT conname, pg_get_constraintdef(oid) AS definition, conenforced, convalidated FROM pg_constraint
+WHERE conrelid = 'member'::regclass AND contype <> 'p' ORDER BY conname;
+ALTER TABLE member ALTER CONSTRAINT member_age_ck ENFORCED;
+UPDATE member SET age = 1 WHERE id = 3;
+ALTER TABLE member ALTER CONSTRAINT member_age_ck ENFORCED;
+```
+
+```text
+ALTER TABLE
+INSERT 0 1
+    conname     |                definition                 | conenforced | convalidated
+----------------+-------------------------------------------+-------------+--------------
+ member_age_ck  | CHECK ((age >= 0)) NOT ENFORCED           | f           | f
+ member_team_fk | FOREIGN KEY (team_id) REFERENCES team(id) | t           | t
+(2 rows)
+
+ERROR:  check constraint "member_age_ck" of relation "member" is violated by some row
+UPDATE 1
+ALTER TABLE
+```
+
+While a foreign key is enforced, the parent row it refers to cannot be deleted. When it is not enforced, it can:
+
+<!-- example: postgresql -->
+```sql
+DELETE FROM team WHERE id = 1;
+ALTER TABLE member ALTER CONSTRAINT member_team_fk NOT ENFORCED;
+DELETE FROM team WHERE id = 1;
+SELECT id, team_id FROM member ORDER BY id;
+```
+
+```text
+ERROR:  update or delete on table "team" violates foreign key constraint "member_team_fk" on table "member"
+DETAIL:  Key (id)=(1) is still referenced from table "member".
+ALTER TABLE
+DELETE 1
+ id | team_id
+----+---------
+  1 |       1
+  2 |       1
+  3 |       1
+(3 rows)
+```
+
+### I. Errors
 
 <!-- example: postgresql -->
 ```sql
@@ -320,6 +439,11 @@ ALTER TABLE IF EXISTS nosuch ADD COLUMN x int;
 ALTER TABLE store.stock ADD PRIMARY KEY (name);
 ALTER TABLE store.stock SET (fillfactor = 50);
 ALTER TABLE store.stock OWNER TO postgres;
+ALTER TABLE member ALTER CONSTRAINT member_pkey NOT ENFORCED;
+ALTER TABLE member ALTER CONSTRAINT member_age_ck NOT DEFERRABLE;
+ALTER TABLE member ALTER CONSTRAINT nosuch ENFORCED;
+ALTER TABLE member ADD CONSTRAINT member_age_max CHECK (age < 150) NOT ENFORCED;
+ALTER TABLE member VALIDATE CONSTRAINT member_age_max;
 ```
 
 ```text
@@ -329,6 +453,12 @@ ALTER TABLE
 ERROR:  multiple primary keys for table "stock" are not allowed
 ERROR:  lexdb: ALTER TABLE takes ADD, DROP, ALTER COLUMN, VALIDATE CONSTRAINT, RENAME and SET SCHEMA
 ERROR:  role "postgres" does not exist
+ERROR:  cannot alter enforceability of constraint "member_pkey" of relation "member"
+HINT:  Only foreign key and check constraints can change enforceability.
+ERROR:  lexdb: ALTER CONSTRAINT ... DEFERRABLE is not supported
+ERROR:  constraint "nosuch" of relation "member" does not exist
+ALTER TABLE
+ERROR:  cannot validate NOT ENFORCED constraint
 ```
 
 ## See also
