@@ -21,7 +21,9 @@ FORMAT ( value, format [, culture ] ) → nvarchar
   An empty string gives the number's plain text, or for a date the `G` format.
 
 *culture*
-: `'en-US'` (the default) or `'de-DE'` (also `'de'`). Any other name is read as `en-US`.
+: `'en-US'` (the default), `'en-GB'`, `'de-DE'`, `'fr-FR'`, `'es-ES'`, `'it-IT'`, `'nl-NL'`, `'pt-BR'`, `'ja-JP'` or
+  `'sv-SE'` (also the language alone, such as `'de'`). Any other name is read as `en-US`. The cultures give dates their
+  month and day names, patterns, separators and AM or PM; the separators and currency of numbers follow `de-DE` only.
 
 ## Remarks
 
@@ -62,15 +64,18 @@ text in quotes or after `\`; any other character as it is.
 
 ## Differences from SQL Server
 
-- The culture `de-DE` changes the separators of numbers (`1.234.567,89`, currency `1.234,50 €`, percentage `25,6 %`),
-  but not dates: month and day names stay English and the standard date formats keep the `en-US` patterns (`FORMAT(@d,
-  'd', 'de-DE')` is `3/5/2026`; SQL Server gives `05.03.2026`). A custom pattern such as `dd.MM.yyyy` works. Other
-  cultures are read as `en-US`.
+- **Numbers follow `en-US` and `de-DE` only.** `de-DE` gives `1.234.567,89`, currency `1.234,50 €` and percentage
+  `25,6 %`; in every other culture the number formats are `en-US`'s (`FORMAT(1234567.891, 'N2', 'fr-FR')` is
+  `1,234,567.89`; SQL Server gives `1 234 567,89`).
+- A culture name SQL Server does not know is an error there; here it is read as `en-US`. Cultures other than the ten
+  above give the `en-US` patterns and names for dates too.
 - A custom numeric format with several sections is cut at the first `;`: `FORMAT(-5, '0;(0)')` is `-5` (SQL Server:
   `(5)`).
 - Literal characters between digit placeholders are dropped: `FORMAT(123456789, '###-##-####')` is `123456789`
   (SQL Server: `123-45-6789`).
-- `FORMAT` of a `time` value is NULL, whatever the format (example F).
+- `FORMAT` of a `time` value is formatted as a .NET `TimeSpan`: the standard formats `c`, `t`, `T`, `g` and `G` and a
+  custom format such as `hh\:mm` work, and any other standard letter is NULL (example F). The fraction has microsecond
+  precision (`14:07:09.1234570`).
 - Digits are rounded half away from zero, as .NET does.
 
 ## Examples
@@ -168,32 +173,57 @@ iso        day_first         long_form              short_names twelve_hour mill
 ```sql
 SELECT FORMAT(CAST('2026-03-05' AS date), 'dd MMM yyyy') AS from_date, FORMAT(CAST('2026-03-05' AS datetime), 'yyyyMMdd') AS from_datetime,
        FORMAT(CAST(NULL AS int), 'N2') AS null_value, FORMAT(5, CAST(NULL AS varchar(5))) AS null_format,
-       FORMAT(5, '') AS empty_format, FORMAT(CAST('14:07:09' AS time), 'hh\:mm') AS from_time;
+       FORMAT(5, '') AS empty_format, FORMAT(CAST('14:07:09' AS time), 'hh\:mm') AS from_time,
+       FORMAT(CAST('14:07:09' AS time), 'c') AS time_c, FORMAT(CAST('14:07:09' AS time), 'd') AS time_d;
 ```
 
 ```text
-from_date   from_datetime null_value null_format empty_format from_time
------------ ------------- ---------- ----------- ------------ ---------
-05 Mar 2026 20260305      NULL       NULL        5            NULL
+from_date   from_datetime null_value null_format empty_format from_time time_c   time_d
+----------- ------------- ---------- ----------- ------------ --------- -------- ------
+05 Mar 2026 20260305      NULL       NULL        5            14:07     14:07:09 NULL
 
 (1 row affected)
 ```
 
-### G. Dates in the de-DE culture
+### G. Dates in other cultures
 
-Only a custom pattern is followed; month and day names and the standard patterns stay English.
+The names, patterns and separators of the culture are used: the standard formats `d`, `D`, `f`, `t`, `G` and the month
+and day names.
 
 <!-- example: tsql -->
 ```sql
 DECLARE @d datetime2 = '2026-03-05 14:07:09.123';
 SELECT FORMAT(@d, 'd', 'de-DE') AS standard_d, FORMAT(@d, 'D', 'de-DE') AS standard_long,
        FORMAT(@d, 'dd.MM.yyyy', 'de-DE') AS custom, FORMAT(@d, 'MMMM', 'de-DE') AS month_name;
+SELECT FORMAT(@d, 'd', 'en-GB') AS en_gb, FORMAT(@d, 'd', 'fr-FR') AS fr_fr, FORMAT(@d, 'd', 'nl-NL') AS nl_nl,
+       FORMAT(@d, 'd', 'ja-JP') AS ja_jp, FORMAT(@d, 'd', 'sv-SE') AS sv_se;
+SELECT FORMAT(@d, 'D', 'fr-FR') AS fr_long, FORMAT(@d, 'D', 'es-ES') AS es_long, FORMAT(@d, 'D', 'ja-JP') AS ja_long,
+       FORMAT(@d, 'MMMM', 'it-IT') AS it_month, FORMAT(@d, 'dddd', 'nl-NL') AS nl_day;
+SELECT FORMAT(@d, 'f', 'en-GB') AS gb_f, FORMAT(@d, 'G', 'sv-SE') AS sv_g, FORMAT(@d, 'd', 'xx-XX') AS unknown_culture;
 ```
 
 ```text
-standard_d standard_long           custom     month_name
----------- ----------------------- ---------- ----------
-3/5/2026   Thursday, March 5, 2026 05.03.2026 March
+standard_d standard_long            custom     month_name
+---------- ------------------------ ---------- ----------
+05.03.2026 Donnerstag, 5. März 2026 05.03.2026 März
+
+(1 row affected)
+
+en_gb      fr_fr      nl_nl    ja_jp      sv_se
+---------- ---------- -------- ---------- ----------
+05/03/2026 05/03/2026 5-3-2026 2026/03/05 2026-03-05
+
+(1 row affected)
+
+fr_long           es_long                    ja_long   it_month nl_day
+----------------- -------------------------- --------- -------- ---------
+jeudi 5 mars 2026 jueves, 5 de marzo de 2026 2026年3月5日 marzo    donderdag
+
+(1 row affected)
+
+gb_f                sv_g                unknown_culture
+------------------- ------------------- ---------------
+05 March 2026 14:07 2026-03-05 14:07:09 3/5/2026
 
 (1 row affected)
 ```
