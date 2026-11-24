@@ -105,7 +105,6 @@ cut to the length of the target type.
 - A `datetime` column takes PostgreSQL's special strings: `INSERT ... VALUES ('tomorrow')` is accepted.
 - **A literal in E notation is a `decimal`:** `5 / 2.0E0` is `2.500000` (SQL Server: the float 2.5), and `1 + 1.5E0`
   has type `decimal` in the catalog. Use `CAST(x AS float)` to make a float.
-- `DECLARE @d decimal(5, 2) = 10; SELECT 1 + @d / 100` gives the integer 1: see [KNOWN-ISSUES](../../KNOWN-ISSUES.md).
 - A `decimal` result from arithmetic has precision 38 and scale 6 in the catalog and in the driver, where SQL Server
   works out smaller ones; the values print with 6 decimals (`10 / 4.0` is `2.500000`).
 - `SQL_VARIANT_PROPERTY` does not exist, and `sql_variant` is only a name for a plain value. To see a result type, use a view and `sys.columns`
@@ -381,7 +380,7 @@ date/time field value out of range: "2026-13-45"
 Msg 241, Level 16, State 1, Line 1
 Conversion failed when converting date and/or time from character string.
 Msg 8115, Level 16, State 1, Line 1
-integer out of range
+Arithmetic overflow error converting expression to data type int.
 Msg 8115, Level 16, State 1, Line 1
 numeric field overflow: a field with precision 4, scale 0 must round to an absolute value less than 10^4
 Msg 8115, Level 16, State 1, Line 1
