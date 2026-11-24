@@ -131,7 +131,7 @@ GO
 Msg 512, Level 16, State 1, Line 2
 Subquery returned more than 1 value. This is not permitted when the subquery follows =, !=, <, <= , >, >= or when the subquery is used as an expression.
 Msg 8115, Level 16, State 1, Line 3
-integer out of range
+Arithmetic overflow error converting expression to data type int.
 m    i
 ---- ----------
 1.00 2147483647
