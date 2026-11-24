@@ -1216,8 +1216,19 @@ fn (c: &Conn) seqMissing(e: &DbErr, cursor: int): bool {
     return strings.contains(&q, &(nm + ".nextval")) || strings.contains(&q, &(nm + ".currval"))
 }
 
+// A statement of its own that reads a package's variable (invalid identifier here): ORA-06553, PLS-221.
+fn (c: &Conn) pkgVarErr(x: OraErr, cursor: int): OraErr {
+    if x.num != 904 || cursor <= 0 { return x }
+    let ci = c.find(cursor)
+    if ci < 0 { return x }
+    match lexdb_plsql.pkgVarIn(&c.prog, &c.cursors[ci].sql) {
+        Some(v) { return OraErr{num: 6553, text: "PLS-221: '" + v + "' is not a procedure or is undefined"} }
+        None { return x }
+    }
+}
+
 fn (c: mut &Conn) fail(e: &DbErr, cursor: int) {
-    var x = c.oraErr(e)
+    var x = c.pkgVarErr(c.oraErr(e), cursor)
     if c.seqMissing(e, cursor) { x = OraErr{num: 2289, text: "sequence does not exist"} }
     c.endCall(x.num, &(oraText(x.num, &x.text)), cursor, 0)
 }
@@ -2146,7 +2157,7 @@ fn (c: mut &Conn) execute(rq: &Req) {
     var runs = c.runCursor(i, kind, &params, &ptypes, (rq.options & OPT_COMMIT) != 0, rq.batchErrors && !query)
     match runs.failed {
         Some(e) {
-            var x = c.oraErr(&e)
+            var x = c.pkgVarErr(c.oraErr(&e), id)
             if c.seqMissing(&e, id) { x = OraErr{num: 2289, text: "sequence does not exist"} }
             let jj = c.find(id)
             if x.num == 1400 && jj >= 0 && (strings.startsWith(&strings.toLowerAscii(&(strings.trim(&c.cursors[jj].sql))), "update") || e.context == "update") {

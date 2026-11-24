@@ -1,0 +1,100 @@
+// lexdb over TNS: a package's variables are per session (design/lexdb-robust.md, "Package variables"), checked by hand against Oracle Database Free 23.26 (two
+// python-oracledb sessions, the same statements): a session's first use runs the package body's initialisation section, so a second session reads the initial
+// value, not the first's; the session that makes the body again starts afresh without a word; another session's next call into the package is ORA-04068 once
+// (the state is discarded, the call after it runs on a fresh one); a variable read or assigned from outside takes the state as it is (no error, the old
+// value stays) until a call finds it discarded.
+// expect: A set: 0
+// expect: B first: 5
+// expect: A: 50
+// expect: B bump: 0
+// expect: B after bump: 6
+// expect: A again: 50
+// expect: A after its own recompile: 7
+// expect: B variable after recompile: 6
+// expect: B bump, state discarded: error 4068
+// expect: B bump again: 0
+// expect: B fresh: 9
+// expect: B variable, stale: 9
+// expect: from SQL: error 6553
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(&(s.toStr())) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+fn err(r: Result[int, oracle.Error]): str {
+    match r {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// pz.g, read by a block into t's one row, and that row
+fn readG(c: mut &oracle.Conn): str {
+    let r = c.run("begin delete from t; insert into t values (pz.g); commit; end;", &[])
+    if r.isErr() { return "error " + r.unwrapErr().code.toStr() }
+    match c.query("select a from t", &[]) {
+        Ok(rows) { return rows.value(0, 0).unwrap().toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn say(label: &str, what: &str) { println(label + ": " + what) }
+
+fn client(port: &str) {
+    let dsn = "127.0.0.1:" + port + "/lexdb"
+    var a = connect(&("User Id=sa;Password=sa;Data Source=" + dsn))
+    var b = connect(&("User Id=sa;Password=sa;Data Source=" + dsn))
+    a.exec("create table t (a number)").unwrap()
+    a.exec("create or replace package pz as g number := 0; procedure bump; end pz;").unwrap()
+    a.exec("create or replace package body pz as procedure bump is begin g := g + 1; end; begin g := 5; end pz;").unwrap()
+    say("A set", err(a.run("begin pz.g := 50; end;", &[])))
+    say("B first", readG(mut &b))
+    say("A", readG(mut &a))
+    say("B bump", err(b.run("begin pz.bump; end;", &[])))
+    say("B after bump", readG(mut &b))
+    say("A again", readG(mut &a))
+    a.exec("create or replace package body pz as procedure bump is begin g := g + 2; end; begin g := 7; end pz;").unwrap()
+    say("A after its own recompile", readG(mut &a))
+    say("B variable after recompile", readG(mut &b))
+    say("B bump, state discarded", err(b.run("begin pz.bump; end;", &[])))
+    say("B bump again", err(b.run("begin pz.bump; end;", &[])))
+    say("B fresh", readG(mut &b))
+    a.exec("create or replace package body pz as procedure bump is begin g := g + 3; end; begin g := 8; end pz;").unwrap()
+    say("B variable, stale", readG(mut &b))
+    match b.query("select pz.g from dual", &[]) {
+        Ok(_) { say("from SQL", "rows") }
+        Err(e) { say("from SQL", "error " + e.code.toStr()) }
+    }
+    a.logoff()
+    b.logoff()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(167), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}
