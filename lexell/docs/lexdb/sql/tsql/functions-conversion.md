@@ -75,30 +75,26 @@ cut to the length of the target type.
 - A decimal is rounded to the target scale (`CAST(12.345 AS decimal(5, 2))` is 12.35), an integer from a decimal is
   cut towards zero (`CAST(-3.99 AS int)` is -3).
 - A conversion of NULL gives NULL.
+- A number out of `tinyint`'s range (0 to 255) is error 220 for `CAST` and `CONVERT`, and NULL for `TRY_CAST`; a string
+  out of range is error 244.
+- `char(n)` and `nchar(n)` are padded with blanks to *n* characters by every conversion to them: `'[' + CONVERT(char(8),
+  12) + ']'` is `[12      ]`.
+- Binary values: `CAST(0x6869 AS varchar(10))` gives `hi`, the bytes as characters; `CONVERT(varchar(10), 0x6869, 1)`
+  gives `0x6869` and style 2 `6869`; `CONVERT(varbinary(10), '6869', 2)` reads the hexadecimal text. See
+  [Binary types](data-types-binary.md).
 - A string given to a date type is read in ISO form: `2026-03-05`, `2026-03-05 14:07:09`, `2026-03-05T14:07:09.123`.
 - `CAST` of a `bit` accepts the strings `'true'`, `'false'` and `'0'`, `'1'`; any non-zero number is 1.
 
 ## Differences from SQL Server
 
-- **Only the date styles above work.** The style of a conversion to a number or from a string is read and ignored:
+- **Only the date styles above work.** The style of a conversion to a number or from a string is read and ignored (a binary value's styles 1 and 2 work):
   `CONVERT(date, '05/03/2026', 103)` and `CONVERT(date, '20260305', 112)` are error 241, and `CONVERT(varchar(20),
   CAST(1234.5678 AS money), 1)` is `1234.5678`, as style 0 is (SQL Server: `1,234.57` and `1234.57`).
   `TRY_CONVERT(date, '05/03/2026', 103)` is NULL. The styles 9, 13, 14, 22, 109, 113, 114 and the others of SQL Server
   not in the table are error 281.
-- **Binary styles do not work.** `CONVERT(varchar(10), CAST('hi' AS varbinary(10)), 1)` gives `\x6869` (SQL Server:
-  `0x6869`), and style 2 gives the same; `CONVERT(varbinary(10), '6869', 2)` gives the bytes of the text `6869` and
-  not 0x6869 (example F). `CAST(varbinary AS varchar)` gives the hex text too (SQL Server: the bytes as characters).
-- **Hex literals are numbers.** `SELECT 0x00ff` is `255`, and `CAST(0x00ff AS varbinary(2))` is error 50000. SQL
-  Server's `0x00ff` is a `binary(2)`. Make binary values from strings: `CAST('hi' AS varbinary(10))`.
-- **`tinyint` has no range:** `CAST(300 AS tinyint)` is 300 (SQL Server: error 8115),
-  and `TRY_CAST(300 AS tinyint)` is 300 (SQL Server: NULL). `smallint` and `int` are checked. `TRY_CAST('12' AS
-  decimal(2, 0))` is 12 (SQL Server: NULL).
+- `TRY_CAST('12' AS decimal(2, 0))` is 12 (SQL Server: NULL).
 - `CAST(x AS varchar)` without a length is not cut at 30 characters, where SQL Server cuts it.
 - `CAST(0 AS datetime)` is error 50000 (SQL Server: 1900-01-01). Numbers do not convert to dates.
-- `datetime + 1` and `datetime + 0.5` are error 195 (SQL Server adds days); use `DATEADD`. `date + 1` works here
-  (SQL Server: error 206).
-- A value `CAST` to `char(n)` is not padded with spaces: `'[' + CONVERT(char(8), 12) + ']'` is `[12]`
-  (SQL Server: `[12      ]`).
 - In a comparison of a
   string column with a number (`WHERE s = 12`) lexdb gives error 195 (`operator does not exist`), where SQL Server
   converts the column and fails with 245.
@@ -220,7 +216,7 @@ Msg 241, Level 16, State 1, Line 1
 Conversion failed when converting date and/or time from character string.
 ```
 
-### F. Styles that lexdb ignores: money and binary
+### F. Styles: money is ignored, binary styles are read
 
 <!-- example: tsql -->
 ```sql
@@ -232,7 +228,7 @@ SELECT CONVERT(varchar(20), CAST(1234.5678 AS money), 0) AS money_0, CONVERT(var
 ```text
 money_0   money_1   binary_1 binary_2 from_hex_text bytes
 --------- --------- -------- -------- ------------- -----
-1234.5678 1234.5678 \x6869   \x6869   36383639      6869
+1234.5678 1234.5678 0x6869   6869     6869          6869
 
 (1 row affected)
 ```
