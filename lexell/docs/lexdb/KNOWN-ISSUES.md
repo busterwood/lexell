@@ -463,9 +463,7 @@ smaller differences of its statement.
   - `NLS_NUMERIC_CHARACTERS` and `NLS_LANGUAGE` do not change `TO_CHAR` of numbers or messages;
     `SYS_CONTEXT('USERENV', 'NLS_CURRENCY')` is `$` until a territory is set.
   - PL/SQL: records, subtypes, exceptions and collections in a package are not supported (scalar variables and
-    constants are read and assigned from outside, and a variable is an `INTO` or `OUT` target); `SELECT pkg.f() FROM
-    dual` of a function that reads a package variable is a constant of the cached plan: a second call after the
-    variable is assigned gives the first answer; a package specification that declares procedures or functions needs its body
+    constants are read and assigned from outside, and a variable is an `INTO` or `OUT` target); a package specification that declares procedures or functions needs its body
     (a call is PLS-00201 without it); a function without parameters needs brackets in SQL (`SELECT f FROM dual` is ORA-00904); `CALL f()` of
     a function is PLS-00201; `TO_NUMBER('abc')` raises `VALUE_ERROR`, not `INVALID_NUMBER`; `LOCK TABLE` in a block,
     `GOTO`, `FORALL` and collections are refused.
