@@ -1,7 +1,7 @@
 # Known issues
 
 Bugs and gaps found while writing and checking these pages (lexdb built from main at 4fba817b, 2026-11-23; the entries
-that main ca687450 and a15b9a64, 2026-11-24, fixed are removed or reworded to what is left). They are not fixed here: the pages
+that main ca687450, a15b9a64 and 02646472, 2026-11-24, fixed are removed or reworded to what is left). They are not fixed here: the pages
 describe what lexdb does. Each "Differences" section of the reference lists the
 smaller differences of its statement.
 
@@ -13,10 +13,6 @@ smaller differences of its statement.
   - Oracle door: `CREATE GLOBAL TEMPORARY TABLE` on a replica is ORA-16000, as on a standby, and DML on a global
     temporary table is not available there: Active Data Guard allows it for a table the primary defined, but in
     lexdb no such definition reaches a replica's session (see the Oracle door's entry below).
-
-- **MERGE reads its own changes.** A subquery in a `WHEN` clause of `MERGE` sees the rows the statement has already
-  changed, where `UPDATE` and `DELETE` now read the table as the statement found it (Oracle door, checked: a chain of
-  managers doubles a salary the same `MERGE` has just changed). Planned in design/lexdb-robust.md, "MERGE's subqueries".
 
 ## PostgreSQL door
 
@@ -234,8 +230,6 @@ smaller differences of its statement.
 - **Queries and DML** (found writing the T-SQL query pages):
   - `AVG(x) OVER (...)` is error 50000 (`column ... must appear in the GROUP BY clause`); `SUM`, `MIN`, `MAX` and
     `COUNT` with `OVER` work. `COUNT_BIG(*) OVER (...)` is 195.
-  - A `VALUES` derived table's strings conflict on collation when joined to a column: 468 "Cannot resolve the
-    collation conflict between "SQL_Latin1_General_CP1_CI_AS" and "default"" (`COLLATE DATABASE_DEFAULT` avoids it).
   - `TRUNCATE TABLE` does not reset the `IDENTITY` (the next id goes on; SQL Server starts again at the seed).
   - Views are read-only (50000), and a CTE cannot be the target of `UPDATE`, `DELETE` or `MERGE` (208).
   - `SELECT INTO` loses column attributes: `nvarchar(30)` becomes `nvarchar(max)`, a decimal gets wider, `NOT NULL`
@@ -359,9 +353,7 @@ smaller differences of its statement.
 
 - **Data types, functions and catalog** (found writing the T-SQL phase 3 pages):
   - **Binary:** `0x00 = 0x0000` is false (SQL Server pads the shorter value); `CAST(0x41 AS bit)` is 50000; a
-    `varbinary` variable in an expression (`@v + 0x43`) is 195; `HASHBYTES` does not exist. **Regression:**
-    `CAST(NEWID() AS varbinary(16))` and any `uniqueidentifier` cast to `varbinary` is error 529 (it gave the 16 bytes
-    before main a15b9a64).
+    `varbinary` variable in an expression (`@v + 0x43`) is 195; `HASHBYTES` does not exist.
   - **Ranges and casts:** `smallmoney` takes up to 999999.9999; `TRY_CAST('12' AS decimal(2,0))` is not NULL;
     `CAST('yes' AS bit)` is 1; `SUM` of `int` does not overflow; `CAST(0 AS datetime)` is 50000.
   - **Character:** `DECLARE @n varchar = 'abcdef'` and `CAST(x AS varchar)` keep every character; assigning a long
@@ -406,10 +398,6 @@ smaller differences of its statement.
   replica. In Oracle the definition is a schema object that every session sees, and only the rows are private to a
   session.
 
-- **A bare name finds a table of the PostgreSQL door's `public` schema, and blocks `CREATE TABLE` of that name.**
-  With a table `city` made in the PostgreSQL door, `CREATE TABLE city (...)` in the Oracle door (user `SA`) fails with
-  ORA-00955 "name is already used by an existing object", and `SELECT * FROM city` reads `public.city`. In Oracle a
-  public synonym does not stop a user from making an object of the same name in its own schema.
 - **Queries and DML** (found writing the Oracle query pages):
   - `ROWNUM` in a join with an aggregate or `GROUP BY` limits the groups, not the rows grouped (`SELECT COUNT(*) FROM
     emp e, dept d WHERE e.dept_id = d.id AND ROWNUM < 3` is 4; Oracle: 2). With one table in `FROM` it works.
@@ -425,7 +413,6 @@ smaller differences of its statement.
   - `FOR UPDATE OF e.name` (columns) is ORA-00942 (a table or alias works); `FOR UPDATE WAIT n` is ORA-00900;
     `FOR UPDATE` on an inline view is accepted.
   - `FETCH FIRST n PERCENT ROWS ONLY`, `SELECT UNIQUE`, `GROUPING_ID` and `GROUP_ID` are not supported.
-  - A table of the login `SA` is found as `public.t`, not `sa.t` (ORA-00942); `TRUNCATE TABLE sa.t` fails the same way.
   - Not supported (ORA-00900): `SAMPLE`, `AS OF`, `PIVOT`, `UNPIVOT`, `MODEL`, `XMLTABLE`, `JSON_TABLE`, a partitioned
     outer join, `UPDATE SET (a, b) = (SELECT ...)`, `UPDATE (subquery)`, `DELETE FROM (subquery)`, `LOG ERRORS`,
     `WHERE CURRENT OF`, `WITH FUNCTION`, `TRUNCATE ... DROP STORAGE`. Accepted although Oracle refuses them: `LIMIT n`,
@@ -452,9 +439,11 @@ smaller differences of its statement.
   - `SET TRANSACTION READ ONLY` does not stop changes; `ROLLBACK TO` an unknown savepoint is ORA-20000.
   - `ALTER SESSION SET NLS_NUMERIC_CHARACTERS` and `NLS_LANGUAGE` change nothing, and `NLS_SESSION_PARAMETERS` and
     `SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')` do not follow `ALTER SESSION`.
-  - PL/SQL: package variables and constants cannot be read from outside the package (`pay.g_count` is ORA-00904);
-    a function without parameters needs brackets in SQL (`SELECT f FROM dual` is ORA-00904); `CALL f()` of a function
-    is PLS-00201; `TO_NUMBER('abc')` raises `VALUE_ERROR`, not `INVALID_NUMBER`; `LOCK TABLE` in a block,
+  - PL/SQL: a package variable cannot be an `INTO` target or an `OUT` argument from outside the package, and a record
+    or collection variable of a package is not supported (scalar variables and constants are read and assigned from
+    outside); a package with only a specification and no body cannot be used: `cnt.n` is PLS-00201 (a body, even
+    one with a single procedure, makes it work); a function without parameters needs brackets in SQL (`SELECT f FROM dual` is ORA-00904); `CALL f()` of
+    a function is PLS-00201; `TO_NUMBER('abc')` raises `VALUE_ERROR`, not `INVALID_NUMBER`; `LOCK TABLE` in a block,
     `GOTO`, `FORALL` and collections are refused.
 - **Functions** (found writing the Oracle function pages):
   - **Character:** `LENGTHB` and `SUBSTRB` count characters (`LENGTHB('€')` is 1); `LENGTH(DATE ...)` is 19;
