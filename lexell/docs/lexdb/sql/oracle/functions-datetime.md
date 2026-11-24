@@ -113,7 +113,7 @@ are on the [conversion page](functions-conversion.md); the types are on the [dat
 - `SESSIONTIMEZONE` after `ALTER SESSION SET TIME_ZONE = '+02:00'` is `+02`; Oracle gives `+02:00`.
 - `EXTRACT(HOUR FROM DATE ...)` returns 0; Oracle refuses a `DATE` with a time field (ORA-30076). `QUARTER` and `DOW`
   are accepted by `EXTRACT`; Oracle does not know them.
-- `TIME_BUCKET` needs the *origin* argument and fails without it (example I); Oracle makes it optional.
+- `TIME_BUCKET` needs the *origin* argument and fails without it (ORA-00909, example I); Oracle makes it optional.
 - A `DATE` result is shown with a time of day; use `TO_CHAR` for a date alone. A timestamp is shown with its
   fraction (`2026-11-23 14:30:00.0`), an interval as `days hours:minutes:seconds`.
 - `CAST(TIMESTAMP '2026-11-23 14:05:09.9' AS DATE)` rounds the second (14:05:10); Oracle truncates the fraction.
@@ -399,7 +399,7 @@ QUARTER_HOUR BUCKET_END WEEK_BUCKET
 1 row selected.
 
 ERROR:
-ORA-00900: invalid SQL statement
+ORA-00909: invalid number of arguments
 ```
 
 ### J. DATEADD, DATEDIFF and TIMESTAMPDIFF
