@@ -86,11 +86,6 @@ constraint states mean.
   `ENABLE` and `VALIDATE` of one are accepted and do nothing. `DISABLE` or `NOVALIDATE` in the definition of a key
   or of `NOT NULL` is ORA-00900. `RELY` and `NORELY` are read and not kept (`USER_CONSTRAINTS.RELY` is empty).
   Oracle has no `NOT ENFORCED`; neither has lexdb (ORA-00900).
-- An `UPDATE` tests only the `CHECK` constraints that read a column it sets, as Oracle does, for a statement after the
-  door's statement savepoint (the second statement of a transaction, and each one after it). A plain single
-  autocommit `UPDATE`, and `MERGE`, test every `CHECK` of the row. This shows only for a row that breaks a constraint
-  that is not validated: there it fails when any of its columns is updated, where Oracle accepts an update of a
-  column the constraint does not read (example L).
 - `ALTER TABLE ... ALTER COLUMN` (T-SQL and PostgreSQL's form) is ORA-01735.
 
 ## Examples
@@ -596,8 +591,8 @@ ORA-01735: invalid ALTER TABLE option
 
 ### L. UPDATE and a constraint that is not validated
 
-Row 2 breaks `ck`, which is enabled and not validated. The first statement of a transaction tests every check of the
-row it updates; the statements after it test only the checks that read a column they set:
+Row 2 breaks `ck`, which is enabled and not validated. An `UPDATE` tests only the checks that read a column it sets,
+as Oracle does: in every statement of a transaction, the first included, and in `MERGE` too:
 
 <!-- example: oracle -->
 ```sql
@@ -610,6 +605,7 @@ UPDATE b SET pid = 2 WHERE id = 2;
 ROLLBACK;
 UPDATE b SET pid = 3 WHERE id = 1;
 UPDATE b SET pid = 4 WHERE id = 2;
+MERGE INTO b USING (SELECT 2 AS id FROM dual) s ON (b.id = s.id) WHEN MATCHED THEN UPDATE SET pid = 5;
 UPDATE b SET qty = -6 WHERE id = 2;
 ROLLBACK;
 ```
@@ -625,14 +621,15 @@ Commit complete.
 
 Table altered.
 
-ERROR:
-ORA-02290: check constraint violated
+1 row updated.
 
 Rollback complete.
 
 1 row updated.
 
 1 row updated.
+
+1 row merged.
 
 ERROR:
 ORA-02290: check constraint violated

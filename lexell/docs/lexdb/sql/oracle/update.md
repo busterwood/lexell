@@ -58,6 +58,9 @@ returning_clause:
 - A value is converted to its column's type, and constraints are checked: ORA-00001 (unique), ORA-01407 (a `NOT
   NULL` column set to NULL), ORA-02290 (check), ORA-02291 (no parent key), ORA-02292 (a parent key that has children),
   ORA-01438 (a number too large), ORA-12899 (a string too long).
+- An `UPDATE` tests only the `CHECK` constraints that read a column it sets, as Oracle does: for a row that already
+  breaks a constraint that is not validated, an update of another column succeeds (see
+  [ALTER TABLE](alter-table.md), example L).
 - Setting a `NOT NULL` column to `''` is ORA-01407, because the empty string is NULL.
 - On a replica, `UPDATE` of a table is ORA-16000; global temporary tables can be updated.
 

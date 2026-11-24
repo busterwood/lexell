@@ -64,6 +64,8 @@ where the recursive query reads *name* in its `FROM` clause.
 - `WITH` may stand in front of a query inside a view, an inline view, and the subquery of `INSERT`, `UPDATE` or
   `DELETE`.
 - Comments with hints (`/*+ MATERIALIZE */`) are ignored.
+- A recursion that never ends is ORA-32044, also under `FETCH FIRST` (a row limit does not stop it, as in Oracle):
+  bound the recursive term (`WHERE n < 10`), as example B does.
 
 ## Differences from Oracle
 
@@ -347,6 +349,8 @@ WITH nums (n) AS (SELECT 1 FROM dual UNION SELECT n + 1 FROM nums WHERE n < 3) S
 WITH t (a, b) AS (SELECT 1 FROM dual) SELECT * FROM t;
 WITH t AS (SELECT 1 AS a FROM dual), t AS (SELECT 2 AS a FROM dual) SELECT * FROM t;
 WITH FUNCTION twice(x NUMBER) RETURN NUMBER IS BEGIN RETURN x * 2; END; SELECT twice(4) FROM dual;
+WITH nums (n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM nums) SELECT n FROM nums FETCH FIRST 3 ROWS ONLY;
+WITH nums (n) AS (SELECT 1 FROM dual UNION ALL SELECT n + 1 FROM nums) SELECT n FROM nums WHERE n > 2 FETCH FIRST 3 ROWS ONLY;
 ```
 
 ```text
@@ -364,6 +368,12 @@ ORA-20000: WITH query name "t" specified more than once
 
 ERROR:
 ORA-00900: invalid SQL statement
+
+ERROR:
+ORA-32044: cycle detected while executing recursive WITH query
+
+ERROR:
+ORA-32044: cycle detected while executing recursive WITH query
 ```
 
 ## See also
