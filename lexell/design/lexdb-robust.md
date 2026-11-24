@@ -78,7 +78,7 @@ what is below under "As built" and plans what was too large under "Plans". Each 
   subqueries in the statement, `updateB` evaluates every row's new values (and RETURNING) first and writes after (`updNew`: an error of
   a row's values ends them and the rows before it are written first); `deleteB` evaluates RETURNING first. A statement without a
   subquery runs the old loop unchanged (the point path). PostgreSQL 19, SQL Server 2022 and Oracle Free give the same answers.
-  **MERGE** has the same fault (an UPDATE clause's correlated subquery) and is not done (see Plans).
+  MERGE: see "The leftovers" below.
 - PostgreSQL: a LANGUAGE sql function's column is named as the function (`twice`, not `int4`: the select item takes the name of
   the call that was inlined); `INTERVAL(p) '...' FIELD` and `INTERVAL FIELD '...'` are syntax errors (42601), `INTERVAL(p)` keeps its
   precision (it was reset to none).
@@ -98,30 +98,40 @@ sites in 25 files (`grep -c Val.Tstz`: 160). Start with the TNS door alone: Orac
 instant and the offset in a second column?? No: store `Val.Tsz` natively, PostgreSQL's and SQL Server's `datetimeoffset` (the same
 loss: KNOWN-ISSUES "a datetimeoffset is converted to UTC") take it too, in their own slice.
 
-### Package variables and constants outside the package (item 10)
-State is `ip.pkgs[i].vals[slot]` (lexdb_plsql `PkgInst`); the specification's variables are slots of the package unit, not named for
-callers. Plan: (1) the U_PKG unit keeps a list of its public variables (name, slot, constant, type) from the specification's declarations
-(`compilePackage`: `specDecls`); `SigEntry`-like entries make them visible to later compiles; (2) in PL/SQL an expression's text is rendered
-to SQL with its variables replaced (`render`): a `pkg.var` reads like a hoisted call (`hoistCall`) of a synthetic zero-argument
-function that loads the package state (`pkgState`) and returns the slot, an assignment `pkg.var := e` to a K_ASSIGN of the slot of the
-package's state (write back in `ip.pkgs`; ORA-06550/PLS-00363 for a constant); (3) in SQL `lexdb_plcall.block` takes an
-`Expr.Col("pkg.var")` whose first part is no FROM item as a call of that function (the same change makes `SELECT f FROM dual`, a function without brackets,
-work: KNOWN-ISSUES); (4) `pkgSave`/`pkgLoad` already move slots between member frames and the instance: a read from outside while a member runs reads
-the instance (stale until the member's next save: Oracle's package state is one memory). Tests: tns_plsql's package cases plus a new set
-(`pay.g_count` in SQL and PL/SQL, constants, a boolean, a date, the state per session, a second session not seeing the first's, ORA-06550 for
-a name that is none, assignment from a block, `RESET` by recompiling the package).
-
 ### PostgreSQL's bare-literal overflow and recursive CTEs (item 13)
 `SELECT 2147483647 + 1` is 22003 in PostgreSQL (two int4 literals) and 2147483648 in lexdb: constant arithmetic of integer literals is bigint.
 The Oracle door's NUMBER literals must stay unlimited, the point path (`id = 5`, `values (1, 2)`) must not slow: the fix belongs in the PostgreSQL
 and T-SQL doors' parse of a binary operator whose both operands are integer literals (fold with int4 range checks, int8 only when a literal
-is itself past int4), not in `binOp`. A recursive CTE under LIMIT with WHERE, a join or an outer block (lexdb.md 9.139 records the plain
+is itself past int4), not in `binOp`. (Looked at in the leftovers slice: T-SQL already gives 8115 for `SELECT 2147483647 + 1`; for PostgreSQL the check
+would sit in `addExpr` / `mulExpr`, which every `v + 1` goes through, `UPDATE p SET v = v + 1 WHERE id = n` among them: a few instructions on the UPDATE
+by key, so it is not done.) A recursive CTE under LIMIT with WHERE, a join or an outer block (lexdb.md 9.139 records the plain
 case): the LIMIT is pushed into the recursion only when nothing filters the CTE's rows after it; the plan is to push it through a stop
 flag the consumer sets when its own LIMIT is met (`lexdb_recrun` produces row by row), so that a filter, join or outer aggregate on top
 of the CTE sees rows until the consumer is satisfied.
 
-### MERGE's subqueries (item 6, the rest)
-`merge` evaluates a WHEN clause's expressions per source row between writes, as UPDATE did. The fix is UPDATE's: for a MERGE with
-subqueries in its clauses, decide each row's clause and evaluate its values and conditions first (the writes of earlier rows do not change which
-clause fires: that is decided by the joined row and conditions), then apply the writes in order, stopping at the first error as
-`updateB` does. `touched` (ORA-30926 / 21000) is computed in the first pass.
+## The leftovers (2026-11-24)
+
+The planned items of the two sections above, built on `worktree-agent-a7390c6519a32d455` (from main a15b9a64, tag `lo-base`); each fix was checked against the products
+(PostgreSQL 19, SQL Server 2022, Oracle Free 23.26) and has a test per door.
+
+### MERGE's subqueries
+`merge` now works a row in two steps, `mergePlan` and `mergeApply`: the plan decides the row's clause (its WHEN condition), evaluates the values (UPDATE's SET, INSERT's
+values, Oracle's UPDATE WHERE and DELETE WHERE) and the RETURNING / OUTPUT row, and counts the target rows touched twice (ORA-30926 / 21000 / 8672; Oracle's ORA-08006 for a
+row its DELETE WHERE deleted and a later source row matches); the apply writes. With subqueries in the statement (`len(q.subs) > 0`) every row is planned before any is
+applied (an error ends the planning; the rows before it are written first, as `updateB` does); without, each row is planned and applied in turn, as before. An INSERT
+clause's row is built by `insertOne` in a dry mode (`CONFLICT_DRY`: `conflictOf` says the row is its own conflict and `upsertOld` gives it back; a check inside `insertOne`
+itself cost a plain INSERT one instruction) and stored by `storeRow` in the apply. PostgreSQL 19, SQL Server 2022 and Oracle Free read their subqueries as of the statement's start in every clause, RETURNING included (SQL
+Server's OUTPUT takes no subquery: 10705, now also here for INSERT, UPDATE and DELETE). Found by the tests: a text column of `VALUES` in a T-SQL session has the
+session's collation (it was an exact one: a column beside it was error 468, and `'A' = 'a'` was false). Tests: `exec_mergesub`, `tds_mergesub`, `tns_mergesub`.
+
+### The Oracle door's schemas (lexdb-oracle.md section 22)
+Built as planned, except that the roles are not given the schema when made but at their first Oracle login. Tests: `tns_ownschema`, `tns_nls` (reads `sa.pub`),
+`replica_doors` (the schema's commit moves the LSNs by one).
+
+### Package variables
+See lexdb-oracle.md, "As built: package variables". Tests: `tns_pkgvar` (`gen_oracle.py --check`: 0 differences), `tns_pkgstate`.
+
+### Small ones the coordinator asked for
+`CAST` and `CONVERT` of a uniqueidentifier to `binary(n)` / `varbinary(n)` (error 529 since the hex-literal slice; SQL Server's mixed-endian layout: the first three groups
+little-endian), of a binary to uniqueidentifier (padded or cut to 16 bytes), a uniqueidentifier as a string in upper case (8170 for `varchar(n)` under 36);
+`OBJECTPROPERTY(id, 'TableHasNonclustIndex')`. Test: `tds_guidbin`.

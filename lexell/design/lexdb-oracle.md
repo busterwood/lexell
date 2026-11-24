@@ -1096,28 +1096,20 @@ CONNECT for lexdb_ro and reads the REDIRECT's type, flags and data.
 (`Session.setTcps`, the memo's `\0tcps\0n`), else `tcp`. Test: `tns_tcps.lxl` (lib/oracle over TCPS and TCP: in a
 query, a WHERE and PL/SQL).
 
-**A bare name and PostgreSQL's `public` (not done: the plan).** With a table `city` made in the PostgreSQL door,
-`CREATE TABLE city` in the Oracle door as SA is ORA-00955 and `SELECT * FROM city` reads `public.city`. The cause is
-section 8's mapping as built in O1: a login with no schema of its name (SA, a trust login) works in `public`, its
-search path `public` alone, so public's tables are its own objects. A login with a schema of its name (`CREATE
-USER`) already has Oracle's order: its path is its schema, then `public`; CREATE puts a bare name in its schema, and
-a table of public's name does not stop it. Oracle's rule is a user's own schema first, then PUBLIC synonyms, and a
-public synonym never stops a CREATE; section 8 meant public to be seen from Oracle as PUBLIC's objects.
-What it takes, and why it is not done in this pass:
-1. Every Oracle login gets a schema of its name: made when the login first connects through the Oracle door (or
-   when the role is made), owned by it; SA's is `sa`.
-2. The Oracle door's path is that schema, then `public` (public then plays the PUBLIC synonyms' part: found after
-   the user's own, never in the way of a CREATE); `ALTER SESSION SET CURRENT_SCHEMA` as now.
-3. Where the objects of a login without a schema went before (`public`): the catalog views (USER_ = the login's
-   schema; OWNER; ALL_SYNONYMS could list public's tables as PUBLIC synonyms), DESCRIBE, DBMS_METADATA, the
-   privileges on the new schema (the owner's; other users through GRANT, as Oracle's), sequences and PL/SQL
-   units made without a schema (`lexdb_plsql` keys them by schema), and what the other doors see: a table SA makes
-   in the Oracle door is then `sa.t` in the PostgreSQL and SQL Server doors, no longer `public.t` / `dbo.t`.
-4. Every `tns_*` suite and gen_oracle.py's expect lines that show owners, the PL/SQL keys and the cross-door tests
-   (`doorsql`, `replica.py`, the docs' examples) are checked again.
-The change touches name resolution at login and the catalog's owners, and moves where existing data is found for a
-login without a schema (its old tables stay in public and are still found second): more than a day, so it is planned
-here for the user to decide.
+**A bare name and PostgreSQL's `public` (built 2026-11-24).** A login with no schema of its name worked in `public`, so that public's tables (the PostgreSQL door's)
+were its own objects: with a table `city` made in the PostgreSQL door, `CREATE TABLE city` as SA was ORA-00955 and `SELECT * FROM city` read `public.city`, and
+`sa.t` (a table SA made) was ORA-00942. Oracle's rule is a user's own schema first, then PUBLIC synonyms, and a public synonym never stops a CREATE. Now the
+first Oracle connection of a login makes its schema (`Conn.ownSchema`, in `auth2`: `CREATE SCHEMA x AUTHORIZATION x` run as a superuser role, or as no role when there
+is none, which lexdb's role statements take as a superuser; a login under trust that has no role makes `CREATE SCHEMA x`; a replica makes none), and the session's
+path is that schema, then `public` (public plays the PUBLIC synonyms: found second). What was already there for a login with a schema (section 8, `CREATE USER`) does
+the rest: the catalog views (`oraBuilt`: USER_ lists the login's own schema, public's objects are SYS's), the owner of a created object, `SYS_CONTEXT('USERENV',
+'CURRENT_SCHEMA')`, `ALTER SESSION SET CURRENT_SCHEMA`, privileges (the schema is the login's own), PL/SQL units (keyed by owner as before). What changed for the
+other doors: a table SA makes in the Oracle door is `sa."T"` for the PostgreSQL and SQL Server doors, no longer `public."T"`; the objects a login made before stay in public and
+are still found (second). Checked: all `tns_*` suites, `replica_doors` (a login's schema is one more commit: the LSNs), and a script of about 45 statements as a role `sa` before
+and after (tables, views, indexes, sequences, procedures, functions, packages, USER_ views, DBMS_METADATA, truncate, grant, drop): only the intended answers changed.
+Tests: `tns_ownschema` (a PostgreSQL-door `city`, a login under trust, a role that is no superuser); `tns_nls` reads the table of SA as `sa.pub`, as Oracle's rule needs.
+Not done: a read-only replica's login cannot make its schema (a replica serves the schemas its master made); remote or SAN replicas are parked.
+
 
 ## 23. The wrong-answer list's Oracle side (2026-11-24)
 
@@ -1143,4 +1135,20 @@ were a bare text whose first byte equalled its length); a unit created with comp
 ALL_ERRORS, `ALTER ... COMPILE`, revalidated when a block names it, CALL of an invalid unit ORA-06575); a stored function that hits NO_DATA_FOUND in a query is
 NULL, one that raises ends the query with the unit's ORA-06512 lines; ROWNUM before aggregates, DISTINCT and ORDER BY of one table, and in UPDATE and DELETE;
 the REGEXP_ functions' position, occurrence, return option, match parameter (`RE_ORA`), subexpression, errors ORA-01428 / 01760 / 12725-12732; DROP SEQUENCE under
-a DEFAULT. Not done: ROWNUM over a join with aggregates, package variables and constants outside the package, TIMESTAMP WITH TIME ZONE's offset: plans in lexdb-robust.md.
+a DEFAULT. Not done: ROWNUM over a join with aggregates, TIMESTAMP WITH TIME ZONE's offset: plans in lexdb-robust.md (package variables outside the package: built, see below).
+
+## As built: package variables (lexdb-robust.md)
+
+A package's public variables and constants are used from outside it, in PL/SQL, as Oracle's: `PUnit.pubVars` (the variables the specification declares: scalar ones, not
+records, cursors or exceptions) and signature entries of kind `U_VAR` (`SigEntry.slot`, `.konst`) make them known to every later compile (`sigsOf`, `ensureProg`). In
+an expression or an embedded SQL statement `pay.g_count` is a `K_PVGET` in the node's `pre` (`render`; `sqlNode` keeps its `pre` now: the statement runs after the read and
+gets the value as a bind); `pay.g_count := e` is a `K_PVSET` (`pvarAssign`; a constant is PLS-00363, a name the package has none of PLS-00302). The state is
+`ip.pkgs[...]` per session, made when first needed by the body's initialisation section (`pkgStateOf`); a member that runs holds its package's slots in its frame and saves
+them before any call (`pkgSave`), so a read from outside sees them. In a statement of its own (`SELECT pay.g_count FROM dual`) Oracle refuses a package's variable: ORA-06553
+`PLS-221: 'G_COUNT' is not a procedure or is undefined` (a name that is none ORA-00904): lexdb says ORA-00904 where the binder fails, and `Conn.pkgVarErr` says ORA-06553
+when the statement's text names `pkg.var` of a package that has it (so a table alias named as a package with such a column is the case it gets wrong). Checked against Oracle
+Free by two sessions: a second session reads the initial value, not the first's; the session that makes the body again starts afresh silently; another session's next *call* into the
+package is ORA-04068 once (`pkgStateOf`, `call`: the state discarded when the source changed since it was made) and then runs on a fresh state; a variable read or assigned from
+outside keeps the state it has, with no error. Not done: a package variable as an INTO target or an OUT argument, a record or collection variable, and (as before) a stored
+function in a DML statement's own text (`INSERT ... VALUES (f())` is ORA-00904: functions are run for a query's rows only). Tests: `tns_pkgvar` (`gen_oracle.py --check`: 0
+differences), `tns_pkgstate`.
