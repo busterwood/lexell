@@ -38,15 +38,14 @@ END CATCH
 - An unknown table (208) or column (207) in the `TRY` block is not caught: as in SQL Server, the error ends the
   batch (example C). Put the statement in a procedure or in dynamic SQL (`EXEC`) to catch it.
 - Messages of severity 10 or less (`PRINT`, `RAISERROR` with a low severity) are not errors and are not caught.
+- A `RAISERROR` of severity 19 to 25 without `WITH LOG` is error 2754 and is caught. With `WITH LOG` at severity 20 or
+  more the error is fatal: the connection is closed and no `CATCH` block runs (see [RAISERROR](raiserror.md)).
 
 ## Differences from SQL Server
 
 - A failed statement in the `TRY` block sends `(0 rows affected)` before the `CATCH` block's output (example B);
   SQL Server sends no count for it.
 - `ERROR_LINE()` gives 1, whatever line failed.
-- After a batch in which an inner `CATCH` block printed a message and re-raised the error with `THROW` to an outer
-  `CATCH` block, the session's next `TRY` block goes wrong: an unknown table (208) in it is reported, and then its
-  `CATCH` block runs too, with the old error's `ERROR_NUMBER()` and `ERROR_MESSAGE()`.
 - `ERROR_MESSAGE()` is SQL Server's text, except for errors numbered 50000, which carry lexdb's.
 
 ## Examples
@@ -215,9 +214,10 @@ just a note
 the TRY block went on
 ```
 
-### G. After a rethrow: the stale CATCH
+### G. After a rethrow
 
-This batch runs after example E (see Differences).
+An error that `THROW` sent to an outer `CATCH` block in an earlier batch does not reach this batch's `TRY` block: the
+unknown table (208) ends the batch, and the `CATCH` block does not run. This batch runs after example E.
 
 <!-- example: tsql -->
 ```sql
@@ -232,11 +232,6 @@ END CATCH;
 ```text
 Msg 208, Level 16, State 1, Line 2
 Invalid object name 'nothere'.
-number message
------- -------------
-50000  inner failure
-
-(1 row affected)
 ```
 
 ## See also
