@@ -25,15 +25,17 @@ The fuzzy matching functions of the `UTL_MATCH` package are on the [package func
 `REGEXP_REPLACE`
 : *source_char* with matches of *pattern* replaced by *replace_string*. *position* is where the search starts and
   *occurrence* chooses the match (0, the default, replaces all). `\1` to `\9` in *replace_string* are the groups of
-  the pattern. A NULL *replace_string* gives NULL.
+  the pattern. A NULL *replace_string*, or none, removes the
+  matches.
 
 `REGEXP_SUBSTR`
-: The text of the first match of *pattern*, or NULL. *position*, *occurrence*, *match_param* and *subexpr* are
-  accepted but not used (see Differences).
+: The text of a match of *pattern*, or NULL. *position* is where the search starts, *occurrence* chooses the match
+  (the first by default), *match_param* is the flags, and *subexpr* returns the text of that parenthesised group
+  of the match instead of the whole match.
 
 `REGEXP_INSTR`
 : The position of the match of *pattern*, or 0. *return_option* 0 gives the position of the start and 1 the position
-  after the match.
+  after the match. *subexpr* gives the position of that group.
 
 `REGEXP_COUNT`
 : The number of matches of *pattern*, counted from *position*; 0 if there are none.
@@ -43,22 +45,18 @@ The fuzzy matching functions of the `UTL_MATCH` package are on the [package func
 - The pattern syntax is extended regular expressions with the usual Perl-style shortcuts `\d`, `\w`, `\s` and their
   negations, and POSIX classes such as `[[:digit:]]`, `[[:alpha:]]`, `[[:space:]]` and `[[:upper:]]`. Look-ahead and
   look-behind are not supported (neither are they in Oracle).
-- *match_param* is a string of flags: `i` ignore case, `c` match case (the default), `m` multiline (`^` and `$` match
-  at line ends), `n` and `x` (ignore white space in the pattern). An unknown flag is ORA-01722.
-- An invalid pattern is ORA-20000 with the parser's message.
+- *match_param* is a string of flags, read as Oracle reads them: `i` ignore case, `c` match case (the default), `n`
+  the period matches a line feed (by default it does not), `m` multiline (`^` and `$` match at line ends) and `x`
+  ignore white space in the pattern. An unknown flag is ORA-01760.
+- An invalid pattern has Oracle's error: ORA-12725 for unmatched parentheses, ORA-12726 for an unmatched bracket or
+  any other pattern the engine does not read (look-behind, say), ORA-12727 for a back reference in the pattern
+  (`(a)\1`: the engine has none), ORA-12728 for an invalid range, ORA-12729 for an invalid character class and
+  ORA-12732 for an invalid repeat count.
 - A NULL source gives NULL (`REGEXP_COUNT`) or false.
-- *position* 0 or below is ORA-01722.
+- *position*, *occurrence* and *return_option* out of range (position 0 or below, say) are ORA-01428.
 
 ## Differences from Oracle
 
-- `REGEXP_SUBSTR` uses only its first two arguments. `REGEXP_SUBSTR('abc123def456', '[0-9]+', 1, 2)` gives `123`
-  (Oracle: `456`); the *position* in `REGEXP_SUBSTR('abc123def456', '[0-9]+', 5)` is ignored; the flag `i` and the
-  *subexpr* have no effect: `REGEXP_SUBSTR('ABC', 'b', 1, 1, 'i')` is NULL (Oracle: `B`) and the subexpression 2
-  of `([a-z]+)([0-9]+)` returns the whole match. `REGEXP_INSTR` and `REGEXP_COUNT` do use their arguments.
-- `REGEXP_REPLACE` needs a *replace_string*: `REGEXP_REPLACE('abc', 'b')` is ORA-00904 (Oracle removes the matches).
-- The period matches a line feed unless the `n` flag is given, and `n` has the opposite effect: Oracle's period does
-  not match a line feed, and `n` makes it do so.
-- A wrong *match_param* is ORA-01722; Oracle gives ORA-12714.
 - `REGEXP_COUNT('hello', '')` is NULL.
 
 ## Examples
@@ -141,13 +139,13 @@ ID
 
 1 row selected.
 
+no rows selected
+
 ID
 --
  3
 
 1 row selected.
-
-no rows selected
 ```
 
 ### C. REGEXP_REPLACE
@@ -159,7 +157,8 @@ SELECT REGEXP_REPLACE('hello world', 'o', '0') AS all_matches, REGEXP_REPLACE('h
        REGEXP_REPLACE('Hello', 'h', 'j', 1, 0, 'i') AS ignore_case, REGEXP_REPLACE('a  b   c', ' +', ' ') AS squeeze
 FROM dual;
 SELECT REGEXP_REPLACE('John Smith', '(\w+) (\w+)', '\2, \1') AS swapped, REGEXP_REPLACE('abc', '(b)', '[\1]') AS group_ref,
-       REGEXP_REPLACE('abc', 'b', NULL) AS null_replacement, REGEXP_REPLACE('a.b', '\.', '\\') AS backslash
+       REGEXP_REPLACE('abc', 'b', NULL) AS null_replacement, REGEXP_REPLACE('abc', 'b') AS no_replacement,
+       REGEXP_REPLACE('a.b', '\.', '\\') AS backslash
 FROM dual;
 SELECT REGEXP_REPLACE('abc123', '[[:digit:]]+', '#') AS digits, REGEXP_REPLACE('abc 123', '[[:space:]]', '_') AS space,
        REGEXP_REPLACE('Ab1', '[[:upper:]]', '*') AS upper, REGEXP_REPLACE('a1b2', '\d', '#') AS shortcut,
@@ -174,9 +173,9 @@ hell0 w0rld hell0 world hello w0rld hello w0rld jello       a b c
 
 1 row selected.
 
-SWAPPED     GROUP_REF NULL_REPLACEMENT BACKSLASH
------------ --------- ---------------- ---------
-Smith, John a[b]c                      a\b
+SWAPPED     GROUP_REF NULL_REPLACEMENT NO_REPLACEMENT BACKSLASH
+----------- --------- ---------------- -------------- ---------
+Smith, John a[b]c     ac               ac             a\b
 
 1 row selected.
 
@@ -205,7 +204,7 @@ FIRST_NUMBER NO_MATCH FIRST_PART LAST_WORD WHOLE_MATCH NULL_IN
 1 row selected.
 ```
 
-### E. REGEXP_SUBSTR with arguments that lexdb ignores
+### E. REGEXP_SUBSTR with position, occurrence, match parameter and subexpression
 
 <!-- example: oracle -->
 ```sql
@@ -218,25 +217,25 @@ SELECT REGEXP_SUBSTR('abc123', '([a-z]+)([0-9]+)', 1, 1, NULL, 2) AS subexpressi
 ```text
 NTH_MATCH
 ---------
-123
+456
 
 1 row selected.
 
 FROM_POSITION_5
 ---------------
-123
+23
 
 1 row selected.
 
 IGNORE_CASE
 -----------
-
+B
 
 1 row selected.
 
 SUBEXPRESSION_2
 ---------------
-abc123
+123
 
 1 row selected.
 ```
@@ -282,28 +281,28 @@ THREE FROM_4 CASE_SENSITIVE IGNORE_CASE NUMBERS NO_OVERLAP NONE NULL_IN
 
 <!-- example: oracle -->
 ```sql
-SELECT REGEXP_REPLACE('abc', 'b') FROM dual;
 SELECT REGEXP_SUBSTR('abc', '(') FROM dual;
 SELECT CASE WHEN REGEXP_LIKE('abc', 'a', 'z') THEN 1 END FROM dual;
 SELECT REGEXP_REPLACE('abc', 'x', 'y', 0) FROM dual;
 SELECT REGEXP_REPLACE('a1b2', '(?<=a)1', 'X') FROM dual;
+SELECT REGEXP_LIKE('aa', '(a)\1') FROM dual;
 ```
 
 ```text
 ERROR:
-ORA-00904: invalid identifier
+ORA-12725: unmatched parentheses in regular expression
 
 ERROR:
-ORA-20000: invalid regular expression: error parsing regexp: missing closing ): `(?s)(()`
+ORA-01760: illegal argument for function
 
 ERROR:
-ORA-01722: invalid number
+ORA-01428: Argument 0 is out of range.
 
 ERROR:
-ORA-01722: invalid number
+ORA-12726: invalid regular expression
 
 ERROR:
-ORA-20000: invalid regular expression: error parsing regexp: invalid named capture: `(?<=a)1`
+ORA-12727: invalid back reference in regular expression
 ```
 
 ## See also
