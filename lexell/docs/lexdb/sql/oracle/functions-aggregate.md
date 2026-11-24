@@ -68,7 +68,8 @@ KURTOSIS_POP ( expr )  KURTOSIS_SAMP ( expr )  SKEWNESS_POP ( expr )  SKEWNESS_S
 
 - `MEDIAN`, `STATS_MODE`, `CORR`, `COVAR_POP`, `COVAR_SAMP`, `REGR_*` and `XMLAGG` are not available (ORA-00904).
 - `MIN` and `MAX` of a `DATE` show as a timestamp (`2019-03-01 00:00:00.0`): use `TO_CHAR`.
-- `SELECT COUNT(*) ... WHERE ROWNUM < n` limits groups, not rows (see [SELECT](select.md)).
+- `SELECT COUNT(*) ... WHERE ROWNUM < n` counts the first n rows of one table, as Oracle does; over a join it limits
+  the groups, not the rows (see [SELECT](select.md)).
 
 ## Examples
 
