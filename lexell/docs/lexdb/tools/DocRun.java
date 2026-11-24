@@ -81,9 +81,15 @@ public class DocRun {
     }
 
     static boolean more(Statement s, List<String> o) {
+        String last = null;
         while (true) {
             try { return s.getMoreResults(); }
-            catch (SQLException e) { quietWarnings(s, o); msg(e, o); }
+            catch (SQLException e) {
+                // a connection the server closed (RAISERROR at severity 20) throws the same error again: stop
+                if (e.getMessage() != null && e.getMessage().equals(last)) return false;
+                last = e.getMessage();
+                quietWarnings(s, o); msg(e, o);
+            }
         }
     }
 
