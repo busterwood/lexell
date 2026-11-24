@@ -119,7 +119,7 @@ HAS_PERMS_BY_NAME ( securable, class, permission )
 
 `OBJECTPROPERTY(id, property)`, `OBJECTPROPERTYEX(id, property)`
 : A property of an object: `IsTable`, `IsView`, `IsProcedure`, `TableHasPrimaryKey`, `TableHasClustIndex`,
-  `TableHasUniqueCnst` and others.
+  `TableHasNonclustIndex`, `TableHasUniqueCnst` and others.
 
 `COLUMNPROPERTY(id, column, property)`, `INDEXPROPERTY(id, index, property)`
 : A property of a column (`IsIdentity`, `AllowsNull`, `ColumnId`) or of an index.
@@ -452,6 +452,7 @@ CREATE TABLE dbo.k3 (a int, b int);
 GO
 SELECT OBJECT_NAME(object_id) AS tbl, OBJECTPROPERTY(object_id, 'TableHasPrimaryKey') AS has_pk,
        OBJECTPROPERTY(object_id, 'TableHasClustIndex') AS has_clustered_index,
+       OBJECTPROPERTY(object_id, 'TableHasNonclustIndex') AS has_nonclustered_index,
        OBJECTPROPERTY(object_id, 'TableHasUniqueCnst') AS has_unique
 FROM sys.tables WHERE name IN ('k1', 'k2', 'k3') ORDER BY name;
 ```
@@ -481,11 +482,11 @@ CREATE VIEW dbo.mv1 AS SELECT id FROM dbo.m1;
 
 (1 row affected)
 
-tbl has_pk has_clustered_index has_unique
---- ------ ------------------- ----------
-k1  1      1                   1
-k2  1      0                   0
-k3  0      0                   0
+tbl has_pk has_clustered_index has_nonclustered_index has_unique
+--- ------ ------------------- ---------------------- ----------
+k1  1      1                   1                      1
+k2  1      0                   1                      0
+k3  0      0                   0                      0
 
 (3 rows affected)
 ```
