@@ -93,8 +93,8 @@ expression AT TIME ZONE timezone
 - `AT TIME ZONE 'UTC'` works. Other zone names were not checked, and a `datetimeoffset` is always shown at
   `+00:00` (see the types page).
 - `DATEFROMPARTS` with an impossible date is error 517 (SQL Server: 289).
-- `datetime + number` and `datetime - datetime` do not work as in SQL Server: use `DATEADD` and `DATEDIFF`
-  (see [date and time types](data-types-datetime.md)).
+- `datetime + number` and `datetime - datetime` work as in SQL Server, but `date`, `datetime2` and `time` with a
+  number are error 206: use `DATEADD` and `DATEDIFF` (see [date and time types](data-types-datetime.md)).
 - A `datetime` result prints with one fractional digit (`.0`); see the types page.
 
 ## Examples
