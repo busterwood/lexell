@@ -45,6 +45,7 @@ public class OracleJdbc {
         cancel();
         lengths();
         warnings();
+        storedFunctions();
         try { generatedKeys(); } catch (Exception e) { System.out.println("SKIP generatedKeys by column name: " + e.toString().split("\n")[0]); }
         for (String t : new String[]{"JT_CHILD", "JT_ALL", "JT_PARENT", "JT_TX", "JT_MERGE", "JT_BATCH"}) ddl("drop table " + t);
         ddl("drop sequence JT_SEQ");
@@ -475,5 +476,47 @@ public class OracleJdbc {
         Check.eq("a raising function in a query", Check.errorOf(() -> rows("select JT_RS(1) from dual")), 20001);
         Check.eq("and the connection stays", rows("select 1 from dual"), List.of("1"));
         ddl("drop function JT_ND"); ddl("drop function JT_RS");
+    }
+
+    // ---- stored functions in SQL: a package function that reads a package variable, called with no or constant arguments, on a statement the driver
+    // caches and runs again (the cursor is kept: the plan of the first run must not give the second its value), in a block's SQL and in DML
+    static void storedFunctions() throws Exception {
+        ddl("create table JT_SFT (a number)");
+        ddl("insert into JT_SFT values (1)");
+        ddl("insert into JT_SFT values (2)");
+        ddl("create or replace package JT_SPK as g number := 0; function f return number; function h(x number) return number; end JT_SPK;");
+        ddl("create or replace package body JT_SPK as function f return number is begin return g; end; function h(x number) return number is begin return g + x; end; end JT_SPK;");
+        ddl("create or replace function JT_SF(x number) return number is begin return JT_SPK.g * 10 + x; end;");
+        oracle.jdbc.OracleConnection oc = c.unwrap(oracle.jdbc.OracleConnection.class);
+        oc.setStatementCacheSize(10);
+        oc.setImplicitCachingEnabled(true);
+        String[] sqls = {"select JT_SPK.f() from dual", "select JT_SF(1) from dual", "select JT_SPK.h(2) from dual"};
+        for (int k = 0; k < sqls.length; k++) {
+            List<String> got = new ArrayList<>();
+            List<String> want = new ArrayList<>();
+            for (int g = 3; g <= 5; g++) {
+                try (Statement st = c.createStatement()) { st.execute("begin JT_SPK.g := " + g + "; end;"); }
+                try (PreparedStatement p = c.prepareStatement(sqls[k]); ResultSet r = p.executeQuery()) { r.next(); got.add(r.getString(1)); }
+                want.add(String.valueOf(k == 0 ? g : k == 1 ? g * 10 + 1 : g + 2));
+            }
+            Check.eq("cached statement " + sqls[k], got, want);
+        }
+        // the same statement object run twice
+        try (PreparedStatement p = c.prepareStatement("select JT_SPK.f() from dual")) {
+            List<String> got = new ArrayList<>();
+            for (int g = 7; g <= 8; g++) {
+                try (Statement st = c.createStatement()) { st.execute("begin JT_SPK.g := " + g + "; end;"); }
+                try (ResultSet r = p.executeQuery()) { r.next(); got.add(r.getString(1)); }
+            }
+            Check.eq("one statement twice", got, Arrays.asList("7", "8"));
+        }
+        // a block's SQL and DML
+        try (Statement st = c.createStatement()) {
+            st.execute("declare v number; begin select JT_SF(a) into v from JT_SFT where a = 2; insert into JT_SFT values (v * 100); end;");
+            st.execute("begin update JT_SFT set a = JT_SF(a) where a = 1; end;");
+            st.execute("begin insert into JT_SFT select JT_SF(a) + 1000 from JT_SFT where a = 2; end;");
+        }
+        Check.eq("stored functions in a block and in DML", rows("select a from JT_SFT order by a"), Arrays.asList("2", "81", "1082", "8200"));
+        ddl("drop function JT_SF"); ddl("drop package JT_SPK"); ddl("drop table JT_SFT");
     }
 }
