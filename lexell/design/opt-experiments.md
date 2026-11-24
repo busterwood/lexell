@@ -1391,3 +1391,49 @@ loads two indices and then two elements from wherever they are. On the benchmark
 elements, those loads miss the cache. A sort that moves the elements themselves would need the
 runtime to call the closure, and the C FFI has no closure callbacks. Doing that means a runtime
 or language feature, so it is a design question, not a code-generation change.
+
+## 34. Reusing a dropped block for the next allocation (Perceus-style reuse): counted, not built
+
+**The idea.** Perceus (Koka; Lean 4 does the same) turns a drop followed by an allocation of the
+same size into a reuse of the dropped cell in place. The win is the free and the allocation
+skipped: about 14 instructions for the inline free and 9 for the inline constant-size
+allocation, and some 20 for the variable-size path through `rt_alloc`.
+
+**The census.** A temporary runtime patch, `LXL_CENSUS=1`, turned the inline paths off and
+counted, at each allocation, whether the heap's last operation was a free of the same size class
+(adjacent). It also counted whether the class had had a free since its last allocation (within
+class). The counts are split into constant-size allocations, which are the record and enum
+cells a compile-time reuse would target, and variable-size ones (strings, vectors, slices).
+
+| program | allocations, constant / variable | adjacent pairs, constant / variable | within class, constant / variable |
+|---|---:|---:|---:|
+| compiler --native (self) | 0 / 4.81M | 0 / 1.09M | 0 / 2.89M |
+| eza --native / grep --native | 0 / 0.65M, 0 / 1.68M | 0 / 0.13M, 0 / 0.30M | 0 / 0.38M, 0 / 1.04M |
+| lists | 20.0M / 0 | 1,999 / 0 | 1,999 / 0 |
+| trees | 13.2M / 0 | 399 / 1 | 399 / 1 |
+| maps | 0 / 4.0M | 0 / 0.40M | 0 / 1.60M |
+| closures | 0 / 0.40M | 0 / 0.20M | 0 / 0.20M |
+| pingpong | 20.0M / 4.0M | 4.0M / 0 | 10.0M / 4.0M |
+| json | 0.55M / 4.57M | 0 / 1.27M | 0.05M / 2.33M |
+| jq | 0 / 5.33M | 0 / 1.10M | 0 / 2.22M |
+| cmark | 0 / 1.22M | 0 / 0.25M | 0 / 0.81M |
+| regex | 0.01M / 0.05M | 875 / 12,076 | 11,839 / 24,547 |
+| alloc, fib, loop, array, sieve, nbody, interp, matmul, decimal | under 3,000 each | about 0 | about 0 |
+
+**What it shows.** Constant-size cells are almost never freed just before one is made, except in
+pingpong. lists and trees build their whole structure and then drop it. The compiler keeps its
+trees in index arrays, and alloc's records no longer reach the heap (section 28). pingpong's 4M
+pairs are its promise cells: a waited future is dropped and the next `task.promise` is made in
+the library, across a task switch. At 23 instructions a pair, that is at most 3.7% of pingpong's
+instructions, in a program whose cost is mostly the task switch.
+
+The variable-size pairs are temporaries: strings and vectors built, dropped, and built again.
+Their sizes are known only at run time, so a compile-time reuse cannot match them. At about 35
+instructions a pair, their ceiling is about 0.7% of the compiler, 1.2% of jq and json, and 0.7%
+of cmark, and only if every pair could be reused. The LIFO free lists already hand back the
+block just freed, which is still in cache, so the cycles gained would be less than the
+instructions.
+
+**Not built.** Constructor reuse has nothing to work on. A variable-size allocation inline in the
+generated code (the class from the size, then the pop, as with constant sizes) would reach all
+4.8M of the compiler's allocations, not just the pairs. That would be the one to count next.
