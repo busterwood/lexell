@@ -53,8 +53,9 @@ others are 0, NULL or a fixed value (for example `is_replicated` is 0).
 
 `sys.indexes`
 : One row per index, the key indexes included: `object_id`, `name`, `index_id`, `type` and `type_desc`
-  (`CLUSTERED` for a primary key, `NONCLUSTERED` for every other index), `is_unique`, `is_primary_key`,
-  `is_unique_constraint`, `has_filter`, `filter_definition`.
+  (`CLUSTERED` for the table's clustered index, `NONCLUSTERED` for every other, `HEAP` for a table without one),
+  `is_unique`, `is_primary_key`, `is_unique_constraint`, `has_filter`, `filter_definition`. The clustered index is
+  `index_id` 1; a heap's row has `index_id` 0 and a NULL name.
 
 `sys.index_columns`
 : `object_id`, `index_id`, `index_column_id`, `column_id`, `key_ordinal`, `is_descending_key`,
@@ -76,8 +77,9 @@ others are 0, NULL or a fixed value (for example `is_replicated` is 0).
 
 ## Differences from SQL Server
 
-- `sys.indexes` shows every primary key as `CLUSTERED` and every other index as `NONCLUSTERED`; lexdb has one
-  kind of index, and a table is always stored in its primary key's order.
+- `sys.indexes` shows what `CLUSTERED` and `NONCLUSTERED` said (a primary key is the clustered index unless it is
+  `NONCLUSTERED` or another index is `CLUSTERED`), but lexdb has one kind of index and stores a table in its primary
+  key's order whatever the label (see [CREATE INDEX](create-index.md)).
 - Names of constraints and keys that were not named follow PostgreSQL's pattern (`emp_pkey`, `emp_dept_id_fkey`),
   not SQL Server's `PK__emp__3213E83F...`. A default constraint is always called `DF_table_column`, whatever
   name was given.
@@ -251,6 +253,16 @@ JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.inde
 JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
 WHERE i.object_id = OBJECT_ID('hr.emp')
 ORDER BY i.index_id, ic.index_column_id;
+GO
+CREATE TABLE hr.note (txt varchar(40));
+CREATE CLUSTERED INDEX cx_note ON hr.note (txt);
+GO
+SELECT OBJECT_NAME(object_id) AS tbl, index_id, name, type_desc FROM sys.indexes
+WHERE object_id IN (OBJECT_ID('hr.note'), OBJECT_ID('hr.emp')) ORDER BY object_id, index_id;
+GO
+DROP INDEX cx_note ON hr.note;
+GO
+SELECT index_id, name, type_desc FROM sys.indexes WHERE object_id = OBJECT_ID('hr.note');
 ```
 
 ```text
@@ -267,6 +279,20 @@ emp_pkey    id          1           0
 ix_emp_name name        1           0
 
 (2 rows affected)
+
+tbl  index_id name        type_desc
+---- -------- ----------- ------------
+note 1        cx_note     CLUSTERED
+emp  1        emp_pkey    CLUSTERED
+emp  2        ix_emp_name NONCLUSTERED
+
+(3 rows affected)
+
+index_id name type_desc
+-------- ---- ---------
+0        NULL HEAP
+
+(1 row affected)
 ```
 
 ### F. Types
