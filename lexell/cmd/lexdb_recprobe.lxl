@@ -1,0 +1,113 @@
+// lexdb_recprobe: a recursive CTE under a LIMIT that something filters (design/lexdb-robust.md, "Recursive CTE under LIMIT";
+// lexdb.md 9.139 has the plain case). PostgreSQL and SQL Server make the CTE's rows as the query above it asks for them, so
+// `WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n) SELECT i FROM n WHERE i % 7 = 0 LIMIT 3` ends at 21.
+// lexdb makes a CTE's rows whole before the query reads them (rounds: lexdb_exec.runRecursive), so the query reading it
+// finds how many rows it needs by trying: the CTE is made as far as its first `cap` rows (whole rounds), the query reads
+// them (the row engine, counting the rows its WHERE and joins keep), and a cap too small is doubled. The rows the query
+// then reads are the first rows of the CTE in its order, which are all a query that only filters and joins them reads
+// (mark says which are). The run is lexdb_exec.probeRecursion; this module has the shape it needs and its search.
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_plan"
+
+type DbErr = lexdb_base.DbErr
+type Query = lexdb_plan.Query
+
+// The CTE's rows the first attempt makes at least.
+pub const FIRST: int = 64
+
+// What an attempt found: the query has the rows it needs, or the recursion ended; it needs more of the CTE's rows; the
+// recursion's rounds ran out (max_recursion, MAXRECURSION) before it had them, so the CTE is run as it was (its error).
+pub const DONE: int = 0
+pub const MORE: int = 1
+pub const OUT: int = 2
+
+// The query q (the one that has a LIMIT of need rows, nothing between its rows and the limit that needs them all: no
+// ORDER BY, grouping, DISTINCT, window) reads its only subquery as its first table, and that is a recursive CTE it alone uses
+// or a plain select of one (a derived table): its joins keep that table's order, nothing else is read, nothing it evaluates
+// differs from one run to the next. The subquery is then marked with the rows q needs (SubPlan.need).
+pub fn mark(q: mut &Query, need: int) {
+    if reads(q) { q.subs[0].need = need }
+}
+
+fn reads(q: &Query): bool {
+    if len(q.subs) != 1 || q.corr || len(q.levels) == 0 || q.levels[0].src != 0 { return false }
+    for lv in q.levels {
+        if lexdb_plan.keepsRight(lv.join) || lv.lateral || lv.semi || lv.anti || lv.mode != 0 || lv.lock != 0 { return false }
+        if volatile(&lv.cond) || volatile(&lv.post) { return false }
+    }
+    let sp = &q.subs[0]
+    if sp.use != lexdb_sql.SUB_FROM { return false }
+    if sp.need == -2 { return sp.sel.limit < 0 && len(sp.sel.order) == 0 }
+    // a derived table: a plain select of such a query
+    let d = &sp.sel
+    if sp.cte >= 0 || len(d.q.refs) > 0 || d.setop != 0 || d.aggQ || d.distinct || d.donKey != 0 || d.sort || len(d.order) > 0 || d.limit >= 0 || d.offset > 0 { return false }
+    if d.topMode != 0 || len(d.wins) > 0 || len(d.locks) > 0 || d.withTies || len(d.srf) > 0 || len(d.feedback) > 0 || len(d.gsets) > 0 || len(d.mr) > 0 { return false }
+    if lexdb_plan.hasSrfCall(&d.exprs) || volatile(&d.exprs) { return false }
+    return reads(&d.q)
+}
+
+// The recursive CTE a marked subquery reads, through its derived tables: its Sel.rec, and its number (SubPlan.cte).
+pub fn recOf(sp: &lexdb_plan.SubPlan): int {
+    if sp.cte >= 0 { return sp.sel.rec }
+    return recOf(&sp.sel.q.subs[0])
+}
+
+pub fn cteOf(sp: &lexdb_plan.SubPlan): int {
+    if sp.cte >= 0 { return sp.cte }
+    return cteOf(&sp.sel.q.subs[0])
+}
+
+// Whether any of xs calls a function whose value differs from one call to the next (the query is run more than once).
+fn volatile(xs: &[]lexdb_sql.Expr): bool {
+    for x in xs {
+        let t = lexdb_sql.exprText(&x)
+        for f in ["random", "rand(", "nextval", "currval", "setval", "newid", "gen_random_uuid", "uuid_generate", "clock_timestamp", "timeofday", "dbms_random", "sys_guid", "pg_sleep", "waitfor"] {
+            if strings.contains(&t, f) { return true }
+        }
+    }
+    return false
+}
+
+// The search for the cap that works: the CTE's rows made as far as cap rows by an attempt, which tells whether the query had
+// enough. A cap that fails with an error is searched below (the error may come from rows the query would not have read:
+// the cap is a bound, whole rounds); the smallest that does is the error the CTE gives.
+pub type Search = record {
+    pub cap: int                // the cap to try
+    lo: int                     // the largest that was too small
+    hi: int                     // the smallest that gave an error (0 none yet)
+    pub failed: DbErr
+}
+
+pub fn start(): Search { return Search{cap: FIRST, lo: 0, hi: 0, failed: lexdb_base.err("XX000", "recursion")} }
+
+// What to do after an attempt: STOP_KEEP (the rows of the last attempt stand), STOP_RUN (run the CTE as it was), STOP_ERR
+// (the search's `failed`), or TRY (the search's `cap` next).
+pub const TRY: int = 0
+pub const STOP_KEEP: int = 1
+pub const STOP_RUN: int = 2
+pub const STOP_ERR: int = 3
+
+// The attempt at s.cap ended as r (DONE, MORE, OUT).
+pub fn (s: mut &Search) after(r: int): int {
+    if r == DONE { return STOP_KEEP }
+    if r == OUT { return STOP_RUN }
+    s.lo = s.cap
+    if s.hi == 0 {
+        s.cap = s.cap * 2
+        return TRY
+    }
+    if s.hi - s.lo <= 1 { return STOP_ERR }
+    s.cap = s.lo + (s.hi - s.lo) / 2
+    return TRY
+}
+
+// The attempt at s.cap gave the error x (the CTE's, not the query's).
+pub fn (s: mut &Search) failedWith(x: DbErr): int {
+    s.hi = s.cap
+    s.failed = x
+    if s.hi - s.lo <= 1 { return STOP_ERR }
+    s.cap = s.lo + (s.hi - s.lo) / 2
+    return TRY
+}

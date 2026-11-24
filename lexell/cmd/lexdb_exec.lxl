@@ -70,6 +70,7 @@ import "./lexdb_census"
 import "./lexdb_recur"
 import "./lexdb_oldnew"
 import "./lexdb_recrun"
+import "./lexdb_recprobe"
 import "./lexdb_standby"
 
 type Val = lexdb_sql.Val
@@ -2648,7 +2649,7 @@ fn planSubIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     let oid = if s.use == lexdb_sql.SUB_EXISTS || len(sel.outs) == 0 { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
     let name = if s.use == lexdb_sql.SUB_EXISTS { "exists" } else if s.use == lexdb_sql.SUB_SCALAR { sel.outs[0].name.clone() } else { "?column?" }
     // (in FROM: its columns are its outs)
-    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte, kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None, lat: []}
+    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte, kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None, lat: [], need: if s.use == lexdb_sql.SUB_FROM && s.cteOnce && sel.rec >= 0 { -2 } else { -1 }}
     // res: a semi-join's alternative (buildQuery), which may keep correlated
     // filters that are not keys as residuals (SubPlan.res) for its level to
     // check. Any other hashed subquery must not: nothing else reads them.
@@ -2884,6 +2885,23 @@ fn cachePut(c: mut &CteCache, key: str, rows: [][]Val) {
     }
     c.index.put(key, len(c.rows))
     append(mut &c.rows, rows)
+}
+
+// A recursive CTE's rows being found as far as a query reading it needs (probeRecursion): its cap in rows ("k" and the CTE's
+// number; the rounds stop at the first that makes that many), and how its run ended ("x": 1 at the cap, 2 at max_recursion).
+fn probeCap(c: &CteCache, rec: int): int {
+    let at = cacheAt(c, &("k" + rec.toStr()))
+    if at < 0 { return -1 }
+    return match c.rows[at][0][0] { Val.Int(n) { n } else { -1 } }
+}
+
+fn probeEnd(c: mut &CteCache, rec: int, how: int) { cachePut(c, "x" + rec.toStr(), [[Val.Int(how)]]) }
+
+fn cacheDrop(c: mut &CteCache, key: &str) {
+    let at = cacheAt(c, key)
+    if at < 0 { return }
+    c.rows[at] = []
+    let gone = c.index.remove(key)
 }
 
 fn copyRows(rows: &[][]Val): [][]Val {
@@ -3242,6 +3260,7 @@ fn runSubs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params:
         if lexdb_plan.lazySeries(q, i) {
             append(mut &subs, try seriesRes(st, txn, sp, &ps, rs))
         } else if sp.use == lexdb_sql.SUB_FROM {
+            if sp.need >= 0 && cacheAt(&rs.cache, &("k" + lexdb_recprobe.recOf(sp).toStr())) < 0 { try probeRecursion(st, txn, q, i, params, rs) }
             append(mut &subs, try runFrom(st, txn, sp, &ps, rs, i))
         } else if sp.semi {
             append(mut &subs, try runSemi(st, txn, sp, &ps, rs, i))
@@ -3258,6 +3277,57 @@ fn runSubs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params:
         try rs.bud.hold(resBytes(&subs[len(subs) - 1]))
     }
     return Ok(subs)
+}
+
+// q reads a recursive CTE (its subquery i) as its first table under a LIMIT of sp.need rows that its conditions and joins
+// filter (lexdb_recprobe.mark): the CTE's rows are made as far as the query needs them, as PostgreSQL's and SQL Server's lazy
+// scans give them. Each attempt makes the CTE to a cap of rows (runRecursive; its rows kept in the cache as any CTE's) and
+// reads it with q's levels, counting the rows they keep; the cap is doubled while those are too few and the recursion went
+// on. The rows stay in the cache, the cap too: the run of q finds them there (runFrom).
+fn probeRecursion(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, i: int, params: &[]Val, rs: mut &Run): Result[Unit, DbErr] {
+    let rec = lexdb_recprobe.recOf(&q.subs[i])
+    let kkey = "k" + rec.toStr()
+    let xkey = "x" + rec.toStr()
+    let ckey = "c" + lexdb_recprobe.cteOf(&q.subs[i]).toStr()
+    let need = q.subs[i].need
+    let batch = rs.batch
+    var sr = lexdb_recprobe.start()
+    var step = lexdb_recprobe.TRY
+    while step == lexdb_recprobe.TRY {
+        cachePut(mut &rs.cache, kkey.clone(), [[Val.Int(sr.cap)]])
+        cacheDrop(mut &rs.cache, &ckey)
+        cacheDrop(mut &rs.cache, &xkey)
+        rs.batch = false
+        match prepareIn(st, txn, q, params, rs, true, true) {
+            Err(x) {
+                rs.batch = batch
+                step = sr.failedWith(x)
+            }
+            Ok(m) {
+                // how the CTE's run ended: no flag, by itself; 1 at the cap; 2 at max_recursion
+                let at = cacheAt(&rs.cache, &xkey)
+                let how = if at < 0 { 0 } else { match rs.cache.rows[at][0][0] { Val.Int(h) { h } else { 0 } } }
+                var n = 0
+                if how > 0 {
+                    let ran = runQuery(st, txn, q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
+                        n += 1
+                        return Ok(n < need)
+                    }, rs)
+                    rs.batch = batch
+                    try ran
+                }
+                rs.batch = batch
+                step = sr.after(if how == 0 || n >= need { lexdb_recprobe.DONE } else if how == 1 { lexdb_recprobe.MORE } else { lexdb_recprobe.OUT })
+            }
+        }
+    }
+    if step == lexdb_recprobe.STOP_KEEP { return Ok(Unit{}) }
+    // (the CTE as it was: its rows made whole, or its error; the cap -1 so that no other run of q tries again)
+    cacheDrop(mut &rs.cache, &ckey)
+    cacheDrop(mut &rs.cache, &xkey)
+    cachePut(mut &rs.cache, kkey, [[Val.Int(-1)]])
+    if step == lexdb_recprobe.STOP_ERR { return Err(sr.failed.clone()) }
+    return Ok(Unit{})
 }
 
 // Whether a subquery's run's error waits for its value to be read (E5): a
@@ -10420,10 +10490,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     let topN = if s.topMode != 0 { n0 } else { -1 }
     let limit = if s.topMode != 0 { -1 } else { n0 }
     let offset = try lexdb_plan.evalInt(&s.offset, params, "OFFSET", mut &sc.looks)
-    if limit >= 0 && len(q.levels) == 1 && q.levels[0].src >= 0 && s.setop == 0 && len(order) == 0 && !aggQ && !s.distinct && len(s.distinctOn) == 0 &&
-       len(s.from) == 1 && s.where.isNone() && len(wdefs) == 0 {
-        limitRecursion(mut &q, limit + max(offset, 0))
-    }
+    if limit >= 0 { limitQuery(mut &q, s, limit + max(offset, 0), len(order) == 0 && !aggQ && len(wdefs) == 0) }
     var sort = len(order) > 0
     var first = -1
     // The first table's order holds through the joins, unless a RIGHT or
@@ -11095,6 +11162,25 @@ fn setRes(sel: &Sel, rows: [][]Val, n: int): Res {
     return Res{cols: outs, rows: rows, tag: "SELECT " + n.toStr(), hasRows: true, copy: COPY_NONE}
 }
 
+// A query with a LIMIT of need rows (plain: no ORDER BY, grouping or window function) over a recursive CTE: its rows are made as far as the
+// query needs them, as PostgreSQL's and SQL Server's lazy scans give them (limitRecursion: the CTE alone; lexdb_recprobe: a filter, a join,
+// a derived table, which the query finds the rows it needs by trying). Here, called for a LIMIT query only, so that a statement
+// without one pays nothing for it (the point path).
+fn limitQuery(q: mut &Query, s: &lexdb_sql.Stmt, need: int, plain: bool) {
+    if !plain || s.setop != 0 || s.distinct || len(s.distinctOn) != 0 { return }
+    if len(q.levels) == 1 && q.levels[0].src >= 0 && len(s.from) == 1 && s.where.isNone() { limitRecursion(q, need) }
+    if s.mdialect == lexdb_sql.MD_ORA || s.lockMode != 0 || s.withTies { return }
+    var xs: []Expr = []
+    for it in s.items {
+        match it.expr {
+            Some(x) { append(mut &xs, x.clone()) }
+            None {}
+        }
+    }
+    if lexdb_plan.hasSrfCall(&xs) { return }
+    lexdb_recprobe.mark(q, need)
+}
+
 // A SELECT of a recursive CTE's rows alone (no WHERE, join, grouping or order), with a LIMIT of need rows (the offset's too):
 // the recursion stops when it has made them, as PostgreSQL's lazy scan of the working table does, not at max_recursion
 // (its own limit is that many rows: runRecursive).
@@ -11102,9 +11188,10 @@ fn limitRecursion(q: mut &Query, need: int) {
     let i = q.levels[0].src
     if i >= len(q.subs) || q.subs[i].cte < 0 || q.subs[i].sel.rec < 0 || q.subs[i].sel.setop == 0 || q.subs[i].sel.limit >= 0 || len(q.subs[i].sel.order) > 0 { return }
     // (the CTE read by this FROM item alone: a second use needs every row)
+    // (the statement's only use of it: Stmt.cteOnce, SubPlan.need -2; another use, a UNION's other part, needs every row)
     var uses = 0
     for sp in q.subs { if sp.cte == q.subs[i].cte { uses += 1 } }
-    if uses == 1 && len(q.subs) == 1 { q.subs[i].sel.limit = need }
+    if uses == 1 && len(q.subs) == 1 && q.subs[i].need == -2 { q.subs[i].sel.limit = need }
 }
 
 // A recursive CTE: the first query's rows, then rounds of the second over
@@ -11121,6 +11208,8 @@ fn runRecursive(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, lp
     var out: [][]Val = []
     // a LIMIT of the query reading it alone (limitRecursion): the rows it needs
     let need = if sel.limit >= 0 && len(sel.order) == 0 { sel.limit + max(sel.offset, 0) } else { -1 }
+    // (a query above it that filters finds how many rows it needs by trying: probeRecursion)
+    let cap = probeCap(&rs.cache, sel.rec)
     // max_recursion: rounds that add rows (the last round, adding none, is free)
     var rounds = 0
     while len(work) > 0 {
@@ -11128,12 +11217,20 @@ fn runRecursive(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, lp
         try rs.bud.hold(lexdb_pipe.rowsBytes(&work) * 2)       // kept in the result and as the working table
         for r in work { append(mut &out, collections.copyOf(&r)) }
         if need >= 0 && len(out) >= need { break }
+        if cap >= 0 && len(out) >= cap {
+            probeEnd(mut &rs.cache, sel.rec, 1)
+            break
+        }
         cachePut(mut &rs.cache, key.clone(), work)
         var rres = try runChild(st, txn, &sel.parts[1], rp, -1, rs, 1)
         work = replace(mut &rres.rows, [])
         if !sel.setAll { work = lexdb_setop.distinctRows(work, mut &seen, &sel.outKinds) }
         rounds += 1
         if rs.maxRounds > 0 && rounds > rs.maxRounds && len(work) > 0 {
+            if cap >= 0 {
+                probeEnd(mut &rs.cache, sel.rec, 2)
+                break
+            }
             return Err(e("54001", &("recursive query still adding rows after " + rs.maxRounds.toStr() +
                          " rounds (max_recursion); SET max_recursion = n to allow more, 0 for no limit")))
         }
@@ -11153,14 +11250,38 @@ fn runRecursiveAs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, 
     var made = replace(mut &lres.rows, [])
     if !sel.setAll { made = lexdb_setop.distinctRows(made, mut &seen, &sel.outKinds) }
     var work = try run.anchor(made)
+    // (a query above it that filters finds how many rows it needs by trying: probeRecursion; the rows of a chain, a row a round,
+    // are the same in any order: the first rows are the first rows)
+    let cap = probeCap(&rs.cache, sel.rec)
+    var chain = len(work) == 1
+    var rounds = 0
+    var made1 = 1
     while len(work) > 0 {
         try rs.bud.tick()
         try rs.bud.hold(lexdb_pipe.rowsBytes(&work) * 2)
+        if cap >= 0 && chain && made1 >= cap {
+            probeEnd(mut &rs.cache, sel.rec, 1)
+            break
+        }
         cachePut(mut &rs.cache, key.clone(), work)
         var rres = try runChild(st, txn, &sel.parts[1], rp, -1, rs, 1)
         var next = replace(mut &rres.rows, [])
         if !sel.setAll { next = lexdb_setop.distinctRows(next, mut &seen, &sel.outKinds) }
-        work = try run.round(next)
+        rounds += 1
+        if len(next) != 1 { chain = false }
+        made1 += len(next)
+        work = []
+        match run.round(next) {
+            Ok(w) { work = w }
+            Err(x) {
+                // (the rounds ran out under a cap: the query reads the rows made before)
+                if cap >= 0 && chain && rs.maxRounds > 0 && rs.maxRounds < lexdb_recrun.TRUNCATE && rounds > rs.maxRounds {
+                    probeEnd(mut &rs.cache, sel.rec, 2)
+                    break
+                }
+                return Err(x)
+            }
+        }
     }
     return Ok(run.finish())
 }
