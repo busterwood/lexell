@@ -88,8 +88,6 @@ sql_body:
   - named arguments (`f(a => 1)`) are taken by `CALL` only, and `VARIADIC` is read but cannot be called.
 - With overloads `add(int, int)` and `add(numeric, numeric)`, `add(2, 3)` calls the `numeric` one; PostgreSQL calls
   the `integer` one.
-- The result column of a call is named after its type or expression (`int4`, `numeric`, `?column?`), not after the
-  function; give it a name with `AS`.
 - `SECURITY DEFINER` is accepted and ignored: a function runs as its caller.
 - `ALTER FUNCTION` is not supported.
 
@@ -252,6 +250,8 @@ ERROR:  no function body specified
 
 ### G. Overloads, and the result's name
 
+The result column of a call is named after the function (`twice`, `add`), as in PostgreSQL.
+
 <!-- example: postgresql -->
 ```sql
 CREATE FUNCTION add(a numeric, b numeric) RETURNS numeric RETURN a + b + 0.5;
@@ -261,14 +261,14 @@ SELECT twice(2);
 
 ```text
 CREATE FUNCTION
- numeric | numeric
----------+---------
-     5.5 |     5.5
+ add | add
+-----+-----
+ 5.5 | 5.5
 (1 row)
 
- int4
-------
-    4
+ twice
+-------
+     4
 (1 row)
 ```
 
