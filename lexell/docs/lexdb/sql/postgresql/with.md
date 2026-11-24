@@ -57,18 +57,19 @@ recursive query:
 - A `WITH` query is part of its statement: it sees the same snapshot, and a statement after `WITH` may be `INSERT`,
   `UPDATE`, `DELETE` or `MERGE` as well as `SELECT`.
 - A recursive query stops with 54001 after `max_recursion` rounds (1000 by default) that still add rows. `SET
-  max_recursion = n` changes the limit; 0 is no limit. A constant `LIMIT` on a plain `SELECT` of the query ends it
-  sooner, when it has the rows.
+  max_recursion = n` changes the limit; 0 is no limit. A `LIMIT` or `FETCH FIRST` ends it sooner, when the statement
+  has the rows, also when a `WHERE`, a join, a left join or a derived table filters the query's rows (example H).
 - A recursive term may not read its own name in a subquery (42P19), as in PostgreSQL.
 
 ## Differences from PostgreSQL
 
 - Data-modifying statements in `WITH` (`WITH d AS (DELETE ... RETURNING *) SELECT ...`) are not supported (42601,
   lexdb-gaps.md 2.2).
-- A recursive query stops at a `LIMIT` only when the statement is a plain `SELECT` of the query with a constant
-  `LIMIT` (and `OFFSET`): `SELECT * FROM r LIMIT 3` gives three rows. With a `WHERE`, a join, grouping, `DISTINCT`,
-  `ORDER BY` or an enclosing query block, PostgreSQL still stops when it has the rows, and lexdb runs the recursion
-  until `max_recursion` and fails with 54001. Put the bound in the recursive term (`WHERE n < 3`).
+- A recursive query stops at a `LIMIT` when the statement has no `ORDER BY`, grouping, `DISTINCT` or window, and
+  reads the query as its first table (a derived table of such a query too). It still runs until `max_recursion` and
+  fails with 54001 for a join where lexdb's planner reads the other table first (`FROM rt JOIN n`), for a subquery
+  in the `WHERE` or the select list, and for a `WHERE` that calls `nextval` or `random`; PostgreSQL stops in those
+  cases when it has the rows. Put the bound in the recursive term (`WHERE n < 3`).
 - A recursive term with an aggregate, a window function, `ORDER BY`, or an outer join that has its own name on the
   nullable side is not refused, as PostgreSQL refuses it (42P19, 0A000). Such a query usually never stops adding
   rows, and ends with 54001 at `max_recursion`.
@@ -272,13 +273,15 @@ INSERT 0 2
 
 ### H. The recursion limit
 
-A `LIMIT` ends an endless query when the statement only selects from it; a `WHERE` in the statement does not allow
-that.
+A `LIMIT` ends an endless query when it has its rows, also when a `WHERE`, a join or a derived table filters them.
+A subquery in the `WHERE` is not understood: the recursion runs to `max_recursion`.
 
 <!-- example: postgresql -->
 ```sql
 WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT * FROM r LIMIT 3;
-WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT * FROM r WHERE n > 0 LIMIT 3;
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT * FROM r WHERE n % 7 = 0 LIMIT 3;
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT d.n, emp.name FROM (SELECT n FROM r WHERE n % 3 = 0) AS d LEFT JOIN emp ON emp.id = d.n LIMIT 2;
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT * FROM r WHERE n IN (SELECT 3) LIMIT 1;
 SET max_recursion = 5000;
 WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 2000) SELECT count(*) FROM r;
 RESET max_recursion;
@@ -291,6 +294,19 @@ RESET max_recursion;
  2
  3
 (3 rows)
+
+ n
+----
+  7
+ 14
+ 21
+(3 rows)
+
+ n | name
+---+------
+ 3 | cy
+ 6 | fay
+(2 rows)
 
 ERROR:  recursive query still adding rows after 1000 rounds (max_recursion); SET max_recursion = n to allow more, 0 for no limit
 SET
