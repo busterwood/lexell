@@ -50,9 +50,6 @@ END [ package ] ;
   (example D). A package variable is also an `INTO` target (`SELECT`, `FETCH`, `RETURNING`, `EXECUTE IMMEDIATE`), a
   `USING OUT` bind and an `OUT` or `IN OUT` argument of a call from outside the package (example G). Not supported: a
   variable of a record or collection type.
-- **`SELECT pkg.f() FROM dual` of a function that reads a package variable gives a constant of the cached plan:** a
-  second call after the variable is assigned gives the first answer (Oracle: the current value). Call the function in
-  a block (`v := pkg.f();`), where it is read every time.
 - A specification that declares procedures or functions needs its body: without it a call is PLS-00201 (Oracle:
   ORA-04067).
 - Records, subtypes and exceptions declared in a package are not supported, with a body or without. Collection types and

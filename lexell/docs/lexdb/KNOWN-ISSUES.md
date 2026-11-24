@@ -469,6 +469,10 @@ smaller differences of its statement.
     (a call is PLS-00201 without it); a function without parameters needs brackets in SQL (`SELECT f FROM dual` is ORA-00904); `CALL f()` of
     a function is PLS-00201; `TO_NUMBER('abc')` raises `VALUE_ERROR`, not `INVALID_NUMBER`; `LOCK TABLE` in a block,
     `GOTO`, `FORALL` and collections are refused.
+  - A stored function (a standalone one or a package's) called in a SQL statement inside a block is ORA-00904:
+    `SELECT f(x) INTO v FROM t`, the query of a cursor `FOR` loop and `EXECUTE IMMEDIATE 'SELECT f(x) FROM t' INTO v`
+    (found writing the PL/SQL pages, on main e689d814; not fixed). `v := f(x);` in the block, and the same `SELECT`
+    sent by itself, work.
 - **Functions** (found writing the Oracle function pages):
   - **Character:** `LENGTHB` and `SUBSTRB` count characters (`LENGTHB('€')` is 1); `LENGTH(DATE ...)` is 19;
     `TRIM('xy' FROM 'xyabc')` returns `abc` (Oracle ORA-30001); `SYS_GUID()` is text of 64 hex digits, not `RAW(16)`;
