@@ -46,9 +46,6 @@ argmode:
 
 - **There is no PL/pgSQL, and no `DO`.** Procedures are `LANGUAGE sql` only: a body cannot `COMMIT` or
   `ROLLBACK`, or loop.
-- In a procedure's body, `1 + p / 100` with a `numeric` parameter `p` of 10 gives 1, as if the division were of
-  integers: `UPDATE emp SET salary = salary * (1 + pct / 100)` leaves the salaries as they were. The same
-  expression in a function's body or in a query gives 1.1.
 - `SECURITY DEFINER` is accepted and ignored.
 - `ALTER PROCEDURE` is not supported.
 
@@ -125,7 +122,30 @@ DETAIL:  Key (id)=(3) already exists.
 (1 row)
 ```
 
-### D. Errors
+### D. A numeric parameter in an expression
+
+A `numeric` parameter divides as a decimal, as in a query: `1 + pct / 100` is 1.10 for a *pct* of 10.
+
+<!-- example: postgresql -->
+```sql
+CREATE PROCEDURE raise_pct(pct numeric) LANGUAGE sql AS $$
+    UPDATE emp SET salary = salary * (1 + pct / 100)
+$$;
+CALL raise_pct(10);
+SELECT id, salary FROM emp ORDER BY id;
+```
+
+```text
+CREATE PROCEDURE
+CALL
+ id | salary
+----+---------
+  1 | 5720.00
+  2 | 3520.00
+(2 rows)
+```
+
+### E. Errors
 
 <!-- example: postgresql -->
 ```sql
