@@ -30,7 +30,7 @@ returning_clause:
 
 *schema*
 : The schema (user) that owns the table. Without it, the session's current schema: the login user, or the one
-  `ALTER SESSION SET CURRENT_SCHEMA` set. Tables of the PostgreSQL door's `public` schema are `PUBLIC.table`.
+  `ALTER SESSION SET CURRENT_SCHEMA` set. A name without a schema is looked for in that schema, then in the PostgreSQL door's `public` schema (also `public.table`).
 
 *t_alias*
 : A name for the table in the `RETURNING` clause.
