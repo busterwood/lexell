@@ -25,7 +25,7 @@ COPY table_name [ ( column_name [, ...] ) ] FROM STDIN [ [ WITH ] ( option [, ..
 COPY { table_name [ ( column_name [, ...] ) ] | ( query ) } TO STDOUT [ [ WITH ] ( option [, ...] ) ]
 
 option:
-    FORMAT { text | csv }
+    FORMAT { text | csv | json }          -- json: COPY TO only
     DELIMITER 'delimiter_character'
     NULL 'null_string'
     HEADER [ boolean ]
@@ -34,6 +34,10 @@ option:
     FORCE_QUOTE { ( column_name [, ...] ) | * }
     FORCE_NOT_NULL ( column_name [, ...] )
     FORCE_NULL ( column_name [, ...] )
+    FORCE_ARRAY [ boolean ]               -- with json
+    ON_ERROR { stop | ignore }            -- COPY FROM
+    REJECT_LIMIT n                        -- with ON_ERROR ignore
+    LOG_VERBOSITY { default | verbose | silent }
     ENCODING 'UTF8'
     FREEZE [ boolean ]
     batch_rows n                        -- lexdb's own
@@ -50,6 +54,12 @@ COPY ... [ WITH ] [ BINARY ] [ DELIMITER [ AS ] 'c' ] [ NULL [ AS ] 's' ]
   (or writes) a first line of names.
 - `FORCE_QUOTE` quotes a column's values on the way out; `FORCE_NOT_NULL` never reads a column as NULL;
   `FORCE_NULL` reads a quoted NULL string as NULL.
+- **json** (`COPY TO` only): one JSON object a row, `{"id":1,"name":"Lisbon"}`; `FORCE_ARRAY` writes the objects as
+  one array, `[`, a row to a line, `]`. `COPY FROM` with it is 22023, as in PostgreSQL.
+- **`ON_ERROR ignore`** (`COPY FROM`): a row with a value its column's type does not take is skipped, and a NOTICE at
+  the end counts the rows skipped (`LOG_VERBOSITY verbose` also names each, `silent` gives none). Any other error
+  (a missing field, a constraint, a duplicate key) still stops the load. `REJECT_LIMIT n` fails the load (22P02)
+  when more than n rows were skipped. The rows of a failed load are not kept.
 - **`batch_rows n`** (lexdb's own, `COPY FROM` only): commit every n rows. A very large load then needs memory for n
   rows' writes only. It is not all or nothing: a failure keeps the batches committed before it, and the error says
   how many rows were committed. Not allowed inside a transaction block (25001).
@@ -132,6 +142,28 @@ CONTEXT:  COPY city, line 4
 (2 rows)
 ```
 
+Skipping the rows that do not fit, and JSON out:
+
+<!-- example: postgresql -->
+```sql
+COPY city FROM STDIN WITH (FORMAT csv, ON_ERROR ignore, REJECT_LIMIT 2);
+9,Beja,35000,1254-01-01
+10,Tavira,lots,1244-01-01
+11,Sines,not a number,1362-01-01
+12,Elvas,23000,1230-01-01
+\.
+COPY (SELECT id, name, pop FROM city WHERE id > 8 ORDER BY id) TO STDOUT WITH (FORMAT json, FORCE_ARRAY);
+```
+
+```text
+NOTICE:  2 rows were skipped due to data type incompatibility
+COPY 2
+[
+ {"id":9,"name":"Beja","pop":35000}
+,{"id":12,"name":"Elvas","pop":23000}
+]
+```
+
 ### From psql
 
 `\copy` runs `COPY ... FROM STDIN` or `TO STDOUT` and reads or writes a file on the client:
@@ -167,7 +199,7 @@ Lexell's `postgres` module has no COPY.
 ### Differences from PostgreSQL
 
 - No binary format (0A000), no server files or programs (0A000).
-- No `WHERE`, `ON_ERROR`, `REJECT_LIMIT`, `LOG_VERBOSITY`, `DEFAULT` or `HEADER MATCH` (0A000).
+- No `WHERE`, `DEFAULT` or `HEADER MATCH` (0A000), and no `ON_ERROR set_null` (PostgreSQL 19; 0A000).
 - `COPY (query)` takes a `SELECT` (or `WITH ... SELECT`), not `INSERT/UPDATE/DELETE ... RETURNING`.
 - Both `\n` and `\r\n` line ends are read in one input; PostgreSQL fixes the line end from the first line.
 - `ENCODING` must be UTF8.
