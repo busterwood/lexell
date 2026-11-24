@@ -71,6 +71,8 @@ merge_insert:
   second time`), and nothing is changed.
 - Constraints, defaults, identity columns and foreign keys apply to the rows as in `INSERT`, `UPDATE` and `DELETE`.
 - A `MERGE` is one statement: all its changes are made, or none are.
+- A subquery in a `WHEN` condition, in `SET` or in `VALUES` reads the tables as the statement found them: it does not
+  see the rows the same `MERGE` has already changed (example F).
 - `EXPLAIN MERGE` shows the join that pairs the rows.
 - Inside a read-only transaction, and on a replica, `MERGE` gives 25006.
 
@@ -225,7 +227,43 @@ RETURNING p.id, p.stock;
 MERGE 1
 ```
 
-### F. Errors
+### F. A subquery reads the rows as the statement found them
+
+The subquery sums the stock of the whole table. Both matched rows get the same total, the one before the statement
+changed anything.
+
+<!-- example: postgresql -->
+```sql
+SELECT sum(stock) AS total_before FROM product;
+BEGIN;
+MERGE INTO product p
+USING delivery d ON p.id = d.product_id
+WHEN MATCHED THEN UPDATE SET stock = (SELECT sum(stock) FROM product);
+SELECT id, stock FROM product ORDER BY id;
+ROLLBACK;
+```
+
+```text
+ total_before
+--------------
+          239
+(1 row)
+
+BEGIN
+MERGE 2
+ id | stock
+----+-------
+  1 |   239
+  2 |    40
+  3 |   239
+  4 |    99
+ 10 |     0
+(5 rows)
+
+ROLLBACK
+```
+
+### G. Errors
 
 <!-- example: postgresql -->
 ```sql
