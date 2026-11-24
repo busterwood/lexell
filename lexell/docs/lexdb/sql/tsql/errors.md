@@ -52,12 +52,17 @@ feature, the number is **50000**.
 | 547 | A `CHECK` or `FOREIGN KEY` constraint violated. |
 | 2627 | A `PRIMARY KEY` or `UNIQUE` constraint violated (a unique index gives the same). |
 | 8110 | A second `PRIMARY KEY` in `CREATE TABLE`. |
-| 1902 | A second `CLUSTERED` index on a table. |
+| 1779 | A second `PRIMARY KEY` by `ALTER TABLE`. |
+| 8112 | Two `CLUSTERED` keys in one `CREATE TABLE`. |
+| 1902 | A second `CLUSTERED` index on a table (`CREATE INDEX` and `ALTER TABLE`). |
+| 220, 244 | A value outside `tinyint`'s 0 to 255: a number (220), a string (244). |
+| 206 | An operand type clash: `date`, `datetime2`, `datetimeoffset` or `time` with a number. |
+| 402 | The data types of the operands are incompatible for the operator: a binary value beside another binary in an arithmetic or bit operator (`+` joins them), or beside a string outside a comparison. |
 | 2628 | A string too long for its column. |
 | 241 | A date or time that cannot be read. |
 | 245 | A string that cannot be converted to an integer. |
 | 517 | A date or time out of range (`2026-02-30`, `25:00`). |
-| 8114 | A string that cannot be converted to a `decimal`, `float` or `bigint`. |
+| 8114 | A string that cannot be converted to a `decimal`, `float` or `bigint`; a `decimal` beside a binary value. |
 | 8115 | An arithmetic overflow, an integer out of range or a number too large for its decimal. |
 | 8134 | Division by zero. |
 | 512 | A subquery that returns more than one value where one is expected. |
@@ -76,6 +81,7 @@ feature, the number is **50000**.
 | 4121 | A column, function or method that cannot be found by that name. |
 | 4902 | A table named by `TRUNCATE` or similar that cannot be found. |
 | 5074 | An object depends on the column you are dropping or changing. |
+| 3729 | `DROP SEQUENCE` of a sequence a column's default uses. |
 | 2754 | `RAISERROR` of severity 19 to 25 without `WITH LOG`. |
 | 5324, 8672, 10713 | `MERGE` rules: a `WHEN` clause after one with no condition; a target row matched twice; a missing `;`. |
 | 310, 1042 | `OPTION (MAXRECURSION n)` out of range, or given twice. |
