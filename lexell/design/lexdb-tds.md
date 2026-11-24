@@ -1179,3 +1179,10 @@ the brief said NULL, SQL Server 2022 says 9818). Dates of cultures other than th
 Checked because the Oracle door's stored functions failed in a block's SQL (lexdb-oracle.md, "stored functions in the SQL of a block"): the T-SQL door has no such bug. A scalar function
 called in `SELECT @v = dbo.f(a) FROM t`, INSERT (VALUES and SELECT), UPDATE and DELETE inside a batch with IF and WHILE, a procedure, `EXEC('...')` and `sp_executesql` gives SQL Server 2022's
 answers. Test `tds_udfblock` (15 batches, batches off and on; gen_mssql.py udfblock). Not supported, as before: a T-SQL cursor (`DECLARE c CURSOR FOR`, error 102).
+
+## As built: a prepared statement run again (2026-11-24)
+
+Checked because the Oracle door failed every second run of a prepared DML statement from JDBC (lexdb-oracle.md, "a cursor run again"): mssql-jdbc 13.6 runs INSERT, UPDATE, DELETE and SELECT 12 times each
+(and a batch of 100 three times) through sp_prepexec and sp_execute, with the defaults, `enablePrepareOnFirstPreparedStatementCall=true`, `prepareMethod=prepare` and statement pooling, with a bind
+that changes from int to text every fourth run: no failure, the row counts are the ones the arithmetic gives. No change in this door; not added to `MssqlJdbc` (its prepared cases already run a statement
+more than once).

@@ -1207,3 +1207,31 @@ UPDATE, DELETE (INSERT ... VALUES and DELETE with constant arguments already wor
   IF, WHILE, a procedure, EXEC, sp_executesql, DML with a call) and PostgreSQL's (`exec_sqlfunc`, against PostgreSQL 18: a SQL function in a function's body and a procedure's
   statements; no DO or PL/pgSQL) had no such bug.
 - The cached-plan report (a package function that reads a variable, called with no or constant arguments, gave the first run's value on a statement run again) was real, for a client that keeps its cursor (python-oracledb; JDBC with implicit statement caching): `prepare` replaces such a call by its value (`expandCalls`) at each execute, but the cursor's plan cache (`pc`) kept the plan of the first text, with the first value in it. `prepare` now makes a new plan cache for a cursor whose text it changed. Check: `OracleJdbc.storedFunctions` (statement cache on; 200 passed against Oracle Free, the same on lexdb; before the fix 'cached statement' and 'one statement twice' failed). A view that calls a stored function cannot be created (ORA-00904, Oracle allows it): not done.
+
+## As built: a cursor run again (KNOWN-ISSUES.md, 2026-11-24)
+
+ojdbc runs a PreparedStatement's open cursor again (the second `executeUpdate()`, a pool's reuse, a batch loop, Hibernate) with an EXECUTE of the cursor id (function 94) that has no SQL
+(options 0x8120 where the first run's were 0x8129: no parse bit, no bind bit), a bind count of 0 and, after the 13 words of the call's tail, the values alone: ROW_DATA and the
+values, typed by the bind descriptions of the run before. A query takes a different call (REEXECUTE_FETCH, function 78: the values only as well), which `readRequest` already
+read with the cursor's own descriptions; the EXECUTE with no descriptions took none, so an INSERT, UPDATE, DELETE, MERGE or block failed at its second run with ORA-01008, whatever
+the values. python-oracledb always sends its descriptions and never hit it. `readRequest` now reads the values with the cursor's `meta`, its `sites` and its `dirs` (the OUT binds of a
+block) when the call has no parse bit, no descriptions and the next byte is ROW_DATA (a define-only call has none). A run that sends descriptions again (a bind whose type changed, or a
+NULL: `setNull` with another type) replaces the cursor's, and the values alone after it are read by the new ones. No change in `execute`: the 1008 check was right, the values were not read.
+- Checked by `OracleJdbc.reuse` (INSERT with NUMBER, VARCHAR2, DATE and TIMESTAMP binds 20 times, NULLs of every type, a text for a number, types back, a duplicate key and a run after
+  the error; UPDATE, DELETE, MERGE; `{call}` and `begin ...; end;` with IN, NULL and text, and a call with OUT and IN OUT; batches of 100, 100, 100, 3 and a single run, and an UPDATE batch
+  run again; RETURNING INTO with `registerReturnParameter`; implicit statement caching with prepareStatement of one text in a loop): 256 passed on lexdb, 259 on Oracle Free (the
+  three more are the generated-keys checks lexdb skips as before). The same program fails at its 2nd INSERT before the fix.
+- `tns_reuse` (in process): `tns.Execute.valuesOnly` (lib/tns, the client's new field, which sends exactly that call) for INSERT, UPDATE, DELETE, MERGE and a block, run again with the
+  same types, with a NULL, with the descriptions sent again for a changed type and the values alone after it, and after a failed run. Without the fix every run after the first of a cursor fails with ORA-01008.
+- pgjdbc (42.7.14: `prepareThreshold` 5, 0 and 1; INSERT, UPDATE, DELETE, SELECT 12 times each, a bind that is text every fourth run, a batch of 100 three times) and mssql-jdbc
+  (sp_prepexec, `enablePrepareOnFirstPreparedStatementCall`, `prepareMethod=prepare`, statement pooling; the same loops) re-execute without a failure (pgjdbc re-runs a named statement with Bind and Execute, mssql-jdbc with sp_execute and the handle); nothing changed in those doors.
+- Cost (JDBC, one client, server on CPUs 0-3, 20,000 autocommitted statements, two rounds; the round trip and the commit are most of it): a literal INSERT 273 to 278 us, a prepared
+  one run again 259 to 261 us; a literal UPDATE by key 292 to 297 us, a prepared one 278 to 289 us. The re-use saves 5% of the statement (the parse and plan of a statement of
+  this size are small next to the wire and the commit). A literal loop on the branch is the same as on main (269 to 270, 292 to 295 against 273 to 278, 296 to 297).
+- Point select, INSERT, UPDATE by key: the change is in the TNS door's request reader, which the in-process path does not link. In process (`LXL_HASH_SEED=1`, (20,000 runs - 1 run) / 19,999;
+  500 for INSERT and UPDATE), two rounds: 98,579.71 / 98,579.75 instructions a select on main against 98,579.92 / 98,579.92 on the branch (+0.2); INSERT 109,574,140.6 / .5 against
+  109,574,146.5 / .8; UPDATE 109,564,830.3 / .4 against 109,564,836.1 / .2 (+6 in 109.6 million). The same sources with an unused function added to lexdb_tns.lxl (no imported module
+  changes) give 98,579.83 (+0.12): the difference is a placement effect of a build that has a different unimported file, not an executed instruction. Over the wire (`icount6.sh`, 3
+  rounds, 60,000 statements; main twice, branch twice): instructions 163,357 / 163,362 against 163,377 / 163,451, cycles 90,833 / 92,096 against 90,167 / 91,330, L1 i-cache misses 330 /
+  336 against 378 / 380; the control (main with an unused function in lexdb_tns.lxl): 163,470 / 163,345 instructions (main alone ranges 163,319 to 163,532), i-cache 375 / 374: every
+  change to the TNS door's file moves the i-cache misses by that much, and the cycles are not slower.
