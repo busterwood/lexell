@@ -22,14 +22,13 @@ DROP SEQUENCE [ IF EXISTS ] [ schema_name . ] sequence_name [ ,...n ]
 ## Remarks
 
 - `DROP SEQUENCE` is transactional.
-- A sequence that a column's default calls (`DEFAULT (NEXT VALUE FOR s)`) cannot be dropped while the default exists.
+- A sequence that a column's default calls (`DEFAULT (NEXT VALUE FOR s)`) cannot be dropped while the default exists:
+  error 3729, which names the default constraint (`DF__table__column__nnnnnnnn`, a name lexdb makes). Drop the table
+  or the default first (example B).
 
 ## Differences from SQL Server
 
 - A sequence that does not exist is error 208, `sequence "s" does not exist` (SQL Server: 3701).
-- A sequence that a column's default uses is refused, as in SQL Server, but with error 50000 and PostgreSQL's text
-  (`cannot drop sequence ticket because other objects depend on it`); SQL Server's is 3729. Drop the table or the
-  default first (example B).
 
 ## Examples
 
@@ -70,8 +69,8 @@ SELECT COUNT(*) AS sequences FROM sys.sequences;
 ```
 
 ```text
-Msg 50000, Level 16, State 1, Line 3
-cannot drop sequence ticket because other objects depend on it
+Msg 3729, Level 16, State 1, Line 3
+Cannot DROP SEQUENCE 'ticket' because it is being referenced by object 'DF__t__id__1387171750'.
 (1 row affected)
 
 id v
