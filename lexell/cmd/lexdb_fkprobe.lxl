@@ -40,15 +40,23 @@ pub type FkRef = record {
     pub parent: int             // the parent's place in the statement's tables
     pub at: []int               // per key column, its place in the rows given (the statement's targets), -1 none
     known: Map[str, int]        // the parent's primary keys known to be there
-    prow: []Val                // a row of the parent's width, for making keys
+    pkAt: []int                 // per column of the parent's primary key, its place in cols (via -1)
 }
 
 pub type Probes = record { pub fks: []FkRef }
 
 pub fn none(): Probes { return Probes{fks: []} }
 
-pub fn ref(cols: []int, refCols: []int, via: int, parent: int, at: []int, width: int): FkRef {
-    return FkRef{cols: cols, refCols: refCols, via: via, parent: parent, at: at, known: newMap(), prow: array(width, Val.Null)}
+pub fn ref(cols: []int, refCols: []int, via: int, parent: int, at: []int, pk: &[]int): FkRef {
+    var pkAt: []int = []
+    if via == -1 {
+        for c in pk {
+            var j = -1
+            for x in 0..len(refCols) { if refCols[x] == c { j = x } }
+            append(mut &pkAt, j)
+        }
+    }
+    return FkRef{cols: cols, refCols: refCols, via: via, parent: parent, at: at, known: newMap(), pkAt: pkAt}
 }
 
 pub fn (pr: mut &Probes) add(f: FkRef) { append(mut &pr.fks, f) }
@@ -62,18 +70,17 @@ pub fn (pr: &Probes) any(): bool {
     return false
 }
 
-// The key in parent p of the values vals (in the foreign key's order), as a
-// row's check reads it.
-pub fn (pr: mut &Probes) key(k: int, p: &Table, vals: &[]Val): str {
-    for j in 0..len(vals) { pr.fks[k].prow[pr.fks[k].refCols[j]] = vals[j].clone() }
-    return lexdb_access.keyOf(&lexdb_catalog.relOf(p), &pr.fks[k].prow)
+// The key in parent p (by its primary key, via -1) of a foreign key's values: vals[at[m]] the m-th key column's (in the
+// foreign key's order), as a row's check reads it (lexdb_access.keyOf of the parent's row), encoded without a copy.
+fn (pr: &Probes) keyOfVals(k: int, p: &Table, vals: &[]Val, at: &[]int): str {
+    var b = ""
+    let f = &pr.fks[k]
+    for x in 0..len(f.pkAt) { lexdb_access.encKeyCol(mut &b, &p.cols[p.pk[x]], &vals[at[f.pkAt[x]]]) }
+    return b
 }
 
 // The same from a row of the child: its key columns' values.
-pub fn (pr: mut &Probes) keyOfRow(k: int, p: &Table, row: &[]Val): str {
-    for j in 0..len(pr.fks[k].cols) { pr.fks[k].prow[pr.fks[k].refCols[j]] = row[pr.fks[k].cols[j]].clone() }
-    return lexdb_access.keyOf(&lexdb_catalog.relOf(p), &pr.fks[k].prow)
-}
+pub fn (pr: &Probes) keyOfRow(k: int, p: &Table, row: &[]Val): str { return pr.keyOfVals(k, p, row, &pr.fks[k].cols) }
 
 // Whether the parent key is known to be there.
 pub fn (pr: &Probes) known(k: int, key: &str): bool { return pr.fks[k].known.has(key) }
@@ -121,8 +128,12 @@ pub fn (pr: mut &Probes) ahead(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn
         if pr.fks[k].via != -1 { continue }
         let p = &fw[pr.fks[k].parent]
         var keys0: []str = []
+        // (each row's key values coerced into one array of the key's width, reused; ident: their places, 0..)
+        let nk = len(pr.fks[k].cols)
+        var vals: []Val = array(nk, Val.Null)
+        var ident: []int = []
+        for m in 0..nk { append(mut &ident, m) }
         for r in rows {
-            var vals: []Val = []
             var whole = true
             for m in 0..len(pr.fks[k].cols) {
                 let j = pr.fks[k].at[m]
@@ -131,7 +142,13 @@ pub fn (pr: mut &Probes) ahead(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn
                     break
                 }
                 match lexdb_ops.coerceZ(r[j].clone(), &t.cols[pr.fks[k].cols[m]].typ, &txn.sql.zone) {
-                    Ok(v) { append(mut &vals, v) }
+                    Ok(v) {
+                        if lexdb_ops.isNull(&v) {
+                            whole = false
+                            break
+                        }
+                        vals[m] = v
+                    }
                     Err(_) {
                         whole = false
                         break
@@ -139,9 +156,7 @@ pub fn (pr: mut &Probes) ahead(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn
                 }
             }
             if !whole { continue }
-            for v in vals { if lexdb_ops.isNull(&v) { whole = false } }
-            if !whole { continue }
-            let key = pr.key(k, p, &vals)
+            let key = pr.keyOfVals(k, p, &vals, &ident)
             if !pr.known(k, &key) { append(mut &keys0, key) }
         }
         let keys = move(keys0)
