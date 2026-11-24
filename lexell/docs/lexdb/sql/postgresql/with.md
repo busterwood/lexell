@@ -57,16 +57,18 @@ recursive query:
 - A `WITH` query is part of its statement: it sees the same snapshot, and a statement after `WITH` may be `INSERT`,
   `UPDATE`, `DELETE` or `MERGE` as well as `SELECT`.
 - A recursive query stops with 54001 after `max_recursion` rounds (1000 by default) that still add rows. `SET
-  max_recursion = n` changes the limit; 0 is no limit.
+  max_recursion = n` changes the limit; 0 is no limit. A constant `LIMIT` on a plain `SELECT` of the query ends it
+  sooner, when it has the rows.
 - A recursive term may not read its own name in a subquery (42P19), as in PostgreSQL.
 
 ## Differences from PostgreSQL
 
 - Data-modifying statements in `WITH` (`WITH d AS (DELETE ... RETURNING *) SELECT ...`) are not supported (42601,
   lexdb-gaps.md 2.2).
-- A `LIMIT` on a statement that reads a recursive query does not stop the recursion: `WITH RECURSIVE r(n) AS (SELECT 1
-  UNION ALL SELECT n + 1 FROM r) SELECT * FROM r LIMIT 3` runs until `max_recursion` and fails with 54001. PostgreSQL
-  stops when it has three rows. Put the bound in the recursive term (`WHERE n < 3`).
+- A recursive query stops at a `LIMIT` only when the statement is a plain `SELECT` of the query with a constant
+  `LIMIT` (and `OFFSET`): `SELECT * FROM r LIMIT 3` gives three rows. With a `WHERE`, a join, grouping, `DISTINCT`,
+  `ORDER BY` or an enclosing query block, PostgreSQL still stops when it has the rows, and lexdb runs the recursion
+  until `max_recursion` and fails with 54001. Put the bound in the recursive term (`WHERE n < 3`).
 - A recursive term with an aggregate, a window function, `ORDER BY`, or an outer join that has its own name on the
   nullable side is not refused, as PostgreSQL refuses it (42P19, 0A000). Such a query usually never stops adding
   rows, and ends with 54001 at `max_recursion`.
@@ -270,15 +272,26 @@ INSERT 0 2
 
 ### H. The recursion limit
 
+A `LIMIT` ends an endless query when the statement only selects from it; a `WHERE` in the statement does not allow
+that.
+
 <!-- example: postgresql -->
 ```sql
 WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT * FROM r LIMIT 3;
+WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT * FROM r WHERE n > 0 LIMIT 3;
 SET max_recursion = 5000;
 WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n < 2000) SELECT count(*) FROM r;
 RESET max_recursion;
 ```
 
 ```text
+ n
+---
+ 1
+ 2
+ 3
+(3 rows)
+
 ERROR:  recursive query still adding rows after 1000 rounds (max_recursion); SET max_recursion = n to allow more, 0 for no limit
 SET
  count
