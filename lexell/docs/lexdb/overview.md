@@ -2,7 +2,7 @@
 
 lexdb is a SQL database server written in Lexell. It keeps its data on disk and serves it through three wire
 protocols: PostgreSQL's, SQL Server's (TDS) and Oracle's (TNS). A client connects with its usual driver or tool and
-gets that product's SQL dialect, data types, error numbers and catalog views. All three see the same tables.
+gets that product's SQL dialect, data types, error numbers and catalog views. All three work on one store and one catalog.
 
 This page explains what is different about lexdb and what it is not. [Quick start](quickstart.md) shows how to run
 it.
@@ -29,7 +29,21 @@ Each protocol listener is called a **door** in these pages. A door is more than 
   as psql's `\d`, the VS Code SQL Server extension and SQLcl browse lexdb as they browse the product.
 
 Below the doors there is one implementation. A statement from any door becomes the same internal statement, and the
-same planner and executor run it. A table made in one door is there in the other two.
+same planner and executor run it. There is one store and one catalog, so a table made in one door can be reached
+from the other two. What a door finds by a bare table name differs:
+
+| Door | A bare name is looked for in | Tables it makes go to |
+|---|---|---|
+| PostgreSQL | `public` (the `search_path`) | `public` |
+| SQL Server | `dbo`, which is `public` | `dbo`, which is `public` |
+| Oracle | the login's own schema, then `public` | the login's own schema |
+
+An Oracle login's schema is made at its first connection and has the login's name: the login `sa` works in schema
+`sa`. The tables it makes are named in upper case unless quoted, so the PostgreSQL and SQL Server doors see
+`sa."CITY"` for `CREATE TABLE city` made as `sa`. Tables the PostgreSQL or SQL Server doors make are in `public`, and
+an Oracle login finds them by their bare name, or as `public.city`. A table of the same name in the login's own
+schema hides the one in `public`, and does not stop the login from making it. See the
+[Oracle door](connect/oracle.md#schemas) for the details.
 
 Each door follows a current product release: PostgreSQL 18 and 19, SQL Server 2022 and 2025, Oracle 23ai and 26ai.
 The reference pages under [sql/](sql/) say per statement and function where lexdb differs.
