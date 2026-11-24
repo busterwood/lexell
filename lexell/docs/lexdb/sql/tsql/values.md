@@ -37,10 +37,6 @@ VALUES ( { DEFAULT | NULL | expression } [ ,...n ] ) [ ,...n ]
 
 - `VALUES` in `FROM` without column aliases names its columns `column1`, `column2` ...; SQL Server needs them
   (error 8155).
-- **A string column of a `VALUES` derived table compared with a table's string column is error 468** ("Cannot
-  resolve the collation conflict between "SQL_Latin1_General_CP1_CI_AS" and "default""). SQL Server gives the
-  constants the database's collation and compares them. Put `COLLATE DATABASE_DEFAULT` on one side (example C), or
-  use `IN (SELECT ...)`, which does not fail.
 - `VALUES (...)` on its own, as a statement, returns its rows (PostgreSQL's form); SQL Server refuses it.
 
 ## Examples
@@ -84,13 +80,13 @@ id name  hex
 
 ### C. A join to a list of values
 
-A string of `VALUES` compared with a table's column needs a `COLLATE` (see Differences).
+A string of `VALUES` has the session's collation, so it compares with a table's column as it would in SQL Server.
 
 <!-- example: tsql -->
 ```sql
 SELECT c.name, v.rank_no
 FROM dbo.colour AS c
-JOIN (VALUES (N'white', 1), (N'red', 2)) AS v (name, rank_no) ON v.name = c.name COLLATE DATABASE_DEFAULT
+JOIN (VALUES (N'white', 1), (N'red', 2)) AS v (name, rank_no) ON v.name = c.name
 ORDER BY v.rank_no;
 ```
 
@@ -143,15 +139,11 @@ n what
 ```sql
 SELECT * FROM (VALUES (1), (N'x')) AS v (n);
 GO
-SELECT c.name FROM dbo.colour AS c JOIN (VALUES (N'white')) AS v (name) ON v.name = c.name;
-GO
 ```
 
 ```text
 Msg 245, Level 16, State 1, Line 1
 Conversion failed when converting the varchar value 'x' to data type int.
-Msg 468, Level 16, State 1, Line 1
-Cannot resolve the collation conflict between "SQL_Latin1_General_CP1_CI_AS" and "default" in the equal to operation.
 ```
 
 ## See also
