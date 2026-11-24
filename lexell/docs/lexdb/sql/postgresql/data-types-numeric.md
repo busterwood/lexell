@@ -57,8 +57,11 @@ bigserial | serial8
 
 ## Differences from PostgreSQL
 
-- Arithmetic on `integer` and `smallint` constants does not overflow: `2147483647::int + 1` gives 2147483648 and
-  `32767::smallint + 1::smallint` gives 32768. On a column the same sum is 22003, as in PostgreSQL.
+- Arithmetic on bare integer constants does not overflow: `SELECT 2147483647 + 1` gives 2147483648 (PostgreSQL:
+  22003, `integer out of range`). Once a cast to `smallint` or `integer` is in the expression it does, as in
+  PostgreSQL: `2147483647::int + 1` and `32767::smallint + 1::smallint` are 22003, and so is a sum on a column.
+  PostgreSQL folds a constant expression when it plans, so `SELECT 2147483647::int + 1 FROM t WHERE false` is 22003
+  there and gives no rows here.
 - `numeric` has at most 38 significant digits (PostgreSQL: 131072 digits before the point). An integer literal of
   39 digits is 22003 (`numeric literal out of range`).
 - `numeric` has no `NaN` and no infinities: `'NaN'::numeric` is 22P02.
@@ -249,6 +252,9 @@ SELECT 0x1F AS hex, 0b101 AS bin, 0o17 AS oct, 1_000_000 AS million;
 CREATE TABLE counter (n int);
 INSERT INTO counter VALUES (2147483647);
 SELECT n + 1 FROM counter;
+SELECT 2147483647::int + 1;
+SELECT 32767::smallint + 1::smallint;
+SELECT 2147483647::int * 2;
 SELECT 5 / 0;
 SELECT 'abc'::int;
 SELECT 'NaN'::numeric;
@@ -258,6 +264,9 @@ SELECT 1::float(60);
 ```text
 CREATE TABLE
 INSERT 0 1
+ERROR:  integer out of range
+ERROR:  integer out of range
+ERROR:  smallint out of range
 ERROR:  integer out of range
 ERROR:  division by zero
 ERROR:  invalid input syntax for type integer: "abc"
