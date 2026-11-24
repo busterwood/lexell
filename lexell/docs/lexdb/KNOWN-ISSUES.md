@@ -419,9 +419,6 @@ smaller differences of its statement.
   replica. In Oracle the definition is a schema object that every session sees, and only the rows are private to a
   session.
 
-- **Prepared DML over Oracle's JDBC driver** (found on main 60c08a84; being fixed): a prepared `INSERT`, `UPDATE` or
-  `DELETE` fails on its second execution with ORA-01008 (not all variables bound). A `SELECT` runs again without
-  trouble.
 - **Queries and DML** (found writing the Oracle query pages):
   - `ROWNUM` in a join with an aggregate or `GROUP BY` limits the groups, not the rows grouped (`SELECT COUNT(*) FROM
     emp e, dept d WHERE e.dept_id = d.id AND ROWNUM < 3` is 4; Oracle: 2). With one table in `FROM` it works.
