@@ -307,6 +307,8 @@ const K_BUILTIN = 25    // DBMS_OUTPUT.PUT_LINE and the like: names[0] the name,
 const K_DECL = 26       // a variable's start value: slot, x[0] its initialiser (none: NULL), flag NOT NULL, pt in ival's slot type
 const K_ELEM = 27       // an element of a collection assigned (not built)
 const K_FORALL = 28
+const K_PVGET = 29      // a package's public variable read from outside (a hoist): names the package's owner and name, ival its slot, slot gets the value
+const K_PVSET = 30      // ... assigned: names as K_PVGET's, ival the slot, x[0] the value
 
 const SQ_DML = 1
 const SQ_SELECT_INTO = 2
@@ -352,6 +354,7 @@ const U_BLOCK = 1
 const U_PROC = 2
 const U_FUNC = 3
 const U_PKG = 4
+const U_VAR = 5         // (a SigEntry only) a package's public variable or constant
 
 // A compiled unit: a block, a procedure or a function.
 type PUnit = record {
@@ -376,7 +379,11 @@ type PUnit = record {
     pkg: str                // the package a member belongs to, "" none (a package itself: kind U_PKG, its name)
     isPub: bool               // a member the package's specification declares
     pkgSlots: []int         // a package's variables: their slots (in every member's frame too)
+    pubVars: []PubVar       // a package's: the variables and constants its specification declares
 }
+
+// A variable or constant a package's specification declares: its slot in the package's frame.
+type PubVar = value record { name: str; slot: int; pt: PT; konst: bool }
 
 // ---- compile state
 
@@ -626,7 +633,7 @@ type Sig = record { found: bool; kind: int; prms: []Prm; ret: PT; canon: []str }
 fn noSig(): Sig { return Sig{found: false, kind: 0, prms: [], ret: pt(PK_ANY), canon: []} }
 
 // The signature of a stored procedure or function, as a compile of its callers sees it.
-type SigEntry = record { owner: str; pkg: str; name: str; kind: int; prms: []Prm; ret: PT; isPub: bool }
+type SigEntry = record { owner: str; pkg: str; name: str; kind: int; prms: []Prm; ret: PT; isPub: bool; slot: int; konst: bool }
 
 fn cloneRow(a: &[]Val): []Val {
     var out: []Val = []
@@ -657,7 +664,7 @@ fn (cx: &Cx) sigOf(names: &[]str): Sig {
     var pick = -1
     for i in 0..len(cx.sigs) {
         let s = &cx.sigs[i]
-        if s.name != nm { continue }
+        if s.name != nm || s.kind == U_VAR { continue }
         if len(names) == 1 {
             // a bare name: a member of the package being compiled, else a standalone unit (of this owner first)
             if len(cx.pkg) > 0 && s.pkg == cx.pkg && s.owner == cx.owner { pick = i }
@@ -673,6 +680,22 @@ fn (cx: &Cx) sigOf(names: &[]str): Sig {
     if pick < 0 { return noSig() }
     let e = &cx.sigs[pick]
     return Sig{found: true, kind: e.kind, prms: copyPrms(&e.prms), ret: e.ret, canon: [e.owner.clone(), e.pkg.clone(), e.name.clone()]}
+}
+
+// The public variable of a package that names (PKG.VAR or OWNER.PKG.VAR) mean: its entry in sigs, -1 none.
+fn (cx: &Cx) pvarOf(names: &[]str): int {
+    if len(names) != 2 && len(names) != 3 { return -1 }
+    let pk = &names[len(names) - 2]
+    let nm = &names[len(names) - 1]
+    if len(names) == 2 && len(cx.pkg) > 0 && cx.pkg == pk { return -1 }
+    var pick = -1
+    for i in 0..len(cx.sigs) {
+        let s = &cx.sigs[i]
+        if s.kind != U_VAR || s.name != nm || s.pkg != pk { continue }
+        if len(names) == 3 && s.owner != names[0] { continue }
+        if pick < 0 || s.owner == cx.owner { pick = i }
+    }
+    return pick
 }
 
 // Every stored unit compiled, for one version of the catalog.
@@ -735,7 +758,8 @@ fn sigsOf(pg: &Prog): []SigEntry {
     var out: []SigEntry = []
     for u in pg.units {
         if len(u.pkg) == 0 && pg.deniedUnit(&u.owner, &u.name) { continue }
-        if (u.kind == U_PROC || u.kind == U_FUNC) && (u.isPub || len(u.pkg) == 0) { append(mut &out, SigEntry{owner: u.owner.clone(), pkg: u.pkg.clone(), name: u.name.clone(), kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: u.isPub}) }
+        if (u.kind == U_PROC || u.kind == U_FUNC) && (u.isPub || len(u.pkg) == 0) { append(mut &out, SigEntry{owner: u.owner.clone(), pkg: u.pkg.clone(), name: u.name.clone(), kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: u.isPub, slot: 0, konst: false}) }
+        for v in u.pubVars { append(mut &out, varSig(&u, &v)) }
     }
     return out
 }
@@ -950,6 +974,27 @@ fn (cx: mut &Cx) render(ip: mut &Ip, sess: mut &lexdb_exec.Session, a: int, b: i
                     } else {
                         rep = dollar(v.slot)
                     }
+                } else if t.kind == TK_ID && cx.isO(i + 1, ".") && cx.ident(i + 2) && cx.pvarAt(i) >= 0 {
+                    // a package's public variable: its value is read first (a K_PVGET in pre), the statement takes it as a bind
+                    var names: []str = [t.up.clone()]
+                    var j = i
+                    while cx.isO(j + 1, ".") && cx.ident(j + 2) && len(names) < 3 {
+                        append(mut &names, cx.tk(j + 2).up)
+                        j += 2
+                    }
+                    let pv = cx.pvarOf(&names)
+                    var n = node(K_PVGET, cx.tk(i).line)
+                    append(mut &n.names, cx.sigs[pv].owner.clone())
+                    append(mut &n.names, cx.sigs[pv].pkg.clone())
+                    n.ival = cx.sigs[pv].slot
+                    n.slot = cx.newSlot(cx.sigs[pv].ret)
+                    rep = dollar(n.slot)
+                    endTok = j + 1
+                    append(pre, n)
+                } else if t.kind == TK_ID && cx.isO(i + 1, ".") && cx.ident(i + 2) && !cx.isO(i + 3, ".") && !cx.isO(i + 3, "(") && cx.pkg != t.up && cx.pkgKnown(&t.up) &&
+                          !cx.sigOf(&[t.up.clone(), cx.tk(i + 2).up.clone()]).found {
+                    let nm = cx.tk(i + 2)
+                    return Err(plErr("ORA06550", &("line " + nm.line.toStr() + ", column " + nm.col.toStr() + ":\nPLS-00302: component '" + nm.up + "' must be declared" + cx.ignored())))
                 } else if hoist && cx.hoistOk {
                     var names: []str = [t.up.clone()]
                     var j = i
@@ -1015,6 +1060,25 @@ fn (cx: &Cx) shadowed(i: int, up: &str): bool {
     if i >= cx.noSubA && i < cx.noSubB { return true }
     for c in cx.colScope { if c == up { return true } }
     return false
+}
+
+// Whether a package of that name is there to a compile (a public procedure, function or variable of it is known).
+fn (cx: &Cx) pkgKnown(name: &str): bool {
+    for x in cx.sigs { if x.pkg == name { return true } }
+    return false
+}
+
+// The public variable of a package that the name at token i begins (PKG.VAR or OWNER.PKG.VAR, not a call), its entry in sigs, -1 none.
+fn (cx: &Cx) pvarAt(i: int): int {
+    var names: []str = [cx.tk(i).up.clone()]
+    var j = i
+    while cx.isO(j + 1, ".") && cx.ident(j + 2) && len(names) < 3 {
+        append(mut &names, cx.tk(j + 2).up)
+        j += 2
+    }
+    if cx.isO(j + 1, "(") { return -1 }
+    if len(names) == 3 { return cx.pvarOf(&names) }
+    return cx.pvarOf(&names)
 }
 
 // A call of a stored function with arguments in tokens a..b: a K_HOIST node in pre; its result's slot.
@@ -1426,6 +1490,7 @@ fn (cx: mut &Cx) sqlNode(ip: mut &Ip, sess: mut &lexdb_exec.Session, a: int, b: 
     cx.noSubB = -1
     cx.hoistOk = was
     n.sql = try text
+    n.pre = pre
     n.ival = sub
     n.sid = cx.newSid()
     n.flag = cx.uses
@@ -1648,6 +1713,9 @@ fn (cx: mut &Cx) stmt(ip: mut &Ip, sess: mut &lexdb_exec.Session, label: &str): 
             while cx.isO(j + 1, ".") && cx.ident(j + 2) { j += 2 }
             j += 1
         }
+        if cx.isO(j, ":=") && t.kind == TK_ID && j > i && cx.find(&t.up) < 0 && cx.pvarAt(i) >= 0 {
+            return cx.pvarAssign(ip, sess, i, j)
+        }
         if cx.isO(j, ":=") {
             let g = try cx.target(i)
             var n = node(K_ASSIGN, line)
@@ -1670,6 +1738,31 @@ fn (cx: mut &Cx) stmt(ip: mut &Ip, sess: mut &lexdb_exec.Session, label: &str): 
         return cx.callStmt(ip, sess)
     }
     return Err(cx.bad(i, ""))
+}
+
+// PKG.VAR := expression (tokens i..j the name, j the :=): a K_PVSET node; a constant is PLS-00363.
+fn (cx: mut &Cx) pvarAssign(ip: mut &Ip, sess: mut &lexdb_exec.Session, i: int, j: int): Result[P, DbErr] {
+    var names: []str = []
+    var q = i
+    while q < j {
+        append(mut &names, cx.tk(q).up)
+        q += 2
+    }
+    let pv = cx.pvarOf(&names)
+    let t = cx.tk(i)
+    if cx.sigs[pv].konst {
+        return Err(plErr("ORA06550", &("line " + t.line.toStr() + ", column " + t.col.toStr() + ":\nPLS-00363: expression '" + dotted(&names) + "' cannot be used as an assignment target" + cx.ignored())))
+    }
+    var n = node(K_PVSET, t.line)
+    append(mut &n.names, cx.sigs[pv].owner.clone())
+    append(mut &n.names, cx.sigs[pv].pkg.clone())
+    n.ival = cx.sigs[pv].slot
+    n.sid = -1
+    let e = cx.stmtEnd(j + 1)
+    append(mut &n.x, try cx.expr(ip, sess, j + 1, e, false))
+    try cx.needO(e, ";")
+    cx.pos = e + 1
+    return Ok(n)
 }
 
 // The slot of a cursor variable named at i (a bind for a REF CURSOR OUT).
@@ -2395,7 +2488,7 @@ fn newCx(src: &str, toks: []Tok, owner: &str, nls: []str, sigs: []SigEntry, uid:
 
 fn emptyUnit(): PUnit {
     return PUnit{owner: "", name: "", kind: U_BLOCK, prms: [], defs: [], ret: pt(PK_ANY), retSlot: -1, nslots: 0, slotPt: [], body: node(K_NULL, 0), src: "",
-                 bindUse: [], bindSlot: [], nbinds: 0, sid0: 0, sid1: 0, curs: [], bad: "", pkg: "", isPub: true, pkgSlots: []}
+                 bindUse: [], bindSlot: [], nbinds: 0, sid0: 0, sid1: 0, curs: [], bad: "", pkg: "", isPub: true, pkgSlots: [], pubVars: []}
 }
 
 // The unit cx has compiled, with its tables moved into it.
@@ -2875,22 +2968,32 @@ fn pkgIndex(ip: &Ip, owner: &str, name: &str): int {
 }
 
 // The state of the package a member belongs to, made (its variables initialised, its own statements run) when first needed.
-fn pkgState(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, cu: &PUnit): Result[int, DbErr] {
+fn pkgState(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, cu: &PUnit): Result[int, DbErr] { return pkgStateOf(pg, ip, sess, &cu.owner, &cu.pkg, true) }
+
+// call: a member is to run (a package's variable read or assigned from outside takes the state as it is, Oracle's).
+fn pkgStateOf(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, owner: &str, pkg: &str, call: bool): Result[int, DbErr] {
     // its state is discarded when its own source changes, not for other DDL
     var stamp = ""
-    for s in ip.stored { if s.owner == cu.owner && s.name == cu.pkg && (s.kind == "PACKAGE" || s.kind == "PACKAGE BODY") { stamp = stamp + s.kind + "\x00" + s.src + "\x00" } }
-    var i = pkgIndex(ip, &cu.owner, &cu.pkg)
+    for s in ip.stored { if s.owner == owner && s.name == pkg && (s.kind == "PACKAGE" || s.kind == "PACKAGE BODY") { stamp = stamp + s.kind + "\x00" + s.src + "\x00" } }
+    var i = pkgIndex(ip, &owner, &pkg)
+    if i >= 0 && !call && ip.pkgs[i].ready { return Ok(i) }
     if i >= 0 && ip.pkgs[i].stamp != stamp {
+        let had = ip.pkgs[i].ready
         ip.pkgs[i].ready = false
         ip.pkgs[i].stamp = stamp.clone()
+        // another session made the package again: its state is discarded, and the call that finds it so is told once (the session that
+        // made it again, forgetPkg, starts afresh without a word)
+        if had {
+            return Err(ora(4068, "existing state of packages has been discarded\nORA-04061: existing state of package body \"" + owner + "." + pkg + "\" has been invalidated\nORA-04065: not executed, altered or dropped package body \"" + owner + "." + pkg + "\"\nORA-06508: PL/SQL: could not find program unit being called: \"" + owner + "." + pkg + "\""))
+        }
     }
     if i < 0 {
-        append(mut &ip.pkgs, PkgInst{owner: cu.owner.clone(), name: cu.pkg.clone(), vals: [], oids: [], ready: false, stamp: stamp})
+        append(mut &ip.pkgs, PkgInst{owner: owner.clone(), name: pkg.clone(), vals: [], oids: [], ready: false, stamp: stamp})
         i = len(ip.pkgs) - 1
     }
     if ip.pkgs[i].ready { return Ok(i) }
-    let pi = pg.pkgOf(&cu.owner, &cu.pkg)
-    if pi < 0 { return Err(ora(4067, &("not executed, package body \"" + cu.owner + "." + cu.pkg + "\" does not exist"))) }
+    let pi = pg.pkgOf(&owner, &pkg)
+    if pi < 0 { return Err(ora(4067, &("not executed, package body \"" + owner + "." + pkg + "\" does not exist"))) }
     let pu = &pg.units[pi]
     var fr = newFr(pu)
     ip.pkgs[i].ready = true
@@ -2955,6 +3058,11 @@ fn evalCond(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, x:
 }
 
 fn hoist(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, h: &P, fr: mut &Fr): Result[Unit, DbErr] {
+    if h.kind == K_PVGET {
+        let i = try pkgStateOf(pg, ip, sess, &h.names[0], &h.names[1], false)
+        try assign(u, fr, h.slot, ip.pkgs[i].vals[h.ival].clone())
+        return Ok(Unit{})
+    }
     let v = try callUnit(pg, ip, sess, u, h, fr)
     try assign(u, fr, h.slot, v)
     return Ok(Unit{})
@@ -3310,7 +3418,22 @@ fn exec(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P,
     if k == K_FETCH { return fetchCur(pg, ip, sess, u, p, fr) }
     if k == K_CLOSE { return exec_close(pg, ip, sess, u, p, fr) }
     if k == K_EXECIMM { return execImm(pg, ip, sess, u, p, fr) }
+    if k == K_PVSET { return execPvSet(pg, ip, sess, u, p, fr) }
     return Err(plErr("XX000", &("PL/SQL statement kind " + k.toStr())))
+}
+
+// PKG.VAR := expression, in the session's state of the package (made when first needed).
+fn execPvSet(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
+    let v = try eval(pg, ip, sess, u, &p.x[0], fr)
+    let i = try pkgStateOf(pg, ip, sess, &p.names[0], &p.names[1], false)
+    let pi = pg.pkgOf(&p.names[0], &p.names[1])
+    let c = try conv(&pg.units[pi].slotPt[p.ival], v)
+    match c {
+        Val.Null { ip.pkgs[i].oids[p.ival] = oidOf(&pg.units[pi].slotPt[p.ival]) }
+        else { ip.pkgs[i].oids[p.ival] = lexdb_ops.kindOid(&c) }
+    }
+    ip.pkgs[i].vals[p.ival] = c
+    return Ok(F_NEXT)
 }
 
 // ---- SQL statements
@@ -3332,6 +3455,7 @@ fn tcl(ip: mut &Ip, sess: mut &lexdb_exec.Session, text: &str): Result[Unit, DbE
 
 fn execSql(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[int, DbErr] {
     let sub = p.ival
+    for i in 0..len(p.pre) { try hoist(pg, ip, sess, u, &p.pre[i], fr) }
     if p.flag { syncSys(ip, fr) }
     if sub == SQ_TCL {
         try tcl(ip, sess, &p.sql)
@@ -3794,6 +3918,26 @@ fn execImm(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: 
     return Ok(F_NEXT)
 }
 
+// The name (upper case) of a package's public variable that the SQL text reads as PKG.VAR: a statement of its own may not (ORA-06553).
+pub fn pkgVarIn(pg: &Prog, text: &str): Option[str] {
+    var any = false
+    for u in pg.units { if len(u.pubVars) > 0 { any = true } }
+    if !any { return None }
+    match lex(text) {
+        Ok(toks) {
+            var i = 0
+            while i + 2 < len(toks) {
+                if toks[i].kind == TK_ID && toks[i + 1].kind == TK_OP && toks[i + 1].text == "." && toks[i + 2].kind == TK_ID && (i == 0 || !(toks[i - 1].kind == TK_OP && toks[i - 1].text == ".")) {
+                    for u in pg.units { if u.kind == U_PKG && u.name == toks[i].up { for v in u.pubVars { if v.name == toks[i + 2].up { return Some(v.name.clone()) } } } }
+                }
+                i += 1
+            }
+        }
+        Err(_) {}
+    }
+    return None
+}
+
 // ---- the compiled program of the stored units
 
 // Every stored procedure and function compiled for the catalog as it is now: their signatures first (so they
@@ -3820,7 +3964,7 @@ pub fn ensureProg(pg: mut &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session): Re
         let hdr = compileStored(ip, sess, &s.src, &s.owner, [], true)
         if s.owner != ip.user { sess.backToSchema(&save) }
         match hdr {
-            Ok(u) { append(mut &sigs, SigEntry{owner: u.owner.clone(), pkg: "", name: u.name.clone(), kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: true}) }
+            Ok(u) { append(mut &sigs, SigEntry{owner: u.owner.clone(), pkg: "", name: u.name.clone(), kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: true, slot: 0, konst: false}) }
             Err(_) {}
         }
     }
@@ -3830,7 +3974,10 @@ pub fn ensureProg(pg: mut &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session): Re
         for b in bodies { if b.owner == sp.owner && b.name == sp.name { body = b.src.clone() } }
         match compilePackage(ip, sess, &sp.owner, &sp.name, &sp.src, &body, cloneSigs(&sigs)) {
             Ok(us) {
-                for u in us { if u.kind != U_PKG && u.isPub { append(mut &sigs, sigOfUnit(&u)) } }
+                for u in us {
+                    if u.kind != U_PKG && u.isPub { append(mut &sigs, sigOfUnit(&u)) }
+                    for v in u.pubVars { append(mut &sigs, varSig(&u, &v)) }
+                }
             }
             Err(_) {}
         }
@@ -3899,13 +4046,18 @@ pub fn revalidate(pg: mut &Prog, ip: mut &Ip, text: &str) {
     pg.revals = keep
 }
 
+// A package's public variable as a signature entry.
+fn varSig(u: &PUnit, v: &PubVar): SigEntry {
+    return SigEntry{owner: u.owner.clone(), pkg: u.name.clone(), name: v.name.clone(), kind: U_VAR, prms: [], ret: v.pt, isPub: true, slot: v.slot, konst: v.konst}
+}
+
 fn sigOfUnit(u: &PUnit): SigEntry {
-    return SigEntry{owner: u.owner.clone(), pkg: u.pkg.clone(), name: u.name.clone(), kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: u.isPub}
+    return SigEntry{owner: u.owner.clone(), pkg: u.pkg.clone(), name: u.name.clone(), kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: u.isPub, slot: 0, konst: false}
 }
 
 fn cloneSigs(a: &[]SigEntry): []SigEntry {
     var out: []SigEntry = []
-    for x in a { append(mut &out, SigEntry{owner: x.owner.clone(), pkg: x.pkg.clone(), name: x.name.clone(), kind: x.kind, prms: copyPrms(&x.prms), ret: x.ret, isPub: x.isPub}) }
+    for x in a { append(mut &out, SigEntry{owner: x.owner.clone(), pkg: x.pkg.clone(), name: x.name.clone(), kind: x.kind, prms: copyPrms(&x.prms), ret: x.ret, isPub: x.isPub, slot: x.slot, konst: x.konst}) }
     return out
 }
 
@@ -4425,7 +4577,7 @@ fn (cx: mut &Cx) pkgMember(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[U
     var si = cx.sigIndex(&u.name)
     let known = si >= 0
     if si < 0 {
-        append(mut &cx.sigs, SigEntry{owner: cx.owner.clone(), pkg: cx.pkg.clone(), name: u.name.clone(), kind: kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: cx.specMode})
+        append(mut &cx.sigs, SigEntry{owner: cx.owner.clone(), pkg: cx.pkg.clone(), name: u.name.clone(), kind: kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: cx.specMode, slot: 0, konst: false})
     }
     if cx.specMode { append(mut &cx.pubs, u.name.clone()) }
     if cx.specMode || cx.isO(cx.pos, ";") {
@@ -4491,6 +4643,8 @@ fn compilePackage(ip: mut &Ip, sess: mut &lexdb_exec.Session, owner: &str, name:
     if at < 0 { return Err(plErr("ORA06550", "line 1, column 1:\nPLS-00103: Encountered the symbol \"CREATE\"")) }
     cx.pos = at
     var specDecls = try cx.decls(ip, sess)
+    var pubVars: []PubVar = []
+    for v in cx.vars { if v.pt.k != PK_REC && v.pt.k != PK_EXC && v.pt.k != PK_CUR && v.pt.k != PK_REFCUR { append(mut &pubVars, PubVar{name: v.name.clone(), slot: v.slot, pt: v.pt, konst: v.konst}) } }
     try cx.needK(cx.pos, "END")
     var out: []PUnit = []
     if len(body) == 0 { return Ok(out) }
@@ -4535,6 +4689,7 @@ fn compilePackage(ip: mut &Ip, sess: mut &lexdb_exec.Session, owner: &str, name:
     pk.nslots = len(cx.slotPt)
     pk.slotPt = cloneSlotPt(&cx.slotPt)
     pk.pkgSlots = cloneInts(&pkgSlots)
+    pk.pubVars = pubVars
     pk.curs = cloneCurs(&cx.curs)
     append(mut &out, pk)
     for k in 0..len(cx.members) {

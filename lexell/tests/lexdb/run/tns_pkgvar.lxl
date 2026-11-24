@@ -1,0 +1,151 @@
+// lexdb over TNS: a package's variables and constants from outside the package (design/lexdb-robust.md, "Package variables"), checked against Oracle Database
+// Free 23.26 (gen_oracle.py --check tns_pkgvar: the answers below are Oracle's): pay.g_count read and assigned in a block, a procedure and a function outside the
+// package, in expressions, conditions, loops and embedded SQL (INSERT, SELECT INTO), a constant (PLS-00363), a name that is none (PLS-00302), a variable of
+// another package assigned by a package's member, a boolean, a date and a text; in a SQL statement of its own a package's variable is ORA-06553 (PLS-221),
+// and a name that is none ORA-00904. Each statement runs with set lexdb_batch = off (the row engine) and on: "same" and the answer, or DIFFERENT and both.
+// expect: setup: 7 statements
+// expect: same: 0 / A = 7
+// expect: same: 0 / A = 10;23
+// expect: same: 0 / A = 3;300
+// expect: same: 0 / A = 101;202
+// expect: same: 0 / A = 4;14
+// expect: same: 0 / A = 0;2;3
+// expect: same: 0 / A = 18
+// expect: same: 0 / A = 6
+// expect: same: 0 / A = 9
+// expect: same: 0 / A = -1;2
+// expect: same: 0 / A = 22
+// expect: same: error 6502
+// expect: same: error 6502
+// expect: same: error 6550
+// expect: same: error 6550
+// expect: same: error 6550
+// expect: same: error 6553
+// expect: same: error 6553
+// expect: same: error 904
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+const SETUP = "create table t1 (a number)\ncreate or replace package pay as g_count number := 0; c_max constant number := 10; g_flag boolean := true; g_d date := date '2020-01-01'; g_s varchar2(20) := 'hi'; g_n number; procedure bump; function total return number; end pay;\ncreate or replace package body pay as procedure bump is begin g_count := g_count + 1; end; function total return number is begin return g_count * 100; end; begin g_count := 5; end pay;\ncreate or replace package other as procedure peek; function twice return number; end other;\ncreate or replace package body other as procedure peek is begin pay.g_count := pay.g_count + 100; end; function twice return number is begin return pay.g_count * 2; end; end other;\ncreate or replace procedure show_count as begin insert into t1 values (pay.g_count); end;\ncreate or replace function get_count return number is begin return pay.g_count + pay.c_max; end;"
+
+const QS = "begin pay.g_count := 7; insert into t1 values (pay.g_count); end; ;; select a from t1 order by a\nbegin pay.g_count := 3; insert into t1 values (pay.c_max); insert into t1 values (pay.c_max * 2 + pay.g_count); end; ;; select a from t1 order by a\ndeclare x number; begin pay.g_count := 1; pay.bump; pay.bump; insert into t1 values (pay.g_count); x := pay.total(); insert into t1 values (x); end; ;; select a from t1 order by a\ndeclare x number; begin pay.g_count := 1; other.peek; insert into t1 values (pay.g_count); x := other.twice(); insert into t1 values (x); end; ;; select a from t1 order by a\ndeclare x number; begin pay.g_count := 4; show_count; x := get_count(); insert into t1 values (x); end; ;; select a from t1 order by a\nbegin pay.g_s := 'hi'; pay.g_d := date '2020-01-01'; pay.g_flag := true; pay.g_s := pay.g_s || 'x'; pay.g_d := pay.g_d + 1; pay.g_flag := not pay.g_flag; if pay.g_flag then insert into t1 values (1); else insert into t1 values (0); end if; insert into t1 values (length(pay.g_s)); insert into t1 values (to_number(to_char(pay.g_d, 'DD'))); end; ;; select a from t1 order by a\ndeclare x number; begin pay.g_count := 4; x := pay.g_count * 2; if pay.g_count > 3 then x := x + pay.c_max; end if; insert into t1 values (x); end; ;; select a from t1 order by a\nbegin pay.g_count := 0; for i in 1..3 loop pay.g_count := pay.g_count + i; end loop; insert into t1 values (pay.g_count); end; ;; select a from t1 order by a\ndeclare x number; begin pay.g_count := 8; select pay.g_count + 1 into x from dual; insert into t1 values (x); end; ;; select a from t1 order by a\nbegin pay.g_n := null; insert into t1 values (nvl(pay.g_n, -1)); pay.g_n := 2; insert into t1 values (pay.g_n); end; ;; select a from t1 order by a\nbegin pay.g_count := 12; update t1 set a = pay.g_count; insert into t1 values (pay.g_count); update t1 set a = a + pay.c_max where a = pay.g_count; end; ;; select a from t1 order by a\nbegin pay.g_s := 'abcdefghijklmnopqrstuvwxyz'; end;\nbegin pay.g_count := 'x'; end;\nbegin pay.c_max := 3; end;\nbegin pay.nothere := 3; end;\nbegin insert into t1 values (pay.nothere); end;\nselect pay.g_count from dual\nselect pay.c_max from dual\nselect pay.nothere from dual"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows; or error and the number.
+fn qtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// A statement: its row count, or error and the number.
+fn xtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.run(&(sql.toStr()), &[]) {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn one(c: mut &oracle.Conn, sql: &str): str {
+    let low = strings.toLowerAscii(sql)
+    if strings.startsWith(&low, "select") || strings.startsWith(&low, "with") { return qtext(c, sql) }
+    return xtext(c, sql)
+}
+
+// A query, or statements ("a ;; b ;; c") in a transaction rolled back: each answer, joined by " / " (after an error, the
+// last part, the check, after the rollback).
+fn answer(c: mut &oracle.Conn, sqls: &str): str {
+    if !strings.contains(sqls, " ;; ") { return one(c, sqls) }
+    let parts = strings.split(sqls, " ;; ")
+    var out: []str = []
+    var failed = false
+    let r = c.transaction(fn(c2: mut &oracle.Conn): Result[int, oracle.Error] {
+        for i in 0..len(parts) {
+            if failed { break }
+            let a = one(c2, &parts[i])
+            if strings.startsWith(&a, "error") { failed = true }
+            append(mut &out, a)
+        }
+        return Err(sqldialect.inputError("rolled back"))
+    })
+    if failed { append(mut &out, one(c, &parts[len(parts) - 1])) }
+    return strings.join(&out, " / ")
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            let text: str = QS
+            for q in strings.lines(&text) {
+                let a = c.run(&("set lexdb_batch = off".toStr()), &[])
+                let off = answer(mut &c, &q)
+                let b = c.run(&("set lexdb_batch = on".toStr()), &[])
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(166), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

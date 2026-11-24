@@ -1148,3 +1148,11 @@ AS bit)`, a binary variable beside a binary, `HASHBYTES`, `CAST(0x4142 AS nvarch
 as SQL Server's, `datetime +/- days` and `datetime - datetime` are `#dtadd` / `#dtdiff` (the binder knows the operands' types only where they are
 columns or casts; a datetime from a function call is not seen), `FORMAT` has ten cultures' dates (`lexdb_tsqlfmt.CULTURES`) and formats a `time` as a
 TimeSpan.
+
+## As built: the leftovers (lexdb-robust.md)
+
+MERGE's subqueries (WHEN conditions, UPDATE's SET, INSERT's values, NOT MATCHED BY SOURCE, DELETE) read the rows as the statement found them (`tds_mergesub`, SQL Server
+2022, 42 batches with `lexdb_batch` off and on); OUTPUT takes no subquery in INSERT, UPDATE, DELETE and MERGE (10705); a text column of `VALUES` has the session's collation
+(a column beside it was 468; `'A' = 'a'` was false). `CAST` / `CONVERT` of a uniqueidentifier to `binary(n)` / `varbinary(n)` give SQL Server's bytes (the first three groups
+little-endian; error 529 after the hex-literal slice: `#tobin`), of a binary to uniqueidentifier (`#bin2uuid`: padded with zeros or cut to 16), a uniqueidentifier as a
+string is upper case (`#bin2str`) and 8170 for `varchar(n)` under 36; `OBJECTPROPERTY(id, 'TableHasNonclustIndex')` (`tds_guidbin`).

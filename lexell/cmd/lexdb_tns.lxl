@@ -1216,8 +1216,19 @@ fn (c: &Conn) seqMissing(e: &DbErr, cursor: int): bool {
     return strings.contains(&q, &(nm + ".nextval")) || strings.contains(&q, &(nm + ".currval"))
 }
 
+// A statement of its own that reads a package's variable (invalid identifier here): ORA-06553, PLS-221.
+fn (c: &Conn) pkgVarErr(x: OraErr, cursor: int): OraErr {
+    if x.num != 904 || cursor <= 0 { return x }
+    let ci = c.find(cursor)
+    if ci < 0 { return x }
+    match lexdb_plsql.pkgVarIn(&c.prog, &c.cursors[ci].sql) {
+        Some(v) { return OraErr{num: 6553, text: "PLS-221: '" + v + "' is not a procedure or is undefined"} }
+        None { return x }
+    }
+}
+
 fn (c: mut &Conn) fail(e: &DbErr, cursor: int) {
-    var x = c.oraErr(e)
+    var x = c.pkgVarErr(c.oraErr(e), cursor)
     if c.seqMissing(e, cursor) { x = OraErr{num: 2289, text: "sequence does not exist"} }
     c.endCall(x.num, &(oraText(x.num, &x.text)), cursor, 0)
 }
@@ -1425,8 +1436,9 @@ fn (c: mut &Conn) auth2(rq: &Req) {
             c.user = c.auth.role.clone()
             c.loggedIn = true
             c.localZone = c.sess.zone().name
-            // a user that has a schema of its name works in it
+            // a user works in a schema of its name (made at its first login: Oracle's user is its schema)
             let me = c.user.clone()
+            if !c.schemaExists(&me) { c.ownSchema(&me) }
             if c.schemaExists(&me) { c.nls.schema = me }
             c.reapply()
             var ps: []tns.KeyValue = []
@@ -2145,7 +2157,7 @@ fn (c: mut &Conn) execute(rq: &Req) {
     var runs = c.runCursor(i, kind, &params, &ptypes, (rq.options & OPT_COMMIT) != 0, rq.batchErrors && !query)
     match runs.failed {
         Some(e) {
-            var x = c.oraErr(&e)
+            var x = c.pkgVarErr(c.oraErr(&e), id)
             if c.seqMissing(&e, id) { x = OraErr{num: 2289, text: "sequence does not exist"} }
             let jj = c.find(id)
             if x.num == 1400 && jj >= 0 && (strings.startsWith(&strings.toLowerAscii(&(strings.trim(&c.cursors[jj].sql))), "update") || e.context == "update") {
@@ -2549,6 +2561,26 @@ fn (c: mut &Conn) hasRole(n: &str): bool {
         Err(_) {}
     }
     return false
+}
+
+// The login's own schema, made by a superuser when it has none (a role; not on a replica, whose database is read-only).
+fn (c: mut &Conn) ownSchema(n: &str) {
+    if lexdb_standby.isReplica(&c.st) { return }
+    // (a login under trust that has no role: it is a superuser, as lexdb's own role statements take it, and makes its schema itself)
+    if !c.hasRole(n) {
+        let x = c.simple("CREATE SCHEMA " + lexdb_oraadm.qid(n))
+        return
+    }
+    var sup = ""
+    match lexdb_priv.roles(&c.st) {
+        Ok(rs) { for r in rs { if r.superuser && len(sup) == 0 { sup = r.name.clone() } } }
+        Err(_) { return }
+    }
+    // (no superuser role: the schemas' maker is no role at all, which lexdb's role statements take as a superuser)
+    if len(sup) == 0 { sup = "sys" }
+    let prev = c.sess.actAs(&sup)
+    let x = c.simple("CREATE SCHEMA " + lexdb_oraadm.qid(n) + " AUTHORIZATION " + lexdb_oraadm.qid(n))
+    c.sess.backTo(&prev)
 }
 
 fn (c: mut &Conn) schemaExists(n: &str): bool {

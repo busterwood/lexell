@@ -1,0 +1,154 @@
+// lexdb over TNS: every Oracle login works in a schema of its name (design/lexdb-oracle.md section 22, "A bare name and PostgreSQL's public"): made at the
+// login's first connection (a role's by a superuser, a login under trust that has no role its own), its search path that schema, then public (the PostgreSQL
+// door's tables: found second, never in the way of a CREATE). A table of the PostgreSQL door's public named city does not stop CREATE TABLE city (it was
+// ORA-00955), the login's own city is read first, TRUNCATE and SELECT of sa.city find it (they were ORA-00942), USER_TABLES lists only its own tables, a second
+// login makes no second schema, a role that is no superuser gets its schema too, and the PostgreSQL door sees the table as sa."CITY", public.city untouched.
+// The Oracle side is Oracle Free's (a user's own table, USER_TABLES, SYS_CONTEXT, the qualified name); public's tables stand for Oracle's PUBLIC synonyms.
+// expect: pg door: public.city 1
+// expect: bare name finds public: 1
+// expect: create table city: 0
+// expect: insert: 1
+// expect: bare name finds its own: 5
+// expect: qualified: 5
+// expect: user_tables: 'CITY'
+// expect: current_schema: 'SA'
+// expect: truncate sa.city: 0
+// expect: empty: 0
+// expect: second login: 'SA CITY'
+// expect: public untouched: 1
+// expect: pg door sees: 0
+// expect: role login: connected
+// expect: role create: 0
+// expect: role insert: 1
+// expect: role reads its own: 9
+// expect: role user_tables: 'CITY'
+// expect: role current_schema: 'ORA1'
+// expect: pg door sees role's: 9
+// expect: sa city after: 0
+// expect: schemas: ora1,sa
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(&(s.toStr())) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// a query's rows (columns joined by |, rows by ;), or its error's number
+fn q1(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(r) {
+            var out: []str = []
+            for i in 0..r.rowCount() { append(mut &out, values(&r, i)) }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn err(r: Result[int, oracle.Error]): str {
+    match r {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// the PostgreSQL door's answer: the first column of the rows joined by ;
+fn pg(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var out: []str = []
+            for row in r.rows { append(mut &out, s.text(&row[0], r.cols[0].oid)) }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "error " + e.state }
+    }
+}
+
+fn say(label: &str, what: &str) { println(label + ": " + what) }
+
+fn client(st: &lexdb_store.Store, port: &str) {
+    let dsn = "127.0.0.1:" + port + "/lexdb"
+    var p = lexdb_exec.newSession(st.share())
+    p.exec("create table city (id int)").unwrap()
+    p.exec("insert into city values (1)").unwrap()
+    say("pg door", "public.city " + pg(mut &p, &"select count(*) from public.city"))
+    var sa = connect(&("User Id=sa;Password=sa;Data Source=" + dsn))
+    say("bare name finds public", q1(mut &sa, &"select id from city"))
+    say("create table city", err(sa.run("create table city (id number)", &[])))
+    say("insert", err(sa.run("insert into city values (5)", &[])))
+    sa.exec("commit").unwrap()
+    say("bare name finds its own", q1(mut &sa, &"select id from city"))
+    say("qualified", q1(mut &sa, &"select id from sa.city"))
+    say("user_tables", q1(mut &sa, &"select table_name from user_tables order by 1"))
+    say("current_schema", q1(mut &sa, &"select sys_context('USERENV', 'CURRENT_SCHEMA') from dual"))
+    say("truncate sa.city", err(sa.run("truncate table sa.city", &[])))
+    say("empty", q1(mut &sa, &"select count(*) from city"))
+    sa.logoff()
+    var sb = connect(&("User Id=sa;Password=sa;Data Source=" + dsn))
+    say("second login", q1(mut &sb, &"select owner || ' ' || table_name from all_tables where owner = 'SA' order by 1"))
+    sb.logoff()
+    say("public untouched", pg(mut &p, &"select count(*) from public.city"))
+    say("pg door sees", pg(mut &p, &"select count(*) from sa.\"CITY\""))
+    // a role that is no superuser
+    p.exec("create role ora1 login password 'pw'").unwrap()
+    var o = connect(&("User Id=ora1;Password=pw;Data Source=" + dsn))
+    say("role login", "connected")
+    say("role create", err(o.run("create table city (id number)", &[])))
+    say("role insert", err(o.run("insert into city values (9)", &[])))
+    o.exec("commit").unwrap()
+    say("role reads its own", q1(mut &o, &"select id from city"))
+    say("role user_tables", q1(mut &o, &"select table_name from user_tables"))
+    say("role current_schema", q1(mut &o, &"select sys_context('USERENV', 'CURRENT_SCHEMA') from dual"))
+    o.logoff()
+    say("pg door sees role's", pg(mut &p, &"select id from ora1.\"CITY\""))
+    say("sa city after", pg(mut &p, &"select count(*) from sa.\"CITY\""))
+    say("schemas", pg(mut &p, &"select string_agg(nspname, ',' order by nspname) from pg_namespace where nspname in ('sa', 'ora1')"))
+    p.close()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&st, &addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(165), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

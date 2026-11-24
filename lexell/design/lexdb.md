@@ -13025,7 +13025,15 @@ UPDATE got cheaper.
 ### 9.140 Robustness and wrong answers from the documentation pass (lexdb-robust.md)
 
 An UPDATE's and DELETE's subqueries (SET, RETURNING) read the rows as the statement found them in every door (`updNew`: all the new rows first when the statement has
-subqueries, then the writes; PostgreSQL 19, SQL Server 2022 and Oracle Free agree: `exec_robust`, `tds_robust`, `tns_robust`); MERGE has the same fault and
-a plan. A LANGUAGE sql function's column is named as the function; `INTERVAL(p) '...' FIELD` and `INTERVAL FIELD '...'` are syntax errors and `INTERVAL(p)` keeps its
+subqueries, then the writes; PostgreSQL 19, SQL Server 2022 and Oracle Free agree: `exec_robust`, `tds_robust`, `tns_robust`); MERGE has the same fault, fixed in 9.141. A LANGUAGE sql function's column is named as the function; `INTERVAL(p) '...' FIELD` and `INTERVAL FIELD '...'` are syntax errors and `INTERVAL(p)` keeps its
 precision. Point selects: in process, 20,000 statements, `LXL_HASH_SEED=1`, base ca687450: select -31 instructions of 118,690, INSERT -5 of 4,120,225, UPDATE by key -22 of
 4,146,084 (two rounds, equal).
+
+### 9.141 The planned leftovers (lexdb-robust.md, "The leftovers")
+
+MERGE's subqueries read the rows as the statement found them in all three doors (`mergePlan` / `mergeApply`); every Oracle login works in a schema of its name, made at its
+first connection (lexdb-oracle.md section 22: `CREATE TABLE city` no longer meets the PostgreSQL door's `public.city`, `sa.t` is found); a package's public variables and
+constants are read and assigned from PL/SQL outside the package, per session, with ORA-04068 for a call into a package another session made again (lexdb-oracle.md, "As built:
+package variables"); a uniqueidentifier converts to and from binary again, OUTPUT takes no subquery (10705), a text column of VALUES has the session's collation, OBJECTPROPERTY's
+TableHasNonclustIndex. Not done: PostgreSQL's bare-literal overflow (`SELECT 2147483647 + 1`: the check would cost every `v + 1` of an UPDATE by key instructions), recursive CTEs
+under LIMIT. Point statements (base a15b9a64, in process by `pt2.lxl`, 20,000 statements, `LXL_HASH_SEED=1`, two rounds): select 122,345.01 instructions both, INSERT 55,062,708.50 against 55,062,708.51 and .52, UPDATE by key 55,081,434.34 and .35 against .34 and .41 (the first form of MERGE's dry insert, a check in `insertOne`, cost one instruction an INSERT and went to `conflictOf` and `upsertOld`); over the wire (`icount6.sh`, 3 passes, alternated twice) instructions 170,817 and 170,994 against 170,813 and 170,671, cycles 97,796 and 97,855 against 95,328 and 96,219.
