@@ -133,16 +133,13 @@ matching functions, are on [another](functions-regex-fuzzy.md). Conversion betwe
 ## Differences from SQL Server
 
 - `DATALENGTH` of a string is always twice its length in characters: `DATALENGTH('abc')` is 6 where SQL Server says 3
-  for a `varchar`, and `DATALENGTH(CAST('ab' AS char(5)))` is 4 where SQL Server says 5.
+  for a `varchar`, and `DATALENGTH(CAST('ab' AS char(5)))` is 10 where SQL Server says 5.
 - `UPPER` and `LOWER` change ASCII letters only: `UPPER('héllo')` is `HéLLO` (SQL Server: `HÉLLO`).
 - `LEFT('abc', -1)` is `ab`, and `SUBSTRING('abcdef', 2)` is `bcdef`. SQL Server refuses both: a negative length is
   error 536, and `SUBSTRING` needs all three arguments (error 174). `CONCAT` with one argument gives that argument
   (SQL Server: error 189).
 - `TRANSLATE('abc', 'abc', 'xy')` gives `xy` (SQL Server: error 9828, the two lists differ in length).
 - `ASCII('')` is 0 (SQL Server: NULL).
-- `BASE64_DECODE` gives a `varbinary`, but `CAST(BASE64_DECODE('aGVsbG8=') AS varchar(10))` gives its hex text
-  (`\x68656c6c`) and not the characters. `0x41` and the other hex literals are numbers, so they cannot be passed
-  to `BASE64_ENCODE` (see the [conversion page](functions-conversion.md)). Cast a string to `varbinary`.
 - Not available (error 195): `UNICODE`, `SOUNDEX`, `DIFFERENCE`, `STR`, `ISNUMERIC`, `STRING_SPLIT`,
   `STRING_ESCAPE`, `HASHBYTES`, `COMPRESS`, `DECOMPRESS` (example M).
 - `STRING_AGG` is on its own page; here it is only mentioned.
@@ -322,13 +319,14 @@ translated    to_spaces e_acute a_euro
 
 <!-- example: tsql -->
 ```sql
-SELECT BASE64_ENCODE(CAST('hello' AS varbinary(10))) AS encoded, BASE64_DECODE('aGVsbG8=') AS decoded;
+SELECT BASE64_ENCODE(CAST('hello' AS varbinary(10))) AS encoded, BASE64_ENCODE(0x68656C6C6F) AS from_hex,
+       BASE64_DECODE('aGVsbG8=') AS decoded, CAST(BASE64_DECODE('aGVsbG8=') AS varchar(10)) AS as_text;
 ```
 
 ```text
-encoded  decoded
--------- ----------
-aGVsbG8= 68656C6C6F
+encoded  from_hex decoded    as_text
+-------- -------- ---------- -------
+aGVsbG8= aGVsbG8= 68656C6C6F hello
 
 (1 row affected)
 ```
