@@ -97,8 +97,8 @@ table_constraint ::=
   reset. It may be made, filled and read on a replica.
 - **`CLUSTERED` and `NONCLUSTERED` are labels.** lexdb keeps rows in the order of the primary key whatever is said.
   `sys.indexes` shows the clustered index as `CLUSTERED` (a primary key is, unless `NONCLUSTERED` is said for it or
-  another key says `CLUSTERED`) and a table with none as a heap (`index_id` 0). A second clustered index by `CREATE
-  INDEX` is error 1902. See [CREATE INDEX](create-index.md).
+  another key says `CLUSTERED`) and a table with none as a heap (`index_id` 0). Two `CLUSTERED` keys in one `CREATE
+  TABLE` are error 8112; a second clustered index by `CREATE INDEX` is error 1902. See [CREATE INDEX](create-index.md).
 - `ON filegroup`, `TEXTIMAGE_ON`, `WITH (...)` options on a key or the table (`FILLFACTOR`, `DATA_COMPRESSION` ...)
   are read and not kept.
 - The names lexdb gives constraints that have none follow PostgreSQL: `emp_pkey`, `emp_name_key` (unique),
@@ -111,8 +111,6 @@ table_constraint ::=
 
 ## Differences from SQL Server
 
-- Two `CLUSTERED` keys in one `CREATE TABLE` are taken (the later one is shown as the clustered index); SQL Server
-  refuses them (1902). A `CREATE INDEX ... CLUSTERED` that finds one is 1902.
 - A column constraint written `CONSTRAINT name FOREIGN KEY REFERENCES t (c)` is error 102: write
   `CONSTRAINT name REFERENCES t (c)`, or a table constraint.
 - `ROWGUIDCOL`, `SPARSE`, `FILESTREAM`, `NOT FOR REPLICATION`, `MASKED WITH`, `ENCRYPTED WITH` and
@@ -329,6 +327,8 @@ CREATE TABLE dbo.place (spot geography);
 GO
 CREATE TABLE dbo.twokeys (a int PRIMARY KEY, b int PRIMARY KEY);
 GO
+CREATE TABLE dbo.twoclustered (a int, b int, CONSTRAINT uq_a UNIQUE CLUSTERED (a), CONSTRAINT uq_b UNIQUE CLUSTERED (b));
+GO
 CREATE CLUSTERED INDEX cx_dept ON dbo.dept (name);
 GO
 ```
@@ -346,6 +346,8 @@ Msg 2715, Level 16, State 1, Line 1
 Column, parameter, or variable #1: Cannot find data type geography.
 Msg 8110, Level 16, State 1, Line 1
 Cannot add multiple PRIMARY KEY constraints to table 'twokeys'.
+Msg 8112, Level 16, State 1, Line 1
+Cannot add more than one clustered index for constraints on table 'twoclustered'.
 Msg 1902, Level 16, State 1, Line 1
 Cannot create more than one clustered index on table 'dept'. Drop the existing clustered index 'pk_dept' before creating another.
 ```
