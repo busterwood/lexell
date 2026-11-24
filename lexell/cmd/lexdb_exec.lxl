@@ -5087,6 +5087,8 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             try renameConstraint(st, txn, mut &t, &a.name, &a.to)
         } else if a.kind == lexdb_sql.A_VALIDATE {
             try validateConstraint(st, txn, mut &t, &a.name)
+        } else if a.kind == lexdb_sql.A_CON_STATE {
+            try conState(st, txn, mut &t, &a, s.mdialect)
         } else if a.kind == lexdb_sql.A_SET_SCHEMA {
             try setSchema(st, txn, mut &t, &a.name)
         } else if a.kind == lexdb_sql.A_ADD {
@@ -5690,7 +5692,10 @@ fn renameConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &T
     if from == to { return Ok(Unit{}) }
     if conTaken(t, to) { return Err(e("42710", &("constraint \"" + to + "\" for relation \"" + rel + "\" already exists"))) }
     let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), to)
-    for k in 0..len(t.invalid) { if t.invalid[k] == from { t.invalid[k] = to.toStr() } }
+    for k in 0..len(t.invalid) {
+        if t.invalid[k] == from { t.invalid[k] = to.toStr() }
+        else if t.invalid[k] == lexdb_catalog.OFF_MARK + from { t.invalid[k] = lexdb_catalog.OFF_MARK + to }
+    }
     for k in 0..len(t.checks) { if t.checks[k].name == from { t.checks[k].name = to.toStr() } }
     for k in 0..len(t.fks) { if t.fks[k].name == from { t.fks[k].name = to.toStr() } }
     for k in 0..len(t.indexes) {
@@ -5722,6 +5727,7 @@ fn validateConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut 
         }
         return Err(e("42704", &("constraint \"" + name + "\" of relation \"" + rel + "\" does not exist")))
     }
+    if lexdb_catalog.isOff(t, name) { return Err(e("55000", "cannot validate NOT ENFORCED constraint")) }
     if !lexdb_base.hasStr(&t.invalid, name) { return Ok(Unit{}) }
     if kind == 1 {
         for c in t.checks { if c.name == name { try checkRows(st, txn, t, &c) } }
@@ -5741,6 +5747,83 @@ fn validateConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut 
     return Ok(Unit{})
 }
 
+// A_CON_STATE (design/lexdb-new-features.md 10.5): CHECK or foreign key a.name of table t (a.name CON_ALL: all of them) made enforced
+// or not, valid or not (a.mode: lexdb_sql.CS_*), its rows checked first when it is made valid, with the errors of the dialect dia that
+// said so (PostgreSQL 23514 and 23503, SQL Server's 547, Oracle's ORA-02293 and ORA-02298).
+fn conState(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, a: &lexdb_sql.Alter, dia: int): Result[Unit, DbErr] {
+    var names: []str = []
+    if a.name == lexdb_sql.CON_ALL {
+        for c in t.checks { append(mut &names, c.name.clone()) }
+        for f in t.fks { append(mut &names, f.name.clone()) }
+    } else {
+        append(mut &names, a.name.clone())
+    }
+    for n in names { try conStateOne(st, txn, t, &n, a.mode, dia) }
+    return Ok(Unit{})
+}
+
+fn conStateOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, name: &str, mode: int, dia: int): Result[Unit, DbErr] {
+    let rel = lexdb_sql.baseName(&t.name)
+    var kind = 0
+    for c in t.checks { if c.name == name { kind = 1 } }
+    for f in t.fks { if f.name == name { kind = 2 } }
+    if kind == 0 {
+        let other = hasConName(t, name) || (lexdb_catalog.hasPk(t) && lexdb_catalog.pkConName(t) == name)
+        if dia == lexdb_sql.MD_TSQL {
+            if other { return Err(tsE(11415, "Object '" + name + "' cannot be disabled or enabled. This action applies only to foreign key and check constraints.")) }
+            return Err(tsE(4917, "Constraint '" + name + "' does not exist."))
+        }
+        if dia == lexdb_sql.MD_ORA {
+            let on = mode & lexdb_sql.CS_OFF == 0
+            let up = strings.toUpperAscii(name)
+            if other { return Err(e("ORA02430", &("cannot enable constraint (" + up + ") - no such constraint"))) }
+            return Err(if on { e("ORA02430", &("cannot enable constraint (" + up + ") - no such constraint")) } else { e("ORA02431", &("cannot disable constraint (" + up + ") - no such constraint")) })
+        }
+        if other {
+            return Err(lexdb_base.errDetail("42809", &("cannot alter enforceability of constraint \"" + name + "\" of relation \"" + rel + "\""), "",
+                                            "Only foreign key and check constraints can change enforceability."))
+        }
+        return Err(e("42704", &("constraint \"" + name + "\" of relation \"" + rel + "\" does not exist")))
+    }
+    let off = lexdb_catalog.isOff(t, name)
+    if mode & lexdb_sql.CS_IF_OFF != 0 && !off { return Ok(Unit{}) }
+    if mode & lexdb_sql.CS_VALIDATE != 0 {
+        var bad: Option[DbErr] = None
+        if kind == 1 {
+            for c in t.checks {
+                if c.name != name { continue }
+                let ck = Check{name: c.name.clone(), expr: if off { lexdb_catalog.offInner(&c.expr) } else { lexdb_sql.cloneExpr(&c.expr) }}
+                match checkRows(st, txn, t, &ck) {
+                    Ok(_) {}
+                    Err(x) { bad = Some(x) }
+                }
+            }
+        } else {
+            for f in t.fks {
+                if f.name != name { continue }
+                let pt = if f.ref == t.name { try decTable(&t.name, &lexdb_catalog.encTable(t)) } else { try byKey(st, txn, &f.ref) }
+                match fkRows(st, txn, t, &f, &pt) {
+                    Ok(_) {}
+                    Err(x) { bad = Some(x) }
+                }
+            }
+        }
+        match bad {
+            Some(x) {
+                if dia == lexdb_sql.MD_ORA && (x.state == "23514" || x.state == "23503") {
+                    let up = strings.toUpperAscii(name)
+                    return Err(if kind == 1 { e("ORA02293", &("cannot validate (" + up + ") - check constraint violated")) } else { e("ORA02298", &("cannot validate (" + up + ") - parent keys not found")) })
+                }
+                return Err(x)
+            }
+            None {}
+        }
+    }
+    if mode & lexdb_sql.CS_ON != 0 { lexdb_catalog.setOff(t, name, false) } else if mode & lexdb_sql.CS_OFF != 0 { lexdb_catalog.setOff(t, name, true) }
+    if mode & lexdb_sql.CS_VALIDATE != 0 { lexdb_catalog.setInvalid(t, name, false) } else if mode & lexdb_sql.CS_NOVALIDATE != 0 { lexdb_catalog.setInvalid(t, name, true) }
+    return Ok(Unit{})
+}
+
 // t.invalid without the names of constraints gone.
 fn pruneInvalid(t: mut &Table) {
     var keep: []str = []
@@ -5748,6 +5831,12 @@ fn pruneInvalid(t: mut &Table) {
         var there = false
         for c in t.checks { if c.name == n { there = true } }
         for f in t.fks { if f.name == n { there = true } }
+        let off = strings.startsWith(&n, lexdb_catalog.OFF_MARK)
+        if off {
+            let on = n[len(lexdb_catalog.OFF_MARK)..len(n)]
+            for c in t.checks { if c.name == on { there = true } }
+            for f in t.fks { if f.name == on { there = true } }
+        }
         if there || strings.startsWith(&n, lexdb_catalog.CL_MARK) { append(mut &keep, n.clone()) }
     }
     t.invalid = keep
@@ -6147,7 +6236,8 @@ fn clusterClash(t: &Table): Result[Unit, DbErr] {
 }
 
 fn addConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c: &lexdb_sql.Constraint, alter: bool): Result[Unit, DbErr] {
-    let later = alter && c.notValid
+    // (not valid: ALTER TABLE's NOT VALID, or a state written: PostgreSQL's NOT ENFORCED, Oracle's DISABLE and ENABLE NOVALIDATE, T-SQL's WITH NOCHECK)
+    let later = (alter && c.notValid) || c.off || (c.notValid && c.stated)
     if c.kind == lexdb_sql.C_CHECK { return addCheck(st, txn, t, c, later) }
     if c.kind == lexdb_sql.C_FOREIGN { return addForeign(st, txn, t, c, later) }
     var cols: []int = []
@@ -6210,8 +6300,9 @@ fn addCheck(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, c:
         Err(bad) { if bad.state == "42804" { return Err(bad) } }
     }
     // the rows there
-    if later { append(mut &t.invalid, name) } else { try checkRows(st, txn, t, &ck) }
+    if later { append(mut &t.invalid, name.clone()) } else { try checkRows(st, txn, t, &ck) }
     append(mut &t.checks, ck)
+    if c.off { lexdb_catalog.setOff(t, &name, true) }
     return Ok(Unit{})
 }
 
@@ -13713,7 +13804,7 @@ fn fkProbes(t: &Table, fw: &[]Table, targets: &[]int): lexdb_fkprobe.Probes {
             for x in 0..len(targets) { if targets[x] == c && t.cols[c].identity == lexdb_sql.ID_NONE { j = x } }
             append(mut &at, j)
         }
-        pr.add(lexdb_fkprobe.ref(collections.copyOf(&fc.cols), collections.copyOf(&fc.refCols), fc.via, pi, at, len(fw[pi].cols)))
+        pr.add(lexdb_fkprobe.ref(collections.copyOf(&fc.cols), collections.copyOf(&fc.refCols), if t.fks[k].off { -2 } else { fc.via }, pi, at, len(fw[pi].cols)))
     }
     return pr
 }
@@ -13809,6 +13900,7 @@ fn childSide(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, fw: &
              later: mut &[]FkLater, pr: mut &lexdb_fkprobe.Probes): Result[Unit, DbErr] {
     for k in 0..len(t.fks) {
         let f = &t.fks[k]
+        if f.off { continue }       // not enforced (design/lexdb-new-features.md 10.5)
         let pi = findTab(fw, &f.ref)
         if pr.active(k) {
             // an INSERT's, with the statement's probes: the key's columns worked out once, and a parent known
@@ -13844,7 +13936,7 @@ fn parentSide(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, fw: 
     for ck in t.refBy {
         let c = &fw[findTab(fw, &ck)]
         for k in 0..len(c.fks) {
-            if c.fks[k].ref != t.name { continue }
+            if c.fks[k].ref != t.name || c.fks[k].off { continue }
             let fc = fkCols(c, &c.fks[k], t)
             if hasNullAt(old, &fc.refCols) { continue }
             let vals = valsAt(old, &fc.refCols)
@@ -14057,6 +14149,7 @@ fn addForeign(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, 
     if refKey == t.name {
         let f = try makeFk(st, txn, t, t, c, &refKey)
         append(mut &t.fks, f)
+        if c.off { lexdb_catalog.setOff(t, &t.fks[len(t.fks) - 1].name.clone(), true) }
         addKey(mut &t.refBy, &t.name)
         return Ok(Unit{})
     }
@@ -14069,6 +14162,7 @@ fn addForeign(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, 
             }
             let f = try makeFk(st, txn, t, &p, c, &refKey)
             append(mut &t.fks, f)
+            if c.off { lexdb_catalog.setOff(t, &t.fks[len(t.fks) - 1].name.clone(), true) }
             var pm = p
             addKey(mut &pm.refBy, &t.name)
             return putTable(txn, &pm)
@@ -14120,7 +14214,7 @@ fn makeFk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Tabl
     var own: []str = []
     for n in c.cols { append(mut &own, n.clone()) }
     let f = ForeignKey{name: name.clone(), cols: own, ref: refKey.clone(), refCols: refCols, onDelete: c.onDelete, onUpdate: c.onUpdate,
-                       deferrable: c.deferrable, deferred: c.deferred}
+                       deferrable: c.deferrable, deferred: c.deferred, off: false}
     // the rows there (NOT VALID: when validated)
     if !lexdb_base.hasStr(&t.invalid, &name) { try fkRows(st, txn, t, &f, p) }
     return Ok(f)

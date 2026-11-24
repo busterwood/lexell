@@ -76,6 +76,7 @@ pub type ForeignKey = record {
     pub onUpdate: int
     pub deferrable: bool        // DEFERRABLE, INITIALLY DEFERRED (9.85)
     pub deferred: bool
+    pub off: bool               // not enforced (isOff: set where the table is decoded): neither its rows nor the rows it references are checked
 }
 
 pub fn emptyTable(name: &str): Table {
@@ -131,6 +132,7 @@ pub type CatCon = record {
     pub deferrable: bool
     pub deferred: bool
     pub valid: bool             // convalidated: false for a CHECK or foreign key added NOT VALID (9.117)
+    pub enforced: bool          // conenforced: false for one NOT ENFORCED (T-SQL's disabled, Oracle's DISABLED)
 }
 
 pub type CatSnap = record {
@@ -984,7 +986,7 @@ pub fn decTable(name: &str, s: &str, parseExpr: &fn(&str): Result[Expr, lexdb_ba
             at += strsLen(&frefCols)
             let ub = int(s[at + 1])
             append(mut &t.fks, ForeignKey{name: fname, cols: foldAll(fcols), ref: fref, refCols: foldAll(frefCols), onDelete: int(s[at]), onUpdate: ub & 15,
-                                          deferrable: ub & 16 != 0, deferred: ub & 32 != 0})
+                                          deferrable: ub & 16 != 0, deferred: ub & 32 != 0, off: false})
             at += 2
         }
         t.refBy = strsAt(s, at)
@@ -1019,7 +1021,74 @@ pub fn decTable(name: &str, s: &str, parseExpr: &fn(&str): Result[Expr, lexdb_ba
         at += strsLen(&t.invalid)
     }
     slotExprs(mut &t)
+    if len(t.invalid) > 0 { markOff(mut &t) }
     return Ok(t)
+}
+
+// The constraints not enforced (design/lexdb-new-features.md 10.5: PostgreSQL's NOT ENFORCED, T-SQL's NOCHECK CONSTRAINT, Oracle's DISABLE),
+// by name, as entries of Table.invalid with the prefix OFF_MARK (a name no constraint has: what reads that list does not see them; the
+// way CL_MARK keeps T-SQL's clustered label). A constraint not enforced is not valid either (its name is in the list as well), unless Oracle's
+// DISABLE VALIDATE. A CHECK not enforced is kept as `true OR expr` (offWrap: the rows' test, which every write runs, reads no new field and
+// finds nothing to evaluate); a foreign key has ForeignKey.off, which the write path's loops over a table's keys test. Both are made
+// where the table is decoded (markOff) and where a statement changes the state (setOff).
+pub const OFF_MARK = "\x00off:"
+
+pub fn isOff(t: &Table, name: &str): bool {
+    for x in t.invalid { if strings.startsWith(&x, OFF_MARK) && x[len(OFF_MARK)..len(x)] == name { return true } }
+    return false
+}
+
+// A CHECK's expression as it is tested while the constraint is not enforced.
+pub fn offWrap(x: &Expr): Expr { return Expr.Bin("or", Expr.Lit(Val.Bool(true)), lexdb_sql.cloneExpr(x)) }
+
+// ... and as written (what offWrap wrapped).
+pub fn offInner(x: &Expr): Expr {
+    match x {
+        Expr.Bin(op, a, b) {
+            if op == "or" {
+                match a {
+                    Expr.Lit(v) { match v { Val.Bool(t) { if t { return lexdb_sql.cloneExpr(&b) } } else {} } }
+                    else {}
+                }
+            }
+        }
+        else {}
+    }
+    return lexdb_sql.cloneExpr(x)
+}
+
+// What the decoded table's constraints are in memory: its foreign keys' flags (its checks' expressions were stored wrapped).
+fn markOff(t: mut &Table) {
+    for k in 0..len(t.fks) {
+        let o = isOff(t, &t.fks[k].name)
+        t.fks[k].off = o
+    }
+}
+
+// Constraint name of table t not enforced (off) or enforced again, in memory and in its list (the caller writes the row). Its
+// validity is the list's name (setInvalid).
+pub fn setOff(t: mut &Table, name: &str, off: bool) {
+    let had = isOff(t, name)
+    var keep: []str = []
+    for x in t.invalid { if !(strings.startsWith(&x, OFF_MARK) && x[len(OFF_MARK)..len(x)] == name) { append(mut &keep, x.clone()) } }
+    if off { append(mut &keep, OFF_MARK + name) }
+    t.invalid = keep
+    if had == off { return }
+    for k in 0..len(t.checks) {
+        if t.checks[k].name == name {
+            let x = if off { offWrap(&t.checks[k].expr) } else { offInner(&t.checks[k].expr) }
+            t.checks[k].expr = x
+        }
+    }
+    for k in 0..len(t.fks) { if t.fks[k].name == name { t.fks[k].off = off } }
+}
+
+// Constraint name of table t valid (its rows known to obey it: convalidated) or not.
+pub fn setInvalid(t: mut &Table, name: &str, invalid: bool) {
+    var keep: []str = []
+    for x in t.invalid { if x != name { append(mut &keep, x.clone()) } }
+    if invalid { append(mut &keep, name.toStr()) }
+    t.invalid = keep
 }
 
 // Its CHECKs and its indexes' expressions and predicates with each column at
@@ -1540,7 +1609,7 @@ pub fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, parseExpr: &fn
             let def = (if ix.primary { "PRIMARY KEY (" } else { "UNIQUE (" }) + colList(&ct.t, &ix.cols) + ")"
             append(mut &cons, CatCon{oid: catOid(&"c", &(ct.key.clone() + "\x00" + ix.name)), name: ix.name.clone(), typ: ty, rel: ct.oid,
                                           schema: ct.schema.clone(), cols: copyInts(&ix.cols), refRel: 0, refCols: [], idx: ix.oid, def: def,
-                                          upd: " ", del: " ", check: "", deferrable: false, deferred: false, valid: true})
+                                          upd: " ", del: " ", check: "", deferrable: false, deferred: false, valid: true, enforced: true})
         }
         for fk in ct.t.fks {
             var cs: []int = []
@@ -1578,18 +1647,20 @@ pub fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, parseExpr: &fn
             if fk.deferrable { def = def + " DEFERRABLE" }
             if fk.deferred { def = def + " INITIALLY DEFERRED" }
             let fvalid = !lexdb_base.hasStr(&ct.t.invalid, &fk.name)
-            if !fvalid { def = def + " NOT VALID" }
+            if fk.off { def = def + " NOT ENFORCED" } else if !fvalid { def = def + " NOT VALID" }
             append(mut &cons, CatCon{oid: catOid(&"c", &(ct.key.clone() + "\x00" + fk.name)), name: fk.name.clone(), typ: "f", rel: ct.oid,
                                           schema: ct.schema.clone(), cols: cs, refRel: refRel, refCols: refCols, idx: refIdx, def: def,
-                                          upd: upd, del: del, check: "", deferrable: fk.deferrable, deferred: fk.deferred, valid: fvalid})
+                                          upd: upd, del: del, check: "", deferrable: fk.deferrable, deferred: fk.deferred, valid: fvalid, enforced: !fk.off})
         }
         for ck in ct.t.checks {
             let none: Option[lexdb_sql.TypeName] = None
-            let x = naming.exprText(&ck.expr, &none)
+            let coff = isOff(&ct.t, &ck.name)
+            let cx = if coff { offInner(&ck.expr) } else { lexdb_sql.cloneExpr(&ck.expr) }
+            let x = naming.exprText(&cx, &none)
             let body = if strings.startsWith(&x, "(") { x } else { "(" + x + ")" }
             // conkey: the columns it uses, in the table's order
             var used: []str = []
-            lexdb_sql.colNames(&ck.expr, mut &used)
+            lexdb_sql.colNames(&cx, mut &used)
             var ccols: []int = []
             for i in 0..len(ct.t.cols) {
                 var uses = false
@@ -1599,8 +1670,8 @@ pub fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, parseExpr: &fn
             let cvalid = !lexdb_base.hasStr(&ct.t.invalid, &ck.name)
             append(mut &cons, CatCon{oid: catOid(&"c", &(ct.key.clone() + "\x00" + ck.name)), name: ck.name.clone(), typ: "c", rel: ct.oid,
                                           schema: ct.schema.clone(), cols: ccols, refRel: 0, refCols: [], idx: 0,
-                                          def: "CHECK (" + body + ")" + (if cvalid { "" } else { " NOT VALID" }),
-                                          upd: " ", del: " ", check: body, deferrable: false, deferred: false, valid: cvalid})
+                                          def: "CHECK (" + body + ")" + (if coff { " NOT ENFORCED" } else if cvalid { "" } else { " NOT VALID" }),
+                                          upd: " ", del: " ", check: body, deferrable: false, deferred: false, valid: cvalid, enforced: !coff})
         }
     }
     snap.cons = cons

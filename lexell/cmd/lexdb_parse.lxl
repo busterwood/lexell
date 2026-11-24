@@ -186,6 +186,7 @@ const A_ADD_CON = lexdb_sql.A_ADD_CON
 const A_DROP_CON = lexdb_sql.A_DROP_CON
 const A_RENAME_CON = lexdb_sql.A_RENAME_CON
 const A_VALIDATE = lexdb_sql.A_VALIDATE
+const A_CON_STATE = lexdb_sql.A_CON_STATE
 const A_ADD_IDENTITY = lexdb_sql.A_ADD_IDENTITY
 const A_SET_IDENTITY = lexdb_sql.A_SET_IDENTITY
 const A_DROP_IDENTITY = lexdb_sql.A_DROP_IDENTITY
@@ -3014,6 +3015,7 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
             }
             try p.expectKw(")")
             try p.tsqlStorage()
+            if p.enforcedNext() { return Err(lexdb_base.err("0A000", "PRIMARY KEY constraints cannot be marked NOT ENFORCED")) }
         } else if len(cname) > 0 || p.isKw("unique") || p.isKw("check") || p.isKw("foreign") || p.isKw("exclude") {
             append(mut &s.cons, try p.tableConstraint(&cname))
         } else {
@@ -3029,6 +3031,8 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
                 if p.acceptKw("constraint") { cn = try p.name() }
                 if p.ora && c.genKind == lexdb_sql.GEN_NONE && p.acceptKw("as") {
                     try p.genClause(mut &c, true)
+                } else if p.enforcedNext() {
+                    return Err(misplacedState())
                 } else if p.acceptKw("not") {
                     try p.expectKw("null")
                     c.notNull = true
@@ -3057,15 +3061,17 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
                     append(mut &s.cons, u)
                 } else if p.acceptKw("check") {
                     var ck = try p.checkTail(&cn)
-                    if ck.notValid { return Err(near(&p.toks[p.pos - 1])) }     // a column's may not be NOT VALID
+                    if ck.notValid && !ck.stated { return Err(near(&p.toks[p.pos - 1])) }     // a column's may not be NOT VALID
                     append(mut &ck.cols, n.clone())         // a column's: named for it
                     append(mut &s.cons, ck)
                 } else if p.acceptKw("references") {
                     var fk = lexdb_sql.newConstraint(C_FOREIGN, &cn)
                     append(mut &fk.cols, n.clone())
                     try p.fkTail(mut &fk)
-                    if fk.notValid { return Err(near(&p.toks[p.pos - 1])) }
+                    if fk.notValid && !fk.stated { return Err(near(&p.toks[p.pos - 1])) }
                     append(mut &s.cons, fk)
+                } else if p.enforcedNext() {
+                    return Err(misplacedState())
                 } else if len(cn) > 0 {
                     return Err(near(&p.peek()))
                 } else {
@@ -3200,6 +3206,7 @@ fn (p: mut &P) tableConstraint(name: &str): Result[Constraint, lexdb_base.DbErr]
         try p.expectKw(")")
         try p.indexTail()
         try p.tsqlStorage()
+        if p.enforcedNext() { return Err(lexdb_base.err("0A000", &((if prim { "PRIMARY KEY" } else { "UNIQUE" }) + " constraints cannot be marked NOT ENFORCED"))) }
         if p.isNotValid() { return Err(lexdb_base.err("0A000", &((if prim { "PRIMARY KEY" } else { "UNIQUE" }) + " constraints cannot be marked NOT VALID"))) }
         return Ok(c)
     }
@@ -3279,6 +3286,59 @@ fn (p: mut &P) uniqueTail(): Result[Unit, lexdb_base.DbErr] {
     return Ok(Unit{})
 }
 
+// A constraint's state word after a CHECK's or foreign key's definition (design/lexdb-new-features.md 10.5), when one is next: true
+// when read. PostgreSQL 18's ENFORCED and NOT ENFORCED (42601 for two); Oracle's ENABLE, DISABLE, VALIDATE, NOVALIDATE (a state is a
+// constraint's ENABLE [VALIDATE | NOVALIDATE] or DISABLE [NOVALIDATE]: not enforced is not validated), RELY and NORELY (read, not kept).
+// Not SQL Server's: its WITH NOCHECK is ALTER TABLE's.
+fn (p: mut &P) stateWord(c: mut &Constraint): Result[bool, lexdb_base.DbErr] {
+    if p.tsql { return Ok(false) }
+    if p.ora {
+        if p.acceptKw("enable") {
+            c.off = false
+            c.stated = true
+            return Ok(true)
+        }
+        if p.acceptKw("disable") {
+            c.off = true
+            c.notValid = true
+            c.stated = true
+            return Ok(true)
+        }
+        if p.acceptKw("validate") {
+            c.notValid = c.off
+            return Ok(true)
+        }
+        if p.acceptKw("novalidate") {
+            c.notValid = true
+            c.stated = true
+            return Ok(true)
+        }
+        if p.acceptKw("rely") || p.acceptKw("norely") { return Ok(true) }
+        return Ok(false)
+    }
+    var off = false
+    if p.isKw("enforced") { p.pos += 1 }
+    else if p.isKw("not") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "enforced" {
+        p.pos += 2
+        off = true
+    } else { return Ok(false) }
+    if c.stated { return Err(lexdb_base.err("42601", "multiple ENFORCED/NOT ENFORCED clauses not allowed")) }
+    c.stated = true
+    if off {
+        c.off = true
+        c.notValid = true
+    }
+    return Ok(true)
+}
+
+// PostgreSQL's ENFORCED or NOT ENFORCED next (where a key, NOT NULL or a default allows neither).
+fn (p: &P) enforcedNext(): bool {
+    if p.tsql || p.ora { return false }
+    return p.isKw("enforced") || (p.isKw("not") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "enforced")
+}
+
+fn misplacedState(): lexdb_base.DbErr { return lexdb_base.err("42601", "misplaced NOT ENFORCED clause") }
+
 // After CHECK: (expr) [NO INHERIT]. No subquery or parameter; NOT VALID is
 // not lexdb's (rows there are always checked).
 fn (p: mut &P) checkTail(name: &str): Result[Constraint, lexdb_base.DbErr] {
@@ -3290,10 +3350,12 @@ fn (p: mut &P) checkTail(name: &str): Result[Constraint, lexdb_base.DbErr] {
     if len(p.subs) > subs { return Err(lexdb_base.err("0A000", "cannot use subquery in check constraint")) }
     if p.params > params { return Err(lexdb_base.err("42P02", &("there is no parameter $" + p.params.toStr()))) }
     try p.expectKw(")")
-    if p.acceptKw("no") { try p.expectKw("inherit") }
-    if p.isNotValid() {
-        p.pos += 2
-        c.notValid = true
+    while true {
+        if p.acceptKw("no") { try p.expectKw("inherit") }
+        else if p.isNotValid() {
+            p.pos += 2
+            c.notValid = true
+        } else if !(try p.stateWord(mut &c)) { break }
     }
     return Ok(c)
 }
@@ -3332,6 +3394,7 @@ fn (p: mut &P) fkTail(c: mut &Constraint): Result[Unit, lexdb_base.DbErr] {
         } else if p.isNotValid() {
             p.pos += 2
             c.notValid = true
+        } else if try p.stateWord(mut &c) {
         } else {
             break
         }
@@ -3822,7 +3885,14 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
         return Ok(s)
     }
     var addList = false          // Oracle: ADD (col type, ...)
+    var withNo = false           // T-SQL: WITH NOCHECK ADD
     while true {
+        let st = try p.conStateAlter(mut &s)
+        if st == 1 {
+            if !(p.tsql && p.acceptKw(",")) { break }
+            continue
+        }
+        if st == 3 { withNo = true }
         if addList || p.acceptKw("add") {
             if p.ora && !addList && p.isKw("(") && !(p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "constraint" || p.peekAt(1).text == "unique" || p.peekAt(1).text == "check" || p.peekAt(1).text == "foreign" || p.peekAt(1).text == "primary")) {
                 p.pos += 1
@@ -3842,6 +3912,16 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 if p.acceptKw("constraint") { cname = try p.name() }
                 var a = lexdb_sql.alterOf(A_ADD_CON, "")
                 append(mut &a.cons, try p.tableConstraint(&cname))
+                if withNo {
+                    // T-SQL's WITH NOCHECK: a CHECK or foreign key enforced from now on, its rows not checked (not trusted)
+                    withNo = false
+                    for k in 0..len(a.cons) {
+                        if a.cons[k].kind == C_CHECK || a.cons[k].kind == C_FOREIGN {
+                            a.cons[k].notValid = true
+                            a.cons[k].stated = true
+                        }
+                    }
+                }
                 append(mut &s.alters, a)
                 if !p.acceptKw(",") { break }
                 continue
@@ -3864,6 +3944,8 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 if p.acceptKw("constraint") { cn = try p.name() }
                 if p.ora && a.col.genKind == lexdb_sql.GEN_NONE && p.acceptKw("as") {
                     try p.genClause(mut &a.col, true)
+                } else if p.enforcedNext() {
+                    return Err(misplacedState())
                 } else if p.acceptKw("not") {
                     try p.expectKw("null")
                     a.col.notNull = true
@@ -3887,15 +3969,17 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                     append(mut &cons, u)
                 } else if p.acceptKw("check") {
                     var ck = try p.checkTail(&cn)
-                    if ck.notValid { return Err(near(&p.toks[p.pos - 1])) }     // a column's may not be NOT VALID
+                    if ck.notValid && !ck.stated { return Err(near(&p.toks[p.pos - 1])) }     // a column's may not be NOT VALID
                     append(mut &ck.cols, a.col.name.clone())
                     append(mut &cons, ck)
                 } else if p.acceptKw("references") {
                     var fk = lexdb_sql.newConstraint(C_FOREIGN, &cn)
                     append(mut &fk.cols, a.col.name.clone())
                     try p.fkTail(mut &fk)
-                    if fk.notValid { return Err(near(&p.toks[p.pos - 1])) }
+                    if fk.notValid && !fk.stated { return Err(near(&p.toks[p.pos - 1])) }
                     append(mut &cons, fk)
+                } else if p.enforcedNext() {
+                    return Err(misplacedState())
                 } else if len(cn) > 0 {
                     return Err(near(&p.peek()))
                 } else {
@@ -3923,6 +4007,11 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 try p.expectKw(")")
                 addList = false
             }
+        } else if p.ora && p.isKw("modify") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "constraint" {
+            // MODIFY CONSTRAINT name state (design/lexdb-new-features.md 10.5)
+            p.pos += 2
+            let cn = try p.name()
+            try p.oraStateAlter(mut &s, &cn)
         } else if p.ora && p.acceptKw("modify") {
             // MODIFY [(] col [type] [NOT NULL | NULL] [DEFAULT e], ... [)]
             let paren = p.acceptKw("(")
@@ -3985,6 +4074,32 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
             try p.expectKw("constraint")
             append(mut &s.alters, lexdb_sql.alterOf(A_VALIDATE, &(try p.name())))
         } else if p.acceptKw("alter") {
+            if !p.tsql && !p.ora && p.isKw("constraint") {
+                // ALTER CONSTRAINT name [NOT] ENFORCED (PostgreSQL 18, design/lexdb-new-features.md 10.5)
+                p.pos += 1
+                var a = lexdb_sql.alterOf(A_CON_STATE, &(try p.name()))
+                var enforced = false
+                var notEnforced = false
+                while true {
+                    if p.isKw("enforced") {
+                        p.pos += 1
+                        enforced = true
+                    } else if p.isKw("not") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "enforced" {
+                        p.pos += 2
+                        notEnforced = true
+                    } else if p.isNotValid() {
+                        return Err(lexdb_base.err("0A000", "constraints cannot be altered to be NOT VALID"))
+                    } else if p.isKw("deferrable") || p.isKw("initially") || (p.isKw("not") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "deferrable") {
+                        return Err(lexdb_base.err("0A000", "lexdb: ALTER CONSTRAINT ... DEFERRABLE is not supported"))
+                    } else { break }
+                }
+                if enforced && notEnforced { return Err(lexdb_base.err("42601", "conflicting constraint properties")) }
+                if !enforced && !notEnforced { return Err(near(&p.peek())) }
+                a.mode = if enforced { lexdb_sql.CS_ON | lexdb_sql.CS_VALIDATE | lexdb_sql.CS_IF_OFF } else { lexdb_sql.CS_OFF | lexdb_sql.CS_NOVALIDATE }
+                append(mut &s.alters, a)
+                if !p.acceptKw(",") { break }
+                continue
+            }
             let c = p.acceptKw("column")
             // Oracle changes a column with MODIFY
             if p.ora { return Err(lexdb_base.err("ORA01735", "invalid ALTER TABLE option")) }
@@ -4136,6 +4251,83 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
         if !p.acceptKw(",") { break }
     }
     return Ok(s)
+}
+
+// ALTER TABLE's constraint states of SQL Server and Oracle (design/lexdb-new-features.md 10.5), at the start of an action:
+// 0 none; 1 the action read (one A_CON_STATE a name); 2 WITH CHECK, ADD follows; 3 WITH NOCHECK, ADD follows.
+// T-SQL: [WITH CHECK | WITH NOCHECK] CHECK CONSTRAINT {name [, name ...] | ALL} and NOCHECK CONSTRAINT {...}.
+// Oracle: ENABLE | DISABLE [VALIDATE | NOVALIDATE] CONSTRAINT name.
+fn (p: mut &P) conStateAlter(s: mut &Stmt): Result[int, lexdb_base.DbErr] {
+    if p.tsql {
+        var w = 0
+        if p.isKw("with") && p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "check" || p.peekAt(1).text == "nocheck") {
+            w = if p.peekAt(1).text == "check" { 1 } else { 2 }
+            p.pos += 2
+        }
+        let cons = p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "constraint"
+        if cons && (p.isKw("nocheck") || p.isKw("check")) {
+            let mode = if p.isKw("nocheck") { lexdb_sql.CS_OFF | lexdb_sql.CS_NOVALIDATE } else { lexdb_sql.CS_ON | (if w == 1 { lexdb_sql.CS_VALIDATE } else { 0 }) }
+            p.pos += 2
+            if p.isKw("all") && !(p.peekAt(1).kind == T_OP && p.peekAt(1).text == ".") {
+                p.pos += 1
+                var a = lexdb_sql.alterOf(A_CON_STATE, lexdb_sql.CON_ALL)
+                a.mode = mode
+                append(mut &s.alters, a)
+                return Ok(1)
+            }
+            while true {
+                var a = lexdb_sql.alterOf(A_CON_STATE, &(try p.name()))
+                a.mode = mode
+                append(mut &s.alters, a)
+                if !p.acceptKw(",") { break }
+            }
+            return Ok(1)
+        }
+        if w > 0 {
+            if p.isKw("add") { return Ok(1 + w) }
+            return Err(near(&p.peek()))
+        }
+        return Ok(0)
+    }
+    if p.ora && (p.isKw("enable") || p.isKw("disable")) {
+        let en = p.isKw("enable")
+        p.pos += 1
+        var val = 0
+        if p.acceptKw("validate") { val = 1 } else if p.acceptKw("novalidate") { val = 2 }
+        if !p.isKw("constraint") { return Err(near(&p.peek())) }
+        p.pos += 1
+        let cn = try p.name()
+        var mode = if en { lexdb_sql.CS_ON } else { lexdb_sql.CS_OFF }
+        if val == 1 || (val == 0 && en) { mode = mode | lexdb_sql.CS_VALIDATE } else { mode = mode | lexdb_sql.CS_NOVALIDATE }
+        var a = lexdb_sql.alterOf(A_CON_STATE, &cn)
+        a.mode = mode
+        append(mut &s.alters, a)
+        if p.acceptKw("cascade") {}
+        return Ok(1)
+    }
+    return Ok(0)
+}
+
+// Oracle's MODIFY CONSTRAINT name state clauses: ENABLE, DISABLE, VALIDATE, NOVALIDATE, RELY, NORELY, in any order: one A_CON_STATE.
+fn (p: mut &P) oraStateAlter(s: mut &Stmt, name: &str): Result[Unit, lexdb_base.DbErr] {
+    var en = 0
+    var val = 0
+    while true {
+        if p.acceptKw("enable") { en = 1 }
+        else if p.acceptKw("disable") { en = 2 }
+        else if p.acceptKw("validate") { val = 1 }
+        else if p.acceptKw("novalidate") { val = 2 }
+        else if p.acceptKw("rely") || p.acceptKw("norely") {}
+        else { break }
+    }
+    var a = lexdb_sql.alterOf(A_CON_STATE, name)
+    if en == 1 { a.mode = lexdb_sql.CS_ON } else if en == 2 { a.mode = lexdb_sql.CS_OFF }
+    if val == 1 { a.mode = a.mode | lexdb_sql.CS_VALIDATE }
+    else if val == 2 { a.mode = a.mode | lexdb_sql.CS_NOVALIDATE }
+    else if en == 1 { a.mode = a.mode | lexdb_sql.CS_VALIDATE }
+    else if en == 2 { a.mode = a.mode | lexdb_sql.CS_NOVALIDATE }
+    append(mut &s.alters, a)
+    return Ok(Unit{})
 }
 
 // Whether an identity column's change follows (ALTER COLUMN c ...):
