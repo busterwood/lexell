@@ -294,6 +294,33 @@ pub fn commonOid(ty: &Typing, oids: &[]int): int {
     return if p == 0 { lexdb_sql.OID_TEXT } else { p }
 }
 
+// The two types commonOid found of different categories: the type chosen so far and the one that did not fit; [] none.
+pub fn clashOids(ty: &Typing, oids: &[]int): []int {
+    var p = 0
+    for o in oids {
+        if isUnknownOid(o) || o == p { continue }
+        if p == 0 {
+            p = o
+            continue
+        }
+        let pf = factOf(ty, p)
+        let nf = factOf(ty, o)
+        // (only the types everyone knows: lexdb's own typing of a catalog's oids and names is not PostgreSQL's)
+        if pf.cat != nf.cat && clashable(p) && clashable(o) { return [p, o] }
+        if !pf.pref && implicitCast(ty, p, o) && !implicitCast(ty, o, p) { p = o }
+    }
+    return []
+}
+
+fn clashable(o: int): bool {
+    return o == lexdb_sql.OID_BOOL || plainNum(o) || plainTime(o) || isTextOid(o) || o == lexdb_sql.OID_BYTEA || o == lexdb_sql.OID_UUID
+}
+
+// PostgreSQL's 42804 for two types that cannot be made one ("CASE types integer and boolean cannot be matched").
+pub fn clashErr(what: &str, c: &[]int): DbErr {
+    return lexdb_base.err("42804", &(what + " types " + lexdb_ops.kindName(&lexdb_sql.oidType(c[0])) + " and " + lexdb_ops.kindName(&lexdb_sql.oidType(c[1])) + " cannot be matched"))
+}
+
 fn plainNum(o: int): bool {
     return o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8 || o == lexdb_sql.OID_NUMERIC ||
            o == lexdb_sql.OID_FLOAT4 || o == lexdb_sql.OID_FLOAT8
@@ -576,6 +603,7 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing)
         Expr.Cast(_, t) { return t.oid }
         Expr.Call(n, args, _) {
             if n == "#ora_sub" && oraSubStamp(&args, cols, ptypes, ty) { return lexdb_sql.OID_IVAL }
+            if (n == "#enumat" || n == "#enumchk") && len(args) == 3 { return lexdb_sql.litInt(&args[2]) }
             if n == "#bptrim" { return lexdb_sql.OID_TEXT }
             if n == "#bptrims" { return lexdb_sql.arrayOid(lexdb_sql.OID_TEXT) }
             if n == "#bppad" { return lexdb_sql.OID_BPCHAR }
@@ -1456,6 +1484,26 @@ pub fn bpLen(x: &Expr, cols: &[]lexdb_sql.ColDef): int {
 }
 
 // A value whose type the other side gives: a text literal, a parameter.
+// x an untyped text constant beside a value other of a number's or a bool's type: the constant read as that type, as
+// PostgreSQL's parser does (1 = 'a' is 22P02, invalid input syntax for type integer); None for any other pair.
+fn readLit(x: &Expr, other: &Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): Result[Option[Expr], DbErr] {
+    match x {
+        Expr.Lit(v) {
+            match v {
+                Val.Text(_) {
+                    let pt = ptypesOf(ns)
+                    let o = exprOid(other, cols, &pt, &ns.ty)
+                    if !(plainNum(o) || o == lexdb_sql.OID_BOOL) { return Ok(None) }
+                    return Ok(Some(Expr.Lit(try ns.constCast(v.clone(), &lexdb_sql.oidType(o)))))
+                }
+                else {}
+            }
+        }
+        else {}
+    }
+    return Ok(None)
+}
+
 fn untyped(x: &Expr): bool {
     match x {
         Expr.Lit(v) {
@@ -1703,6 +1751,13 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
             if isCmp(&op) {
                 var lx = l
                 var rx = r
+                // an untyped text constant beside a number or a bool: read as its type (22P02 for a text that is not one)
+                if pgRules(ns) {
+                    let pl = try readLit(&lx, &rx, cols, ns)
+                    let pr = try readLit(&rx, &lx, cols, ns)
+                    if pl.isSome() { lx = pl.unwrap() }
+                    if pr.isSome() { rx = pr.unwrap() }
+                }
                 // an untyped value beside a date or time column: of its type (timeLitOid)
                 let tl = timeLitOid(&lx, &rx, cols, ns)
                 let tr = timeLitOid(&rx, &lx, cols, ns)
@@ -1729,6 +1784,11 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                     Expr.Bin(o2, l2, r2) { return Ok(Expr.Bin(o2, collKeyOf(k, l2), collKeyOf(k, r2))) }
                     else { return Err(e("XX000", "a comparison resolved to no comparison")) }
                 }
+            }
+            if (op == "+" || op == "-" || op == "*" || op == "/" || op == "%") && pgRules(ns) {
+                let pl = try readLit(&l, &r, cols, ns)
+                let pr = try readLit(&r, &l, cols, ns)
+                return Ok(intChecked(Expr.Bin(op.clone(), if pl.isSome() { pl.unwrap() } else { l }, if pr.isSome() { pr.unwrap() } else { r }), cols, ns))
             }
             return Ok(intChecked(Expr.Bin(op.clone(), l, r), cols, ns))
         }
@@ -1822,6 +1882,15 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                     let o = timeLitOid(&out[i], &out[0], cols, ns)
                     if o > 0 { out[i] = Expr.Cast(replace(mut &out[i], Expr.Lit(Val.Null)), lexdb_sql.timeType(o)) }
                 }
+                // a text constant beside a number or a bool: read as its type (22P02 for a text that is not one)
+                if pgRules(ns) {
+                    for i in 1..len(out) {
+                        let pl = try readLit(&out[i], &out[0], cols, ns)
+                        if pl.isSome() { out[i] = pl.unwrap() }
+                    }
+                    let p0 = try readLit(&out[0], &out[len(out) - 1], cols, ns)
+                    if p0.isSome() && len(out) == 2 { out[0] = p0.unwrap() }
+                }
             }
             if isTypedFn(&nm) && (len(out) == 0 || !isHint(&out[len(out) - 1])) {
                 // the arguments' types, for the call to see (9.92)
@@ -1853,7 +1922,7 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                 // PostgreSQL's: an untyped one ('1900-01-01' after a
                 // timestamp) read as it, a number or a date of another type
                 // converted (1 as a numeric beside 2.5)
-                out = unifyVals(&nm, out, cols, ns)
+                out = try unifyVals(&nm, out, cols, ns)
             }
             if nm == "avg" && !star && len(out) == 1 && len(ns.coll) > 0 {
                 // T-SQL's AVG: of integers an integer, of decimal(p, s) scale max(s, 6)
@@ -1867,6 +1936,13 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                 // REPLACE under a case-insensitive collation matches as it folds
                 let c = try cmpColl(exprColl(&out[0], cols, ns), exprColl(&out[1], cols, ns), &"replace")
                 if c.level != CL_NONE && lexdb_sql.collKind(&c.name) == lexdb_sql.COLL_CI { return Ok(Expr.Call("#replaceci", out, star)) }
+            }
+            if nm == "nullif" && len(out) == 2 && !star && pgRules(ns) {
+                // a text constant beside a number or a bool: read as its type (22P02 for a text that is not one)
+                let pl = try readLit(&out[0], &out[1], cols, ns)
+                let pr = try readLit(&out[1], &out[0], cols, ns)
+                if pl.isSome() { out[0] = pl.unwrap() }
+                if pr.isSome() { out[1] = pr.unwrap() }
             }
             if nm == "nullif" && len(out) == 2 && !star && pgRules(ns) {
                 // NULLIF(a, b) is a of the type a = b compares as (PostgreSQL's make_op): a converted to it
@@ -1951,12 +2027,12 @@ pub fn intArith(l: int, r: int): int {
 }
 
 // x, resolved: + - * / of smallints and integers, unary minus, abs of one cast to their type (intArith); anything else
-// as it is. Arithmetic of literals alone is not checked (constX).
+// as it is. Arithmetic of literals alone is checked only with a cast to smallint or integer in it (constX, castsInt).
 fn intChecked(x: Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): Expr {
     var w = 0
     match x {
         Expr.Bin(op, l, r) {
-            if (op == "+" || op == "-" || op == "*" || op == "/" || op == "t+") && !(constX(&l) && constX(&r)) {
+            if (op == "+" || op == "-" || op == "*" || op == "/" || op == "t+") && (!(constX(&l) && constX(&r)) || castsInt(&l) || castsInt(&r)) {
                 w = intArith(arithOid(&l, cols, ns), arithOid(&r, cols, ns))
             }
         }
@@ -1988,8 +2064,17 @@ fn arithOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): int {
         Expr.Lit(_) { return exprOid(x, cols, &[], &ns.ty) }
         Expr.Col(_, _) { return exprOid(x, cols, &[], &ns.ty) }
         Expr.Cast(_, t) { return t.oid }
+        Expr.Bin(_, _, _) { return nestedOid(x, cols, ns) }
+        Expr.Unary(_, _) { return nestedOid(x, cols, ns) }
+        Expr.Call(_, _, _) { return nestedOid(x, cols, ns) }
         else { return exprOid(x, cols, &[], &ns.ty) }
     }
+}
+
+// An expression's type with the parameters' types given (arithOid: p / 100 of a numeric p is a numeric, not an integer).
+fn nestedOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): int {
+    if len(ns.frames) == 0 { return exprOid(x, cols, &ns.ptypes, &ns.ty) }
+    return exprOid(x, cols, &ptypesOf(ns), &ns.ty)
 }
 
 // x without the casts resolve puts on smallint and integer arithmetic (intArith), to compare a resolved expression
@@ -2021,14 +2106,26 @@ fn intOp(x: &Expr): bool {
     }
 }
 
-// Whether x is of literals alone: such arithmetic is not checked (intArith). Oracle's NUMBER literals are lexdb's
-// integers there, its door sharing the binder; PostgreSQL folds them when it plans (and raises then).
+// Whether x is of literals alone (with casts): such arithmetic is checked only with an explicit smallint or integer in it
+// (castsInt).
 fn constX(x: &Expr): bool {
     match x {
         Expr.Lit(_) { return true }
         Expr.Cast(a, _) { return constX(&a) }
         Expr.Unary(_, a) { return constX(&a) }
         Expr.Bin(_, a, b) { return constX(&a) && constX(&b) }
+        else { return false }
+    }
+}
+
+// Whether x of literals alone has a smallint or an integer in it, by an explicit cast: 2147483647::int + 1 is checked as
+// PostgreSQL's planner folds and checks it. (Literals alone are not: the Oracle door's NUMBER literals are lexdb's
+// integers, its door sharing the binder, and 2147483647 + 1 is 2147483648 there.)
+fn castsInt(x: &Expr): bool {
+    match x {
+        Expr.Cast(a, t) { return t.oid == lexdb_sql.OID_INT4 || t.oid == lexdb_sql.OID_INT2 || castsInt(&a) }
+        Expr.Unary(_, a) { return castsInt(&a) }
+        Expr.Bin(_, a, b) { return castsInt(&a) || castsInt(&b) }
         else { return false }
     }
 }
@@ -2065,14 +2162,21 @@ pub fn wideInner(x: &Expr): Option[Expr] {
 // one of another type cast to it, a constant converted now (but for a
 // timestamptz, whose value is the session's zone's). Of different
 // categories, as they are.
-fn unifyVals(nm: &str, out: []Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): []Expr {
+fn unifyVals(nm: &str, out: []Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): Result[[]Expr, DbErr] {
     let pt = ptypesOf(ns)
     let ty = ns.ty
     let idx = valueArgs(nm, len(out))
     var os: []int = []
     for i in idx { append(mut &os, argOid(&out[i], cols, &pt, &ty)) }
     let o = commonOid(&ty, &os)
-    if o == 0 { return out }
+    if o == 0 {
+        // of different categories: PostgreSQL's 42804 (the T-SQL door converts by its own precedence)
+        if pgRules(ns) {
+            let c = clashOids(&ty, &os)
+            if len(c) == 2 { return Err(clashErr(if nm == "coalesce" { "COALESCE" } else if nm == "greatest" { "GREATEST" } else if nm == "least" { "LEAST" } else { "CASE" }, &c)) }
+        }
+        return Ok(out)
+    }
     var xs = out
     for k in 0..len(idx) {
         let i = idx[k]
@@ -2087,9 +2191,24 @@ fn unifyVals(nm: &str, out: []Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): []Ex
         }
         if !converts(&ty, os[k], o) { continue }
         let x = replace(mut &xs[i], Expr.Lit(Val.Null))
+        // (an untyped text of the PostgreSQL door that is not a value of the type: 22P02, as its parser raises it)
+        if pgRules(ns) && o != lexdb_sql.OID_TSTZ {
+            match x {
+                Expr.Lit(v) {
+                    match v {
+                        Val.Text(_) {
+                            xs[i] = Expr.Lit(try ns.constCast(v.clone(), &lexdb_sql.oidType(o)))
+                            continue
+                        }
+                        else {}
+                    }
+                }
+                else {}
+            }
+        }
         xs[i] = castConst(x, o, ns)
     }
-    return xs
+    return Ok(xs)
 }
 
 // x cast to the type oid: a constant's value converted now (an error left

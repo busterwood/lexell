@@ -1,0 +1,71 @@
+// lexdb_tds: RAISERROR with a severity of 20 or more WITH LOG ends the session, as SQL Server's does (design/lexdb-tds.md 18): the
+// messages 50000 (severity 20), 2745 and 596 reach the client, then the connection is closed; the next request on it fails, and a new
+// connection works. Severity 19 WITH LOG is a user error that leaves the session open. Without WITH LOG severities 19 to 25 are
+// error 2754 and the session goes on. Through lib/sqlserver; run with LEXDB_MSSQL set to a connection string, the program asks
+// that SQL Server instead: the same output.
+// expect: 20 without log: errors 2754; next ok
+// expect: 25 with log: errors 50000 2745 596; next failed
+// expect: 19 with log: errors 50000; next ok
+// expect: 20 with log in a TRY block: errors 50000 2745 596; next failed
+// expect: 20 with log, a batch of statements: errors 50000 2745 596; next failed
+// expect: 16 with log: errors 50000; next ok
+import "os"
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+const BATCHES: []str = ["RAISERROR('fatal', 20, 1)", "RAISERROR('fatal', 25, 1) WITH LOG", "RAISERROR('logged', 19, 1) WITH LOG",
+                        "BEGIN TRY RAISERROR('x', 20, 1) WITH LOG END TRY BEGIN CATCH SELECT 1 END CATCH",
+                        "SELECT 1; RAISERROR('x', 20, 1) WITH LOG; SELECT 2", "RAISERROR('x', 16, 1) WITH LOG"]
+const NAMES: []str = ["20 without log", "25 with log", "19 with log", "20 with log in a TRY block", "20 with log, a batch of statements", "16 with log"]
+
+fn errorsOf(c: &sqlserver.Conn): str {
+    var ns: []str = []
+    for m in c.errors() { append(mut &ns, m.number.toStr()) }
+    return strings.join(&ns, " ")
+}
+
+fn client(dsn: &str) {
+    for i in 0..len(BATCHES) {
+        // (a connection for each: the fatal ones end it)
+        let got = sqlserver.connect(dsn)
+        if got.isErr() {
+            println(NAMES[i] + ": connect failed")
+            continue
+        }
+        var c = got.unwrap()
+        let r = c.queryAll(&(BATCHES[i].toStr()), &[])
+        let errs = errorsOf(&c)
+        let next = c.queryAll(&"SELECT 1", &[])
+        println(NAMES[i] + ": errors " + errs + "; next " + (if next.isOk() { "ok" } else { "failed" }))
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(sc: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        client(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    match os.env("LEXDB_MSSQL") {
+        Some(dsn) { client(&dsn) }
+        None {
+            lexdb_store.run(lexdb_disk.sim(6), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                                   snapNodes: 50000}, body).unwrap()
+        }
+    }
+}

@@ -36,6 +36,7 @@ import "./lexdb_parse"
 import "./lexdb_recur"
 import "./lexdb_recrun"
 import "./lexdb_tsqlerr"
+import "./lexdb_routine"
 
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
@@ -119,6 +120,12 @@ fn quotedName(msg: &str): str {
 // SQL Server's text for the errors programs look at, where lexdb's differs.
 fn sqlMessage(n: int, msg: &str): str {
     if n == 8134 { return "Divide by zero error encountered." }
+    if n == 8115 {
+        // (the integer arithmetic's 22003: SQL Server's text names the type)
+        if msg == "integer out of range" { return "Arithmetic overflow error converting expression to data type int." }
+        if msg == "smallint out of range" { return "Arithmetic overflow error converting expression to data type smallint." }
+        if msg == "bigint out of range" { return "Arithmetic overflow error converting expression to data type bigint." }
+    }
     if n == 3906 { return "Failed to update database \"lexdb\" because the database is read-only." }
     if n == 208 && strings.startsWith(msg, "relation \"") { return "Invalid object name '" + quotedName(msg) + "'." }
     if n == 207 && strings.startsWith(msg, "column \"") { return "Invalid column name '" + quotedName(msg) + "'." }
@@ -241,6 +248,7 @@ pub type State = record {
     pub rowLimit: int           // SET ROWCOUNT n: a SELECT returns at most n rows (0: all)
     pub error: int
     pub spid: int
+    pub kill: bool              // the session is to end after this batch's answer (RAISERROR severity 20 or more WITH LOG)
     saves: []str                // SAVE TRAN names, in order
     committed: bool             // the last transaction to end was committed
     // TRY ... CATCH (S4): TRY blocks in, the error that leaves one (jump),
@@ -281,7 +289,7 @@ pub type BulkReq = record { pub table: str; pub cols: []str; pub keepNulls: bool
 
 pub fn newState(spid: int): State {
     return State{nocount: false, xactAbort: false, implicitTx: false, quotedIdent: true, postgres: false, trancount: 0,
-                 rowcount: 0, rowLimit: 0, error: 0, spid: spid, saves: [], committed: false, tryDepth: 0, jump: false,
+                 rowcount: 0, rowLimit: 0, error: 0, spid: spid, kill: false, saves: [], committed: false, tryDepth: 0, jump: false,
                  pending: Caught{number: 0, message: "", severity: 0, state: 0}, caught: [], doomed: false, temps: [], tableVars: [],
                  fmtOnly: false, bulk: [], roTables: [], roParams: [], nest: 0, procId: 0, procs: [], retVal: 0, scopeEnd: false, tryNest: 0, uncatchable: false, pendingProc: "", caughtProc: [],
                  line: 1, pendingLine: 1, caughtLine: []}
@@ -502,7 +510,7 @@ fn (st: mut &State) sqlStmtWith(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stm
         f.vals[0] = Val.Int(max(st.trancount, if sess.status() == 'I' { 0 } else { 1 }) + 1)
     }
     let oids = f.oids()
-    var r = if bulk { sess.copyInFrom(s, pull) } else { sess.run(s, &f.vals, &oids) }
+    var r = if bulk { sess.copyInFrom(s, pull) } else { runIn(sess, s, f, &oids) }
     if len(s.outInto) > 0 && r.isOk() { r = outputInto(sess, s, r.unwrap()) }
     var before: []lexdb_exec.Res = []
     var past = false
@@ -613,7 +621,7 @@ fn recursionRows(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, f: &Frame, o
     let keep = sess.recursionLimit()
     if keep <= 0 { return }
     sess.setRecursionLimit(keep + lexdb_recrun.TRUNCATE)
-    let again = sess.run(s, &f.vals, oids)
+    let again = runIn(sess, s, f, oids)
     sess.setRecursionLimit(keep)
     match again {
         Ok(res0) {
@@ -846,6 +854,9 @@ fn (st: mut &State) after(sess: &lexdb_exec.Session, before: byte, ev: mut &[]Ev
 // Runs a batch: its events onto ev. f: its variables to start with
 // (newFrame's, and an RPC's parameters), and after it the values they have.
 pub fn run(sess: mut &lexdb_exec.Session, st: mut &State, sql: &str, f: mut &Frame, ev: mut &[]Event) {
+    // (nothing of an earlier batch's errors is left: no jump to a CATCH block, no error a TRY block does not catch)
+    st.jump = false
+    st.uncatchable = false
     st.refresh(sess, f)
     if st.postgres {
         st.runPg(sess, sql, ev)
@@ -1186,10 +1197,31 @@ fn (st: mut &State) block(sess: mut &lexdb_exec.Session, ts: &[]lexdb_tsqlparse.
     return F_NEXT
 }
 
+// A statement run with the frame's values. A decimal variable is read as its declared type, so that its arithmetic has SQL Server's
+// scale and does not take the other operand's (1 + @p / 100 of a decimal(5,2) @p: 1.100000, not an integer's 1): each such
+// @variable in the statement as CAST(@p AS decimal(p, s)).
+fn runIn(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, f: &Frame, oids: &[]int): Result[lexdb_exec.Res, DbErr] {
+    var any = false
+    for k in len(SYSVARS)..len(f.types) { if f.types[k].kind == lexdb_sql.K_NUM && f.types[k].prec > 0 { any = true } }
+    if !any { return sess.run(s, &f.vals, oids) }
+    let w = lexdb_routine.mapStmt(s, fn(x: &lexdb_sql.Expr): Option[lexdb_sql.Expr] {
+        match x {
+            lexdb_sql.Expr.Param(k) {
+                if k > len(SYSVARS) && k <= len(f.types) && f.types[k - 1].kind == lexdb_sql.K_NUM && f.types[k - 1].prec > 0 {
+                    return Some(lexdb_sql.Expr.Cast(lexdb_sql.Expr.Param(k), f.types[k - 1]))
+                }
+                return None
+            }
+            else { return None }
+        }
+    })
+    return sess.run(&w, &f.vals, oids)
+}
+
 // IF's and WHILE's condition: 1 true, 0 not, -1 an error (its flow in fl).
 fn (st: mut &State) cond(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, f: mut &Frame, ev: mut &[]Event): int {
     let oids = f.oids()
-    match sess.run(s, &f.vals, &oids) {
+    match runIn(sess, s, f, &oids) {
         Ok(r) {
             if len(r.rows) > 0 && len(r.rows[0]) > 0 {
                 match r.rows[0][0] {
@@ -1209,7 +1241,7 @@ fn (st: mut &State) cond(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, f: m
 // The values of PRINT's, RAISERROR's and THROW's arguments; None after an error.
 fn (st: mut &State) args(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, f: mut &Frame, ev: mut &[]Event): Option[[]Val] {
     let oids = f.oids()
-    match sess.run(s, &f.vals, &oids) {
+    match runIn(sess, s, f, &oids) {
         Ok(r0) {
             var r = r0
             if len(r.rows) > 0 { return Some(replace(mut &r.rows[0], [])) }
@@ -1350,11 +1382,33 @@ fn (st: mut &State) one(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt
                 var rest: []Val = []
                 for i in 3..len(vs) { append(mut &rest, vs[i].clone()) }
                 let msg = raiseText(&(if lexdb_ops.isNull(&vs[0]) { "" } else { lexdb_sql.text(&vs[0]) }), &rest)
-                let sev = intVal(&vs[1])
+                let sev = min(intVal(&vs[1]), 25)
                 let c = Caught{number: 50000, message: msg, severity: sev, state: intVal(&vs[2])}
+                var withLog = false
+                var setError = false
+                for o in t.names {
+                    if o == "log" { withLog = true }
+                    if o == "seterror" { setError = true }
+                }
                 if sev <= 10 {
                     caughtEv(ev, &c, EV_INFO)
+                    if setError { st.error = 50000 }
                     return F_NEXT
+                }
+                // severities above 18 are for WITH LOG (the sysadmin's), else error 2754; from 20 SQL Server ends the connection
+                if sev >= 19 && !withLog {
+                    st.failAs(ev, Caught{number: 2754, message: "Error severity levels greater than 18 can only be specified by members of the sysadmin role, using the WITH LOG option.", severity: 16, state: 1}, 0, false)
+                    return st.flowAfterError()
+                }
+                if sev >= 20 {
+                    st.error = 50000
+                    // (as SQL Server sends them: the error, 2745, and 596 as the session is killed)
+                    caughtEv(ev, &c, EV_ERROR)
+                    caughtEv(ev, &Caught{number: 2745, message: "Process ID " + st.spid.toStr() + " has raised user error 50000, severity " + sev.toStr() + ". SQL Server is terminating this process.", severity: 16, state: 2}, EV_ERROR)
+                    caughtEv(ev, &Caught{number: 596, message: "Cannot continue the execution because the session is in the kill state.", severity: 21, state: 1}, EV_ERROR)
+                    doneEv(ev, -1, 0, true)
+                    st.kill = true
+                    return F_END
                 }
                 st.failAs(ev, c, 0, false)
                 return st.flowAfterError()
@@ -1383,8 +1437,11 @@ fn (st: mut &State) one(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt
             }
         }
         st.failAs(ev, c, 0, false)
-        // THROW ends the batch (and, with XACT_ABORT, the transaction)
-        if st.jump { return F_ERROR }
+        // THROW ends the batch (and, with XACT_ABORT, the transaction); to the next CATCH block out, the jump made
+        if st.jump {
+            st.jump = false
+            return F_ERROR
+        }
         if st.xactAbort && sess.status() != 'I' { let rb = simple(sess, &"ROLLBACK") }
         return F_END
     }
@@ -1484,7 +1541,7 @@ fn (st: mut &State) call(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
     var vals: []Val = []
     if len(t.stmt) > 0 && len(t.stmt[0].items) > 0 {
         let oids = f.oids()
-        match sess.run(&t.stmt[0], &f.vals, &oids) {
+        match runIn(sess, &t.stmt[0], f, &oids) {
             Ok(r0) {
                 var r = r0
                 if len(r.rows) > 0 { vals = replace(mut &r.rows[0], []) }

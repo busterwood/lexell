@@ -65,6 +65,10 @@ pub type Table = record {
     // Its CHECK and foreign key constraints added NOT VALID and not
     // validated since, by name (9.117)
     pub invalid: []str
+    // T-SQL's CLUSTERED and NONCLUSTERED (a label only: lexdb's rows are in the primary key's order whichever): "" the default
+    // (the primary key is the clustered one, a table without one a heap); "\x01" none (the key NONCLUSTERED); else the clustered
+    // index's name (a UNIQUE constraint's or CREATE CLUSTERED INDEX's, without its schema)
+    pub clustered: str
 }
 
 pub type ForeignKey = record {
@@ -80,7 +84,7 @@ pub type ForeignKey = record {
 
 pub fn emptyTable(name: &str): Table {
     return Table{name: name.toStr(), tree: 0, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                 view: "", deps: [], rn: [], onCommit: 0, spell: "", pkName: "", invalid: []}
+                 view: "", deps: [], rn: [], onCommit: 0, spell: "", pkName: "", invalid: [], clustered: ""}
 }
 
 // t's layout, lent to lexdb_access.
@@ -681,7 +685,7 @@ pub fn encTable(t: &Table): str {
     if add { addKinds(mut &b, &cur) }
     // then a temporary table's ON COMMIT, when it is DELETE ROWS or DROP
     // (9.96), or when a spelling follows
-    let more = len(t.pkName) > 0 || len(t.invalid) > 0
+    let more = len(t.pkName) > 0 || len(t.invalid) > 0 || len(t.clustered) > 0
     if t.onCommit > lexdb_sql.ONC_PRESERVE || len(t.spell) > 0 || more { b.addByte(byte(t.onCommit)) }
     // then its name as written, if that is not its key's (L6)
     if len(t.spell) > 0 || more { addStr(mut &b, &t.spell) }
@@ -689,8 +693,19 @@ pub fn encTable(t: &Table): str {
     if more {
         addStr(mut &b, &t.pkName)
         addStrs(mut &b, &t.invalid)
+        // then which key or index T-SQL calls clustered, when it is not the primary key
+        if len(t.clustered) > 0 { addStr(mut &b, &t.clustered) }
     }
     return b
+}
+
+// The key or index T-SQL calls clustered: CL_PK (the primary key), an index's name, or "" (none: a heap).
+pub const CL_PK = "\x02pk"
+
+pub fn clusteredOf(t: &Table): str {
+    if t.clustered == "\x01" { return "" }
+    if len(t.clustered) > 0 { return t.clustered.clone() }
+    return if hasPk(t) { CL_PK } else { "" }
 }
 
 // The name of table t's primary key constraint (and its index).
@@ -823,6 +838,7 @@ pub fn decTable(name: &str, s: &str, parseExpr: &fn(&str): Result[Expr, lexdb_ba
                                     prec: binary.readU32LEStr(s, at + 8), scale: binary.readU32LEStr(s, at + 12),
                                     len: binary.readU32LEStr(s, at + 16)}
         at += 20
+        if ty.kind == lexdb_sql.K_ENUM { enumsSeen = true }
         append(mut &t.cols, spelledCol(&cn, ty, s[at] == 1))
         at += 1
     }
@@ -988,6 +1004,10 @@ pub fn decTable(name: &str, s: &str, parseExpr: &fn(&str): Result[Expr, lexdb_ba
         t.invalid = strsAt(s, at)
         at += strsLen(&t.invalid)
     }
+    if at + 4 <= len(s) {
+        t.clustered = strAt(s, at)
+        at += 4 + len(t.clustered)
+    }
     slotExprs(mut &t)
     return Ok(t)
 }
@@ -1092,9 +1112,21 @@ pub fn decEnum(oid: int, v: &str): EnumType {
     return EnumType{key: all[0].clone(), oid: oid, labels: labels}
 }
 
+// Whether an enum type has been seen in this process (CREATE TYPE ... AS ENUM, a table with a column of one, a type read): the
+// statements' enum passes (lexdb_enum) run only then, so a database without enum types does no work for them. The process's tasks
+// share one thread, so a plain flag; it is never cleared.
+var enumsSeen: bool = false
+
+pub fn enumsOn(): bool { return enumsSeen }
+
+pub fn noteEnums() { enumsSeen = true }
+
 pub fn readEnum(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, oid: int): Result[Option[EnumType], lexdb_base.DbErr] {
     match try st.get(txn, CATALOG, &(enumKey(oid))) {
-        Some(v) { return Ok(Some(decEnum(oid, &v))) }
+        Some(v) {
+            enumsSeen = true
+            return Ok(Some(decEnum(oid, &v)))
+        }
         None { return Ok(None) }
     }
 }

@@ -1,0 +1,201 @@
+# Wrong answers and serious errors found writing the user documentation (KNOWN-ISSUES.md), in the PostgreSQL door, against PostgreSQL 18
+# (gen_pg.py ... wrong): a variable's or parameter's quotient under +, integer overflow of casts, enums' order and labels, mixed types,
+# the SQL standard's interval fields, DROP SEQUENCE under a default, two primary keys, a recursive CTE under LIMIT. Each answer with its
+# columns' names; each query runs with lexdb_batch off and on ("@once" lines once).
+
+# a numeric parameter divides as a numeric (1 + p / 100 was 1)
+@once create table acc (id int primary key, salary numeric(10,2), pct int)
+@once insert into acc values (1, 100, 10), (2, 250.50, 5), (3, 80, 0)
+@once create function raise_to(p numeric) returns numeric language sql as $$ select 1 + p / 100 $$
+@once create function raise_to2(p numeric, q numeric) returns numeric language sql as $$ select 2 * (p / q) + 1 $$
+@once create procedure raise_pct(p numeric) language sql as $$ update acc set salary = salary * (1 + p / 100) where id = 1 $$
+@once create procedure raise_row(i int, p numeric) language sql as $$ update acc set salary = salary * (1 + p / 3) where id = i $$
+@once create procedure add_row(i int, p numeric) language sql as $$ insert into acc values (i, 10 * (1 + p / 4), 0) $$
+select raise_to(10) as a, raise_to(2.5) as b, raise_to(0) as c, raise_to(null) as d
+select raise_to2(10, 4) as a, raise_to2(1, 3) as b
+@once call raise_pct(10)
+select id, salary from acc order by id
+@once call raise_row(2, 10)
+select id, salary from acc order by id
+@once call add_row(4, 10)
+select id, salary from acc where id = 4
+select id, 1 + pct / 100.0 as f, salary * (1 + pct::numeric / 100) as s from acc order by id
+select 1 + 10::numeric / 100 as a, 1 + 10 / 100 as b, 2 * (7::numeric / 2) as c
+
+# integer arithmetic of casts, smallints and integers, overflows
+select 2147483647::int + 1
+select 32767::smallint + 1::smallint
+select 2147483647::int * 2
+select (-2147483648)::int - 1
+select 2147483647::int - -1
+select 32767::smallint * 2::smallint
+select 2147483647::int + 1 > 0
+select 2147483647::int + 1::bigint as a, 2147483647::int::bigint + 1 as b
+select 2147483646::int + 1 as ok
+select -32768::smallint - 1::smallint
+select case when false then 1 else 2147483647::int + 1 end
+select coalesce(2147483647::int * 2, 0)
+@once create table ov (a int, b smallint, c bigint)
+@once insert into ov values (2147483647, 32767, 9223372036854775807)
+select a + 1 from ov
+select 2147483647::int + 1 from ov
+select b + 1::smallint from ov
+select b * 2 from ov
+select c + 1 from ov
+insert into ov values (2147483647::int + 1, 1, 1)
+select 2147483647::int + a from ov
+
+# enums: order in the select list and in functions; the labels checked
+@once create type mood as enum ('sad', 'ok', 'happy')
+@once create table moods (id int primary key, m mood)
+@once insert into moods values (1, 'sad'), (2, 'ok'), (3, 'happy'), (4, null)
+select id, m < 'happy' as lt, m > 'ok' as gt, m <= 'ok' as le, m >= 'ok' as ge, m = 'ok' as eq, m <> 'ok' as ne from moods order by id
+select 'ok'::mood < 'happy'::mood as a, 'happy'::mood < 'ok'::mood as b, 'ok'::mood > 'sad'::mood as c
+select min(m) as lo, max(m) as hi from moods
+select max(m) as hi from moods where id < 3
+select min(m) as lo from moods where id > 3
+select greatest('sad'::mood, 'happy'::mood, 'ok'::mood) as g, least('happy'::mood, 'ok'::mood) as l
+select greatest(m, 'ok') as g, least(m, 'ok') as l from moods order by id
+select m, count(*) from moods group by m order by m
+select m, m < 'ok' as low from moods order by m
+select id, case when m < 'happy' then 'low' else 'high' end as c from moods order by id
+select m from moods where m between 'ok' and 'happy' order by id
+select id, m from moods order by m desc
+select m, row_number() over (order by m) as rn from moods order by id
+select m, rank() over (order by m desc) as r from moods order by id
+select distinct m from moods order by m
+select count(*) from moods where m < 'ok'
+select 'angry'::mood
+select cast('angry' as mood)
+select 'angry'::mood from moods
+select m = 'angry' from moods
+select id from moods where m = 'angry'
+select id from moods where m > 'angry'
+select max(m) < 'happy' as a from moods
+select coalesce(m, 'sad'::mood) < 'ok' from moods order by id
+@once alter type mood add value 'ecstatic' after 'happy'
+select 'ecstatic'::mood > 'happy'::mood as a
+select max(m) from moods
+@once insert into moods values (5, 'ecstatic')
+select max(m) as hi from moods
+select id from moods where m >= 'happy' order by id
+insert into moods values (6, 'angry')
+
+# mixed types: 42804 with PostgreSQL's messages, an untyped text read as the other's type
+select case when false then 1 else false end
+select case when true then 1 when false then true end
+select case when true then 'a' else 2 end
+select case when true then 1 else 'a' end
+select 1 union select true
+select 1 union all select true
+select 1 intersect select true
+select 1 except select true
+select true union select 1
+select 1 union select date '2020-01-01'
+select coalesce(1, true)
+select coalesce(true, 1)
+select coalesce(null, 1, true)
+select coalesce(1, 'a')
+select greatest(1, true)
+select least(true, 1)
+values (1), (true)
+values (true), (1)
+values (1, 'a'), (2, 3)
+select * from (values (1), (true)) s
+select 1 = 'a'
+select 'a' = 1
+select 1 < 'a'
+select 1 + 'a'
+select 'a' + 1
+select 1 - 'x'
+select 2 * 'y'
+select 1 = '1'
+select 1 + '2'
+select 1.5 = 'a'
+select true = 'a'
+select nullif(1, 'a')
+select 1 in (1, 'a')
+select 'a' in (1, 2)
+select * from (values (1)) t(x) where x = 'a'
+select 1 where 1 = 'a'
+@once create table mt (i int, t text, b boolean)
+@once insert into mt values (1, 'a', true), (2, '2', false)
+select * from mt where i = 'a'
+select * from mt where i = '2'
+select i + 'x' from mt
+select coalesce(i, t) from mt
+select case when b then i else t end from mt
+select i from mt union select t from mt
+select i from mt union select b from mt
+select t from mt union select i::text from mt order by 1
+select i from mt union select 3 order by 1
+select coalesce(t, 'z'), coalesce(i, 0), coalesce(1, 2.5), coalesce(1.5, 2) from mt order by i
+select 1 union select 2.5 order by 1
+select 1 union select null order by 1
+select 'a' union select 'b' order by 1
+select (select 1 union select true)
+
+# the SQL standard's interval fields
+select interval '1' day as a, interval '2' hour as b, interval '3' minute as c, interval '4' second as d, interval '5' month as e, interval '6' year as f
+select interval '90' minute as a, interval '-1' day as b, interval '1.5' day as c, interval '1.5' second as d
+select interval '1-2' year to month as a, interval '-1-2' year to month as b, interval '14' month as c, interval '1' year to month as d
+select interval '1 2:03:04' day to second as a, interval '2:03' hour to minute as b, interval '2:03:04' hour to second as c, interval '03:04' minute to second as d
+select interval '1 2' day to hour as a, interval '1 2:3' day to minute as b, interval '4 5:6:7.8' day to second(2) as c
+select interval '1.234567' second(3) as a, interval '1' second(3) as b
+select interval '1' day + interval '2' hour as a, interval '1' day * 2 as b, interval '1' day < interval '25' hour as c
+select date '2020-01-31' + interval '1' month as a, date '2020-01-01' + interval '1' year as b, timestamp '2020-01-01 10:00' + interval '90' minute as c
+select extract(day from interval '3' day) as d, extract(hour from interval '3' hour) as h
+select interval '1 year 3 months' year as a, interval '1 year 3 months' month as b, interval '1 day 5 hours' day as c, interval '1 day 5 hours' hour as d
+select interval '1 day 5:06:07.123456' day to second(2) as a, interval '1 day 5:06:07' day to hour as b, interval '1 day 5:06:07' day to minute as c
+select '1 day 5:06:07'::interval day to hour as a, '3'::interval hour as b, cast('1 2:03:04' as interval day to second) as c
+select cast(interval '2 days 3 hours' as interval day) as a, cast(interval '1 year 2 months 3 days' as interval year to month) as b
+select interval '1 2' year to month
+select interval '1-14' year to month
+select interval '5' second to minute
+select interval 'x' day
+@once create table ivr (a interval year, b interval month, c interval day, d interval hour, e interval minute, f interval second, g interval year to month, h interval day to hour, i interval day to minute, j interval day to second, k interval hour to minute, l interval hour to second, m interval minute to second, n interval day to second(2), o interval second(1), p interval)
+@once insert into ivr values ('1 year 3 months', '1 year 3 months', '1 day 5 hours', '1 day 5 hours', '1 day 5 hours 6 minutes', '1 day 5 hours 6 minutes 7.891 seconds', '1 year 3 months 4 days', '1 day 5:06:07', '1 day 5:06:07', '1 day 5:06:07.891', '1 day 5:06:07', '1 day 5:06:07.891', '1 day 5:06:07.891', '1 day 5:06:07.891', '1.26', '1 day 5:06:07.891')
+select * from ivr
+select a::text, d::text from ivr
+@once create table dayc (day int, id int)
+@once insert into dayc values (7, 1)
+select interval '1' day as x, day from dayc
+select day, interval '2' hour as hr from dayc
+select interval '1' hour hr, interval '1' minute as min
+
+# DROP SEQUENCE under a column default, two primary keys
+@once create sequence sq9
+@once create table tq9 (id int default nextval('sq9'), v int)
+drop sequence sq9
+@once insert into tq9 (v) values (1)
+select * from tq9
+@once drop sequence sq9 cascade
+@once create sequence sq10
+@once create table tq10 (id bigint default nextval('sq10'::regclass) primary key, v int)
+drop sequence sq10
+@once alter table tq10 alter column id drop default
+@once drop sequence sq10
+@once create sequence sq11
+@once create table tq11 (a int default 1 + nextval('sq11'), b int default nextval('sq11'))
+drop sequence sq11
+@once drop table tq11
+@once drop sequence sq11
+create table pk2 (a int primary key, b int primary key)
+create table pk2 (a int primary key, b int, primary key (b))
+create table pk2 (a int, primary key (a), primary key (a))
+create table pk2 (a int, b int, c int primary key, primary key (a, b))
+create table pk2 (a int primary key primary key)
+@once create table pk2 (a int primary key, b int unique, c int)
+
+# a recursive CTE under LIMIT stops when it has the rows
+with recursive r(n) as (select 1 union all select n + 1 from r) select * from r limit 3
+with recursive r(n) as (select 1 union all select n + 1 from r) select n * 2 as d from r limit 5 offset 2
+with recursive r(n) as (select 1 union all select n + 1 from r) select * from r limit 0
+with recursive r(n) as (select 1 union all select n + 1 from r) select * from r fetch first 4 rows only
+with recursive r(n) as (select 1 union select n + 1 from r) select * from r limit 4
+with recursive r(n) as (select 1 union all select n + 1 from r) select count(*) from (select * from r limit 5) s
+with recursive r(n) as (select 1 union all select n + 1 from r where n < 5) select * from r limit 3
+with recursive r(n) as (select 1 union all select n + 1 from r where n < 5) select * from r limit 30
+with recursive r(n, s) as (select 1, 'a' union all select n + 1, s || 'b' from r) select * from r limit 3
+with recursive r(n) as (select 1 union all select n + 1 from r) select r.n from r limit 3
+with recursive r(n) as (select 1 union all select n + 1 from r) select * from r limit 999
