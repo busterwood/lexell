@@ -1,7 +1,7 @@
 # Known issues
 
 Bugs and gaps found while writing and checking these pages (lexdb built from main at 4fba817b, 2026-11-23; the entries
-that main ca687450, a15b9a64, 02646472, 436468d8 and 81ee25d1, 2026-11-24, fixed are removed or reworded to what is left). They are not fixed here: the pages
+that main ca687450, a15b9a64, 02646472, 436468d8, 81ee25d1 and e689d814, 2026-11-24, fixed are removed or reworded to what is left). They are not fixed here: the pages
 describe what lexdb does. Each "Differences" section of the reference lists the
 smaller differences of its statement.
 
@@ -31,10 +31,12 @@ smaller differences of its statement.
   - `FOR UPDATE` with `FETCH ... WITH TIES` is 0A000.
   - `json_agg`, `corr`, `regr_slope`, `covar_pop` and the other statistics aggregates do not exist (42883).
 - **WITH:**
-  - `LIMIT` stops a recursive query only when the statement is a plain `SELECT` of it with a constant `LIMIT`. With a
-    `WHERE`, a join, grouping, `DISTINCT`, `ORDER BY` or an outer query block, `WITH RECURSIVE r(n) AS (SELECT 1 UNION
-    ALL SELECT n + 1 FROM r) SELECT * FROM r WHERE n > 0 LIMIT 3` still runs to 54001 after `max_recursion` rounds
-    (PostgreSQL returns 3 rows).
+  - A recursive CTE under `LIMIT`, `FETCH FIRST` or `TOP` stops when a `WHERE`, a join, a left join or a derived table
+    filters it (`WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT * FROM r WHERE n % 7 = 0 LIMIT
+    3`). It still runs to `max_recursion` (54001) for a join where lexdb's planner reads the other table first
+    (`FROM rt JOIN n`), for a subquery in the `WHERE` or the select list, for a `WHERE` that calls `nextval` or
+    `random`, and, in the T-SQL door, for a tree recursion (more than one row a round). The Oracle door gives ORA-32044,
+    as Oracle does.
   - The recursive term's checks are missing: an aggregate, a window function, `ORDER BY`, or the CTE on the nullable
     side of an outer join is not refused (PostgreSQL: 42P19 or 0A000), and the query runs to 54001.
   - Under `RECURSIVE` a CTE cannot name a later one (`relation "a2" does not exist`).
@@ -141,10 +143,13 @@ smaller differences of its statement.
 - **COPY:** `WITH (FORMAT binary)` is 0A000; once, after a COPY error at the end of a psql script, the session gave
   no answer for 120 s (not narrowed down).
 - **Data types** (found writing the type pages):
-  - **Bare integer constants do not overflow:** `SELECT 2147483647 + 1` gives 2147483648 (PostgreSQL: 22003). With a
-    cast in the expression (`2147483647::int + 1`, `32767::smallint + 1::smallint`) and on a column it is 22003, as in
-    PostgreSQL; PostgreSQL also folds a constant expression when it plans, so `2147483647::int + 1` from a table
-    `WHERE false` raises there and gives no rows here.
+  - **Bare integer constants are checked only in a select list:** integer-literal arithmetic there is 22003 (int4 and
+    bigint), as in PostgreSQL (`SELECT 2147483647 + 1`). In `WHERE`, `ON`, `HAVING` and `ORDER BY` it is not checked
+    (computed as bigint: `WHERE 2147483647 + 1 > 0` is true). With a cast in the expression (`2147483647::int + 1`,
+    `32767::smallint + 1::smallint`) and on a column it is 22003, as in PostgreSQL; PostgreSQL also folds a constant
+    expression when it plans, so `2147483647::int + 1` from a table `WHERE false` raises there and gives no rows here.
+    Oracle door: `9223372036854775807 + 1` is ORA-01426 where Oracle gives 9223372036854775808. T-SQL door:
+    `9223372036854775807 + 1` is an error (8115) where SQL Server gives a numeric.
   - **Enums are still ordered as text in four places:** `min` and `max` as window functions, the `ORDER BY` inside
     an aggregate (`array_agg(m ORDER BY m)`), a set operation's `ORDER BY`, and arrays (`ARRAY['ok'::mood]` is an array
     of text). Elsewhere they follow the list and a string that is not a label is 22P02.
@@ -272,10 +277,6 @@ smaller differences of its statement.
     - The 547 of `ADD` and of `WITH CHECK CHECK CONSTRAINT` says `The INSERT statement conflicted with ...` (a foreign
       key under `ADD`: `insert or update on table ... violates foreign key constraint`); SQL Server says `The ALTER TABLE
       statement conflicted with ...`.
-    - An `UPDATE` tests only the `CHECK`s that read a column it sets (as SQL Server does) outside an explicit
-      transaction; inside `BEGIN TRANSACTION`, in `MERGE`, and in an `UPDATE ... OUTPUT ... INTO` (a table or a table
-      variable), lexdb tests every `CHECK` of the row. This shows only for a check that is not trusted: a row that
-      breaks it fails there when any of its columns is updated.
   - A column-level `CONSTRAINT fk FOREIGN KEY REFERENCES t (c)` is 102 (without `FOREIGN KEY` it works).
   - `ON [PRIMARY]`, `TEXTIMAGE_ON`, `WITH (...)` index and table options and `ASC` / `DESC` in a key are read and not
     kept. Still syntax errors: `ROWGUIDCOL`, `SPARSE`, `FILESTREAM`, `MASKED WITH`, `NOT FOR REPLICATION`, `GENERATED
@@ -381,10 +382,11 @@ smaller differences of its statement.
   - **Functions that are lenient:** `IIF(1, 'a', 'b')` gives `b` (SQL Server: 4145); `GREATEST(1)`, `CONCAT('a')`,
     `SUBSTRING('abcdef', 2)` and `LEFT('abc', -1)` are taken (SQL Server: 189, 174, 536); `TRANSLATE('abc', 'abc',
     'xy')` is accepted (9828); `ASCII('')` is 0; `CASE` and `COALESCE` over `1` and `2.5` give `1`, not `1.0`.
-  - **`FORMAT`:** dates of cultures other than the ten (en-US, en-GB, de-DE, fr-FR, es-ES, it-IT, nl-NL, pt-BR,
-    ja-JP, sv-SE) are en-US's. A name of the form of a culture that SQL Server does not know gets the invariant
-    culture, as SQL Server 2022 does; a name of the wrong form is error 9818. 61 cultures are known for numbers; a
-    real culture outside them is read as the invariant one.
+  - **`FORMAT`:** dates cover 46 cultures (the ten en-US, en-GB, de-DE, fr-FR, es-ES, it-IT, nl-NL, pt-BR, ja-JP,
+    sv-SE and 36 more, with genitive month names, the time separator and Thai Buddhist years). ar-SA (the Hijri
+    calendar) and cultures outside the 46 get en-US dates. A valid-form unknown name gets the invariant culture, as SQL
+    Server 2022 does; a name of the wrong form is error 9818. 61 cultures are known for numbers; a real culture outside
+    them is read as the invariant one.
   - **Conversion errors:** a comparison of a string with a number is 195 (`'abc' = 1`; SQL Server: 245).
   - **Operators:** `!<` and `!>` are 102; `SELECT 1 = 1` and `SELECT NOT 1 = 2` are accepted (SQL Server: 102); `||`
     joins strings.
@@ -440,10 +442,6 @@ smaller differences of its statement.
     or `NOT NULL` is ORA-00900.
   - `RELY` and `NORELY` are read and not kept (`USER_CONSTRAINTS.RELY` is empty). `NOT ENFORCED` is ORA-00900 (Oracle
     23.26 has none: ORA-02000 or ORA-03075).
-  - An `UPDATE` tests only the `CHECK`s that read a column it sets (as Oracle does) for a statement after the door's
-    statement savepoint (the second statement of a transaction, and each one after it); a plain single autocommit
-    `UPDATE` on the Oracle door, and `MERGE`, test every `CHECK` of the row. This shows only for a check that is not
-    validated: a row that breaks it fails there when any of its columns is updated.
 - **Tables, users and PL/SQL** (found writing the Oracle DDL and PL/SQL pages):
   - `CREATE TABLE`: `INTERVAL` columns, `INVISIBLE`, `TABLESPACE`, storage clauses, `PARTITION BY`,
     `ORGANIZATION INDEX` and `DEFERRABLE` are ORA-00900;
@@ -464,9 +462,10 @@ smaller differences of its statement.
   - `SET TRANSACTION READ ONLY` does not stop changes; `ROLLBACK TO` an unknown savepoint is ORA-20000.
   - `NLS_NUMERIC_CHARACTERS` and `NLS_LANGUAGE` do not change `TO_CHAR` of numbers or messages;
     `SYS_CONTEXT('USERENV', 'NLS_CURRENCY')` is `$` until a territory is set.
-  - PL/SQL: a package variable cannot be an `INTO` target or an `OUT` argument from outside the package, and
-    records, subtypes, exceptions and collections in a package are not supported (scalar variables and constants are
-    read and assigned from outside); a package specification that declares procedures or functions needs its body
+  - PL/SQL: records, subtypes, exceptions and collections in a package are not supported (scalar variables and
+    constants are read and assigned from outside, and a variable is an `INTO` or `OUT` target); `SELECT pkg.f() FROM
+    dual` of a function that reads a package variable is a constant of the cached plan: a second call after the
+    variable is assigned gives the first answer; a package specification that declares procedures or functions needs its body
     (a call is PLS-00201 without it); a function without parameters needs brackets in SQL (`SELECT f FROM dual` is ORA-00904); `CALL f()` of
     a function is PLS-00201; `TO_NUMBER('abc')` raises `VALUE_ERROR`, not `INVALID_NUMBER`; `LOCK TABLE` in a block,
     `GOTO`, `FORALL` and collections are refused.
