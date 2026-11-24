@@ -59,6 +59,8 @@ MERGE
 - A target row matched by more than one source row is error 8672, and nothing changes.
 - A `WHEN MATCHED` clause with a condition after one without is error 5324.
 - `@@ROWCOUNT` is the number of rows inserted, updated and deleted together.
+- A subquery in a `WHEN` condition, in `SET` or in `VALUES` reads the tables as the statement found them: it does not see
+  the rows the same `MERGE` has already changed (example E). `OUTPUT` takes no subquery (error 10705).
 - `NOT NULL`, `CHECK`, foreign key and unique constraints are checked as for `INSERT`, `UPDATE` and `DELETE`.
 
 ## Differences from SQL Server
@@ -192,7 +194,42 @@ UPDATE 4      40
 (2 rows affected)
 ```
 
-### E. Errors
+### E. A subquery reads the rows as the statement found them
+
+The subquery sums the whole of `dbo.stock`. Both matched rows get the same total, the one before the statement
+changed anything.
+
+<!-- example: tsql -->
+```sql
+SELECT SUM(qty) AS total_before FROM dbo.stock;
+BEGIN TRANSACTION;
+MERGE dbo.stock AS t
+USING dbo.delivery AS s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET t.qty = (SELECT SUM(x.qty) FROM dbo.stock AS x);
+SELECT id, qty FROM dbo.stock ORDER BY id;
+ROLLBACK;
+```
+
+```text
+total_before
+------------
+72
+
+(1 row affected)
+
+(2 rows affected)
+
+id qty
+-- ---
+1  0
+2  72
+4  72
+5  7
+
+(4 rows affected)
+```
+
+### F. Errors
 
 <!-- example: tsql -->
 ```sql
