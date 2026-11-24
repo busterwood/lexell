@@ -23,6 +23,7 @@ import "./lexdb_time"
 import "./lexdb_oradata"
 import "./lexdb_oraadm"
 import "./lexdb_sql"
+import "./lexdb_annot"
 
 type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
@@ -176,7 +177,8 @@ pub fn family(view: &str): Family {
 pub fn isBuilt(base: &str): bool {
     match base.toStr() {
         "TABLES", "TAB_COLUMNS", "TAB_COLS", "INDEXES", "IND_COLUMNS", "IND_EXPRESSIONS", "CONSTRAINTS", "CONS_COLUMNS", "OBJECTS", "SEQUENCES",
-        "VIEWS", "TAB_COMMENTS", "COL_COMMENTS", "TAB_IDENTITY_COLS", "CATALOG", "SOURCE", "PROCEDURES", "ERRORS" { return true }
+        "VIEWS", "TAB_COMMENTS", "COL_COMMENTS", "TAB_IDENTITY_COLS", "CATALOG", "SOURCE", "PROCEDURES", "ERRORS", "ANNOTATIONS_USAGE", "ANNOTATIONS",
+        "ANNOTATION_VALUES" { return true }
         else { return false }
     }
 }
@@ -580,12 +582,59 @@ fn oraCommentRows(out: mut &[]OraPend, ct: &CatTab, user: &str, tableLevel: bool
     }
 }
 
+// Oracle's annotations (lexdb_annot) of a table or view ct: ANNOTATIONS_USAGE's rows, or the names (ANNOTATIONS) or names and values
+// (ANNOTATION_VALUES) each once an owner (seen: those listed). A column's or an index's that is no longer there is not listed.
+fn oraAnnotRows(out: mut &[]OraPend, seen: mut &[]str, ct: &CatTab, user: &str, base: &str, isView: bool) {
+    if lexdb_base.isTempSchema(&ct.schema) { return }
+    let ans = lexdb_annot.all(&ct.t.invalid)
+    if len(ans) == 0 { return }
+    let owner = oraOwner(&ct.schema, user)
+    for a in ans {
+        var obj = oraTabName(ct)
+        var typ = if isView { "VIEW" } else { "TABLE" }
+        var col = ""
+        var there = len(a.scope) == 0
+        if strings.startsWith(&a.scope, "c:") {
+            for c in ct.t.cols { if c.name == a.scope[2..len(a.scope)] { col = oraColName(&c); there = true } }
+        } else if strings.startsWith(&a.scope, "i:") {
+            let ix = a.scope[2..len(a.scope)].toStr()
+            for x in ct.t.indexes { if lexdb_sql.baseName(&x.name) == ix { there = true } }
+            obj = oraUp(&ix)
+            typ = "INDEX"
+        }
+        if !there { continue }
+        if base != "ANNOTATIONS_USAGE" {
+            let k = owner + "\x00" + a.name + (if base == "ANNOTATION_VALUES" { if a.has { "\x00v" + a.value } else { "\x00n" } } else { "" })
+            if lexdb_base.hasStr(seen, &k) { continue }
+            append(seen, k)
+        }
+        var p = oraPend(&owner, &"")
+        if base == "ANNOTATIONS_USAGE" {
+            p.s("OBJECT_NAME", &obj)
+            p.s("OBJECT_TYPE", &typ)
+            if len(col) > 0 { p.s("COLUMN_NAME", &col) } else { p.null("COLUMN_NAME") }
+            p.null("DOMAIN_NAME")
+            p.null("DOMAIN_OWNER")
+        }
+        p.s("ANNOTATION_OWNER", &owner)
+        p.s("ANNOTATION_NAME", &a.name)
+        if base != "ANNOTATIONS" { if a.has { p.s("ANNOTATION_VALUE", &a.value) } else { p.null("ANNOTATION_VALUE") } }
+        append(out, p)
+    }
+}
+
 fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role): []OraPend {
     // objects of the public schema are the login's own only when it has no schema of its name; a user with one
     // has them as the system's (USER_ views list a user's own schema alone)
     var user = snap.user.clone()
     for sc in snap.schemas { if sc == strings.toLowerAscii(&snap.user) && sc != "public" { user = "SYS" } }
     var out: []OraPend = []
+    if base == "ANNOTATIONS_USAGE" || base == "ANNOTATIONS" || base == "ANNOTATION_VALUES" {
+        var seen: []str = []
+        for ct in snap.tabs { oraAnnotRows(mut &out, mut &seen, &ct, &user, base, false) }
+        for v in snap.views { oraAnnotRows(mut &out, mut &seen, &v, &user, base, true) }
+        return out
+    }
     if base == "TABLES" {
         for ct in snap.tabs {
             if lexdb_base.isTempSchema(&ct.schema) { continue }
