@@ -11,6 +11,7 @@ CREATE TABLE { database_name.schema_name.table_name | schema_name.table_name | t
 (
     { column_definition | computed_column_definition | table_constraint } [ ,...n ]
 )
+[ ON filegroup ] [ TEXTIMAGE_ON filegroup ] [ WITH ( table_option [ ,...n ] ) ]
 [ ; ]
 
 column_definition ::=
@@ -23,8 +24,7 @@ column_name data_type
 
 column_constraint ::=
 [ CONSTRAINT constraint_name ]
-{   PRIMARY KEY
-  | UNIQUE
+{   { PRIMARY KEY | UNIQUE } [ CLUSTERED | NONCLUSTERED ]
   | [ FOREIGN KEY ] REFERENCES ref_table [ ( ref_column ) ]
         [ ON DELETE { NO ACTION | CASCADE | SET NULL | SET DEFAULT } ]
         [ ON UPDATE { NO ACTION | CASCADE | SET NULL | SET DEFAULT } ]
@@ -36,7 +36,8 @@ column_name AS computed_column_expression [ PERSISTED [ NOT NULL ] ]
 
 table_constraint ::=
 [ CONSTRAINT constraint_name ]
-{   { PRIMARY KEY | UNIQUE } ( column [ ASC ] [ ,...n ] )
+{   { PRIMARY KEY | UNIQUE } [ CLUSTERED | NONCLUSTERED ] ( column [ ASC | DESC ] [ ,...n ] )
+        [ WITH ( index_option [ ,...n ] ) ] [ ON filegroup ]
   | FOREIGN KEY ( column [ ,...n ] ) REFERENCES ref_table [ ( ref_column [ ,...n ] ) ]
         [ ON DELETE ... ] [ ON UPDATE ... ]
   | CHECK ( logical_expression )
@@ -73,7 +74,11 @@ table_constraint ::=
 
 `PRIMARY KEY`, `UNIQUE`
 : A key: no two rows may have the same values (error 2627). A primary key's columns are `NOT NULL`. A unique
-  key's columns may hold several NULLs.
+  key's columns may hold several NULLs. A table has one primary key: a second is error 8110.
+
+`CLUSTERED`, `NONCLUSTERED`
+: After `PRIMARY KEY` or `UNIQUE`: which key is the table's clustered index (see Remarks). `ASC` and `DESC` after a
+  key column are read.
 
 `REFERENCES`, `FOREIGN KEY`
 : A foreign key: each value must be one of the referenced key's, or NULL (error 547). `ON DELETE` and `ON UPDATE`
@@ -90,8 +95,15 @@ table_constraint ::=
 
 - A temporary table (`#name`) belongs to the session that made it, and is dropped when the session ends or is
   reset. It may be made, filled and read on a replica.
+- **`CLUSTERED` and `NONCLUSTERED` are labels.** lexdb keeps rows in the order of the primary key whatever is said.
+  `sys.indexes` shows the clustered index as `CLUSTERED` (a primary key is, unless `NONCLUSTERED` is said for it or
+  another key says `CLUSTERED`) and a table with none as a heap (`index_id` 0). A second clustered index by `CREATE
+  INDEX` is error 1902. See [CREATE INDEX](create-index.md).
+- `ON filegroup`, `TEXTIMAGE_ON`, `WITH (...)` options on a key or the table (`FILLFACTOR`, `DATA_COMPRESSION` ...)
+  are read and not kept.
 - The names lexdb gives constraints that have none follow PostgreSQL: `emp_pkey`, `emp_name_key` (unique),
-  `emp_dept_id_fkey`, `emp_name_check`. A `DEFAULT`'s constraint is named `DF_table_column`.
+  `emp_dept_id_fkey`, `emp_name_check`. A `DEFAULT`'s constraint is named `DF_table_column`. SQL Server makes
+  names such as `PK__emp__3213E83F...`: name the constraints that a script will refer to.
 - `sys.tables`, `sys.columns`, `sys.objects`, `sys.indexes`, `sys.key_constraints` and the other catalog views,
   and `INFORMATION_SCHEMA`, show the new table.
 - `CREATE TABLE` is transactional: inside a transaction, `ROLLBACK` removes the table.
@@ -99,15 +111,13 @@ table_constraint ::=
 
 ## Differences from SQL Server
 
-- **`CLUSTERED` and `NONCLUSTERED`** after `PRIMARY KEY` or `UNIQUE` are error 102. Leave them out: a primary key is
-  shown as clustered in `sys.indexes`.
-- `ON filegroup` (`ON [PRIMARY]`), `TEXTIMAGE_ON`, `WITH (DATA_COMPRESSION = ...)` and the other table options are
-  syntax errors (156, 102).
+- Two `CLUSTERED` keys in one `CREATE TABLE` are taken (the later one is shown as the clustered index); SQL Server
+  refuses them (1902). A `CREATE INDEX ... CLUSTERED` that finds one is 1902.
 - A column constraint written `CONSTRAINT name FOREIGN KEY REFERENCES t (c)` is error 102: write
   `CONSTRAINT name REFERENCES t (c)`, or a table constraint.
 - `ROWGUIDCOL`, `SPARSE`, `FILESTREAM`, `NOT FOR REPLICATION`, `MASKED WITH`, `ENCRYPTED WITH` and
   `GENERATED ALWAYS AS ROW START` are syntax errors. An index in the table's definition (`INDEX ix (col)`) is error
-  102: use [CREATE INDEX](create-index.md). `DESC` in a key's column list is error 156.
+  102: use [CREATE INDEX](create-index.md).
 - A `rowversion` (`timestamp`) column is not filled in: it stays NULL.
 - A `DEFAULT` constraint's own name is not kept; it is shown as `DF_table_column`. `ALTER TABLE ... DROP CONSTRAINT`
   finds it by neither name (error 50000).
@@ -115,7 +125,6 @@ table_constraint ::=
 - `##name` makes a temporary table of the session, as `#name` does: other sessions do not see it.
 - `sql_variant`, `hierarchyid`, `geography`, `geometry` and CLR types are not available (2715). Alias types
   (`CREATE TYPE name FROM varchar(20)`) are error 156.
-- Error 2714's text is lexdb's: `relation "dept" already exists`.
 
 ## Examples
 
@@ -182,7 +191,35 @@ uq_dept_code NONCLUSTERED 1         0
 (2 rows affected)
 ```
 
-### C. ON UPDATE CASCADE and ON DELETE SET NULL
+### C. CLUSTERED, NONCLUSTERED and the storage clauses
+
+These are read and shown in `sys.indexes`; the rows stay in primary-key order.
+
+<!-- example: tsql -->
+```sql
+CREATE TABLE dbo.audit (
+    id    bigint NOT NULL,
+    at    datetime2 NOT NULL,
+    what  nvarchar(100),
+    CONSTRAINT pk_audit PRIMARY KEY NONCLUSTERED (id DESC) WITH (FILLFACTOR = 80),
+    CONSTRAINT uq_audit_at UNIQUE CLUSTERED (at)
+) ON [PRIMARY] TEXTIMAGE_ON [PRIMARY];
+CREATE TABLE dbo.scratch (a int, b int);
+SELECT OBJECT_NAME(object_id) AS tbl, index_id, name, type_desc, is_primary_key
+FROM sys.indexes WHERE object_id IN (OBJECT_ID('dbo.audit'), OBJECT_ID('dbo.scratch')) ORDER BY object_id, index_id;
+```
+
+```text
+tbl     index_id name        type_desc    is_primary_key
+------- -------- ----------- ------------ --------------
+audit   1        uq_audit_at CLUSTERED    0
+audit   2        pk_audit    NONCLUSTERED 1
+scratch 0        NULL        HEAP         0
+
+(3 rows affected)
+```
+
+### D. ON UPDATE CASCADE and ON DELETE SET NULL
 
 <!-- example: tsql -->
 ```sql
@@ -204,7 +241,7 @@ Bob  20
 (2 rows affected)
 ```
 
-### D. Computed columns
+### E. Computed columns
 
 <!-- example: tsql -->
 ```sql
@@ -229,7 +266,7 @@ qty price total band
 (2 rows affected)
 ```
 
-### E. Table constraints over several columns
+### F. Table constraints over several columns
 
 <!-- example: tsql -->
 ```sql
@@ -252,7 +289,7 @@ pk_enrolment        PRIMARY_KEY_CONSTRAINT
 (3 rows affected)
 ```
 
-### F. A temporary table
+### G. A temporary table
 
 <!-- example: tsql -->
 ```sql
@@ -278,7 +315,7 @@ yes
 (1 row affected)
 ```
 
-### G. Errors
+### H. Errors
 
 <!-- example: tsql -->
 ```sql
@@ -289,6 +326,10 @@ GO
 CREATE TABLE dbo.dept (x int);
 GO
 CREATE TABLE dbo.place (spot geography);
+GO
+CREATE TABLE dbo.twokeys (a int PRIMARY KEY, b int PRIMARY KEY);
+GO
+CREATE CLUSTERED INDEX cx_dept ON dbo.dept (name);
 GO
 ```
 
@@ -303,15 +344,17 @@ Msg 2714, Level 16, State 1, Line 1
 There is already an object named 'dept' in the database.
 Msg 2715, Level 16, State 1, Line 1
 Column, parameter, or variable #1: Cannot find data type geography.
+Msg 8110, Level 16, State 1, Line 1
+Cannot add multiple PRIMARY KEY constraints to table 'twokeys'.
+Msg 1902, Level 16, State 1, Line 1
+Cannot create more than one clustered index on table 'dept'. Drop the existing clustered index 'pk_dept' before creating another.
 ```
 
-### H. What lexdb does not take
+### I. What lexdb does not take
 
 <!-- example: tsql -->
 ```sql
-CREATE TABLE dbo.t1 (id int NOT NULL, CONSTRAINT pk_t1 PRIMARY KEY CLUSTERED (id));
-GO
-CREATE TABLE dbo.t2 (id int) ON [PRIMARY];
+CREATE TABLE dbo.t1 (id int, INDEX ix_t1 (id));
 GO
 CREATE TABLE dbo.t3 (id int, ref int CONSTRAINT fk_t3 FOREIGN KEY REFERENCES dbo.dept (id));
 GO
@@ -319,9 +362,7 @@ GO
 
 ```text
 Msg 102, Level 15, State 1, Line 1
-Incorrect syntax near 'CLUSTERED'.
-Msg 156, Level 15, State 1, Line 1
-Incorrect syntax near the keyword 'PRIMARY'.
+Incorrect syntax near '('.
 Msg 102, Level 15, State 1, Line 1
 Incorrect syntax near 'FOREIGN'.
 ```
