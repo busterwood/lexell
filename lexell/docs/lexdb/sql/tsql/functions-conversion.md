@@ -61,6 +61,13 @@ with a century (100 and up) writes four year digits; the same style below 100 wr
 Any other style number is error 281. A style 126 or 127 string leaves out the fraction when it is zero. The result is
 cut to the length of the target type.
 
+A `datetimeoffset` takes the same styles, and these show its offset: 0 and 100 (`Mar  5 2026  2:07PM +02:00`), 9 and
+109 (`Mar  5 2026  2:07:09.0000000PM +02:00`), 13 and 113 (`05 Mar 2026 14:07:09.0000000 +02:00`), 20 and 120
+(`2026-03-05 14:07:09 +02:00`), 21 and 121 (`2026-03-05 14:07:09.0000000 +02:00`), 126 (`2026-03-05T14:07:09+02:00`)
+and 127 (UTC: `2026-03-05T12:07:09Z`). The others give its local date or time alone (101: `03/05/2026`). `CAST` to a
+string is style 121's form. Converting a string to a `datetimeoffset` reads the offset in it (`+02:00`, `-05:30`,
+`Z`); a string without one is at `+00:00` (example O).
+
 ## Remarks
 
 - **Data type precedence.** When an operator or a function gets two types, the one lower in this list is converted to
@@ -90,8 +97,12 @@ cut to the length of the target type.
 - **Only the date styles above work.** The style of a conversion to a number or from a string is read and ignored (a binary value's styles 1 and 2 work):
   `CONVERT(date, '05/03/2026', 103)` and `CONVERT(date, '20260305', 112)` are error 241, and `CONVERT(varchar(20),
   CAST(1234.5678 AS money), 1)` is `1234.5678`, as style 0 is (SQL Server: `1,234.57` and `1234.57`).
-  `TRY_CONVERT(date, '05/03/2026', 103)` is NULL. The styles 9, 13, 14, 22, 109, 113, 114 and the others of SQL Server
-  not in the table are error 281.
+  `TRY_CONVERT(date, '05/03/2026', 103)` is NULL. The styles 14, 22, 114 and the others of SQL Server not in the table
+  are error 281, and so are 9, 13, 109 and 113 for every type but `datetimeoffset` (SQL Server: `Mar  5 2026
+  2:07:09:123PM` and the like).
+- A `datetimeoffset` as a string has seven fractional digits whatever its scale (`datetimeoffset(0)` gives
+  `14:07:09.0000000 +02:00`; SQL Server `14:07:09 +02:00`), and styles 126 and 127 print none, three or seven by the
+  value (`.5` as `.500`; SQL Server gives the scale's digits).
 - `TRY_CAST('12' AS decimal(2, 0))` is 12 (SQL Server: NULL).
 - `CAST(x AS varchar)` without a length is not cut at 30 characters, where SQL Server cuts it.
 - `CAST(0 AS datetime)` is error 50000 (SQL Server: 1900-01-01). Numbers do not convert to dates.
@@ -441,6 +452,47 @@ Msg 156, Level 15, State 1, Line 1
 Incorrect syntax near the keyword 'AS'.
 Msg 156, Level 15, State 1, Line 1
 Incorrect syntax near the keyword 'AS'.
+```
+
+### O. datetimeoffset to and from strings
+
+<!-- example: tsql -->
+```sql
+SELECT CONVERT(varchar(40), CAST('2026-03-05 14:07:09.123 +02:00' AS datetimeoffset(3)), 0) AS s0,
+       CONVERT(varchar(40), CAST('2026-03-05 14:07:09.123 +02:00' AS datetimeoffset(3)), 101) AS s101,
+       CONVERT(varchar(40), CAST('2026-03-05 14:07:09.123 +02:00' AS datetimeoffset(3)), 120) AS s120,
+       CONVERT(varchar(40), CAST('2026-03-05 14:07:09 +02:00' AS datetimeoffset(0)), 126) AS s126,
+       CONVERT(varchar(40), CAST('2026-03-05 14:07:09 +02:00' AS datetimeoffset(0)), 127) AS s127;
+SELECT CONVERT(varchar(40), CAST('2026-03-05 14:07:09 +02:00' AS datetimeoffset(0)), 9) AS s9,
+       CONVERT(varchar(40), CAST('2026-03-05 14:07:09 +02:00' AS datetimeoffset(0)), 113) AS s113,
+       CAST(CAST('2026-03-05 14:07:09 +02:00' AS datetimeoffset(0)) AS varchar(40)) AS cast_;
+SELECT CONVERT(datetimeoffset(0), '2026-03-05T14:07:09+02:00', 127) AS iso, CONVERT(datetimeoffset(0), '2026-03-05T14:07:09Z', 127) AS zulu,
+       CAST('2026-03-05 14:07:09' AS datetimeoffset(0)) AS no_offset, TRY_CAST('2026-03-05 14:07:09 +20:00' AS datetimeoffset(0)) AS too_far;
+GO
+SELECT CONVERT(varchar(40), CAST('2026-03-05 14:07:09' AS datetime2(0)), 109) AS not_for_datetime2;
+```
+
+```text
+s0                         s101       s120                       s126                      s127
+-------------------------- ---------- -------------------------- ------------------------- --------------------
+Mar  5 2026  2:07PM +02:00 03/05/2026 2026-03-05 14:07:09 +02:00 2026-03-05T14:07:09+02:00 2026-03-05T12:07:09Z
+
+(1 row affected)
+
+s9                                    s113                                cast_
+------------------------------------- ----------------------------------- ----------------------------------
+Mar  5 2026  2:07:09.0000000PM +02:00 05 Mar 2026 14:07:09.0000000 +02:00 2026-03-05 14:07:09.0000000 +02:00
+
+(1 row affected)
+
+iso                        zulu                       no_offset                  too_far
+-------------------------- -------------------------- -------------------------- -------
+2026-03-05 14:07:09 +02:00 2026-03-05 14:07:09 +00:00 2026-03-05 14:07:09 +00:00 NULL
+
+(1 row affected)
+
+Msg 281, Level 16, State 1, Line 1
+109 is not a valid style number when converting from datetime to a character string.
 ```
 
 ## See also

@@ -27,7 +27,8 @@ name).
   BULK_LOAD message: bcp, SqlBulkCopy): see [bulk loading](../bulk-load.md#sql-server-bulk-copy).
 - **Result types.** A column's TDS type comes from its lexdb type: `int`, `bigint`, `smallint`, `bit`, `float`,
   `real`, `decimal(38, s)`, `nvarchar(4000)` or `nvarchar(max)`, `varbinary`, `uniqueidentifier`, `date`, `time(6)`,
-  `datetime2(6)`, `datetimeoffset(6)`. A table's declared types are given where drivers ask for them (`SET FMTONLY
+  `datetime2(6)`, `datetimeoffset(6)` (with each value's offset: `OffsetDateTime` or `microsoft.sql.DateTimeOffset`
+  in JDBC). A table's declared types are given where drivers ask for them (`SET FMTONLY
   ON`, `sp_describe_first_result_set`).
 - **Errors** are ERROR tokens with SQL Server's error number and severity for the same failure (208 for a missing
   table, 2627 for a duplicate key, 547 for a constraint), else 50000, with the line of the batch it happened on.

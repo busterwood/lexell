@@ -122,7 +122,7 @@ Not available: `hierarchyid`, `geography`, `geometry`, `cursor`, CLR types.
 | [Mathematical and bit functions](functions-math.md) | `ABS`, `CEILING`, `FLOOR`, `ROUND`, `SIGN`, `POWER`, `SQUARE`, `SQRT`, `EXP`, `LOG`, `LOG10`, `PI`, `SIN`, `COS`, `TAN`, `COT`, `ASIN`, `ACOS`, `ATAN`, `DEGREES`, `RADIANS`, `BIT_COUNT`, `LEFT_SHIFT`, `RIGHT_SHIFT`, `GET_BIT`, `SET_BIT` |
 | [Logical functions and CASE](functions-logical.md) | `IIF`, `CHOOSE`, `ISNULL`, `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`, `CASE` |
 | [Conversion functions](functions-conversion.md) | `CAST`, `CONVERT` (with styles), `TRY_CAST`, `TRY_CONVERT` |
-| [Date and time functions](functions-datetime.md) | `GETDATE`, `GETUTCDATE`, `SYSDATETIME`, `SYSUTCDATETIME`, `SYSDATETIMEOFFSET`, `CURRENT_TIMESTAMP`, `DATEADD`, `DATEDIFF`, `DATEDIFF_BIG`, `DATEPART`, `DATENAME`, `YEAR`, `MONTH`, `DAY`, `EOMONTH`, `DATEFROMPARTS`, `DATETRUNC`, `DATE_BUCKET`, `AT TIME ZONE` |
+| [Date and time functions](functions-datetime.md) | `GETDATE`, `GETUTCDATE`, `SYSDATETIME`, `SYSUTCDATETIME`, `SYSDATETIMEOFFSET`, `CURRENT_TIMESTAMP`, `DATEADD`, `DATEDIFF`, `DATEDIFF_BIG`, `DATEPART`, `DATENAME`, `YEAR`, `MONTH`, `DAY`, `EOMONTH`, `DATEFROMPARTS`, `DATETRUNC`, `DATE_BUCKET`, `SWITCHOFFSET`, `TODATETIMEOFFSET`, `AT TIME ZONE` |
 | [Aggregate functions](functions-aggregate.md) | `COUNT`, `COUNT_BIG`, `SUM`, `AVG`, `MIN`, `MAX`, `STRING_AGG`, `PRODUCT`, `APPROX_PERCENTILE_CONT`, `APPROX_PERCENTILE_DISC` |
 | [Window functions](functions-window.md) | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `PERCENT_RANK`, `CUME_DIST`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, `PERCENTILE_CONT`, `PERCENTILE_DISC`; see also [OVER](over.md) |
 | [System, identity, error and metadata functions](functions-system.md) | `@@ROWCOUNT`, `@@ERROR`, `@@TRANCOUNT`, `SCOPE_IDENTITY`, `@@IDENTITY`, `NEXT VALUE FOR`, `NEWID`, `ERROR_NUMBER` and the other error functions, `XACT_STATE`, `@@VERSION` and the other system variables, `SERVERPROPERTY`, `DB_NAME`, `OBJECT_ID`, `OBJECT_NAME`, `OBJECTPROPERTY`, `COLUMNPROPERTY`, `TYPE_NAME`, `USER_NAME`, `SUSER_SNAME`, `IS_MEMBER`, `HAS_PERMS_BY_NAME` and others |
@@ -131,7 +131,7 @@ Not available: `hierarchyid`, `geography`, `geometry`, `cursor`, CLR types.
 
 Not available: `UNICODE`, `STDEV`, `STDEVP`, `VAR`, `VARP`, `ATN2`, `SOUNDEX`, `DIFFERENCE`, `STR`, `ISNUMERIC`,
 `ISDATE`, `HASHBYTES`, `CHECKSUM`, JSON functions (`JSON_VALUE`, `OPENJSON`), `STRING_SPLIT`, `PARSE`, `TRY_PARSE`,
-`RAND`, `IDENT_CURRENT`, `SWITCHOFFSET`, `TODATETIMEOFFSET`. The pages above show each one's error.
+`RAND`, `IDENT_CURRENT`. The pages above show each one's error.
 
 ## Operators
 

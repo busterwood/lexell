@@ -83,6 +83,10 @@ text in quotes or after `\`; any other character as it is.
   custom format such as `hh\:mm` work, and any other standard letter is NULL (example F). The fraction has microsecond
   precision (`14:07:09.1234570`).
 - Digits are rounded half away from zero, as .NET does.
+- The currency format `C` gives the yen two decimals: `FORMAT(1234.5, 'C', 'ja-JP')` is `¥1,234.50` (SQL Server:
+  `¥1,235`, as the yen has none). Example L.
+- A `datetimeoffset` is formatted in its local time, but the offset specifiers `z`, `zz` and `zzz` are not known: they
+  are written as they are (`'HH:mm zzz'` gives `14:07 zzz`; SQL Server `14:07 +02:00`). Example N.
 
 ## Examples
 
@@ -377,6 +381,23 @@ Msg 9818, Level 16, State 1, Line 1
 The culture parameter 'english' provided in the function call is not supported.
 Msg 9818, Level 16, State 1, Line 1
 The culture parameter 'en_US' provided in the function call is not supported.
+```
+
+### N. A datetimeoffset
+
+<!-- example: tsql -->
+```sql
+SELECT FORMAT(CAST('2026-03-05 14:07:09 +02:00' AS datetimeoffset), 'yyyy-MM-dd HH:mm') AS custom,
+       FORMAT(CAST('2026-03-05 14:07:09 +02:00' AS datetimeoffset), 'd', 'de-DE') AS german,
+       FORMAT(CAST('2026-03-05 14:07:09 +02:00' AS datetimeoffset), 'HH:mm zzz') AS with_zzz;
+```
+
+```text
+custom           german     with_zzz
+---------------- ---------- ---------
+2026-03-05 14:07 05.03.2026 14:07 zzz
+
+(1 row affected)
 ```
 
 ## See also
