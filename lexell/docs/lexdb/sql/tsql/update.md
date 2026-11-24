@@ -74,7 +74,9 @@ UPDATE
   decimal is rounded to the column's scale.
 - `NOT NULL` (515), `CHECK` and `FOREIGN KEY` (547), and unique keys (2627) are checked. A failed `UPDATE` changes
   no row; the batch goes on with the next statement unless `SET XACT_ABORT ON` or a `TRY ... CATCH` says
-  otherwise.
+  otherwise. An `UPDATE` tests the `CHECK` constraints that read a column it sets; inside an explicit transaction
+  it tests every `CHECK` of the row, which differs only for a row that already breaks a constraint that is not
+  trusted (see [ALTER TABLE](alter-table.md), example H).
 - An `IDENTITY` column cannot be updated (error 544). A computed column cannot be set.
 - `@@ROWCOUNT` is the number of rows changed. With `SET NOCOUNT ON` the client gets no `(n rows affected)`.
 - A subquery in `SET` or `OUTPUT` sees the table as it was when the statement began, not the rows the statement has
