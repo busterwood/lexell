@@ -295,6 +295,34 @@ DETAIL:  Key (id)=(1) already exists.
 (1 row)
 ```
 
+### J. A row that fails part way through a large INSERT ... SELECT
+
+The statement fails with the error of the row, and none of its rows are inserted, also when the table has a foreign
+key and a check:
+
+<!-- example: postgresql -->
+```sql
+CREATE TABLE parent9 (id int PRIMARY KEY);
+CREATE TABLE child9 (id int PRIMARY KEY, pid int REFERENCES parent9 (id), v int CHECK (v > 0));
+INSERT INTO parent9 VALUES (1);
+INSERT INTO child9 SELECT i + 100, 1, 2000 - i FROM generate_series(1, 3000) i;
+INSERT INTO child9 SELECT i + 100, 2, 5 FROM generate_series(1, 3000) i;
+SELECT count(*) FROM child9;
+```
+
+```text
+CREATE TABLE
+CREATE TABLE
+INSERT 0 1
+ERROR:  new row for relation "child9" violates check constraint "child9_v_check"
+ERROR:  insert or update on table "child9" violates foreign key constraint "child9_pid_fkey"
+DETAIL:  Key (pid)=(2) is not present in table "parent9".
+ count
+-------
+     0
+(1 row)
+```
+
 ## See also
 
 [UPDATE](update.md) · [DELETE](delete.md) · [MERGE](merge.md) · [COPY](copy.md) · [CREATE TABLE](create-table.md) ·

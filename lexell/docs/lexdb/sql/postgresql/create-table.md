@@ -107,7 +107,9 @@ table from a query, see [CREATE TABLE AS](create-table-as.md).
   instead of at the end of the statement, in a transaction block.
 
 `NOT VALID`
-: For a table's `CHECK` or `FOREIGN KEY`: the constraint applies to new rows; on a new table there are no others.
+: For a table's `CHECK` or `FOREIGN KEY`: the constraint applies to new rows; on a new table there are no others. It
+  is written in a table constraint only: after a column constraint, with or without `NOT ENFORCED`, it is a syntax
+  error (42601). A table constraint takes `NOT VALID` and `NOT ENFORCED` together, in either order.
 
 `ENFORCED`, `NOT ENFORCED`
 : For a `CHECK` or a foreign key. `ENFORCED` is the default. A constraint that is `NOT ENFORCED` is kept and shown in
@@ -398,6 +400,8 @@ CREATE TABLE ex (a int, EXCLUDE USING gist (a WITH =));
 CREATE TABLE ne1 (a int PRIMARY KEY NOT ENFORCED);
 CREATE TABLE ne2 (a int, UNIQUE (a) NOT ENFORCED);
 CREATE TABLE ne3 (a int CHECK (a > 0) NOT ENFORCED ENFORCED);
+CREATE TABLE ne4 (a int CHECK (a > 0) NOT VALID NOT ENFORCED);
+CREATE TABLE ne5 (a int CHECK (a > 0) NOT ENFORCED NOT VALID);
 BEGIN READ ONLY;
 CREATE TABLE ro (a int);
 ROLLBACK;
@@ -414,9 +418,27 @@ ERROR:  lexdb: EXCLUDE constraints are not supported
 ERROR:  misplaced NOT ENFORCED clause
 ERROR:  UNIQUE constraints cannot be marked NOT ENFORCED
 ERROR:  multiple ENFORCED/NOT ENFORCED clauses not allowed
+ERROR:  syntax error at or near "valid"
+ERROR:  syntax error at or near "valid"
 BEGIN
 ERROR:  cannot execute CREATE TABLE in a read-only transaction
 ROLLBACK
+```
+
+### I. NOT VALID and NOT ENFORCED in a table constraint
+
+<!-- example: postgresql -->
+```sql
+CREATE TABLE nv3 (a int, CHECK (a > 0) NOT VALID NOT ENFORCED);
+SELECT conname, convalidated, conenforced FROM pg_constraint WHERE conrelid = 'nv3'::regclass;
+```
+
+```text
+CREATE TABLE
+   conname   | convalidated | conenforced
+-------------+--------------+-------------
+ nv3_a_check | f            | f
+(1 row)
 ```
 
 ## See also
