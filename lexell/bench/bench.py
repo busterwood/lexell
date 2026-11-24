@@ -13,7 +13,8 @@ once with `cargo build --release` and timed as the "Rust" column ("-" for
 `maps`, which has no reference, and when cargo is missing or --no-rust is
 given). Their output must equal the lxl output. The Java ports in java/ (Bench.java, compiled
 once with javac) are the "Java" column: one JVM per program, the best of RUNS runs inside it
-after a warm-up run (the JIT has compiled the hot code; JVM startup is not counted). Their
+after a warm-up run (the JIT has compiled the hot code; JVM startup is not counted), with a
+64 MB thread stack for lists' recursion. Their
 checksum must equal the lxl output too; --no-java skips them. pingpong (tasks) has no Rust port
 but a Go one in go/ (goroutines and channels), the Go column, when go is installed.
 
@@ -215,7 +216,9 @@ def peak_run(exe, name):
 
 def java_run(name, n):
     """(best warm seconds, checksum line, peak MB) of the Java port, in one JVM."""
-    cmd = ['java', f'-Dbench.runs={n}', '-cp', JAVA_CP, 'Bench', name] + args_for(name)
+    # -Xss: lists recurses 10,000 deep, which the default 1 MB stack overflowed in some runs
+    # (depending on what the JIT had compiled when); the stack size does not change the speed
+    cmd = ['java', '-Xss64m', f'-Dbench.runs={n}', '-cp', JAVA_CP, 'Bench', name] + args_for(name)
     p = subprocess.run(([PEAK] if PEAK else []) + cmd, capture_output=True, text=True, env=base_env())
     if p.returncode != 0:
         raise SystemExit(f"{name}: the Java port exited {p.returncode}: {p.stderr.strip()[-500:]}")
