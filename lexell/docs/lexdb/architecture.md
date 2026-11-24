@@ -13,6 +13,10 @@ A database is a **data directory** (`DATADIR` on the command line) with:
 | `log.N` | The write-ahead log, in segments (64 MB by default, `LEXDB_SEG_KB`). `--log-dir` puts them on another device. |
 | `lock` | Held by the running server: a second server on the same directory exits ("is in use by another lexdb"). |
 
+There is one catalog in the data file, whatever door made an object. Objects live in schemas: the PostgreSQL and SQL
+Server doors work in `public` (`dbo`), and each Oracle login works in a schema of its name, then `public`. A table
+reaches the other doors by its schema name (see [overview](overview.md#one-engine-three-doors)).
+
 Memory holds a cache of pages (`--cache-mb`, by default a quarter of the memory) and nothing else that must survive.
 The design assumes SSD or NVMe storage.
 
