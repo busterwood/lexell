@@ -7,10 +7,12 @@ Makes an index on a table: unique or not, on columns or computed columns, with i
 ## Syntax
 
 ```
-CREATE [ UNIQUE ] INDEX index_name
+CREATE [ UNIQUE ] [ CLUSTERED | NONCLUSTERED ] INDEX index_name
     ON { schema_name.table_name | table_name | #table_name } ( column [ ASC | DESC ] [ ,...n ] )
     [ INCLUDE ( column_name [ ,...n ] ) ]
     [ WHERE filter_predicate ]
+    [ WITH ( index_option [ ,...n ] ) ]
+    [ ON filegroup_name ]
 [ ; ]
 ```
 
@@ -19,6 +21,10 @@ CREATE [ UNIQUE ] INDEX index_name
 `UNIQUE`
 : No two rows may have the same key (error 2627 when a row would break it). The rows already in the table are
   checked when the index is made. NULLs do not clash with each other.
+
+`CLUSTERED`, `NONCLUSTERED`
+: Which index is the table's clustered one. A table has at most one clustered index: a second is error 1902. See
+  Remarks.
 
 *index_name*
 : The index's name. It must not be used by another index, table or view of the schema (error 2714).
@@ -39,13 +45,18 @@ CREATE [ UNIQUE ] INDEX index_name
   `sys.indexes.filter_definition`.
 - `CREATE INDEX` is transactional.
 - To rename an index, use [sp_rename](sp-rename.md) with `'INDEX'`.
+- **`CLUSTERED` and `NONCLUSTERED` are labels.** lexdb keeps a table's rows in the order of its primary key whatever
+  is said, so the words change what the catalog shows and nothing else. `sys.indexes` shows the clustered index as
+  `CLUSTERED` with `index_id` 1, every other as `NONCLUSTERED`, and a table with no clustered index as a heap (a row
+  with `index_id` 0, `type_desc` `HEAP` and no name; `OBJECTPROPERTY(..., 'TableHasClustIndex')` is 0).
+- A primary key is the clustered index unless `NONCLUSTERED` is said for it or another index is clustered. A
+  `CREATE CLUSTERED INDEX` on a table that has a primary key is error 1902 until the primary key is made
+  `NONCLUSTERED`; dropping the clustered index (or its constraint) leaves a heap.
+- `WITH (...)` index options (`FILLFACTOR`, `ONLINE`, `DATA_COMPRESSION` ...) and `ON filegroup` are read and not
+  kept.
 
 ## Differences from SQL Server
 
-- **`CLUSTERED` and `NONCLUSTERED`** are error 102. Every index lexdb makes is shown as `NONCLUSTERED`; a primary
-  key is shown as `CLUSTERED`.
-- `WITH (...)` index options (`ONLINE`, `FILLFACTOR`, `DATA_COMPRESSION`, `DROP_EXISTING` ...) are error 102, and
-  `ON filegroup` is error 156.
 - `ALTER INDEX ... REBUILD`, `REORGANIZE` and `DISABLE` are error 50000 ("lexdb: ALTER INDEX takes RENAME TO only").
   `CREATE STATISTICS` is error 50000; `UPDATE STATISTICS` is error 102.
 - A unique index over rows that already clash is error 2627, "could not create unique index" (SQL Server: 1505).
@@ -172,13 +183,59 @@ Msg 207, Level 16, State 1, Line 1
 Invalid column name 'nothere'.
 ```
 
-### F. What lexdb does not take
+### F. CLUSTERED and NONCLUSTERED
+
+The primary key `emp_pkey` is the table's clustered index, so a second clustered index is refused. A table made with its
+key `NONCLUSTERED` can have a clustered index of another column, and a heap shows as index 0.
 
 <!-- example: tsql -->
 ```sql
-CREATE NONCLUSTERED INDEX ix_emp_name ON dbo.emp (name);
+CREATE NONCLUSTERED INDEX ix_emp_name ON dbo.emp (name) WITH (FILLFACTOR = 90) ON [PRIMARY];
 GO
-CREATE INDEX ix_emp_name ON dbo.emp (name) WITH (FILLFACTOR = 90);
+CREATE CLUSTERED INDEX cx_emp_dept ON dbo.emp (dept_id);
+GO
+CREATE TABLE dbo.log_entry (id int NOT NULL, at datetime2 NOT NULL, msg nvarchar(200),
+    CONSTRAINT pk_log PRIMARY KEY NONCLUSTERED (id));
+CREATE UNIQUE CLUSTERED INDEX cx_log_at ON dbo.log_entry (at DESC, id);
+GO
+SELECT OBJECT_NAME(object_id) AS tbl, index_id, name, type_desc FROM sys.indexes
+WHERE object_id IN (OBJECT_ID('dbo.emp'), OBJECT_ID('dbo.log_entry')) ORDER BY object_id, index_id;
+GO
+DROP INDEX cx_log_at ON dbo.log_entry;
+GO
+SELECT index_id, name, type_desc FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.log_entry') ORDER BY index_id;
+GO
+```
+
+```text
+Msg 1902, Level 16, State 1, Line 1
+Cannot create more than one clustered index on table 'emp'. Drop the existing clustered index 'emp_pkey' before creating another.
+tbl       index_id name             type_desc
+--------- -------- ---------------- ------------
+emp       1        emp_pkey         CLUSTERED
+emp       2        ix_emp_dept      NONCLUSTERED
+emp       3        ux_emp_email     NONCLUSTERED
+emp       4        ux_emp_name_high NONCLUSTERED
+emp       5        ix_emp_band      NONCLUSTERED
+emp       6        ix_emp_name      NONCLUSTERED
+log_entry 1        cx_log_at        CLUSTERED
+log_entry 2        pk_log           NONCLUSTERED
+
+(8 rows affected)
+
+index_id name   type_desc
+-------- ------ ------------
+0        NULL   HEAP
+2        pk_log NONCLUSTERED
+
+(2 rows affected)
+```
+
+### G. What lexdb does not take
+
+<!-- example: tsql -->
+```sql
+CREATE COLUMNSTORE INDEX cs_emp ON dbo.emp (salary);
 GO
 ALTER INDEX ix_emp_dept ON dbo.emp REBUILD;
 GO
@@ -186,9 +243,7 @@ GO
 
 ```text
 Msg 102, Level 15, State 1, Line 1
-Incorrect syntax near 'NONCLUSTERED'.
-Msg 102, Level 15, State 1, Line 1
-Incorrect syntax near '('.
+Incorrect syntax near 'COLUMNSTORE'.
 Msg 50000, Level 16, State 1, Line 1
 lexdb: ALTER INDEX takes RENAME TO only
 ```
