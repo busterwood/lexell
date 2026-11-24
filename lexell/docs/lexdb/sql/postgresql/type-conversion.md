@@ -35,8 +35,11 @@ type_keyword:
 - In arithmetic and comparison, integers widen to `bigint`, then `numeric`, then `double precision`, whichever
   side needs it.
 - The branches of `CASE`, the arguments of `coalesce`, `greatest` and `least`, the rows of `VALUES` and the arms of
-  `UNION` are converted to one common type, as in PostgreSQL. In `VALUES`, types that cannot meet (`integer` and
-  `boolean`) are 42804.
+  `UNION`, `INTERSECT` and `EXCEPT` are converted to one common type, as in PostgreSQL. Types that cannot meet are
+  42804 (`COALESCE types integer and boolean cannot be matched`): numbers, booleans, texts, dates and times, `bytea`
+  and `uuid` are the categories.
+- A string constant beside a number or a boolean is read as that type, and is 22P02 when it is not one: `1 = 'a'`,
+  `1 + 'a'`, `x IN (1, 'a')` and `NULLIF(1, 'a')` say `invalid input syntax for type integer: "a"`.
 - On `INSERT` and `UPDATE` a value is converted to its column's type as an assignment: a number is rounded to the
   column's scale, and text too long for `varchar(n)` is 22001.
 - Every type casts to and from `text`. Text that does not read as the target type is 22P02 (or 22007, 22008 for
@@ -47,10 +50,10 @@ type_keyword:
 
 - Typed constants are taken only for the date and time types. `text '1'`, `int '42'`, `numeric '1.5'`, `bool 'yes'`,
   `uuid '...'` and `bytea '...'` are syntax errors; use a cast (`'42'::int`).
-- Comparing a number with text that is not a number gives `operator does not exist: 1 compared with a` (42883);
-  PostgreSQL reads the text as a number and gives 22P02.
-- `CASE`, `coalesce` and `UNION` do not check that their types can meet: `CASE WHEN false THEN 1 ELSE false END`
-  gives `f`, and `SELECT 1 UNION SELECT true` gives the rows `1` and `t` (PostgreSQL: 42804).
+- Mixed types are not refused everywhere. `true AND 1`, `ARRAY[1, true]` and `1 IN (1, true)` are taken, where
+  PostgreSQL refuses them (`SELECT true AND 1` gives an empty row, `ARRAY[1, true]` gives `{1,t}`), and `NOT 1` is
+  refused with a shorter message (`argument of NOT must be type boolean`). `1 = true` is 42883 as in PostgreSQL, with
+  the operands written as values (`operator does not exist: 1 compared with t`).
 - Bit-string constants (`B'101'`, `X'1F'`) are syntax errors; there is no `bit` type.
 - A cast's result column is sometimes named after the source type, or `?column?`, where PostgreSQL uses the target
   type's name; give it an alias.
@@ -154,14 +157,20 @@ SELECT DATE '2026-01-01'::timestamp AS ts, TIMESTAMP '2026-01-01 10:00'::date AS
 SELECT int '42';
 SELECT 'abc'::int;
 SELECT 1 = 'a';
+SELECT coalesce(1, true);
+SELECT CASE WHEN false THEN 1 ELSE false END;
+SELECT 1 UNION SELECT true;
 VALUES (1), (true);
 ```
 
 ```text
 ERROR:  syntax error at or near "42"
 ERROR:  invalid input syntax for type integer: "abc"
-ERROR:  operator does not exist: 1 compared with a
-ERROR:  column is of type integer but the expression is of another type
+ERROR:  invalid input syntax for type integer: "a"
+ERROR:  COALESCE types integer and boolean cannot be matched
+ERROR:  CASE types boolean and integer cannot be matched
+ERROR:  UNION types integer and boolean cannot be matched
+ERROR:  VALUES types integer and boolean cannot be matched
 ```
 
 ## See also
