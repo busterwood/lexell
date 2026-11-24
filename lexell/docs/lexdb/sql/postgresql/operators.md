@@ -102,8 +102,8 @@ As in PostgreSQL, `-2 ^ 2` is 4 (the minus binds first) and `2 ^ 3 ^ 2` is 64 (l
 
 ## Differences from PostgreSQL
 
-- Arithmetic on `integer` and `smallint` constants does not overflow (`2147483647::int + 1` is 2147483648); on
-  columns it does (see [numeric types](data-types-numeric.md)).
+- Arithmetic on bare integer constants does not overflow (`SELECT 2147483647 + 1` is 2147483648); with a cast or on
+  columns it does (22003: see [numeric types](data-types-numeric.md)).
 - `~~`, `~~*`, `!~~`, `!~~*` (LIKE spelled as operators), `^@` (starts with), `@` (absolute value), `|/` and `||/`
   (roots), `!` (factorial), `OVERLAPS` and the JSON, range, geometric and network operators do not exist.
 - `OPERATOR(pg_catalog.+)` syntax and user-defined operators are not taken.
@@ -233,7 +233,7 @@ SELECT 2 BETWEEN 1 AND 3 = true;
 
 ```text
 ERROR:  division by zero
-ERROR:  operator does not exist: a + 1
+ERROR:  invalid input syntax for type integer: "a"
 ERROR:  syntax error at or near "@"
 ERROR:  syntax error at or near "="
 ```
