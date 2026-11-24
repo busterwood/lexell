@@ -47,8 +47,12 @@ END [ package ] ;
 - **Package variables are used from PL/SQL, not from a statement of its own.** A block, procedure or function outside
   the package reads and assigns the package's variables and reads its constants (example C), also inside a SQL
   statement it runs. A statement sent by itself (`SELECT pay.g_count FROM dual`) is ORA-06553, as in Oracle
-  (example D). Not supported: a package variable as an `INTO` target or an `OUT` argument from outside the package,
-  and a variable of a record or collection type.
+  (example D). A package variable is also an `INTO` target (`SELECT`, `FETCH`, `RETURNING`, `EXECUTE IMMEDIATE`), a
+  `USING OUT` bind and an `OUT` or `IN OUT` argument of a call from outside the package (example G). Not supported: a
+  variable of a record or collection type.
+- **`SELECT pkg.f() FROM dual` of a function that reads a package variable gives a constant of the cached plan:** a
+  second call after the variable is assigned gives the first answer (Oracle: the current value). Call the function in
+  a block (`v := pkg.f();`), where it is read every time.
 - A specification that declares procedures or functions needs its body: without it a call is PLS-00201 (Oracle:
   ORA-04067).
 - Records, subtypes and exceptions declared in a package are not supported, with a body or without. Collection types and
@@ -270,6 +274,79 @@ ERROR:
 ORA-06550: line 1, column 7:
 PLS-00201: identifier 'NOBODY_HOME.P' must be declared
 ORA-06550: line 1, column 7:
+PL/SQL: Statement ignored
+```
+
+### G. A package variable as a target
+
+From outside the package, a variable is the target of `SELECT ... INTO`, `FETCH ... INTO`, `RETURNING ... INTO` and
+`EXECUTE IMMEDIATE ... INTO` or `USING OUT`, and of the `OUT` argument of a call. The value is copied to the variable
+when the statement has run: an error leaves the variable as it was. A constant is PLS-00363 and a name that is none
+PLS-00201 (both reported as ORA-06550).
+
+<!-- example: oracle -->
+```sql
+CREATE OR REPLACE PACKAGE st AS
+  g_name VARCHAR2(20);
+  g_sal NUMBER;
+  g_id NUMBER;
+  c_k CONSTANT NUMBER := 1;
+END st;
+/
+CREATE OR REPLACE PROCEDURE top_paid (p_name OUT VARCHAR2, p_sal OUT NUMBER) IS
+BEGIN
+  SELECT name, salary INTO p_name, p_sal FROM emp WHERE salary = (SELECT MAX(salary) FROM emp);
+END;
+/
+DECLARE
+  CURSOR c IS SELECT name FROM emp ORDER BY id;
+BEGIN
+  SELECT salary INTO st.g_sal FROM emp WHERE id = 1;
+  DBMS_OUTPUT.PUT_LINE('select into: ' || st.g_sal);
+  OPEN c;
+  FETCH c INTO st.g_name;
+  CLOSE c;
+  DBMS_OUTPUT.PUT_LINE('fetch into: ' || st.g_name);
+  UPDATE emp SET salary = salary + 1 WHERE id = 2 RETURNING salary INTO st.g_sal;
+  DBMS_OUTPUT.PUT_LINE('returning into: ' || st.g_sal);
+  EXECUTE IMMEDIATE 'SELECT id FROM emp WHERE name = :1' INTO st.g_id USING 'bob';
+  DBMS_OUTPUT.PUT_LINE('execute immediate into: ' || st.g_id);
+  EXECUTE IMMEDIATE 'BEGIN :1 := 77; END;' USING OUT st.g_id;
+  DBMS_OUTPUT.PUT_LINE('using out: ' || st.g_id);
+  top_paid(st.g_name, st.g_sal);
+  DBMS_OUTPUT.PUT_LINE('out argument: ' || st.g_name || ' ' || st.g_sal);
+  BEGIN
+    SELECT salary INTO st.g_sal FROM emp WHERE id = 99;
+  EXCEPTION WHEN NO_DATA_FOUND THEN
+    DBMS_OUTPUT.PUT_LINE('no row, still ' || st.g_sal);
+  END;
+END;
+/
+BEGIN
+  SELECT 1 INTO st.c_k FROM dual;
+END;
+/
+```
+
+```text
+Package created.
+
+Procedure created.
+
+select into: 130
+fetch into: ann
+returning into: 211
+execute immediate into: 2
+using out: 77
+out argument: bob 211
+no row, still 211
+
+PL/SQL procedure successfully completed.
+
+ERROR:
+ORA-06550: line 2, column 17:
+PLS-00363: expression 'ST.C_K' cannot be used as an assignment target
+ORA-06550: line 2, column 3:
 PL/SQL: Statement ignored
 ```
 
