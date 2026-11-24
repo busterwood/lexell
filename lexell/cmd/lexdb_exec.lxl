@@ -1288,7 +1288,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
         var item = lexdb_bind.noPlan()         // its plan, before its columns are renamed into the row (Sub)
         var viewName = ""
         var t = rc(Table{name: f.alias.clone(), tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                         view: "", deps: [], rn: [], onCommit: 0, spell: "", pkName: "", invalid: [], clustered: ""})
+                         view: "", deps: [], rn: [], onCommit: 0, spell: "", pkName: "", invalid: []})
         var lateral = false
         if f.sub >= 0 {
             sc.names.frames[me].hidden = !f.lateral
@@ -1384,7 +1384,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                                  len(f.cols).toStr() + " columns specified")))
                 }
                 var vt = Table{name: f.alias.clone(), tree: -1, cols: [], pk: [], indexes: [], slots: [], width: 0, checks: [], fks: [], refBy: [], layouts: [], lays: [],
-                               view: "", deps: [], rn: [], onCommit: 0, spell: "", pkName: "", invalid: [], clustered: ""}
+                               view: "", deps: [], rn: [], onCommit: 0, spell: "", pkName: "", invalid: []}
                 for i in 0..len(sp.sel.outs) {
                     let name = if i < len(f.cols) { f.cols[i].clone() } else if i < len(t.cols) { t.cols[i].name.clone() } else { sp.sel.outs[i].name.clone() }
                     var col = lexdb_sql.colDef(&name, outType(&sp.sel.outs[i]), false)
@@ -2388,9 +2388,16 @@ fn constLit(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
     return castVal(v, t, &none)
 }
 
+// The types of a statement's n parameters, 0 where not given.
+fn scopeTypes(n: int, ptypes: &[]int): []int {
+    if n == 0 { return [] }
+    var pt: []int = withCapacity(n)
+    for i in 0..n { append(mut &pt, if i < len(ptypes) { ptypes[i] } else { 0 }) }
+    return pt
+}
+
 fn newScope(params: &[]Val, ptypes: &[]int): Scope {
-    var pt: []int = []
-    for i in 0..len(params) { append(mut &pt, if i < len(ptypes) { ptypes[i] } else { 0 }) }
+    let pt = scopeTypes(len(params), ptypes)
     return Scope{names: Names{frames: [], base: len(params), ptypes: pt, coll: "", ty: typing(), blank: lexdb_syscat.tsqlBlank, constCast: constLit, colScale: typScale, outScale: exprScale, virt: false}, works: [], asRole: [], whos: [], target: "", looks: [], early: false, locking: false, ordBy: [], ordLim: -1, noRefKeys: false, noLp: false, rn: []}
 }
 
@@ -3720,8 +3727,8 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
             if c.cluster == 1 && len(t.indexes) > before { clustered = lexdb_sql.baseName(&t.indexes[len(t.indexes) - 1].name) }
         }
     }
-    // T-SQL's CLUSTERED and NONCLUSTERED: which key or index is the clustered one (a label: lexdb_catalog.Table.clustered)
-    if len(clustered) > 0 { t.clustered = clustered } else if s.pkCluster == 2 && len(t.pk) > 0 { t.clustered = "\x01" }
+    // T-SQL's CLUSTERED and NONCLUSTERED: which key or index is the clustered one (a label: lexdb_catalog.clusterLabel)
+    if len(clustered) > 0 { lexdb_catalog.setCluster(mut &t, &clustered) } else if s.pkCluster == 2 && len(t.pk) > 0 { lexdb_catalog.setCluster(mut &t, lexdb_catalog.CL_NONE) }
     for c in s.cons { if c.kind == lexdb_sql.C_FOREIGN { try lexdb_gen.checkConstraint(&t.cols, &c, s.mdialect, &lexdb_sql.baseName(&t.name)); try addConstraint(st, txn, mut &t, &c, false) } }
     t.onCommit = s.onCommit
     if s.onCommit > lexdb_sql.ONC_PRESERVE { append(mut &txn.onCommit, key.clone()) }
@@ -5047,21 +5054,21 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             let nIdx = len(t.indexes)
             if c.kind == lexdb_sql.C_PRIMARY {
                 try addPrimary(st, txn, mut &t, c, mut &pk)
-                if c.cluster == 2 && t.clustered == "" { t.clustered = "\x01" }
+                if c.cluster == 2 && len(lexdb_catalog.clusterLabel(&t)) == 0 { lexdb_catalog.setCluster(mut &t, lexdb_catalog.CL_NONE) }
             } else if c.kind == lexdb_sql.C_UNIQUE && len(c.index) > 0 {
                 try uniqueUsing(st, txn, mut &t, c)
             } else {
                 try lexdb_gen.checkConstraint(&t.cols, c, s.mdialect, &lexdb_sql.baseName(&t.name))
                 try addConstraint(st, txn, mut &t, c, true)
             }
-            if c.kind == lexdb_sql.C_UNIQUE && c.cluster == 1 && len(t.indexes) > nIdx { t.clustered = lexdb_sql.baseName(&t.indexes[len(t.indexes) - 1].name) }
+            if c.kind == lexdb_sql.C_UNIQUE && c.cluster == 1 && len(t.indexes) > nIdx { lexdb_catalog.setCluster(mut &t, &lexdb_sql.baseName(&t.indexes[len(t.indexes) - 1].name)) }
         } else if a.kind == lexdb_sql.A_DROP_CON {
             if lexdb_catalog.hasPk(&t) && a.name == lexdb_catalog.pkConName(&t) {
                 try dropPrimary(st, txn, mut &t, a.cascade, &"")
                 pk.changed = true
-                if t.clustered == "\x01" { t.clustered = "" }
-            } else if t.clustered == a.name && (try dropConstraint(st, txn, mut &t, &a.name, a.cascade)) {
-                t.clustered = if lexdb_catalog.hasPk(&t) { "\x01" } else { "" }
+                if lexdb_catalog.clusterLabel(&t) == lexdb_catalog.CL_NONE { lexdb_catalog.setCluster(mut &t, "") }
+            } else if lexdb_catalog.clusterLabel(&t) == a.name && (try dropConstraint(st, txn, mut &t, &a.name, a.cascade)) {
+                lexdb_catalog.setCluster(mut &t, if lexdb_catalog.hasPk(&t) { lexdb_catalog.CL_NONE } else { "" })
             } else if !(try dropConstraint(st, txn, mut &t, &a.name, a.cascade)) {
                 if !a.ifFlag {
                     return Err(e("42704", &("constraint \"" + a.name + "\" of relation \"" + rel + "\" does not exist")))
@@ -5729,7 +5736,7 @@ fn pruneInvalid(t: mut &Table) {
         var there = false
         for c in t.checks { if c.name == n { there = true } }
         for f in t.fks { if f.name == n { there = true } }
-        if there { append(mut &keep, n.clone()) }
+        if there || strings.startsWith(&n, lexdb_catalog.CL_MARK) { append(mut &keep, n.clone()) }
     }
     t.invalid = keep
 }
@@ -5985,7 +5992,7 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     let ixBase = lexdb_sql.baseName(&ixKey)
     let ix = Index{name: ixKey, tree: st.createTree(txn), cols: cols, unique: s.unique, pred: pred, con: false, opts: collections.copyOf(&s.pk), exprs: exprs}
     try addIndex(st, txn, mut &t, ix)
-    if s.cluster == 1 { t.clustered = lexdb_sql.baseName(&ixBase) }
+    if s.cluster == 1 { lexdb_catalog.setCluster(mut &t, &ixBase) }
     try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(&t)))
     try bumpFor(st, txn, &t.name)
     return Ok(tagOnly("CREATE INDEX"))
@@ -6272,7 +6279,7 @@ fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
                 let ix = pop(mut &old)
                 if ix.name == ixKey { txn.dropTree(ix.tree) } else { append(mut &rev, ix) }
             }
-            if t.clustered == lexdb_sql.baseName(&ixKey) { t.clustered = if lexdb_catalog.hasPk(&t) { "\x01" } else { "" } }
+            if lexdb_catalog.clusterLabel(&t) == lexdb_sql.baseName(&ixKey) { lexdb_catalog.setCluster(mut &t, if lexdb_catalog.hasPk(&t) { lexdb_catalog.CL_NONE } else { "" }) }
             while len(rev) > 0 { append(mut &t.indexes, pop(mut &rev)) }
             txn.del(lexdb_catalog.CATALOG, &(idxName(&ixKey)))
             try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(&t)))

@@ -1118,3 +1118,16 @@ What it takes, and why it is not done in this pass:
 The change touches name resolution at login and the catalog's owners, and moves where existing data is found for a
 login without a schema (its old tables stay in public and are still found second): more than a day, so it is planned
 here for the user to decide.
+
+## 23. The wrong-answer list's Oracle side (2026-11-24)
+
+The documentation pass's wrong answers (lexdb.md 9.139) checked in the Oracle door against Oracle Free 23.26: the NUMBER
+variables, parameters and function arguments of PL/SQL (`declare p number := 10; ... 1 + p / 100`, a procedure's
+`v * (1 + p / 100)`, a function's `1 + p / 100`, an `integer` and a `pls_integer`) were right (`/` is `#ora_div`), and so
+were two primary keys (ORA-02260) and the interval qualifiers (`INTERVAL '1' DAY`, `'1-2' YEAR TO MONTH`: the Oracle parser
+reads them itself; the PostgreSQL door's reading of the fields, 9.139 item 5, does not reach it). What the pass had to keep
+true here: integer-sized constants add and multiply as NUMBERs (`select 2147483647 + 1 from dual` is 2147483648: the binder
+checks constant arithmetic only with a cast to smallint or integer in it), and the DML statements plan with their
+parameters' types (9.139 item 1). Test: `tns_wrong.lxl` (Oracle's answers: `gen_oracle.py --check tns_wrong`, 0 differences).
+Not done, as they differ from Oracle: ORA-00932 (CASE, COALESCE, NULLIF) and ORA-01790 (UNION) for a text beside a number
+are ORA-01722 here, and a UNION of a number and a date gives rows.

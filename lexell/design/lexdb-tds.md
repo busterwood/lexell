@@ -1099,3 +1099,37 @@ statuses in order and its INFO texts; with `LEXDB_MSSQL` the same program gives 
 2627 text, an error's line and FMTONLY after `sp_executesql`. That program's stored procedure part fails before and
 after this pass with mssql-jdbc 13 (`{? = call p(?, ?, ?)}`: "The TDS protocol stream is not valid", the driver's
 `skipOutParameters` index -2); not looked into here.
+
+## 18. Wrong answers and serious errors from the documentation pass (2026-11-24)
+
+The T-SQL entries of the documentation's KNOWN-ISSUES.md, each checked on SQL Server 2022 (lexdb.md 9.139 has the PostgreSQL
+door's). Tests: `tds_wrong.lxl` (`mssql_wrong_queries.txt`, SQL Server's answers, each batch with batches off and on) and
+`tds_raiserror.lxl` (the fatal severities; run with `LEXDB_MSSQL` it asks SQL Server: the same output).
+
+- **A decimal variable's quotient** (`DECLARE @p decimal(5,2) = 10; SELECT 1 + @p / 100` gave 1): `lexdb_tsql.runIn` reads
+  each decimal `@variable` or parameter of a statement as `CAST(@p AS decimal(p, s))`, so the binder gives the division SQL
+  Server's scale and the sum is a decimal (lexdb.md 9.139 item 1). It covers `UPDATE t SET salary = salary * (1 + @p / 100)`,
+  IF and PRINT arguments, procedures' and `sp_executesql`'s parameters.
+- **Integer overflow**: 8115 as before, now with SQL Server's text for `CAST(.. AS int) + 1` and the like.
+- **RAISERROR's severities.** 19 to 25 without WITH LOG are error 2754 (severity 16; a TRY block catches it as 2754); more
+  than 25 is read as 25. WITH LOG at 19 is a user error 50000 of severity 19 that leaves the session open. At 20 and more it
+  is fatal as SQL Server's: the client gets 50000 (severity 20), 2745 and 596 (severity 21), and the connection is closed
+  after the reply (`State.kill`, read by `lexdb_tds.requests`; a TRY block does not catch it). `WITH SETERROR` sets
+  `@@ERROR` to 50000 (also under severity 11: `RAISERROR('x', 5, 1) WITH SETERROR`); `NOWAIT` is read. (The documentation
+  saw a session that never answered again: a severity of 20 was sent as 16, severity 20 to a client that waits for the kill.)
+- **A TRY block after a rethrow.** `THROW;` in a CATCH block inside a TRY block set the jump to the outer CATCH and left it
+  set; the session's next TRY block then took any error of its own that SQL Server does not catch (the unknown table 208) as
+  the jump and ran its CATCH with the old error. The jump is cleared where THROW sends it and at the start of every batch
+  (`run`). Seen only through a client that reads on after an error (mssql-jdbc), not lib/sqlserver, which stops at the first
+  error: the test makes the CATCH insert a row, and counts the rows.
+- **CLUSTERED and NONCLUSTERED** are read after PRIMARY KEY and UNIQUE (column and table level, ALTER TABLE ADD CONSTRAINT) and
+  in `CREATE [UNIQUE] [CLUSTERED | NONCLUSTERED] INDEX`, with ASC and DESC after a key's column and the storage clauses
+  `WITH (...)`, `ON [filegroup]` and `TEXTIMAGE_ON` after keys, indexes and tables (read, not kept). In lexdb the rows are in
+  the primary key's order whatever is said, so the words are labels: `Table.clustered` ("" the default: the primary key is the
+  clustered one, a table without one a heap; `"\x01"` none; or the clustered index's name; kept at the catalog row's end) and
+  `sys.indexes` shows them as SQL Server does (the clustered index is index_id 1 and CLUSTERED, a heap index 0,
+  `OBJECTPROPERTY(.., 'TableHasClustIndex')`). A second clustered index is 1902 with SQL Server's text; a primary key is
+  clustered unless NONCLUSTERED is said or another clustered index is; dropping the clustered index or constraint leaves a
+  heap. `DROP INDEX name ON table` (SSMS's form) is read too. Not looked at: the auto-generated names (SQL Server's
+  `PK__t__...`; lexdb's `t_pkey`), CLUSTERED COLUMNSTORE, partition schemes.
+- A second PRIMARY KEY in CREATE TABLE is 8110 (`Cannot add multiple PRIMARY KEY constraints to table 't'.`).

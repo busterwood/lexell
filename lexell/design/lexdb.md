@@ -12944,3 +12944,79 @@ stop the next query. By hand: pgjdbc 42.7.14 with no URL options (a prepared INS
 BigDecimal, UUID, byte[], dates, times, timestamps, timestamptz, intervals, floats, arrays and NULLs; getters by
 type after the threshold) gives the same output as against PostgreSQL 19; psql's Ctrl-C, JDBC `Statement.cancel()`
 and `setQueryTimeout` stop a long query with 57014 as PostgreSQL 19 does.
+
+### 9.139 Wrong answers and serious errors from the documentation pass (2026-11-24)
+
+Ten entries of the documentation's KNOWN-ISSUES.md (lexdb built from main at 4fba817b) that gave a wrong answer, accepted
+what a product refuses, or ran into its limit; each was checked against PostgreSQL 18, SQL Server 2022 and Oracle Free 23.26
+and fixed where the product has the behaviour. Tests: `exec_wrong.lxl` (the statements of `wrong_queries.txt`, answers
+PostgreSQL 18's, each with batches on and off), `tds_wrong.lxl` and `tds_raiserror.lxl` (lexdb-tds.md 18), `tns_wrong.lxl`
+(lexdb-oracle.md 23).
+
+1. **A numeric parameter divides as an integer** (`1 + p / 100`). Not the value (a parameter was coerced to its declared type
+   all along) but its typing: `lexdb_bind.arithOid`, which `intChecked` uses to cast smallint and integer arithmetic to its
+   type, typed a parameter inside an expression with no parameter types (text), so `p / 100` was read as `text / integer`,
+   an integer, and `1 + p / 100` was cast to integer; it now takes the statement's and the outer values' types
+   (`nestedOid`). And UPDATE, DELETE, INSERT and MERGE were planned with no parameter types at all
+   (`newScopeIn(..., &[])`): they get the statement's (`ptypes` through `update`, `updateB`, `deleteB`, `insert`, `merge`,
+   `batchDml`; an INSERT ... SELECT's scope too), which is what made a `LANGUAGE sql` procedure's `UPDATE ... SET salary =
+   salary * (1 + p / 100)` change nothing. The T-SQL door's variables and parameters (`DECLARE @p decimal(5,2)`) are read
+   as their declared type (`lexdb_tsql.runIn`: each `@p` of a decimal in the statement as `CAST(@p AS decimal(5,2))`), so
+   `@p / 100` gets SQL Server's scale (`#tdiv`: 1.100000, not 20 digits) and `1 + @p / 100` is a decimal. Oracle's NUMBER
+   variables and parameters were right (an Oracle `/` is `#ora_div`).
+2. **Integer constant arithmetic did not overflow.** `intChecked` left arithmetic of constants alone unchecked (the Oracle door
+   shares the binder and its literals are integers); it now checks it when a cast to smallint or integer is in it
+   (`2147483647::int + 1`, `32767::smallint + 1::smallint`, `2147483647::int * 2`: 22003; T-SQL's `CAST(.. AS int) + 1`:
+   8115), and not for literals alone: `SELECT 2147483647 + 1` still gives 2147483648 in the PostgreSQL door (PostgreSQL:
+   22003; the binder cannot tell the Oracle door's NUMBER literals from the PostgreSQL door's integers without a dialect in
+   `Names`, which the point path would pay for). PostgreSQL also folds the expression when it plans, so
+   `select 2147483647::int + 1 from t where false` raises there and gives no rows here. The T-SQL door sends 8115's text
+   (`Arithmetic overflow error converting expression to data type int.`) for the integer errors (`sqlMessage`).
+3. **Enums** (`lexdb_enum.lxl`, new): comparisons (`< <= > >=`), MIN, MAX, GREATEST and LEAST of enum values, `=` and `<>`
+   against a constant that is not a label (22P02) and the cast `'x'::mood` (`#enumchk`, 22P02) are made over the labels'
+   places (`#enumpos`, `#enumat`) wherever they stand in a SELECT: select list, HAVING, GROUP BY, ORDER BY, window keys,
+   CASE (`fix`, applied to the resolved lists of `planSelect`; WHERE and ON as before, through `fixIn`). A process that has
+   seen no enum type does none of it (`lexdb_catalog.enumsOn`, set by CREATE TYPE, a table with an enum column decoded, an
+   enum type read). Not done: MIN and MAX as window functions, ordered aggregates' ORDER BY keys
+   (`array_agg(m ORDER BY m)`), a set operation's ORDER BY, arrays of enums, an enum's type name in `pg_typeof`.
+4. **Mixed types** were not checked: CASE, COALESCE, GREATEST and LEAST (`unifyVals`), UNION, INTERSECT and EXCEPT
+   (`planSet`) and VALUES (`valuesClash`) now give 42804 with PostgreSQL's text (`CASE types integer and boolean cannot be
+   matched`, from `commonOid`'s category test: `lexdb_bind.clashOids`) for types of different categories among those every
+   client knows (numbers, booleans, texts, dates and times, bytea, uuid: not a catalog's oid and name columns, whose typing
+   is lexdb's own). An untyped text beside a number or a boolean is read as its type, 22P02 for one that is not (`1 = 'a'`,
+   `1 + 'a'`, `x IN (1, 'a')`, `NULLIF(1, 'a')`, a CASE's or COALESCE's `'a'` beside an integer: `readLit`). Not done:
+   `true AND 1`, `NOT 1` (42804), ARRAY[1, true], `1 IN (1, true)` (42883), and the Oracle door's ORA-00932 and ORA-01790 for
+   the same mixes (it says ORA-01722 for a text that is not a number). Two tests had written the old answer down
+   (`exec_bindtypes` U13, an int UNION text; `exec_held`'s column of mixed kinds: its counts of rows that gave way).
+5. **The SQL standard's interval fields.** `INTERVAL '1' DAY` read `day` as a column alias and `'1-2' YEAR TO MONTH` was a
+   syntax error: `typeName` and the typed literal read YEAR, MONTH, DAY, HOUR, MINUTE, SECOND or one TO a lower one, and
+   SECOND(p) (`ivalFields`), kept in the interval type's `len` as `lexdb_time.IF_*` bits. A text is read in the fields'
+   terms (`parseIvalFields`: a bare number in the lowest field's unit, `'1-2'`, `'03:04'` as minutes and seconds, `'1 2'`
+   of DAY TO HOUR; `'1-14'` is 22015, `'1 2'` of YEAR TO MONTH 22007) and a value loses what is below its lowest field
+   (`adjustFields`, PostgreSQL's AdjustIntervalForTypmod), in columns too (`interval day to second(3)`) and in casts. The
+   text `'1 2:03:04'` (days and a time) reads as PostgreSQL's. Not read: `INTERVAL(3) '1' SECOND` (PostgreSQL: 42601). The
+   Oracle door's own reading of its qualifiers is unchanged (`tns_wrong.lxl` keeps it).
+6. to 8. are T-SQL's: lexdb-tds.md 18.
+9. **DDL checks.** `DROP SEQUENCE s` while a column default calls `nextval('s')` is 2BP01 with PostgreSQL's DETAIL and HINT,
+   and with CASCADE drops the defaults, each with its NOTICE (`seqDefaults`, over every table's defaults: a rare
+   statement). A second PRIMARY KEY in CREATE TABLE is 42P16 (`P.multiPk`; the T-SQL door's 8110, the Oracle door's
+   ORA-02260, which it already gave).
+10. **A recursive CTE under LIMIT** stops once it has made the rows it must give. When the statement is a SELECT of the CTE
+    alone (no WHERE, join, grouping, DISTINCT or ORDER BY) with a constant LIMIT (and OFFSET), the CTE's own limit is that
+    many rows (`limitRecursion`) and `runRecursive` stops after the round that reaches them; max_recursion still ends one
+    that does not get there. PostgreSQL also stops lazily for a WHERE, a join or an enclosing query block, which lexdb does
+    not (54001 as before); the T-SQL door's TOP already did (SQL Server's stack spool), and Oracle's ORA-32044 for an
+    endless one is Oracle's own.
+
+**Measured** (base main bb025dc5, both built with -O, `LXL_HASH_SEED=1`, 20,000 statements, instructions per statement, two rounds
+identical): prepared point select 33,100 / 33,100 (base / branch), INSERT 224,821 / 224,815, UPDATE by key 208,842 / 208,227; by
+text (parsed and planned each time) select 119,455 / 118,811, INSERT 88,679 / 88,667, UPDATE 121,192 / 120,470. Over the wire
+(`icount6.sh`, 20,000 point selects, two rounds each, alternated): 171,651 and 171,528 / 170,902 and 170,818 instructions,
+96,579 and 96,599 / 95,874 and 96,137 cycles; L1 instruction-cache misses 284 and 281 / 338 and 347 per statement (the code's
+layout: instructions and cycles are lower), branch misses 397 and 402 / 374 and 375. TPC-H SF1 (22 queries, base and branch
+alternated twice, best of two): checksums equal on all 22, total 8,876 ms / 8,783 ms; q21 +1.9% in time with 6,852 / 6,856 million
+instructions (code placement). An INSERT 22 to 58 instructions dearer than main's turned out to be the `clustered` string that
+T-SQL's labels first added to `Table` (every table copy clones and drops it): the label lives in `Table.invalid` now (`CL_MARK`),
+and a statement's parameter types are made once, with room for them (`scopeTypes`). The WHERE and ON of every statement no longer
+clone each condition for the enum pass (`fixIn` returns it as it is when no enum type was seen), which is where select and
+UPDATE got cheaper.
