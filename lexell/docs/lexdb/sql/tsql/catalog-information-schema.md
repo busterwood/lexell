@@ -77,6 +77,11 @@ PostgreSQL's values. They answer from the same catalog as [the `sys` views](cata
 - **The values are PostgreSQL's.** `data_type` is `integer`, `character varying`, `numeric`, `timestamp without
   time zone` and `bytea`, not `int`, `varchar`, `decimal`, `datetime2` and `varbinary`; `udt_name` is `int4`,
   `varchar`, `numeric`. Use `sys.columns` and `sys.types` when you need SQL Server's names.
+- **`NOT NULL` columns are listed as constraints.** The views answer from PostgreSQL's `information_schema`, which
+  since main 7b6b1235 has a row for each `NOT NULL` column: `TABLE_CONSTRAINTS` lists it as a `CHECK` named
+  `table_column_not_null` (`emp_id_not_null`), and `CHECK_CONSTRAINTS` gives its clause as `id IS NOT NULL`. SQL Server
+  lists no constraint for a `NOT NULL` column, and `sys.check_constraints` does not either (example D shows the extra
+  rows). Filter them out with `constraint_name NOT LIKE '%[_]not[_]null'`.
 - `SCHEMATA` lists the schemas made with `CREATE SCHEMA`; `dbo` and the system schemas are not in it.
 - Constraint names are lexdb's, `table_pkey`, `table_column_fkey`, and `view_definition` is the text of the query.
 - `ROUTINES` and `PARAMETERS` have no rows for T-SQL procedures and functions: use `sys.procedures`,
@@ -200,15 +205,20 @@ SELECT constraint_name, check_clause FROM INFORMATION_SCHEMA.CHECK_CONSTRAINTS;
 ```
 
 ```text
-constraint_name  table_name constraint_type
----------------- ---------- ---------------
-ck_sal           emp        CHECK
-dept_name_key    dept       UNIQUE
-dept_pkey        dept       PRIMARY KEY
-emp_dept_id_fkey emp        FOREIGN KEY
-emp_pkey         emp        PRIMARY KEY
+constraint_name      table_name constraint_type
+-------------------- ---------- ---------------
+ck_sal               emp        CHECK
+dept_id_not_null     dept       CHECK
+dept_name_key        dept       UNIQUE
+dept_name_not_null   dept       CHECK
+dept_pkey            dept       PRIMARY KEY
+emp_dept_id_fkey     emp        FOREIGN KEY
+emp_dept_id_not_null emp        CHECK
+emp_id_not_null      emp        CHECK
+emp_name_not_null    emp        CHECK
+emp_pkey             emp        PRIMARY KEY
 
-(5 rows affected)
+(10 rows affected)
 
 constraint_name  table_name column_name ordinal_position
 ---------------- ---------- ----------- ----------------
@@ -225,11 +235,16 @@ emp_dept_id_fkey dept_pkey              NO ACTION   NO ACTION
 
 (1 row affected)
 
-constraint_name check_clause
---------------- -------------
-ck_sal          (salary >= 0)
+constraint_name      check_clause
+-------------------- -------------------
+ck_sal               (salary >= 0)
+dept_id_not_null     id IS NOT NULL
+dept_name_not_null   name IS NOT NULL
+emp_id_not_null      id IS NOT NULL
+emp_dept_id_not_null dept_id IS NOT NULL
+emp_name_not_null    name IS NOT NULL
 
-(1 row affected)
+(6 rows affected)
 ```
 
 ### E. Views and sequences

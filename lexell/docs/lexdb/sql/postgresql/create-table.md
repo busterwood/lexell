@@ -68,7 +68,11 @@ table from a query, see [CREATE TABLE AS](create-table-as.md).
 : Accepted and kept in the catalog; text always compares by its bytes.
 
 `NOT NULL`, `NULL`
-: Whether the column may be NULL. `NULL`, the default, says it may.
+: Whether the column may be NULL. `NULL`, the default, says it may. A `NOT NULL` is a constraint with a name: the
+  one given (`CONSTRAINT name NOT NULL`, or a table constraint `CONSTRAINT name NOT NULL column`), else
+  `table_column_not_null`. The name is fixed when the table is made, and a rename of the column or the table leaves
+  it. It is a row of `pg_constraint` with `contype` `n`. Two names for one column are refused (`conflicting not-null
+  constraint names`), and so is one name used twice (42710).
 
 `CHECK (` *expression* `)`
 : A condition every row must meet (not false: NULL passes). It may use the row's columns, but no subqueries. A
@@ -128,7 +132,7 @@ table from a query, see [CREATE TABLE AS](create-table-as.md).
 - The table's rows are kept in a B+tree in the order of the primary key. A table with no primary key is kept in the
   order of a hidden row number.
 - Constraint names that are not given are made as PostgreSQL makes them: `t_pkey`, `t_a_key`, `t_b_check`,
-  `t_c_fkey`.
+  `t_c_fkey`, `t_d_not_null`.
 - `CREATE TABLE` is transactional: in a block, `ROLLBACK` takes it back.
 - Temporary tables are written to the log like other tables (lexdb-gaps.md 2.4).
 - Inside a read-only transaction, and on a replica, `CREATE TABLE` gives 25006.
@@ -145,7 +149,8 @@ table from a query, see [CREATE TABLE AS](create-table-as.md).
   - `INCLUDE`, `WITH` and `USING INDEX TABLESPACE` on a key, and `DEFERRABLE` on a primary key or a unique
     constraint;
   - `SET NULL (column, ...)` and `SET DEFAULT (column, ...)`.
-- PostgreSQL 18 lists a `NOT NULL` constraint in `pg_constraint` (`contype` n); lexdb does not (lexdb-gaps.md 2.2).
+- psql's `\d+` shows no "Not-null constraints" section, though `pg_constraint` has the rows (see [Catalog:
+  constraints](catalog-constraints.md)).
 - `COLLATE` changes nothing: text compares by bytes.
 - `UNLOGGED` tables are logged, and temporary tables too.
 - Types not in lexdb (`json`, `jsonb`, `xml`, `money`, network and geometric types, ranges, domains) are 42704.
@@ -213,12 +218,16 @@ INSERT 0 1
 ERROR:  insert or update on table "orders" violates foreign key constraint "orders_customer_id_fkey"
 DETAIL:  Key (customer_id)=(2) is not present in table "customer".
 ERROR:  new row for relation "orders" violates check constraint "qty_positive"
-         conname         | contype
--------------------------+---------
- orders_customer_id_fkey | f
- orders_pkey             | p
- qty_positive            | c
-(3 rows)
+           conname           | contype
+-----------------------------+---------
+ orders_customer_id_fkey     | f
+ orders_customer_id_not_null | n
+ orders_item_not_null        | n
+ orders_line_not_null        | n
+ orders_pkey                 | p
+ orders_qty_not_null         | n
+ qty_positive                | c
+(7 rows)
 ```
 
 ### C. Identity and serial columns
@@ -372,18 +381,20 @@ ERROR:  new row for relation "crate" violates check constraint "crate_id_ck"
       conname       | contype | conenforced | convalidated |                      definition
 --------------------+---------+-------------+--------------+------------------------------------------------------
  crate_id_ck        | c       | t           | t            | CHECK ((id > 0))
+ crate_id_not_null  | n       | t           | t            | NOT NULL id
  crate_lot_id_fkey  | f       | f           | f            | FOREIGN KEY (lot_id) REFERENCES lot(id) NOT ENFORCED
  crate_pkey         | p       | t           | t            | PRIMARY KEY (id)
  crate_weight_check | c       | f           | f            | CHECK ((weight > 0)) NOT ENFORCED
-(4 rows)
+(5 rows)
 
   constraint_name   | constraint_type | enforced
 --------------------+-----------------+----------
  crate_id_ck        | CHECK           | YES
+ crate_id_not_null  | CHECK           | YES
  crate_lot_id_fkey  | FOREIGN KEY     | NO
  crate_pkey         | PRIMARY KEY     | YES
  crate_weight_check | CHECK           | NO
-(4 rows)
+(5 rows)
 ```
 
 ### H. Errors
@@ -439,6 +450,47 @@ CREATE TABLE
 -------------+--------------+-------------
  nv3_a_check | f            | f
 (1 row)
+```
+
+### J. Named NOT NULL constraints
+
+<!-- example: postgresql -->
+```sql
+CREATE TABLE visit (
+    id      int PRIMARY KEY,
+    who     text CONSTRAINT who_required NOT NULL,
+    on_day  date NOT NULL,
+    note    text,
+    CONSTRAINT note_required NOT NULL note
+);
+SELECT conname, contype, conkey FROM pg_constraint WHERE conrelid = 'visit'::regclass ORDER BY conname;
+INSERT INTO visit VALUES (1, 'ann', DATE '2026-01-01', 'first');
+INSERT INTO visit VALUES (2, NULL, DATE '2026-01-01', 'x');
+INSERT INTO visit VALUES (3, 'bob', NULL, 'x');
+CREATE TABLE twice (a int CONSTRAINT n1 NOT NULL, b int, CONSTRAINT n1 NOT NULL b);
+CREATE TABLE both (a int CONSTRAINT n1 NOT NULL CONSTRAINT n2 NOT NULL);
+CREATE TABLE both (a int, CONSTRAINT n1 NOT NULL a, CONSTRAINT n2 NOT NULL a);
+```
+
+```text
+CREATE TABLE
+        conname        | contype | conkey
+-----------------------+---------+--------
+ note_required         | n       | {4}
+ visit_id_not_null     | n       | {1}
+ visit_on_day_not_null | n       | {3}
+ visit_pkey            | p       | {1}
+ who_required          | n       | {2}
+(5 rows)
+
+INSERT 0 1
+ERROR:  null value in column "who" of relation "visit" violates not-null constraint
+DETAIL:  Failing row contains (2, null, 2026-01-01, x).
+ERROR:  null value in column "on_day" of relation "visit" violates not-null constraint
+DETAIL:  Failing row contains (3, bob, null, x).
+ERROR:  constraint "n1" for relation "twice" already exists
+ERROR:  conflicting not-null constraint names "n1" and "n2"
+ERROR:  conflicting not-null constraint names "n1" and "n2"
 ```
 
 ## See also

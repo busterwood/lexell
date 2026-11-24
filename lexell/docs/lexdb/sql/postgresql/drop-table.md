@@ -100,7 +100,7 @@ ROLLBACK
 ```sql
 DROP TABLE customer;
 DROP TABLE customer CASCADE;
-SELECT conname FROM pg_constraint WHERE conrelid = 'orders'::regclass;
+SELECT conname FROM pg_constraint WHERE conrelid = 'orders'::regclass ORDER BY conname;
 SELECT count(*) FROM pg_views WHERE viewname = 'customer_names';
 SELECT count(*) FROM pg_class WHERE relname = 'customer_id_seq';
 ```
@@ -108,10 +108,11 @@ SELECT count(*) FROM pg_class WHERE relname = 'customer_id_seq';
 ```text
 ERROR:  cannot drop table customer because other objects depend on it
 DROP TABLE
-   conname
--------------
+      conname
+--------------------
  orders_pkey
-(1 row)
+ orders_id_not_null
+(2 rows)
 
  count
 -------

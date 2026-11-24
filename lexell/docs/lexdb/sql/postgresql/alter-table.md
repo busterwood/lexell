@@ -59,7 +59,14 @@ action:
 : The default for rows inserted from now on.
 
 `SET NOT NULL`, `DROP NOT NULL`
-: `SET NOT NULL` checks the rows first (23502 if one is NULL).
+: `SET NOT NULL` checks the rows first (23502 if one is NULL), and makes a `NOT NULL` constraint named
+  `table_column_not_null` (a column that has one already is left as it is). `DROP NOT NULL` removes the constraint;
+  on a column of a primary key it is 42P16, and on an identity column 42601.
+
+`ADD` [ `CONSTRAINT` *name* ] `NOT NULL` *column_name*
+: Makes the column `NOT NULL` under the name given (checking the rows first, as `SET NOT NULL` does). A column that
+  has a `NOT NULL` constraint already takes no second one: the statement is 55000 when it gives a name, and does
+  nothing when it does not.
 
 `SET EXPRESSION AS`, `DROP EXPRESSION`
 : Gives a generated column a new expression, computed again for every row; or makes it an ordinary column that
@@ -86,10 +93,13 @@ action:
   change: that is 42809.
 
 `DROP CONSTRAINT`
-: Removes a constraint, and the index of a unique or primary key.
+: Removes a constraint, and the index of a unique or primary key. The name of a `NOT NULL` constraint makes the
+  column nullable again, as `DROP NOT NULL` does (42P16 on a column of a primary key, 42704 for a name that is
+  none; `IF EXISTS` gives a notice instead).
 
 `RENAME`
-: Renames a column, a constraint, or the table. Views that use the old name go on working: their text follows the
+: Renames a column, a constraint (a `NOT NULL` constraint too: 42710 for a name the table uses already), or the
+  table. Views that use the old name go on working: their text follows the
   new name.
 
 `SET SCHEMA`
@@ -111,6 +121,9 @@ action:
 - A foreign key that is not enforced does not check the table it refers to, and does not act on it: deleting the
   parent row neither refuses (23503) nor cascades.
 - `ALTER CONSTRAINT` takes the name of a constraint of the table (42704 for another name).
+- A `NOT NULL` constraint is a row of `pg_constraint` (`contype` `n`) with its name, and of `information_schema`
+  (see [Catalog: constraints](catalog-constraints.md)). Its name is fixed when it is made: renaming the column or
+  the table leaves it.
 
 ## Differences from PostgreSQL
 
@@ -128,6 +141,8 @@ action:
 - A view that selects `*` from the table shows the columns added and dropped later (see [CREATE
   VIEW](create-view.md)).
 - A type change that needs `USING` says so in its message (`USING name::integer would`) rather than in a `HINT`.
+- On a table without a primary key, a column added later gets an `attnum` (and a `conkey` in `pg_constraint`) one
+  higher than in PostgreSQL.
 
 ## Examples
 
@@ -239,9 +254,11 @@ ALTER TABLE
 ALTER TABLE
       conname      | contype | convalidated
 -------------------+---------+--------------
+ item_id_not_null  | n       | t
  item_pkey         | p       | t
  item_price_id_key | u       | t
-(2 rows)
+ item_qty_not_null | n       | t
+(4 rows)
 ```
 
 ### E. Identity and generated columns
@@ -347,11 +364,12 @@ CREATE TABLE
 CREATE TABLE
 INSERT 0 1
 INSERT 0 2
-    conname     | conenforced | convalidated
-----------------+-------------+--------------
- member_age_ck  | f           | f
- member_team_fk | f           | f
-(2 rows)
+      conname       | conenforced | convalidated
+--------------------+-------------+--------------
+ member_age_ck      | f           | f
+ member_id_not_null | t           | t
+ member_team_fk     | f           | f
+(3 rows)
 ```
 
 Both rows were taken, though row 2 breaks both constraints. `ENFORCED` checks the rows first, and refuses while one
@@ -396,11 +414,12 @@ ALTER TABLE member ALTER CONSTRAINT member_age_ck ENFORCED;
 ```text
 ALTER TABLE
 INSERT 0 1
-    conname     |                definition                 | conenforced | convalidated
-----------------+-------------------------------------------+-------------+--------------
- member_age_ck  | CHECK ((age >= 0)) NOT ENFORCED           | f           | f
- member_team_fk | FOREIGN KEY (team_id) REFERENCES team(id) | t           | t
-(2 rows)
+      conname       |                definition                 | conenforced | convalidated
+--------------------+-------------------------------------------+-------------+--------------
+ member_age_ck      | CHECK ((age >= 0)) NOT ENFORCED           | f           | f
+ member_id_not_null | NOT NULL id                               | t           | t
+ member_team_fk     | FOREIGN KEY (team_id) REFERENCES team(id) | t           | t
+(3 rows)
 
 ERROR:  check constraint "member_age_ck" of relation "member" is violated by some row
 UPDATE 1
@@ -459,6 +478,52 @@ ERROR:  lexdb: ALTER CONSTRAINT ... DEFERRABLE is not supported
 ERROR:  constraint "nosuch" of relation "member" does not exist
 ALTER TABLE
 ERROR:  cannot validate NOT ENFORCED constraint
+```
+
+### J. Named NOT NULL constraints
+
+<!-- example: postgresql -->
+```sql
+CREATE TABLE badge (id int PRIMARY KEY, holder text CONSTRAINT holder_required NOT NULL, issued date, expires date);
+ALTER TABLE badge ALTER COLUMN issued SET NOT NULL;
+ALTER TABLE badge ADD CONSTRAINT expires_required NOT NULL expires;
+ALTER TABLE badge ADD CONSTRAINT issued_again NOT NULL issued;
+ALTER TABLE badge RENAME CONSTRAINT holder_required TO holder_needed;
+ALTER TABLE badge RENAME COLUMN issued TO issued_on;
+SELECT conname, conkey, pg_get_constraintdef(oid) AS definition FROM pg_constraint
+WHERE conrelid = 'badge'::regclass AND contype = 'n' ORDER BY conname;
+ALTER TABLE badge DROP CONSTRAINT expires_required;
+ALTER TABLE badge DROP CONSTRAINT badge_id_not_null;
+ALTER TABLE badge DROP CONSTRAINT nosuch;
+ALTER TABLE badge DROP CONSTRAINT IF EXISTS nosuch;
+INSERT INTO badge VALUES (1, 'ann', DATE '2026-01-01', NULL);
+INSERT INTO badge VALUES (2, NULL, DATE '2026-01-01', NULL);
+```
+
+```text
+CREATE TABLE
+ALTER TABLE
+ALTER TABLE
+ERROR:  cannot create not-null constraint "issued_again" on column "issued" of table "badge"
+DETAIL:  A not-null constraint named "badge_issued_not_null" already exists for this column.
+ALTER TABLE
+ALTER TABLE
+        conname        | conkey |     definition
+-----------------------+--------+--------------------
+ badge_id_not_null     | {1}    | NOT NULL id
+ badge_issued_not_null | {3}    | NOT NULL issued_on
+ expires_required      | {4}    | NOT NULL expires
+ holder_needed         | {2}    | NOT NULL holder
+(4 rows)
+
+ALTER TABLE
+ERROR:  column "id" is in a primary key
+ERROR:  constraint "nosuch" of relation "badge" does not exist
+NOTICE:  constraint "nosuch" of relation "badge" does not exist, skipping
+ALTER TABLE
+INSERT 0 1
+ERROR:  null value in column "holder" of relation "badge" violates not-null constraint
+DETAIL:  Failing row contains (2, null, 2026-01-01, null).
 ```
 
 ## See also

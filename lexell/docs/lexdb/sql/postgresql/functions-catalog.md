@@ -65,7 +65,7 @@ pg_size_pretty ( bigint ) → text
 : The text of an expression stored in the catalog: a default (`pg_attrdef.adbin`), a check, an index's predicate.
 
 `pg_get_constraintdef`
-: A constraint as it would be written in `CREATE TABLE` (`PRIMARY KEY (id)`, `CHECK (...)`, `FOREIGN KEY ...`).
+: A constraint as it would be written in `CREATE TABLE` (`PRIMARY KEY (id)`, `CHECK (...)`, `FOREIGN KEY ...`, `NOT NULL column`).
 
 `pg_get_indexdef`
 : The `CREATE INDEX` statement of an index.
@@ -218,11 +218,13 @@ SELECT pg_get_serial_sequence('orders', 'id') AS seq;
  total   | 0
 (2 rows)
 
-      conname       |      definition
---------------------+----------------------
- orders_pkey        | PRIMARY KEY (id)
- orders_total_check | CHECK ((total >= 0))
-(2 rows)
+         conname          |      definition
+--------------------------+----------------------
+ orders_customer_not_null | NOT NULL customer
+ orders_id_not_null       | NOT NULL id
+ orders_pkey              | PRIMARY KEY (id)
+ orders_total_check       | CHECK ((total >= 0))
+(4 rows)
 
          seq
 ----------------------
