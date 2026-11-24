@@ -1156,3 +1156,10 @@ MERGE's subqueries (WHEN conditions, UPDATE's SET, INSERT's values, NOT MATCHED 
 (a column beside it was 468; `'A' = 'a'` was false). `CAST` / `CONVERT` of a uniqueidentifier to `binary(n)` / `varbinary(n)` give SQL Server's bytes (the first three groups
 little-endian; error 529 after the hex-literal slice: `#tobin`), of a binary to uniqueidentifier (`#bin2uuid`: padded with zeros or cut to 16), a uniqueidentifier as a
 string is upper case (`#bin2str`) and 8170 for `varchar(n)` under 36; `OBJECTPROPERTY(id, 'TableHasNonclustIndex')` (`tds_guidbin`).
+
+## As built: WITH NOCHECK and NOCHECK CONSTRAINT (lexdb-new-features.md 10.8, S22, commit fe8daf59)
+
+`ALTER TABLE t WITH NOCHECK ADD CONSTRAINT ...` (a CHECK or foreign key enforced from now on, its rows not checked: `sys.check_constraints.is_not_trusted`),
+`NOCHECK CONSTRAINT name [, name ...] | ALL` (`is_disabled`; a disabled foreign key neither checks nor cascades), `[WITH CHECK | WITH NOCHECK] CHECK CONSTRAINT name | ALL`
+(WITH CHECK checks the rows: 547 "The ALTER TABLE statement conflicted with ...", and the constraint is trusted after), 4917 for a name not there. Both catalogs show
+is_disabled and is_not_trusted. Test `tds_unenforced` (50 batches against SQL Server 2022, each with batches off and on).

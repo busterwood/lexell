@@ -7,7 +7,8 @@ answer and wrong error fixed, marked *works* with the commit. Section 8 (later, 
 forms of 6.1 (items 1, 2's Oracle GROUP BY ALL, 4 and 5), marked *works* with the commit. Section 9 (later, commits f8c07339
 and 271ca36e): 6.1's items 6 and 7, the missing scalar functions and aggregates, marked *works* with the commit. Section 10
 (later, commits 96be5d41, 4e1cf747, 269cfa25): a panic that ended the server, and 6.2's items 3 (IGNORE NULLS) and 5 (ON
-CONFLICT DO SELECT) built; items 4 (QUALIFY) and 6 (unenforced constraints) planned.
+CONFLICT DO SELECT) built; items 4 (QUALIFY) and 6 (unenforced constraints) planned. Section 10.8 (later, commits 443310eb and fe8daf59): QUALIFY and the
+unenforced constraints built, marked *works* with the commit.
 
 **What was audited.** The SQL a user of each product's newest release would reach for: PostgreSQL 19 (and 18, and
 older features met on the way), SQL Server 2025 (compatibility level 170) with 2022's additions, Oracle AI Database 26ai
@@ -53,7 +54,7 @@ Checked on 19.0 unless marked. "P18" etc.: the release that added it.
 | P3 | `PRIMARY KEY / UNIQUE (k, r WITHOUT OVERLAPS)`, `FOREIGN KEY (k, PERIOD r) REFERENCES t (k, PERIOD r)` (P18) | needs a range column (and btree_gist for scalar parts); 23P01 for an overlap, 23503 for a range the referenced rows do not cover | 42601 at `without`; range types do not exist (`daterange`: 42704) | missing | L: range types first, then the constraint (section 6.3) | none (Oracle's PERIOD FOR has no such key; SQL Server's temporal tables are system-versioned) | new lexdb_range, catalog, write path |
 | P4 | `WAIT FOR LSN 'lsn' [WITH (MODE 'standby_replay\|standby_write\|standby_flush\|primary_flush', TIMEOUT '...', NO_THROW)]` (P19) | on a primary: `recovery is not in progress` (55000) for the standby modes | as PostgreSQL 19 (lexdb.md 9.137): the options, statuses and errors, checked against a 19.0 primary and standby; lexdb's LSN is the batch number; `pg_current_wal_lsn`, `pg_last_wal_replay_lsn`, `pg_last_wal_receive_lsn`, `pg_is_in_recovery` added (was 42601 at `wait`) | works (replica branch) | M, with the replica work (the user's order) | none (SQL Server and Oracle have no statement for it) | lexdb_standby, lexdb_parse, lexdb_store (Follower.waitApplied) |
 | P5 | `lag/lead/first_value/last_value/nth_value(...) IGNORE NULLS \| RESPECT NULLS OVER (...)` (P19) | NULLs skipped in the frame (lag/lead: in the offset) | as PostgreSQL 19: lag and lead the off'th value not NULL (0 the row's own, a negative offset the other way), first_value, last_value, nth_value over any frame and EXCLUDE; 0A000, 42809 (was 42601 at `nulls`) | works (4e1cf747) | M | SQL Server 2022 (FIRST_VALUE, LAST_VALUE, LAG, LEAD: S15), Oracle (`f(x IGNORE NULLS)` and `f(x) IGNORE NULLS`: O25) | lexdb_parse, lexdb_window |
-| P6 | `CHECK (...) NOT ENFORCED`, `REFERENCES ... NOT ENFORCED` (P18); `ALTER TABLE ... ALTER CONSTRAINT c [NOT] ENFORCED` for CHECK (P19) | rows not checked while not enforced; ENFORCED rechecks (23514 "is violated by some row") | 42601 at `not`; ALTER CONSTRAINT: lexdb's ALTER COLUMN message | missing | M: a flag on the constraint, the write path skipping it, ALTER rechecking | Oracle `CHECK (...) DISABLE`, `ENABLE NOVALIDATE` (O26); SQL Server `WITH NOCHECK`, `NOCHECK CONSTRAINT` (S22) | lexdb_parse `checkTail`, lexdb_catalog, the write path |
+| P6 | `CHECK (...) NOT ENFORCED`, `REFERENCES ... NOT ENFORCED` (P18); `ALTER TABLE ... ALTER CONSTRAINT c [NOT] ENFORCED` for CHECK (P19) | rows not checked while not enforced; ENFORCED rechecks (23514 "is violated by some row") | as PostgreSQL 18 and 19: NOT ENFORCED on a CHECK or foreign key (column and table constraints, ADD CONSTRAINT), ALTER CONSTRAINT [NOT] ENFORCED (the rows checked: 23514, 23503), VALIDATE of one not enforced 55000, 42601 on a key, NOT NULL or default, 0A000 on a table key; pg_constraint.conenforced, pg_get_constraintdef, information_schema.table_constraints.enforced (10.8) | works (fe8daf59) | M | Oracle `CHECK (...) DISABLE`, `ENABLE NOVALIDATE` (O26); SQL Server `WITH NOCHECK`, `NOCHECK CONSTRAINT` (S22) | lexdb_parse `stateWord`, lexdb_catalog, lexdb_exec `conState` |
 | P7 | `CONSTRAINT n NOT NULL col` as a table constraint (P18) | a named NOT NULL, kept in pg_constraint (contype `n`, every NOT NULL there, `t_c_not_null` by default), information_schema's CHECK rows, DROP / RENAME CONSTRAINT | the syntax as PostgreSQL 18 (`[CONSTRAINT n] NOT NULL c` in CREATE TABLE and ALTER TABLE ... ADD, 42703, 42601 for two names of a column); the name is not kept, the catalogs list no NOT NULL constraints, DROP CONSTRAINT n 42704 | works (syntax, ec3c5c17) / missing (the catalogs: plan in 8.4) | S (syntax) / M (catalogs) | none | lexdb_parse `nnCons`; lexdb_catalog, lexdb_pgcat |
 | P8 | `uuidv7([shift interval])`, `uuidv4()` (P18); `uuid_extract_version`, `uuid_extract_timestamp` (P17) | | as PostgreSQL: version 7 with 12 bits of the sub-millisecond, rising within the process; the version and time of versions 1, 4, 7 (NULL for another variant) (was 42883) | works (f8c07339) | S | Oracle `UUID()`, `IS_UUID()` (O14, works); T-SQL NEWID (works) | lexdb_newfn |
 | P9 | `casefold`, `array_sort`, `array_reverse`, `crc32`, `crc32c`, `gamma`, `lgamma` (P18) | | as PostgreSQL but array_sort (lexdb-gaps.md 2.1: 42883 still); gamma and lgamma the C library's (its last digit may differ from another libm's) | works (271ca36e) / missing (array_sort) | S (together) | none | lexdb_newfn |
@@ -99,7 +100,7 @@ Checked on 2025 RTM-CU10 at level 170 unless marked 2022.
 | S19 | `GREATEST`, `LEAST`, `TRIM/LTRIM/RTRIM(s, chars)`, `WINDOW` clause, `IS [NOT] DISTINCT FROM` (2022) | | as SQL Server (IS DISTINCT FROM: section 5) | works | | | |
 | S20 | `GENERATE_SERIES` (2022), `STRING_SPLIT(s, sep, 1)` with the ordinal (2022) | columns `value` and `value, ordinal` | GENERATE_SERIES as SQL Server (`value`; without a step -1 when start > stop, as SQL Server: was no rows) (91781b58); STRING_SPLIT 208 (missing in any form) | works / missing | S | | lexdb_srf, lexdb_parse |
 | S21 | 2022's `APPROX_PERCENTILE_CONT/DISC`, `BIT_COUNT`, `LEFT_SHIFT`, `RIGHT_SHIFT`, `GET_BIT`, `SET_BIT`; and older ones met on the way: `CHAR()`, `NCHAR()`, `FORMAT(n, 'N2')` | `FORMAT(1234.5, 'N2')` = `1,234.50` | FORMAT as SQL Server: .NET's standard and custom number and date formats, en-US and de-DE (new module lexdb_tsqlfmt); CHAR and NCHAR (the REGEXP tests' newlines needed them) (91781b58); the 2022 functions as SQL Server (ec3c5c17): BIT_COUNT, LEFT_SHIFT / RIGHT_SHIFT and `<<` / `>>` (as wide as the type: `1 << 33` is 0, logical, a negative count the other way), GET_BIT, SET_BIT, their errors (8116, 9838, 9839, 174), APPROX_PERCENTILE_CONT / _DISC (exact: lexdb_pct's T-SQL percentiles, no OVER: 4113); a varbinary's bits only where lexdb has a varbinary value (a `0x..` literal is an int in the door, lexdb-tds.md 13) | works | S each | PostgreSQL `bit_count` (P23), `chr` | lexdb_tsqlfmt, lexdb_parse `tsqlCall` |
-| S22 | constraint checking off: `WITH NOCHECK`, `ALTER TABLE t NOCHECK CONSTRAINT c\|ALL` | | 50000 (ALTER TABLE takes ...) | missing | (P6) | PostgreSQL NOT ENFORCED (P6), Oracle DISABLE (O26) | |
+| S22 | constraint checking off: `WITH NOCHECK`, `ALTER TABLE t NOCHECK CONSTRAINT c\|ALL` | WITH NOCHECK ADD enforced from now on, NOCHECK CONSTRAINT name, ... \| ALL disabled, CHECK CONSTRAINT enables, WITH CHECK CHECK CONSTRAINT checks the rows (547) and trusts; 4917 for a name not there | as SQL Server: all of it; sys.check_constraints and sys.foreign_keys is_disabled, is_not_trusted (was 50000) (10.8) | works (fe8daf59) | (P6) | PostgreSQL NOT ENFORCED (P6), Oracle DISABLE (O26) | lexdb_parse `conStateAlter`, lexdb_syscat |
 | S23 | GROUP BY rules (old T-SQL): `GROUP BY ALL a` keeps the groups WHERE removed (count 0); a select alias or a position in GROUP BY is 207 / 164 | `1\|1;2\|0` | as SQL Server: GROUP BY ALL's groups of every row, each aggregate over WHERE's rows (in the select list, HAVING and ORDER BY), 1028 with ROLLUP; 207 for an alias; 164 for a constant, a position or a variable (91781b58) | works | S | Oracle 26ai `GROUP BY ALL` means another thing (O7): not parsed in that door | lexdb_parse `groupAll`, lexdb_bind `resolveGroupIn` |
 | S24 | an unknown function over no rows | 195 when the batch is compiled | 42883 / 195 / ORA-00904 when the statement is bound, over no rows too (91781b58) | works | S | all doors | lexdb_bind `knownCall`, lexdb_lib `entryOf`'s misses |
 | S25 | DATEADD of a string literal | a `datetime` (`2020-01-03 00:00:00.000`) | as SQL Server; DATEADD's type is its date's (datetime, smalldatetime, datetime2) (91781b58) | works | S | | lexdb_parse `tsqlCall`, lexdb_exec `exprScale` |
@@ -109,7 +110,7 @@ Checked on 2025 RTM-CU10 at level 170 unless marked 2022.
 
 | # | Feature | Oracle's behaviour | lexdb (TNS door) | Class | Size | Other doors natively | Modules |
 |---|---|---|---|---|---|---|---|
-| O1 | `QUALIFY cond` (23.26.0) | filters on window results after them; select-list aliases visible (`qualify rn = 1`) | ORA-00900 | missing | M: a filter above the window step; aliases and ORDER BY make it more than a token rewrite | none | lexdb_parse, lexdb_plan |
+| O1 | `QUALIFY cond` (23.26.0) | filters on window results after them; select-list aliases visible (`qualify rn = 1`) | as Oracle 23.26: QUALIFY after WINDOW, select aliases, window calls and aggregates in the condition, ORA-00960, ORA-03049 (was ORA-00900) (10.8) | works (443310eb) | M: a filter above the window step; aliases and ORDER BY make it more than a token rewrite | none | lexdb_parse `oraQualify`, lexdb_exec, lexdb_pipe |
 | O2 | aggregate and window `FILTER (WHERE ...)` (23.26.1) | | as Oracle | works | | PostgreSQL (works) | |
 | O3 | `SELECT` without `FROM` | | as Oracle | works | | PostgreSQL, T-SQL | |
 | O4 | `BOOLEAN` columns, `TRUE`/`FALSE`, boolean expressions in the select list and WHERE | | as Oracle (types BOOLEAN on the wire); `TO_BOOLEAN` (ORA-61800), `BOOLEAN_AND_AGG`, `BOOLEAN_OR_AGG` as Oracle (f8c07339) | works | S | PostgreSQL `bool_and`/`bool_or` (work) | lexdb_newfn, lexdb_agg |
@@ -134,7 +135,7 @@ Checked on 2025 RTM-CU10 at level 170 unless marked 2022.
 | O23 | `CREATE ASSERTION a CHECK (NOT EXISTS (...) \| ALL (...) SATISFY (...))` (23.26.1) | ORA-08601 `Assertion (APP.A1) violated` at the DML; no aggregates (ORA-08689, ORA-00934); `USER_ASSERTIONS` | ORA-00900 | missing | L (section 6.3: a design note) | none | new lexdb_assert |
 | O24 | `IS [NOT] DISTINCT FROM` | not Oracle's (ORA-00908, 23.26.3) | accepted (lexdb's extension in this door) | works (kept: the user's decision, 2026-11-23) | none: the user wants it in the Oracle door too, as an extension; test tns_distinct | PostgreSQL, T-SQL 2022 | lexdb_parse |
 | O25 | `IGNORE NULLS` in `FIRST_VALUE(x IGNORE NULLS)`, `LAST_VALUE`, `LAG(x) IGNORE NULLS`, `LEAD`, `NTH_VALUE` | PostgreSQL's values; ORA-01428 for an offset or n below 1 | as Oracle, both spellings; ORA-30484, 01428 (was ORA-00900); not NTH_VALUE's FROM FIRST / FROM LAST (10.4) | works (4e1cf747) | (P5) | PostgreSQL 19, T-SQL 2022 | lexdb_window |
-| O26 | `CONSTRAINT c CHECK (...) DISABLE`, `ENABLE [NO]VALIDATE` | | ORA-00900 | missing | (P6) | PostgreSQL NOT ENFORCED, T-SQL NOCHECK | |
+| O26 | `CONSTRAINT c CHECK (...) DISABLE`, `ENABLE [NO]VALIDATE` | DISABLE; ENABLE [VALIDATE] checks the rows (ORA-02293, ORA-02298), ENABLE NOVALIDATE checks the new ones (ORA-02290, ORA-02291); 23.26.3 has no NOT ENFORCED (ORA-02000, ORA-03075) | as Oracle: DISABLE, ENABLE [NO]VALIDATE in CREATE TABLE and ADD CONSTRAINT, ENABLE | DISABLE CONSTRAINT, MODIFY CONSTRAINT; USER_CONSTRAINTS STATUS and VALIDATED (was ORA-00900) (10.8) | works (fe8daf59) | (P6) | PostgreSQL NOT ENFORCED, T-SQL NOCHECK | lexdb_parse `stateWord`, `oraStateAlter` |
 | O27 | `UNISTR('\00e9')` | NVARCHAR2 | as Oracle (ORA-30186) (was ORA-00904) | works (f8c07339) | (S16) | PostgreSQL, T-SQL 2025 (works) | lexdb_newfn |
 | O28 | `UTL_MATCH.EDIT_DISTANCE`, `.JARO_WINKLER`; `UTL_ENCODE.BASE64_ENCODE` | 3; `aGk=` | UTL_ENCODE.BASE64_ENCODE and BASE64_DECODE as Oracle (RAW in, RAW out; ORA-29261 for NULL), with UTL_RAW.CAST_TO_RAW and CAST_TO_VARCHAR2 (they were NULL) (91781b58); UTL_MATCH's EDIT_DISTANCE, EDIT_DISTANCE_SIMILARITY, JARO_WINKLER, JARO_WINKLER_SIMILARITY as Oracle (f8c07339) | works | S | T-SQL 2025 (S17, S7, works) | lexdb_orafn, lexdb_newfn, lexdb_parse |
 | O29 | JSON: the `JSON` type, `JSON_OBJECT('a' : 1)`, `JSON_ARRAY`, `JSON_VALUE ... RETURNING`, `JSON_ARRAYAGG`, `JSON_OBJECTAGG(k VALUE v)`; JSON relational duality views (note only) | | ORA-00900 / ORA-00902 | missing | L (section 6.3) | PostgreSQL (P17), SQL Server (S10) | new lexdb_json, lexdb_tns (type 119) |
@@ -149,14 +150,14 @@ the rows.
 
 | Product | works | wrong answer | wrong error | missing | parts / rows |
 |---|---|---|---|---|---|
-| PostgreSQL 19/18 (and older met on the way) | 18 (P1, P2, P4, P5, P7's syntax, P8, P9 but array_sort, P10-P12, P14 but random of dates, P15, P18-P22, P23's VALUES in WITH and functions) | 0 | 0 | 9 (P3, P6, P7's catalogs, P9's array_sort, P13, P14's random of dates, P16, P17, P23's CREATE DOMAIN and pg_input_*) | 27 / 23 |
-| SQL Server 2025/2022 | 22 (S1-S9, S12-S21, S23-S25) | 0 | 0 | 4 (S10, S11, S20's STRING_SPLIT, S22) | 26 / 25, and S26 (note) |
-| Oracle 26ai/23ai | 22 (O2-O10, O12-O20 but O17's CHECKSUM, O24 as an extension, O25, O27, O28) | 1 (O5's literal type) | 0 | 9 (O1, O11, O17's CHECKSUM, O21-O23, O26, O29, O30) | 32 / 30 |
+| PostgreSQL 19/18 (and older met on the way) | 19 (P1, P2, P4, P5, P6, P7's syntax, P8, P9 but array_sort, P10-P12, P14 but random of dates, P15, P18-P22, P23's VALUES in WITH and functions) | 0 | 0 | 8 (P3, P7's catalogs, P9's array_sort, P13, P14's random of dates, P16, P17, P23's CREATE DOMAIN and pg_input_*) | 27 / 23 |
+| SQL Server 2025/2022 | 23 (S1-S9, S12-S25) | 0 | 0 | 3 (S10, S11, S20's STRING_SPLIT) | 26 / 25, and S26 (note) |
+| Oracle 26ai/23ai | 24 (O1-O10, O12-O20 but O17's CHECKSUM, O24 as an extension, O25, O26, O27, O28) | 1 (O5's literal type) | 0 | 7 (O11, O17's CHECKSUM, O21-O23, O29, O30) | 32 / 30 |
 
 Before the fixes of section 7 (the audit as run): PostgreSQL 2 / 4 / 1 / 16; SQL Server 3 / 8 / 5 / 13; Oracle 5 / 4 / 2 / 26. After
 section 7, before section 8: PostgreSQL 7 / 0 / 0 / 16; SQL Server 14 / 0 / 0 / 13; Oracle 10 / 2 / 1 / 26. After section 8,
 before section 9: PostgreSQL 11 / 0 / 0 / 14; SQL Server 15 / 0 / 0 / 11; Oracle 14 / 2 / 1 / 18. After section 9, before
-section 10: PostgreSQL 16 / 0 / 0 / 11; SQL Server 21 / 0 / 0 / 5; Oracle 20 / 1 / 1 / 10.
+section 10: PostgreSQL 16 / 0 / 0 / 11; SQL Server 21 / 0 / 0 / 5; Oracle 20 / 1 / 1 / 10. After section 10.8: PostgreSQL 19 / 0 / 0 / 8; SQL Server 23 / 0 / 0 / 3; Oracle 24 / 1 / 0 / 7.
 
 ## 5. IS [NOT] DISTINCT FROM in the T-SQL door: the test
 
@@ -612,7 +613,7 @@ Branch from main `be7461cc`, commits `96be5d41` (the panic), `4e1cf747` (IGNORE 
 `06e4fbb5` and `7053aba0` (the cost, 10.6).
 Each item checked against the product first (the containers of the header: PostgreSQL 19.0 `lxl-pg19`, SQL Server 2022
 `lxl-mssql`, Oracle Free 23.26.3 `lxl-oracle`) and built in every door that has it. Rows above say *works* with the commit.
-QUALIFY (O1) and the unenforced constraints (P6, S22, O26) are not built: plans in 10.4 and 10.5.
+QUALIFY (O1) and the unenforced constraints (P6, S22, O26): plans in 10.4 and 10.5, built in 10.8.
 
 ### 10.1 No Decimal operator ends the server
 
@@ -804,7 +805,7 @@ Measured on the branch's last code commit (7053aba0) against main `be7461cc`, bo
 
 ### 10.7 Left
 
-- Not built: QUALIFY (O1) and the unenforced constraints (P6, S22, O26): the plans in 10.4 and 10.5.
+- QUALIFY (O1) and the unenforced constraints (P6, S22, O26), planned in 10.4 and 10.5: built, 10.8.
 - Oracle's `NTH_VALUE(x, n) FROM FIRST | FROM LAST` (with either treatment): ORA-00900 in lexdb, as before.
 - Met while testing, not changed (each as before this slice): Oracle's `LAG(x, -1)` without IGNORE NULLS is ORA-01428 there and a
   lead in lexdb, and `NTH_VALUE(x, 0)` ORA-01428 there, ORA-20000 (22016) in lexdb; SQL Server's `LAG(x, -1)` without IGNORE
@@ -818,3 +819,110 @@ Measured on the branch's last code commit (7053aba0) against main `be7461cc`, bo
 - random(min, max) of numerics whose units span more than 38 digits is 22003 in lexdb (PostgreSQL's numeric draws one).
 - DO SELECT FOR UPDATE that waited for another transaction returns the row as it found it (PostgreSQL re-reads it); the lock
   is lexdb_store's row lock, as SELECT ... FOR UPDATE's.
+
+### 10.8 QUALIFY and the unenforced constraints (as built)
+
+Branch from main `02646472`, commits `443310eb` (QUALIFY, O1) and `fe8daf59` (P6, S22, O26). Each checked against the product first (Oracle Free 23.26.3
+`lxl-oracle`, SQL Server 2022 `lxl-mssql`, PostgreSQL 19.0 `lxl-pg19`) and built in every door that has it. The plans of 10.4 and 10.5 held; where the
+product differed from the plan it is said here.
+
+**QUALIFY (Oracle 23.26.3 has it; checked).** `QUALIFY cond` after WHERE, GROUP BY, HAVING and WINDOW, before DISTINCT, ORDER BY and FETCH. What the
+product does, beyond 10.4: a name in the condition is a select alias first, then a column (`select id as x, v as id ... qualify id = 1` keeps v; two
+outputs of that name, an alias and a column item too, ORA-00960), a column item without an alias is no alias (a join's ambiguous `id` is ORA-00918);
+HAVING, WINDOW and a second QUALIFY after the condition are all ORA-03049 (10.4 said ORA-03048 for HAVING: it is 03049, whose text names the
+condition's first word); the condition is any expression Oracle takes as a boolean, a number included (`qualify 1`, `qualify id - 1`: not zero is true;
+a text is ORA-61800); QUALIFY is no reserved word (`from qt qualify where ...` is an alias); each UNION branch has its own and an alias of one is not the
+other's (ORA-00904); a query with no window call at all filters as WHERE (HAVING when grouped) does.
+What lexdb did: ORA-00900. Now (the way of 10.4, with two changes): the parser's `oraQualify` (end of lexdb_parse; the select core calls it after
+WINDOW, and its three clause tests moved under one test of the next token's kind, which a statement that ends there answers first: the select core
+costs a point select fewer instructions, not more) replaces the aliases by their items' expressions and then **has no Stmt field**: with no window call in
+the statement the condition is ANDed to the WHERE (the HAVING of a grouped one), else kept as a window the query does not have, named `#qualify`, in
+`Stmt.windows`; `planSelect` (lexdb_exec) reads it only where it plans window calls (`qualifyOf`), resolves it as a select item, lets `winMarks`,
+`collectAggs`, `checkGrouped` and `winSlots` see it, and `WinPlan.qual` of the query's first call carries it (a Sel field would cost every statement
+a store: 10.6, 8.2). The row engine's windowed loop (`qualifies`, before DISTINCT, ORDER BY and the sort keys) and the pipeline's `winBody` (`winQual`,
+`PWin.qual` bound with the other expressions: a condition that does not bind gives the query to the row engine) drop a row it is not true of; the pipeline's
+window over an aggregate's groups is not run with one (`aggShape`: the row engine's). Aliases inside a window of the condition itself
+(`row_number() over (order by c)`) are replaced too; a subquery an alias carries is copied (`dupSubs`: the subqueries are numbered, and one index
+used twice is one subquery run twice). `tns_qualify`: 97 statements (aliases, ORA-00960, window calls and aggregates in the condition, grouped,
+DISTINCT, ORDER BY and FETCH after it, WHERE, HAVING and WINDOW before it, derived tables, CTEs, UNION branches, subqueries, a correlated one, QUALIFY as a
+table alias, a 3,000-row table with NULLs, NULLs and no rows, errors in a later row), each with batches off and on; 41 ran in the pipeline's Window;
+`gen_oracle.py --check tns_qualify`: 0 differences. PostgreSQL and SQL Server have no QUALIFY.
+
+**Unenforced constraints.** What the products do (checked), beyond 10.5:
+- PostgreSQL 19: `CHECK (...) NOT ENFORCED`, `REFERENCES ... NOT ENFORCED` in column and table constraints (`NO INHERIT` before it too) and ADD CONSTRAINT;
+  not enforced is not valid (`conenforced` f, `convalidated` f); a foreign key not enforced neither checks its rows nor acts on a deleted parent (no ON
+  DELETE CASCADE, no 23503); `ALTER CONSTRAINT c ENFORCED` of one not enforced checks the rows (23514 "check constraint "c" of relation "t" is violated by
+  some row", 23503 as an insert's) and makes it enforced and valid, of one enforced (valid or NOT VALID) is nothing, `NOT ENFORCED` makes it not enforced
+  and not valid; 42601 "misplaced NOT ENFORCED clause" on a column's PRIMARY KEY, UNIQUE, NOT NULL or default, 0A000 "PRIMARY KEY constraints cannot be
+  marked NOT ENFORCED" on a table's, 42601 "multiple ENFORCED/NOT ENFORCED clauses not allowed" and "conflicting constraint properties", 0A000 "constraints
+  cannot be altered to be NOT VALID", 42809 for a key's name and 42704 for none; VALIDATE CONSTRAINT of one not enforced 55000 "cannot validate NOT ENFORCED
+  constraint"; `pg_get_constraintdef` ends ` NOT ENFORCED`, `information_schema.table_constraints.enforced` NO.
+- SQL Server 2022: `WITH NOCHECK ADD` (enforced from now on; `is_not_trusted` 1), `NOCHECK CONSTRAINT {name [, name ...] | ALL}` (`is_disabled` 1,
+  `is_not_trusted` 1; a disabled foreign key does not cascade), `CHECK CONSTRAINT` (enabled, still not trusted), `WITH CHECK CHECK CONSTRAINT` (the rows
+  checked: 547 "The ALTER TABLE statement conflicted with the CHECK constraint ...", trusted after), 4917 for a name not there, `ALL` takes the CHECK and
+  FOREIGN KEY constraints only.
+- Oracle 23.26.3: `DISABLE` (`STATUS` DISABLED, `VALIDATED` NOT VALIDATED), `ENABLE [VALIDATE]` (rows checked: ORA-02293, ORA-02298), `ENABLE NOVALIDATE`,
+  in column and table constraints, ADD CONSTRAINT, `ALTER TABLE t ENABLE | DISABLE [VALIDATE | NOVALIDATE] CONSTRAINT c` and `MODIFY CONSTRAINT c ...`
+  (a bare VALIDATE or NOVALIDATE changes validity only), ORA-02430 and ORA-02431 for a name not there; new rows then fail ORA-02290 and ORA-02291.
+
+The model of 10.5 held (two flags), with the second kept where lexdb keeps NOT VALID: **enforced** is the new one, `Table.invalid` entries with the prefix
+`OFF_MARK` (as the clustered label's CL_MARK: no new column in the catalog row, a table with none is stored as before), **valid** is the old one (the
+name in `Table.invalid`). Not enforced is not valid except Oracle's DISABLE VALIDATE (read as DISABLE). `lexdb_catalog` makes the two forms the write
+path reads where a table is decoded and changed (`markOff`, `setOff`, `setInvalid`): a CHECK not enforced is stored as `true OR expr` (`offWrap`, so the
+test of a written row, `passes`, short-circuits and the check costs it nothing whatever it holds: **no instruction on the write path of an enforced
+check, none anywhere for a table with none off**), a foreign key has `ForeignKey.off`, which `childSide`, `fkProbes` (an inactive probe) and `parentSide`
+test (a table with foreign keys: one test per key and row). The catalogs show the expression as written (`offInner`), `conenforced` and `convalidated` (pg_constraint
+had no `conenforced`: added in PostgreSQL 18's place, after `condeferred`), `NOT ENFORCED` in the constraint's text, `is_disabled` and `is_not_trusted`,
+`STATUS` (ALL_CONSTRAINTS had none set) and `VALIDATED`. The state of a constraint follows RENAME CONSTRAINT and DROP CONSTRAINT (`pruneInvalid`).
+The grammar: `Constraint.off` and `.stated` (a state was written), one new alteration `A_CON_STATE` (`Alter.mode`: `CS_ON`, `CS_OFF`, `CS_VALIDATE`,
+`CS_NOVALIDATE`, `CS_IF_OFF`) that all three ALTER TABLE grammars produce (`conStateAlter` and `oraStateAlter` in lexdb_parse: T-SQL's WITH CHECK |
+NOCHECK, CHECK | NOCHECK CONSTRAINT list or ALL; Oracle's ENABLE, DISABLE, MODIFY CONSTRAINT; PostgreSQL's ALTER CONSTRAINT), and `conState` (lexdb_exec,
+beside `validateConstraint`) that changes the two flags, checking the rows first where the state says so (`checkRows`, `fkRows`: the errors of each
+door, `lexdb_tsqlerr.checkErr` for 547 on the rows there, ORA-02293 and ORA-02298 built here). The planner reads no constraint (no join elimination or CHECK
+pruning exists in lexdb), so (f) of 10.5 had nothing to do.
+Tests, each statement with batches off and on and each checked against its product: `exec_unenf` (PostgreSQL 19, 71 statements: all of the above, a
+parent deleted and its cascade not done, 3,000-row inserts, an expression that would divide by zero left unevaluated, retyped and renamed columns,
+the catalogs), `tds_unenforced` (SQL Server 2022, 50 batches, each making its own tables), `tns_unenforced` (Oracle Free, 65 statements, the states set by
+ALTERs that repeat and the writes in transactions rolled back; `gen_oracle.py --check`: 0 differences). Suite 357 of 357 (the new tests: tns_qualify,
+exec_unenf, tds_unenforced, tns_unenforced).
+
+**Cost** (the branch's last code commit against main `02646472`, both `-O`; the numbers below were measured at the stated place):
+- In process (`LXL_HASH_SEED=1`, 20,000 statements less the setup, two rounds alternated, `taskset -c 4`, exclusive lock; a scratch program over a Session, tables of 1,000
+  rows), instructions per statement, base -> branch: point select 110,863.4 -> 110,764.4 (**-99.0**: the select core's one test of the next token's kind, 10.8), INSERT
+  (plain table) 4,147,461.3 -> 4,147,461.0, UPDATE by key 4,097,802.9 -> 4,097,802.1; a table with a CHECK: INSERT 4,165,976.9 -> 4,165,979.3 (+2.4), UPDATE
+  4,101,434.8 -> 4,101,435.9 (+1.1) (no changed code runs: placement); a table with a foreign key: INSERT 4,195,479.3 -> 4,195,485.2 (+5.9), UPDATE 4,127,602.5 -> 4,127,608.8
+  (+6.3) (`ForeignKey.off` stored where a key is decoded, tested once per key and row in `childSide`: 0.00015%); both: INSERT +4.0, UPDATE +6.5. The two rounds gave the
+  same numbers to 0.1. The plain table, the one the rule is about, pays nothing: the CHECK has no test of its own to pay (`offWrap`), the first version's decode test
+  moved into the catalog row's trailing sections (a table without them reads nothing: it was +14 on the foreign-key tables).
+- Over the wire (`icount6.sh`, 3 x points.sql, base and branch alternated twice, fresh copy of the data each), per statement: instructions 170,689 / 170,813 -> 170,666 /
+  170,530; cycles 95,111 / 94,425 -> 97,636 / 97,402; L1 i-cache misses 335.7 / 336.9 -> 352.4 / 356.5; branch misses 376.2 / 374.9 -> 403.8 / 399.3. The instructions are
+  level (lower); cycles +2.7% and branch misses +7% are **placement**, as in 10.6 (the IGNORE NULLS slice): found by building the first commit alone (the same: 98,275 / 97,957
+  cycles, 409 / 404 branch misses against base 94,194 / 94,186 and 377 / 372), then that commit with the select core's tests as written in 10.4 (instructions +88, cycles 97,199 /
+  96,953, i-cache 275, 393 / 387 branch misses) and without the table-alias and ROWNUM changes (98,294 / 97,693, i-cache 393 / 389, 398 / 393): the extra cycles stay
+  with the code of the QUALIFY commit wherever its pieces sit, and an unused function added to lexdb_parse of the base moves nothing (94,184 / 94,321, 373 / 379). Not
+  fixed: no change of instructions to fix; the cost is where the new code puts the functions after it.
+- TPC-H SF1 (`run.sh`, lexdb only, base and branch alternated twice, the best of each side): checksums equal on all 22; total 8,817 -> 8,778 ms (0.996). Above 1.5%: q20 251.0 ->
+  255.2 (1.017): its server instructions are equal (`iq.sh` over the run's own data, two runs each: 1,625.83M / 1,625.91M against 1,625.83M / 1,626.29M; q21, 1.012: 6,903.6M /
+  6,915.2M against 6,909.8M / 6,904.9M): noise and placement.
+- lexdb_exec: 21,038 -> 21,178 lines (QUALIFY's `qualifyOf` and `qualifies`, the five lines of planSelect; `conState` and `conStateOne`, 85 lines, beside `validateConstraint`:
+  they call exec's `checkRows`, `fkRows`, `byKey`, `hasConName`); the rest in lexdb_parse (+387), lexdb_catalog (+87), lexdb_sql, lexdb_pipe, lexdb_plan and the catalogs.
+
+**Left, met on the way, not changed:**
+- QUALIFY: with CONNECT BY (the hierarchical rewrite does not read it); a number or text condition is WHERE's (`where id` is no row in lexdb, every row in Oracle:
+  an existing gap) so `qualify id - 1` is no row here and ORA-61800 is not given; with FOR UPDATE lexdb refuses only a query with a window call (0A000, Oracle
+  ORA-01786 for both); `ORDER BY` before QUALIFY is ORA-00900 (Oracle ORA-03049); the text of ORA-03049 is shortened; ORA-00937 in Oracle where lexdb gives
+  ORA-00979 for a plain column beside an aggregate; ROLLUP, CUBE and GROUPING SETS with a window are 0A000 as before; Oracle gave no row for `qualify rn in (select ...)`
+  and lexdb gives the rows (a product bug, not copied); `"rn"` for the alias rn matches in this door (its names fold: ORA-00904 in Oracle); ORDER BY a name that is
+  an alias of a window call and also a column (`order by s`) sorts by the column in the Oracle door (an old fault; PostgreSQL's door sorts by the output).
+- Constraints: Oracle's PRIMARY KEY, UNIQUE and NOT NULL DISABLE / NOVALIDATE (ORA-00900 as before) and RELY (read, not kept: USER_CONSTRAINTS.RELY is empty);
+  23.26.3's NOT ENFORCED is ORA-02000 (inline) and ORA-03075 (table constraint), ORA-00900 here; a second foreign key on the same columns is not ORA-02275;
+  Oracle and SQL Server evaluate a CHECK on an UPDATE only when a column it reads is set, lexdb tests every check of the new row (it matters only for rows
+  that do not obey a constraint that is not valid: such a row updated in another column fails in lexdb, not in Oracle); PostgreSQL's `ALTER CONSTRAINT ...
+  DEFERRABLE` is 0A000 (it was a syntax error); a column constraint `NOT VALID NOT ENFORCED` is accepted (a syntax error in PostgreSQL); T-SQL's `DROP COLUMN`
+  under a CHECK is 5074 in SQL Server and drops the check here (old); T-SQL's `NOCHECK` of a key's name is 11415 (not checked against the product); USER_CONS_COLUMNS has
+  no row for a CHECK constraint (old); PostgreSQL 18's NOT NULL rows in pg_constraint (P7: not built, so the catalog answers of `exec_unenf` select
+  `contype in ('c', 'f')`).
+- **Found, not mine, not fixed:** `INSERT ... SELECT` into a table with a foreign key whose rows break a CHECK part way gives 23505 (a duplicate key of a row
+  written twice) where PostgreSQL gives 23514, on main `02646472` as well (`create table c9 (id int primary key, pid int references p9 (id), v int check (v > 0));
+  insert into c9 select i + 100, 1, 2000 - i from generate_series(1, 3000) i;`: Key (id)=(1093) already exists): the chunked write of `insertSelRows`
+  after a failed row. `exec_unenf` keeps its 3,000-row case on a table with no foreign key.

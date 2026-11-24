@@ -1152,3 +1152,14 @@ package is ORA-04068 once (`pkgStateOf`, `call`: the state discarded when the so
 outside keeps the state it has, with no error. Not done: a package variable as an INTO target or an OUT argument, a record or collection variable, and (as before) a stored
 function in a DML statement's own text (`INSERT ... VALUES (f())` is ORA-00904: functions are run for a query's rows only). Tests: `tns_pkgvar` (`gen_oracle.py --check`: 0
 differences), `tns_pkgstate`.
+
+## As built: QUALIFY and constraint states (lexdb-new-features.md 10.8)
+
+QUALIFY (O1, commit 443310eb): `qualify cond` after WINDOW; the aliases of the select list are the condition's first names (ORA-00960 for a name two outputs have),
+window calls and aggregates may be in it, ORA-03049 for HAVING, WINDOW or a second QUALIFY after it, `qualify` is still a table alias where no condition follows;
+a query without a window call has it as WHERE (HAVING). Test `tns_qualify` (97 statements, batches off and on, 0 differences in `gen_oracle.py --check`). Not
+read after CONNECT BY.
+Constraint states (O26, commit fe8daf59): `DISABLE`, `ENABLE [VALIDATE | NOVALIDATE]`, RELY and NORELY (read) after a CHECK or foreign key in CREATE TABLE and ADD
+CONSTRAINT; `ALTER TABLE t ENABLE | DISABLE [VALIDATE | NOVALIDATE] CONSTRAINT c` and `MODIFY CONSTRAINT c ...`; ORA-02293 and ORA-02298 when the rows are checked,
+ORA-02290 and ORA-02291 for new rows, ORA-02430 and ORA-02431 for a name not there; USER_CONSTRAINTS.STATUS and VALIDATED. PRIMARY KEY, UNIQUE and NOT NULL
+cannot be disabled (ORA-00900 as before); 23.26.3 has no NOT ENFORCED. Test `tns_unenforced` (65 statements, 0 differences).

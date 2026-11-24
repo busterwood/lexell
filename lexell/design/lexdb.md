@@ -13037,3 +13037,16 @@ constants are read and assigned from PL/SQL outside the package, per session, wi
 package variables"); a uniqueidentifier converts to and from binary again, OUTPUT takes no subquery (10705), a text column of VALUES has the session's collation, OBJECTPROPERTY's
 TableHasNonclustIndex. Not done: PostgreSQL's bare-literal overflow (`SELECT 2147483647 + 1`: the check would cost every `v + 1` of an UPDATE by key instructions), recursive CTEs
 under LIMIT. Point statements (base a15b9a64, in process by `pt2.lxl`, 20,000 statements, `LXL_HASH_SEED=1`, two rounds): select 122,345.01 instructions both, INSERT 55,062,708.50 against 55,062,708.51 and .52, UPDATE by key 55,081,434.34 and .35 against .34 and .41 (the first form of MERGE's dry insert, a check in `insertOne`, cost one instruction an INSERT and went to `conflictOf` and `upsertOld`); over the wire (`icount6.sh`, 3 passes, alternated twice) instructions 170,817 and 170,994 against 170,813 and 170,671, cycles 97,796 and 97,855 against 95,328 and 96,219.
+
+### 9.142 QUALIFY and CHECK and foreign key constraints that are not enforced (lexdb-new-features.md 10.8)
+
+Oracle 26ai's `QUALIFY cond` (commit 443310eb): a filter after the window step, before DISTINCT, ORDER BY and FETCH; select aliases visible; with no window call it is
+the WHERE's (HAVING's) condition. `lexdb_parse.oraQualify` replaces the aliases and keeps a windowed one as a window named `#qualify` in `Stmt.windows`;
+`WinPlan.qual` of the first window call carries it to the row engine's windowed loop (`qualifies`) and the pipeline's `winBody` (`winQual`, `PWin.qual`).
+No field of `Stmt` or `Sel` was added: each would cost every statement a store.
+The constraint states (commit fe8daf59): a CHECK or foreign key is *enforced* (new rows checked; `Table.invalid`'s `OFF_MARK` entries say it is not) and *valid* (the rows
+there obey it: the name in `Table.invalid`, as NOT VALID's). A CHECK not enforced is held as `true OR expr`, so the write path's test of a row is untouched and a
+table with none off pays nothing; a foreign key has `ForeignKey.off`, tested where a table's keys are walked (`childSide`, `fkProbes`, `parentSide`). The three
+ALTER TABLE grammars make one alteration, `A_CON_STATE`, run by `conState` beside VALIDATE CONSTRAINT. PostgreSQL's NOT ENFORCED and ALTER CONSTRAINT [NOT]
+ENFORCED (`exec_unenf`), T-SQL's WITH NOCHECK, NOCHECK CONSTRAINT, [WITH CHECK] CHECK CONSTRAINT (`tds_unenforced`), Oracle's DISABLE, ENABLE [NO]VALIDATE and
+MODIFY CONSTRAINT (`tns_unenforced`); pg_constraint.conenforced (new in the table), is_disabled and is_not_trusted, STATUS and VALIDATED.
