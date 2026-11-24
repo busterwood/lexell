@@ -101,8 +101,6 @@ timezone ( zone, source ) → timestamp | timestamptz
 
 - `justify_days`, `justify_hours`, `justify_interval`, `make_time`, `pg_sleep` and the `OVERLAPS` operator do not
   exist.
-- `INTERVAL '1' DAY` and other interval fields after the string are not read (see [date and time
-  types](data-types-datetime.md)).
 
 ## Examples
 
