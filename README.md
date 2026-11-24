@@ -2,7 +2,7 @@
 
 Lexell is a small, straightforward language for command-line tools and database-backed services. It writes Linux executables directly, checks ownership and borrowing at compile time, and has a built-in decimal type. Servers handle thousands of connections as cooperative tasks, written as plain sequential code, with no threads, locks or `async`.
 
-I wanted the quick edit–compile–run loop I remember from Turbo Pascal, with runtime performance competitive with established native toolchains. The compiler is about 3 MB and rebuilds itself in about 0.48 seconds. The [benchmarks](#performance) compare compile time and generated code with Rust, and the regex, JSON, jq, Markdown, decimal and command-line programs with their usual external tools.
+I wanted the quick edit–compile–run loop I remember from Turbo Pascal, with runtime performance competitive with established native toolchains. The compiler is about 3 MB and rebuilds itself in about half a second. The [benchmarks](#performance) compare compile time and generated code with Rust, and the regex, JSON, jq, Markdown, decimal and command-line programs with their usual external tools.
 
 **In active development.** The language and library APIs may change. The native target is Linux x86-64-v3, which includes AVX2. You can try it today from a source checkout.
 
@@ -14,8 +14,8 @@ I wanted the quick edit–compile–run loop I remember from Turbo Pascal, with 
 
 | | Lexell | Rust | Lexell is |
 |---|---:|---:|---:|
-| Hello world (a 20 KB executable) | 14 ms | 46 ms | 3.3× faster |
-| The nine benchmark programs | 131 ms | 3.05 s | 23× faster |
+| Hello world (a 20 KB executable) | 13 ms | 48 ms | 3.6× faster |
+| The nine benchmark programs | 131 ms | 3.19 s | 24× faster |
 
 ### Generated code
 
@@ -23,48 +23,49 @@ Lexell with `-O` against Rust and against Java on a warmed-up JVM:
 
 | Benchmark | Faster than Rust | Faster than Java |
 |---|---:|---:|
-| Allocation | 10× | |
-| Lists and trees | 5.2× | |
-| Strings | 3.2× | |
+| Allocation | 11× | |
+| Lists and trees | 5.2–5.3× | |
+| Strings | 3.3× | |
 | Maps | 1.9× | |
-| Recursive calls | 1.5× | 1.2× |
+| Recursive calls | 1.5× | 1.1× |
 | Sieve | 1.4× | 1.8× |
-| Interpreter loop | 1.1× | 1.9× |
-| Switching between tasks | | 5.9× (1.9× Go) |
+| Interpreter loop | 1.4× | 2.2× |
+| Matrix multiplication | 1.06× | |
+| Switching between tasks | | 9.6× (1.9× Go) |
 | Token scanner | | 1.6× |
-| Sorting with closures | | 1.5× |
-| Loops | level | 1.3× |
-| Peak memory (14 of 15 programs) | | 2–14 MB against the JVM's 50 MB–1.4 GB |
+| Sorting with closures | | 1.6× |
+| Loops | level | 1.1× |
+| Peak memory (14 of 15 programs) | | 2–14 MB against the JVM's 51 MB–1.4 GB |
 
-Rust is ahead on floating point, matrix multiplication, sorting with closures and the token scanner. Java is ahead on the allocation-heavy programs, arrays, maps and matrix multiplication.
+Rust is ahead on floating point (`nbody`), sorting with closures and slightly on the token scanner (1.06×). Java is ahead on the allocation-heavy programs, arrays, maps and vectorised matrix multiplication.
 
 ### Real programs
 
 | Program | Compared with | Lexell is |
 |---|---|---:|
 | Regex, all eight patterns | Go's regexp | 2× to several hundred× faster |
-| jq, every filter (identical output) | jq 1.7.1 | 1.4–2.2× faster |
-| Tree listing | eza | 3.3× faster |
-| JSON parsing | Python | 2.1× faster |
-| grep | GNU grep | 1.4–1.5× faster |
-| JSON writing | Python | 1.4× faster |
+| jq, every filter (identical output) | jq 1.7.1 | 1.5–2.3× faster |
+| Tree listing | eza | 4.6× faster |
+| JSON parsing | Python | 1.8× faster |
+| grep | GNU grep | 1.5–1.7× faster |
+| JSON writing | Python | 1.4–1.5× faster |
 
-Lexell is behind cmark on Markdown, Python on JSON queries, Rust's regex crate on most patterns, and GNU sort.
+Lexell is slightly behind cmark on long Markdown documents (ahead on the spec examples), behind Python on JSON queries, Rust's regex crate on most patterns, and GNU sort.
 
 ### Decimal
 
 | Operation | Faster than Java `BigDecimal` | Faster than .NET `Decimal` |
 |---|---:|---:|
-| Parse | 4.6× (38 digits) | 2.7× |
-| Format | 3.3× (38 digits) | 1.7× |
-| Divide | | 4.4× |
+| Parse | 4.6× (38 digits) | 2.9× |
+| Format | 3.2× (38 digits) | 1.7× |
+| Divide | | 4.5× |
 | Compare | | 1.6× |
-| Multiply | 1.5× (19 digits) | 1.2× |
-| Add | 1.1–1.35× | |
+| Multiply | 1.5× (19 digits) | 1.3× |
+| Add | 1.15–1.34× | |
 
 Java is ahead on division and comparison, and .NET is slightly ahead on 19-digit addition.
 
-Measured on one AMD Ryzen 7 8745HS running Linux 7.2, 22 November 2026. The [performance report](PERFORMANCE.md) has every result, what each benchmark does, and how to reproduce them.
+Measured on one AMD Ryzen 7 8745HS running Linux 7.2, 24 November 2026. The [performance report](PERFORMANCE.md) has every result, what each benchmark does, and how to reproduce them.
 
 ## Concurrency without threads or locks
 
@@ -113,7 +114,7 @@ fn main() {
 
 The same design runs through the library and LexDB:
 
-- **HTTP and HTTPS server.** One task per connection, with keep-alive, graceful shutdown, and worker processes sharing one port. On one core it serves 1.5 times as many requests a second as Go's `net/http` and 1.2 to 1.3 times as many as Node.js, each also on one core. At 100 clients its p99 latency is 0.78 ms, against Node's 0.89 ms and Go's 3.2 ms.
+- **HTTP and HTTPS server.** One task per connection, with keep-alive, graceful shutdown, and worker processes sharing one port. On one core it serves 1.5 times as many requests a second as Go's `net/http` and 1.2 to 1.3 times as many as Node.js, each also on one core. At 100 clients its p99 latency is 0.61 ms, against Node's 0.87 ms and Go's 3.1 ms.
 - **Database clients.** The PostgreSQL, SQL Server, Oracle and Redis clients speak their wire protocols on the event loop, so a query parks only the task that sent it, and their connection pools hand out connections the same way. SQLite has only a blocking C API, so its calls run on a helper thread, which runs only C code, while the task waits.
 - **LexDB.** The database runs every session as a task on one thread. A commit never waits partway through, so no other session can run inside it, and the engine needs no latches on its pages and no locks to keep threads out of each other's way. Commits that arrive in the same turn of the event loop share one flush to disk. Read-only replicas are separate processes that follow the master's log, the same way LexDB uses more cores.
 
@@ -155,7 +156,7 @@ This also prints `24.49`. The repository includes [other command-line tools, a R
 
 LexDB is a SQL database server written in Lexell (`lexell/cmd/lexdb.lxl`). It is designed for SSDs and NVMe drives, consumer drives first, and keeps its data on disk with memory as a cache. Pages are copy-on-write, so a write torn by a power cut can never damage a page in use, and its disk I/O goes through io_uring where the kernel allows it. It speaks three wire protocols: PostgreSQL's, SQL Server's TDS and Oracle's TNS, each with its own SQL dialect. Existing clients and drivers, such as `psql`, `pgbench`, the JDBC drivers and Lexell's own database clients, connect unchanged. Read-write transactions are serializable, and read-only transactions read from a snapshot. Tables are stored by column and queries run over batches of rows, planned by a cost-based optimizer. A server can run read-only replicas as separate processes.
 
-On TPC-H at scale factor 1, LexDB on one core takes about the same total time as PostgreSQL on four processes and two-thirds of PostgreSQL's on one core (geometric mean). It commits 1.6 to 2.4 times as many durable updates a second, and with three read replicas serves more point selects than PostgreSQL on the same four cores. PostgreSQL is ahead on point selects from a single process at 8 or more clients ([details](PERFORMANCE.md#lexdb)).
+On TPC-H at scale factor 1, LexDB on one core finishes the 22 queries in less total time than PostgreSQL on four processes (8.1 against 8.8 s) and takes 0.63 of PostgreSQL's time on one core (geometric mean, 20 of 22 level or ahead). It commits 1.75 to 2.5 times as many durable updates a second, and on 35 analytic queries its CPU is 0.49 of PostgreSQL on one core (wall time 0.98 of four processes). PostgreSQL is ahead on point selects from a single process at 8 or more clients ([details](PERFORMANCE.md#lexdb)).
 
 For now, the [program notes](lexell/cmd/README.md#lexdb) cover running it, and the [design](lexell/design/lexdb.md) covers how it works. A full LexDB guide is in progress.
 
