@@ -547,8 +547,8 @@ differences of its statement.
     `TO_CHAR` is right).
   - **Conversion:** `TO_CHAR` number elements `EEEE`, `RN`, `XXXX`, `TM`, `B`, `V`, `C` are ORA-01481 and date elements
     `CC`, `E`, `RM`, `YEAR`, `SYYYY`, `DS`, `DL`, `TS` are ORA-01821 (the zone elements `TZH`, `TZM`, `TZR` and `TZD`
-    work on a value with a time zone, and are ORA-01821 on one without, as in Oracle); `CAST(TRUE AS VARCHAR2(5))` and
-    `TO_CHAR(TRUE)` are `1` (Oracle `TRUE`; the `CAST` gave `true` before main 178ea2df: found on main 55040a20);
+    work on a value with a time zone, and are ORA-01821 on one without, as in Oracle); `CAST(TRUE AS CHAR(5))` is
+    `true ` (Oracle `TRUE `) and `LENGTH(TRUE)` is 1 (Oracle 4);
     `TO_CHAR(0, '999')` is blanks and `TO_CHAR(0, 'FM999')` is empty (Oracle `0`); the third argument of `TO_CHAR` and `TO_NUMBER`
     (NLS parameters) is ignored; `DDSP` gives `03`; `TO_CHAR` of an interval is NULL; `TO_BOOLEAN(NULL)` is false;
     a string inserted into a `DATE` column is read as `YYYY-MM-DD`, not by `NLS_DATE_FORMAT`; `CAST(... AS INTERVAL ...)`,

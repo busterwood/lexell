@@ -1,0 +1,125 @@
+// lexdb_orafn: Oracle 23's BOOLEAN as text in the Oracle door: CAST(b AS VARCHAR2 | NVARCHAR2), TO_CHAR(b), b || text and UPPER(b) are
+// TRUE / FALSE, TO_NUMBER(b) 1 / 0 (each answer checked against Oracle Database Free 23.26.3, 2026-11-24). 178ea2df made a CAST to VARCHAR2
+// TO_CHAR's (for the NLS date formats), and TO_CHAR wrote a boolean as 1 / 0. Each statement runs with batches on and off: the same answer.
+// expect: select cast(true as varchar2(5)) from dual -> SELECT 1: TRUE
+// expect: select cast(true as nvarchar2(5)) from dual -> SELECT 1: TRUE
+// expect: select cast(false as varchar2(10)) || 'x' from dual -> SELECT 1: FALSEx
+// expect: select true || 'x' from dual -> SELECT 1: TRUEx
+// expect: select to_char(true) from dual -> SELECT 1: TRUE
+// expect: select to_char(1 = 1) from dual -> SELECT 1: TRUE
+// expect: select upper(false) from dual -> SELECT 1: FALSE
+// expect: select to_number(true) from dual -> SELECT 1: 1
+// expect: select cast(f as varchar2(5)), to_char(f) from b order by id -> SELECT 2: TRUE|TRUE; FALSE|FALSE
+// expect: select to_char(5), cast(2.50 as varchar2(10)), to_char(date '2026-03-15') from dual -> SELECT 1: 5|2.5|15-MAR-26
+import "strings"
+import "os"
+import "collections"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_parse"
+import "../../../cmd/lexdb_sql"
+
+type Val = lexdb_sql.Val
+
+// A result's rows as text (sorted unless ordered), or the tag, or the error's state.
+fn render(rs: &[]lexdb_exec.Res, sql: &str, s: &lexdb_exec.Session): str {
+    var parts: []str = []
+    for r in rs {
+        if !r.hasRows && len(r.rows) == 0 {
+            append(mut &parts, r.tag.clone())
+            continue
+        }
+        var lines: []str = []
+        for row in r.rows {
+            var cells: []str = []
+            for i in 0..len(row) { append(mut &cells, if lexdb_ops.isNull(&row[i]) { "NULL" } else { s.text(&row[i], r.cols[i].oid) }) }
+            append(mut &lines, strings.join(&cells, "|"))
+        }
+        if !strings.contains(&strings.toLowerAscii(sql), &"order by") { collections.sort(mut &lines) }
+        append(mut &parts, r.tag + ": " + strings.join(&lines, "; "))
+    }
+    return strings.join(&parts, " / ")
+}
+
+// A statement as the Oracle door reads it (its parser and its session's door), or as PostgreSQL's.
+fn run(s: mut &lexdb_exec.Session, sql: &str, ora: bool): str {
+    if !ora {
+        match s.exec(sql) {
+            Ok(rs) { return render(&rs, sql, s) }
+            Err(e) { return "ERROR " + e.state }
+        }
+    }
+    match lexdb_parse.oraParse(sql) {
+        Ok(stmts) {
+            var out: []str = []
+            for st in stmts {
+                match s.run(&st, &[], &[]) {
+                    Ok(r) { append(mut &out, render(&[r], sql, s)) }
+                    Err(e) { return "ERROR " + e.state }
+                }
+            }
+            return strings.join(&out, " / ")
+        }
+        Err(e) { return "PARSE " + e.state }
+    }
+}
+
+type Group = record { name: str; n: int; same: int }
+
+fn report(g: &Group) { println(g.name + ": " + g.n.toStr() + " statements, " + g.same.toStr() + " the same") }
+
+// Statements (separated by ";;") with batches on and off; a write's in a block rolled back each way.
+fn check(s: mut &lexdb_exec.Session, g: mut &Group, sql: &str, ora: bool) {
+    let w = strings.startsWith(sql, &"W ")
+    let body = if w { sql[2..len(sql)].toStr() } else { sql.toStr() }
+    let on = stmts(s, &body, w, ora)
+    let a = run(s, &"set lexdb_batch = off", false)
+    let off = stmts(s, &body, w, ora)
+    let b = run(s, &"set lexdb_batch = on", false)
+    g.n += 1
+    if on == off { g.same += 1 } else { println("DIFFERENT: " + sql + "\n  on:  " + on + "\n  off: " + off) }
+    if strings.startsWith(&on, &"ERROR") || strings.startsWith(&on, &"PARSE") || os.envOr("VERBOSE", "") != "" { println("  " + sql + " -> " + on) }
+}
+
+fn stmts(s: mut &lexdb_exec.Session, sql: &str, w: bool, ora: bool): str {
+    var out: []str = []
+    if w { let b = run(s, &"begin", false) }
+    for x in strings.split(sql, &";;") { append(mut &out, run(s, &x, ora)) }
+    if w { let r = run(s, &"rollback", false) }
+    return strings.join(&out, " // ")
+}
+
+// What one statement gives, printed with a label: the value the group's "same" does not show.
+fn show(s: mut &lexdb_exec.Session, label: &str, sql: &str, ora: bool) { println(label + run(s, sql, ora)) }
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(93), lexdb_store.Options{cacheBytes: 32 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 1024 * 1024, snapNodes: 200000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+        s.setDoor(&"tns")
+        let setup = ["create table b (id number primary key, f boolean)", "insert into b values (1, true)", "insert into b values (2, false)"]
+        for x in setup { let r = run(mut &s, &x, true) }
+        let qs = [
+            "select cast(true as varchar2(5)) from dual",
+            "select cast(true as nvarchar2(5)) from dual",
+            "select cast(false as varchar2(10)) || 'x' from dual",
+            "select true || 'x' from dual",
+            "select to_char(true) from dual",
+            "select to_char(1 = 1) from dual",
+            "select upper(false) from dual",
+            "select to_number(true) from dual",
+            "select cast(f as varchar2(5)), to_char(f) from b order by id",
+            "select to_char(5), cast(2.50 as varchar2(10)), to_char(date '2026-03-15') from dual",
+        ]
+        for x in qs {
+            let on = run(mut &s, &x, true)
+            let a = run(mut &s, &"set lexdb_batch = off", false)
+            let off = run(mut &s, &x, true)
+            let b = run(mut &s, &"set lexdb_batch = on", false)
+            if on == off { println(x + " -> " + on) } else { println("DIFFERENT: " + x + " on: " + on + " off: " + off) }
+        }
+        return 0
+    })
+}

@@ -86,7 +86,7 @@ CAST ( expr AS type )
   elements `CC`, `E`, `RM`, `YEAR`, `SYYYY`, `DS`, `DL`, `TS` are ORA-01821.
 - `TZR` of a value whose zone was a region shows its offset (`+01:00`; Oracle `EUROPE/BERLIN`), and `TZD` is empty
   (Oracle `CET`): lexdb keeps a region as the offset it had (see [date and time types](data-types-datetime.md)).
-- `CAST(TRUE AS VARCHAR2(5))` and `TO_CHAR(TRUE)` are `1`; Oracle gives `TRUE`.
+- `CAST(TRUE AS CHAR(5))` is `true ` and `LENGTH(TRUE)` is 1; Oracle gives `TRUE ` and 4.
 - A `TIMESTAMP` literal converted to text has six fractional digits (`10.00.00.000000 AM +02:00`); Oracle gives it
   nine.
 - `TO_CHAR(0, '999')` returns four blanks and `TO_CHAR(0, 'FM999')` an empty string; Oracle gives `0` in both.
@@ -320,7 +320,7 @@ UP HALF_UP NEGATIVE DOWN EXPONENT BLANKS
 
 DATE_TO_TIMESTAMP   TIMESTAMP_TO_DATE TO_CLOB TO_RAW NUMBER_TO_BOOLEAN TEXT_TO_BOOLEAN BOOLEAN_TO_TEXT
 ------------------- ----------------- ------- ------ ----------------- --------------- ---------------
-2026-11-23 00:00:00 14:05:10          x       41     true              true            1
+2026-11-23 00:00:00 14:05:10          x       41     true              true            TRUE
 
 1 row selected.
 ```
