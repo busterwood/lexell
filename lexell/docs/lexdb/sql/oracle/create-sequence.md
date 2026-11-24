@@ -52,7 +52,6 @@ sequence.CURRVAL
 - `CURRVAL` before the first `NEXTVAL` is ORA-20000 (`currval of sequence ... is not yet defined in this session`);
   Oracle gives ORA-08002.
 - `USER_SEQUENCES.CACHE_SIZE` is 0 and `LAST_NUMBER` is the start value, whatever the options said.
-- A sequence that does not exist is ORA-00942 from `NEXTVAL` (Oracle: ORA-02289).
 - `SESSION` and `SCALE` sequences are ORA-00900.
 - `CURRVAL` and `NEXTVAL` are allowed in a subquery (Oracle: ORA-02287).
 
@@ -241,7 +240,7 @@ SELECT s5.CURRVAL FROM dual;
 
 ```text
 ERROR:
-ORA-00942: table or view "SA"."S_NOTHERE" does not exist
+ORA-02289: sequence does not exist
 
 Sequence created.
 

@@ -12,16 +12,15 @@ DROP SEQUENCE [ schema. ] sequence
 
 ## Remarks
 
-- A sequence that does not exist is ORA-02289.
-
-- A sequence that a column's default calls (`DEFAULT s.NEXTVAL`) cannot be dropped while the default exists: the
-  statement is ORA-02449 (example B).
+- A sequence that does not exist is ORA-02289, and so is `s.NEXTVAL` of a sequence that was dropped.
+- A sequence that a column's default calls (`DEFAULT s.NEXTVAL`) can be dropped, as in Oracle. The column keeps its
+  default, and the next `INSERT` that needs the default fails (example B).
 
 ## Differences from Oracle
 
-- The refusal for a sequence under a column default carries the message of ORA-02449 (`unique/primary keys in table
-  referenced by foreign keys`), which does not describe it. The drop is refused until the table (or the default) is
-  dropped; whether Oracle itself refuses it was not checked.
+- An `INSERT` into a table whose default calls the dropped sequence is ORA-00942 (`table or view "SA"."S6" does not
+  exist`), also when the statement gives the column a value. The error of a missing sequence is ORA-02289 (as
+  `s6.NEXTVAL` gives it).
 
 ## Examples
 
@@ -44,7 +43,7 @@ ERROR:
 ORA-02289: sequence does not exist
 
 ERROR:
-ORA-00942: table or view "SA"."S5" does not exist
+ORA-02289: sequence does not exist
 ```
 
 ### B. A sequence a column default uses
@@ -53,11 +52,12 @@ ORA-00942: table or view "SA"."S5" does not exist
 ```sql
 CREATE SEQUENCE s6;
 CREATE TABLE ticket (id NUMBER DEFAULT s6.NEXTVAL, note VARCHAR2(20));
-DROP SEQUENCE s6;
 INSERT INTO ticket (note) VALUES ('first');
+DROP SEQUENCE s6;
+INSERT INTO ticket (note) VALUES ('second');
+INSERT INTO ticket (id, note) VALUES (10, 'second');
 SELECT id, note FROM ticket;
 DROP TABLE ticket;
-DROP SEQUENCE s6;
 ```
 
 ```text
@@ -65,10 +65,15 @@ Sequence created.
 
 Table created.
 
-ERROR:
-ORA-02449: unique/primary keys in table referenced by foreign keys
-
 1 row created.
+
+Sequence dropped.
+
+ERROR:
+ORA-00942: table or view "SA"."S6" does not exist
+
+ERROR:
+ORA-00942: table or view "SA"."S6" does not exist
 
 ID NOTE
 -- -----
@@ -77,8 +82,6 @@ ID NOTE
 1 row selected.
 
 Table dropped.
-
-Sequence dropped.
 ```
 
 ## See also
