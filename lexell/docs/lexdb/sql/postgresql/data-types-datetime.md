@@ -11,7 +11,12 @@ date
 time [ ( p ) ] [ without time zone ]
 timestamp [ ( p ) ] [ without time zone ]
 timestamp [ ( p ) ] with time zone | timestamptz [ ( p ) ]
-interval [ ( p ) ]
+interval [ fields ] [ ( p ) ]
+
+fields ::=
+    YEAR | MONTH | DAY | HOUR | MINUTE | SECOND
+  | YEAR TO MONTH | DAY TO HOUR | DAY TO MINUTE | DAY TO SECOND
+  | HOUR TO MINUTE | HOUR TO SECOND | MINUTE TO SECOND
 ```
 
 ## Arguments
@@ -33,7 +38,9 @@ interval [ ( p ) ]
   session's time zone (`SET TIME ZONE`; UTC by default).
 
 `interval`
-: A span of months, days and microseconds, kept apart: `1 month` is not `30 days` until it is compared.
+: A span of months, days and microseconds, kept apart: `1 month` is not `30 days` until it is compared. *fields*
+  (SQL's interval qualifiers) name the units a value may hold and drop what is below the lowest one; *p* goes with
+  `SECOND` (`interval second(3)`, `interval day to second(3)`).
 
 ## Remarks
 
@@ -45,6 +52,11 @@ interval [ ( p ) ]
   abbreviation (`PST`).
 - Intervals are read in PostgreSQL's words (`1 year 2 mons 3 days 04:05:06`, `2 weeks`, `90 minutes`, `1 century`),
   `@ ... ago`, and ISO 8601 (`P1Y2M3DT4H`).
+- The standard's qualifiers follow the string (`INTERVAL '1' DAY`, `INTERVAL '1-2' YEAR TO MONTH`) or the type of a
+  column or cast. The text is read in the fields' terms: a bare number is in the lowest field's unit (`'1'` of `DAY`
+  is a day; of `MINUTE` a minute), `'1-2'` is years and months, `'03:04'` of `MINUTE TO SECOND` is minutes and
+  seconds. A value loses what is below its lowest field (`INTERVAL '1 day 2 hours' DAY` is `1 day`). A text the
+  fields cannot hold is 22015 (`'1-14' YEAR TO MONTH`) or 22007.
 - Arithmetic: `date + integer` and `date - integer` move by days; `date - date` is an integer of days; `date +
   interval` and `timestamp ± interval` are timestamps; `timestamp - timestamp` is an interval; `time ± interval`
   wraps round midnight; an interval multiplies and divides by a number.
@@ -60,10 +72,8 @@ interval [ ( p ) ]
   timestamptz)`).
 - Dates are read in ISO order only: `'01/03/2026'`, `'20260301'` and `'March 1, 2026'` are 22007 (PostgreSQL reads
   them by `DateStyle`). `SET DateStyle` and `SET IntervalStyle` are accepted and change nothing.
-- `INTERVAL '1' DAY` is read as `INTERVAL '1'` (one second) with the column alias `day`, and `INTERVAL '1-2' YEAR
-  TO MONTH` is a syntax error: interval fields after the string are not read. Write the unit in the string
-  (`INTERVAL '1 day'`).
-- `'infinity'::interval` and `'allballs'::time` are not read.
+- `'infinity'::interval` and `'allballs'::time` are not read. `INTERVAL(3) '1' SECOND` (the precision before the
+  string) is accepted and gives one second (PostgreSQL: a syntax error).
 - A cast's result column is named after the source type in some cases (`TIMESTAMP '...'::timestamptz` is named
   `timestamp`).
 
@@ -189,6 +199,35 @@ SELECT INTERVAL '1 day' * 3 AS times3, INTERVAL '1 hour' / 4 AS quarter, INTERVA
 (1 row)
 ```
 
+The standard's qualifiers, after the string and in a column's type:
+
+<!-- example: postgresql -->
+```sql
+SELECT INTERVAL '1' DAY AS d, INTERVAL '1-2' YEAR TO MONTH AS ym, INTERVAL '03:04' MINUTE TO SECOND AS ms,
+       INTERVAL '1 day 2 hours' DAY AS cut;
+CREATE TABLE shift (len interval hour to minute);
+INSERT INTO shift VALUES ('2:30:45'), ('90 minutes');
+SELECT len FROM shift;
+SELECT INTERVAL '1-14' YEAR TO MONTH;
+```
+
+```text
+   d   |      ym       |    ms    |  cut
+-------+---------------+----------+-------
+ 1 day | 1 year 2 mons | 00:03:04 | 1 day
+(1 row)
+
+CREATE TABLE
+INSERT 0 2
+   len
+----------
+ 02:30:00
+ 01:30:00
+(2 rows)
+
+ERROR:  interval field value out of range: "1-14"
+```
+
 ### G. Special values
 
 <!-- example: postgresql -->
@@ -211,14 +250,14 @@ SELECT 'infinity'::date AS inf, 'epoch'::timestamptz AS epoch, '4713-01-01 BC'::
 SELECT '2026-02-30'::date;
 SELECT '01/03/2026'::date;
 SELECT '10:30'::timetz;
-SELECT INTERVAL '1-2' YEAR TO MONTH;
+SELECT INTERVAL '1 2' YEAR TO MONTH;
 ```
 
 ```text
 ERROR:  date/time field value out of range: "2026-02-30"
 ERROR:  invalid input syntax for type date: "01/03/2026"
 ERROR:  lexdb: time with time zone is not supported (use timestamptz)
-ERROR:  syntax error at or near "to"
+ERROR:  invalid input syntax for type interval: "1 2"
 ```
 
 ## See also
