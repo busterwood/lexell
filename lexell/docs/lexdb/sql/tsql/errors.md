@@ -51,6 +51,8 @@ feature, the number is **50000**.
 | 544 | An explicit value for an identity column while `IDENTITY_INSERT` is `OFF`. |
 | 547 | A `CHECK` or `FOREIGN KEY` constraint violated. |
 | 2627 | A `PRIMARY KEY` or `UNIQUE` constraint violated (a unique index gives the same). |
+| 8110 | A second `PRIMARY KEY` in `CREATE TABLE`. |
+| 1902 | A second `CLUSTERED` index on a table. |
 | 2628 | A string too long for its column. |
 | 241 | A date or time that cannot be read. |
 | 245 | A string that cannot be converted to an integer. |
@@ -74,6 +76,7 @@ feature, the number is **50000**.
 | 4121 | A column, function or method that cannot be found by that name. |
 | 4902 | A table named by `TRUNCATE` or similar that cannot be found. |
 | 5074 | An object depends on the column you are dropping or changing. |
+| 2754 | `RAISERROR` of severity 19 to 25 without `WITH LOG`. |
 | 5324, 8672, 10713 | `MERGE` rules: a `WHEN` clause after one with no condition; a target row matched twice; a missing `;`. |
 | 310, 1042 | `OPTION (MAXRECURSION n)` out of range, or given twice. |
 | 313 | Too few arguments for a procedure or function. |
@@ -97,6 +100,7 @@ feature, the number is **50000**.
 |---|---|
 | 50000 | `RAISERROR` with a message text; also every error SQL Server has no number for here (a column named twice, a column that must be in `GROUP BY`, an ambiguous column) and every feature lexdb does not support: the message begins `lexdb:`. |
 | 51000 and up | `THROW` with your own number. |
+| 2745, 596 | Sent after a `RAISERROR ... WITH LOG` of severity 20 or more; the connection is closed. |
 | 18456 | A failed login. |
 
 ## Remarks
