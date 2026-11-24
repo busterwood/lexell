@@ -33,8 +33,6 @@ VALUES ( expression [, ...] ) [, ...]
 
 ## Differences from PostgreSQL
 
-- Values with no common type give 42804 with lexdb's message (`column is of type integer but the expression is of
-  another type`); PostgreSQL's is `VALUES types integer and boolean cannot be matched`.
 - `VALUES` after `WITH` (`WITH t AS (...) VALUES ...`) is a syntax error; `WITH t AS (...) SELECT * FROM (VALUES
   ...) AS v` works.
 
@@ -118,7 +116,7 @@ VALUES (1, 2), (3);
 (1 row)
 
 ERROR:  invalid input syntax for type integer: "x"
-ERROR:  column is of type integer but the expression is of another type
+ERROR:  VALUES types integer and boolean cannot be matched
 ERROR:  VALUES lists must all be the same length
 ```
 
