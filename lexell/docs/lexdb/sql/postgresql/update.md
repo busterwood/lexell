@@ -62,6 +62,8 @@ UPDATE [ ONLY ] table_name [ * ] [ [ AS ] alias ]
   a `varchar(n)` is 22001), and `NOT NULL`, `CHECK`, unique and foreign key constraints are checked for every row.
   Generated columns are computed again.
 - An `UPDATE` is one statement: all its rows change, or none do.
+- A subquery in `SET` or `RETURNING` sees the table as it was when the statement began, not the rows the statement
+  has already changed (example F). The same holds in the SQL Server and Oracle doors.
 - A primary key may be updated. A foreign key's `ON UPDATE` action runs for the rows that reference it.
 - An `UPDATE` waits for the row locks other transactions hold on its rows, then finds its rows again, reading what
   they committed. In a transaction block it keeps a lock on each row it changes until the block ends (`FOR NO KEY
@@ -194,7 +196,42 @@ UPDATE product SET price = (SELECT max(price) FROM product) WHERE id = 3 RETURNI
 UPDATE 1
 ```
 
-### F. In batches
+### F. A subquery sees the starting rows
+
+Each employee takes twice the pay of the manager. The managers are updated in the same statement, but the subquery
+reads their old pay, and so does the one in `RETURNING` (`rows_paid_400` is the one row that had 400 when the
+statement began).
+
+<!-- example: postgresql -->
+```sql
+CREATE TABLE staff (id int PRIMARY KEY, boss int, pay int);
+INSERT INTO staff VALUES (1, NULL, 100), (2, 1, 200), (3, 2, 300), (4, 3, 400);
+UPDATE staff s SET pay = (SELECT b.pay * 2 FROM staff b WHERE b.id = s.boss) WHERE boss IS NOT NULL
+RETURNING s.id, s.pay, (SELECT count(*) FROM staff x WHERE x.pay = 400) AS rows_paid_400;
+SELECT id, pay FROM staff ORDER BY id;
+```
+
+```text
+CREATE TABLE
+INSERT 0 4
+ id | pay | rows_paid_400
+----+-----+---------------
+  2 | 200 |             1
+  3 | 400 |             1
+  4 | 600 |             1
+(3 rows)
+
+UPDATE 3
+ id | pay
+----+-----
+  1 | 100
+  2 | 200
+  3 | 400
+  4 | 600
+(4 rows)
+```
+
+### G. In batches
 
 <!-- example: postgresql -->
 ```sql
@@ -214,7 +251,7 @@ ERROR:  lexdb: UPDATE with batch_rows cannot assign a primary key column
 CONTEXT:  UPDATE with batch_rows 2: 0 rows committed before the error
 ```
 
-### G. Errors
+### H. Errors
 
 A constraint error stops the statement, and no row is changed.
 
