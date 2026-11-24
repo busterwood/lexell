@@ -1,7 +1,7 @@
 # Conversion functions
 
-`TO_CHAR`, `TO_NCHAR`, `TO_DATE`, `TO_TIMESTAMP`, `TO_NUMBER`, `TO_BOOLEAN` and `CAST`, and the conversions lexdb
-makes by itself.
+`TO_CHAR`, `TO_NCHAR`, `TO_DATE`, `TO_TIMESTAMP`, `TO_TIMESTAMP_TZ`, `TO_NUMBER`, `TO_BOOLEAN` and `CAST`, and the
+conversions lexdb makes by itself.
 
 **Door:** Oracle (TNS). **Follows:** Oracle AI Database 26ai (23.26) and 23ai.
 
@@ -14,6 +14,7 @@ TO_CHAR ( character )
 TO_NCHAR ( n | datetime | char [, format ] )
 TO_DATE ( char [, format ] )
 TO_TIMESTAMP ( char [, format ] )
+TO_TIMESTAMP_TZ ( char [, format ] )
 TO_NUMBER ( expr [, format [, 'nlsparam' ] ] )
 TO_BOOLEAN ( expr )
 CAST ( expr AS type )
@@ -33,7 +34,11 @@ CAST ( expr AS type )
   `DD`, `DDD`, `D`, `DAY`, `DY`, `Q`, `WW`, `W`, `IW`, `J`, `HH`, `HH12`, `HH24`, `MI`, `SS`, `SSSSS`, `FF` and `FF1` to
   `FF9`, `AM`, `PM`, `A.M.`, `P.M.`, `AD`, `BC`, the suffixes `TH` and `SP`, the prefix `FM`, and text in double
   quotes. The case of `Day`, `Month` and `Mon` follows the format (`MONDAY`, `Monday`). Without a format the
-  session's `NLS_DATE_FORMAT` (`DD-MON-RR`) is used, and for timestamps `DD-MON-RR HH.MI.SSXFF AM`.
+  session's `NLS_DATE_FORMAT` (`DD-MON-RR`) is used, for timestamps `NLS_TIMESTAMP_FORMAT` (`DD-MON-RR HH.MI.SSXFF
+  AM`), and for timestamps with a time zone `NLS_TIMESTAMP_TZ_FORMAT` (`DD-MON-RR HH.MI.SSXFF AM TZR`).
+  The time zone elements take a `TIMESTAMP WITH TIME ZONE`: `TZH` is the offset's sign and hours (`+05`), `TZM` its
+  minutes (`30`), `TZR` the zone (`+05:30`) and `TZD` its abbreviation (empty for an offset). On a value without a
+  zone they are ORA-01821, as in Oracle.
 
 `TO_NCHAR`
 : As `TO_CHAR`, giving an `NVARCHAR2`.
@@ -45,6 +50,12 @@ CAST ( expr AS type )
 
 `TO_TIMESTAMP`
 : A `TIMESTAMP` from text; `FF` reads the fraction.
+
+`TO_TIMESTAMP_TZ`
+: A `TIMESTAMP WITH TIME ZONE` from text: `TZH` and `TZM` read the offset, `TZR` an offset or a region. Text without a
+  zone is in the session's time zone. Without a format, the text is read by `NLS_TIMESTAMP_TZ_FORMAT`, then as ISO
+  (`2026-11-23 14:05:09 +05:30`). An hour beyond 15 is ORA-01874, a minute beyond 59 ORA-01875, an unknown region
+  ORA-01882.
 
 `TO_NUMBER`
 : A number from text, optionally by a format (`9`, `0`, `,`, `.`, `$`, `MI`, `PR`, `XX` for hexadecimal). Surrounding
@@ -64,16 +75,20 @@ CAST ( expr AS type )
 - Implicit conversion: a character value used as a number is converted by `TO_NUMBER`, and a number or a date used as
   text by `TO_CHAR`: `1 + '2'` is 3, `10 || 5` is `105`. Text that is not a number is ORA-01722.
 - A string put into a `DATE` column by `INSERT` is read in the form `YYYY-MM-DD` (see Differences).
-- `TO_DSINTERVAL`, `TO_YMINTERVAL`, `TO_TIMESTAMP_TZ`, `TO_SINGLE_BYTE`, `TO_LOB`, `TO_BINARY_DOUBLE` and
-  `TO_BINARY_FLOAT` do not exist (ORA-00904). `VALIDATE_CONVERSION`, and the `DEFAULT ... ON CONVERSION ERROR`
+- `TO_DSINTERVAL`, `TO_YMINTERVAL`, `TO_SINGLE_BYTE`, `TO_LOB`, `TO_BINARY_DOUBLE` and `TO_BINARY_FLOAT` do not
+  exist (ORA-00904). `VALIDATE_CONVERSION`, and the `DEFAULT ... ON CONVERSION ERROR`
   clause of `TO_NUMBER`, `TO_DATE` and `CAST`, are ORA-00900.
 - Where an interval is needed, write the literal: `INTERVAL '3 04:05:06' DAY TO SECOND`, `INTERVAL '2-5' YEAR TO MONTH`.
 
 ## Differences from Oracle
 
 - Number format elements `EEEE`, `RN`, `rn`, `X` (`TO_CHAR(255, 'XXXX')`), `TM`, `B`, `V` and `C` are ORA-01481. Date
-  elements `CC`, `E`, `RM`, `YEAR`, `SYYYY`, `DS`, `DL`, `TS` and the time zone elements `TZH`, `TZM`, `TZR`, `TZD` are
-  ORA-01821.
+  elements `CC`, `E`, `RM`, `YEAR`, `SYYYY`, `DS`, `DL`, `TS` are ORA-01821.
+- `TZR` of a value whose zone was a region shows its offset (`+01:00`; Oracle `EUROPE/BERLIN`), and `TZD` is empty
+  (Oracle `CET`): lexdb keeps a region as the offset it had (see [date and time types](data-types-datetime.md)).
+- `CAST(TRUE AS VARCHAR2(5))` and `TO_CHAR(TRUE)` are `1`; Oracle gives `TRUE`.
+- A `TIMESTAMP` literal converted to text has six fractional digits (`10.00.00.000000 AM +02:00`); Oracle gives it
+  nine.
 - `TO_CHAR(0, '999')` returns four blanks and `TO_CHAR(0, 'FM999')` an empty string; Oracle gives `0` in both.
 - The third argument of `TO_CHAR` and `TO_NUMBER` (`NLS_DATE_LANGUAGE=GERMAN`, `NLS_NUMERIC_CHARACTERS`) is accepted and
   ignored: `TO_NUMBER('1,5', '9D9', 'NLS_NUMERIC_CHARACTERS='',.''')` is 15 (Oracle: 1.5).
@@ -87,8 +102,8 @@ CAST ( expr AS type )
 - `CAST(... AS INTERVAL DAY TO SECOND)` is ORA-00900. `TO_CHAR(.5)` and the literal `.5` are ORA-01426.
 - The error texts are lexdb's own, shorter or different from Oracle's (ORA-01843 reads "An invalid month was
   specified"). The codes are Oracle's.
-- A timestamp with a time zone keeps no offset (see the [date and time page](functions-datetime.md)), so `TO_CHAR` of one
-  shows UTC.
+- A text inserted into a `TIMESTAMP WITH TIME ZONE` column is read as ISO (`'2026-03-15 10:00:00 +02:00'`), not by
+  `NLS_TIMESTAMP_TZ_FORMAT`, as for a `DATE` column; `CAST` and `TO_TIMESTAMP_TZ` read the NLS format.
 
 ## Examples
 
@@ -305,7 +320,7 @@ UP HALF_UP NEGATIVE DOWN EXPONENT BLANKS
 
 DATE_TO_TIMESTAMP   TIMESTAMP_TO_DATE TO_CLOB TO_RAW NUMBER_TO_BOOLEAN TEXT_TO_BOOLEAN BOOLEAN_TO_TEXT
 ------------------- ----------------- ------- ------ ----------------- --------------- ---------------
-2026-11-23 00:00:00 14:05:10          x       41     true              true            true
+2026-11-23 00:00:00 14:05:10          x       41     true              true            1
 
 1 row selected.
 ```
@@ -447,10 +462,8 @@ SELECT TO_CHAR(1234.5678, '9.9999EEEE') FROM dual;
 SELECT TO_CHAR(1994, 'RN') FROM dual;
 SELECT TO_CHAR(255, 'XXXX') FROM dual;
 SELECT TO_CHAR(DATE '2026-11-23', 'RM') FROM dual;
-SELECT TO_CHAR(TIMESTAMP '2026-11-23 14:05:09 +05:30', 'TZH:TZM') FROM dual;
 SELECT TO_DSINTERVAL('3 04:05:06') FROM dual;
 SELECT TO_YMINTERVAL('2-5') FROM dual;
-SELECT TO_TIMESTAMP_TZ('2026-11-23 14:05:09 +05:30', 'YYYY-MM-DD HH24:MI:SS TZH:TZM') FROM dual;
 SELECT TO_NUMBER('x' DEFAULT -1 ON CONVERSION ERROR) FROM dual;
 SELECT VALIDATE_CONVERSION('12' AS NUMBER) FROM dual;
 SELECT CAST('3 04:05:06' AS INTERVAL DAY TO SECOND) FROM dual;
@@ -468,12 +481,6 @@ ORA-01481: invalid number format model
 
 ERROR:
 ORA-01821: date format not recognized
-
-ERROR:
-ORA-01821: date format not recognized
-
-ERROR:
-ORA-00904: invalid identifier
 
 ERROR:
 ORA-00904: invalid identifier
@@ -536,6 +543,45 @@ false
 
 ERROR:
 ORA-01426: numeric overflow
+```
+
+### L. Time zones: TZH, TZM, TZR and TO_TIMESTAMP_TZ
+
+<!-- example: oracle -->
+```sql
+SELECT TO_CHAR(TIMESTAMP '2026-11-23 14:05:09.5 -03:30', 'HH24:MI:SS.FF3 TZH TZM TZR') AS elements,
+       TO_CHAR(TIMESTAMP '2026-11-23 14:05:09 -03:30') AS nls_default
+FROM dual;
+SELECT TO_CHAR(TO_TIMESTAMP_TZ('2026-11-23 14:05:09 +05:30', 'YYYY-MM-DD HH24:MI:SS TZH:TZM'), 'YYYY-MM-DD HH24:MI:SS TZH:TZM') AS with_offset,
+       TO_CHAR(TO_TIMESTAMP_TZ('2026-11-23 14:05:09', 'YYYY-MM-DD HH24:MI:SS'), 'YYYY-MM-DD HH24:MI:SS TZH:TZM') AS session_zone,
+       TO_CHAR(TO_TIMESTAMP_TZ('23-NOV-26 02.05.09.000000 PM -03:30'), 'HH24:MI TZH:TZM') AS nls_format
+FROM dual;
+SELECT TO_TIMESTAMP_TZ('2026-11-23 14:05:09 +02:60', 'YYYY-MM-DD HH24:MI:SS TZH:TZM') FROM dual;
+SELECT TO_CHAR(TIMESTAMP '2026-11-23 14:05:09', 'TZH:TZM') FROM dual;
+SELECT TO_CHAR(DATE '2026-11-23', 'TZR') FROM dual;
+```
+
+```text
+ELEMENTS                   NLS_DEFAULT
+-------------------------- -----------------------------------
+14:05:09.500 -03 30 -03:30 23-NOV-26 02.05.09.000000 PM -03:30
+
+1 row selected.
+
+WITH_OFFSET                SESSION_ZONE               NLS_FORMAT
+-------------------------- -------------------------- ------------
+2026-11-23 14:05:09 +05:30 2026-11-23 14:05:09 +00:00 14:05 -03:30
+
+1 row selected.
+
+ERROR:
+ORA-01875: time zone minute must be between -59 and 59
+
+ERROR:
+ORA-01821: date format not recognized
+
+ERROR:
+ORA-01821: date format not recognized
 ```
 
 ## See also
