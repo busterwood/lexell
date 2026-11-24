@@ -1481,3 +1481,40 @@ The gate, the lexdb tests (363), vrgen and loopgen (300 each) and run_native (1,
 Tests: tests/run/native_inline_drop, and native_inline_drop_dyn (the same in a dynamically linked
 program). They cover owned strings, literals, views, empty arrays, drops through drop glue, and a
 variable assigned again, over several chunks.
+
+## 36. SipHash: the hash table's cost, and rotates in place (built, measured, not kept)
+
+**The question.** Should `Map` use xxHash instead of SipHash-1-3? `lib/hash.lxl` explains why the
+default is keyed SipHash: Map is keyed by input (headers, JSON keys, ids, SQL values), and a
+hash whose collisions can be found without the key lets a sender make every insert scan the
+table. xxHash is not designed against that, so it would only be a choice for trusted keys
+(`newMapWith(fxHashStr)` already is one).
+
+**Where the time is.**
+
+- **lexdb, TPC-H q1-q22** (cycles sampled over the server): `sipKeyedStr` is 0.42%. `Map_probe` is
+  3.45%, mostly cache misses on the table, which the hash does not change.
+- **The compiler** hashes with `fxHashStr`.
+- **jq and json:** SipHash is not among their top functions.
+- **maps:** SipHash is 36% of the program, about 127 cycles a hash, against about 20 for its four
+  rounds (one block and three finalization rounds for a key of under 8 bytes). The hash is the
+  first read of each key's bytes. The 400,000 keys are spread over the heap, so the hash takes
+  the cache misses, as any hash would.
+
+**What was built.** In SipHash's rounds, `v1 = rotl(v1, 13) ^ v0` compiled to `mov rax, v1; rol rax;
+xor rax, v0; mov v1, rax`, and `v0 = rotl(v0, 32)` to three instructions. x64gen `rotIntoLocal`
+rotated the local in its own register and combined the other operand into it: `rol v1, 13; xor
+v1, v0`, and one `rol`.
+
+| measure (325e9991 against this; perfsuite on the a1c47b3c inputs, 4 placements, CPU 2) | instructions | cycles |
+|---|---:|---:|
+| maps | -10.57% | -0.68% |
+| run suite / compile suite | -0.53% / 0 | 0 / 0 |
+| apps regex / json / jq / cmark / decimal | 0 (cmark -0.07%) | level |
+| TPC-H SF1, server instructions per query (22) | -0.27% geomean | |
+| lexdb point select (icount6, 2 rounds) | -0.4% (162,755-162,777 against 163,411-163,431) | +3.6 to +4.2% (92.9-94.6K against 89.7-90.3K), branch misses +45 a statement |
+
+**Not kept.** The moves it removed were register-to-register, which Zen 4 does at rename with no
+latency. SipHash's speed is its dependency chain (add, rotate, xor) and the miss on the key, so
+the instructions fell and the cycles did not. Point selects took 4% more cycles from code that
+moved. The pass meets neither rule in HISTORY.md ("Judging a pass").
