@@ -35,6 +35,8 @@ import "./lexdb_like"
 import "./lexdb_access"
 import "./lexdb_store"
 import "./lexdb_catalog"
+import "./lexdb_nncon"
+import "./lexdb_nnalter"
 import "./lexdb_sql"
 import "./lexdb_plan"
 import "./lexdb_enum"
@@ -3809,6 +3811,7 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     // T-SQL's CLUSTERED and NONCLUSTERED: which key or index is the clustered one (a label: lexdb_catalog.clusterLabel)
     if len(clustered) > 0 { lexdb_catalog.setCluster(mut &t, &clustered) } else if s.pkCluster == 2 && len(t.pk) > 0 { lexdb_catalog.setCluster(mut &t, lexdb_catalog.CL_NONE) }
     for c in s.cons { if c.kind == lexdb_sql.C_FOREIGN { try lexdb_gen.checkConstraint(&t.cols, &c, s.mdialect, &lexdb_sql.baseName(&t.name)); try addConstraint(st, txn, mut &t, &c, false, s.mdialect) } }
+    try lexdb_nnalter.createNames(mut &t, &s.names)
     t.onCommit = s.onCommit
     if s.onCommit > lexdb_sql.ONC_PRESERVE { append(mut &txn.onCommit, key.clone()) }
     try txn.put(lexdb_catalog.CATALOG, &key, &(lexdb_catalog.encTable(&t)))
@@ -5129,6 +5132,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             for n in skipped { if len(a.name) > 0 && n == a.name { skip = true } }
             if skip { continue }
             let c = &a.cons[0]
+            if len(c.name) > 0 && lexdb_nnalter.colOfName(&t, &c.name) >= 0 { return Err(e("42710", &("constraint \"" + c.name + "\" for relation \"" + rel + "\" already exists"))) }
             if lexdb_gen.keyOnVirtual(&t.cols, c) {
                 return Err(e("0A000", "lexdb: a primary key or foreign key over a virtual column is made in CREATE TABLE (the row keeps its value)"))
             }
@@ -5216,6 +5220,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 return Err(e("23502", &("column \"" + a.col.name + "\" of relation \"" + rel + "\" contains null values")))
             }
             append(mut &t.cols, col)
+            if a.col.notNull && len(a.to) > 0 { try lexdb_nnalter.addColumnName(mut &t, &a.col.name, &a.to) }
             if a.col.genKind != lexdb_sql.GEN_NONE { try genSetup(mut &t, len(t.cols) - 1, s.mdialect) }
             if len(t.slots) > 0 {
                 append(mut &t.slots, t.width)
@@ -5260,6 +5265,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             let at = lexdb_bind.colIndex(&t.cols, &a.name)
             try fkDropColumn(st, txn, mut &t, &a.name, a.cascade)
             try dropOwnedSeqs(st, txn, &t, &a.name)
+            lexdb_nncon.drop(mut &t.invalid, &a.name)
             try dropColumn(txn, mut &t, at)
         } else if a.kind == lexdb_sql.A_RENAME {
             let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &a.name)
@@ -5274,6 +5280,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             }
             // its key's index keeps its name, as PostgreSQL's
             if lexdb_catalog.hasPk(&t) && len(t.pkName) == 0 { t.pkName = lexdb_catalog.pkConName(&t) }
+            lexdb_nnalter.beforeRenameTable(mut &t)
             txn.del(lexdb_catalog.CATALOG, &t.name)
             let old = t.name.clone()
             t.name = key.clone()
@@ -5299,6 +5306,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                     return Err(e(if s.mdialect == lexdb_sql.MD_ORA { "ORA00957" } else { "42701" },
                                  &("column \"" + a.to + "\" of relation \"" + rel + "\" already exists")))
                 }
+                lexdb_nnalter.renameColumn(mut &t, &a.name, &a.to)
                 t.cols[i].name = a.to.clone()
                 // a filtered index's predicate names its columns
                 for k in 0..len(t.indexes) {
@@ -5331,7 +5339,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                     if s.mdialect == lexdb_sql.MD_ORA { return Err(e("ORA02296", "cannot enable - null values found")) }
                     return Err(e("23502", &("column \"" + a.name + "\" of relation \"" + rel + "\" contains null values")))
                 }
-                t.cols[i].notNull = true
+                try lexdb_nnalter.setNotNull(mut &t, i, &a.to)
             } else if a.kind == lexdb_sql.A_SET_DEFAULT {
                 if t.cols[i].genKind != lexdb_sql.GEN_NONE {
                     return Err(lexdb_base.errDetail("42601", &("column \"" + a.name + "\" of relation \"" + rel + "\" is a generated column"), "", "Use ALTER TABLE ... ALTER COLUMN ... DROP EXPRESSION instead."))
@@ -5366,7 +5374,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 if t.cols[i].identity == lexdb_sql.ID_ALWAYS || t.cols[i].identity == lexdb_sql.ID_BY_DEFAULT {
                     return Err(e("42601", &("column \"" + a.name + "\" of relation \"" + rel + "\" is an identity column")))
                 }
-                t.cols[i].notNull = false
+                lexdb_nnalter.dropNotNull(mut &t, i)
             } else if a.kind == lexdb_sql.A_DROP_EXPR || a.kind == lexdb_sql.A_SET_EXPR {
                 // PostgreSQL's: a stored generated column made ordinary (its values stay), or given a new expression (its rows recomputed)
                 if t.cols[i].genKind == lexdb_sql.GEN_NONE {
@@ -5572,7 +5580,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
 type PkChange = record { changed: bool; nn: []str }
 
 // Whether name is taken among t's constraints, its key's among them.
-fn conTaken(t: &Table, name: &str): bool { return hasConName(t, name) || (lexdb_catalog.hasPk(t) && lexdb_catalog.pkConName(t) == name) }
+fn conTaken(t: &Table, name: &str): bool { return hasConName(t, name) || (lexdb_catalog.hasPk(t) && lexdb_catalog.pkConName(t) == name) || lexdb_nnalter.colOfName(t, name) >= 0 }
 
 // ADD [CONSTRAINT name] PRIMARY KEY (cols) | USING INDEX ix: t.pk made
 // those columns (NOT NULL), the hidden key's column dropped.
@@ -5778,6 +5786,7 @@ fn renameConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &T
     if !conTaken(t, from) { return Err(e("42704", &("constraint \"" + from + "\" for table \"" + rel + "\" does not exist"))) }
     if from == to { return Ok(Unit{}) }
     if conTaken(t, to) { return Err(e("42710", &("constraint \"" + to + "\" for relation \"" + rel + "\" already exists"))) }
+    if lexdb_nnalter.renameByName(t, from, to) { return Ok(Unit{}) }
     let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), to)
     for k in 0..len(t.invalid) {
         if t.invalid[k] == from { t.invalid[k] = to.toStr() }
@@ -5927,7 +5936,7 @@ fn pruneInvalid(t: mut &Table) {
             for c in t.checks { if c.name == on { there = true } }
             for f in t.fks { if f.name == on { there = true } }
         }
-        if there || strings.startsWith(&n, lexdb_catalog.CL_MARK) { append(mut &keep, n.clone()) }
+        if there || strings.startsWith(&n, lexdb_catalog.CL_MARK) || strings.startsWith(&n, lexdb_nncon.NN_MARK) { append(mut &keep, n.clone()) }
     }
     t.invalid = keep
 }
@@ -6474,7 +6483,7 @@ fn dropConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Tab
             return Ok(true)
         }
     }
-    return Ok(false)
+    return lexdb_nnalter.dropByName(t, name)
 }
 
 fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
@@ -17731,6 +17740,7 @@ fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
               lexdb_pg.shownIn(&snap.path, &sc, &nm) + "\t" + sc + "\t" + nm + "\n")
     }
     for c in snap.cons { b += &("c\t" + c.oid.toStr() + "\t" + lexdb_pg.clean(&c.def) + "\n") }
+    for c in snap.nns { b += &("c\t" + c.oid.toStr() + "\t" + lexdb_pg.clean(&c.def) + "\n") }
     lexdb_syscat.bind(&snap, mut &b)
     // the routines (has_function_privilege, HAS_PERMS_BY_NAME): ACL object, name's key, signature, owner, dialect, privilege a use needs
     for r in snap.routines {

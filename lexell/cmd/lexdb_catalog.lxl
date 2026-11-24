@@ -12,6 +12,7 @@ import "./lexdb_store"
 import "./lexdb_rows"
 import "./lexdb_access"
 import "./lexdb_sql"
+import "./lexdb_nncon"
 
 type Expr = lexdb_sql.Expr
 type Val = lexdb_sql.Val
@@ -139,6 +140,7 @@ pub type CatSnap = record {
     pub tabs: []CatTab
     pub views: []CatTab         // views (9.82): t.view their text, t.cols their columns
     pub cons: []CatCon
+    pub nns: []CatCon           // PostgreSQL 18's NOT NULL constraints (typ "n"): only the PostgreSQL door's catalogs list them (lexdb_nncon)
     pub seqs: []Seq
     pub schemas: []str          // public and those made
     pub path: []str
@@ -1629,7 +1631,7 @@ pub fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, parseExpr: &fn
     var seqs: []Seq = []
     for d in try allSeqs(st, txn, &"") { if !hiddenName(&d.key) { append(mut &seqs, seqCopy(&d)) } }
     let procs = try units(st, txn)
-    var snap = CatSnap{acls: newMap(), tabs: [], views: [], cons: [], seqs: seqs, schemas: schemas, path: copyStrs(&txn.sql.path),
+    var snap = CatSnap{acls: newMap(), tabs: [], views: [], cons: [], nns: [], seqs: seqs, schemas: schemas, path: copyStrs(&txn.sql.path),
                        user: st.memo.get(&userKey(txn.sql.sess)).unwrapOr("lexdb"), enums: try allEnums(st, txn), procs: procs,
                        ttypes: try allTabTypes(st, txn), routines: try allRoutines(st, txn)}
     var aclKeys: []str = []
@@ -1752,6 +1754,22 @@ pub fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, parseExpr: &fn
                                           schema: ct.schema.clone(), cols: ccols, refRel: 0, refCols: [], idx: 0,
                                           def: "CHECK (" + body + ")" + (if coff { " NOT ENFORCED" } else if cvalid { "" } else { " NOT VALID" }),
                                           upd: " ", del: " ", check: body, deferrable: false, deferred: false, valid: cvalid, enforced: !coff})
+        }
+        // PostgreSQL 18: each NOT NULL column has a constraint of its own (lexdb_nncon), after the others
+        var taken: []str = []
+        for ix in ct.idxs { if ix.con { append(mut &taken, ix.name.clone()) } }
+        for fk in ct.t.fks { append(mut &taken, fk.name.clone()) }
+        for ck in ct.t.checks { append(mut &taken, ck.name.clone()) }
+        let tbase = if len(ct.t.spell) > 0 { ct.t.spell.clone() } else { lexdb_sql.baseName(&ct.t.name) }
+        for i in 0..len(ct.t.cols) {
+            let col = &ct.t.cols[i]
+            if !col.notNull || col.name == ROWID { continue }
+            let nn = lexdb_nncon.nameOf(&ct.t.invalid, &tbase, col, &taken)
+            let lbl = if len(col.spell) > 0 { col.spell.clone() } else { col.name.clone() }
+            let q = quoteIfNeeded(&lbl)
+            append(mut &snap.nns, CatCon{oid: catOid(&"c", &(ct.key.clone() + "\x00" + nn)), name: nn, typ: "n", rel: ct.oid,
+                                         schema: ct.schema.clone(), cols: [i + 1], refRel: 0, refCols: [], idx: 0, def: "NOT NULL " + q,
+                                         upd: " ", del: " ", check: lbl + " IS NOT NULL", deferrable: false, deferred: false, valid: true, enforced: true})
         }
     }
     snap.cons = cons

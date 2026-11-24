@@ -3025,6 +3025,7 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
             c.name = n.clone()
             c.spell = p.spelled.clone()
             try p.colTypeOpt(mut &c)
+            var nnHere = ""             // the name this column's NOT NULL was given
             while true {
                 // CONSTRAINT name names the one after it (a UNIQUE's; the
                 // others' names are not kept)
@@ -3037,6 +3038,11 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
                 } else if p.acceptKw("not") {
                     try p.expectKw("null")
                     c.notNull = true
+                    if len(cn) > 0 {
+                        if len(nnHere) > 0 && nnHere != cn { return Err(lexdb_base.err("XX000", &("conflicting not-null constraint names \"" + nnHere + "\" and \"" + cn + "\""))) }
+                        if len(nnHere) == 0 { append(mut &nns, n.clone() + "\x00" + cn) }
+                        nnHere = cn.clone()
+                    }
                 } else if p.acceptKw("null") {
                 } else if p.acceptKw("primary") {
                     try p.expectKw("key")
@@ -3919,10 +3925,13 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
             }
             if !p.tsql && !p.ora && ((p.isKw("not") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "null") ||
                                      (p.isKw("constraint") && p.peekAt(2).kind == T_IDENT && p.peekAt(2).text == "not" && p.peekAt(3).kind == T_IDENT && p.peekAt(3).text == "null")) {
-                // PostgreSQL 18: ADD [CONSTRAINT n] NOT NULL c, SET NOT NULL's (its name not kept: nnCons)
-                if p.acceptKw("constraint") { let cn = try p.name() }
+                // PostgreSQL 18: ADD [CONSTRAINT n] NOT NULL c, SET NOT NULL's (its name in to: lexdb_nncon)
+                var cn = ""
+                if p.acceptKw("constraint") { cn = try p.name() }
                 p.pos += 2
-                append(mut &s.alters, lexdb_sql.alterOf(A_SET_NOT_NULL, &(try p.name())))
+                var nn = lexdb_sql.alterOf(A_SET_NOT_NULL, &(try p.name()))
+                nn.to = cn
+                append(mut &s.alters, nn)
                 if !p.acceptKw(",") { break }
                 continue
             }
@@ -3968,6 +3977,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 } else if p.acceptKw("not") {
                     try p.expectKw("null")
                     a.col.notNull = true
+                    a.to = cn.clone()
                 } else if p.acceptKw("null") {
                 } else if p.acceptKw("generated") {
                     try p.identity(mut &a.col, mut &s)
@@ -10003,9 +10013,9 @@ fn (p: mut &P) oraGroupAll(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     return Ok(Unit{})
 }
 
-// PostgreSQL 18's NOT NULL table constraints (nns: "column\x00name", "" no name) on s's columns: NOT NULL; 42703 for a column
-// not there, 42601 for two names of one column. (Their names are not kept: lexdb's catalogs list no NOT NULL constraints,
-// design/lexdb-new-features.md P7.)
+// PostgreSQL 18's NOT NULL constraints with a name (nns: "column\x00name", "" no name; a table constraint's, and a column's CONSTRAINT n
+// NOT NULL) on s's columns: NOT NULL; 42703 for a column not there, 42601 for two names of one column. The names are kept in s.names
+// (the same entries, a column's once: CREATE TABLE has no other use for it; lexdb_nncon, design/lexdb-new-features.md P7).
 fn nnCons(s: mut &Stmt, nns: &[]str): Result[Unit, lexdb_base.DbErr] {
     for k in 0..len(nns) {
         let z = strings.indexOf(&nns[k], "\x00", 0)
@@ -10023,6 +10033,7 @@ fn nnCons(s: mut &Stmt, nns: &[]str): Result[Unit, lexdb_base.DbErr] {
         if !found {
             return Err(lexdb_base.err("42703", &("column \"" + c + "\" of relation \"" + lexdb_sql.baseName(&s.table) + "\" does not exist")))
         }
+        if len(n) > 0 && !lexdb_base.hasStr(&s.names, &nns[k]) { append(mut &s.names, nns[k].clone()) }
     }
     return Ok(Unit{})
 }
