@@ -37,7 +37,10 @@ pub const PK_F8: byte = 11      // 8 bytes: a double's bits
 pub const PK_F4: byte = 12      // 4 bytes: a real's bits
 pub const PK_UUID: byte = 13    // variable: its 16 bytes
 pub const PK_BYTEA: byte = 14   // variable: its bytes
-pub const PK_TSZ: byte = 16     // variable: a timestamp that keeps its offset (Val.Tsz), 10 bytes: the instant and the offset in minutes
+// A timestamp that keeps its offset (Val.Tsz; lexdb_sql.isTszType) is a variable place of the uuid's kind, 10 bytes (the instant
+// and the offset in minutes) where a uuid has 16: a kind of its own would cost the row codec's tests on the point path a few
+// instructions (isVarKind's comparisons no longer a bit test).
+pub const PK_TSZ: byte = PK_UUID
 
 // A row's stored form: per column a tag (0 NULL, 1 int, 2 bool, 3 numeric,
 // 4 text) and its value. A row with a text of LONG bytes or more begins with
@@ -100,7 +103,6 @@ pub fn placeKinds(r: &Rows): []byte {
 pub fn placeKind(c: &lexdb_sql.ColDef): byte {
     if c.genKind == lexdb_sql.GEN_VIRTUAL { return PK_NONE }
     let o = c.typ.oid
-    if lexdb_sql.isTszType(&c.typ) { return PK_TSZ }
     var k = PK_TEXT
     if o == lexdb_sql.OID_INT8 { k = PK_INT }
     else if o == lexdb_sql.OID_INT4 { k = PK_INT4 }
@@ -110,7 +112,7 @@ pub fn placeKind(c: &lexdb_sql.ColDef): byte {
     else if o == lexdb_sql.OID_DATE { k = PK_DATE }
     else if o == lexdb_sql.OID_TIME { k = PK_TIME }
     else if o == lexdb_sql.OID_TS { k = PK_TS }
-    else if o == lexdb_sql.OID_TSTZ { k = PK_TSTZ }
+    else if o == lexdb_sql.OID_TSTZ { k = if c.typ.len == lexdb_sql.TSZ_LEN || c.typ.len == lexdb_sql.TSZ_TSQL { PK_TSZ } else { PK_TSTZ } }
     else if o == lexdb_sql.OID_FLOAT8 { k = PK_F8 }
     else if o == lexdb_sql.OID_FLOAT4 { k = PK_F4 }
     else if o == lexdb_sql.OID_UUID { k = PK_UUID }
@@ -133,7 +135,7 @@ pub fn isIntKind(k: byte): bool { return k == PK_INT || k == PK_INT4 || k == PK_
 pub fn isWordKind(k: byte): bool { return isIntKind(k) || (k >= PK_DATE && k <= PK_F4) }
 
 // A place holding a variable-length value: its end in the fixed part.
-pub fn isVarKind(k: byte): bool { return k == PK_NUM || k == PK_TEXT || k == PK_UUID || k == PK_BYTEA || k == PK_TSZ }
+pub fn isVarKind(k: byte): bool { return k == PK_NUM || k == PK_TEXT || k == PK_UUID || k == PK_BYTEA }
 
 // The word of v for a place of word kind k; None: v is not of k's kind, or
 // does not fit its width.
@@ -216,11 +218,8 @@ fn tszBytes(u: int, o: int): str {
 pub fn varVal(k: byte, s: &str, a: int, b: int): Result[Val, DbErr] {
     if k == PK_TEXT { return Ok(Val.Text(s[a..b].clone())) }
     if k == PK_BYTEA { return Ok(Val.Bytes(s[a..b].clone())) }
-    if k == PK_TSZ {
-        if b - a != 10 { return Err(lexdb_base.corrupt("a timestamp with a time zone in a row")) }
-        return Ok(Val.Tsz(binary.readI64LEStr(s, a), binary.readI16LEStr(s, a + 8)))
-    }
     if k == PK_UUID {
+        if b - a == 10 { return tszVal(s, a, b) }
         if b - a != 16 { return Err(lexdb_base.corrupt("a uuid value in a row")) }
         return Ok(Val.Uuid(uuidText(&s[a..b])))
     }
@@ -228,6 +227,12 @@ pub fn varVal(k: byte, s: &str, a: int, b: int): Result[Val, DbErr] {
         Ok(d) { return Ok(Val.Num(d)) }
         Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
     }
+}
+
+// A timestamp with its offset at s[a..b] (10 bytes): the instant, the offset in minutes.
+fn tszVal(s: &str, a: int, b: int): Result[Val, DbErr] {
+    if b - a != 10 { return Err(lexdb_base.corrupt("a timestamp with a time zone in a row")) }
+    return Ok(Val.Tsz(binary.readI64LEStr(s, a), binary.readI16LEStr(s, a + 8)))
 }
 
 // Whether integer v fits a place of kind k.

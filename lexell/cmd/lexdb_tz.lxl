@@ -49,13 +49,40 @@ pub fn textPg(us: int, off: int): str {
     return lexdb_time.fmtTstz(us, &z)
 }
 
+// Whether a text that ends with a numeric offset writes it +hh:mm or -hh:mm.
+fn offsetShapeOk(s: &str): bool {
+    let t = strings.trim(s)
+    var i = len(t) - 1
+    while i > 10 && t[i] != '+' && t[i] != '-' && t[i] != ' ' && t[i] != ':' { i -= 1 }
+    // a ':' before the sign, or digits after one that is not the date's own, make the tail an offset
+    var j = len(t) - 1
+    while j > 10 && t[j] != '+' && t[j] != '-' { j -= 1 }
+    if j <= 10 { return true }
+    let tail = t[j + 1..len(t)]
+    if len(tail) == 0 { return true }
+    if tail[0] < '0' || tail[0] > '9' { return true }
+    return len(tail) == 5 && tail[2] == ':'
+}
+
 // ---- conversions to a column that keeps the offset
 
 // v made a timestamp with its offset (precision p: fractional digits), in session zone z: a text is read with the offset it
 // carries (the session's where it has none), a timestamp or date as local time in z, a timestamptz as its instant seen in z.
-pub fn coerceTsz(v: &Val, p: int, z: &lexdb_time.Zone): Result[Val, lexdb_base.DbErr] {
+pub fn coerceTsz(v: &Val, p: int, z: &lexdb_time.Zone, tsql: bool): Result[Val, lexdb_base.DbErr] {
     match v {
         Val.Text(s) {
+            if tsql {
+                // SQL Server's datetimeoffset: an offset written +hh:mm (not +h, +hh, +hhmm), 14 hours at most; any bad text is 241
+                let bad = lexdb_base.err("TS241", "Conversion failed when converting date and/or time from character string.")
+                if !offsetShapeOk(&s) { return Err(bad) }
+                match lexdb_time.parseTsz(&s, z) {
+                    Ok(r) {
+                        if r.off > 840 || r.off < -840 { return Err(bad) }
+                        return Ok(Val.Tsz(lexdb_time.roundUs(r.us, p), r.off))
+                    }
+                    Err(_) { return Err(bad) }
+                }
+            }
             let r = try lexdb_time.parseTsz(&s, z)
             return Ok(Val.Tsz(lexdb_time.roundUs(r.us, p), r.off))
         }
