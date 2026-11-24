@@ -1,7 +1,8 @@
 # Known issues
 
-Bugs and gaps found while writing and checking these pages (lexdb built from main at 4fba817b, 2026-11-23). They
-are not fixed here: the pages describe what lexdb does. Each "Differences" section of the reference lists the
+Bugs and gaps found while writing and checking these pages (lexdb built from main at 4fba817b, 2026-11-23; the entries
+that main ca687450, 2026-11-24, fixed are removed or reworded to what is left). They are not fixed here: the pages
+describe what lexdb does. Each "Differences" section of the reference lists the
 smaller differences of its statement.
 
 ## All doors
@@ -12,11 +13,6 @@ smaller differences of its statement.
   - Oracle door: `CREATE GLOBAL TEMPORARY TABLE` on a replica is ORA-16000, as on a standby, and DML on a global
     temporary table is not available there: Active Data Guard allows it for a table the primary defined, but in
     lexdb no such definition reaches a replica's session (see the Oracle door's entry below).
-- **Wrong arithmetic: an integer plus a decimal quotient of a variable gives an integer.** In the SQL Server door,
-  `DECLARE @p decimal(5,2) = 10; SELECT 1 + @p / 100` gives 1 (`@p / 100` alone gives 0.1000...), so `UPDATE t SET
-  salary = salary * (1 + @p / 100)` reports its rows and changes nothing. In the PostgreSQL door the same happens in
-  a `LANGUAGE sql` procedure body with a numeric parameter (`1 + p / 100` gives 1), while a function body or a query
-  gives 1.1. The two look like one bug in how a parameter's or variable's quotient is typed under `+`.
 
 
 ## PostgreSQL door
@@ -35,11 +31,11 @@ smaller differences of its statement.
   - A subquery in `LIMIT` is 0A000.
   - `FOR UPDATE` with `FETCH ... WITH TIES` is 0A000.
   - `json_agg`, `corr`, `regr_slope`, `covar_pop` and the other statistics aggregates do not exist (42883).
-  - `VALUES (1), (true)` gives 42804 with a vaguer message than PostgreSQL's (`VALUES types integer and boolean
-    cannot be matched`).
 - **WITH:**
-  - `LIMIT` does not stop a recursive query: `WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r)
-    SELECT * FROM r LIMIT 3` runs to 54001 after `max_recursion` rounds (PostgreSQL returns 3 rows).
+  - `LIMIT` stops a recursive query only when the statement is a plain `SELECT` of it with a constant `LIMIT`. With a
+    `WHERE`, a join, grouping, `DISTINCT`, `ORDER BY` or an outer query block, `WITH RECURSIVE r(n) AS (SELECT 1 UNION
+    ALL SELECT n + 1 FROM r) SELECT * FROM r WHERE n > 0 LIMIT 3` still runs to 54001 after `max_recursion` rounds
+    (PostgreSQL returns 3 rows).
   - The recursive term's checks are missing: an aggregate, a window function, `ORDER BY`, or the CTE on the nullable
     side of an outer join is not refused (PostgreSQL: 42P19 or 0A000), and the query runs to 54001.
   - Under `RECURSIVE` a CTE cannot name a later one (`relation "a2" does not exist`).
@@ -52,8 +48,6 @@ smaller differences of its statement.
 - **TRUNCATE:** the foreign key refusal carries its DETAIL and HINT in the message text, and `TRUNCATE ... CASCADE`
   gives no NOTICE naming the tables it adds.
 - **Tables** (found writing the DDL pages):
-  - Two column-level primary keys are not refused: `CREATE TABLE t (a int PRIMARY KEY, b int PRIMARY KEY)` makes
-    one key on (a, b) (PostgreSQL: 42P16).
   - `ALTER TABLE | VIEW | SEQUENCE ... OWNER TO postgres` is `role "postgres" does not exist`, though `current_user`
     is `postgres` and `pg_roles` lists it. `OWNER TO` a role made with `CREATE ROLE` works.
   - `COMMENT ON` is a syntax error.
@@ -75,9 +69,8 @@ smaller differences of its statement.
   - `CREATE OR REPLACE VIEW` with columns renamed or reordered says `cannot drop columns from view` (PostgreSQL:
     `cannot change name of view column ...`).
   - `CREATE RECURSIVE VIEW` and `ALTER VIEW v RENAME COLUMN` are syntax errors.
-- **Sequences:** `DROP SEQUENCE s` succeeds while a column default calls `nextval('s')`, and the next insert fails
-  with `relation "s" does not exist` (PostgreSQL: 2BP01). `DROP SEQUENCE t` of a table is 42P01 `sequence "t" does
-  not exist` (PostgreSQL: 42809 `"t" is not a sequence`).
+- **Sequences:** `DROP SEQUENCE t` of a table is 42P01 `sequence "t" does not exist` (PostgreSQL: 42809 `"t" is not a
+  sequence`).
 - **Indexes:**
   - `DROP INDEX t_pkey` is 42704 `index "t_pkey" does not exist`, though `pg_indexes` lists it and `ALTER INDEX
     t_pkey RENAME` works (PostgreSQL: 2BP01, the index belongs to a constraint).
@@ -133,9 +126,6 @@ smaller differences of its statement.
   - `GRANT MAINTAIN` is accepted and not kept. Column privileges, `WITH GRANT OPTION`, `WITH ADMIN OPTION` and
     privileges on types are 0A000.
 - **SQL functions and procedures** (found writing the routine pages):
-  - **Wrong arithmetic in a procedure body:** in a `LANGUAGE sql` procedure, `1 + p / 100` with a numeric parameter
-    `p = 10` gives 1, as if the division were of integers, so `SET salary = salary * (1 + p / 100)` changes nothing.
-    The same expression in a function body or a query gives 1.1; `p / 100` alone is right.
   - Overloads: with `add(int, int)` and `add(numeric, numeric)`, `SELECT add(2, 3)` calls the numeric one
     (PostgreSQL: the integer one).
   - A call's result column is named after its type or expression (`numeric`, `int4`, `?column?`), not after the
@@ -151,12 +141,13 @@ smaller differences of its statement.
 - **COPY:** `WITH (FORMAT binary)` is 0A000; once, after a COPY error at the end of a psql script, the session gave
   no answer for 120 s (not narrowed down).
 - **Data types** (found writing the type pages):
-  - **Integer constant arithmetic does not overflow:** `2147483647::int + 1` gives 2147483648 (and
-    `32767::smallint + 1::smallint` 32768), while `pg_typeof` says integer. On a column it is 22003, as in PostgreSQL.
-  - **Enums compare as text outside `WHERE` and `ORDER BY`:** with `mood ('sad','ok','happy')`, `SELECT 'ok'::mood <
-    'happy'::mood` gives f; `min`, `max` and `greatest` of enums go by the labels' text. `'angry'::mood` is accepted
-    for a label that does not exist (an `INSERT` of it is 22P02).
-  - `INTERVAL '1' DAY` reads `day` as an alias (one second); `INTERVAL '1-2' YEAR TO MONTH` is 42601.
+  - **Bare integer constants do not overflow:** `SELECT 2147483647 + 1` gives 2147483648 (PostgreSQL: 22003). With a
+    cast in the expression (`2147483647::int + 1`, `32767::smallint + 1::smallint`) and on a column it is 22003, as in
+    PostgreSQL; PostgreSQL also folds a constant expression when it plans, so `2147483647::int + 1` from a table
+    `WHERE false` raises there and gives no rows here.
+  - **Enums are still ordered as text in four places:** `min` and `max` as window functions, the `ORDER BY` inside
+    an aggregate (`array_agg(m ORDER BY m)`), a set operation's `ORDER BY`, and arrays (`ARRAY['ok'::mood]` is an array
+    of text). Elsewhere they follow the list and a string that is not a label is 22P02.
   - `'alice'::regrole` is looked up as a function (42883); `pg_proc` holds only the user's functions, so
     `'now'::regproc` is 42883; `regprocedure` leaves out the argument types.
   - `pg_typeof` says text for `oid`, `regclass`, `regtype`, `name` and `pg_class.relname`.
@@ -173,8 +164,9 @@ smaller differences of its statement.
   - Arrays: `integer ARRAY`, `SET a[2] = ...`, slices (`a[2:3]`), `ARRAY[[1,2],[3,4]]` are 42601; more than one
     dimension is 0A000; `'[0:2]={...}'` is 22P02; `a[1]` is named `#elem`; `ARRAY[1, 'x']` is accepted;
     `'1 2'::int2vector` prints `{1,2}`.
-  - Mixed types are not checked in `CASE`, `UNION` and `coalesce` (`coalesce(1, true)` gives 1; PostgreSQL: 42804).
-  - `1 = 'a'` is 42883 `operator does not exist` (PostgreSQL: 22P02).
+  - Some mixed types are still not refused: `true AND 1` gives an empty row, `ARRAY[1, true]` gives `{1,t}` and `1 IN
+    (1, true)` is taken (`NOT 1` is refused with a shorter message). `CASE`, `coalesce`, `UNION`, `VALUES` and a text
+    beside a number are checked.
   - Some casts' columns are named differently: `(-2.5)::int` is `?column?`, `42::oid` is `integer`.
 - **Scalar functions** (found writing the function pages):
   - Regular expressions are RE2's: no back references (`'aa' ~ '(a)\1'` is 2201B) and no lookaround; the error
@@ -269,19 +261,22 @@ smaller differences of its statement.
     mismatch is 102 (SQL Server: 205); updating an identity column is 544 (SQL Server: 8102).
   - `DATALENGTH` of a `char(7)` value is 14 (SQL Server: 7).
 - **Tables, indexes, views and sequences** (found writing the T-SQL DDL pages):
-  - **`CLUSTERED` and `NONCLUSTERED` are refused everywhere** (102): `PRIMARY KEY CLUSTERED (id)`, `CREATE
-    NONCLUSTERED INDEX`. Most scripts SSMS generates use them.
-  - `DROP INDEX ix ON dbo.t`, SQL Server's usual form, is 156; `DROP INDEX t.ix` is 50000; only `DROP INDEX ix` and
-    `DROP INDEX dbo.ix` work, one at a time.
+  - **`CLUSTERED` and `NONCLUSTERED` are labels:** the rows stay in primary-key order. Two `CLUSTERED` keys in one
+    `CREATE TABLE` are taken (SQL Server: 1902; the later one is shown as the clustered index), and a second primary
+    key by `ALTER TABLE ... ADD CONSTRAINT` is 50000 (SQL Server: 8110).
+  - Constraint names that were not given still differ: `emp_pkey`, `emp_name_key`, `emp_dept_id_fkey` where SQL Server
+    generates `PK__emp__3213E83F...`.
+  - `DROP INDEX ix ON dbo.t` works. `DROP INDEX t.ix` is 50000, a list of indexes is 102, and the index of a primary
+    key or unique constraint is not found (SQL Server: 3723).
   - `ALTER TABLE t ADD CONSTRAINT df DEFAULT 0 FOR col` is 102; a DEFAULT constraint's own name is not kept (it shows
     as `DF_table_col`), and `DROP CONSTRAINT` finds it by neither name.
   - `ALTER TABLE` takes one action per statement (`ADD b int, c int` is 50000), and refuses `WITH CHECK ADD`, `WITH
     NOCHECK ADD`, `NOCHECK CONSTRAINT`, `CHECK CONSTRAINT`, `SET (LOCK_ESCALATION = ...)`, `SWITCH`, `REBUILD` and
     `DISABLE TRIGGER` (50000).
   - A column-level `CONSTRAINT fk FOREIGN KEY REFERENCES t (c)` is 102 (without `FOREIGN KEY` it works).
-  - Storage and index options are syntax errors: `ON [PRIMARY]`, `TEXTIMAGE_ON`, `WITH (DATA_COMPRESSION = ...)`,
-    `WITH (FILLFACTOR = ...)`, `WITH (ONLINE = ON)`; so are `ROWGUIDCOL`, `SPARSE`, `FILESTREAM`, `MASKED WITH`, `NOT
-    FOR REPLICATION`, `GENERATED ALWAYS AS ROW START`, `PRIMARY KEY (a DESC)` and an inline `INDEX ix (c)`.
+  - `ON [PRIMARY]`, `TEXTIMAGE_ON`, `WITH (...)` index and table options and `ASC` / `DESC` in a key are read and not
+    kept. Still syntax errors: `ROWGUIDCOL`, `SPARSE`, `FILESTREAM`, `MASKED WITH`, `NOT FOR REPLICATION`, `GENERATED
+    ALWAYS AS ROW START` and an inline `INDEX ix (c)`.
   - A `rowversion` (`timestamp`) column is never filled in (NULL).
   - A table with two `IDENTITY` columns is accepted (SQL Server: 2744).
   - `##g` is a session-private temporary table, as `#g` is.
@@ -293,7 +288,7 @@ smaller differences of its statement.
     in its batch (SQL Server: 111); `DROP TABLE` of a table a view reads and `DROP VIEW` of a view another view reads
     are refused (50000; SQL Server allows both).
   - `DROP TABLE` of a table a foreign key refers to is 50000 (SQL Server: 3726). A sequence a column `DEFAULT` uses
-    can be dropped, and the next `INSERT` fails with 208 (SQL Server refuses the drop: 3729).
+    is refused with 50000 and PostgreSQL's text (SQL Server: 3729).
   - Sequences: `NO CACHE` is 102; `AS decimal(10,0)` is 50000; without `AS` and `START WITH` a sequence starts at 1
     (SQL Server: a bigint from its minimum); `NEXT VALUE FOR s` twice in one row gives two values (SQL Server: the
     same); `NEXT VALUE FOR s OVER (...)` is 102; `sp_sequence_get_range` is 2812; past `MAXVALUE` the error is 50000
@@ -317,17 +312,11 @@ smaller differences of its statement.
     `DECLARE c CURSOR FOR`) are 50000 and 102.
   - With `XACT_ABORT ON`, a failed `UPDATE` inside `BEGIN TRY` sends `(0 rows affected)` before the `CATCH` output.
 - **Control of flow** (found writing those T-SQL pages):
-  - **`RAISERROR('fatal', 20, 1)` hangs the session**: it never answers again. SQL Server ends the connection (and
-    wants `WITH LOG` above severity 18). lexdb treats severities up to 19 as 16.
-  - **A stale `CATCH` after a rethrow:** after a batch whose inner `CATCH` prints `ERROR_MESSAGE()` and rethrows with
-    `THROW`, a later batch's `BEGIN TRY SELECT * FROM dbo.nothere; END TRY BEGIN CATCH ... END CATCH` gives Msg 208
-    and then runs its `CATCH` with the old error (50000, 'inner failure'). Without the earlier batch, 208 ends the
-    batch and the `CATCH` does not run (try-catch.md, example G).
   - A failed statement inside `BEGIN TRY` sends `(0 rows affected)` before the `CATCH` output.
   - `BREAK` or `CONTINUE` outside a loop is accepted (SQL Server: 135).
   - `RAISERROR` reads and ignores a placeholder's width, precision and flags (`%5d`, `%-6s`); `%o` prints decimal;
-    `RAISERROR(50005, 16, 1)` gives Msg 50000 with the text "50005" (no `sys.messages`); `WITH LOG`, `NOWAIT` and
-    `SETERROR` do nothing.
+    `RAISERROR(50005, 16, 1)` gives Msg 50000 with the text "50005" (no `sys.messages`); `WITH LOG` writes no log and
+    `NOWAIT` changes nothing.
   - `THROW 49999, 'too low', 1` is accepted (SQL Server: 35100).
   - `EXECUTE AS USER = 'dbo'` is 2812 (`Could not find stored procedure 'as'`); `EXEC ('...') AT linked` is 102;
     `GOTO` and `WAITFOR` are 102.
@@ -454,13 +443,14 @@ smaller differences of its statement.
 - **Tables, users and PL/SQL** (found writing the Oracle DDL and PL/SQL pages):
   - `CREATE TABLE`: `INTERVAL` columns, `INVISIBLE`, `TABLESPACE`, storage clauses, `PARTITION BY`,
     `ORGANIZATION INDEX`, `DEFERRABLE` and `ENABLE`/`VALIDATE` on a constraint are ORA-00900;
-    `GENERATED BY DEFAULT ON NULL AS IDENTITY` does not fill a NULL key (ORA-01400); two column-level `PRIMARY KEY`s are
-    not refused; `USER_TAB_COLUMNS` shows a `RAW` as `BLOB` and a `TIMESTAMP WITH LOCAL TIME ZONE` as `TIMESTAMP(6) WITH
-    TIME ZONE`.
+    `GENERATED BY DEFAULT ON NULL AS IDENTITY` does not fill a NULL key (ORA-01400); `USER_TAB_COLUMNS` shows a
+    `RAW` as `BLOB` and a `TIMESTAMP WITH LOCAL TIME ZONE` as `TIMESTAMP(6) WITH TIME ZONE`.
   - Views are read-only (`INSERT`, `UPDATE`, `DELETE` through a view are ORA-03001); `WITH READ ONLY` and `WITH CHECK
     OPTION` are refused; a view another view reads cannot be dropped (ORA-02449).
   - `ALTER TABLE ... DISABLE CONSTRAINT`, `READ ONLY` and `ALTER INDEX ... REBUILD` are ORA-03001; `COMMIT COMMENT` and
     `COMMIT WRITE` are ORA-00900; `COMMENT ON` does not keep the comment and accepts a missing table.
+  - `DROP SEQUENCE` of a sequence a column `DEFAULT s.NEXTVAL` uses is refused with ORA-02449 (`unique/primary keys in
+    table referenced by foreign keys`: the message of another error; not checked whether Oracle refuses it).
   - Sequences: past `MAXVALUE` the error is ORA-20000 (Oracle ORA-08004); `CURRVAL` before `NEXTVAL` is ORA-20000
     (ORA-08002); `ALTER SEQUENCE ... START WITH` is accepted and does nothing; `SESSION` and `SCALE` sequences are ORA-00900.
   - Users: `ALL_USERS` and `DBA_USERS` list only users that can log in (granted `CREATE SESSION`); `ACCOUNT LOCK` removes a
