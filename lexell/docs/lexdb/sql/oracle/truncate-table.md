@@ -36,8 +36,9 @@ TRUNCATE TABLE [ schema. ] table [ CASCADE ]
   LOG` are not supported (ORA-00900), nor is `TRUNCATE CLUSTER`.
 - `CASCADE` empties the tables with a foreign key to the table, whether or not the key is `ON DELETE CASCADE`.
   Oracle's `CASCADE` follows only keys declared `ON DELETE CASCADE`.
-- The table is found in the current schema. The tables that the login `SA` makes are in `PUBLIC`: `TRUNCATE TABLE
-  public.emp` works and `sa.emp` is ORA-00942. A table made in another user's schema is named `user.table`.
+- The table is found in the current schema (the login's own, or the one `ALTER SESSION SET CURRENT_SCHEMA` set), then
+  in `public`, the PostgreSQL door's schema. `TRUNCATE TABLE sa.emp` works for a table that `SA` made, and
+  `public.emp` for one the PostgreSQL door made. A table made in another user's schema is named `user.table`.
 
 ## Examples
 
