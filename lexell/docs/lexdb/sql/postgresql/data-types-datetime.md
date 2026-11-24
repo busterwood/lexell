@@ -73,7 +73,7 @@ fields ::=
 - Dates are read in ISO order only: `'01/03/2026'`, `'20260301'` and `'March 1, 2026'` are 22007 (PostgreSQL reads
   them by `DateStyle`). `SET DateStyle` and `SET IntervalStyle` are accepted and change nothing.
 - `'infinity'::interval` and `'allballs'::time` are not read. `INTERVAL(3) '1' SECOND` (the precision before the
-  string) is accepted and gives one second (PostgreSQL: a syntax error).
+  string) and `INTERVAL SECOND '1'` are syntax errors (42601), as in PostgreSQL: the field comes after the string.
 - A cast's result column is named after the source type in some cases (`TIMESTAMP '...'::timestamptz` is named
   `timestamp`).
 
@@ -251,6 +251,8 @@ SELECT '2026-02-30'::date;
 SELECT '01/03/2026'::date;
 SELECT '10:30'::timetz;
 SELECT INTERVAL '1 2' YEAR TO MONTH;
+SELECT INTERVAL(3) '1' SECOND;
+SELECT INTERVAL SECOND '1';
 ```
 
 ```text
@@ -258,6 +260,8 @@ ERROR:  date/time field value out of range: "2026-02-30"
 ERROR:  invalid input syntax for type date: "01/03/2026"
 ERROR:  lexdb: time with time zone is not supported (use timestamptz)
 ERROR:  invalid input syntax for type interval: "1 2"
+ERROR:  syntax error at or near "second"
+ERROR:  syntax error at or near "second"
 ```
 
 ## See also
