@@ -1,7 +1,7 @@
 # Known issues
 
 Bugs and gaps found while writing and checking these pages (lexdb built from main at 4fba817b, 2026-11-23; the entries
-that main ca687450, 2026-11-24, fixed are removed or reworded to what is left). They are not fixed here: the pages
+that main ca687450 and a15b9a64, 2026-11-24, fixed are removed or reworded to what is left). They are not fixed here: the pages
 describe what lexdb does. Each "Differences" section of the reference lists the
 smaller differences of its statement.
 
@@ -14,6 +14,9 @@ smaller differences of its statement.
     temporary table is not available there: Active Data Guard allows it for a table the primary defined, but in
     lexdb no such definition reaches a replica's session (see the Oracle door's entry below).
 
+- **MERGE reads its own changes.** A subquery in a `WHEN` clause of `MERGE` sees the rows the statement has already
+  changed, where `UPDATE` and `DELETE` now read the table as the statement found it (Oracle door, checked: a chain of
+  managers doubles a salary the same `MERGE` has just changed). Planned in design/lexdb-robust.md, "MERGE's subqueries".
 
 ## PostgreSQL door
 
@@ -128,8 +131,6 @@ smaller differences of its statement.
 - **SQL functions and procedures** (found writing the routine pages):
   - Overloads: with `add(int, int)` and `add(numeric, numeric)`, `SELECT add(2, 3)` calls the numeric one
     (PostgreSQL: the integer one).
-  - A call's result column is named after its type or expression (`numeric`, `int4`, `?column?`), not after the
-    function.
   - 0A000 or 42883 in a query: a function whose body reads tables given a column or subquery as an argument; a
     function with several OUT parameters; a function whose body writes; a set-returning function in the select
     list; named arguments (`CALL` takes them); calling a VARIADIC function.
@@ -261,9 +262,7 @@ smaller differences of its statement.
     mismatch is 102 (SQL Server: 205); updating an identity column is 544 (SQL Server: 8102).
   - `DATALENGTH` of a `char(7)` value is 14 (SQL Server: 7).
 - **Tables, indexes, views and sequences** (found writing the T-SQL DDL pages):
-  - **`CLUSTERED` and `NONCLUSTERED` are labels:** the rows stay in primary-key order. Two `CLUSTERED` keys in one
-    `CREATE TABLE` are taken (SQL Server: 1902; the later one is shown as the clustered index), and a second primary
-    key by `ALTER TABLE ... ADD CONSTRAINT` is 50000 (SQL Server: 8110).
+  - **`CLUSTERED` and `NONCLUSTERED` are labels:** the rows stay in primary-key order.
   - Constraint names that were not given still differ: `emp_pkey`, `emp_name_key`, `emp_dept_id_fkey` where SQL Server
     generates `PK__emp__3213E83F...`.
   - `DROP INDEX ix ON dbo.t` works. `DROP INDEX t.ix` is 50000, a list of indexes is 102, and the index of a primary
@@ -287,8 +286,7 @@ smaller differences of its statement.
   - Views: `WITH SCHEMABINDING`, `WITH ENCRYPTION` and `WITH CHECK OPTION` are 50000; `CREATE VIEW` need not be first
     in its batch (SQL Server: 111); `DROP TABLE` of a table a view reads and `DROP VIEW` of a view another view reads
     are refused (50000; SQL Server allows both).
-  - `DROP TABLE` of a table a foreign key refers to is 50000 (SQL Server: 3726). A sequence a column `DEFAULT` uses
-    is refused with 50000 and PostgreSQL's text (SQL Server: 3729).
+  - `DROP TABLE` of a table a foreign key refers to is 50000 (SQL Server: 3726).
   - Sequences: `NO CACHE` is 102; `AS decimal(10,0)` is 50000; without `AS` and `START WITH` a sequence starts at 1
     (SQL Server: a bigint from its minimum); `NEXT VALUE FOR s` twice in one row gives two values (SQL Server: the
     same); `NEXT VALUE FOR s OVER (...)` is 102; `sp_sequence_get_range` is 2812; past `MAXVALUE` the error is 50000
@@ -360,33 +358,31 @@ smaller differences of its statement.
 
 
 - **Data types, functions and catalog** (found writing the T-SQL phase 3 pages):
-  - **Hangs:** `REGEXP_REPLACE('abc', 'b')` (two arguments) never answers; give `''` as the third argument.
-  - **Binary:** hexadecimal literals are numbers (`SELECT 0x4142` is 16706; `CAST(0x4142 AS varbinary(10))` is
-    50000); `CAST(varbinary AS varchar)` and `CONVERT(..., 1 | 2)` give `\x4142`; `LEN` of a binary value is 0,
-    `SUBSTRING` and `LEFT` work on that hex text; `binary(n)` is not padded and a longer value into `varbinary(n)`
-    is kept; `HASHBYTES` does not exist.
-  - **Ranges and casts:** `tinyint` is not range-checked (`CAST(256 AS tinyint)`, a column storing 256 or -1);
-    `smallmoney` takes up to 999999.9999; `TRY_CAST(300 AS tinyint)` and `TRY_CAST('12' AS decimal(2,0))` are not
-    NULL; `CAST('yes' AS bit)` is 1; `SUM` of `int` does not overflow; `CAST(0 AS datetime)` is 50000.
-  - **Character:** `char(n)` and `nchar(n)` are not padded; `DECLARE @n varchar = 'abcdef'` and `CAST(x AS varchar)`
-    keep every character; assigning a long string to a `varchar(10)` variable is error 2628 (SQL Server cuts it);
-    `ISNULL` is `COALESCE` (the type of the first argument is not kept); `DATALENGTH` counts two bytes per
-    character of every string type and gives 0 for a `real`.
+  - **Binary:** `0x00 = 0x0000` is false (SQL Server pads the shorter value); `CAST(0x41 AS bit)` is 50000; a
+    `varbinary` variable in an expression (`@v + 0x43`) is 195; `HASHBYTES` does not exist. **Regression:**
+    `CAST(NEWID() AS varbinary(16))` and any `uniqueidentifier` cast to `varbinary` is error 529 (it gave the 16 bytes
+    before main a15b9a64).
+  - **Ranges and casts:** `smallmoney` takes up to 999999.9999; `TRY_CAST('12' AS decimal(2,0))` is not NULL;
+    `CAST('yes' AS bit)` is 1; `SUM` of `int` does not overflow; `CAST(0 AS datetime)` is 50000.
+  - **Character:** `DECLARE @n varchar = 'abcdef'` and `CAST(x AS varchar)` keep every character; assigning a long
+    string to a `varchar(10)` variable is error 2628 (SQL Server cuts it); `ISNULL` is `COALESCE` (the type of the
+    first argument is not kept); `DATALENGTH` counts two bytes per character of every string type (a padded
+    `char(5)` is 10) and gives 0 for a `real`.
   - **Dates:** only ISO layouts are read (`'20260315'`, `'March 15, 2026'` and `'03/15/2026'` are 241, with any
     style); the seventh fractional digit is lost; a `datetimeoffset` is converted to UTC and shows `+00:00`;
-    `DATEPART(tzoffset | tz | iso_week)` is 155; `datetime + 1` is 195; `datetime - datetime` is an interval
-    (`1 day 10:00:00`); `date + 1` and `date - date` are accepted; `CAST('2026-03-15 13:45:30' AS time)` is 241;
+    `DATEPART(tzoffset | tz | iso_week)` is 155; `date - date` is accepted (SQL Server: 8117) and `GETDATE() -
+    GETDATE()` is an interval (`00:00:00`; SQL Server: a datetime); `CAST('2026-03-15 13:45:30' AS time)` is 241;
     `ISDATE`, `SWITCHOFFSET`, `TODATETIMEOFFSET`, `DATETIMEFROMPARTS`, `TIMEFROMPARTS` and `DATETIME2FROMPARTS` are
     195; conversion styles 9, 13, 14, 22, 109, 113 and 114 are 281.
-  - **Maths:** `LOG(100, 10)` is 0.5 (the arguments are swapped; SQL Server: 2); `ROUND(123.4567, -1)` on a decimal
-    is 8115; `SQRT(-1)` and `LOG(0)` are 50000, `ASIN(2)` and `EXP(710)` 8115 with PostgreSQL's text; `5 / 2.0E0` is
+  - **Maths:** `ROUND(123.4567, -1)` on a decimal is 8115; `SQRT(-1)` and `LOG(0)` are 50000, `ASIN(2)` and `EXP(710)` 8115 with PostgreSQL's text; `5 / 2.0E0` is
     a decimal (6 places); `real / int` is computed as a float.
   - **Functions that are lenient:** `IIF(1, 'a', 'b')` gives `b` (SQL Server: 4145); `GREATEST(1)`, `CONCAT('a')`,
     `SUBSTRING('abcdef', 2)` and `LEFT('abc', -1)` are taken (SQL Server: 189, 174, 536); `TRANSLATE('abc', 'abc',
     'xy')` is accepted (9828); `ASCII('')` is 0; `CASE` and `COALESCE` over `1` and `2.5` give `1`, not `1.0`.
-  - **`FORMAT`:** with `de-DE` a date format is still English (`d` gives `3/5/2026`); a custom format with sections
-    stops at the first `;` (`FORMAT(-5, '0;(0)')` is -5); literals between digit placeholders are dropped
-    (`FORMAT(123456789, '###-##-####')`); `FORMAT(CAST('14:07:09' AS time), 'hh\:mm')` is NULL.
+  - **`FORMAT`:** numbers follow `en-US` and `de-DE` only (`FORMAT(1234567.891, 'N2', 'fr-FR')` is `1,234,567.89`),
+    and a culture outside the ten known ones is read as `en-US`; a custom format with sections stops at the first `;`
+    (`FORMAT(-5, '0;(0)')` is -5); literals between digit placeholders are dropped (`FORMAT(123456789,
+    '###-##-####')`).
   - **Conversion errors:** a comparison of a string with a number is 195 (`'abc' = 1`; SQL Server: 245).
   - **Operators:** `!<` and `!>` are 102; `SELECT 1 = 1` and `SELECT NOT 1 = 2` are accepted (SQL Server: 102); `||`
     joins strings.
@@ -415,12 +411,8 @@ smaller differences of its statement.
   ORA-00955 "name is already used by an existing object", and `SELECT * FROM city` reads `public.city`. In Oracle a
   public synonym does not stop a user from making an object of the same name in its own schema.
 - **Queries and DML** (found writing the Oracle query pages):
-  - **A valid statement of exactly 84 bytes** (counting the final `;`) is answered ORA-00900 by a JDBC thin client; 83
-    and 85 bytes work. The cause was not found (the driver or lexdb's TNS decoding).
-  - `UPDATE emp e SET salary = (SELECT ... FROM emp x WHERE x.id = e.mgr_id)` reads rows the same statement has
-    already changed (Oracle reads the old values).
-  - `ROWNUM` with an aggregate limits the groups, not the rows grouped (`SELECT COUNT(*) FROM emp WHERE ROWNUM < 4`
-    is 5); `ROWNUM` in `UPDATE` and `DELETE` is ORA-20000.
+  - `ROWNUM` in a join with an aggregate or `GROUP BY` limits the groups, not the rows grouped (`SELECT COUNT(*) FROM
+    emp e, dept d WHERE e.dept_id = d.id AND ROWNUM < 3` is 4; Oracle: 2). With one table in `FROM` it works.
   - `MIN` and `MAX` of a `DATE` show as a timestamp (`2019-03-01 00:00:00.0`); `SELECT *` over `NATURAL JOIN` and
     `JOIN ... USING` does the same and prints column names in lower case.
   - `UNION` of a number column and a text column returns both as text (Oracle: ORA-01790).
@@ -449,8 +441,8 @@ smaller differences of its statement.
     OPTION` are refused; a view another view reads cannot be dropped (ORA-02449).
   - `ALTER TABLE ... DISABLE CONSTRAINT`, `READ ONLY` and `ALTER INDEX ... REBUILD` are ORA-03001; `COMMIT COMMENT` and
     `COMMIT WRITE` are ORA-00900; `COMMENT ON` does not keep the comment and accepts a missing table.
-  - `DROP SEQUENCE` of a sequence a column `DEFAULT s.NEXTVAL` uses is refused with ORA-02449 (`unique/primary keys in
-    table referenced by foreign keys`: the message of another error; not checked whether Oracle refuses it).
+  - An `INSERT` into a table whose column `DEFAULT s.NEXTVAL` calls a dropped sequence is ORA-00942 (also when the
+    statement gives the column a value); the error of a missing sequence is ORA-02289.
   - Sequences: past `MAXVALUE` the error is ORA-20000 (Oracle ORA-08004); `CURRVAL` before `NEXTVAL` is ORA-20000
     (ORA-08002); `ALTER SEQUENCE ... START WITH` is accepted and does nothing; `SESSION` and `SCALE` sequences are ORA-00900.
   - Users: `ALL_USERS` and `DBA_USERS` list only users that can log in (granted `CREATE SESSION`); `ACCOUNT LOCK` removes a
@@ -462,19 +454,9 @@ smaller differences of its statement.
     `SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')` do not follow `ALTER SESSION`.
   - PL/SQL: package variables and constants cannot be read from outside the package (`pay.g_count` is ORA-00904);
     a function without parameters needs brackets in SQL (`SELECT f FROM dual` is ORA-00904); `CALL f()` of a function
-    is PLS-00201; a one-line `CREATE FUNCTION f RETURN NUMBER IS BEGIN RETURN 7; END;` is ORA-00900 where the same text
-    over several lines works; `TO_NUMBER('abc')` raises `VALUE_ERROR`, not `INVALID_NUMBER`; `LOCK TABLE` in a block,
+    is PLS-00201; `TO_NUMBER('abc')` raises `VALUE_ERROR`, not `INVALID_NUMBER`; `LOCK TABLE` in a block,
     `GOTO`, `FORALL` and collections are refused.
-  - A unit created with an undefined procedure call (`BEGIN nothere(1); END;` in `CREATE PROCEDURE`) closes the
-    connection of the documentation's JDBC checker (`ORA-17008: Closed connection`).
-  - A `SELECT` that calls a stored function which raises an exception makes ojdbc throw a `NullPointerException`
-    (`this.accessors is null`).
-  - `ALTER PROCEDURE nothere COMPILE` and `COMMENT ON TABLE nothere` succeed.
 - **Functions** (found writing the Oracle function pages):
-  - **Regular expressions:** `REGEXP_SUBSTR` uses only its first two arguments (`REGEXP_SUBSTR('abc123def456',
-    '[0-9]+', 1, 2)` is `123`; Oracle `456`; position, occurrence, match parameter and subexpression are ignored);
-    `REGEXP_REPLACE` with two arguments is ORA-00904; the period matches a line feed by default and the `n` flag has the
-    opposite effect; an unknown match parameter or position 0 is ORA-01722; an invalid pattern is ORA-20000.
   - **Character:** `LENGTHB` and `SUBSTRB` count characters (`LENGTHB('€')` is 1); `LENGTH(DATE ...)` is 19;
     `TRIM('xy' FROM 'xyabc')` returns `abc` (Oracle ORA-30001); `SYS_GUID()` is text of 64 hex digits, not `RAW(16)`;
     `HEXTORAW('abc')` is ORA-01722; `REVERSE`, `REPEAT`, `COT` and `CBRT` are accepted under their PostgreSQL names.
