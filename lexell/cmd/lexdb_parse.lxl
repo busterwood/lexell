@@ -3025,6 +3025,7 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
             c.name = n.clone()
             c.spell = p.spelled.clone()
             try p.colTypeOpt(mut &c)
+            var nnHere = ""             // the name this column's NOT NULL was given
             while true {
                 // CONSTRAINT name names the one after it (a UNIQUE's; the
                 // others' names are not kept)
@@ -3037,6 +3038,11 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
                 } else if p.acceptKw("not") {
                     try p.expectKw("null")
                     c.notNull = true
+                    if len(cn) > 0 {
+                        if len(nnHere) > 0 && nnHere != cn { return Err(lexdb_base.err("XX000", &("conflicting not-null constraint names \"" + nnHere + "\" and \"" + cn + "\""))) }
+                        if len(nnHere) == 0 { append(mut &nns, n.clone() + "\x00" + cn) }
+                        nnHere = cn.clone()
+                    }
                 } else if p.acceptKw("null") {
                 } else if p.acceptKw("primary") {
                     try p.expectKw("key")
@@ -3919,10 +3925,13 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
             }
             if !p.tsql && !p.ora && ((p.isKw("not") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "null") ||
                                      (p.isKw("constraint") && p.peekAt(2).kind == T_IDENT && p.peekAt(2).text == "not" && p.peekAt(3).kind == T_IDENT && p.peekAt(3).text == "null")) {
-                // PostgreSQL 18: ADD [CONSTRAINT n] NOT NULL c, SET NOT NULL's (its name not kept: nnCons)
-                if p.acceptKw("constraint") { let cn = try p.name() }
+                // PostgreSQL 18: ADD [CONSTRAINT n] NOT NULL c, SET NOT NULL's (its name in to: lexdb_nncon)
+                var cn = ""
+                if p.acceptKw("constraint") { cn = try p.name() }
                 p.pos += 2
-                append(mut &s.alters, lexdb_sql.alterOf(A_SET_NOT_NULL, &(try p.name())))
+                var nn = lexdb_sql.alterOf(A_SET_NOT_NULL, &(try p.name()))
+                nn.to = cn
+                append(mut &s.alters, nn)
                 if !p.acceptKw(",") { break }
                 continue
             }
@@ -3968,6 +3977,7 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 } else if p.acceptKw("not") {
                     try p.expectKw("null")
                     a.col.notNull = true
+                    a.to = cn.clone()
                 } else if p.acceptKw("null") {
                 } else if p.acceptKw("generated") {
                     try p.identity(mut &a.col, mut &s)
@@ -7252,6 +7262,7 @@ fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
         if !p.acceptKw("stdout") { return Err(lexdb_base.err("0A000", "lexdb: COPY TO writes only STDOUT (a file on the server: use psql's \\copy)")) }
     }
     var format = ""
+    var hasForceArray = false
     var hasQuote = false
     var hasEscape = false
     var delim: Option[str] = None
@@ -7302,7 +7313,47 @@ fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
                     if n < 1 { return Err(lexdb_base.err("22023", "batch_rows must be a positive integer")) }
                     s.copy.batchRows = n
                 }
-                "on_error", "default", "log_verbosity", "reject_limit" {
+                "force_array" {
+                    // (PostgreSQL 19) FORMAT json's one array of the rows; a Boolean, true when no value is given
+                    if v.kind == T_IDENT && (v.text == "true" || v.text == "on") { p.pos += 1; s.copy.forceArray = true }
+                    else if v.kind == T_IDENT && (v.text == "false" || v.text == "off") { p.pos += 1; s.copy.forceArray = false }
+                    else if v.kind == T_NUM && (v.text == "1" || v.text == "0") { p.pos += 1; s.copy.forceArray = v.text == "1" }
+                    else if v.kind == T_OP && (v.text == "," || v.text == ")") { s.copy.forceArray = true }
+                    else { return Err(lexdb_base.err("42601", "force_array requires a Boolean value")) }
+                    hasForceArray = true
+                }
+                "on_error" {
+                    // (PostgreSQL 17) stop, or ignore: a row with a value its column does not take is skipped
+                    if v.kind != T_IDENT && v.kind != T_STR { return Err(near(&v)) }
+                    p.pos += 1
+                    let w = strings.toLowerAscii(&v.text)
+                    if w == "ignore" { s.copy.onErr = 1 }
+                    else if w == "stop" { s.copy.onErr = 0 }
+                    else if w == "set_null" { return Err(lexdb_base.err("0A000", "lexdb: COPY's ON_ERROR set_null is not supported")) }
+                    else { return Err(lexdb_base.err("22023", &("COPY ON_ERROR \"" + v.text + "\" not recognized"))) }
+                }
+                "reject_limit" {
+                    // (PostgreSQL 18) the rows ON_ERROR ignore may skip: more is an error
+                    var neg = false
+                    if v.kind == T_OP && v.text == "-" { neg = true; p.pos += 1 }
+                    let nv = p.peek().clone()
+                    if nv.kind != T_NUM { return Err(lexdb_base.err("22P02", &("invalid input syntax for type bigint: \"" + nv.text + "\""))) }
+                    p.pos += 1
+                    let n = strings.parseIntOpt(&nv.text).unwrapOr(-1)
+                    if neg || n < 1 { return Err(lexdb_base.err("22023", &("REJECT_LIMIT (" + (if neg { "-" } else { "" }) + nv.text + ") must be greater than zero"))) }
+                    s.copy.reject = n
+                }
+                "log_verbosity" {
+                    // (PostgreSQL 16, silent: 18) what COPY FROM ... ON_ERROR ignore tells of the rows it skips
+                    if v.kind != T_IDENT && v.kind != T_STR { return Err(near(&v)) }
+                    p.pos += 1
+                    let w = strings.toLowerAscii(&v.text)
+                    if w == "default" { s.copy.verb = 0 }
+                    else if w == "verbose" { s.copy.verb = 1 }
+                    else if w == "silent" { s.copy.verb = 2 }
+                    else { return Err(lexdb_base.err("22023", &("COPY LOG_VERBOSITY \"" + v.text + "\" not recognized"))) }
+                }
+                "default" {
                     return Err(lexdb_base.err("0A000", &("lexdb: COPY's option \"" + t.text + "\" is not supported")))
                 }
                 else { return Err(lexdb_base.err("42601", &("option \"" + t.text + "\" not recognized"))) }
@@ -7332,8 +7383,26 @@ fn (p: mut &P) copyStmt(): Result[Stmt, lexdb_base.DbErr] {
             else { break }
         }
     }
-    if format == "binary" { return Err(lexdb_base.err("0A000", "lexdb: COPY's binary format is not supported")) }
-    if format != "" && format != "text" && format != "csv" { return Err(lexdb_base.err("22023", &("COPY format \"" + format + "\" not recognized"))) }
+    if format == "binary" {
+        if s.copy.onErr > 0 { return Err(lexdb_base.err("42601", "only ON_ERROR STOP is allowed in BINARY mode")) }
+        return Err(lexdb_base.err("0A000", "lexdb: COPY's binary format is not supported"))
+    }
+    if format != "" && format != "text" && format != "csv" && format != "json" { return Err(lexdb_base.err("22023", &("COPY format \"" + format + "\" not recognized"))) }
+    if s.copy.onErr > 0 && !s.copy.from { return Err(lexdb_base.err("22023", "COPY ON_ERROR cannot be used with COPY TO")) }
+    if s.copy.reject > 0 && s.copy.onErr == 0 { return Err(lexdb_base.err("22023", "COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE")) }
+    if s.copy.reject > 0 && !s.copy.from { return Err(lexdb_base.err("22023", "COPY REJECT_LIMIT cannot be used with COPY TO")) }
+    if hasForceArray && format != "json" { return Err(lexdb_base.err("22023", "COPY FORCE_ARRAY requires JSON mode")) }
+    if format == "json" {
+        if s.copy.from { return Err(lexdb_base.err("22023", "COPY FORMAT JSON is not supported for COPY FROM")) }
+        if s.copy.header { return Err(lexdb_base.err("0A000", "cannot specify HEADER in JSON mode")) }
+        if delim.isSome() { return Err(lexdb_base.err("42601", "cannot specify DELIMITER in JSON mode")) }
+        if null.isSome() { return Err(lexdb_base.err("42601", "cannot specify NULL in JSON mode")) }
+        if hasQuote || hasEscape { return Err(lexdb_base.err("0A000", "cannot specify QUOTE or ESCAPE in JSON mode")) }
+        if s.copy.quoteAll || len(s.copy.forceQuote) > 0 || len(s.copy.forceNotNull) > 0 || len(s.copy.forceNull) > 0 {
+            return Err(lexdb_base.err("0A000", "cannot specify FORCE_QUOTE, FORCE_NOT_NULL or FORCE_NULL in JSON mode"))
+        }
+        s.copy.json = true
+    }
     s.copy.csv = format == "csv"
     s.copy.delim = delim.unwrapOr(if s.copy.csv { "," } else { "\t" })
     s.copy.null = null.unwrapOr(if s.copy.csv { "" } else { "\\N" })
@@ -10003,9 +10072,9 @@ fn (p: mut &P) oraGroupAll(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     return Ok(Unit{})
 }
 
-// PostgreSQL 18's NOT NULL table constraints (nns: "column\x00name", "" no name) on s's columns: NOT NULL; 42703 for a column
-// not there, 42601 for two names of one column. (Their names are not kept: lexdb's catalogs list no NOT NULL constraints,
-// design/lexdb-new-features.md P7.)
+// PostgreSQL 18's NOT NULL constraints with a name (nns: "column\x00name", "" no name; a table constraint's, and a column's CONSTRAINT n
+// NOT NULL) on s's columns: NOT NULL; 42703 for a column not there, 42601 for two names of one column. The names are kept in s.names
+// (the same entries, a column's once: CREATE TABLE has no other use for it; lexdb_nncon, design/lexdb-new-features.md P7).
 fn nnCons(s: mut &Stmt, nns: &[]str): Result[Unit, lexdb_base.DbErr] {
     for k in 0..len(nns) {
         let z = strings.indexOf(&nns[k], "\x00", 0)
@@ -10023,6 +10092,7 @@ fn nnCons(s: mut &Stmt, nns: &[]str): Result[Unit, lexdb_base.DbErr] {
         if !found {
             return Err(lexdb_base.err("42703", &("column \"" + c + "\" of relation \"" + lexdb_sql.baseName(&s.table) + "\" does not exist")))
         }
+        if len(n) > 0 && !lexdb_base.hasStr(&s.names, &nns[k]) { append(mut &s.names, nns[k].clone()) }
     }
     return Ok(Unit{})
 }

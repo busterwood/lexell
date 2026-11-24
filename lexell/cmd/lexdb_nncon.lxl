@@ -1,0 +1,87 @@
+// lexdb_nncon: the names of NOT NULL constraints, as PostgreSQL 18 shows them (design/lexdb-new-features.md 8.4, P7).
+//
+// A column that is NOT NULL has a constraint in pg_constraint (contype n, conkey the column) whose name is the one the statement gave
+// (CONSTRAINT n NOT NULL, ADD CONSTRAINT n NOT NULL col), else `table_column_not_null` (a number after it where a constraint of that
+// name is there already). lexdb keeps only ColDef.notNull in the rows' path; the names given are entries of Table.invalid with the prefix
+// NN_MARK (a name no constraint has, so what reads that list does not see them: the way CL_MARK and OFF_MARK keep their labels), "column"
+// NUL "name". The default name is not kept until a rename of the table or the column needs it as it was (PostgreSQL keeps the name the
+// constraint was made with: lexdb_nnalter). Nothing here is on the path of a row: NOT NULL is tested as it always was.
+import "strings"
+import "./lexdb_sql"
+
+type ColDef = lexdb_sql.ColDef
+
+pub const NN_MARK = "\x00nn:"
+
+fn keyOf(col: &str): str { return NN_MARK + col + "\x00" }
+
+// The name given to the NOT NULL of column col, "" none.
+pub fn given(inv: &[]str, col: &str): str {
+    if len(inv) == 0 { return "" }
+    let p = keyOf(col)
+    for x in inv { if strings.startsWith(&x, &p) { return x[len(p)..len(x)].toStr() } }
+    return ""
+}
+
+// The NOT NULL of column col is called name (a name given before is replaced).
+pub fn setName(inv: mut &[]str, col: &str, name: &str) {
+    drop(inv, col)
+    append(inv, keyOf(col) + name)
+}
+
+// The name of column col's NOT NULL forgotten.
+pub fn drop(inv: mut &[]str, col: &str) {
+    if len(inv) == 0 { return }
+    let p = keyOf(col)
+    var keep: []str = []
+    for x in inv { if !strings.startsWith(&x, &p) { append(mut &keep, x.clone()) } }
+    inv = keep
+}
+
+// Column from renamed to: its name goes with it.
+pub fn renameCol(inv: mut &[]str, from: &str, to: &str) {
+    let n = given(inv, from)
+    if len(n) == 0 { return }
+    drop(inv, from)
+    append(inv, keyOf(to) + n)
+}
+
+// PostgreSQL's makeObjectName: table_column_label, the longer of the two names cut until it is 63 bytes.
+pub fn defName(table: &str, col: &str, label: &str): str {
+    var a = table.toStr()
+    var b = col.toStr()
+    while len(a) + len(b) + len(label) + 2 > 63 {
+        if len(a) > len(b) { a = a[0..len(a) - 1].toStr() } else { b = b[0..len(b) - 1].toStr() }
+    }
+    return a + "_" + b + "_" + label
+}
+
+// The name of column col's NOT NULL constraint: the one given, else the default one, with a number after it while a constraint
+// of the table (taken: their names) has it.
+pub fn nameOf(inv: &[]str, table: &str, c: &ColDef, taken: &[]str): str {
+    let g = given(inv, &c.name)
+    if len(g) > 0 { return g }
+    // (the default name is made of the names as they were written)
+    let col = if len(c.spell) > 0 { c.spell.clone() } else { c.name.clone() }
+    let d = defName(table, &col, "not_null")
+    var n = d.clone()
+    var k = 0
+    while has(taken, &n) {
+        k += 1
+        n = defName(table, &col, "not_null" + k.toStr())
+    }
+    return n
+}
+
+fn has(xs: &[]str, x: &str): bool {
+    for y in xs { if y == x { return true } }
+    return false
+}
+
+// The index of the column whose NOT NULL constraint is called name, -1 none.
+pub fn colOf(inv: &[]str, table: &str, cols: &[]ColDef, taken: &[]str, name: &str): int {
+    for i in 0..len(cols) {
+        if cols[i].notNull && nameOf(inv, table, &cols[i], taken) == name { return i }
+    }
+    return -1
+}

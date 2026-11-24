@@ -1,0 +1,158 @@
+// lexdb_exec: COPY's newest options (design/lexdb-new-features.md P16), checked against PostgreSQL 19 (FORMAT json, FORCE_ARRAY) and 18 (ON_ERROR ignore,
+// REJECT_LIMIT, LOG_VERBOSITY silent; the answers are those the product gave): COPY TO's FORMAT json (one object a line, the values as to_json writes them:
+// numbers, booleans, null, arrays, the other types as strings; FORCE_ARRAY: one array, a space before the first row, a comma before the others, "[" and "]" lines
+// even for no rows), COPY FROM's JSON refused, ON_ERROR ignore (a row a column does not take is skipped and counted: the NOTICE "n rows were skipped due to
+// data type incompatibility", one a row with LOG_VERBOSITY verbose, none with silent; other errors still end the COPY; the CSV format and a HEADER too),
+// REJECT_LIMIT n (more rows skipped is 22P02 with the line), and the options' errors. Each line: the answer.
+// expect: json: {"a":1,"b":"x","c":1.5}|{"a":2,"b":null,"c":2}|{"a":3,"b":"a\"b","c":null}
+// expect: force_array: [| {"a":1,"b":"x","c":1.5}|,{"a":2,"b":null,"c":2}|,{"a":3,"b":"a\"b","c":null}|]
+// expect: force_array true: [| {"a":1,"b":"x"}|,{"a":2,"b":null}|]
+// expect: force_array false: {"x":1,"y":"a"}
+// expect: types: {"x":1.50,"y":"a\n\t\u0001","t":true,"n":null,"ar":[1,2],"tx":["a","b"],"d":"2024-01-02","f":1.5,"nf":"NaN","bb":"\\x1234","iv":"1 day","f4":1000,"bi":12345678901,"an":[1,null]}
+// expect: no rows: |[|]
+// expect: names: {"a":1,"a":2}|{"?column?":1}
+// expect: json errors: 22023 0A000 42601 42601 0A000 0A000 22023 22023 22023
+// expect: ignore: COPY 2; 10|q|1 11|r|3; 1 row was skipped due to data type incompatibility
+// expect: verbose: COPY 1; 20|q|1; skipping row due to data type incompatibility at line 2 for column "a": "bad" / 1 row was skipped due to data type incompatibility
+// expect: silent: COPY 1; 30|q|1; no notice
+// expect: reject_limit 2: COPY 1; 40|q|1; 2 rows were skipped due to data type incompatibility
+// expect: reject_limit 1: 22P02 skipped more than REJECT_LIMIT (1) rows due to data type incompatibility | COPY cj2, line 3: "bad2	q	3"; rows kept 0
+// expect: stop: 22P02 invalid input syntax for type integer: "bad" | COPY cj2, line 2, column a: "bad"
+// expect: other errors: 22P04 | 22P04 | 23505 | 23514
+// expect: csv: COPY 2; 60|q|1 61|r|3; 1 row was skipped due to data type incompatibility
+// expect: csv header: COPY 1; 70|q|1; 1 row was skipped due to data type incompatibility
+// expect: option errors: 22023 22023 22023 22023 22023 22023 42601 0A000
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_parse"
+
+fn fail(e: &lexdb_base.DbErr): str {
+    return e.state + " " + e.msg + (if e.context != "" { " | " + e.context } else { "" })
+}
+
+// The notices a statement gave, joined by " / ".
+fn notices(s: mut &lexdb_exec.Session): str {
+    var out: []str = []
+    for n in s.takeNotices() { append(mut &out, n.msg.clone()) }
+    if len(out) == 0 { return "no notice" }
+    return strings.join(&out, " / ")
+}
+
+// COPY ... FROM STDIN with data: its tag, or its error.
+fn copyIn(s: mut &lexdb_exec.Session, sql: &str, data: &str): str {
+    match lexdb_parse.parse(sql) {
+        Ok(stmts) {
+            let none: []lexdb_sql.Val = []
+            let nt: []int = []
+            match s.run(&stmts[0], &none, &nt) {
+                Ok(r) {
+                    if r.copy != lexdb_exec.COPY_IN { return "not COPY_IN: " + r.tag }
+                    match s.copyIn(&stmts[0], lexdb_exec.CopyInput{have: true, data: data.clone(), fail: "", proto: false, stream: false, pull: false}) {
+                        Ok(r2) { return r2.tag.clone() }
+                        Err(e) { return fail(&e) }
+                    }
+                }
+                Err(e) { return fail(&e) }
+            }
+        }
+        Err(e) { return fail(&e) }
+    }
+}
+
+// COPY ... TO STDOUT: its lines (each without its newline) joined by |, or the error.
+fn copyOut(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.copy != lexdb_exec.COPY_OUT { return "not COPY_OUT" }
+            var ls: []str = []
+            for row in r.rows {
+                let l = lexdb_sql.text(&row[0])
+                append(mut &ls, l[0..len(l) - 1].clone())
+            }
+            return strings.join(&ls, "|")
+        }
+        Err(e) { return fail(&e) }
+    }
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag.clone() }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return fail(&e) }
+    }
+}
+
+// The statement's SQLSTATE: of the error it gives (COPY TO), or of the one the COPY gives with this data.
+fn state(s: mut &lexdb_exec.Session, sql: &str): str {
+    if strings.contains(sql, " from stdin") { return copyIn(s, sql, &"")[0..5].toStr() }
+    return copyOut(s, sql)[0..5].toStr()
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(46)
+    lexdb_store.run(fs.share(), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        let c1 = q(mut &s, &"create table cj (a int, b text, c numeric); insert into cj values (1, 'x', 1.5), (2, null, 2), (3, 'a\"b', null)")
+        println("json: " + copyOut(mut &s, &"copy cj to stdout (format json)"))
+        println("force_array: " + copyOut(mut &s, &"copy cj to stdout (format json, force_array)"))
+        println("force_array true: " + copyOut(mut &s, &"copy (select a, b from cj where a < 3 order by a) to stdout (format json, force_array true)"))
+        println("force_array false: " + copyOut(mut &s, &"copy (select 1 as x, 'a' as y) to stdout (format json, force_array false)"))
+        println("types: " + copyOut(mut &s, &"copy (select 1.50::numeric as x, 'a' || E'\\n' || E'\\t' || chr(1) as y, true as t, null as n, array[1,2] as ar, array['a','b']::text[] as tx, date '2024-01-02' as d, 1.5::float8 as f, 'NaN'::float8 as nf, '\\x1234'::bytea as bb, interval '1 day' as iv, '1e3'::float4 as f4, 12345678901::bigint as bi, array[1,null] as an) to stdout (format json)"))
+        println("no rows: " + copyOut(mut &s, &"copy (select 1 where false) to stdout (format json)") + "|" + copyOut(mut &s, &"copy (select 1 where false) to stdout (format json, force_array)"))
+        println("names: " + copyOut(mut &s, &"copy (select 1 as a, 2 as a) to stdout (format json)") + "|" + copyOut(mut &s, &"copy (select 1) to stdout (format json)"))
+        let t0 = q(mut &s, &"create table cj2 (a int, b text, c numeric)")
+        println("json errors: " + state(mut &s, &"copy cj2 from stdin (format json)") + " " + state(mut &s, &"copy cj2 to stdout (format json, header)") + " " +
+                state(mut &s, &"copy cj2 to stdout (format json, delimiter ',')") + " " + state(mut &s, &"copy cj2 to stdout (format json, null 'x')") + " " +
+                state(mut &s, &"copy cj2 to stdout (format json, force_quote *)") + " " + state(mut &s, &"copy cj2 to stdout (format json, quote '\"')") + " " +
+                state(mut &s, &"copy cj2 to stdout (format csv, force_array)") + " " + state(mut &s, &"copy cj2 to stdout (force_array)") + " " +
+                state(mut &s, &"copy cj2 to stdout (format jsonb)"))
+
+        let i1 = copyIn(mut &s, &"copy cj2 from stdin (on_error ignore)", &"10\tq\t1\nbad\tq\t2\n11\tr\t3\n")
+        println("ignore: " + i1 + "; " + q(mut &s, &"select a, b, c from cj2 order by a") + "; " + notices(mut &s))
+        let v1 = copyIn(mut &s, &"copy cj2 from stdin (on_error ignore, log_verbosity verbose)", &"20\tq\t1\nbad\tq\t2\n")
+        println("verbose: " + v1 + "; " + q(mut &s, &"select a, b, c from cj2 where a = 20") + "; " + notices(mut &s))
+        let s1 = copyIn(mut &s, &"copy cj2 from stdin (on_error ignore, log_verbosity silent)", &"30\tq\t1\nbad\tq\t2\n")
+        println("silent: " + s1 + "; " + q(mut &s, &"select a, b, c from cj2 where a = 30") + "; " + notices(mut &s))
+        let r2 = copyIn(mut &s, &"copy cj2 from stdin (on_error ignore, reject_limit 2)", &"40\tq\t1\nbad\tq\t2\nbad2\tq\t3\n")
+        println("reject_limit 2: " + r2 + "; " + q(mut &s, &"select a, b, c from cj2 where a = 40") + "; " + notices(mut &s))
+        let r1 = copyIn(mut &s, &"copy cj2 from stdin (on_error ignore, reject_limit 1)", &"50\tq\t1\nbad\tq\t2\nbad2\tq\t3\n")
+        println("reject_limit 1: " + r1 + "; rows kept " + q(mut &s, &"select count(*) from cj2 where a = 50"))
+        println("stop: " + copyIn(mut &s, &"copy cj2 from stdin (on_error stop)", &"55\tq\t1\nbad\tq\t2\n"))
+        let t1 = q(mut &s, &"create table cu (a int primary key, b int check (b < 100))")
+        println("other errors: " + copyIn(mut &s, &"copy cj2 from stdin (on_error ignore)", &"1\tx\n")[0..5] + " | " +
+                copyIn(mut &s, &"copy cj2 from stdin (on_error ignore)", &"1\tx\t1\t2\n")[0..5] + " | " +
+                copyIn(mut &s, &"copy cu from stdin (on_error ignore)", &"1\t1\n1\t2\n")[0..5] + " | " +
+                copyIn(mut &s, &"copy cu from stdin (on_error ignore)", &"2\t200\n")[0..5])
+        let c2 = copyIn(mut &s, &"copy cj2 from stdin (format csv, on_error ignore)", &"60,q,1\nx,q,2\n61,r,3\n")
+        println("csv: " + c2 + "; " + q(mut &s, &"select a, b, c from cj2 where a >= 60 order by a") + "; " + notices(mut &s))
+        let c3 = copyIn(mut &s, &"copy cj2 from stdin (format csv, header, on_error ignore)", &"a,b,c\n70,q,1\nx,q,2\n")
+        println("csv header: " + c3 + "; " + q(mut &s, &"select a, b, c from cj2 where a = 70") + "; " + notices(mut &s))
+        println("option errors: " + state(mut &s, &"copy cj2 from stdin (on_error ignore, reject_limit 0)") + " " +
+                state(mut &s, &"copy cj2 from stdin (on_error bogus)") + " " + state(mut &s, &"copy cj2 from stdin (reject_limit 5)") + " " +
+                state(mut &s, &"copy cj2 to stdout (on_error ignore)") + " " + state(mut &s, &"copy cj2 to stdout (reject_limit 5)") + " " +
+                state(mut &s, &"copy cj2 from stdin (log_verbosity bogus)") + " " + state(mut &s, &"copy cj2 from stdin (on_error ignore, format binary)") + " " +
+                state(mut &s, &"copy cj2 from stdin (on_error set_null)"))
+        return 0
+    }).unwrap()
+}

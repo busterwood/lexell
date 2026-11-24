@@ -1173,3 +1173,9 @@ negative section shows no sign, an empty one is the first with the sign), litera
 61 cultures as SQL Server 2022 gives them (separators, India's grouping, C and P patterns: `NUMCULS`, read from it), the invariant culture's numbers and dates for a name
 of the form of a culture that SQL Server takes without knowing it (`xx`, `xx-YY`), and error 9818 for a name that is none (`english`, `en_US`, `x`, an empty one;
 the brief said NULL, SQL Server 2022 says 9818). Dates of cultures other than the ten of `CULTURES` are still en-US's. `tds_docbugs` (108 batches).
+
+## As built: a scalar function in the SQL of a batch (2026-11-24)
+
+Checked because the Oracle door's stored functions failed in a block's SQL (lexdb-oracle.md, "stored functions in the SQL of a block"): the T-SQL door has no such bug. A scalar function
+called in `SELECT @v = dbo.f(a) FROM t`, INSERT (VALUES and SELECT), UPDATE and DELETE inside a batch with IF and WHILE, a procedure, `EXEC('...')` and `sp_executesql` gives SQL Server 2022's
+answers. Test `tds_udfblock` (15 batches, batches off and on; gen_mssql.py udfblock). Not supported, as before: a T-SQL cursor (`DECLARE c CURSOR FOR`, error 102).

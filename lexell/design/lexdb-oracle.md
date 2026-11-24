@@ -1186,3 +1186,24 @@ cannot be disabled (ORA-00900 as before); 23.26.3 has no NOT ENFORCED. Test `tns
 - A DEFAULT that calls a dropped sequence is no error until a row takes the default (ORA-02289 then, `Defs.late`): a statement that gives the column a value, and an UPDATE, are right.
 - UPDATE tests the CHECKs that read a column it sets (see lexdb-tds.md): inside a transaction after the first statement, and by `lxl_stmt`'s savepoint; the first statement of
   a transaction the door began (a single statement outside a transaction) still tests every check (it has nothing to undo to).
+
+## As built: stored functions in the SQL of a block and in DML (KNOWN-ISSUES.md, 2026-11-24)
+
+A stored function (standalone or a package's) called in a SQL statement was run for a top-level SELECT only (`lexdb_plcall`: the call is `Cast(Call("#plf", ...))`, the
+function is run for each combination of arguments before the query, the values kept in the store's memo). Everywhere else it was ORA-00904: the SQL of a block
+(`SELECT f(x) INTO`, a cursor FOR loop, an explicit cursor, a REF CURSOR, `EXECUTE IMMEDIATE`, INSERT / UPDATE / DELETE in the block) and, outside a block, INSERT ... SELECT,
+UPDATE, DELETE (INSERT ... VALUES and DELETE with constant arguments already worked: `expandCalls`) and CREATE TABLE AS. Oracle Free runs every one of them.
+- `lexdb_plcall.rewrite` takes INSERT, UPDATE, DELETE and CREATE TABLE AS as well. The arguments of a call in INSERT ... VALUES, UPDATE or DELETE come from a query over the
+  target table (and the statement's FROM items) under the conditions that call no function (`driverOfDml`), as a SELECT's do. A statement that writes cannot be run again for
+  a combination it missed, so a driver that fails (an outer reference in a subquery) or a run that misses is an error, 0A000 (a subquery of the DML statement that reads its
+  table and calls a function; a MERGE that calls a function). The statement's rows decide how often the function runs, as for a SELECT (once per distinct arguments).
+- The blocks: `lexdb_plsql.runStmt` sends a statement of a block through a hook (`setSqlHook`, set by `lexdb_plcall.install` at each connection: plcall imports plsql, not the
+  other way) when the program has stored units. The block remembers, per statement (`Ip.scalls`), that it calls none, so a block without such calls pays one array read per
+  run. The function is called as a call in the block (`callFunctionIn` builds a K_CALL node and uses `callUnit`): the block's cursors, savepoints, depth and package
+  variables are as a call from PL/SQL leaves them, which `callFunction` (a block of its own through `runBlock`) cannot do from inside a block.
+- The compile of a cursor's query (`describeText`) reads a call of a known stored function as its lookup of the function's type, so a cursor FOR loop and an explicit
+  cursor compile.
+- Tests: `tns_plfunc` (37 statements, batches off and on, 0 differences in `gen_oracle.py --check tns_plfunc`). The T-SQL door (`tds_udfblock`, against SQL Server 2022: a batch,
+  IF, WHILE, a procedure, EXEC, sp_executesql, DML with a call) and PostgreSQL's (`exec_sqlfunc`, against PostgreSQL 18: a SQL function in a function's body and a procedure's
+  statements; no DO or PL/pgSQL) had no such bug.
+- The cached-plan report (a package function that reads a variable, called with no or constant arguments, gave the first run's value on a statement run again) was real, for a client that keeps its cursor (python-oracledb; JDBC with implicit statement caching): `prepare` replaces such a call by its value (`expandCalls`) at each execute, but the cursor's plan cache (`pc`) kept the plan of the first text, with the first value in it. `prepare` now makes a new plan cache for a cursor whose text it changed. Check: `OracleJdbc.storedFunctions` (statement cache on; 200 passed against Oracle Free, the same on lexdb; before the fix 'cached statement' and 'one statement twice' failed). A view that calls a stored function cannot be created (ORA-00904, Oracle allows it): not done.

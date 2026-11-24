@@ -1743,7 +1743,7 @@ fn (c: mut &Conn) prepare(i: int): Result[Unit, DbErr] {
         if len(stmts) != 1 { return Err(lexdb_base.err("42601", "SQL command not properly ended")) }
         // a query's calls of stored functions of a column are written as lookups (lexdb_plcall)
         c.cursors[i].plan = lexdb_plcall.noPlan()
-        if sk == tns.S_QUERY && lexdb_plsql.hasUnits(&c.prog) {
+        if (sk == tns.S_QUERY || sk == tns.S_DML || sk == tns.S_DDL) && lexdb_plsql.hasUnits(&c.prog) {
             match lexdb_plcall.rewrite(&c.prog, &c.pl, &stmts[0]) {
                 Ok(rw) {
                     match rw {
@@ -1760,6 +1760,8 @@ fn (c: mut &Conn) prepare(i: int): Result[Unit, DbErr] {
         }
     }
     c.cursors[i].stmts = stmts
+    // (a statement made again from its text, a call of a stored function replaced by its value: the plan kept for the last one has that value in it)
+    if c.cursors[i].dyn { c.cursors[i].pc = lexdb_exec.newPlanCache() }
     c.cursors[i].prepared = true
     return Ok(Unit{})
 }
@@ -1789,6 +1791,12 @@ type Runs = record {
 
 fn newRuns(): Runs {
     return Runs{counts: [], total: 0, rets: [], errs: [], failed: None, res: emptyRes("")}
+}
+
+// The cursor's statement run: with the values of the stored functions it calls (lexdb_plcall) when it calls any.
+fn (c: mut &Conn) runPlan(i: int, stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &lexdb_exec.PlanCache): Result[lexdb_exec.Res, DbErr] {
+    if len(c.cursors[i].plan.sites) > 0 { return lexdb_plcall.run(&c.prog, mut &c.pl, mut &c.sess, &c.cursors[i].plan, stmt, params, ptypes, pc) }
+    return c.sess.runCached(stmt, params, ptypes, pc)
 }
 
 // Cursor i's statement run once per element of params, on lexdb's transactions: a DML statement starts one
@@ -1850,7 +1858,7 @@ fn (c: mut &Conn) runCursor(i: int, kind: int, params: &[][]Val, ptypes: &[][]in
                 }
                 if len(ptypes) > 0 && !sameTypes(&c.cursors[i].pts, &ptypes[k]) { pc = lexdb_exec.newPlanCache() }
                 if len(ptypes) > 0 { setTypes(mut &c.cursors[i].pts, &ptypes[k]) }
-                match c.sess.runCached(&stmts[0], if len(params) > 0 { &params[k] } else { &none }, if len(ptypes) > 0 { &ptypes[k] } else { &nt }, mut &pc) {
+                match c.runPlan(i, &stmts[0], if len(params) > 0 { &params[k] } else { &none }, if len(ptypes) > 0 { &ptypes[k] } else { &nt }, mut &pc) {
                     Ok(rr) {
                         var r = rr
                         if sp { let x = c.simple("RELEASE SAVEPOINT lxl_stmt") }
@@ -1915,12 +1923,7 @@ fn (c: mut &Conn) runCursor(i: int, kind: int, params: &[][]Val, ptypes: &[][]in
             if len(ptypes) > 0 && !sameTypes(&c.cursors[i].pts, &ptypes[0]) { pc = lexdb_exec.newPlanCache() }
             if len(ptypes) > 0 { setTypes(mut &c.cursors[i].pts, &ptypes[0]) }
             var ran: Result[lexdb_exec.Res, DbErr] = Err(lexdb_base.err("XX000", "not run"))
-            if len(c.cursors[i].plan.sites) > 0 {
-                ran = lexdb_plcall.run(&c.prog, mut &c.pl, mut &c.sess, &c.cursors[i].plan, &stmts[0], if len(params) > 0 { &params[0] } else { &none },
-                                       if len(ptypes) > 0 { &ptypes[0] } else { &nt }, mut &pc)
-            } else {
-                ran = c.sess.runCached(&stmts[0], if len(params) > 0 { &params[0] } else { &none }, if len(ptypes) > 0 { &ptypes[0] } else { &nt }, mut &pc)
-            }
+            ran = c.runPlan(i, &stmts[0], if len(params) > 0 { &params[0] } else { &none }, if len(ptypes) > 0 { &ptypes[0] } else { &nt }, mut &pc)
             match ran {
                 Ok(r) {
                     // CREATE TABLE ... AS SELECT: Oracle's row count is the rows made (checked against Oracle Free)
@@ -3530,6 +3533,7 @@ pub fn serve(a: ConnArg): int {
     let ConnArg{conn: sock, st: st, id: id, secret: secret, ctx: ctx} = move(a)
     let nd = sock.setNoDelay(true)
     let sess = lexdb_exec.newSession(st.share())
+    lexdb_plcall.install()
     sess.setDoor(&"tns")
     let local = sock.localAddr()
     var c = Conn{connId: id, local: local, w: newWire(sock), sess: sess, st: st, o: newOut(), secret: secret, fv: FV_SERVER, seq: 0, user: "",

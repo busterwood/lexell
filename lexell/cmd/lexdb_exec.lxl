@@ -35,6 +35,9 @@ import "./lexdb_like"
 import "./lexdb_access"
 import "./lexdb_store"
 import "./lexdb_catalog"
+import "./lexdb_copyjson"
+import "./lexdb_nncon"
+import "./lexdb_nnalter"
 import "./lexdb_sql"
 import "./lexdb_plan"
 import "./lexdb_enum"
@@ -3809,6 +3812,7 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     // T-SQL's CLUSTERED and NONCLUSTERED: which key or index is the clustered one (a label: lexdb_catalog.clusterLabel)
     if len(clustered) > 0 { lexdb_catalog.setCluster(mut &t, &clustered) } else if s.pkCluster == 2 && len(t.pk) > 0 { lexdb_catalog.setCluster(mut &t, lexdb_catalog.CL_NONE) }
     for c in s.cons { if c.kind == lexdb_sql.C_FOREIGN { try lexdb_gen.checkConstraint(&t.cols, &c, s.mdialect, &lexdb_sql.baseName(&t.name)); try addConstraint(st, txn, mut &t, &c, false, s.mdialect) } }
+    try lexdb_nnalter.createNames(mut &t, &s.names)
     t.onCommit = s.onCommit
     if s.onCommit > lexdb_sql.ONC_PRESERVE { append(mut &txn.onCommit, key.clone()) }
     try txn.put(lexdb_catalog.CATALOG, &key, &(lexdb_catalog.encTable(&t)))
@@ -5129,6 +5133,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             for n in skipped { if len(a.name) > 0 && n == a.name { skip = true } }
             if skip { continue }
             let c = &a.cons[0]
+            if len(c.name) > 0 && lexdb_nnalter.colOfName(&t, &c.name) >= 0 { return Err(e("42710", &("constraint \"" + c.name + "\" for relation \"" + rel + "\" already exists"))) }
             if lexdb_gen.keyOnVirtual(&t.cols, c) {
                 return Err(e("0A000", "lexdb: a primary key or foreign key over a virtual column is made in CREATE TABLE (the row keeps its value)"))
             }
@@ -5216,6 +5221,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 return Err(e("23502", &("column \"" + a.col.name + "\" of relation \"" + rel + "\" contains null values")))
             }
             append(mut &t.cols, col)
+            if a.col.notNull && len(a.to) > 0 { try lexdb_nnalter.addColumnName(mut &t, &a.col.name, &a.to) }
             if a.col.genKind != lexdb_sql.GEN_NONE { try genSetup(mut &t, len(t.cols) - 1, s.mdialect) }
             if len(t.slots) > 0 {
                 append(mut &t.slots, t.width)
@@ -5260,6 +5266,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             let at = lexdb_bind.colIndex(&t.cols, &a.name)
             try fkDropColumn(st, txn, mut &t, &a.name, a.cascade)
             try dropOwnedSeqs(st, txn, &t, &a.name)
+            lexdb_nncon.drop(mut &t.invalid, &a.name)
             try dropColumn(txn, mut &t, at)
         } else if a.kind == lexdb_sql.A_RENAME {
             let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &a.name)
@@ -5274,6 +5281,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             }
             // its key's index keeps its name, as PostgreSQL's
             if lexdb_catalog.hasPk(&t) && len(t.pkName) == 0 { t.pkName = lexdb_catalog.pkConName(&t) }
+            lexdb_nnalter.beforeRenameTable(mut &t)
             txn.del(lexdb_catalog.CATALOG, &t.name)
             let old = t.name.clone()
             t.name = key.clone()
@@ -5299,6 +5307,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                     return Err(e(if s.mdialect == lexdb_sql.MD_ORA { "ORA00957" } else { "42701" },
                                  &("column \"" + a.to + "\" of relation \"" + rel + "\" already exists")))
                 }
+                lexdb_nnalter.renameColumn(mut &t, &a.name, &a.to)
                 t.cols[i].name = a.to.clone()
                 // a filtered index's predicate names its columns
                 for k in 0..len(t.indexes) {
@@ -5331,7 +5340,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                     if s.mdialect == lexdb_sql.MD_ORA { return Err(e("ORA02296", "cannot enable - null values found")) }
                     return Err(e("23502", &("column \"" + a.name + "\" of relation \"" + rel + "\" contains null values")))
                 }
-                t.cols[i].notNull = true
+                try lexdb_nnalter.setNotNull(mut &t, i, &a.to)
             } else if a.kind == lexdb_sql.A_SET_DEFAULT {
                 if t.cols[i].genKind != lexdb_sql.GEN_NONE {
                     return Err(lexdb_base.errDetail("42601", &("column \"" + a.name + "\" of relation \"" + rel + "\" is a generated column"), "", "Use ALTER TABLE ... ALTER COLUMN ... DROP EXPRESSION instead."))
@@ -5366,7 +5375,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 if t.cols[i].identity == lexdb_sql.ID_ALWAYS || t.cols[i].identity == lexdb_sql.ID_BY_DEFAULT {
                     return Err(e("42601", &("column \"" + a.name + "\" of relation \"" + rel + "\" is an identity column")))
                 }
-                t.cols[i].notNull = false
+                lexdb_nnalter.dropNotNull(mut &t, i)
             } else if a.kind == lexdb_sql.A_DROP_EXPR || a.kind == lexdb_sql.A_SET_EXPR {
                 // PostgreSQL's: a stored generated column made ordinary (its values stay), or given a new expression (its rows recomputed)
                 if t.cols[i].genKind == lexdb_sql.GEN_NONE {
@@ -5572,7 +5581,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
 type PkChange = record { changed: bool; nn: []str }
 
 // Whether name is taken among t's constraints, its key's among them.
-fn conTaken(t: &Table, name: &str): bool { return hasConName(t, name) || (lexdb_catalog.hasPk(t) && lexdb_catalog.pkConName(t) == name) }
+fn conTaken(t: &Table, name: &str): bool { return hasConName(t, name) || (lexdb_catalog.hasPk(t) && lexdb_catalog.pkConName(t) == name) || lexdb_nnalter.colOfName(t, name) >= 0 }
 
 // ADD [CONSTRAINT name] PRIMARY KEY (cols) | USING INDEX ix: t.pk made
 // those columns (NOT NULL), the hidden key's column dropped.
@@ -5778,6 +5787,7 @@ fn renameConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &T
     if !conTaken(t, from) { return Err(e("42704", &("constraint \"" + from + "\" for table \"" + rel + "\" does not exist"))) }
     if from == to { return Ok(Unit{}) }
     if conTaken(t, to) { return Err(e("42710", &("constraint \"" + to + "\" for relation \"" + rel + "\" already exists"))) }
+    if lexdb_nnalter.renameByName(t, from, to) { return Ok(Unit{}) }
     let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), to)
     for k in 0..len(t.invalid) {
         if t.invalid[k] == from { t.invalid[k] = to.toStr() }
@@ -5927,7 +5937,7 @@ fn pruneInvalid(t: mut &Table) {
             for c in t.checks { if c.name == on { there = true } }
             for f in t.fks { if f.name == on { there = true } }
         }
-        if there || strings.startsWith(&n, lexdb_catalog.CL_MARK) { append(mut &keep, n.clone()) }
+        if there || strings.startsWith(&n, lexdb_catalog.CL_MARK) || strings.startsWith(&n, lexdb_nncon.NN_MARK) { append(mut &keep, n.clone()) }
     }
     t.invalid = keep
 }
@@ -6474,7 +6484,7 @@ fn dropConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Tab
             return Ok(true)
         }
     }
-    return Ok(false)
+    return lexdb_nnalter.dropByName(t, name)
 }
 
 fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
@@ -15849,6 +15859,7 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
                     forceNull: try forced(&s.copy.forceNull, &names, &"FORCE_NULL")}
     var vs: []Val = []
     var count = 0
+    var skipped = 0                         // the rows ON_ERROR ignore skipped
     let where = "COPY " + lexdb_sql.baseName(&s.table) + ", line "
     var noUp = noUpsert()                   // COPY has no ON CONFLICT
     let noCols: []lexdb_sql.ColDef = []
@@ -15954,13 +15965,29 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             Err(x) {
                 // a value not of its column's type (insertOne turns them
                 // first, in order): which column, said as PostgreSQL does
+                var skip = false
                 for k in 0..len(vs) {
                     match lexdb_ops.coerceZ(vs[k].clone(), &t.cols[targets[k]].typ, &txn.sql.zone) {
                         Ok(_) {}
-                        Err(y) { return Err(within(y, &(where + rd.line.toStr() + ", column " + names[k] + ": " + quoted(&lexdb_sql.text(&vs[k]))))) }
+                        Err(y) {
+                            if s.copy.onErr == 0 { return Err(within(y, &(where + rd.line.toStr() + ", column " + names[k] + ": " + quoted(&lexdb_sql.text(&vs[k]))))) }
+                            // ON_ERROR ignore: the row is skipped (a value its column does not take; any other error ends the COPY)
+                            skip = true
+                            if s.copy.verb == 1 {
+                                notice(st, txn, &"00000", &("skipping row due to data type incompatibility at line " + rd.line.toStr() + " for column \"" + names[k] + "\": " +
+                                                            quoted(&lexdb_sql.text(&vs[k]))), &"")
+                            }
+                            break
+                        }
                     }
                 }
-                return Err(within(x, &(where + rd.line.toStr())))
+                if !skip { return Err(within(x, &(where + rd.line.toStr()))) }
+                skipped += 1
+                if s.copy.reject > 0 && skipped > s.copy.reject {
+                    return Err(within(e("22P02", &("skipped more than REJECT_LIMIT (" + s.copy.reject.toStr() + ") rows due to data type incompatibility")),
+                                      &(where + rd.line.toStr() + ": " + quoted(&recordText(&buf, &rd)))))
+                }
+                continue
             }
         }
         count += 1
@@ -15979,6 +16006,9 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     }
     // what follows an end marker (\.) is not read; the wire drops it
     try fkFinish(st, txn, &fw, mut &later)
+    if skipped > 0 && s.copy.verb != 2 {
+        notice(st, txn, &"00000", &(if skipped == 1 { "1 row was skipped due to data type incompatibility" } else { skipped.toStr() + " rows were skipped due to data type incompatibility" }), &"")
+    }
     return Ok(Res{cols: [], rows: [], tag: "COPY " + count.toStr(), hasRows: false, copy: COPY_NONE})
 }
 
@@ -16009,7 +16039,7 @@ type FastCopyPlan = record {
 
 fn fastCopyPlan(t: &Table, targets: &[]int, s: &lexdb_sql.Stmt): Option[FastCopyPlan] {
     if lexdb_gen.anyGen(&t.cols) { return None }          // (a generated column is computed row by row)
-    if s.copy.csv || s.copy.header || s.copy.bulk || s.copy.batchRows > 0 { return None }
+    if s.copy.csv || s.copy.header || s.copy.bulk || s.copy.batchRows > 0 || s.copy.onErr > 0 { return None }
     if s.copy.delim != "\t" || s.copy.null != "\\N" { return None }
     if len(s.copy.forceNotNull) > 0 || len(s.copy.forceNull) > 0 || len(s.copy.forceQuote) > 0 || s.copy.quoteAll { return None }
     if len(t.view) > 0 || len(t.slots) != 0 || len(t.checks) != 0 || len(t.fks) != 0 { return None }
@@ -16735,11 +16765,22 @@ fn copyOut(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         append(mut &lines, [Val.Text(strFromBytes(&b))])
     }
     let zone = txn.sql.zone.clone()
+    if s.copy.json && s.copy.forceArray { append(mut &lines, [Val.Text("[\n")]) }
+    var first = true
     for r in res.rows {
         replace(mut &b, [])
-        copyLine(&r, &s.copy, &fq, &res.cols, &zone, mut &b)
+        if s.copy.json {
+            // (FORCE_ARRAY: the rows are the elements of one array, a space before the first and a comma before the others)
+            if s.copy.forceArray { append(mut &b, if first { ' ' } else { ',' }) }
+            first = false
+            lexdb_copyjson.object(&r, &res.cols, &zone, mut &b)
+            append(mut &b, '\n')
+        } else {
+            copyLine(&r, &s.copy, &fq, &res.cols, &zone, mut &b)
+        }
         append(mut &lines, [Val.Text(strFromBytes(&b))])
     }
+    if s.copy.json && s.copy.forceArray { append(mut &lines, [Val.Text("]\n")]) }
     let n = len(res.rows)
     return Ok(Res{cols: replace(mut &res.cols, []), rows: lines, tag: "COPY " + n.toStr(), hasRows: false, copy: COPY_OUT})
 }
@@ -16765,9 +16806,20 @@ fn copyStream(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     }
     var count = 0
     let zone = txn.sql.zone.clone()
+    if s.copy.json && s.copy.forceArray {
+        let at = copyMsgStart(mut &b)
+        appendStr(mut &b, "[\n")
+        copyMsgEnd(mut &b, at)
+    }
     try eachRow(st, txn, &sel, params, lim, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
         let at = copyMsgStart(mut &b)
-        copyLine(r, &s.copy, &fq, &sel.outs, &zone, mut &b)
+        if s.copy.json {
+            if s.copy.forceArray { append(mut &b, if count == 0 { ' ' } else { ',' }) }
+            lexdb_copyjson.object(r, &sel.outs, &zone, mut &b)
+            append(mut &b, '\n')
+        } else {
+            copyLine(r, &s.copy, &fq, &sel.outs, &zone, mut &b)
+        }
         copyMsgEnd(mut &b, at)
         count += 1
         if len(b) >= COPY_PART {
@@ -16776,6 +16828,11 @@ fn copyStream(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         }
         return Ok(true)
     })
+    if s.copy.json && s.copy.forceArray {
+        let at = copyMsgStart(mut &b)
+        appendStr(mut &b, "]\n")
+        copyMsgEnd(mut &b, at)
+    }
     if !out(n, &b) { return Err(e("08006", "lexdb: the connection was lost during COPY")) }
     return Ok(Res{cols: [], rows: [], tag: "COPY " + count.toStr(), hasRows: false, copy: COPY_NONE})
 }
@@ -17731,6 +17788,7 @@ fn bindCatalog(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[Unit, 
               lexdb_pg.shownIn(&snap.path, &sc, &nm) + "\t" + sc + "\t" + nm + "\n")
     }
     for c in snap.cons { b += &("c\t" + c.oid.toStr() + "\t" + lexdb_pg.clean(&c.def) + "\n") }
+    for c in snap.nns { b += &("c\t" + c.oid.toStr() + "\t" + lexdb_pg.clean(&c.def) + "\n") }
     lexdb_syscat.bind(&snap, mut &b)
     // the routines (has_function_privilege, HAS_PERMS_BY_NAME): ACL object, name's key, signature, owner, dialect, privilege a use needs
     for r in snap.routines {

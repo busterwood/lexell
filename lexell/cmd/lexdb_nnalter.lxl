@@ -1,0 +1,127 @@
+// lexdb_nnalter: what CREATE TABLE and ALTER TABLE do with the names of NOT NULL constraints (PostgreSQL 18; lexdb_nncon, design/lexdb-new-features.md
+// 8.4). The statements' own code (lexdb_exec) calls these where a table's NOT NULL columns change; nothing here touches a row.
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_catalog"
+import "./lexdb_nncon"
+
+type Table = lexdb_catalog.Table
+type DbErr = lexdb_base.DbErr
+
+fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+// The names of the constraints of table t other than its NOT NULLs' (what a default name must not be).
+pub fn takenNames(t: &Table): []str {
+    var out: []str = []
+    if lexdb_catalog.hasPk(t) { append(mut &out, lexdb_catalog.pkConName(t)) }
+    for ix in t.indexes { if ix.con { append(mut &out, lexdb_sql.baseName(&ix.name)) } }
+    for fk in t.fks { append(mut &out, fk.name.clone()) }
+    for ck in t.checks { append(mut &out, ck.name.clone()) }
+    return out
+}
+
+// The table's name as it was written (what a default constraint name is made of).
+fn label(t: &Table): str { return if len(t.spell) > 0 { t.spell.clone() } else { lexdb_sql.baseName(&t.name) } }
+
+// The column (its index) whose NOT NULL constraint is called name, -1 none (nor the hidden key's).
+pub fn colOfName(t: &Table, name: &str): int {
+    let i = lexdb_nncon.colOf(&t.invalid, &label(t), &t.cols, &takenNames(t), name)
+    if i >= 0 && t.cols[i].name == lexdb_catalog.ROWID { return -1 }
+    return i
+}
+
+// CREATE TABLE: the names the statement gave ("column NUL name"): kept; 42710 for one that another constraint of the table, or another NOT NULL, has.
+pub fn createNames(t: mut &Table, names: &[]str): Result[Unit, DbErr] {
+    if len(names) == 0 { return Ok(Unit{}) }
+    let taken = takenNames(t)
+    var seen: []str = []
+    for en in names {
+        let z = strings.indexOf(&en, "\x00", 0)
+        let col = en[0..z].toStr()
+        let name = en[z + 1..len(en)].toStr()
+        if lexdb_base.hasStr(&taken, &name) || lexdb_base.hasStr(&seen, &name) {
+            return Err(e("42710", &("constraint \"" + name + "\" for relation \"" + lexdb_sql.baseName(&t.name) + "\" already exists")))
+        }
+        append(mut &seen, name.clone())
+        lexdb_nncon.setName(mut &t.invalid, &col, &name)
+    }
+    return Ok(Unit{})
+}
+
+// ALTER COLUMN i SET NOT NULL, or ADD [CONSTRAINT name] NOT NULL col: the column is NOT NULL, and called name when one was given. A column that
+// is NOT NULL already is not made again: a name that differs from its own is refused; a name another constraint has is 42710.
+pub fn setNotNull(t: mut &Table, i: int, name: &str): Result[Unit, DbErr] {
+    let rel = lexdb_sql.baseName(&t.name)
+    if len(name) > 0 {
+        let own = lexdb_nncon.nameOf(&t.invalid, &label(t), &t.cols[i], &takenNames(t))
+        if t.cols[i].notNull {
+            if own == name { return Ok(Unit{}) }
+            return Err(lexdb_base.errDetail("55000", &("cannot create not-null constraint \"" + name + "\" on column \"" + t.cols[i].name + "\" of table \"" + rel + "\""),
+                                            &("A not-null constraint named \"" + own + "\" already exists for this column."), ""))
+        }
+        if lexdb_base.hasStr(&takenNames(t), name) || colOfName(t, name) >= 0 {
+            return Err(e("42710", &("constraint \"" + name + "\" for relation \"" + rel + "\" already exists")))
+        }
+        lexdb_nncon.setName(mut &t.invalid, &t.cols[i].name, name)
+    }
+    t.cols[i].notNull = true
+    return Ok(Unit{})
+}
+
+// ADD COLUMN ... CONSTRAINT name NOT NULL: the column (appended, NOT NULL) is called name: 42710 for a name another constraint has.
+pub fn addColumnName(t: mut &Table, col: &str, name: &str): Result[Unit, DbErr] {
+    if lexdb_base.hasStr(&takenNames(t), name) || colOfName(t, name) >= 0 {
+        return Err(e("42710", &("constraint \"" + name + "\" for relation \"" + lexdb_sql.baseName(&t.name) + "\" already exists")))
+    }
+    lexdb_nncon.setName(mut &t.invalid, col, name)
+    return Ok(Unit{})
+}
+
+// DROP NOT NULL of column i, or DROP CONSTRAINT of its constraint: the name goes with it.
+pub fn dropNotNull(t: mut &Table, i: int) {
+    t.cols[i].notNull = false
+    lexdb_nncon.drop(mut &t.invalid, &t.cols[i].name)
+}
+
+// DROP CONSTRAINT name where name is a NOT NULL constraint: false when it is none. As DROP NOT NULL: a primary key's column, an identity column are refused.
+pub fn dropByName(t: mut &Table, name: &str): Result[bool, DbErr] {
+    let i = colOfName(t, name)
+    if i < 0 { return Ok(false) }
+    for k in t.pk {
+        if k == i && lexdb_catalog.hasPk(t) { return Err(e("42P16", &("column \"" + t.cols[i].name + "\" is in a primary key"))) }
+    }
+    if t.cols[i].identity == lexdb_sql.ID_ALWAYS || t.cols[i].identity == lexdb_sql.ID_BY_DEFAULT {
+        return Err(e("42601", &("column \"" + t.cols[i].name + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" is an identity column")))
+    }
+    dropNotNull(t, i)
+    return Ok(true)
+}
+
+// RENAME CONSTRAINT from TO to where from is a NOT NULL constraint: false when it is none (the caller has checked that to is free).
+pub fn renameByName(t: mut &Table, from: &str, to: &str): bool {
+    let i = colOfName(t, from)
+    if i < 0 { return false }
+    lexdb_nncon.setName(mut &t.invalid, &t.cols[i].name, to)
+    return true
+}
+
+// The table is renamed: every NOT NULL keeps the name it has now (as PostgreSQL's does).
+pub fn beforeRenameTable(t: mut &Table) {
+    let rel = label(t)
+    let taken = takenNames(t)
+    for c in t.cols {
+        if !c.notNull || c.name == lexdb_catalog.ROWID { continue }
+        if len(lexdb_nncon.given(&t.invalid, &c.name)) == 0 { lexdb_nncon.setName(mut &t.invalid, &c.name, &lexdb_nncon.nameOf(&t.invalid, &rel, &c, &taken)) }
+    }
+}
+
+// Column from of the table is renamed to: its NOT NULL keeps its name.
+pub fn renameColumn(t: mut &Table, from: &str, to: &str) {
+    var i = -1
+    for k in 0..len(t.cols) { if t.cols[k].name == from { i = k } }
+    if i >= 0 && t.cols[i].notNull && len(lexdb_nncon.given(&t.invalid, from)) == 0 {
+        lexdb_nncon.setName(mut &t.invalid, from, &lexdb_nncon.nameOf(&t.invalid, &label(t), &t.cols[i], &takenNames(t)))
+    }
+    lexdb_nncon.renameCol(mut &t.invalid, from, to)
+}
