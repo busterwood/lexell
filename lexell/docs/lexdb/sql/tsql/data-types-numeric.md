@@ -24,7 +24,7 @@ real
 `tinyint`, `smallint`, `int`, `bigint`
 : Integers of 1, 2, 4 and 8 bytes. `tinyint` is 0 to 255, `smallint` -32768 to 32767, `int` -2147483648 to
   2147483647, `bigint` -9223372036854775808 to 9223372036854775807. A value out of range for `smallint`, `int` or
-  `bigint` is error 8115.
+  `bigint` is error 8115, and so is a sum, difference or product of integers that does not fit (`2147483647 + 1`).
 
 `decimal`, `numeric`
 : The same type. An exact decimal number with *precision* significant digits (1 to 38, default 18) and *scale*
@@ -62,11 +62,7 @@ real
   refuses a larger value with 8115 (`numeric field overflow`). `money` is `numeric(19,4)`, as SQL Server's range
   suggests, but is named `decimal` in `sys.columns` after `SELECT INTO`.
 - **Scales of divisions differ.** `decimal(10,4) / 3` has scale 6, where SQL Server gives the larger scale (at
-  least 6, up to 38 - precision). `@p / 100` for a `decimal(5,2)` variable has scale 20. `AVG` of a `decimal`
-  has scale 6.
-- **`1 + @p / 100` gives an integer.** With `DECLARE @p decimal(5,2) = 10`, `1 + @p / 100` is 1, where SQL Server
-  gives 1.100000 (see [KNOWN-ISSUES](../../KNOWN-ISSUES.md)). The same sum with a constant (`1 + CAST(10 AS
-  decimal(5,2)) / 100`) is right.
+  least 6, up to 38 - precision). `AVG` of a `decimal` has scale 6.
 - `SUM` of `int` values does not raise 8115 when the total passes 2147483647; it returns the `bigint` total.
 - `SELECT ... INTO` and `sp_describe_first_result_set` report every computed decimal as `decimal(38,6)` and a
   `tinyint` or `money` column as `smallint` or `decimal`.
@@ -89,6 +85,8 @@ GO
 SELECT CAST(32768 AS smallint);
 GO
 SELECT CAST(2147483648 AS int);
+GO
+SELECT CAST(2147483647 AS int) + 1, 2147483647 + 1;
 ```
 
 ```text
@@ -99,9 +97,11 @@ t   s     i          b
 (1 row affected)
 
 Msg 8115, Level 16, State 1, Line 1
-smallint out of range
+Arithmetic overflow error converting expression to data type smallint.
 Msg 8115, Level 16, State 1, Line 1
-integer out of range
+Arithmetic overflow error converting expression to data type int.
+Msg 8115, Level 16, State 1, Line 1
+Arithmetic overflow error converting expression to data type int.
 ```
 
 ### B. Integer division and remainder
@@ -300,18 +300,18 @@ Msg 245, Level 16, State 1, Line 1
 Conversion failed when converting the varchar value 'abc' to data type int.
 ```
 
-### J. The decimal quotient under +
+### J. A decimal variable's quotient under +
 
 <!-- example: tsql -->
 ```sql
 DECLARE @p decimal(5,2) = 10;
-SELECT 1 + @p / 100 AS variable, 1 + CAST(10 AS decimal(5,2)) / 100 AS constant;
+SELECT 1 + @p / 100 AS variable, 1 + CAST(10 AS decimal(5,2)) / 100 AS constant, @p / 100 AS quotient;
 ```
 
 ```text
-variable constant
--------- --------
-1        1.100000
+variable constant quotient
+-------- -------- --------
+1.100000 1.100000 0.100000
 
 (1 row affected)
 ```
@@ -339,7 +339,7 @@ a   b
 (3 rows affected)
 
 Msg 8115, Level 16, State 1, Line 1
-smallint out of range
+Arithmetic overflow error converting expression to data type smallint.
 ```
 
 ## See also
