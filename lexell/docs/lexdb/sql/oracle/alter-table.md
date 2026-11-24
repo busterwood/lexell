@@ -13,16 +13,22 @@ ALTER TABLE [ schema. ] table
     | MODIFY ( column_modification [, ...] )
     | DROP COLUMN column
     | DROP ( column [, column ]... )
-    | ADD [ CONSTRAINT name ] table_constraint
+    | ADD [ CONSTRAINT name ] table_constraint [ constraint_state ]
     | DROP CONSTRAINT name
+    | { ENABLE | DISABLE } [ VALIDATE | NOVALIDATE ] CONSTRAINT name
+    | MODIFY CONSTRAINT name constraint_state
     | RENAME COLUMN old TO new
     | RENAME TO new_table }
 
 column_modification:
     column [ datatype ] [ DEFAULT expr ] [ NULL | NOT NULL ]
+
+constraint_state:
+    [ ENABLE | DISABLE ] [ VALIDATE | NOVALIDATE ] [ RELY | NORELY ]
 ```
 
-*column_definition* and *table_constraint* are as in [CREATE TABLE](create-table.md).
+*column_definition* and *table_constraint* are as in [CREATE TABLE](create-table.md), which also says what the
+constraint states mean.
 
 ## Arguments
 
@@ -40,18 +46,39 @@ column_modification:
 `DROP CONSTRAINT`
 : Removes a constraint by name.
 
+`ENABLE`, `DISABLE`, `MODIFY CONSTRAINT`
+: Change the state of a `CHECK` or foreign key constraint (see Remarks). `ENABLE [VALIDATE]` checks every row first:
+  a `CHECK` that a row fails is ORA-02293, a foreign key with no parent ORA-02298, and the constraint stays as it
+  was. `ENABLE NOVALIDATE` enables it without looking at the rows that are there. `DISABLE` stops the checking, and
+  the constraint is then also not validated. `DISABLE VALIDATE` checks the rows first, then disables. A bare
+  `VALIDATE` or `NOVALIDATE` (only in `MODIFY CONSTRAINT`) changes the validity alone: `VALIDATE` checks the rows,
+  `NOVALIDATE` forgets that they were checked. A name that is not a constraint of the table is ORA-02430
+  (`ENABLE`, `VALIDATE`) or ORA-02431 (`DISABLE`).
+
 `RENAME COLUMN`, `RENAME TO`
 : Renames a column, or the table.
 
 ## Remarks
 
 - Names in the statement are folded to upper case unless quoted.
+- A constraint has two states: *enabled* or *disabled* (`USER_CONSTRAINTS.STATUS`), and *validated* or *not validated*
+  (`VALIDATED`). A disabled constraint is never checked. An enabled one that is not validated is checked for rows
+  inserted or changed from then on (ORA-02290 for a `CHECK`, ORA-02291 for a foreign key), and the rows that are there
+  may break it. A disabled foreign key does not refuse the deletion of the parent (no ORA-02292) and does not
+  cascade `ON DELETE`.
 - Each statement does one kind of change; several `ADD` or `MODIFY` definitions go in one pair of brackets.
 
 ## Differences from Oracle
 
-- **Not supported (ORA-03001):** `ENABLE` and `DISABLE` of a constraint, `READ ONLY` and `READ WRITE`, and the other
-  clauses of Oracle's `ALTER TABLE` (storage, partitions, `MOVE`, `SHRINK`, `ROW MOVEMENT`).
+- **Not supported (ORA-03001):** `READ ONLY` and `READ WRITE`, and the other clauses of Oracle's `ALTER TABLE`
+  (storage, partitions, `MOVE`, `SHRINK`, `ROW MOVEMENT`).
+- **Constraint states** are kept for `CHECK` and foreign key constraints only. `PRIMARY KEY`, `UNIQUE` and `NOT NULL`
+  cannot be disabled: `ENABLE CONSTRAINT` or `DISABLE CONSTRAINT` of one is ORA-02430 (`no such constraint`, its text
+  saying `cannot enable` for both), and `DISABLE` or `NOVALIDATE` in the definition of one is ORA-00900. `RELY` and `NORELY` are read and not kept
+  (`USER_CONSTRAINTS.RELY` is empty). Oracle has no `NOT ENFORCED`; neither has lexdb (ORA-00900).
+- `ADD CONSTRAINT ... CHECK` over rows that break it is ORA-02290 (Oracle: ORA-02293).
+- lexdb tests every `CHECK` of a row on an `UPDATE`; Oracle tests only those that read a column the `UPDATE` sets. A
+  row that does not obey a constraint that is not validated therefore fails when any of its columns is updated.
 - `ALTER TABLE ... ALTER COLUMN` (T-SQL and PostgreSQL's form) is ORA-01735.
 
 ## Examples
@@ -256,12 +283,204 @@ ERROR:
 ORA-00942: table or view "SA"."NOTHERE" does not exist
 ```
 
-### H. What lexdb does not take
+### H. Constraint states: DISABLE and ENABLE
 
 <!-- example: oracle -->
 ```sql
-ALTER TABLE staff DISABLE CONSTRAINT emp_sal_ck;
+CREATE TABLE part (id NUMBER PRIMARY KEY, name VARCHAR2(20));
+CREATE TABLE bin (id NUMBER PRIMARY KEY, part_id NUMBER, qty NUMBER,
+  CONSTRAINT bin_qty_ck CHECK (qty >= 0) DISABLE,
+  CONSTRAINT bin_part_fk FOREIGN KEY (part_id) REFERENCES part (id) DISABLE);
+INSERT INTO part VALUES (1, 'bolt');
+INSERT INTO bin VALUES (1, 1, 10);
+INSERT INTO bin VALUES (2, 9, -5);
+COMMIT;
+SELECT constraint_name, constraint_type, status, validated FROM user_constraints
+WHERE table_name = 'BIN' ORDER BY constraint_name;
+```
+
+```text
+Table created.
+
+Table created.
+
+1 row created.
+
+1 row created.
+
+1 row created.
+
+Commit complete.
+
+CONSTRAINT_NAME CONSTRAINT_TYPE STATUS   VALIDATED
+--------------- --------------- -------- -------------
+BIN_PART_FK     R               DISABLED NOT VALIDATED
+BIN_PKEY        P               ENABLED  VALIDATED
+BIN_QTY_CK      C               DISABLED NOT VALIDATED
+
+3 rows selected.
+```
+
+Both constraints are disabled, so row 2 was taken. `ENABLE` checks the rows, and refuses while one breaks the
+constraint:
+
+<!-- example: oracle -->
+```sql
+ALTER TABLE bin ENABLE CONSTRAINT bin_qty_ck;
+ALTER TABLE bin ENABLE CONSTRAINT bin_part_fk;
+UPDATE bin SET qty = 0, part_id = 1 WHERE id = 2;
+ALTER TABLE bin ENABLE CONSTRAINT bin_qty_ck;
+ALTER TABLE bin ENABLE CONSTRAINT bin_part_fk;
+SELECT constraint_name, status, validated FROM user_constraints
+WHERE table_name = 'BIN' AND constraint_type IN ('C', 'R') ORDER BY constraint_name;
+```
+
+```text
+ERROR:
+ORA-02293: cannot validate (BIN_QTY_CK) - check constraint violated
+
+ERROR:
+ORA-02298: cannot validate (BIN_PART_FK) - parent keys not found
+
+1 row updated.
+
+Table altered.
+
+Table altered.
+
+CONSTRAINT_NAME STATUS  VALIDATED
+--------------- ------- ---------
+BIN_PART_FK     ENABLED VALIDATED
+BIN_QTY_CK      ENABLED VALIDATED
+
+2 rows selected.
+```
+
+`ENABLE NOVALIDATE` enables a constraint for the new rows and leaves the old ones unchecked:
+
+<!-- example: oracle -->
+```sql
+ALTER TABLE bin DISABLE CONSTRAINT bin_qty_ck;
+ALTER TABLE bin DISABLE CONSTRAINT bin_part_fk;
+UPDATE bin SET qty = -5, part_id = 9 WHERE id = 2;
+ALTER TABLE bin ENABLE NOVALIDATE CONSTRAINT bin_qty_ck;
+ALTER TABLE bin MODIFY CONSTRAINT bin_part_fk ENABLE NOVALIDATE;
+INSERT INTO bin VALUES (3, 1, -1);
+INSERT INTO bin VALUES (3, 8, 1);
+INSERT INTO bin VALUES (3, 1, 1);
+SELECT constraint_name, status, validated FROM user_constraints
+WHERE table_name = 'BIN' AND constraint_type IN ('C', 'R') ORDER BY constraint_name;
+```
+
+```text
+Table altered.
+
+Table altered.
+
+1 row updated.
+
+Table altered.
+
+Table altered.
+
+ERROR:
+ORA-02290: check constraint violated
+
+ERROR:
+ORA-02291: integrity constraint violated - parent key not found
+
+1 row created.
+
+CONSTRAINT_NAME STATUS  VALIDATED
+--------------- ------- -------------
+BIN_PART_FK     ENABLED NOT VALIDATED
+BIN_QTY_CK      ENABLED NOT VALIDATED
+
+2 rows selected.
+```
+
+`MODIFY CONSTRAINT ... VALIDATE` checks the rows of a constraint that is enabled and not validated, and a disabled
+foreign key does not stop the deletion of its parent:
+
+<!-- example: oracle -->
+```sql
+ALTER TABLE bin MODIFY CONSTRAINT bin_qty_ck VALIDATE;
+UPDATE bin SET qty = 0, part_id = 1 WHERE id = 2;
+ALTER TABLE bin MODIFY CONSTRAINT bin_qty_ck VALIDATE;
+DELETE FROM part WHERE id = 1;
+ALTER TABLE bin DISABLE CONSTRAINT bin_part_fk;
+DELETE FROM part WHERE id = 1;
+SELECT id, part_id FROM bin ORDER BY id;
+```
+
+```text
+ERROR:
+ORA-02293: cannot validate (BIN_QTY_CK) - check constraint violated
+
+1 row updated.
+
+Table altered.
+
+ERROR:
+ORA-02292: integrity constraint violated - child record found
+
+Table altered.
+
+1 row deleted.
+
+ID PART_ID
+-- -------
+ 1       1
+ 2       1
+ 3       1
+
+3 rows selected.
+```
+
+A state can be given when a constraint is added:
+
+<!-- example: oracle -->
+```sql
+ALTER TABLE bin ADD CONSTRAINT bin_cap_ck CHECK (qty < 1000) DISABLE;
+ALTER TABLE bin ADD CONSTRAINT bin_min_ck CHECK (qty > -10) ENABLE NOVALIDATE;
+ALTER TABLE bin DROP CONSTRAINT bin_cap_ck;
+SELECT constraint_name, status, validated FROM user_constraints
+WHERE table_name = 'BIN' AND constraint_type = 'C' ORDER BY constraint_name;
+ALTER TABLE bin ENABLE CONSTRAINT nosuch;
+ALTER TABLE bin MODIFY CONSTRAINT nosuch DISABLE;
+ALTER TABLE bin DISABLE CONSTRAINT nosuch;
+```
+
+```text
+Table altered.
+
+Table altered.
+
+Table altered.
+
+CONSTRAINT_NAME STATUS  VALIDATED
+--------------- ------- -------------
+BIN_MIN_CK      ENABLED NOT VALIDATED
+BIN_QTY_CK      ENABLED VALIDATED
+
+2 rows selected.
+
+ERROR:
+ORA-02430: cannot enable constraint (NOSUCH) - no such constraint
+
+ERROR:
+ORA-02431: cannot disable constraint (NOSUCH) - no such constraint
+
+ERROR:
+ORA-02431: cannot disable constraint (NOSUCH) - no such constraint
+```
+
+### I. What lexdb does not take
+
+<!-- example: oracle -->
+```sql
 ALTER TABLE staff READ ONLY;
+ALTER TABLE staff DISABLE CONSTRAINT emp_pkey;
 ALTER TABLE staff ALTER COLUMN salary SET DEFAULT 5;
 ```
 
@@ -270,7 +489,7 @@ ERROR:
 ORA-03001: unimplemented feature: lexdb: ALTER TABLE takes ADD, DROP, ALTER COLUMN, VALIDATE CONSTRAINT, RENAME and SET SCHEMA
 
 ERROR:
-ORA-03001: unimplemented feature: lexdb: ALTER TABLE takes ADD, DROP, ALTER COLUMN, VALIDATE CONSTRAINT, RENAME and SET SCHEMA
+ORA-02430: cannot enable constraint (EMP_PKEY) - no such constraint
 
 ERROR:
 ORA-01735: invalid ALTER TABLE option

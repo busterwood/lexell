@@ -32,8 +32,8 @@ Oracle. Each page names what lexdb lacks or does differently.
 
 | Statement | What it does |
 |---|---|
-| [CREATE TABLE](create-table.md) | Constraints, identity columns, `DEFAULT ON NULL`, virtual columns, `GLOBAL TEMPORARY ... ON COMMIT`. |
-| [ALTER TABLE](alter-table.md) | `ADD`, `MODIFY`, `DROP`, `RENAME COLUMN`, constraints. |
+| [CREATE TABLE](create-table.md) | Constraints (`DISABLE`, `ENABLE NOVALIDATE`), identity columns, `DEFAULT ON NULL`, virtual columns, `GLOBAL TEMPORARY ... ON COMMIT`. |
+| [ALTER TABLE](alter-table.md) | `ADD`, `MODIFY`, `DROP`, `RENAME COLUMN`, constraints (`ENABLE`, `DISABLE`, `MODIFY CONSTRAINT`). |
 | [DROP TABLE](drop-table.md) | `CASCADE CONSTRAINTS`, `PURGE`. |
 | [CREATE INDEX](create-index.md), [DROP INDEX](drop-index.md) | Unique and function-based indexes; `ALTER INDEX ... RENAME`. |
 | [CREATE VIEW](create-view.md), [DROP VIEW](drop-view.md) | `OR REPLACE`; views are read-only. |
