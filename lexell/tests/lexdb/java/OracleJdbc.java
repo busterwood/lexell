@@ -30,13 +30,14 @@ public class OracleJdbc {
         pass = a[2];
         c = DriverManager.getConnection(a[0], a[1], a[2]);
         c.setAutoCommit(true);
-        for (String t : new String[]{"JT_CHILD", "JT_ALL", "JT_PARENT", "JT_TX", "JT_MERGE", "JT_BATCH"}) ddl("drop table " + t);
+        for (String t : new String[]{"JT_CHILD", "JT_ALL", "JT_PARENT", "JT_TX", "JT_MERGE", "JT_BATCH", "JT_RU", "JT_RUB"}) ddl("drop table " + t);
         ddl("drop sequence JT_SEQ");
-        ddl("drop procedure JT_PROC"); ddl("drop function JT_FUNC");
+        ddl("drop procedure JT_PROC"); ddl("drop function JT_FUNC"); ddl("drop procedure JT_RU_P"); ddl("drop procedure JT_RU_Q");
         connection();
         types();
         binds();
         batch();
+        reuse();
         transactions();
         merge();
         errors();
@@ -47,9 +48,9 @@ public class OracleJdbc {
         warnings();
         storedFunctions();
         try { generatedKeys(); } catch (Exception e) { System.out.println("SKIP generatedKeys by column name: " + e.toString().split("\n")[0]); }
-        for (String t : new String[]{"JT_CHILD", "JT_ALL", "JT_PARENT", "JT_TX", "JT_MERGE", "JT_BATCH"}) ddl("drop table " + t);
+        for (String t : new String[]{"JT_CHILD", "JT_ALL", "JT_PARENT", "JT_TX", "JT_MERGE", "JT_BATCH", "JT_RU", "JT_RUB"}) ddl("drop table " + t);
         ddl("drop sequence JT_SEQ");
-        ddl("drop procedure JT_PROC"); ddl("drop function JT_FUNC");
+        ddl("drop procedure JT_PROC"); ddl("drop function JT_FUNC"); ddl("drop procedure JT_RU_P"); ddl("drop procedure JT_RU_Q");
         c.close();
         Check.done();
     }
@@ -238,6 +239,123 @@ public class OracleJdbc {
             s.addBatch("insert into JT_BATCH values (7000, 'a')"); s.addBatch("insert into JT_BATCH values (7001, 'b')"); s.addBatch("update JT_BATCH set v = 'c' where id >= 7000");
             Check.eq("statement batch", s.executeBatch().length, 3);
         }
+    }
+
+    // ---- a prepared statement run again: the driver sends the values alone (no bind descriptions) when their types are the last run's
+    static List<Integer> counts(int[] n) { return Arrays.stream(n).map(x -> x == Statement.SUCCESS_NO_INFO ? 1 : x).boxed().toList(); }
+
+    static void reuse() throws Exception {
+        ddl("create table JT_RU (id number(10) primary key, n number, s varchar2(30), d date, ts timestamp(6))");
+        try (PreparedStatement p = c.prepareStatement("insert into JT_RU (id, n, s, d, ts) values (?, ?, ?, ?, ?)")) {
+            List<Integer> got = new ArrayList<>();
+            for (int i = 1; i <= 20; i++) {
+                p.setInt(1, i); p.setBigDecimal(2, new BigDecimal(i + ".5")); p.setString(3, "row " + i);
+                p.setDate(4, java.sql.Date.valueOf("2024-01-" + String.format("%02d", i))); p.setTimestamp(5, Timestamp.valueOf("2024-01-01 00:00:" + String.format("%02d", i) + ".25"));
+                got.add(p.executeUpdate());
+            }
+            Check.eq("insert run 20 times", got, Collections.nCopies(20, 1));
+            // NULLs in every bind but the key, then values again, then NULLs of other types
+            p.setInt(1, 21); p.setNull(2, Types.NUMERIC); p.setNull(3, Types.VARCHAR); p.setNull(4, Types.DATE); p.setNull(5, Types.TIMESTAMP); Check.eq("insert nulls", p.executeUpdate(), 1);
+            p.setInt(1, 22); p.setInt(2, 22); p.setString(3, "back"); p.setDate(4, java.sql.Date.valueOf("2024-02-02")); p.setTimestamp(5, Timestamp.valueOf("2024-02-02 01:02:03")); Check.eq("insert after nulls", p.executeUpdate(), 1);
+            p.setInt(1, 23); p.setNull(2, Types.VARCHAR); p.setNull(3, Types.NUMERIC); p.setNull(4, Types.TIMESTAMP); p.setNull(5, Types.DATE); Check.eq("insert nulls of other types", p.executeUpdate(), 1);
+            // a bind that changes type between runs
+            p.setInt(1, 24); p.setString(2, "24"); p.setInt(3, 24); p.setDate(4, java.sql.Date.valueOf("2024-03-03")); p.setTimestamp(5, Timestamp.valueOf("2024-03-03 04:05:06")); Check.eq("insert, text for number, number for text", p.executeUpdate(), 1);
+            p.setInt(1, 25); p.setInt(2, 25); p.setString(3, "back again"); p.setDate(4, java.sql.Date.valueOf("2024-04-04")); p.setTimestamp(5, Timestamp.valueOf("2024-04-04 04:04:04")); Check.eq("insert, types back", p.executeUpdate(), 1);
+            p.setInt(1, 25); Check.eq("insert duplicate key", Check.errorOf(() -> p.executeUpdate()), 1);
+            p.setInt(1, 26); p.setInt(2, 26); p.setString(3, "after the error"); p.setNull(4, Types.DATE); p.setNull(5, Types.TIMESTAMP); Check.eq("insert after an error", p.executeUpdate(), 1);
+        }
+        Check.eq("reuse rows", rows("select count(*), sum(n), min(id), max(id) from JT_RU"), List.of("26|317|1|26"));
+        Check.eq("reuse values", rows("select id, n, s, to_char(d, 'YYYY-MM-DD'), to_char(ts, 'YYYY-MM-DD HH24:MI:SS.FF2') from JT_RU where id in (1, 20, 21, 22, 23, 24, 25, 26) order by id"),
+                 List.of("1|1.5|row 1|2024-01-01|2024-01-01 00:00:01.25", "20|20.5|row 20|2024-01-20|2024-01-01 00:00:20.25", "21|null|null|null|null", "22|22|back|2024-02-02|2024-02-02 01:02:03.00",
+                         "23|null|null|null|null", "24|24|24|2024-03-03|2024-03-03 04:05:06.00", "25|25|back again|2024-04-04|2024-04-04 04:04:04.00", "26|26|after the error|null|null"));
+        try (PreparedStatement p = c.prepareStatement("update JT_RU set n = ?, s = ? where id = ?")) {
+            List<Integer> got = new ArrayList<>();
+            for (int i = 1; i <= 10; i++) { p.setInt(1, i * 100); p.setString(2, "u" + i); p.setInt(3, i); got.add(p.executeUpdate()); }
+            p.setInt(1, 0); p.setString(2, "none"); p.setInt(3, 9999); got.add(p.executeUpdate());
+            p.setNull(1, Types.NUMERIC); p.setString(2, "null n"); p.setInt(3, 11); got.add(p.executeUpdate());
+            p.setInt(1, 1200); p.setNull(2, Types.VARCHAR); p.setInt(3, 12); got.add(p.executeUpdate());
+            Check.eq("update run again", got, List.of(1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1, 1));
+        }
+        Check.eq("updated", rows("select id, n, s from JT_RU where id in (1, 10, 11, 12) order by id"), List.of("1|100|u1", "10|1000|u10", "11|null|null n", "12|1200|null"));
+        try (PreparedStatement p = c.prepareStatement("delete from JT_RU where id = ?")) {
+            List<Integer> got = new ArrayList<>();
+            for (int i = 21; i <= 26; i++) { p.setInt(1, i); got.add(p.executeUpdate()); }
+            p.setInt(1, 21); got.add(p.executeUpdate());
+            Check.eq("delete run again", got, List.of(1, 1, 1, 1, 1, 1, 0));
+        }
+        Check.eq("deleted", rows("select count(*) from JT_RU"), List.of("20"));
+        try (PreparedStatement p = c.prepareStatement("merge into JT_RU t using (select ? id, ? n from dual) x on (t.id = x.id) when matched then update set t.n = x.n when not matched then insert (id, n) values (x.id, x.n)")) {
+            List<Integer> got = new ArrayList<>();
+            for (int i = 19; i <= 23; i++) { p.setInt(1, i); p.setInt(2, i * 7); got.add(p.executeUpdate()); }
+            Check.eq("merge run again", got, List.of(1, 1, 1, 1, 1));
+        }
+        Check.eq("merged", rows("select count(*), sum(n) from JT_RU where id >= 19"), List.of("5|" + (19 + 20 + 21 + 22 + 23) * 7));
+        // PL/SQL: a call and a block, IN only, then with an OUT and an IN OUT
+        try (Statement s = c.createStatement()) {
+            s.execute("create or replace procedure JT_RU_P(k in number) is begin update JT_RU set n = k where id = 1; end;");
+            s.execute("create or replace procedure JT_RU_Q(a in number, b in out number, o out varchar2) is begin b := b + a; o := 'sum=' || b; end;");
+        }
+        try (CallableStatement cs = c.prepareCall("{call JT_RU_P(?)}")) {
+            for (int i = 1; i <= 5; i++) { cs.setInt(1, i * 11); cs.execute(); }
+            Check.eq("call run again", rows("select n from JT_RU where id = 1"), List.of("55"));
+        }
+        try (CallableStatement cs = c.prepareCall("begin JT_RU_P(?); end;")) {
+            for (int i = 1; i <= 5; i++) { cs.setInt(1, i * 13); cs.execute(); }
+            Check.eq("block run again", rows("select n from JT_RU where id = 1"), List.of("65"));
+            cs.setNull(1, Types.NUMERIC); cs.execute();
+            Check.eq("block run again with null", rows("select n from JT_RU where id = 1"), List.of("null"));
+            cs.setString(1, "77"); cs.execute();
+            Check.eq("block run again, text for number", rows("select n from JT_RU where id = 1"), List.of("77"));
+        }
+        try (CallableStatement cs = c.prepareCall("{call JT_RU_Q(?, ?, ?)}")) {
+            cs.registerOutParameter(2, Types.NUMERIC); cs.registerOutParameter(3, Types.VARCHAR);
+            List<String> got = new ArrayList<>();
+            for (int i = 1; i <= 4; i++) { cs.setInt(1, i); cs.setInt(2, i * 10); cs.execute(); got.add(cs.getInt(2) + "/" + cs.getString(3)); }
+            Check.eq("call with OUT run again", got, List.of("11/sum=11", "22/sum=22", "33/sum=33", "44/sum=44"));
+        }
+        // a batch is array binds; the statement is run again as a batch
+        ddl("create table JT_RUB (id number(10) primary key, v varchar2(20), d date)");
+        try (PreparedStatement p = c.prepareStatement("insert into JT_RUB (id, v, d) values (?, ?, ?)")) {
+            for (int round = 0; round < 3; round++) {
+                for (int i = 0; i < 100; i++) { p.setInt(1, round * 1000 + i); if (i % 10 == 9) p.setNull(2, Types.VARCHAR); else p.setString(2, "r" + round + "-" + i); p.setDate(3, java.sql.Date.valueOf("2024-05-05")); p.addBatch(); }
+                Check.eq("batch of 100 (round " + round + ")", counts(p.executeBatch()), Collections.nCopies(100, 1));
+            }
+            for (int i = 0; i < 3; i++) { p.setInt(1, 5000 + i); p.setString(2, "small"); p.setNull(3, Types.DATE); p.addBatch(); }
+            Check.eq("batch of 3 after batches of 100", counts(p.executeBatch()), List.of(1, 1, 1));
+            p.setInt(1, 6000); p.setString(2, "single"); p.setNull(3, Types.DATE); Check.eq("single run after batches", p.executeUpdate(), 1);
+        }
+        Check.eq("batch rows run again", rows("select count(*), sum(case when v is null then 1 else 0 end), count(d) from JT_RUB"), List.of("304|30|300"));
+        try (PreparedStatement p = c.prepareStatement("update JT_RUB set v = ? where id = ?")) {
+            for (int round = 0; round < 2; round++) {
+                for (int i = 0; i < 50; i++) { p.setString(1, "u" + round); p.setInt(2, round * 1000 + i); p.addBatch(); }
+                Check.eq("update batch of 50 (round " + round + ")", counts(p.executeBatch()), Collections.nCopies(50, 1));
+            }
+        }
+        Check.eq("update batch rows", rows("select count(*) from JT_RUB where v in ('u0', 'u1')"), List.of("100"));
+        // RETURNING ... INTO, run again
+        try (PreparedStatement p0 = c.prepareStatement("insert into JT_RUB (id, v) values (?, ?) returning id, v into ?, ?")) {
+            oracle.jdbc.OraclePreparedStatement p = p0.unwrap(oracle.jdbc.OraclePreparedStatement.class);
+            List<String> got = new ArrayList<>();
+            try {
+                for (int i = 1; i <= 3; i++) {
+                    p.setInt(1, 7000 + i); p.setString(2, "ret" + i); p.registerReturnParameter(3, Types.NUMERIC); p.registerReturnParameter(4, Types.VARCHAR);
+                    Check.eq("returning count " + i, p.executeUpdate(), 1);
+                    try (ResultSet r = p.getReturnResultSet()) { while (r.next()) got.add(r.getInt(1) + "/" + r.getString(2)); }
+                }
+                Check.eq("returning run again", got, List.of("7001/ret1", "7002/ret2", "7003/ret3"));
+            } catch (SQLException e) { System.out.println("SKIP returning run again: " + e.getMessage().split("\n")[0]); }
+        }
+        // implicit statement caching: prepareStatement of the same text returns the cursor the driver kept
+        oracle.jdbc.OracleConnection oc = c.unwrap(oracle.jdbc.OracleConnection.class);
+        oc.setImplicitCachingEnabled(true); oc.setStatementCacheSize(10);
+        for (int i = 1; i <= 6; i++) {
+            try (PreparedStatement p = c.prepareStatement("insert into JT_RUB (id, v) values (?, ?)")) { p.setInt(1, 8000 + i); p.setString(2, "cached " + i); Check.eq("cached insert " + i, p.executeUpdate(), 1); }
+            try (PreparedStatement p = c.prepareStatement("update JT_RUB set v = ? where id = ?")) { p.setString(1, "cached u" + i); p.setInt(2, 8000 + i); Check.eq("cached update " + i, p.executeUpdate(), 1); }
+            try (PreparedStatement p = c.prepareStatement("select v from JT_RUB where id = ?")) { p.setInt(1, 8000 + i); try (ResultSet r = p.executeQuery()) { r.next(); Check.eq("cached select " + i, r.getString(1), "cached u" + i); } }
+        }
+        try (PreparedStatement p = c.prepareStatement("delete from JT_RUB where id = ?")) { for (int i = 1; i <= 6; i++) { p.setInt(1, 8000 + i); Check.eq("cached delete " + i, p.executeUpdate(), 1); } }
+        oc.setImplicitCachingEnabled(false);
+        Check.eq("cache rows", rows("select count(*) from JT_RUB where id >= 8000"), List.of("0"));
     }
 
     // ---- transactions

@@ -1,0 +1,176 @@
+// lexdb over TNS: an open DML cursor run again (design/lexdb-oracle.md, "As built: a cursor run again"). JDBC's
+// PreparedStatement parses an INSERT, UPDATE, DELETE, MERGE or PL/SQL block with its first executeUpdate() (bind
+// descriptions and values) and runs the cursor again with the values alone: an EXECUTE of the cursor with no SQL and no
+// bind descriptions (a bind count of 0), the values typed by the descriptions of the run before. lexdb answered that
+// with ORA-01008 (the same shape from a SELECT is a different call, and worked). Here the client sends exactly that
+// (tns.Execute.valuesOnly): INSERT, UPDATE, DELETE, MERGE and a block, each run again with the same types, with NULL,
+// with the descriptions sent again for a changed type (and the values alone after it), and a run that fails
+// (the cursor stays usable).
+// expect: insert first: rows 1
+// expect: insert again: rows 1
+// expect: insert again with null: rows 1
+// expect: insert again, no change of type: rows 1
+// expect: insert, types changed: rows 1
+// expect: insert, values alone after the change: rows 1
+// expect: insert duplicate: error 1
+// expect: insert after the error: rows 1
+// expect: table: 1 10 'a' | 2 20 'b' | 3 30 NULL | 4 40 'd' | 5 50 'e' | 6 60 'f' | 7 70 'g' | 8 80 'h'
+// expect: update first: rows 1
+// expect: update again: rows 1
+// expect: update no row: rows 0
+// expect: update again after none: rows 1
+// expect: updated: 1 11 | 2 22 | 3 33 | 4 40 | 5 50 | 6 60 | 7 70 | 8 80
+// expect: delete first: rows 1
+// expect: delete again: rows 1
+// expect: delete again, none: rows 0
+// expect: left: 3 4 5 6 7 8
+// expect: merge first: rows 1
+// expect: merge again, matched: rows 1
+// expect: merge again, new: rows 1
+// expect: merged: 3 33 | 4 4 | 5 500 | 6 60 | 7 70 | 8 80 | 9 90
+// expect: block first: rows 0
+// expect: block again: rows 0
+// expect: block again with null: rows 0
+// expect: block table: 3 134 | 4 105 | 5 601 | 6 161 | 7 171 | 8 181 | 9 191
+// expect: parsed again with the same cursor: rows 1
+import "task"
+import "net"
+import "strings"
+import "time"
+import "tns"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+var CUR: int = 0
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(&(s.toStr())) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+fn num(n: int): tns.Bind { return tns.numberBind(&tns.numOfInt(n)).unwrap() }
+fn txt(s: &str): tns.Bind { return tns.textBind(s, 4000).unwrap() }
+
+// An execute of cursor id (0: parse sql) of the kind; again: only the values follow the cursor's id.
+fn ex(sql: &str, kind: int, id: int, binds: []tns.Bind, again: bool): tns.Execute {
+    return tns.Execute{sql: sql.clone(), kind: kind, cursorId: id, binds: binds, prefetch: 1, commit: true, fetchOnly: false, valuesOnly: again}
+}
+
+fn run(s: mut &tns.Session, label: &str, e: &tns.Execute) {
+    match s.execute(e, &[]) {
+        Ok(r) {
+            if r.error.cursorId != 0 { CUR = r.error.cursorId }
+            if r.hasError && r.error.num != 0 { println(label + ": error " + r.error.num.toStr()) } else { println(label + ": rows " + r.error.rowCount.toStr()) }
+        }
+        Err(x) { println(label + ": wire error " + x.code.toStr() + " " + x.msg) }
+    }
+}
+
+fn table(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(sql, &[]) {
+        Ok(rows) {
+            var out: []str = []
+            for i in 0..rows.rowCount() {
+                var cells: []str = []
+                for k in 0..rows.columnCount() {
+                    match rows.isNull(i, k) {
+                        Ok(n) {
+                            if n { append(mut &cells, "NULL") } else {
+                                match rows.value(i, k) {
+                                    Ok(v) { append(mut &cells, v.toStr()) }
+                                    Err(e) { append(mut &cells, "error " + e.code.toStr()) }
+                                }
+                            }
+                        }
+                        Err(e) { append(mut &cells, "error " + e.code.toStr()) }
+                    }
+                }
+                append(mut &out, strings.join(&cells, " "))
+            }
+            return strings.join(&out, " | ")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn client(port: &str) {
+    let cs = "User Id=sa;Password=sa;Data Source=127.0.0.1:" + port + "/lexdb"
+    var c = connect(&cs)
+    c.exec("create table ru (id number(10) primary key, v number(10), w varchar2(20))").unwrap()
+    c.exec("create procedure bump(p in number, q in varchar2) is begin update ru set v = v + p where id > 2; update ru set w = q where id = 3; end;").unwrap()
+    let st = oracle.parseConnString(&cs).unwrap()
+    var s = tns.open(&st.config).unwrap()
+    let dml = tns.S_DML
+    // INSERT: the first run parses, the rest are values alone
+    let ins = "insert into ru values (:1, :2, :3)"
+    run(mut &s, "insert first", &ex(ins, dml, 0, [num(1), num(10), txt("a")], false))
+    let id = CUR
+    run(mut &s, "insert again", &ex("", dml, id, [num(2), num(20), txt("b")], true))
+    run(mut &s, "insert again with null", &ex("", dml, id, [num(3), num(30), tns.nullBind()], true))
+    run(mut &s, "insert again, no change of type", &ex("", dml, id, [num(4), num(40), txt("d")], true))
+    // the third bind a number, the second text: the descriptions are sent again, then values alone as typed by them
+    run(mut &s, "insert, types changed", &ex("", dml, id, [num(5), txt("50"), txt("e")], false))
+    run(mut &s, "insert, values alone after the change", &ex("", dml, id, [num(6), txt("60"), txt("f")], true))
+    run(mut &s, "insert duplicate", &ex("", dml, id, [num(6), txt("61"), txt("x")], true))
+    run(mut &s, "insert after the error", &ex("", dml, id, [num(7), txt("70"), txt("g")], true))
+    c.run("insert into ru values (8, 80, 'h')", &[]).unwrap()
+    println("table: " + table(mut &c, &"select id, v, w from ru order by id"))
+    // UPDATE
+    let upd = "update ru set v = :1 where id = :2"
+    run(mut &s, "update first", &ex(upd, dml, 0, [num(11), num(1)], false))
+    let uid = CUR
+    run(mut &s, "update again", &ex("", dml, uid, [num(22), num(2)], true))
+    run(mut &s, "update no row", &ex("", dml, uid, [num(0), num(99)], true))
+    run(mut &s, "update again after none", &ex("", dml, uid, [num(33), num(3)], true))
+    println("updated: " + table(mut &c, &"select id, v from ru order by id"))
+    // DELETE
+    let del = "delete from ru where id = :1"
+    run(mut &s, "delete first", &ex(del, dml, 0, [num(1)], false))
+    let did = CUR
+    run(mut &s, "delete again", &ex("", dml, did, [num(2)], true))
+    run(mut &s, "delete again, none", &ex("", dml, did, [num(2)], true))
+    println("left: " + strings.replaceAll(&(table(mut &c, &"select id from ru order by id")), " | ", " "))
+    // MERGE
+    let mrg = "merge into ru using dual on (ru.id = :1) when matched then update set v = :2 when not matched then insert (id, v) values (:3, :4)"
+    run(mut &s, "merge first", &ex(mrg, dml, 0, [num(4), num(4), num(4), num(4)], false))
+    let mid = CUR
+    run(mut &s, "merge again, matched", &ex("", dml, mid, [num(5), num(500), num(5), num(500)], true))
+    run(mut &s, "merge again, new", &ex("", dml, mid, [num(9), num(90), num(9), num(90)], true))
+    println("merged: " + table(mut &c, &"select id, v from ru order by id"))
+    // a block
+    let blk = "begin bump(:1, :2); end;"
+    run(mut &s, "block first", &ex(blk, tns.S_PLSQL, 0, [num(100), txt("p")], false))
+    let bid = CUR
+    run(mut &s, "block again", &ex("", tns.S_PLSQL, bid, [num(1), txt("q")], true))
+    run(mut &s, "block again with null", &ex("", tns.S_PLSQL, bid, [num(0), tns.nullBind()], true))
+    println("block table: " + table(mut &c, &"select id, v from ru order by id"))
+    // the same cursor parsed again (a new text) is a statement of its own
+    run(mut &s, "parsed again with the same cursor", &ex("insert into ru values (:1, :2, :3)", dml, 0, [num(10), num(100), txt("z")], false))
+    s.close()
+    c.logoff()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

@@ -13077,3 +13077,10 @@ statement is gone). Oracle package variables are INTO and OUT targets (`Cx.targe
 them. `COPY ... TO (FORMAT json [, FORCE_ARRAY])` writes one object a row (`lexdb_copyjson`); `COPY ... FROM` takes `ON_ERROR ignore` (a row a column's type does not take is skipped and
 counted, a NOTICE at the end), `REJECT_LIMIT n` and `LOG_VERBOSITY verbose | silent` in the generic row loop only (the fast path takes no COPY with ON_ERROR). Tests `exec_nncon`, `exec_copyopts`.
 Plan: Oracle annotations (lexdb-new-features.md 8.5).
+
+## As built: a prepared DML statement run again over TNS, and the other doors' (2026-11-24)
+
+ojdbc's second `executeUpdate()` of a PreparedStatement (an INSERT, UPDATE, DELETE, MERGE or block) was ORA-01008: the cursor is run again with an EXECUTE that has no SQL and no bind descriptions, the
+values alone, which `lexdb_tns.readRequest` took for no values (lexdb-oracle.md, "a cursor run again"). pgjdbc 42.7.14 (`prepareThreshold` 0, 1 and 5, past the switch to a server-side statement) and
+mssql-jdbc (sp_prepexec / sp_execute) re-execute INSERT, UPDATE, DELETE, SELECT and batches without a failure. Test `tns_reuse` (in process, with `tns.Execute.valuesOnly`), `OracleJdbc.reuse`
+(256 passed against lexdb, 259 against Oracle Free). Point select, INSERT and UPDATE by key: equal within the placement noise of any change to the TNS door's file (lexdb-oracle.md).
