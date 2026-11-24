@@ -22,8 +22,10 @@ FORMAT ( value, format [, culture ] ) → nvarchar
 
 *culture*
 : A culture name, `'en-US'` by default. Dates have the month and day names, patterns, separators and AM or PM of
-  `'en-US'`, `'en-GB'`, `'de-DE'`, `'fr-FR'`, `'es-ES'`, `'it-IT'`, `'nl-NL'`, `'pt-BR'`, `'ja-JP'` or `'sv-SE'` (also
-  the language alone, such as `'de'`). Numbers follow 61 cultures (`'fr-FR'`, `'de-CH'`, `'en-IN'`, `'ru-RU'`,
+  46 cultures: `'en-US'`, `'en-GB'`, `'de-DE'`, `'fr-FR'`, `'es-ES'`, `'it-IT'`, `'nl-NL'`, `'pt-BR'`, `'ja-JP'`,
+  `'sv-SE'` and 36 more (`'en-AU'`, `'de-AT'`, `'fr-CA'`, `'es-MX'`, `'zh-CN'`, `'ko-KR'`, `'pl-PL'`, `'ru-RU'`,
+  `'tr-TR'`, `'th-TH'`, `'hi-IN'` and others; the language alone, such as `'de'`, takes the first of its cultures).
+  Numbers follow 61 cultures (`'fr-FR'`, `'de-CH'`, `'en-IN'`, `'ru-RU'`,
   `'ja-JP'` and others: their separators, grouping and currency and percent patterns). A name of the form of a
   culture (a language of two or three letters, then parts of letters and digits joined by `-`, such as `'xx-YY'`)
   that lexdb does not know gets the invariant culture, as in SQL Server 2022. A name of any other form
@@ -71,10 +73,10 @@ text in quotes or after `\`; any other character as it is.
 
 ## Differences from SQL Server
 
-- **Dates of other cultures are `en-US`'s.** Only the ten cultures above have their own month and day names and
-  patterns; a real culture outside them, such as `'ru-RU'`, gives dates the `en-US` names and patterns (SQL Server
-  gives its own). A name of the right form that no culture has gets the invariant culture, as in SQL Server
-  (`Thursday, 05 March 2026` for `'D'` of `'xx-YY'`).
+- **Dates of 46 cultures only.** `'ar-SA'` (it uses the Hijri calendar, so every number differs) and the cultures
+  outside the 46 get `en-US` dates (SQL Server gives their own). A name of the right form that no culture has gets
+  the invariant culture, as in SQL Server (`Thursday, 05 March 2026` for `'D'` of `'xx-YY'`). A name of the wrong
+  form is error 9818.
 - **Numbers follow 61 cultures.** A real culture outside them is read as the invariant one (`,` and `.`, `¤` for the
   currency), where SQL Server has its own numbers for it.
 - `FORMAT` of a `time` value is formatted as a .NET `TimeSpan`: the standard formats `c`, `t`, `T`, `g` and `G` and a
@@ -230,6 +232,42 @@ gb_f                sv_g                unknown_culture
 05 March 2026 14:07 2026-03-05 14:07:09 03/05/2026
 
 (1 row affected)
+```
+
+A month name takes its genitive form beside a day of the month in the pattern, as .NET does for Polish, Czech,
+Russian, Ukrainian, Greek and Finnish; `fi-FI` and `id-ID` write the time with `.` instead of `:`; `th-TH` counts years
+in the Buddhist era (+543):
+
+<!-- example: tsql -->
+```sql
+DECLARE @d datetime2 = '2026-03-05 14:07:09';
+SELECT FORMAT(@d, 'D', 'ru-RU') AS ru_long, FORMAT(@d, 'MMMM', 'ru-RU') AS ru_month, FORMAT(@d, 'D', 'pl-PL') AS pl_long;
+SELECT FORMAT(@d, 'G', 'fi-FI') AS fi_g, FORMAT(@d, 'T', 'id-ID') AS id_t, FORMAT(@d, 'd', 'th-TH') AS th_d;
+SELECT FORMAT(@d, 'D', 'ar-SA') AS ar_sa, FORMAT(@d, 'D', 'xx-XX') AS unknown_culture;
+SELECT FORMAT(@d, 'D', 'english') AS wrong_form;
+```
+
+```text
+ru_long         ru_month pl_long
+--------------- -------- ----------------------
+5 марта 2026 г. Март     czwartek, 5 marca 2026
+
+(1 row affected)
+
+fi_g              id_t     th_d
+----------------- -------- --------
+5.3.2026 14.07.09 14.07.09 5/3/2569
+
+(1 row affected)
+
+ar_sa                   unknown_culture
+----------------------- -----------------------
+Thursday, March 5, 2026 Thursday, 05 March 2026
+
+(1 row affected)
+
+Msg 9818, Level 16, State 1, Line 5
+The culture parameter 'english' provided in the function call is not supported.
 ```
 
 ### H. Rounding and the numeric types
