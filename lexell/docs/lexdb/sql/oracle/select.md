@@ -108,8 +108,6 @@ select_list:
 - `SELECT *` over a `NATURAL JOIN` or `JOIN ... USING` names its columns in lower case; see [Joins](select-join.md).
 - Some errors have other numbers: `SELECT DISTINCT name ... ORDER BY salary` is ORA-20000 (Oracle ORA-01791), and
   `ORDER BY` on a column that a set operator's first query does not name is ORA-20000 (Oracle ORA-00904).
-- A query whose text is exactly 84 bytes long, with its final `;`, is answered with ORA-00900 although it is valid
-  (seen with plain `SELECT` and `UPDATE` statements). Add or remove a space. This is listed in the known issues.
 - Hints (`/*+ ... */`) are read as comments. `SAMPLE`, `AS OF` (flashback), `PIVOT`, `UNPIVOT`, `MODEL`,
   partitioned outer joins, `XMLTABLE` and `JSON_TABLE` are not supported (ORA-00900).
 

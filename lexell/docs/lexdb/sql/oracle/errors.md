@@ -27,13 +27,13 @@ it.
 | ORA-00903 | Invalid table name. |
 | ORA-00904 | Invalid identifier: a column, a function or a pseudo-column that does not exist. |
 | ORA-00918 | A column name that is ambiguous. |
-| ORA-00942 | A table, view or sequence that does not exist (the message names `"SCHEMA"."NAME"`). |
+| ORA-00942 | A table or view that does not exist (an `INSERT` into a table whose default calls a dropped sequence, too) (the message names `"SCHEMA"."NAME"`). |
 | ORA-00947 | Not enough values in an `INSERT`. |
 | ORA-00955 | A name that is already used by an object. |
 | ORA-00957 | A duplicate column name. |
 | ORA-00979 | A select-list column that is not in `GROUP BY`. |
 | ORA-01418 | An index that does not exist. |
-| ORA-02289 | A sequence that does not exist (in `DROP SEQUENCE`). |
+| ORA-02289 | A sequence that does not exist (in `DROP SEQUENCE`, and `NEXTVAL` or `CURRVAL` of a missing or dropped one). |
 
 ### Constraints and data
 
@@ -45,12 +45,14 @@ it.
 | ORA-02291 | No parent key for a foreign key. |
 | ORA-02292 | A child row exists for a parent key being deleted. |
 | ORA-02260 | A second `PRIMARY KEY` in `CREATE TABLE`. |
-| ORA-02449 | A table dropped while other tables' foreign keys point at it (use `CASCADE CONSTRAINTS`); also, with that message, a sequence dropped while a column default calls it. |
+| ORA-02449 | A table dropped while other tables' foreign keys point at it (use `CASCADE CONSTRAINTS`). |
 | ORA-12899 | A string too long for the column. |
 | ORA-01438 | A number with more digits than the column's precision. |
 | ORA-01476 | Division by zero. |
 | ORA-01722 | A string that is not a number. |
 | ORA-01427 | A subquery that returns more than one row where one is expected. |
+| ORA-01428, ORA-01760 | A function argument out of range (a `REGEXP_` position of 0, say); an illegal match parameter. |
+| ORA-12725 to ORA-12732 | A regular expression that cannot be read: unmatched parentheses, bracket, back reference, range, class, repeat count. |
 | ORA-01841, ORA-01843 | A date that cannot be read: a bad year or month. |
 | ORA-01727 | A `NUMBER` precision out of range (1 to 38). |
 
@@ -80,6 +82,8 @@ it.
 | ORA-06512 | Added after another error: the line of the block where it was raised. |
 | ORA-20000 to ORA-20999 | `RAISE_APPLICATION_ERROR` with your own number; lexdb also uses ORA-20000 for some of its own refusals (a sequence at its limit, a savepoint outside a transaction). |
 | ORA-04042 | `GRANT EXECUTE` on a procedure that does not exist. |
+| ORA-04043 | `ALTER PROCEDURE`, `FUNCTION` or `PACKAGE ... COMPILE` of a unit that does not exist. |
+| ORA-06575, PLS-00905 | `CALL` of a unit that is invalid (it was stored with compile errors); a block that names one. |
 
 ### Refusals
 
@@ -96,7 +100,7 @@ it.
 ## Differences from Oracle
 
 - Several errors Oracle gives are different here: `COMMIT COMMENT` is ORA-00900, a missing procedure in `CALL` is
-  ORA-06550, a missing sequence in `NEXTVAL` is ORA-00942, a savepoint that does not exist is ORA-20000
+  ORA-06550, a savepoint that does not exist is ORA-20000
   (Oracle: ORA-01086), a sequence past its limit is ORA-20000 (Oracle: ORA-08004).
 - `INSERT ALL`, `CREATE TRIGGER` and `CREATE SYNONYM` are refused as above (ORA-00900 and ORA-03001).
 - Some statements lexdb does not take are ORA-00900 where Oracle's syntax is fine (a clause lexdb does not know).
