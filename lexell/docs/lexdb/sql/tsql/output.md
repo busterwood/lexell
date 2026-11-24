@@ -50,6 +50,8 @@ column_name ::=
   `DELETE` and `MERGE`.
 - `OUTPUT` is the way to get the identity values of many inserted rows, where `SCOPE_IDENTITY()` gives only the last.
 - The order of the output rows is not defined.
+- `OUTPUT` takes no subquery, in any of the four statements: it is error 10705, as in SQL Server. Read the other
+  table in a join or the `MERGE` source, and use `INSERTED` and `DELETED` for the changed row.
 
 ## Differences from SQL Server
 
@@ -184,6 +186,8 @@ UPDATE dbo.item SET qty = 1 OUTPUT INSERTED.id INTO #missing WHERE id = 1;
 GO
 UPDATE dbo.item SET qty = 1 OUTPUT INSERTED.id INTO dbo.audit (item_id) OUTPUT INSERTED.name WHERE id = 1;
 GO
+UPDATE dbo.item SET qty = 1 OUTPUT INSERTED.id, (SELECT COUNT(*) FROM dbo.audit) AS audited WHERE id = 1;
+GO
 ```
 
 ```text
@@ -191,6 +195,8 @@ Msg 208, Level 16, State 1, Line 1
 Invalid object name '#missing'.
 Msg 50000, Level 16, State 1, Line 1
 lexdb: OUTPUT INTO followed by an OUTPUT clause that returns rows is not supported yet
+Msg 10705, Level 16, State 1, Line 1
+Subqueries are not allowed in the OUTPUT clause.
 ```
 
 ## See also
