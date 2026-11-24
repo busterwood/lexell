@@ -28,14 +28,15 @@ it.
 | ORA-00904 | Invalid identifier: a column, a function or a pseudo-column that does not exist. |
 | ORA-00918 | A column name that is ambiguous. |
 | ORA-00960 | A name in `QUALIFY` that two select-list items are named. |
-| ORA-00942 | A table or view that does not exist (an `INSERT` into a table whose default calls a dropped sequence, too) (the message names `"SCHEMA"."NAME"`). |
+| ORA-00942 | A table or view that does not exist (the message names `"SCHEMA"."NAME"`). |
 | ORA-00947 | Not enough values in an `INSERT`. |
 | ORA-00955 | A name that is already used by an object. |
 | ORA-00957 | A duplicate column name. |
 | ORA-00979 | A select-list column that is not in `GROUP BY`. |
 | ORA-01418 | An index that does not exist. |
-| ORA-02289 | A sequence that does not exist (in `DROP SEQUENCE`, and `NEXTVAL` or `CURRVAL` of a missing or dropped one). |
-| ORA-03049 | `HAVING`, `WINDOW` or a second `QUALIFY` after a `QUALIFY` condition. |
+| ORA-02289 | A sequence that does not exist (in `DROP SEQUENCE`, and `NEXTVAL` or `CURRVAL` of a missing or dropped one, and an `INSERT` whose default calls a dropped one). |
+| ORA-03049 | `HAVING`, `WINDOW` or a second `QUALIFY` after a `QUALIFY` condition, and `QUALIFY` after `ORDER BY` or `FOR UPDATE`. |
+| ORA-01786 | `FOR UPDATE` after `QUALIFY`. |
 
 ### Constraints and data
 
@@ -46,8 +47,11 @@ it.
 | ORA-02290 | A `CHECK` constraint violated. |
 | ORA-02291 | No parent key for a foreign key. |
 | ORA-02292 | A child row exists for a parent key being deleted. |
-| ORA-02293 | `ENABLE` or `VALIDATE` of a `CHECK` that a row breaks. |
-| ORA-02298 | `ENABLE` or `VALIDATE` of a foreign key that a row has no parent for. |
+| ORA-02293 | `ENABLE`, `VALIDATE` or `ADD CONSTRAINT` of a `CHECK` that a row breaks. |
+| ORA-02298 | `ENABLE`, `VALIDATE` or `ADD CONSTRAINT` of a foreign key that a row has no parent for. |
+| ORA-02299 | `ADD CONSTRAINT` of a `UNIQUE` key over duplicate values. |
+| ORA-02275 | A second foreign key on the same columns and the same referenced columns (`ALTER TABLE`; ORA-02274 in `CREATE TABLE`). |
+| ORA-12991 | `DROP COLUMN` of a column a multi-column `CHECK` reads. |
 | ORA-02430 | `ENABLE` or `MODIFY CONSTRAINT` of a name that is no constraint of the table (and of a key or `NOT NULL`, which have no state). |
 | ORA-02431 | `DISABLE CONSTRAINT` of a name that is no constraint of the table. |
 | ORA-30926 | A `MERGE` target row that two source rows match. |
@@ -431,7 +435,7 @@ ERROR:
 ORA-00960: ambiguous column naming in select list
 
 ERROR:
-ORA-03049: SQL keyword 'V' is not syntactically valid following 'qualify '
+ORA-03049: SQL keyword 'V' is not syntactically valid following 'SELECT id FROM qa QUALIFY '
 
 ERROR:
 ORA-02293: cannot validate (QA_V_CK) - check constraint violated

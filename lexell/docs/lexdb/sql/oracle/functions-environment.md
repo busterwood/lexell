@@ -26,7 +26,9 @@ sequence.NEXTVAL    sequence.CURRVAL
 
 `SYS_CONTEXT('USERENV', parameter)`
 : A property of the session. The parameters lexdb knows include `SESSION_USER`, `CURRENT_USER`, `CURRENT_SCHEMA`,
-  `DB_NAME`, `INSTANCE_NAME`, `NLS_DATE_FORMAT`, `SESSIONID` and others; an unknown parameter is NULL.
+  `SESSION_SCHEMA`, `DB_NAME`, `INSTANCE_NAME`, `NLS_DATE_FORMAT`, `NLS_TERRITORY`, `NLS_SORT`, `NLS_CURRENCY`,
+  `NLS_DATE_LANGUAGE`, `LANGUAGE`, `SESSIONID` and others; an unknown parameter is NULL. `CURRENT_SCHEMA` and the
+  `NLS_*` ones follow `ALTER SESSION` (see [ALTER SESSION](alter-session.md)).
 
 `SYS_GUID`
 : A new 16-byte `RAW` identifier.
@@ -50,7 +52,7 @@ sequence.NEXTVAL    sequence.CURRVAL
 
 ## Differences from Oracle
 
-- `SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')` ignores `ALTER SESSION SET CURRENT_SCHEMA`.
+- `SYS_CONTEXT('USERENV', 'NLS_CURRENCY')` is `$` until a territory is set.
 - `ROWID` is not a pseudo-column here (ORA-00904), and `ORA_DATABASE_NAME` is ORA-00904 (use
   `SYS_CONTEXT('USERENV', 'DB_NAME')`).
 

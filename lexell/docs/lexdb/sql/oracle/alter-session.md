@@ -24,6 +24,12 @@ ALTER SESSION SET parameter = value [ parameter = value ]...
 : The default format of `TO_CHAR`, `TO_DATE` and the other conversions of dates. A format that is not one is
   ORA-01821.
 
+`NLS_TERRITORY`, `NLS_LANGUAGE`, `NLS_SORT`, `NLS_CURRENCY`
+: Kept for the session. A territory gives the default date and timestamp formats, the numeric characters and the
+  currency symbols; a language gives the date language and the sort. `SYS_CONTEXT('USERENV', ...)` and
+  `NLS_SESSION_PARAMETERS` show them (example F). Setting `NLS_TERRITORY` or `NLS_LANGUAGE` forgets what was set apart
+  before it that the new setting also gives (as in Oracle).
+
 `GROUP_BY_POSITION_ENABLED`
 : `TRUE` lets `GROUP BY 1` name the first column of the select list (23ai).
 
@@ -38,10 +44,9 @@ Other `NLS_*` parameters, `OPTIMIZER_*`, `SQL_TRACE`, `ISOLATION_LEVEL`, `CURSOR
 
 ## Differences from Oracle
 
-- `SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')` still says the login user after `SET CURRENT_SCHEMA`
-  (`SYS_CONTEXT('USERENV', 'NLS_DATE_FORMAT')` likewise keeps the default `DD-MON-RR`), although the setting works.
-- `NLS_NUMERIC_CHARACTERS` and `NLS_LANGUAGE` are accepted but do not change the output of `TO_CHAR`: the group and
-  decimal characters, the day and month names stay those of `AMERICAN`.
+- `NLS_NUMERIC_CHARACTERS` and `NLS_LANGUAGE` do not change the output of `TO_CHAR` of numbers or the language of
+  messages: the group and decimal characters stay `,` and `.`, the messages those of `AMERICAN`.
+- `SYS_CONTEXT('USERENV', 'NLS_CURRENCY')` is `$` until a territory is set.
 
 ## Examples
 
@@ -76,7 +81,7 @@ A
 
 CURRENT_SCHEMA
 --------------
-SA
+HR
 
 1 row selected.
 
@@ -206,6 +211,47 @@ Session altered.
 
 ERROR:
 ORA-02248: invalid option for ALTER SESSION
+```
+
+### F. Territory and language
+
+<!-- example: oracle -->
+```sql
+SELECT SYS_CONTEXT('USERENV', 'NLS_TERRITORY') AS terr, SYS_CONTEXT('USERENV', 'NLS_CURRENCY') AS cur FROM dual;
+ALTER SESSION SET NLS_TERRITORY = 'GERMANY';
+ALTER SESSION SET NLS_LANGUAGE = 'GERMAN';
+SELECT SYS_CONTEXT('USERENV', 'NLS_TERRITORY') AS terr, SYS_CONTEXT('USERENV', 'NLS_CURRENCY') AS cur,
+       SYS_CONTEXT('USERENV', 'NLS_DATE_LANGUAGE') AS dl, SYS_CONTEXT('USERENV', 'LANGUAGE') AS lang FROM dual;
+SELECT parameter, value FROM nls_session_parameters
+WHERE parameter IN ('NLS_TERRITORY', 'NLS_LANGUAGE', 'NLS_CURRENCY', 'NLS_NUMERIC_CHARACTERS', 'NLS_SORT') ORDER BY parameter;
+```
+
+```text
+TERR    CUR
+------- ---
+AMERICA $
+
+1 row selected.
+
+Session altered.
+
+Session altered.
+
+TERR    CUR DL     LANG
+------- --- ------ -----------------------
+GERMANY €   GERMAN GERMAN_GERMANY.AL32UTF8
+
+1 row selected.
+
+PARAMETER              VALUE
+---------------------- -------
+NLS_CURRENCY           €
+NLS_LANGUAGE           GERMAN
+NLS_NUMERIC_CHARACTERS ,.
+NLS_SORT               GERMAN
+NLS_TERRITORY          GERMANY
+
+5 rows selected.
 ```
 
 ## See also

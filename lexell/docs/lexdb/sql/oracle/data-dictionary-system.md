@@ -30,8 +30,9 @@ SELECT ... FROM view_name
 : A recorded list of Oracle's own privileges and roles; they do not change with `GRANT`.
 
 `NLS_SESSION_PARAMETERS`, `NLS_DATABASE_PARAMETERS`, `NLS_INSTANCE_PARAMETERS`
-: The NLS parameters: `PARAMETER`, `VALUE`. They are fixed: `ALTER SESSION SET NLS_DATE_FORMAT` changes how
-  dates print (see [ALTER SESSION](alter-session.md)) but not `NLS_SESSION_PARAMETERS`.
+: The NLS parameters: `PARAMETER`, `VALUE`. `NLS_SESSION_PARAMETERS` shows what `ALTER SESSION` set, and what a
+  territory or a language gives the other parameters (see [ALTER SESSION](alter-session.md)); the other two views are
+  fixed.
 
 `DATABASE_PROPERTIES`, `PRODUCT_COMPONENT_VERSION`, `V$VERSION`
 : Properties of the database (`NLS_CHARACTERSET` `AL32UTF8`) and its version: Oracle Database 23ai Free 23.4.
@@ -51,7 +52,6 @@ SELECT ... FROM view_name
 
 - `SESSION_PRIVS`, `SESSION_ROLES` and `USER_ROLE_PRIVS` do not show what the session was really granted.
 - `DBA_SYS_PRIVS`, `DBA_ROLE_PRIVS` and `DBA_ROLES` have no rows.
-- `NLS_SESSION_PARAMETERS` does not follow `ALTER SESSION` (example C).
 - `V$` views show a few rows of recorded values, not live statistics.
 
 ## Examples
@@ -173,8 +173,8 @@ NLS_SORT        BINARY
 Session altered.
 
 PARAMETER       VALUE
---------------- ---------
-NLS_DATE_FORMAT DD-MON-RR
+--------------- ----------
+NLS_DATE_FORMAT YYYY-MM-DD
 
 1 row selected.
 
