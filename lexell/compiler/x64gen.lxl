@@ -3039,8 +3039,12 @@ fn (g: mut &Gen) stmt1(s: int) {
             g.genInto(g.u.nodes[g.forCond(s)].b, RCX)
             g.a.aluI(x64.CMP, 8, RCX, 64)
             g.a.jcc(x64.CC_L, small)
-            let cv = g.intConst(g.u.nodes[fill].b, g.u.nodes[fill].ty)
-            if cv.c == 0 { g.a.movRI(RAX, cv.v) } else { g.genInto(g.u.nodes[fill].b, RAX) }
+            if g.isF(g.u.nodes[fill].ty) {
+                g.a.movRI(RAX, 0)
+            } else {
+                let cv = g.intConst(g.u.nodes[fill].b, g.u.nodes[fill].ty)
+                if cv.c == 0 { g.a.movRI(RAX, cv.v) } else { g.genInto(g.u.nodes[fill].b, RAX) }
+            }
             g.a.movRR(8, R11, RDI)
             g.genInto(g.fillBase(st.a), RDI)
             g.a.repStos(g.u.nodes[st.a].v)
@@ -3209,10 +3213,11 @@ fn (g: &Gen) fillLoop(s: int): int {
     let pa = g.u.nodes[sa.a].a
     let p = g.u.nodes[pa]
     let et = g.tk(sa.ty)
-    if p.k != ir.E_PADD || p.v != g.size(sa.ty) || et < ir.TY_BOOL || et > ir.TY_U64 { return -1 }
+    let fzero = et == ir.TY_F64 && g.u.nk(sa.b) == ir.E_FLT && floatBits(g.u.flts[g.u.nodes[sa.b].v]) == 0
+    if p.k != ir.E_PADD || p.v != g.size(sa.ty) || (!fzero && (et < ir.TY_BOOL || et > ir.TY_U64)) { return -1 }
     if g.u.nk(p.b) != ir.E_LOCAL || g.u.nodes[p.b].a != i { return -1 }
     let base = g.fillBase(pa)
-    if g.u.nk(base) != ir.E_LOCAL || !g.fixedVal(base) || g.u.nodes[base].a == i || !g.fixedVal(sa.b) { return -1 }
+    if g.u.nk(base) != ir.E_LOCAL || !g.fixedVal(base) || g.u.nodes[base].a == i || (!fzero && !g.fixedVal(sa.b)) { return -1 }
     var vx = sa.b
     while g.u.nk(vx) == ir.E_CAST { vx = g.u.nodes[vx].a }
     if g.u.nk(vx) == ir.E_LOCAL && g.u.nodes[vx].a == i { return -1 }
@@ -5632,6 +5637,9 @@ fn (g: mut &Gen) gen(e: int) {
             let sc = n.v
             if sc == 1 || sc == 2 || sc == 4 || sc == 8 {
                 g.a.lea(RAX, x64.memx(RAX, RCX, sc, 0))
+            } else if sc > 1 && (sc & (sc - 1)) == 0 {
+                g.a.shiftI(x64.SHL, 8, RCX, pow2Exp(sc))
+                g.a.alu(x64.ADD, 8, RAX, RCX)
             } else if x64.fits32(sc) {
                 g.a.imulI(8, RCX, RCX, sc)
                 g.a.alu(x64.ADD, 8, RAX, RCX)
@@ -5731,7 +5739,11 @@ fn (g: mut &Gen) paddMem(e: int): x64.Mem {
         return x64.memx(RAX, RCX, 1, 0)
     }
     if !scaleOk(sc) {
-        g.a.imulI(8, RAX, RAX, sc)
+        if sc > 1 && (sc & (sc - 1)) == 0 {
+            g.a.shiftI(x64.SHL, 8, RAX, pow2Exp(sc))
+        } else {
+            g.a.imulI(8, RAX, RAX, sc)
+        }
         sc = 1
     }
     if g.regOf(n.a) >= 0 { return x64.memx(g.regOf(n.a), RAX, sc, 0) }
@@ -5875,6 +5887,25 @@ fn (g: mut &Gen) genAssign(e: int) {
         g.a.store(g.size(t), pm, r)
         if !unused { g.a.movRR(8, RAX, r) }
         return
+    }
+    if (lk == ir.E_DEREF || lk == ir.E_MEMBER) && g.tk(t) == ir.TY_F64 && g.u.nodes[n.b].ty == t &&
+        g.addrCode(g.u.nodes[lhs].a) && g.noFloatIn(g.u.nodes[lhs].a) {
+        if g.fregOf(n.b) >= 0 {
+            let pm = g.place(lhs)
+            let r = g.fregOf(n.b)
+            g.a.movsdStore(pm, r)
+            if !unused { g.a.sse66(MOVAPD, 0, r) }
+            return
+        }
+        if g.pure(lhs) && g.pure(n.b) {
+            let fr = g.fIntoTemp(n.b, pd)
+            let r = if fr >= 0 { fr } else { 0 }
+            if fr < 0 { g.gen(n.b) }
+            let pm = g.place(lhs)
+            g.a.movsdStore(pm, r)
+            if !unused && r != 0 { g.a.sse66(MOVAPD, 0, r) }
+            return
+        }
     }
     if lk == ir.E_DEREF && g.isAggr(t) && g.u.nk(n.b) == ir.E_CLIT && g.u.nodes[n.b].ty == t && g.litLeaves(n.b, lhs) {
         // a literal of values the address's code cannot change (forwardLit): built at the
@@ -8313,6 +8344,9 @@ fn (g: mut &Gen) inlineRt(e: int, name: &str): bool {
         g.a.load(8, RDX, x64.mem(RAX, 0))
         if size == 1 || size == 2 || size == 4 || size == 8 {
             g.a.lea(RAX, x64.memx(RDX, RCX, size, 0))
+        } else if size > 1 && (size & (size - 1)) == 0 {
+            g.a.shiftI(x64.SHL, 8, RCX, pow2Exp(size))
+            g.a.lea(RAX, x64.memx(RDX, RCX, 1, 0))
         } else {
             g.a.imulI(8, RCX, RCX, size)
             g.a.lea(RAX, x64.memx(RDX, RCX, 1, 0))
