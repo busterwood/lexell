@@ -3856,6 +3856,9 @@ fn (g: mut &Gen) genSwitch(s: int) {
     let lst = g.u.nodes[body].a
     let end = g.a.newLabel()
     var deflt = end
+    var hasDeflt = false
+    var vals: []int = []
+    var lbs: []int = []
     for j in 0..g.u.listLen(lst) {
         let x = g.u.listAt(lst, j)
         let xk = g.u.nk(x)
@@ -3864,19 +3867,79 @@ fn (g: mut &Gen) genSwitch(s: int) {
             g.caseL.put(x, l)
             if xk == ir.S_DEFAULT {
                 deflt = l
+                hasDeflt = true
             } else {
-                let v = g.u.nodes[x].v
-                if x64.fits32(v) {
-                    g.a.aluI(x64.CMP, 8, RAX, v)
-                } else {
-                    g.a.movRI(RCX, v)
-                    g.a.alu(x64.CMP, 8, RAX, RCX)
-                }
-                g.a.jcc(x64.CC_E, l)
+                append(mut &vals, g.u.nodes[x].v)
+                append(mut &lbs, l)
             }
         }
     }
-    g.a.jmp(deflt)
+    var dispatched = false
+    let nc = len(vals)
+    if nc >= 8 {
+        var lo = vals[0]
+        var hi = vals[0]
+        for v in vals {
+            if v < lo { lo = v }
+            if v > hi { hi = v }
+        }
+        if x64.fits32(lo) && x64.fits32(hi) {
+            let span = hi - lo + 1
+            if span > 0 && span <= 4 * nc && span <= 1024 {
+                var slot = array(span, -1)
+                for i in 0..nc {
+                    if slot[vals[i] - lo] < 0 { slot[vals[i] - lo] = lbs[i] }
+                }
+                if lo != 0 { g.a.aluI(x64.SUB, 8, RAX, lo) }
+                g.a.aluI(x64.CMP, 8, RAX, hi - lo)
+                g.a.jcc(x64.CC_A, deflt)
+                let tbl = g.a.newLabel()
+                g.a.leaLabel(RCX, tbl)
+                g.a.loadSX(4, RAX, x64.memx(RCX, RAX, 4, 0))
+                g.a.alu(x64.ADD, 8, RAX, RCX)
+                g.a.jmpR(RAX)
+                g.a.bind(tbl)
+                for i in 0..span { g.a.tableEntry(if slot[i] < 0 { deflt } else { slot[i] }, tbl) }
+                dispatched = true
+            }
+        }
+    }
+    if !dispatched {
+        // sparse non-default switch in 0..63 (e.g. dup/drop glue of an enum whose POD variants
+        // were omitted): one branchless range-masked bit test skips all absent tags at once
+        var masked = false
+        if !hasDeflt && nc >= 3 {
+            var lo = vals[0]
+            var hi = vals[0]
+            for v in vals {
+                if v < lo { lo = v }
+                if v > hi { hi = v }
+            }
+            if lo >= 0 && hi <= 63 && hi + 1 > nc {
+                var mask = 0
+                for v in vals { mask = mask | (1 << v) }
+                g.a.movRI(RCX, mask)
+                g.a.alu(x64.XOR, 4, RDX, RDX)
+                g.a.aluI(x64.CMP, 8, RAX, hi)
+                g.a.cmov(x64.CC_A, RCX, RDX)
+                g.a.bt(RCX, RAX)
+                g.a.jcc(x64.CC_AE, deflt)
+                masked = true
+            }
+        }
+        let lim = if masked { nc - 1 } else { nc }
+        for i in 0..lim {
+            let v = vals[i]
+            if x64.fits32(v) {
+                g.a.aluI(x64.CMP, 8, RAX, v)
+            } else {
+                g.a.movRI(RCX, v)
+                g.a.alu(x64.CMP, 8, RAX, RCX)
+            }
+            g.a.jcc(x64.CC_E, lbs[i])
+        }
+        g.a.jmp(if masked { lbs[nc - 1] } else { deflt })
+    }
     append(mut &g.breakL, end)
     g.stmt(body)
     pop(mut &g.breakL)

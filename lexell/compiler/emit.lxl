@@ -759,17 +759,32 @@ fn (e: mut &Emitter) cases(t: int, base: int, sep: &str, mode: int, boxed: bool)
         append(mut &out, e.c.x.send())
         return Lines{ls: out, refs: r.refs}
     }
-    var out: []int = [e.c.x.sswitch(e.tagX(t, base, sep))]
     var refs = false
     let vs = copyInts(&e.c.pg.types[d].variants)
+    var active: [][]int = []
+    var cidx: []int = []
     for v in vs {
         var fts: []int = []
         var locs: []int = []
         e.us(t, v, base, sep, mut &fts, mut &locs)
         let r = e.caseBody(mode, &fts, &locs, boxed)
         refs = refs || r.refs
-        append(mut &out, e.c.x.scase(e.c.x.lit(e.c.pg.variants[v].index)))
-        for x in r.ls { append(mut &out, x) }
+        if len(r.ls) > 0 {
+            append(mut &active, r.ls)
+            append(mut &cidx, e.c.pg.variants[v].index)
+        }
+    }
+    if len(cidx) == 0 { return Lines{ls: [], refs: refs} }
+    if len(cidx) == 1 {
+        var out: []int = [e.c.x.sif(e.c.x.bin("==", e.tagX(t, base, sep), e.c.x.lit(cidx[0])))]
+        for x in active[0] { append(mut &out, x) }
+        append(mut &out, e.c.x.send())
+        return Lines{ls: out, refs: refs}
+    }
+    var out: []int = [e.c.x.sswitch(e.tagX(t, base, sep))]
+    for i in 0..len(cidx) {
+        append(mut &out, e.c.x.scase(e.c.x.lit(cidx[i])))
+        for x in active[i] { append(mut &out, x) }
         append(mut &out, e.c.x.sbreak())
     }
     append(mut &out, e.c.x.send())
@@ -1128,24 +1143,42 @@ fn (e: mut &Emitter) makeGlue(kind: int, t: int) {
         for i in 0..len(e.c.pg.types[d].fields) {
             let f = e.c.pg.types[d].fields[i].clone()
             let ft = e.c.pg.subst(f.ty, &env)
+            if e.pod(ft) { continue }
             let loc = e.c.x.dot(e.nm("v"), &("f_" + f.name))
             append(mut &body, e.dupField(ft, loc))
         }
     } else {
-        append(mut &body, e.c.x.sswitch(e.tagX(t, e.nm("v"), ".")))
         let vs = copyInts(&e.c.pg.types[d].variants)
+        var active: [][]int = []
+        var cidx: []int = []
         for v in vs {
-            append(mut &body, e.c.x.scase(e.c.x.lit(e.c.pg.variants[v].index)))
+            var ls: []int = []
             for i in 0..len(e.c.pg.variants[v].fields) {
                 let fd = e.c.pg.variants[v].fields[i].clone()
+                let ft = e.c.pg.subst(fd.ty, &env)
+                if e.pod(ft) { continue }
                 let vv = e.c.x.dot(e.c.x.dot(e.nm("v"), "u"), &("V_" + e.c.pg.variants[v].name))
                 let loc = e.c.x.dot(vv, &("f_" + fd.name))
-                let ft = e.c.pg.subst(fd.ty, &env)
-                append(mut &body, e.dupField(ft, loc))
+                append(mut &ls, e.dupField(ft, loc))
             }
-            append(mut &body, e.c.x.sbreak())
+            if len(ls) > 0 {
+                append(mut &active, ls)
+                append(mut &cidx, e.c.pg.variants[v].index)
+            }
         }
-        append(mut &body, e.c.x.send())
+        if len(cidx) == 1 {
+            append(mut &body, e.c.x.sif(e.c.x.bin("==", e.tagX(t, e.nm("v"), "."), e.c.x.lit(cidx[0]))))
+            for x in active[0] { append(mut &body, x) }
+            append(mut &body, e.c.x.send())
+        } else if len(cidx) >= 2 {
+            append(mut &body, e.c.x.sswitch(e.tagX(t, e.nm("v"), ".")))
+            for i in 0..len(cidx) {
+                append(mut &body, e.c.x.scase(e.c.x.lit(cidx[i])))
+                for x in active[i] { append(mut &body, x) }
+                append(mut &body, e.c.x.sbreak())
+            }
+            append(mut &body, e.c.x.send())
+        }
     }
     append(mut &body, e.c.x.sret(e.nm("v")))
     e.define(&n, &ct, [ct.clone()], ["v"], body, -1)
