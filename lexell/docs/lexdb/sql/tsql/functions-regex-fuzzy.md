@@ -28,7 +28,7 @@ JARO_WINKLER_SIMILARITY ( string1, string2 ) → int
 `REGEXP_REPLACE`
 : The string with the matches of *pattern* replaced by *replacement*, from character *start* (default 1). *occurrence*
   names the match to replace; 0, the default, replaces every one. The replacement refers to a captured group as `\1`
-  to `\9`.
+  to `\9`. Without a replacement the matches are removed.
 
 `REGEXP_SUBSTR`
 : The text of the *occurrence*th match (default 1) from *start*, or NULL when there is none. With *group* it is the
@@ -69,8 +69,6 @@ JARO_WINKLER_SIMILARITY ( string1, string2 ) → int
 
 ## Differences from SQL Server
 
-- **`REGEXP_REPLACE` without a replacement never answers** (SQL Server: the matches are removed):
-  `REGEXP_REPLACE('abc', 'b')` hangs the session. Always give the third argument, `''` to remove the matches.
 - The replacement refers to a group only as `\1` to `\9`; `$1` is written out as it stands.
 
 ## Examples
@@ -115,13 +113,13 @@ Incorrect syntax near the keyword 'regexp_like'.
 SELECT REGEXP_REPLACE('a1b22c333', '[0-9]+', '#') AS all_matches, REGEXP_REPLACE('a1b22c333', '[0-9]+', '#', 1, 2) AS second_only,
        REGEXP_REPLACE('John Smith', '(\w+) (\w+)', '\2, \1') AS groups, REGEXP_REPLACE('  a   b  ', '\s+', ' ') AS spaces,
        REGEXP_REPLACE('Hello World', 'O', '0', 1, 0, 'i') AS ignore_case, REGEXP_REPLACE('abc', 'b', '') AS removed,
-       REGEXP_REPLACE('abc', '(a)(b)', '$2$1') AS dollar_not_a_group;
+       REGEXP_REPLACE('abc', 'b') AS two_arguments, REGEXP_REPLACE('abc', '(a)(b)', '$2$1') AS dollar_not_a_group;
 ```
 
 ```text
-all_matches second_only groups      spaces ignore_case removed dollar_not_a_group
------------ ----------- ----------- ------ ----------- ------- ------------------
-a#b#c#      a1b#c333    Smith, John  a b   Hell0 W0rld ac      $2$1c
+all_matches second_only groups      spaces ignore_case removed two_arguments dollar_not_a_group
+----------- ----------- ----------- ------ ----------- ------- ------------- ------------------
+a#b#c#      a1b#c333    Smith, John  a b   Hell0 W0rld ac      ac            $2$1c
 
 (1 row affected)
 ```
