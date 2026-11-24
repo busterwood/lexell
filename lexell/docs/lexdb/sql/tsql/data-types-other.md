@@ -50,8 +50,9 @@ type_name                  -- a table type made by CREATE TYPE ... AS TABLE
   (`doc.value(...)` is error 4121), and no XML schema checks run.
 - **`sql_variant`** is accepted in a declaration (`DECLARE @v sql_variant = 1`) but behaves as a plain value;
   `SQL_VARIANT_PROPERTY` does not exist (error 195).
-- `uniqueidentifier` text comes out in upper case when a value is selected and in lower case after
-  `CAST(... AS varchar)`. SQL Server gives upper case in both.
+- A `uniqueidentifier` converts to and from `binary(n)` and `varbinary(n)` in SQL Server's byte order (see
+  [binary types](data-types-binary.md), example I). `CAST(... AS varchar(n))` gives upper case, and `n` under 36 is
+  error 8170.
 - `hierarchyid`, `geography`, `geometry`, `cursor` and CLR types do not exist (error 2715).
 
 ## Examples
@@ -187,7 +188,7 @@ SELECT CAST('6f9619ff-8b86-d011-b42d-00c04fc964ff' AS uniqueidentifier) AS lower
 ```text
 lower_case                           with_braces                          as_text
 ------------------------------------ ------------------------------------ ------------------------------------
-6F9619FF-8B86-D011-B42D-00C04FC964FF 6F9619FF-8B86-D011-B42D-00C04FC964FF 6f9619ff-8b86-d011-b42d-00c04fc964ff
+6F9619FF-8B86-D011-B42D-00C04FC964FF 6F9619FF-8B86-D011-B42D-00C04FC964FF 6F9619FF-8B86-D011-B42D-00C04FC964FF
 
 (1 row affected)
 ```
