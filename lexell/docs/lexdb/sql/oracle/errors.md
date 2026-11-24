@@ -44,7 +44,8 @@ it.
 | ORA-02290 | A `CHECK` constraint violated. |
 | ORA-02291 | No parent key for a foreign key. |
 | ORA-02292 | A child row exists for a parent key being deleted. |
-| ORA-02449 | A table dropped while other tables' foreign keys point at it (use `CASCADE CONSTRAINTS`). |
+| ORA-02260 | A second `PRIMARY KEY` in `CREATE TABLE`. |
+| ORA-02449 | A table dropped while other tables' foreign keys point at it (use `CASCADE CONSTRAINTS`); also, with that message, a sequence dropped while a column default calls it. |
 | ORA-12899 | A string too long for the column. |
 | ORA-01438 | A number with more digits than the column's precision. |
 | ORA-01476 | Division by zero. |
