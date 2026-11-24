@@ -7666,9 +7666,9 @@ struct S76_loops_Loops { struct S8_ir_Ir*f_u; lxl_arr f_wfn; lxl_arr f_rtc; lxl_
 struct S77_loops_Sym { int64_t f_l; int64_t f_c; };
 struct S78_loops_Sat { int64_t f_v; int64_t f_c; };
 struct S79_bfold_Bf { struct S8_ir_Ir*f_u; lxl_arr f_uses; int64_t f_n; };
-struct S80_opt_Cand { int64_t f_l; int64_t f_decl; bool f_bad; lxl_arr f_flds; };
+struct S80_opt_Cand { int64_t f_l; int64_t f_decl; bool f_bad; bool f_fresh; int64_t f_init; int64_t f_dead; lxl_arr f_flds; };
 struct S81_opt_Ub { int64_t f_uses; int64_t f_ok; int64_t f_decls; bool f_alloc; bool f_bad; int64_t f_from; bool f_seen; };
-struct S82_opt_Opt { struct S8_ir_Ir*f_u; lxl_arr f_state; lxl_arr f_form; lxl_arr f_size; lxl_arr f_rets; lxl_arr f_refs; lxl_arr f_ro; lxl_arr f_aTaken; lxl_arr f_mk; lxl_arr f_mv; lxl_arr f_bound; int64_t f_budget; int64_t f_limit; int64_t f_cur; int64_t f_grown; int64_t f_dest; int64_t f_dl; int64_t f_lv; int64_t f_aty; bool f_single; int64_t f_nrvo; int64_t f_dupF; int64_t f_dropF; int64_t f_stamp; lxl_arr f_sStamp; lxl_arr f_sCand; lxl_arr f_cands; int64_t f_adj; bool f_selfOnce; lxl_arr f_fpOf; lxl_arr f_fpList; struct S65_collections_Map*f_ren; int64_t f_allocF; int64_t f_freeF; lxl_arr f_ub; lxl_arr f_ubSeen; int64_t f_wf; lxl_arr f_recur; lxl_arr f_allocs; };
+struct S82_opt_Opt { struct S8_ir_Ir*f_u; lxl_arr f_state; lxl_arr f_form; lxl_arr f_size; lxl_arr f_rets; lxl_arr f_refs; lxl_arr f_ro; lxl_arr f_aTaken; lxl_arr f_mk; lxl_arr f_mv; lxl_arr f_bound; int64_t f_budget; int64_t f_limit; int64_t f_cur; int64_t f_grown; int64_t f_dest; int64_t f_dl; int64_t f_lv; int64_t f_aty; bool f_single; int64_t f_nrvo; int64_t f_dupF; int64_t f_dropF; int64_t f_stamp; lxl_arr f_sStamp; lxl_arr f_sCand; lxl_arr f_cands; int64_t f_prevFresh; int64_t f_adj; bool f_selfOnce; lxl_arr f_fpOf; lxl_arr f_fpList; struct S65_collections_Map*f_ren; int64_t f_allocF; int64_t f_freeF; lxl_arr f_ub; lxl_arr f_ubSeen; int64_t f_wf; lxl_arr f_recur; lxl_arr f_allocs; };
 struct A203 { int64_t f_0; };
 struct A204 { char _e; };
 union A202 { struct A203 V_Some; struct A204 V_None; char _e; };
@@ -73470,150 +73470,152 @@ static struct S8_ir_Ir*f153_opt_optimize(struct S8_ir_Ir*p_p) {
   lxl_arr a19 = rt_arr_new(0LL, 8ULL);
   lxl_arr a20 = rt_arr_new(0LL, 8ULL);
   int64_t t21 = -1LL;
-  lxl_arr a22 = rt_arr_new(0LL, 8ULL);
-  lxl_arr a23 = rt_arr_new(0LL, 24ULL);
-  struct S65_collections_Map*t24 = f565_std_newMap();
-  lxl_arr a25 = rt_arr_new(0LL, 48ULL);
-  lxl_arr a26 = rt_arr_new(0LL, 8ULL);
-  lxl_arr a27 = rt_arr_new(0LL, 1ULL);
+  int64_t t22 = -1LL;
+  lxl_arr a23 = rt_arr_new(0LL, 8ULL);
+  lxl_arr a24 = rt_arr_new(0LL, 24ULL);
+  struct S65_collections_Map*t25 = f565_std_newMap();
+  lxl_arr a26 = rt_arr_new(0LL, 48ULL);
+  lxl_arr a27 = rt_arr_new(0LL, 8ULL);
   lxl_arr a28 = rt_arr_new(0LL, 1ULL);
-  struct S82_opt_Opt*o29 = (struct S82_opt_Opt*)rt_alloc(616ULL);
-  o29->f_u = p_p;
-  o29->f_state = a1;
-  o29->f_form = a2;
-  o29->f_size = a3;
-  o29->f_rets = a4;
-  o29->f_refs = a6;
-  o29->f_ro = a5;
-  o29->f_aTaken = a7;
-  o29->f_mk = a8;
-  o29->f_mv = a9;
-  o29->f_bound = a10;
-  o29->f_budget = 0LL;
-  o29->f_limit = 0LL;
-  o29->f_cur = t11;
-  o29->f_grown = 0LL;
-  o29->f_dest = 0LL;
-  o29->f_dl = t12;
-  o29->f_lv = t13;
-  o29->f_aty = t14;
-  o29->f_single = (bool)0LL;
-  o29->f_nrvo = t15;
-  o29->f_dupF = t16;
-  o29->f_dropF = t17;
-  o29->f_stamp = 0LL;
-  o29->f_sStamp = a18;
-  o29->f_sCand = a19;
-  o29->f_cands = a20;
-  o29->f_adj = t21;
-  o29->f_selfOnce = (bool)0LL;
-  o29->f_fpOf = a22;
-  o29->f_fpList = a23;
-  o29->f_ren = t24;
-  o29->f_allocF = -1LL;
-  o29->f_freeF = -1LL;
-  o29->f_ub = a25;
-  o29->f_ubSeen = a26;
-  o29->f_wf = -1LL;
-  o29->f_recur = a27;
-  o29->f_allocs = a28;
-  struct S82_opt_Opt*t30 = o29;
-  struct S82_opt_Opt*v_o_31 = t30;
-  v_o_31->f_limit = 25LL;
-  lxl_str t32 = f21_os_envOr(sl9414, sl0);
-  lxl_str v_ev_33 = t32;
-  bool c34 = (bool)!rt_str_eq(v_ev_33, sl0);
-  if (c34) {
-    struct S83_std_Option t35 = f806_strings_parseIntOpt(v_ev_33);
-    int64_t t36 = f807_std_Option_unwrapOr(t35, 25LL);
-    v_o_31->f_limit = t36;
+  lxl_arr a29 = rt_arr_new(0LL, 1ULL);
+  struct S82_opt_Opt*o30 = (struct S82_opt_Opt*)rt_alloc(624ULL);
+  o30->f_u = p_p;
+  o30->f_state = a1;
+  o30->f_form = a2;
+  o30->f_size = a3;
+  o30->f_rets = a4;
+  o30->f_refs = a6;
+  o30->f_ro = a5;
+  o30->f_aTaken = a7;
+  o30->f_mk = a8;
+  o30->f_mv = a9;
+  o30->f_bound = a10;
+  o30->f_budget = 0LL;
+  o30->f_limit = 0LL;
+  o30->f_cur = t11;
+  o30->f_grown = 0LL;
+  o30->f_dest = 0LL;
+  o30->f_dl = t12;
+  o30->f_lv = t13;
+  o30->f_aty = t14;
+  o30->f_single = (bool)0LL;
+  o30->f_nrvo = t15;
+  o30->f_dupF = t16;
+  o30->f_dropF = t17;
+  o30->f_stamp = 0LL;
+  o30->f_sStamp = a18;
+  o30->f_sCand = a19;
+  o30->f_cands = a20;
+  o30->f_prevFresh = t21;
+  o30->f_adj = t22;
+  o30->f_selfOnce = (bool)0LL;
+  o30->f_fpOf = a23;
+  o30->f_fpList = a24;
+  o30->f_ren = t25;
+  o30->f_allocF = -1LL;
+  o30->f_freeF = -1LL;
+  o30->f_ub = a26;
+  o30->f_ubSeen = a27;
+  o30->f_wf = -1LL;
+  o30->f_recur = a28;
+  o30->f_allocs = a29;
+  struct S82_opt_Opt*t31 = o30;
+  struct S82_opt_Opt*v_o_32 = t31;
+  v_o_32->f_limit = 25LL;
+  lxl_str t33 = f21_os_envOr(sl9414, sl0);
+  lxl_str v_ev_34 = t33;
+  bool c35 = (bool)!rt_str_eq(v_ev_34, sl0);
+  if (c35) {
+    struct S83_std_Option t36 = f806_strings_parseIntOpt(v_ev_34);
+    int64_t t37 = f807_std_Option_unwrapOr(t36, 25LL);
+    v_o_32->f_limit = t37;
   }
-  int64_t end37 = v_o_31->f_u->f_funcs.len;
-  for (int64_t v_f_38 = 0LL; v_f_38 < end37; v_f_38++) {
-    int64_t ap39 = 0LL;
-    *(int64_t*)rt_arr_push(&v_o_31->f_state, 8ULL) = ap39;
-    int64_t ap40 = -1LL;
-    *(int64_t*)rt_arr_push(&v_o_31->f_form, 8ULL) = ap40;
-    int64_t ap41 = 0LL;
-    *(int64_t*)rt_arr_push(&v_o_31->f_size, 8ULL) = ap41;
+  int64_t end38 = v_o_32->f_u->f_funcs.len;
+  for (int64_t v_f_39 = 0LL; v_f_39 < end38; v_f_39++) {
+    int64_t ap40 = 0LL;
+    *(int64_t*)rt_arr_push(&v_o_32->f_state, 8ULL) = ap40;
+    int64_t ap41 = -1LL;
+    *(int64_t*)rt_arr_push(&v_o_32->f_form, 8ULL) = ap41;
     int64_t ap42 = 0LL;
-    *(int64_t*)rt_arr_push(&v_o_31->f_rets, 8ULL) = ap42;
+    *(int64_t*)rt_arr_push(&v_o_32->f_size, 8ULL) = ap42;
     int64_t ap43 = 0LL;
-    *(int64_t*)rt_arr_push(&v_o_31->f_refs, 8ULL) = ap43;
+    *(int64_t*)rt_arr_push(&v_o_32->f_rets, 8ULL) = ap43;
     int64_t ap44 = 0LL;
-    *(int64_t*)rt_arr_push(&v_o_31->f_ro, 8ULL) = ap44;
-    int64_t ap45 = -1LL;
-    *(int64_t*)rt_arr_push(&v_o_31->f_fpOf, 8ULL) = ap45;
-    bool ap46 = (bool)0LL;
-    *(bool*)rt_arr_push(&v_o_31->f_recur, 1ULL) = ap46;
+    *(int64_t*)rt_arr_push(&v_o_32->f_refs, 8ULL) = ap44;
+    int64_t ap45 = 0LL;
+    *(int64_t*)rt_arr_push(&v_o_32->f_ro, 8ULL) = ap45;
+    int64_t ap46 = -1LL;
+    *(int64_t*)rt_arr_push(&v_o_32->f_fpOf, 8ULL) = ap46;
     bool ap47 = (bool)0LL;
-    *(bool*)rt_arr_push(&v_o_31->f_allocs, 1ULL) = ap47;
+    *(bool*)rt_arr_push(&v_o_32->f_recur, 1ULL) = ap47;
+    bool ap48 = (bool)0LL;
+    *(bool*)rt_arr_push(&v_o_32->f_allocs, 1ULL) = ap48;
   }
-  int64_t end48 = v_o_31->f_u->f_nRtFuncs;
-  for (int64_t v_f_49 = 0LL; v_f_49 < end48; v_f_49++) {
-    int64_t ix50 = v_f_49;
-    bool c51 = rt_str_eq((*((struct S31_ir_Func**)v_o_31->f_u->f_funcs.data + rt_idx(ix50, v_o_31->f_u->f_funcs.len, "opt.lxl:130")))->f_name, sl332);
-    if (c51) {
-      v_o_31->f_dupF = v_f_49;
+  int64_t end49 = v_o_32->f_u->f_nRtFuncs;
+  for (int64_t v_f_50 = 0LL; v_f_50 < end49; v_f_50++) {
+    int64_t ix51 = v_f_50;
+    bool c52 = rt_str_eq((*((struct S31_ir_Func**)v_o_32->f_u->f_funcs.data + rt_idx(ix51, v_o_32->f_u->f_funcs.len, "opt.lxl:131")))->f_name, sl332);
+    if (c52) {
+      v_o_32->f_dupF = v_f_50;
     }
-    int64_t ix52 = v_f_49;
-    bool c53 = rt_str_eq((*((struct S31_ir_Func**)v_o_31->f_u->f_funcs.data + rt_idx(ix52, v_o_31->f_u->f_funcs.len, "opt.lxl:131")))->f_name, sl333);
-    if (c53) {
-      v_o_31->f_dropF = v_f_49;
+    int64_t ix53 = v_f_50;
+    bool c54 = rt_str_eq((*((struct S31_ir_Func**)v_o_32->f_u->f_funcs.data + rt_idx(ix53, v_o_32->f_u->f_funcs.len, "opt.lxl:132")))->f_name, sl333);
+    if (c54) {
+      v_o_32->f_dropF = v_f_50;
     }
-    int64_t ix54 = v_f_49;
-    bool c55 = rt_str_eq((*((struct S31_ir_Func**)v_o_31->f_u->f_funcs.data + rt_idx(ix54, v_o_31->f_u->f_funcs.len, "opt.lxl:132")))->f_name, sl301);
-    if (c55) {
-      v_o_31->f_allocF = v_f_49;
+    int64_t ix55 = v_f_50;
+    bool c56 = rt_str_eq((*((struct S31_ir_Func**)v_o_32->f_u->f_funcs.data + rt_idx(ix55, v_o_32->f_u->f_funcs.len, "opt.lxl:133")))->f_name, sl301);
+    if (c56) {
+      v_o_32->f_allocF = v_f_50;
     }
-    int64_t ix56 = v_f_49;
-    bool c57 = rt_str_eq((*((struct S31_ir_Func**)v_o_31->f_u->f_funcs.data + rt_idx(ix56, v_o_31->f_u->f_funcs.len, "opt.lxl:133")))->f_name, sl305);
-    if (c57) {
-      v_o_31->f_freeF = v_f_49;
+    int64_t ix57 = v_f_50;
+    bool c58 = rt_str_eq((*((struct S31_ir_Func**)v_o_32->f_u->f_funcs.data + rt_idx(ix57, v_o_32->f_u->f_funcs.len, "opt.lxl:134")))->f_name, sl305);
+    if (c58) {
+      v_o_32->f_freeF = v_f_50;
     }
   }
-  int64_t end58 = v_o_31->f_u->f_locals.len;
-  for (int64_t v_l_59 = 0LL; v_l_59 < end58; v_l_59++) {
-    int64_t ap60 = 0LL;
-    *(int64_t*)rt_arr_push(&v_o_31->f_sStamp, 8ULL) = ap60;
-    int64_t ap61 = -1LL;
-    *(int64_t*)rt_arr_push(&v_o_31->f_sCand, 8ULL) = ap61;
-    bool ap62 = (bool)0LL;
-    *(bool*)rt_arr_push(&v_o_31->f_aTaken, 1ULL) = ap62;
-    int64_t ap63 = -1LL;
-    *(int64_t*)rt_arr_push(&v_o_31->f_mk, 8ULL) = ap63;
+  int64_t end59 = v_o_32->f_u->f_locals.len;
+  for (int64_t v_l_60 = 0LL; v_l_60 < end59; v_l_60++) {
+    int64_t ap61 = 0LL;
+    *(int64_t*)rt_arr_push(&v_o_32->f_sStamp, 8ULL) = ap61;
+    int64_t ap62 = -1LL;
+    *(int64_t*)rt_arr_push(&v_o_32->f_sCand, 8ULL) = ap62;
+    bool ap63 = (bool)0LL;
+    *(bool*)rt_arr_push(&v_o_32->f_aTaken, 1ULL) = ap63;
     int64_t ap64 = -1LL;
-    *(int64_t*)rt_arr_push(&v_o_31->f_mv, 8ULL) = ap64;
+    *(int64_t*)rt_arr_push(&v_o_32->f_mk, 8ULL) = ap64;
+    int64_t ap65 = -1LL;
+    *(int64_t*)rt_arr_push(&v_o_32->f_mv, 8ULL) = ap65;
   }
-  int64_t end65 = v_o_31->f_u->f_globals.len;
-  for (int64_t v_v_66 = 0LL; v_v_66 < end65; v_v_66++) {
-    int64_t ix67 = v_v_66;
-    int64_t t68 = f808_opt_Opt_walkList(&v_o_31, (*((struct S34_ir_Global**)v_o_31->f_u->f_globals.data + rt_idx(ix67, v_o_31->f_u->f_globals.len, "opt.lxl:142")))->f_init, 1LL, -1LL);
+  int64_t end66 = v_o_32->f_u->f_globals.len;
+  for (int64_t v_v_67 = 0LL; v_v_67 < end66; v_v_67++) {
+    int64_t ix68 = v_v_67;
+    int64_t t69 = f808_opt_Opt_walkList(&v_o_32, (*((struct S34_ir_Global**)v_o_32->f_u->f_globals.data + rt_idx(ix68, v_o_32->f_u->f_globals.len, "opt.lxl:143")))->f_init, 1LL, -1LL);
   }
-  int64_t end69 = v_o_31->f_u->f_funcs.len;
-  for (int64_t v_f_70 = 0LL; v_f_70 < end69; v_f_70++) {
-    int64_t ix71 = v_f_70;
-    bool c72 = (bool)((*((struct S31_ir_Func**)v_o_31->f_u->f_funcs.data + rt_idx(ix71, v_o_31->f_u->f_funcs.len, "opt.lxl:144")))->f_body >= 0LL);
-    if (c72) {
-      f809_opt_Opt_visit(&v_o_31, v_f_70);
+  int64_t end70 = v_o_32->f_u->f_funcs.len;
+  for (int64_t v_f_71 = 0LL; v_f_71 < end70; v_f_71++) {
+    int64_t ix72 = v_f_71;
+    bool c73 = (bool)((*((struct S31_ir_Func**)v_o_32->f_u->f_funcs.data + rt_idx(ix72, v_o_32->f_u->f_funcs.len, "opt.lxl:145")))->f_body >= 0LL);
+    if (c73) {
+      f809_opt_Opt_visit(&v_o_32, v_f_71);
     }
   }
-  f810_opt_Opt_dropDead(&v_o_31);
-  f811_opt_Opt_fwdReceivers(&v_o_31);
-  f812_opt_Opt_fwdBorrows(&v_o_31);
-  struct S8_ir_Ir*t73 = f643_ir_newIr();
-  struct S8_ir_Ir*old74 = *&v_o_31->f_u;
-  *&v_o_31->f_u = t73;
-  struct S8_ir_Ir*r75 = old74;
-  rt_str_drop(v_ev_33);
-  gl41_drop(v_o_31);
-  return r75;
+  f810_opt_Opt_dropDead(&v_o_32);
+  f811_opt_Opt_fwdReceivers(&v_o_32);
+  f812_opt_Opt_fwdBorrows(&v_o_32);
+  struct S8_ir_Ir*t74 = f643_ir_newIr();
+  struct S8_ir_Ir*old75 = *&v_o_32->f_u;
+  *&v_o_32->f_u = t74;
+  struct S8_ir_Ir*r76 = old75;
+  rt_str_drop(v_ev_34);
+  gl41_drop(v_o_32);
+  return r76;
 }
 static void f812_opt_Opt_fwdBorrows(struct S82_opt_Opt**p_o) {
   int64_t end1 = (*p_o)->f_u->f_funcs.len;
   for (int64_t v_f_2 = 0LL; v_f_2 < end1; v_f_2++) {
     int64_t ix3 = v_f_2;
-    int64_t v_b_4 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix3, (*p_o)->f_u->f_funcs.len, "opt.lxl:278")))->f_body;
+    int64_t v_b_4 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix3, (*p_o)->f_u->f_funcs.len, "opt.lxl:279")))->f_body;
     bool c5 = (bool)(v_b_4 >= 0LL);
     if (c5) {
       f813_opt_Opt_borrowWalk(p_o, v_b_4, v_b_4);
@@ -73630,13 +73632,13 @@ static void f813_opt_Opt_borrowWalk(struct S82_opt_Opt**p_o, int64_t p_s, int64_
   bool c4 = (bool)(v_k_3 == 48LL);
   if (c4) {
     int64_t ix5 = p_s;
-    int64_t v_l_6 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix5, (*p_o)->f_u->f_nodes.len, "opt.lxl:287"))->f_a;
+    int64_t v_l_6 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix5, (*p_o)->f_u->f_nodes.len, "opt.lxl:288"))->f_a;
     int64_t ix7 = v_l_6;
-    int64_t v_n_8 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix7, (*p_o)->f_u->f_items.len, "opt.lxl:288"));
+    int64_t v_n_8 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix7, (*p_o)->f_u->f_items.len, "opt.lxl:289"));
     int64_t end9 = v_n_8;
     for (int64_t v_j_10 = 0LL; v_j_10 < end9; v_j_10++) {
-      int64_t ix11 = rt_add_int(rt_add_int(v_l_6, 1LL, "opt.lxl:290"), v_j_10, "opt.lxl:290");
-      int64_t v_d_12 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix11, (*p_o)->f_u->f_items.len, "opt.lxl:290"));
+      int64_t ix11 = rt_add_int(rt_add_int(v_l_6, 1LL, "opt.lxl:291"), v_j_10, "opt.lxl:291");
+      int64_t v_d_12 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix11, (*p_o)->f_u->f_items.len, "opt.lxl:291"));
       int64_t t13 = f82_ir_Ir_nk(&(*p_o)->f_u, v_d_12);
       bool c14 = (bool)(t13 == 40LL);
       if (c14) {
@@ -73644,19 +73646,19 @@ static void f813_opt_Opt_borrowWalk(struct S82_opt_Opt**p_o, int64_t p_s, int64_
       }
     }
     int64_t ix15 = v_l_6;
-    int64_t end16 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix15, (*p_o)->f_u->f_items.len, "opt.lxl:293"));
+    int64_t end16 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix15, (*p_o)->f_u->f_items.len, "opt.lxl:294"));
     for (int64_t v_j_17 = 0LL; v_j_17 < end16; v_j_17++) {
-      int64_t ix18 = rt_add_int(rt_add_int(v_l_6, 1LL, "opt.lxl:293"), v_j_17, "opt.lxl:293");
-      f813_opt_Opt_borrowWalk(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix18, (*p_o)->f_u->f_items.len, "opt.lxl:293")), p_body);
+      int64_t ix18 = rt_add_int(rt_add_int(v_l_6, 1LL, "opt.lxl:294"), v_j_17, "opt.lxl:294");
+      f813_opt_Opt_borrowWalk(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix18, (*p_o)->f_u->f_items.len, "opt.lxl:294")), p_body);
     }
     return;
   }
   bool c19 = (bool)(v_k_3 == 42LL);
   if (c19) {
     int64_t ix20 = p_s;
-    f813_opt_Opt_borrowWalk(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix20, (*p_o)->f_u->f_nodes.len, "opt.lxl:297"))->f_b, p_body);
+    f813_opt_Opt_borrowWalk(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix20, (*p_o)->f_u->f_nodes.len, "opt.lxl:298"))->f_b, p_body);
     int64_t ix21 = p_s;
-    f813_opt_Opt_borrowWalk(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix21, (*p_o)->f_u->f_nodes.len, "opt.lxl:298"))->f_c, p_body);
+    f813_opt_Opt_borrowWalk(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix21, (*p_o)->f_u->f_nodes.len, "opt.lxl:299"))->f_c, p_body);
   } else {
     bool b22 = (bool)(v_k_3 == 43LL);
     if (!b22) {
@@ -73665,47 +73667,47 @@ static void f813_opt_Opt_borrowWalk(struct S82_opt_Opt**p_o, int64_t p_s, int64_
     bool c23 = b22;
     if (c23) {
       int64_t ix24 = p_s;
-      f813_opt_Opt_borrowWalk(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix24, (*p_o)->f_u->f_nodes.len, "opt.lxl:300"))->f_b, p_body);
+      f813_opt_Opt_borrowWalk(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix24, (*p_o)->f_u->f_nodes.len, "opt.lxl:301"))->f_b, p_body);
     } else {
       bool c25 = (bool)(v_k_3 == 44LL);
       if (c25) {
         int64_t ix26 = p_s;
-        f813_opt_Opt_borrowWalk(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix26, (*p_o)->f_u->f_nodes.len, "opt.lxl:302"))->f_a, p_body);
+        f813_opt_Opt_borrowWalk(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix26, (*p_o)->f_u->f_nodes.len, "opt.lxl:303"))->f_a, p_body);
         int64_t ix27 = p_s;
-        f813_opt_Opt_borrowWalk(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix27, (*p_o)->f_u->f_nodes.len, "opt.lxl:303"))->f_d, p_body);
+        f813_opt_Opt_borrowWalk(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix27, (*p_o)->f_u->f_nodes.len, "opt.lxl:304"))->f_d, p_body);
       }
     }
   }
 }
 static void f814_opt_Opt_borrowTry(struct S82_opt_Opt**p_o, int64_t p_d, int64_t p_l, int64_t p_j, int64_t p_n, int64_t p_body) {
   int64_t ix1 = p_d;
-  int64_t v_t_2 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:416"))->f_a;
+  int64_t v_t_2 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:417"))->f_a;
   int64_t ix3 = p_d;
-  int64_t v_init_4 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:417"))->f_b;
+  int64_t v_init_4 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:418"))->f_b;
   bool b5 = (bool)(v_init_4 < 0LL);
   if (!b5) {
     int64_t ix6 = p_d;
-    b5 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:418"))->f_c >= 0LL);
+    b5 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:419"))->f_c >= 0LL);
   }
   bool c7 = b5;
   if (c7) {
     return;
   }
   int64_t ix8 = v_t_2;
-  int64_t v_ty_9 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix8, (*p_o)->f_u->f_locals.len, "opt.lxl:419"))->f_ty;
+  int64_t v_ty_9 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix8, (*p_o)->f_u->f_locals.len, "opt.lxl:420"))->f_ty;
   int64_t t10 = f87_ir_Ir_tk(&(*p_o)->f_u, v_ty_9);
   bool b11 = (bool)(t10 != 15LL);
   if (!b11) {
     int64_t ix12 = v_ty_9;
-    int64_t ix13 = ((struct S33_ir_Ty*)(*p_o)->f_u->f_tys.data + rt_idx(ix12, (*p_o)->f_u->f_tys.len, "opt.lxl:420"))->f_sid;
-    b11 = (*((struct S30_ir_Struct**)(*p_o)->f_u->f_structs.data + rt_idx(ix13, (*p_o)->f_u->f_structs.len, "opt.lxl:420")))->f_isUnion;
+    int64_t ix13 = ((struct S33_ir_Ty*)(*p_o)->f_u->f_tys.data + rt_idx(ix12, (*p_o)->f_u->f_tys.len, "opt.lxl:421"))->f_sid;
+    b11 = (*((struct S30_ir_Struct**)(*p_o)->f_u->f_structs.data + rt_idx(ix13, (*p_o)->f_u->f_structs.len, "opt.lxl:421")))->f_isUnion;
   }
   bool c14 = b11;
   if (c14) {
     return;
   }
   int64_t ix15 = v_init_4;
-  bool b16 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix15, (*p_o)->f_u->f_nodes.len, "opt.lxl:421"))->f_ty != v_ty_9);
+  bool b16 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix15, (*p_o)->f_u->f_nodes.len, "opt.lxl:422"))->f_ty != v_ty_9);
   if (!b16) {
     bool t17 = f815_opt_Opt_lvalue(p_o, v_init_4);
     b16 = (bool)!t17;
@@ -73719,12 +73721,12 @@ static void f814_opt_Opt_borrowTry(struct S82_opt_Opt**p_o, int64_t p_d, int64_t
   if (c20) {
     return;
   }
-  bool c21 = (bool)(rt_add_int(p_j, 1LL, "opt.lxl:422") >= p_n);
+  bool c21 = (bool)(rt_add_int(p_j, 1LL, "opt.lxl:423") >= p_n);
   if (c21) {
     return;
   }
-  int64_t ix22 = rt_add_int(rt_add_int(rt_add_int(p_l, 1LL, "opt.lxl:423"), p_j, "opt.lxl:423"), 1LL, "opt.lxl:423");
-  int64_t t23 = f817_opt_Opt_stmtCall(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix22, (*p_o)->f_u->f_items.len, "opt.lxl:423")));
+  int64_t ix22 = rt_add_int(rt_add_int(rt_add_int(p_l, 1LL, "opt.lxl:424"), p_j, "opt.lxl:424"), 1LL, "opt.lxl:424");
+  int64_t t23 = f817_opt_Opt_stmtCall(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix22, (*p_o)->f_u->f_items.len, "opt.lxl:424")));
   int64_t v_c_24 = t23;
   bool c25 = (bool)(v_c_24 < 0LL);
   if (c25) {
@@ -73742,7 +73744,7 @@ static void f814_opt_Opt_borrowTry(struct S82_opt_Opt**p_o, int64_t p_d, int64_t
     return;
   }
   int64_t ix30 = v_c_24;
-  int64_t v_args_31 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix30, (*p_o)->f_u->f_nodes.len, "opt.lxl:429"))->f_b;
+  int64_t v_args_31 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix30, (*p_o)->f_u->f_nodes.len, "opt.lxl:430"))->f_b;
   int64_t v_ai_32 = -1LL;
   int64_t t33 = f77_ir_Ir_listLen(&(*p_o)->f_u, v_args_31);
   int64_t end34 = t33;
@@ -73776,13 +73778,13 @@ static void f814_opt_Opt_borrowTry(struct S82_opt_Opt**p_o, int64_t p_d, int64_t
   bool b48 = (bool)(v_g_47 < 0LL);
   if (!b48) {
     int64_t ix49 = v_g_47;
-    b48 = (bool)((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix49, (*p_o)->f_u->f_funcs.len, "opt.lxl:439")))->f_body < 0LL);
+    b48 = (bool)((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix49, (*p_o)->f_u->f_funcs.len, "opt.lxl:440")))->f_body < 0LL);
   }
   bool b50 = b48;
   if (!b50) {
     int64_t t51 = v_ai_32;
     int64_t ix52 = v_g_47;
-    b50 = (bool)(t51 >= (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix52, (*p_o)->f_u->f_funcs.len, "opt.lxl:439")))->f_params.len);
+    b50 = (bool)(t51 >= (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix52, (*p_o)->f_u->f_funcs.len, "opt.lxl:440")))->f_params.len);
   }
   bool c53 = b50;
   if (c53) {
@@ -73790,14 +73792,14 @@ static void f814_opt_Opt_borrowTry(struct S82_opt_Opt**p_o, int64_t p_d, int64_t
   }
   int64_t ix54 = v_g_47;
   int64_t ix55 = v_ai_32;
-  int64_t v_p_56 = *((int64_t*)(*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix54, (*p_o)->f_u->f_funcs.len, "opt.lxl:440")))->f_params.data + rt_idx(ix55, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix54, (*p_o)->f_u->f_funcs.len, "opt.lxl:440")))->f_params.len, "opt.lxl:440"));
+  int64_t v_p_56 = *((int64_t*)(*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix54, (*p_o)->f_u->f_funcs.len, "opt.lxl:441")))->f_params.data + rt_idx(ix55, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix54, (*p_o)->f_u->f_funcs.len, "opt.lxl:441")))->f_params.len, "opt.lxl:441"));
   int64_t ix57 = v_hit_26;
-  int64_t t58 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix57, (*p_o)->f_u->f_nodes.len, "opt.lxl:441"))->f_ty;
+  int64_t t58 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix57, (*p_o)->f_u->f_nodes.len, "opt.lxl:442"))->f_ty;
   int64_t ix59 = v_p_56;
-  bool b60 = (bool)(t58 != ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix59, (*p_o)->f_u->f_locals.len, "opt.lxl:441"))->f_ty);
+  bool b60 = (bool)(t58 != ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix59, (*p_o)->f_u->f_locals.len, "opt.lxl:442"))->f_ty);
   if (!b60) {
     int64_t ix61 = v_g_47;
-    bool t62 = f820_opt_Opt_pureBody(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix61, (*p_o)->f_u->f_funcs.len, "opt.lxl:441")))->f_body, v_p_56);
+    bool t62 = f820_opt_Opt_pureBody(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix61, (*p_o)->f_u->f_funcs.len, "opt.lxl:442")))->f_body, v_p_56);
     b60 = (bool)!t62;
   }
   bool c63 = b60;
@@ -73805,11 +73807,11 @@ static void f814_opt_Opt_borrowTry(struct S82_opt_Opt**p_o, int64_t p_d, int64_t
     return;
   }
   int64_t ix64 = v_hit_26;
-  ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix64, (*p_o)->f_u->f_nodes.len, "opt.lxl:442"))->f_a = v_init_4;
+  ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix64, (*p_o)->f_u->f_nodes.len, "opt.lxl:443"))->f_a = v_init_4;
   int64_t ix65 = p_d;
-  ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix65, (*p_o)->f_u->f_nodes.len, "opt.lxl:443"))->f_k = 52LL;
+  ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix65, (*p_o)->f_u->f_nodes.len, "opt.lxl:444"))->f_k = 52LL;
   int64_t ix66 = p_d;
-  ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix66, (*p_o)->f_u->f_nodes.len, "opt.lxl:444"))->f_b = -1LL;
+  ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix66, (*p_o)->f_u->f_nodes.len, "opt.lxl:445"))->f_b = -1LL;
 }
 static bool f820_opt_Opt_pureBody(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p_p) {
   bool t1 = f821_opt_Opt_pureAt(p_o, p_x, p_p, (bool)0LL);
@@ -73826,14 +73828,14 @@ static bool f821_opt_Opt_pureAt(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p_
   int64_t v_k_4 = t3;
   lxl_slice t5 = k2_ir_KIDS;
   int64_t ix6 = v_k_4;
-  int64_t v_kc_7 = *((int64_t*)t5.data + rt_idx(ix6, t5.len, "opt.lxl:370"));
+  int64_t v_kc_7 = *((int64_t*)t5.data + rt_idx(ix6, t5.len, "opt.lxl:371"));
   bool c8 = (bool)(v_kc_7 < 0LL);
   if (c8) {
     bool r9 = (bool)0LL;
     return r9;
   }
   int64_t ix10 = p_x;
-  int64_t v_a_11 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:372"))->f_a;
+  int64_t v_a_11 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:373"))->f_a;
   bool c12 = (bool)(v_k_4 == 4LL);
   if (c12) {
     bool b13 = (bool)(v_a_11 != p_p);
@@ -73883,7 +73885,7 @@ static bool f821_opt_Opt_pureAt(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p_
     bool b30 = t29;
     if (b30) {
       int64_t ix31 = p_x;
-      bool t32 = f821_opt_Opt_pureAt(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix31, (*p_o)->f_u->f_nodes.len, "opt.lxl:381"))->f_b, p_p, (bool)0LL);
+      bool t32 = f821_opt_Opt_pureAt(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix31, (*p_o)->f_u->f_nodes.len, "opt.lxl:382"))->f_b, p_p, (bool)0LL);
       b30 = t32;
     }
     bool r33 = b30;
@@ -73906,12 +73908,12 @@ static bool f821_opt_Opt_pureAt(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p_
     bool b41 = (bool)(v_f_40 < 0LL);
     if (!b41) {
       int64_t ix42 = v_f_40;
-      b41 = (bool)((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix42, (*p_o)->f_u->f_funcs.len, "opt.lxl:386")))->f_body >= 0LL);
+      b41 = (bool)((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix42, (*p_o)->f_u->f_funcs.len, "opt.lxl:387")))->f_body >= 0LL);
     }
     bool b43 = b41;
     if (!b43) {
       int64_t ix44 = v_f_40;
-      bool t45 = f823_opt_Opt_pureRt(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix44, (*p_o)->f_u->f_funcs.len, "opt.lxl:386")))->f_name);
+      bool t45 = f823_opt_Opt_pureRt(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix44, (*p_o)->f_u->f_funcs.len, "opt.lxl:387")))->f_name);
       b43 = (bool)!t45;
     }
     bool c46 = b43;
@@ -73920,7 +73922,7 @@ static bool f821_opt_Opt_pureAt(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p_
       return r47;
     }
     int64_t ix48 = p_x;
-    int64_t v_l_49 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix48, (*p_o)->f_u->f_nodes.len, "opt.lxl:387"))->f_b;
+    int64_t v_l_49 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix48, (*p_o)->f_u->f_nodes.len, "opt.lxl:388"))->f_b;
     int64_t t50 = f77_ir_Ir_listLen(&(*p_o)->f_u, v_l_49);
     int64_t end51 = t50;
     for (int64_t v_j_52 = 0LL; v_j_52 < end51; v_j_52++) {
@@ -73936,9 +73938,9 @@ static bool f821_opt_Opt_pureAt(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p_
     return r57;
   }
   int64_t ix58 = p_x;
-  int64_t v_b_59 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix58, (*p_o)->f_u->f_nodes.len, "opt.lxl:391"))->f_b;
+  int64_t v_b_59 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix58, (*p_o)->f_u->f_nodes.len, "opt.lxl:392"))->f_b;
   int64_t ix60 = p_x;
-  int64_t v_c_61 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix60, (*p_o)->f_u->f_nodes.len, "opt.lxl:392"))->f_c;
+  int64_t v_c_61 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix60, (*p_o)->f_u->f_nodes.len, "opt.lxl:393"))->f_c;
   bool c62 = (bool)(v_kc_7 == 1LL);
   if (c62) {
     bool t63 = f821_opt_Opt_pureAt(p_o, v_a_11, p_p, (bool)0LL);
@@ -74042,7 +74044,7 @@ static bool f821_opt_Opt_pureAt(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p_
   bool b111 = b109;
   if (b111) {
     int64_t ix112 = p_x;
-    bool t113 = f821_opt_Opt_pureAt(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix112, (*p_o)->f_u->f_nodes.len, "opt.lxl:410"))->f_d, p_p, (bool)0LL);
+    bool t113 = f821_opt_Opt_pureAt(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix112, (*p_o)->f_u->f_nodes.len, "opt.lxl:411"))->f_d, p_p, (bool)0LL);
     b111 = t113;
   }
   bool r114 = b111;
@@ -74082,9 +74084,9 @@ static bool f823_opt_Opt_pureRt(struct S82_opt_Opt**p_o, lxl_str p_name) {
     bool r12 = (bool)1LL;
     return r12;
   }
-  lxl_str vw13 = rt_str_view(p_name, 3LL, 7LL, "opt.lxl:355");
+  lxl_str vw13 = rt_str_view(p_name, 3LL, 7LL, "opt.lxl:356");
   lxl_str v_o4_14 = vw13;
-  lxl_str vw15 = rt_str_view(p_name, 3LL, 8LL, "opt.lxl:356");
+  lxl_str vw15 = rt_str_view(p_name, 3LL, 8LL, "opt.lxl:357");
   lxl_str v_o5_16 = vw15;
   bool b17 = rt_str_eq(v_o4_14, sl9337);
   if (!b17) {
@@ -74138,13 +74140,13 @@ static int64_t f822_opt_Opt_root(struct S82_opt_Opt**p_o, int64_t p_x) {
       break;
     }
     int64_t ix4 = v_r_1;
-    v_r_1 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:720"))->f_a;
+    v_r_1 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:721"))->f_a;
   }
   int64_t t5 = f82_ir_Ir_nk(&(*p_o)->f_u, v_r_1);
   int64_t ifx6;
   if (t5 == 4LL) {
     int64_t ix7 = v_r_1;
-    ifx6 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:721"))->f_a;
+    ifx6 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:722"))->f_a;
   } else {
     ifx6 = -1LL;
   }
@@ -74159,12 +74161,12 @@ static int64_t f819_opt_Opt_callee(struct S82_opt_Opt**p_o, int64_t p_x) {
     return r3;
   }
   int64_t ix4 = p_x;
-  int64_t v_c_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:538"))->f_a;
+  int64_t v_c_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:539"))->f_a;
   int64_t t6 = f82_ir_Ir_nk(&(*p_o)->f_u, v_c_5);
   bool b7 = (bool)(t6 != 11LL);
   if (!b7) {
     int64_t ix8 = v_c_5;
-    int64_t t9 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix8, (*p_o)->f_u->f_nodes.len, "opt.lxl:539"))->f_a);
+    int64_t t9 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix8, (*p_o)->f_u->f_nodes.len, "opt.lxl:540"))->f_a);
     b7 = (bool)(t9 != 6LL);
   }
   bool c10 = b7;
@@ -74173,8 +74175,8 @@ static int64_t f819_opt_Opt_callee(struct S82_opt_Opt**p_o, int64_t p_x) {
     return r11;
   }
   int64_t ix12 = v_c_5;
-  int64_t ix13 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix12, (*p_o)->f_u->f_nodes.len, "opt.lxl:540"))->f_a;
-  int64_t r14 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:540"))->f_a;
+  int64_t ix13 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix12, (*p_o)->f_u->f_nodes.len, "opt.lxl:541"))->f_a;
+  int64_t r14 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:541"))->f_a;
   return r14;
 }
 static void f818_opt_Opt_scanBorrow(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p_d, int64_t*p_hit, bool*p_bad) {
@@ -74191,7 +74193,7 @@ static void f818_opt_Opt_scanBorrow(struct S82_opt_Opt**p_o, int64_t p_x, int64_
   bool c5 = (bool)(v_k_4 == 4LL);
   if (c5) {
     int64_t ix6 = p_x;
-    bool c7 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:328"))->f_a == p_d);
+    bool c7 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:329"))->f_a == p_d);
     if (c7) {
       *p_bad = (bool)1LL;
     }
@@ -74200,12 +74202,12 @@ static void f818_opt_Opt_scanBorrow(struct S82_opt_Opt**p_o, int64_t p_x, int64_
   bool c8 = (bool)(v_k_4 == 10LL);
   if (c8) {
     int64_t ix9 = p_x;
-    int64_t v_a_10 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix9, (*p_o)->f_u->f_nodes.len, "opt.lxl:332"))->f_a;
+    int64_t v_a_10 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix9, (*p_o)->f_u->f_nodes.len, "opt.lxl:333"))->f_a;
     int64_t t11 = f82_ir_Ir_nk(&(*p_o)->f_u, v_a_10);
     bool b12 = (bool)(t11 == 4LL);
     if (b12) {
       int64_t ix13 = v_a_10;
-      b12 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:333"))->f_a == p_d);
+      b12 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:334"))->f_a == p_d);
     }
     bool c14 = b12;
     if (c14) {
@@ -74220,7 +74222,7 @@ static void f818_opt_Opt_scanBorrow(struct S82_opt_Opt**p_o, int64_t p_x, int64_
   }
   lxl_slice t16 = k2_ir_KIDS;
   int64_t ix17 = v_k_4;
-  int64_t v_kc_18 = *((int64_t*)t16.data + rt_idx(ix17, t16.len, "opt.lxl:338"));
+  int64_t v_kc_18 = *((int64_t*)t16.data + rt_idx(ix17, t16.len, "opt.lxl:339"));
   bool c19 = (bool)(v_kc_18 == 0LL);
   if (c19) {
     return;
@@ -74236,7 +74238,7 @@ static void f818_opt_Opt_scanBorrow(struct S82_opt_Opt**p_o, int64_t p_x, int64_
   bool c22 = b21;
   if (c22) {
     int64_t ix23 = p_x;
-    f818_opt_Opt_scanBorrow(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix23, (*p_o)->f_u->f_nodes.len, "opt.lxl:340"))->f_a, p_d, p_hit, p_bad);
+    f818_opt_Opt_scanBorrow(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix23, (*p_o)->f_u->f_nodes.len, "opt.lxl:341"))->f_a, p_d, p_hit, p_bad);
   }
   bool b24 = (bool)(v_kc_18 == 2LL);
   if (!b24) {
@@ -74253,7 +74255,7 @@ static void f818_opt_Opt_scanBorrow(struct S82_opt_Opt**p_o, int64_t p_x, int64_
   bool c27 = b26;
   if (c27) {
     int64_t ix28 = p_x;
-    f818_opt_Opt_scanBorrow(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix28, (*p_o)->f_u->f_nodes.len, "opt.lxl:342"))->f_b, p_d, p_hit, p_bad);
+    f818_opt_Opt_scanBorrow(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix28, (*p_o)->f_u->f_nodes.len, "opt.lxl:343"))->f_b, p_d, p_hit, p_bad);
   }
   bool b29 = (bool)(v_kc_18 == 3LL);
   if (!b29) {
@@ -74262,12 +74264,12 @@ static void f818_opt_Opt_scanBorrow(struct S82_opt_Opt**p_o, int64_t p_x, int64_
   bool c30 = b29;
   if (c30) {
     int64_t ix31 = p_x;
-    f818_opt_Opt_scanBorrow(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix31, (*p_o)->f_u->f_nodes.len, "opt.lxl:344"))->f_c, p_d, p_hit, p_bad);
+    f818_opt_Opt_scanBorrow(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix31, (*p_o)->f_u->f_nodes.len, "opt.lxl:345"))->f_c, p_d, p_hit, p_bad);
   }
   bool c32 = (bool)(v_kc_18 == 8LL);
   if (c32) {
     int64_t ix33 = p_x;
-    f818_opt_Opt_scanBorrow(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix33, (*p_o)->f_u->f_nodes.len, "opt.lxl:345"))->f_d, p_d, p_hit, p_bad);
+    f818_opt_Opt_scanBorrow(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix33, (*p_o)->f_u->f_nodes.len, "opt.lxl:346"))->f_d, p_d, p_hit, p_bad);
   }
   bool b34 = (bool)(v_kc_18 == 4LL);
   if (!b34) {
@@ -74276,17 +74278,17 @@ static void f818_opt_Opt_scanBorrow(struct S82_opt_Opt**p_o, int64_t p_x, int64_
   int64_t ifx35;
   if (b34) {
     int64_t ix36 = p_x;
-    ifx35 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix36, (*p_o)->f_u->f_nodes.len, "opt.lxl:346"))->f_b;
+    ifx35 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix36, (*p_o)->f_u->f_nodes.len, "opt.lxl:347"))->f_b;
   } else {
     int64_t ifx37;
     if (v_kc_18 == 6LL) {
       int64_t ix38 = p_x;
-      ifx37 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix38, (*p_o)->f_u->f_nodes.len, "opt.lxl:346"))->f_a;
+      ifx37 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix38, (*p_o)->f_u->f_nodes.len, "opt.lxl:347"))->f_a;
     } else {
       int64_t ifx39;
       if (v_kc_18 == 7LL) {
         int64_t ix40 = p_x;
-        ifx39 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix40, (*p_o)->f_u->f_nodes.len, "opt.lxl:346"))->f_c;
+        ifx39 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix40, (*p_o)->f_u->f_nodes.len, "opt.lxl:347"))->f_c;
       } else {
         ifx39 = -1LL;
       }
@@ -74298,10 +74300,10 @@ static void f818_opt_Opt_scanBorrow(struct S82_opt_Opt**p_o, int64_t p_x, int64_
   bool c42 = (bool)(v_l_41 >= 0LL);
   if (c42) {
     int64_t ix43 = v_l_41;
-    int64_t end44 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix43, (*p_o)->f_u->f_items.len, "opt.lxl:347"));
+    int64_t end44 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix43, (*p_o)->f_u->f_items.len, "opt.lxl:348"));
     for (int64_t v_j_45 = 0LL; v_j_45 < end44; v_j_45++) {
-      int64_t ix46 = rt_add_int(rt_add_int(v_l_41, 1LL, "opt.lxl:347"), v_j_45, "opt.lxl:347");
-      f818_opt_Opt_scanBorrow(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix46, (*p_o)->f_u->f_items.len, "opt.lxl:347")), p_d, p_hit, p_bad);
+      int64_t ix46 = rt_add_int(rt_add_int(v_l_41, 1LL, "opt.lxl:348"), v_j_45, "opt.lxl:348");
+      f818_opt_Opt_scanBorrow(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix46, (*p_o)->f_u->f_items.len, "opt.lxl:348")), p_d, p_hit, p_bad);
     }
   }
 }
@@ -74311,7 +74313,7 @@ static int64_t f817_opt_Opt_stmtCall(struct S82_opt_Opt**p_o, int64_t p_s) {
   bool c3 = (bool)(v_k_2 == 41LL);
   if (c3) {
     int64_t ix4 = p_s;
-    int64_t v_e_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:311"))->f_a;
+    int64_t v_e_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:312"))->f_a;
     int64_t t6 = f82_ir_Ir_nk(&(*p_o)->f_u, v_e_5);
     bool c7 = (bool)(t6 == 7LL);
     if (c7) {
@@ -74322,45 +74324,45 @@ static int64_t f817_opt_Opt_stmtCall(struct S82_opt_Opt**p_o, int64_t p_s) {
     bool b10 = (bool)(t9 == 20LL);
     if (b10) {
       int64_t ix11 = v_e_5;
-      int64_t t12 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix11, (*p_o)->f_u->f_nodes.len, "opt.lxl:313"))->f_b);
+      int64_t t12 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix11, (*p_o)->f_u->f_nodes.len, "opt.lxl:314"))->f_b);
       b10 = (bool)(t12 == 7LL);
     }
     bool c13 = b10;
     if (c13) {
       int64_t ix14 = v_e_5;
-      int64_t r15 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix14, (*p_o)->f_u->f_nodes.len, "opt.lxl:313"))->f_b;
+      int64_t r15 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix14, (*p_o)->f_u->f_nodes.len, "opt.lxl:314"))->f_b;
       return r15;
     }
   } else {
     bool c16 = (bool)(v_k_2 == 40LL);
     if (c16) {
       int64_t ix17 = p_s;
-      bool b18 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix17, (*p_o)->f_u->f_nodes.len, "opt.lxl:315"))->f_b >= 0LL);
+      bool b18 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix17, (*p_o)->f_u->f_nodes.len, "opt.lxl:316"))->f_b >= 0LL);
       if (b18) {
         int64_t ix19 = p_s;
-        int64_t t20 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:315"))->f_b);
+        int64_t t20 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:316"))->f_b);
         b18 = (bool)(t20 == 7LL);
       }
       bool c21 = b18;
       if (c21) {
         int64_t ix22 = p_s;
-        int64_t r23 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix22, (*p_o)->f_u->f_nodes.len, "opt.lxl:315"))->f_b;
+        int64_t r23 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix22, (*p_o)->f_u->f_nodes.len, "opt.lxl:316"))->f_b;
         return r23;
       }
     } else {
       bool c24 = (bool)(v_k_2 == 47LL);
       if (c24) {
         int64_t ix25 = p_s;
-        bool b26 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix25, (*p_o)->f_u->f_nodes.len, "opt.lxl:317"))->f_a >= 0LL);
+        bool b26 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix25, (*p_o)->f_u->f_nodes.len, "opt.lxl:318"))->f_a >= 0LL);
         if (b26) {
           int64_t ix27 = p_s;
-          int64_t t28 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix27, (*p_o)->f_u->f_nodes.len, "opt.lxl:317"))->f_a);
+          int64_t t28 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix27, (*p_o)->f_u->f_nodes.len, "opt.lxl:318"))->f_a);
           b26 = (bool)(t28 == 7LL);
         }
         bool c29 = b26;
         if (c29) {
           int64_t ix30 = p_s;
-          int64_t r31 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix30, (*p_o)->f_u->f_nodes.len, "opt.lxl:317"))->f_a;
+          int64_t r31 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix30, (*p_o)->f_u->f_nodes.len, "opt.lxl:318"))->f_a;
           return r31;
         }
       }
@@ -74389,12 +74391,12 @@ static bool f816_opt_Opt_pureInit(struct S82_opt_Opt**p_o, int64_t p_x) {
   bool c8 = (bool)(v_k_4 == 7LL);
   if (c8) {
     int64_t ix9 = p_x;
-    int64_t v_c_10 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix9, (*p_o)->f_u->f_nodes.len, "opt.lxl:455"))->f_a;
+    int64_t v_c_10 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix9, (*p_o)->f_u->f_nodes.len, "opt.lxl:456"))->f_a;
     int64_t t11 = f82_ir_Ir_nk(&(*p_o)->f_u, v_c_10);
     bool b12 = (bool)(t11 != 11LL);
     if (!b12) {
       int64_t ix13 = v_c_10;
-      int64_t t14 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:456"))->f_a);
+      int64_t t14 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:457"))->f_a);
       b12 = (bool)(t14 != 6LL);
     }
     bool c15 = b12;
@@ -74403,9 +74405,9 @@ static bool f816_opt_Opt_pureInit(struct S82_opt_Opt**p_o, int64_t p_x) {
       return r16;
     }
     int64_t ix17 = v_c_10;
-    int64_t ix18 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix17, (*p_o)->f_u->f_nodes.len, "opt.lxl:459"))->f_a;
-    int64_t ix19 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix18, (*p_o)->f_u->f_nodes.len, "opt.lxl:459"))->f_a;
-    lxl_str v_nm_20 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix19, (*p_o)->f_u->f_funcs.len, "opt.lxl:459")))->f_name;
+    int64_t ix18 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix17, (*p_o)->f_u->f_nodes.len, "opt.lxl:460"))->f_a;
+    int64_t ix19 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix18, (*p_o)->f_u->f_nodes.len, "opt.lxl:460"))->f_a;
+    lxl_str v_nm_20 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix19, (*p_o)->f_u->f_funcs.len, "opt.lxl:460")))->f_name;
     bool b21 = (bool)!rt_str_eq(v_nm_20, sl364);
     if (b21) {
       b21 = (bool)!rt_str_eq(v_nm_20, sl365);
@@ -74426,7 +74428,7 @@ static bool f816_opt_Opt_pureInit(struct S82_opt_Opt**p_o, int64_t p_x) {
   }
   lxl_slice t26 = k2_ir_KIDS;
   int64_t ix27 = v_k_4;
-  int64_t v_kc_28 = *((int64_t*)t26.data + rt_idx(ix27, t26.len, "opt.lxl:464"));
+  int64_t v_kc_28 = *((int64_t*)t26.data + rt_idx(ix27, t26.len, "opt.lxl:465"));
   bool c29 = (bool)(v_kc_28 == 0LL);
   if (c29) {
     bool r30 = (bool)1LL;
@@ -74435,12 +74437,12 @@ static bool f816_opt_Opt_pureInit(struct S82_opt_Opt**p_o, int64_t p_x) {
   bool c31 = (bool)(v_kc_28 == 5LL);
   if (c31) {
     int64_t ix32 = p_x;
-    int64_t v_l_33 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix32, (*p_o)->f_u->f_nodes.len, "opt.lxl:467"))->f_b;
+    int64_t v_l_33 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix32, (*p_o)->f_u->f_nodes.len, "opt.lxl:468"))->f_b;
     int64_t ix34 = v_l_33;
-    int64_t end35 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix34, (*p_o)->f_u->f_items.len, "opt.lxl:468"));
+    int64_t end35 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix34, (*p_o)->f_u->f_items.len, "opt.lxl:469"));
     for (int64_t v_j_36 = 0LL; v_j_36 < end35; v_j_36++) {
-      int64_t ix37 = rt_add_int(rt_add_int(v_l_33, 1LL, "opt.lxl:468"), v_j_36, "opt.lxl:468");
-      bool t38 = f816_opt_Opt_pureInit(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix37, (*p_o)->f_u->f_items.len, "opt.lxl:468")));
+      int64_t ix37 = rt_add_int(rt_add_int(v_l_33, 1LL, "opt.lxl:469"), v_j_36, "opt.lxl:469");
+      bool t38 = f816_opt_Opt_pureInit(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix37, (*p_o)->f_u->f_items.len, "opt.lxl:469")));
       bool c39 = (bool)!t38;
       if (c39) {
         bool r40 = (bool)0LL;
@@ -74460,7 +74462,7 @@ static bool f816_opt_Opt_pureInit(struct S82_opt_Opt**p_o, int64_t p_x) {
     return r44;
   }
   int64_t ix45 = p_x;
-  bool t46 = f816_opt_Opt_pureInit(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix45, (*p_o)->f_u->f_nodes.len, "opt.lxl:472"))->f_a);
+  bool t46 = f816_opt_Opt_pureInit(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix45, (*p_o)->f_u->f_nodes.len, "opt.lxl:473"))->f_a);
   bool c47 = (bool)!t46;
   if (c47) {
     bool r48 = (bool)0LL;
@@ -74477,7 +74479,7 @@ static bool f816_opt_Opt_pureInit(struct S82_opt_Opt**p_o, int64_t p_x) {
   bool c51 = b50;
   if (c51) {
     int64_t ix52 = p_x;
-    bool t53 = f816_opt_Opt_pureInit(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix52, (*p_o)->f_u->f_nodes.len, "opt.lxl:473"))->f_b);
+    bool t53 = f816_opt_Opt_pureInit(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix52, (*p_o)->f_u->f_nodes.len, "opt.lxl:474"))->f_b);
     bool c54 = (bool)!t53;
     if (c54) {
       bool r55 = (bool)0LL;
@@ -74491,7 +74493,7 @@ static bool f816_opt_Opt_pureInit(struct S82_opt_Opt**p_o, int64_t p_x) {
   bool c57 = b56;
   if (c57) {
     int64_t ix58 = p_x;
-    bool t59 = f816_opt_Opt_pureInit(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix58, (*p_o)->f_u->f_nodes.len, "opt.lxl:474"))->f_c);
+    bool t59 = f816_opt_Opt_pureInit(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix58, (*p_o)->f_u->f_nodes.len, "opt.lxl:475"))->f_c);
     bool c60 = (bool)!t59;
     if (c60) {
       bool r61 = (bool)0LL;
@@ -74501,19 +74503,19 @@ static bool f816_opt_Opt_pureInit(struct S82_opt_Opt**p_o, int64_t p_x) {
   bool c62 = (bool)(v_kc_28 == 8LL);
   if (c62) {
     int64_t ix63 = p_x;
-    bool t64 = f816_opt_Opt_pureInit(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix63, (*p_o)->f_u->f_nodes.len, "opt.lxl:475"))->f_d);
+    bool t64 = f816_opt_Opt_pureInit(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix63, (*p_o)->f_u->f_nodes.len, "opt.lxl:476"))->f_d);
     bool r65 = t64;
     return r65;
   }
   bool c66 = (bool)(v_kc_28 == 4LL);
   if (c66) {
     int64_t ix67 = p_x;
-    int64_t v_l_68 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix67, (*p_o)->f_u->f_nodes.len, "opt.lxl:477"))->f_b;
+    int64_t v_l_68 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix67, (*p_o)->f_u->f_nodes.len, "opt.lxl:478"))->f_b;
     int64_t ix69 = v_l_68;
-    int64_t end70 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix69, (*p_o)->f_u->f_items.len, "opt.lxl:478"));
+    int64_t end70 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix69, (*p_o)->f_u->f_items.len, "opt.lxl:479"));
     for (int64_t v_j_71 = 0LL; v_j_71 < end70; v_j_71++) {
-      int64_t ix72 = rt_add_int(rt_add_int(v_l_68, 1LL, "opt.lxl:478"), v_j_71, "opt.lxl:478");
-      bool t73 = f816_opt_Opt_pureInit(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix72, (*p_o)->f_u->f_items.len, "opt.lxl:478")));
+      int64_t ix72 = rt_add_int(rt_add_int(v_l_68, 1LL, "opt.lxl:479"), v_j_71, "opt.lxl:479");
+      bool t73 = f816_opt_Opt_pureInit(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix72, (*p_o)->f_u->f_items.len, "opt.lxl:479")));
       bool c74 = (bool)!t73;
       if (c74) {
         bool r75 = (bool)0LL;
@@ -74533,7 +74535,7 @@ static bool f815_opt_Opt_lvalue(struct S82_opt_Opt**p_o, int64_t p_x) {
       break;
     }
     int64_t ix4 = v_r_1;
-    v_r_1 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1764"))->f_a;
+    v_r_1 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1870"))->f_a;
   }
   int64_t t5 = f82_ir_Ir_nk(&(*p_o)->f_u, v_r_1);
   int64_t v_k_6 = t5;
@@ -74550,7 +74552,7 @@ static bool f815_opt_Opt_lvalue(struct S82_opt_Opt**p_o, int64_t p_x) {
 }
 static void f811_opt_Opt_fwdReceivers(struct S82_opt_Opt**p_o) {
   int64_t fill1 = 0LL;
-  lxl_arr a2 = rt_arr_fill((*p_o)->f_u->f_locals.len, 8ULL, "opt.lxl:251");
+  lxl_arr a2 = rt_arr_fill((*p_o)->f_u->f_locals.len, 8ULL, "opt.lxl:252");
   for (int64_t i3 = 0LL; i3 < a2.len; i3++) {
     *((int64_t*)a2.data + i3) = fill1;
   }
@@ -74558,21 +74560,21 @@ static void f811_opt_Opt_fwdReceivers(struct S82_opt_Opt**p_o) {
   int64_t end5 = (*p_o)->f_u->f_funcs.len;
   for (int64_t v_f_6 = 0LL; v_f_6 < end5; v_f_6++) {
     int64_t ix7 = v_f_6;
-    bool c8 = (bool)((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix7, (*p_o)->f_u->f_funcs.len, "opt.lxl:253")))->f_body < 0LL);
+    bool c8 = (bool)((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix7, (*p_o)->f_u->f_funcs.len, "opt.lxl:254")))->f_body < 0LL);
     if (c8) {
       continue;
     }
     lxl_arr a9 = rt_arr_new(0LL, 8ULL);
     lxl_arr v_touched_10 = a9;
     int64_t ix11 = v_f_6;
-    f824_opt_Opt_countAll(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix11, (*p_o)->f_u->f_funcs.len, "opt.lxl:255")))->f_body, &v_uses_4, &v_touched_10);
+    f824_opt_Opt_countAll(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix11, (*p_o)->f_u->f_funcs.len, "opt.lxl:256")))->f_body, &v_uses_4, &v_touched_10);
     int64_t ix12 = v_f_6;
-    f825_opt_Opt_fwdStmtSafe(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix12, (*p_o)->f_u->f_funcs.len, "opt.lxl:256")))->f_body, &v_uses_4);
+    f825_opt_Opt_fwdStmtSafe(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix12, (*p_o)->f_u->f_funcs.len, "opt.lxl:257")))->f_body, &v_uses_4);
     lxl_slice ap13 = rt_as_slice(&v_touched_10);
     for (int64_t i14 = 0LL; i14 < ap13.len; i14++) {
       int64_t v_l_15 = *((int64_t*)ap13.data + i14);
       int64_t ix16 = v_l_15;
-      *((int64_t*)v_uses_4.data + rt_idx(ix16, v_uses_4.len, "opt.lxl:257")) = 0LL;
+      *((int64_t*)v_uses_4.data + rt_idx(ix16, v_uses_4.len, "opt.lxl:258")) = 0LL;
     }
     gl10_drop(v_touched_10);
   }
@@ -74589,37 +74591,37 @@ static void f825_opt_Opt_fwdStmtSafe(struct S82_opt_Opt**p_o, int64_t p_s, lxl_a
     return;
   }
   int64_t ix4 = p_s;
-  int64_t v_l_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:184"))->f_a;
+  int64_t v_l_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:185"))->f_a;
   int64_t ix6 = v_l_5;
-  int64_t end7 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix6, (*p_o)->f_u->f_items.len, "opt.lxl:185"));
+  int64_t end7 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix6, (*p_o)->f_u->f_items.len, "opt.lxl:186"));
   for (int64_t v_j_8 = 0LL; v_j_8 < end7; v_j_8++) {
-    int64_t ix9 = rt_add_int(rt_add_int(v_l_5, 1LL, "opt.lxl:186"), v_j_8, "opt.lxl:186");
-    int64_t v_d_10 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix9, (*p_o)->f_u->f_items.len, "opt.lxl:186"));
+    int64_t ix9 = rt_add_int(rt_add_int(v_l_5, 1LL, "opt.lxl:187"), v_j_8, "opt.lxl:187");
+    int64_t v_d_10 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix9, (*p_o)->f_u->f_items.len, "opt.lxl:187"));
     int64_t t11 = f82_ir_Ir_nk(&(*p_o)->f_u, v_d_10);
     bool b12 = (bool)(t11 != 40LL);
     if (!b12) {
       int64_t ix13 = v_d_10;
-      b12 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:187"))->f_b < 0LL);
+      b12 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:188"))->f_b < 0LL);
     }
     bool b14 = b12;
     if (!b14) {
       int64_t ix15 = v_d_10;
-      b14 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix15, (*p_o)->f_u->f_nodes.len, "opt.lxl:187"))->f_c >= 0LL);
+      b14 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix15, (*p_o)->f_u->f_nodes.len, "opt.lxl:188"))->f_c >= 0LL);
     }
     bool c16 = b14;
     if (c16) {
       continue;
     }
     int64_t ix17 = v_d_10;
-    int64_t v_t_18 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix17, (*p_o)->f_u->f_nodes.len, "opt.lxl:188"))->f_a;
+    int64_t v_t_18 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix17, (*p_o)->f_u->f_nodes.len, "opt.lxl:189"))->f_a;
     int64_t ix19 = v_t_18;
-    bool t20 = f206_ir_Ir_isAggr(&(*p_o)->f_u, ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix19, (*p_o)->f_u->f_locals.len, "opt.lxl:189"))->f_ty);
+    bool t20 = f206_ir_Ir_isAggr(&(*p_o)->f_u, ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix19, (*p_o)->f_u->f_locals.len, "opt.lxl:190"))->f_ty);
     bool c21 = (bool)!t20;
     if (c21) {
       continue;
     }
     int64_t ix22 = v_d_10;
-    int64_t v_init_23 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix22, (*p_o)->f_u->f_nodes.len, "opt.lxl:190"))->f_b;
+    int64_t v_init_23 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix22, (*p_o)->f_u->f_nodes.len, "opt.lxl:191"))->f_b;
     int64_t t24 = f82_ir_Ir_nk(&(*p_o)->f_u, v_init_23);
     int64_t v_ik_25 = t24;
     bool b26 = (bool)(v_ik_25 != 8LL);
@@ -74631,9 +74633,9 @@ static void f825_opt_Opt_fwdStmtSafe(struct S82_opt_Opt**p_o, int64_t p_s, lxl_a
       continue;
     }
     int64_t ix28 = v_init_23;
-    int64_t t29 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix28, (*p_o)->f_u->f_nodes.len, "opt.lxl:193"))->f_ty;
+    int64_t t29 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix28, (*p_o)->f_u->f_nodes.len, "opt.lxl:194"))->f_ty;
     int64_t ix30 = v_t_18;
-    bool b31 = (bool)(t29 != ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix30, (*p_o)->f_u->f_locals.len, "opt.lxl:193"))->f_ty);
+    bool b31 = (bool)(t29 != ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix30, (*p_o)->f_u->f_locals.len, "opt.lxl:194"))->f_ty);
     if (!b31) {
       bool t32 = f816_opt_Opt_pureInit(p_o, v_init_23);
       b31 = (bool)!t32;
@@ -74641,19 +74643,19 @@ static void f825_opt_Opt_fwdStmtSafe(struct S82_opt_Opt**p_o, int64_t p_s, lxl_a
     bool b33 = b31;
     if (!b33) {
       int64_t ix34 = v_t_18;
-      b33 = (bool)(*((int64_t*)p_uses->data + rt_idx(ix34, p_uses->len, "opt.lxl:193")) != 1LL);
+      b33 = (bool)(*((int64_t*)p_uses->data + rt_idx(ix34, p_uses->len, "opt.lxl:194")) != 1LL);
     }
     bool c35 = b33;
     if (c35) {
       continue;
     }
     int64_t v_hit_36 = -1LL;
-    int64_t t37 = rt_add_int(v_j_8, 1LL, "opt.lxl:195");
+    int64_t t37 = rt_add_int(v_j_8, 1LL, "opt.lxl:196");
     int64_t ix38 = v_l_5;
-    int64_t end39 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix38, (*p_o)->f_u->f_items.len, "opt.lxl:195"));
+    int64_t end39 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix38, (*p_o)->f_u->f_items.len, "opt.lxl:196"));
     for (int64_t v_q_40 = t37; v_q_40 < end39; v_q_40++) {
-      int64_t ix41 = rt_add_int(rt_add_int(v_l_5, 1LL, "opt.lxl:196"), v_q_40, "opt.lxl:196");
-      int64_t v_nx_42 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix41, (*p_o)->f_u->f_items.len, "opt.lxl:196"));
+      int64_t ix41 = rt_add_int(rt_add_int(v_l_5, 1LL, "opt.lxl:197"), v_q_40, "opt.lxl:197");
+      int64_t v_nx_42 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix41, (*p_o)->f_u->f_items.len, "opt.lxl:197"));
       int64_t t43 = f82_ir_Ir_nk(&(*p_o)->f_u, v_nx_42);
       bool c44 = (bool)(t43 == 52LL);
       if (c44) {
@@ -74663,29 +74665,29 @@ static void f825_opt_Opt_fwdStmtSafe(struct S82_opt_Opt**p_o, int64_t p_s, lxl_a
       bool b46 = (bool)(t45 == 40LL);
       if (b46) {
         int64_t ix47 = v_nx_42;
-        b46 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix47, (*p_o)->f_u->f_nodes.len, "opt.lxl:198"))->f_b >= 0LL);
+        b46 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix47, (*p_o)->f_u->f_nodes.len, "opt.lxl:199"))->f_b >= 0LL);
       }
       bool b48 = b46;
       if (b48) {
         int64_t ix49 = v_nx_42;
-        b48 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix49, (*p_o)->f_u->f_nodes.len, "opt.lxl:198"))->f_c < 0LL);
+        b48 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix49, (*p_o)->f_u->f_nodes.len, "opt.lxl:199"))->f_c < 0LL);
       }
       bool b50 = b48;
       if (b50) {
         int64_t ix51 = v_nx_42;
-        int64_t t52 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix51, (*p_o)->f_u->f_nodes.len, "opt.lxl:199"))->f_b);
+        int64_t t52 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix51, (*p_o)->f_u->f_nodes.len, "opt.lxl:200"))->f_b);
         b50 = (bool)(t52 != 7LL);
       }
       bool b53 = b50;
       if (b53) {
         int64_t ix54 = v_nx_42;
-        bool t55 = f816_opt_Opt_pureInit(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix54, (*p_o)->f_u->f_nodes.len, "opt.lxl:199"))->f_b);
+        bool t55 = f816_opt_Opt_pureInit(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix54, (*p_o)->f_u->f_nodes.len, "opt.lxl:200"))->f_b);
         b53 = t55;
       }
       bool b56 = b53;
       if (b56) {
         int64_t ix57 = v_nx_42;
-        bool t58 = f826_opt_Opt_namesLocal(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix57, (*p_o)->f_u->f_nodes.len, "opt.lxl:200"))->f_b, v_t_18);
+        bool t58 = f826_opt_Opt_namesLocal(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix57, (*p_o)->f_u->f_nodes.len, "opt.lxl:201"))->f_b, v_t_18);
         b56 = (bool)!t58;
       }
       bool c59 = b56;
@@ -74701,20 +74703,20 @@ static void f825_opt_Opt_fwdStmtSafe(struct S82_opt_Opt**p_o, int64_t p_s, lxl_a
       continue;
     }
     int64_t ix62 = v_hit_36;
-    int64_t ix63 = rt_add_int(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix62, (*p_o)->f_u->f_nodes.len, "opt.lxl:207"))->f_b, 1LL, "opt.lxl:207");
-    *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix63, (*p_o)->f_u->f_items.len, "opt.lxl:207")) = v_init_23;
+    int64_t ix63 = rt_add_int(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix62, (*p_o)->f_u->f_nodes.len, "opt.lxl:208"))->f_b, 1LL, "opt.lxl:208");
+    *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix63, (*p_o)->f_u->f_items.len, "opt.lxl:208")) = v_init_23;
     int64_t ix64 = v_d_10;
-    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix64, (*p_o)->f_u->f_nodes.len, "opt.lxl:208"))->f_k = 52LL;
+    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix64, (*p_o)->f_u->f_nodes.len, "opt.lxl:209"))->f_k = 52LL;
     int64_t ix65 = v_d_10;
-    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix65, (*p_o)->f_u->f_nodes.len, "opt.lxl:209"))->f_b = -1LL;
+    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix65, (*p_o)->f_u->f_nodes.len, "opt.lxl:210"))->f_b = -1LL;
     int64_t ix66 = v_t_18;
-    *((int64_t*)p_uses->data + rt_idx(ix66, p_uses->len, "opt.lxl:210")) = 0LL;
+    *((int64_t*)p_uses->data + rt_idx(ix66, p_uses->len, "opt.lxl:211")) = 0LL;
   }
   int64_t ix67 = v_l_5;
-  int64_t end68 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix67, (*p_o)->f_u->f_items.len, "opt.lxl:212"));
+  int64_t end68 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix67, (*p_o)->f_u->f_items.len, "opt.lxl:213"));
   for (int64_t v_j_69 = 0LL; v_j_69 < end68; v_j_69++) {
-    int64_t ix70 = rt_add_int(rt_add_int(v_l_5, 1LL, "opt.lxl:213"), v_j_69, "opt.lxl:213");
-    int64_t v_d_71 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix70, (*p_o)->f_u->f_items.len, "opt.lxl:213"));
+    int64_t ix70 = rt_add_int(rt_add_int(v_l_5, 1LL, "opt.lxl:214"), v_j_69, "opt.lxl:214");
+    int64_t v_d_71 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix70, (*p_o)->f_u->f_items.len, "opt.lxl:214"));
     int64_t t72 = f82_ir_Ir_nk(&(*p_o)->f_u, v_d_71);
     int64_t v_k_73 = t72;
     bool c74 = (bool)(v_k_73 == 48LL);
@@ -74724,9 +74726,9 @@ static void f825_opt_Opt_fwdStmtSafe(struct S82_opt_Opt**p_o, int64_t p_s, lxl_a
     bool c75 = (bool)(v_k_73 == 42LL);
     if (c75) {
       int64_t ix76 = v_d_71;
-      f825_opt_Opt_fwdStmtSafe(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix76, (*p_o)->f_u->f_nodes.len, "opt.lxl:217"))->f_b, p_uses);
+      f825_opt_Opt_fwdStmtSafe(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix76, (*p_o)->f_u->f_nodes.len, "opt.lxl:218"))->f_b, p_uses);
       int64_t ix77 = v_d_71;
-      f825_opt_Opt_fwdStmtSafe(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix77, (*p_o)->f_u->f_nodes.len, "opt.lxl:218"))->f_c, p_uses);
+      f825_opt_Opt_fwdStmtSafe(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix77, (*p_o)->f_u->f_nodes.len, "opt.lxl:219"))->f_c, p_uses);
     }
     bool b78 = (bool)(v_k_73 == 43LL);
     if (!b78) {
@@ -74735,12 +74737,12 @@ static void f825_opt_Opt_fwdStmtSafe(struct S82_opt_Opt**p_o, int64_t p_s, lxl_a
     bool c79 = b78;
     if (c79) {
       int64_t ix80 = v_d_71;
-      f825_opt_Opt_fwdStmtSafe(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix80, (*p_o)->f_u->f_nodes.len, "opt.lxl:220"))->f_b, p_uses);
+      f825_opt_Opt_fwdStmtSafe(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix80, (*p_o)->f_u->f_nodes.len, "opt.lxl:221"))->f_b, p_uses);
     }
     bool c81 = (bool)(v_k_73 == 44LL);
     if (c81) {
       int64_t ix82 = v_d_71;
-      f825_opt_Opt_fwdStmtSafe(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix82, (*p_o)->f_u->f_nodes.len, "opt.lxl:221"))->f_d, p_uses);
+      f825_opt_Opt_fwdStmtSafe(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix82, (*p_o)->f_u->f_nodes.len, "opt.lxl:222"))->f_d, p_uses);
     }
   }
 }
@@ -74751,12 +74753,12 @@ static int64_t f827_opt_Opt_receiverCall(struct S82_opt_Opt**p_o, int64_t p_s, i
   bool c4 = (bool)(v_k_2 == 40LL);
   if (c4) {
     int64_t ix5 = p_s;
-    v_c_3 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix5, (*p_o)->f_u->f_nodes.len, "opt.lxl:169"))->f_b;
+    v_c_3 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix5, (*p_o)->f_u->f_nodes.len, "opt.lxl:170"))->f_b;
   } else {
     bool c6 = (bool)(v_k_2 == 41LL);
     if (c6) {
       int64_t ix7 = p_s;
-      v_c_3 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:169"))->f_a;
+      v_c_3 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:170"))->f_a;
     } else {
       int64_t r8 = -1LL;
       return r8;
@@ -74778,7 +74780,7 @@ static int64_t f827_opt_Opt_receiverCall(struct S82_opt_Opt**p_o, int64_t p_s, i
     return r14;
   }
   int64_t ix15 = v_c_3;
-  int64_t v_l_16 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix15, (*p_o)->f_u->f_nodes.len, "opt.lxl:171"))->f_b;
+  int64_t v_l_16 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix15, (*p_o)->f_u->f_nodes.len, "opt.lxl:172"))->f_b;
   int64_t t17 = f77_ir_Ir_listLen(&(*p_o)->f_u, v_l_16);
   bool c18 = (bool)(t17 == 0LL);
   if (c18) {
@@ -74791,7 +74793,7 @@ static int64_t f827_opt_Opt_receiverCall(struct S82_opt_Opt**p_o, int64_t p_s, i
   bool b23 = (bool)(t22 != 4LL);
   if (!b23) {
     int64_t ix24 = v_a0_21;
-    b23 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix24, (*p_o)->f_u->f_nodes.len, "opt.lxl:174"))->f_a != p_t);
+    b23 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix24, (*p_o)->f_u->f_nodes.len, "opt.lxl:175"))->f_a != p_t);
   }
   bool c25 = b23;
   if (c25) {
@@ -74819,7 +74821,7 @@ static bool f826_opt_Opt_namesLocal(struct S82_opt_Opt**p_o, int64_t p_x, int64_
     return r2;
   }
   int64_t ix3 = p_x;
-  struct S32_ir_Node v_n_4 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:228"));
+  struct S32_ir_Node v_n_4 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:229"));
   bool c5 = (bool)(v_n_4.f_k == 4LL);
   if (c5) {
     bool r6 = (bool)(v_n_4.f_a == p_t);
@@ -74827,7 +74829,7 @@ static bool f826_opt_Opt_namesLocal(struct S82_opt_Opt**p_o, int64_t p_x, int64_
   }
   lxl_slice t7 = k2_ir_KIDS;
   int64_t ix8 = v_n_4.f_k;
-  int64_t v_kc_9 = *((int64_t*)t7.data + rt_idx(ix8, t7.len, "opt.lxl:230"));
+  int64_t v_kc_9 = *((int64_t*)t7.data + rt_idx(ix8, t7.len, "opt.lxl:231"));
   bool c10 = (bool)(v_kc_9 == 0LL);
   if (c10) {
     bool r11 = (bool)0LL;
@@ -74901,10 +74903,10 @@ static bool f826_opt_Opt_namesLocal(struct S82_opt_Opt**p_o, int64_t p_x, int64_
   if (c34) {
     int64_t v_l_35 = v_n_4.f_b;
     int64_t ix36 = v_l_35;
-    int64_t end37 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix36, (*p_o)->f_u->f_items.len, "opt.lxl:238"));
+    int64_t end37 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix36, (*p_o)->f_u->f_items.len, "opt.lxl:239"));
     for (int64_t v_j_38 = 0LL; v_j_38 < end37; v_j_38++) {
-      int64_t ix39 = rt_add_int(rt_add_int(v_l_35, 1LL, "opt.lxl:238"), v_j_38, "opt.lxl:238");
-      bool t40 = f826_opt_Opt_namesLocal(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix39, (*p_o)->f_u->f_items.len, "opt.lxl:238")), p_t);
+      int64_t ix39 = rt_add_int(rt_add_int(v_l_35, 1LL, "opt.lxl:239"), v_j_38, "opt.lxl:239");
+      bool t40 = f826_opt_Opt_namesLocal(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix39, (*p_o)->f_u->f_items.len, "opt.lxl:239")), p_t);
       bool c41 = t40;
       if (c41) {
         bool r42 = (bool)1LL;
@@ -74916,10 +74918,10 @@ static bool f826_opt_Opt_namesLocal(struct S82_opt_Opt**p_o, int64_t p_x, int64_
   if (c43) {
     int64_t v_l_44 = v_n_4.f_b;
     int64_t ix45 = v_l_44;
-    int64_t end46 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix45, (*p_o)->f_u->f_items.len, "opt.lxl:242"));
+    int64_t end46 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix45, (*p_o)->f_u->f_items.len, "opt.lxl:243"));
     for (int64_t v_j_47 = 0LL; v_j_47 < end46; v_j_47++) {
-      int64_t ix48 = rt_add_int(rt_add_int(v_l_44, 1LL, "opt.lxl:242"), v_j_47, "opt.lxl:242");
-      bool t49 = f826_opt_Opt_namesLocal(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix48, (*p_o)->f_u->f_items.len, "opt.lxl:242")), p_t);
+      int64_t ix48 = rt_add_int(rt_add_int(v_l_44, 1LL, "opt.lxl:243"), v_j_47, "opt.lxl:243");
+      bool t49 = f826_opt_Opt_namesLocal(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix48, (*p_o)->f_u->f_items.len, "opt.lxl:243")), p_t);
       bool c50 = t49;
       if (c50) {
         bool r51 = (bool)1LL;
@@ -74934,10 +74936,10 @@ static bool f826_opt_Opt_namesLocal(struct S82_opt_Opt**p_o, int64_t p_x, int64_
   bool c53 = b52;
   if (c53) {
     int64_t ix54 = v_n_4.f_c;
-    int64_t end55 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix54, (*p_o)->f_u->f_items.len, "opt.lxl:245"));
+    int64_t end55 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix54, (*p_o)->f_u->f_items.len, "opt.lxl:246"));
     for (int64_t v_j_56 = 0LL; v_j_56 < end55; v_j_56++) {
-      int64_t ix57 = rt_add_int(rt_add_int(v_n_4.f_c, 1LL, "opt.lxl:245"), v_j_56, "opt.lxl:245");
-      bool t58 = f826_opt_Opt_namesLocal(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix57, (*p_o)->f_u->f_items.len, "opt.lxl:245")), p_t);
+      int64_t ix57 = rt_add_int(rt_add_int(v_n_4.f_c, 1LL, "opt.lxl:246"), v_j_56, "opt.lxl:246");
+      bool t58 = f826_opt_Opt_namesLocal(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix57, (*p_o)->f_u->f_items.len, "opt.lxl:246")), p_t);
       bool c59 = t58;
       if (c59) {
         bool r60 = (bool)1LL;
@@ -74958,20 +74960,20 @@ static void f824_opt_Opt_countAll(struct S82_opt_Opt**p_o, int64_t p_x, lxl_arr*
   bool c4 = (bool)(v_k_3 == 4LL);
   if (c4) {
     int64_t ix5 = p_x;
-    int64_t v_l_6 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix5, (*p_o)->f_u->f_nodes.len, "opt.lxl:488"))->f_a;
+    int64_t v_l_6 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix5, (*p_o)->f_u->f_nodes.len, "opt.lxl:489"))->f_a;
     int64_t ix7 = v_l_6;
-    bool c8 = (bool)(*((int64_t*)p_uses->data + rt_idx(ix7, p_uses->len, "opt.lxl:489")) == 0LL);
+    bool c8 = (bool)(*((int64_t*)p_uses->data + rt_idx(ix7, p_uses->len, "opt.lxl:490")) == 0LL);
     if (c8) {
       int64_t ap9 = v_l_6;
       *(int64_t*)rt_arr_push(p_touched, 8ULL) = ap9;
     }
     int64_t ix10 = v_l_6;
-    *((int64_t*)p_uses->data + rt_idx(ix10, p_uses->len, "opt.lxl:490")) = rt_add_int(*((int64_t*)p_uses->data + rt_idx(ix10, p_uses->len, "opt.lxl:490")), 1LL, "opt.lxl:490");
+    *((int64_t*)p_uses->data + rt_idx(ix10, p_uses->len, "opt.lxl:491")) = rt_add_int(*((int64_t*)p_uses->data + rt_idx(ix10, p_uses->len, "opt.lxl:491")), 1LL, "opt.lxl:491");
     return;
   }
   lxl_slice t11 = k2_ir_KIDS;
   int64_t ix12 = v_k_3;
-  int64_t v_kc_13 = *((int64_t*)t11.data + rt_idx(ix12, t11.len, "opt.lxl:493"));
+  int64_t v_kc_13 = *((int64_t*)t11.data + rt_idx(ix12, t11.len, "opt.lxl:494"));
   bool c14 = (bool)(v_kc_13 == 0LL);
   if (c14) {
     return;
@@ -74987,7 +74989,7 @@ static void f824_opt_Opt_countAll(struct S82_opt_Opt**p_o, int64_t p_x, lxl_arr*
   bool c17 = b16;
   if (c17) {
     int64_t ix18 = p_x;
-    f824_opt_Opt_countAll(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix18, (*p_o)->f_u->f_nodes.len, "opt.lxl:495"))->f_a, p_uses, p_touched);
+    f824_opt_Opt_countAll(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix18, (*p_o)->f_u->f_nodes.len, "opt.lxl:496"))->f_a, p_uses, p_touched);
   }
   bool b19 = (bool)(v_kc_13 == 2LL);
   if (!b19) {
@@ -75004,7 +75006,7 @@ static void f824_opt_Opt_countAll(struct S82_opt_Opt**p_o, int64_t p_x, lxl_arr*
   bool c22 = b21;
   if (c22) {
     int64_t ix23 = p_x;
-    f824_opt_Opt_countAll(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix23, (*p_o)->f_u->f_nodes.len, "opt.lxl:496"))->f_b, p_uses, p_touched);
+    f824_opt_Opt_countAll(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix23, (*p_o)->f_u->f_nodes.len, "opt.lxl:497"))->f_b, p_uses, p_touched);
   }
   bool b24 = (bool)(v_kc_13 == 3LL);
   if (!b24) {
@@ -75013,12 +75015,12 @@ static void f824_opt_Opt_countAll(struct S82_opt_Opt**p_o, int64_t p_x, lxl_arr*
   bool c25 = b24;
   if (c25) {
     int64_t ix26 = p_x;
-    f824_opt_Opt_countAll(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix26, (*p_o)->f_u->f_nodes.len, "opt.lxl:497"))->f_c, p_uses, p_touched);
+    f824_opt_Opt_countAll(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix26, (*p_o)->f_u->f_nodes.len, "opt.lxl:498"))->f_c, p_uses, p_touched);
   }
   bool c27 = (bool)(v_kc_13 == 8LL);
   if (c27) {
     int64_t ix28 = p_x;
-    f824_opt_Opt_countAll(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix28, (*p_o)->f_u->f_nodes.len, "opt.lxl:498"))->f_d, p_uses, p_touched);
+    f824_opt_Opt_countAll(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix28, (*p_o)->f_u->f_nodes.len, "opt.lxl:499"))->f_d, p_uses, p_touched);
   }
   int64_t v_l_29 = -1LL;
   bool b30 = (bool)(v_kc_13 == 4LL);
@@ -75028,27 +75030,27 @@ static void f824_opt_Opt_countAll(struct S82_opt_Opt**p_o, int64_t p_x, lxl_arr*
   bool c31 = b30;
   if (c31) {
     int64_t ix32 = p_x;
-    v_l_29 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix32, (*p_o)->f_u->f_nodes.len, "opt.lxl:500"))->f_b;
+    v_l_29 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix32, (*p_o)->f_u->f_nodes.len, "opt.lxl:501"))->f_b;
   } else {
     bool c33 = (bool)(v_kc_13 == 6LL);
     if (c33) {
       int64_t ix34 = p_x;
-      v_l_29 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix34, (*p_o)->f_u->f_nodes.len, "opt.lxl:500"))->f_a;
+      v_l_29 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix34, (*p_o)->f_u->f_nodes.len, "opt.lxl:501"))->f_a;
     } else {
       bool c35 = (bool)(v_kc_13 == 7LL);
       if (c35) {
         int64_t ix36 = p_x;
-        v_l_29 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix36, (*p_o)->f_u->f_nodes.len, "opt.lxl:500"))->f_c;
+        v_l_29 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix36, (*p_o)->f_u->f_nodes.len, "opt.lxl:501"))->f_c;
       }
     }
   }
   bool c37 = (bool)(v_l_29 >= 0LL);
   if (c37) {
     int64_t ix38 = v_l_29;
-    int64_t end39 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix38, (*p_o)->f_u->f_items.len, "opt.lxl:501"));
+    int64_t end39 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix38, (*p_o)->f_u->f_items.len, "opt.lxl:502"));
     for (int64_t v_j_40 = 0LL; v_j_40 < end39; v_j_40++) {
-      int64_t ix41 = rt_add_int(rt_add_int(v_l_29, 1LL, "opt.lxl:501"), v_j_40, "opt.lxl:501");
-      f824_opt_Opt_countAll(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix41, (*p_o)->f_u->f_items.len, "opt.lxl:501")), p_uses, p_touched);
+      int64_t ix41 = rt_add_int(rt_add_int(v_l_29, 1LL, "opt.lxl:502"), v_j_40, "opt.lxl:502");
+      f824_opt_Opt_countAll(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix41, (*p_o)->f_u->f_items.len, "opt.lxl:502")), p_uses, p_touched);
     }
   }
 }
@@ -75065,12 +75067,12 @@ static void f810_opt_Opt_dropDead(struct S82_opt_Opt**p_o) {
     if (!c6) {
       break;
     }
-    int64_t t7 = *(int64_t*)rt_arr_pop(&v_work_2, 8ULL, "opt.lxl:672");
+    int64_t t7 = *(int64_t*)rt_arr_pop(&v_work_2, 8ULL, "opt.lxl:673");
     int64_t v_f_8 = t7;
     int64_t ix9 = v_f_8;
-    int64_t v_body_10 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix9, (*p_o)->f_u->f_funcs.len, "opt.lxl:673")))->f_body;
+    int64_t v_body_10 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix9, (*p_o)->f_u->f_funcs.len, "opt.lxl:674")))->f_body;
     int64_t ix11 = v_f_8;
-    (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix11, (*p_o)->f_u->f_funcs.len, "opt.lxl:674")))->f_body = -1LL;
+    (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix11, (*p_o)->f_u->f_funcs.len, "opt.lxl:675")))->f_body = -1LL;
     f829_opt_Opt_unref(p_o, v_body_10, &v_work_2);
   }
   gl10_drop(v_work_2);
@@ -75082,25 +75084,25 @@ static void f829_opt_Opt_unref(struct S82_opt_Opt**p_o, int64_t p_x, lxl_arr*p_w
   }
   lxl_slice t2 = k2_ir_KIDS;
   int64_t ix3 = p_x;
-  int64_t ix4 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:690"))->f_k;
-  int64_t v_kc_5 = *((int64_t*)t2.data + rt_idx(ix4, t2.len, "opt.lxl:690"));
+  int64_t ix4 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:691"))->f_k;
+  int64_t v_kc_5 = *((int64_t*)t2.data + rt_idx(ix4, t2.len, "opt.lxl:691"));
   int64_t ix6 = p_x;
-  int64_t v_a_7 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:691"))->f_a;
+  int64_t v_a_7 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:692"))->f_a;
   bool c8 = (bool)(v_kc_5 == 0LL);
   if (c8) {
     int64_t ix9 = p_x;
-    bool c10 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix9, (*p_o)->f_u->f_nodes.len, "opt.lxl:693"))->f_k == 6LL);
+    bool c10 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix9, (*p_o)->f_u->f_nodes.len, "opt.lxl:694"))->f_k == 6LL);
     if (c10) {
       int64_t ix11 = v_a_7;
-      *((int64_t*)(*p_o)->f_refs.data + rt_idx(ix11, (*p_o)->f_refs.len, "opt.lxl:694")) = rt_sub_int(*((int64_t*)(*p_o)->f_refs.data + rt_idx(ix11, (*p_o)->f_refs.len, "opt.lxl:694")), 1LL, "opt.lxl:694");
+      *((int64_t*)(*p_o)->f_refs.data + rt_idx(ix11, (*p_o)->f_refs.len, "opt.lxl:695")) = rt_sub_int(*((int64_t*)(*p_o)->f_refs.data + rt_idx(ix11, (*p_o)->f_refs.len, "opt.lxl:695")), 1LL, "opt.lxl:695");
       f828_opt_Opt_dead(p_o, v_a_7, p_work);
     }
     return;
   }
   int64_t ix12 = p_x;
-  int64_t v_b_13 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix12, (*p_o)->f_u->f_nodes.len, "opt.lxl:699"))->f_b;
+  int64_t v_b_13 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix12, (*p_o)->f_u->f_nodes.len, "opt.lxl:700"))->f_b;
   int64_t ix14 = p_x;
-  int64_t v_c_15 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix14, (*p_o)->f_u->f_nodes.len, "opt.lxl:700"))->f_c;
+  int64_t v_c_15 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix14, (*p_o)->f_u->f_nodes.len, "opt.lxl:701"))->f_c;
   bool b16 = (bool)(v_kc_5 != 6LL);
   if (b16) {
     b16 = (bool)(v_kc_5 != 5LL);
@@ -75140,7 +75142,7 @@ static void f829_opt_Opt_unref(struct S82_opt_Opt**p_o, int64_t p_x, lxl_arr*p_w
   bool c25 = (bool)(v_kc_5 == 8LL);
   if (c25) {
     int64_t ix26 = p_x;
-    f829_opt_Opt_unref(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix26, (*p_o)->f_u->f_nodes.len, "opt.lxl:704"))->f_d, p_work);
+    f829_opt_Opt_unref(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix26, (*p_o)->f_u->f_nodes.len, "opt.lxl:705"))->f_d, p_work);
   }
   bool b27 = (bool)(v_kc_5 == 4LL);
   if (!b27) {
@@ -75150,10 +75152,10 @@ static void f829_opt_Opt_unref(struct S82_opt_Opt**p_o, int64_t p_x, lxl_arr*p_w
   bool c32 = (bool)(v_l_31 >= 0LL);
   if (c32) {
     int64_t ix33 = v_l_31;
-    int64_t end34 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix33, (*p_o)->f_u->f_items.len, "opt.lxl:707"));
+    int64_t end34 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix33, (*p_o)->f_u->f_items.len, "opt.lxl:708"));
     for (int64_t v_j_35 = 0LL; v_j_35 < end34; v_j_35++) {
-      int64_t ix36 = rt_add_int(rt_add_int(v_l_31, 1LL, "opt.lxl:707"), v_j_35, "opt.lxl:707");
-      f829_opt_Opt_unref(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix36, (*p_o)->f_u->f_items.len, "opt.lxl:707")), p_work);
+      int64_t ix36 = rt_add_int(rt_add_int(v_l_31, 1LL, "opt.lxl:708"), v_j_35, "opt.lxl:708");
+      f829_opt_Opt_unref(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix36, (*p_o)->f_u->f_items.len, "opt.lxl:708")), p_work);
     }
   }
 }
@@ -75161,17 +75163,17 @@ static void f828_opt_Opt_dead(struct S82_opt_Opt**p_o, int64_t p_f, lxl_arr*p_wo
   bool b1 = (bool)(p_f >= (*p_o)->f_u->f_nRtFuncs);
   if (b1) {
     int64_t ix2 = p_f;
-    b1 = (bool)(*((int64_t*)(*p_o)->f_refs.data + rt_idx(ix2, (*p_o)->f_refs.len, "opt.lxl:681")) == 0LL);
+    b1 = (bool)(*((int64_t*)(*p_o)->f_refs.data + rt_idx(ix2, (*p_o)->f_refs.len, "opt.lxl:682")) == 0LL);
   }
   bool b3 = b1;
   if (b3) {
     int64_t ix4 = p_f;
-    b3 = (bool)((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix4, (*p_o)->f_u->f_funcs.len, "opt.lxl:681")))->f_body >= 0LL);
+    b3 = (bool)((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix4, (*p_o)->f_u->f_funcs.len, "opt.lxl:682")))->f_body >= 0LL);
   }
   bool b5 = b3;
   if (b5) {
     int64_t ix6 = p_f;
-    b5 = (bool)!rt_str_eq((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix6, (*p_o)->f_u->f_funcs.len, "opt.lxl:681")))->f_name, sl9283);
+    b5 = (bool)!rt_str_eq((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix6, (*p_o)->f_u->f_funcs.len, "opt.lxl:682")))->f_name, sl9283);
   }
   bool c7 = b5;
   if (c7) {
@@ -75181,55 +75183,55 @@ static void f828_opt_Opt_dead(struct S82_opt_Opt**p_o, int64_t p_f, lxl_arr*p_wo
 }
 static void f809_opt_Opt_visit(struct S82_opt_Opt**p_o, int64_t p_f) {
   int64_t ix1 = p_f;
-  bool c2 = (bool)(*((int64_t*)(*p_o)->f_state.data + rt_idx(ix1, (*p_o)->f_state.len, "opt.lxl:746")) != 0LL);
+  bool c2 = (bool)(*((int64_t*)(*p_o)->f_state.data + rt_idx(ix1, (*p_o)->f_state.len, "opt.lxl:747")) != 0LL);
   if (c2) {
     return;
   }
   int64_t ix3 = p_f;
-  *((int64_t*)(*p_o)->f_state.data + rt_idx(ix3, (*p_o)->f_state.len, "opt.lxl:747")) = 1LL;
+  *((int64_t*)(*p_o)->f_state.data + rt_idx(ix3, (*p_o)->f_state.len, "opt.lxl:748")) = 1LL;
   int64_t v_wf_4 = (*p_o)->f_wf;
   (*p_o)->f_wf = p_f;
   int64_t ix5 = p_f;
-  int64_t t6 = f830_opt_Opt_walk(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix5, (*p_o)->f_u->f_funcs.len, "opt.lxl:750")))->f_body, 1LL, -1LL);
+  int64_t t6 = f830_opt_Opt_walk(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix5, (*p_o)->f_u->f_funcs.len, "opt.lxl:751")))->f_body, 1LL, -1LL);
   (*p_o)->f_wf = v_wf_4;
   (*p_o)->f_cur = p_f;
   (*p_o)->f_grown = 0LL;
   int64_t ix7 = p_f;
-  f831_opt_Opt_stmtIn(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix7, (*p_o)->f_u->f_funcs.len, "opt.lxl:754")))->f_body);
+  f831_opt_Opt_stmtIn(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix7, (*p_o)->f_u->f_funcs.len, "opt.lxl:755")))->f_body);
   f832_opt_Opt_unbox(p_o, p_f);
   f833_opt_Opt_scalars(p_o, p_f);
   int64_t t8 = f834_opt_Opt_shape(p_o, p_f);
   int64_t ix9 = p_f;
-  *((int64_t*)(*p_o)->f_form.data + rt_idx(ix9, (*p_o)->f_form.len, "opt.lxl:757")) = t8;
+  *((int64_t*)(*p_o)->f_form.data + rt_idx(ix9, (*p_o)->f_form.len, "opt.lxl:758")) = t8;
   int64_t ix10 = p_f;
-  int64_t v_form_11 = *((int64_t*)(*p_o)->f_form.data + rt_idx(ix10, (*p_o)->f_form.len, "opt.lxl:758"));
+  int64_t v_form_11 = *((int64_t*)(*p_o)->f_form.data + rt_idx(ix10, (*p_o)->f_form.len, "opt.lxl:759"));
   bool c12 = (bool)(v_form_11 >= 0LL);
   if (c12) {
     int64_t t13 = f835_opt_Opt_cost(p_o, v_form_11);
     int64_t ix14 = p_f;
-    *((int64_t*)(*p_o)->f_size.data + rt_idx(ix14, (*p_o)->f_size.len, "opt.lxl:760")) = t13;
+    *((int64_t*)(*p_o)->f_size.data + rt_idx(ix14, (*p_o)->f_size.len, "opt.lxl:761")) = t13;
     int64_t t15 = f830_opt_Opt_walk(p_o, v_form_11, 3LL, -1LL);
     int64_t ix16 = p_f;
-    *((int64_t*)(*p_o)->f_rets.data + rt_idx(ix16, (*p_o)->f_rets.len, "opt.lxl:761")) = t15;
+    *((int64_t*)(*p_o)->f_rets.data + rt_idx(ix16, (*p_o)->f_rets.len, "opt.lxl:762")) = t15;
     int64_t ix17 = p_f;
-    int64_t t18 = f836_std_min((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix17, (*p_o)->f_u->f_funcs.len, "opt.lxl:762")))->f_params.len, 62LL);
+    int64_t t18 = f836_std_min((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix17, (*p_o)->f_u->f_funcs.len, "opt.lxl:763")))->f_params.len, 62LL);
     int64_t end19 = t18;
     for (int64_t v_j_20 = 0LL; v_j_20 < end19; v_j_20++) {
       int64_t ix21 = p_f;
       int64_t ix22 = v_j_20;
-      int64_t t23 = f830_opt_Opt_walk(p_o, v_form_11, 4LL, *((int64_t*)(*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix21, (*p_o)->f_u->f_funcs.len, "opt.lxl:763")))->f_params.data + rt_idx(ix22, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix21, (*p_o)->f_u->f_funcs.len, "opt.lxl:763")))->f_params.len, "opt.lxl:763")));
+      int64_t t23 = f830_opt_Opt_walk(p_o, v_form_11, 4LL, *((int64_t*)(*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix21, (*p_o)->f_u->f_funcs.len, "opt.lxl:764")))->f_params.data + rt_idx(ix22, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix21, (*p_o)->f_u->f_funcs.len, "opt.lxl:764")))->f_params.len, "opt.lxl:764")));
       bool c24 = (bool)(t23 == 0LL);
       if (c24) {
         int64_t ix25 = p_f;
-        int64_t t26 = *((int64_t*)(*p_o)->f_ro.data + rt_idx(ix25, (*p_o)->f_ro.len, "opt.lxl:763"));
-        int64_t t27 = t26 | rt_shl_int(1LL, v_j_20, "opt.lxl:763");
+        int64_t t26 = *((int64_t*)(*p_o)->f_ro.data + rt_idx(ix25, (*p_o)->f_ro.len, "opt.lxl:764"));
+        int64_t t27 = t26 | rt_shl_int(1LL, v_j_20, "opt.lxl:764");
         int64_t ix28 = p_f;
-        *((int64_t*)(*p_o)->f_ro.data + rt_idx(ix28, (*p_o)->f_ro.len, "opt.lxl:763")) = t27;
+        *((int64_t*)(*p_o)->f_ro.data + rt_idx(ix28, (*p_o)->f_ro.len, "opt.lxl:764")) = t27;
       }
     }
   }
   int64_t ix29 = p_f;
-  *((int64_t*)(*p_o)->f_state.data + rt_idx(ix29, (*p_o)->f_state.len, "opt.lxl:766")) = 2LL;
+  *((int64_t*)(*p_o)->f_state.data + rt_idx(ix29, (*p_o)->f_state.len, "opt.lxl:767")) = 2LL;
   bool b30 = (bool)(v_form_11 >= 0LL);
   if (b30) {
     b30 = (bool)((*p_o)->f_limit > 0LL);
@@ -75237,13 +75239,13 @@ static void f809_opt_Opt_visit(struct S82_opt_Opt**p_o, int64_t p_f) {
   bool b31 = b30;
   if (b31) {
     int64_t ix32 = p_f;
-    int64_t t33 = *((int64_t*)(*p_o)->f_size.data + rt_idx(ix32, (*p_o)->f_size.len, "opt.lxl:767"));
-    b31 = (bool)(t33 <= rt_div_int(rt_mul_int(60LL, (*p_o)->f_limit, "opt.lxl:767"), 25LL, "opt.lxl:767"));
+    int64_t t33 = *((int64_t*)(*p_o)->f_size.data + rt_idx(ix32, (*p_o)->f_size.len, "opt.lxl:768"));
+    b31 = (bool)(t33 <= rt_div_int(rt_mul_int(60LL, (*p_o)->f_limit, "opt.lxl:768"), 25LL, "opt.lxl:768"));
   }
   bool b34 = b31;
   if (b34) {
     int64_t ix35 = p_f;
-    b34 = *((bool*)(*p_o)->f_recur.data + rt_idx(ix35, (*p_o)->f_recur.len, "opt.lxl:767"));
+    b34 = *((bool*)(*p_o)->f_recur.data + rt_idx(ix35, (*p_o)->f_recur.len, "opt.lxl:768"));
   }
   bool c36 = b34;
   if (c36) {
@@ -75255,11 +75257,11 @@ static void f809_opt_Opt_visit(struct S82_opt_Opt**p_o, int64_t p_f) {
     }
     int64_t t39 = f837_opt_Opt_deep(p_o, v_form_11);
     int64_t ix40 = p_f;
-    *((int64_t*)(*p_o)->f_form.data + rt_idx(ix40, (*p_o)->f_form.len, "opt.lxl:774")) = t39;
+    *((int64_t*)(*p_o)->f_form.data + rt_idx(ix40, (*p_o)->f_form.len, "opt.lxl:775")) = t39;
     lxl_arr a41 = rt_arr_new(0LL, 8ULL);
     lxl_arr v_ps_42 = a41;
     int64_t ix43 = p_f;
-    lxl_arr t44 = gl42_clone((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix43, (*p_o)->f_u->f_funcs.len, "opt.lxl:776")))->f_params);
+    lxl_arr t44 = gl42_clone((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix43, (*p_o)->f_u->f_funcs.len, "opt.lxl:777")))->f_params);
     lxl_slice ap45 = rt_as_slice(&t44);
     for (int64_t i46 = 0LL; i46 < ap45.len; i46++) {
       int64_t v_p_47 = *((int64_t*)ap45.data + i46);
@@ -75269,13 +75271,13 @@ static void f809_opt_Opt_visit(struct S82_opt_Opt**p_o, int64_t p_f) {
     }
     gl10_drop(t44);
     int64_t ix50 = p_f;
-    *((int64_t*)(*p_o)->f_fpOf.data + rt_idx(ix50, (*p_o)->f_fpOf.len, "opt.lxl:777")) = (*p_o)->f_fpList.len;
+    *((int64_t*)(*p_o)->f_fpOf.data + rt_idx(ix50, (*p_o)->f_fpOf.len, "opt.lxl:778")) = (*p_o)->f_fpList.len;
     lxl_arr ap51 = v_ps_42;
     *(lxl_arr*)rt_arr_push(&(*p_o)->f_fpList, 24ULL) = ap51;
     (*p_o)->f_grown = 0LL;
     (*p_o)->f_selfOnce = (bool)1LL;
     int64_t ix52 = p_f;
-    f831_opt_Opt_stmtIn(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix52, (*p_o)->f_u->f_funcs.len, "opt.lxl:781")))->f_body);
+    f831_opt_Opt_stmtIn(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix52, (*p_o)->f_u->f_funcs.len, "opt.lxl:782")))->f_body);
     (*p_o)->f_selfOnce = (bool)0LL;
   }
 }
@@ -75288,11 +75290,11 @@ static int64_t f838_opt_Opt_renamed(struct S82_opt_Opt**p_o, int64_t p_l) {
     return r4;
   }
   int64_t ix5 = p_l;
-  lxl_str t6 = rt_str_dup(((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix5, (*p_o)->f_u->f_locals.len, "opt.lxl:1039"))->f_name);
+  lxl_str t6 = rt_str_dup(((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix5, (*p_o)->f_u->f_locals.len, "opt.lxl:1040"))->f_name);
   int64_t ix7 = p_l;
-  int64_t t8 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix7, (*p_o)->f_u->f_locals.len, "opt.lxl:1039"))->f_ty;
+  int64_t t8 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix7, (*p_o)->f_u->f_locals.len, "opt.lxl:1040"))->f_ty;
   int64_t ix9 = p_l;
-  int64_t t10 = f839_opt_Opt_local(p_o, t6, t8, *((bool*)(*p_o)->f_aTaken.data + rt_idx(ix9, (*p_o)->f_aTaken.len, "opt.lxl:1039")));
+  int64_t t10 = f839_opt_Opt_local(p_o, t6, t8, *((bool*)(*p_o)->f_aTaken.data + rt_idx(ix9, (*p_o)->f_aTaken.len, "opt.lxl:1040")));
   int64_t v_nl_11 = t10;
   rt_str_drop(t6);
   f506_collections_Map_put(&(*p_o)->f_ren, p_l, v_nl_11);
@@ -75314,7 +75316,7 @@ static int64_t f839_opt_Opt_local(struct S82_opt_Opt**p_o, lxl_str p_name, int64
   *(int64_t*)rt_arr_push(&(*p_o)->f_mk, 8ULL) = ap7;
   int64_t ap8 = -1LL;
   *(int64_t*)rt_arr_push(&(*p_o)->f_mv, 8ULL) = ap8;
-  int64_t r9 = rt_sub_int((*p_o)->f_u->f_locals.len, 1LL, "opt.lxl:519");
+  int64_t r9 = rt_sub_int((*p_o)->f_u->f_locals.len, 1LL, "opt.lxl:520");
   return r9;
 }
 static int64_t f837_opt_Opt_deep(struct S82_opt_Opt**p_o, int64_t p_x) {
@@ -75324,11 +75326,11 @@ static int64_t f837_opt_Opt_deep(struct S82_opt_Opt**p_o, int64_t p_x) {
     return r2;
   }
   int64_t ix3 = p_x;
-  struct S32_ir_Node ap4 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:1011"));
+  struct S32_ir_Node ap4 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:1012"));
   *(struct S32_ir_Node*)rt_arr_push(&(*p_o)->f_u->f_nodes, 64ULL) = ap4;
-  int64_t v_y_5 = rt_sub_int((*p_o)->f_u->f_nodes.len, 1LL, "opt.lxl:1012");
+  int64_t v_y_5 = rt_sub_int((*p_o)->f_u->f_nodes.len, 1LL, "opt.lxl:1013");
   int64_t ix6 = p_x;
-  struct S32_ir_Node v_n_7 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:1013"));
+  struct S32_ir_Node v_n_7 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:1014"));
   bool b8 = (bool)(v_n_7.f_k == 4LL);
   if (!b8) {
     b8 = (bool)(v_n_7.f_k == 40LL);
@@ -75337,11 +75339,11 @@ static int64_t f837_opt_Opt_deep(struct S82_opt_Opt**p_o, int64_t p_x) {
   if (c9) {
     int64_t t10 = f838_opt_Opt_renamed(p_o, v_n_7.f_a);
     int64_t ix11 = v_y_5;
-    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix11, (*p_o)->f_u->f_nodes.len, "opt.lxl:1014"))->f_a = t10;
+    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix11, (*p_o)->f_u->f_nodes.len, "opt.lxl:1015"))->f_a = t10;
   }
   lxl_slice t12 = k2_ir_KIDS;
   int64_t ix13 = v_n_7.f_k;
-  int64_t v_kc_14 = *((int64_t*)t12.data + rt_idx(ix13, t12.len, "opt.lxl:1015"));
+  int64_t v_kc_14 = *((int64_t*)t12.data + rt_idx(ix13, t12.len, "opt.lxl:1016"));
   bool b15 = (bool)(v_kc_14 == 0LL);
   if (!b15) {
     b15 = (bool)(v_kc_14 < 0LL);
@@ -75355,35 +75357,35 @@ static int64_t f837_opt_Opt_deep(struct S82_opt_Opt**p_o, int64_t p_x) {
   if (c18) {
     int64_t t19 = f840_opt_Opt_deepList(p_o, v_n_7.f_a);
     int64_t ix20 = v_y_5;
-    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix20, (*p_o)->f_u->f_nodes.len, "opt.lxl:1018"))->f_a = t19;
+    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix20, (*p_o)->f_u->f_nodes.len, "opt.lxl:1019"))->f_a = t19;
   } else {
     bool c21 = (bool)(v_kc_14 == 5LL);
     if (c21) {
       int64_t t22 = f840_opt_Opt_deepList(p_o, v_n_7.f_b);
       int64_t ix23 = v_y_5;
-      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix23, (*p_o)->f_u->f_nodes.len, "opt.lxl:1020"))->f_b = t22;
+      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix23, (*p_o)->f_u->f_nodes.len, "opt.lxl:1021"))->f_b = t22;
     } else {
       bool c24 = (bool)(v_kc_14 == 7LL);
       if (c24) {
         int64_t t25 = f837_opt_Opt_deep(p_o, v_n_7.f_b);
         int64_t ix26 = v_y_5;
-        ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix26, (*p_o)->f_u->f_nodes.len, "opt.lxl:1022"))->f_b = t25;
+        ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix26, (*p_o)->f_u->f_nodes.len, "opt.lxl:1023"))->f_b = t25;
         int64_t t27 = f840_opt_Opt_deepList(p_o, v_n_7.f_c);
         int64_t ix28 = v_y_5;
-        ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix28, (*p_o)->f_u->f_nodes.len, "opt.lxl:1023"))->f_c = t27;
+        ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix28, (*p_o)->f_u->f_nodes.len, "opt.lxl:1024"))->f_c = t27;
       } else {
         bool c29 = (bool)(v_kc_14 == 4LL);
         if (c29) {
           int64_t t30 = f837_opt_Opt_deep(p_o, v_n_7.f_a);
           int64_t ix31 = v_y_5;
-          ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix31, (*p_o)->f_u->f_nodes.len, "opt.lxl:1025"))->f_a = t30;
+          ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix31, (*p_o)->f_u->f_nodes.len, "opt.lxl:1026"))->f_a = t30;
           int64_t t32 = f840_opt_Opt_deepList(p_o, v_n_7.f_b);
           int64_t ix33 = v_y_5;
-          ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix33, (*p_o)->f_u->f_nodes.len, "opt.lxl:1026"))->f_b = t32;
+          ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix33, (*p_o)->f_u->f_nodes.len, "opt.lxl:1027"))->f_b = t32;
         } else {
           int64_t t34 = f837_opt_Opt_deep(p_o, v_n_7.f_a);
           int64_t ix35 = v_y_5;
-          ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix35, (*p_o)->f_u->f_nodes.len, "opt.lxl:1028"))->f_a = t34;
+          ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix35, (*p_o)->f_u->f_nodes.len, "opt.lxl:1029"))->f_a = t34;
           bool b36 = (bool)(v_kc_14 == 2LL);
           if (!b36) {
             b36 = (bool)(v_kc_14 == 3LL);
@@ -75396,7 +75398,7 @@ static int64_t f837_opt_Opt_deep(struct S82_opt_Opt**p_o, int64_t p_x) {
           if (c38) {
             int64_t t39 = f837_opt_Opt_deep(p_o, v_n_7.f_b);
             int64_t ix40 = v_y_5;
-            ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix40, (*p_o)->f_u->f_nodes.len, "opt.lxl:1029"))->f_b = t39;
+            ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix40, (*p_o)->f_u->f_nodes.len, "opt.lxl:1030"))->f_b = t39;
           }
           bool b41 = (bool)(v_kc_14 == 3LL);
           if (!b41) {
@@ -75406,13 +75408,13 @@ static int64_t f837_opt_Opt_deep(struct S82_opt_Opt**p_o, int64_t p_x) {
           if (c42) {
             int64_t t43 = f837_opt_Opt_deep(p_o, v_n_7.f_c);
             int64_t ix44 = v_y_5;
-            ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix44, (*p_o)->f_u->f_nodes.len, "opt.lxl:1030"))->f_c = t43;
+            ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix44, (*p_o)->f_u->f_nodes.len, "opt.lxl:1031"))->f_c = t43;
           }
           bool c45 = (bool)(v_kc_14 == 8LL);
           if (c45) {
             int64_t t46 = f837_opt_Opt_deep(p_o, v_n_7.f_d);
             int64_t ix47 = v_y_5;
-            ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix47, (*p_o)->f_u->f_nodes.len, "opt.lxl:1031"))->f_d = t46;
+            ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix47, (*p_o)->f_u->f_nodes.len, "opt.lxl:1032"))->f_d = t46;
           }
         }
       }
@@ -75475,9 +75477,9 @@ static int64_t f842_std_cmpOf(bool p_lt, bool p_gt) {
   return r5;
 }
 static int64_t f835_opt_Opt_cost(struct S82_opt_Opt**p_o, int64_t p_x) {
-  int64_t v_budget_1 = rt_shl_int(1LL, 40LL, "opt.lxl:567");
+  int64_t v_budget_1 = rt_shl_int(1LL, 40LL, "opt.lxl:568");
   bool t2 = f843_opt_Opt_small(p_o, p_x, &v_budget_1);
-  int64_t r3 = rt_sub_int(rt_shl_int(1LL, 40LL, "opt.lxl:569"), v_budget_1, "opt.lxl:569");
+  int64_t r3 = rt_sub_int(rt_shl_int(1LL, 40LL, "opt.lxl:570"), v_budget_1, "opt.lxl:570");
   return r3;
 }
 static bool f843_opt_Opt_small(struct S82_opt_Opt**p_o, int64_t p_x, int64_t*p_budget) {
@@ -75487,10 +75489,10 @@ static bool f843_opt_Opt_small(struct S82_opt_Opt**p_o, int64_t p_x, int64_t*p_b
     return r2;
   }
   int64_t ix3 = p_x;
-  int64_t v_k_4 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:635"))->f_k;
+  int64_t v_k_4 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:636"))->f_k;
   lxl_slice t5 = k3_opt_COST;
   int64_t ix6 = v_k_4;
-  *p_budget = rt_sub_int(*p_budget, *((int64_t*)t5.data + rt_idx(ix6, t5.len, "opt.lxl:636")), "opt.lxl:636");
+  *p_budget = rt_sub_int(*p_budget, *((int64_t*)t5.data + rt_idx(ix6, t5.len, "opt.lxl:637")), "opt.lxl:637");
   bool c7 = (bool)(v_k_4 == 7LL);
   if (c7) {
     int64_t t8 = f819_opt_Opt_callee(p_o, p_x);
@@ -75501,7 +75503,7 @@ static bool f843_opt_Opt_small(struct S82_opt_Opt**p_o, int64_t p_x, int64_t*p_b
     }
     bool c11 = b10;
     if (c11) {
-      *p_budget = rt_add_int(*p_budget, 2LL, "opt.lxl:639");
+      *p_budget = rt_add_int(*p_budget, 2LL, "opt.lxl:640");
     }
   }
   bool c12 = (bool)(*p_budget < 0LL);
@@ -75511,14 +75513,14 @@ static bool f843_opt_Opt_small(struct S82_opt_Opt**p_o, int64_t p_x, int64_t*p_b
   }
   lxl_slice t14 = k2_ir_KIDS;
   int64_t ix15 = v_k_4;
-  int64_t v_kc_16 = *((int64_t*)t14.data + rt_idx(ix15, t14.len, "opt.lxl:642"));
+  int64_t v_kc_16 = *((int64_t*)t14.data + rt_idx(ix15, t14.len, "opt.lxl:643"));
   bool c17 = (bool)(v_kc_16 == 0LL);
   if (c17) {
     bool r18 = (bool)1LL;
     return r18;
   }
   int64_t ix19 = p_x;
-  int64_t v_a_20 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:644"))->f_a;
+  int64_t v_a_20 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:645"))->f_a;
   bool c21 = (bool)(v_kc_16 == 1LL);
   if (c21) {
     bool t22 = f843_opt_Opt_small(p_o, v_a_20, p_budget);
@@ -75526,7 +75528,7 @@ static bool f843_opt_Opt_small(struct S82_opt_Opt**p_o, int64_t p_x, int64_t*p_b
     return r23;
   }
   int64_t ix24 = p_x;
-  int64_t v_b_25 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix24, (*p_o)->f_u->f_nodes.len, "opt.lxl:646"))->f_b;
+  int64_t v_b_25 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix24, (*p_o)->f_u->f_nodes.len, "opt.lxl:647"))->f_b;
   bool c26 = (bool)(v_kc_16 == 2LL);
   if (c26) {
     bool t27 = f843_opt_Opt_small(p_o, v_a_20, p_budget);
@@ -75556,7 +75558,7 @@ static bool f843_opt_Opt_small(struct S82_opt_Opt**p_o, int64_t p_x, int64_t*p_b
     return r38;
   }
   int64_t ix39 = p_x;
-  int64_t v_c_40 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix39, (*p_o)->f_u->f_nodes.len, "opt.lxl:650"))->f_c;
+  int64_t v_c_40 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix39, (*p_o)->f_u->f_nodes.len, "opt.lxl:651"))->f_c;
   bool c41 = (bool)(v_kc_16 == 3LL);
   if (c41) {
     bool t42 = f843_opt_Opt_small(p_o, v_a_20, p_budget);
@@ -75604,7 +75606,7 @@ static bool f843_opt_Opt_small(struct S82_opt_Opt**p_o, int64_t p_x, int64_t*p_b
   bool b61 = b59;
   if (b61) {
     int64_t ix62 = p_x;
-    bool t63 = f843_opt_Opt_small(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix62, (*p_o)->f_u->f_nodes.len, "opt.lxl:654"))->f_d, p_budget);
+    bool t63 = f843_opt_Opt_small(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix62, (*p_o)->f_u->f_nodes.len, "opt.lxl:655"))->f_d, p_budget);
     b61 = t63;
   }
   bool r64 = b61;
@@ -75617,10 +75619,10 @@ static bool f844_opt_Opt_smallList(struct S82_opt_Opt**p_o, int64_t p_l, int64_t
     return r2;
   }
   int64_t ix3 = p_l;
-  int64_t end4 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix3, (*p_o)->f_u->f_items.len, "opt.lxl:659"));
+  int64_t end4 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix3, (*p_o)->f_u->f_items.len, "opt.lxl:660"));
   for (int64_t v_j_5 = 0LL; v_j_5 < end4; v_j_5++) {
-    int64_t ix6 = rt_add_int(rt_add_int(p_l, 1LL, "opt.lxl:660"), v_j_5, "opt.lxl:660");
-    bool t7 = f843_opt_Opt_small(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix6, (*p_o)->f_u->f_items.len, "opt.lxl:660")), p_budget);
+    int64_t ix6 = rt_add_int(rt_add_int(p_l, 1LL, "opt.lxl:661"), v_j_5, "opt.lxl:661");
+    bool t7 = f843_opt_Opt_small(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix6, (*p_o)->f_u->f_items.len, "opt.lxl:661")), p_budget);
     bool c8 = (bool)!t7;
     if (c8) {
       bool r9 = (bool)0LL;
@@ -75632,15 +75634,15 @@ static bool f844_opt_Opt_smallList(struct S82_opt_Opt**p_o, int64_t p_l, int64_t
 }
 static int64_t f834_opt_Opt_shape(struct S82_opt_Opt**p_o, int64_t p_f) {
   int64_t ix1 = p_f;
-  bool b2 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix1, (*p_o)->f_u->f_funcs.len, "opt.lxl:1062")))->f_isExtern;
+  bool b2 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix1, (*p_o)->f_u->f_funcs.len, "opt.lxl:1063")))->f_isExtern;
   if (!b2) {
     int64_t ix3 = p_f;
-    b2 = rt_str_eq((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix3, (*p_o)->f_u->f_funcs.len, "opt.lxl:1062")))->f_name, sl9283);
+    b2 = rt_str_eq((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix3, (*p_o)->f_u->f_funcs.len, "opt.lxl:1063")))->f_name, sl9283);
   }
   bool b4 = b2;
   if (!b4) {
     int64_t ix5 = p_f;
-    bool t6 = f146_ir_Ir_isVarFn(&(*p_o)->f_u, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix5, (*p_o)->f_u->f_funcs.len, "opt.lxl:1062")))->f_ty);
+    bool t6 = f146_ir_Ir_isVarFn(&(*p_o)->f_u, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix5, (*p_o)->f_u->f_funcs.len, "opt.lxl:1063")))->f_ty);
     b4 = t6;
   }
   bool c7 = b4;
@@ -75648,20 +75650,20 @@ static int64_t f834_opt_Opt_shape(struct S82_opt_Opt**p_o, int64_t p_f) {
     int64_t r8 = -1LL;
     return r8;
   }
-  int64_t v_budget_9 = rt_mul_int(4LL, (*p_o)->f_limit, "opt.lxl:1063");
+  int64_t v_budget_9 = rt_mul_int(4LL, (*p_o)->f_limit, "opt.lxl:1064");
   int64_t ix10 = p_f;
-  bool t11 = f843_opt_Opt_small(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix10, (*p_o)->f_u->f_funcs.len, "opt.lxl:1064")))->f_body, &v_budget_9);
+  bool t11 = f843_opt_Opt_small(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix10, (*p_o)->f_u->f_funcs.len, "opt.lxl:1065")))->f_body, &v_budget_9);
   bool c12 = (bool)!t11;
   if (c12) {
     int64_t r13 = -1LL;
     return r13;
   }
   int64_t ix14 = p_f;
-  lxl_arr t15 = f845_opt_Opt_items(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix14, (*p_o)->f_u->f_funcs.len, "opt.lxl:1065")))->f_body);
+  lxl_arr t15 = f845_opt_Opt_items(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix14, (*p_o)->f_u->f_funcs.len, "opt.lxl:1066")))->f_body);
   lxl_arr v_xs_16 = t15;
   lxl_arr a17 = rt_arr_new(0LL, 8ULL);
   lxl_arr v_out_18 = a17;
-  (*p_o)->f_budget = rt_mul_int(4LL, (*p_o)->f_limit, "opt.lxl:1067");
+  (*p_o)->f_budget = rt_mul_int(4LL, (*p_o)->f_limit, "opt.lxl:1068");
   bool t19 = f846_opt_Opt_tail(p_o, &v_xs_16, 0LL, &v_out_18);
   bool c20 = (bool)!t19;
   if (c20) {
@@ -75671,8 +75673,8 @@ static int64_t f834_opt_Opt_shape(struct S82_opt_Opt**p_o, int64_t p_f) {
     return r21;
   }
   int64_t ix22 = p_f;
-  int64_t ix23 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix22, (*p_o)->f_u->f_funcs.len, "opt.lxl:1069")))->f_ty;
-  int64_t v_rt_24 = ((struct S33_ir_Ty*)(*p_o)->f_u->f_tys.data + rt_idx(ix23, (*p_o)->f_u->f_tys.len, "opt.lxl:1069"))->f_base;
+  int64_t ix23 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix22, (*p_o)->f_u->f_funcs.len, "opt.lxl:1070")))->f_ty;
+  int64_t v_rt_24 = ((struct S33_ir_Ty*)(*p_o)->f_u->f_tys.data + rt_idx(ix23, (*p_o)->f_u->f_tys.len, "opt.lxl:1070"))->f_base;
   bool b25 = (bool)(v_out_18.len > 0LL);
   if (b25) {
     bool t26 = f346_ir_Ir_isScalar(&(*p_o)->f_u, v_rt_24);
@@ -75685,10 +75687,10 @@ static int64_t f834_opt_Opt_shape(struct S82_opt_Opt**p_o, int64_t p_f) {
   }
   bool c29 = b27;
   if (c29) {
-    int64_t ix30 = rt_sub_int(v_out_18.len, 1LL, "opt.lxl:1071");
-    int64_t t31 = f847_opt_Opt_select(p_o, *((int64_t*)v_out_18.data + rt_idx(ix30, v_out_18.len, "opt.lxl:1071")), v_rt_24);
-    int64_t ix32 = rt_sub_int(v_out_18.len, 1LL, "opt.lxl:1071");
-    *((int64_t*)v_out_18.data + rt_idx(ix32, v_out_18.len, "opt.lxl:1071")) = t31;
+    int64_t ix30 = rt_sub_int(v_out_18.len, 1LL, "opt.lxl:1072");
+    int64_t t31 = f847_opt_Opt_select(p_o, *((int64_t*)v_out_18.data + rt_idx(ix30, v_out_18.len, "opt.lxl:1072")), v_rt_24);
+    int64_t ix32 = rt_sub_int(v_out_18.len, 1LL, "opt.lxl:1072");
+    *((int64_t*)v_out_18.data + rt_idx(ix32, v_out_18.len, "opt.lxl:1072")) = t31;
   }
   int64_t t33 = f848_opt_Opt_block(p_o, &v_out_18);
   int64_t r34 = t33;
@@ -75706,8 +75708,8 @@ static int64_t f849_opt_Opt_mk1(struct S82_opt_Opt**p_o, int64_t p_k, int64_t p_
   struct S32_ir_Node t1 = (struct S32_ir_Node){.f_k = p_k, .f_ty = p_ty, .f_line = 0LL, .f_a = p_a, .f_b = p_b, .f_c = p_c, .f_d = -1LL, .f_v = 0LL};
   struct S32_ir_Node ap2 = t1;
   *(struct S32_ir_Node*)rt_arr_push(&(*p_o)->f_u->f_nodes, 64ULL) = ap2;
-  (*p_o)->f_grown = rt_add_int((*p_o)->f_grown, 1LL, "opt.lxl:508");
-  int64_t r3 = rt_sub_int((*p_o)->f_u->f_nodes.len, 1LL, "opt.lxl:509");
+  (*p_o)->f_grown = rt_add_int((*p_o)->f_grown, 1LL, "opt.lxl:509");
+  int64_t r3 = rt_sub_int((*p_o)->f_u->f_nodes.len, 1LL, "opt.lxl:510");
   return r3;
 }
 static int64_t f847_opt_Opt_select(struct S82_opt_Opt**p_o, int64_t p_s, int64_t p_rt) {
@@ -75715,7 +75717,7 @@ static int64_t f847_opt_Opt_select(struct S82_opt_Opt**p_o, int64_t p_s, int64_t
   bool b2 = (bool)(t1 != 42LL);
   if (!b2) {
     int64_t ix3 = p_s;
-    b2 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:1082"))->f_c < 0LL);
+    b2 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:1083"))->f_c < 0LL);
   }
   bool c4 = b2;
   if (c4) {
@@ -75723,10 +75725,10 @@ static int64_t f847_opt_Opt_select(struct S82_opt_Opt**p_o, int64_t p_s, int64_t
     return r5;
   }
   int64_t ix6 = p_s;
-  int64_t t7 = f850_opt_Opt_retVal(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:1083"))->f_b, p_rt);
+  int64_t t7 = f850_opt_Opt_retVal(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:1084"))->f_b, p_rt);
   int64_t v_a_8 = t7;
   int64_t ix9 = p_s;
-  int64_t t10 = f850_opt_Opt_retVal(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix9, (*p_o)->f_u->f_nodes.len, "opt.lxl:1084"))->f_c, p_rt);
+  int64_t t10 = f850_opt_Opt_retVal(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix9, (*p_o)->f_u->f_nodes.len, "opt.lxl:1085"))->f_c, p_rt);
   int64_t v_b_11 = t10;
   bool b12 = (bool)(v_a_8 < 0LL);
   if (!b12) {
@@ -75738,7 +75740,7 @@ static int64_t f847_opt_Opt_select(struct S82_opt_Opt**p_o, int64_t p_s, int64_t
     return r14;
   }
   int64_t ix15 = p_s;
-  int64_t t16 = f849_opt_Opt_mk1(p_o, 19LL, p_rt, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix15, (*p_o)->f_u->f_nodes.len, "opt.lxl:1086"))->f_a, v_a_8, v_b_11);
+  int64_t t16 = f849_opt_Opt_mk1(p_o, 19LL, p_rt, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix15, (*p_o)->f_u->f_nodes.len, "opt.lxl:1087"))->f_a, v_a_8, v_b_11);
   int64_t v_e_17 = t16;
   int64_t t18 = f849_opt_Opt_mk1(p_o, 47LL, 0LL, v_e_17, -1LL, -1LL);
   int64_t r19 = t18;
@@ -75762,14 +75764,14 @@ static int64_t f850_opt_Opt_retVal(struct S82_opt_Opt**p_o, int64_t p_s, int64_t
   while (1) {
     bool b10 = (bool)(v_xs_2.len == 1LL);
     if (b10) {
-      int64_t t11 = f82_ir_Ir_nk(&(*p_o)->f_u, *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1097")));
+      int64_t t11 = f82_ir_Ir_nk(&(*p_o)->f_u, *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1098")));
       b10 = (bool)(t11 == 48LL);
     }
     bool c12 = b10;
     if (!c12) {
       break;
     }
-    lxl_arr t13 = f845_opt_Opt_items(p_o, *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1098")));
+    lxl_arr t13 = f845_opt_Opt_items(p_o, *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1099")));
     lxl_arr v_inner_14 = t13;
     lxl_arr a15 = rt_arr_new(0LL, 8ULL);
     {
@@ -75791,20 +75793,20 @@ static int64_t f850_opt_Opt_retVal(struct S82_opt_Opt**p_o, int64_t p_s, int64_t
   }
   bool b23 = (bool)(v_xs_2.len == 2LL);
   if (b23) {
-    int64_t t24 = f82_ir_Ir_nk(&(*p_o)->f_u, *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1104")));
+    int64_t t24 = f82_ir_Ir_nk(&(*p_o)->f_u, *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1105")));
     b23 = (bool)(t24 == 40LL);
   }
   bool b25 = b23;
   if (b25) {
-    int64_t t26 = f82_ir_Ir_nk(&(*p_o)->f_u, *((int64_t*)v_xs_2.data + rt_idx(1LL, v_xs_2.len, "opt.lxl:1104")));
+    int64_t t26 = f82_ir_Ir_nk(&(*p_o)->f_u, *((int64_t*)v_xs_2.data + rt_idx(1LL, v_xs_2.len, "opt.lxl:1105")));
     b25 = (bool)(t26 == 42LL);
   }
   bool c27 = b25;
   if (c27) {
-    int64_t ix28 = *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1106"));
-    struct S32_ir_Node v_d_29 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix28, (*p_o)->f_u->f_nodes.len, "opt.lxl:1106"));
-    int64_t ix30 = *((int64_t*)v_xs_2.data + rt_idx(1LL, v_xs_2.len, "opt.lxl:1107"));
-    struct S32_ir_Node v_f_31 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix30, (*p_o)->f_u->f_nodes.len, "opt.lxl:1107"));
+    int64_t ix28 = *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1107"));
+    struct S32_ir_Node v_d_29 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix28, (*p_o)->f_u->f_nodes.len, "opt.lxl:1107"));
+    int64_t ix30 = *((int64_t*)v_xs_2.data + rt_idx(1LL, v_xs_2.len, "opt.lxl:1108"));
+    struct S32_ir_Node v_f_31 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix30, (*p_o)->f_u->f_nodes.len, "opt.lxl:1108"));
     bool b32 = (bool)(v_d_29.f_b >= 0LL);
     if (b32) {
       b32 = (bool)(v_d_29.f_c < 0LL);
@@ -75812,7 +75814,7 @@ static int64_t f850_opt_Opt_retVal(struct S82_opt_Opt**p_o, int64_t p_s, int64_t
     bool b33 = b32;
     if (b33) {
       int64_t ix34 = v_d_29.f_a;
-      b33 = (bool)!*((bool*)(*p_o)->f_aTaken.data + rt_idx(ix34, (*p_o)->f_aTaken.len, "opt.lxl:1108"));
+      b33 = (bool)!*((bool*)(*p_o)->f_aTaken.data + rt_idx(ix34, (*p_o)->f_aTaken.len, "opt.lxl:1109"));
     }
     bool b35 = b33;
     if (b35) {
@@ -75822,7 +75824,7 @@ static int64_t f850_opt_Opt_retVal(struct S82_opt_Opt**p_o, int64_t p_s, int64_t
     bool b37 = b35;
     if (b37) {
       int64_t ix38 = v_f_31.f_a;
-      b37 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix38, (*p_o)->f_u->f_nodes.len, "opt.lxl:1108"))->f_a == v_d_29.f_a);
+      b37 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix38, (*p_o)->f_u->f_nodes.len, "opt.lxl:1109"))->f_a == v_d_29.f_a);
     }
     bool b39 = b37;
     if (b39) {
@@ -75849,46 +75851,46 @@ static int64_t f850_opt_Opt_retVal(struct S82_opt_Opt**p_o, int64_t p_s, int64_t
   int64_t v_v_47 = -1LL;
   bool b48 = (bool)(v_xs_2.len == 1LL);
   if (b48) {
-    int64_t t49 = f82_ir_Ir_nk(&(*p_o)->f_u, *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1114")));
+    int64_t t49 = f82_ir_Ir_nk(&(*p_o)->f_u, *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1115")));
     b48 = (bool)(t49 == 42LL);
   }
   bool c50 = b48;
   if (c50) {
-    int64_t t51 = f847_opt_Opt_select(p_o, *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1115")), p_rt);
+    int64_t t51 = f847_opt_Opt_select(p_o, *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1116")), p_rt);
     int64_t v_x_52 = t51;
     int64_t t53 = f82_ir_Ir_nk(&(*p_o)->f_u, v_x_52);
     bool c54 = (bool)(t53 == 47LL);
     if (c54) {
       int64_t ix55 = v_x_52;
-      v_v_47 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix55, (*p_o)->f_u->f_nodes.len, "opt.lxl:1116"))->f_a;
+      v_v_47 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix55, (*p_o)->f_u->f_nodes.len, "opt.lxl:1117"))->f_a;
     }
   } else {
     bool b56 = (bool)(v_xs_2.len == 1LL);
     if (b56) {
-      int64_t t57 = f82_ir_Ir_nk(&(*p_o)->f_u, *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1117")));
+      int64_t t57 = f82_ir_Ir_nk(&(*p_o)->f_u, *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1118")));
       b56 = (bool)(t57 == 47LL);
     }
     bool c58 = b56;
     if (c58) {
-      int64_t ix59 = *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1118"));
-      v_v_47 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix59, (*p_o)->f_u->f_nodes.len, "opt.lxl:1118"))->f_a;
+      int64_t ix59 = *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1119"));
+      v_v_47 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix59, (*p_o)->f_u->f_nodes.len, "opt.lxl:1119"))->f_a;
     } else {
       bool b60 = (bool)(v_xs_2.len == 2LL);
       if (b60) {
-        int64_t t61 = f82_ir_Ir_nk(&(*p_o)->f_u, *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1119")));
+        int64_t t61 = f82_ir_Ir_nk(&(*p_o)->f_u, *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1120")));
         b60 = (bool)(t61 == 40LL);
       }
       bool b62 = b60;
       if (b62) {
-        int64_t t63 = f82_ir_Ir_nk(&(*p_o)->f_u, *((int64_t*)v_xs_2.data + rt_idx(1LL, v_xs_2.len, "opt.lxl:1119")));
+        int64_t t63 = f82_ir_Ir_nk(&(*p_o)->f_u, *((int64_t*)v_xs_2.data + rt_idx(1LL, v_xs_2.len, "opt.lxl:1120")));
         b62 = (bool)(t63 == 47LL);
       }
       bool c64 = b62;
       if (c64) {
-        int64_t ix65 = *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1121"));
-        struct S32_ir_Node v_d_66 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix65, (*p_o)->f_u->f_nodes.len, "opt.lxl:1121"));
-        int64_t ix67 = *((int64_t*)v_xs_2.data + rt_idx(1LL, v_xs_2.len, "opt.lxl:1122"));
-        int64_t v_r_68 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix67, (*p_o)->f_u->f_nodes.len, "opt.lxl:1122"))->f_a;
+        int64_t ix65 = *((int64_t*)v_xs_2.data + rt_idx(0LL, v_xs_2.len, "opt.lxl:1122"));
+        struct S32_ir_Node v_d_66 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix65, (*p_o)->f_u->f_nodes.len, "opt.lxl:1122"));
+        int64_t ix67 = *((int64_t*)v_xs_2.data + rt_idx(1LL, v_xs_2.len, "opt.lxl:1123"));
+        int64_t v_r_68 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix67, (*p_o)->f_u->f_nodes.len, "opt.lxl:1123"))->f_a;
         bool b69 = (bool)(v_d_66.f_b >= 0LL);
         if (b69) {
           b69 = (bool)(v_d_66.f_c < 0LL);
@@ -75905,12 +75907,12 @@ static int64_t f850_opt_Opt_retVal(struct S82_opt_Opt**p_o, int64_t p_s, int64_t
         bool b73 = b71;
         if (b73) {
           int64_t ix74 = v_r_68;
-          b73 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix74, (*p_o)->f_u->f_nodes.len, "opt.lxl:1123"))->f_a == v_d_66.f_a);
+          b73 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix74, (*p_o)->f_u->f_nodes.len, "opt.lxl:1124"))->f_a == v_d_66.f_a);
         }
         bool b75 = b73;
         if (b75) {
           int64_t ix76 = v_d_66.f_a;
-          b75 = (bool)!*((bool*)(*p_o)->f_aTaken.data + rt_idx(ix76, (*p_o)->f_aTaken.len, "opt.lxl:1123"));
+          b75 = (bool)!*((bool*)(*p_o)->f_aTaken.data + rt_idx(ix76, (*p_o)->f_aTaken.len, "opt.lxl:1124"));
         }
         bool c77 = b75;
         if (c77) {
@@ -75922,7 +75924,7 @@ static int64_t f850_opt_Opt_retVal(struct S82_opt_Opt**p_o, int64_t p_s, int64_t
   bool b78 = (bool)(v_v_47 < 0LL);
   if (!b78) {
     int64_t ix79 = v_v_47;
-    b78 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix79, (*p_o)->f_u->f_nodes.len, "opt.lxl:1127"))->f_ty != p_rt);
+    b78 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix79, (*p_o)->f_u->f_nodes.len, "opt.lxl:1128"))->f_ty != p_rt);
   }
   bool c80 = b78;
   if (c80) {
@@ -75948,14 +75950,14 @@ static bool f851_opt_Opt_nop(struct S82_opt_Opt**p_o, int64_t p_s) {
     return r6;
   }
   int64_t ix7 = p_s;
-  int64_t v_e_8 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:738"))->f_a;
+  int64_t v_e_8 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:739"))->f_a;
   int64_t t9 = f82_ir_Ir_nk(&(*p_o)->f_u, v_e_8);
   bool b10 = (bool)(t9 == 20LL);
   if (b10) {
     int64_t ix11 = v_e_8;
-    int64_t t12 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix11, (*p_o)->f_u->f_nodes.len, "opt.lxl:739"))->f_a;
+    int64_t t12 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix11, (*p_o)->f_u->f_nodes.len, "opt.lxl:740"))->f_a;
     int64_t ix13 = v_e_8;
-    bool t14 = f852_opt_Opt_samePlace(p_o, t12, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:739"))->f_b);
+    bool t14 = f852_opt_Opt_samePlace(p_o, t12, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:740"))->f_b);
     b10 = t14;
   }
   bool r15 = b10;
@@ -75969,9 +75971,9 @@ static bool f852_opt_Opt_samePlace(struct S82_opt_Opt**p_o, int64_t p_x, int64_t
   bool b5 = (bool)(t3 != t4);
   if (!b5) {
     int64_t ix6 = p_x;
-    int64_t t7 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:727"))->f_ty;
+    int64_t t7 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:728"))->f_ty;
     int64_t ix8 = p_y;
-    b5 = (bool)(t7 != ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix8, (*p_o)->f_u->f_nodes.len, "opt.lxl:727"))->f_ty);
+    b5 = (bool)(t7 != ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix8, (*p_o)->f_u->f_nodes.len, "opt.lxl:728"))->f_ty);
   }
   bool c9 = b5;
   if (c9) {
@@ -75981,22 +75983,22 @@ static bool f852_opt_Opt_samePlace(struct S82_opt_Opt**p_o, int64_t p_x, int64_t
   bool c11 = (bool)(v_k_2 == 4LL);
   if (c11) {
     int64_t ix12 = p_x;
-    int64_t t13 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix12, (*p_o)->f_u->f_nodes.len, "opt.lxl:728"))->f_a;
+    int64_t t13 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix12, (*p_o)->f_u->f_nodes.len, "opt.lxl:729"))->f_a;
     int64_t ix14 = p_y;
-    bool r15 = (bool)(t13 == ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix14, (*p_o)->f_u->f_nodes.len, "opt.lxl:728"))->f_a);
+    bool r15 = (bool)(t13 == ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix14, (*p_o)->f_u->f_nodes.len, "opt.lxl:729"))->f_a);
     return r15;
   }
   bool c16 = (bool)(v_k_2 == 8LL);
   if (c16) {
     int64_t ix17 = p_x;
-    int64_t t18 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix17, (*p_o)->f_u->f_nodes.len, "opt.lxl:729"))->f_v;
+    int64_t t18 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix17, (*p_o)->f_u->f_nodes.len, "opt.lxl:730"))->f_v;
     int64_t ix19 = p_y;
-    bool b20 = (bool)(t18 == ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:729"))->f_v);
+    bool b20 = (bool)(t18 == ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:730"))->f_v);
     if (b20) {
       int64_t ix21 = p_x;
-      int64_t t22 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix21, (*p_o)->f_u->f_nodes.len, "opt.lxl:729"))->f_a;
+      int64_t t22 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix21, (*p_o)->f_u->f_nodes.len, "opt.lxl:730"))->f_a;
       int64_t ix23 = p_y;
-      bool t24 = f852_opt_Opt_samePlace(p_o, t22, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix23, (*p_o)->f_u->f_nodes.len, "opt.lxl:729"))->f_a);
+      bool t24 = f852_opt_Opt_samePlace(p_o, t22, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix23, (*p_o)->f_u->f_nodes.len, "opt.lxl:730"))->f_a);
       b20 = t24;
     }
     bool r25 = b20;
@@ -76010,13 +76012,13 @@ static bool f846_opt_Opt_tail(struct S82_opt_Opt**p_o, lxl_arr*p_xs, int64_t p_i
   int64_t end2 = p_xs->len;
   for (int64_t v_j_3 = t1; v_j_3 < end2; v_j_3++) {
     int64_t ix4 = v_j_3;
-    int64_t v_s_5 = *((int64_t*)p_xs->data + rt_idx(ix4, p_xs->len, "opt.lxl:1137"));
+    int64_t v_s_5 = *((int64_t*)p_xs->data + rt_idx(ix4, p_xs->len, "opt.lxl:1138"));
     bool t6 = f851_opt_Opt_nop(p_o, v_s_5);
     bool c7 = t6;
     if (c7) {
       continue;
     }
-    (*p_o)->f_budget = rt_sub_int((*p_o)->f_budget, 1LL, "opt.lxl:1139");
+    (*p_o)->f_budget = rt_sub_int((*p_o)->f_budget, 1LL, "opt.lxl:1140");
     bool c8 = (bool)((*p_o)->f_budget < 0LL);
     if (c8) {
       bool r9 = (bool)0LL;
@@ -76040,11 +76042,11 @@ static bool f846_opt_Opt_tail(struct S82_opt_Opt**p_o, lxl_arr*p_xs, int64_t p_i
     }
     lxl_arr a18 = rt_arr_new(0LL, 8ULL);
     lxl_arr v_rest_19 = a18;
-    int64_t t20 = rt_add_int(v_j_3, 1LL, "opt.lxl:1151");
+    int64_t t20 = rt_add_int(v_j_3, 1LL, "opt.lxl:1152");
     int64_t end21 = p_xs->len;
     for (int64_t v_m_22 = t20; v_m_22 < end21; v_m_22++) {
       int64_t ix23 = v_m_22;
-      int64_t ap24 = *((int64_t*)p_xs->data + rt_idx(ix23, p_xs->len, "opt.lxl:1151"));
+      int64_t ap24 = *((int64_t*)p_xs->data + rt_idx(ix23, p_xs->len, "opt.lxl:1152"));
       *(int64_t*)rt_arr_push(&v_rest_19, 8ULL) = ap24;
     }
     bool c25 = (bool)(v_k_14 == 48LL);
@@ -76070,9 +76072,9 @@ static bool f846_opt_Opt_tail(struct S82_opt_Opt**p_o, lxl_arr*p_xs, int64_t p_i
       return r35;
     }
     int64_t ix36 = v_s_5;
-    int64_t v_b_37 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix36, (*p_o)->f_u->f_nodes.len, "opt.lxl:1158"))->f_b;
+    int64_t v_b_37 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix36, (*p_o)->f_u->f_nodes.len, "opt.lxl:1159"))->f_b;
     int64_t ix38 = v_s_5;
-    int64_t v_c_39 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix38, (*p_o)->f_u->f_nodes.len, "opt.lxl:1159"))->f_c;
+    int64_t v_c_39 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix38, (*p_o)->f_u->f_nodes.len, "opt.lxl:1160"))->f_c;
     lxl_arr t40 = f845_opt_Opt_items(p_o, v_b_37);
     lxl_arr v_tb_41 = t40;
     bool t42 = f853_opt_Opt_always(p_o, v_b_37);
@@ -76143,7 +76145,7 @@ static bool f846_opt_Opt_tail(struct S82_opt_Opt**p_o, lxl_arr*p_xs, int64_t p_i
     }
     int64_t v_e_72 = ifx70;
     int64_t ix73 = v_s_5;
-    int64_t t74 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix73, (*p_o)->f_u->f_nodes.len, "opt.lxl:1174"))->f_a;
+    int64_t t74 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix73, (*p_o)->f_u->f_nodes.len, "opt.lxl:1175"))->f_a;
     int64_t t75 = f848_opt_Opt_block(p_o, &v_ts_49);
     int64_t t76 = f849_opt_Opt_mk1(p_o, 42LL, 0LL, t74, t75, v_e_72);
     int64_t ap77 = t76;
@@ -76170,7 +76172,7 @@ static bool f853_opt_Opt_always(struct S82_opt_Opt**p_o, int64_t p_s) {
   bool c5 = (bool)(v_k_2 == 48LL);
   if (c5) {
     int64_t ix6 = p_s;
-    int64_t v_l_7 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:1185"))->f_a;
+    int64_t v_l_7 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:1186"))->f_a;
     int64_t t8 = f77_ir_Ir_listLen(&(*p_o)->f_u, v_l_7);
     int64_t end9 = t8;
     for (int64_t v_j_10 = 0LL; v_j_10 < end9; v_j_10++) {
@@ -76188,16 +76190,16 @@ static bool f853_opt_Opt_always(struct S82_opt_Opt**p_o, int64_t p_s) {
   bool c16 = (bool)(v_k_2 == 42LL);
   if (c16) {
     int64_t ix17 = p_s;
-    bool b18 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix17, (*p_o)->f_u->f_nodes.len, "opt.lxl:1191"))->f_c >= 0LL);
+    bool b18 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix17, (*p_o)->f_u->f_nodes.len, "opt.lxl:1192"))->f_c >= 0LL);
     if (b18) {
       int64_t ix19 = p_s;
-      bool t20 = f853_opt_Opt_always(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:1191"))->f_b);
+      bool t20 = f853_opt_Opt_always(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:1192"))->f_b);
       b18 = t20;
     }
     bool b21 = b18;
     if (b21) {
       int64_t ix22 = p_s;
-      bool t23 = f853_opt_Opt_always(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix22, (*p_o)->f_u->f_nodes.len, "opt.lxl:1191"))->f_c);
+      bool t23 = f853_opt_Opt_always(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix22, (*p_o)->f_u->f_nodes.len, "opt.lxl:1192"))->f_c);
       b21 = t23;
     }
     bool r24 = b21;
@@ -76218,7 +76220,7 @@ static lxl_arr f845_opt_Opt_items(struct S82_opt_Opt**p_o, int64_t p_s) {
     return r6;
   }
   int64_t ix7 = p_s;
-  int64_t v_l_8 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:530"))->f_a;
+  int64_t v_l_8 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:531"))->f_a;
   int64_t t9 = f77_ir_Ir_listLen(&(*p_o)->f_u, v_l_8);
   int64_t end10 = t9;
   for (int64_t v_j_11 = 0LL; v_j_11 < end10; v_j_11++) {
@@ -76238,7 +76240,7 @@ static void f833_opt_Opt_scalars(struct S82_opt_Opt**p_o, int64_t p_f) {
   if (c2) {
     return;
   }
-  (*p_o)->f_stamp = rt_add_int((*p_o)->f_stamp, 1LL, "opt.lxl:1258");
+  (*p_o)->f_stamp = rt_add_int((*p_o)->f_stamp, 1LL, "opt.lxl:1272");
   lxl_arr a3 = rt_arr_new(0LL, 8ULL);
   {
     lxl_arr nw4 = a3;
@@ -76247,7 +76249,7 @@ static void f833_opt_Opt_scalars(struct S82_opt_Opt**p_o, int64_t p_f) {
   }
   (*p_o)->f_adj = -1LL;
   int64_t ix5 = p_f;
-  f854_opt_Opt_sa(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix5, (*p_o)->f_u->f_funcs.len, "opt.lxl:1261")))->f_body);
+  f854_opt_Opt_sa(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix5, (*p_o)->f_u->f_funcs.len, "opt.lxl:1275")))->f_body);
   bool v_any_6 = (bool)0LL;
   int64_t end7 = (*p_o)->f_cands.len;
   for (int64_t v_c_8 = 0LL; v_c_8 < end7; v_c_8++) {
@@ -76260,7 +76262,7 @@ static void f833_opt_Opt_scalars(struct S82_opt_Opt**p_o, int64_t p_f) {
   bool c11 = v_any_6;
   if (c11) {
     int64_t ix12 = p_f;
-    f856_opt_Opt_sr(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix12, (*p_o)->f_u->f_funcs.len, "opt.lxl:1266")))->f_body);
+    f856_opt_Opt_sr(p_o, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix12, (*p_o)->f_u->f_funcs.len, "opt.lxl:1280")))->f_body);
   }
 }
 static void f856_opt_Opt_sr(struct S82_opt_Opt**p_o, int64_t p_x) {
@@ -76269,19 +76271,19 @@ static void f856_opt_Opt_sr(struct S82_opt_Opt**p_o, int64_t p_x) {
     return;
   }
   int64_t ix2 = p_x;
-  int64_t v_k_3 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix2, (*p_o)->f_u->f_nodes.len, "opt.lxl:1490"))->f_k;
+  int64_t v_k_3 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix2, (*p_o)->f_u->f_nodes.len, "opt.lxl:1574"))->f_k;
   int64_t ix4 = p_x;
-  int64_t v_a_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1491"))->f_a;
+  int64_t v_a_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1575"))->f_a;
   bool c6 = (bool)(v_k_3 == 48LL);
   if (c6) {
     lxl_arr a7 = rt_arr_new(0LL, 8ULL);
     lxl_arr v_out_8 = a7;
     bool v_changed_9 = (bool)0LL;
     int64_t ix10 = v_a_5;
-    int64_t end11 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix10, (*p_o)->f_u->f_items.len, "opt.lxl:1495"));
+    int64_t end11 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix10, (*p_o)->f_u->f_items.len, "opt.lxl:1579"));
     for (int64_t v_j_12 = 0LL; v_j_12 < end11; v_j_12++) {
-      int64_t ix13 = rt_add_int(rt_add_int(v_a_5, 1LL, "opt.lxl:1496"), v_j_12, "opt.lxl:1496");
-      int64_t v_s_14 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix13, (*p_o)->f_u->f_items.len, "opt.lxl:1496"));
+      int64_t ix13 = rt_add_int(rt_add_int(v_a_5, 1LL, "opt.lxl:1580"), v_j_12, "opt.lxl:1580");
+      int64_t v_s_14 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix13, (*p_o)->f_u->f_items.len, "opt.lxl:1580"));
       bool t15 = f857_opt_Opt_srItem(p_o, v_s_14, &v_out_8);
       bool c16 = t15;
       if (c16) {
@@ -76292,7 +76294,7 @@ static void f856_opt_Opt_sr(struct S82_opt_Opt**p_o, int64_t p_x) {
     if (c17) {
       int64_t t18 = f633_ir_Ir_list(&(*p_o)->f_u, &v_out_8);
       int64_t ix19 = p_x;
-      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:1499"))->f_a = t18;
+      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:1583"))->f_a = t18;
     }
     gl10_drop(v_out_8);
     return;
@@ -76313,7 +76315,7 @@ static void f856_opt_Opt_sr(struct S82_opt_Opt**p_o, int64_t p_x) {
     if (b26) {
       int64_t ix27 = v_c_22;
       int64_t ix28 = v_fi_25;
-      b26 = (bool)(((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix27, (*p_o)->f_cands.len, "opt.lxl:1505")))->f_flds.data + rt_idx(ix28, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix27, (*p_o)->f_cands.len, "opt.lxl:1505")))->f_flds.len, "opt.lxl:1505"))->f_outer >= 0LL);
+      b26 = (bool)(((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix27, (*p_o)->f_cands.len, "opt.lxl:1589")))->f_flds.data + rt_idx(ix28, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix27, (*p_o)->f_cands.len, "opt.lxl:1589")))->f_flds.len, "opt.lxl:1589"))->f_outer >= 0LL);
     }
     bool c29 = b26;
     if (c29) {
@@ -76325,25 +76327,25 @@ static void f856_opt_Opt_sr(struct S82_opt_Opt**p_o, int64_t p_x) {
       int64_t t31 = f861_opt_Opt_fieldLoc(p_o, v_c_22, p_x);
       int64_t v_l_32 = t31;
       int64_t ix33 = p_x;
-      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix33, (*p_o)->f_u->f_nodes.len, "opt.lxl:1511"))->f_k = 4LL;
+      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix33, (*p_o)->f_u->f_nodes.len, "opt.lxl:1595"))->f_k = 4LL;
       int64_t ix34 = p_x;
-      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix34, (*p_o)->f_u->f_nodes.len, "opt.lxl:1512"))->f_a = v_l_32;
+      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix34, (*p_o)->f_u->f_nodes.len, "opt.lxl:1596"))->f_a = v_l_32;
       int64_t ix35 = p_x;
-      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix35, (*p_o)->f_u->f_nodes.len, "opt.lxl:1513"))->f_v = 0LL;
+      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix35, (*p_o)->f_u->f_nodes.len, "opt.lxl:1597"))->f_v = 0LL;
       return;
     }
   }
   lxl_slice t36 = k2_ir_KIDS;
   int64_t ix37 = v_k_3;
-  int64_t v_kc_38 = *((int64_t*)t36.data + rt_idx(ix37, t36.len, "opt.lxl:1517"));
+  int64_t v_kc_38 = *((int64_t*)t36.data + rt_idx(ix37, t36.len, "opt.lxl:1601"));
   bool c39 = (bool)(v_kc_38 == 0LL);
   if (c39) {
     return;
   }
   int64_t ix40 = p_x;
-  int64_t v_b_41 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix40, (*p_o)->f_u->f_nodes.len, "opt.lxl:1519"))->f_b;
+  int64_t v_b_41 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix40, (*p_o)->f_u->f_nodes.len, "opt.lxl:1603"))->f_b;
   int64_t ix42 = p_x;
-  int64_t v_c_43 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix42, (*p_o)->f_u->f_nodes.len, "opt.lxl:1520"))->f_c;
+  int64_t v_c_43 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix42, (*p_o)->f_u->f_nodes.len, "opt.lxl:1604"))->f_c;
   bool b44 = (bool)(v_kc_38 == 1LL);
   if (!b44) {
     b44 = (bool)(v_kc_38 == 2LL);
@@ -76391,7 +76393,7 @@ static void f856_opt_Opt_sr(struct S82_opt_Opt**p_o, int64_t p_x) {
   bool c55 = (bool)(v_kc_38 == 8LL);
   if (c55) {
     int64_t ix56 = p_x;
-    f856_opt_Opt_sr(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix56, (*p_o)->f_u->f_nodes.len, "opt.lxl:1524"))->f_d);
+    f856_opt_Opt_sr(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix56, (*p_o)->f_u->f_nodes.len, "opt.lxl:1608"))->f_d);
   }
   bool b57 = (bool)(v_kc_38 == 4LL);
   if (!b57) {
@@ -76401,10 +76403,10 @@ static void f856_opt_Opt_sr(struct S82_opt_Opt**p_o, int64_t p_x) {
   bool c61 = (bool)(v_l_60 >= 0LL);
   if (c61) {
     int64_t ix62 = v_l_60;
-    int64_t end63 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix62, (*p_o)->f_u->f_items.len, "opt.lxl:1527"));
+    int64_t end63 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix62, (*p_o)->f_u->f_items.len, "opt.lxl:1611"));
     for (int64_t v_j_64 = 0LL; v_j_64 < end63; v_j_64++) {
-      int64_t ix65 = rt_add_int(rt_add_int(v_l_60, 1LL, "opt.lxl:1527"), v_j_64, "opt.lxl:1527");
-      f856_opt_Opt_sr(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix65, (*p_o)->f_u->f_items.len, "opt.lxl:1527")));
+      int64_t ix65 = rt_add_int(rt_add_int(v_l_60, 1LL, "opt.lxl:1611"), v_j_64, "opt.lxl:1611");
+      f856_opt_Opt_sr(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix65, (*p_o)->f_u->f_items.len, "opt.lxl:1611")));
     }
   }
 }
@@ -76413,7 +76415,7 @@ static int64_t f861_opt_Opt_fieldLoc(struct S82_opt_Opt**p_o, int64_t p_c, int64
   int64_t v_i_2 = t1;
   int64_t ix3 = p_c;
   int64_t ix4 = v_i_2;
-  int64_t r5 = ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix3, (*p_o)->f_cands.len, "opt.lxl:1454")))->f_flds.data + rt_idx(ix4, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix3, (*p_o)->f_cands.len, "opt.lxl:1454")))->f_flds.len, "opt.lxl:1454"))->f_loc;
+  int64_t r5 = ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix3, (*p_o)->f_cands.len, "opt.lxl:1538")))->f_flds.data + rt_idx(ix4, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix3, (*p_o)->f_cands.len, "opt.lxl:1538")))->f_flds.len, "opt.lxl:1538"))->f_loc;
   return r5;
 }
 static void f860_opt_Opt_inner(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_x) {
@@ -76421,10 +76423,10 @@ static void f860_opt_Opt_inner(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_x
   int64_t v_fi_2 = t1;
   int64_t ix3 = p_c;
   int64_t ix4 = v_fi_2;
-  int64_t v_q_5 = ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix3, (*p_o)->f_cands.len, "opt.lxl:1535")))->f_flds.data + rt_idx(ix4, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix3, (*p_o)->f_cands.len, "opt.lxl:1535")))->f_flds.len, "opt.lxl:1535"))->f_outer;
+  int64_t v_q_5 = ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix3, (*p_o)->f_cands.len, "opt.lxl:1619")))->f_flds.data + rt_idx(ix4, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix3, (*p_o)->f_cands.len, "opt.lxl:1619")))->f_flds.len, "opt.lxl:1619"))->f_outer;
   int64_t ix6 = p_c;
   int64_t ix7 = v_q_5;
-  struct S84_opt_Fld v_fq_8 = *((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix6, (*p_o)->f_cands.len, "opt.lxl:1536")))->f_flds.data + rt_idx(ix7, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix6, (*p_o)->f_cands.len, "opt.lxl:1536")))->f_flds.len, "opt.lxl:1536"));
+  struct S84_opt_Fld v_fq_8 = *((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix6, (*p_o)->f_cands.len, "opt.lxl:1620")))->f_flds.data + rt_idx(ix7, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix6, (*p_o)->f_cands.len, "opt.lxl:1620")))->f_flds.len, "opt.lxl:1620"));
   int64_t v_off_9 = 0LL;
   int64_t v_r_10 = p_x;
   while (1) {
@@ -76434,9 +76436,9 @@ static void f860_opt_Opt_inner(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_x
       break;
     }
     int64_t ix13 = v_r_10;
-    v_off_9 = rt_add_int(v_off_9, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:1540"))->f_v, "opt.lxl:1540");
+    v_off_9 = rt_add_int(v_off_9, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:1624"))->f_v, "opt.lxl:1624");
     int64_t ix14 = v_r_10;
-    v_r_10 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix14, (*p_o)->f_u->f_nodes.len, "opt.lxl:1541"))->f_a;
+    v_r_10 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix14, (*p_o)->f_u->f_nodes.len, "opt.lxl:1625"))->f_a;
   }
   int64_t v_y_15 = p_x;
   while (1) {
@@ -76448,25 +76450,25 @@ static void f860_opt_Opt_inner(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_x
     bool b18 = (bool)(v_off_9 == v_fq_8.f_off);
     if (b18) {
       int64_t ix19 = v_y_15;
-      b18 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:1545"))->f_ty == v_fq_8.f_ty);
+      b18 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:1629"))->f_ty == v_fq_8.f_ty);
     }
     bool c20 = b18;
     if (c20) {
       int64_t ix21 = v_y_15;
-      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix21, (*p_o)->f_u->f_nodes.len, "opt.lxl:1546"))->f_k = 4LL;
+      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix21, (*p_o)->f_u->f_nodes.len, "opt.lxl:1630"))->f_k = 4LL;
       int64_t ix22 = v_y_15;
-      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix22, (*p_o)->f_u->f_nodes.len, "opt.lxl:1547"))->f_a = v_fq_8.f_loc;
+      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix22, (*p_o)->f_u->f_nodes.len, "opt.lxl:1631"))->f_a = v_fq_8.f_loc;
       int64_t ix23 = v_y_15;
-      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix23, (*p_o)->f_u->f_nodes.len, "opt.lxl:1548"))->f_v = 0LL;
+      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix23, (*p_o)->f_u->f_nodes.len, "opt.lxl:1632"))->f_v = 0LL;
       return;
     }
     int64_t ix24 = v_y_15;
-    v_off_9 = rt_sub_int(v_off_9, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix24, (*p_o)->f_u->f_nodes.len, "opt.lxl:1551"))->f_v, "opt.lxl:1551");
+    v_off_9 = rt_sub_int(v_off_9, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix24, (*p_o)->f_u->f_nodes.len, "opt.lxl:1635"))->f_v, "opt.lxl:1635");
     int64_t ix25 = v_y_15;
-    v_y_15 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix25, (*p_o)->f_u->f_nodes.len, "opt.lxl:1552"))->f_a;
+    v_y_15 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix25, (*p_o)->f_u->f_nodes.len, "opt.lxl:1636"))->f_a;
   }
   int64_t ix26 = p_x;
-  f107_ir_failAt(sl9258, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix26, (*p_o)->f_u->f_nodes.len, "opt.lxl:1554"))->f_line, sl9415);
+  f107_ir_failAt(sl9258, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix26, (*p_o)->f_u->f_nodes.len, "opt.lxl:1638"))->f_line, sl9415);
 }
 static int64_t f859_opt_Opt_field(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_x) {
   int64_t v_off_1 = 0LL;
@@ -76478,22 +76480,22 @@ static int64_t f859_opt_Opt_field(struct S82_opt_Opt**p_o, int64_t p_c, int64_t 
       break;
     }
     int64_t ix5 = v_r_2;
-    v_off_1 = rt_add_int(v_off_1, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix5, (*p_o)->f_u->f_nodes.len, "opt.lxl:1244"))->f_v, "opt.lxl:1244");
+    v_off_1 = rt_add_int(v_off_1, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix5, (*p_o)->f_u->f_nodes.len, "opt.lxl:1258"))->f_v, "opt.lxl:1258");
     int64_t ix6 = v_r_2;
-    v_r_2 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:1245"))->f_a;
+    v_r_2 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:1259"))->f_a;
   }
   int64_t ix7 = p_x;
-  int64_t v_t_8 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:1247"))->f_ty;
+  int64_t v_t_8 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:1261"))->f_ty;
   int64_t ix9 = p_c;
-  int64_t end10 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix9, (*p_o)->f_cands.len, "opt.lxl:1248")))->f_flds.len;
+  int64_t end10 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix9, (*p_o)->f_cands.len, "opt.lxl:1262")))->f_flds.len;
   for (int64_t v_i_11 = 0LL; v_i_11 < end10; v_i_11++) {
     int64_t ix12 = p_c;
     int64_t ix13 = v_i_11;
-    bool b14 = (bool)(((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix12, (*p_o)->f_cands.len, "opt.lxl:1249")))->f_flds.data + rt_idx(ix13, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix12, (*p_o)->f_cands.len, "opt.lxl:1249")))->f_flds.len, "opt.lxl:1249"))->f_off == v_off_1);
+    bool b14 = (bool)(((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix12, (*p_o)->f_cands.len, "opt.lxl:1263")))->f_flds.data + rt_idx(ix13, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix12, (*p_o)->f_cands.len, "opt.lxl:1263")))->f_flds.len, "opt.lxl:1263"))->f_off == v_off_1);
     if (b14) {
       int64_t ix15 = p_c;
       int64_t ix16 = v_i_11;
-      b14 = (bool)(((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix15, (*p_o)->f_cands.len, "opt.lxl:1249")))->f_flds.data + rt_idx(ix16, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix15, (*p_o)->f_cands.len, "opt.lxl:1249")))->f_flds.len, "opt.lxl:1249"))->f_ty == v_t_8);
+      b14 = (bool)(((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix15, (*p_o)->f_cands.len, "opt.lxl:1263")))->f_flds.data + rt_idx(ix16, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix15, (*p_o)->f_cands.len, "opt.lxl:1263")))->f_flds.len, "opt.lxl:1263"))->f_ty == v_t_8);
     }
     bool c17 = b14;
     if (c17) {
@@ -76504,9 +76506,9 @@ static int64_t f859_opt_Opt_field(struct S82_opt_Opt**p_o, int64_t p_c, int64_t 
   int64_t ix19 = p_c;
   struct S84_opt_Fld t20 = (struct S84_opt_Fld){.f_off = v_off_1, .f_ty = v_t_8, .f_tmpl = p_x, .f_read = (bool)0LL, .f_dups = 0LL, .f_drops = 0LL, .f_away = (bool)0LL, .f_loc = -1LL, .f_outer = -1LL};
   struct S84_opt_Fld ap21 = t20;
-  *(struct S84_opt_Fld*)rt_arr_push(&(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix19, (*p_o)->f_cands.len, "opt.lxl:1251")))->f_flds, 72ULL) = ap21;
+  *(struct S84_opt_Fld*)rt_arr_push(&(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix19, (*p_o)->f_cands.len, "opt.lxl:1265")))->f_flds, 72ULL) = ap21;
   int64_t ix22 = p_c;
-  int64_t r23 = rt_sub_int((*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix22, (*p_o)->f_cands.len, "opt.lxl:1252")))->f_flds.len, 1LL, "opt.lxl:1252");
+  int64_t r23 = rt_sub_int((*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix22, (*p_o)->f_cands.len, "opt.lxl:1266")))->f_flds.len, 1LL, "opt.lxl:1266");
   return r23;
 }
 static int64_t f858_opt_Opt_done(struct S82_opt_Opt**p_o, int64_t p_x) {
@@ -76516,7 +76518,7 @@ static int64_t f858_opt_Opt_done(struct S82_opt_Opt**p_o, int64_t p_x) {
   bool b4 = (bool)(v_c_3 >= 0LL);
   if (b4) {
     int64_t ix5 = v_c_3;
-    b4 = (bool)!(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix5, (*p_o)->f_cands.len, "opt.lxl:1448")))->f_bad;
+    b4 = (bool)!(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix5, (*p_o)->f_cands.len, "opt.lxl:1532")))->f_bad;
   }
   int64_t r7 = b4 ? v_c_3 : -1LL;
   return r7;
@@ -76525,7 +76527,7 @@ static int64_t f862_opt_Opt_candOf(struct S82_opt_Opt**p_o, int64_t p_l) {
   bool b1 = (bool)(p_l < 0LL);
   if (!b1) {
     int64_t ix2 = p_l;
-    b1 = (bool)(*((int64_t*)(*p_o)->f_sStamp.data + rt_idx(ix2, (*p_o)->f_sStamp.len, "opt.lxl:1229")) != (*p_o)->f_stamp);
+    b1 = (bool)(*((int64_t*)(*p_o)->f_sStamp.data + rt_idx(ix2, (*p_o)->f_sStamp.len, "opt.lxl:1243")) != (*p_o)->f_stamp);
   }
   bool c3 = b1;
   if (c3) {
@@ -76533,27 +76535,27 @@ static int64_t f862_opt_Opt_candOf(struct S82_opt_Opt**p_o, int64_t p_l) {
     return r4;
   }
   int64_t ix5 = p_l;
-  int64_t r6 = *((int64_t*)(*p_o)->f_sCand.data + rt_idx(ix5, (*p_o)->f_sCand.len, "opt.lxl:1230"));
+  int64_t r6 = *((int64_t*)(*p_o)->f_sCand.data + rt_idx(ix5, (*p_o)->f_sCand.len, "opt.lxl:1244"));
   return r6;
 }
 static bool f857_opt_Opt_srItem(struct S82_opt_Opt**p_o, int64_t p_x, lxl_arr*p_out) {
   int64_t ix1 = p_x;
-  int64_t v_k_2 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:1559"))->f_k;
+  int64_t v_k_2 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:1643"))->f_k;
   bool c3 = (bool)(v_k_2 == 40LL);
   if (c3) {
     int64_t ix4 = p_x;
-    int64_t v_l_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1561"))->f_a;
+    int64_t v_l_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1645"))->f_a;
     int64_t t6 = f862_opt_Opt_candOf(p_o, v_l_5);
     int64_t v_c_7 = t6;
     bool b8 = (bool)(v_c_7 >= 0LL);
     if (b8) {
       int64_t ix9 = v_c_7;
-      b8 = (bool)!(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix9, (*p_o)->f_cands.len, "opt.lxl:1563")))->f_bad;
+      b8 = (bool)!(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix9, (*p_o)->f_cands.len, "opt.lxl:1647")))->f_bad;
     }
     bool c10 = b8;
     if (c10) {
       int64_t ix11 = v_c_7;
-      bool c12 = (bool)((*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix11, (*p_o)->f_cands.len, "opt.lxl:1564")))->f_decl == p_x);
+      bool c12 = (bool)((*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix11, (*p_o)->f_cands.len, "opt.lxl:1648")))->f_decl == p_x);
       if (c12) {
         f863_opt_Opt_split(p_o, v_c_7, p_x, p_out);
       }
@@ -76564,12 +76566,12 @@ static bool f857_opt_Opt_srItem(struct S82_opt_Opt**p_o, int64_t p_x, lxl_arr*p_
     bool c14 = (bool)(v_k_2 == 41LL);
     if (c14) {
       int64_t ix15 = p_x;
-      int64_t v_e_16 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix15, (*p_o)->f_u->f_nodes.len, "opt.lxl:1568"))->f_a;
+      int64_t v_e_16 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix15, (*p_o)->f_u->f_nodes.len, "opt.lxl:1652"))->f_a;
       bool t17 = f864_opt_Opt_nopAssign(p_o, v_e_16);
       bool b18 = t17;
       if (b18) {
         int64_t ix19 = v_e_16;
-        int64_t t20 = f858_opt_Opt_done(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:1569"))->f_a);
+        int64_t t20 = f858_opt_Opt_done(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:1653"))->f_a);
         b18 = (bool)(t20 >= 0LL);
       }
       bool c21 = b18;
@@ -76624,7 +76626,7 @@ static int64_t f866_opt_Opt_dropOf(struct S82_opt_Opt**p_o, int64_t p_e) {
   bool b2 = (bool)(t1 != (*p_o)->f_dropF);
   if (!b2) {
     int64_t ix3 = p_e;
-    int64_t t4 = f77_ir_Ir_listLen(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:1280"))->f_b);
+    int64_t t4 = f77_ir_Ir_listLen(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:1294"))->f_b);
     b2 = (bool)(t4 != 1LL);
   }
   bool c5 = b2;
@@ -76633,7 +76635,7 @@ static int64_t f866_opt_Opt_dropOf(struct S82_opt_Opt**p_o, int64_t p_e) {
     return r6;
   }
   int64_t ix7 = p_e;
-  int64_t t8 = f78_ir_Ir_listAt(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:1281"))->f_b, 0LL);
+  int64_t t8 = f78_ir_Ir_listAt(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:1295"))->f_b, 0LL);
   int64_t v_a_9 = t8;
   int64_t t10 = f82_ir_Ir_nk(&(*p_o)->f_u, v_a_9);
   int64_t r12 = t10 == 8LL ? v_a_9 : -1LL;
@@ -76647,9 +76649,9 @@ static int64_t f865_opt_Opt_dupOf(struct S82_opt_Opt**p_o, int64_t p_e) {
     return r3;
   }
   int64_t ix4 = p_e;
-  int64_t v_a_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1272"))->f_a;
+  int64_t v_a_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1286"))->f_a;
   int64_t ix6 = p_e;
-  int64_t v_b_7 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:1273"))->f_b;
+  int64_t v_b_7 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:1287"))->f_b;
   int64_t t8 = f82_ir_Ir_nk(&(*p_o)->f_u, v_a_5);
   bool b9 = (bool)(t8 != 8LL);
   if (!b9) {
@@ -76659,7 +76661,7 @@ static int64_t f865_opt_Opt_dupOf(struct S82_opt_Opt**p_o, int64_t p_e) {
   bool b11 = b9;
   if (!b11) {
     int64_t ix12 = v_b_7;
-    int64_t t13 = f77_ir_Ir_listLen(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix12, (*p_o)->f_u->f_nodes.len, "opt.lxl:1274"))->f_b);
+    int64_t t13 = f77_ir_Ir_listLen(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix12, (*p_o)->f_u->f_nodes.len, "opt.lxl:1288"))->f_b);
     b11 = (bool)(t13 != 1LL);
   }
   bool c14 = b11;
@@ -76669,7 +76671,7 @@ static int64_t f865_opt_Opt_dupOf(struct S82_opt_Opt**p_o, int64_t p_e) {
   }
   int64_t t16 = v_a_5;
   int64_t ix17 = v_b_7;
-  int64_t t18 = f78_ir_Ir_listAt(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix17, (*p_o)->f_u->f_nodes.len, "opt.lxl:1275"))->f_b, 0LL);
+  int64_t t18 = f78_ir_Ir_listAt(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix17, (*p_o)->f_u->f_nodes.len, "opt.lxl:1289"))->f_b, 0LL);
   bool t19 = f852_opt_Opt_samePlace(p_o, t16, t18);
   int64_t r21 = t19 ? v_a_5 : -1LL;
   return r21;
@@ -76679,73 +76681,128 @@ static bool f864_opt_Opt_nopAssign(struct S82_opt_Opt**p_o, int64_t p_e) {
   bool b2 = (bool)(t1 == 20LL);
   if (b2) {
     int64_t ix3 = p_e;
-    int64_t t4 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:1287"))->f_a;
+    int64_t t4 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:1301"))->f_a;
     int64_t ix5 = p_e;
-    bool t6 = f852_opt_Opt_samePlace(p_o, t4, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix5, (*p_o)->f_u->f_nodes.len, "opt.lxl:1287"))->f_b);
+    bool t6 = f852_opt_Opt_samePlace(p_o, t4, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix5, (*p_o)->f_u->f_nodes.len, "opt.lxl:1301"))->f_b);
     b2 = t6;
   }
   bool r7 = b2;
   return r7;
 }
 static void f863_opt_Opt_split(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_x, lxl_arr*p_out) {
-  int64_t ix1 = p_x;
-  int64_t v_e_2 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:1588"))->f_b;
-  f856_opt_Opt_sr(p_o, v_e_2);
-  int64_t v_base_3 = -1LL;
-  int64_t v_q_4 = -1LL;
-  bool t5 = f867_opt_Opt_cheap(p_o, v_e_2);
-  bool c6 = (bool)!t5;
-  if (c6) {
-    int64_t ix7 = v_e_2;
-    int64_t t8 = f632_ir_Ir_ptrTo(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:1593"))->f_ty);
-    int64_t v_pt_9 = t8;
-    int64_t ix10 = p_c;
-    int64_t ix11 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix10, (*p_o)->f_cands.len, "opt.lxl:1594")))->f_l;
-    lxl_str t12 = rt_str_dup(((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix11, (*p_o)->f_u->f_locals.len, "opt.lxl:1594"))->f_name);
-    lxl_str v_name_13 = t12;
-    int64_t t14 = f839_opt_Opt_local(p_o, v_name_13, v_pt_9, (bool)0LL);
-    v_q_4 = t14;
-    int64_t t15 = f82_ir_Ir_nk(&(*p_o)->f_u, v_e_2);
-    int64_t ifx16;
-    if (t15 == 9LL) {
-      int64_t ix17 = v_e_2;
-      ifx16 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix17, (*p_o)->f_u->f_nodes.len, "opt.lxl:1596"))->f_a;
+  int64_t ix1 = p_c;
+  bool c2 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix1, (*p_o)->f_cands.len, "opt.lxl:1672")))->f_fresh;
+  if (c2) {
+    int64_t ix3 = p_c;
+    int64_t v_ents_4 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix3, (*p_o)->f_cands.len, "opt.lxl:1673")))->f_init;
+    int64_t ifx5;
+    if (v_ents_4 >= 0LL) {
+      int64_t ix6 = v_ents_4;
+      ifx5 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix6, (*p_o)->f_u->f_items.len, "opt.lxl:1674"));
     } else {
-      int64_t t18 = f849_opt_Opt_mk1(p_o, 10LL, v_pt_9, v_e_2, -1LL, -1LL);
-      ifx16 = t18;
+      ifx5 = 0LL;
     }
-    int64_t v_addr_19 = ifx16;
-    int64_t t20 = f849_opt_Opt_mk1(p_o, 40LL, 0LL, v_q_4, v_addr_19, -1LL);
-    int64_t ap21 = t20;
-    *(int64_t*)rt_arr_push(p_out, 8ULL) = ap21;
-    rt_str_drop(v_name_13);
-  }
-  int64_t ix22 = p_c;
-  int64_t end23 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix22, (*p_o)->f_cands.len, "opt.lxl:1599")))->f_flds.len;
-  for (int64_t v_i_24 = 0LL; v_i_24 < end23; v_i_24++) {
-    int64_t ix25 = p_c;
-    int64_t ix26 = v_i_24;
-    struct S84_opt_Fld v_f_27 = *((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix25, (*p_o)->f_cands.len, "opt.lxl:1600")))->f_flds.data + rt_idx(ix26, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix25, (*p_o)->f_cands.len, "opt.lxl:1600")))->f_flds.len, "opt.lxl:1600"));
-    bool c28 = (bool)(v_f_27.f_loc >= 0LL);
-    if (c28) {
-      int64_t v_b_29 = -1LL;
-      bool c30 = (bool)(v_q_4 >= 0LL);
-      if (c30) {
-        int64_t ix31 = v_q_4;
-        int64_t t32 = f849_opt_Opt_mk1(p_o, 4LL, ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix31, (*p_o)->f_u->f_locals.len, "opt.lxl:1604"))->f_ty, v_q_4, -1LL, -1LL);
-        int64_t v_ql_33 = t32;
-        int64_t ix34 = v_e_2;
-        int64_t t35 = f849_opt_Opt_mk1(p_o, 9LL, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix34, (*p_o)->f_u->f_nodes.len, "opt.lxl:1605"))->f_ty, v_ql_33, -1LL, -1LL);
-        v_b_29 = t35;
-      } else {
-        int64_t t36 = f868_opt_Opt_copyTree(p_o, v_e_2);
-        v_b_29 = t36;
+    int64_t v_ne_7 = ifx5;
+    int64_t end8 = v_ne_7;
+    for (int64_t v_j_9 = 0LL; v_j_9 < end8; v_j_9++) {
+      int64_t ix10 = rt_add_int(rt_add_int(v_ents_4, 1LL, "opt.lxl:1676"), v_j_9, "opt.lxl:1676");
+      int64_t v_ei_11 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix10, (*p_o)->f_u->f_items.len, "opt.lxl:1676"));
+      int64_t ix12 = v_ei_11;
+      f856_opt_Opt_sr(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix12, (*p_o)->f_u->f_nodes.len, "opt.lxl:1677"))->f_a);
+      int64_t ix13 = p_c;
+      int64_t end14 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix13, (*p_o)->f_cands.len, "opt.lxl:1678")))->f_flds.len;
+      for (int64_t v_i_15 = 0LL; v_i_15 < end14; v_i_15++) {
+        int64_t ix16 = p_c;
+        int64_t ix17 = v_i_15;
+        int64_t t18 = ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix16, (*p_o)->f_cands.len, "opt.lxl:1679")))->f_flds.data + rt_idx(ix17, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix16, (*p_o)->f_cands.len, "opt.lxl:1679")))->f_flds.len, "opt.lxl:1679"))->f_dups;
+        bool c19 = (bool)(t18 == rt_add_int(v_j_9, 1LL, "opt.lxl:1679"));
+        if (c19) {
+          int64_t ix20 = p_c;
+          int64_t ix21 = v_i_15;
+          int64_t v_fl_22 = ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix20, (*p_o)->f_cands.len, "opt.lxl:1680")))->f_flds.data + rt_idx(ix21, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix20, (*p_o)->f_cands.len, "opt.lxl:1680")))->f_flds.len, "opt.lxl:1680"))->f_loc;
+          int64_t ix23 = v_ei_11;
+          int64_t v_ev_24 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix23, (*p_o)->f_u->f_nodes.len, "opt.lxl:1681"))->f_a;
+          int64_t t25 = f849_opt_Opt_mk1(p_o, 40LL, 0LL, v_fl_22, v_ev_24, -1LL);
+          int64_t ap26 = t25;
+          *(int64_t*)rt_arr_push(p_out, 8ULL) = ap26;
+        }
       }
-      int64_t t37 = v_f_27.f_loc;
-      int64_t t38 = f869_opt_Opt_rebase(p_o, v_f_27.f_tmpl, v_b_29);
-      int64_t t39 = f849_opt_Opt_mk1(p_o, 40LL, 0LL, t37, t38, -1LL);
-      int64_t ap40 = t39;
-      *(int64_t*)rt_arr_push(p_out, 8ULL) = ap40;
+    }
+    int64_t ix27 = p_c;
+    int64_t end28 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix27, (*p_o)->f_cands.len, "opt.lxl:1686")))->f_flds.len;
+    for (int64_t v_i_29 = 0LL; v_i_29 < end28; v_i_29++) {
+      int64_t ix30 = p_c;
+      int64_t ix31 = v_i_29;
+      bool c32 = (bool)(((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix30, (*p_o)->f_cands.len, "opt.lxl:1687")))->f_flds.data + rt_idx(ix31, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix30, (*p_o)->f_cands.len, "opt.lxl:1687")))->f_flds.len, "opt.lxl:1687"))->f_dups == 0LL);
+      if (c32) {
+        int64_t ix33 = p_c;
+        int64_t ix34 = v_i_29;
+        int64_t v_fl_35 = ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix33, (*p_o)->f_cands.len, "opt.lxl:1688")))->f_flds.data + rt_idx(ix34, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix33, (*p_o)->f_cands.len, "opt.lxl:1688")))->f_flds.len, "opt.lxl:1688"))->f_loc;
+        int64_t t36 = f849_opt_Opt_mk1(p_o, 40LL, 0LL, v_fl_35, -1LL, -1LL);
+        int64_t ap37 = t36;
+        *(int64_t*)rt_arr_push(p_out, 8ULL) = ap37;
+      }
+    }
+    return;
+  }
+  int64_t ix38 = p_x;
+  int64_t v_e_39 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix38, (*p_o)->f_u->f_nodes.len, "opt.lxl:1694"))->f_b;
+  f856_opt_Opt_sr(p_o, v_e_39);
+  int64_t v_base_40 = -1LL;
+  int64_t v_q_41 = -1LL;
+  bool t42 = f867_opt_Opt_cheap(p_o, v_e_39);
+  bool c43 = (bool)!t42;
+  if (c43) {
+    int64_t ix44 = v_e_39;
+    int64_t t45 = f632_ir_Ir_ptrTo(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix44, (*p_o)->f_u->f_nodes.len, "opt.lxl:1699"))->f_ty);
+    int64_t v_pt_46 = t45;
+    int64_t ix47 = p_c;
+    int64_t ix48 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix47, (*p_o)->f_cands.len, "opt.lxl:1700")))->f_l;
+    lxl_str t49 = rt_str_dup(((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix48, (*p_o)->f_u->f_locals.len, "opt.lxl:1700"))->f_name);
+    lxl_str v_name_50 = t49;
+    int64_t t51 = f839_opt_Opt_local(p_o, v_name_50, v_pt_46, (bool)0LL);
+    v_q_41 = t51;
+    int64_t t52 = f82_ir_Ir_nk(&(*p_o)->f_u, v_e_39);
+    int64_t ifx53;
+    if (t52 == 9LL) {
+      int64_t ix54 = v_e_39;
+      ifx53 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix54, (*p_o)->f_u->f_nodes.len, "opt.lxl:1702"))->f_a;
+    } else {
+      int64_t t55 = f849_opt_Opt_mk1(p_o, 10LL, v_pt_46, v_e_39, -1LL, -1LL);
+      ifx53 = t55;
+    }
+    int64_t v_addr_56 = ifx53;
+    int64_t t57 = f849_opt_Opt_mk1(p_o, 40LL, 0LL, v_q_41, v_addr_56, -1LL);
+    int64_t ap58 = t57;
+    *(int64_t*)rt_arr_push(p_out, 8ULL) = ap58;
+    rt_str_drop(v_name_50);
+  }
+  int64_t ix59 = p_c;
+  int64_t end60 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix59, (*p_o)->f_cands.len, "opt.lxl:1705")))->f_flds.len;
+  for (int64_t v_i_61 = 0LL; v_i_61 < end60; v_i_61++) {
+    int64_t ix62 = p_c;
+    int64_t ix63 = v_i_61;
+    struct S84_opt_Fld v_f_64 = *((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix62, (*p_o)->f_cands.len, "opt.lxl:1706")))->f_flds.data + rt_idx(ix63, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix62, (*p_o)->f_cands.len, "opt.lxl:1706")))->f_flds.len, "opt.lxl:1706"));
+    bool c65 = (bool)(v_f_64.f_loc >= 0LL);
+    if (c65) {
+      int64_t v_b_66 = -1LL;
+      bool c67 = (bool)(v_q_41 >= 0LL);
+      if (c67) {
+        int64_t ix68 = v_q_41;
+        int64_t t69 = f849_opt_Opt_mk1(p_o, 4LL, ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix68, (*p_o)->f_u->f_locals.len, "opt.lxl:1710"))->f_ty, v_q_41, -1LL, -1LL);
+        int64_t v_ql_70 = t69;
+        int64_t ix71 = v_e_39;
+        int64_t t72 = f849_opt_Opt_mk1(p_o, 9LL, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix71, (*p_o)->f_u->f_nodes.len, "opt.lxl:1711"))->f_ty, v_ql_70, -1LL, -1LL);
+        v_b_66 = t72;
+      } else {
+        int64_t t73 = f868_opt_Opt_copyTree(p_o, v_e_39);
+        v_b_66 = t73;
+      }
+      int64_t t74 = v_f_64.f_loc;
+      int64_t t75 = f869_opt_Opt_rebase(p_o, v_f_64.f_tmpl, v_b_66);
+      int64_t t76 = f849_opt_Opt_mk1(p_o, 40LL, 0LL, t74, t75, -1LL);
+      int64_t ap77 = t76;
+      *(int64_t*)rt_arr_push(p_out, 8ULL) = ap77;
     }
   }
 }
@@ -76757,24 +76814,24 @@ static int64_t f869_opt_Opt_rebase(struct S82_opt_Opt**p_o, int64_t p_x, int64_t
     return r3;
   }
   int64_t ix4 = p_x;
-  int64_t t5 = f869_opt_Opt_rebase(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1470"))->f_a, p_base);
+  int64_t t5 = f869_opt_Opt_rebase(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1554"))->f_a, p_base);
   int64_t v_inner_6 = t5;
   int64_t ix7 = p_x;
-  struct S32_ir_Node ap8 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:1471"));
+  struct S32_ir_Node ap8 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:1555"));
   *(struct S32_ir_Node*)rt_arr_push(&(*p_o)->f_u->f_nodes, 64ULL) = ap8;
-  int64_t v_y_9 = rt_sub_int((*p_o)->f_u->f_nodes.len, 1LL, "opt.lxl:1472");
+  int64_t v_y_9 = rt_sub_int((*p_o)->f_u->f_nodes.len, 1LL, "opt.lxl:1556");
   int64_t ix10 = v_y_9;
-  ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:1473"))->f_a = v_inner_6;
+  ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:1557"))->f_a = v_inner_6;
   int64_t r11 = v_y_9;
   return r11;
 }
 static int64_t f868_opt_Opt_copyTree(struct S82_opt_Opt**p_o, int64_t p_x) {
   int64_t ix1 = p_x;
-  struct S32_ir_Node ap2 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:1479"));
+  struct S32_ir_Node ap2 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:1563"));
   *(struct S32_ir_Node*)rt_arr_push(&(*p_o)->f_u->f_nodes, 64ULL) = ap2;
-  int64_t v_y_3 = rt_sub_int((*p_o)->f_u->f_nodes.len, 1LL, "opt.lxl:1480");
+  int64_t v_y_3 = rt_sub_int((*p_o)->f_u->f_nodes.len, 1LL, "opt.lxl:1564");
   int64_t ix4 = p_x;
-  int64_t v_k_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1481"))->f_k;
+  int64_t v_k_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1565"))->f_k;
   bool b6 = (bool)(v_k_5 == 8LL);
   if (!b6) {
     b6 = (bool)(v_k_5 == 9LL);
@@ -76782,9 +76839,9 @@ static int64_t f868_opt_Opt_copyTree(struct S82_opt_Opt**p_o, int64_t p_x) {
   bool c7 = b6;
   if (c7) {
     int64_t ix8 = p_x;
-    int64_t t9 = f868_opt_Opt_copyTree(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix8, (*p_o)->f_u->f_nodes.len, "opt.lxl:1482"))->f_a);
+    int64_t t9 = f868_opt_Opt_copyTree(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix8, (*p_o)->f_u->f_nodes.len, "opt.lxl:1566"))->f_a);
     int64_t ix10 = v_y_3;
-    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:1482"))->f_a = t9;
+    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:1566"))->f_a = t9;
   }
   int64_t r11 = v_y_3;
   return r11;
@@ -76798,7 +76855,7 @@ static bool f867_opt_Opt_cheap(struct S82_opt_Opt**p_o, int64_t p_x) {
       break;
     }
     int64_t ix4 = v_r_1;
-    v_r_1 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1461"))->f_a;
+    v_r_1 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1545"))->f_a;
   }
   int64_t t5 = f82_ir_Ir_nk(&(*p_o)->f_u, v_r_1);
   int64_t v_k_6 = t5;
@@ -76814,7 +76871,7 @@ static bool f867_opt_Opt_cheap(struct S82_opt_Opt**p_o, int64_t p_x) {
   bool b10 = (bool)(v_k_6 == 9LL);
   if (b10) {
     int64_t ix11 = v_r_1;
-    int64_t t12 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix11, (*p_o)->f_u->f_nodes.len, "opt.lxl:1464"))->f_a);
+    int64_t t12 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix11, (*p_o)->f_u->f_nodes.len, "opt.lxl:1548"))->f_a);
     b10 = (bool)(t12 == 4LL);
   }
   bool r13 = b10;
@@ -76822,217 +76879,328 @@ static bool f867_opt_Opt_cheap(struct S82_opt_Opt**p_o, int64_t p_x) {
 }
 static bool f855_opt_Opt_settle(struct S82_opt_Opt**p_o, int64_t p_c) {
   int64_t ix1 = p_c;
-  bool c2 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix1, (*p_o)->f_cands.len, "opt.lxl:1390")))->f_bad;
+  bool c2 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix1, (*p_o)->f_cands.len, "opt.lxl:1434")))->f_bad;
   if (c2) {
     bool r3 = (bool)0LL;
     return r3;
   }
   int64_t ix4 = p_c;
-  int64_t v_n_5 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix4, (*p_o)->f_cands.len, "opt.lxl:1391")))->f_flds.len;
-  int64_t end6 = v_n_5;
-  for (int64_t v_i_7 = 0LL; v_i_7 < end6; v_i_7++) {
+  int64_t v_n_5 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix4, (*p_o)->f_cands.len, "opt.lxl:1435")))->f_flds.len;
+  int64_t ix6 = p_c;
+  bool c7 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix6, (*p_o)->f_cands.len, "opt.lxl:1436")))->f_fresh;
+  if (c7) {
     int64_t ix8 = p_c;
-    int64_t ix9 = v_i_7;
-    struct S84_opt_Fld v_fi_10 = *((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix8, (*p_o)->f_cands.len, "opt.lxl:1393")))->f_flds.data + rt_idx(ix9, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix8, (*p_o)->f_cands.len, "opt.lxl:1393")))->f_flds.len, "opt.lxl:1393"));
-    int64_t t11 = v_fi_10.f_off;
-    int64_t t12 = f106_ir_Ir_sizeOf(&(*p_o)->f_u, v_fi_10.f_ty);
-    int64_t v_ei_13 = rt_add_int(t11, t12, "opt.lxl:1394");
-    int64_t end14 = v_n_5;
-    for (int64_t v_j_15 = 0LL; v_j_15 < end14; v_j_15++) {
-      int64_t ix16 = p_c;
-      int64_t ix17 = v_j_15;
-      struct S84_opt_Fld v_fj_18 = *((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix16, (*p_o)->f_cands.len, "opt.lxl:1396")))->f_flds.data + rt_idx(ix17, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix16, (*p_o)->f_cands.len, "opt.lxl:1396")))->f_flds.len, "opt.lxl:1396"));
-      int64_t t19 = v_fj_18.f_off;
-      int64_t t20 = f106_ir_Ir_sizeOf(&(*p_o)->f_u, v_fj_18.f_ty);
-      int64_t v_ej_21 = rt_add_int(t19, t20, "opt.lxl:1397");
-      bool b22 = (bool)(v_i_7 == v_j_15);
-      if (!b22) {
-        bool b23 = (bool)(v_fi_10.f_off < v_ej_21);
-        if (b23) {
-          b23 = (bool)(v_fj_18.f_off < v_ei_13);
+    int64_t v_ents_9 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix8, (*p_o)->f_cands.len, "opt.lxl:1438")))->f_init;
+    bool c10 = (bool)(v_ents_9 >= 0LL);
+    if (c10) {
+      int64_t v_used_11 = v_n_5;
+      int64_t ix12 = v_ents_9;
+      int64_t end13 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix12, (*p_o)->f_u->f_items.len, "opt.lxl:1441"));
+      for (int64_t v_j_14 = 0LL; v_j_14 < end13; v_j_14++) {
+        int64_t ix15 = rt_add_int(rt_add_int(v_ents_9, 1LL, "opt.lxl:1442"), v_j_14, "opt.lxl:1442");
+        int64_t ix16 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix15, (*p_o)->f_u->f_items.len, "opt.lxl:1442"));
+        struct S32_ir_Node v_en_17 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix16, (*p_o)->f_u->f_nodes.len, "opt.lxl:1442"));
+        int64_t v_have_18 = -1LL;
+        int64_t ix19 = p_c;
+        int64_t end20 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix19, (*p_o)->f_cands.len, "opt.lxl:1444")))->f_flds.len;
+        for (int64_t v_i_21 = 0LL; v_i_21 < end20; v_i_21++) {
+          int64_t ix22 = p_c;
+          int64_t ix23 = v_i_21;
+          bool b24 = (bool)(((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix22, (*p_o)->f_cands.len, "opt.lxl:1445")))->f_flds.data + rt_idx(ix23, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix22, (*p_o)->f_cands.len, "opt.lxl:1445")))->f_flds.len, "opt.lxl:1445"))->f_off == v_en_17.f_v);
+          if (b24) {
+            int64_t ix25 = p_c;
+            int64_t ix26 = v_i_21;
+            b24 = (bool)(((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix25, (*p_o)->f_cands.len, "opt.lxl:1445")))->f_flds.data + rt_idx(ix26, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix25, (*p_o)->f_cands.len, "opt.lxl:1445")))->f_flds.len, "opt.lxl:1445"))->f_ty == v_en_17.f_ty);
+          }
+          bool c27 = b24;
+          if (c27) {
+            v_have_18 = v_i_21;
+          }
         }
-        b22 = (bool)!b23;
+        bool c28 = (bool)(v_have_18 < 0LL);
+        if (c28) {
+          int64_t ix29 = p_c;
+          struct S84_opt_Fld t30 = (struct S84_opt_Fld){.f_off = v_en_17.f_v, .f_ty = v_en_17.f_ty, .f_tmpl = -1LL, .f_read = (bool)0LL, .f_dups = 0LL, .f_drops = 0LL, .f_away = (bool)0LL, .f_loc = -1LL, .f_outer = -1LL};
+          struct S84_opt_Fld ap31 = t30;
+          *(struct S84_opt_Fld*)rt_arr_push(&(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix29, (*p_o)->f_cands.len, "opt.lxl:1448")))->f_flds, 72ULL) = ap31;
+          int64_t ix32 = p_c;
+          v_have_18 = rt_sub_int((*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix32, (*p_o)->f_cands.len, "opt.lxl:1449")))->f_flds.len, 1LL, "opt.lxl:1449");
+        }
+        int64_t t33 = rt_add_int(v_j_14, 1LL, "opt.lxl:1451");
+        int64_t ix34 = p_c;
+        int64_t ix35 = v_have_18;
+        ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix34, (*p_o)->f_cands.len, "opt.lxl:1451")))->f_flds.data + rt_idx(ix35, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix34, (*p_o)->f_cands.len, "opt.lxl:1451")))->f_flds.len, "opt.lxl:1451"))->f_dups = t33;
       }
-      bool c24 = b22;
-      if (c24) {
+      int64_t end36 = v_used_11;
+      for (int64_t v_i_37 = 0LL; v_i_37 < end36; v_i_37++) {
+        int64_t ix38 = p_c;
+        int64_t ix39 = v_i_37;
+        bool c40 = (bool)(((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix38, (*p_o)->f_cands.len, "opt.lxl:1454")))->f_flds.data + rt_idx(ix39, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix38, (*p_o)->f_cands.len, "opt.lxl:1454")))->f_flds.len, "opt.lxl:1454"))->f_dups == 0LL);
+        if (c40) {
+          int64_t ix41 = p_c;
+          (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix41, (*p_o)->f_cands.len, "opt.lxl:1455")))->f_bad = (bool)1LL;
+          bool r42 = (bool)0LL;
+          return r42;
+        }
+      }
+    }
+    int64_t ix43 = p_c;
+    int64_t v_nf_44 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix43, (*p_o)->f_cands.len, "opt.lxl:1460")))->f_flds.len;
+    bool c45 = (bool)(v_nf_44 == 0LL);
+    if (c45) {
+      bool r46 = (bool)0LL;
+      return r46;
+    }
+    int64_t end47 = v_nf_44;
+    for (int64_t v_i_48 = 0LL; v_i_48 < end47; v_i_48++) {
+      int64_t ix49 = p_c;
+      int64_t ix50 = v_i_48;
+      struct S84_opt_Fld v_fi_51 = *((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix49, (*p_o)->f_cands.len, "opt.lxl:1463")))->f_flds.data + rt_idx(ix50, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix49, (*p_o)->f_cands.len, "opt.lxl:1463")))->f_flds.len, "opt.lxl:1463"));
+      int64_t end52 = v_nf_44;
+      for (int64_t v_j_53 = rt_add_int(v_i_48, 1LL, "opt.lxl:1464"); v_j_53 < end52; v_j_53++) {
+        int64_t ix54 = p_c;
+        int64_t ix55 = v_j_53;
+        struct S84_opt_Fld v_fj_56 = *((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix54, (*p_o)->f_cands.len, "opt.lxl:1465")))->f_flds.data + rt_idx(ix55, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix54, (*p_o)->f_cands.len, "opt.lxl:1465")))->f_flds.len, "opt.lxl:1465"));
+        int64_t t57 = v_fi_51.f_off;
+        int64_t t58 = v_fj_56.f_off;
+        int64_t t59 = f106_ir_Ir_sizeOf(&(*p_o)->f_u, v_fj_56.f_ty);
+        bool b60 = (bool)(t57 < rt_add_int(t58, t59, "opt.lxl:1466"));
+        if (b60) {
+          int64_t t61 = v_fj_56.f_off;
+          int64_t t62 = v_fi_51.f_off;
+          int64_t t63 = f106_ir_Ir_sizeOf(&(*p_o)->f_u, v_fi_51.f_ty);
+          b60 = (bool)(t61 < rt_add_int(t62, t63, "opt.lxl:1466"));
+        }
+        bool c64 = b60;
+        if (c64) {
+          int64_t ix65 = p_c;
+          (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix65, (*p_o)->f_cands.len, "opt.lxl:1467")))->f_bad = (bool)1LL;
+          bool r66 = (bool)0LL;
+          return r66;
+        }
+      }
+    }
+    int64_t ix67 = p_c;
+    int64_t ix68 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix67, (*p_o)->f_cands.len, "opt.lxl:1472")))->f_l;
+    lxl_str t69 = rt_str_dup(((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix68, (*p_o)->f_u->f_locals.len, "opt.lxl:1472"))->f_name);
+    lxl_str v_fname_70 = t69;
+    int64_t end71 = v_nf_44;
+    for (int64_t v_i_72 = 0LL; v_i_72 < end71; v_i_72++) {
+      int64_t ix73 = p_c;
+      int64_t ix74 = v_i_72;
+      int64_t t75 = f839_opt_Opt_local(p_o, v_fname_70, ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix73, (*p_o)->f_cands.len, "opt.lxl:1473")))->f_flds.data + rt_idx(ix74, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix73, (*p_o)->f_cands.len, "opt.lxl:1473")))->f_flds.len, "opt.lxl:1473"))->f_ty, (bool)0LL);
+      int64_t ix76 = p_c;
+      int64_t ix77 = v_i_72;
+      ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix76, (*p_o)->f_cands.len, "opt.lxl:1473")))->f_flds.data + rt_idx(ix77, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix76, (*p_o)->f_cands.len, "opt.lxl:1473")))->f_flds.len, "opt.lxl:1473"))->f_loc = t75;
+    }
+    bool r78 = (bool)1LL;
+    rt_str_drop(v_fname_70);
+    return r78;
+  }
+  int64_t end79 = v_n_5;
+  for (int64_t v_i_80 = 0LL; v_i_80 < end79; v_i_80++) {
+    int64_t ix81 = p_c;
+    int64_t ix82 = v_i_80;
+    struct S84_opt_Fld v_fi_83 = *((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix81, (*p_o)->f_cands.len, "opt.lxl:1477")))->f_flds.data + rt_idx(ix82, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix81, (*p_o)->f_cands.len, "opt.lxl:1477")))->f_flds.len, "opt.lxl:1477"));
+    int64_t t84 = v_fi_83.f_off;
+    int64_t t85 = f106_ir_Ir_sizeOf(&(*p_o)->f_u, v_fi_83.f_ty);
+    int64_t v_ei_86 = rt_add_int(t84, t85, "opt.lxl:1478");
+    int64_t end87 = v_n_5;
+    for (int64_t v_j_88 = 0LL; v_j_88 < end87; v_j_88++) {
+      int64_t ix89 = p_c;
+      int64_t ix90 = v_j_88;
+      struct S84_opt_Fld v_fj_91 = *((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix89, (*p_o)->f_cands.len, "opt.lxl:1480")))->f_flds.data + rt_idx(ix90, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix89, (*p_o)->f_cands.len, "opt.lxl:1480")))->f_flds.len, "opt.lxl:1480"));
+      int64_t t92 = v_fj_91.f_off;
+      int64_t t93 = f106_ir_Ir_sizeOf(&(*p_o)->f_u, v_fj_91.f_ty);
+      int64_t v_ej_94 = rt_add_int(t92, t93, "opt.lxl:1481");
+      bool b95 = (bool)(v_i_80 == v_j_88);
+      if (!b95) {
+        bool b96 = (bool)(v_fi_83.f_off < v_ej_94);
+        if (b96) {
+          b96 = (bool)(v_fj_91.f_off < v_ei_86);
+        }
+        b95 = (bool)!b96;
+      }
+      bool c97 = b95;
+      if (c97) {
         continue;
       }
-      bool b25 = (bool)(v_fj_18.f_off <= v_fi_10.f_off);
-      if (b25) {
-        b25 = (bool)(v_ei_13 <= v_ej_21);
+      bool b98 = (bool)(v_fj_91.f_off <= v_fi_83.f_off);
+      if (b98) {
+        b98 = (bool)(v_ei_86 <= v_ej_94);
       }
-      bool b26 = b25;
-      if (b26) {
-        int64_t t27 = f87_ir_Ir_tk(&(*p_o)->f_u, v_fj_18.f_ty);
-        b26 = (bool)(t27 == 15LL);
+      bool b99 = b98;
+      if (b99) {
+        int64_t t100 = f87_ir_Ir_tk(&(*p_o)->f_u, v_fj_91.f_ty);
+        b99 = (bool)(t100 == 15LL);
       }
-      bool b28 = b26;
-      if (b28) {
-        int64_t ix29 = v_fj_18.f_ty;
-        int64_t ix30 = ((struct S33_ir_Ty*)(*p_o)->f_u->f_tys.data + rt_idx(ix29, (*p_o)->f_u->f_tys.len, "opt.lxl:1401"))->f_sid;
-        b28 = (bool)!(*((struct S30_ir_Struct**)(*p_o)->f_u->f_structs.data + rt_idx(ix30, (*p_o)->f_u->f_structs.len, "opt.lxl:1401")))->f_isUnion;
+      bool b101 = b99;
+      if (b101) {
+        int64_t ix102 = v_fj_91.f_ty;
+        int64_t ix103 = ((struct S33_ir_Ty*)(*p_o)->f_u->f_tys.data + rt_idx(ix102, (*p_o)->f_u->f_tys.len, "opt.lxl:1485"))->f_sid;
+        b101 = (bool)!(*((struct S30_ir_Struct**)(*p_o)->f_u->f_structs.data + rt_idx(ix103, (*p_o)->f_u->f_structs.len, "opt.lxl:1485")))->f_isUnion;
       }
-      bool b31 = b28;
-      if (b31) {
-        int64_t t32 = rt_sub_int(v_ej_21, v_fj_18.f_off, "opt.lxl:1401");
-        bool b33 = (bool)(t32 > rt_sub_int(v_ei_13, v_fi_10.f_off, "opt.lxl:1401"));
-        if (!b33) {
-          int64_t t34 = f87_ir_Ir_tk(&(*p_o)->f_u, v_fi_10.f_ty);
-          b33 = (bool)(t34 != 15LL);
+      bool b104 = b101;
+      if (b104) {
+        int64_t t105 = rt_sub_int(v_ej_94, v_fj_91.f_off, "opt.lxl:1485");
+        bool b106 = (bool)(t105 > rt_sub_int(v_ei_86, v_fi_83.f_off, "opt.lxl:1485"));
+        if (!b106) {
+          int64_t t107 = f87_ir_Ir_tk(&(*p_o)->f_u, v_fi_83.f_ty);
+          b106 = (bool)(t107 != 15LL);
         }
-        b31 = b33;
+        b104 = b106;
       }
-      bool v_inside_35 = b31;
-      int64_t t36 = f87_ir_Ir_tk(&(*p_o)->f_u, v_fi_10.f_ty);
-      int64_t v_fk_37 = t36;
-      bool b38 = v_inside_35;
-      if (b38) {
-        bool b39 = (bool)(v_fk_37 >= 1LL);
-        if (b39) {
-          b39 = (bool)(v_fk_37 <= 9LL);
+      bool v_inside_108 = b104;
+      int64_t t109 = f87_ir_Ir_tk(&(*p_o)->f_u, v_fi_83.f_ty);
+      int64_t v_fk_110 = t109;
+      bool b111 = v_inside_108;
+      if (b111) {
+        bool b112 = (bool)(v_fk_110 >= 1LL);
+        if (b112) {
+          b112 = (bool)(v_fk_110 <= 9LL);
         }
-        bool b40 = b39;
-        if (!b40) {
-          b40 = (bool)(v_fk_37 == 12LL);
+        bool b113 = b112;
+        if (!b113) {
+          b113 = (bool)(v_fk_110 == 12LL);
         }
-        b38 = b40;
+        b111 = b113;
       }
-      bool c41 = b38;
-      if (c41) {
+      bool c114 = b111;
+      if (c114) {
         continue;
       }
-      bool c42 = v_inside_35;
-      if (c42) {
-        int64_t ix43 = p_c;
-        int64_t ix44 = v_i_7;
-        int64_t v_q_45 = ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix43, (*p_o)->f_cands.len, "opt.lxl:1408")))->f_flds.data + rt_idx(ix44, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix43, (*p_o)->f_cands.len, "opt.lxl:1408")))->f_flds.len, "opt.lxl:1408"))->f_outer;
-        bool b46 = (bool)(v_q_45 < 0LL);
-        if (!b46) {
-          int64_t ix47 = p_c;
-          int64_t ix48 = v_q_45;
-          int64_t t49 = f106_ir_Ir_sizeOf(&(*p_o)->f_u, ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix47, (*p_o)->f_cands.len, "opt.lxl:1409")))->f_flds.data + rt_idx(ix48, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix47, (*p_o)->f_cands.len, "opt.lxl:1409")))->f_flds.len, "opt.lxl:1409"))->f_ty);
-          b46 = (bool)(t49 < rt_sub_int(v_ej_21, v_fj_18.f_off, "opt.lxl:1409"));
+      bool c115 = v_inside_108;
+      if (c115) {
+        int64_t ix116 = p_c;
+        int64_t ix117 = v_i_80;
+        int64_t v_q_118 = ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix116, (*p_o)->f_cands.len, "opt.lxl:1492")))->f_flds.data + rt_idx(ix117, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix116, (*p_o)->f_cands.len, "opt.lxl:1492")))->f_flds.len, "opt.lxl:1492"))->f_outer;
+        bool b119 = (bool)(v_q_118 < 0LL);
+        if (!b119) {
+          int64_t ix120 = p_c;
+          int64_t ix121 = v_q_118;
+          int64_t t122 = f106_ir_Ir_sizeOf(&(*p_o)->f_u, ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix120, (*p_o)->f_cands.len, "opt.lxl:1493")))->f_flds.data + rt_idx(ix121, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix120, (*p_o)->f_cands.len, "opt.lxl:1493")))->f_flds.len, "opt.lxl:1493"))->f_ty);
+          b119 = (bool)(t122 < rt_sub_int(v_ej_94, v_fj_91.f_off, "opt.lxl:1493"));
         }
-        bool c50 = b46;
-        if (c50) {
-          int64_t ix51 = p_c;
-          int64_t ix52 = v_i_7;
-          ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix51, (*p_o)->f_cands.len, "opt.lxl:1409")))->f_flds.data + rt_idx(ix52, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix51, (*p_o)->f_cands.len, "opt.lxl:1409")))->f_flds.len, "opt.lxl:1409"))->f_outer = v_j_15;
+        bool c123 = b119;
+        if (c123) {
+          int64_t ix124 = p_c;
+          int64_t ix125 = v_i_80;
+          ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix124, (*p_o)->f_cands.len, "opt.lxl:1493")))->f_flds.data + rt_idx(ix125, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix124, (*p_o)->f_cands.len, "opt.lxl:1493")))->f_flds.len, "opt.lxl:1493"))->f_outer = v_j_88;
         }
       } else {
-        bool b53 = (bool)(v_fi_10.f_off <= v_fj_18.f_off);
-        if (b53) {
-          b53 = (bool)(v_ej_21 <= v_ei_13);
+        bool b126 = (bool)(v_fi_83.f_off <= v_fj_91.f_off);
+        if (b126) {
+          b126 = (bool)(v_ej_94 <= v_ei_86);
         }
-        bool b54 = (bool)!b53;
-        if (!b54) {
-          bool b55 = (bool)(v_fi_10.f_off == v_fj_18.f_off);
-          if (b55) {
-            b55 = (bool)(v_ei_13 == v_ej_21);
+        bool b127 = (bool)!b126;
+        if (!b127) {
+          bool b128 = (bool)(v_fi_83.f_off == v_fj_91.f_off);
+          if (b128) {
+            b128 = (bool)(v_ei_86 == v_ej_94);
           }
-          b54 = b55;
+          b127 = b128;
         }
-        bool c56 = b54;
-        if (c56) {
-          int64_t ix57 = p_c;
-          (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix57, (*p_o)->f_cands.len, "opt.lxl:1411")))->f_bad = (bool)1LL;
-          bool r58 = (bool)0LL;
-          return r58;
+        bool c129 = b127;
+        if (c129) {
+          int64_t ix130 = p_c;
+          (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix130, (*p_o)->f_cands.len, "opt.lxl:1495")))->f_bad = (bool)1LL;
+          bool r131 = (bool)0LL;
+          return r131;
         }
       }
     }
   }
-  int64_t end59 = v_n_5;
-  for (int64_t v_i_60 = 0LL; v_i_60 < end59; v_i_60++) {
-    int64_t ix61 = p_c;
-    int64_t ix62 = v_i_60;
-    int64_t v_q_63 = ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix61, (*p_o)->f_cands.len, "opt.lxl:1417")))->f_flds.data + rt_idx(ix62, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix61, (*p_o)->f_cands.len, "opt.lxl:1417")))->f_flds.len, "opt.lxl:1417"))->f_outer;
-    bool c64 = (bool)(v_q_63 >= 0LL);
-    if (c64) {
-      int64_t ix65 = p_c;
-      int64_t ix66 = v_i_60;
-      bool b67 = (bool)(((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix65, (*p_o)->f_cands.len, "opt.lxl:1419")))->f_flds.data + rt_idx(ix66, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix65, (*p_o)->f_cands.len, "opt.lxl:1419")))->f_flds.len, "opt.lxl:1419"))->f_dups > 0LL);
-      if (!b67) {
-        int64_t ix68 = p_c;
-        int64_t ix69 = v_i_60;
-        b67 = (bool)(((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix68, (*p_o)->f_cands.len, "opt.lxl:1419")))->f_flds.data + rt_idx(ix69, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix68, (*p_o)->f_cands.len, "opt.lxl:1419")))->f_flds.len, "opt.lxl:1419"))->f_drops > 0LL);
+  int64_t end132 = v_n_5;
+  for (int64_t v_i_133 = 0LL; v_i_133 < end132; v_i_133++) {
+    int64_t ix134 = p_c;
+    int64_t ix135 = v_i_133;
+    int64_t v_q_136 = ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix134, (*p_o)->f_cands.len, "opt.lxl:1501")))->f_flds.data + rt_idx(ix135, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix134, (*p_o)->f_cands.len, "opt.lxl:1501")))->f_flds.len, "opt.lxl:1501"))->f_outer;
+    bool c137 = (bool)(v_q_136 >= 0LL);
+    if (c137) {
+      int64_t ix138 = p_c;
+      int64_t ix139 = v_i_133;
+      bool b140 = (bool)(((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix138, (*p_o)->f_cands.len, "opt.lxl:1503")))->f_flds.data + rt_idx(ix139, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix138, (*p_o)->f_cands.len, "opt.lxl:1503")))->f_flds.len, "opt.lxl:1503"))->f_dups > 0LL);
+      if (!b140) {
+        int64_t ix141 = p_c;
+        int64_t ix142 = v_i_133;
+        b140 = (bool)(((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix141, (*p_o)->f_cands.len, "opt.lxl:1503")))->f_flds.data + rt_idx(ix142, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix141, (*p_o)->f_cands.len, "opt.lxl:1503")))->f_flds.len, "opt.lxl:1503"))->f_drops > 0LL);
       }
-      bool c70 = b67;
-      if (c70) {
-        int64_t ix71 = p_c;
-        (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix71, (*p_o)->f_cands.len, "opt.lxl:1420")))->f_bad = (bool)1LL;
-        bool r72 = (bool)0LL;
-        return r72;
+      bool c143 = b140;
+      if (c143) {
+        int64_t ix144 = p_c;
+        (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix144, (*p_o)->f_cands.len, "opt.lxl:1504")))->f_bad = (bool)1LL;
+        bool r145 = (bool)0LL;
+        return r145;
       }
-      int64_t ix73 = p_c;
-      int64_t ix74 = v_q_63;
-      ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix73, (*p_o)->f_cands.len, "opt.lxl:1423")))->f_flds.data + rt_idx(ix74, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix73, (*p_o)->f_cands.len, "opt.lxl:1423")))->f_flds.len, "opt.lxl:1423"))->f_read = (bool)1LL;
+      int64_t ix146 = p_c;
+      int64_t ix147 = v_q_136;
+      ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix146, (*p_o)->f_cands.len, "opt.lxl:1507")))->f_flds.data + rt_idx(ix147, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix146, (*p_o)->f_cands.len, "opt.lxl:1507")))->f_flds.len, "opt.lxl:1507"))->f_read = (bool)1LL;
     }
   }
-  bool v_saves_75 = (bool)0LL;
-  int64_t ix76 = p_c;
-  lxl_slice ap77 = rt_as_slice(&(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix76, (*p_o)->f_cands.len, "opt.lxl:1428")))->f_flds);
-  for (int64_t i78 = 0LL; i78 < ap77.len; i78++) {
-    struct S84_opt_Fld v_f_79 = *((struct S84_opt_Fld*)ap77.data + i78);
-    bool b80 = (bool)!v_f_79.f_read;
-    if (b80) {
-      b80 = (bool)(v_f_79.f_dups == 1LL);
+  bool v_saves_148 = (bool)0LL;
+  int64_t ix149 = p_c;
+  lxl_slice ap150 = rt_as_slice(&(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix149, (*p_o)->f_cands.len, "opt.lxl:1512")))->f_flds);
+  for (int64_t i151 = 0LL; i151 < ap150.len; i151++) {
+    struct S84_opt_Fld v_f_152 = *((struct S84_opt_Fld*)ap150.data + i151);
+    bool b153 = (bool)!v_f_152.f_read;
+    if (b153) {
+      b153 = (bool)(v_f_152.f_dups == 1LL);
     }
-    bool b81 = b80;
-    if (b81) {
-      b81 = (bool)!v_f_79.f_away;
+    bool b154 = b153;
+    if (b154) {
+      b154 = (bool)!v_f_152.f_away;
     }
-    bool c82 = b81;
-    if (c82) {
-      v_saves_75 = (bool)1LL;
+    bool c155 = b154;
+    if (c155) {
+      v_saves_148 = (bool)1LL;
     }
   }
-  bool b83 = (bool)!v_saves_75;
-  if (b83) {
-    int64_t ix84 = p_c;
-    int64_t ix85 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix84, (*p_o)->f_cands.len, "opt.lxl:1431")))->f_decl;
-    int64_t t86 = f822_opt_Opt_root(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix85, (*p_o)->f_u->f_nodes.len, "opt.lxl:1431"))->f_b);
-    b83 = (bool)(t86 >= 0LL);
+  bool b156 = (bool)!v_saves_148;
+  if (b156) {
+    int64_t ix157 = p_c;
+    int64_t ix158 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix157, (*p_o)->f_cands.len, "opt.lxl:1515")))->f_decl;
+    int64_t t159 = f822_opt_Opt_root(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix158, (*p_o)->f_u->f_nodes.len, "opt.lxl:1515"))->f_b);
+    b156 = (bool)(t159 >= 0LL);
   }
-  bool c87 = b83;
-  if (c87) {
-    int64_t ix88 = p_c;
-    (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix88, (*p_o)->f_cands.len, "opt.lxl:1432")))->f_bad = (bool)1LL;
-    bool r89 = (bool)0LL;
-    return r89;
+  bool c160 = b156;
+  if (c160) {
+    int64_t ix161 = p_c;
+    (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix161, (*p_o)->f_cands.len, "opt.lxl:1516")))->f_bad = (bool)1LL;
+    bool r162 = (bool)0LL;
+    return r162;
   }
-  int64_t ix90 = p_c;
-  int64_t ix91 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix90, (*p_o)->f_cands.len, "opt.lxl:1435")))->f_l;
-  lxl_str t92 = rt_str_dup(((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix91, (*p_o)->f_u->f_locals.len, "opt.lxl:1435"))->f_name);
-  lxl_str v_name_93 = t92;
-  int64_t end94 = v_n_5;
-  for (int64_t v_i_95 = 0LL; v_i_95 < end94; v_i_95++) {
-    int64_t ix96 = p_c;
-    int64_t ix97 = v_i_95;
-    struct S84_opt_Fld v_f_98 = *((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix96, (*p_o)->f_cands.len, "opt.lxl:1437")))->f_flds.data + rt_idx(ix97, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix96, (*p_o)->f_cands.len, "opt.lxl:1437")))->f_flds.len, "opt.lxl:1437"));
-    bool b99 = (bool)(v_f_98.f_outer < 0LL);
-    if (b99) {
-      bool b100 = v_f_98.f_read;
-      if (!b100) {
-        b100 = (bool)(v_f_98.f_dups != 1LL);
+  int64_t ix163 = p_c;
+  int64_t ix164 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix163, (*p_o)->f_cands.len, "opt.lxl:1519")))->f_l;
+  lxl_str t165 = rt_str_dup(((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix164, (*p_o)->f_u->f_locals.len, "opt.lxl:1519"))->f_name);
+  lxl_str v_name_166 = t165;
+  int64_t end167 = v_n_5;
+  for (int64_t v_i_168 = 0LL; v_i_168 < end167; v_i_168++) {
+    int64_t ix169 = p_c;
+    int64_t ix170 = v_i_168;
+    struct S84_opt_Fld v_f_171 = *((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix169, (*p_o)->f_cands.len, "opt.lxl:1521")))->f_flds.data + rt_idx(ix170, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix169, (*p_o)->f_cands.len, "opt.lxl:1521")))->f_flds.len, "opt.lxl:1521"));
+    bool b172 = (bool)(v_f_171.f_outer < 0LL);
+    if (b172) {
+      bool b173 = v_f_171.f_read;
+      if (!b173) {
+        b173 = (bool)(v_f_171.f_dups != 1LL);
       }
-      bool b101 = b100;
-      if (!b101) {
-        b101 = v_f_98.f_away;
+      bool b174 = b173;
+      if (!b174) {
+        b174 = v_f_171.f_away;
       }
-      b99 = b101;
+      b172 = b174;
     }
-    bool c102 = b99;
-    if (c102) {
-      int64_t t103 = f839_opt_Opt_local(p_o, v_name_93, v_f_98.f_ty, (bool)0LL);
-      int64_t ix104 = p_c;
-      int64_t ix105 = v_i_95;
-      ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix104, (*p_o)->f_cands.len, "opt.lxl:1439")))->f_flds.data + rt_idx(ix105, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix104, (*p_o)->f_cands.len, "opt.lxl:1439")))->f_flds.len, "opt.lxl:1439"))->f_loc = t103;
+    bool c175 = b172;
+    if (c175) {
+      int64_t t176 = f839_opt_Opt_local(p_o, v_name_166, v_f_171.f_ty, (bool)0LL);
+      int64_t ix177 = p_c;
+      int64_t ix178 = v_i_168;
+      ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix177, (*p_o)->f_cands.len, "opt.lxl:1523")))->f_flds.data + rt_idx(ix178, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix177, (*p_o)->f_cands.len, "opt.lxl:1523")))->f_flds.len, "opt.lxl:1523"))->f_loc = t176;
     }
   }
-  bool r106 = (bool)1LL;
-  rt_str_drop(v_name_93);
-  return r106;
+  bool r179 = (bool)1LL;
+  rt_str_drop(v_name_166);
+  return r179;
 }
 static void f854_opt_Opt_sa(struct S82_opt_Opt**p_o, int64_t p_x) {
   bool c1 = (bool)(p_x < 0LL);
@@ -77040,17 +77208,17 @@ static void f854_opt_Opt_sa(struct S82_opt_Opt**p_o, int64_t p_x) {
     return;
   }
   int64_t ix2 = p_x;
-  int64_t v_k_3 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix2, (*p_o)->f_u->f_nodes.len, "opt.lxl:1295"))->f_k;
+  int64_t v_k_3 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix2, (*p_o)->f_u->f_nodes.len, "opt.lxl:1309"))->f_k;
   int64_t ix4 = p_x;
-  int64_t v_a_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1296"))->f_a;
+  int64_t v_a_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1310"))->f_a;
   bool c6 = (bool)(v_k_3 == 48LL);
   if (c6) {
     (*p_o)->f_adj = -1LL;
     int64_t ix7 = v_a_5;
-    int64_t end8 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix7, (*p_o)->f_u->f_items.len, "opt.lxl:1299"));
+    int64_t end8 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix7, (*p_o)->f_u->f_items.len, "opt.lxl:1313"));
     for (int64_t v_j_9 = 0LL; v_j_9 < end8; v_j_9++) {
-      int64_t ix10 = rt_add_int(rt_add_int(v_a_5, 1LL, "opt.lxl:1299"), v_j_9, "opt.lxl:1299");
-      f870_opt_Opt_saItem(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix10, (*p_o)->f_u->f_items.len, "opt.lxl:1299")));
+      int64_t ix10 = rt_add_int(rt_add_int(v_a_5, 1LL, "opt.lxl:1313"), v_j_9, "opt.lxl:1313");
+      f870_opt_Opt_saItem(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix10, (*p_o)->f_u->f_items.len, "opt.lxl:1313")));
     }
     (*p_o)->f_adj = -1LL;
     return;
@@ -77062,7 +77230,7 @@ static void f854_opt_Opt_sa(struct S82_opt_Opt**p_o, int64_t p_x) {
     bool c14 = (bool)(v_c_13 >= 0LL);
     if (c14) {
       int64_t ix15 = v_c_13;
-      (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix15, (*p_o)->f_cands.len, "opt.lxl:1305")))->f_bad = (bool)1LL;
+      (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix15, (*p_o)->f_cands.len, "opt.lxl:1319")))->f_bad = (bool)1LL;
     }
     return;
   }
@@ -77071,273 +77239,435 @@ static void f854_opt_Opt_sa(struct S82_opt_Opt**p_o, int64_t p_x) {
     int64_t t17 = f822_opt_Opt_root(p_o, p_x);
     int64_t t18 = f862_opt_Opt_candOf(p_o, t17);
     int64_t v_c_19 = t18;
-    bool c20 = (bool)(v_c_19 >= 0LL);
-    if (c20) {
-      int64_t t21 = f859_opt_Opt_field(p_o, v_c_19, p_x);
-      int64_t v_i_22 = t21;
-      int64_t ix23 = v_c_19;
-      int64_t ix24 = v_i_22;
-      ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix23, (*p_o)->f_cands.len, "opt.lxl:1312")))->f_flds.data + rt_idx(ix24, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix23, (*p_o)->f_cands.len, "opt.lxl:1312")))->f_flds.len, "opt.lxl:1312"))->f_read = (bool)1LL;
+    bool b20 = (bool)(v_c_19 >= 0LL);
+    if (b20) {
+      int64_t ix21 = v_c_19;
+      int64_t t22 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix21, (*p_o)->f_cands.len, "opt.lxl:1324")))->f_dead;
+      int64_t t23 = f822_opt_Opt_root(p_o, p_x);
+      b20 = (bool)(t22 == t23);
+    }
+    bool c24 = b20;
+    if (c24) {
+      int64_t ix25 = v_c_19;
+      (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix25, (*p_o)->f_cands.len, "opt.lxl:1324")))->f_bad = (bool)1LL;
+    }
+    bool c26 = (bool)(v_c_19 >= 0LL);
+    if (c26) {
+      int64_t t27 = f859_opt_Opt_field(p_o, v_c_19, p_x);
+      int64_t v_i_28 = t27;
+      int64_t ix29 = v_c_19;
+      int64_t ix30 = v_i_28;
+      ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix29, (*p_o)->f_cands.len, "opt.lxl:1327")))->f_flds.data + rt_idx(ix30, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix29, (*p_o)->f_cands.len, "opt.lxl:1327")))->f_flds.len, "opt.lxl:1327"))->f_read = (bool)1LL;
       return;
     }
   } else {
-    bool b25 = (bool)(v_k_3 == 20LL);
-    if (!b25) {
-      b25 = (bool)(v_k_3 == 21LL);
+    bool b31 = (bool)(v_k_3 == 20LL);
+    if (!b31) {
+      b31 = (bool)(v_k_3 == 21LL);
     }
-    bool b26 = b25;
-    if (!b26) {
-      b26 = (bool)(v_k_3 == 10LL);
+    bool b32 = b31;
+    if (!b32) {
+      b32 = (bool)(v_k_3 == 10LL);
     }
-    bool b27 = b26;
-    if (!b27) {
-      b27 = (bool)(v_k_3 == 11LL);
+    bool b33 = b32;
+    if (!b33) {
+      b33 = (bool)(v_k_3 == 11LL);
     }
-    bool c28 = b27;
-    if (c28) {
-      int64_t t29 = f822_opt_Opt_root(p_o, v_a_5);
-      int64_t t30 = f862_opt_Opt_candOf(p_o, t29);
-      int64_t v_c_31 = t30;
-      bool c32 = (bool)(v_c_31 >= 0LL);
-      if (c32) {
-        int64_t ix33 = v_c_31;
-        (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix33, (*p_o)->f_cands.len, "opt.lxl:1317")))->f_bad = (bool)1LL;
+    bool c34 = b33;
+    if (c34) {
+      int64_t t35 = f822_opt_Opt_root(p_o, v_a_5);
+      int64_t t36 = f862_opt_Opt_candOf(p_o, t35);
+      int64_t v_c_37 = t36;
+      bool b38 = (bool)(v_c_37 >= 0LL);
+      if (b38) {
+        int64_t ix39 = v_c_37;
+        bool b40 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix39, (*p_o)->f_cands.len, "opt.lxl:1333")))->f_fresh;
+        if (b40) {
+          b40 = (bool)(v_k_3 != 10LL);
+        }
+        bool b41 = b40;
+        if (b41) {
+          b41 = (bool)(v_k_3 != 11LL);
+        }
+        bool b42 = b41;
+        if (b42) {
+          int64_t t43 = f82_ir_Ir_nk(&(*p_o)->f_u, v_a_5);
+          b42 = (bool)(t43 == 8LL);
+        }
+        b38 = (bool)!b42;
+      }
+      bool c44 = b38;
+      if (c44) {
+        int64_t ix45 = v_c_37;
+        (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix45, (*p_o)->f_cands.len, "opt.lxl:1334")))->f_bad = (bool)1LL;
       }
     }
   }
-  lxl_slice t34 = k2_ir_KIDS;
-  int64_t ix35 = v_k_3;
-  int64_t v_kc_36 = *((int64_t*)t34.data + rt_idx(ix35, t34.len, "opt.lxl:1319"));
-  bool c37 = (bool)(v_kc_36 == 0LL);
-  if (c37) {
+  lxl_slice t46 = k2_ir_KIDS;
+  int64_t ix47 = v_k_3;
+  int64_t v_kc_48 = *((int64_t*)t46.data + rt_idx(ix47, t46.len, "opt.lxl:1337"));
+  bool c49 = (bool)(v_kc_48 == 0LL);
+  if (c49) {
     return;
   }
-  int64_t ix38 = p_x;
-  int64_t v_b_39 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix38, (*p_o)->f_u->f_nodes.len, "opt.lxl:1321"))->f_b;
-  int64_t ix40 = p_x;
-  int64_t v_c_41 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix40, (*p_o)->f_u->f_nodes.len, "opt.lxl:1322"))->f_c;
-  bool b42 = (bool)(v_kc_36 == 1LL);
-  if (!b42) {
-    b42 = (bool)(v_kc_36 == 2LL);
+  int64_t ix50 = p_x;
+  int64_t v_b_51 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix50, (*p_o)->f_u->f_nodes.len, "opt.lxl:1339"))->f_b;
+  int64_t ix52 = p_x;
+  int64_t v_c_53 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix52, (*p_o)->f_u->f_nodes.len, "opt.lxl:1340"))->f_c;
+  bool b54 = (bool)(v_kc_48 == 1LL);
+  if (!b54) {
+    b54 = (bool)(v_kc_48 == 2LL);
   }
-  bool b43 = b42;
-  if (!b43) {
-    b43 = (bool)(v_kc_36 == 3LL);
+  bool b55 = b54;
+  if (!b55) {
+    b55 = (bool)(v_kc_48 == 3LL);
   }
-  bool b44 = b43;
-  if (!b44) {
-    b44 = (bool)(v_kc_36 == 8LL);
+  bool b56 = b55;
+  if (!b56) {
+    b56 = (bool)(v_kc_48 == 8LL);
   }
-  bool b45 = b44;
-  if (!b45) {
-    b45 = (bool)(v_kc_36 == 4LL);
+  bool b57 = b56;
+  if (!b57) {
+    b57 = (bool)(v_kc_48 == 4LL);
   }
-  bool c46 = b45;
-  if (c46) {
+  bool c58 = b57;
+  if (c58) {
     f854_opt_Opt_sa(p_o, v_a_5);
   }
-  bool b47 = (bool)(v_kc_36 == 2LL);
-  if (!b47) {
-    b47 = (bool)(v_kc_36 == 3LL);
+  bool b59 = (bool)(v_kc_48 == 2LL);
+  if (!b59) {
+    b59 = (bool)(v_kc_48 == 3LL);
   }
-  bool b48 = b47;
-  if (!b48) {
-    b48 = (bool)(v_kc_36 == 8LL);
+  bool b60 = b59;
+  if (!b60) {
+    b60 = (bool)(v_kc_48 == 8LL);
   }
-  bool b49 = b48;
-  if (!b49) {
-    b49 = (bool)(v_kc_36 == 7LL);
+  bool b61 = b60;
+  if (!b61) {
+    b61 = (bool)(v_kc_48 == 7LL);
   }
-  bool c50 = b49;
-  if (c50) {
-    f854_opt_Opt_sa(p_o, v_b_39);
+  bool c62 = b61;
+  if (c62) {
+    f854_opt_Opt_sa(p_o, v_b_51);
   }
-  bool b51 = (bool)(v_kc_36 == 3LL);
-  if (!b51) {
-    b51 = (bool)(v_kc_36 == 8LL);
+  bool b63 = (bool)(v_kc_48 == 3LL);
+  if (!b63) {
+    b63 = (bool)(v_kc_48 == 8LL);
   }
-  bool c52 = b51;
-  if (c52) {
-    f854_opt_Opt_sa(p_o, v_c_41);
+  bool c64 = b63;
+  if (c64) {
+    f854_opt_Opt_sa(p_o, v_c_53);
   }
-  bool c53 = (bool)(v_kc_36 == 8LL);
-  if (c53) {
-    int64_t ix54 = p_x;
-    f854_opt_Opt_sa(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix54, (*p_o)->f_u->f_nodes.len, "opt.lxl:1326"))->f_d);
+  bool c65 = (bool)(v_kc_48 == 8LL);
+  if (c65) {
+    int64_t ix66 = p_x;
+    f854_opt_Opt_sa(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix66, (*p_o)->f_u->f_nodes.len, "opt.lxl:1344"))->f_d);
   }
-  bool b55 = (bool)(v_kc_36 == 4LL);
-  if (!b55) {
-    b55 = (bool)(v_kc_36 == 5LL);
+  bool b67 = (bool)(v_kc_48 == 4LL);
+  if (!b67) {
+    b67 = (bool)(v_kc_48 == 5LL);
   }
-  int64_t v_l_58 = b55 ? v_b_39 : v_kc_36 == 7LL ? v_c_41 : -1LL;
-  bool c59 = (bool)(v_l_58 >= 0LL);
-  if (c59) {
-    int64_t ix60 = v_l_58;
-    int64_t end61 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix60, (*p_o)->f_u->f_items.len, "opt.lxl:1329"));
-    for (int64_t v_j_62 = 0LL; v_j_62 < end61; v_j_62++) {
-      int64_t ix63 = rt_add_int(rt_add_int(v_l_58, 1LL, "opt.lxl:1329"), v_j_62, "opt.lxl:1329");
-      f854_opt_Opt_sa(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix63, (*p_o)->f_u->f_items.len, "opt.lxl:1329")));
+  int64_t v_l_70 = b67 ? v_b_51 : v_kc_48 == 7LL ? v_c_53 : -1LL;
+  bool c71 = (bool)(v_l_70 >= 0LL);
+  if (c71) {
+    int64_t ix72 = v_l_70;
+    int64_t end73 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix72, (*p_o)->f_u->f_items.len, "opt.lxl:1347"));
+    for (int64_t v_j_74 = 0LL; v_j_74 < end73; v_j_74++) {
+      int64_t ix75 = rt_add_int(rt_add_int(v_l_70, 1LL, "opt.lxl:1347"), v_j_74, "opt.lxl:1347");
+      f854_opt_Opt_sa(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix75, (*p_o)->f_u->f_items.len, "opt.lxl:1347")));
     }
   }
-  bool c64 = (bool)(v_k_3 >= 40LL);
-  if (c64) {
+  bool c76 = (bool)(v_k_3 >= 40LL);
+  if (c76) {
     (*p_o)->f_adj = -1LL;
   }
 }
 static void f870_opt_Opt_saItem(struct S82_opt_Opt**p_o, int64_t p_x) {
   int64_t ix1 = p_x;
-  int64_t v_k_2 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:1336"))->f_k;
-  bool c3 = (bool)(v_k_2 == 40LL);
-  if (c3) {
-    int64_t ix4 = p_x;
-    int64_t v_l_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1338"))->f_a;
-    int64_t ix6 = p_x;
-    int64_t v_b_7 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:1339"))->f_b;
-    int64_t ix8 = v_l_5;
-    int64_t v_t_9 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix8, (*p_o)->f_u->f_locals.len, "opt.lxl:1340"))->f_ty;
-    bool b10 = (bool)(v_b_7 >= 0LL);
-    if (b10) {
-      int64_t ix11 = p_x;
-      b10 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix11, (*p_o)->f_u->f_nodes.len, "opt.lxl:1341"))->f_c < 0LL);
+  int64_t v_k_2 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:1354"))->f_k;
+  int64_t v_pf_3 = (*p_o)->f_prevFresh;
+  (*p_o)->f_prevFresh = -1LL;
+  bool c4 = (bool)(v_k_2 == 40LL);
+  if (c4) {
+    int64_t ix5 = p_x;
+    int64_t v_l_6 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix5, (*p_o)->f_u->f_nodes.len, "opt.lxl:1358"))->f_a;
+    int64_t ix7 = p_x;
+    int64_t v_b_8 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:1359"))->f_b;
+    int64_t ix9 = v_l_6;
+    int64_t v_t_10 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix9, (*p_o)->f_u->f_locals.len, "opt.lxl:1360"))->f_ty;
+    bool b11 = (bool)(v_b_8 >= 0LL);
+    if (b11) {
+      int64_t ix12 = p_x;
+      b11 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix12, (*p_o)->f_u->f_nodes.len, "opt.lxl:1361"))->f_c < 0LL);
     }
-    bool b12 = b10;
-    if (b12) {
-      int64_t t13 = f87_ir_Ir_tk(&(*p_o)->f_u, v_t_9);
-      b12 = (bool)(t13 == 15LL);
+    bool b13 = b11;
+    if (b13) {
+      int64_t t14 = f87_ir_Ir_tk(&(*p_o)->f_u, v_t_10);
+      b13 = (bool)(t14 == 15LL);
     }
-    bool b14 = b12;
-    if (b14) {
-      int64_t ix15 = v_b_7;
-      b14 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix15, (*p_o)->f_u->f_nodes.len, "opt.lxl:1341"))->f_ty == v_t_9);
+    bool b15 = b13;
+    if (b15) {
+      int64_t ix16 = v_b_8;
+      b15 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix16, (*p_o)->f_u->f_nodes.len, "opt.lxl:1361"))->f_ty == v_t_10);
     }
-    bool b16 = b14;
-    if (b16) {
-      int64_t ix17 = v_l_5;
-      b16 = (bool)!*((bool*)(*p_o)->f_aTaken.data + rt_idx(ix17, (*p_o)->f_aTaken.len, "opt.lxl:1341"));
+    bool b17 = b15;
+    if (b17) {
+      int64_t ix18 = v_l_6;
+      b17 = (bool)!*((bool*)(*p_o)->f_aTaken.data + rt_idx(ix18, (*p_o)->f_aTaken.len, "opt.lxl:1361"));
     }
-    bool c18 = b16;
-    if (c18) {
-      int64_t t19 = f82_ir_Ir_nk(&(*p_o)->f_u, v_b_7);
-      int64_t ifx20;
-      if (t19 == 4LL) {
-        int64_t ix21 = v_b_7;
-        int64_t t22 = f862_opt_Opt_candOf(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix21, (*p_o)->f_u->f_nodes.len, "opt.lxl:1342"))->f_a);
-        ifx20 = t22;
+    bool c19 = b17;
+    if (c19) {
+      int64_t t20 = f82_ir_Ir_nk(&(*p_o)->f_u, v_b_8);
+      int64_t ifx21;
+      if (t20 == 4LL) {
+        int64_t ix22 = v_b_8;
+        int64_t t23 = f862_opt_Opt_candOf(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix22, (*p_o)->f_u->f_nodes.len, "opt.lxl:1362"))->f_a);
+        ifx21 = t23;
       } else {
-        ifx20 = -1LL;
+        ifx21 = -1LL;
       }
-      int64_t v_src_23 = ifx20;
-      bool c24 = (bool)(v_src_23 >= 0LL);
-      if (c24) {
-        int64_t ix25 = v_src_23;
-        bool c26 = (bool)!(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix25, (*p_o)->f_cands.len, "opt.lxl:1344")))->f_bad;
-        if (c26) {
-          f871_opt_Opt_setCand(p_o, v_l_5, v_src_23);
-          (*p_o)->f_adj = v_l_5;
-          return;
-        }
-      } else {
-        bool t27 = f815_opt_Opt_lvalue(p_o, v_b_7);
-        bool b28 = t27;
+      int64_t v_src_24 = ifx21;
+      bool b25 = (bool)(v_src_24 >= 0LL);
+      if (b25) {
+        int64_t ix26 = v_src_24;
+        b25 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix26, (*p_o)->f_cands.len, "opt.lxl:1363")))->f_fresh;
+      }
+      bool c27 = b25;
+      if (c27) {
+        bool b28 = (bool)(v_pf_3 == v_src_24);
         if (b28) {
-          int64_t ix29 = v_t_9;
-          int64_t ix30 = ((struct S33_ir_Ty*)(*p_o)->f_u->f_tys.data + rt_idx(ix29, (*p_o)->f_u->f_tys.len, "opt.lxl:1350"))->f_sid;
-          b28 = (bool)!(*((struct S30_ir_Struct**)(*p_o)->f_u->f_structs.data + rt_idx(ix30, (*p_o)->f_u->f_structs.len, "opt.lxl:1350")))->f_isUnion;
+          int64_t ix29 = v_src_24;
+          b28 = (bool)((*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix29, (*p_o)->f_cands.len, "opt.lxl:1364")))->f_dead < 0LL);
         }
-        bool c31 = b28;
-        if (c31) {
-          f854_opt_Opt_sa(p_o, v_b_7);
-          int64_t t32 = v_l_5;
-          f871_opt_Opt_setCand(p_o, t32, (*p_o)->f_cands.len);
-          lxl_arr a33 = rt_arr_new(0LL, 72ULL);
-          struct S80_opt_Cand*o34 = (struct S80_opt_Cand*)rt_alloc(48ULL);
-          o34->f_l = v_l_5;
-          o34->f_decl = p_x;
-          o34->f_bad = (bool)0LL;
-          o34->f_flds = a33;
-          struct S80_opt_Cand*t35 = o34;
-          struct S80_opt_Cand*ap36 = t35;
-          *(struct S80_opt_Cand**)rt_arr_push(&(*p_o)->f_cands, 8ULL) = ap36;
-          (*p_o)->f_adj = v_l_5;
+        bool b30 = b28;
+        if (b30) {
+          int64_t ix31 = v_b_8;
+          int64_t t32 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix31, (*p_o)->f_u->f_nodes.len, "opt.lxl:1364"))->f_a;
+          int64_t ix33 = v_src_24;
+          b30 = (bool)(t32 == (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix33, (*p_o)->f_cands.len, "opt.lxl:1364")))->f_l);
+        }
+        bool b34 = b30;
+        if (b34) {
+          int64_t ix35 = v_l_6;
+          b34 = (bool)!*((bool*)(*p_o)->f_aTaken.data + rt_idx(ix35, (*p_o)->f_aTaken.len, "opt.lxl:1364"));
+        }
+        bool c36 = b34;
+        if (c36) {
+          int64_t ix37 = v_src_24;
+          int64_t t38 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix37, (*p_o)->f_cands.len, "opt.lxl:1366")))->f_l;
+          int64_t ix39 = v_src_24;
+          (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix39, (*p_o)->f_cands.len, "opt.lxl:1366")))->f_dead = t38;
+          f871_opt_Opt_setCand(p_o, v_l_6, v_src_24);
           return;
         }
+        int64_t ix40 = v_src_24;
+        (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix40, (*p_o)->f_cands.len, "opt.lxl:1371")))->f_bad = (bool)1LL;
+      } else {
+        bool c41 = (bool)(v_src_24 >= 0LL);
+        if (c41) {
+          int64_t ix42 = v_src_24;
+          bool c43 = (bool)!(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix42, (*p_o)->f_cands.len, "opt.lxl:1373")))->f_bad;
+          if (c43) {
+            f871_opt_Opt_setCand(p_o, v_l_6, v_src_24);
+            (*p_o)->f_adj = v_l_6;
+            return;
+          }
+        } else {
+          bool t44 = f815_opt_Opt_lvalue(p_o, v_b_8);
+          bool b45 = t44;
+          if (b45) {
+            int64_t ix46 = v_t_10;
+            int64_t ix47 = ((struct S33_ir_Ty*)(*p_o)->f_u->f_tys.data + rt_idx(ix46, (*p_o)->f_u->f_tys.len, "opt.lxl:1379"))->f_sid;
+            b45 = (bool)!(*((struct S30_ir_Struct**)(*p_o)->f_u->f_structs.data + rt_idx(ix47, (*p_o)->f_u->f_structs.len, "opt.lxl:1379")))->f_isUnion;
+          }
+          bool c48 = b45;
+          if (c48) {
+            f854_opt_Opt_sa(p_o, v_b_8);
+            int64_t t49 = v_l_6;
+            f871_opt_Opt_setCand(p_o, t49, (*p_o)->f_cands.len);
+            lxl_arr a50 = rt_arr_new(0LL, 72ULL);
+            struct S80_opt_Cand*o51 = (struct S80_opt_Cand*)rt_alloc(64ULL);
+            o51->f_l = v_l_6;
+            o51->f_decl = p_x;
+            o51->f_bad = (bool)0LL;
+            o51->f_fresh = (bool)0LL;
+            o51->f_init = -1LL;
+            o51->f_dead = -1LL;
+            o51->f_flds = a50;
+            struct S80_opt_Cand*t52 = o51;
+            struct S80_opt_Cand*ap53 = t52;
+            *(struct S80_opt_Cand**)rt_arr_push(&(*p_o)->f_cands, 8ULL) = ap53;
+            (*p_o)->f_adj = v_l_6;
+            return;
+          }
+        }
       }
+    }
+    int64_t ifx54;
+    if (v_b_8 < 0LL) {
+      int64_t ix55 = p_x;
+      ifx54 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix55, (*p_o)->f_u->f_nodes.len, "opt.lxl:1387"))->f_c;
+    } else {
+      int64_t ix56 = p_x;
+      bool b57 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix56, (*p_o)->f_u->f_nodes.len, "opt.lxl:1387"))->f_c < 0LL);
+      if (b57) {
+        int64_t t58 = f82_ir_Ir_nk(&(*p_o)->f_u, v_b_8);
+        b57 = (bool)(t58 == 22LL);
+      }
+      bool b59 = b57;
+      if (b59) {
+        int64_t ix60 = v_b_8;
+        b59 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix60, (*p_o)->f_u->f_nodes.len, "opt.lxl:1387"))->f_ty == v_t_10);
+      }
+      int64_t ifx61;
+      if (b59) {
+        int64_t ix62 = v_b_8;
+        ifx61 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix62, (*p_o)->f_u->f_nodes.len, "opt.lxl:1388"))->f_b;
+      } else {
+        ifx61 = -2LL;
+      }
+      ifx54 = ifx61;
+    }
+    int64_t v_ents_63 = ifx54;
+    bool b64 = (bool)(v_ents_63 >= -1LL);
+    if (b64) {
+      int64_t t65 = f87_ir_Ir_tk(&(*p_o)->f_u, v_t_10);
+      b64 = (bool)(t65 == 15LL);
+    }
+    bool b66 = b64;
+    if (b66) {
+      int64_t ix67 = v_l_6;
+      b66 = (bool)!*((bool*)(*p_o)->f_aTaken.data + rt_idx(ix67, (*p_o)->f_aTaken.len, "opt.lxl:1390"));
+    }
+    bool b68 = b66;
+    if (b68) {
+      int64_t ix69 = v_t_10;
+      int64_t ix70 = ((struct S33_ir_Ty*)(*p_o)->f_u->f_tys.data + rt_idx(ix69, (*p_o)->f_u->f_tys.len, "opt.lxl:1390"))->f_sid;
+      b68 = (bool)!(*((struct S30_ir_Struct**)(*p_o)->f_u->f_structs.data + rt_idx(ix70, (*p_o)->f_u->f_structs.len, "opt.lxl:1390")))->f_isUnion;
+    }
+    bool c71 = b68;
+    if (c71) {
+      bool c72 = (bool)(v_ents_63 >= 0LL);
+      if (c72) {
+        int64_t ix73 = v_ents_63;
+        int64_t end74 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix73, (*p_o)->f_u->f_items.len, "opt.lxl:1392"));
+        for (int64_t v_j_75 = 0LL; v_j_75 < end74; v_j_75++) {
+          int64_t ix76 = rt_add_int(rt_add_int(v_ents_63, 1LL, "opt.lxl:1392"), v_j_75, "opt.lxl:1392");
+          int64_t ix77 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix76, (*p_o)->f_u->f_items.len, "opt.lxl:1392"));
+          f854_opt_Opt_sa(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix77, (*p_o)->f_u->f_nodes.len, "opt.lxl:1392"))->f_a);
+        }
+      }
+      int64_t t78 = v_l_6;
+      f871_opt_Opt_setCand(p_o, t78, (*p_o)->f_cands.len);
+      lxl_arr a79 = rt_arr_new(0LL, 72ULL);
+      struct S80_opt_Cand*o80 = (struct S80_opt_Cand*)rt_alloc(64ULL);
+      o80->f_l = v_l_6;
+      o80->f_decl = p_x;
+      o80->f_bad = (bool)0LL;
+      o80->f_fresh = (bool)1LL;
+      o80->f_init = v_ents_63;
+      o80->f_dead = -1LL;
+      o80->f_flds = a79;
+      struct S80_opt_Cand*t81 = o80;
+      struct S80_opt_Cand*ap82 = t81;
+      *(struct S80_opt_Cand**)rt_arr_push(&(*p_o)->f_cands, 8ULL) = ap82;
+      (*p_o)->f_prevFresh = rt_sub_int((*p_o)->f_cands.len, 1LL, "opt.lxl:1396");
+      (*p_o)->f_adj = -1LL;
+      return;
     }
   } else {
-    bool c37 = (bool)(v_k_2 == 41LL);
-    if (c37) {
-      int64_t ix38 = p_x;
-      int64_t v_e_39 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix38, (*p_o)->f_u->f_nodes.len, "opt.lxl:1359"))->f_a;
-      bool t40 = f864_opt_Opt_nopAssign(p_o, v_e_39);
-      bool b41 = t40;
-      if (b41) {
-        int64_t ix42 = v_e_39;
-        int64_t t43 = f822_opt_Opt_root(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix42, (*p_o)->f_u->f_nodes.len, "opt.lxl:1360"))->f_a);
-        int64_t t44 = f862_opt_Opt_candOf(p_o, t43);
-        b41 = (bool)(t44 >= 0LL);
+    bool c83 = (bool)(v_k_2 == 41LL);
+    if (c83) {
+      int64_t ix84 = p_x;
+      int64_t v_e_85 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix84, (*p_o)->f_u->f_nodes.len, "opt.lxl:1401"))->f_a;
+      bool t86 = f864_opt_Opt_nopAssign(p_o, v_e_85);
+      bool b87 = t86;
+      if (b87) {
+        int64_t ix88 = v_e_85;
+        int64_t t89 = f822_opt_Opt_root(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix88, (*p_o)->f_u->f_nodes.len, "opt.lxl:1402"))->f_a);
+        int64_t t90 = f862_opt_Opt_candOf(p_o, t89);
+        b87 = (bool)(t90 >= 0LL);
       }
-      bool c45 = b41;
-      if (c45) {
+      bool c91 = b87;
+      if (c91) {
         return;
       }
-      int64_t t46 = f865_opt_Opt_dupOf(p_o, v_e_39);
-      int64_t v_d_47 = t46;
-      int64_t ifx48;
-      if (v_d_47 >= 0LL) {
-        int64_t t49 = f822_opt_Opt_root(p_o, v_d_47);
-        int64_t t50 = f862_opt_Opt_candOf(p_o, t49);
-        ifx48 = t50;
+      int64_t t92 = f865_opt_Opt_dupOf(p_o, v_e_85);
+      int64_t v_d_93 = t92;
+      int64_t ifx94;
+      if (v_d_93 >= 0LL) {
+        int64_t t95 = f822_opt_Opt_root(p_o, v_d_93);
+        int64_t t96 = f862_opt_Opt_candOf(p_o, t95);
+        ifx94 = t96;
       } else {
-        ifx48 = -1LL;
+        ifx94 = -1LL;
       }
-      int64_t v_dc_51 = ifx48;
-      bool b52 = (bool)(v_dc_51 >= 0LL);
-      if (b52) {
-        int64_t t53 = f822_opt_Opt_root(p_o, v_d_47);
-        int64_t ix54 = v_dc_51;
-        b52 = (bool)(t53 != (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix54, (*p_o)->f_cands.len, "opt.lxl:1363")))->f_l);
+      int64_t v_dc_97 = ifx94;
+      bool b98 = (bool)(v_dc_97 >= 0LL);
+      if (b98) {
+        int64_t ix99 = v_dc_97;
+        b98 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix99, (*p_o)->f_cands.len, "opt.lxl:1405")))->f_fresh;
       }
-      bool c55 = b52;
-      if (c55) {
-        int64_t ix56 = v_dc_51;
-        (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix56, (*p_o)->f_cands.len, "opt.lxl:1365")))->f_bad = (bool)1LL;
+      bool c100 = b98;
+      if (c100) {
+        v_dc_97 = -1LL;
+      }
+      bool b101 = (bool)(v_dc_97 >= 0LL);
+      if (b101) {
+        int64_t t102 = f822_opt_Opt_root(p_o, v_d_93);
+        int64_t ix103 = v_dc_97;
+        b101 = (bool)(t102 != (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix103, (*p_o)->f_cands.len, "opt.lxl:1406")))->f_l);
+      }
+      bool c104 = b101;
+      if (c104) {
+        int64_t ix105 = v_dc_97;
+        (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix105, (*p_o)->f_cands.len, "opt.lxl:1408")))->f_bad = (bool)1LL;
         (*p_o)->f_adj = -1LL;
         return;
       }
-      bool c57 = (bool)(v_dc_51 >= 0LL);
-      if (c57) {
-        int64_t t58 = f859_opt_Opt_field(p_o, v_dc_51, v_d_47);
-        int64_t v_i_59 = t58;
-        int64_t ix60 = v_dc_51;
-        int64_t ix61 = v_i_59;
-        ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix60, (*p_o)->f_cands.len, "opt.lxl:1371")))->f_flds.data + rt_idx(ix61, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix60, (*p_o)->f_cands.len, "opt.lxl:1371")))->f_flds.len, "opt.lxl:1371"))->f_dups = rt_add_int(((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix60, (*p_o)->f_cands.len, "opt.lxl:1371")))->f_flds.data + rt_idx(ix61, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix60, (*p_o)->f_cands.len, "opt.lxl:1371")))->f_flds.len, "opt.lxl:1371"))->f_dups, 1LL, "opt.lxl:1371");
-        int64_t t62 = f822_opt_Opt_root(p_o, v_d_47);
-        bool c63 = (bool)(t62 != (*p_o)->f_adj);
-        if (c63) {
-          int64_t ix64 = v_dc_51;
-          int64_t ix65 = v_i_59;
-          ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix64, (*p_o)->f_cands.len, "opt.lxl:1372")))->f_flds.data + rt_idx(ix65, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix64, (*p_o)->f_cands.len, "opt.lxl:1372")))->f_flds.len, "opt.lxl:1372"))->f_away = (bool)1LL;
+      bool c106 = (bool)(v_dc_97 >= 0LL);
+      if (c106) {
+        int64_t t107 = f859_opt_Opt_field(p_o, v_dc_97, v_d_93);
+        int64_t v_i_108 = t107;
+        int64_t ix109 = v_dc_97;
+        int64_t ix110 = v_i_108;
+        ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix109, (*p_o)->f_cands.len, "opt.lxl:1414")))->f_flds.data + rt_idx(ix110, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix109, (*p_o)->f_cands.len, "opt.lxl:1414")))->f_flds.len, "opt.lxl:1414"))->f_dups = rt_add_int(((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix109, (*p_o)->f_cands.len, "opt.lxl:1414")))->f_flds.data + rt_idx(ix110, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix109, (*p_o)->f_cands.len, "opt.lxl:1414")))->f_flds.len, "opt.lxl:1414"))->f_dups, 1LL, "opt.lxl:1414");
+        int64_t t111 = f822_opt_Opt_root(p_o, v_d_93);
+        bool c112 = (bool)(t111 != (*p_o)->f_adj);
+        if (c112) {
+          int64_t ix113 = v_dc_97;
+          int64_t ix114 = v_i_108;
+          ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix113, (*p_o)->f_cands.len, "opt.lxl:1415")))->f_flds.data + rt_idx(ix114, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix113, (*p_o)->f_cands.len, "opt.lxl:1415")))->f_flds.len, "opt.lxl:1415"))->f_away = (bool)1LL;
         }
         return;
       }
-      int64_t t66 = f866_opt_Opt_dropOf(p_o, v_e_39);
-      int64_t v_p_67 = t66;
-      int64_t ifx68;
-      if (v_p_67 >= 0LL) {
-        int64_t t69 = f822_opt_Opt_root(p_o, v_p_67);
-        int64_t t70 = f862_opt_Opt_candOf(p_o, t69);
-        ifx68 = t70;
+      int64_t t115 = f866_opt_Opt_dropOf(p_o, v_e_85);
+      int64_t v_p_116 = t115;
+      int64_t ifx117;
+      if (v_p_116 >= 0LL) {
+        int64_t t118 = f822_opt_Opt_root(p_o, v_p_116);
+        int64_t t119 = f862_opt_Opt_candOf(p_o, t118);
+        ifx117 = t119;
       } else {
-        ifx68 = -1LL;
+        ifx117 = -1LL;
       }
-      int64_t v_pc_71 = ifx68;
-      bool c72 = (bool)(v_pc_71 >= 0LL);
-      if (c72) {
-        int64_t t73 = f859_opt_Opt_field(p_o, v_pc_71, v_p_67);
-        int64_t v_i_74 = t73;
-        int64_t ix75 = v_pc_71;
-        int64_t ix76 = v_i_74;
-        ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix75, (*p_o)->f_cands.len, "opt.lxl:1379")))->f_flds.data + rt_idx(ix76, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix75, (*p_o)->f_cands.len, "opt.lxl:1379")))->f_flds.len, "opt.lxl:1379"))->f_drops = rt_add_int(((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix75, (*p_o)->f_cands.len, "opt.lxl:1379")))->f_flds.data + rt_idx(ix76, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix75, (*p_o)->f_cands.len, "opt.lxl:1379")))->f_flds.len, "opt.lxl:1379"))->f_drops, 1LL, "opt.lxl:1379");
+      int64_t v_pc_120 = ifx117;
+      bool b121 = (bool)(v_pc_120 >= 0LL);
+      if (b121) {
+        int64_t ix122 = v_pc_120;
+        b121 = (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix122, (*p_o)->f_cands.len, "opt.lxl:1420")))->f_fresh;
+      }
+      bool c123 = b121;
+      if (c123) {
+        v_pc_120 = -1LL;
+      }
+      bool c124 = (bool)(v_pc_120 >= 0LL);
+      if (c124) {
+        int64_t t125 = f859_opt_Opt_field(p_o, v_pc_120, v_p_116);
+        int64_t v_i_126 = t125;
+        int64_t ix127 = v_pc_120;
+        int64_t ix128 = v_i_126;
+        ((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix127, (*p_o)->f_cands.len, "opt.lxl:1423")))->f_flds.data + rt_idx(ix128, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix127, (*p_o)->f_cands.len, "opt.lxl:1423")))->f_flds.len, "opt.lxl:1423"))->f_drops = rt_add_int(((struct S84_opt_Fld*)(*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix127, (*p_o)->f_cands.len, "opt.lxl:1423")))->f_flds.data + rt_idx(ix128, (*((struct S80_opt_Cand**)(*p_o)->f_cands.data + rt_idx(ix127, (*p_o)->f_cands.len, "opt.lxl:1423")))->f_flds.len, "opt.lxl:1423"))->f_drops, 1LL, "opt.lxl:1423");
         (*p_o)->f_adj = -1LL;
         return;
       }
@@ -77348,13 +77678,13 @@ static void f870_opt_Opt_saItem(struct S82_opt_Opt**p_o, int64_t p_x) {
 }
 static void f871_opt_Opt_setCand(struct S82_opt_Opt**p_o, int64_t p_l, int64_t p_c) {
   int64_t ix1 = p_l;
-  *((int64_t*)(*p_o)->f_sStamp.data + rt_idx(ix1, (*p_o)->f_sStamp.len, "opt.lxl:1234")) = (*p_o)->f_stamp;
+  *((int64_t*)(*p_o)->f_sStamp.data + rt_idx(ix1, (*p_o)->f_sStamp.len, "opt.lxl:1248")) = (*p_o)->f_stamp;
   int64_t ix2 = p_l;
-  *((int64_t*)(*p_o)->f_sCand.data + rt_idx(ix2, (*p_o)->f_sCand.len, "opt.lxl:1235")) = p_c;
+  *((int64_t*)(*p_o)->f_sCand.data + rt_idx(ix2, (*p_o)->f_sCand.len, "opt.lxl:1249")) = p_c;
 }
 static void f832_opt_Opt_unbox(struct S82_opt_Opt**p_o, int64_t p_f) {
   int64_t ix1 = p_f;
-  int64_t v_body_2 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix1, (*p_o)->f_u->f_funcs.len, "opt.lxl:796")))->f_body;
+  int64_t v_body_2 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix1, (*p_o)->f_u->f_funcs.len, "opt.lxl:797")))->f_body;
   bool b3 = (bool)((*p_o)->f_allocF < 0LL);
   if (!b3) {
     b3 = (bool)((*p_o)->f_freeF < 0LL);
@@ -77362,7 +77692,7 @@ static void f832_opt_Opt_unbox(struct S82_opt_Opt**p_o, int64_t p_f) {
   bool b4 = b3;
   if (!b4) {
     int64_t ix5 = p_f;
-    b4 = (bool)!*((bool*)(*p_o)->f_allocs.data + rt_idx(ix5, (*p_o)->f_allocs.len, "opt.lxl:797"));
+    b4 = (bool)!*((bool*)(*p_o)->f_allocs.data + rt_idx(ix5, (*p_o)->f_allocs.len, "opt.lxl:798"));
   }
   bool c6 = b4;
   if (c6) {
@@ -77391,10 +77721,10 @@ static void f832_opt_Opt_unbox(struct S82_opt_Opt**p_o, int64_t p_f) {
     for (int64_t i19 = 0LL; i19 < ap18.len; i19++) {
       int64_t v_l_20 = *((int64_t*)ap18.data + i19);
       int64_t ix21 = v_l_20;
-      bool c22 = ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix21, (*p_o)->f_ub.len, "opt.lxl:807"))->f_alloc;
+      bool c22 = ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix21, (*p_o)->f_ub.len, "opt.lxl:808"))->f_alloc;
       if (c22) {
         int64_t ix23 = v_l_20;
-        f678_collections_Map_put(&v_good_16, v_l_20, (bool)(((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix23, (*p_o)->f_ub.len, "opt.lxl:807"))->f_decls == 1LL));
+        f678_collections_Map_put(&v_good_16, v_l_20, (bool)(((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix23, (*p_o)->f_ub.len, "opt.lxl:808"))->f_decls == 1LL));
       }
     }
     gl10_drop(t17);
@@ -77413,11 +77743,11 @@ static void f832_opt_Opt_unbox(struct S82_opt_Opt**p_o, int64_t p_f) {
         continue;
       }
       int64_t ix34 = v_l_29;
-      struct S81_opt_Ub v_u_35 = *((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix34, (*p_o)->f_ub.len, "opt.lxl:814"));
+      struct S81_opt_Ub v_u_35 = *((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix34, (*p_o)->f_ub.len, "opt.lxl:815"));
       bool b36 = v_u_35.f_bad;
       if (!b36) {
         int64_t ix37 = v_l_29;
-        b36 = *((bool*)(*p_o)->f_aTaken.data + rt_idx(ix37, (*p_o)->f_aTaken.len, "opt.lxl:815"));
+        b36 = *((bool*)(*p_o)->f_aTaken.data + rt_idx(ix37, (*p_o)->f_aTaken.len, "opt.lxl:816"));
       }
       bool b38 = b36;
       if (!b38) {
@@ -77440,9 +77770,9 @@ static void f832_opt_Opt_unbox(struct S82_opt_Opt**p_o, int64_t p_f) {
     int64_t end45 = v_seen_44.len;
     for (int64_t v_i_46 = 0LL; v_i_46 < end45; v_i_46++) {
       int64_t ix47 = v_i_46;
-      int64_t v_l_48 = *((int64_t*)v_seen_44.data + rt_idx(ix47, v_seen_44.len, "opt.lxl:820"));
+      int64_t v_l_48 = *((int64_t*)v_seen_44.data + rt_idx(ix47, v_seen_44.len, "opt.lxl:821"));
       int64_t ix49 = v_i_46;
-      int64_t v_r_50 = *((int64_t*)v_roots_25.data + rt_idx(ix49, v_roots_25.len, "opt.lxl:821"));
+      int64_t v_r_50 = *((int64_t*)v_roots_25.data + rt_idx(ix49, v_roots_25.len, "opt.lxl:822"));
       bool b51 = (bool)(v_r_50 < 0LL);
       if (!b51) {
         bool t52 = f875_collections_Map_getOr(&v_good_16, &v_r_50, (bool)0LL);
@@ -77457,10 +77787,10 @@ static void f832_opt_Opt_unbox(struct S82_opt_Opt**p_o, int64_t p_f) {
       if (c55) {
         int64_t t56 = v_r_50;
         int64_t ix57 = v_r_50;
-        lxl_str t58 = rt_str_concat(sl9416, ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix57, (*p_o)->f_u->f_locals.len, "opt.lxl:824"))->f_name);
+        lxl_str t58 = rt_str_concat(sl9416, ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix57, (*p_o)->f_u->f_locals.len, "opt.lxl:825"))->f_name);
         int64_t ix59 = v_r_50;
-        int64_t ix60 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix59, (*p_o)->f_u->f_locals.len, "opt.lxl:824"))->f_ty;
-        int64_t t61 = f839_opt_Opt_local(p_o, t58, ((struct S33_ir_Ty*)(*p_o)->f_u->f_tys.data + rt_idx(ix60, (*p_o)->f_u->f_tys.len, "opt.lxl:824"))->f_base, (bool)0LL);
+        int64_t ix60 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix59, (*p_o)->f_u->f_locals.len, "opt.lxl:825"))->f_ty;
+        int64_t t61 = f839_opt_Opt_local(p_o, t58, ((struct S33_ir_Ty*)(*p_o)->f_u->f_tys.data + rt_idx(ix60, (*p_o)->f_u->f_tys.len, "opt.lxl:825"))->f_base, (bool)0LL);
         f506_collections_Map_put(&v_keep_42, t56, t61);
         rt_str_drop(t58);
       }
@@ -77484,7 +77814,7 @@ static void f832_opt_Opt_unbox(struct S82_opt_Opt**p_o, int64_t p_f) {
     int64_t v_l_69 = *((int64_t*)ap67.data + i68);
     struct S81_opt_Ub t70 = f872_opt_ubNone();
     int64_t ix71 = v_l_69;
-    *((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix71, (*p_o)->f_ub.len, "opt.lxl:830")) = t70;
+    *((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix71, (*p_o)->f_ub.len, "opt.lxl:831")) = t70;
   }
   gl10_drop(t66);
   lxl_arr a72 = rt_arr_new(0LL, 8ULL);
@@ -77501,7 +77831,7 @@ static void f878_opt_Opt_ubRewrite(struct S82_opt_Opt**p_o, int64_t p_x, struct 
     return;
   }
   int64_t ix2 = p_x;
-  struct S32_ir_Node v_n_3 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix2, (*p_o)->f_u->f_nodes.len, "opt.lxl:959"));
+  struct S32_ir_Node v_n_3 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix2, (*p_o)->f_u->f_nodes.len, "opt.lxl:960"));
   bool b4 = (bool)(v_n_3.f_k == 40LL);
   if (b4) {
     bool t5 = f876_collections_Map_has(p_map, &v_n_3.f_a);
@@ -77510,18 +77840,18 @@ static void f878_opt_Opt_ubRewrite(struct S82_opt_Opt**p_o, int64_t p_x, struct 
   bool c6 = b4;
   if (c6) {
     int64_t ix7 = v_n_3.f_a;
-    bool c8 = ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix7, (*p_o)->f_ub.len, "opt.lxl:961"))->f_alloc;
+    bool c8 = ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix7, (*p_o)->f_ub.len, "opt.lxl:962"))->f_alloc;
     if (c8) {
       int64_t t9 = f505_collections_Map_getOr(p_map, &v_n_3.f_a, -1LL);
       int64_t ix10 = p_x;
-      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:962"))->f_a = t9;
+      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:963"))->f_a = t9;
       int64_t ix11 = p_x;
-      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix11, (*p_o)->f_u->f_nodes.len, "opt.lxl:963"))->f_b = -1LL;
+      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix11, (*p_o)->f_u->f_nodes.len, "opt.lxl:964"))->f_b = -1LL;
     } else {
       int64_t ix12 = p_x;
-      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix12, (*p_o)->f_u->f_nodes.len, "opt.lxl:965"))->f_k = 52LL;
+      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix12, (*p_o)->f_u->f_nodes.len, "opt.lxl:966"))->f_k = 52LL;
       int64_t ix13 = p_x;
-      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:966"))->f_b = -1LL;
+      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:967"))->f_b = -1LL;
     }
     return;
   }
@@ -77537,9 +77867,9 @@ static void f878_opt_Opt_ubRewrite(struct S82_opt_Opt**p_o, int64_t p_x, struct 
     bool c19 = b17;
     if (c19) {
       int64_t ix20 = p_x;
-      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix20, (*p_o)->f_u->f_nodes.len, "opt.lxl:973"))->f_k = 52LL;
+      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix20, (*p_o)->f_u->f_nodes.len, "opt.lxl:974"))->f_k = 52LL;
       int64_t ix21 = p_x;
-      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix21, (*p_o)->f_u->f_nodes.len, "opt.lxl:974"))->f_a = -1LL;
+      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix21, (*p_o)->f_u->f_nodes.len, "opt.lxl:975"))->f_a = -1LL;
       return;
     }
   }
@@ -77551,22 +77881,22 @@ static void f878_opt_Opt_ubRewrite(struct S82_opt_Opt**p_o, int64_t p_x, struct 
   bool b24 = b22;
   if (b24) {
     int64_t ix25 = v_n_3.f_a;
-    bool t26 = f876_collections_Map_has(p_map, &((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix25, (*p_o)->f_u->f_nodes.len, "opt.lxl:978"))->f_a);
+    bool t26 = f876_collections_Map_has(p_map, &((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix25, (*p_o)->f_u->f_nodes.len, "opt.lxl:979"))->f_a);
     b24 = t26;
   }
   bool c27 = b24;
   if (c27) {
     int64_t ix28 = p_x;
-    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix28, (*p_o)->f_u->f_nodes.len, "opt.lxl:979"))->f_k = 4LL;
+    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix28, (*p_o)->f_u->f_nodes.len, "opt.lxl:980"))->f_k = 4LL;
     int64_t ix29 = v_n_3.f_a;
-    int64_t t30 = f505_collections_Map_getOr(p_map, &((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix29, (*p_o)->f_u->f_nodes.len, "opt.lxl:980"))->f_a, -1LL);
+    int64_t t30 = f505_collections_Map_getOr(p_map, &((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix29, (*p_o)->f_u->f_nodes.len, "opt.lxl:981"))->f_a, -1LL);
     int64_t ix31 = p_x;
-    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix31, (*p_o)->f_u->f_nodes.len, "opt.lxl:980"))->f_a = t30;
+    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix31, (*p_o)->f_u->f_nodes.len, "opt.lxl:981"))->f_a = t30;
     return;
   }
   lxl_slice t32 = k2_ir_KIDS;
   int64_t ix33 = v_n_3.f_k;
-  int64_t v_kc_34 = *((int64_t*)t32.data + rt_idx(ix33, t32.len, "opt.lxl:983"));
+  int64_t v_kc_34 = *((int64_t*)t32.data + rt_idx(ix33, t32.len, "opt.lxl:984"));
   bool b35 = (bool)(v_kc_34 == 0LL);
   if (!b35) {
     b35 = (bool)(v_kc_34 < 0LL);
@@ -77643,7 +77973,7 @@ static int64_t f879_opt_Opt_freeOf(struct S82_opt_Opt**p_o, int64_t p_s) {
     return r3;
   }
   int64_t ix4 = p_s;
-  int64_t v_c_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:876"))->f_a;
+  int64_t v_c_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:877"))->f_a;
   int64_t t6 = f82_ir_Ir_nk(&(*p_o)->f_u, v_c_5);
   bool b7 = (bool)(t6 != 7LL);
   if (!b7) {
@@ -77653,7 +77983,7 @@ static int64_t f879_opt_Opt_freeOf(struct S82_opt_Opt**p_o, int64_t p_s) {
   bool b9 = b7;
   if (!b9) {
     int64_t ix10 = v_c_5;
-    int64_t t11 = f77_ir_Ir_listLen(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:877"))->f_b);
+    int64_t t11 = f77_ir_Ir_listLen(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:878"))->f_b);
     b9 = (bool)(t11 != 1LL);
   }
   bool c12 = b9;
@@ -77662,7 +77992,7 @@ static int64_t f879_opt_Opt_freeOf(struct S82_opt_Opt**p_o, int64_t p_s) {
     return r13;
   }
   int64_t ix14 = v_c_5;
-  int64_t t15 = f78_ir_Ir_listAt(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix14, (*p_o)->f_u->f_nodes.len, "opt.lxl:878"))->f_b, 0LL);
+  int64_t t15 = f78_ir_Ir_listAt(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix14, (*p_o)->f_u->f_nodes.len, "opt.lxl:879"))->f_b, 0LL);
   int64_t t16 = f881_opt_Opt_ptrLocal(p_o, t15);
   int64_t r17 = t16;
   return r17;
@@ -77674,7 +78004,7 @@ static int64_t f881_opt_Opt_ptrLocal(struct S82_opt_Opt**p_o, int64_t p_x) {
     bool b3 = (bool)(t2 == 12LL);
     if (b3) {
       int64_t ix4 = v_c_1;
-      int64_t t5 = f87_ir_Ir_tk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:869"))->f_ty);
+      int64_t t5 = f87_ir_Ir_tk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:870"))->f_ty);
       b3 = (bool)(t5 == 13LL);
     }
     bool c6 = b3;
@@ -77682,13 +78012,13 @@ static int64_t f881_opt_Opt_ptrLocal(struct S82_opt_Opt**p_o, int64_t p_x) {
       break;
     }
     int64_t ix7 = v_c_1;
-    v_c_1 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:869"))->f_a;
+    v_c_1 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:870"))->f_a;
   }
   int64_t t8 = f82_ir_Ir_nk(&(*p_o)->f_u, v_c_1);
   int64_t ifx9;
   if (t8 == 4LL) {
     int64_t ix10 = v_c_1;
-    ifx9 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:870"))->f_a;
+    ifx9 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:871"))->f_a;
   } else {
     ifx9 = -1LL;
   }
@@ -77743,7 +78073,7 @@ static int64_t f874_opt_Opt_ubRoot(struct S82_opt_Opt**p_o, int64_t p_l) {
     bool b3 = (bool)(v_r_1 >= 0LL);
     if (b3) {
       int64_t ix4 = v_r_1;
-      b3 = (bool)!((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix4, (*p_o)->f_ub.len, "opt.lxl:849"))->f_alloc;
+      b3 = (bool)!((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix4, (*p_o)->f_ub.len, "opt.lxl:850"))->f_alloc;
     }
     bool b5 = b3;
     if (b5) {
@@ -77754,13 +78084,13 @@ static int64_t f874_opt_Opt_ubRoot(struct S82_opt_Opt**p_o, int64_t p_l) {
       break;
     }
     int64_t ix7 = v_r_1;
-    v_r_1 = ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix7, (*p_o)->f_ub.len, "opt.lxl:850"))->f_from;
-    v_steps_2 = rt_add_int(v_steps_2, 1LL, "opt.lxl:851");
+    v_r_1 = ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix7, (*p_o)->f_ub.len, "opt.lxl:851"))->f_from;
+    v_steps_2 = rt_add_int(v_steps_2, 1LL, "opt.lxl:852");
   }
   bool b8 = (bool)(v_r_1 >= 0LL);
   if (b8) {
     int64_t ix9 = v_r_1;
-    b8 = ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix9, (*p_o)->f_ub.len, "opt.lxl:853"))->f_alloc;
+    b8 = ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix9, (*p_o)->f_ub.len, "opt.lxl:854"))->f_alloc;
   }
   int64_t r11 = b8 ? v_r_1 : -1LL;
   return r11;
@@ -77771,16 +78101,16 @@ static void f873_opt_Opt_ubScan(struct S82_opt_Opt**p_o, int64_t p_x, bool p_ok,
     return;
   }
   int64_t ix2 = p_x;
-  struct S32_ir_Node v_n_3 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix2, (*p_o)->f_u->f_nodes.len, "opt.lxl:884"));
+  struct S32_ir_Node v_n_3 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix2, (*p_o)->f_u->f_nodes.len, "opt.lxl:885"));
   bool c4 = (bool)(v_n_3.f_k == 4LL);
   if (c4) {
     f882_opt_Opt_ubAt(p_o, v_n_3.f_a);
     int64_t ix5 = v_n_3.f_a;
-    ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix5, (*p_o)->f_ub.len, "opt.lxl:887"))->f_uses = rt_add_int(((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix5, (*p_o)->f_ub.len, "opt.lxl:887"))->f_uses, 1LL, "opt.lxl:887");
+    ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix5, (*p_o)->f_ub.len, "opt.lxl:888"))->f_uses = rt_add_int(((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix5, (*p_o)->f_ub.len, "opt.lxl:888"))->f_uses, 1LL, "opt.lxl:888");
     bool c6 = p_ok;
     if (c6) {
       int64_t ix7 = v_n_3.f_a;
-      ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix7, (*p_o)->f_ub.len, "opt.lxl:888"))->f_ok = rt_add_int(((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix7, (*p_o)->f_ub.len, "opt.lxl:888"))->f_ok, 1LL, "opt.lxl:888");
+      ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix7, (*p_o)->f_ub.len, "opt.lxl:889"))->f_ok = rt_add_int(((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix7, (*p_o)->f_ub.len, "opt.lxl:889"))->f_ok, 1LL, "opt.lxl:889");
     }
     return;
   }
@@ -77788,7 +78118,7 @@ static void f873_opt_Opt_ubScan(struct S82_opt_Opt**p_o, int64_t p_x, bool p_ok,
   if (c8) {
     f882_opt_Opt_ubAt(p_o, v_n_3.f_a);
     int64_t ix9 = v_n_3.f_a;
-    ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix9, (*p_o)->f_ub.len, "opt.lxl:893"))->f_decls = rt_add_int(((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix9, (*p_o)->f_ub.len, "opt.lxl:893"))->f_decls, 1LL, "opt.lxl:893");
+    ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix9, (*p_o)->f_ub.len, "opt.lxl:894"))->f_decls = rt_add_int(((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix9, (*p_o)->f_ub.len, "opt.lxl:894"))->f_decls, 1LL, "opt.lxl:894");
     bool b10 = (bool)(v_n_3.f_b >= 0LL);
     if (b10) {
       b10 = (bool)(v_n_3.f_c < 0LL);
@@ -77796,20 +78126,20 @@ static void f873_opt_Opt_ubScan(struct S82_opt_Opt**p_o, int64_t p_x, bool p_ok,
     bool b11 = b10;
     if (b11) {
       int64_t ix12 = v_n_3.f_a;
-      bool t13 = f883_opt_Opt_allocOf(p_o, v_n_3.f_b, ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix12, (*p_o)->f_u->f_locals.len, "opt.lxl:894"))->f_ty);
+      bool t13 = f883_opt_Opt_allocOf(p_o, v_n_3.f_b, ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix12, (*p_o)->f_u->f_locals.len, "opt.lxl:895"))->f_ty);
       b11 = t13;
     }
     bool c14 = b11;
     if (c14) {
       int64_t ix15 = v_n_3.f_a;
-      ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix15, (*p_o)->f_ub.len, "opt.lxl:895"))->f_alloc = (bool)1LL;
+      ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix15, (*p_o)->f_ub.len, "opt.lxl:896"))->f_alloc = (bool)1LL;
       *p_any = (bool)1LL;
       return;
     }
     bool b16 = (bool)(v_n_3.f_b >= 0LL);
     if (b16) {
       int64_t ix17 = v_n_3.f_a;
-      int64_t t18 = f87_ir_Ir_tk(&(*p_o)->f_u, ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix17, (*p_o)->f_u->f_locals.len, "opt.lxl:899"))->f_ty);
+      int64_t t18 = f87_ir_Ir_tk(&(*p_o)->f_u, ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix17, (*p_o)->f_u->f_locals.len, "opt.lxl:900"))->f_ty);
       b16 = (bool)(t18 == 13LL);
     }
     int64_t ifx19;
@@ -77823,20 +78153,20 @@ static void f873_opt_Opt_ubScan(struct S82_opt_Opt**p_o, int64_t p_x, bool p_ok,
     bool b22 = (bool)(v_src_21 >= 0LL);
     if (b22) {
       int64_t ix23 = v_src_21;
-      int64_t ix24 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix23, (*p_o)->f_u->f_locals.len, "opt.lxl:900"))->f_ty;
-      b22 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix24, (*p_o)->f_u->f_nodes.len, "opt.lxl:900"))->f_k >= 0LL);
+      int64_t ix24 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix23, (*p_o)->f_u->f_locals.len, "opt.lxl:901"))->f_ty;
+      b22 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix24, (*p_o)->f_u->f_nodes.len, "opt.lxl:901"))->f_k >= 0LL);
     }
     bool b25 = b22;
     if (b25) {
       int64_t ix26 = v_src_21;
-      int64_t t27 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix26, (*p_o)->f_u->f_locals.len, "opt.lxl:900"))->f_ty;
+      int64_t t27 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix26, (*p_o)->f_u->f_locals.len, "opt.lxl:901"))->f_ty;
       int64_t ix28 = v_n_3.f_a;
-      b25 = (bool)(t27 == ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix28, (*p_o)->f_u->f_locals.len, "opt.lxl:900"))->f_ty);
+      b25 = (bool)(t27 == ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix28, (*p_o)->f_u->f_locals.len, "opt.lxl:901"))->f_ty);
     }
     bool c29 = b25;
     if (c29) {
       int64_t ix30 = v_n_3.f_a;
-      ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix30, (*p_o)->f_ub.len, "opt.lxl:901"))->f_from = v_src_21;
+      ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix30, (*p_o)->f_ub.len, "opt.lxl:902"))->f_from = v_src_21;
       f873_opt_Opt_ubScan(p_o, v_n_3.f_b, (bool)1LL, p_any);
       return;
     }
@@ -77855,9 +78185,9 @@ static void f873_opt_Opt_ubScan(struct S82_opt_Opt**p_o, int64_t p_x, bool p_ok,
     int64_t v_l_35 = t34;
     f882_opt_Opt_ubAt(p_o, v_l_35);
     int64_t ix36 = v_l_35;
-    ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix36, (*p_o)->f_ub.len, "opt.lxl:912"))->f_uses = rt_add_int(((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix36, (*p_o)->f_ub.len, "opt.lxl:912"))->f_uses, 1LL, "opt.lxl:912");
+    ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix36, (*p_o)->f_ub.len, "opt.lxl:913"))->f_uses = rt_add_int(((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix36, (*p_o)->f_ub.len, "opt.lxl:913"))->f_uses, 1LL, "opt.lxl:913");
     int64_t ix37 = v_l_35;
-    ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix37, (*p_o)->f_ub.len, "opt.lxl:913"))->f_ok = rt_add_int(((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix37, (*p_o)->f_ub.len, "opt.lxl:913"))->f_ok, 1LL, "opt.lxl:913");
+    ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix37, (*p_o)->f_ub.len, "opt.lxl:914"))->f_ok = rt_add_int(((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix37, (*p_o)->f_ub.len, "opt.lxl:914"))->f_ok, 1LL, "opt.lxl:914");
     return;
   }
   bool c38 = (bool)(v_n_3.f_k == 9LL);
@@ -77877,10 +78207,10 @@ static void f873_opt_Opt_ubScan(struct S82_opt_Opt**p_o, int64_t p_x, bool p_ok,
     bool c44 = (bool)(t43 == 4LL);
     if (c44) {
       int64_t ix45 = v_n_3.f_a;
-      f882_opt_Opt_ubAt(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix45, (*p_o)->f_u->f_nodes.len, "opt.lxl:922"))->f_a);
+      f882_opt_Opt_ubAt(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix45, (*p_o)->f_u->f_nodes.len, "opt.lxl:923"))->f_a);
       int64_t ix46 = v_n_3.f_a;
-      int64_t ix47 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix46, (*p_o)->f_u->f_nodes.len, "opt.lxl:923"))->f_a;
-      ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix47, (*p_o)->f_ub.len, "opt.lxl:923"))->f_bad = (bool)1LL;
+      int64_t ix47 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix46, (*p_o)->f_u->f_nodes.len, "opt.lxl:924"))->f_a;
+      ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix47, (*p_o)->f_ub.len, "opt.lxl:924"))->f_bad = (bool)1LL;
     }
   }
   bool b48 = (bool)(v_n_3.f_k == 10LL);
@@ -77891,14 +78221,14 @@ static void f873_opt_Opt_ubScan(struct S82_opt_Opt**p_o, int64_t p_x, bool p_ok,
   bool c50 = b48;
   if (c50) {
     int64_t ix51 = v_n_3.f_a;
-    f882_opt_Opt_ubAt(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix51, (*p_o)->f_u->f_nodes.len, "opt.lxl:927"))->f_a);
+    f882_opt_Opt_ubAt(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix51, (*p_o)->f_u->f_nodes.len, "opt.lxl:928"))->f_a);
     int64_t ix52 = v_n_3.f_a;
-    int64_t ix53 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix52, (*p_o)->f_u->f_nodes.len, "opt.lxl:928"))->f_a;
-    ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix53, (*p_o)->f_ub.len, "opt.lxl:928"))->f_bad = (bool)1LL;
+    int64_t ix53 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix52, (*p_o)->f_u->f_nodes.len, "opt.lxl:929"))->f_a;
+    ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix53, (*p_o)->f_ub.len, "opt.lxl:929"))->f_bad = (bool)1LL;
   }
   lxl_slice t54 = k2_ir_KIDS;
   int64_t ix55 = v_n_3.f_k;
-  int64_t v_kc_56 = *((int64_t*)t54.data + rt_idx(ix55, t54.len, "opt.lxl:930"));
+  int64_t v_kc_56 = *((int64_t*)t54.data + rt_idx(ix55, t54.len, "opt.lxl:931"));
   bool b57 = (bool)(v_kc_56 == 0LL);
   if (!b57) {
     b57 = (bool)(v_kc_56 < 0LL);
@@ -77972,7 +78302,7 @@ static bool f883_opt_Opt_allocOf(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p
   bool b2 = (bool)(t1 != 13LL);
   if (!b2) {
     int64_t ix3 = p_pt;
-    int64_t t4 = f87_ir_Ir_tk(&(*p_o)->f_u, ((struct S33_ir_Ty*)(*p_o)->f_u->f_tys.data + rt_idx(ix3, (*p_o)->f_u->f_tys.len, "opt.lxl:858"))->f_base);
+    int64_t t4 = f87_ir_Ir_tk(&(*p_o)->f_u, ((struct S33_ir_Ty*)(*p_o)->f_u->f_tys.data + rt_idx(ix3, (*p_o)->f_u->f_tys.len, "opt.lxl:859"))->f_base);
     b2 = (bool)(t4 != 15LL);
   }
   bool c5 = b2;
@@ -77988,7 +78318,7 @@ static bool f883_opt_Opt_allocOf(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p
       break;
     }
     int64_t ix10 = v_c_7;
-    v_c_7 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:860"))->f_a;
+    v_c_7 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:861"))->f_a;
   }
   int64_t t11 = f82_ir_Ir_nk(&(*p_o)->f_u, v_c_7);
   bool b12 = (bool)(t11 != 7LL);
@@ -77999,7 +78329,7 @@ static bool f883_opt_Opt_allocOf(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p
   bool b14 = b12;
   if (!b14) {
     int64_t ix15 = v_c_7;
-    int64_t t16 = f77_ir_Ir_listLen(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix15, (*p_o)->f_u->f_nodes.len, "opt.lxl:861"))->f_b);
+    int64_t t16 = f77_ir_Ir_listLen(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix15, (*p_o)->f_u->f_nodes.len, "opt.lxl:862"))->f_b);
     b14 = (bool)(t16 != 1LL);
   }
   bool c17 = b14;
@@ -78008,15 +78338,15 @@ static bool f883_opt_Opt_allocOf(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p
     return r18;
   }
   int64_t ix19 = v_c_7;
-  int64_t t20 = f78_ir_Ir_listAt(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:862"))->f_b, 0LL);
+  int64_t t20 = f78_ir_Ir_listAt(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:863"))->f_b, 0LL);
   int64_t v_n_21 = t20;
   int64_t t22 = f82_ir_Ir_nk(&(*p_o)->f_u, v_n_21);
   bool b23 = (bool)(t22 == 1LL);
   if (b23) {
     int64_t ix24 = v_n_21;
-    int64_t t25 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix24, (*p_o)->f_u->f_nodes.len, "opt.lxl:863"))->f_v;
+    int64_t t25 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix24, (*p_o)->f_u->f_nodes.len, "opt.lxl:864"))->f_v;
     int64_t ix26 = p_pt;
-    int64_t t27 = f106_ir_Ir_sizeOf(&(*p_o)->f_u, ((struct S33_ir_Ty*)(*p_o)->f_u->f_tys.data + rt_idx(ix26, (*p_o)->f_u->f_tys.len, "opt.lxl:863"))->f_base);
+    int64_t t27 = f106_ir_Ir_sizeOf(&(*p_o)->f_u, ((struct S33_ir_Ty*)(*p_o)->f_u->f_tys.data + rt_idx(ix26, (*p_o)->f_u->f_tys.len, "opt.lxl:864"))->f_base);
     b23 = (bool)(t25 == t27);
   }
   bool r28 = b23;
@@ -78033,10 +78363,10 @@ static void f882_opt_Opt_ubAt(struct S82_opt_Opt**p_o, int64_t p_l) {
     *(struct S81_opt_Ub*)rt_arr_push(&(*p_o)->f_ub, 48ULL) = ap3;
   }
   int64_t ix4 = p_l;
-  bool c5 = (bool)!((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix4, (*p_o)->f_ub.len, "opt.lxl:839"))->f_seen;
+  bool c5 = (bool)!((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix4, (*p_o)->f_ub.len, "opt.lxl:840"))->f_seen;
   if (c5) {
     int64_t ix6 = p_l;
-    ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix6, (*p_o)->f_ub.len, "opt.lxl:840"))->f_seen = (bool)1LL;
+    ((struct S81_opt_Ub*)(*p_o)->f_ub.data + rt_idx(ix6, (*p_o)->f_ub.len, "opt.lxl:841"))->f_seen = (bool)1LL;
     int64_t ap7 = p_l;
     *(int64_t*)rt_arr_push(&(*p_o)->f_ubSeen, 8ULL) = ap7;
   }
@@ -78060,16 +78390,16 @@ static void f831_opt_Opt_stmtIn(struct S82_opt_Opt**p_o, int64_t p_s) {
     bool c5 = (bool)(v_k_3 == 42LL);
     if (c5) {
       int64_t ix6 = p_s;
-      int64_t t7 = f886_opt_Opt_bodyIn(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:1623"))->f_b);
+      int64_t t7 = f886_opt_Opt_bodyIn(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:1729"))->f_b);
       int64_t ix8 = p_s;
-      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix8, (*p_o)->f_u->f_nodes.len, "opt.lxl:1623"))->f_b = t7;
+      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix8, (*p_o)->f_u->f_nodes.len, "opt.lxl:1729"))->f_b = t7;
       int64_t ix9 = p_s;
-      bool c10 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix9, (*p_o)->f_u->f_nodes.len, "opt.lxl:1624"))->f_c >= 0LL);
+      bool c10 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix9, (*p_o)->f_u->f_nodes.len, "opt.lxl:1730"))->f_c >= 0LL);
       if (c10) {
         int64_t ix11 = p_s;
-        int64_t t12 = f886_opt_Opt_bodyIn(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix11, (*p_o)->f_u->f_nodes.len, "opt.lxl:1624"))->f_c);
+        int64_t t12 = f886_opt_Opt_bodyIn(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix11, (*p_o)->f_u->f_nodes.len, "opt.lxl:1730"))->f_c);
         int64_t ix13 = p_s;
-        ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:1624"))->f_c = t12;
+        ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:1730"))->f_c = t12;
       }
     } else {
       bool b14 = (bool)(v_k_3 == 43LL);
@@ -78079,16 +78409,16 @@ static void f831_opt_Opt_stmtIn(struct S82_opt_Opt**p_o, int64_t p_s) {
       bool c15 = b14;
       if (c15) {
         int64_t ix16 = p_s;
-        int64_t t17 = f886_opt_Opt_bodyIn(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix16, (*p_o)->f_u->f_nodes.len, "opt.lxl:1626"))->f_b);
+        int64_t t17 = f886_opt_Opt_bodyIn(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix16, (*p_o)->f_u->f_nodes.len, "opt.lxl:1732"))->f_b);
         int64_t ix18 = p_s;
-        ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix18, (*p_o)->f_u->f_nodes.len, "opt.lxl:1626"))->f_b = t17;
+        ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix18, (*p_o)->f_u->f_nodes.len, "opt.lxl:1732"))->f_b = t17;
       } else {
         bool c19 = (bool)(v_k_3 == 44LL);
         if (c19) {
           int64_t ix20 = p_s;
-          int64_t t21 = f886_opt_Opt_bodyIn(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix20, (*p_o)->f_u->f_nodes.len, "opt.lxl:1628"))->f_d);
+          int64_t t21 = f886_opt_Opt_bodyIn(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix20, (*p_o)->f_u->f_nodes.len, "opt.lxl:1734"))->f_d);
           int64_t ix22 = p_s;
-          ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix22, (*p_o)->f_u->f_nodes.len, "opt.lxl:1628"))->f_d = t21;
+          ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix22, (*p_o)->f_u->f_nodes.len, "opt.lxl:1734"))->f_d = t21;
         }
       }
     }
@@ -78108,7 +78438,7 @@ static int64_t f886_opt_Opt_bodyIn(struct S82_opt_Opt**p_o, int64_t p_s) {
   f887_opt_Opt_site(p_o, p_s, &v_out_5);
   bool b6 = (bool)(v_out_5.len == 1LL);
   if (b6) {
-    b6 = (bool)(*((int64_t*)v_out_5.data + rt_idx(0LL, v_out_5.len, "opt.lxl:1642")) == p_s);
+    b6 = (bool)(*((int64_t*)v_out_5.data + rt_idx(0LL, v_out_5.len, "opt.lxl:1748")) == p_s);
   }
   bool c7 = b6;
   if (c7) {
@@ -78129,7 +78459,7 @@ static void f887_opt_Opt_site(struct S82_opt_Opt**p_o, int64_t p_x, lxl_arr*p_ou
   bool c5 = (bool)(v_k_2 == 41LL);
   if (c5) {
     int64_t ix6 = p_x;
-    int64_t v_e_7 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:1667"))->f_a;
+    int64_t v_e_7 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:1773"))->f_a;
     int64_t t8 = f82_ir_Ir_nk(&(*p_o)->f_u, v_e_7);
     bool c9 = (bool)(t8 == 7LL);
     if (c9) {
@@ -78139,27 +78469,27 @@ static void f887_opt_Opt_site(struct S82_opt_Opt**p_o, int64_t p_x, lxl_arr*p_ou
       bool b11 = (bool)(t10 == 20LL);
       if (b11) {
         int64_t ix12 = v_e_7;
-        int64_t t13 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix12, (*p_o)->f_u->f_nodes.len, "opt.lxl:1670"))->f_b);
+        int64_t t13 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix12, (*p_o)->f_u->f_nodes.len, "opt.lxl:1776"))->f_b);
         b11 = (bool)(t13 == 7LL);
       }
       bool b14 = b11;
       if (b14) {
         int64_t ix15 = v_e_7;
-        int64_t t16 = f822_opt_Opt_root(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix15, (*p_o)->f_u->f_nodes.len, "opt.lxl:1670"))->f_a);
+        int64_t t16 = f822_opt_Opt_root(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix15, (*p_o)->f_u->f_nodes.len, "opt.lxl:1776"))->f_a);
         b14 = (bool)(t16 >= 0LL);
       }
       bool b17 = b14;
       if (b17) {
         int64_t ix18 = v_e_7;
-        int64_t ix19 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix18, (*p_o)->f_u->f_nodes.len, "opt.lxl:1671"))->f_b;
-        int64_t t20 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:1671"))->f_ty;
+        int64_t ix19 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix18, (*p_o)->f_u->f_nodes.len, "opt.lxl:1777"))->f_b;
+        int64_t t20 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:1777"))->f_ty;
         int64_t ix21 = v_e_7;
-        b17 = (bool)(t20 == ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix21, (*p_o)->f_u->f_nodes.len, "opt.lxl:1671"))->f_ty);
+        b17 = (bool)(t20 == ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix21, (*p_o)->f_u->f_nodes.len, "opt.lxl:1777"))->f_ty);
       }
       bool c22 = b17;
       if (c22) {
         int64_t ix23 = v_e_7;
-        v_c_3 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix23, (*p_o)->f_u->f_nodes.len, "opt.lxl:1672"))->f_b;
+        v_c_3 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix23, (*p_o)->f_u->f_nodes.len, "opt.lxl:1778"))->f_b;
         v_dest_4 = 2LL;
       }
     }
@@ -78167,58 +78497,58 @@ static void f887_opt_Opt_site(struct S82_opt_Opt**p_o, int64_t p_x, lxl_arr*p_ou
     bool b24 = (bool)(v_k_2 == 40LL);
     if (b24) {
       int64_t ix25 = p_x;
-      b24 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix25, (*p_o)->f_u->f_nodes.len, "opt.lxl:1675"))->f_c < 0LL);
+      b24 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix25, (*p_o)->f_u->f_nodes.len, "opt.lxl:1781"))->f_c < 0LL);
     }
     bool b26 = b24;
     if (b26) {
       int64_t ix27 = p_x;
-      b26 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix27, (*p_o)->f_u->f_nodes.len, "opt.lxl:1675"))->f_b >= 0LL);
+      b26 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix27, (*p_o)->f_u->f_nodes.len, "opt.lxl:1781"))->f_b >= 0LL);
     }
     bool b28 = b26;
     if (b28) {
       int64_t ix29 = p_x;
-      int64_t t30 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix29, (*p_o)->f_u->f_nodes.len, "opt.lxl:1675"))->f_b);
+      int64_t t30 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix29, (*p_o)->f_u->f_nodes.len, "opt.lxl:1781"))->f_b);
       b28 = (bool)(t30 == 7LL);
     }
     bool b31 = b28;
     if (b31) {
       int64_t ix32 = p_x;
-      int64_t ix33 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix32, (*p_o)->f_u->f_nodes.len, "opt.lxl:1676"))->f_b;
-      int64_t t34 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix33, (*p_o)->f_u->f_nodes.len, "opt.lxl:1676"))->f_ty;
+      int64_t ix33 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix32, (*p_o)->f_u->f_nodes.len, "opt.lxl:1782"))->f_b;
+      int64_t t34 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix33, (*p_o)->f_u->f_nodes.len, "opt.lxl:1782"))->f_ty;
       int64_t ix35 = p_x;
-      int64_t ix36 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix35, (*p_o)->f_u->f_nodes.len, "opt.lxl:1676"))->f_a;
-      b31 = (bool)(t34 == ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix36, (*p_o)->f_u->f_locals.len, "opt.lxl:1676"))->f_ty);
+      int64_t ix36 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix35, (*p_o)->f_u->f_nodes.len, "opt.lxl:1782"))->f_a;
+      b31 = (bool)(t34 == ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix36, (*p_o)->f_u->f_locals.len, "opt.lxl:1782"))->f_ty);
     }
     bool c37 = b31;
     if (c37) {
       int64_t ix38 = p_x;
-      v_c_3 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix38, (*p_o)->f_u->f_nodes.len, "opt.lxl:1677"))->f_b;
+      v_c_3 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix38, (*p_o)->f_u->f_nodes.len, "opt.lxl:1783"))->f_b;
       v_dest_4 = 1LL;
     } else {
       bool b39 = (bool)(v_k_2 == 47LL);
       if (b39) {
         int64_t ix40 = p_x;
-        b39 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix40, (*p_o)->f_u->f_nodes.len, "opt.lxl:1679"))->f_a >= 0LL);
+        b39 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix40, (*p_o)->f_u->f_nodes.len, "opt.lxl:1785"))->f_a >= 0LL);
       }
       bool b41 = b39;
       if (b41) {
         int64_t ix42 = p_x;
-        int64_t t43 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix42, (*p_o)->f_u->f_nodes.len, "opt.lxl:1679"))->f_a);
+        int64_t t43 = f82_ir_Ir_nk(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix42, (*p_o)->f_u->f_nodes.len, "opt.lxl:1785"))->f_a);
         b41 = (bool)(t43 == 7LL);
       }
       bool b44 = b41;
       if (b44) {
         int64_t ix45 = p_x;
-        int64_t ix46 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix45, (*p_o)->f_u->f_nodes.len, "opt.lxl:1680"))->f_a;
-        int64_t t47 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix46, (*p_o)->f_u->f_nodes.len, "opt.lxl:1680"))->f_ty;
+        int64_t ix46 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix45, (*p_o)->f_u->f_nodes.len, "opt.lxl:1786"))->f_a;
+        int64_t t47 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix46, (*p_o)->f_u->f_nodes.len, "opt.lxl:1786"))->f_ty;
         int64_t ix48 = (*p_o)->f_cur;
-        int64_t ix49 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix48, (*p_o)->f_u->f_funcs.len, "opt.lxl:1680")))->f_ty;
-        b44 = (bool)(t47 == ((struct S33_ir_Ty*)(*p_o)->f_u->f_tys.data + rt_idx(ix49, (*p_o)->f_u->f_tys.len, "opt.lxl:1680"))->f_base);
+        int64_t ix49 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix48, (*p_o)->f_u->f_funcs.len, "opt.lxl:1786")))->f_ty;
+        b44 = (bool)(t47 == ((struct S33_ir_Ty*)(*p_o)->f_u->f_tys.data + rt_idx(ix49, (*p_o)->f_u->f_tys.len, "opt.lxl:1786"))->f_base);
       }
       bool c50 = b44;
       if (c50) {
         int64_t ix51 = p_x;
-        v_c_3 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix51, (*p_o)->f_u->f_nodes.len, "opt.lxl:1681"))->f_a;
+        v_c_3 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix51, (*p_o)->f_u->f_nodes.len, "opt.lxl:1787"))->f_a;
         v_dest_4 = 3LL;
       }
     }
@@ -78242,7 +78572,7 @@ static void f887_opt_Opt_site(struct S82_opt_Opt**p_o, int64_t p_x, lxl_arr*p_ou
   int64_t ifx58;
   if (v_dest_4 == 1LL) {
     int64_t ix59 = p_x;
-    ifx58 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix59, (*p_o)->f_u->f_nodes.len, "opt.lxl:1695"))->f_a;
+    ifx58 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix59, (*p_o)->f_u->f_nodes.len, "opt.lxl:1801"))->f_a;
   } else {
     ifx58 = -1LL;
   }
@@ -78250,8 +78580,8 @@ static void f887_opt_Opt_site(struct S82_opt_Opt**p_o, int64_t p_x, lxl_arr*p_ou
   int64_t ifx60;
   if (v_dest_4 == 2LL) {
     int64_t ix61 = p_x;
-    int64_t ix62 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix61, (*p_o)->f_u->f_nodes.len, "opt.lxl:1696"))->f_a;
-    ifx60 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix62, (*p_o)->f_u->f_nodes.len, "opt.lxl:1696"))->f_a;
+    int64_t ix62 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix61, (*p_o)->f_u->f_nodes.len, "opt.lxl:1802"))->f_a;
+    ifx60 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix62, (*p_o)->f_u->f_nodes.len, "opt.lxl:1802"))->f_a;
   } else {
     ifx60 = -1LL;
   }
@@ -78259,38 +78589,38 @@ static void f887_opt_Opt_site(struct S82_opt_Opt**p_o, int64_t p_x, lxl_arr*p_ou
   int64_t ifx63;
   if (v_dest_4 == 2LL) {
     int64_t ix64 = p_x;
-    int64_t ix65 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix64, (*p_o)->f_u->f_nodes.len, "opt.lxl:1697"))->f_a;
-    ifx63 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix65, (*p_o)->f_u->f_nodes.len, "opt.lxl:1697"))->f_ty;
+    int64_t ix65 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix64, (*p_o)->f_u->f_nodes.len, "opt.lxl:1803"))->f_a;
+    ifx63 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix65, (*p_o)->f_u->f_nodes.len, "opt.lxl:1803"))->f_ty;
   } else {
     ifx63 = -1LL;
   }
   (*p_o)->f_aty = ifx63;
   int64_t ix66 = v_g_55;
-  *((int64_t*)(*p_o)->f_refs.data + rt_idx(ix66, (*p_o)->f_refs.len, "opt.lxl:1698")) = rt_sub_int(*((int64_t*)(*p_o)->f_refs.data + rt_idx(ix66, (*p_o)->f_refs.len, "opt.lxl:1698")), 1LL, "opt.lxl:1698");
+  *((int64_t*)(*p_o)->f_refs.data + rt_idx(ix66, (*p_o)->f_refs.len, "opt.lxl:1804")) = rt_sub_int(*((int64_t*)(*p_o)->f_refs.data + rt_idx(ix66, (*p_o)->f_refs.len, "opt.lxl:1804")), 1LL, "opt.lxl:1804");
   f890_opt_Opt_expand(p_o, v_c_3, v_g_55, p_out);
 }
 static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_g, lxl_arr*p_out) {
   int64_t ix1 = p_g;
-  bool c2 = *((bool*)(*p_o)->f_allocs.data + rt_idx(ix1, (*p_o)->f_allocs.len, "opt.lxl:1777"));
+  bool c2 = *((bool*)(*p_o)->f_allocs.data + rt_idx(ix1, (*p_o)->f_allocs.len, "opt.lxl:1883"));
   if (c2) {
     int64_t ix3 = (*p_o)->f_cur;
-    *((bool*)(*p_o)->f_allocs.data + rt_idx(ix3, (*p_o)->f_allocs.len, "opt.lxl:1777")) = (bool)1LL;
+    *((bool*)(*p_o)->f_allocs.data + rt_idx(ix3, (*p_o)->f_allocs.len, "opt.lxl:1883")) = (bool)1LL;
   }
   int64_t ix4 = p_g;
-  int64_t v_form_5 = *((int64_t*)(*p_o)->f_form.data + rt_idx(ix4, (*p_o)->f_form.len, "opt.lxl:1778"));
+  int64_t v_form_5 = *((int64_t*)(*p_o)->f_form.data + rt_idx(ix4, (*p_o)->f_form.len, "opt.lxl:1884"));
   int64_t ix6 = v_form_5;
-  int64_t v_fl_7 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:1779"))->f_a;
+  int64_t v_fl_7 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:1885"))->f_a;
   int64_t t8 = f77_ir_Ir_listLen(&(*p_o)->f_u, v_fl_7);
   int64_t v_n_9 = t8;
   int64_t ix10 = p_g;
-  int64_t v_rets_11 = *((int64_t*)(*p_o)->f_rets.data + rt_idx(ix10, (*p_o)->f_rets.len, "opt.lxl:1781"));
+  int64_t v_rets_11 = *((int64_t*)(*p_o)->f_rets.data + rt_idx(ix10, (*p_o)->f_rets.len, "opt.lxl:1887"));
   bool b12 = (bool)(v_rets_11 == 1LL);
   if (b12) {
     b12 = (bool)(v_n_9 > 0LL);
   }
   bool b13 = b12;
   if (b13) {
-    int64_t t14 = f78_ir_Ir_listAt(&(*p_o)->f_u, v_fl_7, rt_sub_int(v_n_9, 1LL, "opt.lxl:1782"));
+    int64_t t14 = f78_ir_Ir_listAt(&(*p_o)->f_u, v_fl_7, rt_sub_int(v_n_9, 1LL, "opt.lxl:1888"));
     int64_t t15 = f82_ir_Ir_nk(&(*p_o)->f_u, t14);
     b13 = (bool)(t15 == 47LL);
   }
@@ -78302,9 +78632,9 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
   }
   bool c17 = b16;
   if (c17) {
-    int64_t t18 = f78_ir_Ir_listAt(&(*p_o)->f_u, v_fl_7, rt_sub_int(v_n_9, 1LL, "opt.lxl:1786"));
+    int64_t t18 = f78_ir_Ir_listAt(&(*p_o)->f_u, v_fl_7, rt_sub_int(v_n_9, 1LL, "opt.lxl:1892"));
     int64_t ix19 = t18;
-    int64_t v_r_20 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:1786"))->f_a;
+    int64_t v_r_20 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix19, (*p_o)->f_u->f_nodes.len, "opt.lxl:1892"))->f_a;
     bool b21 = (bool)(v_r_20 >= 0LL);
     if (b21) {
       int64_t t22 = f82_ir_Ir_nk(&(*p_o)->f_u, v_r_20);
@@ -78313,7 +78643,7 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
     bool c23 = b21;
     if (c23) {
       int64_t ix24 = v_r_20;
-      int64_t v_q_25 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix24, (*p_o)->f_u->f_nodes.len, "opt.lxl:1788"))->f_a;
+      int64_t v_q_25 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix24, (*p_o)->f_u->f_nodes.len, "opt.lxl:1894"))->f_a;
       bool v_top_26 = (bool)0LL;
       int64_t t27 = f891_opt_Opt_npar(p_o, p_g);
       int64_t end28 = t27;
@@ -78332,7 +78662,7 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
         bool b37 = (bool)(t36 == 40LL);
         if (b37) {
           int64_t ix38 = v_s_35;
-          b37 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix38, (*p_o)->f_u->f_nodes.len, "opt.lxl:1795"))->f_a == v_q_25);
+          b37 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix38, (*p_o)->f_u->f_nodes.len, "opt.lxl:1901"))->f_a == v_q_25);
         }
         bool c39 = b37;
         if (c39) {
@@ -78342,14 +78672,14 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
       bool b40 = v_top_26;
       if (b40) {
         int64_t ix41 = v_q_25;
-        b40 = (bool)!*((bool*)(*p_o)->f_aTaken.data + rt_idx(ix41, (*p_o)->f_aTaken.len, "opt.lxl:1797"));
+        b40 = (bool)!*((bool*)(*p_o)->f_aTaken.data + rt_idx(ix41, (*p_o)->f_aTaken.len, "opt.lxl:1903"));
       }
       bool b42 = b40;
       if (b42) {
         int64_t ix43 = v_q_25;
-        int64_t t44 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix43, (*p_o)->f_u->f_locals.len, "opt.lxl:1797"))->f_ty;
+        int64_t t44 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix43, (*p_o)->f_u->f_locals.len, "opt.lxl:1903"))->f_ty;
         int64_t ix45 = (*p_o)->f_dl;
-        b42 = (bool)(t44 == ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix45, (*p_o)->f_u->f_locals.len, "opt.lxl:1797"))->f_ty);
+        b42 = (bool)(t44 == ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix45, (*p_o)->f_u->f_locals.len, "opt.lxl:1903"))->f_ty);
       }
       bool c46 = b42;
       if (c46) {
@@ -78363,9 +78693,9 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
   }
   bool c48 = b47;
   if (c48) {
-    int64_t t49 = f78_ir_Ir_listAt(&(*p_o)->f_u, v_fl_7, rt_sub_int(v_n_9, 1LL, "opt.lxl:1802"));
+    int64_t t49 = f78_ir_Ir_listAt(&(*p_o)->f_u, v_fl_7, rt_sub_int(v_n_9, 1LL, "opt.lxl:1908"));
     int64_t ix50 = t49;
-    int64_t v_r_51 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix50, (*p_o)->f_u->f_nodes.len, "opt.lxl:1802"))->f_a;
+    int64_t v_r_51 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix50, (*p_o)->f_u->f_nodes.len, "opt.lxl:1908"))->f_a;
     int64_t t52 = f822_opt_Opt_root(p_o, (*p_o)->f_lv);
     int64_t v_root_53 = t52;
     bool b54 = (bool)(v_r_51 >= 0LL);
@@ -78380,14 +78710,14 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
     bool b57 = b56;
     if (b57) {
       int64_t ix58 = v_root_53;
-      b57 = (bool)!*((bool*)(*p_o)->f_aTaken.data + rt_idx(ix58, (*p_o)->f_aTaken.len, "opt.lxl:1804"));
+      b57 = (bool)!*((bool*)(*p_o)->f_aTaken.data + rt_idx(ix58, (*p_o)->f_aTaken.len, "opt.lxl:1910"));
     }
     bool c59 = b57;
     if (c59) {
       int64_t ix60 = v_r_51;
-      int64_t v_q_61 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix60, (*p_o)->f_u->f_nodes.len, "opt.lxl:1805"))->f_a;
+      int64_t v_q_61 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix60, (*p_o)->f_u->f_nodes.len, "opt.lxl:1911"))->f_a;
       int64_t ix62 = p_c;
-      int64_t v_args_63 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix62, (*p_o)->f_u->f_nodes.len, "opt.lxl:1806"))->f_b;
+      int64_t v_args_63 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix62, (*p_o)->f_u->f_nodes.len, "opt.lxl:1912"))->f_b;
       int64_t t64 = f891_opt_Opt_npar(p_o, p_g);
       int64_t v_ps_65 = t64;
       int64_t end66 = v_ps_65;
@@ -78396,12 +78726,12 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
         bool b69 = (bool)(t68 == v_q_61);
         if (b69) {
           int64_t ix70 = v_q_61;
-          b69 = (bool)!*((bool*)(*p_o)->f_aTaken.data + rt_idx(ix70, (*p_o)->f_aTaken.len, "opt.lxl:1809"));
+          b69 = (bool)!*((bool*)(*p_o)->f_aTaken.data + rt_idx(ix70, (*p_o)->f_aTaken.len, "opt.lxl:1915"));
         }
         bool b71 = b69;
         if (b71) {
           int64_t ix72 = v_q_61;
-          b71 = (bool)(((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix72, (*p_o)->f_u->f_locals.len, "opt.lxl:1809"))->f_ty == (*p_o)->f_aty);
+          b71 = (bool)(((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix72, (*p_o)->f_u->f_locals.len, "opt.lxl:1915"))->f_ty == (*p_o)->f_aty);
         }
         bool b73 = b71;
         if (b73) {
@@ -78445,7 +78775,7 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
     *(int64_t*)rt_arr_push(p_out, 8ULL) = ap89;
   }
   int64_t ix90 = p_c;
-  int64_t v_args_91 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix90, (*p_o)->f_u->f_nodes.len, "opt.lxl:1824"))->f_b;
+  int64_t v_args_91 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix90, (*p_o)->f_u->f_nodes.len, "opt.lxl:1930"))->f_b;
   int64_t t92 = f891_opt_Opt_npar(p_o, p_g);
   int64_t v_np_93 = t92;
   int64_t end94 = v_np_93;
@@ -78453,7 +78783,7 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
     int64_t t96 = f892_opt_Opt_par(p_o, p_g, v_j_95);
     int64_t v_p_97 = t96;
     int64_t ix98 = v_p_97;
-    int64_t v_t_99 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix98, (*p_o)->f_u->f_locals.len, "opt.lxl:1828"))->f_ty;
+    int64_t v_t_99 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix98, (*p_o)->f_u->f_locals.len, "opt.lxl:1934"))->f_ty;
     int64_t t100 = f78_ir_Ir_listAt(&(*p_o)->f_u, v_args_91, v_j_95);
     int64_t v_x_101 = t100;
     int64_t ap102 = v_p_97;
@@ -78461,7 +78791,7 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
     bool b103 = (bool)(v_j_95 < 62LL);
     if (b103) {
       int64_t ix104 = p_g;
-      b103 = (bool)((rt_shr_int(*((int64_t*)(*p_o)->f_ro.data + rt_idx(ix104, (*p_o)->f_ro.len, "opt.lxl:1831")), v_j_95, "opt.lxl:1831") & 1LL) == 1LL);
+      b103 = (bool)((rt_shr_int(*((int64_t*)(*p_o)->f_ro.data + rt_idx(ix104, (*p_o)->f_ro.len, "opt.lxl:1937")), v_j_95, "opt.lxl:1937") & 1LL) == 1LL);
     }
     bool v_ro_105 = b103;
     bool b106 = (bool)(v_p_97 == (*p_o)->f_nrvo);
@@ -78471,16 +78801,16 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
     bool c107 = b106;
     if (c107) {
       int64_t ix108 = v_p_97;
-      *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix108, (*p_o)->f_mk.len, "opt.lxl:1833")) = 1LL;
+      *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix108, (*p_o)->f_mk.len, "opt.lxl:1939")) = 1LL;
       int64_t ix109 = v_p_97;
-      *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix109, (*p_o)->f_mv.len, "opt.lxl:1834")) = (*p_o)->f_lv;
+      *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix109, (*p_o)->f_mv.len, "opt.lxl:1940")) = (*p_o)->f_lv;
     } else {
       bool c110 = (bool)(v_p_97 == (*p_o)->f_nrvo);
       if (c110) {
         int64_t ix111 = v_p_97;
-        *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix111, (*p_o)->f_mk.len, "opt.lxl:1836")) = 0LL;
+        *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix111, (*p_o)->f_mk.len, "opt.lxl:1942")) = 0LL;
         int64_t ix112 = v_p_97;
-        *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix112, (*p_o)->f_mv.len, "opt.lxl:1837")) = (*p_o)->f_dl;
+        *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix112, (*p_o)->f_mv.len, "opt.lxl:1943")) = (*p_o)->f_dl;
         int64_t t113 = f849_opt_Opt_mk1(p_o, 40LL, 0LL, (*p_o)->f_dl, v_x_101, -1LL);
         int64_t ap114 = t113;
         *(int64_t*)rt_arr_push(p_out, 8ULL) = ap114;
@@ -78488,7 +78818,7 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
         bool b115 = v_ro_105;
         if (b115) {
           int64_t ix116 = v_x_101;
-          b115 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix116, (*p_o)->f_u->f_nodes.len, "opt.lxl:1839"))->f_ty == v_t_99);
+          b115 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix116, (*p_o)->f_u->f_nodes.len, "opt.lxl:1945"))->f_ty == v_t_99);
         }
         bool b117 = b115;
         if (b117) {
@@ -78513,9 +78843,9 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
         bool c125 = b119;
         if (c125) {
           int64_t ix126 = v_p_97;
-          *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix126, (*p_o)->f_mk.len, "opt.lxl:1844")) = 1LL;
+          *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix126, (*p_o)->f_mk.len, "opt.lxl:1950")) = 1LL;
           int64_t ix127 = v_p_97;
-          *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix127, (*p_o)->f_mv.len, "opt.lxl:1845")) = v_x_101;
+          *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix127, (*p_o)->f_mv.len, "opt.lxl:1951")) = v_x_101;
           f894_opt_Opt_unrefAll(p_o, v_x_101);
         } else {
           bool b128 = v_ro_105;
@@ -78526,9 +78856,9 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
           bool c130 = b128;
           if (c130) {
             int64_t ix131 = v_p_97;
-            *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix131, (*p_o)->f_mk.len, "opt.lxl:1848")) = 1LL;
+            *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix131, (*p_o)->f_mk.len, "opt.lxl:1954")) = 1LL;
             int64_t ix132 = v_p_97;
-            *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix132, (*p_o)->f_mv.len, "opt.lxl:1849")) = v_x_101;
+            *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix132, (*p_o)->f_mv.len, "opt.lxl:1955")) = v_x_101;
             f894_opt_Opt_unrefAll(p_o, v_x_101);
           } else {
             bool b133 = v_ro_105;
@@ -78539,21 +78869,21 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
             bool c135 = b133;
             if (c135) {
               int64_t ix136 = v_x_101;
-              int64_t t137 = f78_ir_Ir_listAt(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix136, (*p_o)->f_u->f_nodes.len, "opt.lxl:1853"))->f_b, 0LL);
+              int64_t t137 = f78_ir_Ir_listAt(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix136, (*p_o)->f_u->f_nodes.len, "opt.lxl:1959"))->f_b, 0LL);
               int64_t v_y_138 = t137;
               int64_t t139 = f632_ir_Ir_ptrTo(&(*p_o)->f_u, v_t_99);
               int64_t v_pt_140 = t139;
               int64_t ix141 = v_p_97;
-              lxl_str t142 = rt_str_dup(((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix141, (*p_o)->f_u->f_locals.len, "opt.lxl:1855"))->f_name);
+              lxl_str t142 = rt_str_dup(((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix141, (*p_o)->f_u->f_locals.len, "opt.lxl:1961"))->f_name);
               lxl_str v_pname_143 = t142;
               int64_t t144 = f839_opt_Opt_local(p_o, v_pname_143, v_pt_140, (bool)0LL);
               int64_t v_q_145 = t144;
               int64_t ix146 = v_p_97;
-              *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix146, (*p_o)->f_mk.len, "opt.lxl:1857")) = 3LL;
+              *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix146, (*p_o)->f_mk.len, "opt.lxl:1963")) = 3LL;
               int64_t ix147 = v_p_97;
-              *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix147, (*p_o)->f_mv.len, "opt.lxl:1858")) = v_q_145;
+              *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix147, (*p_o)->f_mv.len, "opt.lxl:1964")) = v_q_145;
               int64_t ix148 = v_x_101;
-              f894_opt_Opt_unrefAll(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix148, (*p_o)->f_u->f_nodes.len, "opt.lxl:1859"))->f_a);
+              f894_opt_Opt_unrefAll(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix148, (*p_o)->f_u->f_nodes.len, "opt.lxl:1965"))->f_a);
               int64_t t149 = v_q_145;
               int64_t t150 = f849_opt_Opt_mk1(p_o, 10LL, v_pt_140, v_y_138, -1LL, -1LL);
               int64_t t151 = f849_opt_Opt_mk1(p_o, 40LL, 0LL, t149, t150, -1LL);
@@ -78574,7 +78904,7 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
               bool b157 = b155;
               if (b157) {
                 int64_t ix158 = v_x_101;
-                b157 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix158, (*p_o)->f_u->f_nodes.len, "opt.lxl:1861"))->f_ty == v_t_99);
+                b157 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix158, (*p_o)->f_u->f_nodes.len, "opt.lxl:1967"))->f_ty == v_t_99);
               }
               bool b159 = b157;
               if (b159) {
@@ -78586,14 +78916,14 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
                 int64_t t162 = f632_ir_Ir_ptrTo(&(*p_o)->f_u, v_t_99);
                 int64_t v_pt_163 = t162;
                 int64_t ix164 = v_p_97;
-                lxl_str t165 = rt_str_dup(((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix164, (*p_o)->f_u->f_locals.len, "opt.lxl:1863"))->f_name);
+                lxl_str t165 = rt_str_dup(((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix164, (*p_o)->f_u->f_locals.len, "opt.lxl:1969"))->f_name);
                 lxl_str v_pname_166 = t165;
                 int64_t t167 = f839_opt_Opt_local(p_o, v_pname_166, v_pt_163, (bool)0LL);
                 int64_t v_q_168 = t167;
                 int64_t ix169 = v_p_97;
-                *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix169, (*p_o)->f_mk.len, "opt.lxl:1865")) = 2LL;
+                *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix169, (*p_o)->f_mk.len, "opt.lxl:1971")) = 2LL;
                 int64_t ix170 = v_p_97;
-                *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix170, (*p_o)->f_mv.len, "opt.lxl:1866")) = v_q_168;
+                *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix170, (*p_o)->f_mv.len, "opt.lxl:1972")) = v_q_168;
                 int64_t t171 = v_q_168;
                 int64_t t172 = f849_opt_Opt_mk1(p_o, 10LL, v_pt_163, v_x_101, -1LL, -1LL);
                 int64_t t173 = f849_opt_Opt_mk1(p_o, 40LL, 0LL, t171, t172, -1LL);
@@ -78602,15 +78932,15 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
                 rt_str_drop(v_pname_166);
               } else {
                 int64_t ix175 = v_p_97;
-                lxl_str t176 = rt_str_dup(((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix175, (*p_o)->f_u->f_locals.len, "opt.lxl:1869"))->f_name);
+                lxl_str t176 = rt_str_dup(((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix175, (*p_o)->f_u->f_locals.len, "opt.lxl:1975"))->f_name);
                 lxl_str v_pname_177 = t176;
                 int64_t ix178 = v_p_97;
-                int64_t t179 = f839_opt_Opt_local(p_o, v_pname_177, v_t_99, *((bool*)(*p_o)->f_aTaken.data + rt_idx(ix178, (*p_o)->f_aTaken.len, "opt.lxl:1870")));
+                int64_t t179 = f839_opt_Opt_local(p_o, v_pname_177, v_t_99, *((bool*)(*p_o)->f_aTaken.data + rt_idx(ix178, (*p_o)->f_aTaken.len, "opt.lxl:1976")));
                 int64_t v_q_180 = t179;
                 int64_t ix181 = v_p_97;
-                *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix181, (*p_o)->f_mk.len, "opt.lxl:1871")) = 0LL;
+                *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix181, (*p_o)->f_mk.len, "opt.lxl:1977")) = 0LL;
                 int64_t ix182 = v_p_97;
-                *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix182, (*p_o)->f_mv.len, "opt.lxl:1872")) = v_q_180;
+                *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix182, (*p_o)->f_mv.len, "opt.lxl:1978")) = v_q_180;
                 int64_t t183 = f849_opt_Opt_mk1(p_o, 40LL, 0LL, v_q_180, v_x_101, -1LL);
                 int64_t ap184 = t183;
                 *(int64_t*)rt_arr_push(p_out, 8ULL) = ap184;
@@ -78642,9 +78972,9 @@ static void f890_opt_Opt_expand(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_
   for (int64_t i196 = 0LL; i196 < ap195.len; i196++) {
     int64_t v_l_197 = *((int64_t*)ap195.data + i196);
     int64_t ix198 = v_l_197;
-    *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix198, (*p_o)->f_mk.len, "opt.lxl:1884")) = -1LL;
+    *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix198, (*p_o)->f_mk.len, "opt.lxl:1990")) = -1LL;
     int64_t ix199 = v_l_197;
-    *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix199, (*p_o)->f_mv.len, "opt.lxl:1885")) = -1LL;
+    *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix199, (*p_o)->f_mv.len, "opt.lxl:1991")) = -1LL;
   }
   gl10_drop(v_bs_194);
 }
@@ -78655,17 +78985,17 @@ static int64_t f899_opt_Opt_cl(struct S82_opt_Opt**p_o, int64_t p_x) {
     return r2;
   }
   int64_t ix3 = p_x;
-  int64_t v_k_4 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:2076"))->f_k;
+  int64_t v_k_4 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:2182"))->f_k;
   bool c5 = (bool)(v_k_4 == 4LL);
   if (c5) {
     int64_t ix6 = p_x;
-    int64_t v_l_7 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:2078"))->f_a;
+    int64_t v_l_7 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix6, (*p_o)->f_u->f_nodes.len, "opt.lxl:2184"))->f_a;
     int64_t ix8 = v_l_7;
-    int64_t v_m_9 = *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix8, (*p_o)->f_mk.len, "opt.lxl:2079"));
+    int64_t v_m_9 = *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix8, (*p_o)->f_mk.len, "opt.lxl:2185"));
     bool c10 = (bool)(v_m_9 == 1LL);
     if (c10) {
       int64_t ix11 = v_l_7;
-      int64_t t12 = f899_opt_Opt_cl(p_o, *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix11, (*p_o)->f_mv.len, "opt.lxl:2080")));
+      int64_t t12 = f899_opt_Opt_cl(p_o, *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix11, (*p_o)->f_mv.len, "opt.lxl:2186")));
       int64_t r13 = t12;
       return r13;
     }
@@ -78676,22 +79006,22 @@ static int64_t f899_opt_Opt_cl(struct S82_opt_Opt**p_o, int64_t p_x) {
     bool c15 = b14;
     if (c15) {
       int64_t ix16 = v_l_7;
-      int64_t ix17 = *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix16, (*p_o)->f_mv.len, "opt.lxl:2082"));
-      int64_t t18 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix17, (*p_o)->f_u->f_locals.len, "opt.lxl:2082"))->f_ty;
+      int64_t ix17 = *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix16, (*p_o)->f_mv.len, "opt.lxl:2188"));
+      int64_t t18 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix17, (*p_o)->f_u->f_locals.len, "opt.lxl:2188"))->f_ty;
       int64_t ix19 = v_l_7;
-      int64_t t20 = f849_opt_Opt_mk1(p_o, 4LL, t18, *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix19, (*p_o)->f_mv.len, "opt.lxl:2082")), -1LL, -1LL);
+      int64_t t20 = f849_opt_Opt_mk1(p_o, 4LL, t18, *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix19, (*p_o)->f_mv.len, "opt.lxl:2188")), -1LL, -1LL);
       int64_t v_p_21 = t20;
       int64_t ix22 = p_x;
-      int64_t t23 = f849_opt_Opt_mk1(p_o, 9LL, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix22, (*p_o)->f_u->f_nodes.len, "opt.lxl:2083"))->f_ty, v_p_21, -1LL, -1LL);
+      int64_t t23 = f849_opt_Opt_mk1(p_o, 9LL, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix22, (*p_o)->f_u->f_nodes.len, "opt.lxl:2189"))->f_ty, v_p_21, -1LL, -1LL);
       int64_t r24 = t23;
       return r24;
     }
     bool c25 = (bool)(v_m_9 == 0LL);
     if (c25) {
       int64_t ix26 = p_x;
-      int64_t t27 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix26, (*p_o)->f_u->f_nodes.len, "opt.lxl:2085"))->f_ty;
+      int64_t t27 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix26, (*p_o)->f_u->f_nodes.len, "opt.lxl:2191"))->f_ty;
       int64_t ix28 = v_l_7;
-      int64_t t29 = f849_opt_Opt_mk1(p_o, 4LL, t27, *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix28, (*p_o)->f_mv.len, "opt.lxl:2085")), -1LL, -1LL);
+      int64_t t29 = f849_opt_Opt_mk1(p_o, 4LL, t27, *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix28, (*p_o)->f_mv.len, "opt.lxl:2191")), -1LL, -1LL);
       int64_t r30 = t29;
       return r30;
     }
@@ -78699,7 +79029,7 @@ static int64_t f899_opt_Opt_cl(struct S82_opt_Opt**p_o, int64_t p_x) {
   bool c31 = (bool)(v_k_4 == 47LL);
   if (c31) {
     int64_t ix32 = p_x;
-    int64_t t33 = f900_opt_Opt_ret(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix32, (*p_o)->f_u->f_nodes.len, "opt.lxl:2087"))->f_a);
+    int64_t t33 = f900_opt_Opt_ret(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix32, (*p_o)->f_u->f_nodes.len, "opt.lxl:2193"))->f_a);
     int64_t r34 = t33;
     return r34;
   }
@@ -78712,21 +79042,21 @@ static int64_t f899_opt_Opt_cl(struct S82_opt_Opt**p_o, int64_t p_x) {
   bool b38 = (bool)(v_k_4 == 41LL);
   if (b38) {
     int64_t ix39 = p_x;
-    int64_t t40 = f819_opt_Opt_callee(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix39, (*p_o)->f_u->f_nodes.len, "opt.lxl:2089"))->f_a);
+    int64_t t40 = f819_opt_Opt_callee(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix39, (*p_o)->f_u->f_nodes.len, "opt.lxl:2195"))->f_a);
     b38 = (bool)(t40 == (*p_o)->f_dropF);
   }
   bool c41 = b38;
   if (c41) {
     int64_t ix42 = p_x;
-    int64_t ix43 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix42, (*p_o)->f_u->f_nodes.len, "opt.lxl:2091"))->f_a;
-    int64_t t44 = f78_ir_Ir_listAt(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix43, (*p_o)->f_u->f_nodes.len, "opt.lxl:2091"))->f_b, 0LL);
+    int64_t ix43 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix42, (*p_o)->f_u->f_nodes.len, "opt.lxl:2197"))->f_a;
+    int64_t t44 = f78_ir_Ir_listAt(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix43, (*p_o)->f_u->f_nodes.len, "opt.lxl:2197"))->f_b, 0LL);
     int64_t v_d_45 = t44;
     int64_t t46 = f82_ir_Ir_nk(&(*p_o)->f_u, v_d_45);
     bool b47 = (bool)(t46 == 4LL);
     if (b47) {
       int64_t ix48 = v_d_45;
-      int64_t ix49 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix48, (*p_o)->f_u->f_nodes.len, "opt.lxl:2092"))->f_a;
-      b47 = (bool)(*((int64_t*)(*p_o)->f_mk.data + rt_idx(ix49, (*p_o)->f_mk.len, "opt.lxl:2092")) == 3LL);
+      int64_t ix49 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix48, (*p_o)->f_u->f_nodes.len, "opt.lxl:2198"))->f_a;
+      b47 = (bool)(*((int64_t*)(*p_o)->f_mk.data + rt_idx(ix49, (*p_o)->f_mk.len, "opt.lxl:2198")) == 3LL);
     }
     bool c50 = b47;
     if (c50) {
@@ -78735,20 +79065,20 @@ static int64_t f899_opt_Opt_cl(struct S82_opt_Opt**p_o, int64_t p_x) {
     }
   }
   int64_t ix52 = p_x;
-  struct S32_ir_Node ap53 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix52, (*p_o)->f_u->f_nodes.len, "opt.lxl:2094"));
+  struct S32_ir_Node ap53 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix52, (*p_o)->f_u->f_nodes.len, "opt.lxl:2200"));
   *(struct S32_ir_Node*)rt_arr_push(&(*p_o)->f_u->f_nodes, 64ULL) = ap53;
-  (*p_o)->f_grown = rt_add_int((*p_o)->f_grown, 1LL, "opt.lxl:2095");
-  int64_t v_y_54 = rt_sub_int((*p_o)->f_u->f_nodes.len, 1LL, "opt.lxl:2096");
+  (*p_o)->f_grown = rt_add_int((*p_o)->f_grown, 1LL, "opt.lxl:2201");
+  int64_t v_y_54 = rt_sub_int((*p_o)->f_u->f_nodes.len, 1LL, "opt.lxl:2202");
   int64_t ix55 = p_x;
-  int64_t v_a_56 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix55, (*p_o)->f_u->f_nodes.len, "opt.lxl:2097"))->f_a;
+  int64_t v_a_56 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix55, (*p_o)->f_u->f_nodes.len, "opt.lxl:2203"))->f_a;
   int64_t ix57 = p_x;
-  int64_t v_b_58 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix57, (*p_o)->f_u->f_nodes.len, "opt.lxl:2098"))->f_b;
+  int64_t v_b_58 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix57, (*p_o)->f_u->f_nodes.len, "opt.lxl:2204"))->f_b;
   int64_t ix59 = p_x;
-  int64_t v_c_60 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix59, (*p_o)->f_u->f_nodes.len, "opt.lxl:2099"))->f_c;
+  int64_t v_c_60 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix59, (*p_o)->f_u->f_nodes.len, "opt.lxl:2205"))->f_c;
   bool c61 = (bool)(v_k_4 == 6LL);
   if (c61) {
     int64_t ix62 = v_a_56;
-    *((int64_t*)(*p_o)->f_refs.data + rt_idx(ix62, (*p_o)->f_refs.len, "opt.lxl:2100")) = rt_add_int(*((int64_t*)(*p_o)->f_refs.data + rt_idx(ix62, (*p_o)->f_refs.len, "opt.lxl:2100")), 1LL, "opt.lxl:2100");
+    *((int64_t*)(*p_o)->f_refs.data + rt_idx(ix62, (*p_o)->f_refs.len, "opt.lxl:2206")) = rt_add_int(*((int64_t*)(*p_o)->f_refs.data + rt_idx(ix62, (*p_o)->f_refs.len, "opt.lxl:2206")), 1LL, "opt.lxl:2206");
   }
   bool b63 = (bool)(v_k_4 == 1LL);
   if (!b63) {
@@ -78799,55 +79129,55 @@ static int64_t f899_opt_Opt_cl(struct S82_opt_Opt**p_o, int64_t p_x) {
   if (c75) {
     int64_t t76 = f899_opt_Opt_cl(p_o, v_a_56);
     int64_t ix77 = v_y_54;
-    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix77, (*p_o)->f_u->f_nodes.len, "opt.lxl:2106"))->f_a = t76;
+    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix77, (*p_o)->f_u->f_nodes.len, "opt.lxl:2212"))->f_a = t76;
     int64_t t78 = f901_opt_Opt_clList(p_o, v_b_58);
     int64_t ix79 = v_y_54;
-    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix79, (*p_o)->f_u->f_nodes.len, "opt.lxl:2107"))->f_b = t78;
+    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix79, (*p_o)->f_u->f_nodes.len, "opt.lxl:2213"))->f_b = t78;
   } else {
     bool c80 = (bool)(v_k_4 == 22LL);
     if (c80) {
       int64_t t81 = f901_opt_Opt_clList(p_o, v_b_58);
       int64_t ix82 = v_y_54;
-      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix82, (*p_o)->f_u->f_nodes.len, "opt.lxl:2109"))->f_b = t81;
+      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix82, (*p_o)->f_u->f_nodes.len, "opt.lxl:2215"))->f_b = t81;
     } else {
       bool c83 = (bool)(v_k_4 == 48LL);
       if (c83) {
         int64_t t84 = f901_opt_Opt_clList(p_o, v_a_56);
         int64_t ix85 = v_y_54;
-        ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix85, (*p_o)->f_u->f_nodes.len, "opt.lxl:2111"))->f_a = t84;
+        ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix85, (*p_o)->f_u->f_nodes.len, "opt.lxl:2217"))->f_a = t84;
       } else {
         bool c86 = (bool)(v_k_4 == 40LL);
         if (c86) {
           int64_t ix87 = v_a_56;
-          bool c88 = (bool)(*((int64_t*)(*p_o)->f_mk.data + rt_idx(ix87, (*p_o)->f_mk.len, "opt.lxl:2113")) == 0LL);
+          bool c88 = (bool)(*((int64_t*)(*p_o)->f_mk.data + rt_idx(ix87, (*p_o)->f_mk.len, "opt.lxl:2219")) == 0LL);
           if (c88) {
             int64_t ix89 = v_a_56;
-            int64_t t90 = *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix89, (*p_o)->f_mv.len, "opt.lxl:2113"));
+            int64_t t90 = *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix89, (*p_o)->f_mv.len, "opt.lxl:2219"));
             int64_t ix91 = v_y_54;
-            ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix91, (*p_o)->f_u->f_nodes.len, "opt.lxl:2113"))->f_a = t90;
+            ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix91, (*p_o)->f_u->f_nodes.len, "opt.lxl:2219"))->f_a = t90;
           }
           int64_t t92 = f899_opt_Opt_cl(p_o, v_b_58);
           int64_t ix93 = v_y_54;
-          ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix93, (*p_o)->f_u->f_nodes.len, "opt.lxl:2114"))->f_b = t92;
+          ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix93, (*p_o)->f_u->f_nodes.len, "opt.lxl:2220"))->f_b = t92;
           int64_t t94 = f901_opt_Opt_clList(p_o, v_c_60);
           int64_t ix95 = v_y_54;
-          ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix95, (*p_o)->f_u->f_nodes.len, "opt.lxl:2115"))->f_c = t94;
+          ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix95, (*p_o)->f_u->f_nodes.len, "opt.lxl:2221"))->f_c = t94;
         } else {
           bool c96 = (bool)(v_k_4 == 44LL);
           if (c96) {
             int64_t t97 = f899_opt_Opt_cl(p_o, v_a_56);
             int64_t ix98 = v_y_54;
-            ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix98, (*p_o)->f_u->f_nodes.len, "opt.lxl:2117"))->f_a = t97;
+            ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix98, (*p_o)->f_u->f_nodes.len, "opt.lxl:2223"))->f_a = t97;
             int64_t t99 = f899_opt_Opt_cl(p_o, v_b_58);
             int64_t ix100 = v_y_54;
-            ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix100, (*p_o)->f_u->f_nodes.len, "opt.lxl:2118"))->f_b = t99;
+            ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix100, (*p_o)->f_u->f_nodes.len, "opt.lxl:2224"))->f_b = t99;
             int64_t t101 = f899_opt_Opt_cl(p_o, v_c_60);
             int64_t ix102 = v_y_54;
-            ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix102, (*p_o)->f_u->f_nodes.len, "opt.lxl:2119"))->f_c = t101;
+            ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix102, (*p_o)->f_u->f_nodes.len, "opt.lxl:2225"))->f_c = t101;
             int64_t ix103 = p_x;
-            int64_t t104 = f902_opt_Opt_clBody(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix103, (*p_o)->f_u->f_nodes.len, "opt.lxl:2120"))->f_d);
+            int64_t t104 = f902_opt_Opt_clBody(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix103, (*p_o)->f_u->f_nodes.len, "opt.lxl:2226"))->f_d);
             int64_t ix105 = v_y_54;
-            ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix105, (*p_o)->f_u->f_nodes.len, "opt.lxl:2120"))->f_d = t104;
+            ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix105, (*p_o)->f_u->f_nodes.len, "opt.lxl:2226"))->f_d = t104;
           } else {
             bool c106 = (bool)(v_k_4 == 9LL);
             if (c106) {
@@ -78857,19 +79187,19 @@ static int64_t f899_opt_Opt_cl(struct S82_opt_Opt**p_o, int64_t p_x) {
               bool b110 = (bool)(t109 == 10LL);
               if (b110) {
                 int64_t ix111 = v_p_108;
-                int64_t ix112 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix111, (*p_o)->f_u->f_nodes.len, "opt.lxl:2124"))->f_a;
-                int64_t t113 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix112, (*p_o)->f_u->f_nodes.len, "opt.lxl:2124"))->f_ty;
+                int64_t ix112 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix111, (*p_o)->f_u->f_nodes.len, "opt.lxl:2230"))->f_a;
+                int64_t t113 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix112, (*p_o)->f_u->f_nodes.len, "opt.lxl:2230"))->f_ty;
                 int64_t ix114 = p_x;
-                b110 = (bool)(t113 == ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix114, (*p_o)->f_u->f_nodes.len, "opt.lxl:2124"))->f_ty);
+                b110 = (bool)(t113 == ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix114, (*p_o)->f_u->f_nodes.len, "opt.lxl:2230"))->f_ty);
               }
               bool c115 = b110;
               if (c115) {
                 int64_t ix116 = v_p_108;
-                int64_t r117 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix116, (*p_o)->f_u->f_nodes.len, "opt.lxl:2124"))->f_a;
+                int64_t r117 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix116, (*p_o)->f_u->f_nodes.len, "opt.lxl:2230"))->f_a;
                 return r117;
               }
               int64_t ix118 = v_y_54;
-              ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix118, (*p_o)->f_u->f_nodes.len, "opt.lxl:2125"))->f_a = v_p_108;
+              ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix118, (*p_o)->f_u->f_nodes.len, "opt.lxl:2231"))->f_a = v_p_108;
             } else {
               bool b119 = (bool)(v_k_4 == 8LL);
               if (!b119) {
@@ -78911,7 +79241,7 @@ static int64_t f899_opt_Opt_cl(struct S82_opt_Opt**p_o, int64_t p_x) {
               if (c128) {
                 int64_t t129 = f899_opt_Opt_cl(p_o, v_a_56);
                 int64_t ix130 = v_y_54;
-                ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix130, (*p_o)->f_u->f_nodes.len, "opt.lxl:2128"))->f_a = t129;
+                ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix130, (*p_o)->f_u->f_nodes.len, "opt.lxl:2234"))->f_a = t129;
               } else {
                 bool b131 = (bool)(v_k_4 == 49LL);
                 if (!b131) {
@@ -78921,10 +79251,10 @@ static int64_t f899_opt_Opt_cl(struct S82_opt_Opt**p_o, int64_t p_x) {
                 if (c132) {
                   int64_t t133 = f899_opt_Opt_cl(p_o, v_a_56);
                   int64_t ix134 = v_y_54;
-                  ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix134, (*p_o)->f_u->f_nodes.len, "opt.lxl:2130"))->f_a = t133;
+                  ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix134, (*p_o)->f_u->f_nodes.len, "opt.lxl:2236"))->f_a = t133;
                   int64_t t135 = f902_opt_Opt_clBody(p_o, v_b_58);
                   int64_t ix136 = v_y_54;
-                  ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix136, (*p_o)->f_u->f_nodes.len, "opt.lxl:2131"))->f_b = t135;
+                  ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix136, (*p_o)->f_u->f_nodes.len, "opt.lxl:2237"))->f_b = t135;
                 } else {
                   bool b137 = (bool)(v_k_4 == 13LL);
                   if (!b137) {
@@ -78946,37 +79276,37 @@ static int64_t f899_opt_Opt_cl(struct S82_opt_Opt**p_o, int64_t p_x) {
                   if (c141) {
                     int64_t t142 = f899_opt_Opt_cl(p_o, v_a_56);
                     int64_t ix143 = v_y_54;
-                    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix143, (*p_o)->f_u->f_nodes.len, "opt.lxl:2133"))->f_a = t142;
+                    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix143, (*p_o)->f_u->f_nodes.len, "opt.lxl:2239"))->f_a = t142;
                     int64_t t144 = f899_opt_Opt_cl(p_o, v_b_58);
                     int64_t ix145 = v_y_54;
-                    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix145, (*p_o)->f_u->f_nodes.len, "opt.lxl:2134"))->f_b = t144;
+                    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix145, (*p_o)->f_u->f_nodes.len, "opt.lxl:2240"))->f_b = t144;
                   } else {
                     bool c146 = (bool)(v_k_4 == 42LL);
                     if (c146) {
                       int64_t t147 = f899_opt_Opt_cl(p_o, v_a_56);
                       int64_t ix148 = v_y_54;
-                      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix148, (*p_o)->f_u->f_nodes.len, "opt.lxl:2136"))->f_a = t147;
+                      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix148, (*p_o)->f_u->f_nodes.len, "opt.lxl:2242"))->f_a = t147;
                       int64_t t149 = f902_opt_Opt_clBody(p_o, v_b_58);
                       int64_t ix150 = v_y_54;
-                      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix150, (*p_o)->f_u->f_nodes.len, "opt.lxl:2137"))->f_b = t149;
+                      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix150, (*p_o)->f_u->f_nodes.len, "opt.lxl:2243"))->f_b = t149;
                       int64_t t151 = f899_opt_Opt_cl(p_o, v_c_60);
                       int64_t ix152 = v_y_54;
-                      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix152, (*p_o)->f_u->f_nodes.len, "opt.lxl:2138"))->f_c = t151;
+                      ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix152, (*p_o)->f_u->f_nodes.len, "opt.lxl:2244"))->f_c = t151;
                     } else {
                       bool c153 = (bool)(v_k_4 == 19LL);
                       if (c153) {
                         int64_t t154 = f899_opt_Opt_cl(p_o, v_a_56);
                         int64_t ix155 = v_y_54;
-                        ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix155, (*p_o)->f_u->f_nodes.len, "opt.lxl:2140"))->f_a = t154;
+                        ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix155, (*p_o)->f_u->f_nodes.len, "opt.lxl:2246"))->f_a = t154;
                         int64_t t156 = f899_opt_Opt_cl(p_o, v_b_58);
                         int64_t ix157 = v_y_54;
-                        ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix157, (*p_o)->f_u->f_nodes.len, "opt.lxl:2141"))->f_b = t156;
+                        ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix157, (*p_o)->f_u->f_nodes.len, "opt.lxl:2247"))->f_b = t156;
                         int64_t t158 = f899_opt_Opt_cl(p_o, v_c_60);
                         int64_t ix159 = v_y_54;
-                        ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix159, (*p_o)->f_u->f_nodes.len, "opt.lxl:2142"))->f_c = t158;
+                        ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix159, (*p_o)->f_u->f_nodes.len, "opt.lxl:2248"))->f_c = t158;
                       } else {
                         int64_t ix160 = p_x;
-                        int64_t t161 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix160, (*p_o)->f_u->f_nodes.len, "opt.lxl:2144"))->f_line;
+                        int64_t t161 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix160, (*p_o)->f_u->f_nodes.len, "opt.lxl:2250"))->f_line;
                         lxl_str t162 = sl9417;
                         lxl_str t163 = rt_int_to_str(v_k_4);
                         lxl_str t164 = rt_str_concat(t162, t163);
@@ -79083,7 +79413,7 @@ static int64_t f900_opt_Opt_ret(struct S82_opt_Opt**p_o, int64_t p_r) {
       return r22;
     }
     int64_t ix23 = (*p_o)->f_dl;
-    int64_t v_t_24 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix23, (*p_o)->f_u->f_locals.len, "opt.lxl:2063"))->f_ty;
+    int64_t v_t_24 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix23, (*p_o)->f_u->f_locals.len, "opt.lxl:2169"))->f_ty;
     int64_t t25 = v_t_24;
     int64_t t26 = f849_opt_Opt_mk1(p_o, 4LL, v_t_24, (*p_o)->f_dl, -1LL, -1LL);
     int64_t t27 = f899_opt_Opt_cl(p_o, p_r);
@@ -79117,36 +79447,36 @@ static void f898_opt_Opt_declare(struct S82_opt_Opt**p_o, int64_t p_x) {
   bool c4 = (bool)(v_k_3 == 40LL);
   if (c4) {
     int64_t ix5 = p_x;
-    int64_t v_l_6 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix5, (*p_o)->f_u->f_nodes.len, "opt.lxl:2027"))->f_a;
+    int64_t v_l_6 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix5, (*p_o)->f_u->f_nodes.len, "opt.lxl:2133"))->f_a;
     int64_t ix7 = v_l_6;
-    bool c8 = (bool)(*((int64_t*)(*p_o)->f_mk.data + rt_idx(ix7, (*p_o)->f_mk.len, "opt.lxl:2028")) == -1LL);
+    bool c8 = (bool)(*((int64_t*)(*p_o)->f_mk.data + rt_idx(ix7, (*p_o)->f_mk.len, "opt.lxl:2134")) == -1LL);
     if (c8) {
       int64_t ap9 = v_l_6;
       *(int64_t*)rt_arr_push(&(*p_o)->f_bound, 8ULL) = ap9;
       int64_t ix10 = v_l_6;
-      *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix10, (*p_o)->f_mk.len, "opt.lxl:2030")) = 0LL;
+      *((int64_t*)(*p_o)->f_mk.data + rt_idx(ix10, (*p_o)->f_mk.len, "opt.lxl:2136")) = 0LL;
       int64_t ix11 = v_l_6;
-      lxl_str t12 = rt_str_dup(((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix11, (*p_o)->f_u->f_locals.len, "opt.lxl:2031"))->f_name);
+      lxl_str t12 = rt_str_dup(((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix11, (*p_o)->f_u->f_locals.len, "opt.lxl:2137"))->f_name);
       lxl_str v_pname_13 = t12;
       int64_t ifx14;
       if (v_l_6 == (*p_o)->f_nrvo) {
         ifx14 = (*p_o)->f_dl;
       } else {
         int64_t ix15 = v_l_6;
-        int64_t t16 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix15, (*p_o)->f_u->f_locals.len, "opt.lxl:2032"))->f_ty;
+        int64_t t16 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix15, (*p_o)->f_u->f_locals.len, "opt.lxl:2138"))->f_ty;
         int64_t ix17 = v_l_6;
-        int64_t t18 = f839_opt_Opt_local(p_o, v_pname_13, t16, *((bool*)(*p_o)->f_aTaken.data + rt_idx(ix17, (*p_o)->f_aTaken.len, "opt.lxl:2032")));
+        int64_t t18 = f839_opt_Opt_local(p_o, v_pname_13, t16, *((bool*)(*p_o)->f_aTaken.data + rt_idx(ix17, (*p_o)->f_aTaken.len, "opt.lxl:2138")));
         ifx14 = t18;
       }
       int64_t ix19 = v_l_6;
-      *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix19, (*p_o)->f_mv.len, "opt.lxl:2032")) = ifx14;
+      *((int64_t*)(*p_o)->f_mv.data + rt_idx(ix19, (*p_o)->f_mv.len, "opt.lxl:2138")) = ifx14;
       rt_str_drop(v_pname_13);
     }
   } else {
     bool c20 = (bool)(v_k_3 == 48LL);
     if (c20) {
       int64_t ix21 = p_x;
-      int64_t v_l_22 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix21, (*p_o)->f_u->f_nodes.len, "opt.lxl:2035"))->f_a;
+      int64_t v_l_22 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix21, (*p_o)->f_u->f_nodes.len, "opt.lxl:2141"))->f_a;
       int64_t t23 = f77_ir_Ir_listLen(&(*p_o)->f_u, v_l_22);
       int64_t end24 = t23;
       for (int64_t v_j_25 = 0LL; v_j_25 < end24; v_j_25++) {
@@ -79157,9 +79487,9 @@ static void f898_opt_Opt_declare(struct S82_opt_Opt**p_o, int64_t p_x) {
       bool c27 = (bool)(v_k_3 == 42LL);
       if (c27) {
         int64_t ix28 = p_x;
-        f898_opt_Opt_declare(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix28, (*p_o)->f_u->f_nodes.len, "opt.lxl:2038"))->f_b);
+        f898_opt_Opt_declare(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix28, (*p_o)->f_u->f_nodes.len, "opt.lxl:2144"))->f_b);
         int64_t ix29 = p_x;
-        f898_opt_Opt_declare(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix29, (*p_o)->f_u->f_nodes.len, "opt.lxl:2039"))->f_c);
+        f898_opt_Opt_declare(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix29, (*p_o)->f_u->f_nodes.len, "opt.lxl:2145"))->f_c);
       } else {
         bool b30 = (bool)(v_k_3 == 43LL);
         if (!b30) {
@@ -79168,14 +79498,14 @@ static void f898_opt_Opt_declare(struct S82_opt_Opt**p_o, int64_t p_x) {
         bool c31 = b30;
         if (c31) {
           int64_t ix32 = p_x;
-          f898_opt_Opt_declare(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix32, (*p_o)->f_u->f_nodes.len, "opt.lxl:2041"))->f_b);
+          f898_opt_Opt_declare(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix32, (*p_o)->f_u->f_nodes.len, "opt.lxl:2147"))->f_b);
         } else {
           bool c33 = (bool)(v_k_3 == 44LL);
           if (c33) {
             int64_t ix34 = p_x;
-            f898_opt_Opt_declare(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix34, (*p_o)->f_u->f_nodes.len, "opt.lxl:2043"))->f_a);
+            f898_opt_Opt_declare(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix34, (*p_o)->f_u->f_nodes.len, "opt.lxl:2149"))->f_a);
             int64_t ix35 = p_x;
-            f898_opt_Opt_declare(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix35, (*p_o)->f_u->f_nodes.len, "opt.lxl:2044"))->f_d);
+            f898_opt_Opt_declare(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix35, (*p_o)->f_u->f_nodes.len, "opt.lxl:2150"))->f_d);
           }
         }
       }
@@ -79184,7 +79514,7 @@ static void f898_opt_Opt_declare(struct S82_opt_Opt**p_o, int64_t p_x) {
 }
 static bool f897_opt_Opt_dropGlue(struct S82_opt_Opt**p_o, int64_t p_f) {
   int64_t ix1 = p_f;
-  lxl_str v_n_2 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix1, (*p_o)->f_u->f_funcs.len, "opt.lxl:1771")))->f_name;
+  lxl_str v_n_2 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix1, (*p_o)->f_u->f_funcs.len, "opt.lxl:1877")))->f_name;
   bool t3 = f11_strings_startsWith(v_n_2, sl9418);
   bool b4 = t3;
   if (b4) {
@@ -79196,7 +79526,7 @@ static bool f897_opt_Opt_dropGlue(struct S82_opt_Opt**p_o, int64_t p_f) {
 }
 static bool f896_opt_Opt_lends(struct S82_opt_Opt**p_o, int64_t p_form, int64_t p_p, int64_t p_x, int64_t p_args, int64_t p_j) {
   int64_t ix1 = p_p;
-  int64_t v_t_2 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix1, (*p_o)->f_u->f_locals.len, "opt.lxl:1896"))->f_ty;
+  int64_t v_t_2 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix1, (*p_o)->f_u->f_locals.len, "opt.lxl:2002"))->f_ty;
   bool b3 = (bool)((*p_o)->f_dupF < 0LL);
   if (!b3) {
     b3 = (bool)((*p_o)->f_dropF < 0LL);
@@ -79204,7 +79534,7 @@ static bool f896_opt_Opt_lends(struct S82_opt_Opt**p_o, int64_t p_form, int64_t 
   bool b4 = b3;
   if (!b4) {
     int64_t ix5 = p_p;
-    b4 = *((bool*)(*p_o)->f_aTaken.data + rt_idx(ix5, (*p_o)->f_aTaken.len, "opt.lxl:1897"));
+    b4 = *((bool*)(*p_o)->f_aTaken.data + rt_idx(ix5, (*p_o)->f_aTaken.len, "opt.lxl:2003"));
   }
   bool b6 = b4;
   if (!b6) {
@@ -79214,7 +79544,7 @@ static bool f896_opt_Opt_lends(struct S82_opt_Opt**p_o, int64_t p_form, int64_t 
   bool b8 = b6;
   if (!b8) {
     int64_t ix9 = p_x;
-    int64_t t10 = f77_ir_Ir_listLen(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix9, (*p_o)->f_u->f_nodes.len, "opt.lxl:1897"))->f_b);
+    int64_t t10 = f77_ir_Ir_listLen(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix9, (*p_o)->f_u->f_nodes.len, "opt.lxl:2003"))->f_b);
     b8 = (bool)(t10 != 1LL);
   }
   bool c11 = b8;
@@ -79223,13 +79553,13 @@ static bool f896_opt_Opt_lends(struct S82_opt_Opt**p_o, int64_t p_form, int64_t 
     return r12;
   }
   int64_t ix13 = p_x;
-  int64_t t14 = f78_ir_Ir_listAt(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:1900"))->f_b, 0LL);
+  int64_t t14 = f78_ir_Ir_listAt(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:2006"))->f_b, 0LL);
   int64_t v_y_15 = t14;
   int64_t ix16 = v_y_15;
-  bool b17 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix16, (*p_o)->f_u->f_nodes.len, "opt.lxl:1901"))->f_ty != v_t_2);
+  bool b17 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix16, (*p_o)->f_u->f_nodes.len, "opt.lxl:2007"))->f_ty != v_t_2);
   if (!b17) {
     int64_t ix18 = p_x;
-    b17 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix18, (*p_o)->f_u->f_nodes.len, "opt.lxl:1901"))->f_ty != v_t_2);
+    b17 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix18, (*p_o)->f_u->f_nodes.len, "opt.lxl:2007"))->f_ty != v_t_2);
   }
   bool b19 = b17;
   if (!b19) {
@@ -79241,7 +79571,7 @@ static bool f896_opt_Opt_lends(struct S82_opt_Opt**p_o, int64_t p_form, int64_t 
     bool r22 = (bool)0LL;
     return r22;
   }
-  int64_t t23 = rt_add_int(p_j, 1LL, "opt.lxl:1902");
+  int64_t t23 = rt_add_int(p_j, 1LL, "opt.lxl:2008");
   int64_t t24 = f77_ir_Ir_listLen(&(*p_o)->f_u, p_args);
   int64_t end25 = t24;
   for (int64_t v_m_26 = t23; v_m_26 < end25; v_m_26++) {
@@ -79264,17 +79594,17 @@ static bool f903_opt_Opt_calm(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p_p,
     return r2;
   }
   int64_t ix3 = p_x;
-  int64_t v_k_4 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:1926"))->f_k;
+  int64_t v_k_4 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:2032"))->f_k;
   lxl_slice t5 = k2_ir_KIDS;
   int64_t ix6 = v_k_4;
-  int64_t v_kc_7 = *((int64_t*)t5.data + rt_idx(ix6, t5.len, "opt.lxl:1927"));
+  int64_t v_kc_7 = *((int64_t*)t5.data + rt_idx(ix6, t5.len, "opt.lxl:2033"));
   bool c8 = (bool)(v_kc_7 < 0LL);
   if (c8) {
     bool r9 = (bool)0LL;
     return r9;
   }
   int64_t ix10 = p_x;
-  int64_t v_a_11 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:1929"))->f_a;
+  int64_t v_a_11 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:2035"))->f_a;
   bool c12 = (bool)(v_k_4 == 4LL);
   if (c12) {
     bool b13 = (bool)(v_a_11 != p_p);
@@ -79336,7 +79666,7 @@ static bool f903_opt_Opt_calm(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p_p,
     bool b36 = t35;
     if (b36) {
       int64_t ix37 = p_x;
-      bool t38 = f903_opt_Opt_calm(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix37, (*p_o)->f_u->f_nodes.len, "opt.lxl:1940"))->f_b, p_p, (bool)0LL);
+      bool t38 = f903_opt_Opt_calm(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix37, (*p_o)->f_u->f_nodes.len, "opt.lxl:2046"))->f_b, p_p, (bool)0LL);
       b36 = t38;
     }
     bool r39 = b36;
@@ -79354,19 +79684,19 @@ static bool f903_opt_Opt_calm(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p_p,
   bool b43 = b41;
   if (b43) {
     int64_t ix44 = v_a_11;
-    int64_t t45 = f77_ir_Ir_listLen(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix44, (*p_o)->f_u->f_nodes.len, "opt.lxl:1942"))->f_b);
+    int64_t t45 = f77_ir_Ir_listLen(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix44, (*p_o)->f_u->f_nodes.len, "opt.lxl:2048"))->f_b);
     b43 = (bool)(t45 == 1LL);
   }
   bool c46 = b43;
   if (c46) {
     int64_t ix47 = v_a_11;
-    int64_t t48 = f78_ir_Ir_listAt(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix47, (*p_o)->f_u->f_nodes.len, "opt.lxl:1943"))->f_b, 0LL);
+    int64_t t48 = f78_ir_Ir_listAt(&(*p_o)->f_u, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix47, (*p_o)->f_u->f_nodes.len, "opt.lxl:2049"))->f_b, 0LL);
     int64_t v_d_49 = t48;
     int64_t t50 = f82_ir_Ir_nk(&(*p_o)->f_u, v_d_49);
     bool b51 = (bool)(t50 == 4LL);
     if (b51) {
       int64_t ix52 = v_d_49;
-      b51 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix52, (*p_o)->f_u->f_nodes.len, "opt.lxl:1944"))->f_a == p_p);
+      b51 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix52, (*p_o)->f_u->f_nodes.len, "opt.lxl:2050"))->f_a == p_p);
     }
     bool c53 = b51;
     if (c53) {
@@ -79381,17 +79711,17 @@ static bool f903_opt_Opt_calm(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p_p,
     bool b58 = (bool)(v_f_57 < 0LL);
     if (!b58) {
       int64_t ix59 = v_f_57;
-      b58 = (bool)((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix59, (*p_o)->f_u->f_funcs.len, "opt.lxl:1948")))->f_body >= 0LL);
+      b58 = (bool)((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix59, (*p_o)->f_u->f_funcs.len, "opt.lxl:2054")))->f_body >= 0LL);
     }
     bool b60 = b58;
     if (!b60) {
       int64_t ix61 = v_f_57;
-      b60 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix61, (*p_o)->f_u->f_funcs.len, "opt.lxl:1948")))->f_isExtern;
+      b60 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix61, (*p_o)->f_u->f_funcs.len, "opt.lxl:2054")))->f_isExtern;
     }
     bool b62 = b60;
     if (!b62) {
       int64_t ix63 = v_f_57;
-      bool t64 = f904_opt_named(k3_opt_CALM, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix63, (*p_o)->f_u->f_funcs.len, "opt.lxl:1948")))->f_name);
+      bool t64 = f904_opt_named(k3_opt_CALM, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix63, (*p_o)->f_u->f_funcs.len, "opt.lxl:2054")))->f_name);
       b62 = (bool)!t64;
     }
     bool c65 = b62;
@@ -79400,10 +79730,10 @@ static bool f903_opt_Opt_calm(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p_p,
       return r66;
     }
     int64_t ix67 = v_f_57;
-    bool t68 = f904_opt_named(k3_opt_READS, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix67, (*p_o)->f_u->f_funcs.len, "opt.lxl:1949")))->f_name);
+    bool t68 = f904_opt_named(k3_opt_READS, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix67, (*p_o)->f_u->f_funcs.len, "opt.lxl:2055")))->f_name);
     bool v_r_69 = t68;
     int64_t ix70 = p_x;
-    int64_t v_l_71 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix70, (*p_o)->f_u->f_nodes.len, "opt.lxl:1950"))->f_b;
+    int64_t v_l_71 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix70, (*p_o)->f_u->f_nodes.len, "opt.lxl:2056"))->f_b;
     int64_t t72 = f77_ir_Ir_listLen(&(*p_o)->f_u, v_l_71);
     int64_t end73 = t72;
     for (int64_t v_i_74 = 0LL; v_i_74 < end73; v_i_74++) {
@@ -79425,7 +79755,7 @@ static bool f903_opt_Opt_calm(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p_p,
     return r82;
   }
   int64_t ix83 = p_x;
-  int64_t v_b_84 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix83, (*p_o)->f_u->f_nodes.len, "opt.lxl:1957"))->f_b;
+  int64_t v_b_84 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix83, (*p_o)->f_u->f_nodes.len, "opt.lxl:2063"))->f_b;
   bool c85 = (bool)(v_kc_7 == 1LL);
   if (c85) {
     bool t86 = f903_opt_Opt_calm(p_o, v_a_11, p_p, (bool)0LL);
@@ -79470,7 +79800,7 @@ static bool f903_opt_Opt_calm(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p_p,
     return r106;
   }
   int64_t ix107 = p_x;
-  int64_t v_c_108 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix107, (*p_o)->f_u->f_nodes.len, "opt.lxl:1968"))->f_c;
+  int64_t v_c_108 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix107, (*p_o)->f_u->f_nodes.len, "opt.lxl:2074"))->f_c;
   bool c109 = (bool)(v_kc_7 == 3LL);
   if (c109) {
     bool t110 = f903_opt_Opt_calm(p_o, v_a_11, p_p, (bool)0LL);
@@ -79531,7 +79861,7 @@ static bool f903_opt_Opt_calm(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p_p,
   bool b136 = b134;
   if (b136) {
     int64_t ix137 = p_x;
-    bool t138 = f903_opt_Opt_calm(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix137, (*p_o)->f_u->f_nodes.len, "opt.lxl:1980"))->f_d, p_p, (bool)0LL);
+    bool t138 = f903_opt_Opt_calm(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix137, (*p_o)->f_u->f_nodes.len, "opt.lxl:2086"))->f_d, p_p, (bool)0LL);
     b136 = t138;
   }
   bool r139 = b136;
@@ -79552,9 +79882,9 @@ static bool f904_opt_named(lxl_slice p_names, lxl_str p_n) {
 }
 static bool f895_opt_Opt_lazyCmp(struct S82_opt_Opt**p_o, int64_t p_form, int64_t p_p, int64_t p_x, int64_t p_args) {
   int64_t ix1 = p_x;
-  int64_t t2 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:1991"))->f_ty;
+  int64_t t2 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:2097"))->f_ty;
   int64_t ix3 = p_p;
-  bool c4 = (bool)(t2 != ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix3, (*p_o)->f_u->f_locals.len, "opt.lxl:1991"))->f_ty);
+  bool c4 = (bool)(t2 != ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix3, (*p_o)->f_u->f_locals.len, "opt.lxl:2097"))->f_ty);
   if (c4) {
     bool r5 = (bool)0LL;
     return r5;
@@ -79567,10 +79897,10 @@ static bool f895_opt_Opt_lazyCmp(struct S82_opt_Opt**p_o, int64_t p_form, int64_
       break;
     }
     int64_t ix9 = v_c_6;
-    v_c_6 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix9, (*p_o)->f_u->f_nodes.len, "opt.lxl:1993"))->f_a;
+    v_c_6 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix9, (*p_o)->f_u->f_nodes.len, "opt.lxl:2099"))->f_a;
   }
   int64_t ix10 = v_c_6;
-  struct S32_ir_Node v_n_11 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:1994"));
+  struct S32_ir_Node v_n_11 = *((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:2100"));
   bool b12 = (bool)(v_n_11.f_k != 13LL);
   if (!b12) {
     b12 = (bool)(v_n_11.f_v < 10LL);
@@ -79643,7 +79973,7 @@ static bool f905_opt_Opt_readOnly(struct S82_opt_Opt**p_o, int64_t p_x) {
   bool c9 = b8;
   if (c9) {
     int64_t ix10 = p_x;
-    bool t11 = f905_opt_Opt_readOnly(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:2008"))->f_a);
+    bool t11 = f905_opt_Opt_readOnly(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix10, (*p_o)->f_u->f_nodes.len, "opt.lxl:2114"))->f_a);
     bool r12 = t11;
     return r12;
   }
@@ -79680,7 +80010,7 @@ static bool f893_opt_Opt_invariant(struct S82_opt_Opt**p_o, int64_t p_x, int64_t
     bool r11 = (bool)1LL;
     return r11;
   }
-  int64_t t12 = rt_add_int(p_j, 1LL, "opt.lxl:2016");
+  int64_t t12 = rt_add_int(p_j, 1LL, "opt.lxl:2122");
   int64_t t13 = f77_ir_Ir_listLen(&(*p_o)->f_u, p_args);
   int64_t end14 = t13;
   for (int64_t v_m_15 = t12; v_m_15 < end14; v_m_15++) {
@@ -79710,7 +80040,7 @@ static bool f906_opt_Opt_stable(struct S82_opt_Opt**p_o, int64_t p_x) {
   bool c6 = (bool)(v_k_2 == 12LL);
   if (c6) {
     int64_t ix7 = p_x;
-    bool t8 = f906_opt_Opt_stable(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:1751"))->f_a);
+    bool t8 = f906_opt_Opt_stable(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix7, (*p_o)->f_u->f_nodes.len, "opt.lxl:1857"))->f_a);
     bool r9 = t8;
     return r9;
   }
@@ -79721,7 +80051,7 @@ static bool f906_opt_Opt_stable(struct S82_opt_Opt**p_o, int64_t p_x) {
   bool c11 = b10;
   if (c11) {
     int64_t ix12 = p_x;
-    int64_t v_a_13 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix12, (*p_o)->f_u->f_nodes.len, "opt.lxl:1753"))->f_a;
+    int64_t v_a_13 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix12, (*p_o)->f_u->f_nodes.len, "opt.lxl:1859"))->f_a;
     int64_t t14 = f82_ir_Ir_nk(&(*p_o)->f_u, v_a_13);
     int64_t v_ak_15 = t14;
     bool b16 = (bool)(v_ak_15 == 6LL);
@@ -79745,7 +80075,7 @@ static bool f906_opt_Opt_stable(struct S82_opt_Opt**p_o, int64_t p_x) {
   bool b23 = (bool)(v_r_22 >= 0LL);
   if (b23) {
     int64_t ix24 = v_r_22;
-    b23 = (bool)!*((bool*)(*p_o)->f_aTaken.data + rt_idx(ix24, (*p_o)->f_aTaken.len, "opt.lxl:1758"));
+    b23 = (bool)!*((bool*)(*p_o)->f_aTaken.data + rt_idx(ix24, (*p_o)->f_aTaken.len, "opt.lxl:1864"));
   }
   bool r25 = b23;
   return r25;
@@ -79753,22 +80083,22 @@ static bool f906_opt_Opt_stable(struct S82_opt_Opt**p_o, int64_t p_x) {
 static int64_t f892_opt_Opt_par(struct S82_opt_Opt**p_o, int64_t p_g, int64_t p_j) {
   int64_t ix1 = p_g;
   int64_t ifx2;
-  if (*((int64_t*)(*p_o)->f_fpOf.data + rt_idx(ix1, (*p_o)->f_fpOf.len, "opt.lxl:1046")) < 0LL) {
+  if (*((int64_t*)(*p_o)->f_fpOf.data + rt_idx(ix1, (*p_o)->f_fpOf.len, "opt.lxl:1047")) < 0LL) {
     int64_t ix3 = p_g;
     int64_t ix4 = p_j;
-    ifx2 = *((int64_t*)(*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix3, (*p_o)->f_u->f_funcs.len, "opt.lxl:1046")))->f_params.data + rt_idx(ix4, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix3, (*p_o)->f_u->f_funcs.len, "opt.lxl:1046")))->f_params.len, "opt.lxl:1046"));
+    ifx2 = *((int64_t*)(*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix3, (*p_o)->f_u->f_funcs.len, "opt.lxl:1047")))->f_params.data + rt_idx(ix4, (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix3, (*p_o)->f_u->f_funcs.len, "opt.lxl:1047")))->f_params.len, "opt.lxl:1047"));
   } else {
     int64_t ix5 = p_g;
-    int64_t ix6 = *((int64_t*)(*p_o)->f_fpOf.data + rt_idx(ix5, (*p_o)->f_fpOf.len, "opt.lxl:1046"));
+    int64_t ix6 = *((int64_t*)(*p_o)->f_fpOf.data + rt_idx(ix5, (*p_o)->f_fpOf.len, "opt.lxl:1047"));
     int64_t ix7 = p_j;
-    ifx2 = *((int64_t*)((lxl_arr*)(*p_o)->f_fpList.data + rt_idx(ix6, (*p_o)->f_fpList.len, "opt.lxl:1046"))->data + rt_idx(ix7, ((lxl_arr*)(*p_o)->f_fpList.data + rt_idx(ix6, (*p_o)->f_fpList.len, "opt.lxl:1046"))->len, "opt.lxl:1046"));
+    ifx2 = *((int64_t*)((lxl_arr*)(*p_o)->f_fpList.data + rt_idx(ix6, (*p_o)->f_fpList.len, "opt.lxl:1047"))->data + rt_idx(ix7, ((lxl_arr*)(*p_o)->f_fpList.data + rt_idx(ix6, (*p_o)->f_fpList.len, "opt.lxl:1047"))->len, "opt.lxl:1047"));
   }
   int64_t r8 = ifx2;
   return r8;
 }
 static int64_t f891_opt_Opt_npar(struct S82_opt_Opt**p_o, int64_t p_g) {
   int64_t ix1 = p_g;
-  int64_t r2 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix1, (*p_o)->f_u->f_funcs.len, "opt.lxl:1049")))->f_params.len;
+  int64_t r2 = (*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix1, (*p_o)->f_u->f_funcs.len, "opt.lxl:1050")))->f_params.len;
   return r2;
 }
 static int64_t f889_opt_Opt_target(struct S82_opt_Opt**p_o, int64_t p_c) {
@@ -79783,12 +80113,12 @@ static int64_t f889_opt_Opt_target(struct S82_opt_Opt**p_o, int64_t p_c) {
   bool b6 = (bool)(v_g_2 < 0LL);
   if (!b6) {
     int64_t ix7 = v_g_2;
-    b6 = (bool)(*((int64_t*)(*p_o)->f_state.data + rt_idx(ix7, (*p_o)->f_state.len, "opt.lxl:1706")) != 2LL);
+    b6 = (bool)(*((int64_t*)(*p_o)->f_state.data + rt_idx(ix7, (*p_o)->f_state.len, "opt.lxl:1812")) != 2LL);
   }
   bool b8 = b6;
   if (!b8) {
     int64_t ix9 = v_g_2;
-    b8 = (bool)(*((int64_t*)(*p_o)->f_form.data + rt_idx(ix9, (*p_o)->f_form.len, "opt.lxl:1706")) < 0LL);
+    b8 = (bool)(*((int64_t*)(*p_o)->f_form.data + rt_idx(ix9, (*p_o)->f_form.len, "opt.lxl:1812")) < 0LL);
   }
   bool c10 = b8;
   if (c10) {
@@ -79797,20 +80127,20 @@ static int64_t f889_opt_Opt_target(struct S82_opt_Opt**p_o, int64_t p_c) {
   }
   int64_t ifx12;
   if ((*p_o)->f_selfOnce) {
-    ifx12 = rt_div_int(rt_mul_int(60LL, (*p_o)->f_limit, "opt.lxl:1707"), 25LL, "opt.lxl:1707");
+    ifx12 = rt_div_int(rt_mul_int(60LL, (*p_o)->f_limit, "opt.lxl:1813"), 25LL, "opt.lxl:1813");
   } else {
     bool t13 = f907_opt_Opt_copyArg(p_o, p_c, v_g_2);
-    ifx12 = t13 ? rt_add_int((*p_o)->f_limit, 15LL, "opt.lxl:1707") : (*p_o)->f_limit;
+    ifx12 = t13 ? rt_add_int((*p_o)->f_limit, 15LL, "opt.lxl:1813") : (*p_o)->f_limit;
   }
   int64_t v_lim_15 = ifx12;
   int64_t ix16 = v_g_2;
-  bool c17 = (bool)(*((int64_t*)(*p_o)->f_size.data + rt_idx(ix16, (*p_o)->f_size.len, "opt.lxl:1708")) > v_lim_15);
+  bool c17 = (bool)(*((int64_t*)(*p_o)->f_size.data + rt_idx(ix16, (*p_o)->f_size.len, "opt.lxl:1814")) > v_lim_15);
   if (c17) {
     int64_t r18 = -1LL;
     return r18;
   }
   int64_t ix19 = v_g_2;
-  bool c20 = (bool)(rt_add_int((*p_o)->f_grown, *((int64_t*)(*p_o)->f_size.data + rt_idx(ix19, (*p_o)->f_size.len, "opt.lxl:1709")), "opt.lxl:1709") > 20000LL);
+  bool c20 = (bool)(rt_add_int((*p_o)->f_grown, *((int64_t*)(*p_o)->f_size.data + rt_idx(ix19, (*p_o)->f_size.len, "opt.lxl:1815")), "opt.lxl:1815") > 20000LL);
   if (c20) {
     int64_t r21 = -1LL;
     return r21;
@@ -79820,13 +80150,13 @@ static int64_t f889_opt_Opt_target(struct S82_opt_Opt**p_o, int64_t p_c) {
 }
 static bool f907_opt_Opt_copyArg(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p_g) {
   int64_t ix1 = p_c;
-  int64_t v_args_2 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:1716"))->f_b;
+  int64_t v_args_2 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:1822"))->f_b;
   int64_t t3 = f891_opt_Opt_npar(p_o, p_g);
   int64_t end4 = t3;
   for (int64_t v_j_5 = 0LL; v_j_5 < end4; v_j_5++) {
     int64_t t6 = f892_opt_Opt_par(p_o, p_g, v_j_5);
     int64_t ix7 = t6;
-    int64_t v_t_8 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix7, (*p_o)->f_u->f_locals.len, "opt.lxl:1718"))->f_ty;
+    int64_t v_t_8 = ((struct S36_ir_Local*)(*p_o)->f_u->f_locals.data + rt_idx(ix7, (*p_o)->f_u->f_locals.len, "opt.lxl:1824"))->f_ty;
     int64_t t9 = f87_ir_Ir_tk(&(*p_o)->f_u, v_t_8);
     bool b10 = (bool)(t9 != 15LL);
     if (!b10) {
@@ -79846,7 +80176,7 @@ static bool f907_opt_Opt_copyArg(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p
     int64_t t16 = f78_ir_Ir_listAt(&(*p_o)->f_u, v_args_2, v_j_5);
     int64_t v_x_17 = t16;
     int64_t ix18 = v_x_17;
-    bool b19 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix18, (*p_o)->f_u->f_nodes.len, "opt.lxl:1721"))->f_ty == v_t_8);
+    bool b19 = (bool)(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix18, (*p_o)->f_u->f_nodes.len, "opt.lxl:1827"))->f_ty == v_t_8);
     if (b19) {
       bool t20 = f815_opt_Opt_lvalue(p_o, v_x_17);
       b19 = t20;
@@ -79862,13 +80192,13 @@ static bool f907_opt_Opt_copyArg(struct S82_opt_Opt**p_o, int64_t p_c, int64_t p
 }
 static void f888_opt_Opt_hoist(struct S82_opt_Opt**p_o, int64_t p_c, lxl_arr*p_out) {
   int64_t ix1 = p_c;
-  bool t2 = f906_opt_Opt_stable(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:1730"))->f_a);
+  bool t2 = f906_opt_Opt_stable(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:1836"))->f_a);
   bool c3 = (bool)!t2;
   if (c3) {
     return;
   }
   int64_t ix4 = p_c;
-  int64_t v_l_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1731"))->f_b;
+  int64_t v_l_5 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:1837"))->f_b;
   int64_t t6 = f77_ir_Ir_listLen(&(*p_o)->f_u, v_l_5);
   int64_t end7 = t6;
   for (int64_t v_j_8 = 0LL; v_j_8 < end7; v_j_8++) {
@@ -79878,14 +80208,14 @@ static void f888_opt_Opt_hoist(struct S82_opt_Opt**p_o, int64_t p_c, lxl_arr*p_o
     bool c12 = (bool)(t11 >= 0LL);
     if (c12) {
       int64_t ix13 = v_x_10;
-      int64_t t14 = f839_opt_Opt_local(p_o, sl9420, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:1735"))->f_ty, (bool)0LL);
+      int64_t t14 = f839_opt_Opt_local(p_o, sl9420, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix13, (*p_o)->f_u->f_nodes.len, "opt.lxl:1841"))->f_ty, (bool)0LL);
       int64_t v_t_15 = t14;
       int64_t t16 = f849_opt_Opt_mk1(p_o, 40LL, 0LL, v_t_15, v_x_10, -1LL);
       int64_t v_d_17 = t16;
       int64_t ix18 = v_x_10;
-      int64_t t19 = f849_opt_Opt_mk1(p_o, 4LL, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix18, (*p_o)->f_u->f_nodes.len, "opt.lxl:1737"))->f_ty, v_t_15, -1LL, -1LL);
-      int64_t ix20 = rt_add_int(rt_add_int(v_l_5, 1LL, "opt.lxl:1737"), v_j_8, "opt.lxl:1737");
-      *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix20, (*p_o)->f_u->f_items.len, "opt.lxl:1737")) = t19;
+      int64_t t19 = f849_opt_Opt_mk1(p_o, 4LL, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix18, (*p_o)->f_u->f_nodes.len, "opt.lxl:1843"))->f_ty, v_t_15, -1LL, -1LL);
+      int64_t ix20 = rt_add_int(rt_add_int(v_l_5, 1LL, "opt.lxl:1843"), v_j_8, "opt.lxl:1843");
+      *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix20, (*p_o)->f_u->f_items.len, "opt.lxl:1843")) = t19;
       f887_opt_Opt_site(p_o, v_d_17, p_out);
     } else {
       bool t21 = f906_opt_Opt_stable(p_o, v_x_10);
@@ -79898,7 +80228,7 @@ static void f888_opt_Opt_hoist(struct S82_opt_Opt**p_o, int64_t p_c, lxl_arr*p_o
 }
 static void f885_opt_Opt_blockIn(struct S82_opt_Opt**p_o, int64_t p_b) {
   int64_t ix1 = p_b;
-  int64_t v_l_2 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:1647"))->f_a;
+  int64_t v_l_2 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:1753"))->f_a;
   lxl_arr a3 = rt_arr_new(0LL, 8ULL);
   lxl_arr v_out_4 = a3;
   bool v_changed_5 = (bool)0LL;
@@ -79910,10 +80240,10 @@ static void f885_opt_Opt_blockIn(struct S82_opt_Opt**p_o, int64_t p_b) {
     f831_opt_Opt_stmtIn(p_o, v_x_10);
     int64_t v_n_11 = v_out_4.len;
     f887_opt_Opt_site(p_o, v_x_10, &v_out_4);
-    bool b12 = (bool)(v_out_4.len != rt_add_int(v_n_11, 1LL, "opt.lxl:1655"));
+    bool b12 = (bool)(v_out_4.len != rt_add_int(v_n_11, 1LL, "opt.lxl:1761"));
     if (!b12) {
       int64_t ix13 = v_n_11;
-      b12 = (bool)(*((int64_t*)v_out_4.data + rt_idx(ix13, v_out_4.len, "opt.lxl:1655")) != v_x_10);
+      b12 = (bool)(*((int64_t*)v_out_4.data + rt_idx(ix13, v_out_4.len, "opt.lxl:1761")) != v_x_10);
     }
     bool c14 = b12;
     if (c14) {
@@ -79924,7 +80254,7 @@ static void f885_opt_Opt_blockIn(struct S82_opt_Opt**p_o, int64_t p_b) {
   if (c15) {
     int64_t t16 = f633_ir_Ir_list(&(*p_o)->f_u, &v_out_4);
     int64_t ix17 = p_b;
-    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix17, (*p_o)->f_u->f_nodes.len, "opt.lxl:1657"))->f_a = t16;
+    ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix17, (*p_o)->f_u->f_nodes.len, "opt.lxl:1763"))->f_a = t16;
   }
   gl10_drop(v_out_4);
 }
@@ -79935,16 +80265,16 @@ static int64_t f830_opt_Opt_walk(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p
     return r2;
   }
   int64_t ix3 = p_x;
-  int64_t v_k_4 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:576"))->f_k;
+  int64_t v_k_4 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix3, (*p_o)->f_u->f_nodes.len, "opt.lxl:577"))->f_k;
   lxl_slice t5 = k2_ir_KIDS;
   int64_t ix6 = v_k_4;
-  int64_t v_kc_7 = *((int64_t*)t5.data + rt_idx(ix6, t5.len, "opt.lxl:577"));
+  int64_t v_kc_7 = *((int64_t*)t5.data + rt_idx(ix6, t5.len, "opt.lxl:578"));
   bool c8 = (bool)(v_kc_7 < 0LL);
   if (c8) {
     f908_opt_Opt_bad(p_o, p_x);
   }
   int64_t ix9 = p_x;
-  int64_t v_a_10 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix9, (*p_o)->f_u->f_nodes.len, "opt.lxl:579"))->f_a;
+  int64_t v_a_10 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix9, (*p_o)->f_u->f_nodes.len, "opt.lxl:580"))->f_a;
   int64_t v_hit_11 = 0LL;
   bool c12 = (bool)(v_kc_7 == 0LL);
   if (c12) {
@@ -79955,7 +80285,7 @@ static int64_t f830_opt_Opt_walk(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p
     bool c14 = b13;
     if (c14) {
       int64_t ix15 = v_a_10;
-      *((int64_t*)(*p_o)->f_refs.data + rt_idx(ix15, (*p_o)->f_refs.len, "opt.lxl:582")) = rt_add_int(*((int64_t*)(*p_o)->f_refs.data + rt_idx(ix15, (*p_o)->f_refs.len, "opt.lxl:582")), 1LL, "opt.lxl:582");
+      *((int64_t*)(*p_o)->f_refs.data + rt_idx(ix15, (*p_o)->f_refs.len, "opt.lxl:583")) = rt_add_int(*((int64_t*)(*p_o)->f_refs.data + rt_idx(ix15, (*p_o)->f_refs.len, "opt.lxl:583")), 1LL, "opt.lxl:583");
     }
     bool b16 = (bool)(v_k_4 == 4LL);
     if (b16) {
@@ -79967,7 +80297,7 @@ static int64_t f830_opt_Opt_walk(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p
     }
     bool c18 = b17;
     if (c18) {
-      v_hit_11 = rt_add_int(v_hit_11, 1LL, "opt.lxl:583");
+      v_hit_11 = rt_add_int(v_hit_11, 1LL, "opt.lxl:584");
     }
     int64_t r19 = v_hit_11;
     return r19;
@@ -79991,11 +80321,11 @@ static int64_t f830_opt_Opt_walk(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p
         bool c27 = (bool)(p_op == 1LL);
         if (c27) {
           int64_t ix28 = v_r_25;
-          *((bool*)(*p_o)->f_aTaken.data + rt_idx(ix28, (*p_o)->f_aTaken.len, "opt.lxl:590")) = (bool)1LL;
+          *((bool*)(*p_o)->f_aTaken.data + rt_idx(ix28, (*p_o)->f_aTaken.len, "opt.lxl:591")) = (bool)1LL;
         }
         bool c29 = (bool)(v_r_25 == p_l);
         if (c29) {
-          v_hit_11 = rt_add_int(v_hit_11, 1LL, "opt.lxl:591");
+          v_hit_11 = rt_add_int(v_hit_11, 1LL, "opt.lxl:592");
         }
       }
     }
@@ -80013,18 +80343,18 @@ static int64_t f830_opt_Opt_walk(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p
       }
       bool c34 = b32;
       if (c34) {
-        v_hit_11 = rt_add_int(v_hit_11, 1LL, "opt.lxl:595");
+        v_hit_11 = rt_add_int(v_hit_11, 1LL, "opt.lxl:596");
       }
       bool c35 = (bool)(p_op == 5LL);
       if (c35) {
-        v_hit_11 = rt_add_int(v_hit_11, 1LL, "opt.lxl:596");
+        v_hit_11 = rt_add_int(v_hit_11, 1LL, "opt.lxl:597");
       }
     } else {
       bool c36 = (bool)(v_k_4 == 7LL);
       if (c36) {
         bool c37 = (bool)(p_op == 5LL);
         if (c37) {
-          v_hit_11 = rt_add_int(v_hit_11, 1LL, "opt.lxl:598");
+          v_hit_11 = rt_add_int(v_hit_11, 1LL, "opt.lxl:599");
         }
         bool c38 = (bool)(p_op == 1LL);
         if (c38) {
@@ -80039,18 +80369,18 @@ static int64_t f830_opt_Opt_walk(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p
             bool c43 = (bool)(v_f_40 == (*p_o)->f_wf);
             if (c43) {
               int64_t ix44 = v_f_40;
-              *((bool*)(*p_o)->f_recur.data + rt_idx(ix44, (*p_o)->f_recur.len, "opt.lxl:602")) = (bool)1LL;
+              *((bool*)(*p_o)->f_recur.data + rt_idx(ix44, (*p_o)->f_recur.len, "opt.lxl:603")) = (bool)1LL;
             }
             bool c45 = (bool)(v_f_40 == (*p_o)->f_allocF);
             if (c45) {
               int64_t ix46 = (*p_o)->f_wf;
-              *((bool*)(*p_o)->f_allocs.data + rt_idx(ix46, (*p_o)->f_allocs.len, "opt.lxl:603")) = (bool)1LL;
+              *((bool*)(*p_o)->f_allocs.data + rt_idx(ix46, (*p_o)->f_allocs.len, "opt.lxl:604")) = (bool)1LL;
             }
           }
           bool b47 = (bool)(v_f_40 >= 0LL);
           if (b47) {
             int64_t ix48 = v_f_40;
-            b47 = (bool)((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix48, (*p_o)->f_u->f_funcs.len, "opt.lxl:605")))->f_body >= 0LL);
+            b47 = (bool)((*((struct S31_ir_Func**)(*p_o)->f_u->f_funcs.data + rt_idx(ix48, (*p_o)->f_u->f_funcs.len, "opt.lxl:606")))->f_body >= 0LL);
           }
           bool c49 = b47;
           if (c49) {
@@ -80062,7 +80392,7 @@ static int64_t f830_opt_Opt_walk(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p
         if (c50) {
           bool c51 = (bool)(p_op == 3LL);
           if (c51) {
-            v_hit_11 = rt_add_int(v_hit_11, 1LL, "opt.lxl:608");
+            v_hit_11 = rt_add_int(v_hit_11, 1LL, "opt.lxl:609");
           }
         } else {
           bool b52 = (bool)(v_k_4 == 44LL);
@@ -80073,7 +80403,7 @@ static int64_t f830_opt_Opt_walk(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p
           if (c53) {
             bool c54 = (bool)(p_op == 7LL);
             if (c54) {
-              v_hit_11 = rt_add_int(v_hit_11, 1LL, "opt.lxl:610");
+              v_hit_11 = rt_add_int(v_hit_11, 1LL, "opt.lxl:611");
             }
           }
         }
@@ -80084,83 +80414,83 @@ static int64_t f830_opt_Opt_walk(struct S82_opt_Opt**p_o, int64_t p_x, int64_t p
   if (c55) {
     int64_t t56 = v_hit_11;
     int64_t t57 = f830_opt_Opt_walk(p_o, v_a_10, p_op, p_l);
-    int64_t r58 = rt_add_int(t56, t57, "opt.lxl:612");
+    int64_t r58 = rt_add_int(t56, t57, "opt.lxl:613");
     return r58;
   }
   int64_t ix59 = p_x;
-  int64_t v_b_60 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix59, (*p_o)->f_u->f_nodes.len, "opt.lxl:613"))->f_b;
+  int64_t v_b_60 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix59, (*p_o)->f_u->f_nodes.len, "opt.lxl:614"))->f_b;
   bool c61 = (bool)(v_kc_7 == 2LL);
   if (c61) {
     int64_t t62 = v_hit_11;
     int64_t t63 = f830_opt_Opt_walk(p_o, v_a_10, p_op, p_l);
-    int64_t t64 = rt_add_int(t62, t63, "opt.lxl:614");
+    int64_t t64 = rt_add_int(t62, t63, "opt.lxl:615");
     int64_t t65 = f830_opt_Opt_walk(p_o, v_b_60, p_op, p_l);
-    int64_t r66 = rt_add_int(t64, t65, "opt.lxl:614");
+    int64_t r66 = rt_add_int(t64, t65, "opt.lxl:615");
     return r66;
   }
   bool c67 = (bool)(v_kc_7 == 4LL);
   if (c67) {
     int64_t t68 = v_hit_11;
     int64_t t69 = f830_opt_Opt_walk(p_o, v_a_10, p_op, p_l);
-    int64_t t70 = rt_add_int(t68, t69, "opt.lxl:615");
+    int64_t t70 = rt_add_int(t68, t69, "opt.lxl:616");
     int64_t t71 = f808_opt_Opt_walkList(p_o, v_b_60, p_op, p_l);
-    int64_t r72 = rt_add_int(t70, t71, "opt.lxl:615");
+    int64_t r72 = rt_add_int(t70, t71, "opt.lxl:616");
     return r72;
   }
   bool c73 = (bool)(v_kc_7 == 6LL);
   if (c73) {
     int64_t t74 = v_hit_11;
     int64_t t75 = f808_opt_Opt_walkList(p_o, v_a_10, p_op, p_l);
-    int64_t r76 = rt_add_int(t74, t75, "opt.lxl:616");
+    int64_t r76 = rt_add_int(t74, t75, "opt.lxl:617");
     return r76;
   }
   int64_t ix77 = p_x;
-  int64_t v_c_78 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix77, (*p_o)->f_u->f_nodes.len, "opt.lxl:617"))->f_c;
+  int64_t v_c_78 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix77, (*p_o)->f_u->f_nodes.len, "opt.lxl:618"))->f_c;
   bool c79 = (bool)(v_kc_7 == 3LL);
   if (c79) {
     int64_t t80 = v_hit_11;
     int64_t t81 = f830_opt_Opt_walk(p_o, v_a_10, p_op, p_l);
-    int64_t t82 = rt_add_int(t80, t81, "opt.lxl:618");
+    int64_t t82 = rt_add_int(t80, t81, "opt.lxl:619");
     int64_t t83 = f830_opt_Opt_walk(p_o, v_b_60, p_op, p_l);
-    int64_t t84 = rt_add_int(t82, t83, "opt.lxl:618");
+    int64_t t84 = rt_add_int(t82, t83, "opt.lxl:619");
     int64_t t85 = f830_opt_Opt_walk(p_o, v_c_78, p_op, p_l);
-    int64_t r86 = rt_add_int(t84, t85, "opt.lxl:618");
+    int64_t r86 = rt_add_int(t84, t85, "opt.lxl:619");
     return r86;
   }
   bool c87 = (bool)(v_kc_7 == 7LL);
   if (c87) {
     int64_t t88 = v_hit_11;
     int64_t t89 = f830_opt_Opt_walk(p_o, v_b_60, p_op, p_l);
-    int64_t t90 = rt_add_int(t88, t89, "opt.lxl:619");
+    int64_t t90 = rt_add_int(t88, t89, "opt.lxl:620");
     int64_t t91 = f808_opt_Opt_walkList(p_o, v_c_78, p_op, p_l);
-    int64_t r92 = rt_add_int(t90, t91, "opt.lxl:619");
+    int64_t r92 = rt_add_int(t90, t91, "opt.lxl:620");
     return r92;
   }
   bool c93 = (bool)(v_kc_7 == 5LL);
   if (c93) {
     int64_t t94 = v_hit_11;
     int64_t t95 = f808_opt_Opt_walkList(p_o, v_b_60, p_op, p_l);
-    int64_t r96 = rt_add_int(t94, t95, "opt.lxl:620");
+    int64_t r96 = rt_add_int(t94, t95, "opt.lxl:621");
     return r96;
   }
   int64_t t97 = v_hit_11;
   int64_t t98 = f830_opt_Opt_walk(p_o, v_a_10, p_op, p_l);
-  int64_t t99 = rt_add_int(t97, t98, "opt.lxl:621");
+  int64_t t99 = rt_add_int(t97, t98, "opt.lxl:622");
   int64_t t100 = f830_opt_Opt_walk(p_o, v_b_60, p_op, p_l);
-  int64_t t101 = rt_add_int(t99, t100, "opt.lxl:621");
+  int64_t t101 = rt_add_int(t99, t100, "opt.lxl:622");
   int64_t t102 = f830_opt_Opt_walk(p_o, v_c_78, p_op, p_l);
-  int64_t t103 = rt_add_int(t101, t102, "opt.lxl:621");
+  int64_t t103 = rt_add_int(t101, t102, "opt.lxl:622");
   int64_t ix104 = p_x;
-  int64_t t105 = f830_opt_Opt_walk(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix104, (*p_o)->f_u->f_nodes.len, "opt.lxl:621"))->f_d, p_op, p_l);
-  int64_t r106 = rt_add_int(t103, t105, "opt.lxl:621");
+  int64_t t105 = f830_opt_Opt_walk(p_o, ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix104, (*p_o)->f_u->f_nodes.len, "opt.lxl:622"))->f_d, p_op, p_l);
+  int64_t r106 = rt_add_int(t103, t105, "opt.lxl:622");
   return r106;
 }
 static void f908_opt_Opt_bad(struct S82_opt_Opt**p_o, int64_t p_x) {
   int64_t ix1 = p_x;
-  int64_t t2 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:572"))->f_line;
+  int64_t t2 = ((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix1, (*p_o)->f_u->f_nodes.len, "opt.lxl:573"))->f_line;
   lxl_str t3 = sl9417;
   int64_t ix4 = p_x;
-  lxl_str t5 = rt_int_to_str(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:572"))->f_k);
+  lxl_str t5 = rt_int_to_str(((struct S32_ir_Node*)(*p_o)->f_u->f_nodes.data + rt_idx(ix4, (*p_o)->f_u->f_nodes.len, "opt.lxl:573"))->f_k);
   lxl_str t6 = rt_str_concat(t3, t5);
   f107_ir_failAt(sl9258, t2, t6);
 }
@@ -80172,13 +80502,13 @@ static int64_t f808_opt_Opt_walkList(struct S82_opt_Opt**p_o, int64_t p_l, int64
   }
   int64_t v_hit_3 = 0LL;
   int64_t ix4 = p_l;
-  int64_t v_n_5 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix4, (*p_o)->f_u->f_items.len, "opt.lxl:627"));
+  int64_t v_n_5 = *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix4, (*p_o)->f_u->f_items.len, "opt.lxl:628"));
   int64_t end6 = v_n_5;
   for (int64_t v_j_7 = 0LL; v_j_7 < end6; v_j_7++) {
     int64_t t8 = v_hit_3;
-    int64_t ix9 = rt_add_int(rt_add_int(p_l, 1LL, "opt.lxl:628"), v_j_7, "opt.lxl:628");
-    int64_t t10 = f830_opt_Opt_walk(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix9, (*p_o)->f_u->f_items.len, "opt.lxl:628")), p_op, p_loc);
-    v_hit_3 = rt_add_int(t8, t10, "opt.lxl:628");
+    int64_t ix9 = rt_add_int(rt_add_int(p_l, 1LL, "opt.lxl:629"), v_j_7, "opt.lxl:629");
+    int64_t t10 = f830_opt_Opt_walk(p_o, *((int64_t*)(*p_o)->f_u->f_items.data + rt_idx(ix9, (*p_o)->f_u->f_items.len, "opt.lxl:629")), p_op, p_loc);
+    v_hit_3 = rt_add_int(t8, t10, "opt.lxl:629");
   }
   int64_t r11 = v_hit_3;
   return r11;

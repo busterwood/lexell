@@ -82,6 +82,7 @@ type Opt = record {
     sStamp: []int           // per local: stamp when sCand is set
     sCand: []int            // ... the candidate it stands for
     cands: []Cand
+    prevFresh: int          // the fresh candidate the statement before declared (saItem), or -1
     adj: int
     selfOnce: bool      // the pass that inlines a recursive function into itself, one level (visit)
     fpOf: []int         // per function: its form's parameters in fpList (a renamed copy, visit), or -1
@@ -111,7 +112,7 @@ type Ub = value record {
 pub fn optimize(p: ir.Ir): ir.Ir {
     var o = Opt{u: p, state: [], form: [], size: [], rets: [], ro: [], refs: [], aTaken: [], mk: [], mv: [], bound: [], budget: 0, cur: -1,
         grown: 0, limit: 0, dest: D_NONE, dl: -1, lv: -1, aty: -1, single: false, nrvo: -1,
-        dupF: -1, dropF: -1, stamp: 0, sStamp: [], sCand: [], cands: [], adj: -1, selfOnce: false, fpOf: [], fpList: [], ren: newMap(), allocF: -1, freeF: -1, ub: [], ubSeen: [], wf: -1, recur: [], allocs: []}
+        dupF: -1, dropF: -1, stamp: 0, sStamp: [], sCand: [], cands: [], prevFresh: -1, adj: -1, selfOnce: false, fpOf: [], fpList: [], ren: newMap(), allocF: -1, freeF: -1, ub: [], ubSeen: [], wf: -1, recur: [], allocs: []}
     o.limit = INLINE_LIMIT
     let ev = os.envOr("LXL_INLINE", "")
     if ev != "" { o.limit = strings.parseIntOpt(&ev).unwrapOr(INLINE_LIMIT) }
@@ -1204,6 +1205,16 @@ fn (o: &Opt) always(s: int): bool {
 // is needed. `T m = n;` where m is n moved (n never named again but in m's field reads) is the
 // same record: both go together. Only a move: a dup of m's fields (the dup glue after `T m =
 // n;`) makes m a copy with counts of its own, and both stay records.
+//
+// A local of a record type declared without an initializer (`T n;`, a record that never escapes
+// once unbox has made it a local) or by a literal (`T n = (T){.a = x, .b = y};`, or entries),
+// whose fields are only written and read one by one (`n.v = i;`, `n.v + n.w`), is fresh: it
+// becomes one local per field, each declared where n was, with its entry of the literal (in the
+// literal's order) or without an initializer, and the writes and reads name them. Its fields
+// must not overlap (a field and a member of it), each field it names must have an entry when
+// it has a literal, and none of the copy's shortcuts apply (dups and drops kept). `T m = n;`
+// right after n's declaration moves it (a value record's literal is a temporary copied so): m
+// stands for the same fields, and any later naming of n keeps both records.
 
 type Fld = value record {
     off: int                // its offset in the record
@@ -1221,6 +1232,9 @@ type Cand = record {
     l: int                  // the record's local
     decl: int
     bad: bool               // named some other way: stays a record
+    fresh: bool             // declared without an initializer or by a literal: its fields may be written
+    init: int               // a fresh record's initializer entries (a list of E_IENT), or -1
+    dead: int               // a fresh record's local moved into another (`T m = n;`), or -1
     flds: []Fld
 }
 
@@ -1307,6 +1321,7 @@ fn (o: mut &Opt) sa(x: int) {
     }
     if k == ir.E_MEMBER {
         let c = o.candOf(o.root(x))
+        if c >= 0 && o.cands[c].dead == o.root(x) { o.cands[c].bad = true }
         if c >= 0 {
             let i = o.field(c, x)
             o.cands[c].flds[i].read = true
@@ -1314,7 +1329,10 @@ fn (o: mut &Opt) sa(x: int) {
         }
     } else if k == ir.E_ASSIGN || k == ir.E_POSTINC || k == ir.E_ADDR || k == ir.E_DECAY {
         let c = o.candOf(o.root(a))
-        if c >= 0 { o.cands[c].bad = true }
+        // a fresh record's field written (the walk below reads the member, which marks it)
+        if c >= 0 && !(o.cands[c].fresh && k != ir.E_ADDR && k != ir.E_DECAY && o.u.nk(a) == ir.E_MEMBER) {
+            o.cands[c].bad = true
+        }
     }
     let kc = ir.KIDS[k]
     if kc == ir.K_NONE { return }
@@ -1334,13 +1352,24 @@ fn (o: mut &Opt) sa(x: int) {
 // sa of a statement of a list: where candidates are declared, and their dups follow.
 fn (o: mut &Opt) saItem(x: int) {
     let k = o.u.nodes[x].k
+    let pf = o.prevFresh
+    o.prevFresh = -1
     if k == ir.S_DECL {
         let l = o.u.nodes[x].a
         let b = o.u.nodes[x].b
         let t = o.u.locals[l].ty
         if b >= 0 && o.u.nodes[x].c < 0 && o.u.tk(t) == ir.TY_STRUCT && o.u.nodes[b].ty == t && !o.aTaken[l] {
             let src = if o.u.nk(b) == ir.E_LOCAL { o.candOf(o.u.nodes[b].a) } else { -1 }
-            if src >= 0 {
+            if src >= 0 && o.cands[src].fresh {
+                if pf == src && o.cands[src].dead < 0 && o.u.nodes[b].a == o.cands[src].l && !o.aTaken[l] {
+                    // n moved into m right after its declaration: m stands for its fields
+                    o.cands[src].dead = o.cands[src].l
+                    o.setCand(l, src)
+                    return
+                }
+                // a copy of a fresh record, which may be written after it: both stay records
+                o.cands[src].bad = true
+            } else if src >= 0 {
                 if !o.cands[src].bad {
                     // m = n: the same record
                     o.setCand(l, src)
@@ -1350,16 +1379,30 @@ fn (o: mut &Opt) saItem(x: int) {
             } else if o.lvalue(b) && !o.u.structs[o.u.tys[t].sid].isUnion {
                 o.sa(b)
                 o.setCand(l, len(o.cands))
-                append(mut &o.cands, Cand{l: l, decl: x, bad: false, flds: []})
+                append(mut &o.cands, Cand{l: l, decl: x, bad: false, fresh: false, init: -1, dead: -1, flds: []})
                 o.adj = l
                 return
             }
+        }
+        let ents = if b < 0 { o.u.nodes[x].c } else if o.u.nodes[x].c < 0 && o.u.nk(b) == ir.E_CLIT && o.u.nodes[b].ty == t {
+            o.u.nodes[b].b
+        } else { -2 }
+        if ents >= -1 && o.u.tk(t) == ir.TY_STRUCT && !o.aTaken[l] && !o.u.structs[o.u.tys[t].sid].isUnion {
+            if ents >= 0 {
+                for j in 0..o.u.items[ents] { o.sa(o.u.nodes[o.u.items[ents + 1 + j]].a) }
+            }
+            o.setCand(l, len(o.cands))
+            append(mut &o.cands, Cand{l: l, decl: x, bad: false, fresh: true, init: ents, dead: -1, flds: []})
+            o.prevFresh = len(o.cands) - 1
+            o.adj = -1
+            return
         }
     } else if k == ir.S_EXPR {
         let e = o.u.nodes[x].a
         if o.nopAssign(e) && o.candOf(o.root(o.u.nodes[e].a)) >= 0 { return }
         let d = o.dupOf(e)
-        let dc = if d >= 0 { o.candOf(o.root(d)) } else { -1 }
+        var dc = if d >= 0 { o.candOf(o.root(d)) } else { -1 }
+        if dc >= 0 && o.cands[dc].fresh { dc = -1 }
         if dc >= 0 && o.root(d) != o.cands[dc].l {
             // a dup of m after `T m = n;`: m is a copy of n, with counts of its own, not n moved
             o.cands[dc].bad = true
@@ -1373,7 +1416,8 @@ fn (o: mut &Opt) saItem(x: int) {
             return
         }
         let p = o.dropOf(e)
-        let pc = if p >= 0 { o.candOf(o.root(p)) } else { -1 }
+        var pc = if p >= 0 { o.candOf(o.root(p)) } else { -1 }
+        if pc >= 0 && o.cands[pc].fresh { pc = -1 }
         if pc >= 0 {
             let i = o.field(pc, p)
             o.cands[pc].flds[i].drops += 1
@@ -1389,6 +1433,46 @@ fn (o: mut &Opt) saItem(x: int) {
 fn (o: mut &Opt) settle(c: int): bool {
     if o.cands[c].bad { return false }
     let n = len(o.cands[c].flds)
+    if o.cands[c].fresh {
+        // each field a local of its own (each entry of the literal too): none may overlap another
+        let ents = o.cands[c].init
+        if ents >= 0 {
+            let used = n
+            for j in 0..o.u.items[ents] {
+                let en = o.u.nodes[o.u.items[ents + 1 + j]]
+                var have = -1
+                for i in 0..len(o.cands[c].flds) {
+                    if o.cands[c].flds[i].off == en.v && o.cands[c].flds[i].ty == en.ty { have = i }
+                }
+                if have < 0 {
+                    append(mut &o.cands[c].flds, Fld{off: en.v, ty: en.ty, tmpl: -1, read: false, dups: 0, drops: 0, away: false, loc: -1, outer: -1})
+                    have = len(o.cands[c].flds) - 1
+                }
+                o.cands[c].flds[have].dups = j + 1          // (a fresh record's: its entry, plus one)
+            }
+            for i in 0..used {
+                if o.cands[c].flds[i].dups == 0 {
+                    o.cands[c].bad = true
+                    return false
+                }
+            }
+        }
+        let nf = len(o.cands[c].flds)
+        if nf == 0 { return false }
+        for i in 0..nf {
+            let fi = o.cands[c].flds[i]
+            for j in i + 1..nf {
+                let fj = o.cands[c].flds[j]
+                if fi.off < fj.off + o.u.sizeOf(fj.ty) && fj.off < fi.off + o.u.sizeOf(fi.ty) {
+                    o.cands[c].bad = true
+                    return false
+                }
+            }
+        }
+        let fname = o.u.locals[o.cands[c].l].name.clone()
+        for i in 0..nf { o.cands[c].flds[i].loc = o.local(&fname, o.cands[c].flds[i].ty, false) }
+        return true
+    }
     for i in 0..n {
         let fi = o.cands[c].flds[i]
         let ei = fi.off + o.u.sizeOf(fi.ty)
@@ -1585,6 +1669,28 @@ fn (o: mut &Opt) srItem(x: int, out: mut &[]int): bool {
 
 // The declaration x of candidate c as its fields' declarations, into out.
 fn (o: mut &Opt) split(c: int, x: int, out: mut &[]int) {
+    if o.cands[c].fresh {
+        let ents = o.cands[c].init
+        let ne = if ents >= 0 { o.u.items[ents] } else { 0 }
+        for j in 0..ne {
+            let ei = o.u.items[ents + 1 + j]
+            o.sr(o.u.nodes[ei].a)
+            for i in 0..len(o.cands[c].flds) {
+                if o.cands[c].flds[i].dups == j + 1 {
+                    let fl = o.cands[c].flds[i].loc
+                    let ev = o.u.nodes[ei].a
+                    append(out, o.mk1(ir.S_DECL, ir.TY_VOID, fl, ev, -1))
+                }
+            }
+        }
+        for i in 0..len(o.cands[c].flds) {
+            if o.cands[c].flds[i].dups == 0 {
+                let fl = o.cands[c].flds[i].loc
+                append(out, o.mk1(ir.S_DECL, ir.TY_VOID, fl, -1, -1))
+            }
+        }
+        return
+    }
     let e = o.u.nodes[x].b
     o.sr(e)
     var base = -1

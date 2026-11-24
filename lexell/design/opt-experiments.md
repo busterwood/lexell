@@ -1114,3 +1114,57 @@ statements, so that the distances cross rel8's reach (the loops switch from all-
 between 5 and 6 statements). The bodies have checked jumps to the stubs and padded loop tops.
 The output must equal the script's own simulation. Every build in the suites now uses the
 short forms (vrgen, loopgen, native, the self-build's fixed point).
+
+## 28. Records with fields written, and value-record literals, as one local per field (as built)
+
+After section 27, alloc's loop still kept its unboxed record in the frame:
+
+- **The loop.** `ub.f_v = i; ub.f_w = 2;` was followed by `total + ub.f_v + ub.f_w`, a store
+  and a load back of each field every iteration.
+- **The cost.** Its speed followed the code's addresses: +8.9% at equal instructions after
+  section 27, at one placement.
+- **Why the pass missed it.** opt.lxl's `scalars` pass replaced a record by its fields only when
+  it was declared as a copy of a place and never written. alloc's record and every value record
+  declared by a literal (`var p = P{...}`, lowered as a temporary `T t = (T){...}` copied into
+  `p`) were declared and then written field by field.
+
+**The change** (opt.lxl, the fresh candidates of `scalars`):
+
+- **Which records.** A record local declared without an initializer, or by a compound literal
+  or initializer entries, is a fresh candidate.
+- **Writes.** A fresh candidate's fields may be assigned or incremented.
+- **What disqualifies it:**
+  - being named whole;
+  - an address taken, its own or a field's;
+  - fields that overlap (a record field also read member by member);
+  - a field it uses that has no entry in the literal.
+- **The rewrite.** Each field becomes a local, declared where the record was: with its entry's
+  value, in the literal's order, or without an initializer.
+- **Moves.** `T m = n;` right after n's declaration (the literal's temporary) moves n: m stands
+  for the same fields, and any later naming of n keeps both as records.
+- **What a fresh candidate does without.** The copy kind's shortcuts depend on nothing writing
+  the record: dups and drops removed, `T m = n` sharing fields, copies of nested fields. Those
+  don't apply.
+
+| measure (d5d4bca1 against this; perfsuite 4 placements, best of 3, CPU 2) | instructions | cycles |
+|---|---:|---:|
+| alloc | -14.3% | -16.0% (apart) |
+| the other run-suite programs | 0 (eza -0.1%) | within 0.5%, none apart |
+| run suite / compile suite | -0.96 / +0.08% | -1.13 / +0.19% |
+| apps regex / json / jq / cmark / decimal | 0 / 0 / 0 / -3.13 / 0% | -0.1 / -0.1 / +0.9 / -3.4 / 0% |
+| TPC-H SF1, server instructions per query (22) | +0.02% geomean | |
+| lexdb point select (icount6, 4 placements each) | 170,721-170,929 against 170,784-170,835 | median 99,484 against 98,855 (+0.6%, not apart) |
+
+- **alloc `-O`** keeps its cycles (160M: the loop was already at its two dependent checked adds
+  a turn) and loses 15% of its instructions.
+- **The point selects.** At one placement they were +2.1 and +3.6% cycles. Only 13 of lexdb's
+  6,060 functions changed size, none on the point-select path, so everything after 0x651dc0
+  moved. At four placements the ranges overlap (98,270-99,543 against 96,966-99,962), and so do
+  the branch misses (386-477 against 395-438): placement.
+- **lexdb `-O`** is 4 KB smaller.
+
+Test: tests/run/sra_fresh_record. These split: an unboxed record; a literal whose fields are
+written in branches and by compound assignment; floats; a record passed whole to an inlined
+function. These stay records: one copied whole and then written, one whose address is passed,
+a record field read whole and member by member, and a str field. It runs on --c, --native and
+-O, and the expected output is the previous compiler's.
