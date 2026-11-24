@@ -60,7 +60,13 @@ The two `WHEN` clauses may come in either order.
 
 ## Differences from Oracle
 
-- A `WHEN MATCHED THEN DELETE` without `UPDATE` (standard SQL's form) is not supported (ORA-00900).
+- A `WHEN MATCHED THEN DELETE` without `UPDATE` (standard SQL's form) is not supported (ORA-02000, "missing UPDATE
+  keyword").
+- **A subquery in a clause reads rows the `MERGE` has already changed.** `UPDATE` and `DELETE` work every row out
+  from the table as the statement found it, as Oracle does; `MERGE` does not yet. `MERGE INTO emp e USING (SELECT
+  id FROM emp WHERE mgr_id IS NOT NULL) s ON (e.id = s.id) WHEN MATCHED THEN UPDATE SET e.salary = (SELECT x.salary
+  * 2 FROM emp x WHERE x.id = e.mgr_id)` over a chain of managers doubles a salary that the same statement has just
+  changed. Use an `UPDATE` where the statement needs the starting rows.
 - `LOG ERRORS` is not supported (ORA-00900). `RETURNING` after `MERGE` was not tried.
 - A hint after `MERGE` (`/*+ PARALLEL */`) is read as a comment.
 
@@ -320,7 +326,7 @@ ERROR:
 ORA-01722: invalid number
 
 ERROR:
-ORA-00900: invalid SQL statement
+ORA-02000: missing UPDATE keyword
 
 ERROR:
 ORA-00900: invalid SQL statement
