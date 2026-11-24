@@ -4024,6 +4024,7 @@ fn dropTableNamed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str,
             try lexdb_priv.needRelOwner(st, txn, &t.name, &"table")
             try dropDependentViews(st, txn, &t.name, s.cascade, &"table")
             var d = t
+            lexdb_catalog.joinFks(mut &d)
             try unlinkTable(st, txn, mut &d, s.cascade)
             try dropOwnedSeqs(st, txn, &d, &"")
             dropOne(txn, &d)
@@ -4115,6 +4116,7 @@ fn dropTempIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &str): Resu
         match try byKeyOpt(st, txn, &k) {
             Some(t) {
                 var d = t
+                lexdb_catalog.joinFks(mut &d)
                 try unlinkTable(st, txn, mut &d, true)
                 try dropOwnedSeqs(st, txn, &d, &"")
                 dropOne(txn, &d)
@@ -5015,6 +5017,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         None {}
     }
     var t = found.unwrap()
+    lexdb_catalog.joinFks(mut &t)
     // SQL Server's ALTER COLUMN of a type: refused where an index, key or constraint is on the column (its length may grow)
     if s.mdialect == lexdb_sql.MD_TSQL {
         for a in s.alters {
@@ -5600,7 +5603,7 @@ fn dropKeyRefs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table,
                 }
             }
         } else {
-            var c = try byKey(st, txn, &ck)
+            var c = try byKeyJ(st, txn, &ck)
             var changed = false
             var k = 0
             while k < len(c.fks) {
@@ -13588,6 +13591,13 @@ fn byKeyOpt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[
     }
 }
 
+// byKey for a DDL statement: the foreign keys not enforced among the table's keys (lexdb_catalog.joinFks; the write path's byKey leaves them out).
+fn byKeyJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[Table, DbErr] {
+    var t = try byKey(st, txn, k)
+    lexdb_catalog.joinFks(mut &t)
+    return Ok(t)
+}
+
 fn byKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[Table, DbErr] {
     match try byKeyOpt(st, txn, k) {
         Some(t) { return Ok(t) }
@@ -13804,7 +13814,7 @@ fn fkProbes(t: &Table, fw: &[]Table, targets: &[]int): lexdb_fkprobe.Probes {
             for x in 0..len(targets) { if targets[x] == c && t.cols[c].identity == lexdb_sql.ID_NONE { j = x } }
             append(mut &at, j)
         }
-        pr.add(lexdb_fkprobe.ref(collections.copyOf(&fc.cols), collections.copyOf(&fc.refCols), if t.fks[k].off { -2 } else { fc.via }, pi, at, len(fw[pi].cols)))
+        pr.add(lexdb_fkprobe.ref(collections.copyOf(&fc.cols), collections.copyOf(&fc.refCols), fc.via, pi, at, len(fw[pi].cols)))
     }
     return pr
 }
@@ -13900,7 +13910,6 @@ fn childSide(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, fw: &
              later: mut &[]FkLater, pr: mut &lexdb_fkprobe.Probes): Result[Unit, DbErr] {
     for k in 0..len(t.fks) {
         let f = &t.fks[k]
-        if f.off { continue }       // not enforced (design/lexdb-new-features.md 10.5)
         let pi = findTab(fw, &f.ref)
         if pr.active(k) {
             // an INSERT's, with the statement's probes: the key's columns worked out once, and a parent known
@@ -13936,7 +13945,7 @@ fn parentSide(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, fw: 
     for ck in t.refBy {
         let c = &fw[findTab(fw, &ck)]
         for k in 0..len(c.fks) {
-            if c.fks[k].ref != t.name || c.fks[k].off { continue }
+            if c.fks[k].ref != t.name { continue }
             let fc = fkCols(c, &c.fks[k], t)
             if hasNullAt(old, &fc.refCols) { continue }
             let vals = valsAt(old, &fc.refCols)
@@ -14214,7 +14223,7 @@ fn makeFk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Tabl
     var own: []str = []
     for n in c.cols { append(mut &own, n.clone()) }
     let f = ForeignKey{name: name.clone(), cols: own, ref: refKey.clone(), refCols: refCols, onDelete: c.onDelete, onUpdate: c.onUpdate,
-                       deferrable: c.deferrable, deferred: c.deferred, off: false}
+                       deferrable: c.deferrable, deferred: c.deferred}
     // the rows there (NOT VALID: when validated)
     if !lexdb_base.hasStr(&t.invalid, &name) { try fkRows(st, txn, t, &f, p) }
     return Ok(f)
@@ -14283,7 +14292,7 @@ fn dropReferencing(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Ta
                 }
             }
         } else {
-            var c = try byKey(st, txn, &ck)
+            var c = try byKeyJ(st, txn, &ck)
             var changed = false
             var k = 0
             while k < len(c.fks) {
@@ -14359,7 +14368,7 @@ fn fkUses(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, name: &s
         if ck == t.name {
             for f in t.fks { if f.ref == t.name { for n in f.refCols { if n == name { return Ok(true) } } } }
         } else {
-            let c = try byKey(st, txn, &ck)
+            let c = try byKeyJ(st, txn, &ck)
             for f in c.fks { if f.ref == t.name { for n in f.refCols { if n == name { return Ok(true) } } } }
         }
     }
@@ -14382,7 +14391,7 @@ fn renameFkCol(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table,
                 }
             }
         } else {
-            var c = try byKey(st, txn, &ck)
+            var c = try byKeyJ(st, txn, &ck)
             for k in 0..len(c.fks) {
                 if c.fks[k].ref == t.name {
                     for j in 0..len(c.fks[k].refCols) { if c.fks[k].refCols[j] == from { c.fks[k].refCols[j] = to.clone() } }
@@ -14410,7 +14419,7 @@ fn relink(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, old:
     var kids: []str = []
     for ck in t.refBy { if ck != now { addKey(mut &kids, &ck) } }
     for ck in kids {
-        var c = try byKey(st, txn, &ck)
+        var c = try byKeyJ(st, txn, &ck)
         for k in 0..len(c.fks) { if c.fks[k].ref == old { c.fks[k].ref = now.clone() } }
         try putTable(txn, &c)
     }
@@ -18077,13 +18086,25 @@ fn tableDecls(t: &Table): []DeclCol {
 fn (s: mut &Session) tableNamed(name: &str): Result[Table, DbErr] {
     if len(s.txn) > 0 {
         let st = &s.st
-        return needTable(st, mut &s.txn[0], name)
+        return joinedTable(needTable(st, mut &s.txn[0], name))
     }
     var t = lexdb_store.begin()
     s.setUp(mut &t)
     let r = needTable(&s.st, mut &t, name)
     s.st.abort(t)
-    return r
+    return joinedTable(r)
+}
+
+// A table read by the error texts: its foreign keys not enforced among its keys (lexdb_catalog.joinFks).
+fn joinedTable(r: Result[Table, DbErr]): Result[Table, DbErr] {
+    match r {
+        Ok(t0) {
+            var t = t0
+            lexdb_catalog.joinFks(mut &t)
+            return Ok(t)
+        }
+        Err(x) { return Err(x) }
+    }
 }
 
 // A table's columns as SQL Server describes them (INSERT BULK,

@@ -76,7 +76,6 @@ pub type ForeignKey = record {
     pub onUpdate: int
     pub deferrable: bool        // DEFERRABLE, INITIALLY DEFERRED (9.85)
     pub deferred: bool
-    pub off: bool               // not enforced (isOff: set where the table is decoded): neither its rows nor the rows it references are checked
 }
 
 pub fn emptyTable(name: &str): Table {
@@ -660,9 +659,15 @@ pub fn encTable(t: &Table): str {
         }
     }
     // then the foreign keys, and the tables referencing it
+    // (a table a DDL statement has joined: its foreign keys not enforced are kept in the list of the names not valid instead, fkOffs)
+    let offs = fkOffs(t)
+    let inv = persistedInvalid(t, &offs)
     if fkx {
-        binary.addU32LE(mut &b, len(t.fks))
+        var nOn = 0
+        for f in t.fks { if !hasStrAt(&offs, &f.name) { nOn += 1 } }
+        binary.addU32LE(mut &b, nOn)
         for f in t.fks {
+            if hasStrAt(&offs, &f.name) { continue }
             addStr(mut &b, &f.name)
             addStrs(mut &b, &f.cols)
             addStr(mut &b, &f.ref)
@@ -683,16 +688,21 @@ pub fn encTable(t: &Table): str {
     if add { addKinds(mut &b, &cur) }
     // then a temporary table's ON COMMIT, when it is DELETE ROWS or DROP
     // (9.96), or when a spelling follows
-    let more = len(t.pkName) > 0 || len(t.invalid) > 0
+    let more = len(t.pkName) > 0 || len(inv) > 0
     if t.onCommit > lexdb_sql.ONC_PRESERVE || len(t.spell) > 0 || more { b.addByte(byte(t.onCommit)) }
     // then its name as written, if that is not its key's (L6)
     if len(t.spell) > 0 || more { addStr(mut &b, &t.spell) }
     // then its primary key's name and its constraints NOT VALID (9.117)
     if more {
         addStr(mut &b, &t.pkName)
-        addStrs(mut &b, &t.invalid)
+        addStrs(mut &b, &inv)
     }
     return b
+}
+
+fn hasStrAt(xs: &[]str, x: &str): bool {
+    for y in xs { if y == x { return true } }
+    return false
 }
 
 // T-SQL's CLUSTERED and NONCLUSTERED are labels (lexdb's rows are in the primary key's order whatever is said), kept as an entry of
@@ -986,7 +996,7 @@ pub fn decTable(name: &str, s: &str, parseExpr: &fn(&str): Result[Expr, lexdb_ba
             at += strsLen(&frefCols)
             let ub = int(s[at + 1])
             append(mut &t.fks, ForeignKey{name: fname, cols: foldAll(fcols), ref: fref, refCols: foldAll(frefCols), onDelete: int(s[at]), onUpdate: ub & 15,
-                                          deferrable: ub & 16 != 0, deferred: ub & 32 != 0, off: false})
+                                          deferrable: ub & 16 != 0, deferred: ub & 32 != 0})
             at += 2
         }
         t.refBy = strsAt(s, at)
@@ -1019,7 +1029,6 @@ pub fn decTable(name: &str, s: &str, parseExpr: &fn(&str): Result[Expr, lexdb_ba
         at += 4 + len(t.pkName)
         t.invalid = strsAt(s, at)
         at += strsLen(&t.invalid)
-        markOff(mut &t)
     }
     slotExprs(mut &t)
     return Ok(t)
@@ -1057,16 +1066,9 @@ pub fn offInner(x: &Expr): Expr {
     return lexdb_sql.cloneExpr(x)
 }
 
-// What the decoded table's constraints are in memory: its foreign keys' flags (its checks' expressions were stored wrapped).
-fn markOff(t: mut &Table) {
-    for k in 0..len(t.fks) {
-        let o = isOff(t, &t.fks[k].name)
-        t.fks[k].off = o
-    }
-}
-
-// Constraint name of table t not enforced (off) or enforced again, in memory and in its list (the caller writes the row). Its
-// validity is the list's name (setInvalid).
+// Constraint name of table t not enforced (off) or enforced again, in memory and in its list (the caller writes the row). A CHECK is
+// rewritten as `true OR expr` or back; a foreign key is only marked: where the table is written (encTable) the foreign keys marked move out of
+// its list of keys into the list of names not valid (FKOFF_MARK, fkOffs), and where a DDL statement reads a table (joinFks) they come back.
 pub fn setOff(t: mut &Table, name: &str, off: bool) {
     let had = isOff(t, name)
     var keep: []str = []
@@ -1080,7 +1082,77 @@ pub fn setOff(t: mut &Table, name: &str, off: bool) {
             t.checks[k].expr = x
         }
     }
-    for k in 0..len(t.fks) { if t.fks[k].name == name { t.fks[k].off = off } }
+}
+
+// A table's foreign keys that are not enforced are not in Table.fks as the write path reads it (childSide, fkProbes, parentSide walk that
+// list as it always was: no flag, no test): they are entries of Table.invalid with this prefix, each a foreign key as fkEnc writes it.
+// DDL statements, the catalogs and the error texts read the table joined (joinFks), where they are in Table.fks and marked with OFF_MARK.
+pub const FKOFF_MARK = "\x00fkoff:"
+
+pub fn fkEnc(f: &ForeignKey): str {
+    var b = ""
+    addStr(mut &b, &f.name)
+    addStrs(mut &b, &f.cols)
+    addStr(mut &b, &f.ref)
+    addStrs(mut &b, &f.refCols)
+    b.addByte(byte(f.onDelete))
+    b.addByte(byte(f.onUpdate | (if f.deferrable { 16 } else { 0 }) | (if f.deferred { 32 } else { 0 })))
+    return b
+}
+
+fn fkDec(s: &str): ForeignKey {
+    var at = 0
+    let name = strAt(s, at)
+    at += 4 + len(name)
+    let cols = strsAt(s, at)
+    at += strsLen(&cols)
+    let ref = strAt(s, at)
+    at += 4 + len(ref)
+    let refCols = strsAt(s, at)
+    at += strsLen(&refCols)
+    let ub = int(s[at + 1])
+    return ForeignKey{name: name, cols: foldAll(cols), ref: ref, refCols: foldAll(refCols), onDelete: int(s[at]), onUpdate: ub & 15,
+                      deferrable: ub & 16 != 0, deferred: ub & 32 != 0}
+}
+
+// The names of t's foreign keys marked not enforced (a joined table's).
+fn fkOffs(t: &Table): []str {
+    var out: []str = []
+    if len(t.invalid) == 0 { return out }
+    for f in t.fks { if isOff(t, &f.name) { append(mut &out, f.name.clone()) } }
+    return out
+}
+
+// t.invalid as it is written: the markers of the foreign keys not enforced replaced by the keys themselves.
+fn persistedInvalid(t: &Table, offs: &[]str): []str {
+    if len(offs) == 0 {
+        var same: []str = []
+        for x in t.invalid { append(mut &same, x.clone()) }
+        return same
+    }
+    var out: []str = []
+    for x in t.invalid {
+        if strings.startsWith(&x, OFF_MARK) && hasStrAt(offs, &(x[len(OFF_MARK)..len(x)].toStr())) { continue }
+        append(mut &out, x.clone())
+    }
+    for f in t.fks { if hasStrAt(offs, &f.name) { append(mut &out, FKOFF_MARK + fkEnc(&f)) } }
+    return out
+}
+
+// t with its foreign keys not enforced back in Table.fks, marked (OFF_MARK): what a DDL statement, a catalog or an error text reads.
+pub fn joinFks(t: mut &Table) {
+    if len(t.invalid) == 0 { return }
+    var keep: []str = []
+    for x in t.invalid {
+        if strings.startsWith(&x, FKOFF_MARK) {
+            let f = fkDec(&(x[len(FKOFF_MARK)..len(x)].toStr()))
+            append(mut &keep, OFF_MARK + f.name)
+            append(mut &t.fks, f)
+        } else {
+            append(mut &keep, x.clone())
+        }
+    }
+    t.invalid = keep
 }
 
 // Constraint name of table t valid (its rows known to obey it: convalidated) or not.
@@ -1168,7 +1240,8 @@ pub fn seenTables(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, parseExpr: 
     })
     var tabs: []Table = []
     for i in 0..len(keys) {
-        let t = try decTable(&keys[i], &raw[i], parseExpr)
+        var t = try decTable(&keys[i], &raw[i], parseExpr)
+        joinFks(mut &t)
         if len(t.view) == 0 { append(mut &tabs, t) }
     }
     return Ok(tabs)
@@ -1500,7 +1573,11 @@ pub fn allTables(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, parseExpr: &
         return true
     })
     var out: []Table = []
-    for i in 0..len(keys) { append(mut &out, try decTable(&keys[i], &vals[i], parseExpr)) }
+    for i in 0..len(keys) {
+        var t = try decTable(&keys[i], &vals[i], parseExpr)
+        joinFks(mut &t)
+        append(mut &out, t)
+    }
     return Ok(out)
 }
 
@@ -1567,7 +1644,8 @@ pub fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, parseExpr: &fn
     var tnames: []str = []
     if len(txn.tmp) > 0 { for k in keys { if lexdb_sql.schemaOf(&k) == txn.tmp { append(mut &tnames, lexdb_sql.baseName(&k)) } } }
     for i in 0..len(keys) {
-        let t = try decTable(&keys[i], &raw[i], parseExpr)
+        var t = try decTable(&keys[i], &raw[i], parseExpr)
+        joinFks(mut &t)
         let schema = lexdb_sql.schemaOf(&keys[i])
         let name = lexdb_sql.baseName(&keys[i])
         let spelt = if len(t.spell) > 0 { t.spell.clone() } else { name.clone() }      // as written (L6)
@@ -1647,10 +1725,11 @@ pub fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, parseExpr: &fn
             if fk.deferrable { def = def + " DEFERRABLE" }
             if fk.deferred { def = def + " INITIALLY DEFERRED" }
             let fvalid = !lexdb_base.hasStr(&ct.t.invalid, &fk.name)
-            if fk.off { def = def + " NOT ENFORCED" } else if !fvalid { def = def + " NOT VALID" }
+            let foff = isOff(&ct.t, &fk.name)
+            if foff { def = def + " NOT ENFORCED" } else if !fvalid { def = def + " NOT VALID" }
             append(mut &cons, CatCon{oid: catOid(&"c", &(ct.key.clone() + "\x00" + fk.name)), name: fk.name.clone(), typ: "f", rel: ct.oid,
                                           schema: ct.schema.clone(), cols: cs, refRel: refRel, refCols: refCols, idx: refIdx, def: def,
-                                          upd: upd, del: del, check: "", deferrable: fk.deferrable, deferred: fk.deferred, valid: fvalid, enforced: !fk.off})
+                                          upd: upd, del: del, check: "", deferrable: fk.deferrable, deferred: fk.deferred, valid: fvalid, enforced: !foff})
         }
         for ck in ct.t.checks {
             let none: Option[lexdb_sql.TypeName] = None

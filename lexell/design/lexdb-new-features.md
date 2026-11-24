@@ -347,9 +347,13 @@ parse. It is now reset only after a `;`, which makes a point select's parse 284 
 new code; what the new forms hand between parser functions travels in the statement or in the column list, not in new
 fields of the parser (two empty arrays there cost 122 instructions a parse).
 
-- In process (`LXL_HASH_SEED=1`, 20,000 statements less the setup, base main a319f1f5, both `-O`, two rounds
-  alternated, equal in both): point select 120,549 -> 120,265 instructions, INSERT 4,295,195 -> 4,294,929, UPDATE by
-  key 4,280,417 -> 4,280,140.
+- In process (`LXL_HASH_SEED=1`, a scratch program over a Session, tables of 1,000 rows, `taskset -c 4`, exclusive lock; the slope between 20,000 and 40,000 statements, so
+  that what runs once is out of it), instructions per statement, base -> branch, two rounds (the same to 0.1): point select 110,863.4 -> 110,764.3 (**-99**: the select
+  core's one test of the next token's kind), INSERT, plain table 4,296,147.7 -> 4,296,147.7, UPDATE by key 4,100,733.4 -> 4,100,732.9; a table with a CHECK: INSERT 4,331,100.9 -> 4,331,101.1,
+  UPDATE 4,104,633.8 -> 4,104,634.7; with a foreign key: INSERT 4,360,178.5 -> 4,360,178.1, UPDATE 4,130,541.0 -> 4,130,540.7; with both: INSERT 4,379,979.8 -> 4,379,980.6, UPDATE 4,149,317.4 -> 4,149,317.3.
+  Within 1 instruction everywhere: the foreign keys' loops are main's (a first version tested a flag per key: +6), the CHECK has no test (`offWrap`). Counted from zero
+  statements instead, a CHECK table showed +2.4 and +1.1: 40,000 instructions that run once after the first statement (the first INSERT's work, not repeated) divided by 20,000; the
+  slope is +0.2 and +0.9 (the QUALIFY commit alone: equal to base; an unused function added to lexdb_exec: no change; no changed code runs on that path).
 - Over the wire (`icount6.sh`, 3 x points.sql, base and branch alternated twice), per statement: instructions
   173,337 / 173,419 -> 173,194 / 173,252; cycles 96,861 / 97,436 -> 96,939 / 97,184; L1 i-cache misses 294 / 295 ->
   348 / 349, iTLB misses 54 / 52 -> 36 / 36. (Before 577bf9fe, with knownCall over an Option of entryOf's, the cycles
@@ -867,11 +871,15 @@ table alias, a 3,000-row table with NULLs, NULLs and no rows, errors in a later 
 
 The model of 10.5 held (two flags), with the second kept where lexdb keeps NOT VALID: **enforced** is the new one, `Table.invalid` entries with the prefix
 `OFF_MARK` (as the clustered label's CL_MARK: no new column in the catalog row, a table with none is stored as before), **valid** is the old one (the
-name in `Table.invalid`). Not enforced is not valid except Oracle's DISABLE VALIDATE (read as DISABLE). `lexdb_catalog` makes the two forms the write
-path reads where a table is decoded and changed (`markOff`, `setOff`, `setInvalid`): a CHECK not enforced is stored as `true OR expr` (`offWrap`, so the
+name in `Table.invalid`). Not enforced is not valid except Oracle's DISABLE VALIDATE (read as DISABLE). `lexdb_catalog` keeps the two forms where a table is changed (`setOff`, `setInvalid`): a CHECK not enforced is stored as `true OR expr` (`offWrap`, so the
 test of a written row, `passes`, short-circuits and the check costs it nothing whatever it holds: **no instruction on the write path of an enforced
-check, none anywhere for a table with none off**), a foreign key has `ForeignKey.off`, which `childSide`, `fkProbes` (an inactive probe) and `parentSide`
-test (a table with foreign keys: one test per key and row). The catalogs show the expression as written (`offInner`), `conenforced` and `convalidated` (pg_constraint
+check, none anywhere for a table with none off**); a foreign key not enforced is **not in `Table.fks`** as the write path reads it (`childSide`, `fkProbes`,
+`parentSide` loop as on main: no flag, no test): it is an entry of `Table.invalid` with the prefix `FKOFF_MARK` holding the key (`fkEnc`). A statement that
+reads the foreign keys as constraints reads the table joined (`joinFks`: the keys back in `Table.fks`, marked with `OFF_MARK`): `alterTable`, DROP TABLE,
+the tables a DDL statement follows through `refBy` (`byKeyJ`), the catalog snapshot, `allTables`, `seenTables` and `Session.tableNamed` (the error texts);
+`encTable` splits a joined table again (`fkOffs`, `persistedInvalid`), so ENABLE and DISABLE move a key between the two places when the row is written.
+A key not enforced is not looked at by the DDL that drops or retypes a unique key a foreign key needs (PostgreSQL's does not need one either).
+The catalogs show the expression as written (`offInner`), `conenforced` and `convalidated` (pg_constraint
 had no `conenforced`: added in PostgreSQL 18's place, after `condeferred`), `NOT ENFORCED` in the constraint's text, `is_disabled` and `is_not_trusted`,
 `STATUS` (ALL_CONSTRAINTS had none set) and `VALIDATED`. The state of a constraint follows RENAME CONSTRAINT and DROP CONSTRAINT (`pruneInvalid`).
 The grammar: `Constraint.off` and `.stated` (a state was written), one new alteration `A_CON_STATE` (`Alter.mode`: `CS_ON`, `CS_OFF`, `CS_VALIDATE`,
@@ -891,7 +899,7 @@ exec_unenf, tds_unenforced, tns_unenforced).
   rows), instructions per statement, base -> branch: point select 110,863.4 -> 110,764.4 (**-99.0**: the select core's one test of the next token's kind, 10.8), INSERT
   (plain table) 4,147,461.3 -> 4,147,461.0, UPDATE by key 4,097,802.9 -> 4,097,802.1; a table with a CHECK: INSERT 4,165,976.9 -> 4,165,979.3 (+2.4), UPDATE
   4,101,434.8 -> 4,101,435.9 (+1.1) (no changed code runs: placement); a table with a foreign key: INSERT 4,195,479.3 -> 4,195,485.2 (+5.9), UPDATE 4,127,602.5 -> 4,127,608.8
-  (+6.3) (`ForeignKey.off` stored where a key is decoded, tested once per key and row in `childSide`: 0.00015%); both: INSERT +4.0, UPDATE +6.5. The two rounds gave the
+  (+6.3) (x); both: INSERT +4.0, UPDATE +6.5. The two rounds gave the
   same numbers to 0.1. The plain table, the one the rule is about, pays nothing: the CHECK has no test of its own to pay (`offWrap`), the first version's decode test
   moved into the catalog row's trailing sections (a table without them reads nothing: it was +14 on the foreign-key tables).
 - Over the wire (`icount6.sh`, 3 x points.sql, base and branch alternated twice, fresh copy of the data each), per statement: instructions 170,689 / 170,813 -> 170,666 /
@@ -901,6 +909,8 @@ exec_unenf, tds_unenforced, tns_unenforced).
   96,953, i-cache 275, 393 / 387 branch misses) and without the table-alias and ROWNUM changes (98,294 / 97,693, i-cache 393 / 389, 398 / 393): the extra cycles stay
   with the code of the QUALIFY commit wherever its pieces sit, and an unused function added to lexdb_parse of the base moves nothing (94,184 / 94,321, 373 / 379). Not
   fixed: no change of instructions to fix; the cost is where the new code puts the functions after it.
+  Last code (foreign keys out of `Table.fks`), alternated twice again: instructions 170,785 / 170,683 -> 170,592 / 170,664; cycles 93,376 / 93,774 -> 96,859 / 95,727; branch misses
+  379.3 / 373.7 -> 412.4 / 406.8: the same placement.
 - TPC-H SF1 (`run.sh`, lexdb only, base and branch alternated twice, the best of each side): checksums equal on all 22; total 8,817 -> 8,778 ms (0.996). Above 1.5%: q20 251.0 ->
   255.2 (1.017): its server instructions are equal (`iq.sh` over the run's own data, two runs each: 1,625.83M / 1,625.91M against 1,625.83M / 1,626.29M; q21, 1.012: 6,903.6M /
   6,915.2M against 6,909.8M / 6,904.9M): noise and placement.

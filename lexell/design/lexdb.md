@@ -13046,7 +13046,7 @@ the WHERE's (HAVING's) condition. `lexdb_parse.oraQualify` replaces the aliases 
 No field of `Stmt` or `Sel` was added: each would cost every statement a store.
 The constraint states (commit fe8daf59): a CHECK or foreign key is *enforced* (new rows checked; `Table.invalid`'s `OFF_MARK` entries say it is not) and *valid* (the rows
 there obey it: the name in `Table.invalid`, as NOT VALID's). A CHECK not enforced is held as `true OR expr`, so the write path's test of a row is untouched and a
-table with none off pays nothing; a foreign key has `ForeignKey.off`, tested where a table's keys are walked (`childSide`, `fkProbes`, `parentSide`). The three
+table with none off pays nothing; a foreign key not enforced is kept out of `Table.fks` (an entry of `Table.invalid`, `FKOFF_MARK`), so the write path walks the keys as before; DDL, the catalogs and the error texts read the table joined (`joinFks`). The three
 ALTER TABLE grammars make one alteration, `A_CON_STATE`, run by `conState` beside VALIDATE CONSTRAINT. PostgreSQL's NOT ENFORCED and ALTER CONSTRAINT [NOT]
 ENFORCED (`exec_unenf`), T-SQL's WITH NOCHECK, NOCHECK CONSTRAINT, [WITH CHECK] CHECK CONSTRAINT (`tds_unenforced`), Oracle's DISABLE, ENABLE [NO]VALIDATE and
 MODIFY CONSTRAINT (`tns_unenforced`); pg_constraint.conenforced (new in the table), is_disabled and is_not_trusted, STATUS and VALIDATED.
