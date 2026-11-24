@@ -21,9 +21,13 @@ FORMAT ( value, format [, culture ] ) → nvarchar
   An empty string gives the number's plain text, or for a date the `G` format.
 
 *culture*
-: `'en-US'` (the default), `'en-GB'`, `'de-DE'`, `'fr-FR'`, `'es-ES'`, `'it-IT'`, `'nl-NL'`, `'pt-BR'`, `'ja-JP'` or
-  `'sv-SE'` (also the language alone, such as `'de'`). Any other name is read as `en-US`. The cultures give dates their
-  month and day names, patterns, separators and AM or PM; the separators and currency of numbers follow `de-DE` only.
+: A culture name, `'en-US'` by default. Dates have the month and day names, patterns, separators and AM or PM of
+  `'en-US'`, `'en-GB'`, `'de-DE'`, `'fr-FR'`, `'es-ES'`, `'it-IT'`, `'nl-NL'`, `'pt-BR'`, `'ja-JP'` or `'sv-SE'` (also
+  the language alone, such as `'de'`). Numbers follow 61 cultures (`'fr-FR'`, `'de-CH'`, `'en-IN'`, `'ru-RU'`,
+  `'ja-JP'` and others: their separators, grouping and currency and percent patterns). A name of the form of a
+  culture (a language of two or three letters, then parts of letters and digits joined by `-`, such as `'xx-YY'`)
+  that lexdb does not know gets the invariant culture, as in SQL Server 2022. A name of any other form
+  (`'english'`, `'en_US'`, `'x'`, an empty string) is error 9818.
 
 ## Remarks
 
@@ -45,7 +49,10 @@ take, such as `'D'` for a decimal, or `'Q'` for a date).
 
 **Custom numeric formats.** `0` is a digit that always shows, `#` one that shows where it is significant, `,` between
 placeholders groups the integer part, `.` is the decimal point, `%` multiplies by 100, text in quotes or after `\` is
-written as it is. Only the first section (before a `;`) is used.
+written as it is, and other characters between the digit placeholders stay where they stand (`###-##-####`).
+Up to three sections divided by `;` give the format of positive, negative and zero values: a value that rounds to zero
+takes the zero section, the negative section shows no sign of its own, and an empty negative section is the first
+section with a minus sign (example K).
 
 **Standard date formats** (en-US):
 
@@ -64,15 +71,12 @@ text in quotes or after `\`; any other character as it is.
 
 ## Differences from SQL Server
 
-- **Numbers follow `en-US` and `de-DE` only.** `de-DE` gives `1.234.567,89`, currency `1.234,50 €` and percentage
-  `25,6 %`; in every other culture the number formats are `en-US`'s (`FORMAT(1234567.891, 'N2', 'fr-FR')` is
-  `1,234,567.89`; SQL Server gives `1 234 567,89`).
-- A culture name SQL Server does not know is an error there; here it is read as `en-US`. Cultures other than the ten
-  above give the `en-US` patterns and names for dates too.
-- A custom numeric format with several sections is cut at the first `;`: `FORMAT(-5, '0;(0)')` is `-5` (SQL Server:
-  `(5)`).
-- Literal characters between digit placeholders are dropped: `FORMAT(123456789, '###-##-####')` is `123456789`
-  (SQL Server: `123-45-6789`).
+- **Dates of other cultures are `en-US`'s.** Only the ten cultures above have their own month and day names and
+  patterns; a real culture outside them, such as `'ru-RU'`, gives dates the `en-US` names and patterns (SQL Server
+  gives its own). A name of the right form that no culture has gets the invariant culture, as in SQL Server
+  (`Thursday, 05 March 2026` for `'D'` of `'xx-YY'`).
+- **Numbers follow 61 cultures.** A real culture outside them is read as the invariant one (`,` and `.`, `¤` for the
+  currency), where SQL Server has its own numbers for it.
 - `FORMAT` of a `time` value is formatted as a .NET `TimeSpan`: the standard formats `c`, `t`, `T`, `g` and `G` and a
   custom format such as `hh\:mm` work, and any other standard letter is NULL (example F). The fraction has microsecond
   precision (`14:07:09.1234570`).
@@ -223,7 +227,7 @@ jeudi 5 mars 2026 jueves, 5 de marzo de 2026 2026年3月5日 marzo    donderdag
 
 gb_f                sv_g                unknown_culture
 ------------------- ------------------- ---------------
-05 March 2026 14:07 2026-03-05 14:07:09 3/5/2026
+05 March 2026 14:07 2026-03-05 14:07:09 03/05/2026
 
 (1 row affected)
 ```
@@ -272,21 +276,69 @@ Msg 8116, Level 16, State 1, Line 1
 Argument data type varchar is invalid for argument 1 of format function.
 ```
 
-### K. Custom numeric formats that lexdb does not follow
+### K. Sections and literals in a custom numeric format
 
-Both lines show lexdb's answer; SQL Server gives `(5)` and `123-45-6789`.
+Up to three sections give the positive, negative and zero formats. Characters between the digit placeholders stay
+where they are.
 
 <!-- example: tsql -->
 ```sql
-SELECT FORMAT(-5, '0;(0)') AS sections, FORMAT(123456789, '###-##-####') AS literals_between_digits;
+SELECT FORMAT(-5, '0;(0)') AS sections, FORMAT(5, '0;(0)') AS positive, FORMAT(0, '0;(0);zero') AS zero_section,
+       FORMAT(-0.001, '0.0;(0.0);zero') AS rounds_to_zero, FORMAT(-5, '0;;zero') AS empty_negative,
+       FORMAT(123456789, '###-##-####') AS ssn, FORMAT(5551234567, '(###) ###-####') AS phone;
 ```
 
 ```text
-sections literals_between_digits
--------- -----------------------
--5       123456789
+sections positive zero_section rounds_to_zero empty_negative ssn         phone
+-------- -------- ------------ -------------- -------------- ----------- --------------
+(5)      5        zero         zero           -5             123-45-6789 (555) 123-4567
 
 (1 row affected)
+```
+
+### L. Numbers in other cultures
+
+<!-- example: tsql -->
+```sql
+SELECT FORMAT(1234567.891, 'N2', 'fr-FR') AS fr, FORMAT(1234567.891, 'N2', 'de-CH') AS de_ch,
+       FORMAT(1234567.891, 'N2', 'en-IN') AS en_in, FORMAT(1234.5, 'C', 'ja-JP') AS ja_yen, FORMAT(1234.5, 'C', 'pt-BR') AS pt_br,
+       FORMAT(0.256, 'P1', 'sv-SE') AS sv_p;
+```
+
+```text
+fr           de_ch        en_in        ja_yen    pt_br       sv_p
+------------ ------------ ------------ --------- ----------- ------
+1 234 567,89 1’234’567.89 12,34,567.89 ¥1,234.50 R$ 1.234,50 25,6 %
+
+(1 row affected)
+```
+
+### M. Culture names
+
+A name of the form of a culture that is not known gets the invariant culture: `,` and `.` for numbers, `¤` for
+currency, and the invariant date patterns. A name of another form is error 9818.
+
+<!-- example: tsql -->
+```sql
+SELECT FORMAT(1234567.891, 'C', 'xx-YY') AS invariant_c, FORMAT(CAST('2026-03-05' AS date), 'D', 'xx-YY') AS invariant_date;
+GO
+SELECT FORMAT(5, 'N2', 'english') AS a;
+GO
+SELECT FORMAT(5, 'N2', 'en_US') AS a;
+GO
+```
+
+```text
+invariant_c   invariant_date
+------------- -----------------------
+¤1,234,567.89 Thursday, 05 March 2026
+
+(1 row affected)
+
+Msg 9818, Level 16, State 1, Line 1
+The culture parameter 'english' provided in the function call is not supported.
+Msg 9818, Level 16, State 1, Line 1
+The culture parameter 'en_US' provided in the function call is not supported.
 ```
 
 ## See also
