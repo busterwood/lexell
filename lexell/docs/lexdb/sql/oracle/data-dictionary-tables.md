@@ -36,8 +36,9 @@ read them, and return no rows).
 
 `USER_CONSTRAINTS`, `USER_CONS_COLUMNS`
 : `CONSTRAINT_NAME`, `CONSTRAINT_TYPE` (`P`, `U`, `R`, `C`), `TABLE_NAME`, `SEARCH_CONDITION` (a check's text),
-  `R_CONSTRAINT_NAME` (the key a foreign key points to), `DELETE_RULE`, `STATUS`; and the columns of each
-  constraint with `POSITION`.
+  `R_CONSTRAINT_NAME` (the key a foreign key points to), `DELETE_RULE`, `STATUS` (`ENABLED` or `DISABLED`),
+  `VALIDATED` (`VALIDATED` or `NOT VALIDATED`; see [ALTER TABLE](alter-table.md)); and the columns of each
+  constraint with `POSITION`. `RELY` is always empty.
 
 `USER_TAB_IDENTITY_COLS`
 : The identity columns: `TABLE_NAME`, `COLUMN_NAME`, `GENERATION_TYPE` (`ALWAYS` or `BY DEFAULT`),
@@ -339,6 +340,50 @@ ORA-00942: table or view "SA"."USER_TAB_PRIVS_MADE" does not exist
 
 ERROR:
 ORA-00942: table or view "SA"."ROLE_TAB_PRIVS" does not exist
+```
+
+### H. Constraint states
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE gate (id NUMBER PRIMARY KEY, dept_id NUMBER, level NUMBER,
+  CONSTRAINT gate_level_ck CHECK (level > 0) DISABLE,
+  CONSTRAINT gate_dept_fk FOREIGN KEY (dept_id) REFERENCES dept (id) ENABLE NOVALIDATE);
+INSERT INTO dept VALUES (1, 'Sales');
+INSERT INTO gate VALUES (1, 1, -1);
+SELECT constraint_name, constraint_type, status, validated FROM user_constraints
+WHERE table_name = 'GATE' ORDER BY constraint_name;
+ALTER TABLE gate MODIFY CONSTRAINT gate_dept_fk VALIDATE;
+ALTER TABLE gate ENABLE NOVALIDATE CONSTRAINT gate_level_ck;
+SELECT constraint_name, status, validated FROM user_constraints
+WHERE table_name = 'GATE' AND constraint_type IN ('C', 'R') ORDER BY constraint_name;
+```
+
+```text
+Table created.
+
+1 row created.
+
+1 row created.
+
+CONSTRAINT_NAME CONSTRAINT_TYPE STATUS   VALIDATED
+--------------- --------------- -------- -------------
+GATE_DEPT_FK    R               ENABLED  NOT VALIDATED
+GATE_LEVEL_CK   C               DISABLED NOT VALIDATED
+GATE_PKEY       P               ENABLED  VALIDATED
+
+3 rows selected.
+
+Table altered.
+
+Table altered.
+
+CONSTRAINT_NAME STATUS  VALIDATED
+--------------- ------- -------------
+GATE_DEPT_FK    ENABLED VALIDATED
+GATE_LEVEL_CK   ENABLED NOT VALIDATED
+
+2 rows selected.
 ```
 
 ## See also
