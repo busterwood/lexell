@@ -10,6 +10,8 @@
 // default); DATEPART(weekday) is 1 on Sunday.
 
 import "strings"
+import "math"
+import "collections"
 import "unicode"
 import "./lexdb_base"
 import "./lexdb_sql"
@@ -25,8 +27,8 @@ fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
 pub fn isTsqlFn(name: &str): bool {
     match name {
         "#len", "#datalength", "charindex", "patindex", "#replaceci", "#stuff", "#round", "#power", "#dateadd", "#datediff",
-        "#datepart", "#datename", "#eomonth", "#datestyle", "#tlike", "#utcnow", "#reverse", "#concat_ws", "#tint", "#bitint",
-        "#bitnot", "#quotename", "#format", "#tbit_count", "#tbit_shl", "#tbit_shr", "#tbit_get", "#tbit_set" { return true }
+        "#datepart", "#datename", "#eomonth", "#datestyle", "#tlike", "#utcnow", "#reverse", "#concat_ws", "#tint", "#bin2str", "#bsub", "#tobin", "#bitint",
+        "#bitnot", "#quotename", "#format", "#dtadd", "#dtdiff", "#tbit_count", "#tbit_shl", "#tbit_shr", "#tbit_get", "#tbit_set" { return true }
         else { return false }
     }
 }
@@ -238,6 +240,40 @@ pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], Db
     }
     if n > 0 && name[1] == 't' && strings.startsWith(name, "#tbit_") { return tbit(name, vs) }
     if name == "#utcnow" { return Ok(Some(Val.Ts(lexdb_time.nowTstz()))) }
+    // datetime + days (a number: its fraction the time of day), datetime - datetime (a datetime from 1900-01-01 on: the days
+    // between, as SQL Server's)
+    if name == "#dtadd" && n == 2 {
+        if isNull(&vs[0]) || isNull(&vs[1]) { return Ok(Some(Val.Null)) }
+        var days = 0.0f
+        match vs[1] {
+            Val.Int(k) { days = float(k) }
+            Val.Num(d) { days = math.parse(&(d.toStr())).unwrapOr(0.0f) }
+            Val.Float(x) { days = x }
+            Val.Real(x) { days = x }
+            else { return Err(e("TS8116", "Argument data type is invalid for argument of + operator.")) }
+        }
+        match vs[0] {
+            Val.Ts(us) {
+                // (datetime keeps 3 ms steps: rounded to a millisecond)
+                let add = int((days * 86400000.0f + 0.5f).floor()) * 1000
+                return Ok(Some(Val.Ts(us + add)))
+            }
+            else { return Err(e("TS8116", "Argument data type is invalid for argument of + operator.")) }
+        }
+    }
+    if name == "#dtdiff" && n == 2 {
+        if isNull(&vs[0]) || isNull(&vs[1]) { return Ok(Some(Val.Null)) }
+        match vs[0] {
+            Val.Ts(a) {
+                match vs[1] {
+                    Val.Ts(b) { return Ok(Some(Val.Ts(a - b - 36524 * lexdb_time.DAY_US))) }
+                    else {}
+                }
+            }
+            else {}
+        }
+        return Err(e("TS8116", "Argument data type is invalid for argument of - operator."))
+    }
     // FORMAT(value, format [, culture]): .NET's format strings (lexdb_tsqlfmt)
     if name == "#format" { return Ok(Some(try lexdb_tsqlfmt.format(vs, z))) }
     if name == "#concat_ws" {
@@ -250,6 +286,10 @@ pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], Db
     for v in vs { if isNull(&v) { return Ok(Some(Val.Null)) } }
     match name {
         "#len" {
+            match vs[0] {
+                Val.Bytes(b) { return Ok(Some(Val.Int(len(b)))) }
+                else {}
+            }
             // its characters, trailing spaces not counted
             var s = sv(&vs[0])
             var end = len(s)
@@ -465,9 +505,92 @@ pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], Db
             }
             return Ok(Some(Val.Text(sb)))
         }
+        "#bsub" {
+            // SUBSTRING (plain result, value, from, count): of a varbinary its bytes
+            match vs[1] {
+                Val.Bytes(b) {
+                    let from = try intOf(&vs[2], &"substring")
+                    let cnt = try intOf(&vs[3], &"substring")
+                    if cnt < 0 { return Err(e("TS536", "Invalid length parameter passed to the substring function.")) }
+                    let lo = max(from, 1)
+                    let hi = min(from + cnt, len(b) + 1)
+                    return Ok(Some(Val.Bytes(if hi > lo { b[lo - 1..hi - 1].toStr() } else { "" })))
+                }
+                else { return Ok(Some(vs[0].clone())) }
+            }
+        }
+        "#bin2str" {
+            // a varbinary as text: its bytes as characters (style 1: 0x and the hex digits, 2: the hex digits); any other value as it is
+            match vs[0] {
+                Val.Bytes(b) {
+                    let st = if n > 1 { try intOf(&vs[1], &"convert") } else { 0 }
+                    if st == 1 || st == 2 { return Ok(Some(Val.Text((if st == 1 { "0x" } else { "" }) + hexUpper(&b)))) }
+                    var o = ""
+                    for k in 0..len(b) {
+                        let c = int(b[k])
+                        if c < 0x80 { o.addByte(byte(c)) } else { o.addByte(byte(0xc0 | (c >> 6))); o.addByte(byte(0x80 | (c & 0x3f))) }
+                    }
+                    return Ok(Some(Val.Text(o)))
+                }
+                else { return Ok(Some(vs[0].clone())) }
+            }
+        }
+        "#tobin" {
+            // CAST and CONVERT to binary(n) | varbinary(n): (value, n, fixed, style); a string by its bytes (style 1: 0x and hex
+            // digits, 2: hex digits), a number as its big-endian bytes; cut to n, a binary(n) padded with zeros on the right
+            let want = try intOf(&vs[1], &"convert")
+            let fixed = try intOf(&vs[2], &"convert") == 1
+            let st = try intOf(&vs[3], &"convert")
+            var raw: []byte = []
+            match vs[0] {
+                Val.Bytes(b) { raw = strToBytes(&b) }
+                Val.Text(t) {
+                    if st == 1 || st == 2 {
+                        var h = t.toStr()
+                        if st == 1 && (strings.startsWith(&h, "0x") || strings.startsWith(&h, "0X")) { h = h[2..len(h)].toStr() }
+                        if len(h) % 2 == 1 { h = "0" + h }
+                        var k = 0
+                        while k + 1 < len(h) {
+                            let a = hexVal(h[k])
+                            let c = hexVal(h[k + 1])
+                            if a < 0 || c < 0 { return Err(e("TS8114", "Error converting data type varchar to varbinary.")) }
+                            append(mut &raw, byte(a * 16 + c))
+                            k += 2
+                        }
+                    } else { raw = strToBytes(&t) }
+                }
+                Val.Int(x) {
+                    let w = if x >= -2147483648 && x <= 2147483647 { 4 } else { 8 }
+                    for k in 0..w { append(mut &raw, byte((x >> (8 * (w - 1 - k))) & 0xff)) }
+                }
+                else { return Err(e("TS529", "Explicit conversion from data type to varbinary is not allowed.")) }
+            }
+            if want > 0 {
+                // (a number keeps its low bytes, any other value its first)
+                var number = false
+                match vs[0] {
+                    Val.Int(_) { number = true }
+                    else {}
+                }
+                if number && len(raw) > want { raw = collections.copyOf(&raw[len(raw) - want..len(raw)]) }
+                while fixed && len(raw) < want { append(mut &raw, byte(0)) }
+                while len(raw) > want { let dropped = pop(mut &raw) }
+            }
+            return Ok(Some(Val.Bytes(strFromBytes(&raw))))
+        }
         "#tint" {
             // CAST to an integer type: a fraction cut, not rounded (3.9 is 3)
             match vs[0] {
+                // a varbinary: its last bytes, big-endian (the integer's width, 4 bytes unless given)
+                Val.Bytes(b) {
+                    let w = if n > 1 { try intOf(&vs[1], &"convert") } else { 4 }
+                    var x = 0
+                    let from = max(0, len(b) - w)
+                    for k in from..len(b) { x = (x << 8) | int(b[k]) }
+                    let have = len(b) - from
+                    if have > 0 && have < 8 && w > 1 && ((x >> (8 * have - 1)) & 1) == 1 && have == w { x = x - (1 << (8 * have)) }
+                    return Ok(Some(Val.Int(x)))
+                }
                 Val.Num(d) { return Ok(Some(Val.Num(try quant(&d, 0, Rounding.TOWARD_ZERO)))) }
                 Val.Float(x) { return Ok(Some(Val.Float(x.trunc()))) }
                 // '' (or spaces) is 0
@@ -483,6 +606,23 @@ pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], Db
         }
         else { return Ok(None) }
     }
+}
+
+fn hexVal(c: byte): int {
+    if c >= '0' && c <= '9' { return int(c) - 48 }
+    if c >= 'a' && c <= 'f' { return int(c) - 87 }
+    if c >= 'A' && c <= 'F' { return int(c) - 55 }
+    return -1
+}
+
+fn hexUpper(b: &str): str {
+    var o = ""
+    for k in 0..len(b) {
+        let c = int(b[k])
+        o.addByte(byte(if c / 16 < 10 { 48 + c / 16 } else { 55 + c / 16 }))
+        o.addByte(byte(if c % 16 < 10 { 48 + c % 16 } else { 55 + c % 16 }))
+    }
+    return o
 }
 
 fn quant(d: &Decimal, scale: int, mode: Rounding): Result[Decimal, DbErr] {

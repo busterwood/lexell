@@ -159,7 +159,13 @@ fn notNegative(v: &Val): bool {
 
 pub fn intRange(t: &lexdb_sql.TypeName, n: int): Result[int, DbErr] {
     if t.oid == lexdb_sql.OID_INT4 && (n < -2147483648 || n > 2147483647) { return Err(e("22003", "integer out of range")) }
-    if t.oid == lexdb_sql.OID_INT2 && (n < -32768 || n > 32767) { return Err(e("22003", "smallint out of range")) }
+    if t.oid == lexdb_sql.OID_INT2 {
+        if n < -32768 || n > 32767 { return Err(e("22003", "smallint out of range")) }
+        // T-SQL's tinyint (a smallint with its label): 0 to 255
+        if t.prec == lexdb_dialect.TS_TINYINT && (n < 0 || n > 255) {
+            return Err(e("TS220", &("Arithmetic overflow error for data type tinyint, value = " + n.toStr() + ".")))
+        }
+    }
     return Ok(n)
 }
 
@@ -208,6 +214,15 @@ pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
     if t.kind == lexdb_sql.K_INT {
         match v {
             Val.Int(n) { return Ok(Val.Int(try intRange(t, n))) }
+            // a varbinary (T-SQL's 0x literal) as an integer: its last bytes, big-endian
+            Val.Bytes(b) {
+                let w = if t.oid == lexdb_sql.OID_INT8 { 8 } else if t.oid == lexdb_sql.OID_INT4 { 4 } else { 2 }
+                var x = 0
+                for k in max(0, len(b) - w)..len(b) { x = (x << 8) | int(b[k]) }
+                let have = min(len(b), w)
+                if have == w && w < 8 && ((x >> (8 * w - 1)) & 1) == 1 { x = x - (1 << (8 * w)) }
+                return Ok(Val.Int(try intRange(t, x)))
+            }
             Val.Num(d) {
                 match d.toInt(Rounding.HALF_AWAY) {
                     Ok(n) { return Ok(Val.Int(try intRange(t, n))) }
@@ -219,7 +234,12 @@ pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
             Val.Reg(o, _) { return Ok(Val.Int(o)) }
             Val.Text(s) {
                 match strings.parseIntOpt(&(strings.trim(&s))) {
-                    Some(n) { return Ok(Val.Int(try intRange(t, n))) }
+                    Some(n) {
+                        if t.oid == lexdb_sql.OID_INT2 && t.prec == lexdb_dialect.TS_TINYINT && (n < 0 || n > 255) {
+                            return Err(e("TS244", &("The conversion of the varchar value '" + s + "' overflowed an INT1 column. Use a larger integer column.")))
+                        }
+                        return Ok(Val.Int(try intRange(t, n)))
+                    }
                     None { return Err(badInput(t, &s)) }
                 }
             }
@@ -288,7 +308,18 @@ pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
         }
     } else if t.kind == lexdb_sql.K_BYTEA {
         match v {
-            Val.Bytes(x) { return Ok(v) }
+            // T-SQL's binary(n) is padded with zero bytes to n, a varbinary(n) refuses more than n bytes (2628)
+            Val.Bytes(x) {
+                if t.len > 0 && (t.prec == lexdb_dialect.TS_BINARY || t.prec == lexdb_dialect.TS_VARBINARY) {
+                    if len(x) > t.len { return Err(e("TS2628", &("String or binary data would be truncated."))) }
+                    if t.prec == lexdb_dialect.TS_BINARY && len(x) < t.len {
+                        var pad = x.clone()
+                        for k in len(x)..t.len { pad.addByte(byte(0)) }
+                        return Ok(Val.Bytes(pad))
+                    }
+                }
+                return Ok(v)
+            }
             Val.Text(x) { return Ok(Val.Bytes(try parseBytea(&x))) }
             else { return castMore(&v, t) }
         }
@@ -310,6 +341,15 @@ pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
     } else {
         var s = ""
         match v {
+            // a varbinary into T-SQL's varchar: its bytes as characters
+            Val.Bytes(b) {
+                if t.prec == lexdb_dialect.TS_VARCHAR || t.prec == lexdb_dialect.TS_CHAR || t.prec == lexdb_dialect.TS_NCHAR {
+                    for k in 0..len(b) {
+                        let c = int(b[k])
+                        if c < 0x80 { s.addByte(byte(c)) } else { s.addByte(byte(0xc0 | (c >> 6))); s.addByte(byte(0x80 | (c & 0x3f))) }
+                    }
+                } else { s = lexdb_sql.text(&v) }
+            }
             Val.Text(x) { s = x.clone() }
             Val.Int(n) { s = n.toStr() }
             Val.Num(d) { s = d.toStr() }
@@ -317,9 +357,21 @@ pub fn coerce(v: Val, t: &lexdb_sql.TypeName): Result[Val, DbErr] {
             else { s = lexdb_sql.text(&v) }
         }
         if t.oid == lexdb_sql.OID_BPCHAR { return bpcharOf(&s, t.len, false) }
-        // (characters are counted only when the bytes could be too many)
-        if t.len > 0 && len(s) > t.len && strings.runeCount(&s) > t.len {
-            return Err(e("22001", &("value too long for type character varying(" + t.len.toStr() + ")")))
+        if t.len > 0 {
+            // (characters are counted only when the bytes could be too many)
+            if len(s) > t.len && strings.runeCount(&s) > t.len {
+                return Err(e("22001", &("value too long for type character varying(" + t.len.toStr() + ")")))
+            }
+            // T-SQL's char(n) and nchar(n) (a varchar with its label) are padded with blanks to n
+            if t.oid == lexdb_sql.OID_VARCHAR && (t.prec == lexdb_dialect.TS_CHAR || t.prec == lexdb_dialect.TS_NCHAR) {
+                let k = strings.runeCount(&s)
+                if k < t.len {
+                    var b = ""
+                    b += &s
+                    for i in k..t.len { b.addByte(' ') }
+                    return Ok(Val.Text(b))
+                }
+            }
         }
         return Ok(Val.Text(s))
     }

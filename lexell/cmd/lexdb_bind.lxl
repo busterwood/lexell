@@ -1737,6 +1737,13 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                 let rt = if isBp(&r, cols, &ns.ty) { trimmed(r) } else { r }
                 return Ok(Expr.Bin(op.clone(), lt, rt))
             }
+            if len(ns.coll) > 0 {
+                // T-SQL's varbinary and datetime operands (their own function: the PostgreSQL door's frame stays as it was)
+                match try tsOps(&op, &l, &r, cols, ns) {
+                    Some(tx) { return Ok(tx) }
+                    None {}
+                }
+            }
             if op == "/" && len(ns.coll) > 0 {
                 // T-SQL's decimal division: its scale SQL Server's (design/lexdb-tds.md S3)
                 let pa = numPS(&l, cols, ns)
@@ -2282,6 +2289,213 @@ fn numPS(x: &Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): PS {
     }
 }
 
+// What a T-SQL expression is among the date and time types, where it is a column or a cast: 1 datetime or smalldatetime,
+// 2 date, 3 datetime2, datetimeoffset or time, 0 not known or another type.
+fn tsTimeOf(x: &Expr, cols: &[]lexdb_sql.ColDef): int {
+    var t = lexdb_sql.oidType(0)
+    var have = false
+    match x {
+        Expr.Col(n, _) { for c in cols { if c.name == n { t = c.typ.clone(); have = true } } }
+        Expr.Cast(_, ty) {
+            t = ty.clone()
+            have = true
+        }
+        else {}
+    }
+    if !have || lexdb_sql.timeKind(t.oid) == 0 || t.oid == lexdb_sql.OID_IVAL { return 0 }
+
+    if t.prec == lexdb_dialect.TS_DATETIME || t.prec == lexdb_dialect.TS_SMALLDATETIME { return 1 }
+    if t.oid == lexdb_sql.OID_DATE { return 2 }
+    return 3
+}
+
+// 1 where x is a number (a literal, or a column or cast of a number type), 2 for a decimal or float, else 0; name: its T-SQL type.
+fn tsNumOf(x: &Expr, cols: &[]lexdb_sql.ColDef): int {
+    match x {
+        Expr.Lit(v) {
+            match v {
+                Val.Int(_) { return 1 }
+                Val.Num(_) { return 2 }
+                else { return 0 }
+            }
+        }
+        Expr.Col(n, _) {
+            for c in cols { if c.name == n { return if c.typ.kind == lexdb_sql.K_INT { 1 } else if c.typ.kind == lexdb_sql.K_NUM || c.typ.kind == lexdb_sql.K_FLOAT { 2 } else { 0 } } }
+            return 0
+        }
+        Expr.Cast(_, t) { return if t.kind == lexdb_sql.K_INT { 1 } else if t.kind == lexdb_sql.K_NUM || t.kind == lexdb_sql.K_FLOAT { 2 } else { 0 } }
+        else { return 0 }
+    }
+}
+
+fn tsSmall(x: &Expr, cols: &[]lexdb_sql.ColDef): bool {
+    match x {
+        Expr.Col(n, _) { for c in cols { if c.name == n { return c.typ.prec == lexdb_dialect.TS_SMALLDATETIME } } return false }
+        Expr.Cast(_, t) { return t.prec == lexdb_dialect.TS_SMALLDATETIME }
+        else { return false }
+    }
+}
+
+fn tsTypeWord(x: &Expr, cols: &[]lexdb_sql.ColDef): str {
+    match x {
+        Expr.Col(n, _) { for c in cols { if c.name == n { return tsTypeName(&c.typ) } } return "" }
+        Expr.Cast(_, t) { return tsTypeName(t) }
+        else { return "" }
+    }
+}
+
+fn tsTypeName(t: &lexdb_sql.TypeName): str {
+    if t.oid == lexdb_sql.OID_DATE { return "date" }
+    if t.oid == lexdb_sql.OID_TSTZ { return "datetimeoffset" }
+    if t.oid == lexdb_sql.OID_TIME { return "time" }
+    if t.kind == lexdb_sql.K_INT { return if t.oid == lexdb_sql.OID_INT8 { "bigint" } else if t.oid == lexdb_sql.OID_INT2 { "smallint" } else { "int" } }
+    if t.kind == lexdb_sql.K_NUM { return "numeric" }
+    if t.kind == lexdb_sql.K_FLOAT { return "float" }
+    return "datetime2"
+}
+
+// Whether x is a T-SQL binary value: a 0x literal, or a column or cast of a binary type.
+fn tsBinaryX(x: &Expr, cols: &[]lexdb_sql.ColDef): bool {
+    match x {
+        Expr.Lit(v) {
+            match v {
+                Val.Bytes(_) { return true }
+                else { return false }
+            }
+        }
+        Expr.Col(n, _) {
+            for c in cols { if c.name == n { return c.typ.kind == lexdb_sql.K_BYTEA } }
+            return false
+        }
+        Expr.Cast(_, t) { return t.kind == lexdb_sql.K_BYTEA }
+        else { return false }
+    }
+}
+
+fn tsIsText(x: &Expr, cols: &[]lexdb_sql.ColDef): bool {
+    match x {
+        Expr.Lit(v) {
+            match v {
+                Val.Text(_) { return true }
+                else { return false }
+            }
+        }
+        Expr.Col(n, _) {
+            for c in cols { if c.name == n { return c.typ.kind == lexdb_sql.K_TEXT } }
+            return false
+        }
+        Expr.Cast(_, t) { return t.kind == lexdb_sql.K_TEXT }
+        else { return false }
+    }
+}
+
+fn tsOpWord(op: &str): str {
+    if op == "-" { return "subtract" }
+    if op == "*" { return "multiply" }
+    if op == "/" { return "divide" }
+    if op == "%" { return "modulo" }
+    return "add"
+}
+
+// A binary operand of T-SQL beside a number: the integer it reads as (int, bigint beside one); beside a string, in a comparison:
+// the string as bytes; beside another binary, + joins them and - * / % are 402. [] for none of these, [x] the whole expression,
+// [l, r] the operands to go on with.
+fn tsBinary(op: &str, l: &Expr, r: &Expr, cols: &[]lexdb_sql.ColDef): Result[[]Expr, lexdb_base.DbErr] {
+    let bl = tsBinaryX(l, cols)
+    let br = tsBinaryX(r, cols)
+    let arith = op == "+" || op == "t+" || op == "-" || op == "*" || op == "/" || op == "%"
+    if bl && br {
+        if op == "t+" || op == "+" { return Ok([Expr.Bin("||", lexdb_sql.cloneExpr(l), lexdb_sql.cloneExpr(r))]) }
+        if arith { return Err(e("TS402", &("The data types varbinary and varbinary are incompatible in the " + tsOpWord(op) + " operator."))) }
+        if op == "&" || op == "|" || op == "^" { return Err(e("TS402", &("The data types varbinary and varbinary are incompatible in the boolean " + (if op == "&" { "AND" } else if op == "|" { "OR" } else { "exclusive OR" }) + " operator."))) }
+        return Ok([])
+    }
+    let other = if bl { lexdb_sql.cloneExpr(r) } else { lexdb_sql.cloneExpr(l) }
+    let bin = if bl { lexdb_sql.cloneExpr(l) } else { lexdb_sql.cloneExpr(r) }
+    let int4 = lexdb_sql.oidType(lexdb_sql.OID_INT4)
+    let int8 = lexdb_sql.oidType(lexdb_sql.OID_INT8)
+    if tsNumOf(&other, cols) == 2 {
+        // (a decimal or float beside a varbinary: SQL Server converts the binary to the decimal type, which it cannot)
+        return Err(e("TS8114", "Error converting data type varbinary to numeric."))
+    }
+    if tsNumOf(&other, cols) > 0 {
+        var wide = false
+        match other {
+            Expr.Cast(_, t) { wide = t.oid == lexdb_sql.OID_INT8 }
+            Expr.Col(n, _) { for c in cols { if c.name == n { wide = c.typ.oid == lexdb_sql.OID_INT8 } } }
+            Expr.Lit(v) { match v { Val.Int(k) { wide = k > 2147483647 || k < -2147483648 } else {} } }
+            else {}
+        }
+        let w = if wide { 8 } else { 4 }
+        let num = Expr.Cast(Expr.Call("#tint", [lexdb_sql.cloneExpr(bin), Expr.Lit(Val.Int(w))], false), if wide { int8 } else { int4 })
+        return Ok(if bl { [num, lexdb_sql.cloneExpr(r)] } else { [lexdb_sql.cloneExpr(l), num] })
+    }
+    if tsIsText(&other, cols) {
+        if arith { return Err(e("TS402", &("The data types " + (if bl { "varbinary and varchar" } else { "varchar and varbinary" }) + " are incompatible in the " + tsOpWord(op) + " operator."))) }
+        if op == "=" || op == "<>" || op == "!=" || op == "<" || op == ">" || op == "<=" || op == ">=" {
+            var bt = lexdb_sql.oidType(lexdb_sql.OID_BYTEA)
+            let conv = Expr.Cast(Expr.Call("#tobin", [lexdb_sql.cloneExpr(other), Expr.Lit(Val.Int(0)), Expr.Lit(Val.Int(0)), Expr.Lit(Val.Int(0))], false), bt)
+            return Ok(if bl { [lexdb_sql.cloneExpr(l), conv] } else { [conv, lexdb_sql.cloneExpr(r)] })
+        }
+    }
+    return Ok([])
+}
+
+// T-SQL's operators on a varbinary (0x literal, binary column) beside a number or a string, and on a date or time beside a number
+// (+ and - days, two datetimes' difference): the expression, None for any other.
+fn tsOps(op: &str, l: &Expr, r: &Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): Result[Option[Expr], lexdb_base.DbErr] {
+    if tsBinaryX(l, cols) || tsBinaryX(r, cols) {
+        // (a varbinary beside a number is read as the number, beside a string in a comparison the string as bytes)
+        let bo = try tsBinary(op, l, r, cols)
+        if len(bo) == 1 { return Ok(Some(bo[0].clone())) }
+        if len(bo) == 2 { return Ok(Some(intChecked(Expr.Bin(op.toStr(), bo[0].clone(), bo[1].clone()), cols, ns))) }
+    }
+    if op == "+" || op == "-" || op == "t+" {
+        return tsDateArith(&(if op == "t+" { "+".toStr() } else { op.toStr() }), l, r, cols)
+    }
+    return Ok(None)
+}
+
+// T-SQL's + and - with a date or time operand: a datetime and a number add days, two datetimes subtract to a datetime (days
+// from 1900-01-01), a date, datetime2, datetimeoffset or time with a number is 206; None for anything else.
+fn tsDateArith(op: &str, l: &Expr, r: &Expr, cols: &[]lexdb_sql.ColDef): Result[Option[Expr], lexdb_base.DbErr] {
+    let tl = tsTimeOf(l, cols)
+    let tr = tsTimeOf(r, cols)
+    if tl == 0 && tr == 0 { return Ok(None) }
+    let nl = tsNumOf(l, cols)
+    let nr = tsNumOf(r, cols)
+    var dt = lexdb_sql.timeType(lexdb_sql.OID_TS)
+    dt.prec = lexdb_dialect.TS_DATETIME
+    dt.scale = 3
+    if tsSmall(l, cols) && tsSmall(r, cols) || (tl == 1 && tsSmall(l, cols) && nr > 0) || (tr == 1 && tsSmall(r, cols) && nl > 0) {
+        dt.prec = lexdb_dialect.TS_SMALLDATETIME
+        dt.scale = 0
+    }
+    if tl == 1 && nr > 0 {
+        let days = if op == "-" { Expr.Unary("-", lexdb_sql.cloneExpr(r)) } else { lexdb_sql.cloneExpr(r) }
+        return Ok(Some(Expr.Cast(Expr.Call("#dtadd", [lexdb_sql.cloneExpr(l), days], false), dt)))
+    }
+    if tr == 1 && nl > 0 && op == "+" { return Ok(Some(Expr.Cast(Expr.Call("#dtadd", [lexdb_sql.cloneExpr(r), lexdb_sql.cloneExpr(l)], false), dt))) }
+    if tl == 1 && tr == 1 && op == "-" { return Ok(Some(Expr.Cast(Expr.Call("#dtdiff", [lexdb_sql.cloneExpr(l), lexdb_sql.cloneExpr(r)], false), dt))) }
+    if tl >= 2 && nr > 0 { return Err(e("TS206", &("Operand type clash: " + tsTypeWord(l, cols) + " is incompatible with " + (if nr == 2 && false { "numeric" } else { numWord(r) })))) }
+    if tr >= 2 && nl > 0 { return Err(e("TS206", &("Operand type clash: " + numWord(l) + " is incompatible with " + tsTypeWord(r, cols)))) }
+    return Ok(None)
+}
+
+// The type a number operand has in SQL Server's words (an integer literal is int, a decimal one numeric).
+fn numWord(x: &Expr): str {
+    match x {
+        Expr.Lit(v) {
+            match v {
+                Val.Int(_) { return "int" }
+                else { return "numeric" }
+            }
+        }
+        Expr.Cast(_, t) { return tsTypeName(t) }
+        else { return "int" }
+    }
+}
+
 fn typPS(t: &lexdb_sql.TypeName): PS {
     if t.oid == lexdb_sql.OID_INT4 { return PS{p: 10, s: 0, dec: false} }
     if t.oid == lexdb_sql.OID_INT8 { return PS{p: 19, s: 0, dec: false} }
@@ -2540,6 +2754,8 @@ fn exprName(x: &Expr): str {
                 match args[2] { Expr.Lit(v) { return lexdb_sql.text(&v) } else {} }
             }
             if n == "#win" && len(args) == 2 { return exprName(&args[1]) }
+            // a stored function called in SQL: its own name (the key's last part)
+            if n == "#udf" && len(args) >= 1 { match args[0] { Expr.Lit(v) { return colPart(&lexdb_sql.text(&v)) } else {} } }
             if (n == "#old" || n == "#new") && len(args) == 1 { return exprName(&args[0]) }
             if n == "#acat" || n == "#aappend" || n == "#aprepend" || n == "@>" || n == "<@" || n == "&&" || n == "~" ||
                n == "!~" || n == "~*" || n == "!~*" || n == "distinct from" { return "?column?" }

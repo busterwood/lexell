@@ -722,11 +722,13 @@ pub type ReFlags = value record {
     pub nlAnchor: bool      // w: ^ and $ at lines, . matching a newline
     pub nlStop: bool        // p: . not matching a newline, ^ and $ at the ends
     pub tsql: bool          // SQL Server 2025's (tsReFlags): the pattern as RE2 reads it, the first match of the leftmost
+    pub ora: bool           // Oracle's (oraReFlags): its errors (ORA-01428, ORA-12725 ...)
 }
 
 pub fn reFlags(f: &str): Result[ReFlags, DbErr] {
-    var r = ReFlags{glob: false, icase: false, newline: false, quote: false, expanded: false, nlAnchor: false, nlStop: false, tsql: false}
+    var r = ReFlags{glob: false, icase: false, newline: false, quote: false, expanded: false, nlAnchor: false, nlStop: false, tsql: false, ora: false}
     if len(f) > 0 && f[0] == 1 { return tsReFlags(&f[1..len(f)], r) }
+    if len(f) > 0 && f[0] == 2 { return oraReFlags(&f[1..len(f)], r) }
     for i in 0..len(f) {
         let c = f[i]
         if c == 'g' { r.glob = true }
@@ -767,6 +769,41 @@ fn tsReFlags(f: &str, r0: ReFlags): Result[ReFlags, DbErr] {
     r.newline = lines && !dot
     r.nlAnchor = lines && dot
     return Ok(r)
+}
+
+// Oracle's match parameter: i and c the case (the last wins), n a . matching a newline, m ^ and $ at lines, x white space in the
+// pattern ignored; none: case-sensitive, . not matching a newline, ^ and $ at the ends. Any other is ORA-01760.
+fn oraReFlags(f: &str, r0: ReFlags): Result[ReFlags, DbErr] {
+    var r = r0
+    r.ora = true
+    var dot = false
+    var lines = false
+    for i in 0..len(f) {
+        let c = f[i]
+        if c == 'c' { r.icase = false }
+        else if c == 'i' { r.icase = true }
+        else if c == 'n' { dot = true }
+        else if c == 'm' { lines = true }
+        else if c == 'x' { r.expanded = true }
+        else { return Err(e("ORA01760", "illegal argument for function")) }
+    }
+    r.nlStop = !dot && !lines
+    r.newline = lines && !dot
+    r.nlAnchor = lines && dot
+    return Ok(r)
+}
+
+// Oracle's error for a pattern it does not take (ORA-12725 to 12732).
+fn oraReErr(msg: &str): DbErr {
+    if strings.contains(msg, "missing closing )") || strings.contains(msg, "unexpected )") { return e("ORA12725", "unmatched parentheses in regular expression") }
+    if strings.contains(msg, "missing closing ]") { return e("ORA12726", "unmatched bracket in regular expression") }
+    if strings.contains(msg, "invalid repeat count") { return e("ORA12732", "invalid interval value in regular expression") }
+    if strings.contains(msg, "invalid character class range") {
+        if strings.contains(msg, "[:") { return e("ORA12729", "invalid character class in regular expression") }
+        return e("ORA12728", "invalid range in regular expression")
+    }
+    if strings.contains(msg, "backreferences are not supported") { return e("ORA12727", "invalid back reference in regular expression") }
+    return e("ORA12726", "invalid regular expression")
 }
 
 // SQL Server's error for a pattern RE2 does not take (19300 with RE2's words; 19307, 19308, 19309 for the ones it names).
@@ -885,7 +922,10 @@ fn reCompileFor(pat: &str, fl: &ReFlags, which: bool): Result[regex.Regex, DbErr
     let r = if !which || (!fl.quote && nonGreedy(&body)) { regex.compile(&full) } else { regex.compileLongest(&full) }
     match move(r) {
         Ok(re) { return Ok(re) }
-        Err(x) { return Err(e("2201B", &("invalid regular expression: " + x.toStr()))) }
+        Err(x) {
+            if fl.ora { return Err(oraReErr(&x.toStr())) }
+            return Err(e("2201B", &("invalid regular expression: " + x.toStr())))
+        }
     }
 }
 

@@ -1,0 +1,96 @@
+# Wrong answers and gaps of the SQL Server door found writing the user documentation (KNOWN-ISSUES.md, "robustness" slice), against SQL Server 2022
+# (gen_mssql.py ... robust): an UPDATE's subqueries read the statement's starting snapshot, LOG(x, base), tinyint's range, char(n)'s padding,
+# datetime + days and datetime - datetime, FORMAT with a culture, 0x literals as varbinary and their conversions, DROP SEQUENCE under a default
+# (3729), a second PRIMARY KEY by ALTER TABLE (1779), two CLUSTERED keys (8112), OBJECTPROPERTY's table properties.
+
+# UPDATE reads the rows as they were when the statement began
+@once CREATE TABLE emp (id int PRIMARY KEY, mgr_id int, salary int)
+@once INSERT INTO emp VALUES (1, NULL, 100), (2, 1, 200), (3, 2, 300), (4, 3, 400)
+BEGIN TRAN; UPDATE e SET salary = (SELECT x.salary + 1 FROM emp x WHERE x.id = e.mgr_id) FROM emp e WHERE mgr_id IS NOT NULL; SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; UPDATE emp SET salary = (SELECT x.salary + 1 FROM emp x WHERE x.id = emp.mgr_id + 0) WHERE mgr_id IS NOT NULL; SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; UPDATE emp SET salary = salary + (SELECT COUNT(*) FROM emp x WHERE x.salary > emp.salary); SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; UPDATE emp SET salary = 1; UPDATE emp SET salary = salary + (SELECT COUNT(*) FROM emp x WHERE x.salary = 1); SELECT id, salary FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; DELETE e FROM emp e WHERE EXISTS (SELECT 1 FROM emp x WHERE x.mgr_id = e.id) AND salary > (SELECT MIN(salary) FROM emp); SELECT id FROM emp ORDER BY id; ROLLBACK
+BEGIN TRAN; UPDATE emp SET salary = (SELECT x.salary + 1 FROM emp x WHERE x.id = emp.mgr_id) OUTPUT inserted.id, inserted.salary WHERE mgr_id IS NOT NULL; ROLLBACK
+
+# LOG(x, base)
+SELECT LOG(100, 10) AS a, LOG(8, 2) AS b, LOG(10) AS c, LOG(100.0, 10) AS d, LOG(1, 10) AS e
+SELECT LOG(NULL, 10) AS a, LOG(100, NULL) AS b
+
+# tinyint's range
+SELECT CAST(256 AS tinyint) AS a
+SELECT CAST(-1 AS tinyint) AS a
+SELECT CAST(255 AS tinyint) AS a, CAST(12.9 AS tinyint) AS b, CAST(0 AS tinyint) AS c
+SELECT TRY_CAST(300 AS tinyint) AS a, TRY_CAST(-1 AS tinyint) AS b, TRY_CAST(100 AS tinyint) AS c
+SELECT CAST('300' AS tinyint) AS a
+DECLARE @t tinyint = 200; SET @t = @t + 100
+DECLARE @t tinyint = 200; SELECT @t + 100 AS a, @t * 2 AS b, @t - 201 AS c
+SELECT CAST(220 AS tinyint) / 8 AS a, CAST(220 AS tinyint) * 2 AS b
+@once CREATE TABLE ty (a tinyint, b char(5), c nchar(4), d varchar(5), e datetime, f binary(4), g varbinary(3))
+BEGIN TRAN; INSERT INTO ty (a) VALUES (255); SELECT a FROM ty; ROLLBACK
+BEGIN TRAN; INSERT INTO ty (a) VALUES (256); ROLLBACK
+BEGIN TRAN; INSERT INTO ty (a) VALUES (-1); ROLLBACK
+BEGIN TRAN; INSERT INTO ty (a) VALUES (200); UPDATE ty SET a = a + 100; ROLLBACK
+BEGIN TRAN; INSERT INTO ty (a) VALUES (200); UPDATE ty SET a = a - 1; SELECT a FROM ty; ROLLBACK
+
+# char(n) and nchar(n) padded
+BEGIN TRAN; INSERT INTO ty (b, c, d) VALUES ('ab', N'xy', 'cd'); SELECT b, '[' + b + ']' AS bb, LEN(b) AS lb, '[' + c + ']' AS cc, '[' + d + ']' AS dd FROM ty; ROLLBACK
+SELECT '[' + CAST('ab' AS char(5)) + ']' AS a, '[' + CAST('ab' AS nchar(4)) + ']' AS b, '[' + CAST('ab' AS varchar(5)) + ']' AS c, '[' + CAST('abcdefg' AS char(3)) + ']' AS d
+DECLARE @c char(5) = 'ab'; SELECT '[' + @c + ']' AS a, LEN(@c) AS c
+BEGIN TRAN; INSERT INTO ty (b) VALUES ('abcdef'); ROLLBACK
+
+# datetime + days, datetime - datetime
+SELECT CAST('2026-03-15 10:00:00' AS datetime) + 1 AS a, CAST('2026-03-15 10:00:00' AS datetime) - 1 AS b, CAST('2026-03-15 10:00:00' AS datetime) + 1.5 AS c, 1 + CAST('2026-03-15 10:00:00' AS datetime) AS d
+SELECT CAST('2026-03-15 10:00:00' AS datetime) - CAST('2026-03-14 04:30:00' AS datetime) AS a, CAST('2026-03-15' AS datetime) - CAST('2026-03-15' AS datetime) AS b
+BEGIN TRAN; INSERT INTO ty (e) VALUES ('2026-03-15 10:00:00'); SELECT e + 1 AS a, e - 1 AS b, e + 0.25 AS c, e - e AS d, DATEDIFF(day, e - 3, e) AS f FROM ty; ROLLBACK
+SELECT CAST('2026-03-15' AS date) + 1 AS a
+SELECT CAST('2026-03-15 10:00:00' AS datetime2) + 1 AS a
+SELECT CAST('2026-03-15 10:00:00' AS datetime2) - 1 AS a
+SELECT CAST('2026-03-15 10:00:00' AS smalldatetime) + 1 AS a
+
+# FORMAT with a culture: dates, times and numbers
+SELECT FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'd', 'de-DE') AS a, FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'D', 'de-DE') AS b, FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'f', 'de-DE') AS c, FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'G', 'de-DE') AS d, FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'M', 'de-DE') AS e, FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'Y', 'de-DE') AS g
+SELECT FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'dddd, d. MMMM yyyy', 'de-DE') AS a, FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'ddd MMM', 'de-DE') AS b, FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'dd/MM/yy HH:mm', 'de-DE') AS c, FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'MMMM', 'fr-FR') AS d, FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'dddd', 'es-ES') AS e
+SELECT FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'd', 'fr-FR') AS a, FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'D', 'fr-FR') AS b, FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'D', 'es-ES') AS c, FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'D', 'it-IT') AS d, FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'd', 'en-GB') AS e, FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'D', 'en-GB') AS f, FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'd', 'ja-JP') AS g, FORMAT(CAST('2026-03-05 14:07:09' AS datetime), 'D', 'ja-JP') AS h
+SELECT FORMAT(CAST('2026-11-25 09:05:03' AS datetime), 't', 'es-ES') AS a, FORMAT(CAST('2026-11-25 09:05:03' AS datetime), 'T', 'en-US') AS b, FORMAT(CAST('2026-11-25 21:05:03' AS datetime), 'T', 'en-US') AS c, FORMAT(CAST('2026-11-25 21:05:03' AS datetime), 'g', 'nl-NL') AS d, FORMAT(CAST('2026-11-25 09:05:03' AS datetime), 'tt h', 'ja-JP') AS e, FORMAT(CAST('2026-11-25 09:05:03' AS datetime), 'D', 'sv-SE') AS f, FORMAT(CAST('2026-11-25 09:05:03' AS datetime), 'D', 'pt-BR') AS g
+SELECT FORMAT(CAST('2026-03-05' AS date), 'd', 'de-DE') AS a, FORMAT(CAST('2026-03-05' AS date), 'D', 'de-DE') AS b, FORMAT(CAST('2026-03-05' AS date), 'D') AS c
+SELECT FORMAT(CAST('14:07:09' AS time), 'T', 'de-DE') AS a, FORMAT(CAST('14:07:09' AS time), 'T') AS b, FORMAT(CAST('14:07:09.5' AS time), 'c') AS c, FORMAT(CAST('04:07:09' AS time), 'g') AS d, FORMAT(CAST('14:07:09' AS time), 'hh\:mm') AS e, FORMAT(CAST('14:07:09' AS time), 'hh:mm') AS f, FORMAT(CAST('14:07:09' AS time), 'd') AS g
+SELECT FORMAT(1234567.891, 'N2', 'de-DE') AS a, FORMAT(1234567.891, 'C', 'de-DE') AS b, FORMAT(0.256, 'P', 'de-DE') AS c, FORMAT(1234567.891, 'N2', 'en-US') AS d
+
+# hexadecimal literals are varbinary
+SELECT 0x4142 AS a, 0xFF AS b, DATALENGTH(0x4142) AS c, LEN(0x4142) AS d, DATALENGTH(0x) AS e
+SELECT 0x4142 + 1 AS a, 0x10 * 2 AS b, 1 + 0x10 AS c, 0xFF / 2 AS d, 0x10 % 3 AS e, 0x10 | 1 AS f, 0xF0 & 0x3C AS g
+SELECT 0x4142 + 0x43 AS a, 0x41 + 0x4243 AS b
+SELECT 0x4142 - 0x4140 AS a
+SELECT 'a' + 0x41 AS a
+SELECT 0x4142 * 2.5 AS a
+SELECT CASE WHEN 0x4142 = 16706 THEN 1 ELSE 0 END AS a, CASE WHEN 0x4142 = 0x4142 THEN 1 ELSE 0 END AS b, CASE WHEN 0x41 < 0x42 THEN 1 ELSE 0 END AS c, CASE WHEN 0x4142 = 'AB' THEN 1 ELSE 0 END AS d, CASE WHEN 0x41 = 'A' THEN 1 ELSE 0 END AS e, CASE WHEN 0x4142 > 0x41 THEN 1 ELSE 0 END AS f
+SELECT CAST(0x4142 AS varbinary(10)) AS a, CAST(0x4142 AS int) AS b, CAST(0x4142 AS varchar(10)) AS c, CAST(0x4142 AS bigint) AS d, CAST(0x41 AS varchar(5)) AS e, CAST(0x0100 AS smallint) AS g
+SELECT CONVERT(varchar(10), 0x4142, 1) AS a, CONVERT(varchar(10), 0x4142, 2) AS b, CONVERT(varchar(10), 0x4142) AS c, CONVERT(varbinary(10), '4142', 2) AS d, CONVERT(varbinary(10), '0x4142', 1) AS e, CONVERT(varbinary(10), 'AB') AS f
+SELECT CAST(0x4142 AS binary(4)) AS a, CAST(0x414243 AS binary(2)) AS b, CAST(0x4142 AS varbinary(1)) AS c, CAST(16 AS varbinary(4)) AS d, CAST('AB' AS varbinary(10)) AS e, CAST(65 AS varbinary(2)) AS f
+SELECT SUBSTRING(0x41424344, 2, 2) AS a, LEFT(0x41424344, 2) AS b, RIGHT(0x41424344, 2) AS c, SUBSTRING(0x41424344, 3, 10) AS d, SUBSTRING(0x41424344, 0, 3) AS e
+SELECT 0x7FFFFFFF + 1 AS a
+SELECT 0xFFFFFFFF + 1 AS a
+BEGIN TRAN; INSERT INTO ty (a, b, f, g) VALUES (0x10, 'x', 0x41, 0x4142); SELECT a, f, g, DATALENGTH(f) AS df, DATALENGTH(g) AS dg FROM ty; ROLLBACK
+BEGIN TRAN; INSERT INTO ty (g) VALUES (0x41424344); ROLLBACK
+BEGIN TRAN; INSERT INTO ty (f, g) VALUES (0x4142, 0x4142); SELECT f, g FROM ty WHERE g = 0x4142; ROLLBACK
+BEGIN TRAN; INSERT INTO ty (d, a) VALUES (0x4142, 0x41); SELECT d, a FROM ty; ROLLBACK
+
+# DROP SEQUENCE under a default, a second primary key, two clustered keys
+@once CREATE SEQUENCE sq
+@once CREATE TABLE sqt (id int NOT NULL DEFAULT (NEXT VALUE FOR sq), v int)
+DROP SEQUENCE sq
+@once CREATE TABLE pk2 (id int NOT NULL, v int NOT NULL)
+@once ALTER TABLE pk2 ADD CONSTRAINT pk2a PRIMARY KEY (id)
+ALTER TABLE pk2 ADD CONSTRAINT pk2b PRIMARY KEY (v)
+CREATE TABLE cl2 (a int PRIMARY KEY CLUSTERED, b int UNIQUE CLUSTERED)
+DROP TABLE IF EXISTS cl3; CREATE TABLE cl3 (a int NOT NULL PRIMARY KEY NONCLUSTERED, b int, CONSTRAINT k3 UNIQUE CLUSTERED (b)); SELECT type_desc, is_primary_key, is_unique_constraint FROM sys.indexes WHERE object_id = OBJECT_ID('cl3') ORDER BY type_desc
+DROP TABLE IF EXISTS cl4; CREATE TABLE cl4 (a int NOT NULL PRIMARY KEY CLUSTERED, b int, CONSTRAINT k4 UNIQUE NONCLUSTERED (b)); SELECT type_desc, is_primary_key, is_unique_constraint FROM sys.indexes WHERE object_id = OBJECT_ID('cl4') ORDER BY type_desc
+@once CREATE TABLE cl5 (a int NOT NULL PRIMARY KEY CLUSTERED, b int)
+ALTER TABLE cl5 ADD CONSTRAINT u5 UNIQUE CLUSTERED (b)
+
+# OBJECTPROPERTY of a table
+SELECT OBJECTPROPERTY(OBJECT_ID('cl3'), 'TableHasPrimaryKey') AS p, OBJECTPROPERTY(OBJECT_ID('cl3'), 'TableHasClustIndex') AS c, OBJECTPROPERTY(OBJECT_ID('cl3'), 'TableHasUniqueCnst') AS u, OBJECTPROPERTY(OBJECT_ID('cl3'), 'TableHasIndex') AS i
+SELECT OBJECTPROPERTY(OBJECT_ID('cl4'), 'TableHasPrimaryKey') AS p, OBJECTPROPERTY(OBJECT_ID('cl4'), 'TableHasClustIndex') AS c, OBJECTPROPERTY(OBJECT_ID('cl4'), 'TableHasUniqueCnst') AS u
+SELECT OBJECTPROPERTY(OBJECT_ID('ty'), 'TableHasPrimaryKey') AS p, OBJECTPROPERTY(OBJECT_ID('ty'), 'TableHasClustIndex') AS c, OBJECTPROPERTY(OBJECT_ID('ty'), 'TableHasUniqueCnst') AS u, OBJECTPROPERTY(OBJECT_ID('ty'), 'TableHasIndex') AS i
+SELECT OBJECTPROPERTY(OBJECT_ID('emp'), 'TableHasPrimaryKey') AS p, OBJECTPROPERTY(OBJECT_ID('emp'), 'TableHasClustIndex') AS c

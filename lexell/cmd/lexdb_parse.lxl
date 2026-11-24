@@ -919,8 +919,10 @@ fn (p: mut &P) typeName(): Result[TypeName, lexdb_base.DbErr] {
             t.kind = lexdb_sql.timeKind(oid)
             t.oid = oid
             if w == "interval" {
-                t.prec = 0
-                if !p.tsql && !p.ora { try p.ivalFields(mut &t) }
+                // INTERVAL(p) is the precision alone (PostgreSQL: no fields after it); INTERVAL fields [(p)] else
+                let precOnly = t.prec == 1 && !p.tsql && !p.ora
+                if !precOnly { t.prec = 0 }
+                if !p.tsql && !p.ora && !precOnly { try p.ivalFields(mut &t) }
             }
             return Ok(try p.arraySuffix(t))
         }
@@ -2118,14 +2120,8 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         return Ok(subRef("#exists", try p.subquery(SUB_EXISTS)))
     }
     if t.kind == T_NUM && strings.startsWith(&t.text, "0x") {
-        // T-SQL's 0x literal: up to 8 digits an int (as SQL Server converts
-        // one in arithmetic: 0x200 | x), longer the bytes
+        // T-SQL's 0x literal: a varbinary (as SQL Server's: lexdb_bind's binary rules read one as a number beside a number)
         let h = t.text[2..len(t.text)]
-        if len(h) > 0 && len(h) <= 8 {
-            var v = 0
-            for i in 0..len(h) { v = v * 16 + hexDigit(h[i]) }
-            return Ok(Expr.Lit(Val.Int(v)))
-        }
         var b = ""
         var i = 0
         if len(h) % 2 == 1 {
@@ -2214,12 +2210,24 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
                 // a typed literal: date '2026-11-11', timestamp(3) with time zone '...'
                 let at = p.pos
                 p.pos -= 1
+                // (PostgreSQL: INTERVAL '1' YEAR, not INTERVAL YEAR '1')
+                if t.text == "interval" && !p.ora && !p.tsql {
+                    let f = p.peekAt(1)
+                    if f.kind == T_IDENT && (f.text == "year" || f.text == "month" || f.text == "day" || f.text == "hour" || f.text == "minute" || f.text == "second") && p.peekAt(2).kind == T_STR {
+                        return Err(near(&f))
+                    }
+                }
                 match p.typeName() {
                     Ok(ty) {
                         if p.peek().kind == T_STR {
                             var lit = p.next().text
                             var ty2 = ty
-                            if !p.ora && !p.tsql && t.text == "interval" { try p.ivalFields(mut &ty2) }
+                            if !p.ora && !p.tsql && t.text == "interval" && ty.prec != 1 { try p.ivalFields(mut &ty2) }
+                            if !p.ora && !p.tsql && t.text == "interval" && ty.prec == 1 && ty.len == 0 {
+                                // (INTERVAL(p) '...' takes no fields after it)
+                                let f = p.peek().clone()
+                                if f.kind == T_IDENT && (f.text == "year" || f.text == "month" || f.text == "day" || f.text == "hour" || f.text == "minute" || f.text == "second") { return Err(near(&f)) }
+                            }
                             if p.ora && t.text == "interval" {
                                 // INTERVAL '1' DAY, INTERVAL '1-2' YEAR TO MONTH, INTERVAL '1 02:03:04' DAY(2) TO SECOND(3)
                                 let u = p.peek().clone()
@@ -2607,8 +2615,24 @@ fn outputRefs(x: &Expr, q: &str, upd: bool): Expr {
 fn tsqlCast(x: Expr, ty: TypeName, style: Option[Expr]): Expr {
     var v = x
     var sty = style
-    if ty.kind == K_INT { v = Expr.Call("#tint", [v], false) }
+    if ty.kind == K_INT { v = Expr.Call("#tint", [v, Expr.Lit(Val.Int(if ty.oid == OID_INT8 { 8 } else if ty.oid == OID_INT4 { 4 } else if ty.prec == lexdb_dialect.TS_TINYINT { 1 } else { 2 }))], false) }
+    if ty.kind == K_BYTEA && ty.prec != lexdb_dialect.TS_IMAGE {
+        // varbinary(n), binary(n): a string by its bytes (style 1 or 2: its hex digits), a number by its big-endian bytes
+        var st = Expr.Lit(Val.Int(0))
+        match replace(mut &sty, None) {
+            Some(sx) { st = sx }
+            None {}
+        }
+        v = Expr.Call("#tobin", [v, Expr.Lit(Val.Int(ty.len)), Expr.Lit(Val.Int(if ty.prec == lexdb_dialect.TS_BINARY { 1 } else { 0 })), st], false)
+    }
     if ty.kind == K_TEXT {
+        // (a varbinary: its bytes as characters, style 1 or 2 its hex digits)
+        var bst = Expr.Lit(Val.Int(0))
+        match sty {
+            Some(sx) { bst = lexdb_sql.cloneExpr(&sx) }
+            None {}
+        }
+        v = Expr.Call("#bin2str", [v, bst], false)
         match replace(mut &sty, None) {
             Some(st) { v = Expr.Call("#datestyle", [v, st], false) }
             None {}
@@ -2700,6 +2724,8 @@ fn (p: mut &P) tsqlCall(name: &str, args: []Expr, star: bool): Result[Expr, lexd
             else {}
         }
         if fk >= 0 && n >= 2 && n <= fk + 2 {
+            // (REGEXP_REPLACE's replacement is optional: the empty string, the matches removed)
+            if name == "regexp_replace" && len(a) == 2 { append(mut &a, Expr.Lit(Val.Text(""))) }
             let first = fk - len(defs)
             while len(a) < fk { append(mut &a, cloneE(&defs[len(a) - first])) }
             if len(a) == fk { append(mut &a, Expr.Lit(Val.Text(""))) }
@@ -2713,6 +2739,16 @@ fn (p: mut &P) tsqlCall(name: &str, args: []Expr, star: bool): Result[Expr, lexd
     }
     match name.toStr() {
         "len" { return Ok(Expr.Call("#len", a, false)) }
+        // (a varbinary's SUBSTRING is bytes; its LEFT and RIGHT are characters, as SQL Server's)
+        "left", "right" {
+            if n == 2 { a[0] = Expr.Call("#bin2str", [replace(mut &a[0], Expr.Lit(Val.Null)), Expr.Lit(Val.Int(0))], false) }
+        }
+        "substring" {
+            if n == 3 {
+                let plain = Expr.Call("substring", [cloneE(&a[0]), cloneE(&a[1]), cloneE(&a[2])], false)
+                return Ok(Expr.Call("#bsub", [plain, replace(mut &a[0], Expr.Lit(Val.Null)), replace(mut &a[1], Expr.Lit(Val.Null)), replace(mut &a[2], Expr.Lit(Val.Null))], false))
+            }
+        }
         "datalength" { return Ok(Expr.Call("#datalength", a, false)) }
         "replicate" { return Ok(Expr.Call("repeat", a, false)) }
         "space" { if n == 1 { return Ok(Expr.Call("repeat", [Expr.Lit(Val.Text(" ")), replace(mut &a[0], Expr.Lit(Val.Null))], false)) } }
@@ -2785,7 +2821,15 @@ fn (p: mut &P) tsqlCall(name: &str, args: []Expr, star: bool): Result[Expr, lexd
                 return Ok(Expr.Call(name.toStr(), [x], false))
             }
         }
-        "log" { if n == 1 { return Ok(Expr.Call("ln", [Expr.Cast(replace(mut &a[0], Expr.Lit(Val.Null)), float8)], false)) } }
+        "log" {
+            if n == 1 { return Ok(Expr.Call("ln", [Expr.Cast(replace(mut &a[0], Expr.Lit(Val.Null)), float8)], false)) }
+            // LOG(x, base): lexdb's log takes the base first
+            if n == 2 {
+                let lx = Expr.Cast(replace(mut &a[0], Expr.Lit(Val.Null)), float8)
+                let lb = Expr.Cast(replace(mut &a[1], Expr.Lit(Val.Null)), float8)
+                return Ok(Expr.Cast(Expr.Call("log", [lb, lx], false), float8))
+            }
+        }
         "newid" { return Ok(Expr.Call("gen_random_uuid", [], false)) }
         "db_name" { return Ok(Expr.Call("current_database", [], false)) }
         "schema_name" { if n == 0 { return Ok(Expr.Lit(Val.Text("dbo"))) } }
@@ -6485,11 +6529,24 @@ fn (p: mut &P) update(): Result[Stmt, lexdb_base.DbErr] {
     var out: []SelItem = []
     if p.tsql && p.acceptKw("output") { try p.outputList(mut &s, mut &out) }
     if p.acceptKw("from") { try p.dmlFrom(mut &s) }
-    if p.acceptKw("where") { s.where = Some(try p.expr()) }
+    if p.acceptKw("where") {
+        if p.ora { try p.dmlWhere(mut &s) } else { s.where = Some(try p.expr()) }
+    }
     try p.returning(mut &s)
     try p.batchOpt(mut &s)
     if p.tsql { try tsqlDml(mut &s, out) }
     return Ok(s)
+}
+
+// An UPDATE's or DELETE's WHERE, after its keyword. Oracle's ROWNUM tests in it (oraRownum) are the statement's limit: the first
+// n rows the rest of the condition finds (TOP's, firstN).
+fn (p: mut &P) dmlWhere(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    var emptied = false
+    var rn = -1
+    if p.ora { rn = p.oraRownum(mut &emptied) }
+    if !emptied { s.where = Some(try p.expr()) }
+    if rn >= 0 { s.limit = Some(Expr.Lit(Val.Int(rn))) }
+    return Ok(Unit{})
 }
 
 // lexdb's WITH (batch_rows n) at the end of an UPDATE or DELETE (design/
@@ -6521,7 +6578,9 @@ fn (p: mut &P) delete(): Result[Stmt, lexdb_base.DbErr] {
     if p.tsql && p.acceptKw("output") { try p.outputList(mut &s, mut &out) }
     // (Oracle 23ai's direct join: DELETE [FROM] t [alias] FROM list, as PostgreSQL's USING)
     if p.acceptKw("using") || ((p.tsql || p.ora) && p.acceptKw("from")) { try p.dmlFrom(mut &s) }
-    if p.acceptKw("where") { s.where = Some(try p.expr()) }
+    if p.acceptKw("where") {
+        if p.ora { try p.dmlWhere(mut &s) } else { s.where = Some(try p.expr()) }
+    }
     try p.returning(mut &s)
     try p.batchOpt(mut &s)
     if p.tsql { try tsqlDml(mut &s, out) }
@@ -7646,6 +7705,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             }
             if p.acceptKw("sequence") {
                 var s = lexdb_sql.newStmt(S_DROP_SEQ)
+                s.mdialect = p.md()
                 if p.acceptKw("if") {
                     try p.expectKw("exists")
                     s.ifFlag = true
@@ -8535,6 +8595,28 @@ fn cloneAll(a: &[]Expr): []Expr {
     return out
 }
 
+// An Oracle call's argument i (its default when not given).
+fn oraArg(a: &[]Expr, i: int, dflt: int): Expr {
+    if i < len(a) { return cloneE(&a[i]) }
+    return Expr.Lit(Val.Int(dflt))
+}
+
+// An Oracle REGEXP_ call's match parameter at i, marked (lexdb_sql.RE_ORA); NULL or missing: none.
+fn oraReFlagsArg(a: &[]Expr, i: int): Expr {
+    if i >= len(a) { return Expr.Lit(Val.Text(lexdb_sql.RE_ORA)) }
+    match a[i] {
+        Expr.Lit(v) {
+            match v {
+                Val.Text(t) { return Expr.Lit(Val.Text(lexdb_sql.RE_ORA + t)) }
+                Val.Null { return Expr.Lit(Val.Text(lexdb_sql.RE_ORA)) }
+                else {}
+            }
+        }
+        else {}
+    }
+    return Expr.Bin("||", Expr.Lit(Val.Text(lexdb_sql.RE_ORA)), Expr.Call("coalesce", [cloneE(&a[i]), Expr.Lit(Val.Text(""))], false))
+}
+
 fn orArgs(name: &str): lexdb_base.DbErr { return oraErr(909, "invalid number of arguments") }
 
 // SYS_CONTEXT('USERENV', name): what Oracle's connection has of the session
@@ -8744,15 +8826,31 @@ fn (p: mut &P) oraCall(name: &str, args: []Expr, star: bool): Result[Expr, lexdb
             let u = Expr.Call("gen_random_uuid", [], false)
             return Ok(Expr.Call("upper", [Expr.Call("replace", [u, Expr.Lit(Val.Text("-")), Expr.Lit(Val.Text(""))], false)], false))
         }
+        // REGEXP_REPLACE (source, pattern [, replacement [, position [, occurrence [, match_param]]]]), the occurrence 0 all of them
+        // (the replacement NULL: the matches removed); REGEXP_SUBSTR (source, pattern [, position [, occurrence [, match_param
+        // [, subexpr]]]]); REGEXP_INSTR (..., occurrence [, return_option [, match_param [, subexpr]]]); REGEXP_COUNT (source,
+        // pattern [, position [, match_param]]): lexdb's own functions of the same arguments, the match parameter marked as
+        // Oracle's (lexdb_sql.RE_ORA)
         "regexp_replace" {
-            if n == 3 { append(mut &a, Expr.Lit(Val.Text("g"))) }
-            return Ok(Expr.Call("regexp_replace", a, false))
+            if n < 2 || n > 6 { return Err(orArgs(name)) }
+            let rep = if n >= 3 { Expr.Call("coalesce", [cloneE(&a[2]), Expr.Lit(Val.Text(""))], false) } else { Expr.Lit(Val.Text("")) }
+            return Ok(Expr.Call("regexp_replace", [cloneE(&a[0]), cloneE(&a[1]), rep, oraArg(&a, 3, 1), oraArg(&a, 4, 0), oraReFlagsArg(&a, 5)], false))
         }
         "regexp_substr" {
-            if n < 2 { return Err(orArgs(name)) }
-            // the whole match: the pattern in a group
-            let pat = Expr.Bin("||", Expr.Lit(Val.Text("(")), Expr.Bin("||", cloneE(&a[1]), Expr.Lit(Val.Text(")"))))
-            return Ok(Expr.Call("#elem", [Expr.Call("regexp_match", [cloneE(&a[0]), pat], false), Expr.Lit(Val.Int(1))], false))
+            if n < 2 || n > 6 { return Err(orArgs(name)) }
+            return Ok(Expr.Call("regexp_substr", [cloneE(&a[0]), cloneE(&a[1]), oraArg(&a, 2, 1), oraArg(&a, 3, 1), oraReFlagsArg(&a, 4), oraArg(&a, 5, 0)], false))
+        }
+        "regexp_instr" {
+            if n < 2 || n > 7 { return Err(orArgs(name)) }
+            return Ok(Expr.Call("regexp_instr", [cloneE(&a[0]), cloneE(&a[1]), oraArg(&a, 2, 1), oraArg(&a, 3, 1), oraArg(&a, 4, 0), oraReFlagsArg(&a, 5), oraArg(&a, 6, 0)], false))
+        }
+        "regexp_count" {
+            if n < 2 || n > 4 { return Err(orArgs(name)) }
+            return Ok(Expr.Call("regexp_count", [cloneE(&a[0]), cloneE(&a[1]), oraArg(&a, 2, 1), oraReFlagsArg(&a, 3)], false))
+        }
+        "regexp_like" {
+            if n < 2 || n > 3 { return Err(orArgs(name)) }
+            return Ok(Expr.Call("regexp_like", [cloneE(&a[0]), cloneE(&a[1]), oraReFlagsArg(&a, 2)], false))
         }
         else { return oraNewCall(name, a, star) }
     }
@@ -8887,7 +8985,7 @@ fn (p: mut &P) oraRownum(emptied: mut &bool): int {
             } else if t.kind == T_OP && t.text == ";" && depth == 0 { break }
             else if depth == 0 && t.kind == T_IDENT {
                 match t.text {
-                    "group", "order", "having", "union", "except", "intersect", "fetch", "offset", "for", "window", "limit", "connect", "start" { done = true }
+                    "group", "order", "having", "union", "except", "intersect", "fetch", "offset", "for", "window", "limit", "connect", "start", "returning", "with" { done = true }
                     "or" { hasOr = true }
                     "between" { between = true }
                     "and" {
@@ -8949,8 +9047,10 @@ fn (p: mut &P) oraRownum(emptied: mut &bool): int {
 fn (p: mut &P) oraLimit(s0: Stmt, n: int): Stmt {
     var s = s0
     let lim = Some(Expr.Lit(Val.Int(n)))
-    if len(s.order) == 0 || len(p.subs) > 0 || len(p.wins) > 0 || len(s.from) != 1 || s.from[0].sub >= 0 || len(s.group) > 0 ||
-       s.distinct || s.having.isSome() || len(s.distinctOn) > 0 {
+    // (rows are numbered after WHERE and before what follows: the groups, an aggregate over all the rows, DISTINCT, the sort)
+    var after = len(s.order) > 0 || len(s.group) > 0 || len(s.gsets) > 0 || s.distinct || s.having.isSome() || len(s.distinctOn) > 0
+    for it in s.items { match it.expr { Some(x) { if aggIn(&x) { after = true } } None {} } }
+    if !after || len(p.subs) > 0 || len(p.wins) > 0 || len(s.from) != 1 || s.from[0].sub >= 0 {
         s.limit = lim
         return s
     }
@@ -8961,14 +9061,27 @@ fn (p: mut &P) oraLimit(s0: Stmt, n: int): Stmt {
     inner.where = replace(mut &s.where, None)
     inner.limit = lim
     inner.use = SUB_FROM
-    var outer = lexdb_sql.newStmt(S_SELECT)
-    outer.items = replace(mut &s.items, [])
-    outer.order = replace(mut &s.order, [])
-    outer.offset = replace(mut &s.offset, None)
     let al = inner.from[0].alias.clone()
-    append(mut &outer.from, FromItem{table: "", alias: al, join: J_FIRST, on: None, sub: 0, cols: [], work: -1, lateral: false, using: [], natural: false, comma: true})
+    append(mut &s.from, FromItem{table: "", alias: al, join: J_FIRST, on: None, sub: 0, cols: [], work: -1, lateral: false, using: [], natural: false, comma: true})
+    s.table = ""
     p.subs = [inner]
-    return outer
+    return s
+}
+
+// Whether an expression calls an aggregate.
+fn aggIn(x: &Expr): bool {
+    match x {
+        Expr.Call(name, args, _) {
+            if lexdb_sql.isAgg(&name) { return true }
+            for a in args { if aggIn(&a) { return true } }
+            return false
+        }
+        Expr.Unary(_, a) { return aggIn(&a) }
+        Expr.Bin(_, a, b) { return aggIn(&a) || aggIn(&b) }
+        Expr.IsNull(a, _) { return aggIn(&a) }
+        Expr.Cast(a, _) { return aggIn(&a) }
+        else { return false }
+    }
 }
 
 
