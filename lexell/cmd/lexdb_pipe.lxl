@@ -9423,6 +9423,14 @@ fn winOuts(xs: &[]BX, at: &[]int, row: &[]Val, vals: &[]Val, cx: &Ctx, vs: mut &
     return Ok(Unit{})
 }
 
+// Whether a row (and its calls' values vals) passes QUALIFY's condition: true where the query has none.
+fn winQual(pw: &lexdb_plan.PWin, row: &[]Val, vals: &[]Val, cx: &Ctx): Result[bool, DbErr] {
+    match pw.qual {
+        Some(b) { return Ok(lexdb_ops.truth(&(try bxEval(&b, row, vals, cx))) == Some(true)) }
+        None { return Ok(true) }
+    }
+}
+
 fn winBody(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, input: &lexdb_plan.PPlan, pw: &lexdb_plan.PWin, xs: &[]BX,
            cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, hrows: &[][]Val, tabs: &[]&lexdb_catalog.Table, srcs: &[]Src,
            vrows: &[][][]Val, cx: &Ctx, cap: int, bud: mut &Budget, cnt: mut &[]Counts,
@@ -9486,11 +9494,14 @@ fn winBody(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, input: 
         // engine's; a SortSt's OutBatch costs more than it saves here)
         var kept: [][]Val = []
         let noInts: []int = []
+        var k = 0
         for r in 0..n {
+            if !(try winQual(pw, &rows[r].row, &wv[r], cx)) { continue }
             var vs: []Val = withCapacity(len(xs))
             try winOuts(xs, &at, &rows[r].row, &wv[r], cx, mut &vs)
             outHeld += winBytes(&vs, len(xs), false, &noInts, &noInts)
-            if r >= sr.offset && (sr.limit < 0 || len(kept) < sr.limit) { append(mut &kept, vs) }
+            if k >= sr.offset && (sr.limit < 0 || len(kept) < sr.limit) { append(mut &kept, vs) }
+            k += 1
         }
         if bud.maxHeld > 0 && bud.held + inHeld + outHeld > bud.maxHeld { return Err(memErr(bud.maxHeld)) }
         bud.held += inHeld + outHeld
@@ -9498,6 +9509,7 @@ fn winBody(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, input: 
         return Ok(len(kept))
     }
     for r in 0..n {
+        if !(try winQual(pw, &rows[r].row, &wv[r], cx)) { continue }
         var vs: []Val = withCapacity(len(xs))
         try winOuts(xs, &at, &rows[r].row, &wv[r], cx, mut &vs)
         let before = sr.set.n
@@ -9724,7 +9736,7 @@ pub fn groupsView(txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDe
     for x in srt.desc { append(mut &go.desc, x) }
     for x in srt.nf { append(mut &go.nf, x) }
     if cap >= 0 && (go.limit < 0 || cap < go.limit) { go.limit = cap }
-    let noWin = lexdb_plan.PWin{wins: [], keys: [], args: [], offs: [], slots: []}
+    let noWin = lexdb_plan.PWin{wins: [], keys: [], args: [], offs: [], slots: [], qual: None}
     let noHs: []BX = []
     match projUnder(top) {
         lexdb_plan.PPlan.Project(i, xs) {

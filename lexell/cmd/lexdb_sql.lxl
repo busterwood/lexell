@@ -465,11 +465,17 @@ pub type Constraint = record {
     pub index: str
     pub notValid: bool
     pub cluster: int            // T-SQL's CLUSTERED (1) or NONCLUSTERED (2) of a PRIMARY KEY or UNIQUE; 0 not said
+    // a CHECK's or foreign key's state as written (design/lexdb-new-features.md 10.5): off, not enforced (PostgreSQL's NOT ENFORCED,
+    // Oracle's DISABLE; the rows are not checked, and it is not valid); notValid with it off or not: Oracle's ENABLE NOVALIDATE,
+    // T-SQL's WITH NOCHECK (enforced from now on, the rows there not checked: CHECK constraints and foreign keys added so to a table
+    // that has rows are NOT VALID, here also in CREATE TABLE where the dialect says so)
+    pub off: bool
+    pub stated: bool            // ENFORCED, NOT ENFORCED, ENABLE or DISABLE was written (a second one is an error)
 }
 
 pub fn newConstraint(kind: int, name: &str): Constraint {
     return Constraint{kind: kind, name: name.clone(), cols: [], expr: None, refTable: "", refCols: [], onDelete: 0, onUpdate: 0,
-                      deferrable: false, deferred: false, index: "", notValid: false, cluster: 0}
+                      deferrable: false, deferred: false, index: "", notValid: false, cluster: 0, off: false, stated: false}
 }
 
 // A join tree's subquery (lexdb_parse's nestTree): its select list, *
@@ -687,6 +693,19 @@ pub const A_SET_IDENTITY = 16   // ALTER COLUMN name SET GENERATED col.identity 
 pub const A_DROP_IDENTITY = 17  // ALTER COLUMN name DROP IDENTITY [IF EXISTS]
 pub const A_DROP_EXPR = 18      // ALTER COLUMN name DROP EXPRESSION [IF EXISTS]: a stored generated column made an ordinary one
 pub const A_SET_EXPR = 19       // ALTER COLUMN name SET EXPRESSION AS (expr): col.gen the new expression
+pub const A_CON_STATE = 20      // a CHECK or foreign key's state (design/lexdb-new-features.md 10.5): PostgreSQL's ALTER CONSTRAINT name [NOT] ENFORCED, T-SQL's
+                                // [WITH CHECK | WITH NOCHECK] CHECK CONSTRAINT and NOCHECK CONSTRAINT, Oracle's ENABLE, DISABLE, MODIFY CONSTRAINT;
+                                // name CON_ALL: every CHECK and foreign key (T-SQL's ALL); mode: CS_*
+
+// A_CON_STATE's mode: the constraint is made enforced (CS_ON) or not (CS_OFF); its rows are checked now and it is valid (CS_VALIDATE)
+// or it becomes not valid without a check (CS_NOVALIDATE); CS_IF_OFF: only a constraint that is not enforced is changed (PostgreSQL's
+// ENFORCED of one that is enforced is nothing).
+pub const CS_ON = 1
+pub const CS_OFF = 2
+pub const CS_VALIDATE = 4
+pub const CS_NOVALIDATE = 8
+pub const CS_IF_OFF = 16
+pub const CON_ALL = "\x00all"
 
 pub type Alter = record {
     pub kind: int
@@ -698,13 +717,14 @@ pub type Alter = record {
     pub cons: []Constraint      // A_ADD_CON: the constraint
     pub cascade: bool           // DROP COLUMN, DROP CONSTRAINT: CASCADE (foreign keys on it dropped)
     pub seq: SeqOpts            // A_ADD_IDENTITY, A_SET_IDENTITY: the sequence's options (9.117)
+    pub mode: int               // A_CON_STATE: CS_* flags
 }
 
 // An action of ALTER TABLE: kind on name.
 pub fn noCol(): ColDef { return colDef("", TypeName{kind: 0, oid: 0, prec: 0, scale: 0, len: 0}, false) }
 
 pub fn alterOf(kind: int, name: &str): Alter {
-    return Alter{kind: kind, col: noCol(), name: name.clone(), to: "", ifFlag: false, using: None, cons: [], cascade: false, seq: noSeqOpts()}
+    return Alter{kind: kind, col: noCol(), name: name.clone(), to: "", ifFlag: false, using: None, cons: [], cascade: false, seq: noSeqOpts(), mode: 0}
 }
 
 // A qualified name, schema.name, as the parser gives it: the two joined by

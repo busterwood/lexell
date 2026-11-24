@@ -186,6 +186,7 @@ const A_ADD_CON = lexdb_sql.A_ADD_CON
 const A_DROP_CON = lexdb_sql.A_DROP_CON
 const A_RENAME_CON = lexdb_sql.A_RENAME_CON
 const A_VALIDATE = lexdb_sql.A_VALIDATE
+const A_CON_STATE = lexdb_sql.A_CON_STATE
 const A_ADD_IDENTITY = lexdb_sql.A_ADD_IDENTITY
 const A_SET_IDENTITY = lexdb_sql.A_SET_IDENTITY
 const A_DROP_IDENTITY = lexdb_sql.A_DROP_IDENTITY
@@ -3014,6 +3015,7 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
             }
             try p.expectKw(")")
             try p.tsqlStorage()
+            if p.enforcedNext() { return Err(lexdb_base.err("0A000", "PRIMARY KEY constraints cannot be marked NOT ENFORCED")) }
         } else if len(cname) > 0 || p.isKw("unique") || p.isKw("check") || p.isKw("foreign") || p.isKw("exclude") {
             append(mut &s.cons, try p.tableConstraint(&cname))
         } else {
@@ -3029,6 +3031,8 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
                 if p.acceptKw("constraint") { cn = try p.name() }
                 if p.ora && c.genKind == lexdb_sql.GEN_NONE && p.acceptKw("as") {
                     try p.genClause(mut &c, true)
+                } else if p.enforcedNext() {
+                    return Err(misplacedState())
                 } else if p.acceptKw("not") {
                     try p.expectKw("null")
                     c.notNull = true
@@ -3057,15 +3061,17 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
                     append(mut &s.cons, u)
                 } else if p.acceptKw("check") {
                     var ck = try p.checkTail(&cn)
-                    if ck.notValid { return Err(near(&p.toks[p.pos - 1])) }     // a column's may not be NOT VALID
+                    if ck.notValid && !ck.stated { return Err(near(&p.toks[p.pos - 1])) }     // a column's may not be NOT VALID
                     append(mut &ck.cols, n.clone())         // a column's: named for it
                     append(mut &s.cons, ck)
                 } else if p.acceptKw("references") {
                     var fk = lexdb_sql.newConstraint(C_FOREIGN, &cn)
                     append(mut &fk.cols, n.clone())
                     try p.fkTail(mut &fk)
-                    if fk.notValid { return Err(near(&p.toks[p.pos - 1])) }
+                    if fk.notValid && !fk.stated { return Err(near(&p.toks[p.pos - 1])) }
                     append(mut &s.cons, fk)
+                } else if p.enforcedNext() {
+                    return Err(misplacedState())
                 } else if len(cn) > 0 {
                     return Err(near(&p.peek()))
                 } else {
@@ -3200,6 +3206,7 @@ fn (p: mut &P) tableConstraint(name: &str): Result[Constraint, lexdb_base.DbErr]
         try p.expectKw(")")
         try p.indexTail()
         try p.tsqlStorage()
+        if p.enforcedNext() { return Err(lexdb_base.err("0A000", &((if prim { "PRIMARY KEY" } else { "UNIQUE" }) + " constraints cannot be marked NOT ENFORCED"))) }
         if p.isNotValid() { return Err(lexdb_base.err("0A000", &((if prim { "PRIMARY KEY" } else { "UNIQUE" }) + " constraints cannot be marked NOT VALID"))) }
         return Ok(c)
     }
@@ -3279,6 +3286,59 @@ fn (p: mut &P) uniqueTail(): Result[Unit, lexdb_base.DbErr] {
     return Ok(Unit{})
 }
 
+// A constraint's state word after a CHECK's or foreign key's definition (design/lexdb-new-features.md 10.5), when one is next: true
+// when read. PostgreSQL 18's ENFORCED and NOT ENFORCED (42601 for two); Oracle's ENABLE, DISABLE, VALIDATE, NOVALIDATE (a state is a
+// constraint's ENABLE [VALIDATE | NOVALIDATE] or DISABLE [NOVALIDATE]: not enforced is not validated), RELY and NORELY (read, not kept).
+// Not SQL Server's: its WITH NOCHECK is ALTER TABLE's.
+fn (p: mut &P) stateWord(c: mut &Constraint): Result[bool, lexdb_base.DbErr] {
+    if p.tsql { return Ok(false) }
+    if p.ora {
+        if p.acceptKw("enable") {
+            c.off = false
+            c.stated = true
+            return Ok(true)
+        }
+        if p.acceptKw("disable") {
+            c.off = true
+            c.notValid = true
+            c.stated = true
+            return Ok(true)
+        }
+        if p.acceptKw("validate") {
+            c.notValid = c.off
+            return Ok(true)
+        }
+        if p.acceptKw("novalidate") {
+            c.notValid = true
+            c.stated = true
+            return Ok(true)
+        }
+        if p.acceptKw("rely") || p.acceptKw("norely") { return Ok(true) }
+        return Ok(false)
+    }
+    var off = false
+    if p.isKw("enforced") { p.pos += 1 }
+    else if p.isKw("not") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "enforced" {
+        p.pos += 2
+        off = true
+    } else { return Ok(false) }
+    if c.stated { return Err(lexdb_base.err("42601", "multiple ENFORCED/NOT ENFORCED clauses not allowed")) }
+    c.stated = true
+    if off {
+        c.off = true
+        c.notValid = true
+    }
+    return Ok(true)
+}
+
+// PostgreSQL's ENFORCED or NOT ENFORCED next (where a key, NOT NULL or a default allows neither).
+fn (p: &P) enforcedNext(): bool {
+    if p.tsql || p.ora { return false }
+    return p.isKw("enforced") || (p.isKw("not") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "enforced")
+}
+
+fn misplacedState(): lexdb_base.DbErr { return lexdb_base.err("42601", "misplaced NOT ENFORCED clause") }
+
 // After CHECK: (expr) [NO INHERIT]. No subquery or parameter; NOT VALID is
 // not lexdb's (rows there are always checked).
 fn (p: mut &P) checkTail(name: &str): Result[Constraint, lexdb_base.DbErr] {
@@ -3290,10 +3350,12 @@ fn (p: mut &P) checkTail(name: &str): Result[Constraint, lexdb_base.DbErr] {
     if len(p.subs) > subs { return Err(lexdb_base.err("0A000", "cannot use subquery in check constraint")) }
     if p.params > params { return Err(lexdb_base.err("42P02", &("there is no parameter $" + p.params.toStr()))) }
     try p.expectKw(")")
-    if p.acceptKw("no") { try p.expectKw("inherit") }
-    if p.isNotValid() {
-        p.pos += 2
-        c.notValid = true
+    while true {
+        if p.acceptKw("no") { try p.expectKw("inherit") }
+        else if p.isNotValid() {
+            p.pos += 2
+            c.notValid = true
+        } else if !(try p.stateWord(mut &c)) { break }
     }
     return Ok(c)
 }
@@ -3332,6 +3394,7 @@ fn (p: mut &P) fkTail(c: mut &Constraint): Result[Unit, lexdb_base.DbErr] {
         } else if p.isNotValid() {
             p.pos += 2
             c.notValid = true
+        } else if try p.stateWord(mut &c) {
         } else {
             break
         }
@@ -3822,7 +3885,14 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
         return Ok(s)
     }
     var addList = false          // Oracle: ADD (col type, ...)
+    var withNo = false           // T-SQL: WITH NOCHECK ADD
     while true {
+        let st = try p.conStateAlter(mut &s)
+        if st == 1 {
+            if !(p.tsql && p.acceptKw(",")) { break }
+            continue
+        }
+        if st == 3 { withNo = true }
         if addList || p.acceptKw("add") {
             if p.ora && !addList && p.isKw("(") && !(p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "constraint" || p.peekAt(1).text == "unique" || p.peekAt(1).text == "check" || p.peekAt(1).text == "foreign" || p.peekAt(1).text == "primary")) {
                 p.pos += 1
@@ -3842,6 +3912,16 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 if p.acceptKw("constraint") { cname = try p.name() }
                 var a = lexdb_sql.alterOf(A_ADD_CON, "")
                 append(mut &a.cons, try p.tableConstraint(&cname))
+                if withNo {
+                    // T-SQL's WITH NOCHECK: a CHECK or foreign key enforced from now on, its rows not checked (not trusted)
+                    withNo = false
+                    for k in 0..len(a.cons) {
+                        if a.cons[k].kind == C_CHECK || a.cons[k].kind == C_FOREIGN {
+                            a.cons[k].notValid = true
+                            a.cons[k].stated = true
+                        }
+                    }
+                }
                 append(mut &s.alters, a)
                 if !p.acceptKw(",") { break }
                 continue
@@ -3864,6 +3944,8 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 if p.acceptKw("constraint") { cn = try p.name() }
                 if p.ora && a.col.genKind == lexdb_sql.GEN_NONE && p.acceptKw("as") {
                     try p.genClause(mut &a.col, true)
+                } else if p.enforcedNext() {
+                    return Err(misplacedState())
                 } else if p.acceptKw("not") {
                     try p.expectKw("null")
                     a.col.notNull = true
@@ -3887,15 +3969,17 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                     append(mut &cons, u)
                 } else if p.acceptKw("check") {
                     var ck = try p.checkTail(&cn)
-                    if ck.notValid { return Err(near(&p.toks[p.pos - 1])) }     // a column's may not be NOT VALID
+                    if ck.notValid && !ck.stated { return Err(near(&p.toks[p.pos - 1])) }     // a column's may not be NOT VALID
                     append(mut &ck.cols, a.col.name.clone())
                     append(mut &cons, ck)
                 } else if p.acceptKw("references") {
                     var fk = lexdb_sql.newConstraint(C_FOREIGN, &cn)
                     append(mut &fk.cols, a.col.name.clone())
                     try p.fkTail(mut &fk)
-                    if fk.notValid { return Err(near(&p.toks[p.pos - 1])) }
+                    if fk.notValid && !fk.stated { return Err(near(&p.toks[p.pos - 1])) }
                     append(mut &cons, fk)
+                } else if p.enforcedNext() {
+                    return Err(misplacedState())
                 } else if len(cn) > 0 {
                     return Err(near(&p.peek()))
                 } else {
@@ -3923,6 +4007,11 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
                 try p.expectKw(")")
                 addList = false
             }
+        } else if p.ora && p.isKw("modify") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "constraint" {
+            // MODIFY CONSTRAINT name state (design/lexdb-new-features.md 10.5)
+            p.pos += 2
+            let cn = try p.name()
+            try p.oraStateAlter(mut &s, &cn)
         } else if p.ora && p.acceptKw("modify") {
             // MODIFY [(] col [type] [NOT NULL | NULL] [DEFAULT e], ... [)]
             let paren = p.acceptKw("(")
@@ -3985,6 +4074,32 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
             try p.expectKw("constraint")
             append(mut &s.alters, lexdb_sql.alterOf(A_VALIDATE, &(try p.name())))
         } else if p.acceptKw("alter") {
+            if !p.tsql && !p.ora && p.isKw("constraint") {
+                // ALTER CONSTRAINT name [NOT] ENFORCED (PostgreSQL 18, design/lexdb-new-features.md 10.5)
+                p.pos += 1
+                var a = lexdb_sql.alterOf(A_CON_STATE, &(try p.name()))
+                var enforced = false
+                var notEnforced = false
+                while true {
+                    if p.isKw("enforced") {
+                        p.pos += 1
+                        enforced = true
+                    } else if p.isKw("not") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "enforced" {
+                        p.pos += 2
+                        notEnforced = true
+                    } else if p.isNotValid() {
+                        return Err(lexdb_base.err("0A000", "constraints cannot be altered to be NOT VALID"))
+                    } else if p.isKw("deferrable") || p.isKw("initially") || (p.isKw("not") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "deferrable") {
+                        return Err(lexdb_base.err("0A000", "lexdb: ALTER CONSTRAINT ... DEFERRABLE is not supported"))
+                    } else { break }
+                }
+                if enforced && notEnforced { return Err(lexdb_base.err("42601", "conflicting constraint properties")) }
+                if !enforced && !notEnforced { return Err(near(&p.peek())) }
+                a.mode = if enforced { lexdb_sql.CS_ON | lexdb_sql.CS_VALIDATE | lexdb_sql.CS_IF_OFF } else { lexdb_sql.CS_OFF | lexdb_sql.CS_NOVALIDATE }
+                append(mut &s.alters, a)
+                if !p.acceptKw(",") { break }
+                continue
+            }
             let c = p.acceptKw("column")
             // Oracle changes a column with MODIFY
             if p.ora { return Err(lexdb_base.err("ORA01735", "invalid ALTER TABLE option")) }
@@ -4136,6 +4251,83 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
         if !p.acceptKw(",") { break }
     }
     return Ok(s)
+}
+
+// ALTER TABLE's constraint states of SQL Server and Oracle (design/lexdb-new-features.md 10.5), at the start of an action:
+// 0 none; 1 the action read (one A_CON_STATE a name); 2 WITH CHECK, ADD follows; 3 WITH NOCHECK, ADD follows.
+// T-SQL: [WITH CHECK | WITH NOCHECK] CHECK CONSTRAINT {name [, name ...] | ALL} and NOCHECK CONSTRAINT {...}.
+// Oracle: ENABLE | DISABLE [VALIDATE | NOVALIDATE] CONSTRAINT name.
+fn (p: mut &P) conStateAlter(s: mut &Stmt): Result[int, lexdb_base.DbErr] {
+    if p.tsql {
+        var w = 0
+        if p.isKw("with") && p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "check" || p.peekAt(1).text == "nocheck") {
+            w = if p.peekAt(1).text == "check" { 1 } else { 2 }
+            p.pos += 2
+        }
+        let cons = p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "constraint"
+        if cons && (p.isKw("nocheck") || p.isKw("check")) {
+            let mode = if p.isKw("nocheck") { lexdb_sql.CS_OFF | lexdb_sql.CS_NOVALIDATE } else { lexdb_sql.CS_ON | (if w == 1 { lexdb_sql.CS_VALIDATE } else { 0 }) }
+            p.pos += 2
+            if p.isKw("all") && !(p.peekAt(1).kind == T_OP && p.peekAt(1).text == ".") {
+                p.pos += 1
+                var a = lexdb_sql.alterOf(A_CON_STATE, lexdb_sql.CON_ALL)
+                a.mode = mode
+                append(mut &s.alters, a)
+                return Ok(1)
+            }
+            while true {
+                var a = lexdb_sql.alterOf(A_CON_STATE, &(try p.name()))
+                a.mode = mode
+                append(mut &s.alters, a)
+                if !p.acceptKw(",") { break }
+            }
+            return Ok(1)
+        }
+        if w > 0 {
+            if p.isKw("add") { return Ok(1 + w) }
+            return Err(near(&p.peek()))
+        }
+        return Ok(0)
+    }
+    if p.ora && (p.isKw("enable") || p.isKw("disable")) {
+        let en = p.isKw("enable")
+        p.pos += 1
+        var val = 0
+        if p.acceptKw("validate") { val = 1 } else if p.acceptKw("novalidate") { val = 2 }
+        if !p.isKw("constraint") { return Err(near(&p.peek())) }
+        p.pos += 1
+        let cn = try p.name()
+        var mode = if en { lexdb_sql.CS_ON } else { lexdb_sql.CS_OFF }
+        if val == 1 || (val == 0 && en) { mode = mode | lexdb_sql.CS_VALIDATE } else { mode = mode | lexdb_sql.CS_NOVALIDATE }
+        var a = lexdb_sql.alterOf(A_CON_STATE, &cn)
+        a.mode = mode
+        append(mut &s.alters, a)
+        if p.acceptKw("cascade") {}
+        return Ok(1)
+    }
+    return Ok(0)
+}
+
+// Oracle's MODIFY CONSTRAINT name state clauses: ENABLE, DISABLE, VALIDATE, NOVALIDATE, RELY, NORELY, in any order: one A_CON_STATE.
+fn (p: mut &P) oraStateAlter(s: mut &Stmt, name: &str): Result[Unit, lexdb_base.DbErr] {
+    var en = 0
+    var val = 0
+    while true {
+        if p.acceptKw("enable") { en = 1 }
+        else if p.acceptKw("disable") { en = 2 }
+        else if p.acceptKw("validate") { val = 1 }
+        else if p.acceptKw("novalidate") { val = 2 }
+        else if p.acceptKw("rely") || p.acceptKw("norely") {}
+        else { break }
+    }
+    var a = lexdb_sql.alterOf(A_CON_STATE, name)
+    if en == 1 { a.mode = lexdb_sql.CS_ON } else if en == 2 { a.mode = lexdb_sql.CS_OFF }
+    if val == 1 { a.mode = a.mode | lexdb_sql.CS_VALIDATE }
+    else if val == 2 { a.mode = a.mode | lexdb_sql.CS_NOVALIDATE }
+    else if en == 1 { a.mode = a.mode | lexdb_sql.CS_VALIDATE }
+    else if en == 2 { a.mode = a.mode | lexdb_sql.CS_NOVALIDATE }
+    append(mut &s.alters, a)
+    return Ok(Unit{})
 }
 
 // Whether an identity column's change follows (ALTER COLUMN c ...):
@@ -6021,8 +6213,9 @@ fn (p: mut &P) aliasOf(alias: mut &str, cols: mut &[]str, spelled: bool): Result
         let fetch = t.kind == T_IDENT && t.text == "fetch" && p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "first" || p.peekAt(1).text == "next")
         if !tw && !fetch && !p.waitAhead() && (t.kind == T_QIDENT || (t.kind == T_IDENT && !lexdb_sql.isReserved(&t.text))) {
             // (Oracle: START WITH and CONNECT BY after a table are a hierarchical query's clauses)
-            if !(p.ora && t.kind == T_IDENT && p.peekAt(1).kind == T_IDENT && ((t.text == "start" && p.peekAt(1).text == "with") ||
-                                                                              (t.text == "connect" && p.peekAt(1).text == "by"))) {
+            if !(p.ora && t.kind == T_IDENT && ((p.peekAt(1).kind == T_IDENT && ((t.text == "start" && p.peekAt(1).text == "with") ||
+                                                                               (t.text == "connect" && p.peekAt(1).text == "by"))) ||
+                                                (t.text == "qualify" && p.qualifyClause()))) {
                 let old = replace(alias, t.text.clone())
                 p.pos += 1
                 got = true
@@ -8992,7 +9185,7 @@ fn (p: mut &P) oraRownum(emptied: mut &bool): int {
             } else if t.kind == T_OP && t.text == ";" && depth == 0 { break }
             else if depth == 0 && t.kind == T_IDENT {
                 match t.text {
-                    "group", "order", "having", "union", "except", "intersect", "fetch", "offset", "for", "window", "limit", "connect", "start", "returning", "with" { done = true }
+                    "group", "order", "having", "union", "except", "intersect", "fetch", "offset", "for", "window", "limit", "connect", "start", "returning", "with", "qualify" { done = true }
                     "or" { hasOr = true }
                     "between" { between = true }
                     "and" {
@@ -9684,30 +9877,35 @@ fn (p: mut &P) selectCore(): Result[Stmt, lexdb_base.DbErr] {
             return p.hierTail(s, rn)
         }
     }
-    if p.acceptKw("group") {
-        try p.expectKw("by")
-        try p.groupBy(mut &s)
-        if len(s.sets) > 0 {
-            // T-SQL's GROUP BY ALL (marked by groupBy): HAVING's aggregates too
-            if p.acceptKw("having") { s.having = Some(try p.expr()) }
-            p.groupAll(mut &s)
+    // (a clause word follows, or the end: the token's kind, read once, tells the common end from the clauses)
+    if p.peek().kind == T_IDENT {
+        if p.acceptKw("group") {
+            try p.expectKw("by")
+            try p.groupBy(mut &s)
+            if len(s.sets) > 0 {
+                // T-SQL's GROUP BY ALL (marked by groupBy): HAVING's aggregates too
+                if p.acceptKw("having") { s.having = Some(try p.expr()) }
+                p.groupAll(mut &s)
+            }
         }
-    }
-    if p.acceptKw("having") {
-        s.mdialect = p.md()
-        s.having = Some(try p.expr())
-    }
-    if p.acceptKw("window") {
-        // WINDOW name AS (spec), ...
-        while true {
-            let n = try p.name()
-            try p.expectKw("as")
-            try p.expectKw("(")
-            let d = try p.winSpec()
-            for w in s.windows { if w.name == n { return Err(lexdb_base.err("42P20", &("window \"" + n + "\" is already defined"))) } }
-            append(mut &s.windows, NamedWin{name: n, def: d})
-            if !p.acceptKw(",") { break }
+        if p.acceptKw("having") {
+            s.mdialect = p.md()
+            s.having = Some(try p.expr())
         }
+        if p.acceptKw("window") {
+            // WINDOW name AS (spec), ...
+            while true {
+                let n = try p.name()
+                try p.expectKw("as")
+                try p.expectKw("(")
+                let d = try p.winSpec()
+                for w in s.windows { if w.name == n { return Err(lexdb_base.err("42P20", &("window \"" + n + "\" is already defined"))) } }
+                append(mut &s.windows, NamedWin{name: n, def: d})
+                if !p.acceptKw(",") { break }
+            }
+        }
+        // Oracle 26ai's QUALIFY (design/lexdb-new-features.md 10.4)
+        if p.ora && p.isKw("qualify") { try p.oraQualify(mut &s) }
     }
     p.rnLimit = rn
     return Ok(s)
@@ -10192,4 +10390,127 @@ fn (p: mut &P) conflictSelect(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     s.conflict = lexdb_sql.CONFLICT_SELECT + lock
     if p.acceptKw("where") { s.where = Some(try p.expr()) }
     return Ok(Unit{})
+}
+
+// At the word QUALIFY after a table: Oracle's clause (not a table alias) when a condition follows; the word alone, or before
+// a word that goes on a FROM list or a query (WHERE, ORDER ...), is an alias (QUALIFY is not a reserved word there).
+fn (p: &P) qualifyClause(): bool {
+    let n = p.peekAt(1)
+    if n.kind == T_EOF { return false }
+    if n.kind == T_OP { return n.text != ")" && n.text != "," && n.text != ";" }
+    if n.kind == T_IDENT {
+        match n.text {
+            "where", "group", "having", "window", "order", "union", "intersect", "except", "minus", "fetch", "offset", "for", "join", "inner", "left", "right",
+            "full", "cross", "natural", "on", "using", "connect", "start", "as", "pivot", "unpivot", "partition", "tablesample", "sample", "match_recognize" { return false }
+            else { return true }
+        }
+    }
+    return true
+}
+
+// Oracle 26ai's QUALIFY cond (design/lexdb-new-features.md O1, 10.4), at QUALIFY after WINDOW: a filter on the rows after the
+// window step, before DISTINCT, ORDER BY and FETCH. The condition may name a select alias (as ORDER BY does: an output's name
+// before a column's, ORA-00960 for a name two outputs have) and hold window calls (numbered in p.wins as the select list's are).
+// The aliases are replaced by their items' expressions here. A query with no window call anywhere has nothing to run after:
+// the condition is a WHERE's (HAVING's, where the query is grouped). With windows it is kept as a window the query does not
+// have, named "#qualify" (no new Stmt field: lexdb_exec.planSelect reads it where it plans the windows).
+// HAVING, WINDOW or QUALIFY after the condition: ORA-03049, at the condition's first word.
+fn (p: mut &P) oraQualify(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    p.pos += 1
+    let first = p.peek().clone()
+    let n0 = len(p.wins)
+    var cond = try p.expr()
+    if p.isKw("having") || p.isKw("window") || p.isKw("qualify") {
+        return Err(lexdb_base.err("ORA03049", &("SQL keyword '" + strings.toUpperAscii(&first.text) + "' is not syntactically valid following 'qualify '")))
+    }
+    s.mdialect = p.md()
+    cond = try p.qualAliases(&cond, &s.items)
+    for i in n0..len(p.wins) {
+        let c = p.wins[i].call.clone()
+        p.wins[i].call = try p.qualAliases(&c, &s.items)
+        for j in 0..len(p.wins[i].part) {
+            let x = p.wins[i].part[j].clone()
+            p.wins[i].part[j] = try p.qualAliases(&x, &s.items)
+        }
+        for j in 0..len(p.wins[i].order) {
+            let x = p.wins[i].order[j].expr.clone()
+            p.wins[i].order[j].expr = try p.qualAliases(&x, &s.items)
+        }
+    }
+    if len(p.wins) > 0 {
+        append(mut &s.windows, NamedWin{name: "#qualify", def: WinDef{call: cond, ref: "", bare: false, part: [], order: [], frame: lexdb_sql.noFrame()}})
+        return Ok(Unit{})
+    }
+    var grouped = len(s.group) > 0 || len(s.gsets) > 0 || s.having.isSome() || aggIn(&cond)
+    for it in s.items { match it.expr { Some(x) { if aggIn(&x) { grouped = true } } None {} } }
+    if grouped {
+        let h = replace(mut &s.having, None)
+        s.having = Some(match h { Some(h2) { Expr.Bin("and", h2, cond) } None { cond } })
+    } else {
+        let w = replace(mut &s.where, None)
+        s.where = Some(match w { Some(w2) { Expr.Bin("and", w2, cond) } None { cond } })
+    }
+    return Ok(Unit{})
+}
+
+// x as a copy of its own, with a copy of each subquery it calls (the subqueries are numbered in the query's list: two calls of
+// one index would be one subquery read twice).
+fn (p: mut &P) dupSubs(x: &Expr): Expr {
+    match x {
+        Expr.Call(n, args, star) {
+            var out: []Expr = []
+            for a in args { append(mut &out, p.dupSubs(&a)) }
+            if (n == "#sub" || n == "#exists" || n == "#in") && len(args) > 0 {
+                let i = lexdb_sql.litInt(&args[0])
+                if i >= 0 && i < len(p.subs) {
+                    append(mut &p.subs, p.subs[i].clone())
+                    out[0] = Expr.Lit(Val.Int(len(p.subs) - 1))
+                }
+            }
+            return Expr.Call(n.clone(), out, star)
+        }
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), p.dupSubs(&a)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), p.dupSubs(&a), p.dupSubs(&b)) }
+        Expr.IsNull(a, neg) { return Expr.IsNull(p.dupSubs(&a), neg) }
+        Expr.Cast(a, t) { return Expr.Cast(p.dupSubs(&a), t) }
+        else { return lexdb_sql.cloneExpr(x) }
+    }
+}
+
+// x with each bare name that is a select item's alias made that item's expression; ORA-00960 for a name that two items have
+// (an alias, or a column item's own name).
+fn (p: mut &P) qualAliases(x: &Expr, items: &[]SelItem): Result[Expr, lexdb_base.DbErr] {
+    match x {
+        Expr.Col(n, _) {
+            if strings.contains(&n, ".") { return Ok(lexdb_sql.cloneExpr(x)) }
+            var at = -1
+            for i in 0..len(items) {
+                var nm = items[i].alias.clone()
+                if len(nm) == 0 {
+                    match items[i].expr {
+                        Some(ex) { match ex { Expr.Col(cn, _) { nm = cn[strings.lastIndexOf(&cn, ".") + 1..len(cn)].toStr() } else {} } }
+                        None {}
+                    }
+                }
+                if len(nm) == 0 || nm != n { continue }
+                if at >= 0 { return Err(oraErr(960, "ambiguous column naming in select list")) }
+                at = i
+            }
+            // (a column item without an alias is no alias: the name is a column of the FROM list's, ambiguous or not)
+            if at >= 0 && len(items[at].alias) > 0 {
+                match items[at].expr { Some(ex) { return Ok(p.dupSubs(&ex)) } None {} }
+            }
+            return Ok(lexdb_sql.cloneExpr(x))
+        }
+        Expr.Unary(op, a) { return Ok(Expr.Unary(op.clone(), try p.qualAliases(&a, items))) }
+        Expr.Bin(op, a, b) { return Ok(Expr.Bin(op.clone(), try p.qualAliases(&a, items), try p.qualAliases(&b, items))) }
+        Expr.IsNull(a, neg) { return Ok(Expr.IsNull(try p.qualAliases(&a, items), neg)) }
+        Expr.Cast(a, t) { return Ok(Expr.Cast(try p.qualAliases(&a, items), t)) }
+        Expr.Call(n, args, star) {
+            var out: []Expr = []
+            for a in args { append(mut &out, try p.qualAliases(&a, items)) }
+            return Ok(Expr.Call(n.clone(), out, star))
+        }
+        else { return Ok(lexdb_sql.cloneExpr(x)) }
+    }
 }

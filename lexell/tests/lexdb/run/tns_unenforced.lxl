@@ -1,0 +1,199 @@
+// lexdb over TNS: Oracle's constraint states (design/lexdb-new-features.md 10.5, O26): CHECK and foreign key constraints DISABLE, ENABLE NOVALIDATE and
+// ENABLE [VALIDATE] in CREATE TABLE (column and table constraints) and ALTER TABLE ADD CONSTRAINT, ALTER TABLE ENABLE | DISABLE [VALIDATE | NOVALIDATE]
+// CONSTRAINT and MODIFY CONSTRAINT (ENABLE VALIDATE and VALIDATE check the rows: ORA-02293, ORA-02298; ENABLE NOVALIDATE checks the rows written from then on:
+// ORA-02290, ORA-02291), ORA-02430 and ORA-02431 for a name not there, USER_CONSTRAINTS' STATUS and VALIDATED, a parent deleted under a foreign key disabled
+// (no ON DELETE CASCADE) and enabled again. Checked against Oracle Database Free 23.26 (gen_oracle.py --check tns_unenforced: the answers below are Oracle's;
+// 23.26.3 has no NOT ENFORCED). Each statement runs with set lexdb_batch = off (the row engine) and on: "same" and the answer, or DIFFERENT and both; every
+// statement gives its answer again the second time (the ALTERs set a state, the writes run in a transaction rolled back).
+// expect: setup: 28 statements
+// expect: same: CONSTRAINT_NAME,CONSTRAINT_TYPE,STATUS,VALIDATED,SEARCH_CONDITION = 'CK1'|'C'|'DISABLED'|'NOT VALIDATED'|'v > 0';'FK1'|'R'|'DISABLED'|'NOT VALIDATED'|NULL
+// expect: same: 1 / N = 3
+// expect: same: error 2293
+// expect: same: error 2293
+// expect: same: error 2293
+// expect: same: CONSTRAINT_NAME,STATUS,VALIDATED = 'CK1'|'DISABLED'|'NOT VALIDATED';'FK1'|'DISABLED'|'NOT VALIDATED'
+// expect: same: 0
+// expect: same: CONSTRAINT_NAME,STATUS,VALIDATED = 'CK1'|'ENABLED'|'NOT VALIDATED';'FK1'|'DISABLED'|'NOT VALIDATED'
+// expect: same: error 2290 / N = 2
+// expect: same: error 2290 / N = 2
+// expect: same: error 2293
+// expect: same: 0
+// expect: same: error 2291 / N = 2
+// expect: same: error 2298
+// expect: same: error 2298
+// expect: same: error 2298
+// expect: same: CONSTRAINT_NAME,STATUS,VALIDATED = 'CK1'|'ENABLED'|'NOT VALIDATED';'FK1'|'ENABLED'|'NOT VALIDATED'
+// expect: same: 0
+// expect: same: 0
+// expect: same: CONSTRAINT_NAME,STATUS,VALIDATED = 'CK1'|'ENABLED'|'NOT VALIDATED';'FK1'|'ENABLED'|'NOT VALIDATED'
+// expect: same: 0
+// expect: same: 0
+// expect: same: CONSTRAINT_NAME,STATUS,VALIDATED = 'CK1'|'DISABLED'|'NOT VALIDATED';'FK1'|'DISABLED'|'NOT VALIDATED'
+// expect: same: 1 / N = 3
+// expect: same: error 2431
+// expect: same: error 2430
+// expect: same: error 2430
+// expect: same: error 2431
+// expect: same: error 2430
+// expect: same: CONSTRAINT_NAME,STATUS,VALIDATED = 'CK2'|'DISABLED'|'NOT VALIDATED';'FK2'|'DISABLED'|'NOT VALIDATED'
+// expect: same: 1 / N = 3
+// expect: same: 0
+// expect: same: 0
+// expect: same: CONSTRAINT_NAME,STATUS,VALIDATED = 'CK2'|'ENABLED'|'VALIDATED';'FK2'|'ENABLED'|'VALIDATED'
+// expect: same: error 2290 / N = 2
+// expect: same: error 2291 / N = 2
+// expect: same: error 2290 / N = 2
+// expect: same: error 2291 / N = 2
+// expect: same: 1 / N = 3
+// expect: same: 0
+// expect: same: 0
+// expect: same: CONSTRAINT_NAME,STATUS,VALIDATED = 'CK2'|'DISABLED'|'NOT VALIDATED';'FK2'|'DISABLED'|'NOT VALIDATED'
+// expect: same: 0
+// expect: same: 0
+// expect: same: CONSTRAINT_NAME,STATUS,VALIDATED = 'CK2'|'ENABLED'|'NOT VALIDATED';'FK2'|'ENABLED'|'NOT VALIDATED'
+// expect: same: 0
+// expect: same: 0
+// expect: same: CONSTRAINT_NAME,STATUS,VALIDATED = 'CK2'|'ENABLED'|'VALIDATED';'FK2'|'ENABLED'|'VALIDATED'
+// expect: same: 1 / N = 2
+// expect: same: 0
+// expect: same: CONSTRAINT_NAME,STATUS,VALIDATED,DELETE_RULE = 'FK3'|'ENABLED'|'VALIDATED'|'CASCADE'
+// expect: same: 1 / N = 1
+// expect: same: 0
+// expect: same: 1 / N = 3
+// expect: same: CONSTRAINT_NAME,STATUS,VALIDATED = 'OC4A'|'DISABLED'|'NOT VALIDATED';'OC4B'|'ENABLED'|'NOT VALIDATED';'OC4C'|'ENABLED'|'VALIDATED';'OC4D'|'DISABLED'|'NOT VALIDATED';'OC4E'|'ENABLED'|'NOT VALIDATED'
+// expect: same: CONSTRAINT_NAME,STATUS,VALIDATED,SEARCH_CONDITION = 'CK5'|'DISABLED'|'NOT VALIDATED'|'v > 0';'CK6'|'ENABLED'|'NOT VALIDATED'|'v > 0';'FK5'|'DISABLED'|'NOT VALIDATED'|NULL;'FK6'|'ENABLED'|'NOT VALIDATED'|NULL
+// expect: same: error 2290 / N = 1
+// expect: same: CONSTRAINT_NAME,STATUS,VALIDATED = 'CK7'|'DISABLED'|'NOT VALIDATED'
+// expect: same: 1 / N = 2
+// expect: same: 0
+// expect: same: error 2290 / N = 1
+// expect: same: CONSTRAINT_NAME,STATUS,VALIDATED = 'CK7'|'ENABLED'|'VALIDATED'
+// expect: same: CONSTRAINT_NAME,STATUS,VALIDATED = 'CK8'|'DISABLED'|'NOT VALIDATED'
+// expect: same: error 2293
+// expect: same: CONSTRAINT_NAME,STATUS,VALIDATED = 'CK8'|'DISABLED'|'NOT VALIDATED'
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+const SETUP = "create table op1 (id number primary key, v number)\ninsert into op1 values (1, 10)\ninsert into op1 values (2, 20)\ncreate table oc1 (id number primary key, pid number, v number, constraint ck1 check (v > 0) disable, constraint fk1 foreign key (pid) references op1 (id) disable)\ninsert into oc1 values (1, 1, -5)\ninsert into oc1 values (2, 99, 5)\ncreate table oc2 (id number primary key, pid number, v number, constraint ck2 check (v > 0) disable, constraint fk2 foreign key (pid) references op1 (id) disable)\ninsert into oc2 values (1, 1, 5)\ninsert into oc2 values (2, 2, 6)\ncreate table op3 (id number primary key)\ninsert into op3 values (1)\ninsert into op3 values (2)\ncreate table oc3 (id number primary key, pid number, constraint fk3 foreign key (pid) references op3 (id) on delete cascade disable)\ninsert into oc3 values (10, 1)\ninsert into oc3 values (20, 2)\ncreate table oc4 (id number primary key, a number constraint oc4a check (a > 0) disable, b number constraint oc4b check (b > 0) enable novalidate, c number constraint oc4c check (c > 0) enable validate, d number constraint oc4d references op1 (id) disable, e number constraint oc4e references op1 (id) enable novalidate)\ninsert into oc4 values (1, -1, 1, 1, 1, 1)\ncreate table oc5 (id number primary key, v number, w number)\ninsert into oc5 values (1, -1, 99)\nalter table oc5 add constraint ck5 check (v > 0) disable\nalter table oc5 add constraint ck6 check (v > 0) enable novalidate\nalter table oc5 add constraint fk5 foreign key (w) references op1 (id) disable\nalter table oc5 add constraint fk6 foreign key (id) references op1 (id) enable novalidate\ncreate table oc6 (id number primary key, v number, constraint ck7 check (v > 0))\ninsert into oc6 values (1, 5)\nalter table oc6 modify constraint ck7 disable\ncreate table oc7 (id number primary key, v number, constraint ck8 check (v > 0) disable)\ninsert into oc7 values (1, -5)"
+
+const QS = "select constraint_name, constraint_type, status, validated, search_condition from user_constraints where table_name = 'OC1' and constraint_type in ('C', 'R') order by constraint_name\ninsert into oc1 values (3, 77, -1) ;; select count(*) n from oc1\nalter table oc1 enable constraint ck1\nalter table oc1 enable validate constraint ck1\nalter table oc1 modify constraint ck1 enable\nselect constraint_name, status, validated from user_constraints where table_name = 'OC1' and constraint_type in ('C', 'R') order by constraint_name\nalter table oc1 enable novalidate constraint ck1\nselect constraint_name, status, validated from user_constraints where table_name = 'OC1' and constraint_type in ('C', 'R') order by constraint_name\ninsert into oc1 values (4, 1, -1) ;; select count(*) n from oc1\nupdate oc1 set v = -2 where id = 2 ;; select count(*) n from oc1\nalter table oc1 modify constraint ck1 validate\nalter table oc1 enable novalidate constraint fk1\ninsert into oc1 values (5, 77, 1) ;; select count(*) n from oc1\nalter table oc1 enable validate constraint fk1\nalter table oc1 modify constraint fk1 validate\nalter table oc1 enable constraint fk1\nselect constraint_name, status, validated from user_constraints where table_name = 'OC1' and constraint_type in ('C', 'R') order by constraint_name\nalter table oc1 modify constraint fk1 novalidate\nalter table oc1 modify constraint ck1 novalidate\nselect constraint_name, status, validated from user_constraints where table_name = 'OC1' and constraint_type in ('C', 'R') order by constraint_name\nalter table oc1 disable constraint ck1\nalter table oc1 disable novalidate constraint fk1\nselect constraint_name, status, validated from user_constraints where table_name = 'OC1' and constraint_type in ('C', 'R') order by constraint_name\ninsert into oc1 values (6, 88, -6) ;; select count(*) n from oc1\nalter table oc1 disable constraint nosuch\nalter table oc1 enable constraint nosuch\nalter table oc1 modify constraint nosuch enable\nalter table oc1 modify constraint nosuch disable\nalter table oc1 enable validate constraint nosuch\nselect constraint_name, status, validated from user_constraints where table_name = 'OC2' and constraint_type in ('C', 'R') order by constraint_name\ninsert into oc2 values (3, 9, -1) ;; select count(*) n from oc2\nalter table oc2 enable constraint ck2\nalter table oc2 enable constraint fk2\nselect constraint_name, status, validated from user_constraints where table_name = 'OC2' and constraint_type in ('C', 'R') order by constraint_name\ninsert into oc2 values (3, 1, -1) ;; select count(*) n from oc2\ninsert into oc2 values (3, 9, 1) ;; select count(*) n from oc2\nupdate oc2 set v = -1 where id = 1 ;; select count(*) n from oc2\nupdate oc2 set pid = 9 where id = 1 ;; select count(*) n from oc2\ninsert into oc2 values (3, 2, 1) ;; select count(*) n from oc2\nalter table oc2 disable novalidate constraint ck2\nalter table oc2 disable constraint fk2\nselect constraint_name, status, validated from user_constraints where table_name = 'OC2' and constraint_type in ('C', 'R') order by constraint_name\nalter table oc2 modify constraint ck2 enable novalidate\nalter table oc2 modify constraint fk2 enable novalidate\nselect constraint_name, status, validated from user_constraints where table_name = 'OC2' and constraint_type in ('C', 'R') order by constraint_name\nalter table oc2 modify constraint ck2 validate\nalter table oc2 modify constraint fk2 validate\nselect constraint_name, status, validated from user_constraints where table_name = 'OC2' and constraint_type in ('C', 'R') order by constraint_name\ndelete from op3 where id = 1 ;; select count(*) n from oc3\nalter table oc3 enable constraint fk3\nselect constraint_name, status, validated, delete_rule from user_constraints where table_name = 'OC3' and constraint_type = 'R'\ndelete from op3 where id = 1 ;; select count(*) n from oc3\nalter table oc3 disable constraint fk3\ninsert into oc3 values (40, 99) ;; select count(*) n from oc3\nselect constraint_name, status, validated from user_constraints where table_name = 'OC4' and constraint_type in ('C', 'R') order by constraint_name\nselect constraint_name, status, validated, search_condition from user_constraints where table_name = 'OC5' and constraint_type in ('C', 'R') order by constraint_name\ninsert into oc5 values (2, -1, 99) ;; select count(*) n from oc5\nselect constraint_name, status, validated from user_constraints where table_name = 'OC6' and constraint_type = 'C'\ninsert into oc6 values (2, -1) ;; select count(*) n from oc6\nalter table oc6 enable constraint ck7\ninsert into oc6 values (2, -1) ;; select count(*) n from oc6\nselect constraint_name, status, validated from user_constraints where table_name = 'OC6' and constraint_type = 'C'\nselect constraint_name, status, validated from user_constraints where table_name = 'OC7' and constraint_type = 'C'\nalter table oc7 enable constraint ck8\nselect constraint_name, status, validated from user_constraints where table_name = 'OC7' and constraint_type = 'C'"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows; or error and the number.
+fn qtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// A statement: its row count, or error and the number.
+fn xtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.run(&(sql.toStr()), &[]) {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn one(c: mut &oracle.Conn, sql: &str): str {
+    let low = strings.toLowerAscii(sql)
+    if strings.startsWith(&low, "select") || strings.startsWith(&low, "with") { return qtext(c, sql) }
+    return xtext(c, sql)
+}
+
+// A query, or statements ("a ;; b ;; c") in a transaction rolled back: each answer, joined by " / " (after an error, the
+// last part, the check, after the rollback).
+fn answer(c: mut &oracle.Conn, sqls: &str): str {
+    if !strings.contains(sqls, " ;; ") { return one(c, sqls) }
+    let parts = strings.split(sqls, " ;; ")
+    var out: []str = []
+    var failed = false
+    let r = c.transaction(fn(c2: mut &oracle.Conn): Result[int, oracle.Error] {
+        for i in 0..len(parts) {
+            if failed { break }
+            let a = one(c2, &parts[i])
+            if strings.startsWith(&a, "error") { failed = true }
+            append(mut &out, a)
+        }
+        return Err(sqldialect.inputError("rolled back"))
+    })
+    if failed { append(mut &out, one(c, &parts[len(parts) - 1])) }
+    return strings.join(&out, " / ")
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            let text: str = QS
+            for q in strings.lines(&text) {
+                let a = c.run(&("set lexdb_batch = off".toStr()), &[])
+                let off = answer(mut &c, &q)
+                let b = c.run(&("set lexdb_batch = on".toStr()), &[])
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(62), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}
