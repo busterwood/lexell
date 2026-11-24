@@ -1002,6 +1002,7 @@ fn (c: mut &Conn) executeAs(sql: &str, decls: &str, call: &tds.RpcCall, first: i
     var f = lexdb_tsql.newFrame()
     var outs: []int = []                        // the frame's indexes of the output parameters
     var outNames: []str = []
+    var outAt: []int = []                       // per output parameter: the call's parameter it came in as, -1 none
     var bad: Option[DbErr] = None
     var runSql = sql.toStr()                    // with the table-valued parameters named for their tables
     // a table-valued parameter's type first, as SQL Server (351)
@@ -1050,6 +1051,7 @@ fn (c: mut &Conn) executeAs(sql: &str, decls: &str, call: &tds.RpcCall, first: i
             if d.output {
                 append(mut &outs, k)
                 append(mut &outNames, if j < len(outAs) { outAs[j].clone() } else { d.name.clone() })
+                append(mut &outAt, -1)
             }
             if bad.isSome() { continue }
             if len(d.tableType) > 0 {
@@ -1091,6 +1093,14 @@ fn (c: mut &Conn) executeAs(sql: &str, decls: &str, call: &tds.RpcCall, first: i
                 break
             }
             given[k] = true
+            if list[k].output {
+                // its RETURNVALUE goes back under the call's ordinal and the name as the client sent it (SQL Server: none for a
+                // parameter sent without one, as JDBC's)
+                var o = 0
+                for j in 0..k { if list[j].output { o += 1 } }
+                outAt[o] = i
+                if k >= len(outAs) { outNames[o] = p.name.clone() }
+            }
             if isTable[k] {
                 match p.table {
                     Some(tv) {
@@ -1218,7 +1228,7 @@ fn (c: mut &Conn) executeAs(sql: &str, decls: &str, call: &tds.RpcCall, first: i
         ordinal = 1
     }
     for i in 0..len(outs) {
-        c.o.returnValue(ordinal + i, &outNames[i], &f.types[outs[i]], &f.vals[outs[i]])
+        c.o.returnValue(if outAt[i] >= 0 { outAt[i] } else { ordinal + i }, &outNames[i], &f.types[outs[i]], &f.vals[outs[i]])
     }
     c.o.doneTok(tds.TK_DONEPROC, (if more { tds.DONE_MORE } else { 0 }) | (if status != 0 { tds.DONE_ERROR } else { 0 }), CMD_EXECUTE, 0)
 }

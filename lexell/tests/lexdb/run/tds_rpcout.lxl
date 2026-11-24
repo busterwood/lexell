@@ -1,0 +1,202 @@
+// lexdb over TDS: an RPC's output parameters (RETURNVALUE: the parameter's ordinal in the call, after sp_executesql's @stmt and @params,
+// and its name as the client sent it: none for mssql-jdbc's, which sends them without names) and EXEC [@r =] of a scalar function (SQL
+// Server runs it: mssql-jdbc's {? = call dbo.f(?)}), by place and by name, a default left out, and SQL Server's errors 8144 and 201.
+// With LEXDB_MSSQL it runs against a SQL Server, which is how its expect lines were made (SQL Server 2022).
+// expect: setup: ok
+// expect: setup: ok
+// expect: setup: ok
+// expect: jdbc proc: 2||7; 4||42; status 0 / (1) / (1)
+// expect: jdbc out only: 3||6; status 0 / (1) / (1)
+// expect: jdbc function: 2||42; status 0 / (1)
+// expect: named: 3|@o|12; status 0 / (1)
+// expect: named out first: 2|@o|15; status 0 / (1)
+// expect: exec function: 9
+// expect: exec function bare name: 9
+// expect: exec function by name: 12
+// expect: exec function default: 18
+// expect: exec function DEFAULT: 18
+// expect: exec function no target: 1
+// expect: exec function too many: error 8144: Procedure or function ro_f has too many arguments specified.
+// expect: exec function missing: error 201: Procedure or function 'ro_f' expects parameter '@x', which was not supplied.
+// expect: exec function as text: 9
+// expect: cleanup: ok
+import "os"
+import "strings"
+import "task"
+import "net"
+import "tds"
+import "sqldialect"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+type V = sqldialect.Value
+
+fn u8(b: mut &[]byte, v: int) { append(b, byte(v & 0xff)) }
+fn le(b: mut &[]byte, v: int, n: int) { for k in 0..n { u8(b, if k < 8 { v >> (8 * k) } else if v < 0 { 0xff } else { 0 }) } }
+fn utf16(s: &str): []byte { return tds.toUtf16(&(s.toStr())).unwrap() }
+fn bvarchar(b: mut &[]byte, s: &str) {
+    let u = utf16(s)
+    u8(b, len(u) / 2)
+    for x in u { append(b, x) }
+}
+
+fn cellText(c: &tds.Column, v: &tds.Cell): str {
+    match v {
+        tds.Cell.Null { return "NULL" }
+        tds.Cell.Bytes(b) {
+            var s = "0x"
+            for i in 0..len(b) { s = s + strings.padLeft(&(strings.toUpperAscii(&strings.hex(int(b[i])))), 2, '0') }
+            return s
+        }
+        else { return tds.cellText(c, v).unwrapOr("?") }
+    }
+}
+
+// A reply: its first error (number and text, or the number only), else its result sets' rows ("a|b;c|d") and the
+// counts of statements without rows ("(n)"), joined by " / ".
+fn said(r: Result[tds.Reply, sqldialect.DbError], textToo: bool): str {
+    match r {
+        Ok(rep) {
+            if len(rep.errors) > 0 {
+                let e = &rep.errors[0]
+                return "error " + e.number.toStr() + (if textToo { ": " + e.text } else { "" })
+            }
+            var parts: []str = []
+            for rs in rep.results {
+                var rows: []str = []
+                for row in rs.rows {
+                    var cells: []str = []
+                    for i in 0..len(row) { append(mut &cells, cellText(&rs.columns[i], &row[i])) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                append(mut &parts, strings.join(&rows, ";"))
+            }
+            if len(rep.results) == 0 {
+                for c in rep.counts { if c.resultSet < 0 { append(mut &parts, "(" + c.rows.toStr() + ")") } }
+            }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "failed " + e.code.toStr() + " " + e.msg }
+    }
+}
+
+fn batch(s: mut &tds.Session, sql: &str): str { return said(s.batch(sql), true) }
+
+// rows in a TVP named name of the type typeName (lib/tds's tableParam)
+fn named(p: tds.Param, n: &str): tds.Param {
+    var x = p
+    x.name = n.toStr()
+    return x
+}
+
+// an int (INTN 4: sp_prepexec's and sp_execute's handle)
+fn int4(n: int): tds.Param {
+    var d: []byte = []
+    u8(mut &d, 4)
+    le(mut &d, n, 4)
+    return tds.Param{name: "", output: false, byDefault: false, declared: "int", typeInfo: "\x26\x04", data: strFromBytes(&d)}
+}
+
+// An RPC of the procedure with id proc (PROC_PREPEXEC, ...), as drivers send them: ProcIDSwitch, not a name.
+fn text(t: &str): tds.Param { return tds.textParam(&(t.toStr()), &tds.noCollation()).unwrap() }
+
+fn out(p: tds.Param): tds.Param {
+    var x = p
+    x.output = true
+    return x
+}
+
+// a reply's RETURNVALUE tokens: ordinal, name (as sent back) and value, then what said gives
+fn rvs(r: Result[tds.Reply, sqldialect.DbError]): str {
+    var parts: []str = []
+    match r {
+        Ok(rep) {
+            for rv in rep.returnValues { append(mut &parts, rv.ordinal.toStr() + "|" + rv.name + "|" + cellText(&rv.column, &rv.value)) }
+            match rep.returnStatus {
+                Some(n) { append(mut &parts, "status " + n.toStr()) }
+                None {}
+            }
+        }
+        Err(_) {}
+    }
+    return strings.join(&parts, "; ") + " / " + said(r, true)
+}
+
+fn tests(s: mut &tds.Session) {
+    println("setup: " + batch(s, &"DROP FUNCTION IF EXISTS dbo.ro_f; DROP PROCEDURE IF EXISTS dbo.ro_p"))
+    println("setup: " + batch(s, &"CREATE FUNCTION dbo.ro_f(@x int, @y int = 10) RETURNS int AS BEGIN RETURN @x * 2 + @y; END"))
+    println("setup: " + batch(s, &"CREATE PROCEDURE dbo.ro_p @a int, @b int OUTPUT AS BEGIN SET @b = @a + 1; RETURN 7; END"))
+    // mssql-jdbc's CallableStatement: sp_executesql, the parameters sent without names
+    println("jdbc proc: " + rvs(s.callProc("sp_executesql", &[text(&"EXEC @P0 = dbo.ro_p @P1, @P2 OUTPUT"), text(&"@P0 int OUTPUT, @P1 int, @P2 int OUTPUT"),
+                                                              out(int4(0)), int4(41), out(int4(0))])))
+    println("jdbc out only: " + rvs(s.callProc("sp_executesql", &[text(&"EXEC dbo.ro_p @P0, @P1 OUTPUT"), text(&"@P0 int, @P1 int OUTPUT"),
+                                                                  int4(5), out(int4(0))])))
+    println("jdbc function: " + rvs(s.callProc("sp_executesql", &[text(&"EXEC @P0 = dbo.ro_f @P1, @P2"), text(&"@P0 int OUTPUT, @P1 int, @P2 int"),
+                                                                  out(int4(0)), int4(21), int4(0)])))
+    // named, as ADO.NET sends them: the names come back
+    println("named: " + rvs(s.callProc("sp_executesql", &[text(&"SET @o = @a * 3"), text(&"@a int, @o int OUTPUT"),
+                                                          named(int4(4), &"@a"), named(out(int4(0)), &"@o")])))
+    println("named out first: " + rvs(s.callProc("sp_executesql", &[text(&"SET @o = @a * 3"), text(&"@a int, @o int OUTPUT"),
+                                                                    named(out(int4(0)), &"@o"), named(int4(5), &"@a")])))
+    // EXEC of a scalar function in a batch: by place, by name, a default left out, too many arguments, a missing one
+    println("exec function: " + batch(s, &"DECLARE @r int; EXEC @r = dbo.ro_f 4, 1; SELECT @r"))
+    println("exec function bare name: " + batch(s, &"DECLARE @r int; EXEC @r = ro_f 4, 1; SELECT @r"))
+    println("exec function by name: " + batch(s, &"DECLARE @r int; EXEC @r = dbo.ro_f @y = 2, @x = 5; SELECT @r"))
+    println("exec function default: " + batch(s, &"DECLARE @r int; EXEC @r = dbo.ro_f 4; SELECT @r"))
+    println("exec function DEFAULT: " + batch(s, &"DECLARE @r int; EXEC @r = dbo.ro_f 4, DEFAULT; SELECT @r"))
+    println("exec function no target: " + batch(s, &"EXEC dbo.ro_f 4; SELECT 1"))
+    println("exec function too many: " + batch(s, &"DECLARE @r int; EXEC @r = dbo.ro_f 1, 2, 3"))
+    println("exec function missing: " + batch(s, &"DECLARE @r int; EXEC @r = dbo.ro_f @y = 1"))
+    println("exec function as text: " + batch(s, &"DECLARE @r varchar(10); EXEC @r = dbo.ro_f 4, 1; SELECT @r"))
+    println("cleanup: " + batch(s, &"DROP FUNCTION dbo.ro_f; DROP PROCEDURE dbo.ro_p"))
+}
+
+fn connect(dsn: &str): Option[tds.Session] {
+    let st = sqlserver.parseConnString(&(dsn.toStr())).unwrap()
+    match tds.open(&st.config) {
+        Ok(s) { return Some(s) }
+        Err(e) {
+            println("connect: " + e.msg)
+            return None
+        }
+    }
+}
+
+fn runAll(dsn: &str) {
+    match connect(dsn) {
+        Some(s0) {
+            var s = s0
+            tests(mut &s)
+        }
+        None {}
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(sc: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        runAll(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    // LEXDB_MSSQL: the oracle, for the expect lines
+    match os.env("LEXDB_MSSQL") {
+        Some(dsn) { runAll(&dsn) }
+        None {
+            lexdb_store.run(lexdb_disk.sim(41), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                                     snapNodes: 50000}, body).unwrap()
+        }
+    }
+}

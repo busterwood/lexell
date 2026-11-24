@@ -1198,3 +1198,15 @@ carries the offset both ways (`lexdb_tds`: UTC time and date, then the offset in
 `MssqlJdbc.dto` (OffsetDateTime, `microsoft.sql.DateTimeOffset`; the old KNOWN line is a check now). Left: a string's fractional digits are seven whatever the type's scale (styles 126 and 127 print none,
 three or seven by the value); `FORMAT` of `zzz`; text forms SQL Server reads and lexdb does not (`March 15, 2026 10:00:00 AM +02:00`, `20260315 10:00:00 +02:00`); a VALUES list or derived column typed by
 OID alone is an instant; `MIN` and `MAX` show the last of equal instants' offsets (SQL Server the first); `datetimeoffset - datetimeoffset` and `+ n` are an interval and a text (SQL Server 8117, 206).
+
+### As built: output parameters' RETURNVALUE and EXEC of a scalar function (2026-11-24)
+- A RETURNVALUE's ordinal is the parameter's place in the RPC call (sp_executesql's first parameter after `@stmt` and `@params` is 2,
+  sp_prepexec's after its handle, `@stmt` and `@params` 3), and its name the one the client sent (none for mssql-jdbc, which sends its
+  parameters without names). lexdb counted among the output parameters alone and sent the declared name; mssql-jdbc refused the
+  stream ("The TDS protocol stream is not valid") for every `CallableStatement` with `registerOutParameter`. An output parameter
+  declared but not sent keeps the old count.
+- `EXEC [@r =] f args` of a scalar function of the user's runs it (lexdb_tsql `callScalarFn`): the arguments by place or name, a
+  parameter with a default left out or given as DEFAULT, 8144, 8143, 8145 and 201 as for a procedure, the call made as
+  `SET @r = dbo.f(...)` in a nested batch. That is what mssql-jdbc sends for `{? = call dbo.f(?)}`.
+- `tds_rpcout` (expect lines from SQL Server 2022) has both; `MssqlJdbc` now runs to its end on lexdb: 211 passed, 0 failed (5
+  KNOWN or SKIP lines, as before).

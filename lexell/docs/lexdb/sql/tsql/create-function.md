@@ -67,6 +67,8 @@ END
 
 - `CREATE FUNCTION` must be the first statement of its batch.
 - A scalar function may be used wherever an expression may, and may call itself.
+- `EXEC @r = dbo.f 4, 1` runs a scalar function and puts its value in `@r`, as SQL Server does (arguments by place or
+  by name; a parameter with a default may be left out). This is what Microsoft's JDBC driver sends for `{? = call dbo.f(?)}`.
 - `sys.objects` shows scalar functions as `SQL_SCALAR_FUNCTION`, inline ones as `SQL_INLINE_TABLE_VALUED_FUNCTION`
   and multi-statement ones as `SQL_TABLE_VALUED_FUNCTION`; `OBJECT_DEFINITION` gives the text.
 - A function name without its schema is looked up as a built-in function (error 195 when there is none).
@@ -77,7 +79,6 @@ END
   multi-statement table-valued function squares is not supported yet (an inline one is)").
 - A function of the user's cannot be used in a column's `DEFAULT`, a `CHECK` constraint, a computed column, an index
   or a view: error 50000 (lexdb-dialect-gaps.md 7a).
-- `EXEC` of a scalar function (`EXEC @r = dbo.f`) is error 2812.
 
 ## Examples
 

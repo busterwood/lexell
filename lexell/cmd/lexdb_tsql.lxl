@@ -1729,6 +1729,17 @@ fn (st: mut &State) call(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
                     }
                     return st.callProc(sess, t, &rt, &vals, f, ev)
                 }
+                if rt.kind == lexdb_sql.RK_FUNC && !rt.retSet {
+                    // EXEC @r = f args: a scalar function's value to @r (a driver's {? = call f(?)})
+                    match sess.needExecute(&rt) {
+                        Ok(_) {}
+                        Err(e) {
+                            st.failErr(ev, &e, 0)
+                            return F_NEXT
+                        }
+                    }
+                    return st.callScalarFn(sess, t, &rt, &vals, f, ev)
+                }
             }
         }
         Err(e) {
@@ -1783,6 +1794,77 @@ fn bindArg(v: Val, p: &lexdb_sql.RParam): Result[Val, DbErr] {
         Ok(c) { return Ok(c) }
         Err(_) { return Err(tsErr(8114, &("Error converting data type " + src + " to " + paramTypeName(p) + "."))) }
     }
+}
+
+// EXEC [@r =] f args of a scalar function of the user's (SQL Server runs it, as mssql-jdbc's {? = call f(?)} does): the arguments
+// bound by place or name to its parameters (a DEFAULT one left out), the function called as an expression, its value to @r.
+fn (st: mut &State) callScalarFn(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStmt, rt: &lexdb_sql.Routine, vals: &[]Val, f: mut &Frame,
+                                 ev: mut &[]Event): int {
+    let np = len(rt.params)
+    let shown = procShown(rt)
+    var slot: []int = []
+    for i in 0..np { append(mut &slot, -1) }
+    for j in 0..len(vals) {
+        let pn = if 1 + j < len(t.names) { t.names[1 + j].clone() } else { "" }
+        var k = j
+        if len(pn) > 0 {
+            k = -1
+            for i in 0..np { if rt.params[i].name == pn { k = i } }
+            if k < 0 {
+                st.fail(ev, Caught{number: 8145, message: pn + " is not a parameter for procedure " + shown + ".", severity: 16, state: 2}, 0)
+                return F_NEXT
+            }
+        } else if j >= np {
+            st.fail(ev, Caught{number: 8144, message: "Procedure or function " + shown + " has too many arguments specified.", severity: 16, state: 2}, 0)
+            return F_NEXT
+        }
+        if slot[k] >= 0 {
+            st.fail(ev, Caught{number: 8143, message: "Parameter '" + rt.params[k].name + "' was supplied multiple times.", severity: 16, state: 1}, 0)
+            return F_NEXT
+        }
+        slot[k] = j
+    }
+    var fr = newFrame()
+    var args: []str = []
+    for i in 0..np {
+        let p = &rt.params[i]
+        var dflt = slot[i] < 0
+        if slot[i] >= 0 { for fl in t.flags { if fl == slot[i] { dflt = true } } }
+        if dflt {
+            if !p.has {
+                st.fail(ev, Caught{number: 201, message: "Procedure or function '" + shown + "' expects parameter '" + p.name + "', which was not supplied.", severity: 16, state: 4}, 0)
+                return F_NEXT
+            }
+            append(mut &args, "DEFAULT")
+            continue
+        }
+        match bindArg(vals[slot[i]].clone(), p) {
+            Ok(v) {
+                let n = "@__fa" + i.toStr()
+                let k = fr.add(&n, p.typ, v)
+                append(mut &args, n)
+            }
+            Err(e) {
+                st.failErr(ev, &e, 0)
+                return F_NEXT
+            }
+        }
+    }
+    let kr = fr.add(&"@__fr", rt.ret, Val.Null)
+    // (an expression's call of a scalar function names its schema: EXEC's resolves the bare name in dbo)
+    let fname = if strings.contains(&t.names[0], &".") { t.names[0].clone() } else { "dbo." + t.names[0] }
+    let r = st.nested(sess, &("SET @__fr = " + fname + "(" + strings.join(&args, ", ") + ")"), mut &fr, ev)
+    if r != F_NEXT { return r }
+    if len(t.ret) > 0 {
+        let ko = f.find(&t.ret)
+        if ko >= 0 {
+            match lexdb_ops.coerce(fr.vals[kr].clone(), &f.types[ko]) {
+                Ok(cv) { f.vals[ko] = cv }
+                Err(e) { st.failErr(ev, &e, 0) }
+            }
+        }
+    }
+    return F_NEXT
 }
 
 // The value of a parameter's default.

@@ -239,16 +239,6 @@ differences of its statement.
 ## SQL Server door
 
 - **`UPDATE STATISTICS`** is a syntax error (102), on the master and on a replica.
-- **A procedure call with an output parameter through Microsoft's JDBC driver** (found on main 55040a20 and on main
-  before 178ea2df; not fixed): the `procedures()` part of the driver test `tests/lexdb/java/MssqlJdbc.java` stops at
-  its first `CallableStatement`, `{? = call jt_proc(?, ?, ?)}`, with `The TDS protocol stream is not valid`. The
-  failing shape is any call with a parameter registered with `registerOutParameter`: an `OUTPUT` parameter
-  (`{call p(?, ?)}` with the second one out, of `int` or `varchar`) or the return status (`{? = call p(?)}`). The
-  driver sends these as `sp_executesql` with `EXEC @P0 = p @P1` and `@P0 int OUTPUT, @P1 int`; lexdb's RETURNVALUE
-  token carries ordinal 0 and the name `@p0`, where SQL Server gives the parameter's place in the RPC request (2, after
-  `@stmt` and `@params`) and no name, and the driver refuses the stream. A call with input parameters only
-  (`{call p(?)}` with `setInt`) and `EXEC p @b = @b OUTPUT` in a batch work. A scalar function called as
-  `{? = call dbo.f(?)}` is error 2812 (`Could not find stored procedure 'f'`; SQL Server runs it).
 - **Missing functions:** `UNICODE`, `STDEV`, `STDEVP`, `VAR`, `VARP` and `ATN2` give error 195 ("function ... does
   not exist"). An error 195 ends the batch, as SQL Server's compile errors do.
 - **`INSERT TOP (n)`** is error 102, and a table hint on an `INSERT`'s target (`INSERT INTO t WITH (TABLOCK)`) is
@@ -353,7 +343,6 @@ differences of its statement.
   - A table type a procedure uses can be dropped (SQL Server: 3732); an index in a table type is 102.
   - `CREATE PROCEDURE` takes a parameter of a type that does not exist; `WITH EXECUTE AS OWNER` is 102; `WITH
     ENCRYPTION` is accepted.
-  - `EXEC @r = dbo.scalar_function` is 2812 (SQL Server allows it).
   - `CREATE SCHEMA hr CREATE TABLE staff ...` makes `dbo.staff`, not `hr.staff`; `AUTHORIZATION dbo` is 50000;
     `CREATE SCHEMA dbo` is accepted (SQL Server: 2714); an existing schema is 50000 (2714); `CREATE SCHEMA` need not
     be first in its batch (111).
