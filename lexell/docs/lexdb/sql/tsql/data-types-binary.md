@@ -49,6 +49,9 @@ timestamp
 - `CAST` and `CONVERT` from a binary value to `varchar`: the bytes as characters (`0x4142` gives `AB`), or with style 1
   or 2 the hexadecimal text (`0x4142`, `4142`). To `int`, `bigint` and `smallint`: the last bytes, big-endian.
   Examples E and G.
+- `CAST` and `CONVERT` of a `uniqueidentifier` to `binary(n)` or `varbinary(n)` give the 16 bytes as SQL Server stores
+  them: the first three groups of the GUID are little-endian, so `6F9619FF-8B86-D011-...` is `0xFF19966F868B11D0...`.
+  A binary value to `uniqueidentifier` is padded with zeros or cut to 16 bytes. Example I.
 
 ## Differences from SQL Server
 
@@ -56,7 +59,6 @@ timestamp
   values as they are. `CAST(0x41 AS bit)` is error 50000.
 - A `varbinary` variable cannot be used in an expression: `DECLARE @v varbinary(4) = 0x4142; SELECT @v + 0x43` is error
   195 (`@v` alone, and `DATALENGTH(@v)`, work).
-- A `uniqueidentifier` cannot be cast to `varbinary(16)`: `CAST(NEWID() AS varbinary(16))` is error 529.
 - **`rowversion` and `timestamp` columns stay NULL.** SQL Server fills them with a database-wide counter on every
   insert and update; lexdb does not, so they cannot detect changes. Use an explicit version column.
 - `HASHBYTES` and `CHECKSUM` do not exist (error 195).
@@ -251,8 +253,6 @@ SELECT @v AS alone, DATALENGTH(@v) AS bytes;
 SELECT @v + 0x43 AS in_an_expression;
 GO
 SELECT HASHBYTES('SHA2_256', 'abc') AS hash;
-GO
-SELECT CAST(NEWID() AS varbinary(16)) AS guid_bytes;
 ```
 
 ```text
@@ -274,8 +274,43 @@ Msg 195, Level 15, State 1, Line 3
 operator does not exist: \x4142 + \x43
 Msg 195, Level 15, State 1, Line 1
 'hashbytes' is not a recognized built-in function name.
-Msg 529, Level 16, State 1, Line 1
-Explicit conversion from data type to varbinary is not allowed.
+```
+
+### I. uniqueidentifier and bytes
+
+The bytes are in SQL Server's mixed-endian order. A string for `varchar(n)` needs 36 characters.
+
+<!-- example: tsql -->
+```sql
+SELECT CAST(CAST('6F9619FF-8B86-D011-B42D-00C04FC964FF' AS uniqueidentifier) AS varbinary(16)) AS guid_bytes;
+SELECT CAST(0xFF19966F868B11D0B42D00C04FC964FF AS uniqueidentifier) AS guid;
+SELECT CAST(0x01 AS uniqueidentifier) AS short_value, DATALENGTH(CAST(NEWID() AS binary(16))) AS bytes;
+GO
+SELECT CAST(CAST('6F9619FF-8B86-D011-B42D-00C04FC964FF' AS uniqueidentifier) AS varchar(20)) AS too_short;
+GO
+```
+
+```text
+guid_bytes
+--------------------------------
+FF19966F868B11D0B42D00C04FC964FF
+
+(1 row affected)
+
+guid
+------------------------------------
+6F9619FF-8B86-D011-B42D-00C04FC964FF
+
+(1 row affected)
+
+short_value                          bytes
+------------------------------------ -----
+00000001-0000-0000-0000-000000000000 16
+
+(1 row affected)
+
+Msg 8170, Level 16, State 1, Line 1
+Insufficient result space to convert uniqueidentifier value to char.
 ```
 
 ## See also
