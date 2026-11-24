@@ -146,7 +146,6 @@ pub fn optimize(p: ir.Ir): ir.Ir {
     }
     o.dropDead()
     o.fwdReceivers()
-    o.fwdBorrows()
     return replace(mut &o.u, ir.newIr())
 }
 
@@ -251,10 +250,12 @@ fn (o: &Opt) namesLocal(x: int, t: int): bool {
 fn (o: mut &Opt) fwdReceivers() {
     var uses: []int = array(len(o.u.locals), 0)
     for f in 0..len(o.u.funcs) {
-        if o.u.funcs[f].body < 0 { continue }
+        let b = o.u.funcs[f].body
+        if b < 0 { continue }
         var touched: []int = []
-        o.countAll(o.u.funcs[f].body, mut &uses, mut &touched)
-        o.fwdStmtSafe(o.u.funcs[f].body, mut &uses)
+        o.countAll(b, mut &uses, mut &touched)
+        o.fwdStmtSafe(b, mut &uses)
+        o.borrowWalk(b, mut &uses)
         for l in touched { uses[l] = 0 }
     }
 }
@@ -274,14 +275,7 @@ fn (o: mut &Opt) fwdReceivers() {
 // the place before it reads it. As with receiver temporaries, a bounds check in the place
 // may run one statement later; a program that does not trap is unaffected.
 
-fn (o: mut &Opt) fwdBorrows() {
-    for f in 0..len(o.u.funcs) {
-        let b = o.u.funcs[f].body
-        if b >= 0 { o.borrowWalk(b, b) }
-    }
-}
-
-fn (o: mut &Opt) borrowWalk(s: int, body: int) {
+fn (o: mut &Opt) borrowWalk(s: int, uses: mut &[]int) {
     if s < 0 { return }
     let k = o.u.nk(s)
     if k == ir.S_BLOCK {
@@ -289,19 +283,19 @@ fn (o: mut &Opt) borrowWalk(s: int, body: int) {
         let n = o.u.items[l]
         for j in 0..n {
             let d = o.u.items[l + 1 + j]
-            if o.u.nk(d) == ir.S_DECL { o.borrowTry(d, l, j, n, body) }
+            if o.u.nk(d) == ir.S_DECL { o.borrowTry(d, l, j, n, mut &uses) }
         }
-        for j in 0..o.u.items[l] { o.borrowWalk(o.u.items[l + 1 + j], body) }
+        for j in 0..o.u.items[l] { o.borrowWalk(o.u.items[l + 1 + j], mut &uses) }
         return
     }
     if k == ir.S_IF {
-        o.borrowWalk(o.u.nodes[s].b, body)
-        o.borrowWalk(o.u.nodes[s].c, body)
+        o.borrowWalk(o.u.nodes[s].b, mut &uses)
+        o.borrowWalk(o.u.nodes[s].c, mut &uses)
     } else if k == ir.S_WHILE || k == ir.S_SWITCH {
-        o.borrowWalk(o.u.nodes[s].b, body)
+        o.borrowWalk(o.u.nodes[s].b, mut &uses)
     } else if k == ir.S_FOR {
-        o.borrowWalk(o.u.nodes[s].a, body)
-        o.borrowWalk(o.u.nodes[s].d, body)
+        o.borrowWalk(o.u.nodes[s].a, mut &uses)
+        o.borrowWalk(o.u.nodes[s].d, mut &uses)
     }
 }
 
@@ -318,34 +312,6 @@ fn (o: &Opt) stmtCall(s: int): int {
         if o.u.nodes[s].a >= 0 && o.u.nk(o.u.nodes[s].a) == ir.E_CALL { return o.u.nodes[s].a }
     }
     return -1
-}
-
-// Finds the only use of local d in x as `&d` (into hit), or marks bad when d is named any
-// other way or more than once.
-fn (o: &Opt) scanBorrow(x: int, d: int, hit: mut &int, bad: mut &bool) {
-    if x < 0 || bad { return }
-    let k = o.u.nk(x)
-    if k == ir.E_LOCAL {
-        if o.u.nodes[x].a == d { bad = true }
-        return
-    }
-    if k == ir.E_ADDR {
-        let a = o.u.nodes[x].a
-        if o.u.nk(a) == ir.E_LOCAL && o.u.nodes[a].a == d {
-            if hit >= 0 { bad = true } else { hit = x }
-            return
-        }
-    }
-    let kc = ir.KIDS[k]
-    if kc == ir.K_NONE { return }
-    if kc != ir.K_BLOCK && kc != ir.K_CLIT && kc != ir.K_DECL { o.scanBorrow(o.u.nodes[x].a, d, hit, bad) }
-    if kc == ir.K_AB || kc == ir.K_ABC || kc == ir.K_FOR || kc == ir.K_DECL {
-        o.scanBorrow(o.u.nodes[x].b, d, hit, bad)
-    }
-    if kc == ir.K_ABC || kc == ir.K_FOR { o.scanBorrow(o.u.nodes[x].c, d, hit, bad) }
-    if kc == ir.K_FOR { o.scanBorrow(o.u.nodes[x].d, d, hit, bad) }
-    let l = if kc == ir.K_CALL || kc == ir.K_CLIT { o.u.nodes[x].b } else if kc == ir.K_BLOCK { o.u.nodes[x].a } else if kc == ir.K_DECL { o.u.nodes[x].c } else { -1 }
-    if l >= 0 { for j in 0..o.u.items[l] { o.scanBorrow(o.u.items[l + 1 + j], d, hit, bad) } }
 }
 
 // The runtime functions that read their arguments and write no memory (as cse's pureName).
@@ -413,8 +379,9 @@ fn (o: &Opt) pureAt(x: int, p: int, read: bool): bool {
 
 // The declaration d (statement j of the list l, of n statements) as a payload borrow, when
 // it is one: the local stands for the place and the declaration goes.
-fn (o: mut &Opt) borrowTry(d: int, l: int, j: int, n: int, body: int) {
+fn (o: mut &Opt) borrowTry(d: int, l: int, j: int, n: int, uses: mut &[]int) {
     let t = o.u.nodes[d].a
+    if uses[t] != 1 { return }
     let init = o.u.nodes[d].b
     if init < 0 || o.u.nodes[d].c >= 0 { return }
     let ty = o.u.locals[t].ty
@@ -423,14 +390,19 @@ fn (o: mut &Opt) borrowTry(d: int, l: int, j: int, n: int, body: int) {
     if j + 1 >= n { return }
     let c = o.stmtCall(o.u.items[l + 1 + j + 1])
     if c < 0 { return }
-    var hit = -1
-    var bad = false
-    o.scanBorrow(body, t, mut &hit, mut &bad)
-    if bad || hit < 0 { return }
     let args = o.u.nodes[c].b
     var ai = -1
+    var hit = -1
     for i in 0..o.u.listLen(args) {
-        if o.u.listAt(args, i) == hit { ai = i }
+        let a = o.u.listAt(args, i)
+        if o.u.nk(a) == ir.E_ADDR {
+            let p = o.u.nodes[a].a
+            if o.u.nk(p) == ir.E_LOCAL && o.u.nodes[p].a == t {
+                ai = i
+                hit = a
+                break
+            }
+        }
     }
     if ai < 0 { return }
     for i in 0..o.u.listLen(args) {
@@ -443,6 +415,7 @@ fn (o: mut &Opt) borrowTry(d: int, l: int, j: int, n: int, body: int) {
     o.u.nodes[hit].a = init
     o.u.nodes[d].k = ir.S_EMPTY
     o.u.nodes[d].b = -1
+    uses[t] = 0
 }
 
 // ---------------------------------------------------------------- helpers
