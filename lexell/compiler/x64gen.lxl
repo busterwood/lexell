@@ -245,6 +245,12 @@ type Gen = record {
     nGuards: int                // the leading guards of the function being generated
     guardLabels: []int          // their labels bound where the prologue goes
     shrink: bool                // generating the guards before the prologue: a return is a bare ret
+    rotTop: int                 // innermost rotated while loop with a simple tail test: top label, or -1
+    rotEnd: int                 // ... end label
+    rotCond: int                // ... condition expression
+    rotWhen: bool               // ... branch to rotTop when rotCond is rotWhen
+    atTail: bool                // current statement falls straight into the rotated loop's test
+    spillActive: int            // locals currently saved in spill slots around an enclosing site
 }
 
 // A statement whose code a local in one of QUIET_REGS may run with in its slot: stored before
@@ -291,7 +297,8 @@ fn newGen(u: ir.Ir): Gen {
         saved: [], seen: [], stamp: 1, counting: false, scanStack: [], inlStack: [], inlEnd: [], inl: [], curFunc: -1,
         loops: 0, aTaken: [], emptyS: -1, callDest: NO_MEM, callFresh: false, simpF: -1, destUsed: false, byteDest: 0, posOf: [], posSeen: [],
         inlPos: -1, held: [], nLocalRegs: 0, bareRet: false, rm: newMap(), noCopy: -1, sites: [],
-        siteIdx: [], siteStamp: [], noSites: 0, rotBody: 0, ifDepth: 0, loopDepth: 0, posW: [], spill: [], spillSlot: [], nGuards: 0, guardLabels: [], shrink: false}
+        siteIdx: [], siteStamp: [], noSites: 0, rotBody: 0, ifDepth: 0, loopDepth: 0, posW: [], spill: [], spillSlot: [], nGuards: 0, guardLabels: [], shrink: false,
+        rotTop: -1, rotEnd: -1, rotCond: -1, rotWhen: false, atTail: false, spillActive: 0}
     g.a.peep = true
     g.siteIdx = array(2 * len(g.u.nodes), -1)
     g.siteStamp = array(2 * len(g.u.nodes), 0)
@@ -2869,6 +2876,7 @@ fn (g: &Gen) siteLocals(s: int, kind: int): []int {
 // Stores the locals ls in their slots, which the code generated next reads and writes; their
 // registers.
 fn (g: mut &Gen) saveRegs(ls: &[]int): []int {
+    g.spillActive += len(ls)
     var rs: []int = []
     for l in ls {
         append(mut &rs, g.reg[l])
@@ -2882,6 +2890,7 @@ fn (g: mut &Gen) saveRegs(ls: &[]int): []int {
 // Loads the locals ls into their registers rs again (no flag changed): from the slot the code
 // left each in (a declaration takes a new one), normalized (it may have stored fewer bytes).
 fn (g: mut &Gen) loadRegs(ls: &[]int, rs: &[]int) {
+    g.spillActive -= len(ls)
     for i in 0..len(ls) {
         let l = ls[i]
         g.reg[l] = rs[i]
@@ -2908,6 +2917,7 @@ fn (g: mut &Gen) stmt2(s: int) {
     let rs = g.saveRegs(&ls)
     g.genTest(cond)
     g.loadRegs(&ls, &rs)
+    g.atTail = false
     let target = g.jumpOnly(n.b)
     if n.c < 0 && target >= 0 {
         g.a.jcc(if neg { x64.CC_E } else { x64.CC_NE }, target)
@@ -2928,11 +2938,12 @@ fn (g: mut &Gen) stmt2(s: int) {
 }
 
 fn (g: mut &Gen) stmt1(s: int) {
+    let wasTail = replace(mut &g.atTail, false)
     let n = g.u.nodes[s]
     let k = n.k
     if k == ir.S_BLOCK {
         let mark = g.frame
-        g.stmtsFrom(n.a, 0)
+        g.stmtsTail(n.a, 0, g.u.listLen(n.a), wasTail)
         if n.v != 1 { g.frame = mark }
     } else if k == ir.S_DECL {
         let l = n.a
@@ -2998,20 +3009,32 @@ fn (g: mut &Gen) stmt1(s: int) {
         // done: a jump table
     } else if k == ir.S_IF {
         let elseL = g.a.newLabel()
+        let doTail = wasTail && n.c >= 0 && g.rotTop >= 0 && g.spillActive == 0
         g.branch(n.a, elseL, false)
+        if doTail { g.atTail = true }
         g.stmt(n.b)
+        g.atTail = false
         if n.c >= 0 {
-            let end = g.a.newLabel()
-            g.a.jmp(end)
-            g.a.bind(elseL)
-            g.stmt(n.c)
-            g.a.bind(end)
+            if doTail {
+                if !g.alwaysJumps(n.b) { g.emitTail() }
+                g.a.bind(elseL)
+                g.atTail = true
+                g.stmt(n.c)
+                g.atTail = false
+            } else {
+                let end = g.a.newLabel()
+                g.a.jmp(end)
+                g.a.bind(elseL)
+                g.stmt(n.c)
+                g.a.bind(end)
+            }
         } else {
             g.a.bind(elseL)
         }
     } else if k == ir.S_WHILE && g.rotTest(s) >= 0 {
         g.rotated(s)
     } else if k == ir.S_WHILE {
+        let oldTop = replace(mut &g.rotTop, -1)
         let top = g.a.newLabel()
         let end = g.a.newLabel()
         g.a.bind(top)
@@ -3023,9 +3046,11 @@ fn (g: mut &Gen) stmt1(s: int) {
         pop(mut &g.breakL)
         pop(mut &g.contL)
         g.loops -= 1
+        g.rotTop = oldTop
         g.a.jmp(top)
         g.a.bind(end)
     } else if k == ir.S_FOR {
+        let oldTop = replace(mut &g.rotTop, -1)
         let mark = g.frame
         let fill = g.fillLoop(s)
         var fillEnd = -1
@@ -3080,6 +3105,7 @@ fn (g: mut &Gen) stmt1(s: int) {
         g.a.bind(test)
         if n.b >= 0 { g.branch(n.b, top, true) } else { g.a.jmp(top) }
         g.loops -= 1
+        g.rotTop = oldTop
         g.a.bind(end)
         if fillEnd >= 0 { g.a.bind(fillEnd) }
         g.frame = mark
@@ -3088,7 +3114,11 @@ fn (g: mut &Gen) stmt1(s: int) {
         g.a.jmp(g.breakL[len(g.breakL) - 1])
     } else if k == ir.S_CONTINUE {
         if len(g.contL) == 0 { g.fail(s, "continue outside a loop") }
-        g.a.jmp(g.contL[len(g.contL) - 1])
+        if g.rotTop >= 0 && g.spillActive == 0 {
+            g.emitTail()
+        } else {
+            g.a.jmp(g.contL[len(g.contL) - 1])
+        }
     } else if k == ir.S_RETURN {
         if n.a >= 0 { g.genReturn(n.a) }
         g.epilogue()
@@ -3106,16 +3136,25 @@ fn (g: mut &Gen) stmt1(s: int) {
 
 // The statements of the list l from index j0, as a block generates them (the frame of each
 // statement's temporaries released after it, a declaration's slot kept).
-fn (g: mut &Gen) stmtsFrom(l: int, j0: int) { g.stmtsTo(l, j0, g.u.listLen(l)) }
+fn (g: mut &Gen) stmtsFrom(l: int, j0: int) { g.stmtsTail(l, j0, g.u.listLen(l), false) }
 
 // ... up to index j1.
-fn (g: mut &Gen) stmtsTo(l: int, j0: int, j1: int) {
+fn (g: mut &Gen) stmtsTo(l: int, j0: int, j1: int) { g.stmtsTail(l, j0, j1, false) }
+
+// ... with tail true when the end of the list falls straight into a rotated loop's test.
+fn (g: mut &Gen) stmtsTail(l: int, j0: int, j1: int, tail: bool) {
+    var lastReal = -1
+    if tail {
+        var r = j1 - 1
+        while r >= j0 && g.u.nk(g.u.listAt(l, r)) == ir.S_EMPTY { r -= 1 }
+        lastReal = r
+    }
     var j = j0
     while j < j1 {
         let x = g.u.listAt(l, j)
         let before = g.frame
         if j + 1 < j1 && !g.spillsHere(x) && !g.spillsHere(g.u.listAt(l, j + 1)) &&
-            (g.fusedIf(x, g.u.listAt(l, j + 1)) || g.fusedReturn(x, g.u.listAt(l, j + 1)) ||
+            (g.fusedIf(x, g.u.listAt(l, j + 1), tail && j + 1 == lastReal) || g.fusedReturn(x, g.u.listAt(l, j + 1)) ||
             g.fusedDivMod(x, g.u.listAt(l, j + 1))) {
             j += 2
             continue
@@ -3125,7 +3164,9 @@ fn (g: mut &Gen) stmtsTo(l: int, j0: int, j1: int) {
             let p = g.u.nodes[g.u.listAt(l, j - 1)]
             if p.k == ir.S_DECL && p.b >= 0 && p.c < 0 { g.prevDecl = p.a }
         }
+        g.atTail = tail && j == lastReal
         g.stmt(x)
+        g.atTail = false
         g.prevDecl = -1
         g.frame = if g.isDecl(x) { g.declMark } else { before }
         j += 1
@@ -3238,17 +3279,82 @@ fn (g: &Gen) rotTest(s: int): int {
     return -1
 }
 
+// Whether x is a simple integer/pointer operand that never reads a spilled quiet local.
+fn (g: &Gen) tailOpOk(x: int): bool {
+    if !g.simple(x) { return false }
+    var v = x
+    while g.u.nk(v) == ir.E_CAST { v = g.u.nodes[v].a }
+    if g.u.nk(v) == ir.E_LOCAL && len(g.spill) > 0 && hasInt(&g.spill, g.u.nodes[v].a) { return false }
+    return true
+}
+
+// Whether cond is a single compare of two simple non-spilled integer/pointer operands (cheap
+// enough to duplicate at continue and tail-if sites so hot byte loops take one branch per turn).
+fn (g: &Gen) simpleTail(cond: int): bool {
+    var c = cond
+    while g.u.nk(c) == ir.E_LNOT || (g.u.nk(c) == ir.E_CAST && g.tk(g.u.nodes[c].ty) == ir.TY_BOOL) {
+        c = g.u.nodes[c].a
+    }
+    let n = g.u.nodes[c]
+    if n.k != ir.E_BIN || n.v < ir.OP_EQ || n.v > ir.OP_GE { return false }
+    if g.isF(n.c) || g.is128(n.c) || g.isAggr(n.c) { return false }
+    return g.tailOpOk(n.a) && g.tailOpOk(n.b)
+}
+
+// Whether statement s always transfers control out of its end (so no fall-through jump is needed).
+fn (g: &Gen) alwaysJumps(s: int): bool {
+    if s < 0 { return false }
+    let n = g.u.nodes[s]
+    if n.k == ir.S_RETURN || n.k == ir.S_BREAK || n.k == ir.S_CONTINUE { return true }
+    if n.k == ir.S_BLOCK {
+        let l = n.a
+        var r = g.u.listLen(l) - 1
+        while r >= 0 && g.u.nk(g.u.listAt(l, r)) == ir.S_EMPTY { r -= 1 }
+        return r >= 0 && g.alwaysJumps(g.u.listAt(l, r))
+    }
+    if n.k == ir.S_IF && n.c >= 0 { return g.alwaysJumps(n.b) && g.alwaysJumps(n.c) }
+    return false
+}
+
+fn (g: mut &Gen) emitTail() {
+    g.branch(g.rotCond, g.rotTop, g.rotWhen)
+    g.a.jmp(g.rotEnd)
+}
+
 // The while loop s rotated: a jump to the test, the rest of the body, then the test, which
 // jumps back to the body while the loop goes on. The same tests run in the same order (each
 // iteration starts with the test); only the layout changes, so the live ranges by position
 // (allocRegs) still hold: the test is reached from the entry and from the end of the body,
-// as the top was. A continue jumps to the test.
+// as the top was. A continue (or tail-position if-then) duplicates a simple test inline.
 fn (g: mut &Gen) rotated(s: int) {
     let n = g.u.nodes[s]
     let nt = g.rotTest(s)
     let top = g.a.newLabel()
     let test = g.a.newLabel()
     let end = g.a.newLabel()
+    var tCond = n.a
+    var tWhen = true
+    if nt == 2 {
+        let l = g.u.nodes[n.b].a
+        tCond = g.u.nodes[g.u.listAt(l, 0)].b
+        tWhen = g.u.nk(g.u.nodes[g.u.listAt(l, 1)].a) == ir.E_LNOT
+    } else if nt == 1 {
+        let l = g.u.nodes[n.b].a
+        tCond = g.u.nodes[g.u.listAt(l, 0)].a
+        tWhen = false
+    }
+    let oldTop = g.rotTop
+    let oldEnd = g.rotEnd
+    let oldCond = g.rotCond
+    let oldWhen = g.rotWhen
+    if g.simpleTail(tCond) {
+        g.rotTop = top
+        g.rotEnd = end
+        g.rotCond = tCond
+        g.rotWhen = tWhen
+    } else {
+        g.rotTop = -1
+    }
     g.a.jmp(test)
     append(mut &g.loopTops, top)
     append(mut &g.loopEnds, end)
@@ -3258,27 +3364,21 @@ fn (g: mut &Gen) rotated(s: int) {
     append(mut &g.contL, test)
     let mark = g.frame
     if nt == 0 {
+        g.atTail = g.rotTop >= 0
         g.stmt(n.b)
+        g.atTail = false
     } else {
-        g.stmtsFrom(g.u.nodes[n.b].a, nt)
+        g.stmtsTail(g.u.nodes[n.b].a, nt, g.u.listLen(g.u.nodes[n.b].a), g.rotTop >= 0)
     }
     g.frame = mark
     pop(mut &g.breakL)
     pop(mut &g.contL)
+    g.rotTop = oldTop
+    g.rotEnd = oldEnd
+    g.rotCond = oldCond
+    g.rotWhen = oldWhen
     g.a.bind(test)
-    if nt == 0 {
-        g.branch(n.a, top, true)
-    } else {
-        let l = g.u.nodes[n.b].a
-        let ifS = g.u.listAt(l, nt - 1)
-        let cond = g.u.nodes[ifS].a
-        if nt == 2 {
-            // `bool c = E; if (!c) break;` (or `if (c)`): E for c
-            g.branch(g.u.nodes[g.u.listAt(l, 0)].b, top, g.u.nk(cond) == ir.E_LNOT)
-        } else {
-            g.branch(cond, top, false)
-        }
-    }
+    g.branch(tCond, top, tWhen)
     g.loops -= 1
     g.a.bind(end)
 }
@@ -3383,7 +3483,7 @@ fn (g: mut &Gen) incIf(cond0: int, neg0: bool, body: int): bool {
 
 // `bool c = e; if (!c) ...` (the C of every loop condition) with c named nowhere else:
 // generates the if with e for its condition and no c, and true. Else false, nothing generated.
-fn (g: mut &Gen) fusedIf(d: int, s: int): bool {
+fn (g: mut &Gen) fusedIf(d: int, s: int, atTail: bool): bool {
     let dn = g.u.nodes[d]
     if dn.k != ir.S_DECL || dn.b < 0 || dn.c >= 0 || g.uses[dn.a] != 2 { return false }
     if g.tk(g.u.locals[dn.a].ty) != ir.TY_BOOL || g.u.nk(s) != ir.S_IF { return false }
@@ -3402,18 +3502,30 @@ fn (g: mut &Gen) fusedIf(d: int, s: int): bool {
         return true
     }
     if !neg && g.genChain(dn.b, sn.b, sn.c) { return true }
+    let doTail = atTail && sn.c >= 0 && g.rotTop >= 0 && g.spillActive == 0
     let elseL = g.a.newLabel()
     g.branch(dn.b, elseL, neg)
     let before = g.frame
+    if doTail { g.atTail = true }
     g.stmt(sn.b)
+    g.atTail = false
     g.frame = before
     if sn.c >= 0 {
-        let end = g.a.newLabel()
-        g.a.jmp(end)
-        g.a.bind(elseL)
-        g.stmt(sn.c)
-        g.frame = before
-        g.a.bind(end)
+        if doTail {
+            if !g.alwaysJumps(sn.b) { g.emitTail() }
+            g.a.bind(elseL)
+            g.atTail = true
+            g.stmt(sn.c)
+            g.atTail = false
+            g.frame = before
+        } else {
+            let end = g.a.newLabel()
+            g.a.jmp(end)
+            g.a.bind(elseL)
+            g.stmt(sn.c)
+            g.frame = before
+            g.a.bind(end)
+        }
     } else {
         g.a.bind(elseL)
     }
@@ -7607,6 +7719,8 @@ fn (g: mut &Gen) genInline(f: int, e: int) {
     let ch = g.applyAlias(f, &al)
     let saveRet = g.retTy
     let saveDecl = g.declMark
+    let saveTop = replace(mut &g.rotTop, -1)
+    let saveAt = replace(mut &g.atTail, false)
     g.retTy = g.u.tys[g.u.funcs[f].ty].base
     let end = g.a.newLabel()
     if len(g.inlStack) == 0 { g.inlPos = g.posAt(e) }
@@ -7617,6 +7731,8 @@ fn (g: mut &Gen) genInline(f: int, e: int) {
     pop(mut &g.inlEnd)
     g.unalias(&ch)
     g.a.bind(end)
+    g.rotTop = saveTop
+    g.atTail = saveAt
     g.retTy = saveRet
     g.declMark = saveDecl
 }
