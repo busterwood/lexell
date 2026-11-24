@@ -78,6 +78,8 @@ select_list:
 - `ROWNUM` numbers the rows as the query produces them, before `ORDER BY`. `WHERE ROWNUM <= n` (also `< n`, `= 1`)
   is a limit: with `ORDER BY` it takes the first n rows and sorts them. To take the top n of a sorted result, sort in
   an inline view and test `ROWNUM` outside, or use `FETCH FIRST`. `ROWNUM = 2` and `ROWNUM > 1` return no rows.
+  The limit comes before the aggregates, `GROUP BY`, `HAVING`, `DISTINCT` and `ORDER BY` of the query block, as in
+  Oracle (`SELECT COUNT(*) FROM emp WHERE ROWNUM < 4` is 3). `ROWNUM` also works in `UPDATE` and `DELETE`.
 - A subquery may stand for a value (one column; no row gives NULL; more than one row is ORA-01427), and be used with
   `IN`, `NOT IN`, `EXISTS`, and with `ANY`, `SOME` and `ALL` after a comparison. `(a, b) IN (subquery)` takes a
   list of columns. A subquery may use the columns of the query around it.
@@ -95,9 +97,10 @@ select_list:
 - `FOR UPDATE OF` takes a table or an alias (`OF emp`, `OF e`); Oracle takes columns (`OF e.name`), which lexdb
   answers with ORA-00942. `FOR UPDATE` is refused with `GROUP BY`, aggregates, `DISTINCT` and set operators
   (ORA-03001; Oracle gives ORA-01786 and others). It is accepted on an inline view, which Oracle refuses (ORA-02014).
-- `WHERE ROWNUM <= n` is read from the `WHERE` clause of a query block, and applied to the rows the block returns.
-  With `GROUP BY` or an aggregate it limits the groups, not the rows that are grouped: `SELECT COUNT(*) FROM emp
-  WHERE ROWNUM < 4` is 5 (Oracle: 3). `ROWNUM` tests in `UPDATE` and `DELETE` are not supported (ORA-20000).
+- `WHERE ROWNUM <= n` is read from the `WHERE` clause of a query block. With one table in `FROM` it limits the rows
+  read, before the grouping, as Oracle does. With a join it limits the rows the block returns, so over a join with an
+  aggregate or `GROUP BY` it limits the groups, not the rows that are grouped: `SELECT COUNT(*) FROM emp e, dept d
+  WHERE e.dept_id = d.id AND ROWNUM < 3` is 4 (Oracle: 2).
 - A set operator over columns of different types is not refused: `SELECT id FROM emp UNION SELECT name FROM dept`
   returns numbers and names together as text (Oracle: ORA-01790), though `SELECT 1 ... UNION SELECT 'a' ...` is
   ORA-01722.
@@ -316,7 +319,9 @@ Dee    6100
 
 ### E. ROWNUM
 
-`ROWNUM` counts rows before `ORDER BY`. To take the highest paid, sort first in an inline view.
+`ROWNUM` counts rows before `ORDER BY`. To take the highest paid, sort first in an inline view. With one table in
+`FROM`, the limit comes before an aggregate, `GROUP BY`, `HAVING` or `DISTINCT`, so the last four queries read
+the first three, three, two and four rows of `emp`.
 
 <!-- example: oracle -->
 ```sql
@@ -325,6 +330,10 @@ SELECT name FROM emp WHERE ROWNUM <= 2 ORDER BY salary;
 SELECT name, salary FROM (SELECT name, salary FROM emp ORDER BY salary DESC, name) x WHERE ROWNUM <= 2;
 SELECT * FROM (SELECT ROWNUM AS rn, name FROM emp) WHERE rn BETWEEN 2 AND 3;
 SELECT name FROM emp WHERE ROWNUM = 2;
+SELECT COUNT(*) AS n FROM emp WHERE ROWNUM < 4;
+SELECT dept_id, COUNT(*) AS n FROM emp WHERE ROWNUM <= 3 GROUP BY dept_id ORDER BY dept_id;
+SELECT DISTINCT dept_id FROM emp WHERE ROWNUM <= 2;
+SELECT dept_id, SUM(salary) AS total FROM emp WHERE ROWNUM <= 4 GROUP BY dept_id HAVING SUM(salary) > 6000;
 ```
 
 ```text
@@ -358,6 +367,32 @@ RN NAME
 2 rows selected.
 
 no rows selected
+
+N
+-
+3
+
+1 row selected.
+
+DEPT_ID N
+------- -
+      1 2
+      2 1
+
+2 rows selected.
+
+DEPT_ID
+-------
+      1
+
+1 row selected.
+
+DEPT_ID TOTAL
+------- -----
+      1  9300
+      2 12200
+
+2 rows selected.
 ```
 
 ### F. UNION, INTERSECT and MINUS
@@ -529,7 +564,6 @@ SELECT name FROM emp WHERE id = 2 FOR UPDATE WAIT 5;
 SELECT name FROM emp e WHERE id = 2 FOR UPDATE OF e.name;
 SELECT name FROM emp GROUP BY name FOR UPDATE;
 SELECT name FROM emp ORDER BY 2;
-SELECT COUNT(*) AS n FROM emp WHERE ROWNUM < 4;
 SELECT * FROM emp SAMPLE (50);
 SELECT * FROM emp PIVOT (COUNT(*) FOR dept_id IN (1, 2));
 SELECT dept_id, name FROM emp GROUP BY dept_id;
@@ -557,12 +591,6 @@ ORA-03001: unimplemented feature: FOR UPDATE is not allowed with GROUP BY clause
 
 ERROR:
 ORA-01785: ORDER BY item must be the number of a SELECT-list expression
-
-N
--
-5
-
-1 row selected.
 
 ERROR:
 ORA-00900: invalid SQL statement
