@@ -23,6 +23,10 @@ TRUNC ( date [, format ] )
 ROUND ( date [, format ] )
 SYS_EXTRACT_UTC ( timestamp_with_time_zone )
 FROM_TZ ( timestamp, time_zone )
+datetime AT TIME ZONE { 'zone' | DBTIMEZONE | SESSIONTIMEZONE | expr }
+datetime AT LOCAL
+TZ_OFFSET ( 'zone' | DBTIMEZONE | SESSIONTIMEZONE )
+NEW_TIME ( date, zone1, zone2 )
 NUMTODSINTERVAL ( n, 'DAY' | 'HOUR' | 'MINUTE' | 'SECOND' )
 NUMTOYMINTERVAL ( n, 'YEAR' | 'MONTH' )
 TIME_BUCKET ( datetime, width, origin [, START | END ] )
@@ -31,8 +35,12 @@ DATEDIFF ( unit, start, end )
 TIMESTAMPDIFF ( unit, start, end )
 ```
 
-`DATEADD`, `DATEDIFF`, `TIMESTAMPDIFF` and `TIME_BUCKET` are 26ai functions. Date formats for `TO_CHAR` and `TO_DATE`
-are on the [conversion page](functions-conversion.md); the types are on the [date and time types page](data-types-datetime.md).
+`DATEADD`, `DATEDIFF`, `TIMESTAMPDIFF` and `TIME_BUCKET` are 26ai functions. Date formats for `TO_CHAR` and `TO_DATE`,
+the time zone elements `TZH`, `TZM`, `TZR`, `TZD` and `TO_TIMESTAMP_TZ` are on the [conversion page](functions-conversion.md);
+the types are on the [date and time types page](data-types-datetime.md).
+
+A *zone* is an offset (`'+05:30'`, `'-03:00'`) or a region name (`'Europe/Paris'`, `'UTC'`). A region is used as the
+offset it has at that instant (see the differences). An unknown region is ORA-01882.
 
 ## Functions
 
@@ -40,11 +48,13 @@ are on the [conversion page](functions-conversion.md); the types are on the [dat
 : The current date and time of the server as a `DATE` (to the second).
 
 `SYSTIMESTAMP`, `CURRENT_TIMESTAMP`, `LOCALTIMESTAMP`
-: The current time as a timestamp. `CURRENT_DATE` is the current date and time as a `DATE`. All of them are fixed
-  for the length of a statement.
+: The current time. `SYSTIMESTAMP` is a `TIMESTAMP WITH TIME ZONE` at the server's offset, `+00:00`;
+  `CURRENT_TIMESTAMP` is one at the session's time zone; `LOCALTIMESTAMP` is a `TIMESTAMP` of the session's local
+  time. `CURRENT_DATE` is the session's date and time as a `DATE`. All of them are fixed for the length of a statement.
 
 `SESSIONTIMEZONE`, `DBTIMEZONE`
-: The session's time zone (set with `ALTER SESSION SET TIME_ZONE`) and the database's, which is `+00:00`.
+: The session's time zone (set with `ALTER SESSION SET TIME_ZONE`) as it was set, an offset (`+02:00`) or a region
+  name, and the database's, which is `+00:00`.
 
 `ADD_MONTHS`
 : *date* moved by *integer* months. When *date* is the last day of its month, so is the result:
@@ -63,7 +73,10 @@ are on the [conversion page](functions-conversion.md); the types are on the [dat
 
 `EXTRACT`
 : One field of a date, timestamp or interval: `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND` (with its fraction),
-  and for timestamps `TIMEZONE_HOUR` and `TIMEZONE_MINUTE`.
+  and for a timestamp with a time zone `TIMEZONE_HOUR`, `TIMEZONE_MINUTE`, `TIMEZONE_REGION` and `TIMEZONE_ABBR`. The
+  date and time fields of a `TIMESTAMP WITH TIME ZONE` are UTC's, as in Oracle: `EXTRACT(HOUR FROM TIMESTAMP
+  '2026-11-23 14:30:00 +05:30')` is 9; use `TO_CHAR` for the local time. `TIMEZONE_HOUR` of a timestamp without a zone
+  is ORA-30076.
 
 `TRUNC`, `ROUND` of dates
 : A date cut or rounded to a unit: `'YYYY'` or `'YEAR'`, `'Q'`, `'MM'` or `'MONTH'`, `'IW'` (Monday of the ISO week),
@@ -74,7 +87,20 @@ are on the [conversion page](functions-conversion.md); the types are on the [dat
 : A timestamp with time zone as a timestamp in UTC.
 
 `FROM_TZ`
-: A timestamp with a time zone given as an offset (`'+05:30'`) or a region name (`'Europe/Paris'`).
+: The timestamp, unchanged, with the zone attached: `FROM_TZ(TIMESTAMP '2026-11-23 14:30:00', '+05:30')` is 14:30 at
+  `+05:30`. An offset beyond 15 hours is ORA-01874, and one without its minutes (`'+03'`) ORA-01861.
+
+`AT TIME ZONE`, `AT LOCAL`
+: The same instant at another zone: `TIMESTAMP '2026-11-23 14:05:09 +02:00' AT TIME ZONE '+00:00'` is 12:05:09 at
+  `+00:00`. The zone may be `DBTIMEZONE`, `SESSIONTIMEZONE` or an expression. `AT LOCAL` moves the value to the
+  session's time zone. A timestamp without a zone is read in the session's zone first.
+
+`TZ_OFFSET`
+: The offset of a zone as text, `+05:30`; for a region, its offset now.
+
+`NEW_TIME`
+: A `DATE` moved from one of Oracle's zone abbreviations to another: `AST`, `ADT`, `BST`, `BDT`, `CST`, `CDT`, `EST`,
+  `EDT`, `GMT`, `HST`, `HDT`, `MST`, `MDT`, `NST`, `PST`, `PDT`, `YST`, `YDT`. Another is ORA-01857.
 
 `NUMTODSINTERVAL`, `NUMTOYMINTERVAL`
 : An interval of *n* units: `INTERVAL DAY TO SECOND` or `INTERVAL YEAR TO MONTH`. Add it to a date or timestamp.
@@ -97,20 +123,25 @@ are on the [conversion page](functions-conversion.md); the types are on the [dat
 
 - Subtracting two dates gives a number of days (with a fraction); subtracting two timestamps gives an `INTERVAL DAY TO
   SECOND`. A number added to a date is days: `DATE '2026-11-23' + 1.5` is noon on the 24th.
-- `DATE '2026-01-31' + INTERVAL '1' MONTH` is 28 February: the day is moved to the end of the shorter month.
+- A `TIMESTAMP WITH TIME ZONE` keeps its offset through arithmetic: `+ INTERVAL` gives one at the same offset (months
+  and days count in the local time), the difference of two is an `INTERVAL DAY TO SECOND` between the instants, and
+  `+ n` gives a `DATE` of the local time. Two of them compare by instant (example L).
 - The examples on this page never print the clock. They compare it with a fixed date or reduce it with `CASE`.
 - The week starts on Sunday (NLS territory AMERICA): `TO_CHAR(DATE, 'D')` is 1 for Sunday, `TRUNC(date, 'D')` goes to
   Sunday.
-- `TIMESTAMPADD`, `NEW_TIME`, `TZ_OFFSET`, `TO_TIMESTAMP_TZ`, `TO_DSINTERVAL`, `TO_YMINTERVAL` are not available
-  (ORA-00904).
+- `TIMESTAMPADD`, `TO_DSINTERVAL`, `TO_YMINTERVAL` are not available (ORA-00904).
 
 ## Differences from Oracle
 
-- A timestamp with a time zone is stored in UTC: `TIMESTAMP '2026-11-23 14:30:45 +05:30'` reads back as 09:00:45 and
-  `EXTRACT(TIMEZONE_HOUR FROM ...)` is 0. The offset is lost.
-- `FROM_TZ(TIMESTAMP '2026-11-23 14:30:00', '+05:30')` turns the time into UTC (09:00) instead of attaching the zone
-  to 14:30, and so does `FROM_TZ(..., 'Europe/Paris')` (13:30). `SYS_EXTRACT_UTC` on such a value is right.
-- `SESSIONTIMEZONE` after `ALTER SESSION SET TIME_ZONE = '+02:00'` is `+02`; Oracle gives `+02:00`.
+- **A region is kept as its offset at that instant.** `FROM_TZ(..., 'Europe/Paris')`, `AT TIME ZONE 'America/New_York'`
+  and a session in a region give the offset alone: `EXTRACT(TIMEZONE_REGION ...)` is `UNKNOWN` and `TIMEZONE_ABBR`
+  `UNK` (Oracle: `Europe/Paris`, `CET`), and `TO_CHAR(..., 'TZR')` shows `+01:00`. Adding an interval keeps the offset,
+  not the region's summer time.
+- `DATE '2026-01-31' + INTERVAL '1' MONTH` is 28 February (the day is moved to the end of the shorter month), and so
+  for a timestamp; Oracle gives ORA-01839. `ADD_MONTHS` is the same in both.
+- `MIN` and `MAX` of equal instants show the offset of the last row; Oracle shows the first's.
+- A session starts at `+00:00`, whatever time zone the client sends at logon; Oracle starts it there (a JDBC client
+  sends its JVM's zone, so example B's first `SESSIONTIMEZONE` is `UTC` in Oracle).
 - `EXTRACT(HOUR FROM DATE ...)` returns 0; Oracle refuses a `DATE` with a time field (ORA-30076). `QUARTER` and `DOW`
   are accepted by `EXTRACT`; Oracle does not know them.
 - `TIME_BUCKET` needs the *origin* argument and fails without it (ORA-00909, example I); Oracle makes it optional.
@@ -160,7 +191,9 @@ SELECT SESSIONTIMEZONE AS session_tz, DBTIMEZONE AS database_tz FROM dual;
 ALTER SESSION SET TIME_ZONE = 'Europe/Paris';
 SELECT SESSIONTIMEZONE AS session_tz FROM dual;
 ALTER SESSION SET TIME_ZONE = '+02:00';
-SELECT SESSIONTIMEZONE AS session_tz FROM dual;
+SELECT SESSIONTIMEZONE AS session_tz, TO_CHAR(CURRENT_TIMESTAMP, 'TZH:TZM') AS current_offset, TO_CHAR(SYSTIMESTAMP, 'TZH:TZM') AS system_offset,
+       CASE WHEN LOCALTIMESTAMP - CAST(SYS_EXTRACT_UTC(SYSTIMESTAMP) AS TIMESTAMP) > INTERVAL '1' HOUR THEN 'ahead of UTC' END AS localtimestamp_check
+FROM dual;
 ALTER SESSION SET TIME_ZONE = 'UTC';
 ```
 
@@ -181,9 +214,9 @@ Europe/Paris
 
 Session altered.
 
-SESSION_TZ
-----------
-+02
+SESSION_TZ CURRENT_OFFSET SYSTEM_OFFSET LOCALTIMESTAMP_CHECK
+---------- -------------- ------------- --------------------
++02:00     +02:00         +00:00        ahead of UTC
 
 1 row selected.
 
@@ -259,7 +292,9 @@ FROM dual;
 SELECT EXTRACT(DAY FROM INTERVAL '3 04:05:06' DAY TO SECOND) AS interval_days, EXTRACT(HOUR FROM INTERVAL '3 04:05:06' DAY TO SECOND) AS interval_hours,
        EXTRACT(YEAR FROM INTERVAL '2-5' YEAR TO MONTH) AS interval_years, EXTRACT(MONTH FROM INTERVAL '2-5' YEAR TO MONTH) AS interval_months
 FROM dual;
-SELECT EXTRACT(TIMEZONE_HOUR FROM TIMESTAMP '2026-11-23 14:30:45 +05:30') AS tz_hour, TO_CHAR(TIMESTAMP '2026-11-23 14:30:45 +05:30', 'HH24:MI') AS stored_as_utc FROM dual;
+SELECT EXTRACT(HOUR FROM TIMESTAMP '2026-11-23 14:30:45 +05:30') AS utc_hour, EXTRACT(TIMEZONE_HOUR FROM TIMESTAMP '2026-11-23 14:30:45 +05:30') AS tz_hour,
+       EXTRACT(TIMEZONE_MINUTE FROM TIMESTAMP '2026-11-23 14:30:45 +05:30') AS tz_minute, TO_CHAR(TIMESTAMP '2026-11-23 14:30:45 +05:30', 'HH24:MI') AS local_time
+FROM dual;
 ```
 
 ```text
@@ -275,9 +310,9 @@ INTERVAL_DAYS INTERVAL_HOURS INTERVAL_YEARS INTERVAL_MONTHS
 
 1 row selected.
 
-TZ_HOUR STORED_AS_UTC
-------- -------------
-      0 09:00
+UTC_HOUR TZ_HOUR TZ_MINUTE LOCAL_TIME
+-------- ------- --------- ----------
+       9       5        30 14:30
 
 1 row selected.
 ```
@@ -316,12 +351,21 @@ ROUND_MONTH_UP ROUND_MONTH_DOWN ROUND_YEAR ROUND_HOUR          ROUND_DAY
 <!-- example: oracle -->
 ```sql
 SELECT TO_CHAR(SYS_EXTRACT_UTC(TIMESTAMP '2026-11-23 14:30:00 +05:30'), 'YYYY-MM-DD HH24:MI:SS') AS utc FROM dual;
-SELECT TO_CHAR(FROM_TZ(TIMESTAMP '2026-11-23 14:30:00', '+05:30'), 'YYYY-MM-DD HH24:MI:SS') AS from_offset,
-       TO_CHAR(FROM_TZ(TIMESTAMP '2026-11-23 14:30:00', 'Europe/Paris'), 'YYYY-MM-DD HH24:MI:SS') AS from_region
+SELECT TO_CHAR(FROM_TZ(TIMESTAMP '2026-11-23 14:30:00', '+05:30'), 'YYYY-MM-DD HH24:MI TZH:TZM') AS from_offset,
+       TO_CHAR(FROM_TZ(TIMESTAMP '2026-11-23 14:30:00', 'Europe/Paris'), 'YYYY-MM-DD HH24:MI TZH:TZM') AS from_region
 FROM dual;
-SELECT TO_CHAR(FROM_TZ(TIMESTAMP '2026-11-23 14:05:09', '+02:00') AT TIME ZONE '+00:00', 'HH24:MI') AS at_utc,
-       TO_CHAR(FROM_TZ(TIMESTAMP '2026-11-23 14:05:09', 'UTC') AT TIME ZONE 'America/New_York', 'HH24:MI') AS at_new_york
+SELECT TO_CHAR(FROM_TZ(TIMESTAMP '2026-11-23 14:05:09', '+02:00') AT TIME ZONE '+00:00', 'HH24:MI TZH:TZM') AS at_utc,
+       TO_CHAR(FROM_TZ(TIMESTAMP '2026-11-23 14:05:09', 'UTC') AT TIME ZONE 'America/New_York', 'HH24:MI TZH:TZM') AS at_new_york,
+       TO_CHAR(TIMESTAMP '2026-11-23 14:05:09 +02:00' AT LOCAL, 'HH24:MI TZH:TZM') AS at_local,
+       TO_CHAR(TIMESTAMP '2026-11-23 14:05:09' AT TIME ZONE '+05:30', 'HH24:MI TZH:TZM') AS without_zone
 FROM dual;
+SELECT TZ_OFFSET('+05:30') AS fixed, TZ_OFFSET('Asia/Tokyo') AS tokyo, TZ_OFFSET(DBTIMEZONE) AS db, TZ_OFFSET(SESSIONTIMEZONE) AS session_ FROM dual;
+SELECT TO_CHAR(NEW_TIME(TO_DATE('2026-11-23 12:00', 'YYYY-MM-DD HH24:MI'), 'GMT', 'EST'), 'YYYY-MM-DD HH24:MI') AS gmt_noon_in_est,
+       TO_CHAR(NEW_TIME(TO_DATE('2026-11-23 09:00', 'YYYY-MM-DD HH24:MI'), 'PST', 'EST'), 'YYYY-MM-DD HH24:MI') AS pst_9_in_est
+FROM dual;
+SELECT FROM_TZ(TIMESTAMP '2026-11-23 14:05:09', 'Mars/Olympus') FROM dual;
+SELECT NEW_TIME(DATE '2026-11-23', 'GMT', 'XXX') FROM dual;
+SELECT TIMESTAMP '2026-11-23 14:05:09 +16:00' FROM dual;
 ```
 
 ```text
@@ -331,17 +375,38 @@ UTC
 
 1 row selected.
 
-FROM_OFFSET         FROM_REGION
-------------------- -------------------
-2026-11-23 09:00:00 2026-11-23 13:30:00
+FROM_OFFSET             FROM_REGION
+----------------------- -----------------------
+2026-11-23 14:30 +05:30 2026-11-23 14:30 +01:00
 
 1 row selected.
 
-AT_UTC AT_NEW_YORK
------- -----------
-12:05  09:05
+AT_UTC       AT_NEW_YORK  AT_LOCAL     WITHOUT_ZONE
+------------ ------------ ------------ ------------
+12:05 +00:00 09:05 -05:00 12:05 +00:00 19:35 +05:30
 
 1 row selected.
+
+FIXED  TOKYO  DB     SESSION_
+------ ------ ------ --------
++05:30 +09:00 +00:00 +00:00
+
+1 row selected.
+
+GMT_NOON_IN_EST  PST_9_IN_EST
+---------------- ----------------
+2026-11-23 07:00 2026-11-23 12:00
+
+1 row selected.
+
+ERROR:
+ORA-01882: time zone region not found
+
+ERROR:
+ORA-01857: not a valid time zone
+
+ERROR:
+ORA-01874: time zone hour must be between -15 and 15
 ```
 
 ### H. Intervals
@@ -445,9 +510,7 @@ HOURS MINUTES DAYS
 <!-- example: oracle -->
 ```sql
 SELECT TIMESTAMPADD(DAY, 1, DATE '2026-11-01') FROM dual;
-SELECT NEW_TIME(DATE '2026-11-23', 'GMT', 'EST') FROM dual;
-SELECT TZ_OFFSET('Europe/Paris') FROM dual;
-SELECT TO_TIMESTAMP_TZ('2026-11-23 14:05:09 +05:30', 'YYYY-MM-DD HH24:MI:SS TZH:TZM') FROM dual;
+SELECT TO_DSINTERVAL('3 04:05:06') FROM dual;
 ```
 
 ```text
@@ -456,12 +519,39 @@ ORA-00904: "DAY": invalid identifier
 
 ERROR:
 ORA-00904: invalid identifier
+```
 
-ERROR:
-ORA-00904: invalid identifier
+### L. Arithmetic and comparison with a time zone
 
-ERROR:
-ORA-00904: invalid identifier
+The offset stays through arithmetic; a comparison is by instant.
+
+<!-- example: oracle -->
+```sql
+SELECT TO_CHAR(TIMESTAMP '2026-03-15 10:00:00 +02:00' + INTERVAL '1' DAY, 'YYYY-MM-DD HH24:MI TZH:TZM') AS plus_day,
+       TO_CHAR(TIMESTAMP '2026-03-15 10:00:00 +02:00' - INTERVAL '5' HOUR, 'YYYY-MM-DD HH24:MI TZH:TZM') AS minus_5_hours,
+       TO_CHAR(TIMESTAMP '2026-01-15 10:00:00 -03:00' + INTERVAL '1' MONTH, 'YYYY-MM-DD HH24:MI TZH:TZM') AS plus_month,
+       TIMESTAMP '2026-03-15 10:00:00 +02:00' - TIMESTAMP '2026-03-15 07:00:00 +00:00' AS difference
+FROM dual;
+SELECT CASE WHEN TIMESTAMP '2026-03-15 10:00:00 +02:00' = TIMESTAMP '2026-03-15 08:00:00 +00:00' THEN 'same instant' END AS equal,
+       CASE WHEN TIMESTAMP '2026-03-15 10:00:00 +02:00' < TIMESTAMP '2026-03-15 09:00:00 +00:00' THEN 'earlier' END AS less,
+       TO_CHAR(GREATEST(TIMESTAMP '2026-03-15 10:00:00 +02:00', TIMESTAMP '2026-03-15 09:00:00 +00:00'), 'HH24:MI TZH:TZM') AS later,
+       TO_CHAR(TRUNC(TIMESTAMP '2026-03-15 01:30:00 +05:30'), 'YYYY-MM-DD HH24:MI') AS trunc_local_day,
+       TO_CHAR(TIMESTAMP '2026-03-15 10:00:00 +02:00' + 1, 'YYYY-MM-DD HH24:MI') AS plus_one_is_date
+FROM dual;
+```
+
+```text
+PLUS_DAY                MINUS_5_HOURS           PLUS_MONTH              DIFFERENCE
+----------------------- ----------------------- ----------------------- ----------
+2026-03-16 10:00 +02:00 2026-03-15 05:00 +02:00 2026-02-15 10:00 -03:00 0 1:0:0.0
+
+1 row selected.
+
+EQUAL        LESS    LATER        TRUNC_LOCAL_DAY  PLUS_ONE_IS_DATE
+------------ ------- ------------ ---------------- ----------------
+same instant earlier 09:00 +00:00 2026-03-15 00:00 2026-03-16 10:00
+
+1 row selected.
 ```
 
 ## See also
