@@ -65,7 +65,7 @@ SET_BIT ( expression_value, bit_offset [, bit_value ] ) → type of expression_v
 : *e* raised to the value.
 
 `LOG`
-: The natural logarithm. With *base*, the logarithm to that base (but see Differences).
+: The natural logarithm. With *base*, the logarithm to that base: `LOG(100, 10)` is 2.
 
 `LOG10`
 : The logarithm to base 10.
@@ -106,9 +106,6 @@ SET_BIT ( expression_value, bit_offset [, bit_value ] ) → type of expression_v
 
 ## Differences from SQL Server
 
-- **`LOG(x, base)` has its arguments the wrong way round:** `LOG(100, 10)` gives 0.5 (SQL Server: 2), as it is the
-  logarithm of 10 to base 100, and the result is a `decimal`. Use `LOG10`, or `LOG(x) / LOG(base)` (which can differ
-  in the last digit).
 - `ROUND` of a `decimal` with a negative length is error 8115: `ROUND(123.4567, -1)` (SQL Server: 120.0000). An `int`
   or a `float` can be rounded that way (example B).
 - `SQRT(-1)`, `LOG(0)`, `LOG(-1)` and `ASIN(2)` are errors (50000 or 8115, with PostgreSQL's wording); SQL Server's
@@ -175,8 +172,6 @@ int_power int_base float_base         big_power     int_negative float_negative 
 
 ### D. Logarithms
 
-`LOG(100, 10)` is shown as lexdb gives it: the arguments are the wrong way round (see Differences).
-
 <!-- example: tsql -->
 ```sql
 SELECT LOG(100) AS ln_100, LOG(EXP(1)) AS ln_of_e, LOG10(1000) AS base_10, LOG(1000) / LOG(10) AS base_10_by_hand,
@@ -185,8 +180,8 @@ SELECT LOG(100) AS ln_100, LOG(EXP(1)) AS ln_of_e, LOG10(1000) AS base_10, LOG(1
 
 ```text
 ln_100            ln_of_e base_10 base_10_by_hand    two_arguments
------------------ ------- ------- ------------------ ------------------
-4.605170185988092 1.0     3.0     2.9999999999999996 0.5000000000000000
+----------------- ------- ------- ------------------ -------------
+4.605170185988092 1.0     3.0     2.9999999999999996 2.0
 
 (1 row affected)
 ```
