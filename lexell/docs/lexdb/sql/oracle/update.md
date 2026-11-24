@@ -51,6 +51,9 @@ returning_clause:
 
 - The result is `N rows updated.`; in PL/SQL `SQL%ROWCOUNT` gives the count and `SQL%FOUND` tells whether any row
   changed.
+- The new values of all the rows (and `RETURNING`) are worked out before any row is written, so a subquery in `SET`
+  or `RETURNING` sees the table as the statement found it, not its own changes (example G).
+- `WHERE ROWNUM <= n` limits the statement to the first n rows it finds (example I).
 - The first `UPDATE` begins a transaction, which `COMMIT` or `ROLLBACK` ends. A statement that fails is undone alone.
 - A value is converted to its column's type, and constraints are checked: ORA-00001 (unique), ORA-01407 (a `NOT
   NULL` column set to NULL), ORA-02290 (check), ORA-02291 (no parent key), ORA-02292 (a parent key that has children),
@@ -60,14 +63,10 @@ returning_clause:
 
 ## Differences from Oracle
 
-- A subquery in `SET` that reads the table being updated sees the rows the statement has already changed, where Oracle
-  gives each row the table as it was when the statement began (example G).
 - `SET (col1, col2) = (SELECT ...)`, a column list set from a subquery, is not supported (ORA-00900); use one
   `SET col = (SELECT ...)` for each column. A list set from values, `SET (a, b) = (1, 2)`, works.
 - `UPDATE (subquery) SET ...` (updatable inline views) and `UPDATE ... PARTITION`, `LOG ERRORS`, `WHERE CURRENT OF`
   and `ORDER BY` are not supported (ORA-00900).
-- `ROWNUM` in the `WHERE` clause of `UPDATE` is not supported (ORA-20000, "window functions are not allowed in
-  UPDATE"). Select the keys in a subquery, `WHERE id IN (SELECT id FROM t FETCH FIRST 2 ROWS ONLY)`.
 - `UPDATE ... FROM table` (PostgreSQL's and T-SQL's join form) is accepted; Oracle refuses it. Use a correlated
   subquery or `MERGE`.
 - `RETURNING ... BULK COLLECT INTO` is not supported, as PL/SQL collections are not. `RETURNING` from a client's
@@ -298,9 +297,8 @@ Rollback complete.
 
 ### G. A subquery that reads the table being updated
 
-Each row takes twice its manager's salary. Oracle reads the table as it was when the statement began, so Dee and Eve
-get 12200 (twice Cid's old 6100). lexdb reads the rows the statement has already changed, so they get 20800 (twice
-Cid's new 10400).
+Each row takes twice its manager's salary. A subquery in `SET` reads the table as it was when the statement began, as
+in Oracle, so Dee and Eve get 12200 (twice Cid's old 6100), not twice Cid's new 10400.
 
 <!-- example: oracle -->
 ```sql
@@ -317,8 +315,8 @@ ID NAME SALARY
  1 Ann    5200
  2 Bob   10400
  3 Cid   10400
- 4 Dee   20800
- 5 Eve   20800
+ 4 Dee   12200
+ 5 Eve   12200
 
 5 rows selected.
 
@@ -331,7 +329,6 @@ Rollback complete.
 ```sql
 UPDATE emp SET (salary, mgr_id) = (SELECT 7000, 2 FROM dual) WHERE name = 'Dee';
 UPDATE (SELECT salary FROM emp WHERE id = 1) SET salary = 1;
-UPDATE emp SET salary = salary + 1 WHERE ROWNUM <= 2;
 UPDATE emp SET salary = salary + 1 WHERE id = 1 LOG ERRORS INTO errlog;
 UPDATE emp SET salary = 1 WHERE CURRENT OF c1;
 ```
@@ -344,13 +341,37 @@ ERROR:
 ORA-00900: invalid SQL statement
 
 ERROR:
-ORA-20000: window functions are not allowed in UPDATE
-
-ERROR:
 ORA-00900: invalid SQL statement
 
 ERROR:
 ORA-00900: invalid SQL statement
+```
+
+### I. ROWNUM
+
+`ROWNUM <= n` in the `WHERE` clause limits the statement to the first n rows it finds.
+
+<!-- example: oracle -->
+```sql
+UPDATE emp SET salary = salary + 1 WHERE ROWNUM <= 2;
+SELECT id, name, salary FROM emp ORDER BY id;
+ROLLBACK;
+```
+
+```text
+2 rows updated.
+
+ID NAME SALARY
+-- ---- ------
+ 1 Ann    5201
+ 2 Bob    4101
+ 3 Cid    6100
+ 4 Dee    6100
+ 5 Eve    3000
+
+5 rows selected.
+
+Rollback complete.
 ```
 
 ## See also
