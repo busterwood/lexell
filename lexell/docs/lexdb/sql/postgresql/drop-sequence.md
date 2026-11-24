@@ -19,25 +19,25 @@ DROP SEQUENCE [ IF EXISTS ] name [, ...] [ CASCADE | RESTRICT ]
 : A sequence, optionally schema-qualified.
 
 `CASCADE`
-: For a sequence a column owns (a `serial` column's): also drops the column's default.
+: For a sequence a column owns (a `serial` column's) or a column default calls (`DEFAULT nextval('s')`): also drops
+  the column's default, with a notice for each.
 
 `RESTRICT`
-: Refuses to drop a sequence that a column owns (2BP01). This is the default.
+: Refuses to drop a sequence that a column owns or a column default calls (2BP01). This is the default.
 
 ## Remarks
 
 - The sequence of a `serial` or identity column goes with its column or table; it is refused on its own unless
-  `CASCADE` is given.
+  `CASCADE` is given. So is a sequence a column's default names: `DROP SEQUENCE s` is 2BP01 while a table's
+  `DEFAULT nextval('s')` uses it.
 
 ## Differences from PostgreSQL
 
-- A column default that only names the sequence (`DEFAULT nextval('s')`, without `OWNED BY`) does not stop the drop:
-  the sequence goes, and the next `INSERT` that uses the default fails with 42P01. PostgreSQL refuses the drop
-  (2BP01), because `nextval('s')` keeps the sequence as a dependency.
 - `DROP SEQUENCE` of a table says `sequence "t" does not exist` (42P01); PostgreSQL says `"t" is not a sequence`
   (42809).
-- The refusal puts what `CASCADE` would do in its message (`with CASCADE its default is dropped`); PostgreSQL gives
-  a `DETAIL` and a `HINT`.
+- The refusal for a `serial` column's sequence puts what `CASCADE` would do in its message (`with CASCADE its default
+  is dropped`); PostgreSQL gives a `DETAIL` and a `HINT`. The refusal for a column default that names the sequence
+  has both, as PostgreSQL's.
 
 ## Examples
 
@@ -101,14 +101,24 @@ Indexes:
 CREATE SEQUENCE ref_no;
 CREATE TABLE ticket (no int DEFAULT nextval('ref_no'));
 DROP SEQUENCE ref_no;
+DROP SEQUENCE ref_no CASCADE;
 INSERT INTO ticket DEFAULT VALUES;
+SELECT * FROM ticket;
 ```
 
 ```text
 CREATE SEQUENCE
 CREATE TABLE
+ERROR:  cannot drop sequence ref_no because other objects depend on it
+DETAIL:  default value for column no of table ticket depends on sequence ref_no
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+NOTICE:  drop cascades to default value for column no of table ticket
 DROP SEQUENCE
-ERROR:  relation "ref_no" does not exist
+INSERT 0 1
+ no
+----
+
+(1 row)
 ```
 
 ### D. Errors
