@@ -692,8 +692,8 @@ distinct, over 64 `sys` views, two dozen catalog and property functions,
   without the caller's variables), `EXEC sp_executesql` in a batch (its
   @params, OUTPUT ones back), `EXEC master.dbo.xp_msver` (SQL Server's
   rows), `xp_instance_regread` (its OUTPUT NULL: lexdb has no registry),
-  any other procedure 2812; `INSERT t EXEC ...`; 0x literals (up to 8
-  digits an int, as arithmetic takes them; longer, bytes); a bit in
+  any other procedure 2812; `INSERT t EXEC ...`; 0x literals (varbinary,
+  as SQL Server's: read as a number beside one, see "As built: robustness" in lexdb-robust.md; once an int up to 8 digits); a bit in
   arithmetic and `~` (`#bitint`, `#bitnot`); `''` as a number is 0 (CAST,
   ISNULL's second argument, a VALUES column); `INSERT` without `INTO`;
   `CREATE INDEX ... INCLUDE (...)` (read, not kept: lexdb's index holds its
@@ -1133,3 +1133,18 @@ door's). Tests: `tds_wrong.lxl` (`mssql_wrong_queries.txt`, SQL Server's answers
   heap. `DROP INDEX name ON table` (SSMS's form) is read too. Not looked at: the auto-generated names (SQL Server's
   `PK__t__...`; lexdb's `t_pkey`), CLUSTERED COLUMNSTORE, partition schemes.
 - A second PRIMARY KEY in CREATE TABLE is 8110 (`Cannot add multiple PRIMARY KEY constraints to table 't'.`).
+
+
+## As built: robustness and wrong answers (lexdb-robust.md)
+
+The wrong answers the T-SQL phase 3 pages found, checked against SQL Server 2022 (`tds_robust`, 74 batches, each with `lexdb_batch` off and on;
+`tds_regexp` for 2025's two-argument REGEXP_REPLACE). `0x4142` is a varbinary, not the number 16706: beside a number it is read as an int (bigint
+beside one: its last bytes, big-endian), beside another varbinary `+` joins and `- * / % & | ^` are 402, beside a string a comparison reads the string as
+bytes, a decimal beside one is 8114 (`lexdb_bind.tsOps`); CAST and CONVERT to binary(n) / varbinary(n) (`#tobin`: a string by its bytes, style 1 / 2 hex
+text, a number big-endian keeping its low bytes, binary padded with zeros) and from one (`#bin2str`: bytes as characters, styles 1 and 2 hex; `#tint`:
+the last bytes big-endian), `LEN` of bytes, `SUBSTRING` (`#bsub`) and `LEFT` / `RIGHT` (characters). Left: `0x00 = 0x0000` (SQL Server pads the shorter), `CAST(0x41
+AS bit)`, a binary variable beside a binary, `HASHBYTES`, `CAST(0x4142 AS nvarchar)` (UTF-16 reading), DATALENGTH of a char (two bytes a character).
+`tinyint` is range-checked in `lexdb_ops.intRange` (220; 244 for a string), `char(n)` / `nchar(n)` pad in `coerce`, `LOG(x, base)` has its arguments
+as SQL Server's, `datetime +/- days` and `datetime - datetime` are `#dtadd` / `#dtdiff` (the binder knows the operands' types only where they are
+columns or casts; a datetime from a function call is not seen), `FORMAT` has ten cultures' dates (`lexdb_tsqlfmt.CULTURES`) and formats a `time` as a
+TimeSpan.

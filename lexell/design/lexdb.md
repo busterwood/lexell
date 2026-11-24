@@ -13020,3 +13020,12 @@ T-SQL's labels first added to `Table` (every table copy clones and drops it): th
 and a statement's parameter types are made once, with room for them (`scopeTypes`). The WHERE and ON of every statement no longer
 clone each condition for the enum pass (`fixIn` returns it as it is when no enum type was seen), which is where select and
 UPDATE got cheaper.
+
+
+### 9.140 Robustness and wrong answers from the documentation pass (lexdb-robust.md)
+
+An UPDATE's and DELETE's subqueries (SET, RETURNING) read the rows as the statement found them in every door (`updNew`: all the new rows first when the statement has
+subqueries, then the writes; PostgreSQL 19, SQL Server 2022 and Oracle Free agree: `exec_robust`, `tds_robust`, `tns_robust`); MERGE has the same fault and
+a plan. A LANGUAGE sql function's column is named as the function; `INTERVAL(p) '...' FIELD` and `INTERVAL FIELD '...'` are syntax errors and `INTERVAL(p)` keeps its
+precision. Point selects: in process, 20,000 statements, `LXL_HASH_SEED=1`, base ca687450: select +4 instructions of 118,690, INSERT -5 of 4,120,225, UPDATE by key +12 of
+4,146,084 (two rounds, equal).

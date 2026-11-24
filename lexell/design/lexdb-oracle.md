@@ -1131,3 +1131,16 @@ checks constant arithmetic only with a cast to smallint or integer in it), and t
 parameters' types (9.139 item 1). Test: `tns_wrong.lxl` (Oracle's answers: `gen_oracle.py --check tns_wrong`, 0 differences).
 Not done, as they differ from Oracle: ORA-00932 (CASE, COALESCE, NULLIF) and ORA-01790 (UNION) for a text beside a number
 are ORA-01722 here, and a UNION of a number and a date gives rows.
+
+
+## As built: robustness and wrong answers (lexdb-robust.md)
+
+The documentation pass's hangs and wrong answers of this door, checked against Oracle Free 23.26 (`tns_robust`: 58 answers, `gen_oracle.py --check tns_robust` 0
+differences; `tns_lenstr`; `tests/lexdb/java/OracleJdbc.java` "lengths" and "warnings", 195 checks on Oracle Free and lexdb alike): a text sent after its length
+is JDBC's bare bytes or python-oracledb's length-prefixed, told by the client's table of types (`lenStr`: the 84-byte statement and the one-line `CREATE FUNCTION`
+were a bare text whose first byte equalled its length); a unit created with compilation errors answers with the warning flags of the call's ERROR message
+(ORA-17110 in ojdbc, no WARNING message: lib/oracle still reads one), is stored INVALID with its error after the source (USER_OBJECTS, USER_ERRORS /
+ALL_ERRORS, `ALTER ... COMPILE`, revalidated when a block names it, CALL of an invalid unit ORA-06575); a stored function that hits NO_DATA_FOUND in a query is
+NULL, one that raises ends the query with the unit's ORA-06512 lines; ROWNUM before aggregates, DISTINCT and ORDER BY of one table, and in UPDATE and DELETE;
+the REGEXP_ functions' position, occurrence, return option, match parameter (`RE_ORA`), subexpression, errors ORA-01428 / 01760 / 12725-12732; DROP SEQUENCE under
+a DEFAULT. Not done: ROWNUM over a join with aggregates, package variables and constants outside the package, TIMESTAMP WITH TIME ZONE's offset: plans in lexdb-robust.md.
