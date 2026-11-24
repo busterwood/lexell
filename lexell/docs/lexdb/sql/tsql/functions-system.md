@@ -118,7 +118,8 @@ HAS_PERMS_BY_NAME ( securable, class, permission )
 : The text of a view's or a procedure's `CREATE` statement.
 
 `OBJECTPROPERTY(id, property)`, `OBJECTPROPERTYEX(id, property)`
-: A property of an object: `IsTable`, `IsView`, `IsProcedure`, `TableHasPrimaryKey` and others.
+: A property of an object: `IsTable`, `IsView`, `IsProcedure`, `TableHasPrimaryKey`, `TableHasClustIndex`,
+  `TableHasUniqueCnst` and others.
 
 `COLUMNPROPERTY(id, column, property)`, `INDEXPROPERTY(id, index, property)`
 : A property of a column (`IsIdentity`, `AllowsNull`, `ColumnId`) or of an index.
@@ -444,6 +445,15 @@ SELECT COLUMNPROPERTY(OBJECT_ID('dbo.m1'), 'n', 'IsIdentity') AS identity_column
        COLUMNPROPERTY(OBJECT_ID('dbo.m1'), 'name', 'AllowsNull') AS name_nullable,
        COLUMNPROPERTY(OBJECT_ID('dbo.m1'), 'name', 'ColumnId') AS name_position;
 SELECT OBJECT_DEFINITION(OBJECT_ID('dbo.mv1')) AS definition;
+GO
+CREATE TABLE dbo.k1 (id int PRIMARY KEY, code varchar(5) UNIQUE);
+CREATE TABLE dbo.k2 (id int PRIMARY KEY NONCLUSTERED);
+CREATE TABLE dbo.k3 (a int, b int);
+GO
+SELECT OBJECT_NAME(object_id) AS tbl, OBJECTPROPERTY(object_id, 'TableHasPrimaryKey') AS has_pk,
+       OBJECTPROPERTY(object_id, 'TableHasClustIndex') AS has_clustered_index,
+       OBJECTPROPERTY(object_id, 'TableHasUniqueCnst') AS has_unique
+FROM sys.tables WHERE name IN ('k1', 'k2', 'k3') ORDER BY name;
 ```
 
 ```text
@@ -470,6 +480,14 @@ definition
 CREATE VIEW dbo.mv1 AS SELECT id FROM dbo.m1;
 
 (1 row affected)
+
+tbl has_pk has_clustered_index has_unique
+--- ------ ------------------- ----------
+k1  1      1                   1
+k2  1      0                   0
+k3  0      0                   0
+
+(3 rows affected)
 ```
 
 ### J. Names from ids, and types
