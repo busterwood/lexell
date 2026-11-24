@@ -38,6 +38,8 @@ END [ package ] ;
   variables. Reading or assigning a variable from outside does not raise it.
 - A package's members are called as `package.member`: `pay.give_bonus(1)`, `pay.total()`. Variables and constants
   declared in the specification are shared by the code that uses the package, and keep their values for the session.
+- A package whose specification declares no procedure or function needs no body: its variables and constants are used
+  as they are (example F).
 - `USER_OBJECTS` lists both as `PACKAGE` and `PACKAGE BODY`; `USER_SOURCE` has their text.
 
 ## Differences from Oracle
@@ -47,7 +49,10 @@ END [ package ] ;
   statement it runs. A statement sent by itself (`SELECT pay.g_count FROM dual`) is ORA-06553, as in Oracle
   (example D). Not supported: a package variable as an `INTO` target or an `OUT` argument from outside the package,
   and a variable of a record or collection type.
-- Collection types and nested subprograms are not supported, as elsewhere in PL/SQL.
+- A specification that declares procedures or functions needs its body: without it a call is PLS-00201 (Oracle:
+  ORA-04067).
+- Records, subtypes and exceptions declared in a package are not supported, with a body or without. Collection types and
+  nested subprograms are not supported, as elsewhere in PL/SQL.
 
 ## Examples
 
@@ -224,6 +229,48 @@ PAY         PACKAGE      VALID
 PAY         PACKAGE BODY VALID
 
 2 rows selected.
+```
+
+### F. A package with only a specification
+
+A package of variables and constants needs no body. A package that declares a procedure does:
+
+<!-- example: oracle -->
+```sql
+CREATE OR REPLACE PACKAGE cfg AS
+  c_rate CONSTANT NUMBER := 0.2;
+  g_hits NUMBER := 0;
+  g_name VARCHAR2(20) := 'none';
+END cfg;
+/
+BEGIN
+  cfg.g_hits := cfg.g_hits + 1;
+  cfg.g_name := 'main';
+  DBMS_OUTPUT.PUT_LINE(cfg.g_name || ' ' || cfg.g_hits || ' ' || cfg.c_rate);
+END;
+/
+CREATE OR REPLACE PACKAGE nobody_home AS
+  PROCEDURE p;
+END nobody_home;
+/
+BEGIN nobody_home.p; END;
+/
+```
+
+```text
+Package created.
+
+main 1 .2
+
+PL/SQL procedure successfully completed.
+
+Package created.
+
+ERROR:
+ORA-06550: line 1, column 7:
+PLS-00201: identifier 'NOBODY_HOME.P' must be declared
+ORA-06550: line 1, column 7:
+PL/SQL: Statement ignored
 ```
 
 ## See also
