@@ -1,7 +1,8 @@
 # Known issues
 
 Bugs and gaps found while writing and checking these pages (lexdb built from main at 4fba817b, 2026-11-23; the entries
-that main ca687450, a15b9a64, 02646472, 436468d8, 81ee25d1 and e689d814, 2026-11-24, fixed are removed or reworded to what is left). They are not fixed here: the pages
+that main ca687450, a15b9a64, 02646472, 436468d8, 81ee25d1, e689d814 and 7b6b1235, 2026-11-24, fixed are removed or
+reworded to what is left; the new pages and examples were checked against main 60c08a84). They are not fixed here: the pages
 describe what lexdb does. Each "Differences" section of the reference lists the
 smaller differences of its statement.
 
@@ -141,7 +142,12 @@ smaller differences of its statement.
   (`pg_stat_user_tables.n_live_tup` is right). `REINDEX` and `CLUSTER` are checked and do nothing; `VACUUM` (and
   `VACUUM FULL`) rewrites row-form leaves as column leaves and gives no space back.
 - **COPY:** `WITH (FORMAT binary)` is 0A000; once, after a COPY error at the end of a psql script, the session gave
-  no answer for 120 s (not narrowed down).
+  no answer for 120 s (not narrowed down). `ON_ERROR set_null` (PostgreSQL 19) is 0A000; `FORMAT json` is for `COPY TO`
+  only (`COPY FROM` with it is 22023, as in PostgreSQL); an option given twice is not refused.
+  - **An error in a `COPY ... FROM STDIN` statement's table or options is sent after the data.** PostgreSQL answers it
+    at once (an unknown table, `REJECT_LIMIT` without `ON_ERROR`, a bad option); lexdb has already asked the client
+    for data, so in a psql script the lines after the statement are taken as its data up to a line `\.`, and the
+    error shows only then (found checking the new COPY options on main 60c08a84, not fixed).
 - **Data types** (found writing the type pages):
   - **Bare integer constants are checked only in a select list:** integer-literal arithmetic there is 22003 (int4 and
     bigint), as in PostgreSQL (`SELECT 2147483647 + 1`). In `WHERE`, `ON`, `HAVING` and `ORDER BY` it is not checked
@@ -210,8 +216,11 @@ smaller differences of its statement.
   - `OPERATOR(pg_catalog.+)` is not taken; `@`, `|/`, `||/` and `!` do not exist.
   - `SELECT 'a' || 'b' LIKE 'a%'` names its column `like` (PostgreSQL: `?column?`).
 - **Catalog** (found writing the catalog pages):
-  - NOT NULL constraints have no rows in `pg_constraint` or `information_schema.table_constraints` (PostgreSQL 18:
-    contype `n`).
+  - NOT NULL constraints (named, in `pg_constraint` as contype `n`, and in `information_schema`) are there, and
+    `DROP CONSTRAINT` and `RENAME CONSTRAINT` act on them. What is left: psql's `\d+` shows no "Not-null constraints"
+    section (its query joins on `conkey[1]` and finds nothing; primary keys too, on main before); `CREATE TABLE ...
+    LIKE` is 42601; on a table without a primary key a column added later gets an `attnum` and a `conkey` one too
+    high.
   - `pg_rewrite` is empty, though a view's `pg_class.relhasrules` is t; `pg_depend` holds only column-to-sequence
     rows; `pg_opclass` is empty; `pg_am` lists `hash`, which `CREATE INDEX` refuses.
   - Identity sequences are in `pg_sequences` but not in `information_schema.sequences`.
@@ -362,6 +371,10 @@ smaller differences of its statement.
     `xp_msver` shows the real machine's processor count and memory.
 
 
+- **INFORMATION_SCHEMA lists `NOT NULL` columns as constraints** (found on main 60c08a84, not fixed; a side effect of
+  the PostgreSQL door's NOT NULL rows, main 7b6b1235): `TABLE_CONSTRAINTS` has a `CHECK` row named
+  `table_column_not_null` for each `NOT NULL` column and `CHECK_CONSTRAINTS` a clause `col IS NOT NULL`. SQL Server has
+  none, and the `sys` views of lexdb have none either.
 - **Data types, functions and catalog** (found writing the T-SQL phase 3 pages):
   - **Binary:** `0x00 = 0x0000` is false (SQL Server pads the shorter value); `CAST(0x41 AS bit)` is 50000; a
     `varbinary` variable in an expression (`@v + 0x43`) is 195; `HASHBYTES` does not exist.
@@ -410,6 +423,9 @@ smaller differences of its statement.
   replica. In Oracle the definition is a schema object that every session sees, and only the rows are private to a
   session.
 
+- **Prepared DML over Oracle's JDBC driver** (found on main 60c08a84; being fixed): a prepared `INSERT`, `UPDATE` or
+  `DELETE` fails on its second execution with ORA-01008 (not all variables bound). A `SELECT` runs again without
+  trouble.
 - **Queries and DML** (found writing the Oracle query pages):
   - `ROWNUM` in a join with an aggregate or `GROUP BY` limits the groups, not the rows grouped (`SELECT COUNT(*) FROM
     emp e, dept d WHERE e.dept_id = d.id AND ROWNUM < 3` is 4; Oracle: 2). With one table in `FROM` it works.
@@ -467,10 +483,15 @@ smaller differences of its statement.
     (a call is PLS-00201 without it); a function without parameters needs brackets in SQL (`SELECT f FROM dual` is ORA-00904); `CALL f()` of
     a function is PLS-00201; `TO_NUMBER('abc')` raises `VALUE_ERROR`, not `INVALID_NUMBER`; `LOCK TABLE` in a block,
     `GOTO`, `FORALL` and collections are refused.
-  - A stored function (a standalone one or a package's) called in a SQL statement inside a block is ORA-00904:
-    `SELECT f(x) INTO v FROM t`, the query of a cursor `FOR` loop and `EXECUTE IMMEDIATE 'SELECT f(x) FROM t' INTO v`
-    (found writing the PL/SQL pages, on main e689d814; not fixed). `v := f(x);` in the block, and the same `SELECT`
-    sent by itself, work.
+  - A stored function (a standalone one or a package's) works in the SQL of a block, a cursor, `EXECUTE IMMEDIATE`,
+    `INSERT ... SELECT`, `UPDATE`, `DELETE` and `CREATE TABLE AS` (fixed on main 7b6b1235). Still refused (the Oracle
+    door says ORA-03001, `unimplemented feature`; 0A000 inside): a `MERGE` that calls one; a function in a subquery
+    of a DML statement when the subquery reads the statement's own table or refers to its columns; a function whose
+    argument is an aggregate or another stored function's call (`f(SUM(x))`, `f(g(x))`). A view that calls one
+    cannot be created (ORA-00904; Oracle allows it).
+  - Annotations (`ANNOTATIONS (...)` on a table or column, `USER_ANNOTATIONS_USAGE`) are not supported (ORA-00900).
+  - `USER_CONSTRAINTS` does not list `NOT NULL` constraints (Oracle lists them as type `C` rows with the search
+    condition `"A" IS NOT NULL`).
 - **Functions** (found writing the Oracle function pages):
   - **Character:** `LENGTHB` and `SUBSTRB` count characters (`LENGTHB('€')` is 1); `LENGTH(DATE ...)` is 19;
     `TRIM('xy' FROM 'xyabc')` returns `abc` (Oracle ORA-30001); `SYS_GUID()` is text of 64 hex digits, not `RAW(16)`;
