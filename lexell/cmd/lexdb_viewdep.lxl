@@ -163,3 +163,40 @@ pub fn viewErrs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str, sn
     }
     return Ok(out)
 }
+
+// DROP TABLE k under views (the sixth bug slice), per door, as each product does: PostgreSQL refuses it (2BP01, the views in
+// its DETAIL) and its CASCADE drops the views (and the views over them); SQL Server drops the table unless a view made WITH
+// SCHEMABINDING reads it (3729), and a view over it fails when read (208); Oracle drops it, and a view over it has errors
+// (ORA-04063 when read, INVALID, ORA-00942 in USER_ERRORS). Such a view reads the table again once one of its name is made.
+// door: the session's (lexdb_priv.doorOf: "tds", "tns" or the PostgreSQL door's; DROP TABLE's statement does not say).
+pub fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, k: &str, door: &str): Result[Unit, DbErr] {
+    let deps = try lexdb_catalog.dependentViews(st, txn, k)
+    if len(deps) == 0 || door == "tns" || s.mdialect == lexdb_sql.MD_ORA { return Ok(Unit{}) }
+    if door == "tds" || s.mdialect == lexdb_sql.MD_TSQL {
+        for v in try lexdb_catalog.allViews(st, txn) {
+            if lexdb_base.hasStr(&deps, &v.name) && lexdb_sql.viewBound(&v.view) && lexdb_base.hasStr(&v.deps, k) {
+                return Err(err("TS3729", &("Cannot DROP TABLE '" + lexdb_sql.baseName(k) + "' because it is being referenced by object '" + lexdb_sql.baseName(&v.name) + "'.")))
+            }
+        }
+        return Ok(Unit{})
+    }
+    if s.cascade {
+        // (the views and their grants, as DROP VIEW ... CASCADE drops them)
+        for b in deps {
+            txn.del(lexdb_catalog.CATALOG, &b)
+            txn.del(lexdb_catalog.CATALOG, &(lexdb_catalog.ACL_PRE + lexdb_catalog.relObj(&b)))
+        }
+        return Ok(Unit{})
+    }
+    var detail: []str = []
+    for v in try lexdb_catalog.allViews(st, txn) {
+        if !lexdb_base.hasStr(&deps, &v.name) { continue }
+        var on = ""
+        if lexdb_base.hasStr(&v.deps, k) { on = "table " + lexdb_sql.shown(k) } else {
+            for d in v.deps { if len(on) == 0 && lexdb_base.hasStr(&deps, &d) { on = "view " + lexdb_sql.shown(&d) } }
+        }
+        append(mut &detail, "view " + lexdb_sql.shown(&v.name) + " depends on " + on)
+    }
+    return Err(lexdb_base.errDetail("2BP01", &("cannot drop table " + lexdb_sql.shown(k) + " because other objects depend on it"),
+                                    &strings.join(&detail, "\n"), "Use DROP ... CASCADE to drop the dependent objects too."))
+}
