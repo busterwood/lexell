@@ -89,6 +89,9 @@ constraint states mean.
 
 ## Differences from Oracle
 
+- **`DROP COLUMN` is refused while a view reads the table** (ORA-02449), whatever the column: lexdb keeps a view's
+  text. Oracle drops the column and marks a view that used it `INVALID`. Drop the view, change the table, and make
+  the view again.
 - **Not supported (ORA-03001):** `READ ONLY` and `READ WRITE`, and the other clauses of Oracle's `ALTER TABLE`
   (storage, partitions, `MOVE`, `SHRINK`, `ROW MOVEMENT`).
 - **Constraint states** are kept for `CHECK` and foreign key constraints only. `DISABLE` or `NOVALIDATE` of a

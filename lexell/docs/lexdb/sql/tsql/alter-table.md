@@ -78,6 +78,8 @@ ALTER TABLE { database_name.schema_name.table_name | schema_name.table_name | ta
 
 ## Differences from SQL Server
 
+- **`DROP COLUMN` is refused while a view reads the table** (error 50000: `lexdb keeps a view's text`), whatever the
+  column. SQL Server drops it. Drop the view, change the table, and make the view again.
 - One action per statement: several columns or constraints in one `ADD`, or `DROP COLUMN a, b`, give error 50000
   ("lexdb: ALTER TABLE takes ADD, DROP, ALTER COLUMN, VALIDATE CONSTRAINT, RENAME and SET SCHEMA").
 - **`ADD CONSTRAINT name DEFAULT value FOR column`** is error 102. Give the default when the column is made.
