@@ -782,6 +782,22 @@ fn tsqlStarts(w: &str): bool {
     }
 }
 
+fn tableHintErr(t: &Tok): lexdb_base.DbErr {
+    let w = if len(t.spell) > 0 { t.spell.clone() } else { strings.toUpperAscii(&t.text) }
+    return lexdb_base.err("TS1018", &("Incorrect syntax near '" + w + "'. If this is intended as a part of a table hint, A WITH keyword and parenthesis are now required. See SQL Server Books Online for proper syntax."))
+}
+
+// T-SQL: a statement that cannot start with the reserved word it starts with (SELECT 1 rule: rule after the SELECT, a statement
+// of its own) is SQL Server's 156 at the word, not 102 (e: the parser's error, at: where the statement starts).
+fn (p: &P) startErr(at: int, e: lexdb_base.DbErr): lexdb_base.DbErr {
+    if !p.tsql || e.state != "42601" || at >= len(p.toks) { return e }
+    let t = &p.toks[at]
+    if t.kind != T_IDENT || !lexdb_sql.tsqlReserved(&t.text) || tsqlStarts(&t.text) || e.msg != near(t).msg { return e }
+    // (after a table, HOLDLOCK is a table hint without WITH: 1018)
+    if t.text == "holdlock" { return tableHintErr(t) }
+    return lexdb_base.err("TS156", &("Incorrect syntax near the keyword '" + (if len(t.spell) > 0 { t.spell.clone() } else { t.text.clone() }) + "'."))
+}
+
 fn (p: mut &P) name(): Result[str, lexdb_base.DbErr] {
     let t = p.peek().clone()
     if t.kind == T_QIDENT || (t.kind == T_IDENT && !lexdb_sql.isReserved(&t.text)) {
@@ -3016,6 +3032,8 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
         try p.expectKw("exists")
         s.ifFlag = true
     }
+    // (SQL Server reads HOLDLOCK and INDEX there as a table hint without WITH: 1018)
+    if p.tsql && (p.isKw("holdlock") || p.isKw("index")) { return Err(tableHintErr(&p.peek())) }
     s.table = try p.rname()
     s.spell = p.spelled.clone()
     if p.ora && p.isKw("(") && p.colAnnotThenAs() {
@@ -4709,7 +4727,7 @@ fn (p: mut &P) select(): Result[Stmt, lexdb_base.DbErr] {
         var op = SET_EXCEPT
         if p.acceptKw("union") { op = SET_UNION } else { let x = p.acceptKw("except") }
         let all = p.setAll()
-        let rhs = try p.intersects(try p.setBranch())
+        let rhs = try p.intersects(try p.armBranch())
         lhs = setOf(op, all, lhs, rhs, p.md())
     }
     try p.orderLimit(mut &lhs)
@@ -4740,7 +4758,7 @@ fn (p: mut &P) intersects(first: Stmt): Result[Stmt, lexdb_base.DbErr] {
     var lhs = first
     while p.acceptKw("intersect") {
         let all = p.setAll()
-        let rhs = try p.setBranch()
+        let rhs = try p.armBranch()
         lhs = setOf(SET_INTERSECT, all, lhs, rhs, p.md())
     }
     return Ok(lhs)
@@ -4753,12 +4771,13 @@ fn (p: mut &P) intersects(first: Stmt): Result[Stmt, lexdb_base.DbErr] {
 fn (p: mut &P) parenSelect(): Result[Stmt, lexdb_base.DbErr] {
     var first = try p.setBranch()
     if p.isKw("union") || p.isKw("intersect") || p.isKw("except") {
+        try p.armOrder(&first)
         var lhs = try p.intersects(first)
         while p.isKw("union") || p.isKw("except") {
             var op = SET_EXCEPT
             if p.acceptKw("union") { op = SET_UNION } else { let x = p.acceptKw("except") }
             let all = p.setAll()
-            let rhs = try p.intersects(try p.setBranch())
+            let rhs = try p.intersects(try p.armBranch())
             lhs = setOf(op, all, lhs, rhs, p.md())
         }
         try p.orderLimit(mut &lhs)
@@ -5131,6 +5150,19 @@ fn (p: mut &P) valuesQuery(): Result[Stmt, lexdb_base.DbErr] {
 
 // One query of a UNION (and the like): SELECT ..., VALUES ..., or one in
 // parentheses with its own ORDER BY and LIMIT.
+// An operand of UNION, INTERSECT or EXCEPT after the first (setBranch), its ORDER BY checked (armOrder).
+fn (p: mut &P) armBranch(): Result[Stmt, lexdb_base.DbErr] {
+    let b = try p.setBranch()
+    try p.armOrder(&b)
+    return Ok(b)
+}
+
+// SQL Server: an operand of a set operation in parentheses has no ORDER BY of its own (156 at ORDER; TOP or not).
+fn (p: &P) armOrder(b: &Stmt): Result[Unit, lexdb_base.DbErr] {
+    if p.tsql && b.setop == 0 && len(b.order) > 0 { return Err(lexdb_base.err("TS156", "Incorrect syntax near the keyword 'ORDER'.")) }
+    return Ok(Unit{})
+}
+
 fn (p: mut &P) setBranch(): Result[Stmt, lexdb_base.DbErr] {
     var b = lexdb_sql.newStmt(S_SELECT)
     if p.acceptKw("values") {
@@ -9025,7 +9057,11 @@ pub fn (q: mut &Parser) variable(t: &Tok): Result[Expr, lexdb_base.DbErr] { retu
 // One of lexdb's statements, whole.
 pub fn (q: mut &Parser) statement(): Result[Stmt, lexdb_base.DbErr] {
     q.p.fresh()
-    var s = try q.p.statement()
+    let at = q.p.pos
+    var s = match q.p.statement() {
+        Ok(x) { x }
+        Err(e) { return Err(q.p.startErr(at, e)) }
+    }
     q.p.finish(mut &s)
     return Ok(s)
 }
