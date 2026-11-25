@@ -271,7 +271,7 @@ Cannot create assertion 'too_many': its query is not supported: aggregates, GROU
 Msg 50000, Level 16, State 1, Line 1
 Cannot create assertion 'recent': its query is not supported: a function whose value the rows do not decide (the time, the user, random values, a sequence).
 Msg 156, Level 15, State 1, Line 1
-Incorrect syntax near the keyword 'not'.
+Incorrect syntax near the keyword 'NOT'.
 ```
 
 ### E. The INFORMATION_SCHEMA rows
@@ -292,9 +292,9 @@ SELECT OBJECT_ID('sal_pos') AS id;
 ```text
 CONSTRAINT_SCHEMA CONSTRAINT_NAME    IS_DEFERRABLE INITIALLY_DEFERRED
 ----------------- ------------------ ------------- ------------------
-public            order_has_customer YES           YES
-public            qty_ok             YES           NO
-public            sal_pos            NO            NO
+dbo               order_has_customer YES           YES
+dbo               qty_ok             YES           NO
+dbo               sal_pos            NO            NO
 
 (3 rows affected)
 

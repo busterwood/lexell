@@ -446,7 +446,8 @@ differences of its statement.
     works (SQL Server has none).
   - **Catalog:** `sys.index_columns` omits the `INCLUDE` columns of an index; `sys.server_principals` does not list
     `sa`; `sys.dm_exec_sessions` is one recorded row; `INFORMATION_SCHEMA` shows `dbo` (`SCHEMATA` lists `dbo`, owned by
-    `dbo`, and no `guest`), but `ROUTINES` and `PARAMETERS` have no T-SQL procedures or functions,
+    `dbo`, and the schemas made with `CREATE SCHEMA` owned by their creator, `sa` (SQL Server: `dbo`); it also lists
+    PostgreSQL's `information_schema` and `pg_catalog`, and has no `guest`, `sys` or `db_*`), but `ROUTINES` and `PARAMETERS` have no T-SQL procedures or functions,
     `CONSTRAINT_COLUMN_USAGE` gives a foreign key's referenced column and not the key's own (`p3.id` for `fk3`, where
     SQL Server lists `c3.pid`), and `INFORMATION_SCHEMA.VIEW_TABLE_USAGE`, `DOMAINS`, `COLUMN_PRIVILEGES` and
     `VIEW_COLUMN_USAGE` do not exist; `sys.database_role_members`, `sys.partitions` and `sys.dm_exec_requests` do
