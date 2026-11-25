@@ -1,0 +1,136 @@
+// lexdb_graph (design/lexdb-new-features.md O22, section 13): each GRAPH_TABLE query of the Oracle door against the join written by
+// hand that it stands for, on a graph of 2,000 people, 60 companies, 6,050 knows edges (NULL ends, self-edges) and 1,500 works_at edges:
+// one hop, two hops, a {1,3} path, an edge without a direction, any edge table, aggregates of a quantified edge, an element's WHERE with
+// IS LABELED, GRAPH_TABLE joined with a table and grouped, two path patterns sharing a vertex, a label disjunction, an outer join to
+// GRAPH_TABLE, a bind. Each pair runs with batches on and off: the four answers (rows sorted) must be one.
+// expect: pair 1: 5922 rows, the same
+// expect: pair 2: 1795 rows, the same
+// expect: pair 3: 3856 rows, the same
+// expect: pair 4: 1780 rows, the same
+// expect: pair 5: 7422 rows, the same
+// expect: pair 6: 1344 rows, the same
+// expect: pair 7: 754 rows, the same
+// expect: pair 8: 45 rows, the same
+// expect: pair 9: 5897 rows, the same
+// expect: pair 10: 2060 rows, the same
+// expect: pair 11: 1500 rows, the same
+// expect: pair 12: 2 rows, the same
+import "strings"
+import "collections"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_parse"
+import "../../../cmd/lexdb_sql"
+
+type Val = lexdb_sql.Val
+
+// A result's rows as text, sorted, and their count; or the error's state.
+fn render(r: &lexdb_exec.Res, s: &lexdb_exec.Session, n: mut &int): str {
+    var lines: []str = []
+    for row in r.rows {
+        var cells: []str = []
+        for i in 0..len(row) { append(mut &cells, if lexdb_ops.isNull(&row[i]) { "NULL" } else { s.text(&row[i], r.cols[i].oid) }) }
+        append(mut &lines, strings.join(&cells, "|"))
+    }
+    collections.sort(mut &lines)
+    let old = replace(n, len(lines))
+    return strings.join(&lines, "\n")
+}
+
+fn run(s: mut &lexdb_exec.Session, sql: &str, ora: bool, params: &[]Val, n: mut &int): str {
+    if !ora {
+        match s.exec(sql) {
+            Ok(rs) { return "ok" }
+            Err(e) { return "ERROR " + e.state + " " + e.msg }
+        }
+    }
+    match lexdb_parse.oraParse(sql) {
+        Ok(stmts) {
+            var out = ""
+            for st in stmts {
+                match s.run(&st, params, &[]) {
+                    Ok(r) { out = render(&r, s, n) }
+                    Err(e) { return "ERROR " + e.state + " " + e.msg }
+                }
+            }
+            return out
+        }
+        Err(e) { return "PARSE " + e.state + " " + e.msg }
+    }
+}
+
+fn pair(s: mut &lexdb_exec.Session, k: int, gt: &str, join: &str, params: &[]Val) {
+    var n = 0
+    var m = 0
+    let a = run(s, gt, true, params, mut &n)
+    let b = run(s, join, true, params, mut &m)
+    let x = run(s, &"set lexdb_batch = off", false, &[], mut &m)
+    let c = run(s, gt, true, params, mut &m)
+    let d = run(s, join, true, params, mut &m)
+    let y = run(s, &"set lexdb_batch = on", false, &[], mut &m)
+    if a == b && a == c && a == d && !strings.startsWith(&a, &"ERROR") {
+        println("pair " + k.toStr() + ": " + n.toStr() + " rows, the same")
+        return
+    }
+    println("pair " + k.toStr() + ": DIFFERENT")
+    for z in [a, b, c, d] { println("  " + z[0..min(len(z), 300)]) }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(97), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 4 * 1024 * 1024, snapNodes: 200000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+        var n = 0
+        let setup = [
+            "create table person (id int primary key, name text, age int, city text)",
+            "insert into person select g, 'p' || g, case when g % 7 = 0 then null else 20 + g % 50 end, case when g % 5 = 0 then null else 'c' || (g % 13) end from generate_series(1, 2000) g",
+            "create table company (id int primary key, name text)",
+            "insert into company select g, 'co' || g from generate_series(1, 60) g",
+            "create table knows (id int primary key, src int, dst int, since int)",
+            "insert into knows select g, case when g % 97 = 0 then null else 1 + (g * 7919) % 2000 end, case when g % 89 = 0 then null else 1 + (g * 104729 + g / 3) % 2000 end, 2000 + g % 25 from generate_series(1, 6000) g",
+            "insert into knows select 6000 + g, g * 10, g * 10, 1999 from generate_series(1, 50) g",
+            "create table works_at (pid int, cid int, role text, primary key (pid, cid))",
+            "insert into works_at select g, 1 + g % 60, case when g % 3 = 0 then 'dev' else 'ops' end from generate_series(1, 2000) g where g % 4 <> 0",
+            "analyze",
+        ]
+        for x in setup {
+            let r = run(mut &s, &x, false, &[], mut &n)
+            if r != "ok" { println("setup: " + r) }
+        }
+        s.setDoor(&"tns")
+        let g = run(mut &s, &"create property graph g vertex tables (person, company) edge tables (knows source key (src) references person (id) destination key (dst) references person (id), works_at source key (pid) references person (id) destination key (cid) references company (id))", true, &[], mut &n)
+        if strings.startsWith(&g, &"ERROR") { println("graph: " + g) }
+        pair(mut &s, 1, &"select * from graph_table (g match (a is person) -[e is knows]-> (b is person) columns (a.id as a, b.id as b, e.since as s))",
+             &"select a.id a, b.id b, e.since s from person a, knows e, person b where e.src = a.id and e.dst = b.id", &[])
+        pair(mut &s, 2, &"select * from graph_table (g match (a is person) -[e is knows]-> (b is person) -[f is knows]-> (c is person) where a.id < 200 columns (a.id as a, c.id as c))",
+             &"select a.id a, c.id c from person a, knows e, person b, knows f, person c where e.src = a.id and e.dst = b.id and f.src = b.id and f.dst = c.id and a.id < 200", &[])
+        pair(mut &s, 3, &"select * from graph_table (g match (a is person) -[e is knows]->{1,3} (b is person) where a.id < 100 columns (a.id as a, b.id as b))",
+             &("select a.id a, b.id b from person a, knows e, person b where e.src = a.id and e.dst = b.id and a.id < 100 union all " +
+               "select a.id, b.id from person a, knows e1, person x, knows e2, person b where e1.src = a.id and e1.dst = x.id and e2.src = x.id and e2.dst = b.id and a.id < 100 union all " +
+               "select a.id, b.id from person a, knows e1, person x, knows e2, person y, knows e3, person b where e1.src = a.id and e1.dst = x.id and e2.src = x.id and e2.dst = y.id and e3.src = y.id and e3.dst = b.id and a.id < 100"), &[])
+        pair(mut &s, 4, &"select * from graph_table (g match (a is person) -[e is knows]- (b is person) where a.id < 300 columns (a.id as a, b.id as b, e.id as e))",
+             &("select a.id a, b.id b, e.id e from person a, knows e, person b where e.src = a.id and e.dst = b.id and a.id < 300 union all " +
+               "select a.id, b.id, e.id from person a, knows e, person b where e.dst = a.id and e.src = b.id and a.id < 300 and a.id <> b.id"), &[])
+        pair(mut &s, 5, &"select * from graph_table (g match (a) -[e]-> (b) columns (a.id as a, b.name as bn))",
+             &("select a.id a, b.name bn from person a, knows e, person b where e.src = a.id and e.dst = b.id union all " +
+               "select a.id, b.name from person a, works_at e, company b where e.pid = a.id and e.cid = b.id"), &[])
+        pair(mut &s, 6, &"select * from graph_table (g match (a is person) -[e is knows]->{2} (b) where a.id < 150 columns (a.id as a, b.id as b, sum(e.since) as s, count(e.since) as c, max(e.id) as m))",
+             &("select a.id a, b.id b, e1.since + e2.since s, 2 c, greatest(e1.id, e2.id) m from person a, knows e1, person x, knows e2, person b " +
+               "where e1.src = a.id and e1.dst = x.id and e2.src = x.id and e2.dst = b.id and a.id < 150"), &[])
+        pair(mut &s, 7, &"select * from graph_table (g match (a is person where a.age > 40) -[e]-> (b) where b is labeled company columns (a.id as a, b.id as b, e.role as r))",
+             &"select a.id a, b.id b, e.role r from person a, works_at e, company b where e.pid = a.id and e.cid = b.id and a.age > 40", &[])
+        pair(mut &s, 8, &"select c.name, count(*) n from graph_table (g match (a is person) -[e is works_at]-> (c is company) columns (c.id as cid)) x join company c on c.id = x.cid group by c.name",
+             &"select c.name, count(*) n from works_at e join person a on a.id = e.pid join company c on c.id = e.cid group by c.name", &[])
+        pair(mut &s, 9, &"select * from graph_table (g match (a is person) -[e is knows]-> (b), (b) -[f is works_at]-> (c) columns (a.id as a, c.name as c))",
+             &"select a.id a, c.name c from person a, knows e, person b, works_at f, company c where e.src = a.id and e.dst = b.id and f.pid = b.id and f.cid = c.id", &[])
+        pair(mut &s, 10, &"select * from graph_table (g match (x is person|company) columns (x.id as i, x.name as n, x.age as a))",
+             &"select id i, name n, age a from person union all select id, name, null from company", &[])
+        pair(mut &s, 11, &"select p.id from person p left join graph_table (g match (a is person) -[e is works_at]-> (b) where e.role = 'dev' columns (a.id as a)) x on x.a = p.id where x.a is null",
+             &"select p.id from person p where not exists (select 1 from works_at e join company b on b.id = e.cid where e.pid = p.id and e.role = 'dev')", &[])
+        pair(mut &s, 12, &"select * from graph_table (g match (a is person) -[e is knows]-> (b is person) where a.id = :1 columns (a.id as a, b.id as b))",
+             &"select a.id a, b.id b from person a, knows e, person b where e.src = a.id and e.dst = b.id and a.id = :1", &[Val.Int(7)])
+        return 0
+    })
+}
