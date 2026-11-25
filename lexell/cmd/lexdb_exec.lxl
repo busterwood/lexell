@@ -1413,6 +1413,9 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 }
                 viewSrc = len(subs) + len(views)
                 sp.view = Some(lexdb_plan.ViewSrc{stmt: vs, owner: vowner, rn: t.rn.clone()})  // for the planner's pushdown (optimizer 48.3)
+                if !strings.startsWith(&t.view, SEQ_REL) && len(sc.works) == 0 && selPure(&sp.sel) {
+                    sp.viewKey = t.name.toStr()
+                }
                 append(mut &views, sp)
                 t = rc(vt)
             } else if len(f.cols) > 0 {
@@ -2667,7 +2670,7 @@ fn planSubIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     let oid = if s.use == lexdb_sql.SUB_EXISTS || len(sel.outs) == 0 { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
     let name = if s.use == lexdb_sql.SUB_EXISTS { "exists" } else if s.use == lexdb_sql.SUB_SCALAR { sel.outs[0].name.clone() } else { "?column?" }
     // (in FROM: its columns are its outs)
-    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte, kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None, lat: [], need: if s.use == lexdb_sql.SUB_FROM && s.cteOnce && sel.rec >= 0 { -2 } else { -1 }}
+    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte, kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None, lat: [], need: if s.use == lexdb_sql.SUB_FROM && s.cteOnce && sel.rec >= 0 { -2 } else { -1 }, viewKey: ""}
     // res: a semi-join's alternative (buildQuery), which may keep correlated
     // filters that are not keys as residuals (SubPlan.res) for its level to
     // check. Any other hashed subquery must not: nothing else reads them.
@@ -2856,13 +2859,92 @@ fn mergeStats(a: mut &[]SubStat, b: &[]SubStat) {
     }
 }
 
+// Whether an expression has no volatile, side-effecting, or user function calls.
+fn exprPure(x: &Expr): bool {
+    match x {
+        Expr.Call(n, args, _) {
+            if n == "#udf" || n == "#plf" || lexdb_bind.isSeqFn(&n) || lexdb_bind.isAdvFn(&n) ||
+               n == "gen_random_uuid" || n == "random" || n == "setseed" || n == "clock_timestamp" || lexdb_bind.newVolatile(&n) { return false }
+            for a in args { if !exprPure(&a) { return false } }
+            return true
+        }
+        Expr.Unary(_, a) { return exprPure(&a) }
+        Expr.Bin(_, a, b) { return exprPure(&a) && exprPure(&b) }
+        Expr.IsNull(a, _) { return exprPure(&a) }
+        Expr.Cast(a, _) { return exprPure(&a) }
+        else { return true }
+    }
+}
+
+fn exprsPure(xs: &[]Expr): bool {
+    for x in xs { if !exprPure(&x) { return false } }
+    return true
+}
+
+// Whether sel is deterministic and side-effect free within one read-only statement
+// (safe to cache a view's rows across multiple unmodified references).
+fn selPure(sel: &Sel): bool {
+    if len(sel.q.refs) > 0 || len(sel.locks) > 0 || len(sel.srf) > 0 || sel.rec >= 0 || len(sel.wins) > 0 || len(sel.mr) > 0 || len(sel.feedback) > 0 { return false }
+    for lv in sel.q.levels {
+        if lv.work >= 0 || !exprsPure(&lv.cond) || !exprsPure(&lv.post) || !exprsPure(&lv.local) { return false }
+    }
+    if !exprsPure(&sel.q.top) || !exprsPure(&sel.exprs) || !exprsPure(&sel.groupBy) || !exprsPure(&sel.order) { return false }
+    match sel.having {
+        Some(h) { if !exprPure(&h) { return false } }
+        None {}
+    }
+    for sp in sel.specs {
+        if !exprsPure(&sp.args) { return false }
+        match sp.filter {
+            Some(f) { if !exprPure(&f) { return false } }
+            None {}
+        }
+    }
+    for sp in sel.q.subs { if !selPure(&sp.sel) { return false } }
+    for p in sel.parts { if !selPure(&p) { return false } }
+    return true
+}
+
+fn countViews(sel: &Sel, counts: mut &Map[str, int]) {
+    for sp in sel.q.subs {
+        if len(sp.viewKey) > 0 {
+            let n = counts.get(&sp.viewKey).unwrapOr(0) + 1
+            counts.put(sp.viewKey.toStr(), n)
+            if n == 1 { countViews(&sp.sel, counts) }
+        } else {
+            countViews(&sp.sel, counts)
+        }
+    }
+    for p in sel.parts { countViews(&p, counts) }
+}
+
+fn dropSingleViews(sel: mut &Sel, counts: &Map[str, int]) {
+    for i in 0..len(sel.q.subs) {
+        if len(sel.q.subs[i].viewKey) > 0 && counts.get(&sel.q.subs[i].viewKey).unwrapOr(0) < 2 {
+            sel.q.subs[i].viewKey = ""
+        }
+        dropSingleViews(mut &sel.q.subs[i].sel, counts)
+    }
+    for i in 0..len(sel.parts) { dropSingleViews(mut &sel.parts[i], counts) }
+}
+
+// Clear viewKey on views referenced only once in the final plan (avoid extra copy & memory).
+fn pruneViews(sel: mut &Sel) {
+    if len(sel.q.subs) == 0 && len(sel.parts) == 0 { return }
+    var counts: Map[str, int] = newMap()
+    countViews(sel, mut &counts)
+    dropSingleViews(sel, &counts)
+}
+
 // A subquery in FROM: its rows.
 fn runFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, params: &[]Val, parent: mut &Run,
            i: int): Result[SubRes, DbErr] {
     var out = emptyRes()
-    // a CTE: run once in the statement, its rows kept for its other uses
-    let key = "c" + sp.cte.toStr()
-    if sp.cte >= 0 {
+    // a CTE: run once in the statement, its rows kept for its other uses;
+    // a pure unmodified view used more than once in a read-only statement: the same
+    let isView = sp.cte < 0 && len(sp.viewKey) > 0 && !parent.writes && !txn.noting()
+    let key = if sp.cte >= 0 { "c" + sp.cte.toStr() } else if isView { "v:" + sp.viewKey } else { "" }
+    if len(key) > 0 {
         let at = cacheAt(&parent.cache, &key)
         if at >= 0 {
             out.data = copyRows(&parent.cache.rows[at])
@@ -2877,6 +2959,12 @@ fn runFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, para
     if sp.cte >= 0 {
         try parent.bud.hold(lexdb_pipe.rowsBytes(&out.data))
         cachePut(mut &parent.cache, key, copyRows(&out.data))
+    } else if isView {
+        let nb = lexdb_pipe.rowsBytes(&out.data)
+        if parent.bud.maxHeld <= 0 || parent.bud.held + parent.bud.aside + nb <= parent.bud.maxHeld {
+            try parent.bud.hold(nb)
+            cachePut(mut &parent.cache, key, copyRows(&out.data))
+        }
     }
     return Ok(out)
 }
@@ -8668,6 +8756,7 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     var sc = newScopeIn(st, txn, params, ptypes)
     sc.noLp = true
     var sel = try planSelect(st, txn, s, params, mut &sc)
+    pruneViews(mut &sel)
     bindSel(mut &sel)
     pipeSel(mut &sel)
     let looks = replace(mut &sc.looks, [])
@@ -11486,6 +11575,7 @@ fn selectWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
               lim: Limits, analyze: bool, plan: mut &[]str): Result[Res, DbErr] {
     var sc = newScopeIn(st, txn, params, ptypes)
     var sel = try planSelect(st, txn, s, params, mut &sc)
+    pruneViews(mut &sel)
     bindSel(mut &sel)
     pipeSel(mut &sel)
     var rs = newRun(&sel.q)

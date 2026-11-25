@@ -1388,8 +1388,10 @@ pub fn lazyOf(bp: &BPlan, t: &lexdb_catalog.Table, conds: &[]BNode, extra: int):
     bf.stopAt = 0
     for pl in 0..len(bf.placeCol) { if bf.placeCol[pl] >= 0 { bf.stopAt = pl + 1 } }
     let br = placesOnly(bp, &rest)
-    // the first conditions in order (the raw ones aside) that run on a
-    // column leaf's bytes, and the places the others read
+    // the conditions (the raw ones aside) that run on a column leaf's bytes,
+    // and the places the others read. Stopping on a condition that may error
+    // preserves left-to-right error semantics; error-free non-kernel conditions
+    // may be skipped so later kernels still run on the leaf's bytes.
     var kern: []lexdb_leafk.LeafK = []
     var skipK = collections.copyOf(&skip)
     for ci in 0..len(conds) {
@@ -1399,7 +1401,7 @@ pub fn lazyOf(bp: &BPlan, t: &lexdb_catalog.Table, conds: &[]BNode, extra: int):
                 append(mut &kern, k)
                 skipK[ci] = true
             }
-            None { break }
+            None { if !bNoErr(&conds[ci], t) { break } }
         }
     }
     var usedK: []bool = array(nc, false)
@@ -1412,6 +1414,71 @@ pub fn lazyOf(bp: &BPlan, t: &lexdb_catalog.Table, conds: &[]BNode, extra: int):
     }
     return Lazy{on: ((len(first) > 0 || len(raw) > 0) && len(rest) > 0) || len(kern) > 0, first: first, rest: rest, raw: raw, rawPl: rawPl,
                 pieces: pieces, skip: skip, bf: bf, br: br, kern: lexdb_leafk.merged(kern), firstK: firstK, restK: restK, skipK: skipK}
+}
+
+// Whether evaluating n cannot raise a runtime error (safe to run a later
+// leaf kernel before n without hiding an error n would have raised).
+fn bNoErr(n: &BNode, t: &lexdb_catalog.Table): bool {
+    match n {
+        BNode.Const(_, _) { return true }
+        BNode.Col(_) { return true }
+        BNode.Not(a) { return bNoErr(&a, t) }
+        BNode.IsNull(a, _) { return bNoErr(&a, t) }
+        BNode.And(a, b) { return bNoErr(&a, t) && bNoErr(&b, t) }
+        BNode.Or(a, b) { return bNoErr(&a, t) && bNoErr(&b, t) }
+        BNode.Cmp(_, a, b) { return bNoErr(&a, t) && bNoErr(&b, t) }
+        BNode.DCmp(_, a, _, b, _) { return bNoErr(&a, t) && bNoErr(&b, t) }
+        BNode.Like(_, _) { return true }
+        BNode.InInts(_, _, _) { return true }
+        BNode.ValCmp(_, c, k, _, _) { return lexdb_ops.isNull(&k) || t.cols[c].typ.kind == lexdb_ops.kindOf(&k) }
+        BNode.VCmp(_, a, b, _, _) { return t.cols[a].typ.kind == t.cols[b].typ.kind }
+        else { return false }
+    }
+}
+
+// A units place at scale sc (value u * 10^(-sc)) compared with decimal d
+// (of any scale): a range of units. None if d's scaled units overflow int.
+fn numVsUnits(op: int, pl: int, sc: int, d: &Decimal): Option[lexdb_leafk.LeafK] {
+    let pk = lexdb_rows.PK_NUM
+    let c = d.coefficient()
+    if c == u128(0) { return Some(lexdb_leafk.words(op, pl, pk, sc, 0)) }
+    let neg = d.isNeg()
+    let sh = d.exponent() + sc
+    if sh >= 0 {
+        if sh > lexdb_rows.DEC_MAX_P { return None }
+        let p = lexdb_rows.pow10i(sh)
+        let lim = u128(0x7ffffffffffffffe) / u128(p)
+        if c > lim { return None }
+        let u = int(c) * p
+        return Some(lexdb_leafk.words(op, pl, pk, sc, if neg { -u } else { u }))
+    }
+    let k = -sh
+    var fl = 0
+    var exact = false
+    if k > 38 {
+        // every u128 coefficient has < 39 digits, so 0 < |d * 10^sc| < 1
+        fl = if neg { -1 } else { 0 }
+    } else {
+        var p = u128(1)
+        for i in 0..k { p *= u128(10) }
+        let q = c / p
+        let rem = c % p
+        if q > u128(0x7ffffffffffffffe) { return None }
+        let qi = int(q)
+        if rem == u128(0) {
+            exact = true
+            fl = if neg { -qi } else { qi }
+        } else {
+            fl = if neg { -(qi + 1) } else { qi }
+        }
+    }
+    if exact { return Some(lexdb_leafk.words(op, pl, pk, sc, fl)) }
+    let lo = lexdb_leafk.MIN_W
+    let hi = lexdb_leafk.MAX_W
+    if op == 0 { return Some(lexdb_leafk.LeafK.Range(pl, pk, sc, 0, -1)) }
+    if op == 1 { return Some(lexdb_leafk.LeafK.Range(pl, pk, sc, lo, hi)) }
+    if op == 2 || op == 3 { return Some(lexdb_leafk.LeafK.Range(pl, pk, sc, lo, fl)) }
+    return Some(lexdb_leafk.LeafK.Range(pl, pk, sc, fl + 1, hi))
 }
 
 // A date place's days d against timestamp u as compare orders them (d's
@@ -1488,7 +1555,8 @@ fn leafKOf(n: &BNode, bp: &BPlan, t: &lexdb_catalog.Table): Option[lexdb_leafk.L
                 }
                 else {}
             }
-            if c < 0 || !lexdb_rows.isDecKind(bp.kinds[c]) || lexdb_rows.decScale(bp.kinds[c]) != sc || sk > sc { return None }
+            if c < 0 || !lexdb_rows.isDecKind(bp.kinds[c]) || lexdb_rows.decScale(bp.kinds[c]) != sc { return None }
+            if sk > sc { return numVsUnits(o, plOf(c), sc, &Decimal.fromUnits(k, sk)) }
             match k.checkedMul(lexdb_rows.pow10i(sc - sk)) {
                 Some(u) { return Some(lexdb_leafk.words(o, plOf(c), lexdb_rows.PK_NUM, sc, u)) }
                 None { return None }
@@ -1510,6 +1578,22 @@ fn leafKOf(n: &BNode, bp: &BPlan, t: &lexdb_catalog.Table): Option[lexdb_leafk.L
                 Val.Tstz(u) { if ck == lexdb_rows.PK_TSTZ { return Some(lexdb_leafk.words(op, pl, ck, -1, u)) } }
                 Val.Time(u) { if ck == lexdb_rows.PK_TIME { return Some(lexdb_leafk.words(op, pl, ck, -1, u)) } }
                 Val.Text(x) { if ck == lexdb_rows.PK_TEXT { return Some(lexdb_leafk.LeafK.Texts(op, pl, [x.clone()])) } }
+                Val.Num(d) {
+                    if ck == lexdb_rows.PK_NUM {
+                        let ct = t.cols[c].typ
+                        if ct.oid == lexdb_sql.OID_NUMERIC && ct.prec > 0 && ct.prec <= lexdb_rows.DEC_MAX_P && ct.scale >= 0 && ct.scale <= ct.prec {
+                            return numVsUnits(op, pl, ct.scale, &d)
+                        }
+                    }
+                }
+                Val.Int(i) {
+                    if ck == lexdb_rows.PK_NUM {
+                        let ct = t.cols[c].typ
+                        if ct.oid == lexdb_sql.OID_NUMERIC && ct.prec > 0 && ct.prec <= lexdb_rows.DEC_MAX_P && ct.scale >= 0 && ct.scale <= ct.prec {
+                            return numVsUnits(op, pl, ct.scale, &Decimal.fromInt(i))
+                        }
+                    }
+                }
                 else {}
             }
             return None
@@ -3697,6 +3781,37 @@ fn aggRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PSc
     return aggRows(st, txn, sc, conds, a, cols, t, src, hrows, cx, room, bud, cnt, give)
 }
 
+// Whether x calls a volatile or user function (cannot be re-evaluated if a
+// units-mode batch run spills and retries).
+fn bxVolatile(x: &BX): bool {
+    match x {
+        BX.Call(fr, cs) {
+            let n = &fr.name
+            if n == "#udf" || n == "#plf" || lexdb_bind.isSeqFn(n) || lexdb_bind.isAdvFn(n) ||
+               n == "gen_random_uuid" || n == "random" || n == "setseed" || n == "clock_timestamp" || lexdb_bind.newVolatile(n) { return true }
+            for c in cs { if bxVolatile(&c) { return true } }
+            return false
+        }
+        BX.Un(_, a) { return bxVolatile(&a) }
+        BX.And(a, b) { return bxVolatile(&a) || bxVolatile(&b) }
+        BX.Or(a, b) { return bxVolatile(&a) || bxVolatile(&b) }
+        BX.Op(_, a, b) { return bxVolatile(&a) || bxVolatile(&b) }
+        BX.Cat(a, b, _) { return bxVolatile(&a) || bxVolatile(&b) }
+        BX.IsNull(a, _) { return bxVolatile(&a) }
+        BX.Cast(a, _) { return bxVolatile(&a) }
+        BX.Case(cs, _) {
+            for c in cs { if bxVolatile(&c) { return true } }
+            return false
+        }
+        BX.Try(a) { return bxVolatile(&a) }
+        BX.Sub(_, _, xs) {
+            for c in xs { if bxVolatile(&c) { return true } }
+            return false
+        }
+        else { return false }
+    }
+}
+
 // The aggregate over the scan's batches; dec: numeric(p, s) columns as
 // units (usedDec set when one is read so). None: the batches give way
 // (nothing given).
@@ -3712,11 +3827,11 @@ fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan
     // the conditions, the group keys and the calls over batches
     var bconds: []BNode = []
     for c in conds {
-        let got = bCompileD(&c, cols, &kinds, cx, 0, dec)
-        if got.isNone() { return Ok(None) }
-        let cc = got.unwrap()
-        if !boolLike(cc.typ) { return Ok(None) }
-        append(mut &bconds, takeN(cc))
+        if bxVolatile(&c) { return Ok(None) }
+        match condNodeD(&c, cols, &kinds, cx, 0, &needCol, dec) {
+            Some(n) { append(mut &bconds, n) }
+            None { return Ok(None) }
+        }
     }
     var ag = match aggSets(a, cols, &kinds, &needCol, cx, dec, room, bud.maxHeld) {
         Some(x) { x }
