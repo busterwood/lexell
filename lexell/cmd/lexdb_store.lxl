@@ -176,6 +176,8 @@ pub type Db = record {
     hist: [][]Hist              // per slot
     histCount: int
     histSlots: []int            // the slots with old versions
+    histAdded: int              // old versions added since the last prune
+    pruneMinSnap: int           // oldest live snapshot seq at the last prune (-1 none)
     deferred: []Deferred        // slots freed while a snapshot may reach them
     rootHist: []RootChange      // root changes a snapshot may still need
     lateRoots: int              // root changes a live snapshot saw at its own commit (setRoot, snapRoot)
@@ -842,47 +844,129 @@ fn (db: mut &Db) willChange(s: int) {
         }
         append(mut &db.hist[s], Hist{since: db.meta[s].since, until: db.seq, node: copyNode(&db.pool[db.meta[s].frame])})
         db.histCount += 1
+        db.histAdded += 1
     }
     db.meta[s].since = db.seq
+}
+
+// Whether an old version covering [since, until) is still needed by durableSeq
+// or any snapshot in live (sorted when len(live) > 8, bounded by [minL, maxL]).
+fn snapNeeds(live: &[]int, minL: int, maxL: int, since: int, until: int, durable: int): bool {
+    if until > durable { return true }
+    let n = len(live)
+    if n == 0 || until <= minL || since > maxL { return false }
+    if n == 1 { return since <= minL && minL < until }
+    if n <= 8 {
+        for q in live { if since <= q && q < until { return true } }
+        return false
+    }
+    var lo = 0
+    var hi = n
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if live[mid] < since { lo = mid + 1 } else { hi = mid }
+    }
+    return lo < n && live[lo] < until
 }
 
 // Drops the old versions, kept slots and root changes no snapshot needs: a
 // live one, or one that may begin (as of a commit from durableSeq on).
 fn (db: mut &Db) prune() {
-    var live: []int = []
-    for sn in db.snaps { if !sn.cancelled { append(mut &live, sn.seq) } }
-    var roots: []RootChange = []
-    for rc in replace(mut &db.rootHist, []) {
-        var need = rc.seq > db.durableSeq
-        for q in live { if q < rc.seq { need = true } }
-        if need { append(mut &roots, rc) }
+    db.histAdded = 0
+    if len(db.histSlots) == 0 && len(db.rootHist) == 0 && len(db.deferred) == 0 {
+        var m = -1
+        for sn in db.snaps { if !sn.cancelled && (m < 0 || sn.seq < m) { m = sn.seq } }
+        db.pruneMinSnap = m
+        return
     }
-    db.rootHist = roots
-    var keepSlots: []int = []
-    for s in replace(mut &db.histSlots, []) {
-        db.meta[s].listed = false
-        var kept: []Hist = []
-        var old = replace(mut &db.hist[s], [])
-        while len(old) > 0 {
-            let h = pop(mut &old)
-            var need = h.until > db.durableSeq
-            for q in live { if h.since <= q && q < h.until { need = true } }
-            if need { append(mut &kept, h) } else { db.histCount -= 1 }
-        }
-        if len(kept) > 0 {
-            db.hist[s] = kept
-            append(mut &keepSlots, s)
-            db.meta[s].listed = true
+    var live: []int = withCapacity(len(db.snaps))
+    var minL = -1
+    var maxL = -1
+    for sn in db.snaps {
+        if !sn.cancelled {
+            append(mut &live, sn.seq)
+            if minL < 0 || sn.seq < minL { minL = sn.seq }
+            if sn.seq > maxL { maxL = sn.seq }
         }
     }
-    db.histSlots = keepSlots
-    var still: []Deferred = []
-    for d in replace(mut &db.deferred, []) {
-        var need = d.seq > db.durableSeq
-        for q in live { if q < d.seq { need = true } }
-        if need { append(mut &still, d) } else if d.whole { db.releaseWhole(d.slot, d.height) } else { db.releaseSlot(d.slot, d.height) }
+    if len(live) > 8 {
+        collections.sortBy(mut &live, fn(a: &int, b: &int): int { return a.cmp(b) })
     }
-    db.deferred = still
+    db.pruneMinSnap = minL
+    if len(db.rootHist) > 0 {
+        var roots: []RootChange = []
+        for rc in replace(mut &db.rootHist, []) {
+            if rc.seq > db.durableSeq || (minL >= 0 && minL < rc.seq) { append(mut &roots, rc) }
+        }
+        db.rootHist = roots
+    }
+    if len(db.histSlots) > 0 {
+        var w = 0
+        for r in 0..len(db.histSlots) {
+            let s = db.histSlots[r]
+            let hs = &db.hist[s]
+            var anyDrop = false
+            for j in 0..len(hs) {
+                if !snapNeeds(&live, minL, maxL, hs[j].since, hs[j].until, db.durableSeq) {
+                    anyDrop = true
+                    break
+                }
+            }
+            if !anyDrop {
+                db.histSlots[w] = s
+                w += 1
+                continue
+            }
+            var kept: []Hist = []
+            var old = replace(mut &db.hist[s], [])
+            while len(old) > 0 {
+                let h = pop(mut &old)
+                if snapNeeds(&live, minL, maxL, h.since, h.until, db.durableSeq) {
+                    append(mut &kept, h)
+                } else {
+                    db.histCount -= 1
+                }
+            }
+            if len(kept) > 0 {
+                db.hist[s] = kept
+                db.histSlots[w] = s
+                w += 1
+            } else {
+                db.meta[s].listed = false
+            }
+        }
+        while len(db.histSlots) > w { let gone = pop(mut &db.histSlots) }
+    }
+    if len(db.deferred) > 0 {
+        var still: []Deferred = []
+        for d in replace(mut &db.deferred, []) {
+            if d.seq > db.durableSeq || (minL >= 0 && minL < d.seq) {
+                append(mut &still, d)
+            } else if d.whole {
+                db.releaseWhole(d.slot, d.height)
+            } else {
+                db.releaseSlot(d.slot, d.height)
+            }
+        }
+        db.deferred = still
+    }
+}
+
+// Amortized prune for hot commit/flush paths: prunes immediately when all
+// snapshots have ended, when the history is small, when the oldest snapshot
+// advanced, when deferred slots/root changes exist, or after histAdded reaches
+// max(256, histCount / 2) so steady-state work is O(1) per version created.
+fn (db: mut &Db) maybePrune() {
+    if len(db.histSlots) == 0 && len(db.rootHist) == 0 && len(db.deferred) == 0 { return }
+    var minL = -1
+    for sn in db.snaps {
+        if !sn.cancelled && (minL < 0 || sn.seq < minL) { minL = sn.seq }
+    }
+    let thresh = max(256, db.histCount / 2)
+    if minL < 0 || db.histCount <= 64 || len(db.deferred) > 0 || len(db.rootHist) > 0 ||
+       (db.pruneMinSnap >= 0 && minL > db.pruneMinSnap) || db.histAdded >= thresh {
+        db.prune()
+    }
 }
 
 // Whether slot s could be evicted, but for its children (kidsOut).
@@ -907,6 +991,7 @@ fn (db: &Db) kidsOut(s: int): bool {
 // marks its path) never loses them while it loads the rest; the cache
 // then holds more than its size for a while.
 fn (db: mut &Db) maybeEvict() {
+    if db.cacheUsed > db.opts.cacheBytes && db.histAdded > 0 { db.prune() }
     var tries = 0
     while db.cacheUsed > db.opts.cacheBytes && tries < len(db.meta) {
         tries += 1
@@ -3631,7 +3716,14 @@ fn (st: &Store) scanLeavesMerged(t: mut &Txn, tree: int, from: &str, to: &str,
 pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
                                f: &fn(&lexdb_rows.LeafView, int, int): bool): Result[Unit, lexdb_base.DbErr] {
     let view = st.viewOf(t)
-    if view == View.Repl { return st.scanLeavesMerged(t, tree, from, to, f) }   // a replica's base and delta
+    if view == View.Repl {
+        if len(t.tmp) == 0 {
+            let fo = st.follower().unwrap()
+            let s = try repSnap(&fo, t)
+            if try fo.scanLeaves(&s, tree, from, &to, f) { return Ok(Unit{}) }
+        }
+        return st.scanLeavesMerged(t, tree, from, to, f)
+    }
     if len(t.ownRange(tree, &from, &to)) > 0 || t.cutsMeet(tree, &from, &to) { return st.scanLeavesMerged(t, tree, from, to, f) }
     let snap = view == View.Snap
     var cursor: str = from.clone()
@@ -4344,6 +4436,7 @@ fn (st: &Store) commitLive(t: &Txn, durable: bool): Result[Unit, lexdb_base.DbEr
 // Cancels the oldest snapshots while the old versions kept for them are over
 // the budget ("snapshot too old").
 fn (db: mut &Db) overBudget() {
+    if db.histCount > db.opts.snapNodes && db.histAdded > 0 { db.prune() }
     while db.histCount > db.opts.snapNodes {
         var oldest = -1
         for i in 0..len(db.snaps) {
@@ -4448,10 +4541,15 @@ pub fn (st: &Store) endSnapshot(t: &Txn) {
 fn (st: &Store) endSnap(id: int) {
     if id < 0 { return }
     st.sh.with(fn(db: mut &Db) {
-        var keep: []Snap = []
-        for sn in db.snaps { if sn.id != id { append(mut &keep, sn) } }
-        db.snaps = keep
-        db.prune()
+        for i in 0..len(db.snaps) {
+            if db.snaps[i].id == id {
+                let last = len(db.snaps) - 1
+                if i != last { db.snaps[i] = db.snaps[last] }
+                let gone = pop(mut &db.snaps)
+                break
+            }
+        }
+        db.maybePrune()
     })
 }
 
@@ -4772,7 +4870,7 @@ pub fn writer(st: Store): int {
             }
             if upto > db.durableSeq {
                 db.durableSeq = upto
-                db.prune()
+                db.maybePrune()
             }
             db.seg = segNo
             db.segOff = segOff
@@ -6187,7 +6285,7 @@ fn newDb(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, data: lexdb_disk.File, opts: O
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
               durableBatch: m.replayBatch - 1, waiters: [], writerWake: [], ckptWake: [], ckptDone: [], seg: m.replaySeg,
               segOff: m.replayOff, logSinceCkpt: 0, failed: [], closing: false, seq: 0, snaps: [], nextSnap: 0,
-              hist: [], histCount: 0, histSlots: [], deferred: [], rootHist: [], lateRoots: 0, durableSeq: 0, holds: newMap(), holdCkpt: -1, holdSeg: -1, heldFree: [], changeWake: [], recent: [], recentAt: 0, recentBytes: 0, durWaits: [], nextDurWait: 0, ckptCovers: m.covers, snapshots: 0, tooOld: 0, commits: 0,
+              hist: [], histCount: 0, histSlots: [], histAdded: 0, pruneMinSnap: -1, deferred: [], rootHist: [], lateRoots: 0, durableSeq: 0, holds: newMap(), holdCkpt: -1, holdSeg: -1, heldFree: [], changeWake: [], recent: [], recentAt: 0, recentBytes: 0, durWaits: [], nextDurWait: 0, ckptCovers: m.covers, snapshots: 0, tooOld: 0, commits: 0,
               conflicts: 0, loads: 0, aheadReads: 0, aheadPages: 0, evictions: 0, flushes: 0, logBytes: 0, checkpoints: 0, pagesWritten: 0, held: 0, wholes: 0,
               colSpecs: newMap(), specs: [], colLeaves: 0, rowLeaves: 0, colsOff: false,
               specRatio: [], specSplits: [], refitCuts: 0, upgTree: [], upgKey: [], upgBudget: UPG_BUDGET, upgLeaves: 0, upgFailed: 0, ckptLocked: 0, cutRetries: 0, cutChunk: CUT_CHUNK, cutEnds: 0}
@@ -7853,6 +7951,64 @@ pub fn (fo: &Follower) scan(s: &FSnap, tree: int, from: &str, to: &str, f: &fn(&
         j += 1
     }
     return Ok(Unit{})
+}
+
+// Zero-copy base-leaf scan for a replica when tree has no delta entries or
+// cuts at or before s: feeds each base leaf directly to f as a LeafView
+// (preserving column leaves and avoiding key/value clones). Returns false when
+// tree has a delta so the caller falls back to scanLeavesMerged.
+pub fn (fo: &Follower) scanLeaves(s: &FSnap, tree: int, from: &str, to: &str,
+                                  f: &fn(&lexdb_rows.LeafView, int, int): bool): Result[bool, lexdb_base.DbErr] {
+    var bi = -1
+    var live = false
+    var delta = false
+    fo.sh.with(fn(fl: mut &Fol) {
+        bi = fl.baseOf(s.ckpt)
+        if bi < 0 { return }
+        live = fl.live(s, tree, bi)
+        if live { delta = fl.hasDelta(tree) }
+    })
+    if bi < 0 { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "follower: the snapshot has ended")) }
+    if !live { return Ok(true) }
+    if delta { return Ok(false) }
+    var cursor = lexdb_base.own(from)
+    while true {
+        var need = -1
+        var upper = ""
+        var last = true
+        var none = false
+        var go = true
+        fo.sh.with(fn(fl: mut &Fol) {
+            match fl.bases[bi].roots.get(&tree) {
+                Some(root) {
+                    let st = fl.descend(root, &cursor)
+                    if st.need >= 0 {
+                        need = st.need
+                        return
+                    }
+                    let n = &fl.pool[st.leaf]
+                    let i = n.lower(&cursor)
+                    var j = n.count()
+                    if len(to) > 0 { j = n.lower(to) }
+                    if j > i {
+                        let lv = lexdb_page.leafView(n)
+                        go = f(&lv, i, j)
+                    }
+                    last = !st.hasUpper || (len(to) > 0 && st.upper >= to)
+                    upper = st.upper.clone()
+                }
+                None { none = true }
+            }
+        })
+        if none { return Ok(true) }
+        if need >= 0 {
+            try fo.load(need)
+            continue
+        }
+        if !go || last { return Ok(true) }
+        cursor = upper
+    }
+    return Ok(true)
 }
 
 pub type FStats = value record { pub applied: int; pub bases: int; pub ckpt: int; pub cached: int; pub cacheBytes: int; pub loads: int; pub evictions: int; pub freed: int; pub deltaKeys: int; pub cuts: int; pub snaps: int }
