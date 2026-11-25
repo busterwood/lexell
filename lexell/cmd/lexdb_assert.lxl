@@ -1675,12 +1675,27 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ro
     var rs: [][][]Val = []
     var big: []int = []         // the instances whose table the statements put more than MAX_KEYS rows to: checked BIG_CHUNK at a time
     var bigW: []int = []        // (their writes, in ws)
+    var gone: []Val = []        // the join key's values of the rows taken out of an instance under NOT (goneVals)
+    var goneFrom = ""           // (the table they were taken out of)
+    let top = topInst(an)
     for i in 0..len(an.insts) {
         let x = &an.insts[i]
         var wi = -1
         for k in 0..len(ws) { if ws[k].key == x.key { wi = k } }
         if wi < 0 { continue }
-        if ws[wi].whole || (x.neg && touches(a, &ws[wi]) && ws[wi].any && txn.wroteSince(ws[wi].tree, ws[wi].mark)) {
+        let out = x.neg && touches(a, &ws[wi]) && ws[wi].any && txn.wroteSince(ws[wi].tree, ws[wi].mark)
+        if out && !ws[wi].whole && a.form != F_EXISTS && top >= 0 && len(plan.keys) > 0 {
+            // rows taken out of an instance under NOT: the query for the rows of their join key's values only
+            match try goneVals(st, txn, an, i, &plan.keys, &ws[wi]) {
+                Some(vs) {
+                    for v in vs { addVal(mut &gone, &v) }
+                    if len(goneFrom) == 0 { goneFrom = x.key.clone() }
+                    continue
+                }
+                None {}
+            }
+        }
+        if ws[wi].whole || out {
             whole = true
             if len(first) == 0 { first = x.key.clone() }
             continue
@@ -1709,7 +1724,7 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ro
             None {}
         }
     }
-    if !whole && len(ix) == 0 && len(big) == 0 { return Ok(Unit{}) }
+    if !whole && len(ix) == 0 && len(big) == 0 && len(gone) == 0 { return Ok(Unit{}) }
     let locks = len(an.insts) > 1 || a.form == F_EXISTS
     // (many rows: the assertion's own lock, exclusive, not a lock per row's join key)
     let excl = whole || len(big) > 0
@@ -1733,7 +1748,7 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ro
                 }
                 if hit { append(mut &keep, j) }
             }
-            if len(keep) == 0 { return Ok(Unit{}) }
+            if len(keep) == 0 && len(gone) == 0 { return Ok(Unit{}) }
             var ix2: []int = []
             var ts2: []rc Table = []
             var rs2: [][][]Val = []
@@ -1761,10 +1776,28 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ro
                 let x = try st.lockRow(txn, -9, &b, lexdb_sql.LOCK_UPDATE, 0, true)
             }
         }
+        for v in gone {
+            var b = a.key + "\x00"
+            lexdb_access.encIdxPart(mut &b, &v)
+            let x = try st.lockRow(txn, -9, &b, lexdb_sql.LOCK_UPDATE, 0, true)
+        }
     }
     if whole {
         if broken(a, try runOn(st, txn, a, &plan.stmt, up, true)) { return Err(violated(st, txn, up, a, &first, verb)) }
         return Ok(Unit{})
+    }
+    // the rows of the outer query whose join key is one of the values of the rows taken out (only they may have lost what
+    // kept them out of it: each row of the query and every row it meets have one value there), CHUNK values at a time
+    var ga = 0
+    while ga < len(gone) {
+        let hi = min(ga + CHUNK, len(gone))
+        let x = &an.insts[top]
+        var args: []Expr = [Expr.Col(x.alias + "." + plan.keys[top], -1)]
+        for k in ga..hi { append(mut &args, Expr.Lit(gone[k].clone())) }
+        var q = plan.stmt.clone()
+        addConj(mut &q, &x.path, 0, Expr.Call("in", args, false))
+        if broken(a, try runOn(st, txn, a, &q, up, true)) { return Err(violated(st, txn, up, a, &goneFrom, verb)) }
+        ga = hi
     }
     for j in 0..len(ix) {
         let x = &an.insts[ix[j]]
@@ -1815,6 +1848,59 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ro
 }
 
 const BIG_CHUNK = 4096
+
+// An instance of the query's outer block (its rows are the query's), -1 none.
+fn topInst(an: &An): int {
+    for i in 0..len(an.insts) { if len(an.insts[i].path) == 0 { return i } }
+    return -1
+}
+
+fn addVal(xs: mut &[]Val, v: &Val) {
+    for x in xs { if lexdb_sql.text(&x) == lexdb_sql.text(v) { return } }
+    append(xs, v.clone())
+}
+
+// The join key's values (instance i's column of keys) of the rows the statement that wrote w took out of instance i's table:
+// those it deleted, and those it changed as they were before it (Store.beforeMark: its own earlier writes, else the stored
+// row), NULLs left out (they meet no row). The seventh bug slice: under NOVALIDATE (or not) a DELETE or UPDATE of a table
+// under NOT EXISTS is checked for the outer rows of those values only, as Oracle's, not with the whole query. None when they
+// cannot be had: more than MAX_KEYS rows, a range deleted, an earlier write of a row too far back (the whole query then).
+fn goneVals(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, an: &An, i: int, keys: &[]str, w: &Wr): Result[Option[[]Val], DbErr] {
+    let ks = match txn.changedKeys(w.tree, w.mark, MAX_KEYS) {
+        Some(k) { k }
+        None { return Ok(None) }
+    }
+    let t = match try tableRc(st, txn, &an.insts[i].key) {
+        Some(x) { x }
+        None { return Ok(None) }
+    }
+    let c = colAt(&t, &keys[i])
+    if c < 0 { return Ok(None) }
+    let rel = lexdb_catalog.relOf(&t)
+    let none: []bool = []
+    let rr = lexdb_access.rowRead(&rel, &none)
+    var out: []Val = []
+    for k in ks {
+        match try st.beforeMark(txn, w.tree, &k, w.mark) {
+            Some(old) {
+                match old {
+                    Some(v) {
+                        let row = try lexdb_access.rowFrom(st, txn, &rel, &rr, &k, &v)
+                        if c < len(row) {
+                            match &row[c] {
+                                Val.Null {}
+                                else { addVal(mut &out, &row[c]) }
+                            }
+                        }
+                    }
+                    None {}
+                }
+            }
+            None { return Ok(None) }
+        }
+    }
+    return Ok(Some(out))
+}
 
 // Whether table key is one instance of the query only (another instance of it would read its rows put: the whole query then).
 fn oneInstance(an: &An, key: &str): bool {

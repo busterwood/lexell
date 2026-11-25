@@ -1,0 +1,71 @@
+// lexdb_exec: the seventh bug slice (design/lexdb-robust.md, "The seventh bug slice"), item 5: DROP TABLE of a table other objects depend on
+// refused as PostgreSQL 18 refuses it (2BP01), its DETAIL naming the foreign keys of other tables on it ("constraint fk on table c depends on
+// table p"), then the views (lexdb's order: the foreign keys by their tables, then the views by name; PostgreSQL's is the order they were
+// made), its HINT apart; a table only foreign keys depend on refused so too; a key of the table on itself is no dependent; CASCADE drops the
+// keys and the views. Texts checked against PostgreSQL 18 (psql, VERBOSITY verbose).
+// expect: made: CREATE TABLE CREATE TABLE CREATE VIEW CREATE TABLE CREATE VIEW
+// expect: drop p: 2BP01 cannot drop table p because other objects depend on it
+// expect:   detail: constraint c2_pid_fkey on table c2 depends on table p|constraint fk1 on table c1 depends on table p|view pv depends on table p|view pvv depends on view pv
+// expect:   hint: Use DROP ... CASCADE to drop the dependent objects too.
+// expect: drop q: 2BP01 cannot drop table q because other objects depend on it
+// expect:   detail: constraint qc_a_fkey on table qc depends on table q
+// expect:   hint: Use DROP ... CASCADE to drop the dependent objects too.
+// expect: drop r (its own key): DROP TABLE
+// expect: cascade: DROP TABLE, then INSERT 0 1 INSERT 0 1, views 0
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag.clone() }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+// A refusal: its state and text, then its DETAIL (lines joined by |) and HINT.
+fn refused(s: mut &lexdb_exec.Session, what: &str, sql: &str) {
+    match s.exec(sql) {
+        Ok(rs) { println(what + ": " + rs[len(rs) - 1].tag) }
+        Err(e) {
+            println(what + ": " + e.state + " " + e.msg)
+            println("  detail: " + strings.replaceAll(&e.detail, "\n", "|"))
+            println("  hint: " + e.hint)
+        }
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(77), lexdb_store.Options{cacheBytes: 256 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 100000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+        let m1 = q(mut &s, &"create table p (id int primary key)")
+        let m2 = q(mut &s, &"create table c2 (pid int references p (id))")
+        let m3 = q(mut &s, &"create view pv as select * from p")
+        let m4 = q(mut &s, &"create table c1 (id int, pid int, constraint fk1 foreign key (pid) references p)")
+        let m5 = q(mut &s, &"create view pvv as select * from pv")
+        println("made: " + m1 + " " + m2 + " " + m3 + " " + m4 + " " + m5)
+        refused(mut &s, "drop p", "drop table p")
+        let n1 = q(mut &s, &"create table q (id int primary key)")
+        let n2 = q(mut &s, &"create table qc (a int references q)")
+        refused(mut &s, "drop q", "drop table q")
+        let n3 = q(mut &s, &"create table r (id int primary key, pid int references r)")
+        refused(mut &s, "drop r (its own key)", "drop table r")
+        let d = q(mut &s, &"drop table p cascade")
+        println("cascade: " + d + ", then " + q(mut &s, &"insert into c2 values (5)") + " " + q(mut &s, &"insert into c1 values (1, 5)") + ", views " +
+                q(mut &s, &"select count(*) from information_schema.views where table_schema = 'public'"))
+        return 0
+    }).unwrap()
+}

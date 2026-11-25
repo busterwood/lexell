@@ -21,6 +21,8 @@ import "./lexdb_catalog"
 import "./lexdb_routine"
 import "./lexdb_bind"
 import "./lexdb_assert"
+import "./lexdb_tsqlname"
+import "./lexdb_parse"
 
 type DbErr = lexdb_base.DbErr
 type Table = lexdb_catalog.Table
@@ -46,6 +48,15 @@ pub fn planErr(t: &Table, pe: DbErr, role: &str): DbErr {
     if strings.startsWith(&t.view, lexdb_sql.ORA_VIEW) && gone(&pe) {
         let o = if lexdb_sql.isQual(&t.name) { lexdb_sql.schemaOf(&t.name) } else { role.toStr() }
         return err("ORA04063", &("view \"" + lexdb_sql.oraShown(&o) + "." + lexdb_sql.oraShown(&lexdb_sql.baseName(&t.name)) + "\" has errors"))
+    }
+    if strings.startsWith(&t.view, lexdb_sql.TSQL_VIEW) && pe.state == "42P01" && strings.startsWith(&pe.msg, "relation \"") {
+        // (SQL Server's 208 names the relation as the view's query wrote it)
+        let a = 10
+        let b = strings.indexOf(&pe.msg, "\"", a)
+        if b > a {
+            let w = lexdb_tsqlname.asWritten(&lexdb_sql.viewShown(&t.view), &("'" + pe.msg[a..b] + "'"))
+            return err("42P01", &("relation \"" + w[1..len(w) - 1] + "\" does not exist"))
+        }
     }
     return pe
 }
@@ -238,8 +249,9 @@ pub fn refreshStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_
 // door: the session's (lexdb_priv.doorOf: "tds", "tns" or the PostgreSQL door's; DROP TABLE's statement does not say).
 pub fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, k: &str, door: &str): Result[Unit, DbErr] {
     let deps = try lexdb_catalog.dependentViews(st, txn, k)
-    if len(deps) == 0 || door == "tns" || s.mdialect == lexdb_sql.MD_ORA { return Ok(Unit{}) }
+    if door == "tns" || s.mdialect == lexdb_sql.MD_ORA { return Ok(Unit{}) }
     if door == "tds" || s.mdialect == lexdb_sql.MD_TSQL {
+        if len(deps) == 0 { return Ok(Unit{}) }
         for v in try lexdb_catalog.allViews(st, txn) {
             if lexdb_base.hasStr(&deps, &v.name) && lexdb_sql.viewBound(&v.view) && lexdb_base.hasStr(&v.deps, k) {
                 return Err(err("TS3729", &("Cannot DROP TABLE '" + lexdb_sql.baseName(k) + "' because it is being referenced by object '" + lexdb_sql.baseName(&v.name) + "'.")))
@@ -255,7 +267,10 @@ pub fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sq
         }
         return Ok(Unit{})
     }
-    var detail: []str = []
+    // (PostgreSQL's DETAIL: the foreign keys of other tables on it, then the views; CASCADE drops the keys where the executor
+    // unlinks the table)
+    var detail = try fkLines(st, txn, k)
+    if len(deps) == 0 && len(detail) == 0 { return Ok(Unit{}) }
     for v in try lexdb_catalog.allViews(st, txn) {
         if !lexdb_base.hasStr(&deps, &v.name) { continue }
         var on = ""
@@ -266,6 +281,29 @@ pub fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sq
     }
     return Err(lexdb_base.errDetail("2BP01", &("cannot drop table " + lexdb_sql.shown(k) + " because other objects depend on it"),
                                     &strings.join(&detail, "\n"), "Use DROP ... CASCADE to drop the dependent objects too."))
+}
+
+// PostgreSQL's DETAIL lines for the foreign keys of other tables that reference table k ("constraint fk on table c depends on
+// table k"), by the referencing tables in k's refBy order.
+fn fkLines(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[[]str, DbErr] {
+    var out: []str = []
+    let tv = try st.get(txn, lexdb_catalog.CATALOG, k)
+    if tv.isNone() { return Ok(out) }
+    let t = try lexdb_catalog.decTable(k, &tv.unwrap(), lexdb_parse.parseExpr)
+    for ck in lexdb_assert.refs(&t.refBy) {
+        if ck == k { continue }
+        match try st.get(txn, lexdb_catalog.CATALOG, &ck) {
+            Some(cv) {
+                var c = try lexdb_catalog.decTable(&ck, &cv, lexdb_parse.parseExpr)
+                lexdb_catalog.joinFks(mut &c)
+                for f in c.fks {
+                    if f.ref == k { append(mut &out, "constraint " + f.name + " on table " + lexdb_sql.shown(&ck) + " depends on table " + lexdb_sql.shown(k)) }
+                }
+            }
+            None {}
+        }
+    }
+    return Ok(out)
 }
 
 // information_schema.VIEW_TABLE_USAGE (cols false) and VIEW_COLUMN_USAGE (cols true), in both doors (lexdb_pg.viewRows; the T-SQL
@@ -391,4 +429,54 @@ fn usesCol(refs: &[]Ref, rel: &str, col: &str): bool {
         if r.name == c0 && (len(r.qual) == 0 || lexdb_base.hasStr(&quals, &r.qual)) { return true }
     }
     return false
+}
+
+// ---- a view's columns as at its CREATE (the seventh bug slice)
+
+// A view whose query now gives more columns than the view has (outs: a column added to a table under its SELECT *): its query q
+// made the derived table of a query that keeps the view's columns as at its CREATE, as each product does: SQL Server's by
+// position (the first ones, until sp_refreshview), PostgreSQL's and Oracle's by name (they expand * at CREATE), by position
+// when a name is not among the query's (a view that names its own columns). A T-SQL view that names its own columns (CREATE
+// VIEW v (a, b) AS ...) is SQL Server's 8158. False, q as it is, when the query gives as many (or fewer: fewerErr's). Only a
+// view whose tables gained columns pays (its query planned a second time).
+pub fn narrowed(t: &Table, outs: &[]OutCol, q: mut &lexdb_sql.Stmt): Result[bool, DbErr] {
+    let n = len(t.cols)
+    if len(outs) <= n || n == 0 { return Ok(false) }
+    var pick: []int = []
+    if strings.startsWith(&t.view, lexdb_sql.TSQL_VIEW) {
+        if lexdb_tsqlname.viewColList(&lexdb_sql.viewDefinition(&t.view)) {
+            return Err(err("TS8158", &("'" + lexdb_sql.baseName(&t.name) + "' has more columns than were specified in the column list.")))
+        }
+    } else {
+        var used: []bool = array(len(outs), false)
+        for c in t.cols {
+            var at = -1
+            for i in 0..len(outs) { if at < 0 && !used[i] && outs[i].name == c.name { at = i } }
+            if at < 0 { break }
+            used[at] = true
+            append(mut &pick, at)
+        }
+    }
+    if len(pick) != n {
+        pick = []
+        for i in 0..n { append(mut &pick, i) }
+    }
+    var w = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
+    w.params = q.params
+    w.use = q.use
+    var inner = replace(q, lexdb_sql.newStmt(lexdb_sql.S_SELECT))
+    inner.use = lexdb_sql.SUB_FROM
+    append(mut &w.subs, inner)
+    var last = 0
+    for p in pick { if p > last { last = p } }
+    var names: []str = []
+    for i in 0..last + 1 { append(mut &names, "c" + i.toStr()) }
+    append(mut &w.from, lexdb_sql.FromItem{table: "", alias: "view_", join: lexdb_sql.J_FIRST, on: None, sub: 0, cols: names, work: -1, lateral: false,
+                                           using: [], natural: false, comma: true})
+    for k in 0..n {
+        append(mut &w.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(lexdb_sql.Expr.Col("view_.c" + pick[k].toStr(), -1)),
+                                               alias: t.cols[k].name.clone(), spell: t.cols[k].spell.clone()})
+    }
+    let x = replace(q, w)
+    return Ok(true)
 }

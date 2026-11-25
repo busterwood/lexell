@@ -1,0 +1,173 @@
+// lexdb: the names SQL Server's messages echo as the statement wrote them (the seventh bug slice, design/lexdb-robust.md):
+// 208, 3729, 4502, 4512 and 4513 name a table or view as its text has it ('dbo.T' for dbo.T, 'dbo.T' for [dbo].[T], 'T' for T),
+// where lexdb's own message has the catalog's name (no dbo, folded). Only the error path comes here: the name is looked up in
+// the text of the statement (the batch from the statement's line, a view's query).
+import "strings"
+
+// A name of the text: its parts as written (brackets and quotes taken out).
+type WName = record { parts: []str }
+
+fn identStart(c: byte): bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '@' || c == '#' || c >= 128 }
+fn identByte(c: byte): bool { return identStart(c) || (c >= '0' && c <= '9') || c == '$' }
+
+// The part at text[i] (an identifier, [bracketed] or "quoted"): its text and where it ends; ("", i) none.
+type Part = record { text: str; end: int }
+
+fn partAt(text: &str, i: int): Part {
+    let n = len(text)
+    if i >= n { return Part{text: "", end: i} }
+    let c = text[i]
+    if c == '[' || c == '"' {
+        let close: byte = if c == '[' { ']' } else { '"' }
+        var out = ""
+        var j = i + 1
+        while j < n {
+            if text[j] == close {
+                if j + 1 < n && text[j + 1] == close {
+                    out += text[j..j + 1]
+                    j += 2
+                    continue
+                }
+                return Part{text: out, end: j + 1}
+            }
+            out += text[j..j + 1]
+            j += 1
+        }
+        return Part{text: "", end: i}
+    }
+    if !identStart(c) { return Part{text: "", end: i} }
+    var j = i
+    while j < n && identByte(text[j]) { j += 1 }
+    return Part{text: text[i..j].toStr(), end: j}
+}
+
+// The names of text (one or more parts joined by "."), in order; strings and comments skipped.
+fn namesOf(text: &str): []WName {
+    var out: []WName = []
+    let n = len(text)
+    var i = 0
+    while i < n {
+        let c = text[i]
+        if c == '\'' {
+            i += 1
+            while i < n {
+                if text[i] == '\'' {
+                    if i + 1 < n && text[i + 1] == '\'' { i += 2 } else { break }
+                } else { i += 1 }
+            }
+            i += 1
+            continue
+        }
+        if c == '-' && i + 1 < n && text[i + 1] == '-' {
+            while i < n && text[i] != '\n' { i += 1 }
+            continue
+        }
+        if c == '/' && i + 1 < n && text[i + 1] == '*' {
+            let e = strings.indexOf(text, "*/", i + 2)
+            i = if e < 0 { n } else { e + 2 }
+            continue
+        }
+        if c >= '0' && c <= '9' {
+            while i < n && identByte(text[i]) { i += 1 }
+            continue
+        }
+        let pa = partAt(text, i)
+        let j = pa.end
+        if j == i {
+            i += 1
+            continue
+        }
+        var w = WName{parts: [pa.text.clone()]}
+        var k = j
+        while k < n && text[k] == '.' {
+            let pb = partAt(text, k + 1)
+            let e = pb.end
+            if e == k + 1 { break }
+            append(mut &w.parts, pb.text.clone())
+            k = e
+        }
+        append(mut &out, w)
+        i = k
+    }
+    return out
+}
+
+// The name of text whose last parts are name's (by "."; case aside): as written; "" none.
+fn writtenOf(names: &[]WName, name: &str): str {
+    let low = strings.toLowerAscii(name)
+    let want = strings.split(&low, ".")
+    for w in names {
+        if len(w.parts) < len(want) { continue }
+        var ok = true
+        let off = len(w.parts) - len(want)
+        for k in 0..len(want) { if strings.toLowerAscii(&w.parts[off + k]) != want[k] { ok = false } }
+        if ok { return strings.join(&w.parts, ".") }
+    }
+    return ""
+}
+
+// msg with each name in single quotes as text writes it (where text has it; else as it was).
+pub fn asWritten(text: &str, msg: &str): str {
+    if len(text) == 0 { return msg.toStr() }
+    let names = namesOf(text)
+    var out = ""
+    var i = 0
+    while i < len(msg) {
+        let a = strings.indexOf(msg, "'", i)
+        if a < 0 { break }
+        let b = strings.indexOf(msg, "'", a + 1)
+        if b < 0 { break }
+        let w = writtenOf(&names, &msg[a + 1..b])
+        out += msg[i..a + 1]
+        out += if len(w) > 0 { w } else { msg[a + 1..b].toStr() }
+        out += "'"
+        i = b + 1
+    }
+    out += msg[i..len(msg)]
+    return out
+}
+
+// The text from line `line` (1 the first) on.
+pub fn fromLine(text: &str, line: int): str {
+    var at = 0
+    var l = 1
+    while l < line && at < len(text) {
+        let nl = strings.indexOf(text, "\n", at)
+        if nl < 0 { return text.toStr() }
+        at = nl + 1
+        l += 1
+    }
+    return text[at..len(text)].toStr()
+}
+
+fn skipBlanks(s: &str, i: int): int {
+    var j = i
+    while j < len(s) && (s[j] == ' ' || s[j] == '\t' || s[j] == '\n' || s[j] == '\r') { j += 1 }
+    return j
+}
+
+// Whether a T-SQL CREATE VIEW's text (def, as kept) names the view's columns: CREATE [OR ALTER] VIEW name (a, b) AS ...
+pub fn viewColList(def: &str): bool {
+    var i = skipBlanks(def, 0)
+    var words = 0
+    // CREATE, [OR, ALTER,] VIEW
+    while words < 4 {
+        let p = partAt(def, i)
+        if p.end == i { return false }
+        let w = strings.toLowerAscii(&p.text)
+        i = skipBlanks(def, p.end)
+        words += 1
+        if w == "view" { break }
+    }
+    // the name, of one or more parts
+    var p = partAt(def, i)
+    if p.end == i { return false }
+    i = skipBlanks(def, p.end)
+    while i < len(def) && def[i] == '.' {
+        let at = skipBlanks(def, i + 1)
+        p = partAt(def, at)
+        if p.end == at { return false }
+        i = skipBlanks(def, p.end)
+    }
+    return i < len(def) && def[i] == '('
+}

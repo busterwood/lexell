@@ -18,6 +18,13 @@ const DB = "lexdb"
 
 fn tsErr(n: int, msg: &str): DbErr { return lexdb_base.err(&("TS" + n.toStr()), msg) }
 
+// An error whose state is not its number's usual one (lexdb_tsql.sqlState reads it from the detail).
+fn tsErrState(n: int, state: int, msg: &str): DbErr {
+    var x = tsErr(n, msg)
+    x.detail = "state=" + state.toStr()
+    return x
+}
+
 // The text between the k-th pair of double quotes of msg ("" none).
 fn quoted(msg: &str, k: int): str {
     var at = 0
@@ -73,6 +80,23 @@ pub fn translate(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stmt, e: &DbErr): 
     }
     if st == "23514" && (strings.startsWith(m, "new row for relation \"") || strings.startsWith(m, "check constraint \"")) { return checkErr(sess, s, e) }
     if st == "23503" { return fkErr(sess, s, e) }
+    if s.kind == lexdb_sql.S_DROP_INDEX && s.mdialect == lexdb_sql.MD_TSQL && len(s.spells) == 1 {
+        // (the index as written, table.index: 3701 state 6 for a table not there, 7 for an index; 3723 for a constraint's)
+        var pk = false
+        if st == "42704" || st == "2BP01" {
+            match sess.tableInfo(&s.table) {
+                Ok(t) { pk = lexdb_catalog.hasPk(&t) && lexdb_catalog.pkConName(&t) == lexdb_sql.baseName(&s.index) }
+                Err(_) {}
+            }
+        }
+        if st == "42P01" || (st == "42704" && !pk) {
+            return tsErrState(3701, if st == "42P01" { 6 } else { 7 }, &("Cannot drop the index '" + s.spells[0] + "', because it does not exist or you do not have permission."))
+        }
+        if (st == "42704" && pk) || (st == "2BP01" && strings.startsWith(m, "cannot drop index ") && strings.contains(m, " because constraint ")) {
+            return tsErrState(3723, if pk { 4 } else { 5 }, &("An explicit DROP INDEX is not allowed on index '" + s.spells[0] + "'. It is being used for " +
+                              (if pk { "PRIMARY KEY" } else { "UNIQUE KEY" }) + " constraint enforcement."))
+        }
+    }
     if st == "42P01" && (s.kind == lexdb_sql.S_DROP || s.kind == lexdb_sql.S_DROP_VIEW) && (strings.startsWith(m, "table \"") || strings.startsWith(m, "view \"")) {
         let what = if strings.startsWith(m, "view") { "view" } else { "table" }
         return tsErr(3701, &("Cannot drop the " + what + " '" + quoted(m, 0) + "', because it does not exist or you do not have permission."))

@@ -1,0 +1,26 @@
+// lexdb_txmode: SET TRANSACTION READ ONLY and READ WRITE in a transaction block (the seventh bug slice, design/lexdb-robust.md), as
+// PostgreSQL's: READ ONLY at any time (the block refuses writes from then on, 25006), READ WRITE before the block's first query
+// only (25001 after it, as PostgreSQL's). A block BEGIN made read-write reads a snapshot it takes lazily, one made READ ONLY reads
+// the snapshot BEGIN took; the change makes the block as the other BEGIN would have: READ ONLY takes its snapshot now (when it has
+// none yet), READ WRITE gives it up so that the block takes one, tracked, at its first read.
+import "./lexdb_base"
+import "./lexdb_store"
+
+type DbErr = lexdb_base.DbErr
+
+// The block t's mode: ro READ ONLY, else READ WRITE; readOnly the session's flag; fresh: no query of the block has run.
+pub fn setReadOnly(st: &lexdb_store.Store, t: mut &lexdb_store.Txn, readOnly: mut &bool, fresh: bool, ro: bool): Result[Unit, DbErr] {
+    if ro == readOnly { return Ok(Unit{}) }
+    if ro {
+        if t.lazySnap { try st.takeSnapshot(t) }
+        readOnly = true
+        return Ok(Unit{})
+    }
+    if !fresh { return Err(lexdb_base.err("25001", "transaction read-write mode must be set before any query")) }
+    // (nothing ran in it: the block BEGIN would have made, its snapshot taken at its first read)
+    let rc = t.rc
+    st.releaseSnapshot(t)
+    let old = replace(t, lexdb_store.beginBlockLazy(rc))
+    readOnly = false
+    return Ok(Unit{})
+}

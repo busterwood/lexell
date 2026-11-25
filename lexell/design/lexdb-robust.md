@@ -496,3 +496,76 @@ hash seed is not fixed there). TPC-H SF1, 22 queries, base and branch alternated
 q14 983.6 M / 983.7 M, q16 1,902.3 M / 1,908.8 M, q17 119.89 M / 119.88 M, q19 154.14 M / 154.15 M). An earlier pair of runs (a branch build without the last three edits,
 none of them on the PostgreSQL door's path) gave 7,744 ms against 7,634 ms, its slower queries (q2, q7, q15, q21) with the same instructions too. Suite 401 passed; replica.py
 passed. lexdb_exec.lxl 22,186 lines before, 22,191 after (the calls of lexdb_viewdep, lexdb_ixname and lexdb_syscat.infoRows).
+
+## The seventh bug slice (2026-11-25)
+
+The next bugs KNOWN-ISSUES.md listed, on `worktree-agent-af88b6c8e4931611f` (from main a62b87d5, tags `b7-base` and `b7`). Each was checked on the product before and after
+(Oracle Free 23.26.3, SQL Server 2022, PostgreSQL 18). Tests: `tns_bugs7` (`gen_oracle.py --check tns_bugs7`), `tds_bugs7` (`gen_mssql.py bugs7`), `exec_bugs7`
+(`gen_pg.py bugs7`), `exec_bugs7d` (DROP TABLE's DETAIL, texts from PostgreSQL 18 by hand).
+
+### Oracle: overloaded nested subprograms (item 1)
+- The cause: a nested subprogram's scope held one subprogram to a name (`Cx.sigOf` gave the innermost of the name), so with two `sq` the later answered both calls.
+- A nested subprogram now records the declarations that declare it (`NestSig.scope`, `Cx.declScope`: one per declaration section); its overloads are the subprograms of its
+  name and kind in that scope (an inner scope's hides the outer's, as Oracle's). A call picks among them (`Cx.overload`) by the arguments' number and names (`argMap`: as
+  `argCheck`) and type families (`famOf`: NUMBER and its subtypes one, the character types one, DATE, the TIMESTAMPs, BOOLEAN, RAW, a record type each; an argument's from its
+  literal, its variable, else the type its SQL expression describes as; NULL fits any): the one that takes each argument in its own family, else the one that takes them by
+  conversion. More than one is PLS-00307, none PLS-00306, as Oracle's: lexdb refuses where it cannot tell them apart and never picks one. A forward declaration is matched to its
+  body by signature (`samePrms`). Only calls of a name with overloads pay (at compile time).
+- A nested function called from SQL inside the unit is PLS-00231 at compile time (`render`, the SQL statement's text): USER_ERRORS has Oracle's three rows (PLS-00231,
+  `PL/SQL: ORA-03066: invalid PL/SQL expression`, `PL/SQL: SQL Statement ignored`); a block is ORA-06550.
+- Found: a **package**'s overloaded members are not resolved either (`pko.sq(4)` with `sq(number)` and `sq(varchar2)` in the package is ORA-06502, from SQL and from
+  PL/SQL): the members' signatures, `Prog.find` and the SQL call path pick by name. Not done (the brief named nested subprograms); the same `overload` would serve PL/SQL's calls,
+  SQL's call of a member needs its arguments' types where `lexdb_plcall` runs it.
+
+### Every door: a SELECT * view keeps its columns (item 2)
+- The cause: lexdb keeps a view's query as text and plans it where the view is read; the binder named the query's columns past the view's own (its CREATE's) after them, so a
+  column added to the table showed in the view.
+- `lexdb_viewdep.narrowed`: when a view's query gives more columns than the view has, it is read through a derived table whose select list keeps the view's columns: SQL
+  Server's by position (the first ones; until `sp_refreshview`, which makes the view again), PostgreSQL's and Oracle's by name (both expand `*` at CREATE; `select t.*, u.*`
+  keeps t's and u's columns), by position where a name is not among the query's (a view that names its own columns). A T-SQL view with a column list is 8158, as SQL Server's. Only
+  such a view pays (its query planned twice); others are planned as before. A view made before the change does the same (its catalog row already has its CREATE's columns).
+- Oracle shows `USER_VIEWS.TEXT` expanded (`select "A","B" from vt1`); lexdb's is the text as written. A table that lost a column and gained none is as before (fewerErr: 4502,
+  ORA-04063); one that lost one and gained another reads by position as before (Oracle by name: the view is INVALID).
+
+### Assertions: a DELETE or UPDATE under NOT EXISTS (item 3)
+- The cause: rows going from an instance under NOT (`Inst.neg`) ran the whole query, so under NOVALIDATE rows that already broke the assertion refused writes that broke
+  nothing (Oracle checks the rows related to those written).
+- The sound way is the old rows from the store, not notes from the write paths: `Store.beforeMark` gives a key's value before a statement's mark (the transaction's own last
+  write before it, else the stored row read below its writes: the live tree a DML reads, the snapshot otherwise; a range delete before the mark: none), `Txn.changedKeys` the keys
+  a statement deleted or put since its mark. `lexdb_assert.goneVals` takes those rows' join-key values (the column of `joinKeys`' class, NULLs out) and the check runs the query
+  with its outer instance restricted to them (CHUNK values at a time): a row of the query, and every row it meets, have one value there, so only those rows can have lost what kept
+  them out. The values are locked as a writer's rows' are. The whole query stays for an EXISTS assertion, one without a join key, past MAX_KEYS rows, a range deleted, and a row
+  also written before a mark past 4,096 writes. The write paths, the point path and unasserted tables pay nothing; a VALIDATED assertion gives the same answer with less work.
+
+### SQL Server: texts, states, DROP INDEX, INFORMATION_SCHEMA (item 4)
+- Names as written (`lexdb_tsqlname`, the error path only): 208, 3729, 4502, 4512 and 4513 name the object as the statement wrote it (`dbo.T`; `[dbo].[T]` as `dbo.T`; the case
+  typed), looked up in the text the statement's line counts in (`State.text`: the batch's, a procedure's, EXEC's); a view's 208 as its query wrote it (`planErr`). 4502 and 8158
+  are compile errors, not caught in the same scope (as 208).
+- States: 4512 is 3, 4513 2 (`sqlState`); an error whose state depends on more than its number carries it in its detail (`state=N`).
+- WITH CHECK OPTION before AS: 102 quotes WITH as typed. A failed DDL statement inside TRY gives no row count.
+- DROP INDEX: a bare name is 159 (`DROP INDEX IF EXISTS ix` too); `t.ix`, `s.t.ix` and `ix ON t`: 3701 naming `table.index` as written, state 6 when the table is not there, 7 when
+  the index is not; a key's index 3723, state 4 for a PRIMARY KEY's, 5 for a UNIQUE one's. (`DROP INDEX dbo.ix` is 3701 on SQL Server 2022, not 159: `dbo` is read as the table.)
+- INFORMATION_SCHEMA.DOMAINS and COLUMN_PRIVILEGES exist: none in the T-SQL door (lexdb has no alias types and grants on whole tables only; SQL Server lists column grants
+  only); the PostgreSQL door lists information_schema's five domains and each column's share of a table's grants (SELECT, INSERT, UPDATE, REFERENCES), as PostgreSQL 18.
+  Their columns are PostgreSQL's in lower case in both doors (SQL Server's DOMAINS has 17).
+- SCHEMATA's schema_owner and sys.schemas' principal_id give a schema's AUTHORIZATION owner (`schemaOwner`; dbo for a superuser's).
+
+### PostgreSQL: DROP TABLE's DETAIL, SET TRANSACTION (item 5)
+- DROP TABLE of a table other tables' foreign keys reference is 2BP01 with PostgreSQL's DETAIL lines (`constraint fk on table c depends on table p`) before the views', and the
+  HINT apart, also when only keys depend on it (`lexdb_viewdep.fkLines`). The order: the keys by their tables (refBy), then the views by name; PostgreSQL's is the order the
+  objects were made. A table's key on itself is no dependent.
+- `SET TRANSACTION READ ONLY` makes the block read-only at any time (25006 for a write; the block takes its snapshot then if it had none), `READ WRITE` before its first query
+  only (25001 `transaction read-write mode must be set before any query`; a block BEGIN made READ ONLY gives up its snapshot and takes one at its first read), the modes in any
+  order with or without commas (`lexdb_txmode`); `SHOW transaction_read_only` is on in a read-only block. `SET TRANSACTION ISOLATION LEVEL` after the first query takes the
+  level the block has (25001 for another). Not changed: `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` (accepted, not kept), the Oracle door's `SET TRANSACTION READ ONLY`
+  (no block there: changes go on), no WARNING outside a block.
+
+### Measured
+In process (`pt.lxl`, 20,000 statements, `LXL_HASH_SEED=1`, two rounds, base = main a62b87d5 built the same way, trees at paths of equal length), equal in both rounds: point select
+25,325.3, INSERT 124,976.6, UPDATE by key 130,873.5, as text 102,576.3 / 178,372.8 / 214,255.2-.3 (the text update flips by 0.1 between rounds, base and branch alike); in a
+transaction block INSERT 15,531.9, UPDATE 23,767.4. Over the wire (`icount6.sh`, 20,000 point selects x 3, base and branch alternated twice): instructions 151,421 and 151,426
+against 151,457 and 151,481, cycles 80,765 and 81,416 against 82,161 and 81,912, L1 i-cache misses 293 and 289 against 345 and 343 (the server's hash seed is not fixed there;
+no code of the slice is on the point path). TPC-H SF1, 22 queries, base and branch alternated twice: checksums equal on all 22, total 6,767 ms against 6,705 ms, no query 1.5%
+slower (the most: q18 +1.2%, q12 +0.7%). A database made by the base binary in all three doors, opened by the branch's: its stored function with nested overloads answers right
+(18, was 3), its SELECT * views keep their columns, a schema's AUTHORIZATION owner shows, its NOVALIDATE assertion takes a DELETE that breaks nothing. Suite 407 passed;
+replica.py passed. lexdb_exec.lxl 22,621 lines before, 22,625 after (the import of lexdb_txmode, the calls of `narrowed` and `setReadOnly`).

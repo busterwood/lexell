@@ -700,6 +700,65 @@ pub fn (t: &Txn) wroteSince(tree: int, from: int): bool {
     return false
 }
 
+// The keys of tree the transaction put or deleted since its write from (a statement's mark: the rows it changed or deleted
+// there, and those it put), each once; None past most of them, or when it deleted a range of tree since (lexdb_assert: the
+// rows a statement took out of a table an assertion reads).
+pub fn (t: &Txn) changedKeys(tree: int, from: int, most: int): Option[[]str] {
+    var out: []str = []
+    var seen: Map[str, bool] = newMap()
+    var i = if from < 0 { 0 } else { from }
+    while i < len(t.writes) {
+        let w = &t.writes[i]
+        if w.tree == tree {
+            if w.op == OP_DELRANGE || w.op == OP_DROP { return None }
+            if !seen.has(&w.key) {
+                if len(out) >= most { return None }
+                seen.put(w.key.clone(), true)
+                append(mut &out, w.key.clone())
+            }
+        }
+        i += 1
+    }
+    return Some(out)
+}
+
+// Past this many writes before a statement's mark, beforeMark does not look for a key's own earlier write.
+const BEFORE_SCAN = 4096
+
+// Key of tree as it was before the transaction's write from on (a statement's mark): its own last write before then, else the
+// stored row as its reads see the store (a range delete before then: none). Some(None): there was none; None: not known (a
+// key it wrote both before and since a mark past BEFORE_SCAN writes). lexdb_assert: the old row a statement deleted or changed.
+pub fn (st: &Store) beforeMark(t: mut &Txn, tree: int, key: &str, from: int): Result[Option[Option[str]], lexdb_base.DbErr] {
+    match t.lastWrite(tree, key) {
+        Some(last) {
+            if last < from {
+                if t.writes[last].op == OP_DEL { return Ok(Some(None)) }
+                return Ok(Some(Some(t.writes[last].val.clone())))
+            }
+            if from > BEFORE_SCAN { return Ok(None) }
+            var i = from - 1
+            while i >= 0 {
+                let w = &t.writes[i]
+                if w.tree == tree && w.key == key && (w.op == OP_PUT || w.op == OP_DEL) {
+                    if w.op == OP_DEL { return Ok(Some(None)) }
+                    return Ok(Some(Some(w.val.clone())))
+                }
+                i -= 1
+            }
+        }
+        None {}
+    }
+    for c in t.cuts {
+        if c.pos < from && c.tree == tree && key >= c.lo && (len(c.hi) == 0 || key < c.hi) { return Ok(Some(None)) }
+    }
+    // (not noted for the commit's check, as the assertion's own reads)
+    let was = t.quiet
+    t.quiet = true
+    let got = st.getBaseIn(t, tree, key, M_FULL)
+    t.quiet = was
+    return Ok(Some(try got))
+}
+
 // ---- slots and the cache
 
 fn (db: mut &Db) allocSlot(): int {

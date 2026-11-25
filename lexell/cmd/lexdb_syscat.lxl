@@ -1003,6 +1003,19 @@ fn appendRows(rows: mut &[][]Val, more: [][]Val) {
 
 // A role's principal_id in sys.database_principals: public 0, a superuser (or a name no role has: a trusted login) dbo 1,
 // else 5 and on over the other roles in their order.
+// The owner of schema s as SQL Server names it (CREATE SCHEMA ... AUTHORIZATION x): x, dbo for a superuser's (or no owner kept).
+fn schemaOwner(snap: &lexdb_catalog.CatSnap, roles: &[]lexdb_catalog.Role, s: &str): str {
+    let obj = lexdb_catalog.nspObj(s)
+    match snap.acls.get(&obj) {
+        Some(v) {
+            let a = lexdb_catalog.decAcl(&obj, &v)
+            if sysPrincipalId(roles, &a.owner) > 1 { return a.owner.clone() }
+        }
+        None {}
+    }
+    return "dbo"
+}
+
 fn sysPrincipalId(roles: &[]lexdb_catalog.Role, name: &str): int {
     if len(name) == 0 { return 0 }
     var n = 0
@@ -1053,7 +1066,7 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] 
             rows = sysFull(&"schemas")
             for s in snap.schemas {
                 if s == "public" || lexdb_base.isTempSchema(&s) { continue }
-                append(mut &rows, [tv(&s), iv(lexdb_sql.nameOid("n", &s)), iv(1)])
+                append(mut &rows, [tv(&s), iv(lexdb_sql.nameOid("n", &s)), iv(sysPrincipalId(roles, &schemaOwner(snap, roles, &s)))])
             }
         }
         "configurations", "syslanguages", "fulltext_languages", "database_scoped_configurations", "data_spaces",
@@ -1575,7 +1588,10 @@ fn (r: mut &IRow) i(name: &str, n: int) { r.set(name, Val.Int(n)) }
 
 pub fn infoRows(cq: &lexdb_catalog.CatView, rel: &str, names: &[]str, rows: [][]Val): [][]Val {
     if !(rel == "information_schema.schemata" || rel == "information_schema.routines" || rel == "information_schema.parameters" ||
-         rel == "information_schema.constraint_column_usage") { return rows }
+         rel == "information_schema.constraint_column_usage" || rel == "information_schema.column_privileges" || rel == "information_schema.domains") { return rows }
+    // (SQL Server's COLUMN_PRIVILEGES lists the grants on columns, and lexdb grants on whole tables only; its DOMAINS the alias
+    // types, which lexdb has not)
+    if rel == "information_schema.column_privileges" || rel == "information_schema.domains" { return [] }
     let db = "lexdb"
     var out: [][]Val = []
     let snap = &cq.snap
@@ -1590,8 +1606,8 @@ pub fn infoRows(cq: &lexdb_catalog.CatView, rel: &str, names: &[]str, rows: [][]
             var r = newRow(names)
             r.s(&"catalog_name", db)
             r.s(&"schema_name", &list[k])
-            // (the fixed ones own themselves; a schema made is dbo's: SQL Server's sa is dbo)
-            r.s(&"schema_owner", &(if k < 13 { list[k].clone() } else { "dbo".toStr() }))
+            // (the fixed ones own themselves; a schema made is its AUTHORIZATION's, else dbo's: SQL Server's sa is dbo)
+            r.s(&"schema_owner", &(if k < 13 { list[k].clone() } else { schemaOwner(snap, &cq.roles, &list[k]) }))
             r.s(&"default_character_set_name", &"iso_1")
             append(mut &out, r.vals)
         }
