@@ -13317,6 +13317,7 @@ pub type Session = record {
     fnGen: int
     fnNames: []str
     rcDefault: bool             // SET default_transaction_isolation: true = read committed, false = serializable
+    roDefault: bool             // SET default_transaction_read_only (SET SESSION CHARACTERISTICS ... READ ONLY): its later transactions are read-only
     savedRc: []bool             // in a transaction block: rcDefault at its BEGIN
 }
 
@@ -13465,7 +13466,10 @@ fn (s: &Session) setting(name: &str): Option[str] {
         }
         // PostgreSQL's that clients ask for, fixed in lexdb (9.80)
         "standard_conforming_strings", "integer_datetimes", "is_superuser" { return Some("on") }
-        "transaction_read_only", "default_transaction_read_only", "in_hot_standby" { return Some(if name == "transaction_read_only" && s.readOnly && len(s.txn) > 0 { "on".toStr() } else { lexdb_standby.standbySetting(&s.st) }) }   // (on a replica, 9.137)
+        "transaction_read_only", "default_transaction_read_only", "in_hot_standby" {
+            let on = if name == "transaction_read_only" && len(s.txn) > 0 { s.readOnly } else if name == "in_hot_standby" { false } else { s.roDefault }
+            return Some(if on { "on".toStr() } else { lexdb_standby.standbySetting(&s.st) })
+        }   // (on a replica, 9.137)
         "server_version" { return Some("16.0") }
         "server_version_num" { return Some("160000") }
         "server_encoding", "client_encoding" { return Some("UTF8") }
@@ -13672,7 +13676,7 @@ fn (s: &Session) waitLsn(stmt: &lexdb_sql.Stmt): Result[Res, DbErr] {
 pub fn parkedSession(st: lexdb_store.Store): Session {
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS, timeoutMs: 0, dword: 0, maxMem: MAX_STATEMENT_MEM,
                    saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: 0, batch: true, rules: false, auto: true, rdel: true, saves: [], savedRoles: [],
-                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc().clone(), savedZone: [], tmp: "", onCommit: [], fresh: false, fnGen: -1, fnNames: [], rcDefault: false, savedRc: []}
+                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc().clone(), savedZone: [], tmp: "", onCommit: [], fresh: false, fnGen: -1, fnNames: [], rcDefault: false, roDefault: false, savedRc: []}
 }
 
 pub fn newSession(st: lexdb_store.Store): Session {
@@ -13681,7 +13685,7 @@ pub fn newSession(st: lexdb_store.Store): Session {
     st.memo.put(&"sessions", &id.toStr())
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS, timeoutMs: 0, dword: id, maxMem: MAX_STATEMENT_MEM,
                    saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true, rules: false, auto: true, rdel: true, saves: [], savedRoles: [],
-                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc().clone(), savedZone: [], tmp: "", onCommit: [], fresh: false, fnGen: -1, fnNames: [], rcDefault: false, savedRc: []}
+                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc().clone(), savedZone: [], tmp: "", onCommit: [], fresh: false, fnGen: -1, fnNames: [], rcDefault: false, roDefault: false, savedRc: []}
 }
 
 // max_statement_mem's default.
@@ -13924,6 +13928,30 @@ fn (s: mut &Session) tempWrite(stmt: &lexdb_sql.Stmt): bool {
     }
 }
 
+// SET SESSION CHARACTERISTICS ... READ ONLY | READ WRITE, SET default_transaction_read_only: the session's later transactions are
+// read-only (a block's s.readOnly at its BEGIN; a statement alone is refused in execStmt by its store's ro flag).
+fn (s: mut &Session) setRoDefault(on: bool) {
+    s.roDefault = on
+    s.st.ro = on || s.st.follower().isSome()
+}
+
+// A write statement outside a block of a session whose transactions are read-only: 25006 as PostgreSQL's, a temporary table's
+// writes apart.
+fn roDefaultRefuses(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Unit, DbErr] {
+    match writesOn(s) {
+        Some(what) {
+            if s.kind == lexdb_sql.S_INSERT || s.kind == lexdb_sql.S_UPDATE || s.kind == lexdb_sql.S_DELETE || s.kind == lexdb_sql.S_MERGE || (s.kind == lexdb_sql.S_COPY && s.copy.from) {
+                match catKey(st, txn, &s.table, false) {
+                    Ok(k) { if lexdb_catalog.tempRel(&k) { return Ok(Unit{}) } }
+                    Err(_) {}
+                }
+            }
+            return Err(e("25006", &("cannot execute " + what + " in a read-only transaction")))
+        }
+        None { return Ok(Unit{}) }
+    }
+}
+
 fn isWrite(kind: int): bool {
     return kind == lexdb_sql.S_CREATE || kind == lexdb_sql.S_DROP || kind == lexdb_sql.S_INSERT ||
            kind == lexdb_sql.S_UPDATE || kind == lexdb_sql.S_DELETE || kind == lexdb_sql.S_CREATE_INDEX ||
@@ -14026,11 +14054,13 @@ fn hasSubs(s: &lexdb_sql.Stmt): bool {
 fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
             lim: Limits, pc: mut &PlanCache, input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart,
             sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
-    if st.follower().isSome() {
-        match writesOn(s) {
-            Some(what) { try lexdb_standby.mayWrite(&st.memo.get(&lexdb_priv.doorKey(txn.sql.sess)).unwrapOr(""), s, &what) }
-            None {}
-        }
+    if st.ro {
+        if st.follower().isSome() {
+            match writesOn(s) {
+                Some(what) { try lexdb_standby.mayWrite(&st.memo.get(&lexdb_priv.doorKey(txn.sql.sess)).unwrapOr(""), s, &what) }
+                None {}
+            }
+        } else if !txn.inBlock() { try roDefaultRefuses(st, txn, s) }
     }
     if len(s.wins) > 0 && s.kind != lexdb_sql.S_SELECT {
         let what = if len(s.items) > 0 && s.kind != lexdb_sql.S_SELECT { "RETURNING" } else { stmtName(s.kind) }
@@ -14370,7 +14400,8 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                     }
                 }
                 if stmt.limit.isSome() || len(stmt.names) == 0 { try s.applySetting(&stmt.table, &val, false) }
-                if len(stmt.names) > 0 && len(s.txn) > 0 { try lexdb_txmode.setReadOnly(&s.st, mut &s.txn[0], mut &s.readOnly, s.fresh, stmt.names[0] == "read only") }
+                if len(stmt.names) > 0 && stmt.table == "default_transaction_isolation" { s.setRoDefault(stmt.names[0] == "read only") }
+                else if len(stmt.names) > 0 && len(s.txn) > 0 { try lexdb_txmode.setReadOnly(&s.st, mut &s.txn[0], mut &s.readOnly, s.fresh, stmt.names[0] == "read only") }
             } else if stmt.table != "" {
                 var v = -1                          // DEFAULT, RESET
                 match stmt.limit {
@@ -14398,13 +14429,14 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             if len(s.txn) == 0 {
                 lexdb_stats.chgEnd(&s.st, s.id, false)          // (counts an earlier failed statement left: optimizer 44)
                 let rc = if stmt.table == "read committed" { true } else if stmt.table == "serializable" { false } else { s.rcDefault }
-                if stmt.ifFlag {
+                let ro = stmt.ifFlag || (s.roDefault && len(stmt.names) == 0)       // (BEGIN READ WRITE: names)
+                if ro {
                     append(mut &s.txn, try s.st.beginSnapshot())     // READ ONLY: a snapshot (4.5)
                     s.txn[0].rc = rc
                 } else {
                     append(mut &s.txn, lexdb_store.beginBlockLazy(rc))
                 }
-                s.readOnly = stmt.ifFlag
+                s.readOnly = ro
                 s.failed = false
                 s.fresh = true
                 s.saves = []
