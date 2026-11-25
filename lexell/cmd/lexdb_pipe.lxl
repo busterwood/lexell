@@ -7918,6 +7918,7 @@ type SortSt = record {
     ties: int
     pct: bool
     top: int
+    text1: bool             // single BK_TEXT output sorted by itself with COLL_EXACT (stored once in keys[0].strs)
 }
 
 // Whether p (under its Limit) is a Sort or Distinct that holds its rows
@@ -7946,7 +7947,7 @@ fn projUnder(p: &lexdb_plan.PPlan): &lexdb_plan.PPlan {
 fn sortRun(p: &lexdb_plan.PPlan, cap: int, bud: &Budget): SortSt {
     var sr = SortSt{sorting: false, distinct: false, shown: 0, keyCol: [], desc: [], nf: [], coll: [], dcoll: [], kinds: [],
                      limit: -1, offset: 0, topK: -1, early: false, dmode: 0, ds: [], set: SortSet{outs: [], ovals: [], keys: [], vk: [], seq: [], bytes: [], n: 0}, heap: [], scr: -1,
-                     seq: 0, held: 0, room: bud.room(), maxHeld: bud.maxHeld, mixed: false, row: [], don: 0, ties: 0, pct: false, top: -1}
+                     seq: 0, held: 0, room: bud.room(), maxHeld: bud.maxHeld, mixed: false, row: [], don: 0, ties: 0, pct: false, top: -1, text1: false}
     sr.shown = projLen(projUnder(p))
     sortArmOf(p, mut &sr)
     if cap >= 0 && (sr.limit < 0 || cap < sr.limit) { sr.limit = cap }
@@ -7961,6 +7962,15 @@ fn sortRun(p: &lexdb_plan.PPlan, cap: int, bud: &Budget): SortSt {
     let whole = sr.don > 0 || sr.ties != 0 || sr.pct || sr.top >= 0
     sr.topK = if sr.sorting && sr.limit >= 0 && !sr.distinct && !whole { sr.limit + max(sr.offset, 0) } else { -1 }
     sr.early = !sr.sorting && sr.limit >= 0
+    // SELECT DISTINCT c ... ORDER BY c with matching collation: skip hashing
+    // in eat() and deduplicate adjacent equal sorted rows in cutOf (don = 1).
+    if sr.distinct && sr.sorting && sr.don == 0 && sr.topK < 0 && sr.shown == 1 && len(sr.keyCol) == 1 && sr.keyCol[0] == 0 {
+        let dc0 = if len(sr.dcoll) > 0 { sr.dcoll[0] } else { lexdb_sql.COLL_EXACT }
+        if dc0 == sr.coll[0] {
+            sr.don = 1
+            sr.distinct = false
+        }
+    }
     if sr.distinct { append(mut &sr.ds, DistSet{ints: newMap(), keys: newMap(), nul: false, kb: ""}) }
     return sr
 }
@@ -7979,7 +7989,7 @@ pub fn setSort(ncol: int, keyCol: []int, desc: []bool, nf: []bool, coll: []int, 
                room: int, maxMem: int): SortRun {
     var sr = SortSt{sorting: true, distinct: false, shown: ncol, keyCol: keyCol, desc: desc, nf: nf, coll: coll, dcoll: [], kinds: [],
                      limit: limit, offset: max(offset, 0), topK: -1, early: false, dmode: 0, ds: [], set: SortSet{outs: [], ovals: [], keys: [], vk: [], seq: [], bytes: [], n: 0},
-                     heap: [], scr: -1, seq: 0, held: 0, room: room, maxHeld: maxMem, mixed: false, row: [], don: 0, ties: 0, pct: false, top: -1}
+                     heap: [], scr: -1, seq: 0, held: 0, room: room, maxHeld: maxMem, mixed: false, row: [], don: 0, ties: 0, pct: false, top: -1, text1: false}
     sr.topK = if limit >= 0 { limit + sr.offset } else { -1 }
     return SortRun{st: [sr]}
 }
@@ -8076,6 +8086,46 @@ fn (sr: mut &SortSt) begin(ob: &lexdb_rows.OutBatch, ncol: int) {
     if sr.distinct {
         sr.dmode = if sr.shown == 1 && sr.kinds[0] != BK_VAL { 1 } else if sr.shown == 1 { 2 } else { 3 }
     }
+    if sr.sorting && !sr.distinct && sr.topK < 0 && sr.shown == 1 && len(sr.keyCol) == 1 && sr.keyCol[0] == 0 &&
+       sr.coll[0] == lexdb_sql.COLL_EXACT && ob.n > 0 && ob.src[0] >= 0 && ob.kinds[0] == lexdb_rows.BK_TEXT {
+        sr.text1 = true
+        sr.set.keys[0] = lexdb_sort.newSKey(lexdb_sort.SK_TEXT, sr.desc[0], sr.nf[0])
+    }
+}
+
+// Materializes a text1 sort back into generic BK_VAL keys/ovals if a later
+// input batch is not a BK_TEXT OutBatch (e.g., UNION with a row-path arm).
+fn (sr: mut &SortSt) dropText1() {
+    sr.text1 = false
+    let n = sr.set.n
+    var kvals: []Val = withCapacity(n)
+    var ovals: []Val = withCapacity(n)
+    var nuls: []bool = withCapacity(n)
+    var seqs: []int = withCapacity(n)
+    var bs: []int = withCapacity(n)
+    for i in 0..n {
+        if sr.set.keys[0].nul[i] {
+            append(mut &kvals, Val.Null)
+            append(mut &ovals, Val.Null)
+            append(mut &nuls, true)
+            append(mut &bs, 80)
+        } else {
+            let s = &sr.set.keys[0].strs[i]
+            append(mut &kvals, Val.Text(s.clone()))
+            append(mut &ovals, Val.Text(s.clone()))
+            append(mut &nuls, false)
+            append(mut &bs, 80 + 2 * len(s))
+        }
+        append(mut &seqs, i + 1)
+    }
+    var key = lexdb_sort.newSKey(lexdb_sort.SK_VAL, sr.desc[0], sr.nf[0])
+    key.vals = kvals
+    sr.set.keys[0] = key
+    sr.set.vk[0] = if n > 0 { lexdb_sql.K_TEXT } else { 0 }
+    sr.set.ovals[0] = ovals
+    sr.set.outs[0] = lexdb_rows.BVec{v: [], nul: nuls}
+    sr.set.seq = seqs
+    sr.set.bytes = bs
 }
 
 // Column c of row j of what the run gave (ob, or the row r when ob.n is
@@ -8344,6 +8394,33 @@ fn hDown(set: &SortSet, heap: mut &[]int, i: int) {
 fn (sr: mut &SortSt) eat(ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
     let ncol = if ob.n > 0 { len(ob.kinds) } else { len(r) }
     if len(sr.kinds) == 0 { sr.begin(ob, ncol) }
+    if sr.text1 {
+        if ob.n > 0 && ob.src[0] >= 0 && ob.kinds[0] == lexdb_rows.BK_TEXT {
+            let c = ob.src[0]
+            let col = &ob.cols[c]
+            let txt = &ob.txt[c]
+            for j in 0..ob.n {
+                sr.seq += 1
+                let rr = ob.idx[j]
+                if col.nul[rr] {
+                    append(mut &sr.set.keys[0].strs, "")
+                    append(mut &sr.set.keys[0].nul, true)
+                    sr.held += 56
+                } else {
+                    let w = col.v[rr]
+                    let a = w >> 24
+                    let l = w & lexdb_rows.TEXT_MAX
+                    append(mut &sr.set.keys[0].strs, txt[a..a + l].clone())
+                    append(mut &sr.set.keys[0].nul, false)
+                    sr.held += 56 + l
+                }
+                sr.set.n += 1
+                if sr.room >= 0 && sr.held > sr.room { return Err(memErr(sr.maxHeld)) }
+            }
+            return Ok(true)
+        }
+        sr.dropText1()
+    }
     let m = if ob.n > 0 { ob.n } else { 1 }
     for j in 0..m {
         sr.seq += 1
@@ -8403,7 +8480,13 @@ fn (sr: mut &SortSt) finish(txn: mut &lexdb_store.Txn, bud: mut &Budget,
                              give: &fn(mut &lexdb_store.Txn, &lexdb_rows.OutBatch, &[]Val): Result[bool, DbErr]): Result[int, DbErr] {
     var perm: []int = []
     let nk = len(sr.keyCol)
-    if sr.topK >= 0 {
+    if sr.text1 && sr.set.n > 0 {
+        let n = sr.set.n
+        perm = withCapacity(n)
+        for i in 0..n { append(mut &perm, i) }
+        var tmp: []int = array(n, 0)
+        lexdb_sort.skMerge(&sr.set.keys, 0, 1, mut &perm, 0, n, mut &tmp)
+    } else if sr.topK >= 0 {
         // the heap's rows in the input's order, then sorted by their keys (stable)
         var hs: []int = []
         for x in sr.heap { append(mut &hs, x) }
@@ -8441,6 +8524,55 @@ fn (sr: mut &SortSt) finish(txn: mut &lexdb_store.Txn, bud: mut &Budget,
     }
     if len(oidx) == 0 { return Ok(0) }
     let to = len(oidx)
+    if sr.text1 {
+        let strs = &sr.set.keys[0].strs
+        let nuls = &sr.set.keys[0].nul
+        var bv = lexdb_rows.bvec(to)
+        var buf = ""
+        var idxs: []int = withCapacity(to)
+        var fits = true
+        for q in 0..to {
+            let s = oidx[q]
+            append(mut &idxs, q)
+            if nuls[s] {
+                bv.nul[q] = true
+            } else {
+                let st = &strs[s]
+                if len(st) > lexdb_rows.TEXT_MAX || len(buf) > 0x7FFFFFFF {
+                    fits = false
+                    break
+                }
+                let a = len(buf)
+                buf += st
+                bv.v[q] = (a << 24) | len(st)
+            }
+        }
+        if fits {
+            let ob = lexdb_rows.OutBatch{n: to, kinds: [lexdb_rows.BK_TEXT], src: [0], idx: idxs, cols: [bv],
+                                         vals: [[]], txt: [buf], ex: []}
+            let noRow: []Val = []
+            let more = try give(txn, &ob, &noRow)
+            return Ok(to)
+        }
+        var ovals: []Val = withCapacity(to)
+        var bv2 = lexdb_rows.bvec(to)
+        var idxs2: []int = withCapacity(to)
+        for q in 0..to {
+            let s = oidx[q]
+            append(mut &idxs2, q)
+            if nuls[s] {
+                bv2.nul[q] = true
+                append(mut &ovals, Val.Null)
+            } else {
+                append(mut &ovals, Val.Text(strs[s].clone()))
+            }
+        }
+        let ob = lexdb_rows.OutBatch{n: to, kinds: [BK_VAL], src: [0], idx: idxs2, cols: [bv2],
+                                     vals: [ovals], txt: [], ex: []}
+        let noRow: []Val = []
+        let more = try give(txn, &ob, &noRow)
+        return Ok(to)
+    }
     let from = 0
     var srcs: []int = []
     var kinds: []int = []

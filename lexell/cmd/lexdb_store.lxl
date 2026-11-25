@@ -827,7 +827,7 @@ fn copyNode(n: &lexdb_page.Node): lexdb_page.Node {
         for x in n.cdir { append(mut &c.cdir, x) }
         return c
     }
-    for v in n.vals { append(mut &c.vals, v.clone()) }
+    for i in 0..len(n.vals) { append(mut &c.vals, n.vals[i].share()) }
     for k in n.kids { append(mut &c.kids, k) }
     return c
 }
@@ -2151,6 +2151,25 @@ fn (db: mut &Db) applyWrite(w: &TxWrite) {
     else if w.op == OP_DELRANGE { db.applyRange(w.tree, &w.key, &w.val) }
 }
 
+// Zero-allocation check for the first unloaded node on tree's path to k,
+// marking every loaded node visited as referenced for clock eviction (-1: all
+// nodes on the path are in memory).
+fn (db: mut &Db) pathNeed(tree: int, k: &str): int {
+    var s = match db.trees.get(&tree) {
+        Some(r) { r }
+        None { return -1 }
+    }
+    let w = lexdb_page.keyWord(k)
+    while true {
+        if !db.meta[s].loaded { return s }
+        db.meta[s].ref = true
+        let n = &db.pool[db.meta[s].frame]
+        if n.leaf { return -1 }
+        s = n.kids[n.childW(k, w)]
+    }
+    return -1
+}
+
 // The slot a write needs loaded before it can be applied, or -1: the leaf
 // of its key, and when it writes or removes a large value, the companion
 // tree's leaves its chunks are in or go to; for a drop, a slot on the
@@ -2189,8 +2208,8 @@ fn (db: mut &Db) writeNeeds(w: &TxWrite): int {
         return -1
     }
     if w.op == OP_PUT || w.op == OP_DEL {
-        let d = db.descend(w.tree, &w.key)
-        if d.need >= 0 { return d.need }
+        let need = db.pathNeed(w.tree, &w.key)
+        if need >= 0 { return need }
         let ovf = w.tree + OVF
         if db.trees.has(&ovf) {
             var touch = w.op == OP_PUT && lexdb_page.leafEntry(&w.key, &w.val) + 1 > lexdb_page.MAX_ENTRY
@@ -4357,12 +4376,26 @@ fn (st: &Store) commitLive(t: &Txn, durable: bool): Result[Unit, lexdb_base.DbEr
             // in its writes when they missed the cache (design/lexdb.md
             // 9.109). Each pass's descents mark the nodes they pass, so
             // loadMany's sweep keeps them.
-            var seen: Map[int, int] = newMap()
+            var seen: []Map[int, int] = []
             for i in order {
                 let n = db.writeNeeds(&t.writes[i])
-                if n >= 0 && !seen.has(&n) {
-                    seen.put(n, 1)
-                    append(mut &needs, n)
+                if n < 0 { continue }
+                if len(seen) > 0 {
+                    if !seen[0].has(&n) {
+                        seen[0].put(n, 1)
+                        append(mut &needs, n)
+                    }
+                } else {
+                    var dup = false
+                    for x in needs { if x == n { dup = true; break } }
+                    if !dup {
+                        append(mut &needs, n)
+                        if len(needs) >= 16 {
+                            var m: Map[int, int] = newMap()
+                            for x in needs { m.put(x, 1) }
+                            append(mut &seen, m)
+                        }
+                    }
                 }
             }
             if len(needs) > 0 { return }
