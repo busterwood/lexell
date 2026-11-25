@@ -25,20 +25,38 @@ pub const TAG_TDIGEST = 3
 
 fn rotl64(x: u64, k: int): u64 { return (x << k) | (x >> (64 - k)) }
 
+fn mix64(x: u64): u64 {
+    // 4-round 32-bit-lane ARX mixer (non-linear carry diffusion across all 64 bits; cannot overflow u64).
+    let m32 = u64(0xffffffff)
+    var lo = (x & m32) ^ u64(0x27220a95)
+    var hi = ((x >> 32) & m32) ^ u64(0x517cc1b7)
+    for _ in 0..4 {
+        lo = (lo + hi + u64(0x9e3779b9)) & m32
+        hi = (((hi << 13) | (hi >> 19)) & m32) ^ lo
+        lo = ((lo << 7) | (lo >> 25)) & m32
+        hi = (hi + lo + u64(0x85ebca6b)) & m32
+        lo = (((lo << 17) | (lo >> 15)) & m32) ^ hi
+        hi = ((hi << 11) | (hi >> 21)) & m32
+    }
+    return (hi << 32) | lo
+}
+
 fn hashBytes64(s: &str): u64 {
     // 64-bit string hash + 4-round shift/rotate avalanche (uses only bitwise ops; cannot overflow).
-    var h = s.hash() ^ u64(len(s)) ^ u64(0x517cc1b727220a95)
-    h = h ^ (h >> 30) ^ rotl64(h, 17)
-    h = h ^ (h >> 27) ^ rotl64(h, 31)
-    h = h ^ (h >> 31) ^ rotl64(h, 13)
-    h = h ^ (h >> 29) ^ rotl64(h, 43)
-    return h
+    return mix64(s.hash() ^ u64(len(s)))
 }
 
 pub fn hashVal(v: &Val): u64 {
-    var kb = ""
-    lexdb_access.encIdxPart(mut &kb, v)
-    return hashBytes64(&kb)
+    // Zero-allocation fast paths for Int and Text (the dominant distinct-count column types).
+    match v {
+        Val.Int(n) { return mix64(u64(n) ^ u64(0x1e3779b97f4a7c15)) }
+        Val.Text(s) { return mix64(s.hash() ^ u64(len(s)) ^ u64(0x243f6a8885a308d3)) }
+        else {
+            var kb = ""
+            lexdb_access.encIdxPart(mut &kb, v)
+            return hashBytes64(&kb)
+        }
+    }
 }
 
 // ---- HyperLogLog++ (p = 12, M = 4096 registers, sparse <= 256 exact)
@@ -184,9 +202,8 @@ pub fn (h: mut &Hll) merge(other: &Hll) {
 }
 
 fn pow2Neg(r: int): float {
-    var x = 1.0f
-    for _ in 0..r { x = x * 0.5f }
-    return x
+    // Exact IEEE-754 2^(-r) for r in [0, 53] in one instruction.
+    return math.fromBits((1023 - r) << 52)
 }
 
 pub fn (h: &Hll) estimate(): int {
@@ -209,19 +226,20 @@ pub fn (h: &Hll) estimate(): int {
 
 pub fn (h: &Hll) toBytes(): str {
     if h.isEmpty() { return "" }
-    var b = ""
     if len(h.dense) == HLL_M {
-        b.addByte(byte(TAG_HLL_DENSE))
-        for i in 0..HLL_M { b.addByte(h.dense[i]) }
-        return b
+        var b: []byte = withCapacity(1 + HLL_M)
+        append(mut &b, byte(TAG_HLL_DENSE))
+        for i in 0..HLL_M { append(mut &b, h.dense[i]) }
+        return strFromBytes(&b)
     }
-    b.addByte(byte(TAG_HLL_SPARSE))
-    binary.addU32LE(mut &b, len(h.sparse))
+    var b: []byte = withCapacity(5 + len(h.sparse) * 8)
+    append(mut &b, byte(TAG_HLL_SPARSE))
+    binary.appendU32LE(mut &b, len(h.sparse))
     for x in h.sparse {
-        binary.addU32LE(mut &b, int(x & u64(0xffffffff)))
-        binary.addU32LE(mut &b, int(x >> 32))
+        binary.appendU32LE(mut &b, int(x & u64(0xffffffff)))
+        binary.appendU32LE(mut &b, int(x >> 32))
     }
-    return b
+    return strFromBytes(&b)
 }
 
 pub fn hllFromBytes(s: &str): Result[Hll, DbErr] {
@@ -249,9 +267,56 @@ pub fn hllFromBytes(s: &str): Result[Hll, DbErr] {
     return Err(e("22023", "invalid APPROX_COUNT_DISTINCT sketch tag"))
 }
 
+// Fast-path merge of sparse bytes into dense bytes without decoding/allocating when no register improves.
+fn mergeSparseIntoDense(denseStr: &str, sparseStr: &str): Result[str, DbErr] {
+    if len(denseStr) != 1 + HLL_M { return Err(e("22023", "corrupt APPROX_COUNT_DISTINCT dense sketch")) }
+    if len(sparseStr) < 5 { return Err(e("22023", "invalid APPROX_COUNT_DISTINCT sketch data")) }
+    let n = binary.readU32LEStr(sparseStr, 1)
+    if len(sparseStr) != 5 + n * 8 { return Err(e("22023", "corrupt APPROX_COUNT_DISTINCT sparse sketch")) }
+    var changed = false
+    for i in 0..n {
+        let off = 5 + i * 8
+        let lo = u64(binary.readU32LEStr(sparseStr, off))
+        let hi = u64(binary.readU32LEStr(sparseStr, off + 4))
+        let h = lo | (hi << 32)
+        let idx = int(h >> 52)
+        if hllRho(h) > denseStr[1 + idx] { changed = true; break }
+    }
+    if !changed { return Ok(denseStr.toStr()) }
+    var out: []byte = withCapacity(1 + HLL_M)
+    appendStr(mut &out, denseStr)
+    for i in 0..n {
+        let off = 5 + i * 8
+        let lo = u64(binary.readU32LEStr(sparseStr, off))
+        let hi = u64(binary.readU32LEStr(sparseStr, off + 4))
+        let h = lo | (hi << 32)
+        let idx = int(h >> 52)
+        let rho = hllRho(h)
+        if rho > out[1 + idx] { out[1 + idx] = rho }
+    }
+    return Ok(strFromBytes(&out))
+}
+
 pub fn hllMergeBytes(a: &str, b: &str): Result[str, DbErr] {
     if len(a) == 0 { return Ok(b.toStr()) }
     if len(b) == 0 { return Ok(a.toStr()) }
+    let ta = int(a[0])
+    let tb = int(b[0])
+    if ta == TAG_HLL_DENSE && tb == TAG_HLL_SPARSE { return mergeSparseIntoDense(a, b) }
+    if ta == TAG_HLL_SPARSE && tb == TAG_HLL_DENSE { return mergeSparseIntoDense(b, a) }
+    if ta == TAG_HLL_DENSE && tb == TAG_HLL_DENSE {
+        if len(a) != 1 + HLL_M || len(b) != 1 + HLL_M {
+            return Err(e("22023", "corrupt APPROX_COUNT_DISTINCT dense sketch"))
+        }
+        var out: []byte = withCapacity(1 + HLL_M)
+        append(mut &out, byte(TAG_HLL_DENSE))
+        for i in 0..HLL_M {
+            let va = a[1 + i]
+            let vb = b[1 + i]
+            append(mut &out, if vb > va { vb } else { va })
+        }
+        return Ok(strFromBytes(&out))
+    }
     var ha = try hllFromBytes(a)
     let hb = try hllFromBytes(b)
     ha.merge(&hb)
@@ -260,15 +325,36 @@ pub fn hllMergeBytes(a: &str, b: &str): Result[str, DbErr] {
 
 pub fn hllEstimateBytes(s: &str): Result[int, DbErr] {
     if len(s) == 0 { return Ok(0) }
-    let h = try hllFromBytes(s)
-    return Ok(h.estimate())
+    let tag = int(s[0])
+    if tag == TAG_HLL_SPARSE {
+        if len(s) < 5 { return Err(e("22023", "invalid APPROX_COUNT_DISTINCT sketch data")) }
+        let n = binary.readU32LEStr(s, 1)
+        if len(s) != 5 + n * 8 { return Err(e("22023", "corrupt APPROX_COUNT_DISTINCT sparse sketch")) }
+        return Ok(n)
+    }
+    if tag == TAG_HLL_DENSE {
+        if len(s) != 1 + HLL_M { return Err(e("22023", "corrupt APPROX_COUNT_DISTINCT dense sketch")) }
+        var sum = 0.0f
+        var zeros = 0
+        for i in 0..HLL_M {
+            let r = int(s[1 + i])
+            if r == 0 { zeros += 1 }
+            sum += pow2Neg(r)
+        }
+        let m = float(HLL_M)
+        var est = HLL_ALPHA * m * m / sum
+        if est <= 2.5f * m && zeros > 0 {
+            est = m * (m / float(zeros)).ln()
+        }
+        return Ok(int((est + 0.5f).floor()))
+    }
+    return Err(e("22023", "invalid APPROX_COUNT_DISTINCT sketch tag"))
 }
 
 // ---- Dunning Merging t-digest (delta = 100, exact extremes, <0.5% quantile error)
 
 const TD_DELTA = 100.0f
-const TD_BUF_MAX = 512
-const TD_TWO_PI = 6.283185307179586f
+const TD_BUF_MAX = 1024
 
 pub type TDigest = record {
     pub means: []float
@@ -283,13 +369,6 @@ pub fn newTDigest(): TDigest {
 
 pub fn (td: &TDigest) isEmpty(): bool {
     return td.totalW <= 0.0f || len(td.means) == 0
-}
-
-fn k1Scale(q: float): float {
-    var x = 2.0f * q - 1.0f
-    if x < -1.0f { x = -1.0f }
-    if x > 1.0f { x = 1.0f }
-    return (TD_DELTA / TD_TWO_PI) * x.asin()
 }
 
 pub fn (td: mut &TDigest) compress() {
@@ -314,23 +393,23 @@ pub fn (td: mut &TDigest) compress() {
     var weightSoFar = 0.0f
     var curM = td.means[idx[0]]
     var curW = td.weights[idx[0]]
-    var k0 = k1Scale(0.0f)
+    let invTotal = 1.0f / td.totalW
+    let scaleK = 4.0f * td.totalW / TD_DELTA
 
     for j in 1..n {
         let m = td.means[idx[j]]
         let w = td.weights[idx[j]]
         let propW = curW + w
-        let q1 = (weightSoFar + propW) / td.totalW
-        let k1 = k1Scale(q1)
-        // Merge if within scale budget (or identical mean), keeping singleton extremes sharp.
-        if m == curM || (k1 - k0 <= 1.0f && !(j == 1 && curW == 1.0f && m > curM) && !(j == n - 1 && w == 1.0f && m > curM)) {
+        let q = (weightSoFar + propW * 0.5f) * invTotal
+        let maxW = scaleK * q * (1.0f - q)
+        // Merge if within quadratic Dunning weight budget (or identical mean), keeping singleton extremes sharp.
+        if m == curM || (propW <= maxW && !(j == 1 && curW == 1.0f && m > curM) && !(j == n - 1 && w == 1.0f && m > curM)) {
             curM = (curM * curW + m * w) / propW
             curW = propW
         } else {
             append(mut &outM, curM)
             append(mut &outW, curW)
             weightSoFar += curW
-            k0 = k1Scale(weightSoFar / td.totalW)
             curM = m
             curW = w
         }
@@ -394,15 +473,15 @@ pub fn (td: mut &TDigest) toBytes(): str {
     if td.isEmpty() { return "" }
     if td.dirty { td.compress() }
     let n = len(td.means)
-    var b = ""
-    b.addByte(byte(TAG_TDIGEST))
-    binary.addU32LE(mut &b, n)
-    binary.addU64LE(mut &b, math.bitsOf(td.totalW))
+    var b: []byte = withCapacity(13 + n * 16)
+    append(mut &b, byte(TAG_TDIGEST))
+    binary.appendU32LE(mut &b, n)
+    binary.appendU64LE(mut &b, math.bitsOf(td.totalW))
     for i in 0..n {
-        binary.addU64LE(mut &b, math.bitsOf(td.means[i]))
-        binary.addU64LE(mut &b, math.bitsOf(td.weights[i]))
+        binary.appendU64LE(mut &b, math.bitsOf(td.means[i]))
+        binary.appendU64LE(mut &b, math.bitsOf(td.weights[i]))
     }
-    return b
+    return strFromBytes(&b)
 }
 
 pub fn tdFromBytes(s: &str): Result[TDigest, DbErr] {
