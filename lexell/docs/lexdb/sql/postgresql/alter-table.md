@@ -49,7 +49,8 @@ action:
   otherwise). `IF NOT EXISTS` skips a column that is there, with a notice.
 
 `DROP COLUMN`
-: Removes a column, with the indexes and constraints on it. `IF EXISTS` skips one that is not there.
+: Removes a column, with the indexes and constraints on it. `IF EXISTS` skips one that is not there. A column that a
+  view uses is 2BP01 (the DETAIL names the views); `CASCADE` drops those views, and the views over them (example K).
 
 `ALTER COLUMN ... TYPE`
 : Changes a column's type, converting each value. `USING` gives the new value as an expression of the old row;
@@ -134,10 +135,12 @@ action:
   ALTER TABLE takes ADD, DROP, ALTER COLUMN, VALIDATE CONSTRAINT, RENAME and SET SCHEMA`).
 - `ALTER CONSTRAINT ... DEFERRABLE`, `INITIALLY DEFERRED` and `NOT DEFERRABLE` are 0A000 (`lexdb: ALTER
   CONSTRAINT ... DEFERRABLE is not supported`); only `ENFORCED` and `NOT ENFORCED` are taken.
-- While a view reads the table, `DROP COLUMN` of any of its columns and `SET SCHEMA` are refused (2BP01, `cannot
-  alter table t because view v depends on it (lexdb keeps a view's text: drop the view, then make it again)`).
-  PostgreSQL refuses only the drop of a column the view uses, and moves the table with the view following it. A
-  type change of a column a view uses is allowed; PostgreSQL refuses it (0A000).
+- `DROP COLUMN` is refused only for a column a view uses, as in PostgreSQL (2BP01, DETAIL and HINT as PostgreSQL's;
+  `CASCADE` drops the views). The DETAIL lists the views in lexdb's catalog order (by name), PostgreSQL's in the order
+  they were made, and `CASCADE` gives no NOTICE (`drop cascades to 2 other objects` and its DETAIL). While a view reads
+  the table, `SET SCHEMA` is refused (2BP01, `cannot alter table t because view v depends on it (lexdb keeps a view's
+  text: drop the view, then make it again)`); PostgreSQL moves the table with the view following it. A type change of a
+  column a view uses is allowed; PostgreSQL refuses it (0A000).
 - `OWNER TO postgres` gives 42704 `role "postgres" does not exist`, although `pg_roles` lists `postgres` and the
   session runs as it. `OWNER TO` a role made with `CREATE ROLE` works.
 - A view that selects `*` from the table shows the columns added and dropped later (see [CREATE
@@ -526,6 +529,48 @@ ALTER TABLE
 INSERT 0 1
 ERROR:  null value in column "holder" of relation "badge" violates not-null constraint
 DETAIL:  Failing row contains (2, null, 2026-01-01, null).
+```
+
+### K. DROP COLUMN under views
+
+<!-- example: postgresql -->
+```sql
+CREATE TABLE crew (id int PRIMARY KEY, name text, rank_no int, notes text);
+INSERT INTO crew VALUES (1, 'Ann', 3, 'lead');
+CREATE VIEW v_crew AS SELECT id, name FROM crew;
+CREATE VIEW v_crew_top AS SELECT id, name FROM v_crew;
+ALTER TABLE crew DROP COLUMN notes;
+ALTER TABLE crew DROP COLUMN name;
+SELECT * FROM v_crew_top;
+ALTER TABLE crew DROP COLUMN name CASCADE;
+SELECT table_name FROM information_schema.views WHERE table_name LIKE 'v\_crew%' ORDER BY table_name;
+SELECT * FROM crew;
+```
+
+```text
+CREATE TABLE
+INSERT 0 1
+CREATE VIEW
+CREATE VIEW
+ALTER TABLE
+ERROR:  cannot drop column name of table crew because other objects depend on it
+DETAIL:  view v_crew depends on column name of table crew
+view v_crew_top depends on view v_crew
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+ id | name
+----+------
+  1 | Ann
+(1 row)
+
+ALTER TABLE
+ table_name
+------------
+(0 rows)
+
+ id | rank_no
+----+---------
+  1 |       3
+(1 row)
 ```
 
 ## See also

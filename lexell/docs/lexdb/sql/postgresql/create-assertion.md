@@ -94,6 +94,12 @@ that is not is 0A000, `assertion's query is not supported: ` and the reason:
 | `ALTER TABLE ... TYPE` of a column | The values are cast, and the whole query then runs: 23514 if it fails. |
 | `ADD COLUMN`, another column | Allowed. |
 
+## Whose rights the check has
+
+The check runs with the rights of the assertion's owner, as in the Oracle door: a user with `INSERT`, `UPDATE` or
+`DELETE` on an asserted table and no `SELECT` on it is not refused (42501); the write is checked, and breaks it with
+23514. The user's own `WHERE` and `RETURNING` still need the privilege.
+
 ## Catalog
 
 `information_schema.assertions` lists it (`constraint_catalog`, `constraint_schema`, `constraint_name`,

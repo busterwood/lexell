@@ -29,6 +29,9 @@ reference pages:
 - **Dropped from any door.** `DROP ASSERTION` in one door drops it for all.
 - **One namespace with tables.** An assertion's name cannot be a table's, view's or sequence's (ORA-00955, 42P07,
   2714), nor the other way round.
+- **The check has the owner's rights, in every door.** A user with `INSERT`, `UPDATE` or `DELETE` on an asserted table
+  and no `SELECT` on it is not refused: the write is checked, as Oracle checks it (ORA-08601, 547, 23514 when it breaks
+  the assertion). The user's own `WHERE` and `SELECT` still need the privilege.
 - **Replicas never check.** A replica applies what the master decided, so it does not check an assertion; the master
   refuses the write first. `CREATE ASSERTION` on a replica is refused as any DDL is (ORA-16000 in the Oracle door). An
   assertion made on the master is listed on the replica.

@@ -109,8 +109,10 @@ or a table, view or sequence is 2714; `DROP` of none is 3701; a schema that is n
 ## Catalog
 
 `INFORMATION_SCHEMA.ASSERTIONS` lists it, `INFORMATION_SCHEMA.CHECK_CONSTRAINTS` has its row (`CHECK_CLAUSE`, as
-written) and `INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE` has a row per column it reads. `CONSTRAINT_SCHEMA` shows
-`public` where `dbo` is meant.
+written) and `INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE` has a row per column it reads. `CONSTRAINT_SCHEMA` is `dbo`.
+
+The check runs with the rights of the assertion's owner, as in the Oracle door: a user with `INSERT`, `UPDATE` or
+`DELETE` on an asserted table and no `SELECT` is not refused (229); the write is checked, and breaks it with 547.
 
 There is **no `sys.objects` row**: SQL Server has no object type for an assertion, and a made-up one would be listed
 by SSMS's Object Explorer and by `sp_help` under nothing. So SSMS, `sqlcmd`'s `sp_help` and mssql-jdbc's
