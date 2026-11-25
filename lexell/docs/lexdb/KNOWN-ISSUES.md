@@ -5,8 +5,9 @@ that main ca687450, a15b9a64, 02646472, 436468d8, 81ee25d1, e689d814 and 7b6b123
 reworded to what is left; the new pages and examples were checked against main 60c08a84; the time zone entries were
 reworded after the merge of timestamps that keep their offset, main 178ea2df, and checked against main 55040a20; the
 Oracle annotation entry was reworded to what is left after the merge of annotations, main 6c2e83f1; the entries that
-the third bug slice fixed, main 84ceec7e, 2026-11-25, are removed or reworded to what is left, checked against it). They
-are not fixed here: the pages describe what lexdb does. Each "Differences" section of the reference lists the smaller
+the third bug slice fixed, main 84ceec7e, 2026-11-25, are removed or reworded to what is left, checked against it; the
+property graph entries are what is left after the merge of SQL/PGQ in the Oracle door, main e7691bd6, 2026-11-25, and
+were checked against it and Oracle Free 23.26.3). They are not fixed here: the pages describe what lexdb does. Each "Differences" section of the reference lists the smaller
 differences of its statement.
 
 ## All doors
@@ -456,6 +457,33 @@ differences of its statement.
     `UPDATE ... FROM`, `DELETE ... USING`, `WITH RECURSIVE`.
   - `TRUNCATE` of a table a foreign key refers to is ORA-03001 (Oracle: ORA-02266); `TRUNCATE ... CASCADE`
     truncates the referencing tables whether or not the key is `ON DELETE CASCADE`; an identity column continues.
+- **Property graphs** (SQL/PGQ, supported since main e7691bd6; see [GRAPH_TABLE](sql/oracle/graph-table.md) and
+  [CREATE PROPERTY GRAPH](sql/oracle/create-property-graph.md)):
+  - Not supported (ORA-03001): `ONE ROW PER VERTEX` and `ONE ROW PER STEP`, and so `ELEMENT_NUMBER`; `LISTAGG ...
+    WITHIN GROUP` and `DISTINCT` in an aggregate of a quantified variable; a pattern that needs more than 4,096 joins
+    (Oracle runs out of memory on one, ORA-04036 at `{1,5000}`). `ALTER PROPERTY GRAPH ... COMPILE` is ORA-03001 and
+    privileges on a graph (`GRANT READ ON PROPERTY GRAPH g`) ORA-00942; `COMMENT ON PROPERTY GRAPH` is accepted and not
+    kept (`USER_PG_COMMENTS.COMMENTS` stays empty).
+  - `VERTEX_ID` and `EDGE_ID` give the JSON's text as `VARCHAR2` (Oracle: `JSON`; lexdb has no JSON type), and
+    `MATCHNUM()`'s numbers are lexdb's own (one a match, as in Oracle, but not Oracle's numbers).
+  - A quoted graph name is matched without its case: `GRAPH_TABLE (mixg ...)` and `DROP PROPERTY GRAPH mixg` find
+    `"MixG"` (Oracle: ORA-42421). Quoted labels are matched with their case, as in Oracle.
+  - `USER_OBJECTS.STATUS` of a graph says whether the tables and columns it names are there. Oracle marks a graph
+    `INVALID` when a column of one of its tables is changed (`ALTER TABLE ... MODIFY`, a column renamed) even with its
+    names all there, and `VALID` at its next use (`ADD` of a column and `CREATE INDEX` leave it `VALID`).
+    `USER_PG_ELEMENTS.OBJECT_NAME`, `USER_PG_PROP_DEFINITIONS.COLUMN_NAME` and the types in `USER_PG_LABEL_PROPERTIES`
+    stay as they were at `CREATE` (Oracle's follow a rename and a `MODIFY`). `USER_PG_LABEL_PROPERTIES.DATA_LENGTH` is
+    the property's own column's; Oracle gives every property of one name in the graph the longest length of them.
+  - A view over a dropped graph is ORA-42421 when read and stays `VALID` (Oracle: ORA-04063, `INVALID`).
+  - A PL/SQL variable inside `GRAPH_TABLE` is read as a bind (Oracle refuses it: ORA-49028).
+  - Other errors (found on main e7691bd6): the texts of ORA-40983 and ORA-49044 say `is noRows defined` (Oracle: `is
+    never defined`); a property only vertex labels have, read through an edge variable (or the other way round), is
+    ORA-49044 (Oracle: ORA-40983); `{m,}` is ORA-40985 (Oracle: ORA-40984); `SOURCE v` without `KEY` when the edge
+    table has two foreign keys to `v`'s table is ORA-42413 (Oracle: ORA-42431); ORA-42442's text is `cannot infer key
+    for graph element view V` (Oracle: `KEY is not specified for view graph element table V.`); ORA-04045 has no
+    second line with its cause (Oracle adds ORA-00942 or ORA-00904); `DROP PROPERTY GRAPH g CASCADE` (or `PURGE`) is
+    ORA-00900 (Oracle: ORA-03049); `GRAPH_TABLE (...) AS x` is ORA-03048 as in Oracle, but its text keeps only `...)`
+    of the statement before `AS`.
 - **QUALIFY** (Oracle 23.26's clause; see [QUALIFY](sql/oracle/qualify.md)):
   - The ORA-03049 text keeps at most 28 characters of the statement before the word (Oracle cuts differently after a
     long `CONNECT BY`).
@@ -479,6 +507,9 @@ differences of its statement.
     `ALTER INDEX ... REBUILD`, `COALESCE`, `[NO]PARALLEL`, `[NO]LOGGING` and `ALTER VIEW ... COMPILE` are accepted and do
     nothing; `COMMIT COMMENT` and `COMMIT WRITE` are ORA-00900; `COMMENT ON` does not keep the comment and accepts a
     missing table.
+  - A foreign key of type `NUMBER` or `NUMBER(p)` to a `NUMBER GENERATED ... AS IDENTITY` key is refused (ORA-00932,
+    `Key columns "p" and "id" are of incompatible types: numeric and bigint`); an `INTEGER` one is taken, and Oracle
+    takes both (found on main e7691bd6).
   - `USER_TAB_COLUMNS.DATA_DEFAULT` of a column whose default is a sequence shows `nextval('s')` (Oracle:
     `"APP"."S"."NEXTVAL"`).
   - Sequences: past `MAXVALUE` the error is ORA-20000 (Oracle ORA-08004); `CURRVAL` before `NEXTVAL` is ORA-20000
