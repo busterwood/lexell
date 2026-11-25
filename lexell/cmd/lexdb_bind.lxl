@@ -1796,8 +1796,7 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
             let l = try resolve(&a, cols, n, ns)
             let r = try resolve(&b, cols, n, ns)
             if op == "||" {
-                let ptj = ptypesOf(ns)
-                if exprOid(&l, cols, &ptj, &ns.ty) == lexdb_sql.OID_JSONB || exprOid(&r, cols, &ptj, &ns.ty) == lexdb_sql.OID_JSONB {
+                if isJsonb(&l, cols, ns) || isJsonb(&r, cols, ns) {
                     return Ok(Expr.Call("#jsonb_concat", [l, r], false))
                 }
                 // with an array: array_cat, array_append or array_prepend (9.92)
@@ -1810,8 +1809,8 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                 return Ok(Expr.Bin(op.clone(), lt, rt))
             }
             if op == "-" {
-                let ptj = ptypesOf(ns)
-                if exprOid(&l, cols, &ptj, &ns.ty) == lexdb_sql.OID_JSONB {
+                if isJsonb(&l, cols, ns) {
+                    let ptj = ptypesOf(ns)
                     let isArr = if lexdb_sql.elemOid(exprOid(&r, cols, &ptj, &ns.ty)) > 0 { 1 } else { 0 }
                     return Ok(Expr.Call("#jsonb_del", [l, r, Expr.Lit(Val.Int(isArr))], false))
                 }
@@ -1837,10 +1836,10 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
             if isCmp(&op) {
                 var lx = l
                 var rx = r
-                let ptjb = ptypesOf(ns)
-                let lojb = exprOid(&lx, cols, &ptjb, &ns.ty)
-                let rojb = exprOid(&rx, cols, &ptjb, &ns.ty)
-                if lojb == lexdb_sql.OID_JSONB || rojb == lexdb_sql.OID_JSONB {
+                if isJsonb(&lx, cols, ns) || isJsonb(&rx, cols, ns) {
+                    let ptjb = ptypesOf(ns)
+                    let lojb = exprOid(&lx, cols, &ptjb, &ns.ty)
+                    let rojb = exprOid(&rx, cols, &ptjb, &ns.ty)
                     let jbt = lexdb_sql.oidType(lexdb_sql.OID_JSONB)
                     if lojb != lexdb_sql.OID_JSONB && (untyped(&lx) || isTextOid(lojb)) {
                         lx = Expr.Cast(replace(mut &lx, Expr.Lit(Val.Null)), jbt)
@@ -2236,6 +2235,21 @@ fn intChecked(x: Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): Expr {
     }
     if w == 0 { return x }
     return Expr.Cast(x, lexdb_sql.oidType(w))
+}
+
+// Is x a jsonb? Asked of each comparison's sides and each || and -, so a constant, a column, a cast and a
+// parameter are looked at in place (no parameter list made: ptypesOf); anything else through exprOid.
+fn isJsonb(x: &Expr, cols: &[]lexdb_sql.ColDef, ns: &Names): bool {
+    match x {
+        Expr.Lit(_) { return false }
+        Expr.Param(_) { return arithOid(x, cols, ns) == lexdb_sql.OID_JSONB }
+        Expr.Col(_, _) { return exprOid(x, cols, &[], &ns.ty) == lexdb_sql.OID_JSONB }
+        Expr.Cast(_, t) { return t.oid == lexdb_sql.OID_JSONB }
+        else {
+            let pt = ptypesOf(ns)
+            return exprOid(x, cols, &pt, &ns.ty) == lexdb_sql.OID_JSONB
+        }
+    }
 }
 
 // An operand's type for intArith: a parameter's as given (the statement's, then the outer values'), else exprOid's.

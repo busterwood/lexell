@@ -724,7 +724,9 @@ fn lexInGt(s: &str, dialect: Dialect, ora: bool, initGt: int): Result[[]Tok, lex
             if two == "<=" || two == ">=" || two == "<>" || two == "!=" || two == "||" || two == "::" || two == "!~" || two == "~*" ||
                two == "<<" || two == ">>" || two == "@>" || two == "<@" || two == "&&" { op = two.clone() }
             if two == "!~" && i + 2 < n && s[i + 2] == '*' { op = "!~*" }
-            if !ora && !dialect.tsql {
+            // PostgreSQL's JSON operators: their first characters' look first, so other operators pay one
+            let c0 = s[i]
+            if (c0 == '-' || c0 == '#' || c0 == '?' || c0 == '@') && !ora && !dialect.tsql {
                 if two == "->" { op = if i + 2 < n && s[i + 2] == '>' { "->>" } else { "->" } }
                 else if two == "#>" { op = if i + 2 < n && s[i + 2] == '>' { "#>>" } else { "#>" } }
                 else if two == "?|" || two == "?&" || two == "@?" || two == "@@" || two == "#-" { op = two.clone() }
@@ -1392,14 +1394,23 @@ fn (p: mut &P) isTail(e: Expr): Result[Expr, lexdb_base.DbErr] {
     return Ok(e)
 }
 
+// Is the token one of catExpr's operators? One look at the token: an
+// operand's end asks it, so it must cost no more as operators are added
+// (PostgreSQL's JSON operators: only the PostgreSQL door's).
+fn (p: &P) catOp(): bool {
+    if p.toks[p.pos].kind != T_OP { return false }
+    match p.toks[p.pos].text {
+        "||", "&", "|", "#", "<<", ">>", "@>", "<@", "&&" { return true }
+        "->", "->>", "#>", "#>>", "?", "?|", "?&", "@?", "@@", "#-" { return !p.ora && !p.tsql }
+        else { return false }
+    }
+}
+
 // ||, and the bitwise & | # << >> (9.85): PostgreSQL's "any other
 // operator", between + - and the comparisons, left to right.
 fn (p: mut &P) catExpr(): Result[Expr, lexdb_base.DbErr] {
     var e = try p.addExpr()
-    while p.isKw("||") || p.isKw("&") || p.isKw("|") || p.isKw("#") || p.isKw("<<") || p.isKw(">>") || p.isKw("@>") ||
-          p.isKw("<@") || p.isKw("&&") ||
-          (!p.ora && !p.tsql && (p.isKw("->") || p.isKw("->>") || p.isKw("#>") || p.isKw("#>>") || p.isKw("?") ||
-                                 p.isKw("?|") || p.isKw("?&") || p.isKw("@?") || p.isKw("@@") || p.isKw("#-"))) {
+    while p.catOp() {
         let op = p.next().text
         let r = try p.addExpr()
         // the array operators (9.92) are calls; T-SQL's ^ is # (XOR: its lexer)
@@ -2080,6 +2091,48 @@ fn (p: mut &P) callArg(udf: bool): Result[Expr, lexdb_base.DbErr] {
     return Ok(x)
 }
 
+// primary's SQL/JSON words (JSON 'text', JSON(...), JSON_VALUE(...), T-SQL's ISJSON(...)): the expression, or
+// None when the word is not one of them (or is one without its parenthesis: a name).
+fn (p: mut &P) jsonPrimary(w: &str): Result[Option[Expr], lexdb_base.DbErr] {
+    match w {
+        "json" {
+            if p.peek().kind == T_STR {
+                let lit = p.next().text
+                return Ok(Some(Expr.Cast(Expr.Lit(Val.Text(lit)), TypeName{kind: K_JSON, oid: OID_JSON, prec: 0, scale: 0, len: 0})))
+            }
+            if p.isKw("(") { return Ok(Some(try p.jsonCtorExpr())) }
+        }
+        "jsonb" {
+            if p.peek().kind == T_STR {
+                let lit = p.next().text
+                return Ok(Some(Expr.Cast(Expr.Lit(Val.Text(lit)), TypeName{kind: K_JSON, oid: OID_JSONB, prec: 0, scale: 0, len: 0})))
+            }
+        }
+        "json_value" { if p.isKw("(") { return Ok(Some(try p.jsonValueExpr())) } }
+        "json_query" { if p.isKw("(") { return Ok(Some(try p.jsonQueryExpr())) } }
+        "json_exists" { if p.isKw("(") { return Ok(Some(try p.jsonExistsExpr())) } }
+        "json_object" {
+            if p.isKw("(") {
+                match try p.jsonObjectExpr() {
+                    Some(x) { return Ok(Some(x)) }
+                    None {}
+                }
+            }
+        }
+        "json_array" { if p.isKw("(") { return Ok(Some(try p.jsonArrayExpr())) } }
+        "json_scalar" { if p.isKw("(") { return Ok(Some(try p.jsonScalarExpr())) } }
+        "json_serialize" { if p.isKw("(") { return Ok(Some(try p.jsonSerializeExpr())) } }
+        "json_mergepatch" { if p.isKw("(") { return Ok(Some(try p.jsonMergePatchExpr())) } }
+        "json_equal" { if p.isKw("(") { return Ok(Some(try p.jsonEqualExpr())) } }
+        "json_transform" { if p.isKw("(") { return Ok(Some(try p.jsonTransformExpr())) } }
+        "json_arrayagg" { if p.isKw("(") { return Ok(Some(try p.jsonArrayAggExpr())) } }
+        "json_objectagg" { if p.isKw("(") { return Ok(Some(try p.jsonObjectAggExpr())) } }
+        "isjson" { if p.tsql && p.isKw("(") { return Ok(Some(try p.tsqlIsJsonExpr())) } }
+        else {}
+    }
+    return Ok(None)
+}
+
 fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
     // pg_catalog.f(...): f (9.80)
     if p.peek().kind == T_IDENT && p.peek().text == "pg_catalog" && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." &&
@@ -2305,43 +2358,17 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         return Ok(e)
     }
     if t.kind == T_IDENT {
+        // the SQL/JSON words: asked only of a name that starts as they do, so other names pay one look
+        if len(t.text) >= 4 && (t.text[0] == 'j' || t.text[0] == 'i') && t.text[1] == 's' {
+            match try p.jsonPrimary(&t.text) {
+                Some(x) { return Ok(x) }
+                None {}
+            }
+        }
         match t.text {
             "null" { return Ok(Expr.Lit(Val.Null)) }
             "true" { return Ok(Expr.Lit(Val.Bool(true))) }
             "false" { return Ok(Expr.Lit(Val.Bool(false))) }
-            "json" {
-                if p.peek().kind == T_STR {
-                    let lit = p.next().text
-                    return Ok(Expr.Cast(Expr.Lit(Val.Text(lit)), TypeName{kind: K_JSON, oid: OID_JSON, prec: 0, scale: 0, len: 0}))
-                }
-                if p.isKw("(") { return p.jsonCtorExpr() }
-            }
-            "jsonb" {
-                if p.peek().kind == T_STR {
-                    let lit = p.next().text
-                    return Ok(Expr.Cast(Expr.Lit(Val.Text(lit)), TypeName{kind: K_JSON, oid: OID_JSONB, prec: 0, scale: 0, len: 0}))
-                }
-            }
-            "json_value" { if p.isKw("(") { return p.jsonValueExpr() } }
-            "json_query" { if p.isKw("(") { return p.jsonQueryExpr() } }
-            "json_exists" { if p.isKw("(") { return p.jsonExistsExpr() } }
-            "json_object" {
-                if p.isKw("(") {
-                    match try p.jsonObjectExpr() {
-                        Some(x) { return Ok(x) }
-                        None {}
-                    }
-                }
-            }
-            "json_array" { if p.isKw("(") { return p.jsonArrayExpr() } }
-            "json_scalar" { if p.isKw("(") { return p.jsonScalarExpr() } }
-            "json_serialize" { if p.isKw("(") { return p.jsonSerializeExpr() } }
-            "json_mergepatch" { if p.isKw("(") { return p.jsonMergePatchExpr() } }
-            "json_equal" { if p.isKw("(") { return p.jsonEqualExpr() } }
-            "json_transform" { if p.isKw("(") { return p.jsonTransformExpr() } }
-            "json_arrayagg" { if p.isKw("(") { return p.jsonArrayAggExpr() } }
-            "json_objectagg" { if p.isKw("(") { return p.jsonObjectAggExpr() } }
-            "isjson" { if p.tsql && p.isKw("(") { return p.tsqlIsJsonExpr() } }
             "cast" {
                 try p.expectKw("(")
                 let e = try p.expr()
@@ -6280,9 +6307,14 @@ fn (p: mut &P) parenTree(join: int): Result[FromItem, lexdb_base.DbErr] {
 
 // The functions that may be a FROM item.
 pub fn isFromFn(n: &str): bool {
+    if len(n) > 4 && n[0] == 'j' && n[1] == 's' { return isJsonFromFn(n) }
     return n == "generate_series" || n == "unnest" || n == "pg_partition_ancestors" || n == "pg_available_extensions" || n == "regexp_matches" ||
-           n == "regexp_split_to_table" || n == "string_to_table" ||
-           n == "json_each" || n == "jsonb_each" || n == "json_each_text" || n == "jsonb_each_text" ||
+           n == "regexp_split_to_table" || n == "string_to_table"
+}
+
+// The JSON functions that may be a FROM item (isFromFn: a name that starts js).
+fn isJsonFromFn(n: &str): bool {
+    return n == "json_each" || n == "jsonb_each" || n == "json_each_text" || n == "jsonb_each_text" ||
            n == "json_array_elements" || n == "jsonb_array_elements" || n == "json_array_elements_text" || n == "jsonb_array_elements_text" ||
            n == "json_object_keys" || n == "jsonb_object_keys" || n == "jsonb_path_query"
 }
