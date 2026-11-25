@@ -4251,8 +4251,8 @@ fn dropLeftTemps(st: &lexdb_store.Store): Result[Unit, DbErr] {
 // TRUNCATE empties a table (new trees), when they hold rows. have: the
 // DELETE ROWS tables known before (Session.onCommit), the transaction's own
 // made ones added; gives those still there.
-fn onCommitDo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, have: &[]str, lim: Limits): Result[[]str, DbErr] {
-    try lexdb_assert.beforeCommit(st, txn, &assertUp(st, txn.sql.sess, lim))         // (O23)
+fn onCommitDo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, have: &[]str, lim: Limits, s: &lexdb_sql.Stmt): Result[[]str, DbErr] {
+    try lexdb_assert.beforeCommit(st, txn, s, &assertUp(st, txn.sql.sess, lim))      // (O23)
     var keys = collections.copyOf(have)
     for k in txn.onCommit { addKey(mut &keys, &k) }
     var kept: []str = []
@@ -5259,6 +5259,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 }
                 return Err(e("42703", &("column \"" + a.name + "\" of relation \"" + rel + "\" does not exist")))
             }
+            try lexdb_assert.colChange(st, txn, &t, &a.name)
             // SQL Server refuses the drop of a column a CHECK reads, Oracle one a multi-column CHECK reads (PostgreSQL drops them)
             match lexdb_conerr.checkDropErr(&t.checks, &a.name, s.mdialect) {
                 Some(x) { return Err(x) }
@@ -5285,7 +5286,6 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 if gi >= 0 { try dropColumn(txn, mut &t, gi) }
             }
             let at = lexdb_bind.colIndex(&t.cols, &a.name)
-            try lexdb_assert.colChange(st, txn, &t, &a.name)
             try fkDropColumn(st, txn, mut &t, &a.name, a.cascade)
             try dropOwnedSeqs(st, txn, &t, &a.name)
             lexdb_nncon.drop(mut &t.invalid, &a.name)
@@ -13376,7 +13376,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             if !s.failed && ((len(s.onCommit) > 0 && s.txn[0].hasWrites()) || len(s.txn[0].onCommit) > 0) {
                 let st = &s.st
                 let have = collections.copyOf(&s.onCommit)
-                match onCommitDo(&st, mut &s.txn[0], &have, s.limits()) {
+                match onCommitDo(&st, mut &s.txn[0], &have, s.limits(), stmt) {
                     Ok(k) { kept = k }
                     Err(x) {
                         let t = pop(mut &s.txn)
@@ -13485,7 +13485,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                         (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from) || (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode > 0)
         if s.readOnly { s.txn[0].live = false }       // (a temporary table's writes: its snapshot is the session's own, 9.96)
         var r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits(), pc, input, out, pull, sink)
-        if len(s.txn[0].onCommit) > 0 { match lexdb_assert.stmtEnd(&st, mut &s.txn[0], r.isOk(), &assertUp(&s.st, s.id, s.limits())) { Ok(_) {} Err(x) { r = Err(x) } } }  // (O23)
+        if len(s.txn[0].onCommit) > 0 { match lexdb_assert.stmtEnd(&st, mut &s.txn[0], r.isOk(), stmt, &assertUp(&s.st, s.id, s.limits())) { Ok(_) {} Err(x) { r = Err(x) } } }  // (O23)
         s.txn[0].live = false
         if len(s.tmp) == 0 && len(s.txn[0].tmp) > 0 { s.tmp = s.txn[0].tmp.clone() }
         if r.isErr() { s.failed = true }
@@ -13525,7 +13525,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 // its temporary tables' ON COMMIT (9.96)
                 var kept = collections.copyOf(&s.onCommit)
                 if (len(s.onCommit) > 0 && t.hasWrites()) || len(t.onCommit) > 0 {
-                    match onCommitDo(&s.st, mut &t, &kept, lim) {
+                    match onCommitDo(&s.st, mut &t, &kept, lim, stmt) {
                         Ok(k) { kept = k }
                         Err(x) {
                             s.tmpUndo(&t)

@@ -709,6 +709,20 @@ fn condWalk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, path0: &[]str, s:
                 // an EXISTS is in its block's group (a semi-join); a NOT EXISTS (its polarity turned) is a group of its own
                 return walk(st, txn, path0, &s.subs[i], &with(path, i), b, if neg == bneg { group } else { -1 }, neg, an)
             }
+            if n == "#in" && len(args) == 2 {
+                // c [NOT] IN (SELECT d FROM ...): as [NOT] EXISTS (... AND d = c), a column each side (Oracle's anti- or semi-join)
+                let i = lexdb_sql.litInt(&args[0])
+                if i < 0 || i >= len(s.subs) || len(s.subs[i].items) != 1 || len(colOf(&args[1])) == 0 { return Err(refused(8659, "Subquery is not supported.")) }
+                let item = match s.subs[i].items[0].expr {
+                    Some(y) { y.clone() }
+                    None { Expr.Lit(Val.Null) }
+                }
+                if len(colOf(&item)) == 0 { return Err(refused(8659, "Subquery is not supported.")) }
+                let nb = len(an.blocks)
+                try walk(st, txn, path0, &s.subs[i], &with(path, i), b, if neg == bneg { group } else { -1 }, neg, an)
+                append(mut &an.blocks[nb].conj, Expr.Bin("=", item, args[1].clone()))
+                return Ok(Unit{})
+            }
         }
         else {}
     }
@@ -1169,7 +1183,24 @@ pub fn note(txn: mut &lexdb_store.Txn, t: &Table, any: bool) {
 }
 
 // A table a statement wrote: its key, tree, the statement's first write mark, whether it may have updated or deleted.
-type Wr = record { key: str; tree: int; mark: int; any: bool }
+// sets: an UPDATE's SET columns, [] for any other statement (its rows' every column may be new).
+type Wr = record { key: str; tree: int; mark: int; any: bool; sets: []str }
+
+// An UPDATE's SET columns (its rows' other columns are as they were); [] for any other statement.
+fn setCols(s: &Stmt): []str {
+    var out: []str = []
+    if s.kind != lexdb_sql.S_UPDATE { return out }
+    for x in s.sets { append(mut &out, x.col.clone()) }
+    return out
+}
+
+// Whether a write changed a column of table key the assertion reads (an UPDATE of others changes nothing it reads: Oracle
+// does not check its rows).
+fn touches(a: &Assertion, w: &Wr): bool {
+    if len(w.sets) == 0 { return true }
+    for c in w.sets { if lexdb_base.hasStr(&a.cols, &(w.key + "\x00" + c)) { return true } }
+    return false
+}
 
 // The instances of an assertion's query, its violation query parsed (kept per catalog row: the same row reads the same).
 type Plan = record { stmt: Stmt; an: An; keys: []str }
@@ -1362,7 +1393,7 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ws
         let x = &an.insts[i]
         var wi = -1
         for k in 0..len(ws) { if ws[k].key == x.key { wi = k } }
-        if wi < 0 { continue }
+        if wi < 0 || !touches(a, &ws[wi]) { continue }
         if x.neg {
             if ws[wi].any && txn.wroteSince(ws[wi].tree, ws[wi].mark) { whole = true }
             continue
@@ -1458,7 +1489,7 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ws
 // The statements' notes in the transaction's onCommit list, taken out of it; with ok (the statement ran) each assertion of
 // the tables they wrote is checked, or kept for the COMMIT when deferred (lexdb_exec.runStmt in a block, onCommitDo before
 // a statement's own commit).
-pub fn stmtEnd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ok: bool, up: &Up): Result[Unit, DbErr] {
+pub fn stmtEnd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ok: bool, s: &Stmt, up: &Up): Result[Unit, DbErr] {
     var ws: []Wr = []
     var keep: []str = []
     var any = false
@@ -1478,7 +1509,7 @@ pub fn stmtEnd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ok: bool, up: 
                 if f[1] == "w" { ws[k].any = true }
             }
         }
-        if !found { append(mut &ws, Wr{key: f[2].clone(), tree: -1, mark: m, any: f[1] == "w"}) }
+        if !found { append(mut &ws, Wr{key: f[2].clone(), tree: -1, mark: m, any: f[1] == "w", sets: setCols(s)}) }
     }
     if !any { return Ok(Unit{}) }
     txn.onCommit = keep
@@ -1600,7 +1631,7 @@ fn pendingAt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, which: &Option[[
                 var ws: []Wr = []
                 for k in tablesOf(&a) {
                     match try tableOf(st, txn, &k) {
-                        Some(t) { append(mut &ws, Wr{key: k.clone(), tree: t.tree, mark: m, any: true}) }
+                        Some(t) { append(mut &ws, Wr{key: k.clone(), tree: t.tree, mark: m, any: true, sets: []}) }
                         None {}
                     }
                 }
@@ -1621,8 +1652,8 @@ fn pendingAt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, which: &Option[[
 
 // Before a transaction's commit (lexdb_exec.onCommitDo): a statement's own (outside a block) checked as at a statement's
 // end, a block's deferred ones as at its COMMIT (ORA-02091 over a violation: it is rolled back).
-pub fn beforeCommit(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, up: &Up): Result[Unit, DbErr] {
-    try stmtEnd(st, txn, true, up)
+pub fn beforeCommit(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, up: &Up): Result[Unit, DbErr] {
+    try stmtEnd(st, txn, true, s, up)
     let all: Option[[]str] = None
     match pendingAt(st, txn, &all, true, up) {
         Ok(_) { return Ok(Unit{}) }
