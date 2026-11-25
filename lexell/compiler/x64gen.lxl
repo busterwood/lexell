@@ -251,6 +251,7 @@ type Gen = record {
     rotWhen: bool               // ... branch to rotTop when rotCond is rotWhen
     atTail: bool                // current statement falls straight into the rotated loop's test
     spillActive: int            // locals currently saved in spill slots around an enclosing site
+    selfTop: int                // label right after prologue + param entry for self-tail-calls, or -1
 }
 
 // A statement whose code a local in one of QUIET_REGS may run with in its slot: stored before
@@ -298,7 +299,7 @@ fn newGen(u: ir.Ir): Gen {
         loops: 0, aTaken: [], emptyS: -1, callDest: NO_MEM, callFresh: false, simpF: -1, destUsed: false, byteDest: 0, posOf: [], posSeen: [],
         inlPos: -1, held: [], nLocalRegs: 0, bareRet: false, rm: newMap(), noCopy: -1, sites: [],
         siteIdx: [], siteStamp: [], noSites: 0, rotBody: 0, ifDepth: 0, loopDepth: 0, posW: [], spill: [], spillSlot: [], nGuards: 0, guardLabels: [], shrink: false,
-        rotTop: -1, rotEnd: -1, rotCond: -1, rotWhen: false, atTail: false, spillActive: 0}
+        rotTop: -1, rotEnd: -1, rotCond: -1, rotWhen: false, atTail: false, spillActive: 0, selfTop: -1}
     g.a.peep = true
     g.siteIdx = array(2 * len(g.u.nodes), -1)
     g.siteStamp = array(2 * len(g.u.nodes), 0)
@@ -708,6 +709,7 @@ fn (g: mut &Gen) genFunc(f: int) {
         ni = 1
     }
     var stackOff = 16
+    g.selfTop = -1
     for j in 0..len(g.u.funcs[f].params) {
         let l = g.u.funcs[f].params[j]
         let t = g.u.locals[l].ty
@@ -762,6 +764,8 @@ fn (g: mut &Gen) genFunc(f: int) {
         g.stmtsFrom(g.u.nodes[g.u.funcs[f].body].a, g.nGuards)
         if g.u.nodes[g.u.funcs[f].body].v != 1 { g.frame = mark }
     } else {
+        g.selfTop = g.a.newLabel()
+        g.a.bind(g.selfTop)
         g.stmt(g.u.funcs[f].body)
     }
     g.epilogue()
@@ -1791,6 +1795,11 @@ fn (g: mut &Gen) forward(l: int, j: int) {
     let t = g.u.nodes[x].a
     let y = g.u.listAt(l, j + 1)
     if g.uses[t] != 2 || !g.u.isScalar(g.u.locals[t].ty) || g.aTaken[t] { return }
+    let v0 = g.u.nodes[x].b
+    if g.u.nk(v0) == ir.E_BIN && g.u.nodes[v0].v == ir.OP_OR &&
+        (g.isShift24(g.u.nodes[v0].b) || g.isShift24(g.u.nodes[v0].a)) {
+        return
+    }
     let v = g.u.nodes[x].b
     if g.u.nodes[v].ty != g.u.locals[t].ty { return }
     let yk = g.u.nk(y)
@@ -2636,6 +2645,18 @@ fn (g: mut &Gen) scan(x: int, depth: int) {
                 let s = g.u.listAt(n.a, j + 1)
                 if g.fusesIf(d, s) || g.fusesReturn(d, s) { g.bad[g.u.nodes[d].a] = true }
             }
+            var lj = 0
+            while lj + 1 < cnt {
+                if g.canStartLe(g.u.listAt(n.a, lj)) {
+                    let lm = g.matchLeLoad(n.a, lj, cnt)
+                    if lm.width > 0 {
+                        for q in 0..lm.width - 1 { g.bad[g.u.nodes[g.u.listAt(n.a, lj + q)].a] = true }
+                        lj += lm.width
+                        continue
+                    }
+                }
+                lj += 1
+            }
         }
     } else if k == ir.S_DECL {
         g.step()
@@ -3216,6 +3237,7 @@ fn (g: mut &Gen) stmt1(s: int) {
             g.a.jmp(g.contL[len(g.contL) - 1])
         }
     } else if k == ir.S_RETURN {
+        if n.a >= 0 && g.genTailCall(n.a) { return }
         if n.a >= 0 { g.genReturn(n.a) }
         g.epilogue()
     } else if k == ir.S_SWITCH {
@@ -3249,6 +3271,13 @@ fn (g: mut &Gen) stmtsTail(l: int, j0: int, j1: int, tail: bool) {
     while j < j1 {
         let x = g.u.listAt(l, j)
         let before = g.frame
+        if j + 1 < j1 && g.canStartLe(x) {
+            let leW = g.fusedLeLoad(l, j, j1)
+            if leW > 0 {
+                j += leW
+                continue
+            }
+        }
         if j + 1 < j1 && !g.spillsHere(x) && !g.spillsHere(g.u.listAt(l, j + 1)) &&
             (g.fusedIf(x, g.u.listAt(l, j + 1), tail && j + 1 == lastReal) || g.fusedReturn(x, g.u.listAt(l, j + 1)) ||
             g.fusedDivMod(x, g.u.listAt(l, j + 1))) {
@@ -4030,7 +4059,7 @@ fn (g: mut &Gen) genChain(cond: int, then: int, els: int): bool {
         append(mut &bodies, g.u.nodes[lk.s].b)
         rest = g.u.nodes[lk.s].c
     }
-    if len(bodies) < 8 || len(vals) < 8 { return false }
+    if len(bodies) + (if rest >= 0 { 1 } else { 0 }) < 8 || len(vals) < 7 { return false }
     var lo = vals[0]
     var hi = vals[0]
     for v in vals {
@@ -4064,7 +4093,7 @@ fn (g: mut &Gen) genChain(cond: int, then: int, els: int): bool {
         g.a.bind(lbs[i])
         g.stmt(bodies[i])
         g.frame = before
-        g.a.jmp(end)
+        if !g.alwaysJumps(bodies[i]) { g.a.jmp(end) }
     }
     g.a.bind(dl)
     if rest >= 0 {
@@ -6808,6 +6837,307 @@ fn (g: mut &Gen) fusedDivMod(s1: int, s2: int): bool {
     g.set128From(s1, d[0], RAX, RDX)
     g.set128From(s2, m[0], R10, R11)
     return true
+}
+
+// Self-tail-call optimization: `return self(args...)` updates any changed scalar/float register
+// parameters and jumps directly to selfTop (right after the prologue and entry parameter loads),
+// leaving unchanged register and stack parameters (including slices) in place.
+fn (g: mut &Gen) genTailCall(e: int): bool {
+    if g.selfTop < 0 || g.nGuards > 0 || len(g.inlStack) > 0 || g.shrink || len(g.spill) > 0 || g.spillActive > 0 {
+        return false
+    }
+    if g.isAggr(g.retTy) || g.is128(g.retTy) || g.u.nk(e) != ir.E_CALL { return false }
+    let callee = g.u.nodes[e].a
+    if g.u.nk(callee) != ir.E_DECAY || g.u.nk(g.u.nodes[callee].a) != ir.E_FUNC { return false }
+    if g.u.nodes[g.u.nodes[callee].a].a != g.curFunc { return false }
+    let args = g.u.nodes[e].b
+    let np = len(g.u.funcs[g.curFunc].params)
+    if g.u.listLen(args) != np { return false }
+    var chIdx: []int = []
+    for j in 0..np {
+        let p = g.u.funcs[g.curFunc].params[j]
+        let ax = g.u.listAt(args, j)
+        if g.u.nk(ax) == ir.E_LOCAL && g.u.nodes[ax].a == p { continue }
+        if g.slots[p] > 0 { return false }
+        let pt = g.u.locals[p].ty
+        if g.isAggr(pt) || g.is128(pt) || g.u.nodes[ax].ty != pt { return false }
+        append(mut &chIdx, j)
+    }
+    if len(chIdx) == 1 {
+        let p = g.u.funcs[g.curFunc].params[chIdx[0]]
+        let ax = g.u.listAt(args, chIdx[0])
+        let pt = g.u.locals[p].ty
+        if g.freg[p] >= 0 {
+            g.gen(ax)
+            g.a.sse66(MOVAPD, g.freg[p], 0)
+        } else if g.reg[p] >= 0 {
+            if g.simple(ax) {
+                g.genInto(ax, g.reg[p])
+            } else {
+                g.gen(ax)
+                g.a.movRR(8, g.reg[p], RAX)
+            }
+        } else if g.slots[p] != 0 {
+            g.gen(ax)
+            g.storeFrom(pt, pt, rbp(g.slots[p]))
+        }
+    } else if len(chIdx) > 1 {
+        let mark = g.frame
+        var ts: []int = []
+        for j in chIdx {
+            let p = g.u.funcs[g.curFunc].params[j]
+            let ax = g.u.listAt(args, j)
+            let pt = g.u.locals[p].ty
+            let s = g.temp(8, 8)
+            append(mut &ts, s)
+            g.gen(ax)
+            if g.isF(pt) { g.a.movsdStore(rbp(s), 0) } else { g.a.store(8, rbp(s), RAX) }
+        }
+        for k in 0..len(chIdx) {
+            let p = g.u.funcs[g.curFunc].params[chIdx[k]]
+            let pt = g.u.locals[p].ty
+            let s = ts[k]
+            if g.freg[p] >= 0 {
+                g.a.movsdLoad(g.freg[p], rbp(s))
+            } else if g.reg[p] >= 0 {
+                g.a.load(8, g.reg[p], rbp(s))
+            } else if g.slots[p] != 0 {
+                if g.isF(pt) {
+                    g.a.movsdLoad(0, rbp(s))
+                    g.a.movsdStore(rbp(g.slots[p]), 0)
+                } else {
+                    g.a.load(8, RAX, rbp(s))
+                    g.storeFrom(pt, pt, rbp(g.slots[p]))
+                }
+            }
+        }
+        g.frame = mark
+    }
+    g.a.jmp(g.selfTop)
+    return true
+}
+
+// One byte read in a little-endian multi-byte load sequence:
+// `int64_t` from `*((uint8_t*)base + rt_idx(idx + off, len, w))` (or unchecked `idx + off`).
+type LeByte = value record {
+    ok: bool
+    base: int           // E_LOCAL or E_MEMBER of local
+    idx: int            // E_LOCAL
+    off: int            // 0..3
+    checked: bool
+    lenE: int           // E_LOCAL or E_MEMBER of local (when checked)
+    w: int              // where string node (when checked)
+}
+
+type LeMatch = value record {
+    width: int          // 0 (no match), 2, or 4
+    dst: int            // final local assigned, or -1 if S_RETURN
+    ret: bool           // final statement is S_RETURN
+    base: int
+    idx: int
+    checked: bool
+    lenE: int
+    w: int
+}
+
+fn (g: &Gen) canStartLe(s: int): bool {
+    let n = g.u.nodes[s]
+    if n.k != ir.S_DECL || n.b < 0 || n.c >= 0 { return false }
+    if g.uses[n.a] != 2 || g.aTaken[n.a] { return false }
+    let bk = g.u.nk(n.b)
+    return (bk == ir.E_CAST || bk == ir.E_DEREF || bk == ir.E_CALL) && g.tk(g.u.locals[n.a].ty) == ir.TY_I64
+}
+
+fn (g: &Gen) isShift24(e: int): bool {
+    let n = g.u.nodes[e]
+    if n.k == ir.E_BIN && n.v == ir.OP_SHL && g.u.nk(n.b) == ir.E_INT && g.u.nodes[n.b].v == 24 { return true }
+    if n.k == ir.E_CALL && g.u.listLen(n.b) == 3 {
+        let b1 = g.u.listAt(n.b, 1)
+        if g.u.nk(b1) == ir.E_INT && g.u.nodes[b1].v == 24 && g.rtName(e) == "rt_shl_int" { return true }
+    }
+    return false
+}
+
+fn (g: &Gen) leByteLoad(e: int): LeByte {
+    let none = LeByte{ok: false, base: -1, idx: -1, off: 0, checked: false, lenE: -1, w: -1}
+    var x = e
+    if g.u.nk(x) == ir.E_CALL && g.rtName(x) == "rt_cvs_int" && g.u.listLen(g.u.nodes[x].b) == 2 {
+        x = g.u.listAt(g.u.nodes[x].b, 0)
+    }
+    while g.u.nk(x) == ir.E_CAST { x = g.u.nodes[x].a }
+    if g.u.nk(x) != ir.E_DEREF || g.tk(g.u.nodes[x].ty) != ir.TY_U8 { return none }
+    let pa = g.u.nodes[x].a
+    if g.u.nk(pa) != ir.E_PADD || g.u.nodes[pa].v != 1 { return none }
+    var base = g.u.nodes[pa].a
+    while g.u.nk(base) == ir.E_CAST && g.tk(g.u.nodes[base].ty) == ir.TY_PTR { base = g.u.nodes[base].a }
+    let bk = g.u.nk(base)
+    if !(bk == ir.E_LOCAL || (bk == ir.E_MEMBER && g.u.nk(g.u.nodes[base].a) == ir.E_LOCAL)) { return none }
+    if g.size(g.u.nodes[base].ty) != 8 { return none }
+    var ix = g.u.nodes[pa].b
+    var checked = false
+    var lenE = -1
+    var w = -1
+    if g.u.nk(ix) == ir.E_CALL && g.rtName(ix) == "rt_idx" && g.u.listLen(g.u.nodes[ix].b) == 3 &&
+        g.isWhere(g.u.listAt(g.u.nodes[ix].b, 2)) {
+        checked = true
+        lenE = g.u.listAt(g.u.nodes[ix].b, 1)
+        w = g.u.listAt(g.u.nodes[ix].b, 2)
+        let lk = g.u.nk(lenE)
+        if !(lk == ir.E_LOCAL || (lk == ir.E_MEMBER && g.u.nk(g.u.nodes[lenE].a) == ir.E_LOCAL)) { return none }
+        if g.size(g.u.nodes[lenE].ty) != 8 { return none }
+        ix = g.u.listAt(g.u.nodes[ix].b, 0)
+    }
+    var off = 0
+    if g.u.nk(ix) == ir.E_LOCAL {
+        if g.tk(g.u.locals[g.u.nodes[ix].a].ty) != ir.TY_I64 { return none }
+        return LeByte{ok: true, base: base, idx: ix, off: 0, checked: checked, lenE: lenE, w: w}
+    }
+    if g.u.nk(ix) == ir.E_CALL {
+        let nm = g.rtName(ix)
+        if (nm == "rt_wadd_int" && g.u.listLen(g.u.nodes[ix].b) == 2) ||
+            (nm == "rt_add_int" && g.u.listLen(g.u.nodes[ix].b) == 3) {
+            let a0 = g.u.listAt(g.u.nodes[ix].b, 0)
+            let a1 = g.u.listAt(g.u.nodes[ix].b, 1)
+            if g.u.nk(a0) == ir.E_LOCAL && g.u.nk(a1) == ir.E_INT && g.tk(g.u.locals[g.u.nodes[a0].a].ty) == ir.TY_I64 {
+                off = g.u.nodes[a1].v
+                if off >= 1 && off <= 3 {
+                    return LeByte{ok: true, base: base, idx: a0, off: off, checked: checked, lenE: lenE, w: w}
+                }
+            }
+        }
+    } else if g.u.nk(ix) == ir.E_BIN && g.u.nodes[ix].v == ir.OP_ADD {
+        let a0 = g.u.nodes[ix].a
+        let a1 = g.u.nodes[ix].b
+        if g.u.nk(a0) == ir.E_LOCAL && g.u.nk(a1) == ir.E_INT && g.tk(g.u.locals[g.u.nodes[a0].a].ty) == ir.TY_I64 {
+            off = g.u.nodes[a1].v
+            if off >= 1 && off <= 3 {
+                return LeByte{ok: true, base: base, idx: a0, off: off, checked: checked, lenE: lenE, w: w}
+            }
+        }
+    }
+    return none
+}
+
+fn (g: &Gen) leShiftLoad(e: int, shift: int): LeByte {
+    let none = LeByte{ok: false, base: -1, idx: -1, off: 0, checked: false, lenE: -1, w: -1}
+    let n = g.u.nodes[e]
+    if n.k == ir.E_BIN && n.v == ir.OP_SHL && g.u.nk(n.b) == ir.E_INT && g.u.nodes[n.b].v == shift {
+        return g.leByteLoad(n.a)
+    }
+    if n.k == ir.E_CALL && g.rtName(e) == "rt_shl_int" && g.u.listLen(n.b) == 3 {
+        let b1 = g.u.listAt(n.b, 1)
+        if g.u.nk(b1) == ir.E_INT && g.u.nodes[b1].v == shift { return g.leByteLoad(g.u.listAt(n.b, 0)) }
+    }
+    return none
+}
+
+fn (g: &Gen) leSame(a: LeByte, b: LeByte): bool {
+    return a.checked == b.checked && g.sameTree(a.base, b.base) && g.sameTree(a.idx, b.idx) &&
+        (!a.checked || g.sameTree(a.lenE, b.lenE))
+}
+
+fn (g: &Gen) leExprOk(e: int, prev: int, shift: int, off: int, b0: LeByte): bool {
+    if e < 0 { return false }
+    let rhs = g.u.nodes[e]
+    if rhs.k != ir.E_BIN || rhs.v != ir.OP_OR { return false }
+    var sh = -1
+    if g.u.nk(rhs.a) == ir.E_LOCAL && g.u.nodes[rhs.a].a == prev {
+        sh = rhs.b
+    } else if g.u.nk(rhs.b) == ir.E_LOCAL && g.u.nodes[rhs.b].a == prev {
+        sh = rhs.a
+    } else {
+        return false
+    }
+    let bi = g.leShiftLoad(sh, shift)
+    return bi.ok && bi.off == off && g.leSame(b0, bi)
+}
+
+fn (g: &Gen) leStepOk(s: int, prev: int, shift: int, off: int, b0: LeByte): int {
+    let n = g.u.nodes[s]
+    if n.k != ir.S_DECL || n.b < 0 || n.c >= 0 || g.tk(g.u.locals[n.a].ty) != ir.TY_I64 { return -1 }
+    if !g.leExprOk(n.b, prev, shift, off, b0) { return -1 }
+    return n.a
+}
+
+fn (g: &Gen) leRetOk(s: int, prev: int, shift: int, off: int, b0: LeByte): bool {
+    let n = g.u.nodes[s]
+    return n.k == ir.S_RETURN && n.a >= 0 && g.tk(g.u.nodes[n.a].ty) == ir.TY_I64 && g.leExprOk(n.a, prev, shift, off, b0)
+}
+
+fn (g: &Gen) matchLeLoad(l: int, j: int, j1: int): LeMatch {
+    let none = LeMatch{width: 0, dst: -1, ret: false, base: -1, idx: -1, checked: false, lenE: -1, w: -1}
+    if j + 1 >= j1 { return none }
+    let s0 = g.u.listAt(l, j)
+    let n0 = g.u.nodes[s0]
+    if n0.k != ir.S_DECL || n0.b < 0 || n0.c >= 0 || g.tk(g.u.locals[n0.a].ty) != ir.TY_I64 { return none }
+    let t0 = n0.a
+    if g.uses[t0] != 2 || g.aTaken[t0] { return none }
+    let b0 = g.leByteLoad(n0.b)
+    if !b0.ok || b0.off != 0 { return none }
+    if g.u.nodes[b0.idx].a == t0 { return none }
+    let s1 = g.u.listAt(l, j + 1)
+    if g.leRetOk(s1, t0, 8, 1, b0) {
+        return LeMatch{width: 2, dst: -1, ret: true, base: b0.base, idx: b0.idx, checked: b0.checked, lenE: b0.lenE, w: b0.w}
+    }
+    let t1 = g.leStepOk(s1, t0, 8, 1, b0)
+    if t1 < 0 { return none }
+    if j + 3 < j1 && g.uses[t1] == 2 && !g.aTaken[t1] && g.u.nodes[b0.idx].a != t1 {
+        let s2 = g.u.listAt(l, j + 2)
+        let t2 = g.leStepOk(s2, t1, 16, 2, b0)
+        if t2 >= 0 && g.uses[t2] == 2 && !g.aTaken[t2] && g.u.nodes[b0.idx].a != t2 {
+            let s3 = g.u.listAt(l, j + 3)
+            if g.leRetOk(s3, t2, 24, 3, b0) {
+                return LeMatch{width: 4, dst: -1, ret: true, base: b0.base, idx: b0.idx, checked: b0.checked, lenE: b0.lenE, w: b0.w}
+            }
+            let t3 = g.leStepOk(s3, t2, 24, 3, b0)
+            if t3 >= 0 {
+                return LeMatch{width: 4, dst: t3, ret: false, base: b0.base, idx: b0.idx, checked: b0.checked, lenE: b0.lenE, w: b0.w}
+            }
+        }
+    }
+    return LeMatch{width: 2, dst: t1, ret: false, base: b0.base, idx: b0.idx, checked: b0.checked, lenE: b0.lenE, w: b0.w}
+}
+
+// Fuses 2 or 4 adjacent little-endian byte loads `b[i] | b[i+1]<<8 ...` into one bounds check
+// and a single 16- or 32-bit zero-extending load.
+fn (g: mut &Gen) fusedLeLoad(l: int, j: int, j1: int): int {
+    let m = g.matchLeLoad(l, j, j1)
+    if m.width == 0 { return 0 }
+    for q in 0..m.width {
+        if g.spillsHere(g.u.listAt(l, j + q)) { return 0 }
+    }
+    if !g.simple(m.base) || !g.simple(m.idx) || (m.checked && !g.simple(m.lenE)) { return 0 }
+    var ridx = g.regOf(m.idx)
+    if ridx < 0 {
+        g.genInto(m.idx, RDX)
+        ridx = RDX
+    }
+    if m.checked {
+        g.genInto(m.lenE, RCX)
+        g.a.aluI(x64.SUB, 8, RCX, m.width - 1)
+        g.a.jcc(x64.CC_LE, g.stub(3, "index out of range", m.w))
+        g.a.alu(x64.CMP, 8, ridx, RCX)
+        g.a.jcc(x64.CC_AE, g.stub(3, "index out of range", m.w))
+    }
+    var rbase = g.regOf(m.base)
+    if rbase < 0 {
+        g.genInto(m.base, RAX)
+        rbase = RAX
+    }
+    let dst = if !m.ret && g.reg[m.dst] >= 0 { g.reg[m.dst] } else { RAX }
+    if m.width == 4 {
+        g.a.load(4, dst, x64.memx(rbase, ridx, 1, 0))
+    } else {
+        g.a.loadZX(2, dst, x64.memx(rbase, ridx, 1, 0))
+    }
+    if m.ret {
+        g.epilogue()
+    } else if g.reg[m.dst] < 0 {
+        let s2 = g.temp(8, 8)
+        g.slots[m.dst] = s2
+        g.a.store(8, rbp(s2), dst)
+    }
+    return m.width
 }
 
 // Local l (set by statement s, perhaps its declaration) from the registers lo and hi.
