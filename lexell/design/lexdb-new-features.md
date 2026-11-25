@@ -1256,8 +1256,8 @@ Planted: no whole query after a DELETE from a NOT EXISTS's table (exec_assert: s
   is always NULL (Oracle marks an assertion INVALID at DDL on its tables, an ADD COLUMN too, and still checks it).
 - lexdb serializes the writers of rows that meet in the join key's value or, without a join key, every writer of rows that meet their own conditions;
   Oracle's matrix is finer for chains of joins.
-- Under NOVALIDATE, rows that already break the assertion fail a statement that must run the whole query: a DELETE from a NOT EXISTS's table, or more than
-  64 rows put (Oracle checks only the rows written: FAST).
+- Under NOVALIDATE, rows that already break the assertion fail a statement that must run the whole query: an UPDATE or DELETE of a table under its NOT
+  EXISTS (Oracle's FAST validation covers those too). More than 64 rows put run the whole query only for a VALIDATED assertion (the same answer).
 - Each check plans its query again (its parsed form is kept per assertion): the INSERT's cost above is mostly that planning.
 - An asserted table's refBy is not empty: the PostgreSQL door's pg_class.relhastriggers is true for it (the checks are its triggers, in effect).
 - Quoted names are matched folded (L6: `"xd"` is shown XD); the check reads the tables with the session's rights (not the owner's); TRUNCATE of an EXISTS
