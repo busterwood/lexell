@@ -16,7 +16,11 @@ SQL Server doors with every write path checked, main f23d0ebc, 2026-11-25, check
 23.26.3; the entries that the fifth bug slice fixed, main 30b54d6f, 2026-11-25 (DROP COLUMN of a table views read, the
 T-SQL inline INDEX and TOP in DELETE, UPDATE and INSERT, assertion checks run as their owner, stored functions' column
 names, T-SQL INFORMATION_SCHEMA's dbo, syntax errors in stored units, ORA-32796, T-SQL parse errors, assertion
-leftovers), are removed or reworded to what is left, checked against it, Oracle Free 23.26.3 and SQL Server 2022).
+leftovers), are removed or reworded to what is left, checked against it, Oracle Free 23.26.3 and SQL Server 2022; the
+entries that the sixth bug slice fixed, main f1e0ddf8, 2026-11-25 (Oracle's quoted names, nested subprograms, DROP TABLE
+under a view in each door, T-SQL index names per table, INFORMATION_SCHEMA and `sp_refreshview`, schema-bound view
+errors, `WITH CHECK OPTION` before `AS`, ORA-00907 before `INTO`), are removed or reworded to what is left, checked
+against it, Oracle Free 23.26.3, SQL Server 2022 and PostgreSQL 18).
 They are not fixed here: the pages describe what lexdb does. Each "Differences" section of the reference lists the smaller
 differences of its statement.
 
@@ -72,7 +76,10 @@ differences of its statement.
     `CREATE TABLE ... AS TABLE t` / `AS EXECUTE`, `ALTER COLUMN ... SET STATISTICS`, `ALTER COLUMN ... TYPE ...
     COLLATE`. At table level `INCLUDE`, `WITH`, `USING INDEX TABLESPACE` and `DEFERRABLE` on a key are 0A000.
   - `ALTER COLUMN ... TYPE` without `USING` folds its hint into the message (42804).
-  - `DROP ... CASCADE` gives no NOTICE naming what it drops; the 2BP01 refusals carry their hints in the message.
+  - `DROP ... CASCADE` gives no NOTICE naming what it drops. `DROP TABLE` of a table a view reads is refused as in
+    PostgreSQL (2BP01, DETAIL and HINT) and `CASCADE` drops the views; the DETAIL lists the views (by name; PostgreSQL's
+    order is not fixed) and not foreign keys, and a table that only foreign keys depend on is refused with the hint in
+    the message. The other 2BP01 refusals carry their hints in the message.
 - **Constraint states** (`NOT ENFORCED`, `ALTER CONSTRAINT [NOT] ENFORCED`; see [ALTER TABLE](sql/postgresql/alter-table.md)):
   - `ALTER CONSTRAINT ... DEFERRABLE`, `INITIALLY` and `NOT DEFERRABLE` are 0A000 (PostgreSQL takes them for a foreign
     key); only `ENFORCED` and `NOT ENFORCED` are taken.
@@ -101,7 +108,13 @@ differences of its statement.
 - **Transactions** (found writing the transaction pages):
   - `SHOW transaction_read_only` says `off` inside `BEGIN READ ONLY`, which refuses writes (25006).
   - `BEGIN` ignores words it does not know: `BEGIN nonsense words here` starts a block (PostgreSQL: 42601).
-  - `SET TRANSACTION READ ONLY` and `SET SESSION CHARACTERISTICS AS TRANSACTION ...` are accepted and do nothing.
+  - `SET TRANSACTION READ ONLY` and the `READ ONLY` / `READ WRITE` of `SET SESSION CHARACTERISTICS AS TRANSACTION`
+    are accepted and do nothing.
+  - The default isolation level is `serializable` (PostgreSQL: `read committed`); `READ COMMITTED` is opt-in
+    (`BEGIN ISOLATION LEVEL`, `SET TRANSACTION`, `SET default_transaction_isolation`). `READ UNCOMMITTED` shows as
+    `read committed` and `REPEATABLE READ` as `serializable` in `SHOW transaction_isolation` (PostgreSQL: their own
+    names), and `SET TRANSACTION ISOLATION LEVEL` after the block's first statement is 25001 even when the level stays
+    the same.
   - No WARNINGs for `BEGIN` inside a block, `COMMIT` or `ROLLBACK` outside one, or `SET CONSTRAINTS` outside one;
     outside a block `SET CONSTRAINTS nosuch DEFERRED` succeeds.
   - `COMMIT AND CHAIN`, `ROLLBACK AND CHAIN` and `PREPARE TRANSACTION` are syntax errors.
@@ -271,11 +284,17 @@ differences of its statement.
     (`INNER LOOP JOIN`), `FOR SYSTEM_TIME`, `GROUP BY ... WITH ROLLUP` / `WITH CUBE` (SQL Server accepts them all);
     `GROUPING_ID` is 195.
   - `TOP (subquery)` is 156 (SQL Server accepts it); `MERGE TOP ... PERCENT` is 50000.
+  - `INSERT TOP (n) ... SELECT ... ORDER BY` follows the `ORDER BY`; SQL Server ignores it (the rows `INSERT TOP` takes
+    are in no defined order, and in a test it took the first rows of its scan).
+  - **`SELECT *` in a view is expanded when the view is read**, not when it is made: a column added to the table
+    later shows in the view at once. SQL Server keeps the view's columns until `sp_refreshview` (checked on SQL
+    Server 2022).
   - A `SELECT *` view whose table lost a column and gained another reads the columns by position: the view's column
     `y` shows the values of the column that took its place, and keeps its old name. SQL Server does the same
     (checked) when the view was not read in between; once a read has failed with 4502, SQL Server goes on with 4502
-    until `sp_refreshview` (lexdb has none: 2812), where lexdb reads by position again. With a column dropped and
-    none added, both give 4502 (lexdb's text names `v2a`, SQL Server's `dbo.v2a`). Oracle reads by name.
+    until `sp_refreshview`, while lexdb reads by position again (a failed read changes nothing in the view);
+    `sp_refreshview` exists and brings the table's columns as they are now. With a column dropped and none added,
+    both give 4502 (lexdb's text names `v2a`, SQL Server's `dbo.v2a`). Oracle reads by name.
   - `UPDATE t SET @v = @v + col` and `SET @v = col = expr` are 102.
   - `OUTPUT ... INTO t` followed by an `OUTPUT` that returns rows is 50000.
   - `SET IDENTITY_INSERT` checks nothing: a missing table (208), a table without an identity (8106), a second table
@@ -297,8 +316,10 @@ differences of its statement.
   - **`CLUSTERED` and `NONCLUSTERED` are labels:** the rows stay in primary-key order.
   - Constraint names that were not given still differ: `emp_pkey`, `emp_name_key`, `emp_dept_id_fkey` where SQL Server
     generates `PK__emp__3213E83F...`.
-  - `DROP INDEX ix ON dbo.t` works. `DROP INDEX t.ix` is 50000, a list of indexes is 102, and the index of a primary
-    key or unique constraint is not found (SQL Server: 3723).
+  - `DROP INDEX ix ON dbo.t`, `DROP INDEX t.ix` and `DROP INDEX dbo.t.ix` work. A list of indexes is 102 (SQL Server
+    takes it), and the index of a unique constraint is refused with 50000 and a primary key's index is not found
+    (SQL Server: 3723 for both). `DROP INDEX ix` without a table is taken (SQL Server: 159), and `DROP INDEX dbo.ix`
+    is 208 (SQL Server: 159).
   - `ALTER TABLE t ADD CONSTRAINT df DEFAULT 0 FOR col` is 102; a DEFAULT constraint's own name is not kept (it shows
     as `DF_table_col`), and `DROP CONSTRAINT` finds it by neither name.
   - `ALTER TABLE` takes one action per statement (`ADD b int, c int` is 50000), and refuses `SET (LOCK_ESCALATION =
@@ -316,15 +337,17 @@ differences of its statement.
   - `##g` is a session-private temporary table, as `#g` is.
   - Alias types (`CREATE TYPE dbo.phone FROM varchar(20)`) are 156.
   - `ALTER INDEX ... REBUILD`, `REORGANIZE` and `DISABLE` and `CREATE STATISTICS` are 50000; `CREATE COLUMNSTORE
-    INDEX` is 102; `sp_helpindex`, `sp_helptext` and `sp_refreshview` are 2812.
+    INDEX` is 102; `sp_helpindex` and `sp_helptext` are 2812.
   - A unique index over rows that clash is 2627 (SQL Server: 1505).
-  - Views: `WITH CHECK OPTION` is 50000; `CREATE VIEW` need not be first in its batch (SQL Server: 111); `DROP VIEW`
-    of a view another view reads is refused (50000; SQL Server allows it), and so is `DROP TABLE` under any view, in
-    every door (50000; SQL Server allows it unless a view is schema-bound, 3729).
-  - `WITH SCHEMABINDING` is read and kept (`sys.sql_modules.is_schema_bound`): `ALTER TABLE ... DROP COLUMN` of a
-    column such a view uses is 5074, and `SELECT *` in one is 1054, as in SQL Server. Not there: 4512 (a one-part name
-    in the view, or a view over itself), 4513 (a schema-bound view over a view that is not), and 5074 for `ALTER
-    COLUMN` of a column the view reads (lexdb makes the change).
+  - Views: `WITH CHECK OPTION` after the query is 50000 (before `AS` it is 102, as in SQL Server, but the text quotes
+    `with` in lower case); `CREATE VIEW` need not be first in its batch (SQL Server: 111); `DROP VIEW` of a view
+    another view reads is refused (50000; SQL Server allows it, and the other view then fails with 208 when read).
+    `DROP TABLE` under a view is done as in SQL Server (208 when the view is read, 3729 for a schema-bound view);
+    these texts, and 4502's and 4512's, name the table or view without its schema (SQL Server: `dbo.base`), and the
+    states of 4512 and 4513 are 1 (SQL Server: 3 and 2).
+  - `WITH SCHEMABINDING` is read and kept (`sys.sql_modules.is_schema_bound`): `ALTER TABLE ... DROP COLUMN` or
+    `ALTER COLUMN` of a column such a view uses is 5074, `SELECT *` in one is 1054, a one-part name in the view 4512,
+    a view over a view or function that is not schema-bound 4513, as in SQL Server.
   - `DROP TABLE` of a table a foreign key refers to is 50000 (SQL Server: 3726).
   - Sequences: `NO CACHE` is 102; `AS decimal(10,0)` is 50000; without `AS` and `START WITH` a sequence starts at 1
     (SQL Server: a bigint from its minimum); `NEXT VALUE FOR s` twice in one row gives two values (SQL Server: the
@@ -333,10 +356,10 @@ differences of its statement.
     `RESTART WITH 50`.
   - Other error numbers: `DROP TABLE`, `VIEW` or `SEQUENCE` of a missing object is 208 (SQL Server: 3701), `DROP
     INDEX` of a missing index 50000 (3701), adding a column that exists 50000 (2705), dropping an unknown column 207
-    (4924), adding a `NOT NULL` column without a default to a table with rows 515 (4901), two `CLUSTERED` indexes
-    in a `CREATE TABLE` 1902 (8112) and a repeated index name there 2714 (8168).
-  - **Index names are unique in the schema**, not per table: `CREATE INDEX ix ON t2 (a)` when `ix` is an index of
-    another table is 2714 (SQL Server allows it; the same name on the same table is 1913 there, 2714 here).
+    (4924), adding a `NOT NULL` column without a default to a table with rows 515 (4901).
+  - Index names are per table, as in SQL Server (1913 for the same name on the same table, 8168 for a repeated inline
+    name, 8112 for two `CLUSTERED`). The PostgreSQL and Oracle doors keep index names per schema, and show the second
+    `ix` under a longer name (`ix`, a control character and the table's name).
 - **Transactions and variables** (found writing those T-SQL pages):
   - A string too long for a variable is error 2628 and leaves it NULL: `DECLARE @s varchar(3) = 'abcdef'` (SQL
     Server cuts it to 'abc').
@@ -445,12 +468,15 @@ differences of its statement.
     `IS_SRVROLEMEMBER('sysadmin')` are 0 for `sa`; `xml` has no methods (`doc.value(...)` is 4121); `NTH_VALUE`
     works (SQL Server has none).
   - **Catalog:** `sys.index_columns` omits the `INCLUDE` columns of an index; `sys.server_principals` does not list
-    `sa`; `sys.dm_exec_sessions` is one recorded row; `INFORMATION_SCHEMA` shows `dbo` (`SCHEMATA` lists `dbo`, owned by
-    `dbo`, and the schemas made with `CREATE SCHEMA` owned by their creator, `sa` (SQL Server: `dbo`); it also lists
-    PostgreSQL's `information_schema` and `pg_catalog`, and has no `guest`, `sys` or `db_*`), but `ROUTINES` and `PARAMETERS` have no T-SQL procedures or functions,
-    `CONSTRAINT_COLUMN_USAGE` gives a foreign key's referenced column and not the key's own (`p3.id` for `fk3`, where
-    SQL Server lists `c3.pid`), and `INFORMATION_SCHEMA.VIEW_TABLE_USAGE`, `DOMAINS`, `COLUMN_PRIVILEGES` and
-    `VIEW_COLUMN_USAGE` do not exist; `sys.database_role_members`, `sys.partitions` and `sys.dm_exec_requests` do
+    `sa`; `sys.dm_exec_sessions` is one recorded row; `INFORMATION_SCHEMA` is SQL Server's for
+    `SCHEMATA` (its schemas, `dbo`, `guest`, `INFORMATION_SCHEMA`, `sys` and the `db_*` ones, and the schemas made with
+    `CREATE SCHEMA`, owned by `dbo`), `ROUTINES`, `PARAMETERS`, `CONSTRAINT_COLUMN_USAGE` (a foreign key's own columns),
+    `VIEW_TABLE_USAGE` and `VIEW_COLUMN_USAGE`; still missing are `DOMAINS` and `COLUMN_PRIVILEGES` (208), a schema
+    made `AUTHORIZATION x` still shows `dbo` as its owner (SQL Server: `x`), the column names are in lower case and the
+    catalog name is `lexdb` (SQL Server: upper case, the database's name), and **an assertion has no row in
+    `CONSTRAINT_COLUMN_USAGE`** in this door (found on main f1e0ddf8, not fixed: the `ASSERTIONS` and `CHECK_CONSTRAINTS`
+    rows are there, and the PostgreSQL door's `constraint_column_usage` still lists the columns an assertion reads;
+    [CREATE ASSERTION](sql/tsql/create-assertion.md), example E, shows it); `sys.database_role_members`, `sys.partitions` and `sys.dm_exec_requests` do
     not exist (208); `sys.types` gives `decimal` scale 38; every decimal expression is `decimal(38,6)` in
     `sys.columns`. A CHECK's text (`INFORMATION_SCHEMA.CHECK_CONSTRAINTS.CHECK_CLAUSE`,
     `sys.check_constraints.definition`) is SQL Server's form (`([salary]>=(0))`) except a `CAST`, which shows as what
@@ -495,8 +521,9 @@ differences of its statement.
     kept (`USER_PG_COMMENTS.COMMENTS` stays empty).
   - `VERTEX_ID` and `EDGE_ID` give the JSON's text as `VARCHAR2` (Oracle: `JSON`; lexdb has no JSON type), and
     `MATCHNUM()`'s numbers are lexdb's own (one a match, as in Oracle, but not Oracle's numbers).
-  - A quoted graph name is matched without its case: `GRAPH_TABLE (mixg ...)` and `DROP PROPERTY GRAPH mixg` find
-    `"MixG"` (Oracle: ORA-42421). Quoted labels are matched with their case, as in Oracle.
+  - Quoted graph names and quoted labels are exact, as in Oracle: `GRAPH_TABLE (mixg ...)` and `DROP PROPERTY GRAPH
+    mixg` are ORA-42421 for `"MixG"` (checked on Oracle Free 23.26.3), in a database made by this lexdb or later (see
+    the names entry below).
   - `USER_OBJECTS.STATUS` of a graph says whether the tables and columns it names are there. Oracle marks a graph
     `INVALID` when a column of one of its tables is changed (`ALTER TABLE ... MODIFY`, a column renamed) even with its
     names all there, and `VALID` at its next use (`ADD` of a column and `CREATE INDEX` leave it `VALID`).
@@ -505,7 +532,8 @@ differences of its statement.
   - `ALTER TABLE ... DROP COLUMN` of a column a view reads through `GRAPH_TABLE` drops it: the view is `INVALID`,
     reading it is ORA-04063, and `USER_ERRORS` shows ORA-04045 and its cause, as in Oracle. Once the column is
     back, the graph and the view are `VALID` and the view readable at once; Oracle keeps both `INVALID`, with
-    ORA-04063 on every read, until `ALTER VIEW ... COMPILE` (checked on Oracle Free 23.26.3). The same holds for a
+    ORA-04063 on every read, until `ALTER VIEW ... COMPILE` (checked on Oracle Free 23.26.3; kept as a deliberate
+    choice: lexdb's view says what its query does now). The same holds for a
     view over a graph that was dropped and made again: `VALID` at once (Oracle: `INVALID` until its next use).
 - **Assertions** (`CREATE ASSERTION`, supported since main f23d0ebc; see [CREATE ASSERTION](sql/oracle/create-assertion.md)
   and [Assertions in the three doors](assertions.md)). What is left, checked against main and Oracle Free 23.26.3:
@@ -543,7 +571,9 @@ differences of its statement.
   - `USER_OBJECTS.STATUS` and `USER_ERRORS` of a view say what the view's query does now: after `ALTER TABLE ... DROP
     COLUMN` of a column it reads the view is `INVALID` with its error in `USER_ERRORS` at once (Oracle fills
     `USER_ERRORS` at the view's next use), and it is `VALID` again as soon as the column is back (Oracle keeps it
-    `INVALID` until its next use, a view over another view too). A `SELECT *` view over a table that lost a column
+    `INVALID` until its next use, a view over another view too). `DROP TABLE` under a view is done as in Oracle (the
+    view is `INVALID`, ORA-04063 when read, ORA-00942 in `USER_ERRORS`), and the view is `VALID` again as soon as the
+    table is made again (Oracle: at its next use). A `SELECT *` view over a table that lost a column
     and gained another reads the columns by position (each view column shows the values of the table column that
     now stands in its place); Oracle reads them by name.
   - `ALTER TABLE ... READ ONLY` and `ALTER INDEX ... UNUSABLE` are ORA-03001 (Oracle marks the index unusable);
@@ -552,10 +582,14 @@ differences of its statement.
     missing table.
   - A foreign key accepts `ON UPDATE CASCADE` (the child rows follow a parent's key change); Oracle has no such
     clause and gives ORA-02000 (`missing DELETE keyword`).
-  - Quoted lower-case table and column names are folded to upper case: `create table "qt"` is listed as `QT` and is the
-    same table as `qt` (a second `create table qt` is ORA-00955); Oracle keeps two tables, `"qt"` and `QT`. A quoted
-    mixed-case name is kept as written (`"MixT"`) but `mixt` finds it too (Oracle: ORA-00942). A call of a quoted
-    mixed-case function (`"MixF"(2)`) is ORA-00900.
+  - **Quoted names are exact, as in Oracle** (`"qt"` and `QT` are two tables, `mixt` does not find `"MixT"`, and
+    `"MixF"(2)` is a call), in a database made by this lexdb or a later one. A database made before keeps the old
+    rule for good: its quoted mixed-case names are folded, so its objects answer to the spellings they were made with
+    (`mixt` finds `"MixT"`, and `"qt"` and `QT` are one table); to get exact names, load it into a new database.
+    Limits: an exact name cannot be reached from the PostgreSQL or SQL Server doors (their quoted names are folded:
+    `sa."qt"` is 42P01 / 208 there, though both list the table); a SQL Server spelling such as `Orders` is `ORDERS` to
+    the Oracle door (`public.orders` finds it) but is listed as `Orders`; and names lexdb makes from an exact table's
+    name (`Emp_PKEY` for `"Emp"`) show their raw bytes in the other doors (`e\x1Cmp\x1D_pkey` in `pg_indexes`).
   - `USER_TAB_COLUMNS.DATA_DEFAULT` of a column whose default is a sequence shows `nextval('s')` (Oracle:
     `"APP"."S"."NEXTVAL"`).
   - Sequences: past `MAXVALUE` the error is ORA-20000 (Oracle ORA-08004); `CURRVAL` before `NEXTVAL` is ORA-20000
@@ -587,11 +621,16 @@ differences of its statement.
     and `CREATE VIEW` over it is refused with ORA-06575. A syntax error in a SQL statement of a stored procedure or
     function is found at `CREATE` too (ORA-00936, ORA-00907 with a parenthesis left open, at the token where lexdb's
     parser stopped; Oracle's number may differ for other syntax errors); a `SELECT ... INTO` with a parenthesis left
-    open before `INTO` (`select count(* into n from t`) is PLS-00428 where Oracle gives ORA-00907. Other compile
+    open before `INTO` (`select count(* into n from t`) is ORA-00907, as in Oracle. Other compile
     errors (types, argument counts, unknown columns of `SELECT INTO`), and any in a package body or an anonymous
     block, appear when the code runs (Oracle: ORA-06550 first for a block, ORA-04063 for a package body).
-    PLS-00103's text has no list of expected symbols. Nested subprograms in a stored unit still leave it `INVALID`
-    ("subprograms declared in a block are not supported"; Oracle takes them).
+    PLS-00103's text has no list of expected symbols.
+  - **Nested subprograms** (in a stored unit's, a package member's or a block's declarations) work: forward
+    declarations, recursion and the enclosing variables. Not supported: overloading them (one subprogram to a name in
+    a scope, so with two `sq` of different argument types **the later one is used for both calls**, silently: Oracle
+    picks by the arguments; found on main f1e0ddf8, not fixed), and calling a nested function from SQL inside the unit
+    (`select sq(3) into r from dual`: the unit is stored `VALID` and the statement is ORA-00904 when it runs; Oracle
+    refuses the unit with PLS-00231).
   - Annotations (supported since main 6c2e83f1; see [annotations](sql/oracle/annotations.md)): `ALL_` and
     `DBA_ANNOTATIONS_USAGE` have no rows for the built-in domains of `SYS` and `DOMAIN_NAME` / `DOMAIN_OWNER` are
     always NULL (lexdb has no domains); a global temporary table's annotations are kept but not listed.

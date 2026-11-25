@@ -69,8 +69,8 @@ AS select_statement
 - **`SELECT *` is expanded when the view is read**, not when it is made: a column added to the table later shows in
   the view at once. SQL Server keeps the columns the view had until `sp_refreshview`.
 - The texts of 4502, 4512, 208 (a table under a view dropped) and 3729 name the view or table without its schema
-  (`base`, SQL Server: `dbo.base`), and the states of 4512 and 4513 are 1 (SQL Server: 3 and 2). A syntax error near a keyword quotes it in
-  lower case (`near 'with'`; SQL Server quotes it as written).
+  (`base`, SQL Server: `dbo.base`), and the states of 4512 and 4513 are 1 (SQL Server: 3 and 2). The 102 of `WITH CHECK OPTION`
+  before `AS` quotes `with` in lower case (SQL Server quotes `WITH` as written).
 - `CREATE VIEW` need not be the first statement of its batch (SQL Server: 111).
 - An `ORDER BY` without `TOP` is taken (SQL Server: 1033). The rows of the view are not sorted by it.
 - `DROP VIEW` of a view that another view reads is refused (error 50000); SQL Server drops it, and the other view
