@@ -14,6 +14,8 @@ COMMENT ON { TABLE [ schema. ] table | COLUMN [ schema. ] table.column } IS 'tex
 
 - The statement is accepted and **the comment is not kept**: `USER_TAB_COMMENTS` and `USER_COL_COMMENTS` list the
   table and its columns with an empty comment.
+- [Annotations](annotations.md) are kept: a name and value on a table, a view, an index or a column, listed in
+  `USER_ANNOTATIONS_USAGE`.
 - A table that does not exist is not an error (see the examples).
 
 ## Differences from Oracle
@@ -69,4 +71,4 @@ Comment created.
 
 ## See also
 
-[CREATE TABLE](create-table.md), [ALTER TABLE](alter-table.md)
+[CREATE TABLE](create-table.md), [ALTER TABLE](alter-table.md), [Annotations](annotations.md)
