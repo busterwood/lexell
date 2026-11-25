@@ -13101,3 +13101,10 @@ UPDATE / DELETE / COPY with batch_rows are checked per batch (were refused), TRU
 ON UPDATE action is checked whatever the statement's SET, COPY's fast path is not taken for an asserted table (its rows could not be read back:
 they went unchecked), Oracle's array DML is one check after its last run (as Oracle), and many rows put are checked by key 4,096 at a time
 (a 1,000,000-row COPY into an asserted table 113 s -> 1.8 s). Tests pg_assert, tds_assert, tns_assert_doors; replica.py. lexdb_exec +8 lines.
+
+### 9.147 The fourth bug slice (lexdb-robust.md, "The fourth bug slice")
+
+The core's share of the slice: a foreign key between an integer and a numeric column (the Oracle door's; the PostgreSQL door still refuses numeric to bigint, `exec_bugs4`) compares values
+(`lexdb_fkconv`: the parent found by its primary key's key made from the values, `pkKey`, which builds no row and made a foreign key's INSERT cheaper; the children by `fit`); a PL/SQL unit's
+CREATE and DROP move the catalog's version (`lexdb_catalog.CAT_VERSION_KEY`), so plans kept over it are made again; SQL Server's reserved words (`lexdb_sql.tsqlReserved`) are refused as bare
+names in the T-SQL door's parse.

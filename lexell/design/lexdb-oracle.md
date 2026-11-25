@@ -1299,3 +1299,12 @@ whole-query check, the check's plan made each time.
 - A view may call stored functions (`PLF_MARK` after its text, `lexdb_routine.viewPlf`, `lexdb_plcall.again`); a cursor run again reloads the program before calling a function.
 - ORA-11559, 00957, 01418, 00942 (ALTER TABLE of a view, ALTER VIEW of a table), 00922 (ALTER VIEW ... RENAME TO); ALTER INDEX ... REBUILD / COALESCE / [NO]PARALLEL / [NO]LOGGING and ALTER VIEW
   ... COMPILE / [NON]EDITIONABLE accepted as no-ops. Test `tns_bugs3` (91 answers as Oracle Free gives them), `tns_logonzone`.
+
+## As built: the fourth bug slice (lexdb-robust.md, 2026-11-25)
+
+- A foreign key between a NUMBER and an integer (identity, INTEGER) column is taken and compares by value (`lexdb_fkconv`); a pair Oracle refuses is ORA-02267.
+- A PL/SQL unit's CREATE and DROP move the catalog's version: a kept plan of a view over a dropped function gives ORA-04063 / 04067; USER_OBJECTS shows such a view (or one over a dropped
+  graph) INVALID.
+- A stored procedure or function with an undeclared name, an expression that does not parse or DML on a missing table is stored INVALID with USER_ERRORS; SQL's call of it is ORA-06575.
+- TIME_ZONE 'UTC' (ALTER SESSION, logon) is the region: SESSIONTIMEZONE shows UTC. TO_CHAR of a TIMESTAMP WITH LOCAL TIME ZONE refuses TZH and TZM (ORA-01821).
+- Property graphs' error numbers and texts as Oracle's (lexdb-robust.md lists them). Tests `tns_bugs4`, `tns_viewplf`, `tns_graphtext`.
