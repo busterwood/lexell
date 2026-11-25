@@ -1,0 +1,138 @@
+// lexdb over TNS: the texts of the property graph errors the fourth bug slice fixed (design/lexdb-robust.md, "The fourth bug slice";
+// KNOWN-ISSUES.md's property graph entry), each as Oracle Database Free 23.26 gives it (checked by hand with python-oracledb, the same
+// statements): ORA-40983 and ORA-49044 ("is never defined"), a vertex's property read through an edge variable and an edge's through a
+// vertex variable (ORA-40983, not 49044), {m,} (ORA-40984), SOURCE v without KEY with two foreign keys to v's table (ORA-42431), ORA-42442's
+// text, ORA-04045 with its cause (ORA-00942 for a table gone before ORA-00904 for a column), DROP PROPERTY GRAPH ... CASCADE | PURGE
+// (ORA-03049), GRAPH_TABLE (...) AS (ORA-03048 and its text), a view over a dropped graph (ORA-04063, USER_OBJECTS.STATUS INVALID, VALID
+// once the graph is back), USER_PG_LABEL_PROPERTIES.DATA_LENGTH (the longest of the graph's properties of the name) and a PL/SQL
+// variable inside GRAPH_TABLE (ORA-49028 when the block compiles). Each answer: its rows, or the error's number and text.
+// expect: nosuch column: ORA-40983: property "NOSUCH" is never defined
+// expect: nosuch where: ORA-40983: property "NOSUCH" is never defined
+// expect: edge property, vertex variable: ORA-40983: property "W" is never defined
+// expect: vertex property, edge variable: ORA-40983: property "CITY" is never defined
+// expect: other label: ORA-49044: Property "CITY" is never defined when evaluating the label expression for element variable "A".
+// expect: {1,}: ORA-40984: invalid value specified for bounded quantifier in a GRAPH_TABLE operator
+// expect: two foreign keys: ORA-42431: ambiguous edge relationship for graph edge table GE
+// expect: view without key: ORA-42442: KEY is not specified for view graph element table PV.
+// expect: cascade: ORA-03049: SQL keyword 'CASCADE' is not syntactically valid following 'drop property graph g1 '
+// expect: purge: ORA-03049: SQL keyword 'PURGE' is not syntactically valid following 'drop property graph g1 '
+// expect: as: ORA-03048: SQL reserved word 'AS' is not syntactically valid following '...) columns (a.name as x)) '
+// expect: lengths: ID NUMBER 22 | NAME VARCHAR2 30 | W NUMBER 22 | CITY VARCHAR2 40 | ID NUMBER 22 | NAME VARCHAR2 30
+// expect: view: 'Ann' | 'Bob'
+// expect: view after drop: ORA-04063: view "APP.GV" has errors
+// expect: status after drop: 'GV' 'INVALID'
+// expect: view after the graph is back: 'Ann' | 'Bob'
+// expect: status after: 'GV' 'VALID'
+// expect: graph variable: ORA-06550: line 1, column 116: | PL/SQL: ORA-49028: The PL/SQL variable "V" is referenced inside a GRAPH_TABLE operator. | ORA-06550: line 1, column 46: | PL/SQL: SQL Statement ignored
+// expect: column dropped: ORA-04045: errors during recompilation or revalidation of APP.H1 | ORA-00904: "CITY": invalid identifier
+// expect: table dropped too: ORA-04045: errors during recompilation or revalidation of APP.H1 | ORA-00942: table or view "APP"."HW" does not exist
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+const SETUP = "create table gp (id number primary key, name varchar2(20), city varchar2(40))\ncreate table gc (id number primary key, cname varchar2(30))\ncreate table ge (id number primary key, s number references gp (id), d number references gp (id), w number)\ncreate table gk (id number primary key, a number references gp (id), b number references gc (id))\ninsert into gp values (1, 'Ann', 'Oslo')\ninsert into gp values (2, 'Bob', 'Rome')\ninsert into ge values (10, 1, 2, 5)\ncreate view pv as select id, name from gp\ncreate table hv (id number primary key, name varchar2(20), city varchar2(40))\ninsert into hv values (1, 'Ann', 'Oslo')\ncreate table hw (id number primary key, x number)\ncreate property graph h1 vertex tables (hv label p properties (id, name, city), hw label q properties (id, x))"
+
+const G1 = "create property graph g1 vertex tables (gp label person properties (id, name, city), gc label comp properties (id, cname as name)) edge tables (ge source key (s) references gp (id) destination key (d) references gp (id) label knows properties (w), gk source key (a) references gp (id) destination key (b) references gc (id) label worksat no properties)"
+
+fn cell(rows: &oracle.Rows, i: int, k: int): str {
+    match rows.isNull(i, k) {
+        Ok(n) {
+            if n { return "NULL" }
+            match rows.value(i, k) {
+                Ok(v) { return v.toStr() }
+                Err(e) { return "error " + e.code.toStr() }
+            }
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn failed(e: &oracle.Error): str { return strings.replaceAll(&e.msg, "\n", " | ") }
+
+fn q(c: mut &oracle.Conn, label: &str, sql: &str) {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var out: []str = []
+            for i in 0..rows.rowCount() {
+                var cs: []str = []
+                for k in 0..rows.columnCount() { append(mut &cs, cell(&rows, i, k)) }
+                append(mut &out, strings.join(&cs, " "))
+            }
+            println(label + ": " + strings.join(&out, " | "))
+        }
+        Err(e) { println(label + ": " + failed(&e)) }
+    }
+}
+
+fn x(c: mut &oracle.Conn, label: &str, sql: &str) {
+    match c.run(&(sql.toStr()), &[]) {
+        Ok(_) { if len(label) > 0 { println(label + ": ok") } }
+        Err(e) { println((if len(label) > 0 { label.toStr() } else { sql.toStr() }) + ": " + failed(&e)) }
+    }
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) { x(mut &c, &"", &s) }
+            x(mut &c, &"", &G1)
+            q(mut &c, "nosuch column", "select * from graph_table (g1 match (a is person) columns (a.nosuch as x))")
+            q(mut &c, "nosuch where", "select * from graph_table (g1 match (a is person) where a.nosuch = 1 columns (a.name as x))")
+            q(mut &c, "edge property, vertex variable", "select * from graph_table (g1 match (a is person) columns (a.w as x))")
+            q(mut &c, "vertex property, edge variable", "select * from graph_table (g1 match (a is person) -[e is knows]-> (b) columns (e.city as x))")
+            q(mut &c, "other label", "select * from graph_table (g1 match (a is comp) columns (a.city as x))")
+            q(mut &c, "{1,}", "select * from graph_table (g1 match (a is person) -[e]->{1,} (b) columns (a.name as x))")
+            x(mut &c, "two foreign keys", "create property graph g2 vertex tables (gp) edge tables (ge source gp destination gp)")
+            x(mut &c, "view without key", "create property graph g4 vertex tables (pv)")
+            x(mut &c, "cascade", "drop property graph g1 cascade")
+            x(mut &c, "purge", "drop property graph g1 purge")
+            q(mut &c, "as", "select * from graph_table (g1 match (a is person) columns (a.name as x)) as q")
+            match c.query("select property_name, data_type, data_length from user_pg_label_properties where graph_name = 'G1' order by label_name, property_name", &[]) {
+                Ok(rows) {
+                    var out: []str = []
+                    for i in 0..rows.rowCount() { append(mut &out, cell(&rows, i, 0) + " " + cell(&rows, i, 1) + " " + cell(&rows, i, 2)) }
+                    println("lengths: " + strings.replaceAll(&strings.join(&out, " | "), "'", ""))
+                }
+                Err(e) { println("lengths: " + failed(&e)) }
+            }
+            x(mut &c, "", "create view gv as select * from graph_table (g1 match (a is person) columns (a.name as n))")
+            q(mut &c, "view", "select n from gv order by n")
+            x(mut &c, "", "drop property graph g1")
+            q(mut &c, "view after drop", "select n from gv")
+            q(mut &c, "status after drop", "select object_name, status from user_objects where object_name = 'GV'")
+            x(mut &c, "", &G1)
+            q(mut &c, "view after the graph is back", "select n from gv order by n")
+            q(mut &c, "status after", "select object_name, status from user_objects where object_name = 'GV'")
+            x(mut &c, "graph variable", "declare v number := 1; n varchar2(20); begin select x into n from graph_table (g1 match (a is person) where a.id = v columns (a.name as x)); end;")
+            x(mut &c, "", "alter table hv drop column city")
+            q(mut &c, "column dropped", "select * from graph_table (h1 match (a is p) columns (a.name as x))")
+            x(mut &c, "", "drop table hw purge")
+            q(mut &c, "table dropped too", "select * from graph_table (h1 match (a is p) columns (a.name as x))")
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(160), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

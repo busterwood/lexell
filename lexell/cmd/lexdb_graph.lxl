@@ -198,6 +198,29 @@ pub fn all(raw: &[]str): []Graph {
     return out
 }
 
+// Whether a view's text (of a view in schema) reads GRAPH_TABLE of a graph that is not there (USER_OBJECTS shows the view INVALID,
+// and reading it is ORA-04063, as Oracle's; the fourth bug slice, design/lexdb-robust.md).
+pub fn viewGraphGone(text: &str, schema: &str, graphs: &[]Graph): bool {
+    if !strings.startsWith(text, lexdb_sql.ORA_VIEW) || !strings.contains(&strings.toLowerAscii(text), "graph_table") { return false }
+    let kept = lexdb_sql.viewKept(text)
+    let ts = match lexdb_parse.oraTokens(&kept[len(lexdb_sql.ORA_VIEW)..len(kept)]) {
+        Ok(x) { x }
+        Err(_) { return false }
+    }
+    for i in 0..len(ts) {
+        if !(isName(&ts[i]) && strings.toLowerAscii(&ts[i].text) == "graph_table" && i + 2 < len(ts) && ts[i + 1].kind == T_OP && ts[i + 1].text == "(" && isName(&ts[i + 2])) { continue }
+        var n = ts[i + 2].text.clone()
+        if i + 4 < len(ts) && ts[i + 3].kind == T_OP && ts[i + 3].text == "." && isName(&ts[i + 4]) { n = lexdb_sql.qual(&n, &ts[i + 4].text) }
+        var found = false
+        for g in graphs {
+            if g.key == n || (!lexdb_sql.isQual(&n) && lexdb_sql.baseName(&g.key) == n && (lexdb_sql.schemaOf(&g.key) == schema || lexdb_sql.schemaOf(&g.key) == "public")) { found = true }
+            if lexdb_sql.isQual(&n) && lexdb_sql.schemaOf(&n) == "public" && g.key == lexdb_sql.baseName(&n) { found = true }
+        }
+        if !found { return true }
+    }
+    return false
+}
+
 // A property's expression's tokens (lexdb_oracat shows it as Oracle does), without the end; [] if it does not read.
 pub fn exprToks(text: &str): []Tok {
     match lexdb_parse.oraTokens(text) {
@@ -537,7 +560,7 @@ fn elemDef(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: mut &Rdr, verte
         }
     } else {
         if lexdb_catalog.hasPk(&t) { for p in t.pk { append(mut &el.keys, t.cols[p].name.clone()) } }
-        if len(el.keys) == 0 { return Err(if len(t.view) > 0 { ora(42442, &("cannot infer key for graph element view " + shown)) } else { ora(42402, &("cannot infer key for graph element table " + shown)) }) }
+        if len(el.keys) == 0 { return Err(if len(t.view) > 0 { ora(42442, &("KEY is not specified for view graph element table " + shown + ".")) } else { ora(42402, &("cannot infer key for graph element table " + shown)) }) }
     }
     if !vertex {
         if !r.accept("source") { return Err(ora(2000, "missing SOURCE keyword")) }
@@ -618,6 +641,7 @@ fn endDef(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: mut &Rdr, t: &Ta
                 refs = f.refCols.clone()
             }
         }
+        if found > 1 { return Err(ora(42431, &("ambiguous edge relationship for graph edge table " + edge))) }
         if found != 1 { return Err(ora(42413, &("cannot infer edge relationship for edge table " + edge))) }
     }
     if len(cols) != len(refs) { return Err(ora(42415, "missing key column in edge reference definition")) }
@@ -1085,18 +1109,21 @@ fn parseGT(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str): Resul
     // its tables and columns as they are now: one gone makes the graph invalid
     var tabs: []Table = []
     var allCols: []str = []
+    // (with its cause on a second line, as Oracle's: a table gone, ORA-00942, before a column, ORA-00904)
+    let bad = "errors during recompilation or revalidation of " + owner + "." + g.name
     for el in g.elems {
-        let bad = ora(4045, &("errors during recompilation or revalidation of " + owner + "." + g.name))
-        let t = match try tableOf(st, txn, &el.table) {
-            Some(x) { x }
-            None { return Err(bad) }
+        if (try tableOf(st, txn, &el.table)).isNone() {
+            return Err(ora(4045, &(bad + "\nORA-00942: table or view \"" + owner + "\".\"" + strings.toUpperAscii(&lexdb_sql.baseName(&el.table)) + "\" does not exist")))
         }
+    }
+    for el in g.elems {
+        let t = (try tableOf(st, txn, &el.table)).unwrap()
         var need: []str = []
         for k in el.keys { append(mut &need, k.clone()) }
         for k in el.src.cols { append(mut &need, k.clone()) }
         for k in el.dst.cols { append(mut &need, k.clone()) }
         for l in el.labels { for p in l.props { for u in p.uses { append(mut &need, u.clone()) } } }
-        for n in need { if colIdx(&t, &n) < 0 { return Err(bad) } }
+        for n in need { if colIdx(&t, &n) < 0 { return Err(ora(4045, &(bad + "\nORA-00904: \"" + strings.toUpperAscii(&n) + "\": invalid identifier"))) } }
         for c in t.cols { if !lexdb_base.hasStr(&allCols, &c.name) { append(mut &allCols, c.name.clone()) } }
         append(mut &tabs, t)
     }
@@ -1248,7 +1275,7 @@ fn quant(r: mut &Rdr, lo: mut &int, hi: mut &int): Result[Unit, DbErr] {
         b = a
     }
     if r.acceptOp(",") {
-        if r.peek().kind != T_NUM { return Err(ora(40985, "unsupported quantifier for variable path pattern in a GRAPH_TABLE operator")) }
+        if r.peek().kind != T_NUM { return Err(ora(40984, "invalid value specified for bounded quantifier in a GRAPH_TABLE operator")) }     // ({m,})
         b = lexdb_base.num(&r.peek().text)
         r.pos += 1
     }
@@ -1499,15 +1526,16 @@ fn epSpans(pt: &[]PI, out: mut &[][]int) {
 }
 
 fn checkProp(gt: &GT, d: int, p: &str): Result[Unit, DbErr] {
+    // (ORA-40983 when no label of the variable's kind has it: a vertex's property read through an edge variable too, as Oracle)
     var anywhere = false
-    for el in gt.g.elems { for l in el.labels { for x in l.props { if x.name == p { anywhere = true } } } }
-    if !anywhere { return Err(ora(40983, &("property \"" + p + "\" is noRows defined"))) }
+    for el in gt.g.elems { if el.vertex == gt.decls[d].vertex { for l in el.labels { for x in l.props { if x.name == p { anywhere = true } } } } }
+    if !anywhere { return Err(ora(40983, &("property \"" + p + "\" is never defined"))) }
     let v = &gt.decls[d].name
     if len(candidates(gt, gt.decls[d].vertex, &gt.decls[d].labs)) == 0 {
         return Err(ora(49013, &("Invalid property reference \"" + p + "\" because the label expression for variable \"" + v + "\" is not satisfied.")))
     }
     if !lexdb_base.hasStr(&propsOf(gt, d), p) {
-        return Err(ora(49044, &("Property \"" + p + "\" is noRows defined when evaluating the label expression for element variable \"" + v + "\".")))
+        return Err(ora(49044, &("Property \"" + p + "\" is never defined when evaluating the label expression for element variable \"" + v + "\".")))
     }
     return Ok(Unit{})
 }
