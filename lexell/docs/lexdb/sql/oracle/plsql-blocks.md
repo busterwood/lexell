@@ -241,7 +241,7 @@ ORA-06550: line 5, column 3:
 PL/SQL: Statement ignored
 
 ERROR:
-ORA-06550: line 4, column 11:
+ORA-06550: line 4, column 3:
 PLS-00306: wrong number or types of arguments in call to 'SHOW'
 ORA-06550: line 4, column 3:
 PL/SQL: Statement ignored
@@ -253,6 +253,27 @@ ORA-06550: line 5, column 10:
 PL/SQL: ORA-03066: invalid PL/SQL expression
 ORA-06550: line 5, column 3:
 PL/SQL: SQL Statement ignored
+```
+
+### G. A named argument given twice
+
+<!-- example: oracle -->
+```sql
+DECLARE
+  FUNCTION add2 (a NUMBER, b NUMBER) RETURN NUMBER IS BEGIN RETURN a + b; END;
+BEGIN
+  DBMS_OUTPUT.PUT_LINE(add2(b => 2, a => 1));
+  DBMS_OUTPUT.PUT_LINE(add2(a => 1, a => 2));
+END;
+/
+```
+
+```text
+ERROR:
+ORA-06550: line 5, column 24:
+PLS-00703: multiple instances of named argument in list
+ORA-06550: line 5, column 3:
+PL/SQL: Statement ignored
 ```
 
 ## See also

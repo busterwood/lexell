@@ -33,6 +33,9 @@ EXEC[UTE] { procedure | package.procedure } [ ( [ argument [, ...] ] ) ] ;
 
 ## Differences from Oracle
 
+- `CALL` of a procedure that does not exist, or with the wrong arguments, is ORA-06550 with PLS-00201 or PLS-00306, as
+  `EXEC` is in SQL\*Plus; Oracle's `CALL` statement itself says ORA-06576 (no such procedure) and ORA-06553 with PLS-306
+  (wrong arguments), which a driver shows.
 - `CALL` of a **function** without `INTO` is PLS-00201 (Oracle: ORA-06576); use `SELECT f() FROM dual` or a block.
 - `OUT` binds work from a client that supplies them; the documentation's checker does not (`ORA-01008: not all
   variables bound`), so the examples call with variables inside a block instead.
@@ -115,7 +118,7 @@ ORA-06550: line 1, column 7:
 PL/SQL: Statement ignored
 
 ERROR:
-ORA-06550: line 1, column 16:
+ORA-06550: line 1, column 7:
 PLS-00306: wrong number or types of arguments in call to 'HELLO'
 ORA-06550: line 1, column 7:
 PL/SQL: Statement ignored

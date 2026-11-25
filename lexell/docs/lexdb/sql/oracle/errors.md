@@ -152,10 +152,11 @@ in [Assertions in the three doors](../../assertions.md#errors-of-each-door).
 | ORA-06550 | A PL/SQL compile error; the next lines give the position and the `PLS-` message. |
 | PLS-00103 | A symbol that was not expected: a syntax error. |
 | PLS-00201 | An identifier that is not declared: a procedure or variable that does not exist. |
+| PLS-00306, PLS-00307, PLS-00703 | A call that no overload fits, a call that more than one overload fits, and a named argument given twice (`f(x => 1, x => 2)`); the position is the call's name. From SQL, the first two come as ORA-06553. |
 | ORA-01403 | `SELECT ... INTO` found no row (`NO_DATA_FOUND`). |
 | ORA-01422 | `SELECT ... INTO` found more than one row (`TOO_MANY_ROWS`). |
 | PLS-00302, PLS-00363 | A component the package does not have (`pay.nothere`); a constant used as an assignment target. |
-| ORA-06553 | A statement of its own that names a package variable (`SELECT pay.g_count FROM dual`: PLS-221). |
+| ORA-06553 | A statement of its own that names a package variable (`SELECT pay.g_count FROM dual`: PLS-221), or a call in SQL that no overload fits or that more than one fits (PLS-306, PLS-307). |
 | ORA-04068 | A call into a package that another session compiled again since this session made its state. It is raised once; the next call runs on fresh variables. |
 | ORA-06512 | Added after another error: the line of the block where it was raised. |
 | ORA-20000 to ORA-20999 | `RAISE_APPLICATION_ERROR` with your own number; lexdb also uses ORA-20000 for some of its own refusals (a sequence at its limit, a savepoint outside a transaction). |

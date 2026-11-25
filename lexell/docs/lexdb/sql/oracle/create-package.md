@@ -41,7 +41,7 @@ END [ package ] ;
 - A package whose specification declares no procedure or function needs no body: its variables and constants are used
   as they are (example F).
 - A package function is called in SQL like a standalone one: in a query, in the SQL of a block and in DML (example
-  H).
+  H); its members may be overloaded (example I).
 - `USER_OBJECTS` lists both as `PACKAGE` and `PACKAGE BODY`; `USER_SOURCE` has their text.
 
 ## Differences from Oracle
@@ -57,10 +57,14 @@ END [ package ] ;
 - Records, subtypes and exceptions declared in a package are not supported, with a body or without. Collection types are not
   supported, as elsewhere in PL/SQL. A member may declare nested subprograms (see [CREATE FUNCTION](create-function.md),
   example K), and nested subprograms may be overloaded (example L there).
-- **Overloaded members of a package are not told apart:** the members of one name are found by the name alone, and the
-  first one declared answers every call, from SQL and from PL/SQL. With `sq(x NUMBER)` declared before `sq(x VARCHAR2)`,
-  `pkg.sq('abc')` is ORA-06502; with the other order, `pkg.sq(4)` is not an error and answers with the `VARCHAR2`
-  member (the length of `'4'`). Oracle picks the member by the arguments.
+- **Overloaded members** of a package are picked by the call's arguments, from SQL and from PL/SQL, whichever the
+  order of the declarations (example I): by their number, their names (`f(c => 2)`) and the type families of the
+  arguments (number, text, date), then by the implicit conversions Oracle allows (a number to text and back, a date
+  to text, text to any scalar). A call that no member fits is PLS-00306, one that more than one fits is PLS-00307,
+  both at the call's name; in SQL they come as ORA-06553 with the PLS text. A view keeps the member resolved when it
+  was created. In SQL, arguments by name work for packaged and standalone functions (`pkg.f(x => 1)`).
+- A DATE passed where the member takes text is converted to ISO text (`2020-01-01 00:00:00`); Oracle uses the
+  session's `NLS_DATE_FORMAT` (`01-JAN-20`).
 
 ## Examples
 
@@ -416,6 +420,91 @@ ID      NET
 2 rows selected.
 
 Rollback complete.
+```
+
+### I. Overloaded members
+
+<!-- example: oracle -->
+```sql
+CREATE OR REPLACE PACKAGE shapes AS
+  FUNCTION area(r NUMBER) RETURN NUMBER;
+  FUNCTION area(w NUMBER, h NUMBER) RETURN NUMBER;
+  FUNCTION show(x NUMBER) RETURN VARCHAR2;
+  FUNCTION show(x VARCHAR2) RETURN VARCHAR2;
+  FUNCTION show(x NUMBER, y NUMBER) RETURN VARCHAR2;
+  FUNCTION show(x VARCHAR2, y VARCHAR2) RETURN VARCHAR2;
+  FUNCTION pick(a NUMBER, b NUMBER) RETURN VARCHAR2;
+  FUNCTION pick(a NUMBER, c NUMBER) RETURN VARCHAR2;
+END shapes;
+/
+CREATE OR REPLACE PACKAGE BODY shapes AS
+  FUNCTION area(r NUMBER) RETURN NUMBER IS BEGIN RETURN r * r * 3; END;
+  FUNCTION area(w NUMBER, h NUMBER) RETURN NUMBER IS BEGIN RETURN w * h; END;
+  FUNCTION show(x NUMBER) RETURN VARCHAR2 IS BEGIN RETURN 'number ' || x; END;
+  FUNCTION show(x VARCHAR2) RETURN VARCHAR2 IS BEGIN RETURN 'text ' || x; END;
+  FUNCTION show(x NUMBER, y NUMBER) RETURN VARCHAR2 IS BEGIN RETURN 'two numbers ' || (x + y); END;
+  FUNCTION show(x VARCHAR2, y VARCHAR2) RETURN VARCHAR2 IS BEGIN RETURN 'two texts ' || x || y; END;
+  FUNCTION pick(a NUMBER, b NUMBER) RETURN VARCHAR2 IS BEGIN RETURN 'b'; END;
+  FUNCTION pick(a NUMBER, c NUMBER) RETURN VARCHAR2 IS BEGIN RETURN 'c'; END;
+END shapes;
+/
+SELECT shapes.area(2) AS one_arg, shapes.area(2, 5) AS two_args FROM dual;
+SELECT shapes.show(7) AS n, shapes.show('7') AS t, shapes.show(1, 2) AS nn, shapes.show('a', 'b') AS tt FROM dual;
+SELECT shapes.pick(a => 1, c => 2) AS by_name FROM dual;
+SELECT shapes.pick(1, 2) FROM dual;
+SELECT shapes.area(1, 2, 3) FROM dual;
+BEGIN DBMS_OUTPUT.PUT_LINE(shapes.show(3) || ', ' || shapes.show('x')); END;
+/
+BEGIN DBMS_OUTPUT.PUT_LINE(shapes.pick(1, 2)); END;
+/
+BEGIN DBMS_OUTPUT.PUT_LINE(shapes.area(1, 2, 3)); END;
+/
+```
+
+```text
+Package created.
+
+Package body created.
+
+ONE_ARG TWO_ARGS
+------- --------
+     12       10
+
+1 row selected.
+
+N        T      NN            TT
+-------- ------ ------------- ------------
+number 7 text 7 two numbers 3 two texts ab
+
+1 row selected.
+
+BY_NAME
+-------
+c
+
+1 row selected.
+
+ERROR:
+ORA-06553: PLS-307: too many declarations of 'PICK' match this call
+
+ERROR:
+ORA-06553: PLS-306: wrong number or types of arguments in call to 'AREA'
+
+number 3, text x
+
+PL/SQL procedure successfully completed.
+
+ERROR:
+ORA-06550: line 1, column 28:
+PLS-00307: too many declarations of 'PICK' match this call
+ORA-06550: line 1, column 7:
+PL/SQL: Statement ignored
+
+ERROR:
+ORA-06550: line 1, column 28:
+PLS-00306: wrong number or types of arguments in call to 'AREA'
+ORA-06550: line 1, column 7:
+PL/SQL: Statement ignored
 ```
 
 ## See also

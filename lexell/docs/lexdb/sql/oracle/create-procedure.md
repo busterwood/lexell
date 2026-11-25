@@ -194,7 +194,7 @@ ORA-06502: PL/SQL: value or conversion error: character to number conversion err
 ORA-06512: at line 1
 
 ERROR:
-ORA-06550: line 1, column 17:
+ORA-06550: line 1, column 7:
 PLS-00306: wrong number or types of arguments in call to 'P_TEXT'
 ORA-06550: line 1, column 7:
 PL/SQL: Statement ignored
