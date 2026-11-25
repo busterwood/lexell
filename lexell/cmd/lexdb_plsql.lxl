@@ -5141,11 +5141,56 @@ pub fn callFunctionIn(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: 
     return callUnit(pg, ip, sess, u, &p, fr)
 }
 
+// The overload of a package's function a call without one (a view kept by an earlier version: its calls are by name) means, by its
+// argument values' types (family of the value; a timestamp is not told from a date where a member takes a timestamp, a NULL is any):
+// its number, 0 where the name has no overloads; PLS-307 / PLS-306 as a call's where none or more than one fits (never a guess).
+fn unpinnedOvl(pg: &Prog, f: &FnId, args: &[]Val): Result[int, DbErr] {
+    if len(f.names) != 3 { return Ok(0) }
+    var cands: []int = []
+    for k in 0..len(pg.units) {
+        let x = &pg.units[k]
+        if x.kind == U_FUNC && x.isPub && len(x.nest) == 0 && x.owner == f.names[0] && x.pkg == f.names[1] && x.name == f.names[2] { append(mut &cands, k) }
+    }
+    if len(cands) < 2 { return Ok(0) }
+    var prmss: [][]Prm = []
+    var tsTaken = false
+    for k in cands {
+        append(mut &prmss, copyPrms(&pg.units[k].prms))
+        for p in pg.units[k].prms { if p.pt.k == PK_TS { tsTaken = true } }
+    }
+    var fams: []int = []
+    var names2: []str = []
+    for k in 0..len(args) {
+        var fm = 0
+        match args[k] {
+            Val.Int(_) { fm = PK_NUM }
+            Val.Num(_) { fm = PK_NUM }
+            Val.Float(_) { fm = PK_FLOAT }
+            Val.Real(_) { fm = PK_FLOAT }
+            Val.Text(_) { fm = PK_TEXT }
+            Val.Bool(_) { fm = PK_BOOL }
+            Val.Date(_) { fm = PK_DATE }
+            Val.Ts(_) { if !tsTaken { fm = PK_DATE } }
+            Val.Tstz(_) { fm = PK_TSTZ }
+            Val.Tsz(_, _) { fm = PK_TSTZ }
+            else {}
+        }
+        append(mut &fams, fm)
+        append(mut &names2, if k < len(f.args) { f.args[k].clone() } else { "" })
+    }
+    let pick = pickOf(&prmss, &names2, &fams)
+    let un = pg.units[cands[0]].name.clone()
+    if len(pick) == 0 { return Err(ora(6553, &("PLS-306: wrong number or types of arguments in call to '" + un + "'"))) }
+    if len(pick) > 1 { return Err(ora(6553, &("PLS-307: too many declarations of '" + un + "' match this call"))) }
+    return Ok(pg.units[cands[pick[0]]].ovl)
+}
+
 // A stored function called with these values: its result, or the error it raised.
 pub fn callFunction(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, id: &str, args: &[]Val): Result[Val, DbErr] {
     var binds: []BindIn = [BindIn{name: "R__", v: Val.Null, array: false, cursor: false}]
     // (the id's names quoted: a function's name is exact, "MixF"; an overload's call is to the one resolved: Ip.pin)
-    let f = fnIdOf(id)
+    var f = fnIdOf(id)
+    if f.ovl == 0 { f.ovl = try unpinnedOvl(pg, &f, args) }
     var qid: []str = []
     for part in f.names { append(mut &qid, "\"" + part + "\"") }
     var blk = "BEGIN :r__ := " + strings.join(&qid, ".") + "("
