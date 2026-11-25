@@ -2670,7 +2670,7 @@ fn planSubIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     let oid = if s.use == lexdb_sql.SUB_EXISTS || len(sel.outs) == 0 { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
     let name = if s.use == lexdb_sql.SUB_EXISTS { "exists" } else if s.use == lexdb_sql.SUB_SCALAR { sel.outs[0].name.clone() } else { "?column?" }
     // (in FROM: its columns are its outs)
-    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte, kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None, lat: [], need: if s.use == lexdb_sql.SUB_FROM && s.cteOnce && sel.rec >= 0 { -2 } else { -1 }, viewKey: ""}
+    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte, kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None, lat: [], need: if s.use == lexdb_sql.SUB_FROM && s.cteOnce && sel.rec >= 0 { -2 } else { -1 }, viewKey: "", rollup: []}
     // res: a semi-join's alternative (buildQuery), which may keep correlated
     // filters that are not keys as residuals (SubPlan.res) for its level to
     // check. Any other hashed subquery must not: nothing else reads them.
@@ -2928,12 +2928,389 @@ fn dropSingleViews(sel: mut &Sel, counts: &Map[str, int]) {
     for i in 0..len(sel.parts) { dropSingleViews(mut &sel.parts[i], counts) }
 }
 
-// Clear viewKey on views referenced only once in the final plan (avoid extra copy & memory).
+// Clear viewKey on views referenced only once in the final plan (avoid extra copy & memory),
+// and mark identical-FROM+WHERE post-aggregation scalar subqueries for rollup reuse (Q11).
 fn pruneViews(sel: mut &Sel) {
     if len(sel.q.subs) == 0 && len(sel.parts) == 0 { return }
     var counts: Map[str, int] = newMap()
     countViews(sel, mut &counts)
     dropSingleViews(sel, &counts)
+    markRollups(sel)
+}
+
+fn sameValExact(a: &Val, b: &Val): bool {
+    match a {
+        Val.Null { return lexdb_ops.isNull(b) }
+        Val.Bool(x) { match b { Val.Bool(y) { return x == y } else { return false } } }
+        Val.Int(x) { match b { Val.Int(y) { return x == y } else { return false } } }
+        Val.Text(x) { match b { Val.Text(y) { return x == y } else { return false } } }
+        Val.Num(x) {
+            match b {
+                Val.Num(y) {
+                    return x.isNeg() == y.isNeg() && x.coefficient() == y.coefficient() &&
+                           x.exponent() == y.exponent() && x.scale() == y.scale()
+                }
+                else { return false }
+            }
+        }
+        Val.Date(x) { match b { Val.Date(y) { return x == y } else { return false } } }
+        Val.Time(x) { match b { Val.Time(y) { return x == y } else { return false } } }
+        Val.Ts(x) { match b { Val.Ts(y) { return x == y } else { return false } } }
+        Val.Tstz(x) { match b { Val.Tstz(y) { return x == y } else { return false } } }
+        else { return false }
+    }
+}
+
+fn flipCmpStr(op: &str): str {
+    if op == "<" { return ">" }
+    if op == ">" { return "<" }
+    if op == "<=" { return ">=" }
+    if op == ">=" { return "<=" }
+    if op == "=" || op == "<>" || op == "+" || op == "*" || op == "and" || op == "or" { return op.toStr() }
+    return ""
+}
+
+fn sameExprMapped(subCols: &[]lexdb_sql.ColDef, outCols: &[]lexdb_sql.ColDef, mapCol: &[]int, a: &Expr, b: &Expr): bool {
+    match a {
+        Expr.Lit(va) {
+            match b {
+                Expr.Lit(vb) { return sameValExact(&va, &vb) }
+                else { return false }
+            }
+        }
+        Expr.Param(pa) {
+            match b {
+                Expr.Param(pb) { return pa == pb }
+                else { return false }
+            }
+        }
+        Expr.Col(na, sa) {
+            match b {
+                Expr.Col(nb, sb) {
+                    let ia = lexdb_bind.colSlot(subCols, &na, sa)
+                    let ib = lexdb_bind.colSlot(outCols, &nb, sb)
+                    return ia >= 0 && ia < len(mapCol) && mapCol[ia] == ib
+                }
+                else { return false }
+            }
+        }
+        Expr.Unary(oa, xa) {
+            match b {
+                Expr.Unary(ob, xb) { return oa == ob && sameExprMapped(subCols, outCols, mapCol, &xa, &xb) }
+                else { return false }
+            }
+        }
+        Expr.Bin(oa, la, ra) {
+            match b {
+                Expr.Bin(ob, lb, rb) {
+                    if oa == ob && sameExprMapped(subCols, outCols, mapCol, &la, &lb) && sameExprMapped(subCols, outCols, mapCol, &ra, &rb) {
+                        return true
+                    }
+                    let fo = flipCmpStr(&oa)
+                    if len(fo) > 0 && fo == ob && sameExprMapped(subCols, outCols, mapCol, &la, &rb) && sameExprMapped(subCols, outCols, mapCol, &ra, &lb) {
+                        return true
+                    }
+                    return false
+                }
+                else { return false }
+            }
+        }
+        Expr.IsNull(xa, na) {
+            match b {
+                Expr.IsNull(xb, nb) { return na == nb && sameExprMapped(subCols, outCols, mapCol, &xa, &xb) }
+                else { return false }
+            }
+        }
+        Expr.Cast(xa, ta) {
+            match b {
+                Expr.Cast(xb, tb) {
+                    return ta.oid == tb.oid && ta.kind == tb.kind && ta.prec == tb.prec && ta.scale == tb.scale && ta.len == tb.len &&
+                           sameExprMapped(subCols, outCols, mapCol, &xa, &xb)
+                }
+                else { return false }
+            }
+        }
+        Expr.Call(na, aa, sa) {
+            match b {
+                Expr.Call(nb, ab, sb) {
+                    if na != nb || sa != sb || len(aa) != len(ab) || lexdb_sql.isSubCall(&na) { return false }
+                    for i in 0..len(aa) { if !sameExprMapped(subCols, outCols, mapCol, &aa[i], &ab[i]) { return false } }
+                    return true
+                }
+                else { return false }
+            }
+        }
+    }
+}
+
+fn exprHasCol(x: &Expr): bool {
+    match x {
+        Expr.Col(_, _) { return true }
+        Expr.Unary(_, a) { return exprHasCol(&a) }
+        Expr.Bin(_, a, b) { return exprHasCol(&a) || exprHasCol(&b) }
+        Expr.IsNull(a, _) { return exprHasCol(&a) }
+        Expr.Cast(a, _) { return exprHasCol(&a) }
+        Expr.Call(_, args, _) {
+            for a in args { if exprHasCol(&a) { return true } }
+            return false
+        }
+        else { return false }
+    }
+}
+
+fn noFloatExpr(x: &Expr, cols: &[]lexdb_sql.ColDef): bool {
+    match x {
+        Expr.Lit(v) {
+            match v {
+                Val.Float(_) { return false }
+                else { return true }
+            }
+        }
+        Expr.Col(n, sl) {
+            let i = lexdb_bind.colSlot(cols, &n, sl)
+            if i < 0 || i >= len(cols) { return false }
+            let oid = cols[i].typ.oid
+            return oid != lexdb_sql.OID_FLOAT4 && oid != lexdb_sql.OID_FLOAT8
+        }
+        Expr.Unary(_, a) { return noFloatExpr(&a, cols) }
+        Expr.Bin(_, a, b) { return noFloatExpr(&a, cols) && noFloatExpr(&b, cols) }
+        Expr.IsNull(a, _) { return noFloatExpr(&a, cols) }
+        Expr.Cast(a, t) {
+            if t.oid == lexdb_sql.OID_FLOAT4 || t.oid == lexdb_sql.OID_FLOAT8 { return false }
+            return noFloatExpr(&a, cols)
+        }
+        Expr.Call(_, args, _) {
+            for a in args { if !noFloatExpr(&a, cols) { return false } }
+            return true
+        }
+        else { return true }
+    }
+}
+
+fn exprUsesSub(x: &Expr, idx: int): bool {
+    match x {
+        Expr.Call(n, args, _) {
+            if lexdb_sql.isSubCall(&n) && len(args) > 0 && lexdb_sql.litInt(&args[0]) == idx { return true }
+            for a in args { if exprUsesSub(&a, idx) { return true } }
+            return false
+        }
+        Expr.Unary(_, a) { return exprUsesSub(&a, idx) }
+        Expr.Bin(_, a, b) { return exprUsesSub(&a, idx) || exprUsesSub(&b, idx) }
+        Expr.IsNull(a, _) { return exprUsesSub(&a, idx) }
+        Expr.Cast(a, _) { return exprUsesSub(&a, idx) }
+        else { return false }
+    }
+}
+
+fn exprsUseSub(xs: &[]Expr, idx: int): bool {
+    for x in xs { if exprUsesSub(&x, idx) { return true } }
+    return false
+}
+
+fn rollupMatch(outer: &Sel, subIdx: int): []int {
+    let sp = &outer.q.subs[subIdx]
+    if sp.use != lexdb_sql.SUB_SCALAR || len(sp.sel.q.refs) > 0 || sp.hashed || sp.semi || sp.cte >= 0 { return [] }
+    let sub = &sp.sel
+    if !sub.aggQ || len(sub.groupBy) > 0 || len(sub.gsets) > 0 || sub.having.isSome() || sub.setop != 0 ||
+       len(sub.srf) > 0 || len(sub.wins) > 0 || len(sub.mr) > 0 || len(sub.locks) > 0 ||
+       (sub.limit >= 0 && sub.limit < 1) || sub.offset > 0 || sub.distinct ||
+       len(sub.q.subs) > 0 || len(sub.exprs) != 1 || len(sub.specs) == 0 {
+        return []
+    }
+    if exprHasCol(&sub.exprs[0]) || !selPure(sub) { return [] }
+    let nl = len(outer.q.levels)
+    if nl == 0 || len(sub.q.levels) != nl { return [] }
+    // subIdx must only be referenced after grouping (HAVING / SELECT / ORDER BY)
+    for lv in outer.q.levels {
+        if exprsUseSub(&lv.cond, subIdx) || exprsUseSub(&lv.post, subIdx) || exprsUseSub(&lv.local, subIdx) { return [] }
+    }
+    if exprsUseSub(&outer.q.top, subIdx) || exprsUseSub(&outer.groupBy, subIdx) { return [] }
+    for osp in outer.specs {
+        if exprsUseSub(&osp.args, subIdx) || exprsUseSub(&osp.order, subIdx) { return [] }
+        match osp.filter {
+            Some(f) { if exprUsesSub(&f, subIdx) { return [] } }
+            None {}
+        }
+    }
+    var usedPost = exprsUseSub(&outer.exprs, subIdx) || exprsUseSub(&outer.order, subIdx)
+    match outer.having {
+        Some(h) { if exprUsesSub(&h, subIdx) { usedPost = true } }
+        None {}
+    }
+    if !usedPost { return [] }
+    // Verify base tables only, inner joins only, unique table names, pure outer FROM+WHERE
+    var outByName: Map[str, int] = newMap()
+    for k in 0..nl {
+        let olv = &outer.q.levels[k]
+        let slv = &sub.q.levels[k]
+        if olv.virt() || slv.virt() || olv.work >= 0 || slv.work >= 0 || olv.semi || slv.semi || olv.anti || slv.anti ||
+           olv.lateral || slv.lateral || olv.semiSub >= 0 || slv.semiSub >= 0 {
+            return []
+        }
+        if k > 0 && (olv.join != lexdb_sql.J_INNER || slv.join != lexdb_sql.J_INNER) { return [] }
+        if !exprsPure(&olv.cond) || !exprsPure(&olv.post) || !exprsPure(&olv.local) { return [] }
+        if outByName.has(&olv.t.name) { return [] }
+        outByName.put(olv.t.name.toStr(), k)
+    }
+    if !exprsPure(&outer.q.top) { return [] }
+    // Map each sub level and column slot to its matching outer level and column slot
+    var mapCol: []int = array(len(sub.q.cols), -1)
+    for sk in 0..nl {
+        let slv = &sub.q.levels[sk]
+        match outByName.get(&slv.t.name) {
+            Some(ok) {
+                let olv = &outer.q.levels[ok]
+                if len(slv.t.cols) != len(olv.t.cols) { return [] }
+                for c in 0..len(slv.t.cols) { mapCol[slv.first + c] = olv.first + c }
+            }
+            None { return [] }
+        }
+    }
+    // Collect and match all FROM+WHERE conjuncts 1-to-1
+    var outConds: []&Expr = []
+    var subConds: []&Expr = []
+    for k in 0..nl {
+        for i in 0..len(outer.q.levels[k].cond) { append(mut &outConds, &outer.q.levels[k].cond[i]) }
+        for i in 0..len(outer.q.levels[k].post) { append(mut &outConds, &outer.q.levels[k].post[i]) }
+        for i in 0..len(sub.q.levels[k].cond) { append(mut &subConds, &sub.q.levels[k].cond[i]) }
+        for i in 0..len(sub.q.levels[k].post) { append(mut &subConds, &sub.q.levels[k].post[i]) }
+    }
+    for i in 0..len(outer.q.top) { append(mut &outConds, &outer.q.top[i]) }
+    for i in 0..len(sub.q.top) { append(mut &subConds, &sub.q.top[i]) }
+    if len(outConds) != len(subConds) { return [] }
+    var matched: []bool = array(len(outConds), false)
+    for sc in subConds {
+        var found = false
+        for j in 0..len(outConds) {
+            if !matched[j] && sameExprMapped(&sub.q.cols, &outer.q.cols, &mapCol, sc, outConds[j]) {
+                matched[j] = true
+                found = true
+                break
+            }
+        }
+        if !found { return [] }
+    }
+    // Match each inner aggregate spec to an identical outer aggregate spec
+    var mapSpecs: []int = []
+    for ss in sub.specs {
+        let op = ss.op
+        if !(op == lexdb_agg.OP_COUNT || op == lexdb_agg.OP_SUM || op == lexdb_agg.OP_AVG || op == lexdb_agg.OP_MIN || op == lexdb_agg.OP_MAX) { return [] }
+        if ss.distinct || len(ss.order) > 0 || len(ss.dirs) > 0 { return [] }
+        if (op == lexdb_agg.OP_SUM || op == lexdb_agg.OP_AVG) && (len(ss.args) != 1 || !noFloatExpr(&ss.args[0], &sub.q.cols)) { return [] }
+        var oi = -1
+        for k in 0..len(outer.specs) {
+            let os = &outer.specs[k]
+            if os.fname != ss.fname || os.op != ss.op || os.star != ss.star || os.distinct || len(os.order) > 0 || len(os.dirs) > 0 ||
+               os.kind != ss.kind || os.dia != ss.dia || len(os.args) != len(ss.args) { continue }
+            var fok = false
+            match ss.filter {
+                Some(sf) {
+                    match os.filter {
+                        Some(of) { fok = sameExprMapped(&sub.q.cols, &outer.q.cols, &mapCol, &sf, &of) }
+                        None {}
+                    }
+                }
+                None { fok = os.filter.isNone() }
+            }
+            if !fok { continue }
+            var aok = true
+            for ai in 0..len(ss.args) {
+                if !sameExprMapped(&sub.q.cols, &outer.q.cols, &mapCol, &ss.args[ai], &os.args[ai]) {
+                    aok = false
+                    break
+                }
+            }
+            if aok {
+                oi = k
+                break
+            }
+        }
+        if oi < 0 { return [] }
+        append(mut &mapSpecs, oi)
+    }
+    return mapSpecs
+}
+
+fn markRollups(sel: mut &Sel) {
+    if sel.aggQ && len(sel.groupBy) > 0 && len(sel.gsets) == 0 && len(sel.wins) == 0 && len(sel.q.refs) == 0 &&
+       len(sel.q.subs) > 0 && len(sel.mr) == 0 && len(sel.locks) == 0 && len(sel.srf) == 0 && sel.rec < 0 && sel.setop == 0 {
+        for i in 0..len(sel.q.subs) {
+            let m = rollupMatch(sel, i)
+            if len(m) > 0 { sel.q.subs[i].rollup = m }
+        }
+    }
+    for i in 0..len(sel.q.subs) { markRollups(mut &sel.q.subs[i].sel) }
+    for i in 0..len(sel.parts) { markRollups(mut &sel.parts[i]) }
+}
+
+fn anyRollup(q: &Query): bool {
+    for sp in q.subs { if len(sp.rollup) > 0 { return true } }
+    return false
+}
+
+// Compute rollup scalar subqueries directly from the outer query's per-group accumulators.
+fn evalRollups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, accss: &[][]lexdb_agg.Acc,
+               params: &[]Val, subs: mut &[]SubRes, rs: mut &Run): Result[Unit, DbErr] {
+    let q = &sel.q
+    let sqe = seqEnv(st, txn)
+    var ps: []Val = []
+    for j in 0..q.base { append(mut &ps, params[j].clone()) }
+    let noRow: []Val = []
+    let noSubs: []SubRes = []
+    for i in 0..len(q.subs) {
+        let sp = &q.subs[i]
+        if len(sp.rollup) == 0 { continue }
+        let sub = &sp.sel
+        var subAggs: []Val = []
+        for j in 0..len(sub.specs) {
+            let ss = &sub.specs[j]
+            let oi = sp.rollup[j]
+            var acc = lexdb_agg.newAcc()
+            let op = ss.op
+            for g in 0..len(accss) {
+                let ga = &accss[g][oi]
+                if ga.n == 0 { continue }
+                if op == lexdb_agg.OP_COUNT {
+                    acc.n += ga.n
+                } else if op == lexdb_agg.OP_SUM || op == lexdb_agg.OP_AVG {
+                    acc.n += ga.n
+                    acc.sum = if lexdb_ops.isNull(&acc.sum) { ga.sum.clone() } else { try lexdb_agg.sumAdd(&acc.sum, &ga.sum) }
+                } else if op == lexdb_agg.OP_MIN {
+                    if !lexdb_ops.isNull(&ga.val) {
+                        acc.n += ga.n
+                        if lexdb_ops.isNull(&acc.val) {
+                            acc.val = ga.val.clone()
+                        } else if ss.kind != lexdb_sql.COLL_EXACT {
+                            if (try lexdb_ops.compare(&lexdb_sort.collVal(ss.kind, &ga.val), &lexdb_sort.collVal(ss.kind, &acc.val))) < 0 { acc.val = ga.val.clone() }
+                        } else if (try lexdb_ops.compare(&ga.val, &acc.val)) < 0 {
+                            acc.val = ga.val.clone()
+                        }
+                    }
+                } else if op == lexdb_agg.OP_MAX {
+                    if !lexdb_ops.isNull(&ga.val) {
+                        acc.n += ga.n
+                        if lexdb_ops.isNull(&acc.val) {
+                            acc.val = ga.val.clone()
+                        } else if ss.kind != lexdb_sql.COLL_EXACT {
+                            if (try lexdb_ops.compare(&lexdb_sort.collVal(ss.kind, &ga.val), &lexdb_sort.collVal(ss.kind, &acc.val))) > 0 { acc.val = ga.val.clone() }
+                        } else if (try lexdb_ops.compare(&ga.val, &acc.val)) > 0 {
+                            acc.val = ga.val.clone()
+                        }
+                    }
+                }
+            }
+            append(mut &subAggs, try lexdb_agg.finish(ss, &acc))
+        }
+        let env = Env{cols: &sub.q.cols, row: &noRow, aggs: &subAggs, params: &ps, subs: &noSubs, cur: &noRow, seq: &sqe}
+        let v = try eval(&sub.exprs[0], &env)
+        var sr = emptyRes()
+        sr.v.rows = 1
+        sr.v.val = v
+        subs[i] = sr
+        while len(rs.stats) <= i { append(mut &rs.stats, SubStat{runs: 0, hits: 0, cnt: [], inner: []}) }
+        rs.stats[i].hits += 1
+    }
+    return Ok(Unit{})
 }
 
 // A subquery in FROM: its rows.
@@ -3357,7 +3734,7 @@ fn runSubs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params:
     var subs: []SubRes = []
     for i in 0..len(q.subs) {
         let sp = &q.subs[i]
-        if len(sp.sel.q.refs) > 0 && !sp.hashed {
+        if (len(sp.sel.q.refs) > 0 && !sp.hashed) || len(sp.rollup) > 0 {
             append(mut &subs, emptyRes())
             continue
         }
@@ -9511,7 +9888,8 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
             // (an Apply's conjuncts, Q8 R6, and the marked: as runPipe's, the subqueries' values copied)
             let ak = lexdb_plan.applyAt(&pg.plan)
             // (a LATERAL level's asks, Q8 R4b, read them too: copied for a correlated query)
-            let lend = ak < 0 && pg.run != lexdb_plan.PR_EVAL && !q.corr
+            let hasRollup = anyRollup(q)
+            let lend = ak < 0 && pg.run != lexdb_plan.PR_EVAL && !q.corr && !hasRollup
             var cx = if lend { pipeCtx(st, txn, params, mut &m.subs) } else { applyCtx(st, txn, params, &m.subs) }
             var bud = rs.bud
             let h0 = rs.bud.held
@@ -9534,25 +9912,41 @@ fn pipeGroups(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, m: m
                 return Ok(setRes(sel, [row], 1))
             }
             let mv = &m.vrows
-            let msubs = &m.subs
             // (the groups, then the operators over them: two calls, each closure the run's)
             var gm = lexdb_pipe.noGroups()
             let made = lexdb_pipe.groupsMake(st, txn, &pg, &q.cols, &q.levels[0].t, &src, &tabs, &srcs, mv, &cx, room, &sel.specs, mut &bud, mut &cnt, mut &gm,
                                              fn(tx: mut &lexdb_store.Txn, row: &[]Val, rows: mut &[][]Val): Result[bool, DbErr] {
                 let noAggs: []Val = []
-                let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: msubs, cur: &noAggs, seq: &sqe}
+                let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
                 return applyAsk(st, tx, q, ak, &env, rows, rs)
             })
-            let got = match made {
-                Ok(_) {
-                    lexdb_pipe.groupsView(txn, &pg, &q.cols, &cx, cap, &sel.specs, mut &gm,
-                                          fn(tx: mut &lexdb_store.Txn, what: int, s: int, i: int, row: &[]Val, aggs: &[]Val, outs: &[]Val): Result[Val, DbErr] {
-                        let noAggs: []Val = []
-                        let env = Env{cols: &q.cols, row: row, aggs: aggs, params: params, subs: msubs, cur: &noAggs, seq: &sqe}
-                        return grpEval(st, tx, sel, what, s, i, outs, &env, rs)
-                    })
+            var rollErr: Option[DbErr] = None
+            if hasRollup && made.isOk() {
+                match evalRollups(st, txn, sel, &gm.accss, params, mut &m.subs, rs) {
+                    Ok(_) {
+                        for i in 0..len(q.subs) {
+                            if len(q.subs[i].rollup) > 0 { cx.subs[i] = lexdb_pipe.copySub(&m.subs[i].v) }
+                        }
+                    }
+                    Err(x) { rollErr = Some(x) }
                 }
-                Err(x) { Err(x) }
+            }
+            let msubs = &m.subs
+            let got: Result[lexdb_pipe.GOut, DbErr] = match rollErr {
+                Some(x) { Err(x) }
+                None {
+                    match made {
+                        Ok(_) {
+                            lexdb_pipe.groupsView(txn, &pg, &q.cols, &cx, cap, &sel.specs, mut &gm,
+                                                  fn(tx: mut &lexdb_store.Txn, what: int, s: int, i: int, row: &[]Val, aggs: &[]Val, outs: &[]Val): Result[Val, DbErr] {
+                                let noAggs: []Val = []
+                                let env = Env{cols: &q.cols, row: row, aggs: aggs, params: params, subs: msubs, cur: &noAggs, seq: &sqe}
+                                return grpEval(st, tx, sel, what, s, i, outs, &env, rs)
+                            })
+                        }
+                        Err(x) { Err(x) }
+                    }
+                }
             }
             budBack(rs, &bud, h0, t0)
             if lend { subsBack(mut &m.subs, replace(mut &cx.subs, [])) }
@@ -11816,6 +12210,7 @@ fn execSelIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, param
                 append(mut &gsets, si)
             }
         }
+        if anyRollup(q) { try evalRollups(st, txn, sel, &accs, params, mut &m.subs, rs) }
         for gi in 0..len(firsts) {
             let si = if len(sel.gsets) > 0 { gsets[gi] } else { -1 }
             var vals: []Val = []
