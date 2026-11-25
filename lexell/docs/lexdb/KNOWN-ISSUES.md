@@ -10,7 +10,10 @@ property graph entries are what is left after the merge of SQL/PGQ in the Oracle
 were checked against it and Oracle Free 23.26.3; the entries that the fourth bug slice fixed, main f87d8cf8, 2026-11-25
 (a NUMBER foreign key to an identity key, views over dropped functions, units created with compilation errors, the
 zone UTC, TO_CHAR of a TIMESTAMP WITH LOCAL TIME ZONE, property graph errors, SQL Server's reserved words as names), are
-removed or reworded to what is left, checked against it, Oracle Free 23.26.3 and SQL Server 2022). They are not fixed here: the pages describe what lexdb does. Each "Differences" section of the reference lists the smaller
+removed or reworded to what is left, checked against it, Oracle Free 23.26.3 and SQL Server 2022; the assertion
+entry is what is left after the merges of CREATE ASSERTION in the Oracle door, main ad2ff242, and in the PostgreSQL and
+SQL Server doors with every write path checked, main f23d0ebc, 2026-11-25, checked against main and Oracle Free
+23.26.3). They are not fixed here: the pages describe what lexdb does. Each "Differences" section of the reference lists the smaller
 differences of its statement.
 
 ## All doors
@@ -486,6 +489,21 @@ differences of its statement.
     reads it directly does: ORA-02449, below); the view stays `VALID` after the drop (Oracle: `INVALID`, ORA-04063 when
     read; lexdb: ORA-04045). `USER_OBJECTS.STATUS` of a view over a graph that was dropped and made again is `VALID` at
     once (Oracle: `INVALID` until its next use).
+- **Assertions** (`CREATE ASSERTION`, supported since main f23d0ebc; see [CREATE ASSERTION](sql/oracle/create-assertion.md)
+  and [Assertions in the three doors](assertions.md)). What is left, checked against main and Oracle Free 23.26.3:
+  - `USER_ASSERTION_LOCK_MATRIX` has no rows, and `USER_ASSERTIONS.INVALID` is always NULL (Oracle marks an assertion
+    `INVALID` at DDL on its tables, an `ADD COLUMN` too, and still checks it).
+  - Writers of rows that meet in an assertion's join key wait for each other, and without a join key every writer of
+    rows that meet their own conditions; Oracle's locks can be finer, for chains of joins.
+  - Under `NOVALIDATE`, an `UPDATE` or `DELETE` of a table under the assertion's inner `NOT EXISTS` runs the whole query,
+    and is refused when rows already break it, where Oracle's row-only check passes ([CREATE ASSERTION](sql/oracle/create-assertion.md), example G).
+  - The check reads the tables with the rights of the session that writes, not of the assertion's owner: a user with
+    `INSERT` on an asserted table and no `SELECT` is refused with ORA-41900 (`missing READ privilege`); in Oracle the
+    insert goes through and is checked.
+  - Quoted names are matched folded: `CREATE ASSERTION "xd"` is listed as `XD` (Oracle: `xd`).
+  - `SET CONSTRAINT` of a name that does not exist is ORA-02443 (Oracle: ORA-02448).
+  - In the PostgreSQL door an asserted table shows `pg_class.relhastriggers` true (the checks are its triggers, in
+    effect; `pg_trigger` has no rows).
 - **QUALIFY** (Oracle 23.26's clause; see [QUALIFY](sql/oracle/qualify.md)):
   - The ORA-03049 text keeps at most 28 characters of the statement before the word (Oracle cuts differently after a
     long `CONNECT BY`).
