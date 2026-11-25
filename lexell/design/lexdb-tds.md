@@ -1236,3 +1236,12 @@ assertion's CHECK_CONSTRAINTS row; no sys.objects row (no type for one: SSMS, sp
 
 - SQL Server's reserved words (`lexdb_sql.tsqlReserved`, its list checked against SQL Server 2022) are 156 as a bare table name, column name in CREATE TABLE or alias after AS; quoted
   they are names, and its other keywords stay names. A bare reserved alias is 102 (SQL Server 156). Test `tds_bugs4`.
+
+## As built: the fifth bug slice (lexdb-robust.md, 2026-11-25)
+
+- ALTER TABLE ... DROP COLUMN of a table views read is done; a view WITH SCHEMABINDING that uses the column keeps it (5074); a view that used it fails when read (207, 4502 for
+  `SELECT *`). CREATE VIEW reads WITH SCHEMABINDING, VIEW_METADATA and ENCRYPTION (195, 1054; `sys.sql_modules.is_schema_bound`).
+- CREATE TABLE takes inline INDEX definitions (table and column level); DELETE, UPDATE and INSERT TOP (n) [PERCENT]; CREATE INDEX of a missing column is 1911.
+- INFORMATION_SCHEMA shows dbo for lexdb's public schema. An assertion's check reads with its owner's rights.
+- A parenthesized UNION operand with its own ORDER BY is 156; a reserved word as a bare alias 156; CREATE TABLE HOLDLOCK / INDEX and `FROM t HOLDLOCK` 1018. Tests `tds_bugs5`,
+  `tds_assertpriv`.

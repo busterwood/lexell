@@ -79,6 +79,7 @@ import "./lexdb_recrun"
 import "./lexdb_recprobe"
 import "./lexdb_standby"
 import "./lexdb_assert"
+import "./lexdb_viewdep"
 
 type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
@@ -1387,7 +1388,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 if len(sc.names.frames) > 64 { return Err(e("42P17", &("infinite recursion detected in rules for relation \"" + lexdb_sql.shown(&f.table) + "\""))) }
                 let vs = try viewQuery(&t)
                 let fg = try lexdb_routine.viewPlfGone(st, txn, &t.view)       // (a stored function it calls is gone: ORA-04063, 04067)
-                if fg == "!" { let gone = try viewPlanned(st, txn, &t, Err(e("42703", "a function the view calls is gone"))) }
+                if fg == "!" { return Err(viewErr(st, txn, &t, e("42703", "a function the view calls is gone"))) }
                 if len(fg) > 1 { return Err(e("ORA04067", &("not executed, package body \"" + fg + "\" does not exist"))) }
                 let vowner = (try lexdb_priv.readAcl(st, txn, &lexdb_catalog.relObj(&t.name))).owner
                 if len(vowner) > 0 { append(mut &sc.asRole, vowner.clone()) }
@@ -2590,21 +2591,25 @@ fn endScope(sc: mut &Scope, q: mut &Query) {
     for i in 0..len(f.subReads) { if i < len(q.subs) { q.subs[i].readAs = f.subReads[i] } }
 }
 
-// A view's plan, or its error: Oracle says a view whose query no longer plans (a table or a column it names was renamed or
-// dropped) has errors (ORA-04063).
+// A view's plan, or its error (lexdb_viewdep: an Oracle view whose query no longer plans has errors, ORA-04063; a SELECT *
+// that gives fewer columns than the view has, 4502).
 fn viewPlanned(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, planning: Result[SubPlan, DbErr]): Result[SubPlan, DbErr] {
     match planning {
-        Ok(x) { return Ok(x) }
-        Err(pe) {
-            let ora = strings.startsWith(&t.view, lexdb_sql.ORA_VIEW)
-            let gone = pe.state == "42P01" || pe.state == "42703" || pe.state == "ORA42421"      // (a table, a column or a graph)
-            if ora && gone {
-                let owner = if lexdb_sql.isQual(&t.name) { lexdb_sql.schemaOf(&t.name) } else { lexdb_priv.currentRole(st, txn.sql.sess) }
-                return Err(e("ORA04063", &("view \"" + strings.toUpperAscii(&owner) + "." + strings.toUpperAscii(&lexdb_sql.baseName(&t.name)) + "\" has errors")))
-            }
-            return Err(pe)
-        }
+        Ok(x) { match lexdb_viewdep.fewerErr(t, &x.sel.outs) { Some(fe) { return Err(viewErr(st, txn, t, fe)) } None { return Ok(x) } } }
+        Err(pe) { return Err(viewErr(st, txn, t, pe)) }
     }
+}
+fn viewErr(st: &lexdb_store.Store, txn: &lexdb_store.Txn, t: &Table, pe: DbErr): DbErr { return lexdb_viewdep.planErr(t, pe, &lexdb_priv.currentRole(st, txn.sql.sess)) }
+
+// A view's query planned on its own, as reading the view plans it (lexdb_viewdep: the views a dropped column breaks).
+fn viewCols(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result[[]OutCol, DbErr] {
+    var q = try viewQuery(t)
+    q.use = 0
+    var sc = newScopeIn(st, txn, &[], &[])
+    sc.rn = t.rn.clone()
+    let vowner = (try lexdb_priv.readAcl(st, txn, &lexdb_catalog.relObj(&t.name))).owner
+    if len(vowner) > 0 { append(mut &sc.asRole, vowner.clone()) }
+    return Ok((try planSelect(st, txn, &q, &[], mut &sc)).outs.clone())
 }
 
 fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
@@ -5685,8 +5690,8 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 if a.kind == lexdb_sql.A_SET_SCHEMA && (lexdb_catalog.tempRel(&ft.name) || a.name == "pg_temp" || lexdb_base.isTempSchema(&a.name)) {
                     return Err(e("0A000", "cannot move objects into or out of temporary schemas"))
                 }
-                if a.kind == lexdb_sql.A_RENAME || a.kind == lexdb_sql.A_RENAME_COL || a.kind == lexdb_sql.A_DROP_COL ||
-                   a.kind == lexdb_sql.A_TYPE || a.kind == lexdb_sql.A_SET_SCHEMA {
+                // (a dropped column: the views it breaks, after, lexdb_viewdep.afterAlter)
+                if a.kind == lexdb_sql.A_RENAME || a.kind == lexdb_sql.A_RENAME_COL || a.kind == lexdb_sql.A_TYPE || a.kind == lexdb_sql.A_SET_SCHEMA {
                     let deps = try lexdb_catalog.dependentViews(st, txn, &ft.name)
                     if len(deps) == 0 { continue }
                     let pg = s.mdialect == lexdb_sql.MD_PG
@@ -6187,6 +6192,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     pruneInvalid(mut &t)
     try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(&t)))
     try bumpFor(st, txn, &t.name)
+    try lexdb_viewdep.afterAlter(st, txn, s, &t.name, &viewCols, &bumpCatalog)
     return Ok(tagOnly("ALTER TABLE"))
 }
 
@@ -6781,7 +6787,7 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
             continue
         }
         let i = lexdb_bind.colIndex(&t.cols, &n)
-        if i < 0 { return Err(e("42703", &("column \"" + n + "\" does not exist"))) }
+        if i < 0 { return Err(if s.mdialect == lexdb_sql.MD_TSQL { e("TS1911", &("Column name '" + n + "' does not exist in the target table or view.")) } else { e("42703", &("column \"" + n + "\" does not exist")) }) }
         if s.mdialect == lexdb_sql.MD_PG && lexdb_sql.isVirtual(&t.cols[i]) { return Err(e("0A000", "indexes on virtual generated columns are not supported")) }
         try lexdb_gen.indexable(&t.cols, i, s.mdialect, &lexdb_sql.baseName(&t.name))
         append(mut &cols, i)
@@ -7276,7 +7282,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         var later: []FkLater = []
         let noAggs: []Val = []
         let env = Env{cols: &q.cols, row: &noAggs, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
-        if try stmtReads(st, txn, &s.inner[0], &t.name) {
+        if sel.topMode != 0 || try stmtReads(st, txn, &s.inner[0], &t.name) {      // (TOP n PERCENT, WITH TIES: the rows made whole)
             var res = try runSel(st, txn, &sel, params, lim)
             for i in 0..len(res.rows) {
                 let r = replace(mut &res.rows[i], [])
@@ -7943,7 +7949,7 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
             return Ok(wn == 0 || len(found) < wn)         // a batch stops at its n rows
         }, mut &rs)
         if len(s.from) > 0 { found = onceEach(t, found, true) }
-        if s.limit.isSome() { found = firstN(found, try lexdb_plan.evalTop(&s.limit, params)) }     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
+        if s.limit.isSome() { found = firstN(found, try lexdb_plan.topOf(&s.limit, params, s.topMode, len(found))) }     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
         if !(try lockFound(st, txn, t, &found, lmode)) { break }
         // a lock waited for: the rows found again, holding the locks
         found = []
@@ -7959,7 +7965,8 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let defs = try defaultsOf(st, txn, t)
     for k in 0..len(sets) {
         if len(defs.gens) > 0 { try lexdb_gen.checkWrite(&t.cols, targets[k], lexdb_sql.isDefault(&sets[k]), s.mdialect, false) }
-        if t.cols[targets[k]].identity == lexdb_sql.ID_ALWAYS && !lexdb_sql.isDefault(&sets[k]) {
+        if t.cols[targets[k]].identity == lexdb_sql.ID_ALWAYS && (!lexdb_sql.isDefault(&sets[k]) || s.mdialect == lexdb_sql.MD_ORA) {
+            if s.mdialect == lexdb_sql.MD_ORA { return Err(e("ORA32796", "cannot update a generated always identity column")) }     // (Oracle: DEFAULT too)
             return Err(lexdb_base.errDetail("428C9", &("column \"" + t.cols[targets[k]].name + "\" can only be updated to DEFAULT"),
                                             &("Column \"" + t.cols[targets[k]].name + "\" is an identity column defined as GENERATED ALWAYS."), ""))
         }
@@ -8106,7 +8113,7 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
             return Ok(wn == 0 || len(found) < wn)         // a batch stops at its n rows
         }, mut &rs)
         if len(s.from) > 0 { found = onceEach(t, found, true) }
-        if s.limit.isSome() { found = firstN(found, try lexdb_plan.evalTop(&s.limit, params)) }     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
+        if s.limit.isSome() { found = firstN(found, try lexdb_plan.topOf(&s.limit, params, s.topMode, len(found))) }     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
         if !(try lockFound(st, txn, t, &found, lexdb_sql.LOCK_UPDATE)) { break }
         found = []
         held = 0
@@ -8865,7 +8872,7 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
         if c.act != lexdb_sql.MA_UPDATE { continue }
         for k in 0..len(c.targets) {
             if len(defs.gens) > 0 { try lexdb_gen.checkWrite(&t.cols, c.targets[k], lexdb_sql.isDefault(&c.exprs[k]), s.mdialect, false) }
-            if t.cols[c.targets[k]].identity == lexdb_sql.ID_ALWAYS && !lexdb_sql.isDefault(&c.exprs[k]) {
+            if t.cols[c.targets[k]].identity == lexdb_sql.ID_ALWAYS && (!lexdb_sql.isDefault(&c.exprs[k]) || s.mdialect == lexdb_sql.MD_ORA) {
                 if s.mdialect == lexdb_sql.MD_TSQL { return Err(e("TS8102", &("Cannot update identity column '" + t.cols[c.targets[k]].name + "'."))) }
                 if s.mdialect == lexdb_sql.MD_ORA { return Err(e("ORA32796", "cannot update a generated always identity column")) }
                 return Err(lexdb_base.errDetail("428C9", &("column \"" + t.cols[c.targets[k]].name + "\" can only be updated to DEFAULT"),
@@ -13615,8 +13622,10 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     }
     match s.kind {
         lexdb_sql.S_CREATE {
-            if len(s.inner) > 0 { return createTableAs(st, txn, s, params, ptypes, lim) }
-            return createTable(st, txn, s)
+            if len(s.inner) > 0 && s.inner[0].kind != lexdb_sql.S_CREATE_INDEX { return createTableAs(st, txn, s, params, ptypes, lim) }
+            let made = try createTable(st, txn, s)
+            for x in s.inner { let ix = try createIndex(st, txn, &x) }     // (T-SQL's INDEX in CREATE TABLE)
+            return Ok(made)
         }
         lexdb_sql.S_DROP { return dropTable(st, txn, s) }
         lexdb_sql.S_INSERT { return insert(st, txn, s, params, ptypes, lim) }
@@ -14971,7 +14980,7 @@ fn setConstraints(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, stmt: &lexd
         if !found {
             var other = false
             for t in try allTables(st, txn) { if hasConName(&t, &lexdb_sql.baseName(&n)) { other = true } }
-            if !other { return Err(e("42704", &("constraint \"" + lexdb_sql.baseName(&n) + "\" does not exist"))) }
+            if !other { return Err(if doorMd(st, txn.sql.sess) == lexdb_sql.MD_ORA { e("ORA02448", "constraint does not exist") } else { e("42704", &("constraint \"" + lexdb_sql.baseName(&n) + "\" does not exist")) }) }
         }
         if !found || !deferrable { return Err(e("42809", &("constraint \"" + lexdb_sql.baseName(&n) + "\" is not deferrable"))) }
         append(mut &txn.sql.consNames, n.clone())
@@ -18985,8 +18994,9 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str, tsqlIs:
     if rel == "sys.databases" { dbopts = (try st.get(txn, lexdb_catalog.CATALOG, &lexdb_dbopt.KEY)).unwrapOr("") }
     // (Oracle's NLS views show what ALTER SESSION set)
     let sets = if rel == "ora.NLS_SESSION_PARAMETERS" || rel == "ora.V_$NLS_PARAMETERS" { st.memo.get(&settingsKey(txn.sql.sess)).unwrapOr("") } else { "" }
+    let verrs = try lexdb_viewdep.viewErrs(st, txn, rel, &snap, &viewCols)
     var cq = CatView{snap: snap, roles: roles, sess: txn.sql.sess, mems: mems, used: used, cur: cur, who: who, whoSuper: whoSuper, dbopts: dbopts,
-                     replica: lexdb_standby.isReplica(st), sets: sets}
+                     replica: lexdb_standby.isReplica(st), sets: sets, verrs: verrs}
     if strings.startsWith(rel, "sys.") { return lexdb_syscat.viewRows(&cq, &rel[4..len(rel)]) }
     if strings.startsWith(rel, "ora.") { return lexdb_oracat.viewRows(&cq, &rel[4..len(rel)]) }
     var stats: Map[int, TabStat] = newMap()
@@ -18995,7 +19005,8 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str, tsqlIs:
             stats.put(ct.t.tree, try lexdb_stats.tabStat(st, txn, &ct.t))
         }
     }
-    return lexdb_pg.viewRows(&cq, &stats, rel)
+    let rows = try lexdb_pg.viewRows(&cq, &stats, rel)
+    return Ok(if tsqlIs { lexdb_syscat.dboRows(&lexdb_pgcat.relColNames(rel), rows) } else { rows })     // (SQL Server's dbo)
 }
 
 // A column as SQL Server describes it (lexdb_tds: SET FMTONLY ON, sp_prepare's

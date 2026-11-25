@@ -28,6 +28,7 @@ import "./lexdb_graph"
 import "./lexdb_assert"
 import "./lexdb_parse"
 import "./lexdb_routine"
+import "./lexdb_oratext"
 
 type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
@@ -670,7 +671,7 @@ fn oraAssertRows(out: mut &[]OraPend, snap: &CatSnap, user: &str, base: &str) {
             p.s("DEFERRABLE", if a.deferrable { "DEFERRABLE" } else { "NOT DEFERRABLE" })
             p.s("DEFERRED", if a.deferred { "DEFERRED" } else { "IMMEDIATE" })
             p.s("VALIDATED", if a.validated { "VALIDATED" } else { "NOT VALIDATED" })
-            p.null("INVALID")
+            if a.invalid { p.s("INVALID", "INVALID") } else { p.null("INVALID") }
             p.s("DEFINITION_SQL", &lexdb_assert.definition(&a, &owner))
             append(out, p)
             continue
@@ -866,7 +867,7 @@ fn oraGraphExpr(p: &lexdb_graph.Prop): str {
     return out
 }
 
-fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role): []OraPend {
+fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role, verrs: &Map[str, DbErr]): []OraPend {
     // objects of the public schema are the login's own only when it has no schema of its name; a user with one
     // has them as the system's (USER_ views list a user's own schema alone)
     var user = snap.user.clone()
@@ -922,7 +923,7 @@ fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role): []OraPend {
             var p = oraPend(&oraOwner(&v.schema, &user), &"VIEW")
             oraObject(mut &p, &oraTabName(&v), v.oid, &"VIEW", false)
             // (a function it calls, or a graph it reads, gone)
-            if lexdb_routine.viewPlfBad(&v.t.view, &snap.procs) || lexdb_graph.viewGraphGone(&v.t.view, &v.schema, &graphs) { p.s("STATUS", "INVALID") }
+            if lexdb_routine.viewPlfBad(&v.t.view, &snap.procs) || lexdb_graph.viewGraphGone(&v.t.view, &v.schema, &graphs) || verrs.get(&v.key).isSome() { p.s("STATUS", "INVALID") }
             append(mut &out, p)
         }
         for d in snap.seqs {
@@ -1054,6 +1055,29 @@ fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role): []OraPend {
                 p.s("ATTRIBUTE", "ERROR")
                 p.i("MESSAGE_NUMBER", nums[k])
                 append(mut &out, p)
+            }
+        }
+        // a view whose query does not plan (lexdb_viewdep): its error's lines, at line 0, position 0
+        for v in snap.views {
+            match verrs.get(&v.key) {
+                Some(x) {
+                    let o = lexdb_oratext.oraOf(&x, &oraOwner(&v.schema, &user))
+                    let txt = lexdb_oratext.oraText(o.num, &o.text)
+                    let lines = strings.split(&txt, "\n")
+                    for k in 0..len(lines) {
+                        var p = oraPend(&oraOwner(&v.schema, &user), &"VIEW")
+                        p.s("NAME", &oraTabName(&v))
+                        p.s("TYPE", "VIEW")
+                        p.i("SEQUENCE", k + 1)
+                        p.i("LINE", 0)
+                        p.i("POSITION", 0)
+                        p.s("TEXT", &(lines[k] + "\n"))       // (Oracle's ends a view's with a line feed)
+                        p.s("ATTRIBUTE", "ERROR")
+                        p.i("MESSAGE_NUMBER", 0)
+                        append(mut &out, p)
+                    }
+                }
+                None {}
             }
         }
         return out
@@ -1440,7 +1464,7 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] 
     }
     if view == "NLS_SESSION_PARAMETERS" || view == "V_$NLS_PARAMETERS" { return Ok(nlsFollow(oraTyped(view, &rows(view, "full")), &cq.sets)) }
     if len(fam.scope) > 0 && isBuilt(&fam.base) {
-        let pends = oraBuilt(&snap, &fam.base, &roles)
+        let pends = oraBuilt(&snap, &fam.base, &roles, &cq.verrs)
         return Ok(oraProject(view, &fam, &pends, &userOwner))
     }
     return Ok(oraTyped(view, &rows(view, "full")))

@@ -1,0 +1,134 @@
+// lexdb: an assertion's check reads the tables with its owner's rights, not the writer's (the fifth bug slice, design/lexdb-robust.md;
+// Oracle's rule, checked against Oracle Free in tns_assertpriv): a user with INSERT and UPDATE and no SELECT on an asserted table writes
+// rows that keep the assertion and is refused (the door's violation: SQL Server's 547, PostgreSQL's 23514) for rows that break it, as
+// the owner would be; reading the table is still refused (229, 42501). The T-SQL door over TDS (a login of its own), the PostgreSQL
+// door in process (SET ROLE). lexdb's own answers: SQL Server and PostgreSQL have no assertions.
+// expect: setup: 4
+// expect: w insert: (1)
+// expect: w insert violating: error 547
+// expect: w update violating: error 547
+// expect: w update keeping: (1)
+// expect: w insert select violating: error 547
+// expect: w select: error 229
+// expect: owner count: n: 1
+// expect: pg setup: CREATE ASSERTION
+// expect: pg insert: INSERT 0 1
+// expect: pg insert violating: ERROR 23514
+// expect: pg update violating: ERROR 23514
+// expect: pg insert select: INSERT 0 3
+// expect: pg insert select violating: ERROR 23514
+// expect: pg select: ERROR 42501
+// expect: pg owner count: n: 4
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+fn rows(r: &sqlserver.Rows): str {
+    var names: []str = []
+    for j in 0..r.columnCount() { append(mut &names, r.columnName(j).unwrap()) }
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() {
+            match r.value(i, j) {
+                Ok(v) { append(mut &cells, v.toStr()) }
+                Err(e) { append(mut &cells, "error " + e.code.toStr()) }
+            }
+        }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&names, ",") + ": " + strings.join(&out, ";")
+}
+
+// a batch's result sets and counts, or its error's number
+fn show(c: mut &sqlserver.Conn, q: &str): str {
+    match c.queryAll(&(q.toStr()), &[]) {
+        Ok(r) {
+            var parts: []str = []
+            for n in r.counts {
+                if n.resultSet >= 0 { append(mut &parts, rows(&r.sets[n.resultSet])) } else { append(mut &parts, "(" + n.rows.toStr() + ")") }
+            }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn client(dsn: &str, w: &str) {
+    var c = sqlserver.connect(&(dsn.toStr())).unwrap()
+    var n = 0
+    for s in ["CREATE ROLE w5 LOGIN PASSWORD 'x'", "CREATE TABLE ta5 (id int PRIMARY KEY, v int)",
+              "CREATE ASSERTION ta5_a CHECK (NOT EXISTS (SELECT 1 FROM ta5 WHERE v < 0))", "GRANT INSERT, UPDATE ON ta5 TO w5"] {
+        if show(mut &c, &s) != "ok" { println("setup failed: " + s) } else { n += 1 }
+    }
+    println("setup: " + n.toStr())
+    var u = sqlserver.connect(&(w.toStr())).unwrap()
+    println("w insert: " + show(mut &u, &"INSERT INTO ta5 VALUES (1, 1)"))
+    println("w insert violating: " + show(mut &u, &"INSERT INTO ta5 VALUES (2, -1)"))
+    println("w update violating: " + show(mut &u, &"UPDATE ta5 SET v = -2"))
+    println("w update keeping: " + show(mut &u, &"UPDATE ta5 SET v = 3"))
+    println("w insert select violating: " + show(mut &u, &"INSERT INTO ta5 SELECT value, 1 - value FROM generate_series(5, 7)"))
+    println("w select: " + show(mut &u, &"SELECT COUNT(*) AS n FROM ta5"))
+    println("owner count: " + show(mut &c, &"SELECT COUNT(*) AS n FROM ta5"))
+    u.close()
+    c.close()
+}
+
+// the last result: its rows (columns joined by |, rows by ;) after the columns' names; or the tag; or the error
+fn pg(s: mut &lexdb_exec.Session, q: &str): str {
+    match s.exec(q) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag.clone() }
+            var names: []str = []
+            for c in r.cols { append(mut &names, c.name.clone()) }
+            var out: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for k in 0..len(row) { append(mut &cells, s.text(&row[k], r.cols[k].oid)) }
+                append(mut &out, strings.join(&cells, "|"))
+            }
+            return strings.join(&names, "|") + ": " + strings.join(&out, ";")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(sc: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        let at = "Server=127.0.0.1," + addr[10..len(addr)] + ";Encrypt=no"
+        client(&(at + ";UID=sa;PWD=x"), &(at + ";UID=w5;PWD=x"))
+        { let stop = f }
+    })
+    // the PostgreSQL door: the writer by SET ROLE
+    var s = lexdb_exec.newSession(st.share())
+    for q in ["create role p5", "create table pa5 (id int primary key, v int)", "grant insert, update on pa5 to p5"] { let r = pg(mut &s, &q) }
+    println("pg setup: " + pg(mut &s, &"create assertion pa5_a check (not exists (select 1 from pa5 where v < 0))"))
+    let r = pg(mut &s, &"set role p5")
+    println("pg insert: " + pg(mut &s, &"insert into pa5 values (1, 1)"))
+    println("pg insert violating: " + pg(mut &s, &"insert into pa5 values (2, -1)"))
+    println("pg update violating: " + pg(mut &s, &"update pa5 set v = -2"))
+    println("pg insert select: " + pg(mut &s, &"insert into pa5 select g, g from generate_series(2, 4) g"))
+    println("pg insert select violating: " + pg(mut &s, &"insert into pa5 select g, 6 - g from generate_series(5, 7) g"))
+    println("pg select: " + pg(mut &s, &"select count(*) as n from pa5"))
+    let r2 = pg(mut &s, &"reset role")
+    println("pg owner count: " + pg(mut &s, &"select count(*) as n from pa5"))
+    s.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(178), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

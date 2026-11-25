@@ -782,6 +782,23 @@ fn tsqlStarts(w: &str): bool {
     }
 }
 
+fn tableHintErr(t: &Tok): lexdb_base.DbErr {
+    let w = if len(t.spell) > 0 { t.spell.clone() } else { strings.toUpperAscii(&t.text) }
+    return lexdb_base.err("TS1018", &("Incorrect syntax near '" + w + "'. If this is intended as a part of a table hint, A WITH keyword and parenthesis are now required. See SQL Server Books Online for proper syntax."))
+}
+
+// T-SQL: a statement that cannot start with the reserved word it starts with (SELECT 1 rule: rule after the SELECT, a statement
+// of its own) is SQL Server's 156 at the word, not 102 (e: the parser's error, at: where the statement starts).
+fn (p: &P) startErr(at: int, e: lexdb_base.DbErr): lexdb_base.DbErr {
+    // (the parser stopped at the statement's first word, not at one like it further on)
+    if !p.tsql || e.state != "42601" || at >= len(p.toks) || p.pos > at + 1 { return e }
+    let t = &p.toks[at]
+    if t.kind != T_IDENT || !lexdb_sql.tsqlReserved(&t.text) || tsqlStarts(&t.text) || e.msg != near(t).msg { return e }
+    // (after a table, HOLDLOCK is a table hint without WITH: 1018)
+    if t.text == "holdlock" { return tableHintErr(t) }
+    return lexdb_base.err("TS156", &("Incorrect syntax near the keyword '" + (if len(t.spell) > 0 { t.spell.clone() } else { t.text.clone() }) + "'."))
+}
+
 fn (p: mut &P) name(): Result[str, lexdb_base.DbErr] {
     let t = p.peek().clone()
     if t.kind == T_QIDENT || (t.kind == T_IDENT && !lexdb_sql.isReserved(&t.text)) {
@@ -3016,6 +3033,8 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
         try p.expectKw("exists")
         s.ifFlag = true
     }
+    // (SQL Server reads HOLDLOCK and INDEX there as a table hint without WITH: 1018)
+    if p.tsql && (p.isKw("holdlock") || p.isKw("index")) { return Err(tableHintErr(&p.peek())) }
     s.table = try p.rname()
     s.spell = p.spelled.clone()
     if p.ora && p.isKw("(") && p.colAnnotThenAs() {
@@ -3081,6 +3100,8 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
             try p.expectKw(")")
             try p.tsqlStorage()
             if p.enforcedNext() { return Err(lexdb_base.err("0A000", "PRIMARY KEY constraints cannot be marked NOT ENFORCED")) }
+        } else if p.tsql && len(cname) == 0 && p.acceptKw("index") {
+            try p.inlineIndex(mut &s, "")
         } else if len(cname) > 0 || p.isKw("unique") || p.isKw("check") || p.isKw("foreign") || p.isKw("exclude") {
             append(mut &s.cons, try p.tableConstraint(&cname))
         } else {
@@ -3125,6 +3146,8 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
                     try p.identity(mut &c, mut &s)
                 } else if p.tsql && p.acceptKw("identity") {
                     try p.tsqlIdentity(mut &c, mut &s)
+                } else if p.tsql && len(cn) == 0 && p.acceptKw("index") {
+                    try p.inlineIndex(mut &s, &n)
                 } else if p.acceptKw("unique") {
                     try p.uniqueTail()
                     var u = lexdb_sql.newConstraint(C_UNIQUE, &cn)
@@ -4471,8 +4494,10 @@ fn (p: &P) selectNext(): bool {
 }
 
 fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
-    // T-SQL: INTO may be left out
-    if !(p.tsql && !p.isKw("into")) { try p.expectKw("into") }
+    // T-SQL: INTO may be left out; INSERT TOP (n) [PERCENT] (insertTop)
+    if p.tsql && !p.isKw("into") {
+        if p.isKw("top") { return p.insertTopOf() }
+    } else { try p.expectKw("into") }
     var s = lexdb_sql.newStmt(S_INSERT)
     s.mdialect = if p.tsql { MD_TSQL } else if p.ora { MD_ORA } else { MD_PG }
     s.table = try p.rname()
@@ -4550,6 +4575,48 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
 
 
 
+
+// At INSERT's TOP: the TOP, then the rest of the INSERT, the one applied to the other (insertTop).
+fn (p: mut &P) insertTopOf(): Result[Stmt, lexdb_base.DbErr] {
+    p.pos += 1
+    var tq = lexdb_sql.newStmt(S_SELECT)
+    try p.top(mut &tq, false)
+    return insertTop(try p.insert(), tq)
+}
+
+// T-SQL's INSERT TOP (n) [PERCENT] (tq: its limit and topMode) of INSERT s: the query's TOP (its rows' first n, or n percent
+// rounded up; which ones is undefined, as SQL Server's), the query read as a derived table under it when it has its own TOP,
+// ORDER BY, OFFSET or a set operation; VALUES' rows cut by a constant n.
+fn insertTop(s0: Stmt, tq: Stmt): Result[Stmt, lexdb_base.DbErr] {
+    var s = s0
+    var t = tq
+    if len(s.inner) == 0 {
+        let n = match t.limit { Some(x) { match x { Expr.Lit(v) { match v { Val.Int(i) { i } else { -2 } } } else { -2 } } } None { -2 } }
+        if n == -2 { return Err(lexdb_base.err("0A000", "lexdb: INSERT TOP of VALUES takes a constant count")) }
+        if n < 0 { return Err(lexdb_base.err("TS127", "A TOP N or FETCH rowcount value may not be negative.")) }
+        var keep = n
+        if t.topMode & TOP_PERCENT != 0 {
+            if n > 100 { return Err(lexdb_base.err("TS1031", "Percent values must be between 0 and 100.")) }
+            keep = (len(s.rows) * n + 99) / 100
+        }
+        while len(s.rows) > keep { let x = pop(mut &s.rows) }
+        return Ok(s)
+    }
+    var q = pop(mut &s.inner)
+    if q.limit.isSome() || q.offset.isSome() || q.topMode != 0 || q.setop != 0 || len(q.order) > 0 {
+        var w = lexdb_sql.newStmt(S_SELECT)
+        w.params = q.params
+        q.use = SUB_FROM
+        append(mut &w.subs, q)
+        append(mut &w.from, FromItem{table: "", alias: "top_", join: J_FIRST, on: None, sub: 0, cols: [], work: -1, lateral: false, using: [], natural: false, comma: true})
+        append(mut &w.items, SelItem{star: true, qual: "", expr: None, alias: "", spell: ""})
+        q = w
+    }
+    q.limit = replace(mut &t.limit, None)
+    q.topMode = t.topMode
+    append(mut &s.inner, q)
+    return Ok(s)
+}
 
 // INSERT's query that starts WITH, at WITH: the query in inner[0], its CTEs in scope.
 fn (p: mut &P) insertWith(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
@@ -4664,7 +4731,7 @@ fn (p: mut &P) select(): Result[Stmt, lexdb_base.DbErr] {
         var op = SET_EXCEPT
         if p.acceptKw("union") { op = SET_UNION } else { let x = p.acceptKw("except") }
         let all = p.setAll()
-        let rhs = try p.intersects(try p.setBranch())
+        let rhs = try p.intersects(try p.armBranch())
         lhs = setOf(op, all, lhs, rhs, p.md())
     }
     try p.orderLimit(mut &lhs)
@@ -4695,7 +4762,7 @@ fn (p: mut &P) intersects(first: Stmt): Result[Stmt, lexdb_base.DbErr] {
     var lhs = first
     while p.acceptKw("intersect") {
         let all = p.setAll()
-        let rhs = try p.setBranch()
+        let rhs = try p.armBranch()
         lhs = setOf(SET_INTERSECT, all, lhs, rhs, p.md())
     }
     return Ok(lhs)
@@ -4708,12 +4775,13 @@ fn (p: mut &P) intersects(first: Stmt): Result[Stmt, lexdb_base.DbErr] {
 fn (p: mut &P) parenSelect(): Result[Stmt, lexdb_base.DbErr] {
     var first = try p.setBranch()
     if p.isKw("union") || p.isKw("intersect") || p.isKw("except") {
+        try p.armOrder(&first)
         var lhs = try p.intersects(first)
         while p.isKw("union") || p.isKw("except") {
             var op = SET_EXCEPT
             if p.acceptKw("union") { op = SET_UNION } else { let x = p.acceptKw("except") }
             let all = p.setAll()
-            let rhs = try p.intersects(try p.setBranch())
+            let rhs = try p.intersects(try p.armBranch())
             lhs = setOf(op, all, lhs, rhs, p.md())
         }
         try p.orderLimit(mut &lhs)
@@ -4938,6 +5006,16 @@ fn (p: mut &P) createView(orReplace: bool, alterOnly: bool): Result[Stmt, lexdb_
         try p.expectKw(")")
     }
     while p.ora && p.acceptKw("annotations") { append(mut &v.alters, try p.annotClause("", true)) }
+    // T-SQL's WITH SCHEMABINDING, VIEW_METADATA, ENCRYPTION (SCHEMABINDING kept: SB_MARK; the others read)
+    var bound = false
+    if p.tsql && p.acceptKw("with") {
+        while true {
+            let o = p.next()
+            if o.kind != T_IDENT || (o.text != "schemabinding" && o.text != "view_metadata" && o.text != "encryption") { return Err(lexdb_base.err("TS195", &("'" + o.text + "' is not a recognized option."))) }
+            if o.text == "schemabinding" { bound = true }
+            if !p.acceptKw(",") { break }
+        }
+    }
     if p.isKw("with") { return Err(lexdb_base.err("0A000", "lexdb: view options (WITH (...)) are not supported")) }
     try p.expectKw("as")
     let start = p.peek().at
@@ -4961,10 +5039,11 @@ fn (p: mut &P) createView(orReplace: bool, alterOnly: bool): Result[Stmt, lexdb_
     }
     let end = p.peek().at
     if p.isKw("with") { return Err(lexdb_base.err("0A000", "lexdb: WITH CHECK OPTION is not supported")) }
+    if bound { for it in q.items { if it.star { return Err(lexdb_base.err("TS1054", "Syntax '*' is not allowed in schema-bound objects.")) } } }
     v.index = strings.trim(&p.src[start..end]).toStr()
     // made over TDS: T-SQL, tagged so (parseView)
     if p.tsql {
-        v.index = TSQL_VIEW + v.index
+        v.index = TSQL_VIEW + v.index + (if bound { lexdb_sql.SB_MARK } else { "" })
         // the statement's text from its CREATE to the end of the batch, as SQL Server keeps it
         if from >= 0 {
             v.index = v.index + lexdb_sql.DEF_MARK
@@ -5075,6 +5154,19 @@ fn (p: mut &P) valuesQuery(): Result[Stmt, lexdb_base.DbErr] {
 
 // One query of a UNION (and the like): SELECT ..., VALUES ..., or one in
 // parentheses with its own ORDER BY and LIMIT.
+// An operand of UNION, INTERSECT or EXCEPT after the first (setBranch), its ORDER BY checked (armOrder).
+fn (p: mut &P) armBranch(): Result[Stmt, lexdb_base.DbErr] {
+    let b = try p.setBranch()
+    try p.armOrder(&b)
+    return Ok(b)
+}
+
+// SQL Server: an operand of a set operation in parentheses has no ORDER BY of its own (156 at ORDER; TOP or not).
+fn (p: &P) armOrder(b: &Stmt): Result[Unit, lexdb_base.DbErr] {
+    if p.tsql && b.setop == 0 && len(b.order) > 0 { return Err(lexdb_base.err("TS156", "Incorrect syntax near the keyword 'ORDER'.")) }
+    return Ok(Unit{})
+}
+
 fn (p: mut &P) setBranch(): Result[Stmt, lexdb_base.DbErr] {
     var b = lexdb_sql.newStmt(S_SELECT)
     if p.acceptKw("values") {
@@ -5714,7 +5806,7 @@ fn (p: mut &P) top(s: mut &Stmt, sel: bool): Result[Unit, lexdb_base.DbErr] {
         p.pos -= 1
         s.limit = Some(try p.primary())
     }
-    if sel && p.acceptKw("percent") { s.topMode = s.topMode | TOP_PERCENT }
+    if p.acceptKw("percent") { s.topMode = s.topMode | TOP_PERCENT }        // (UPDATE, DELETE and INSERT TOP n PERCENT too)
     if sel && p.isKw("with") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "ties" {
         p.pos += 2
         s.topMode = s.topMode | TOP_TIES
@@ -6786,9 +6878,38 @@ fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
         let m = try p.name()
         if m != "btree" { return Err(lexdb_base.err("0A000", &("index method \"" + m + "\" is not supported"))) }
     }
+    try p.indexCols(mut &s)
+    return Ok(s)
+}
+
+// T-SQL's index in CREATE TABLE: INDEX name [UNIQUE] [CLUSTERED | NONCLUSTERED] (columns) [INCLUDE ...] [WHERE ...] [WITH ...] [ON
+// ...] among the table's elements, INDEX name [UNIQUE] [CLUSTERED | NONCLUSTERED] after a column (col: its name). A CREATE INDEX of
+// s.table, kept in s.inner and made with the table (lexdb_exec).
+fn (p: mut &P) inlineIndex(s: mut &Stmt, col: &str): Result[Unit, lexdb_base.DbErr] {
+    var ci = lexdb_sql.newStmt(S_CREATE_INDEX)
+    ci.mdialect = MD_TSQL
+    ci.index = try p.name()
+    ci.unique = p.acceptKw("unique")
+    ci.cluster = p.clusterWord()
+    ci.table = s.table.clone()
+    // (a CLUSTERED one makes a primary key not said to be either NONCLUSTERED, as SQL Server's)
+    if ci.cluster == 1 && s.pkCluster == 0 { s.pkCluster = 2 }
+    if len(col) > 0 {
+        append(mut &ci.names, col.toStr())
+        append(mut &ci.exprs, Expr.Lit(Val.Null))
+        append(mut &ci.pk, "")
+    } else {
+        try p.indexCols(mut &ci)
+    }
+    append(mut &s.inner, ci)
+    return Ok(Unit{})
+}
+
+// An index's (columns) and what follows them: INCLUDE, WHERE, Oracle's ANNOTATIONS, T-SQL's storage.
+fn (p: mut &P) indexCols(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     try p.expectKw("(")
-    try p.indexCol(mut &s)
-    while p.acceptKw(",") { try p.indexCol(mut &s) }
+    try p.indexCol(s)
+    while p.acceptKw(",") { try p.indexCol(s) }
     try p.expectKw(")")
     if p.tsql && p.acceptKw("include") {
         // T-SQL's INCLUDE (columns): read, not kept (lexdb's index holds its
@@ -6801,7 +6922,7 @@ fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
     if p.acceptKw("where") { s.where = Some(try p.expr()) }      // a filtered index
     while p.ora && p.acceptKw("annotations") { append(mut &s.alters, try p.annotClause("", true)) }
     try p.tsqlStorage()
-    return Ok(s)
+    return Ok(Unit{})
 }
 
 // PostgreSQL's B-tree operator classes for the types lexdb has.
@@ -6960,7 +7081,7 @@ fn (p: mut &P) merge(): Result[Stmt, lexdb_base.DbErr] {
     s.mdialect = if p.tsql { MD_TSQL } else if p.ora { MD_ORA } else { MD_PG }
     if p.tsql && p.acceptKw("top") {
         try p.top(mut &s, false)
-        if p.acceptKw("percent") { return Err(lexdb_base.err("0A000", "lexdb: MERGE TOP ... PERCENT is not supported")) }
+        if s.topMode & TOP_PERCENT != 0 { return Err(lexdb_base.err("0A000", "lexdb: MERGE TOP ... PERCENT is not supported")) }
     }
     if p.tsql { let into = p.acceptKw("into") } else { try p.expectKw("into") }
     s.table = try p.rname()
@@ -8580,6 +8701,32 @@ pub fn oraParse(sql: &str): Result[[]Stmt, lexdb_base.DbErr] { return parseIn(sq
 // TO_CHAR, TO_DATE and TO_TIMESTAMP with no format follow them.
 pub fn oraParseNls(sql: &str, nls: []str): Result[[]Stmt, lexdb_base.DbErr] { return parseIn(sql, true, nls) }
 
+// Where Oracle's SQL text sql has a syntax error (lexdb_plsql: a stored unit's SQL statement, its error at compile time): the token
+// the parser stopped at, as its text and how many tokens of that text come before it ("text\x00n"; "\x00eof" at the end), or ""
+// when it parses or fails otherwise.
+pub fn oraSyntaxAt(sql: &str, nls: []str): str {
+    let toks = match lexOra(sql, pgDialect(), true) { Ok(t) { t } Err(_) { return "" } }
+    var tk = toks
+    oraWordNames(mut &tk)
+    var p = P{toks: tk, pos: 0, params: 0, subs: [], ctes: [], nextCte: 0, inCte: [], depth: 0, seqs: [], wins: [], src: sql.toStr(), tsql: false, vars: [], spelled: "", ora: true, rnLimit: -1, nls: nls, mr: 0, udf: false}
+    match p.statement() {
+        Ok(_) { return "" }
+        Err(e) {
+            if e.state != "42601" { return "" }
+            if strings.contains(&e.msg, "at end of input") { return "\x00eof" }
+            let q = strings.indexOf(&e.msg, "near \"", 0)
+            if q < 0 { return "" }
+            let x = e.msg[q + 6..len(e.msg) - 1].toStr()
+            var k = min(p.pos, len(p.toks) - 1)
+            while k > 0 && p.toks[k].text != x { k -= 1 }
+            if p.toks[k].text != x { return "" }
+            var n = 0
+            for j in 0..k { if p.toks[j].text == x { n += 1 } }
+            return x + "\x00" + n.toStr()
+        }
+    }
+}
+
 // The last of oraParseNls's nls when the session has ALTER SESSION SET group_by_position_enabled = TRUE: a GROUP BY
 // position is the select list's item (by default it is a constant, and ORA-03162 if the list needs a grouping).
 pub const GB_POS = "#gbpos"
@@ -8914,7 +9061,11 @@ pub fn (q: mut &Parser) variable(t: &Tok): Result[Expr, lexdb_base.DbErr] { retu
 // One of lexdb's statements, whole.
 pub fn (q: mut &Parser) statement(): Result[Stmt, lexdb_base.DbErr] {
     q.p.fresh()
-    var s = try q.p.statement()
+    let at = q.p.pos
+    var s = match q.p.statement() {
+        Ok(x) { x }
+        Err(e) { return Err(q.p.startErr(at, e)) }
+    }
     q.p.finish(mut &s)
     return Ok(s)
 }
@@ -9463,15 +9614,63 @@ fn (p: &P) oraLabel(a: int, b: int): str {
     var sq = false          // inside '...'
     var n = len(txt)
     while n > 0 && (txt[n - 1] == ' ' || txt[n - 1] == '\n' || txt[n - 1] == '\t' || txt[n - 1] == '\r') { n -= 1 }
-    for i in 0..n {
+    let mark = "/*" + lexdb_sql.PLF_LABEL
+    var i = 0
+    while i < n {
         let c = txt[i]
+        // a stored function's call made before the query: its text, not its value's (lexdb_sql.PLF_LABEL)
+        if !q && !sq && c == '(' && strings.startsWith(&txt[i + 1..n], &mark) {
+            let e = strings.indexOf(&txt, "*/", i + 1 + len(mark))
+            if e > 0 {
+                out += &labelText(&txt[i + 1 + len(mark)..e])
+                i = skipGroup(&txt, i, n)
+                continue
+            }
+        }
         // blanks outside "quotes" (Oracle drops them inside literals too) are dropped
+        i += 1
         if !q && (c == ' ' || c == '\n' || c == '\t' || c == '\r') { continue }
         if c == '"' && !sq { q = !q }
         if c == '\'' && !q { sq = !sq }
         out.addByte(if !q && c >= 'a' && c <= 'z' { c - 32 } else { c })
     }
     return out
+}
+
+// oraLabel's text of s: blanks outside quotes dropped, upper case outside "quotes".
+fn labelText(s: &str): str {
+    var out = ""
+    var q = false
+    var sq = false
+    for i in 0..len(s) {
+        let c = s[i]
+        if !q && (c == ' ' || c == '\n' || c == '\t' || c == '\r') { continue }
+        if c == '"' && !sq { q = !q }
+        if c == '\'' && !q { sq = !sq }
+        out.addByte(if !q && c >= 'a' && c <= 'z' { c - 32 } else { c })
+    }
+    return out
+}
+
+// Past the group "( ... )" that starts at or after at (blanks before it), quotes read: where it ends (n at most).
+fn skipGroup(s: &str, at: int, n: int): int {
+    var i = at
+    while i < n && s[i] == ' ' { i += 1 }
+    if i >= n || s[i] != '(' { return i }
+    var d = 0
+    var sq = false
+    while i < n {
+        let c = s[i]
+        i += 1
+        if c == '\'' { sq = !sq }
+        if sq { continue }
+        if c == '(' { d += 1 }
+        if c == ')' {
+            d -= 1
+            if d == 0 { return i }
+        }
+    }
+    return n
 }
 
 // WHERE's tests of ROWNUM (ROWNUM <= n, < n, = n, > n, >= n, among AND's
@@ -11110,6 +11309,8 @@ fn (p: mut &P) assertStmt(verb: &str): Result[Stmt, lexdb_base.DbErr] {
     }
     s.table = try p.qname()
     s.spell = p.spelled.clone()
+    // (Oracle: a quoted name in lower case is kept so, "xd", not shown as XD)
+    if p.ora && len(s.spell) == 0 && p.toks[p.pos - 1].kind == T_QIDENT { s.spell = p.toks[p.pos - 1].text.clone() }
     let from = p.peek().at
     let k0 = p.pos
     if p.tsql { p.assertEnd(verb) } else { p.skipToEnd() }

@@ -123,6 +123,7 @@ pub type Assertion = record {
     pub deps: []Dep             // its instances, in USER_ASSERTION_DEPENDENCIES' order
     pub cols: []str             // the columns it reads: the table's key, "\x00", the column
     pub dialect: int            // the dialect it was made in (MD_PG, MD_TSQL, MD_ORA): its text is read as that dialect reads it
+    pub invalid: bool           // a column of a table it reads was added, dropped, retyped or renamed since it was made (Oracle's USER_ASSERTIONS.INVALID)
 }
 
 fn e(code: &str, msg: &str): DbErr { return lexdb_base.err(code, msg) }
@@ -156,6 +157,7 @@ pub fn encode(a: &Assertion): str {
     }
     addList(mut &xs, &a.cols)
     append(mut &xs, a.dialect.toStr())
+    append(mut &xs, flag(a.invalid))
     var b = ""
     lexdb_catalog.addStrs(mut &b, &xs)
     return b
@@ -202,9 +204,10 @@ pub fn decode(v: &str): Assertion {
     }
     let cols = r.list()
     let md = r.s()
+    let inv = r.b()
     return Assertion{key: key, name: name, owner: owner, cond: cond, form: form, query: query, sat: sat, path: path, enabled: en,
                      validated: va, deferrable: df, deferred: dd, deps: deps, cols: cols,
-                     dialect: if len(md) == 0 { MD_ORA } else { lexdb_base.num(&md) }}
+                     dialect: if len(md) == 0 { MD_ORA } else { lexdb_base.num(&md) }, invalid: inv}
 }
 
 // Every assertion, as their catalog rows are (lexdb_catalog.catSnap keeps them for the dictionary views).
@@ -1157,10 +1160,27 @@ fn runOn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, s: &S
     let saved = replace(mut &txn.sql.path, collections.copyOf(&a.path))
     let was = txn.quiet
     if quiet { txn.quiet = true }
-    let r = up.rows(st, txn, &qs, up)
+    let r = up.rows(st, txn, &asOwner(a, qs), up)
     txn.quiet = was
     txn.sql.path = saved
     return r
+}
+
+// A check's query q read with the rights of the assertion's owner, not the writer's (as Oracle checks it: a user with INSERT
+// and no SELECT on an asserted table is checked, not refused; a view's query is read so, lexdb.md 9.83): a derived table of
+// its row, run as the owner (Stmt.runAs). The owner: the schema of its key, or (public's) the user that made it.
+fn asOwner(a: &Assertion, q0: Stmt): Stmt {
+    var q = q0
+    q.use = lexdb_sql.SUB_FROM
+    let sc = lexdb_sql.schemaOf(&a.key)
+    q.runAs = if sc != "public" { sc } else { strings.toLowerAscii(&a.owner) }
+    var w = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
+    w.params = q.params
+    append(mut &w.subs, q)
+    append(mut &w.from, lexdb_sql.FromItem{table: "", alias: "assert_", join: lexdb_sql.J_FIRST, on: None, sub: 0, cols: [], work: -1, lateral: false,
+                                           using: [], natural: false, comma: true})
+    append(mut &w.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(Expr.Lit(Val.Int(1))), alias: "x", spell: ""})
+    return w
 }
 
 // The tables an assertion reads, each once.
@@ -1250,7 +1270,7 @@ fn ddlIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, up: &Up): 
     var d = try defOf(&s.index, md)
     var a = Assertion{key: key.clone(), name: if md == MD_ORA { shownOf(&lexdb_sql.baseName(&key), &s.spell) } else { shown.clone() }, owner: ownerOf(st, txn, &key),
                       cond: replace(mut &d.cond, ""), form: d.form, query: replace(mut &d.query, ""), sat: replace(mut &d.sat, ""), path: collections.copyOf(&txn.sql.path),
-                      enabled: d.enabled, validated: d.validated, deferrable: d.deferrable, deferred: d.deferred, deps: [], cols: [], dialect: md}
+                      enabled: d.enabled, validated: d.validated, deferrable: d.deferrable, deferred: d.deferred, deps: [], cols: [], dialect: md, invalid: false}
     let qs = try parseQuery(&violationText(&a), a.dialect)
     // its query planned and run first (Oracle reads its names before its refusals), its rows used when it is validated
     let n = try runOn(st, txn, &a, &qs, up, false)
@@ -1418,6 +1438,29 @@ pub fn truncated(txn: mut &lexdb_store.Txn, t: &Table, md: int) { if md != MD_OR
 // statement's end, in every door.
 pub fn retyped(txn: mut &lexdb_store.Txn, t: &Table) {
     if marked(&t.refBy) { append(mut &txn.onCommit, NOTE + txn.mark().toStr() + "\x00a\x00" + t.name) }
+}
+
+// ALTER TABLE added, dropped, retyped or renamed a column of table k: the assertions that read it are INVALID from now on (Oracle's
+// USER_ASSERTIONS.INVALID; still checked, as Oracle's are).
+pub fn columnsChanged(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[Unit, DbErr] {
+    if !assertsSeen { return Ok(Unit{}) }
+    var keys: []str = []
+    var vals: []str = []
+    try st.scan(txn, lexdb_catalog.CATALOG, ASSERT_PRE, ASSERT_END, fn(en: &lexdb_store.Entry): bool {
+        append(mut &keys, en.key.clone())
+        append(mut &vals, en.val.clone())
+        return true
+    })
+    for i in 0..len(keys) {
+        var a = decode(&vals[i])
+        if a.invalid { continue }
+        var reads = false
+        for d in a.deps { if d.table == k { reads = true } }
+        if !reads { continue }
+        a.invalid = true
+        try txn.put(lexdb_catalog.CATALOG, &keys[i], &encode(&a))
+    }
+    return Ok(Unit{})
 }
 
 // A table a statement wrote: its key, tree, the statement's first write mark, whether it may have updated or deleted.
@@ -1907,7 +1950,7 @@ pub fn setCons(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, defer
     let k = try keyOn(st, txn, &txn.sql.path.clone(), n, &ASSERT_PRE)
     if len(k) == 0 { return Ok(false) }
     let a = (try readAt(st, txn, &assertKey(&k))).unwrap()
-    if deferred && !a.deferrable {
+    if (deferred || md == MD_ORA) && !a.deferrable {      // (Oracle: IMMEDIATE too)
         if md != MD_ORA { return Err(e("42809", &("constraint \"" + nameIn(&a, md) + "\" is not deferrable"))) }
         return Err(ora(8687, "Cannot defer an assertion that is not deferrable."))
     }

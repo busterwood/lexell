@@ -1,0 +1,125 @@
+// lexdb over TNS: a view over a stored function dropped by another session while a transaction that wrote is open (the fifth bug
+// slice, design/lexdb-robust.md): the transaction's reads of the view are ORA-04063 at once, as Oracle's (its DDL is not
+// transactional), not ORA-00904 and then rows with NULLs until it ends; the view works again once the function is made again.
+// The answers are Oracle Free 23.26's for the same two sessions (python-oracledb, design/lexdb-robust.md), not checked by gen_oracle.py.
+// expect: create function: ok
+// expect: read: 1|20
+// expect: in the transaction: 1|20 / ok / error 4063 / error 4063 / 1
+// expect: after it: error 4063
+// expect: status: 'INVALID'
+// expect: recreated: ok
+// expect: read again: 1|30
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(&(s.toStr())) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// a statement's count, or its error's number
+fn err(r: Result[int, oracle.Error]): str {
+    match r {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// a query's rows (columns joined by |, rows by ;), or its error's number
+fn q1(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(r) {
+            var out: []str = []
+            for i in 0..r.rowCount() { append(mut &out, values(&r, i)) }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// a block or a call: ok, or its error's number
+fn blk(c: mut &oracle.Conn, sql: &str): str {
+    let none: []sqldialect.Value = []
+    match c.call(&(sql.toStr()), &none, &[]) {
+        Ok(_) { return "ok" }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn say(label: &str, what: &str) { println(label + ": " + what) }
+
+fn client(port: &str) {
+    let dsn = "127.0.0.1:" + port + "/lexdb"
+    var a = connect(&("User Id=sa;Password=sa;Data Source=" + dsn))
+    var b = connect(&("User Id=sa;Password=sa;Data Source=" + dsn))
+    a.exec("create table t2 (id number)").unwrap()
+    a.exec("create table tt (id number primary key, v number)").unwrap()
+    a.exec("insert into tt values (1, 10)").unwrap()
+    say("create function", blk(mut &a, &"create or replace function tf (x number) return number as begin return x * 2; end;"))
+    a.exec("create view tv as select id, tf(v) as w from tt").unwrap()
+    say("read", q1(mut &b, &"select id, w from tv"))
+    // b writes in a transaction; a drops the function; b reads the view in it, then after its rollback
+    var out: []str = []
+    let r = b.transaction(fn(c2: mut &oracle.Conn): Result[int, oracle.Error] {
+        append(mut &out, q1(c2, &"select id, w from tv"))
+        let w = c2.run("insert into t2 values (1)", &[])
+        append(mut &out, blk(mut &a, &"drop function tf"))
+        append(mut &out, q1(c2, &"select id, w from tv"))
+        append(mut &out, q1(c2, &"select id, w from tv"))
+        append(mut &out, q1(c2, &"select count(*) from t2"))
+        return Err(sqldialect.inputError("rolled back"))
+    })
+    say("in the transaction", strings.join(&out, " / "))
+    say("after it", q1(mut &b, &"select id, w from tv"))
+    say("status", q1(mut &a, &"select status from user_objects where object_name = 'TV'"))
+    say("recreated", blk(mut &a, &"create or replace function tf (x number) return number as begin return x * 3; end;"))
+    say("read again", q1(mut &b, &"select id, w from tv"))
+    b.logoff()
+    a.logoff()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(19), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

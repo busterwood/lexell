@@ -1,0 +1,165 @@
+// lexdb_viewdep: the views a change to a table breaks, found by planning their queries (the fifth bug slice,
+// design/lexdb-robust.md). lexdb keeps a view's query as text and plans it where the view is read (lexdb.md 9.82), so a
+// view "uses" a column when its query no longer plans without it, or gives fewer columns than the view has (a SELECT *
+// over the table: the view's columns are those of its CREATE).
+//
+// ALTER TABLE ... DROP COLUMN, per door, as each product does: PostgreSQL refuses the drop of a column a view uses (2BP01,
+// with the views in its DETAIL), and its CASCADE drops those views (and the views over them); SQL Server drops it unless a
+// view made WITH SCHEMABINDING uses it (5074), and a view that used it fails when read (207, or 4502 for SELECT *); Oracle
+// drops it, and a view that used it has errors (ORA-04063 when read, INVALID in USER_OBJECTS, its error in USER_ERRORS). The
+// check runs after the table's new definition is written in the statement's transaction: a refusal undoes the statement.
+//
+// Oracle's USER_OBJECTS.STATUS and USER_ERRORS of a view (viewErrs, for lexdb_oracat): a view whose query does not plan now
+// is INVALID, with the error planning it gives (Oracle's: ORA-00904 for a column or a function gone, ORA-04063 for a view
+// under it with errors, ORA-04045 and its cause for a property graph). Oracle keeps a view INVALID from the DDL until its
+// next use; lexdb's says what the view's query does now (VALID as soon as what it needs is back).
+import "strings"
+import "./lexdb_base"
+import "./lexdb_store"
+import "./lexdb_sql"
+import "./lexdb_catalog"
+import "./lexdb_routine"
+import "./lexdb_bind"
+import "./lexdb_assert"
+
+type DbErr = lexdb_base.DbErr
+type Table = lexdb_catalog.Table
+type OutCol = lexdb_bind.OutCol
+
+// The executor's planning of a view's query on its own (as reading the view plans it): its columns.
+pub type PlanFn = fn(&lexdb_store.Store, mut &lexdb_store.Txn, &Table): Result[[]OutCol, DbErr]
+pub type BumpFn = fn(&lexdb_store.Store, mut &lexdb_store.Txn): Result[Unit, DbErr]
+
+fn err(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+// The errors of a view's query that mean something it reads is gone (a table, a column, a graph or what the graph
+// names, a view under it with errors, fewer columns than the view has).
+fn gone(pe: &DbErr): bool {
+    return pe.state == "42P01" || pe.state == "42703" || pe.state == "ORA42421" || pe.state == "ORA04045" || pe.state == "ORA04063" ||
+           pe.state == "TS4502"
+}
+
+// A view's planning error as reading the view gives it: an Oracle view whose query no longer plans (a table or a column it
+// names renamed or dropped, a graph it reads gone or invalid) has errors (ORA-04063). role: the session's (the owner of an
+// unqualified view's name).
+pub fn planErr(t: &Table, pe: DbErr, role: &str): DbErr {
+    if strings.startsWith(&t.view, lexdb_sql.ORA_VIEW) && gone(&pe) {
+        let o = if lexdb_sql.isQual(&t.name) { lexdb_sql.schemaOf(&t.name) } else { role.toStr() }
+        return err("ORA04063", &("view \"" + strings.toUpperAscii(&o) + "." + strings.toUpperAscii(&lexdb_sql.baseName(&t.name)) + "\" has errors"))
+    }
+    return pe
+}
+
+// The first of view t's columns its query's columns (outs) do not have ("" all there).
+fn missing(t: &Table, outs: &[]OutCol): str {
+    for c in t.cols {
+        var have = false
+        for o in outs { if o.name == c.name { have = true } }
+        if !have { return c.name.clone() }
+    }
+    return ""
+}
+
+// A view whose query gives fewer columns (outs) than the view has (a column under its SELECT * dropped): SQL Server's 4502;
+// else 42703 for the first of the view's columns gone (Oracle's ORA-00904 in USER_ERRORS; planErr makes it ORA-04063 when
+// the view is read). None: as many.
+pub fn fewerErr(t: &Table, outs: &[]OutCol): Option[DbErr] {
+    if len(outs) >= len(t.cols) { return None }
+    let n = lexdb_sql.baseName(&t.name)
+    if strings.startsWith(&t.view, lexdb_sql.TSQL_VIEW) { return Some(err("TS4502", &("View or function '" + n + "' has more column names specified than columns defined."))) }
+    let m = missing(t, outs)
+    if len(m) > 0 { return Some(err("42703", &("column \"" + m + "\" does not exist"))) }
+    return Some(err("42703", &("view \"" + n + "\" has more columns than its query gives (a column it read was dropped)")))
+}
+
+// An Oracle view's stored function gone (lexdb_routine.viewPlfGone), as Oracle's error for the view: ORA-00904 for its name.
+fn plfGone(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result[Option[DbErr], DbErr] {
+    let m = lexdb_sql.viewPlf(&t.view)
+    if len(m) == 0 { return Ok(None) }
+    for c in strings.split(&m, "\x02") {
+        if (try lexdb_routine.viewPlfGone(st, txn, &(lexdb_sql.PLF_MARK + c))) != "!" { continue }
+        let f = strings.split(c, "\x01")
+        return Ok(Some(err("42703", &("column \"" + strings.toLowerAscii(&f[0]) + "\" does not exist"))))
+    }
+    return Ok(None)
+}
+
+// Whether view v (its query planned by plan) is broken now: its error (its query's own, not the view's ORA-04063), or None.
+fn broken(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, v: &Table, plan: &PlanFn): Result[Option[DbErr], DbErr] {
+    match try plfGone(st, txn, v) {
+        Some(x) { return Ok(Some(x)) }
+        None {}
+    }
+    match plan(st, txn, v) {
+        Ok(outs) { return Ok(fewerErr(v, &outs)) }
+        Err(x) { return Ok(if gone(&x) { Some(x) } else { None }) }
+    }
+}
+
+// After ALTER TABLE wrote table k's new definition: its DROP COLUMN actions checked against the views that read k (see the
+// head of the file), in the door's dialect (s.mdialect).
+pub fn afterAlter(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, k: &str, plan: &PlanFn, bump: &BumpFn): Result[Unit, DbErr] {
+    var col = ""
+    var cascade = false
+    var cols = false
+    for a in s.alters {
+        if a.kind == lexdb_sql.A_DROP_COL {
+            if len(col) == 0 { col = a.name.clone() }
+            if a.cascade { cascade = true }
+        }
+        if a.kind == lexdb_sql.A_ADD || a.kind == lexdb_sql.A_DROP_COL || a.kind == lexdb_sql.A_TYPE || a.kind == lexdb_sql.A_RENAME_COL { cols = true }
+    }
+    // (the assertions that read the table: INVALID, as Oracle's)
+    if cols { try lexdb_assert.columnsChanged(st, txn, k) }
+    if len(col) == 0 || s.mdialect == lexdb_sql.MD_ORA { return Ok(Unit{}) }
+    let deps = try lexdb_catalog.dependentViews(st, txn, k)
+    if len(deps) == 0 { return Ok(Unit{}) }
+    var views: []Table = []
+    for v in try lexdb_catalog.allViews(st, txn) { if lexdb_base.hasStr(&deps, &v.name) { append(mut &views, v) } }
+    let rel = lexdb_sql.baseName(k)
+    if s.mdialect == lexdb_sql.MD_TSQL {
+        // SQL Server: a view WITH SCHEMABINDING that reads the table and uses the column keeps it
+        for v in views {
+            if !lexdb_sql.viewBound(&v.view) || !lexdb_base.hasStr(&v.deps, k) { continue }
+            if (try broken(st, txn, &v, plan)).isSome() { return Err(err("TS5074", &("The object '" + lexdb_sql.baseName(&v.name) + "' is dependent on column '" + col + "'."))) }
+        }
+        return Ok(Unit{})
+    }
+    // PostgreSQL: the views that use the column (directly, or through a view that does)
+    var bad: []str = []
+    var detail: []str = []
+    for v in views {
+        if (try broken(st, txn, &v, plan)).isNone() { continue }
+        append(mut &bad, v.name.clone())
+        var under = ""
+        for d in v.deps { if len(under) == 0 && d != k && lexdb_base.hasStr(&deps, &d) { under = d.clone() } }
+        let on = if lexdb_base.hasStr(&v.deps, k) || len(under) == 0 { "column " + col + " of table " + rel } else { "view " + lexdb_sql.shown(&under) }
+        append(mut &detail, "view " + lexdb_sql.shown(&v.name) + " depends on " + on)
+    }
+    if len(bad) == 0 { return Ok(Unit{}) }
+    if !cascade {
+        return Err(lexdb_base.errDetail("2BP01", &("cannot drop column " + col + " of table " + rel + " because other objects depend on it"),
+                                        &strings.join(&detail, "\n"), "Use DROP ... CASCADE to drop the dependent objects too."))
+    }
+    // (the views and their grants, as DROP VIEW ... CASCADE drops them)
+    for b in bad {
+        txn.del(lexdb_catalog.CATALOG, &b)
+        txn.del(lexdb_catalog.CATALOG, &(lexdb_catalog.ACL_PRE + lexdb_catalog.relObj(&b)))
+    }
+    return bump(st, txn)
+}
+
+// Oracle's USER_OBJECTS, ALL_OBJECTS, DBA_OBJECTS and *_ERRORS (rel "ora." and the view's name): the views of snap whose
+// queries do not plan now, by key, with their errors (lexdb_oracat gives them as Oracle's text); empty for any other.
+pub fn viewErrs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str, snap: &lexdb_catalog.CatSnap, plan: &PlanFn): Result[Map[str, DbErr], DbErr] {
+    var out: Map[str, DbErr] = newMap()
+    if !strings.startsWith(rel, "ora.") || !(strings.endsWith(rel, "_OBJECTS") || strings.endsWith(rel, "_ERRORS")) { return Ok(out) }
+    for v in snap.views {
+        if lexdb_base.isTempSchema(&v.schema) { continue }
+        match try broken(st, txn, &v.t, plan) {
+            Some(x) { out.put(v.key.clone(), x) }
+            None {}
+        }
+    }
+    return Ok(out)
+}

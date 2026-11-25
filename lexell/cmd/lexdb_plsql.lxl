@@ -1664,7 +1664,48 @@ fn (cx: mut &Cx) sqlNode(ip: mut &Ip, sess: mut &lexdb_exec.Session, a: int, b: 
         }
         if cx.strict && sub == SQ_DML { try cx.checkTarget(sess, &n.sql, a) }
     }
+    if cx.strict { try cx.checkSyntax(&n.sql, a, b) }
     return Ok(n)
+}
+
+// A stored unit's SQL statement (tokens a..b) that does not parse: a compile error, as Oracle's (not ORA-00900 when it runs):
+// ORA-00907 where a parenthesis is left open, else ORA-00936, at the token the parser stopped at (the statement's ";" at its
+// end), then the statement ignored at its start.
+fn (cx: &Cx) checkSyntax(sql: &str, a: int, b: int): Result[Unit, DbErr] {
+    let text = lexdb_oratext.oracleSql(sql)
+    match lexdb_parse.oraParseNls(&text, cloneStrs(&cx.nls)) {
+        Ok(_) { return Ok(Unit{}) }
+        Err(e) { if e.state != "42601" || !strings.startsWith(&e.msg, "syntax error") { return Ok(Unit{}) } }
+    }
+    let at = lexdb_parse.oraSyntaxAt(&text, cloneStrs(&cx.nls))
+    if len(at) == 0 { return Ok(Unit{}) }
+    var depth = 0
+    var inq = false
+    for k in 0..len(text) {
+        if text[k] == '\'' { inq = !inq }
+        if !inq && text[k] == '(' { depth += 1 }
+        if !inq && text[k] == ')' { depth -= 1 }
+    }
+    let z = strings.indexOf(&at, "\x00", 0)
+    let x = at[0..z].toStr()
+    let nth = strings.parseIntOpt(&at[z + 1..len(at)]).unwrapOr(-1)
+    var ti = b
+    if len(x) > 0 {
+        var seen = 0
+        var found = -1
+        for i in a..b {
+            if found < 0 && strings.toLowerAscii(&cx.tk(i).text) == x {
+                if seen == nth { found = i }
+                seen += 1
+            }
+        }
+        if found < 0 { return Ok(Unit{}) }
+        ti = found
+    }
+    let t = cx.tk(ti)
+    let what = if depth > 0 { "ORA-00907: missing right parenthesis" } else { "ORA-00936: missing expression" }
+    return Err(plErr("ORA06550", &("line " + t.line.toStr() + ", column " + t.col.toStr() + ":\nPL/SQL: " + what +
+                     "\nORA-06550: line " + cx.stmtLine.toStr() + ", column " + cx.stmtCol.toStr() + ":\nPL/SQL: SQL Statement ignored")))
 }
 
 // A statement at cx.pos, with its label (loops). One that takes package variables as targets (cx.post) is a block of itself and the
@@ -4769,8 +4810,10 @@ pub fn expandCalls(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, text: 
                         None { rv = res.outs[0].v.clone() }
                     }
                     sb += text[from..t.s]
-                    // in parentheses: a negative number beside a minus would be a comment (a--1)
-                    sb += &("(" + sqlLiteral(&rv) + ")")
+                    // in parentheses: a negative number beside a minus would be a comment (a--1); after the call as written in a
+                    // comment, for the column's name (lexdb_sql.PLF_LABEL: Oracle's OKF(1), not the value)
+                    let orig = text[t.s..toks[close].e].toStr()
+                    sb += &("(" + (if strings.contains(&orig, "*/") { "" } else { "/*" + lexdb_sql.PLF_LABEL + orig + "*/" }) + sqlLiteral(&rv) + ")")
                     from = toks[close].e
                     i = close + 1
                     continue
