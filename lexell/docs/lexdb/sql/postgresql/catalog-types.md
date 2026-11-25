@@ -12,6 +12,7 @@ SELECT ... FROM [ pg_catalog. ] pg_enum
 SELECT ... FROM [ pg_catalog. ] pg_collation
 SELECT ... FROM [ pg_catalog. ] pg_am
 SELECT ... FROM [ pg_catalog. ] pg_opclass
+SELECT ... FROM information_schema.domains
 ```
 
 ## Views
@@ -38,6 +39,11 @@ NULL, zero, false or empty.
 
 `pg_opclass`
 : No rows.
+
+`information_schema.domains`: one row per domain
+: `domain_catalog`, `domain_schema`, `domain_name`, `data_type` and PostgreSQL's other columns. lexdb has no
+  `CREATE DOMAIN`, so the rows are the five domains of `information_schema` itself (`cardinal_number`,
+  `character_data`, `sql_identifier`, `time_stamp`, `yes_or_no`), as in PostgreSQL.
 
 ## Remarks
 
@@ -145,6 +151,24 @@ SELECT amname, amtype FROM pg_am ORDER BY oid;
 --------+------+-------------
  public | mood |
 (1 row)
+```
+
+### E. Domains
+
+<!-- example: postgresql -->
+```sql
+SELECT domain_schema, domain_name, data_type FROM information_schema.domains ORDER BY domain_name;
+```
+
+```text
+   domain_schema    |   domain_name   |        data_type
+--------------------+-----------------+--------------------------
+ information_schema | cardinal_number | integer
+ information_schema | character_data  | character varying
+ information_schema | sql_identifier  | name
+ information_schema | time_stamp      | timestamp with time zone
+ information_schema | yes_or_no       | character varying
+(5 rows)
 ```
 
 ## See also

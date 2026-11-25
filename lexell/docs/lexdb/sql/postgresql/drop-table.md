@@ -35,11 +35,11 @@ DROP TABLE [ IF EXISTS ] name [, ...] [ CASCADE | RESTRICT ]
 
 ## Differences from PostgreSQL
 
-- The refusal of a table that views read (2BP01) is PostgreSQL's: a `DETAIL` with a line for each view (and the views
-  that read those views) and the `HINT`, in the order of the views' names (PostgreSQL's order is not fixed). It does
-  not list foreign keys: when only foreign keys depend on the table, the message says what `CASCADE` would do (`with
-  CASCADE the foreign keys on it are dropped`) and has no `DETAIL` or `HINT`, and when views and foreign keys both
-  depend on it the `DETAIL` lists the views only.
+- The refusal of a table that other objects depend on (2BP01) is PostgreSQL's: a `DETAIL` with a line for each foreign
+  key of another table (`constraint orders_customer_id_fkey on table orders depends on table customer`) and for each
+  view (and the views that read those views), and the `HINT`. A table that only foreign keys depend on is refused the
+  same way; a table's foreign key on itself is no dependent. The order of the lines differs: lexdb lists the keys by
+  their tables, then the views by their names, where PostgreSQL lists the objects in the order they were made.
 - `CASCADE` gives no `NOTICE` naming what it drops.
 
 ## Examples
@@ -99,6 +99,9 @@ ROLLBACK
 
 ### C. Dependents and CASCADE
 
+The refusal names the foreign key of `orders` and the view `customer_names`. `CASCADE` drops the view and the key (the
+table `orders` stays).
+
 <!-- example: postgresql -->
 ```sql
 DROP TABLE customer;
@@ -110,7 +113,8 @@ SELECT count(*) FROM pg_class WHERE relname = 'customer_id_seq';
 
 ```text
 ERROR:  cannot drop table customer because other objects depend on it
-DETAIL:  view customer_names depends on table customer
+DETAIL:  constraint orders_customer_id_fkey on table orders depends on table customer
+view customer_names depends on table customer
 HINT:  Use DROP ... CASCADE to drop the dependent objects too.
 DROP TABLE
       conname
@@ -172,6 +176,30 @@ DROP TABLE v;
 ERROR:  table "nosuch" does not exist
 CREATE VIEW
 ERROR:  "v" is not a table (use DROP VIEW)
+```
+
+### F. Only a foreign key depends on it
+
+<!-- example: postgresql -->
+```sql
+CREATE TABLE team (id int PRIMARY KEY);
+CREATE TABLE player (id int PRIMARY KEY, team_id int REFERENCES team);
+DROP TABLE team;
+DROP TABLE team CASCADE;
+SELECT count(*) FROM pg_constraint WHERE conrelid = 'player'::regclass AND contype = 'f';
+```
+
+```text
+CREATE TABLE
+CREATE TABLE
+ERROR:  cannot drop table team because other objects depend on it
+DETAIL:  constraint player_team_id_fkey on table player depends on table team
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+DROP TABLE
+ count
+-------
+     0
+(1 row)
 ```
 
 ## See also

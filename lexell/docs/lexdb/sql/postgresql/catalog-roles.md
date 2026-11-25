@@ -12,6 +12,7 @@ SELECT ... FROM [ pg_catalog. ] pg_user
 SELECT ... FROM [ pg_catalog. ] pg_auth_members
 SELECT ... FROM information_schema.table_privileges
 SELECT ... FROM information_schema.role_table_grants
+SELECT ... FROM information_schema.column_privileges
 SELECT ... FROM information_schema.routine_privileges
 SELECT ... FROM information_schema.role_routine_grants
 ```
@@ -37,6 +38,11 @@ or view
 : `grantor`, `grantee`, `table_catalog`, `table_schema`, `table_name`, `privilege_type`, `is_grantable`,
   `with_hierarchy`. The owner holds every privilege, `WITH GRANT OPTION`.
 
+`information_schema.column_privileges`: one row per column and privilege
+: `grantor`, `grantee`, `table_catalog`, `table_schema`, `table_name`, `column_name`, `privilege_type`,
+  `is_grantable`. lexdb grants on whole tables, so a column holds the privileges of its table: `SELECT`, `INSERT`,
+  `UPDATE` and `REFERENCES` (the others, such as `DELETE`, are not column privileges), as PostgreSQL lists them.
+
 `information_schema.routine_privileges`, `information_schema.role_routine_grants`: one row per `EXECUTE`
 privilege
 : `grantor`, `grantee` (`PUBLIC` for the default grant), `specific_catalog`, `specific_schema`, `specific_name`,
@@ -54,8 +60,7 @@ privilege
 
 - `CREATEDB`, `CREATEROLE` and other non-login options of `CREATE ROLE` are read and not kept: `rolcreatedb` and
   `rolcreaterole` stay false.
-- `pg_authid`, `pg_has_role`, `information_schema.enabled_roles`, `applicable_roles` and `column_privileges` do not
-  exist.
+- `pg_authid`, `pg_has_role`, `information_schema.enabled_roles` and `applicable_roles` do not exist.
 - `table_privileges` lists every table's privileges, not only those of the current user's roles.
 
 ## Examples
@@ -172,6 +177,27 @@ GRANT
  clerk     |
  postgres  | Superuser, Create role, Create DB, Bypass RLS
  staff     | Cannot login
+```
+
+### F. Column privileges
+
+A privilege on a table is a privilege on each of its columns.
+
+<!-- example: postgresql -->
+```sql
+SELECT table_name, column_name, privilege_type
+FROM information_schema.column_privileges
+WHERE table_name = 'orders' AND grantee = 'clerk' ORDER BY column_name, privilege_type;
+```
+
+```text
+ table_name | column_name | privilege_type
+------------+-------------+----------------
+ orders     | no          | INSERT
+ orders     | no          | SELECT
+ orders     | total       | INSERT
+ orders     | total       | SELECT
+(4 rows)
 ```
 
 ## See also

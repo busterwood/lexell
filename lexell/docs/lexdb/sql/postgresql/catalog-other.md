@@ -43,8 +43,7 @@ Each relation has all of PostgreSQL 18's columns.
 
 - `pg_settings` has no rows; `SHOW ALL` gives lexdb's settings.
 - `pg_stats`, `pg_statistic`, `pg_stat_activity`, `pg_stat_all_tables`, `pg_statio_user_tables`, `pg_locks`,
-  `pg_operator`, `pg_cast`, `pg_authid`, `pg_timezone_names`, `information_schema.triggers` and
-  `information_schema.domains` do not exist (42P01).
+  `pg_operator`, `pg_cast`, `pg_authid`, `pg_timezone_names` and `information_schema.triggers` do not exist (42P01).
 - `pg_class.reltuples` is not kept (see [catalog: tables](catalog-tables.md)).
 
 ## Examples

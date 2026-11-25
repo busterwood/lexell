@@ -33,6 +33,8 @@ CREATE [ OR REPLACE ] [ TEMP | TEMPORARY ] VIEW name [ ( column_name [, ...] ) ]
 
 - lexdb keeps the query's text, and reads it again each time the view is used. The query is planned with the
   statement that reads the view, so a condition on the view (`WHERE id = 1`) reaches the tables under it.
+- **`SELECT *` keeps the columns the view was made with**, as in PostgreSQL: a column added to the table later is not in
+  the view (example E). `SELECT t.*, u.*` keeps `t`'s and `u`'s columns.
 - Renaming a table or a column that a view reads changes the view's text with it, so the view goes on working.
 - Views are read-only: `INSERT`, `UPDATE`, `DELETE` and `MERGE` of a view are refused.
 - `pg_get_viewdef`, `pg_views.definition` and `information_schema.views` give the query as written.
@@ -42,8 +44,6 @@ CREATE [ OR REPLACE ] [ TEMP | TEMPORARY ] VIEW name [ ( column_name [, ...] ) ]
 
 - Views are not updatable: PostgreSQL updates a simple view's table, and lexdb refuses (`cannot update view "v"
   (lexdb's views are read-only)`) (lexdb-gaps.md 2.2).
-- `SELECT *` in a view is not expanded when the view is made: the view shows the table's columns as they are when it
-  is read, so a column added later appears in it. PostgreSQL fixes the columns at `CREATE VIEW`.
 - The definition is shown as written; PostgreSQL shows its own rewritten form (`SELECT emp.id, emp.name FROM emp`).
 - Not supported: `CREATE RECURSIVE VIEW` (42601), `WITH ( view_option )` and `WITH CHECK OPTION` (0A000), and
   materialized views (0A000).
@@ -146,18 +146,28 @@ SELECT viewname, definition FROM pg_views WHERE viewname = 'well_paid';
 (1 row)
 ```
 
-### E. SELECT * follows the table
+### E. SELECT * keeps the columns it was made with
+
+A column added to the table after `CREATE VIEW` is not in the view; a view made after it has the column.
 
 <!-- example: postgresql -->
 ```sql
 CREATE VIEW all_emp AS SELECT * FROM emp;
 ALTER TABLE emp ADD COLUMN phone text;
+CREATE VIEW all_emp2 AS SELECT * FROM emp;
 SELECT * FROM all_emp WHERE id = 1;
+SELECT * FROM all_emp2 WHERE id = 1;
 ```
 
 ```text
 CREATE VIEW
 ALTER TABLE
+CREATE VIEW
+ id | name |   dept   | salary
+----+------+----------+---------
+  1 | ada  | research | 5200.00
+(1 row)
+
  id | name |   dept   | salary  | phone
 ----+------+----------+---------+-------
   1 | ada  | research | 5200.00 |

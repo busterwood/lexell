@@ -44,6 +44,10 @@ transaction_mode:
   (`could not serialize access due to concurrent update`) and nothing of the block is kept. The application runs the block again. Row locks
   (`SELECT ... FOR UPDATE`, and the rows `UPDATE` and `DELETE` change) make a second writer wait instead, which
   removes the common case.
+- `SET TRANSACTION READ ONLY` makes the block read-only at any time, also after its first query (a write is 25006);
+  `SET TRANSACTION READ WRITE` makes a block that was made `READ ONLY` read-write only before its first query (25001
+  `transaction read-write mode must be set before any query` after it); in a read-write block it changes nothing. The modes may come in any order, with or without commas. `SHOW transaction_read_only` says `on` in a
+  read-only block (example E).
 - DDL is transactional: `CREATE`, `ALTER` and `DROP` in a block are kept or undone with it. `nextval` and `ALTER
   SEQUENCE ... RESTART` are not undone.
 - An error in a block aborts it: later statements give 25P02 (`current transaction is aborted, commands ignored
@@ -59,13 +63,13 @@ transaction_mode:
   serializable and says `serializable` (PostgreSQL: `repeatable read`). An application written for read committed
   meets 40001 failures unless it asks for the level (lexdb-gaps.md 2.2).
 - `BEGIN` ignores words it does not know: `BEGIN nonsense` starts a block where PostgreSQL gives 42601.
-- In a `READ ONLY` block, `SHOW transaction_read_only` says `off`.
 - `BEGIN` inside a block, and `COMMIT` or `ROLLBACK` outside one, give no `WARNING` (PostgreSQL warns `there is
   already a transaction in progress` and `there is no transaction in progress`).
-- `SET TRANSACTION` and `SET SESSION CHARACTERISTICS AS TRANSACTION` take the isolation level (`SET TRANSACTION
-  ISOLATION LEVEL` after the block's first statement is 25001 in lexdb; PostgreSQL allows it until a snapshot is
-  taken, or when the level stays the same) and ignore `READ ONLY` and `READ WRITE`:
-  write the mode in `BEGIN`.
+- `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` and `READ WRITE` are accepted and do nothing: write the mode in
+  `BEGIN`, or `SET TRANSACTION` in the block (PostgreSQL makes it the default of the session's later blocks, and `SHOW
+  default_transaction_read_only` says so). Its isolation level is taken.
+- `SET TRANSACTION` outside a block gives no `WARNING` (PostgreSQL: `SET TRANSACTION can only be used in transaction
+  blocks`), and does nothing.
 - `PREPARE TRANSACTION` (two-phase commit) is not supported.
 
 ## Examples
@@ -223,7 +227,63 @@ BEGIN
 COMMIT
 ```
 
-### E. DDL in a block
+### E. READ ONLY, in BEGIN and in SET TRANSACTION
+
+`SET TRANSACTION READ ONLY` makes a block that has been reading read-only from then on. A block made `READ ONLY` can
+be made read-write again before its first query.
+
+<!-- example: postgresql -->
+```sql
+BEGIN;
+SELECT sum(bal) FROM acct;
+SET TRANSACTION READ ONLY;
+SHOW transaction_read_only;
+UPDATE acct SET bal = 0;
+ROLLBACK;
+BEGIN READ ONLY;
+SET TRANSACTION READ WRITE;
+SHOW transaction_read_only;
+ROLLBACK;
+BEGIN READ ONLY;
+SELECT 1;
+SET TRANSACTION READ WRITE;
+ROLLBACK;
+```
+
+```text
+BEGIN
+ sum
+-----
+ 150
+(1 row)
+
+SET
+ transaction_read_only
+-----------------------
+ on
+(1 row)
+
+ERROR:  cannot execute UPDATE in a read-only transaction
+ROLLBACK
+BEGIN
+SET
+ transaction_read_only
+-----------------------
+ off
+(1 row)
+
+ROLLBACK
+BEGIN
+ ?column?
+----------
+        1
+(1 row)
+
+ERROR:  transaction read-write mode must be set before any query
+ROLLBACK
+```
+
+### F. DDL in a block
 
 <!-- example: postgresql -->
 ```sql
