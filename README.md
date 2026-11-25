@@ -23,23 +23,25 @@ Lexell with `-O` against Rust and against Java on a warmed-up JVM (20 benchmarks
 
 | Benchmark | Faster than Rust | Faster than Java |
 |---|---:|---:|
-| Allocation | 10× | |
-| Lists and trees | 5.4–5.8× | |
-| Strings | 3.7× | |
+| Allocation | 11× | |
+| Lists and trees | 5.2–5.9× | |
+| Strings | 3.6× | |
 | Maps | 1.9× | |
 | Recursive calls (`fib`) | 1.6× | 1.1× |
-| Sieve | 1.6× | 1.7× |
-| Matrix multiplication | 1.45× | |
-| Interpreter loop | 1.33× | 2.2× |
-| Bit-packed column decode | | 1.33× |
-| Varint CSV parsing | 1.05× | 1.36× |
-| Switching between tasks | | 9.3× (1.8× Go) |
-| Token scanner | | 1.7× |
-| Sorting with closures | | 1.8× |
-| Loops | level | 1.2× |
+| Matrix multiplication | 1.6× | |
+| Sieve | 1.6× | 1.8× |
+| Interpreter loop | 1.34× | 2.1× |
+| Array indexing | 1.33× | 1.08× |
+| Bit-packed column decode | | 1.49× |
+| Varint CSV parsing | 1.03× | 1.37× |
+| Switching between tasks | | 8.7× (1.8× Go) |
+| Token scanner | | 1.8× |
+| Sorting with closures | | 1.6× |
+| Loops | level | 1.1× |
+| B-tree | level | |
 | Peak memory (19 of 20 programs) | | 2–31 MB against the JVM's 51 MB–1.4 GB |
 
-Rust is ahead on floating point (`nbody`), sorting with closures, bit-packed decode (`bitpack`), hash aggregation (`hashagg`), expression AST evaluation (`enum_eval`), and slightly on the token scanner (1.08×) and B-tree (1.03×). Java is ahead on the allocation-heavy programs, arrays, maps, B-tree (1.10×), hash aggregation, expression evaluation, and vectorised matrix multiplication.
+Rust is ahead on floating point (`nbody`), sorting with closures, bit-packed decode (`bitpack`), hash aggregation (`hashagg`), and slightly on the token scanner (1.10×) and expression AST evaluation (`enum_eval`, 1.09×). Java is ahead on the allocation-heavy programs, maps, B-tree (1.05×), hash aggregation, expression evaluation, and vectorised matrix multiplication.
 
 ### Real programs
 
@@ -158,7 +160,7 @@ This also prints `24.49`. The repository includes [other command-line tools, a R
 
 LexDB is a SQL database server written in Lexell (`lexell/cmd/lexdb.lxl`). It is designed for SSDs and NVMe drives, consumer drives first, and keeps its data on disk with memory as a cache. Pages are copy-on-write, so a write torn by a power cut can never damage a page in use, and its disk I/O goes through io_uring where the kernel allows it. It speaks three wire protocols: PostgreSQL's, SQL Server's TDS and Oracle's TNS, each with its own SQL dialect. Existing clients and drivers, such as `psql`, `pgbench`, the JDBC drivers and Lexell's own database clients, connect unchanged. Read-write transactions are serializable, and read-only transactions read from a snapshot. Tables are stored by column and queries run over batches of rows, planned by a cost-based optimizer. A server can run read-only replicas as separate processes.
 
-On TPC-H at scale factor 1, LexDB on one core finishes the 22 queries in less total time than PostgreSQL on four processes (8.1 against 8.8 s) and takes 0.63 of PostgreSQL's time on one core (geometric mean, 20 of 22 level or ahead). It commits 1.75 to 2.5 times as many durable updates a second, and on 35 analytic queries its CPU is 0.49 of PostgreSQL on one core (wall time 0.98 of four processes). PostgreSQL is ahead on point selects from a single process at 8 or more clients ([details](PERFORMANCE.md#lexdb)).
+On TPC-H at scale factor 1, LexDB on one core finishes the 22 queries in less total time than PostgreSQL on four processes (7.94 against 8.84 s) and takes 0.63 of PostgreSQL's time on one core (geometric mean, 20 of 22 level or ahead). It commits 1.75 to 2.5 times as many durable updates a second, and on 35 analytic queries its CPU is 0.49 of PostgreSQL on one core (wall time 0.98 of four processes). PostgreSQL is ahead on point selects from a single process at 8 or more clients ([details](PERFORMANCE.md#lexdb)).
 
 For now, the [program notes](lexell/cmd/README.md#lexdb) cover running it, and the [design](lexell/design/lexdb.md) covers how it works. A full LexDB guide is in progress.
 

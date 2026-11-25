@@ -238,8 +238,9 @@ result, and it has no refresh functions: see
 - **`loop`** is two overflow-checked operations per iteration. The native
   backend proves both cannot overflow (`i < n` bounds `i` and `i * 2`) and
   runs the loop at one cycle an iteration; gcc keeps the checks.
-- **`array`** keeps one bounds check per element natively: the loop runs to
-  `n`, which the compiler cannot relate to the array's length.
+- **`array`** hoists its bounds check out of the inner loop via loop
+  versioning (`versionLoop` in `loops.lxl`), leaving only the checked
+  additions in the hot loop.
 - **Allocation-bound programs** (lists, trees): through C, about half the
   time is libc's `malloc` and `free`, one block per node.
 - **`strings`**: every `+` allocates a new reference-counted block, and
