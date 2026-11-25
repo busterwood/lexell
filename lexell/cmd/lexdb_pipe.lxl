@@ -3863,6 +3863,48 @@ fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan
     var nBatches = 0
     // (rows the run holds: one pass over them, in place of the scans)
     let held = src.held
+    // Direct leaf-count fast path for unconditional COUNT(*) over table scans:
+    // sums entry counts per leaf in one scanLeaves pass without decoding rows.
+    var onlyStar = !held && len(bconds) == 0 && len(bp.usedP) == 0 && !ag.set && len(ag.ags) == 1 &&
+                   len(ag.ags[0].keys) == 0 && len(ag.ags[0].fcols) == 0 && len(ag.ags[0].specs) > 0
+    if onlyStar {
+        for sp in ag.ags[0].specs {
+            if sp.kind != BA_STAR || sp.filter.isSome() { onlyStar = false }
+        }
+        if src.rd.ix >= 0 {
+            for sj in 0..len(src.scans) {
+                if !src.scans[sj].whole { onlyStar = false }
+            }
+        }
+    }
+    if onlyStar {
+        for sj in 0..len(src.scans) {
+            let n = try lexdb_access.countScan(st, txn, &rel, &src.scans[sj], sc.part, fn(chunk: int): Result[Unit, DbErr] {
+                return bud.tickN(chunk)
+            })
+            nRead += n
+            nJoined += n
+            if n > 0 { nBatches += 1 }
+        }
+        if nRead > 0 {
+            let ns = len(ag.ags[0].specs)
+            let cost = 64 * (ns + 1)
+            ag.ags[0].ngroups += 1
+            ag.ags[0].added += cost
+            if ag.ags[0].room >= 0 && ag.ags[0].added > ag.ags[0].room { return Err(memErr(ag.ags[0].maxHeld)) }
+            ag.ags[0].newGroup(0)
+            for si in 0..ns { ag.ags[0].an[si][0] = nRead }
+            ag.rows += nRead
+        }
+        groupRuns += 1
+        cnt[0].starts += 1
+        cnt[0].read += nRead
+        cnt[0].joined += nJoined
+        cnt[0].batches += nBatches
+        cnt[len(cnt) - 1].joined += ag.ngroups()
+        try ag.finish(len(cols), give)
+        return Ok(Some(ag.added()))
+    }
     // (a table's scan decoded in two steps: lazyOf)
     let lazy = lazyOf(&bp, t, &bconds, -1)
     for sj in 0..(if held { 1 } else { len(src.scans) }) {

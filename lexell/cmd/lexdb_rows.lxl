@@ -1275,59 +1275,43 @@ pub fn leafValAt(l: &LeafView, i: int): &str {
     return &l.body[vStart(e)..vEnd(e)]
 }
 
-// Decodes stored row s into row r of b: 0 done, 1 a value of a kind its
-// column's batch does not hold (the row path reads the query), 2 a value
-// stored apart (the store must be read: the caller's).
-pub fn decodeRow(s: &str, r: int, b: mut &Batch, bp: &Projection, rw: &Rows): Result[int, DbErr] {
+// Whether a format-6 row (or a version-2 stub's inline prefix p) holds every
+// needed place up to stopAt inline, with no needed place stored as a long text
+// (tag 5) and every byte in bounds.
+fn fitsInStop(p: &str, stopAt: int, placeCol: &[]int): bool {
+    if len(p) < 5 || p[0] != 6 { return false }
+    let cols = binary.readU32LEStr(p, 1)
+    let lim = if stopAt < cols { stopAt } else { cols }
+    var at = 5
+    for pl in 0..lim {
+        if at >= len(p) { return false }
+        let tag = p[at]
+        at += 1
+        if tag == 5 {
+            if placeCol[pl] >= 0 { return false }
+            at += 4
+        } else {
+            if (tag == 3 || tag == 4 || tag == 13) && at + 4 > len(p) { return false }
+            let sz = valSize(p, at, tag)
+            if sz < 0 { return false }
+            at += sz
+        }
+        if at > len(p) { return false }
+    }
+    return true
+}
+
+// Decodes tagged row bytes starting at s[at0..] (cols >= 0 for format-6 rows /
+// version-2 stub prefixes whose header is validated by fitsInStop, -1 for plain
+// tagged rows) into row r of b.
+fn decodeTaggedAt(s: &str, at0: int, cols: int, r: int, b: mut &Batch, bp: &Projection): Result[int, DbErr] {
     let kinds = &bp.kinds
     let placeCol = &bp.placeCol
     let missing = &bp.missing
-    if isFixedRow(s) {
-        // one load per column used, at its offset (9.50)
-        let lay = &rw.lays[try layOf(s, rw.lays)]
-        let np = len(lay.kinds)
-        for pl in bp.usedP {
-            let c = placeCol[pl]
-            let k = kinds[c]
-            if pl >= np {
-                let mv = if pl < len(missing) { missing[pl].clone() } else { Val.Null }
-                if !put(b, c, r, mv, k) { return Ok(1) }
-                continue
-            }
-            let pk = lay.kinds[pl]
-            if pk == PK_NONE || (int(s[lay.bm + pl / 8]) >> (pl % 8)) & 1 == 1 {
-                setNull(b, c, r)
-            } else if k == BK_INT && isIntKind(pk) {
-                b.cols[c].v[r] = readIntK(s, lay.off[pl], pk)
-            } else if pk == PK_BOOL && k == BK_BOOL {
-                b.cols[c].v[r] = if s[lay.off[pl]] == 1 { 1 } else { 0 }
-            } else if k == BK_TEXT {
-                if pk != PK_TEXT || !putText(b, c, r, try fixedText(s, pl, lay)) { return Ok(1) }
-            } else if isDecKind(k) {
-                if !put(b, c, r, try fixedVal(s, pl, pk, lay), k) { return Ok(1) }
-            } else if k != BK_VAL {
-                return Ok(1)
-            } else {
-                b.vals[c][r] = try fixedVal(s, pl, pk, lay)
-            }
-        }
-        return Ok(0)
-    }
-    if len(s) > 0 && s[0] == BIG { return Ok(2) }
-    if len(s) > 0 && s[0] == 6 {
-        // a row with long texts, kept whole in its leaf: read as the row path reads it
-        let places = try decodeRowNeed(s, bp.width, &bp.needP, missing, rw.lays)
-        for i in 0..len(kinds) {
-            if !bp.needCol[i] { continue }
-            let pl = if len(rw.slots) == 0 { i } else { rw.slots[i] }
-            if !put(b, i, r, places[pl].clone(), kinds[i]) { return Ok(1) }
-        }
-        return Ok(0)
-    }
-    var at = 0
+    var at = at0
     for pl in 0..bp.stopAt {
         let c = placeCol[pl]
-        if at >= len(s) {
+        if (cols >= 0 && pl >= cols) || (cols < 0 && at >= len(s)) {
             // a column added after the row was written: its value then
             if c >= 0 {
                 let mv = if pl < len(missing) { missing[pl].clone() } else { Val.Null }
@@ -1398,6 +1382,72 @@ pub fn decodeRow(s: &str, r: int, b: mut &Batch, bp: &Projection, rw: &Rows): Re
     return Ok(0)
 }
 
+// Decodes stored row s into row r of b: 0 done, 1 a value of a kind its
+// column's batch does not hold (the row path reads the query), 2 a value
+// stored apart (the store must be read: the caller's).
+pub fn decodeRow(s: &str, r: int, b: mut &Batch, bp: &Projection, rw: &Rows): Result[int, DbErr] {
+    if len(bp.usedP) == 0 { return Ok(0) }
+    let kinds = &bp.kinds
+    let placeCol = &bp.placeCol
+    let missing = &bp.missing
+    if isFixedRow(s) {
+        // one load per column used, at its offset (9.50)
+        let lay = &rw.lays[try layOf(s, rw.lays)]
+        let np = len(lay.kinds)
+        for pl in bp.usedP {
+            let c = placeCol[pl]
+            let k = kinds[c]
+            if pl >= np {
+                let mv = if pl < len(missing) { missing[pl].clone() } else { Val.Null }
+                if !put(b, c, r, mv, k) { return Ok(1) }
+                continue
+            }
+            let pk = lay.kinds[pl]
+            if pk == PK_NONE || (int(s[lay.bm + pl / 8]) >> (pl % 8)) & 1 == 1 {
+                setNull(b, c, r)
+            } else if k == BK_INT && isIntKind(pk) {
+                b.cols[c].v[r] = readIntK(s, lay.off[pl], pk)
+            } else if pk == PK_BOOL && k == BK_BOOL {
+                b.cols[c].v[r] = if s[lay.off[pl]] == 1 { 1 } else { 0 }
+            } else if k == BK_TEXT {
+                if pk != PK_TEXT || !putText(b, c, r, try fixedText(s, pl, lay)) { return Ok(1) }
+            } else if isDecKind(k) {
+                if !put(b, c, r, try fixedVal(s, pl, pk, lay), k) { return Ok(1) }
+            } else if k != BK_VAL {
+                return Ok(1)
+            } else {
+                b.vals[c][r] = try fixedVal(s, pl, pk, lay)
+            }
+        }
+        return Ok(0)
+    }
+    if len(s) > 0 && s[0] == BIG {
+        // a version-2 stub carries the row's inline head right after STUB_LEN;
+        // when every needed place fits in it, decode in place without re-reading the store
+        if isStub(s) && s[1] == 2 {
+            let p = &s[STUB_LEN..len(s)]
+            if fitsInStop(p, bp.stopAt, placeCol) {
+                return decodeTaggedAt(p, 5, binary.readU32LEStr(p, 1), r, b, bp)
+            }
+        }
+        return Ok(2)
+    }
+    if len(s) > 0 && s[0] == 6 {
+        if fitsInStop(s, bp.stopAt, placeCol) {
+            return decodeTaggedAt(s, 5, binary.readU32LEStr(s, 1), r, b, bp)
+        }
+        // a row with long texts, kept whole in its leaf: read as the row path reads it
+        let places = try decodeRowNeed(s, bp.width, &bp.needP, missing, rw.lays)
+        for i in 0..len(kinds) {
+            if !bp.needCol[i] { continue }
+            let pl = if len(rw.slots) == 0 { i } else { rw.slots[i] }
+            if !put(b, i, r, places[pl].clone(), kinds[i]) { return Ok(1) }
+        }
+        return Ok(0)
+    }
+    return decodeTaggedAt(s, 0, -1, r, b, bp)
+}
+
 // The run of rows from `from` (at most `to`) that are in the fixed layout
 // of the first, as views of the leaf's bytes ([] when the first is not in a
 // fixed layout).
@@ -1433,6 +1483,7 @@ pub fn leafPlaceKind(leaf: &LeafView, pl: int): byte { return lexdb_cols.kindOf(
 // it), -1 a value of a kind its column's batch does not hold (as
 // decodeRow's 1).
 pub fn decodeRun(leaf: &LeafView, from: int, to: int, b: mut &Batch, bp: &Projection, rw: &Rows): Result[int, DbErr] {
+    if len(bp.usedP) == 0 { return Ok(to - from) }
     if leaf.isCols { return decodeCols(leaf, from, to, b, bp, rw) }
     // each row's bytes, found once (a lazy leaf's are in its page's body)
     let rows = try fixedRunRows(leaf, from, to, rw)

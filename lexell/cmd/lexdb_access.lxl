@@ -1045,6 +1045,50 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Sc
     return Ok(Some(b))
 }
 
+// Counts the entries of a table scan in leaf chunks without decoding any row
+// values, yielding to tick outside the store lock every COUNT_CHUNK rows.
+const COUNT_CHUNK = 65536
+
+pub fn countScan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Scan, part: bool,
+                 tick: &fn(int): Result[Unit, DbErr]): Result[int, DbErr] {
+    if sc.empty { return Ok(0) }
+    if sc.point {
+        let got = if part { try st.getPart(txn, t.tree, &sc.lo) } else { try st.get(txn, t.tree, &sc.lo) }
+        if got.isSome() {
+            try tick(1)
+            return Ok(1)
+        }
+        return Ok(0)
+    }
+    var total = 0
+    var at = sc.lo.clone()
+    var done = false
+    while !done {
+        var chunk = 0
+        var stopKey = ""
+        var paused = false
+        try st.scanLeaves(txn, t.tree, &at, sc.hi.clone(), fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+            chunk += j - i
+            if chunk >= COUNT_CHUNK {
+                paused = true
+                stopKey = lexdb_rows.leafKey(leaf, j - 1)
+                return false
+            }
+            return true
+        })
+        if chunk > 0 {
+            try tick(chunk)
+            total += chunk
+        }
+        if paused {
+            at = after(&stopKey)
+        } else {
+            done = true
+        }
+    }
+    return Ok(total)
+}
+
 // The next batch of the first level, as rd reads it (fillBatch for the
 // primary key, and for a scan of the whole table in an index's place;
 // spare as fillBatch's).
