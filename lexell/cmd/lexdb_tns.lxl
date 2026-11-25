@@ -406,6 +406,22 @@ fn rawOf(v: &Val): str {
     }
 }
 
+// Whether column i of the rows holds instants (Val.Tstz: TIMESTAMP WITH LOCAL TIME ZONE), one at least and no value
+// that keeps an offset.
+fn localTz(rows: &[][]Val, i: int): bool {
+    var any = false
+    for r in rows {
+        if i < len(r) {
+            match r[i] {
+                Val.Tstz(_) { any = true }
+                Val.Null {}
+                else { return false }
+            }
+        }
+    }
+    return any
+}
+
 // The columns' Oracle types for these rows.
 fn colTypes(cols: &[]lexdb_bind.OutCol, rows: &[][]Val, fv: int, sess: &lexdb_exec.Session): []CT {
     var ts: []CT = []
@@ -447,6 +463,12 @@ fn colTypes(cols: &[]lexdb_bind.OutCol, rows: &[][]Val, fv: int, sess: &lexdb_ex
             }
         } else if kind == K_TSTZ {
             t = CT{kind: kind, ora: tns.T_TIMESTAMP_TZ, size: 13, prec: 0, scale: 6}
+            if localTz(rows, i) {
+                // TIMESTAMP WITH LOCAL TIME ZONE (an instant, Val.Tstz): type 231, in DBTIMEZONE (UTC), as Oracle sends it;
+                // the client shows it in the session's zone
+                let fs = cols[i].scale
+                t = CT{kind: kind, ora: tns.T_TIMESTAMP_LTZ, size: 11, prec: 0, scale: if fs >= 0 && fs <= 9 { fs } else { 6 }}
+            }
         } else if kind == K_IDS {
             t = CT{kind: kind, ora: tns.T_INTERVAL_DS, size: 11, prec: 0, scale: 0}
         } else if kind == K_IYM {
@@ -584,6 +606,7 @@ fn cellBytes(v: &Val, t: &CT, oid: int, sess: &lexdb_exec.Session): Result[str, 
     } else if t.kind == K_TSTZ {
         match v {
             Val.Tstz(us) {
+                if t.ora == tns.T_TIMESTAMP_LTZ { return Ok(tns.encodeTimestamp(&lexdb_time.localOf(us))) }
                 match lexdb_time.localOf(us).withOffset(0) {
                     Some(o) { return Ok(tns.encodeTimestampTz(&o)) }
                     None {}
@@ -1436,6 +1459,22 @@ fn (c: &Conn) proves(rq: &Req): Result[str, str] {
     return Ok(combo)
 }
 
+// The time zone the client sent at logon (AUTH_ALTER_SESSION) is the session's, and its LOCAL, as in Oracle. '+00:00',
+// where a session starts, sets nothing; a zone lexdb does not know is left (the session stays at +00:00).
+fn (c: mut &Conn) logonZone(rq: &Req) {
+    let v = lexdb_oraadm.zoneSet(&(pairOf(&rq.pairs, "AUTH_ALTER_SESSION")))
+    if len(v) == 0 || v == "+00:00" { return }
+    match zoneSetting(&v, &c.localZone) {
+        Ok(z) {
+            if c.sess.startupZone(&z).isErr() { return }
+            c.nls.tz = v
+            c.nls.zset = z.clone()
+            c.localZone = z
+        }
+        Err(_) {}
+    }
+}
+
 // Phase two: the password proved, the session starts.
 fn (c: mut &Conn) auth2(rq: &Req) {
     match c.proves(rq) {
@@ -1456,25 +1495,10 @@ fn (c: mut &Conn) auth2(rq: &Req) {
             let me = c.user.clone()
             if !c.schemaExists(&me) { c.ownSchema(&me) }
             if c.schemaExists(&me) { c.nls.schema = me }
+            c.logonZone(rq)
             c.reapply()
             var ps: []tns.KeyValue = []
             append(mut &ps, kv("AUTH_SVR_RESPONSE", &(hexUpper(&resp)), 0))
-// The time zone the client sent at logon (AUTH_ALTER_SESSION) is the session's, and its LOCAL, as in Oracle. '+00:00',
-// where a session starts, sets nothing; a zone lexdb does not know is left (the session stays at +00:00).
-fn (c: mut &Conn) logonZone(rq: &Req) {
-    let v = lexdb_oraadm.zoneSet(&(pairOf(&rq.pairs, "AUTH_ALTER_SESSION")))
-    if len(v) == 0 || v == "+00:00" { return }
-    match zoneSetting(&v, &c.localZone) {
-        Ok(z) {
-            if c.sess.startupZone(&z).isErr() { return }
-            c.nls.tz = v
-            c.nls.zset = z.clone()
-            c.localZone = z
-        }
-        Err(_) {}
-    }
-}
-
             append(mut &ps, kv("AUTH_VERSION_NO", &(VERSION_NO.toStr()), 0))
             append(mut &ps, kv("AUTH_MAX_OPEN_CURSORS", &(MAX_OPEN_CURSORS.toStr()), 0))
             append(mut &ps, kv("AUTH_SESSION_ID", &(c.sess.number().toStr()), 0))
@@ -1495,7 +1519,6 @@ fn (c: mut &Conn) logonZone(rq: &Req) {
 // ---- statements
 
 fn emptyRes(tag: &str): lexdb_exec.Res {
-            c.logonZone(rq)
     return lexdb_exec.Res{cols: [], rows: [], tag: tag.clone(), hasRows: false, copy: lexdb_exec.COPY_NONE}
 }
 
