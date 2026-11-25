@@ -127,8 +127,9 @@ quantifier:
 - A pattern that would need more than 4,096 joins (the lengths of its quantifiers multiplied by the tables its
   variables may be bound to) is refused (ORA-03001). Oracle runs out of memory on such a pattern (ORA-04036 at
   `{1,5000}`).
-- `VERTEX_ID` and `EDGE_ID` give the JSON's text as `VARCHAR2`: lexdb has no `JSON` type. `JSON_SERIALIZE` of them in
-  `COLUMNS` is the same text; the JSON functions do not exist outside `GRAPH_TABLE`.
+- `VERTEX_ID` and `EDGE_ID` give the JSON text as a character value, not as the `JSON` type: a table made from them with
+  `CREATE TABLE ... AS SELECT` has a `CLOB` column (Oracle: `JSON`). `JSON_VALUE`, `JSON_SERIALIZE` and the other
+  [JSON functions](functions-json.md) read them (`JSON_VALUE(vp, '$.KEY_VALUE.ID')`).
 - `MATCHNUM()` numbers the matches one each, as Oracle does, but the numbers are lexdb's own: a match does not have
   Oracle's number.
 - The [PostgreSQL](../postgresql/graph-table.md) and [SQL Server](../tsql/graph-table.md) doors also support `GRAPH_TABLE`.

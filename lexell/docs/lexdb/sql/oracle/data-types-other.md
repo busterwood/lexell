@@ -11,6 +11,7 @@ RAW ( size )
 LONG RAW
 BLOB
 BOOLEAN
+JSON
 ROWID
 UROWID
 ```
@@ -24,6 +25,10 @@ UROWID
 `BOOLEAN`
 : `TRUE`, `FALSE` or NULL (Oracle 23ai). Columns of this type, `TRUE` and `FALSE` as values, and `TO_BOOLEAN`
   work; a boolean column can be a condition in `WHERE`.
+
+`JSON`
+: A valid JSON document (23ai). Text that is not JSON is refused on `INSERT` (lexdb: ORA-01722; Oracle: ORA-40441). `USER_TAB_COLUMNS` says `JSON`. See
+  [JSON and SQL/JSON](functions-json.md) and example E.
 
 `ROWID`, `UROWID`
 : Accepted as column types.
@@ -158,6 +163,45 @@ ORA-03001: unimplemented feature: lexdb: CREATE TYPE supports AS ENUM only
 
 ERROR:
 ORA-00904: "ROWID": invalid identifier
+```
+
+### E. JSON
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE jt (id NUMBER PRIMARY KEY, doc JSON);
+INSERT INTO jt VALUES (1, '{"a":[1,2]}');
+INSERT INTO jt VALUES (2, NULL);
+INSERT INTO jt VALUES (3, 'not json');
+SELECT id, doc, JSON_VALUE(doc, '$.a[1]') AS second FROM jt ORDER BY id;
+SELECT data_type FROM user_tab_columns WHERE table_name = 'JT' AND column_name = 'DOC';
+DROP TABLE jt;
+```
+
+```text
+Table created.
+
+1 row created.
+
+1 row created.
+
+ERROR:
+ORA-01722: invalid number
+
+ID DOC         SECOND
+-- ----------- ------
+ 1 {"a":[1,2]} 2
+ 2
+
+2 rows selected.
+
+DATA_TYPE
+---------
+JSON
+
+1 row selected.
+
+Table dropped.
 ```
 
 ## See also

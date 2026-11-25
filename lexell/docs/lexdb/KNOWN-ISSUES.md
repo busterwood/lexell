@@ -29,6 +29,8 @@ d9564763, 2026-11-25 (the overloaded members of an Oracle package, the positions
 T-SQL's 159 severity, the names in 4512 and 2010, ALTER VIEW of a missing view, DOMAINS listing the table types,
 PostgreSQL's SET SESSION CHARACTERISTICS and schemata.schema_owner), are removed or reworded to what is left, checked
 against it, Oracle Free 23.26.3, SQL Server 2022 and PostgreSQL 18).
+The "JSON" entries of the three doors are what checking the JSON pages against PostgreSQL 18.6, SQL Server 2022 and 2025 and
+Oracle Free 23.26.3 found (main d9564763).
 They are not fixed here: the pages describe what lexdb does. Each "Differences" section of the reference lists the smaller
 differences of its statement.
 
@@ -267,6 +269,29 @@ differences of its statement.
   `max_statement_mem` of 1 kB did not stop a top-N sort over 100,000 rows (not narrowed down).
 
 
+- **JSON** (found writing [the JSON page](sql/postgresql/functions-json.md), checked against PostgreSQL 18.6 on main d9564763, not fixed):
+  - A column of an SQL/JSON function, a JSON operator or `to_json` without `AS` is named `#jsonb_arrow`, `#json_value`, `#to_json`
+    (PostgreSQL: `?column?` or the function's name); `FROM json_array_elements(...) AS el` names its column `el` (PostgreSQL: `value`).
+  - A set-returning JSON function in the select list (`SELECT json_object_keys(...)`, `jsonb_path_query`, `jsonb_array_elements_text`) gives one
+    empty row (or wrong rows); in `FROM` they work.
+  - `SELECT DISTINCT jsonb_col ... ORDER BY jsonb_col` sorts an array before `null`; a plain `ORDER BY` is right. PostgreSQL puts an empty array
+    before `null` (lexdb: after the booleans).
+  - `->>`, `#>>`, `jsonb_each_text` and `jsonb_array_elements_text` of an object or array give compact text (`{"b":[1]}`; PostgreSQL: `{"b": [1]}`);
+    `json_agg`, `json_object_agg`, `JSON_ARRAYAGG`, `JSON_OBJECTAGG`, `JSON_OBJECT`, `JSON_ARRAY`, `JSON_QUERY`, `JSON_SERIALIZE`, `json_object` and `array_to_json` give
+    compact JSON (PostgreSQL: `[1, 2]`, `{ "a" : 1 }`); `json_object_agg` keeps the last of a repeated key (PostgreSQL's `json` keeps both).
+  - `jsonb_pretty` indents by two spaces and ends with a blank line (PostgreSQL: four); `to_json(timestamp)` is `"2020-01-02 03:04:05"` (PostgreSQL: `T`);
+    `to_json` of a two-dimensional array is an array of strings; `'1e400'::jsonb` prints `1e400`.
+  - `JSON_QUERY ... WITH CONDITIONAL WRAPPER` wraps a single item (PostgreSQL: not); `OMIT QUOTES` with `jsonb` gives `x` (PostgreSQL: `NULL`);
+    `JSON_EXISTS ... TRUE ON ERROR` and `JSON_QUERY ... ON ERROR` accept text that is not JSON (PostgreSQL: 22P02); a `JSON_TABLE` column with `NULL ON
+    ERROR` of a value that does not convert is 22P02 (PostgreSQL: `NULL`); `5 IS JSON` is true (PostgreSQL: 42804); a missing path variable is no error;
+    `jsonb_insert` of an existing key is no error (22023); `json = json` works (PostgreSQL: no operator).
+  - Error texts: `invalid input syntax for type json: "{bad}"` without `LINE`, `DETAIL`, `CONTEXT` (and `jsonb` for the `jsonb` type); `no SQL/JSON item`,
+    `SQL/JSON scalar required`, `field name must not be null`, `cannot call json_object_keys on an array` / `non-object`, `arithmetic operands in jsonpath must be single
+    numbers`.
+  - Missing: `GIN` indexes (`index method "gin" is not supported`), subscripts (`b['a']`, `UPDATE ... SET b['a']`), `jsonb_set_lax`, `jsonb_concat`, `json_each_text` and
+    `jsonb_each` in the select list, the functions that take a column definition list (`jsonb_to_record`, `jsonb_to_recordset`, `json_to_record`, `jsonb_populate_record`,
+    `json_populate_record`), `row_to_json` and `to_jsonb` of a whole row or a subquery alias, `ARRAY[[1,2],[3,4]]`.
+
 ## SQL Server door
 
 - **`UPDATE STATISTICS`** is a syntax error (102), on the master and on a replica.
@@ -488,6 +513,18 @@ differences of its statement.
     SQL Server `CK__ck__c__3C69FB99`).
   - A `datetime` column takes PostgreSQL's special strings (`INSERT ... VALUES ('tomorrow')`).
 
+- **JSON** (found writing [the JSON page](sql/tsql/functions-json.md), checked against SQL Server 2022 and 2025 on main d9564763, not fixed):
+  - `ISJSON('1')` and `ISJSON('"x"')` are 1 (SQL Server: 0).
+  - Strict-mode errors are 13608 only, with `JSON object does not contain key "zz"` (SQL Server: 13608 `Property cannot be found on the specified JSON path.`, then 13623 or 13624);
+    text that is not JSON is 13609 without the position (SQL Server: `Unexpected character 'n' is found at position 0.`), 245 for a `json` column or `CAST` (SQL Server: 13609); a path
+    without `$` is `NULL` (SQL Server: 13607); `JSON_PATH_EXISTS` of text that is not JSON is 13609 (SQL Server: 0); `JSON_OBJECT(NULL: 1)` is 156 (SQL Server: 13638); the states differ.
+  - `JSON_OBJECT('a': 1, 'a': 2)` is `{"a":2}` (SQL Server: both keys); `SELECT 1 AS a, 2 AS a FOR JSON PATH` is `[{"a":2}]` (SQL Server: 13601).
+  - `FOR JSON AUTO, ROOT` without a name writes `root` (SQL Server: the table's name); a `datetime2` is `2020-01-02 03:04:05` (SQL Server: `T`); a `uniqueidentifier` in lower case
+    (SQL Server: upper case); a column of the outer query inside a `FOR JSON` subquery is named `#coll`.
+  - The `json` type keeps the text as written (SQL Server 2025: compact), `DATALENGTH` is the text's length, `sys.types` says `nvarchar`, and `json` values compare (SQL Server: 13636).
+    `JSON_CONTAINS` takes `nvarchar` (SQL Server: 8116).
+  - Beyond SQL Server (accepted, not an error): `IS JSON`, `JSON_EXISTS`, `RETURNING`, `PASSING`, `ON EMPTY` / `ON ERROR` and `JSON_TABLE`.
+
 ## Oracle door
 
 - **A global temporary table's definition is private to the session that made it**, on the master as on a
@@ -522,8 +559,8 @@ differences of its statement.
     (Oracle runs out of memory on one, ORA-04036 at `{1,5000}`). `ALTER PROPERTY GRAPH ... COMPILE` is ORA-03001 and
     privileges on a graph (`GRANT READ ON PROPERTY GRAPH g`) ORA-00942; `COMMENT ON PROPERTY GRAPH` is accepted and not
     kept (`USER_PG_COMMENTS.COMMENTS` stays empty).
-  - `VERTEX_ID` and `EDGE_ID` give the JSON's text as `VARCHAR2` (Oracle: `JSON`; lexdb has no JSON type), and
-    `MATCHNUM()`'s numbers are lexdb's own (one a match, as in Oracle, but not Oracle's numbers).
+  - `VERTEX_ID` and `EDGE_ID` give the JSON text as a character value, not the `JSON` type (a `CREATE TABLE ... AS SELECT` of them
+    has a `CLOB` column; Oracle: `JSON`); the JSON functions read them. `MATCHNUM()`'s numbers are lexdb's own (one a match, as in Oracle, but not Oracle's numbers).
   - Quoted graph names and quoted labels are exact, as in Oracle: `GRAPH_TABLE (mixg ...)` and `DROP PROPERTY GRAPH
     mixg` are ORA-42421 for `"MixG"` (checked on Oracle Free 23.26.3), in a database made by this lexdb or later (see
     the names entry below).
@@ -697,3 +734,17 @@ differences of its statement.
     `VALIDATE_CONVERSION` and `DEFAULT ... ON CONVERSION ERROR` are ORA-00900.
   - `ORA_DATABASE_NAME`, `RATIO_TO_REPORT`, `MEDIAN`, `STATS_MODE`, `CORR`, `COVAR_*`, `REGR_*`, `LNNVL`, `NANVL`,
     `GROUPING_ID` and `GROUP_ID` do not exist (ORA-00904); `LISTAGG ... OVER` is ORA-03001.
+- **JSON** (found writing [the JSON page](sql/oracle/functions-json.md), checked against Oracle Free 23.26.3 on main d9564763, not fixed):
+  - Text that is not JSON into a `JSON` column is ORA-01722 (Oracle: ORA-40441); `JSON_VALUE` of an array with `ERROR ON ERROR` is ORA-20000 `SQL/JSON scalar required`
+    (Oracle: ORA-40456), of a missing path with `ERROR ON EMPTY` ORA-20000 `no SQL/JSON item` (ORA-40462), `WITH UNIQUE KEYS` ORA-20000 (ORA-40473); a bad path is `NULL`
+    (ORA-40597); a failed `CHECK (... IS JSON)` gives `ORA-02290: check constraint violated` without the name.
+  - `PASSING 80 AS "min"` (a quoted name, as Oracle needs) does not bind: `JSON_EXISTS` is false and `JSON_VALUE` is `NULL`; an unquoted name works (Oracle: ORA-40656).
+  - `JSON_QUERY ... WITH CONDITIONAL WRAPPER` wraps a single scalar (Oracle: not); `PRETTY` output is `"a": 1` (Oracle: `"a" : 1`, brackets on their own lines); `JSON_OBJECT`
+    with a repeated key keeps the last (Oracle: both); `JSON(' {"a" : 1 } ')` keeps the spaces; `JSON_OBJECTAGG` embeds a `VARCHAR2` column with `CHECK (... IS JSON)`;
+    `JSON_EXISTS ... TRUE ON ERROR` accepts text that is not JSON (ORA-40441); `IS JSON ARRAY | OBJECT | SCALAR | WITH UNIQUE KEYS` of text is accepted (ORA-61763).
+  - `JSON_TRANSFORM`: `INSERT` of an existing member returns the document unchanged (ORA-40763); `PREPEND '$.tags' = 'x'` replaces the array by the value; `RENAME` sets the value
+    instead of renaming the key; `KEEP`, `NESTED PATH`, `IGNORE ON ...`, `RETURNING`, `FORMAT JSON` and `JSON(...)` values are ORA-00900.
+  - `JSON_TABLE`: an `EXISTS PATH` column shows `t` / `f` (Oracle: `true` / `false`); `NULL ON ERROR DEFAULT 0 ON EMPTY` of a string is ORA-01722 (Oracle: `NULL`); `COLUMNS (a, b)` without
+    types is ORA-00900.
+  - Missing (ORA-00900 or ORA-00904): the dot notation (`d.doc.name`, `d.doc.tags[0]`, `d.doc.score.number()`), `IS JSON STRICT | LAX`, `JSON_OBJECT(*)`, `FORMAT JSON` in `JSON_ARRAY`,
+    `JSON_ARRAY ( query )`, `PRETTY` in `JSON_QUERY`, `TREAT(... AS JSON)`, `CAST(... AS JSON)`, `CREATE SEARCH INDEX ... FOR JSON`.

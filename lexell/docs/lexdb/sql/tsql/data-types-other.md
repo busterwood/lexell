@@ -26,7 +26,8 @@ type_name                  -- a table type made by CREATE TYPE ... AS TABLE
   `NEWID()` makes a random one.
 
 `json`
-: Validated RFC 8259 JSON text (sent as `nvarchar(max)` over TDS). See [JSON, OPENJSON and FOR JSON](functions-json.md).
+: Validated RFC 8259 JSON text (SQL Server 2025's type; sent as `nvarchar(max)` over TDS). Text that is not JSON is error 245 on `INSERT`
+  and `CAST` (SQL Server: 13609). See [JSON, OPENJSON and FOR JSON](functions-json.md) and example H.
 
 `xml`
 : A column that holds XML text. lexdb keeps the text and checks nothing.
@@ -235,6 +236,46 @@ Msg 2715, Level 16, State 1, Line 1
 Column, parameter, or variable #1: Cannot find data type geography.
 Msg 195, Level 15, State 1, Line 1
 'sql_variant_property' is not a recognized built-in function name.
+```
+
+### H. json
+
+<!-- example: tsql -->
+```sql
+CREATE TABLE jj (id int PRIMARY KEY, doc json NULL);
+INSERT jj VALUES (1, N'{"a":[1,2]}'), (2, NULL);
+GO
+SELECT id, doc, JSON_VALUE(doc, '$.a[1]') AS second FROM jj ORDER BY id;
+GO
+INSERT jj VALUES (3, N'{"a":');
+GO
+SELECT CAST(N'[1, 2]' AS json) AS j;
+GO
+SELECT CAST(N'nope' AS json) AS j;
+GO
+DROP TABLE jj;
+```
+
+```text
+(2 rows affected)
+
+id doc         second
+-- ----------- ------
+1  {"a":[1,2]} 2
+2  NULL        NULL
+
+(2 rows affected)
+
+Msg 245, Level 16, State 1, Line 1
+invalid input syntax for type json: "{"a":"
+j
+------
+[1, 2]
+
+(1 row affected)
+
+Msg 245, Level 16, State 1, Line 1
+invalid input syntax for type json: "nope"
 ```
 
 ## See also

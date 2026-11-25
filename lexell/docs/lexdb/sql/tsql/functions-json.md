@@ -99,7 +99,7 @@ JSON_TABLE ( expression , path COLUMNS ( ... ) [ ... ON ERROR ] )
 - **Errors.** The numbers are SQL Server's, the texts shorter. In strict mode the missing member is 13608 with `JSON object does not contain key "zz"`
   (SQL Server: `Property cannot be found on the specified JSON path.`, followed by a second error, 13623 or 13624, `Scalar value cannot be found in the specified JSON
   path` or `Object or array cannot be found ...`; lexdb gives the second as another 13608). Text that is not JSON is 13609 without the position of the
-  character (`Unexpected character 'n' is found at position 0.`), and 245 for a `json` column or `CAST`. A path that is not
+  character (`Unexpected character 'n' is found at position 0.`), and 245 for a `json` column or `CAST` (SQL Server: 13609). A path that is not
   well formed (`'a'` without `$`) is not an error here (SQL Server: 13607); `JSON_PATH_EXISTS` of text that is not JSON is an error here (SQL Server: 0).
   The states of the errors differ from SQL Server's.
 - `JSON_OBJECT('a': 1, 'a': 2)` keeps the last (`{"a":2}`; SQL Server writes both keys). A `NULL` key is a syntax error here (SQL Server: 13638).

@@ -111,7 +111,7 @@ JSON_TABLE ( expression , path COLUMNS ( column_definition [, ...] ) [ { ERROR |
 - **Not supported** (each is ORA-00900 or ORA-00904): the simple dot notation (`d.doc.name`, `d.doc.tags[0]`, `d.doc.score.number()`), `IS JSON STRICT` and `LAX`,
   `JSON_OBJECT(*)`, `FORMAT JSON` in `JSON_ARRAY`, `JSON_ARRAY ( query )`, `PRETTY` in `JSON_QUERY`, `JSON_TRANSFORM`'s `KEEP`, `PREPEND`, `NESTED PATH`, `IGNORE ON`,
   `RETURNING`, `FORMAT JSON` and `JSON(...)` as a value (and its `RENAME`, which sets the value instead of renaming the key), `TREAT(... AS JSON)`, `CAST(... AS JSON)`,
-  a `JSON_TABLE` column list without types (`COLUMNS (a, b)`), `ORDER BY` of `JSON_ARRAYAGG`'s `NULL ON NULL` clause, and `CREATE SEARCH INDEX ... FOR JSON`
+  a `JSON_TABLE` column list without types (`COLUMNS (a, b)`), and `CREATE SEARCH INDEX ... FOR JSON`
   (a function-based index `ON t (JSON_VALUE(doc, '$.name'))` works).
 
 ## Examples

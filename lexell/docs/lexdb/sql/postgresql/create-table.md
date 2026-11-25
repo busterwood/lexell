@@ -155,7 +155,8 @@ table from a query, see [CREATE TABLE AS](create-table-as.md).
   constraints](catalog-constraints.md)).
 - `COLLATE` changes nothing: text compares by bytes.
 - `UNLOGGED` tables are logged, and temporary tables too.
-- Types not in lexdb (`json`, `jsonb`, `xml`, `money`, network and geometric types, ranges, domains) are 42704.
+- Types not in lexdb (`xml`, `money`, network and geometric types, ranges, domains) are 42704. `json` and `jsonb` columns work (example K and
+  [JSON and SQL/JSON](functions-json.md)); `jsonb` columns can be keys and have `btree` indexes, `GIN` indexes are refused.
 
 ## Examples
 
@@ -493,6 +494,35 @@ DETAIL:  Failing row contains (3, bob, null, x).
 ERROR:  constraint "n1" for relation "twice" already exists
 ERROR:  conflicting not-null constraint names "n1" and "n2"
 ERROR:  conflicting not-null constraint names "n1" and "n2"
+```
+
+### K. json and jsonb columns
+
+A `json` column keeps the text as written; a `jsonb` column keeps it in canonical form (keys sorted, the last of a repeated key). Text that is not JSON
+is refused.
+
+<!-- example: postgresql -->
+```sql
+CREATE TABLE events (id int PRIMARY KEY, raw json, doc jsonb NOT NULL DEFAULT '{}');
+INSERT INTO events (id, raw, doc) VALUES (1, '{"b": 1,  "a": [1, 2]}', '{"b": 1,  "a": [1, 2]}');
+INSERT INTO events (id) VALUES (2);
+INSERT INTO events (id, raw) VALUES (3, '{oops');
+SELECT * FROM events ORDER BY id;
+DROP TABLE events;
+```
+
+```text
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+ERROR:  invalid input syntax for type json: "{oops"
+ id |          raw           |          doc
+----+------------------------+-----------------------
+  1 | {"b": 1,  "a": [1, 2]} | {"a": [1, 2], "b": 1}
+  2 |                        | {}
+(2 rows)
+
+DROP TABLE
 ```
 
 ## See also
