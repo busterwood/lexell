@@ -904,6 +904,7 @@ pub fn flatQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt): R
     let g = &s.subs[0]
     var mn = false
     let branches = try branchTexts(st, txn, &g.index, mut &mn)
+    if len(branches) > 1 && !mn { return unionOnly(s, &branches) }
     if len(branches) != 1 || mn { return Ok(None) }
     var bs = try lexdb_parse.oraParseNls(&branches[0], g.names.clone())
     if len(bs) != 1 { return Ok(None) }
@@ -994,6 +995,27 @@ pub fn flatQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt): R
 }
 
 type Expr = lexdb_sql.Expr
+
+// SELECT * FROM GRAPH_TABLE (...) [ORDER BY positions] whose pattern is several joins: their UNION ALL itself (with the ORDER BY).
+fn unionOnly(s: &Stmt, branches: &[]str): Result[Option[Stmt], DbErr] {
+    if len(s.items) != 1 || !s.items[0].star || s.where.isSome() || len(s.group) > 0 || s.having.isSome() || s.distinct ||
+       len(s.wins) > 0 || s.limit.isSome() || s.offset.isSome() || len(s.gsets) > 0 {
+        return Ok(None)
+    }
+    var text = strings.join(branches, " union all ")
+    var ord: []str = []
+    for o in s.order {
+        let k = lexdb_sql.litInt(&o.expr)
+        if k < 1 { return Ok(None) }
+        append(mut &ord, k.toStr() + (if o.desc { " desc" } else { "" }) + (if o.nullsFirst { " nulls first" } else { " nulls last" }))
+    }
+    if len(ord) > 0 { text += " order by " + strings.join(&ord, ", ") }
+    var ss = try lexdb_parse.oraParseNls(&text, s.subs[0].names.clone())
+    if len(ss) != 1 { return Ok(None) }
+    var out = pop(mut &ss)
+    if s.params > out.params { out.params = s.params }
+    return Ok(Some(out))
+}
 
 fn andOf(a: &Option[Expr], b: Option[Expr]): Option[Expr] {
     match a {
