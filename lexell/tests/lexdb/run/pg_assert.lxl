@@ -1,0 +1,518 @@
+// lexdb's PostgreSQL door: the SQL standard's assertions (ISO/IEC 9075-2, 11.47 <assertion definition>; design/lexdb-new-features.md
+// O23 and section 14). PostgreSQL has none, so these answers are lexdb's own, reviewed against the standard and PostgreSQL's
+// conventions for constraints (its constraint characteristics, its error states): CREATE ASSERTION [IF NOT EXISTS] name CHECK
+// (NOT EXISTS (q) | EXISTS (q) | ALL (q) SATISFY (c)) [[NOT] DEFERRABLE] [INITIALLY IMMEDIATE | DEFERRED], DROP ASSERTION [IF
+// EXISTS], SET CONSTRAINTS name | ALL DEFERRED | IMMEDIATE; 23514 `assertion "a" is violated` at the statement, at COMMIT for a
+// deferred one (the transaction rolled back); the refused shapes (0A000), 42601, 42710 / 42P07, 42704, 42809, 2BP01 for DROP TABLE
+// and DROP COLUMN (CASCADE dropping it), 0A000 for a rename of what it reads; information_schema.ASSERTIONS, CHECK_CONSTRAINTS and
+// CONSTRAINT_COLUMN_USAGE (no pg_constraint row). Every write path: INSERT (VALUES, SELECT, ON CONFLICT DO UPDATE / NOTHING),
+// UPDATE, DELETE, MERGE, a procedure's statements, the foreign keys' ON DELETE CASCADE / SET NULL / SET DEFAULT and ON UPDATE
+// CASCADE / SET DEFAULT, TRUNCATE (checked here; Oracle's door does not), ALTER TABLE ... TYPE (its values cast: the whole query),
+// COPY FROM STDIN (text, CSV; ON_ERROR ignore and REJECT_LIMIT, the rows skipped not counted; 1,000 rows: the whole query), and
+// UPDATE / DELETE / COPY with batch_rows (each batch checked before it commits: the batches before a failing one stay). Each line
+// runs in a transaction rolled back after it (each statement under a savepoint: a failing one undone alone; COMMIT begins the next),
+// or, marked "!", statement by statement on their own; once with set lexdb_batch = off and once on: "same" and the answer, or
+// DIFFERENT and both.
+// timeout: 120
+// expect: setup: 36 statements
+// expect: same: error 23514 assertion "sal_pos" is violated / n = 4
+// expect: same: INSERT 0 1 / n = 5
+// expect: same: INSERT 0 1 / n = 5
+// expect: same: INSERT 0 2 / n = 6
+// expect: same: error 23514 assertion "sal_pos" is violated / n = 4
+// expect: same: INSERT 0 200 / n = 204
+// expect: same: error 23514 assertion "sal_pos" is violated / n = 4
+// expect: same: error 23514 assertion "sal_pos" is violated / sal = 30
+// expect: same: error 23514 assertion "in_budget" is violated / id,sal = 1|50;2|30;3|40;4|NULL
+// expect: same: UPDATE 4 / id,sal = 1|60;2|40;3|50;4|NULL
+// expect: same: UPDATE 1 / mgr = 9
+// expect: same: error 23514 assertion "in_budget" is violated / budget = 100
+// expect: same: error 23514 assertion "lead_boss" is violated / n = 2
+// expect: same: error 23514 assertion "has_boss" is violated / n = 2
+// expect: same: error 23514 assertion "lead_boss" is violated / role = boss
+// expect: same: UPDATE 1 / error 23514 assertion "lead_boss" is violated / id,role = 1|boss;2|dev;3|boss;4|boss
+// expect: same: error 23514 assertion "has_boss" is violated / n = 4
+// expect: same: DELETE 1 / n = 3
+// expect: same: DELETE 1 / DELETE 1 / n = 3
+// expect: same: DELETE 2 / error 23514 assertion "any_dept" is violated / n = 1
+// expect: same: error 23514 assertion "sal_pos" is violated / sal = 30
+// expect: same: error 23514 assertion "sal_pos" is violated / n = 4
+// expect: same: MERGE 1 / n = 5
+// expect: same: error 23514 assertion "sal_pos" is violated / sal = 30
+// expect: same: INSERT 0 1 / sal = 9
+// expect: same: INSERT 0 0 / sal = 30
+// expect: same: error 23514 assertion "nn_pos" is violated / n = 2
+// expect: same: INSERT 0 1 / n = 3
+// expect: same: error 23514 assertion "nn_pos" is violated / id,v = 1|5;2|NULL
+// expect: same: error 23514 assertion "tx_key" is violated / n = 1
+// expect: same: INSERT 0 1 / INSERT 0 1 / error 23514 assertion "tx_key" is violated / n = 3
+// expect: same: error 23514 assertion "sal_pos" is violated / n = 4
+// expect: same: CALL / n = 6
+// expect: same: INSERT 0 1 / n = 1 / error 23514 assertion "d1_neg" is violated / n = 0
+// expect: same: INSERT 0 1 / UPDATE 1 / COMMIT / id,v = 2|5 / DELETE 1 / COMMIT / n = 0
+// expect: same: error 23514 assertion "d1_big" is violated / n = 0
+// expect: same: SET CONSTRAINTS / INSERT 0 1 / n = 1 / error 23514 assertion "d1_big" is violated / n = 0
+// expect: same: SET CONSTRAINTS / INSERT 0 1 / error 23514 assertion "d1_big" is violated / n = 1
+// expect: same: SET CONSTRAINTS / error 23514 assertion "d1_neg" is violated / n = 0
+// expect: same: SET CONSTRAINTS / INSERT 0 1 / error 23514 assertion "d1_neg" is violated / SET CONSTRAINTS / INSERT 0 1 / error 23514 assertion "d1_neg" is violated / n = 0
+// expect: same: error 42809 constraint "sal_pos" is not deferrable
+// expect: same: SET CONSTRAINTS / INSERT 0 1 / INSERT 0 1 / error 23514 assertion "d1_big" is violated / n = 2
+// expect: same: INSERT 0 1 / SAVEPOINT / INSERT 0 1 / ROLLBACK / COMMIT / n = 1 / DELETE 1 / COMMIT
+// expect: same: error 23514 assertion "kc_any" is violated / n = 2
+// expect: same: DELETE 1 / n = 1
+// expect: same: error 23514 assertion "kc_4" is violated / pid = 2
+// expect: same: UPDATE 1 / pid = 7
+// expect: same: error 23514 assertion "kn_null" is violated / pid = 5
+// expect: same: error 23514 assertion "kd_1" is violated / pid = 6
+// expect: same: error 23514 assertion "kd_1" is violated / pid = 6
+// expect: same: UPDATE 1 / DELETE 1 / pid = 1
+// expect: same: error 23514 assertion "any_dept" is violated / n = 3
+// expect: same: TRUNCATE TABLE / n = 0
+// expect: same: error 23514 assertion "has_boss" is violated / n = 4
+// expect: same: TRUNCATE TABLE / TRUNCATE TABLE / n = 0
+// expect: same: ALTER TABLE / id,v = 1|5;2|NULL
+// expect: same: CREATE TABLE / INSERT 0 1 / CREATE ASSERTION / error 23514 assertion "x1_pos" is violated / v = 0.4
+// expect: same: ALTER TABLE / n = 4
+// expect: same: error 23514 assertion "sal_pos" is violated / n = 4
+// expect: same: COPY 2 / n = 6
+// expect: same: error 23514 assertion "in_budget" is violated / n = 4
+// expect: same: error 23514 assertion "sal_pos" is violated / n = 4
+// expect: same: COPY 2 / n = 6
+// expect: same: COPY 2 / n = 6
+// expect: same: error 23514 assertion "sal_pos" is violated / n = 4
+// expect: same: COPY 1 / n = 5
+// expect: same: error 23514 assertion "sal_pos" is violated / n = 4
+// expect: same: COPY 2 / n = 4
+// expect: same: error 23503 insert or update on table "kc" violates foreign key constraint "kc_pid_fkey" (Key (pid)=(4) is not present in table "par".) / n = 2
+// expect: same: COPY 1000 / n = 1000
+// expect: same: error 23514 assertion "big_pos" is violated / n = 0
+// expect: same: COPY 50 / error 23514 assertion "big_pos" is violated / n = 50
+// expect: same: COPY 50 / COPY 1000 / n = 1050
+// expect: same: error 23514 assertion "big_pos" is violated | COPY big, line 4 (2 rows committed before) / n = 2 / DELETE 2
+// expect: same: COPY 4 / n = 4 / DELETE 4
+// expect: same: error 23514 assertion "sal_pos" is violated | UPDATE with batch_rows 1: 1 rows committed before the error / id,sal = 1|5;2|30;3|40;4|NULL / UPDATE 1
+// expect: same: UPDATE 4 / id,sal = 1|51;2|31;3|41;4|NULL / UPDATE 4
+// expect: same: error 23514 assertion "any_dept" is violated | DELETE with batch_rows 1: 2 rows committed before the error / n = 1 / INSERT 0 2
+// expect: same: error 23514 assertion "sal_pos" is violated / INSERT 0 1 / DELETE 1
+// expect: same: error 23514 assertion "d1_neg" is violated / SET CONSTRAINTS / error 23514 assertion "d1_neg" is violated / n = 0
+// expect: same: CREATE ASSERTION / DROP ASSERTION / error 42704 assertion "a1" does not exist
+// expect: same: CREATE ASSERTION
+// expect: same: error 42710 assertion "sal_pos" already exists
+// expect: same: error 42P07 relation "emp" already exists
+// expect: same: error 42P07 relation "sal_pos" already exists
+// expect: same: error 42P07 relation "sal_pos" already exists
+// expect: same: error 42P07 relation "sal_pos" already exists
+// expect: same: CREATE ASSERTION / constraint_schema,constraint_name = public|a2 / DROP ASSERTION
+// expect: same: error 3F000 schema "nosuch" does not exist
+// expect: same: CREATE ASSERTION / constraint_name = MixA / DROP ASSERTION
+// expect: same: error 23514 assertion "a1" is violated by some row
+// expect: same: error 23514 assertion "a1" is violated by some row
+// expect: same: CREATE ASSERTION / error 23514 assertion "a1" is violated
+// expect: same: error 42704 assertion "nosuch" does not exist
+// expect: same: DROP ASSERTION
+// expect: same: error 42601 syntax error at or near "cascade"
+// expect: same: error 42601 syntax error at or near "restrict"
+// expect: same: error 0A000 assertion's query is not supported: aggregates, GROUP BY or HAVING
+// expect: same: error 0A000 assertion's query is not supported: aggregates, GROUP BY or HAVING
+// expect: same: error 0A000 assertion's query is not supported: a subquery under OR
+// expect: same: error 0A000 assertion's query is not supported: a condition other than one NOT EXISTS (query), EXISTS (query) or ALL (query) SATISFY (condition) of one SELECT (split it into several assertions)
+// expect: same: error 0A000 assertion's query is not supported: a condition other than one NOT EXISTS (query), EXISTS (query) or ALL (query) SATISFY (condition) of one SELECT (split it into several assertions)
+// expect: same: CREATE ASSERTION / DROP ASSERTION
+// expect: same: error 0A000 assertion's query is not supported: FETCH FIRST, LIMIT, OFFSET or TOP
+// expect: same: error 0A000 assertion's query is not supported: FETCH FIRST, LIMIT, OFFSET or TOP
+// expect: same: error 0A000 assertion's query is not supported: a function whose value the rows do not decide (the time, the user, random values, a sequence)
+// expect: same: error 0A000 assertion's query is not supported: a function whose value the rows do not decide (the time, the user, random values, a sequence)
+// expect: same: error 0A000 assertion's query is not supported: a function whose value the rows do not decide (the time, the user, random values, a sequence)
+// expect: same: error 0A000 assertion's query is not supported: a window function
+// expect: same: error 0A000 assertion's query is not supported: a query without a table (no FROM, or VALUES)
+// expect: same: error 0A000 assertion's query is not supported: a query without a table (no FROM, or VALUES)
+// expect: same: error 0A000 assertion's query is not supported: an equijoin of columns that may be NULL (a.mgr=b.mgr): each column must be NOT NULL, a key's, or kept from NULL by a condition of its own block
+// expect: same: CREATE ASSERTION / DROP ASSERTION
+// expect: same: error 0A000 assertion's query is not supported: JOIN (write the join's condition in WHERE)
+// expect: same: CREATE ASSERTION / DROP ASSERTION
+// expect: same: error 0A000 assertion's query is not supported: a subquery other than [NOT] EXISTS (query) or [NOT] IN (a query of one column)
+// expect: same: error 0A000 assertion's query is not supported: a subquery other than [NOT] EXISTS (query) or [NOT] IN (a query of one column)
+// expect: same: error 0A000 assertion's query is not supported: WITH
+// expect: same: error 0A000 assertion's query is not supported: a view, a function in FROM or a WITH query
+// expect: same: error 0A000 assertion's query is not supported: a view, a function in FROM or a WITH query
+// expect: same: error 42P01 relation "nosuch" does not exist
+// expect: same: error 42703 column "nosuch" does not exist
+// expect: same: error 42703 column "sal" does not exist
+// expect: same: error 0A000 assertion's query is not supported: a condition other than one NOT EXISTS (query), EXISTS (query) or ALL (query) SATISFY (condition) of one SELECT (split it into several assertions)
+// expect: same: error 0A000 assertion's query is not supported: a condition other than one NOT EXISTS (query), EXISTS (query) or ALL (query) SATISFY (condition) of one SELECT (split it into several assertions)
+// expect: same: error 42601 syntax error at or near "not"
+// expect: same: error 42601 syntax error at or near "("
+// expect: same: error 42601 syntax error at or near "check"
+// expect: same: error 42601 constraint declared INITIALLY DEFERRED must be DEFERRABLE
+// expect: same: error 42601 multiple DEFERRABLE/NOT DEFERRABLE clauses not allowed
+// expect: same: error 42601 multiple INITIALLY IMMEDIATE/DEFERRED clauses not allowed
+// expect: same: error 42601 syntax error at or near "later"
+// expect: same: error 42601 syntax error at or near "enable"
+// expect: same: error 42601 syntax error at or near "assertion"
+// expect: same: error 0A000 only ALTER TABLE, ALTER INDEX and ALTER SCHEMA are supported
+// expect: same: CREATE ASSERTION / is_deferrable,initially_deferred = YES|YES
+// expect: same: error 2BP01 cannot drop column sal of table emp because other objects depend on it (assertion sal_pos depends on column sal of table emp)
+// expect: same: ALTER TABLE / constraint_name =  / INSERT 0 1
+// expect: same: error 0A000 cannot rename column sal of table emp because assertion sal_pos reads it
+// expect: same: error 0A000 cannot rename table emp because assertion sal_pos reads it
+// expect: same: ALTER TABLE / ALTER TABLE / ALTER TABLE / n = 4
+// expect: same: error 2BP01 cannot drop table nn because other objects depend on it (assertion nn_pos depends on table nn)
+// expect: same: DROP TABLE / n = 0
+// expect: same: DROP TABLE / constraint_name = sal_pos / INSERT 0 1
+// expect: same: constraint_catalog,constraint_schema,constraint_name,is_deferrable,initially_deferred = lexdb|public|any_dept|NO|NO;lexdb|public|big_pos|NO|NO;lexdb|public|d1_big|YES|NO;lexdb|public|d1_neg|YES|YES;lexdb|public|has_boss|NO|NO;lexdb|public|in_budget|NO|NO;lexdb|public|kc_4|NO|NO;lexdb|public|kc_any|NO|NO;lexdb|public|kd_1|NO|NO;lexdb|public|kn_null|NO|NO;lexdb|public|lead_boss|NO|NO;lexdb|public|nn_pos|NO|NO;lexdb|public|sal_pos|NO|NO;lexdb|public|tx_key|NO|NO
+// expect: same: constraint_schema,constraint_name,check_clause = public|any_dept|(exists (select 1 from dept));public|d1_neg|(not exists (select 1 from d1 where v < 0));public|nn_pos|(all (select v from nn) satisfy (v > 0));public|sal_pos|(not exists (select 1 from emp where sal < 0))
+// expect: same: table_name,column_name = dept|budget;dept|id;emp|dept;emp|sal
+// expect: same: n = 0
+// expect: same: n = 0
+// expect: same: n = 0
+// expect: same: relhastriggers = t / n = 0
+// expect: reopened: error 23514 assertion "sal_pos" is violated / INSERT 0 1 / n = 14
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_parse"
+
+fn setup(): []str {
+    return ["create table dept (id int primary key, name text, budget int)",
+            "create table emp (id int primary key, dept int not null, sal int, mgr int, role text)",
+            "create table proj (id int primary key, dept int not null, lead int not null)",
+            "create table nn (id int primary key, v int)",
+            "create table d1 (id int primary key, v int)",
+            "create table tx (k text primary key, v int)",
+            "create table par (id int primary key)",
+            "create table kc (id int primary key, pid int default 2 references par on delete cascade on update cascade, w int)",
+            "create table kn (id int primary key, pid int references par on delete set null, w int)",
+            "create table kd (id int primary key, pid int default 1 references par on delete set default on update set default, w int)",
+            "create table big (id int primary key, v int)",
+            "create view vtx as select * from tx",
+            "insert into dept values (1, 'Sales', 100), (2, 'Labs', 200), (3, 'Empty', null)",
+            "insert into emp values (1, 1, 50, null, 'boss'), (2, 1, 30, 1, 'dev'), (3, 2, 40, null, 'boss'), (4, 2, null, 3, 'dev')",
+            "insert into proj values (10, 1, 1), (11, 2, 3)",
+            "insert into nn values (1, 5), (2, null)",
+            "insert into tx values ('a', 1)",
+            "insert into par values (1), (2), (3), (5), (6)",
+            "insert into kc values (100, 1, 0), (101, 2, 0)",
+            "insert into kn values (200, 5, 0)",
+            "insert into kd values (300, 6, 0)",
+            "create procedure ins_emp(s int) language sql as $$ insert into emp values (50, 1, 7, null, 'dev'); insert into emp values (51, 1, s, null, 'dev') $$",
+            "create assertion sal_pos check (not exists (select 1 from emp where sal < 0))",
+            "create assertion nn_pos check (all (select v from nn) satisfy (v > 0))",
+            "create assertion lead_boss check (not exists (select 1 from proj p, emp e where p.lead = e.id and e.role = 'dev'))",
+            "create assertion has_boss check (not exists (select 1 from proj p where not exists (select 1 from emp e where e.dept = p.dept and e.role = 'boss')))",
+            "create assertion in_budget check (not exists (select 1 from emp e, dept d where e.dept = d.id and e.sal > d.budget))",
+            "create assertion any_dept check (exists (select 1 from dept))",
+            "create assertion d1_neg check (not exists (select 1 from d1 where v < 0)) deferrable initially deferred",
+            "create assertion d1_big check (not exists (select 1 from d1 where v > 100)) initially immediate deferrable",
+            "create assertion tx_key check (not exists (select 1 from tx where k = 'zz' and v is null))",
+            "create assertion kc_4 check (not exists (select 1 from kc where pid = 4))",
+            "create assertion kc_any check (exists (select 1 from kc where pid = 1))",
+            "create assertion kn_null check (not exists (select 1 from kn where pid is null and w = 0))",
+            "create assertion kd_1 check (not exists (select 1 from kd where pid = 1 and w = 0))",
+            "create assertion big_pos check (not exists (select 1 from big where v < 0))"]
+}
+
+fn lines(): []str {
+    return [// INSERT, UPDATE, DELETE, MERGE
+            "insert into emp values (5, 1, -1, null, 'dev') ;; select count(*) n from emp",
+            "insert into emp values (5, 1, 10, null, 'dev') ;; select count(*) n from emp",
+            "insert into emp values (5, 3, 1000, null, 'dev') ;; select count(*) n from emp",
+            "insert into emp values (5, 1, null, null, 'dev'), (6, 1, 0, null, 'dev') ;; select count(*) n from emp",
+            "insert into emp select 10 + g, 1, 60 - g * 25, null, 'dev' from generate_series(1, 3) g ;; select count(*) n from emp",
+            "insert into emp select 100 + g, 2, g % 7, null, 'dev' from generate_series(1, 200) g ;; select count(*) n from emp",
+            "insert into emp select 100 + g, 2, g % 7 - case when g = 150 then 10 else 0 end, null, 'dev' from generate_series(1, 200) g ;; select count(*) n from emp",
+            "update emp set sal = -5 where id = 2 ;; select sal from emp where id = 2",
+            "update emp set sal = sal + 60 ;; select id, sal from emp order by id",
+            "update emp set sal = sal + 10 ;; select id, sal from emp order by id",
+            "update emp set mgr = 9 where id = 2 ;; select mgr from emp where id = 2",
+            "update dept set budget = 20 where id = 1 ;; select budget from dept where id = 1",
+            "insert into proj values (12, 1, 2) ;; select count(*) n from proj",
+            "insert into proj values (13, 3, 1) ;; select count(*) n from proj",
+            "update emp set role = 'dev' where id = 3 ;; select role from emp where id = 3",
+            "update emp set role = 'boss' where id = 4 ;; update emp set role = 'dev' where id = 3 ;; select id, role from emp order by id",
+            "delete from emp where role = 'boss' ;; select count(*) n from emp",
+            "delete from emp where id = 4 ;; select count(*) n from emp",
+            "delete from proj where id = 11 ;; delete from emp where id = 3 ;; select count(*) n from emp",
+            "delete from dept where id > 1 ;; delete from dept ;; select count(*) n from dept",
+            "merge into emp t using (select 2 id, -3 sal) s on t.id = s.id when matched then update set sal = s.sal ;; select sal from emp where id = 2",
+            "merge into emp t using (select 9 id, -3 sal) s on t.id = s.id when not matched then insert values (s.id, 1, s.sal, null, 'dev') ;; select count(*) n from emp",
+            "merge into emp t using (select 9 id, 3 sal) s on t.id = s.id when not matched then insert values (s.id, 1, s.sal, null, 'dev') ;; select count(*) n from emp",
+            "insert into emp values (2, 1, -1, null, 'dev') on conflict (id) do update set sal = excluded.sal ;; select sal from emp where id = 2",
+            "insert into emp values (2, 1, 9, null, 'dev') on conflict (id) do update set sal = excluded.sal ;; select sal from emp where id = 2",
+            "insert into emp values (2, 1, -1, null, 'dev') on conflict do nothing ;; select sal from emp where id = 2",
+            "insert into nn values (3, -1) ;; select count(*) n from nn",
+            "insert into nn values (3, null) ;; select count(*) n from nn",
+            "update nn set v = v - 5 ;; select id, v from nn order by id",
+            "insert into tx values ('zz', null) ;; select count(*) n from tx",
+            "insert into tx values ('ZZ', null) ;; insert into tx values ('zz', 1) ;; update tx set v = null where k = 'zz' ;; select count(*) n from tx",
+            // a procedure's statements (each checked at its end in the CALL's block)
+            "call ins_emp(-1) ;; select count(*) n from emp",
+            "call ins_emp(8) ;; select count(*) n from emp",
+            // deferred ones, SET CONSTRAINTS, savepoints
+            "insert into d1 values (1, -5) ;; select count(*) n from d1 ;; commit ;; select count(*) n from d1",
+            "insert into d1 values (2, -5) ;; update d1 set v = 5 where id = 2 ;; commit ;; select id, v from d1 ;; delete from d1 ;; commit ;; select count(*) n from d1",
+            "insert into d1 values (3, 200) ;; select count(*) n from d1",
+            "set constraints d1_big deferred ;; insert into d1 values (3, 200) ;; select count(*) n from d1 ;; commit ;; select count(*) n from d1",
+            "set constraints all deferred ;; insert into d1 values (4, 200) ;; set constraints all immediate ;; select count(*) n from d1",
+            "set constraints d1_neg immediate ;; insert into d1 values (5, -1) ;; select count(*) n from d1",
+            "set constraints d1_neg immediate ;; insert into d1 values (5, 1) ;; insert into d1 values (6, -1) ;; set constraints d1_neg deferred ;; insert into d1 values (6, -1) ;; commit ;; select count(*) n from d1",
+            "set constraints sal_pos deferred",
+            "set constraints public.d1_neg, d1_big deferred ;; insert into d1 values (7, 500) ;; insert into d1 values (8, -500) ;; set constraints d1_big immediate ;; select count(*) n from d1",
+            "insert into d1 values (9, 1) ;; savepoint sp1 ;; insert into d1 values (10, -1) ;; rollback to savepoint sp1 ;; commit ;; select count(*) n from d1 ;; delete from d1 ;; commit",
+            // the foreign keys' actions
+            "delete from par where id = 1 ;; select count(*) n from kc",
+            "delete from par where id = 2 ;; select count(*) n from kc",
+            "update par set id = 4 where id = 2 ;; select pid from kc where id = 101",
+            "update par set id = 7 where id = 2 ;; select pid from kc where id = 101",
+            "delete from par where id = 5 ;; select pid from kn",
+            "delete from par where id = 6 ;; select pid from kd",
+            "update par set id = 8 where id = 6 ;; select pid from kd",
+            "update kd set w = 1 ;; delete from par where id = 6 ;; select pid from kd",
+            // TRUNCATE (the whole query: an EXISTS's table, a NOT EXISTS's)
+            "truncate dept ;; select count(*) n from dept",
+            "truncate nn ;; select count(*) n from nn",
+            "truncate emp ;; select count(*) n from emp",
+            "truncate proj ;; truncate emp ;; select count(*) n from emp",
+            // ALTER TABLE: a type change casts the values (the whole query); a column added
+            "alter table nn alter column v type numeric ;; select id, v from nn order by id",
+            "create table x1 (id int primary key, v numeric) ;; insert into x1 values (1, 0.4) ;; create assertion x1_pos check (not exists (select 1 from x1 where v <= 0)) ;; alter table x1 alter column v type int ;; select v from x1",
+            "alter table emp add column z int default 5 ;; select count(*) n from emp where z = 5",
+            // COPY FROM STDIN (data after <<: / ends a line, ~ is a tab)
+            "copy emp from stdin <<20~1~5~\\N~dev/21~1~-5~\\N~dev ;; select count(*) n from emp",
+            "copy emp from stdin <<20~1~5~\\N~dev/21~1~7~\\N~dev ;; select count(*) n from emp",
+            "copy emp from stdin <<20~1~500~\\N~dev ;; select count(*) n from emp",
+            "copy emp from stdin with (format csv) <<20,1,5,,dev/21,1,-7,,dev ;; select count(*) n from emp",
+            "copy emp from stdin with (format csv, header true) <<id,dept,sal,mgr,role/20,1,5,,dev/21,1,7,,dev ;; select count(*) n from emp",
+            "copy emp from stdin (on_error ignore) <<20~1~5~\\N~dev/21~1~x~\\N~dev/22~1~6~\\N~dev ;; select count(*) n from emp",
+            "copy emp from stdin (on_error ignore) <<20~1~5~\\N~dev/21~1~x~\\N~dev/22~1~-6~\\N~dev ;; select count(*) n from emp",
+            "copy emp from stdin (on_error ignore, reject_limit 1) <<20~1~5~\\N~dev/21~1~x~\\N~dev ;; select count(*) n from emp",
+            "copy emp from stdin (on_error ignore, reject_limit 1) <<20~1~-5~\\N~dev/21~1~x~\\N~dev ;; select count(*) n from emp",
+            "copy kc from stdin <<110~1~0/111~3~0 ;; select count(*) n from kc",
+            "copy kc from stdin <<110~4~0 ;; select count(*) n from kc",
+            "copy big 0 1000 0 ;; select count(*) n from big",
+            "copy big 0 1000 999 ;; select count(*) n from big",
+            "copy big 0 50 0 ;; copy big 50 1000 500 ;; select count(*) n from big",
+            "copy big 0 50 0 ;; copy big 50 1000 0 ;; select count(*) n from big",
+            // batch_rows: each batch checked before it commits
+            "! copy big from stdin with (batch_rows 2) <<1~1/2~2/3~-3/4~4 ;; select count(*) n from big ;; delete from big",
+            "! copy big from stdin with (batch_rows 2) <<1~1/2~2/3~3/4~4 ;; select count(*) n from big ;; delete from big",
+            "! update emp set sal = sal - 45 with (batch_rows 1) ;; select id, sal from emp order by id ;; update emp set sal = sal + 45 where id = 1",
+            "! update emp set sal = sal + 1 with (batch_rows 2) ;; select id, sal from emp order by id ;; update emp set sal = sal - 1",
+            "! delete from dept with (batch_rows 1) ;; select count(*) n from dept ;; insert into dept values (1, 'Sales', 100), (2, 'Labs', 200)",
+            "! insert into emp values (60, 1, -1, null, 'dev') ;; insert into emp values (60, 1, 1, null, 'dev') ;; delete from emp where id = 60",
+            "! insert into d1 values (11, -1) ;; set constraints all deferred ;; insert into d1 values (11, -1) ;; select count(*) n from d1",
+            // CREATE, DROP and the names
+            "create assertion a1 check (not exists (select 1 from emp where sal > 1000)) ;; drop assertion a1 ;; drop assertion a1",
+            "create assertion if not exists sal_pos check (not exists (select 1 from emp where sal = 3))",
+            "create assertion sal_pos check (not exists (select 1 from emp where sal = 3))",
+            "create assertion emp check (not exists (select 1 from emp where sal = 3))",
+            "create table sal_pos (x int)",
+            "create view sal_pos as select 1 x",
+            "create sequence sal_pos",
+            "create assertion public.a2 check (not exists (select 1 from emp where sal > 1000)) ;; select constraint_schema, constraint_name from information_schema.assertions where constraint_name = 'a2' ;; drop assertion public.a2",
+            "create assertion nosuch.a2 check (not exists (select 1 from emp where sal > 1000))",
+            "create assertion \"MixA\" check (not exists (select 1 from emp where sal > 1000)) ;; select constraint_name from information_schema.assertions where constraint_name like 'M%' ;; drop assertion \"MixA\"",
+            "create assertion a1 check (not exists (select 1 from emp where sal > 45))",
+            "create assertion a1 check (all (select sal from emp) satisfy (sal < 45))",
+            "create assertion a1 check (all (select sal from emp) satisfy (sal < 1000)) ;; insert into emp values (7, 3, 2000, null, 'boss')",
+            "drop assertion nosuch",
+            "drop assertion if exists nosuch",
+            "drop assertion sal_pos cascade",
+            "drop assertion sal_pos restrict",
+            // the refused shapes (0A000) and the syntax (42601)
+            "create assertion a1 check (not exists (select count(*) from emp having count(*) > 3))",
+            "create assertion a1 check (not exists (select dept from emp group by dept))",
+            "create assertion a1 check (not exists (select 1 from emp where sal < 0) or not exists (select 1 from emp where sal > 1000))",
+            "create assertion a1 check (not exists (select 1 from emp where sal < 0) and not exists (select 1 from emp where sal > 1000))",
+            "create assertion a1 check (not exists (select 1 from emp where sal = 7 union all select 1 from emp where sal = 8))",
+            "create assertion a1 check (not exists (select 1 from emp where sal = 7 order by 1)) ;; drop assertion a1",
+            "create assertion a1 check (not exists (select 1 from emp where sal = 7 limit 1))",
+            "create assertion a1 check (not exists (select 1 from emp where sal = 7 offset 1))",
+            "create assertion a1 check (not exists (select 1 from emp where sal > extract(day from now())))",
+            "create assertion a1 check (not exists (select 1 from emp where sal > random()))",
+            "create assertion a1 check (not exists (select 1 from emp where current_user = 'x'))",
+            "create assertion a1 check (not exists (select row_number() over (order by id) from emp where sal = 7))",
+            "create assertion a1 check (not exists (select 1 where false))",
+            "create assertion a1 check (not exists (select 1 from (values (1)) v (x)))",
+            "create assertion a1 check (not exists (select 1 from emp a, emp b where a.id <> b.id and a.mgr = b.mgr))",
+            "create assertion a1 check (not exists (select 1 from emp a, emp b where a.id <> b.id and a.mgr = b.mgr and a.mgr > 0)) ;; drop assertion a1",
+            "create assertion a1 check (not exists (select 1 from emp a left join emp b on a.id = b.mgr where b.id is null and a.sal = 77))",
+            "create assertion a1 check (not exists (select 1 from emp a where a.sal = 56 and a.id not in (select b.dept from proj b))) ;; drop assertion a1",
+            "create assertion a1 check (not exists (select 1 from emp where sal in (select max(sal) from emp)))",
+            "create assertion a1 check (not exists (select 1 from emp where sal = (select 1)))",
+            "create assertion a1 check (not exists (with w as (select * from emp) select 1 from w where w.sal = 58))",
+            "create assertion a1 check (not exists (select 1 from vtx where v = 59))",
+            "create assertion a1 check (not exists (select 1 from generate_series(1, 3) g where g > 5))",
+            "create assertion a1 check (not exists (select 1 from nosuch))",
+            "create assertion a1 check (not exists (select nosuch from emp))",
+            "create assertion a1 check (all (select sal + 1 from emp) satisfy (sal < 1000))",
+            "create assertion a1 check (1 = 1)",
+            "create assertion a1 check ((select count(*) from emp) < 10)",
+            "create assertion a1 check not exists (select 1 from emp)",
+            "create assertion a1 (not exists (select 1 from emp))",
+            "create assertion check (not exists (select 1 from emp))",
+            "create assertion a1 check (not exists (select 1 from emp where sal = 3)) not deferrable initially deferred",
+            "create assertion a1 check (not exists (select 1 from emp where sal = 3)) deferrable deferrable",
+            "create assertion a1 check (not exists (select 1 from emp where sal = 3)) initially deferred initially immediate",
+            "create assertion a1 check (not exists (select 1 from emp where sal = 3)) initially later",
+            "create assertion a1 check (not exists (select 1 from emp where sal = 3)) enable novalidate",
+            "create or replace assertion a1 check (not exists (select 1 from emp where sal = 3))",
+            "alter assertion sal_pos rename to s2",
+            "create assertion a1 check (not exists (select 1 from emp where sal = 3)) initially deferred ;; select is_deferrable, initially_deferred from information_schema.assertions where constraint_name = 'a1'",
+            // DDL on the tables an assertion reads
+            "alter table emp drop column sal",
+            "alter table emp drop column sal cascade ;; select constraint_name from information_schema.assertions where constraint_name in ('sal_pos', 'in_budget') order by 1 ;; insert into emp values (7, 1, null, 'dev')",
+            "alter table emp rename column sal to s",
+            "alter table emp rename to emp2",
+            "alter table emp drop column mgr ;; alter table emp add column x int ;; alter table emp rename column x to y ;; select count(*) n from emp",
+            "drop table nn",
+            "drop table nn cascade ;; select count(*) n from information_schema.assertions where constraint_name = 'nn_pos'",
+            "drop table dept cascade ;; select constraint_name from information_schema.assertions where constraint_name in ('in_budget', 'any_dept', 'sal_pos') order by 1 ;; insert into emp values (7, 1, 900, null, 'dev')",
+            // the catalog
+            "select constraint_catalog, constraint_schema, constraint_name, is_deferrable, initially_deferred from information_schema.assertions order by 3",
+            "select constraint_schema, constraint_name, check_clause from information_schema.check_constraints where constraint_name in ('sal_pos', 'nn_pos', 'any_dept', 'd1_neg') order by 2",
+            "select table_name, column_name from information_schema.constraint_column_usage where constraint_name = 'in_budget' order by 1, 2",
+            "select count(*) n from information_schema.table_constraints where constraint_name in ('sal_pos', 'in_budget')",
+            "select count(*) n from pg_constraint where conname in ('sal_pos', 'in_budget')",
+            "select count(*) n from pg_class where relname = 'sal_pos'",
+            "select relhastriggers from pg_class where relname = 'emp' ;; select count(*) n from pg_trigger where tgrelid = 'emp'::regclass"]
+}
+
+fn fail(e: &lexdb_base.DbErr): str {
+    return "error " + e.state + " " + e.msg + (if e.detail != "" { " (" + e.detail + ")" } else { "" }) + (if e.context != "" { " | " + e.context } else { "" })
+}
+
+fn rowsOf(r: &lexdb_exec.Res): str {
+    if !r.hasRows { return r.tag.clone() }
+    var out: []str = []
+    for row in r.rows {
+        var vs: []str = []
+        for v in row { append(mut &vs, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+        append(mut &out, strings.join(&vs, "|"))
+    }
+    var names: []str = []
+    for c in r.cols { append(mut &names, c.name.clone()) }
+    return strings.join(&names, ",") + " = " + strings.join(&out, ";")
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) { return rowsOf(&rs[len(rs) - 1]) }
+        Err(e) { return fail(&e) }
+    }
+}
+
+// COPY ... FROM STDIN with data: its tag, or its error.
+fn copyIn(s: mut &lexdb_exec.Session, sql: &str, data: &str): str {
+    match lexdb_parse.parse(sql) {
+        Ok(stmts) {
+            let none: []lexdb_sql.Val = []
+            let nt: []int = []
+            match s.run(&stmts[0], &none, &nt) {
+                Ok(r) {
+                    if r.copy != lexdb_exec.COPY_IN { return "not COPY_IN: " + r.tag }
+                    match s.copyIn(&stmts[0], lexdb_exec.CopyInput{have: true, data: data.clone(), fail: "", proto: false, stream: false, pull: false}) {
+                        Ok(r2) { return r2.tag.clone() }
+                        Err(e) { return fail(&e) }
+                    }
+                }
+                Err(e) { return fail(&e) }
+            }
+        }
+        Err(e) { return fail(&e) }
+    }
+}
+
+// A statement of a line: "copy t from stdin ... <<data", "copy big S N K" (N rows into big after id 1000 + S, row K's value
+// negative; 0 none), or SQL.
+fn one(s: mut &lexdb_exec.Session, x: &str): str {
+    let at = strings.indexOf(x, " <<", 0)
+    if at > 0 {
+        let data = strings.replaceAll(&strings.replaceAll(&x[at + 3..len(x)], "/", "\n"), "~", "\t") + "\n"
+        return copyIn(s, &x[0..at], &data)
+    }
+    if strings.startsWith(x, "copy big ") {
+        let ws = strings.split(x, " ")
+        let s0 = lexdb_base.num(&ws[2])
+        let n = lexdb_base.num(&ws[3])
+        let k = lexdb_base.num(&ws[4])
+        var b = ""
+        for i in 1..n + 1 { b += (1000 + s0 + i).toStr() + "\t" + (if i == k { "-1" } else { (i % 50).toStr() }) + "\n" }
+        return copyIn(s, "copy big from stdin", &b)
+    }
+    return q(s, x)
+}
+
+// A line: in a transaction rolled back after it, each statement under a savepoint (COMMIT begins the next transaction), or with
+// "!" each statement on its own; the answers joined by " / ".
+fn answer(s: mut &lexdb_exec.Session, line: &str): str {
+    let auto = strings.startsWith(line, "! ")
+    let body = if auto { line[2..len(line)].toStr() } else { line.toStr() }
+    let parts = strings.split(&body, " ;; ")
+    var out: []str = []
+    if !auto { let b = q(s, "begin") }
+    for p in parts {
+        if auto {
+            append(mut &out, one(s, &p))
+            continue
+        }
+        if strings.startsWith(&p, "savepoint ") || strings.startsWith(&p, "rollback to ") || strings.startsWith(&p, "release ") {
+            append(mut &out, q(s, &p))
+            continue
+        }
+        if p == "commit" {
+            append(mut &out, q(s, "commit"))
+            let b = q(s, "begin")
+            continue
+        }
+        let sp = q(s, "savepoint lxl_line")
+        let r = one(s, &p)
+        if strings.startsWith(&r, "error ") {
+            let x = q(s, "rollback to savepoint lxl_line")
+        }
+        let y = q(s, "release savepoint lxl_line")
+        append(mut &out, r)
+    }
+    if !auto { let r = q(s, "rollback") }
+    return strings.join(&out, " / ")
+}
+
+fn opts(): lexdb_store.Options { return lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 100000} }
+
+fn main() {
+    let fs = lexdb_disk.sim(311)
+    lexdb_store.run(fs.share(), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+        var n = 0
+        for x in setup() {
+            let r = q(mut &s, &x)
+            if strings.startsWith(&r, "error ") { println("setup: " + x + ": " + r) } else { n += 1 }
+        }
+        println("setup: " + n.toStr() + " statements")
+        for l in lines() {
+            let a = q(mut &s, "set lexdb_batch = off")
+            let off = answer(mut &s, &l)
+            let b = q(mut &s, "set lexdb_batch = on")
+            let on = answer(mut &s, &l)
+            if off == on { println("same: " + on) } else {
+                println("DIFFERENT: " + l)
+                println("  rows:    " + off)
+                println("  batches: " + on)
+            }
+        }
+        s.close()
+        return 0
+    }).unwrap()
+    // reopened: the assertions are in the catalog's rows, checked as before
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st)
+        println("reopened: " + q(mut &s, "insert into emp values (70, 1, -1, null, 'dev')") + " / " + q(mut &s, "insert into emp values (70, 1, 1, null, 'dev')") + " / " +
+                q(mut &s, "select count(*) n from information_schema.assertions"))
+        s.close()
+        return 0
+    }).unwrap()
+}
