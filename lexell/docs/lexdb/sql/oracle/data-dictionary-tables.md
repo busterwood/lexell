@@ -77,8 +77,9 @@ read them, and return no rows).
 `USER_PG_LABELS`, `USER_PG_ELEMENT_LABELS`, `USER_PG_LABEL_PROPERTIES`, `USER_PG_PROP_DEFINITIONS`
 : The labels (`LABEL_NAME`), the labels of each element, the properties of each label (`PROPERTY_NAME`,
   `DATA_TYPE`, `DATA_LENGTH`, `DATA_PRECISION`, `DATA_SCALE`, `DATA_CHAR_LENGTH`, `CHARACTER_SET_NAME`, `COLLATION`,
-  `PROPERTY_ORDER`), and what each property of an element reads: `COLUMN_NAME` for a column, `COLUMN_EXPR` for an
-  expression.
+  `PROPERTY_ORDER`; the `DATA_LENGTH` of a property is the longest of the lengths of the properties of that name in
+  the graph, as in Oracle: example J lists `DEPT`'s `NAME`, a `VARCHAR2(30)`, as 40, the length of `EMP`'s), and what
+  each property of an element reads: `COLUMN_NAME` for a column, `COLUMN_EXPR` for an expression.
 
 `USER_PG_COMMENTS`
 : A row for each graph, `COMMENTS` empty (lexdb does not keep comments).
@@ -109,9 +110,6 @@ All of them have `ALL_` and `DBA_` forms with an `OWNER` column. Example J below
   `INVALID` when a column of one of its tables is changed, until its next use. `USER_PG_ELEMENTS.OBJECT_NAME`,
   `USER_PG_PROP_DEFINITIONS.COLUMN_NAME` and the types in `USER_PG_LABEL_PROPERTIES` are as they were at `CREATE
   PROPERTY GRAPH` (Oracle's follow a rename or `MODIFY`), and `USER_PG_COMMENTS` has no comments.
-- `USER_PG_LABEL_PROPERTIES.DATA_LENGTH` is the length of the property's own column. Oracle gives the properties of
-  one name in a graph the longest of their lengths: in example J it lists `DEPT`'s `NAME` (a `VARCHAR2(30)`) as 40,
-  the length of `EMP`'s `NAME`.
 - `USER_SOURCE` and the other program views are on [their own page](data-dictionary-programs.md).
 - Views Oracle has and lexdb has not (`USER_TAB_PRIVS_MADE`, `USER_TAB_PRIVS_RECD`, `ROLE_TAB_PRIVS`) are
   ORA-00942.
@@ -368,7 +366,7 @@ COLS
 
 VIEWS_IN_DICTIONARY
 -------------------
-                262
+                271
 
 1 row selected.
 ```
@@ -540,7 +538,7 @@ WORKS_IN     WORKS_IN
 LABEL_NAME PROPERTY_NAME DATA_TYPE DATA_LENGTH PROPERTY_ORDER
 ---------- ------------- --------- ----------- --------------
 DEPT       ID            NUMBER             22              1
-DEPT       NAME          VARCHAR2           30              2
+DEPT       NAME          VARCHAR2           40              2
 EMPLOYEE   NAME          VARCHAR2           40              1
 EMPLOYEE   SALARY        NUMBER             22              2
 EMPLOYEE   YEARLY        NUMBER             22              3

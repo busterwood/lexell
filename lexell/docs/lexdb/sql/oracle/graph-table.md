@@ -71,9 +71,9 @@ quantifier:
 *quantifier*
 : The number of edges of a path: `{n}` exactly n, `{m,n}` from m to n, `{,n}` from 0 to n. It follows an edge pattern
   (`-[k IS knows]->{1,3}`) or a bracketed path of edges and vertices (`(-[k]-> (m)){1,2}`). Zero edges is a path from a
-  vertex to itself. A path may use an edge more than once. Only bounded quantifiers exist: `+`, `*` and `{m,}` are
-  ORA-40985 (ORA-40984 in Oracle for `{m,}`), `?` is ORA-49003, `{0}` and `{3,1}` are ORA-40984, and a quantifier
-  after a vertex pattern is ORA-40997.
+  vertex to itself. A path may use an edge more than once. Only bounded quantifiers exist: `+` and `*` are
+  ORA-40985, `?` is ORA-49003, `{m,}`, `{0}` and `{3,1}` are ORA-40984, and a quantifier after a vertex pattern is
+  ORA-40997.
 
 `ONE ROW PER MATCH`
 : The default, and the only form lexdb has: one row for each match.
@@ -103,7 +103,9 @@ quantifier:
   `COUNT(*)` too). `COUNT(e)` without a property is ORA-40956.
 - No subquery inside `GRAPH_TABLE` (ORA-40988), and no column of the query around it (ORA-40996): join the result
   instead (example J).
-- Bind variables work in the conditions and `COLUMNS`, as in any query: `WHERE a.name = :who`.
+- Bind variables work in the conditions and `COLUMNS`, as in any query: `WHERE a.name = :who`. A PL/SQL variable
+  inside `GRAPH_TABLE` is refused when the block compiles, ORA-49028, as in Oracle; pass its value as a bind with
+  `EXECUTE IMMEDIATE ... USING` (example M).
 - `GRAPH_TABLE` is a table reference. It may be joined with tables, used in a subquery, an `IN` list, a `WITH` query
   and a view, and its rows grouped, ordered and filtered as any others. The rows come in no particular order: use
   `ORDER BY`.
@@ -130,11 +132,6 @@ quantifier:
   Oracle's number.
 - A quoted graph name is matched without its case: `GRAPH_TABLE (mixg ...)` reads a graph `"MixG"` (Oracle:
   ORA-42421).
-- A PL/SQL variable in `GRAPH_TABLE` is read as a bind (example L); Oracle refuses it (ORA-49028).
-- `{m,}` is ORA-40985; Oracle gives ORA-40984.
-- A property that only the graph's vertex labels have, read through an edge variable (or one only edge labels have,
-  through a vertex variable), is ORA-49044; Oracle gives ORA-40983. The messages of ORA-40983 and ORA-49044 say
-  `is noRows defined` where Oracle says `is never defined`.
 - The PostgreSQL and SQL Server doors have no `GRAPH_TABLE` (a syntax error, 42601 and Msg 102), as PostgreSQL 19
   and SQL Server 2022 have none.
 
@@ -543,11 +540,13 @@ SELECT * FROM GRAPH_TABLE (nosuch MATCH (a) COLUMNS (a.name AS n));
 SELECT * FROM GRAPH_TABLE (social MATCH (a IS employee) COLUMNS (a.name AS n));
 SELECT * FROM GRAPH_TABLE (social MATCH (a IS person) -[k IS knows]->* (b) COLUMNS (a.name AS n));
 SELECT * FROM GRAPH_TABLE (social MATCH (a IS person) -[k IS knows]->{3,1} (b) COLUMNS (a.name AS n));
+SELECT * FROM GRAPH_TABLE (social MATCH (a IS person) -[k IS knows]->{1,} (b) COLUMNS (a.name AS n));
 SELECT * FROM GRAPH_TABLE (social MATCH (a IS person) -[k IS knows]->{1,2} (b) COLUMNS (a.name AS n, k.since AS s));
 SELECT * FROM GRAPH_TABLE (social MATCH (a IS person) -[k IS knows]->{1,2} (b) WHERE k.since > 2010 COLUMNS (a.name AS n));
 SELECT * FROM GRAPH_TABLE (social MATCH (a IS person) -[k IS knows]-> (b) COLUMNS (a.name AS n, SUM(k.since) AS s));
 SELECT * FROM GRAPH_TABLE (social MATCH (a IS company) COLUMNS (a.nosuch AS s));
 SELECT * FROM GRAPH_TABLE (social MATCH (a IS person) -[w IS works_at]-> (b) COLUMNS (w.since AS s));
+SELECT * FROM GRAPH_TABLE (social MATCH (a IS person) -[w IS works_at]-> (c) COLUMNS (w.city AS c));
 SELECT * FROM GRAPH_TABLE (social MATCH (a IS person) COLUMNS (a.name || '!'));
 SELECT * FROM GRAPH_TABLE (social MATCH (a IS person) COLUMNS (a.name AS n, (SELECT COUNT(*) FROM companies) AS c));
 SELECT COUNT(*) FROM people p, GRAPH_TABLE (social MATCH (a IS person) WHERE a.id = p.id COLUMNS (a.name AS n));
@@ -567,6 +566,9 @@ ERROR:
 ORA-40984: invalid value specified for bounded quantifier in a GRAPH_TABLE operator
 
 ERROR:
+ORA-40984: invalid value specified for bounded quantifier in a GRAPH_TABLE operator
+
+ERROR:
 ORA-40990: invalid reference of group variable K in the COLUMNS clause of a GRAPH_TABLE operator
 
 ERROR:
@@ -576,10 +578,13 @@ ERROR:
 ORA-49011: A group function inside GRAPH_TABLE() must have a group reference.
 
 ERROR:
-ORA-40983: property "NOSUCH" is noRows defined
+ORA-40983: property "NOSUCH" is never defined
 
 ERROR:
-ORA-49044: Property "SINCE" is noRows defined when evaluating the label expression for element variable "W".
+ORA-49044: Property "SINCE" is never defined when evaluating the label expression for element variable "W".
+
+ERROR:
+ORA-40983: property "CITY" is never defined
 
 ERROR:
 ORA-02000: missing AS keyword
@@ -599,8 +604,25 @@ SELECT * FROM GRAPH_TABLE (social MATCH (a) -[e]-> (b) ONE ROW PER VERTEX (v) CO
 SELECT * FROM GRAPH_TABLE (social
   MATCH (a IS person WHERE a.name = 'Ann') -[k IS knows]->{1,2} (b)
   COLUMNS (LISTAGG(k.since, ',') WITHIN GROUP (ORDER BY k.since) AS years));
-SELECT * FROM GRAPH_TABLE (social MATCH (a IS person) -[k IS knows]->{1,} (b) COLUMNS (a.name AS n));
-SELECT * FROM GRAPH_TABLE (social MATCH (a IS person) -[w IS works_at]-> (c) COLUMNS (w.city AS c));
+```
+
+```text
+ERROR:
+ORA-03001: unimplemented feature: lexdb: GRAPH_TABLE's ONE ROW PER VERTEX and ONE ROW PER STEP are not supported (ONE ROW PER MATCH is)
+
+ERROR:
+ORA-03001: unimplemented feature: lexdb: WITHIN GROUP and OVER after an aggregate of GRAPH_TABLE are not supported
+```
+
+Oracle gives ORA-03001 for neither: it returns the rows.
+
+### M. A PL/SQL variable
+
+A PL/SQL variable inside `GRAPH_TABLE` is ORA-49028 when the block compiles. A bind passes the value: dynamic SQL with
+`USING`.
+
+<!-- example: oracle -->
+```sql
 DECLARE
   v_name VARCHAR2(20) := 'Bob';
   n NUMBER;
@@ -610,28 +632,28 @@ BEGIN
   DBMS_OUTPUT.PUT_LINE(v_name || ' knows ' || n);
 END;
 /
+DECLARE
+  v_name VARCHAR2(20) := 'Bob';
+  n NUMBER;
+BEGIN
+  EXECUTE IMMEDIATE 'SELECT COUNT(*) FROM GRAPH_TABLE (social
+    MATCH (a IS person) -[IS knows]- (b IS person) WHERE a.name = :who COLUMNS (b.id AS id))' INTO n USING v_name;
+  DBMS_OUTPUT.PUT_LINE(v_name || ' knows ' || n);
+END;
+/
 ```
 
 ```text
 ERROR:
-ORA-03001: unimplemented feature: lexdb: GRAPH_TABLE's ONE ROW PER VERTEX and ONE ROW PER STEP are not supported (ONE ROW PER MATCH is)
-
-ERROR:
-ORA-03001: unimplemented feature: lexdb: WITHIN GROUP and OVER after an aggregate of GRAPH_TABLE are not supported
-
-ERROR:
-ORA-40985: unsupported quantifier for variable path pattern in a GRAPH_TABLE operator
-
-ERROR:
-ORA-49044: Property "CITY" is noRows defined when evaluating the label expression for element variable "W".
+ORA-06550: line 6, column 67:
+PL/SQL: ORA-49028: The PL/SQL variable "V_NAME" is referenced inside a GRAPH_TABLE operator.
+ORA-06550: line 5, column 3:
+PL/SQL: SQL Statement ignored
 
 Bob knows 2
 
 PL/SQL procedure successfully completed.
 ```
-
-Oracle gives ORA-03001 for none of these: it returns the rows of the first two, ORA-40984 for `{1,}`, ORA-40983
-(`property "CITY" is never defined`) for the fourth, and ORA-49028 for the block.
 
 ## See also
 
