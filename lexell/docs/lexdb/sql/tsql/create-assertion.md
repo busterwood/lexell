@@ -109,8 +109,7 @@ or a table, view or sequence is 2714; `DROP` of none is 3701; a schema that is n
 ## Catalog
 
 `INFORMATION_SCHEMA.ASSERTIONS` lists it, `INFORMATION_SCHEMA.CHECK_CONSTRAINTS` has its row (`CHECK_CLAUSE`, as
-written). `INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE` has no rows for it in this door (the PostgreSQL door's
-`information_schema.constraint_column_usage` has a row per column the assertion reads; see KNOWN-ISSUES.md).
+written), and `INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE` has a row per column the assertion reads.
 `CONSTRAINT_SCHEMA` is `dbo`.
 
 The check runs with the rights of the assertion's owner, as in the Oracle door: a user with `INSERT`, `UPDATE` or
@@ -307,9 +306,11 @@ sal_pos         (NOT EXISTS (SELECT 1 FROM dbo.emp WHERE sal < 0))
 (1 row affected)
 
 TABLE_NAME COLUMN_NAME CONSTRAINT_NAME
----------- ----------- ---------------
+---------- ----------- ------------------
+customers  id          order_has_customer
+orders     customer_id order_has_customer
 
-(0 rows affected)
+(2 rows affected)
 
 objects
 -------

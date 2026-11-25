@@ -473,10 +473,7 @@ differences of its statement.
     `CREATE SCHEMA`, owned by `dbo`), `ROUTINES`, `PARAMETERS`, `CONSTRAINT_COLUMN_USAGE` (a foreign key's own columns),
     `VIEW_TABLE_USAGE` and `VIEW_COLUMN_USAGE`; still missing are `DOMAINS` and `COLUMN_PRIVILEGES` (208), a schema
     made `AUTHORIZATION x` still shows `dbo` as its owner (SQL Server: `x`), the column names are in lower case and the
-    catalog name is `lexdb` (SQL Server: upper case, the database's name), and **an assertion has no row in
-    `CONSTRAINT_COLUMN_USAGE`** in this door (found on main f1e0ddf8, not fixed: the `ASSERTIONS` and `CHECK_CONSTRAINTS`
-    rows are there, and the PostgreSQL door's `constraint_column_usage` still lists the columns an assertion reads;
-    [CREATE ASSERTION](sql/tsql/create-assertion.md), example E, shows it); `sys.database_role_members`, `sys.partitions` and `sys.dm_exec_requests` do
+    catalog name is `lexdb` (SQL Server: upper case, the database's name); `sys.database_role_members`, `sys.partitions` and `sys.dm_exec_requests` do
     not exist (208); `sys.types` gives `decimal` scale 38; every decimal expression is `decimal(38,6)` in
     `sys.columns`. A CHECK's text (`INFORMATION_SCHEMA.CHECK_CONSTRAINTS.CHECK_CLAUSE`,
     `sys.check_constraints.definition`) is SQL Server's form (`([salary]>=(0))`) except a `CAST`, which shows as what
