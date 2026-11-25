@@ -416,8 +416,21 @@ and after (Oracle Free 23.26.3, SQL Server 2022, PostgreSQL 18). Tests: `tns_bug
   Tables, views, columns, indexes, constraints, sequences, PL/SQL units, assertions, graphs, the dictionary views' columns (`"table_name"` is ORA-00904) and GRANT ... ON's
   object (`lexdb_tns.quotedObject`) all follow. `"MixF"(2)`, a call of a quoted name, is read as a call (`primary`; a stored function's
   call from SQL and PL/SQL's %TYPE and %ROWTYPE quote the names they write, `callFunction`, `qn`); the SQL GRAPH_TABLE writes names as the Oracle door reads them
-  (`lexdb_graph.q`); an expression's label upper-cases quoted names too (`"ID"+1`, as Oracle 23.26). Not a format change: the rows are as before; a quoted
-  mixed-case name made in the Oracle door before this keeps its folded key (found by the unquoted name, shown as written).
+  (`lexdb_graph.q`); an expression's label upper-cases quoted names too (`"ID"+1`, as Oracle 23.26). 
+- **Databases made before keep folding.** Exact names are a database's from its making: `lexdb_exec.bootstrap` writes the sequences' tree's
+  number with a leading 0 in a store it makes (a mark that adds no key and no page: a key of its own, in the catalog or the sequences' tree,
+  moved UPDATE by key's instructions by 2 to 18 through the trees' pages), and sets `lexdb_sql.setOraExact` from it at every open (a process
+  serves one store). A store made before has no mark, and its Oracle door folds quoted names as before: `"MixT"`, `mixt` and `MIXT` are the
+  table made as `"MixT"`, `"lowt"` and `LOWT` the one made as `"lowt"` (listed `LOWT`), `"Col"` and `col` its column, `create table "mixt"`
+  ORA-00955; an application that quotes its names goes on working (checked: a store made by main b7c7b37f's binary answers the same through
+  this one, `"MixF"(2)` better). The alternatives were not sound: a migration at open cannot tell a name made quoted in the Oracle door from a
+  T-SQL spelling (`"MixT"` and T-SQL's `MixT` are both the key `mixt` with the spelling `MixT`, and `"lowt"` has none, as `LOWT`); a lookup
+  that tries the folded key when an exact one finds nothing would have to be in every name lookup (relations, columns in the binder and the
+  planner, sequences, indexes, constraints, graphs, assertions, grants), would let `"table_name"` and `"qt"` find `TABLE_NAME` and `QT` where
+  Oracle gives ORA-00904 / ORA-00942, and with an old `mixt` and a new `"mixt"` in one database would make what a spelling finds depend on what
+  is there. So a database has one rule for good: an old one never has an exact key beside a folded one, and a new one never has an old
+  one. An old database moves to exact names only by being loaded into a new one (Data Pump-style export and import); nothing switches it in
+  place. Test `tns_oldnames` (a store made, its mark taken out, opened again).
 - The other doors cannot name an exact key (their lexers fold quoted names): an Oracle table `"qt"` is reached from the Oracle door only; a T-SQL table `Orders` is `ORDERS`
   to the Oracle door (found by `orders` or `"ORDERS"`) and is still shown as `Orders` there (its spelling). An index or constraint name generated from an exact table name
   shows the key's bytes in the PostgreSQL and T-SQL doors.

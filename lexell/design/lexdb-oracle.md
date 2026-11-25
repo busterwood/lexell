@@ -1326,7 +1326,9 @@ whole-query check, the check's plan made each time.
   lower-case column is not its upper-case name (ORA-00904), and so for views, indexes, constraints, sequences, PL/SQL units, assertions, graphs and the dictionary views' columns
   (`"table_name"` is ORA-00904). Its key is the name in lower case with marks after its upper-case letters and at its end (`lexdb_sql.oraQuoted`), which no fold reaches and
   every fold keeps; `lexdb_sql.oraShown` gives the name back. A bare name and a quoted one without a lower-case letter keep their fold, so the other doors find them as before
-  (`T` is `t` in the PostgreSQL door); an exact name cannot be named from the other doors. `"MixF"(2)` is a call. Expression labels are upper case in quotes too (`"ID"+1`).
+  (`T` is `t` in the PostgreSQL door); an exact name cannot be named from the other doors. A database made before keeps folding quoted names
+  (exact names are a database's from its making: the mark is the sequences' tree's number written with a leading 0), so its objects answer to
+  the spellings they were made with (`tns_oldnames`). `"MixF"(2)` is a call. Expression labels are upper case in quotes too (`"ID"+1`).
 - **Nested subprograms** in a stored unit's, a package member's or a block's declarations are compiled in the declaring unit's slots and called with its variables (forward
   declarations, recursion, calls between them); errors in one go to USER_ERRORS at their lines. Not done: overloading, and a call of one from SQL inside the unit (PLS-00231).
 - **DROP TABLE** under a view is done; the view is INVALID, ORA-04063 when read, ORA-00942 in USER_ERRORS, and VALID again once the table is made (Oracle: at its next use).
