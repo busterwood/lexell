@@ -14,7 +14,7 @@ CREATE MATERIALIZED VIEW [ IF NOT EXISTS ] [ schema_name . ] mview_name [ ( colu
     [ REFRESH [ FAST | COMPLETE | FORCE ] [ ON { DEMAND | COMMIT | STATEMENT } ] ]
     [ { ENABLE | DISABLE } QUERY REWRITE ]
     [ { ENABLE | DISABLE } ON QUERY COMPUTATION ]
-    [ WITH ( refresh = 'demand' | 'fast_on_commit' | 'fast_on_statement' | 'complete_on_commit' [, query_rewrite = true | false ] ) ]
+    [ WITH ( refresh = 'demand' | 'fast_on_commit' | 'fast_on_statement' | 'realtime' | 'complete_on_commit' [, query_rewrite = true | false ] ) ]
     AS select_statement
     [ WITH [ NO ] DATA ]
 
@@ -44,6 +44,9 @@ DROP MATERIALIZED VIEW [ IF EXISTS ] [ schema_name . ] mview_name [ ,...n ] [ CA
   `TRUNCATE`.
 - Composable HyperLogLog++ and t-digest sketch aggregates merge associatively in $O(\Delta)$ on appends and re-probe
   affected groups on deletes.
+- Real-time materialized views (`WITH (refresh = 'realtime')` or `ENABLE ON QUERY COMPUTATION`) append signed deltas to
+  a contention-free companion delta tree, merge deltas on read in the reader's MVCC snapshot, and fold into the base
+  tree in the background or on `REFRESH MATERIALIZED VIEW ... FAST`.
 
 ## Examples
 
@@ -112,7 +115,44 @@ dept_id mn  mx  du vp
 (2 rows affected)
 ```
 
-### C. On-demand snapshot materialized view and cleanup
+### C. Real-time materialized view (`refresh = 'realtime'`) and `REFRESH ... FAST`
+
+<!-- example: tsql -->
+```sql
+CREATE MATERIALIZED VIEW dbo.mv_rt
+    WITH (refresh = 'realtime')
+AS SELECT dept_id, COUNT(*) AS cnt, SUM(amount) AS tot FROM dbo.sales GROUP BY dept_id;
+GO
+INSERT dbo.sales VALUES (7, 2, 25);
+GO
+SELECT dept_id, cnt, tot FROM dbo.mv_rt ORDER BY dept_id;
+GO
+REFRESH MATERIALIZED VIEW dbo.mv_rt FAST;
+GO
+SELECT dept_id, cnt, tot FROM dbo.mv_rt ORDER BY dept_id;
+```
+
+```text
+(2 rows affected)
+
+(1 row affected)
+
+dept_id cnt tot
+------- --- ---
+1       4   750
+2       3   225
+
+(2 rows affected)
+
+dept_id cnt tot
+------- --- ---
+1       4   750
+2       3   225
+
+(2 rows affected)
+```
+
+### D. On-demand snapshot materialized view and cleanup
 
 <!-- example: tsql -->
 ```sql
@@ -120,13 +160,13 @@ CREATE MATERIALIZED VIEW dbo.mv_snap
     REFRESH COMPLETE ON DEMAND
 AS SELECT dept_id, SUM(amount) AS tot FROM dbo.sales GROUP BY dept_id;
 GO
-INSERT dbo.sales VALUES (7, 2, 25);
+INSERT dbo.sales VALUES (8, 2, 75);
 GO
 REFRESH MATERIALIZED VIEW dbo.mv_snap;
 GO
 SELECT dept_id, tot FROM dbo.mv_snap ORDER BY dept_id;
 GO
-DROP MATERIALIZED VIEW dbo.mv_stats, dbo.mv_snap;
+DROP MATERIALIZED VIEW dbo.mv_stats, dbo.mv_rt, dbo.mv_snap;
 DROP INDEX ix_v_sales ON dbo.v_sales;
 DROP VIEW dbo.v_sales;
 ```
@@ -139,7 +179,7 @@ DROP VIEW dbo.v_sales;
 dept_id tot
 ------- ---
 1       750
-2       225
+2       300
 
 (2 rows affected)
 ```

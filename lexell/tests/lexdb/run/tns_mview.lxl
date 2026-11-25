@@ -22,6 +22,10 @@
 // expect: same: REWRITE_ENABLED,REFRESH_MODE = 'Y'|'COMMIT'
 // expect: same: DEPT,MN,MX,BX,DU,P50 = 'a'|100|200|58|3|150;'b'|50|50|50|1|50
 // expect: same: DEPT,MN,MX,BX,DU,P50 = 'a'|150|300|370|3|200;'b'|50|50|50|1|50
+// expect: same: DEPT,N,TOT = 'a'|3|650;'b'|1|50
+// expect: dbms_fast_fold: ok
+// expect: same: DEPT,N,TOT = 'a'|3|650;'b'|1|50
+// expect: same: STALENESS = 'FRESH'
 // expect: same: C = 0
 import "task"
 import "net"
@@ -138,7 +142,23 @@ fn client(port: &str) {
             let _s2i = c.run(&("insert into emp values (5, 'a', 300)".toStr()), &[]).unwrap()
             checkBoth(mut &c, &"select dept, mn, mx, bx, du, p50 from mv_stage2 order by dept")
 
+            // Stage 3: Oracle ON DEMAND ENABLE ON QUERY COMPUTATION (real-time merge-on-read + DBMS_MVIEW.REFRESH 'F' fold!)
+            let _s3 = c.run(&("create materialized view mv_oqc refresh fast on demand enable on query computation as select dept, count(*) n, sum(sal) tot from emp group by dept".toStr()), &[]).unwrap()
+            let _s3d = c.run(&("insert into emp values (6, 'a', 100)".toStr()), &[]).unwrap()
+            let _s3d2 = c.run(&("delete from emp where id = 6".toStr()), &[]).unwrap()
+            // Wait: let's insert a net row, verify fresh read BEFORE refresh, then fold with 'F'!
+            let _s3d3 = c.run(&("insert into emp values (7, 'c', 999)".toStr()), &[]).unwrap()
+            let _s3d4 = c.run(&("delete from emp where id = 7".toStr()), &[]).unwrap()
+            checkBoth(mut &c, &"select dept, n, tot from mv_oqc order by dept")
+            match c.run(&("begin dbms_mview.refresh('mv_oqc', 'F'); end;".toStr()), &[]) {
+                Ok(_) { println("dbms_fast_fold: ok") }
+                Err(e) { println("dbms_fast_fold: error " + e.code.toStr() + " " + e.msg) }
+            }
+            checkBoth(mut &c, &"select dept, n, tot from mv_oqc order by dept")
+            checkBoth(mut &c, &"select staleness from user_mviews where mview_name = 'MV_OQC'")
+
             // Cleanup
+            let _s3drop = c.run(&("drop materialized view mv_oqc".toStr()), &[]).unwrap()
             let _s2drop = c.run(&("drop materialized view mv_stage2".toStr()), &[]).unwrap()
             let _7 = c.run(&("drop materialized view mv_demand".toStr()), &[]).unwrap()
             let _8 = c.run(&("drop materialized view mv_fast_commit".toStr()), &[]).unwrap()

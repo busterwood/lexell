@@ -21,6 +21,7 @@ import "strings"
 import "collections"
 import "time"
 import "task"
+import "os"
 import "./lexdb_base"
 import "./lexdb_time"
 import "./lexdb_float"
@@ -244,6 +245,9 @@ fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
         for c in seqRelation(&lexdb_catalog.noSeq()).cols { append(mut &out, OutCol{name: c.name.clone(), oid: c.typ.oid, spell: "", coll: "", scale: -1}) }
         return Ok(out)
     }
+    if strings.startsWith(name, &("#" + MV_OQC_REL)) {
+        return Ok(mvOqcOutCols(name))
+    }
     if strings.startsWith(&name, "#") {
         // a catalog relation (9.80)
         for c in lexdb_pgcat.relCols(&lexdb_sql.catRelName(name)) { append(mut &out, OutCol{name: c.name.clone(), oid: c.oid, spell: "", coll: "", scale: -1}) }
@@ -389,6 +393,11 @@ fn srfRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, args: [
             Some(v) { append(mut &rows, try seqState(st, &lexdb_catalog.decSeq(&v))) }
             None {}
         }
+    } else if strings.startsWith(&sel.srf, &("#" + MV_OQC_REL)) {
+        let key = mvOqcKey(&sel.srf)
+        let lim = Limits{rounds: MAX_RECURSION, steps: MAX_MATCH_STEPS, mem: txn.sql.memMax, deadline: rs.bud.deadline, batch: rs.batch, rules: txn.sql.rules, auto: false, rdel: true}
+        let up = mvUp(st, txn.sql.sess, lim)
+        rows = try lexdb_mview.readMergedRows(st, txn, &key, &up)
     } else {
         rows = try catRows(st, txn, &lexdb_sql.catRelName(&sel.srf), strings.endsWith(&sel.srf, lexdb_sql.TSQL_IS))
     }
@@ -803,6 +812,60 @@ fn statsUp(): lexdb_stats.Up { return lexdb_stats.Up{idxVal: idxVal, inIndex: in
 // The automatic statistics' task (lexdb's master starts it) and one look
 // (lexdb_stats.autoAnalyzer, autoAnalyzeStep), with the executor's hooks.
 pub fn autoAnalyzer(st: lexdb_store.Store): int { return lexdb_stats.autoAnalyzer(st, &statsUp()) }
+
+// Folds all pending entries in every populated OQC/realtime MV's deltaTree into its base B+tree.
+pub fn foldAll(st: &lexdb_store.Store): Result[int, DbErr] {
+    let keys = try lexdb_mview.listFoldable(st)
+    if len(keys) == 0 { return Ok(0) }
+    var total = 0
+    let lim = Limits{rounds: MAX_RECURSION, steps: MAX_MATCH_STEPS, mem: 0, deadline: 0, batch: true, rules: false, auto: false, rdel: true}
+    for key in keys {
+        for attempt in 0..3 {
+            var txn = lexdb_store.begin()
+            let up = mvUp(st, txn.sql.sess, lim)
+            match lexdb_mview.foldDeltas(st, mut &txn, &key, &up) {
+                Ok(n) {
+                    if n == 0 {
+                        st.abort(txn)
+                        break
+                    }
+                    match st.commit(txn) {
+                        Ok(_) { total += n; break }
+                        Err(x) {
+                            if x.state != "40001" { break }
+                        }
+                    }
+                }
+                Err(x) {
+                    st.abort(txn)
+                    if x.state != "40001" { break }
+                }
+            }
+        }
+    }
+    return Ok(total)
+}
+
+fn mvFoldOn(): bool {
+    match os.env("LEXDB_MV_FOLD") {
+        Some(v) { return strings.toLowerAscii(&v) != "off" }
+        None { return true }
+    }
+}
+
+// Background materialized view delta folder coroutine (started alongside autoAnalyzer in lexdb.lxl).
+pub fn mvFolder(st: lexdb_store.Store): int {
+    if st.follower().isSome() || !mvFoldOn() { return 0 }
+    while true {
+        let due = st.memo.get(&lexdb_mview.MV_FOLD_DUE).isSome()
+        if due { st.memo.del(&lexdb_mview.MV_FOLD_DUE) }
+        if task.sleep(if due { 50 } else { 500 }).isErr() { return 0 }
+        if !due && st.memo.get(&lexdb_mview.MV_FOLD_DUE).isNone() { continue }
+        st.memo.del(&lexdb_mview.MV_FOLD_DUE)
+        let _r = foldAll(&st)
+    }
+    return 0
+}
 pub fn autoAnalyzeStep(st: &lexdb_store.Store): Result[int, DbErr] { return lexdb_stats.autoAnalyzeStep(st, &statsUp()) }
 
 // ---- schemas (9.20): a table's catalog key is its name qualified by its
@@ -1436,6 +1499,9 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                     return Err(lexdb_base.errDetail("55000", &("materialized view \"" + lexdb_sql.baseName(&t.name) + "\" has not been populated"),
                                                     "", "Use the REFRESH MATERIALIZED VIEW command."))
                 }
+                if len(t.view) == 0 && lexdb_mview.isOqcMv(&t) {
+                    t = rc(mvOqcRelation(&t))
+                }
             }
             if len(t.view) > 0 {
                 // a view: its query planned as a subquery in FROM (9.82),
@@ -1476,7 +1542,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 }
                 viewSrc = len(subs) + len(views)
                 sp.view = Some(lexdb_plan.ViewSrc{stmt: vs, owner: vowner, rn: t.rn.clone()})  // for the planner's pushdown (optimizer 48.3)
-                if !strings.startsWith(&t.view, SEQ_REL) && len(sc.works) == 0 && selPure(&sp.sel) {
+                if !strings.startsWith(&t.view, SEQ_REL) && !strings.startsWith(&t.view, MV_OQC_REL) && len(sc.works) == 0 && selPure(&sp.sel) {
                     sp.viewKey = t.name.toStr()
                 }
                 append(mut &views, sp)
@@ -16288,6 +16354,42 @@ fn seqForget(st: &lexdb_store.Store, d: &Seq) {
 
 // The mark of a sequence's view (Table.view): then its catalog key.
 const SEQ_REL: str = "\x00seq:"
+const MV_OQC_REL: str = "\x00mvoqc:"
+
+// Virtual relation wrapper for an ON QUERY COMPUTATION / realtime MV: merges mv.tree + mv.deltaTree on read.
+fn mvOqcRelation(t: &Table): Table {
+    var vt = lexdb_catalog.emptyTable(&t.name)
+    vt.tree = -1
+    var specs: []str = []
+    for c in t.cols {
+        if lexdb_catalog.hiddenName(&c.name) { continue }
+        append(mut &vt.cols, c.clone())
+        append(mut &specs, c.name + "\x02" + c.typ.oid.toStr() + "\x02" + c.spell + "\x02" + c.coll)
+    }
+    vt.view = MV_OQC_REL + t.name + "\x01" + strings.join(&specs, "\x03")
+    return vt
+}
+
+fn mvOqcKey(srf: &str): str {
+    let start = 1 + len(MV_OQC_REL)
+    let sep = strings.indexOf(srf, "\x01", start)
+    return if sep < 0 { srf[start..len(srf)].toStr() } else { srf[start..sep].toStr() }
+}
+
+fn mvOqcOutCols(srf: &str): []OutCol {
+    var out: []OutCol = []
+    let sep = strings.indexOf(srf, "\x01", 1 + len(MV_OQC_REL))
+    if sep < 0 || sep + 1 >= len(srf) { return out }
+    let rest = &srf[sep + 1..len(srf)]
+    for part in strings.split(rest, "\x03") {
+        let fs = strings.split(&part, "\x02")
+        if len(fs) >= 4 {
+            append(mut &out, OutCol{name: fs[0].clone(), oid: strings.parseIntOpt(&fs[1]).unwrapOr(lexdb_sql.OID_TEXT),
+                                    spell: fs[2].clone(), coll: fs[3].clone(), scale: -1})
+        }
+    }
+    return out
+}
 
 // A table standing for sequence d in FROM: a view whose query is its row.
 fn seqRelation(d: &Seq): Table {
@@ -20520,8 +20622,8 @@ fn roleStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
 
 // A view's query, parsed to be planned where the view is used.
 fn viewQuery(t: &Table): Result[lexdb_sql.Stmt, DbErr] {
-    if strings.startsWith(&t.view, SEQ_REL) {
-        // a sequence's row: made by the executor, as a catalog relation's
+    if strings.startsWith(&t.view, SEQ_REL) || strings.startsWith(&t.view, MV_OQC_REL) {
+        // a sequence's row or OQC materialized view's merged rows: made by the executor, as a catalog relation's
         var q = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
         q.srf = "#" + t.view
         q.use = lexdb_sql.SUB_FROM
@@ -20865,7 +20967,10 @@ fn createMview(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         append(mut &t.cols, rc)
     }
     t.tree = st.createTree(txn)
+    let useDelta = fastKind != lexdb_mview.FAST_NONE && (opts.onQueryComp || opts.timing == lexdb_sql.MV_REALTIME)
+    let deltaTree = if useDelta { st.createTree(txn) } else { 0 }
     append(mut &t.invalid, lexdb_mview.MV_MARK.toStr())
+    if useDelta { append(mut &t.invalid, lexdb_mview.OQC_MARK.toStr()) }
     if (s.noData || opts.buildDeferred) && s.mdialect == lexdb_sql.MD_PG {
         append(mut &t.invalid, lexdb_mview.UNPOP_MARK.toStr())
     }
@@ -20875,7 +20980,7 @@ fn createMview(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     let meta = lexdb_mview.MvMeta{
         key: key.clone(), query: s.index.clone(), mdialect: s.mdialect, mode: opts.mode, timing: opts.timing,
         rewrite: opts.rewrite, onQueryComp: opts.onQueryComp, populated: false, stale: false, indexedView: false,
-        viewDef: "", fastKind: fastKind, deps: deps, deltaTree: 0, foldedSeq: 0, lastRefresh: 0, lastType: "NA", path: path
+        viewDef: "", fastKind: fastKind, deps: deps, deltaTree: deltaTree, foldedSeq: 0, lastRefresh: 0, lastType: "NA", path: path
     }
     try lexdb_mview.writeMeta(txn, &meta)
     try lexdb_mview.subscribeDeps(st, txn, &meta, &up)
@@ -20925,6 +21030,14 @@ fn refreshMview(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql
         }
         return Err(e("0A000", &("FAST refresh cannot be used for materialized view \"" + lexdb_sql.baseName(&t.name) + "\"")))
     }
+    // When deltaTree is active and FAST/FORCE refresh is requested (non-CONCURRENTLY), fold companion deltaTree in O(delta)!
+    let wantFold = !s.conc && mv.populated && mv.deltaTree > 0 &&
+                   ((opts.hasMode && (opts.mode == lexdb_sql.MV_FAST || opts.mode == lexdb_sql.MV_FORCE)) ||
+                    (!opts.hasMode && (mv.mode == lexdb_sql.MV_FAST || mv.mode == lexdb_sql.MV_FORCE)))
+    if wantFold {
+        let _f = try lexdb_mview.foldDeltas(st, txn, &t.name, &up)
+        return Ok(tagOnly("REFRESH MATERIALIZED VIEW"))
+    }
     // Atomic CoW B+tree swap refresh (also satisfies CONCURRENTLY lock-free!).
     let _ = try lexdb_mview.refreshComplete(st, txn, &t.name, &up)
     return Ok(tagOnly("REFRESH MATERIALIZED VIEW"))
@@ -20935,6 +21048,7 @@ fn dropMviewKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, ca
     let up = mvUp(st, txn.sql.sess, lim)
     match try lexdb_mview.readMeta(st, txn, key) {
         Some(mv) {
+            if mv.deltaTree > 0 { txn.dropTree(mv.deltaTree) }
             try lexdb_mview.unsubscribeDeps(st, txn, &mv, &up)
             lexdb_mview.delMeta(txn, key)
         }
@@ -21033,6 +21147,20 @@ fn alterMview(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     if opts.hasTiming { mv.timing = opts.timing }
     if opts.hasRewrite { mv.rewrite = opts.rewrite }
     if opts.hasOqc { mv.onQueryComp = opts.onQueryComp }
+    let wantDelta = mv.fastKind != lexdb_mview.FAST_NONE && (mv.onQueryComp || mv.timing == lexdb_sql.MV_REALTIME)
+    if wantDelta && mv.deltaTree == 0 {
+        mv.deltaTree = st.createTree(txn)
+        var t = t0
+        lexdb_mview.setOqcMark(mut &t, true)
+        try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(&t)))
+    } else if !wantDelta && mv.deltaTree > 0 {
+        let _f = try lexdb_mview.foldDeltas(st, txn, &mv.key, &up)
+        txn.dropTree(mv.deltaTree)
+        mv.deltaTree = 0
+        var t = t0
+        lexdb_mview.setOqcMark(mut &t, false)
+        try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(&t)))
+    }
     try lexdb_mview.writeMeta(txn, &mv)
     try bumpFor(st, txn, &mv.key)
     return Ok(tagOnly("ALTER MATERIALIZED VIEW"))

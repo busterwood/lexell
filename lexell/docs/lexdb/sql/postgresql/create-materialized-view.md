@@ -51,6 +51,10 @@ DROP MATERIALIZED VIEW [ IF EXISTS ] name [, ...] [ CASCADE | RESTRICT ]
   - `'complete_on_commit'`: atomically rebuilt at `COMMIT` whenever a base table changes.
   - `'force_on_commit'` / `'force_on_statement'`: uses incremental `FAST` maintenance when the query shape is eligible
     and falls back to atomic `COMPLETE` refresh otherwise.
+  - `'realtime'` (or `ENABLE ON QUERY COMPUTATION`): appends signed deltas to a contention-free sharded companion
+    delta tree (avoiding hot-leaf `40001` write-write conflicts across concurrent writers), merges base + deltas on
+    read in the reader's MVCC snapshot, and folds deltas into the base tree automatically in the background (or on
+    `REFRESH MATERIALIZED VIEW name FAST`). Set `LEXDB_MV_FOLD=off` to disable background folding.
 
 `WITH [ NO ] DATA`
 : `WITH DATA` (the default) populates the view immediately. `WITH NO DATA` creates it empty; reading it before the
@@ -179,21 +183,53 @@ DELETE 1
 (3 rows)
 ```
 
-### C. Catalog views and `ALTER` / `DROP`
+### C. Real-time materialized view (`refresh = 'realtime'` / `ON QUERY COMPUTATION`)
+
+<!-- example: postgresql -->
+```sql
+CREATE MATERIALIZED VIEW mv_rt WITH (refresh = 'realtime') AS
+SELECT dept, count(*) AS n, sum(amt) AS total FROM sales GROUP BY dept;
+INSERT INTO sales VALUES (7, 'a', 50, true);
+SELECT * FROM mv_rt ORDER BY dept;
+REFRESH MATERIALIZED VIEW mv_rt FAST;
+SELECT * FROM mv_rt ORDER BY dept;
+```
+
+```text
+SELECT 3
+INSERT 0 1
+ dept | n | total
+------+---+-------
+ a    | 3 |   400
+ b    | 2 |   300
+ c    | 1 |   300
+(3 rows)
+
+REFRESH MATERIALIZED VIEW
+ dept | n | total
+------+---+-------
+ a    | 3 |   400
+ b    | 2 |   300
+ c    | 1 |   300
+(3 rows)
+```
+
+### D. Catalog views and `ALTER` / `DROP`
 
 <!-- example: postgresql -->
 ```sql
 SELECT matviewname, hasindexes, ispopulated FROM pg_matviews ORDER BY matviewname;
 ALTER MATERIALIZED VIEW mv_sales RENAME TO mv_sales_snap;
-DROP MATERIALIZED VIEW mv_sales_snap, mv_live;
+DROP MATERIALIZED VIEW mv_sales_snap, mv_live, mv_rt;
 ```
 
 ```text
  matviewname | hasindexes | ispopulated
 -------------+------------+-------------
  mv_live     | f          | t
+ mv_rt       | f          | t
  mv_sales    | t          | t
-(2 rows)
+(3 rows)
 
 ALTER MATERIALIZED VIEW
 DROP MATERIALIZED VIEW

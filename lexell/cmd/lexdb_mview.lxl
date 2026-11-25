@@ -14,6 +14,7 @@
 //   the delta batch (O(delta)) for single-table filter/project, GROUP BY (COUNT/SUM/AVG), and
 //   multi-table inner equi-joins (bilinear telescoping deltas).
 import "strings"
+import "binary"
 import "task"
 import "collections"
 import "time"
@@ -53,14 +54,24 @@ pub const MV_SKETCH = lexdb_catalog.MV_SKETCH
 // Markers carried in Table.invalid on an MV backing table (zero CATALOG reads on SELECT/DML!).
 pub const MV_MARK = "\x02mv_rel"
 pub const UNPOP_MARK = "\x02mv_unpop"
+pub const OQC_MARK = "\x02mv_oqc"
+pub const MV_FOLD_DUE = "\x02mv_fold_due"
 
 pub fn isMvTable(t: &Table): bool { return lexdb_base.hasStr(&t.invalid, &MV_MARK) }
 pub fn isUnpopPgMv(t: &Table): bool { return lexdb_base.hasStr(&t.invalid, &UNPOP_MARK) }
+pub fn isOqcMv(t: &Table): bool { return lexdb_base.hasStr(&t.invalid, &OQC_MARK) }
 
 pub fn setUnpopMark(t: mut &Table, on: bool) {
     var keep: []str = []
     for x in t.invalid { if x != UNPOP_MARK { append(mut &keep, x.clone()) } }
     if on { append(mut &keep, UNPOP_MARK.toStr()) }
+    t.invalid = keep
+}
+
+pub fn setOqcMark(t: mut &Table, on: bool) {
+    var keep: []str = []
+    for x in t.invalid { if x != OQC_MARK { append(mut &keep, x.clone()) } }
+    if on { append(mut &keep, OQC_MARK.toStr()) }
     t.invalid = keep
 }
 
@@ -1823,9 +1834,638 @@ fn computeMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mv: &MvMet
     return Ok(out)
 }
 
+// ---- Stage 3: Sharded append-only companion deltaTree codec, merge-on-read, and atomic folding
+
+var DELTA_SEQ: once task.Shared[int]
+
+fn deltaSeqShared(): task.Shared[int] {
+    if !DELTA_SEQ.isSet() { DELTA_SEQ.set(task.shared(0)) }
+    return DELTA_SEQ.get().share()
+}
+
+// Strictly monotonic 64-bit sequence number across all sessions and server restarts.
+fn nextDeltaSeq(): int {
+    var out = 0
+    let nowFloor = time.now().unixMicros() * 1024
+    deltaSeqShared().with(fn(cur: mut &int) {
+        let nxt = if cur + 1 > nowFloor { cur + 1 } else { nowFloor }
+        cur = nxt
+        out = nxt
+    })
+    return out
+}
+
+fn addU64BE(b: mut &str, x: int) {
+    b.addByte(byte((x >> 56) & 0xff))
+    b.addByte(byte((x >> 48) & 0xff))
+    b.addByte(byte((x >> 40) & 0xff))
+    b.addByte(byte((x >> 32) & 0xff))
+    b.addByte(byte((x >> 24) & 0xff))
+    b.addByte(byte((x >> 16) & 0xff))
+    b.addByte(byte((x >> 8) & 0xff))
+    b.addByte(byte(x & 0xff))
+}
+
+fn addU32BE(b: mut &str, x: int) {
+    b.addByte(byte((x >> 24) & 0xff))
+    b.addByte(byte((x >> 16) & 0xff))
+    b.addByte(byte((x >> 8) & 0xff))
+    b.addByte(byte(x & 0xff))
+}
+
+// 16-byte big-endian delta key: (seq, shard/session, itemIdx). Never collides across writers!
+fn encDeltaKey(seq: int, sess: int, idx: int): str {
+    var b = ""
+    addU64BE(mut &b, seq)
+    addU32BE(mut &b, sess & 0x7fffffff)
+    addU32BE(mut &b, idx & 0x7fffffff)
+    return b
+}
+
+// Strict upper bound for all delta keys with entrySeq < seq.
+fn encDeltaSeqHi(seq: int): str {
+    var b = ""
+    addU64BE(mut &b, seq)
+    return b
+}
+
+fn addLenStr(b: mut &str, s: &str) {
+    binary.addU32LE(b, len(s))
+    b = b + s
+}
+
+fn readLenStr(s: &str, at: mut &int): str {
+    if at + 4 > len(s) { at = len(s); return "" }
+    let n = binary.readU32LEStr(s, at)
+    at += 4
+    let end = min(at + n, len(s))
+    let out = s[at..end].toStr()
+    at = end
+    return out
+}
+
+fn encValSlice(b: mut &str, vs: &[]Val) {
+    binary.addU32LE(b, len(vs))
+    if len(vs) > 0 {
+        let enc = lexdb_rows.encodeRow(vs)
+        addLenStr(b, &enc)
+    }
+}
+
+fn decValSlice(s: &str, at: mut &int): Result[[]Val, DbErr] {
+    if at + 4 > len(s) { return Ok([]) }
+    let n = binary.readU32LEStr(s, at)
+    at += 4
+    if n == 0 { return Ok([]) }
+    let enc = readLenStr(s, at)
+    let emptyNeed: []bool = []
+    let emptyMiss: []Val = []
+    let emptyLays: []lexdb_rows.FixedLay = []
+    return lexdb_rows.decodeRowNeed(&enc, n, &emptyNeed, &emptyMiss, &emptyLays)
+}
+
+fn encPending(pd: &PendingDelta): str {
+    var b = ""
+    b.addByte(byte(1))
+    var flags = 0
+    if pd.isAgg { flags = flags | 1 }
+    if pd.globalAgg { flags = flags | 2 }
+    if pd.fullRefresh { flags = flags | 4 }
+    if pd.truncate { flags = flags | 8 }
+    b.addByte(byte(flags))
+    binary.addU64LE(mut &b, pd.dCnt)
+    binary.addU64LE(mut &b, pd.dSign)
+    let nItems = len(pd.dNn)
+    binary.addU32LE(mut &b, nItems)
+    addLenStr(mut &b, &pd.gk)
+    encValSlice(mut &b, &pd.gVals)
+    encValSlice(mut &b, &pd.visRow)
+    if pd.isAgg && nItems > 0 {
+        for x in pd.dNn { binary.addU64LE(mut &b, x) }
+        for x in pd.dXor { binary.addU64LE(mut &b, x) }
+        for f in pd.dHasNeg { b.addByte(byte(if f { 1 } else { 0 })) }
+        encValSlice(mut &b, &pd.dSum)
+        encValSlice(mut &b, &pd.dSumSq)
+        encValSlice(mut &b, &pd.dExtAdd)
+        encValSlice(mut &b, &pd.dExtDel)
+        for sk in pd.dSketch { addLenStr(mut &b, &sk) }
+    }
+    return b
+}
+
+fn decPending(mvKey: &str, s: &str): Result[PendingDelta, DbErr] {
+    if len(s) < 22 || int(s[0]) != 1 { return Err(err("XX000", "corrupt materialized view delta entry")) }
+    let flags = int(s[1])
+    let isAgg = (flags & 1) != 0
+    let globalAgg = (flags & 2) != 0
+    let fullRefresh = (flags & 4) != 0
+    let truncate = (flags & 8) != 0
+    let dCnt = binary.readI64LEStr(s, 2)
+    let dSign = binary.readI64LEStr(s, 10)
+    let nItems = binary.readU32LEStr(s, 18)
+    var at = 22
+    let gk = readLenStr(s, mut &at)
+    let gVals = try decValSlice(s, mut &at)
+    let visRow = try decValSlice(s, mut &at)
+    var dNn: []int = []
+    var dXor: []int = []
+    var dHasNeg: []bool = []
+    var dSum: []Val = []
+    var dSumSq: []Val = []
+    var dExtAdd: []Val = []
+    var dExtDel: []Val = []
+    var dSketch: []str = []
+    if isAgg && nItems > 0 {
+        for _ in 0..nItems {
+            append(mut &dNn, binary.readI64LEStr(s, at))
+            at += 8
+        }
+        for _ in 0..nItems {
+            append(mut &dXor, binary.readI64LEStr(s, at))
+            at += 8
+        }
+        for _ in 0..nItems {
+            append(mut &dHasNeg, int(s[at]) != 0)
+            at += 1
+        }
+        dSum = try decValSlice(s, mut &at)
+        dSumSq = try decValSlice(s, mut &at)
+        dExtAdd = try decValSlice(s, mut &at)
+        dExtDel = try decValSlice(s, mut &at)
+        for _ in 0..nItems { append(mut &dSketch, readLenStr(s, mut &at)) }
+    }
+    return Ok(PendingDelta{mark: 0, mvKey: mvKey.toStr(), fullRefresh: fullRefresh, truncate: truncate,
+                           isAgg: isAgg, globalAgg: globalAgg, gk: gk, gVals: gVals, visRow: visRow,
+                           dCnt: dCnt, dNn: dNn, dSum: dSum, dSumSq: dSumSq, dXor: dXor,
+                           dExtAdd: dExtAdd, dExtDel: dExtDel, dHasNeg: dHasNeg, dSketch: dSketch, dSign: dSign})
+}
+
+// Appends collapsed MV deltas to the companion deltaTree (contention-free across concurrent writers!).
+fn appendDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mv: &MvMeta, deltas: &[]PendingDelta): Result[Unit, DbErr] {
+    if mv.deltaTree == 0 || len(deltas) == 0 { return Ok(Unit{}) }
+    let seq = nextDeltaSeq()
+    let sess = txn.sql.sess
+    for i in 0..len(deltas) {
+        let k = encDeltaKey(seq, sess, i)
+        let v = encPending(&deltas[i])
+        try txn.put(mv.deltaTree, &k, &v)
+    }
+    st.memo.put(MV_FOLD_DUE, "1")
+    return Ok(Unit{})
+}
+
+fn anyResetDelta(deltas: &[]PendingDelta): bool {
+    for d in deltas { if d.fullRefresh || d.truncate { return true } }
+    return false
+}
+
+// Coalesces non-aggregate deltas by gk.
+fn coalesceNonAgg(deltas: &[]PendingDelta): []PendingDelta {
+    var coal: []PendingDelta = []
+    var byK: Map[str, int] = newMap()
+    for d in deltas {
+        match byK.get(&d.gk) {
+            Some(i) {
+                coal[i].dSign += d.dSign
+                if d.dSign > 0 { coal[i].visRow = collections.copyOf(&d.visRow) }
+            }
+            None {
+                byK.put(d.gk.clone(), len(coal))
+                append(mut &coal, d.clone())
+            }
+        }
+    }
+    return coal
+}
+
+// Coalesces aggregate deltas by gk.
+fn coalesceAgg(fp: &FastPlan, deltas: &[]PendingDelta): Result[[]PendingDelta, DbErr] {
+    let nItems = len(fp.items)
+    var coal: []PendingDelta = []
+    var byK: Map[str, int] = newMap()
+    for d in deltas {
+        match byK.get(&d.gk) {
+            Some(i) {
+                coal[i].dCnt += d.dCnt
+                for k in 0..nItems {
+                    let ak = fp.items[k].aggKind
+                    coal[i].dNn[k] += d.dNn[k]
+                    coal[i].dSum[k] = try combineSum(&coal[i].dSum[k], &d.dSum[k])
+                    coal[i].dSumSq[k] = try combineSum(&coal[i].dSumSq[k], &d.dSumSq[k])
+                    coal[i].dXor[k] = coal[i].dXor[k] ^ d.dXor[k]
+                    if d.dHasNeg[k] { coal[i].dHasNeg[k] = true }
+                    if ak == AGG_MIN || ak == AGG_MAX {
+                        let isMax = ak == AGG_MAX
+                        coal[i].dExtAdd[k] = try extPick(&coal[i].dExtAdd[k], &d.dExtAdd[k], isMax)
+                        coal[i].dExtDel[k] = try extPick(&coal[i].dExtDel[k], &d.dExtDel[k], isMax)
+                    } else if isHllAgg(ak) && len(d.dSketch[k]) > 0 {
+                        coal[i].dSketch[k] = try lexdb_sketch.hllMergeBytes(&coal[i].dSketch[k], &d.dSketch[k])
+                    } else if isTdAgg(ak) && len(d.dSketch[k]) > 0 {
+                        coal[i].dSketch[k] = try lexdb_sketch.tdMergeBytes(&coal[i].dSketch[k], &d.dSketch[k])
+                    }
+                }
+            }
+            None {
+                byK.put(d.gk.clone(), len(coal))
+                append(mut &coal, d.clone())
+            }
+        }
+    }
+    return Ok(coal)
+}
+
+fn aggDeltaNonZero(d: &PendingDelta, nItems: int): bool {
+    if d.dCnt != 0 { return true }
+    for k in 0..nItems {
+        if d.dNn[k] != 0 || !lexdb_ops.isNull(&d.dSum[k]) || !lexdb_ops.isNull(&d.dSumSq[k]) ||
+           d.dXor[k] != 0 || d.dHasNeg[k] || !lexdb_ops.isNull(&d.dExtAdd[k]) || len(d.dSketch[k]) > 0 {
+            return true
+        }
+    }
+    return false
+}
+
+fn aggNeedsReprobe(fp: &FastPlan, oldOpt: &Option[[]Val], d: &PendingDelta, newCnt: int): Result[bool, DbErr] {
+    if newCnt <= 0 { return Ok(false) }
+    for k in 0..len(fp.items) {
+        let it = &fp.items[k]
+        let ak = it.aggKind
+        if ak == AGG_MIN || ak == AGG_MAX {
+            if d.dHasNeg[k] && !lexdb_ops.isNull(&d.dExtDel[k]) {
+                match oldOpt {
+                    Some(oldRow) {
+                        let oldNn = match oldRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
+                        let newNn = max(oldNn + d.dNn[k], 0)
+                        if oldNn > 0 && newNn > 0 && !lexdb_ops.isNull(&oldRow[it.visCol]) {
+                            let cmp = try lexdb_ops.compare(&d.dExtDel[k], &oldRow[it.visCol])
+                            if (ak == AGG_MIN && cmp <= 0) || (ak == AGG_MAX && cmp >= 0) { return Ok(true) }
+                        }
+                    }
+                    None {}
+                }
+            }
+        } else if isSketchAgg(ak) && d.dHasNeg[k] {
+            return Ok(true)
+        }
+    }
+    return Ok(false)
+}
+
+// Applies one coalesced aggregate delta d onto oldOpt in O(1), producing the updated full backing row.
+fn mergeAggRow(fp: &FastPlan, mvTab: &Table, mv: &MvMeta, oldOpt: &Option[[]Val], d: &PendingDelta, newCnt: int, z: &lexdb_time.Zone): Result[[]Val, DbErr] {
+    let nItems = len(fp.items)
+    var newRow: []Val = []
+    match oldOpt {
+        Some(oldRow) { newRow = collections.copyOf(&oldRow) }
+        None {
+            newRow = array(len(mvTab.cols), Val.Null)
+            newRow[fp.gkCol] = Val.Bytes(d.gk.clone())
+            for k in 0..nItems {
+                if fp.items[k].aggKind == AGG_NONE { newRow[fp.items[k].visCol] = d.visRow[k].clone() }
+            }
+        }
+    }
+    newRow[fp.cntCol] = Val.Int(max(newCnt, 0))
+    for k in 0..nItems {
+        let it = &fp.items[k]
+        let ak = it.aggKind
+        if ak == AGG_NONE { continue }
+        if ak == AGG_COUNT_STAR || ak == AGG_COUNT_EXPR {
+            let oldN = match newRow[it.visCol] { Val.Int(x) { x } else { 0 } }
+            newRow[it.visCol] = Val.Int(max(oldN + d.dNn[k], 0))
+        } else if ak == AGG_SUM {
+            let oldNn = match newRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
+            let newNn = max(oldNn + d.dNn[k], 0)
+            newRow[it.nnCol] = Val.Int(newNn)
+            if newNn == 0 {
+                newRow[it.visCol] = Val.Null
+            } else {
+                let s = try combineSum(&newRow[it.visCol], &d.dSum[k])
+                newRow[it.visCol] = try lexdb_ops.coerceZ(s, &mvTab.cols[it.visCol].typ, z)
+            }
+        } else if ak == AGG_AVG {
+            let oldNn = match newRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
+            let newNn = max(oldNn + d.dNn[k], 0)
+            newRow[it.nnCol] = Val.Int(newNn)
+            if newNn == 0 {
+                newRow[it.sumCol] = Val.Null
+                newRow[it.visCol] = Val.Null
+            } else {
+                let s = try combineSum(&newRow[it.sumCol], &d.dSum[k])
+                newRow[it.sumCol] = try lexdb_ops.coerceZ(s, &mvTab.cols[it.sumCol].typ, z)
+                let av = try avgVal(&newRow[it.sumCol], newNn, &mvTab.cols[it.visCol].typ, mv.mdialect)
+                newRow[it.visCol] = try lexdb_ops.coerceZ(av, &mvTab.cols[it.visCol].typ, z)
+            }
+        } else if isVarAgg(ak) {
+            let oldNn = match newRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
+            let newNn = max(oldNn + d.dNn[k], 0)
+            newRow[it.nnCol] = Val.Int(newNn)
+            if newNn == 0 {
+                newRow[it.sumCol] = Val.Null
+                newRow[it.sumSqCol] = Val.Null
+                newRow[it.visCol] = Val.Null
+            } else {
+                let s = try combineSum(&newRow[it.sumCol], &d.dSum[k])
+                let sq = try combineSum(&newRow[it.sumSqCol], &d.dSumSq[k])
+                newRow[it.sumCol] = try lexdb_ops.coerceZ(s, &mvTab.cols[it.sumCol].typ, z)
+                newRow[it.sumSqCol] = try lexdb_ops.coerceZ(sq, &mvTab.cols[it.sumSqCol].typ, z)
+                let vr = try lexdb_agg.varResult(&varFname(ak), newNn, &newRow[it.sumCol], &newRow[it.sumSqCol])
+                newRow[it.visCol] = try lexdb_ops.coerceZ(vr, &mvTab.cols[it.visCol].typ, z)
+            }
+        } else if ak == AGG_BOOL_AND || ak == AGG_BOOL_OR {
+            let oldNn = match newRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
+            let newNn = max(oldNn + d.dNn[k], 0)
+            newRow[it.nnCol] = Val.Int(newNn)
+            let oldTrue = match newRow[it.sumCol] { Val.Int(x) { x } else { 0 } }
+            let dTrue = match d.dSum[k] { Val.Int(x) { x } else { 0 } }
+            let newTrue = max(oldTrue + dTrue, 0)
+            newRow[it.sumCol] = Val.Int(newTrue)
+            if newNn == 0 {
+                newRow[it.visCol] = Val.Null
+            } else {
+                newRow[it.visCol] = Val.Bool(if ak == AGG_BOOL_AND { newTrue == newNn } else { newTrue > 0 })
+            }
+        } else if ak == AGG_BIT_XOR {
+            let oldNn = match newRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
+            let newNn = max(oldNn + d.dNn[k], 0)
+            newRow[it.nnCol] = Val.Int(newNn)
+            let oldX = match newRow[it.sumCol] { Val.Int(x) { x } else { 0 } }
+            let newX = if newNn == 0 { 0 } else { oldX ^ d.dXor[k] }
+            newRow[it.sumCol] = Val.Int(newX)
+            if newNn == 0 {
+                newRow[it.visCol] = if it.oraDia { Val.Num(Decimal.zero()) } else { Val.Null }
+            } else {
+                newRow[it.visCol] = try lexdb_ops.coerceZ(Val.Int(newX), &mvTab.cols[it.visCol].typ, z)
+            }
+        } else if ak == AGG_MIN || ak == AGG_MAX {
+            let oldNn = match newRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
+            let newNn = max(oldNn + d.dNn[k], 0)
+            newRow[it.nnCol] = Val.Int(newNn)
+            if newNn == 0 {
+                newRow[it.visCol] = Val.Null
+            } else if oldNn == 0 {
+                newRow[it.visCol] = try lexdb_ops.coerceZ(d.dExtAdd[k].clone(), &mvTab.cols[it.visCol].typ, z)
+            } else {
+                let picked = try extPick(&newRow[it.visCol], &d.dExtAdd[k], ak == AGG_MAX)
+                newRow[it.visCol] = try lexdb_ops.coerceZ(picked, &mvTab.cols[it.visCol].typ, z)
+            }
+        } else if isHllAgg(ak) {
+            let skCol = if ak == AGG_HLL { it.sketchCol } else { it.visCol }
+            if newCnt <= 0 {
+                newRow[skCol] = Val.Null
+                if ak == AGG_HLL { newRow[it.visCol] = Val.Int(0) }
+            } else {
+                let oldSk = match &newRow[skCol] { Val.Bytes(b) { b.clone() } else { "" } }
+                let merged = try lexdb_sketch.hllMergeBytes(&oldSk, &d.dSketch[k])
+                newRow[skCol] = if len(merged) == 0 { Val.Null } else { Val.Bytes(merged.clone()) }
+                if ak == AGG_HLL {
+                    newRow[it.visCol] = Val.Int(try lexdb_sketch.hllEstimateBytes(&merged))
+                }
+            }
+        } else if isTdAgg(ak) {
+            let skCol = if ak == AGG_TDIGEST { it.sketchCol } else { it.visCol }
+            if newCnt <= 0 {
+                newRow[skCol] = Val.Null
+                if ak == AGG_TDIGEST { newRow[it.visCol] = Val.Null }
+            } else {
+                let oldSk = match &newRow[skCol] { Val.Bytes(b) { b.clone() } else { "" } }
+                let merged = try lexdb_sketch.tdMergeBytes(&oldSk, &d.dSketch[k])
+                newRow[skCol] = if len(merged) == 0 { Val.Null } else { Val.Bytes(merged.clone()) }
+                if ak == AGG_TDIGEST {
+                    let p = if it.pctDesc { 1.0f - it.pctFrac } else { it.pctFrac }
+                    match try lexdb_sketch.tdQuantileBytes(&merged, p) {
+                        Some(qv) { newRow[it.visCol] = Val.Float(qv) }
+                        None { newRow[it.visCol] = Val.Null }
+                    }
+                }
+            }
+        }
+    }
+    return Ok(newRow)
+}
+
+// ON QUERY COMPUTATION merge-on-read: returns all visible rows of MV key, merging mv.tree with any
+// unfolded entries in mv.deltaTree inside txn's MVCC snapshot (works in read-only txns & replicas!).
+pub fn readMergedRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, up: &Up): Result[[][]Val, DbErr] {
+    let mv = match try readMeta(st, txn, key) {
+        Some(m) { m }
+        None { return Ok([]) }
+    }
+    let mvTab = match try (up.loadTable)(st, txn, key) {
+        Some(t) { t }
+        None { return Ok([]) }
+    }
+    var visCols: []int = []
+    for ci in 0..len(mvTab.cols) {
+        if !lexdb_catalog.hiddenName(&mvTab.cols[ci].name) { append(mut &visCols, ci) }
+    }
+    let project = fn(row: &[]Val): []Val {
+        var v: []Val = withCapacity(len(visCols))
+        for ci in visCols { append(mut &v, row[ci].clone()) }
+        return v
+    }
+
+    // Collect pending delta entries from deltaTree in txn's snapshot.
+    var rawVals: []str = []
+    if mv.deltaTree > 0 && mv.populated {
+        try st.scan(txn, mv.deltaTree, "", "", fn(en: &lexdb_store.Entry): bool {
+            append(mut &rawVals, en.val.clone())
+            return true
+        })
+    }
+
+    let baseRows = try scanAllRows(st, txn, &mvTab)
+    if len(rawVals) == 0 {
+        var out: [][]Val = withCapacity(len(baseRows))
+        for r in baseRows { append(mut &out, project(&r)) }
+        return Ok(out)
+    }
+
+    var deltas: []PendingDelta = withCapacity(len(rawVals))
+    for rv in rawVals { append(mut &deltas, try decPending(&mv.key, &rv)) }
+
+    let fp = try getCachedPlan(st, txn, &mv, &mvTab, up)
+    if fp.kind == FAST_NONE {
+        var out: [][]Val = withCapacity(len(baseRows))
+        for r in baseRows { append(mut &out, project(&r)) }
+        return Ok(out)
+    }
+
+    var rows = baseRows
+    var alive = array(len(rows), true)
+    var rowByGk: Map[str, int] = newMap()
+    for i in 0..len(rows) {
+        match &rows[i][fp.gkCol] {
+            Val.Bytes(gk) { rowByGk.put(gk.clone(), i) }
+            else {}
+        }
+    }
+
+    let z = txn.sql.zone.clone()
+    if !fp.isAgg {
+        let coal = coalesceNonAgg(&deltas)
+        for d in coal {
+            match rowByGk.get(&d.gk) {
+                Some(idx) {
+                    if d.dSign < 0 {
+                        alive[idx] = false
+                    } else if d.dSign >= 0 && len(d.visRow) > 0 {
+                        for k in 0..len(fp.items) { rows[idx][fp.items[k].visCol] = d.visRow[k].clone() }
+                        alive[idx] = true
+                    }
+                }
+                None {
+                    if d.dSign > 0 && len(d.visRow) > 0 {
+                        var nr = array(len(mvTab.cols), Val.Null)
+                        for k in 0..len(fp.items) { nr[fp.items[k].visCol] = d.visRow[k].clone() }
+                        nr[fp.gkCol] = Val.Bytes(d.gk.clone())
+                        rowByGk.put(d.gk.clone(), len(rows))
+                        append(mut &rows, nr)
+                        append(mut &alive, true)
+                    }
+                }
+            }
+        }
+    } else {
+        let coal = try coalesceAgg(&fp, &deltas)
+        let nItems = len(fp.items)
+        var parsedQ: Option[Stmt] = None
+        for d in coal {
+            if !aggDeltaNonZero(&d, nItems) { continue }
+            var oldIdx = -1
+            var oldOpt: Option[[]Val] = None
+            match rowByGk.get(&d.gk) {
+                Some(idx) {
+                    if alive[idx] { oldIdx = idx; oldOpt = Some(collections.copyOf(&rows[idx])) }
+                }
+                None {}
+            }
+            var oldCnt = 0
+            match &oldOpt {
+                Some(orow) { match orow[fp.cntCol] { Val.Int(x) { oldCnt = x } else {} } }
+                None {}
+            }
+            let newCnt = oldCnt + d.dCnt
+            if newCnt <= 0 && !fp.globalAgg {
+                if oldIdx >= 0 { alive[oldIdx] = false }
+                continue
+            }
+            let needReprobe = try aggNeedsReprobe(&fp, &oldOpt, &d, newCnt)
+            var mergedRow: Option[[]Val] = None
+            if needReprobe {
+                if parsedQ.isNone() { parsedQ = Some(try parseQuery(&mv.query, mv.mdialect)) }
+                match &parsedQ {
+                    Some(qq) { mergedRow = try reprobeGroup(st, txn, &mv, &mvTab, &fp, &qq, &d.gVals, &z, up) }
+                    None {}
+                }
+            } else {
+                mergedRow = Some(try mergeAggRow(&fp, &mvTab, &mv, &oldOpt, &d, newCnt, &z))
+            }
+            match mergedRow {
+                Some(nr) {
+                    if oldIdx >= 0 {
+                        rows[oldIdx] = nr
+                        alive[oldIdx] = true
+                    } else {
+                        rowByGk.put(d.gk.clone(), len(rows))
+                        append(mut &rows, nr)
+                        append(mut &alive, true)
+                    }
+                }
+                None {
+                    if oldIdx >= 0 { alive[oldIdx] = false }
+                }
+            }
+        }
+    }
+
+    var out: [][]Val = []
+    for i in 0..len(rows) {
+        if alive[i] { append(mut &out, project(&rows[i])) }
+    }
+    return Ok(out)
+}
+
+// Atomically folds all entries in mv.deltaTree with seq < cutoff into mv.tree and deletes them.
+// Concurrent writers mint seq > cutoff and write strictly outside the scanned range -> zero conflicts!
+pub fn foldDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, up: &Up): Result[int, DbErr] {
+    var mv = match try readMeta(st, txn, key) {
+        Some(m) { m }
+        None { return Ok(0) }
+    }
+    if mv.deltaTree == 0 || !mv.populated { return Ok(0) }
+    let cutoff = nextDeltaSeq()
+    let hiKey = encDeltaSeqHi(cutoff)
+    var delKeys: []str = []
+    var rawVals: []str = []
+    try st.scan(txn, mv.deltaTree, "", &hiKey, fn(en: &lexdb_store.Entry): bool {
+        append(mut &delKeys, en.key.clone())
+        append(mut &rawVals, en.val.clone())
+        return len(delKeys) < 50000
+    })
+    if len(delKeys) == 0 { return Ok(0) }
+    var pds: []PendingDelta = withCapacity(len(rawVals))
+    for rv in rawVals { append(mut &pds, try decPending(&mv.key, &rv)) }
+    try applyMvDeltasEx(st, txn, &mv.key, &pds, up, false)
+    for ek in delKeys { txn.del(mv.deltaTree, &ek) }
+    mv.foldedSeq = cutoff
+    mv.stale = false
+    mv.lastRefresh = time.now().unixMicros()
+    mv.lastType = "FAST"
+    try writeMeta(txn, &mv)
+    return Ok(len(delKeys))
+}
+
+// Returns keys of all populated MVs that currently have at least one pending entry in deltaTree.
+pub fn listFoldable(st: &lexdb_store.Store): Result[[]str, DbErr] {
+    var txn = lexdb_store.begin()
+    var mvs: []MvMeta = []
+    match st.scan(mut &txn, lexdb_catalog.CATALOG, MV_PRE, MV_END, fn(en: &lexdb_store.Entry): bool {
+        let m = decMeta(&en.val)
+        if m.deltaTree > 0 && m.populated { append(mut &mvs, m) }
+        return true
+    }) {
+        Ok(_) {}
+        Err(x) { st.abort(txn); return Err(x) }
+    }
+    var due: []str = []
+    for m in mvs {
+        var any = false
+        match st.scan(mut &txn, m.deltaTree, "", "", fn(_: &lexdb_store.Entry): bool {
+            any = true
+            return false
+        }) {
+            Ok(_) {}
+            Err(x) { st.abort(txn); return Err(x) }
+        }
+        if any { append(mut &due, m.key.clone()) }
+    }
+    st.abort(txn)
+    return Ok(due)
+}
+
+// Returns the current number of unfolded entries in mv.deltaTree (useful for diagnostics/tests).
+pub fn pendingDeltaCount(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str): Result[int, DbErr] {
+    let mv = match try readMeta(st, txn, key) {
+        Some(m) { m }
+        None { return Ok(0) }
+    }
+    if mv.deltaTree == 0 { return Ok(0) }
+    var n = 0
+    try st.scan(txn, mv.deltaTree, "", "", fn(_: &lexdb_store.Entry): bool {
+        n += 1
+        return true
+    })
+    return Ok(n)
+}
+
 // ---- Applying collapsed MV deltas to the MV's backing B+tree
 
 fn applyMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: &str, deltas: &[]PendingDelta, up: &Up): Result[Unit, DbErr] {
+    return applyMvDeltasEx(st, txn, mvKeyStr, deltas, up, true)
+}
+
+fn applyMvDeltasEx(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: &str, deltas: &[]PendingDelta, up: &Up, writeCat: bool): Result[Unit, DbErr] {
     if len(deltas) == 0 { return Ok(Unit{}) }
     let mvOpt = try readMeta(st, txn, mvKeyStr)
     let mv0 = match mvOpt { Some(m) { m } None { return Ok(Unit{}) } }
@@ -1869,20 +2509,7 @@ fn applyMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: &s
 
     // Coalesce deltas by gk (ClickHouse-style collapsing across statements in a transaction!).
     if !fp.isAgg {
-        var coal: []PendingDelta = []
-        var byK: Map[str, int] = newMap()
-        for d in deltas {
-            match byK.get(&d.gk) {
-                Some(i) {
-                    coal[i].dSign += d.dSign
-                    if d.dSign > 0 { coal[i].visRow = collections.copyOf(&d.visRow) }
-                }
-                None {
-                    byK.put(d.gk.clone(), len(coal))
-                    append(mut &coal, d.clone())
-                }
-            }
-        }
+        let coal = coalesceNonAgg(deltas)
         for d in coal {
             // Build lookup key for MV_GK (encoded Bytes column).
             var pkKey = ""
@@ -1914,60 +2541,22 @@ fn applyMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: &s
     } else {
         // Coalesce aggregate deltas by gk.
         let nItems = len(fp.items)
-        var coal: []PendingDelta = []
-        var byK: Map[str, int] = newMap()
-        for d in deltas {
-            match byK.get(&d.gk) {
-                Some(i) {
-                    coal[i].dCnt += d.dCnt
-                    for k in 0..nItems {
-                        let ak = fp.items[k].aggKind
-                        coal[i].dNn[k] += d.dNn[k]
-                        coal[i].dSum[k] = try combineSum(&coal[i].dSum[k], &d.dSum[k])
-                        coal[i].dSumSq[k] = try combineSum(&coal[i].dSumSq[k], &d.dSumSq[k])
-                        coal[i].dXor[k] = coal[i].dXor[k] ^ d.dXor[k]
-                        if d.dHasNeg[k] { coal[i].dHasNeg[k] = true }
-                        if ak == AGG_MIN || ak == AGG_MAX {
-                            let isMax = ak == AGG_MAX
-                            coal[i].dExtAdd[k] = try extPick(&coal[i].dExtAdd[k], &d.dExtAdd[k], isMax)
-                            coal[i].dExtDel[k] = try extPick(&coal[i].dExtDel[k], &d.dExtDel[k], isMax)
-                        } else if isHllAgg(ak) && len(d.dSketch[k]) > 0 {
-                            coal[i].dSketch[k] = try lexdb_sketch.hllMergeBytes(&coal[i].dSketch[k], &d.dSketch[k])
-                        } else if isTdAgg(ak) && len(d.dSketch[k]) > 0 {
-                            coal[i].dSketch[k] = try lexdb_sketch.tdMergeBytes(&coal[i].dSketch[k], &d.dSketch[k])
-                        }
-                    }
-                }
-                None {
-                    byK.put(d.gk.clone(), len(coal))
-                    append(mut &coal, d.clone())
-                }
-            }
-        }
+        let coal = try coalesceAgg(&fp, deltas)
         var parsedQ: Option[Stmt] = None
         for d in coal {
-            // Skip pure no-op delta.
-            var anyNonZero = d.dCnt != 0
-            for k in 0..nItems {
-                if d.dNn[k] != 0 || !lexdb_ops.isNull(&d.dSum[k]) || !lexdb_ops.isNull(&d.dSumSq[k]) ||
-                   d.dXor[k] != 0 || d.dHasNeg[k] || !lexdb_ops.isNull(&d.dExtAdd[k]) || len(d.dSketch[k]) > 0 {
-                    anyNonZero = true
-                }
-            }
-            if !anyNonZero { continue }
+            if !aggDeltaNonZero(&d, nItems) { continue }
 
             var pkKey = ""
             lexdb_access.encKeyCol(mut &pkKey, &mvTab.cols[fp.gkCol], &Val.Bytes(d.gk.clone()))
             let oldOpt = try lexdb_access.getRow(st, txn, &rel, &rr, &pkKey)
 
             var oldCnt = 0
-            match oldOpt {
+            match &oldOpt {
                 Some(oldRow) { match oldRow[fp.cntCol] { Val.Int(x) { oldCnt = x } else {} } }
                 None {}
             }
             let newCnt = oldCnt + d.dCnt
             if newCnt <= 0 && !fp.globalAgg {
-                // Group became empty: delete group row!
                 match oldOpt {
                     Some(oldRow) { try lexdb_access.deleteRow(st, txn, &rel, &oldRow, predFn, exprFn, noWrote) }
                     None {}
@@ -1975,32 +2564,7 @@ fn applyMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: &s
                 continue
             }
 
-            // Check whether any MIN/MAX extremum deletion or sketch -1 delta needs a targeted single-group re-probe.
-            var needReprobe = false
-            if newCnt > 0 {
-                for k in 0..nItems {
-                    let it = &fp.items[k]
-                    let ak = it.aggKind
-                    if ak == AGG_MIN || ak == AGG_MAX {
-                        if d.dHasNeg[k] && !lexdb_ops.isNull(&d.dExtDel[k]) {
-                            match oldOpt {
-                                Some(oldRow) {
-                                    let oldNn = match oldRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
-                                    let newNn = max(oldNn + d.dNn[k], 0)
-                                    if oldNn > 0 && newNn > 0 && !lexdb_ops.isNull(&oldRow[it.visCol]) {
-                                        let cmp = try lexdb_ops.compare(&d.dExtDel[k], &oldRow[it.visCol])
-                                        if (ak == AGG_MIN && cmp <= 0) || (ak == AGG_MAX && cmp >= 0) { needReprobe = true }
-                                    }
-                                }
-                                None {}
-                            }
-                        }
-                    } else if isSketchAgg(ak) && d.dHasNeg[k] {
-                        needReprobe = true
-                    }
-                }
-            }
-
+            let needReprobe = try aggNeedsReprobe(&fp, &oldOpt, &d, newCnt)
             if needReprobe {
                 if parsedQ.isNone() { parsedQ = Some(try parseQuery(&mv.query, mv.mdialect)) }
                 var reprobed: Option[[]Val] = None
@@ -2031,136 +2595,7 @@ fn applyMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: &s
                 continue
             }
 
-            // Build updated group row in pure O(1) per aggregate!
-            var newRow: []Val = []
-            match oldOpt {
-                Some(oldRow) { newRow = collections.copyOf(&oldRow) }
-                None {
-                    newRow = array(len(mvTab.cols), Val.Null)
-                    newRow[fp.gkCol] = Val.Bytes(d.gk.clone())
-                    for k in 0..nItems {
-                        if fp.items[k].aggKind == AGG_NONE { newRow[fp.items[k].visCol] = d.visRow[k].clone() }
-                    }
-                }
-            }
-            newRow[fp.cntCol] = Val.Int(max(newCnt, 0))
-
-            for k in 0..nItems {
-                let it = &fp.items[k]
-                let ak = it.aggKind
-                if ak == AGG_NONE { continue }
-                if ak == AGG_COUNT_STAR || ak == AGG_COUNT_EXPR {
-                    let oldN = match newRow[it.visCol] { Val.Int(x) { x } else { 0 } }
-                    newRow[it.visCol] = Val.Int(max(oldN + d.dNn[k], 0))
-                } else if ak == AGG_SUM {
-                    let oldNn = match newRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
-                    let newNn = max(oldNn + d.dNn[k], 0)
-                    newRow[it.nnCol] = Val.Int(newNn)
-                    if newNn == 0 {
-                        newRow[it.visCol] = Val.Null
-                    } else {
-                        let s = try combineSum(&newRow[it.visCol], &d.dSum[k])
-                        newRow[it.visCol] = try lexdb_ops.coerceZ(s, &mvTab.cols[it.visCol].typ, &z)
-                    }
-                } else if ak == AGG_AVG {
-                    let oldNn = match newRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
-                    let newNn = max(oldNn + d.dNn[k], 0)
-                    newRow[it.nnCol] = Val.Int(newNn)
-                    if newNn == 0 {
-                        newRow[it.sumCol] = Val.Null
-                        newRow[it.visCol] = Val.Null
-                    } else {
-                        let s = try combineSum(&newRow[it.sumCol], &d.dSum[k])
-                        newRow[it.sumCol] = try lexdb_ops.coerceZ(s, &mvTab.cols[it.sumCol].typ, &z)
-                        let av = try avgVal(&newRow[it.sumCol], newNn, &mvTab.cols[it.visCol].typ, mv.mdialect)
-                        newRow[it.visCol] = try lexdb_ops.coerceZ(av, &mvTab.cols[it.visCol].typ, &z)
-                    }
-                } else if isVarAgg(ak) {
-                    let oldNn = match newRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
-                    let newNn = max(oldNn + d.dNn[k], 0)
-                    newRow[it.nnCol] = Val.Int(newNn)
-                    if newNn == 0 {
-                        newRow[it.sumCol] = Val.Null
-                        newRow[it.sumSqCol] = Val.Null
-                        newRow[it.visCol] = Val.Null
-                    } else {
-                        let s = try combineSum(&newRow[it.sumCol], &d.dSum[k])
-                        let sq = try combineSum(&newRow[it.sumSqCol], &d.dSumSq[k])
-                        newRow[it.sumCol] = try lexdb_ops.coerceZ(s, &mvTab.cols[it.sumCol].typ, &z)
-                        newRow[it.sumSqCol] = try lexdb_ops.coerceZ(sq, &mvTab.cols[it.sumSqCol].typ, &z)
-                        let vr = try lexdb_agg.varResult(&varFname(ak), newNn, &newRow[it.sumCol], &newRow[it.sumSqCol])
-                        newRow[it.visCol] = try lexdb_ops.coerceZ(vr, &mvTab.cols[it.visCol].typ, &z)
-                    }
-                } else if ak == AGG_BOOL_AND || ak == AGG_BOOL_OR {
-                    let oldNn = match newRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
-                    let newNn = max(oldNn + d.dNn[k], 0)
-                    newRow[it.nnCol] = Val.Int(newNn)
-                    let oldTrue = match newRow[it.sumCol] { Val.Int(x) { x } else { 0 } }
-                    let dTrue = match d.dSum[k] { Val.Int(x) { x } else { 0 } }
-                    let newTrue = max(oldTrue + dTrue, 0)
-                    newRow[it.sumCol] = Val.Int(newTrue)
-                    if newNn == 0 {
-                        newRow[it.visCol] = Val.Null
-                    } else {
-                        newRow[it.visCol] = Val.Bool(if ak == AGG_BOOL_AND { newTrue == newNn } else { newTrue > 0 })
-                    }
-                } else if ak == AGG_BIT_XOR {
-                    let oldNn = match newRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
-                    let newNn = max(oldNn + d.dNn[k], 0)
-                    newRow[it.nnCol] = Val.Int(newNn)
-                    let oldX = match newRow[it.sumCol] { Val.Int(x) { x } else { 0 } }
-                    let newX = if newNn == 0 { 0 } else { oldX ^ d.dXor[k] }
-                    newRow[it.sumCol] = Val.Int(newX)
-                    if newNn == 0 {
-                        newRow[it.visCol] = if it.oraDia { Val.Num(Decimal.zero()) } else { Val.Null }
-                    } else {
-                        newRow[it.visCol] = try lexdb_ops.coerceZ(Val.Int(newX), &mvTab.cols[it.visCol].typ, &z)
-                    }
-                } else if ak == AGG_MIN || ak == AGG_MAX {
-                    let oldNn = match newRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
-                    let newNn = max(oldNn + d.dNn[k], 0)
-                    newRow[it.nnCol] = Val.Int(newNn)
-                    if newNn == 0 {
-                        newRow[it.visCol] = Val.Null
-                    } else if oldNn == 0 {
-                        newRow[it.visCol] = try lexdb_ops.coerceZ(d.dExtAdd[k].clone(), &mvTab.cols[it.visCol].typ, &z)
-                    } else {
-                        let picked = try extPick(&newRow[it.visCol], &d.dExtAdd[k], ak == AGG_MAX)
-                        newRow[it.visCol] = try lexdb_ops.coerceZ(picked, &mvTab.cols[it.visCol].typ, &z)
-                    }
-                } else if isHllAgg(ak) {
-                    let skCol = if ak == AGG_HLL { it.sketchCol } else { it.visCol }
-                    if newCnt <= 0 {
-                        newRow[skCol] = Val.Null
-                        if ak == AGG_HLL { newRow[it.visCol] = Val.Int(0) }
-                    } else {
-                        let oldSk = match &newRow[skCol] { Val.Bytes(b) { b.clone() } else { "" } }
-                        let merged = try lexdb_sketch.hllMergeBytes(&oldSk, &d.dSketch[k])
-                        newRow[skCol] = if len(merged) == 0 { Val.Null } else { Val.Bytes(merged.clone()) }
-                        if ak == AGG_HLL {
-                            newRow[it.visCol] = Val.Int(try lexdb_sketch.hllEstimateBytes(&merged))
-                        }
-                    }
-                } else if isTdAgg(ak) {
-                    let skCol = if ak == AGG_TDIGEST { it.sketchCol } else { it.visCol }
-                    if newCnt <= 0 {
-                        newRow[skCol] = Val.Null
-                        if ak == AGG_TDIGEST { newRow[it.visCol] = Val.Null }
-                    } else {
-                        let oldSk = match &newRow[skCol] { Val.Bytes(b) { b.clone() } else { "" } }
-                        let merged = try lexdb_sketch.tdMergeBytes(&oldSk, &d.dSketch[k])
-                        newRow[skCol] = if len(merged) == 0 { Val.Null } else { Val.Bytes(merged.clone()) }
-                        if ak == AGG_TDIGEST {
-                            let p = if it.pctDesc { 1.0f - it.pctFrac } else { it.pctFrac }
-                            match try lexdb_sketch.tdQuantileBytes(&merged, p) {
-                                Some(qv) { newRow[it.visCol] = Val.Float(qv) }
-                                None { newRow[it.visCol] = Val.Null }
-                            }
-                        }
-                    }
-                }
-            }
-
+            let newRow = try mergeAggRow(&fp, &mvTab, &mv, &oldOpt, &d, newCnt, &z)
             match oldOpt {
                 Some(oldRow) {
                     let c = try lexdb_access.updateRow(st, txn, &rel, &oldRow, &newRow, predFn, exprFn, noWrote)
@@ -2174,10 +2609,12 @@ fn applyMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: &s
         }
     }
 
-    mv.stale = false
-    mv.lastRefresh = time.now().unixMicros()
-    mv.lastType = "FAST"
-    try writeMeta(txn, &mv)
+    if writeCat {
+        mv.stale = false
+        mv.lastRefresh = time.now().unixMicros()
+        mv.lastType = "FAST"
+        try writeMeta(txn, &mv)
+    }
     return Ok(Unit{})
 }
 
@@ -2212,7 +2649,7 @@ pub fn stmtEnd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ok: bool, up: 
         var mv = match mvOpt { Some(m) { m } None { continue } }
         if !mv.populated { continue }
 
-        if mv.timing == MV_DEMAND {
+        if mv.timing == MV_DEMAND && mv.deltaTree == 0 {
             if !mv.stale {
                 mv.stale = true
                 try writeMeta(txn, &mv)
@@ -2226,6 +2663,22 @@ pub fn stmtEnd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ok: bool, up: 
         }
         let pd = try computeMvDeltas(st, txn, &mv, &mvTab, &stmtDeltas, stmtMark, up)
         if len(pd) == 0 { continue }
+
+        if mv.deltaTree > 0 {
+            // Stage 3 sharded append-only companion deltaTree path!
+            if mv.timing == MV_COMMIT {
+                pushPending(sess, &pd)
+            } else if anyResetDelta(&pd) {
+                try applyMvDeltas(st, txn, &mv.key, &pd, up)
+            } else {
+                try appendDeltas(st, txn, &mv, &pd)
+                if mv.timing == MV_DEMAND && !mv.stale {
+                    mv.stale = true
+                    try writeMeta(txn, &mv)
+                }
+            }
+            continue
+        }
 
         if mv.timing == MV_STATEMENT {
             try applyMvDeltas(st, txn, &mv.key, &pd, up)
@@ -2257,6 +2710,16 @@ pub fn beforeCommit(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, up: &Up):
         }
     }
     for i in 0..len(mvKeys) {
+        let mvOpt = try readMeta(st, txn, &mvKeys[i])
+        match mvOpt {
+            Some(mv) {
+                if mv.deltaTree > 0 && !anyResetDelta(&groups[i]) {
+                    try appendDeltas(st, txn, &mv, &groups[i])
+                    continue
+                }
+            }
+            None {}
+        }
         try applyMvDeltas(st, txn, &mvKeys[i], &groups[i], up)
     }
     return Ok(Unit{})
@@ -2550,6 +3013,12 @@ pub fn refreshComplete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &
     try (up.saveTable)(txn, &mvTab)
     txn.dropTree(oldTree)
     for oi in oldIdxTrees { txn.dropTree(oi) }
+    if mv.deltaTree > 0 {
+        let oldDelta = mv.deltaTree
+        mv.deltaTree = st.createTree(txn)
+        txn.dropTree(oldDelta)
+        mv.foldedSeq = nextDeltaSeq()
+    }
 
     mv.populated = true
     mv.stale = false
@@ -2577,6 +3046,11 @@ pub fn clearData(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, u
         let oi = mvTab.indexes[i].tree
         mvTab.indexes[i].tree = st.createTree(txn)
         txn.dropTree(oi)
+    }
+    if mv.deltaTree > 0 {
+        let oldDelta = mv.deltaTree
+        mv.deltaTree = st.createTree(txn)
+        txn.dropTree(oldDelta)
     }
     setUnpopMark(mut &mvTab, mv.mdialect == MD_PG)
     try (up.saveTable)(txn, &mvTab)

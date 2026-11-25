@@ -48,6 +48,10 @@ DROP MATERIALIZED VIEW LOG ON [ schema. ] table
 
 `ENABLE QUERY REWRITE` / `ENABLE ON QUERY COMPUTATION`
 : Recorded in `USER_MVIEWS` (`REWRITE_ENABLED`, `ON_QUERY_COMPUTATION`) and changeable via `ALTER MATERIALIZED VIEW`.
+  When `ON QUERY COMPUTATION` is enabled on a fast-refreshable materialized view, DML appends signed deltas to a
+  contention-free companion delta tree, `SELECT` queries merge base + delta rows on the fly in the reader's MVCC
+  snapshot (even on `ON DEMAND` views before refresh), and `DBMS_MVIEW.REFRESH(..., 'F')` or the background folder
+  folds deltas into the base tree in $O(\Delta)$.
 
 ## Remarks
 
@@ -182,7 +186,48 @@ b     50  50  50  1  50
 2 rows selected.
 ```
 
-### C. `ALTER` and `DROP`
+### C. Real-time materialized view (`ON DEMAND ENABLE ON QUERY COMPUTATION`)
+
+<!-- example: oracle -->
+```sql
+CREATE MATERIALIZED VIEW mv_oqc
+    REFRESH FAST ON DEMAND ENABLE ON QUERY COMPUTATION
+AS SELECT dept, COUNT(*) AS n, SUM(sal) AS tot FROM emp GROUP BY dept;
+INSERT INTO emp VALUES (6, 'c', 400);
+COMMIT;
+SELECT dept, n, tot FROM mv_oqc ORDER BY dept;
+BEGIN
+  DBMS_MVIEW.REFRESH('mv_oqc', 'F');
+END;
+/
+SELECT mview_name, on_query_computation, staleness FROM user_mviews WHERE mview_name = 'MV_OQC';
+```
+
+```text
+Materialized view created.
+
+1 row created.
+
+Commit complete.
+
+DEPT N TOT
+---- - ---
+a    3 650
+b    1  50
+c    1 400
+
+3 rows selected.
+
+PL/SQL procedure successfully completed.
+
+MVIEW_NAME ON_QUERY_COMPUTATION STALENESS
+---------- -------------------- ---------
+MV_OQC     Y                    FRESH
+
+1 row selected.
+```
+
+### D. `ALTER` and `DROP`
 
 <!-- example: oracle -->
 ```sql
@@ -191,6 +236,7 @@ SELECT mview_name, refresh_mode, rewrite_enabled FROM user_mviews WHERE mview_na
 DROP MATERIALIZED VIEW mv_demand;
 DROP MATERIALIZED VIEW mv_fast;
 DROP MATERIALIZED VIEW mv_stats;
+DROP MATERIALIZED VIEW mv_oqc;
 DROP MATERIALIZED VIEW LOG ON emp;
 ```
 
@@ -202,6 +248,8 @@ MVIEW_NAME REFRESH_MODE REWRITE_ENABLED
 MV_DEMAND  COMMIT       Y
 
 1 row selected.
+
+Materialized view dropped.
 
 Materialized view dropped.
 
