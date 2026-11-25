@@ -2,7 +2,9 @@
 
 `USER_TABLES`, `USER_TAB_COLUMNS`, `USER_INDEXES`, `USER_IND_COLUMNS`, `USER_IND_EXPRESSIONS`, `USER_CONSTRAINTS`,
 `USER_CONS_COLUMNS`, `USER_TAB_IDENTITY_COLS`, `USER_OBJECTS`, `USER_CATALOG`, `USER_ANNOTATIONS_USAGE`,
-`USER_ANNOTATIONS`, `USER_ANNOTATION_VALUES` and their `ALL_` and `DBA_` forms.
+`USER_ANNOTATIONS`, `USER_ANNOTATION_VALUES`, the property graph views (`USER_PROPERTY_GRAPHS`, `USER_PG_ELEMENTS`,
+`USER_PG_LABELS`, `USER_PG_ELEMENT_LABELS`, `USER_PG_LABEL_PROPERTIES`, `USER_PG_PROP_DEFINITIONS`, `USER_PG_KEYS`,
+`USER_PG_EDGE_RELATIONSHIPS`, `USER_PG_COMMENTS`) and their `ALL_` and `DBA_` forms.
 
 **Door:** Oracle (TNS). **Follows:** Oracle AI Database 26ai (23.26) and 23ai.
 
@@ -46,7 +48,8 @@ read them, and return no rows).
   `IDENTITY_OPTIONS`.
 
 `USER_OBJECTS`, `ALL_OBJECTS`, `DBA_OBJECTS`, `USER_CATALOG` (`CAT` is not present)
-: Every table, view, index, sequence, procedure, function and package: `OBJECT_NAME`, `OBJECT_TYPE`, `STATUS`,
+: Every table, view, index, sequence, procedure, function, package and property graph (`OBJECT_TYPE` `PROPERTY
+  GRAPH`): `OBJECT_NAME`, `OBJECT_TYPE`, `STATUS`,
   `CREATED` and `LAST_DDL_TIME` (always 2000-01-01), `OBJECT_ID` (derived from the name). `USER_CATALOG` lists
   tables, views and sequences with `TABLE_TYPE`.
 
@@ -60,6 +63,27 @@ read them, and return no rows).
 : The annotation names in use (`ANNOTATION_NAME`), and the names and values in use (`ANNOTATION_NAME`,
   `ANNOTATION_VALUE`), each once for an owner (`ANNOTATION_OWNER` in `ALL_` and `DBA_`). A name goes from them when
   its last use goes.
+
+`USER_PROPERTY_GRAPHS`, `ALL_PROPERTY_GRAPHS`, `DBA_PROPERTY_GRAPHS`
+: One row for each [property graph](create-property-graph.md): `GRAPH_NAME`, `GRAPH_MODE` (`TRUSTED`),
+  `ALLOWS_MIXED_TYPES` (`NO`), `INMEMORY` (`NO`); `OWNER` in `ALL_` and `DBA_`. A graph's `USER_OBJECTS.STATUS` is
+  `INVALID` while a table or column it names is gone.
+
+`USER_PG_ELEMENTS`, `USER_PG_KEYS`, `USER_PG_EDGE_RELATIONSHIPS`
+: A graph's elements: `ELEMENT_NAME`, `ELEMENT_KIND` (`VERTEX` or `EDGE`), `OBJECT_OWNER` and `OBJECT_NAME` (the
+  table or view); the key columns of each (`COLUMN_NAME`); and for each edge table its two ends: `EDGE_TAB_NAME`,
+  `VERTEX_TAB_NAME`, `EDGE_END` (`SOURCE` or `DESTINATION`), `EDGE_COL_NAME`, `VERTEX_COL_NAME`, a row per column.
+
+`USER_PG_LABELS`, `USER_PG_ELEMENT_LABELS`, `USER_PG_LABEL_PROPERTIES`, `USER_PG_PROP_DEFINITIONS`
+: The labels (`LABEL_NAME`), the labels of each element, the properties of each label (`PROPERTY_NAME`,
+  `DATA_TYPE`, `DATA_LENGTH`, `DATA_PRECISION`, `DATA_SCALE`, `DATA_CHAR_LENGTH`, `CHARACTER_SET_NAME`, `COLLATION`,
+  `PROPERTY_ORDER`), and what each property of an element reads: `COLUMN_NAME` for a column, `COLUMN_EXPR` for an
+  expression.
+
+`USER_PG_COMMENTS`
+: A row for each graph, `COMMENTS` empty (lexdb does not keep comments).
+
+All of them have `ALL_` and `DBA_` forms with an `OWNER` column. Example J below.
 
 `DICTIONARY` (`DICT`), `DICT_COLUMNS`
 : The list of the dictionary's own views.
@@ -81,6 +105,13 @@ read them, and return no rows).
 - `ALL_` and `DBA_ANNOTATIONS_USAGE` have no rows for the built-in domains of `SYS` (Oracle Free lists about a
   hundred, `OBJECT_TYPE` `DOMAIN`): lexdb has no domains. A global temporary table's annotations are not listed.
 - `USER_INDEXES.COMPRESSION` is `DISABLED` and the storage columns are empty.
+- A property graph's `USER_OBJECTS.STATUS` says whether the tables and columns it names are there; Oracle marks it
+  `INVALID` when a column of one of its tables is changed, until its next use. `USER_PG_ELEMENTS.OBJECT_NAME`,
+  `USER_PG_PROP_DEFINITIONS.COLUMN_NAME` and the types in `USER_PG_LABEL_PROPERTIES` are as they were at `CREATE
+  PROPERTY GRAPH` (Oracle's follow a rename or `MODIFY`), and `USER_PG_COMMENTS` has no comments.
+- `USER_PG_LABEL_PROPERTIES.DATA_LENGTH` is the length of the property's own column. Oracle gives the properties of
+  one name in a graph the longest of their lengths: in example J it lists `DEPT`'s `NAME` (a `VARCHAR2(30)`) as 40,
+  the length of `EMP`'s `NAME`.
 - `USER_SOURCE` and the other program views are on [their own page](data-dictionary-programs.md).
 - Views Oracle has and lexdb has not (`USER_TAB_PRIVS_MADE`, `USER_TAB_PRIVS_RECD`, `ROLE_TAB_PRIVS`) are
   ORA-00942.
@@ -337,7 +368,7 @@ COLS
 
 VIEWS_IN_DICTIONARY
 -------------------
-                235
+                262
 
 1 row selected.
 ```
@@ -460,7 +491,96 @@ SA               UNIT
 4 rows selected.
 ```
 
+### J. Property graphs
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE works_in (emp_id INTEGER PRIMARY KEY REFERENCES emp (id), dept_id NUMBER(4) NOT NULL REFERENCES dept (id));
+CREATE PROPERTY GRAPH org
+  VERTEX TABLES (emp LABEL employee PROPERTIES (name, salary, salary * 12 AS yearly), dept)
+  EDGE TABLES (works_in SOURCE emp DESTINATION dept NO PROPERTIES);
+SELECT * FROM user_property_graphs;
+SELECT element_name, element_kind, object_name FROM user_pg_elements ORDER BY 1;
+SELECT element_name, label_name FROM user_pg_element_labels ORDER BY 1;
+SELECT label_name, property_name, data_type, data_length, property_order FROM user_pg_label_properties ORDER BY 1, 5;
+SELECT element_name, property_name, column_name, column_expr FROM user_pg_prop_definitions ORDER BY 1, 2;
+SELECT element_name, column_name FROM user_pg_keys ORDER BY 1;
+SELECT edge_tab_name, vertex_tab_name, edge_end, edge_col_name, vertex_col_name
+FROM user_pg_edge_relationships ORDER BY 3 DESC;
+SELECT object_name, object_type, status FROM user_objects WHERE object_type = 'PROPERTY GRAPH';
+```
+
+```text
+Table created.
+
+Property graph created.
+
+GRAPH_NAME GRAPH_MODE ALLOWS_MIXED_TYPES INMEMORY
+---------- ---------- ------------------ --------
+ORG        TRUSTED    NO                 NO
+
+1 row selected.
+
+ELEMENT_NAME ELEMENT_KIND OBJECT_NAME
+------------ ------------ -----------
+DEPT         VERTEX       DEPT
+EMP          VERTEX       EMP
+WORKS_IN     EDGE         WORKS_IN
+
+3 rows selected.
+
+ELEMENT_NAME LABEL_NAME
+------------ ----------
+DEPT         DEPT
+EMP          EMPLOYEE
+WORKS_IN     WORKS_IN
+
+3 rows selected.
+
+LABEL_NAME PROPERTY_NAME DATA_TYPE DATA_LENGTH PROPERTY_ORDER
+---------- ------------- --------- ----------- --------------
+DEPT       ID            NUMBER             22              1
+DEPT       NAME          VARCHAR2           30              2
+EMPLOYEE   NAME          VARCHAR2           40              1
+EMPLOYEE   SALARY        NUMBER             22              2
+EMPLOYEE   YEARLY        NUMBER             22              3
+
+5 rows selected.
+
+ELEMENT_NAME PROPERTY_NAME COLUMN_NAME COLUMN_EXPR
+------------ ------------- ----------- -----------
+DEPT         ID            ID
+DEPT         NAME          NAME
+EMP          NAME          NAME
+EMP          SALARY        SALARY
+EMP          YEARLY                    "SALARY"*12
+
+5 rows selected.
+
+ELEMENT_NAME COLUMN_NAME
+------------ -----------
+DEPT         ID
+EMP          ID
+WORKS_IN     EMP_ID
+
+3 rows selected.
+
+EDGE_TAB_NAME VERTEX_TAB_NAME EDGE_END    EDGE_COL_NAME VERTEX_COL_NAME
+------------- --------------- ----------- ------------- ---------------
+WORKS_IN      EMP             SOURCE      EMP_ID        ID
+WORKS_IN      DEPT            DESTINATION DEPT_ID       ID
+
+2 rows selected.
+
+OBJECT_NAME OBJECT_TYPE    STATUS
+----------- -------------- ------
+ORG         PROPERTY GRAPH VALID
+
+1 row selected.
+```
+
 ## See also
 
 [Programs, sequences and views](data-dictionary-programs.md), [System and session views](data-dictionary-system.md),
-[CREATE TABLE](create-table.md), [CREATE INDEX](create-index.md), [Annotations](annotations.md)
+[CREATE TABLE](create-table.md), [CREATE INDEX](create-index.md), [Annotations](annotations.md),
+[CREATE PROPERTY GRAPH](create-property-graph.md)

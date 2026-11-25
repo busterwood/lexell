@@ -39,6 +39,33 @@ it.
 | ORA-01786 | `FOR UPDATE` after `QUALIFY`. |
 | ORA-11543 to ORA-11562, ORA-11602 | An `ANNOTATIONS` clause that is not right: a name that is reserved or missing, a value that is empty or not text, a name and value given twice, `DROP` or `REPLACE` in a `CREATE`, an annotation to drop that is not there or to add that is; see [Annotations](annotations.md). ORA-03099, ORA-03076, ORA-03062: something after a column's `ANNOTATIONS`. |
 
+### Property graphs
+
+The errors of [CREATE PROPERTY GRAPH](create-property-graph.md), [DROP PROPERTY GRAPH](drop-property-graph.md) and
+[GRAPH_TABLE](graph-table.md), with Oracle's numbers and texts.
+
+| Error | Meaning |
+|---|---|
+| ORA-42421 | A property graph that does not exist (`GRAPH_TABLE`, `DROP PROPERTY GRAPH`). |
+| ORA-04045 | `GRAPH_TABLE` over a graph whose table, or a column it names, has been dropped or renamed. |
+| ORA-42402, ORA-42442 | An element table without a primary key and without `KEY`; a view without `KEY`. |
+| ORA-42404, ORA-42416 | Two elements of one name; a column twice in a `KEY`. |
+| ORA-42405 | `REFERENCES` of a name that is no vertex element (a table's name where the element has an alias). |
+| ORA-42413 | `SOURCE` or `DESTINATION` without `KEY`, when the edge table has no foreign key to that vertex table. |
+| ORA-42415 | `KEY (...) REFERENCES v (...)` with lists of different lengths. |
+| ORA-42407 | A property twice in one label. |
+| ORA-42409, ORA-42414 | A label on two elements with other property names; with a property of another kind of type. |
+| ORA-42424, ORA-42439 | A property expression without `AS`; one that calls a function that is not deterministic (`SYSDATE`). |
+| ORA-40954, ORA-40951 | A label the graph does not have; `!` in a label expression. |
+| ORA-40983, ORA-49044, ORA-49013 | A property no label of the graph has; one the variable's labels do not have; a property of a variable whose label expression no element satisfies. |
+| ORA-40984, ORA-40985, ORA-49003 | A quantifier bound out of range (`{0}`, `{3,1}`); an unbounded quantifier (`+`, `*`, `{m,}`); `?`. |
+| ORA-40997 | A quantifier after a vertex pattern; a `GRAPH_TABLE` without `COLUMNS`. |
+| ORA-40990, ORA-40998, ORA-49011, ORA-40956 | A quantified variable outside an aggregate in `COLUMNS`; in the pattern's `WHERE`; an aggregate without a quantified variable (and `COUNT(*)`); `COUNT(e)` without a property. |
+| ORA-49000, ORA-40996 | A vertex and an edge variable of one name; a variable that is not in the pattern, or a column of the query outside. |
+| ORA-40988 | A subquery inside `GRAPH_TABLE`. |
+| ORA-49033 | `ELEMENT_NUMBER` without `ONE ROW PER VERTEX` or `STEP`. |
+| ORA-02000 | A `COLUMNS` expression without `AS`; `SOURCE`, `DESTINATION` or `VERTEX` missing in `CREATE PROPERTY GRAPH`. |
+
 ### Constraints and data
 
 | Error | Meaning |
@@ -106,7 +133,7 @@ it.
 
 | Error | Meaning |
 |---|---|
-| ORA-03001 | A feature lexdb does not have: a trigger, a synonym, a view update, a column list in `GRANT`, `ALTER TABLE ... READ ONLY`. |
+| ORA-03001 | A feature lexdb does not have: a trigger, a synonym, a view update, a column list in `GRANT`, `ALTER TABLE ... READ ONLY`, `ONE ROW PER VERTEX` in `GRAPH_TABLE`. |
 
 ## Remarks
 
@@ -121,6 +148,11 @@ it.
   (Oracle: ORA-01086), a sequence past its limit is ORA-20000 (Oracle: ORA-08004).
 - `INSERT ALL`, `CREATE TRIGGER` and `CREATE SYNONYM` are refused as above (ORA-00900 and ORA-03001).
 - Some statements lexdb does not take are ORA-00900 where Oracle's syntax is fine (a clause lexdb does not know).
+- The texts of ORA-40983 and ORA-49044 say `is noRows defined` where Oracle's say `is never defined` (example J), and
+  ORA-42442's is `cannot infer key for graph element view V` (Oracle: `KEY is not specified for view graph element
+  table V.`). An edge variable's property that only vertex labels have is ORA-49044 (Oracle: ORA-40983), `{m,}` is
+  ORA-40985 (Oracle: ORA-40984), and an edge table with two foreign keys to the `SOURCE` table is ORA-42413 (Oracle:
+  ORA-42431).
 
 ## Examples
 
@@ -449,6 +481,53 @@ ERROR:
 ORA-02431: cannot disable constraint (NOSUCH) - no such constraint
 ```
 
+### J. Property graphs
+
+<!-- example: oracle -->
+```sql
+CREATE PROPERTY GRAPH pg VERTEX TABLES (p);
+CREATE PROPERTY GRAPH pg2 VERTEX TABLES (c);
+CREATE PROPERTY GRAPH p VERTEX TABLES (p);
+SELECT * FROM GRAPH_TABLE (nosuch MATCH (x) COLUMNS (x.id AS id));
+SELECT * FROM GRAPH_TABLE (pg MATCH (x IS nolabel) COLUMNS (x.id AS id));
+SELECT * FROM GRAPH_TABLE (pg MATCH (x) COLUMNS (x.nosuch AS v));
+SELECT * FROM GRAPH_TABLE (pg MATCH (x) COLUMNS (x.id + 1));
+SELECT * FROM GRAPH_TABLE (pg MATCH (x){2} COLUMNS (x.id AS id));
+DROP PROPERTY GRAPH pg;
+DROP PROPERTY GRAPH pg;
+```
+
+```text
+Property graph created.
+
+ERROR:
+ORA-42402: cannot infer key for graph element table C
+
+ERROR:
+ORA-00955: name is already used by an existing object
+
+ERROR:
+ORA-42421: property graph does not exist
+
+ERROR:
+ORA-40954: unknown label
+
+ERROR:
+ORA-40983: property "NOSUCH" is noRows defined
+
+ERROR:
+ORA-02000: missing AS keyword
+
+ERROR:
+ORA-40997: invalid path pattern expression is specified in a GRAPH_TABLE operator
+
+Property graph dropped.
+
+ERROR:
+ORA-42421: property graph does not exist
+```
+
 ## See also
 
-[INSERT](insert.md), [PL/SQL exceptions](README.md#plsql), [Data dictionary](data-dictionary-tables.md)
+[INSERT](insert.md), [PL/SQL exceptions](README.md#plsql), [Data dictionary](data-dictionary-tables.md),
+[GRAPH_TABLE](graph-table.md)

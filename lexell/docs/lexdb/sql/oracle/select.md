@@ -44,7 +44,9 @@ select_list:
 
 `FROM`
 : Tables, views, inline views (`( subquery )`), `LATERAL` and `CROSS APPLY` / `OUTER APPLY` subqueries, and joins of
-  them. See [Joins](select-join.md). `FROM DUAL` gives one row; the `FROM` clause may also be left out.
+  them. See [Joins](select-join.md). `FROM DUAL` gives one row; the `FROM` clause may also be left out. A
+  `GRAPH_TABLE (...)` is the rows of a pattern matched over a property graph, read as an inline view's: see
+  [GRAPH_TABLE](graph-table.md). `MATCH_RECOGNIZE` finds patterns in rows: see [MATCH_RECOGNIZE](match-recognize.md).
 
 `WHERE`
 : Keeps the rows for which the condition is true. `ROWNUM` tests in it are read as a row limit (see Remarks).
@@ -623,4 +625,4 @@ ORA-00918: column ambiguously defined
 ## See also
 
 [Joins](select-join.md) · [GROUP BY](select-group-by.md) · [QUALIFY](qualify.md) · [Hierarchical queries](hierarchical-queries.md) · [WITH](with.md) ·
-[MATCH_RECOGNIZE](match-recognize.md) · [INSERT](insert.md) · [UPDATE](update.md) · [DELETE](delete.md) · [MERGE](merge.md)
+[MATCH_RECOGNIZE](match-recognize.md) · [GRAPH_TABLE](graph-table.md) · [INSERT](insert.md) · [UPDATE](update.md) · [DELETE](delete.md) · [MERGE](merge.md)

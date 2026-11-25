@@ -17,6 +17,7 @@ Oracle. Each page names what lexdb lacks or does differently.
 | [Hierarchical queries](hierarchical-queries.md) | `START WITH`, `CONNECT BY [NOCYCLE]`, `PRIOR`, `LEVEL`, `CONNECT_BY_ROOT`, `SYS_CONNECT_BY_PATH`, `ORDER SIBLINGS BY`. |
 | [WITH](with.md) | Subquery factoring, recursive `WITH`. |
 | [MATCH_RECOGNIZE](match-recognize.md) | Pattern matching over rows. |
+| [GRAPH_TABLE](graph-table.md) | Pattern matching over a property graph (SQL/PGQ): vertex and edge patterns, labels, directions, bounded quantifiers, aggregates of a path. |
 
 ### Changing data
 
@@ -41,6 +42,7 @@ Oracle. Each page names what lexdb lacks or does differently.
 | [RENAME](rename.md) | Tables, views, sequences. |
 | [COMMENT ON](comment-on.md) | Accepted; comments are not kept. |
 | [Annotations](annotations.md) | `ANNOTATIONS (...)` on tables, views, indexes and columns; `ALTER ... ANNOTATIONS` with `ADD`, `DROP` and `REPLACE`. |
+| [CREATE PROPERTY GRAPH](create-property-graph.md), [DROP PROPERTY GRAPH](drop-property-graph.md) | Vertex and edge tables, keys, `SOURCE` and `DESTINATION`, labels and properties; `OR REPLACE`, `IF [NOT] EXISTS`. |
 
 ### PL/SQL units
 
@@ -127,7 +129,7 @@ Not available: `NANVL`, `LNNVL`, `SOUNDEX`, `ORA_HASH`, `STANDARD_HASH`, `VSIZE`
 
 | Page | Views |
 |---|---|
-| [Tables, columns, indexes and constraints](data-dictionary-tables.md) | `USER_`, `ALL_` and `DBA_` `TABLES`, `TAB_COLUMNS`, `INDEXES`, `IND_COLUMNS`, `IND_EXPRESSIONS`, `CONSTRAINTS`, `CONS_COLUMNS`, `TAB_IDENTITY_COLS`, `OBJECTS`, `CATALOG`, `ANNOTATIONS_USAGE`, `ANNOTATIONS`, `ANNOTATION_VALUES`; `TABS`, `COLS`, `DICT`, `DICTIONARY`, `DUAL` |
+| [Tables, columns, indexes and constraints](data-dictionary-tables.md) | `USER_`, `ALL_` and `DBA_` `TABLES`, `TAB_COLUMNS`, `INDEXES`, `IND_COLUMNS`, `IND_EXPRESSIONS`, `CONSTRAINTS`, `CONS_COLUMNS`, `TAB_IDENTITY_COLS`, `OBJECTS`, `CATALOG`, `ANNOTATIONS_USAGE`, `ANNOTATIONS`, `ANNOTATION_VALUES`, `PROPERTY_GRAPHS`, `PG_ELEMENTS`, `PG_LABELS`, `PG_ELEMENT_LABELS`, `PG_LABEL_PROPERTIES`, `PG_PROP_DEFINITIONS`, `PG_KEYS`, `PG_EDGE_RELATIONSHIPS`, `PG_COMMENTS`; `TABS`, `COLS`, `DICT`, `DICTIONARY`, `DUAL` |
 | [Views, sequences, procedures and source](data-dictionary-programs.md) | `VIEWS`, `SEQUENCES`, `SOURCE`, `PROCEDURES`, `ARGUMENTS`, `ERRORS`, `TRIGGERS`, `SYNONYMS` |
 | [Users, privileges, parameters and V$ views](data-dictionary-system.md) | `USER_USERS`, `ALL_USERS`, `DBA_USERS`, `USER_TAB_PRIVS`, `SESSION_PRIVS`, `NLS_SESSION_PARAMETERS`, `DATABASE_PROPERTIES`, `PRODUCT_COMPONENT_VERSION`, `V$VERSION`, `V$INSTANCE`, `V$DATABASE`, `V$SESSION`, `V$PARAMETER` |
 
