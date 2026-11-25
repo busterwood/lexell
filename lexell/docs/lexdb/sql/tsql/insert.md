@@ -8,7 +8,7 @@ Adds one or more rows to a table or a table variable.
 
 ```
 [ WITH common_table_expression [ ,...n ] ]
-INSERT [ INTO ] { table_name | @table_variable | #temp_table }
+INSERT [ TOP ( expression ) [ PERCENT ] ] [ INTO ] { table_name | @table_variable | #temp_table }
     [ ( column_list ) ]
     [ OUTPUT { INSERTED.column_name | INSERTED.* | expression } [ [ AS ] column_alias ] [ ,...n ]
         [ INTO { @table_variable | table_name } [ ( column_list ) ] ] ]
@@ -25,6 +25,11 @@ table_name ::= [ database_name . [ schema_name ] . | schema_name . ] table_name
 
 *common_table_expression*
 : A named query the `SELECT` can read. See [WITH](with.md).
+
+`TOP (` *expression* `)` [ `PERCENT` ]
+: Inserts only the first *expression* rows of the query, or of the `VALUES` list; with `PERCENT`, that percentage of
+  the rows, rounded up. A query with its own `TOP`, `ORDER BY` or a set operation is read as it stands, then cut. See
+  [TOP](top.md) and example J.
 
 `INTO`
 : Optional, as in SQL Server.
@@ -78,8 +83,11 @@ table_name ::= [ database_name . [ schema_name ] . | schema_name . ] table_name
 
 ## Differences from SQL Server
 
-- **`INSERT TOP (n)` is not supported.** SQL Server accepts it; lexdb refuses it with error 156 (example I). Table hints
-  (`WITH (TABLOCK)`) are also refused (156), and SQL Server takes them.
+- In `INSERT TOP (n) ... SELECT ... ORDER BY`, lexdb takes the rows in the query's `ORDER BY` order. SQL Server does not
+  promise it (its `INSERT TOP` takes the rows in no defined order, and in a test it ignored the `ORDER BY`): use
+  `INSERT ... SELECT TOP (n) ... ORDER BY` where the order matters.
+- **Table hints are not supported**: `INSERT INTO t WITH (TABLOCK) ...` is refused with error 156 (example I), and SQL
+  Server takes it.
 - Most error messages are SQL Server's; those with number 50000 carry lexdb's text.
 - The line number in an error message is the line of the failing statement in the batch.
 - There are no triggers, so `INSERT` fires none.
@@ -285,18 +293,68 @@ the batch went on
 
 <!-- example: tsql -->
 ```sql
-INSERT TOP (1) INTO dbo.cheap (id, name) SELECT id, name FROM dbo.product;
-GO
 INSERT INTO dbo.cheap WITH (TABLOCK) (id, name) VALUES (20, N'x');
 GO
 ```
 
 ```text
 Msg 156, Level 15, State 1, Line 1
-Incorrect syntax near the keyword 'TOP'.
-Msg 156, Level 15, State 1, Line 1
 Incorrect syntax near the keyword 'WITH'.
 ```
+
+### J. TOP
+
+`INSERT TOP (n)` takes the first *n* rows of the query or of the `VALUES` list; with `PERCENT`, *n* percent of them,
+rounded up. Which rows of a query come first is not defined (see below), so the example counts them.
+
+<!-- example: tsql -->
+```sql
+CREATE TABLE dbo.top_src (id int PRIMARY KEY, name nvarchar(10));
+INSERT dbo.top_src VALUES (1, N'a'), (2, N'b'), (3, N'c'), (4, N'd'), (5, N'e');
+CREATE TABLE dbo.top_demo (id int PRIMARY KEY, name nvarchar(10));
+INSERT TOP (2) INTO dbo.top_demo (id, name) SELECT id, name FROM dbo.top_src;
+SELECT COUNT(*) AS inserted FROM dbo.top_demo;
+INSERT TOP (50) PERCENT dbo.top_demo (id, name) SELECT id + 10, name FROM dbo.top_src;
+SELECT COUNT(*) AS inserted FROM dbo.top_demo;
+INSERT TOP (1) dbo.top_demo (id, name) VALUES (21, N'first'), (22, N'second');
+SELECT COUNT(*) AS inserted, MAX(id) AS last_id FROM dbo.top_demo;
+GO
+INSERT TOP (101) PERCENT dbo.top_demo (id, name) SELECT id + 30, name FROM dbo.top_src;
+GO
+```
+
+```text
+(5 rows affected)
+
+(2 rows affected)
+
+inserted
+--------
+2
+
+(1 row affected)
+
+(3 rows affected)
+
+inserted
+--------
+5
+
+(1 row affected)
+
+(1 row affected)
+
+inserted last_id
+-------- -------
+6        21
+
+(1 row affected)
+
+Msg 1031, Level 15, State 1, Line 1
+Percent values must be between 0 and 100.
+```
+
+To choose the rows, put the `TOP` in the query: `INSERT INTO t SELECT TOP (2) ... ORDER BY id DESC`.
 
 ## See also
 

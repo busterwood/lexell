@@ -9,7 +9,7 @@ Changes the values of rows in a table or a table variable.
 ```
 [ WITH common_table_expression [ ,...n ] ]
 UPDATE
-    [ TOP ( expression ) ]
+    [ TOP ( expression ) [ PERCENT ] ]
     { table_name | table_alias | @table_variable | #temp_table }
     [ WITH ( table_hint [ ,...n ] ) ]
     SET
@@ -29,8 +29,9 @@ UPDATE
 *common_table_expression*
 : A named query the statement can read in `FROM`, `WHERE` or `SET`. See [WITH](with.md).
 
-`TOP (` *expression* `)`
-: Changes at most this many rows, picked in no order. See [TOP](top.md).
+`TOP (` *expression* `)` [ `PERCENT` ]
+: Changes at most this many rows, picked in no order; with `PERCENT`, that percentage of the rows the statement found,
+  rounded up to a whole row (a percent past 100 is error 1031). See [TOP](top.md) and example I.
 
 *table_name*
 : The table to change: `t`, `dbo.t`, `lexdb.dbo.t`, or `[my table]`.
@@ -90,7 +91,6 @@ UPDATE
 
 - A common table expression or a view cannot be the target: a CTE gives error 208, a view error 50000 ("cannot
   update view ... (lexdb's views are read-only)"). Name the table, and read the CTE in `WHERE`.
-- `UPDATE TOP (n) PERCENT` is error 102; SQL Server accepts it.
 - A column set twice in one `SET` takes the last value; SQL Server refuses it (error 264).
 - `WITH ( batch_rows n )` is lexdb's, not SQL Server's.
 - `SET @variable = expression` and `SET @variable = column = expression`, which set a variable for each row, are
@@ -346,7 +346,45 @@ Msg 50000, Level 16, State 1, Line 3
 lexdb: UPDATE with batch_rows cannot run inside a transaction block
 ```
 
-### I. What lexdb does not take
+### I. TOP PERCENT
+
+<!-- example: tsql -->
+```sql
+CREATE TABLE dbo.upd_demo (id int PRIMARY KEY, n int);
+INSERT dbo.upd_demo VALUES (1, 0), (2, 0), (3, 0), (4, 0), (5, 0);
+UPDATE TOP (50) PERCENT dbo.upd_demo SET n = 1;
+SELECT COUNT(*) AS changed FROM dbo.upd_demo WHERE n = 1;
+UPDATE TOP (1) PERCENT dbo.upd_demo SET n = 2 WHERE n = 0;
+SELECT COUNT(*) AS changed FROM dbo.upd_demo WHERE n = 2;
+GO
+UPDATE TOP (150) PERCENT dbo.upd_demo SET n = 9;
+GO
+```
+
+```text
+(5 rows affected)
+
+(3 rows affected)
+
+changed
+-------
+3
+
+(1 row affected)
+
+(1 row affected)
+
+changed
+-------
+1
+
+(1 row affected)
+
+Msg 1031, Level 15, State 1, Line 1
+Percent values must be between 0 and 100.
+```
+
+### J. What lexdb does not take
 
 <!-- example: tsql -->
 ```sql

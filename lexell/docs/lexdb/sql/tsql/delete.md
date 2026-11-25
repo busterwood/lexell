@@ -57,8 +57,8 @@ DELETE
 
 ## Differences from SQL Server
 
-- **`DELETE TOP (n) PERCENT` is not supported.** SQL Server accepts it; lexdb refuses it with error 156 (`PERCENT` is a
-  reserved word). Delete by a condition, or `DELETE TOP (n)` (example G).
+- `DELETE TOP (n) PERCENT` removes *n* percent of the rows the `WHERE` finds, rounded up to a whole row, as SQL Server
+  does (example H); a percent past 100 is error 1031 (example G).
 - A common table expression or a view cannot be the target: a CTE gives error 208, a view error 50000 ("cannot
   delete from view ... (lexdb's views are read-only)").
 - `WHERE CURRENT OF` is error 102: lexdb has no cursors. There are no triggers.
@@ -230,7 +230,7 @@ order_id item
 DELETE FROM dbo.dept WHERE id = 1;
 PRINT 'the batch went on';
 GO
-DELETE TOP (50) PERCENT FROM dbo.emp;
+DELETE TOP (150) PERCENT FROM dbo.emp;
 GO
 ```
 
@@ -238,8 +238,53 @@ GO
 Msg 547, Level 16, State 1, Line 1
 The DELETE statement conflicted with the REFERENCE constraint "emp_dept_id_fkey". The conflict occurred in database "lexdb", table "dbo.emp", column 'dept_id'.
 the batch went on
-Msg 156, Level 15, State 1, Line 1
-Incorrect syntax near the keyword 'PERCENT'.
+Msg 1031, Level 15, State 1, Line 1
+Percent values must be between 0 and 100.
+```
+
+### H. TOP PERCENT
+
+`TOP (n) PERCENT` takes *n* percent of the rows found, rounded up: 50 percent of five rows is three, 1 percent of the
+two left is one. A `DELETE` has no `ORDER BY`, so which rows go is not defined and the example counts what is left.
+
+<!-- example: tsql -->
+```sql
+CREATE TABLE dbo.batch_log (id int PRIMARY KEY, note nvarchar(20));
+INSERT dbo.batch_log VALUES (1, N'a'), (2, N'b'), (3, N'c'), (4, N'd'), (5, N'e');
+DELETE TOP (50) PERCENT FROM dbo.batch_log;
+SELECT COUNT(*) AS left_over FROM dbo.batch_log;
+DELETE TOP (1) PERCENT FROM dbo.batch_log WHERE id > 0;
+SELECT COUNT(*) AS left_over FROM dbo.batch_log;
+DELETE TOP (0) PERCENT FROM dbo.batch_log;
+SELECT COUNT(*) AS left_over FROM dbo.batch_log;
+```
+
+```text
+(5 rows affected)
+
+(3 rows affected)
+
+left_over
+---------
+2
+
+(1 row affected)
+
+(1 row affected)
+
+left_over
+---------
+1
+
+(1 row affected)
+
+(0 rows affected)
+
+left_over
+---------
+1
+
+(1 row affected)
 ```
 
 ## See also

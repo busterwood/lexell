@@ -1,6 +1,6 @@
 # TOP (Transact-SQL)
 
-Limits the rows a query returns, or the rows an `UPDATE`, `DELETE` or `MERGE` changes.
+Limits the rows a query returns, or the rows an `INSERT`, `UPDATE`, `DELETE` or `MERGE` changes.
 
 **Door:** SQL Server (TDS). **Follows:** SQL Server 2022 and 2025.
 
@@ -11,9 +11,10 @@ Limits the rows a query returns, or the rows an `UPDATE`, `DELETE` or `MERGE` ch
 SELECT [ ALL | DISTINCT ] TOP ( expression ) [ PERCENT ] [ WITH TIES ] select_list ...
 SELECT [ ALL | DISTINCT ] TOP constant [ PERCENT ] [ WITH TIES ] select_list ...
 
--- in UPDATE, DELETE and MERGE
-UPDATE TOP ( expression ) ...
-DELETE TOP ( expression ) ...
+-- in INSERT, UPDATE, DELETE and MERGE
+INSERT TOP ( expression ) [ PERCENT ] [ INTO ] ...
+UPDATE TOP ( expression ) [ PERCENT ] ...
+DELETE TOP ( expression ) [ PERCENT ] ...
 MERGE TOP ( expression ) ...
 ```
 
@@ -32,7 +33,10 @@ MERGE TOP ( expression ) ...
 ## Remarks
 
 - Without `ORDER BY`, which rows `TOP` returns is not defined. Use `ORDER BY` to say which.
-- In `UPDATE`, `DELETE` and `MERGE`, the rows `TOP` picks are in no order.
+- In `UPDATE`, `DELETE` and `MERGE`, the rows `TOP` picks are in no order. In `INSERT`, they are the first rows of
+  the query (its `ORDER BY` decides which) or of the `VALUES` list. With `PERCENT`, `UPDATE` and `DELETE` take *n*
+  percent of the rows they found, rounded up (examples in [DELETE](delete.md), [UPDATE](update.md) and
+  [INSERT](insert.md)).
 - `TOP (0)` returns no rows, and gives the result's columns.
 - `TOP` without `ORDER BY` ends a recursive CTE that has no end of its own once it has its rows (see [WITH](with.md),
   example C).
@@ -42,11 +46,9 @@ MERGE TOP ( expression ) ...
 
 ## Differences from SQL Server
 
-- `INSERT TOP (n)` is not supported (error 156); SQL Server accepts it.
-- `PERCENT` is taken in `SELECT` only. `UPDATE TOP (n) PERCENT` is error 102, `DELETE TOP (n) PERCENT` error 156,
-  and `MERGE TOP (n) PERCENT` error 50000 ("lexdb: MERGE TOP ... PERCENT is not supported"). SQL Server accepts all
-  three.
-- `TOP (`*subquery*`)` is a syntax error (156): put the count in a variable first.
+- `MERGE TOP (n) PERCENT` is error 50000 ("lexdb: MERGE TOP ... PERCENT is not supported"); SQL Server accepts it.
+  `PERCENT` is taken in `SELECT`, `INSERT`, `UPDATE` and `DELETE`.
+- `TOP (`*subquery*`)` is a syntax error (156), and SQL Server accepts it: put the count in a variable first.
 - `TOP ... WITH TIES` without `ORDER BY` returns every row; SQL Server refuses it (error 1062).
 - `TOP` with a decimal constant and no `PERCENT` (`TOP 2.5`) returns a whole number of rows (3 here); SQL Server
   refuses it (1060).
@@ -189,7 +191,7 @@ GO
 ```
 
 ```text
-Msg 1031, Level 16, State 1, Line 1
+Msg 1031, Level 15, State 1, Line 1
 Percent values must be between 0 and 100.
 Msg 156, Level 15, State 1, Line 1
 Incorrect syntax near the keyword 'select'.
