@@ -13115,3 +13115,10 @@ The core's share of the slice: ALTER TABLE ... DROP COLUMN checks the views that
 (`lexdb_viewdep`): PostgreSQL's door refuses a column a view uses (2BP01; CASCADE drops those views), SQL Server's only for a schema-bound view (5074), Oracle's never; a view read with
 fewer columns than it was made with is an error in every door. An assertion's check reads its tables with the assertion owner's rights (`Stmt.runAs`, as a view's query), and a
 column's DDL on a table one reads marks it INVALID (Oracle's USER_ASSERTIONS). PostgreSQL's door is unchanged otherwise (`exec_bugs5`).
+
+### 9.149 The sixth bug slice (lexdb-robust.md, "The sixth bug slice")
+
+The core's share of the slice: DROP TABLE under views (`lexdb_viewdep.dropTable`): PostgreSQL's door refuses it with PostgreSQL's DETAIL and HINT and its CASCADE drops the views,
+the SQL Server and Oracle doors drop the table (a view over it fails when read, and reads it again once one of the name is made). `information_schema.view_table_usage` and
+`view_column_usage` exist (`lexdb_viewdep.usageRows`). The Oracle door's quoted names are exact (`lexdb_sql.oraQuoted`), with keys no fold reaches; the other doors' names are
+unchanged (`exec_bugs6`).

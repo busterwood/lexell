@@ -397,3 +397,89 @@ base and branch alternated twice): instructions 156,075 and 156,077 against 156,
 and 410 (the server's hash seed is not fixed there). TPC-H SF1, 22 queries, base and branch alternated twice: checksums equal on all 22, total 7,586 ms against 7,532 ms; q21 (+2.0%) and q22
 (+1.9%) slower in time with the same server instructions (q21 6,390.5 M against 6,394.6 M, q22 464.86 M against 464.87 M; `iq.sh`). Suite 398 passed; replica.py passed. lexdb_exec.lxl
 22,175 lines before, 22,186 after (viewCols and viewErr; viewPlanned's body moved to lexdb_viewdep).
+
+## The sixth bug slice (2026-11-25)
+
+The bugs the documentation passes listed in KNOWN-ISSUES.md, on `worktree-agent-a8da2f176e663b6fe` (from main b7c7b37f, tags `b6-base` and `b6`). Each was checked on the product before
+and after (Oracle Free 23.26.3, SQL Server 2022, PostgreSQL 18). Tests: `tns_bugs6` (`gen_oracle.py --check tns_bugs6`), `tds_bugs6` (`gen_mssql.py bugs6`), `exec_bugs6`
+(`gen_pg.py bugs6`).
+
+### Oracle: quoted names are exact (item 1)
+- lexdb's keys are folded (L6): every door's lexer lowered a name, quoted or not, and kept its spelling beside it, so `"qt"` and `QT` were one table and `mixt` found `"MixT"`.
+  The Oracle door's lexer now gives a quoted name that has a lower-case letter a key of its own (`lexdb_sql.oraQuoted`): the name in lower case, ORA_UPC (0x1c) after each
+  letter that was upper case, ORA_EXACT (0x1d) at the end (`"MixT"` is `m^ixt^$`, `"qt"` is `qt$`). No fold reaches such a key and every fold leaves it as it is, so all
+  the code that lowers names (column decoders, stored expressions read again in lexdb's dialect, catalog lookups) keeps it, and nothing else changed: a bare name and a quoted
+  one without a lower-case letter keep their fold (`T`, `"T"` and `t` are the key `t`, which the PostgreSQL door calls `t` and the T-SQL door `t` in any case, as before).
+  `lexdb_sql.oraShown` gives the name back (an exact key as written, a folded one in upper case, a name generated from an exact one, `"Emp"`'s `Emp_PKEY`, its exact part as
+  written): the Oracle door's dictionary (`lexdb_oracat.oraUp`, `lexdb_graph` and `lexdb_assert`'s `shownOf`), its error texts (`lexdb_oratext.quotedName`), the views' ORA-04063
+  and PL/SQL's lookup of a function SQL calls (`findFunction`). A column's catalog row stores an exact key itself (`colStored`; `spelledCol` reads it back with its spelling).
+  Tables, views, columns, indexes, constraints, sequences, PL/SQL units, assertions, graphs, the dictionary views' columns (`"table_name"` is ORA-00904) and GRANT ... ON's
+  object (`lexdb_tns.quotedObject`) all follow. `"MixF"(2)`, a call of a quoted name, is read as a call (`primary`; a stored function's
+  call from SQL and PL/SQL's %TYPE and %ROWTYPE quote the names they write, `callFunction`, `qn`); the SQL GRAPH_TABLE writes names as the Oracle door reads them
+  (`lexdb_graph.q`); an expression's label upper-cases quoted names too (`"ID"+1`, as Oracle 23.26). Not a format change: the rows are as before; a quoted
+  mixed-case name made in the Oracle door before this keeps its folded key (found by the unquoted name, shown as written).
+- The other doors cannot name an exact key (their lexers fold quoted names): an Oracle table `"qt"` is reached from the Oracle door only; a T-SQL table `Orders` is `ORDERS`
+  to the Oracle door (found by `orders` or `"ORDERS"`) and is still shown as `Orders` there (its spelling). An index or constraint name generated from an exact table name
+  shows the key's bytes in the PostgreSQL and T-SQL doors.
+- Synonyms: lexdb has no CREATE SYNONYM (ORA-03001), so there is nothing to make exact.
+
+### SQL Server: index names per table (item 2)
+- `lexdb_ixname`: a T-SQL CREATE INDEX whose name another table's index (or a relation) has in the schema keeps the index under the name, IX_OF (0x0e) and its table's name;
+  the T-SQL door shows the name as written (`lexdb_sql.ixShown`: sys.indexes, and so INDEXPROPERTY) and finds it through its table (`DROP INDEX ix ON t`, and now `DROP INDEX
+  t.ix` and `schema.t.ix`, which were 50000). The same name on the same table is 1913; in CREATE TABLE a repeated inline name is 8168 and two CLUSTERED indexes (or a
+  CLUSTERED primary key and a CLUSTERED index) 8112, as SQL Server's. PostgreSQL's and Oracle's doors keep names per schema and see the kept name. `sp_helpindex` is still 2812.
+
+### Oracle: nested subprograms (item 3)
+- A procedure or function declared in a unit's declarations (a stored unit's, a package member's, an anonymous block's, a nested block's) is compiled as a package's member is
+  (`Cx.nestedUnit`): its parameters and variables get slots of its own (`PUnit.nfrom`..`nto`) in the slot space of the unit that declares it; it is a unit of the program
+  (`subs`, moved beside its unit in `ensureProg`; an anonymous block's live in `Ip.subs` for the block's run) with a scope id (`PUnit.nest`, the fourth name of `Sig.canon`), so
+  that no name from outside reaches it. A bare name resolves to the innermost nested subprogram in scope first (`Cx.nested`, trimmed at the end of the declaring block);
+  forward declarations take the definition's body; recursion and calls between nested subprograms work. On a call (`callUnit`) the slots outside the callee's own are
+  copied from the caller's frame into the callee's and back after it (`nestCopy`), which gives it the enclosing units' variables (and the package's). Errors inside one are
+  compile errors of the unit (USER_ERRORS at their own lines). Not done: overloading by arguments (one subprogram a name in a scope), and the call of a nested function from
+  SQL inside the unit (Oracle: PLS-00231; lexdb: ORA-00904 when it runs).
+
+### Every door: DROP TABLE under a view (item 4)
+- `lexdb_viewdep.dropTable`: PostgreSQL's door refuses it as before (2BP01), now with PostgreSQL's DETAIL (each view and what it depends on) and HINT, and CASCADE drops the
+  views; SQL Server's door drops the table unless a view made WITH SCHEMABINDING reads it (3729), a view over it fails with 208 when read; Oracle's door drops it, a view over
+  it is INVALID, reading it ORA-04063 and USER_ERRORS has ORA-00942. Such a view reads the table again once one of the name is made (lexdb keeps a view's text): in Oracle it
+  is VALID at once (Oracle: at its next use).
+
+### SQL Server: INFORMATION_SCHEMA and sp_refreshview (item 5)
+- `lexdb_syscat.infoRows`: the T-SQL door's SCHEMATA lists SQL Server's schemas (dbo, guest, INFORMATION_SCHEMA, sys, the db_* roles' and those made, owned by dbo, character set
+  iso_1) and not pg_catalog or information_schema; ROUTINES and PARAMETERS list the T-SQL procedures and functions (types as SQL Server's, a scalar function's result as
+  parameter 0, OUTPUT as INOUT, the definition, READS or MODIFIES); CONSTRAINT_COLUMN_USAGE gives a foreign key's own columns; VIEW_TABLE_USAGE and VIEW_COLUMN_USAGE exist (in
+  the PostgreSQL door too, as PostgreSQL's; `lexdb_viewdep.usageRows`): a view's relations are its kept dependencies, the columns those its text names (by name, qualified by the table or an alias, or
+  all of them for `*`).
+- `sp_refreshview 'v'` makes the view again from its kept text (a CREATE OR ALTER VIEW: `lexdb_viewdep.refreshStmt`), so a `SELECT *` view takes its table's columns as they
+  are now; 15165 for a name that is no view. SQL Server keeps giving 4502 for a `SELECT *` view once a read failed until sp_refreshview; lexdb does not follow that (a read's
+  failure does not change the view): it reads by position as before, and sp_refreshview brings the new columns.
+
+### SQL Server: smaller ones (item 6)
+- `INSERT TOP (n) ... SELECT ... ORDER BY`: SQL Server ignores the ORDER BY (its documentation: the rows TOP takes for INSERT are in no order; checked with three ORDER BYs
+  and a WHERE, it took the first rows of its scan each time). Its choice is undefined, so lexdb keeps honouring the ORDER BY.
+- `WITH CHECK OPTION` before AS is 102 (`Incorrect syntax near 'with'.`); 1054's state is 6 (`lexdb_tsql.sqlState`, in the TDS error and ERROR_STATE()).
+- A schema-bound view: a FROM item not in two parts is 4512 (`Parser.boundNames`), a view over a view that is not schema-bound 4513 (`lexdb_viewdep.boundOver`), over a
+  function 4513 (`lexdb_tsqlparse`: the function is not schema-bound); ALTER COLUMN of a column such a view names is 5074 (`afterAlter`).
+- Not done: 4502's text names the view without its schema when the query wrote `dbo.v` (lexdb's statement does not keep the name as written).
+
+### Oracle: smaller ones (item 7)
+- A view over a graph after DROP COLUMN and the column back: kept VALID at once (lexdb's view says what its query does now; Oracle's stays INVALID with ORA-04063 on every
+  read until ALTER VIEW ... COMPILE, which only adds a step that changes nothing in the data).
+- A SELECT with a parenthesis left open before INTO in a block or a stored unit: ORA-00907 at the INTO, then "SQL Statement ignored" at the statement (USER_ERRORS of a
+  stored unit), as Oracle's, not PLS-00428.
+- Not done: under NOVALIDATE, a DELETE or UPDATE of the inner table of a NOT EXISTS still runs the whole query. Restricting it needs the old rows' join-key values; the
+  transaction's writes keep only a deleted row's key (OP_DEL), and the old row is not readable through the transaction (its reads overlay its own writes), so either the
+  write paths note the join-key values of the rows they delete or change (a per-row cost on UPDATE and DELETE of asserted tables only: their refBy marks them) or the store
+  offers a read of the snapshot below the transaction's own writes.
+
+### Measured
+In process (`pt.lxl`, 20,000 statements, `LXL_HASH_SEED=1`, two rounds, base = main b7c7b37f built the same way, trees at paths of equal length), equal in both rounds: point select
+30,934.2, INSERT 177,941.6, UPDATE by key 199,908.2 (199,908.3 in round 2, both), as text 105,360.3 / 197,960.2 / 224,376.3 (the text select and update flip by 0.1 between
+base and branch); in a transaction block INSERT 50,155.0, UPDATE 84,068.2. Over the wire (`icount6.sh`, 20,000 point selects x 3, base and branch alternated twice):
+instructions 155,389 and 155,349 against 155,264 and 155,200, cycles 88,938 and 89,622 against 82,015 and 81,765, L1 i-cache misses 566 and 562 against 307 and 314 (the server's
+hash seed is not fixed there). TPC-H SF1, 22 queries, base and branch alternated twice: checksums equal on all 22, total 7,526 ms against 7,593 ms; q9 (+2.3%), q13 (+2.2%), q14
+(+1.9%), q16 (+2.3%), q17 (+2.6 ms) and q19 (+4.5%) slower in time with the same server instructions (`iq.sh`: q9 13,093.4 M against 13,097.0 M, q13 4,477.7 M / 4,478.5 M,
+q14 983.6 M / 983.7 M, q16 1,902.3 M / 1,908.8 M, q17 119.89 M / 119.88 M, q19 154.14 M / 154.15 M). An earlier pair of runs (a branch build without the last three edits,
+none of them on the PostgreSQL door's path) gave 7,744 ms against 7,634 ms, its slower queries (q2, q7, q15, q21) with the same instructions too. Suite 401 passed; replica.py
+passed. lexdb_exec.lxl 22,186 lines before, 22,191 after (the calls of lexdb_viewdep, lexdb_ixname and lexdb_syscat.infoRows).
