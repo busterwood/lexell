@@ -4,8 +4,9 @@ Creates an assertion: a condition over one or more tables that every write to th
 
 **Door:** SQL Server (TDS). **Follows:** the SQL standard (ISO/IEC 9075-2, 11.47), not SQL Server: **SQL Server has no
 assertions.** `CREATE ASSERTION` is lexdb's own statement here, in the standard's form, with SQL Server's conventions
-for constraints (error 547, its numbers for names that exist or do not). A script that has it does not run on SQL
-Server.
+for constraints (error 547, its numbers for names that exist or do not). On SQL Server the statement is error 343
+(`Unknown object type 'ASSERTION' used in a CREATE, DROP, or ALTER statement.`), so a script that has it does not run
+there.
 
 An assertion is a constraint across tables. A `CHECK` constraint sees one row; an assertion sees whole tables, so it can
 say that no order is without its customer. lexdb checks it after each statement that writes a table the assertion
@@ -339,6 +340,85 @@ Msg 5074, Level 16, State 1, Line 1
 The object 'sal_pos' is dependent on column 'sal'.
 Msg 15336, Level 16, State 1, Line 1
 Object 'dbo.emp.sal' cannot be renamed because the object participates in enforced dependencies.
+```
+
+### G. XACT_ABORT, nested transactions, SAVE TRAN, TRUNCATE and a temporary table
+
+<!-- example: tsql -->
+```sql
+CREATE TABLE dbo.acct (id int PRIMARY KEY, bal int);
+INSERT dbo.acct VALUES (1, 5);
+GO
+CREATE ASSERTION late_pos CHECK (NOT EXISTS (SELECT 1 FROM dbo.acct WHERE bal < 0)) DEFERRABLE INITIALLY DEFERRED
+GO
+SET XACT_ABORT ON;
+BEGIN TRAN;
+INSERT dbo.acct VALUES (2, -5);
+COMMIT TRAN;
+PRINT 'not reached';
+GO
+SELECT @@TRANCOUNT AS trancount, COUNT(*) AS n FROM dbo.acct;
+SET XACT_ABORT OFF;
+GO
+BEGIN TRAN;
+BEGIN TRAN;
+INSERT dbo.acct VALUES (3, -500);
+COMMIT TRAN;
+SELECT @@TRANCOUNT AS trancount;
+COMMIT TRAN;
+SELECT @@TRANCOUNT AS trancount, COUNT(*) AS n FROM dbo.acct;
+GO
+BEGIN TRAN;
+SAVE TRAN s;
+INSERT dbo.acct VALUES (3, -500);
+ROLLBACK TRAN s;
+COMMIT TRAN;
+SELECT COUNT(*) AS n FROM dbo.acct;
+GO
+CREATE TABLE #tmp (v int);
+GO
+CREATE ASSERTION tmp_pos CHECK (NOT EXISTS (SELECT 1 FROM #tmp WHERE v < 0))
+```
+
+```text
+(1 row affected)
+
+(1 row affected)
+
+Msg 547, Level 16, State 1, Line 4
+The COMMIT TRANSACTION statement conflicted with the assertion "late_pos". The conflict occurred in database "lexdb", table "dbo.acct".
+trancount n
+--------- -
+0         1
+
+(1 row affected)
+
+(1 row affected)
+
+trancount
+---------
+1
+
+(1 row affected)
+
+Msg 547, Level 16, State 1, Line 6
+The COMMIT TRANSACTION statement conflicted with the assertion "late_pos". The conflict occurred in database "lexdb", table "dbo.acct".
+trancount n
+--------- -
+0         1
+
+(1 row affected)
+
+(1 row affected)
+
+n
+-
+1
+
+(1 row affected)
+
+Msg 50000, Level 16, State 1, Line 1
+lexdb: an assertion cannot read a temporary table ("#tmp")
 ```
 
 ## See also

@@ -331,6 +331,71 @@ DROP TABLE
 (1 row)
 ```
 
+### H. Other ways in: a savepoint, a cascade, ALTER TYPE, TRUNCATE, a rename, a temporary table
+
+<!-- example: postgresql -->
+```sql
+CREATE TABLE acct (id int PRIMARY KEY, bal int);
+INSERT INTO acct VALUES (1, 5);
+CREATE ASSERTION bal_pos CHECK (NOT EXISTS (SELECT 1 FROM acct WHERE bal < 0));
+BEGIN;
+INSERT INTO acct VALUES (2, -5);
+SELECT 1;
+ROLLBACK;
+BEGIN;
+SAVEPOINT s;
+INSERT INTO acct VALUES (2, -5);
+ROLLBACK TO s;
+INSERT INTO acct VALUES (2, 5);
+COMMIT;
+CREATE TEMP TABLE scratch (v int);
+CREATE ASSERTION scratch_pos CHECK (NOT EXISTS (SELECT 1 FROM scratch WHERE v < 0));
+CREATE TABLE parent (id int PRIMARY KEY);
+CREATE TABLE child (id int PRIMARY KEY, pid int REFERENCES parent ON DELETE CASCADE);
+INSERT INTO parent VALUES (1);
+INSERT INTO child VALUES (1, 1);
+CREATE ASSERTION has_child CHECK (EXISTS (SELECT 1 FROM child));
+DELETE FROM parent WHERE id = 1;
+TRUNCATE child;
+CREATE TABLE label (id int, v text);
+INSERT INTO label VALUES (1, '5');
+CREATE ASSERTION label_small CHECK (NOT EXISTS (SELECT 1 FROM label WHERE v = '5000'));
+ALTER TABLE label ALTER COLUMN v TYPE int USING v::int * 1000;
+ALTER TABLE acct RENAME TO acct2;
+ALTER TABLE acct RENAME COLUMN bal TO amount;
+```
+
+```text
+CREATE TABLE
+INSERT 0 1
+CREATE ASSERTION
+BEGIN
+ERROR:  assertion "bal_pos" is violated
+ERROR:  current transaction is aborted, commands ignored until end of transaction block
+ROLLBACK
+BEGIN
+SAVEPOINT
+ERROR:  assertion "bal_pos" is violated
+ROLLBACK
+INSERT 0 1
+COMMIT
+CREATE TABLE
+ERROR:  lexdb: an assertion cannot read a temporary table ("scratch")
+CREATE TABLE
+CREATE TABLE
+INSERT 0 1
+INSERT 0 1
+CREATE ASSERTION
+ERROR:  assertion "has_child" is violated
+ERROR:  assertion "has_child" is violated
+CREATE TABLE
+INSERT 0 1
+CREATE ASSERTION
+ERROR:  assertion "label_small" is violated
+ERROR:  cannot rename table acct because assertion bal_pos reads it
+ERROR:  cannot rename column bal of table acct because assertion bal_pos reads it
+```
+
 ## See also
 
 [DROP ASSERTION](drop-assertion.md) · [SET CONSTRAINTS](set-constraints.md) · [COPY](copy.md) ·
