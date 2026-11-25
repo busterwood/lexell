@@ -1,0 +1,95 @@
+// LexDB-shaped benchmark: columnar bit-packed integer decoding + filter + multiply-sum
+// (mirrors lexdb_cols / lexdb_vec scanning compressed lineitem columns in TPC-H Q1/Q6).
+
+fn packCol(vals: &[int], bits: int): []byte {
+    let n = len(vals)
+    let totalBits = n * bits
+    var out = array((totalBits + 7) / 8 + 8, byte(0))
+    var bitPos = 0
+    for i in 0..n {
+        let v = vals[i]
+        var b = 0
+        while b < bits {
+            let byteIdx = (bitPos + b) >> 3
+            let bitOff = (bitPos + b) & 7
+            let take = 8 - bitOff
+            let rem = bits - b
+            let k = if take < rem { take } else { rem }
+            let mask = (1 << k) - 1
+            let chunk = (v >> b) & mask
+            out[byteIdx] = byte(int(out[byteIdx]) | (chunk << bitOff))
+            b += k
+        }
+        bitPos += bits
+    }
+    return out
+}
+
+fn unpackBatch(buf: &[byte], startIdx: int, count: int, bits: int, baseVal: int, dst: mut &[int]) {
+    let mask = (1 << bits) - 1
+    var bitPos = startIdx * bits
+    for i in 0..count {
+        let byteIdx = bitPos >> 3
+        let bitOff = bitPos & 7
+        // Read 4 consecutive bytes little-endian (enough for bits <= 25)
+        let w = int(buf[byteIdx]) |
+            (int(buf[byteIdx + 1]) << 8) |
+            (int(buf[byteIdx + 2]) << 16) |
+            (int(buf[byteIdx + 3]) << 24)
+        dst[i] = baseVal + ((w >> bitOff) & mask)
+        bitPos += bits
+    }
+}
+
+fn main() {
+    let n = 1000000
+    let batch = 1024
+    var rawQty = array(n, 0)
+    var rawDisc = array(n, 0)
+    var rawPrice = array(n, 0)
+    var s = 123456789
+    for i in 0..n {
+        s = ((s *% 6364136223846793005) +% 1442695040888963407) & 4611686018427387903
+        rawQty[i] = (s >> 16) & 63          // 6-bit (0..63), base 1
+        rawDisc[i] = (s >> 24) & 15         // 4-bit (0..15), base 0
+        rawPrice[i] = (s >> 30) & 131071    // 17-bit (0..131071), base 90000
+    }
+    let pQty = packCol(&rawQty[0..n], 6)
+    let pDisc = packCol(&rawDisc[0..n], 4)
+    let pPrice = packCol(&rawPrice[0..n], 17)
+
+    var qty = array(batch, 0)
+    var disc = array(batch, 0)
+    var price = array(batch, 0)
+    var sel = array(batch, 0)
+
+    var total = 0
+    for round in 0..60 {
+        let loDisc = 4 + (round & 3)
+        let hiDisc = loDisc + 4
+        let maxQty = 30 + (round & 7)
+        var pos = 0
+        while pos < n {
+            let cnt = if n - pos < batch { n - pos } else { batch }
+            unpackBatch(&pQty[0..len(pQty)], pos, cnt, 6, 1, mut &qty[0..batch])
+            unpackBatch(&pDisc[0..len(pDisc)], pos, cnt, 4, 0, mut &disc[0..batch])
+            unpackBatch(&pPrice[0..len(pPrice)], pos, cnt, 17, 90000, mut &price[0..batch])
+            var nsel = 0
+            for i in 0..cnt {
+                let d = disc[i]
+                if d >= loDisc && d <= hiDisc && qty[i] < maxQty {
+                    sel[nsel] = i
+                    nsel += 1
+                }
+            }
+            var acc = 0
+            for j in 0..nsel {
+                let idx = sel[j]
+                acc += price[idx] * disc[idx]
+            }
+            total += acc
+            pos += cnt
+        }
+    }
+    println(total)
+}

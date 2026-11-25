@@ -628,6 +628,532 @@ fn bench_matmul() {
     println!("{}", total);
 }
 
+// ---------------------------------------------------------------- bitpack
+
+fn pack_col(vals: &[i64], bits: usize) -> Vec<u8> {
+    let n = vals.len();
+    let total_bits = n * bits;
+    let mut out = vec![0u8; (total_bits + 7) / 8 + 8];
+    let mut bit_pos = 0usize;
+    for &v in vals {
+        let mut b = 0usize;
+        while b < bits {
+            let byte_idx = (bit_pos + b) >> 3;
+            let bit_off = (bit_pos + b) & 7;
+            let take = 8 - bit_off;
+            let rem = bits - b;
+            let k = if take < rem { take } else { rem };
+            let mask = (1i64 << k) - 1;
+            let chunk = (v >> b) & mask;
+            out[byte_idx] = (out[byte_idx] as i64 | (chunk << bit_off)) as u8;
+            b += k;
+        }
+        bit_pos += bits;
+    }
+    out
+}
+
+fn unpack_batch(buf: &[u8], start_idx: usize, count: usize, bits: usize, base_val: i64, dst: &mut [i64]) {
+    let mask = (1i64 << bits) - 1;
+    let mut bit_pos = start_idx * bits;
+    for i in 0..count {
+        let byte_idx = bit_pos >> 3;
+        let bit_off = bit_pos & 7;
+        let w = (buf[byte_idx] as i64)
+            | ((buf[byte_idx + 1] as i64) << 8)
+            | ((buf[byte_idx + 2] as i64) << 16)
+            | ((buf[byte_idx + 3] as i64) << 24);
+        dst[i] = base_val + ((w >> bit_off) & mask);
+        bit_pos += bits;
+    }
+}
+
+fn bench_bitpack() {
+    let n = black_box(1_000_000usize);
+    let batch = 1024usize;
+    let mut raw_qty = vec![0i64; n];
+    let mut raw_disc = vec![0i64; n];
+    let mut raw_price = vec![0i64; n];
+    let mut s = 123_456_789i64;
+    for i in 0..n {
+        s = (s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) & 4611686018427387903;
+        raw_qty[i] = (s >> 16) & 63;
+        raw_disc[i] = (s >> 24) & 15;
+        raw_price[i] = (s >> 30) & 131071;
+    }
+    let p_qty = pack_col(&raw_qty, 6);
+    let p_disc = pack_col(&raw_disc, 4);
+    let p_price = pack_col(&raw_price, 17);
+
+    let mut qty = vec![0i64; batch];
+    let mut disc = vec![0i64; batch];
+    let mut price = vec![0i64; batch];
+    let mut sel = vec![0usize; batch];
+
+    let mut total = 0i64;
+    for round in 0..60i64 {
+        let lo_disc = 4 + (round & 3);
+        let hi_disc = lo_disc + 4;
+        let max_qty = 30 + (round & 7);
+        let mut pos = 0usize;
+        while pos < n {
+            let cnt = if n - pos < batch { n - pos } else { batch };
+            unpack_batch(&p_qty, pos, cnt, 6, 1, &mut qty);
+            unpack_batch(&p_disc, pos, cnt, 4, 0, &mut disc);
+            unpack_batch(&p_price, pos, cnt, 17, 90000, &mut price);
+            let mut nsel = 0usize;
+            for i in 0..cnt {
+                let d = disc[i];
+                if d >= lo_disc && d <= hi_disc && qty[i] < max_qty {
+                    sel[nsel] = i;
+                    nsel += 1;
+                }
+            }
+            let mut acc = 0i64;
+            for j in 0..nsel {
+                let idx = sel[j];
+                acc += price[idx] * disc[idx];
+            }
+            total += acc;
+            pos += cnt;
+        }
+    }
+    println!("{}", total);
+}
+
+// ---------------------------------------------------------------- btree
+
+const BT_MAX_KEYS: usize = 31;
+const BT_MID: usize = 15;
+
+struct BtNode {
+    leaf: bool,
+    keys: Vec<i64>,
+    vals: Vec<i64>,
+    kids: Vec<Box<BtNode>>,
+}
+
+struct BtSplit {
+    promoted: bool,
+    key: i64,
+    right: Option<Box<BtNode>>,
+}
+
+fn bt_new_leaf() -> Box<BtNode> {
+    Box::new(BtNode {
+        leaf: true,
+        keys: Vec::new(),
+        vals: Vec::new(),
+        kids: Vec::new(),
+    })
+}
+
+fn bt_lower_bound(keys: &[i64], key: i64) -> usize {
+    let mut lo = 0usize;
+    let mut hi = keys.len();
+    while lo < hi {
+        let mid = (lo + hi) >> 1;
+        if keys[mid] < key {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+fn bt_search(mut cur: &BtNode, key: i64) -> i64 {
+    loop {
+        let i = bt_lower_bound(&cur.keys, key);
+        if cur.leaf {
+            if i < cur.keys.len() && cur.keys[i] == key {
+                return cur.vals[i];
+            }
+            return -1;
+        }
+        if i < cur.keys.len() && cur.keys[i] == key {
+            cur = &cur.kids[i + 1];
+        } else {
+            cur = &cur.kids[i];
+        }
+    }
+}
+
+fn bt_range_sum(node: &BtNode, lo: i64, hi: i64) -> i64 {
+    let i = bt_lower_bound(&node.keys, lo);
+    let mut sum = 0i64;
+    if node.leaf {
+        let mut j = i;
+        while j < node.keys.len() && node.keys[j] <= hi {
+            sum += node.vals[j];
+            j += 1;
+        }
+        return sum;
+    }
+    let mut j = i;
+    while j < node.keys.len() {
+        sum += bt_range_sum(&node.kids[j], lo, hi);
+        if node.keys[j] > hi {
+            return sum;
+        }
+        j += 1;
+    }
+    sum += bt_range_sum(&node.kids[node.keys.len()], lo, hi);
+    sum
+}
+
+fn bt_insert_rec(node: &mut BtNode, key: i64, val: i64) -> BtSplit {
+    let pos = bt_lower_bound(&node.keys, key);
+    if node.leaf {
+        if pos < node.keys.len() && node.keys[pos] == key {
+            node.vals[pos] = val;
+            return BtSplit { promoted: false, key: 0, right: None };
+        }
+        node.keys.insert(pos, key);
+        node.vals.insert(pos, val);
+        if node.keys.len() <= BT_MAX_KEYS {
+            return BtSplit { promoted: false, key: 0, right: None };
+        }
+        let rkeys = node.keys.split_off(BT_MID);
+        let rvals = node.vals.split_off(BT_MID);
+        let pkey = rkeys[0];
+        return BtSplit {
+            promoted: true,
+            key: pkey,
+            right: Some(Box::new(BtNode { leaf: true, keys: rkeys, vals: rvals, kids: Vec::new() })),
+        };
+    }
+    let ci = if pos < node.keys.len() && node.keys[pos] == key { pos + 1 } else { pos };
+    let sp = bt_insert_rec(&mut node.kids[ci], key, val);
+    if !sp.promoted {
+        return sp;
+    }
+    let right_node = sp.right.unwrap();
+    node.keys.insert(ci, sp.key);
+    node.kids.insert(ci + 1, right_node);
+    if node.keys.len() <= BT_MAX_KEYS {
+        return BtSplit { promoted: false, key: 0, right: None };
+    }
+    let pkey = node.keys[BT_MID];
+    let rkeys = node.keys.split_off(BT_MID + 1);
+    node.keys.pop();
+    let rkids = node.kids.split_off(BT_MID + 1);
+    BtSplit {
+        promoted: true,
+        key: pkey,
+        right: Some(Box::new(BtNode { leaf: false, keys: rkeys, vals: Vec::new(), kids: rkids })),
+    }
+}
+
+fn bt_insert_root(root: &mut Box<BtNode>, key: i64, val: i64) {
+    let sp = bt_insert_rec(root, key, val);
+    if sp.promoted {
+        let right_node = sp.right.unwrap();
+        let old_root = std::mem::replace(root, bt_new_leaf());
+        *root = Box::new(BtNode {
+            leaf: false,
+            keys: vec![sp.key],
+            vals: Vec::new(),
+            kids: vec![old_root, right_node],
+        });
+    }
+}
+
+fn bench_btree() {
+    let n = black_box(100_000i64);
+    let mut root = bt_new_leaf();
+    let mut s = 987_654_321i64;
+    for i in 0..n {
+        s = (s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) & 4611686018427387903;
+        let k = (s >> 12) & 1048575;
+        bt_insert_root(&mut root, k, i + 1);
+    }
+
+    let mut total = 0i64;
+    s = 987_654_321i64;
+    for _round in 0..10 {
+        for _i in 0..n {
+            s = (s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) & 4611686018427387903;
+            let k = (s >> 12) & 1048575;
+            let v = bt_search(&root, k);
+            if v >= 0 {
+                total += v;
+            }
+        }
+    }
+    for i in 0..30_000i64 {
+        let lo = (i * 31) & 1048575;
+        total += bt_range_sum(&root, lo, lo + 200);
+    }
+    println!("{}", total);
+}
+
+// ---------------------------------------------------------------- hashagg
+
+#[inline]
+fn hashagg_hash2(k1: i64, k2: i64) -> i64 {
+    let mut h = k1.wrapping_mul(2654435761) ^ k2.wrapping_mul(2246822519);
+    h = (h ^ (h >> 16)).wrapping_mul(2246822519);
+    h = h ^ (h >> 13);
+    h & 4611686018427387903
+}
+
+fn bench_hashagg() {
+    let n = black_box(1_000_000usize);
+    let mut col_k1 = vec![0i64; n];
+    let mut col_k2 = vec![0i64; n];
+    let mut col_val = vec![0i64; n];
+    let mut s = 42_424_242i64;
+    for i in 0..n {
+        s = (s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) & 4611686018427387903;
+        col_k1[i] = (s >> 16) & 255;
+        col_k2[i] = (s >> 24) & 63;
+        col_val[i] = ((s >> 32) & 65535) - 32768;
+    }
+
+    let cap = 32768usize;
+    let mask = cap - 1;
+    let mut slots = vec![-1i64; cap];
+    let mut g_k1 = vec![0i64; cap];
+    let mut g_k2 = vec![0i64; cap];
+    let mut g_cnt = vec![0i64; cap];
+    let mut g_sum = vec![0i64; cap];
+    let mut g_min = vec![0i64; cap];
+    let mut g_max = vec![0i64; cap];
+
+    let mut checksum = 0i64;
+    for round in 0..10i64 {
+        slots.fill(-1);
+        let mut ng = 0usize;
+        for i in 0..n {
+            let k1 = col_k1[i];
+            let k2 = col_k2[i];
+            let v = col_val[i] + round;
+            let mut h = (hashagg_hash2(k1, k2) as usize) & mask;
+            loop {
+                let g = slots[h];
+                if g < 0 {
+                    slots[h] = ng as i64;
+                    g_k1[ng] = k1;
+                    g_k2[ng] = k2;
+                    g_cnt[ng] = 1;
+                    g_sum[ng] = v;
+                    g_min[ng] = v;
+                    g_max[ng] = v;
+                    ng += 1;
+                    break;
+                }
+                let gu = g as usize;
+                if g_k1[gu] == k1 && g_k2[gu] == k2 {
+                    g_cnt[gu] += 1;
+                    g_sum[gu] += v;
+                    if v < g_min[gu] { g_min[gu] = v; }
+                    if v > g_max[gu] { g_max[gu] = v; }
+                    break;
+                }
+                h = (h + 1) & mask;
+            }
+        }
+        for g in 0..ng {
+            checksum += g_cnt[g] + g_sum[g] + g_min[g] + g_max[g];
+        }
+    }
+    println!("{}", checksum);
+}
+
+// ---------------------------------------------------------------- varint_csv
+
+fn put_varint(out: &mut Vec<u8>, mut v: i64) {
+    while v >= 128 {
+        out.push(((v & 127) | 128) as u8);
+        v >>= 7;
+    }
+    out.push(v as u8);
+}
+
+fn parse_csv_int(buf: &[u8], start: usize, end: usize) -> i64 {
+    let mut i = start;
+    let mut neg = false;
+    if i < end && buf[i] == b'-' {
+        neg = true;
+        i += 1;
+    }
+    let mut acc = 0i64;
+    while i < end {
+        acc = acc * 10 + (buf[i] - b'0') as i64;
+        i += 1;
+    }
+    if neg { -acc } else { acc }
+}
+
+fn append_csv_int(out: &mut Vec<u8>, mut v: i64) {
+    if v < 0 {
+        out.push(b'-');
+        v = -v;
+    }
+    if v == 0 {
+        out.push(b'0');
+        return;
+    }
+    let mut tmp = Vec::new();
+    while v > 0 {
+        tmp.push(b'0' + (v % 10) as u8);
+        v /= 10;
+    }
+    while let Some(b) = tmp.pop() {
+        out.push(b);
+    }
+}
+
+fn build_csv(rows: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let codes = b"ABCDEFGHIJKLMNOP";
+    let mut s = 7_777_777i64;
+    for i in 0..rows {
+        s = (s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) & 4611686018427387903;
+        append_csv_int(&mut buf, (i + 1) as i64);
+        buf.push(b'|');
+        append_csv_int(&mut buf, ((s >> 16) & 63) + 1);
+        buf.push(b'|');
+        append_csv_int(&mut buf, ((s >> 24) & 65535) + 1000);
+        buf.push(b'|');
+        let c1 = ((s >> 40) & 15) as usize;
+        let c2 = ((s >> 44) & 15) as usize;
+        buf.push(codes[c1]);
+        buf.push(codes[c2]);
+        buf.push(codes[(c1 + c2) & 15]);
+        buf.push(b'\n');
+    }
+    buf
+}
+
+fn bench_varint_csv() {
+    let csv = black_box(build_csv(120_000));
+    let n = csv.len();
+    let mut total = 0i64;
+    for round in 0..25i64 {
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        let mut row_hash = 0i64;
+        while pos < n {
+            let f0 = pos;
+            while csv[pos] != b'|' { pos += 1; }
+            let id = parse_csv_int(&csv, f0, pos);
+            pos += 1;
+
+            let f1 = pos;
+            while csv[pos] != b'|' { pos += 1; }
+            let qty = parse_csv_int(&csv, f1, pos);
+            pos += 1;
+
+            let f2 = pos;
+            while csv[pos] != b'|' { pos += 1; }
+            let price = parse_csv_int(&csv, f2, pos);
+            pos += 1;
+
+            let mut code_h = 0i64;
+            while csv[pos] != b'\n' {
+                code_h = code_h * 31 + csv[pos] as i64;
+                pos += 1;
+            }
+            pos += 1;
+
+            put_varint(&mut out, id);
+            put_varint(&mut out, qty);
+            put_varint(&mut out, price);
+            row_hash += code_h;
+        }
+        let mut sum_b = 0i64;
+        for &b in &out { sum_b += b as i64; }
+        total += out.len() as i64 + sum_b + row_hash + round;
+    }
+    println!("{}", total);
+}
+
+// ---------------------------------------------------------------- enum_eval
+
+enum Expr {
+    Col(usize),
+    Lit(i64),
+    Add(Box<Expr>, Box<Expr>),
+    Sub(Box<Expr>, Box<Expr>),
+    Mul(Box<Expr>, Box<Expr>),
+    Lt(Box<Expr>, Box<Expr>),
+    And(Box<Expr>, Box<Expr>),
+    If(Box<Expr>, Box<Expr>, Box<Expr>),
+}
+
+fn eval_row(e: &Expr, c0: &[i64], c1: &[i64], c2: &[i64], c3: &[i64], row: usize) -> i64 {
+    match e {
+        Expr::Col(k) => match *k {
+            0 => c0[row],
+            1 => c1[row],
+            2 => c2[row],
+            _ => c3[row],
+        },
+        Expr::Lit(v) => *v,
+        Expr::Add(a, b) => eval_row(a, c0, c1, c2, c3, row) + eval_row(b, c0, c1, c2, c3, row),
+        Expr::Sub(a, b) => eval_row(a, c0, c1, c2, c3, row) - eval_row(b, c0, c1, c2, c3, row),
+        Expr::Mul(a, b) => eval_row(a, c0, c1, c2, c3, row) * eval_row(b, c0, c1, c2, c3, row),
+        Expr::Lt(a, b) => if eval_row(a, c0, c1, c2, c3, row) < eval_row(b, c0, c1, c2, c3, row) { 1 } else { 0 },
+        Expr::And(a, b) => {
+            if eval_row(a, c0, c1, c2, c3, row) == 0 { return 0; }
+            if eval_row(b, c0, c1, c2, c3, row) != 0 { 1 } else { 0 }
+        }
+        Expr::If(cond, t, f) => {
+            if eval_row(cond, c0, c1, c2, c3, row) != 0 {
+                eval_row(t, c0, c1, c2, c3, row)
+            } else {
+                eval_row(f, c0, c1, c2, c3, row)
+            }
+        }
+    }
+}
+
+fn bench_enum_eval() {
+    let expr = black_box(Expr::If(
+        Box::new(Expr::And(
+            Box::new(Expr::Lt(Box::new(Expr::Col(0)), Box::new(Expr::Lit(25)))),
+            Box::new(Expr::Lt(Box::new(Expr::Col(1)), Box::new(Expr::Lit(8)))),
+        )),
+        Box::new(Expr::Mul(
+            Box::new(Expr::Col(2)),
+            Box::new(Expr::Sub(Box::new(Expr::Lit(100)), Box::new(Expr::Col(1)))),
+        )),
+        Box::new(Expr::Add(
+            Box::new(Expr::Mul(
+                Box::new(Expr::Col(2)),
+                Box::new(Expr::Sub(Box::new(Expr::Lit(100)), Box::new(Expr::Col(3)))),
+            )),
+            Box::new(Expr::Col(0)),
+        )),
+    ));
+
+    let n = black_box(500_000usize);
+    let mut c0 = vec![0i64; n];
+    let mut c1 = vec![0i64; n];
+    let mut c2 = vec![0i64; n];
+    let mut c3 = vec![0i64; n];
+    let mut s = 135_792_468i64;
+    for i in 0..n {
+        s = (s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) & 4611686018427387903;
+        c0[i] = (s >> 16) & 63;
+        c1[i] = (s >> 22) & 15;
+        c2[i] = ((s >> 26) & 4095) + 100;
+        c3[i] = (s >> 38) & 15;
+    }
+
+    let mut total = 0i64;
+    for round in 0..8i64 {
+        let mut acc = 0i64;
+        for i in 0..n {
+            acc += eval_row(&expr, &c0, &c1, &c2, &c3, i);
+        }
+        total += acc + round;
+    }
+    println!("{}", total);
+}
+
 fn main() {
     let mut args = env::args().skip(1);
     let bench = args.next().unwrap_or_else(|| {
@@ -660,6 +1186,11 @@ fn main() {
         "interp" => bench_interp(),
         "closures" => bench_closures(),
         "matmul" => bench_matmul(),
+        "bitpack" => bench_bitpack(),
+        "btree" => bench_btree(),
+        "hashagg" => bench_hashagg(),
+        "varint_csv" => bench_varint_csv(),
+        "enum_eval" => bench_enum_eval(),
         other => {
             eprintln!("dbench: unknown benchmark {other}");
             std::process::exit(2);

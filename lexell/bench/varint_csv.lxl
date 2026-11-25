@@ -1,0 +1,114 @@
+// LexDB-shaped benchmark: COPY-style delimited text parsing + LEB128 varint encoding
+// (mirrors lexdb COPY ingestion + lexdb_wire / lexdb_page binary encoding).
+
+fn putVarint(out: mut &[]byte, v0: int) {
+    var v = v0
+    while v >= 128 {
+        append(out, byte((v & 127) | 128))
+        v = v >> 7
+    }
+    append(out, byte(v))
+}
+
+fn parseInt(buf: &[byte], start: int, end: int): int {
+    var i = start
+    var neg = false
+    if i < end && buf[i] == '-' {
+        neg = true
+        i += 1
+    }
+    var acc = 0
+    while i < end {
+        acc = acc * 10 + int(buf[i] - '0')
+        i += 1
+    }
+    return if neg { -acc } else { acc }
+}
+
+fn appendInt(out: mut &[]byte, v0: int) {
+    var v = v0
+    if v < 0 {
+        append(out, '-')
+        v = -v
+    }
+    if v == 0 {
+        append(out, '0')
+        return
+    }
+    var tmp: []byte = []
+    while v > 0 {
+        append(mut &tmp, byte(int('0') + (v % 10)))
+        v = v / 10
+    }
+    var k = len(tmp) - 1
+    while k >= 0 {
+        append(out, tmp[k])
+        k -= 1
+    }
+}
+
+fn buildCsv(rows: int): []byte {
+    var buf: []byte = []
+    let codes = "ABCDEFGHIJKLMNOP"
+    var s = 7777777
+    for i in 0..rows {
+        s = ((s *% 6364136223846793005) +% 1442695040888963407) & 4611686018427387903
+        appendInt(mut &buf, i + 1)
+        append(mut &buf, '|')
+        appendInt(mut &buf, ((s >> 16) & 63) + 1)
+        append(mut &buf, '|')
+        appendInt(mut &buf, ((s >> 24) & 65535) + 1000)
+        append(mut &buf, '|')
+        let c1 = (s >> 40) & 15
+        let c2 = (s >> 44) & 15
+        append(mut &buf, strByte(codes, c1))
+        append(mut &buf, strByte(codes, c2))
+        append(mut &buf, strByte(codes, (c1 + c2) & 15))
+        append(mut &buf, '\n')
+    }
+    return buf
+}
+
+fn main() {
+    let csv = buildCsv(120000)
+    let n = len(csv)
+    var out: []byte = []
+    var total = 0
+    for round in 0..25 {
+        out = []
+        var pos = 0
+        var rowHash = 0
+        while pos < n {
+            let f0 = pos
+            while csv[pos] != '|' { pos += 1 }
+            let id = parseInt(&csv[0..n], f0, pos)
+            pos += 1
+
+            let f1 = pos
+            while csv[pos] != '|' { pos += 1 }
+            let qty = parseInt(&csv[0..n], f1, pos)
+            pos += 1
+
+            let f2 = pos
+            while csv[pos] != '|' { pos += 1 }
+            let price = parseInt(&csv[0..n], f2, pos)
+            pos += 1
+
+            var codeH = 0
+            while csv[pos] != '\n' {
+                codeH = codeH * 31 + int(csv[pos])
+                pos += 1
+            }
+            pos += 1
+
+            putVarint(mut &out, id)
+            putVarint(mut &out, qty)
+            putVarint(mut &out, price)
+            rowHash += codeH
+        }
+        var sumB = 0
+        for i in 0..len(out) { sumB += int(out[i]) }
+        total += len(out) + sumB + rowHash + round
+    }
+    println(total)
+}

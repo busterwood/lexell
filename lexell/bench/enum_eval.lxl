@@ -1,0 +1,77 @@
+// LexDB-shaped benchmark: boxed closed-type expression AST evaluated over columnar batches
+// (mirrors lexdb_exec / lexdb_bind tag-dispatched SQL expression evaluation).
+
+type Expr = closed {
+    Col(int)
+    Lit(int)
+    Add(Expr, Expr)
+    Sub(Expr, Expr)
+    Mul(Expr, Expr)
+    Lt(Expr, Expr)
+    And(Expr, Expr)
+    If(Expr, Expr, Expr)
+}
+
+fn evalRow(e: &Expr, c0: &[int], c1: &[int], c2: &[int], c3: &[int], row: int): int {
+    match e {
+        Expr.Col(k) {
+            if k == 0 { return c0[row] }
+            if k == 1 { return c1[row] }
+            if k == 2 { return c2[row] }
+            return c3[row]
+        }
+        Expr.Lit(v) { return v }
+        Expr.Add(a, b) { return evalRow(a, c0, c1, c2, c3, row) + evalRow(b, c0, c1, c2, c3, row) }
+        Expr.Sub(a, b) { return evalRow(a, c0, c1, c2, c3, row) - evalRow(b, c0, c1, c2, c3, row) }
+        Expr.Mul(a, b) { return evalRow(a, c0, c1, c2, c3, row) * evalRow(b, c0, c1, c2, c3, row) }
+        Expr.Lt(a, b) {
+            return if evalRow(a, c0, c1, c2, c3, row) < evalRow(b, c0, c1, c2, c3, row) { 1 } else { 0 }
+        }
+        Expr.And(a, b) {
+            if evalRow(a, c0, c1, c2, c3, row) == 0 { return 0 }
+            return if evalRow(b, c0, c1, c2, c3, row) != 0 { 1 } else { 0 }
+        }
+        Expr.If(cond, t, f) {
+            if evalRow(cond, c0, c1, c2, c3, row) != 0 {
+                return evalRow(t, c0, c1, c2, c3, row)
+            }
+            return evalRow(f, c0, c1, c2, c3, row)
+        }
+    }
+}
+
+fn main() {
+    // CASE WHEN col0 < 25 AND col1 < 8 THEN col2 * (100 - col1) ELSE col2 * (100 - col3) + col0 END
+    let expr = Expr.If(
+        Expr.And(
+            Expr.Lt(Expr.Col(0), Expr.Lit(25)),
+            Expr.Lt(Expr.Col(1), Expr.Lit(8)),
+        ),
+        Expr.Mul(Expr.Col(2), Expr.Sub(Expr.Lit(100), Expr.Col(1))),
+        Expr.Add(Expr.Mul(Expr.Col(2), Expr.Sub(Expr.Lit(100), Expr.Col(3))), Expr.Col(0)),
+    )
+
+    let n = 500000
+    var c0 = array(n, 0)
+    var c1 = array(n, 0)
+    var c2 = array(n, 0)
+    var c3 = array(n, 0)
+    var s = 135792468
+    for i in 0..n {
+        s = ((s *% 6364136223846793005) +% 1442695040888963407) & 4611686018427387903
+        c0[i] = (s >> 16) & 63
+        c1[i] = (s >> 22) & 15
+        c2[i] = ((s >> 26) & 4095) + 100
+        c3[i] = (s >> 38) & 15
+    }
+
+    var total = 0
+    for round in 0..8 {
+        var acc = 0
+        for i in 0..n {
+            acc += evalRow(&expr, &c0[0..n], &c1[0..n], &c2[0..n], &c3[0..n], i)
+        }
+        total += acc + round
+    }
+    println(total)
+}
