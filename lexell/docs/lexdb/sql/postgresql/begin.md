@@ -44,6 +44,9 @@ transaction_mode:
   (`could not serialize access due to concurrent update`) and nothing of the block is kept. The application runs the block again. Row locks
   (`SELECT ... FOR UPDATE`, and the rows `UPDATE` and `DELETE` change) make a second writer wait instead, which
   removes the common case.
+- With `default_transaction_read_only` on (see `SET SESSION CHARACTERISTICS`, example G), a block starts read-only, and so
+  is a statement outside a block: 25006, except for writes to a temporary table that already exists. `BEGIN READ WRITE`
+  and a `SET TRANSACTION READ WRITE` before the first query override it.
 - `SET TRANSACTION READ ONLY` makes the block read-only at any time, also after its first query (a write is 25006);
   `SET TRANSACTION READ WRITE` makes a block that was made `READ ONLY` read-write only before its first query (25001
   `transaction read-write mode must be set before any query` after it); in a read-write block it changes nothing. The modes may come in any order, with or without commas. `SHOW transaction_read_only` says `on` in a
@@ -65,9 +68,10 @@ transaction_mode:
 - `BEGIN` ignores words it does not know: `BEGIN nonsense` starts a block where PostgreSQL gives 42601.
 - `BEGIN` inside a block, and `COMMIT` or `ROLLBACK` outside one, give no `WARNING` (PostgreSQL warns `there is
   already a transaction in progress` and `there is no transaction in progress`).
-- `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` and `READ WRITE` are accepted and do nothing: write the mode in
-  `BEGIN`, or `SET TRANSACTION` in the block (PostgreSQL makes it the default of the session's later blocks, and `SHOW
-  default_transaction_read_only` says so). Its isolation level is taken.
+- `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` and `READ WRITE` set `default_transaction_read_only`, as `SET
+  default_transaction_read_only` and `RESET` do (example G); an isolation level in it is taken, and one alone leaves the
+  read-only default as it was. The setting is **not undone** when the block that set it rolls back (PostgreSQL undoes
+  it: after `BEGIN; SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY; ROLLBACK;` it is `off` there, `on` in lexdb).
 - `SET TRANSACTION` outside a block gives no `WARNING` (PostgreSQL: `SET TRANSACTION can only be used in transaction
   blocks`), and does nothing.
 - `PREPARE TRANSACTION` (two-phase commit) is not supported.
@@ -300,6 +304,53 @@ CREATE TABLE
 INSERT 0 1
 ROLLBACK
 ERROR:  relation "audit" does not exist
+```
+
+### G. The session's default
+
+`SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` makes later blocks, and statements outside a block, read-only
+until a block asks for `READ WRITE` or the default is set back.
+
+<!-- example: postgresql -->
+```sql
+SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY;
+SHOW default_transaction_read_only;
+UPDATE acct SET bal = bal + 1 WHERE id = 1;
+BEGIN;
+SHOW transaction_read_only;
+UPDATE acct SET bal = bal + 1 WHERE id = 1;
+ROLLBACK;
+BEGIN READ WRITE;
+UPDATE acct SET bal = bal + 1 WHERE id = 1;
+ROLLBACK;
+SET SESSION CHARACTERISTICS AS TRANSACTION READ WRITE;
+SHOW default_transaction_read_only;
+```
+
+```text
+SET
+ default_transaction_read_only
+-------------------------------
+ on
+(1 row)
+
+ERROR:  cannot execute UPDATE in a read-only transaction
+BEGIN
+ transaction_read_only
+-----------------------
+ on
+(1 row)
+
+ERROR:  cannot execute UPDATE in a read-only transaction
+ROLLBACK
+BEGIN
+UPDATE 1
+ROLLBACK
+SET
+ default_transaction_read_only
+-------------------------------
+ off
+(1 row)
 ```
 
 ## See also

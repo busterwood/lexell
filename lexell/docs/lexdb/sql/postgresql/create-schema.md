@@ -38,8 +38,6 @@ role_specification:
 - `search_path` is `public` by default; PostgreSQL's default is `"$user", public`.
 - The schema elements (`CREATE SCHEMA app CREATE TABLE t (...) ...`) are a syntax error: make the objects with their
   own statements.
-- `information_schema.schemata.schema_owner` shows `postgres` for every schema; `pg_namespace.nspowner` has the
-  real owner.
 
 ## Examples
 

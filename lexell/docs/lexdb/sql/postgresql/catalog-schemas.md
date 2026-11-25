@@ -33,7 +33,7 @@ NULL, zero, false or empty.
   own.
 
 `information_schema.schemata`: one row per schema
-: `catalog_name` (`lexdb`), `schema_name`, `schema_owner`.
+: `catalog_name` (`lexdb`), `schema_name`, `schema_owner` (the schema's owner: its `AUTHORIZATION` role, as `pg_namespace.nspowner`).
 
 ## Remarks
 
@@ -43,8 +43,6 @@ NULL, zero, false or empty.
 
 ## Differences from PostgreSQL
 
-- `information_schema.schemata.schema_owner` is always `postgres`, whatever the owner (`pg_namespace.nspowner` is
-  right).
 - There is one database; `CREATE DATABASE` is refused.
 
 ## Examples
@@ -73,7 +71,7 @@ CREATE SCHEMA
 
     schema_name     | schema_owner
 --------------------+--------------
- app                | postgres
+ app                | alice
  information_schema | postgres
  pg_catalog         | postgres
  public             | postgres

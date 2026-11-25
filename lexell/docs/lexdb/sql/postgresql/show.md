@@ -37,7 +37,7 @@ SHOW ALL
   | `max_identifier_length` | `63` |
   | `transaction_isolation` | `serializable`; `read committed` in a block begun with that level, and after `SET default_transaction_isolation` |
   | `is_superuser` | `on` |
-  | `transaction_read_only`, `default_transaction_read_only`, `in_hot_standby` | `on` on a replica, else `off` |
+  | `transaction_read_only`, `default_transaction_read_only`, `in_hot_standby` | `on` on a replica, else `off`; `default_transaction_read_only` follows `SET`, and `transaction_read_only` is `on` in a read-only block |
 
 - `current_setting(name)` gives the same value as a function.
 
@@ -45,7 +45,7 @@ SHOW ALL
 
 - `server_version` is `16.0`, though lexdb follows PostgreSQL 18: clients choose their queries by it.
 - `SHOW ALL` lists lexdb's settings only (and not `TimeZone`), not PostgreSQL's 300 and more.
-- `transaction_read_only` is `off` even in a `READ ONLY` block, and `is_superuser` is `on` for every role.
+- `is_superuser` is `on` for every role.
 - A name that `SET` accepted and ignored (`work_mem`) is 42704.
 
 ## Examples

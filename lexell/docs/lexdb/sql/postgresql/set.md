@@ -31,6 +31,7 @@ SET SCHEMA 'schema_name'
   | `max_statement_mem` | `256MB` | The memory a statement may hold for sorts, groups and the like, before 53200. |
   | `max_recursion` | `1000` | Rounds a recursive `WITH` query may add rows in, before 54001; 0 is no limit. |
   | `max_match_steps` | `10000000` | Steps a `MATCH_RECOGNIZE` search from one row may take, before 54001; 0 is no limit. |
+  | `default_transaction_read_only` | `off` | Whether blocks and statements outside a block start read-only (25006 for a write); `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` sets it (see [BEGIN](begin.md), example G). |
   | `lexdb_planner` | `cost` | `cost`, or `rules` for the older rule-based plans. |
   | `lexdb_batch` | `on` | Whether scans and operators work on batches of rows; `off` runs them a row at a time. |
   | `lexdb_autoanalyze` | `on` | Whether the session's changes count towards the statistics that are gathered on their own. |
@@ -46,7 +47,8 @@ SET SCHEMA 'schema_name'
 
 ## Remarks
 
-- A `SET` in a transaction block that rolls back is undone.
+- A `SET` in a transaction block that rolls back is undone, except `default_transaction_read_only` (and `SET SESSION
+  CHARACTERISTICS AS TRANSACTION READ ONLY | READ WRITE`, which set it): it stays as the block set it.
 - `set_config(name, value, is_local)` is the function form.
 - `pg_settings` is empty; `SHOW ALL` lists lexdb's settings.
 
