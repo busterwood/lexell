@@ -35,8 +35,8 @@ SELECT ... FROM { USER_ | ALL_ | DBA_ }{ VIEWS | SEQUENCES | SOURCE | PROCEDURES
   `TEXT` (`PLS-00201: identifier 'NOTHERE' must be declared`, then `PL/SQL: Statement ignored`), `ATTRIBUTE` (`ERROR`),
   `MESSAGE_NUMBER`. `ALL_ERRORS` and `DBA_ERRORS` hold the same rows. A unit with errors is `INVALID` in `USER_OBJECTS`;
   the rows go when the unit compiles again. A unit is stored with errors when its body has an undeclared name, an
-  expression that does not parse, DML on a table that does not exist, or a subprogram declared inside it ([CREATE
-  FUNCTION](create-function.md), examples I and J).
+  expression that does not parse, or DML on a table that does not exist ([CREATE
+  FUNCTION](create-function.md), example I). Errors in a nested subprogram are errors of the unit, at their own lines.
 
 `USER_TRIGGERS`, `USER_SYNONYMS`
 : No rows: lexdb has no triggers and no synonyms.

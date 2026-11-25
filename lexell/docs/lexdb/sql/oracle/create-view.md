@@ -68,6 +68,9 @@ annotations_clause:
   the view's next use and keeps a view `INVALID` until its next use; lexdb's `STATUS` and `USER_ERRORS` say what
   the view's query does now. A `SELECT *` view over a table that lost a column and gained another reads the columns
   by position, where Oracle reads them by name.
+- `DROP TABLE` of a table a view reads is done, as in Oracle: the view is `INVALID`, reading it is ORA-04063 and
+  `USER_ERRORS` has ORA-00942. When a table of that name is made again the view is `VALID` at once (Oracle: at the view's
+  next use); see [DROP TABLE](drop-table.md), example E.
 - `CREATE VIEW` over a function that was created with compilation errors (`INVALID`) is ORA-06575, as in Oracle (see
   [CREATE FUNCTION](create-function.md), example I).
 - `ALTER VIEW ... READ ONLY` is ORA-03001; Oracle gives ORA-42310 for a view that is not an editioning view.

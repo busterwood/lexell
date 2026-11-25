@@ -59,14 +59,20 @@ END [ function ] ;
 - **Compilation errors are found for names and syntax only.** An undeclared name, an expression that does not parse,
   a SQL statement that does not parse and DML on a missing table make the function `INVALID` when it is created
   (example I; a SQL statement's error is ORA-00936, or ORA-00907 with a parenthesis left open, at the token where
-  lexdb's parser stopped: Oracle's number may differ for other syntax errors, and a `SELECT ... INTO` with a
-  parenthesis left open before `INTO` is PLS-00428 where Oracle gives ORA-00907). Type errors, argument counts and
+  lexdb's parser stopped: Oracle's number may differ for other syntax errors; a `SELECT ... INTO` with a
+  parenthesis left open before `INTO` is ORA-00907, as in Oracle). Type errors, argument counts and
   unknown columns of a `SELECT INTO` appear when the code runs, and a package body or an anonymous block with any
-  error is also found when it runs (Oracle: ORA-06550 first for a block). Nested subprograms leave the function
-  `INVALID` (example J).
+  error is also found when it runs (Oracle: ORA-06550 first for a block).
+- **Nested subprograms** (a `PROCEDURE` or `FUNCTION` in the declarations of the function, of a block or of another
+  nested subprogram) work: forward declarations, recursion, calls between them, and the enclosing units' variables
+  (example K). Not supported: overloading them (one subprogram to a name in a scope: with two `sq` of different
+  argument types the later one is used for both calls, where Oracle picks by the arguments), and calling a nested
+  function from SQL inside the unit (`SELECT sq(3) INTO r FROM dual`: the unit is stored `VALID`, and the statement is
+  ORA-00904 when it runs; Oracle refuses the unit with PLS-00231).
 - A call's column name is the call as written: `SELECT f(1) FROM dual` names the column `F(1)`, `5+f(3)` is `5+F(3)`
-  and `f(id)` is `F(ID)`, as in Oracle (example A). A call of a function whose name is quoted with mixed case
-  (`"MixF"(2)`) is ORA-00900.
+  and `f(id)` is `F(ID)`, as in Oracle (example A). A function whose name is quoted is exact, as every quoted
+  name in the Oracle door is (see [CREATE TABLE](create-table.md)): `"MixF"` and `MIXF` are two functions, and
+  `"MixF"(2)` is a call.
 
 ## Examples
 
@@ -421,8 +427,7 @@ ORA-06575: Package or function BONUS_OF is in an invalid state
 Other errors in a function's body (a type mismatch, a wrong argument count, an unknown column of a `SELECT INTO`) do not
 make the function invalid: they come when it runs (Oracle finds them when it compiles: PLS-00382 here, and ORA-06575 for
 the call). The same holds for a package body and for an anonymous block, where Oracle's compile errors are ORA-06550
-before anything runs (and ORA-04063 for the call of a package body with errors). A function that declares another
-function inside itself is stored invalid ("subprograms declared in a block are not supported"), where Oracle takes it.
+before anything runs (and ORA-04063 for the call of a package body with errors).
 
 <!-- example: oracle -->
 ```sql
@@ -438,14 +443,6 @@ BEGIN
   INSERT INTO no_such_table VALUES (1);
 END;
 /
-CREATE FUNCTION outer_f RETURN NUMBER IS
-  FUNCTION inner_f RETURN NUMBER IS BEGIN RETURN 1; END;
-BEGIN
-  RETURN inner_f;
-END;
-/
-SELECT status FROM user_objects WHERE object_name = 'OUTER_F';
-SELECT line, position, text FROM user_errors WHERE name = 'OUTER_F';
 ```
 
 ```text
@@ -458,20 +455,93 @@ ORA-06512: at "SA.TO_DAY", line 4
 ERROR:
 ORA-00942: table or view does not exist
 ORA-06512: at line 2
+```
 
-Warning: Function created with compilation errors.
+### K. Nested subprograms
+
+A function or procedure declared in the declarations of a unit is local to it, sees the unit's variables, may be
+declared ahead and defined later, and may call itself. The last function calls a nested one from SQL inside the unit,
+which is stored valid and fails when it runs.
+
+<!-- example: oracle -->
+```sql
+CREATE FUNCTION fact (n NUMBER) RETURN NUMBER IS
+  FUNCTION f (k NUMBER) RETURN NUMBER IS
+  BEGIN
+    IF k <= 1 THEN RETURN 1; END IF;
+    RETURN k * f(k - 1);
+  END;
+BEGIN
+  RETURN f(n);
+END;
+/
+CREATE FUNCTION is_even (n NUMBER) RETURN NUMBER IS
+  FUNCTION is_odd (k NUMBER) RETURN NUMBER;
+  FUNCTION is_even2 (k NUMBER) RETURN NUMBER IS
+  BEGIN
+    IF k = 0 THEN RETURN 1; END IF;
+    RETURN is_odd(k - 1);
+  END;
+  FUNCTION is_odd (k NUMBER) RETURN NUMBER IS
+  BEGIN
+    IF k = 0 THEN RETURN 0; END IF;
+    RETURN is_even2(k - 1);
+  END;
+BEGIN
+  RETURN is_even2(n);
+END;
+/
+CREATE FUNCTION sum_to (n NUMBER) RETURN NUMBER IS
+  total NUMBER := 0;
+  PROCEDURE add_to (k NUMBER) IS
+  BEGIN
+    total := total + k;
+  END;
+BEGIN
+  FOR i IN 1 .. n LOOP add_to(i); END LOOP;
+  RETURN total;
+END;
+/
+CREATE FUNCTION sql_calls_nested RETURN NUMBER IS
+  r NUMBER;
+  FUNCTION sq (x NUMBER) RETURN NUMBER IS BEGIN RETURN x * x; END;
+BEGIN
+  SELECT sq(3) INTO r FROM dual;
+  RETURN r;
+END;
+/
+SELECT fact(5) AS fact5, is_even(10) AS e10, is_even(7) AS e7, sum_to(4) AS s4 FROM dual;
+SELECT status FROM user_objects WHERE object_name IN ('FACT', 'IS_EVEN', 'SUM_TO', 'SQL_CALLS_NESTED') ORDER BY object_name;
+SELECT sql_calls_nested() FROM dual;
+```
+
+```text
+Function created.
+
+Function created.
+
+Function created.
+
+Function created.
+
+FACT5 E10 E7 S4
+----- --- -- --
+  120   1  0 10
+
+1 row selected.
 
 STATUS
--------
-INVALID
+------
+VALID
+VALID
+VALID
+VALID
 
-1 row selected.
+4 rows selected.
 
-LINE POSITION TEXT
----- -------- ------------------------------------------------------------
-   2        3 PLS-00103: subprograms declared in a block are not supported
-
-1 row selected.
+ERROR:
+ORA-00904: invalid identifier
+ORA-06512: at "SA.SQL_CALLS_NESTED", line 5
 ```
 
 ## See also

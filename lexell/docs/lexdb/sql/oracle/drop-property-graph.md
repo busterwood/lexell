@@ -32,7 +32,7 @@ DROP PROPERTY GRAPH [ IF EXISTS ] [ schema. ] graph
 
 - `USER_OBJECTS.STATUS` of the view is `VALID` again as soon as the graph is made again; Oracle shows it `INVALID` until
   the view's next use (example B).
-- A quoted name is matched without its case: `DROP PROPERTY GRAPH mixg` drops a graph `"MixG"` (Oracle: ORA-42421).
+- A quoted name is exact, as in Oracle: `DROP PROPERTY GRAPH mixg` is ORA-42421 for a graph `"MixG"`.
 
 ## Examples
 

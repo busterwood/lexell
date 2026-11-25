@@ -115,7 +115,8 @@ quantifier:
 - The tables are read with the session's privileges.
 - A graph whose table, or a column it names, has been dropped or renamed is ORA-04045 until a table and columns of
   those names are there again (see [CREATE PROPERTY GRAPH](create-property-graph.md)).
-- Names without quotes are folded to upper case. A quoted label is matched with its case: `IS "person"` is not
+- Names without quotes are folded to upper case. A quoted graph name and a quoted label are exact, as in Oracle:
+  `GRAPH_TABLE (mixg ...)` is ORA-42421 for a graph `"MixG"`, and `IS "person"` is not
   `PERSON` (ORA-40954).
 
 ## Differences from Oracle
@@ -130,8 +131,6 @@ quantifier:
   `COLUMNS` is the same text; the JSON functions do not exist outside `GRAPH_TABLE`.
 - `MATCHNUM()` numbers the matches one each, as Oracle does, but the numbers are lexdb's own: a match does not have
   Oracle's number.
-- A quoted graph name is matched without its case: `GRAPH_TABLE (mixg ...)` reads a graph `"MixG"` (Oracle:
-  ORA-42421).
 - The PostgreSQL and SQL Server doors have no `GRAPH_TABLE` (a syntax error, 42601 and Msg 102), as PostgreSQL 19
   and SQL Server 2022 have none.
 

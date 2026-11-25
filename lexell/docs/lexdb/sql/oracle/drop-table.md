@@ -26,12 +26,15 @@ DROP TABLE [ IF EXISTS ] [ schema. ] table [ CASCADE CONSTRAINTS ] [ PURGE ]
 
 - The table's indexes, constraints and rows go with it.
 - A table that does not exist is ORA-00942.
+- A table that views read is dropped, as in Oracle: each view is `INVALID`, reading it is ORA-04063, and `USER_ERRORS`
+  holds ORA-00942 for it (example E).
 - To empty a table and keep it, use [TRUNCATE TABLE](truncate-table.md).
 
 ## Differences from Oracle
 
 - `DROP TABLE` without `PURGE` does not keep the table in a recycle bin (no `FLASHBACK TABLE ... TO BEFORE DROP`).
-- None other known.
+- A view over a dropped table is `VALID` again as soon as a table of that name is made again; Oracle shows it
+  `INVALID` until the view's next use (example E).
 
 ## Examples
 
@@ -111,6 +114,59 @@ DROP TABLE IF EXISTS nothere;
 
 ```text
 Table dropped.
+```
+
+### E. A table under a view
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE dept (id NUMBER PRIMARY KEY, name VARCHAR2(20));
+INSERT INTO dept VALUES (1, 'sales');
+CREATE VIEW dept_names AS SELECT name FROM dept;
+CREATE VIEW dept_upper AS SELECT UPPER(name) AS name FROM dept_names;
+DROP TABLE dept;
+SELECT object_name, status FROM user_objects WHERE object_type = 'VIEW' ORDER BY object_name;
+SELECT * FROM dept_names;
+SELECT name, type, TRIM(text) AS text FROM user_errors WHERE name = 'DEPT_NAMES';
+CREATE TABLE dept (id NUMBER PRIMARY KEY, name VARCHAR2(20));
+SELECT object_name, status FROM user_objects WHERE object_type = 'VIEW' ORDER BY object_name;
+```
+
+```text
+Table created.
+
+1 row created.
+
+View created.
+
+View created.
+
+Table dropped.
+
+OBJECT_NAME STATUS
+----------- -------
+DEPT_NAMES  INVALID
+DEPT_UPPER  INVALID
+
+2 rows selected.
+
+ERROR:
+ORA-04063: view "SA.DEPT_NAMES" has errors
+
+NAME       TYPE TEXT
+---------- ---- ---------------------------------------------------
+DEPT_NAMES VIEW ORA-00942: table or view "SA"."DEPT" does not exist
+
+1 row selected.
+
+Table created.
+
+OBJECT_NAME STATUS
+----------- ------
+DEPT_NAMES  VALID
+DEPT_UPPER  VALID
+
+2 rows selected.
 ```
 
 ## See also

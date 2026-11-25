@@ -52,17 +52,18 @@ parameter:
 
 ## Differences from Oracle
 
-- Subprograms declared inside another unit or block (the unit is stored `INVALID`: "subprograms declared in a block
-  are not supported"), collection-typed parameters, and `AUTHID`, `ACCESSIBLE BY` and
-  `PRAGMA AUTONOMOUS_TRANSACTION` clauses are not supported.
+- Collection-typed parameters, and `AUTHID`, `ACCESSIBLE BY` and `PRAGMA AUTONOMOUS_TRANSACTION` clauses are not
+  supported.
+- Subprograms declared inside a procedure work (example H); overloading them is not supported, and a nested function
+  called from SQL inside the procedure is ORA-00904 when it runs (see [CREATE FUNCTION](create-function.md)).
 - A call with a wrong argument count is PLS-00306, as in Oracle; an argument that cannot be converted is ORA-06502.
 - **Compilation errors are found for names and syntax only** (example G). A type error, a wrong argument count to a
   built-in function and an unknown column of a `SELECT INTO` appear when the procedure runs, where Oracle finds them
   when it compiles (`INVALID`, `USER_ERRORS`). PLS-00103's text has no list of the symbols expected.
 - A syntax error inside a SQL statement of the body is found when the procedure is created, as Oracle does: ORA-00936
   (ORA-00907 with a parenthesis left open) at the token where lexdb's parser stopped, with `PL/SQL: SQL Statement
-  ignored` at the statement's start. Oracle's number may differ for other syntax errors, and a `SELECT ... INTO` with a
-  parenthesis left open before `INTO` (`SELECT COUNT(* INTO n FROM t`) is PLS-00428 where Oracle gives ORA-00907.
+  ignored` at the statement's start. Oracle's number may differ for other syntax errors; a `SELECT ... INTO` with a
+  parenthesis left open before `INTO` (`SELECT COUNT(* INTO n FROM t`) is ORA-00907, as in Oracle.
 
 ## Examples
 
@@ -337,6 +338,52 @@ ERROR:
 ORA-06502: PL/SQL: value or conversion error
 ORA-06512: at "SA.SET_DAY", line 4
 ORA-06512: at line 1
+```
+
+### H. Nested subprograms
+
+A nested procedure may change the variables of the procedure that declares it, and may be declared ahead of its body.
+
+<!-- example: oracle -->
+```sql
+CREATE PROCEDURE tally (n NUMBER, total OUT NUMBER, calls OUT NUMBER) IS
+  PROCEDURE add_to (k NUMBER);
+  PROCEDURE add_to (k NUMBER) IS
+  BEGIN
+    total := total + k;
+    calls := calls + 1;
+  END;
+BEGIN
+  total := 0;
+  calls := 0;
+  FOR i IN 1 .. n LOOP
+    add_to(i * i);
+  END LOOP;
+END;
+/
+DECLARE
+  t NUMBER;
+  c NUMBER;
+BEGIN
+  tally(4, t, c);
+  DBMS_OUTPUT.PUT_LINE('total ' || t || ' in ' || c || ' calls');
+END;
+/
+SELECT status FROM user_objects WHERE object_name = 'TALLY';
+```
+
+```text
+Procedure created.
+
+total 30 in 4 calls
+
+PL/SQL procedure successfully completed.
+
+STATUS
+------
+VALID
+
+1 row selected.
 ```
 
 ## See also

@@ -54,8 +54,9 @@ END [ package ] ;
   variable of a record or collection type.
 - A specification that declares procedures or functions needs its body: without it a call is PLS-00201 (Oracle:
   ORA-04067).
-- Records, subtypes and exceptions declared in a package are not supported, with a body or without. Collection types and
-  nested subprograms are not supported, as elsewhere in PL/SQL.
+- Records, subtypes and exceptions declared in a package are not supported, with a body or without. Collection types are not
+  supported, as elsewhere in PL/SQL. A member may declare nested subprograms (see [CREATE FUNCTION](create-function.md),
+  example K).
 
 ## Examples
 

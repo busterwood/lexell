@@ -47,8 +47,10 @@ END [ label ] ;
 
 ## Differences from Oracle
 
-- Subprograms declared inside a block (a `PROCEDURE` or `FUNCTION` in `DECLARE`), `GOTO`, `FORALL`, `BULK COLLECT`
-  and collection types are not supported (PLS-00103).
+- `GOTO`, `FORALL`, `BULK COLLECT` and collection types are not supported (PLS-00103).
+- Subprograms declared in `DECLARE` work (example D): forward declarations, recursion and the enclosing variables
+  included. Not supported: overloading them (the later declaration of a name is the one called) and calling one from SQL
+  inside the block (ORA-00904 when it runs; Oracle: PLS-00231).
 - DDL cannot be written directly in a block; use `EXECUTE IMMEDIATE` (as Oracle requires).
 - `LOCK TABLE` inside a block is ORA-00900.
 
@@ -123,7 +125,35 @@ cannot divide by zero
 PL/SQL procedure successfully completed.
 ```
 
-### D. Compile errors
+### D. Subprograms in DECLARE
+
+<!-- example: oracle -->
+```sql
+DECLARE
+  total NUMBER := 0;
+  PROCEDURE bump (k NUMBER) IS
+  BEGIN
+    total := total + k;
+  END;
+  FUNCTION twice (k NUMBER) RETURN NUMBER IS
+  BEGIN
+    RETURN 2 * k;
+  END;
+BEGIN
+  bump(5);
+  bump(twice(3));
+  DBMS_OUTPUT.PUT_LINE('total ' || total);
+END;
+/
+```
+
+```text
+total 11
+
+PL/SQL procedure successfully completed.
+```
+
+### E. Compile errors
 
 <!-- example: oracle -->
 ```sql

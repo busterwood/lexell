@@ -89,7 +89,7 @@ views, `LOCK TABLE` outside PL/SQL, `FLASHBACK`, `PURGE`, `AUDIT`, `EXPLAIN PLAN
 | [Built-in packages](plsql-builtin-packages.md) | `DBMS_OUTPUT`, `DBMS_LOCK`, `DBMS_SESSION`, `DBMS_SQL.RETURN_RESULT`, and packages accepted and ignored. |
 
 Not available: collections (nested tables, varrays, associative arrays), `FORALL`, `BULK COLLECT`, `GOTO`,
-subprograms declared inside a block, DDL directly in a block (use `EXECUTE IMMEDIATE`).
+overloading of subprograms declared inside a block, DDL directly in a block (use `EXECUTE IMMEDIATE`).
 
 ## Data types
 

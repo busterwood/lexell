@@ -18,8 +18,9 @@ DROP ASSERTION [ IF EXISTS ] [ schema. ] assertion
   (see [Assertions in the three doors](../../assertions.md)).
 - `DROP TABLE ... CASCADE CONSTRAINTS` of a table an assertion reads drops the assertion with it; `DROP TABLE` alone is
   ORA-08702 (see [CREATE ASSERTION](create-assertion.md#what-ddl-does-to-its-tables)).
-- A name is matched as an unquoted name is, folded to upper case; `DROP ASSERTION "MixA"` drops the one made as
-  `"MixA"`.
+- A quoted name is exact, as in Oracle: `DROP ASSERTION "MixA"` drops the one made as `"MixA"`, and `DROP ASSERTION
+  mixa` is ORA-13650 (in a database made before exact names, a quoted name is folded: see [CREATE
+  TABLE](create-table.md)).
 
 ## Examples
 
