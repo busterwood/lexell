@@ -6090,9 +6090,13 @@ fn (p: mut &P) fromItem0(join: int): Result[FromItem, lexdb_base.DbErr] {
     let at0 = p.pos
     let table = try p.rname()
     // PostgreSQL: a name and "(": [schema.]f(arguments), a set-returning SQL function of the user's (written as its query: lexdb_routine)
-    if p.toks[p.pos].kind == T_OP && p.isKw("(") && !p.tsql && !p.ora {
-        p.pos = at0
-        return p.pgFunctionFrom(join)
+    if p.toks[p.pos].kind == T_OP && p.isKw("(") && !p.tsql {
+        // (Oracle: GRAPH_TABLE (...), O22)
+        if !p.ora {
+            p.pos = at0
+            return p.pgFunctionFrom(join)
+        }
+        if table == "graph_table" { return p.graphTable(join) }
     }
     var alias = lexdb_sql.baseName(&table)
     var cols: []str = []
@@ -7900,7 +7904,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                         return Err(lexdb_base.err("0A000", "lexdb: CREATE OR REPLACE FORCE VIEW (a view with errors) is not supported"))
                     }
                     if p.ora && p.isKw("noforce") { p.pos += 1 }
-                    if !p.isKw("view") && !p.isKw("temp") && !p.isKw("temporary") && !p.isKw("function") && !p.isKw("procedure") {
+                    if !p.isKw("view") && !p.isKw("temp") && !p.isKw("temporary") && !p.isKw("function") && !p.isKw("procedure") && !p.graphNext() {
                         // the kinds the dialect's server has OR ALTER | OR REPLACE for, lexdb not yet; for any other kind
                         // the server's syntax error (Oracle's: ORA-00922, missing or invalid option)
                         let kind = p.peek().text.clone()
@@ -7924,6 +7928,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 let proc = p.next().text == "procedure"
                 return p.createRoutine(orReplace, proc)
             }
+            if p.graphNext() { return p.createGraph(orReplace) }
             // [GLOBAL | LOCAL] {TEMPORARY | TEMP}, or UNLOGGED (a table as any:
             // lexdb's are logged), before TABLE, SEQUENCE or VIEW (9.96)
             var temp = false
@@ -8066,6 +8071,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 if kw == "proc" { kw = "procedure" }
                 return p.dropRoutine(&kw)
             }
+            if p.graphNext() { return p.dropGraph() }
             if p.acceptKw("view") {
                 var v = lexdb_sql.newStmt(S_DROP_VIEW)
                 if p.acceptKw("if") {
@@ -10960,3 +10966,92 @@ fn (p: mut &P) annotAlters(s: mut &Stmt, cols: bool): Result[Unit, lexdb_base.Db
     }
     return Ok(Unit{})
 }
+
+// ---- SQL/PGQ in the Oracle door (design/lexdb-new-features.md O22; lexdb_graph reads the texts kept here)
+
+// PROPERTY GRAPH next (Oracle's).
+fn (p: &P) graphNext(): bool {
+    return p.ora && p.isKw("property") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "graph"
+}
+
+// CREATE [OR REPLACE] PROPERTY GRAPH [IF NOT EXISTS] name ...: the name, and the rest of the statement as its text.
+fn (p: mut &P) createGraph(orReplace: bool): Result[Stmt, lexdb_base.DbErr] {
+    p.pos += 2
+    var s = lexdb_sql.newStmt(lexdb_sql.S_CREATE_GRAPH)
+    s.ifFlag = orReplace
+    if p.isKw("if") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "not" && p.peekAt(2).kind == T_IDENT && p.peekAt(2).text == "exists" {
+        p.pos += 3
+        s.unique = true
+    }
+    s.table = try p.qname()
+    s.spell = p.spelled.clone()
+    let from = p.peek().at
+    p.skipToEnd()
+    s.index = p.src[from..p.peek().at].toStr()
+    return Ok(s)
+}
+
+// DROP PROPERTY GRAPH [IF EXISTS] name.
+fn (p: mut &P) dropGraph(): Result[Stmt, lexdb_base.DbErr] {
+    p.pos += 2
+    var s = lexdb_sql.newStmt(lexdb_sql.S_DROP_GRAPH)
+    if p.isKw("if") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "exists" {
+        p.pos += 2
+        s.ifFlag = true
+    }
+    s.table = try p.qname()
+    s.spell = p.spelled.clone()
+    return Ok(s)
+}
+
+// GRAPH_TABLE (...) [alias] in FROM (the name read, "(" next): a subquery marked GRAPH_MARK with the text inside the brackets
+// (a bind written $n, its number the statement's), which lexdb_graph.expand writes as its query where it is planned.
+fn (p: mut &P) graphTable(join: int): Result[FromItem, lexdb_base.DbErr] {
+    let open = p.pos
+    var depth = 0
+    var close = -1
+    var k = open
+    while k < len(p.toks) && p.toks[k].kind != T_EOF {
+        let t = &p.toks[k]
+        if t.kind == T_OP && t.text == "(" { depth += 1 }
+        if t.kind == T_OP && t.text == ")" {
+            depth -= 1
+            if depth == 0 {
+                close = k
+                break
+            }
+        }
+        k += 1
+    }
+    if close < 0 { return Err(oraErr(907, "missing right parenthesis")) }
+    var text = ""
+    for i in open + 1..close {
+        let t = &p.toks[i]
+        if t.kind == T_PARAM {
+            let n = strings.parseIntOpt(&t.text).unwrapOr(0)
+            if n > p.params { p.params = n }
+            text += "$" + t.text + " "
+        } else {
+            text += &p.src[t.at..p.toks[i + 1].at]
+        }
+    }
+    p.pos = close + 1
+    if p.isKw("as") { return Err(lexdb_base.err("ORA03048", "SQL reserved word 'AS' is not syntactically valid following '...)'")) }
+    var s = lexdb_sql.newStmt(S_SELECT)
+    s.srf = lexdb_sql.GRAPH_MARK.toStr()
+    s.index = text
+    for x in p.nls { append(mut &s.names, x.clone()) }
+    s.use = SUB_FROM
+    s.mdialect = MD_ORA
+    append(mut &p.subs, s)
+    p.udf = true            // (lexdb_exec.inlineFunctions: a query of GRAPH_TABLE alone is written as its join, lexdb_graph.flatQuery)
+    var alias = "\x01graph_table" + len(p.subs).toStr()
+    var cols: []str = []
+    try p.aliasOf(mut &alias, mut &cols, true)
+    let spells = spellsOff(mut &cols)
+    p.subs[len(p.subs) - 1].spells = spells
+    return Ok(FromItem{table: "", alias: alias, join: join, on: None, sub: len(p.subs) - 1, cols: cols, work: -1, lateral: false, using: [], natural: false, comma: false})
+}
+
+// Oracle's SQL text as its tokens (lexdb_graph reads a graph's definition and GRAPH_TABLE's text with them).
+pub fn oraTokens(sql: &str): Result[[]Tok, lexdb_base.DbErr] { return lexOra(sql, pgDialect(), true) }

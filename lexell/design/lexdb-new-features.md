@@ -8,7 +8,7 @@ forms of 6.1 (items 1, 2's Oracle GROUP BY ALL, 4 and 5), marked *works* with th
 and 271ca36e): 6.1's items 6 and 7, the missing scalar functions and aggregates, marked *works* with the commit. Section 10
 (later, commits 96be5d41, 4e1cf747, 269cfa25): a panic that ended the server, and 6.2's items 3 (IGNORE NULLS) and 5 (ON
 CONFLICT DO SELECT) built; items 4 (QUALIFY) and 6 (unenforced constraints) planned. Section 10.8 (later, commits 443310eb and fe8daf59): QUALIFY and the
-unenforced constraints built, marked *works* with the commit.
+unenforced constraints built, marked *works* with the commit. Section 13 (later, 2026-11-25): SQL/PGQ in the Oracle door (O22, 6.3 item 1) built.
 
 **What was audited.** The SQL a user of each product's newest release would reach for: PostgreSQL 19 (and 18, and
 older features met on the way), SQL Server 2025 (compatibility level 170) with 2022's additions, Oracle AI Database 26ai
@@ -131,7 +131,7 @@ Checked on 2025 RTM-CU10 at level 170 unless marked 2022.
 | O19 | `RETURNING OLD c, NEW c INTO :a, :b` for INSERT, UPDATE, DELETE, MERGE (23ai) | INSERT's OLD NULL, DELETE's NEW NULL; OLD/NEW before any column of an expression; ORA-00904 for `old.c` and `OLD f(x)`, ORA-01747 for `OLD *`, ORA-03050 without a column; MERGE with DELETE WHERE ORA-03001; INSERT ... SELECT has no RETURNING (ORA-03049) | as Oracle (ec3c5c17), through the door's RETURNING INTO and in PL/SQL; the two errors of other RETURNINGs (03001, 03049) too (they were accepted) | works (ec3c5c17) | (P2) | PostgreSQL 18 (P2), T-SQL OUTPUT (works) | lexdb_parse |
 | O20 | `DEFAULT ON NULL [FOR INSERT ONLY \| FOR INSERT AND UPDATE] v` (12c; UPDATE 23ai) | a NULL written becomes the default, the column NOT NULL; an UPDATE to NULL ORA-01407 unless FOR INSERT AND UPDATE; USER_TAB_COLUMNS' DEFAULT_ON_NULL, DEFAULT_ON_NULL_UPD | as Oracle (ec3c5c17): INSERT, INSERT ... SELECT, UPDATE, MERGE, ALTER TABLE ADD / MODIFY, the views, ORA-02000, 00936, 30665 | works (ec3c5c17) | S | none | lexdb_parse `oraDefault`, lexdb_exec `onNullFill`, lexdb_oracat |
 | O21 | annotations: `ANNOTATIONS (name 'value', ...)` on tables and columns, `USER_ANNOTATIONS_USAGE` | | ORA-00900 | works (section 12) | M: kept in the catalog, listed in the views | none | lexdb_parse, lexdb_oracat |
-| O22 | SQL/PGQ: `CREATE PROPERTY GRAPH`, `GRAPH_TABLE (g MATCH ... WHERE ... COLUMNS (...))`, bounded quantifiers `->{1,2}` | rows as the joins of the pattern; ORA-42421 for an unknown graph | ORA-00900 | missing | L (section 6.3) | none (PostgreSQL 19 has not; SQL Server's MATCH over NODE/EDGE tables is another design) | new lexdb_graph |
+| O22 | SQL/PGQ: `CREATE PROPERTY GRAPH`, `GRAPH_TABLE (g MATCH ... WHERE ... COLUMNS (...))`, bounded quantifiers `->{1,2}` | rows as the joins of the pattern; ORA-42421 for an unknown graph | as Oracle (section 13): CREATE [OR REPLACE] PROPERTY GRAPH [IF NOT EXISTS], DROP, GRAPH_TABLE with labels, directions, bounded quantifiers, aggregates of quantified variables, IS LABELED, IS SOURCE OF, VERTEX_ID / EDGE_ID (as text), MATCHNUM, the 424xx and 409xx errors, the PG_* views (was ORA-00900); not ONE ROW PER VERTEX / STEP (0A000) | works (af49fb6c) | L (section 6.3) | none (PostgreSQL 19 has not; SQL Server's MATCH over NODE/EDGE tables is another design) | new lexdb_graph, lexdb_parse `graphTable`, lexdb_oracat |
 | O23 | `CREATE ASSERTION a CHECK (NOT EXISTS (...) \| ALL (...) SATISFY (...))` (23.26.1) | ORA-08601 `Assertion (APP.A1) violated` at the DML; no aggregates (ORA-08689, ORA-00934); `USER_ASSERTIONS` | ORA-00900 | missing | L (section 6.3: a design note) | none | new lexdb_assert |
 | O24 | `IS [NOT] DISTINCT FROM` | not Oracle's (ORA-00908, 23.26.3) | accepted (lexdb's extension in this door) | works (kept: the user's decision, 2026-11-23) | none: the user wants it in the Oracle door too, as an extension; test tns_distinct | PostgreSQL, T-SQL 2022 | lexdb_parse |
 | O25 | `IGNORE NULLS` in `FIRST_VALUE(x IGNORE NULLS)`, `LAST_VALUE`, `LAG(x) IGNORE NULLS`, `LEAD`, `NTH_VALUE` | PostgreSQL's values; ORA-01428 for an offset or n below 1 | as Oracle, both spellings; ORA-30484, 01428 (was ORA-00900); not NTH_VALUE's FROM FIRST / FROM LAST (10.4) | works (4e1cf747) | (P5) | PostgreSQL 19, T-SQL 2022 | lexdb_window |
@@ -234,7 +234,7 @@ containers above), batches on and off.
 
 ### 6.3 Large, with a short plan each
 
-1. **GRAPH_TABLE** (O22; PostgreSQL when it ships SQL/PGQ, the same rewrite). A property graph is a catalog object:
+1. **GRAPH_TABLE** (O22; PostgreSQL when it ships SQL/PGQ, the same rewrite; built: section 13). A property graph is a catalog object:
    vertex tables (KEY, LABEL, PROPERTIES) and edge tables (KEY, SOURCE KEY ... REFERENCES, DESTINATION KEY ...
    REFERENCES, LABEL, PROPERTIES). `GRAPH_TABLE (g MATCH pattern [WHERE c] COLUMNS (...))` in FROM is rewritten into
    SQL before planning: a vertex pattern `(a IS person)` becomes the label's table (a UNION ALL when several tables
@@ -1065,3 +1065,88 @@ before the master's SIGKILL there after its log is replayed, all of them after t
 - A global temporary table's annotations are kept but not listed: lexdb's GTT is a session's temporary table, which USER_TABLES does not list either (older).
 - `n'x'` as a value: Oracle Free keeps a character before the text (a product fault, not copied).
 - The texts of ORA-00972 and ORA-11545 cut the name or value as `first ten...last ten...`; Oracle's form was not checked with names that differ along their length.
+
+## 13. SQL/PGQ: property graphs and GRAPH_TABLE (O22, as built, 2026-11-25)
+
+Branch from main `84ceec7e`, commits `af49fb6c` (the graph object and GRAPH_TABLE, `lexdb_graph`), `42aaee7b` (the views), `3e84dad4` (`tns_graph`),
+`deaf448c` (`exec_graph`), `c1dcf9cd` (`replica.py`), `b518e86a` (no read where a table is made in a database without graphs), `500396ff` and `4fa5bde3`
+(a query of GRAPH_TABLE alone written as its join or UNION ALL). The plan of 6.3 item 1 held; Oracle Free 23.26.3 was probed first.
+
+**What the product does** (each checked on `lxl-oracle`):
+- `CREATE [OR REPLACE] PROPERTY GRAPH [IF NOT EXISTS] g VERTEX TABLES (t [[AS] e] [KEY (c, ...)] [LABEL l [props] | DEFAULT LABEL [props] ...| props], ...)
+  [EDGE TABLES (t [[AS] e] [KEY (...)] SOURCE [KEY (c, ...) REFERENCES] v [(c, ...)] DESTINATION ... [labels], ...)]`, props `PROPERTIES (col | expr AS
+  name, ...)`, `PROPERTIES [ARE] ALL COLUMNS [EXCEPT (c, ...)]`, `NO PROPERTIES`; none: the default label (the element's name: the table's or its alias) with
+  every column. The default key is the primary key (ORA-42402, a view's ORA-42442); SOURCE v without KEY is the edge table's one foreign key to v (ORA-42413);
+  REFERENCES names an element, not a table (ORA-42405); the column counts must agree (ORA-42415; the vertex columns need not be its key). A label on two elements
+  (or twice on one) has one set of property names (ORA-42409) of one type family each (ORA-42414: NUMBER and VARCHAR2 differ, VARCHAR2(10) and (20) do not); vertex
+  and edge labels share the names. `label l label l` is accepted and listed twice. ORA-00955 for a name a table, view or sequence has, and the other way round;
+  ORA-00942, 00904, 42404, 42407, 42416, 42424 (an expression without AS), 42439 (SYSDATE), 00931, 00936, 02000 (VERTEX, SOURCE, DESTINATION); DROP ORA-42421.
+  ALL COLUMNS is the columns at CREATE (one added later is no property). A table dropped, or a column the graph names dropped or renamed, leaves the graph:
+  GRAPH_TABLE is ORA-04045 until a table and columns of those names are there again (Oracle marks every graph of a table INVALID at any DDL on it and
+  revalidates at the next use; lexdb's STATUS is whether the names are there).
+- `GRAPH_TABLE (g MATCH path [, path ...] [WHERE c] [ONE ROW PER MATCH] COLUMNS (expr [AS name], ...)) [alias]` (AS before the alias ORA-03048): `(v IS l|m&n
+  WHERE c)`, `-[e IS l WHERE c]->`, `<-[e]-`, `-[e]-` (an edge from a vertex to itself matched once), `->`, `<-`, `-`, edges without vertices between them (an
+  anonymous vertex), paths sharing a variable (a join), the same edge twice (one edge); quantifiers `{n}`, `{m,n}`, `{,n}` (0 allowed: the two vertices one) on an
+  edge or a bracketed path, walks (an edge may repeat); `+`, `*`, `{m,}` ORA-40985, `?` ORA-49003, `{0}` and `{3,1}` ORA-40984, a quantified vertex ORA-40997. A
+  quantified variable only in COUNT, SUM, MIN, MAX, AVG, LISTAGG (in the path's order) of COLUMNS (ORA-40990, 40998, 49011 for an aggregate without one, 40956
+  for `count(e)`). Properties: those of every label of the elements a variable may be bound to (`(a IS human)` has PERSON's too), NULL for an element without
+  one; ORA-40983 (no label has it), 49044 (not the variable's), 49013 (no element has its labels). `v.*`, `IS [NOT] LABELED`, `IS [NOT] SOURCE / DESTINATION OF`,
+  `VERTEX_ID` / `EDGE_ID` (JSON), `MATCHNUM()`, `ELEMENT_NUMBER` only with ONE ROW PER VERTEX / STEP (ORA-49033), which 23.26.3 has; no subqueries (ORA-40988),
+  no outer column (ORA-40996), ORA-00918, 02000 (an expression without AS), 49000, 40951 (`!`), 40954, 40997 (no COLUMNS). An unquoted name is upper case: a
+  quoted lower-case label is another (ORA-40954).
+- Views USER_, ALL_, DBA_ PROPERTY_GRAPHS, PG_ELEMENTS, PG_LABELS, PG_ELEMENT_LABELS, PG_LABEL_PROPERTIES, PG_PROP_DEFINITIONS, PG_KEYS,
+  PG_EDGE_RELATIONSHIPS, PG_COMMENTS (a row a graph); USER_OBJECTS' OBJECT_TYPE `PROPERTY GRAPH`.
+
+**What lexdb did:** ORA-00900 (CREATE, DROP, GRAPH_TABLE), ORA-00922 (CREATE OR REPLACE). **Now:** the parser keeps the DDL's text after the name (`S_CREATE_GRAPH`,
+`S_DROP_GRAPH`) and GRAPH_TABLE's text (a subquery marked `lexdb_sql.GRAPH_MARK`, binds written `$n`; `lexdb_parse.graphTable`, reached from the table-name
+path of `fromItem0` only after a name and "(", so a point select's parse is as it was). `lexdb_graph` (a core module, ~2,080 lines) reads both with the Oracle
+lexer: the graph is a catalog row of its own (`\x02pgraph\x00` and the key a table of that name would have), its elements with their tables' keys, key columns,
+labels, properties (a column's name, or an expression's text with the columns it reads and its type, from a query of the table: `lexdb_exec.describe`), an edge's
+two ends. Tables keep their layout, encoding and read paths. GRAPH_TABLE is written as SQL: per combination of the quantifiers' lengths and per binding of the
+variables to elements (an edge's element fixes its vertices', an edge without a direction both ways), one join of the element tables on the edges' columns,
+the patterns' WHERE and IS LABELED / SOURCE OF as its conditions, COLUMNS its items (a quantified variable's aggregate an expression over its copies); their
+UNION ALL is the subquery `lexdb_exec.bindFrom` plans in the placeholder's place (`expand`). A query of GRAPH_TABLE alone (SELECT ... FROM GRAPH_TABLE (...)
+[WHERE ...] [GROUP BY ...] [ORDER BY ...]) whose pattern is one join is written as that join (`flatQuery`, from `inlineFunctions`: the parser marks the
+statement, `Stmt.udf`), `SELECT * FROM GRAPH_TABLE` of several joins as their UNION ALL: a subquery in FROM costs the row engine a copy of each row (one hop
+over 100,000 edges: 545 ms against the join's 402 before, 395 against 399 after). CREATE TABLE, VIEW, SEQUENCE of a graph's name is ORA-00955
+(`lexdb_graph.freeKey` in `createKey` and `createView`, only once a graph has been seen: `noteGraphs` at bootstrap). `lexdb_oracat` lists the views from the
+graphs' rows (`CatSnap.graphs`); their shapes from `tools/gen_oracle_catalog.py` (the new views' lines, DICTIONARY rows and synonyms merged into
+`lexdb_oradata`). The PostgreSQL and T-SQL doors refuse the syntax as before (42601 at `property` / `match`, 102), checked on the branch's server.
+
+Tests: `tns_graph` (59 setup statements, 159 statements each with batches off and on; `gen_oracle.py --check tns_graph`: 0 differences; `gen_oracle.py`'s
+emptied schema drops graphs too), `exec_graph` (12 GRAPH_TABLE queries against their hand-written joins on 2,000 people and 7,550 edges, batches on and off:
+the four answers one), `replica.py` (a graph each round and an edge: the replica's USER_PROPERTY_GRAPHS and a GRAPH_TABLE count the master's, CREATE PROPERTY
+GRAPH there ORA-16000, the graph made before the master's SIGKILL there after replay, all after a clean close); a server killed with -9 and closed cleanly after
+graph DDL: the graphs, their views and GRAPH_TABLE as before; a graph's name ORA-00955 after a restart.
+
+**Cost** (base `84ceec7e`, branch `4fa5bde3`, both `-O`, trees at paths of equal length):
+- In process, instructions per statement (`LXL_HASH_SEED=1`, `perf stat -e instructions:u`, `taskset -c 6`, `(I(20000) - I(0)) / 20000`, two rounds), base ->
+  branch: prepared (a 10,000-row table) point select 31,437.2 -> 31,437.2, INSERT 217,516.1 -> 217,516.0, UPDATE by key 201,363.7 -> 201,363.7; as text (a
+  2,000-row table) select 111,072.8 -> 111,072.8, INSERT 241,012.6 -> 241,012.6, UPDATE 228,838.6 -> 228,838.6 (both rounds). Before `b518e86a` the graph-name
+  read in CREATE TABLE moved text INSERT and UPDATE by +0.2 / -2.2.
+- Over the wire (`icount6.sh BIN 3`, alternated twice): instructions 160,876 / 160,944 -> 160,898 / 160,793 (level); cycles 88,455 / 88,794 -> 85,767 / 85,613;
+  L1 i-cache misses 259.0 / 259.2 -> 259.1 / 252.9; iTLB misses 72.3 / 74.8 -> 37.6 / 37.2; branch misses 387.6 / 383.5 -> 354.5 / 352.8 (placement).
+- GRAPH_TABLE against its hand-written SQL (in process, 20,000 people, 100,000 knows edges, parsed and run each time; instructions a run, ms of 10 runs),
+  batches on: one hop, count and sum 177,987,832 / 143 ms against 177,722,700 / 143; its 100,000 rows 248,319,398 / 203 against 248,081,630 / 205; two hops
+  (a.id <= 2,000) 254,808,439 / 202 against 254,479,217 / 202, rows 290,372,812 / 235 against 290,055,588 / 235; a {1,3} path (a.id <= 200), aggregated
+  590,290,346 / 464 against 589,672,984 / 456, rows 582,083,239 / 457 against 581,727,634 / 455. Batches off: 1,288,309,455 / 1,096 against 1,288,378,483 /
+  1,092; 1,536,107,639 / 1,283 against 1,536,078,354 / 1,295; 3,559,710,876 / 2,576 against 3,560,765,081 / 2,568. The difference, 0.03-0.1%, is the rewrite
+  (reading the graph, writing and parsing the join) each time the statement is planned.
+- TPC-H not run: no planner, pipeline or read-path change (bindFrom's new test is of a FROM subquery's mark).
+- lexdb_exec: 21,499 -> 21,513 lines (the import, the two kinds in isWrite, stmtName and execStmt, bindFrom's expand, createKey's and createView's freeKey,
+  bootstrap's noteGraphs, inlineFunctions' hook and `graphFlat`).
+
+**Left, not built:**
+- ONE ROW PER VERTEX and ONE ROW PER STEP (and so ELEMENT_NUMBER): lexdb's 0A000. MATCHNUM's numbers are lexdb's own (each match one, as Oracle's; not its order).
+- VERTEX_ID and EDGE_ID give the JSON's text as VARCHAR2 (lexdb has no JSON type, lexdb-gaps.md 9.85); JSON_SERIALIZE of them inside GRAPH_TABLE is that text.
+- LISTAGG ... WITHIN GROUP, DISTINCT in an aggregate of a quantified variable, an aggregate in WHERE: lexdb's 0A000. A pattern of more than 4,096 joins: 0A000
+  (Oracle's own unrolling ran out of memory at `{2,1000}`). No recursive CTE for long bounds (none needed for the bounds Oracle runs).
+- Quoted graph and label names: lexdb matches them folded (L6): `graph_table (mixg ...)` finds `"MixG"` (Oracle ORA-42421); `IS "person"` is checked as Oracle does.
+- A property of an expression has its type from a query of it; a text one's length is its columns' (the longest, or their sum for `||`), not Oracle's own rule;
+  a view's text column has no length in lexdb (VARCHAR2(4000), as its USER_TAB_COLUMNS). COLUMN_EXPR is written `"AGE"*2` by a rule of lexdb's, checked on simple
+  expressions only.
+- USER_OBJECTS' STATUS is whether the names are there (Oracle's goes INVALID at any DDL on a table and VALID at the next use); PG_ELEMENTS' OBJECT_NAME and
+  PG_PROP_DEFINITIONS' COLUMN_NAME are the names at CREATE (Oracle's follow a rename: the graph is then invalid until the old name is back).
+- `v.*` and PROPERTY_ORDER follow the labels' order as written; Oracle put a label of explicit properties before one of ALL COLUMNS on one edge table (not
+  understood; the test avoids it). A table that is both a vertex and an edge element gave Oracle results not understood (not tested).
+- COMMENT ON PROPERTY GRAPH, ALTER PROPERTY GRAPH, privileges on graphs (lexdb reads the tables with the session's rights): not built.

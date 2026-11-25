@@ -1260,6 +1260,18 @@ dictionary views (`lexdb_dialect.oraRelOf`) compares each entry's head now, with
 Test `tns_annotations` (118 statements, 0 differences in `gen_oracle.py --check`); `replica.py` checks them on a replica, after a kill -9 and after a clean close.
 Left: no SYS domain rows in ALL_ and DBA_; a global temporary table's not listed.
 
+## As built: property graphs and GRAPH_TABLE (O22, lexdb-new-features.md 13)
+
+`CREATE [OR REPLACE] PROPERTY GRAPH [IF NOT EXISTS]` (vertex and edge tables, KEY, SOURCE / DESTINATION by KEY ... REFERENCES or the foreign key, LABEL,
+DEFAULT LABEL, PROPERTIES, ALL COLUMNS [EXCEPT], NO PROPERTIES), `DROP PROPERTY GRAPH [IF EXISTS]`, and `GRAPH_TABLE (g MATCH ... [WHERE ...] COLUMNS (...))`
+in FROM, with Oracle Free 23.26.3's errors. `lexdb_graph` keeps a graph as a catalog row of its own (the tables are untouched) and writes GRAPH_TABLE as a
+join of the element tables per binding and quantifier length, their UNION ALL the subquery planned in its place (`lexdb_exec.bindFrom`); a query of
+GRAPH_TABLE alone is written as its join (`flatQuery`), so it costs what the hand-written join does. A graph's name is ORA-00955 for a table, view or
+sequence. USER_, ALL_ and DBA_ PROPERTY_GRAPHS, PG_ELEMENTS, PG_LABELS, PG_ELEMENT_LABELS, PG_LABEL_PROPERTIES, PG_PROP_DEFINITIONS, PG_KEYS,
+PG_EDGE_RELATIONSHIPS, PG_COMMENTS (shapes from `tools/gen_oracle_catalog.py`), USER_OBJECTS' `PROPERTY GRAPH` rows. Tests `tns_graph` (159 statements, 0
+differences in `gen_oracle.py --check`), `exec_graph`, `replica.py`. Left: ONE ROW PER VERTEX / STEP (0A000), VERTEX_ID / EDGE_ID as text (no JSON type),
+quoted names matched folded.
+
 ## As built: the third bug slice (lexdb-robust.md, 2026-11-25)
 
 - Logon: the TIME_ZONE of AUTH_ALTER_SESSION is the session's and LOCAL's (`logonZone`); `+00:00` sets nothing.
