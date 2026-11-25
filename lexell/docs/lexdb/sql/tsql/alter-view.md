@@ -28,8 +28,9 @@ AS select_statement
 
 ## Differences from SQL Server
 
-- The options `WITH SCHEMABINDING`, `WITH ENCRYPTION` and `WITH CHECK OPTION` are error 50000, as in
-  [CREATE VIEW](create-view.md).
+- `WITH SCHEMABINDING`, `WITH VIEW_METADATA` and `WITH ENCRYPTION` are taken as in [CREATE VIEW](create-view.md); an
+  `ALTER VIEW` without `WITH SCHEMABINDING` makes the view not schema-bound again, as in SQL Server. `WITH CHECK
+  OPTION` is error 50000.
 - The text kept for the view is the `ALTER VIEW` statement turned into `CREATE VIEW`.
 
 ## Examples

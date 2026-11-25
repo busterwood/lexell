@@ -9,7 +9,7 @@ Makes a new table: its columns, their types, defaults and computed values, and i
 ```
 CREATE TABLE { database_name.schema_name.table_name | schema_name.table_name | table_name | #table_name }
 (
-    { column_definition | computed_column_definition | table_constraint } [ ,...n ]
+    { column_definition | computed_column_definition | table_constraint | table_index } [ ,...n ]
 )
 [ ON filegroup ] [ TEXTIMAGE_ON filegroup ] [ WITH ( table_option [ ,...n ] ) ]
 [ ; ]
@@ -21,6 +21,7 @@ column_name data_type
     [ [ CONSTRAINT constraint_name ] DEFAULT constant_expression ]
     [ IDENTITY [ ( seed, increment ) ] ]
     [ column_constraint [ ...n ] ]
+    [ INDEX index_name [ CLUSTERED | NONCLUSTERED ] ]
 
 column_constraint ::=
 [ CONSTRAINT constraint_name ]
@@ -42,6 +43,10 @@ table_constraint ::=
         [ ON DELETE ... ] [ ON UPDATE ... ]
   | CHECK ( logical_expression )
 }
+
+table_index ::=
+INDEX index_name [ UNIQUE ] [ CLUSTERED | NONCLUSTERED ] ( column [ ASC | DESC ] [ ,...n ] )
+    [ INCLUDE ( column [ ,...n ] ) ] [ WHERE filter_predicate ]
 ```
 
 ## Arguments
@@ -116,13 +121,17 @@ table_constraint ::=
 
 ## Differences from SQL Server
 
-- A table named `HOLDLOCK` or `INDEX` (bare) is error 156; SQL Server reads it as a table hint and gives 1018. Every
-  other reserved word as a bare table or column name is 156 in both. Bracket the name (`[plan]`) to use one.
+- A table named `HOLDLOCK` or `INDEX` (bare) is error 1018, as in SQL Server, which reads the word as a table hint.
+  Every other reserved word as a bare table or column name is 156 in both. Bracket the name (`[plan]`) to use one.
 - A column constraint written `CONSTRAINT name FOREIGN KEY REFERENCES t (c)` is error 102: write
   `CONSTRAINT name REFERENCES t (c)`, or a table constraint.
 - `ROWGUIDCOL`, `SPARSE`, `FILESTREAM`, `NOT FOR REPLICATION`, `MASKED WITH`, `ENCRYPTED WITH` and
-  `GENERATED ALWAYS AS ROW START` are syntax errors. SQL Server accepts an index in the table's definition (`INDEX ix
-  (col)`); lexdb refuses it with error 156 (example I): use [CREATE INDEX](create-index.md).
+  `GENERATED ALWAYS AS ROW START` are syntax errors.
+- An `INDEX` in the table's definition (after a column, or among the table's elements) is made with the table, as if by
+  [CREATE INDEX](create-index.md) in the same statement (example I): a column that does not exist is error 1911, and
+  an index name is unique in the schema (error 2714; SQL Server has them per table, and says 8168 for a name used
+  twice in one table). Two `CLUSTERED` indexes, or one and a `CLUSTERED` key, are error 1902 where SQL Server says
+  8112. A `CLUSTERED` index makes a primary key that did not say so `NONCLUSTERED`.
 - A `rowversion` (`timestamp`) column is not filled in: it stays NULL.
 - A `DEFAULT` constraint's own name is not kept; it is shown as `DF_table_column`. `ALTER TABLE ... DROP CONSTRAINT`
   finds it by neither name (error 50000).
@@ -338,6 +347,8 @@ CREATE TABLE dbo.twoclustered (a int, b int, CONSTRAINT uq_a UNIQUE CLUSTERED (a
 GO
 CREATE CLUSTERED INDEX cx_dept ON dbo.dept (name);
 GO
+CREATE TABLE INDEX (id int);
+GO
 ```
 
 ```text
@@ -357,21 +368,70 @@ Msg 8112, Level 16, State 1, Line 1
 Cannot add more than one clustered index for constraints on table 'twoclustered'.
 Msg 1902, Level 16, State 1, Line 1
 Cannot create more than one clustered index on table 'dept'. Drop the existing clustered index 'pk_dept' before creating another.
+Msg 1018, Level 15, State 1, Line 1
+Incorrect syntax near 'INDEX'. If this is intended as a part of a table hint, A WITH keyword and parenthesis are now required. See SQL Server Books Online for proper syntax.
 ```
 
-### I. What lexdb does not take
+### I. Indexes in the table's definition
+
+An `INDEX` after a column, or among the table's elements, is made with the table. It may be `UNIQUE`, take `INCLUDE`
+columns and a `WHERE` filter.
 
 <!-- example: tsql -->
 ```sql
-CREATE TABLE dbo.t1 (id int, INDEX ix_t1 (id));
+CREATE TABLE dbo.ticket (
+    id       int NOT NULL,
+    owner_id int,
+    status   varchar(10) INDEX ix_ticket_status,
+    opened   date,
+    INDEX ix_ticket_owner NONCLUSTERED (owner_id) INCLUDE (opened),
+    INDEX ux_ticket_open UNIQUE (owner_id) WHERE status = 'open'
+);
+SELECT name, is_unique, has_filter FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.ticket') AND name IS NOT NULL ORDER BY name;
+INSERT dbo.ticket (id, owner_id, status) VALUES (1, 7, 'open'), (2, 7, 'closed');
 GO
+INSERT dbo.ticket (id, owner_id, status) VALUES (3, 7, 'open');
+GO
+CREATE TABLE dbo.keyed (id int PRIMARY KEY, v int, INDEX cx_keyed CLUSTERED (v));
+SELECT type_desc, is_primary_key FROM sys.indexes WHERE object_id = OBJECT_ID('dbo.keyed') ORDER BY type_desc;
+GO
+CREATE TABLE dbo.bad_ix (id int, INDEX ix_bad (nothere));
+GO
+```
+
+```text
+name             is_unique has_filter
+---------------- --------- ----------
+ix_ticket_owner  0         0
+ix_ticket_status 0         0
+ux_ticket_open   1         1
+
+(3 rows affected)
+
+(2 rows affected)
+
+Msg 2601, Level 14, State 1, Line 1
+Cannot insert duplicate key row in object 'dbo.ticket' with unique index 'ux_ticket_open'. The duplicate key value is (7).
+type_desc    is_primary_key
+------------ --------------
+CLUSTERED    0
+NONCLUSTERED 1
+
+(2 rows affected)
+
+Msg 1911, Level 16, State 1, Line 1
+Column name 'nothere' does not exist in the target table or view.
+```
+
+### J. What lexdb does not take
+
+<!-- example: tsql -->
+```sql
 CREATE TABLE dbo.t3 (id int, ref int CONSTRAINT fk_t3 FOREIGN KEY REFERENCES dbo.dept (id));
 GO
 ```
 
 ```text
-Msg 156, Level 15, State 1, Line 1
-Incorrect syntax near the keyword 'INDEX'.
 Msg 102, Level 15, State 1, Line 1
 Incorrect syntax near 'FOREIGN'.
 ```

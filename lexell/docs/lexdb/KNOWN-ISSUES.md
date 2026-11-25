@@ -272,9 +272,10 @@ differences of its statement.
     `GROUPING_ID` is 195.
   - `TOP (subquery)` is 156 (SQL Server accepts it); `MERGE TOP ... PERCENT` is 50000.
   - A `SELECT *` view whose table lost a column and gained another reads the columns by position: the view's column
-    `y` shows the values of the column that took its place. SQL Server does the same (checked); Oracle reads by
-    name. With a column dropped and none added, both give 4502 (lexdb's text names `v2a`, SQL Server's `dbo.v2a`),
-    and `sp_refreshview` is 2812.
+    `y` shows the values of the column that took its place, and keeps its old name. SQL Server does the same
+    (checked) when the view was not read in between; once a read has failed with 4502, SQL Server goes on with 4502
+    until `sp_refreshview` (lexdb has none: 2812), where lexdb reads by position again. With a column dropped and
+    none added, both give 4502 (lexdb's text names `v2a`, SQL Server's `dbo.v2a`). Oracle reads by name.
   - `UPDATE t SET @v = @v + col` and `SET @v = col = expr` are 102.
   - `OUTPUT ... INTO t` followed by an `OUTPUT` that returns rows is 50000.
   - `SET IDENTITY_INSERT` checks nothing: a missing table (208), a table without an identity (8106), a second table

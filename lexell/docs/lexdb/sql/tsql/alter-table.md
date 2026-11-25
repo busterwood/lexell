@@ -64,7 +64,8 @@ ALTER TABLE { database_name.schema_name.table_name | schema_name.table_name | ta
 `DROP COLUMN`
 : Removes a column. `IF EXISTS` makes a missing column no error. A column that a `CHECK` constraint reads
   (alone or with other columns) cannot be dropped: error 5074 names the constraint, and the constraint and the column
-  stay (example J). Drop the constraint first.
+  stay (example J). Drop the constraint first. A column that a view `WITH SCHEMABINDING` uses cannot be dropped either
+  (5074 names the view); any other view is left as it is and fails when it is read (example K).
 
 `DROP CONSTRAINT`
 : Removes a constraint by its name (see `sys.objects` or `sys.key_constraints`). `IF EXISTS` makes a missing one no
@@ -81,8 +82,11 @@ ALTER TABLE { database_name.schema_name.table_name | schema_name.table_name | ta
 
 ## Differences from SQL Server
 
-- **`DROP COLUMN` is refused while a view reads the table** (error 50000: `lexdb keeps a view's text`), whatever the
-  column. SQL Server drops it. Drop the view, change the table, and make the view again.
+- `DROP COLUMN` of a column a view reads is done, as in SQL Server, unless the view is schema-bound (5074). The view
+  fails when read: 207 for a column it names, 4502 for a `SELECT *` view that has fewer columns than before. A
+  `SELECT *` view over a table that lost a column and gained another reads the columns by position under their old
+  names (see [CREATE VIEW](create-view.md)). `ALTER COLUMN` of a column a schema-bound view reads is made (SQL
+  Server: 5074).
 - One action per statement: several columns or constraints in one `ADD`, or `DROP COLUMN a, b`, give error 50000
   ("lexdb: ALTER TABLE takes ADD, DROP, ALTER COLUMN, VALIDATE CONSTRAINT, RENAME and SET SCHEMA").
 - **`ADD CONSTRAINT name DEFAULT value FOR column`** is error 102. Give the default when the column is made.
@@ -511,6 +515,59 @@ name
 ck_range
 
 (1 row affected)
+```
+
+### K. A column that a view reads
+
+<!-- example: tsql -->
+```sql
+CREATE TABLE dbo.crew (id int PRIMARY KEY, name nvarchar(20), rank_no int, notes nvarchar(20));
+INSERT dbo.crew VALUES (1, N'Ann', 3, N'lead'), (2, N'Bob', 5, N'new');
+GO
+CREATE VIEW dbo.v_crew AS SELECT id, name FROM dbo.crew;
+GO
+CREATE VIEW dbo.v_crew_bound WITH SCHEMABINDING AS SELECT id, rank_no FROM dbo.crew;
+GO
+CREATE VIEW dbo.v_crew_all AS SELECT * FROM dbo.crew;
+GO
+ALTER TABLE dbo.crew DROP COLUMN rank_no;
+GO
+ALTER TABLE dbo.crew DROP COLUMN notes;
+ALTER TABLE dbo.crew ADD team nvarchar(20);
+UPDATE dbo.crew SET team = N'red';
+GO
+SELECT * FROM dbo.v_crew_all;
+GO
+ALTER TABLE dbo.crew DROP COLUMN name;
+GO
+SELECT * FROM dbo.v_crew;
+GO
+SELECT * FROM dbo.v_crew_bound;
+GO
+```
+
+```text
+(2 rows affected)
+
+Msg 5074, Level 16, State 1, Line 1
+The object 'v_crew_bound' is dependent on column 'rank_no'.
+(2 rows affected)
+
+id name rank_no notes
+-- ---- ------- -----
+1  Ann  3       red
+2  Bob  5       red
+
+(2 rows affected)
+
+Msg 207, Level 16, State 1, Line 1
+Invalid column name 'name'.
+id rank_no
+-- -------
+1  3
+2  5
+
+(2 rows affected)
 ```
 
 ## See also

@@ -9,6 +9,7 @@ exists.
 
 ```
 CREATE [ OR ALTER ] VIEW [ schema_name . ] view_name [ ( column [ ,...n ] ) ]
+[ WITH { SCHEMABINDING | VIEW_METADATA | ENCRYPTION } [ ,...n ] ]
 AS select_statement
 [ ; ]
 ```
@@ -26,6 +27,13 @@ AS select_statement
 : Names for the view's columns, as many as the query has. Without them the columns take the query's names, and
   each expression needs a name.
 
+`WITH SCHEMABINDING`
+: Ties the view to the tables it reads: `ALTER TABLE ... DROP COLUMN` of a column the view uses is error 5074, and `*`
+  in the query is error 1054. `sys.sql_modules.is_schema_bound` is 1. See example F.
+
+`WITH VIEW_METADATA`, `WITH ENCRYPTION`
+: Read and ignored (the text is not encrypted).
+
 *select_statement*
 : The query. It may join tables and views, group, use common table expressions and `UNION`. An `ORDER BY` needs
   `TOP` to mean anything.
@@ -33,6 +41,11 @@ AS select_statement
 ## Remarks
 
 - A view stores its query, not its rows: each read runs the query.
+- `ALTER TABLE ... DROP COLUMN` of a column a view reads is allowed unless the view is schema-bound. The view then
+  fails when it is read: error 207 for a column it names, 4502 for a `SELECT *` view that has fewer columns than it
+  had. A `SELECT *` view whose table lost a column and gained another reads the table's columns by position under its
+  old column names, as SQL Server does when the view was not read in between (after a failed read SQL Server keeps
+  giving 4502 until `sp_refreshview`, which lexdb does not have; see [ALTER TABLE](alter-table.md), example K).
 - The view's text, as written, is in `OBJECT_DEFINITION(OBJECT_ID('view'))` and `sys.sql_modules`; `sys.views`
   lists the view. `INFORMATION_SCHEMA.VIEWS.VIEW_DEFINITION` gives the query.
 - The names in the query are checked when the view is made: an unknown table is error 208, an unknown column 207.
@@ -42,11 +55,15 @@ AS select_statement
 
 - **Views are read-only.** `INSERT`, `UPDATE`, `DELETE` and `MERGE` through a view are error 50000 ("cannot update
   view "v" (lexdb's views are read-only)").
-- `WITH SCHEMABINDING`, `WITH ENCRYPTION`, `WITH VIEW_METADATA` and `WITH CHECK OPTION` are error 50000. There are
-  no indexed views.
+- `WITH CHECK OPTION` is error 50000 (written before `AS` it is 195, SQL Server 102). There are no indexed views.
+- `WITH SCHEMABINDING` is read and kept, but not all of SQL Server's checks are made: a one-part name in the query
+  (`FROM emp`) and a schema-bound view over a view that is not are taken (SQL Server: 4512 and 4513), and `ALTER TABLE
+  ... ALTER COLUMN` of a column the view reads is made (SQL Server: 5074). The 4502 text names the view without its
+  schema, and the state of 1054 is 1 (SQL Server: 6).
 - `CREATE VIEW` need not be the first statement of its batch (SQL Server: 111).
 - An `ORDER BY` without `TOP` is taken (SQL Server: 1033). The rows of the view are not sorted by it.
-- A table that a view reads cannot be dropped while the view exists (see [DROP TABLE](drop-table.md)).
+- A table that a view reads cannot be dropped while the view exists, schema-bound or not: error 50000 (SQL Server
+  drops it unless the view is schema-bound, 3729; see [DROP TABLE](drop-table.md)).
 - `sp_helptext` and `sp_refreshview` are not available (2812).
 
 ## Examples
@@ -163,7 +180,70 @@ Ann  5200.00
 (2 rows affected)
 ```
 
-### F. Errors
+### F. WITH SCHEMABINDING and DROP COLUMN
+
+<!-- example: tsql -->
+```sql
+CREATE TABLE dbo.pay (id int PRIMARY KEY, name nvarchar(30), bonus int, note nvarchar(20));
+INSERT dbo.pay VALUES (1, N'Ann', 10, N'a'), (2, N'Bob', 20, N'b');
+GO
+CREATE VIEW dbo.v_pay AS SELECT id, name FROM dbo.pay;
+GO
+CREATE VIEW dbo.v_pay_bound WITH SCHEMABINDING AS SELECT id, bonus FROM dbo.pay;
+GO
+CREATE VIEW dbo.v_pay_all AS SELECT * FROM dbo.pay;
+GO
+SELECT v.name AS view_name, m.is_schema_bound FROM sys.sql_modules m JOIN sys.views v ON v.object_id = m.object_id WHERE v.name LIKE 'v_pay%' ORDER BY v.name;
+GO
+ALTER TABLE dbo.pay DROP COLUMN bonus;
+GO
+ALTER TABLE dbo.pay DROP COLUMN note;
+GO
+SELECT * FROM dbo.v_pay_all;
+GO
+ALTER TABLE dbo.pay DROP COLUMN name;
+GO
+SELECT * FROM dbo.v_pay;
+GO
+SELECT * FROM dbo.v_pay_bound;
+GO
+CREATE VIEW dbo.v_star_bound WITH SCHEMABINDING AS SELECT * FROM dbo.pay;
+GO
+DROP TABLE dbo.pay;
+GO
+```
+
+```text
+(2 rows affected)
+
+view_name   is_schema_bound
+----------- ---------------
+v_pay       0
+v_pay_all   0
+v_pay_bound 1
+
+(3 rows affected)
+
+Msg 5074, Level 16, State 1, Line 1
+The object 'v_pay_bound' is dependent on column 'bonus'.
+Msg 4502, Level 16, State 1, Line 1
+View or function 'v_pay_all' has more column names specified than columns defined.
+Msg 207, Level 16, State 1, Line 1
+Invalid column name 'name'.
+id bonus
+-- -----
+1  10
+2  20
+
+(2 rows affected)
+
+Msg 1054, Level 15, State 1, Line 1
+Syntax '*' is not allowed in schema-bound objects.
+Msg 50000, Level 16, State 1, Line 1
+cannot drop table pay because other objects depend on it
+```
+
+### G. Errors
 
 <!-- example: tsql -->
 ```sql
@@ -172,7 +252,7 @@ CREATE VIEW dbo.v_dept AS SELECT 1 AS one;
 GO
 CREATE VIEW dbo.v_bad AS SELECT nothere FROM dbo.emp;
 GO
-CREATE VIEW dbo.v_bound WITH SCHEMABINDING AS SELECT id FROM dbo.emp;
+CREATE VIEW dbo.v_chk AS SELECT id FROM dbo.emp WITH CHECK OPTION;
 GO
 ```
 
@@ -184,7 +264,7 @@ There is already an object named 'v_dept' in the database.
 Msg 207, Level 16, State 1, Line 1
 Invalid column name 'nothere'.
 Msg 50000, Level 16, State 1, Line 1
-lexdb: view options (WITH (...)) are not supported
+lexdb: WITH CHECK OPTION is not supported
 ```
 
 ## See also
