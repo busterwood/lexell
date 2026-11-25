@@ -98,6 +98,37 @@ The errors of [CREATE PROPERTY GRAPH](create-property-graph.md), [DROP PROPERTY 
 | ORA-01841, ORA-01843 | A date that cannot be read: a bad year or month. |
 | ORA-01727 | A `NUMBER` precision out of range (1 to 38). |
 
+### Assertions
+
+See [CREATE ASSERTION](create-assertion.md). The same errors come in the other doors as 23514, 547 and the numbers
+in [Assertions in the three doors](../../assertions.md#errors-of-each-door).
+
+| Error | Meaning |
+|---|---|
+| ORA-08601 | A statement broke an assertion (`Assertion (APP.A1) violated.`); the statement is undone. Also `SET CONSTRAINT ... IMMEDIATE`, `ALTER ASSERTION ... ENABLE VALIDATE`, and the first line under ORA-08689 or ORA-02091. |
+| ORA-02091 | The `COMMIT` of a deferred assertion that failed: the transaction was rolled back; ORA-08601 is on the next line. |
+| ORA-08689 | `CREATE ASSERTION failed`: the next line is the reason (below), or ORA-08601 when the rows there break it. |
+| ORA-08661 | The reason: an aggregate, `GROUP BY` or `HAVING`. |
+| ORA-08695 | The reason: a subquery under `OR`. |
+| ORA-08680 | The reason: a subquery in `SATISFY`. |
+| ORA-08697 | The reason: `FETCH FIRST`. |
+| ORA-08677 | The reason: `SYSDATE`, `ROWNUM` and the like. |
+| ORA-08664 | The reason: a window function. |
+| ORA-08678 | The reason: `DUAL`. |
+| ORA-08651 | The reason: a view. |
+| ORA-08735 | The reason: an ANSI join. |
+| ORA-08659 | The reason: `IN` with an aggregate subquery. |
+| ORA-08660 | The reason: `WITH`. |
+| ORA-08673 | The reason: an equijoin of columns that may be NULL (`Equijoin "A"."G"="B"."G" found does not meet the criteria to do a FAST validation.`). |
+| ORA-08702 | `DROP TABLE` (without `CASCADE CONSTRAINTS`), `DROP COLUMN`, `RENAME COLUMN` or `MODIFY` of what an assertion reads (`Columns are referenced by assertion APP.A1.`). |
+| ORA-08694 | `RENAME` or `ALTER TABLE ... RENAME TO` of a table an assertion reads. |
+| ORA-08687 | `SET CONSTRAINT ... DEFERRED` of an assertion that is not deferrable. |
+| ORA-08724 | `NOT DEFERRABLE INITIALLY DEFERRED`. |
+| ORA-08725 | `ALTER ASSERTION ... DEFERRABLE`: a deferrability cannot be changed. |
+| ORA-08701 | `DISABLE VALIDATE`. |
+| ORA-13650 | `DROP` or `ALTER ASSERTION` of an assertion that does not exist. |
+| ORA-02443 | `SET CONSTRAINT` of a name that is no constraint or assertion (Oracle: ORA-02448). |
+
 ### Users, privileges and the session
 
 | Error | Meaning |
@@ -523,6 +554,55 @@ Property graph dropped.
 
 ERROR:
 ORA-42421: property graph does not exist
+```
+
+### K. Assertions
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE ak (id NUMBER PRIMARY KEY, v NUMBER);
+CREATE ASSERTION ak_pos CHECK (NOT EXISTS (SELECT 1 FROM ak WHERE v < 0)) DEFERRABLE;
+INSERT INTO ak VALUES (1, -1);
+SET CONSTRAINT ak_pos DEFERRED;
+INSERT INTO ak VALUES (1, -1);
+COMMIT;
+DROP TABLE ak;
+ALTER TABLE ak RENAME TO ak2;
+ALTER ASSERTION ak_pos DEFERRABLE;
+CREATE ASSERTION ak_bad CHECK (NOT EXISTS (SELECT 1 FROM ak WHERE v < 0)) NOT DEFERRABLE INITIALLY DEFERRED;
+DROP ASSERTION nosuch;
+```
+
+```text
+Table created.
+
+Assertion created.
+
+ERROR:
+ORA-08601: Assertion (SA.AK_POS) violated.
+
+Statement processed.
+
+1 row created.
+
+ERROR:
+ORA-02091: transaction rolled back
+ORA-08601: Assertion (SA.AK_POS) violated.
+
+ERROR:
+ORA-08702: Columns are referenced by assertion SA.AK_POS.
+
+ERROR:
+ORA-08694: Cannot rename a table referenced in assertion.
+
+ERROR:
+ORA-08725: Attempting to modify deferrability of assertion.
+
+ERROR:
+ORA-08724: Attempting to set assertion to INITIALLY DEFERRED NOT DEFERRABLE.
+
+ERROR:
+ORA-13650: The specified object does not exist for this execution.
 ```
 
 ## See also

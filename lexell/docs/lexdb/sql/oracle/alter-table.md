@@ -78,6 +78,8 @@ constraint states mean.
 
 ## Remarks
 
+- `MODIFY`, `DROP COLUMN` and `RENAME COLUMN` of a column an [assertion](create-assertion.md) reads are ORA-08702;
+  `RENAME TO` of its table is ORA-08694. Another column may be added, dropped or renamed.
 - Names in the statement are folded to upper case unless quoted.
 - A constraint has two states: *enabled* or *disabled* (`USER_CONSTRAINTS.STATUS`), and *validated* or *not validated*
   (`VALIDATED`). A disabled constraint is never checked. An enabled one that is not validated is checked for rows

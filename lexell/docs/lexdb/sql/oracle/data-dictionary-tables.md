@@ -4,7 +4,8 @@
 `USER_CONS_COLUMNS`, `USER_TAB_IDENTITY_COLS`, `USER_OBJECTS`, `USER_CATALOG`, `USER_ANNOTATIONS_USAGE`,
 `USER_ANNOTATIONS`, `USER_ANNOTATION_VALUES`, the property graph views (`USER_PROPERTY_GRAPHS`, `USER_PG_ELEMENTS`,
 `USER_PG_LABELS`, `USER_PG_ELEMENT_LABELS`, `USER_PG_LABEL_PROPERTIES`, `USER_PG_PROP_DEFINITIONS`, `USER_PG_KEYS`,
-`USER_PG_EDGE_RELATIONSHIPS`, `USER_PG_COMMENTS`) and their `ALL_` and `DBA_` forms.
+`USER_PG_EDGE_RELATIONSHIPS`, `USER_PG_COMMENTS`), the assertion views (`USER_ASSERTIONS`,
+`USER_ASSERTION_DEPENDENCIES`, `USER_ASSERTION_LOCK_MATRIX`) and their `ALL_` and `DBA_` forms.
 
 **Door:** Oracle (TNS). **Follows:** Oracle AI Database 26ai (23.26) and 23ai.
 
@@ -85,6 +86,28 @@ read them, and return no rows).
 : A row for each graph, `COMMENTS` empty (lexdb does not keep comments).
 
 All of them have `ALL_` and `DBA_` forms with an `OWNER` column. Example J below.
+
+`USER_ASSERTIONS`, `ALL_ASSERTIONS`, `DBA_ASSERTIONS`
+: One row for each [assertion](create-assertion.md), whichever door made it: `ASSERTION_NAME`, `STATUS` (`ENABLED` or
+  `DISABLED`), `DEFERRABLE` (`DEFERRABLE` or `NOT DEFERRABLE`), `DEFERRED` (`DEFERRED` or `IMMEDIATE`), `VALIDATED`
+  (`VALIDATED` or `NOT VALIDATED`), `DEFINITION_SQL` (a CLOB: `CREATE ASSERTION "APP"."A1" CHECK`, a line with the
+  condition as written, then the state words, each on a line of its own, joined by carriage return and line feed),
+  and `INVALID`, which is always NULL. `OWNER` in `ALL_` and `DBA_`; an assertion made in the PostgreSQL or SQL Server
+  door is owned by the user, or by `SYS` for a user with a schema of its own, as public's tables are. A `DBA_` view is
+  not readable by an ordinary user.
+
+`USER_ASSERTION_DEPENDENCIES`, `ALL_ASSERTION_DEPENDENCIES`, `DBA_ASSERTION_DEPENDENCIES`
+: A row for each table an assertion reads, each instance of it (a table read twice has two rows): `ASSERTION_NAME`,
+  `REFERENCED_OWNER`, `REFERENCED_NAME`, `REFERENCED_TYPE` (`TABLE`), `REFERENCED_ID` (0, 1, ... in Oracle's order: the
+  query's own tables first, by their age, then each `NOT EXISTS`'s), `VALIDATION_TYPE` (`FAST`, or `COMPLETE` for an
+  `EXISTS`) and `VALIDATION_EVENT` (`ROWS INSERTED OR UPDATED`; `ROWS DELETED OR UPDATED` for a table under a `NOT EXISTS`
+  and for an `EXISTS`).
+
+`USER_ASSERTION_LOCK_MATRIX` (and `ALL_`, `DBA_`)
+: Has the columns and no rows: lexdb's locks are the assertion's and its join key's values, not Oracle's per-instance
+  modes.
+
+An assertion is also a row of `USER_OBJECTS` with `OBJECT_TYPE` `UNDEFINED` and `STATUS` `VALID`. Example K.
 
 `DICTIONARY` (`DICT`), `DICT_COLUMNS`
 : The list of the dictionary's own views.
@@ -577,8 +600,68 @@ ORG         PROPERTY GRAPH VALID
 1 row selected.
 ```
 
+### K. Assertions
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE ka (id NUMBER PRIMARY KEY, v NUMBER);
+CREATE TABLE kb (id NUMBER PRIMARY KEY, ka_id NUMBER NOT NULL);
+CREATE ASSERTION kb_has_ka CHECK (NOT EXISTS (SELECT 1 FROM kb WHERE NOT EXISTS (SELECT 1 FROM ka WHERE ka.id = kb.ka_id)));
+CREATE ASSERTION ka_pos CHECK (NOT EXISTS (SELECT 1 FROM ka WHERE v < 0)) DEFERRABLE INITIALLY DEFERRED;
+SELECT assertion_name, status, deferrable, deferred, validated, invalid FROM user_assertions ORDER BY 1;
+SELECT assertion_name, referenced_name, referenced_id, validation_type, validation_event
+FROM user_assertion_dependencies ORDER BY assertion_name, referenced_id;
+SELECT object_name, object_type, status FROM user_objects WHERE object_type = 'UNDEFINED' ORDER BY 1;
+SELECT REPLACE(REPLACE(definition_sql, CHR(13), '<cr>'), CHR(10), '<lf>') AS d FROM user_assertions WHERE assertion_name = 'KA_POS';
+SELECT COUNT(*) AS n FROM user_assertion_lock_matrix;
+```
+
+```text
+Table created.
+
+Table created.
+
+Assertion created.
+
+Assertion created.
+
+ASSERTION_NAME STATUS  DEFERRABLE     DEFERRED  VALIDATED INVALID
+-------------- ------- -------------- --------- --------- -------
+KA_POS         ENABLED DEFERRABLE     DEFERRED  VALIDATED
+KB_HAS_KA      ENABLED NOT DEFERRABLE IMMEDIATE VALIDATED
+
+2 rows selected.
+
+ASSERTION_NAME REFERENCED_NAME REFERENCED_ID VALIDATION_TYPE VALIDATION_EVENT
+-------------- --------------- ------------- --------------- ------------------------
+KA_POS         KA                          0 FAST            ROWS INSERTED OR UPDATED
+KB_HAS_KA      KB                          0 FAST            ROWS INSERTED OR UPDATED
+KB_HAS_KA      KA                          1 FAST            ROWS DELETED OR UPDATED
+
+3 rows selected.
+
+OBJECT_NAME OBJECT_TYPE STATUS
+----------- ----------- ------
+KA_POS      UNDEFINED   VALID
+KB_HAS_KA   UNDEFINED   VALID
+
+2 rows selected.
+
+D
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+CREATE ASSERTION "SA"."KA_POS" CHECK <cr><lf>(NOT EXISTS (SELECT 1 FROM ka WHERE v < 0))<cr><lf> ENABLE<cr><lf> DEFERRABLE<cr><lf> INITIALLY DEFERRED<cr><lf> VALIDATE
+
+1 row selected.
+
+N
+-
+0
+
+1 row selected.
+```
+
 ## See also
 
 [Programs, sequences and views](data-dictionary-programs.md), [System and session views](data-dictionary-system.md),
 [CREATE TABLE](create-table.md), [CREATE INDEX](create-index.md), [Annotations](annotations.md),
-[CREATE PROPERTY GRAPH](create-property-graph.md)
+[CREATE PROPERTY GRAPH](create-property-graph.md), [CREATE ASSERTION](create-assertion.md)

@@ -87,6 +87,8 @@ annotations_clause:
 
 ## Remarks
 
+- A foreign key's action (`ON DELETE CASCADE`, `SET NULL`, and lexdb's `ON UPDATE CASCADE`) writes the child table, and an
+  [assertion](create-assertion.md) on the child is checked after it: ORA-08601 undoes the whole statement.
 - Names are folded to upper case unless quoted: `CREATE TABLE "Mixed Case"` keeps its case.
 - The data dictionary shows the table in `USER_TABLES`, its columns in `USER_TAB_COLUMNS`, and its constraints in
   `USER_CONSTRAINTS`.

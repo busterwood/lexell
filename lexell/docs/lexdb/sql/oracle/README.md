@@ -42,6 +42,7 @@ Oracle. Each page names what lexdb lacks or does differently.
 | [RENAME](rename.md) | Tables, views, sequences. |
 | [COMMENT ON](comment-on.md) | Accepted; comments are not kept. |
 | [Annotations](annotations.md) | `ANNOTATIONS (...)` on tables, views, indexes and columns; `ALTER ... ANNOTATIONS` with `ADD`, `DROP` and `REPLACE`. |
+| [CREATE ASSERTION](create-assertion.md), [DROP ASSERTION](drop-assertion.md), [ALTER ASSERTION and SET CONSTRAINT](alter-assertion.md) | Constraints across tables (23.26): `NOT EXISTS`, `EXISTS`, `ALL ... SATISFY`; `DEFERRABLE`, `VALIDATE`, `ENABLE`. Enforced for all three doors ([overview](../../assertions.md)). |
 | [CREATE PROPERTY GRAPH](create-property-graph.md), [DROP PROPERTY GRAPH](drop-property-graph.md) | Vertex and edge tables, keys, `SOURCE` and `DESTINATION`, labels and properties; `OR REPLACE`, `IF [NOT] EXISTS`. |
 
 ### PL/SQL units
