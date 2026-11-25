@@ -6,7 +6,28 @@ run, newest first. Each run's detail (plans, profiles, what changed) stays
 in the design note it came from, linked from its row. When a suite is run
 again, add its row to section 4 and update section 1.
 
-## 1. Now (2026-11-23)
+## 1. Now (2026-11-25)
+
+**Refresh at `5d93ced1` (main, after Materialized Views Stages 1–4 across PostgreSQL, Oracle, and SQL Server),
+pinned (section 2), boost off for TPC-H, ClickBench, sysbench, and dedicated MV suites;
+results in `~/Work/lexdb-bench/saved/results/2026-11-25-mview/`.**
+
+| | 2026-11-23 | 2026-11-25 (`5d93ced1`) | PostgreSQL 18 |
+|---|---:|---:|---:|
+| point selects, 1 / 8 / 32 clients (1 process) | 92,300 / 164,800 / 160,100/s | **98,794 / 188,196 / 180,704/s** | 81,548 / 440,141 / 407,971/s |
+| point selects, 3 replicas, 1 / 8 / 32 clients | 91,000 / 363,000-368,000 / 434,000-439,000/s | 97,924–98,622 / 349,157–392,047 / **499,549–503,649/s** | (4 cores: above) |
+| updates, 1 / 8 / 32 clients | 3,654 / 16,400 / 42,300/s | **4,079 / 18,296 / 67,022/s** | 1,627 / 6,743 / 25,923/s |
+| mixed: replica selects / master updates | 347,600-349,600 / 15,100-15,300/s | **408,392–415,567 / 16,052–16,404/s** | |
+| commit latency p50 / p99 / p99.9 / max (8 clients) | 0.44 / 1.35-1.40 / 3.84-3.86 / 8.4-9.9 ms | **0.41 / 0.81–0.83 / 3.65–3.79 / 8.07–8.23 ms** | |
+| replica lag under the mixed load, p50 / p99 | 0.24-0.26 / 0.49-0.55 ms | **0.21–0.23 / 0.48 ms** | |
+| 35 analytic queries, lexdb CPU / PG 1c, wall / PG 4p | 0.54 / 1.04 | **0.48 / 0.95** (with 4 MVs: **0.30 vs PG1 / 0.49 vs PG4**) | |
+| TPC-H SF1, summed (boost off) | 8,943 ms | **7,115 ms** (geomean 0.49 vs PG1, 0.79 vs PG4; 22/22) | 14,670 one core / 8,839 four processes |
+| ClickBench 1M, summed (boost off) | — | **19,337 ms** (geomean 0.81 vs PG1; with 4 MVs: **0.28 / 0.61**) | 22,363 one core / 11,326 four processes |
+| COPY narrow / wide / wide + 2 indexes / no key / 10M narrow | 0.46 / 1.44 / 6.31 / 2.98 / 4.85 s | **0.24 / 1.04 / 1.80 / 1.05 / 2.44 s** | 0.64 / 1.92 / 4.93 / 1.54 / 5.78 s |
+| COPY peak RSS, wide / wide + 2 indexes / 10M narrow | 764 / 1,680 / 3,256 MB | **619 / 1,330 / 2,870 MB** | |
+| MV `FAST` update (1M rows, 1 row: grp / sketch / 3-level DAG) | — | **0.71 / 0.52 / 0.49 ms** | 145.3 / 367.3 / 142.6 ms (1c); 59.0 / 365.0 / 140.8 ms (4p) |
+
+### 1.0a The 2026-11-23 refresh
 
 **Refresh at `4506a2e8` (main, after the compiler work of opt-experiments.md
 17-19: integers written into string chains, drop loops, recursion inlined
@@ -478,6 +499,8 @@ below 1 for times.
 
 | date | lexdb | suite | headline | detail |
 |---|---|---|---|---|
+| 2026-11-25 | 5d93ced1 (MVs Stages 1–4) | Materialized views & transparent Query Rewrite (1M rows, boost off, pinned) | 35 analytic queries w/ 4 MVs: 9 queries rewritten 8–95 → 3–4 ms (geomean 0.30 vs PG1, 0.49 vs PG4; 1/100/1000-row live insert 4.7/7.0/23.9 ms vs PG 719/249 ms); ClickBench 1M w/ 4 MVs: 8 queries 51–430 → 0.31–5.29 ms (geomean 0.28 / 0.61); dedicated 1M MVs: grp/sketch/3-DAG `FAST` 0.71/0.52/0.49 ms vs PG `REFRESH` 59–367 ms; 16-writer hot-key `realtime` OQC 21.7k/s (0 err) | PERFORMANCE.md |
+| 2026-11-25 | 5d93ced1 (MVs Stages 1–4) | full LexDB refresh (TPC-H SF1, ClickBench 1M, sysbench 1M, pgbench/replicas/commitlat, 35 analytic, COPY) | TPC-H 7,115 ms (geomean 0.49 vs PG1, 0.79 vs PG4, 22/22); ClickBench 19,337 ms (0.81 vs PG1); 35 analytic CPU 0.48 / wall 0.95 vs PG4; pgbench 3-rep 500–504k/s, updates 67k/s (2.59×), commit p99 0.81–0.83 ms; COPY 0.24 / 1.04 / 1.80 / 1.05 / 2.44 s (0.37–0.68× PG on all 5) | this page, 1; PERFORMANCE.md |
 | 2026-11-23 | indexed COPY fast path (this commit) | bulk load, 1M wide rows with two secondary indexes (lexdb and PG, same session) | 5.81 to 2.71 s (PG 4.88: runs 5.45 4.88 4.55); wide without indexes 1.46 s unchanged | lexdb-copy-fast.md |
 | 2026-11-23 | after daa96ce9 (COPY's fast path for keyless tables) | bulk loads (lexdb; PG from the day's refresh) | no primary key 2.98 to 1.50 s (PG 1.52: level); two secondary indexes 6.31 to 5.82 s (PG 4.74); narrow 0.49, wide 1.45, 10M 4.90 s (PG 0.59, 1.81, 5.72) | lexdb-copy-fast.md |
 | 2026-11-23 | after 73cea2c1 (one-leaf checkpoint steps) | commit latency (master alone, 8 clients, pinned, two runs each) | p99 1.33-1.37 ms to 0.97-0.98 (steps of 1 leaf, not 2), updates +1.5%; with checkpoints held off p99 0.50 ms; leaf copies for kept versions 9.7% of server CPU | lexdb.md 9.136 |
