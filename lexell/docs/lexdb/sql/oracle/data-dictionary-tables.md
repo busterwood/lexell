@@ -1,7 +1,8 @@
 # Data dictionary: tables, columns, indexes and constraints
 
 `USER_TABLES`, `USER_TAB_COLUMNS`, `USER_INDEXES`, `USER_IND_COLUMNS`, `USER_IND_EXPRESSIONS`, `USER_CONSTRAINTS`,
-`USER_CONS_COLUMNS`, `USER_TAB_IDENTITY_COLS`, `USER_OBJECTS`, `USER_CATALOG` and their `ALL_` and `DBA_` forms.
+`USER_CONS_COLUMNS`, `USER_TAB_IDENTITY_COLS`, `USER_OBJECTS`, `USER_CATALOG`, `USER_ANNOTATIONS_USAGE`,
+`USER_ANNOTATIONS`, `USER_ANNOTATION_VALUES` and their `ALL_` and `DBA_` forms.
 
 **Door:** Oracle (TNS). **Follows:** Oracle AI Database 26ai (23.26) and 23ai.
 
@@ -15,7 +16,7 @@ SELECT ... FROM TABS | COLS | DICT | DICTIONARY | DUAL
 ## Views
 
 Each view has the columns of Oracle 23ai; the columns named below carry data, the others are NULL or a fixed value.
-`SELECT * FROM DICTIONARY` lists the views the door has (226 names; many of them are present only so that tools can
+`SELECT * FROM DICTIONARY` lists the views the door has (235 names; many of them are present only so that tools can
 read them, and return no rows).
 
 `USER_`, `ALL_` and `DBA_` forms
@@ -49,6 +50,17 @@ read them, and return no rows).
   `CREATED` and `LAST_DDL_TIME` (always 2000-01-01), `OBJECT_ID` (derived from the name). `USER_CATALOG` lists
   tables, views and sequences with `TABLE_TYPE`.
 
+`USER_ANNOTATIONS_USAGE`, `ALL_ANNOTATIONS_USAGE`, `DBA_ANNOTATIONS_USAGE`
+: One row for each [annotation](annotations.md) of a table, view or index or of one of their columns:
+  `OBJECT_NAME`, `OBJECT_TYPE` (`TABLE`, `VIEW` or `INDEX`), `COLUMN_NAME` (NULL for the object's own),
+  `ANNOTATION_NAME`, `ANNOTATION_VALUE` (NULL for a flag); `DOMAIN_NAME` and `DOMAIN_OWNER` are NULL. The `ALL_` and
+  `DBA_` forms add `ANNOTATION_OWNER`.
+
+`USER_ANNOTATIONS`, `USER_ANNOTATION_VALUES` and their `ALL_` and `DBA_` forms
+: The annotation names in use (`ANNOTATION_NAME`), and the names and values in use (`ANNOTATION_NAME`,
+  `ANNOTATION_VALUE`), each once for an owner (`ANNOTATION_OWNER` in `ALL_` and `DBA_`). A name goes from them when
+  its last use goes.
+
 `DICTIONARY` (`DICT`), `DICT_COLUMNS`
 : The list of the dictionary's own views.
 
@@ -65,8 +77,9 @@ read them, and return no rows).
 - Statistics columns (`NUM_ROWS`, `LAST_ANALYZED`, ...) are empty; `DBMS_STATS` calls are accepted and do nothing.
 - Every key index is named after its table (`EMP_PKEY`) where Oracle uses `SYS_Cnnnnnn` for system-generated names.
 - `USER_CONSTRAINTS` and `USER_CONS_COLUMNS` have no rows for `NOT NULL` constraints (Oracle: type `C`, `SEARCH_CONDITION`
-  `"A" IS NOT NULL`); [CREATE TABLE](create-table.md), example K. `USER_ANNOTATIONS_USAGE` does not exist, as annotations are
-  not supported.
+  `"A" IS NOT NULL`); [CREATE TABLE](create-table.md), example K.
+- `ALL_` and `DBA_ANNOTATIONS_USAGE` have no rows for the built-in domains of `SYS` (Oracle Free lists about a
+  hundred, `OBJECT_TYPE` `DOMAIN`): lexdb has no domains. A global temporary table's annotations are not listed.
 - `USER_INDEXES.COMPRESSION` is `DISABLED` and the storage columns are empty.
 - `USER_SOURCE` and the other program views are on [their own page](data-dictionary-programs.md).
 - Views Oracle has and lexdb has not (`USER_TAB_PRIVS_MADE`, `USER_TAB_PRIVS_RECD`, `ROLE_TAB_PRIVS`) are
@@ -324,7 +337,7 @@ COLS
 
 VIEWS_IN_DICTIONARY
 -------------------
-                226
+                235
 
 1 row selected.
 ```
@@ -389,7 +402,65 @@ GATE_LEVEL_CK   ENABLED NOT VALIDATED
 2 rows selected.
 ```
 
+### I. Annotations
+
+<!-- example: oracle -->
+```sql
+ALTER TABLE emp ANNOTATIONS (ADD Owner 'hr', ADD Audited);
+ALTER TABLE emp MODIFY (salary ANNOTATIONS (ADD Unit 'EUR'));
+ALTER INDEX ix_emp_name ANNOTATIONS (ADD Purpose 'search');
+SELECT object_name, object_type, column_name, annotation_name, annotation_value
+FROM user_annotations_usage ORDER BY object_type, column_name NULLS FIRST, annotation_name;
+SELECT * FROM user_annotations ORDER BY 1;
+SELECT * FROM user_annotation_values ORDER BY 1, 2;
+SELECT annotation_owner, annotation_name FROM all_annotations WHERE annotation_owner = USER ORDER BY 2;
+```
+
+```text
+Table altered.
+
+Table altered.
+
+Index altered.
+
+OBJECT_NAME OBJECT_TYPE COLUMN_NAME ANNOTATION_NAME ANNOTATION_VALUE
+----------- ----------- ----------- --------------- ----------------
+IX_EMP_NAME INDEX                   PURPOSE         search
+EMP         TABLE                   AUDITED
+EMP         TABLE                   OWNER           hr
+EMP         TABLE       SALARY      UNIT            EUR
+
+4 rows selected.
+
+ANNOTATION_NAME
+---------------
+AUDITED
+OWNER
+PURPOSE
+UNIT
+
+4 rows selected.
+
+ANNOTATION_NAME ANNOTATION_VALUE
+--------------- ----------------
+AUDITED
+OWNER           hr
+PURPOSE         search
+UNIT            EUR
+
+4 rows selected.
+
+ANNOTATION_OWNER ANNOTATION_NAME
+---------------- ---------------
+SA               AUDITED
+SA               OWNER
+SA               PURPOSE
+SA               UNIT
+
+4 rows selected.
+```
+
 ## See also
 
 [Programs, sequences and views](data-dictionary-programs.md), [System and session views](data-dictionary-system.md),
-[CREATE TABLE](create-table.md), [CREATE INDEX](create-index.md)
+[CREATE TABLE](create-table.md), [CREATE INDEX](create-index.md), [Annotations](annotations.md)
