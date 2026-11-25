@@ -3081,6 +3081,8 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
             try p.expectKw(")")
             try p.tsqlStorage()
             if p.enforcedNext() { return Err(lexdb_base.err("0A000", "PRIMARY KEY constraints cannot be marked NOT ENFORCED")) }
+        } else if p.tsql && len(cname) == 0 && p.acceptKw("index") {
+            try p.inlineIndex(mut &s, "")
         } else if len(cname) > 0 || p.isKw("unique") || p.isKw("check") || p.isKw("foreign") || p.isKw("exclude") {
             append(mut &s.cons, try p.tableConstraint(&cname))
         } else {
@@ -3125,6 +3127,8 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
                     try p.identity(mut &c, mut &s)
                 } else if p.tsql && p.acceptKw("identity") {
                     try p.tsqlIdentity(mut &c, mut &s)
+                } else if p.tsql && len(cn) == 0 && p.acceptKw("index") {
+                    try p.inlineIndex(mut &s, &n)
                 } else if p.acceptKw("unique") {
                     try p.uniqueTail()
                     var u = lexdb_sql.newConstraint(C_UNIQUE, &cn)
@@ -4471,6 +4475,13 @@ fn (p: &P) selectNext(): bool {
 }
 
 fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
+    // T-SQL: INSERT TOP (n) [PERCENT] (insertTop)
+    if p.tsql && p.isKw("top") {
+        p.pos += 1
+        var tq = lexdb_sql.newStmt(S_SELECT)
+        try p.top(mut &tq, false)
+        return insertTop(try p.insert(), tq)
+    }
     // T-SQL: INTO may be left out
     if !(p.tsql && !p.isKw("into")) { try p.expectKw("into") }
     var s = lexdb_sql.newStmt(S_INSERT)
@@ -4550,6 +4561,40 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
 
 
 
+
+// T-SQL's INSERT TOP (n) [PERCENT] (tq: its limit and topMode) of INSERT s: the query's TOP (its rows' first n, or n percent
+// rounded up; which ones is undefined, as SQL Server's), the query read as a derived table under it when it has its own TOP,
+// ORDER BY, OFFSET or a set operation; VALUES' rows cut by a constant n.
+fn insertTop(s0: Stmt, tq: Stmt): Result[Stmt, lexdb_base.DbErr] {
+    var s = s0
+    var t = tq
+    if len(s.inner) == 0 {
+        let n = match t.limit { Some(x) { match x { Expr.Lit(v) { match v { Val.Int(i) { i } else { -2 } } } else { -2 } } } None { -2 } }
+        if n == -2 { return Err(lexdb_base.err("0A000", "lexdb: INSERT TOP of VALUES takes a constant count")) }
+        if n < 0 { return Err(lexdb_base.err("TS127", "A TOP N or FETCH rowcount value may not be negative.")) }
+        var keep = n
+        if t.topMode & TOP_PERCENT != 0 {
+            if n > 100 { return Err(lexdb_base.err("TS1031", "Percent values must be between 0 and 100.")) }
+            keep = (len(s.rows) * n + 99) / 100
+        }
+        while len(s.rows) > keep { let x = pop(mut &s.rows) }
+        return Ok(s)
+    }
+    var q = pop(mut &s.inner)
+    if q.limit.isSome() || q.offset.isSome() || q.topMode != 0 || q.setop != 0 || len(q.order) > 0 {
+        var w = lexdb_sql.newStmt(S_SELECT)
+        w.params = q.params
+        q.use = SUB_FROM
+        append(mut &w.subs, q)
+        append(mut &w.from, FromItem{table: "", alias: "top_", join: J_FIRST, on: None, sub: 0, cols: [], work: -1, lateral: false, using: [], natural: false, comma: true})
+        append(mut &w.items, SelItem{star: true, qual: "", expr: None, alias: "", spell: ""})
+        q = w
+    }
+    q.limit = replace(mut &t.limit, None)
+    q.topMode = t.topMode
+    append(mut &s.inner, q)
+    return Ok(s)
+}
 
 // INSERT's query that starts WITH, at WITH: the query in inner[0], its CTEs in scope.
 fn (p: mut &P) insertWith(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
@@ -5725,7 +5770,7 @@ fn (p: mut &P) top(s: mut &Stmt, sel: bool): Result[Unit, lexdb_base.DbErr] {
         p.pos -= 1
         s.limit = Some(try p.primary())
     }
-    if sel && p.acceptKw("percent") { s.topMode = s.topMode | TOP_PERCENT }
+    if p.acceptKw("percent") { s.topMode = s.topMode | TOP_PERCENT }        // (UPDATE, DELETE and INSERT TOP n PERCENT too)
     if sel && p.isKw("with") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "ties" {
         p.pos += 2
         s.topMode = s.topMode | TOP_TIES
@@ -6797,9 +6842,38 @@ fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
         let m = try p.name()
         if m != "btree" { return Err(lexdb_base.err("0A000", &("index method \"" + m + "\" is not supported"))) }
     }
+    try p.indexCols(mut &s)
+    return Ok(s)
+}
+
+// T-SQL's index in CREATE TABLE: INDEX name [UNIQUE] [CLUSTERED | NONCLUSTERED] (columns) [INCLUDE ...] [WHERE ...] [WITH ...] [ON
+// ...] among the table's elements, INDEX name [UNIQUE] [CLUSTERED | NONCLUSTERED] after a column (col: its name). A CREATE INDEX of
+// s.table, kept in s.inner and made with the table (lexdb_exec).
+fn (p: mut &P) inlineIndex(s: mut &Stmt, col: &str): Result[Unit, lexdb_base.DbErr] {
+    var ci = lexdb_sql.newStmt(S_CREATE_INDEX)
+    ci.mdialect = MD_TSQL
+    ci.index = try p.name()
+    ci.unique = p.acceptKw("unique")
+    ci.cluster = p.clusterWord()
+    ci.table = s.table.clone()
+    // (a CLUSTERED one makes a primary key not said to be either NONCLUSTERED, as SQL Server's)
+    if ci.cluster == 1 && s.pkCluster == 0 { s.pkCluster = 2 }
+    if len(col) > 0 {
+        append(mut &ci.names, col.toStr())
+        append(mut &ci.exprs, Expr.Lit(Val.Null))
+        append(mut &ci.pk, "")
+    } else {
+        try p.indexCols(mut &ci)
+    }
+    append(mut &s.inner, ci)
+    return Ok(Unit{})
+}
+
+// An index's (columns) and what follows them: INCLUDE, WHERE, Oracle's ANNOTATIONS, T-SQL's storage.
+fn (p: mut &P) indexCols(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     try p.expectKw("(")
-    try p.indexCol(mut &s)
-    while p.acceptKw(",") { try p.indexCol(mut &s) }
+    try p.indexCol(s)
+    while p.acceptKw(",") { try p.indexCol(s) }
     try p.expectKw(")")
     if p.tsql && p.acceptKw("include") {
         // T-SQL's INCLUDE (columns): read, not kept (lexdb's index holds its
@@ -6812,7 +6886,7 @@ fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
     if p.acceptKw("where") { s.where = Some(try p.expr()) }      // a filtered index
     while p.ora && p.acceptKw("annotations") { append(mut &s.alters, try p.annotClause("", true)) }
     try p.tsqlStorage()
-    return Ok(s)
+    return Ok(Unit{})
 }
 
 // PostgreSQL's B-tree operator classes for the types lexdb has.
@@ -6971,7 +7045,7 @@ fn (p: mut &P) merge(): Result[Stmt, lexdb_base.DbErr] {
     s.mdialect = if p.tsql { MD_TSQL } else if p.ora { MD_ORA } else { MD_PG }
     if p.tsql && p.acceptKw("top") {
         try p.top(mut &s, false)
-        if p.acceptKw("percent") { return Err(lexdb_base.err("0A000", "lexdb: MERGE TOP ... PERCENT is not supported")) }
+        if s.topMode & TOP_PERCENT != 0 { return Err(lexdb_base.err("0A000", "lexdb: MERGE TOP ... PERCENT is not supported")) }
     }
     if p.tsql { let into = p.acceptKw("into") } else { try p.expectKw("into") }
     s.table = try p.rname()

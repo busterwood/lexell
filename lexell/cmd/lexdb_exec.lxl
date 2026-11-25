@@ -6787,7 +6787,7 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
             continue
         }
         let i = lexdb_bind.colIndex(&t.cols, &n)
-        if i < 0 { return Err(e("42703", &("column \"" + n + "\" does not exist"))) }
+        if i < 0 { return Err(if s.mdialect == lexdb_sql.MD_TSQL { e("TS1911", &("Column name '" + n + "' does not exist in the target table or view.")) } else { e("42703", &("column \"" + n + "\" does not exist")) }) }
         if s.mdialect == lexdb_sql.MD_PG && lexdb_sql.isVirtual(&t.cols[i]) { return Err(e("0A000", "indexes on virtual generated columns are not supported")) }
         try lexdb_gen.indexable(&t.cols, i, s.mdialect, &lexdb_sql.baseName(&t.name))
         append(mut &cols, i)
@@ -7282,7 +7282,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         var later: []FkLater = []
         let noAggs: []Val = []
         let env = Env{cols: &q.cols, row: &noAggs, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
-        if try stmtReads(st, txn, &s.inner[0], &t.name) {
+        if sel.topMode != 0 || try stmtReads(st, txn, &s.inner[0], &t.name) {      // (TOP n PERCENT, WITH TIES: the rows made whole)
             var res = try runSel(st, txn, &sel, params, lim)
             for i in 0..len(res.rows) {
                 let r = replace(mut &res.rows[i], [])
@@ -7949,7 +7949,7 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
             return Ok(wn == 0 || len(found) < wn)         // a batch stops at its n rows
         }, mut &rs)
         if len(s.from) > 0 { found = onceEach(t, found, true) }
-        if s.limit.isSome() { found = firstN(found, try lexdb_plan.evalTop(&s.limit, params)) }     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
+        if s.limit.isSome() { found = firstN(found, try lexdb_plan.topOf(&s.limit, params, s.topMode, len(found))) }     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
         if !(try lockFound(st, txn, t, &found, lmode)) { break }
         // a lock waited for: the rows found again, holding the locks
         found = []
@@ -8112,7 +8112,7 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
             return Ok(wn == 0 || len(found) < wn)         // a batch stops at its n rows
         }, mut &rs)
         if len(s.from) > 0 { found = onceEach(t, found, true) }
-        if s.limit.isSome() { found = firstN(found, try lexdb_plan.evalTop(&s.limit, params)) }     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
+        if s.limit.isSome() { found = firstN(found, try lexdb_plan.topOf(&s.limit, params, s.topMode, len(found))) }     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
         if !(try lockFound(st, txn, t, &found, lexdb_sql.LOCK_UPDATE)) { break }
         found = []
         held = 0
@@ -13621,8 +13621,10 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     }
     match s.kind {
         lexdb_sql.S_CREATE {
-            if len(s.inner) > 0 { return createTableAs(st, txn, s, params, ptypes, lim) }
-            return createTable(st, txn, s)
+            if len(s.inner) > 0 && s.inner[0].kind != lexdb_sql.S_CREATE_INDEX { return createTableAs(st, txn, s, params, ptypes, lim) }
+            let made = try createTable(st, txn, s)
+            for x in s.inner { let ix = try createIndex(st, txn, &x) }     // (T-SQL's INDEX in CREATE TABLE)
+            return Ok(made)
         }
         lexdb_sql.S_DROP { return dropTable(st, txn, s) }
         lexdb_sql.S_INSERT { return insert(st, txn, s, params, ptypes, lim) }
