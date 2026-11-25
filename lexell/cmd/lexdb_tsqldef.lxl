@@ -1,0 +1,132 @@
+// lexdb_tsqldef: an expression as SQL Server writes a definition back (design/lexdb-robust.md, "The third bug slice"): a CHECK's in
+// sys.check_constraints.definition and INFORMATION_SCHEMA.CHECK_CONSTRAINTS.CHECK_CLAUSE, a default's, a computed column's. Read off
+// SQL Server 2022's answers: [names]; numbers in brackets ((0), (-1.5)); strings as they are; comparisons and arithmetic without
+// spaces, a + or - operand of a comparison in brackets (([f]+(1))), inside arithmetic only where precedence needs them;
+// AND, OR, NOT, IS [NOT] NULL in capitals with spaces (an OR under AND or NOT in brackets, an AND under NOT); [NOT] LIKE as
+// `[c] like 'a%'` (NOT before it); IN as ORs of = in the reverse order (([c]='z' OR [c]='y' OR [c]='x')), NOT IN as NOT of them;
+// BETWEEN as >= AND <= (lexdb keeps it so); CASE in lower case; a function in lower case, its arguments by commas. Not as SQL
+// Server's: a CAST (SQL Server writes CONVERT([varchar](5),[a]); lexdb's cast is kept as what it became), an N'...' literal (the N
+// is not kept).
+import "strings"
+import "./lexdb_sql"
+
+type Val = lexdb_sql.Val
+type Expr = lexdb_sql.Expr
+
+// The definition of a CHECK: the expression in one pair of brackets.
+pub fn checkText(x: &Expr): str { return "(" + text(x, 0) + ")" }
+
+// The levels an operand sits at: 0 a definition's top, 1 under OR, 2 under AND, 3 under NOT, 4 a comparison's or LIKE's
+// operand, 5 and up arithmetic (5 + and -, 6 * / %).
+fn text(x: &Expr, at: int): str {
+    match x {
+        Expr.Lit(v) { return lit(&v) }
+        Expr.Col(n, _) {
+            let d = strings.indexOf(n, ".", 0)
+            return "[" + (if d < 0 { n.toStr() } else { n[d + 1..len(n)].toStr() }) + "]"
+        }
+        Expr.Param(n) { return "@" + n.toStr() }
+        Expr.Unary(op, a) {
+            if op == "not" { return wrap("NOT " + text(&a, 3), at > 3) }
+            if op == "-" {
+                match a {
+                    Expr.Lit(v) { if isNum(&v) { return "(-" + lexdb_sql.text(&v) + ")" } }
+                    else {}
+                }
+            }
+            return op + text(&a, 7)
+        }
+        Expr.Bin(op, a, b) {
+            if op == "or" { return wrap(text(&a, 1) + " OR " + text(&b, 1), at >= 2) }
+            if op == "and" { return wrap(text(&a, 2) + " AND " + text(&b, 2), at >= 3) }
+            let o: &str = if op == "t+" { "+" } else { op }
+            let lv = level(o)
+            if lv == 4 { return wrap(text(&a, 4) + o + text(&b, 4), at >= 4) }
+            // arithmetic: + and - in brackets as a comparison's operand (* and / not: ([a]-(1))>(0), [a]/(2)<(5)); the right
+            // operand of an operator at its own level in brackets
+            return wrap(text(&a, lv) + o + text(&b, lv + 1), (at == 4 && lv == 5) || at > lv)
+        }
+        Expr.IsNull(a, not) { return wrap(text(&a, 4) + (if not { " IS NOT NULL" } else { " IS NULL" }), at > 3) }
+        Expr.Cast(a, _) {
+            // a typed literal ('-1.5'::numeric): the number
+            match a {
+                Expr.Lit(v) {
+                    match v {
+                        Val.Text(s) { if isNumText(&s) { return "(" + s + ")" } }
+                        else {}
+                    }
+                }
+                else {}
+            }
+            return text(&a, at)
+        }
+        Expr.Call(f, args, star) {
+            if f == "#bitint" && len(args) == 1 { return text(&args[0], at) }
+            if (f == "#tlike" || f == "like") && len(args) >= 2 { return wrap(text(&args[0], 4) + " like " + text(&args[1], 4), at > 3) }
+            if f == "in" && len(args) >= 2 {
+                var parts: []str = []
+                var i = len(args) - 1
+                while i >= 1 {
+                    append(mut &parts, text(&args[0], 4) + "=" + text(&args[i], 4))
+                    i -= 1
+                }
+                let s = strings.join(&parts, " OR ")
+                return wrap(s, at >= 4 || (len(parts) > 1 && at >= 2))
+            }
+            if f == "case" || f == "case else" {
+                var out = "case"
+                var i = 0
+                while i + 1 < len(args) {
+                    out = out + " when " + text(&args[i], 0) + " then " + text(&args[i + 1], 0)
+                    i += 2
+                }
+                if f == "case else" { out = out + " else " + text(&args[len(args) - 1], 0) }
+                return out + " end"
+            }
+            var n = f.toStr()
+            if strings.startsWith(&n, "#") { n = n[1..len(n)].toStr() }
+            if n == "utcnow" { n = "sysutcdatetime" }
+            if n == "localtimestamp" || n == "current_timestamp" || n == "now" { n = "getdate" }
+            if n == "gen_random_uuid" { n = "newid" }
+            var parts: []str = []
+            for a in args { append(mut &parts, text(&a, 0)) }
+            return strings.toLowerAscii(&n) + "(" + (if star { "*" } else { strings.join(&parts, ",") }) + ")"
+        }
+    }
+}
+
+fn wrap(s: str, need: bool): str { return if need { "(" + s + ")" } else { s } }
+
+fn level(op: &str): int {
+    if op == "=" || op == "<>" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" { return 4 }
+    if op == "*" || op == "/" || op == "%" { return 6 }
+    return 5
+}
+
+fn isNum(v: &Val): bool {
+    match v {
+        Val.Int(_) { return true }
+        Val.Num(_) { return true }
+        Val.Float(_) { return true }
+        else { return false }
+    }
+}
+
+fn isNumText(s: &str): bool {
+    if len(s) == 0 { return false }
+    var digits = 0
+    for i in 0..len(s) {
+        let c = s[i]
+        if c >= '0' && c <= '9' { digits += 1 } else if !(c == '.' || (i == 0 && (c == '-' || c == '+'))) { return false }
+    }
+    return digits > 0
+}
+
+fn lit(v: &Val): str {
+    match v {
+        Val.Null { return "NULL" }
+        Val.Text(s) { return "'" + strings.replaceAll(&s, "'", "''") + "'" }
+        Val.Bool(b) { return if b { "(1)" } else { "(0)" } }
+        else { return "(" + lexdb_sql.text(v) + ")" }
+    }
+}
