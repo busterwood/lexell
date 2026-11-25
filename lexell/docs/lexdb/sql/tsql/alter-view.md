@@ -25,6 +25,8 @@ AS select_statement
 - The view keeps its name and its permissions; only its query changes.
 - `CREATE OR ALTER VIEW` does the same, and makes the view when there is none.
 - `OBJECT_DEFINITION` gives the new text.
+- `ALTER VIEW v AS SELECT * FROM t` takes the table's columns as they are now, as `sp_refreshview` does for a view that
+  keeps its text (see [CREATE VIEW](create-view.md), example J).
 
 ## Differences from SQL Server
 
@@ -32,6 +34,8 @@ AS select_statement
   `ALTER VIEW` without `WITH SCHEMABINDING` makes the view not schema-bound again, as in SQL Server. `WITH CHECK
   OPTION` is error 50000.
 - The text kept for the view is the `ALTER VIEW` statement turned into `CREATE VIEW`.
+- `ALTER VIEW` of a view that is not there is error 208 with state 1 (SQL Server: 6), and error 2010 for a table names
+  it without its schema (`emp`; SQL Server: `dbo.emp`).
 
 ## Examples
 
@@ -88,7 +92,7 @@ GO
 
 ```text
 Msg 208, Level 16, State 1, Line 1
-Invalid object name 'v_nothere'.
+Invalid object name 'dbo.v_nothere'.
 Msg 2010, Level 16, State 1, Line 1
 Cannot perform alter on 'emp' because it is an incompatible object type.
 ```

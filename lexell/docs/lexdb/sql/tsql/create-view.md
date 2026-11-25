@@ -50,6 +50,12 @@ AS select_statement
   giving 4502 until `sp_refreshview`; lexdb does not (a failed read changes nothing in the view), and
   `sp_refreshview` brings the table's columns as they are now (example H; see also [ALTER TABLE](alter-table.md),
   example K).
+- **A `SELECT *` view keeps the columns it was made with**, by position, as in SQL Server: a column added to the table
+  later is not in the view until `sp_refreshview` (example J). A view that names its own columns (`CREATE VIEW v (a, b)
+  AS SELECT * FROM t`) is error 8158 when it is read after the table gained a column.
+- Errors 4502 and 8158 name the view as the statement wrote it (`dbo.v_all` for `FROM dbo.v_all`), and, as 208 is, are
+  compile errors of the statement that reads the view: a `TRY` block in the same batch does not catch them, as in SQL
+  Server.
 - `DROP TABLE` of a table a view reads is done, as in SQL Server, unless the view is schema-bound (3729): the view,
   and a view over it, fail with error 208 when they are read, and read again once a table of that name is made (see
   [DROP TABLE](drop-table.md), example D).
@@ -66,11 +72,8 @@ AS select_statement
   view "v" (lexdb's views are read-only)").
 - `WITH CHECK OPTION` after the query is error 50000 (written before `AS` it is 102, as in SQL Server). There are no
   indexed views.
-- **`SELECT *` is expanded when the view is read**, not when it is made: a column added to the table later shows in
-  the view at once. SQL Server keeps the columns the view had until `sp_refreshview`.
-- The texts of 4502, 4512, 208 (a table under a view dropped) and 3729 name the view or table without its schema
-  (`base`, SQL Server: `dbo.base`), and the states of 4512 and 4513 are 1 (SQL Server: 3 and 2). The 102 of `WITH CHECK OPTION`
-  before `AS` quotes `with` in lower case (SQL Server quotes `WITH` as written).
+- The 4512 of a `WITH SCHEMABINDING` view names the view being made without the schema the statement wrote
+  (`'v_bad1'` for `CREATE VIEW dbo.v_bad1`; SQL Server: `'dbo.v_bad1'`); its 4513 is right.
 - `CREATE VIEW` need not be the first statement of its batch (SQL Server: 111).
 - An `ORDER BY` without `TOP` is taken (SQL Server: 1033). The rows of the view are not sorted by it.
 - `DROP VIEW` of a view that another view reads is refused (error 50000); SQL Server drops it, and the other view
@@ -238,7 +241,7 @@ v_pay_bound 1
 Msg 5074, Level 16, State 1, Line 1
 The object 'v_pay_bound' is dependent on column 'bonus'.
 Msg 4502, Level 16, State 1, Line 1
-View or function 'v_pay_all' has more column names specified than columns defined.
+View or function 'dbo.v_pay_all' has more column names specified than columns defined.
 Msg 207, Level 16, State 1, Line 1
 Invalid column name 'name'.
 id bonus
@@ -251,7 +254,7 @@ id bonus
 Msg 1054, Level 15, State 6, Line 1
 Syntax '*' is not allowed in schema-bound objects.
 Msg 3729, Level 16, State 1, Line 1
-Cannot DROP TABLE 'pay' because it is being referenced by object 'v_pay_bound'.
+Cannot DROP TABLE 'dbo.pay' because it is being referenced by object 'v_pay_bound'.
 ```
 
 ### G. Errors
@@ -279,13 +282,13 @@ Invalid column name 'nothere'.
 Msg 50000, Level 16, State 1, Line 1
 lexdb: WITH CHECK OPTION is not supported
 Msg 102, Level 15, State 1, Line 1
-Incorrect syntax near 'with'.
+Incorrect syntax near 'WITH'.
 ```
 
 ### H. sp_refreshview
 
-A `SELECT *` view reads the table's columns as they are when it is read. `sp_refreshview` makes the view again from its
-stored text.
+A `SELECT *` view whose table lost a column is error 4502 when it is read. `sp_refreshview` makes the view again from
+its stored text, with the table's columns as they are now.
 
 <!-- example: tsql -->
 ```sql
@@ -310,7 +313,7 @@ GO
 (1 row affected)
 
 Msg 4502, Level 16, State 1, Line 1
-View or function 'v_gadget' has more column names specified than columns defined.
+View or function 'dbo.v_gadget' has more column names specified than columns defined.
 id name
 -- ----
 1  bolt
@@ -344,14 +347,63 @@ GO
 ```
 
 ```text
-Msg 4512, Level 16, State 1, Line 1
+Msg 4512, Level 16, State 3, Line 1
 Cannot schema bind view 'v_bad1' because name 'part' is invalid for schema binding. Names must be in two-part format and an object cannot reference itself.
-Msg 4513, Level 16, State 1, Line 1
-Cannot schema bind view 'v_bad2'. 'dbo.v_part_plain' is not schema bound.
+Msg 4513, Level 16, State 2, Line 1
+Cannot schema bind view 'dbo.v_bad2'. 'dbo.v_part_plain' is not schema bound.
 Msg 5074, Level 16, State 1, Line 1
 The object 'v_part_bound' is dependent on column 'qty'.
 Msg 3729, Level 16, State 1, Line 1
-Cannot DROP TABLE 'part' because it is being referenced by object 'v_part_bound'.
+Cannot DROP TABLE 'dbo.part' because it is being referenced by object 'v_part_bound'.
+```
+
+### J. SELECT * keeps the columns, until sp_refreshview
+
+A column added to the table does not show in a `SELECT *` view made before it. A view with a column list (`tool_id`,
+`tool_name`) cannot take the third column: error 8158. `sp_refreshview` makes the first view again, and it then has the
+new column.
+
+<!-- example: tsql -->
+```sql
+CREATE TABLE dbo.tool (id int PRIMARY KEY, name nvarchar(20));
+INSERT dbo.tool VALUES (1, N'saw');
+GO
+CREATE VIEW dbo.v_tool AS SELECT * FROM dbo.tool;
+GO
+CREATE VIEW dbo.v_tool_named (tool_id, tool_name) AS SELECT * FROM dbo.tool;
+GO
+ALTER TABLE dbo.tool ADD price int;
+GO
+UPDATE dbo.tool SET price = 12;
+GO
+SELECT * FROM dbo.v_tool;
+GO
+SELECT * FROM dbo.v_tool_named;
+GO
+EXEC sp_refreshview 'dbo.v_tool';
+GO
+SELECT * FROM dbo.v_tool;
+GO
+```
+
+```text
+(1 row affected)
+
+(1 row affected)
+
+id name
+-- ----
+1  saw
+
+(1 row affected)
+
+Msg 8158, Level 16, State 1, Line 1
+'v_tool_named' has more columns than were specified in the column list.
+id name price
+-- ---- -----
+1  saw  12
+
+(1 row affected)
 ```
 
 ## See also

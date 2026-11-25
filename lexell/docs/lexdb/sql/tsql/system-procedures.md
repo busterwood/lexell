@@ -43,7 +43,7 @@ EXEC xp_instance_regread ...
 
 `sp_refreshview`
 : Makes a view again from its stored text, so that a `SELECT *` view takes its table's columns as they are now (see
-  [CREATE VIEW](create-view.md), example H). A name that is not a view is error 15165.
+  [CREATE VIEW](create-view.md), examples H and J). A name that is not a view is error 15165.
 
 `sp_prepare`, `sp_execute`, `sp_prepexec`, `sp_unprepare`
 : Prepared statements. Drivers call them as RPC requests, and lexdb takes them there. Called by `EXEC` in a batch

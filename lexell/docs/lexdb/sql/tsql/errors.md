@@ -32,6 +32,7 @@ feature, the number is **50000**.
 | 141 | A `SELECT` that assigns to a variable also returns data. |
 | 155 | An unknown part name in `DATEPART`, `DATEADD` and the other date functions. |
 | 156 | Incorrect syntax near a keyword. |
+| 159 | `DROP INDEX` with a bare index name (`Must specify the table name and index name for the DROP INDEX statement`). |
 | 178 | `RETURN` with a value outside a procedure. |
 | 179 | `OUTPUT` with a constant argument in `EXEC`. |
 | 195 | An unknown function or system variable (`function x with n arguments does not exist`). |
@@ -84,13 +85,15 @@ feature, the number is **50000**.
 | 218, 219 | A type that does not exist (on `DROP TYPE`), or one that exists already (`CREATE TYPE`). |
 | 2714 | An object, role or user that exists already, and an assertion's or property graph's name taken by a table or the other way round. |
 | 2715 | A data type that does not exist. |
-| 3701 | `DROP` of a table, view, procedure, function, assertion or property graph that does not exist (severity 11). |
+| 3701 | `DROP` of a table, view, procedure, function, assertion, property graph or index that does not exist (severity 11; state 6 for an index whose table is not there, 7 for one the table does not have). |
+| 3723 | `DROP INDEX` of the index of a `PRIMARY KEY` (state 4) or `UNIQUE` (state 5) constraint. |
 | 4121 | A column, function or method that cannot be found by that name. |
 | 4902 | A table named by `TRUNCATE` or similar that cannot be found. |
 | 5074 | An object depends on the column you are dropping or changing: an assertion reads it, or a `WITH SCHEMABINDING` view uses it (`DROP COLUMN` and `ALTER COLUMN`). |
-| 4502 | A `SELECT *` view whose table has lost a column (`View or function ... has more column names specified than columns defined`). |
+| 4502 | A `SELECT *` view whose table has lost a column (`View or function ... has more column names specified than columns defined`). A compile error of the statement that reads the view: a `TRY` block in the same batch does not catch it. |
+| 8158 | A view with a column list whose query now gives more columns, after the table gained one (`'v' has more columns than were specified in the column list`); a compile error too. |
 | 3729 | `DROP SEQUENCE` of a sequence a column's default uses; `DROP TABLE` of a table an assertion or a `WITH SCHEMABINDING` view reads. |
-| 4512, 4513 | A schema-bound view with a one-part name in its query, or over a view or function that is not schema-bound. |
+| 4512, 4513 | A schema-bound view with a one-part name in its query (state 3), or over a view or function that is not schema-bound (state 2). |
 | 1913 | `CREATE INDEX` with the name of an index the table has. |
 | 15165 | `sp_refreshview` of a name that is not a view. |
 | 15336 | `sp_rename` of a table or column an assertion reads. |
@@ -132,6 +135,9 @@ feature, the number is **50000**.
   have run. Any other error ends only its statement, unless `SET XACT_ABORT ON` is in force.
 - `lexdb:` messages (error 50000) give the feature that is missing: see the *Differences* section of the page for
   the statement.
+- Errors 208, 3729, 4502, 4512 and 4513 name the table or view as the statement wrote it, as SQL Server does:
+  `FROM dbo.nothere` gives `Invalid object name 'dbo.nothere'` and `FROM nothere` gives `'nothere'`. Errors 4502 and 8158
+  are compile errors, like 208: a `TRY` block in the same batch does not catch them.
 - Most messages are SQL Server's text. Errors numbered 50000, and a few others (8115 for a decimal that does not fit,
   2628 for a string too long), carry lexdb's own.
 
@@ -176,7 +182,7 @@ USE nosuchdb;
 
 ```text
 Msg 208, Level 16, State 1, Line 1
-Invalid object name 'nothere'.
+Invalid object name 'dbo.nothere'.
 Msg 207, Level 16, State 1, Line 1
 Invalid column name 'nothere'.
 Msg 195, Level 15, State 1, Line 1
