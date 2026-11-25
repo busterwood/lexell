@@ -20,6 +20,10 @@ by many checkpoints. Through psql:
 - the master is killed (SIGKILL) at round R/2: the replica must stop by
   itself (exit 1) within 10 s; both start again, the master recovering;
 - at the end the master stops (SIGTERM) and the replica must stop too.
+- Oracle's annotations (design/lexdb-new-features.md 8.5), made through the master's own TNS
+  door: one is added each round and the replica's USER_ANNOTATIONS_USAGE must be the
+  master's; the one added just before the master is killed must be there after its log is
+  replayed, and all of them after the clean close at the end and a start again.
 
 Then the supervised form, lexdb DATADIR ADDR --replicas 2 --tds ... --tns ...: both replicas
 answer on the replicas' port, and on the TDS and TNS ports one above the master's
@@ -142,6 +146,7 @@ def psql(port, sql, check=True):
 
 
 DOORSQL = None      # the SQL Server and Oracle client (doorsql.lxl), built in main
+ANQ = 'select object_name, column_name, annotation_name, annotation_value from user_annotations_usage order by 2 nulls first, 3, 4'
 
 
 def door(kind, port, sql, extra=''):
@@ -380,9 +385,10 @@ def main():
     if r.returncode != 0:
         sys.exit('replica.py: building doorsql failed:\n' + r.stdout + r.stderr)
     data = os.path.join(work, 'data')
-    mport, rport, rtds, rtns = free_port(), free_port(), free_port(), free_port()
+    mport, rport, rtds, rtns, mtns = free_port(), free_port(), free_port(), free_port(), free_port()
     env = dict(os.environ, LEXDB_CACHE_MB='4', LEXDB_SEG_KB='1024', LEXDB_CKPT_KB='512')
-    master = Proc([exe, data, '127.0.0.1:%d' % mport], mport, os.path.join(work, 'master.log'), env)
+    # (the master's Oracle door: the annotations, design/lexdb-new-features.md 8.5, made there)
+    master = Proc([exe, data, '127.0.0.1:%d' % mport, '--tns', '127.0.0.1:%d' % mtns], [mport, mtns], os.path.join(work, 'master.log'), env)
     # the replica serves the SQL Server and Oracle doors too (9.137)
     replica = Proc([exe, '--replica', data, '127.0.0.1:%d' % rport, '--tds', '127.0.0.1:%d' % rtds, '--tns', '127.0.0.1:%d' % rtns],
                    [rport, rtds, rtns], os.path.join(work, 'replica.log'), env)
@@ -413,9 +419,26 @@ def main():
             if w != g:
                 fail('round %d: the replica did not catch up: %s\n  master  %s\n  replica %s' % (rnd, q, w[:300], g[:300]))
 
+    # Oracle's annotations (catalog entries, no rows): the replica's USER_ANNOTATIONS_USAGE is the master's
+    def annots_same(rnd, want_name=None):
+        want = door('tns', mtns, ANQ)
+        if want_name is not None and want_name not in want:
+            fail('round %d: the master lost annotation %s: %s' % (rnd, want_name, want))
+        end = time.time() + 10
+        got = None
+        while time.time() < end:
+            got = door('tns', rtns, ANQ)
+            if got == want:
+                return want
+            time.sleep(0.05)
+        fail('round %d: the replica\'s annotations are not the master\'s:\n  master  %s\n  replica %s' % (rnd, want, got))
+
     master.start()
     if not master.ready():
         fail('the master did not start')
+    w = door('tns', mtns, "create table an (id number primary key annotations (Display 'Id'), v number annotations (Hidden)) annotations (Note 'n')")
+    if not w.startswith('ok'):
+        fail('the annotated table was not made: ' + w)
     psql(mport, "create table t (id int primary key, v int not null, g int not null, s text)")
     psql(mport, "create index t_g on t (g)")
     psql(mport, "create table u (id int primary key, name text)")
@@ -451,6 +474,10 @@ def main():
             for q in sql:
                 psql(mport, q)
         caught_up(rnd)
+        w = door('tns', mtns, "alter table an annotations (add if not exists r%d 'round')" % rnd)
+        if not w.startswith('ok'):
+            fail('round %d: an annotation was not added: %s' % (rnd, w))
+        annots_same(rnd)
         w = psql(rport, "insert into u values (999999, 'no')", check=False)
         if '25006' in w.stderr or 'read-only' in w.stderr:
             refused += 1
@@ -470,6 +497,10 @@ def main():
                 if got != want:
                     fail('round %d: a #temporary table on the replica gives %s rows, t has %s' % (rnd, got, want))
         if rnd == a.rounds // 2:
+            # the last DDL before the master is killed: in its log only, replayed when it starts again
+            w = door('tns', mtns, "alter table an modify (v annotations (add before_kill 'k'))")
+            if not w.startswith('ok'):
+                fail('an annotation was not added before the kill: ' + w)
             master.kill()
             try:
                 code = replica.p.wait(10)
@@ -484,6 +515,7 @@ def main():
             if not replica.ready():
                 fail('the replica did not start after the master recovered')
             caught_up(rnd)
+            annots_same(rnd, 'BEFORE_KILL')
     code = master.stop()
     if code != 0:
         fail('the master stopped with %s' % code)
@@ -491,6 +523,15 @@ def main():
         rc = replica.p.wait(10)
     except subprocess.TimeoutExpired:
         fail('the replica did not stop after the master did')
+    # a clean close: the annotations are there when it starts again
+    master.start()
+    if not master.ready():
+        fail('the master did not start again after a clean close')
+    got = door('tns', mtns, ANQ)
+    if 'BEFORE_KILL' not in got or ('R%d' % a.rounds) not in got:
+        fail('the annotations after a clean close: ' + got)
+    if master.stop() != 0:
+        fail('the master did not stop again')
     print('replica test: %d rounds, the replica caught up every round, %d writes refused, killed and started again %d times, '
           'the master killed once: passed' % (a.rounds, refused, a.rounds // 3), flush=True)
     supervised(exe, work, env, fail)
