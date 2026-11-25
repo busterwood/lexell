@@ -312,16 +312,48 @@ PostgreSQL's parallel queries capped at four processes, LexDB's shape (a main pr
 replicas). Both are durable by default (PostgreSQL with `fsync` and `synchronous_commit` on).
 The full record, the rules and the commands are in `lexell/design/lexdb-benchmarks.md`.
 
-TPC-H derived (22 queries, SF1, warm, median of 3, at a fixed clock with boost off; every result
-checked against PostgreSQL's):
+### TPC-H derived (SF1)
+
+22 queries, SF1, warm, median of 3, at a fixed clock with boost off; every result checked against
+PostgreSQL's (LexDB at `870cb22a` / `0e3250e9`, PostgreSQL 18.6 from the `b28afb4c` run):
 
 | | LexDB (one core) | PostgreSQL, one core | PostgreSQL, four processes |
 |---|---:|---:|---:|
-| all 22 queries, summed | 7,941 ms | 14,670 ms | 8,839 ms |
-| geometric mean of LexDB / PostgreSQL (wall) | | 0.63 | 1.01 |
-| queries level or ahead (within 10%) | | 20 of 22 | |
+| all 22 queries, summed (wall) | 7,941 ms | 14,670 ms | 8,839 ms |
+| geometric mean of LexDB / PostgreSQL (wall) | | 0.61 | 0.99 |
+| geometric mean of LexDB / PostgreSQL (CPU) | | 0.57 | |
+| queries level or ahead of one core (within 10%) | | 20 of 22 | |
 
-OLTP (pgbench, prepared statements over Unix sockets, 1M rows, median of three 10 s rounds):
+| query | LexDB wall | PG 1-core wall | LexDB / PG1 | LexDB CPU | PG1 CPU | CPU ratio | PG 4-proc wall | LexDB / PG4 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| q1 | 1,136.8 ms | 3,365.9 ms | 0.34 | 1,132.4 ms | 3,375.3 ms | 0.34 | 873.5 ms | 1.30 |
+| q2 | 35.7 ms | 160.9 ms | 0.22 | 35.6 ms | 166.9 ms | 0.21 | 137.6 ms | 0.26 |
+| q3 | 495.6 ms | 551.7 ms | 0.90 | 492.9 ms | 579.3 ms | 0.85 | 353.6 ms | 1.40 |
+| q4 | 128.7 ms | 184.9 ms | 0.70 | 128.2 ms | 211.6 ms | 0.61 | 102.9 ms | 1.25 |
+| q5 | 147.2 ms | 312.6 ms | 0.47 | 146.6 ms | 341.2 ms | 0.43 | 173.2 ms | 0.85 |
+| q6 | 175.4 ms | 274.8 ms | 0.64 | 174.6 ms | 294.1 ms | 0.59 | 203.4 ms | 0.86 |
+| q7 | 371.9 ms | 585.8 ms | 0.63 | 370.2 ms | 615.2 ms | 0.60 | 287.6 ms | 1.29 |
+| q8 | 144.0 ms | 226.2 ms | 0.64 | 143.2 ms | 253.5 ms | 0.56 | 141.9 ms | 1.01 |
+| q9 | 1,467.2 ms | 1,743.2 ms | 0.84 | 1,460.5 ms | 1,770.1 ms | 0.83 | 750.9 ms | 1.95 |
+| q10 | 411.3 ms | 389.0 ms | 1.06 | 409.1 ms | 417.2 ms | 0.98 | 167.3 ms | 2.46 |
+| q11 | 92.3 ms | 61.4 ms | 1.50 | 91.4 ms | 67.7 ms | 1.35 | 61.5 ms | 1.50 |
+| q12 | 417.3 ms | 854.9 ms | 0.49 | 415.5 ms | 880.7 ms | 0.47 | 253.6 ms | 1.65 |
+| q13 | 634.4 ms | 839.8 ms | 0.76 | 631.3 ms | 843.9 ms | 0.75 | 825.6 ms | 0.77 |
+| q14 | 131.5 ms | 141.6 ms | 0.93 | 130.7 ms | 159.8 ms | 0.82 | 95.1 ms | 1.38 |
+| q15 | 351.1 ms | 331.9 ms | 1.06 | 349.9 ms | 348.1 ms | 1.01 | 333.9 ms | 1.05 |
+| q16 | 205.6 ms | 267.9 ms | 0.77 | 203.0 ms | 273.4 ms | 0.74 | 105.3 ms | 1.95 |
+| q17 | 20.5 ms | 551.2 ms | 0.04 | 20.5 ms | 569.9 ms | 0.04 | 554.7 ms | 0.04 |
+| q18 | 584.1 ms | 2,753.9 ms | 0.21 | 581.4 ms | 2,722.6 ms | 0.21 | 2,933.0 ms | 0.20 |
+| q19 | 34.3 ms | 40.2 ms | 0.85 | 34.2 ms | 53.6 ms | 0.64 | 37.5 ms | 0.91 |
+| q20 | 223.8 ms | 125.8 ms | 1.78 | 222.8 ms | 149.3 ms | 1.49 | 127.8 ms | 1.75 |
+| q21 | 636.3 ms | 818.4 ms | 0.78 | 633.7 ms | 846.4 ms | 0.75 | 269.6 ms | 2.36 |
+| q22 | 96.3 ms | 88.4 ms | 1.09 | 96.0 ms | 94.1 ms | 1.02 | 49.5 ms | 1.95 |
+| **sum** | **7,941.3 ms** | **14,670.4 ms** | **0.54** | **7,903.7 ms** | **15,033.8 ms** | **0.53** | **8,839.0 ms** | **0.90** |
+| **geomean** | | | **0.61** | | | **0.57** | | **0.99** |
+
+### OLTP
+
+`pgbench`, prepared statements over Unix sockets, 1M rows, median of three 10 s rounds:
 
 | | LexDB | PostgreSQL | LexDB / PostgreSQL |
 |---|---:|---:|---:|
@@ -335,14 +367,63 @@ master with a lag of 0.22–0.23 ms at the median and 0.47–0.74 ms at p99 unde
 (361,500–370,000/s replica selects alongside 15,600–15,800/s master updates). Its commit latency
 with 8 clients is 0.43–0.44 ms at the median and 0.96 ms at p99.
 
-Analytic queries (35 queries over 1M-row tables: scans, joins, groups, windows; median of 5):
-LexDB's CPU is 0.49 of PostgreSQL's on one core (geometric mean), and its wall time 0.98 of
-PostgreSQL's on four processes; 33 of 35 are level with or ahead of PostgreSQL on one core on
-CPU (34 of 35 on wall time).
+### Analytic queries
 
-Bulk loads (`\copy`, median of 3, not pinned): LexDB is faster on narrow rows (1M: 0.48 against
-0.61 s; 10M: 4.82 against 5.84 s), wide rows (1.40 against 2.15 s) and wide rows with two
-secondary indexes (2.60 against 4.92 s), and slower with no primary key (1.75 against 1.39 s).
+35 queries over 1M-row tables (scans, joins, groups, windows; median of 5, at `b28afb4c`):
+LexDB's CPU is 0.49 of PostgreSQL's on one core (geometric mean; wall 0.60), and its wall time
+0.98 of PostgreSQL's on four processes; 33 of 35 are level with or ahead of PostgreSQL on one core
+on CPU (34 of 35 on wall time).
+
+| query | LexDB wall | PG 1-core wall | LexDB / PG1 | LexDB CPU | PG1 CPU | CPU ratio | PG 4-proc wall | LexDB / PG4 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `scan2` | 112 ms | 143 ms | 0.78 | 56 ms | 90 ms | 0.62 | 141 ms | 0.79 |
+| `scan3` | 162 ms | 213 ms | 0.76 | 79 ms | 120 ms | 0.66 | 214 ms | 0.76 |
+| `scan9` | 518 ms | 532 ms | 0.97 | 263 ms | 250 ms | 1.05 | 529 ms | 0.98 |
+| `filt1pct` | 19 ms | 41 ms | 0.46 | 14 ms | 40 ms | 0.35 | 22 ms | 0.86 |
+| `filt10pct` | 35 ms | 59 ms | 0.59 | 23 ms | 50 ms | 0.46 | 59 ms | 0.59 |
+| `filt_like` | 39 ms | 82 ms | 0.48 | 34 ms | 80 ms | 0.42 | 32 ms | 1.22 |
+| `filt_agg` | 21 ms | 45 ms | 0.47 | 17 ms | 50 ms | 0.34 | 22 ms | 0.95 |
+| `expr_int` | 153 ms | 218 ms | 0.70 | 70 ms | 140 ms | 0.50 | 218 ms | 0.70 |
+| `expr_mix` | 373 ms | 431 ms | 0.87 | 258 ms | 310 ms | 0.83 | 428 ms | 0.87 |
+| `expr_agg` | 31 ms | 58 ms | 0.53 | 27 ms | 60 ms | 0.45 | 26 ms | 1.19 |
+| `sort_all` | 122 ms | 438 ms | 0.28 | 66 ms | 380 ms | 0.17 | 438 ms | 0.28 |
+| `sort_lim` | 19 ms | 91 ms | 0.21 | 15 ms | 90 ms | 0.17 | 33 ms | 0.58 |
+| `count` | 11 ms | 36 ms | 0.31 | 7 ms | 30 ms | 0.23 | 18 ms | 0.61 |
+| `grp_int` | 30 ms | 97 ms | 0.31 | 26 ms | 90 ms | 0.29 | 35 ms | 0.86 |
+| `grp_text` | 54 ms | 127 ms | 0.43 | 50 ms | 130 ms | 0.38 | 42 ms | 1.29 |
+| `minmax_text` | 57 ms | 128 ms | 0.45 | 53 ms | 130 ms | 0.41 | 43 ms | 1.33 |
+| `distinct` | 66 ms | 95 ms | 0.69 | 61 ms | 90 ms | 0.68 | 34 ms | 1.94 |
+| `distinct2` | 143 ms | 113 ms | 1.27 | 139 ms | 110 ms | 1.26 | 40 ms | 3.58 |
+| `idx_range1k` | 5 ms | 10 ms | 0.50 | 1 ms | 10 ms | 0.10 | 9 ms | 0.56 |
+| `idx_range100k` | 46 ms | 46 ms | 1.00 | 34 ms | 40 ms | 0.85 | 45 ms | 1.02 |
+| `idx_range_agg` | 29 ms | 29 ms | 1.00 | 25 ms | 30 ms | 0.83 | 24 ms | 1.21 |
+| `pk_range100k` | 21 ms | 32 ms | 0.66 | 9 ms | 20 ms | 0.45 | 32 ms | 0.66 |
+| `pk_point20k` | 618 ms | 618 ms | 1.00 | 574 ms | 410 ms | 1.40 | 638 ms | 0.97 |
+| `join_hash_agg` | 40 ms | 98 ms | 0.41 | 36 ms | 100 ms | 0.36 | 35 ms | 1.14 |
+| `join_hash_rows` | 38 ms | 63 ms | 0.60 | 28 ms | 60 ms | 0.47 | 63 ms | 0.60 |
+| `join_lookup_agg` | 75 ms | 79 ms | 0.95 | 71 ms | 80 ms | 0.89 | 32 ms | 2.34 |
+| `sub_in` | 25 ms | 51 ms | 0.49 | 21 ms | 50 ms | 0.42 | 24 ms | 1.04 |
+| `sub_exists` | 25 ms | 51 ms | 0.49 | 22 ms | 60 ms | 0.37 | 24 ms | 1.04 |
+| `sub_corr_sel` | 109 ms | 149 ms | 0.73 | 96 ms | 150 ms | 0.64 | 150 ms | 0.73 |
+| `window` | 130 ms | 143 ms | 0.91 | 111 ms | 130 ms | 0.85 | 89 ms | 1.46 |
+| `join_hash_sort` | 66 ms | 115 ms | 0.57 | 53 ms | 110 ms | 0.48 | 54 ms | 1.22 |
+| `join_text_agg` | 60 ms | 86 ms | 0.70 | 56 ms | 90 ms | 0.62 | 32 ms | 1.88 |
+| `join_text_rows` | 73 ms | 87 ms | 0.84 | 61 ms | 70 ms | 0.87 | 87 ms | 0.84 |
+| `join_text_group` | 99 ms | 165 ms | 0.60 | 94 ms | 170 ms | 0.55 | 52 ms | 1.90 |
+| `join_left_rows` | 32 ms | 56 ms | 0.57 | 18 ms | 50 ms | 0.36 | 56 ms | 0.57 |
+| **geomean** | | | **0.60** | | | **0.49** | | **0.98** |
+
+### Bulk loads
+
+`\copy`, median of 3, not pinned (at `b28afb4c`):
+
+| workload | LexDB | PostgreSQL 18 | LexDB / PG | LexDB peak RSS |
+|---|---:|---:|---:|---:|
+| narrow, 1M rows | 0.48 s | 0.61 s | 0.79 | 338 MB |
+| wide, 1M rows | 1.40 s | 2.15 s | 0.65 | 766 MB |
+| wide + 2 secondary indexes, 1M rows | 2.60 s | 4.92 s | 0.53 | 1,565 MB |
+| wide, no primary key, 1M rows | 1.75 s | 1.39 s | 1.26 | 806 MB |
+| narrow, 10M rows | 4.82 s | 5.84 s | 0.83 | 3,258 MB |
 
 ## Commands
 
