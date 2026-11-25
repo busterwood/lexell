@@ -1248,3 +1248,14 @@ instant; `TSTZ + interval` keeps the offset (months and days by the local time),
 time. Type 181 carries the offset both ways (the UTC date and time, then the hour + 20 and the minute + 60: `lexdb_tns` encode, bind decode); a named-zone region id (`decodeStamp`) is still an
 error. Checked: `tns_tstz` (113 statements: 109 as Oracle Free answers, 4 listed in oracle_known_diffs.txt), `exec_tstz`, `OracleJdbc.tstz` (OffsetDateTime binds and reads, `oracle.sql.TIMESTAMPTZ`
 bytes). Left: regions; a text inserted into a TSTZ column is not read by the NLS format (as a DATE column's); `TO_CHAR` of an interval is NULL; a TIMESTAMP literal's nine fractional digits.
+
+## As built: annotations (O21, lexdb-new-features.md 12)
+
+`ANNOTATIONS (name ['value'], ...)` in CREATE TABLE (the table's and a column's), CREATE TABLE ... AS, CREATE VIEW (the view's and its column list's) and CREATE
+INDEX; `ALTER TABLE | VIEW | INDEX ... ANNOTATIONS (ADD [IF NOT EXISTS] | DROP [IF EXISTS] | REPLACE ...)` and `MODIFY (col ANNOTATIONS (...))`, ADD COLUMN's,
+a primary key's index. The parser makes an `A_ANNOT` alteration; `lexdb_annot` keeps the annotations as prefixed entries of `Table.invalid` (a view's in its catalog
+row), with Oracle Free 23.26.3's errors and duplicates (by name and value), and follows the drop and rename of a column and an index; `lexdb_oracat` serves
+USER_, ALL_ and DBA_ ANNOTATIONS_USAGE, ANNOTATIONS and ANNOTATION_VALUES (shapes from `tools/gen_oracle_catalog.py`). The door's FROM-name lookup of the
+dictionary views (`lexdb_dialect.oraRelOf`) compares each entry's head now, without a search or a copy (a point select's parse 234,582 -> 55,529 instructions).
+Test `tns_annotations` (118 statements, 0 differences in `gen_oracle.py --check`); `replica.py` checks them on a replica, after a kill -9 and after a clean close.
+Left: ORA-11559, ORA-00957 and ORA-01418 not given (lexdb-new-features.md 12); no SYS domain rows in ALL_ and DBA_; a global temporary table's not listed.

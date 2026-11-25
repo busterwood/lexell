@@ -130,7 +130,7 @@ Checked on 2025 RTM-CU10 at level 170 unless marked 2022.
 | O18 | `ANY_VALUE` (21c) | | as Oracle (was ORA-00979) | works (f8c07339) | S | PostgreSQL 16 (P23, works) | lexdb_agg |
 | O19 | `RETURNING OLD c, NEW c INTO :a, :b` for INSERT, UPDATE, DELETE, MERGE (23ai) | INSERT's OLD NULL, DELETE's NEW NULL; OLD/NEW before any column of an expression; ORA-00904 for `old.c` and `OLD f(x)`, ORA-01747 for `OLD *`, ORA-03050 without a column; MERGE with DELETE WHERE ORA-03001; INSERT ... SELECT has no RETURNING (ORA-03049) | as Oracle (ec3c5c17), through the door's RETURNING INTO and in PL/SQL; the two errors of other RETURNINGs (03001, 03049) too (they were accepted) | works (ec3c5c17) | (P2) | PostgreSQL 18 (P2), T-SQL OUTPUT (works) | lexdb_parse |
 | O20 | `DEFAULT ON NULL [FOR INSERT ONLY \| FOR INSERT AND UPDATE] v` (12c; UPDATE 23ai) | a NULL written becomes the default, the column NOT NULL; an UPDATE to NULL ORA-01407 unless FOR INSERT AND UPDATE; USER_TAB_COLUMNS' DEFAULT_ON_NULL, DEFAULT_ON_NULL_UPD | as Oracle (ec3c5c17): INSERT, INSERT ... SELECT, UPDATE, MERGE, ALTER TABLE ADD / MODIFY, the views, ORA-02000, 00936, 30665 | works (ec3c5c17) | S | none | lexdb_parse `oraDefault`, lexdb_exec `onNullFill`, lexdb_oracat |
-| O21 | annotations: `ANNOTATIONS (name 'value', ...)` on tables and columns, `USER_ANNOTATIONS_USAGE` | | ORA-00900 | missing (plan: 8.5) | M: kept in the catalog, listed in the views | none | lexdb_parse, lexdb_oracat |
+| O21 | annotations: `ANNOTATIONS (name 'value', ...)` on tables and columns, `USER_ANNOTATIONS_USAGE` | | ORA-00900 | works (section 12) | M: kept in the catalog, listed in the views | none | lexdb_parse, lexdb_oracat |
 | O22 | SQL/PGQ: `CREATE PROPERTY GRAPH`, `GRAPH_TABLE (g MATCH ... WHERE ... COLUMNS (...))`, bounded quantifiers `->{1,2}` | rows as the joins of the pattern; ORA-42421 for an unknown graph | ORA-00900 | missing | L (section 6.3) | none (PostgreSQL 19 has not; SQL Server's MATCH over NODE/EDGE tables is another design) | new lexdb_graph |
 | O23 | `CREATE ASSERTION a CHECK (NOT EXISTS (...) \| ALL (...) SATISFY (...))` (23.26.1) | ORA-08601 `Assertion (APP.A1) violated` at the DML; no aggregates (ORA-08689, ORA-00934); `USER_ASSERTIONS` | ORA-00900 | missing | L (section 6.3: a design note) | none | new lexdb_assert |
 | O24 | `IS [NOT] DISTINCT FROM` | not Oracle's (ORA-00908, 23.26.3) | accepted (lexdb's extension in this door) | works (kept: the user's decision, 2026-11-23) | none: the user wants it in the Oracle door too, as an extension; test tns_distinct | PostgreSQL, T-SQL 2022 | lexdb_parse |
@@ -487,7 +487,7 @@ existing oids do not move), pg_get_constraintdef's `NOT NULL c`, the information
 CONSTRAINT finding them; (d) the tests that read pg_constraint without a contype filter (exec_catalog, exec_keyless and
 tds_vscode's) checked again against PostgreSQL 18. No row path is touched: NOT NULL is checked as now.
 
-### 8.5 Plan: Oracle annotations (O21, about a day and a half; not built)
+### 8.5 Plan: Oracle annotations (O21, about a day and a half; built: section 12)
 
 Checked against Oracle Free 23.26.3 (2026-11-24). Annotations are name/value pairs the catalog keeps for an object or one of its columns; nothing reads them but
 the dictionary views. What the product does:
@@ -1001,3 +1001,68 @@ the fast path 534 and 594 ms / 529 and 528 ms, the generic path (a CHECK) 1554 a
 statement, base and branch the same in both rounds. Over the wire (`icount6.sh BIN 3`, points.sql): instructions 169,831 and 169,787 (base), 169,772 and 169,749 (branch); cycles 95,118 and 94,975 / 97,482 and 97,181;
 L1 i-cache misses 281 and 283 / 399 and 401. Cycles move with the code's placement, not its length: the branch of the Oracle work alone (`lexdb_plsql`, `lexdb_plcall`, `lexdb_tns`: nothing of the
 point path) is already at 349 i-cache misses and 96,698 cycles (instructions 169,743), and the same binary with P7 added at 351 and 98,696.
+
+## 12. Oracle annotations (as built, 2026-11-24)
+
+Branch from main `55040a20`, commits `c57a10da` (the clause and `lexdb_annot`), `279039de` (the views), `d9b887b1` (the test), `ab83111b` (the Oracle door's
+FROM-name lookup), `e73b61a2` (a primary key's index). Checked against Oracle Free 23.26.3 (`lxl-oracle`) first; the plan of 8.5 held, with these
+corrections of what the product does:
+- **Duplicates are by name and value.** `a 'x', a 'y'` is two annotations, `a 'x', a 'x'` (and `a, a`) is ORA-11562 "Duplicate annotation", in CREATE and in
+  ALTER's list; ADD of a name and value that is there is ORA-11552 (a column's ORA-11560), of a name that is there with another value adds it; ADD IF NOT EXISTS
+  skips only a name and value that is there (8.5 said: a name). DROP n drops every value of n, DROP n 'v' that one (ORA-11553, a column's ORA-11561, when there is
+  none); REPLACE n ['v'] makes the name's values one. In one list a name with a DROP or REPLACE beside anything else of that name is ORA-11602; the list is checked
+  first (ORA-11562, 11602 in order), then each item against the annotations as they were before the statement, in order; a statement that fails changes nothing.
+- **Names:** Oracle's reserved words (V$RESERVED_WORDS, `lexdb_annot.reserved`) are ORA-11548, not only LONG; any other keyword is a name (KEY, VALUE, NAME,
+  TYPE, CONSTRAINT, PRIMARY, IF, IGNORE, TRUE, WHEN, END, ANNOTATIONS); a quoted name as written; 1,025 characters ORA-00972, a value of 4,001 ORA-11545; `""`
+  ORA-01741; the other syntax errors ORA-11543 (ADD IF EXISTS), 11544 (DROP IF NOT EXISTS), 11546, 11547, 11550, 11551, 11555 and 11556 (DROP and REPLACE in a
+  CREATE). A column's ANNOTATIONS is the last of its definition: a column word after it is ORA-03099 (ORA-03076 after an inline constraint), anything else ORA-03062.
+- **More forms than 8.5 listed:** ALTER TABLE ... ADD (col type ANNOTATIONS (...)), CREATE TABLE ... [(names)] ANNOTATIONS (...) AS query, a view's column list
+  (`create view v (a annotations (...), b) ...`), a table's two ANNOTATIONS clauses, ANNOTATIONS after ON COMMIT, one ALTER clause after another without a comma
+  (`annotations (...) modify (...)`), MODIFY (col type NOT NULL ANNOTATIONS (...)), CREATE OR REPLACE VIEW (the old view's annotations go), a primary key's index
+  (`alter index pk annotations ...`). DDL commits the open transaction also when it fails (as every DDL of the door: lexdb_tns).
+- **The views:** the six (and DBA_'s three) have the product's shapes (`tools/gen_oracle_catalog.py`, the three bases added to BUILT; only the new views' lines, their
+  DICTIONARY rows and synonyms were merged into `lexdb_oradata`: a full regeneration moves the instance's own rows). ANNOTATIONS and ANNOTATION_VALUES are the names
+  (names and values) in use, each once an owner; nothing is left of a name when its last use goes.
+
+What lexdb did: ORA-00900. Now: the parser (`annotClause`, `annotColEnd`, `annotAlters` at the end of lexdb_parse) reads a clause into an `A_ANNOT` alteration
+(`Alter.name` the column, `Alter.to` the items: no Stmt field, CREATE TABLE, VIEW and INDEX carry theirs in `Stmt.alters`, which they had no use for);
+`lexdb_annot` (a core module, ~300 lines) keeps them as entries of `Table.invalid` with the prefix `\x00an:` (scope "" the object, `c:col`, `i:index`; name; value),
+a view's in a last section of its catalog row (`encViewRn`'s new argument: a view without them is written as before), applies a clause (`apply`: the errors above),
+and follows DROP COLUMN, RENAME COLUMN, DROP INDEX and ALTER INDEX ... RENAME (the table's rename and DROP need nothing: the entries are the table's);
+`pruneInvalid` keeps them. `lexdb_oracat` lists them (`oraAnnotRows`: a column's or an index's that is not there any more is not listed). A table without
+annotations has no entry: its encoding, its row layout and every read and write path are as they were. PostgreSQL's and T-SQL's CREATE TABLE ... ANNOTATIONS stay
+syntax errors (42601, 102; checked on the branch's server), their ALTER TABLE ... ANNOTATIONS lexdb's 0A000 as before.
+The Oracle door's FROM names: every one not a CTE was looked up in lexdb_oradata's views and synonyms by searching each entry for its tab and splitting each synonym
+(`oraView`, `oraRelOf`); the 18 new entries would have made that longer, so it compares the entry's head now (`headIs`): an Oracle point select's parse is 234,582 ->
+55,529 instructions (in process, `oraParse`, 20,000 times, LXL_HASH_SEED=1, both rounds the same).
+
+Tests: `tns_annotations` (64 setup statements, 118 statements each with batches off and on: every form and error above, the views, a table, a column and an index
+dropped and renamed, CREATE OR REPLACE VIEW, CTAS, a DDL that commits, also when it fails; `gen_oracle.py --check tns_annotations`: 0 differences); `replica.py`
+(the master gets a TNS door: an annotated table made there, an annotation added each round and the replica's USER_ANNOTATIONS_USAGE the master's, one added just
+before the master's SIGKILL there after its log is replayed, all of them after the clean close at the end and a start again). A process check of the branch's server
+(scratch): a clean close and a kill -9 right after two annotation DDLs, the views the same after each start.
+
+**Cost** (base `55040a20`, branch `e73b61a2`, both `-O`, trees at paths of equal length):
+- In process (`LXL_HASH_SEED=1`, `perf stat -e instructions:u`, `taskset -c 6`, exclusive lock, two rounds alternated), instructions per statement, base -> branch:
+  20,000 prepared statements (`runCached`, a 10,000-row table): point select 31,438.4 / 31,438.4 -> 31,438.4 / 31,438.4, INSERT 217,518.5 / 217,518.5 -> 217,518.5 /
+  217,518.6, UPDATE by key 201,369.1 / 201,369.1 -> 201,369.1 / 201,369.1; 20,000 statements as text (`exec`, parsed each time, a 2,000-row table): select
+  116,168.6 / 116,168.6 -> 116,168.6 / 116,168.6, INSERT 55,054,469.9 / 55,054,469.9 -> 55,054,469.8 / 55,054,469.9, UPDATE 55,072,546.9 / 55,072,546.9 ->
+  55,072,547.0 / 55,072,546.9 (the base itself moves by 0.1 between runs). Level: no changed code runs on these paths. The Oracle door's parse of a point select:
+  234,582.2 -> 55,529.2 (`headIs`, above).
+- Over the wire (`icount6.sh BIN 3`, points.sql, base and branch alternated twice), per statement: instructions 160,961 / 160,815 -> 160,892 / 160,981 (level);
+  cycles 85,393 / 85,262 -> 83,753 / 83,509 (-1.9%); L1 i-cache misses 368.9 / 365.6 -> 340.5 / 343.8; branch misses 363.6 / 363.6 -> 326.3 / 324.5 (placement:
+  the instructions are the same).
+- TPC-H not run: no planner, pipeline or read-path change.
+- lexdb_exec: 21,477 -> 21,492 lines (the import; one call each in createTable, createTableAs, createView, createIndex, dropIndex, ALTER INDEX's two forms and the
+  rename, alterTable's branch, DROP COLUMN, RENAME COLUMN, alterView); the rest in lexdb_annot (294), lexdb_parse (+164), lexdb_oracat (+51), lexdb_catalog,
+  lexdb_dialect, lexdb_sql, lexdb_oradata.
+
+**Left, met on the way, not changed:**
+- CREATE TABLE ... AS with a column's annotations (`(id annotations (...)) as select`): Oracle ORA-11559, lexdb ORA-00900; one column twice in MODIFY (`modify (v
+  annotations (...), v annotations (...))`): Oracle ORA-00957, lexdb applies both; ALTER INDEX of an index that is not there: Oracle ORA-01418, lexdb ORA-00942;
+  ALTER TABLE ... ANNOTATIONS of a view and ALTER VIEW of a table: Oracle ORA-00942, lexdb ORA-20000 (the messages of 42809).
+- ALL_ and DBA_ views list no rows of SYS's 23ai domains (Oracle Free lists about a hundred, OBJECT_TYPE DOMAIN): lexdb has no domains; DOMAIN_NAME and
+  DOMAIN_OWNER are always NULL.
+- A global temporary table's annotations are kept but not listed: lexdb's GTT is a session's temporary table, which USER_TABLES does not list either (older).
+- `n'x'` as a value: Oracle Free keeps a character before the text (a product fault, not copied).
+- The texts of ORA-00972 and ORA-11545 cut the name or value as `first ten...last ten...`; Oracle's form was not checked with names that differ along their length.
