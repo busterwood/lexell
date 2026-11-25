@@ -198,7 +198,7 @@ fn sv(v: &Val, z: &lexdb_time.Zone): str {
         Val.Date(d) { return fmtDate(lexdb_time.dateToTs(d), &"DD-MON-RR").unwrapOr("") }
         Val.Ts(u) { return fmtDate(u, &"DD-MON-RR").unwrapOr("") }
         Val.Tstz(u) { return fmtDate(lexdb_time.tstzToTs(u, z), &"DD-MON-RR").unwrapOr("") }
-        Val.Tsz(u, o) { return fmtDateTz(lexdb_tz.local(u, o), &"DD-MON-RR HH.MI.SSXFF AM TZR", &TzOut{has: true, off: o}).unwrapOr("") }
+        Val.Tsz(u, o) { return fmtDateTz(lexdb_tz.local(u, o), &"DD-MON-RR HH.MI.SSXFF AM TZR", &TzOut{has: true, off: o, ltz: false}).unwrapOr("") }
         Val.Uuid(u) { return strings.toUpperAscii(&(strings.replaceAll(u, "-", ""))) }
         Val.Bytes(b) { return hexUpper(&b) }
         else { return "" }
@@ -641,13 +641,13 @@ fn ff9(fmt: &str): str {
 }
 
 // What a value's zone gives the TZH, TZM, TZR and TZD elements of a format: its offset in minutes (has: the value has one).
-type TzOut = record { has: bool; off: int }
+type TzOut = record { has: bool; off: int; ltz: bool }       // (ltz: a TIMESTAMP WITH LOCAL TIME ZONE: TZH and TZM refused, as Oracle does)
 
 // What reading TZH, TZM, TZR and TZD sets: the offset, its sign as written (TZM takes TZH's), a region or abbreviation.
 type TzIn = record { has: bool; off: int; neg: bool; region: str }
 
 // TO_CHAR(date, fmt).
-fn fmtDate(us: int, fmt: &str): Result[str, DbErr] { return fmtDateTz(us, fmt, &TzOut{has: false, off: 0}) }
+fn fmtDate(us: int, fmt: &str): Result[str, DbErr] { return fmtDateTz(us, fmt, &TzOut{has: false, off: 0, ltz: false}) }
 
 // TO_CHAR(date, fmt) of a value with an offset: us is its local time; TZH is the offset's sign and hours, TZM its minutes,
 // TZR its text, TZD empty (an offset has no abbreviation). ORA-01821 for these on a value without one.
@@ -725,7 +725,7 @@ fn fmtDateTz(us: int, fmt: &str, tz: &TzOut): Result[str, DbErr] {
             }
             "J" { sb += &((2451545 + p.days).toStr()) }
             "TZH", "TZM", "TZR", "TZD" {
-                if !tz.has { return Err(ora(1821, "date format not recognized")) }
+                if !tz.has || (tz.ltz && (e.key == "TZH" || e.key == "TZM")) { return Err(ora(1821, "date format not recognized")) }
                 let a = if tz.off < 0 { -tz.off } else { tz.off }
                 if e.key == "TZH" { sb += &((if tz.off < 0 { "-" } else { "+" }) + pad(a / 60, 2)) }
                 else if e.key == "TZM" { sb += &(pad(a % 60, 2)) }
@@ -1474,10 +1474,11 @@ pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], Db
                     return Ok(Some(nz(&(try fmtDate(u, &(if u % 1000000 != 0 { tfmt } else { dfmt }))))))
                 }
                 Val.Tstz(u) {
-                    // an instant (a column made before a timestamp kept its offset, TIMESTAMP WITH LOCAL TIME ZONE): at the session zone's offset
-                    return Ok(Some(nz(&(try fmtDateTz(try asTs(&vs[0], z), &zfmt, &TzOut{has: true, off: z.offsetOf(u) / 60})))))
+                    // an instant (a column made before a timestamp kept its offset, TIMESTAMP WITH LOCAL TIME ZONE): at the session zone's offset,
+                    // in the timestamp's format, as Oracle shows a TIMESTAMP WITH LOCAL TIME ZONE
+                    return Ok(Some(nz(&(try fmtDateTz(try asTs(&vs[0], z), &tfmt, &TzOut{has: true, off: z.offsetOf(u) / 60, ltz: true})))))
                 }
-                Val.Tsz(u, o) { return Ok(Some(nz(&(try fmtDateTz(lexdb_tz.local(u, o), &zfmt, &TzOut{has: true, off: o}))))) }
+                Val.Tsz(u, o) { return Ok(Some(nz(&(try fmtDateTz(lexdb_tz.local(u, o), &zfmt, &TzOut{has: true, off: o, ltz: false}))))) }
                 Val.Int(_) { return Ok(Some(nz(&(try numToChar(&[vs[0].clone()], z))))) }
                 Val.Num(_) { return Ok(Some(nz(&(try numToChar(&[vs[0].clone()], z))))) }
                 Val.Float(_) { return Ok(Some(nz(&(try numToChar(&[vs[0].clone()], z))))) }
@@ -1493,12 +1494,12 @@ pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], Db
                 }
                 Val.Tstz(u) {
                     let us = try asTs(&vs[0], z)
-                    let fmt = if n > 1 { ff9(&sv(&vs[1], z)) } else { "DD-MON-RR" }
-                    return Ok(Some(nz(&(try fmtDateTz(us, &fmt, &TzOut{has: true, off: z.offsetOf(u) / 60})))))
+                    let fmt = if n > 1 { ff9(&sv(&vs[1], z)) } else { "DD-MON-RR HH.MI.SSXFF AM" }
+                    return Ok(Some(nz(&(try fmtDateTz(us, &fmt, &TzOut{has: true, off: z.offsetOf(u) / 60, ltz: true})))))
                 }
                 Val.Tsz(u, o) {
                     let fmt = if n > 1 { ff9(&sv(&vs[1], z)) } else { "DD-MON-RR HH.MI.SSXFF AM TZR" }
-                    return Ok(Some(nz(&(try fmtDateTz(lexdb_tz.local(u, o), &fmt, &TzOut{has: true, off: o})))))
+                    return Ok(Some(nz(&(try fmtDateTz(lexdb_tz.local(u, o), &fmt, &TzOut{has: true, off: o, ltz: false})))))
                 }
                 Val.Int(_) { return Ok(Some(nz(&(try numToChar(&vs, z))))) }
                 Val.Num(_) { return Ok(Some(nz(&(try numToChar(&vs, z))))) }
@@ -1597,6 +1598,6 @@ pub fn call(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val], Db
 
 // Whether fmt is a date format model Oracle knows (ALTER SESSION SET NLS_DATE_FORMAT).
 pub fn checkFormat(fmt: &str): Result[Unit, DbErr] {
-    let x = try fmtDateTz(0, fmt, &TzOut{has: true, off: 0})
+    let x = try fmtDateTz(0, fmt, &TzOut{has: true, off: 0, ltz: false})
     return Ok(Unit{})
 }
