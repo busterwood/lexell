@@ -70,7 +70,7 @@ SELECT COUNT(*) AS sequences FROM sys.sequences;
 
 ```text
 Msg 3729, Level 16, State 1, Line 3
-Cannot DROP SEQUENCE 'ticket' because it is being referenced by object 'DF__t__id__1387171750'.
+Cannot DROP SEQUENCE 'dbo.ticket' because it is being referenced by object 'DF__t__id__1387171750'.
 (1 row affected)
 
 id v

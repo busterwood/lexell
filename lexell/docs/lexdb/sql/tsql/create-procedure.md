@@ -275,7 +275,7 @@ Msg 111, Level 16, State 1, Line 2
 Msg 2714, Level 16, State 1, Line 1
 There is already an object named 'staff' in the database.
 Msg 208, Level 16, State 1, Line 1
-Invalid object name 'nothere'.
+Invalid object name 'dbo.nothere'.
 Msg 102, Level 15, State 1, Line 1
 Incorrect syntax near 'owner'.
 ```

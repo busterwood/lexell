@@ -30,9 +30,9 @@ DROP TABLE [ IF EXISTS ] { database_name.schema_name.table_name | schema_name.ta
 ## Differences from SQL Server
 
 - **A table that a view reads is dropped, as in SQL Server**, unless the view is `WITH SCHEMABINDING` (error 3729,
-  naming the table without its schema; SQL Server: `dbo.emp`). The view, and a view over it, fail with error 208 when
-  read (the text names the table without its schema), and read again as soon as a table of that name is made (example
-  E). `DROP VIEW` of a view another view reads is still refused (error 50000; SQL Server allows it).
+  naming the table as the statement wrote it). The view, and a view over it, fail with error 208 when read (the text
+  names the table as the view's query wrote it), and read again as soon as a table of that name is made (example E).
+  `DROP VIEW` of a view another view reads is still refused (error 50000; SQL Server allows it).
 - A table that a foreign key refers to gives error 50000 with lexdb's text (SQL Server: 3726).
 
 ## Examples
@@ -149,7 +149,7 @@ GO
 (1 row affected)
 
 Msg 208, Level 16, State 1, Line 1
-Invalid object name 'dept'.
+Invalid object name 'dbo.dept'.
 (1 row affected)
 
 name
@@ -159,7 +159,7 @@ OPS
 (1 row affected)
 
 Msg 3729, Level 16, State 1, Line 1
-Cannot DROP TABLE 'dept' because it is being referenced by object 'v_dept_bound'.
+Cannot DROP TABLE 'dbo.dept' because it is being referenced by object 'v_dept_bound'.
 ```
 
 ### F. Errors

@@ -43,8 +43,8 @@ END CATCH
 
 ## Differences from SQL Server
 
-- A failed statement in the `TRY` block sends `(0 rows affected)` before the `CATCH` block's output (example B);
-  SQL Server sends no count for it.
+- A failed `INSERT`, `UPDATE` or `DELETE` in the `TRY` block sends `(0 rows affected)` before the `CATCH` block's output
+  (example B); SQL Server sends no count for it. A failed `SELECT` or DDL statement sends none, as in SQL Server.
 - `ERROR_LINE()` gives 1, whatever line failed.
 - `ERROR_MESSAGE()` is SQL Server's text, except for errors numbered 50000, which carry lexdb's.
 
@@ -129,10 +129,10 @@ END CATCH;
 
 ```text
 Msg 208, Level 16, State 1, Line 2
-Invalid object name 'nothere'.
+Invalid object name 'dbo.nothere'.
 number message
------- ------------------------------
-208    Invalid object name 'nothere'.
+------ ----------------------------------
+208    Invalid object name 'dbo.nothere'.
 
 (1 row affected)
 ```
@@ -231,7 +231,7 @@ END CATCH;
 
 ```text
 Msg 208, Level 16, State 1, Line 2
-Invalid object name 'nothere'.
+Invalid object name 'dbo.nothere'.
 ```
 
 ## See also

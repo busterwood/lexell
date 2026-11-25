@@ -343,7 +343,7 @@ column reference "name" is ambiguous
 Msg 207, Level 16, State 1, Line 1
 Invalid column name 'nme'.
 Msg 208, Level 16, State 1, Line 1
-Invalid object name 'employee'.
+Invalid object name 'dbo.employee'.
 ```
 
 ### J. What lexdb does not take
