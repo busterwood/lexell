@@ -13122,3 +13122,11 @@ The core's share of the slice: DROP TABLE under views (`lexdb_viewdep.dropTable`
 the SQL Server and Oracle doors drop the table (a view over it fails when read, and reads it again once one of the name is made). `information_schema.view_table_usage` and
 `view_column_usage` exist (`lexdb_viewdep.usageRows`). The Oracle door's quoted names are exact (`lexdb_sql.oraQuoted`), with keys no fold reaches; the other doors' names are
 unchanged (`exec_bugs6`).
+
+### 9.150 The seventh bug slice (lexdb-robust.md, "The seventh bug slice")
+
+The core's share: a `SELECT *` view keeps its columns as at its CREATE when its tables gain columns (`lexdb_viewdep.narrowed`: read through a derived table of its columns, by
+position in the T-SQL door, by name in the others); an assertion's check of rows taken out of a table under NOT EXISTS is restricted to the outer rows of their join key's
+values (`lexdb_assert.goneVals`, with `Store.beforeMark` and `Txn.changedKeys`: a key's value before a statement's mark). The PostgreSQL door: DROP TABLE's DETAIL names the
+foreign keys on the table, `SET TRANSACTION READ ONLY` and `READ WRITE` take effect (`lexdb_txmode`), the same isolation level is taken after the first query;
+`information_schema.domains` and `column_privileges` exist (`exec_bugs7`, `exec_bugs7d`).

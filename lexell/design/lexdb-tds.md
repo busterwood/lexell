@@ -1257,3 +1257,13 @@ assertion's CHECK_CONSTRAINTS row; no sys.objects row (no type for one: SSMS, sp
 - 4512 (a one-part name in a schema-bound view), 4513 (over a view that is not schema-bound, or a function), 5074 for ALTER COLUMN under a schema-bound view; WITH CHECK
   OPTION before AS is 102; 1054's state is 6. INSERT TOP (n) ... SELECT ... ORDER BY keeps following the ORDER BY (SQL Server ignores it: its choice is undefined).
   Not done: 4502's text without the schema written in the query. Test `tds_bugs6`.
+
+## As built: the seventh bug slice (lexdb-robust.md, 2026-11-25)
+
+- A `SELECT *` view keeps its columns as at CREATE VIEW (by position) until `sp_refreshview`; one that names its own columns is 8158 once its table has more.
+- 208, 3729, 4502, 4512 and 4513 name objects as the statement wrote them (`lexdb_tsqlname`; a view's 208 as its query wrote it); 4512's state is 3, 4513's 2; 4502 and 8158
+  are compile errors (not caught in the same scope); WITH CHECK OPTION before AS quotes WITH as typed; a failed DDL statement in TRY gives no row count.
+- DROP INDEX: 159 for a bare name; 3701 (state 6: no such table, 7: no such index) and 3723 (state 4 for a PRIMARY KEY's index, 5 for a UNIQUE one's) name `table.index` as
+  written.
+- INFORMATION_SCHEMA.DOMAINS and COLUMN_PRIVILEGES exist (no rows: lexdb has no alias types and no grants on columns); SCHEMATA and sys.schemas give a schema's
+  AUTHORIZATION owner. Test `tds_bugs7`.

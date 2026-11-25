@@ -1335,3 +1335,12 @@ whole-query check, the check's plan made each time.
 - A SELECT with a parenthesis left open before INTO is ORA-00907 at the INTO. A view over a graph whose column came back stays VALID at once (Oracle keeps it INVALID until
   ALTER VIEW ... COMPILE): kept, lexdb's view says what its query does now. Not done: NOVALIDATE assertions still run the whole query for a DELETE or UPDATE of a NOT EXISTS
   table (lexdb-robust.md says what it needs). Test `tns_bugs6`.
+
+## As built: the seventh bug slice (lexdb-robust.md, 2026-11-25)
+
+- **Nested subprograms overload**: a call picks among the subprograms of its name in the scope that declares them by the arguments' number, names and type families
+  (`Cx.overload`); PLS-00307 when more than one fits, PLS-00306 when none does. A nested function called from SQL inside the unit is PLS-00231 at compile time (USER_ERRORS:
+  PLS-00231, ORA-03066, SQL Statement ignored). A package's overloaded members are still resolved by name (found, not done).
+- A `SELECT *` view keeps its columns (by name) when its table gains one, as Oracle expands `*` at CREATE (`lexdb_viewdep.narrowed`); USER_VIEWS.TEXT stays as written.
+- **Assertions**: a DELETE or UPDATE of a table under NOT EXISTS checks the outer rows of the join key's values of the rows taken out only (`lexdb_assert.goneVals`, the old
+  rows from `Store.beforeMark`), so NOVALIDATE over rows that break it takes writes that break nothing (example G). Test `tns_bugs7`.
