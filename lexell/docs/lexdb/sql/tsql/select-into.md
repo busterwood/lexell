@@ -27,6 +27,8 @@ INTO { new_table | #new_temp_table }
 - The new table's columns are named and typed after the select list. Every expression needs a name.
 - The table gets no primary key, indexes, constraints or defaults.
 - `SELECT TOP (0) * INTO new_table FROM t` copies the columns and no rows.
+- The statement gives `(n rows affected)` for the rows put in, and a client's update count is *n* (JDBC's
+  `getUpdateCount`).
 - `SELECT ... INTO #temp` works on a replica too.
 
 ## Differences from SQL Server
@@ -35,8 +37,6 @@ INTO { new_table | #new_temp_table }
   column becomes `nvarchar(max)`, a `decimal(10,2)` one a wider `decimal`, every column allows NULL, and an identity
   column becomes a plain `int` (example D).
 - The `IDENTITY (type, seed, increment)` function, which numbers the new rows, is not supported (error 207).
-- No `(n rows affected)` message is given for the rows put in, as SQL Server gives; the counts in the examples are
-  those of the queries after it.
 
 ## Examples
 
@@ -62,6 +62,8 @@ SELECT * FROM dbo.yearly ORDER BY name;
 ```
 
 ```text
+(2 rows affected)
+
 name yearly
 ---- --------
 Ann  62400.00
@@ -82,6 +84,8 @@ SELECT * FROM #by_dept ORDER BY dept_id;
 ```
 
 ```text
+(3 rows affected)
+
 dept_id staff total
 ------- ----- --------
 NULL    1     3000.00
@@ -100,6 +104,8 @@ SELECT COUNT(*) AS rows_in FROM dbo.emp_empty;
 ```
 
 ```text
+(0 rows affected)
+
 rows_in
 -------
 0

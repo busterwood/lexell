@@ -83,8 +83,9 @@ text in quotes or after `\`; any other character as it is.
   custom format such as `hh\:mm` work, and any other standard letter is NULL (example F). The fraction has microsecond
   precision (`14:07:09.1234570`).
 - Digits are rounded half away from zero, as .NET does.
-- The currency format `C` gives the yen two decimals: `FORMAT(1234.5, 'C', 'ja-JP')` is `¥1,234.50` (SQL Server:
-  `¥1,235`, as the yen has none). Example L.
+- The currency format `C` without a precision gives the currency's own decimals: none for `'ja-JP'`, `'ko-KR'`,
+  `'id-ID'`, `'es-CO'`, `'ja'` and `'ko'` (`FORMAT(1234.5, 'C', 'ja-JP')` is `¥1,235`), two for the others, as in SQL
+  Server. Example L.
 - A `datetimeoffset` is formatted in its local time, but the offset specifiers `z`, `zz` and `zzz` are not known: they
   are written as they are (`'HH:mm zzz'` gives `14:07 zzz`; SQL Server `14:07 +02:00`). Example N.
 
@@ -344,13 +345,13 @@ sections positive zero_section rounds_to_zero empty_negative ssn         phone
 ```sql
 SELECT FORMAT(1234567.891, 'N2', 'fr-FR') AS fr, FORMAT(1234567.891, 'N2', 'de-CH') AS de_ch,
        FORMAT(1234567.891, 'N2', 'en-IN') AS en_in, FORMAT(1234.5, 'C', 'ja-JP') AS ja_yen, FORMAT(1234.5, 'C', 'pt-BR') AS pt_br,
-       FORMAT(0.256, 'P1', 'sv-SE') AS sv_p;
+       FORMAT(0.256, 'P1', 'sv-SE') AS sv_p, FORMAT(1234.5, 'C', 'ko-KR') AS ko_won, FORMAT(1234.5, 'C2', 'ja-JP') AS ja_c2;
 ```
 
 ```text
-fr           de_ch        en_in        ja_yen    pt_br       sv_p
------------- ------------ ------------ --------- ----------- ------
-1 234 567,89 1’234’567.89 12,34,567.89 ¥1,234.50 R$ 1.234,50 25,6 %
+fr           de_ch        en_in        ja_yen pt_br       sv_p   ko_won ja_c2
+------------ ------------ ------------ ------ ----------- ------ ------ ---------
+1 234 567,89 1’234’567.89 12,34,567.89 ¥1,235 R$ 1.234,50 25,6 % ₩1,235 ¥1,234.50
 
 (1 row affected)
 ```
