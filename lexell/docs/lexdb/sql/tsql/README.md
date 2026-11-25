@@ -48,6 +48,7 @@ This index lists everything the door takes today. Pages not written yet are list
 | [CREATE FUNCTION](create-function.md) (and `ALTER`, `CREATE OR ALTER`), [DROP FUNCTION](drop-function.md) | Scalar functions and inline table-valued functions (multi-statement ones are made but cannot be read yet). |
 | [CREATE TYPE](create-type.md) (and `DROP TYPE`) | Table types (for table-valued parameters). |
 | [CREATE SEQUENCE](create-sequence.md), [ALTER SEQUENCE](alter-sequence.md), [DROP SEQUENCE](drop-sequence.md) | `NEXT VALUE FOR`. |
+| [CREATE ASSERTION](create-assertion.md), [DROP ASSERTION](drop-assertion.md) | The SQL standard's constraint across tables; lexdb's own here (SQL Server has none); `DEFERRABLE`. |
 | [CREATE SCHEMA](create-schema.md), [DROP SCHEMA](drop-schema.md) | |
 | [ALTER DATABASE](alter-database.md) | `SET` options (most read and kept; `READ_ONLY`, `SINGLE_USER`, `OFFLINE` refused). |
 | [sp_rename](sp-rename.md) | Renames a table, column or index. |
@@ -71,6 +72,7 @@ This index lists everything the door takes today. Pages not written yet are list
 | [BEGIN TRANSACTION](begin-transaction.md), [COMMIT](commit-transaction.md), [ROLLBACK](rollback-transaction.md), [SAVE TRANSACTION](save-transaction.md) | Named transactions and savepoints; `@@TRANCOUNT`. |
 | [SET TRANSACTION ISOLATION LEVEL](set-transaction-isolation-level.md) | Accepted; every read-write transaction is serializable. |
 | [SET IMPLICIT_TRANSACTIONS](set-implicit-transactions.md), [SET XACT_ABORT](set-xact-abort.md) | |
+| [SET CONSTRAINTS](set-constraints.md) | lexdb's own: defers or runs the check of an assertion. |
 
 ### Session
 

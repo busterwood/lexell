@@ -18,6 +18,9 @@ TRUNCATE TABLE { database_name.schema_name.table_name | schema_name.table_name |
 
 ## Remarks
 
+- A table an [assertion](create-assertion.md) reads is checked, though `TRUNCATE TABLE` checks no row of its own: one that leaves an
+  `EXISTS` assertion false is error 547 (`The TRUNCATE TABLE statement conflicted with the assertion`) and the
+  statement is undone.
 - `TRUNCATE TABLE` gives no `(n rows affected)` message, and checks no row.
 - It is transactional: inside a transaction, `ROLLBACK` brings the rows back.
 - A table that a foreign key of another table refers to cannot be truncated, even when no row refers to it. Use

@@ -93,6 +93,8 @@ table_constraint ::=
 
 ## Remarks
 
+- A foreign key's action (`ON DELETE CASCADE`, `SET NULL`, `SET DEFAULT`, `ON UPDATE CASCADE`) writes the child table, and an
+  [assertion](create-assertion.md) on the child is checked after it: error 547 undoes the whole statement.
 - A temporary table (`#name`) belongs to the session that made it, and is dropped when the session ends or is
   reset. It may be made, filled and read on a replica.
 - **`CLUSTERED` and `NONCLUSTERED` are labels.** lexdb keeps rows in the order of the primary key whatever is said.

@@ -21,6 +21,8 @@ COMMIT [ WORK ]
 
 ## Remarks
 
+- A deferred [assertion](create-assertion.md) is checked at the outermost `COMMIT TRAN`: a violation is error 547 naming
+  `COMMIT TRANSACTION`, the transaction is rolled back and `@@TRANCOUNT` is 0. A nested `COMMIT TRAN` checks nothing.
 - When `@@TRANCOUNT` is 1, `COMMIT` commits the transaction and sets `@@TRANCOUNT` to 0. When it is more than 1,
   `COMMIT` only lowers it by one; nothing is committed until the outermost `COMMIT`.
 - `COMMIT` with no transaction is error 3902.

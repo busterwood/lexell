@@ -72,6 +72,9 @@ ALTER TABLE { database_name.schema_name.table_name | schema_name.table_name | ta
 
 ## Remarks
 
+- `ALTER COLUMN` of a column an [assertion](create-assertion.md) reads converts the values, and then runs the assertion's
+  whole query: 547 if it fails (SQL Server refuses `ALTER COLUMN` of a column a `CHECK` reads, 5074). `DROP COLUMN` of
+  one is 5074.
 - To rename a table, a column or an index, use [sp_rename](sp-rename.md).
 - `ALTER TABLE` is transactional: inside a transaction, `ROLLBACK` undoes it.
 - An unknown table is error 4902; an unknown column is 207.

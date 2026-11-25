@@ -49,7 +49,7 @@ feature, the number is **50000**.
 |---|---|
 | 515 | NULL in a `NOT NULL` column. |
 | 544 | An explicit value for an identity column while `IDENTITY_INSERT` is `OFF`. |
-| 547 | A `CHECK` or `FOREIGN KEY` constraint violated, by a write or by `ALTER TABLE ... WITH CHECK` (`ADD`, `CHECK CONSTRAINT`) over rows that break it. |
+| 547 | A `CHECK` or `FOREIGN KEY` constraint violated, by a write or by `ALTER TABLE ... WITH CHECK` (`ADD`, `CHECK CONSTRAINT`) over rows that break it. Also an [assertion](create-assertion.md) broken (`conflicted with the assertion "a"`), by a statement, by `COMMIT TRANSACTION` for a deferred one (the transaction rolled back, `@@TRANCOUNT` 0), by `SET CONSTRAINTS ... IMMEDIATE` or by `CREATE ASSERTION` over rows that break it. |
 | 4917 | `CHECK CONSTRAINT` or `NOCHECK CONSTRAINT` of a name that is not a constraint of the table. |
 | 11415 | `CHECK CONSTRAINT` or `NOCHECK CONSTRAINT` of a key, which has no such state. |
 | 2627 | A `PRIMARY KEY` or `UNIQUE` constraint violated (a unique index gives the same). |
@@ -77,13 +77,14 @@ feature, the number is **50000**.
 | Number | Meaning |
 |---|---|
 | 218, 219 | A type that does not exist (on `DROP TYPE`), or one that exists already (`CREATE TYPE`). |
-| 2714 | An object, role or user that exists already. |
+| 2714 | An object, role or user that exists already, and an assertion's name taken by a table or the other way round. |
 | 2715 | A data type that does not exist. |
-| 3701 | `DROP` of a table, view, procedure or function that does not exist (severity 11). |
+| 3701 | `DROP` of a table, view, procedure, function or assertion that does not exist (severity 11). |
 | 4121 | A column, function or method that cannot be found by that name. |
 | 4902 | A table named by `TRUNCATE` or similar that cannot be found. |
-| 5074 | An object depends on the column you are dropping or changing. |
-| 3729 | `DROP SEQUENCE` of a sequence a column's default uses. |
+| 5074 | An object depends on the column you are dropping or changing (an assertion reads it). |
+| 3729 | `DROP SEQUENCE` of a sequence a column's default uses; `DROP TABLE` of a table an assertion reads. |
+| 15336 | `sp_rename` of a table or column an assertion reads. |
 | 2754 | `RAISERROR` of severity 19 to 25 without `WITH LOG`. |
 | 5324, 8672, 10713 | `MERGE` rules: a `WHEN` clause after one with no condition; a target row matched twice; a missing `;`. |
 | 310, 1042 | `OPTION (MAXRECURSION n)` out of range, or given twice. |
@@ -106,7 +107,7 @@ feature, the number is **50000**.
 
 | Number | Meaning |
 |---|---|
-| 50000 | `RAISERROR` with a message text; also every error SQL Server has no number for here (a column named twice, a column that must be in `GROUP BY`, an ambiguous column) and every feature lexdb does not support: the message begins `lexdb:`. |
+| 50000 | An assertion's query that lexdb cannot check (`Cannot create assertion 'a': its query is not supported: ` and the reason), and `SET CONSTRAINTS` of an assertion that is not deferrable (`constraint "a" is not deferrable`) or of a name that is none (`does not exist`); `RAISERROR` with a message text; also every error SQL Server has no number for here (a column named twice, a column that must be in `GROUP BY`, an ambiguous column) and every feature lexdb does not support: the message begins `lexdb:`. |
 | 51000 and up | `THROW` with your own number. |
 | 2745, 596 | Sent after a `RAISERROR ... WITH LOG` of severity 20 or more; the connection is closed. |
 | 18456 | A failed login. |
@@ -383,6 +384,40 @@ Msg 4917, Level 16, State 1, Line 1
 Constraint 'nosuch' does not exist.
 Msg 11415, Level 16, State 1, Line 1
 Object 'sh_pkey' cannot be disabled or enabled. This action applies only to foreign key and check constraints.
+```
+
+### J. Assertions
+
+<!-- example: tsql -->
+```sql
+CREATE TABLE dbo.ja (id int PRIMARY KEY, v int);
+GO
+CREATE ASSERTION ja_pos CHECK (NOT EXISTS (SELECT 1 FROM dbo.ja WHERE v < 0))
+GO
+INSERT dbo.ja VALUES (1, -1);
+GO
+CREATE ASSERTION ja_pos CHECK (NOT EXISTS (SELECT 1 FROM dbo.ja WHERE v < 1))
+GO
+DROP ASSERTION nosuch;
+GO
+CREATE ASSERTION ja_cnt CHECK (NOT EXISTS (SELECT 1 FROM dbo.ja GROUP BY id HAVING COUNT(*) > 1))
+GO
+DROP TABLE dbo.ja;
+GO
+SET CONSTRAINTS ja_pos DEFERRED;
+```
+
+```text
+Msg 547, Level 16, State 1, Line 1
+The INSERT statement conflicted with the assertion "ja_pos". The conflict occurred in database "lexdb", table "dbo.ja".
+Msg 2714, Level 16, State 1, Line 1
+There is already an object named 'ja_pos' in the database.
+Msg 3701, Level 11, State 1, Line 1
+Cannot drop the assertion 'nosuch', because it does not exist or you do not have permission.
+Msg 50000, Level 16, State 1, Line 1
+Cannot create assertion 'ja_cnt': its query is not supported: aggregates, GROUP BY or HAVING.
+Msg 3729, Level 16, State 1, Line 1
+Cannot DROP TABLE 'dbo.ja' because it is being referenced by object 'ja_pos'.
 ```
 
 ## See also
