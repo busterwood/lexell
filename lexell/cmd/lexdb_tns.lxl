@@ -657,6 +657,7 @@ type Cursor = record {
     dyn: bool               // its text had calls of stored functions made at prepare: prepared again at each execute
     dirs: []int             // a PL/SQL block's binds: 16 OUT, 32 IN, 48 IN OUT, as the IO vector told the client
     plan: lexdb_plcall.Plan // a query's calls of stored functions of a column (lexdb_plcall): what it takes to run it
+    pbt: []int              // the binds' types plan was made with (an overloaded function's call is resolved by them)
 }
 
 // A bind as the client describes it.
@@ -670,7 +671,7 @@ type BindMeta = value record {
 
 fn newCursor(id: int, sql: &str): Cursor {
     return Cursor{id: id, sql: sql.clone(), query: false, cols: [], ts: [], rows: [], pos: 0, count: 0, meta: [], sites: [], into: -1,
-                  stmts: [], prepared: false, special: 0, lobPre: false, modes: [], pc: lexdb_exec.newPlanCache(), pts: [], dyn: false, dirs: [], plan: lexdb_plcall.noPlan()}
+                  stmts: [], prepared: false, special: 0, lobPre: false, modes: [], pc: lexdb_exec.newPlanCache(), pts: [], dyn: false, dirs: [], plan: lexdb_plcall.noPlan(), pbt: []}
 }
 
 // ---- what a request says
@@ -1808,7 +1809,8 @@ fn (c: mut &Conn) prepare(i: int): Result[Unit, DbErr] {
         // (a view's calls are resolved as the functions are now)
         if stmts[0].kind == lexdb_sql.S_CREATE_VIEW { let ep = lexdb_plsql.ensureProg(mut &c.prog, mut &c.pl, mut &c.sess) }
         if (sk == tns.S_QUERY || sk == tns.S_DML || sk == tns.S_DDL) && lexdb_plsql.hasUnits(&c.prog) {
-            match lexdb_plcall.rewrite(&c.prog, &c.pl, &stmts[0]) {
+            c.cursors[i].pbt = bindOids(&c.cursors[i].meta)
+            match lexdb_plcall.rewrite(&c.prog, &c.pl, mut &c.sess, &stmts[0], &c.cursors[i].pbt) {
                 Ok(rw) {
                     match rw {
                         Some(x0) {
@@ -1828,6 +1830,25 @@ fn (c: mut &Conn) prepare(i: int): Result[Unit, DbErr] {
     if c.cursors[i].dyn { c.cursors[i].pc = lexdb_exec.newPlanCache() }
     c.cursors[i].prepared = true
     return Ok(Unit{})
+}
+
+// The types of the binds as the client describes them (bindVal's; 0 where it does not tell one).
+fn bindOids(meta: &[]BindMeta): []int {
+    var out: []int = []
+    for m in meta {
+        let t = m.ora
+        var o = 0
+        if t == tns.T_VARCHAR || t == tns.T_CHAR || t == tns.T_LONG { o = lexdb_sql.OID_TEXT }
+        else if t == tns.T_NUMBER || t == tns.T_BINARY_INTEGER { o = lexdb_sql.OID_NUMERIC }
+        else if t == tns.T_BINARY_DOUBLE { o = lexdb_sql.OID_FLOAT8 }
+        else if t == tns.T_BINARY_FLOAT { o = lexdb_sql.OID_FLOAT4 }
+        else if t == tns.T_DATE || t == tns.T_TIMESTAMP || t == tns.T_TIMESTAMP_LTZ { o = lexdb_sql.OID_TS }
+        else if t == tns.T_TIMESTAMP_TZ { o = lexdb_sql.OID_TSTZ }
+        else if t == tns.T_RAW || t == tns.T_LONG_RAW { o = lexdb_sql.OID_BYTEA }
+        else if t == tns.T_BOOLEAN { o = lexdb_sql.OID_BOOL }
+        append(mut &out, o)
+    }
+    return out
 }
 
 fn sameTypes(a: &[]int, b: &[]int): bool {
@@ -2181,6 +2202,8 @@ fn (c: mut &Conn) execute(rq: &Req) {
         }
     }
     if c.cursors[i].dyn { c.cursors[i].prepared = false }
+    // (calls of stored functions resolved by the binds' types: binds of other types are another resolution)
+    if c.cursors[i].prepared && len(c.cursors[i].plan.sites) > 0 && !sameTypes(&c.cursors[i].pbt, &bindOids(&c.cursors[i].meta)) { c.cursors[i].prepared = false }
     let sql = c.cursors[i].sql.clone()
     var kind = tns.statementKind(&sql)
     if kind == tns.S_OTHER && len(lexdb_plsql.execToBlock(&sql)) > 0 { kind = tns.S_PLSQL }

@@ -384,6 +384,8 @@ pub type PUnit = record {
     nest: str               // a nested subprogram's (declared in a unit's declarations): its scope's id, "" none
     nfrom: int              // ... its own slots, from and to: the others are its enclosing unit's, copied from the caller's frame and back
     nto: int
+    ovl: int                // a package member's number among the package's subprograms of its name, from 1 in the order they are declared
+                            // (the specification's, then the body's own); 0 for any other unit
     subs: []PUnit           // the nested subprograms a unit's text declares (moved into the program beside it)
 }
 
@@ -578,12 +580,14 @@ pub type Ip = record {
     ddl: int                // bumped by DDL: cached units' types may be stale
     lines: int
     subs: []PUnit           // the nested subprograms of the anonymous block that runs
+    pin: str                // a call from SQL resolved to an overload of a package member (callFunction): OWNER.PKG.NAME, "\x03" and its
+                            // number; the block's call of it is to that one
 }
 
 pub fn newIp(st: lexdb_store.Store): Ip {
     return Ip{st: st, out: [], outOn: false, outPart: "", scache: [], scalls: [], stored: [], storedVer: -1, storedOk: false,
               curs: [], results: [], nls: [], user: "", sqlRows: 0, sqlFound: -1, errCode: 0, errMsg: "", depth: 0, uid: 0, sps: false, sp0: false,
-              exitLabel: "", ctl: [], curErr: plErr("", ""), outPos: 0, outBytes: 0, arrOut: [], outLimit: 20000, keep: 0, pkgs: [], ddl: 0, lines: 0, subs: []}
+              exitLabel: "", ctl: [], curErr: plErr("", ""), outPos: 0, outBytes: 0, arrOut: [], outLimit: 20000, keep: 0, pkgs: [], ddl: 0, lines: 0, subs: [], pin: ""}
 }
 
 // ---- stored source (the catalog tree's "\x02src\x00" keys: owner, kind and name)
@@ -680,7 +684,8 @@ type Sig = record { found: bool; kind: int; prms: []Prm; ret: PT; canon: []str }
 fn noSig(): Sig { return Sig{found: false, kind: 0, prms: [], ret: pt(PK_ANY), canon: []} }
 
 // The signature of a stored procedure or function, as a compile of its callers sees it.
-type SigEntry = record { owner: str; pkg: str; name: str; kind: int; prms: []Prm; ret: PT; isPub: bool; slot: int; konst: bool }
+// ovl: a package member's number among the package's subprograms of its name (PUnit.ovl), 0 a standalone unit's.
+type SigEntry = record { owner: str; pkg: str; name: str; kind: int; prms: []Prm; ret: PT; isPub: bool; slot: int; konst: bool; ovl: int }
 
 fn cloneRow(a: &[]Val): []Val {
     var out: []Val = []
@@ -738,7 +743,14 @@ fn (cx: &Cx) sigOf(names: &[]str): Sig {
     }
     if pick < 0 { return noSig() }
     let e = &cx.sigs[pick]
-    return Sig{found: true, kind: e.kind, prms: copyPrms(&e.prms), ret: e.ret, canon: [e.owner.clone(), e.pkg.clone(), e.name.clone()]}
+    return Sig{found: true, kind: e.kind, prms: copyPrms(&e.prms), ret: e.ret, canon: canonOf(e)}
+}
+
+// The names a compiled call of a stored unit keeps (Prog.findC): owner, package, name; a package member's also "" (no nested
+// scope) and its overload's number.
+fn canonOf(e: &SigEntry): []str {
+    if len(e.pkg) > 0 && e.ovl > 0 { return [e.owner.clone(), e.pkg.clone(), e.name.clone(), "", e.ovl.toStr()] }
+    return [e.owner.clone(), e.pkg.clone(), e.name.clone()]
 }
 
 // ---- overloads of nested subprograms
@@ -823,19 +835,41 @@ fn (cx: mut &Cx) argFam(ip: mut &Ip, sess: mut &lexdb_exec.Session, s: int, e: i
     return Ok(0)
 }
 
-// A call's subprogram among the overloads of the nested subprogram sg found (those of its name and kind, 0 any, in the scope
-// that declares it), by its arguments (tokens a..b; none when b <= a): their number, names and type families, as Oracle's
-// resolution: the one that takes each argument in its own family, else the one that takes them by conversion; PLS-00306 when
-// none fits, PLS-00307 when more than one does (a refusal where lexdb cannot tell them apart, never a guess). sg itself when
-// the name has no overloads (a stored unit or a package member: their resolution is by name, as before).
+// A call's subprogram among the overloads of the subprogram sg found, by its arguments (tokens a..b; none when b <= a): a
+// nested subprogram's (those of its name and kind, 0 any, in the scope that declares it) or a package member's (the package's
+// subprograms of its name and kind that the caller sees: canonOf's five names). Picked as Oracle's resolution does (pickOf):
+// PLS-00306 when none fits, PLS-00307 when more than one does (a refusal where lexdb cannot tell them apart, never a guess), at
+// the call's name (its first part). sg itself when the name has no overloads (a standalone unit: by name, as before).
 fn (cx: mut &Cx) overload(ip: mut &Ip, sess: mut &lexdb_exec.Session, sg: Sig, kind: int, a: int, b: int, nameTok: int): Result[Sig, DbErr] {
-    if !sg.found || len(sg.canon) != 4 { return Ok(sg) }
-    var scope = -1
-    for ns in cx.nested { if ns.nest == sg.canon[3] { scope = ns.scope } }
+    if !sg.found || (len(sg.canon) != 4 && len(sg.canon) != 5) { return Ok(sg) }
     var cands: []int = []
-    for k in 0..len(cx.nested) {
-        let ns = &cx.nested[k]
-        if ns.name == sg.canon[2] && ns.scope == scope && (kind == 0 || ns.kind == kind) { append(mut &cands, k) }
+    var prmss: [][]Prm = []
+    if len(sg.canon) == 4 {
+        var scope = -1
+        for ns in cx.nested { if ns.nest == sg.canon[3] { scope = ns.scope } }
+        for k in 0..len(cx.nested) {
+            let ns = &cx.nested[k]
+            if ns.name == sg.canon[2] && ns.scope == scope && (kind == 0 || ns.kind == kind) {
+                append(mut &cands, k)
+                append(mut &prmss, copyPrms(&ns.prms))
+            }
+        }
+    } else {
+        for k in 0..len(cx.sigs) {
+            let e = &cx.sigs[k]
+            if e.ovl > 0 && e.owner == sg.canon[0] && e.pkg == sg.canon[1] && e.name == sg.canon[2] && (kind == 0 || e.kind == kind) &&
+               (e.isPub || (e.pkg == cx.pkg && e.owner == cx.owner)) {
+                append(mut &cands, k)
+                append(mut &prmss, copyPrms(&e.prms))
+            }
+        }
+        // (a call from SQL resolved already: lexdb_plcall's, by its arguments' types there)
+        if len(ip.pin) > 0 && len(cands) > 1 {
+            for k in cands {
+                let e = &cx.sigs[k]
+                if ip.pin == e.owner + "." + e.pkg + "." + e.name + "\x03" + e.ovl.toStr() { return Ok(sigOfEntry(e)) }
+            }
+        }
     }
     if len(cands) <= 1 { return Ok(sg) }
     let rs = cx.splitArgs(a, b)
@@ -853,15 +887,34 @@ fn (cx: mut &Cx) overload(ip: mut &Ip, sess: mut &lexdb_exec.Session, sg: Sig, k
         append(mut &fams, try cx.argFam(ip, sess, s, rs[q + 1]))
         q += 2
     }
+    let pick = pickOf(&prmss, &names2, &fams)
+    let nt = cx.tk(nameTok)
+    if len(pick) != 1 {
+        var at = nameTok
+        while at >= 2 && cx.isO(at - 1, ".") && cx.ident(at - 2) { at -= 2 }
+        let msg = if len(pick) == 0 { "PLS-00306: wrong number or types of arguments in call to '" + nt.up + "'" } else { "PLS-00307: too many declarations of '" + nt.up + "' match this call" }
+        return Err(plErr("ORA06550", &("line " + cx.tk(at).line.toStr() + ", column " + cx.tk(at).col.toStr() + ":\n" + msg + cx.ignored())))
+    }
+    if len(sg.canon) == 5 { return Ok(sigOfEntry(&cx.sigs[cands[pick[0]]])) }
+    let ns = &cx.nested[cands[pick[0]]]
+    return Ok(Sig{found: true, kind: ns.kind, prms: copyPrms(&ns.prms), ret: ns.ret, canon: [cx.owner.clone(), cx.pkg.clone(), ns.name.clone(), ns.nest.clone()]})
+}
+
+fn sigOfEntry(e: &SigEntry): Sig { return Sig{found: true, kind: e.kind, prms: copyPrms(&e.prms), ret: e.ret, canon: canonOf(e)} }
+
+// Oracle's resolution among overloads (each a parameter list) of a call: its arguments' names ("" by position) and type families
+// (0 not known: any parameter takes it). The ones that take each argument in its own family, else the ones that take them by
+// conversion: their indexes (one: the call's; none or more: PLS-00306, PLS-00307).
+fn pickOf(prmss: &[][]Prm, names2: &[]str, fams: &[]int): []int {
     var exact: []int = []
     var conv: []int = []
-    for k in cands {
-        match argMap(&cx.nested[k].prms, &names2) {
+    for k in 0..len(prmss) {
+        match argMap(&prmss[k], names2) {
             Some(m) {
                 var ex = true
                 var cv = true
                 for i in 0..len(m) {
-                    let pf = famOf(&cx.nested[k].prms[m[i]].pt)
+                    let pf = famOf(&prmss[k][m[i]].pt)
                     if fams[i] != 0 && fams[i] != pf {
                         ex = false
                         if !famConv(fams[i], pf) { cv = false }
@@ -872,14 +925,7 @@ fn (cx: mut &Cx) overload(ip: mut &Ip, sess: mut &lexdb_exec.Session, sg: Sig, k
             None {}
         }
     }
-    let pick = if len(exact) > 0 { exact } else { conv }
-    let nt = cx.tk(nameTok)
-    if len(pick) != 1 {
-        let msg = if len(pick) == 0 { "PLS-00306: wrong number or types of arguments in call to '" + nt.up + "'" } else { "PLS-00307: too many declarations of '" + nt.up + "' match this call" }
-        return Err(plErr("ORA06550", &("line " + nt.line.toStr() + ", column " + nt.col.toStr() + ":\n" + msg + cx.ignored())))
-    }
-    let ns = &cx.nested[pick[0]]
-    return Ok(Sig{found: true, kind: ns.kind, prms: copyPrms(&ns.prms), ret: ns.ret, canon: [cx.owner.clone(), cx.pkg.clone(), ns.name.clone(), ns.nest.clone()]})
+    return if len(exact) > 0 { exact } else { conv }
 }
 
 // Whether a bare name is a nested function in scope (which SQL cannot call: PLS-00231).
@@ -945,13 +991,15 @@ fn (pg: &Prog) find(names: &[]str, user: &str): int {
     return pick
 }
 
-// The unit a compile resolved a call to: owner, package ("" none) and name.
+// The unit a compile resolved a call to: owner, package ("" none) and name; a nested subprogram's scope (canon's fourth name),
+// a package member's overload (its fifth: canonOf).
 fn (pg: &Prog) findC(c: &[]str): int {
-    if len(c) != 3 && len(c) != 4 { return -1 }
-    let nest: &str = if len(c) == 4 { &c[3] } else { "" }
+    if len(c) < 3 || len(c) > 5 { return -1 }
+    let nest: &str = if len(c) >= 4 { &c[3] } else { "" }
+    let ovl = if len(c) == 5 { strings.parseIntOpt(&c[4]).unwrapOr(0) } else { 0 }
     for i in 0..len(pg.units) {
         let u = &pg.units[i]
-        if (u.kind == U_PROC || u.kind == U_FUNC) && u.owner == c[0] && u.pkg == c[1] && u.name == c[2] && u.nest == nest { return i }
+        if (u.kind == U_PROC || u.kind == U_FUNC) && u.owner == c[0] && u.pkg == c[1] && u.name == c[2] && u.nest == nest && (ovl == 0 || u.ovl == ovl) { return i }
     }
     return -1
 }
@@ -969,7 +1017,7 @@ fn sigsOf(pg: &Prog): []SigEntry {
     var out: []SigEntry = []
     for u in pg.units {
         if len(u.pkg) == 0 && pg.deniedUnit(&u.owner, &u.name) { continue }
-        if (u.kind == U_PROC || u.kind == U_FUNC) && (u.isPub || len(u.pkg) == 0) && len(u.nest) == 0 { append(mut &out, SigEntry{owner: u.owner.clone(), pkg: u.pkg.clone(), name: u.name.clone(), kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: u.isPub, slot: 0, konst: false}) }
+        if (u.kind == U_PROC || u.kind == U_FUNC) && (u.isPub || len(u.pkg) == 0) && len(u.nest) == 0 { append(mut &out, SigEntry{owner: u.owner.clone(), pkg: u.pkg.clone(), name: u.name.clone(), kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: u.isPub, slot: 0, konst: false, ovl: u.ovl}) }
         for v in u.pubVars { append(mut &out, varSig(&u, &v)) }
     }
     return out
@@ -2919,7 +2967,7 @@ fn newCx(src: &str, toks: []Tok, owner: &str, nls: []str, sigs: []SigEntry, uid:
 fn emptyUnit(): PUnit {
     return PUnit{owner: "", name: "", kind: U_BLOCK, prms: [], defs: [], ret: pt(PK_ANY), retSlot: -1, nslots: 0, slotPt: [], body: node(K_NULL, 0), src: "",
                  bindUse: [], bindSlot: [], nbinds: 0, sid0: 0, sid1: 0, curs: [], bad: "", pkg: "", isPub: true, pkgSlots: [], pubVars: [], nest: "",
-                 nfrom: 0, nto: 0, subs: []}
+                 nfrom: 0, nto: 0, subs: [], ovl: 0}
 }
 
 // The unit cx has compiled, with its tables moved into it.
@@ -4468,7 +4516,7 @@ pub fn ensureProg(pg: mut &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session): Re
         let hdr = compileStored(ip, sess, &s.src, &s.owner, [], true)
         if s.owner != ip.user { sess.backToSchema(&save) }
         match hdr {
-            Ok(u) { append(mut &sigs, SigEntry{owner: u.owner.clone(), pkg: "", name: u.name.clone(), kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: true, slot: 0, konst: false}) }
+            Ok(u) { append(mut &sigs, SigEntry{owner: u.owner.clone(), pkg: "", name: u.name.clone(), kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: true, slot: 0, konst: false, ovl: 0}) }
             Err(_) {}
         }
     }
@@ -4563,16 +4611,16 @@ pub fn revalidate(pg: mut &Prog, ip: mut &Ip, text: &str) {
 
 // A package's public variable as a signature entry.
 fn varSig(u: &PUnit, v: &PubVar): SigEntry {
-    return SigEntry{owner: u.owner.clone(), pkg: u.name.clone(), name: v.name.clone(), kind: U_VAR, prms: [], ret: v.pt, isPub: true, slot: v.slot, konst: v.konst}
+    return SigEntry{owner: u.owner.clone(), pkg: u.name.clone(), name: v.name.clone(), kind: U_VAR, prms: [], ret: v.pt, isPub: true, slot: v.slot, konst: v.konst, ovl: 0}
 }
 
 fn sigOfUnit(u: &PUnit): SigEntry {
-    return SigEntry{owner: u.owner.clone(), pkg: u.pkg.clone(), name: u.name.clone(), kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: u.isPub, slot: 0, konst: false}
+    return SigEntry{owner: u.owner.clone(), pkg: u.pkg.clone(), name: u.name.clone(), kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: u.isPub, slot: 0, konst: false, ovl: u.ovl}
 }
 
 fn cloneSigs(a: &[]SigEntry): []SigEntry {
     var out: []SigEntry = []
-    for x in a { append(mut &out, SigEntry{owner: x.owner.clone(), pkg: x.pkg.clone(), name: x.name.clone(), kind: x.kind, prms: copyPrms(&x.prms), ret: x.ret, isPub: x.isPub, slot: x.slot, konst: x.konst}) }
+    for x in a { append(mut &out, SigEntry{owner: x.owner.clone(), pkg: x.pkg.clone(), name: x.name.clone(), kind: x.kind, prms: copyPrms(&x.prms), ret: x.ret, isPub: x.isPub, slot: x.slot, konst: x.konst, ovl: x.ovl}) }
     return out
 }
 
@@ -4613,6 +4661,17 @@ pub fn sqlError(e: &DbErr): DbErr {
         let dot = strings.indexOf(&rest, ".", 0)
         let sp = strings.indexOf(&rest, " ", 0)
         if dot >= 0 && sp > dot { return ora(6575, &("Package or function " + rest[dot + 1..sp] + " is in an invalid state")) }
+    }
+    // (the call's own arguments fit none or more than one of its declarations: Oracle's SQL says ORA-06553 with PLS-306, PLS-307)
+    if fe.num == 6550 && strings.indexOf(&t, "ORA-06512", 0) < 0 {
+        for pls in ["PLS-00306: ", "PLS-00307: "] {
+            let at = strings.indexOf(&t, &pls, 0)
+            if at >= 0 {
+                var end = strings.indexOf(&t, "\n", at)
+                if end < 0 { end = len(t) }
+                return ora(6553, &("PLS-30" + t[at + 8..at + 9] + ": " + t[at + 11..end]))
+            }
+        }
     }
     let tail = "\nORA-06512: at line 1"
     if strings.endsWith(&t, tail) { t = t[0..len(t) - len(tail)].toStr() }
@@ -4938,15 +4997,98 @@ pub type FnInfo = record { pub id: str; pub ret: lexdb_sql.TypeName; pub oid: in
 // The stored function a call's name means to the user (the parser's: lower case, owner and name joined by a dot or the qualifier's
 // separator); None for a name that is none, or is a procedure, or the user may not run.
 pub fn findFunction(pg: &Prog, ip: &Ip, name: &str): Option[FnInfo] {
-    if len(pg.units) == 0 || len(name) == 0 { return None }
-    var names: []str = []
-    for part in strings.split(&strings.replaceAll(name, lexdb_sql.QSEP, "."), ".") { append(mut &names, lexdb_sql.oraShown(&part)) }
-    let i = pg.find(&names, &ip.user)
+    let i = findIndex(pg, ip, name)
     if i < 0 { return None }
     let u = &pg.units[i]
     if u.kind != U_FUNC || len(u.bad) > 0 { return None }
     let o = oidOf(&u.ret)
     return Some(FnInfo{id: u.owner + "." + (if len(u.pkg) > 0 { u.pkg + "." } else { "" }) + u.name, ret: lexdb_sql.oidType(o), oid: o})
+}
+
+fn findIndex(pg: &Prog, ip: &Ip, name: &str): int {
+    if len(pg.units) == 0 || len(name) == 0 { return -1 }
+    var names: []str = []
+    for part in strings.split(&strings.replaceAll(name, lexdb_sql.QSEP, "."), ".") { append(mut &names, lexdb_sql.oraShown(&part)) }
+    return pg.find(&names, &ip.user)
+}
+
+// The public functions of a package of member pg.units[i]'s name (its overloads; the member alone when it is a standalone unit's).
+fn (pg: &Prog) funcsOf(i: int): []int {
+    let u = &pg.units[i]
+    if len(u.pkg) == 0 { return if u.kind == U_FUNC { [i] } else { [] } }
+    var out: []int = []
+    for k in 0..len(pg.units) {
+        let x = &pg.units[k]
+        if x.kind == U_FUNC && x.isPub && len(x.nest) == 0 && x.owner == u.owner && x.pkg == u.pkg && x.name == u.name { append(mut &out, k) }
+    }
+    return out
+}
+
+// Whether a call's name means a package's overloaded function (lexdb_plcall resolves such a call by its arguments: findFunctionFor).
+pub fn overloaded(pg: &Prog, ip: &Ip, name: &str): bool {
+    let i = findIndex(pg, ip, name)
+    return i >= 0 && len(pg.funcsOf(i)) > 1
+}
+
+// The type family of a SQL expression's described column, as overload resolution takes it (famOf; 0: not known, as NULL's).
+pub fn famOfOut(o: &lexdb_bind.OutCol): int {
+    if o.oid == lexdb_sql.OID_UNKNOWN || o.oid == 0 { return 0 }
+    return famOf(&ptOfOut(o))
+}
+
+// The stored function a call from SQL means by its arguments as well as its name: their names ("" by position; the parser's #named)
+// and type families (famOfOut; 0 not known). A package's overloaded functions are told apart as Oracle's resolution does (pickOf),
+// a standalone function's or a single member's arguments by their number and names. ORA-06553 (PLS-306, PLS-307) where none or more
+// than one fits, as Oracle's SQL says; None as findFunction. The id carries the overload's number ("\x03" and it) when the name is
+// overloaded and the arguments' names ("\x04" and them, by commas) when some are named: callFunction calls that one with them; else
+// it is findFunction's.
+pub fn findFunctionFor(pg: &Prog, ip: &Ip, name: &str, names2: &[]str, fams: &[]int): Result[Option[FnInfo], DbErr] {
+    let i = findIndex(pg, ip, name)
+    if i < 0 { return Ok(None) }
+    let cands = pg.funcsOf(i)
+    if len(cands) == 0 || len(pg.units[i].bad) > 0 { return Ok(None) }
+    var prmss: [][]Prm = []
+    for k in cands { append(mut &prmss, copyPrms(&pg.units[k].prms)) }
+    var pick: []int = []
+    if len(cands) == 1 {
+        if argMap(&prmss[0], names2).isSome() { append(mut &pick, 0) }
+    } else {
+        pick = pickOf(&prmss, names2, fams)
+    }
+    let un = pg.units[cands[0]].name.clone()
+    if len(pick) == 0 { return Err(ora(6553, &("PLS-306: wrong number or types of arguments in call to '" + un + "'"))) }
+    if len(pick) > 1 { return Err(ora(6553, &("PLS-307: too many declarations of '" + un + "' match this call"))) }
+    let u = &pg.units[cands[pick[0]]]
+    if len(u.bad) > 0 { return Ok(None) }
+    var id = u.owner + "." + (if len(u.pkg) > 0 { u.pkg + "." } else { "" }) + u.name
+    if len(cands) > 1 { id = id + "\x03" + u.ovl.toStr() }
+    var named = false
+    for n in names2 { if len(n) > 0 { named = true } }
+    if named { id = id + "\x04" + strings.join(names2, ",") }
+    let o = oidOf(&u.ret)
+    return Ok(Some(FnInfo{id: id, ret: lexdb_sql.oidType(o), oid: o}))
+}
+
+// A function's id (findFunctionFor's): its names (owner, [package,] name), the overload's number (0 none) and the arguments' names.
+type FnId = record { names: []str; ovl: int; args: []str }
+
+fn fnIdOf(id: &str): FnId {
+    var base = id.toStr()
+    var ovl = 0
+    var args: []str = []
+    let an = strings.indexOf(&base, "\x04", 0)
+    if an >= 0 {
+        for a in strings.split(&(base[an + 1..len(base)].toStr()), ",") { append(mut &args, a.toStr()) }
+        base = base[0..an].toStr()
+    }
+    let ov = strings.indexOf(&base, "\x03", 0)
+    if ov >= 0 {
+        ovl = strings.parseIntOpt(&(base[ov + 1..len(base)].toStr())).unwrapOr(0)
+        base = base[0..ov].toStr()
+    }
+    var names: []str = []
+    for part in strings.split(&base, ".") { append(mut &names, part.toStr()) }
+    return FnId{names: names, ovl: ovl, args: args}
 }
 
 // A call's name that means a stored function the user may run but that is stored with compilation errors (or whose dependency went):
@@ -4969,14 +5111,19 @@ pub fn noFrame(): Fr { return Fr{vals: [], oids: [], ret: Val.Null, line: 0, has
 // variables go through the session's copy, and the block's state (cursors, savepoints, depth) is as it was. id: owner.[package.]name.
 pub fn callFunctionIn(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, fr: mut &Fr, id: &str, args: &[]Val): Result[Val, DbErr] {
     var p = node(K_CALL, fr.line)
-    let parts = strings.split(id, ".")
-    if len(parts) == 2 { p.names = [parts[0].toStr(), "", parts[1].toStr()] } else { p.names = [parts[0].toStr(), parts[1].toStr(), parts[2].toStr()] }
-    for a in args {
+    let f = fnIdOf(id)
+    let parts = &f.names
+    if len(parts) == 2 { p.names = [parts[0].clone(), "", parts[1].clone()] } else { p.names = [parts[0].clone(), parts[1].clone(), parts[2].clone()] }
+    if f.ovl > 0 {
+        append(mut &p.names, "")
+        append(mut &p.names, f.ovl.toStr())
+    }
+    for k in 0..len(args) {
         var x = node(K_EXPR, fr.line)
         x.isLit = true
-        x.lit = a.clone()
+        x.lit = args[k].clone()
         append(mut &p.x, x)
-        append(mut &p.names2, "")
+        append(mut &p.names2, if k < len(f.args) { f.args[k].clone() } else { "" })
         append(mut &p.slots, -1)
     }
     return callUnit(pg, ip, sess, u, &p, fr)
@@ -4985,17 +5132,21 @@ pub fn callFunctionIn(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: 
 // A stored function called with these values: its result, or the error it raised.
 pub fn callFunction(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, id: &str, args: &[]Val): Result[Val, DbErr] {
     var binds: []BindIn = [BindIn{name: "R__", v: Val.Null, array: false, cursor: false}]
-    // (the id's names quoted: a function's name is exact, "MixF")
+    // (the id's names quoted: a function's name is exact, "MixF"; an overload's call is to the one resolved: Ip.pin)
+    let f = fnIdOf(id)
     var qid: []str = []
-    for part in strings.split(id, ".") { append(mut &qid, "\"" + part + "\"") }
+    for part in f.names { append(mut &qid, "\"" + part + "\"") }
     var blk = "BEGIN :r__ := " + strings.join(&qid, ".") + "("
     for k in 0..len(args) {
         if k > 0 { blk += ", " }
+        if k < len(f.args) && len(f.args[k]) > 0 { blk += "\"" + f.args[k] + "\" => " }
         blk += ":a" + k.toStr()
         append(mut &binds, BindIn{name: "A" + k.toStr(), v: args[k].clone(), array: false, cursor: false})
     }
     blk += "); END;"
+    let pin = replace(mut &ip.pin, if f.ovl > 0 { strings.join(&f.names, ".") + "\x03" + f.ovl.toStr() } else { "" })
     let res = runBlock(pg, ip, sess, &blk, &binds, false)
+    ip.pin = pin
     match res.err {
         Some(e) { return Err(e.clone()) }
         None {}
@@ -5126,11 +5277,21 @@ fn (cx: mut &Cx) useText(src: &str): Result[Unit, DbErr] {
     return Ok(Unit{})
 }
 
-fn (cx: &Cx) sigIndex(name: &str): int {
+// The package's own signature of a member (its name, kind and parameters' families: a body's member is its specification's, or
+// its own forward declaration's), -1 none.
+fn (cx: &Cx) sigIndex(name: &str, kind: int, prms: &[]Prm): int {
     for i in 0..len(cx.sigs) {
-        if cx.sigs[i].pkg == cx.pkg && cx.sigs[i].owner == cx.owner && cx.sigs[i].name == name { return i }
+        let e = &cx.sigs[i]
+        if e.pkg == cx.pkg && e.owner == cx.owner && e.name == name && e.kind == kind && samePrms(&e.prms, prms) { return i }
     }
     return -1
+}
+
+// The number of a package's next subprogram of a name (SigEntry.ovl): 1 for its first.
+fn (cx: &Cx) nextOvl(name: &str): int {
+    var n = 1
+    for e in cx.sigs { if e.pkg == cx.pkg && e.owner == cx.owner && e.name == name && (e.kind == U_PROC || e.kind == U_FUNC) { n += 1 } }
+    return n
 }
 
 // A procedure or function in a package's text: in the specification a signature; in the body a signature again (a forward
@@ -5145,11 +5306,13 @@ fn (cx: mut &Cx) pkgMember(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[U
     u.owner = cx.owner.clone()
     try cx.header(ip, sess, kind, mut &u)
     u.pkg = cx.pkg.clone()
-    var si = cx.sigIndex(&u.name)
-    let known = si >= 0
+    var si = cx.sigIndex(&u.name, kind, &u.prms)
     if si < 0 {
-        append(mut &cx.sigs, SigEntry{owner: cx.owner.clone(), pkg: cx.pkg.clone(), name: u.name.clone(), kind: kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: cx.specMode, slot: 0, konst: false})
+        append(mut &cx.sigs, SigEntry{owner: cx.owner.clone(), pkg: cx.pkg.clone(), name: u.name.clone(), kind: kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: cx.specMode, slot: 0, konst: false,
+                                      ovl: cx.nextOvl(&u.name)})
+        si = len(cx.sigs) - 1
     }
+    u.ovl = cx.sigs[si].ovl
     if cx.specMode { append(mut &cx.pubs, u.name.clone()) }
     if cx.specMode || cx.isO(cx.pos, ";") {
         try cx.needO(cx.pos, ";")
@@ -5160,8 +5323,7 @@ fn (cx: mut &Cx) pkgMember(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[U
     }
     if !(cx.isK(cx.pos, "IS") || cx.isK(cx.pos, "AS")) { return Err(cx.bad(cx.pos, "IS")) }
     cx.pos += 1
-    var isP = false
-    for x in cx.pubs { if x == u.name { isP = true } }
+    let isP = cx.sigs[si].isPub
     var n = node(K_BLOCK, cx.tk(cx.pos).line)
     let was = cx.stopAtEnd
     cx.stopAtEnd = false
@@ -5288,6 +5450,7 @@ fn cloneUnit(u: &PUnit): PUnit {
     c.nest = u.nest.clone()
     c.nfrom = u.nfrom
     c.nto = u.nto
+    c.ovl = u.ovl
     return c
 }
 
@@ -5315,7 +5478,14 @@ fn (cx: &Cx) pkgHead(body: bool): int {
 
 // A package: its specification and body compiled together; the units: the package itself (its variables and what it does
 // once, first), then each member. Without a body the members are not there.
-fn compilePackage(ip: mut &Ip, sess: mut &lexdb_exec.Session, owner: &str, name: &str, spec: &str, body: &str, sigs: []SigEntry): Result[[]PUnit, DbErr] {
+fn compilePackage(ip: mut &Ip, sess: mut &lexdb_exec.Session, owner: &str, name: &str, spec: &str, body: &str, sigs0: []SigEntry): Result[[]PUnit, DbErr] {
+    // (the package's own procedures and functions are declared by its text: a signature from an earlier compile or version is not theirs)
+    var sigs: []SigEntry = []
+    var all = sigs0
+    for k in 0..len(all) {
+        let mine = all[k].owner == owner && all[k].pkg == name && (all[k].kind == U_PROC || all[k].kind == U_FUNC)
+        if !mine { append(mut &sigs, replace(mut &all[k], varSig(&emptyUnit(), &PubVar{name: "", slot: 0, pt: pt(PK_ANY), konst: false}))) }
+    }
     var cx = newCx(spec, try lex(spec), owner, cloneStrs(&ip.nls), sigs, ip.uid)
     cx.pkg = name.toStr()
     cx.nsid = len(ip.scache)
