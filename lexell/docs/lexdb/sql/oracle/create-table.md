@@ -9,15 +9,15 @@ Creates a table, or a global temporary table, with its columns, defaults and con
 ```
 CREATE [ GLOBAL TEMPORARY ] TABLE [ schema. ] table
     ( column_definition [, column_definition ]... [, table_constraint ]... )
-    [ ON COMMIT { DELETE | PRESERVE } ROWS ]
+    [ ON COMMIT { DELETE | PRESERVE } ROWS ] [ annotations_clause ]
 
-CREATE TABLE [ schema. ] table [ ( column [, column ]... ) ] AS subquery
+CREATE TABLE [ schema. ] table [ ( column [, column ]... ) ] [ annotations_clause ] AS subquery
 
 column_definition:
     column datatype [ DEFAULT [ ON NULL ] expr ]
         [ GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [ ( identity_option ... ) ] ]
         [ GENERATED ALWAYS AS ( expr ) [ VIRTUAL ] ]
-        [ column_constraint ]...
+        [ column_constraint ]... [ annotations_clause ]
 
 column_constraint:
     [ CONSTRAINT name ]
@@ -34,6 +34,9 @@ table_constraint:
 
 constraint_state:
     [ ENABLE | DISABLE ] [ VALIDATE | NOVALIDATE ] [ RELY | NORELY ]
+
+annotations_clause:
+    ANNOTATIONS ( [ ADD [ IF NOT EXISTS ] ] name [ 'value' ] [, ...] )
 ```
 
 ## Arguments
@@ -78,6 +81,10 @@ constraint_state:
 `AS subquery`
 : A table with the subquery's columns and rows (and no rows when the query returns none).
 
+`ANNOTATIONS`
+: Names, with or without a value, kept for the table (after the column list) or a column (the last part of its
+  definition) and shown in `USER_ANNOTATIONS_USAGE`; see [annotations](annotations.md) (example M).
+
 ## Remarks
 
 - Names are folded to upper case unless quoted: `CREATE TABLE "Mixed Case"` keeps its case.
@@ -94,8 +101,9 @@ constraint_state:
 ## Differences from Oracle
 
 - **Not supported (ORA-00900):** `INTERVAL YEAR TO MONTH` and `INTERVAL DAY TO SECOND` columns (the types work in
-  expressions), `INVISIBLE` columns, annotations (`ANNOTATIONS (name 'value')` on a table or a column), `TABLESPACE`, storage clauses such as `PCTFREE`, `PARTITION BY`,
-  `ORGANIZATION INDEX` and `DEFERRABLE`.
+  expressions), `INVISIBLE` columns, `TABLESPACE`, storage clauses such as `PCTFREE`, `PARTITION BY`,
+  `ORGANIZATION INDEX` and `DEFERRABLE`; a column's annotations in `CREATE TABLE ... AS` (Oracle: ORA-11559).
+- A global temporary table's annotations are kept but not listed in `USER_ANNOTATIONS_USAGE`.
 - **Constraint states** (`DISABLE`, `ENABLE`, `NOVALIDATE`) are taken on `CHECK` and foreign key constraints only: on a
   `PRIMARY KEY`, `UNIQUE` or `NOT NULL` they are ORA-00900. `NOT ENFORCED` is ORA-00900 (Oracle 23.26 has none either:
   it gives ORA-02000 or ORA-03075).
@@ -504,8 +512,7 @@ ORA-00900: invalid SQL statement
 ERROR:
 ORA-00900: invalid SQL statement
 
-ERROR:
-ORA-00900: invalid SQL statement
+Table created.
 
 Table created.
 
@@ -594,7 +601,39 @@ SELECT note FROM sa."PLACE";
 (1 row)
 ```
 
+### M. Annotations
+
+`Searchable` and `Audited` are flags, without a value.
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE item (
+  id NUMBER PRIMARY KEY ANNOTATIONS (Display 'Item id'),
+  name VARCHAR2(40) NOT NULL ANNOTATIONS (Display 'Name', Searchable)
+) ANNOTATIONS (Owner 'sales', Audited);
+SELECT column_name, annotation_name, annotation_value FROM user_annotations_usage
+WHERE object_name = 'ITEM' ORDER BY column_name NULLS FIRST, annotation_name;
+CREATE TABLE item2 (id NUMBER ANNOTATIONS (Display 'x') NOT NULL);
+```
+
+```text
+Table created.
+
+COLUMN_NAME ANNOTATION_NAME ANNOTATION_VALUE
+----------- --------------- ----------------
+            AUDITED
+            OWNER           sales
+ID          DISPLAY         Item id
+NAME        DISPLAY         Name
+NAME        SEARCHABLE
+
+5 rows selected.
+
+ERROR:
+ORA-03099: unexpected item NOT in a column definition
+```
+
 ## See also
 
 [ALTER TABLE](alter-table.md), [DROP TABLE](drop-table.md), [INSERT](insert.md), [CREATE INDEX](create-index.md),
-[CREATE SEQUENCE](create-sequence.md)
+[CREATE SEQUENCE](create-sequence.md), [Annotations](annotations.md)
