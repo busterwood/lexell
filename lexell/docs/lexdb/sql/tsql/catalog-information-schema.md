@@ -18,6 +18,8 @@ SELECT ... FROM INFORMATION_SCHEMA.CHECK_CONSTRAINTS
 SELECT ... FROM INFORMATION_SCHEMA.SCHEMATA
 SELECT ... FROM INFORMATION_SCHEMA.SEQUENCES
 SELECT ... FROM INFORMATION_SCHEMA.TABLE_PRIVILEGES
+SELECT ... FROM INFORMATION_SCHEMA.COLUMN_PRIVILEGES
+SELECT ... FROM INFORMATION_SCHEMA.DOMAINS
 SELECT ... FROM INFORMATION_SCHEMA.ROUTINES
 SELECT ... FROM INFORMATION_SCHEMA.PARAMETERS
 SELECT ... FROM INFORMATION_SCHEMA.VIEW_TABLE_USAGE
@@ -66,8 +68,9 @@ PostgreSQL's values, except `SCHEMATA`, `ROUTINES`, `PARAMETERS` and the two `VI
 
 `SCHEMATA`
 : SQL Server's schemas: `dbo`, `guest`, `INFORMATION_SCHEMA`, `sys`, the nine `db_*` role schemas and the schemas made
-  with `CREATE SCHEMA`. Columns `catalog_name`, `schema_name`, `schema_owner` (`dbo` for `dbo` and for every schema made
-  with `CREATE SCHEMA`; each fixed schema is its own owner), `default_character_set_catalog`,
+  with `CREATE SCHEMA`. Columns `catalog_name`, `schema_name`, `schema_owner` (the owner of a schema made `CREATE SCHEMA
+  s AUTHORIZATION x`, `x`; `dbo` for `dbo` and for a schema made without `AUTHORIZATION`; each fixed schema is its own
+  owner), `default_character_set_catalog`,
   `default_character_set_schema`, `default_character_set_name` (`iso_1`), `sql_path`.
 
 `SEQUENCES`
@@ -76,6 +79,10 @@ PostgreSQL's values, except `SCHEMATA`, `ROUTINES`, `PARAMETERS` and the two `VI
 
 `TABLE_PRIVILEGES`
 : `grantor`, `grantee`, `table_schema`, `table_name`, `privilege_type`, `is_grantable`.
+
+`COLUMN_PRIVILEGES`, `DOMAINS`
+: No rows: lexdb grants on whole tables, never on columns, and `DOMAINS` does not list its table types, and it has
+  no alias types (`CREATE TYPE ... FROM`). The views exist so that tools that read them work. Their columns are PostgreSQL's, in lower case (see below).
 
 `ROUTINES`, `PARAMETERS`
 : The T-SQL procedures and functions (those made in this door; the PostgreSQL door's functions are listed by its own
@@ -106,11 +113,12 @@ PostgreSQL's values, except `SCHEMATA`, `ROUTINES`, `PARAMETERS` and the two `VI
   (see [constraints](catalog-constraints.md) for where it differs).
 - The schema columns (`table_schema`, `constraint_schema`, `routine_schema`, `schema_name` ...) show `dbo` where
   lexdb's schema is `public`, as `sys.schemas` does.
-- `SCHEMATA` shows `dbo` as the owner of a schema made `CREATE SCHEMA s AUTHORIZATION x` (SQL Server: `x`). The
-  catalog name is `lexdb` (SQL Server: the database's name), and the column names are in lower case (SQL Server:
-  upper case).
+- `SCHEMATA`'s catalog name is `lexdb` (SQL Server: the database's name), and the column names are in lower case (SQL
+  Server: upper case).
 - Constraint names are lexdb's, `table_pkey`, `table_column_fkey`, and `view_definition` is the text of the query.
-- `COLUMN_PRIVILEGES` and `DOMAINS` do not exist (error 208).
+- `COLUMN_PRIVILEGES` and `DOMAINS` have no rows and PostgreSQL's columns in lower case. SQL Server's `DOMAINS` has 17
+  columns (`DOMAIN_CATALOG` to `DOMAIN_DEFAULT`), lexdb's 27 (PostgreSQL's), and it lists table types
+  (`CREATE TYPE ... AS TABLE`, `data_type` `table type`) and alias types, which lexdb's does not.
 - The view `INFORMATION_SCHEMA.TABLES` has the extra PostgreSQL columns (`self_referencing_column_name`,
   `commit_action`, ...).
 
@@ -285,9 +293,15 @@ sq            bigint    5           1         NO
 
 ### F. Schemas
 
+A schema made `AUTHORIZATION` a role or user is owned by it.
+
 <!-- example: tsql -->
 ```sql
-SELECT schema_name, schema_owner FROM INFORMATION_SCHEMA.SCHEMATA WHERE schema_name IN ('dbo', 'hr') ORDER BY schema_name;
+CREATE ROLE clerk;
+GO
+CREATE SCHEMA ops AUTHORIZATION clerk;
+GO
+SELECT schema_name, schema_owner FROM INFORMATION_SCHEMA.SCHEMATA WHERE schema_name IN ('dbo', 'hr', 'ops') ORDER BY schema_name;
 ```
 
 ```text
@@ -295,8 +309,9 @@ schema_name schema_owner
 ----------- ------------
 dbo         dbo
 hr          dbo
+ops         clerk
 
-(2 rows affected)
+(3 rows affected)
 ```
 
 ### G. Procedures and functions
@@ -371,20 +386,28 @@ emp        dept_id     emp_dept_id_fkey
 (1 row affected)
 ```
 
-### I. Views that do not exist
+### I. Views without rows
+
+This database has a table type (`hr.idl`), which SQL Server's `DOMAINS` would list.
 
 <!-- example: tsql -->
 ```sql
-SELECT * FROM INFORMATION_SCHEMA.DOMAINS;
+SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.DOMAINS;
 GO
 SELECT * FROM INFORMATION_SCHEMA.COLUMN_PRIVILEGES;
 ```
 
 ```text
-Msg 208, Level 16, State 1, Line 1
-Invalid object name 'information_schema.domains'.
-Msg 208, Level 16, State 1, Line 1
-Invalid object name 'information_schema.column_privileges'.
+n
+-
+0
+
+(1 row affected)
+
+grantor grantee table_catalog table_schema table_name column_name privilege_type is_grantable
+------- ------- ------------- ------------ ---------- ----------- -------------- ------------
+
+(0 rows affected)
 ```
 
 ## See also

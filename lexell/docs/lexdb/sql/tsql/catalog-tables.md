@@ -27,8 +27,9 @@ Each view has the columns of SQL Server 2022. The columns named below are the on
 others are 0, NULL or a fixed value (for example `is_replicated` is 0).
 
 `sys.schemas`
-: `name`, `schema_id`, `principal_id`. The schemas of the database, the system ones (`sys`, `INFORMATION_SCHEMA`,
-  `guest` and the fixed role names) included.
+: `name`, `schema_id`, `principal_id` (the owner's: that of `dbo` for `dbo` and for a schema made without
+  `AUTHORIZATION`). The schemas of the database, the system ones (`sys`, `INFORMATION_SCHEMA`, `guest` and the fixed
+  role names) included.
 
 `sys.objects`, `sys.all_objects`
 : One row per table, view, procedure, function, sequence, constraint, table type and index-owning object:

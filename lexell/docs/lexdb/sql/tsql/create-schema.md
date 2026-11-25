@@ -19,7 +19,8 @@ CREATE SCHEMA schema_name
 ## Remarks
 
 - The default schema is `dbo`; names without a schema are looked up there.
-- `sys.schemas` and `INFORMATION_SCHEMA.SCHEMATA` list the schemas.
+- `sys.schemas` and `INFORMATION_SCHEMA.SCHEMATA` list the schemas, with the owner of a schema made `AUTHORIZATION x`
+  (`principal_id`, `schema_owner`); `dbo` owns the others.
 - `CREATE SCHEMA` is transactional.
 - To drop a schema, use [DROP SCHEMA](drop-schema.md).
 
