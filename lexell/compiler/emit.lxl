@@ -147,7 +147,7 @@ fn (e: mut &Emitter) ctype(t: int): str {
     if k == sema.TK_PRIM { return ck.CTYPES[t].clone() }
     if k == sema.TK_ARR { return "lxl_arr" }
     if k == sema.TK_REF {
-        if e.c.pg.ta(t) == sema.T_STR && !e.c.pg.tm(t) { return "lxl_str" }     // a shared &str: the header, uncounted
+        if !e.c.pg.tm(t) && e.c.pg.isRefByVal(e.c.pg.ta(t)) { return e.ctype(e.c.pg.ta(t)) }
         return e.ctype(e.c.pg.ta(t)) + "*"
     }
     if k == sema.TK_SLICE { return "lxl_slice" }
@@ -313,7 +313,7 @@ fn (e: mut &Emitter) cloneC(t: int, cc: int): int {
             var ta: []int = []
             for tp in e.c.pg.fns[f].tps { append(mut &ta, envGet(&bind, tp)) }
             let fname = e.instance(f, e.c.pg.mkFn(&ta, sema.T_VOID))
-            let arg = if e.c.pg.fns[f].recvMode == sema.RM_VAL { e.dupC(t, cc) } else { e.c.x.pre("&", cc) }
+            let arg = if e.c.pg.fns[f].recvMode == sema.RM_VAL { e.dupC(t, cc) } else { e.refC(t, cc) }
             return e.call(&fname, [arg])
         }
     }
@@ -428,9 +428,9 @@ fn (e: mut &Emitter) globalAccessor(g: int, t: int, cn: &str, m: int, name: &str
 // ---- derived methods (design/consistency.md, finding 4): eq, hash and toStr glue for a record or
 // closed type without its own, each taking pointers to the values (&Self).
 
-// The C of &x for a value x of type t (a &str is the string itself).
+// The C of &x for a value x of type t (str and boxed records/closed types pass by value).
 fn (e: mut &Emitter) refC(t: int, x: int): int {
-    return if t == sema.T_STR { x } else { e.c.x.par(e.c.x.pre("&", x)) }
+    return if e.c.pg.isRefByVal(t) { x } else { e.c.x.par(e.c.x.pre("&", x)) }
 }
 
 // A call of t's method name (declared, or derived) on the value x, with the &Self argument y.
@@ -452,7 +452,7 @@ fn (e: mut &Emitter) methodC(t: int, name: &str, x: int, y: int): int {
 // The fields of t's record, or of variant v of its closed type, as places of the value at pointer p.
 fn (e: mut &Emitter) derivedFields(t: int, d: int, v: int, p: int): []int {
     let boxed = !e.c.pg.types[d].value
-    let base = e.c.x.par(e.c.x.pre("*", p))
+    let base = if boxed { p } else { e.c.x.par(e.c.x.pre("*", p)) }
     var out: []int = []
     let names = e.fieldNames(d, v)
     if v < 0 {
@@ -481,7 +481,7 @@ fn (e: mut &Emitter) derivedTypes(t: int, d: int, v: int): []int {
 }
 
 fn (e: mut &Emitter) tagC(t: int, boxed: bool, p: int): int {
-    let base = e.c.x.par(e.c.x.pre("*", p))
+    let base = if boxed { p } else { e.c.x.par(e.c.x.pre("*", p)) }
     return e.tagX(t, base, if boxed { "->" } else { "." })
 }
 
@@ -1291,10 +1291,10 @@ fn (e: mut &Emitter) hole(i: int, holes: &[]ck.Hole, env: &[]int, name: &str, re
     if k == ck.H_ADDR || k == ck.H_DEREF || k == ck.H_SHARE {
         let t = e.c.pg.subst(h.t, env)
         e.fill(h.x, holes, env, name, res)
-        let isStr = t == sema.T_STR
-        if k == ck.H_ADDR { return if isStr { e.c.x.par(h.x) } else { e.c.x.par(e.c.x.pre("&", h.x)) } }
-        if k == ck.H_DEREF { return if isStr { e.c.x.par(h.x) } else { e.c.x.par(e.c.x.pre("*", h.x)) } }
-        return if isStr { e.c.x.par(e.c.x.pre("*", h.x)) } else { e.c.x.par(h.x) }
+        let byVal = e.c.pg.isRefByVal(t)
+        if k == ck.H_ADDR { return if byVal { e.c.x.par(h.x) } else { e.c.x.par(e.c.x.pre("&", h.x)) } }
+        if k == ck.H_DEREF { return if byVal { e.c.x.par(h.x) } else { e.c.x.par(e.c.x.pre("*", h.x)) } }
+        return if byVal { e.c.x.par(e.c.x.pre("*", h.x)) } else { e.c.x.par(h.x) }
     }
     if k == ck.H_FN {
         let f = e.instance(h.f, e.c.pg.subst(h.t, env))
@@ -1331,7 +1331,7 @@ fn (e: mut &Emitter) hole(i: int, holes: &[]ck.Hole, env: &[]int, name: &str, re
         for tp in e.c.pg.fns[f].tps { append(mut &ta, envGet(&bind, tp)) }
         let fname = e.instance(f, e.c.pg.mkFn(&ta, sema.T_VOID))
         let recv = if e.c.pg.fns[f].recvMode == sema.RM_VAL {
-            e.dupC(u, if u == sema.T_STR { rv } else { e.c.x.par(e.c.x.pre("*", rv)) })
+            e.dupC(u, if e.c.pg.isRefByVal(u) { rv } else { e.c.x.par(e.c.x.pre("*", rv)) })
         } else { rv }
         var args: []int = [recv]
         for a in bargs { append(mut &args, a) }
@@ -1341,7 +1341,7 @@ fn (e: mut &Emitter) hole(i: int, holes: &[]ck.Hole, env: &[]int, name: &str, re
         // design/owned-str.md: the built-in clone (sema.builtinClone)
         e.fill(h.r, holes, env, name, res)
         if h.f == sema.RM_VAL { return h.r }
-        return e.cloneC(t, if t == sema.T_STR { e.c.x.par(h.r) } else { e.c.x.par(e.c.x.pre("*", h.r)) })
+        return e.cloneC(t, if e.c.pg.isRefByVal(t) { e.c.x.par(h.r) } else { e.c.x.par(e.c.x.pre("*", h.r)) })
     }
     if k == ck.H_IMETH && (h.s == "eq" || h.s == "hash" || h.s == "toStr") && e.c.pg.methodOf(t, h.s) < 0 &&
             e.c.pg.derivable(t, h.s) {
@@ -1365,7 +1365,7 @@ fn (e: mut &Emitter) hole(i: int, holes: &[]ck.Hole, env: &[]int, name: &str, re
     e.fill(h.r, holes, env, name, res)
     var recv = h.r
     if h.f == sema.RM_REF && e.c.pg.fns[f].recvMode == sema.RM_VAL {
-        recv = e.dupC(t, if t == sema.T_STR { e.c.x.par(h.r) } else { e.c.x.par(e.c.x.pre("*", h.r)) })
+        recv = e.dupC(t, if e.c.pg.isRefByVal(t) { e.c.x.par(h.r) } else { e.c.x.par(e.c.x.pre("*", h.r)) })
     }
     var args: []int = [recv]
     for a in h.args {

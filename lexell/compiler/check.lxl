@@ -494,24 +494,25 @@ fn (c: mut &Checker) T(t: int): int {
 // A C type of the runtime by name.
 fn (c: mut &Checker) ct(s: &str): int { return c.x.ct(s) }
 
-// The C of a shared borrow of the place x (an lvalue) of type t: &x, or x itself for a str (a
-// shared &str is the header, uncounted), or a hole when t mentions type parameters.
+// The C of a shared borrow of the place x (an lvalue) of type t: &x, or x itself for a type
+// passed by value as a shared borrow (str: the header; a boxed record or closed type: its heap
+// pointer S*), or a hole when t mentions type parameters.
 fn (c: mut &Checker) addrOf(t: int, x: int): int {
-    if t == sema.T_STR { return x }
+    if c.pg.isRefByVal(t) { return x }
     if c.pg.tk(t) == sema.TK_TP { return c.hole(mkHoleX(H_ADDR, t, x)) }
     return c.x.par(c.x.pre("&", x))
 }
 
 // The C of the place a shared borrow x of a t points to.
 fn (c: mut &Checker) derefOf(t: int, x: int): int {
-    if t == sema.T_STR { return x }
+    if c.pg.isRefByVal(t) { return x }
     if c.pg.tk(t) == sema.TK_TP { return c.hole(mkHoleX(H_DEREF, t, x)) }
     return c.x.par(c.x.pre("*", x))
 }
 
 // The C of a mut &t borrow x used as a shared &t.
 fn (c: mut &Checker) shareOf(t: int, x: int): int {
-    if t == sema.T_STR { return c.x.par(c.x.pre("*", x)) }
+    if c.pg.isRefByVal(t) { return c.x.par(c.x.pre("*", x)) }
     if c.pg.tk(t) == sema.TK_TP { return c.hole(mkHoleX(H_SHARE, t, x)) }
     return x
 }
@@ -1884,7 +1885,7 @@ fn (c: mut &Checker) seq(v: Val): Val {
     if !c.checks(v.c) { return v }
     let k = c.pg.tk(v.t)
     if k == sema.TK_REF || k == sema.TK_SLICE || (v.cat == CAT_PLACE && !c.isCopy(v.t)) {
-        let x = if v.cat != CAT_PLACE { v.c } else { c.x.pre("&", v.c) }
+        let x = if v.cat != CAT_PLACE { v.c } else { c.addrOf(v.t, v.c) }
         c.emitx(c.x.cast(c.ct("void"), c.x.par(x)))
         return v
     }
@@ -3123,8 +3124,13 @@ fn (c: mut &Checker) sMatch(s: int, mx: bool) {
         if p.gk >= 0 { p = c.holdtmp(c.dup(p.c, p.t), p.t) }
         let sp = c.fresh("sp")
         let ct = c.T(base)
-        c.emit(c.x.decl(c.x.ptr(ct), &sp, c.x.pre("&", p.c)))
-        acc = c.x.par(c.x.pre("*", c.nm(&sp)))
+        if !c.pg.types[d].value {
+            c.emit(c.x.decl(ct, &sp, p.c))
+            acc = c.nm(&sp)
+        } else {
+            c.emit(c.x.decl(c.x.ptr(ct), &sp, c.x.pre("&", p.c)))
+            acc = c.x.par(c.x.pre("*", c.nm(&sp)))
+        }
         root = p.root
         pcr = p.cr
     } else {
@@ -5999,7 +6005,9 @@ fn (c: mut &Checker) slotType(pt: int, at: int): int {
     let k = c.pg.tk(pt)
     if at == sema.T_STR || pt == sema.T_STR { return c.ct("const char*") }
     if k == sema.TK_SLICE || (k == sema.TK_REF && c.pg.tk(c.pg.ta(pt)) == sema.TK_ARR) { return c.ct("void*") }
-    if k == sema.TK_REF { return c.x.ptr(c.T(c.pg.ta(pt))) }
+    if k == sema.TK_REF {
+        return if !c.pg.tm(pt) && c.pg.isRefByVal(c.pg.ta(pt)) { c.T(c.pg.ta(pt)) } else { c.x.ptr(c.T(c.pg.ta(pt))) }
+    }
     return c.T(pt)
 }
 
@@ -6455,7 +6463,7 @@ fn (c: mut &Checker) globalWith(g: int, st: St, gnode: int, e: int): Val {
     c.emit(c.x.if1(open, c.x.sx(c.x.call("rt_trap", [c.lit(13), c.x.str(&("with on global " + gname + ", whose with is open")), W]))))
     c.emit(c.x.sx(c.x.asg(open, c.lit(1))))
     let ft = c.T(c.pg.mkFn(&[sema.T_PTR, c.pg.mkRef(gt, true)], sema.T_VOID))
-    c.emit(c.x.sx(c.x.callx(c.x.pcast(ft, c.x.dot(c.x.par(fv.c), "fn")), [c.x.dot(c.x.par(fv.c), "env"), c.addrOf(gt, place.c)])))
+    c.emit(c.x.sx(c.x.callx(c.x.pcast(ft, c.x.dot(c.x.par(fv.c), "fn")), [c.x.dot(c.x.par(fv.c), "env"), c.x.par(c.x.pre("&", place.c))])))
     c.emit(c.x.sx(c.x.asg(open, c.lit(0))))
     return voidVal(false)
 }
