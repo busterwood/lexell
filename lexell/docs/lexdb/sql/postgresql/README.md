@@ -39,6 +39,7 @@ This index lists everything the door takes today. Pages not written yet are list
 | [CREATE INDEX](create-index.md) | B-tree indexes, unique, on expressions, partial, `CONCURRENTLY`. |
 | [ALTER INDEX](alter-index.md), [DROP INDEX](drop-index.md) | Rename; drop. |
 | [CREATE VIEW](create-view.md), [ALTER VIEW](alter-view.md), [DROP VIEW](drop-view.md) | Views (read-only). |
+| [CREATE MATERIALIZED VIEW](create-materialized-view.md) | `REFRESH [CONCURRENTLY]`, `WITH [NO] DATA`, `ALTER` / `DROP MATERIALIZED VIEW`, incremental `FAST ON COMMIT` / `ON STATEMENT`, `pg_matviews`. |
 | [CREATE SEQUENCE](create-sequence.md), [ALTER SEQUENCE](alter-sequence.md), [DROP SEQUENCE](drop-sequence.md) | Sequences. |
 | [CREATE SCHEMA](create-schema.md), [ALTER SCHEMA](alter-schema.md), [DROP SCHEMA](drop-schema.md) | Schemas. |
 | [CREATE TYPE](create-type.md), [ALTER TYPE](alter-type.md), [DROP TYPE](drop-type.md) | Enum types. |
@@ -80,7 +81,7 @@ This index lists everything the door takes today. Pages not written yet are list
 
 `COMMENT ON` (a syntax error; `obj_description` gives nothing), `DO`, PL/pgSQL (functions in any language but `sql`:
 42704), triggers, `LOCK TABLE`, SQL-level `PREPARE` and `EXECUTE` (the protocol's prepared statements work), cursors
-(`DECLARE`, `FETCH`), `LISTEN`/`NOTIFY`, materialized views, domains, extensions, `CREATE DATABASE`.
+(`DECLARE`, `FETCH`), `LISTEN`/`NOTIFY`, domains, extensions, `CREATE DATABASE`.
 
 ## Data types
 

@@ -38,6 +38,7 @@ Oracle. Each page names what lexdb lacks or does differently.
 | [DROP TABLE](drop-table.md) | `CASCADE CONSTRAINTS`, `PURGE`. |
 | [CREATE INDEX](create-index.md), [DROP INDEX](drop-index.md) | Unique and function-based indexes; `ALTER INDEX ... RENAME` and `ANNOTATIONS` (`REBUILD` and the like are accepted). |
 | [CREATE VIEW](create-view.md), [DROP VIEW](drop-view.md) | `OR REPLACE`; views are read-only and may call stored functions; `ALTER VIEW ... COMPILE`. |
+| [CREATE MATERIALIZED VIEW](create-materialized-view.md) | `BUILD IMMEDIATE`/`DEFERRED`, `REFRESH FAST`/`COMPLETE`/`FORCE` `ON DEMAND`/`COMMIT`/`STATEMENT`, `MATERIALIZED VIEW LOG`, `DBMS_MVIEW.REFRESH`, `*_MVIEWS`. |
 | [CREATE SEQUENCE](create-sequence.md), [ALTER SEQUENCE](alter-sequence.md), [DROP SEQUENCE](drop-sequence.md) | `NEXTVAL`, `CURRVAL`. |
 | [RENAME](rename.md) | Tables, views, sequences. |
 | [COMMENT ON](comment-on.md) | Accepted; comments are not kept. |
@@ -73,8 +74,8 @@ Oracle. Each page names what lexdb lacks or does differently.
 
 ### Not in this door
 
-`INSERT ALL` / `INSERT FIRST`, triggers, synonyms (other than the dictionary's), database links, materialized
-views, `LOCK TABLE` outside PL/SQL, `FLASHBACK`, `PURGE`, `AUDIT`, `EXPLAIN PLAN`, object types, collections.
+`INSERT ALL` / `INSERT FIRST`, triggers, synonyms (other than the dictionary's), database links, `LOCK TABLE` outside
+PL/SQL, `FLASHBACK`, `PURGE`, `AUDIT`, `EXPLAIN PLAN`, object types, collections.
 
 ## PL/SQL
 

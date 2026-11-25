@@ -45,8 +45,8 @@ CREATE [ OR REPLACE ] [ TEMP | TEMPORARY ] VIEW name [ ( column_name [, ...] ) ]
 - Views are not updatable: PostgreSQL updates a simple view's table, and lexdb refuses (`cannot update view "v"
   (lexdb's views are read-only)`) (lexdb-gaps.md 2.2).
 - The definition is shown as written; PostgreSQL shows its own rewritten form (`SELECT emp.id, emp.name FROM emp`).
-- Not supported: `CREATE RECURSIVE VIEW` (42601), `WITH ( view_option )` and `WITH CHECK OPTION` (0A000), and
-  materialized views (0A000).
+- Not supported: `CREATE RECURSIVE VIEW` (42601), `WITH ( view_option )` and `WITH CHECK OPTION` (0A000).
+- For materialized views, see [CREATE MATERIALIZED VIEW](create-materialized-view.md).
 - `CREATE OR REPLACE VIEW` that renames a column gives `cannot drop columns from view`; PostgreSQL says `cannot
   change name of view column`.
 

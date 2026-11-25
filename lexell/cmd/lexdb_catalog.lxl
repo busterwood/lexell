@@ -151,6 +151,8 @@ pub type CatSnap = record {
     pub routines: []Routine     // stored procedures and functions (package F)
     pub graphs: []str           // Oracle's property graphs, their catalog rows (lexdb_graph decodes them)
     pub asserts: []str          // Oracle's assertions, their catalog rows (lexdb_assert decodes them)
+    pub mviews: []str           // materialized views, their catalog rows (lexdb_mview decodes them)
+    pub mvlogs: []str           // Oracle materialized view logs, their catalog rows (lexdb_mview decodes them)
 }
 
 // The assertions' catalog rows (lexdb_assert: O23): ASSERT_PRE and the assertion's key. A table an assertion reads names it
@@ -158,6 +160,19 @@ pub type CatSnap = record {
 // foreign keys reference it.
 pub const ASSERT_PRE = "\x02assert\x00"
 pub const ASSERT_END = "\x02assert\x01"
+
+// The materialized views' catalog rows (lexdb_mview): MV_PRE and the MV's key; a subscribed base table names MV_PRE + key
+// in its refBy. Oracle's materialized view logs live under MVLOG_PRE + table key.
+pub const MV_PRE = "\x02mview\x00"
+pub const MV_END = "\x02mview\x01"
+pub const MVLOG_PRE = "\x02mvlog\x00"
+pub const MVLOG_END = "\x02mvlog\x01"
+
+// Hidden state columns on materialized view backing tables: all contain "\x00rowid" so hiddenName() hides them from SELECT *.
+pub const MV_GK = "\x00rowid_mvgk"
+pub const MV_CNT = "\x00rowid_mvcnt"
+pub const MV_NN = "\x00rowid_mvnn_"
+pub const MV_SUM = "\x00rowid_mvsum_"
 
 // The property graphs' catalog rows (lexdb_graph: O22): GRAPH_PRE and the graph's key.
 pub const GRAPH_PRE = "\x02pgraph\x00"
@@ -233,6 +248,9 @@ pub fn colNum(t: &Table, name: &str): int {
 
 // Whether a table's primary key is lexdb's hidden rowid.
 pub fn rowidKeyed(t: &Table): bool { return len(t.pk) == 1 && t.pk[0] < len(t.cols) && t.cols[t.pk[0]].name == ROWID }
+
+// Whether a table's primary key is any hidden column (ROWID or materialized view hidden key).
+pub fn hiddenKeyed(t: &Table): bool { return len(t.pk) == 1 && t.pk[0] < len(t.cols) && hiddenName(&t.cols[t.pk[0]].name) }
 
 // Copies of an array (the catalog keeps its own).
 pub fn copyInts(xs: &[]int): []int {
@@ -757,7 +775,7 @@ pub fn clusteredOf(t: &Table): str {
 pub fn pkConName(t: &Table): str { return if len(t.pkName) > 0 { t.pkName.clone() } else { lexdb_sql.baseName(&t.name) + "_pkey" } }
 
 // Whether t has a primary key of its own (not the hidden one, 9.88).
-pub fn hasPk(t: &Table): bool { return len(t.pk) > 0 && !rowidKeyed(t) }
+pub fn hasPk(t: &Table): bool { return len(t.pk) > 0 && !hiddenKeyed(t) }
 
 // A name as stored (its spelling, L6) made a column: its name folded, its
 // spelling kept if that differs.
@@ -1664,9 +1682,19 @@ pub fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, parseExpr: &fn
         append(mut &asserts, en.val.clone())
         return true
     })
+    var mviews: []str = []
+    try st.scan(txn, CATALOG, MV_PRE, MV_END, fn(en: &lexdb_store.Entry): bool {
+        append(mut &mviews, en.val.clone())
+        return true
+    })
+    var mvlogs: []str = []
+    try st.scan(txn, CATALOG, MVLOG_PRE, MVLOG_END, fn(en: &lexdb_store.Entry): bool {
+        append(mut &mvlogs, en.val.clone())
+        return true
+    })
     var snap = CatSnap{acls: newMap(), tabs: [], views: [], cons: [], nns: [], seqs: seqs, schemas: schemas, path: copyStrs(&txn.sql.path),
                        user: st.memo.get(&userKey(txn.sql.sess)).unwrapOr("lexdb"), enums: try allEnums(st, txn), procs: procs,
-                       ttypes: try allTabTypes(st, txn), routines: try allRoutines(st, txn), graphs: graphs, asserts: asserts}
+                       ttypes: try allTabTypes(st, txn), routines: try allRoutines(st, txn), graphs: graphs, asserts: asserts, mviews: mviews, mvlogs: mvlogs}
     var aclKeys: []str = []
     var aclVals: []str = []
     try catScan(st, txn, &ACL_PRE, &(ACL_PRE + "\xff"), &(ACL_PRE + "r:"), fn(en: &lexdb_store.Entry): bool {
@@ -1691,7 +1719,7 @@ pub fn catSnap(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, parseExpr: &fn
             continue
         }
         var idxs: []CatIdx = []
-        if len(t.pk) > 0 && !rowidKeyed(&t) {
+        if len(t.pk) > 0 && !hiddenKeyed(&t) {
             var cs: []int = []
             for p in t.pk { append(mut &cs, p + 1) }
             let pn = pkConName(&t)

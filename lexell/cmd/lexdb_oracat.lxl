@@ -26,6 +26,7 @@ import "./lexdb_sql"
 import "./lexdb_annot"
 import "./lexdb_graph"
 import "./lexdb_assert"
+import "./lexdb_mview"
 import "./lexdb_parse"
 import "./lexdb_routine"
 import "./lexdb_oratext"
@@ -184,7 +185,7 @@ pub fn isBuilt(base: &str): bool {
         "TABLES", "TAB_COLUMNS", "TAB_COLS", "INDEXES", "IND_COLUMNS", "IND_EXPRESSIONS", "CONSTRAINTS", "CONS_COLUMNS", "OBJECTS", "SEQUENCES",
         "VIEWS", "TAB_COMMENTS", "COL_COMMENTS", "TAB_IDENTITY_COLS", "CATALOG", "SOURCE", "PROCEDURES", "ERRORS", "ANNOTATIONS_USAGE", "ANNOTATIONS",
         "ANNOTATION_VALUES", "PROPERTY_GRAPHS", "PG_ELEMENTS", "PG_LABELS", "PG_ELEMENT_LABELS", "PG_LABEL_PROPERTIES", "PG_PROP_DEFINITIONS",
-        "PG_KEYS", "PG_EDGE_RELATIONSHIPS", "PG_COMMENTS", "ASSERTIONS", "ASSERTION_DEPENDENCIES" { return true }
+        "PG_KEYS", "PG_EDGE_RELATIONSHIPS", "PG_COMMENTS", "ASSERTIONS", "ASSERTION_DEPENDENCIES", "MVIEWS", "MVIEW_LOGS" { return true }
         else { return false }
     }
 }
@@ -526,7 +527,7 @@ fn oraColRows(out: mut &[]OraPend, ct: &CatTab, user: &str, view: bool) {
     var n = 0
     for i in 0..len(ct.t.cols) {
         let c = &ct.t.cols[i]
-        if c.name == ROWID { continue }
+        if lexdb_catalog.hiddenName(&c.name) { continue }
         n += 1
         var nn = c.notNull
         for k in ct.t.pk { if k == i { nn = true } }
@@ -580,7 +581,7 @@ fn oraCommentRows(out: mut &[]OraPend, ct: &CatTab, user: &str, tableLevel: bool
         return
     }
     for c in ct.t.cols {
-        if c.name == ROWID { continue }
+        if lexdb_catalog.hiddenName(&c.name) { continue }
         var p = oraPend(&owner, &"")
         p.s("TABLE_NAME", &oraTabName(ct))
         p.s("COLUMN_NAME", &oraColName(&c))
@@ -912,6 +913,11 @@ fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role, verrs: &Map[str, DbErr])
             var p = oraPend(&owner, &"TABLE")
             oraObject(mut &p, &oraTabName(&ct), ct.oid, &"TABLE", false)
             append(mut &out, p)
+            if lexdb_mview.findInSnap(&snap.mviews, &ct.key).isSome() {
+                var mp = oraPend(&owner, &"TABLE")
+                oraObject(mut &mp, &oraTabName(&ct), lexdb_sql.nameOid("mv", &ct.key), &"MATERIALIZED VIEW", false)
+                append(mut &out, mp)
+            }
             for ix in ct.idxs {
                 var q = oraPend(&owner, &"INDEX")
                 oraObject(mut &q, &oraIdxName(&ix), ix.oid, &"INDEX", oraGenIdx(&ct, &ix))
@@ -1172,11 +1178,66 @@ fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role, verrs: &Map[str, DbErr])
         }
         return out
     }
+    if base == "MVIEWS" {
+        for mv in lexdb_mview.listAll(&snap.mviews) {
+            let sc = lexdb_sql.schemaOf(&mv.key)
+            if lexdb_base.isTempSchema(&sc) { continue }
+            let owner = oraOwner(&sc, &user)
+            let nm = oraUp(&lexdb_sql.baseName(&mv.key))
+            var p = oraPend(&owner, &"")
+            p.s("OWNER", &owner)
+            p.s("MVIEW_NAME", &nm)
+            p.s("CONTAINER_NAME", &nm)
+            p.s("QUERY", &mv.query)
+            p.i("QUERY_LEN", len(mv.query))
+            p.s("UPDATABLE", "N")
+            p.s("REWRITE_ENABLED", if mv.rewrite { "Y" } else { "N" })
+            p.s("REWRITE_CAPABILITY", if mv.rewrite { "GENERAL" } else { "NONE" })
+            p.s("REFRESH_MODE", &lexdb_mview.refreshModeText(mv.timing))
+            p.s("REFRESH_METHOD", &lexdb_mview.refreshMethodText(mv.mode))
+            p.s("BUILD_MODE", if mv.populated { "IMMEDIATE" } else { "DEFERRED" })
+            p.s("FAST_REFRESHABLE", &lexdb_mview.fastRefreshableText(&mv))
+            p.s("LAST_REFRESH_TYPE", &mv.lastType)
+            p.s("STALENESS", &lexdb_mview.stalenessText(&mv))
+            p.s("AFTER_FAST_REFRESH", &lexdb_mview.stalenessText(&mv))
+            p.s("COMPILE_STATE", "VALID")
+            p.s("USE_NO_INDEX", "N")
+            p.s("SEGMENT_CREATED", "YES")
+            p.s("ON_QUERY_COMPUTATION", if mv.onQueryComp { "Y" } else { "N" })
+            p.s("CONCURRENT_REFRESH_ENABLED", "Y")
+            append(mut &out, p)
+        }
+        return out
+    }
+    if base == "MVIEW_LOGS" {
+        for ml in lexdb_mview.listLogs(&snap.mvlogs) {
+            let sc = lexdb_sql.schemaOf(&ml.key)
+            if lexdb_base.isTempSchema(&sc) { continue }
+            let owner = oraOwner(&sc, &user)
+            let master = oraUp(&lexdb_sql.baseName(&ml.key))
+            var p = oraPend(&owner, &"")
+            p.s("LOG_OWNER", &owner)
+            p.s("MASTER", &master)
+            p.s("LOG_TABLE", &ml.logTable)
+            p.s("ROWIDS", if ml.rowids { "YES" } else { "NO" })
+            p.s("PRIMARY_KEY", if ml.pk { "YES" } else { "NO" })
+            p.s("OBJECT_ID", "NO")
+            p.s("FILTER_COLUMNS", if len(ml.cols) > 0 { "YES" } else { "NO" })
+            p.s("SEQUENCE", if ml.seq { "YES" } else { "NO" })
+            p.s("INCLUDE_NEW_VALUES", if ml.newVals { "YES" } else { "NO" })
+            p.s("PURGE_ASYNCHRONOUS", "NO")
+            p.s("PURGE_DEFERRED", "NO")
+            p.s("COMMIT_SCN_BASED", "NO")
+            p.s("STAGING_LOG", "NO")
+            append(mut &out, p)
+        }
+        return out
+    }
     if base == "TAB_IDENTITY_COLS" {
         for ct in snap.tabs {
             if lexdb_base.isTempSchema(&ct.schema) { continue }
             for c in ct.t.cols {
-                if c.name == ROWID || (c.identity != lexdb_sql.ID_ALWAYS && c.identity != lexdb_sql.ID_BY_DEFAULT) { continue }
+                if lexdb_catalog.hiddenName(&c.name) || (c.identity != lexdb_sql.ID_ALWAYS && c.identity != lexdb_sql.ID_BY_DEFAULT) { continue }
                 var p = oraPend(&oraOwner(&ct.schema, &user), &"")
                 p.s("TABLE_NAME", &oraTabName(&ct))
                 p.s("COLUMN_NAME", &oraColName(&c))
@@ -1192,7 +1253,7 @@ fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role, verrs: &Map[str, DbErr])
             if lexdb_base.isTempSchema(&ct.schema) { continue }
             let owner = oraOwner(&ct.schema, &user)
             var hidden = len(ct.t.cols)          // the hidden columns of function-based indexes: SYS_NCnnnnn$, numbered after the columns
-            for c in ct.t.cols { if c.name == ROWID { hidden -= 1 } }
+            for c in ct.t.cols { if lexdb_catalog.hiddenName(&c.name) { hidden -= 1 } }
             for ix in ct.idxs {
                 var xi = -1
                 for k in 0..len(ct.t.indexes) { if lexdb_sql.baseName(&ct.t.indexes[k].name) == ix.name { xi = k } }

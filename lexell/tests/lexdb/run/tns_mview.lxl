@@ -1,0 +1,158 @@
+// lexdb over TNS: Oracle Materialized Views (Stage 1).
+// Covers CREATE MATERIALIZED VIEW (BUILD IMMEDIATE/DEFERRED, REFRESH COMPLETE/FAST/FORCE,
+// ON DEMAND/ON COMMIT/ON STATEMENT, ENABLE QUERY REWRITE, ENABLE ON QUERY COMPUTATION),
+// CREATE/DROP MATERIALIZED VIEW LOG, USER_MVIEWS, USER_MVIEW_LOGS, USER_OBJECTS,
+// DBMS_MVIEW.REFRESH, ALTER MATERIALIZED VIEW, ORA-12015, and DROP MATERIALIZED VIEW.
+// expect: setup: 5 statements
+// expect: same: DEPT,N,TOT = 'a'|2|300;'b'|1|50
+// expect: same: MVIEW_NAME,REFRESH_MODE,REFRESH_METHOD,BUILD_MODE,FAST_REFRESHABLE,REWRITE_ENABLED,ON_QUERY_COMPUTATION,STALENESS = 'MV_DEMAND'|'DEMAND'|'COMPLETE'|'IMMEDIATE'|'NO'|'N'|'N'|'FRESH';'MV_FAST_COMMIT'|'COMMIT'|'FAST'|'IMMEDIATE'|'DML'|'Y'|'N'|'FRESH';'MV_FAST_STMT'|'STATEMENT'|'FAST'|'IMMEDIATE'|'DML'|'N'|'Y'|'FRESH'
+// expect: same: MASTER,LOG_TABLE,PRIMARY_KEY,ROWIDS,SEQUENCE,INCLUDE_NEW_VALUES = 'EMP'|'MLOG$_EMP'|'YES'|'YES'|'YES'|'YES'
+// expect: same: OBJECT_TYPE = 'MATERIALIZED VIEW'
+// expect: same: DEPT,N,TOT = 'a'|2|300;'b'|1|50
+// expect: same: STALENESS = 'NEEDS_COMPILE'
+// expect: same: DEPT,N,TOT = 'a'|3|450;'b'|1|50
+// expect: same: DEPT,N,TOT = 'a'|3|450;'b'|1|50
+// expect: dbms_refresh: ok
+// expect: same: DEPT,N,TOT = 'a'|3|450;'b'|1|50
+// expect: same: STALENESS = 'FRESH'
+// expect: same: N = 0
+// expect: dbms_def: ok
+// expect: same: N = 4
+// expect: complex_fast_err: error 12015
+// expect: same: REWRITE_ENABLED,REFRESH_MODE = 'Y'|'COMMIT'
+// expect: same: C = 0
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+const SETUP = "create table emp (id number primary key, dept varchar2(10), sal number)\ninsert into emp values (1, 'a', 100)\ninsert into emp values (2, 'a', 200)\ninsert into emp values (3, 'b', 50)\ncreate materialized view log on emp with primary key, rowid, sequence (dept, sal) including new values"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+fn qtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn checkBoth(c: mut &oracle.Conn, sql: &str) {
+    let _a = c.run(&("set lexdb_batch = off".toStr()), &[])
+    let off = qtext(c, sql)
+    let _b = c.run(&("set lexdb_batch = on".toStr()), &[])
+    let on = qtext(c, sql)
+    if off == on { println("same: " + on) } else { println("diff: off=" + off + " on=" + on) }
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+
+            let _1 = c.run(&("create materialized view mv_demand refresh complete on demand as select dept, count(*) n, sum(sal) tot from emp group by dept".toStr()), &[]).unwrap()
+            let _2 = c.run(&("create materialized view mv_fast_commit refresh fast on commit enable query rewrite as select dept, count(*) n, sum(sal) tot from emp group by dept".toStr()), &[]).unwrap()
+            let _3 = c.run(&("create materialized view mv_fast_stmt refresh fast on statement enable on query computation as select dept, count(*) n, sum(sal) tot from emp group by dept".toStr()), &[]).unwrap()
+
+            checkBoth(mut &c, &"select dept, n, tot from mv_demand order by dept")
+            checkBoth(mut &c, &"select mview_name, refresh_mode, refresh_method, build_mode, fast_refreshable, rewrite_enabled, on_query_computation, staleness from user_mviews order by mview_name")
+            checkBoth(mut &c, &"select master, log_table, primary_key, rowids, sequence, include_new_values from user_mview_logs")
+            checkBoth(mut &c, &"select object_type from user_objects where object_name = 'MV_DEMAND' and object_type = 'MATERIALIZED VIEW'")
+
+            // Insert a new row -> ON COMMIT and ON STATEMENT update automatically, ON DEMAND goes NEEDS_COMPILE.
+            let _4 = c.run(&("insert into emp values (4, 'a', 150)".toStr()), &[]).unwrap()
+            checkBoth(mut &c, &"select dept, n, tot from mv_demand order by dept")
+            checkBoth(mut &c, &"select staleness from user_mviews where mview_name = 'MV_DEMAND'")
+            checkBoth(mut &c, &"select dept, n, tot from mv_fast_commit order by dept")
+            checkBoth(mut &c, &"select dept, n, tot from mv_fast_stmt order by dept")
+
+            // Refresh via DBMS_MVIEW.REFRESH
+            match c.run(&("begin dbms_mview.refresh('mv_demand', 'C'); end;".toStr()), &[]) {
+                Ok(_) { println("dbms_refresh: ok") }
+                Err(e) { println("dbms_refresh: error " + e.code.toStr() + " " + e.msg) }
+            }
+            checkBoth(mut &c, &"select dept, n, tot from mv_demand order by dept")
+            checkBoth(mut &c, &"select staleness from user_mviews where mview_name = 'MV_DEMAND'")
+
+            // BUILD DEFERRED
+            let _5 = c.run(&("create materialized view mv_def build deferred refresh complete on demand as select count(*) n from emp".toStr()), &[]).unwrap()
+            checkBoth(mut &c, &"select count(*) n from mv_def")
+            match c.run(&("begin dbms_mview.refresh('mv_def', 'C'); end;".toStr()), &[]) {
+                Ok(_) { println("dbms_def: ok") }
+                Err(e) { println("dbms_def: error " + e.code.toStr()) }
+            }
+            checkBoth(mut &c, &"select n from mv_def")
+
+            // Complex query with REFRESH FAST -> ORA-12015
+            match c.run(&("create materialized view mv_bad refresh fast on demand as select distinct dept from emp".toStr()), &[]) {
+                Ok(_) { println("complex_fast_err: unexpected ok") }
+                Err(e) { println("complex_fast_err: error " + e.code.toStr()) }
+            }
+
+            // ALTER MATERIALIZED VIEW
+            let _6 = c.run(&("alter materialized view mv_demand enable query rewrite refresh complete on commit".toStr()), &[]).unwrap()
+            checkBoth(mut &c, &"select rewrite_enabled, refresh_mode from user_mviews where mview_name = 'MV_DEMAND'")
+
+            // Cleanup
+            let _7 = c.run(&("drop materialized view mv_demand".toStr()), &[]).unwrap()
+            let _8 = c.run(&("drop materialized view mv_fast_commit".toStr()), &[]).unwrap()
+            let _9 = c.run(&("drop materialized view mv_fast_stmt".toStr()), &[]).unwrap()
+            let _10 = c.run(&("drop materialized view mv_def".toStr()), &[]).unwrap()
+            let _11 = c.run(&("drop materialized view log on emp".toStr()), &[]).unwrap()
+            checkBoth(mut &c, &"select count(*) c from user_mviews")
+            c.logoff()
+        }
+        Err(e) { println("connect: " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(192), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

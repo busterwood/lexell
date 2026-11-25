@@ -67,10 +67,13 @@ const F_ALL = 2         // ALL (q) SATISFY (c): no row of q makes c false
 // An assertion's catalog row's key.
 pub fn assertKey(key: &str): str { return ASSERT_PRE + key }
 
-// Whether a refBy entry is an assertion's (its catalog row's key), not a table's.
+// Whether a refBy entry is a catalog-object mark (assertion or materialized view), not a referencing table's key.
 pub fn isMark(k: &str): bool { return len(k) > 0 && k[0] == byte(2) }
 
-// A table's refBy without the assertions': the tables whose foreign keys reference it.
+// Whether a refBy entry is an assertion's mark specifically.
+fn isAssertMark(k: &str): bool { return strings.startsWith(k, ASSERT_PRE) }
+
+// A table's refBy without catalog-object marks: the tables whose foreign keys reference it.
 pub fn refs(xs: &[]str): []str {
     var out: []str = []
     for x in xs { if !isMark(&x) { append(mut &out, x.clone()) } }
@@ -80,7 +83,7 @@ pub fn refs(xs: &[]str): []str {
 // The assertions a table's refBy names: their catalog rows' keys.
 fn marksOf(xs: &[]str): []str {
     var out: []str = []
-    for x in xs { if isMark(&x) { append(mut &out, x.clone()) } }
+    for x in xs { if isAssertMark(&x) { append(mut &out, x.clone()) } }
     return out
 }
 
@@ -1395,7 +1398,9 @@ pub fn unlink(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, 
         return Err(depends(st, txn, &xs[0]))
     }
     for a in xs { try dropFor(st, txn, t, &a) }
-    t.refBy = refs(&t.refBy)
+    var keep: []str = []
+    for x in t.refBy { if !isAssertMark(&x) { append(mut &keep, x.clone()) } }
+    t.refBy = keep
     return Ok(Unit{})
 }
 
@@ -1411,20 +1416,25 @@ fn refsExcept(xs: &[]str, m: &str): []str {
 // foreign key's action wrote it: any column) or "a" (its rows rewritten: the whole query), the table's key.
 const NOTE = "\x02n\x00"
 
+pub fn hasAsserts(refBy: &[]str): bool {
+    for x in refBy { if isAssertMark(&x) { return true } }
+    return false
+}
+
 // Table t (one whose refBy names an assertion or a table) about to be written by a statement (lexdb_exec.fkTables, once a
 // statement and table): noted for its end.
 pub fn note(txn: mut &lexdb_store.Txn, t: &Table, any: bool) {
-    if !marked(&t.refBy) { return }
+    if !hasAsserts(&t.refBy) { return }
     append(mut &txn.onCommit, NOTE + txn.mark().toStr() + "\x00" + (if any { "w" } else { "i" }) + "\x00" + t.name)
 }
 
 // Table t written by a foreign key's action of a statement on another table (lexdb_exec.fkTables): any of its columns may
 // change, whatever the statement's SET says.
 pub fn noteKid(txn: mut &lexdb_store.Txn, t: &Table) {
-    if marked(&t.refBy) { append(mut &txn.onCommit, NOTE + txn.mark().toStr() + "\x00c\x00" + t.name) }
+    if hasAsserts(&t.refBy) { append(mut &txn.onCommit, NOTE + txn.mark().toStr() + "\x00c\x00" + t.name) }
 }
 
-// Whether a table's refBy names an assertion (COPY's fast path, which a check cannot read back, is not for it).
+// Whether a table's refBy names an assertion or materialized view (COPY's fast path is skipped for both).
 pub fn marked(refBy: &[]str): bool {
     for x in refBy { if isMark(&x) { return true } }
     return false
@@ -1437,7 +1447,7 @@ pub fn truncated(txn: mut &lexdb_store.Txn, t: &Table, md: int) { if md != MD_OR
 // Table t's rows rewritten by ALTER TABLE (a column's new type, its values cast): its assertions' whole queries run at the
 // statement's end, in every door.
 pub fn retyped(txn: mut &lexdb_store.Txn, t: &Table) {
-    if marked(&t.refBy) { append(mut &txn.onCommit, NOTE + txn.mark().toStr() + "\x00a\x00" + t.name) }
+    if hasAsserts(&t.refBy) { append(mut &txn.onCommit, NOTE + txn.mark().toStr() + "\x00a\x00" + t.name) }
 }
 
 // ALTER TABLE added, dropped, retyped or renamed a column of table k: the assertions that read it are INVALID from now on (Oracle's

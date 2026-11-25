@@ -1,0 +1,255 @@
+// Materialized views (Stage 1): PostgreSQL DDL, atomic CoW COMPLETE refresh,
+// CONCURRENTLY, WITH NO DATA, secondary indexes, pg_matviews / pg_class / pg_tables,
+// incremental Z-set FAST ON STATEMENT & ON COMMIT (filter/project, GROUP BY COUNT/SUM/AVG/FILTER,
+// global aggregate empty-table semantics, inner equi-join bilinear deltas, COPY FROM, TRUNCATE,
+// SAVEPOINT / ROLLBACK TO, dependency checks, and persistence across reopen).
+// expect: pg_basic: CREATE MATERIALIZED VIEW|SELECT 3|1|a|100;2|a|200;3|b|50
+// expect: pg_nodata: CREATE MATERIALIZED VIEW|ERR:55000|REFRESH MATERIALIZED VIEW|1|a|100;2|a|200;3|b|50
+// expect: pg_conc: ERR:55000|CREATE INDEX|REFRESH MATERIALIZED VIEW|1|a|100;2|a|200;3|b|50;4|c|300
+// expect: pg_clear: REFRESH MATERIALIZED VIEW|ERR:55000|REFRESH MATERIALIZED VIEW|1|a|100;2|a|200;3|b|50;4|c|300
+// expect: pg_dml_err: ERR:42809|ERR:42809|ERR:42809|ERR:42809|ERR:42809
+// expect: pg_cat: mv_basic|m|t|t;mv_basic|t|t|SELECT id, dept, amt FROM sales
+// expect: pg_not_in_tables: 0
+// expect: pg_rename: ALTER MATERIALIZED VIEW|1|a|100;2|a|200;3|b|50;4|c|300
+// expect: fast_proj_init: a|200;a|400;c|600
+// expect: fast_proj_dml: a|200;a|500;c|600;d|1000
+// expect: fast_proj_del: a|500;d|1000
+// expect: fast_agg_init: a|2|2|300|150.0000000000000000;b|1|1|50|50.0000000000000000;c|1|1|300|300.0000000000000000
+// expect: fast_agg_null_and_flt: a|3|2|300|150.0000000000000000|1;b|1|1|50|50.0000000000000000|0;c|1|1|300|300.0000000000000000|1;NULL|1|1|40|40.0000000000000000|0
+// expect: fast_agg_del_all_nonnull: a|1|0|NULL|NULL|0;b|1|1|50|50.0000000000000000|0;c|1|1|300|300.0000000000000000|1;NULL|1|1|40|40.0000000000000000|0
+// expect: fast_agg_extinct: a|1|0|NULL|NULL|0;c|1|1|300|300.0000000000000000|1
+// expect: global_agg: 2|300|150.0000000000000000|0|NULL|NULL|1|75|75.0000000000000000
+// expect: txn_timing: 2|1|2|2|1|1
+// expect: savepoint_ok: a|2|300;b|1|50
+// expect: join_init: 1|Alpha|100;2|Alpha|200;3|Beta|50
+// expect: join_agg_init: Alpha|2|300;Beta|1|50
+// expect: join_bilinear: Alpha|3|450;Beta|1|50;Gamma|2|900
+// expect: copy_fast: a|3|330;b|2|70;c|1|50
+// expect: trunc_fast: 0|0|NULL
+// expect: dep_guard: ERR:2BP01|ERR:2BP01|DROP TABLE|0
+// expect: pg_ora_opts: 1|100;2|200|1|100;2|200;3|300
+// expect: reopen: Alpha|3|450;Beta|1|50;Gamma|2|900
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_parse"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return "ERR:" + e.state }
+    }
+}
+
+fn checkBoth(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let _a = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let _b = q(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    if off != on { println(label + ": MISMATCH off=" + off + " on=" + on) }
+    else { println(label + ": " + on) }
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}
+}
+
+fn main() {
+    let disk = lexdb_disk.sim(191)
+    lexdb_store.run(disk.share(), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+
+    // --- 1. Basic PG Materialized View + WITH NO DATA + CONCURRENTLY + catalog ---
+    let _1 = q(mut &s, &"CREATE TABLE sales (id int PRIMARY KEY, dept text, amt int, note text)")
+    let _2 = q(mut &s, &"INSERT INTO sales VALUES (1, 'a', 100, 'n1'), (2, 'a', 200, 'n2'), (3, 'b', 50, 'n3')")
+
+    let c1 = q(mut &s, &"CREATE MATERIALIZED VIEW mv_basic AS SELECT id, dept, amt FROM sales")
+    let c2 = q(mut &s, &"CREATE MATERIALIZED VIEW IF NOT EXISTS mv_basic AS SELECT 1")
+    let r1 = q(mut &s, &"SELECT id, dept, amt FROM mv_basic ORDER BY id")
+    println("pg_basic: " + c2 + "|" + c1 + "|" + r1)
+
+    let nd1 = q(mut &s, &"CREATE MATERIALIZED VIEW mv_nd AS SELECT id, dept, amt FROM sales WITH NO DATA")
+    let nd2 = q(mut &s, &"SELECT * FROM mv_nd")
+    let nd3 = q(mut &s, &"REFRESH MATERIALIZED VIEW mv_nd")
+    let nd4 = q(mut &s, &"SELECT * FROM mv_nd ORDER BY id")
+    println("pg_nodata: " + nd1 + "|" + nd2 + "|" + nd3 + "|" + nd4)
+
+    let _3 = q(mut &s, &"INSERT INTO sales VALUES (4, 'c', 300, 'n4')")
+    let cc1 = q(mut &s, &"REFRESH MATERIALIZED VIEW CONCURRENTLY mv_basic")
+    let cc2 = q(mut &s, &"CREATE UNIQUE INDEX mv_basic_id_idx ON mv_basic (id)")
+    let cc3 = q(mut &s, &"REFRESH MATERIALIZED VIEW CONCURRENTLY mv_basic")
+    let cc4 = q(mut &s, &"SELECT * FROM mv_basic ORDER BY id")
+    println("pg_conc: " + cc1 + "|" + cc2 + "|" + cc3 + "|" + cc4)
+
+    let cl1 = q(mut &s, &"REFRESH MATERIALIZED VIEW mv_nd WITH NO DATA")
+    let cl2 = q(mut &s, &"SELECT * FROM mv_nd")
+    let cl3 = q(mut &s, &"REFRESH MATERIALIZED VIEW mv_nd WITH DATA")
+    let cl4 = q(mut &s, &"SELECT * FROM mv_nd ORDER BY id")
+    println("pg_clear: " + cl1 + "|" + cl2 + "|" + cl3 + "|" + cl4)
+
+    let e1 = q(mut &s, &"INSERT INTO mv_basic VALUES (9, 'z', 1)")
+    let e2 = q(mut &s, &"UPDATE mv_basic SET amt = 0")
+    let e3 = q(mut &s, &"DELETE FROM mv_basic")
+    let e4 = q(mut &s, &"TRUNCATE mv_basic")
+    let e5 = q(mut &s, &"DROP TABLE mv_basic")
+    println("pg_dml_err: " + e1 + "|" + e2 + "|" + e3 + "|" + e4 + "|" + e5)
+
+    let cat1 = q(mut &s, &"SELECT relname, relkind, relhasindex, relispopulated FROM pg_class WHERE relname = 'mv_basic'")
+    let cat2 = q(mut &s, &"SELECT matviewname, hasindexes, ispopulated, rtrim(definition, ';') FROM pg_matviews WHERE matviewname = 'mv_basic'")
+    println("pg_cat: " + cat1 + ";" + cat2)
+    println("pg_not_in_tables: " + q(mut &s, &"SELECT count(*) FROM pg_tables WHERE tablename = 'mv_basic'"))
+
+    let rn1 = q(mut &s, &"ALTER MATERIALIZED VIEW mv_basic RENAME TO mv_renamed")
+    let rn2 = q(mut &s, &"SELECT * FROM mv_renamed ORDER BY id")
+    println("pg_rename: " + rn1 + "|" + rn2)
+    let _4 = q(mut &s, &"DROP MATERIALIZED VIEW mv_renamed, mv_nd")
+
+    // --- 2. FAST ON STATEMENT: filter + projection ---
+    let _5 = q(mut &s, &"CREATE MATERIALIZED VIEW mv_proj WITH (refresh = 'fast_on_statement') AS SELECT id, dept, amt * 2 AS dbl FROM sales WHERE amt >= 100")
+    checkBoth(mut &s, &"fast_proj_init", &"SELECT dept, dbl FROM mv_proj ORDER BY id")
+    // Unrelated column update (note) is skipped; matching update updates; below-threshold insert skipped; above-threshold insert added.
+    let _6 = q(mut &s, &"UPDATE sales SET note = 'changed' WHERE id = 1")
+    let _7 = q(mut &s, &"UPDATE sales SET amt = 250 WHERE id = 2")
+    let _8 = q(mut &s, &"INSERT INTO sales VALUES (5, 'd', 50, 'low'), (6, 'd', 500, 'high')")
+    checkBoth(mut &s, &"fast_proj_dml", &"SELECT dept, dbl FROM mv_proj ORDER BY id")
+    // Delete row 1 and lower row 4 below filter threshold.
+    let _9 = q(mut &s, &"DELETE FROM sales WHERE id = 1")
+    let _10 = q(mut &s, &"UPDATE sales SET amt = 20 WHERE id = 4")
+    checkBoth(mut &s, &"fast_proj_del", &"SELECT dept, dbl FROM mv_proj ORDER BY id")
+    let _11 = q(mut &s, &"DROP MATERIALIZED VIEW mv_proj")
+
+    // --- 3. FAST ON STATEMENT: GROUP BY with COUNT(*), COUNT(col), SUM, AVG, FILTER, NULLs, extinction ---
+    let _12 = q(mut &s, &"TRUNCATE sales")
+    let _13 = q(mut &s, &"INSERT INTO sales VALUES (1, 'a', 100, 'n'), (2, 'a', 200, 'n'), (3, 'b', 50, 'n'), (4, 'c', 300, 'n')")
+    let _14 = q(mut &s, &"CREATE MATERIALIZED VIEW mv_agg WITH (refresh = 'fast_on_statement') AS SELECT dept, count(*) AS n, count(amt) AS nn, sum(amt) AS tot, avg(amt) AS avg_amt, count(*) FILTER (WHERE amt >= 200) AS big FROM sales GROUP BY dept")
+    checkBoth(mut &s, &"fast_agg_init", &"SELECT dept, n, nn, tot, avg_amt FROM mv_agg ORDER BY dept")
+
+    // Insert a NULL amt into 'a' and a NULL dept group!
+    let _15 = q(mut &s, &"INSERT INTO sales VALUES (5, 'a', NULL, 'n'), (6, NULL, 40, 'n')")
+    checkBoth(mut &s, &"fast_agg_null_and_flt", &"SELECT dept, n, nn, tot, avg_amt, big FROM mv_agg ORDER BY dept NULLS LAST")
+
+    // Delete all non-null amt rows of 'a' -> 'a' still has 1 row with NULL amt, so tot & avg MUST flip to NULL!
+    let _16 = q(mut &s, &"DELETE FROM sales WHERE id IN (1, 2)")
+    checkBoth(mut &s, &"fast_agg_del_all_nonnull", &"SELECT dept, n, nn, tot, avg_amt, big FROM mv_agg ORDER BY dept NULLS LAST")
+
+    // Delete last row of 'b' and last row of NULL dept -> both groups must vanish!
+    let _17 = q(mut &s, &"DELETE FROM sales WHERE id IN (3, 6)")
+    checkBoth(mut &s, &"fast_agg_extinct", &"SELECT dept, n, nn, tot, avg_amt, big FROM mv_agg ORDER BY dept NULLS LAST")
+    let _18 = q(mut &s, &"DROP MATERIALIZED VIEW mv_agg")
+
+    // --- 4. Global aggregate (no GROUP BY): survives dropping to 0 rows ---
+    let _19 = q(mut &s, &"CREATE TABLE gtab (id int PRIMARY KEY, v int)")
+    let _20 = q(mut &s, &"INSERT INTO gtab VALUES (1, 100), (2, 200)")
+    let _21 = q(mut &s, &"CREATE MATERIALIZED VIEW mv_glob WITH (refresh = 'fast_on_statement') AS SELECT count(*) AS n, sum(v) AS s, avg(v) AS a FROM gtab")
+    let g1 = q(mut &s, &"SELECT n, s, a FROM mv_glob")
+    let _22 = q(mut &s, &"DELETE FROM gtab")
+    let g2 = q(mut &s, &"SELECT n, s, a FROM mv_glob")
+    let _23 = q(mut &s, &"INSERT INTO gtab VALUES (3, 75)")
+    let g3 = q(mut &s, &"SELECT n, s, a FROM mv_glob")
+    println("global_agg: " + g1 + "|" + g2 + "|" + g3)
+
+    // --- 5. ON STATEMENT vs ON COMMIT timing + ROLLBACK + SAVEPOINT ---
+    let _24 = q(mut &s, &"CREATE TABLE tx_t (id int PRIMARY KEY, dept text, amt int)")
+    let _25 = q(mut &s, &"INSERT INTO tx_t VALUES (1, 'a', 100)")
+    let _26 = q(mut &s, &"CREATE MATERIALIZED VIEW mv_stmt WITH (refresh = 'fast_on_statement') AS SELECT count(*) AS n FROM tx_t")
+    let _27 = q(mut &s, &"CREATE MATERIALIZED VIEW mv_comm WITH (refresh = 'fast_on_commit') AS SELECT count(*) AS n FROM tx_t")
+    let _28 = q(mut &s, &"BEGIN")
+    let _29 = q(mut &s, &"INSERT INTO tx_t VALUES (2, 'a', 200)")
+    let t_s1 = q(mut &s, &"SELECT n FROM mv_stmt")
+    let t_c1 = q(mut &s, &"SELECT n FROM mv_comm")
+    let _30 = q(mut &s, &"COMMIT")
+    let t_s2 = q(mut &s, &"SELECT n FROM mv_stmt")
+    let t_c2 = q(mut &s, &"SELECT n FROM mv_comm")
+    // Rollback check
+    let _31 = q(mut &s, &"BEGIN")
+    let _32 = q(mut &s, &"DELETE FROM tx_t WHERE id = 2")
+    let _33 = q(mut &s, &"ROLLBACK")
+    let _34 = q(mut &s, &"DELETE FROM tx_t WHERE id = 2")
+    let t_s3 = q(mut &s, &"SELECT n FROM mv_stmt")
+    let t_c3 = q(mut &s, &"SELECT n FROM mv_comm")
+    println("txn_timing: " + t_s1 + "|" + t_c1 + "|" + t_s2 + "|" + t_c2 + "|" + t_s3 + "|" + t_c3)
+
+    // Savepoint test on ON COMMIT aggregate MV
+    let _35 = q(mut &s, &"CREATE MATERIALIZED VIEW mv_sp WITH (refresh = 'fast_on_commit') AS SELECT dept, count(*) AS n, sum(amt) AS tot FROM tx_t GROUP BY dept")
+    let _36 = q(mut &s, &"BEGIN")
+    let _37 = q(mut &s, &"INSERT INTO tx_t VALUES (2, 'a', 200)")
+    let _38 = q(mut &s, &"SAVEPOINT sp1")
+    let _39 = q(mut &s, &"INSERT INTO tx_t VALUES (3, 'a', 999), (4, 'z', 500)")
+    let _40 = q(mut &s, &"ROLLBACK TO SAVEPOINT sp1")
+    let _41 = q(mut &s, &"INSERT INTO tx_t VALUES (5, 'b', 50)")
+    let _42 = q(mut &s, &"COMMIT")
+    checkBoth(mut &s, &"savepoint_ok", &"SELECT dept, n, tot FROM mv_sp ORDER BY dept")
+
+    // --- 6. Multi-table Inner Equi-Join MV (bilinear telescoping deltas in same transaction!) ---
+    let _43 = q(mut &s, &"CREATE TABLE depts (id int PRIMARY KEY, dname text)")
+    let _44 = q(mut &s, &"CREATE TABLE items (id int PRIMARY KEY, dept_id int, price int)")
+    let _45 = q(mut &s, &"INSERT INTO depts VALUES (1, 'Alpha'), (2, 'Beta')")
+    let _46 = q(mut &s, &"INSERT INTO items VALUES (1, 1, 100), (2, 1, 200), (3, 2, 50)")
+    let _47 = q(mut &s, &"CREATE MATERIALIZED VIEW mv_jproj WITH (refresh = 'fast_on_commit') AS SELECT i.id, d.dname, i.price FROM items i INNER JOIN depts d ON i.dept_id = d.id")
+    let _48 = q(mut &s, &"CREATE MATERIALIZED VIEW mv_jagg WITH (refresh = 'fast_on_commit') AS SELECT d.dname, count(*) AS n, sum(i.price) AS tot FROM items i INNER JOIN depts d ON i.dept_id = d.id GROUP BY d.dname")
+    checkBoth(mut &s, &"join_init", &"SELECT id, dname, price FROM mv_jproj ORDER BY id")
+    checkBoth(mut &s, &"join_agg_init", &"SELECT dname, n, tot FROM mv_jagg ORDER BY dname")
+    // Mutate BOTH joined tables in the SAME transaction (bilinear telescoping!)
+    let _49 = q(mut &s, &"BEGIN")
+    let _50 = q(mut &s, &"INSERT INTO depts VALUES (3, 'Gamma')")
+    let _51 = q(mut &s, &"INSERT INTO items VALUES (4, 1, 150), (5, 3, 400), (6, 3, 500)")
+    let _52 = q(mut &s, &"COMMIT")
+    checkBoth(mut &s, &"join_bilinear", &"SELECT dname, n, tot FROM mv_jagg ORDER BY dname")
+
+    // --- 7. COPY FROM bulk delta into FAST aggregate MV + TRUNCATE ---
+    let _53 = q(mut &s, &"CREATE TABLE ctab (id int PRIMARY KEY, dept text, v int)")
+    let _54 = q(mut &s, &"CREATE MATERIALIZED VIEW mv_copy WITH (refresh = 'fast_on_commit') AS SELECT dept, count(*) AS n, sum(v) AS tot FROM ctab GROUP BY dept")
+    let cpStmts = lexdb_parse.parse(&"COPY ctab FROM STDIN").unwrap()
+    let _55 = s.copyIn(&cpStmts[0], lexdb_exec.CopyInput{have: true, data: "1\ta\t100\n2\ta\t110\n3\ta\t120\n4\tb\t30\n5\tb\t40\n6\tc\t50\n", fail: "", proto: false, stream: false, pull: false}).unwrap()
+    checkBoth(mut &s, &"copy_fast", &"SELECT dept, n, tot FROM mv_copy ORDER BY dept")
+
+    let _56 = q(mut &s, &"CREATE MATERIALIZED VIEW mv_copy_glob WITH (refresh = 'fast_on_statement') AS SELECT count(*) AS n, sum(v) AS tot FROM ctab")
+    let _57 = q(mut &s, &"TRUNCATE ctab")
+    let tr1 = q(mut &s, &"SELECT count(*) FROM mv_copy")
+    let tr2 = q(mut &s, &"SELECT n, tot FROM mv_copy_glob")
+    println("trunc_fast: " + tr1 + "|" + tr2)
+
+    // --- 8. Base table DROP / ALTER COLUMN dependency protection ---
+    let _58 = q(mut &s, &"CREATE TABLE base_dep (id int PRIMARY KEY, x int, y int)")
+    let _59 = q(mut &s, &"CREATE MATERIALIZED VIEW mv_dep WITH (refresh = 'fast_on_commit') AS SELECT id, x FROM base_dep")
+    let dp1 = q(mut &s, &"ALTER TABLE base_dep DROP COLUMN x")
+    let dp2 = q(mut &s, &"DROP TABLE base_dep")
+    let dp3 = q(mut &s, &"DROP TABLE base_dep CASCADE")
+    let dp4 = q(mut &s, &"SELECT count(*) FROM pg_matviews WHERE matviewname = 'mv_dep'")
+    println("dep_guard: " + dp1 + "|" + dp2 + "|" + dp3 + "|" + dp4)
+
+    // --- 8b. Cross-door Oracle-style options in PostgreSQL door ---
+    let _60 = q(mut &s, &"CREATE TABLE xopt (id int PRIMARY KEY, v int)")
+    let _61 = q(mut &s, &"INSERT INTO xopt VALUES (1, 100), (2, 200)")
+    let _62 = q(mut &s, &"CREATE MATERIALIZED VIEW mv_xopt REFRESH FAST ON COMMIT ENABLE QUERY REWRITE AS SELECT id, v FROM xopt")
+    let xo1 = q(mut &s, &"SELECT id, v FROM mv_xopt ORDER BY id")
+    let _63 = q(mut &s, &"INSERT INTO xopt VALUES (3, 300)")
+    let xo2 = q(mut &s, &"SELECT id, v FROM mv_xopt ORDER BY id")
+    println("pg_ora_opts: " + xo1 + "|" + xo2)
+        return 0
+    }).unwrap()
+
+    // --- 9. Persistence across reopen ---
+    lexdb_store.run(disk, opts(), fn(st2: lexdb_store.Store): int {
+        var s2 = lexdb_exec.newSession(st2)
+        checkBoth(mut &s2, &"reopen", &"SELECT dname, n, tot FROM mv_jagg ORDER BY dname")
+        return 0
+    }).unwrap()
+}

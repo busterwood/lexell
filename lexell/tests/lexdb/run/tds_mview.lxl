@@ -1,0 +1,143 @@
+// lexdb over TDS: SQL Server Indexed Views (Stage 1).
+// Covers CREATE VIEW WITH SCHEMABINDING + CREATE UNIQUE CLUSTERED INDEX promotion,
+// non-schemabound refusal (1939), secondary nonclustered index on indexed view,
+// synchronous ON STATEMENT incremental maintenance (INSERT/UPDATE/DELETE/ROLLBACK),
+// sys.views / sys.tables / sys.objects / sys.indexes catalog metadata,
+// DROP INDEX demotion back to regular view, and persistence across reopen.
+// expect: setup: ok
+// expect: nosb: error 1939: Cannot create index on view 'v_nosb' because the view is not schema bound.
+// expect: promote: ok
+// expect: nc_idx: ok
+// expect: same: dept_id,cnt,tot = 1|2|300;2|1|50
+// expect: cat_view: name,type = v_sales|V 
+// expect: cat_not_tab: n = 0
+// expect: cat_idx: name,is_unique,type_desc = ix_v_sales|1|CLUSTERED;ix_v_sales_tot|0|NONCLUSTERED
+// expect: dml_ok: (1) / (1) / (1)
+// expect: same: dept_id,cnt,tot = 1|2|350;3|1|500
+// expect: rb_same: dept_id,cnt,tot = 1|2|350;3|1|500
+// expect: demote: ok
+// expect: after_demote: dept_id,cnt,tot = 1|2|350;3|1|500
+// expect: tds_mv_fast: dept_id,cnt,tot = 1|3|450;3|1|500
+// expect: tds_mv_demand: dept_id,tot = 1|450;3|500
+// expect: reopened: dept_id,cnt,tot = 1|2|350;3|1|500
+import "strings"
+import "task"
+import "net"
+import "tds"
+import "sqldialect"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+fn cellText(c: &tds.Column, v: &tds.Cell): str {
+    match v {
+        tds.Cell.Null { return "NULL" }
+        else { return tds.cellText(c, v).unwrapOr("?") }
+    }
+}
+
+fn said(r: Result[tds.Reply, sqldialect.DbError]): str {
+    match r {
+        Ok(rep) {
+            var parts: []str = []
+            for e in rep.errors { append(mut &parts, "error " + e.number.toStr() + ": " + e.text) }
+            for rs in rep.results {
+                var rows: []str = []
+                for row in rs.rows {
+                    var cells: []str = []
+                    for i in 0..len(row) { append(mut &cells, cellText(&rs.columns[i], &row[i])) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                var names: []str = []
+                for c in rs.columns { append(mut &names, c.name.clone()) }
+                append(mut &parts, strings.join(&names, ",") + " = " + strings.join(&rows, ";"))
+            }
+            if len(rep.results) == 0 && len(rep.errors) == 0 {
+                for c in rep.counts { if c.resultSet < 0 && c.rows >= 0 { append(mut &parts, "(" + c.rows.toStr() + ")") } }
+            }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "failed " + e.code.toStr() + " " + e.msg }
+    }
+}
+
+fn checkBoth(c: mut &tds.Session, sql: &str) {
+    let _a = c.batch("SET lexdb_batch = off")
+    let off = said(c.batch(sql))
+    let _b = c.batch("SET lexdb_batch = on")
+    let on = said(c.batch(sql))
+    if off == on { println("same: " + on) } else { println("diff: off=" + off + " on=" + on) }
+}
+
+fn client(dsn: &str, reopen: bool) {
+    let cfg = sqlserver.parseConnString(&(dsn.toStr())).unwrap()
+    var c = tds.open(&cfg.config).unwrap()
+    if reopen {
+        println("reopened: " + said(c.batch("SELECT dept_id, cnt, tot FROM dbo.v_sales2 ORDER BY dept_id")))
+        return
+    }
+    let _1 = c.batch("CREATE TABLE dbo.sales (id int PRIMARY KEY, dept_id int, amount int)")
+    let _2 = c.batch("INSERT dbo.sales VALUES (1, 1, 100), (2, 1, 200), (3, 2, 50)")
+    let _3 = c.batch("CREATE VIEW dbo.v_nosb AS SELECT dept_id, count(*) AS cnt FROM dbo.sales GROUP BY dept_id")
+    let _4 = c.batch("CREATE VIEW dbo.v_sales WITH SCHEMABINDING AS SELECT dept_id, count(*) AS cnt, sum(amount) AS tot FROM dbo.sales GROUP BY dept_id")
+    println("setup: ok")
+
+    println("nosb: " + said(c.batch("CREATE UNIQUE CLUSTERED INDEX ix_nosb ON dbo.v_nosb (dept_id)")))
+    println("promote: " + said(c.batch("CREATE UNIQUE CLUSTERED INDEX ix_v_sales ON dbo.v_sales (dept_id)")))
+    println("nc_idx: " + said(c.batch("CREATE NONCLUSTERED INDEX ix_v_sales_tot ON dbo.v_sales (tot)")))
+    checkBoth(mut &c, &"SELECT dept_id, cnt, tot FROM dbo.v_sales ORDER BY dept_id")
+
+    println("cat_view: " + said(c.batch("SELECT name, type FROM sys.views WHERE name = 'v_sales'")))
+    println("cat_not_tab: " + said(c.batch("SELECT count(*) AS n FROM sys.tables WHERE name = 'v_sales'")))
+    println("cat_idx: " + said(c.batch("SELECT i.name, i.is_unique, i.type_desc FROM sys.indexes i JOIN sys.objects o ON i.object_id = o.object_id WHERE o.name = 'v_sales' ORDER BY i.name")))
+
+    // Live DML updates indexed view synchronously!
+    println("dml_ok: " + said(c.batch("UPDATE dbo.sales SET amount = 250 WHERE id = 2; DELETE FROM dbo.sales WHERE id = 3; INSERT dbo.sales VALUES (4, 3, 500)")))
+    checkBoth(mut &c, &"SELECT dept_id, cnt, tot FROM dbo.v_sales ORDER BY dept_id")
+
+    // Rollback preserves indexed view state
+    let _5 = c.batch("BEGIN TRAN; INSERT dbo.sales VALUES (9, 9, 999); ROLLBACK TRAN")
+    println("rb_same: " + said(c.batch("SELECT dept_id, cnt, tot FROM dbo.v_sales ORDER BY dept_id")))
+
+    // Create a second indexed view to survive reopen, and demote the first one via DROP INDEX!
+    let _6 = c.batch("CREATE VIEW dbo.v_sales2 WITH SCHEMABINDING AS SELECT dept_id, count(*) AS cnt, sum(amount) AS tot FROM dbo.sales GROUP BY dept_id")
+    let _7 = c.batch("CREATE UNIQUE CLUSTERED INDEX ix_v_sales2 ON dbo.v_sales2 (dept_id)")
+    println("demote: " + said(c.batch("DROP INDEX ix_v_sales ON dbo.v_sales")))
+    println("after_demote: " + said(c.batch("SELECT dept_id, cnt, tot FROM dbo.v_sales ORDER BY dept_id")))
+
+    // Cross-door CREATE/REFRESH/DROP MATERIALIZED VIEW syntax over TDS
+    let _8 = c.batch("CREATE MATERIALIZED VIEW dbo.mv_fast REFRESH FAST ON COMMIT ENABLE QUERY REWRITE AS SELECT dept_id, count(*) AS cnt, sum(amount) AS tot FROM dbo.sales GROUP BY dept_id")
+    let _9 = c.batch("CREATE MATERIALIZED VIEW dbo.mv_dem REFRESH COMPLETE ON DEMAND AS SELECT dept_id, sum(amount) AS tot FROM dbo.sales GROUP BY dept_id")
+    let _10 = c.batch("INSERT dbo.sales VALUES (5, 1, 100)")
+    println("tds_mv_fast: " + said(c.batch("SELECT dept_id, cnt, tot FROM dbo.mv_fast ORDER BY dept_id")))
+    let _11 = c.batch("REFRESH MATERIALIZED VIEW dbo.mv_dem")
+    println("tds_mv_demand: " + said(c.batch("SELECT dept_id, tot FROM dbo.mv_dem ORDER BY dept_id")))
+    let _12 = c.batch("DELETE FROM dbo.sales WHERE id = 5")
+    let _13 = c.batch("DROP MATERIALIZED VIEW dbo.mv_fast, dbo.mv_dem")
+}
+
+fn opts(): lexdb_store.Options { return lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000} }
+
+fn runTds(st: lexdb_store.Store, reopen: bool): int {
+    if !reopen { lexdb_exec.bootstrap(&st).unwrap() }
+    task.scope(fn(sc: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        client(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"), reopen)
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(193)
+    lexdb_store.run(fs.share(), opts(), fn(st: lexdb_store.Store): int { return runTds(st, false) }).unwrap()
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int { return runTds(st, true) }).unwrap()
+}

@@ -58,7 +58,8 @@ annotations_clause:
 - **`WITH READ ONLY` and `WITH CHECK OPTION` are refused** (ORA-03001, message `WITH CHECK OPTION is not supported`
   for both). Every view is read-only anyway.
 - `FORCE` (a view over a table that does not exist yet) is ORA-00900; `NOFORCE` is the default and is accepted.
-- `CREATE MATERIALIZED VIEW` is ORA-03001.
+- For materialized views (`CREATE MATERIALIZED VIEW`, `CREATE MATERIALIZED VIEW LOG`, `DBMS_MVIEW.REFRESH`), see
+  [CREATE MATERIALIZED VIEW](create-materialized-view.md).
 - **A view that calls a stored function cannot be read by DML:** an `INSERT`, `UPDATE`, `DELETE` or `CREATE TABLE ...
   AS` that reads one is ORA-03001 (example G). A query reads it.
 - After `DROP FUNCTION` or `DROP PACKAGE` of a function a view calls, reading the view is ORA-04063 (`view ... has

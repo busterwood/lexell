@@ -30,8 +30,11 @@ NULL, zero, false or empty.
 : `table_catalog`, `table_schema`, `table_name`, `view_definition`, `check_option` (`NONE`), and `is_updatable`,
   `is_insertable_into` and the `is_trigger_` columns, all `NO`.
 
-`pg_matviews`, `pg_rewrite`
-: No rows: lexdb has no materialized views and no rules.
+`pg_matviews`: one row per materialized view
+: `schemaname`, `matviewname`, `matviewowner`, `tablespace` (NULL), `hasindexes`, `ispopulated`, `definition`.
+
+`pg_rewrite`
+: No rows: lexdb has no rules.
 
 `pg_sequence`: one row per sequence
 : `seqrelid`, `seqtypid`, `seqstart`, `seqincrement`, `seqmax`, `seqmin`, `seqcache`, `seqcycle`.
