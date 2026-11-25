@@ -6,7 +6,8 @@
 // - two sessions, each in a task: each adds half of a violation of the join (write skew): the second waits for the first's
 //   COMMIT and then fails; two rows of different join keys: neither waits; two DELETEs each leaving the anti-join one row:
 //   the second waits and fails; an assertion without a join key: the second waits, then passes after a ROLLBACK;
-// - the PostgreSQL door: its writes are checked (23514), its parser refuses CREATE ASSERTION as before, the T-SQL door's too;
+// - the PostgreSQL door: its writes are checked (23514), UPDATE and DELETE ... WITH (batch_rows n) of a table an assertion reads
+//   refused (0A000: they commit as they go), its parser refuses CREATE ASSERTION as before, the T-SQL door's too;
 // - the store reopened: the assertions there, still checked.
 // expect: random: 1200 statements, 200 refused, 0 differences
 // expect: skew: first INSERT 0 1, second waited then 23514, commit ROLLBACK
@@ -17,6 +18,7 @@
 // expect: pg write: 23514 assertion "C_CAP" is violated
 // expect: pg: 42601 syntax error at or near "assertion"
 // expect: pg: 42601 syntax error at or near "assertion"
+// expect: batch_rows: 0A000 0A000 UPDATE 3
 // expect: tsql: 42601
 // expect: ora: ORA08601 Assertion (LEXDB.C_CAP) violated.
 // expect: reopened: 23514, 23514, INSERT 0 1; USER_ASSERTIONS: C_CAP|C_NOVAL|C_ONE|K_X|P_KID
@@ -235,6 +237,7 @@ fn main() {
         lexdb_exec.bootstrap(&st).unwrap()
         var s = lexdb_exec.newSession(st.share())
         random(mut &s)
+        let u0 = one(mut &s, "create table u2 (id int primary key, v int); insert into u2 values (1, 1), (2, 2), (3, 3)")
         sessions(&st)
         println("pg write: " + one(mut &s, "insert into c values (800, 1, 5000)") + " " + (match s.exec(&"insert into c values (800, 1, 5000)") {
             Ok(_) { "" }
@@ -244,6 +247,8 @@ fn main() {
             Ok(_) { "" }
             Err(e) { e.msg.clone() }
         })) }
+        println("batch_rows: " + one(mut &s, "update c set qty = qty where k = 1 with (batch_rows 2)") + " " + one(mut &s, "delete from p where id = 1 with (batch_rows 2)") +
+                " " + one(mut &s, "update u2 set v = v with (batch_rows 2)"))
         match lexdb_tsqlparse.parseBatch(&"create assertion z check (not exists (select 1 from c))", lexdb_parse.Dialect{tsql: true, quotedIdent: true}, &[]) {
             Ok(_) { println("tsql: parsed") }
             Err(e) { println("tsql: " + e.state) }
