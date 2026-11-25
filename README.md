@@ -19,25 +19,27 @@ I wanted the quick edit–compile–run loop I remember from Turbo Pascal, with 
 
 ### Generated code
 
-Lexell with `-O` against Rust and against Java on a warmed-up JVM:
+Lexell with `-O` against Rust and against Java on a warmed-up JVM (20 benchmarks):
 
 | Benchmark | Faster than Rust | Faster than Java |
 |---|---:|---:|
-| Allocation | 11× | |
-| Lists and trees | 5.2–5.3× | |
-| Strings | 3.3× | |
+| Allocation | 10× | |
+| Lists and trees | 5.4–5.8× | |
+| Strings | 3.7× | |
 | Maps | 1.9× | |
-| Recursive calls | 1.5× | 1.1× |
-| Sieve | 1.4× | 1.8× |
-| Interpreter loop | 1.4× | 2.2× |
-| Matrix multiplication | 1.06× | |
-| Switching between tasks | | 9.6× (1.9× Go) |
-| Token scanner | | 1.6× |
-| Sorting with closures | | 1.6× |
-| Loops | level | 1.1× |
-| Peak memory (14 of 15 programs) | | 2–14 MB against the JVM's 51 MB–1.4 GB |
+| Recursive calls (`fib`) | 1.6× | 1.1× |
+| Sieve | 1.6× | 1.7× |
+| Matrix multiplication | 1.45× | |
+| Interpreter loop | 1.33× | 2.2× |
+| Bit-packed column decode | | 1.33× |
+| Varint CSV parsing | 1.05× | 1.36× |
+| Switching between tasks | | 9.3× (1.8× Go) |
+| Token scanner | | 1.7× |
+| Sorting with closures | | 1.8× |
+| Loops | level | 1.2× |
+| Peak memory (19 of 20 programs) | | 2–31 MB against the JVM's 51 MB–1.4 GB |
 
-Rust is ahead on floating point (`nbody`), sorting with closures and slightly on the token scanner (1.06×). Java is ahead on the allocation-heavy programs, arrays, maps and vectorised matrix multiplication.
+Rust is ahead on floating point (`nbody`), sorting with closures, bit-packed decode (`bitpack`), hash aggregation (`hashagg`), expression AST evaluation (`enum_eval`), and slightly on the token scanner (1.08×) and B-tree (1.03×). Java is ahead on the allocation-heavy programs, arrays, maps, B-tree (1.10×), hash aggregation, expression evaluation, and vectorised matrix multiplication.
 
 ### Real programs
 
@@ -65,7 +67,7 @@ Lexell is slightly behind cmark on long Markdown documents (ahead on the spec ex
 
 Java is ahead on division and comparison, and .NET is slightly ahead on 19-digit addition.
 
-Measured on one AMD Ryzen 7 8745HS running Linux 7.2, 24 November 2026. The [performance report](PERFORMANCE.md) has every result, what each benchmark does, and how to reproduce them.
+Measured on one AMD Ryzen 7 8745HS running Linux 7.2, 24–25 November 2026. The [performance report](PERFORMANCE.md) has every result, what each benchmark does, and how to reproduce them.
 
 ## Concurrency without threads or locks
 

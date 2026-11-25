@@ -1,6 +1,6 @@
 # Lexell benchmarks
 
-Fifteen small programs, each built with the default native backend and, with
+Twenty small programs, each built with the default native backend and, with
 `--c`, through C. Each has a Java port, and all but `pingpong` a hand-written Rust
 port (`pingpong` has a Go one instead: Rust's lightweight tasks are an async runtime
 crate, and the ports use none):
@@ -11,7 +11,12 @@ crate, and the ports use none):
 - `nbody` (floating point), `interp` (a stack machine: an enum with payloads run
   by a match), `closures` (stable sorts with comparator closures, calls through an
   array of functions), `matmul` (a 400 x 400 product over arrays of rows) and
-  `pingpong` (two tasks handing a counter back and forth through promises).
+  `pingpong` (two tasks handing a counter back and forth through promises);
+- `bitpack` (columnar bit-packed integer decode, filter and multiply-sum),
+  `btree` (in-memory order-32 B-tree inserts, splits, lookups and range scans),
+  `hashagg` (open-addressing columnar hash aggregation), `varint_csv`
+  (delimited text parsing and LEB128 varint encoding) and `enum_eval` (boxed
+  closed-type SQL expression AST evaluation over columnar batches).
 
     python3 lexell/bench/bench.py [-n RUNS] [--only NAME ...] [--obo] [--opt] [--perf]
                               [--no-rust] [--no-java]
@@ -139,6 +144,11 @@ output does not depend on the seed.
 | `tokens` | byte scanning and hashing; reads `lexell/compiler/sema.lxl` (any text file works) |
 | `sieve` | the sieve of Eratosthenes up to 10 million, ten rounds; `c/sieve.c` is the same in plain C |
 | `maps` | `std.Map`: 200,000 short and 200,000 long `str` keys and 200,000 `int` keys put, looked up four times, and missed |
+| `bitpack` | columnar bit-packed integer decode (6/4/17-bit), selection filter and multiply-sum |
+| `btree` | in-memory order-32 B-tree inserts/splits, lookups and range scans |
+| `hashagg` | open-addressing columnar hash aggregation (COUNT/SUM/MIN/MAX over 16K groups) |
+| `varint_csv` | delimited text field parsing and LEB128 varint encoding |
+| `enum_eval` | boxed closed-type SQL expression AST evaluation over columnar batches |
 
 The results, with eza and the compiler, are in
 [PERFORMANCE.md](../../PERFORMANCE.md).
