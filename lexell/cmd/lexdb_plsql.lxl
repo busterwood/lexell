@@ -442,6 +442,7 @@ type Cx = record {
     noSubA: int             // tokens noSubA..noSubB are not substituted (an INSERT's column list)
     noSubB: int
     post: []P               // K_PVSETs of the statement being compiled: a package variable it takes as a target (INTO, OUT) is set from a slot after it
+    strict: bool            // a stored procedure's or function's: its expressions and DML checked as Oracle's compile does (checkExpr, checkTarget)
 }
 
 fn (cx: &Cx) tk(i: int): Tok { return cx.toks[min(i, len(cx.toks) - 1)].clone() }
@@ -1209,7 +1210,62 @@ fn (cx: mut &Cx) expr(ip: mut &Ip, sess: mut &lexdb_exec.Session, a: int, b: int
     n.sid = cx.newSid()
     n.pre = pre
     n.flag = cx.uses
+    if cx.strict { try cx.checkExpr(sess, &n.sql, a, b) }
     return Ok(n)
+}
+
+// A stored unit's expression (its SQL, of tokens a..b) checked as Oracle's compile does (design/lexdb-robust.md, the fourth bug
+// slice): one that does not parse is PLS-00103 at the token after it, a name that is no variable, column or function PLS-00201 (the
+// unit is stored invalid, createUnit). Any other error is left for the code's run, as before.
+fn (cx: &Cx) checkExpr(sess: mut &lexdb_exec.Session, sql: &str, a: int, b: int): Result[Unit, DbErr] {
+    match lexdb_parse.oraParseNls(&(lexdb_oratext.oracleSql(sql)), cloneStrs(&cx.nls)) {
+        Ok(_) {}
+        Err(_) { return Err(cx.bad(b, "")) }
+    }
+    match cx.describeText(sess, sql) {
+        Ok(_) {}
+        Err(e) {
+            var name = ""
+            if e.state == "42703" { name = lexdb_oratext.quotedName(&e.msg) }
+            else if e.state == "42883" && strings.startsWith(&e.msg, "function ") {
+                // ("function f(numeric) does not exist", "function f with 1 arguments does not exist")
+                var end = 9
+                while end < len(e.msg) && e.msg[end] != '(' && e.msg[end] != ' ' { end += 1 }
+                name = strings.toUpperAscii(&(e.msg[9..end].toStr()))
+            }
+            if len(name) > 0 { for i in a..b { if cx.ident(i) && cx.tk(i).up == name { return Err(cx.undeclared(i)) } } }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// A stored unit's INSERT, UPDATE, DELETE or MERGE: a table that is not there is a compile error, as Oracle's (the SQL's other
+// errors are found when it runs).
+fn (cx: &Cx) checkTarget(sess: mut &lexdb_exec.Session, sql: &str, a: int): Result[Unit, DbErr] {
+    match lexdb_parse.oraParseNls(&(lexdb_oratext.oracleSql(sql)), cloneStrs(&cx.nls)) {
+        Ok(stmts) {
+            if len(stmts) != 1 || len(stmts[0].table) == 0 { return Ok(Unit{}) }
+            match sess.tableDecl(&stmts[0].table) {
+                Ok(_) {}
+                Err(e) {
+                    if e.state != "42P01" { return Ok(Unit{}) }
+                    // (at the table's name, then the statement ignored at its start, as Oracle's)
+                    let nm = strings.toUpperAscii(&lexdb_sql.baseName(&stmts[0].table))
+                    var at = a
+                    var i = a
+                    while i < len(cx.toks) && cx.tk(i).kind != TK_EOF && !cx.isO(i, ";") {
+                        if cx.ident(i) && cx.tk(i).up == nm { at = i }
+                        i += 1
+                    }
+                    let t = cx.tk(at)
+                    return Err(plErr("ORA06550", &("line " + t.line.toStr() + ", column " + t.col.toStr() + ":\nPL/SQL: ORA-00942: table or view does not exist" +
+                                     "\nORA-06550: line " + cx.stmtLine.toStr() + ", column " + cx.stmtCol.toStr() + ":\nPL/SQL: SQL Statement ignored")))
+                }
+            }
+        }
+        Err(_) {}
+    }
+    return Ok(Unit{})
 }
 
 // ---- types and declarations
@@ -1575,6 +1631,7 @@ fn (cx: mut &Cx) sqlNode(ip: mut &Ip, sess: mut &lexdb_exec.Session, a: int, b: 
             Ok(_) {}
             Err(e) { if e.state == "42P01" { return Err(cx.sqlErr(cx.tk(a).line, &e)) } }
         }
+        if cx.strict && sub == SQ_DML { try cx.checkTarget(sess, &n.sql, a) }
     }
     return Ok(n)
 }
@@ -2564,7 +2621,7 @@ fn (cx: mut &Cx) decls(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[[]P, 
 fn newCx(src: &str, toks: []Tok, owner: &str, nls: []str, sigs: []SigEntry, uid: int): Cx {
     var cx = Cx{src: src.toStr(), toks: toks, pos: 0, vars: [], marks: [], slotPt: [], recs: [], curs: [], excs: [], types: [], bindNames: [],
                 bindUse: [], bindSlot: [], nsid: 0, uid: uid, unit: "", owner: owner.toStr(), retPt: pt(PK_ANY), isFunc: false,
-                self: emptyUnit(), hasSelf: false, sigs: sigs, nls: nls, pkg: "", inMember: false, stopAtEnd: false, members: [], ranges: [], pubs: [], specMode: false, stmtLine: 1, stmtCol: 1, uses: false, hoistOk: true, colScope: [], noSubA: -1, noSubB: -1, post: []}
+                self: emptyUnit(), hasSelf: false, sigs: sigs, nls: nls, pkg: "", inMember: false, stopAtEnd: false, members: [], ranges: [], pubs: [], specMode: false, stmtLine: 1, stmtCol: 1, uses: false, hoistOk: true, colScope: [], noSubA: -1, noSubB: -1, post: [], strict: false}
     append(mut &cx.slotPt, pt(PK_INT))
     append(mut &cx.slotPt, pt(PK_BOOL))
     append(mut &cx.slotPt, pt(PK_BOOL))
@@ -2719,6 +2776,7 @@ fn compileStored(ip: mut &Ip, sess: mut &lexdb_exec.Session, src: &str, owner: &
     cx.self.prms = copyPrms(&u.prms)
     cx.self.ret = u.ret
     cx.hasSelf = true
+    cx.strict = true
     if !(cx.isK(cx.pos, "IS") || cx.isK(cx.pos, "AS")) { return Err(cx.bad(cx.pos, "IS")) }
     cx.pos += 1
     var n = node(K_BLOCK, cx.tk(cx.pos).line)
@@ -4130,6 +4188,14 @@ pub fn ensureProg(pg: mut &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session): Re
                 u.name = s.name.clone()
                 u.kind = if s.kind == "FUNCTION" { U_FUNC } else { U_PROC }
                 u.bad = e.msg.clone()
+                // (its parameters and type from its header, so that a call finds it invalid, not of the wrong arguments)
+                match compileStored(ip, sess, &s.src, &s.owner, [], true) {
+                    Ok(h) {
+                        u.prms = copyPrms(&h.prms)
+                        u.ret = h.ret
+                    }
+                    Err(_) {}
+                }
                 append(mut &units, u)
                 // (a unit whose dependency went: invalid, with its error for USER_ERRORS)
                 if len(s.err) == 0 { append(mut &flips, Stored{owner: s.owner.clone(), name: s.name.clone(), kind: s.kind.clone(), src: s.src.clone(), err: e.msg.clone()}) }
@@ -4223,6 +4289,14 @@ pub fn finalError(e: &DbErr): FinalErr {
 pub fn sqlError(e: &DbErr): DbErr {
     let fe = finalError(e)
     var t = strings.trim(&fe.text)
+    // (a function stored invalid: Oracle's SQL says ORA-06575, where a block says PLS-00905)
+    let bad = strings.indexOf(&t, "PLS-00905: object ", 0)
+    if fe.num == 6550 && bad >= 0 {
+        let rest = t[bad + 18..len(t)].toStr()
+        let dot = strings.indexOf(&rest, ".", 0)
+        let sp = strings.indexOf(&rest, " ", 0)
+        if dot >= 0 && sp > dot { return ora(6575, &("Package or function " + rest[dot + 1..sp] + " is in an invalid state")) }
+    }
     let tail = "\nORA-06512: at line 1"
     if strings.endsWith(&t, tail) { t = t[0..len(t) - len(tail)].toStr() }
     return lexdb_base.err("ORA" + lexdb_oratext.pad5(fe.num), &t)
@@ -4547,6 +4621,17 @@ pub fn findFunction(pg: &Prog, ip: &Ip, name: &str): Option[FnInfo] {
     if u.kind != U_FUNC || len(u.bad) > 0 { return None }
     let o = oidOf(&u.ret)
     return Some(FnInfo{id: u.owner + "." + (if len(u.pkg) > 0 { u.pkg + "." } else { "" }) + u.name, ret: lexdb_sql.oidType(o), oid: o})
+}
+
+// A call's name that means a stored function the user may run but that is stored with compilation errors (or whose dependency went):
+// ORA-06575, as Oracle's SQL says; None for any other name.
+pub fn invalidFunction(pg: &Prog, ip: &Ip, name: &str): Option[DbErr] {
+    if len(pg.units) == 0 || len(name) == 0 { return None }
+    var names: []str = []
+    for part in strings.split(&strings.replaceAll(name, lexdb_sql.QSEP, "."), ".") { append(mut &names, strings.toUpperAscii(&part)) }
+    let i = pg.find(&names, &ip.user)
+    if i < 0 || pg.units[i].kind != U_FUNC || len(pg.units[i].bad) == 0 { return None }
+    return Some(ora(6575, &("Package or function " + pg.units[i].name + " is in an invalid state")))
 }
 
 // The unit and the frame of a statement that is not in a block (lexdb_plcall's callers' stand-ins).
