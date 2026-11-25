@@ -56,7 +56,11 @@ END [ package ] ;
   ORA-04067).
 - Records, subtypes and exceptions declared in a package are not supported, with a body or without. Collection types are not
   supported, as elsewhere in PL/SQL. A member may declare nested subprograms (see [CREATE FUNCTION](create-function.md),
-  example K).
+  example K), and nested subprograms may be overloaded (example L there).
+- **Overloaded members of a package are not told apart:** the members of one name are found by the name alone, and the
+  first one declared answers every call, from SQL and from PL/SQL. With `sq(x NUMBER)` declared before `sq(x VARCHAR2)`,
+  `pkg.sq('abc')` is ORA-06502; with the other order, `pkg.sq(4)` is not an error and answers with the `VARCHAR2`
+  member (the length of `'4'`). Oracle picks the member by the arguments.
 
 ## Examples
 

@@ -54,8 +54,10 @@ parameter:
 
 - Collection-typed parameters, and `AUTHID`, `ACCESSIBLE BY` and `PRAGMA AUTONOMOUS_TRANSACTION` clauses are not
   supported.
-- Subprograms declared inside a procedure work (example H); overloading them is not supported, and a nested function
-  called from SQL inside the procedure is ORA-00904 when it runs (see [CREATE FUNCTION](create-function.md)).
+- Subprograms declared inside a procedure work (example H), and may be overloaded (example I): a call is matched by the
+  number, names and type families of its arguments, as in Oracle; a call that more than one overload fits is PLS-00307
+  and one that none fits PLS-00306, and the procedure is stored invalid. A nested function called from SQL inside the
+  procedure is PLS-00231 at `CREATE`, as in Oracle (see [CREATE FUNCTION](create-function.md)).
 - A call with a wrong argument count is PLS-00306, as in Oracle; an argument that cannot be converted is ORA-06502.
 - **Compilation errors are found for names and syntax only** (example G). A type error, a wrong argument count to a
   built-in function and an unknown column of a `SELECT INTO` appear when the procedure runs, where Oracle finds them
@@ -384,6 +386,53 @@ STATUS
 VALID
 
 1 row selected.
+```
+
+### I. Overloaded nested procedures
+
+Nested procedures of one name are told apart by their arguments. When the arguments fit two of them equally (here
+`x` and `y` are only two names of one parameter), the call is PLS-00307, and the procedure is stored invalid.
+
+<!-- example: oracle -->
+```sql
+CREATE PROCEDURE greet (who VARCHAR2) IS
+  PROCEDURE say (n NUMBER) IS BEGIN DBMS_OUTPUT.PUT_LINE('number ' || n); END;
+  PROCEDURE say (t VARCHAR2) IS BEGIN DBMS_OUTPUT.PUT_LINE('text ' || t); END;
+  PROCEDURE say (t VARCHAR2, n NUMBER) IS BEGIN DBMS_OUTPUT.PUT_LINE(t || ' ' || n); END;
+BEGIN
+  say(7);
+  say(who);
+  say(who, 7);
+END;
+/
+CALL greet('hello');
+CREATE PROCEDURE clash IS
+  PROCEDURE say (x NUMBER) IS BEGIN NULL; END;
+  PROCEDURE say (y NUMBER) IS BEGIN NULL; END;
+BEGIN
+  say(1);
+END;
+/
+SELECT text FROM user_errors WHERE name = 'CLASH' ORDER BY sequence;
+```
+
+```text
+Procedure created.
+
+number 7
+text hello
+hello 7
+
+PL/SQL procedure successfully completed.
+
+Warning: Procedure created with compilation errors.
+
+TEXT
+---------------------------------------------------------
+PLS-00307: too many declarations of 'SAY' match this call
+PL/SQL: Statement ignored
+
+2 rows selected.
 ```
 
 ## See also

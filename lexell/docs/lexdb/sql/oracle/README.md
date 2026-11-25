@@ -88,8 +88,11 @@ views, `LOCK TABLE` outside PL/SQL, `FLASHBACK`, `PURGE`, `AUDIT`, `EXPLAIN PLAN
 | [Exceptions](plsql-exceptions.md) | Handlers, predefined exceptions, `RAISE`, `RAISE_APPLICATION_ERROR`, `SQLCODE`, `SQLERRM`. |
 | [Built-in packages](plsql-builtin-packages.md) | `DBMS_OUTPUT`, `DBMS_LOCK`, `DBMS_SESSION`, `DBMS_SQL.RETURN_RESULT`, and packages accepted and ignored. |
 
-Not available: collections (nested tables, varrays, associative arrays), `FORALL`, `BULK COLLECT`, `GOTO`,
-overloading of subprograms declared inside a block, DDL directly in a block (use `EXECUTE IMMEDIATE`).
+Subprograms declared inside a block, a procedure or a function may be overloaded ([PL/SQL blocks](plsql-blocks.md),
+example F; [CREATE FUNCTION](create-function.md), example L).
+
+Not available: collections (nested tables, varrays, associative arrays), `FORALL`, `BULK COLLECT`, `GOTO`, DDL
+directly in a block (use `EXECUTE IMMEDIATE`).
 
 ## Data types
 

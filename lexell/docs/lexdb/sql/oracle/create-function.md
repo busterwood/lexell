@@ -65,10 +65,10 @@ END [ function ] ;
   error is also found when it runs (Oracle: ORA-06550 first for a block).
 - **Nested subprograms** (a `PROCEDURE` or `FUNCTION` in the declarations of the function, of a block or of another
   nested subprogram) work: forward declarations, recursion, calls between them, and the enclosing units' variables
-  (example K). Not supported: overloading them (one subprogram to a name in a scope: with two `sq` of different
-  argument types the later one is used for both calls, where Oracle picks by the arguments), and calling a nested
-  function from SQL inside the unit (`SELECT sq(3) INTO r FROM dual`: the unit is stored `VALID`, and the statement is
-  ORA-00904 when it runs; Oracle refuses the unit with PLS-00231).
+  (example K). They may be overloaded (example L): a call picks the overload of its name in the nearest scope that
+  declares one by the number, names and type families of its arguments; a call that more than one overload fits is
+  PLS-00307, one that none fits PLS-00306, and the function is stored invalid. A nested function called from SQL inside
+  the unit (`SELECT sq(3) INTO r FROM dual`) is PLS-00231 when the unit is created, as in Oracle.
 - A call's column name is the call as written: `SELECT f(1) FROM dual` names the column `F(1)`, `5+f(3)` is `5+F(3)`
   and `f(id)` is `F(ID)`, as in Oracle (example A). A function whose name is quoted is exact, as every quoted
   name in the Oracle door is (see [CREATE TABLE](create-table.md)): `"MixF"` and `MIXF` are two functions, and
@@ -460,8 +460,8 @@ ORA-06512: at line 2
 ### K. Nested subprograms
 
 A function or procedure declared in the declarations of a unit is local to it, sees the unit's variables, may be
-declared ahead and defined later, and may call itself. The last function calls a nested one from SQL inside the unit,
-which is stored valid and fails when it runs.
+declared ahead and defined later, and may call itself. The last function calls a nested one from SQL inside the unit:
+it is created with compilation errors (PLS-00231), and calling it is ORA-06575.
 
 <!-- example: oracle -->
 ```sql
@@ -512,6 +512,7 @@ END;
 /
 SELECT fact(5) AS fact5, is_even(10) AS e10, is_even(7) AS e7, sum_to(4) AS s4 FROM dual;
 SELECT status FROM user_objects WHERE object_name IN ('FACT', 'IS_EVEN', 'SUM_TO', 'SQL_CALLS_NESTED') ORDER BY object_name;
+SELECT text FROM user_errors WHERE name = 'SQL_CALLS_NESTED' ORDER BY sequence;
 SELECT sql_calls_nested() FROM dual;
 ```
 
@@ -522,7 +523,7 @@ Function created.
 
 Function created.
 
-Function created.
+Warning: Function created with compilation errors.
 
 FACT5 E10 E7 S4
 ----- --- -- --
@@ -531,17 +532,80 @@ FACT5 E10 E7 S4
 1 row selected.
 
 STATUS
-------
+-------
 VALID
 VALID
-VALID
+INVALID
 VALID
 
 4 rows selected.
 
+TEXT
+-----------------------------------------------
+PLS-00231: function 'SQ' may not be used in SQL
+PL/SQL: ORA-03066: invalid PL/SQL expression
+PL/SQL: SQL Statement ignored
+
+3 rows selected.
+
 ERROR:
-ORA-00904: invalid identifier
-ORA-06512: at "SA.SQL_CALLS_NESTED", line 5
+ORA-06575: Package or function SQL_CALLS_NESTED is in an invalid state
+```
+
+### L. Overloaded nested subprograms
+
+Nested functions of one name are told apart by the number, names and type families of the arguments. A call that two of
+them fit is PLS-00307, and one that none fits PLS-00306: lexdb refuses where it cannot tell them apart, and never picks
+one. The function is stored invalid, and `USER_ERRORS` says why.
+
+<!-- example: oracle -->
+```sql
+CREATE FUNCTION measure (n NUMBER) RETURN VARCHAR2 IS
+  FUNCTION size_of (x NUMBER) RETURN NUMBER IS BEGIN RETURN x * x; END;
+  FUNCTION size_of (x VARCHAR2) RETURN NUMBER IS BEGIN RETURN LENGTH(x); END;
+  FUNCTION size_of (x NUMBER, y NUMBER) RETURN NUMBER IS BEGIN RETURN x * y; END;
+BEGIN
+  RETURN size_of(n) || ' ' || size_of('abcd') || ' ' || size_of(n, 3);
+END;
+/
+CREATE FUNCTION clash (n NUMBER) RETURN NUMBER IS
+  FUNCTION sq (x NUMBER) RETURN NUMBER IS BEGIN RETURN x * x; END;
+  FUNCTION sq (y NUMBER) RETURN NUMBER IS BEGIN RETURN y + 1; END;
+BEGIN
+  RETURN sq(n);
+END;
+/
+CREATE FUNCTION nofit (n NUMBER) RETURN NUMBER IS
+  FUNCTION sq (x NUMBER) RETURN NUMBER IS BEGIN RETURN x * x; END;
+BEGIN
+  RETURN sq(n, 2);
+END;
+/
+SELECT measure(5) AS r FROM dual;
+SELECT name, text FROM user_errors WHERE name IN ('CLASH', 'NOFIT') ORDER BY name, sequence;
+```
+
+```text
+Function created.
+
+Warning: Function created with compilation errors.
+
+Warning: Function created with compilation errors.
+
+R
+-------
+25 4 15
+
+1 row selected.
+
+NAME  TEXT
+----- -------------------------------------------------------------
+CLASH PLS-00307: too many declarations of 'SQ' match this call
+CLASH PL/SQL: Statement ignored
+NOFIT PLS-00306: wrong number or types of arguments in call to 'SQ'
+NOFIT PL/SQL: Statement ignored
+
+4 rows selected.
 ```
 
 ## See also

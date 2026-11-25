@@ -49,8 +49,9 @@ END [ label ] ;
 
 - `GOTO`, `FORALL`, `BULK COLLECT` and collection types are not supported (PLS-00103).
 - Subprograms declared in `DECLARE` work (example D): forward declarations, recursion and the enclosing variables
-  included. Not supported: overloading them (the later declaration of a name is the one called) and calling one from SQL
-  inside the block (ORA-00904 when it runs; Oracle: PLS-00231).
+  included. They may be overloaded (example F): a call picks one by the number, names and type families of its
+  arguments, and one that more than one fits is PLS-00307, one that none fits PLS-00306 (ORA-06550 in a block, as in
+  Oracle). Calling one from SQL inside the block is PLS-00231, also as ORA-06550.
 - DDL cannot be written directly in a block; use `EXECUTE IMMEDIATE` (as Oracle requires).
 - `LOCK TABLE` inside a block is ORA-00900.
 
@@ -184,6 +185,74 @@ PLS-00103: GOTO is not supported
 ERROR:
 ORA-00900: invalid SQL statement
 ORA-06512: at line 2
+```
+
+### F. Overloaded subprograms, and calling one from SQL
+
+Subprograms of one name in `DECLARE` are told apart by their arguments. A call that two of them fit is PLS-00307, a call
+that none fits PLS-00306, and a nested function named in a SQL statement of the block is PLS-00231; each stops the block
+before it runs.
+
+<!-- example: oracle -->
+```sql
+DECLARE
+  PROCEDURE show (v NUMBER) IS BEGIN DBMS_OUTPUT.PUT_LINE('number ' || v); END;
+  PROCEDURE show (v VARCHAR2) IS BEGIN DBMS_OUTPUT.PUT_LINE('text ' || v); END;
+  PROCEDURE show (v NUMBER, w NUMBER) IS BEGIN DBMS_OUTPUT.PUT_LINE('sum ' || (v + w)); END;
+BEGIN
+  show(42);
+  show('forty-two');
+  show(40, 2);
+END;
+/
+DECLARE
+  PROCEDURE show (v NUMBER) IS BEGIN DBMS_OUTPUT.PUT_LINE('a ' || v); END;
+  PROCEDURE show (w NUMBER) IS BEGIN DBMS_OUTPUT.PUT_LINE('b ' || w); END;
+BEGIN
+  show(1);
+END;
+/
+DECLARE
+  PROCEDURE show (v NUMBER) IS BEGIN DBMS_OUTPUT.PUT_LINE('a ' || v); END;
+BEGIN
+  show(1, 2);
+END;
+/
+DECLARE
+  r NUMBER;
+  FUNCTION sq (x NUMBER) RETURN NUMBER IS BEGIN RETURN x * x; END;
+BEGIN
+  SELECT sq(3) INTO r FROM dual;
+END;
+/
+```
+
+```text
+number 42
+text forty-two
+sum 42
+
+PL/SQL procedure successfully completed.
+
+ERROR:
+ORA-06550: line 5, column 3:
+PLS-00307: too many declarations of 'SHOW' match this call
+ORA-06550: line 5, column 3:
+PL/SQL: Statement ignored
+
+ERROR:
+ORA-06550: line 4, column 11:
+PLS-00306: wrong number or types of arguments in call to 'SHOW'
+ORA-06550: line 4, column 3:
+PL/SQL: Statement ignored
+
+ERROR:
+ORA-06550: line 5, column 10:
+PLS-00231: function 'SQ' may not be used in SQL
+ORA-06550: line 5, column 10:
+PL/SQL: ORA-03066: invalid PL/SQL expression
+ORA-06550: line 5, column 3:
+PL/SQL: SQL Statement ignored
 ```
 
 ## See also
