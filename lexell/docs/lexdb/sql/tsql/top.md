@@ -42,10 +42,10 @@ MERGE TOP ( expression ) ...
 
 ## Differences from SQL Server
 
-- `INSERT TOP (n)` is not supported (error 102).
-- `PERCENT` is taken in `SELECT` only. `UPDATE TOP (n) PERCENT` is error 102, `DELETE TOP (n) PERCENT` error 208
-  (`PERCENT` is read as a table name), and `MERGE TOP (n) PERCENT` error 50000 ("lexdb: MERGE TOP ... PERCENT is not
-  supported").
+- `INSERT TOP (n)` is not supported (error 156); SQL Server accepts it.
+- `PERCENT` is taken in `SELECT` only. `UPDATE TOP (n) PERCENT` is error 102, `DELETE TOP (n) PERCENT` error 156,
+  and `MERGE TOP (n) PERCENT` error 50000 ("lexdb: MERGE TOP ... PERCENT is not supported"). SQL Server accepts all
+  three.
 - `TOP (`*subquery*`)` is a syntax error (156): put the count in a variable first.
 - `TOP ... WITH TIES` without `ORDER BY` returns every row; SQL Server refuses it (error 1062).
 - `TOP` with a decimal constant and no `PERCENT` (`TOP 2.5`) returns a whole number of rows (3 here); SQL Server

@@ -78,6 +78,8 @@ constraint states mean.
 
 ## Remarks
 
+- `MODIFY`, `DROP COLUMN` and `RENAME COLUMN` of a column an [assertion](create-assertion.md) reads are ORA-08702;
+  `RENAME TO` of its table is ORA-08694. Another column may be added, dropped or renamed.
 - Names in the statement are folded to upper case unless quoted.
 - A constraint has two states: *enabled* or *disabled* (`USER_CONSTRAINTS.STATUS`), and *validated* or *not validated*
   (`VALIDATED`). A disabled constraint is never checked. An enabled one that is not validated is checked for rows
@@ -89,6 +91,9 @@ constraint states mean.
 
 ## Differences from Oracle
 
+- **`DROP COLUMN` is refused while a view reads the table** (ORA-02449), whatever the column: lexdb keeps a view's
+  text. Oracle drops the column and marks a view that used it `INVALID`. Drop the view, change the table, and make
+  the view again.
 - **Not supported (ORA-03001):** `READ ONLY` and `READ WRITE`, and the other clauses of Oracle's `ALTER TABLE`
   (storage, partitions, `MOVE`, `SHRINK`, `ROW MOVEMENT`).
 - **Constraint states** are kept for `CHECK` and foreign key constraints only. `DISABLE` or `NOVALIDATE` of a

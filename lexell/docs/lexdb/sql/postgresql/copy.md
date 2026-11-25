@@ -49,6 +49,10 @@ loading](../../bulk-load.md#postgresql-copy).
 
 ## Remarks
 
+- An [assertion](create-assertion.md) on the table is checked once, for the whole `COPY`, and a violation (23514) undoes
+  it all. The rows `ON_ERROR ignore` skips are not put and do not count. The fast path of an empty table is not
+  taken for an asserted table. With `batch_rows` each batch is checked before it commits: a failure in batch *k* leaves
+  batches 1 to *k*-1 committed and the error's context says how many rows (example G).
 - See [Bulk loading](../../bulk-load.md#postgresql-copy) for the formats, the options, the speed, and loading from
   psql, Java and other clients.
 - A `COPY FROM` is one statement: all its rows go in, or none do, unless `batch_rows` commits it in parts.
@@ -248,6 +252,61 @@ ERROR:  header requires a Boolean value or "match"
 ERROR:  cannot specify HEADER in JSON mode
 ERROR:  COPY FORCE_ARRAY requires JSON mode
 ERROR:  COPY ON_ERROR cannot be used with COPY TO
+```
+
+### G. A table with an assertion
+
+<!-- example: postgresql -->
+```sql
+CREATE TABLE lot (id int PRIMARY KEY, kg int);
+CREATE ASSERTION lot_pos CHECK (NOT EXISTS (SELECT 1 FROM lot WHERE kg <= 0));
+COPY lot FROM STDIN WITH (FORMAT csv);
+1,10
+2,20
+3,-5
+\.
+SELECT count(*) FROM lot;
+COPY lot FROM STDIN WITH (FORMAT csv, ON_ERROR ignore);
+1,10
+2,x
+3,30
+\.
+SELECT id FROM lot ORDER BY id;
+COPY lot FROM STDIN WITH (FORMAT csv, batch_rows 2);
+4,40
+5,50
+6,-1
+7,70
+\.
+SELECT id FROM lot ORDER BY id;
+```
+
+```text
+CREATE TABLE
+CREATE ASSERTION
+ERROR:  assertion "lot_pos" is violated
+ count
+-------
+     0
+(1 row)
+
+NOTICE:  1 row was skipped due to data type incompatibility
+COPY 2
+ id
+----
+  1
+  3
+(2 rows)
+
+ERROR:  assertion "lot_pos" is violated
+CONTEXT:  COPY lot, line 4 (2 rows committed before)
+ id
+----
+  1
+  3
+  4
+  5
+(4 rows)
 ```
 
 ## See also

@@ -72,12 +72,17 @@ ALTER TABLE { database_name.schema_name.table_name | schema_name.table_name | ta
 
 ## Remarks
 
+- `ALTER COLUMN` of a column an [assertion](create-assertion.md) reads converts the values, and then runs the assertion's
+  whole query: 547 if it fails (SQL Server refuses `ALTER COLUMN` of a column a `CHECK` reads, 5074). `DROP COLUMN` of
+  one is 5074.
 - To rename a table, a column or an index, use [sp_rename](sp-rename.md).
 - `ALTER TABLE` is transactional: inside a transaction, `ROLLBACK` undoes it.
 - An unknown table is error 4902; an unknown column is 207.
 
 ## Differences from SQL Server
 
+- **`DROP COLUMN` is refused while a view reads the table** (error 50000: `lexdb keeps a view's text`), whatever the
+  column. SQL Server drops it. Drop the view, change the table, and make the view again.
 - One action per statement: several columns or constraints in one `ADD`, or `DROP COLUMN a, b`, give error 50000
   ("lexdb: ALTER TABLE takes ADD, DROP, ALTER COLUMN, VALIDATE CONSTRAINT, RENAME and SET SCHEMA").
 - **`ADD CONSTRAINT name DEFAULT value FOR column`** is error 102. Give the default when the column is made.

@@ -22,6 +22,9 @@ TRUNCATE TABLE [ schema. ] table [ CASCADE ]
 
 ## Remarks
 
+- `TRUNCATE` of a table an [assertion](create-assertion.md) reads is checked, as in Oracle: one that would leave an
+  `EXISTS` assertion false, or a `NOT EXISTS` assertion's inner table empty under rows that need it, is ORA-08601 and
+  removes nothing.
 - `TRUNCATE` is a DDL statement as in Oracle: it ends the transaction that is open (it commits), and it cannot
   be rolled back. After `TRUNCATE TABLE emp; ROLLBACK;` the table is still empty.
 - The table, its indexes and constraints stay. An identity column goes on from its last value (example A).

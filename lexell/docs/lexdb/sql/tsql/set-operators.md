@@ -34,8 +34,8 @@ Combine the results of two or more queries into one result.
 - NULLs are equal here: two rows that are both NULL in a column match.
 - `INTERSECT` binds tighter than `UNION` and `EXCEPT`; otherwise the operators go from left to right. Parentheses
   change that.
-- `ORDER BY` comes once, after the last query, and sorts the whole result. A query in parentheses may have its own
-  `TOP ... ORDER BY`.
+- `ORDER BY` comes once, after the last query, and sorts the whole result. A query that needs its own `TOP ... ORDER BY`
+  is a derived table (example D).
 
 ## Differences from SQL Server
 
@@ -43,6 +43,8 @@ Combine the results of two or more queries into one result.
   to `int` by type precedence and fails on the first that is not a number (error 245). Constants are converted as
   SQL Server converts them: `SELECT 1 UNION SELECT N'a'` is error 245.
 - Queries with different numbers of columns give error 102; SQL Server gives 205.
+- A query in parentheses with its own `ORDER BY` (`(SELECT TOP (1) ... ORDER BY id) UNION ALL (...)`) is accepted;
+  SQL Server refuses it with error 156. Write each arm as a derived table, as example D does.
 - PostgreSQL's `EXCEPT ALL` and `INTERSECT ALL` are taken; SQL Server refuses them.
 
 ## Examples
@@ -141,13 +143,13 @@ Eve      emp
 (7 rows affected)
 ```
 
-### D. Queries in parentheses with their own TOP
+### D. Queries with their own TOP
 
 <!-- example: tsql -->
 ```sql
-(SELECT TOP (1) name FROM dbo.emp ORDER BY id)
+SELECT name FROM (SELECT TOP (1) name FROM dbo.emp ORDER BY id) AS first_one
 UNION ALL
-(SELECT TOP (1) name FROM dbo.emp ORDER BY id DESC);
+SELECT name FROM (SELECT TOP (1) name FROM dbo.emp ORDER BY id DESC) AS last_one;
 ```
 
 ```text

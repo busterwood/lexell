@@ -18,6 +18,7 @@ These pages are for people who run lexdb and write programs against it. The desi
 | [Transactions](transactions.md) | Isolation, how a transaction starts and ends in each door, retries. |
 | [Security](security.md) | Logins, roles and privileges per door. |
 | [Bulk loading](bulk-load.md) | `COPY`, SQL Server bulk copy (bcp, `SqlBulkCopy`), Oracle array DML. |
+| [Assertions](assertions.md) | `CREATE ASSERTION` in the three doors: one assertion, enforced for every door's writes; the write paths, catalogs and errors. |
 | [Known issues](KNOWN-ISSUES.md) | Bugs and gaps found while writing these pages. |
 
 Still to be written: monitoring (catalog views, statistics).

@@ -52,8 +52,7 @@ Other `NLS_*` parameters, `OPTIMIZER_*`, `SQL_TRACE`, `ISOLATION_LEVEL`, `CURSOR
 - `NLS_NUMERIC_CHARACTERS` and `NLS_LANGUAGE` do not change the output of `TO_CHAR` of numbers or the language of
   messages: the group and decimal characters stay `,` and `.`, the messages those of `AMERICAN`.
 - `SYS_CONTEXT('USERENV', 'NLS_CURRENCY')` is `$` until a territory is set.
-- A logon zone lexdb does not know leaves the session at `+00:00`; Oracle refuses the logon. `'UTC'`, at logon or set
-  here, is kept as `+00:00`: `SESSIONTIMEZONE` shows `+00:00` (Oracle `UTC`).
+- A logon zone lexdb does not know leaves the session at `+00:00`; Oracle refuses the logon.
 - After `ALTER SESSION SET TIME_ZONE`, a JDBC client still shows a `TIMESTAMP WITH LOCAL TIME ZONE` value in its logon
   zone (`getString`); Oracle tells the driver the new zone and lexdb does not. `TO_CHAR` follows the new zone in both.
 - A region set as `TIME_ZONE` is used as the offset it has at each instant: `TO_CHAR(CURRENT_TIMESTAMP, 'TZR')` is
@@ -148,7 +147,10 @@ SELECT TO_CHAR(CURRENT_TIMESTAMP, 'TZH:TZM') AS current_offset, TO_CHAR(SYSTIMES
        TO_CHAR(CAST(TIMESTAMP '2026-03-15 10:00:00' AS TIMESTAMP WITH TIME ZONE), 'HH24:MI TZH:TZM') AS read_in_session,
        TO_CHAR(TIMESTAMP '2026-03-15 10:00:00 +02:00' AT LOCAL, 'HH24:MI TZH:TZM') AS at_local
 FROM dual;
+ALTER SESSION SET TIME_ZONE = 'UTC';
+SELECT SESSIONTIMEZONE FROM dual;
 ALTER SESSION SET TIME_ZONE = '+00:00';
+SELECT SESSIONTIMEZONE FROM dual;
 ```
 
 ```text
@@ -180,6 +182,20 @@ CURRENT_OFFSET SYSTEM_OFFSET READ_IN_SESSION AT_LOCAL
 1 row selected.
 
 Session altered.
+
+SESSIONTIMEZONE
+---------------
+UTC
+
+1 row selected.
+
+Session altered.
+
+SESSIONTIMEZONE
+---------------
++00:00
+
+1 row selected.
 ```
 
 ### D. The time zone format

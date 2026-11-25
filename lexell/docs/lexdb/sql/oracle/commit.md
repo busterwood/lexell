@@ -12,6 +12,8 @@ COMMIT [ WORK ]
 
 ## Remarks
 
+- A deferred [assertion](create-assertion.md) is checked here: a violation fails the `COMMIT` with ORA-02091 (`transaction
+  rolled back`) over ORA-08601, and the transaction is rolled back.
 - A transaction begins with the first `INSERT`, `UPDATE`, `DELETE`, `MERGE` or `SELECT ... FOR UPDATE`. `COMMIT`
   makes its changes visible to other sessions and releases its locks.
 - Other sessions see a change only after its `COMMIT`. A client that is in autocommit mode (a JDBC connection by

@@ -22,15 +22,16 @@ DROP PROPERTY GRAPH [ IF EXISTS ] [ schema. ] graph
 ## Remarks
 
 - The tables the graph names are not touched: their rows, keys and indexes stay.
-- A view that reads the graph through [GRAPH_TABLE](graph-table.md) stays, and reading it is ORA-42421 until a graph
-  of that name is made again.
+- A view that reads the graph through [GRAPH_TABLE](graph-table.md) stays, and reading it is ORA-04063 (`view ... has
+  errors`) until a graph of that name is made again; its `USER_OBJECTS.STATUS` is `INVALID` while the graph is gone and
+  `VALID` as soon as it is back (example B).
+- `CASCADE` and `PURGE` after the name are ORA-03049, as in Oracle (example C).
 - A graph whose tables are gone can be dropped.
 
 ## Differences from Oracle
 
-- A view over a dropped graph is ORA-42421 when read, and its `USER_OBJECTS.STATUS` stays `VALID`; Oracle marks the
-  view `INVALID` and gives ORA-04063 (`view ... has errors`) (example B).
-- `CASCADE` or `PURGE` after the name is ORA-00900; Oracle gives ORA-03049.
+- `USER_OBJECTS.STATUS` of the view is `VALID` again as soon as the graph is made again; Oracle shows it `INVALID` until
+  the view's next use (example B).
 - A quoted name is matched without its case: `DROP PROPERTY GRAPH mixg` drops a graph `"MixG"` (Oracle: ORA-42421).
 
 ## Examples
@@ -93,6 +94,7 @@ DROP PROPERTY GRAPH g;
 SELECT * FROM names;
 SELECT object_name, status FROM user_objects WHERE object_name = 'NAMES';
 CREATE PROPERTY GRAPH g VERTEX TABLES (people);
+SELECT object_name, status FROM user_objects WHERE object_name = 'NAMES';
 SELECT * FROM names ORDER BY 1;
 ```
 
@@ -104,15 +106,21 @@ View created.
 Property graph dropped.
 
 ERROR:
-ORA-42421: property graph does not exist
+ORA-04063: view "SA.NAMES" has errors
+
+OBJECT_NAME STATUS
+----------- -------
+NAMES       INVALID
+
+1 row selected.
+
+Property graph created.
 
 OBJECT_NAME STATUS
 ----------- ------
 NAMES       VALID
 
 1 row selected.
-
-Property graph created.
 
 NAME
 ----
@@ -122,7 +130,27 @@ Bob
 2 rows selected.
 ```
 
-Oracle gives ORA-04063 for the first read of the view and shows it `INVALID`.
+The view is `INVALID` while the graph is gone and `VALID` as soon as it is back. Oracle shows `INVALID` in the second
+query of `USER_OBJECTS` and `VALID` after the view is read.
+
+### C. CASCADE and PURGE
+
+<!-- example: oracle -->
+```sql
+DROP PROPERTY GRAPH g CASCADE;
+DROP PROPERTY GRAPH g PURGE;
+DROP PROPERTY GRAPH g;
+```
+
+```text
+ERROR:
+ORA-03049: SQL keyword 'CASCADE' is not syntactically valid following 'DROP PROPERTY GRAPH g '
+
+ERROR:
+ORA-03049: SQL keyword 'PURGE' is not syntactically valid following 'DROP PROPERTY GRAPH g '
+
+Property graph dropped.
+```
 
 ## See also
 

@@ -7,7 +7,13 @@ reworded after the merge of timestamps that keep their offset, main 178ea2df, an
 Oracle annotation entry was reworded to what is left after the merge of annotations, main 6c2e83f1; the entries that
 the third bug slice fixed, main 84ceec7e, 2026-11-25, are removed or reworded to what is left, checked against it; the
 property graph entries are what is left after the merge of SQL/PGQ in the Oracle door, main e7691bd6, 2026-11-25, and
-were checked against it and Oracle Free 23.26.3). They are not fixed here: the pages describe what lexdb does. Each "Differences" section of the reference lists the smaller
+were checked against it and Oracle Free 23.26.3; the entries that the fourth bug slice fixed, main f87d8cf8, 2026-11-25
+(a NUMBER foreign key to an identity key, views over dropped functions, units created with compilation errors, the
+zone UTC, TO_CHAR of a TIMESTAMP WITH LOCAL TIME ZONE, property graph errors, SQL Server's reserved words as names), are
+removed or reworded to what is left, checked against it, Oracle Free 23.26.3 and SQL Server 2022; the assertion
+entry is what is left after the merges of CREATE ASSERTION in the Oracle door, main ad2ff242, and in the PostgreSQL and
+SQL Server doors with every write path checked, main f23d0ebc, 2026-11-25, checked against main and Oracle Free
+23.26.3). They are not fixed here: the pages describe what lexdb does. Each "Differences" section of the reference lists the smaller
 differences of its statement.
 
 ## All doors
@@ -242,8 +248,11 @@ differences of its statement.
 - **`UPDATE STATISTICS`** is a syntax error (102), on the master and on a replica.
 - **Missing functions:** `UNICODE`, `STDEV`, `STDEVP`, `VAR`, `VARP` and `ATN2` give error 195 ("function ... does
   not exist"). An error 195 ends the batch, as SQL Server's compile errors do.
-- **`INSERT TOP (n)`** is error 102, and a table hint on an `INSERT`'s target (`INSERT INTO t WITH (TABLOCK)`) is
-  error 156. Table hints in `FROM` are read and ignored.
+- **`INSERT TOP (n)`** is error 156 (SQL Server accepts it), and a table hint on an `INSERT`'s target (`INSERT INTO t
+  WITH (TABLOCK)`) is error 156. Table hints in `FROM` are read and ignored.
+- **Reserved words as names:** SQL Server's reserved words are refused as bare table, column and alias names (156), as
+  SQL Server does. A bare alias without `AS` (`SELECT 1 rule`) is 102 (SQL Server 156); `CREATE TABLE HOLDLOCK` and
+  `CREATE TABLE INDEX` are 156 (SQL Server 1018).
 - **No `CREATE LOGIN`.** `CREATE USER name WITH PASSWORD = '...'` is error 102; `CREATE ROLE name LOGIN PASSWORD
   '...'` (PostgreSQL's form) works in this door.
 - **Queries and DML** (found writing the T-SQL query pages):
@@ -255,8 +264,11 @@ differences of its statement.
     and `IDENTITY` are lost. `SELECT IDENTITY(int, 1, 1) AS n ... INTO` is 207.
   - Error 102 for `PIVOT`, `UNPIVOT`, `FOR XML`, `FOR JSON`, `TABLESAMPLE`, `$IDENTITY`, join hints (`INNER LOOP
     JOIN`), `FOR SYSTEM_TIME`, `GROUP BY ... WITH ROLLUP` / `WITH CUBE`; `GROUPING_ID` is 195.
-  - `TOP (subquery)` is 156; `UPDATE TOP (n) PERCENT` 102; `DELETE TOP (n) PERCENT` 208; `MERGE TOP ... PERCENT`
-    50000.
+  - `TOP (subquery)` is 156; `UPDATE TOP (n) PERCENT` 102; `DELETE TOP (n) PERCENT` 156 (SQL Server accepts it);
+    `MERGE TOP ... PERCENT` 50000.
+  - A query in parentheses with its own `ORDER BY` as an arm of `UNION` is accepted (SQL Server: 156).
+  - `ALTER TABLE ... DROP COLUMN` of a table a view reads is 50000 (`lexdb keeps a view's text`), also for a column
+    the view does not use; SQL Server drops it.
   - `UPDATE t SET @v = @v + col` and `SET @v = col = expr` are 102.
   - `OUTPUT ... INTO t` followed by an `OUTPUT` that returns rows is 50000.
   - `SET IDENTITY_INSERT` checks nothing: a missing table (208), a table without an identity (8106), a second table
@@ -290,8 +302,8 @@ differences of its statement.
       statement conflicted with ...`.
   - A column-level `CONSTRAINT fk FOREIGN KEY REFERENCES t (c)` is 102 (without `FOREIGN KEY` it works).
   - `ON [PRIMARY]`, `TEXTIMAGE_ON`, `WITH (...)` index and table options and `ASC` / `DESC` in a key are read and not
-    kept. Still syntax errors: `ROWGUIDCOL`, `SPARSE`, `FILESTREAM`, `MASKED WITH`, `NOT FOR REPLICATION`, `GENERATED
-    ALWAYS AS ROW START` and an inline `INDEX ix (c)`.
+    kept. Still syntax errors: `ROWGUIDCOL`, `SPARSE`, `FILESTREAM`, `MASKED WITH`, `NOT FOR REPLICATION` and `GENERATED
+    ALWAYS AS ROW START`; an inline `INDEX ix (c)` is 156 (SQL Server accepts it).
   - A `rowversion` (`timestamp`) column is never filled in (NULL).
   - A table with two `IDENTITY` columns is accepted (SQL Server: 2744).
   - `##g` is a session-private temporary table, as `#g` is.
@@ -472,18 +484,26 @@ differences of its statement.
     `INVALID` when a column of one of its tables is changed (`ALTER TABLE ... MODIFY`, a column renamed) even with its
     names all there, and `VALID` at its next use (`ADD` of a column and `CREATE INDEX` leave it `VALID`).
     `USER_PG_ELEMENTS.OBJECT_NAME`, `USER_PG_PROP_DEFINITIONS.COLUMN_NAME` and the types in `USER_PG_LABEL_PROPERTIES`
-    stay as they were at `CREATE` (Oracle's follow a rename and a `MODIFY`). `USER_PG_LABEL_PROPERTIES.DATA_LENGTH` is
-    the property's own column's; Oracle gives every property of one name in the graph the longest length of them.
-  - A view over a dropped graph is ORA-42421 when read and stays `VALID` (Oracle: ORA-04063, `INVALID`).
-  - A PL/SQL variable inside `GRAPH_TABLE` is read as a bind (Oracle refuses it: ORA-49028).
-  - Other errors (found on main e7691bd6): the texts of ORA-40983 and ORA-49044 say `is noRows defined` (Oracle: `is
-    never defined`); a property only vertex labels have, read through an edge variable (or the other way round), is
-    ORA-49044 (Oracle: ORA-40983); `{m,}` is ORA-40985 (Oracle: ORA-40984); `SOURCE v` without `KEY` when the edge
-    table has two foreign keys to `v`'s table is ORA-42413 (Oracle: ORA-42431); ORA-42442's text is `cannot infer key
-    for graph element view V` (Oracle: `KEY is not specified for view graph element table V.`); ORA-04045 has no
-    second line with its cause (Oracle adds ORA-00942 or ORA-00904); `DROP PROPERTY GRAPH g CASCADE` (or `PURGE`) is
-    ORA-00900 (Oracle: ORA-03049); `GRAPH_TABLE (...) AS x` is ORA-03048 as in Oracle, but its text keeps only `...)`
-    of the statement before `AS`.
+    stay as they were at `CREATE` (Oracle's follow a rename and a `MODIFY`).
+  - A view that reads a table only through `GRAPH_TABLE` does not stop `ALTER TABLE ... DROP COLUMN` (a view that
+    reads it directly does: ORA-02449, below); the view stays `VALID` after the drop (Oracle: `INVALID`, ORA-04063 when
+    read; lexdb: ORA-04045). `USER_OBJECTS.STATUS` of a view over a graph that was dropped and made again is `VALID` at
+    once (Oracle: `INVALID` until its next use).
+- **Assertions** (`CREATE ASSERTION`, supported since main f23d0ebc; see [CREATE ASSERTION](sql/oracle/create-assertion.md)
+  and [Assertions in the three doors](assertions.md)). What is left, checked against main and Oracle Free 23.26.3:
+  - `USER_ASSERTION_LOCK_MATRIX` has no rows, and `USER_ASSERTIONS.INVALID` is always NULL (Oracle marks an assertion
+    `INVALID` at DDL on its tables, an `ADD COLUMN` too, and still checks it).
+  - Writers of rows that meet in an assertion's join key wait for each other, and without a join key every writer of
+    rows that meet their own conditions; Oracle's locks can be finer, for chains of joins.
+  - Under `NOVALIDATE`, an `UPDATE` or `DELETE` of a table under the assertion's inner `NOT EXISTS` runs the whole query,
+    and is refused when rows already break it, where Oracle's row-only check passes ([CREATE ASSERTION](sql/oracle/create-assertion.md), example G).
+  - The check reads the tables with the rights of the session that writes, not of the assertion's owner: a user with
+    `INSERT` on an asserted table and no `SELECT` is refused with ORA-41900 (`missing READ privilege`); in Oracle the
+    insert goes through and is checked.
+  - Quoted names are matched folded: `CREATE ASSERTION "xd"` is listed as `XD` (Oracle: `xd`).
+  - `SET CONSTRAINT` of a name that does not exist is ORA-02443 (Oracle: ORA-02448).
+  - In the PostgreSQL door an asserted table shows `pg_class.relhastriggers` true (the checks are its triggers, in
+    effect; `pg_trigger` has no rows).
 - **QUALIFY** (Oracle 23.26's clause; see [QUALIFY](sql/oracle/qualify.md)):
   - The ORA-03049 text keeps at most 28 characters of the statement before the word (Oracle cuts differently after a
     long `CONNECT BY`).
@@ -507,9 +527,12 @@ differences of its statement.
     `ALTER INDEX ... REBUILD`, `COALESCE`, `[NO]PARALLEL`, `[NO]LOGGING` and `ALTER VIEW ... COMPILE` are accepted and do
     nothing; `COMMIT COMMENT` and `COMMIT WRITE` are ORA-00900; `COMMENT ON` does not keep the comment and accepts a
     missing table.
-  - A foreign key of type `NUMBER` or `NUMBER(p)` to a `NUMBER GENERATED ... AS IDENTITY` key is refused (ORA-00932,
-    `Key columns "p" and "id" are of incompatible types: numeric and bigint`); an `INTEGER` one is taken, and Oracle
-    takes both (found on main e7691bd6).
+  - A foreign key accepts `ON UPDATE CASCADE` (the child rows follow a parent's key change); Oracle has no such
+    clause and gives ORA-02000 (`missing DELETE keyword`).
+  - `UPDATE` of a `GENERATED ALWAYS` identity column is ORA-32795 (`cannot insert into ...`); Oracle gives ORA-32796
+    (`cannot update ...`) (found on main f87d8cf8).
+  - `ALTER TABLE ... DROP COLUMN` of a table that a view reads is ORA-02449 even for a column the view does not use;
+    Oracle drops it (found on main f87d8cf8).
   - `USER_TAB_COLUMNS.DATA_DEFAULT` of a column whose default is a sequence shows `nextval('s')` (Oracle:
     `"APP"."S"."NEXTVAL"`).
   - Sequences: past `MAXVALUE` the error is ORA-20000 (Oracle ORA-08004); `CURRVAL` before `NEXTVAL` is ORA-20000
@@ -532,12 +555,22 @@ differences of its statement.
     of a DML statement when the subquery reads the statement's own table or refers to its columns; a function whose
     argument is an aggregate or another stored function's call (`f(SUM(x))`, `f(g(x))`). A view may call one (since
     main 84ceec7e), but an `INSERT`, `UPDATE`, `DELETE` or `CREATE TABLE AS` that reads such a view is ORA-03001.
-    After `DROP FUNCTION`, `DROP PACKAGE` or `DROP PACKAGE BODY` of the function, reading the view is ORA-04063 (ORA-04067
-    after `DROP PACKAGE BODY`), as in Oracle, except in a session that read the view before the drop: there the first
-    read gives ORA-00904 or ORA-00900. `USER_OBJECTS.STATUS` of such a view stays `VALID` (Oracle: `INVALID`).
-  - A stored function or procedure whose body has errors Oracle finds when it compiles (an undeclared name, `return n
-    +;`) is created valid; Oracle creates it with compilation errors, `INVALID`, and a view that calls it is ORA-04063.
-    In lexdb the error comes when the code runs.
+    After `DROP FUNCTION`, `DROP PACKAGE` or `DROP PACKAGE BODY` of the function, reading the view is ORA-04063
+    (ORA-04067 after `DROP PACKAGE BODY`, as one line: Oracle adds ORA-06508 and ORA-06512), as in Oracle; in a
+    transaction that wrote something before the drop, the reads give ORA-00904 until it ends. `USER_OBJECTS.STATUS`
+    of such a view is `INVALID` while the function is gone, and `VALID` as soon as it is back (Oracle: at the view's
+    next use). `USER_ERRORS` has no row for the invalid view (Oracle: `TYPE` `VIEW`, `ORA-00904: "F": invalid
+    identifier`).
+  - A stored procedure or function with an undeclared name, an expression that does not parse or DML on a missing
+    table is created with compilation errors (`INVALID`, `USER_ERRORS`), as in Oracle; SQL's call of it is ORA-06575
+    and `CREATE VIEW` over it is refused with ORA-06575. Other compile errors (types, argument counts, unknown
+    columns of `SELECT INTO`, a syntax error inside a SQL statement of the body), and any in a package body or an
+    anonymous block, appear when the code runs (Oracle: ORA-06550 first for a block, ORA-04063 for a package body).
+    PLS-00103's text has no list of expected symbols. Nested subprograms in a stored unit leave it `INVALID`
+    ("subprograms declared in a block are not supported"; Oracle takes them) (found on main f87d8cf8).
+  - The result column of a stored function called with constant arguments is named like `(2)` (`5+okf(3)` is `5+(4)`):
+    the result in brackets, where Oracle names it `OKF(1)` (`5+OKF(3)`); with a column as argument it is `OKF(ID)`, as
+    in Oracle (found on main f87d8cf8).
   - Annotations (supported since main 6c2e83f1; see [annotations](sql/oracle/annotations.md)): `ALL_` and
     `DBA_ANNOTATIONS_USAGE` have no rows for the built-in domains of `SYS` and `DOMAIN_NAME` / `DOMAIN_OWNER` are
     always NULL (lexdb has no domains); a global temporary table's annotations are kept but not listed.
@@ -571,12 +604,10 @@ differences of its statement.
     converts a `TIMESTAMP WITH LOCAL TIME ZONE` value by its logon zone (`getString` gives `2026-03-15 13:30:00.0
     Asia/Kolkata` in a session set to `-05:00`; Oracle `2026-03-15 03:00:00.0 -05:00`: it tells the driver the new zone
     in a session-state message lexdb does not send; `TO_CHAR` is right). A logon time zone lexdb does not know (a
-    client's `ORA_SDTZ` of `Foo/Bar`) leaves the session at `+00:00` (Oracle refuses the logon, ORA-00604); the zone
-    `UTC`, at logon (a JDBC client in UTC) or by `ALTER SESSION SET TIME_ZONE = 'UTC'`, is kept as `+00:00`, so
-    `SESSIONTIMEZONE` shows `+00:00` (Oracle `UTC`; found on main 84ceec7e). `MIN` and `MAX` of equal instants with
-    different offsets show the first in lexdb's scan order, which is primary key order (Oracle's is the order the rows
-    were inserted). `TO_CHAR` of a `TIMESTAMP WITH LOCAL TIME ZONE` takes the zone elements (`TZH:TZM` gives the
-    session's offset; Oracle: ORA-01821; found on main 84ceec7e).
+    client's `ORA_SDTZ` of `Foo/Bar`) leaves the session at `+00:00` (Oracle refuses the logon, ORA-00604). `MIN` and `MAX`
+    of equal instants with different offsets show the first in lexdb's scan order, which is primary key order (Oracle's
+    is the order the rows were inserted). `TO_CHAR` of a `TIMESTAMP WITH LOCAL TIME ZONE` refuses `TZH` and `TZM` (ORA-01821)
+    and takes `TZR` and `TZD`, as Oracle; `TZR` is the offset (`+00:00`; Oracle `UTC`) as above.
   - **Conversion:** `TO_CHAR` number elements `EEEE`, `RN`, `XXXX`, `TM`, `B`, `V`, `C` are ORA-01481 and date elements
     `CC`, `E`, `RM`, `YEAR`, `SYYYY`, `DS`, `DL`, `TS` are ORA-01821 (the zone elements `TZH`, `TZM`, `TZR` and `TZD`
     work on a value with a time zone, and are ORA-01821 on one without, as in Oracle); `CAST(TRUE AS CHAR(5))` is

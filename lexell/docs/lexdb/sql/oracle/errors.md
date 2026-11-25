@@ -47,18 +47,19 @@ The errors of [CREATE PROPERTY GRAPH](create-property-graph.md), [DROP PROPERTY 
 | Error | Meaning |
 |---|---|
 | ORA-42421 | A property graph that does not exist (`GRAPH_TABLE`, `DROP PROPERTY GRAPH`). |
-| ORA-04045 | `GRAPH_TABLE` over a graph whose table, or a column it names, has been dropped or renamed. |
+| ORA-04045 | `GRAPH_TABLE` over a graph whose table, or a column it names, has been dropped or renamed (a second line gives the cause: ORA-00942 or ORA-00904). |
 | ORA-42402, ORA-42442 | An element table without a primary key and without `KEY`; a view without `KEY`. |
 | ORA-42404, ORA-42416 | Two elements of one name; a column twice in a `KEY`. |
 | ORA-42405 | `REFERENCES` of a name that is no vertex element (a table's name where the element has an alias). |
-| ORA-42413 | `SOURCE` or `DESTINATION` without `KEY`, when the edge table has no foreign key to that vertex table. |
+| ORA-42413, ORA-42431 | `SOURCE` or `DESTINATION` without `KEY`, when the edge table has no foreign key to that vertex table; when it has more than one. |
 | ORA-42415 | `KEY (...) REFERENCES v (...)` with lists of different lengths. |
 | ORA-42407 | A property twice in one label. |
 | ORA-42409, ORA-42414 | A label on two elements with other property names; with a property of another kind of type. |
 | ORA-42424, ORA-42439 | A property expression without `AS`; one that calls a function that is not deterministic (`SYSDATE`). |
 | ORA-40954, ORA-40951 | A label the graph does not have; `!` in a label expression. |
 | ORA-40983, ORA-49044, ORA-49013 | A property no label of the graph has; one the variable's labels do not have; a property of a variable whose label expression no element satisfies. |
-| ORA-40984, ORA-40985, ORA-49003 | A quantifier bound out of range (`{0}`, `{3,1}`); an unbounded quantifier (`+`, `*`, `{m,}`); `?`. |
+| ORA-40984, ORA-40985, ORA-49003 | A quantifier bound out of range (`{0}`, `{3,1}`) or unbounded (`{m,}`); `+` and `*`; `?`. |
+| ORA-49028 | A PL/SQL variable inside `GRAPH_TABLE` (a bind is taken). |
 | ORA-40997 | A quantifier after a vertex pattern; a `GRAPH_TABLE` without `COLUMNS`. |
 | ORA-40990, ORA-40998, ORA-49011, ORA-40956 | A quantified variable outside an aggregate in `COLUMNS`; in the pattern's `WHERE`; an aggregate without a quantified variable (and `COUNT(*)`); `COUNT(e)` without a property. |
 | ORA-49000, ORA-40996 | A vertex and an edge variable of one name; a variable that is not in the pattern, or a column of the query outside. |
@@ -75,6 +76,7 @@ The errors of [CREATE PROPERTY GRAPH](create-property-graph.md), [DROP PROPERTY 
 | ORA-02290 | A `CHECK` constraint violated. |
 | ORA-02291 | No parent key for a foreign key. |
 | ORA-02292 | A child row exists for a parent key being deleted. |
+| ORA-02267 | A foreign key column whose type cannot refer to the key's (`VARCHAR2` or `BINARY_DOUBLE` to a `NUMBER`; a `NUMBER` to an identity or `INTEGER` key is taken: [CREATE TABLE](create-table.md), example N). |
 | ORA-02293 | `ENABLE`, `VALIDATE` or `ADD CONSTRAINT` of a `CHECK` that a row breaks. |
 | ORA-02298 | `ENABLE`, `VALIDATE` or `ADD CONSTRAINT` of a foreign key that a row has no parent for. |
 | ORA-02299 | `ADD CONSTRAINT` of a `UNIQUE` key over duplicate values. |
@@ -95,6 +97,37 @@ The errors of [CREATE PROPERTY GRAPH](create-property-graph.md), [DROP PROPERTY 
 | ORA-12725 to ORA-12732 | A regular expression that cannot be read: unmatched parentheses, bracket, back reference, range, class, repeat count. |
 | ORA-01841, ORA-01843 | A date that cannot be read: a bad year or month. |
 | ORA-01727 | A `NUMBER` precision out of range (1 to 38). |
+
+### Assertions
+
+See [CREATE ASSERTION](create-assertion.md). The same errors come in the other doors as 23514, 547 and the numbers
+in [Assertions in the three doors](../../assertions.md#errors-of-each-door).
+
+| Error | Meaning |
+|---|---|
+| ORA-08601 | A statement broke an assertion (`Assertion (APP.A1) violated.`); the statement is undone. Also `SET CONSTRAINT ... IMMEDIATE`, `ALTER ASSERTION ... ENABLE VALIDATE`, and the first line under ORA-08689 or ORA-02091. |
+| ORA-02091 | The `COMMIT` of a deferred assertion that failed: the transaction was rolled back; ORA-08601 is on the next line. |
+| ORA-08689 | `CREATE ASSERTION failed`: the next line is the reason (below), or ORA-08601 when the rows there break it. |
+| ORA-08661 | The reason: an aggregate, `GROUP BY` or `HAVING`. |
+| ORA-08695 | The reason: a subquery under `OR`. |
+| ORA-08680 | The reason: a subquery in `SATISFY`. |
+| ORA-08697 | The reason: `FETCH FIRST`. |
+| ORA-08677 | The reason: `SYSDATE`, `ROWNUM` and the like. |
+| ORA-08664 | The reason: a window function. |
+| ORA-08678 | The reason: `DUAL`. |
+| ORA-08651 | The reason: a view. |
+| ORA-08735 | The reason: an ANSI join. |
+| ORA-08659 | The reason: `IN` with an aggregate subquery. |
+| ORA-08660 | The reason: `WITH`. |
+| ORA-08673 | The reason: an equijoin of columns that may be NULL (`Equijoin "A"."G"="B"."G" found does not meet the criteria to do a FAST validation.`). |
+| ORA-08702 | `DROP TABLE` (without `CASCADE CONSTRAINTS`), `DROP COLUMN`, `RENAME COLUMN` or `MODIFY` of what an assertion reads (`Columns are referenced by assertion APP.A1.`). |
+| ORA-08694 | `RENAME` or `ALTER TABLE ... RENAME TO` of a table an assertion reads. |
+| ORA-08687 | `SET CONSTRAINT ... DEFERRED` of an assertion that is not deferrable. |
+| ORA-08724 | `NOT DEFERRABLE INITIALLY DEFERRED`. |
+| ORA-08725 | `ALTER ASSERTION ... DEFERRABLE`: a deferrability cannot be changed. |
+| ORA-08701 | `DISABLE VALIDATE`. |
+| ORA-13650 | `DROP` or `ALTER ASSERTION` of an assertion that does not exist. |
+| ORA-02443 | `SET CONSTRAINT` of a name that is no constraint or assertion (Oracle: ORA-02448). |
 
 ### Users, privileges and the session
 
@@ -127,7 +160,8 @@ The errors of [CREATE PROPERTY GRAPH](create-property-graph.md), [DROP PROPERTY 
 | ORA-20000 to ORA-20999 | `RAISE_APPLICATION_ERROR` with your own number; lexdb also uses ORA-20000 for some of its own refusals (a sequence at its limit, a savepoint outside a transaction). |
 | ORA-04042 | `GRANT EXECUTE` on a procedure that does not exist. |
 | ORA-04043 | `ALTER PROCEDURE`, `FUNCTION` or `PACKAGE ... COMPILE` of a unit that does not exist. |
-| ORA-06575, PLS-00905 | `CALL` of a unit that is invalid (it was stored with compile errors); a block that names one. |
+| ORA-06575, PLS-00905 | A call of a unit that is invalid (it was stored with compile errors): `CALL` or a function in SQL (and so a `CREATE VIEW` over it); a block that names one. |
+| ORA-04063, ORA-04067 | A view over a function, package or property graph that was dropped (`view ... has errors`); a package body that was dropped. |
 
 ### Refusals
 
@@ -148,11 +182,6 @@ The errors of [CREATE PROPERTY GRAPH](create-property-graph.md), [DROP PROPERTY 
   (Oracle: ORA-01086), a sequence past its limit is ORA-20000 (Oracle: ORA-08004).
 - `INSERT ALL`, `CREATE TRIGGER` and `CREATE SYNONYM` are refused as above (ORA-00900 and ORA-03001).
 - Some statements lexdb does not take are ORA-00900 where Oracle's syntax is fine (a clause lexdb does not know).
-- The texts of ORA-40983 and ORA-49044 say `is noRows defined` where Oracle's say `is never defined` (example J), and
-  ORA-42442's is `cannot infer key for graph element view V` (Oracle: `KEY is not specified for view graph element
-  table V.`). An edge variable's property that only vertex labels have is ORA-49044 (Oracle: ORA-40983), `{m,}` is
-  ORA-40985 (Oracle: ORA-40984), and an edge table with two foreign keys to the `SOURCE` table is ORA-42413 (Oracle:
-  ORA-42431).
 
 ## Examples
 
@@ -513,7 +542,7 @@ ERROR:
 ORA-40954: unknown label
 
 ERROR:
-ORA-40983: property "NOSUCH" is noRows defined
+ORA-40983: property "NOSUCH" is never defined
 
 ERROR:
 ORA-02000: missing AS keyword
@@ -525,6 +554,55 @@ Property graph dropped.
 
 ERROR:
 ORA-42421: property graph does not exist
+```
+
+### K. Assertions
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE ak (id NUMBER PRIMARY KEY, v NUMBER);
+CREATE ASSERTION ak_pos CHECK (NOT EXISTS (SELECT 1 FROM ak WHERE v < 0)) DEFERRABLE;
+INSERT INTO ak VALUES (1, -1);
+SET CONSTRAINT ak_pos DEFERRED;
+INSERT INTO ak VALUES (1, -1);
+COMMIT;
+DROP TABLE ak;
+ALTER TABLE ak RENAME TO ak2;
+ALTER ASSERTION ak_pos DEFERRABLE;
+CREATE ASSERTION ak_bad CHECK (NOT EXISTS (SELECT 1 FROM ak WHERE v < 0)) NOT DEFERRABLE INITIALLY DEFERRED;
+DROP ASSERTION nosuch;
+```
+
+```text
+Table created.
+
+Assertion created.
+
+ERROR:
+ORA-08601: Assertion (SA.AK_POS) violated.
+
+Statement processed.
+
+1 row created.
+
+ERROR:
+ORA-02091: transaction rolled back
+ORA-08601: Assertion (SA.AK_POS) violated.
+
+ERROR:
+ORA-08702: Columns are referenced by assertion SA.AK_POS.
+
+ERROR:
+ORA-08694: Cannot rename a table referenced in assertion.
+
+ERROR:
+ORA-08725: Attempting to modify deferrability of assertion.
+
+ERROR:
+ORA-08724: Attempting to set assertion to INITIALLY DEFERRED NOT DEFERRABLE.
+
+ERROR:
+ORA-13650: The specified object does not exist for this execution.
 ```
 
 ## See also

@@ -338,6 +338,8 @@ TCPS redirects (`--tcps` with `--replica-tcps`) are built but not yet tested.
 ## Limits
 
 - Replicas run on the master's machine. Replicas on other machines are not built.
+- A replica never checks an [assertion](assertions.md): it applies what the master decided. `CREATE ASSERTION` on a
+  replica is refused as any change is; an assertion made on the master is listed on the replica.
 - There is no failover: a replica is never promoted. The supervisor restarts a master that crashes.
 - `BEGIN READ WRITE` and `SET TRANSACTION READ WRITE` on a replica are accepted (`transaction_read_only` stays `on`)
   and the writes then fail with 25006; PostgreSQL refuses the statement itself (0A000).

@@ -82,7 +82,9 @@ INTERVAL 'text' { YEAR TO MONTH | DAY TO SECOND | unit }
   it logged on with (`getString` gives `2026-03-15 13:30:00.0 Asia/Kolkata` in a session set to `-05:00`; Oracle
   `2026-03-15 03:00:00.0 -05:00`): Oracle tells the driver the new zone, lexdb does not. `TO_CHAR` shows it in the
   session's zone, as in Oracle (example H).
-- `TO_CHAR` of a `TIMESTAMP WITH LOCAL TIME ZONE` takes `TZH` and `TZM` (the session's offset); Oracle gives ORA-01821.
+- `TO_CHAR` of a `TIMESTAMP WITH LOCAL TIME ZONE` refuses `TZH` and `TZM` (ORA-01821) and takes `TZR` and `TZD`, as
+  Oracle does; `TZR` shows the offset where Oracle shows the zone's name (`+00:00`, `UTC`; see the region entry
+  above) and `TZD` nothing (`GMT`). Without a format it is in `NLS_TIMESTAMP_FORMAT` (example H).
 - `MIN` and `MAX` of equal instants at different offsets show the first in lexdb's scan order, which is primary key
   order; Oracle's is the order the rows were inserted.
 - A `VALUES` list (`FROM (VALUES (...)) v (a, b)`) keeps the instant, not the offset: `10:00 +02:00` comes out as
@@ -299,6 +301,8 @@ ALTER SESSION SET TIME_ZONE = '-05:00';
 SELECT TO_CHAR(at_local, 'YYYY-MM-DD HH24:MI') AS at_local, TO_CHAR(CAST(at_local AS TIMESTAMP WITH TIME ZONE), 'TZH:TZM') AS zone FROM seen;
 ALTER SESSION SET TIME_ZONE = '+00:00';
 SELECT TO_CHAR(at_local, 'YYYY-MM-DD HH24:MI') AS at_local FROM seen;
+SELECT TO_CHAR(at_local, 'YYYY-MM-DD HH24:MI TZH:TZM') AS with_zone FROM seen;
+SELECT TO_CHAR(at_local) AS default_format FROM seen;
 ```
 
 ```text
@@ -325,6 +329,15 @@ Session altered.
 AT_LOCAL
 ----------------
 2026-03-15 08:00
+
+1 row selected.
+
+ERROR:
+ORA-01821: date format not recognized
+
+DEFAULT_FORMAT
+----------------------------
+15-MAR-26 08.00.00.000000 AM
 
 1 row selected.
 ```

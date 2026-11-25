@@ -33,7 +33,7 @@ The codes are PostgreSQL's, with PostgreSQL's meaning. The first two characters 
 
 | Code | Name | Cause in lexdb |
 |---|---|---|
-| 0A000 | feature_not_supported | Something lexdb does not do. The message starts with `lexdb:` (`lexdb: time with time zone is not supported`). |
+| 0A000 | feature_not_supported | Something lexdb does not do. The message starts with `lexdb:` (`lexdb: time with time zone is not supported`). Also an [assertion](create-assertion.md)'s query that lexdb cannot check (`assertion's query is not supported: `, with the reason) and a rename of a table or column an assertion reads. |
 
 ### Class 0L: invalid grantor
 
@@ -77,7 +77,7 @@ The codes are PostgreSQL's, with PostgreSQL's meaning. The first two characters 
 | 23502 | not_null_violation | NULL in a `NOT NULL` column. |
 | 23503 | foreign_key_violation | A row with no parent, or a parent row still referenced; `ALTER CONSTRAINT ... ENFORCED` when a row has no parent. |
 | 23505 | unique_violation | A duplicate key in a primary key or unique constraint or index. |
-| 23514 | check_violation | A row a `CHECK` constraint refuses; `ALTER CONSTRAINT ... ENFORCED` when a row breaks it (`is violated by some row`). |
+| 23514 | check_violation | A row a `CHECK` constraint refuses; `ALTER CONSTRAINT ... ENFORCED` when a row breaks it (`is violated by some row`). Also a write that breaks an [assertion](create-assertion.md) (`assertion "a" is violated`), at the statement or at `COMMIT` for a deferred one, and `CREATE ASSERTION` over rows that break it (`assertion "a" is violated by some row`). |
 
 ### Class 25: invalid transaction state
 
@@ -99,7 +99,7 @@ The codes are PostgreSQL's, with PostgreSQL's meaning. The first two characters 
 
 | Code | Name | Cause in lexdb |
 |---|---|---|
-| 2BP01 | dependent_objects_still_exist | `DROP` or `ALTER` of an object that others depend on, without `CASCADE` (a sequence a column default calls, for one). |
+| 2BP01 | dependent_objects_still_exist | `DROP` or `ALTER` of an object that others depend on, without `CASCADE` (a sequence a column default calls, for one; a table or column an [assertion](create-assertion.md) reads). |
 | 26000 | invalid_sql_statement_name | A prepared statement name the session does not have (extended protocol). |
 | 34000 | invalid_cursor_name | A portal name the session does not have (extended protocol). |
 | 3B001 | invalid_savepoint_specification | `ROLLBACK TO` or `RELEASE` of a savepoint that does not exist. |
@@ -122,13 +122,13 @@ The codes are PostgreSQL's, with PostgreSQL's meaning. The first two characters 
 | 42701 | duplicate_column | A column named twice. |
 | 42702 | ambiguous_column | A column name that more than one table in `FROM` has. |
 | 42703 | undefined_column | A column that does not exist. |
-| 42704 | undefined_object | A type, role, index, setting or other object that does not exist. |
-| 42710 | duplicate_object | A role, type, enum label or constraint that already exists. |
+| 42704 | undefined_object | A type, role, index, setting, assertion or other object that does not exist. |
+| 42710 | duplicate_object | A role, type, enum label, constraint or assertion that already exists (an assertion shares its namespace with tables: a table's name is 42P07). |
 | 42712 | duplicate_alias | A table name or alias used twice in `FROM`. |
 | 42725 | ambiguous_function | A call that more than one function matches. |
 | 42803 | grouping_error | A column that must be in `GROUP BY`; an aggregate where none is allowed. |
 | 42804 | datatype_mismatch | Values whose types cannot meet: `CASE`, `COALESCE`, `GREATEST`, `UNION` or `VALUES` over a number and a boolean. |
-| 42809 | wrong_object_type | An object of the wrong kind (a view where a table is needed; `ANY` without an array); `ALTER CONSTRAINT ... ENFORCED` of a key. |
+| 42809 | wrong_object_type | An object of the wrong kind (a view where a table is needed; `ANY` without an array); `ALTER CONSTRAINT ... ENFORCED` of a key; `SET CONSTRAINTS ... DEFERRED` of a constraint or assertion that is not deferrable. |
 | 42830 | invalid_foreign_key | A foreign key without a matching unique key, or with the wrong number of columns. |
 | 42846 | cannot_coerce | A cast lexdb does not have. |
 | 42883 | undefined_function | A function or operator that does not exist for those argument types. |
@@ -136,7 +136,7 @@ The codes are PostgreSQL's, with PostgreSQL's meaning. The first two characters 
 | 428C9 | generated_always | A value for a `GENERATED ALWAYS` column. |
 | 42P01 | undefined_table | A table, view or sequence that does not exist. |
 | 42P06 | duplicate_schema | A schema that already exists. |
-| 42P07 | duplicate_table | A table, view, index or sequence that already exists. |
+| 42P07 | duplicate_table | A table, view, index or sequence that already exists, or an assertion's name taken by one. |
 | 42P10 | invalid_column_reference | An `ORDER BY` or `GROUP BY` position past the select list; a bad `ON CONFLICT` target. |
 | 42P13 | invalid_function_definition | `CREATE OR REPLACE FUNCTION` that changes the result type or a parameter's name. |
 | 42P16 | invalid_table_definition | Bad table options: `ON COMMIT` on a permanent table, a temporary table in a permanent schema, a second `PRIMARY KEY`. |
@@ -356,6 +356,36 @@ HINT:  Only foreign key and check constraints can change enforceability.
 ERROR:  0A000: lexdb: ALTER CONSTRAINT ... DEFERRABLE is not supported
 ERROR:  55000: cannot validate NOT ENFORCED constraint
 ERROR:  42601: misplaced NOT ENFORCED clause
+```
+
+### I. Assertions
+
+<!-- example: postgresql -->
+```sql
+\set VERBOSITY verbose
+CREATE TABLE ia (id int PRIMARY KEY, v int);
+CREATE ASSERTION ia_pos CHECK (NOT EXISTS (SELECT 1 FROM ia WHERE v < 0)) DEFERRABLE;
+INSERT INTO ia VALUES (1, -1);
+CREATE ASSERTION ia_pos CHECK (NOT EXISTS (SELECT 1 FROM ia WHERE v < 1));
+CREATE TABLE ia_pos (x int);
+DROP ASSERTION nosuch;
+CREATE ASSERTION ia_cnt CHECK (NOT EXISTS (SELECT 1 FROM ia GROUP BY id HAVING count(*) > 1));
+DROP TABLE ia;
+ALTER TABLE ia RENAME TO ia2;
+```
+
+```text
+CREATE TABLE
+CREATE ASSERTION
+ERROR:  23514: assertion "ia_pos" is violated
+ERROR:  42710: assertion "ia_pos" already exists
+ERROR:  42P07: relation "ia_pos" already exists
+ERROR:  42704: assertion "nosuch" does not exist
+ERROR:  0A000: assertion's query is not supported: aggregates, GROUP BY or HAVING
+ERROR:  2BP01: cannot drop table ia because other objects depend on it
+DETAIL:  assertion ia_pos depends on table ia
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+ERROR:  0A000: cannot rename table ia because assertion ia_pos reads it
 ```
 
 ## See also

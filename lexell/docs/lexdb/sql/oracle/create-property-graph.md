@@ -61,7 +61,7 @@ properties:
   element `people` (its element name: with an alias, the alias, ORA-42405 for the table's name). The vertex columns
   are the vertex element's key when left out, and need not be a key. The two lists must have as many columns
   (ORA-42415). Without `KEY ... REFERENCES` (`SOURCE people`), the end is the edge table's foreign key to the vertex
-  table; one is needed (ORA-42413).
+  table; one is needed (ORA-42413 when there is none, ORA-42431 when there are several).
 
 `LABEL` *label*
 : A label of the element, with its properties. An element may have several. Vertex and edge labels share one set of
@@ -95,16 +95,15 @@ Without any `LABEL`, an element has the default label (its own name), with the p
 
 ## Differences from Oracle
 
-- `SOURCE v` without `KEY` when the edge table has two foreign keys to `v`'s table is ORA-42413; Oracle gives
-  ORA-42431 (`ambiguous edge relationship`).
 - `USER_OBJECTS.STATUS` says whether the tables and columns the graph names are there. Oracle marks a graph `INVALID`
   when a column of one of its tables is changed (`ALTER TABLE ... MODIFY`, a column renamed), even when its names are
   all there, and `VALID` again at its next use; `ADD` of a column and `CREATE INDEX` leave it `VALID`.
 - `USER_PG_ELEMENTS.OBJECT_NAME`, `USER_PG_PROP_DEFINITIONS.COLUMN_NAME` and the types in
   `USER_PG_LABEL_PROPERTIES` are as they were at `CREATE`; Oracle's follow a rename and an `ALTER TABLE ... MODIFY`.
-- ORA-04045 comes alone; Oracle adds the cause on a second line (ORA-00942 for the table, ORA-00904 for a column).
-- The text of ORA-42442 is `cannot infer key for graph element view OSLO`; Oracle's is `KEY is not specified for view
-  graph element table OSLO.` (example F).
+- `ALTER TABLE ... DROP COLUMN` of a column of a table that a view reads (directly, as by `SELECT`) is ORA-02449: the
+  view's text is kept, so the view has to be dropped first. Oracle drops the column and marks the view, and a graph
+  that names the column, `INVALID`. A view that reads the table only through `GRAPH_TABLE` does not stop it, and
+  stays `VALID` after the drop where Oracle marks it `INVALID`, and reading it is ORA-04045 (Oracle: ORA-04063).
 - `COMMENT ON PROPERTY GRAPH` is accepted and not kept (`USER_PG_COMMENTS.COMMENTS` stays empty), as for every
   `COMMENT ON` in lexdb. `ALTER PROPERTY GRAPH ... COMPILE` is ORA-03001, and privileges on a graph
   (`GRANT READ ON PROPERTY GRAPH`) ORA-00942: `GRAPH_TABLE` reads the tables with the session's privileges.
@@ -395,7 +394,7 @@ CREATE PROPERTY GRAPH g_visits VERTEX TABLES (visits);
 View created.
 
 ERROR:
-ORA-42442: cannot infer key for graph element view OSLO
+ORA-42442: KEY is not specified for view graph element table OSLO.
 
 Property graph created.
 
@@ -442,6 +441,7 @@ Table dropped.
 
 ERROR:
 ORA-04045: errors during recompilation or revalidation of SA.G_OFFICES
+ORA-00942: table or view "SA"."OFFICES" does not exist
 
 OBJECT_NAME STATUS
 ----------- -------
@@ -467,6 +467,7 @@ Table altered.
 
 ERROR:
 ORA-04045: errors during recompilation or revalidation of SA.G_OFFICES
+ORA-00904: "TOWN": invalid identifier
 
 Table altered.
 
@@ -537,7 +538,7 @@ GRANT READ ON PROPERTY GRAPH social TO PUBLIC;
 
 ```text
 ERROR:
-ORA-42413: cannot infer edge relationship for edge table KNOWS
+ORA-42431: ambiguous edge relationship for graph edge table KNOWS
 
 Comment created.
 
@@ -554,8 +555,8 @@ ERROR:
 ORA-00942: table or view does not exist
 ```
 
-Oracle gives ORA-42431 for the first statement (`knows` has two foreign keys to `people`), keeps the comment, and
-runs the last two.
+The first statement is ORA-42431 as in Oracle (`knows` has two foreign keys to `people`). Oracle also keeps the comment
+and runs the last two.
 
 ## See also
 

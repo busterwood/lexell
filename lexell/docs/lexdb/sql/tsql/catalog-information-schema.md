@@ -52,6 +52,14 @@ PostgreSQL's values. They answer from the same catalog as [the `sys` views](cata
 `CHECK_CONSTRAINTS`
 : `constraint_name` and `check_clause`.
 
+`ASSERTIONS`
+: One row per [assertion](create-assertion.md) (the standard's view; SQL Server has none): `constraint_catalog`,
+  `constraint_schema`, `constraint_name`, `is_deferrable`, `initially_deferred`. An assertion also has a row in
+  `CHECK_CONSTRAINTS` (its condition as written) and one in `CONSTRAINT_COLUMN_USAGE` for each column it reads. It has
+  **no `sys.objects` row**: SQL Server has no object type for one, and a made-up type would be listed by SSMS's Object
+  Explorer and `sp_help` under nothing. So SSMS, `sp_help` and mssql-jdbc's `DatabaseMetaData` do not see it,
+  and `OBJECT_ID('a')` is NULL.
+
 `SCHEMATA`
 : `schema_name`, `schema_owner`.
 
@@ -79,6 +87,7 @@ PostgreSQL's values. They answer from the same catalog as [the `sys` views](cata
   `varchar`, `numeric`. Use `sys.columns` and `sys.types` when you need SQL Server's forms.
   `CHECK_CONSTRAINTS.check_clause` is SQL Server's text, `([salary]>=(0))`, as `sys.check_constraints.definition` is
   (see [constraints](catalog-constraints.md) for where it differs).
+- An assertion's `constraint_schema` shows `public` where `dbo` is meant.
 - `SCHEMATA` lists the schemas made with `CREATE SCHEMA`; `dbo` and the system schemas are not in it.
 - Constraint names are lexdb's, `table_pkey`, `table_column_fkey`, and `view_definition` is the text of the query.
 - `ROUTINES` and `PARAMETERS` have no rows for T-SQL procedures and functions: use `sys.procedures`,

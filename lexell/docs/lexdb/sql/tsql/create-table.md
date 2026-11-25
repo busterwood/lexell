@@ -93,6 +93,8 @@ table_constraint ::=
 
 ## Remarks
 
+- A foreign key's action (`ON DELETE CASCADE`, `SET NULL`, `SET DEFAULT`, `ON UPDATE CASCADE`) writes the child table, and an
+  [assertion](create-assertion.md) on the child is checked after it: error 547 undoes the whole statement.
 - A temporary table (`#name`) belongs to the session that made it, and is dropped when the session ends or is
   reset. It may be made, filled and read on a replica.
 - **`CLUSTERED` and `NONCLUSTERED` are labels.** lexdb keeps rows in the order of the primary key whatever is said.
@@ -114,11 +116,13 @@ table_constraint ::=
 
 ## Differences from SQL Server
 
+- A table named `HOLDLOCK` or `INDEX` (bare) is error 156; SQL Server reads it as a table hint and gives 1018. Every
+  other reserved word as a bare table or column name is 156 in both. Bracket the name (`[plan]`) to use one.
 - A column constraint written `CONSTRAINT name FOREIGN KEY REFERENCES t (c)` is error 102: write
   `CONSTRAINT name REFERENCES t (c)`, or a table constraint.
 - `ROWGUIDCOL`, `SPARSE`, `FILESTREAM`, `NOT FOR REPLICATION`, `MASKED WITH`, `ENCRYPTED WITH` and
-  `GENERATED ALWAYS AS ROW START` are syntax errors. An index in the table's definition (`INDEX ix (col)`) is error
-  102: use [CREATE INDEX](create-index.md).
+  `GENERATED ALWAYS AS ROW START` are syntax errors. SQL Server accepts an index in the table's definition (`INDEX ix
+  (col)`); lexdb refuses it with error 156 (example I): use [CREATE INDEX](create-index.md).
 - A `rowversion` (`timestamp`) column is not filled in: it stays NULL.
 - A `DEFAULT` constraint's own name is not kept; it is shown as `DF_table_column`. `ALTER TABLE ... DROP CONSTRAINT`
   finds it by neither name (error 50000).
@@ -366,8 +370,8 @@ GO
 ```
 
 ```text
-Msg 102, Level 15, State 1, Line 1
-Incorrect syntax near '('.
+Msg 156, Level 15, State 1, Line 1
+Incorrect syntax near the keyword 'INDEX'.
 Msg 102, Level 15, State 1, Line 1
 Incorrect syntax near 'FOREIGN'.
 ```

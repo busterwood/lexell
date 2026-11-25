@@ -87,6 +87,8 @@ annotations_clause:
 
 ## Remarks
 
+- A foreign key's action (`ON DELETE CASCADE`, `SET NULL`, and lexdb's `ON UPDATE CASCADE`) writes the child table, and an
+  [assertion](create-assertion.md) on the child is checked after it: ORA-08601 undoes the whole statement.
 - Names are folded to upper case unless quoted: `CREATE TABLE "Mixed Case"` keeps its case.
 - The data dictionary shows the table in `USER_TABLES`, its columns in `USER_TAB_COLUMNS`, and its constraints in
   `USER_CONSTRAINTS`.
@@ -112,7 +114,10 @@ annotations_clause:
 - `USER_CONSTRAINTS` lists no `NOT NULL` constraint, where Oracle lists each as a row of type `C` with the search
   condition `"A" IS NOT NULL` (example K).
 - Key names are lexdb's (`EMP_PKEY`, `EMP_DEPT_ID_FKEY`); Oracle uses `SYS_C00...` for a name you did not give.
-- Error texts are shorter (ORA-02290 names no constraint; ORA-12899 no column).
+- Error texts are shorter (ORA-02290 names no constraint; ORA-12899 no column; ORA-02291 and ORA-02292 name no
+  constraint).
+- **`ON UPDATE CASCADE` is accepted** (a parent's key change then changes the child rows). Oracle has no such clause:
+  `ON` must be followed by `DELETE`, and it gives ORA-02000 (`missing DELETE keyword`).
 - `USER_TAB_COLUMNS` shows a `RAW(4)` column as `BLOB` (length 4000) and a `CLOB` with length 4000.
 - There are no tablespaces and no recycle bin.
 
@@ -631,6 +636,61 @@ NAME        SEARCHABLE
 
 ERROR:
 ORA-03099: unexpected item NOT in a column definition
+```
+
+### N. A NUMBER foreign key to an identity key
+
+A foreign key compares values, so a `NUMBER` column can refer to a `NUMBER GENERATED ... AS IDENTITY` key (lexdb keeps
+the identity key as an integer) and an `INTEGER` column to a plain `NUMBER` key. 5 and 5.0 find the parent 5; 5.5
+finds nothing. A column of a type Oracle does not allow in a foreign key to a number (`VARCHAR2`, `BINARY_DOUBLE`) is
+ORA-02267.
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE site (id NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, name VARCHAR2(20));
+INSERT INTO site (name) VALUES ('north');
+INSERT INTO site (name) VALUES ('south');
+CREATE TABLE booth (id NUMBER PRIMARY KEY, site_id NUMBER REFERENCES site (id));
+INSERT INTO booth VALUES (1, 1);
+INSERT INTO booth VALUES (2, 2.0);
+INSERT INTO booth VALUES (3, 2.5);
+INSERT INTO booth VALUES (4, 99);
+SELECT id, site_id FROM booth ORDER BY id;
+CREATE TABLE booth2 (id NUMBER, site_id VARCHAR2(5) REFERENCES site (id));
+CREATE TABLE booth3 (id NUMBER, site_id BINARY_DOUBLE REFERENCES site (id));
+```
+
+```text
+Table created.
+
+1 row created.
+
+1 row created.
+
+Table created.
+
+1 row created.
+
+1 row created.
+
+ERROR:
+ORA-02291: integrity constraint violated - parent key not found
+
+ERROR:
+ORA-02291: integrity constraint violated - parent key not found
+
+ID SITE_ID
+-- -------
+ 1       1
+ 2       2
+
+2 rows selected.
+
+ERROR:
+ORA-02267: column type incompatible with referenced column type
+
+ERROR:
+ORA-02267: column type incompatible with referenced column type
 ```
 
 ## See also

@@ -34,7 +34,9 @@ SELECT ... FROM { USER_ | ALL_ | DBA_ }{ VIEWS | SEQUENCES | SOURCE | PROCEDURES
 : The compile errors of units that were stored invalid (example F): `NAME`, `TYPE`, `SEQUENCE`, `LINE`, `POSITION`,
   `TEXT` (`PLS-00201: identifier 'NOTHERE' must be declared`, then `PL/SQL: Statement ignored`), `ATTRIBUTE` (`ERROR`),
   `MESSAGE_NUMBER`. `ALL_ERRORS` and `DBA_ERRORS` hold the same rows. A unit with errors is `INVALID` in `USER_OBJECTS`;
-  the rows go when the unit compiles again.
+  the rows go when the unit compiles again. A unit is stored with errors when its body has an undeclared name, an
+  expression that does not parse, DML on a table that does not exist, or a subprogram declared inside it ([CREATE
+  FUNCTION](create-function.md), examples I and J).
 
 `USER_TRIGGERS`, `USER_SYNONYMS`
 : No rows: lexdb has no triggers and no synonyms.
@@ -47,6 +49,9 @@ SELECT ... FROM { USER_ | ALL_ | DBA_ }{ VIEWS | SEQUENCES | SOURCE | PROCEDURES
 ## Differences from Oracle
 
 - `USER_SOURCE` does not hold the `CREATE OR REPLACE` words that Oracle keeps in line 1.
+- `USER_ERRORS` has rows for procedures and functions only. A view that is `INVALID` because the function it calls is
+  gone (see [CREATE VIEW](create-view.md)) has none; Oracle lists it with `TYPE` `VIEW` and the error (`ORA-00904:
+  "DBL": invalid identifier`).
 - `USER_TRIGGERS` and `USER_SYNONYMS` are always empty.
 - `USER_SEQUENCES.CACHE_SIZE` is 0 and `LAST_NUMBER` is the start value or the last value handed out.
 

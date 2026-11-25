@@ -129,6 +129,8 @@ table from a query, see [CREATE TABLE AS](create-table-as.md).
 
 ## Remarks
 
+- A foreign key's action (`ON DELETE CASCADE`, `SET NULL`, `SET DEFAULT`, `ON UPDATE CASCADE`) writes the child table, and an
+  [assertion](create-assertion.md) on the child is checked after it: 23514 undoes the whole statement.
 - The table's rows are kept in a B+tree in the order of the primary key. A table with no primary key is kept in the
   order of a hidden row number.
 - Constraint names that are not given are made as PostgreSQL makes them: `t_pkey`, `t_a_key`, `t_b_check`,

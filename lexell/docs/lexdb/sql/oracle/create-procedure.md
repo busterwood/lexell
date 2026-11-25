@@ -42,9 +42,9 @@ parameter:
 - A procedure may call itself and other procedures.
 - An `OUT` or `IN OUT` argument may be a package variable of another package (`p(pkg.v);`): it is assigned when the
   call ends, and an error leaves it as it was (see [CREATE PACKAGE](create-package.md), example G).
-- A body that does not compile (a call of a procedure that does not exist, an unknown identifier) does not stop the
-  statement: the procedure is stored **invalid**, and SQL\*Plus says "Warning: Procedure created with compilation
-  errors." `USER_OBJECTS.STATUS` is `INVALID`, and `USER_ERRORS` and `ALL_ERRORS` hold the `PLS-` errors with their
+- A body that does not compile (a call of a procedure that does not exist, an undeclared name, an expression that does
+  not parse, DML on a table that does not exist) does not stop the statement: the procedure is stored **invalid**, and
+  SQL\*Plus says "Warning: Procedure created with compilation errors." `USER_OBJECTS.STATUS` is `INVALID`, and `USER_ERRORS` and `ALL_ERRORS` hold the `PLS-` errors with their
   line and position. `CALL` of an invalid procedure is ORA-06575, and a block that names it is ORA-06550 with
   PLS-00905. [ALTER PROCEDURE ... COMPILE](alter-procedure.md) compiles it again (example F).
 - `USER_OBJECTS` lists the procedure, and `USER_SOURCE` its text: see the
@@ -52,9 +52,13 @@ parameter:
 
 ## Differences from Oracle
 
-- Subprograms declared inside another unit or block, collection-typed parameters, and `AUTHID`, `ACCESSIBLE BY` and
+- Subprograms declared inside another unit or block (the unit is stored `INVALID`: "subprograms declared in a block
+  are not supported"), collection-typed parameters, and `AUTHID`, `ACCESSIBLE BY` and
   `PRAGMA AUTONOMOUS_TRANSACTION` clauses are not supported.
 - A call with a wrong argument count is PLS-00306, as in Oracle; an argument that cannot be converted is ORA-06502.
+- **Compilation errors are found for names and syntax only** (example G). A type error, a wrong argument count to a
+  built-in function, an unknown column of a `SELECT INTO` and a syntax error inside a SQL statement appear when the
+  procedure runs, where Oracle finds them when it compiles (`INVALID`, `USER_ERRORS`). PLS-00103's text has no list of the symbols expected.
 
 ## Examples
 
@@ -252,6 +256,84 @@ ORA-06550: line 2, column 1:
 PLS-00905: object SA.REPORT is invalid
 ORA-06550: line 2, column 1:
 PL/SQL: Statement ignored
+```
+
+### G. Other errors in the body
+
+DML on a table that does not exist and a PL/SQL expression that does not parse make the procedure invalid, as an
+undeclared name does. A type error does not, nor does a syntax error inside a SQL statement of the body (`bad_sql`;
+ORA-00900 when it runs, ORA-00936 as Oracle's compilation error): the procedure is created, and the error comes when
+it runs.
+
+<!-- example: oracle -->
+```sql
+CREATE PROCEDURE log_it (p_id NUMBER) IS
+BEGIN
+  INSERT INTO no_such_log VALUES (p_id);
+END;
+/
+CREATE PROCEDURE add_pay (p_id NUMBER) IS
+  v NUMBER;
+BEGIN
+  v := p_id * ;
+END;
+/
+CREATE PROCEDURE bad_sql (p_id NUMBER) IS
+BEGIN
+  UPDATE emp SET salary = salary + WHERE id = p_id;
+END;
+/
+CREATE PROCEDURE set_day (p_id NUMBER) IS
+  d DATE;
+BEGIN
+  d := p_id;
+END;
+/
+SELECT object_name, status FROM user_objects WHERE object_name IN ('LOG_IT', 'ADD_PAY', 'BAD_SQL', 'SET_DAY') ORDER BY object_name;
+SELECT name, line, position, text FROM user_errors WHERE name IN ('LOG_IT', 'ADD_PAY') ORDER BY name, sequence;
+CALL log_it(1);
+CALL bad_sql(1);
+CALL set_day(1);
+```
+
+```text
+Warning: Procedure created with compilation errors.
+
+Warning: Procedure created with compilation errors.
+
+Procedure created.
+
+Procedure created.
+
+OBJECT_NAME STATUS
+----------- -------
+ADD_PAY     INVALID
+BAD_SQL     VALID
+LOG_IT      INVALID
+SET_DAY     VALID
+
+4 rows selected.
+
+NAME    LINE POSITION TEXT
+------- ---- -------- -----------------------------------------------
+ADD_PAY    4       15 PLS-00103: Encountered the symbol ";"
+LOG_IT     3       15 PL/SQL: ORA-00942: table or view does not exist
+LOG_IT     3        3 PL/SQL: SQL Statement ignored
+
+3 rows selected.
+
+ERROR:
+ORA-06575: Package or function LOG_IT is in an invalid state
+
+ERROR:
+ORA-00900: invalid SQL statement
+ORA-06512: at "SA.BAD_SQL", line 3
+ORA-06512: at line 1
+
+ERROR:
+ORA-06502: PL/SQL: value or conversion error
+ORA-06512: at "SA.SET_DAY", line 4
+ORA-06512: at line 1
 ```
 
 ## See also

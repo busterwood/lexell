@@ -176,11 +176,11 @@ SET NUMERIC_ROUNDABORT OFF;
 SET TEXTSIZE 2147483647;
 SET LOCK_TIMEOUT 5000;
 SET DATEFIRST 1;
-SELECT @@DATEFIRST AS datefirst, @@LOCK_TIMEOUT AS lock_timeout, @@TEXTSIZE AS textsize, @@LANGUAGE AS language;
+SELECT @@DATEFIRST AS datefirst, @@LOCK_TIMEOUT AS lock_timeout, @@TEXTSIZE AS text_size, @@LANGUAGE AS language;
 ```
 
 ```text
-datefirst lock_timeout textsize   language
+datefirst lock_timeout text_size  language
 --------- ------------ ---------- ----------
 7         -1           2147483647 us_english
 

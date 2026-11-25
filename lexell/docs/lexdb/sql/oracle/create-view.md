@@ -58,9 +58,13 @@ annotations_clause:
 - `CREATE MATERIALIZED VIEW` is ORA-03001.
 - **A view that calls a stored function cannot be read by DML:** an `INSERT`, `UPDATE`, `DELETE` or `CREATE TABLE ...
   AS` that reads one is ORA-03001 (example G). A query reads it.
-- After `DROP FUNCTION` (or `DROP PACKAGE`) of a function a view calls, reading the view is ORA-04063 (`view ... has
-  errors`; ORA-04067 after `DROP PACKAGE BODY`), as in Oracle, but `USER_OBJECTS.STATUS` stays `VALID` (Oracle:
-  `INVALID`), and a session that read the view before the drop gets ORA-00904 or ORA-00900 on its first read.
+- After `DROP FUNCTION` or `DROP PACKAGE` of a function a view calls, reading the view is ORA-04063 (`view ... has
+  errors`; ORA-04067 after `DROP PACKAGE BODY`), as in Oracle (see [DROP FUNCTION](drop-function.md), example B).
+  `USER_OBJECTS.STATUS` of the view is `INVALID` while the function is gone and `VALID` as soon as it is back (Oracle:
+  `INVALID` until the view's next use). In a transaction that wrote something before the drop, its snapshot still
+  holds the function and a read of the view gives ORA-00904 until the transaction ends.
+- `CREATE VIEW` over a function that was created with compilation errors (`INVALID`) is ORA-06575, as in Oracle (see
+  [CREATE FUNCTION](create-function.md), example I).
 - `ALTER VIEW ... READ ONLY` is ORA-03001; Oracle gives ORA-42310 for a view that is not an editioning view.
 
 ## Examples
