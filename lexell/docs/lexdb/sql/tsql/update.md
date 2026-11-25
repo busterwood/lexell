@@ -90,7 +90,7 @@ UPDATE
 
 - A common table expression or a view cannot be the target: a CTE gives error 208, a view error 50000 ("cannot
   update view ... (lexdb's views are read-only)"). Name the table, and read the CTE in `WHERE`.
-- `UPDATE TOP (n) PERCENT` is error 102.
+- `UPDATE TOP (n) PERCENT` is error 102; SQL Server accepts it.
 - A column set twice in one `SET` takes the last value; SQL Server refuses it (error 264).
 - `WITH ( batch_rows n )` is lexdb's, not SQL Server's.
 - `SET @variable = expression` and `SET @variable = column = expression`, which set a variable for each row, are

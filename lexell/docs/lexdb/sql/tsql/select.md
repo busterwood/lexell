@@ -92,7 +92,9 @@ select_list ::=
   refer to the columns of the query around it.
 - Names are resolved without regard to case. A table name may carry its schema (`dbo.emp`) and the database
   (`lexdb.dbo.emp`); the default schema is `dbo`. Names in brackets (`[order]`) or double quotes may be keywords or
-  hold spaces.
+  hold spaces. SQL Server's reserved words (`key`, `index`, `rule`, `plan`, `user`, `percent` ...: the list in its
+  documentation) are refused as bare table, column and alias names, error 156, as in SQL Server (example K); its other
+  keywords (`name`, `status`, `type`, `date` ...) are names.
 - Strings compare as their column's collation says. The default collation is case-insensitive, so `'ANN'` equals
   `'Ann'`. `COLLATE` changes it for one comparison or sort.
 - Table hints in `FROM` (`WITH (NOLOCK)`, `(NOLOCK)`, `WITH (UPDLOCK, ROWLOCK)`, `WITH (INDEX(...))`) are read and
@@ -105,6 +107,8 @@ select_list ::=
 
 - `PIVOT` and `UNPIVOT`, `FOR XML`, `FOR JSON`, `FOR BROWSE`, `TABLESAMPLE`, `$IDENTITY` and `$ROWGUID` are not
   supported: each is error 102.
+- A bare alias without `AS` that is a reserved word (`SELECT 1 rule`) is error 102; SQL Server gives 156. With `AS`
+  it is 156 in both (example K).
 - Some errors carry 50000 and lexdb's text where SQL Server has a number of its own: an ambiguous column (SQL
   Server 209), a column that is neither grouped nor in an aggregate (8120), a window function in `WHERE` (4108),
   `ORDER BY` with `DISTINCT` on a column not in the list (145).
@@ -358,6 +362,45 @@ Msg 102, Level 15, State 1, Line 2
 Incorrect syntax near 'pivot'.
 Msg 102, Level 15, State 1, Line 1
 Incorrect syntax near 'JSON'.
+```
+
+### K. Reserved words as names
+
+<!-- example: tsql -->
+```sql
+SELECT 1 AS [key], 2 AS name, 3 AS status;
+GO
+SELECT 1 AS key;
+GO
+SELECT 1 AS rule;
+GO
+SELECT 1 AS [rule];
+GO
+CREATE TABLE dbo.plan (id int);
+GO
+CREATE TABLE dbo.[plan] (id int, [index] int);
+GO
+```
+
+```text
+key name status
+--- ---- ------
+1   2    3
+
+(1 row affected)
+
+Msg 156, Level 15, State 1, Line 1
+Incorrect syntax near the keyword 'key'.
+Msg 156, Level 15, State 1, Line 1
+Incorrect syntax near the keyword 'rule'.
+rule
+----
+1
+
+(1 row affected)
+
+Msg 156, Level 15, State 1, Line 1
+Incorrect syntax near the keyword 'plan'.
 ```
 
 ## See also

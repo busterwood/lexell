@@ -57,7 +57,8 @@ DELETE
 
 ## Differences from SQL Server
 
-- `DELETE TOP (n) PERCENT` is not supported: `PERCENT` is read as a table name (error 208).
+- **`DELETE TOP (n) PERCENT` is not supported.** SQL Server accepts it; lexdb refuses it with error 156 (`PERCENT` is a
+  reserved word). Delete by a condition, or `DELETE TOP (n)` (example G).
 - A common table expression or a view cannot be the target: a CTE gives error 208, a view error 50000 ("cannot
   delete from view ... (lexdb's views are read-only)").
 - `WHERE CURRENT OF` is error 102: lexdb has no cursors. There are no triggers.
@@ -237,8 +238,8 @@ GO
 Msg 547, Level 16, State 1, Line 1
 The DELETE statement conflicted with the REFERENCE constraint "emp_dept_id_fkey". The conflict occurred in database "lexdb", table "dbo.emp", column 'dept_id'.
 the batch went on
-Msg 208, Level 16, State 1, Line 1
-Invalid object name 'percent'.
+Msg 156, Level 15, State 1, Line 1
+Incorrect syntax near the keyword 'PERCENT'.
 ```
 
 ## See also

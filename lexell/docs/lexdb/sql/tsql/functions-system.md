@@ -380,10 +380,10 @@ error_after
 ```sql
 SELECT @@VERSION AS version;
 SELECT @@SERVERNAME AS servername, @@SERVICENAME AS service, @@LANGUAGE AS language, @@DATEFIRST AS datefirst,
-       @@MAX_PRECISION AS max_precision, @@TEXTSIZE AS textsize, @@LOCK_TIMEOUT AS lock_timeout;
+       @@MAX_PRECISION AS max_precision, @@TEXTSIZE AS text_size, @@LOCK_TIMEOUT AS lock_timeout;
 SELECT SERVERPROPERTY('ProductVersion') AS product_version, SERVERPROPERTY('Edition') AS edition,
        SERVERPROPERTY('EngineEdition') AS engine, SERVERPROPERTY('ProductMajorVersion') AS major,
-       SERVERPROPERTY('IsClustered') AS clustered, SERVERPROPERTY('Collation') AS collation;
+       SERVERPROPERTY('IsClustered') AS is_clustered, SERVERPROPERTY('Collation') AS collation;
 SELECT DATABASEPROPERTYEX('lexdb', 'Status') AS status, DATABASEPROPERTYEX('lexdb', 'Updateability') AS updateability,
        SESSIONPROPERTY('ANSI_NULLS') AS ansi_nulls, CONNECTIONPROPERTY('net_transport') AS transport;
 ```
@@ -395,15 +395,15 @@ lexdb (SQL Server protocol, TDS 7.4; reports itself as Microsoft SQL Server 16.0
 
 (1 row affected)
 
-servername service     language   datefirst max_precision textsize   lock_timeout
+servername service     language   datefirst max_precision text_size  lock_timeout
 ---------- ----------- ---------- --------- ------------- ---------- ------------
 lexdb      MSSQLSERVER us_english 7         38            2147483647 -1
 
 (1 row affected)
 
-product_version edition                    engine major clustered collation
---------------- -------------------------- ------ ----- --------- ----------------------------
-16.0.4315.2     Developer Edition (64-bit) 3      16    0         SQL_Latin1_General_CP1_CI_AS
+product_version edition                    engine major is_clustered collation
+--------------- -------------------------- ------ ----- ------------ ----------------------------
+16.0.4315.2     Developer Edition (64-bit) 3      16    0            SQL_Latin1_General_CP1_CI_AS
 
 (1 row affected)
 
@@ -434,9 +434,9 @@ lexdb 5     1         dbo 1      sa sa  sa sa sa
 
 <!-- example: tsql -->
 ```sql
-SELECT OBJECT_ID('dbo.m1') IS NOT NULL AS table_found, OBJECT_NAME(OBJECT_ID('dbo.m1')) AS object_name,
+SELECT CASE WHEN OBJECT_ID('dbo.m1') IS NOT NULL THEN 1 END AS table_found, OBJECT_NAME(OBJECT_ID('dbo.m1')) AS object_name,
        OBJECT_SCHEMA_NAME(OBJECT_ID('dbo.m1')) AS schema_name, OBJECT_ID('dbo.nothere') AS missing,
-       OBJECT_ID('dbo.mv1', 'V') IS NOT NULL AS view_found, OBJECT_ID('dbo.m1', 'V') AS table_is_not_a_view;
+       CASE WHEN OBJECT_ID('dbo.mv1', 'V') IS NOT NULL THEN 1 END AS view_found, OBJECT_ID('dbo.m1', 'V') AS table_is_not_a_view;
 SELECT OBJECTPROPERTY(OBJECT_ID('dbo.m1'), 'IsTable') AS is_table,
        OBJECTPROPERTY(OBJECT_ID('dbo.mv1'), 'IsView') AS is_view,
        OBJECTPROPERTY(OBJECT_ID('dbo.m1'), 'TableHasPrimaryKey') AS has_pk,

@@ -78,7 +78,8 @@ table_name ::= [ database_name . [ schema_name ] . | schema_name . ] table_name
 
 ## Differences from SQL Server
 
-- `INSERT TOP (n)` and table hints (`WITH (TABLOCK)`) are not taken: see the examples.
+- **`INSERT TOP (n)` is not supported.** SQL Server accepts it; lexdb refuses it with error 156 (example I). Table hints
+  (`WITH (TABLOCK)`) are also refused (156), and SQL Server takes them.
 - Most error messages are SQL Server's; those with number 50000 carry lexdb's text.
 - The line number in an error message is the line of the failing statement in the batch.
 - There are no triggers, so `INSERT` fires none.
@@ -291,8 +292,8 @@ GO
 ```
 
 ```text
-Msg 102, Level 15, State 1, Line 1
-Incorrect syntax near '1'.
+Msg 156, Level 15, State 1, Line 1
+Incorrect syntax near the keyword 'TOP'.
 Msg 156, Level 15, State 1, Line 1
 Incorrect syntax near the keyword 'WITH'.
 ```
