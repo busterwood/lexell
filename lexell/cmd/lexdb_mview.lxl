@@ -320,6 +320,7 @@ pub fn writeMeta(txn: mut &lexdb_store.Txn, m: &MvMeta): Result[Unit, DbErr] {
 }
 
 pub fn delMeta(txn: mut &lexdb_store.Txn, key: &str) {
+    invalidatePlan(key)
     txn.del(lexdb_catalog.CATALOG, &(mvKey(key)))
 }
 
@@ -418,6 +419,15 @@ pub type FastItem = record {
     pub sumCol: int             // hidden running sum column index for AVG (-1 if none)
 }
 
+pub type EqPair = record {
+    pub tabA: int
+    pub colA: int
+    pub slotA: int
+    pub tabB: int
+    pub colB: int
+    pub slotB: int
+}
+
 pub type FastPlan = record {
     pub kind: int               // FAST_NONE, FAST_PROJ, FAST_AGG, FAST_JOIN
     pub isAgg: bool             // true if GROUP BY or aggregates (including on FAST_JOIN)
@@ -430,13 +440,136 @@ pub type FastPlan = record {
     pub items: []FastItem       // one per visible output column
     pub allCols: []lexdb_sql.ColDef // combined alias.col definitions across tables[]
     pub tabOffsets: []int       // starting column offset in allCols for each table
+    pub eqPairs: []EqPair       // top-level equi-join column pairs (for PK/index probing!)
     pub gkCol: int              // hidden MV_GK column index in MV table
     pub cntCol: int             // hidden MV_CNT column index in MV table (-1 if non-agg)
 }
 
 fn emptyFastPlan(): FastPlan {
     return FastPlan{kind: FAST_NONE, isAgg: false, globalAgg: false, tables: [], aliases: [], joins: [],
-                    where: None, group: [], items: [], allCols: [], tabOffsets: [], gkCol: -1, cntCol: -1}
+                    where: None, group: [], items: [], allCols: [], tabOffsets: [], eqPairs: [], gkCol: -1, cntCol: -1}
+}
+
+// Extracts top-level conjunct colA = colB pairs from an expression for index/PK join probing.
+fn collectEqPairs(x: &Expr, tabOffsets: &[]int, tables: &[]Table, out: mut &[]EqPair) {
+    match x {
+        Expr.Bin(op, a, b) {
+            if op == "and" {
+                collectEqPairs(&a, tabOffsets, tables, out)
+                collectEqPairs(&b, tabOffsets, tables, out)
+                return
+            }
+            if op == "=" {
+                var sA = -1
+                var sB = -1
+                match &a { Expr.Col(_, s) { sA = s } else {} }
+                match &b { Expr.Col(_, s) { sB = s } else {} }
+                if sA >= 0 && sB >= 0 {
+                    var tA = -1
+                    var cA = -1
+                    var tB = -1
+                    var cB = -1
+                    for ti in 0..len(tables) {
+                        let off = tabOffsets[ti]
+                        let end = off + len(tables[ti].cols)
+                        if sA >= off && sA < end { tA = ti; cA = sA - off }
+                        if sB >= off && sB < end { tB = ti; cB = sB - off }
+                    }
+                    if tA >= 0 && tB >= 0 && tA != tB {
+                        append(out, EqPair{tabA: tA, colA: cA, slotA: sA, tabB: tB, colB: cB, slotB: sB})
+                    }
+                }
+            }
+        }
+        else {}
+    }
+}
+
+// ---- FastPlan cache keyed by MV key + signature (invalidated automatically when tree/query changes)
+
+type CachedPlan = record {
+    mvKey: str
+    query: str
+    mdialect: int
+    mvTree: int
+    mvCols: int
+    baseTrees: []int
+    fp: FastPlan
+}
+
+type PlanCacheStore = record {
+    entries: []CachedPlan
+}
+
+var PLAN_CACHE: once task.Shared[PlanCacheStore]
+
+fn planCache(): task.Shared[PlanCacheStore] {
+    if !PLAN_CACHE.isSet() { PLAN_CACHE.set(task.shared(PlanCacheStore{entries: []})) }
+    return PLAN_CACHE.get().share()
+}
+
+pub fn invalidatePlan(mvKeyStr: &str) {
+    planCache().with(fn(pc: mut &PlanCacheStore) {
+        var i = 0
+        while i < len(pc.entries) {
+            if pc.entries[i].mvKey == mvKeyStr {
+                let last = len(pc.entries) - 1
+                if i != last {
+                    pc.entries[i] = replace(mut &pc.entries[last], CachedPlan{mvKey: "", query: "", mdialect: 0, mvTree: 0, mvCols: 0, baseTrees: [], fp: emptyFastPlan()})
+                }
+                let _x = pop(mut &pc.entries)
+            } else { i += 1 }
+        }
+    })
+}
+
+fn getCachedPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mv: &MvMeta, mvTab: &Table, up: &Up): Result[FastPlan, DbErr] {
+    // Check base table trees (only for MVs with deps).
+    var baseTrees: []int = []
+    for d in mv.deps {
+        match try (up.loadTable)(st, txn, &d.table) {
+            Some(bt) { append(mut &baseTrees, bt.tree) }
+            None { append(mut &baseTrees, -1) }
+        }
+    }
+    var hit: Option[FastPlan] = None
+    planCache().with(fn(pc: mut &PlanCacheStore) {
+        for e in pc.entries {
+            if e.mvKey == mv.key && e.query == mv.query && e.mdialect == mv.mdialect &&
+               e.mvTree == mvTab.tree && e.mvCols == len(mvTab.cols) && len(e.baseTrees) == len(baseTrees) {
+                var same = true
+                for k in 0..len(baseTrees) { if e.baseTrees[k] != baseTrees[k] { same = false; break } }
+                if same { hit = Some(e.fp.clone()); break }
+            }
+        }
+    })
+    match hit {
+        Some(fp) { return Ok(fp) }
+        None {}
+    }
+    let q = try parseQuery(&mv.query, mv.mdialect)
+    var fa = try analyzeFast(st, txn, &q, &mv.path, up)
+    if fa.fp.kind == FAST_NONE { return Ok(emptyFastPlan()) }
+    var fp = replace(mut &fa.fp, emptyFastPlan())
+    bindHiddenCols(mut &fp, mvTab)
+    let fpCopy = fp.clone()
+    let mvKeyC = mv.key.clone()
+    let qC = mv.query.clone()
+    let mdC = mv.mdialect
+    let treeC = mvTab.tree
+    let colsC = len(mvTab.cols)
+    let btC = collections.copyOf(&baseTrees)
+    planCache().with(fn(pc: mut &PlanCacheStore) {
+        for i in 0..len(pc.entries) {
+            if pc.entries[i].mvKey == mvKeyC {
+                pc.entries[i] = CachedPlan{mvKey: mvKeyC.clone(), query: qC.clone(), mdialect: mdC, mvTree: treeC, mvCols: colsC, baseTrees: collections.copyOf(&btC), fp: fpCopy.clone()}
+                return
+            }
+        }
+        if len(pc.entries) >= 256 { let _d = pop(mut &pc.entries) }
+        append(mut &pc.entries, CachedPlan{mvKey: mvKeyC.clone(), query: qC.clone(), mdialect: mdC, mvTree: treeC, mvCols: colsC, baseTrees: collections.copyOf(&btC), fp: fpCopy.clone()})
+    })
+    return Ok(fp)
 }
 
 fn hasSubOrWin(q: &Stmt): bool {
@@ -773,10 +906,14 @@ pub fn analyzeFast(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Stmt, 
         append(mut &deps, MvDep{table: tables[ti].name.clone(), cols: cs})
     }
 
+    var eqPairs: []EqPair = []
+    for j in joins { match j { Some(jx) { collectEqPairs(&jx, &tabOffsets, &tables, mut &eqPairs) } None {} } }
+    match whereOpt { Some(w) { collectEqPairs(&w, &tabOffsets, &tables, mut &eqPairs) } None {} }
+
     let kind = if len(tables) > 1 { FAST_JOIN } else if anyAgg { FAST_AGG } else { FAST_PROJ }
     return Ok(FastAnalysis{fp: FastPlan{kind: kind, isAgg: anyAgg, globalAgg: anyAgg && len(grpExprs) == 0,
                                         tables: tables, aliases: aliases, joins: joins, where: whereOpt, group: grpExprs,
-                                        items: fastItems, allCols: allCols, tabOffsets: tabOffsets, gkCol: -1, cntCol: -1},
+                                        items: fastItems, allCols: allCols, tabOffsets: tabOffsets, eqPairs: eqPairs, gkCol: -1, cntCol: -1},
                            deps: deps, reason: ""})
 }
 
@@ -1112,56 +1249,198 @@ type JoinExp = record {
     pks: []str
 }
 
-// Expands a single table's delta rows into full joined rows across fp.tables[] using bilinear probing.
+// Byte-order prefix upper bound: smallest string strictly greater than every string starting with p ("" if none).
+fn prefixEnd(p: &str): str {
+    var i = len(p) - 1
+    while i >= 0 && p[i] == byte(255) { i -= 1 }
+    if i < 0 { return "" }
+    var out = p[0..i].toStr()
+    out.addByte(byte(int(p[i]) + 1))
+    return out
+}
+
+// Probes matching rows of table k given an already-bound partial row using PK lookup,
+// secondary index prefix lookup, or cached full-table fallback.
+fn probeJoinTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, fp: &FastPlan, k: int,
+                  bound: &[]bool, partial: &[]Val, z: &lexdb_time.Zone,
+                  scanCache: mut &[][][]Val, scanned: mut &[]bool): Result[[][]Val, DbErr] {
+    let tab = &fp.tables[k]
+    let rel = lexdb_catalog.relOf(tab)
+    let emptyNeed: []bool = []
+    let rr = lexdb_access.rowRead(&rel, &emptyNeed)
+
+    // Collect bound equality values for columns of table k from already-bound tables.
+    var hasCol = array(len(tab.cols), false)
+    var colVals = array(len(tab.cols), Val.Null)
+    for ep in fp.eqPairs {
+        if ep.tabA == k && bound[ep.tabB] && !hasCol[ep.colA] {
+            let v = &partial[ep.slotB]
+            if lexdb_ops.isNull(v) { return Ok([]) }    // NULL = anything is never true in INNER JOIN!
+            hasCol[ep.colA] = true
+            colVals[ep.colA] = try lexdb_ops.coerceZ(v.clone(), &tab.cols[ep.colA].typ, z)
+        } else if ep.tabB == k && bound[ep.tabA] && !hasCol[ep.colB] {
+            let v = &partial[ep.slotA]
+            if lexdb_ops.isNull(v) { return Ok([]) }
+            hasCol[ep.colB] = true
+            colVals[ep.colB] = try lexdb_ops.coerceZ(v.clone(), &tab.cols[ep.colB].typ, z)
+        }
+    }
+
+    // Fast path 1: Full PK point lookup -> O(log N)!
+    var allPk = len(tab.pk) > 0
+    for pkc in tab.pk { if !hasCol[pkc] { allPk = false; break } }
+    if allPk {
+        var pkKey = ""
+        for pkc in tab.pk { lexdb_access.encKeyCol(mut &pkKey, &tab.cols[pkc], &colVals[pkc]) }
+        match try lexdb_access.getRow(st, txn, &rel, &rr, &pkKey) {
+            Some(row) { return Ok([row]) }
+            None { return Ok([]) }
+        }
+    }
+
+    // Fast path 2: Secondary index leading prefix lookup -> O(log N + matches)!
+    var bestIx = -1
+    var bestLen = 0
+    for xi in 0..len(tab.indexes) {
+        let ix = &tab.indexes[xi]
+        if ix.pred.isSome() || len(ix.exprs) > 0 { continue }
+        var pref = 0
+        for c in ix.cols {
+            if c < 0 || !hasCol[c] { break }
+            pref += 1
+        }
+        if pref > bestLen { bestLen = pref; bestIx = xi }
+    }
+    if bestIx >= 0 {
+        let ix = &tab.indexes[bestIx]
+        var pre = ""
+        for p in 0..bestLen {
+            let c = ix.cols[p]
+            let kv = lexdb_access.collKeyVal(&tab.cols[c], &colVals[c])
+            lexdb_access.encIdxPart(mut &pre, &kv)
+        }
+        let hi = prefixEnd(&pre)
+        var pks: []str = []
+        try st.scan(txn, ix.tree, &pre, &hi, fn(en: &lexdb_store.Entry): bool {
+            append(mut &pks, en.val.clone())
+            return true
+        })
+        var out: [][]Val = withCapacity(len(pks))
+        for pk in pks {
+            match try lexdb_access.getRow(st, txn, &rel, &rr, &pk) {
+                Some(row) { append(mut &out, row) }
+                None {}
+            }
+        }
+        return Ok(out)
+    }
+
+    // Fast path 3: Leading PK prefix range scan -> O(log N + matches)!
+    var pkPref = 0
+    for pkc in tab.pk {
+        if !hasCol[pkc] { break }
+        pkPref += 1
+    }
+    if pkPref > 0 {
+        var pre = ""
+        for p in 0..pkPref {
+            let c = tab.pk[p]
+            lexdb_access.encKeyCol(mut &pre, &tab.cols[c], &colVals[c])
+        }
+        let hi = prefixEnd(&pre)
+        var ks: []str = []
+        var vs: []str = []
+        try st.scan(txn, tab.tree, &pre, &hi, fn(en: &lexdb_store.Entry): bool {
+            append(mut &ks, en.key.clone())
+            append(mut &vs, en.val.clone())
+            return true
+        })
+        var out: [][]Val = withCapacity(len(ks))
+        for i in 0..len(ks) { append(mut &out, try lexdb_access.rowFrom(st, txn, &rel, &rr, &ks[i], &vs[i])) }
+        return Ok(out)
+    }
+
+    // Fallback: scan table once per statement and cache for remaining delta rows.
+    if !scanned[k] {
+        scanCache[k] = try scanAllRows(st, txn, tab)
+        scanned[k] = true
+    }
+    var out: [][]Val = []
+    for r in scanCache[k] { append(mut &out, collections.copyOf(&r)) }
+    return Ok(out)
+}
+
+// Expands a single table's delta rows into full joined rows across fp.tables[] using PK/index probing.
 fn expandJoinDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, fp: &FastPlan, ti: int,
                     tabDeltas: &[]DeltaRec, z: &lexdb_time.Zone, up: &Up): Result[JoinExp, DbErr] {
-    // Load rows of all OTHER tables in the join.
-    var otherRows: [][][]Val = []
-    for k in 0..len(fp.tables) {
-        if k == ti { append(mut &otherRows, []) } else { append(mut &otherRows, try scanAllRows(st, txn, &fp.tables[k])) }
+    let nTabs = len(fp.tables)
+    var scanCache: [][][]Val = []
+    for _ in 0..nTabs { append(mut &scanCache, []) }
+    var scanned = array(nTabs, false)
+
+    // Choose join expansion order starting from ti, greedily picking tables connected by eqPairs!
+    var order: []int = [ti]
+    var inOrd = array(nTabs, false)
+    inOrd[ti] = true
+    while len(order) < nTabs {
+        var nextT = -1
+        for k in 0..nTabs {
+            if inOrd[k] { continue }
+            for ep in fp.eqPairs {
+                if (ep.tabA == k && inOrd[ep.tabB]) || (ep.tabB == k && inOrd[ep.tabA]) { nextT = k; break }
+            }
+            if nextT >= 0 { break }
+        }
+        if nextT < 0 {
+            for k in 0..nTabs { if !inOrd[k] { nextT = k; break } }
+        }
+        append(mut &order, nextT)
+        inOrd[nextT] = true
     }
+
     var joinedRows: [][]Val = []
     var signs: []int = []
     var pks: []str = []
     let totalCols = len(fp.allCols)
     for d in tabDeltas {
-        // Recursive/iterative cartesian expansion over other tables, checking ON/WHERE early.
         var partials: [][]Val = [array(totalCols, Val.Null)]
-        var partialPks: []str = [""]
-        // Place table ti's row into the initial partial.
+        var bound = array(nTabs, false)
         let offI = fp.tabOffsets[ti]
         for c in 0..len(d.row) { partials[0][offI + c] = d.row[c].clone() }
-        for k in 0..len(fp.tables) {
-            if k == ti {
-                let pkI = encBasePk(&fp.tables[ti], &d.row)
-                for p in 0..len(partialPks) {
-                    lexdb_access.encIdxPart(mut &partialPks[p], &Val.Bytes(pkI.clone()))
-                }
-                continue
-            }
+        bound[ti] = true
+
+        for oi in 1..len(order) {
+            let k = order[oi]
             let offK = fp.tabOffsets[k]
             var nextPartials: [][]Val = []
-            var nextPks: []str = []
             for pi in 0..len(partials) {
-                for r in otherRows[k] {
+                let matches = try probeJoinTable(st, txn, fp, k, &bound, &partials[pi], z, mut &scanCache, mut &scanned)
+                for r in matches {
                     var comb = collections.copyOf(&partials[pi])
                     for c in 0..len(r) { comb[offK + c] = r[c].clone() }
-                    var pkComb = partialPks[pi].clone()
-                    let pkK = encBasePk(&fp.tables[k], &r)
-                    lexdb_access.encIdxPart(mut &pkComb, &Val.Bytes(pkK))
                     append(mut &nextPartials, comb)
-                    append(mut &nextPks, pkComb)
                 }
             }
+            bound[k] = true
             partials = nextPartials
-            partialPks = nextPks
             if len(partials) == 0 { break }
         }
         for pi in 0..len(partials) {
             if try passesConds(fp, &partials[pi], z, up) {
+                // Build canonical PK key in FROM table order (0..nTabs) so it matches refreshComplete!
+                var pkKey = ""
+                if !fp.isAgg {
+                    for k in 0..nTabs {
+                        let offK = fp.tabOffsets[k]
+                        let bt = &fp.tables[k]
+                        var onePk = ""
+                        for pkc in bt.pk { lexdb_access.encKeyCol(mut &onePk, &bt.cols[pkc], &partials[pi][offK + pkc]) }
+                        lexdb_access.encIdxPart(mut &pkKey, &Val.Bytes(onePk))
+                    }
+                }
                 append(mut &joinedRows, collections.copyOf(&partials[pi]))
                 append(mut &signs, d.sign)
-                append(mut &pks, partialPks[pi].clone())
+                append(mut &pks, pkKey)
             }
         }
     }
@@ -1201,14 +1480,11 @@ fn computeMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mv: &MvMet
                                 isAgg: false, globalAgg: false, gk: "", visRow: [], dCnt: 0, dNn: [], dSum: [], dSign: 0}])
     }
 
-    let q = try parseQuery(&mv.query, mv.mdialect)
-    var fa = try analyzeFast(st, txn, &q, &mv.path, up)
-    if fa.fp.kind == FAST_NONE {
+    let fp = try getCachedPlan(st, txn, mv, mvTab, up)
+    if fp.kind == FAST_NONE {
         return Ok([PendingDelta{mark: mark, mvKey: mv.key.clone(), fullRefresh: true, truncate: false,
                                 isAgg: false, globalAgg: false, gk: "", visRow: [], dCnt: 0, dNn: [], dSum: [], dSign: 0}])
     }
-    var fp = replace(mut &fa.fp, emptyFastPlan())
-    bindHiddenCols(mut &fp, mvTab)
     let z = txn.sql.zone.clone()
 
     // Collect passing combined rows (with sign and PK key) across all affected FROM tables.
@@ -1361,14 +1637,11 @@ fn applyMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: &s
         Some(t) { t }
         None { return Ok(Unit{}) }
     }
-    let q = try parseQuery(&mv.query, mv.mdialect)
-    var fa = try analyzeFast(st, txn, &q, &mv.path, up)
-    if fa.fp.kind == FAST_NONE {
+    let fp = try getCachedPlan(st, txn, &mv, &mvTab, up)
+    if fp.kind == FAST_NONE {
         try refreshComplete(st, txn, &mv.key, up)
         return Ok(Unit{})
     }
-    var fp = replace(mut &fa.fp, emptyFastPlan())
-    bindHiddenCols(mut &fp, &mvTab)
 
     let rel = lexdb_catalog.relOf(&mvTab)
     let emptyNeed: []bool = []
