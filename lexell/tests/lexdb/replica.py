@@ -24,6 +24,10 @@ by many checkpoints. Through psql:
   door: one is added each round and the replica's USER_ANNOTATIONS_USAGE must be the
   master's; the one added just before the master is killed must be there after its log is
   replayed, and all of them after the clean close at the end and a start again.
+- Oracle's property graphs (design/lexdb-new-features.md O22), the same way: a graph made each
+  round and an edge added, the replica's USER_PROPERTY_GRAPHS and a GRAPH_TABLE count the
+  master's; the graph made just before the master is killed is there after its log is
+  replayed, and all of them after the clean close.
 
 Then the supervised form, lexdb DATADIR ADDR --replicas 2 --tds ... --tns ...: both replicas
 answer on the replicas' port, and on the TDS and TNS ports one above the master's
@@ -147,6 +151,8 @@ def psql(port, sql, check=True):
 
 DOORSQL = None      # the SQL Server and Oracle client (doorsql.lxl), built in main
 ANQ = 'select object_name, column_name, annotation_name, annotation_value from user_annotations_usage order by 2 nulls first, 3, 4'
+GRQ = 'select graph_name from user_property_graphs order by 1'
+GTQ = 'select count(*) from graph_table (gsoc match (a is gv) -[e is ge]->{1,2} (b) columns (a.id as x))'
 
 
 def door(kind, port, sql, extra=''):
@@ -433,12 +439,32 @@ def main():
             time.sleep(0.05)
         fail('round %d: the replica\'s annotations are not the master\'s:\n  master  %s\n  replica %s' % (rnd, want, got))
 
+    # Oracle's property graphs (a catalog row each): the replica's are the master's, and so is a GRAPH_TABLE over them
+    def graphs_same(rnd, want_name=None):
+        want = (door('tns', mtns, GRQ), door('tns', mtns, GTQ))
+        if want_name is not None and want_name not in want[0]:
+            fail('round %d: the master lost graph %s: %s' % (rnd, want_name, want))
+        end = time.time() + 10
+        got = None
+        while time.time() < end:
+            got = (door('tns', rtns, GRQ), door('tns', rtns, GTQ))
+            if got == want:
+                return want
+            time.sleep(0.05)
+        fail('round %d: the replica\'s graphs are not the master\'s:\n  master  %s\n  replica %s' % (rnd, want, got))
+
     master.start()
     if not master.ready():
         fail('the master did not start')
     w = door('tns', mtns, "create table an (id number primary key annotations (Display 'Id'), v number annotations (Hidden)) annotations (Note 'n')")
     if not w.startswith('ok'):
         fail('the annotated table was not made: ' + w)
+    for q in ['create table gv (id number primary key)', 'create table ge (id number primary key, s number, d number)',
+              'insert into gv values (1)', 'insert into gv values (2)', 'insert into ge values (1, 1, 2)',
+              'create property graph gsoc vertex tables (gv) edge tables (ge source key (s) references gv (id) destination key (d) references gv (id))']:
+        w = door('tns', mtns, q)
+        if not w.startswith('ok'):
+            fail('the graph was not made: %s: %s' % (q, w))
     psql(mport, "create table t (id int primary key, v int not null, g int not null, s text)")
     psql(mport, "create index t_g on t (g)")
     psql(mport, "create table u (id int primary key, name text)")
@@ -478,6 +504,14 @@ def main():
         if not w.startswith('ok'):
             fail('round %d: an annotation was not added: %s' % (rnd, w))
         annots_same(rnd)
+        for q in ['create property graph gr%d vertex tables (gv)' % rnd, 'insert into ge values (%d, %d, %d)' % (rnd + 1, 1 + rnd % 2, 2 - rnd % 2)]:
+            w = door('tns', mtns, q)
+            if not w.startswith('ok'):
+                fail('round %d: %s: %s' % (rnd, q, w))
+        graphs_same(rnd)
+        w = door('tns', rtns, 'create property graph on_replica vertex tables (gv)')
+        if not w.startswith('error 16000:'):
+            fail('round %d: CREATE PROPERTY GRAPH on the replica: %s' % (rnd, w))
         w = psql(rport, "insert into u values (999999, 'no')", check=False)
         if '25006' in w.stderr or 'read-only' in w.stderr:
             refused += 1
@@ -501,6 +535,9 @@ def main():
             w = door('tns', mtns, "alter table an modify (v annotations (add before_kill 'k'))")
             if not w.startswith('ok'):
                 fail('an annotation was not added before the kill: ' + w)
+            w = door('tns', mtns, 'create property graph before_kill vertex tables (gv)')
+            if not w.startswith('ok'):
+                fail('a graph was not made before the kill: ' + w)
             master.kill()
             try:
                 code = replica.p.wait(10)
@@ -516,6 +553,8 @@ def main():
                 fail('the replica did not start after the master recovered')
             caught_up(rnd)
             annots_same(rnd, 'BEFORE_KILL')
+            graphs_same(rnd, 'BEFORE_KILL')
+    gt_before = door('tns', mtns, GTQ)
     code = master.stop()
     if code != 0:
         fail('the master stopped with %s' % code)
@@ -530,6 +569,12 @@ def main():
     got = door('tns', mtns, ANQ)
     if 'BEFORE_KILL' not in got or ('R%d' % a.rounds) not in got:
         fail('the annotations after a clean close: ' + got)
+    got = door('tns', mtns, GRQ)
+    if 'BEFORE_KILL' not in got or ('GR%d' % a.rounds) not in got:
+        fail('the graphs after a clean close: ' + got)
+    got = door('tns', mtns, GTQ)
+    if got != gt_before:
+        fail('GRAPH_TABLE after a clean close: %s, before it %s' % (got, gt_before))
     if master.stop() != 0:
         fail('the master did not stop again')
     print('replica test: %d rounds, the replica caught up every round, %d writes refused, killed and started again %d times, '
