@@ -326,3 +326,74 @@ INSERT 216,528.7, UPDATE by key 199,616.9, as text 105,091.3 / 238,008.8 / 224,5
 and 559 against 314 and 315 (the server's hash seed is not fixed there). TPC-H SF1, 22 queries, base and branch alternated twice (base's first run cold, so best of two): checksums equal on all 22,
 total 8,082 ms against 7,958 ms; q1 (+2.9%), q6 (+2.2%) slower in time with fewer server instructions (q1 16,637 M against 16,244 M, q6 1,524.6 M against 1,484.9 M; `iq.sh`). Suite 392 passed;
 replica.py passed. lexdb_exec.lxl 21,558 lines before, 21,564 after.
+
+## The fifth bug slice (2026-11-25)
+
+The bugs the documentation passes listed in KNOWN-ISSUES.md, on `worktree-agent-aada84ce95b9c4421` (from main 0400f272, tags `b5-base` and `b5`). Each was checked on the product
+before and after (Oracle Free 23.26.3, SQL Server 2022, PostgreSQL 18.6). Tests: `tns_bugs5` (`gen_oracle.py --check tns_bugs5`: 44 answers, 0 differences), `tns_assertpriv`
+(`--check`, scenario: 11 answers, 0 differences), `tns_plfdrop` (two sessions; Oracle's answers by python-oracledb), `tds_bugs5` (`gen_mssql.py bugs5`), `tds_assertpriv` (lexdb's own: the
+T-SQL and PostgreSQL doors' assertions), `exec_bugs5` (`gen_pg.py bugs5`).
+
+### Every door: DROP COLUMN of a table views read (item 1)
+- lexdb refused the drop of any column of a table a view reads (2BP01, ORA-02449, 50000). The drop is done now and checked afterwards in the statement (`lexdb_viewdep.afterAlter`, from
+  the end of `alterTable`): each view that reads the table is planned on its own (`lexdb_exec.viewCols`, as reading it plans it: its rename map, its owner's rights); one whose query fails
+  with a name gone (42703, 42P01, a graph's ORA-04045 / ORA-42421, a view under it with errors) or gives fewer columns than the view has (a `SELECT *` over the table: a view's columns are
+  those of its CREATE) uses the column. PostgreSQL's door refuses then (2BP01, PostgreSQL's DETAIL lines and HINT), and its CASCADE drops those views (and the views over them) and no
+  others; SQL Server's door refuses only for a view made WITH SCHEMABINDING (5074); Oracle's door never refuses. A refusal undoes the statement (its door's savepoint).
+- Reading such a view: Oracle's ORA-04063 (now also through GRAPH_TABLE, which gave the graph's ORA-04045), SQL Server's 207 for a name, 4502 for a `SELECT *` short of columns
+  (`fewerErr`). USER_OBJECTS.STATUS of an Oracle view whose query does not plan now is INVALID, and USER_ERRORS has its error (TYPE VIEW, LINE 0, POSITION 0, the text with Oracle's line
+  feed: ORA-00904 for the column or the function gone, ORA-04063 for a view under it, ORA-04045 and its cause for a graph; `viewErrs`, `CatView.verrs`, computed only for the *_OBJECTS and
+  *_ERRORS views). Oracle keeps a view INVALID from the DDL until its next use; lexdb's says what the view's query does now (VALID as soon as the column is back).
+- T-SQL's CREATE VIEW reads WITH SCHEMABINDING (kept: `lexdb_sql.SB_MARK` after the query, `viewBound`; `sys.sql_modules.is_schema_bound`), VIEW_METADATA and ENCRYPTION (195 for another
+  option, 1054 for `SELECT *` in a schema-bound view). Not done: SQL Server's 4512 (one-part names) and 4513 (a schema-bound view over one that is not), ALTER COLUMN of a column a
+  schema-bound view reads (5074), DROP TABLE of its table (3729: lexdb refuses DROP TABLE under any view, in every door). A `SELECT *` view after a column of it was dropped and another
+  added reads the table's columns by position (SQL Server: 4502 until sp_refreshview; Oracle: by name).
+
+### SQL Server (items 2, 6, 9)
+- **An inline INDEX in CREATE TABLE** (`INDEX ix [UNIQUE] [CLUSTERED | NONCLUSTERED] (cols) [INCLUDE] [WHERE]` among the elements, `INDEX ix ...` after a column) is a CREATE INDEX kept in
+  the statement's `inner` and made with the table in its statement (`Parser.inlineIndex`; a CLUSTERED one makes an unsaid primary key NONCLUSTERED); CREATE INDEX of a missing column is 1911.
+- **DELETE, UPDATE and INSERT TOP (n) [PERCENT]**: PERCENT takes n percent of the rows found, rounded up (`lexdb_plan.topOf`; 1031 past 100); INSERT TOP (n) [PERCENT] [INTO] limits its
+  query (read as a derived table when it has its own TOP, ORDER BY, OFFSET or a set operation, `insertTop`) or cuts its VALUES. INSERT ... SELECT TOP n PERCENT inserted every row: the rows
+  are now made whole first (the existing PERCENT code then cuts them).
+- **INFORMATION_SCHEMA in the T-SQL door** shows dbo where the schema is lexdb's public (`lexdb_syscat.dboRows`: every *_SCHEMA column and SCHEMA_NAME, SCHEMATA's owner), as sys.schemas and
+  SCHEMA_NAME() did; the PostgreSQL door keeps public. Still: ROUTINES and PARAMETERS have no T-SQL procedures and functions, CONSTRAINT_COLUMN_USAGE has no foreign key's columns,
+  VIEW_TABLE_USAGE does not exist.
+- **Parse errors**: a parenthesized operand of UNION / INTERSECT / EXCEPT with its own ORDER BY is 156 (`armOrder`); a reserved word where a statement would start (`SELECT 1 rule`) is 156,
+  decided on the error path only (`Parser.statement`'s `startErr`); CREATE TABLE HOLDLOCK / INDEX and a table followed by HOLDLOCK are 1018 (`tableHintErr`). 1018, 1031 and 1054 have
+  SQL Server's severity 15.
+
+### Oracle (items 3, 4, 7, 8, 10, 11)
+- **An assertion's check runs with its owner's rights** (also in the T-SQL and PostgreSQL doors): `lexdb_assert.asOwner` reads the check's query as a derived table under `Stmt.runAs`
+  (the assertion's schema, or the user that made it), as a view's query is read: a writer with INSERT, UPDATE or DELETE and no SELECT is checked (ORA-08601, 547, 23514), not refused (ORA-41900,
+  229, 42501); its own WHERE and SELECT still need the privilege. Oracle refuses an assertion over another schema's table even with SELECT and REFERENCES on it (ORA-01031), so the owner
+  reads its own tables.
+- **A stored function's column name**: a call with constant arguments, made before the query and written as its value, keeps the call as written in a comment, `(/*#plf okf(1)*/2)`
+  (`lexdb_sql.PLF_LABEL`), which `oraLabel` reads back: OKF(1), 5+OKF(3), APP.OKF(2). A call of a quoted mixed-case function (`"MixF"(2)`) is still ORA-00900.
+- **A SQL statement of a stored unit that does not parse** is a compile error: ORA-00936 (ORA-00907 with a parenthesis left open) at the token the parser stopped at
+  (`lexdb_parse.oraSyntaxAt`: its text and how many of it come before), then "SQL Statement ignored" at its start; the unit is INVALID with USER_ERRORS' rows (`Cx.checkSyntax`, stored units
+  only). Oracle's exact number can differ from 936 for other syntax errors; a `SELECT count(* INTO ...` is still PLS-00428 (lexdb's INTO test) where Oracle gives ORA-00907.
+- **UPDATE of a GENERATED ALWAYS identity column** is ORA-32796, `SET id = DEFAULT` and MERGE's UPDATE too; INSERT stays ORA-32795.
+- **Assertions**: a quoted lower-case name is kept ("xq"); SET CONSTRAINT[S] of a name that is not there is ORA-02448, of a non-deferrable assertion ORA-08687 for IMMEDIATE too;
+  USER_ASSERTIONS.INVALID is INVALID once ALTER TABLE added, dropped, retyped or renamed a column of a table the assertion reads (Oracle's, checked: CREATE INDEX, COMMENT, ADD CONSTRAINT,
+  TRUNCATE leave it; DISABLE / ENABLE do not clear it), kept in its catalog row (`Assertion.invalid`, `columnsChanged`, from `afterAlter`), and it is still checked. Not done: under
+  NOVALIDATE, a DELETE or UPDATE of a table under the inner NOT EXISTS still runs the whole query (Oracle checks only the rows related to those written): it needs the old rows' join-key values
+  (the deleted rows are gone when the check runs) to restrict the outer instance (`plan.keys`), captured by the write paths or read at the statement's start.
+- **A view over a function dropped by another session while a transaction that wrote is open** gives ORA-04063 at once: whether a unit is there is read from the transaction's snapshot and
+  the latest catalog (`lexdb_routine.srcValid`; Oracle's DDL is not transactional). It gave ORA-00904, then rows with NULLs, until the transaction ended.
+- Quoted lower-case table names are still folded (`create table "qt"` is listed as QT and is the same table as qt): the Oracle lexer drops a quoted name's spelling when it is lower case.
+
+### Not done: nested subprograms (item 5)
+A procedure or function declared in a block (a stored unit's declare section, a package member's) is still PLS-00103 "not supported". What it needs, from how packages work: the nested
+units compiled as members of the unit that declares them (`pkgMember`'s path: their own slot ranges in the enclosing unit's slot space, signatures in `cx.sigs` under a name only the
+enclosing unit resolves, overloads by argument count as members'), returned with the unit (as `compilePackage` returns its members) and kept in the program; a call copies the slots outside
+the callee's own range from the caller's frame into the callee's and back after it (as `pkgLoad` / `pkgSave` copy a package's variables), which gives the outer unit's variables, recursion
+and calls among nested units; USER_ERRORS positions for errors inside them. About a day with its tests against Oracle.
+
+### Measured
+In process (`pt.lxl`, 20,000 statements, `LXL_HASH_SEED=1`, two rounds, base = main 0400f272 built the same way, trees at paths of equal length), equal in both rounds: point select
+31,336.5, INSERT 217,229.9, UPDATE by key 200,302.6, as text 105,736.3 / 238,692.2 / 225,189.3; in a transaction block INSERT 50,325.9, UPDATE 84,459.0 against 84,459.1 (the 0.1 flips
+between runs). A first build was 4.0 instructions a text INSERT more (INSERT TOP's test ahead of INTO's): moved into the T-SQL branch. Over the wire (`icount6.sh`, 20,000 point selects x 3,
+base and branch alternated twice): instructions 156,075 and 156,077 against 156,250 and 156,173, cycles 84,973 and 85,429 against 85,511 and 84,794, L1 i-cache misses 293 and 290 against 414
+and 410 (the server's hash seed is not fixed there). TPC-H SF1, 22 queries, base and branch alternated twice: checksums equal on all 22, total 7,586 ms against 7,532 ms; q21 (+2.0%) and q22
+(+1.9%) slower in time with the same server instructions (q21 6,390.5 M against 6,394.6 M, q22 464.86 M against 464.87 M; `iq.sh`). Suite 398 passed; replica.py passed. lexdb_exec.lxl
+22,175 lines before, 22,186 after (viewCols and viewErr; viewPlanned's body moved to lexdb_viewdep).

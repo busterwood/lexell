@@ -1308,3 +1308,14 @@ whole-query check, the check's plan made each time.
 - A stored procedure or function with an undeclared name, an expression that does not parse or DML on a missing table is stored INVALID with USER_ERRORS; SQL's call of it is ORA-06575.
 - TIME_ZONE 'UTC' (ALTER SESSION, logon) is the region: SESSIONTIMEZONE shows UTC. TO_CHAR of a TIMESTAMP WITH LOCAL TIME ZONE refuses TZH and TZM (ORA-01821).
 - Property graphs' error numbers and texts as Oracle's (lexdb-robust.md lists them). Tests `tns_bugs4`, `tns_viewplf`, `tns_graphtext`.
+
+## As built: the fifth bug slice (lexdb-robust.md, 2026-11-25)
+
+- ALTER TABLE ... DROP COLUMN of a table views read is done (it was ORA-02449); a view that used the column has errors (ORA-04063, through GRAPH_TABLE too), USER_OBJECTS shows it INVALID
+  while its query does not plan and USER_ERRORS has its error (TYPE VIEW), also for a view over a dropped function.
+- A stored function's result column is named as written (OKF(1), 5+OKF(3)); UPDATE of a GENERATED ALWAYS identity column is ORA-32796; a SQL statement of a stored unit that does not parse
+  makes the unit INVALID (ORA-00936 / ORA-00907 in USER_ERRORS).
+- Assertions: the check reads with the owner's rights; a quoted lower-case name is kept; SET CONSTRAINT of a missing name ORA-02448, of a non-deferrable assertion ORA-08687;
+  USER_ASSERTIONS.INVALID after a column's DDL on a table it reads.
+- A view over a function another session dropped is ORA-04063 at once in a transaction opened before. Tests `tns_bugs5`, `tns_assertpriv`, `tns_plfdrop`. Nested subprograms are still
+  refused (lexdb-robust.md says what they need).

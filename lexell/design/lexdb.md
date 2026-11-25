@@ -13108,3 +13108,10 @@ The core's share of the slice: a foreign key between an integer and a numeric co
 (`lexdb_fkconv`: the parent found by its primary key's key made from the values, `pkKey`, which builds no row and made a foreign key's INSERT cheaper; the children by `fit`); a PL/SQL unit's
 CREATE and DROP move the catalog's version (`lexdb_catalog.CAT_VERSION_KEY`), so plans kept over it are made again; SQL Server's reserved words (`lexdb_sql.tsqlReserved`) are refused as bare
 names in the T-SQL door's parse.
+
+### 9.148 The fifth bug slice (lexdb-robust.md, "The fifth bug slice")
+
+The core's share of the slice: ALTER TABLE ... DROP COLUMN checks the views that read the table after the table's new definition is written, by planning their queries
+(`lexdb_viewdep`): PostgreSQL's door refuses a column a view uses (2BP01; CASCADE drops those views), SQL Server's only for a schema-bound view (5074), Oracle's never; a view read with
+fewer columns than it was made with is an error in every door. An assertion's check reads its tables with the assertion owner's rights (`Stmt.runAs`, as a view's query), and a
+column's DDL on a table one reads marks it INVALID (Oracle's USER_ASSERTIONS). PostgreSQL's door is unchanged otherwise (`exec_bugs5`).
