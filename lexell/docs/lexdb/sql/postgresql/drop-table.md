@@ -35,8 +35,11 @@ DROP TABLE [ IF EXISTS ] name [, ...] [ CASCADE | RESTRICT ]
 
 ## Differences from PostgreSQL
 
-- The refusal of a table with dependents (2BP01) has no `DETAIL` listing them and no `HINT`. When only foreign keys
-  depend on it, the message says what `CASCADE` would do (`with CASCADE the foreign keys on it are dropped`).
+- The refusal of a table that views read (2BP01) is PostgreSQL's: a `DETAIL` with a line for each view (and the views
+  that read those views) and the `HINT`, in the order of the views' names (PostgreSQL's order is not fixed). It does
+  not list foreign keys: when only foreign keys depend on the table, the message says what `CASCADE` would do (`with
+  CASCADE the foreign keys on it are dropped`) and has no `DETAIL` or `HINT`, and when views and foreign keys both
+  depend on it the `DETAIL` lists the views only.
 - `CASCADE` gives no `NOTICE` naming what it drops.
 
 ## Examples
@@ -107,6 +110,8 @@ SELECT count(*) FROM pg_class WHERE relname = 'customer_id_seq';
 
 ```text
 ERROR:  cannot drop table customer because other objects depend on it
+DETAIL:  view customer_names depends on table customer
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
 DROP TABLE
       conname
 --------------------
@@ -125,7 +130,36 @@ DROP TABLE
 (1 row)
 ```
 
-### D. Errors
+### D. A table under a view, and a view under a view
+
+The refusal names each view and what it reads. `CASCADE` drops the views, and the views over them.
+
+<!-- example: postgresql -->
+```sql
+CREATE TABLE dept (id int PRIMARY KEY, name text);
+CREATE VIEW dept_names AS SELECT name FROM dept;
+CREATE VIEW dept_upper AS SELECT upper(name) AS name FROM dept_names;
+DROP TABLE dept;
+DROP TABLE dept CASCADE;
+SELECT count(*) FROM pg_views WHERE viewname IN ('dept_names', 'dept_upper');
+```
+
+```text
+CREATE TABLE
+CREATE VIEW
+CREATE VIEW
+ERROR:  cannot drop table dept because other objects depend on it
+DETAIL:  view dept_names depends on table dept
+view dept_upper depends on view dept_names
+HINT:  Use DROP ... CASCADE to drop the dependent objects too.
+DROP TABLE
+ count
+-------
+     0
+(1 row)
+```
+
+### E. Errors
 
 <!-- example: postgresql -->
 ```sql

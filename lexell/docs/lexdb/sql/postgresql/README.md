@@ -59,7 +59,7 @@ This index lists everything the door takes today. Pages not written yet are list
 
 | Statement | What it does |
 |---|---|
-| [BEGIN, START TRANSACTION](begin.md) | `READ ONLY`, `READ WRITE`, `ISOLATION LEVEL` (every read-write transaction is serializable). |
+| [BEGIN, START TRANSACTION](begin.md) | `READ ONLY`, `READ WRITE`, `ISOLATION LEVEL` (serializable unless `READ COMMITTED` is asked for). |
 | [COMMIT, END](commit.md) | |
 | [ROLLBACK, ABORT](rollback.md) | |
 | [SAVEPOINT](savepoint.md), [RELEASE SAVEPOINT](release-savepoint.md), [ROLLBACK TO SAVEPOINT](rollback-to-savepoint.md) | |

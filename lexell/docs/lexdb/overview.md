@@ -68,8 +68,9 @@ See [architecture](architecture.md) for the files, checkpoints and recovery from
 
 - **Read-write transactions are serializable.** Every transaction that writes runs at SERIALIZABLE, phantoms
   included. lexdb checks at commit whether anything a transaction read has changed; if so, the commit fails with
-  a serialization error (SQLSTATE `40001`, SQL Server 1205, `ORA-08177`) and the client retries. `READ COMMITTED`
-  and the other levels are accepted and run as serializable. Row locks (`SELECT ... FOR UPDATE`) avoid the retries
+  a serialization error (SQLSTATE `40001`, SQL Server 1205, `ORA-08177`) and the client retries. In the
+  PostgreSQL door `READ COMMITTED` can be asked for and then has no commit check; in the SQL Server and Oracle doors
+  the levels are accepted and run as serializable. Row locks (`SELECT ... FOR UPDATE`) avoid the retries
   in the common read-then-update case.
 - **Read-only transactions are snapshots.** A read-only transaction sees the database as it was when it began.
 - **Readers never wait for writers, and writers never wait for readers.**

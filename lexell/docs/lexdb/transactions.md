@@ -4,15 +4,20 @@ How a transaction starts and ends in each door, what isolation lexdb gives, and 
 
 ## Isolation
 
-- Every transaction that writes runs at **serializable** isolation, phantoms included. At commit lexdb checks whether
-  anything the transaction read has changed. If so the commit fails with a serialization error and the client
-  retries the whole transaction.
+- Every transaction that writes runs at **serializable** isolation, phantoms included, unless the PostgreSQL door is
+  asked for read committed (below). At commit lexdb checks whether anything the transaction read has changed. If so
+  the commit fails with a serialization error and the client retries the whole transaction.
 - A transaction that only reads sees a **snapshot**: the database as it was when the transaction began. It never
   waits for writers, and writers never wait for it.
-- The isolation levels each door accepts (`SET TRANSACTION ISOLATION LEVEL ...`, `BEGIN ISOLATION LEVEL ...`) are
-  read and **do not change anything**: `READ COMMITTED` runs as serializable. In the PostgreSQL door `READ ONLY` is
-  enforced (a write gives 25006); in the Oracle door `SET TRANSACTION READ ONLY` is accepted and does not stop
-  writes.
+- **PostgreSQL door: `READ COMMITTED` is opt-in.** `BEGIN ISOLATION LEVEL READ COMMITTED`, `SET TRANSACTION ISOLATION
+  LEVEL READ COMMITTED` (before the block's first statement), `SET default_transaction_isolation = 'read committed'`
+  and the connection's startup options give a transaction that reads what is committed when each statement starts and
+  checks nothing at commit; writers of the same row wait for each other, and there is no 40001. `READ UNCOMMITTED` is
+  the same level; `REPEATABLE READ` and `SERIALIZABLE` are serializable. `SHOW transaction_isolation` says what the
+  block runs at (`read committed` or `serializable`).
+- **SQL Server and Oracle doors:** the levels are read and **do not change anything**: `SET TRANSACTION ISOLATION
+  LEVEL READ COMMITTED` runs as serializable. In the PostgreSQL door `READ ONLY` is enforced (a write gives 25006); in
+  the Oracle door `SET TRANSACTION READ ONLY` is accepted and does not stop writes.
 - Row locks (`SELECT ... FOR UPDATE`) avoid the retries in the common read-then-update case.
 
 | Door | The serialization failure |

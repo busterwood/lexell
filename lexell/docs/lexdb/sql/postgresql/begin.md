@@ -28,8 +28,13 @@ transaction_mode:
 : The block reads a snapshot taken at `BEGIN`, and may not write: `INSERT`, `UPDATE`, `DELETE`, `MERGE`, DDL and
   `SELECT ... FOR UPDATE` give 25006.
 
-`ISOLATION LEVEL`, `DEFERRABLE`
-: Accepted. Every read-write block is serializable, whatever level is asked for.
+`ISOLATION LEVEL`
+: `READ COMMITTED` and `READ UNCOMMITTED` give a block that takes a new snapshot for each statement (PostgreSQL's
+  read committed); `SERIALIZABLE` and `REPEATABLE READ` give the serializable block described below. Without the
+  clause the block is serializable, unless the session's `default_transaction_isolation` says otherwise.
+
+`DEFERRABLE`
+: Accepted and ignored.
 
 ## Remarks
 
@@ -47,14 +52,20 @@ transaction_mode:
 
 ## Differences from PostgreSQL
 
-- `ISOLATION LEVEL READ COMMITTED` and `REPEATABLE READ` run serializable: `SHOW transaction_isolation` says
-  `serializable`. An application written for read committed meets more 40001 failures (lexdb-gaps.md 2.2).
+- **The default level is `serializable`** (PostgreSQL: `read committed`), and `read committed` is opt-in: `BEGIN
+  ISOLATION LEVEL READ COMMITTED`, `SET TRANSACTION ISOLATION LEVEL`, `SET default_transaction_isolation` and the
+  connection's startup options take it. `READ UNCOMMITTED` is read committed, as in PostgreSQL, but `SHOW
+  transaction_isolation` says `read committed` for it (PostgreSQL: `read uncommitted`), and `REPEATABLE READ` runs
+  serializable and says `serializable` (PostgreSQL: `repeatable read`). An application written for read committed
+  meets 40001 failures unless it asks for the level (lexdb-gaps.md 2.2).
 - `BEGIN` ignores words it does not know: `BEGIN nonsense` starts a block where PostgreSQL gives 42601.
 - In a `READ ONLY` block, `SHOW transaction_read_only` says `off`.
 - `BEGIN` inside a block, and `COMMIT` or `ROLLBACK` outside one, give no `WARNING` (PostgreSQL warns `there is
   already a transaction in progress` and `there is no transaction in progress`).
-- `SET TRANSACTION` and `SET SESSION CHARACTERISTICS AS TRANSACTION` are accepted and ignored: write the mode in
-  `BEGIN`.
+- `SET TRANSACTION` and `SET SESSION CHARACTERISTICS AS TRANSACTION` take the isolation level (`SET TRANSACTION
+  ISOLATION LEVEL` after the block's first statement is 25001 in lexdb; PostgreSQL allows it until a snapshot is
+  taken, or when the level stays the same) and ignore `READ ONLY` and `READ WRITE`:
+  write the mode in `BEGIN`.
 - `PREPARE TRANSACTION` (two-phase commit) is not supported.
 
 ## Examples
@@ -140,18 +151,73 @@ ROLLBACK
 
 ### D. Isolation levels
 
+The default is serializable. `READ COMMITTED` and `READ UNCOMMITTED` give a block that reads what is committed when each
+statement starts; `REPEATABLE READ` is serializable.
+
 <!-- example: postgresql -->
 ```sql
+SHOW transaction_isolation;
 BEGIN ISOLATION LEVEL READ COMMITTED;
+SHOW transaction_isolation;
+COMMIT;
+BEGIN ISOLATION LEVEL REPEATABLE READ;
+SHOW transaction_isolation;
+COMMIT;
+BEGIN;
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+SHOW transaction_isolation;
+COMMIT;
+BEGIN;
+SELECT 1;
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
+ROLLBACK;
+SET default_transaction_isolation = 'read committed';
+BEGIN;
 SHOW transaction_isolation;
 COMMIT;
 ```
 
 ```text
+ transaction_isolation
+-----------------------
+ serializable
+(1 row)
+
+BEGIN
+ transaction_isolation
+-----------------------
+ read committed
+(1 row)
+
+COMMIT
 BEGIN
  transaction_isolation
 -----------------------
  serializable
+(1 row)
+
+COMMIT
+BEGIN
+SET
+ transaction_isolation
+-----------------------
+ read committed
+(1 row)
+
+COMMIT
+BEGIN
+ ?column?
+----------
+        1
+(1 row)
+
+ERROR:  SET TRANSACTION ISOLATION LEVEL must be called before any query
+ROLLBACK
+SET
+BEGIN
+ transaction_isolation
+-----------------------
+ read committed
 (1 row)
 
 COMMIT

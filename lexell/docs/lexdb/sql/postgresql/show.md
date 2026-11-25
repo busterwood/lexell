@@ -35,7 +35,7 @@ SHOW ALL
   | `standard_conforming_strings` | `on` |
   | `integer_datetimes` | `on` |
   | `max_identifier_length` | `63` |
-  | `transaction_isolation` | `serializable` |
+  | `transaction_isolation` | `serializable`; `read committed` in a block begun with that level, and after `SET default_transaction_isolation` |
   | `is_superuser` | `on` |
   | `transaction_read_only`, `default_transaction_read_only`, `in_hot_standby` | `on` on a replica, else `off` |
 
