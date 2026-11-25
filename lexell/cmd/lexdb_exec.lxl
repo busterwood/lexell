@@ -872,6 +872,7 @@ fn useTmp(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): str {
     let n = lexdb_catalog.tmpName(txn.sql.sess)
     txn.sql.path = withTmp(&txn.sql.path, &n)
     txn.tmp = n.clone()
+    txn.endWork = true                                  // (its session takes it at the statement's end: blockEnd)
     st.memo.put(&tmpMemo(txn.sql.sess), &n)
     return n
 }
@@ -3824,7 +3825,10 @@ fn createTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     try lexdb_nnalter.createNames(mut &t, &s.names)
     try lexdb_annot.onCreate(mut &t, &s.alters)
     t.onCommit = s.onCommit
-    if s.onCommit > lexdb_sql.ONC_PRESERVE { append(mut &txn.onCommit, key.clone()) }
+    if s.onCommit > lexdb_sql.ONC_PRESERVE {
+        append(mut &txn.onCommit, key.clone())
+        txn.endWork = true
+    }
     try txn.put(lexdb_catalog.CATALOG, &key, &(lexdb_catalog.encTable(&t)))
     try bumpFor(st, txn, &key)
     // its owner, and its columns' sequences' (9.83)
@@ -13169,9 +13173,10 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
 // A block's statement's end when its transaction has notes for the assertions (lexdb_assert.stmtEnd), its reads still the
 // live tree's (its own function: the statement's Result moved, not copied, on runStmt's path).
 fn (s: mut &Session) blockEnd(stmt: &lexdb_sql.Stmt, r0: Result[Res, DbErr]): Result[Res, DbErr] {
-    let r = match lexdb_assert.stmtEnd(&s.st, mut &s.txn[0], r0.isOk(), stmt, &assertUp(&s.st, s.id, s.limits())) { Ok(_) { r0 } Err(x) { Err(x) } }
+    let r = if len(s.txn[0].onCommit) == 0 { r0 } else { match lexdb_assert.stmtEnd(&s.st, mut &s.txn[0], r0.isOk(), stmt, &assertUp(&s.st, s.id, s.limits())) { Ok(_) { r0 } Err(x) { Err(x) } } }
     s.txn[0].live = false
     if len(s.tmp) == 0 && len(s.txn[0].tmp) > 0 { s.tmp = s.txn[0].tmp.clone() }
+    s.txn[0].endWork = len(s.txn[0].onCommit) > 0
     if r.isErr() { s.failed = true }
     return r
 }
@@ -13496,9 +13501,8 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                         (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from) || (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode > 0)
         if s.readOnly { s.txn[0].live = false }       // (a temporary table's writes: its snapshot is the session's own, 9.96)
         let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits(), pc, input, out, pull, sink)
-        if len(s.txn[0].onCommit) > 0 { return s.blockEnd(stmt, r) }      // (its assertions, O23)
+        if s.txn[0].endWork { return s.blockEnd(stmt, r) }        // (its assertions, O23; a temporary schema it made)
         s.txn[0].live = false
-        if len(s.tmp) == 0 && len(s.txn[0].tmp) > 0 { s.tmp = s.txn[0].tmp.clone() }
         if r.isErr() { s.failed = true }
         return r
     }
