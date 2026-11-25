@@ -7,7 +7,14 @@ Creates a view: a stored query that is read like a table.
 ## Syntax
 
 ```
-CREATE [ OR REPLACE ] [ NOFORCE ] VIEW [ schema. ] view [ ( alias [, alias ]... ) ] AS subquery
+CREATE [ OR REPLACE ] [ NOFORCE ] VIEW [ schema. ] view [ ( alias [ annotations_clause ] [, ...] ) ]
+    [ annotations_clause ] AS subquery
+
+ALTER VIEW [ schema. ] view annotations_clause
+ALTER VIEW [ schema. ] view MODIFY ( column annotations_clause [, ...] )
+
+annotations_clause:
+    ANNOTATIONS ( [ ADD [ IF NOT EXISTS ] | DROP [ IF EXISTS ] | REPLACE ] name [ 'value' ] [, ...] )
 ```
 
 ## Arguments
@@ -21,6 +28,11 @@ CREATE [ OR REPLACE ] [ NOFORCE ] VIEW [ schema. ] view [ ( alias [, alias ]... 
 
 *subquery*
 : Any query, with joins, grouping and subqueries.
+
+`ANNOTATIONS`
+: Names, with or without a value, kept for the view or one of its columns and shown in `USER_ANNOTATIONS_USAGE`
+  (`OBJECT_TYPE` `VIEW`). `CREATE VIEW` adds them; `ALTER VIEW` adds, drops and replaces them. `CREATE OR REPLACE
+  VIEW` keeps only the new statement's. Example F below; see also [annotations](annotations.md).
 
 ## Remarks
 
@@ -38,6 +50,9 @@ CREATE [ OR REPLACE ] [ NOFORCE ] VIEW [ schema. ] view [ ( alias [, alias ]... 
   for both). Every view is read-only anyway.
 - `FORCE` (a view over a table that does not exist yet) is ORA-00900; `NOFORCE` is the default and is accepted.
 - `CREATE MATERIALIZED VIEW` is ORA-03001.
+- `ALTER VIEW` of a table is ORA-20000 (Oracle ORA-00942). `ALTER VIEW ... COMPILE` is ORA-03001 (message `ALTER VIEW
+  supports RENAME TO only`), where Oracle accepts it; `ALTER VIEW v RENAME TO w` renames the view, where Oracle gives
+  ORA-00922 (use [RENAME](rename.md)).
 
 ## Examples
 
@@ -173,6 +188,38 @@ ERROR:
 ORA-03001: unimplemented feature: lexdb: CREATE MATERIALIZED is not supported yet (CREATE makes tables, views, indexes, schemas, sequences, types, roles and users)
 ```
 
+### F. Annotations
+
+<!-- example: oracle -->
+```sql
+CREATE VIEW v_pay (id, salary ANNOTATIONS (Unit 'EUR')) ANNOTATIONS (Purpose 'payroll', Restricted)
+AS SELECT id, salary FROM emp;
+ALTER VIEW v_pay ANNOTATIONS (REPLACE Purpose 'pay review', DROP Restricted);
+ALTER VIEW v_pay MODIFY (id ANNOTATIONS (ADD Display 'Employee'));
+SELECT column_name, annotation_name, annotation_value FROM user_annotations_usage
+WHERE object_name = 'V_PAY' ORDER BY column_name NULLS FIRST, annotation_name;
+ALTER VIEW v_pay ANNOTATIONS (DROP Restricted);
+```
+
+```text
+View created.
+
+View altered.
+
+View altered.
+
+COLUMN_NAME ANNOTATION_NAME ANNOTATION_VALUE
+----------- --------------- ----------------
+            PURPOSE         pay review
+ID          DISPLAY         Employee
+SALARY      UNIT            EUR
+
+3 rows selected.
+
+ERROR:
+ORA-11553: Provided annotation 'RESTRICTED' does not exist for the object 'V_PAY'.
+```
+
 ## See also
 
-[DROP VIEW](drop-view.md), [SELECT](select.md), [CREATE TABLE](create-table.md)
+[DROP VIEW](drop-view.md), [SELECT](select.md), [CREATE TABLE](create-table.md), [Annotations](annotations.md)
