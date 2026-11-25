@@ -754,4 +754,4 @@ DROP TABLE
 ## See also
 
 [Operators](operators.md) · [Aggregate functions](functions-aggregate.md) · [Set-returning functions](functions-srf.md) ·
-[Data types](data-types-other.md) · [CREATE TABLE](create-table.md)
+[Arrays](data-types-arrays.md) · [CREATE TABLE](create-table.md)
