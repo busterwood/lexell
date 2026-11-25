@@ -41,6 +41,9 @@ annotations_clause:
 - The query is checked when the view is created: a missing table is ORA-00942.
 - A view is read like a table in `SELECT`, `JOIN` and other views. `USER_VIEWS` has its name and text, and
   `USER_TAB_COLUMNS` its columns.
+- **`SELECT *` keeps the columns the view was made with**, as in Oracle: a column added to the table later is not in the
+  view, and `USER_TAB_COLUMNS` lists the columns the view had (example J). `SELECT t.*, u.*` keeps `t`'s and `u`'s
+  columns.
 - **Views are read-only in lexdb:** `INSERT`, `UPDATE` and `DELETE` through a view are ORA-03001.
 - A view that calls a stored function runs the function's current body each time it is read: `CREATE OR REPLACE
   FUNCTION` changes what the view gives. `USER_VIEWS.TEXT` shows the query as it was written.
@@ -73,6 +76,8 @@ annotations_clause:
   next use); see [DROP TABLE](drop-table.md), example E.
 - `CREATE VIEW` over a function that was created with compilation errors (`INVALID`) is ORA-06575, as in Oracle (see
   [CREATE FUNCTION](create-function.md), example I).
+- `USER_VIEWS.TEXT` shows the query as it was written: Oracle shows a `*` expanded (`SELECT "ID","NAME" FROM tool`), as
+  the last query of example J does.
 - `ALTER VIEW ... READ ONLY` is ORA-03001; Oracle gives ORA-42310 for a view that is not an editioning view.
 
 ## Examples
@@ -434,6 +439,63 @@ V_CREW      VALID
 
 `V_CREW_TOP`, the view over `V_CREW`, is `INVALID` while the column is gone, in both. When the column is back, Oracle
 keeps it `INVALID` until it is read; lexdb's status follows what the view's query does, so it is `VALID` at once.
+
+### J. SELECT * keeps the columns it was made with
+
+The column added to `tool` after `v_tool` was made is in `v_tool2`, made after it, and not in `v_tool`.
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE tool (id NUMBER PRIMARY KEY, name VARCHAR2(20));
+INSERT INTO tool VALUES (1, 'saw');
+CREATE VIEW v_tool AS SELECT * FROM tool;
+ALTER TABLE tool ADD (price NUMBER);
+UPDATE tool SET price = 12;
+CREATE VIEW v_tool2 AS SELECT * FROM tool;
+SELECT * FROM v_tool;
+SELECT * FROM v_tool2;
+SELECT column_name FROM user_tab_columns WHERE table_name = 'V_TOOL' ORDER BY column_id;
+SELECT text FROM user_views WHERE view_name = 'V_TOOL';
+```
+
+```text
+Table created.
+
+1 row created.
+
+View created.
+
+Table altered.
+
+1 row updated.
+
+View created.
+
+ID NAME
+-- ----
+ 1 saw
+
+1 row selected.
+
+ID NAME PRICE
+-- ---- -----
+ 1 saw     12
+
+1 row selected.
+
+COLUMN_NAME
+-----------
+ID
+NAME
+
+2 rows selected.
+
+TEXT
+------------------
+SELECT * FROM tool
+
+1 row selected.
+```
 
 ## See also
 

@@ -59,8 +59,10 @@ error). Statements of a procedure or PL/SQL block are checked one by one. A defe
 back. `SET CONSTRAINT[S] ... IMMEDIATE` checks the waiting writes at once.
 
 A table no assertion reads pays nothing. A table one reads pays for one extra query per writing statement: the query,
-restricted to the rows the statement wrote (by key, 4,096 keys at a time for many rows), or the whole query when rows
-leave a table under a `NOT EXISTS` or an `EXISTS` condition.
+restricted to the rows the statement wrote (by key, 4,096 keys at a time for many rows), or, when rows leave a table under
+a `NOT EXISTS`, restricted to the outer rows that have the join-key values the old rows had; the whole query when rows
+leave a table under an `EXISTS` condition, or under a `NOT EXISTS` without a join key, or more than 64 rows leave, or a
+range is deleted.
 
 ### Concurrency
 

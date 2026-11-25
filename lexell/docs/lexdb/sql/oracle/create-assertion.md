@@ -125,17 +125,21 @@ wait. An assertion without an equijoin locks its tables: the second writer waits
 ## Cost
 
 A statement that writes a table an assertion reads pays for one check: the assertion's query run for the rows the
-statement wrote (for a `NOT EXISTS` over several tables, restricted to those rows' keys), or, for rows going away and
-for an `UPDATE` or `DELETE` that may break a `NOT EXISTS`'s inner tables, the whole query. A table no assertion reads
-pays nothing. Many rows put at once (a `COPY`, an array insert) are checked by key, 4,096 at a time.
+statement wrote (for a `NOT EXISTS` over several tables, restricted to those rows' keys), or, for rows going away from
+a `NOT EXISTS`'s inner table (a `DELETE`, or an `UPDATE` of a column the assertion reads), the query for the outer rows
+that have the join-key values the old rows had. The whole query runs for an `EXISTS` assertion, one without a join key,
+more than 64 rows, and a range delete. A table no assertion reads pays nothing. Many rows put at once (a `COPY`, an array insert) are checked by key, 4,096 at a time.
 
 ## Differences from Oracle
 
 - `USER_ASSERTION_LOCK_MATRIX` is empty.
 - Writers of rows that meet in an assertion's join key wait for each other. Oracle's locks can be finer, for chains of
   joins.
-- Under `NOVALIDATE`, an `UPDATE` or `DELETE` of a table under the assertion's inner `NOT EXISTS` runs the whole query,
-  so it fails when rows already break the assertion, where Oracle's row-only check passes (example G).
+- Under `NOVALIDATE`, an `UPDATE` or `DELETE` of a table under the assertion's inner `NOT EXISTS` checks only the outer
+  rows that have the join-key values taken out, as Oracle's row-only check does: rows that already break the assertion
+  do not refuse a statement that breaks nothing (example G). The whole query still runs for an `EXISTS` assertion, one
+  without a join key, more than 64 rows taken out, and a range delete, and then fails when rows already break the
+  assertion.
 
 ## Examples
 
@@ -377,6 +381,11 @@ V_POSITIVE         READING         FAST            ROWS INSERTED OR UPDATED
 
 ### G. NOVALIDATE, and DDL on the tables
 
+Project 2 has no person in its department when the assertion is made, and stays so. A new row that breaks the assertion
+is refused. A `DELETE` of a person is checked for the projects of the person's department only: removing the boss of
+department 1 passes, though project 2 already breaks the assertion, and removing the department's last two people is
+refused.
+
 <!-- example: oracle -->
 ```sql
 CREATE TABLE person (id NUMBER PRIMARY KEY, dept NUMBER NOT NULL, role VARCHAR2(5));
@@ -392,6 +401,7 @@ SELECT assertion_name, validated FROM user_assertions WHERE assertion_name = 'PR
 INSERT INTO proj VALUES (4, 3);
 INSERT INTO person VALUES (5, 1, 'dev');
 DELETE FROM person WHERE id = 1;
+DELETE FROM person WHERE id IN (3, 5);
 ALTER TABLE person RENAME COLUMN dept TO d;
 ALTER TABLE person MODIFY (dept NUMBER(5));
 ALTER TABLE person ADD (note VARCHAR2(10));
@@ -429,6 +439,8 @@ ERROR:
 ORA-08601: Assertion (SA.PROJ_HAS_PERSON) violated.
 
 1 row created.
+
+1 row deleted.
 
 ERROR:
 ORA-08601: Assertion (SA.PROJ_HAS_PERSON) violated.
