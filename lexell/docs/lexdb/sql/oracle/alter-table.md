@@ -18,10 +18,14 @@ ALTER TABLE [ schema. ] table
     | { ENABLE | DISABLE } [ VALIDATE | NOVALIDATE ] CONSTRAINT name
     | MODIFY CONSTRAINT name constraint_state
     | RENAME COLUMN old TO new
-    | RENAME TO new_table }
+    | RENAME TO new_table
+    | annotations_clause }
 
 column_modification:
-    column [ datatype ] [ DEFAULT expr ] [ NULL | NOT NULL ]
+    column [ datatype ] [ DEFAULT expr ] [ NULL | NOT NULL ] [ annotations_clause ]
+
+annotations_clause:
+    ANNOTATIONS ( [ ADD [ IF NOT EXISTS ] | DROP [ IF EXISTS ] | REPLACE ] name [ 'value' ] [, ...] )
 
 constraint_state:
     [ ENABLE | DISABLE ] [ VALIDATE | NOVALIDATE ] [ RELY | NORELY ]
@@ -67,6 +71,11 @@ constraint states mean.
 `RENAME COLUMN`, `RENAME TO`
 : Renames a column, or the table.
 
+`ANNOTATIONS`
+: Adds, drops or replaces the table's annotations; in `MODIFY`, a column's; in `ADD`, a new column's (as in
+  [CREATE TABLE](create-table.md)). They follow `RENAME COLUMN` and `RENAME TO` and go with `DROP COLUMN`. See
+  [annotations](annotations.md) and example M below.
+
 ## Remarks
 
 - Names in the statement are folded to upper case unless quoted.
@@ -75,7 +84,8 @@ constraint states mean.
   inserted or changed from then on (ORA-02290 for a `CHECK`, ORA-02291 for a foreign key), and the rows that are there
   may break it. A disabled foreign key does not refuse the deletion of the parent (no ORA-02292) and does not
   cascade `ON DELETE`.
-- Each statement does one kind of change; several `ADD` or `MODIFY` definitions go in one pair of brackets.
+- Each statement does one kind of change; several `ADD` or `MODIFY` definitions go in one pair of brackets. An
+  `ANNOTATIONS` clause may come before or after an `ADD` or `MODIFY` clause, without a comma.
 
 ## Differences from Oracle
 
@@ -87,6 +97,8 @@ constraint states mean.
   or of `NOT NULL` is ORA-00900. `RELY` and `NORELY` are read and not kept (`USER_CONSTRAINTS.RELY` is empty).
   Oracle has no `NOT ENFORCED`; neither has lexdb (ORA-00900).
 - `ALTER TABLE ... ALTER COLUMN` (T-SQL and PostgreSQL's form) is ORA-01735.
+- `ALTER TABLE` of a view is ORA-20000 (Oracle ORA-00942). One column twice in a `MODIFY` with annotations
+  (`MODIFY (c ANNOTATIONS (...), c ANNOTATIONS (...))`) applies both, where Oracle gives ORA-00957.
 
 ## Examples
 
@@ -637,6 +649,42 @@ ORA-02290: check constraint violated
 Rollback complete.
 ```
 
+### M. Annotations
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE pay (id NUMBER PRIMARY KEY, amount NUMBER ANNOTATIONS (Unit 'EUR')) ANNOTATIONS (Owner 'hr', Audited);
+ALTER TABLE pay ANNOTATIONS (ADD Reviewed '2026-11', REPLACE Owner 'finance', DROP Audited);
+ALTER TABLE pay MODIFY (amount NUMBER(10,2) ANNOTATIONS (REPLACE Unit 'USD'), id ANNOTATIONS (ADD Display 'Id'));
+ALTER TABLE pay ADD (note VARCHAR2(20) ANNOTATIONS (Hidden));
+SELECT column_name, annotation_name, annotation_value FROM user_annotations_usage
+WHERE object_name = 'PAY' ORDER BY column_name NULLS FIRST, annotation_name;
+ALTER TABLE pay ANNOTATIONS (DROP Audited);
+```
+
+```text
+Table created.
+
+Table altered.
+
+Table altered.
+
+Table altered.
+
+COLUMN_NAME ANNOTATION_NAME ANNOTATION_VALUE
+----------- --------------- ----------------
+            OWNER           finance
+            REVIEWED        2026-11
+AMOUNT      UNIT            USD
+ID          DISPLAY         Id
+NOTE        HIDDEN
+
+5 rows selected.
+
+ERROR:
+ORA-11553: Provided annotation 'AUDITED' does not exist for the object 'PAY'.
+```
+
 ## See also
 
-[CREATE TABLE](create-table.md), [DROP TABLE](drop-table.md), [RENAME](rename.md)
+[CREATE TABLE](create-table.md), [DROP TABLE](drop-table.md), [RENAME](rename.md), [Annotations](annotations.md)
