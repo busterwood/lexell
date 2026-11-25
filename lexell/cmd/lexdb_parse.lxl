@@ -6207,14 +6207,13 @@ fn (p: mut &P) fromItem0(join: int): Result[FromItem, lexdb_base.DbErr] {
     }
     let at0 = p.pos
     let table = try p.rname()
-    // PostgreSQL: a name and "(": [schema.]f(arguments), a set-returning SQL function of the user's (written as its query: lexdb_routine)
+    // PostgreSQL & Oracle: GRAPH_TABLE (...) (SQL/PGQ, O22), or PostgreSQL set-returning SQL function [schema.]f(...)
     if p.toks[p.pos].kind == T_OP && p.isKw("(") && !p.tsql {
-        // (Oracle: GRAPH_TABLE (...), O22)
+        if table == "graph_table" { return p.graphTable(join) }
         if !p.ora {
             p.pos = at0
             return p.pgFunctionFrom(join)
         }
-        if table == "graph_table" { return p.graphTable(join) }
     }
     var alias = lexdb_sql.baseName(&table)
     var cols: []str = []
@@ -11300,17 +11299,18 @@ fn (p: mut &P) annotAlters(s: mut &Stmt, cols: bool): Result[Unit, lexdb_base.Db
     return Ok(Unit{})
 }
 
-// ---- SQL/PGQ in the Oracle door (design/lexdb-new-features.md O22; lexdb_graph reads the texts kept here)
+// ---- SQL/PGQ property graphs (Oracle and PostgreSQL doors; lexdb_graph reads the texts kept here)
 
-// PROPERTY GRAPH next (Oracle's).
+// PROPERTY GRAPH next (Oracle and PostgreSQL).
 fn (p: &P) graphNext(): bool {
-    return p.ora && p.isKw("property") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "graph"
+    return !p.tsql && p.isKw("property") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "graph"
 }
 
 // CREATE [OR REPLACE] PROPERTY GRAPH [IF NOT EXISTS] name ...: the name, and the rest of the statement as its text.
 fn (p: mut &P) createGraph(orReplace: bool): Result[Stmt, lexdb_base.DbErr] {
     p.pos += 2
     var s = lexdb_sql.newStmt(lexdb_sql.S_CREATE_GRAPH)
+    s.mdialect = p.md()
     s.ifFlag = orReplace
     if p.isKw("if") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "not" && p.peekAt(2).kind == T_IDENT && p.peekAt(2).text == "exists" {
         p.pos += 3
@@ -11319,27 +11319,40 @@ fn (p: mut &P) createGraph(orReplace: bool): Result[Stmt, lexdb_base.DbErr] {
     s.table = try p.qname()
     s.spell = p.spelled.clone()
     let from = p.peek().at
+    let k0 = p.pos
     p.skipToEnd()
+    if !p.ora {
+        for k in k0..p.pos {
+            if p.toks[k].kind == T_PARAM {
+                return Err(lexdb_base.err("42P02", &("there is no parameter $" + p.toks[k].text)))
+            }
+        }
+    }
     s.index = p.src[from..p.peek().at].toStr()
     return Ok(s)
 }
 
-// DROP PROPERTY GRAPH [IF EXISTS] name.
+// DROP PROPERTY GRAPH [IF EXISTS] name [RESTRICT | CASCADE].
 fn (p: mut &P) dropGraph(): Result[Stmt, lexdb_base.DbErr] {
     p.pos += 2
     var s = lexdb_sql.newStmt(lexdb_sql.S_DROP_GRAPH)
+    s.mdialect = p.md()
     if p.isKw("if") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "exists" {
         p.pos += 2
         s.ifFlag = true
     }
     s.table = try p.qname()
     s.spell = p.spelled.clone()
-    // (Oracle has no CASCADE or PURGE here: ORA-03049)
-    if p.isKw("cascade") || p.isKw("purge") { return Err(oraKwErr(&p.src, &p.toks[p.pos])) }
+    if p.ora {
+        // (Oracle has no CASCADE or PURGE here: ORA-03049)
+        if p.isKw("cascade") || p.isKw("purge") { return Err(oraKwErr(&p.src, &p.toks[p.pos])) }
+    } else {
+        if p.acceptKw("restrict") || p.acceptKw("cascade") {}
+    }
     return Ok(s)
 }
 
-// GRAPH_TABLE (...) [alias] in FROM (the name read, "(" next): a subquery marked GRAPH_MARK with the text inside the brackets
+// GRAPH_TABLE (...) [AS] [alias] in FROM (the name read, "(" next): a subquery marked GRAPH_MARK with the text inside the brackets
 // (a bind written $n, its number the statement's), which lexdb_graph.expand writes as its query where it is planned.
 fn (p: mut &P) graphTable(join: int): Result[FromItem, lexdb_base.DbErr] {
     let open = p.pos
@@ -11358,7 +11371,9 @@ fn (p: mut &P) graphTable(join: int): Result[FromItem, lexdb_base.DbErr] {
         }
         k += 1
     }
-    if close < 0 { return Err(oraErr(907, "missing right parenthesis")) }
+    if close < 0 {
+        return Err(if p.ora { oraErr(907, "missing right parenthesis") } else { near(&p.peek()) })
+    }
     var text = ""
     for i in open + 1..close {
         let t = &p.toks[i]
@@ -11371,13 +11386,13 @@ fn (p: mut &P) graphTable(join: int): Result[FromItem, lexdb_base.DbErr] {
         }
     }
     p.pos = close + 1
-    if p.isKw("as") { return Err(oraKwErrToks(&p.src, &p.toks, p.pos)) }
+    if p.ora && p.isKw("as") { return Err(oraKwErrToks(&p.src, &p.toks, p.pos)) }
     var s = lexdb_sql.newStmt(S_SELECT)
     s.srf = lexdb_sql.GRAPH_MARK.toStr()
     s.index = text
     for x in p.nls { append(mut &s.names, x.clone()) }
     s.use = SUB_FROM
-    s.mdialect = MD_ORA
+    s.mdialect = p.md()
     append(mut &p.subs, s)
     p.udf = true            // (lexdb_exec.inlineFunctions: a query of GRAPH_TABLE alone is written as its join, lexdb_graph.flatQuery)
     var alias = "\x01graph_table" + len(p.subs).toStr()
@@ -11462,5 +11477,6 @@ pub fn parseFor(sql: &str, md: int): Result[[]Stmt, lexdb_base.DbErr] {
     return Ok([st])
 }
 
-// Oracle's SQL text as its tokens (lexdb_graph reads a graph's definition and GRAPH_TABLE's text with them).
+// Oracle's and PostgreSQL's SQL text as tokens (lexdb_graph reads a graph's definition and GRAPH_TABLE's text with them).
 pub fn oraTokens(sql: &str): Result[[]Tok, lexdb_base.DbErr] { return lexOra(sql, pgDialect(), true) }
+pub fn pgTokens(sql: &str): Result[[]Tok, lexdb_base.DbErr] { return lexOra(sql, pgDialect(), false) }

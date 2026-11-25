@@ -1,0 +1,137 @@
+// PostgreSQL SQL/PGQ property graph tests: DDL variants, ISO NODE/RELATIONSHIP synonyms,
+// computed properties, labels, AS alias & column aliases, quantified paths & aggregates
+// (SUM/COUNT/MIN/MAX/AVG/LISTAGG/STRING_AGG), MATCHNUM(), VERTEX_ID/EDGE_ID, IS SOURCE/DESTINATION OF,
+// parameter type inference, views, EXPLAIN, and PG SQLSTATE errors.
+// expect: ddl: CREATE PROPERTY GRAPH|CREATE PROPERTY GRAPH|CREATE PROPERTY GRAPH|DROP PROPERTY GRAPH|DROP PROPERTY GRAPH
+// expect: cols: id,name,double_age: 1|Ann|60;2|Bob|80;3|Cid|50
+// expect: alias: p1,p2: Ann|Bob;Bob|Cid;Cid|Ann
+// expect: quant: Ann|Bob|2010|2010;Ann|Cid|4022|2010,2012;Bob|Ann|4027|2012,2015;Bob|Cid|2012|2012;Cid|Ann|2015|2015;Cid|Bob|4025|2015,2010
+// expect: matchnum: 1|Ann|Bob;2|Bob|Cid;3|Cid|Ann
+// expect: vid: {"GRAPH_OWNER":"public","GRAPH_NAME":"sg","ELEM_TABLE":"person","KEY_VALUE":{"id":1}}
+// expect: srcdst: Ann|Bob;Bob|Cid;Cid|Ann
+// expect: fk_iso: Ann|Bob;Bob|Cid;Cid|Ann
+// expect: param_oid: 23
+// expect: param_res: Ann|Bob
+// expect: view: Ann|Bob;Bob|Cid;Cid|Ann
+// expect: explain_ok: true
+// expect: errs: 42P07|42704|42P01|42703|42704|42702|42P17|3F000|42P02
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_parse"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn qCols(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var names: []str = []
+            for c in r.cols { append(mut &names, c.name.clone()) }
+            var rows: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                append(mut &rows, strings.join(&cells, "|"))
+            }
+            return strings.join(&names, ",") + ": " + strings.join(&rows, ";")
+        }
+        Err(e) { return "ERR " + e.state + " " + e.msg }
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(71), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024,
+        ckptBytes: 128 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+
+        let setup = [
+            "create table person (id int primary key, name text, age int)",
+            "create table knows (id int primary key, src int references person(id), dst int references person(id), since int)",
+            "insert into person values (1, 'Ann', 30), (2, 'Bob', 40), (3, 'Cid', 25)",
+            "insert into knows values (10, 1, 2, 2010), (11, 2, 3, 2012), (12, 3, 1, 2015)",
+        ]
+        for x in setup { let _r = q(mut &s, x) }
+
+        // 1. CREATE [OR REPLACE] PROPERTY GRAPH [IF NOT EXISTS] and DROP [IF EXISTS] [RESTRICT|CASCADE]
+        let d1 = q(mut &s, "create property graph sg vertex tables (person label person properties (id, name, age * 2 as double_age)) edge tables (knows source key (src) references person (id) destination key (dst) references person (id))")
+        let d2 = q(mut &s, "create property graph if not exists sg vertex tables (person)")
+        let d3 = q(mut &s, "create or replace property graph sg vertex tables (person label person properties (id, name, age * 2 as double_age)) edge tables (knows source key (src) references person (id) destination key (dst) references person (id))")
+        let d4 = q(mut &s, "drop property graph if exists no_such_graph restrict")
+        let d5 = q(mut &s, "create property graph tmp_g vertex tables (person)")
+        let d6 = q(mut &s, "drop property graph tmp_g cascade")
+        println("ddl: " + d1 + "|" + d2 + "|" + d3 + "|" + d4 + "|" + d6)
+
+        // 2. Lowercase PG column names + computed property
+        println("cols: " + qCols(mut &s, "select * from graph_table (sg match (a is person) columns (a.id, a.name, a.double_age)) order by id"))
+
+        // 3. AS alias and column alias list
+        println("alias: " + qCols(mut &s, "select g.p1, g.p2 from graph_table (sg match (a is person) -[e is knows]-> (b is person) columns (a.name as x, b.name as y)) as g (p1, p2) order by g.p1"))
+
+        // 4. Quantified path + SUM + STRING_AGG
+        println("quant: " + q(mut &s, "select a, b, tot, yrs from graph_table (sg match (a is person) -[e is knows]->{1,2} (b is person) columns (a.name as a, b.name as b, sum(e.since) as tot, string_agg(e.since, ',') as yrs)) order by a, b"))
+
+        // 5. MATCHNUM()
+        println("matchnum: " + q(mut &s, "select m, a, b from graph_table (sg match (a is person) -[e is knows]-> (b is person) one row per match columns (matchnum() as m, a.name as a, b.name as b)) order by m"))
+
+        // 6. VERTEX_ID
+        println("vid: " + q(mut &s, "select vid from graph_table (sg match (a is person) where a.id = 1 columns (vertex_id(a) as vid))"))
+
+        // 7. IS SOURCE OF / IS DESTINATION OF on undirected edge
+        println("srcdst: " + q(mut &s, "select a, b from graph_table (sg match (a is person) -[e is knows]- (b is person) where a is source of e and b is destination of e columns (a.name as a, b.name as b)) order by a"))
+
+        // 8. ISO SQL/PGQ NODE TABLES / RELATIONSHIP TABLES + inferred FK edge (single FK table)
+        let _t = q(mut &s, "create table friend (id int primary key, a int references person(id), b int)")
+        let _i = q(mut &s, "insert into friend values (1, 1, 2), (2, 2, 3), (3, 3, 1)")
+        let _ng = q(mut &s, "create property graph iso_g node tables (person) relationship tables (friend source person destination key (b) references person (id))")
+        println("fk_iso: " + q(mut &s, "select a, b from graph_table (iso_g match (x is person) -[f is friend]-> (y is person) columns (x.name as a, y.name as b)) order by a"))
+
+        // 9. Parameter type inference ($1) + execution with parameter
+        let stmts = lexdb_parse.parse(&"select a, b from graph_table (sg match (a is person) -[e is knows]-> (b is person) where a.id = $1 columns (a.name as a, b.name as b))").unwrap()
+        let pts = s.paramTypes(&stmts[0], &[])
+        println("param_oid: " + pts[0].toStr())
+        let pres = s.run(&stmts[0], &[lexdb_sql.Val.Int(1)], &pts).unwrap()
+        println("param_res: " + lexdb_sql.text(&pres.rows[0][0]) + "|" + lexdb_sql.text(&pres.rows[0][1]))
+
+        // 10. View over GRAPH_TABLE and EXPLAIN
+        let _v = q(mut &s, "create view v_knows as select * from graph_table (sg match (a is person) -[e is knows]-> (b is person) columns (a.name as a, b.name as b))")
+        println("view: " + q(mut &s, "select a, b from v_knows order by a"))
+        let ex = q(mut &s, "explain select * from graph_table (sg match (a is person) -[e is knows]-> (b is person) columns (a.name as a, b.name as b))")
+        println("explain_ok: " + (if len(ex) > 0 && !strings.startsWith(&ex, "42") { "true" } else { "false: " + ex }))
+
+        // 11. PostgreSQL SQLSTATE errors
+        let e1 = q(mut &s, "create property graph sg vertex tables (person)")
+        let e2 = q(mut &s, "drop property graph nope")
+        let e3 = q(mut &s, "create property graph bad1 vertex tables (no_such_table)")
+        let e4 = q(mut &s, "select * from graph_table (sg match (a is person) columns (a.no_such_prop))")
+        let e5 = q(mut &s, "select * from graph_table (sg match (a is no_such_label) columns (a.id))")
+        let e6 = q(mut &s, "select * from graph_table (sg match (a is person) columns (a.id, a.id))")
+        let e7 = q(mut &s, "create property graph bad2 vertex tables (person properties (now() as ts))")
+        let e8 = q(mut &s, "create property graph no_such_schema.g vertex tables (person)")
+        let e9 = q(mut &s, "create property graph bad3 vertex tables (person properties (id + $1 as x))")
+        println("errs: " + strings.join(&[e1, e2, e3, e4, e5, e6, e7, e8, e9], "|"))
+        return 0
+    })
+}
