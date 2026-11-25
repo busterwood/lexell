@@ -34,8 +34,8 @@ AS select_statement
   `ALTER VIEW` without `WITH SCHEMABINDING` makes the view not schema-bound again, as in SQL Server. `WITH CHECK
   OPTION` is error 50000.
 - The text kept for the view is the `ALTER VIEW` statement turned into `CREATE VIEW`.
-- `ALTER VIEW` of a view that is not there is error 208 with state 1 (SQL Server: 6), and error 2010 for a table names
-  it without its schema (`emp`; SQL Server: `dbo.emp`).
+- `ALTER VIEW` of a view that is not there is error 208 with state 6, and `ALTER VIEW` of a table is error 2010 naming
+  it with its schema (`dbo.emp`), as in SQL Server.
 
 ## Examples
 
@@ -91,10 +91,10 @@ GO
 ```
 
 ```text
-Msg 208, Level 16, State 1, Line 1
+Msg 208, Level 16, State 6, Line 1
 Invalid object name 'dbo.v_nothere'.
 Msg 2010, Level 16, State 1, Line 1
-Cannot perform alter on 'emp' because it is an incompatible object type.
+Cannot perform alter on 'dbo.emp' because it is an incompatible object type.
 ```
 
 ## See also

@@ -32,7 +32,7 @@ DROP INDEX [ IF EXISTS ] [ schema_name. ] table_name.index_name
 - `DROP INDEX` is transactional.
 - The older forms `DROP INDEX table_name.index_name` and `DROP INDEX schema_name.table_name.index_name` work (example B),
   and name the table whose index is dropped.
-- **Errors,** as in SQL Server: a bare name is 159. `table.index`, `schema.table.index` and `index ON table` give 3701
+- **Errors,** as in SQL Server: a bare name is 159 (severity 15). `table.index`, `schema.table.index` and `index ON table` give 3701
   (`Cannot drop the index 'dbo.emp.ix_nothere', because it does not exist or you do not have permission.`, state 6 when
   the table is not there and 7 when the index is not) and 3723 (an index that backs a constraint: `An explicit DROP
   INDEX is not allowed on index 'dbo.part.uq_part_code'. It is being used for UNIQUE KEY constraint enforcement.`,
@@ -43,7 +43,6 @@ DROP INDEX [ IF EXISTS ] [ schema_name. ] table_name.index_name
 
 - **One index per statement:** a list (`DROP INDEX ix1 ON t1, ix2 ON t2`, `DROP INDEX a.x, b.y`) is error 102 (SQL
   Server takes it).
-- Error 159 has severity 16 (SQL Server: 15).
 - Dropping the clustered index leaves a heap: see [CREATE INDEX](create-index.md).
 
 ## Examples
@@ -181,11 +180,11 @@ Msg 3723, Level 16, State 5, Line 1
 An explicit DROP INDEX is not allowed on index 'dbo.part.uq_part_code'. It is being used for UNIQUE KEY constraint enforcement.
 Msg 3723, Level 16, State 4, Line 1
 An explicit DROP INDEX is not allowed on index 'dbo.emp.emp_pkey'. It is being used for PRIMARY KEY constraint enforcement.
-Msg 159, Level 16, State 1, Line 1
+Msg 159, Level 15, State 1, Line 1
 Must specify the table name and index name for the DROP INDEX statement.
 Msg 3701, Level 11, State 6, Line 1
 Cannot drop the index 'dbo.ix_emp_name', because it does not exist or you do not have permission.
-Msg 159, Level 16, State 1, Line 1
+Msg 159, Level 15, State 1, Line 1
 Must specify the table name and index name for the DROP INDEX statement.
 ```
 

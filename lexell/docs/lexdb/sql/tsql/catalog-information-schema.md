@@ -80,9 +80,11 @@ PostgreSQL's values, except `SCHEMATA`, `ROUTINES`, `PARAMETERS` and the two `VI
 `TABLE_PRIVILEGES`
 : `grantor`, `grantee`, `table_schema`, `table_name`, `privilege_type`, `is_grantable`.
 
-`COLUMN_PRIVILEGES`, `DOMAINS`
-: No rows: lexdb grants on whole tables, never on columns, and `DOMAINS` does not list its table types, and it has
-  no alias types (`CREATE TYPE ... FROM`). The views exist so that tools that read them work. Their columns are PostgreSQL's, in lower case (see below).
+`COLUMN_PRIVILEGES`
+: No rows: lexdb grants on whole tables, never on columns. The view exists so that tools that read it work. Its columns are PostgreSQL's, in lower case (see below).
+
+`DOMAINS`
+: The table types of the database (`CREATE TYPE ... AS TABLE`): `domain_schema` `dbo` or the type's schema, `domain_name`, `data_type` `table type`, as SQL Server lists them (see example I). There are no alias types (`CREATE TYPE ... FROM` is error 156), so no other rows. The columns are PostgreSQL's, in lower case (see below).
 
 `ROUTINES`, `PARAMETERS`
 : The T-SQL procedures and functions (those made in this door; the PostgreSQL door's functions are listed by its own
@@ -116,9 +118,9 @@ PostgreSQL's values, except `SCHEMATA`, `ROUTINES`, `PARAMETERS` and the two `VI
 - `SCHEMATA`'s catalog name is `lexdb` (SQL Server: the database's name), and the column names are in lower case (SQL
   Server: upper case).
 - Constraint names are lexdb's, `table_pkey`, `table_column_fkey`, and `view_definition` is the text of the query.
-- `COLUMN_PRIVILEGES` and `DOMAINS` have no rows and PostgreSQL's columns in lower case. SQL Server's `DOMAINS` has 17
-  columns (`DOMAIN_CATALOG` to `DOMAIN_DEFAULT`), lexdb's 27 (PostgreSQL's), and it lists table types
-  (`CREATE TYPE ... AS TABLE`, `data_type` `table type`) and alias types, which lexdb's does not.
+- `COLUMN_PRIVILEGES` has no rows and `DOMAINS` lists the table types only; both have PostgreSQL's columns in lower case.
+  SQL Server's `DOMAINS` has 17 columns (`DOMAIN_CATALOG` to `DOMAIN_DEFAULT`), lexdb's 27 (PostgreSQL's), and it lists
+  alias types (`CREATE TYPE ... FROM`) as well, which lexdb cannot make.
 - The view `INFORMATION_SCHEMA.TABLES` has the extra PostgreSQL columns (`self_referencing_column_name`,
   `commit_action`, ...).
 
@@ -388,19 +390,19 @@ emp        dept_id     emp_dept_id_fkey
 
 ### I. Views without rows
 
-This database has a table type (`hr.idl`), which SQL Server's `DOMAINS` would list.
+This database has a table type (`hr.idl`), which `DOMAINS` lists as SQL Server's does; `COLUMN_PRIVILEGES` has no rows.
 
 <!-- example: tsql -->
 ```sql
-SELECT COUNT(*) AS n FROM INFORMATION_SCHEMA.DOMAINS;
+SELECT domain_schema, domain_name, data_type FROM INFORMATION_SCHEMA.DOMAINS;
 GO
 SELECT * FROM INFORMATION_SCHEMA.COLUMN_PRIVILEGES;
 ```
 
 ```text
-n
--
-0
+domain_schema domain_name data_type
+------------- ----------- ----------
+hr            idl         table type
 
 (1 row affected)
 

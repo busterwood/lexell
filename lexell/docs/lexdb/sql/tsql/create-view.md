@@ -76,8 +76,8 @@ AS select_statement
   Dropping the unique clustered index demotes it back to a regular schema-bound view. `sys.views` and `sys.objects`
   continue to list it as type `'V'`, `sys.indexes` lists its indexes, and `sys.tables` excludes it. Creating an index
   on a view without `WITH SCHEMABINDING` raises error 1939.
-- The 4512 of a `WITH SCHEMABINDING` view names the view being made without the schema the statement wrote
-  (`'v_bad1'` for `CREATE VIEW dbo.v_bad1`; SQL Server: `'dbo.v_bad1'`); its 4513 is right.
+- The 4512 and 4513 of a `WITH SCHEMABINDING` view name the view being made as the statement wrote it (`'dbo.v_bad1'`
+  for `CREATE VIEW dbo.v_bad1`), as SQL Server does.
 - `CREATE VIEW` need not be the first statement of its batch (SQL Server: 111).
 - An `ORDER BY` without `TOP` is taken (SQL Server: 1033). The rows of the view are not sorted by it.
 - `DROP VIEW` of a view that another view reads is refused (error 50000); SQL Server drops it, and the other view
@@ -352,7 +352,7 @@ GO
 
 ```text
 Msg 4512, Level 16, State 3, Line 1
-Cannot schema bind view 'v_bad1' because name 'part' is invalid for schema binding. Names must be in two-part format and an object cannot reference itself.
+Cannot schema bind view 'dbo.v_bad1' because name 'part' is invalid for schema binding. Names must be in two-part format and an object cannot reference itself.
 Msg 4513, Level 16, State 2, Line 1
 Cannot schema bind view 'dbo.v_bad2'. 'dbo.v_part_plain' is not schema bound.
 Msg 5074, Level 16, State 1, Line 1
