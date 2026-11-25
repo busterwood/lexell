@@ -1,0 +1,83 @@
+# The sixth bug slice (design/lexdb-robust.md, "The sixth bug slice"), the T-SQL door's side.
+# item 2: index names are per table (1913 for one the table has; 8168 and 8112 in CREATE TABLE); DROP INDEX ix ON t and t.ix find the table's;
+# sys.indexes and INDEXPROPERTY
+@once CREATE TABLE x1 (a int, b int)
+@once CREATE TABLE x2 (a int, b int)
+@once CREATE INDEX ix ON x1 (a)
+@once CREATE INDEX ix ON x2 (a)
+CREATE INDEX ix ON x2 (b)
+CREATE TABLE x3 (a int, b int, INDEX i3 (a), INDEX i3 (b))
+CREATE TABLE x4 (a int, b int, INDEX c1 CLUSTERED (a), INDEX c2 CLUSTERED (b))
+CREATE TABLE x5 (a int PRIMARY KEY CLUSTERED, b int, INDEX c1 CLUSTERED (b))
+SELECT o.name AS t, i.name, i.index_id FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name IN ('x1', 'x2') AND i.name IS NOT NULL ORDER BY 1, 2
+SELECT INDEXPROPERTY(OBJECT_ID('x2'), 'ix', 'IndexID') AS a, INDEXPROPERTY(OBJECT_ID('x1'), 'ix', 'IndexID') AS b
+@once DROP INDEX ix ON x2
+SELECT o.name AS t, i.name FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name IN ('x1', 'x2') AND i.name IS NOT NULL ORDER BY 1, 2
+@once CREATE INDEX ix ON x2 (b)
+@once DROP INDEX x1.ix
+SELECT o.name AS t, i.name FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name IN ('x1', 'x2') AND i.name IS NOT NULL ORDER BY 1, 2
+@once CREATE INDEX ix ON x1 (b)
+@once DROP INDEX dbo.x2.ix
+SELECT o.name AS t, i.name FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name IN ('x1', 'x2') AND i.name IS NOT NULL ORDER BY 1, 2
+@once CREATE TABLE x6 (a int PRIMARY KEY, b int)
+@once CREATE INDEX x6 ON x6 (b)
+@once CREATE TABLE ixt (a int)
+@once CREATE INDEX ixt ON x1 (a)
+SELECT o.name AS t, i.name FROM sys.indexes i JOIN sys.objects o ON o.object_id = i.object_id WHERE o.name IN ('x1', 'x6') AND i.is_primary_key = 0 AND i.name IS NOT NULL ORDER BY 1, 2
+# item 4: DROP TABLE under views: done, a view over it 208 when read, back when the table is made again; a schema-bound view stops it (3729)
+@once CREATE TABLE d4 (a int, b int); INSERT INTO d4 VALUES (1, 2)
+@once CREATE VIEW d4v AS SELECT a FROM d4
+@once CREATE VIEW d4vv AS SELECT a FROM d4v
+@once CREATE VIEW d4b WITH SCHEMABINDING AS SELECT a FROM dbo.d4
+DROP TABLE d4
+@once DROP VIEW d4b
+@once DROP TABLE d4
+SELECT * FROM d4v
+SELECT * FROM d4vv
+SELECT name FROM sys.views WHERE name LIKE 'd4%' ORDER BY 1
+@once CREATE TABLE d4 (a int, c int); INSERT INTO d4 VALUES (7, 8)
+SELECT * FROM d4v
+SELECT * FROM d4vv
+# item 5: INFORMATION_SCHEMA: SCHEMATA, ROUTINES and PARAMETERS of T-SQL's routines, CONSTRAINT_COLUMN_USAGE, VIEW_TABLE_USAGE, VIEW_COLUMN_USAGE;
+# sp_refreshview
+@once CREATE SCHEMA s5
+SELECT schema_name, schema_owner, default_character_set_name FROM INFORMATION_SCHEMA.SCHEMATA ORDER BY LOWER(schema_name)
+@once CREATE TABLE p5 (id int PRIMARY KEY, n varchar(10))
+@once CREATE TABLE c5 (id int CONSTRAINT pk_c5 PRIMARY KEY, pid int, v int CONSTRAINT ck5 CHECK (v > 0), CONSTRAINT uq5 UNIQUE (v), CONSTRAINT fk5 FOREIGN KEY (pid) REFERENCES p5 (id))
+SELECT table_schema, table_name, column_name, constraint_name FROM INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE WHERE table_name = 'c5' ORDER BY constraint_name, column_name
+@once CREATE PROCEDURE pr5 @a int, @b varchar(10) OUTPUT AS BEGIN SET @b = 'x' END
+@once CREATE FUNCTION fn5 (@x int) RETURNS int AS BEGIN RETURN @x + 1 END
+@once CREATE FUNCTION tf5 (@x int) RETURNS TABLE AS RETURN (SELECT @x AS y)
+SELECT specific_schema, specific_name, routine_schema, routine_name, routine_type, data_type, character_maximum_length, numeric_precision, routine_body, is_deterministic, sql_data_access FROM INFORMATION_SCHEMA.ROUTINES ORDER BY routine_name
+SELECT routine_name, routine_definition FROM INFORMATION_SCHEMA.ROUTINES WHERE routine_name = 'fn5'
+SELECT specific_schema, specific_name, ordinal_position, parameter_mode, is_result, as_locator, parameter_name, data_type, character_maximum_length, numeric_precision, numeric_scale FROM INFORMATION_SCHEMA.PARAMETERS ORDER BY specific_name, ordinal_position
+@once CREATE VIEW v5 AS SELECT p5.id, c5.v FROM p5 JOIN c5 ON c5.pid = p5.id
+@once CREATE VIEW v5b AS SELECT * FROM v5
+@once CREATE VIEW v5c AS SELECT x.n FROM p5 AS x WHERE x.id > 0
+SELECT view_schema, view_name, table_schema, table_name FROM INFORMATION_SCHEMA.VIEW_TABLE_USAGE WHERE view_name LIKE 'v5%' ORDER BY view_name, table_name
+SELECT view_schema, view_name, table_schema, table_name, column_name FROM INFORMATION_SCHEMA.VIEW_COLUMN_USAGE WHERE view_name LIKE 'v5%' ORDER BY view_name, table_name, column_name
+@once CREATE TABLE r5 (a int, b int); INSERT INTO r5 VALUES (1, 2)
+@once CREATE VIEW vs5 AS SELECT * FROM r5
+@once ALTER TABLE r5 DROP COLUMN b
+SELECT * FROM vs5
+@once ALTER TABLE r5 ADD c int
+@once SET NOCOUNT ON; EXEC sp_refreshview 'vs5'; SET NOCOUNT OFF
+SELECT * FROM vs5
+SELECT column_name FROM INFORMATION_SCHEMA.COLUMNS WHERE table_name = 'vs5' ORDER BY ordinal_position
+EXEC sp_refreshview 'nosuch'
+EXEC sp_refreshview 'r5'
+# item 6: WITH CHECK OPTION before AS (102); 4512 (a one-part name in a schema-bound view); 4513 (a schema-bound view over one that is not, or over a
+# function); ALTER COLUMN of a column a schema-bound view names (5074); INSERT TOP (n) ... SELECT ... ORDER BY (lexdb follows the ORDER BY: not checked)
+CREATE VIEW vco WITH CHECK OPTION AS SELECT a FROM x1
+@once CREATE TABLE s6 (id int, v int, w int)
+CREATE VIEW vb1 WITH SCHEMABINDING AS SELECT id FROM s6
+CREATE VIEW vb1j WITH SCHEMABINDING AS SELECT s.id FROM dbo.s6 AS s JOIN s6 AS t ON t.id = s.id
+@once CREATE VIEW vnb AS SELECT id FROM s6
+CREATE VIEW vb2 WITH SCHEMABINDING AS SELECT id FROM dbo.vnb
+@once CREATE FUNCTION dbo.f6 (@x int) RETURNS int AS BEGIN RETURN @x END
+CREATE VIEW vb3 WITH SCHEMABINDING AS SELECT dbo.f6(id) AS x FROM dbo.s6
+@once CREATE VIEW vb4 WITH SCHEMABINDING AS SELECT id, v FROM dbo.s6
+ALTER TABLE s6 ALTER COLUMN v bigint
+ALTER TABLE s6 ALTER COLUMN id bigint
+@once ALTER TABLE s6 ALTER COLUMN w bigint
+SELECT * FROM vb4
