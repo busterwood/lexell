@@ -5014,11 +5014,12 @@ fn (p: mut &P) createView(orReplace: bool, alterOnly: bool): Result[Stmt, lexdb_
     while p.ora && p.acceptKw("annotations") { append(mut &v.alters, try p.annotClause("", true)) }
     // T-SQL's WITH SCHEMABINDING, VIEW_METADATA, ENCRYPTION (SCHEMABINDING kept: SB_MARK; the others read)
     var bound = false
+    let withAt = p.peek().at
     if p.tsql && p.acceptKw("with") {
         while true {
             let o = p.next()
-            // (WITH CHECK OPTION before AS: SQL Server's 102 at WITH)
-            if o.kind == T_IDENT && o.text == "check" { return Err(lexdb_base.err("TS102", "Incorrect syntax near 'with'.")) }
+            // (WITH CHECK OPTION before AS: SQL Server's 102 at WITH, as written)
+            if o.kind == T_IDENT && o.text == "check" { return Err(lexdb_base.err("TS102", &("Incorrect syntax near '" + p.src[withAt..min(withAt + 4, len(p.src))] + "'."))) }
             if o.kind != T_IDENT || (o.text != "schemabinding" && o.text != "view_metadata" && o.text != "encryption") { return Err(lexdb_base.err("TS195", &("'" + o.text + "' is not a recognized option."))) }
             if o.text == "schemabinding" { bound = true }
             if !p.acceptKw(",") { break }
@@ -8300,11 +8301,14 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     try p.expectKw("exists")
                     s.ifFlag = true
                 }
-                // T-SQL: DROP INDEX name ON table, or table.name (the index is its table's: lexdb_ixname)
+                // T-SQL: DROP INDEX name ON table, or table.name (the index is its table's: lexdb_ixname); spells: table.index as
+                // written (SQL Server's 3701 and 3723 name it so); a bare name is 159
+                let at0 = p.peek().at
                 if p.tsql && !(p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "on") && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." {
                     s.mdialect = MD_TSQL
                     var parts: []str = [try p.name()]
                     while p.acceptKw(".") { append(mut &parts, try p.name()) }
+                    append(mut &s.spells, lexdb_sql.writtenName(&p.src[at0..min(p.peek().at, len(p.src))]))
                     let n = len(parts)
                     s.table = if n >= 3 { lexdb_sql.qual(&parts[n - 3], &parts[n - 2]) } else { parts[0].clone() }
                     if n >= 3 && parts[n - 3] == "dbo" { s.table = parts[n - 2].clone() }
@@ -8312,9 +8316,13 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     return Ok(s)
                 }
                 s.index = try p.qname()
+                let ixWritten = lexdb_sql.writtenName(&p.src[at0..min(p.peek().at, len(p.src))])
+                if p.tsql && !p.isKw("on") { return Err(lexdb_base.err("TS159", "Must specify the table name and index name for the DROP INDEX statement.")) }
                 if p.tsql && p.acceptKw("on") {
                     s.mdialect = MD_TSQL
+                    let at1 = p.peek().at
                     s.table = try p.qname()
+                    append(mut &s.spells, lexdb_sql.writtenName(&p.src[at1..min(p.peek().at, len(p.src))]) + "." + ixWritten)
                     s.index = lexdb_sql.qual(&lexdb_sql.schemaOf(&s.table), &lexdb_sql.baseName(&s.index))
                 }
                 return Ok(s)

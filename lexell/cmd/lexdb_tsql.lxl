@@ -36,6 +36,7 @@ import "./lexdb_parse"
 import "./lexdb_recur"
 import "./lexdb_recrun"
 import "./lexdb_tsqlerr"
+import "./lexdb_tsqlname"
 import "./lexdb_routine"
 
 type Val = lexdb_sql.Val
@@ -105,7 +106,7 @@ fn caughtOf(e: &DbErr): Caught {
             msg = "Incorrect syntax near '" + tok + "'."
         }
     }
-    return Caught{number: n, message: msg, severity: sqlClass(n), state: sqlState(n)}
+    return Caught{number: n, message: msg, severity: sqlClass(n), state: sqlState(n, e)}
 }
 
 // The text between the first pair of double quotes of msg.
@@ -228,7 +229,14 @@ pub fn sqlClass(n: int): int {
 }
 
 // The state SQL Server gives error n (1 for most).
-pub fn sqlState(n: int): int { return if n == 1054 { 6 } else { 1 } }
+// SQL Server's state of error n (e: lexdb's, its detail "state=N" where the state is not its number's usual one).
+pub fn sqlState(n: int, e: &DbErr): int {
+    if strings.startsWith(&e.detail, "state=") { return strings.parseIntOpt(&(e.detail[6..len(e.detail)].toStr())).unwrapOr(1) }
+    if n == 1054 { return 6 }
+    if n == 4512 { return 3 }
+    if n == 4513 { return 2 }
+    return 1
+}
 
 // An error SQL Server finds compiling the batch's statement: the batch ends.
 fn endsBatch(e: &DbErr): bool {
@@ -283,6 +291,7 @@ pub type State = record {
     line: int                   // the line of the batch the statement running starts on (TStmt.line): its errors' Line
     pendingLine: int            // ... the error's that leaves a TRY block, and those the CATCH blocks handle (ERROR_LINE)
     caughtLine: []int
+    text: str                   // the text the running statement's line counts in (the batch's, a procedure's, EXEC's): its errors' names as written
 }
 
 // An INSERT BULK accepted (design/lexdb-tds.md, section 14): the table, the
@@ -296,7 +305,7 @@ pub fn newState(spid: int): State {
                  rowcount: 0, rowLimit: 0, error: 0, spid: spid, kill: false, saves: [], committed: false, tryDepth: 0, jump: false,
                  pending: Caught{number: 0, message: "", severity: 0, state: 0}, caught: [], doomed: false, temps: [], tableVars: [],
                  fmtOnly: false, bulk: [], roTables: [], roParams: [], nest: 0, procId: 0, procs: [], retVal: 0, scopeEnd: false, tryNest: 0, uncatchable: false, pendingProc: "", caughtProc: [],
-                 line: 1, pendingLine: 1, caughtLine: []}
+                 line: 1, pendingLine: 1, caughtLine: [], text: ""}
 }
 
 // An error: to the client, or (in a TRY block) to its CATCH block.
@@ -304,14 +313,19 @@ fn (st: mut &State) fail(ev: mut &[]Event, c: Caught, cmd: int) { st.failAs(ev, 
 
 // fail; counted: a statement's (in a TRY block SQL Server ends it with a
 // count of 0; RAISERROR and THROW with none).
-fn (st: mut &State) failAs(ev: mut &[]Event, c: Caught, cmd: int, counted: bool) {
+fn (st: mut &State) failAs(ev: mut &[]Event, c0: Caught, cmd: int, counted: bool) {
+    var c = c0
+    if c.number == 208 || c.number == 3729 || c.number == 4502 || c.number == 4512 || c.number == 4513 {
+        // (the names as the statement wrote them, as SQL Server's text has them)
+        c.message = lexdb_tsqlname.asWritten(&lexdb_tsqlname.fromLine(&st.text, st.line), &c.message)
+    }
     st.error = c.number
     // (an unknown table or column found where the TRY block is, in the same procedure or batch, is not caught: SQL Server
-    // finds it compiling the statement; and no count for a statement that did not get to run)
-    let compiling = c.number == 208 || c.number == 207 || c.number == 108
+    // finds it compiling the statement; and no count for a statement that did not get to run, or for DDL: cmd 0)
+    let compiling = c.number == 208 || c.number == 207 || c.number == 108 || c.number == 4502 || c.number == 8158
     st.uncatchable = compiling && st.tryDepth > 0 && st.nest == st.tryNest
     if st.tryDepth > 0 && !st.uncatchable {
-        if counted && !compiling && c.number != 2812 { doneEv(ev, if st.nocount { -1 } else { 0 }, cmd, false) }
+        if counted && !compiling && c.number != 2812 && cmd != 0 { doneEv(ev, if st.nocount { -1 } else { 0 }, cmd, false) }
         st.pending = c
         st.pendingProc = if len(st.procs) > 0 { st.procs[len(st.procs) - 1].clone() } else { "" }
         st.pendingLine = st.line
@@ -868,6 +882,7 @@ pub fn run(sess: mut &lexdb_exec.Session, st: mut &State, sql: &str, f: mut &Fra
         return
     }
     let text = withTableTypes(sess, sql)
+    st.text = text.clone()
     let parsed = lexdb_tsqlparse.parseBatch(&text, lexdb_parse.Dialect{tsql: true, quotedIdent: st.quotedIdent}, &f.names)
     st.line = 1
     if parsed.isErr() {
@@ -2006,7 +2021,9 @@ fn (st: mut &State) callProc(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.
     st.retVal = 0
     // (SQL Server's ownership chain: what the body touches is checked as its owner, as long as both own what they use)
     let callerRole = if len(rt.owner) > 0 { sess.actAs(&rt.owner) } else { "" }
+    let wasText = replace(mut &st.text, text.clone())
     let r = st.block(sess, &b.stmts, mut &fr, ev)
+    st.text = wasText
     if len(rt.owner) > 0 { sess.backTo(&callerRole) }
     let rc = if r == F_RETURN { st.retVal } else { 0 }
     let px = pop(mut &st.procs)
@@ -2367,6 +2384,13 @@ fn (st: mut &State) restoreOpts(sess: mut &lexdb_exec.Session, o: &Opts) {
 // options end with it (Opts).
 fn (st: mut &State) nested(sess: mut &lexdb_exec.Session, sql: &str, fr: mut &Frame, ev: mut &[]Event): int {
     let text = withTableTypes(sess, sql)
+    let wasText = replace(mut &st.text, text.clone())
+    let r = st.nested1(sess, &text, fr, ev)
+    st.text = wasText
+    return r
+}
+
+fn (st: mut &State) nested1(sess: mut &lexdb_exec.Session, text: &str, fr: mut &Frame, ev: mut &[]Event): int {
     let parsed = lexdb_tsqlparse.parseBatch(&text, lexdb_parse.Dialect{tsql: true, quotedIdent: st.quotedIdent}, &fr.names)
     if parsed.isErr() {
         let e = parsed.unwrapErr()
