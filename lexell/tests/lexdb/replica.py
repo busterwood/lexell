@@ -28,6 +28,11 @@ by many checkpoints. Through psql:
   round and an edge added, the replica's USER_PROPERTY_GRAPHS and a GRAPH_TABLE count the
   master's; the graph made just before the master is killed is there after its log is
   replayed, and all of them after the clean close.
+- Oracle's assertions (design/lexdb-new-features.md O23), the same way: one made each round,
+  the replica's USER_ASSERTIONS the master's, CREATE ASSERTION there ORA-16000, a row that
+  breaks one refused on the master (ORA-08601); the one made just before the master is
+  killed is there after its log is replayed and still checked, and so are all after the
+  clean close (an assertion's name taken for a table's again: ORA-00955).
 
 Then the supervised form, lexdb DATADIR ADDR --replicas 2 --tds ... --tns ...: both replicas
 answer on the replicas' port, and on the TDS and TNS ports one above the master's
@@ -153,6 +158,7 @@ DOORSQL = None      # the SQL Server and Oracle client (doorsql.lxl), built in m
 ANQ = 'select object_name, column_name, annotation_name, annotation_value from user_annotations_usage order by 2 nulls first, 3, 4'
 GRQ = 'select graph_name from user_property_graphs order by 1'
 GTQ = 'select count(*) from graph_table (gsoc match (a is gv) -[e is ge]->{1,2} (b) columns (a.id as x))'
+ASQ = 'select assertion_name, status, validated from user_assertions order by 1'
 
 
 def door(kind, port, sql, extra=''):
@@ -453,9 +459,33 @@ def main():
             time.sleep(0.05)
         fail('round %d: the replica\'s graphs are not the master\'s:\n  master  %s\n  replica %s' % (rnd, want, got))
 
+    # Oracle's assertions (a catalog row each, and their tables' refBy): the replica's are the master's
+    def asserts_same(rnd, want_name=None):
+        want = door('tns', mtns, ASQ)
+        if want_name is not None and want_name not in want:
+            fail('round %d: the master lost assertion %s: %s' % (rnd, want_name, want))
+        end = time.time() + 10
+        got = None
+        while time.time() < end:
+            got = door('tns', rtns, ASQ)
+            if got == want:
+                return want
+            time.sleep(0.05)
+        fail('round %d: the replica\'s assertions are not the master\'s:\n  master  %s\n  replica %s' % (rnd, want, got))
+
+    # a row that breaks assertion av_pos (or the one named) refused on the master
+    def asserted(rnd, v=-1):
+        w = door('tns', mtns, 'insert into av values (%d, %d)' % (100000 + rnd, v))
+        if not w.startswith('error 8601:'):
+            fail('round %d: a row breaking an assertion on the master: %s' % (rnd, w))
+
     master.start()
     if not master.ready():
         fail('the master did not start')
+    for q in ['create table av (id number primary key, v number)', 'create assertion av_pos check (not exists (select 1 from av where v < 0))']:
+        w = door('tns', mtns, q)
+        if not w.startswith('ok'):
+            fail('the assertion was not made: %s: %s' % (q, w))
     w = door('tns', mtns, "create table an (id number primary key annotations (Display 'Id'), v number annotations (Hidden)) annotations (Note 'n')")
     if not w.startswith('ok'):
         fail('the annotated table was not made: ' + w)
@@ -509,6 +539,16 @@ def main():
             if not w.startswith('ok'):
                 fail('round %d: %s: %s' % (rnd, q, w))
         graphs_same(rnd)
+        for q in ['create assertion ar%d check (not exists (select 1 from av where v = %d))' % (rnd, 1000 + rnd), 'insert into av values (%d, %d)' % (rnd, rnd)]:
+            w = door('tns', mtns, q)
+            if not w.startswith('ok'):
+                fail('round %d: %s: %s' % (rnd, q, w))
+        asserts_same(rnd)
+        asserted(rnd)
+        asserted(rnd, 1000 + rnd)
+        w = door('tns', rtns, 'create assertion on_replica check (not exists (select 1 from av where v = 0))')
+        if not w.startswith('error 16000:'):
+            fail('round %d: CREATE ASSERTION on the replica: %s' % (rnd, w))
         w = door('tns', rtns, 'create property graph on_replica vertex tables (gv)')
         if not w.startswith('error 16000:'):
             fail('round %d: CREATE PROPERTY GRAPH on the replica: %s' % (rnd, w))
@@ -538,6 +578,9 @@ def main():
             w = door('tns', mtns, 'create property graph before_kill vertex tables (gv)')
             if not w.startswith('ok'):
                 fail('a graph was not made before the kill: ' + w)
+            w = door('tns', mtns, 'create assertion before_kill_a check (not exists (select 1 from av where v = 77777))')
+            if not w.startswith('ok'):
+                fail('an assertion was not made before the kill: ' + w)
             master.kill()
             try:
                 code = replica.p.wait(10)
@@ -554,6 +597,8 @@ def main():
             caught_up(rnd)
             annots_same(rnd, 'BEFORE_KILL')
             graphs_same(rnd, 'BEFORE_KILL')
+            asserts_same(rnd, 'BEFORE_KILL_A')
+            asserted(rnd, 77777)
     gt_before = door('tns', mtns, GTQ)
     code = master.stop()
     if code != 0:
@@ -575,6 +620,14 @@ def main():
     got = door('tns', mtns, GTQ)
     if got != gt_before:
         fail('GRAPH_TABLE after a clean close: %s, before it %s' % (got, gt_before))
+    got = door('tns', mtns, ASQ)
+    if 'BEFORE_KILL_A' not in got or ('AR%d' % a.rounds) not in got or 'AV_POS' not in got:
+        fail('the assertions after a clean close: ' + got)
+    asserted(a.rounds + 1)
+    asserted(a.rounds + 1, 77777)
+    w = door('tns', mtns, 'create table av_pos (x number)')
+    if not w.startswith('error 955:'):
+        fail('a table of an assertion\'s name after a clean close: ' + w)
     if master.stop() != 0:
         fail('the master did not stop again')
     print('replica test: %d rounds, the replica caught up every round, %d writes refused, killed and started again %d times, '

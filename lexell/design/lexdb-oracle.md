@@ -1272,6 +1272,22 @@ PG_EDGE_RELATIONSHIPS, PG_COMMENTS (shapes from `tools/gen_oracle_catalog.py`), 
 differences in `gen_oracle.py --check`), `exec_graph`, `replica.py`. Left: ONE ROW PER VERTEX / STEP (0A000), VERTEX_ID / EDGE_ID as text (no JSON type),
 quoted names matched folded.
 
+## As built: assertions (O23, lexdb-new-features.md 14)
+
+`CREATE ASSERTION [IF NOT EXISTS] name CHECK (NOT EXISTS (q) | EXISTS (q) | ALL (q) SATISFY (c))` with ENABLE / DISABLE, VALIDATE / NOVALIDATE, [NOT]
+DEFERRABLE, INITIALLY IMMEDIATE / DEFERRED; `DROP ASSERTION [IF EXISTS]`, `ALTER ASSERTION ... ENABLE | DISABLE [VALIDATE | NOVALIDATE]`; Oracle Free
+23.26.3's refusals at CREATE (ORA-08689 over 08661, 08695, 08680, 08697, 08677, 08664, 08678, 08651, 08735, 08659, 08660, 08673's equijoin rule) and its
+other errors (00904, 00942, 00907, 00936, 00905, 00906, 00931, 00911, 00922, 00955, 01027, 08724, 08701, 08725, 13650, 08687). `lexdb_assert` keeps an
+assertion as a catalog row of its own; each table it reads names it in its refBy, so a statement writing such a table (found where its foreign keys are
+looked for, once a statement) is checked at its end, or before its own commit: the query for the rows it put to each instance whose new rows may break it
+(FAST), the whole query after a statement that may delete or update rows under a NOT EXISTS (or an EXISTS assertion's); ORA-08601 undoes the statement (the
+door's savepoint); a deferred one at COMMIT (ORA-02091, rolled back) or SET CONSTRAINT[S] ... IMMEDIATE. The TNS door begins a transaction for SET
+CONSTRAINT[S]. Writers of rows that may meet lock the join key's values (or the assertion) before the check, which reads the latest committed rows: a second
+session adding the other half of a violation waits, then gets ORA-08601, as on Oracle. DDL on its tables: ORA-08702, ORA-08694, DROP TABLE ... CASCADE
+CONSTRAINTS. USER_, ALL_, DBA_ ASSERTIONS and ASSERTION_DEPENDENCIES, ASSERTION_LOCK_MATRIX (empty), USER_OBJECTS' UNDEFINED rows. Tests `tns_assert`
+(139 lines, 0 differences in `gen_oracle.py --check`), `exec_assert`, `replica.py`. Left: the lock matrix, the INVALID column, NOVALIDATE under a
+whole-query check, the check's plan made each time.
+
 ## As built: the third bug slice (lexdb-robust.md, 2026-11-25)
 
 - Logon: the TIME_ZONE of AUTH_ALTER_SESSION is the session's and LOCAL's (`logonZone`); `+00:00` sets nothing.

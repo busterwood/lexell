@@ -25,6 +25,7 @@ import "./lexdb_oraadm"
 import "./lexdb_sql"
 import "./lexdb_annot"
 import "./lexdb_graph"
+import "./lexdb_assert"
 import "./lexdb_parse"
 
 type Val = lexdb_sql.Val
@@ -181,7 +182,7 @@ pub fn isBuilt(base: &str): bool {
         "TABLES", "TAB_COLUMNS", "TAB_COLS", "INDEXES", "IND_COLUMNS", "IND_EXPRESSIONS", "CONSTRAINTS", "CONS_COLUMNS", "OBJECTS", "SEQUENCES",
         "VIEWS", "TAB_COMMENTS", "COL_COMMENTS", "TAB_IDENTITY_COLS", "CATALOG", "SOURCE", "PROCEDURES", "ERRORS", "ANNOTATIONS_USAGE", "ANNOTATIONS",
         "ANNOTATION_VALUES", "PROPERTY_GRAPHS", "PG_ELEMENTS", "PG_LABELS", "PG_ELEMENT_LABELS", "PG_LABEL_PROPERTIES", "PG_PROP_DEFINITIONS",
-        "PG_KEYS", "PG_EDGE_RELATIONSHIPS", "PG_COMMENTS" { return true }
+        "PG_KEYS", "PG_EDGE_RELATIONSHIPS", "PG_COMMENTS", "ASSERTIONS", "ASSERTION_DEPENDENCIES" { return true }
         else { return false }
     }
 }
@@ -655,6 +656,41 @@ fn oraGraphValid(snap: &CatSnap, g: &lexdb_graph.Graph): bool {
     return true
 }
 
+// The rows of USER_/ALL_/DBA_ ASSERTIONS and ASSERTION_DEPENDENCIES (base) for Oracle's assertions (lexdb_assert, O23).
+fn oraAssertRows(out: mut &[]OraPend, snap: &CatSnap, base: &str) {
+    for a in lexdb_assert.all(&snap.asserts) {
+        if base == "ASSERTIONS" {
+            var p = oraPend(&a.owner, &"")
+            p.s("OWNER", &a.owner)
+            p.s("ASSERTION_NAME", &a.name)
+            p.i("OBJECT_ID", lexdb_sql.nameOid("as", &a.key))
+            p.s("STATUS", if a.enabled { "ENABLED" } else { "DISABLED" })
+            p.s("DEFERRABLE", if a.deferrable { "DEFERRABLE" } else { "NOT DEFERRABLE" })
+            p.s("DEFERRED", if a.deferred { "DEFERRED" } else { "IMMEDIATE" })
+            p.s("VALIDATED", if a.validated { "VALIDATED" } else { "NOT VALIDATED" })
+            p.null("INVALID")
+            p.s("DEFINITION_SQL", &lexdb_assert.definition(&a))
+            append(out, p)
+            continue
+        }
+        for i in 0..len(a.deps) {
+            let d = &a.deps[i]
+            var p = oraPend(&a.owner, &"")
+            p.s("OWNER", &a.owner)
+            p.s("ASSERTION_NAME", &a.name)
+            let ct = oraTabByKey(snap, &d.table)
+            let sc = lexdb_sql.schemaOf(&d.table)
+            p.s("REFERENCED_OWNER", &(if sc == "public" { a.owner.clone() } else { oraUp(&sc) }))
+            p.s("REFERENCED_NAME", &oraGraphTab(&ct, &d.table))
+            p.s("REFERENCED_TYPE", "TABLE")
+            p.i("REFERENCED_ID", i)
+            p.s("VALIDATION_TYPE", if lexdb_assert.complete(&a) { "COMPLETE" } else { "FAST" })
+            p.s("VALIDATION_EVENT", if d.neg { "ROWS DELETED OR UPDATED" } else { "ROWS INSERTED OR UPDATED" })
+            append(out, p)
+        }
+    }
+}
+
 // The rows of USER_/ALL_/DBA_ PROPERTY_GRAPHS and PG_* (base) for Oracle's property graphs (lexdb_graph, O22).
 fn oraGraphRows(out: mut &[]OraPend, snap: &CatSnap, user: &str, base: &str) {
     for g in lexdb_graph.all(&snap.graphs) {
@@ -835,6 +871,10 @@ fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role): []OraPend {
         oraGraphRows(mut &out, snap, &user, base)
         return out
     }
+    if base == "ASSERTIONS" || base == "ASSERTION_DEPENDENCIES" {
+        oraAssertRows(mut &out, snap, base)
+        return out
+    }
     if base == "ANNOTATIONS_USAGE" || base == "ANNOTATIONS" || base == "ANNOTATION_VALUES" {
         var seen: []str = []
         for ct in snap.tabs { oraAnnotRows(mut &out, mut &seen, &ct, &user, base, false) }
@@ -893,6 +933,19 @@ fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role): []OraPend {
             p.s("TEMPORARY", "N")
             p.s("SECONDARY", "N")
             p.i("NAMESPACE", 1)
+            append(mut &out, p)
+        }
+        for a in lexdb_assert.all(&snap.asserts) {
+            // (Oracle 23.26.3 lists an assertion as UNDEFINED)
+            var p = oraPend(&a.owner, &"UNDEFINED")
+            oraObject(mut &p, &a.name, lexdb_sql.nameOid("as", &a.key), &"UNDEFINED", false)
+            p.null("DATA_OBJECT_ID")
+            p.s("STATUS", "VALID")
+            p.s("TEMPORARY", "N")
+            p.s("SECONDARY", "N")
+            p.i("NAMESPACE", 1)
+            p.s("SHARING", "NONE")
+            p.null("EDITIONABLE")
             append(mut &out, p)
         }
         for pr in snap.procs {

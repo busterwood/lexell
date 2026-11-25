@@ -211,6 +211,7 @@ CHECKED = {
     'tns_tstz': ('consts', 'QS'),
     'tns_annotations': ('consts', 'QS'),
     'tns_graph': ('consts', 'QS'),
+    'tns_assert': ('consts', 'QS'),
     'tns_bugs3': ('consts', 'QS'),
 }
 
@@ -225,6 +226,8 @@ def expects_of(text):
 
 def drop_all(conn):
     cur = conn.cursor()
+    # (assertions first: a table one reads is dropped only with CASCADE CONSTRAINTS)
+    cur.execute("begin for a in (select assertion_name from user_assertions) loop execute immediate 'drop assertion \"' || a.assertion_name || '\"'; end loop; end;")
     cur.execute("begin for o in (select object_name, object_type from user_objects where object_type in "
                 "('TABLE','VIEW','SEQUENCE','PROCEDURE','FUNCTION','PACKAGE','TYPE','SYNONYM','PROPERTY GRAPH') and object_name not like 'BIN$%') loop "
                 "begin execute immediate case o.object_type when 'TABLE' then 'drop table \"' || o.object_name || '\" cascade constraints purge' "
