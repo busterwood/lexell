@@ -3003,8 +3003,40 @@ fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
     }
     s.table = try p.rname()
     s.spell = p.spelled.clone()
+    if p.ora && p.isKw("(") && p.colAnnotThenAs() {
+        return Err(lexdb_base.err("ORA11559", "Column level annotations not allowed in CREATE TABLE AS SELECT statements."))
+    }
     if p.isKw("as") || p.isKw("on") || (p.ora && p.isKw("annotations")) || (p.isKw("(") && p.nameListThenAs()) { return p.createTableAs(s) }
     return p.tableBody(s)
+}
+
+// Oracle: at CREATE TABLE's "(": whether its list has a column's ANNOTATIONS and AS follows it (or the table's ANNOTATIONS, then
+// AS): a CREATE TABLE AS whose columns are annotated, ORA-11559.
+fn (p: &P) colAnnotThenAs(): bool {
+    var i = p.pos + 1
+    var depth = 1
+    var annot = false
+    while i < len(p.toks) && depth > 0 {
+        let t = &p.toks[i]
+        if t.kind == T_EOF { return false }
+        if t.kind == T_OP && t.text == "(" { depth += 1 }
+        if t.kind == T_OP && t.text == ")" { depth -= 1 }
+        if depth == 1 && t.kind == T_IDENT && t.text == "annotations" { annot = true }
+        i += 1
+    }
+    if !annot || i >= len(p.toks) { return false }
+    if p.toks[i].kind == T_IDENT && p.toks[i].text == "annotations" && i + 1 < len(p.toks) && p.toks[i + 1].text == "(" {
+        // the table's own ANNOTATIONS (...): what follows it
+        i += 2
+        depth = 1
+        while i < len(p.toks) && depth > 0 {
+            if p.toks[i].kind == T_EOF { return false }
+            if p.toks[i].kind == T_OP && p.toks[i].text == "(" { depth += 1 }
+            if p.toks[i].kind == T_OP && p.toks[i].text == ")" { depth -= 1 }
+            i += 1
+        }
+    }
+    return i < len(p.toks) && p.toks[i].kind == T_IDENT && p.toks[i].text == "as"
 }
 
 
@@ -4080,8 +4112,12 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
         } else if p.ora && p.acceptKw("modify") {
             // MODIFY [(] col [type] [NOT NULL | NULL] [DEFAULT e], ... [)]
             let paren = p.acceptKw("(")
+            var named: []str = []
             while true {
                 let n = try p.name()
+                // (a column given twice: Oracle's ORA-00957)
+                for x in named { if x == n { return Err(lexdb_base.err("ORA00957", "duplicate column name")) } }
+                append(mut &named, n.clone())
                 if p.peek().kind == T_IDENT && !p.isKw("not") && !p.isKw("null") && !p.isKw("default") && !p.isKw("annotations") {
                     var a = lexdb_sql.alterOf(A_TYPE, &n)
                     a.col.typ = try p.typeName()
@@ -7734,9 +7770,17 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     v.ifFlag = true
                 }
                 v.table = try p.qname()
+                if p.ora { v.mdialect = MD_ORA }
                 if p.ora && (p.isKw("annotations") || p.isKw("modify")) {
                     try p.annotAlters(mut &v, true)
                     return Ok(v)
+                }
+                if p.ora {
+                    // Oracle's ALTER VIEW: COMPILE and [NON]EDITIONABLE do nothing to a view that is there (v.index ""); RENAME is
+                    // ORA-00922 (a view is renamed by RENAME v TO w)
+                    if p.acceptKw("compile") || p.acceptKw("editionable") || p.acceptKw("noneditionable") { return Ok(v) }
+                    if p.isKw("rename") { return Err(lexdb_base.err("ORA00922", "missing or invalid option")) }
+                    return Err(lexdb_base.err("0A000", "lexdb: ALTER VIEW takes COMPILE, ANNOTATIONS, MODIFY and [NON]EDITIONABLE only"))
                 }
                 if !p.acceptKw("rename") { return Err(lexdb_base.err("0A000", "lexdb: ALTER VIEW supports RENAME TO only")) }
                 try p.expectKw("to")
@@ -7797,9 +7841,18 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 } else {
                     s.table = try p.name()
                 }
-                if idx && p.ora && p.isKw("annotations") {
-                    try p.annotAlters(mut &s, false)
-                    return Ok(s)
+                if idx && p.ora {
+                    s.mdialect = MD_ORA
+                    if p.isKw("annotations") {
+                        try p.annotAlters(mut &s, false)
+                        return Ok(s)
+                    }
+                    // REBUILD [ONLINE], COALESCE, [NO]PARALLEL [n], [NO]LOGGING: done to an index that is there, nothing to do (no alters)
+                    if p.acceptKw("rebuild") || p.acceptKw("coalesce") || p.acceptKw("parallel") || p.acceptKw("noparallel") || p.acceptKw("logging") || p.acceptKw("nologging") {
+                        while p.peek().kind == T_IDENT || p.peek().kind == T_NUM { p.pos += 1 }
+                        return Ok(s)
+                    }
+                    if !p.isKw("rename") { return Err(lexdb_base.err("0A000", "lexdb: ALTER INDEX takes RENAME TO, ANNOTATIONS, REBUILD, COALESCE, [NO]PARALLEL and [NO]LOGGING only")) }
                 }
                 if !p.acceptKw("rename") {
                     return Err(lexdb_base.err("0A000", &("lexdb: ALTER " + (if idx { "INDEX" } else { "SCHEMA" }) + " takes RENAME TO only")))
@@ -7823,6 +7876,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             if !p.ora { return Err(near(&t)) }
             var s = lexdb_sql.newStmt(S_ALTER)
             s.mdialect = MD_ORA
+            s.alter = true                  // (RENAME, not ALTER TABLE ... RENAME TO: a view's too)
             s.table = try p.rname()
             try p.expectKw("to")
             let to = try p.name()
