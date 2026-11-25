@@ -79,6 +79,7 @@ import "./lexdb_recrun"
 import "./lexdb_recprobe"
 import "./lexdb_standby"
 import "./lexdb_assert"
+import "./lexdb_viewdep"
 
 type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
@@ -1387,7 +1388,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 if len(sc.names.frames) > 64 { return Err(e("42P17", &("infinite recursion detected in rules for relation \"" + lexdb_sql.shown(&f.table) + "\""))) }
                 let vs = try viewQuery(&t)
                 let fg = try lexdb_routine.viewPlfGone(st, txn, &t.view)       // (a stored function it calls is gone: ORA-04063, 04067)
-                if fg == "!" { let gone = try viewPlanned(st, txn, &t, Err(e("42703", "a function the view calls is gone"))) }
+                if fg == "!" { return Err(viewErr(st, txn, &t, e("42703", "a function the view calls is gone"))) }
                 if len(fg) > 1 { return Err(e("ORA04067", &("not executed, package body \"" + fg + "\" does not exist"))) }
                 let vowner = (try lexdb_priv.readAcl(st, txn, &lexdb_catalog.relObj(&t.name))).owner
                 if len(vowner) > 0 { append(mut &sc.asRole, vowner.clone()) }
@@ -2590,21 +2591,25 @@ fn endScope(sc: mut &Scope, q: mut &Query) {
     for i in 0..len(f.subReads) { if i < len(q.subs) { q.subs[i].readAs = f.subReads[i] } }
 }
 
-// A view's plan, or its error: Oracle says a view whose query no longer plans (a table or a column it names was renamed or
-// dropped) has errors (ORA-04063).
+// A view's plan, or its error (lexdb_viewdep: an Oracle view whose query no longer plans has errors, ORA-04063; a SELECT *
+// that gives fewer columns than the view has, 4502).
 fn viewPlanned(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, planning: Result[SubPlan, DbErr]): Result[SubPlan, DbErr] {
     match planning {
-        Ok(x) { return Ok(x) }
-        Err(pe) {
-            let ora = strings.startsWith(&t.view, lexdb_sql.ORA_VIEW)
-            let gone = pe.state == "42P01" || pe.state == "42703" || pe.state == "ORA42421"      // (a table, a column or a graph)
-            if ora && gone {
-                let owner = if lexdb_sql.isQual(&t.name) { lexdb_sql.schemaOf(&t.name) } else { lexdb_priv.currentRole(st, txn.sql.sess) }
-                return Err(e("ORA04063", &("view \"" + strings.toUpperAscii(&owner) + "." + strings.toUpperAscii(&lexdb_sql.baseName(&t.name)) + "\" has errors")))
-            }
-            return Err(pe)
-        }
+        Ok(x) { match lexdb_viewdep.fewerErr(t, &x.sel.outs) { Some(fe) { return Err(viewErr(st, txn, t, fe)) } None { return Ok(x) } } }
+        Err(pe) { return Err(viewErr(st, txn, t, pe)) }
     }
+}
+fn viewErr(st: &lexdb_store.Store, txn: &lexdb_store.Txn, t: &Table, pe: DbErr): DbErr { return lexdb_viewdep.planErr(t, pe, &lexdb_priv.currentRole(st, txn.sql.sess)) }
+
+// A view's query planned on its own, as reading the view plans it (lexdb_viewdep: the views a dropped column breaks).
+fn viewCols(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result[[]OutCol, DbErr] {
+    var q = try viewQuery(t)
+    q.use = 0
+    var sc = newScopeIn(st, txn, &[], &[])
+    sc.rn = t.rn.clone()
+    let vowner = (try lexdb_priv.readAcl(st, txn, &lexdb_catalog.relObj(&t.name))).owner
+    if len(vowner) > 0 { append(mut &sc.asRole, vowner.clone()) }
+    return Ok((try planSelect(st, txn, &q, &[], mut &sc)).outs.clone())
 }
 
 fn planSub(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
@@ -5685,8 +5690,8 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 if a.kind == lexdb_sql.A_SET_SCHEMA && (lexdb_catalog.tempRel(&ft.name) || a.name == "pg_temp" || lexdb_base.isTempSchema(&a.name)) {
                     return Err(e("0A000", "cannot move objects into or out of temporary schemas"))
                 }
-                if a.kind == lexdb_sql.A_RENAME || a.kind == lexdb_sql.A_RENAME_COL || a.kind == lexdb_sql.A_DROP_COL ||
-                   a.kind == lexdb_sql.A_TYPE || a.kind == lexdb_sql.A_SET_SCHEMA {
+                // (a dropped column: the views it breaks, after, lexdb_viewdep.afterAlter)
+                if a.kind == lexdb_sql.A_RENAME || a.kind == lexdb_sql.A_RENAME_COL || a.kind == lexdb_sql.A_TYPE || a.kind == lexdb_sql.A_SET_SCHEMA {
                     let deps = try lexdb_catalog.dependentViews(st, txn, &ft.name)
                     if len(deps) == 0 { continue }
                     let pg = s.mdialect == lexdb_sql.MD_PG
@@ -6187,6 +6192,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     pruneInvalid(mut &t)
     try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(&t)))
     try bumpFor(st, txn, &t.name)
+    try lexdb_viewdep.afterAlter(st, txn, s, &t.name, &viewCols, &bumpCatalog)
     return Ok(tagOnly("ALTER TABLE"))
 }
 
@@ -18985,8 +18991,9 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str, tsqlIs:
     if rel == "sys.databases" { dbopts = (try st.get(txn, lexdb_catalog.CATALOG, &lexdb_dbopt.KEY)).unwrapOr("") }
     // (Oracle's NLS views show what ALTER SESSION set)
     let sets = if rel == "ora.NLS_SESSION_PARAMETERS" || rel == "ora.V_$NLS_PARAMETERS" { st.memo.get(&settingsKey(txn.sql.sess)).unwrapOr("") } else { "" }
+    let verrs = try lexdb_viewdep.viewErrs(st, txn, rel, &snap, &viewCols)
     var cq = CatView{snap: snap, roles: roles, sess: txn.sql.sess, mems: mems, used: used, cur: cur, who: who, whoSuper: whoSuper, dbopts: dbopts,
-                     replica: lexdb_standby.isReplica(st), sets: sets}
+                     replica: lexdb_standby.isReplica(st), sets: sets, verrs: verrs}
     if strings.startsWith(rel, "sys.") { return lexdb_syscat.viewRows(&cq, &rel[4..len(rel)]) }
     if strings.startsWith(rel, "ora.") { return lexdb_oracat.viewRows(&cq, &rel[4..len(rel)]) }
     var stats: Map[int, TabStat] = newMap()
