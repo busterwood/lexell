@@ -102,6 +102,8 @@ expression AT TIME ZONE timezone
 ## Remarks
 
 - All functions return NULL for a NULL argument.
+- `SWITCHOFFSET`, `TODATETIMEOFFSET` and `AT TIME ZONE` give a `datetimeoffset` with their argument's fractional
+  digits (a `datetime`'s 3): of a `datetimeoffset(0)`, `2026-03-15 13:30:00 +05:30` (examples I and K).
 - The clock functions give a different value each time, so the examples compare them with a fixed date.
 - `DATEPART(weekday, ...)` does not depend on `SET DATEFIRST`: the first day is always Sunday (`@@DATEFIRST` is 7).
 
@@ -112,9 +114,6 @@ expression AT TIME ZONE timezone
 - **Missing functions:** `ISDATE`, `DATETIMEFROMPARTS`, `TIMEFROMPARTS` and `DATETIME2FROMPARTS` are error 195.
 - `AT TIME ZONE` knows about 45 Windows zones, the common ones of each continent; another
   (`'Mountain Standard Time (Mexico)'`) is error 9820, where SQL Server knows every zone of `sys.time_zone_info`.
-- `SWITCHOFFSET`, `TODATETIMEOFFSET` and `AT TIME ZONE` give a `datetimeoffset(7)` whatever the scale of their
-  argument; SQL Server keeps the scale, so a client shows `10:00:00 +02:00` where lexdb's shows `10:00:00.0000000
-  +02:00`.
 - `DATEFROMPARTS` with an impossible date is error 517 (SQL Server: 289).
 - `datetime + number` and `datetime - datetime` work as in SQL Server, but `date`, `datetime2` and `time` with a
   number are error 206: use `DATEADD` and `DATEDIFF` (see [date and time types](data-types-datetime.md)).
@@ -358,15 +357,15 @@ SELECT CAST('2026-03-15 10:00:00 +02:00' AS datetimeoffset) AT TIME ZONE 'Nowher
 ```
 
 ```text
-utc                                pacific                            india
----------------------------------- ---------------------------------- ----------------------------------
-2026-03-15 08:00:00.0000000 +00:00 2026-03-15 01:00:00.0000000 -07:00 2026-03-15 13:30:00.0000000 +05:30
+utc                        pacific                    india
+-------------------------- -------------------------- --------------------------
+2026-03-15 08:00:00 +00:00 2026-03-15 01:00:00 -07:00 2026-03-15 13:30:00 +05:30
 
 (1 row affected)
 
-winter                             summer                             in_the_gap                         twice
----------------------------------- ---------------------------------- ---------------------------------- ----------------------------------
-2026-03-15 10:00:00.0000000 +01:00 2026-07-15 10:00:00.0000000 +02:00 2026-03-08 03:30:00.0000000 -04:00 2026-11-01 01:30:00.0000000 -04:00
+winter                     summer                     in_the_gap                 twice
+-------------------------- -------------------------- -------------------------- --------------------------
+2026-03-15 10:00:00 +01:00 2026-07-15 10:00:00 +02:00 2026-03-08 03:30:00 -04:00 2026-11-01 01:30:00 -04:00
 
 (1 row affected)
 
@@ -420,9 +419,9 @@ SELECT TODATETIMEOFFSET(CAST('2026-03-15 10:00:00' AS datetime2), 'zz');
 ```
 
 ```text
-to_offset                          to_minutes                         attach                             attach_minutes
----------------------------------- ---------------------------------- ---------------------------------- ----------------------------------
-2026-03-15 13:30:00.0000000 +05:30 2026-03-15 03:00:00.0000000 -05:00 2026-03-15 10:00:00.0000000 +05:00 2026-03-15 10:00:00.0000000 -01:30
+to_offset                  to_minutes                 attach                     attach_minutes
+-------------------------- -------------------------- -------------------------- --------------------------
+2026-03-15 13:30:00 +05:30 2026-03-15 03:00:00 -05:00 2026-03-15 10:00:00 +05:00 2026-03-15 10:00:00 -01:30
 
 (1 row affected)
 

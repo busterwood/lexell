@@ -65,10 +65,12 @@ datetimeoffset [ ( p ) ]
 - **Time resolution is a microsecond.** The seventh fractional digit is lost: `'13:45:30.1234567'` is stored as
   `13:45:30.1234570`.
 - **A `datetimeoffset` as a string has seven fractional digits whatever its scale**: `CAST(x AS varchar(40))` of a
-  `datetimeoffset(0)` is `2026-03-15 10:00:00.0000000 +02:00` (SQL Server: `2026-03-15 10:00:00 +02:00`). The value
-  `SWITCHOFFSET`, `TODATETIMEOFFSET`, `AT TIME ZONE`, `MIN` and `MAX` give is a `datetimeoffset(7)` whatever the
-  scale of their argument (SQL Server keeps it), so clients show it with seven digits.
-- `MIN` and `MAX` of equal instants show the offset of the last row (SQL Server: of the first).
+  `datetimeoffset(0)` is `2026-03-15 10:00:00.0000000 +02:00` (SQL Server: `2026-03-15 10:00:00 +02:00`). The values
+  themselves keep their scale, as in SQL Server: `SWITCHOFFSET`, `TODATETIMEOFFSET`, `AT TIME ZONE`, `MIN` and `MAX`
+  give their argument's.
+- `MIN` and `MAX` of equal instants at different offsets show the first row in the table's order, as SQL Server's
+  do, but `MAX` alone over an index on the column differs: SQL Server reads the index backwards and shows the last
+  of the equal keys, lexdb the first.
 - A `VALUES` list keeps the instant, not the offset: `(VALUES (CAST('2026-03-15 10:00 +02:00' AS datetimeoffset)))`
   gives `2026-03-15 08:00:00 +00:00`.
 - `datetimeoffset - datetimeoffset` is an interval (`01:00:00`; SQL Server: error 8117), and a variable plus a number
