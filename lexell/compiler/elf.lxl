@@ -23,10 +23,25 @@ pub type Seg = record {
     pub memsz: int          // at least len(data): the rest is zero (bss)
 }
 
+// A function symbol in .text, written to .symtab/.strtab when non-empty.
+pub type Sym = value record {
+    pub name: str
+    pub addr: int
+    pub size: int
+}
+
 fn put(out: mut &[]byte, v: int, n: int) {
     var x = v
     for i in 0..n {
         append(out, byte(x & 255))
+        x = x >> 8
+    }
+}
+
+fn putAt(out: mut &[]byte, off: int, v: int, n: int) {
+    var x = v
+    for i in 0..n {
+        out[off + i] = byte(x & 255)
         x = x >> 8
     }
 }
@@ -39,8 +54,9 @@ pub fn alignUp(v: int, a: int): int { return (v + a - 1) / a * a }
 
 // The executable: segs[0] is the code at TEXT_BASE; entry is an address in it. dynAt is the
 // address of the dynamic section (dynSize bytes, in one of the segments), or 0 for a static
-// executable.
-pub fn image(entry: int, segs: &[]Seg, dynAt: int, dynSize: int): []byte {
+// executable. When syms is non-empty, .text, .symtab, .strtab and .shstrtab section headers
+// are appended after the loadable segments for perf, objdump, nm and gdb.
+pub fn image(entry: int, segs: &[]Seg, dynAt: int, dynSize: int, syms: &[]Sym): []byte {
     let isDyn = dynAt != 0
     let nph = len(segs) + (if isDyn { 4 } else { 1 })    // PT_GNU_STACK; PT_PHDR, PT_INTERP, PT_DYNAMIC
     let interpAt = 64 + 56 * nph
@@ -116,7 +132,65 @@ pub fn image(entry: int, segs: &[]Seg, dynAt: int, dynSize: int): []byte {
         pad(mut &out, offs[i])
         for x in segs[i].data { append(mut &out, x) }
     }
+    if len(syms) > 0 {
+        pad(mut &out, alignUp(len(out), 8))
+        var strtab: []byte = [0]
+        var symtab: []byte = []
+        put(mut &symtab, 0, 24)                             // STN_UNDEF
+        for s in syms {
+            let noff = len(strtab)
+            for j in 0..len(s.name) { append(mut &strtab, strByte(&s.name, j)) }
+            append(mut &strtab, 0)
+            put(mut &symtab, noff, 4)                       // st_name
+            put(mut &symtab, 0x12, 1)                       // STB_GLOBAL, STT_FUNC
+            put(mut &symtab, 0, 1)                          // STV_DEFAULT
+            put(mut &symtab, 1, 2)                          // .text (section 1)
+            put(mut &symtab, s.addr, 8)                     // st_value
+            put(mut &symtab, s.size, 8)                     // st_size
+        }
+        let symOff = len(out)
+        for x in symtab { append(mut &out, x) }
+        let strOff = len(out)
+        for x in strtab { append(mut &out, x) }
+        var shstr: []byte = [0]
+        let nText = addRawStr(mut &shstr, ".text")
+        let nSym = addRawStr(mut &shstr, ".symtab")
+        let nStr = addRawStr(mut &shstr, ".strtab")
+        let nShstr = addRawStr(mut &shstr, ".shstrtab")
+        let shstrOff = len(out)
+        for x in shstr { append(mut &out, x) }
+        pad(mut &out, alignUp(len(out), 8))
+        let shOff = len(out)
+        shdr(mut &out, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)                                                  // [0] SHT_NULL
+        shdr(mut &out, nText, 1, 6, TEXT_BASE, TEXT_BASE - IMAGE_BASE, len(segs[0].data), 0, 0, 16, 0) // [1] .text
+        shdr(mut &out, nSym, 2, 0, 0, symOff, len(symtab), 3, 1, 8, 24)                                // [2] .symtab
+        shdr(mut &out, nStr, 3, 0, 0, strOff, len(strtab), 0, 0, 1, 0)                                 // [3] .strtab
+        shdr(mut &out, nShstr, 3, 0, 0, shstrOff, len(shstr), 0, 0, 1, 0)                              // [4] .shstrtab
+        putAt(mut &out, 40, shOff, 8)                       // e_shoff
+        putAt(mut &out, 60, 5, 2)                           // e_shnum
+        putAt(mut &out, 62, 4, 2)                           // e_shstrndx
+    }
     return out
+}
+
+fn addRawStr(out: mut &[]byte, s: str): int {
+    let off = len(out)
+    for i in 0..len(s) { append(out, strByte(&s, i)) }
+    append(out, 0)
+    return off
+}
+
+fn shdr(out: mut &[]byte, name: int, ty: int, flags: int, addr: int, off: int, size: int, link: int, info: int, align: int, entsize: int) {
+    put(out, name, 4)
+    put(out, ty, 4)
+    put(out, flags, 8)
+    put(out, addr, 8)
+    put(out, off, 8)
+    put(out, size, 8)
+    put(out, link, 4)
+    put(out, info, 4)
+    put(out, align, 8)
+    put(out, entsize, 8)
 }
 
 const PT_DYNAMIC = 2

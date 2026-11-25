@@ -1,7 +1,7 @@
 # Lexell performance
 
-Measured on 24–25 November 2026 on `main` (LexDB sysbench OLTP and ClickBench at `263afd33`;
-TPC-H at `1990a3c7`; microbenchmarks at `870cb22a`; applications, commands and the remaining LexDB suites at `b28afb4c`).
+Measured on 24–25 November 2026 on `main` (LexDB TPC-H, sysbench OLTP and ClickBench, regex and
+microbenchmarks at `9f684cea`; applications, commands and the remaining LexDB suites at `b28afb4c`).
 Every number compares Lexell only with external tools or databases.
 Lexell's own C backend and earlier builds are not compared.
 
@@ -20,13 +20,13 @@ Method: wall times are best of N; instruction counts are user-mode
 | Area | Against | Result |
 |---|---|---|
 | Compile time | Rust | Much faster: about 3.6 times for hello world, about 24 times for nine programs |
-| Microbenchmarks | Rust, Java, Go | Faster than Rust on eleven of nineteen, level on two; faster than warmed-up Java on ten of twenty, level on one; task switching about 1.8 times Go's speed; 2–31 MB on nineteen of twenty against the JVM's 51 MB–2.35 GB |
+| Microbenchmarks | Rust, Java, Go | Faster than Rust on eleven of nineteen, level on two; faster than warmed-up Java on eleven of twenty, near-level on one; task switching about 1.9 times Go's speed; 2–31 MB on nineteen of twenty against the JVM's 51 MB–2.36 GB |
 | Regex | Go, Rust | Faster than Go on all; slower than Rust on six of seven |
 | JSON | Python, jq | Faster to parse and write, slower to query; faster than jq on every filter (0.44 to 0.68 times jq 1.7.1) |
 | Markdown | cmark | Slightly slower on long documents, faster on the spec examples |
 | Decimal | Java, .NET | Faster than .NET on all but 19-digit add; slower than Java on division and comparison |
 | HTTP server | Go net/http, Node.js | Faster at 1, 10 and 100 clients: about 1.5 times Go's requests a second, 1.2 to 1.3 times Node's |
-| LexDB | PostgreSQL 18 | Faster on one core than PostgreSQL on one core in TPC-H (ahead of its four processes in total, 7.48 against 8.84 s; geomean 0.52 vs one core, 0.84 vs four processes; 22 of 22 level or ahead), ClickBench 1M (ahead on total wall 20.13 vs 22.36 s; geomean 0.83 wall, 0.78 CPU; 34 of 43 level or ahead; `ANALYZE` 0.42 vs 1.19 s), durable updates (pgbench 1.75–2.51×; sysbench non-index 2.20–3.07×, index 1.17–2.51× at 1–32 threads), and analytic queries (CPU 0.49 of one core, wall 0.98 of four processes); ahead on all 6 sysbench OLTP workloads at 1 thread, on `oltp_write_only` through 8 threads, and with 3 replicas ahead on both `oltp_point_select` and `oltp_read_only` at 32 threads (~26% less CPU); slower from one process on multi-thread reads and multi-statement read-write blocks |
+| LexDB | PostgreSQL 18 | Faster on one core than PostgreSQL on one core in TPC-H (ahead of its four processes in total, 7.25 against 8.84 s; geomean 0.49 vs one core, 0.80 vs four processes; 22 of 22 faster than one core), ClickBench 1M (ahead on total wall 18.79 vs 22.36 s; geomean 0.79 wall, 0.75 CPU; 36 of 43 level or ahead; `ANALYZE` 0.42 vs 1.19 s), durable updates (pgbench 1.75–2.51×; sysbench non-index 2.34–3.14×, index 1.07–2.48× at 1–32 threads), and analytic queries (CPU 0.49 of one core, wall 0.98 of four processes); ahead on all 6 sysbench OLTP workloads at 1 thread, on `oltp_write_only` through 8 threads, and with 3 replicas ahead on both `oltp_point_select` (1.11×) and `oltp_read_only` (1.06×) at 32 threads (29–33% less CPU); slower from one process on multi-thread reads and multi-statement read-write blocks |
 | Command-line tools | GNU grep, sort, tail, eza | Faster on grep and eza, slower on sort, level on tail |
 
 ## Compile time
@@ -72,30 +72,30 @@ structure. Every port prints the same checksum.
 
 | program | Lexell | Rust | Lexell / Rust | Java (warm) | Lexell / Java |
 |---|---:|---:|---:|---:|---:|
-| fib | 571 ms | 916 ms | 0.62 | 628 ms | 0.91 |
-| loop | 408 ms | 408 ms | 1.00 | 459 ms | 0.89 |
-| array | 253 ms | 337 ms | 0.75 | 273 ms | 0.93 |
-| sieve | 299 ms | 467 ms | 0.64 | 544 ms | 0.55 |
-| alloc | 33 ms | 361 ms | 0.09 | 28 ms | 1.18 |
-| strings | 74 ms | 267 ms | 0.28 | 45 ms | 1.65 |
-| lists | 83 ms | 491 ms | 0.17 | 58 ms | 1.44 |
-| trees | 62 ms | 324 ms | 0.19 | 42 ms | 1.47 |
-| tokens | 104 ms | 95 ms | 1.10 | 187 ms | 0.56 |
-| maps | 328 ms | 637 ms | 0.52 | 274 ms | 1.20 |
-| nbody | 241 ms | 159 ms | 1.52 | 242 ms | 1.00 |
-| interp | 154 ms | 206 ms | 0.74 | 328 ms | 0.47 |
-| closures | 98 ms | 61 ms | 1.60 | 162 ms | 0.61 |
-| matmul | 88 ms | 140 ms | 0.63 | 31 ms | 2.84 |
-| pingpong | 190 ms | - | - | 1,655 ms | 0.12 |
-| bitpack | 407 ms | 334 ms | 1.22 | 606 ms | 0.67 |
-| btree | 101 ms | 101 ms | 1.00 | 96 ms | 1.05 |
-| hashagg | 154 ms | 125 ms | 1.24 | 121 ms | 1.28 |
-| varint_csv | 75 ms | 77 ms | 0.97 | 103 ms | 0.73 |
-| enum_eval | 141 ms | 130 ms | 1.09 | 112 ms | 1.26 |
+| fib | 557 ms | 928 ms | 0.60 | 641 ms | 0.87 |
+| loop | 409 ms | 412 ms | 0.99 | 460 ms | 0.89 |
+| array | 257 ms | 345 ms | 0.75 | 277 ms | 0.93 |
+| sieve | 306 ms | 464 ms | 0.66 | 530 ms | 0.58 |
+| alloc | 35 ms | 370 ms | 0.09 | 28 ms | 1.25 |
+| strings | 78 ms | 273 ms | 0.29 | 47 ms | 1.66 |
+| lists | 88 ms | 505 ms | 0.17 | 63 ms | 1.39 |
+| trees | 61 ms | 329 ms | 0.18 | 41 ms | 1.48 |
+| tokens | 102 ms | 95 ms | 1.07 | 181 ms | 0.56 |
+| maps | 402 ms | 779 ms | 0.52 | 284 ms | 1.42 |
+| nbody | 249 ms | 161 ms | 1.55 | 259 ms | 0.96 |
+| interp | 167 ms | 212 ms | 0.78 | 342 ms | 0.49 |
+| closures | 108 ms | 68 ms | 1.60 | 228 ms | 0.47 |
+| matmul | 90 ms | 146 ms | 0.62 | 32 ms | 2.83 |
+| pingpong | 199 ms | - | - | 841 ms | 0.24 |
+| bitpack | 423 ms | 341 ms | 1.24 | 590 ms | 0.72 |
+| btree | 103 ms | 105 ms | 0.99 | 100 ms | 1.03 |
+| hashagg | 167 ms | 131 ms | 1.27 | 128 ms | 1.30 |
+| varint_csv | 78 ms | 83 ms | 0.93 | 110 ms | 0.71 |
+| enum_eval | 150 ms | 135 ms | 1.11 | 121 ms | 1.24 |
 
-Go runs `pingpong` in 348 ms (Lexell / Go 0.55), with its default threads or with one.
+Go runs `pingpong` in 372 ms (Lexell / Go 0.54), with its default threads or with one.
 
-`alloc` runs about 33 ms: its records never escape, so neither Lexell nor the JVM
+`alloc` runs about 35 ms: its records never escape, so neither Lexell nor the JVM
 allocates them (`lexell/design/opt-experiments.md`, section 18), while Rust's `Box` does.
 
 Peak resident memory of the same runs (the Java figure is the JVM's over its warm-up and timed
@@ -105,24 +105,24 @@ runs, with its default heap, which may grow to a quarter of RAM):
 |---|---:|---:|---:|
 | fib | 2.0 MB | 2.3 MB | 51 MB |
 | loop | 2.0 MB | 2.3 MB | 51 MB |
-| array | 9.6 MB | 9.7 MB | 206 MB |
-| sieve | 12.0 MB | 11.8 MB | 325 MB |
-| alloc | 2.0 MB | 2.2 MB | 69 MB |
-| strings | 2.0 MB | 2.6 MB | 549 MB |
-| lists | 2.2 MB | 2.7 MB | 537 MB |
-| trees | 6.0 MB | 6.9 MB | 1,364 MB |
-| tokens | 3.8 MB | 3.4 MB | 553 MB |
-| maps | 180 MB | 208 MB | 2,352 MB |
-| nbody | 2.0 MB | 2.3 MB | 53 MB |
-| interp | 2.0 MB | 2.2 MB | 54 MB |
-| closures | 13.7 MB | 21.5 MB | 156 MB |
-| matmul | 4.0 MB | 5.7 MB | 93 MB |
-| pingpong | 2.0 MB | - | 547 MB |
-| bitpack | 31.2 MB | 28.3 MB | 245 MB |
-| btree | 4.0 MB | 5.0 MB | 90 MB |
+| array | 9.5 MB | 10.1 MB | 206 MB |
+| sieve | 12.0 MB | 11.8 MB | 327 MB |
+| alloc | 2.0 MB | 2.2 MB | 67 MB |
+| strings | 2.0 MB | 2.7 MB | 548 MB |
+| lists | 2.2 MB | 2.6 MB | 537 MB |
+| trees | 6.0 MB | 7.1 MB | 1,364 MB |
+| tokens | 3.8 MB | 3.6 MB | 552 MB |
+| maps | 180 MB | 208 MB | 2,357 MB |
+| nbody | 2.0 MB | 2.3 MB | 52 MB |
+| interp | 2.0 MB | 2.3 MB | 54 MB |
+| closures | 13.6 MB | 21.4 MB | 160 MB |
+| matmul | 4.0 MB | 5.7 MB | 92 MB |
+| pingpong | 2.0 MB | - | 549 MB |
+| bitpack | 31.2 MB | 27.9 MB | 246 MB |
+| btree | 4.0 MB | 4.9 MB | 93 MB |
 | hashagg | 27.8 MB | 26.2 MB | 233 MB |
-| varint_csv | 5.2 MB | 5.2 MB | 375 MB |
-| enum_eval | 18.0 MB | 17.3 MB | 134 MB |
+| varint_csv | 5.0 MB | 5.2 MB | 375 MB |
+| enum_eval | 18.0 MB | 17.4 MB | 134 MB |
 
 Java's speed here does not depend on that memory. With its heap capped at 64 MB (`-Xmx64m`),
 `lists`, `strings` and `trees` run in 60, 46 and 42 ms at a peak of 86 to 105 MB; at 16 MB they
@@ -133,19 +133,19 @@ nothing to free, whereas Lexell frees each node when its owner is dropped. Lexel
 larger: an `Option` of a box is a pointer, so its `lists` and `trees` nodes are 16 and 24 bytes
 with their headers, against Java's 24.
 
-On `matmul` (88 ms), Lexell is 1.59× faster than Rust (140 ms), while Java's C2 JIT auto-vectorises
-the inner loop (31 ms). On `nbody` (241 ms), Lexell is level with Java (242 ms) and behind Rust
-(159 ms), where LLVM unrolls and vectorises the pairwise force loop. Rust's `sort_by` leads on
-`closures` (61 vs 98 ms), while Lexell is ahead of Java's `List.sort` (162 ms). `interp` (154 ms)
-is 26% ahead of Rust (206 ms) and more than twice Java's speed (328 ms). In `pingpong`, a round
-trip of two task hand-overs takes 95 ns in Lexell, against 174 ns over Go channels and 828 ns for
-Java virtual threads. `tokens` uses `&str` views of the source in all three languages (104 ms vs
-Rust's 95 ms and Java's 187 ms).
+On `matmul` (90 ms), Lexell is 1.62× faster than Rust (146 ms), while Java's C2 JIT auto-vectorises
+the inner loop (32 ms). On `nbody` (249 ms), Lexell edges ahead of Java (259 ms) and is behind Rust
+(161 ms), where LLVM unrolls and vectorises the pairwise force loop. Rust's `sort_by` leads on
+`closures` (68 vs 108 ms), while Lexell is more than twice as fast as Java's `List.sort` (228 ms). `interp` (167 ms)
+is 21% ahead of Rust (212 ms) and more than twice Java's speed (342 ms). In `pingpong`, a round
+trip of two task hand-overs takes 100 ns in Lexell, against 186 ns over Go channels and 421 ns for
+Java virtual threads. `tokens` uses `&str` views of the source in all three languages (102 ms vs
+Rust's 95 ms and Java's 181 ms).
 
-On the five database-kernel benchmarks, Lexell leads Java on `bitpack` (407 vs 606 ms) and leads
-both Rust and Java on `varint_csv` (75 vs 77 and 103 ms), matches Rust on `btree` (101 vs 101 ms;
-Java 96 ms), and trails Rust and Java on `enum_eval` (141 vs 130 and 112 ms) and `hashagg` (154 vs
-125 and 121 ms).
+On the five database-kernel benchmarks, Lexell leads Java on `bitpack` (423 vs 590 ms) and leads
+both Rust and Java on `varint_csv` (78 vs 83 and 110 ms), matches Rust on `btree` (103 vs 105 ms;
+Java 100 ms), and trails Rust and Java on `enum_eval` (150 vs 135 and 121 ms) and `hashagg` (167 vs
+131 and 128 ms).
 
 ## Applications
 
@@ -170,23 +170,22 @@ with the same target flags as the other Rust ports (`opt-level = 3`,
 
 | pattern | Lexell | Go regexp | Rust regex | Lexell / Go | Lexell / Rust |
 |---|---:|---:|---:|---:|---:|
-| literal `Sherlock Holmes` | 0.20 ms | 0.42 ms | 0.07 ms | 0.48 | 2.86 |
-| alternation `Sherlock\|Holmes\|Watson\|Irene` | 0.59 ms | 132.6 ms | 0.40 ms | 0.004 | 1.48 |
-| `\w+` | 19.7 ms | 120.1 ms | 15.9 ms | 0.16 | 1.24 |
-| `(?i)sherlock` | 0.55 ms | 70.0 ms | 0.43 ms | 0.008 | 1.28 |
-| email | 0.09 ms | 75.0 ms | 0.08 ms | 0.001 | 1.13 |
-| `(?m)^ERROR .*timeout$` | 0.38 ms | 29.9 ms | 0.57 ms | 0.013 | 0.67 |
-| dates `(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})` | 2.47 ms | 68.0 ms | 1.21 ms | 0.036 | 2.04 |
-| `(a*)*b` on 100 KB | below timer resolution | 3.20 ms | below timer resolution | | |
+| literal `Sherlock Holmes` | 0.16 ms | 0.41 ms | 0.07 ms | 0.39 | 2.29 |
+| alternation `Sherlock\|Holmes\|Watson\|Irene` | 0.55 ms | 132.5 ms | 0.40 ms | 0.004 | 1.38 |
+| `\w+` | 19.7 ms | 121.5 ms | 16.0 ms | 0.16 | 1.23 |
+| `(?i)sherlock` | 0.51 ms | 69.6 ms | 0.43 ms | 0.007 | 1.19 |
+| email | 0.10 ms | 74.4 ms | 0.09 ms | 0.001 | 1.11 |
+| `(?m)^ERROR .*timeout$` | 0.24 ms | 30.4 ms | 0.57 ms | 0.008 | 0.42 |
+| dates `(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})` | 2.80 ms | 68.6 ms | 1.25 ms | 0.041 | 2.24 |
+| `(a*)*b` on 100 KB | below timer resolution | 3.25 ms | below timer resolution | | |
 
-Against Rust, the regex crate is faster on six patterns (email is 0.09 against 0.08 ms, near
-the script's 0.01 ms resolution) and Lexell is faster on `errors`; `(a*)*b` is below timer
-resolution for both.
+Against Rust, the regex crate is faster on six patterns (email is 0.10 against 0.09 ms, near
+the script's 0.01 ms resolution) and Lexell is more than twice as fast on `errors` (0.24 vs 0.57 ms);
+`(a*)*b` is below timer resolution for both.
 
-Against Rust, the gap on `literal`, alternation and `(?i)sherlock` is on
-the library side: the `regex` crate searches literals with SIMD `memchr` and
-Teddy, and `regex.lxl` makes no SIMD call. The `\w+` and dates gaps are more
-on the native backend's code generation side.
+Against Rust, the remaining gap on `literal`, alternation and `(?i)sherlock` is on
+the library side: Lexell uses AVX2/SSE2 runtime string search (`strFind`, `strFindPair`, `strFindByte`),
+while Rust's `regex` crate adds multi-literal Teddy prefilters and specialized capture DFAs.
 
 ### JSON
 
@@ -293,37 +292,37 @@ PostgreSQL's:
 
 | | LexDB (one core) | PostgreSQL, one core | PostgreSQL, four processes |
 |---|---:|---:|---:|
-| all 22 queries, summed (wall) | 7,477 ms | 14,670 ms | 8,839 ms |
-| geometric mean of LexDB / PostgreSQL (wall) | | 0.52 | 0.84 |
-| geometric mean of LexDB / PostgreSQL (CPU) | | 0.48 | |
-| queries level or ahead of one core (within 10%) | | 22 of 22 | |
+| all 22 queries, summed (wall) | 7,250 ms | 14,670 ms | 8,839 ms |
+| geometric mean of LexDB / PostgreSQL (wall) | | 0.49 | 0.80 |
+| geometric mean of LexDB / PostgreSQL (CPU) | | 0.46 | |
+| queries faster than one core | | 22 of 22 | |
 
 | query | LexDB wall | PG 1-core wall | LexDB / PG1 | LexDB CPU | PG1 CPU | CPU ratio | PG 4-proc wall | LexDB / PG4 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| q1 | 1,117.9 ms | 3,365.9 ms | 0.33 | 1,114.2 ms | 3,375.3 ms | 0.33 | 873.5 ms | 1.28 |
-| q2 | 36.0 ms | 160.9 ms | 0.22 | 35.9 ms | 166.9 ms | 0.22 | 137.6 ms | 0.26 |
-| q3 | 499.9 ms | 551.7 ms | 0.91 | 497.6 ms | 579.3 ms | 0.86 | 353.6 ms | 1.41 |
-| q4 | 132.7 ms | 184.9 ms | 0.72 | 132.3 ms | 211.6 ms | 0.63 | 102.9 ms | 1.29 |
-| q5 | 148.1 ms | 312.6 ms | 0.47 | 147.6 ms | 341.2 ms | 0.43 | 173.2 ms | 0.86 |
-| q6 | 179.8 ms | 274.8 ms | 0.65 | 179.2 ms | 294.1 ms | 0.61 | 203.4 ms | 0.88 |
-| q7 | 390.7 ms | 585.8 ms | 0.67 | 389.2 ms | 615.2 ms | 0.63 | 287.6 ms | 1.36 |
-| q8 | 143.3 ms | 226.2 ms | 0.63 | 142.7 ms | 253.5 ms | 0.56 | 141.9 ms | 1.01 |
-| q9 | 1,434.6 ms | 1,743.2 ms | 0.82 | 1,428.7 ms | 1,770.1 ms | 0.81 | 750.9 ms | 1.91 |
-| q10 | 425.0 ms | 389.0 ms | 1.09 | 423.0 ms | 417.2 ms | 1.01 | 167.3 ms | 2.54 |
-| q11 | 63.4 ms | 61.4 ms | 1.03 | 63.1 ms | 67.7 ms | 0.93 | 61.5 ms | 1.03 |
-| q12 | 417.8 ms | 854.9 ms | 0.49 | 416.5 ms | 880.7 ms | 0.47 | 253.6 ms | 1.65 |
-| q13 | 619.8 ms | 839.8 ms | 0.74 | 617.1 ms | 843.9 ms | 0.73 | 825.6 ms | 0.75 |
-| q14 | 129.2 ms | 141.6 ms | 0.91 | 128.7 ms | 159.8 ms | 0.81 | 95.1 ms | 1.36 |
-| q15 | 180.6 ms | 331.9 ms | 0.54 | 180.4 ms | 348.1 ms | 0.52 | 333.9 ms | 0.54 |
-| q16 | 205.6 ms | 267.9 ms | 0.77 | 203.2 ms | 273.4 ms | 0.74 | 105.3 ms | 1.95 |
-| q17 | 20.4 ms | 551.2 ms | 0.04 | 20.4 ms | 569.9 ms | 0.04 | 554.7 ms | 0.04 |
-| q18 | 573.7 ms | 2,753.9 ms | 0.21 | 571.8 ms | 2,722.6 ms | 0.21 | 2,933.0 ms | 0.20 |
-| q19 | 36.7 ms | 40.2 ms | 0.91 | 36.6 ms | 53.6 ms | 0.68 | 37.5 ms | 0.98 |
-| q20 | 27.1 ms | 125.8 ms | 0.22 | 27.0 ms | 149.3 ms | 0.18 | 127.8 ms | 0.21 |
-| q21 | 646.3 ms | 818.4 ms | 0.79 | 643.6 ms | 846.4 ms | 0.76 | 269.6 ms | 2.40 |
-| q22 | 48.4 ms | 88.4 ms | 0.55 | 48.3 ms | 94.1 ms | 0.51 | 49.5 ms | 0.98 |
-| **sum** | **7,477.0 ms** | **14,670.4 ms** | **0.51** | **7,447.0 ms** | **15,033.8 ms** | **0.50** | **8,839.0 ms** | **0.85** |
-| **geomean** | | | **0.52** | | | **0.48** | | **0.84** |
+| q1 | 1,083.5 ms | 3,365.9 ms | 0.32 | 1,079.0 ms | 3,375.3 ms | 0.32 | 873.5 ms | 1.24 |
+| q2 | 36.5 ms | 160.9 ms | 0.23 | 36.3 ms | 166.9 ms | 0.22 | 137.6 ms | 0.27 |
+| q3 | 471.9 ms | 551.7 ms | 0.86 | 469.3 ms | 579.3 ms | 0.81 | 353.6 ms | 1.33 |
+| q4 | 118.6 ms | 184.9 ms | 0.64 | 118.2 ms | 211.6 ms | 0.56 | 102.9 ms | 1.15 |
+| q5 | 154.9 ms | 312.6 ms | 0.50 | 154.2 ms | 341.2 ms | 0.45 | 173.2 ms | 0.89 |
+| q6 | 180.0 ms | 274.8 ms | 0.66 | 179.2 ms | 294.1 ms | 0.61 | 203.4 ms | 0.88 |
+| q7 | 379.5 ms | 585.8 ms | 0.65 | 377.5 ms | 615.2 ms | 0.61 | 287.6 ms | 1.32 |
+| q8 | 151.0 ms | 226.2 ms | 0.67 | 150.4 ms | 253.5 ms | 0.59 | 141.9 ms | 1.06 |
+| q9 | 1,483.6 ms | 1,743.2 ms | 0.85 | 1,476.5 ms | 1,770.1 ms | 0.83 | 750.9 ms | 1.98 |
+| q10 | 271.5 ms | 389.0 ms | 0.70 | 270.1 ms | 417.2 ms | 0.65 | 167.3 ms | 1.62 |
+| q11 | 49.8 ms | 61.4 ms | 0.81 | 49.5 ms | 67.7 ms | 0.73 | 61.5 ms | 0.81 |
+| q12 | 412.6 ms | 854.9 ms | 0.48 | 410.7 ms | 880.7 ms | 0.47 | 253.6 ms | 1.63 |
+| q13 | 666.3 ms | 839.8 ms | 0.79 | 663.0 ms | 843.9 ms | 0.79 | 825.6 ms | 0.81 |
+| q14 | 136.5 ms | 141.6 ms | 0.96 | 135.8 ms | 159.8 ms | 0.85 | 95.1 ms | 1.44 |
+| q15 | 163.0 ms | 331.9 ms | 0.49 | 162.7 ms | 348.1 ms | 0.47 | 333.9 ms | 0.49 |
+| q16 | 200.9 ms | 267.9 ms | 0.75 | 198.2 ms | 273.4 ms | 0.72 | 105.3 ms | 1.91 |
+| q17 | 20.7 ms | 551.2 ms | 0.04 | 20.8 ms | 569.9 ms | 0.04 | 554.7 ms | 0.04 |
+| q18 | 532.5 ms | 2,753.9 ms | 0.19 | 530.2 ms | 2,722.6 ms | 0.19 | 2,933.0 ms | 0.18 |
+| q19 | 29.0 ms | 40.2 ms | 0.72 | 29.1 ms | 53.6 ms | 0.54 | 37.5 ms | 0.77 |
+| q20 | 28.1 ms | 125.8 ms | 0.22 | 28.1 ms | 149.3 ms | 0.19 | 127.8 ms | 0.22 |
+| q21 | 631.6 ms | 818.4 ms | 0.77 | 628.6 ms | 846.4 ms | 0.74 | 269.6 ms | 2.34 |
+| q22 | 47.5 ms | 88.4 ms | 0.54 | 47.4 ms | 94.1 ms | 0.50 | 49.5 ms | 0.96 |
+| **sum** | **7,249.5 ms** | **14,670.4 ms** | **0.49** | **7,214.9 ms** | **15,033.8 ms** | **0.48** | **8,839.0 ms** | **0.82** |
+| **geomean** | | | **0.49** | | | **0.46** | | **0.80** |
 
 ### OLTP
 
@@ -354,38 +353,38 @@ LexDB (1 process) vs PostgreSQL 18 (4 cores):
 
 | workload | threads | LexDB TPS | PG TPS | TPS ratio | LexDB p95 (ms) | PG p95 (ms) | LexDB CPU µs/tx | PG CPU µs/tx | CPU ratio | LexDB err | PG err |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `oltp_point_select` | 1 | 67,630 | 65,124 | 1.04 | 0.02 | 0.02 | 14.7 | 10.1 | 1.46 | 0 | 0 |
-| `oltp_point_select` | 8 | 120,273 | 369,540 | 0.33 | 0.08 | 0.03 | 8.3 | 10.7 | 0.77 | 0 | 0 |
-| `oltp_point_select` | 32 | 117,257 | 334,053 | 0.35 | 0.32 | 0.15 | 8.5 | 11.9 | 0.71 | 0 | 0 |
-| `oltp_read_only` | 1 | 2,600 | 2,418 | 1.08 | 0.46 | 0.43 | 380.8 | 326.2 | 1.17 | 0 | 0 |
-| `oltp_read_only` | 8 | 3,598 | 11,547 | 0.31 | 2.66 | 0.80 | 276.6 | 341.0 | 0.81 | 0 | 0 |
-| `oltp_read_only` | 32 | 3,420 | 10,241 | 0.33 | 10.09 | 4.18 | 291.2 | 389.9 | 0.75 | 0 | 0 |
-| `oltp_read_write` (`SERIALIZABLE`) | 1 | 1,099 | 829 | 1.33 | 1.08 | 1.32 | 709.3 | 565.8 | 1.25 | 0 | 0 |
-| `oltp_read_write` (`SERIALIZABLE`) | 8 | 1,255 | 4,082 | 0.31 | 12.75 | 2.22 | 791.4 | 607.1 | 1.30 | 5,938 | 14 |
-| `oltp_read_write` (`SERIALIZABLE`) | 32 | 795 | 5,553 | 0.14 | 101.13 | 8.28 | 1,253.9 | 690.3 | 1.82 | 12,429 | 66 |
-| `oltp_read_write` (`READ COMMITTED`) | 1 | 1,083 | 829 | 1.31 | 1.08 | 1.32 | 715.4 | 565.8 | 1.26 | 0 | 0 |
-| `oltp_read_write` (`READ COMMITTED`) | 8 | 1,689 | 4,082 | 0.41 | 5.47 | 2.22 | 588.5 | 607.1 | 0.97 | 0 | 14 |
-| `oltp_read_write` (`READ COMMITTED`) | 32 | 1,942 | 5,553 | 0.35 | 17.95 | 8.28 | 514.4 | 690.3 | 0.75 | 0 | 66 |
-| `oltp_write_only` | 1 | 2,457 | 1,326 | 1.85 | 0.50 | 0.80 | 222.8 | 200.4 | 1.11 | 0 | 0 |
-| `oltp_write_only` | 8 | 7,199 | 5,964 | 1.21 | 1.58 | 1.39 | 137.4 | 152.4 | 0.90 | 0 | 28 |
-| `oltp_write_only` | 32 | 5,680 | 18,505 | 0.31 | 9.73 | 2.35 | 175.4 | 137.4 | 1.28 | 0 | 318 |
-| `oltp_update_index` | 1 | 3,260 | 1,501 | 2.17 | 0.43 | 0.70 | 124.5 | 138.5 | 0.90 | 0 | 0 |
-| `oltp_update_index` | 8 | 14,791 | 5,882 | 2.51 | 0.64 | 1.96 | 55.8 | 82.8 | 0.67 | 0 | 0 |
-| `oltp_update_index` | 32 | 24,533 | 20,992 | 1.17 | 1.79 | 2.22 | 41.0 | 55.0 | 0.75 | 0 | 0 |
-| `oltp_update_non_index` | 1 | 3,834 | 1,381 | 2.78 | 0.30 | 0.80 | 72.6 | 139.2 | 0.52 | 0 | 0 |
-| `oltp_update_non_index` | 8 | 18,125 | 5,898 | 3.07 | 0.48 | 1.96 | 30.9 | 70.5 | 0.44 | 0 | 0 |
-| `oltp_update_non_index` | 32 | 50,520 | 23,015 | 2.20 | 0.81 | 1.55 | 19.7 | 48.6 | 0.41 | 0 | 0 |
+| `oltp_point_select` | 1 | 70,740 | 65,124 | 1.09 | 0.02 | 0.02 | 14.1 | 10.1 | 1.39 | 0 | 0 |
+| `oltp_point_select` | 8 | 126,037 | 369,540 | 0.34 | 0.07 | 0.03 | 7.9 | 10.7 | 0.74 | 0 | 0 |
+| `oltp_point_select` | 32 | 125,547 | 334,053 | 0.38 | 0.27 | 0.15 | 7.9 | 11.9 | 0.66 | 0 | 0 |
+| `oltp_read_only` | 1 | 2,777 | 2,418 | 1.15 | 0.37 | 0.43 | 357.9 | 326.2 | 1.10 | 0 | 0 |
+| `oltp_read_only` | 8 | 3,873 | 11,547 | 0.34 | 2.39 | 0.80 | 257.1 | 341.0 | 0.75 | 0 | 0 |
+| `oltp_read_only` | 32 | 3,748 | 10,241 | 0.37 | 9.06 | 4.18 | 265.9 | 389.9 | 0.68 | 0 | 0 |
+| `oltp_read_write` (`SERIALIZABLE`) | 1 | 1,173 | 829 | 1.41 | 0.92 | 1.32 | 650.5 | 565.8 | 1.15 | 0 | 0 |
+| `oltp_read_write` (`SERIALIZABLE`) | 8 | 1,381 | 4,082 | 0.34 | 11.45 | 2.22 | 723.6 | 607.1 | 1.19 | 6,577 | 14 |
+| `oltp_read_write` (`SERIALIZABLE`) | 32 | 858 | 5,553 | 0.15 | 89.16 | 8.28 | 1,162.8 | 690.3 | 1.68 | 13,324 | 66 |
+| `oltp_read_write` (`READ COMMITTED`) | 1 | 1,144 | 829 | 1.38 | 0.99 | 1.32 | 666.8 | 565.8 | 1.18 | 0 | 0 |
+| `oltp_read_write` (`READ COMMITTED`) | 8 | 1,920 | 4,082 | 0.47 | 5.09 | 2.22 | 517.0 | 607.1 | 0.85 | 0 | 14 |
+| `oltp_read_write` (`READ COMMITTED`) | 32 | 1,984 | 5,553 | 0.36 | 19.65 | 8.28 | 501.0 | 690.3 | 0.73 | 0 | 66 |
+| `oltp_write_only` | 1 | 2,588 | 1,326 | 1.95 | 0.44 | 0.80 | 200.2 | 200.4 | 1.00 | 0 | 0 |
+| `oltp_write_only` | 8 | 7,669 | 5,964 | 1.29 | 1.37 | 1.39 | 130.8 | 152.4 | 0.86 | 0 | 28 |
+| `oltp_write_only` | 32 | 9,208 | 18,505 | 0.50 | 3.89 | 2.35 | 109.0 | 137.4 | 0.79 | 0 | 318 |
+| `oltp_update_index` | 1 | 3,478 | 1,501 | 2.32 | 0.39 | 0.70 | 107.9 | 138.5 | 0.78 | 0 | 0 |
+| `oltp_update_index` | 8 | 14,584 | 5,882 | 2.48 | 0.65 | 1.96 | 55.0 | 82.8 | 0.66 | 0 | 0 |
+| `oltp_update_index` | 32 | 22,503 | 20,992 | 1.07 | 2.57 | 2.22 | 44.4 | 55.0 | 0.81 | 0 | 0 |
+| `oltp_update_non_index` | 1 | 3,884 | 1,381 | 2.81 | 0.30 | 0.80 | 70.6 | 139.2 | 0.51 | 0 | 0 |
+| `oltp_update_non_index` | 8 | 18,540 | 5,898 | 3.14 | 0.46 | 1.96 | 28.1 | 70.5 | 0.40 | 0 | 0 |
+| `oltp_update_non_index` | 32 | 53,876 | 23,015 | 2.34 | 0.86 | 1.55 | 18.6 | 48.6 | 0.38 | 0 | 0 |
 
 LexDB (3 read replicas, 4 processes) vs PostgreSQL 18 (4 cores) — read workloads:
 
 | workload | threads | LexDB 3-rep TPS | PG TPS | TPS ratio | LexDB p95 (ms) | PG p95 (ms) | LexDB CPU µs/tx | PG CPU µs/tx | CPU ratio |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `oltp_point_select` | 1 | 67,581 | 65,124 | 1.04 | 0.02 | 0.02 | 14.7 | 10.1 | 1.46 |
-| `oltp_point_select` | 8 | 309,079 | 369,540 | 0.84 | 0.05 | 0.03 | 9.7 | 10.7 | 0.90 |
-| `oltp_point_select` | 32 | 339,338 | 334,053 | 1.02 | 0.13 | 0.15 | 8.8 | 11.9 | 0.74 |
-| `oltp_read_only` | 1 | 2,537 | 2,418 | 1.05 | 0.46 | 0.43 | 387.7 | 326.2 | 1.19 |
-| `oltp_read_only` | 8 | 9,302 | 11,547 | 0.81 | 1.50 | 0.80 | 319.8 | 341.0 | 0.94 |
-| `oltp_read_only` | 32 | 10,457 | 10,241 | 1.02 | 3.68 | 4.18 | 285.6 | 389.9 | 0.73 |
+| `oltp_point_select` | 1 | 71,400 | 65,124 | 1.10 | 0.01 | 0.02 | 13.9 | 10.1 | 1.38 |
+| `oltp_point_select` | 8 | 333,437 | 369,540 | 0.90 | 0.05 | 0.03 | 9.0 | 10.7 | 0.84 |
+| `oltp_point_select` | 32 | 371,059 | 334,053 | 1.11 | 0.12 | 0.15 | 8.1 | 11.9 | 0.67 |
+| `oltp_read_only` | 1 | 2,708 | 2,418 | 1.12 | 0.42 | 0.43 | 366.0 | 326.2 | 1.12 |
+| `oltp_read_only` | 8 | 9,162 | 11,547 | 0.79 | 1.67 | 0.80 | 313.2 | 341.0 | 0.92 |
+| `oltp_read_only` | 32 | 10,854 | 10,241 | 1.06 | 3.49 | 4.18 | 275.2 | 389.9 | 0.71 |
 
 ### ClickBench (1M rows)
 
@@ -396,58 +395,58 @@ Load (`COPY` 1M × 105 cols): LexDB 17.00 s vs PostgreSQL 6.42 s; `ANALYZE`: Lex
 
 | | LexDB (one core) | PostgreSQL, one core | PostgreSQL, four processes |
 |---|---:|---:|---:|
-| all 43 queries, summed (wall) | 20,127 ms | 22,363 ms | 11,326 ms |
-| geometric mean of LexDB / PostgreSQL (wall) | | 0.83 | 1.83 |
-| geometric mean of LexDB / PostgreSQL (CPU) | | 0.78 | |
-| queries level or ahead of one core (within 10%) | | 34 of 43 | |
+| all 43 queries, summed (wall) | 18,790 ms | 22,363 ms | 11,326 ms |
+| geometric mean of LexDB / PostgreSQL (wall) | | 0.79 | 1.76 |
+| geometric mean of LexDB / PostgreSQL (CPU) | | 0.75 | |
+| queries level or ahead of one core (within 10%) | | 36 of 43 | |
 
 | query | LexDB wall | PG 1-core wall | LexDB / PG1 | LexDB CPU | PG1 CPU | CPU ratio | PG 4-proc wall | LexDB / PG4 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| q0 | 52.1 ms | 87.5 ms | 0.60 | 52.1 ms | 109.9 ms | 0.47 | 34.7 ms | 1.50 |
-| q1 | 219.1 ms | 342.0 ms | 0.64 | 218.1 ms | 361.5 ms | 0.60 | 106.3 ms | 2.06 |
-| q2 | 215.8 ms | 392.2 ms | 0.55 | 214.7 ms | 411.9 ms | 0.52 | 107.7 ms | 2.00 |
-| q3 | 269.4 ms | 256.2 ms | 1.05 | 268.1 ms | 276.6 ms | 0.97 | 80.0 ms | 3.37 |
-| q4 | 166.4 ms | 304.0 ms | 0.55 | 165.4 ms | 323.7 ms | 0.51 | 302.4 ms | 0.55 |
-| q5 | 277.8 ms | 429.8 ms | 0.65 | 276.5 ms | 450.0 ms | 0.61 | 419.5 ms | 0.66 |
-| q6 | 199.3 ms | 252.1 ms | 0.79 | 198.3 ms | 273.4 ms | 0.73 | 79.3 ms | 2.51 |
-| q7 | 216.3 ms | 337.2 ms | 0.64 | 215.2 ms | 357.9 ms | 0.60 | 107.1 ms | 2.02 |
-| q8 | 193.8 ms | 489.4 ms | 0.40 | 192.8 ms | 509.3 ms | 0.38 | 479.0 ms | 0.40 |
-| q9 | 287.7 ms | 624.1 ms | 0.46 | 286.3 ms | 643.1 ms | 0.45 | 604.6 ms | 0.48 |
-| q10 | 227.3 ms | 347.7 ms | 0.65 | 226.2 ms | 368.2 ms | 0.61 | 101.3 ms | 2.24 |
-| q11 | 228.4 ms | 352.4 ms | 0.65 | 227.1 ms | 371.1 ms | 0.61 | 103.8 ms | 2.20 |
-| q12 | 264.3 ms | 365.6 ms | 0.72 | 263.1 ms | 385.4 ms | 0.68 | 113.6 ms | 2.33 |
-| q13 | 280.7 ms | 381.5 ms | 0.74 | 279.3 ms | 402.8 ms | 0.69 | 143.7 ms | 1.95 |
-| q14 | 288.0 ms | 363.1 ms | 0.79 | 286.4 ms | 383.8 ms | 0.75 | 346.7 ms | 0.83 |
-| q15 | 228.1 ms | 336.5 ms | 0.68 | 226.9 ms | 359.0 ms | 0.63 | 132.2 ms | 1.73 |
-| q16 | 426.4 ms | 468.6 ms | 0.91 | 424.3 ms | 488.9 ms | 0.87 | 442.8 ms | 0.96 |
-| q17 | 465.1 ms | 444.5 ms | 1.05 | 462.9 ms | 464.2 ms | 1.00 | 162.0 ms | 2.87 |
-| q18 | 1,014.0 ms | 674.1 ms | 1.50 | 1,009.5 ms | 692.9 ms | 1.46 | 635.6 ms | 1.60 |
-| q19 | 150.5 ms | 238.6 ms | 0.63 | 150.0 ms | 259.3 ms | 0.58 | 73.6 ms | 2.04 |
-| q20 | 286.1 ms | 375.3 ms | 0.76 | 284.8 ms | 397.4 ms | 0.72 | 106.5 ms | 2.69 |
-| q21 | 325.0 ms | 456.5 ms | 0.71 | 323.6 ms | 476.3 ms | 0.68 | 134.2 ms | 2.42 |
-| q22 | 618.1 ms | 512.7 ms | 1.21 | 615.5 ms | 533.1 ms | 1.15 | 137.7 ms | 4.49 |
-| q23 | 322.8 ms | 370.6 ms | 0.87 | 321.3 ms | 390.8 ms | 0.82 | 104.2 ms | 3.10 |
-| q24 | 258.5 ms | 349.7 ms | 0.74 | 257.3 ms | 370.1 ms | 0.70 | 100.6 ms | 2.57 |
-| q25 | 252.9 ms | 347.4 ms | 0.73 | 251.7 ms | 367.8 ms | 0.68 | 100.5 ms | 2.52 |
-| q26 | 257.1 ms | 351.7 ms | 0.73 | 255.9 ms | 371.6 ms | 0.69 | 100.9 ms | 2.55 |
-| q27 | 716.4 ms | 501.9 ms | 1.43 | 713.4 ms | 523.8 ms | 1.36 | 169.1 ms | 4.24 |
-| q28 | 3,101.8 ms | 4,030.8 ms | 0.77 | 3,088.6 ms | 4,039.0 ms | 0.76 | 1,057.0 ms | 2.93 |
-| q29 | 753.3 ms | 852.2 ms | 0.88 | 750.1 ms | 871.6 ms | 0.86 | 336.3 ms | 2.24 |
-| q30 | 304.0 ms | 362.4 ms | 0.84 | 302.5 ms | 382.1 ms | 0.79 | 353.7 ms | 0.86 |
-| q31 | 353.4 ms | 385.5 ms | 0.92 | 351.6 ms | 406.5 ms | 0.86 | 375.7 ms | 0.94 |
-| q32 | 1,306.9 ms | 917.0 ms | 1.43 | 1,299.7 ms | 935.4 ms | 1.39 | 905.7 ms | 1.44 |
-| q33 | 670.9 ms | 479.2 ms | 1.40 | 667.4 ms | 498.1 ms | 1.34 | 461.8 ms | 1.45 |
-| q34 | 777.0 ms | 487.0 ms | 1.60 | 773.1 ms | 506.5 ms | 1.53 | 466.9 ms | 1.66 |
-| q35 | 360.6 ms | 396.7 ms | 0.91 | 358.9 ms | 416.7 ms | 0.86 | 156.4 ms | 2.31 |
-| q36 | 621.2 ms | 548.0 ms | 1.13 | 618.1 ms | 566.9 ms | 1.09 | 246.7 ms | 2.52 |
-| q37 | 656.4 ms | 494.2 ms | 1.33 | 653.4 ms | 514.5 ms | 1.27 | 169.9 ms | 3.86 |
-| q38 | 298.2 ms | 404.5 ms | 0.74 | 296.8 ms | 425.5 ms | 0.70 | 145.8 ms | 2.05 |
-| q39 | 943.6 ms | 536.6 ms | 1.76 | 938.7 ms | 556.1 ms | 1.69 | 532.5 ms | 1.77 |
-| q40 | 435.5 ms | 621.5 ms | 0.70 | 433.2 ms | 641.0 ms | 0.68 | 220.6 ms | 1.97 |
-| q41 | 398.1 ms | 599.1 ms | 0.66 | 396.2 ms | 618.9 ms | 0.64 | 198.9 ms | 2.00 |
-| q42 | 438.9 ms | 495.3 ms | 0.89 | 436.5 ms | 515.4 ms | 0.85 | 168.0 ms | 2.61 |
-| **sum** | **20,127.2 ms** | **22,362.9 ms** | **0.90** | **20,031.5 ms** | **23,218.0 ms** | **0.86** | **11,325.5 ms** | **1.78** |
-| **geomean** | | | **0.83** | | | **0.78** | | **1.83** |
+| q0 | 50.3 ms | 87.5 ms | 0.57 | 50.2 ms | 109.9 ms | 0.46 | 34.7 ms | 1.45 |
+| q1 | 215.9 ms | 342.0 ms | 0.63 | 215.0 ms | 361.5 ms | 0.59 | 106.3 ms | 2.03 |
+| q2 | 212.3 ms | 392.2 ms | 0.54 | 211.4 ms | 411.9 ms | 0.51 | 107.7 ms | 1.97 |
+| q3 | 268.6 ms | 256.2 ms | 1.05 | 267.5 ms | 276.6 ms | 0.97 | 80.0 ms | 3.36 |
+| q4 | 165.6 ms | 304.0 ms | 0.54 | 164.9 ms | 323.7 ms | 0.51 | 302.4 ms | 0.55 |
+| q5 | 274.2 ms | 429.8 ms | 0.64 | 272.9 ms | 450.0 ms | 0.61 | 419.5 ms | 0.65 |
+| q6 | 194.4 ms | 252.1 ms | 0.77 | 193.6 ms | 273.4 ms | 0.71 | 79.3 ms | 2.45 |
+| q7 | 213.7 ms | 337.2 ms | 0.63 | 212.6 ms | 357.9 ms | 0.59 | 107.1 ms | 2.00 |
+| q8 | 187.2 ms | 489.4 ms | 0.38 | 186.4 ms | 509.3 ms | 0.37 | 479.0 ms | 0.39 |
+| q9 | 275.1 ms | 624.1 ms | 0.44 | 273.9 ms | 643.1 ms | 0.43 | 604.6 ms | 0.46 |
+| q10 | 226.5 ms | 347.7 ms | 0.65 | 225.6 ms | 368.2 ms | 0.61 | 101.3 ms | 2.24 |
+| q11 | 230.2 ms | 352.4 ms | 0.65 | 229.2 ms | 371.1 ms | 0.62 | 103.8 ms | 2.22 |
+| q12 | 259.7 ms | 365.6 ms | 0.71 | 258.5 ms | 385.4 ms | 0.67 | 113.6 ms | 2.29 |
+| q13 | 277.0 ms | 381.5 ms | 0.73 | 275.8 ms | 402.8 ms | 0.68 | 143.7 ms | 1.93 |
+| q14 | 279.6 ms | 363.1 ms | 0.77 | 278.4 ms | 383.8 ms | 0.73 | 346.7 ms | 0.81 |
+| q15 | 218.3 ms | 336.5 ms | 0.65 | 217.2 ms | 359.0 ms | 0.61 | 132.2 ms | 1.65 |
+| q16 | 392.6 ms | 468.6 ms | 0.84 | 390.7 ms | 488.9 ms | 0.80 | 442.8 ms | 0.89 |
+| q17 | 424.9 ms | 444.5 ms | 0.96 | 422.9 ms | 464.2 ms | 0.91 | 162.0 ms | 2.62 |
+| q18 | 870.2 ms | 674.1 ms | 1.29 | 865.8 ms | 692.9 ms | 1.25 | 635.6 ms | 1.37 |
+| q19 | 152.7 ms | 238.6 ms | 0.64 | 152.1 ms | 259.3 ms | 0.59 | 73.6 ms | 2.07 |
+| q20 | 299.9 ms | 375.3 ms | 0.80 | 298.6 ms | 397.4 ms | 0.75 | 106.5 ms | 2.82 |
+| q21 | 339.0 ms | 456.5 ms | 0.74 | 337.5 ms | 476.3 ms | 0.71 | 134.2 ms | 2.53 |
+| q22 | 621.1 ms | 512.7 ms | 1.21 | 618.5 ms | 533.1 ms | 1.16 | 137.7 ms | 4.51 |
+| q23 | 338.5 ms | 370.6 ms | 0.91 | 336.9 ms | 390.8 ms | 0.86 | 104.2 ms | 3.25 |
+| q24 | 252.4 ms | 349.7 ms | 0.72 | 251.2 ms | 370.1 ms | 0.68 | 100.6 ms | 2.51 |
+| q25 | 243.4 ms | 347.4 ms | 0.70 | 242.2 ms | 367.8 ms | 0.66 | 100.5 ms | 2.42 |
+| q26 | 256.3 ms | 351.7 ms | 0.73 | 255.1 ms | 371.6 ms | 0.69 | 100.9 ms | 2.54 |
+| q27 | 497.1 ms | 501.9 ms | 0.99 | 494.7 ms | 523.8 ms | 0.94 | 169.1 ms | 2.94 |
+| q28 | 2,735.0 ms | 4,030.8 ms | 0.68 | 2,723.2 ms | 4,039.0 ms | 0.67 | 1,057.0 ms | 2.59 |
+| q29 | 748.4 ms | 852.2 ms | 0.88 | 745.3 ms | 871.6 ms | 0.86 | 336.3 ms | 2.23 |
+| q30 | 294.2 ms | 362.4 ms | 0.81 | 292.8 ms | 382.1 ms | 0.77 | 353.7 ms | 0.83 |
+| q31 | 333.8 ms | 385.5 ms | 0.87 | 332.3 ms | 406.5 ms | 0.82 | 375.7 ms | 0.89 |
+| q32 | 1,211.9 ms | 917.0 ms | 1.32 | 1,205.4 ms | 935.4 ms | 1.29 | 905.7 ms | 1.34 |
+| q33 | 597.2 ms | 479.2 ms | 1.25 | 594.0 ms | 498.1 ms | 1.19 | 461.8 ms | 1.29 |
+| q34 | 710.1 ms | 487.0 ms | 1.46 | 706.2 ms | 506.5 ms | 1.39 | 466.9 ms | 1.52 |
+| q35 | 331.0 ms | 396.7 ms | 0.83 | 329.5 ms | 416.7 ms | 0.79 | 156.4 ms | 2.12 |
+| q36 | 592.2 ms | 548.0 ms | 1.08 | 589.3 ms | 566.9 ms | 1.04 | 246.7 ms | 2.40 |
+| q37 | 638.4 ms | 494.2 ms | 1.29 | 635.3 ms | 514.5 ms | 1.23 | 169.9 ms | 3.76 |
+| q38 | 295.0 ms | 404.5 ms | 0.73 | 293.7 ms | 425.5 ms | 0.69 | 145.8 ms | 2.02 |
+| q39 | 837.2 ms | 536.6 ms | 1.56 | 833.0 ms | 556.1 ms | 1.50 | 532.5 ms | 1.57 |
+| q40 | 416.3 ms | 621.5 ms | 0.67 | 414.4 ms | 641.0 ms | 0.65 | 220.6 ms | 1.89 |
+| q41 | 386.1 ms | 599.1 ms | 0.64 | 384.4 ms | 618.9 ms | 0.62 | 198.9 ms | 1.94 |
+| q42 | 426.2 ms | 495.3 ms | 0.86 | 424.2 ms | 515.4 ms | 0.82 | 168.0 ms | 2.54 |
+| **sum** | **18,789.7 ms** | **22,362.9 ms** | **0.84** | **18,702.3 ms** | **23,218.0 ms** | **0.81** | **11,325.5 ms** | **1.66** |
+| **geomean** | | | **0.79** | | | **0.75** | | **1.76** |
 
 ### Analytic queries
 

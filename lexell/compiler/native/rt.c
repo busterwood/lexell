@@ -124,14 +124,52 @@ void* memset(void* d, int c, size_t n) {
     __asm__ volatile("rep stosb" : "+D"(d), "+c"(n) : "a"(c) : "memory");
     return r;
 }
+#if defined(__SSE2__)
+typedef char rt_v16 __attribute__((vector_size(16)));
+static inline rt_v16 rt_v16_at(const void* p) { rt_v16 v; __builtin_memcpy(&v, p, 16); return v; }
+static inline rt_v16 rt_v16_of(uint8_t c) { rt_v16 v = {0}; return v + (char)c; }
+static inline unsigned rt_v16_mask(rt_v16 v) { return (unsigned)__builtin_ia32_pmovmskb128(v); }
+#endif
+#if defined(__AVX2__)
+typedef char rt_v32 __attribute__((vector_size(32)));
+static inline rt_v32 rt_v32_at(const void* p) { rt_v32 v; __builtin_memcpy(&v, p, 32); return v; }
+static inline rt_v32 rt_v32_of(uint8_t c) { rt_v32 v = {0}; return v + (char)c; }
+static inline unsigned rt_v32_mask(rt_v32 v) { return (unsigned)__builtin_ia32_pmovmskb256(v); }
+#endif
 int memcmp(const void* a, const void* b, size_t n) {
     const unsigned char* p = a;
     const unsigned char* q = b;
-    for (; n >= 8; n -= 8, p += 8, q += 8) {       /* equal words first, then the bytes */
+#if defined(__AVX2__)
+    for (; n >= 32; n -= 32, p += 32, q += 32) {
+        unsigned m = rt_v32_mask(rt_v32_at(p) == rt_v32_at(q));
+        if (m != 0xffffffffu) {
+            int i = __builtin_ctz(~m);
+            return p[i] < q[i] ? -1 : 1;
+        }
+    }
+#endif
+#if defined(__SSE2__)
+    if (n >= 16) {
+        unsigned m = rt_v16_mask(rt_v16_at(p) == rt_v16_at(q));
+        if (m != 0xffffu) {
+            int i = __builtin_ctz(~m);
+            return p[i] < q[i] ? -1 : 1;
+        }
+        n -= 16; p += 16; q += 16;
+    }
+#endif
+    for (; n >= 8; n -= 8, p += 8, q += 8) {
         uint64_t x, y;
         __builtin_memcpy(&x, p, 8);
         __builtin_memcpy(&y, q, 8);
-        if (x != y) break;
+        if (x != y) return __builtin_bswap64(x) < __builtin_bswap64(y) ? -1 : 1;
+    }
+    if (n >= 4) {
+        uint32_t x, y;
+        __builtin_memcpy(&x, p, 4);
+        __builtin_memcpy(&y, q, 4);
+        if (x != y) return __builtin_bswap32(x) < __builtin_bswap32(y) ? -1 : 1;
+        n -= 4; p += 4; q += 4;
     }
     for (; n; n--, p++, q++)
         if (*p != *q) return *p < *q ? -1 : 1;
@@ -139,8 +177,33 @@ int memcmp(const void* a, const void* b, size_t n) {
 }
 void* memchr(const void* s, int c, size_t n) {
     const unsigned char* p = s;
-    for (; n; n--, p++)
-        if (*p == (unsigned char)c) return (void*)p;
+    const unsigned char* e = p + n;
+    uint8_t b = (uint8_t)c;
+#if defined(__AVX2__)
+    if (n >= 32) {
+        rt_v32 vc = rt_v32_of(b);
+        for (; p + 64 <= e; p += 64) {
+            unsigned m0 = rt_v32_mask(rt_v32_at(p) == vc);
+            unsigned m1 = rt_v32_mask(rt_v32_at(p + 32) == vc);
+            if (m0 | m1) return (void*)(m0 ? p + __builtin_ctz(m0) : p + 32 + __builtin_ctz(m1));
+        }
+        for (; p + 32 <= e; p += 32) {
+            unsigned m = rt_v32_mask(rt_v32_at(p) == vc);
+            if (m) return (void*)(p + __builtin_ctz(m));
+        }
+    }
+#endif
+#if defined(__SSE2__)
+    if (p + 16 <= e) {
+        rt_v16 vc16 = rt_v16_of(b);
+        for (; p + 16 <= e; p += 16) {
+            unsigned m = rt_v16_mask(rt_v16_at(p) == vc16);
+            if (m) return (void*)(p + __builtin_ctz(m));
+        }
+    }
+#endif
+    for (; p < e; p++)
+        if (*p == b) return (void*)p;
     return 0;
 }
 size_t strlen(const char* s) {
@@ -1208,6 +1271,13 @@ bool rt_str_eq(lxl_str a, lxl_str b) {
         }
         return n == 0 || (p[0] == q[0] && p[n / 2] == q[n / 2] && p[n - 1] == q[n - 1]);
     }
+#if defined(__SSE2__)
+    if (n <= 32) {
+        unsigned m0 = rt_v16_mask(rt_v16_at(p) == rt_v16_at(q));
+        unsigned m1 = rt_v16_mask(rt_v16_at(p + n - 16) == rt_v16_at(q + n - 16));
+        return (m0 & m1) == 0xffffu;
+    }
+#endif
     return memcmp(p, q, n) == 0;
 }
 /* Short strings (a database's keys: 8 to 16 bytes mostly) compared 8 bytes at a time as
@@ -1472,31 +1542,11 @@ static const uint8_t rt_byte_rank[256] = {   /* 0 rarest .. 255 most common, in 
      79,  80, 158, 115, 116,  81,  82,  83,  84,  85,  86,  87,  88,  89,  90, 138,
     147,  91,  92,  93,  94,  95,  96,  97,  98,  99, 100, 101, 102, 103, 104, 117,
 };
-#if defined(__SSE2__)
-typedef char rt_v16 __attribute__((vector_size(16)));
-static inline rt_v16 rt_v16_at(const char* p) { rt_v16 v; __builtin_memcpy(&v, p, 16); return v; }
-static inline rt_v16 rt_v16_of(uint8_t c) { rt_v16 v = {0}; return v + (char)c; }
-static inline unsigned rt_v16_mask(rt_v16 v) { return (unsigned)__builtin_ia32_pmovmskb128(v); }
-#endif
 static int64_t rt_find1(const char* s, int64_t from, int64_t n, uint8_t c) {
     if (from < 0) from = 0;
     if (from >= n) return -1;
-    const char* p = s + from;
-    const char* e = s + n;
-#if defined(__SSE2__)
-    rt_v16 vc = rt_v16_of(c);
-    for (; p + 32 <= e; p += 32) {
-        unsigned m = rt_v16_mask(rt_v16_at(p) == vc) | rt_v16_mask(rt_v16_at(p + 16) == vc) << 16;
-        if (m) return p - s + __builtin_ctz(m);
-    }
-    for (; p + 16 <= e; p += 16) {
-        unsigned m = rt_v16_mask(rt_v16_at(p) == vc);
-        if (m) return p - s + __builtin_ctz(m);
-    }
-#endif
-    for (; p < e; p++)
-        if ((uint8_t)*p == c) return p - s;
-    return -1;
+    const char* p = memchr(s + from, c, (size_t)(n - from));
+    return p ? p - s : -1;
 }
 static int64_t rt_find_set(const char* s, int64_t from, int64_t n, const char* set, int64_t k) {
     if (from < 0) from = 0;
@@ -1506,12 +1556,25 @@ static int64_t rt_find_set(const char* s, int64_t from, int64_t n, const char* s
     const char* e = s + n;
 #if defined(__SSE2__)
     if (k <= 4) {
-        rt_v16 v0 = rt_v16_of((uint8_t)set[0]), v1 = rt_v16_of((uint8_t)set[1]);
-        rt_v16 v2 = rt_v16_of((uint8_t)set[k > 2 ? 2 : 1]), v3 = rt_v16_of((uint8_t)set[k > 3 ? 3 : 1]);
-        for (; p + 16 <= e; p += 16) {
-            rt_v16 x = rt_v16_at(p);
-            unsigned m = rt_v16_mask((x == v0) | (x == v1) | (x == v2) | (x == v3));
-            if (m) return p - s + __builtin_ctz(m);
+#if defined(__AVX2__)
+        if (p + 32 <= e) {
+            rt_v32 w0 = rt_v32_of((uint8_t)set[0]), w1 = rt_v32_of((uint8_t)set[1]);
+            rt_v32 w2 = rt_v32_of((uint8_t)set[k > 2 ? 2 : 1]), w3 = rt_v32_of((uint8_t)set[k > 3 ? 3 : 1]);
+            for (; p + 32 <= e; p += 32) {
+                rt_v32 x = rt_v32_at(p);
+                unsigned m = rt_v32_mask((x == w0) | (x == w1) | (x == w2) | (x == w3));
+                if (m) return p - s + __builtin_ctz(m);
+            }
+        }
+#endif
+        if (p + 16 <= e) {
+            rt_v16 v0 = rt_v16_of((uint8_t)set[0]), v1 = rt_v16_of((uint8_t)set[1]);
+            rt_v16 v2 = rt_v16_of((uint8_t)set[k > 2 ? 2 : 1]), v3 = rt_v16_of((uint8_t)set[k > 3 ? 3 : 1]);
+            for (; p + 16 <= e; p += 16) {
+                rt_v16 x = rt_v16_at(p);
+                unsigned m = rt_v16_mask((x == v0) | (x == v1) | (x == v2) | (x == v3));
+                if (m) return p - s + __builtin_ctz(m);
+            }
         }
         for (; p < e; p++)
             for (int64_t i = 0; i < k; i++)
@@ -1546,14 +1609,29 @@ static int64_t rt_find_pair(const char* s, int64_t from, int64_t n, int64_t i1, 
     const char* last = s + n - 1 - hi;
 #if defined(__SSE2__)
     if (k1 <= 4 && k2 <= 4) {
-        rt_v16 a0 = rt_v16_of((uint8_t)s1[0]), a1 = rt_v16_of((uint8_t)s1[k1 > 1 ? 1 : 0]);
-        rt_v16 a2 = rt_v16_of((uint8_t)s1[k1 > 2 ? 2 : 0]), a3 = rt_v16_of((uint8_t)s1[k1 > 3 ? 3 : 0]);
-        rt_v16 b0 = rt_v16_of((uint8_t)s2[0]), b1 = rt_v16_of((uint8_t)s2[k2 > 1 ? 1 : 0]);
-        rt_v16 b2 = rt_v16_of((uint8_t)s2[k2 > 2 ? 2 : 0]), b3 = rt_v16_of((uint8_t)s2[k2 > 3 ? 3 : 0]);
-        for (; p + 15 <= last; p += 16) {
-            rt_v16 x = rt_v16_at(p + i1), y = rt_v16_at(p + i2);
-            unsigned m = rt_v16_mask(((x == a0) | (x == a1) | (x == a2) | (x == a3)) & ((y == b0) | (y == b1) | (y == b2) | (y == b3)));
-            if (m) return p - s + __builtin_ctz(m);
+#if defined(__AVX2__)
+        if (p + 31 <= last) {
+            rt_v32 a0 = rt_v32_of((uint8_t)s1[0]), a1 = rt_v32_of((uint8_t)s1[k1 > 1 ? 1 : 0]);
+            rt_v32 a2 = rt_v32_of((uint8_t)s1[k1 > 2 ? 2 : 0]), a3 = rt_v32_of((uint8_t)s1[k1 > 3 ? 3 : 0]);
+            rt_v32 b0 = rt_v32_of((uint8_t)s2[0]), b1 = rt_v32_of((uint8_t)s2[k2 > 1 ? 1 : 0]);
+            rt_v32 b2 = rt_v32_of((uint8_t)s2[k2 > 2 ? 2 : 0]), b3 = rt_v32_of((uint8_t)s2[k2 > 3 ? 3 : 0]);
+            for (; p + 31 <= last; p += 32) {
+                rt_v32 x = rt_v32_at(p + i1), y = rt_v32_at(p + i2);
+                unsigned m = rt_v32_mask(((x == a0) | (x == a1) | (x == a2) | (x == a3)) & ((y == b0) | (y == b1) | (y == b2) | (y == b3)));
+                if (m) return p - s + __builtin_ctz(m);
+            }
+        }
+#endif
+        if (p + 15 <= last) {
+            rt_v16 a0 = rt_v16_of((uint8_t)s1[0]), a1 = rt_v16_of((uint8_t)s1[k1 > 1 ? 1 : 0]);
+            rt_v16 a2 = rt_v16_of((uint8_t)s1[k1 > 2 ? 2 : 0]), a3 = rt_v16_of((uint8_t)s1[k1 > 3 ? 3 : 0]);
+            rt_v16 b0 = rt_v16_of((uint8_t)s2[0]), b1 = rt_v16_of((uint8_t)s2[k2 > 1 ? 1 : 0]);
+            rt_v16 b2 = rt_v16_of((uint8_t)s2[k2 > 2 ? 2 : 0]), b3 = rt_v16_of((uint8_t)s2[k2 > 3 ? 3 : 0]);
+            for (; p + 15 <= last; p += 16) {
+                rt_v16 x = rt_v16_at(p + i1), y = rt_v16_at(p + i2);
+                unsigned m = rt_v16_mask(((x == a0) | (x == a1) | (x == a2) | (x == a3)) & ((y == b0) | (y == b1) | (y == b2) | (y == b3)));
+                if (m) return p - s + __builtin_ctz(m);
+            }
         }
     }
 #endif
@@ -1577,18 +1655,33 @@ static int64_t rt_find_str(const char* s, int64_t from, int64_t n, const char* t
 #if defined(__SSE2__)
     const char* e = s + n;
     int64_t hi = i1 > i2 ? i1 : i2;
-    rt_v16 v1 = rt_v16_of((uint8_t)t[i1]), v2 = rt_v16_of((uint8_t)t[i2]);
-    for (; p + hi + 16 <= e; p += 16) {
-        unsigned m = rt_v16_mask((rt_v16_at(p + i1) == v1) & (rt_v16_at(p + i2) == v2));
-        while (m) {
-            const char* c = p + __builtin_ctz(m);
-            if (c <= last && memcmp(c, t, (size_t)k) == 0) return c - s;
-            m &= m - 1;
+#if defined(__AVX2__)
+    if (p + hi + 32 <= e) {
+        rt_v32 w1 = rt_v32_of((uint8_t)t[i1]), w2 = rt_v32_of((uint8_t)t[i2]);
+        for (; p + hi + 32 <= e; p += 32) {
+            unsigned m = rt_v32_mask((rt_v32_at(p + i1) == w1) & (rt_v32_at(p + i2) == w2));
+            while (m) {
+                const char* c = p + __builtin_ctz(m);
+                if (c <= last && (k == 2 || memcmp(c, t, (size_t)k) == 0)) return c - s;
+                m &= m - 1;
+            }
+        }
+    }
+#endif
+    if (p + hi + 16 <= e) {
+        rt_v16 v1 = rt_v16_of((uint8_t)t[i1]), v2 = rt_v16_of((uint8_t)t[i2]);
+        for (; p + hi + 16 <= e; p += 16) {
+            unsigned m = rt_v16_mask((rt_v16_at(p + i1) == v1) & (rt_v16_at(p + i2) == v2));
+            while (m) {
+                const char* c = p + __builtin_ctz(m);
+                if (c <= last && (k == 2 || memcmp(c, t, (size_t)k) == 0)) return c - s;
+                m &= m - 1;
+            }
         }
     }
 #endif
     for (; p <= last; p++)
-        if (p[i1] == t[i1] && p[i2] == t[i2] && memcmp(p, t, (size_t)k) == 0) return p - s;
+        if (p[i1] == t[i1] && p[i2] == t[i2] && (k == 2 || memcmp(p, t, (size_t)k) == 0)) return p - s;
     return -1;
 }
 int64_t rt_str_find_byte(lxl_str s, int64_t from, uint8_t c) { return rt_find1(RT_SP(s), from, s.len, c); }
