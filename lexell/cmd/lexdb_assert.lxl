@@ -1630,6 +1630,8 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ro
     var ix: []int = []          // the instances to restrict: each with its table and the rows put to it
     var ts: []rc Table = []
     var rs: [][][]Val = []
+    var big: []int = []         // the instances whose table the statements put more than MAX_KEYS rows to: checked BIG_CHUNK at a time
+    var bigW: []int = []        // (their writes, in ws)
     for i in 0..len(an.insts) {
         let x = &an.insts[i]
         var wi = -1
@@ -1643,6 +1645,11 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ro
         if x.neg || !touches(a, &ws[wi]) { continue }
         let ks = txn.putKeys(ws[wi].tree, ws[wi].mark, max(MAX_KEYS, 1))
         if len(ks) == 0 { continue }
+        if len(ks) > MAX_KEYS && oneInstance(an, &x.key) {
+            append(mut &big, i)
+            append(mut &bigW, wi)
+            continue
+        }
         if len(ks) > MAX_KEYS && a.validated {
             whole = true
             if len(first) == 0 { first = x.key.clone() }
@@ -1659,9 +1666,11 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ro
             None {}
         }
     }
-    if !whole && len(ix) == 0 { return Ok(Unit{}) }
+    if !whole && len(ix) == 0 && len(big) == 0 { return Ok(Unit{}) }
     let locks = len(an.insts) > 1 || a.form == F_EXISTS
-    if locks && !whole {
+    // (many rows: the assertion's own lock, exclusive, not a lock per row's join key)
+    let excl = whole || len(big) > 0
+    if locks && !excl {
         {
             // (the instances none of whose new rows meets its own conditions: they take part in nothing, and take no lock)
             var keep: []int = []
@@ -1695,7 +1704,7 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ro
             rs = rs2
         }
     }
-    if locks && (whole || len(plan.keys) == 0) {
+    if locks && (excl || len(plan.keys) == 0) {
         try lockFor(st, txn, a, lexdb_sql.LOCK_UPDATE)
     } else if locks {
         // the join key's values of the rows to check, each locked (after the assertion's weakest lock)
@@ -1727,7 +1736,57 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ro
             at = hi
         }
     }
+    // the many rows put (a COPY, a bulk load, an INSERT ... SELECT): the query with the instance restricted to them, BIG_CHUNK keys
+    // at a time (its key IN (...): lookups of the rows, not a scan of a table whose rows are the transaction's own writes)
+    for j in 0..len(big) {
+        let x = &an.insts[big[j]]
+        let w = &ws[bigW[j]]
+        match try tableRc(st, txn, &x.key) {
+            Some(t) {
+                let rel = lexdb_catalog.relOf(&t)
+                let none: []bool = []
+                let rr = lexdb_access.rowRead(&rel, &none)
+                let keys = txn.putKeys(w.tree, w.mark, 1 << 30)
+                var at = 0
+                while at < len(keys) {
+                    let hi = min(at + BIG_CHUNK, len(keys))
+                    var part: [][]Val = []
+                    for k in at..hi {
+                        match try lexdb_access.getRow(st, txn, &rel, &rr, &keys[k]) {
+                            Some(r) { append(mut &part, r) }
+                            None {}
+                        }
+                    }
+                    if len(part) > 0 {
+                        var q = plan.stmt.clone()
+                        addConj(mut &q, &x.path, 0, keyList(&x.alias, &t, &part))
+                        if broken(a, try runOn(st, txn, a, &q, up, true)) { return Err(violated(st, txn, up, a, &x.key, verb)) }
+                    }
+                    at = hi
+                }
+            }
+            None {}
+        }
+    }
     return Ok(Unit{})
+}
+
+const BIG_CHUNK = 4096
+
+// Whether table key is one instance of the query only (another instance of it would read its rows put: the whole query then).
+fn oneInstance(an: &An, key: &str): bool {
+    var n = 0
+    for x in an.insts { if x.key == key { n += 1 } }
+    return n == 1
+}
+
+// The condition that an instance's row is one of rows: its key IN (...) for a key of one column, else keyIn's.
+fn keyList(alias: &str, t: &Table, rows: &[][]Val): Expr {
+    if len(t.pk) != 1 { return keyIn(alias, t, rows) }
+    let p = t.pk[0]
+    var args: []Expr = [Expr.Col(alias.toStr() + "." + t.cols[p].name, -1)]
+    for r in rows { append(mut &args, Expr.Lit(r[p].clone())) }
+    return Expr.Call("in", args, false)
 }
 
 // The statements' notes in the transaction's onCommit list, taken out of it; with ok (the statement ran) each assertion of
