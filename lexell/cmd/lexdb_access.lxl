@@ -3387,12 +3387,381 @@ pub fn buildWrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, b:
     return Ok(noDup())
 }
 
+// Whether column c's values encode as a single signed 64-bit word ^ MIN_INT in index keys.
+fn isKeyIntCol(c: &lexdb_sql.ColDef): bool {
+    let k = c.typ.kind
+    let o = c.typ.oid
+    if k == lexdb_sql.K_INT && (o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8) { return true }
+    if k == lexdb_sql.K_DATE || k == lexdb_sql.K_TIME || k == lexdb_sql.K_TS { return true }
+    if k == lexdb_sql.K_TSTZ && !lexdb_sql.isTszType(&c.typ) { return true }
+    return false
+}
+
+// Permutation sorting ents in lexicographical order via radix sort on the 8 bytes
+// after the longest common prefix, then breaking ties by full string comparison.
+fn sortOrderStr(ents: &[]str): []int {
+    let n = len(ents)
+    var order: []int = array(n, 0)
+    for i in 0..n { order[i] = i }
+    if n <= 1 || inOrder(ents) { return order }
+    var lcp = len(ents[0])
+    let k0 = &ents[0]
+    for i in 1..n {
+        let k = &ents[i]
+        if len(k) < lcp { lcp = len(k) }
+        var c = 0
+        while c < lcp && k[c] == k0[c] { c += 1 }
+        lcp = c
+    }
+    var pre: []int = withCapacity(n)
+    var lo = 0
+    var hi = 0
+    for i in 0..n {
+        let k = &ents[i]
+        var x = 0
+        if len(k) >= lcp + 8 {
+            x = binary.readI64BEStr(k, lcp)
+        } else {
+            for j in 0..8 { x = (x << 8) | (if lcp + j < len(k) { int(k[lcp + j]) } else { 0 }) }
+        }
+        x = x ^ (-9223372036854775807 - 1)
+        if i == 0 || x < lo { lo = x }
+        if i == 0 || x > hi { hi = x }
+        append(mut &pre, x)
+    }
+    var span = -1
+    match hi.checkedSub(lo) {
+        Some(d) { if d < (1 << 62) { span = d } }
+        None {}
+    }
+    if span < 0 {
+        collections.sortBy(mut &order, fn(a: &int, b: &int): int { return ents[a].cmp(&ents[b]) })
+        return order
+    }
+    var bits = 0
+    while bits < 62 && (span >> bits) > 0 { bits += 1 }
+    for i in 0..n { pre[i] = pre[i] - lo }
+    var perm = lexdb_vec.radixPerm(&pre, bits)
+    var a = 0
+    while a < n {
+        var z = a + 1
+        while z < n && pre[perm[z]] == pre[perm[a]] { z += 1 }
+        if z - a > 1 {
+            // Check if this tie run is already sorted (always true when prefix + PK is already ordered).
+            var runSorted = true
+            for i in a + 1..z {
+                if ents[perm[i]] < ents[perm[i - 1]] {
+                    runSorted = false
+                    break
+                }
+            }
+            if !runSorted {
+                if z - a > SORT_FEW {
+                    var run: []int = withCapacity(z - a)
+                    for i in a..z { append(mut &run, perm[i]) }
+                    collections.sortBy(mut &run, fn(x: &int, y: &int): int { return ents[x].cmp(&ents[y]) })
+                    for i in a..z { perm[i] = run[i - a] }
+                } else {
+                    for i in a + 1..z {
+                        let v = perm[i]
+                        var j = i
+                        while j > a && ents[perm[j - 1]] > ents[v] {
+                            perm[j] = perm[j - 1]
+                            j -= 1
+                        }
+                        perm[j] = v
+                    }
+                }
+            }
+        }
+        a = z
+    }
+    return perm
+}
+
+// Fast CREATE INDEX path for a single integer/date/time/ts/tstz column plain index:
+// scans column/fixed leaves directly without decoding any other columns or re-encoding PKs,
+// sorts non-NULL values stably via radixPerm (preserving the table's strictly ascending PK
+// order within every value run -> zero string comparisons!), and writes directly via
+// putRowLoadMoved when outside a transaction block.
+// Returns Ok(Some(None)) if handled with no duplicate, Ok(Some(Some(row))) on unique clash,
+// or Ok(None) to fall back to the general path.
+fn buildIndexFastInt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix: &Index): Result[Option[Option[[]Val]], DbErr] {
+    let col = ix.cols[0]
+    let pl = if len(t.slots) == 0 { col } else { t.slots[col] }
+    let rw = rowsFor(t)
+    let miss = placesMissing(t)
+    var missNull = true
+    var missVal = 0
+    if pl < len(miss) && !isNull(&miss[pl]) {
+        match &miss[pl] {
+            Val.Int(x) { missVal = x; missNull = false }
+            Val.Date(x) { missVal = x; missNull = false }
+            Val.Time(x) { missVal = x; missNull = false }
+            Val.Ts(x) { missVal = x; missNull = false }
+            Val.Tstz(x) { missVal = x; missNull = false }
+            else { return Ok(None) }
+        }
+    }
+    var vals: []int = []
+    var pks: []str = []
+    var nullPks: []str = []
+    var leafVals: []int = array(256, 0)
+    var leafNul: []bool = array(256, false)
+    var lo = 0
+    var hi = 0
+    var haveRange = false
+    var fallback = false
+    try st.scanLeaves(txn, t.tree, "", "", fn(leaf: &lexdb_rows.LeafView, a: int, b: int): bool {
+        let cnt = b - a
+        if cnt <= 0 { return true }
+        if cnt > len(leafVals) {
+            leafVals = array(cnt, 0)
+            leafNul = array(cnt, false)
+        }
+        let rc = lexdb_rows.leafIntsInto(leaf, pl, a, cnt, &rw, mut &leafVals, mut &leafNul)
+        if rc < 0 {
+            fallback = true
+            return false
+        }
+        if rc == 2 || (rc == 3 && missNull) {
+            for j in 0..cnt { append(mut &nullPks, lexdb_rows.leafKey(leaf, a + j)) }
+            return true
+        }
+        if rc == 3 {
+            if !haveRange {
+                lo = missVal
+                hi = missVal
+                haveRange = true
+            } else {
+                if missVal < lo { lo = missVal }
+                if missVal > hi { hi = missVal }
+            }
+            for j in 0..cnt {
+                append(mut &vals, missVal)
+                append(mut &pks, lexdb_rows.leafKey(leaf, a + j))
+            }
+            return true
+        }
+        if rc == 1 {
+            for j in 0..cnt {
+                let v = leafVals[j]
+                if !haveRange {
+                    lo = v
+                    hi = v
+                    haveRange = true
+                } else {
+                    if v < lo { lo = v }
+                    if v > hi { hi = v }
+                }
+                append(mut &vals, v)
+                append(mut &pks, lexdb_rows.leafKey(leaf, a + j))
+            }
+            return true
+        }
+        for j in 0..cnt {
+            if leafNul[j] {
+                append(mut &nullPks, lexdb_rows.leafKey(leaf, a + j))
+            } else {
+                let v = leafVals[j]
+                if !haveRange {
+                    lo = v
+                    hi = v
+                    haveRange = true
+                } else {
+                    if v < lo { lo = v }
+                    if v > hi { hi = v }
+                }
+                append(mut &vals, v)
+                append(mut &pks, lexdb_rows.leafKey(leaf, a + j))
+            }
+        }
+        return true
+    })
+    if fallback { return Ok(None) }
+    let n = len(vals)
+    var perm: []int = []
+    var shifted = false
+    if n > 1 {
+        var sorted = true
+        for i in 1..n {
+            if vals[i] < vals[i - 1] {
+                sorted = false
+                break
+            }
+        }
+        if !sorted {
+            var span = -1
+            match hi.checkedSub(lo) {
+                Some(d) { if d < (1 << 62) { span = d } }
+                None {}
+            }
+            if span >= 0 {
+                var bits = 0
+                while bits < 62 && (span >> bits) > 0 { bits += 1 }
+                for i in 0..n { vals[i] = vals[i] - lo }
+                shifted = true
+                perm = lexdb_vec.radixPerm(&vals, bits)
+            } else {
+                perm = array(n, 0)
+                for i in 0..n { perm[i] = i }
+                collections.sortBy(mut &perm, fn(x: &int, y: &int): int {
+                    let c = vals[x].cmp(&vals[y])
+                    return if c != 0 { c } else { x.cmp(y) }
+                })
+            }
+        }
+    }
+    let usePerm = len(perm) > 0
+    if ix.unique && n > 1 {
+        for j in 1..n {
+            let i = if usePerm { perm[j] } else { j }
+            let h = if usePerm { perm[j - 1] } else { j - 1 }
+            if vals[i] == vals[h] {
+                var row: []Val = []
+                match try st.get(txn, t.tree, &pks[i]) {
+                    Some(v) { row = try rowOf(st, txn, t, &pks[i], &v, rowWidth(t), &[], &placesMissing(t)) }
+                    None {}
+                }
+                return Ok(Some(Some(row)))
+            }
+        }
+    }
+    let minInt = -9223372036854775807 - 1
+    let noOwn = !txn.inBlock()
+    if noOwn { txn.reserveWrites(n + len(nullPks)) }
+    var kb: []byte = []
+    for j in 0..n {
+        let i = if usePerm { perm[j] } else { j }
+        let v = if shifted { vals[i] + lo } else { vals[i] }
+        let pk = replace(mut &pks[i], "")
+        let pln = len(pk)
+        let klen = 9 + pln
+        if len(kb) != klen { kb = array(klen, byte(0)) }
+        kb[0] = byte(1)
+        let u = v ^ minInt
+        kb[1] = byte((u >> 56) & 0xFF)
+        kb[2] = byte((u >> 48) & 0xFF)
+        kb[3] = byte((u >> 40) & 0xFF)
+        kb[4] = byte((u >> 32) & 0xFF)
+        kb[5] = byte((u >> 24) & 0xFF)
+        kb[6] = byte((u >> 16) & 0xFF)
+        kb[7] = byte((u >> 8) & 0xFF)
+        kb[8] = byte(u & 0xFF)
+        for q in 0..pln { kb[9 + q] = pk[q] }
+        let ent = strFromBytes(&kb)
+        if noOwn {
+            if klen > 512 { try lexdb_store.keyFits(&ent) }
+            txn.putLoadFast(ix.tree, ent, pk, 0)
+        } else {
+            try txn.put(ix.tree, &ent, &pk)
+        }
+    }
+    var nkb: []byte = []
+    for j in 0..len(nullPks) {
+        let pk = replace(mut &nullPks[j], "")
+        let pln = len(pk)
+        let klen = 1 + pln
+        if len(nkb) != klen { nkb = array(klen, byte(0)) }
+        nkb[0] = byte(2)
+        for q in 0..pln { nkb[1 + q] = pk[q] }
+        let ent = strFromBytes(&nkb)
+        if noOwn {
+            if klen > 512 { try lexdb_store.keyFits(&ent) }
+            txn.putLoadFast(ix.tree, ent, pk, 0)
+        } else {
+            try txn.put(ix.tree, &ent, &pk)
+        }
+    }
+    if noOwn && n + len(nullPks) > 0 { txn.markSortedTree(ix.tree) }
+    return Ok(Some(None))
+}
+
+// Fast CREATE INDEX path for any plain (non-predicate, non-expression, non-virtual) index:
+// scans leaves directly with a projection narrowed to ONLY ix.cols and uses raw leaf PKs.
+fn buildIndexFastPlain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix: &Index): Result[Option[Option[[]Val]], DbErr] {
+    var needCol: []bool = array(len(t.cols), false)
+    for c in ix.cols { needCol[c] = true }
+    let kinds: []int = array(len(t.cols), BK_VAL)
+    let rw = rowsFor(t)
+    let bp = lexdb_rows.projectionOf(kinds, needCol, t.slots, rowWidth(t), placesMissing(t), placesNeeded(t, &needCol))
+    var batch = lexdb_rows.newBatch(&bp, BROWS)
+    var ents: []str = []
+    var pks: []str = []
+    var pres: []int = []
+    var fallback = false
+    try st.scanLeaves(txn, t.tree, "", "", fn(leaf: &lexdb_rows.LeafView, a: int, b: int): bool {
+        var k = a
+        while k < b {
+            let want = min(b - k, BROWS)
+            batch.n = 0
+            for c in ix.cols { batch.cols[c] = lexdb_rows.bvec(want) }
+            match lexdb_rows.decodeRun(leaf, k, k + want, mut &batch, &bp, &rw) {
+                Ok(got) {
+                    if got <= 0 || got == lexdb_rows.APART {
+                        fallback = true
+                        return false
+                    }
+                    for r in 0..got {
+                        let pk = lexdb_rows.leafKey(leaf, k + r)
+                        var pre = ""
+                        var nul = false
+                        for c in ix.cols {
+                            if batch.cols[c].nul[r] {
+                                nul = true
+                                pre.addByte(2)
+                            } else {
+                                let v = collKeyVal(&t.cols[c], &batch.vals[c][r])
+                                if isNull(&v) { nul = true }
+                                encIdxPart(mut &pre, &v)
+                            }
+                        }
+                        if ix.unique { append(mut &pres, if nul { -1 } else { len(pre) }) }
+                        pre += &pk
+                        append(mut &ents, pre)
+                        append(mut &pks, pk)
+                    }
+                    k += got
+                }
+                Err(_) {
+                    fallback = true
+                    return false
+                }
+            }
+        }
+        return true
+    })
+    if fallback { return Ok(None) }
+    return Ok(Some(try fillIndex(st, txn, t, ix, &ents, &pks, &pres)))
+}
+
 // Index ix (not yet one of t's: CREATE INDEX) filled from t's rows, a
 // unique one checked: the entries sorted, so a unique index's duplicates
 // are neighbours (the tree is new, so they are all there is to check).
 // Some: a duplicate, one of its rows ([] not known).
 pub fn buildIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix: &Index, pred: &fn(&Index, &[]Val): Result[bool, DbErr],
                   expr: &fn(&Index, int, &[]Val): Result[Val, DbErr]): Result[Option[[]Val], DbErr] {
+    if ix.pred.isNone() && len(ix.exprs) == 0 && len(ix.cols) > 0 {
+        var plain = true
+        for c in ix.cols {
+            if c < 0 || t.cols[c].genKind == lexdb_sql.GEN_VIRTUAL {
+                plain = false
+                break
+            }
+        }
+        if plain {
+            if len(ix.cols) == 1 && isKeyIntCol(&t.cols[ix.cols[0]]) {
+                match try buildIndexFastInt(st, txn, t, ix) {
+                    Some(res) { return Ok(res) }
+                    None {}
+                }
+            }
+            match try buildIndexFastPlain(st, txn, t, ix) {
+                Some(res) { return Ok(res) }
+                None {}
+            }
+        }
+    }
     let sc = allScan()
     var cur = newCursor()
     var ents: []str = []
@@ -3420,12 +3789,10 @@ pub fn buildIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix
 // duplicate, its row read back from t's tree (Some).
 fn fillIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix: &Index, ents: &[]str, pks: &[]str,
              pres: &[]int): Result[Option[[]Val], DbErr] {
-    var order: []int = array(len(ents), 0)
-    for i in 0..len(ents) { order[i] = i }
-    if !inOrder(ents) { collections.sortBy(mut &order, fn(a: &int, b: &int): int { return ents[a].cmp(&ents[b]) }) }
-    for j in 0..len(order) {
-        let i = order[j]
-        if ix.unique && j > 0 {
+    let order = sortOrderStr(ents)
+    if ix.unique {
+        for j in 1..len(order) {
+            let i = order[j]
             let h = order[j - 1]
             if pres[i] >= 0 && pres[h] == pres[i] && ents[i][0..pres[i]] == ents[h][0..pres[h]] {
                 var row: []Val = []
@@ -3436,7 +3803,11 @@ fn fillIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix: &In
                 return Ok(Some(row))
             }
         }
-        try txn.put(ix.tree, &ents[i], &pks[i])
+    }
+    let noOwn = !txn.inBlock()
+    for j in 0..len(order) {
+        let i = order[j]
+        if noOwn { try txn.putRowLoad(ix.tree, &ents[i], &pks[i], 0) } else { try txn.put(ix.tree, &ents[i], &pks[i]) }
     }
     return Ok(None)
 }
@@ -3447,11 +3818,14 @@ fn fillIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix: &In
 // the own-writes map (a key came out of order).
 pub type Load = record {
     lastId: int
+    lastKey: str
     haveLast: bool
     indexed: bool
+    emptyTable: bool
 }
 
-pub fn newLoad(): Load { return Load{lastId: 0, haveLast: false, indexed: false} }
+pub fn newLoad(): Load { return Load{lastId: 0, lastKey: "", haveLast: false, indexed: false, emptyTable: false} }
+pub fn newLoadEmpty(): Load { return Load{lastId: 0, lastKey: "", haveLast: false, indexed: false, emptyTable: true} }
 
 // Row bytes row (t's stored form) of the primary key id (one integer
 // column) loaded into t: in key order straight to the tree's end
@@ -3470,14 +3844,52 @@ pub fn loadRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, id: i
         ld.indexed = true
     }
     if ld.indexed {
+        if ld.emptyTable {
+            if txn.wrote(t.tree, &key) { return Ok(false) }
+        } else {
+            match try st.get(txn, t.tree, &key) {
+                Some(_) { return Ok(false) }
+                None {}
+            }
+        }
+        try txn.putRow(t.tree, &key, row, head)
+    } else {
+        if len(row) <= lexdb_store.MAX_VALUE {
+            txn.putLoadFast(t.tree, key, row.clone(), head)
+        } else {
+            try txn.putRowLoad(t.tree, &key, row, head)
+        }
+    }
+    return Ok(true)
+}
+
+// loadRow for a pre-encoded primary key (single or composite integer PK), moving key and row when possible.
+pub fn loadRowKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, key: str, row: str, head: int, ld: mut &Load): Result[bool, DbErr] {
+    let outOfOrder = ld.haveLast && key <= ld.lastKey
+    if !ld.indexed && !outOfOrder {
+        ld.lastKey = key.clone()
+        ld.haveLast = true
+        if len(key) <= 512 && len(row) <= lexdb_store.MAX_VALUE {
+            txn.putLoadFast(t.tree, key, row, head)
+        } else {
+            try txn.putRowLoadMoved(t.tree, key, row, head)
+        }
+        return Ok(true)
+    }
+    if outOfOrder && !ld.indexed {
+        txn.indexWrites()
+        ld.indexed = true
+    }
+    ld.haveLast = true
+    if ld.emptyTable {
+        if txn.wrote(t.tree, &key) { return Ok(false) }
+    } else {
         match try st.get(txn, t.tree, &key) {
             Some(_) { return Ok(false) }
             None {}
         }
-        try txn.putRow(t.tree, &key, row, head)
-    } else {
-        try txn.putRowLoad(t.tree, &key, row, head)
     }
+    try txn.putRow(t.tree, &key, &row, head)
     return Ok(true)
 }
 

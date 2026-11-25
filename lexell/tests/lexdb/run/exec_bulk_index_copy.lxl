@@ -1,0 +1,138 @@
+// Targeted tests for bulk COPY (CHAR(n), custom delimiter/null, composite integer PK,
+// inline decimal parsing, 19-digit bigint) and bulk CREATE INDEX (columnar/fixed int/date
+// radix build, multi-column index, unique clash, NULLs, ADD COLUMN before CREATE INDEX,
+// transaction block rollback/commit).
+// expect: bpchar: COPY 4; 1|ab  |x;2|abcd|y;3|ef  |z;4|NULL|NULL
+// expect: bpchar_err: 22001 COPY c_err, line 1
+// expect: delim_num: COPY 4; 1|10|12.35|a|b;2|20|-779.73|NULL;3|30|0.00|ok;4|40|99999.99|hi
+// expect: num_err: 22003 COPY dn_err, line 1
+// expect: comp_pk: COPY 5; 1|10|9223372036854775807;1|20|-9223372036854775808;2|5|0;2|10|42;3|1|7
+// expect: comp_dup: 23505 COPY cp_dup, line 3
+// expect: idx_int: CREATE INDEX; 2|20|2;5|10|1;9|30|3;NULL|NULL|4
+// expect: idx_uniq: 23505
+// expect: idx_multi: CREATE INDEX; a|1|1;a|2|2;b|1|3
+// expect: idx_addcol: CREATE INDEX; 7|1;7|2;9|3
+// expect: idx_txn: ROLLBACK; CREATE INDEX; 2
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_parse"
+
+fn err(e: &lexdb_base.DbErr): str {
+    return e.state + (if e.context != "" { " " + e.context } else { "" })
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return err(&e) }
+    }
+}
+
+fn copyIn(s: mut &lexdb_exec.Session, sql: str, data: &str): str {
+    let stmts = lexdb_parse.parse(&sql).unwrap()
+    let none: []lexdb_sql.Val = []
+    let nt: []int = []
+    match s.run(&stmts[0], &none, &nt) {
+        Ok(r) {
+            if r.copy != lexdb_exec.COPY_IN { return "not COPY_IN: " + r.tag }
+            match s.copyIn(&stmts[0], lexdb_exec.CopyInput{have: true, data: data.clone(), fail: "", proto: false, stream: false, pull: false}) {
+                Ok(r2) { return r2.tag.clone() }
+                Err(e) { return err(&e) }
+            }
+        }
+        Err(e) { return err(&e) }
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(41), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024,
+        ckptBytes: 128 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+
+        // 1. CHAR(n) in fast COPY: padding, exact, trailing-space trim, NULL, overflow error
+        let _1 = q(mut &s, "create table c_ok (id int primary key, a char(4), b char(1))")
+        let r1 = copyIn(mut &s, "copy c_ok from stdin", &"1\tab\tx\n2\tabcd   \ty\n3\tef  \tz \n4\t\\N\t\\N\n")
+        println("bpchar: " + r1 + "; " + q(mut &s, "select id, a, b from c_ok order by id"))
+
+        let _2 = q(mut &s, "create table c_err (id int primary key, a char(2))")
+        println("bpchar_err: " + copyIn(mut &s, "copy c_err from stdin", &"1\tabc\n"))
+
+        // 2. Custom DELIMITER '|' and NULL '' with escaped \| and inline DECIMAL(7,2) rounding/neg/zero
+        let _3 = q(mut &s, "create table dn (id int primary key, k int, amt numeric(7,2), note text)")
+        let r3 = copyIn(mut &s, "copy dn from stdin with (format text, delimiter '|', null '')",
+            &"1|10|12.346|a\\|b\n2|20|-779.73|\n3|30|0|ok\n4|40|99999.99|hi\n")
+        println("delim_num: " + r3 + "; " + q(mut &s, "select id, k, amt, note from dn order by id"))
+
+        let _4 = q(mut &s, "create table dn_err (id int primary key, amt numeric(5,2))")
+        println("num_err: " + copyIn(mut &s, "copy dn_err from stdin with (format text, delimiter '|', null '')", &"1|1000.00\n"))
+
+        // 3. Composite integer PK (out of order -> radix commitOrder) + 19-digit bigint extremes + dup error
+        let _5 = q(mut &s, "create table cp (a int, b int, v bigint, primary key (a, b))")
+        let r5 = copyIn(mut &s, "copy cp from stdin with (format text, delimiter '|', null '')",
+            &"2|10|42\n1|20|-9223372036854775808\n3|1|7\n1|10|9223372036854775807\n2|5|0\n")
+        println("comp_pk: " + r5 + "; " + q(mut &s, "select a, b, v from cp order by a, b"))
+
+        let _6 = q(mut &s, "create table cp_dup (a int, b int, primary key (a, b))")
+        println("comp_dup: " + copyIn(mut &s, "copy cp_dup from stdin with (format text, delimiter '|', null '')",
+            &"2|1\n1|1\n2|1\n"))
+
+        // 4. Bulk CREATE INDEX: single int column (with NULLs & bulk load >= 64 rows), unique clash, multi-column, ADD COLUMN, txn block
+        let _7 = q(mut &s, "create table ix_t (id int primary key, k int, v int)")
+        var bulk = ""
+        for i in 1..90 {
+            let k = if i == 4 { "\\N" } else if i == 1 { "5" } else if i == 2 { "2" } else if i == 3 { "9" } else { ((90 - i) % 17 + 100).toStr() }
+            let v = if i == 4 { "\\N" } else { (i * 10).toStr() }
+            bulk += i.toStr() + "\t" + k + "\t" + v + "\n"
+        }
+        let _7c = copyIn(mut &s, "copy ix_t from stdin", &bulk)
+        let r7 = q(mut &s, "create index ix_t_k on ix_t (k)")
+        println("idx_int: " + r7 + "; " + q(mut &s, "select k, v, id from ix_t where id <= 4 order by k nulls last, id"))
+
+        // Unique clash on duplicate k values
+        let uerr = q(mut &s, "create unique index ix_t_ku on ix_t (k)")
+        println("idx_uniq: " + uerr[0..5])
+
+        // Multi-column plain index (text + int)
+        let _8 = q(mut &s, "create table ix_m (id int primary key, tag text, n int)")
+        let _8c = copyIn(mut &s, "copy ix_m from stdin", &"1\ta\t1\n2\ta\t2\n3\tb\t1\n")
+        let r8 = q(mut &s, "create index ix_m_tn on ix_m (tag, n)")
+        println("idx_multi: " + r8 + "; " + q(mut &s, "select tag, n, id from ix_m order by tag, n, id"))
+
+        // ALTER TABLE ADD COLUMN with default before CREATE INDEX
+        let _9 = q(mut &s, "create table ix_a (id int primary key)")
+        let _9c = copyIn(mut &s, "copy ix_a from stdin", &"1\n2\n")
+        let _9a = q(mut &s, "alter table ix_a add column c int default 7")
+        let _9i = q(mut &s, "insert into ix_a values (3, 9)")
+        let r9 = q(mut &s, "create index ix_a_c on ix_a (c)")
+        println("idx_addcol: " + r9 + "; " + q(mut &s, "select c, id from ix_a order by c, id"))
+
+        // CREATE INDEX inside a transaction block (ROLLBACK, then COMMIT + read-your-own-writes)
+        let _10b = q(mut &s, "begin")
+        let _10c = q(mut &s, "create index ix_tmp on ix_t (v)")
+        let r10rb = q(mut &s, "rollback")
+        let _11b = q(mut &s, "begin")
+        let r11c = q(mut &s, "create index ix_tmp on ix_t (v)")
+        let r11q = q(mut &s, "select count(*) from ix_t where v in (10, 20)")
+        let _11e = q(mut &s, "commit")
+        println("idx_txn: " + r10rb + "; " + r11c + "; " + r11q)
+        return 0
+    })
+}
