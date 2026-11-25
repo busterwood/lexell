@@ -39,6 +39,7 @@ import "./lexdb_copyjson"
 import "./lexdb_nncon"
 import "./lexdb_nnalter"
 import "./lexdb_annot"
+import "./lexdb_graph"
 import "./lexdb_sql"
 import "./lexdb_plan"
 import "./lexdb_enum"
@@ -909,14 +910,14 @@ fn createKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, temp: b
         } else {
             if !(try schemaExists(st, txn, &sn)) { return Err(e("3F000", &("schema \"" + sn + "\" does not exist"))) }
             if tmp { return Err(e("42P16", "cannot create temporary relation in non-temporary schema")) }
-            if sn == "public" { return Ok(lexdb_sql.baseName(n)) }        // public.name as written (lexdb_sql.rname)
-            return Ok(n.clone())
+            if sn == "public" { return lexdb_graph.freeKey(st, txn, lexdb_sql.baseName(n)) }        // public.name as written (lexdb_sql.rname)
+            return lexdb_graph.freeKey(st, txn, n.clone())        // (a property graph's name is taken too, O22)
         }
     }
     if tmp { return Ok(lexdb_sql.qual(&useTmp(st, txn), &lexdb_sql.baseName(n))) }
     let sn = try createSchema(st, txn)
     if len(sn) == 0 { return Err(e("3F000", "no schema has been selected to create in")) }
-    return Ok(lexdb_sql.qual(&sn, n))
+    return lexdb_graph.freeKey(st, txn, lexdb_sql.qual(&sn, n))
 }
 
 // Scans the catalog [lo, hi) as st.scan does, leaving out other sessions'
@@ -1298,7 +1299,8 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
         var lateral = false
         if f.sub >= 0 {
             sc.names.frames[me].hidden = !f.lateral
-            let planning = planSub(st, txn, &subs[f.sub], params, sc, false)
+            // (GRAPH_TABLE: the query it stands for, O22)
+            let planning = if lexdb_graph.isGraph(&subs[f.sub]) { planSub(st, txn, &(try lexdb_graph.expand(st, txn, &subs[f.sub])), params, sc, false) } else { planSub(st, txn, &subs[f.sub], params, sc, false) }
             sc.names.frames[me].hidden = false
             var sp = try planning
             // (a CTE's use: its body's plan stays in its SubPlan, bound per use today)
@@ -12884,7 +12886,7 @@ fn isWrite(kind: int): bool {
            kind == lexdb_sql.S_GRANT || kind == lexdb_sql.S_REVOKE || kind == lexdb_sql.S_OWNER ||
            kind == lexdb_sql.S_CREATE_TYPE || kind == lexdb_sql.S_DROP_TYPE || kind == lexdb_sql.S_ALTER_TYPE ||
            kind == lexdb_sql.S_TRUNCATE || kind == lexdb_sql.S_ANALYZE || kind == lexdb_sql.S_MERGE || kind == lexdb_sql.S_ALTER_DB || kind == lexdb_sql.S_SP_RENAME ||
-           kind == lexdb_sql.S_CREATE_ROUTINE || kind == lexdb_sql.S_DROP_ROUTINE
+           kind == lexdb_sql.S_CREATE_ROUTINE || kind == lexdb_sql.S_DROP_ROUTINE || kind == lexdb_sql.S_CREATE_GRAPH || kind == lexdb_sql.S_DROP_GRAPH
 }
 
 fn stmtName(kind: int): str {
@@ -12923,6 +12925,7 @@ fn stmtName(kind: int): str {
         lexdb_sql.S_DROP_ROUTINE { "DROP FUNCTION" }
         lexdb_sql.S_ALTER_DB { "ALTER DATABASE" }
         lexdb_sql.S_SP_RENAME { "EXECUTE" }
+        lexdb_sql.S_CREATE_GRAPH, lexdb_sql.S_DROP_GRAPH { if kind == lexdb_sql.S_CREATE_GRAPH { "CREATE PROPERTY GRAPH" } else { "DROP PROPERTY GRAPH" } }
         else { "DELETE" }
     }
 }
@@ -13020,6 +13023,7 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_DROP_SEQ { return dropSeq(st, txn, s) }
         lexdb_sql.S_CREATE_ROUTINE { return createRoutine(st, txn, s) }
         lexdb_sql.S_DROP_ROUTINE { return dropRoutine(st, txn, s) }
+        lexdb_sql.S_CREATE_GRAPH, lexdb_sql.S_DROP_GRAPH { return Ok(tagOnly(&(try lexdb_graph.ddl(st, txn, s, &lexdb_graph.Up{describe: describe, bump: bumpCatalog})))) }
         lexdb_sql.S_COPY { return copyStmt(st, txn, s, params, ptypes, lim, pc, input, out, pull) }
         lexdb_sql.S_EXPLAIN { return explain(st, txn, s, params, lim, ptypes) }
         else { return Err(e("XX000", "not a data statement")) }
@@ -18990,7 +18994,7 @@ fn createView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         let sn = try createSchema(st, txn)
         if len(sn) == 0 { return Err(e("3F000", "no schema has been selected to create in")) }
         key = try catKey(st, txn, &s.table, false)
-        if !(try relExists(st, txn, &key)) || lexdb_catalog.tempRel(&key) { key = lexdb_sql.qual(&sn, &s.table) }
+        if !(try relExists(st, txn, &key)) || lexdb_catalog.tempRel(&key) { key = try lexdb_graph.freeKey(st, txn, lexdb_sql.qual(&sn, &s.table)) }
     }
     let base = lexdb_sql.baseName(&key)
     var old = try viewOld(st, txn, &key, s)

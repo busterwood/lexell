@@ -1,0 +1,1870 @@
+// lexdb_graph: SQL/PGQ in the Oracle door (Oracle 23ai's property graphs; design/lexdb-new-features.md O22, 6.3 item 1 and
+// section 13), checked against Oracle Database Free 23.26.3.
+//
+// A property graph is a catalog row of its own (graphKey: GRAPH_PRE and the graph's key, made as a table's: its schema and
+// name): its elements, each a vertex or an edge table (the element's name, the table's catalog key, its key columns, its
+// labels with their properties, an edge's source and destination: the vertex element and the columns on each side). The
+// tables keep their row layout, encoding and read paths: nothing of the graph is in them. A graph names its tables and
+// columns by name, so one dropped, renamed or altered under it makes it invalid (USER_OBJECTS' STATUS, ORA-04045 where it is
+// used) until one of that name is there again, as Oracle's is. The row goes through the log as any catalog row: restart,
+// replay and replicas need nothing more.
+//
+// GRAPH_TABLE (g MATCH ... [WHERE ...] COLUMNS (...)) in FROM (lexdb_parse.graphTable keeps its text) is written here as a
+// query (expand) where it is planned: a match of the pattern is a join of its element tables on the edges' keys, the
+// pattern's and the elements' WHERE its conditions, COLUMNS its select list; a UNION ALL takes the elements a variable may
+// be bound to, the lengths of a bounded quantifier (each its own join) and the two directions of an edge pattern without
+// one. The planner then sees nothing but joins.
+import "strings"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_store"
+import "./lexdb_catalog"
+import "./lexdb_parse"
+import "./lexdb_bind"
+
+type DbErr = lexdb_base.DbErr
+type Tok = lexdb_parse.Tok
+type TypeName = lexdb_sql.TypeName
+type Table = lexdb_catalog.Table
+type Stmt = lexdb_sql.Stmt
+
+const T_EOF = lexdb_parse.T_EOF
+const T_IDENT = lexdb_parse.T_IDENT
+const T_QIDENT = lexdb_parse.T_QIDENT
+const T_NUM = lexdb_parse.T_NUM
+const T_STR = lexdb_parse.T_STR
+const T_PARAM = lexdb_parse.T_PARAM
+const T_OP = lexdb_parse.T_OP
+
+pub const GRAPH_PRE = lexdb_catalog.GRAPH_PRE
+pub const GRAPH_END = lexdb_catalog.GRAPH_END
+
+// A graph's catalog row's key.
+pub fn graphKey(key: &str): str { return GRAPH_PRE + key }
+
+// What the statements' module gives this one: a statement's columns (lexdb_exec.describe), and the catalog's version bumped.
+pub type DescribeFn = fn(&lexdb_store.Store, &Stmt, &[]int, &[]str): Result[[]lexdb_bind.OutCol, DbErr]
+pub type BumpFn = fn(&lexdb_store.Store, mut &lexdb_store.Txn): Result[Unit, DbErr]
+pub type Up = value record {
+    pub describe: DescribeFn
+    pub bump: BumpFn
+}
+
+// A label's property: its name as Oracle shows it, its definition's text over the table's columns, the column it is (lexdb's
+// name; "" for an expression), the columns its expression reads, its type.
+pub type Prop = record {
+    pub name: str
+    pub expr: str
+    pub col: str
+    pub uses: []str
+    pub typ: TypeName
+}
+
+pub type Label = record {
+    pub name: str
+    pub props: []Prop
+}
+
+// An edge's end: the vertex element, the edge table's columns and the vertex table's they equal.
+pub type End = record {
+    pub elem: str
+    pub cols: []str
+    pub refs: []str
+}
+
+pub type Elem = record {
+    pub name: str               // the element's name (the table's, or its alias), as Oracle shows it
+    pub vertex: bool
+    pub table: str              // the table's catalog key
+    pub keys: []str             // its key's columns (lexdb's names)
+    pub labels: []Label
+    pub src: End                // an edge's
+    pub dst: End
+}
+
+pub type Graph = record {
+    pub key: str                // its catalog key (a table's)
+    pub name: str               // as Oracle shows it
+    pub elems: []Elem
+}
+
+fn e(code: &str, msg: &str): DbErr { return lexdb_base.err(code, msg) }
+fn ora(n: int, msg: &str): DbErr { return lexdb_base.err(&("ORA" + strings.padLeft(&(n.toStr()), 5, '0')), msg) }
+
+// ---- the catalog row: its strings (lexdb_catalog.addStrs), in order
+
+fn addList(xs: mut &[]str, l: &[]str) {
+    append(xs, len(l).toStr())
+    for x in l { append(xs, x.clone()) }
+}
+
+fn addEnd(xs: mut &[]str, d: &End) {
+    append(xs, d.elem.clone())
+    addList(xs, &d.cols)
+    addList(xs, &d.refs)
+}
+
+pub fn encode(g: &Graph): str {
+    var xs: []str = ["1", g.key.clone(), g.name.clone(), len(g.elems).toStr()]
+    for el in g.elems {
+        append(mut &xs, el.name.clone())
+        append(mut &xs, if el.vertex { "v" } else { "e" })
+        append(mut &xs, el.table.clone())
+        addList(mut &xs, &el.keys)
+        append(mut &xs, len(el.labels).toStr())
+        for l in el.labels {
+            append(mut &xs, l.name.clone())
+            append(mut &xs, len(l.props).toStr())
+            for p in l.props {
+                append(mut &xs, p.name.clone())
+                append(mut &xs, p.expr.clone())
+                append(mut &xs, p.col.clone())
+                addList(mut &xs, &p.uses)
+                append(mut &xs, lexdb_catalog.typeStr(&p.typ))
+            }
+        }
+        addEnd(mut &xs, &el.src)
+        addEnd(mut &xs, &el.dst)
+    }
+    var b = ""
+    lexdb_catalog.addStrs(mut &b, &xs)
+    return b
+}
+
+type Rd = record { xs: []str; at: int }
+
+fn (r: mut &Rd) s(): str {
+    if r.at >= len(r.xs) { return "" }
+    let v = r.xs[r.at].clone()
+    r.at += 1
+    return v
+}
+
+fn (r: mut &Rd) n(): int { return lexdb_base.num(&r.s()) }
+
+fn (r: mut &Rd) list(): []str {
+    var out: []str = []
+    let n = r.n()
+    for i in 0..n { append(mut &out, r.s()) }
+    return out
+}
+
+fn (r: mut &Rd) end(): End {
+    let el = r.s()
+    let cols = r.list()
+    return End{elem: el, cols: cols, refs: r.list()}
+}
+
+fn noEnd(): End { return End{elem: "", cols: [], refs: []} }
+
+pub fn decode(v: &str): Graph {
+    var r = Rd{xs: lexdb_catalog.strsAt(v, 0), at: 1}
+    let key = r.s()
+    let name = r.s()
+    var g = Graph{key: key, name: name, elems: []}
+    let ne = r.n()
+    for i in 0..ne {
+        let nm = r.s()
+        let vx = r.s() == "v"
+        let tb = r.s()
+        let keys = r.list()
+        var labels: []Label = []
+        let nl = r.n()
+        for j in 0..nl {
+            let ln = r.s()
+            var props: []Prop = []
+            let np = r.n()
+            for k in 0..np {
+                let pn = r.s()
+                let ex = r.s()
+                let col = r.s()
+                let uses = r.list()
+                append(mut &props, Prop{name: pn, expr: ex, col: col, uses: uses, typ: lexdb_catalog.strType(&r.s())})
+            }
+            append(mut &labels, Label{name: ln, props: props})
+        }
+        let src = r.end()
+        let dst = r.end()
+        append(mut &g.elems, Elem{name: nm, vertex: vx, table: tb, keys: keys, labels: labels, src: src, dst: dst})
+    }
+    return g
+}
+
+// Every graph, as their catalog rows are (lexdb_catalog.catSnap keeps them for the dictionary views).
+pub fn all(raw: &[]str): []Graph {
+    var out: []Graph = []
+    for v in raw { append(mut &out, decode(&v)) }
+    return out
+}
+
+// A property's expression's tokens (lexdb_oracat shows it as Oracle does), without the end; [] if it does not read.
+pub fn exprToks(text: &str): []Tok {
+    match lexdb_parse.oraTokens(text) {
+        Ok(ts) {
+            var out = ts
+            let x = pop(mut &out)
+            return out
+        }
+        Err(_) { return [] }
+    }
+}
+
+fn readGraph(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str): Result[Option[Graph], DbErr] {
+    match try st.get(txn, lexdb_catalog.CATALOG, &graphKey(key)) {
+        Some(v) { return Ok(Some(decode(&v))) }
+        None { return Ok(None) }
+    }
+}
+
+// ---- names
+
+// A name's token as Oracle keeps it: a bare one upper case, a quoted one as written.
+fn canon(t: &Tok): str { return if len(t.spell) > 0 { t.spell.clone() } else { t.text.clone() } }
+
+fn isName(t: &Tok): bool { return t.kind == T_IDENT || t.kind == T_QIDENT }
+
+// A lexdb name as Oracle shows it (a column's, a schema's): upper case unless it was written so.
+pub fn shownOf(n: &str, spell: &str): str {
+    if len(spell) > 0 { return spell.toStr() }
+    return if n == strings.toLowerAscii(n) { strings.toUpperAscii(n) } else { n.toStr() }
+}
+
+// A name as SQL text writes it, quoted (lexdb matches names folded).
+fn q(n: &str): str { return "\"" + strings.replaceAll(n, "\"", "\"\"") + "\"" }
+
+// A relation's catalog key as SQL text.
+fn relText(key: &str): str { return q(&lexdb_sql.schemaOf(key)) + "." + q(&lexdb_sql.baseName(key)) }
+
+fn schemaHas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &str): Result[bool, DbErr] {
+    if sc == "public" { return Ok(true) }
+    return Ok((try st.get(txn, lexdb_catalog.CATALOG, &("\x03" + sc))).isSome())
+}
+
+// The key of relation n (folded; qualified or not) along the transaction's path, "" none.
+fn relKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str): Result[str, DbErr] {
+    if lexdb_sql.isQual(n) || len(txn.sql.path) == 0 {
+        let k = if lexdb_sql.schemaOf(n) == "public" { lexdb_sql.baseName(n) } else { n.toStr() }
+        return Ok(if (try st.get(txn, lexdb_catalog.CATALOG, &k)).isSome() { k } else { "" })
+    }
+    let path = txn.sql.path.clone()
+    for sc in path {
+        let k = lexdb_sql.qual(&sc, n)
+        if (try st.get(txn, lexdb_catalog.CATALOG, &k)).isSome() { return Ok(k) }
+    }
+    return Ok("")
+}
+
+// The key of graph n along the path, "" none.
+fn graphOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str): Result[str, DbErr] {
+    if lexdb_sql.isQual(n) || len(txn.sql.path) == 0 {
+        let k = if lexdb_sql.schemaOf(n) == "public" { lexdb_sql.baseName(n) } else { n.toStr() }
+        return Ok(if (try st.get(txn, lexdb_catalog.CATALOG, &graphKey(&k))).isSome() { k } else { "" })
+    }
+    let path = txn.sql.path.clone()
+    for sc in path {
+        let k = lexdb_sql.qual(&sc, n)
+        if (try st.get(txn, lexdb_catalog.CATALOG, &graphKey(&k))).isSome() { return Ok(k) }
+    }
+    return Ok("")
+}
+
+// The key CREATE PROPERTY GRAPH n makes: in its schema, or the first on the path that exists.
+fn newKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str): Result[str, DbErr] {
+    if lexdb_sql.isQual(n) {
+        let sc = lexdb_sql.schemaOf(n)
+        if !(try schemaHas(st, txn, &sc)) { return Err(ora(1918, &("user '" + strings.toUpperAscii(&sc) + "' does not exist"))) }
+        return Ok(if sc == "public" { lexdb_sql.baseName(n) } else { n.toStr() })
+    }
+    let path = txn.sql.path.clone()
+    for sc in path {
+        if lexdb_base.isTempSchema(&sc) || sc == "pg_temp" { continue }
+        if try schemaHas(st, txn, &sc) { return Ok(lexdb_sql.qual(&sc, n)) }
+    }
+    return Ok(n.toStr())
+}
+
+// CREATE TABLE, VIEW, SEQUENCE ... of key k (lexdb_exec.createKey): Oracle's ORA-00955 where a graph has the name.
+pub fn freeKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: str): Result[str, DbErr] {
+    if (try st.get(txn, lexdb_catalog.CATALOG, &graphKey(&k))).isSome() {
+        return Err(e("42P07", &("relation \"" + lexdb_sql.baseName(&k) + "\" already exists")))
+    }
+    return Ok(k)
+}
+
+fn hasInt(xs: &[]int, x: int): bool {
+    for y in xs { if y == x { return true } }
+    return false
+}
+
+fn tableOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str): Result[Option[Table], DbErr] {
+    match try st.get(txn, lexdb_catalog.CATALOG, key) {
+        Some(v) { return Ok(Some(try lexdb_catalog.decTable(key, &v, lexdb_parse.parseExpr))) }
+        None { return Ok(None) }
+    }
+}
+
+fn colIdx(t: &Table, n: &str): int {
+    for i in 0..len(t.cols) { if t.cols[i].name == n && t.cols[i].name != lexdb_catalog.ROWID { return i } }
+    return -1
+}
+
+// ---- a token reader
+
+type Rdr = record { toks: []Tok; pos: int; src: str }
+
+fn reader(text: &str): Result[Rdr, DbErr] { return Ok(Rdr{toks: try lexdb_parse.oraTokens(text), pos: 0, src: text.toStr()}) }
+
+fn (r: &Rdr) peek(): &Tok { return &r.toks[r.pos] }
+fn (r: &Rdr) at(k: int): &Tok { return &r.toks[if r.pos + k < len(r.toks) { r.pos + k } else { len(r.toks) - 1 }] }
+fn (r: &Rdr) kw(w: &str): bool { return r.peek().kind == T_IDENT && r.peek().text == w }
+fn (r: &Rdr) kwAt(k: int, w: &str): bool { return r.at(k).kind == T_IDENT && r.at(k).text == w }
+fn (r: &Rdr) op(o: &str): bool { return r.peek().kind == T_OP && r.peek().text == o }
+fn (r: &Rdr) opAt(k: int, o: &str): bool { return r.at(k).kind == T_OP && r.at(k).text == o }
+
+fn (r: mut &Rdr) accept(w: &str): bool {
+    if r.kw(w) {
+        r.pos += 1
+        return true
+    }
+    return false
+}
+
+fn (r: mut &Rdr) acceptOp(o: &str): bool {
+    if r.op(o) {
+        r.pos += 1
+        return true
+    }
+    return false
+}
+
+fn (r: &Rdr) near(): DbErr {
+    let t = r.peek()
+    if t.kind == T_EOF { return ora(921, "unexpected end of SQL command") }
+    return ora(900, &("invalid SQL statement near \"" + r.src[t.at..min(len(r.src), t.at + 20)] + "\""))
+}
+
+fn (r: mut &Rdr) expectOp(o: &str): Result[Unit, DbErr] {
+    if r.acceptOp(o) { return Ok(Unit{}) }
+    if o == ")" { return Err(ora(907, "missing right parenthesis")) }
+    if o == "(" { return Err(ora(906, "missing left parenthesis")) }
+    return Err(r.near())
+}
+
+fn (r: mut &Rdr) expectKw(w: &str): Result[Unit, DbErr] {
+    if r.accept(w) { return Ok(Unit{}) }
+    return Err(ora(2000, &("missing " + strings.toUpperAscii(w) + " keyword")))
+}
+
+// A name (its token), ORA-00931 if none.
+fn (r: mut &Rdr) nameTok(): Result[Tok, DbErr] {
+    let t = r.peek().clone()
+    if !isName(&t) { return Err(ora(931, "missing identifier")) }
+    r.pos += 1
+    return Ok(t)
+}
+
+// [schema.]name: folded, qualified with lexdb_sql.qual; and the last part as Oracle shows it.
+fn (r: mut &Rdr) relName(shown: mut &str): Result[str, DbErr] {
+    let a = try r.nameTok()
+    if r.op(".") && isName(r.at(1)) {
+        r.pos += 1
+        let b = try r.nameTok()
+        let old = replace(shown, canon(&b))
+        return Ok(lexdb_sql.qual(&a.text, &b.text))
+    }
+    let old = replace(shown, canon(&a))
+    return Ok(a.text.clone())
+}
+
+// The end of the bracketed list or item that starts here: the position of the "," or ")" at depth 0.
+fn (r: &Rdr) itemEnd(from: int): int {
+    var d = 0
+    var i = from
+    while i < len(r.toks) && r.toks[i].kind != T_EOF {
+        let t = &r.toks[i]
+        if t.kind == T_OP {
+            if t.text == "(" || t.text == "[" || t.text == "{" { d += 1 }
+            else if t.text == ")" || t.text == "]" || t.text == "}" {
+                if d == 0 { return i }
+                d -= 1
+            } else if t.text == "," && d == 0 { return i }
+        }
+        i += 1
+    }
+    return i
+}
+
+// The text of tokens [lo, hi).
+fn (r: &Rdr) text(lo: int, hi: int): str {
+    if lo >= hi { return "" }
+    let end = if hi < len(r.toks) { r.toks[hi].at } else { len(r.src) }
+    return strings.trim(&r.src[r.toks[lo].at..end]).toStr()
+}
+
+// ---- CREATE and DROP PROPERTY GRAPH
+
+// The statement's tag (lexdb_exec runs it).
+pub fn ddl(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, up: &Up): Result[str, DbErr] {
+    if s.kind == lexdb_sql.S_DROP_GRAPH {
+        let k = try graphOf(st, txn, &s.table)
+        if len(k) == 0 {
+            if s.ifFlag { return Ok("DROP PROPERTY GRAPH") }
+            return Err(ora(42421, "property graph does not exist"))
+        }
+        txn.del(lexdb_catalog.CATALOG, &graphKey(&k))
+        try up.bump(st, txn)
+        return Ok("DROP PROPERTY GRAPH")
+    }
+    let key = try newKey(st, txn, &s.table)
+    if (try st.get(txn, lexdb_catalog.CATALOG, &graphKey(&key))).isSome() {
+        if s.unique { return Ok("CREATE PROPERTY GRAPH") }
+        if !s.ifFlag { return Err(ora(955, "name is already used by an existing object")) }
+    } else if (try st.get(txn, lexdb_catalog.CATALOG, &key)).isSome() || (try st.get(txn, lexdb_catalog.CATALOG, &lexdb_catalog.seqRow(&key))).isSome() {
+        return Err(ora(955, "name is already used by an existing object"))
+    }
+    let name = shownOf(&lexdb_sql.baseName(&key), &s.spell)
+    let g = try define(st, txn, &s.index, &key, &name, up)
+    try txn.put(lexdb_catalog.CATALOG, &graphKey(&key), &encode(&g))
+    try up.bump(st, txn)
+    return Ok("CREATE PROPERTY GRAPH")
+}
+
+// An element being read: its table too.
+type Def = record { el: Elem; t: Table; srcAt: int; dstAt: int }
+
+fn define(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str, key: &str, name: &str, up: &Up): Result[Graph, DbErr] {
+    var r = try reader(text)
+    if !r.accept("vertex") { return Err(ora(2000, "missing VERTEX keyword")) }
+    try r.expectKw("tables")
+    try r.expectOp("(")
+    var defs: []Def = []
+    while true {
+        append(mut &defs, try elemDef(st, txn, mut &r, true, &defs, up))
+        if !r.acceptOp(",") { break }
+    }
+    try r.expectOp(")")
+    if r.accept("edge") {
+        try r.expectKw("tables")
+        try r.expectOp("(")
+        while true {
+            append(mut &defs, try elemDef(st, txn, mut &r, false, &defs, up))
+            if !r.acceptOp(",") { break }
+        }
+        try r.expectOp(")")
+    }
+    if r.peek().kind != T_EOF { return Err(ora(922, "missing or invalid option")) }
+    // a label of several elements (or given twice) has one set of properties, each of one type
+    var seen: []Label = []
+    for d in defs {
+        for l in d.el.labels {
+            var at = -1
+            for i in 0..len(seen) { if seen[i].name == l.name { at = i } }
+            if at < 0 {
+                append(mut &seen, l.clone())
+                continue
+            }
+            var same = len(seen[at].props) == len(l.props)
+            for p in l.props {
+                var found = false
+                for x in seen[at].props { if x.name == p.name { found = true } }
+                if !found { same = false }
+            }
+            if !same { return Err(ora(42409, &("label " + l.name + " already defined"))) }
+            for p in l.props {
+                for x in seen[at].props {
+                    if x.name == p.name && family(&x.typ) != family(&p.typ) {
+                        return Err(ora(42414, &("cannot use mixed type for property " + p.name + " of label " + l.name)))
+                    }
+                }
+            }
+        }
+    }
+    var g = Graph{key: key.toStr(), name: name.toStr(), elems: []}
+    for d in defs { append(mut &g.elems, d.el.clone()) }
+    return Ok(g)
+}
+
+// The kind of type Oracle tells apart in a label's property (ORA-42414): number, text, date, timestamp, ...
+fn family(t: &TypeName): int {
+    let k = t.kind
+    if k == lexdb_sql.K_INT || k == lexdb_sql.K_NUM || k == lexdb_sql.K_FLOAT { return 1 }
+    if k == lexdb_sql.K_TEXT { return 2 }
+    return 10 + k
+}
+
+// One element table of VERTEX TABLES (vertex) or EDGE TABLES.
+fn elemDef(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: mut &Rdr, vertex: bool, defs: &[]Def, up: &Up): Result[Def, DbErr] {
+    var shown = ""
+    let rn = try r.relName(mut &shown)
+    let tk = try relKey(st, txn, &rn)
+    if len(tk) == 0 { return Err(ora(942, &("table or view \"" + shown + "\" does not exist"))) }
+    let t = (try tableOf(st, txn, &tk)).unwrap()
+    var ename = shown.clone()
+    let words = ["key", "label", "default", "properties", "no", "source", "destination"]
+    if r.accept("as") {
+        ename = canon(&(try r.nameTok()))
+    } else if isName(r.peek()) && !(r.peek().kind == T_IDENT && lexdb_base.hasStr(&words, &r.peek().text)) {
+        ename = canon(&(try r.nameTok()))
+    }
+    for d in defs { if d.el.name == ename { return Err(ora(42404, &("graph element table name " + ename + " already defined"))) } }
+    var el = Elem{name: ename.clone(), vertex: vertex, table: tk.clone(), keys: [], labels: [], src: noEnd(), dst: noEnd()}
+    if r.accept("key") {
+        el.keys = try colList(r, &t)
+        for i in 0..len(el.keys) {
+            for j in 0..i {
+                if el.keys[i] == el.keys[j] { return Err(ora(42416, &("duplicate column name " + shownOf(&el.keys[i], &"") + " in key definition"))) }
+            }
+        }
+    } else {
+        if lexdb_catalog.hasPk(&t) { for p in t.pk { append(mut &el.keys, t.cols[p].name.clone()) } }
+        if len(el.keys) == 0 { return Err(if len(t.view) > 0 { ora(42442, &("cannot infer key for graph element view " + shown)) } else { ora(42402, &("cannot infer key for graph element table " + shown)) }) }
+    }
+    if !vertex {
+        if !r.accept("source") { return Err(ora(2000, "missing SOURCE keyword")) }
+        el.src = try endDef(st, txn, r, &t, &el.name, defs)
+        if !r.accept("destination") { return Err(ora(2000, "missing DESTINATION keyword")) }
+        el.dst = try endDef(st, txn, r, &t, &el.name, defs)
+    }
+    // its labels and properties: LABEL l [props] | DEFAULT LABEL [props], or props alone (the default label's); none: the
+    // default label (the element's name) with every column
+    var any = false
+    while true {
+        if r.accept("label") {
+            let l = canon(&(try r.nameTok()))
+            append(mut &el.labels, Label{name: l, props: try propsDef(st, txn, r, &t, &tk, up)})
+            any = true
+        } else if r.kw("default") && r.kwAt(1, "label") {
+            r.pos += 2
+            append(mut &el.labels, Label{name: el.name.clone(), props: try propsDef(st, txn, r, &t, &tk, up)})
+            any = true
+        } else if !any && (r.kw("properties") || (r.kw("no") && r.kwAt(1, "properties"))) {
+            append(mut &el.labels, Label{name: el.name.clone(), props: try propsDef(st, txn, r, &t, &tk, up)})
+            any = true
+            break
+        } else {
+            break
+        }
+    }
+    if !any { append(mut &el.labels, Label{name: el.name.clone(), props: allCols(&t, &[])}) }
+    for l in el.labels {
+        for i in 0..len(l.props) {
+            for j in 0..i {
+                if l.props[i].name == l.props[j].name { return Err(ora(42407, &("duplicate property name in label " + l.name + " : " + l.props[i].name))) }
+            }
+        }
+    }
+    return Ok(Def{el: el, t: t, srcAt: -1, dstAt: -1})
+}
+
+// (col, ...): the columns of t (lexdb's names), ORA-00904 for one it has not.
+fn colList(r: mut &Rdr, t: &Table): Result[[]str, DbErr] {
+    try r.expectOp("(")
+    var out: []str = []
+    if r.op(")") { return Err(ora(936, "missing expression")) }
+    while true {
+        let c = try r.nameTok()
+        if colIdx(t, &c.text) < 0 { return Err(ora(904, &("\"" + canon(&c) + "\": invalid identifier"))) }
+        append(mut &out, c.text.clone())
+        if !r.acceptOp(",") { break }
+    }
+    try r.expectOp(")")
+    return Ok(out)
+}
+
+// An edge's SOURCE or DESTINATION: [KEY (cols) REFERENCES] vertex [(cols)], or the vertex alone (the edge table's one foreign
+// key to the vertex table).
+fn endDef(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: mut &Rdr, t: &Table, edge: &str, defs: &[]Def): Result[End, DbErr] {
+    var cols: []str = []
+    let keyed = r.accept("key")
+    if keyed {
+        cols = try colList(r, t)
+        try r.expectKw("references")
+    }
+    let vt = try r.nameTok()
+    let vn = canon(&vt)
+    var vi = -1
+    for i in 0..len(defs) { if defs[i].el.vertex && defs[i].el.name == vn { vi = i } }
+    if vi < 0 { return Err(ora(42405, &("Referenced vertex table " + vn + " does not exist."))) }
+    let v = &defs[vi]
+    var refs: []str = []
+    if r.op("(") { refs = try colList(r, &v.t) } else { for k in v.el.keys { append(mut &refs, k.clone()) } }
+    if !keyed {
+        // the foreign key from the edge table to the vertex table, if it has one only
+        var found = 0
+        for f in t.fks {
+            if f.ref == v.el.table {
+                found += 1
+                cols = f.cols.clone()
+                refs = f.refCols.clone()
+            }
+        }
+        if found != 1 { return Err(ora(42413, &("cannot infer edge relationship for edge table " + edge))) }
+    }
+    if len(cols) != len(refs) { return Err(ora(42415, "missing key column in edge reference definition")) }
+    return Ok(End{elem: vn, cols: cols, refs: refs})
+}
+
+// Every column of t as a property, but those in except.
+fn allCols(t: &Table, except: &[]str): []Prop {
+    var out: []Prop = []
+    for c in t.cols {
+        if c.name == lexdb_catalog.ROWID || lexdb_base.hasStr(except, &c.name) { continue }
+        append(mut &out, Prop{name: shownOf(&c.name, &c.spell), expr: c.name.clone(), col: c.name.clone(), uses: [c.name.clone()], typ: viewTyp(t, &c.typ)})
+    }
+    return out
+}
+
+// The functions a property's expression may not call (Oracle's: only pure functions, ORA-42439).
+fn impure(w: &str): bool {
+    match w.toStr() {
+        "sysdate", "systimestamp", "current_date", "current_timestamp", "localtimestamp", "sys_guid", "dbms_random", "user", "uid",
+        "userenv", "sys_context", "rownum", "level", "dbtimezone", "sessiontimezone", "uuid" { return true }
+        else { return false }
+    }
+}
+
+// PROPERTIES (item, ...) | PROPERTIES [ARE] ALL COLUMNS [EXCEPT (cols)] | NO PROPERTIES; none: every column.
+fn propsDef(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: mut &Rdr, t: &Table, tk: &str, up: &Up): Result[[]Prop, DbErr] {
+    if r.kw("no") && r.kwAt(1, "properties") {
+        r.pos += 2
+        return Ok([])
+    }
+    if !r.accept("properties") { return Ok(allCols(t, &[])) }
+    let are = r.accept("are")
+    if r.accept("all") {
+        try r.expectKw("columns")
+        var except: []str = []
+        if r.accept("except") { except = try colList(r, t) }
+        return Ok(allCols(t, &except))
+    }
+    if are { return Err(ora(2000, "missing ALL keyword")) }
+    try r.expectOp("(")
+    if r.op(")") { return Err(ora(936, "missing expression")) }
+    var out: []Prop = []
+    var exprs: []int = []          // the expressions' places in out
+    var sel = ""
+    while true {
+        let lo = r.pos
+        let hi = r.itemEnd(lo)
+        if lo == hi { return Err(ora(936, "missing expression")) }
+        // [expr] [AS name]
+        var end = hi
+        var pname = ""
+        if hi - lo >= 2 && r.toks[hi - 2].kind == T_IDENT && r.toks[hi - 2].text == "as" && isName(&r.toks[hi - 1]) {
+            pname = canon(&r.toks[hi - 1])
+            end = hi - 2
+        }
+        if end - lo == 1 && isName(&r.toks[lo]) {
+            let c = &r.toks[lo]
+            let ci = colIdx(t, &c.text)
+            if ci < 0 && c.kind == T_IDENT && impure(&c.text) { return Err(ora(42439, "only pure functions can be specified in a column expression used to define a property")) }
+            if ci < 0 { return Err(ora(904, &("\"" + canon(c) + "\": invalid identifier"))) }
+            if len(pname) == 0 { pname = shownOf(&t.cols[ci].name, &t.cols[ci].spell) }
+            append(mut &out, Prop{name: pname, expr: c.text.clone(), col: c.text.clone(), uses: [c.text.clone()], typ: viewTyp(t, &t.cols[ci].typ)})
+        } else {
+            if len(pname) == 0 { return Err(ora(42424, "An expression based label property definition must use the AS clause.")) }
+            var uses: []str = []
+            for i in lo..end {
+                let x = &r.toks[i]
+                if x.kind == T_IDENT && impure(&x.text) { return Err(ora(42439, "only pure functions can be specified in a column expression used to define a property")) }
+                if isName(x) && !(i + 1 < end && r.toks[i + 1].kind == T_OP && r.toks[i + 1].text == "(") && !(i > lo && r.toks[i - 1].kind == T_OP && r.toks[i - 1].text == ".") &&
+                   colIdx(t, &x.text) >= 0 && !lexdb_base.hasStr(&uses, &x.text) {
+                    append(mut &uses, x.text.clone())
+                }
+            }
+            let ex = r.text(lo, end)
+            if len(sel) > 0 { sel += ", " }
+            sel += "(" + ex + ")"
+            append(mut &exprs, len(out))
+            append(mut &out, Prop{name: pname, expr: ex, col: "", uses: uses, typ: lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0}})
+        }
+        r.pos = hi
+        if !r.acceptOp(",") { break }
+    }
+    try r.expectOp(")")
+    if len(exprs) > 0 {
+        // the expressions' types: as a query of the table gives them (and its errors, ORA-00904 for a column it has not)
+        var ss = try lexdb_parse.oraParse(&("select " + sel + " from " + relText(tk)))
+        let none: []int = []
+        let cols = try up.describe(st, &ss[0], &none, &txn.sql.path)
+        for i in 0..len(exprs) {
+            if i >= len(cols) { continue }
+            var ty = lexdb_catalog.typeOfMod(cols[i].oid, -1)
+            // (a query's text column has no length: an expression's is its text columns' longest, or their sum for ||, else 4,000)
+            if ty.kind == lexdb_sql.K_TEXT && ty.len == 0 { ty.len = textLen(t, &out[exprs[i]]) }
+            out[exprs[i]].typ = ty
+        }
+    }
+    return Ok(out)
+}
+
+fn textLen(t: &Table, p: &Prop): int {
+    var most = 0
+    var sum = 0
+    for u in p.uses {
+        let ci = colIdx(t, &u)
+        if ci >= 0 && t.cols[ci].typ.kind == lexdb_sql.K_TEXT && t.cols[ci].typ.len > 0 {
+            sum += t.cols[ci].typ.len
+            if t.cols[ci].typ.len > most { most = t.cols[ci].typ.len }
+        }
+    }
+    let n = if strings.contains(&p.expr, "||") { sum } else { most }
+    return if n > 0 && n <= 4000 { n } else { 4000 }
+}
+
+// ---- GRAPH_TABLE
+
+pub fn isGraph(s: &Stmt): bool { return s.srf == lexdb_sql.GRAPH_MARK }
+
+// A GRAPH_TABLE subquery (isGraph) as the query it stands for, parsed, to be planned in its place.
+pub fn expand(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt): Result[Stmt, DbErr] {
+    let sql = try rewrite(st, txn, &s.index)
+    var ss = try lexdb_parse.oraParseNls(&sql, s.names.clone())
+    if len(ss) != 1 { return Err(lexdb_base.corrupt("GRAPH_TABLE's query")) }
+    var out = pop(mut &ss)
+    out.use = lexdb_sql.SUB_FROM
+    out.mdialect = lexdb_sql.MD_ORA
+    return Ok(out)
+}
+
+// GRAPH_TABLE's text as the SQL of its query (exec_graph's tests compare the two).
+pub fn rewriteText(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str): Result[str, DbErr] { return rewrite(st, txn, text) }
+
+const DIR_R = 1                 // ->
+const DIR_L = 2                 // <-
+const DIR_ANY = 3               // -
+
+// An element pattern: (v IS l WHERE c) or -[e IS l WHERE c]->: its variable ("" none), label expression (an OR of ANDs; []
+// none), WHERE's tokens [wlo, whi) (wlo -1 none), an edge's direction.
+type EP = record {
+    vertex: bool
+    vname: str
+    lab: [][]str
+    wlo: int
+    whi: int
+    dir: int
+}
+
+// A path's item: an element pattern, or a bracketed path (sub) with its quantifier; an edge with a quantifier is a path of one.
+type PI = record {
+    group: bool
+    ep: EP
+    sub: []PI
+    lo: int
+    hi: int
+    gid: int
+}
+
+// A variable as the pattern declares it: a vertex's or an edge's, of a quantified part (group >= 0) or not.
+type Decl = record {
+    name: str
+    vertex: bool
+    group: int
+    labs: [][][]str             // its label expressions (each must hold)
+}
+
+// A COLUMNS item: its tokens, its name.
+type Col = record {
+    lo: int
+    hi: int
+    name: str
+    vname: str                    // var.prop alone (or var.* expanded): the variable and the property
+    prop: str
+    matchnum: bool
+}
+
+// The parsed GRAPH_TABLE.
+type GT = record {
+    r: Rdr
+    g: Graph
+    tabs: []Table               // per element, its table
+    paths: [][]PI
+    decls: []Decl
+    groups: []int               // per quantified part, its count of lengths ([lo, hi]: hi - lo + 1)
+    glo: []int
+    ghi: []int
+    wlo: int                    // MATCH's WHERE
+    whi: int
+    cols: []Col
+    owner: str
+    allCols: []str              // every column of every element table (a bare name that is one is an undeclared variable)
+}
+
+// A variable of one expansion: its occurrences' constraints.
+type Var = record {
+    name: str                   // its own (a quantified part's copies: name#gid.copy)
+    base: str                   // the pattern's
+    vertex: bool
+    group: int
+    copy: int
+    labs: [][][]str
+    wheres: []Wh
+    rep: int                    // the variable it is one with (two vertex patterns side by side); its own index if none
+}
+
+type Wh = value record { lo: int; hi: int; group: int; copy: int }
+
+// An edge pattern's place in one expansion: the edge, the vertices on its left and right, its direction.
+type Occ = value record { e: int; x: int; y: int; dir: int }
+
+// One expansion: its variables and edges.
+type Exp = record {
+    vars: []Var
+    occs: []Occ
+    counts: []int               // per quantified part, its length here
+}
+
+fn noEP(): EP { return EP{vertex: true, vname: "", lab: [], wlo: -1, whi: -1, dir: 0} }
+
+fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str): Result[str, DbErr] {
+    var gt = try parseGT(st, txn, text)
+    // the lengths of each quantified part: every combination, an expansion
+    var exps: []Exp = []
+    var counts: []int = []
+    for i in 0..len(gt.glo) { append(mut &counts, gt.glo[i]) }
+    while true {
+        append(mut &exps, try expansion(&gt, &counts))
+        var k = len(counts) - 1
+        while k >= 0 {
+            if counts[k] < gt.ghi[k] {
+                counts[k] += 1
+                break
+            }
+            counts[k] = gt.glo[k]
+            k -= 1
+        }
+        if k < 0 { break }
+        if len(exps) > 4096 { return Err(e("0A000", "lexdb: GRAPH_TABLE's pattern has too many lengths (more than 4,096 combinations)")) }
+    }
+    try checkRefs(&gt)
+    var branches: []str = []
+    for x in exps { try branchesOf(&gt, &x, mut &branches) }
+    if len(branches) > 4096 { return Err(e("0A000", "lexdb: GRAPH_TABLE's pattern stands for more than 4,096 joins")) }
+    if len(branches) == 0 {
+        // nothing can match: the first expansion with its first elements, under a false condition (for the columns' types)
+        try fallback(&gt, &exps[0], mut &branches)
+    }
+    var any = false
+    for c in gt.cols { if c.matchnum { any = true } }
+    let body = strings.join(&branches, " union all ")
+    if !any { return Ok(body) }
+    // MATCHNUM(): the matches numbered
+    var sel: []str = []
+    for c in gt.cols {
+        if c.matchnum { append(mut &sel, "row_number() over (order by null) " + q(&c.name)) } else { append(mut &sel, "\"gt$m\"." + q(&c.name) + " " + q(&c.name)) }
+    }
+    return Ok("select " + strings.join(&sel, ", ") + " from (" + body + ") \"gt$m\"")
+}
+
+// ---- reading GRAPH_TABLE's text
+
+fn parseGT(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str): Result[GT, DbErr] {
+    var r = try reader(text)
+    var shown = ""
+    let gn = try r.relName(mut &shown)
+    let gk = try graphOf(st, txn, &gn)
+    if len(gk) == 0 { return Err(ora(42421, "property graph does not exist")) }
+    let g = (try readGraph(st, txn, &gk)).unwrap()
+    let sc = lexdb_sql.schemaOf(&gk)
+    let owner = if sc == "public" { strings.toUpperAscii(&st.memo.get(&lexdb_catalog.userKey(txn.sql.sess)).unwrapOr("lexdb")) } else { shownOf(&sc, &"") }
+    // its tables and columns as they are now: one gone makes the graph invalid
+    var tabs: []Table = []
+    var allCols: []str = []
+    for el in g.elems {
+        let bad = ora(4045, &("errors during recompilation or revalidation of " + owner + "." + g.name))
+        let t = match try tableOf(st, txn, &el.table) {
+            Some(x) { x }
+            None { return Err(bad) }
+        }
+        var need: []str = []
+        for k in el.keys { append(mut &need, k.clone()) }
+        for k in el.src.cols { append(mut &need, k.clone()) }
+        for k in el.dst.cols { append(mut &need, k.clone()) }
+        for l in el.labels { for p in l.props { for u in p.uses { append(mut &need, u.clone()) } } }
+        for n in need { if colIdx(&t, &n) < 0 { return Err(bad) } }
+        for c in t.cols { if !lexdb_base.hasStr(&allCols, &c.name) { append(mut &allCols, c.name.clone()) } }
+        append(mut &tabs, t)
+    }
+    // (an edge's vertex columns are its vertex's key: checked with it)
+    var gt = GT{r: Rdr{toks: [], pos: 0, src: ""}, g: g, tabs: tabs, paths: [], decls: [], groups: [], glo: [], ghi: [], wlo: -1, whi: -1, cols: [], owner: owner, allCols: allCols}
+    if !r.accept("match") { return Err(ora(2000, "missing MATCH keyword")) }
+    while true {
+        var path: []PI = []
+        try pathOf(mut &r, mut &gt, mut &path, -1, 0)
+        if len(path) == 0 { return Err(ora(40997, "invalid path pattern expression is specified in a GRAPH_TABLE operator")) }
+        append(mut &gt.paths, path)
+        if !r.acceptOp(",") { break }
+    }
+    if r.accept("where") {
+        gt.wlo = r.pos
+        var d = 0
+        while r.peek().kind != T_EOF {
+            if r.op("(") { d += 1 } else if r.op(")") { d -= 1 }
+            if d == 0 && (r.kw("columns") || (r.kw("one") && r.kwAt(1, "row"))) { break }
+            r.pos += 1
+        }
+        gt.whi = r.pos
+        if gt.whi == gt.wlo { return Err(ora(936, "missing expression")) }
+    }
+    if r.kw("one") && r.kwAt(1, "row") && r.kwAt(2, "per") {
+        r.pos += 3
+        if r.accept("vertex") || r.accept("step") {
+            return Err(e("0A000", "lexdb: GRAPH_TABLE's ONE ROW PER VERTEX and ONE ROW PER STEP are not supported (ONE ROW PER MATCH is)"))
+        }
+        try r.expectKw("match")
+    }
+    if !r.accept("columns") { return Err(ora(40997, "invalid path pattern expression is specified in a GRAPH_TABLE operator")) }
+    try r.expectOp("(")
+    if r.op(")") { return Err(ora(936, "missing expression")) }
+    while true {
+        let lo = r.pos
+        let hi = r.itemEnd(lo)
+        if lo == hi { return Err(ora(936, "missing expression")) }
+        try colItem(&r, mut &gt, lo, hi)
+        r.pos = hi
+        if !r.acceptOp(",") { break }
+    }
+    try r.expectOp(")")
+    if r.peek().kind != T_EOF { return Err(r.near()) }
+    for i in 0..len(gt.cols) {
+        for j in 0..i {
+            if gt.cols[i].name == gt.cols[j].name { return Err(ora(918, &(gt.cols[i].name + ": column ambiguously specified"))) }
+        }
+    }
+    gt.r = r
+    return Ok(gt)
+}
+
+// A label expression: l | l & l | (expr), in disjunctive form.
+fn labelExpr(r: mut &Rdr): Result[[][]str, DbErr] {
+    var out = try labelTerm(r)
+    while r.acceptOp("|") {
+        for t in try labelTerm(r) { append(mut &out, t) }
+    }
+    return Ok(out)
+}
+
+fn labelTerm(r: mut &Rdr): Result[[][]str, DbErr] {
+    var out = try labelFactor(r)
+    while r.acceptOp("&") {
+        let f = try labelFactor(r)
+        var next: [][]str = []
+        for a in out {
+            for b in f {
+                var c = a.clone()
+                for x in b { append(mut &c, x.clone()) }
+                append(mut &next, c)
+            }
+        }
+        out = next
+    }
+    return Ok(out)
+}
+
+fn labelFactor(r: mut &Rdr): Result[[][]str, DbErr] {
+    if r.acceptOp("(") {
+        let x = try labelExpr(r)
+        try r.expectOp(")")
+        return Ok(x)
+    }
+    if r.op("!") { return Err(ora(40951, "unsupported operation for GRAPH_TABLE: Complex label expressions")) }
+    if r.op("%") { return Err(ora(911, "%: invalid character after IS")) }
+    let t = try r.nameTok()
+    return Ok([[canon(&t)]])
+}
+
+// The inside of an element pattern: [var] [IS labels] [WHERE cond], up to close.
+fn epBody(r: mut &Rdr, gt: mut &GT, vertex: bool, close: &str, group: int): Result[EP, DbErr] {
+    var ep = noEP()
+    ep.vertex = vertex
+    if isName(r.peek()) && !r.kw("is") && !r.kw("where") {
+        let t = try r.nameTok()
+        ep.vname = canon(&t)
+    }
+    if r.accept("is") { ep.lab = try labelExpr(r) }
+    if r.accept("where") {
+        ep.wlo = r.pos
+        var d = 0
+        while r.peek().kind != T_EOF {
+            if r.op("(") || r.op("[") { d += 1 }
+            else if r.op(")") || r.op("]") {
+                if d == 0 { break }
+                d -= 1
+            }
+            r.pos += 1
+        }
+        ep.whi = r.pos
+    }
+    if !r.acceptOp(close) { return Err(if close == ")" { ora(907, "missing right parenthesis") } else { r.near() }) }
+    // the variable declared (or met again)
+    if len(ep.vname) > 0 {
+        var found = -1
+        for i in 0..len(gt.decls) { if gt.decls[i].name == ep.vname { found = i } }
+        if found >= 0 {
+            if gt.decls[found].vertex != vertex { return Err(ora(49000, "A vertex variable has the same name as an edge variable.")) }
+            if len(ep.lab) > 0 { append(mut &gt.decls[found].labs, ep.lab.clone()) }
+        } else {
+            var labs: [][][]str = []
+            if len(ep.lab) > 0 { append(mut &labs, ep.lab.clone()) }
+            append(mut &gt.decls, Decl{name: ep.vname.clone(), vertex: vertex, group: group, labs: labs})
+        }
+    }
+    // its labels are the graph's (a vertex's among the vertex tables', an edge's among the edge tables')
+    for t in ep.lab {
+        for l in t {
+            var known = false
+            for el in gt.g.elems { if el.vertex == vertex { for x in el.labels { if x.name == l { known = true } } } }
+            if !known { return Err(ora(40954, "unknown label")) }
+        }
+    }
+    return Ok(ep)
+}
+
+// A quantifier after an edge or a bracketed path: {n}, {m,n}, {,n}; lo and hi -1: none.
+fn quant(r: mut &Rdr, lo: mut &int, hi: mut &int): Result[Unit, DbErr] {
+    if r.op("+") || r.op("*") { return Err(ora(40985, "unsupported quantifier for variable path pattern in a GRAPH_TABLE operator")) }
+    if r.op("?") { return Err(ora(49003, "Using a question mark in path pattern is not supported.")) }
+    if !r.acceptOp("{") { return Ok(Unit{}) }
+    var a = 0
+    var b = -1
+    if r.peek().kind == T_NUM {
+        a = lexdb_base.num(&r.peek().text)
+        r.pos += 1
+        b = a
+    }
+    if r.acceptOp(",") {
+        if r.peek().kind != T_NUM { return Err(ora(40985, "unsupported quantifier for variable path pattern in a GRAPH_TABLE operator")) }
+        b = lexdb_base.num(&r.peek().text)
+        r.pos += 1
+    }
+    if !r.acceptOp("}") { return Err(ora(40984, "invalid value specified for bounded quantifier in a GRAPH_TABLE operator")) }
+    if b < 1 || a > b { return Err(ora(40984, "invalid value specified for bounded quantifier in a GRAPH_TABLE operator")) }
+    let x = replace(lo, a)
+    let y = replace(hi, b)
+    return Ok(Unit{})
+}
+
+fn newGroup(gt: mut &GT, lo: int, hi: int): int {
+    append(mut &gt.glo, lo)
+    append(mut &gt.ghi, hi)
+    return len(gt.glo) - 1
+}
+
+// A path pattern's items up to a "," at depth 0, the end, WHERE, COLUMNS or ONE (depth 0), or the ")" closing a bracketed path
+// (depth > 0).
+fn pathOf(r: mut &Rdr, gt: mut &GT, out: mut &[]PI, group: int, depth: int): Result[Unit, DbErr] {
+    while true {
+        if r.op("(") {
+            // a vertex pattern, or a bracketed path
+            let k = if isName(r.at(1)) && !r.kwAt(1, "is") && !r.kwAt(1, "where") { 2 } else { 1 }
+            let vtx = r.opAt(k, ")") || r.kwAt(k, "is") || r.kwAt(k, "where") || (k == 1 && (r.kwAt(1, "is") || r.kwAt(1, "where")))
+            if vtx {
+                r.pos += 1
+                let ep = try epBody(r, gt, true, &")", group)
+                if r.op("{") || r.op("+") || r.op("*") || r.op("?") {
+                    return Err(ora(40997, "invalid path pattern expression is specified in a GRAPH_TABLE operator"))
+                }
+                append(out, PI{group: false, ep: ep, sub: [], lo: 1, hi: 1, gid: -1})
+                continue
+            }
+            if group >= 0 { return Err(e("0A000", "lexdb: a quantified path pattern inside another is not supported")) }
+            r.pos += 1
+            var sub: []PI = []
+            // (its variables are the group's: its number is known once its quantifier is read, so made now and set after)
+            let gid = newGroup(gt, 1, 1)
+            try pathOf(r, gt, mut &sub, gid, depth + 1)
+            try r.expectOp(")")
+            var lo = -1
+            var hi = -1
+            try quant(r, mut &lo, mut &hi)
+            if lo < 0 { lo = 1; hi = 1 }
+            gt.glo[gid] = lo
+            gt.ghi[gid] = hi
+            append(out, PI{group: true, ep: noEP(), sub: sub, lo: lo, hi: hi, gid: gid})
+            continue
+        }
+        if r.op("-") || (r.op("<") && r.opAt(1, "-")) {
+            var ep = noEP()
+            ep.vertex = false
+            let left = r.op("<")
+            if left { r.pos += 2 } else { r.pos += 1 }
+            if r.op("[") {
+                r.pos += 1
+                // (the quantifier's group, if one follows: the variable belongs to it)
+                let save = r.pos
+                var depthB = 0
+                var j = r.pos
+                while j < len(r.toks) && r.toks[j].kind != T_EOF {
+                    if r.toks[j].kind == T_OP && r.toks[j].text == "[" { depthB += 1 }
+                    if r.toks[j].kind == T_OP && r.toks[j].text == "]" {
+                        if depthB == 0 { break }
+                        depthB -= 1
+                    }
+                    j += 1
+                }
+                // after "]": "-" or "->", then perhaps a quantifier
+                var k = j + 1
+                var right = false
+                if k < len(r.toks) && r.toks[k].kind == T_OP && r.toks[k].text == "-" {
+                    k += 1
+                    if !left && k < len(r.toks) && r.toks[k].kind == T_OP && r.toks[k].text == ">" {
+                        right = true
+                        k += 1
+                    }
+                } else {
+                    return Err(ora(40997, "invalid path pattern expression is specified in a GRAPH_TABLE operator"))
+                }
+                let quantified = k < len(r.toks) && r.toks[k].kind == T_OP && (r.toks[k].text == "{" || r.toks[k].text == "+" || r.toks[k].text == "*" || r.toks[k].text == "?")
+                var gid = group
+                if quantified && group < 0 { gid = newGroup(gt, 1, 1) }
+                if quantified && group >= 0 { return Err(e("0A000", "lexdb: a quantified path pattern inside another is not supported")) }
+                r.pos = save
+                let body = try epBody(r, gt, false, &"]", gid)
+                ep = body
+                ep.vertex = false
+                r.pos = j + 1
+                r.pos += 1
+                if right { r.pos += 1 }
+                ep.dir = if left { DIR_L } else if right { DIR_R } else { DIR_ANY }
+                if quantified && group < 0 {
+                    var lo = -1
+                    var hi = -1
+                    try quant(r, mut &lo, mut &hi)
+                    gt.glo[gid] = lo
+                    gt.ghi[gid] = hi
+                    append(out, PI{group: true, ep: noEP(), sub: [PI{group: false, ep: ep, sub: [], lo: 1, hi: 1, gid: -1}], lo: lo, hi: hi, gid: gid})
+                    continue
+                }
+                append(out, PI{group: false, ep: ep, sub: [], lo: 1, hi: 1, gid: -1})
+                continue
+            }
+            // the abbreviated ->, <-, -
+            if !left && r.op(">") {
+                r.pos += 1
+                ep.dir = DIR_R
+            } else {
+                ep.dir = if left { DIR_L } else { DIR_ANY }
+            }
+            if (r.op("{") || r.op("+") || r.op("*") || r.op("?")) && group < 0 {
+                var lo = -1
+                var hi = -1
+                try quant(r, mut &lo, mut &hi)
+                let gid = newGroup(gt, lo, hi)
+                append(out, PI{group: true, ep: noEP(), sub: [PI{group: false, ep: ep, sub: [], lo: 1, hi: 1, gid: -1}], lo: lo, hi: hi, gid: gid})
+                continue
+            }
+            append(out, PI{group: false, ep: ep, sub: [], lo: 1, hi: 1, gid: -1})
+            continue
+        }
+        break
+    }
+    return Ok(Unit{})
+}
+
+// A COLUMNS item: expr [AS name]; var.prop is named prop; var.* is every property of the variable's labels.
+fn colItem(r: &Rdr, gt: mut &GT, lo: int, hi: int): Result[Unit, DbErr] {
+    var end = hi
+    var name = ""
+    if hi - lo >= 3 && r.toks[hi - 2].kind == T_IDENT && r.toks[hi - 2].text == "as" && isName(&r.toks[hi - 1]) {
+        name = canon(&r.toks[hi - 1])
+        end = hi - 2
+    }
+    let t = &r.toks[lo]
+    if end - lo == 3 && isName(t) && r.toks[lo + 1].kind == T_OP && r.toks[lo + 1].text == "." && r.toks[lo + 2].kind == T_OP && r.toks[lo + 2].text == "*" && len(name) == 0 {
+        let v = canon(t)
+        let d = try declOf(gt, &v)
+        if gt.decls[d].group >= 0 { return Err(ora(40990, &("invalid reference of group variable " + v + " in the COLUMNS clause of a GRAPH_TABLE operator"))) }
+        for p in propsOf(gt, d) {
+            append(mut &gt.cols, Col{lo: lo, hi: lo + 3, name: p.clone(), vname: v.clone(), prop: p, matchnum: false})
+        }
+        return Ok(Unit{})
+    }
+    if end - lo == 3 && isName(t) && r.toks[lo + 1].kind == T_OP && r.toks[lo + 1].text == "." && isName(&r.toks[lo + 2]) {
+        let v = canon(t)
+        let p = canon(&r.toks[lo + 2])
+        if len(name) == 0 { name = p.clone() }
+        append(mut &gt.cols, Col{lo: lo, hi: end, name: name, vname: v, prop: p, matchnum: false})
+        return Ok(Unit{})
+    }
+    if len(name) == 0 { return Err(ora(2000, "missing AS keyword")) }
+    let mn = end - lo == 3 && t.kind == T_IDENT && t.text == "matchnum" && r.toks[lo + 1].kind == T_OP && r.toks[lo + 1].text == "(" && r.toks[lo + 2].kind == T_OP && r.toks[lo + 2].text == ")"
+    append(mut &gt.cols, Col{lo: lo, hi: end, name: name, vname: "", prop: "", matchnum: mn})
+    return Ok(Unit{})
+}
+
+fn declOf(gt: &GT, v: &str): Result[int, DbErr] {
+    for i in 0..len(gt.decls) { if gt.decls[i].name == v { return Ok(i) } }
+    return Err(ora(40996, &("Variable " + v + " is not declared in the MATCH clause of a GRAPH_TABLE operator.")))
+}
+
+// The labels a declared variable may have: every label of the elements it may be bound to.
+fn labelsOf(gt: &GT, d: int): []str {
+    // (Oracle's: every label of the elements the variable may be bound to, not only those its expressions name)
+    var out: []str = []
+    let dv = &gt.decls[d]
+    for i in candidates(gt, dv.vertex, &dv.labs) {
+        for l in gt.g.elems[i].labels { if !lexdb_base.hasStr(&out, &l.name) { append(mut &out, l.name.clone()) } }
+    }
+    return out
+}
+
+// The properties of a declared variable's labels, in the order the graph defines them.
+fn propsOf(gt: &GT, d: int): []str {
+    let ls = labelsOf(gt, d)
+    var out: []str = []
+    for el in gt.g.elems {
+        if el.vertex != gt.decls[d].vertex { continue }
+        for l in el.labels {
+            if !lexdb_base.hasStr(&ls, &l.name) { continue }
+            for p in l.props { if !lexdb_base.hasStr(&out, &p.name) { append(mut &out, p.name.clone()) } }
+        }
+    }
+    return out
+}
+
+// Whether element el has the labels of an expression (an OR of ANDs).
+fn satisfies(el: &Elem, lab: &[][]str): bool {
+    if len(lab) == 0 { return true }
+    for t in lab {
+        var all = true
+        for l in t {
+            var has = false
+            for x in el.labels { if x.name == l { has = true } }
+            if !has { all = false }
+        }
+        if all { return true }
+    }
+    return false
+}
+
+// The elements a variable with these label expressions may be bound to.
+fn candidates(gt: &GT, vertex: bool, labs: &[][][]str): []int {
+    var out: []int = []
+    for i in 0..len(gt.g.elems) {
+        let el = &gt.g.elems[i]
+        if el.vertex != vertex { continue }
+        var ok = true
+        for lab in labs { if !satisfies(el, lab) { ok = false } }
+        if ok { append(mut &out, i) }
+    }
+    return out
+}
+
+// The property references of COLUMNS and WHERE checked before anything is made: ORA-40983 (no label has it), ORA-49044 (not the
+// variable's labels'), ORA-49013 (no element has the variable's labels).
+fn checkRefs(gt: &GT): Result[Unit, DbErr] {
+    let r = &gt.r
+    var spans: [][]int = []
+    if gt.wlo >= 0 { append(mut &spans, [gt.wlo, gt.whi]) }
+    for c in gt.cols { append(mut &spans, [c.lo, c.hi]) }
+    for pt in gt.paths { epSpans(&pt, mut &spans) }
+    for sp in spans {
+        var i = sp[0]
+        while i + 2 < sp[1] {
+            let t = &r.toks[i]
+            if isName(t) && r.toks[i + 1].kind == T_OP && r.toks[i + 1].text == "." && isName(&r.toks[i + 2]) && !(i > 0 && r.toks[i - 1].kind == T_OP && r.toks[i - 1].text == ".") {
+                let v = canon(t)
+                var d = -1
+                for k in 0..len(gt.decls) { if gt.decls[k].name == v { d = k } }
+                if d >= 0 { try checkProp(gt, d, &canon(&r.toks[i + 2])) }
+                i += 3
+                continue
+            }
+            i += 1
+        }
+    }
+    return Ok(Unit{})
+}
+
+fn epSpans(pt: &[]PI, out: mut &[][]int) {
+    for it in pt {
+        if it.group { epSpans(&it.sub, out) }
+        else if it.ep.wlo >= 0 { append(out, [it.ep.wlo, it.ep.whi]) }
+    }
+}
+
+fn checkProp(gt: &GT, d: int, p: &str): Result[Unit, DbErr] {
+    var anywhere = false
+    for el in gt.g.elems { for l in el.labels { for x in l.props { if x.name == p { anywhere = true } } } }
+    if !anywhere { return Err(ora(40983, &("property \"" + p + "\" is noRows defined"))) }
+    let v = &gt.decls[d].name
+    if len(candidates(gt, gt.decls[d].vertex, &gt.decls[d].labs)) == 0 {
+        return Err(ora(49013, &("Invalid property reference \"" + p + "\" because the label expression for variable \"" + v + "\" is not satisfied.")))
+    }
+    if !lexdb_base.hasStr(&propsOf(gt, d), p) {
+        return Err(ora(49044, &("Property \"" + p + "\" is noRows defined when evaluating the label expression for element variable \"" + v + "\".")))
+    }
+    return Ok(Unit{})
+}
+
+// ---- one expansion: the quantified parts at the lengths of counts
+
+fn expansion(gt: &GT, counts: &[]int): Result[Exp, DbErr] {
+    var x = Exp{vars: [], occs: [], counts: counts.clone()}
+    var anon = 0
+    for pt in gt.paths {
+        // the path flattened: its element patterns, a quantified part's copies (variables of copy c named name#gid.c)
+        var flat: []Var = []
+        var dirs: []int = []
+        flatten(gt, &pt, counts, -1, 0, mut &flat, mut &dirs, mut &anon)
+        // vertices between edges and at the ends; two vertices side by side are one
+        var seq: []int = []          // the path's variables (indexes in x.vars), vertex, edge, vertex, ...
+        var seqDir: []int = []
+        var lastVertex = false
+        for i in 0..len(flat) {
+            let isV = flat[i].vertex
+            if isV && lastVertex {
+                let a = seq[len(seq) - 1]
+                let b = varIndex(mut &x, &flat[i])
+                unite(mut &x, a, b)
+                continue
+            }
+            if !isV && !lastVertex {
+                anon += 1
+                append(mut &seq, varIndex(mut &x, &anonVar(anon)))
+                append(mut &seqDir, 0)
+            }
+            append(mut &seq, varIndex(mut &x, &flat[i]))
+            append(mut &seqDir, dirs[i])
+            lastVertex = isV
+        }
+        if !lastVertex {
+            anon += 1
+            append(mut &seq, varIndex(mut &x, &anonVar(anon)))
+            append(mut &seqDir, 0)
+        }
+        var i = 1
+        while i + 1 < len(seq) {
+            append(mut &x.occs, Occ{e: seq[i], x: seq[i - 1], y: seq[i + 1], dir: seqDir[i]})
+            i += 2
+        }
+    }
+    return Ok(x)
+}
+
+fn anonVar(n: int): Var {
+    return Var{name: "#v" + n.toStr(), base: "", vertex: true, group: -1, copy: 0, labs: [], wheres: [], rep: -1}
+}
+
+fn flatten(gt: &GT, pt: &[]PI, counts: &[]int, group: int, copy: int, out: mut &[]Var, dirs: mut &[]int, anon: mut &int) {
+    for it in pt {
+        if it.group {
+            for c in 1..counts[it.gid] + 1 { flatten(gt, &it.sub, counts, it.gid, c, out, dirs, anon) }
+            continue
+        }
+        var v = Var{name: "", base: it.ep.vname.clone(), vertex: it.ep.vertex, group: group, copy: copy, labs: [], wheres: [], rep: -1}
+        if len(v.base) == 0 {
+            anon += 1
+            v.name = "#a" + anon.toStr()
+        } else if group >= 0 {
+            v.name = v.base + "#" + group.toStr() + "." + copy.toStr()
+        } else {
+            v.name = v.base.clone()
+        }
+        if len(it.ep.lab) > 0 { append(mut &v.labs, it.ep.lab.clone()) }
+        if it.ep.wlo >= 0 { append(mut &v.wheres, Wh{lo: it.ep.wlo, hi: it.ep.whi, group: group, copy: copy}) }
+        append(out, v)
+        append(dirs, it.ep.dir)
+    }
+}
+
+// The variable of v in x (added, or its constraints added to the one of its name).
+fn varIndex(x: mut &Exp, v: &Var): int {
+    for i in 0..len(x.vars) {
+        if x.vars[i].name == v.name {
+            for l in v.labs { append(mut &x.vars[i].labs, l.clone()) }
+            for w in v.wheres { append(mut &x.vars[i].wheres, w) }
+            return i
+        }
+    }
+    var n = v.clone()
+    n.rep = len(x.vars)
+    append(mut &x.vars, n)
+    return len(x.vars) - 1
+}
+
+fn repOf(x: &Exp, i: int): int {
+    var k = i
+    while x.vars[k].rep != k { k = x.vars[k].rep }
+    return k
+}
+
+// Two vertex variables made one (b's constraints go to a's).
+fn unite(x: mut &Exp, a0: int, b0: int) {
+    let a = repOf(x, a0)
+    let b = repOf(x, b0)
+    if a == b { return }
+    let labs = x.vars[b].labs.clone()
+    let ws = x.vars[b].wheres.clone()
+    for l in labs { append(mut &x.vars[a].labs, l) }
+    for w in ws { append(mut &x.vars[a].wheres, w) }
+    x.vars[b].rep = a
+}
+
+// ---- the joins of one expansion
+
+// A binding of an expansion's variables to elements: per variable (its representative's), the element; per edge occurrence,
+// whether the edge's source is on its left.
+type Bind = record { el: []int; fwd: []bool }
+
+fn branchesOf(gt: &GT, x: &Exp, out: mut &[]str): Result[Unit, DbErr] {
+    var cands: [][]int = []
+    for i in 0..len(x.vars) {
+        if repOf(x, i) != i {
+            append(mut &cands, [])
+            continue
+        }
+        append(mut &cands, candidates(gt, x.vars[i].vertex, &x.vars[i].labs))
+    }
+    var b = Bind{el: array(len(x.vars), -1), fwd: array(len(x.occs), true)}
+    try bindEdges(gt, x, &cands, 0, mut &b, out)
+    return Ok(Unit{})
+}
+
+// The edges' elements and directions chosen one by one, then the vertices': each binding that holds a join.
+fn bindEdges(gt: &GT, x: &Exp, cands: &[][]int, k: int, b: mut &Bind, out: mut &[]str): Result[Unit, DbErr] {
+    if len(out) > 4096 { return Err(e("0A000", "lexdb: GRAPH_TABLE's pattern stands for more than 4,096 joins")) }
+    // the edge variables first
+    var ev: []int = []
+    for i in 0..len(x.vars) { if !x.vars[i].vertex && repOf(x, i) == i { append(mut &ev, i) } }
+    if k < len(ev) {
+        for c in cands[ev[k]] {
+            b.el[ev[k]] = c
+            try bindEdges(gt, x, cands, k + 1, b, out)
+        }
+        b.el[ev[k]] = -1
+        return Ok(Unit{})
+    }
+    // then each occurrence's direction
+    let o = k - len(ev)
+    if o < len(x.occs) {
+        if x.occs[o].dir == DIR_ANY {
+            b.fwd[o] = true
+            try bindEdges(gt, x, cands, k + 1, b, out)
+            b.fwd[o] = false
+            try bindEdges(gt, x, cands, k + 1, b, out)
+            b.fwd[o] = true
+            return Ok(Unit{})
+        }
+        b.fwd[o] = x.occs[o].dir == DIR_R
+        return bindEdges(gt, x, cands, k + 1, b, out)
+    }
+    // the vertices the edges fix, then the others
+    var vel: []int = array(len(x.vars), -1)
+    for i in 0..len(x.occs) {
+        let oc = &x.occs[i]
+        let el = &gt.g.elems[b.el[repOf(x, oc.e)]]
+        let sx = elemIndex(gt, &el.src.elem)
+        let dx = elemIndex(gt, &el.dst.elem)
+        let lx = repOf(x, oc.x)
+        let ly = repOf(x, oc.y)
+        let wl = if b.fwd[i] { sx } else { dx }
+        let wr = if b.fwd[i] { dx } else { sx }
+        if (vel[lx] >= 0 && vel[lx] != wl) || (vel[ly] >= 0 && vel[ly] != wr) { return Ok(Unit{}) }
+        vel[lx] = wl
+        vel[ly] = wr
+    }
+    for i in 0..len(x.vars) {
+        if !x.vars[i].vertex || repOf(x, i) != i || vel[i] < 0 { continue }
+        if !hasInt(&cands[i], vel[i]) { return Ok(Unit{}) }
+        b.el[i] = vel[i]
+    }
+    return bindFree(gt, x, cands, 0, b, out)
+}
+
+fn bindFree(gt: &GT, x: &Exp, cands: &[][]int, from: int, b: mut &Bind, out: mut &[]str): Result[Unit, DbErr] {
+    var i = from
+    while i < len(x.vars) && !(x.vars[i].vertex && repOf(x, i) == i && b.el[i] < 0) { i += 1 }
+    if i == len(x.vars) {
+        append(out, try branchSql(gt, x, b, false))
+        return Ok(Unit{})
+    }
+    for c in cands[i] {
+        b.el[i] = c
+        try bindFree(gt, x, cands, i + 1, b, out)
+    }
+    b.el[i] = -1
+    return Ok(Unit{})
+}
+
+fn elemIndex(gt: &GT, n: &str): int {
+    for i in 0..len(gt.g.elems) { if gt.g.elems[i].vertex && gt.g.elems[i].name == n { return i } }
+    return -1
+}
+
+// No binding holds: one made of the first elements of each kind, its condition false.
+fn fallback(gt: &GT, x: &Exp, out: mut &[]str): Result[Unit, DbErr] {
+    var b = Bind{el: array(len(x.vars), -1), fwd: array(len(x.occs), true)}
+    for i in 0..len(x.vars) {
+        if repOf(x, i) != i { continue }
+        let cs = candidates(gt, x.vars[i].vertex, &x.vars[i].labs)
+        if len(cs) > 0 { b.el[i] = cs[0] } else {
+            for k in 0..len(gt.g.elems) { if gt.g.elems[k].vertex == x.vars[i].vertex && b.el[i] < 0 { b.el[i] = k } }
+        }
+    }
+    append(out, try branchSql(gt, x, &b, true))
+    return Ok(Unit{})
+}
+
+fn alias(i: int): str { return "\"gt$" + i.toStr() + "\"" }
+
+// The SQL of one binding: its tables, joined on the edges' keys, with the conditions and COLUMNS' items.
+fn branchSql(gt: &GT, x: &Exp, b: &Bind, noRows: bool): Result[str, DbErr] {
+    var from: []str = []
+    var conds: []str = []
+    for i in 0..len(x.vars) {
+        if repOf(x, i) != i { continue }
+        if b.el[i] < 0 { return Err(lexdb_base.corrupt("GRAPH_TABLE: a variable without an element")) }
+        append(mut &from, relText(&gt.g.elems[b.el[i]].table) + " " + alias(i))
+    }
+    for k in 0..len(x.occs) {
+        let oc = &x.occs[k]
+        let ei = repOf(x, oc.e)
+        let el = &gt.g.elems[b.el[ei]]
+        let l = repOf(x, oc.x)
+        let rr = repOf(x, oc.y)
+        let srcV = if b.fwd[k] { l } else { rr }
+        let dstV = if b.fwd[k] { rr } else { l }
+        for j in 0..len(el.src.cols) { append(mut &conds, alias(ei) + "." + q(&el.src.cols[j]) + " = " + alias(srcV) + "." + q(&el.src.refs[j])) }
+        for j in 0..len(el.dst.cols) { append(mut &conds, alias(ei) + "." + q(&el.dst.cols[j]) + " = " + alias(dstV) + "." + q(&el.dst.refs[j])) }
+        // an edge pattern without a direction matches an edge from a vertex to itself once
+        if oc.dir == DIR_ANY && !b.fwd[k] && el.src.elem == el.dst.elem {
+            let v = &gt.g.elems[b.el[l]]
+            var same: []str = []
+            for c in v.keys { append(mut &same, alias(l) + "." + q(&c) + " = " + alias(rr) + "." + q(&c)) }
+            append(mut &conds, "not (" + strings.join(&same, " and ") + ")")
+        }
+    }
+    for i in 0..len(x.vars) {
+        for w in x.vars[i].wheres {
+            append(mut &conds, "(" + try exprSql(gt, x, b, w.lo, w.hi, 2, w.group, w.copy) + ")")
+        }
+    }
+    if gt.wlo >= 0 { append(mut &conds, "(" + try exprSql(gt, x, b, gt.wlo, gt.whi, 1, -1, 0) + ")") }
+    if noRows { append(mut &conds, "1 = 0") }
+    var items: []str = []
+    for c in gt.cols {
+        if c.matchnum { continue }
+        let v = if len(c.vname) > 0 {
+            "(" + try propRef(gt, x, b, &c.vname, &c.prop, 0, -1, 0) + ")"
+        } else {
+            try exprSql(gt, x, b, c.lo, c.hi, 0, -1, 0)
+        }
+        append(mut &items, v + " " + q(&c.name))
+    }
+    if len(items) == 0 { append(mut &items, "null \"gt$none\"") }
+    var sql = "select " + strings.join(&items, ", ") + " from " + strings.join(&from, ", ")
+    if len(conds) > 0 { sql += " where " + strings.join(&conds, " and ") }
+    return Ok(sql)
+}
+
+// The variable of the pattern's name v in a binding: in the quantified part's copy (group, copy) where it is one of its, else the
+// one outside every quantified part. where: 0 COLUMNS, 1 MATCH's WHERE, 2 an element's WHERE (its errors differ).
+fn varFor(gt: &GT, x: &Exp, v: &str, where: int, group: int, copy: int): Result[int, DbErr] {
+    for i in 0..len(x.vars) {
+        if x.vars[i].base == v && x.vars[i].group == group && group >= 0 && x.vars[i].copy == copy { return Ok(repOf(x, i)) }
+    }
+    for i in 0..len(x.vars) { if x.vars[i].base == v && x.vars[i].group < 0 { return Ok(repOf(x, i)) } }
+    let d = try declOf(gt, v)
+    if gt.decls[d].group >= 0 {
+        if where == 1 { return Err(ora(40998, &("invalid reference of group variable " + v + " in the WHERE clause of a GRAPH_TABLE operator"))) }
+        return Err(ora(40990, &("invalid reference of group variable " + v + " in the COLUMNS clause of a GRAPH_TABLE operator")))
+    }
+    return Err(lexdb_base.corrupt("GRAPH_TABLE: a variable not bound"))
+}
+
+// v.p in a binding: the property's definition over v's table (NULL where v's element has not the property among its labels).
+fn propRef(gt: &GT, x: &Exp, b: &Bind, v: &str, p: &str, where: int, group: int, copy: int): Result[str, DbErr] {
+    let i = try varFor(gt, x, v, where, group, copy)
+    let d = try declOf(gt, v)
+    let ls = labelsOf(gt, d)
+    let el = &gt.g.elems[b.el[i]]
+    for l in el.labels {
+        if !lexdb_base.hasStr(&ls, &l.name) { continue }
+        for pr in l.props {
+            if pr.name == p { return qualified(&pr, &alias(i)) }
+        }
+    }
+    return Ok(nullOf(gt, p))
+}
+
+// A property the bound element has not: NULL of the property's type (where another element has it), so that the UNION ALL's
+// column has that type and not NULL's.
+fn nullOf(gt: &GT, p: &str): str {
+    for el in gt.g.elems {
+        for l in el.labels {
+            for pr in l.props {
+                if pr.name != p { continue }
+                let k = pr.typ.kind
+                if k == lexdb_sql.K_INT || k == lexdb_sql.K_NUM || k == lexdb_sql.K_FLOAT { return "cast(null as number)" }
+                if k == lexdb_sql.K_TEXT { return "cast(null as varchar2(4000))" }
+                if k == lexdb_sql.K_DATE { return "cast(null as date)" }
+                if k == lexdb_sql.K_TS { return "cast(null as timestamp)" }
+                if k == lexdb_sql.K_TSTZ { return "cast(null as timestamp with time zone)" }
+                return "null"
+            }
+        }
+    }
+    return "null"
+}
+
+// A view's text column has no length in lexdb (its USER_TAB_COLUMNS shows 4,000): its property's the same.
+fn viewTyp(t: &Table, ty: &TypeName): TypeName {
+    var x = ty.clone()
+    if len(t.view) > 0 && x.kind == lexdb_sql.K_TEXT && x.len == 0 { x.len = 4000 }
+    return x
+}
+
+// A property's definition with its columns qualified by the alias.
+fn qualified(p: &Prop, al: &str): Result[str, DbErr] {
+    if len(p.col) > 0 { return Ok(al + "." + q(&p.col)) }
+    let r = try reader(&p.expr)
+    var out = ""
+    for i in 0..len(r.toks) - 1 {
+        let t = &r.toks[i]
+        let piece = &r.src[t.at..r.toks[i + 1].at]
+        if isName(t) && lexdb_base.hasStr(&p.uses, &t.text) && !(r.toks[i + 1].kind == T_OP && r.toks[i + 1].text == "(") &&
+           !(i > 0 && r.toks[i - 1].kind == T_OP && r.toks[i - 1].text == ".") {
+            out += al + "." + q(&t.text) + " "
+            continue
+        }
+        out += piece
+    }
+    return Ok(out)
+}
+
+// The aggregates COLUMNS may take of a quantified part's variable.
+fn isAggName(n: &str): bool { return n == "count" || n == "sum" || n == "min" || n == "max" || n == "avg" || n == "listagg" }
+
+// The matching ")" of the "(" at i.
+fn closeOf(r: &Rdr, i: int, hi: int): int {
+    var d = 0
+    var k = i
+    while k < hi {
+        let t = &r.toks[k]
+        if t.kind == T_OP && t.text == "(" { d += 1 }
+        if t.kind == T_OP && t.text == ")" {
+            d -= 1
+            if d == 0 { return k }
+        }
+        k += 1
+    }
+    return hi
+}
+
+// The SQL of tokens [lo, hi) of an expression in a binding: v.p its property's definition, VERTEX_ID and EDGE_ID their JSON's
+// text, IS LABELED and IS SOURCE OF / IS DESTINATION OF conditions, a quantified part's aggregate an expression over its copies.
+fn exprSql(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, where: int, group: int, copy: int): Result[str, DbErr] {
+    let r = &gt.r
+    var out = ""
+    var i = lo
+    while i < hi {
+        let t = &r.toks[i]
+        let nx = &r.toks[i + 1]
+        let piece = &r.src[t.at..r.toks[i + 1].at]
+        if t.kind == T_OP && t.text == "(" && nx.kind == T_IDENT && (nx.text == "select" || nx.text == "with") {
+            return Err(ora(40988, "Subquery is not allowed in a GRAPH_TABLE operator."))
+        }
+        if isName(t) && nx.kind == T_OP && nx.text == "." && !(i > lo && r.toks[i - 1].kind == T_OP && r.toks[i - 1].text == ".") {
+            let v = canon(t)
+            var d = -1
+            for k in 0..len(gt.decls) { if gt.decls[k].name == v { d = k } }
+            if d >= 0 && i + 2 < hi && isName(&r.toks[i + 2]) {
+                out += "(" + try propRef(gt, x, b, &v, &canon(&r.toks[i + 2]), where, group, copy) + ") "
+                i += 3
+                continue
+            }
+            if d >= 0 { return Err(ora(40956, "invalid property name format")) }
+            // a qualified function's name (pkg.f(...)) is left as it is; anything else names no variable
+            if !(i + 3 < hi && isName(&r.toks[i + 2]) && r.toks[i + 3].kind == T_OP && r.toks[i + 3].text == "(") {
+                return Err(ora(40996, &("Variable " + v + " is not declared in the MATCH clause of a GRAPH_TABLE operator.")))
+            }
+        }
+        if t.kind == T_IDENT && nx.kind == T_OP && nx.text == "(" {
+            let c = closeOf(r, i + 1, hi)
+            if t.text == "vertex_id" || t.text == "edge_id" {
+                out += try idSql(gt, x, b, i + 2, c, t.text == "vertex_id", where, group, copy) + " "
+                i = c + 1
+                continue
+            }
+            if t.text == "json_serialize" && i + 3 < hi && r.toks[i + 2].kind == T_IDENT && (r.toks[i + 2].text == "vertex_id" || r.toks[i + 2].text == "edge_id") {
+                let c2 = closeOf(r, i + 3, hi)
+                out += try idSql(gt, x, b, i + 4, c2, r.toks[i + 2].text == "vertex_id", where, group, copy) + " "
+                i = c + 1
+                continue
+            }
+            if t.text == "element_number" { return Err(ora(49033, "ELEMENT_NUMBER can only be used in combination with ONE ROW PER VERTEX or STEP.")) }
+            if t.text == "matchnum" { return Err(e("0A000", "lexdb: MATCHNUM() is supported as a COLUMNS item by itself")) }
+            if isAggName(&t.text) && group < 0 {
+                out += try aggSql(gt, x, b, &t.text, i + 2, c, where) + " "
+                i = c + 1
+                continue
+            }
+        }
+        if isName(t) && !(nx.kind == T_OP && (nx.text == "(" || nx.text == ".")) && !(i > lo && r.toks[i - 1].kind == T_OP && r.toks[i - 1].text == ".") {
+            let v = canon(t)
+            var d = -1
+            for k in 0..len(gt.decls) { if gt.decls[k].name == v { d = k } }
+            if d >= 0 && nx.kind == T_IDENT && nx.text == "is" {
+                var n = 0
+                out += try isSql(gt, x, b, i, hi, where, group, copy, mut &n) + " "
+                i += n
+                continue
+            }
+            if d >= 0 { return Err(ora(40956, "invalid property name format")) }
+            // a bare name that is a column of the graph's tables would be read from them: no such variable
+            if t.kind == T_QIDENT || lexdb_base.hasStr(&gt.allCols, &t.text) {
+                return Err(ora(40996, &("Variable \"" + v + "\" is not declared in the MATCH clause of a GRAPH_TABLE operator.")))
+            }
+        }
+        out += piece
+        i += 1
+    }
+    return Ok(out)
+}
+
+// VERTEX_ID(v) or EDGE_ID(e) (its argument tokens [lo, hi)): the JSON Oracle gives, as text.
+fn idSql(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, vertex: bool, where: int, group: int, copy: int): Result[str, DbErr] {
+    let r = &gt.r
+    if hi - lo != 1 || !isName(&r.toks[lo]) { return Err(ora(40956, "invalid property name format")) }
+    let v = canon(&r.toks[lo])
+    let i = try varFor(gt, x, &v, where, group, copy)
+    let el = &gt.g.elems[b.el[i]]
+    let t = &gt.tabs[b.el[i]]
+    var parts: []str = []
+    for k in el.keys {
+        let ci = colIdx(t, &k)
+        let name = shownOf(&t.cols[ci].name, &t.cols[ci].spell)
+        let ref = alias(i) + "." + q(&k)
+        let kind = t.cols[ci].typ.kind
+        let val = if kind == lexdb_sql.K_INT || kind == lexdb_sql.K_NUM || kind == lexdb_sql.K_FLOAT { ref } else { "'\"' || " + ref + " || '\"'" }
+        append(mut &parts, "'\"" + name + "\":' || " + val)
+    }
+    return Ok("('{\"GRAPH_OWNER\":\"" + gt.owner + "\",\"GRAPH_NAME\":\"" + gt.g.name + "\",\"ELEM_TABLE\":\"" + el.name + "\",\"KEY_VALUE\":{' || " +
+              strings.join(&parts, " || ',' || ") + " || '}}')")
+}
+
+// v IS [NOT] LABELED l, v IS [NOT] SOURCE OF e, v IS [NOT] DESTINATION OF e (from i): its condition; n the tokens read.
+fn isSql(gt: &GT, x: &Exp, b: &Bind, i: int, hi: int, where: int, group: int, copy: int, n: mut &int): Result[str, DbErr] {
+    let r = &gt.r
+    var k = i + 2
+    var neg = false
+    if k < hi && r.toks[k].kind == T_IDENT && r.toks[k].text == "not" {
+        neg = true
+        k += 1
+    }
+    let v = canon(&r.toks[i])
+    let vi = try varFor(gt, x, &v, where, group, copy)
+    let el = &gt.g.elems[b.el[vi]]
+    if k < hi && r.toks[k].kind == T_IDENT && r.toks[k].text == "labeled" {
+        k += 1
+        if k >= hi || !isName(&r.toks[k]) { return Err(ora(931, "missing identifier")) }
+        let l = canon(&r.toks[k])
+        var known = false
+        for g in gt.g.elems { for x2 in g.labels { if x2.name == l { known = true } } }
+        if !known { return Err(ora(40954, "unknown label")) }
+        var has = false
+        for x2 in el.labels { if x2.name == l { has = true } }
+        let old = replace(n, k + 1 - i)
+        return Ok(if has != neg { "1 = 1" } else { "1 = 0" })
+    }
+    if k + 2 < hi + 1 && r.toks[k].kind == T_IDENT && (r.toks[k].text == "source" || r.toks[k].text == "destination") &&
+       r.toks[k + 1].kind == T_IDENT && r.toks[k + 1].text == "of" && isName(&r.toks[k + 2]) {
+        let src = r.toks[k].text == "source"
+        let ev = canon(&r.toks[k + 2])
+        let ei = try varFor(gt, x, &ev, where, group, copy)
+        let ed = &gt.g.elems[b.el[ei]]
+        let end = if src { &ed.src } else { &ed.dst }
+        let old = replace(n, k + 3 - i)
+        if gt.g.elems[b.el[ei]].vertex || !el.vertex { return Err(ora(40956, "invalid property name format")) }
+        if end.elem != el.name {
+            return Ok(if neg { "1 = 1" } else { "1 = 0" })
+        }
+        var eq: []str = []
+        for j in 0..len(end.cols) { append(mut &eq, alias(ei) + "." + q(&end.cols[j]) + " = " + alias(vi) + "." + q(&end.refs[j])) }
+        let c = "(" + strings.join(&eq, " and ") + ")"
+        return Ok(if neg { "not " + c } else { c })
+    }
+    return Err(ora(40956, "invalid property name format"))
+}
+
+// An aggregate of COLUMNS over a quantified part's copies (its argument tokens [lo, hi)): COUNT, SUM, MIN, MAX, AVG, LISTAGG,
+// each an expression over the copies' values (none at length 0: COUNT 0, the others NULL).
+fn aggSql(gt: &GT, x: &Exp, b: &Bind, f: &str, lo: int, hi: int, where: int): Result[str, DbErr] {
+    let r = &gt.r
+    if where != 0 { return Err(e("0A000", "lexdb: an aggregate of a quantified variable is supported in COLUMNS only")) }
+    if lo < hi && r.toks[lo].kind == T_OP && r.toks[lo].text == "*" { return Err(ora(49011, "A group function inside GRAPH_TABLE() must have a group reference.")) }
+    if lo < hi && r.toks[lo].kind == T_IDENT && (r.toks[lo].text == "distinct" || r.toks[lo].text == "all") {
+        return Err(e("0A000", "lexdb: DISTINCT in an aggregate of GRAPH_TABLE is not supported"))
+    }
+    if hi + 1 < len(r.toks) && r.toks[hi + 1].kind == T_IDENT && (r.toks[hi + 1].text == "within" || r.toks[hi + 1].text == "over") {
+        return Err(e("0A000", "lexdb: WITHIN GROUP and OVER after an aggregate of GRAPH_TABLE are not supported"))
+    }
+    // its argument, and LISTAGG's separator
+    var aend = hi
+    var sep = ""
+    var d = 0
+    for k in lo..hi {
+        let t = &r.toks[k]
+        if t.kind == T_OP && t.text == "(" { d += 1 }
+        if t.kind == T_OP && t.text == ")" { d -= 1 }
+        if t.kind == T_OP && t.text == "," && d == 0 {
+            aend = k
+            if f != "listagg" || k + 2 != hi || r.toks[k + 1].kind != T_STR { return Err(e("0A000", "lexdb: LISTAGG of GRAPH_TABLE takes a text literal as its separator")) }
+            sep = r.toks[k + 1].text.clone()
+            break
+        }
+    }
+    // the quantified part its variables are of
+    var grp = -1
+    for k in lo..aend {
+        let t = &r.toks[k]
+        if isName(t) && k + 1 < aend && r.toks[k + 1].kind == T_OP && r.toks[k + 1].text == "." {
+            let v = canon(t)
+            for dd in gt.decls { if dd.name == v && dd.group >= 0 { grp = dd.group } }
+        }
+        if isName(t) && !(k + 1 < aend && r.toks[k + 1].kind == T_OP && (r.toks[k + 1].text == "." || r.toks[k + 1].text == "(")) {
+            for dd in gt.decls { if dd.name == canon(t) { return Err(ora(40956, "invalid property name format")) } }
+        }
+    }
+    if grp < 0 { return Err(ora(49011, "A group function inside GRAPH_TABLE() must have a group reference.")) }
+    let n = x.counts[grp]
+    var vals: []str = []
+    for c in 1..n + 1 { append(mut &vals, "(" + try exprSql(gt, x, b, lo, aend, 0, grp, c) + ")") }
+    if n == 0 { return Ok(if f == "count" { "0" } else { "null" }) }
+    if f == "count" {
+        var ps: []str = []
+        for v in vals { append(mut &ps, "(case when " + v + " is null then 0 else 1 end)") }
+        return Ok("(" + strings.join(&ps, " + ") + ")")
+    }
+    if f == "sum" || f == "avg" {
+        var nulls: []str = []
+        var ps: []str = []
+        var cs: []str = []
+        for v in vals {
+            append(mut &nulls, v + " is null")
+            append(mut &ps, "nvl(" + v + ", 0)")
+            append(mut &cs, "(case when " + v + " is null then 0 else 1 end)")
+        }
+        let sum = "(case when " + strings.join(&nulls, " and ") + " then null else " + strings.join(&ps, " + ") + " end)"
+        if f == "sum" { return Ok(sum) }
+        return Ok("(" + sum + " / nullif(" + strings.join(&cs, " + ") + ", 0))")
+    }
+    if f == "min" || f == "max" {
+        if n == 1 { return Ok(vals[0].clone()) }
+        var ps: []str = []
+        for k in 0..n {
+            var order: []str = [vals[k].clone()]
+            for j in 0..n { if j != k { append(mut &order, vals[j].clone()) } }
+            append(mut &ps, "coalesce(" + strings.join(&order, ", ") + ")")
+        }
+        return Ok((if f == "min" { "least(" } else { "greatest(" }) + strings.join(&ps, ", ") + ")")
+    }
+    // LISTAGG: the values not NULL in the path's order, the separator between them
+    let lit = "'" + strings.replaceAll(&sep, "'", "''") + "'"
+    var ps: []str = []
+    for v in vals { append(mut &ps, "(case when " + v + " is not null then " + (if len(sep) > 0 { lit + " || " + v } else { "to_char(" + v + ")" }) + " end)") }
+    let cat = "(" + strings.join(&ps, " || ") + ")"
+    if len(sep) == 0 { return Ok(cat) }
+    return Ok("substr(" + cat + ", " + (len(sep) + 1).toStr() + ")")
+}
