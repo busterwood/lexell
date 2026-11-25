@@ -409,12 +409,15 @@ pub type Txn = record {
     pub tmp: str
     pub tmpDdl: bool
     pub onCommit: []str
+    // Trees whose OP_PUT writes in this txn were appended in strictly ascending key order
+    // (CREATE INDEX fast path): commitOrder, logWrites, and applyBulkLoad skip redundant key compares.
+    sortedTrees: []int
 }
 
 pub fn begin(): Txn {
     return Txn{reads: [], writes: [], cuts: [], idxTrees: [], idx: [], runs: [], sortedN: [], created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), snapLate: 0, track: false, live: false, lazySnap: false, rc: false, sql: lexdb_session.newSqlTxn(), now: time.now().unixMicros(),
                raTree: -1, ra: AHEAD_MIN, fsnap: [], lockId: 0, held: [], quiet: false, openEnd: false,
-               tmp: "", tmpDdl: false, onCommit: []}
+               tmp: "", tmpDdl: false, onCommit: [], sortedTrees: []}
 }
 
 // A transaction block's (BEGIN ... COMMIT), not a statement's own.
@@ -557,6 +560,44 @@ pub fn (t: mut &Txn) putRowLoad(tree: int, key: &str, val: &str, head: int): Res
     }
     append(mut &t.writes, TxWrite{op: OP_PUT, tree: tree, key: key.clone(), val: val.clone(), head: head})
     return Ok(Unit{})
+}
+
+// putRowLoad moving owned key and val directly into t.writes (no clone).
+pub fn (t: mut &Txn) putRowLoadMoved(tree: int, key: str, val: str, head: int): Result[Unit, lexdb_base.DbErr] {
+    if len(key) > lexdb_page.MAX_KEY {
+        return Err(lexdb_base.err(lexdb_base.S_LIMIT, &("key too large: " + len(key).toStr() + " bytes, at most " + lexdb_page.MAX_KEY.toStr())))
+    }
+    if len(val) > MAX_VALUE {
+        return Err(lexdb_base.err(lexdb_base.S_LIMIT, &("row too large: " + len(val).toStr() + " bytes, at most " + MAX_VALUE.toStr())))
+    }
+    append(mut &t.writes, TxWrite{op: OP_PUT, tree: tree, key: key, val: val, head: head})
+    return Ok(Unit{})
+}
+
+// Fast unchecked load append (caller verified key <= MAX_KEY and val <= MAX_VALUE):
+// avoids returning an 88-byte Result[Unit, DbErr] per row in multi-million-row builds.
+pub fn (t: mut &Txn) putLoadFast(tree: int, key: str, val: str, head: int) {
+    append(mut &t.writes, TxWrite{op: OP_PUT, tree: tree, key: key, val: val, head: head})
+}
+
+// Pre-allocates room in t.writes for extra upcoming bulk entries.
+pub fn (t: mut &Txn) reserveWrites(extra: int) {
+    if extra <= 0 { return }
+    let need = len(t.writes) + extra
+    var nw: []TxWrite = withCapacity(need)
+    var old = replace(mut &t.writes, nw)
+    for w in old { append(mut &t.writes, w) }
+}
+
+// Marks tree as having all its OP_PUT writes in this txn in strictly ascending key order.
+pub fn (t: mut &Txn) markSortedTree(tree: int) {
+    for x in t.sortedTrees { if x == tree { return } }
+    append(mut &t.sortedTrees, tree)
+}
+
+fn (t: &Txn) isSortedTree(tree: int): bool {
+    for x in t.sortedTrees { if x == tree { return true } }
+    return false
 }
 
 pub fn (t: mut &Txn) del(tree: int, key: &str) {
@@ -4373,36 +4414,53 @@ fn (db: &Db) validate(t: &Txn): bool {
 
 // Keeps a commit's writes for the checks of transactions still running.
 fn (db: mut &Db) logWrites(t: &Txn) {
-    // per tree: its writes' count and range
+    // per tree: its writes' count and range (tracked by index into t.writes so
+    // an ascending bulk load never clones every key).
     var trees: []int = []
     var counts: []int = []
-    var los: []str = []
-    var his: []str = []
-    for w in t.writes {
-        if w.op != OP_PUT && w.op != OP_DEL { continue }
+    var loIdx: []int = []
+    var hiIdx: []int = []
+    var anyOther = false
+    for idx in 0..len(t.writes) {
+        let w = &t.writes[idx]
+        if w.op != OP_PUT && w.op != OP_DEL {
+            if w.op == OP_DROP || w.op == OP_DELRANGE { anyOther = true }
+            continue
+        }
         var k = 0
         while k < len(trees) && trees[k] != w.tree { k += 1 }
         if k == len(trees) {
             append(mut &trees, w.tree)
             append(mut &counts, 0)
-            append(mut &los, w.key.clone())
-            append(mut &his, w.key.clone())
+            append(mut &loIdx, idx)
+            append(mut &hiIdx, idx)
         }
         counts[k] += 1
-        if w.key < los[k] { los[k] = w.key.clone() }
-        if w.key > his[k] { his[k] = w.key.clone() }
-    }
-    for k in 0..len(trees) {
-        if counts[k] > WLOG_RANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: trees[k], key: replace(mut &los[k], ""), hi: replace(mut &his[k], ""), all: false, open: false}) }
-    }
-    for w in t.writes {
-        if w.op == OP_PUT || w.op == OP_DEL {
-            var k = 0
-            while trees[k] != w.tree { k += 1 }
-            if counts[k] <= WLOG_RANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: w.key.clone(), hi: "", all: false, open: false}) }
+        if t.isSortedTree(w.tree) {
+            hiIdx[k] = idx
+        } else {
+            if w.key < t.writes[loIdx[k]].key { loIdx[k] = idx }
+            if w.key > t.writes[hiIdx[k]].key { hiIdx[k] = idx }
         }
-        else if w.op == OP_DROP { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: "", hi: "", all: true, open: false}) }
-        else if w.op == OP_DELRANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: w.key.clone(), hi: w.val.clone(), all: false, open: true}) }
+    }
+    var anySmall = false
+    for k in 0..len(trees) {
+        if counts[k] > WLOG_RANGE {
+            append(mut &db.wlog, WEntry{seq: db.seq, tree: trees[k], key: t.writes[loIdx[k]].key.clone(), hi: t.writes[hiIdx[k]].key.clone(), all: false, open: false})
+        } else {
+            anySmall = true
+        }
+    }
+    if anySmall || anyOther {
+        for w in t.writes {
+            if w.op == OP_PUT || w.op == OP_DEL {
+                var k = 0
+                while trees[k] != w.tree { k += 1 }
+                if counts[k] <= WLOG_RANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: w.key.clone(), hi: "", all: false, open: false}) }
+            }
+            else if w.op == OP_DROP { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: "", hi: "", all: true, open: false}) }
+            else if w.op == OP_DELRANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: w.key.clone(), hi: w.val.clone(), all: false, open: true}) }
+        }
     }
     if len(db.wlog) > WLOG_MAX {
         let half = len(db.wlog) / 2
@@ -4438,7 +4496,7 @@ pub fn (st: &Store) commit(t0: Txn): Result[Unit, lexdb_base.DbErr] {
         st.locks.release(lid, &held)
         return Ok(Unit{})
     }
-    let r = st.commitLive(t, true)
+    let r = st.commitLive(mut &t, true)
     st.endSnap(id)
     st.locks.release(lid, &held)            // after the commit: those woken read what it wrote
     return r
@@ -4454,7 +4512,7 @@ pub fn (st: &Store) commitAhead(t0: Txn): Result[Unit, lexdb_base.DbErr] {
     let id = t.snap
     let lid = t.lockId
     let held = replace(mut &t.held, [])
-    let r = st.commitLive(t, false)
+    let r = st.commitLive(mut &t, false)
     st.endSnap(id)
     st.locks.release(lid, &held)
     return r
@@ -4479,7 +4537,109 @@ fn identityOf(n: int): []int {
     return out
 }
 
-fn commitOrder(ws: &[]TxWrite): []int {
+// Stable radix sort for a tree's write indices in commitOrder (by ws[i].key, preserving
+// original index order on equal keys so the last write still wins).
+// Uses 8-bit L1-cache passes on only the byte lanes of the 8-byte word after LCP that vary,
+// so composite integer keys with wide 64-bit spans never fall back to comparison sort.
+fn sortWritesRadix(ws: &[]TxWrite, mine: mut &[]int) {
+    let n = len(mine)
+    if n <= 32 {
+        collections.sortBy(mine, fn(x, y) {
+            let c = ws[x].key.cmp(&ws[y].key)
+            return if c != 0 { c } else { x.cmp(y) }
+        })
+        return
+    }
+    var lcp = len(ws[mine[0]].key)
+    let k0 = &ws[mine[0]].key
+    for i in 1..n {
+        let k = &ws[mine[i]].key
+        if len(k) < lcp { lcp = len(k) }
+        var c = 0
+        while c < lcp && k[c] == k0[c] { c += 1 }
+        lcp = c
+    }
+    var ka: []int = withCapacity(n)
+    var diff = 0
+    var first = 0
+    for i in 0..n {
+        let k = &ws[mine[i]].key
+        var x = 0
+        if len(k) >= lcp + 8 {
+            x = binary.readI64BEStr(k, lcp)
+        } else {
+            for j in 0..8 { x = (x << 8) | (if lcp + j < len(k) { int(k[lcp + j]) } else { 0 }) }
+        }
+        if i == 0 { first = x } else { diff = diff | (x ^ first) }
+        append(mut &ka, x)
+    }
+    if diff != 0 {
+        var kb: []int = array(n, 0)
+        var ia: []int = withCapacity(n)
+        for q in mine { append(mut &ia, q) }
+        var ib: []int = array(n, 0)
+        var cnt: []int = array(257, 0)
+        var shift = 0
+        for b in 0..8 {
+            if ((diff >> shift) & 0xFF) != 0 {
+                for d in 0..257 { cnt[d] = 0 }
+                for i in 0..n { cnt[((ka[i] >> shift) & 0xFF) + 1] += 1 }
+                for d in 1..257 { cnt[d] += cnt[d - 1] }
+                for i in 0..n {
+                    let d = (ka[i] >> shift) & 0xFF
+                    let at = cnt[d]
+                    cnt[d] = at + 1
+                    kb[at] = ka[i]
+                    ib[at] = ia[i]
+                }
+                ka = replace(mut &kb, ka)
+                ia = replace(mut &ib, ia)
+            }
+            shift += 8
+        }
+        for i in 0..n { mine[i] = ia[i] }
+    }
+    // Refine runs with equal 8-byte prefix stably by full key + original index.
+    var a = 0
+    while a < n {
+        var z = a + 1
+        while z < n && ka[z] == ka[a] { z += 1 }
+        if z - a > 1 {
+            var runSorted = true
+            for i in a + 1..z {
+                if ws[mine[i]].key < ws[mine[i - 1]].key {
+                    runSorted = false
+                    break
+                }
+            }
+            if !runSorted {
+                if z - a > 32 {
+                    var run: []int = withCapacity(z - a)
+                    for i in a..z { append(mut &run, mine[i]) }
+                    collections.sortBy(mut &run, fn(x, y) {
+                        let c = ws[x].key.cmp(&ws[y].key)
+                        return if c != 0 { c } else { x.cmp(y) }
+                    })
+                    for i in a..z { mine[i] = run[i - a] }
+                } else {
+                    for i in a + 1..z {
+                        let v = mine[i]
+                        var j = i
+                        while j > a && (ws[mine[j - 1]].key > ws[v].key || (ws[mine[j - 1]].key == ws[v].key && mine[j - 1] > v)) {
+                            mine[j] = mine[j - 1]
+                            j -= 1
+                        }
+                        mine[j] = v
+                    }
+                }
+            }
+        }
+        a = z
+    }
+}
+
+fn commitOrder(t: &Txn): []int {
+    let ws = &t.writes
     var ix: []int = withCapacity(len(ws))
     for i in 0..len(ws) { append(mut &ix, i) }
     if len(ws) < ORDER_MIN { return ix }
@@ -4494,10 +4654,16 @@ fn commitOrder(ws: &[]TxWrite): []int {
         // already in order, tree by tree and key by key: left as it is
         var inOrder = true
         var u = a + 1
+        var fastTree = if t.isSortedTree(ws[a].tree) { ws[a].tree } else { -1 }
         while inOrder && u < b {
             let x = &ws[u]
             let y = &ws[u - 1]
+            if x.tree == fastTree && y.tree == fastTree {
+                u += 1
+                continue
+            }
             if x.tree < y.tree || (x.tree == y.tree && x.key < y.key) { inOrder = false }
+            else if x.tree != y.tree { fastTree = if t.isSortedTree(x.tree) { x.tree } else { -1 } }
             u += 1
         }
         if inOrder {
@@ -4509,12 +4675,12 @@ fn commitOrder(ws: &[]TxWrite): []int {
         var trees: []int = []
         var each: [][]int = []
         for q in a..b {
-            let t = ws[q].tree
-            var k = match slot.get(&t) { Some(x) { x } None { -1 } }
+            let tr = ws[q].tree
+            var k = match slot.get(&tr) { Some(x) { x } None { -1 } }
             if k < 0 {
                 k = len(trees)
-                slot.put(t, k)
-                append(mut &trees, t)
+                slot.put(tr, k)
+                append(mut &trees, tr)
                 append(mut &each, [])
             }
             append(mut &each[k], q)
@@ -4524,10 +4690,15 @@ fn commitOrder(ws: &[]TxWrite): []int {
         var at = a
         for k in byTree {
             var mine = replace(mut &each[k], [])
-            var sorted = true
-            for q in 1..len(mine) { if sorted && ws[mine[q]].key < ws[mine[q - 1]].key { sorted = false } }
-            if !sorted {
-                collections.sortBy(mut &mine, fn(x, y) { return ws[x].key.cmp(&ws[y].key) })     // one comparison (str.cmp)
+            if !t.isSortedTree(trees[k]) {
+                var sorted = true
+                for q in 1..len(mine) {
+                    if ws[mine[q]].key < ws[mine[q - 1]].key {
+                        sorted = false
+                        break
+                    }
+                }
+                if !sorted { sortWritesRadix(ws, mut &mine) }
             }
             for q in mine {
                 ix[at] = q
@@ -4539,10 +4710,121 @@ fn commitOrder(ws: &[]TxWrite): []int {
     return ix
 }
 
-fn (st: &Store) commitLive(t: &Txn, durable: bool): Result[Unit, lexdb_base.DbErr] {
+// Bottom-up B-tree builder for a contiguous strictly ascending run of OP_PUT
+// writes into an empty tree (CREATE INDEX or fresh COPY): fills leaves to room
+// without per-row descend, lower, prev-key clone, delta tracking, or recost.
+// Returns the number of writes consumed from `from` (0 if preconditions fail).
+const BULK_LOAD_MIN = 64
+
+fn (db: mut &Db) applyBulkLoad(tree: int, writes: mut &[]TxWrite, order: &[]int, from: int, knownSorted: bool): int {
+    let total = len(order)
+    if total - from < BULK_LOAD_MIN { return 0 }
+    if tree == 1 || tree == db.watched || isOvf(tree) || db.trees.has(&(tree + OVF)) { return 0 }
+    let oldRoot = match db.trees.get(&tree) { Some(r) { r } None { -1 } }
+    if oldRoot < 0 || !db.meta[oldRoot].loaded { return 0 }
+    let rf = db.meta[oldRoot].frame
+    if !db.pool[rf].leaf || db.pool[rf].count() != 0 { return 0 }
+    var end = from
+    while end < total {
+        let w = &writes[order[end]]
+        if w.op != OP_PUT || w.tree != tree { break }
+        if marked(&w.val) || lexdb_page.leafEntry(&w.key, &w.val) > lexdb_page.MAX_ENTRY { break }
+        if !knownSorted && end > from && !(w.key > writes[order[end - 1]].key) { break }
+        end += 1
+    }
+    if end - from < BULK_LOAD_MIN { return 0 }
+    let specIdx = if db.colsOn() {
+        match db.colSpecs.get(&tree) { Some(i) { i } None { -1 } }
+    } else { -1 }
+    var level: []int = []
+    var seps: []str = []
+    var k = from
+    while k < end {
+        var leaf = lexdb_page.newNode(true)
+        var sz = 0
+        var cnt = 0
+        var room = if specIdx >= 0 && db.specRatio[specIdx] > 0 { roomOf(db.specRatio[specIdx]) } else { lexdb_page.NODE_ROOM }
+        while k < end {
+            let idx = order[k]
+            let e = if cnt == 0 {
+                lexdb_page.frontEntry(&"", &writes[idx].key, &writes[idx].val)
+            } else {
+                lexdb_page.frontEntry(leaf.keyView(cnt - 1), &writes[idx].key, &writes[idx].val)
+            }
+            if cnt > 0 && sz + e > room {
+                if specIdx >= 0 && (db.specRatio[specIdx] == 0 || (db.specSplits[specIdx] >= 64 && sz + e > roomOf(db.specRatio[specIdx]))) {
+                    db.specSplits[specIdx] = 0
+                    leaf.size = sz
+                    let ce = lexdb_page.colSize(&leaf, 0, cnt, &db.specs[specIdx])
+                    db.noteRatio(specIdx, ce, sz)
+                    room = roomOf(db.specRatio[specIdx])
+                    if ce >= 0 && ce <= lexdb_page.PAGE && sz + e <= CAP_LEAF && sz + e > room { room = sz + e }
+                }
+                if sz + e > room { break }
+            }
+            let mk = replace(mut &writes[idx].key, "")
+            let mv = replace(mut &writes[idx].val, "")
+            append(leaf.keys.unshare(), rc(mk))
+            append(mut &leaf.vals, rc(mv))
+            sz += e
+            cnt += 1
+            k += 1
+        }
+        let firstKey = leaf.keys[0].toStr()
+        leaf.size = sz
+        if specIdx >= 0 && room > lexdb_page.NODE_ROOM { db.specSplits[specIdx] += 1 }
+        let s = db.newNode(leaf)
+        append(mut &level, s)
+        append(mut &seps, firstKey)
+    }
+    while len(level) > 1 {
+        var nextLevel: []int = []
+        var nextSeps: []str = []
+        var i = 0
+        while i < len(level) {
+            var node = lexdb_page.newNode(false)
+            let firstSep = seps[i].clone()
+            append(mut &node.kids, level[i])
+            var sz = 8
+            i += 1
+            while i < len(level) {
+                let e = lexdb_page.kidEntry(&seps[i])
+                if len(node.kids) >= 2 && sz + e > lexdb_page.NODE_ROOM {
+                    // Never leave a trailing internal node with a single child.
+                    if i == len(level) - 1 && len(node.kids) >= 3 {
+                        let dk = pop(node.keys.unshare())
+                        let dc = pop(mut &node.kids)
+                        i -= 1
+                    }
+                    break
+                }
+                append(node.keys.unshare(), rc(seps[i].clone()))
+                append(mut &node.kids, level[i])
+                sz += e
+                i += 1
+            }
+            node.reword()
+            node.size = nodeSize(&node)
+            let ps = db.newNode(node)
+            append(mut &nextLevel, ps)
+            append(mut &nextSeps, firstSep)
+        }
+        level = nextLevel
+        seps = nextSeps
+    }
+    let newRoot = level[0]
+    db.meta[oldRoot].root = false
+    db.meta[newRoot].root = true
+    db.setRoot(tree, newRoot)
+    db.freeSlot(oldRoot)
+    db.shape += 1
+    return end - from
+}
+
+fn (st: &Store) commitLive(t: mut &Txn, durable: bool): Result[Unit, lexdb_base.DbErr] {
     var wait: []task.Future[Result[Unit, lexdb_base.DbErr]] = []
     var wake: []task.Promise[Unit] = []
-    let order = commitOrder(&t.writes)
+    let order = commitOrder(t)
     while true {
         var needs: []int = []
         var bad: []lexdb_base.DbErr = []
@@ -4578,9 +4860,28 @@ fn (st: &Store) commitLive(t: &Txn, durable: bool): Result[Unit, lexdb_base.DbEr
             // 9.109). Each pass's descents mark the nodes they pass, so
             // loadMany's sweep keeps them.
             var seen: []Map[int, int] = []
+            var skipTree = -1
             for i in order {
-                let n = db.writeNeeds(&t.writes[i])
-                if n < 0 { continue }
+                let w = &t.writes[i]
+                if (w.op == OP_PUT || w.op == OP_DEL) && w.tree == skipTree { continue }
+                let n = db.writeNeeds(w)
+                if n < 0 {
+                    // A tree not yet in db.trees (created by this txn) or whose root is a
+                    // loaded empty leaf with no companion tree needs nothing for any put/del.
+                    if (w.op == OP_PUT || w.op == OP_DEL) && w.tree != skipTree {
+                        if !db.trees.has(&(w.tree + OVF)) {
+                            match db.trees.get(&w.tree) {
+                                None { skipTree = w.tree }
+                                Some(r) {
+                                    if db.meta[r].loaded && db.pool[db.meta[r].frame].leaf && db.pool[db.meta[r].frame].count() == 0 {
+                                        skipTree = w.tree
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    continue
+                }
                 if len(seen) > 0 {
                     if !seen[0].has(&n) {
                         seen[0].put(n, 1)
@@ -4622,12 +4923,25 @@ fn (st: &Store) commitLive(t: &Txn, durable: bool): Result[Unit, lexdb_base.DbEr
                     return
                 }
                 db.seq += 1
-                db.logWrites(&t)
-                db.reserveBatch(&t)
-                for i in order { db.applyWrite(&t.writes[i]) }
+                db.logWrites(t)
+                db.reserveBatch(t)
                 for w in t.writes {
                     addRecord(mut &db.batch, &w)
                     db.batchCount += 1
+                }
+                var oi = 0
+                while oi < len(order) {
+                    let wop = t.writes[order[oi]].op
+                    let wtree = t.writes[order[oi]].tree
+                    if wop == OP_PUT {
+                        let done = db.applyBulkLoad(wtree, mut &t.writes, &order, oi, t.isSortedTree(wtree))
+                        if done > 0 {
+                            oi += done
+                            continue
+                        }
+                    }
+                    db.applyWrite(&t.writes[order[oi]])
+                    oi += 1
                 }
                 b = db.batchNo
                 db.appliedBatch = b

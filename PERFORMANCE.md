@@ -347,7 +347,7 @@ prepared statements (`--db-ps-mode=auto`), Unix sockets, 10 s per run at a fixed
 servers on CPUs 0–3 and client on CPUs 4–7 and 12–15. Both servers run durable (`fsync` and `synchronous_commit` on).
 LexDB defaults to `SERIALIZABLE` isolation and also supports opt-in `READ COMMITTED`; PostgreSQL runs at its default `READ COMMITTED`.
 Both isolation levels are shown for `oltp_read_write`.
-Prepare (1M rows + 4 secondary indexes + `ANALYZE`): LexDB 7.55 s vs PostgreSQL 2.55 s.
+Prepare (1M rows + 4 secondary indexes + `ANALYZE`): LexDB 5.60 s vs PostgreSQL 2.55 s.
 
 LexDB (1 process) vs PostgreSQL 18 (4 cores):
 
@@ -391,7 +391,7 @@ LexDB (3 read replicas, 4 processes) vs PostgreSQL 18 (4 cores) — read workloa
 `bench/clickbench/run.sh`: official ClickBench `hits` schema (105 columns, wide web-analytics table) and all 43 queries
 (`q0`–`q42`) on the first 1,000,000 rows, warm, median of 3, at a fixed clock (`cpu-boost off`), both servers on CPUs 0–3.
 All 43 queries pass (31 exact MD5 matches; 12 top-N/unordered queries with matching row counts).
-Load (`COPY` 1M × 105 cols): LexDB 17.00 s vs PostgreSQL 6.42 s; `ANALYZE`: LexDB 0.42 s vs PostgreSQL 1.19 s.
+Load (`COPY` 1M × 105 cols): LexDB 8.10 s vs PostgreSQL 6.42 s; `ANALYZE`: LexDB 0.42 s vs PostgreSQL 1.19 s.
 
 | | LexDB (one core) | PostgreSQL, one core | PostgreSQL, four processes |
 |---|---:|---:|---:|

@@ -1477,6 +1477,64 @@ pub fn leafPlaces(leaf: &LeafView): int { return lexdb_cols.places(leaf.dir) }
 
 pub fn leafPlaceKind(leaf: &LeafView, pl: int): byte { return lexdb_cols.kindOf(leaf.cols, pl) }
 
+// Whether fixed place kind k encodes in index keys as 64-bit signed integer ^ MIN_INT.
+pub fn isKeyIntKind(k: byte): bool {
+    return isIntKind(k) || k == PK_DATE || k == PK_TIME || k == PK_TS || k == PK_TSTZ
+}
+
+// Reads place pl of leaf rows from..from+cnt into vals[0..cnt] and nul[0..cnt]
+// when pl holds a key-int kind (integer, date, time, timestamp, timestamptz).
+// Returns:
+//   0: vals and nul filled (some rows may be NULL)
+//   1: vals filled, no row is NULL (nul untouched)
+//   2: every row is NULL (PK_NONE)
+//   3: place pl is missing from every row in this leaf (older layout before ADD COLUMN)
+//  -1: not handled (caller falls back to row decoding)
+pub fn leafIntsInto(leaf: &LeafView, pl: int, from: int, cnt: int, rw: &Rows, vals: mut &[]int, nul: mut &[]bool): int {
+    if cnt <= 0 { return 1 }
+    if leaf.isCols {
+        if !layoutOk(leaf, rw) { return -1 }
+        let np = lexdb_cols.places(leaf.dir)
+        if pl >= np { return 3 }
+        let pk = lexdb_cols.kindOf(leaf.cols, pl)
+        if pk == PK_NONE { return 2 }
+        if !isKeyIntKind(pk) { return -1 }
+        lexdb_cols.intsInto(leaf.cols, leaf.dir, pl, from, cnt, vals, 0)
+        if !lexdb_cols.hasNulls(leaf.dir, pl) { return 1 }
+        for j in 0..cnt { nul[j] = false }
+        lexdb_cols.nullsInto(leaf.cols, leaf.dir, pl, from, cnt, nul, 0)
+        return 0
+    }
+    var anyNull = false
+    for j in 0..cnt {
+        let s = leafValAt(leaf, from + j)
+        if !isFixedRow(s) { return -1 }
+        let id = binary.readU16LEStr(s, 1)
+        if id >= len(rw.lays) { return -1 }
+        let lay = &rw.lays[id]
+        if len(s) < lay.v0 || pl >= len(lay.kinds) { return -1 }
+        let pk = lay.kinds[pl]
+        if pk == PK_NONE {
+            nul[j] = true
+            anyNull = true
+            continue
+        }
+        if !isKeyIntKind(pk) { return -1 }
+        if (s[lay.bm + (pl >> 3)] & byte(1 << (pl & 7))) != 0 {
+            nul[j] = true
+            anyNull = true
+            continue
+        }
+        nul[j] = false
+        let off = lay.off[pl]
+        let sz = fixedSize(pk)
+        if sz == 8 { vals[j] = binary.readI64LEStr(s, off) }
+        else if sz == 4 { vals[j] = binary.readI32LEStr(s, off) }
+        else { vals[j] = binary.readI16LEStr(s, off) }
+    }
+    return if anyNull { 0 } else { 1 }
+}
+
 // Decodes the rows of a leaf in the fixed layout of its first, up to to,
 // into rows b.n on of b, a column at a time (9.53). The number of rows
 // decoded: 0 when the first is not in the fixed layout (decodeRow reads
