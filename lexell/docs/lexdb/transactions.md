@@ -42,6 +42,15 @@ A program that writes should be ready to run its transaction again after one of 
 - **Sequences.** In the PostgreSQL door `nextval` is not rolled back: a value taken in a transaction that rolls back
   is not given again.
 
+## Assertions at the end of a statement and of a transaction
+
+An [assertion](assertions.md) is checked after each statement that writes a table it reads. A deferrable one may wait
+for the commit (`INITIALLY DEFERRED`, or `SET CONSTRAINTS`, `SET CONSTRAINT` in Oracle): a violation then fails the
+`COMMIT` (23514; 547 naming `COMMIT TRANSACTION`, with `@@TRANCOUNT` 0 afterwards; ORA-02091 over ORA-08601) and the
+transaction is rolled back. A statement's violation undoes the statement and keeps the transaction (PostgreSQL:
+aborts it, as after any error; SQL Server with `XACT_ABORT ON`: rolls it back). Two transactions that add rows which
+only together break an assertion cannot both succeed: the second waits for the first, then fails or passes.
+
 ## Transactions and replicas
 
 A read replica serves read-only snapshots; a write on a replica is refused (PostgreSQL `25006`, SQL Server 3906, Oracle

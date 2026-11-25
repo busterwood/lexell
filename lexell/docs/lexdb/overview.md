@@ -73,6 +73,8 @@ See [architecture](architecture.md) for the files, checkpoints and recovery from
   in the common read-then-update case.
 - **Read-only transactions are snapshots.** A read-only transaction sees the database as it was when it began.
 - **Readers never wait for writers, and writers never wait for readers.**
+- **Assertions** (`CREATE ASSERTION`, the SQL standard's constraint across tables) are checked at the end of each
+  statement or, if deferred, at the commit, whichever door the write comes through: see [assertions](assertions.md).
 
 See [transactions](transactions.md).
 

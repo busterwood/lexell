@@ -60,6 +60,7 @@ COPY ... [ WITH ] [ BINARY ] [ DELIMITER [ AS ] 'c' ] [ NULL [ AS ] 's' ]
   the end counts the rows skipped (`LOG_VERBOSITY verbose` also names each, `silent` gives none). Any other error
   (a missing field, a constraint, a duplicate key) still stops the load. `REJECT_LIMIT n` fails the load (22P02)
   when more than n rows were skipped. The rows of a failed load are not kept.
+- **Assertions.** A table an [assertion](assertions.md) reads is checked: `COPY` is one statement and a violation (23514) undoes it all; the rows `ON_ERROR ignore` skips do not count; the fast path of an empty table is not taken for an asserted table. With `batch_rows`, each batch is checked before it commits (below). The check of many rows reads them by key, 4,096 at a time, so it grows linearly with the load.
 - **`batch_rows n`** (lexdb's own, `COPY FROM` only): commit every n rows. A very large load then needs memory for n
   rows' writes only. It is not all or nothing: a failure keeps the batches committed before it, and the error says
   how many rows were committed. Not allowed inside a transaction block (25001).
@@ -277,7 +278,7 @@ let n = try c.bulkInsert("dbo.tds_fruit", &["id", "name", "price"], &more, &sqls
 
 ### Differences from SQL Server
 
-- Constraints are always checked; triggers do not exist.
+- Constraints are always checked; triggers do not exist. An [assertion](assertions.md) on the table is checked too (error 547 naming the assertion), whether or not `CHECK_CONSTRAINTS` was asked for (SQL Server skips `CHECK` constraints without it; an assertion has no untrusted state). In a transaction, the load alone is undone.
 - A malformed message is error 50000 with lexdb's text (SQL Server: 4804, 4815); a type lexdb does not take
   (`sql_variant`, CLR types) is 4816.
 - `datetime2(7)` keeps microseconds (the last digit is rounded); a `datetimeoffset` keeps its instant, not its offset.
@@ -294,6 +295,7 @@ array. lexdb's Oracle door takes it as Oracle does:
 - With batch errors (python-oracledb's `batcherrors=True`), every row is tried; the failures are reported with their
   offsets and the others stay.
 - Row counts per row (`arraydmlrowcounts`, JDBC's `executeBatch` result) are given.
+- An [assertion](assertions.md) on the table is checked once, after the last run, as Oracle does: a violation (ORA-08601) fails the call and undoes every run, with batch errors or not. A deferred one is checked at `COMMIT` (ORA-02091).
 
 ### From Java: executeBatch
 
