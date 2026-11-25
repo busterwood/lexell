@@ -200,3 +200,191 @@ pub fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sq
     return Err(lexdb_base.errDetail("2BP01", &("cannot drop table " + lexdb_sql.shown(k) + " because other objects depend on it"),
                                     &strings.join(&detail, "\n"), "Use DROP ... CASCADE to drop the dependent objects too."))
 }
+
+// T-SQL's sp_refreshview (s: its CREATE VIEW, alias REFRESH_VIEW, the name as given in table): the CREATE OR ALTER VIEW that
+// makes the view again from its kept text (a SELECT * view takes its table's columns as they are now); 15165 if it is no view.
+pub fn refreshStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[lexdb_sql.Stmt, DbErr] {
+    var parts: []str = []
+    for p in strings.split(&s.table, ".") {
+        var x = strings.trim(&p).toStr()
+        if len(x) > 1 && ((x[0] == '[' && x[len(x) - 1] == ']') || (x[0] == '"' && x[len(x) - 1] == '"')) { x = x[1..len(x) - 1].toStr() }
+        append(mut &parts, strings.toLowerAscii(&x))
+    }
+    let n = len(parts)
+    let sc = if n >= 2 { parts[n - 2].clone() } else { "dbo" }
+    let key = if sc == "dbo" || sc == "public" { parts[n - 1].clone() } else { lexdb_sql.qual(&sc, &parts[n - 1]) }
+    for v in try lexdb_catalog.allViews(st, txn) {
+        if v.name != key || !strings.startsWith(&v.view, lexdb_sql.TSQL_VIEW) { continue }
+        var r = lexdb_sql.newStmt(lexdb_sql.S_CREATE_VIEW)
+        r.table = key.clone()
+        r.index = v.view.clone()
+        r.spell = v.spell.clone()
+        r.ifFlag = true
+        r.alter = true
+        r.mdialect = lexdb_sql.MD_TSQL
+        return Ok(r)
+    }
+    return Err(err("TS15165", &("Could not find object '" + s.table + "' or you do not have permission.")))
+}
+
+// DROP TABLE k under views (the sixth bug slice), per door, as each product does: PostgreSQL refuses it (2BP01, the views in
+// its DETAIL) and its CASCADE drops the views (and the views over them); SQL Server drops the table unless a view made WITH
+// SCHEMABINDING reads it (3729), and a view over it fails when read (208); Oracle drops it, and a view over it has errors
+// (ORA-04063 when read, INVALID, ORA-00942 in USER_ERRORS). Such a view reads the table again once one of its name is made.
+// door: the session's (lexdb_priv.doorOf: "tds", "tns" or the PostgreSQL door's; DROP TABLE's statement does not say).
+pub fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, k: &str, door: &str): Result[Unit, DbErr] {
+    let deps = try lexdb_catalog.dependentViews(st, txn, k)
+    if len(deps) == 0 || door == "tns" || s.mdialect == lexdb_sql.MD_ORA { return Ok(Unit{}) }
+    if door == "tds" || s.mdialect == lexdb_sql.MD_TSQL {
+        for v in try lexdb_catalog.allViews(st, txn) {
+            if lexdb_base.hasStr(&deps, &v.name) && lexdb_sql.viewBound(&v.view) && lexdb_base.hasStr(&v.deps, k) {
+                return Err(err("TS3729", &("Cannot DROP TABLE '" + lexdb_sql.baseName(k) + "' because it is being referenced by object '" + lexdb_sql.baseName(&v.name) + "'.")))
+            }
+        }
+        return Ok(Unit{})
+    }
+    if s.cascade {
+        // (the views and their grants, as DROP VIEW ... CASCADE drops them)
+        for b in deps {
+            txn.del(lexdb_catalog.CATALOG, &b)
+            txn.del(lexdb_catalog.CATALOG, &(lexdb_catalog.ACL_PRE + lexdb_catalog.relObj(&b)))
+        }
+        return Ok(Unit{})
+    }
+    var detail: []str = []
+    for v in try lexdb_catalog.allViews(st, txn) {
+        if !lexdb_base.hasStr(&deps, &v.name) { continue }
+        var on = ""
+        if lexdb_base.hasStr(&v.deps, k) { on = "table " + lexdb_sql.shown(k) } else {
+            for d in v.deps { if len(on) == 0 && lexdb_base.hasStr(&deps, &d) { on = "view " + lexdb_sql.shown(&d) } }
+        }
+        append(mut &detail, "view " + lexdb_sql.shown(&v.name) + " depends on " + on)
+    }
+    return Err(lexdb_base.errDetail("2BP01", &("cannot drop table " + lexdb_sql.shown(k) + " because other objects depend on it"),
+                                    &strings.join(&detail, "\n"), "Use DROP ... CASCADE to drop the dependent objects too."))
+}
+
+// information_schema.VIEW_TABLE_USAGE (cols false) and VIEW_COLUMN_USAGE (cols true), in both doors (lexdb_pg.viewRows; the T-SQL
+// door's with dbo for public): per view the relations its query reads (its kept dependencies), and of those the columns its text
+// names (by name, qualified by the relation or an alias, or all of them for *). Rows: view_catalog, view_schema, view_name,
+// table_catalog, table_schema, table_name[, column_name].
+pub fn usageRows(snap: &lexdb_catalog.CatSnap, cols: bool, db: &str): [][]lexdb_sql.Val {
+    var out: [][]lexdb_sql.Val = []
+    for v in snap.views {
+        if lexdb_base.isTempSchema(&v.schema) { continue }
+        let refs = if cols { refsOf(&lexdb_sql.viewKept(&v.t.view)) } else { [] }
+        for d in v.t.deps {
+            var dt = -1
+            var isView = false
+            for i in 0..len(snap.tabs) { if snap.tabs[i].key == d { dt = i } }
+            if dt < 0 {
+                for i in 0..len(snap.views) {
+                    if snap.views[i].key == d {
+                        dt = i
+                        isView = true
+                    }
+                }
+            }
+            if dt < 0 { continue }
+            let ct = if isView { &snap.views[dt] } else { &snap.tabs[dt] }
+            var used: []str = []
+            if cols {
+                for c in ct.t.cols {
+                    if lexdb_catalog.hiddenName(&c.name) || c.name == lexdb_catalog.ROWID { continue }
+                    if usesCol(&refs, &lexdb_sql.baseName(&d), &c.name) { append(mut &used, lexdb_sql.colShown(&c)) }
+                }
+            } else {
+                append(mut &used, "")
+            }
+            for u in used {
+                var r: []lexdb_sql.Val = [tv(db), tv(&v.schema), tv(&(if len(v.t.spell) > 0 { v.t.spell.clone() } else { v.name.clone() })), tv(db), tv(&ct.schema),
+                                          tv(&(if len(ct.t.spell) > 0 { ct.t.spell.clone() } else { ct.name.clone() }))]
+                if cols { append(mut &r, tv(&u)) }
+                append(mut &out, r)
+            }
+        }
+    }
+    return out
+}
+
+fn tv(s: &str): lexdb_sql.Val { return lexdb_sql.Val.Text(s.toStr()) }
+
+// The names a view's query text refers to: each a name and its qualifier ("" none), lower case; "*" for a star.
+type Ref = record { qual: str; name: str }
+
+fn refsOf(text: &str): []Ref {
+    var words: []str = []        // the names, and "." and "*" between them
+    var i = 0
+    let n = len(text)
+    while i < n {
+        let c = text[i]
+        if c == '\'' {
+            i += 1
+            while i < n && text[i] != '\'' { i += 1 }
+            i += 1
+            continue
+        }
+        if c == '-' && i + 1 < n && text[i + 1] == '-' {
+            while i < n && text[i] != '\n' { i += 1 }
+            continue
+        }
+        if c == '[' || c == '"' {
+            let close: byte = if c == '[' { ']' } else { '"' }
+            var j = i + 1
+            while j < n && text[j] != close { j += 1 }
+            append(mut &words, strings.toLowerAscii(&text[i + 1..min(j, n)]))
+            i = j + 1
+            continue
+        }
+        if isNameStart(c) {
+            var j = i
+            while j < n && (isNameStart(text[j]) || (text[j] >= '0' && text[j] <= '9') || text[j] == '$' || text[j] == '#') { j += 1 }
+            append(mut &words, strings.toLowerAscii(&text[i..j]))
+            i = j
+            continue
+        }
+        if c == '.' || c == '*' { append(mut &words, text[i..i + 1].toStr()) } else if c != ' ' && c != '\t' && c != '\n' && c != '\r' { append(mut &words, ",") }
+        i += 1
+    }
+    var out: []Ref = []
+    var k = 0
+    while k < len(words) {
+        let w = &words[k]
+        if w == "," || w == "." {
+            k += 1
+            continue
+        }
+        // a.b.c: the last two
+        var parts: []str = [w.clone()]
+        while k + 2 < len(words) && words[k + 1] == "." && words[k + 2] != "," && words[k + 2] != "." {
+            append(mut &parts, words[k + 2].clone())
+            k += 2
+        }
+        let m = len(parts)
+        append(mut &out, Ref{qual: if m >= 2 { parts[m - 2].clone() } else { "" }, name: parts[m - 1].clone()})
+        k += 1
+    }
+    return out
+}
+
+fn isNameStart(c: byte): bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == '@' || c >= 128 }
+
+// Whether refs name column col of relation rel (qualified by it or by an alias, or not qualified), or take all with *.
+fn usesCol(refs: &[]Ref, rel: &str, col: &str): bool {
+    let r0 = strings.toLowerAscii(rel)
+    let c0 = strings.toLowerAscii(col)
+    // the aliases of rel: the name after "rel [as]"
+    var quals: []str = [r0.clone()]
+    for i in 0..len(refs) {
+        if refs[i].name == r0 && i + 1 < len(refs) {
+            var j = i + 1
+            if refs[j].name == "as" && len(refs[j].qual) == 0 && j + 1 < len(refs) { j += 1 }
+            if len(refs[j].qual) == 0 { append(mut &quals, refs[j].name.clone()) }
+        }
+    }
+    for r in refs {
+        if r.name == "*" && (len(r.qual) == 0 || lexdb_base.hasStr(&quals, &r.qual)) { return true }
+        if r.name == c0 && (len(r.qual) == 0 || lexdb_base.hasStr(&quals, &r.qual)) { return true }
+    }
+    return false
+}

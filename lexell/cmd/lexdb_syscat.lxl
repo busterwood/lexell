@@ -745,7 +745,7 @@ fn routineType(r: &lexdb_sql.Routine): []str {
 
 pub fn procOid(r: &lexdb_sql.Routine): int { return lexdb_sql.nameOid(&"R", &r.key) }
 
-fn procName(r: &lexdb_sql.Routine): str {
+pub fn procName(r: &lexdb_sql.Routine): str {
     var n = if len(r.spell) > 0 { r.spell.toStr() } else { lexdb_sql.baseName(&r.key) }
     let d = strings.lastIndexOf(&n, ".")
     if d >= 0 { n = n[d + 1..len(n)].toStr() }
@@ -1539,3 +1539,159 @@ pub fn bind(snap: &CatSnap, b: mut &str) {
         for i in 0..len(v.t.cols) { b += &("K\t" + v.oid.toStr() + "\t" + lexdb_sql.colShown(&v.t.cols[i]) + "\t" + (i + 1).toStr() + "\t1\t0\n") }
     }
 }
+
+// ---- INFORMATION_SCHEMA as SQL Server gives it, where it differs from PostgreSQL's (the sixth bug slice, design/lexdb-robust.md). The
+// T-SQL door's INFORMATION_SCHEMA rows are PostgreSQL's (lexdb_pg.viewRows) with dbo for public (dboRows); infoRows makes these: SCHEMATA
+// lists SQL Server's schemas (dbo, guest, INFORMATION_SCHEMA, sys and the db_* roles'), those made with CREATE SCHEMA owned by dbo, not
+// PostgreSQL's pg_catalog and information_schema; ROUTINES and PARAMETERS list the T-SQL procedures and functions (the PostgreSQL door
+// its own); CONSTRAINT_COLUMN_USAGE gives a foreign key's own columns (PostgreSQL gives the columns it references). Each row is made in
+// its relation's column order (names) by name.
+
+// A row of rel's columns (names), each NULL until set.
+type IRow = record { names: []str; vals: []Val }
+
+fn newRow(names: &[]str): IRow {
+    var vs: []Val = []
+    for n in names { append(mut &vs, Val.Null) }
+    return IRow{names: copyNames(names), vals: vs}
+}
+
+fn copyNames(a: &[]str): []str {
+    var out: []str = []
+    for x in a { append(mut &out, x.clone()) }
+    return out
+}
+
+fn (r: mut &IRow) set(name: &str, v: Val) {
+    for i in 0..len(r.names) {
+        if r.names[i] == name {
+            r.vals[i] = v
+            return
+        }
+    }
+}
+fn (r: mut &IRow) s(name: &str, v: &str) { r.set(name, Val.Text(v.toStr())) }
+fn (r: mut &IRow) i(name: &str, n: int) { r.set(name, Val.Int(n)) }
+
+pub fn infoRows(cq: &lexdb_catalog.CatView, rel: &str, names: &[]str, rows: [][]Val): [][]Val {
+    if !(rel == "information_schema.schemata" || rel == "information_schema.routines" || rel == "information_schema.parameters" ||
+         rel == "information_schema.constraint_column_usage") { return rows }
+    let db = "lexdb"
+    var out: [][]Val = []
+    let snap = &cq.snap
+    if rel == "information_schema.schemata" {
+        var list: []str = ["dbo", "guest", "INFORMATION_SCHEMA", "sys", "db_owner", "db_accessadmin", "db_securityadmin", "db_ddladmin",
+                           "db_backupoperator", "db_datareader", "db_datawriter", "db_denydatareader", "db_denydatawriter"]
+        for s in snap.schemas {
+            if s == "public" || s == "information_schema" || strings.startsWith(&s, "pg_") || lexdb_base.isTempSchema(&s) { continue }
+            append(mut &list, s.clone())
+        }
+        for k in 0..len(list) {
+            var r = newRow(names)
+            r.s(&"catalog_name", db)
+            r.s(&"schema_name", &list[k])
+            // (the fixed ones own themselves; a schema made is dbo's: SQL Server's sa is dbo)
+            r.s(&"schema_owner", &(if k < 13 { list[k].clone() } else { "dbo".toStr() }))
+            r.s(&"default_character_set_name", &"iso_1")
+            append(mut &out, r.vals)
+        }
+        return out
+    }
+    if rel == "information_schema.routines" || rel == "information_schema.parameters" {
+        for rt in snap.routines {
+            if rt.dialect != lexdb_sql.RD_TSQL { continue }
+            let sc = lexdb_sql.schemaOf(&rt.key)
+            let nm = procName(&rt)
+            let proc = rt.kind == lexdb_sql.RK_PROC
+            if rel == "information_schema.routines" {
+                var r = newRow(names)
+                for c in ["specific_catalog", "routine_catalog"] { r.s(&c, db) }
+                for c in ["specific_schema", "routine_schema"] { r.s(&c, &sc) }
+                for c in ["specific_name", "routine_name"] { r.s(&c, &nm) }
+                r.s(&"routine_type", &(if proc { "PROCEDURE" } else { "FUNCTION" }))
+                if !proc {
+                    if rt.retSet { r.s(&"data_type", &"TABLE") } else { typeCols(mut &r, &rt.ret) }
+                }
+                r.s(&"routine_body", &"SQL")
+                r.s(&"routine_definition", &rt.def)
+                r.s(&"is_deterministic", &"NO")
+                r.s(&"sql_data_access", &(if proc { "MODIFIES" } else { "READS" }))
+                r.s(&"schema_level_routine", &"YES")
+                r.i(&"max_dynamic_result_sets", if proc { -1 } else { 0 })
+                r.s(&"is_user_defined_cast", &"NO")
+                r.s(&"is_implicitly_invocable", &"NO")
+                append(mut &out, r.vals)
+                continue
+            }
+            // a scalar function's result: its parameter 0, unnamed, OUT
+            if !proc && !rt.retSet {
+                var r = newRow(names)
+                paramHead(mut &r, db, &sc, &nm, 0)
+                r.s(&"parameter_mode", &"OUT")
+                r.s(&"is_result", &"YES")
+                r.s(&"parameter_name", &"")
+                typeCols(mut &r, &rt.ret)
+                append(mut &out, r.vals)
+            }
+            for k in 0..len(rt.params) {
+                let p = &rt.params[k]
+                var r = newRow(names)
+                paramHead(mut &r, db, &sc, &nm, k + 1)
+                r.s(&"parameter_mode", &(if p.mode == "out" || p.mode == "inout" { "INOUT" } else { "IN" }))
+                r.s(&"is_result", &"NO")
+                r.s(&"parameter_name", &p.name)
+                typeCols(mut &r, &p.typ)
+                append(mut &out, r.vals)
+            }
+        }
+        return out
+    }
+    if rel == "information_schema.constraint_column_usage" {
+        // every constraint's own columns (a foreign key's too)
+        for c in snap.cons {
+            let ti = lexdb_catalog.catTabIdx(snap, c.rel)
+            if ti < 0 { continue }
+            let t = &snap.tabs[ti]
+            let cols = if c.typ == "c" { lexdb_catalog.checkCols(&t.t, &c) } else { lexdb_catalog.copyInts(&c.cols) }
+            for cn in cols {
+                if cn < 1 || cn > len(t.t.cols) { continue }
+                var r = newRow(names)
+                r.s(&"table_catalog", db)
+                r.s(&"table_schema", &t.schema)
+                r.s(&"table_name", &(if len(t.t.spell) > 0 { t.t.spell.clone() } else { t.name.clone() }))
+                r.s(&"column_name", &lexdb_sql.colShown(&t.t.cols[cn - 1]))
+                r.s(&"constraint_catalog", db)
+                r.s(&"constraint_schema", &c.schema)
+                r.s(&"constraint_name", &c.name)
+                append(mut &out, r.vals)
+            }
+        }
+        return out
+    }
+    return out
+}
+
+fn paramHead(r: mut &IRow, db: &str, sc: &str, nm: &str, pos: int) {
+    r.s(&"specific_catalog", db)
+    r.s(&"specific_schema", sc)
+    r.s(&"specific_name", nm)
+    r.i(&"ordinal_position", pos)
+    r.s(&"as_locator", &"NO")
+}
+
+// DATA_TYPE, CHARACTER_MAXIMUM_LENGTH, NUMERIC_PRECISION, NUMERIC_SCALE as SQL Server's for type t.
+fn typeCols(r: mut &IRow, t: &lexdb_sql.TypeName) {
+    let q = sqlTypeOf(t, &"")
+    r.s(&"data_type", &q.name)
+    let text = q.name == "varchar" || q.name == "nvarchar" || q.name == "char" || q.name == "nchar" || q.name == "varbinary" || q.name == "binary"
+    if text {
+        let n = if q.maxLen < 0 { -1 } else if q.name == "nvarchar" || q.name == "nchar" { q.maxLen / 2 } else { q.maxLen }
+        r.i(&"character_maximum_length", n)
+        r.i(&"character_octet_length", q.maxLen)
+    } else if q.prec > 0 {
+        r.i(&"numeric_precision", q.prec)
+        r.i(&"numeric_precision_radix", 10)
+        r.i(&"numeric_scale", q.scale)
+    }
+}
+
