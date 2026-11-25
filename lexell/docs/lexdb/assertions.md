@@ -65,7 +65,7 @@ Two sessions cannot break an assertion together. A writer of a table in an asser
 of the join key that the assertion joins on, held to the end of its transaction, before the check. The second writer
 of the same value waits for the first's `COMMIT` or `ROLLBACK` and then fails, or passes, on what is committed. Writers
 of other values do not wait; a `DELETE` does not wait for an `INSERT`; an assertion without an equijoin locks as a whole.
-A deadlock is 40P01, ORA-00060 or 1205.
+A deadlock between two such writers is the door's deadlock error (40P01 in the PostgreSQL door, ORA-00060 in the Oracle door).
 
 ## The write paths
 
