@@ -1,0 +1,79 @@
+// lexdb_fkconv: a foreign key between a number and an integer column (design/lexdb-robust.md, "The fourth bug slice", item 1).
+// Oracle's NUMBER GENERATED AS IDENTITY and INTEGER columns are lexdb bigints and its other NUMBER columns numerics, and Oracle
+// takes a foreign key between any two of them; so the Oracle door does (PostgreSQL refuses numeric to bigint, and so does
+// lexdb's PostgreSQL door, lexdb_exec.makeFk). Such a key compares values, not their kinds: the child's 5 and 5.0 find the
+// parent's 5, its 5.5 or a number past bigint's range finds none (no bigint is that value), and a parent's bigint finds the
+// children's numerics equal to it. lexdb_exec's lookups both ways (parentHas, refRows) hand their values here first: the
+// values of one kind are made the other's when the columns they look in hold the other (fit) or found to have no row (None).
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_catalog"
+import "./lexdb_ops"
+import "./lexdb_time"
+
+type Val = lexdb_sql.Val
+type Table = lexdb_catalog.Table
+type TypeName = lexdb_sql.TypeName
+type DbErr = lexdb_base.DbErr
+
+// Whether a foreign key from a column of type a to one of type b may be made in a door of dialect md: the kinds equal, or
+// (Oracle) an integer and a number.
+pub fn compatible(a: &TypeName, b: &TypeName, md: int): bool {
+    if a.kind == b.kind { return true }
+    return md == lexdb_sql.MD_ORA && numeric(a.kind) && numeric(b.kind)
+}
+
+fn numeric(k: int): bool { return k == lexdb_sql.K_INT || k == lexdb_sql.K_NUM }
+
+// Whether a value of vals is of the other kind than its column (t's cols, in order) holds.
+pub fn needs(t: &Table, cols: &[]int, vals: &[]Val): bool {
+    for j in 0..len(vals) {
+        match vals[j] {
+            Val.Num(_) { if t.cols[cols[j]].typ.kind == lexdb_sql.K_INT { return true } }
+            Val.Int(_) { if t.cols[cols[j]].typ.kind == lexdb_sql.K_NUM { return true } }
+            else {}
+        }
+    }
+    return false
+}
+
+// vals as t's columns cols hold them: a number that is a whole bigint as the bigint, a bigint for a numeric column as the
+// number; None when a number is no bigint (5.5, 1e30): no row has it.
+pub fn fit(t: &Table, cols: &[]int, vals: &[]Val): Option[[]Val] {
+    var out: []Val = []
+    for j in 0..len(vals) {
+        let k = t.cols[cols[j]].typ.kind
+        match vals[j] {
+            Val.Num(d) {
+                if k != lexdb_sql.K_INT {
+                    append(mut &out, vals[j].clone())
+                    continue
+                }
+                match d.toInt(Rounding.TOWARD_ZERO) {
+                    Ok(n) {
+                        if Decimal.fromInt(n).cmp(&d) != 0 { return None }
+                        append(mut &out, Val.Int(n))
+                    }
+                    Err(_) { return None }
+                }
+            }
+            Val.Int(n) { append(mut &out, if k == lexdb_sql.K_NUM { Val.Num(Decimal.fromInt(n)) } else { Val.Int(n) }) }
+            else { append(mut &out, vals[j].clone()) }
+        }
+    }
+    return Some(out)
+}
+
+// Whether foreign key columns cols of t and refCols of p are of different kinds (a statement's probes leave such a key to
+// each row's own lookup, which compares through fit).
+pub fn mixed(t: &Table, cols: &[]int, p: &Table, refCols: &[]int): bool {
+    for j in 0..len(cols) { if t.cols[cols[j]].typ.kind != p.cols[refCols[j]].typ.kind { return true } }
+    return false
+}
+
+// A parent's new key value v (of type from), as ON UPDATE CASCADE sets it in a child column of type to: itself, or, between
+// the kinds, the child's type made of it (a 5.5 into a bigint column is 6, which the child's own check then looks for).
+pub fn cascaded(v: &Val, to: &TypeName, from: &TypeName, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if to.kind == from.kind { return Ok(v.clone()) }
+    return lexdb_ops.coerceZ(v.clone(), to, z)
+}

@@ -44,7 +44,7 @@ IMPORT = re.compile(r'import\s+"\./([A-Za-z0-9_]+)"')
 
 CORE = {
     "lexdb_access", "lexdb_agg", "lexdb_base", "lexdb_bind", "lexdb_catalog", "lexdb_census", "lexdb_conerr", "lexdb_cols", "lexdb_dbopt", "lexdb_dialect", "lexdb_disk",
-    "lexdb_enum", "lexdb_exec", "lexdb_fkprobe", "lexdb_float", "lexdb_func", "lexdb_gen", "lexdb_held", "lexdb_leafk", "lexdb_lib", "lexdb_like",
+    "lexdb_enum", "lexdb_exec", "lexdb_fkconv", "lexdb_fkprobe", "lexdb_float", "lexdb_func", "lexdb_gen", "lexdb_held", "lexdb_leafk", "lexdb_lib", "lexdb_like",
     "lexdb_locks", "lexdb_match", "lexdb_recur", "lexdb_recrun", "lexdb_recprobe", "lexdb_litint",
     "lexdb_memo", "lexdb_newfn", "lexdb_nncon", "lexdb_nnalter", "lexdb_annot", "lexdb_graph", "lexdb_assert", "lexdb_copyjson", "lexdb_oldnew", "lexdb_ops", "lexdb_vec", "lexdb_decfit",
     "lexdb_page", "lexdb_parse", "lexdb_pct", "lexdb_pipe", "lexdb_plan", "lexdb_priv", "lexdb_repl", "lexdb_rows", "lexdb_routine",

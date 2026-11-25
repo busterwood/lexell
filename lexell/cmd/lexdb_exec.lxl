@@ -53,6 +53,7 @@ import "./lexdb_window"
 import "./lexdb_setop"
 import "./lexdb_sort"
 import "./lexdb_fkprobe"
+import "./lexdb_fkconv"
 import "./lexdb_lib"
 import "./lexdb_dialect"
 import "./lexdb_conerr"
@@ -13943,6 +13944,7 @@ fn encVals(vs: &[]Val): str {
 
 // Whether table p has a row with key vals (in fc.refCols' order).
 fn parentHas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &Table, fc: &FkCols, vals: &[]Val): Result[bool, DbErr] {
+    if lexdb_fkconv.needs(p, &fc.refCols, vals) { match lexdb_fkconv.fit(p, &fc.refCols, vals) { Some(v) { return parentHas(st, txn, p, fc, &v) } None { return Ok(false) } } }
     var prow = array(len(p.cols), Val.Null)
     for k in 0..len(vals) { prow[fc.refCols[k]] = vals[k].clone() }
     if fc.via < -1 { return Ok(false) }
@@ -13960,6 +13962,7 @@ fn referenced(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, c: &Table, cols
 // one): through its primary key or an index starting with them, else read
 // whole (as PostgreSQL, lexdb makes no index for a foreign key).
 fn refRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, c: &Table, cols: &[]int, vals: &[]Val, one: bool): Result[[][]Val, DbErr] {
+    if lexdb_fkconv.needs(c, cols, vals) { match lexdb_fkconv.fit(c, cols, vals) { Some(v) { return refRows(st, txn, c, cols, &v, one) } None { return Ok([]) } } }
     let n = len(cols)
     var crow = array(len(c.cols), Val.Null)
     for j in 0..n { crow[cols[j]] = vals[j].clone() }
@@ -14078,7 +14081,8 @@ fn fkProbes(t: &Table, fw: &[]Table, targets: &[]int): lexdb_fkprobe.Probes {
             for x in 0..len(targets) { if targets[x] == c && t.cols[c].identity == lexdb_sql.ID_NONE { j = x } }
             append(mut &at, j)
         }
-        pr.add(lexdb_fkprobe.ref(collections.copyOf(&fc.cols), collections.copyOf(&fc.refCols), fc.via, pi, at, &fw[pi].pk))
+        let via = if lexdb_fkconv.mixed(t, &fc.cols, &fw[pi], &fc.refCols) { -2 } else { fc.via }      // (each row's own lookup)
+        pr.add(lexdb_fkprobe.ref(collections.copyOf(&fc.cols), collections.copyOf(&fc.refCols), via, pi, at, &fw[pi].pk))
     }
     return pr
 }
@@ -14411,7 +14415,7 @@ fn fkFinish(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, fw: &[]Table, lat
                     var nr = collections.copyOf(&r)
                     for j in 0..len(fc.cols) {
                         let col = fc.cols[j]
-                        if act == lexdb_sql.FK_CASCADE { nr[col] = to[j].clone() }
+                        if act == lexdb_sql.FK_CASCADE { nr[col] = try lexdb_fkconv.cascaded(&to[j], &c.cols[col].typ, &p.cols[fc.refCols[j]].typ, &txn.sql.zone) }
                         else if act == lexdb_sql.FK_SET_NULL { nr[col] = Val.Null }
                         else { nr[col] = try defAt(st, txn, &defs, c, col) }
                     }
@@ -14494,7 +14498,7 @@ fn makeFk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, p: &Tabl
     for j in 0..len(cols) {
         let a = &t.cols[cols[j]]
         let b = &p.cols[rc[j]]
-        if a.typ.kind != b.typ.kind {
+        if !lexdb_fkconv.compatible(&a.typ, &b.typ, md) {
             return Err(e("42804", &("foreign key constraint \"" + name + "\" cannot be implemented: Key columns \"" + a.name + "\" and \"" + b.name +
                          "\" are of incompatible types: " + lexdb_sql.typeText(&a.typ) + " and " + lexdb_sql.typeText(&b.typ) + ".")))
         }

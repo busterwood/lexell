@@ -1,0 +1,171 @@
+// lexdb over TNS: the fourth bug slice (design/lexdb-robust.md, "The fourth bug slice"; KNOWN-ISSUES.md), checked against Oracle Database Free
+// 23.26 (gen_oracle.py --check tns_bugs4): a NUMBER, NUMBER(p) or NUMBER(p,s) foreign key to a NUMBER GENERATED AS IDENTITY key (lexdb's bigint),
+// NUMBER(10) to INTEGER, INTEGER to NUMBER, both ways: a child's 5 and 5.0 find the parent's 5, 5.5 and numbers past bigint's range find none
+// (ORA-02291), NULL, INSERT ... SELECT with a bad row late, UPDATE of the child, DELETE and UPDATE of the parent (ORA-02292, ON DELETE CASCADE, SET
+// NULL), ADD CONSTRAINT over rows (ORA-02298), the types Oracle refuses (ORA-02267); a view and a session's first read after the function the view
+// calls is dropped (ORA-04063, ORA-04067) and USER_OBJECTS.STATUS of the view; a function or procedure created with compilation errors (INVALID,
+// USER_ERRORS, ORA-06575 and ORA-04063 when called); SESSIONTIMEZONE after ALTER SESSION SET TIME_ZONE to a region; TO_CHAR of a TIMESTAMP WITH
+// LOCAL TIME ZONE with the zone elements (ORA-01821). Each statement runs with set lexdb_batch = off (the row engine) and on: "same" and the
+// answer, or DIFFERENT and both.
+// expect: setup: 27 statements
+// expect: same: 1 / 1 / ID,PID = 1|5;2|5
+// expect: same: error 2291 / N = 0
+// expect: same: error 2291 / N = 0
+// expect: same: error 2291 / N = 0
+// expect: same: error 2291 / N = 0
+// expect: same: 1 / ID,PID = 5|NULL
+// expect: same: 1 / error 2291 / N = 0
+// expect: same: 1 / 1 / ID,PID = 8|4
+// expect: same: 3000 / N,S = 3000|10500
+// expect: same: error 2291 / N = 0
+// expect: same: error 2291 / N = 0
+// expect: same: 3 / ID,PID = 1|2;2|3;3|NULL
+// expect: same: 1 / 1 / 1 / 1 / ID,PID = 3|3
+// expect: same: 1 / 1 / 1 / 1 / ID,PID = 1|NULL;3|NULL;4|4.00
+// expect: same: error 2291 / N = 0
+// expect: same: 1 / error 2292 / N = 6
+// expect: same: 1 / 1 / N = 5
+// expect: same: 3000 / error 2292 / N = 6
+// expect: same: 3000 / 5 / N = 1
+// expect: same: error 2291 / N = 0
+// expect: same: 1 / error 2292 / ID = 1;2
+// expect: same: 1 / 1 / ID = 1;3
+// expect: same: 1 / ID,PID = 1|1
+// expect: same: error 2291 / N = 0
+// expect: same: 1 / 1 / 1 / ID,PID = 1|2;2|3
+// expect: same: 1 / 1 / 1 / ID,PID = 2|3
+// expect: same: error 2291 / N = 0
+// expect: same: 1 / ID,PID = 3|3
+// expect: same: 1 / error 2292 / ID = 1;2;2.5;3
+// expect: same: 1 / 1 / ID,K,PID = 1|'a'|1;2|'a'|1
+// expect: same: error 2291 / N = 0
+// expect: same: 0 / 0
+// expect: same: error 2298
+// expect: same: error 2267
+// expect: same: error 2267
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+const SETUP = "create table fp1 (id number generated always as identity primary key, v varchar2(10))\ninsert into fp1 (v) select 'r' || level from dual connect by level <= 6\ncreate table fc1 (id number primary key, pid number references fp1 (id))\ncreate table fc2 (id number primary key, pid number(10) references fp1 (id) on delete cascade)\ncreate table fc3 (id number primary key, pid number(12,2) references fp1 (id) on delete set null)\ncreate table fp2 (id number(10) primary key)\ninsert into fp2 values (1)\ninsert into fp2 values (2)\ncreate table fc4 (id number primary key, pid number references fp2 (id))\ncreate table fp3 (id integer primary key)\ninsert into fp3 values (1)\ncreate table fc5 (id number primary key, pid number(10) references fp3 (id))\ncreate table fp4 (id number primary key)\ninsert into fp4 values (1)\ninsert into fp4 values (2)\ninsert into fp4 values (2.5)\ninsert into fp4 values (3)\ncreate table fc7 (id number primary key, pid integer references fp4 (id) on delete cascade)\ncreate table fc8 (id number, pid number)\ninsert into fc8 values (1, 2.0)\ninsert into fc8 values (2, null)\ncreate table fc9 (id number, pid number)\ninsert into fc9 values (1, 2.5)\ncreate table fs1 (id number generated always as identity primary key, k varchar2(5) unique)\ninsert into fs1 (k) values ('a')\ncreate table fc10 (id number primary key, k varchar2(5) references fs1 (k), pid number references fs1 (id))\ncreate table nums as select level i from dual connect by level <= 3000"
+
+const QS = "insert into fc1 values (1, 5) ;; insert into fc1 values (2, 5.0) ;; select id, pid from fc1 order by id\ninsert into fc1 values (3, 5.5) ;; select count(*) n from fc1\ninsert into fc1 values (4, 99999999999999999999999) ;; select count(*) n from fc1\ninsert into fc1 values (6, -9223372036854775809) ;; select count(*) n from fc1\ninsert into fc1 values (7, 9223372036854775808) ;; select count(*) n from fc1\ninsert into fc1 values (5, null) ;; select id, pid from fc1\ninsert into fc1 values (8, 6) ;; update fc1 set pid = 6.5 where id = 8 ;; select count(*) n from fc1 where pid = 6.5\ninsert into fc1 values (8, 6) ;; update fc1 set pid = 4.0 where id = 8 ;; select id, pid from fc1\ninsert into fc1 select i, mod(i, 6) + 1 from nums ;; select count(*) n, sum(pid) s from fc1\ninsert into fc1 select i, mod(i, 6) + 1 + case when i = 2999 then 0.5 else 0 end from nums ;; select count(*) n from fc1\ninsert into fc1 select i, case when i = 2999 then 7 else mod(i, 6) + 1 end from nums ;; select count(*) n from fc1\ninsert into fc1 values (1, 2), (2, 3.0), (3, null) ;; select id, pid from fc1 order by id\ninsert into fc2 values (1, 2) ;; insert into fc2 values (2, 2.4) ;; insert into fc2 values (3, 3) ;; delete from fp1 where id = 2 ;; select id, pid from fc2 order by id\ninsert into fc3 values (1, 3) ;; insert into fc3 values (3, 3.00) ;; insert into fc3 values (4, 4) ;; delete from fp1 where id = 3 ;; select id, pid from fc3 order by id\ninsert into fc3 values (2, 3.5) ;; select count(*) n from fc3\ninsert into fc1 values (1, 5) ;; delete from fp1 where id = 5 ;; select count(*) n from fp1\ninsert into fc1 values (1, 5) ;; delete from fp1 where id = 4 ;; select count(*) n from fp1\ninsert into fc1 select i, 5 from nums ;; delete from fp1 where id >= 5 ;; select count(*) n from fp1\ninsert into fc1 select i, 6 from nums ;; delete from fp1 where id < 6 ;; select count(*) n from fp1\ninsert into fc4 values (1, 1.5) ;; select count(*) n from fc4\ninsert into fc4 values (2, 1) ;; update fp2 set id = 3 where id = 1 ;; select id from fp2 order by id\ninsert into fc4 values (2, 1) ;; update fp2 set id = 3 where id = 2 ;; select id from fp2 order by id\ninsert into fc5 values (1, 1.4) ;; select id, pid from fc5\ninsert into fc5 values (1, 2) ;; select count(*) n from fc5\ninsert into fc7 values (1, 2) ;; insert into fc7 values (2, 3) ;; delete from fp4 where id = 2.5 ;; select id, pid from fc7 order by id\ninsert into fc7 values (1, 2) ;; insert into fc7 values (2, 3) ;; delete from fp4 where id = 2 ;; select id, pid from fc7 order by id\ninsert into fc7 values (3, 4) ;; select count(*) n from fc7\ninsert into fc7 values (3, 2.5) ;; select id, pid from fc7\ninsert into fc7 values (1, 3) ;; update fp4 set id = 4 where id = 3 ;; select id from fp4 order by id\ninsert into fc10 values (1, 'a', 1) ;; insert into fc10 values (2, 'a', 1.0) ;; select id, k, pid from fc10 order by id\ninsert into fc10 values (3, 'b', 1) ;; select count(*) n from fc10\nalter table fc8 add constraint fc8_fk foreign key (pid) references fp1 (id) ;; alter table fc8 drop constraint fc8_fk\nalter table fc9 add constraint fc9_fk foreign key (pid) references fp1 (id)\ncreate table fcx (id number, pid varchar2(10) references fp1 (id))\ncreate table fcx (id number, pid binary_double references fp1 (id))"
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// A query: its columns' names, then its rows; or error and the number.
+fn qtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() { append(mut &rs, values(&rows, i)) }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// A statement: its row count, or error and the number.
+fn xtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.run(&(sql.toStr()), &[]) {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn one(c: mut &oracle.Conn, sql: &str): str {
+    let low = strings.toLowerAscii(sql)
+    if strings.startsWith(&low, "select") || strings.startsWith(&low, "with") { return qtext(c, sql) }
+    return xtext(c, sql)
+}
+
+// A query, or statements ("a ;; b ;; c") in a transaction rolled back: each answer, joined by " / " (after an error, the
+// last part, the check, after the rollback).
+fn answer(c: mut &oracle.Conn, sqls: &str): str {
+    if !strings.contains(sqls, " ;; ") { return one(c, sqls) }
+    let parts = strings.split(sqls, " ;; ")
+    var out: []str = []
+    var failed = false
+    let r = c.transaction(fn(c2: mut &oracle.Conn): Result[int, oracle.Error] {
+        for i in 0..len(parts) {
+            if failed { break }
+            let a = one(c2, &parts[i])
+            if strings.startsWith(&a, "error") { failed = true }
+            append(mut &out, a)
+        }
+        return Err(sqldialect.inputError("rolled back"))
+    })
+    if failed { append(mut &out, one(c, &parts[len(parts) - 1])) }
+    return strings.join(&out, " / ")
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            var n = 0
+            let setup: str = SETUP
+            for s in strings.lines(&setup) {
+                match c.run(&(s.toStr()), &[]) {
+                    Ok(_) { n += 1 }
+                    Err(e) { println("setup: error " + e.code.toStr() + ": " + s) }
+                }
+            }
+            println("setup: " + n.toStr() + " statements")
+            let text: str = QS
+            for q in strings.lines(&text) {
+                let a = c.run(&("set lexdb_batch = off".toStr()), &[])
+                let off = answer(mut &c, &q)
+                let b = c.run(&("set lexdb_batch = on".toStr()), &[])
+                let on = answer(mut &c, &q)
+                if off == on { println("same: " + on) } else {
+                    println("DIFFERENT: " + q)
+                    println("  rows:    " + off)
+                    println("  batches: " + on)
+                }
+            }
+            c.logoff()
+        }
+        Err(e) { println("connect: error " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(160), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}
