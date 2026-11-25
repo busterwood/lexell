@@ -216,6 +216,7 @@ CHECKED = {
     'tns_bugs4': ('consts', 'QS'),
     'tns_bugs5': ('consts', 'QS'),
     'tns_bugs6': ('consts', 'QS'),
+    'tns_bugs7': ('consts', 'QS'),
 }
 
 

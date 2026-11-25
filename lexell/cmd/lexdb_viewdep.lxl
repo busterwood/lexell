@@ -403,3 +403,53 @@ fn usesCol(refs: &[]Ref, rel: &str, col: &str): bool {
     }
     return false
 }
+
+// ---- a view's columns as at its CREATE (the seventh bug slice)
+
+// A view whose query now gives more columns than the view has (outs: a column added to a table under its SELECT *): its query q
+// made the derived table of a query that keeps the view's columns as at its CREATE, as each product does: SQL Server's by
+// position (the first ones, until sp_refreshview), PostgreSQL's and Oracle's by name (they expand * at CREATE), by position
+// when a name is not among the query's (a view that names its own columns). A T-SQL view that names its own columns (CREATE
+// VIEW v (a, b) AS ...) is SQL Server's 8158. False, q as it is, when the query gives as many (or fewer: fewerErr's). Only a
+// view whose tables gained columns pays (its query planned a second time).
+pub fn narrowed(t: &Table, outs: &[]OutCol, q: mut &lexdb_sql.Stmt): Result[bool, DbErr] {
+    let n = len(t.cols)
+    if len(outs) <= n || n == 0 { return Ok(false) }
+    var pick: []int = []
+    if strings.startsWith(&t.view, lexdb_sql.TSQL_VIEW) {
+        if lexdb_tsqlname.viewColList(&lexdb_sql.viewDefinition(&t.view)) {
+            return Err(err("TS8158", &("'" + lexdb_sql.baseName(&t.name) + "' has more columns than were specified in the column list.")))
+        }
+    } else {
+        var used: []bool = array(len(outs), false)
+        for c in t.cols {
+            var at = -1
+            for i in 0..len(outs) { if at < 0 && !used[i] && outs[i].name == c.name { at = i } }
+            if at < 0 { break }
+            used[at] = true
+            append(mut &pick, at)
+        }
+    }
+    if len(pick) != n {
+        pick = []
+        for i in 0..n { append(mut &pick, i) }
+    }
+    var w = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
+    w.params = q.params
+    w.use = q.use
+    var inner = replace(q, lexdb_sql.newStmt(lexdb_sql.S_SELECT))
+    inner.use = lexdb_sql.SUB_FROM
+    append(mut &w.subs, inner)
+    var last = 0
+    for p in pick { if p > last { last = p } }
+    var names: []str = []
+    for i in 0..last + 1 { append(mut &names, "c" + i.toStr()) }
+    append(mut &w.from, lexdb_sql.FromItem{table: "", alias: "view_", join: lexdb_sql.J_FIRST, on: None, sub: 0, cols: names, work: -1, lateral: false,
+                                           using: [], natural: false, comma: true})
+    for k in 0..n {
+        append(mut &w.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(lexdb_sql.Expr.Col("view_.c" + pick[k].toStr(), -1)),
+                                               alias: t.cols[k].name.clone(), spell: t.cols[k].spell.clone()})
+    }
+    let x = replace(q, w)
+    return Ok(true)
+}
