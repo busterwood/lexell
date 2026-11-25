@@ -17,6 +17,15 @@ STRING_AGG ( expression, separator ) [ WITHIN GROUP ( ORDER BY order_expression 
 PRODUCT ( expression )
 APPROX_PERCENTILE_CONT ( numeric_literal ) WITHIN GROUP ( ORDER BY expression [ ASC | DESC ] )
 APPROX_PERCENTILE_DISC ( numeric_literal ) WITHIN GROUP ( ORDER BY expression [ ASC | DESC ] )
+APPROX_COUNT_DISTINCT ( expression )
+APPROX_COUNT_DISTINCT_DETAIL ( expression )
+APPROX_COUNT_DISTINCT_AGG ( detail )
+TO_APPROX_COUNT_DISTINCT ( detail )
+APPROX_PERCENTILE ( expression, fraction )
+APPROX_PERCENTILE ( fraction ) WITHIN GROUP ( ORDER BY expression [ ASC | DESC ] )
+APPROX_PERCENTILE_DETAIL ( expression )
+APPROX_PERCENTILE_AGG ( detail )
+TO_APPROX_PERCENTILE ( detail, fraction )
 ```
 
 `PERCENTILE_CONT` and `PERCENTILE_DISC` are on the [window functions](functions-window.md) page, because SQL Server
@@ -53,6 +62,15 @@ takes them only with `OVER`.
 `APPROX_PERCENTILE_CONT`, `APPROX_PERCENTILE_DISC`
 : The value at the given fraction (0 to 1) of the ordered values, interpolated or taken from the data
   (SQL Server 2022).
+
+`APPROX_COUNT_DISTINCT`, `APPROX_COUNT_DISTINCT_DETAIL`, `APPROX_COUNT_DISTINCT_AGG`, `TO_APPROX_COUNT_DISTINCT`
+: Approximate count of distinct non-NULL values (SQL Server 2019 `APPROX_COUNT_DISTINCT`, plus composable binary sketch
+  variants `_DETAIL`, `_AGG`, and `TO_APPROX_COUNT_DISTINCT` backed by HyperLogLog++). Returns `bigint` (0 over no rows).
+
+`APPROX_PERCENTILE`, `APPROX_PERCENTILE_DETAIL`, `APPROX_PERCENTILE_AGG`, `TO_APPROX_PERCENTILE`
+: Composable approximate quantile backed by a Dunning merging t-digest, supporting both `APPROX_PERCENTILE(expr, p)` and
+  `APPROX_PERCENTILE(p) WITHIN GROUP (ORDER BY expr [ASC | DESC])`, plus mergeable binary digests (`_DETAIL`, `_AGG`)
+  and `TO_APPROX_PERCENTILE(detail, p)`.
 
 ## Remarks
 

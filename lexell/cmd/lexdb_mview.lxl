@@ -28,6 +28,7 @@ import "./lexdb_ops"
 import "./lexdb_parse"
 import "./lexdb_bind"
 import "./lexdb_agg"
+import "./lexdb_sketch"
 
 type DbErr = lexdb_base.DbErr
 type Table = lexdb_catalog.Table
@@ -46,6 +47,8 @@ pub const MV_GK = lexdb_catalog.MV_GK
 pub const MV_CNT = lexdb_catalog.MV_CNT
 pub const MV_NN = lexdb_catalog.MV_NN
 pub const MV_SUM = lexdb_catalog.MV_SUM
+pub const MV_SUMSQ = lexdb_catalog.MV_SUMSQ
+pub const MV_SKETCH = lexdb_catalog.MV_SKETCH
 
 // Markers carried in Table.invalid on an MV backing table (zero CATALOG reads on SELECT/DML!).
 pub const MV_MARK = "\x02mv_rel"
@@ -403,20 +406,62 @@ pub fn parseQuery(sql: &str, md: int): Result[Stmt, DbErr] {
     return Ok(replace(mut &ss[0], lexdb_sql.newStmt(lexdb_sql.S_EMPTY)))
 }
 
-// Aggregate kinds supported by Stage 1 FAST incremental maintenance.
+// Aggregate kinds supported by Stage 1 & Stage 2 FAST incremental maintenance.
 pub const AGG_NONE = 0
 pub const AGG_COUNT_STAR = 1
 pub const AGG_COUNT_EXPR = 2
 pub const AGG_SUM = 3
 pub const AGG_AVG = 4
+pub const AGG_VAR_POP = 5
+pub const AGG_VAR_SAMP = 6
+pub const AGG_STDDEV_POP = 7
+pub const AGG_STDDEV_SAMP = 8
+pub const AGG_BOOL_AND = 9
+pub const AGG_BOOL_OR = 10
+pub const AGG_BIT_XOR = 11
+pub const AGG_MIN = 12
+pub const AGG_MAX = 13
+pub const AGG_HLL = 14
+pub const AGG_HLL_DETAIL = 15
+pub const AGG_TDIGEST = 16
+pub const AGG_TDIGEST_DETAIL = 17
+
+fn isVarAgg(ak: int): bool { return ak >= AGG_VAR_POP && ak <= AGG_STDDEV_SAMP }
+fn isHllAgg(ak: int): bool { return ak == AGG_HLL || ak == AGG_HLL_DETAIL }
+fn isTdAgg(ak: int): bool { return ak == AGG_TDIGEST || ak == AGG_TDIGEST_DETAIL }
+fn isSketchAgg(ak: int): bool { return ak >= AGG_HLL && ak <= AGG_TDIGEST_DETAIL }
+
+fn varFname(ak: int): str {
+    if ak == AGG_VAR_POP { return "var_pop" }
+    if ak == AGG_VAR_SAMP { return "var_samp" }
+    if ak == AGG_STDDEV_POP { return "stddev_pop" }
+    return "stddev_samp"
+}
+
+fn needsNnCol(ak: int): bool {
+    return ak == AGG_SUM || ak == AGG_AVG || isVarAgg(ak) || ak == AGG_BOOL_AND || ak == AGG_BOOL_OR ||
+           ak == AGG_BIT_XOR || ak == AGG_MIN || ak == AGG_MAX
+}
+
+fn needsSumCol(ak: int): bool {
+    return ak == AGG_AVG || isVarAgg(ak) || ak == AGG_BOOL_AND || ak == AGG_BOOL_OR || ak == AGG_BIT_XOR
+}
+
+fn needsSumSqCol(ak: int): bool { return isVarAgg(ak) }
+fn needsSketchCol(ak: int): bool { return ak == AGG_HLL || ak == AGG_TDIGEST }
 
 pub type FastItem = record {
     pub visCol: int             // index in MV backing table for the visible output column
     pub aggKind: int            // AGG_*
-    pub expr: Expr              // raw expression (or aggregate's arg for COUNT/SUM/AVG)
+    pub expr: Expr              // raw expression (or aggregate's arg)
     pub filter: Option[Expr]    // optional FILTER (WHERE ...) on the aggregate
     pub nnCol: int              // hidden non-null count column index in MV backing table (-1 if none)
-    pub sumCol: int             // hidden running sum column index for AVG (-1 if none)
+    pub sumCol: int             // hidden running sum / true_cnt / xor_val column index (-1 if none)
+    pub sumSqCol: int           // hidden running sum-of-squares column index for VAR/STDDEV (-1 if none)
+    pub sketchCol: int          // hidden serialized sketch column index for HLL/TDIGEST (-1 if none)
+    pub pctFrac: float          // constant percentile fraction for AGG_TDIGEST
+    pub pctDesc: bool           // true if APPROX_PERCENTILE(... ORDER BY ... DESC)
+    pub oraDia: bool            // true if Oracle dialect aggregate (" dia:o")
 }
 
 pub type EqPair = record {
@@ -578,29 +623,46 @@ fn hasSubOrWin(q: &Stmt): bool {
            len(q.mr) > 0 || q.cte >= 0 || len(q.srf) > 0
 }
 
-// Inspects an expression to see if it is a Stage 1 fast-refreshable aggregate call.
+// Inspects an expression to see if it is a Stage 1 / Stage 2 fast-refreshable aggregate call.
 type FastAggRes = record {
     kind: int
     arg: Expr
     flt: Option[Expr]
     wasAgg: bool
+    pctFrac: float
+    pctDesc: bool
+    oraDia: bool
 }
 
 fn noAggRes(wasAgg: bool): FastAggRes {
-    return FastAggRes{kind: AGG_NONE, arg: Expr.Lit(Val.Null), flt: None, wasAgg: wasAgg}
+    return FastAggRes{kind: AGG_NONE, arg: Expr.Lit(Val.Null), flt: None, wasAgg: wasAgg, pctFrac: 0.0f, pctDesc: false, oraDia: false}
+}
+
+fn litFloat(x: &Expr): Option[float] {
+    match x {
+        Expr.Lit(v) { return lexdb_ops.asFloat(&v) }
+        Expr.Cast(a, _) { return litFloat(&a) }
+        else { return None }
+    }
 }
 
 fn parseFastAgg(x: &Expr): FastAggRes {
     match x {
         Expr.Call(name, args, star) {
             if !lexdb_sql.isAgg(&name) { return noAggRes(false) }
-            // Disallow DISTINCT and ORDER BY inside aggregate calls for Stage 1 FAST.
             let parts = strings.split(&name, " ")
             let base = parts[0]
             var hasFilter = false
+            var pctDesc = false
+            var oraDia = false
             for i in 1..len(parts) {
                 let p = &parts[i]
                 if p == "filter" { hasFilter = true; continue }
+                if p == "dia:o" { oraDia = true; continue }
+                if base == "approx_percentile" && strings.startsWith(p, "order:") {
+                    if len(p) > 6 && (p[6] == 'd' || p[6] == 'D') { pctDesc = true }
+                    continue
+                }
                 if p == "distinct" || strings.startsWith(p, "order:") || p == "within" {
                     return noAggRes(true)
                 }
@@ -612,16 +674,46 @@ fn parseFastAgg(x: &Expr): FastAggRes {
                 nArgs -= 1
             }
             if base == "count" {
-                if star && nArgs == 0 { return FastAggRes{kind: AGG_COUNT_STAR, arg: Expr.Lit(Val.Int(1)), flt: flt, wasAgg: true} }
+                if star && nArgs == 0 { return FastAggRes{kind: AGG_COUNT_STAR, arg: Expr.Lit(Val.Int(1)), flt: flt, wasAgg: true, pctFrac: 0.0f, pctDesc: false, oraDia: oraDia} }
                 if !star && nArgs == 1 {
                     if lexdb_bind.hasAgg(&args[0]) { return noAggRes(true) }
-                    return FastAggRes{kind: AGG_COUNT_EXPR, arg: lexdb_sql.cloneExpr(&args[0]), flt: flt, wasAgg: true}
+                    return FastAggRes{kind: AGG_COUNT_EXPR, arg: lexdb_sql.cloneExpr(&args[0]), flt: flt, wasAgg: true, pctFrac: 0.0f, pctDesc: false, oraDia: oraDia}
                 }
                 return noAggRes(true)
             }
-            if (base == "sum" || base == "avg") && !star && nArgs == 1 {
+            if !star && nArgs == 1 {
                 if lexdb_bind.hasAgg(&args[0]) { return noAggRes(true) }
-                return FastAggRes{kind: if base == "sum" { AGG_SUM } else { AGG_AVG }, arg: lexdb_sql.cloneExpr(&args[0]), flt: flt, wasAgg: true}
+                let k = match base.toStr() {
+                    "sum" { AGG_SUM }
+                    "avg" { AGG_AVG }
+                    "var_pop" { AGG_VAR_POP }
+                    "var_samp", "variance" { AGG_VAR_SAMP }
+                    "stddev_pop" { AGG_STDDEV_POP }
+                    "stddev_samp", "stddev" { AGG_STDDEV_SAMP }
+                    "bool_and", "every" { AGG_BOOL_AND }
+                    "bool_or" { AGG_BOOL_OR }
+                    "bit_xor" { AGG_BIT_XOR }
+                    "min" { AGG_MIN }
+                    "max" { AGG_MAX }
+                    "approx_count_distinct" { AGG_HLL }
+                    "approx_count_distinct_detail" { AGG_HLL_DETAIL }
+                    "approx_percentile_detail" { AGG_TDIGEST_DETAIL }
+                    else { AGG_NONE }
+                }
+                if k != AGG_NONE {
+                    return FastAggRes{kind: k, arg: lexdb_sql.cloneExpr(&args[0]), flt: flt, wasAgg: true, pctFrac: 0.0f, pctDesc: false, oraDia: oraDia}
+                }
+                return noAggRes(true)
+            }
+            if base == "approx_percentile" && !star && nArgs == 2 {
+                if lexdb_bind.hasAgg(&args[0]) || lexdb_bind.hasAgg(&args[1]) { return noAggRes(true) }
+                match litFloat(&args[1]) {
+                    Some(pf) {
+                        if pf.isNaN() || pf < 0.0f || pf > 1.0f { return noAggRes(true) }
+                        return FastAggRes{kind: AGG_TDIGEST, arg: lexdb_sql.cloneExpr(&args[0]), flt: flt, wasAgg: true, pctFrac: pf, pctDesc: pctDesc, oraDia: oraDia}
+                    }
+                    None { return noAggRes(true) }
+                }
             }
             return noAggRes(true)
         }
@@ -821,7 +913,8 @@ pub fn analyzeFast(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Stmt, 
                     let slot = off + ci
                     append(mut &fastItems, FastItem{visCol: visIdx, aggKind: AGG_NONE,
                                                     expr: Expr.Col(allCols[slot].name.clone(), slot),
-                                                    filter: None, nnCol: -1, sumCol: -1})
+                                                    filter: None, nnCol: -1, sumCol: -1, sumSqCol: -1, sketchCol: -1,
+                                                    pctFrac: 0.0f, pctDesc: false, oraDia: false})
                     visIdx += 1
                 }
             }
@@ -834,7 +927,7 @@ pub fn analyzeFast(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Stmt, 
         if anyAgg {
             let ar = parseFastAgg(&ex)
             if ar.wasAgg {
-                if ar.kind == AGG_NONE { return Ok(noFast("aggregate function not supported for Stage 1 FAST refresh (supports COUNT, SUM, AVG)")) }
+                if ar.kind == AGG_NONE { return Ok(noFast("aggregate function not supported for FAST refresh")) }
                 if !lexdb_bind.immutable(&ar.arg) { return Ok(noFast("volatile expression inside aggregate")) }
                 let rArg = match resolveFastExpr(&ar.arg, &allCols) {
                     Ok(rx) { rx }
@@ -851,18 +944,22 @@ pub fn analyzeFast(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Stmt, 
                     }
                     None {}
                 }
-                append(mut &fastItems, FastItem{visCol: visIdx, aggKind: ar.kind, expr: rArg, filter: rFlt, nnCol: -1, sumCol: -1})
+                append(mut &fastItems, FastItem{visCol: visIdx, aggKind: ar.kind, expr: rArg, filter: rFlt,
+                                                nnCol: -1, sumCol: -1, sumSqCol: -1, sketchCol: -1,
+                                                pctFrac: ar.pctFrac, pctDesc: ar.pctDesc, oraDia: ar.oraDia})
                 visIdx += 1
             } else {
                 if lexdb_bind.hasAgg(&ex) {
-                    return Ok(noFast("complex expression wrapping aggregate is not supported for Stage 1 FAST refresh"))
+                    return Ok(noFast("complex expression wrapping aggregate is not supported for FAST refresh"))
                 }
                 if !lexdb_bind.immutable(&ex) { return Ok(noFast("volatile expression in SELECT list")) }
                 let rEx = match resolveFastExpr(&ex, &allCols) {
                     Ok(rx) { rx }
                     Err(_) { return Ok(noFast("cannot resolve SELECT expression")) }
                 }
-                append(mut &fastItems, FastItem{visCol: visIdx, aggKind: AGG_NONE, expr: rEx, filter: None, nnCol: -1, sumCol: -1})
+                append(mut &fastItems, FastItem{visCol: visIdx, aggKind: AGG_NONE, expr: rEx, filter: None,
+                                                nnCol: -1, sumCol: -1, sumSqCol: -1, sketchCol: -1,
+                                                pctFrac: 0.0f, pctDesc: false, oraDia: false})
                 visIdx += 1
             }
         } else {
@@ -871,7 +968,9 @@ pub fn analyzeFast(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Stmt, 
                 Ok(rx) { rx }
                 Err(_) { return Ok(noFast("cannot resolve SELECT expression")) }
             }
-            append(mut &fastItems, FastItem{visCol: visIdx, aggKind: AGG_NONE, expr: rEx, filter: None, nnCol: -1, sumCol: -1})
+            append(mut &fastItems, FastItem{visCol: visIdx, aggKind: AGG_NONE, expr: rEx, filter: None,
+                                            nnCol: -1, sumCol: -1, sumSqCol: -1, sketchCol: -1,
+                                            pctFrac: 0.0f, pctDesc: false, oraDia: false})
             visIdx += 1
         }
     }
@@ -924,6 +1023,8 @@ fn bindHiddenCols(fp: mut &FastPlan, t: &Table) {
     for i in 0..len(fp.items) {
         fp.items[i].nnCol = lexdb_bind.colIndex(&t.cols, &(MV_NN + i.toStr()))
         fp.items[i].sumCol = lexdb_bind.colIndex(&t.cols, &(MV_SUM + i.toStr()))
+        fp.items[i].sumSqCol = lexdb_bind.colIndex(&t.cols, &(MV_SUMSQ + i.toStr()))
+        fp.items[i].sketchCol = lexdb_bind.colIndex(&t.cols, &(MV_SKETCH + i.toStr()))
     }
 }
 
@@ -935,16 +1036,30 @@ pub fn appendHiddenCols(fp: &FastPlan, cols: mut &[]lexdb_sql.ColDef): int {
         append(cols, lexdb_sql.colDef(&MV_CNT, lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}, true))
         for i in 0..len(fp.items) {
             let ak = fp.items[i].aggKind
-            if ak == AGG_SUM || ak == AGG_AVG {
+            if needsNnCol(ak) {
                 append(cols, lexdb_sql.colDef(&(MV_NN + i.toStr()), lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}, true))
             }
-            if ak == AGG_AVG {
-                // Keep exact running sum in numeric (or float if visible col is float)
+            if needsSumCol(ak) {
                 let vTyp = cols[fp.items[i].visCol].typ
-                let sumTyp = if vTyp.kind == lexdb_sql.K_FLOAT { lexdb_sql.floatType(lexdb_sql.OID_FLOAT8) }
-                             else if vTyp.kind == lexdb_sql.K_IVAL { vTyp }
-                             else { lexdb_sql.TypeName{kind: lexdb_sql.K_NUM, oid: lexdb_sql.OID_NUMERIC, prec: 0, scale: 0, len: 0} }
+                let sumTyp = if ak == AGG_BOOL_AND || ak == AGG_BOOL_OR || ak == AGG_BIT_XOR {
+                    lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}
+                } else if vTyp.kind == lexdb_sql.K_FLOAT {
+                    lexdb_sql.floatType(lexdb_sql.OID_FLOAT8)
+                } else if vTyp.kind == lexdb_sql.K_IVAL {
+                    vTyp
+                } else {
+                    lexdb_sql.TypeName{kind: lexdb_sql.K_NUM, oid: lexdb_sql.OID_NUMERIC, prec: 0, scale: 0, len: 0}
+                }
                 append(cols, lexdb_sql.colDef(&(MV_SUM + i.toStr()), sumTyp, false))
+            }
+            if needsSumSqCol(ak) {
+                let vTyp = cols[fp.items[i].visCol].typ
+                let sqTyp = if vTyp.kind == lexdb_sql.K_FLOAT { lexdb_sql.floatType(lexdb_sql.OID_FLOAT8) }
+                            else { lexdb_sql.TypeName{kind: lexdb_sql.K_NUM, oid: lexdb_sql.OID_NUMERIC, prec: 0, scale: 0, len: 0} }
+                append(cols, lexdb_sql.colDef(&(MV_SUMSQ + i.toStr()), sqTyp, false))
+            }
+            if needsSketchCol(ak) {
+                append(cols, lexdb_sql.colDef(&(MV_SKETCH + i.toStr()), lexdb_sql.TypeName{kind: lexdb_sql.K_BYTEA, oid: lexdb_sql.OID_BYTEA, prec: 0, scale: 0, len: 0}, false))
             }
         }
     }
@@ -970,11 +1085,25 @@ pub type PendingDelta = record {
     pub isAgg: bool
     pub globalAgg: bool
     pub gk: str                 // encoded MV_GK bytes
-    pub visRow: []Val           // for non-agg: visible row values; for agg: group key values
+    pub gVals: []Val            // raw GROUP BY values (for targeted single-group re-probe)
+    pub visRow: []Val           // for non-agg: visible row values; for agg: group key display values
     pub dCnt: int               // delta row count (+1/-1 or coalesced)
     pub dNn: []int              // per-item non-null count delta
-    pub dSum: []Val             // per-item signed sum delta (Null = 0)
+    pub dSum: []Val             // per-item signed sum / true-count delta (Null = 0)
+    pub dSumSq: []Val           // per-item signed sum-of-squares delta (Null = 0)
+    pub dXor: []int             // per-item accumulated XOR delta for BIT_XOR
+    pub dExtAdd: []Val          // per-item best +1 extremum candidate for MIN/MAX
+    pub dExtDel: []Val          // per-item worst -1 deleted value for MIN/MAX
+    pub dHasNeg: []bool         // per-item flag: any -1 non-null delta occurred
+    pub dSketch: []str          // per-item serialized +1 delta sketch bytes (HLL/t-digest)
     pub dSign: int              // for non-agg: net +1 or -1
+}
+
+fn emptyPending(mark: int, mvKey: &str, fullRefresh: bool, truncate: bool, isAgg: bool): PendingDelta {
+    return PendingDelta{mark: mark, mvKey: mvKey.toStr(), fullRefresh: fullRefresh, truncate: truncate,
+                        isAgg: isAgg, globalAgg: false, gk: "", gVals: [], visRow: [], dCnt: 0,
+                        dNn: [], dSum: [], dSumSq: [], dXor: [], dExtAdd: [], dExtDel: [],
+                        dHasNeg: [], dSketch: [], dSign: 0}
 }
 
 type TxnBuf = record {
@@ -1149,6 +1278,32 @@ fn combineSum(a: &Val, b: &Val): Result[Val, DbErr] {
     if lexdb_ops.isNull(a) { return Ok(b.clone()) }
     if lexdb_ops.isNull(b) { return Ok(a.clone()) }
     return lexdb_agg.sumAdd(a, b)
+}
+
+fn bitIntVal(v: &Val): Result[int, DbErr] {
+    match v {
+        Val.Int(i) { return Ok(i) }
+        Val.Bool(b) { return Ok(if b { 1 } else { 0 }) }
+        else {
+            match lexdb_ops.asNum(v) {
+                Some(d) {
+                    match d.toInt(Rounding.TOWARD_ZERO) {
+                        Ok(i) { return Ok(i) }
+                        Err(_) { return Err(err("22003", "bigint out of range")) }
+                    }
+                }
+                None { return Err(err("42883", "function bit_xor needs an integer")) }
+            }
+        }
+    }
+}
+
+fn extPick(cur: &Val, cand: &Val, isMax: bool): Result[Val, DbErr] {
+    if lexdb_ops.isNull(cand) { return Ok(cur.clone()) }
+    if lexdb_ops.isNull(cur) { return Ok(cand.clone()) }
+    let c = try lexdb_ops.compare(cand, cur)
+    if (isMax && c > 0) || (!isMax && c < 0) { return Ok(cand.clone()) }
+    return Ok(cur.clone())
 }
 
 fn avgVal(sum: &Val, nn: int, targetTyp: &lexdb_sql.TypeName, md: int): Result[Val, DbErr] {
@@ -1455,9 +1610,8 @@ fn computeMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mv: &MvMet
         if d.sign == 0 {
             for dep in mv.deps {
                 if dep.table == d.table {
-                    return Ok([PendingDelta{mark: mark, mvKey: mv.key.clone(), fullRefresh: false, truncate: true,
-                                            isAgg: mv.fastKind == FAST_AGG || (mv.fastKind == FAST_JOIN && lexdb_bind.colIndex(&mvTab.cols, &MV_CNT) >= 0),
-                                            globalAgg: false, gk: "", visRow: [], dCnt: 0, dNn: [], dSum: [], dSign: 0}])
+                    let isAgg = mv.fastKind == FAST_AGG || (mv.fastKind == FAST_JOIN && lexdb_bind.colIndex(&mvTab.cols, &MV_CNT) >= 0)
+                    return Ok([emptyPending(mark, &mv.key, false, true, isAgg)])
                 }
             }
         }
@@ -1476,14 +1630,12 @@ fn computeMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mv: &MvMet
             }
         }
         if !any { return Ok([]) }
-        return Ok([PendingDelta{mark: mark, mvKey: mv.key.clone(), fullRefresh: true, truncate: false,
-                                isAgg: false, globalAgg: false, gk: "", visRow: [], dCnt: 0, dNn: [], dSum: [], dSign: 0}])
+        return Ok([emptyPending(mark, &mv.key, true, false, false)])
     }
 
     let fp = try getCachedPlan(st, txn, mv, mvTab, up)
     if fp.kind == FAST_NONE {
-        return Ok([PendingDelta{mark: mark, mvKey: mv.key.clone(), fullRefresh: true, truncate: false,
-                                isAgg: false, globalAgg: false, gk: "", visRow: [], dCnt: 0, dNn: [], dSum: [], dSign: 0}])
+        return Ok([emptyPending(mark, &mv.key, true, false, false)])
     }
     let z = txn.sql.zone.clone()
 
@@ -1541,9 +1693,11 @@ fn computeMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mv: &MvMet
                 }
                 None {
                     byKey.put(gk.clone(), len(out))
-                    append(mut &out, PendingDelta{mark: mark, mvKey: mv.key.clone(), fullRefresh: false, truncate: false,
-                                                  isAgg: false, globalAgg: false, gk: gk, visRow: vis, dCnt: 0,
-                                                  dNn: [], dSum: [], dSign: sg})
+                    var pd = emptyPending(mark, &mv.key, false, false, false)
+                    pd.gk = gk
+                    pd.visRow = vis
+                    pd.dSign = sg
+                    append(mut &out, pd)
                 }
             }
         }
@@ -1551,8 +1705,14 @@ fn computeMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mv: &MvMet
     }
 
     // Aggregate MV (single-table or join): vectorized in-memory pre-aggregation over ONLY the delta batch!
+    var anySketch = false
+    for it in fp.items { if isSketchAgg(it.aggKind) { anySketch = true; break } }
     var out: []PendingDelta = []
     var byGk: Map[str, int] = newMap()
+    // Per-group live sketch accumulators during this statement batch (serialized once at end).
+    var grpHlls: [][]lexdb_sketch.Hll = []
+    var grpTds: [][]lexdb_sketch.TDigest = []
+
     for ri in 0..len(rows) {
         let r = &rows[ri]
         let sg = signs[ri]
@@ -1574,14 +1734,28 @@ fn computeMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mv: &MvMet
                     }
                 }
                 append(mut &out, PendingDelta{mark: mark, mvKey: mv.key.clone(), fullRefresh: false, truncate: false,
-                                              isAgg: true, globalAgg: fp.globalAgg, gk: gk, visRow: visRow, dCnt: 0,
-                                              dNn: array(nItems, 0), dSum: array(nItems, Val.Null), dSign: 0})
+                                              isAgg: true, globalAgg: fp.globalAgg, gk: gk, gVals: gVals, visRow: visRow,
+                                              dCnt: 0, dNn: array(nItems, 0), dSum: array(nItems, Val.Null),
+                                              dSumSq: array(nItems, Val.Null), dXor: array(nItems, 0),
+                                              dExtAdd: array(nItems, Val.Null), dExtDel: array(nItems, Val.Null),
+                                              dHasNeg: array(nItems, false), dSketch: array(nItems, ""), dSign: 0})
+                if anySketch {
+                    var hs: []lexdb_sketch.Hll = []
+                    var ts: []lexdb_sketch.TDigest = []
+                    for _ in 0..nItems {
+                        append(mut &hs, lexdb_sketch.newHll())
+                        append(mut &ts, lexdb_sketch.newTDigest())
+                    }
+                    append(mut &grpHlls, hs)
+                    append(mut &grpTds, ts)
+                }
             }
         }
         out[idx].dCnt += sg
         for k in 0..nItems {
             let it = &fp.items[k]
-            if it.aggKind == AGG_NONE { continue }
+            let ak = it.aggKind
+            if ak == AGG_NONE { continue }
             var passFlt = true
             match it.filter {
                 Some(fx) {
@@ -1591,15 +1765,57 @@ fn computeMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mv: &MvMet
                 None {}
             }
             if !passFlt { continue }
-            if it.aggKind == AGG_COUNT_STAR {
+            if ak == AGG_COUNT_STAR {
                 out[idx].dNn[k] += sg
-            } else {
-                let av = try (up.eval)(&fp.allCols, r, &it.expr, &z)
-                if !lexdb_ops.isNull(&av) {
-                    out[idx].dNn[k] += sg
-                    if it.aggKind == AGG_SUM || it.aggKind == AGG_AVG {
-                        out[idx].dSum[k] = try signedAdd(&out[idx].dSum[k], &av, sg)
+                continue
+            }
+            let av = try (up.eval)(&fp.allCols, r, &it.expr, &z)
+            if lexdb_ops.isNull(&av) { continue }
+            out[idx].dNn[k] += sg
+            if sg < 0 { out[idx].dHasNeg[k] = true }
+            if ak == AGG_SUM || ak == AGG_AVG {
+                out[idx].dSum[k] = try signedAdd(&out[idx].dSum[k], &av, sg)
+            } else if isVarAgg(ak) {
+                let x = try lexdb_agg.varNumOf(&av, &varFname(ak))
+                let sq = try lexdb_ops.arith(lexdb_ops.OP_MUL, &x, &x)
+                out[idx].dSum[k] = try signedAdd(&out[idx].dSum[k], &x, sg)
+                out[idx].dSumSq[k] = try signedAdd(&out[idx].dSumSq[k], &sq, sg)
+            } else if ak == AGG_BOOL_AND || ak == AGG_BOOL_OR {
+                match lexdb_ops.truth(&av) {
+                    Some(b) { if b { out[idx].dSum[k] = try signedAdd(&out[idx].dSum[k], &Val.Int(1), sg) } }
+                    None { return Err(err("42883", "boolean aggregate requires a boolean argument")) }
+                }
+            } else if ak == AGG_BIT_XOR {
+                let bv = try bitIntVal(&av)
+                out[idx].dXor[k] = out[idx].dXor[k] ^ bv
+            } else if ak == AGG_MIN || ak == AGG_MAX {
+                let isMax = ak == AGG_MAX
+                let cv = try lexdb_ops.coerceZ(av.clone(), &mvTab.cols[it.visCol].typ, &z)
+                if sg > 0 {
+                    out[idx].dExtAdd[k] = try extPick(&out[idx].dExtAdd[k], &cv, isMax)
+                } else {
+                    out[idx].dExtDel[k] = try extPick(&out[idx].dExtDel[k], &cv, isMax)
+                }
+            } else if isHllAgg(ak) {
+                if sg > 0 { grpHlls[idx][k].addVal(&av) }
+            } else if isTdAgg(ak) {
+                if sg > 0 {
+                    match lexdb_ops.asFloat(&av) {
+                        Some(fv) { grpTds[idx][k].addFloat(fv) }
+                        None { return Err(err("42883", "approx_percentile requires a numeric argument")) }
                     }
+                }
+            }
+        }
+    }
+    if anySketch {
+        for gi in 0..len(out) {
+            for k in 0..nItems {
+                let ak = fp.items[k].aggKind
+                if isHllAgg(ak) && !grpHlls[gi][k].isEmpty() {
+                    out[gi].dSketch[k] = grpHlls[gi][k].toBytes()
+                } else if isTdAgg(ak) && !grpTds[gi][k].isEmpty() {
+                    out[gi].dSketch[k] = grpTds[gi][k].toBytes()
                 }
             }
         }
@@ -1705,8 +1921,21 @@ fn applyMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: &s
                 Some(i) {
                     coal[i].dCnt += d.dCnt
                     for k in 0..nItems {
+                        let ak = fp.items[k].aggKind
                         coal[i].dNn[k] += d.dNn[k]
                         coal[i].dSum[k] = try combineSum(&coal[i].dSum[k], &d.dSum[k])
+                        coal[i].dSumSq[k] = try combineSum(&coal[i].dSumSq[k], &d.dSumSq[k])
+                        coal[i].dXor[k] = coal[i].dXor[k] ^ d.dXor[k]
+                        if d.dHasNeg[k] { coal[i].dHasNeg[k] = true }
+                        if ak == AGG_MIN || ak == AGG_MAX {
+                            let isMax = ak == AGG_MAX
+                            coal[i].dExtAdd[k] = try extPick(&coal[i].dExtAdd[k], &d.dExtAdd[k], isMax)
+                            coal[i].dExtDel[k] = try extPick(&coal[i].dExtDel[k], &d.dExtDel[k], isMax)
+                        } else if isHllAgg(ak) && len(d.dSketch[k]) > 0 {
+                            coal[i].dSketch[k] = try lexdb_sketch.hllMergeBytes(&coal[i].dSketch[k], &d.dSketch[k])
+                        } else if isTdAgg(ak) && len(d.dSketch[k]) > 0 {
+                            coal[i].dSketch[k] = try lexdb_sketch.tdMergeBytes(&coal[i].dSketch[k], &d.dSketch[k])
+                        }
                     }
                 }
                 None {
@@ -1715,10 +1944,16 @@ fn applyMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: &s
                 }
             }
         }
+        var parsedQ: Option[Stmt] = None
         for d in coal {
             // Skip pure no-op delta.
             var anyNonZero = d.dCnt != 0
-            for k in 0..nItems { if d.dNn[k] != 0 || !lexdb_ops.isNull(&d.dSum[k]) { anyNonZero = true } }
+            for k in 0..nItems {
+                if d.dNn[k] != 0 || !lexdb_ops.isNull(&d.dSum[k]) || !lexdb_ops.isNull(&d.dSumSq[k]) ||
+                   d.dXor[k] != 0 || d.dHasNeg[k] || !lexdb_ops.isNull(&d.dExtAdd[k]) || len(d.dSketch[k]) > 0 {
+                    anyNonZero = true
+                }
+            }
             if !anyNonZero { continue }
 
             var pkKey = ""
@@ -1740,7 +1975,63 @@ fn applyMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: &s
                 continue
             }
 
-            // Build updated group row.
+            // Check whether any MIN/MAX extremum deletion or sketch -1 delta needs a targeted single-group re-probe.
+            var needReprobe = false
+            if newCnt > 0 {
+                for k in 0..nItems {
+                    let it = &fp.items[k]
+                    let ak = it.aggKind
+                    if ak == AGG_MIN || ak == AGG_MAX {
+                        if d.dHasNeg[k] && !lexdb_ops.isNull(&d.dExtDel[k]) {
+                            match oldOpt {
+                                Some(oldRow) {
+                                    let oldNn = match oldRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
+                                    let newNn = max(oldNn + d.dNn[k], 0)
+                                    if oldNn > 0 && newNn > 0 && !lexdb_ops.isNull(&oldRow[it.visCol]) {
+                                        let cmp = try lexdb_ops.compare(&d.dExtDel[k], &oldRow[it.visCol])
+                                        if (ak == AGG_MIN && cmp <= 0) || (ak == AGG_MAX && cmp >= 0) { needReprobe = true }
+                                    }
+                                }
+                                None {}
+                            }
+                        }
+                    } else if isSketchAgg(ak) && d.dHasNeg[k] {
+                        needReprobe = true
+                    }
+                }
+            }
+
+            if needReprobe {
+                if parsedQ.isNone() { parsedQ = Some(try parseQuery(&mv.query, mv.mdialect)) }
+                var reprobed: Option[[]Val] = None
+                match &parsedQ {
+                    Some(qq) { reprobed = try reprobeGroup(st, txn, &mv, &mvTab, &fp, &qq, &d.gVals, &z, up) }
+                    None {}
+                }
+                match reprobed {
+                    Some(freshRow) {
+                        match oldOpt {
+                            Some(oldRow) {
+                                let c = try lexdb_access.updateRow(st, txn, &rel, &oldRow, &freshRow, predFn, exprFn, noWrote)
+                                if c >= 0 { return Err(err("23505", &("duplicate key value violates unique index on materialized view \"" + lexdb_sql.baseName(&mvTab.name) + "\""))) }
+                            }
+                            None {
+                                let c = try lexdb_access.insertRow(st, txn, &rel, &freshRow, predFn, exprFn, noWrote)
+                                if c >= 0 { return Err(err("23505", &("duplicate key value violates unique index on materialized view \"" + lexdb_sql.baseName(&mvTab.name) + "\""))) }
+                            }
+                        }
+                    }
+                    None {
+                        match oldOpt {
+                            Some(oldRow) { try lexdb_access.deleteRow(st, txn, &rel, &oldRow, predFn, exprFn, noWrote) }
+                            None {}
+                        }
+                    }
+                }
+                continue
+            }
+
+            // Build updated group row in pure O(1) per aggregate!
             var newRow: []Val = []
             match oldOpt {
                 Some(oldRow) { newRow = collections.copyOf(&oldRow) }
@@ -1756,11 +2047,12 @@ fn applyMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: &s
 
             for k in 0..nItems {
                 let it = &fp.items[k]
-                if it.aggKind == AGG_NONE { continue }
-                if it.aggKind == AGG_COUNT_STAR || it.aggKind == AGG_COUNT_EXPR {
+                let ak = it.aggKind
+                if ak == AGG_NONE { continue }
+                if ak == AGG_COUNT_STAR || ak == AGG_COUNT_EXPR {
                     let oldN = match newRow[it.visCol] { Val.Int(x) { x } else { 0 } }
                     newRow[it.visCol] = Val.Int(max(oldN + d.dNn[k], 0))
-                } else if it.aggKind == AGG_SUM {
+                } else if ak == AGG_SUM {
                     let oldNn = match newRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
                     let newNn = max(oldNn + d.dNn[k], 0)
                     newRow[it.nnCol] = Val.Int(newNn)
@@ -1770,7 +2062,7 @@ fn applyMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: &s
                         let s = try combineSum(&newRow[it.visCol], &d.dSum[k])
                         newRow[it.visCol] = try lexdb_ops.coerceZ(s, &mvTab.cols[it.visCol].typ, &z)
                     }
-                } else if it.aggKind == AGG_AVG {
+                } else if ak == AGG_AVG {
                     let oldNn = match newRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
                     let newNn = max(oldNn + d.dNn[k], 0)
                     newRow[it.nnCol] = Val.Int(newNn)
@@ -1782,6 +2074,89 @@ fn applyMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: &s
                         newRow[it.sumCol] = try lexdb_ops.coerceZ(s, &mvTab.cols[it.sumCol].typ, &z)
                         let av = try avgVal(&newRow[it.sumCol], newNn, &mvTab.cols[it.visCol].typ, mv.mdialect)
                         newRow[it.visCol] = try lexdb_ops.coerceZ(av, &mvTab.cols[it.visCol].typ, &z)
+                    }
+                } else if isVarAgg(ak) {
+                    let oldNn = match newRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
+                    let newNn = max(oldNn + d.dNn[k], 0)
+                    newRow[it.nnCol] = Val.Int(newNn)
+                    if newNn == 0 {
+                        newRow[it.sumCol] = Val.Null
+                        newRow[it.sumSqCol] = Val.Null
+                        newRow[it.visCol] = Val.Null
+                    } else {
+                        let s = try combineSum(&newRow[it.sumCol], &d.dSum[k])
+                        let sq = try combineSum(&newRow[it.sumSqCol], &d.dSumSq[k])
+                        newRow[it.sumCol] = try lexdb_ops.coerceZ(s, &mvTab.cols[it.sumCol].typ, &z)
+                        newRow[it.sumSqCol] = try lexdb_ops.coerceZ(sq, &mvTab.cols[it.sumSqCol].typ, &z)
+                        let vr = try lexdb_agg.varResult(&varFname(ak), newNn, &newRow[it.sumCol], &newRow[it.sumSqCol])
+                        newRow[it.visCol] = try lexdb_ops.coerceZ(vr, &mvTab.cols[it.visCol].typ, &z)
+                    }
+                } else if ak == AGG_BOOL_AND || ak == AGG_BOOL_OR {
+                    let oldNn = match newRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
+                    let newNn = max(oldNn + d.dNn[k], 0)
+                    newRow[it.nnCol] = Val.Int(newNn)
+                    let oldTrue = match newRow[it.sumCol] { Val.Int(x) { x } else { 0 } }
+                    let dTrue = match d.dSum[k] { Val.Int(x) { x } else { 0 } }
+                    let newTrue = max(oldTrue + dTrue, 0)
+                    newRow[it.sumCol] = Val.Int(newTrue)
+                    if newNn == 0 {
+                        newRow[it.visCol] = Val.Null
+                    } else {
+                        newRow[it.visCol] = Val.Bool(if ak == AGG_BOOL_AND { newTrue == newNn } else { newTrue > 0 })
+                    }
+                } else if ak == AGG_BIT_XOR {
+                    let oldNn = match newRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
+                    let newNn = max(oldNn + d.dNn[k], 0)
+                    newRow[it.nnCol] = Val.Int(newNn)
+                    let oldX = match newRow[it.sumCol] { Val.Int(x) { x } else { 0 } }
+                    let newX = if newNn == 0 { 0 } else { oldX ^ d.dXor[k] }
+                    newRow[it.sumCol] = Val.Int(newX)
+                    if newNn == 0 {
+                        newRow[it.visCol] = if it.oraDia { Val.Num(Decimal.zero()) } else { Val.Null }
+                    } else {
+                        newRow[it.visCol] = try lexdb_ops.coerceZ(Val.Int(newX), &mvTab.cols[it.visCol].typ, &z)
+                    }
+                } else if ak == AGG_MIN || ak == AGG_MAX {
+                    let oldNn = match newRow[it.nnCol] { Val.Int(x) { x } else { 0 } }
+                    let newNn = max(oldNn + d.dNn[k], 0)
+                    newRow[it.nnCol] = Val.Int(newNn)
+                    if newNn == 0 {
+                        newRow[it.visCol] = Val.Null
+                    } else if oldNn == 0 {
+                        newRow[it.visCol] = try lexdb_ops.coerceZ(d.dExtAdd[k].clone(), &mvTab.cols[it.visCol].typ, &z)
+                    } else {
+                        let picked = try extPick(&newRow[it.visCol], &d.dExtAdd[k], ak == AGG_MAX)
+                        newRow[it.visCol] = try lexdb_ops.coerceZ(picked, &mvTab.cols[it.visCol].typ, &z)
+                    }
+                } else if isHllAgg(ak) {
+                    let skCol = if ak == AGG_HLL { it.sketchCol } else { it.visCol }
+                    if newCnt <= 0 {
+                        newRow[skCol] = Val.Null
+                        if ak == AGG_HLL { newRow[it.visCol] = Val.Int(0) }
+                    } else {
+                        let oldSk = match &newRow[skCol] { Val.Bytes(b) { b.clone() } else { "" } }
+                        let merged = try lexdb_sketch.hllMergeBytes(&oldSk, &d.dSketch[k])
+                        newRow[skCol] = if len(merged) == 0 { Val.Null } else { Val.Bytes(merged.clone()) }
+                        if ak == AGG_HLL {
+                            newRow[it.visCol] = Val.Int(try lexdb_sketch.hllEstimateBytes(&merged))
+                        }
+                    }
+                } else if isTdAgg(ak) {
+                    let skCol = if ak == AGG_TDIGEST { it.sketchCol } else { it.visCol }
+                    if newCnt <= 0 {
+                        newRow[skCol] = Val.Null
+                        if ak == AGG_TDIGEST { newRow[it.visCol] = Val.Null }
+                    } else {
+                        let oldSk = match &newRow[skCol] { Val.Bytes(b) { b.clone() } else { "" } }
+                        let merged = try lexdb_sketch.tdMergeBytes(&oldSk, &d.dSketch[k])
+                        newRow[skCol] = if len(merged) == 0 { Val.Null } else { Val.Bytes(merged.clone()) }
+                        if ak == AGG_TDIGEST {
+                            let p = if it.pctDesc { 1.0f - it.pctFrac } else { it.pctFrac }
+                            match try lexdb_sketch.tdQuantileBytes(&merged, p) {
+                                Some(qv) { newRow[it.visCol] = Val.Float(qv) }
+                                None { newRow[it.visCol] = Val.Null }
+                            }
+                        }
                     }
                 }
             }
@@ -1891,7 +2266,7 @@ pub fn beforeCommit(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, up: &Up):
 
 // Builds an augmented SELECT statement that produces all visible output columns plus the hidden
 // keys/state columns required by fp so subsequent FAST incremental maintenance is immediately exact.
-fn buildAugmentedSelect(q: &Stmt, fp: &FastPlan): Stmt {
+fn buildAugmentedSelect(q: &Stmt, fp: &FastPlan, mvTab: &Table): Stmt {
     var aq = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
     aq.from = q.from.clone()
     aq.where = match q.where { Some(w) { Some(lexdb_sql.cloneExpr(&w)) } None { None } }
@@ -1912,7 +2287,7 @@ fn buildAugmentedSelect(q: &Stmt, fp: &FastPlan): Stmt {
         return aq
     }
 
-    // For aggregate MVs: append GROUP BY expressions, COUNT(*), and per-agg COUNT(arg) / SUM(arg).
+    // For aggregate MVs: append GROUP BY expressions, COUNT(*), and per-agg hidden state expressions.
     for g in q.group {
         let gx = if lexdb_sql.litInt(&g) >= 1 && lexdb_sql.litInt(&g) <= len(q.items) {
             match q.items[lexdb_sql.litInt(&g) - 1].expr { Some(x) { lexdb_sql.cloneExpr(&x) } None { lexdb_sql.cloneExpr(&g) } }
@@ -1923,9 +2298,10 @@ fn buildAugmentedSelect(q: &Stmt, fp: &FastPlan): Stmt {
     // Re-extract raw (unslotted) agg args + filters from q.items to append hidden state aggregates.
     for i in 0..len(fp.items) {
         let ak = fp.items[i].aggKind
-        if ak == AGG_SUM || ak == AGG_AVG {
-            let rawEx = match q.items[i].expr { Some(x) { lexdb_sql.cloneExpr(&x) } None { continue } }
-            let ar = parseFastAgg(&rawEx)
+        if !needsNnCol(ak) && !needsSumCol(ak) && !needsSumSqCol(ak) && !needsSketchCol(ak) { continue }
+        let rawEx = match q.items[i].expr { Some(x) { lexdb_sql.cloneExpr(&x) } None { continue } }
+        let ar = parseFastAgg(&rawEx)
+        if needsNnCol(ak) {
             var cntName = "count"
             var cntArgs: []Expr = [lexdb_sql.cloneExpr(&ar.arg)]
             match ar.flt {
@@ -1933,18 +2309,136 @@ fn buildAugmentedSelect(q: &Stmt, fp: &FastPlan): Stmt {
                 None {}
             }
             append(mut &aq.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(Expr.Call(cntName, cntArgs, false)), alias: "", spell: ""})
-            if ak == AGG_AVG {
-                var sumName = "sum"
-                var sumArgs: []Expr = [lexdb_sql.cloneExpr(&ar.arg)]
-                match ar.flt {
-                    Some(fx) { sumName = "sum filter"; append(mut &sumArgs, lexdb_sql.cloneExpr(&fx)) }
-                    None {}
-                }
-                append(mut &aq.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(Expr.Call(sumName, sumArgs, false)), alias: "", spell: ""})
+        }
+        if ak == AGG_AVG || isVarAgg(ak) {
+            var sumName = "sum"
+            var sumArgs: []Expr = [lexdb_sql.cloneExpr(&ar.arg)]
+            match ar.flt {
+                Some(fx) { sumName = "sum filter"; append(mut &sumArgs, lexdb_sql.cloneExpr(&fx)) }
+                None {}
             }
+            append(mut &aq.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(Expr.Call(sumName, sumArgs, false)), alias: "", spell: ""})
+        } else if ak == AGG_BOOL_AND || ak == AGG_BOOL_OR {
+            let cond = match ar.flt {
+                Some(fx) { Expr.Bin("and", lexdb_sql.cloneExpr(&fx), lexdb_sql.cloneExpr(&ar.arg)) }
+                None { lexdb_sql.cloneExpr(&ar.arg) }
+            }
+            append(mut &aq.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(Expr.Call("count filter", [cond], true)), alias: "", spell: ""})
+        } else if ak == AGG_BIT_XOR {
+            var xName = if fp.items[i].oraDia { "bit_xor dia:o" } else { "bit_xor" }
+            var xArgs: []Expr = [lexdb_sql.cloneExpr(&ar.arg)]
+            match ar.flt {
+                Some(fx) { xName = xName + " filter"; append(mut &xArgs, lexdb_sql.cloneExpr(&fx)) }
+                None {}
+            }
+            append(mut &aq.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(Expr.Call(xName, xArgs, false)), alias: "", spell: ""})
+        }
+        if isVarAgg(ak) {
+            let sqTyp = mvTab.cols[fp.items[i].sumSqCol].typ.clone()
+            let cArg = Expr.Cast(lexdb_sql.cloneExpr(&ar.arg), sqTyp.clone())
+            let sqExpr = Expr.Bin("*", cArg, Expr.Cast(lexdb_sql.cloneExpr(&ar.arg), sqTyp))
+            var sqName = "sum"
+            var sqArgs: []Expr = [sqExpr]
+            match ar.flt {
+                Some(fx) { sqName = "sum filter"; append(mut &sqArgs, lexdb_sql.cloneExpr(&fx)) }
+                None {}
+            }
+            append(mut &aq.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(Expr.Call(sqName, sqArgs, false)), alias: "", spell: ""})
+        }
+        if ak == AGG_HLL {
+            var hName = "approx_count_distinct_detail"
+            var hArgs: []Expr = [lexdb_sql.cloneExpr(&ar.arg)]
+            match ar.flt {
+                Some(fx) { hName = "approx_count_distinct_detail filter"; append(mut &hArgs, lexdb_sql.cloneExpr(&fx)) }
+                None {}
+            }
+            append(mut &aq.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(Expr.Call(hName, hArgs, false)), alias: "", spell: ""})
+        } else if ak == AGG_TDIGEST {
+            var tName = "approx_percentile_detail"
+            var tArgs: []Expr = [lexdb_sql.cloneExpr(&ar.arg)]
+            match ar.flt {
+                Some(fx) { tName = "approx_percentile_detail filter"; append(mut &tArgs, lexdb_sql.cloneExpr(&fx)) }
+                None {}
+            }
+            append(mut &aq.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(Expr.Call(tName, tArgs, false)), alias: "", spell: ""})
         }
     }
     return aq
+}
+
+// Packs one row returned by buildAugmentedSelect (for an aggregate MV) into an MV backing table row.
+fn populateAggRow(r: &[]Val, mvTab: &Table, fp: &FastPlan, z: &lexdb_time.Zone): Result[[]Val, DbErr] {
+    let nVis = len(fp.items)
+    var row = array(len(mvTab.cols), Val.Null)
+    for k in 0..nVis {
+        row[fp.items[k].visCol] = try lexdb_ops.coerceZ(r[k].clone(), &mvTab.cols[fp.items[k].visCol].typ, z)
+    }
+    var colPos = nVis
+    var gVals: []Val = []
+    for _ in 0..len(fp.group) {
+        append(mut &gVals, r[colPos].clone())
+        colPos += 1
+    }
+    row[fp.gkCol] = Val.Bytes(encGroupKey(&gVals))
+    let cnt = match r[colPos] { Val.Int(x) { x } else { 0 } }
+    colPos += 1
+    row[fp.cntCol] = Val.Int(cnt)
+    for k in 0..nVis {
+        let it = &fp.items[k]
+        let ak = it.aggKind
+        if needsNnCol(ak) {
+            let nn = match r[colPos] { Val.Int(x) { x } else { 0 } }
+            colPos += 1
+            row[it.nnCol] = Val.Int(nn)
+        }
+        if needsSumCol(ak) {
+            if ak == AGG_BIT_XOR {
+                let xv = if lexdb_ops.isNull(&r[colPos]) { 0 } else { try bitIntVal(&r[colPos]) }
+                row[it.sumCol] = Val.Int(xv)
+            } else if ak == AGG_BOOL_AND || ak == AGG_BOOL_OR {
+                let tv = match r[colPos] { Val.Int(x) { x } else { 0 } }
+                row[it.sumCol] = Val.Int(tv)
+            } else {
+                row[it.sumCol] = try lexdb_ops.coerceZ(r[colPos].clone(), &mvTab.cols[it.sumCol].typ, z)
+            }
+            colPos += 1
+        }
+        if needsSumSqCol(ak) {
+            row[it.sumSqCol] = try lexdb_ops.coerceZ(r[colPos].clone(), &mvTab.cols[it.sumSqCol].typ, z)
+            colPos += 1
+        }
+        if needsSketchCol(ak) {
+            row[it.sketchCol] = r[colPos].clone()
+            colPos += 1
+        }
+    }
+    return Ok(row)
+}
+
+// Targeted single-group re-probe on base table(s), used ONLY when MIN/MAX extremum is deleted
+// or a -1 delta hits a group with a sketch aggregate.
+fn reprobeGroup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mv: &MvMeta, mvTab: &Table,
+                fp: &FastPlan, q: &Stmt, gVals: &[]Val, z: &lexdb_time.Zone, up: &Up): Result[Option[[]Val], DbErr] {
+    var aq = buildAugmentedSelect(q, fp, mvTab)
+    for gi in 0..len(q.group) {
+        if gi >= len(gVals) { break }
+        let g = &q.group[gi]
+        let gx = if lexdb_sql.litInt(g) >= 1 && lexdb_sql.litInt(g) <= len(q.items) {
+            match q.items[lexdb_sql.litInt(g) - 1].expr { Some(x) { lexdb_sql.cloneExpr(&x) } None { lexdb_sql.cloneExpr(g) } }
+        } else { lexdb_sql.cloneExpr(g) }
+        let cond = if lexdb_ops.isNull(&gVals[gi]) {
+            Expr.IsNull(gx, false)
+        } else {
+            Expr.Bin("=", gx, Expr.Lit(gVals[gi].clone()))
+        }
+        aq.where = match aq.where {
+            Some(prev) { Some(Expr.Bin("and", lexdb_sql.cloneExpr(&prev), cond)) }
+            None { Some(cond) }
+        }
+    }
+    let qr = try (up.runQuery)(st, txn, &aq, &mv.path)
+    if len(qr.rows) == 0 { return Ok(None) }
+    return Ok(Some(try populateAggRow(&qr.rows[0], mvTab, fp, z)))
 }
 
 // Atomically populates/refreshes MV key into a brand-new B+tree + index trees, then swaps roots.
@@ -1978,16 +2472,17 @@ pub fn refreshComplete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &
         var fa = try analyzeFast(st, txn, &q, &mv.path, up)
         var fp = replace(mut &fa.fp, emptyFastPlan())
         bindHiddenCols(mut &fp, &mvTab)
-        let aq = buildAugmentedSelect(&q, &fp)
+        let aq = buildAugmentedSelect(&q, &fp, &mvTab)
         let qr = try (up.runQuery)(st, txn, &aq, &mv.path)
         let nVis = len(fp.items)
 
         for r in qr.rows {
-            var row = array(len(mvTab.cols), Val.Null)
-            for k in 0..nVis {
-                row[fp.items[k].visCol] = try lexdb_ops.coerceZ(r[k].clone(), &mvTab.cols[fp.items[k].visCol].typ, &z)
-            }
+            var row: []Val = []
             if !fp.isAgg {
+                row = array(len(mvTab.cols), Val.Null)
+                for k in 0..nVis {
+                    row[fp.items[k].visCol] = try lexdb_ops.coerceZ(r[k].clone(), &mvTab.cols[fp.items[k].visCol].typ, &z)
+                }
                 // Encode base table PK(s) from trailing augmented columns.
                 var colPos = nVis
                 var gkBytes = ""
@@ -2012,28 +2507,7 @@ pub fn refreshComplete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &
                 }
                 row[fp.gkCol] = Val.Bytes(gkBytes)
             } else {
-                var colPos = nVis
-                var gVals: []Val = []
-                for _ in 0..len(fp.group) {
-                    append(mut &gVals, r[colPos].clone())
-                    colPos += 1
-                }
-                row[fp.gkCol] = Val.Bytes(encGroupKey(&gVals))
-                let cnt = match r[colPos] { Val.Int(x) { x } else { 0 } }
-                colPos += 1
-                row[fp.cntCol] = Val.Int(cnt)
-                for k in 0..nVis {
-                    let ak = fp.items[k].aggKind
-                    if ak == AGG_SUM || ak == AGG_AVG {
-                        let nn = match r[colPos] { Val.Int(x) { x } else { 0 } }
-                        colPos += 1
-                        row[fp.items[k].nnCol] = Val.Int(nn)
-                        if ak == AGG_AVG {
-                            row[fp.items[k].sumCol] = try lexdb_ops.coerceZ(r[colPos].clone(), &mvTab.cols[fp.items[k].sumCol].typ, &z)
-                            colPos += 1
-                        }
-                    }
-                }
+                row = try populateAggRow(&r, &mvTab, &fp, &z)
             }
             let pk = lexdb_access.keyOf(&rel, &row)
             let enc = lexdb_access.encRow(&rel, &row)

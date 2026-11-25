@@ -18,6 +18,7 @@ DBMS_LOCK.SLEEP ( seconds )
 DBMS_SESSION.SLEEP ( seconds )
 DBMS_SQL.RETURN_RESULT ( cursor )
 DBMS_UTILITY.NAME_RESOLVE ( ... )
+DBMS_MVIEW.REFRESH ( list [, method ] )
 
 DBMS_APPLICATION_INFO.SET_MODULE ( module, action )     -- accepted, no effect
 DBMS_STATS.GATHER_TABLE_STATS ( ... )                    -- accepted, no effect
@@ -46,6 +47,10 @@ DBMS_METADATA.SET_TRANSFORM_PARAM ( ... )                -- accepted, no effect
 
 `DBMS_UTILITY.NAME_RESOLVE`
 : Resolves a name to its schema and object.
+
+`DBMS_MVIEW.REFRESH`
+: Refreshes one or more [materialized views](create-materialized-view.md) named in a comma-separated *list*. The
+  optional *method* string gives `'C'` (complete), `'F'` (fast), or `'?'` (force) per view.
 
 *Others*
 : `DBMS_APPLICATION_INFO.*`, `DBMS_SESSION.*` (other than `SLEEP`), `DBMS_STATS.*` and `DBMS_METADATA.SET_*` calls

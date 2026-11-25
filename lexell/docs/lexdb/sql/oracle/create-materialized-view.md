@@ -59,8 +59,13 @@ DROP MATERIALIZED VIEW LOG ON [ schema. ] table
 - `USER_OBJECTS` lists each materialized view with `OBJECT_TYPE = 'MATERIALIZED VIEW'`.
 - `DBMS_MVIEW.REFRESH('mv1, mv2', 'C' | 'F' | '?')` refreshes one or more materialized views inside a PL/SQL block.
 - Incremental (`FAST`) maintenance supports single-table filter/projection views, `GROUP BY` and global aggregates
-  (`COUNT(*)`, `COUNT(expr)`, `SUM(expr)`, `AVG(expr)`), and multi-table inner equi-joins across `INSERT`, `UPDATE`,
-  `DELETE`, `MERGE`, and `TRUNCATE`.
+  (`COUNT(*)`, `COUNT(expr)`, `SUM`, `AVG`, `VAR_POP`, `VAR_SAMP`, `VARIANCE`, `STDDEV_POP`, `STDDEV_SAMP`, `STDDEV`,
+  `BOOLEAN_AND_AGG`/`BOOL_AND`, `BOOLEAN_OR_AGG`/`BOOL_OR`, `BIT_XOR_AGG`/`BIT_XOR`, `MIN`, `MAX`,
+  `APPROX_COUNT_DISTINCT`, `APPROX_COUNT_DISTINCT_DETAIL`, `APPROX_PERCENTILE`, `APPROX_PERCENTILE_DETAIL`), and
+  multi-table inner equi-joins across `INSERT`, `UPDATE`, `DELETE`, `MERGE`, and `TRUNCATE`.
+- Composable HyperLogLog++ and t-digest sketch aggregates (`APPROX_COUNT_DISTINCT_DETAIL` / `_AGG` /
+  `TO_APPROX_COUNT_DISTINCT`, `APPROX_PERCENTILE(p) WITHIN GROUP (ORDER BY expr)` / `_DETAIL` / `_AGG` /
+  `TO_APPROX_PERCENTILE`) merge associatively in $O(\Delta)$ on appends and re-probe affected groups on deletes.
 
 ## Examples
 

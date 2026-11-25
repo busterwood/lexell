@@ -19,6 +19,15 @@ PERCENTILE_DISC ( fraction ) WITHIN GROUP ( ORDER BY expr )
 BIT_AND_AGG ( expr )  BIT_OR_AGG ( expr )  BIT_XOR_AGG ( expr )
 BOOLEAN_AND_AGG ( expr )  BOOLEAN_OR_AGG ( expr )
 KURTOSIS_POP ( expr )  KURTOSIS_SAMP ( expr )  SKEWNESS_POP ( expr )  SKEWNESS_SAMP ( expr )
+APPROX_COUNT_DISTINCT ( expr )
+APPROX_COUNT_DISTINCT_DETAIL ( expr )
+APPROX_COUNT_DISTINCT_AGG ( detail )
+TO_APPROX_COUNT_DISTINCT ( detail )
+APPROX_PERCENTILE ( fraction ) WITHIN GROUP ( ORDER BY expr [ ASC | DESC ] )
+APPROX_PERCENTILE ( expr, fraction )
+APPROX_PERCENTILE_DETAIL ( expr )
+APPROX_PERCENTILE_AGG ( detail )
+TO_APPROX_PERCENTILE ( detail, fraction )
 ```
 
 ## Functions
@@ -56,6 +65,16 @@ KURTOSIS_POP ( expr )  KURTOSIS_SAMP ( expr )  SKEWNESS_POP ( expr )  SKEWNESS_S
 
 `KURTOSIS_*`, `SKEWNESS_*`
 : The kurtosis and skewness of the values, of the whole population (`_POP`) or of a sample (`_SAMP`) (23ai).
+
+`APPROX_COUNT_DISTINCT`, `APPROX_COUNT_DISTINCT_DETAIL`, `APPROX_COUNT_DISTINCT_AGG`, `TO_APPROX_COUNT_DISTINCT`
+: Approximate distinct count via HyperLogLog++ (0 over no rows; exact up to 256 distinct values). `_DETAIL` produces a
+  mergeable binary sketch, `_AGG` merges sketches across groups or partitions, and `TO_APPROX_COUNT_DISTINCT` extracts
+  the integer estimate.
+
+`APPROX_PERCENTILE`, `APPROX_PERCENTILE_DETAIL`, `APPROX_PERCENTILE_AGG`, `TO_APPROX_PERCENTILE`
+: Approximate quantile at *fraction* (0 to 1) via a Dunning merging t-digest. Accepts Oracle's `WITHIN GROUP (ORDER BY
+  expr [ASC | DESC])` form as well as the two-argument `APPROX_PERCENTILE(expr, fraction)` form. `_DETAIL`, `_AGG`, and
+  `TO_APPROX_PERCENTILE` build, merge, and finalize reusable binary digests.
 
 ## Remarks
 

@@ -63,9 +63,15 @@ DROP MATERIALIZED VIEW [ IF EXISTS ] name [, ...] [ CASCADE | RESTRICT ]
   `ispopulated`, `definition`), and `pg_class` lists it with `relkind = 'm'` (excluded from `pg_tables` and
   `information_schema.tables`).
 - Incremental (`FAST`) maintenance supports single-table filter/projection views, `GROUP BY` and global aggregates
-  (`COUNT(*)`, `COUNT(expr)`, `SUM(expr)`, `AVG(expr)`, including `FILTER (WHERE ...)`), and multi-table inner
+  (`COUNT(*)`, `COUNT(expr)`, `SUM`, `AVG`, `VAR_POP`, `VAR_SAMP`, `VARIANCE`, `STDDEV_POP`, `STDDEV_SAMP`, `STDDEV`,
+  `BOOL_AND`/`EVERY`, `BOOL_OR`, `BIT_XOR`, `MIN`, `MAX`, `APPROX_COUNT_DISTINCT`, `APPROX_COUNT_DISTINCT_DETAIL`,
+  `APPROX_PERCENTILE`, `APPROX_PERCENTILE_DETAIL`, including `FILTER (WHERE ...)`), and multi-table inner
   equi-joins (projection or grouped aggregate) across `INSERT`, `UPDATE`, `DELETE`, `COPY FROM`, `MERGE`, and
   `TRUNCATE`.
+- Sketch aggregates (`APPROX_COUNT_DISTINCT` via HyperLogLog++, `APPROX_PERCENTILE` via Dunning merging t-digest)
+  expose composable partial states (`APPROX_COUNT_DISTINCT_DETAIL` / `_AGG` / `TO_APPROX_COUNT_DISTINCT`, and
+  `APPROX_PERCENTILE_DETAIL` / `_AGG` / `TO_APPROX_PERCENTILE`) that merge associatively in $O(\Delta)$ on appends
+  and automatically re-probe affected groups on deletes.
 - Dropping a base table or column referenced by a materialized view is refused (`2BP01`) unless `CASCADE` is given.
 
 ## Examples

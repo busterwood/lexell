@@ -16,6 +16,7 @@ import "./lexdb_access"
 import "./lexdb_sort"
 import "./lexdb_pct"
 import "./lexdb_json"
+import "./lexdb_sketch"
 
 type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
@@ -55,6 +56,12 @@ pub const OP_ANY = 12               // any_value
 pub const OP_MOMENT = 13            // Oracle's KURTOSIS_POP / _SAMP, SKEWNESS_POP / _SAMP
 pub const OP_JSON_ARRAY = 14        // json_agg, jsonb_agg, json_arrayagg, jsonb_arrayagg
 pub const OP_JSON_OBJ = 15          // json_object_agg, jsonb_object_agg, json_objectagg, jsonb_objectagg
+pub const OP_HLL = 16               // approx_count_distinct
+pub const OP_HLL_DETAIL = 17        // approx_count_distinct_detail
+pub const OP_HLL_AGG = 18           // approx_count_distinct_agg
+pub const OP_TDIGEST = 19           // approx_percentile
+pub const OP_TDIGEST_DETAIL = 20    // approx_percentile_detail
+pub const OP_TDIGEST_AGG = 21       // approx_percentile_agg
 
 fn opOf(f: &str): int {
     if f == "count" { return OP_COUNT }
@@ -72,6 +79,12 @@ fn opOf(f: &str): int {
     if strings.startsWith(f, "#kurtosis") || strings.startsWith(f, "#skewness") { return OP_MOMENT }
     if f == "json_agg" || f == "jsonb_agg" || strings.startsWith(f, "json_arrayagg") || strings.startsWith(f, "jsonb_arrayagg") { return OP_JSON_ARRAY }
     if f == "json_object_agg" || f == "jsonb_object_agg" || strings.startsWith(f, "json_objectagg") || strings.startsWith(f, "jsonb_objectagg") { return OP_JSON_OBJ }
+    if f == "approx_count_distinct" { return OP_HLL }
+    if f == "approx_count_distinct_detail" { return OP_HLL_DETAIL }
+    if f == "approx_count_distinct_agg" { return OP_HLL_AGG }
+    if f == "approx_percentile" { return OP_TDIGEST }
+    if f == "approx_percentile_detail" { return OP_TDIGEST_DETAIL }
+    if f == "approx_percentile_agg" { return OP_TDIGEST_AGG }
     return OP_VAR
 }
 
@@ -90,10 +103,13 @@ pub type Acc = record {
     pub seps: []Val             // ... with ORDER BY: each value's separator
     pub ords: [][]Val           // ... and its keys (sorted when it finishes)
     pub seen: Map[str, int]     // DISTINCT
+    pub hll: lexdb_sketch.Hll   // HyperLogLog++ sketch (OP_HLL*)
+    pub td: lexdb_sketch.TDigest // t-digest sketch (OP_TDIGEST*)
 }
 
 pub fn newAcc(): Acc {
-    return Acc{n: 0, val: Val.Null, sum: Val.Null, sumsq: Val.Null, parts: [], seps: [], ords: [], seen: newMap()}
+    return Acc{n: 0, val: Val.Null, sum: Val.Null, sumsq: Val.Null, parts: [], seps: [], ords: [], seen: newMap(),
+               hll: lexdb_sketch.newHll(), td: lexdb_sketch.newTDigest()}
 }
 
 pub fn newAccs(n: int): []Acc {
@@ -108,13 +124,13 @@ pub fn ordered(sp: &AggSpec): bool { return len(sp.dirs) > 0 }
 // How many values besides its argument a call is given with each row: its
 // separator (string_agg), then its ORDER BY keys.
 pub fn extras(sp: &AggSpec): int {
-    return (if hasSep(sp) { 1 } else { 0 }) + (if sp.op == OP_PCT { 0 } else { len(sp.dirs) })
+    return (if hasSep(sp) { 1 } else { 0 }) + (if sp.op == OP_PCT || sp.op == OP_TDIGEST { 0 } else { len(sp.dirs) })
 }
 
 // Whether a call reads its second argument with each row (as a value besides
 // its first): string_agg's separator, a percentile's fraction. The engines
 // give it to add as more[0].
-pub fn hasSep(sp: &AggSpec): bool { return sp.op == OP_STRING || sp.op == OP_PCT || sp.op == OP_JSON_OBJ }
+pub fn hasSep(sp: &AggSpec): bool { return sp.op == OP_STRING || sp.op == OP_PCT || sp.op == OP_JSON_OBJ || sp.op == OP_TDIGEST }
 
 // Whether a percentile call's ORDER BY is descending (its dirs: a, A, d, D).
 fn pctDesc(sp: &AggSpec): bool { return len(sp.dirs) > 0 && (sp.dirs[0] == 'd' || sp.dirs[0] == 'D') }
@@ -222,7 +238,7 @@ pub fn add(sp: &AggSpec, acc: mut &Acc, v: Val, more: []Val): Result[Unit, DbErr
         append(mut &acc.parts, k)
         append(mut &acc.seps, val.clone())
     } else if op >= OP_PRODUCT {
-        try addNew(sp, acc, v)
+        try addNew(sp, acc, v, &more)
         return Ok(Unit{})
     } else if op == OP_VAR {
         // the variances and standard deviations
@@ -259,6 +275,27 @@ pub fn sumAdd(a: &Val, b: &Val): Result[Val, DbErr] {
         else {}
     }
     return lexdb_ops.arith(lexdb_ops.OP_ADD, a, b)
+}
+
+pub fn varNumOf(v: &Val, fname: &str): Result[Val, DbErr] { return numOf(v, fname) }
+
+// Exact variance / standard deviation result from (n, sum, sumsq), shared by lexdb_agg and lexdb_mview.
+pub fn varResult(fname: &str, n0: int, sum: &Val, sumsq: &Val): Result[Val, DbErr] {
+    if n0 == 0 { return Ok(Val.Null) }
+    let pop = fname == "var_pop" || fname == "stddev_pop"
+    if !pop && n0 < 2 { return Ok(Val.Null) }
+    let n = Val.Int(n0)
+    let num = try lexdb_ops.arith(lexdb_ops.OP_SUB, &(try lexdb_ops.arith(lexdb_ops.OP_MUL, &n, sumsq)), &(try lexdb_ops.arith(lexdb_ops.OP_MUL, sum, sum)))
+    let den = Val.Int(if pop { n0 * n0 } else { n0 * (n0 - 1) })
+    let nv = try numOf(&num, fname)
+    match nv {
+        Val.Num(d) { if d.isZero() || d.isNeg() { return Ok(Val.Num(Decimal.zero())) } }
+        Val.Float(fl) { if fl <= 0.0f { return Ok(Val.Float(0.0f)) } }
+        else {}
+    }
+    let vr = try lexdb_ops.arith(lexdb_ops.OP_DIV, &nv, &(try numOf(&den, fname)))
+    if fname == "variance" || fname == "var_samp" || fname == "var_pop" { return Ok(vr) }
+    return sqrtNum(&vr)
 }
 
 fn numOf(v: &Val, fname: &str): Result[Val, DbErr] {
@@ -415,27 +452,13 @@ pub fn finish(sp: &AggSpec, acc: &Acc): Result[Val, DbErr] {
         return Ok(Val.Text(lexdb_ops.arrayText(&vals)))
     }
     if f == "min" || f == "max" || f == "bool_and" || f == "bool_or" || f == "every" { return Ok(acc.val.clone()) }
-    // variance: (n * sum of squares - sum * sum) / (n * (n - 1)), or n * n for the population's
-    let pop = f == "var_pop" || f == "stddev_pop"
-    if !pop && acc.n < 2 { return Ok(Val.Null) }
-    let n = Val.Int(acc.n)
-    let num = try lexdb_ops.arith(lexdb_ops.OP_SUB, &(try lexdb_ops.arith(lexdb_ops.OP_MUL, &n, &acc.sumsq)), &(try lexdb_ops.arith(lexdb_ops.OP_MUL, &acc.sum, &acc.sum)))
-    let den = Val.Int(if pop { acc.n * acc.n } else { acc.n * (acc.n - 1) })
-    let nv = try numOf(&num, &f)
-    match nv {
-        // a numeric numerator at or below zero is 0, as PostgreSQL's (no division, no scale)
-        Val.Num(d) { if d.isZero() || d.isNeg() { return Ok(Val.Num(Decimal.zero())) } }
-        else {}
-    }
-    let vr = try lexdb_ops.arith(lexdb_ops.OP_DIV, &nv, &(try numOf(&den, &f)))
-    if f == "variance" || f == "var_samp" || f == "var_pop" { return Ok(vr) }
-    return sqrtNum(&vr)
+    return varResult(f, acc.n, &acc.sum, &acc.sumsq)
 }
 
 // ---- the newest releases' aggregates (design/lexdb-new-features.md 6.1 item 7)
 
 // Adds an admitted value of the newer aggregates (op OP_PRODUCT and after).
-fn addNew(sp: &AggSpec, acc: mut &Acc, v: Val): Result[Unit, DbErr] {
+fn addNew(sp: &AggSpec, acc: mut &Acc, v: Val, more: &[]Val): Result[Unit, DbErr] {
     let op = sp.op
     if op == OP_PRODUCT {
         // SQL Server's PRODUCT: integers multiplied as integers (past 2^63 an error, 8115 in the door), decimals exactly,
@@ -507,14 +530,76 @@ fn addNew(sp: &AggSpec, acc: mut &Acc, v: Val): Result[Unit, DbErr] {
             Some(x) { append(mut &acc.seps, Val.Float(x)) }
             None { return Err(e("ORA00932", "inconsistent datatypes: expected NUMBER")) }
         }
+    } else if op == OP_HLL || op == OP_HLL_DETAIL {
+        acc.hll.addVal(&v)
+    } else if op == OP_HLL_AGG {
+        match v {
+            Val.Bytes(b) {
+                let h = try lexdb_sketch.hllFromBytes(&b)
+                acc.hll.merge(&h)
+            }
+            else { return Err(e("42883", "approx_count_distinct_agg requires a bytea sketch")) }
+        }
+    } else if op == OP_TDIGEST {
+        match lexdb_ops.asFloat(&v) {
+            Some(x) {
+                if acc.n == 0 {
+                    if len(more) == 0 { return Err(e("42883", "approx_percentile requires a percentile argument")) }
+                    acc.sum = more[0].clone()
+                }
+                acc.td.addFloat(x)
+            }
+            None { return Err(e("42883", "function approx_percentile needs a number")) }
+        }
+    } else if op == OP_TDIGEST_DETAIL {
+        match lexdb_ops.asFloat(&v) {
+            Some(x) { acc.td.addFloat(x) }
+            None { return Err(e("42883", "function approx_percentile_detail needs a number")) }
+        }
+    } else if op == OP_TDIGEST_AGG {
+        match v {
+            Val.Bytes(b) {
+                let td = try lexdb_sketch.tdFromBytes(&b)
+                acc.td.merge(&td)
+            }
+            else { return Err(e("42883", "approx_percentile_agg requires a bytea sketch")) }
+        }
     }
     acc.n += 1
     return Ok(Unit{})
 }
 
-// The newer aggregates' results: NULL over no rows (Oracle's bit aggregates 0).
+// The newer aggregates' results: NULL over no rows (Oracle's bit aggregates 0; APPROX_COUNT_DISTINCT 0).
 fn finishNew(sp: &AggSpec, acc: &Acc): Result[Val, DbErr] {
     let op = sp.op
+    if op == OP_HLL {
+        if acc.n == 0 { return Ok(Val.Int(0)) }
+        return Ok(Val.Int(acc.hll.estimate()))
+    }
+    if op == OP_HLL_DETAIL || op == OP_HLL_AGG {
+        if acc.n == 0 || acc.hll.isEmpty() { return Ok(Val.Null) }
+        return Ok(Val.Bytes(acc.hll.toBytes()))
+    }
+    if op == OP_TDIGEST {
+        if acc.n == 0 || acc.td.isEmpty() { return Ok(Val.Null) }
+        if lexdb_ops.isNull(&acc.sum) { return Ok(Val.Null) }
+        var p = match lexdb_ops.asFloat(&acc.sum) {
+            Some(f) { f }
+            None { return Err(e("42883", "approx_percentile requires a numeric percentile")) }
+        }
+        if p.isNaN() || p < 0.0f || p > 1.0f { return Err(e("22023", "percentile value must be between 0 and 1")) }
+        if pctDesc(sp) { p = 1.0f - p }
+        var td = acc.td.clone()
+        match try td.quantile(p) {
+            Some(q) { return Ok(Val.Float(q)) }
+            None { return Ok(Val.Null) }
+        }
+    }
+    if op == OP_TDIGEST_DETAIL || op == OP_TDIGEST_AGG {
+        if acc.n == 0 || acc.td.isEmpty() { return Ok(Val.Null) }
+        var td = acc.td.clone()
+        return Ok(Val.Bytes(td.toBytes()))
+    }
     if acc.n == 0 { return Ok(if op == OP_BITS && sp.dia == lexdb_pct.DIA_ORA { Val.Num(Decimal.zero()) } else { Val.Null }) }
     if op == OP_PRODUCT { return Ok(acc.sum.clone()) }
     if op == OP_BITS {
@@ -558,4 +643,71 @@ fn finishNew(sp: &AggSpec, acc: &Acc): Result[Val, DbErr] {
         Ok(d) { return Ok(Val.Num(d)) }
         Err(_) { return Ok(Val.Float(r)) }
     }
+}
+
+// Composable partial-state merge: folds accumulator src into dst for algebraic and sketch aggregates
+// (shared by incremental materialized views, sharded delta folding, and rollup re-aggregation).
+pub fn mergeAcc(sp: &AggSpec, dst: mut &Acc, src: &Acc): Result[Unit, DbErr] {
+    if src.n == 0 { return Ok(Unit{}) }
+    let op = sp.op
+    if op == OP_COUNT {
+        dst.n += src.n
+        return Ok(Unit{})
+    }
+    if op == OP_SUM || op == OP_AVG {
+        dst.sum = if lexdb_ops.isNull(&dst.sum) { src.sum.clone() } else if lexdb_ops.isNull(&src.sum) { dst.sum.clone() } else { try sumAdd(&dst.sum, &src.sum) }
+        dst.n += src.n
+        return Ok(Unit{})
+    }
+    if op == OP_MIN || op == OP_MAX {
+        let side = if op == OP_MAX { 1 } else { -1 }
+        if !lexdb_ops.isNull(&src.val) {
+            if lexdb_ops.isNull(&dst.val) {
+                dst.val = src.val.clone()
+            } else if sp.kind != lexdb_sql.COLL_EXACT {
+                let c = try lexdb_ops.compare(&lexdb_sort.collVal(sp.kind, &src.val), &lexdb_sort.collVal(sp.kind, &dst.val))
+                if (c < 0 && side < 0) || (c > 0 && side > 0) { dst.val = src.val.clone() }
+            } else if takes(try lexdb_ops.compare(&src.val, &dst.val), side, &src.val) {
+                dst.val = src.val.clone()
+            }
+        }
+        dst.n += src.n
+        return Ok(Unit{})
+    }
+    if op == OP_BOOL {
+        let sb = match src.val { Val.Bool(x) { x } else { sp.fname != "bool_or" } }
+        let db = match dst.val { Val.Bool(x) { x } else { sp.fname != "bool_or" } }
+        dst.val = Val.Bool(if sp.fname == "bool_or" { db || sb } else { db && sb })
+        dst.n += src.n
+        return Ok(Unit{})
+    }
+    if op == OP_BITS {
+        let sx = match src.val { Val.Int(i) { i } else { 0 } }
+        if dst.n == 0 {
+            dst.val = Val.Int(sx)
+        } else {
+            let dx = match dst.val { Val.Int(i) { i } else { 0 } }
+            dst.val = Val.Int(if sp.fname == "bit_and" { dx & sx } else if sp.fname == "bit_or" { dx | sx } else { dx ^ sx })
+        }
+        dst.n += src.n
+        return Ok(Unit{})
+    }
+    if op == OP_VAR {
+        dst.sum = if lexdb_ops.isNull(&dst.sum) { src.sum.clone() } else if lexdb_ops.isNull(&src.sum) { dst.sum.clone() } else { try lexdb_ops.arith(lexdb_ops.OP_ADD, &dst.sum, &src.sum) }
+        dst.sumsq = if lexdb_ops.isNull(&dst.sumsq) { src.sumsq.clone() } else if lexdb_ops.isNull(&src.sumsq) { dst.sumsq.clone() } else { try lexdb_ops.arith(lexdb_ops.OP_ADD, &dst.sumsq, &src.sumsq) }
+        dst.n += src.n
+        return Ok(Unit{})
+    }
+    if op == OP_HLL || op == OP_HLL_DETAIL || op == OP_HLL_AGG {
+        dst.hll.merge(&src.hll)
+        dst.n += src.n
+        return Ok(Unit{})
+    }
+    if op == OP_TDIGEST || op == OP_TDIGEST_DETAIL || op == OP_TDIGEST_AGG {
+        if dst.n == 0 && op == OP_TDIGEST { dst.sum = src.sum.clone() }
+        dst.td.merge(&src.td)
+        dst.n += src.n
+        return Ok(Unit{})
+    }
+    return Err(e("0A000", &("aggregate " + sp.fname + " does not support partial-state merging")))
 }

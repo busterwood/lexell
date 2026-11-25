@@ -38,8 +38,13 @@ DROP MATERIALIZED VIEW [ IF EXISTS ] [ schema_name . ] mview_name [ ,...n ] [ CA
 - For SQL Server's native indexed view syntax (`CREATE VIEW ... WITH SCHEMABINDING` + `CREATE UNIQUE CLUSTERED INDEX`),
   see [CREATE VIEW](create-view.md).
 - Incremental (`FAST`) maintenance supports single-table filter/projection views, `GROUP BY` and global aggregates
-  (`COUNT(*)`, `COUNT(expr)`, `SUM(expr)`, `AVG(expr)`), and multi-table inner equi-joins across `INSERT`, `UPDATE`,
-  `DELETE`, `MERGE`, and `TRUNCATE`.
+  (`COUNT(*)`, `COUNT(expr)`, `SUM`, `AVG`, `VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, `STDDEV_SAMP`, `BOOL_AND`, `BOOL_OR`,
+  `BIT_XOR`, `MIN`, `MAX`, `APPROX_COUNT_DISTINCT`, `APPROX_COUNT_DISTINCT_DETAIL`, `APPROX_PERCENTILE`,
+  `APPROX_PERCENTILE_DETAIL`), and multi-table inner equi-joins across `INSERT`, `UPDATE`, `DELETE`, `MERGE`, and
+  `TRUNCATE`.
+- Composable HyperLogLog++ and t-digest sketch aggregates (`APPROX_COUNT_DISTINCT_DETAIL` / `_AGG` /
+  `TO_APPROX_COUNT_DISTINCT`, `APPROX_PERCENTILE` / `_DETAIL` / `_AGG` / `TO_APPROX_PERCENTILE`) merge associatively in
+  $O(\Delta)$ on appends and re-probe affected groups on deletes.
 
 ## Examples
 
