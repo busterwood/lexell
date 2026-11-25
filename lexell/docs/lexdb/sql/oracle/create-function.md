@@ -56,6 +56,14 @@ END [ function ] ;
   `CREATE TABLE ... AS` that reads such a view is ORA-03001 (Oracle allows it). Example H.
 - Pipelined and table functions, `RESULT_CACHE`, `PARALLEL_ENABLE`, `AGGREGATE USING` and `AUTHID` are not supported.
 - A `SYS_REFCURSOR` result works from PL/SQL; a JDBC client reads it as a cursor.
+- **Compilation errors are found for names and syntax only.** An undeclared name, an expression that does not parse
+  and DML on a missing table make the function `INVALID` when it is created (example I). Type errors, argument counts,
+  unknown columns of a `SELECT INTO` and a syntax error inside a SQL statement appear when the code runs, and a package body or an anonymous block with any
+  error is also found when it runs (Oracle: ORA-06550 first for a block). Nested subprograms leave the function
+  `INVALID` (example J).
+- **A call's column name keeps the result, not the call:** in `SELECT f(1) FROM dual` the column is named like `(2)` (the
+  result in brackets), where Oracle names it `F(1)`; with a column as argument it is `F(ID)`, as in Oracle. Give the
+  call an alias.
 
 ## Examples
 
@@ -332,6 +340,116 @@ ORA-03001: unimplemented feature: lexdb: an argument of a stored function that i
 
 ERROR:
 ORA-03001: unimplemented feature: lexdb: an argument of a stored function that is an aggregate or calls a stored function is not supported
+```
+
+### I. A function that does not compile
+
+A function whose body has an undeclared name, an expression that does not parse or DML on a table that does not exist is
+stored **invalid**, and SQL\*Plus says "Warning: Function created with compilation errors." `USER_OBJECTS.STATUS` is
+`INVALID` and `USER_ERRORS` holds the `PLS-` errors with their line and position (the text of PLS-00103 has no list of
+the symbols expected). A call from SQL is ORA-06575, and so is a `CREATE VIEW` over it.
+
+<!-- example: oracle -->
+```sql
+CREATE FUNCTION bonus_of (p_id NUMBER) RETURN NUMBER IS
+BEGIN
+  RETURN p_id * rate;
+END;
+/
+CREATE FUNCTION broken_sum (p_id NUMBER) RETURN NUMBER IS
+BEGIN
+  RETURN p_id + ;
+END;
+/
+SELECT object_name, status FROM user_objects WHERE object_name IN ('BONUS_OF', 'BROKEN_SUM') ORDER BY object_name;
+SELECT name, line, position, text FROM user_errors ORDER BY name, sequence;
+SELECT bonus_of(id) AS bonus FROM emp;
+CREATE VIEW bonus_view AS SELECT id, bonus_of(id) AS bonus FROM emp;
+```
+
+```text
+Warning: Function created with compilation errors.
+
+Warning: Function created with compilation errors.
+
+OBJECT_NAME STATUS
+----------- -------
+BONUS_OF    INVALID
+BROKEN_SUM  INVALID
+
+2 rows selected.
+
+NAME       LINE POSITION TEXT
+---------- ---- -------- ---------------------------------------------
+BONUS_OF      3       17 PLS-00201: identifier 'RATE' must be declared
+BONUS_OF      3        3 PL/SQL: Statement ignored
+BROKEN_SUM    3       17 PLS-00103: Encountered the symbol ";"
+
+3 rows selected.
+
+ERROR:
+ORA-06575: Package or function BONUS_OF is in an invalid state
+
+ERROR:
+ORA-06575: Package or function BONUS_OF is in an invalid state
+```
+
+### J. Errors found when the code runs
+
+Other errors in a function's body (a type mismatch, a wrong argument count, an unknown column of a `SELECT INTO`) do not
+make the function invalid: they come when it runs (Oracle finds them when it compiles: PLS-00382 here, and ORA-06575 for
+the call). The same holds for a package body and for an anonymous block, where Oracle's compile errors are ORA-06550
+before anything runs (and ORA-04063 for the call of a package body with errors). A function that declares another
+function inside itself is stored invalid ("subprograms declared in a block are not supported"), where Oracle takes it.
+
+<!-- example: oracle -->
+```sql
+CREATE FUNCTION to_day (n NUMBER) RETURN NUMBER IS
+  d DATE;
+BEGIN
+  d := n;
+  RETURN 1;
+END;
+/
+SELECT to_day(1) AS x FROM dual;
+BEGIN
+  INSERT INTO no_such_table VALUES (1);
+END;
+/
+CREATE FUNCTION outer_f RETURN NUMBER IS
+  FUNCTION inner_f RETURN NUMBER IS BEGIN RETURN 1; END;
+BEGIN
+  RETURN inner_f;
+END;
+/
+SELECT status FROM user_objects WHERE object_name = 'OUTER_F';
+SELECT line, position, text FROM user_errors WHERE name = 'OUTER_F';
+```
+
+```text
+Function created.
+
+ERROR:
+ORA-06502: PL/SQL: value or conversion error
+ORA-06512: at "SA.TO_DAY", line 4
+
+ERROR:
+ORA-00942: table or view does not exist
+ORA-06512: at line 2
+
+Warning: Function created with compilation errors.
+
+STATUS
+-------
+INVALID
+
+1 row selected.
+
+LINE POSITION TEXT
+---- -------- ------------------------------------------------------------
+   2        3 PLS-00103: subprograms declared in a block are not supported
+
+1 row selected.
 ```
 
 ## See also

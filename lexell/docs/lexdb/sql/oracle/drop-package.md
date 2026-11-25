@@ -22,9 +22,11 @@ DROP PACKAGE [ BODY ] [ schema. ] package
 
 ## Differences from Oracle
 
-- A view that calls one of the package's functions gives ORA-04063 after `DROP PACKAGE` and ORA-04067 after `DROP
-  PACKAGE BODY`, as Oracle does, but a session that read the view before the drop gets ORA-00900 once (see [CREATE
-  VIEW](create-view.md)).
+- A view that calls one of the package's functions gives ORA-04067 after `DROP PACKAGE BODY` and ORA-04063 after
+  `DROP PACKAGE`, as Oracle does (example B). ORA-04067 is its one line; Oracle adds ORA-06508 and ORA-06512 lines.
+  `USER_OBJECTS.STATUS` of the view is `INVALID` after `DROP PACKAGE` and `VALID` after `DROP PACKAGE BODY`, as in
+  Oracle. In a transaction that wrote something before the drop, a read of the view is ORA-00904 until the
+  transaction ends (see [CREATE VIEW](create-view.md)).
 
 ## Examples
 
@@ -81,6 +83,74 @@ Package dropped.
 
 ERROR:
 ORA-04043: object UTIL does not exist
+```
+
+### B. A view over a package's function
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE pay (id NUMBER PRIMARY KEY, amount NUMBER);
+INSERT INTO pay VALUES (1, 100);
+CREATE PACKAGE calc AS
+  FUNCTION thrice (x NUMBER) RETURN NUMBER;
+END calc;
+/
+CREATE PACKAGE BODY calc AS
+  FUNCTION thrice (x NUMBER) RETURN NUMBER IS
+  BEGIN
+    RETURN x * 3;
+  END;
+END calc;
+/
+CREATE VIEW pay_thrice AS SELECT id, calc.thrice(amount) AS amount FROM pay;
+SELECT * FROM pay_thrice;
+DROP PACKAGE BODY calc;
+SELECT * FROM pay_thrice;
+SELECT object_name, object_type, status FROM user_objects WHERE object_name IN ('CALC', 'PAY_THRICE') ORDER BY object_name;
+DROP PACKAGE calc;
+SELECT * FROM pay_thrice;
+SELECT object_name, object_type, status FROM user_objects WHERE object_name IN ('CALC', 'PAY_THRICE') ORDER BY object_name;
+```
+
+```text
+Table created.
+
+1 row created.
+
+Package created.
+
+Package body created.
+
+View created.
+
+ID AMOUNT
+-- ------
+ 1    300
+
+1 row selected.
+
+Package body dropped.
+
+ERROR:
+ORA-04067: not executed, package body "SA.CALC" does not exist
+
+OBJECT_NAME OBJECT_TYPE STATUS
+----------- ----------- ------
+CALC        PACKAGE     VALID
+PAY_THRICE  VIEW        VALID
+
+2 rows selected.
+
+Package dropped.
+
+ERROR:
+ORA-04063: view "SA.PAY_THRICE" has errors
+
+OBJECT_NAME OBJECT_TYPE STATUS
+----------- ----------- -------
+PAY_THRICE  VIEW        INVALID
+
+1 row selected.
 ```
 
 ## See also
