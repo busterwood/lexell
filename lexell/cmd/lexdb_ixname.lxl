@@ -1,0 +1,56 @@
+// lexdb_ixname: T-SQL's index names, per table (the sixth bug slice, design/lexdb-robust.md). SQL Server keeps an index's
+// name per table: CREATE INDEX ix ON t2 is taken when t1 has an ix, the same name twice on one table is 1913. PostgreSQL and
+// Oracle keep index names per schema, as lexdb's catalog does (an index's key is its schema and name, lexdb_exec.idxName). An
+// index made in the T-SQL door whose name another table's index (or a relation) has in the schema is kept under the name
+// with IX_OF and its table's name after it, which the T-SQL door shows as its name (lexdb_sql.ixShown) and finds through
+// its table (DROP INDEX ix ON t, DROP INDEX t.ix). The other doors see the kept name.
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_store"
+import "./lexdb_catalog"
+
+type DbErr = lexdb_base.DbErr
+type Table = lexdb_catalog.Table
+
+fn tsErr(n: int, msg: &str): DbErr { return lexdb_base.err(&("TS" + n.toStr()), msg) }
+
+// The catalog row of index key k (its table's key).
+fn idxRow(k: &str): str {
+    var b = ""
+    b.addByte(1)
+    b += k
+    return b
+}
+
+// Whether key k is a relation's, an index's or a sequence's.
+fn taken(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[bool, DbErr] {
+    return Ok((try st.get(txn, lexdb_catalog.CATALOG, k)).isSome() || (try st.get(txn, lexdb_catalog.CATALOG, &(idxRow(k)))).isSome() ||
+              (try st.get(txn, lexdb_catalog.CATALOG, &(lexdb_catalog.seqRow(k)))).isSome())
+}
+
+// The key a T-SQL CREATE INDEX of key k (schema and name) on table t gets: k when it is free, else the name kept for t;
+// 1913 when t has an index of the name.
+pub fn createKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, k: &str): Result[str, DbErr] {
+    let want = lexdb_sql.baseName(k)
+    for ix in t.indexes {
+        if lexdb_sql.ixShown(&lexdb_sql.baseName(&ix.name)) == want {
+            return Err(tsErr(1913, &("The operation failed because an index or statistics with name '" + want + "' already exists on table '" +
+                                     lexdb_sql.baseName(&t.name) + "'.")))
+        }
+    }
+    if !(try taken(st, txn, k)) { return Ok(k.toStr()) }
+    return Ok(k + lexdb_sql.IX_OF + lexdb_sql.baseName(&t.name))
+}
+
+// The key of index k (schema and name) of table tk (DROP INDEX ix ON t): k or the name kept for t, whichever is t's; the
+// latter when neither is (the index is not there).
+pub fn onTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str, tk: &str): Result[str, DbErr] {
+    let own = k + lexdb_sql.IX_OF + lexdb_sql.baseName(tk)
+    for c in [k.toStr(), own.clone()] {
+        match try st.get(txn, lexdb_catalog.CATALOG, &(idxRow(&c))) {
+            Some(o) { if o == tk { return Ok(c) } }
+            None {}
+        }
+    }
+    return Ok(own)
+}
