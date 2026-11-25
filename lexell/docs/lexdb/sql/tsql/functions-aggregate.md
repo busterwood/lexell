@@ -247,7 +247,36 @@ median_cont median_disc
 (1 row affected)
 ```
 
-### H. Aggregates that are not available
+### H. Approximate distinct counts and percentiles (sketches)
+
+<!-- example: tsql -->
+```sql
+SELECT APPROX_COUNT_DISTINCT(product) AS approx_products,
+       APPROX_PERCENTILE(qty, 0.5) AS approx_median
+FROM dbo.sale;
+SELECT TO_APPROX_COUNT_DISTINCT(APPROX_COUNT_DISTINCT_AGG(h)) AS merged_products,
+       TO_APPROX_PERCENTILE(APPROX_PERCENTILE_AGG(td), 0.5) AS merged_median
+FROM (SELECT region,
+             APPROX_COUNT_DISTINCT_DETAIL(product) AS h,
+             APPROX_PERCENTILE_DETAIL(qty) AS td
+      FROM dbo.sale GROUP BY region) parts;
+```
+
+```text
+approx_products approx_median
+--------------- -------------
+2               5.0
+
+(1 row affected)
+
+merged_products merged_median
+--------------- -------------
+2               5.0
+
+(1 row affected)
+```
+
+### I. Aggregates that are not available
 
 <!-- example: tsql -->
 ```sql

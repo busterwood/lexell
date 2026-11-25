@@ -4,7 +4,7 @@ Creates a materialized view storing query results on disk, supporting all lexdb 
 `FORCE`) and timings (`ON DEMAND`, `ON COMMIT`, `ON STATEMENT`), alongside SQL Server's native indexed views
 (`CREATE VIEW ... WITH SCHEMABINDING` + `CREATE UNIQUE CLUSTERED INDEX`).
 
-**Door:** SQL Server (TDS). **Follows:** SQL Server 2022/2025 indexed views + lexdb cross-door materialized views.
+**Door:** SQL Server (TDS). **Follows:** SQL Server 2022 and 2025 indexed views + lexdb cross-door materialized views.
 
 ## Syntax
 
@@ -42,28 +42,108 @@ DROP MATERIALIZED VIEW [ IF EXISTS ] [ schema_name . ] mview_name [ ,...n ] [ CA
   `BIT_XOR`, `MIN`, `MAX`, `APPROX_COUNT_DISTINCT`, `APPROX_COUNT_DISTINCT_DETAIL`, `APPROX_PERCENTILE`,
   `APPROX_PERCENTILE_DETAIL`), and multi-table inner equi-joins across `INSERT`, `UPDATE`, `DELETE`, `MERGE`, and
   `TRUNCATE`.
-- Composable HyperLogLog++ and t-digest sketch aggregates (`APPROX_COUNT_DISTINCT_DETAIL` / `_AGG` /
-  `TO_APPROX_COUNT_DISTINCT`, `APPROX_PERCENTILE` / `_DETAIL` / `_AGG` / `TO_APPROX_PERCENTILE`) merge associatively in
-  $O(\Delta)$ on appends and re-probe affected groups on deletes.
+- Composable HyperLogLog++ and t-digest sketch aggregates merge associatively in $O(\Delta)$ on appends and re-probe
+  affected groups on deletes.
 
 ## Examples
+
+<!--setup: tsql
+CREATE TABLE dbo.sales (id int PRIMARY KEY, dept_id int, amount int);
+INSERT dbo.sales VALUES (1, 1, 100), (2, 1, 200), (3, 2, 50);
+-->
+
+The examples use one table:
 
 ```sql
 CREATE TABLE dbo.sales (id int PRIMARY KEY, dept_id int, amount int);
 INSERT dbo.sales VALUES (1, 1, 100), (2, 1, 200), (3, 2, 50);
+```
 
-CREATE MATERIALIZED VIEW dbo.mv_sales
-    REFRESH FAST ON COMMIT ENABLE QUERY REWRITE
-AS SELECT dept_id, count(*) AS cnt, sum(amount) AS tot FROM dbo.sales GROUP BY dept_id;
+### A. Native SQL Server indexed view (`WITH SCHEMABINDING` + `UNIQUE CLUSTERED INDEX`)
 
+<!-- example: tsql -->
+```sql
+CREATE VIEW dbo.v_sales WITH SCHEMABINDING AS
+SELECT dept_id, COUNT(*) AS cnt, SUM(amount) AS tot FROM dbo.sales GROUP BY dept_id;
+GO
+CREATE UNIQUE CLUSTERED INDEX ix_v_sales ON dbo.v_sales (dept_id);
+GO
 INSERT dbo.sales VALUES (4, 1, 150);
-SELECT dept_id, cnt, tot FROM dbo.mv_sales ORDER BY dept_id;
+GO
+SELECT dept_id, cnt, tot FROM dbo.v_sales ORDER BY dept_id;
+```
 
+```text
+(1 row affected)
+
+dept_id cnt tot
+------- --- ---
+1       3   450
+2       1   50
+
+(2 rows affected)
+```
+
+### B. Incremental materialized view with `MIN`, `MAX`, `APPROX_COUNT_DISTINCT`, and `VAR_POP`
+
+<!-- example: tsql -->
+```sql
+CREATE MATERIALIZED VIEW dbo.mv_stats
+    REFRESH FAST ON STATEMENT
+AS SELECT dept_id, MIN(amount) AS mn, MAX(amount) AS mx,
+          APPROX_COUNT_DISTINCT(amount) AS du, VAR_POP(amount) AS vp
+   FROM dbo.sales GROUP BY dept_id;
+GO
+INSERT dbo.sales VALUES (5, 1, 300), (6, 2, 150);
+GO
+SELECT dept_id, mn, mx, du, vp FROM dbo.mv_stats ORDER BY dept_id;
+```
+
+```text
+(2 rows affected)
+
+(2 rows affected)
+
+dept_id mn  mx  du vp
+------- --- --- -- ---------------------
+1       100 300 4  5468.7500000000000000
+2       50  150 2  2500.0000000000000000
+
+(2 rows affected)
+```
+
+### C. On-demand snapshot materialized view and cleanup
+
+<!-- example: tsql -->
+```sql
 CREATE MATERIALIZED VIEW dbo.mv_snap
     REFRESH COMPLETE ON DEMAND
-AS SELECT dept_id, sum(amount) AS tot FROM dbo.sales GROUP BY dept_id;
-
-INSERT dbo.sales VALUES (5, 2, 25);
+AS SELECT dept_id, SUM(amount) AS tot FROM dbo.sales GROUP BY dept_id;
+GO
+INSERT dbo.sales VALUES (7, 2, 25);
+GO
 REFRESH MATERIALIZED VIEW dbo.mv_snap;
+GO
 SELECT dept_id, tot FROM dbo.mv_snap ORDER BY dept_id;
+GO
+DROP MATERIALIZED VIEW dbo.mv_stats, dbo.mv_snap;
+DROP INDEX ix_v_sales ON dbo.v_sales;
+DROP VIEW dbo.v_sales;
 ```
+
+```text
+(2 rows affected)
+
+(1 row affected)
+
+dept_id tot
+------- ---
+1       750
+2       225
+
+(2 rows affected)
+```
+
+## See also
+
+[CREATE VIEW](create-view.md), [Aggregate functions](functions-aggregate.md)

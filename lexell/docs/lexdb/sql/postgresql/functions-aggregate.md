@@ -274,7 +274,35 @@ SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY units) AS median,
 (1 row)
 ```
 
-### I. Over no rows
+### I. Approximate distinct counts and percentiles (sketches)
+
+<!-- example: postgresql -->
+```sql
+SELECT approx_count_distinct(rep) AS approx_reps,
+       approx_percentile(units, 0.5) AS approx_median,
+       approx_percentile(0.5) WITHIN GROUP (ORDER BY units) AS approx_median_wg
+FROM sale;
+SELECT to_approx_count_distinct(approx_count_distinct_agg(h)) AS merged_reps,
+       to_approx_percentile(approx_percentile_agg(td), 0.5) AS merged_median
+FROM (SELECT region,
+             approx_count_distinct_detail(rep) AS h,
+             approx_percentile_detail(units) AS td
+      FROM sale GROUP BY region) parts;
+```
+
+```text
+ approx_reps | approx_median | approx_median_wg
+-------------+---------------+------------------
+           5 |           3.5 |              3.5
+(1 row)
+
+ merged_reps | merged_median
+-------------+---------------
+           5 |           3.5
+(1 row)
+```
+
+### J. Over no rows
 
 <!-- example: postgresql -->
 ```sql
@@ -288,7 +316,7 @@ SELECT count(*) AS n, sum(amount) AS total, max(rep) AS rep, bool_and(paid) AS a
 (1 row)
 ```
 
-### J. Errors
+### K. Errors
 
 <!-- example: postgresql -->
 ```sql
