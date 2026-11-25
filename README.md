@@ -24,24 +24,25 @@ Lexell with `-O` against Rust and against Java on a warmed-up JVM (20 benchmarks
 | Benchmark | Faster than Rust | Faster than Java |
 |---|---:|---:|
 | Allocation | 11× | |
-| Lists and trees | 5.2–5.9× | |
-| Strings | 3.6× | |
+| Lists and trees | 5.4–5.7× | |
+| Strings | 3.5× | |
 | Maps | 1.9× | |
-| Recursive calls (`fib`) | 1.6× | 1.1× |
-| Matrix multiplication | 1.6× | |
-| Sieve | 1.6× | 1.8× |
-| Interpreter loop | 1.34× | 2.1× |
-| Array indexing | 1.33× | 1.08× |
-| Bit-packed column decode | | 1.49× |
-| Varint CSV parsing | 1.03× | 1.37× |
-| Switching between tasks | | 8.7× (1.8× Go) |
+| Recursive calls (`fib`) | 1.67× | 1.15× |
+| Matrix multiplication | 1.62× | |
+| Sieve | 1.52× | 1.73× |
+| Interpreter loop | 1.27× | 2.0× |
+| Array indexing | 1.34× | 1.08× |
+| Bit-packed column decode | | 1.39× |
+| Varint CSV parsing | 1.06× | 1.41× |
+| Switching between tasks | | 4.2× (1.9× Go) |
 | Token scanner | | 1.8× |
-| Sorting with closures | | 1.6× |
-| Loops | level | 1.1× |
+| Sorting with closures | | 2.1× |
+| Floating point (`nbody`) | | 1.04× |
+| Loops | level | 1.12× |
 | B-tree | level | |
 | Peak memory (19 of 20 programs) | | 2–31 MB against the JVM's 51 MB–1.4 GB |
 
-Rust is ahead on floating point (`nbody`), sorting with closures, bit-packed decode (`bitpack`), hash aggregation (`hashagg`), and slightly on the token scanner (1.10×) and expression AST evaluation (`enum_eval`, 1.09×). Java is ahead on the allocation-heavy programs, maps, B-tree (1.05×), hash aggregation, expression evaluation, and vectorised matrix multiplication.
+Rust is ahead on floating point (`nbody`), sorting with closures, bit-packed decode (`bitpack`), hash aggregation (`hashagg`), and slightly on the token scanner (1.07×) and expression AST evaluation (`enum_eval`, 1.11×). Java is ahead on the allocation-heavy programs, maps, B-tree (1.03×), hash aggregation, expression evaluation, and vectorised matrix multiplication.
 
 ### Real programs
 
@@ -160,7 +161,7 @@ This also prints `24.49`. The repository includes [other command-line tools, a R
 
 LexDB is a SQL database server written in Lexell (`lexell/cmd/lexdb.lxl`). It is designed for SSDs and NVMe drives, consumer drives first, and keeps its data on disk with memory as a cache. Pages are copy-on-write, so a write torn by a power cut can never damage a page in use, and its disk I/O goes through io_uring where the kernel allows it. It speaks three wire protocols: PostgreSQL's, SQL Server's TDS and Oracle's TNS, each with its own SQL dialect. Existing clients and drivers, such as `psql`, `pgbench`, the JDBC drivers and Lexell's own database clients, connect unchanged. Read-write transactions default to serializable isolation (with opt-in `READ COMMITTED`), and read-only transactions read from a snapshot. Tables are stored by column and queries run over batches of rows, planned by a cost-based optimizer. A server can run read-only replicas as separate processes.
 
-On TPC-H at scale factor 1, LexDB on one core finishes the 22 queries in less total time than PostgreSQL on four processes (7.48 against 8.84 s) and takes 0.52 of PostgreSQL's time on one core (geometric mean, 22 of 22 level or ahead; 0.84 against four processes). On ClickBench (1M rows, 43 queries on a 105-column wide table), LexDB on one core beats PostgreSQL on one core on both total wall time (20.13 against 22.36 s) and geometric mean (0.83 wall, 0.78 CPU; 34 of 43 level or ahead; `ANALYZE` 0.42 against 1.19 s). On sysbench OLTP (1M rows), LexDB leads PostgreSQL 18 on all six workloads at 1 thread (`1.04×`–`2.78×`), commits durable updates faster from a single process at every concurrency up to 32 threads (`2.20×`–`3.07×` non-indexed, `1.17×`–`2.51×` indexed) as well as `oltp_write_only` through 8 threads (`1.21×`–`1.85×`), and with three read replicas beats four-core PostgreSQL on both `oltp_point_select` and `oltp_read_only` at 32 threads using ~26% less CPU. PostgreSQL is ahead on single-process multi-thread reads and multi-statement read-write blocks ([details](PERFORMANCE.md#lexdb)).
+On TPC-H at scale factor 1, LexDB on one core finishes the 22 queries in less total time than PostgreSQL on four processes (7.25 against 8.84 s) and takes 0.49 of PostgreSQL's time on one core (geometric mean, 22 of 22 faster than one core; 0.80 against four processes). On ClickBench (1M rows, 43 queries on a 105-column wide table), LexDB on one core beats PostgreSQL on one core on both total wall time (18.79 against 22.36 s) and geometric mean (0.79 wall, 0.75 CPU; 36 of 43 level or ahead; `ANALYZE` 0.42 against 1.19 s). On sysbench OLTP (1M rows), LexDB leads PostgreSQL 18 on all six workloads at 1 thread (`1.09×`–`2.81×`), commits durable updates faster from a single process at every concurrency up to 32 threads (`2.34×`–`3.14×` non-indexed, `1.07×`–`2.48×` indexed) as well as `oltp_write_only` through 8 threads (`1.29×`–`1.95×`), and with three read replicas beats four-core PostgreSQL on both `oltp_point_select` (`1.11×`) and `oltp_read_only` (`1.06×`) at 32 threads using 29–33% less CPU. PostgreSQL is ahead on single-process multi-thread reads and multi-statement read-write blocks ([details](PERFORMANCE.md#lexdb)).
 
 For now, the [program notes](lexell/cmd/README.md#lexdb) cover running it, and the [design](lexell/design/lexdb.md) covers how it works. A full LexDB guide is in progress.
 
