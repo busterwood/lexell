@@ -184,7 +184,7 @@ CHECKED = {
     # test: (kind, extra) -- helper: calls x/q/qb/t/u(mut &c, "label", "sql"); consts: SETUP and a queries constant
     'tns_catalog': ('helper',), 'tns_computed': ('helper',), 'tns_ddl': ('helper',), 'tns_funcs': ('helper',),
     'tns_merge': ('helper',), 'tns_orpath': ('helper',), 'tns_oracle': ('helper',), 'tns_percentile': ('helper',),
-    'tns_privs': ('scenario',), 'tns_routinepriv': ('scenario',), 'tns_routine': ('routine',),
+    'tns_privs': ('scenario',), 'tns_routinepriv': ('scenario',), 'tns_assertpriv': ('scenario',), 'tns_routine': ('routine',),
     'tns_unnest': ('consts', 'QUERIES'), 'tns_unnest_agg': ('consts', 'QUERIES'), 'tns_subrows': ('consts', 'QS'),
     'tns_r3': ('consts', 'QS'),
     'tns_r4': ('consts', 'QS'),
@@ -349,7 +349,7 @@ def scenario_check(conn, name, text, exp, sysdsn):
         except oracledb.DatabaseError:
             pass
         sc.execute('create user %s identified by pw quota unlimited on users' % u)
-        sc.execute('grant create session, create table, create procedure, create view to %s' % u)
+        sc.execute('grant create session, create table, create procedure, create view, create assertion to %s' % u)
     conns = {}
     for m in re.finditer(r'var (\w+) = connect\(&\("User Id=(\w+);', text):
         if m.group(2) == 'sa':

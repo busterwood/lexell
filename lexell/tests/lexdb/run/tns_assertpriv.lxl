@@ -1,0 +1,132 @@
+// lexdb over TNS: an assertion's check reads the tables with the assertion owner's rights (the fifth bug slice, design/lexdb-robust.md),
+// checked against Oracle Database Free 23.26 (gen_oracle.py --check tns_assertpriv): a user with INSERT, UPDATE and DELETE and no SELECT
+// on an asserted table writes rows that keep it, and is refused with ORA-08601 for rows that break it (not ORA-41900); a WHERE that reads
+// the table and a SELECT still need the privilege (ORA-41900), a user with none is ORA-00942.
+// expect: insert: 1
+// expect: insert violating: error 8601
+// expect: insert select violating: error 8601
+// expect: update violating: error 8601
+// expect: update keeping: 2
+// expect: update with where: error 41900
+// expect: select: error 41900
+// expect: u3 insert: error 942
+// expect: owner reads: 1|7;2|7
+// expect: delete: 2
+// expect: owner reads after: 0
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(&(s.toStr())) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+fn values(rows: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..rows.columnCount() {
+        match rows.isNull(row, i) {
+            Ok(n) {
+                if n { append(mut &out, "NULL") } else {
+                    match rows.value(row, i) {
+                        Ok(v) { append(mut &out, v.toStr()) }
+                        Err(e) { append(mut &out, "error " + e.code.toStr() + " " + e.msg) }
+                    }
+                }
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr()) }
+        }
+    }
+    return strings.join(&out, "|")
+}
+
+// a statement's count, or its error's number
+fn err(r: Result[int, oracle.Error]): str {
+    match r {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// a query's rows (columns joined by |, rows by ;), or its error's number
+fn q1(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(r) {
+            var out: []str = []
+            for i in 0..r.rowCount() { append(mut &out, values(&r, i)) }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+// a block or a call: ok, or its error's number
+fn blk(c: mut &oracle.Conn, sql: &str): str {
+    let none: []sqldialect.Value = []
+    match c.call(&(sql.toStr()), &none, &[]) {
+        Ok(_) { return "ok" }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn say(label: &str, what: &str) { println(label + ": " + what) }
+
+fn client(port: &str) {
+    let dsn = "127.0.0.1:" + port + "/lexdb"
+    var sa = connect(&("User Id=sa;Password=sa;Data Source=" + dsn))
+    for u in ["u1", "u2", "u3"] {
+        sa.exec(&("create user " + u + " identified by pw")).unwrap()
+        sa.exec(&("grant create session, create table, create assertion to " + u)).unwrap()
+    }
+    var a = connect(&("User Id=u1;Password=pw;Data Source=" + dsn))
+    var b = connect(&("User Id=u2;Password=pw;Data Source=" + dsn))
+    var c = connect(&("User Id=u3;Password=pw;Data Source=" + dsn))
+    a.exec("create table at (id number primary key, v number)").unwrap()
+    a.exec("create assertion a1 check (not exists (select 1 from at where v < 0))").unwrap()
+    a.exec("grant insert, update, delete on at to u2").unwrap()
+    a.exec("insert into at values (1, 1)").unwrap()
+    a.exec("commit").unwrap()
+    // u2 writes with INSERT, UPDATE and DELETE and no SELECT: checked with u1's rights
+    say("insert", err(b.run("insert into u1.at values (2, 2)", &[])))
+    say("insert violating", err(b.run("insert into u1.at values (3, -1)", &[])))
+    say("insert select violating", err(b.run("insert into u1.at select 4, -4 from dual", &[])))
+    say("update violating", err(b.run("update u1.at set v = -5", &[])))
+    say("update keeping", err(b.run("update u1.at set v = 7", &[])))
+    say("update with where", err(b.run("update u1.at set v = -5 where id = 1", &[])))
+    say("select", q1(mut &b, &"select count(*) from u1.at"))
+    say("u3 insert", err(c.run("insert into u1.at values (5, 5)", &[])))
+    say("owner reads", q1(mut &a, &"select id, v from at order by id"))
+    say("delete", err(b.run("delete from u1.at", &[])))
+    say("owner reads after", q1(mut &a, &"select count(*) from at"))
+    c.logoff()
+    b.logoff()
+    a.logoff()
+    sa.logoff()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(17), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}
