@@ -148,7 +148,8 @@ privileges](catalog-roles.md) · [statistics and other relations](catalog-other.
   (empty where lexdb has no such object).
 - **information_schema**: `schemata`, `tables`, `columns`, `views`, `table_constraints`, `key_column_usage`,
   `referential_constraints`, `constraint_column_usage`, `check_constraints`, `sequences`, `table_privileges`,
-  `role_table_grants`, `routines`, `parameters`, `routine_privileges`, `role_routine_grants`.
+  `role_table_grants`, `routines`, `parameters`, `routine_privileges`, `role_routine_grants`, `view_table_usage`,
+  `view_column_usage`.
 
 ## Settings
 

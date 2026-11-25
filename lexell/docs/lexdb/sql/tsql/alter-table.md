@@ -85,8 +85,8 @@ ALTER TABLE { database_name.schema_name.table_name | schema_name.table_name | ta
 - `DROP COLUMN` of a column a view reads is done, as in SQL Server, unless the view is schema-bound (5074). The view
   fails when read: 207 for a column it names, 4502 for a `SELECT *` view that has fewer columns than before. A
   `SELECT *` view over a table that lost a column and gained another reads the columns by position under their old
-  names (see [CREATE VIEW](create-view.md)). `ALTER COLUMN` of a column a schema-bound view reads is made (SQL
-  Server: 5074).
+  names (see [CREATE VIEW](create-view.md); `sp_refreshview` makes the view again from the table's columns as they are
+  now). `ALTER COLUMN` of a column a schema-bound view reads is 5074, as in SQL Server.
 - One action per statement: several columns or constraints in one `ADD`, or `DROP COLUMN a, b`, give error 50000
   ("lexdb: ALTER TABLE takes ADD, DROP, ALTER COLUMN, VALIDATE CONSTRAINT, RENAME and SET SCHEMA").
 - **`ADD CONSTRAINT name DEFAULT value FOR column`** is error 102. Give the default when the column is made.

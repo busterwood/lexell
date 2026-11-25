@@ -36,7 +36,7 @@ feature, the number is **50000**.
 | 179 | `OUTPUT` with a constant argument in `EXEC`. |
 | 195 | An unknown function or system variable (`function x with n arguments does not exist`). |
 | 207 | An invalid column name. |
-| 208 | An invalid object name (a table, view or other relation that is not there). |
+| 208 | An invalid object name (a table, view or other relation that is not there, also the table of a view read after the table was dropped). |
 | 213 | The number of values in an `INSERT` does not match the table. |
 | 468 | A collation conflict between two strings. |
 | 1002 | An invalid scale in a type such as `datetime2(8)`. |
@@ -59,7 +59,8 @@ feature, the number is **50000**.
 | 2627 | A `PRIMARY KEY` or `UNIQUE` constraint violated (a unique index gives the same). |
 | 8110 | A second `PRIMARY KEY` in `CREATE TABLE`. |
 | 1779 | A second `PRIMARY KEY` by `ALTER TABLE`. |
-| 8112 | Two `CLUSTERED` keys in one `CREATE TABLE`. |
+| 8112 | Two `CLUSTERED` keys or indexes in one `CREATE TABLE`. |
+| 8168 | An index name used twice in one `CREATE TABLE`. |
 | 1902 | A second `CLUSTERED` index on a table (`CREATE INDEX` and `ALTER TABLE`). |
 | 220, 244 | A value outside `tinyint`'s 0 to 255: a number (220), a string (244). |
 | 206 | An operand type clash: `date`, `datetime2`, `datetimeoffset` or `time` with a number. |
@@ -86,9 +87,12 @@ feature, the number is **50000**.
 | 3701 | `DROP` of a table, view, procedure, function or assertion that does not exist (severity 11). |
 | 4121 | A column, function or method that cannot be found by that name. |
 | 4902 | A table named by `TRUNCATE` or similar that cannot be found. |
-| 5074 | An object depends on the column you are dropping or changing: an assertion reads it, or a `WITH SCHEMABINDING` view uses it (`DROP COLUMN` only). |
+| 5074 | An object depends on the column you are dropping or changing: an assertion reads it, or a `WITH SCHEMABINDING` view uses it (`DROP COLUMN` and `ALTER COLUMN`). |
 | 4502 | A `SELECT *` view whose table has lost a column (`View or function ... has more column names specified than columns defined`). |
-| 3729 | `DROP SEQUENCE` of a sequence a column's default uses; `DROP TABLE` of a table an assertion reads. |
+| 3729 | `DROP SEQUENCE` of a sequence a column's default uses; `DROP TABLE` of a table an assertion or a `WITH SCHEMABINDING` view reads. |
+| 4512, 4513 | A schema-bound view with a one-part name in its query, or over a view or function that is not schema-bound. |
+| 1913 | `CREATE INDEX` with the name of an index the table has. |
+| 15165 | `sp_refreshview` of a name that is not a view. |
 | 15336 | `sp_rename` of a table or column an assertion reads. |
 | 2754 | `RAISERROR` of severity 19 to 25 without `WITH LOG`. |
 | 5324, 8672, 10713 | `MERGE` rules: a `WHEN` clause after one with no condition; a target row matched twice; a missing `;`. |

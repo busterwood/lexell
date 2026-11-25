@@ -20,12 +20,15 @@ SELECT ... FROM INFORMATION_SCHEMA.SEQUENCES
 SELECT ... FROM INFORMATION_SCHEMA.TABLE_PRIVILEGES
 SELECT ... FROM INFORMATION_SCHEMA.ROUTINES
 SELECT ... FROM INFORMATION_SCHEMA.PARAMETERS
+SELECT ... FROM INFORMATION_SCHEMA.VIEW_TABLE_USAGE
+SELECT ... FROM INFORMATION_SCHEMA.VIEW_COLUMN_USAGE
 ```
 
 ## Views
 
 The names resolve to PostgreSQL's `information_schema` views, so each has PostgreSQL's columns, in lower case, with
-PostgreSQL's values. They answer from the same catalog as [the `sys` views](catalog-tables.md).
+PostgreSQL's values, except `SCHEMATA`, `ROUTINES`, `PARAMETERS` and the two `VIEW_` views, which give SQL Server's rows
+(below). They answer from the same catalog as [the `sys` views](catalog-tables.md).
 
 `TABLES`
 : `table_catalog` (`lexdb`), `table_schema`, `table_name`, `table_type` (`BASE TABLE` or `VIEW`),
@@ -44,8 +47,8 @@ PostgreSQL's values. They answer from the same catalog as [the `sys` views](cata
   `UNIQUE`, `FOREIGN KEY`, `CHECK`).
 
 `KEY_COLUMN_USAGE`, `CONSTRAINT_COLUMN_USAGE`
-: The columns of each key: `constraint_name`, `table_name`, `column_name`, `ordinal_position`. (For a foreign key,
-  `CONSTRAINT_COLUMN_USAGE` gives the referenced column, not the key's own: see the differences below.)
+: The columns of each key: `constraint_name`, `table_name`, `column_name`, and `ordinal_position` in the first. For a
+  foreign key, `CONSTRAINT_COLUMN_USAGE` gives the key's own columns (`pid` of the child), as SQL Server does.
 
 `REFERENTIAL_CONSTRAINTS`
 : `constraint_name`, `unique_constraint_name` (the key it points to), `match_option`, `update_rule`, `delete_rule`.
@@ -62,7 +65,10 @@ PostgreSQL's values. They answer from the same catalog as [the `sys` views](cata
   and `OBJECT_ID('a')` is NULL.
 
 `SCHEMATA`
-: `schema_name`, `schema_owner`.
+: SQL Server's schemas: `dbo`, `guest`, `INFORMATION_SCHEMA`, `sys`, the nine `db_*` role schemas and the schemas made
+  with `CREATE SCHEMA`. Columns `catalog_name`, `schema_name`, `schema_owner` (`dbo` for `dbo` and for every schema made
+  with `CREATE SCHEMA`; each fixed schema is its own owner), `default_character_set_catalog`,
+  `default_character_set_schema`, `default_character_set_name` (`iso_1`), `sql_path`.
 
 `SEQUENCES`
 : `sequence_schema`, `sequence_name`, `data_type`, `start_value`, `minimum_value`, `maximum_value`, `increment`,
@@ -72,8 +78,18 @@ PostgreSQL's values. They answer from the same catalog as [the `sys` views](cata
 : `grantor`, `grantee`, `table_schema`, `table_name`, `privilege_type`, `is_grantable`.
 
 `ROUTINES`, `PARAMETERS`
-: Present, with PostgreSQL's columns. They list the functions and procedures of the PostgreSQL door only: see
-  the differences below.
+: The T-SQL procedures and functions (those made in this door; the PostgreSQL door's functions are listed by its own
+  `information_schema.routines`). `ROUTINES`: `specific_schema`, `specific_name`, `routine_schema`, `routine_name`,
+  `routine_type` (`PROCEDURE` or `FUNCTION`), `data_type` (SQL Server's name for a function's result type, NULL for a
+  procedure), `routine_body` (`SQL`), `routine_definition`, `is_deterministic`, `sql_data_access` (`READS` for a
+  function, `MODIFIES` for a procedure). `PARAMETERS`: `specific_name`, `ordinal_position`, `parameter_mode` (`IN`,
+  `INOUT` for `OUTPUT`, and `OUT` for a function's result, at position 0, with `is_result` `YES`), `parameter_name`
+  (`@x`), `data_type`.
+
+`VIEW_TABLE_USAGE`, `VIEW_COLUMN_USAGE`
+: The tables and views each view reads (`view_catalog`, `view_schema`, `view_name`, `table_catalog`, `table_schema`,
+  `table_name`) and, in the second, the columns of them it names (`column_name`: by name, qualified by the table or an
+  alias; all of them for `*`).
 
 ## Remarks
 
@@ -90,15 +106,11 @@ PostgreSQL's values. They answer from the same catalog as [the `sys` views](cata
   (see [constraints](catalog-constraints.md) for where it differs).
 - The schema columns (`table_schema`, `constraint_schema`, `routine_schema`, `schema_name` ...) show `dbo` where
   lexdb's schema is `public`, as `sys.schemas` does.
-- `SCHEMATA` lists `dbo` (its owner is `dbo`), the schemas made with `CREATE SCHEMA` (owned by the user who made
-  them; SQL Server: `dbo` unless `AUTHORIZATION` says otherwise), and PostgreSQL's `information_schema` and
-  `pg_catalog`. SQL Server's `guest`, `sys`, `INFORMATION_SCHEMA` and `db_*` schemas are not in it.
-- `CONSTRAINT_COLUMN_USAGE` gives a foreign key's referenced column (`p.id` for `fk`), where SQL Server gives the
-  key's own column (`c.pid`).
+- `SCHEMATA` shows `dbo` as the owner of a schema made `CREATE SCHEMA s AUTHORIZATION x` (SQL Server: `x`). The
+  catalog name is `lexdb` (SQL Server: the database's name), and the column names are in lower case (SQL Server:
+  upper case).
 - Constraint names are lexdb's, `table_pkey`, `table_column_fkey`, and `view_definition` is the text of the query.
-- `ROUTINES` and `PARAMETERS` have no rows for T-SQL procedures and functions: use `sys.procedures`,
-  `sys.parameters` and `sys.sql_modules`.
-- `COLUMN_PRIVILEGES`, `VIEW_COLUMN_USAGE`, `VIEW_TABLE_USAGE` and `DOMAINS` do not exist (error 208).
+- `COLUMN_PRIVILEGES` and `DOMAINS` do not exist (error 208).
 - The view `INFORMATION_SCHEMA.TABLES` has the extra PostgreSQL columns (`self_referencing_column_name`,
   `commit_action`, ...).
 
@@ -282,7 +294,7 @@ SELECT schema_name, schema_owner FROM INFORMATION_SCHEMA.SCHEMATA WHERE schema_n
 schema_name schema_owner
 ----------- ------------
 dbo         dbo
-hr          sa
+hr          dbo
 
 (2 rows affected)
 ```
@@ -291,15 +303,27 @@ hr          sa
 
 <!-- example: tsql -->
 ```sql
-SELECT routine_name, routine_type FROM INFORMATION_SCHEMA.ROUTINES WHERE routine_schema = 'hr';
+SELECT routine_schema, routine_name, routine_type, data_type, routine_body, sql_data_access FROM INFORMATION_SCHEMA.ROUTINES WHERE routine_schema = 'hr' ORDER BY routine_name;
+SELECT specific_name, ordinal_position, parameter_mode, is_result, parameter_name, data_type FROM INFORMATION_SCHEMA.PARAMETERS WHERE specific_schema = 'hr' ORDER BY specific_name, ordinal_position;
 SELECT name, type_desc FROM sys.objects WHERE type IN ('P', 'FN') AND schema_id = SCHEMA_ID('hr') ORDER BY name;
 ```
 
 ```text
-routine_name routine_type
------------- ------------
+routine_schema routine_name routine_type data_type routine_body sql_data_access
+-------------- ------------ ------------ --------- ------------ ---------------
+hr             f_sq         FUNCTION     int       SQL          READS
+hr             p_raise      PROCEDURE    NULL      SQL          MODIFIES
 
-(0 rows affected)
+(2 rows affected)
+
+specific_name ordinal_position parameter_mode is_result parameter_name data_type
+------------- ---------------- -------------- --------- -------------- ---------
+f_sq          0                OUT            YES                      int
+f_sq          1                IN             NO        @x             int
+p_raise       1                IN             NO        @pct           int
+p_raise       2                INOUT          NO        @out           int
+
+(4 rows affected)
 
 name    type_desc
 ------- --------------------
@@ -309,7 +333,45 @@ p_raise SQL_STORED_PROCEDURE
 (2 rows affected)
 ```
 
-### H. Views that do not exist
+### H. What a view reads, and the columns of a foreign key
+
+<!-- example: tsql -->
+```sql
+CREATE VIEW hr.v_dept_emp AS SELECT d.name AS dept, e.name FROM hr.dept AS d JOIN hr.v_emp AS e ON e.id = d.id;
+GO
+SELECT view_name, table_name FROM INFORMATION_SCHEMA.VIEW_TABLE_USAGE WHERE view_schema = 'hr' ORDER BY view_name, table_name;
+SELECT view_name, table_name, column_name FROM INFORMATION_SCHEMA.VIEW_COLUMN_USAGE WHERE view_schema = 'hr' ORDER BY view_name, table_name, column_name;
+SELECT table_name, column_name, constraint_name FROM INFORMATION_SCHEMA.CONSTRAINT_COLUMN_USAGE WHERE constraint_name LIKE '%fkey%' ORDER BY constraint_name, column_name;
+```
+
+```text
+view_name  table_name
+---------- ----------
+v_dept_emp dept
+v_dept_emp v_emp
+v_emp      emp
+
+(3 rows affected)
+
+view_name  table_name column_name
+---------- ---------- -----------
+v_dept_emp dept       id
+v_dept_emp dept       name
+v_dept_emp v_emp      id
+v_dept_emp v_emp      name
+v_emp      emp        id
+v_emp      emp        name
+
+(6 rows affected)
+
+table_name column_name constraint_name
+---------- ----------- ----------------
+emp        dept_id     emp_dept_id_fkey
+
+(1 row affected)
+```
+
+### I. Views that do not exist
 
 <!-- example: tsql -->
 ```sql

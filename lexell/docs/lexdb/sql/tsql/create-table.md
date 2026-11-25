@@ -129,9 +129,8 @@ INDEX index_name [ UNIQUE ] [ CLUSTERED | NONCLUSTERED ] ( column [ ASC | DESC ]
   `GENERATED ALWAYS AS ROW START` are syntax errors.
 - An `INDEX` in the table's definition (after a column, or among the table's elements) is made with the table, as if by
   [CREATE INDEX](create-index.md) in the same statement (example I): a column that does not exist is error 1911, and
-  an index name is unique in the schema (error 2714; SQL Server has them per table, and says 8168 for a name used
-  twice in one table). Two `CLUSTERED` indexes, or one and a `CLUSTERED` key, are error 1902 where SQL Server says
-  8112. A `CLUSTERED` index makes a primary key that did not say so `NONCLUSTERED`.
+  an index name is per table (error 8168 for a name used twice in one table, as in SQL Server). Two `CLUSTERED`
+  indexes, or one and a `CLUSTERED` key, are error 8112. A `CLUSTERED` index makes a primary key that did not say so `NONCLUSTERED`.
 - A `rowversion` (`timestamp`) column is not filled in: it stays NULL.
 - A `DEFAULT` constraint's own name is not kept; it is shown as `DF_table_column`. `ALTER TABLE ... DROP CONSTRAINT`
   finds it by neither name (error 50000).

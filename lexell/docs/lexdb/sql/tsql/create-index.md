@@ -60,9 +60,11 @@ CREATE [ UNIQUE ] [ CLUSTERED | NONCLUSTERED ] INDEX index_name
 - `ALTER INDEX ... REBUILD`, `REORGANIZE` and `DISABLE` are error 50000 ("lexdb: ALTER INDEX takes RENAME TO only").
   `CREATE STATISTICS` is error 50000; `UPDATE STATISTICS` is error 102.
 - A unique index over rows that already clash is error 2627, "could not create unique index" (SQL Server: 1505).
-- **An index's name is unique in the schema**, as a table's is, not only among the indexes of its table: `ix_emp_dept`
-  on a second table is error 2714 (SQL Server allows it), and so is the name on the same table (SQL Server: 1913,
-  example E).
+- **Index names are per table**, as in SQL Server: `ix_emp_dept` may be the name of an index of each of two tables
+  (example E), and the same name twice on one table is error 1913. The PostgreSQL and Oracle doors keep index names
+  per schema: they list the second `ix` under a longer name (`ix`, a control character and the table's name), and a
+  `CREATE INDEX ix` there is refused while the schema has one. A name that a table or another object has in the schema is still
+  error 2714.
 - Columnstore indexes (`CREATE COLUMNSTORE INDEX`, error 102), and spatial, XML and full-text indexes, are not
   supported.
 - PostgreSQL's `CREATE INDEX IF NOT EXISTS` is taken.
@@ -166,7 +168,9 @@ ux_emp_email email   1           0                 0
 (4 rows affected)
 ```
 
-### E. Errors
+### E. Errors, and one name on two tables
+
+The same name on the same table is error 1913. On another table it is a second index: `sys.indexes` lists both.
 
 <!-- example: tsql -->
 ```sql
@@ -178,17 +182,23 @@ GO
 CREATE TABLE dbo.dept_copy (id int);
 CREATE INDEX ix_emp_dept ON dbo.dept_copy (id);
 GO
+SELECT OBJECT_NAME(object_id) AS tbl, name FROM sys.indexes WHERE name = 'ix_emp_dept' ORDER BY 1;
+GO
 ```
 
 ```text
 Msg 2627, Level 14, State 1, Line 1
 could not create unique index "ux_emp_dept"
-Msg 2714, Level 16, State 1, Line 2
-There is already an object named 'ix_emp_dept' in the database.
+Msg 1913, Level 16, State 1, Line 2
+The operation failed because an index or statistics with name 'ix_emp_dept' already exists on table 'emp'.
 Msg 1911, Level 16, State 1, Line 1
 Column name 'nothere' does not exist in the target table or view.
-Msg 2714, Level 16, State 1, Line 2
-There is already an object named 'ix_emp_dept' in the database.
+tbl       name
+--------- -----------
+dept_copy ix_emp_dept
+emp       ix_emp_dept
+
+(2 rows affected)
 ```
 
 ### F. CLUSTERED and NONCLUSTERED

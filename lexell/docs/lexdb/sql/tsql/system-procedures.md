@@ -10,6 +10,7 @@ and a few server procedures. [sp_rename](sp-rename.md) has its own page.
 ```
 EXEC sp_executesql @stmt [ , @params [ , @param1 = value [ OUTPUT ] [ ,...n ] ] ]
 EXEC sp_describe_first_result_set @tsql [ , @params ]
+EXEC sp_refreshview [ @viewname = ] 'view'
 
 EXEC sp_tables [ @table_name = ] name [ , [ @table_owner = ] schema ] [ , [ @table_type = ] "'TABLE', 'VIEW'" ]
 EXEC sp_columns [ @table_name = ] name [ , [ @table_owner = ] schema ] [ , [ @column_name = ] column ]
@@ -39,6 +40,10 @@ EXEC xp_instance_regread ...
 `sp_describe_first_result_set`
 : Describes the columns of a query's first result set without running it: name, nullability, type, length,
   precision, scale and collation, one row per column.
+
+`sp_refreshview`
+: Makes a view again from its stored text, so that a `SELECT *` view takes its table's columns as they are now (see
+  [CREATE VIEW](create-view.md), example H). A name that is not a view is error 15165.
 
 `sp_prepare`, `sp_execute`, `sp_prepexec`, `sp_unprepare`
 : Prepared statements. Drivers call them as RPC requests, and lexdb takes them there. Called by `EXEC` in a batch
@@ -80,7 +85,7 @@ Their result sets have SQL Server's columns.
 ## Differences from SQL Server
 
 - `sp_help`, `sp_helptext`, `sp_helpindex`, `sp_helpdb`, `sp_who`, `sp_spaceused`, `sp_configure`,
-  `sp_server_info`, `sp_addrolemember`, `sp_refreshview` and `sp_sequence_get_range` are not available (2812).
+  `sp_server_info`, `sp_addrolemember` and `sp_sequence_get_range` are not available (2812).
 - `sp_datatype_info` returns every type whatever its argument.
 - `sp_prepare`, `sp_execute`, `sp_prepexec` and `sp_unprepare` work as RPC only.
 

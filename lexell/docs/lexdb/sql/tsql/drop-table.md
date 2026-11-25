@@ -29,9 +29,10 @@ DROP TABLE [ IF EXISTS ] { database_name.schema_name.table_name | schema_name.ta
 
 ## Differences from SQL Server
 
-- **A table that a view reads cannot be dropped** (error 50000, "cannot drop table emp because other objects depend
-  on it"), schema-bound or not. SQL Server drops it, and the view fails when it is next used, unless the view is
-  `WITH SCHEMABINDING` (error 3729). Drop the view first.
+- **A table that a view reads is dropped, as in SQL Server**, unless the view is `WITH SCHEMABINDING` (error 3729,
+  naming the table without its schema; SQL Server: `dbo.emp`). The view, and a view over it, fail with error 208 when
+  read (the text names the table without its schema), and read again as soon as a table of that name is made (example
+  E). `DROP VIEW` of a view another view reads is still refused (error 50000; SQL Server allows it).
 - A table that a foreign key refers to gives error 50000 with lexdb's text (SQL Server: 3726).
 
 ## Examples
@@ -115,20 +116,61 @@ rows_back
 (1 row affected)
 ```
 
-### E. Errors
+### E. A table under a view
+
+A view over a dropped table is not dropped with it. Reading it is error 208 until a table of that name is made again.
+A schema-bound view stops the drop.
 
 <!-- example: tsql -->
 ```sql
-CREATE VIEW dbo.v_keep AS SELECT id FROM dbo.keep;
+CREATE TABLE dbo.dept (id int PRIMARY KEY, name nvarchar(20));
+INSERT dbo.dept VALUES (1, N'sales');
 GO
-DROP TABLE dbo.keep;
+CREATE VIEW dbo.v_dept AS SELECT name FROM dbo.dept;
+GO
+CREATE VIEW dbo.v_dept_up AS SELECT UPPER(name) AS name FROM dbo.v_dept;
+GO
+DROP TABLE dbo.dept;
+GO
+SELECT * FROM dbo.v_dept_up;
+GO
+CREATE TABLE dbo.dept (id int PRIMARY KEY, name nvarchar(20));
+INSERT dbo.dept VALUES (2, N'ops');
+GO
+SELECT * FROM dbo.v_dept_up;
+GO
+CREATE VIEW dbo.v_dept_bound WITH SCHEMABINDING AS SELECT id FROM dbo.dept;
+GO
+DROP TABLE dbo.dept;
+GO
+```
+
+```text
+(1 row affected)
+
+Msg 208, Level 16, State 1, Line 1
+Invalid object name 'dept'.
+(1 row affected)
+
+name
+----
+OPS
+
+(1 row affected)
+
+Msg 3729, Level 16, State 1, Line 1
+Cannot DROP TABLE 'dept' because it is being referenced by object 'v_dept_bound'.
+```
+
+### F. Errors
+
+<!-- example: tsql -->
+```sql
 DROP TABLE dbo.nothere;
 ```
 
 ```text
-Msg 50000, Level 16, State 1, Line 1
-cannot drop table keep because other objects depend on it
-Msg 3701, Level 11, State 1, Line 2
+Msg 3701, Level 11, State 1, Line 1
 Cannot drop the table 'nothere', because it does not exist or you do not have permission.
 ```
 

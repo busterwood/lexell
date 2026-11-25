@@ -104,7 +104,7 @@ cannot. An unrelated column may be added, dropped or renamed.
 |---|---|
 | Oracle | `USER_ASSERTIONS`, `ALL_ASSERTIONS`, `DBA_ASSERTIONS`, `USER_ASSERTION_DEPENDENCIES` (and `ALL_`, `DBA_`), `USER_ASSERTION_LOCK_MATRIX` (always empty), and `USER_OBJECTS` with `OBJECT_TYPE` `UNDEFINED`. See [Data dictionary](sql/oracle/data-dictionary-tables.md). |
 | PostgreSQL | `information_schema.assertions`, its row in `check_constraints` and one in `constraint_column_usage` per column read. **No `pg_constraint` row**: `psql`'s `\d` and pgjdbc's metadata list constraints by `conrelid` and `contype`, and a row of neither would be a constraint of nothing. `pg_class.relhastriggers` is true for an asserted table (its checks are its triggers, in effect). |
-| SQL Server | `INFORMATION_SCHEMA.ASSERTIONS`, `CHECK_CONSTRAINTS`, `CONSTRAINT_COLUMN_USAGE`. **No `sys.objects` row**: SQL Server has no object type for an assertion, and a made-up one would be listed by SSMS's Object Explorer and `sp_help` under nothing. So SSMS, `sp_help` and mssql-jdbc's `DatabaseMetaData` do not see it, and `OBJECT_ID('a')` is NULL. |
+| SQL Server | `INFORMATION_SCHEMA.ASSERTIONS` and `CHECK_CONSTRAINTS` (`CONSTRAINT_COLUMN_USAGE` has no rows for an assertion in this door: see KNOWN-ISSUES.md). **No `sys.objects` row**: SQL Server has no object type for an assertion, and a made-up one would be listed by SSMS's Object Explorer and `sp_help` under nothing. So SSMS, `sp_help` and mssql-jdbc's `DatabaseMetaData` do not see it, and `OBJECT_ID('a')` is NULL. |
 
 ## Errors of each door
 

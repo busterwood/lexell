@@ -28,8 +28,10 @@ AS select_statement
   each expression needs a name.
 
 `WITH SCHEMABINDING`
-: Ties the view to the tables it reads: `ALTER TABLE ... DROP COLUMN` of a column the view uses is error 5074, and `*`
-  in the query is error 1054. `sys.sql_modules.is_schema_bound` is 1. See example F.
+: Ties the view to the tables it reads: `ALTER TABLE ... DROP COLUMN` or `ALTER COLUMN` of a column the view uses
+  is error 5074, `DROP TABLE` of a table it reads is 3729, `*` in the query is error 1054, a one-part name in the
+  query (`FROM emp`) is 4512, and a view over a view that is not schema-bound (or over a function that is not) is
+  4513. `sys.sql_modules.is_schema_bound` is 1. See example F.
 
 `WITH VIEW_METADATA`, `WITH ENCRYPTION`
 : Read and ignored (the text is not encrypted).
@@ -44,8 +46,15 @@ AS select_statement
 - `ALTER TABLE ... DROP COLUMN` of a column a view reads is allowed unless the view is schema-bound. The view then
   fails when it is read: error 207 for a column it names, 4502 for a `SELECT *` view that has fewer columns than it
   had. A `SELECT *` view whose table lost a column and gained another reads the table's columns by position under its
-  old column names, as SQL Server does when the view was not read in between (after a failed read SQL Server keeps
-  giving 4502 until `sp_refreshview`, which lexdb does not have; see [ALTER TABLE](alter-table.md), example K).
+  old column names, as SQL Server does when the view was not read in between. After a failed read SQL Server keeps
+  giving 4502 until `sp_refreshview`; lexdb does not (a failed read changes nothing in the view), and
+  `sp_refreshview` brings the table's columns as they are now (example H; see also [ALTER TABLE](alter-table.md),
+  example K).
+- `DROP TABLE` of a table a view reads is done, as in SQL Server, unless the view is schema-bound (3729): the view,
+  and a view over it, fail with error 208 when they are read, and read again once a table of that name is made (see
+  [DROP TABLE](drop-table.md), example D).
+- `sp_refreshview 'v'` makes the view again from its stored text, so a `SELECT *` view takes its table's columns as
+  they are now; a name that is no view is error 15165.
 - The view's text, as written, is in `OBJECT_DEFINITION(OBJECT_ID('view'))` and `sys.sql_modules`; `sys.views`
   lists the view. `INFORMATION_SCHEMA.VIEWS.VIEW_DEFINITION` gives the query.
 - The names in the query are checked when the view is made: an unknown table is error 208, an unknown column 207.
@@ -55,16 +64,18 @@ AS select_statement
 
 - **Views are read-only.** `INSERT`, `UPDATE`, `DELETE` and `MERGE` through a view are error 50000 ("cannot update
   view "v" (lexdb's views are read-only)").
-- `WITH CHECK OPTION` is error 50000 (written before `AS` it is 195, SQL Server 102). There are no indexed views.
-- `WITH SCHEMABINDING` is read and kept, but not all of SQL Server's checks are made: a one-part name in the query
-  (`FROM emp`) and a schema-bound view over a view that is not are taken (SQL Server: 4512 and 4513), and `ALTER TABLE
-  ... ALTER COLUMN` of a column the view reads is made (SQL Server: 5074). The 4502 text names the view without its
-  schema, and the state of 1054 is 1 (SQL Server: 6).
+- `WITH CHECK OPTION` after the query is error 50000 (written before `AS` it is 102, as in SQL Server). There are no
+  indexed views.
+- **`SELECT *` is expanded when the view is read**, not when it is made: a column added to the table later shows in
+  the view at once. SQL Server keeps the columns the view had until `sp_refreshview`.
+- The texts of 4502, 4512, 208 (a table under a view dropped) and 3729 name the view or table without its schema
+  (`base`, SQL Server: `dbo.base`), and the states of 4512 and 4513 are 1 (SQL Server: 3 and 2). A syntax error near a keyword quotes it in
+  lower case (`near 'with'`; SQL Server quotes it as written).
 - `CREATE VIEW` need not be the first statement of its batch (SQL Server: 111).
 - An `ORDER BY` without `TOP` is taken (SQL Server: 1033). The rows of the view are not sorted by it.
-- A table that a view reads cannot be dropped while the view exists, schema-bound or not: error 50000 (SQL Server
-  drops it unless the view is schema-bound, 3729; see [DROP TABLE](drop-table.md)).
-- `sp_helptext` and `sp_refreshview` are not available (2812).
+- `DROP VIEW` of a view that another view reads is refused (error 50000); SQL Server drops it, and the other view
+  then fails with 208 when it is read.
+- `sp_helptext` is not available (2812).
 
 ## Examples
 
@@ -237,10 +248,10 @@ id bonus
 
 (2 rows affected)
 
-Msg 1054, Level 15, State 1, Line 1
+Msg 1054, Level 15, State 6, Line 1
 Syntax '*' is not allowed in schema-bound objects.
-Msg 50000, Level 16, State 1, Line 1
-cannot drop table pay because other objects depend on it
+Msg 3729, Level 16, State 1, Line 1
+Cannot DROP TABLE 'pay' because it is being referenced by object 'v_pay_bound'.
 ```
 
 ### G. Errors
@@ -254,6 +265,8 @@ CREATE VIEW dbo.v_bad AS SELECT nothere FROM dbo.emp;
 GO
 CREATE VIEW dbo.v_chk AS SELECT id FROM dbo.emp WITH CHECK OPTION;
 GO
+CREATE VIEW dbo.v_chk2 WITH CHECK OPTION AS SELECT id FROM dbo.emp;
+GO
 ```
 
 ```text
@@ -265,6 +278,80 @@ Msg 207, Level 16, State 1, Line 1
 Invalid column name 'nothere'.
 Msg 50000, Level 16, State 1, Line 1
 lexdb: WITH CHECK OPTION is not supported
+Msg 102, Level 15, State 1, Line 1
+Incorrect syntax near 'with'.
+```
+
+### H. sp_refreshview
+
+A `SELECT *` view reads the table's columns as they are when it is read. `sp_refreshview` makes the view again from its
+stored text.
+
+<!-- example: tsql -->
+```sql
+CREATE TABLE dbo.gadget (id int PRIMARY KEY, name nvarchar(20), price int);
+INSERT dbo.gadget VALUES (1, N'bolt', 5);
+GO
+CREATE VIEW dbo.v_gadget AS SELECT * FROM dbo.gadget;
+GO
+ALTER TABLE dbo.gadget DROP COLUMN price;
+GO
+SELECT * FROM dbo.v_gadget;
+GO
+EXEC sp_refreshview 'dbo.v_gadget';
+GO
+SELECT * FROM dbo.v_gadget;
+GO
+EXEC sp_refreshview 'dbo.gadget';
+GO
+```
+
+```text
+(1 row affected)
+
+Msg 4502, Level 16, State 1, Line 1
+View or function 'v_gadget' has more column names specified than columns defined.
+id name
+-- ----
+1  bolt
+
+(1 row affected)
+
+Msg 15165, Level 16, State 1, Line 1
+Could not find object 'dbo.gadget' or you do not have permission.
+```
+
+### I. What a schema-bound view refuses
+
+<!-- example: tsql -->
+```sql
+CREATE TABLE dbo.part (id int PRIMARY KEY, label nvarchar(20), qty int);
+GO
+CREATE VIEW dbo.v_part_plain AS SELECT id, label FROM dbo.part;
+GO
+CREATE VIEW dbo.v_part_bound WITH SCHEMABINDING AS SELECT id, qty FROM dbo.part;
+GO
+CREATE VIEW dbo.v_bad1 WITH SCHEMABINDING AS SELECT id FROM part;
+GO
+CREATE VIEW dbo.v_bad2 WITH SCHEMABINDING AS SELECT id FROM dbo.v_part_plain;
+GO
+ALTER TABLE dbo.part ALTER COLUMN qty bigint;
+GO
+ALTER TABLE dbo.part ALTER COLUMN label nvarchar(40);
+GO
+DROP TABLE dbo.part;
+GO
+```
+
+```text
+Msg 4512, Level 16, State 1, Line 1
+Cannot schema bind view 'v_bad1' because name 'part' is invalid for schema binding. Names must be in two-part format and an object cannot reference itself.
+Msg 4513, Level 16, State 1, Line 1
+Cannot schema bind view 'v_bad2'. 'dbo.v_part_plain' is not schema bound.
+Msg 5074, Level 16, State 1, Line 1
+The object 'v_part_bound' is dependent on column 'qty'.
+Msg 3729, Level 16, State 1, Line 1
+Cannot DROP TABLE 'part' because it is being referenced by object 'v_part_bound'.
 ```
 
 ## See also
