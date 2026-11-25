@@ -213,3 +213,64 @@ fifth term in `isVarKind` stopped the compiler folding the four into a bit test 
 - **Regions:** offsets only. `lexdb_time` has a zone registry by name (`zoneNamed`) but no table of ids, and a region is not kept in a row: `FROM_TZ(..., 'Europe/Berlin')`, `AT TIME ZONE
   'Europe/Berlin'`, a literal `... Europe/Berlin` and a session in a region keep the offset the region had at that instant (`TZR` shows `+01:00`, `TZD` is empty, `EXTRACT(TIMEZONE_REGION)` is
   `UNKNOWN`); Oracle shows `EUROPE/BERLIN`, `CET`, `Europe/Berlin`. (The plan: a negative offset field as an id into a table of region names, the name kept in the row.)
+
+
+## The third bug slice (2026-11-25)
+
+The bugs the documentation passes listed in KNOWN-ISSUES.md (found on main 55040a20 and 6c2e83f1), on `worktree-agent-a36938384ff7b1bdf` (from main 6c2e83f1, tags `b3-base` and
+`b3`). Each was checked on the product before and after (Oracle Free 23.26.3, SQL Server 2022, PostgreSQL 18.6). Tests: `tns_bugs3` (`gen_oracle.py --check tns_bugs3`: 91 answers, 0
+differences), `tns_logonzone`, `tds_bugs3` (`gen_mssql.py bugs3`), `tds_selectinto` (the same output against SQL Server with LEXDB_MSSQL), `wire_copyerr`.
+
+### Oracle
+- **The client's time zone at logon.** python-oracledb sends `ALTER SESSION SET TIME_ZONE='+05:30'` (its local offset, or ORA_SDTZ) and JDBC the JVM's zone (`Asia/Kolkata`) in AUTH_ALTER_SESSION;
+  the session started at +00:00. `lexdb_tns.logonZone` takes TIME_ZONE from it (`lexdb_oraadm.zoneSet`) as ALTER SESSION SET TIME_ZONE would, and makes it LOCAL's zone too (Oracle's `ALTER SESSION SET
+  TIME_ZONE = LOCAL` goes back to it). `+00:00` (lib/oracle) sets nothing; a zone lexdb's settings do not know leaves the session at +00:00 (Oracle refuses the logon). The other settings of the
+  statement (JDBC's NLS_LANGUAGE, NLS_TERRITORY) are not applied. lib/oracle sends +00:00 only, so the in-process test reads the statement's forms; the logon was checked with python-oracledb (TZ,
+  ORA_SDTZ) and ojdbc11 (`-Duser.timezone`).
+- **MIN and MAX of equal instants** (with the T-SQL door's): they kept the last equal value (PostgreSQL's numeric_smaller, right for numerics); a Val.Tsz keeps the first one read
+  (`lexdb_agg.takes`, row engine and batches, window functions through the row engine). "First" is the scan's order: Oracle's heap is the order rows were inserted, SQL Server's a clustered key's
+  or a heap's, lexdb's the primary key's or a keyless table's insertion order; they agree where those agree (a table filled in key order, a keyless one). An index's end is not used for MIN/MAX of
+  such a column (`lexdb_plan.minMax`): SQL Server reads an index on the column backwards for MAX alone (the last of equal keys), Oracle does not use it (its index is on SYS_EXTRACT_UTC). Found on the
+  way: an index-only scan of such a column gave the instant without its offset (the key holds the instant alone): `lexdb_access.idCode` refuses it.
+- **TIMESTAMP WITH LOCAL TIME ZONE on the wire** is type 231 in DBTIMEZONE (UTC), 11 bytes, its column's fractional digits (`lexdb_tns.localTz`: a column of Val.Tstz values, none with an offset);
+  it went as type 181 at +00:00. JDBC shows it in its session's zone (`2026-03-15 13:30:00.0 Asia/Kolkata`). Not done: after an ALTER SESSION SET TIME_ZONE in the session, Oracle tells JDBC the new zone
+  (a SYNC piggyback, message 23 opcode 5, after the call's reply) and lexdb does not, so JDBC still converts by the logon zone. A `timestamptz` cast in the Oracle door is one of these now (tns_client).
+- **A datetime plus an INTERVAL YEAR TO MONTH** whose day is not in the month is ORA-01839 (`lexdb_orafn.monthFits`): DATE, TIMESTAMP, TIMESTAMP WITH TIME ZONE, NUMTOYMINTERVAL; ADD_MONTHS
+  clamps as before. A TIMESTAMP WITH TIME ZONE moves in UTC, as Oracle's (`TIMESTAMP '2026-01-31 23:00:00 -05:00' + INTERVAL '1' MONTH` is 28 February 23:00 -05:00).
+- **OFFSET and LIMIT are names** where no clause follows (`lexdb_parse.oraWordNames`, after the Oracle door's lexing: the token is made a quoted name of its spelling unless a number, a bind, a
+  bracket or, for OFFSET, a word and ROW / ROWS follows): column aliases, column names (CREATE TABLE, INSERT, UPDATE), a table's alias, a CTE's name. `LIMIT n` stays lexdb's own.
+- **A view that calls a stored function** (a standalone one or a package's): CREATE VIEW was ORA-00904. `lexdb_plcall.viewMarked` keeps the calls after the view's text (`lexdb_sql.PLF_MARK`: the name as
+  written, the function's id, its type's OID; resolved as the maker sees them), `lexdb_exec.viewQuery` makes them lexdb_plcall's lookups when the view is read (`lexdb_routine.viewPlf`), and a statement
+  that read one and missed values computes them and runs again (`lexdb_tns.runPlan`, `lexdb_plcall.again`). A query that calls functions itself and reads such a view: its own sites and the view's
+  misses in the one loop. INSERT, UPDATE, DELETE and CREATE TABLE AS reading such a view are 0A000 (they would have to run twice). Found on the way: a cursor executed again (python-oracledb's
+  statement cache) after CREATE OR REPLACE FUNCTION ran the old body (the program is loaded at parse): it is loaded again before a run that calls a function.
+- **Annotations and ALTER:** a column annotation in CREATE TABLE AS is ORA-11559 (`colAnnotThenAs`); a column twice in ALTER TABLE ... MODIFY (...) ORA-00957; ALTER INDEX of no index ORA-01418;
+  ALTER TABLE of a view (ADD, ANNOTATIONS, RENAME TO: a view is renamed by `RENAME v TO w`, `Stmt.alter` marks that statement) and ALTER VIEW of a table ORA-00942; ALTER VIEW ... RENAME TO
+  ORA-00922. ALTER INDEX ... REBUILD [ONLINE], COALESCE, [NO]PARALLEL, [NO]LOGGING and ALTER VIEW ... COMPILE, [NON]EDITIONABLE are accepted and do nothing (as on a valid object). Still
+  ORA-03001 (their texts list what is taken): ALTER INDEX ... UNUSABLE (Oracle marks the index), ALTER VIEW ... READ ONLY (Oracle ORA-42310 for a view that is not an editioning view).
+
+### SQL Server
+- **The scale of a datetimeoffset result:** SWITCHOFFSET, TODATETIMEOFFSET and AT TIME ZONE give a datetimeoffset of their argument's digits (a datetime's 3), MIN and MAX keep a time type's (and
+  as window functions): `lexdb_syscat.timeScale` from `exprScale`. The Oracle door's MIN and MAX of a DATE are a DATE now (type 12; they were a TIMESTAMP), of a TIMESTAMP(3) a TIMESTAMP(3).
+  Still seven digits: the text of `CAST(x AS varchar)` (KNOWN-ISSUES' separate entry).
+- **SELECT ... INTO's DONE** has CurCmd 0xC2 (SELECT INTO), as SQL Server's: lexdb sent the count with CurCmd 0, which mssql-jdbc does not take as an update count (-1) and sqlcmd does not print.
+- **FORMAT's C** without a precision has no decimals for ja-JP, ko-KR, id-ID, es-CO, ja and ko (`NUMCULS`' eleventh field). The 61 cultures' C, C0, C3, N, P, F, D and E of 1234.5, -1234.5 and
+  0.125 were compared with SQL Server 2022: these were the only differences.
+- **A CHECK's text** in INFORMATION_SCHEMA.CHECK_CONSTRAINTS.CHECK_CLAUSE (it was PostgreSQL's) and sys.check_constraints.definition (half SQL Server's) is `lexdb_tsqldef.checkText`: [names],
+  (literals), comparisons and arithmetic without spaces (a + or - operand of a comparison in brackets, the rest by precedence), AND / OR / NOT / IS [NOT] NULL / LIKE in SQL Server's words and brackets,
+  IN as ORs in reverse order, BETWEEN as >= AND <=, CASE and functions in lower case. Different still: a CAST (SQL Server writes CONVERT([varchar](5),[a]); lexdb's cast is kept as what it became),
+  N'...' (the N is not kept), a system-named constraint's name (`b9_b_check`, SQL Server `CK__b9__b__412EB0B6`).
+
+### PostgreSQL
+- **COPY FROM STDIN's errors before CopyInResponse:** an unknown table, column or option and REJECT_LIMIT without ON_ERROR were already answered first (since the entry was written); an option given
+  twice (42601), FORCE_NOT_NULL / FORCE_NULL of no column (42703, `lexdb_copyjson.unknownCol`) or of one not copied (42P10, was 42703) and HEADER 2 were not: they asked for the data first, so psql took
+  a script's next lines as COPY data. Checked with a raw client against PostgreSQL 18.6 (`wire_copyerr`); a view as COPY's target is refused first by lexdb, after CopyInResponse by PostgreSQL.
+
+### Measured
+In process (`pts.lxl`, 20,000 statements, `LXL_HASH_SEED=1`, two rounds, base = main 6c2e83f1 built the same way, trees at paths of equal length): point select 101,816 against 101,816,
+UPDATE by key 55,312,600 / 55,312,600 (without a CHECK 55,310,902 / 55,310,902), INSERT 55,312,480 / 55,312,480 (without 55,309,781 / 55,309,781), both rounds. Over the wire (`icount6.sh`, 20,000 point
+selects x 3, base and branch alternated twice, a quiet machine): instructions 160,953 and 160,848 against 160,982 and 160,794, cycles 84,604 and 84,367 against 89,629 and 89,136, L1 i-cache misses
+376 and 381 against 276 and 275, iTLB misses 84 against 125, branch misses 320 against 383 (code placement: the instructions are level). TPC-H SF1, 22 queries, base and branch alternated
+twice, checksums equal on all 22, best of two: total 8,036 ms against 8,076 ms; q6 (+4.4%), q8, q9, q17 (+1.9%) and q12 (+1.5%) slower in time with the server's instructions per query equal
+(q6 1,528.2 M against 1,529.5 M, q9 13,492 M against 13,493 M, q12 3,887.5 M against 3,889.1 M; q8 and q17 fewer): placement and the runs' spread (q6's base runs 190.0 and 174.5 ms).
+lexdb_exec.lxl 21,492 lines before, 21,499 after.

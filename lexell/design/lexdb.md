@@ -13084,3 +13084,10 @@ ojdbc's second `executeUpdate()` of a PreparedStatement (an INSERT, UPDATE, DELE
 values alone, which `lexdb_tns.readRequest` took for no values (lexdb-oracle.md, "a cursor run again"). pgjdbc 42.7.14 (`prepareThreshold` 0, 1 and 5, past the switch to a server-side statement) and
 mssql-jdbc (sp_prepexec / sp_execute) re-execute INSERT, UPDATE, DELETE, SELECT and batches without a failure. Test `tns_reuse` (in process, with `tns.Execute.valuesOnly`), `OracleJdbc.reuse`
 (256 passed against lexdb, 259 against Oracle Free). Point select, INSERT and UPDATE by key: equal within the placement noise of any change to the TNS door's file (lexdb-oracle.md).
+
+### 9.145 The third bug slice (lexdb-robust.md, "The third bug slice")
+
+COPY FROM STDIN refuses an option given twice (42601), FORCE_NOT_NULL / FORCE_NULL of no column (42703) or of one not copied (42P10) and HEADER 2 before its CopyInResponse, as PostgreSQL 18
+does (`wire_copyerr`). The core's share of the slice's other doors: MIN and MAX keep the first of equal Val.Tsz instants (`lexdb_agg.takes`), an index-only scan does not read a Val.Tsz column
+from its key (the instant alone, `lexdb_access.idCode`), MIN and MAX keep a time type's scale in OutCol.scale, an Oracle view's calls of stored functions are kept after its text
+(`lexdb_sql.PLF_MARK`) and made lookups when it is read (`lexdb_routine.viewPlf`).
