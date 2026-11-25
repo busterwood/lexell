@@ -288,7 +288,9 @@ pub fn testHooks(): TestHooks {
                      setWriteLogMax: setWriteLogMax, chunkKey: chunkKey, upgradeCounts: upgradeCounts}
 }
 
-pub type Store = value record { sh: task.Shared[Db]; fo: Option[Follower]; pub memo: lexdb_memo.Memo; pub locks: lexdb_locks.Locks }
+// ro: the session refuses writes outside a transaction block (a replica's store; a session after SET SESSION CHARACTERISTICS AS TRANSACTION
+// READ ONLY, default_transaction_read_only: lexdb_exec.Session.setRoDefault); one flag so that the statement path tests it once.
+pub type Store = value record { sh: task.Shared[Db]; fo: Option[Follower]; pub memo: lexdb_memo.Memo; pub locks: lexdb_locks.Locks; pub ro: bool }
 
 // Another handle to the same store: its database, follower, memo and locks are shared (a Store is
 // a handle; clone, a copy, does not apply; design/consistency.md, finding 1).
@@ -297,7 +299,7 @@ pub fn (s: &Store) share(): Store {
         Some(f) { Some(f.share()) }
         None { None }
     }
-    return Store{sh: s.sh.share(), fo: fo, memo: s.memo.share(), locks: s.locks.share()}
+    return Store{sh: s.sh.share(), fo: fo, memo: s.memo.share(), locks: s.locks.share(), ro: s.ro}
 }
 
 // Which tree a transaction's reads see: the live tree, its snapshot, or a
@@ -6992,7 +6994,7 @@ fn openIn(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, split: bool, opts: Options): 
         db.trees.put(roots[i], s)
         i += 2
     }
-    let st = Store{sh: task.shared(db), fo: None, memo: lexdb_memo.newMemo(), locks: lexdb_locks.newLocks()}
+    let st = Store{sh: task.shared(db), fo: None, memo: lexdb_memo.newMemo(), locks: lexdb_locks.newLocks(), ro: false}
     try st.replay(&m)
     return Ok(st)
 }
@@ -7512,7 +7514,7 @@ pub fn (st: &Store) weakRef(): StoreRef { return StoreRef{sh: st.sh.weak(), memo
 // The master store (a primary: no follower of its own); it must still be open.
 fn (r: &StoreRef) store(): Store {
     match r.sh.upgrade() {
-        Some(sh) { return Store{sh: sh, fo: None, memo: r.memo.share(), locks: r.locks.share()} }
+        Some(sh) { return Store{sh: sh, fo: None, memo: r.memo.share(), locks: r.locks.share(), ro: false} }
         None { panic("lexdb: an in-process follower's master store was closed before it") }
     }
 }
@@ -8873,7 +8875,7 @@ fn openReplicaIn(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, split: bool, opts: Opt
     let m = lexdb_page.Meta{ckpt: 0, npages: 2, roots: 0, replaySeg: 1, replayOff: 0, replayBatch: 1, nextTree: lexdb_tmpstore.LOCAL_BASE,
                             dropped: 0, runs: 0, covers: -1}
     let db = newDb(fs, logFs, lexdb_disk.File.Real(-1, false), opts, &m)
-    return Ok(Store{sh: task.shared(db), fo: Some(fo), memo: lexdb_memo.newMemo(), locks: lexdb_locks.newLocks()})
+    return Ok(Store{sh: task.shared(db), fo: Some(fo), memo: lexdb_memo.newMemo(), locks: lexdb_locks.newLocks(), ro: true})
 }
 
 // A replica's follower.

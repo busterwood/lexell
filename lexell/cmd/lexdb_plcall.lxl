@@ -154,15 +154,98 @@ fn driverOfDml(t: &Stmt, args: &[]Expr): Stmt {
     return d
 }
 
-// A block of the query with its calls written, its subqueries' too; the calls found are added to plan.
-fn block(b: &Stmt, pg: &lexdb_plsql.Prog, ip: &lexdb_plsql.Ip, plan: mut &Plan, failure: mut &Option[DbErr]): Stmt {
+// A call's arguments without the parser's name => value marks (lexdb_parse: Oracle's #named), and their names ("" by position).
+pub fn unnamed(args: &[]Expr, names: mut &[]str): []Expr {
+    var out: []Expr = []
+    for a in args {
+        var nm = ""
+        var x = lexdb_sql.cloneExpr(&a)
+        match a {
+            Expr.Call(n, xs, star) {
+                if n == "#named" && len(xs) == 2 {
+                    match xs[0] {
+                        Expr.Lit(v) { match v { Val.Text(s) { nm = s.clone() } else {} } }
+                        else {}
+                    }
+                    x = lexdb_sql.cloneExpr(&xs[1])
+                }
+            }
+            else {}
+        }
+        append(names, nm)
+        append(mut &out, x)
+    }
+    return out
+}
+
+// The type families of a call's arguments in block b (lexdb_plsql.famOfOut: what a query of them over the block's FROM describes
+// them as; a bind's type ptypes'; 0 where it cannot tell, NULL's).
+fn argFams(b: &Stmt, args: &[]Expr, pg: &lexdb_plsql.Prog, ip: &lexdb_plsql.Ip, sess: mut &lexdb_exec.Session, ptypes: &[]int): []int {
+    var fams: []int = []
+    for a in args { append(mut &fams, 0) }
+    // (the calls of stored functions in it as the lookups they are run as, of their types)
+    let d = lexdb_routine.mapStmt(&driverOf(b, args), fn(x: &Expr): Option[Expr] {
+        match x {
+            Expr.Call(nm, xs, star) {
+                if star || len(nm) == 0 || nm[0] == '#' { return None }
+                match lexdb_plsql.findFunction(pg, ip, &nm) {
+                    Some(fi) {
+                        var ys: []Expr = [Expr.Lit(Val.Text(fi.id.clone()))]
+                        var ns: []str = []
+                        for y in unnamed(&xs, mut &ns) { append(mut &ys, y) }
+                        return Some(Expr.Cast(Expr.Call("#plf", ys, false), fi.ret.clone()))
+                    }
+                    None { return None }
+                }
+            }
+            else { return None }
+        }
+    })
+    match sess.describe(&d, ptypes) {
+        Ok(cols) {
+            if len(cols) == len(args) {
+                for k in 0..len(args) {
+                    var isNull = false
+                    match args[k] {
+                        Expr.Lit(v) { isNull = lexdb_ops.isNull(&v) }
+                        else {}
+                    }
+                    if !isNull { fams[k] = lexdb_plsql.famOfOut(&cols[k]) }
+                }
+            }
+        }
+        Err(_) {}
+    }
+    return fams
+}
+
+// A block of the query with its calls written, its subqueries' too; the calls found are added to plan. A call of an overloaded
+// function (a package's), or with arguments by name, is resolved by its arguments too (lexdb_plsql.findFunctionFor; their types:
+// argFams); others by name.
+fn block(b: &Stmt, pg: &lexdb_plsql.Prog, ip: &lexdb_plsql.Ip, sess: mut &lexdb_exec.Session, ptypes: &[]int, plan: mut &Plan, failure: mut &Option[DbErr]): Stmt {
     var found: []Site = []
     var argLists: [][]Expr = []
     var t = lexdb_routine.mapStmtTop(b, fn(x: &Expr): Option[Expr] {
         match x {
-            Expr.Call(nm, args, star) {
+            Expr.Call(nm, args0, star) {
                 if star || len(nm) == 0 || nm[0] == '#' { return None }
-                match lexdb_plsql.findFunction(pg, ip, &nm) {
+                var names2: []str = []
+                let args = unnamed(&args0, mut &names2)
+                var named = false
+                for n in names2 { if len(n) > 0 { named = true } }
+                var fo: Option[lexdb_plsql.FnInfo] = None
+                if named || lexdb_plsql.overloaded(pg, ip, &nm) {
+                    match lexdb_plsql.findFunctionFor(pg, ip, &nm, &names2, &argFams(b, &args, pg, ip, sess, ptypes)) {
+                        Ok(f) { fo = f }
+                        Err(e) {
+                            if failure.isNone() { failure = Some(e) }
+                            return None
+                        }
+                    }
+                } else {
+                    fo = lexdb_plsql.findFunction(pg, ip, &nm)
+                }
+                match fo {
                     Some(fi) {
                         for a in args {
                             if callsStored(&a, pg, ip, true) {
@@ -202,19 +285,20 @@ fn block(b: &Stmt, pg: &lexdb_plsql.Prog, ip: &lexdb_plsql.Ip, plan: mut &Plan, 
             append(mut &plan.sites, found[k].clone())
         }
     }
-    for i in 0..len(t.subs) { t.subs[i] = block(&t.subs[i], pg, ip, plan, failure) }
-    for i in 0..len(t.inner) { t.inner[i] = block(&t.inner[i], pg, ip, plan, failure) }
+    for i in 0..len(t.subs) { t.subs[i] = block(&t.subs[i], pg, ip, sess, ptypes, plan, failure) }
+    for i in 0..len(t.inner) { t.inner[i] = block(&t.inner[i], pg, ip, sess, ptypes, plan, failure) }
     return t
 }
 
 // The query with each call of a stored function written as a lookup, and what it takes to fill them; None when it calls none.
-pub fn rewrite(pg: &lexdb_plsql.Prog, ip: &lexdb_plsql.Ip, s: &Stmt): Result[Option[Rewritten], DbErr] {
+// ptypes: its binds' types (as known: an overloaded function's call is resolved by them).
+pub fn rewrite(pg: &lexdb_plsql.Prog, ip: &lexdb_plsql.Ip, sess: mut &lexdb_exec.Session, s: &Stmt, ptypes: &[]int): Result[Option[Rewritten], DbErr] {
     if !lexdb_plsql.hasUnits(pg) { return Ok(None) }
-    if s.kind == lexdb_sql.S_CREATE_VIEW { return viewMarked(pg, ip, s) }
+    if s.kind == lexdb_sql.S_CREATE_VIEW { return viewMarked(pg, ip, sess, s) }
     if s.kind != lexdb_sql.S_SELECT && s.kind != lexdb_sql.S_INSERT && s.kind != lexdb_sql.S_UPDATE && s.kind != lexdb_sql.S_DELETE && s.kind != lexdb_sql.S_MERGE && s.kind != lexdb_sql.S_CREATE { return Ok(None) }
     var plan = noPlan()
     var failure: Option[DbErr] = None
-    let t = block(s, pg, ip, mut &plan, mut &failure)
+    let t = block(s, pg, ip, sess, ptypes, mut &plan, mut &failure)
     match failure {
         Some(e) { return Err(e) }
         None {}
@@ -229,7 +313,7 @@ pub fn rewrite(pg: &lexdb_plsql.Prog, ip: &lexdb_plsql.Ip, s: &Stmt): Result[Opt
 // written, the function's id, its type's OID), so that where the view is read (lexdb_exec.viewQuery, lexdb_routine.viewPlf) they are
 // lexdb_plcall's lookups, and a query reading it computes them as it computes its own (missed, then run again: again). Resolved as the
 // view's maker sees them, as Oracle binds a view's names when it is made. USER_VIEWS.TEXT shows the query as written.
-fn viewMarked(pg: &lexdb_plsql.Prog, ip: &lexdb_plsql.Ip, s: &Stmt): Result[Option[Rewritten], DbErr] {
+fn viewMarked(pg: &lexdb_plsql.Prog, ip: &lexdb_plsql.Ip, sess: mut &lexdb_exec.Session, s: &Stmt): Result[Option[Rewritten], DbErr] {
     if !strings.startsWith(&s.index, lexdb_sql.ORA_VIEW) { return Ok(None) }
     let ss = match lexdb_parse.oraParse(&lexdb_sql.viewKept(&s.index)[len(lexdb_sql.ORA_VIEW)..len(lexdb_sql.viewKept(&s.index))]) {
         Ok(x) { x }
@@ -238,10 +322,18 @@ fn viewMarked(pg: &lexdb_plsql.Prog, ip: &lexdb_plsql.Ip, s: &Stmt): Result[Opti
     if len(ss) != 1 { return Ok(None) }
     var bad: Option[DbErr] = None
     var ents: []str = []
+    var special = false
     let y = lexdb_routine.mapStmt(&ss[0], fn(x: &Expr): Option[Expr] {
         match x {
             Expr.Call(nm, args, star) {
                 if star || len(nm) == 0 || nm[0] == '#' { return None }
+                if lexdb_plsql.overloaded(pg, ip, &nm) { special = true }
+                for a in args {
+                    match a {
+                        Expr.Call(an, _, _) { if an == "#named" { special = true } }
+                        else {}
+                    }
+                }
                 match lexdb_plsql.findFunction(pg, ip, &nm) {
                     Some(fi) {
                         let e = nm + "\x01" + fi.id + "\x01" + fi.oid.toStr()
@@ -260,10 +352,82 @@ fn viewMarked(pg: &lexdb_plsql.Prog, ip: &lexdb_plsql.Ip, s: &Stmt): Result[Opti
         Some(e) { return Err(e) }       // (a view over a function stored with compilation errors is not made: ORA-06575)
         None {}
     }
+    if special { ents = try specialEnts(pg, ip, sess, &ss[0]) }
     if len(ents) == 0 { return Ok(None) }
     var v = s.clone()
     v.index = lexdb_sql.viewKept(&s.index) + lexdb_sql.PLF_MARK + strings.join(&ents, "\x02")
     return Ok(Some(Rewritten{stmt: v, plan: noPlan()}))
+}
+
+// The kept calls of a view whose query calls an overloaded function or names arguments: each such call resolved where it is (by
+// block, as a query's), kept as the n-th call of its name ("\x03" and n after the name, from 0: lexdb_routine.viewPlf reads them in the
+// same order); the others as before, by name.
+fn specialEnts(pg: &lexdb_plsql.Prog, ip: &lexdb_plsql.Ip, sess: mut &lexdb_exec.Session, q: &Stmt): Result[[]str, DbErr] {
+    var plan = noPlan()
+    var failure: Option[DbErr] = None
+    let t = block(q, pg, ip, sess, &[], mut &plan, mut &failure)
+    match failure {
+        Some(e) { return Err(e) }
+        None {}
+    }
+    var ids: []str = []
+    var oids: []int = []
+    let y = lexdb_routine.mapStmt(&t, fn(x: &Expr): Option[Expr] {
+        match x {
+            Expr.Cast(c, ty) {
+                match c {
+                    Expr.Call(nm, xs, _) {
+                        if nm == "#plf" && len(xs) > 0 {
+                            match xs[0] {
+                                Expr.Lit(v) {
+                                    match v {
+                                        Val.Text(id) {
+                                            append(mut &ids, id.clone())
+                                            append(mut &oids, ty.oid)
+                                        }
+                                        else {}
+                                    }
+                                }
+                                else {}
+                            }
+                            return Some(lexdb_sql.cloneExpr(x))
+                        }
+                    }
+                    else {}
+                }
+            }
+            else {}
+        }
+        return None
+    })
+    var names: []str = []
+    let z = lexdb_routine.mapStmt(q, fn(x: &Expr): Option[Expr] {
+        match x {
+            Expr.Call(nm, args, star) {
+                if star || len(nm) == 0 || nm[0] == '#' { return None }
+                if lexdb_plsql.findFunction(pg, ip, &nm).isSome() || lexdb_plsql.overloaded(pg, ip, &nm) {
+                    append(mut &names, nm.clone())
+                    return Some(lexdb_sql.cloneExpr(x))
+                }
+            }
+            else {}
+        }
+        return None
+    })
+    if len(names) != len(ids) { return Err(err("0A000", "lexdb: a view's calls of overloaded stored functions in this form are not supported")) }
+    var ents: []str = []
+    for k in 0..len(ids) {
+        var e = names[k] + "\x01" + ids[k] + "\x01" + oids[k].toStr()
+        if strings.indexOf(&ids[k], "\x03", 0) >= 0 || strings.indexOf(&ids[k], "\x04", 0) >= 0 {
+            var n = 0
+            for j in 0..k { if names[j] == names[k] { n += 1 } }
+            e = names[k] + "\x03" + n.toStr() + "\x01" + ids[k] + "\x01" + oids[k].toStr()
+        }
+        var seen = false
+        for x in ents { if x == e { seen = true } }
+        if !seen { append(mut &ents, e) }
+    }
+    return Ok(ents)
 }
 
 // A query that read a view calling stored functions missed their values (misses, lexdb_exec.Session.plfMisses): they are computed
@@ -380,7 +544,7 @@ pub fn run(pg: &lexdb_plsql.Prog, ip: mut &lexdb_plsql.Ip, sess: mut &lexdb_exec
 pub fn runNested(pg: &lexdb_plsql.Prog, ip: mut &lexdb_plsql.Ip, sess: mut &lexdb_exec.Session, u: &lexdb_plsql.PUnit, fr: mut &lexdb_plsql.Fr,
                  stmt: &Stmt, params: &[]Val, ptypes: &[]int): Result[Option[lexdb_exec.Res], DbErr] {
     if !lexdb_plsql.hasUnits(pg) { return Ok(None) }
-    match try rewrite(pg, ip, stmt) {
+    match try rewrite(pg, ip, sess, stmt, ptypes) {
         None { return Ok(None) }
         Some(x0) {
             var x = x0

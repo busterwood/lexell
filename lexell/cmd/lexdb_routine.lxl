@@ -359,7 +359,8 @@ pub fn viewPlf(q: Stmt, text: &str): Stmt {
         for p in strings.split(e, "\x01") { append(mut &f, p.toStr()) }
         if len(f) == 3 { append(mut &ents, f) }
     }
-    return mapStmt(&q, fn(x: &Expr): Option[Expr] { return plfOf(x, &ents) })
+    var seen: []str = []
+    return mapStmt(&q, fn(x: &Expr): Option[Expr] { return plfOf(x, &ents, mut &seen) })
 }
 
 // What an Oracle view's kept calls of stored functions find (their source, lexdb_plsql's "\x02src\x00" catalog entries: a standalone
@@ -422,17 +423,34 @@ fn srcValid(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, owner: &str, kind
     }
 }
 
-fn plfOf(x: &Expr, ents: &[][]str): Option[Expr] {
+// A call's lookup by the view's kept calls: the n-th call of a name (seen: the names of the calls met so far, in order) is the entry
+// of the name and n where there is one (lexdb_plcall.specialEnts: an overloaded function's, or one with arguments by name), else the
+// name's; its arguments without their names (#named).
+fn plfOf(x: &Expr, ents: &[][]str, seen: mut &[]str): Option[Expr] {
     match x {
         Expr.Call(nm, args, star) {
             if star || len(nm) == 0 || nm[0] == '#' { return None }
-            for f in ents {
-                if f[0] != nm { continue }
-                var xs: []Expr = [Expr.Lit(Val.Text(f[1].clone()))]
-                for a in args { append(mut &xs, mapE(&a, fn(y: &Expr): Option[Expr] { return plfOf(y, ents) })) }
-                return Some(Expr.Cast(Expr.Call("#plf", xs, false), lexdb_sql.oidType(strings.parseIntOpt(&f[2]).unwrapOr(lexdb_sql.OID_TEXT))))
+            var n = 0
+            for s in seen { if s == nm { n += 1 } }
+            let at = nm + "\x03" + n.toStr()
+            var pick = -1
+            for k in 0..len(ents) {
+                if ents[k][0] == at { pick = k }
+                else if pick < 0 && ents[k][0] == nm { pick = k }
             }
-            return None
+            if pick < 0 { return None }
+            append(seen, nm.clone())
+            let f = &ents[pick]
+            var xs: []Expr = [Expr.Lit(Val.Text(f[1].clone()))]
+            for a0 in args {
+                var a = lexdb_sql.cloneExpr(&a0)
+                match a0 {
+                    Expr.Call(an, ys, _) { if an == "#named" && len(ys) == 2 { a = lexdb_sql.cloneExpr(&ys[1]) } }
+                    else {}
+                }
+                append(mut &xs, mapE(&a, fn(y: &Expr): Option[Expr] { return plfOf(y, ents, seen) }))
+            }
+            return Some(Expr.Cast(Expr.Call("#plf", xs, false), lexdb_sql.oidType(strings.parseIntOpt(&f[2]).unwrapOr(lexdb_sql.OID_TEXT))))
         }
         else { return None }
     }
