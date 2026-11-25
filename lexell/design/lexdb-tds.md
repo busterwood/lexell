@@ -1267,3 +1267,8 @@ assertion's CHECK_CONSTRAINTS row; no sys.objects row (no type for one: SSMS, sp
   written.
 - INFORMATION_SCHEMA.DOMAINS and COLUMN_PRIVILEGES exist (no rows: lexdb has no alias types and no grants on columns); SCHEMATA and sys.schemas give a schema's
   AUTHORIZATION owner. Test `tds_bugs7`.
+
+## As built: the eighth bug slice (lexdb-robust.md, 2026-11-25)
+
+- 159 has severity 15; 4512 (found parsing) and 2010 name the object as written; ALTER VIEW of a missing view is 208 state 6; INFORMATION_SCHEMA.DOMAINS lists the table types
+  (alias types, `CREATE TYPE ... FROM`, are not supported). Test `tds_bugs8`.

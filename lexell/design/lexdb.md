@@ -13130,3 +13130,9 @@ position in the T-SQL door, by name in the others); an assertion's check of rows
 values (`lexdb_assert.goneVals`, with `Store.beforeMark` and `Txn.changedKeys`: a key's value before a statement's mark). The PostgreSQL door: DROP TABLE's DETAIL names the
 foreign keys on the table, `SET TRANSACTION READ ONLY` and `READ WRITE` take effect (`lexdb_txmode`), the same isolation level is taken after the first query;
 `information_schema.domains` and `column_privileges` exist (`exec_bugs7`, `exec_bugs7d`).
+
+### 9.151 The eighth bug slice (lexdb-robust.md, "The eighth bug slice")
+
+The core's share: `Store.ro` (a replica's store, or a PostgreSQL session whose default is read-only) in `execStmt`, with `Txn.inBlock` telling a block from a statement alone;
+`Session.roDefault` and `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY | READ WRITE`, `SET default_transaction_read_only`; the package overloads (Oracle) in `lexdb_plsql` and
+`lexdb_plcall`; T-SQL texts and DOMAINS (`exec_bugs8`, `tns_bugs8`, `tds_bugs8`).

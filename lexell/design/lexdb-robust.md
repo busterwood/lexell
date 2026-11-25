@@ -569,3 +569,64 @@ no code of the slice is on the point path). TPC-H SF1, 22 queries, base and bran
 slower (the most: q18 +1.2%, q12 +0.7%). A database made by the base binary in all three doors, opened by the branch's: its stored function with nested overloads answers right
 (18, was 3), its SELECT * views keep their columns, a schema's AUTHORIZATION owner shows, its NOVALIDATE assertion takes a DELETE that breaks nothing. Suite 407 passed;
 replica.py passed. lexdb_exec.lxl 22,621 lines before, 22,625 after (the import of lexdb_txmode, the calls of `narrowed` and `setReadOnly`).
+
+## The eighth bug slice (2026-11-25)
+
+The next bugs KNOWN-ISSUES.md listed, on `worktree-agent-a3bf8564ec41fb442` (from main 1287c4f6, tags `b8-base` and `b8`). Each was checked on the product before and after
+(Oracle Free 23.26.3, SQL Server 2022, PostgreSQL 18). Tests: `tns_bugs8` (`gen_oracle.py --check tns_bugs8`), `tds_bugs8` (`gen_mssql.py bugs8`), `exec_bugs8`
+(`gen_pg.py bugs8`).
+
+### Oracle: a package's overloaded members (item 1)
+- The cause: a package's members were found by name (`Prog.find`, `Cx.sigOf`, the SQL call path), so the first declared answered every call, silently (`sq(varchar2)` first: `pko.sq(4)`
+  was 1; `sq(number)` first: `pko.sq('abc')` was ORA-06502).
+- Each member records its number among the package's subprograms of its name (`PUnit.ovl`, `SigEntry.ovl`; the specification's first, then the body's own); a body's member is its
+  specification's by kind, parameter types **and names** (`sigIndex`: Oracle needs the names to match, and two members that differ in names only are overloads). `Cx.overload` serves
+  package members as it serves nested subprograms (the candidates are the package's members of the name that the caller sees; `pickOf`: the ones that take each argument in its own
+  family, else by conversion; PLS-00306 / PLS-00307 at the call's name); the unit a call resolved to is kept with the overload's number (`canonOf`: five names; `Prog.findC`).
+- `famConv`, the implicit conversions overload resolution may use, is now Oracle's, probed on Oracle Free: a number converts to and from text (and float), a DATE or TIMESTAMP to and
+  from text and each other, text to any scalar, a RAW to and from text; not number to date, number to timestamp, date to number (before, every scalar to every scalar: `tw(nvl(d, date))`
+  was ambiguous, Oracle takes the `varchar2` member).
+- From SQL (`lexdb_plcall.block`): a call of an overloaded function, or with arguments by name, is resolved by its arguments' types. They are what a query of them over the block's
+  FROM describes them as (`argFams`: a column's, a literal's, an expression's; a bind's the type the client described, `bindOids`; NULL fits any), then `findFunctionFor` picks;
+  none or more than one fit is ORA-06553 with PLS-306 / PLS-307, as Oracle's SQL says (`sqlError` also turns a block's ORA-06550 of that into it). The id of the lookup carries the
+  overload's number (`\x03`) and the arguments' names (`\x04`); `callFunction` runs the block with `Ip.pin` set so that the block's call is to that one. An OCI cursor prepared with
+  binds of other types than the last execute's is prepared again (`Cursor.pbt`). Standalone functions with arguments by name (`f(x => 1)`) go through the same path; the parser keeps
+  Oracle's `name => value` of `f(...)` and of `schema.f(...)` as `#named` marks (`oraNamed`).
+- A view over such a call keeps the overload resolved at CREATE VIEW (`specialEnts`: the n-th call of a name in its query, `lexdb_routine.plfOf`); a view made before this change
+  keeps its calls by name, and a call of an overloaded name without a number (`unpinnedOvl`) is resolved by its argument values' families at run time, refused (PLS-307) where those
+  cannot tell. A package compiled before the change is compiled again as always (its source is what is stored): the same overload numbers.
+- Not done, refused: an aggregate or another stored function as an argument of a stored function in SQL (ORA-03001, as for any stored function); an overloaded call in a correlated
+  subquery whose arguments are the outer query's columns (PLS-307: the arguments cannot be described alone). Found, not changed: an implicit DATE to text conversion in a call
+  shows lexdb's `2020-01-01 00:00:00`, Oracle's `01-JAN-20` (NLS_DATE_FORMAT).
+
+### SQL Server: severity, names, ALTER VIEW, DOMAINS (item 2)
+- 159 has severity 15 (`sqlClass`). 4512 of a CREATE VIEW found parsing it and 2010 name the object as the statement wrote it (`dbo.v_bad1`, `[dbo].[V_Bad3]` as `dbo.V_Bad3`;
+  `lexdb_tsqlname`; 4512's parse-time error before had no text to look in). ALTER VIEW of a missing view is 208 state 6 (`lexdb_tsqlerr.translate`).
+- INFORMATION_SCHEMA.DOMAINS lists the table types (`data_type` `table type`, schema dbo). Not done: **alias types** (`CREATE TYPE t FROM int`) are a syntax error (156): they need
+  a type that columns, parameters and variables take (resolved at CREATE TABLE and at each call), `sys.types`, `sys.columns.user_type_id` and DOMAINS' rows with the base type's
+  precision, length and collation (SQL Server lists `tt_str` with `varchar`, 20, its collation and `iso_1`): a feature of its own, more than this slice.
+
+### Oracle: positions of PLS errors (item 3)
+- The ORA-06550 of PLS-00306 and PLS-00307 points at the call's name, the first part of a qualified one (a function's, a procedure's, in a block and in USER_ERRORS), and
+  "Statement ignored" at the statement, as Oracle's (the column was the first argument's). PLS-00231's positions were right. A repeated named argument is PLS-00703 (it was
+  accepted); USER_ERRORS gives its second row (`lexdb_oracat`).
+
+### PostgreSQL: SET SESSION CHARACTERISTICS, schema owners (item 4)
+- `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY | READ WRITE`, `SET default_transaction_read_only = on | off` and `RESET` set the session's default (`Session.roDefault`; the
+  parser gives them one statement). Later transactions are read-only: a block (`BEGIN` takes `s.readOnly` from it; `BEGIN READ WRITE` and `SET TRANSACTION READ WRITE` before the
+  first query override it), and a statement alone: 25006 `cannot execute INSERT in a read-only transaction`, a temporary table's writes apart (`roDefaultRefuses`). An isolation level
+  alone leaves it. `SHOW default_transaction_read_only` and `transaction_read_only` say on.
+- The statement alone is refused where the replica's writes are (`execStmt`): `Store.ro` stands where `st.follower().isSome()` was, true for a replica's store and for a session whose
+  default is read-only (a block is told by `Txn.inBlock`), so the statement path has one test, as before, and no new field in a transaction. Not done: the setting is not undone when a
+  block that set it rolls back (`default_transaction_isolation`'s is); pgwire reports no ParameterStatus for it (PostgreSQL does not either).
+- information_schema.schemata's `schema_owner` is a schema's AUTHORIZATION owner (`pg_namespace`'s, as before). Found, not changed: `CREATE SCHEMA s AUTHORIZATION x CREATE TABLE ...`
+  (schema elements) is 42601.
+
+### Measured
+In process (`pt.lxl`, 20,000 statements, `LXL_HASH_SEED=1`, two rounds, base = main 1287c4f6 built the same way, trees at paths of equal length), the same in both rounds: point
+select 25,190.5 base, 25,168.5 branch; INSERT 125,178.5 / 125,148.5; UPDATE by key 130,794.4 / 130,764.4; as text 102,638.3 / 102,616.3, 178,686.3 / 178,682.3, 214,708.1 / 214,704.1;
+in a transaction block INSERT 11,670.3 / 11,640.3, UPDATE 23,121.1 / 23,091.1 (lower: one flag test stands where the follower's was). Over the wire (`icount6.sh`, base and branch
+alternated twice): instructions 151,514 and 151,496 against 151,685 and 151,558, cycles 82,446 and 83,008 against 85,436 and 83,414, L1 i-cache misses 247 and 250 against 286 and 288
+(the layout; the server's hash seed is not fixed there). A database made by the base binary in the three doors, opened by the branch's: a package with overloads and views over it (a
+view made by the base answers as before, 4), a table type listed in DOMAINS, a schema's AUTHORIZATION owner. Suite 413 passed; replica.py passed. lexdb_exec.lxl 22,976 lines before,
+22,999 after.
