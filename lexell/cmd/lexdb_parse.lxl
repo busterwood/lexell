@@ -12072,14 +12072,48 @@ fn (p: mut &P) jsonArrayExpr(): Result[Expr, lexdb_base.DbErr] {
 fn (p: mut &P) jsonArraySub(): Result[Expr, lexdb_base.DbErr] {
     p.depth += 1
     let saved = replace(mut &p.subs, [])
-    let inner = try p.subquery(SUB_FROM)
-    // Note: subquery() consumed the closing ')' of JSON_ARRAY(SELECT ...), OR wait: what if ABSENT/NULL ON NULL / RETURNING follows?
-    // Handle both JSON_ARRAY(SELECT ...) and JSON_ARRAY((SELECT ...) NULL ON NULL RETURNING jsonb) cleanly!
+    let savedW = replace(mut &p.wins, [])
+    var nCte = 0
+    if p.acceptKw("with") { nCte = try p.withList() }
+    var sub = lexdb_sql.newStmt(S_SELECT)
+    if p.acceptKw("select") {
+        sub = try p.select()
+    } else if p.parenQuery() {
+        sub = try p.parenSelect()
+    } else {
+        return Err(near(&p.peek()))
+    }
+    sub.subs = replace(mut &p.subs, [])
+    sub.wins = replace(mut &p.wins, [])
+    sub.use = SUB_FROM
+    if nCte > 0 { p.popCtes(nCte) }
+    var absent = 1
+    var ret: Option[TypeName] = None
+    while !p.isKw(")") {
+        if p.isKw("null") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "on" {
+            p.pos += 2; try p.expectKw("null"); absent = 0; continue
+        }
+        if p.isKw("absent") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "on" {
+            p.pos += 2; try p.expectKw("null"); absent = 1; continue
+        }
+        if p.isKw("returning") { ret = try p.parseJsonReturning(); continue }
+        break
+    }
+    try p.expectKw(")")
+    append(mut &p.subs, sub)
+    let inner = len(p.subs) - 1
+    let isJsonb = match ret { Some(t) { t.oid == OID_JSONB } None { false } }
+    let aggName = if isJsonb { if absent == 0 { "jsonb_arrayagg_null" } else { "jsonb_arrayagg" } }
+                  else { if absent == 0 { "json_arrayagg_null" } else { "json_arrayagg" } }
+    let emptyOid = if isJsonb { OID_JSONB } else { OID_JSON }
     var w = lexdb_sql.newStmt(S_SELECT)
     append(mut &w.from, FromItem{table: "", alias: "#jarr", join: J_FIRST, on: None, sub: inner, cols: ["#a"], work: -1, lateral: false, using: [], natural: false, comma: false})
-    let agg = Expr.Call("json_arrayagg", [Expr.Col("#jarr.#a", -1)], false)
-    append(mut &w.items, SelItem{star: false, qual: "", expr: Some(Expr.Call("coalesce", [agg, Expr.Cast(Expr.Lit(Val.Text("[]")), TypeName{kind: K_JSON, oid: OID_JSON, prec: 0, scale: 0, len: 0})], false)), alias: "json_array", spell: ""})
+    let agg = Expr.Call(aggName, [Expr.Col("#jarr.#a", -1)], false)
+    let coal = Expr.Call("coalesce", [agg, Expr.Cast(Expr.Lit(Val.Text("[]")), TypeName{kind: K_JSON, oid: emptyOid, prec: 0, scale: 0, len: 0})], false)
+    let outExpr = match ret { Some(ty) { Expr.Cast(coal, ty) } None { coal } }
+    append(mut &w.items, SelItem{star: false, qual: "", expr: Some(outExpr), alias: "json_array", spell: ""})
     w.subs = replace(mut &p.subs, saved)
+    w.wins = replace(mut &p.wins, savedW)
     w.use = SUB_SCALAR
     p.depth -= 1
     append(mut &p.subs, w)

@@ -150,10 +150,33 @@ fn scanUnique(s: &str, pos: mut &int, depth: int): Result[bool, DbErr] {
     return Ok(true)
 }
 
-// Validates RFC 8259 JSON text; for jsonb returns canonical sorted-key form, for json returns input unchanged.
+// Validates RFC 8259 JSON text; for jsonb returns canonical sorted-key form (rejecting \u0000), for json returns input unchanged.
+fn hasNul(j: &J): bool {
+    match j {
+        J.Str(s) {
+            for i in 0..len(s) { if s[i] == 0 { return true } }
+            return false
+        }
+        J.Arr(_) {
+            for el in j.items() { if hasNul(&el) { return true } }
+            return false
+        }
+        J.Obj(_) {
+            for k in j.keys() {
+                for i in 0..len(k) { if k[i] == 0 { return true } }
+                let v = j.field(&k)
+                if hasNul(&v) { return true }
+            }
+            return false
+        }
+        else { return false }
+    }
+}
+
 pub fn validate(s: &str, jsonb: bool): Result[str, DbErr] {
     match json.parse(s) {
         Ok(j) {
+            if jsonb && hasNul(&j) { return Err(e("22P05", "unsupported Unicode escape sequence: \\u0000 cannot be converted to text")) }
             if !jsonb { return Ok(s.toStr()) }
             return Ok(formatJsonb(&j))
         }
@@ -163,7 +186,10 @@ pub fn validate(s: &str, jsonb: bool): Result[str, DbErr] {
 
 pub fn parse(s: &str, jsonb: bool): Result[J, DbErr] {
     match json.parse(s) {
-        Ok(j) { return Ok(j) }
+        Ok(j) {
+            if jsonb && hasNul(&j) { return Err(e("22P05", "unsupported Unicode escape sequence: \\u0000 cannot be converted to text")) }
+            return Ok(j)
+        }
         Err(_) { return Err(badJson(s, jsonb)) }
     }
 }
@@ -288,6 +314,78 @@ pub fn jsonbCmp(a: &str, b: &str): int {
         return cmpJsonVal(&xa, &xb)
     }
     return a.cmp(b)
+}
+
+fn appendU32BE(b: mut &str, n: int) {
+    b.addByte(byte((n >> 24) & 0xff))
+    b.addByte(byte((n >> 16) & 0xff))
+    b.addByte(byte((n >> 8) & 0xff))
+    b.addByte(byte(n & 0xff))
+}
+
+fn appendStrKey(b: mut &str, s: &str) {
+    for i in 0..len(s) {
+        let c = s[i]
+        if c == 0 { b.addByte(byte(0)); b.addByte(byte(1)) }
+        else { b.addByte(c) }
+    }
+    b.addByte(byte(0))
+    b.addByte(byte(0))
+}
+
+fn appendNumKey(b: mut &str, f0: float) {
+    let f = if f0 == 0.0f { 0.0f } else { f0 }
+    let bits = math.bitsOf(f)
+    // IEEE-754 order-preserving 64-bit unsigned encoding
+    let u = if bits < 0 { ~bits } else { bits ^ (1 << 63) }
+    for sh in [56, 48, 40, 32, 24, 16, 8, 0] {
+        b.addByte(byte((u >> sh) & 0xff))
+    }
+}
+
+fn writeSortKey(b: mut &str, j: &J) {
+    match j {
+        J.Null { b.addByte(byte(1)) }
+        J.Str(s) {
+            b.addByte(byte(2))
+            appendStrKey(b, &s)
+        }
+        J.Num(n) {
+            b.addByte(byte(3))
+            appendNumKey(b, n.toFloat())
+        }
+        J.Bool(v) {
+            b.addByte(byte(4))
+            b.addByte(if v { byte(1) } else { byte(0) })
+        }
+        J.Arr(_) {
+            b.addByte(byte(5))
+            let xs = j.items()
+            appendU32BE(b, len(xs))
+            for el in xs { writeSortKey(b, &el) }
+        }
+        J.Obj(_) {
+            b.addByte(byte(6))
+            var ks = j.keys()
+            sortKeysJsonb(mut &ks)
+            appendU32BE(b, len(ks))
+            for k in ks {
+                appendU32BE(b, len(k))
+                b += &k
+                let v = j.field(&k)
+                writeSortKey(b, &v)
+            }
+        }
+    }
+}
+
+// Byte-sortable key for PostgreSQL jsonb total order (used by ORDER BY on jsonb).
+pub fn jsonbSortKey(v: &Val): Result[Val, DbErr] {
+    if isNullVal(v) { return Ok(Val.Null) }
+    let j = try parse(&lexdb_sql.text(v), true)
+    var b = ""
+    writeSortKey(mut &b, &j)
+    return Ok(Val.Text(b))
 }
 
 pub fn jsonEqual(a: &str, b: &str): Result[bool, DbErr] {

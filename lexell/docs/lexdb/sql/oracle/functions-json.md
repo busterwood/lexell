@@ -67,6 +67,26 @@ FROM jdocs
 WHERE id = 1;
 ```
 
+```text
+Table created.
+
+1 row created.
+
+1 row created.
+
+ID NM  SC
+-- --- --
+ 1 Ann 90
+
+1 row selected.
+
+UPDATED
+-------------------------------------------------
+{"name":"Ann","score":95,"tags":["x","y","vip"]}
+
+1 row selected.
+```
+
 ### B. `JSON_TABLE` with `NESTED PATH`
 
 <!-- example: oracle -->
@@ -79,6 +99,16 @@ FROM jdocs d,
        NESTED PATH '$.tags[*]' COLUMNS (tag VARCHAR2(10) PATH '$')
      )) jt
 ORDER BY d.id, jt.tag;
+```
+
+```text
+ID ORD NM  TAG
+-- --- --- ---
+ 1   1 Ann x
+ 1   1 Ann y
+ 2   1 Bob z
+
+3 rows selected.
 ```
 
 ## See also

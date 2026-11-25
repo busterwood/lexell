@@ -38,6 +38,23 @@
 // expect: json_table_lat: 1|v|10;2|w|20
 // expect: err_uniq: ERR:22030
 // expect: err_null_key: ERR:22004
+// expect: jb_order: null;"a";"b";-5;2;10;false;true;[99];[1, 2];{};{"a": 1};{"a": 1, "b": 2}
+// expect: nul_char: ERR:22P05
+// expect: null_vs_jnull: f|t|t|null|NULL|t
+// expect: json_arrows: 1|1|x|y
+// expect: set_ins_edge: {"a": 1}|[1, 2, 99]|{"a": null}|NULL|{"a": 1}|[10, 20]
+// expect: jpath_adv: ["Apple"]|[30, 40]|[1, 2]|4|NULL
+// expect: jpath_strict_err: ERR:2203A
+// expect: jarr_sub_mod: [1, null, 2]
+// expect: agg_filter_win: [1,3]
+// expect: agg_over: 1|[1,2];2|[1,2];3|[3]
+// expect: catalog_meta: j|json|json;jb|jsonb|jsonb
+// expect: fmt_typeof: json|jsonb|json|jsonb
+// expect: ddl_ok: 1|ann
+// expect: ddl_bad_chk: ERR:23514
+// expect: ddl_def: 3|{}|NULL
+// expect: ddl_idx: 1|ann
+// expect: pgbin: {"a":1}|{"a": 1}|22P03|t
 import "strings"
 import "../../../cmd/lexdb_base"
 import "../../../cmd/lexdb_store"
@@ -45,6 +62,9 @@ import "../../../cmd/lexdb_disk"
 import "../../../cmd/lexdb_exec"
 import "../../../cmd/lexdb_ops"
 import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_bind"
+import "../../../cmd/lexdb_pgbin"
+import "../../../cmd/lexdb_time"
 
 fn q(s: mut &lexdb_exec.Session, sql: &str): str {
     match s.exec(sql) {
@@ -138,6 +158,40 @@ fn main() {
         // Errors
         checkBoth(mut &s, &"err_uniq", &"select json_object('a': 1, 'a': 2 with unique keys)")
         checkBoth(mut &s, &"err_null_key", &"select json_build_object(null, 1)")
+
+        // Edge cases: ORDER BY jsonb total order, \u0000 rejection, SQL NULL vs JSON null, json (non-jsonb) arrows,
+        // jsonb_set/insert/del edge cases, advanced JSONPath, JSON_ARRAY(SELECT ... RETURNING), aggregates with FILTER & OVER,
+        // DDL/indexes/views/generated columns/catalog/prepared params, and PG binary wire format (0x01 prefix for jsonb).
+        checkBoth(mut &s, &"jb_order", &"select v from (values ('{}'::jsonb), ('{\"a\":1,\"b\":2}'::jsonb), ('{\"a\":1}'::jsonb), ('[1,2]'::jsonb), ('[99]'::jsonb), ('true'::jsonb), ('false'::jsonb), ('10'::jsonb), ('2'::jsonb), ('-5'::jsonb), ('\"b\"'::jsonb), ('\"a\"'::jsonb), ('null'::jsonb)) as t(v) order by v")
+        checkBoth(mut &s, &"nul_char", &"select '\"a\\u0000b\"'::jsonb")
+        checkBoth(mut &s, &"null_vs_jnull", &"select ('{\"a\":null}'::jsonb -> 'a') is null, ('{\"a\":null}'::jsonb ->> 'a') is null, ('{\"a\":1}'::jsonb -> 'missing') is null, jsonb_typeof('null'::jsonb), jsonb_typeof(null::jsonb), json_value('{\"a\":null}', '$.a') is null")
+        checkBoth(mut &s, &"json_arrows", &"select j -> 'a', j ->> 'a', j -> 'tags' ->> 0, j #>> '{tags,1}' from docs where id = 1")
+        checkBoth(mut &s, &"set_ins_edge", &"select jsonb_set('{\"a\":1}'::jsonb, '{b}', '2'::jsonb, false), jsonb_set('[1,2,3]'::jsonb, '{-1}', '99'::jsonb), jsonb_set('{\"a\":1}'::jsonb, '{a}', 'null'::jsonb), jsonb_set('{\"a\":1}'::jsonb, '{a}', null), jsonb_insert('{\"a\":1}'::jsonb, '{a}', '2'::jsonb), '[10,20,30]'::jsonb - -1")
+        checkBoth(mut &s, &"jpath_adv", &"select jsonb_path_query_array('{\"items\":[{\"p\":10,\"k\":\"Apple\"},{\"p\":25,\"k\":\"banana\"},{\"p\":5,\"k\":\"apricot\"}]}'::jsonb, '$.items[*] ? (@.p * 2 > 15 && @.k like_regex \"^a\" flag \"i\").k'), jsonb_path_query_array('[10,20,30,40]'::jsonb, '$[last - 1 to last]'), jsonb_path_query_array('{\"a\":{\"x\":1},\"b\":{\"x\":2}}'::jsonb, '$..x'), jsonb_path_query_first('[-3.2]'::jsonb, '$[0].abs().ceiling()'), jsonb_path_exists('{\"a\":1}'::jsonb, 'strict $.missing', '{}'::jsonb, true)")
+        checkBoth(mut &s, &"jpath_strict_err", &"select jsonb_path_exists('{\"a\":1}'::jsonb, 'strict $.missing', '{}'::jsonb, false)")
+        checkBoth(mut &s, &"jarr_sub_mod", &"select json_array(select v from (values (1), (null), (2)) as t(v) null on null returning jsonb)")
+        checkBoth(mut &s, &"agg_filter_win", &"select json_agg(id order by id) filter (where id <> 2) from docs")
+        checkBoth(mut &s, &"agg_over", &"select id, json_agg(id) over (partition by grp) from docs order by id")
+        checkBoth(mut &s, &"catalog_meta", &"select column_name, data_type, udt_name from information_schema.columns where table_name = 'docs' and column_name in ('j','jb') order by column_name")
+        checkBoth(mut &s, &"fmt_typeof", &"select format_type(114, -1), format_type(3802, -1), pg_typeof('{\"a\":1}'::json), pg_typeof('{\"a\":1}'::jsonb)")
+        let _ddl1 = q(mut &s, &"create table jcheck (id int primary key, raw text check (raw is json object), jb jsonb default '{}', u text generated always as (jb ->> 'u') stored)")
+        let _ddl2 = q(mut &s, &"create index jcheck_u on jcheck ((jb ->> 'u'))")
+        println("ddl_ok: " + q(mut &s, &"insert into jcheck (id, raw, jb) values (1, '{\"ok\":true}', '{\"u\":\"ann\"}') returning id, u"))
+        println("ddl_bad_chk: " + q(mut &s, &"insert into jcheck (id, raw) values (2, '[1,2]')"))
+        println("ddl_def: " + q(mut &s, &"insert into jcheck (id, raw) values (3, '{}') returning id, jb, u"))
+        checkBoth(mut &s, &"ddl_idx", &"select id, u from jcheck where jb ->> 'u' = 'ann'")
+
+        // PG binary wire roundtrip for OID_JSON (114) and OID_JSONB (3802 with 0x01 version prefix)
+        let pjson = lexdb_pgbin.param(&"{\"a\":1}", lexdb_sql.OID_JSON).unwrap()
+        let pjsonb = lexdb_pgbin.param(&"\x01{\"a\": 1}", lexdb_sql.OID_JSONB).unwrap()
+        let badBin = match lexdb_pgbin.param(&"\x02{\"a\": 1}", lexdb_sql.OID_JSONB) { Ok(_) { "ok" } Err(er) { er.state } }
+        var wireOut = ""
+        let outCols: []lexdb_bind.OutCol = [lexdb_bind.OutCol{name: "j", oid: lexdb_sql.OID_JSON, spell: "", coll: "", scale: -1},
+                                            lexdb_bind.OutCol{name: "jb", oid: lexdb_sql.OID_JSONB, spell: "", coll: "", scale: -1}]
+        lexdb_pgbin.dataRow(mut &wireOut, &[lexdb_sql.Val.Text("{\"a\":1}"), lexdb_sql.Val.Text("{\"a\": 1}")], &outCols, &[1, 1], &lexdb_time.utc())
+        // Verify jsonb binary column has version byte 0x01 before {"a": 1}
+        let hasVer1 = strings.contains(&wireOut, "\x01{\"a\": 1}")
+        println("pgbin: " + pjson + "|" + pjsonb + "|" + badBin + "|" + (if hasVer1 { "t" } else { "f" }))
 
         return 0
     }).unwrap()

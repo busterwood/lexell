@@ -73,6 +73,23 @@ SELECT JSON_MODIFY(N'{"a":1,"tags":["sql"]}', 'append $.tags', N'json') AS updat
 GO
 ```
 
+```text
+(2 rows affected)
+
+Id total has_second
+-- ----- ----------
+1  120   1
+2  50    0
+
+(2 rows affected)
+
+updated
+-----------------------------
+{"a":1,"tags":["sql","json"]}
+
+(1 row affected)
+```
+
 ### B. `OPENJSON` with `CROSS APPLY` and `FOR JSON PATH`
 
 <!-- example: tsql -->
@@ -89,6 +106,22 @@ FROM dbo.Orders
 ORDER BY Id
 FOR JSON PATH, ROOT('orders');
 GO
+```
+
+```text
+Id sku qty
+-- --- ---
+1  A1  2
+1  B2  1
+2  C3  5
+
+(3 rows affected)
+
+JSON_F52E2B61-18A1-11d1-B105-00805F49916B
+-------------------------------------------------------------------------
+{"orders":[{"Id":1,"info":{"name":"Ann"}},{"Id":2,"info":{"name":"Bob"}}]}
+
+(1 row affected)
 ```
 
 ## See also
