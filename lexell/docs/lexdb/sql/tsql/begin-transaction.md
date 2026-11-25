@@ -33,7 +33,7 @@ BEGIN { TRAN | TRANSACTION } [ transaction_name | @tran_name_variable ]
 
 ## Differences from SQL Server
 
-- `WITH MARK` is error 102. `BEGIN DISTRIBUTED TRANSACTION` is error 102.
+- `WITH MARK` is error 102. `BEGIN DISTRIBUTED TRANSACTION` is error 156 (`near the keyword 'DISTRIBUTED'`).
 - `ROLLBACK` with a name that is neither the transaction's nor a savepoint's rolls the transaction back; SQL Server
   refuses it (6401) and leaves the transaction open. See [ROLLBACK TRANSACTION](rollback-transaction.md).
 
@@ -200,8 +200,8 @@ GO
 ```text
 Msg 102, Level 15, State 1, Line 1
 Incorrect syntax near 'before the load'.
-Msg 102, Level 15, State 1, Line 1
-Incorrect syntax near 'distributed'.
+Msg 156, Level 15, State 1, Line 1
+Incorrect syntax near the keyword 'DISTRIBUTED'.
 ```
 
 ## See also

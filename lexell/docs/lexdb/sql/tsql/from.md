@@ -87,10 +87,10 @@ join_type ::=
 
 ## Differences from SQL Server
 
-- `PIVOT` and `UNPIVOT` are not supported (error 102).
+- `PIVOT` and `UNPIVOT` are not supported (error 156, `Incorrect syntax near the keyword 'PIVOT'`).
 - Join hints (`INNER LOOP JOIN`, `LEFT HASH JOIN`, `MERGE JOIN`, `REMOTE`) are error 102. A join hint in
   `OPTION (HASH JOIN)` is read and ignored.
-- `TABLESAMPLE` is error 102. `OPENROWSET`, `OPENJSON` and `STRING_SPLIT` are not available.
+- `TABLESAMPLE` is error 156. `OPENROWSET`, `OPENJSON` and `STRING_SPLIT` are not available.
 - `VALUES` in `FROM` without column aliases names its columns `column1`, `column2` ...; SQL Server needs the
   aliases (error 8155).
 - PostgreSQL's `NATURAL JOIN`, `JOIN ... USING (...)` and `LATERAL` are taken; SQL Server refuses them.
@@ -284,8 +284,8 @@ GO
 ```text
 Msg 102, Level 15, State 1, Line 1
 Incorrect syntax near 'LOOP'.
-Msg 102, Level 15, State 1, Line 1
-Incorrect syntax near 'unpivot'.
+Msg 156, Level 15, State 1, Line 1
+Incorrect syntax near the keyword 'UNPIVOT'.
 ```
 
 ## See also

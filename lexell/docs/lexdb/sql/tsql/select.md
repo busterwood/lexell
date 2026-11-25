@@ -105,10 +105,9 @@ select_list ::=
 
 ## Differences from SQL Server
 
-- `PIVOT` and `UNPIVOT`, `FOR XML`, `FOR JSON`, `FOR BROWSE`, `TABLESAMPLE`, `$IDENTITY` and `$ROWGUID` are not
-  supported: each is error 102.
-- A bare alias without `AS` that is a reserved word (`SELECT 1 rule`) is error 102; SQL Server gives 156. With `AS`
-  it is 156 in both (example K).
+- `PIVOT`, `UNPIVOT` and `TABLESAMPLE` are not supported: each is error 156 (`Incorrect syntax near the keyword
+  'PIVOT'`). `FOR XML`, `FOR JSON`, `FOR BROWSE`, `$IDENTITY` and `$ROWGUID` are error 102.
+- A reserved word as an alias, with `AS` or without it (`SELECT 1 rule`), is error 156, as in SQL Server (example K).
 - Some errors carry 50000 and lexdb's text where SQL Server has a number of its own: an ambiguous column (SQL
   Server 209), a column that is neither grouped nor in an aggregate (8120), a window function in `WHERE` (4108),
   `ORDER BY` with `DISTINCT` on a column not in the list (145).
@@ -358,8 +357,8 @@ GO
 ```
 
 ```text
-Msg 102, Level 15, State 1, Line 2
-Incorrect syntax near 'pivot'.
+Msg 156, Level 15, State 1, Line 2
+Incorrect syntax near the keyword 'PIVOT'.
 Msg 102, Level 15, State 1, Line 1
 Incorrect syntax near 'JSON'.
 ```
@@ -373,6 +372,8 @@ GO
 SELECT 1 AS key;
 GO
 SELECT 1 AS rule;
+GO
+SELECT 1 rule;
 GO
 SELECT 1 AS [rule];
 GO
@@ -391,6 +392,8 @@ key name status
 
 Msg 156, Level 15, State 1, Line 1
 Incorrect syntax near the keyword 'key'.
+Msg 156, Level 15, State 1, Line 1
+Incorrect syntax near the keyword 'rule'.
 Msg 156, Level 15, State 1, Line 1
 Incorrect syntax near the keyword 'rule'.
 rule

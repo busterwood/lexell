@@ -267,8 +267,9 @@ differences of its statement.
   - Views are read-only (50000), and a CTE cannot be the target of `UPDATE`, `DELETE` or `MERGE` (208).
   - `SELECT INTO` loses column attributes: `nvarchar(30)` becomes `nvarchar(max)`, a decimal gets wider, `NOT NULL`
     and `IDENTITY` are lost. `SELECT IDENTITY(int, 1, 1) AS n ... INTO` is 207.
-  - Error 102 for `PIVOT`, `UNPIVOT`, `FOR XML`, `FOR JSON`, `TABLESAMPLE`, `$IDENTITY`, join hints (`INNER LOOP
-    JOIN`), `FOR SYSTEM_TIME`, `GROUP BY ... WITH ROLLUP` / `WITH CUBE`; `GROUPING_ID` is 195.
+  - Error 156 for `PIVOT`, `UNPIVOT` and `TABLESAMPLE`, and 102 for `FOR XML`, `FOR JSON`, `$IDENTITY`, join hints
+    (`INNER LOOP JOIN`), `FOR SYSTEM_TIME`, `GROUP BY ... WITH ROLLUP` / `WITH CUBE` (SQL Server accepts them all);
+    `GROUPING_ID` is 195.
   - `TOP (subquery)` is 156 (SQL Server accepts it); `MERGE TOP ... PERCENT` is 50000.
   - A `SELECT *` view whose table lost a column and gained another reads the columns by position: the view's column
     `y` shows the values of the column that took its place. SQL Server does the same (checked); Oracle reads by
@@ -331,8 +332,10 @@ differences of its statement.
     `RESTART WITH 50`.
   - Other error numbers: `DROP TABLE`, `VIEW` or `SEQUENCE` of a missing object is 208 (SQL Server: 3701), `DROP
     INDEX` of a missing index 50000 (3701), adding a column that exists 50000 (2705), dropping an unknown column 207
-    (4924), adding a `NOT NULL` column without a default to a table with rows 515 (4901), a second `CLUSTERED` index
-    in a `CREATE TABLE` 2714 (8112) and a repeated index name there 2714 (8168).
+    (4924), adding a `NOT NULL` column without a default to a table with rows 515 (4901), two `CLUSTERED` indexes
+    in a `CREATE TABLE` 1902 (8112) and a repeated index name there 2714 (8168).
+  - **Index names are unique in the schema**, not per table: `CREATE INDEX ix ON t2 (a)` when `ix` is an index of
+    another table is 2714 (SQL Server allows it; the same name on the same table is 1913 there, 2714 here).
 - **Transactions and variables** (found writing those T-SQL pages):
   - A string too long for a variable is error 2628 and leaves it NULL: `DECLARE @s varchar(3) = 'abcdef'` (SQL
     Server cuts it to 'abc').
@@ -344,7 +347,7 @@ differences of its statement.
     (SQL Server: 6401, the transaction stays open).
   - `SET TRANSACTION ISOLATION LEVEL` takes any word (`CHAOS`) and keeps nothing:
     `sys.dm_exec_sessions.transaction_isolation_level` stays 2.
-  - `BEGIN TRANSACTION ... WITH MARK` and `BEGIN DISTRIBUTED TRANSACTION` are 102; cursors (`DECLARE @c CURSOR`,
+  - `BEGIN TRANSACTION ... WITH MARK` is 102 and `BEGIN DISTRIBUTED TRANSACTION` 156; cursors (`DECLARE @c CURSOR`,
     `DECLARE c CURSOR FOR`) are 50000 and 102.
   - With `XACT_ABORT ON`, a failed `UPDATE` inside `BEGIN TRY` sends `(0 rows affected)` before the `CATCH` output.
 - **Control of flow** (found writing those T-SQL pages):

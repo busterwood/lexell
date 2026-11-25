@@ -40,7 +40,11 @@ feature, the number is **50000**.
 | 213 | The number of values in an `INSERT` does not match the table. |
 | 468 | A collation conflict between two strings. |
 | 1002 | An invalid scale in a type such as `datetime2(8)`. |
+| 1018 | `HOLDLOCK` or `INDEX` after a table name without `WITH ( )` (`CREATE TABLE HOLDLOCK (...)`, `FROM t HOLDLOCK`). |
+| 1031 | A percent outside 0 to 100 in `TOP (n) PERCENT`. |
+| 1054 | `*` in the query of a `WITH SCHEMABINDING` view. |
 | 1087 | A table variable used but not declared. |
+| 1911 | A column of an index (`CREATE INDEX`, an inline `INDEX` of `CREATE TABLE`) that the table does not have. |
 | 2812 | A procedure that does not exist (also what a misspelt statement such as `SELEC 1` gives). |
 
 ### Constraints and data
@@ -82,7 +86,8 @@ feature, the number is **50000**.
 | 3701 | `DROP` of a table, view, procedure, function or assertion that does not exist (severity 11). |
 | 4121 | A column, function or method that cannot be found by that name. |
 | 4902 | A table named by `TRUNCATE` or similar that cannot be found. |
-| 5074 | An object depends on the column you are dropping or changing (an assertion reads it). |
+| 5074 | An object depends on the column you are dropping or changing: an assertion reads it, or a `WITH SCHEMABINDING` view uses it (`DROP COLUMN` only). |
+| 4502 | A `SELECT *` view whose table has lost a column (`View or function ... has more column names specified than columns defined`). |
 | 3729 | `DROP SEQUENCE` of a sequence a column's default uses; `DROP TABLE` of a table an assertion reads. |
 | 15336 | `sp_rename` of a table or column an assertion reads. |
 | 2754 | `RAISERROR` of severity 19 to 25 without `WITH LOG`. |
@@ -114,7 +119,7 @@ feature, the number is **50000**.
 
 ## Remarks
 
-- Severity (`Level`) is 16 for most errors, 15 for syntax errors (102, 156, 178 and a few more), and 14 for a key
+- Severity (`Level`) is 16 for most errors, 15 for syntax errors (102, 156, 178, 1018, 1031, 1054 and a few more), and 14 for a key
   violation (2627), a denied permission (229) and a failed login (18456).
 - The `Line` is the line of the failing statement in the batch.
 - A batch is parsed whole before it runs. A syntax error (102, 156) or a refusal at parse time (error 50000

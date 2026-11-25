@@ -60,6 +60,9 @@ CREATE [ UNIQUE ] [ CLUSTERED | NONCLUSTERED ] INDEX index_name
 - `ALTER INDEX ... REBUILD`, `REORGANIZE` and `DISABLE` are error 50000 ("lexdb: ALTER INDEX takes RENAME TO only").
   `CREATE STATISTICS` is error 50000; `UPDATE STATISTICS` is error 102.
 - A unique index over rows that already clash is error 2627, "could not create unique index" (SQL Server: 1505).
+- **An index's name is unique in the schema**, as a table's is, not only among the indexes of its table: `ix_emp_dept`
+  on a second table is error 2714 (SQL Server allows it), and so is the name on the same table (SQL Server: 1913,
+  example E).
 - Columnstore indexes (`CREATE COLUMNSTORE INDEX`, error 102), and spatial, XML and full-text indexes, are not
   supported.
 - PostgreSQL's `CREATE INDEX IF NOT EXISTS` is taken.
@@ -172,6 +175,9 @@ CREATE INDEX ix_emp_dept ON dbo.emp (name);
 GO
 CREATE INDEX ix_emp_x ON dbo.emp (nothere);
 GO
+CREATE TABLE dbo.dept_copy (id int);
+CREATE INDEX ix_emp_dept ON dbo.dept_copy (id);
+GO
 ```
 
 ```text
@@ -179,8 +185,10 @@ Msg 2627, Level 14, State 1, Line 1
 could not create unique index "ux_emp_dept"
 Msg 2714, Level 16, State 1, Line 2
 There is already an object named 'ix_emp_dept' in the database.
-Msg 207, Level 16, State 1, Line 1
-Invalid column name 'nothere'.
+Msg 1911, Level 16, State 1, Line 1
+Column name 'nothere' does not exist in the target table or view.
+Msg 2714, Level 16, State 1, Line 2
+There is already an object named 'ix_emp_dept' in the database.
 ```
 
 ### F. CLUSTERED and NONCLUSTERED
