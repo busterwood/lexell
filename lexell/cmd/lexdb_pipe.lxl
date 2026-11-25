@@ -63,6 +63,8 @@ pub type Ctx = record {
     pub params: []Val           // the run's parameters, for a plan's bound slots (BX.Param); [] where they are bound as constants
     pub up: Up
     pub subs: []SubVal          // per subquery of the query, by number: the value BX.Sub reads (one run once; [] none)
+    pub sipCol: int             // sideways information passing: inner table BK_INT column slot to filter by sipKeys (-1 none)
+    pub sipKeys: Map[int, int]  // allowed integer values for sipCol (mapped to 0)
 }
 
 // name's entry of n arguments where it is not lexdb_lib's; None: lexdb_lib's.
@@ -1288,7 +1290,7 @@ pub fn bGenOf(x: &BX, kinds: &[]int, base: int, need: &[]bool, ce: &Ctx): Option
         append(mut &ks, kinds[i])
     }
     let gce = Ctx{now: ce.now, zone: ce.zone.clone(), params: if par { collections.copyOf(&ce.params) } else { [] }, up: ce.up,
-                  subs: if par && lexdb_bind.hasSub(x) { copySubs(&ce.subs) } else { [] }}
+                  subs: if par && lexdb_bind.hasSub(x) { copySubs(&ce.subs) } else { [] }, sipCol: -1, sipKeys: newMap()}
     return Some(BGen{cx: c, cols: cols, kinds: ks, ce: gce})
 }
 
@@ -7285,13 +7287,18 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
         }
     }
     // the first hash join's one integer key, a column of the scan: its
-    // rows not in the hash are dropped as the scan reads them
+    // rows not in the hash are dropped as the scan reads them; or an outer
+    // SIP key set pushed into an IN subquery's scan before its Apply runs
     var pushCol = -1
+    var useSip = false
     if len(jr.jls) > 1 && jr.apAt != 1 && (jr.jls[1].how == lexdb_plan.JH_HASH || jr.jls[1].how == lexdb_plan.JH_JOIN) && jr.jls[1].mode == JK_INT && !jr.jls[1].left {
         match jr.jls[1].key[0] {
             BNode.Col(c) { if jr.owner[c] == 0 { pushCol = c - sc.first } }
             else {}
         }
+    } else if cx.sipCol >= 0 && cx.sipCol < len(bp.kinds) && bp.needCol[cx.sipCol] && bp.kinds[cx.sipCol] == BK_INT {
+        pushCol = cx.sipCol
+        useSip = true
     }
     cnt[sc.level].starts += 1
     heldRun(&srcs[sc.level])
@@ -7304,8 +7311,10 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
         if jr.jls[i].right { append(mut &rights, i) }
     }
     var rc = RC{read: 0, kept: 0, batches: 0, pushed: 0, cut: 0}
-    let pl = &jr.jls[if pushCol >= 0 { 1 } else { 0 }]
-    let ph = PushH{keys: &pl.ints, head: &pl.head, cutB: &pl.cutB}
+    let sipHead: []int = [0]
+    let sipCut: []int = []
+    let pl = &jr.jls[if pushCol >= 0 && !useSip { 1 } else { 0 }]
+    let ph = if useSip { PushH{keys: &cx.sipKeys, head: &sipHead, cutB: &sipCut} } else { PushH{keys: &pl.ints, head: &pl.head, cutB: &pl.cutB} }
     var rawKept = 0
     let stopped = try readRows(st, txn, t, sc, &srcs[sc.level], &vrows[sc.level], &bp, &cn, pushCol, &ph, exact, mut &rc,
                                fn(tx: mut &lexdb_store.Txn, b: mut &Batch, idx: []int, raw: bool): Result[bool, DbErr] {
@@ -7362,7 +7371,7 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
     cnt[sc.level].read += rc.read - unreached
     cnt[sc.level].joined += rc.kept - unreached
     cnt[sc.level].batches += rc.batches
-    if pushCol >= 0 {
+    if pushCol >= 0 && !useSip {
         cnt[jr.jls[1].level].starts += rc.pushed
         pushDrops += rc.pushed
         if rc.cut > 0 {

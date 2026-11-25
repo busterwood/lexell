@@ -580,7 +580,7 @@ fn cenvOf(seq: &Option[SeqEnv]): Ctx {
         }
         None {}
     }
-    return Ctx{now: now, zone: z, params: [], up: execUp(), subs: []}
+    return Ctx{now: now, zone: z, params: [], up: execUp(), subs: [], sipCol: -1, sipKeys: newMap()}
 }
 
 // Whether name is a T-SQL or Oracle function that lexdb's own functions do
@@ -1061,6 +1061,9 @@ type Run = record {
     swKeys: []str
     swScan: Scan
     after: str                  // a batched DELETE or UPDATE (stage 8): the first level's primary key scan starts at this key; "" none
+    sipCol: int                 // SIP inner scan filter column slot (-1 none)
+    sipKeys: Map[int, int]      // SIP allowed integer keys
+    sipStop: int                // early stop level for collectSipKeys (-1 none)
 }
 
 // A session's limits on one statement (SET max_recursion,
@@ -1116,7 +1119,8 @@ fn newRun(q: &Query): Run {
     }
     return Run{noLimit: false, cnt: array(len(q.levels), lexdb_pipe.noCounts()),
                seen: seen, memo: memo, memoRes: memoRes, stats: stats, cache: newCache(), maxRounds: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS,
-               bud: lexdb_pipe.newBudget(), batch: true, writes: false, sw: -1, swKeys: [], swScan: lexdb_access.noScan(), after: ""}
+               bud: lexdb_pipe.newBudget(), batch: true, writes: false, sw: -1, swKeys: [], swScan: lexdb_access.noScan(), after: "",
+               sipCol: -1, sipKeys: newMap(), sipStop: -1}
 }
 
 // The values of the correlated subqueries in a path's key values, for
@@ -1769,6 +1773,13 @@ fn tryRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats
     let lv = &q.levels[k]
     for i in 0..len(r) { row[lv.first + i] = r[i].clone() }
     rs.cnt[k].read += 1
+    if k == 0 && rs.sipCol >= 0 {
+        if rs.sipCol >= len(r) { return Ok(0) }
+        match r[rs.sipCol] {
+            Val.Int(v) { if !rs.sipKeys.has(&v) { return Ok(0) } }
+            else { return Ok(0) }
+        }
+    }
     if !(try allTrueC(st, txn, q, m, &lv.cond, (if len(m.cc) > 0 { &m.cc[k] } else { &q.cc[k] }), row, params, rs)) { return Ok(0) }
     rs.cnt[k].joined += 1
     if ri >= 0 && len(rs.seen[k]) > 0 { rs.seen[k][ri] = true }
@@ -1900,7 +1911,7 @@ fn naLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mat
 // calling emit for each complete row; false: emit asked to stop.
 fn runLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, k: int, row: mut &[]Val,
             params: &[]Val, emit: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr], rs: mut &Run): Result[bool, DbErr] {
-    if k == len(q.levels) { return emit(txn, row) }
+    if k == len(q.levels) || (rs.sipStop >= 0 && k == rs.sipStop) { return emit(txn, row) }
     let sqe = seqEnv(st, txn)               // (not for the row emitted: a handle and a zone's copy per row, 9.99)
     let lv = &q.levels[k]
     var matched = false
@@ -2670,7 +2681,7 @@ fn planSubIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     let oid = if s.use == lexdb_sql.SUB_EXISTS || len(sel.outs) == 0 { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
     let name = if s.use == lexdb_sql.SUB_EXISTS { "exists" } else if s.use == lexdb_sql.SUB_SCALAR { sel.outs[0].name.clone() } else { "?column?" }
     // (in FROM: its columns are its outs)
-    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte, kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None, lat: [], need: if s.use == lexdb_sql.SUB_FROM && s.cteOnce && sel.rec >= 0 { -2 } else { -1 }, viewKey: "", rollup: []}
+    var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte, kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None, lat: [], need: if s.use == lexdb_sql.SUB_FROM && s.cteOnce && sel.rec >= 0 { -2 } else { -1 }, viewKey: "", rollup: [], sipCol: -1}
     // res: a semi-join's alternative (buildQuery), which may keep correlated
     // filters that are not keys as residuals (SubPlan.res) for its level to
     // check. Any other hashed subquery must not: nothing else reads them.
@@ -2815,6 +2826,94 @@ fn runSemi(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, para
     out.v.rows = len(res.rows)
     out.data = replace(mut &res.rows, [])
     return Ok(out)
+}
+
+// runSemi with a SIP key filter pushed into the inner table scan before correlated subqueries run.
+fn runSemiSip(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sp: &SubPlan, params: &[]Val, parent: mut &Run,
+              i: int, sipCol: int, sipKeys: Map[int, int]): Result[SubRes, DbErr] {
+    var rs = newRun(&sp.sel.q)
+    rs.maxRounds = parent.maxRounds
+    rs.maxSteps = parent.maxSteps
+    rs.bud.maxHeld = parent.bud.maxHeld
+    rs.bud.deadline = parent.bud.deadline
+    rs.batch = parent.batch
+    rs.writes = parent.writes
+    rs.bud.held = parent.bud.held
+    rs.bud.ticks = parent.bud.ticks
+    rs.bud.turnEnd = parent.bud.turnEnd
+    rs.cache = replace(mut &parent.cache, newCache())
+    rs.sipCol = sipCol
+    rs.sipKeys = sipKeys
+    let r = execSel(st, txn, &sp.sel, params, -1, mut &rs)
+    parent.cache = replace(mut &rs.cache, newCache())
+    parent.bud.ticks = rs.bud.ticks
+    parent.bud.turnEnd = rs.bud.turnEnd
+    while len(parent.stats) <= i { append(mut &parent.stats, SubStat{runs: 0, hits: 0, cnt: [], inner: []}) }
+    parent.stats[i].runs += 1
+    addCounts(mut &parent.stats[i].cnt, &rs.cnt)
+    mergeStats(mut &parent.stats[i].inner, &rs.stats)
+    var res = try r
+    var out = emptyRes()
+    out.v.rows = len(res.rows)
+    out.data = replace(mut &res.rows, [])
+    return Ok(out)
+}
+
+// Collect the distinct non-null integer keys produced by levels 0..semiK-1 for a SIP semi-join.
+// Returns the number of distinct keys collected, or -1 if the outer prefix exceeds the SIP cap.
+fn collectSipKeys(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, semiK: int, params: &[]Val,
+                  parent: &Run, out: mut &Map[int, int]): Result[int, DbErr] {
+    let lv = &q.levels[semiK]
+    if len(lv.hashVals) != 1 { return Ok(-1) }
+    var tm = Mats{vrows: [], mat: [], keys: [], ikeys: [], buckets: [], resMixed: [], resSingle: [], subs: [], cc: [], cp: [], ce: cenvOf(seqEnv(st, txn))}
+    for k in 0..len(q.levels) {
+        append(mut &tm.vrows, [])
+        append(mut &tm.mat, [])
+        append(mut &tm.keys, newMap())
+        append(mut &tm.ikeys, newMap())
+        append(mut &tm.buckets, [])
+        append(mut &tm.resMixed, [])
+        append(mut &tm.resSingle, [])
+    }
+    tm.ce.params = collections.copyOf(params)
+    var trs = newRun(q)
+    trs.maxRounds = parent.maxRounds
+    trs.maxSteps = parent.maxSteps
+    trs.bud.maxHeld = parent.bud.maxHeld
+    trs.bud.deadline = parent.bud.deadline
+    trs.batch = false
+    trs.writes = parent.writes
+    trs.sipStop = semiK
+    var row: []Val = array(len(q.cols), Val.Null)
+    let sqe = seqEnv(st, txn)
+    let noAggs: []Val = []
+    var ok = true
+    var nRows = 0
+    var nKeys = 0
+    let hv = &lv.hashVals[0]
+    let go = try runLevel(st, txn, q, &tm, 0, mut &row, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
+        nRows += 1
+        if nRows > 50000 {
+            ok = false
+            return Ok(false)
+        }
+        let env = Env{cols: &q.cols, row: r, aggs: &noAggs, params: params, subs: &tm.subs, cur: &noAggs, seq: &sqe}
+        match try eval(hv, &env) {
+            Val.Int(v) {
+                if !out.has(&v) {
+                    if nKeys >= 10000 {
+                        ok = false
+                        return Ok(false)
+                    }
+                    out.put(v, 0)
+                    nKeys += 1
+                }
+            }
+            else {}
+        }
+        return Ok(true)
+    }, mut &trs)
+    return Ok(if ok { nKeys } else { -1 })
 }
 
 // Rows cut to n values (a semi-join's: its keys, of a subquery's rows).
@@ -3746,7 +3845,29 @@ fn runSubs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, params:
             if sp.need >= 0 && cacheAt(&rs.cache, &("k" + lexdb_recprobe.recOf(sp).toStr())) < 0 { try probeRecursion(st, txn, q, i, params, rs) }
             append(mut &subs, try runFrom(st, txn, sp, &ps, rs, i))
         } else if sp.semi {
-            append(mut &subs, try runSemi(st, txn, sp, &ps, rs, i))
+            var doneSip = false
+            if sp.sipCol >= 0 && !rs.writes && !txn.noting() {
+                var semiK = -1
+                for k in 1..len(q.levels) {
+                    if q.levels[k].semi && q.levels[k].src == i {
+                        semiK = k
+                        break
+                    }
+                }
+                if semiK >= 1 {
+                    var sipKeys: Map[int, int] = newMap()
+                    let nSip = try collectSipKeys(st, txn, q, semiK, params, rs, mut &sipKeys)
+                    if nSip >= 0 {
+                        if nSip == 0 {
+                            append(mut &subs, emptyRes())
+                        } else {
+                            append(mut &subs, try runSemiSip(st, txn, sp, &ps, rs, i, sp.sipCol, move(sipKeys)))
+                        }
+                        doneSip = true
+                    }
+                }
+            }
+            if !doneSip { append(mut &subs, try runSemi(st, txn, sp, &ps, rs, i)) }
         } else {
             match if sp.hashed { runHashed(st, txn, sp, &ps, rs, i) } else { runSub(st, txn, sp, &ps, rs, i) } {
                 Ok(r) { append(mut &subs, r) }
@@ -18019,7 +18140,7 @@ pub fn subConds(): int { return SUB_CONDS }
 // error only if it gets to that row).
 fn batchLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats, row: mut &[]Val,
               params: &[]Val, emit: &fn(mut &lexdb_store.Txn, &[]Val): Result[bool, DbErr], rs: mut &Run, matched: mut &bool): Result[int, DbErr] {
-    if !rs.batch { return Ok(-1) }
+    if !rs.batch || rs.sipCol >= 0 { return Ok(-1) }
     let got0 = try bLevelPlan(st, txn, q, m, params, rs)
     if got0.isNone() { return Ok(-1) }
     let lp = got0.unwrap()
@@ -21826,7 +21947,11 @@ fn runApplyJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, pg: &
     let l0 = &q.levels[0]
     let ak = lexdb_plan.applyAt(&pg.plan)
     let srcs = try joinSrcs(st, txn, sel, pg, params, subs, if l0.src >= 0 { len(subs[l0.src].data) } else if l0.work >= 0 { try workLen(rs, l0) } else { 0 }, rs)
-    let cx = applyCtx(st, txn, params, subs)
+    var cx = applyCtx(st, txn, params, subs)
+    if rs.sipCol >= 0 {
+        cx.sipCol = rs.sipCol
+        cx.sipKeys = replace(mut &rs.sipKeys, newMap())
+    }
     var tabs: []&Table = []
     for k in 0..len(q.levels) { append(mut &tabs, &q.levels[k].t) }
     let vrows = try levelRows(sel, rs, subs)
@@ -21842,6 +21967,7 @@ fn runApplyJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, pg: &
         let env = Env{cols: &q.cols, row: row, aggs: &noAggs, params: params, subs: sv, cur: &noAggs, seq: &sqe}
         return applyAsk(st, tx, q, ak, &env, rows, rs)
     })
+    if rs.sipCol >= 0 { rs.sipKeys = replace(mut &cx.sipKeys, newMap()) }
     budBack(rs, &bud, h0, t0)
     let n = try got
     levelCounts(rs, &cnt)

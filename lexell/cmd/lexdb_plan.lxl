@@ -1353,6 +1353,49 @@ fn hasInSub(cs: &[]Expr): bool {
     return false
 }
 
+// Whether subquery i is an uncorrelated IN subquery over one base table with a correlated
+// child subquery, returning a bare integer column: returns that column's slot on the inner
+// table (for sideways information passing), or -1.
+fn sipCand(q: &Query, i: int): int {
+    if i < 0 || i >= len(q.subs) { return -1 }
+    let sp = &q.subs[i]
+    if sp.use != lexdb_sql.SUB_IN || len(sp.sel.q.refs) > 0 || sp.hashed || sp.cte >= 0 || sp.readAs != 0 || sp.kind != lexdb_sql.COLL_EXACT { return -1 }
+    let sub = &sp.sel
+    if !sub.q.corr || len(sub.q.levels) != 1 || sub.aggQ || len(sub.groupBy) > 0 || sub.having.isSome() || sub.setop != 0 ||
+       len(sub.srf) > 0 || len(sub.wins) > 0 || len(sub.mr) > 0 || len(sub.locks) > 0 || sub.limit >= 0 || sub.offset > 0 ||
+       len(sub.exprs) != 1 {
+        return -1
+    }
+    let slv = &sub.q.levels[0]
+    if slv.virt() || slv.work >= 0 || slv.lateral || slv.semi || slv.anti { return -1 }
+    for x in slv.cond { if unpushableNoSub(&x) { return -1 } }
+    match sub.exprs[0] {
+        Expr.Col(n, sl) {
+            let slot = lexdb_bind.colSlot(&sub.q.cols, &n, sl)
+            let c = slot - slv.first
+            if c >= 0 && c < len(slv.t.cols) && lexdb_rows.colKind(&slv.t.cols[c]) == lexdb_rows.BK_INT { return c }
+        }
+        else {}
+    }
+    return -1
+}
+
+fn unpushableNoSub(x: &Expr): bool {
+    match x {
+        Expr.Call(n, args, _) {
+            if n == "#win" || n == "#udf" || n == "#plf" || lexdb_bind.isSeqFn(&n) || lexdb_bind.isAdvFn(&n) ||
+               n == "gen_random_uuid" || n == "random" || n == "setseed" || n == "clock_timestamp" || lexdb_bind.newVolatile(&n) { return true }
+            for a in args { if unpushableNoSub(&a) { return true } }
+            return false
+        }
+        Expr.Unary(_, a) { return unpushableNoSub(&a) }
+        Expr.Bin(_, a, b) { return unpushableNoSub(&a) || unpushableNoSub(&b) }
+        Expr.IsNull(a, _) { return unpushableNoSub(&a) }
+        Expr.Cast(a, _) { return unpushableNoSub(&a) }
+        else { return false }
+    }
+}
+
 // col IN (subquery), the subquery uncorrelated (run once, before the
 // tables are read): its number, else -1.
 fn inSubOf(cs: &[]Expr, col: &str): int {
@@ -3091,7 +3134,10 @@ fn choosePath(q: &Query, k: int, cs: &[]Expr, params: &[]Val, lk: mut &[]Look): 
             if eqAt < 0 {
                 ins = inList(cs, &name, k, q)
                 if lv.readOnce && q.anyOuter(&ins) { ins = [] }
-                if len(ins) == 0 { inSub = inSubOf(cs, &name) }
+                if len(ins) == 0 {
+                    inSub = inSubOf(cs, &name)
+                    if inSub >= 0 && len(q.levels) >= 2 && sipCand(q, inSub) >= 0 { inSub = -1 }
+                }
                 if len(ins) == 0 && inSub < 0 { inArr = anyOf(cs, &name, k, q) }
                 if lv.readOnce && q.anyOuter(&inArr) { inArr = [] }
                 if len(ins) == 0 && inSub < 0 && len(inArr) == 0 { rng = bs }
@@ -4124,6 +4170,10 @@ pub type SubPlan = record {
     // GROUP BY query's: per inner AggSpec, the outer AggSpec index whose group accumulators
     // roll up to compute it without re-scanning the join; [] otherwise
     pub rollup: []int
+    // sideways information passing (Q20): for an uncorrelated IN semi-join whose inner single-table
+    // scan has a correlated child subquery (q.corr), the inner table's BK_INT output column slot
+    // to filter by the outer join's keys before the correlated subquery runs; -1 none
+    pub sipCol: int
 }
 
 pub type Scope = record {
@@ -4920,7 +4970,7 @@ fn twoSet(q: mut &Query, i: int, tk: &TwoKey, lk: mut &Level) {
                   groupKinds: [], ordKinds: [], outKinds: [lexdb_sql.COLL_EXACT], topMode: 0, topN: -1, feedback: [], mr: [], conv: [], ox: [],
                   oxParam: false, lp: lexdb_bind.noPlan(), pipe: None}
     append(mut &q.subs, SubPlan{use: lexdb_sql.SUB_IN, sel: sel, oid: oid, name: "?column?", hashed: false, keyOuter: [], keyText: [], cte: -1,
-                                 kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None, lat: [], need: -1, viewKey: "", rollup: []})
+                                 kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None, lat: [], need: -1, viewKey: "", rollup: [], sipCol: -1})
     let ax = Expr.Col(lk.alias + "." + lexdb_catalog.ROWID + tk.acol.toStr(), lk.first + tk.acol)
     append(mut &lk.cond, Expr.Call("#in", [Expr.Lit(Val.Int(n)), Expr.Lit(Val.Int(oid)), Expr.Lit(Val.Text("?column?")), ax], false))
     if tk.acol < len(lk.need) { lk.need[tk.acol] = true }
@@ -6630,6 +6680,7 @@ fn semiJoins(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, a
     var placed: [][]Level = []
     for k in 0..nl { append(mut &placed, []) }
     var any = false
+    var sipOuter: []float = array(len(q.subs), -1.0f)
     for k in 0..nl {
         var lv = replace(mut &olds[k], newLevel(rc(noTable()), "", 0, 0))
         var semis: []Level = []
@@ -6671,6 +6722,7 @@ fn semiJoins(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, a
                     if got.isSome() {
                         append(mut &semis, got.unwrap())
                         append(mut &ats, at)
+                        if i < len(sipOuter) { sipOuter[i] = outer }
                         made = true
                         any = true
                     }
@@ -6721,6 +6773,29 @@ fn semiJoins(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, a
         for j in 0..len(placed[k]) { append(mut &q.levels, replace(mut &placed[k][j], newLevel(rc(noTable()), "", 0, 0))) }
     }
     if !any { return Ok(Unit{}) }
+    // Mark uncorrelated IN semi-joins eligible for sideways information passing (Q20):
+    // when preceding per-row levels produce a small outer key set (<= 5000 estimated rows),
+    // pass those keys into the inner table scan before its correlated subquery runs.
+    for lk in 1..len(q.levels) {
+        let slv = &q.levels[lk]
+        if !slv.semi || slv.anti || slv.src < 0 || slv.semiSub >= 0 || !semiIntKey(slv) { continue }
+        let sipc = sipCand(q, slv.src)
+        if sipc < 0 { continue }
+        let eo = if slv.src < len(sipOuter) { sipOuter[slv.src] } else { -1.0f }
+        if eo < 0.0f || eo > 5000.0f { continue }
+        var ok = true
+        for p in 0..lk {
+            let plv = &q.levels[p]
+            if !plv.perRow || plv.virt() || plv.semi || plv.anti || plv.work >= 0 || plv.lateral || plv.join > lexdb_sql.J_INNER {
+                ok = false
+                break
+            }
+            for x in plv.cond { if hasSubCall(&x) || unpushableNoSub(&x) { ok = false; break } }
+            for x in plv.post { if hasSubCall(&x) || unpushableNoSub(&x) { ok = false; break } }
+            if !ok { break }
+        }
+        if ok { q.subs[slv.src].sipCol = sipc }
+    }
     // its columns by name (levelOf); a subquery still run per row
     for i in 0..len(q.cols) { if !q.colAt.has(&q.cols[i].name) { q.colAt.put(q.cols[i].name.toStr(), i) } }
     var corr = false
