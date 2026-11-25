@@ -76,6 +76,7 @@ const RC_PURE = 3       // writes no memory: conversions, checked division, wrap
 const RC_ADD = 4        // checked addition, subtraction, multiplication of a kind (rtk)
 const RC_SUB = 5
 const RC_MUL = 6
+const RC_REM = 7        // checked remainder of a kind (rtk)
 
 type Fact = value record {
     k: int
@@ -202,6 +203,12 @@ pub fn optimize(p: ir.Ir): ir.Ir {
                     c = RC_ADD + op
                     kx = ki
                 }
+            }
+        }
+        for ki in 0..4 {
+            if name == "rt_rem_" + kindName(ki) {
+                c = RC_REM
+                kx = ki
             }
         }
         if name == "rt_arr_fill" { o.fillFn = f }
@@ -1870,7 +1877,28 @@ fn (o: mut &Loops) defineArith(l: int, v: int, k: int) {
     var checked = false
     var ki = -1
     let rc = o.rtc[f]
-    if rc >= RC_ADD && o.nargs(v) == 3 {
+    if rc == RC_REM && o.nargs(v) == 3 {
+        let rki = o.rtk[f]
+        if kindAt(rki) != k { return }
+        let ra = o.symOf(o.arg(v, 0))
+        let rb = o.symOf(o.arg(v, 1))
+        let unsigned = k == ir.TY_U32 || k == ir.TY_U8
+        if !unsigned {
+            if ra.l == -2 || (ra.l >= 0 && o.killed(ra.l)) || !inKind(ra, k) || o.lo(ra, k) < 0 { return }
+        }
+        if rb.l == -2 || (rb.l >= 0 && o.killed(rb.l)) || !inKind(rb, k) || o.lo(rb, k) < 0 { return }
+        // ra >= 0 and rb > 0 (rb == 0 trapped in rt_rem): 0 <= ra % rb < rb
+        o.add(Fact{k: F_LO, a: l, b: -1, c: 0, d: -1, v: 0})
+        if rb.l == -1 && rb.c > 0 {
+            o.add(Fact{k: F_HI, a: l, b: -1, c: 0, d: -1, v: rb.c - 1})
+        } else if rb.l >= 0 && rb.l != l {
+            o.add(Fact{k: F_LT, a: l, b: rb.l, c: k, d: -1, v: 0})
+            let bhi = o.hi(rb, k)
+            if bhi > 0 && bhi < kmax(k) { o.add(Fact{k: F_HI, a: l, b: -1, c: 0, d: -1, v: bhi - 1}) }
+        }
+        return
+    }
+    if rc >= RC_ADD && rc <= RC_MUL && o.nargs(v) == 3 {
         op = rc - RC_ADD
         checked = true
         ki = o.rtk[f]
@@ -2458,7 +2486,7 @@ fn (o: mut &Loops) call(x: int) {
         }
         return
     }
-    if rc < RC_ADD { return }
+    if rc < RC_ADD || rc > RC_MUL { return }
     let op = if rc == RC_ADD { ir.OP_ADD } else if rc == RC_SUB { ir.OP_SUB } else { ir.OP_MUL }
     let ki = o.rtk[f]
     let w = o.wfn[op * 4 + ki]

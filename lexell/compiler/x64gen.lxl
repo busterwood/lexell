@@ -1557,6 +1557,10 @@ fn (g: mut &Gen) simpList(l: int) {
         let cnt = g.u.listLen(l)
         for j in 0..cnt {
             let x = g.u.listAt(l, j)
+            if g.u.nk(x) == ir.S_DECL && g.u.nodes[x].b < 0 && g.u.nodes[x].c < 0 {
+                g.fuseInit(l, j)
+                continue
+            }
             if g.u.nk(x) != ir.S_DECL || g.u.nodes[x].b < 0 || g.u.nodes[x].c >= 0 { continue }
             let b = g.u.nodes[x].a
             if j + 1 < cnt && g.tk(g.u.locals[b].ty) == ir.TY_BOOL {
@@ -1586,6 +1590,42 @@ fn (g: mut &Gen) simpList(l: int) {
         g.u.items[l] = n
         if n == cnt { return }
         pass += 1
+    }
+}
+
+// Fuses `T t; ... t = E;` (uninitialized scalar t, not address-taken, first named in the block
+// by `t = E` with E not naming t) by moving the declaration down to `T t = E;`. Lets merge and
+// forward eliminate temporaries split from unboxed structs.
+fn (g: mut &Gen) fuseInit(l: int, j: int) {
+    let cnt = g.u.listLen(l)
+    let x = g.u.listAt(l, j)
+    let t = g.u.nodes[x].a
+    if !g.u.isScalar(g.u.locals[t].ty) || g.aTaken[t] { return }
+    var m = j + 1
+    while m < cnt && m <= j + 8 {
+        let y = g.u.listAt(l, m)
+        let k = g.u.nk(y)
+        if k == ir.S_EMPTY {
+            m += 1
+            continue
+        }
+        if k == ir.S_CASE || k == ir.S_DEFAULT { return }
+        if k == ir.S_EXPR {
+            let as1 = g.u.nodes[y].a
+            if g.u.nk(as1) == ir.E_ASSIGN {
+                let lhs = g.u.nodes[as1].a
+                let rhs = g.u.nodes[as1].b
+                if g.u.nk(lhs) == ir.E_LOCAL && g.u.nodes[lhs].a == t &&
+                    g.u.nodes[rhs].ty == g.u.locals[t].ty && g.walk(rhs, 0, t, -1) == 0 {
+                    g.u.nodes[x].b = rhs
+                    g.u.items[l + 1 + j] = g.emptyS
+                    g.u.items[l + 1 + m] = x
+                    return
+                }
+            }
+        }
+        if g.walk(y, 0, t, -1) > 0 { return }
+        m += 1
     }
 }
 
@@ -2253,10 +2293,32 @@ fn (g: &Gen) placeKind(x: int): bool {
     return k == ir.E_LOCAL || k == ir.E_GLOBAL || k == ir.E_MEMBER || k == ir.E_DEREF
 }
 
+// Whether the call e is an extern libm math function generated inline by inlineMath (no call;
+// uses only rax, rcx, rdx, xmm0..xmm2 and the frame).
+fn (g: &Gen) mathInline(e: int): bool {
+    let n = g.u.nodes[e]
+    let c = n.a
+    if g.u.nk(c) != ir.E_DECAY || g.u.nk(g.u.nodes[c].a) != ir.E_FUNC { return false }
+    let direct = g.u.nodes[g.u.nodes[c].a].a
+    if g.u.funcs[direct].body >= 0 { return false }
+    let ft = n.c
+    let rt = g.u.tys[ft].base
+    let pts = g.u.fnParams(ft)
+    let nargs = g.u.listLen(n.b)
+    if len(pts) < 1 || len(pts) > 3 || len(pts) != nargs || !g.allF(&pts) || !g.isF(rt) { return false }
+    let name = &g.u.funcs[direct].asmName
+    if nargs == 1 {
+        return name == "sqrt" || name == "floor" || name == "ceil" || name == "trunc" ||
+            name == "rint" || name == "fabs" || name == "round"
+    }
+    if nargs == 2 { return name == "copysign" }
+    return nargs == 3 && name == "fma"
+}
+
 // Whether the call e of a runtime function is generated inline by inlineRt with no call, and
 // changes no register but rax, rcx and rdx (and the frame).
 fn (g: &Gen) quietRt(e: int): bool {
-    if g.checkedOp(e).k >= 0 { return true }
+    if g.checkedOp(e).k >= 0 || g.mathInline(e) { return true }
     let name = g.rtName(e)
     if name == "" { return false }
     let n = g.u.nodes[e]
@@ -2942,20 +3004,26 @@ fn (g: mut &Gen) stmt2(s: int) {
     g.genTest(cond)
     g.loadRegs(&ls, &rs)
     g.atTail = false
+    let hasElse = n.c >= 0 && !g.isEmptyStmt(n.c)
     let target = g.jumpOnly(n.b)
-    if n.c < 0 && target >= 0 {
+    if !hasElse && target >= 0 {
         g.a.jcc(if neg { x64.CC_E } else { x64.CC_NE }, target)
         return
     }
     let elseL = g.a.newLabel()
     g.a.jcc(if neg { x64.CC_NE } else { x64.CC_E }, elseL)
     g.stmt(n.b)
-    if n.c >= 0 {
-        let end = g.a.newLabel()
-        g.a.jmp(end)
-        g.a.bind(elseL)
-        g.stmt(n.c)
-        g.a.bind(end)
+    if hasElse {
+        if g.alwaysJumps(n.b) {
+            g.a.bind(elseL)
+            g.stmt(n.c)
+        } else {
+            let end = g.a.newLabel()
+            g.a.jmp(end)
+            g.a.bind(elseL)
+            g.stmt(n.c)
+            g.a.bind(end)
+        }
     } else {
         g.a.bind(elseL)
     }
@@ -3024,27 +3092,31 @@ fn (g: mut &Gen) stmt1(s: int) {
         }
     } else if k == ir.S_EXPR {
         g.genEffect(n.a)
-    } else if k == ir.S_IF && n.c < 0 && g.jumpOnly(n.b) >= 0 {
+    } else if k == ir.S_IF && g.isEmptyStmt(n.c) && g.jumpOnly(n.b) >= 0 {
         g.branch(n.a, g.jumpOnly(n.b), true)
-    } else if k == ir.S_IF && n.c < 0 && g.incIf(if g.u.nk(n.a) == ir.E_LNOT { g.u.nodes[n.a].a } else { n.a },
+    } else if k == ir.S_IF && g.isEmptyStmt(n.c) && g.incIf(if g.u.nk(n.a) == ir.E_LNOT { g.u.nodes[n.a].a } else { n.a },
         g.u.nk(n.a) == ir.E_LNOT, n.b) {
         // done: a count without a branch
     } else if k == ir.S_IF && g.u.nk(n.a) != ir.E_LNOT && g.genChain(n.a, n.b, n.c) {
         // done: a jump table
     } else if k == ir.S_IF {
+        let hasElse = !g.isEmptyStmt(n.c)
         let elseL = g.a.newLabel()
-        let doTail = wasTail && n.c >= 0 && g.rotTop >= 0 && g.spillActive == 0
+        let doTail = wasTail && hasElse && g.rotTop >= 0 && g.spillActive == 0
         g.branch(n.a, elseL, false)
         if doTail { g.atTail = true }
         g.stmt(n.b)
         g.atTail = false
-        if n.c >= 0 {
+        if hasElse {
             if doTail {
                 if !g.alwaysJumps(n.b) { g.emitTail() }
                 g.a.bind(elseL)
                 g.atTail = true
                 g.stmt(n.c)
                 g.atTail = false
+            } else if g.alwaysJumps(n.b) {
+                g.a.bind(elseL)
+                g.stmt(n.c)
             } else {
                 let end = g.a.newLabel()
                 g.a.jmp(end)
@@ -3323,6 +3395,20 @@ fn (g: &Gen) simpleTail(cond: int): bool {
     if n.k != ir.E_BIN || n.v < ir.OP_EQ || n.v > ir.OP_GE { return false }
     if g.isF(n.c) || g.is128(n.c) || g.isAggr(n.c) { return false }
     return g.tailOpOk(n.a) && g.tailOpOk(n.b)
+}
+
+// Whether statement s emits no code (absent, S_EMPTY, or a block of only empty statements).
+fn (g: &Gen) isEmptyStmt(s: int): bool {
+    if s < 0 { return true }
+    let n = g.u.nodes[s]
+    if n.k == ir.S_EMPTY { return true }
+    if n.k == ir.S_BLOCK {
+        for j in 0..g.u.listLen(n.a) {
+            if !g.isEmptyStmt(g.u.listAt(n.a, j)) { return false }
+        }
+        return true
+    }
+    return false
 }
 
 // Whether statement s always transfers control out of its end (so no fall-through jump is needed).
@@ -7441,8 +7527,14 @@ fn (g: mut &Gen) genCall(e: int) {
                 nx += 1
                 continue
             }
-            let m = if slots[j] == 0 { g.staticMem(x) } else if slots[j] == -1 { g.staticMem(dups[j]) } else {
-                rbp(slots[j])
+            var m = x64.mem(0, 0)
+            if slots[j] == 0 && g.u.nk(x) == ir.E_GLOBAL {
+                g.a.movRSym(R11, g.globalSym[g.u.nodes[x].a], 0)
+                m = x64.mem(R11, 0)
+            } else {
+                m = if slots[j] == 0 { g.staticMem(x) } else if slots[j] == -1 { g.staticMem(dups[j]) } else {
+                    rbp(slots[j])
+                }
             }
             for i in 0..len(cls) {
                 if cls[i] == CL_SSE {
@@ -7542,6 +7634,9 @@ fn (g: &Gen) argDirect(x: int, t: int): bool {
         return g.u.nodes[x].ty == t && (g.pairOf(x) >= 0 || g.staticMem(x).base != -9 || g.viaReg128(x).base != -9)
     }
     if g.isF(t) && (g.fregOf(x) >= 0 || g.u.nk(x) == ir.E_FLT) { return true }
+    if g.isAggr(t) && g.u.nk(x) == ir.E_GLOBAL && g.u.globals[g.u.nodes[x].a].isConst && g.u.nodes[x].ty == t {
+        return true
+    }
     if g.isAggr(t) || g.isF(t) { return g.staticMem(x).base != -9 }
     return g.simple(x)
 }
