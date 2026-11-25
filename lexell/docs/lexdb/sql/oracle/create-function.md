@@ -56,14 +56,17 @@ END [ function ] ;
   `CREATE TABLE ... AS` that reads such a view is ORA-03001 (Oracle allows it). Example H.
 - Pipelined and table functions, `RESULT_CACHE`, `PARALLEL_ENABLE`, `AGGREGATE USING` and `AUTHID` are not supported.
 - A `SYS_REFCURSOR` result works from PL/SQL; a JDBC client reads it as a cursor.
-- **Compilation errors are found for names and syntax only.** An undeclared name, an expression that does not parse
-  and DML on a missing table make the function `INVALID` when it is created (example I). Type errors, argument counts,
-  unknown columns of a `SELECT INTO` and a syntax error inside a SQL statement appear when the code runs, and a package body or an anonymous block with any
+- **Compilation errors are found for names and syntax only.** An undeclared name, an expression that does not parse,
+  a SQL statement that does not parse and DML on a missing table make the function `INVALID` when it is created
+  (example I; a SQL statement's error is ORA-00936, or ORA-00907 with a parenthesis left open, at the token where
+  lexdb's parser stopped: Oracle's number may differ for other syntax errors, and a `SELECT ... INTO` with a
+  parenthesis left open before `INTO` is PLS-00428 where Oracle gives ORA-00907). Type errors, argument counts and
+  unknown columns of a `SELECT INTO` appear when the code runs, and a package body or an anonymous block with any
   error is also found when it runs (Oracle: ORA-06550 first for a block). Nested subprograms leave the function
   `INVALID` (example J).
-- **A call's column name keeps the result, not the call:** in `SELECT f(1) FROM dual` the column is named like `(2)` (the
-  result in brackets), where Oracle names it `F(1)`; with a column as argument it is `F(ID)`, as in Oracle. Give the
-  call an alias.
+- A call's column name is the call as written: `SELECT f(1) FROM dual` names the column `F(1)`, `5+f(3)` is `5+F(3)`
+  and `f(id)` is `F(ID)`, as in Oracle (example A). A call of a function whose name is quoted with mixed case
+  (`"MixF"(2)`) is ORA-00900.
 
 ## Examples
 
@@ -86,6 +89,7 @@ BEGIN
 END;
 /
 SELECT double_it(21) AS answer, double_it(salary) AS doubled FROM emp ORDER BY id;
+SELECT double_it(21), 5+double_it(3), double_it(salary) FROM emp WHERE id = 1;
 SELECT name FROM emp WHERE double_it(salary) > 250;
 ```
 
@@ -98,6 +102,12 @@ ANSWER DOUBLED
     42     400
 
 2 rows selected.
+
+DOUBLE_IT(21) 5+DOUBLE_IT(3) DOUBLE_IT(SALARY)
+------------- -------------- -----------------
+           42             11               200
+
+1 row selected.
 
 NAME
 ----
@@ -344,8 +354,8 @@ ORA-03001: unimplemented feature: lexdb: an argument of a stored function that i
 
 ### I. A function that does not compile
 
-A function whose body has an undeclared name, an expression that does not parse or DML on a table that does not exist is
-stored **invalid**, and SQL\*Plus says "Warning: Function created with compilation errors." `USER_OBJECTS.STATUS` is
+A function whose body has an undeclared name, an expression that does not parse, a SQL statement that does not parse or
+DML on a table that does not exist is stored **invalid**, and SQL\*Plus says "Warning: Function created with compilation errors." `USER_OBJECTS.STATUS` is
 `INVALID` and `USER_ERRORS` holds the `PLS-` errors with their line and position (the text of PLS-00103 has no list of
 the symbols expected). A call from SQL is ORA-06575, and so is a `CREATE VIEW` over it.
 
@@ -361,7 +371,14 @@ BEGIN
   RETURN p_id + ;
 END;
 /
-SELECT object_name, status FROM user_objects WHERE object_name IN ('BONUS_OF', 'BROKEN_SUM') ORDER BY object_name;
+CREATE FUNCTION bad_count (p_id NUMBER) RETURN NUMBER IS
+  n NUMBER;
+BEGIN
+  SELECT COUNT(*) INTO n FROM emp WHERE id = ;
+  RETURN n;
+END;
+/
+SELECT object_name, status FROM user_objects WHERE object_name IN ('BONUS_OF', 'BROKEN_SUM', 'BAD_COUNT') ORDER BY object_name;
 SELECT name, line, position, text FROM user_errors ORDER BY name, sequence;
 SELECT bonus_of(id) AS bonus FROM emp;
 CREATE VIEW bonus_view AS SELECT id, bonus_of(id) AS bonus FROM emp;
@@ -372,20 +389,25 @@ Warning: Function created with compilation errors.
 
 Warning: Function created with compilation errors.
 
+Warning: Function created with compilation errors.
+
 OBJECT_NAME STATUS
 ----------- -------
+BAD_COUNT   INVALID
 BONUS_OF    INVALID
 BROKEN_SUM  INVALID
 
-2 rows selected.
+3 rows selected.
 
 NAME       LINE POSITION TEXT
 ---------- ---- -------- ---------------------------------------------
+BAD_COUNT     4       46 PL/SQL: ORA-00936: missing expression
+BAD_COUNT     4        3 PL/SQL: SQL Statement ignored
 BONUS_OF      3       17 PLS-00201: identifier 'RATE' must be declared
 BONUS_OF      3        3 PL/SQL: Statement ignored
 BROKEN_SUM    3       17 PLS-00103: Encountered the symbol ";"
 
-3 rows selected.
+5 rows selected.
 
 ERROR:
 ORA-06575: Package or function BONUS_OF is in an invalid state

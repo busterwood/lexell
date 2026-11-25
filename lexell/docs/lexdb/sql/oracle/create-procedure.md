@@ -43,7 +43,7 @@ parameter:
 - An `OUT` or `IN OUT` argument may be a package variable of another package (`p(pkg.v);`): it is assigned when the
   call ends, and an error leaves it as it was (see [CREATE PACKAGE](create-package.md), example G).
 - A body that does not compile (a call of a procedure that does not exist, an undeclared name, an expression that does
-  not parse, DML on a table that does not exist) does not stop the statement: the procedure is stored **invalid**, and
+  not parse, DML on a table that does not exist, a SQL statement that does not parse) does not stop the statement: the procedure is stored **invalid**, and
   SQL\*Plus says "Warning: Procedure created with compilation errors." `USER_OBJECTS.STATUS` is `INVALID`, and `USER_ERRORS` and `ALL_ERRORS` hold the `PLS-` errors with their
   line and position. `CALL` of an invalid procedure is ORA-06575, and a block that names it is ORA-06550 with
   PLS-00905. [ALTER PROCEDURE ... COMPILE](alter-procedure.md) compiles it again (example F).
@@ -57,8 +57,12 @@ parameter:
   `PRAGMA AUTONOMOUS_TRANSACTION` clauses are not supported.
 - A call with a wrong argument count is PLS-00306, as in Oracle; an argument that cannot be converted is ORA-06502.
 - **Compilation errors are found for names and syntax only** (example G). A type error, a wrong argument count to a
-  built-in function, an unknown column of a `SELECT INTO` and a syntax error inside a SQL statement appear when the
-  procedure runs, where Oracle finds them when it compiles (`INVALID`, `USER_ERRORS`). PLS-00103's text has no list of the symbols expected.
+  built-in function and an unknown column of a `SELECT INTO` appear when the procedure runs, where Oracle finds them
+  when it compiles (`INVALID`, `USER_ERRORS`). PLS-00103's text has no list of the symbols expected.
+- A syntax error inside a SQL statement of the body is found when the procedure is created, as Oracle does: ORA-00936
+  (ORA-00907 with a parenthesis left open) at the token where lexdb's parser stopped, with `PL/SQL: SQL Statement
+  ignored` at the statement's start. Oracle's number may differ for other syntax errors, and a `SELECT ... INTO` with a
+  parenthesis left open before `INTO` (`SELECT COUNT(* INTO n FROM t`) is PLS-00428 where Oracle gives ORA-00907.
 
 ## Examples
 
@@ -260,10 +264,9 @@ PL/SQL: Statement ignored
 
 ### G. Other errors in the body
 
-DML on a table that does not exist and a PL/SQL expression that does not parse make the procedure invalid, as an
-undeclared name does. A type error does not, nor does a syntax error inside a SQL statement of the body (`bad_sql`;
-ORA-00900 when it runs, ORA-00936 as Oracle's compilation error): the procedure is created, and the error comes when
-it runs.
+DML on a table that does not exist, a PL/SQL expression that does not parse and a SQL statement that does not parse
+(`bad_sql`: ORA-00936, as Oracle's compilation error) make the procedure invalid, as an undeclared name does. A type
+error does not: the procedure is created, and the error comes when it runs.
 
 <!-- example: oracle -->
 ```sql
@@ -290,7 +293,7 @@ BEGIN
 END;
 /
 SELECT object_name, status FROM user_objects WHERE object_name IN ('LOG_IT', 'ADD_PAY', 'BAD_SQL', 'SET_DAY') ORDER BY object_name;
-SELECT name, line, position, text FROM user_errors WHERE name IN ('LOG_IT', 'ADD_PAY') ORDER BY name, sequence;
+SELECT name, line, position, text FROM user_errors WHERE name IN ('LOG_IT', 'ADD_PAY', 'BAD_SQL') ORDER BY name, sequence;
 CALL log_it(1);
 CALL bad_sql(1);
 CALL set_day(1);
@@ -301,14 +304,14 @@ Warning: Procedure created with compilation errors.
 
 Warning: Procedure created with compilation errors.
 
-Procedure created.
+Warning: Procedure created with compilation errors.
 
 Procedure created.
 
 OBJECT_NAME STATUS
 ----------- -------
 ADD_PAY     INVALID
-BAD_SQL     VALID
+BAD_SQL     INVALID
 LOG_IT      INVALID
 SET_DAY     VALID
 
@@ -317,18 +320,18 @@ SET_DAY     VALID
 NAME    LINE POSITION TEXT
 ------- ---- -------- -----------------------------------------------
 ADD_PAY    4       15 PLS-00103: Encountered the symbol ";"
+BAD_SQL    3       36 PL/SQL: ORA-00936: missing expression
+BAD_SQL    3        3 PL/SQL: SQL Statement ignored
 LOG_IT     3       15 PL/SQL: ORA-00942: table or view does not exist
 LOG_IT     3        3 PL/SQL: SQL Statement ignored
 
-3 rows selected.
+5 rows selected.
 
 ERROR:
 ORA-06575: Package or function LOG_IT is in an invalid state
 
 ERROR:
-ORA-00900: invalid SQL statement
-ORA-06512: at "SA.BAD_SQL", line 3
-ORA-06512: at line 1
+ORA-06575: Package or function BAD_SQL is in an invalid state
 
 ERROR:
 ORA-06502: PL/SQL: value or conversion error
