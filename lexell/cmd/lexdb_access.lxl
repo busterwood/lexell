@@ -1810,8 +1810,9 @@ fn barAfter(bar: &Bar, x: int, nul: bool): bool {
 // decoded; 0, -1 as bRunInto; -2 a condition's error on one of them.
 fn bRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Rel, lz: &Lazy,
             narrow: &fn(&[]bool, &Batch, []int): Option[[]int],
-            bar: &Bar, idx: mut &[]int, kept: mut &int): Result[int, DbErr] {
-    if leaf.isCols { return cRunLazy(leaf, from, to, b, bp, t, lz, narrow, bar, idx, kept) }
+            bar: &Bar, idx: mut &[]int, kept: mut &int,
+            bigR: mut &[]int, bigK: mut &[]str, bigV: mut &[]str): Result[int, DbErr] {
+    if leaf.isCols { return cRunLazy(leaf, from, to, b, bp, t, lz, narrow, bar, idx, kept, bigR, bigK, bigV) }
     let rw = rowsFor(t)
     let rows = try lexdb_rows.fixedRunRows(leaf, from, to, &rw)
     if len(rows) == 0 { return Ok(0) }
@@ -1867,24 +1868,50 @@ fn bRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
 // entry. The rows decoded (to - from), -1 and -2 as bRunLazy.
 fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Rel, lz: &Lazy,
             narrow: &fn(&[]bool, &Batch, []int): Option[[]int],
-            bar: &Bar, idx: mut &[]int, kept: mut &int): Result[int, DbErr] {
+            bar: &Bar, idx: mut &[]int, kept: mut &int,
+            bigR: mut &[]int, bigK: mut &[]str, bigV: mut &[]str): Result[int, DbErr] {
     let n = to - from
     let r0 = b.n
     let rw = rowsFor(t)
     var rs: []int = withCapacity(n)
     for q in 0..n { append(mut &rs, r0 + q) }
     if !lexdb_rows.layoutOk(leaf, &rw) {
-        // row by row, the conditions over them all (up to a value stored
-        // apart: the row path reads that row, Q8 R8)
-        let m = try lexdb_rows.rowsInto(leaf, from, to, b, bp, &rw)
+        // Two-phase decode even on non-matching column leaves (e.g. wide tables
+        // with format-6 / inline BIG stubs): decode filter places (lz.bf) first,
+        // run WHERE and any top-N bar, and decode remaining places (lz.br) only
+        // for surviving rows.
+        let useTwo = len(lz.br.usedP) > 0
+        let m = try lexdb_rows.rowsInto(leaf, from, to, b, if useTwo { &lz.bf } else { bp }, &rw)
         if m < 0 { return Ok(m) }
         while len(rs) > m { let gone = pop(mut &rs) }
         let none: []bool = []
         let got0 = narrow(&none, b, rs)
         if got0.isNone() { return Ok(-2) }
-        let ch0 = got0.unwrap()
+        var ch0 = got0.unwrap()
         kept += len(ch0)
-        for r in ch0 { append(idx, r) }
+        if useTwo && bar.on && len(ch0) > 0 {
+            var ok: []int = withCapacity(len(ch0))
+            let kc = &b.cols[bar.col]
+            for r in ch0 { if !barAfter(bar, kc.v[r], kc.nul[r]) { append(mut &ok, r) } }
+            ch0 = ok
+        }
+        if useTwo {
+            for r in ch0 {
+                let k = from + r - r0
+                let row = lexdb_rows.leafVal(leaf, k)
+                let code = try lexdb_rows.decodeRow(&row, r, b, &lz.br, &rw)
+                if code == 2 {
+                    append(bigR, r)
+                    append(bigK, lexdb_rows.leafKey(leaf, k))
+                    append(bigV, row)
+                } else if code != 0 {
+                    return Ok(-1)
+                }
+                append(idx, r)
+            }
+        } else {
+            for r in ch0 { append(idx, r) }
+        }
         return Ok(m)
     }
     let np = lexdb_rows.leafPlaces(leaf)
@@ -2153,9 +2180,13 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
         let from: &str = if cur.started { &cur.at } else { &sc.lo }
         cur.started = true
         var stopKey = ""
+        var stopVal = ""
         var stop = 0                // 1 the batch is full, 2 a value stored apart
         var bail = false
         var bad: []DbErr = []
+        var bigR: []int = []
+        var bigK: []str = []
+        var bigV: []str = []
         try st.scanLeaves(txn, t.tree, from, sc.hi.clone(), fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
             if len(bp.ranges) > 0 && leaf.isCols && lexdb_rows.excluded(leaf, bp, &rw) { return true }
             var k = i
@@ -2165,11 +2196,12 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
                     stopKey = lexdb_rows.leafKey(leaf, k)
                     return false
                 }
-                match bRunLazy(leaf, k, min(j, k + BROWS - b.n), mut &b, bp, t, lz, narrow, bar, mut &idx, mut &kept) {
+                match bRunLazy(leaf, k, min(j, k + BROWS - b.n), mut &b, bp, t, lz, narrow, bar, mut &idx, mut &kept, mut &bigR, mut &bigK, mut &bigV) {
                     Ok(got) {
                         if got == lexdb_rows.APART {
                             stop = 2
                             stopKey = lexdb_rows.leafKey(leaf, k)
+                            stopVal = lexdb_rows.leafVal(leaf, k)
                             return false
                         }
                         if got < 0 {
@@ -2213,6 +2245,7 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
                         if code == 2 {
                             stop = 2
                             stopKey = lexdb_rows.leafKey(leaf, k)
+                            stopVal = lexdb_rows.leafVal(leaf, k)
                             return false
                         }
                     }
@@ -2229,39 +2262,67 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
         })
         if len(bad) > 0 { return Err(bad[0].clone()) }
         if bail { return Ok(None) }
-                if stop == 1 {
+        // Finish decoding lz.br for any surviving BIG rows deferred from cRunLazy
+        for bi in 0..len(bigR) {
+            let w = try st.whole(txn, t.tree, &bigK[bi], &bigV[bi])
+            let code = try lexdb_rows.decodeRow(&w, bigR[bi], mut &b, &lz.br, &rw)
+            if code == 1 { return Ok(None) }
+            if code != 0 && !(try bRowOf(st, txn, t, &bigK[bi], &bigV[bi], bigR[bi], mut &b, &lz.br)) { return Ok(None) }
+        }
+        if stop == 1 {
             cur.at = stopKey
             break
         }
         if stop == 2 {
-            // Decode filter columns (lz.bf) from the inline prefix first (st.getPart);
-            // only fetch full overflow and decode remaining columns (lz.br) if the row
-            // passes both WHERE and any top-N bar.
-            let got = try st.getPart(txn, t.tree, &stopKey)
-            match got {
-                Some(v) {
-                    let r = b.n
-                    if !(try bRowOf(st, txn, t, &stopKey, &v, r, mut &b, &lz.bf)) { return Ok(None) }
-                    let none: []bool = []
-                    let chOpt = narrow(&none, &b, [r])
-                    if chOpt.isNone() { return Ok(None) }
-                    let ch = chOpt.unwrap()
-                    if len(ch) > 0 {
-                        kept += 1
-                        var keep = true
-                        if bar.on {
-                            let kc = &b.cols[bar.col]
-                            if barAfter(bar, kc.v[r], kc.nul[r]) { keep = false }
-                        }
-                        if keep {
-                            if !(try bRowOf(st, txn, t, &stopKey, &v, r, mut &b, &lz.br)) { return Ok(None) }
-                            append(mut &idx, r)
-                        }
+            // Decode filter columns (lz.bf) directly into the batch without re-reading
+            // the leaf via getPart or allocating an intermediate full-width []Val row.
+            let r = b.n
+            var wholeOpt: Option[str] = None
+            var okBf = false
+            match lexdb_rows.partOf(&stopVal) {
+                Some(p) {
+                    if lexdb_rows.fitsInStop(&p, lz.bf.stopAt, &lz.bf.placeCol) {
+                        let code = try lexdb_rows.decodeRow(&p, r, mut &b, &lz.bf, &rw)
+                        if code == 1 { return Ok(None) }
+                        if code == 0 { okBf = true }
                     }
-                    b.n += 1
                 }
                 None {}
             }
+            if !okBf {
+                let w = try st.whole(txn, t.tree, &stopKey, &stopVal)
+                let code = try lexdb_rows.decodeRow(&w, r, mut &b, &lz.bf, &rw)
+                if code == 1 { return Ok(None) }
+                if code != 0 {
+                    if !(try bRowOf(st, txn, t, &stopKey, &stopVal, r, mut &b, &lz.bf)) { return Ok(None) }
+                }
+                wholeOpt = Some(w)
+            }
+            let none: []bool = []
+            let chOpt = narrow(&none, &b, [r])
+            if chOpt.isNone() { return Ok(None) }
+            let ch = chOpt.unwrap()
+            if len(ch) > 0 {
+                kept += 1
+                var keep = true
+                if bar.on {
+                    let kc = &b.cols[bar.col]
+                    if barAfter(bar, kc.v[r], kc.nul[r]) { keep = false }
+                }
+                if keep {
+                    if len(lz.br.usedP) > 0 {
+                        let w = match wholeOpt {
+                            Some(x) { x }
+                            None { try st.whole(txn, t.tree, &stopKey, &stopVal) }
+                        }
+                        let code = try lexdb_rows.decodeRow(&w, r, mut &b, &lz.br, &rw)
+                        if code == 1 { return Ok(None) }
+                        if code != 0 && !(try bRowOf(st, txn, t, &stopKey, &stopVal, r, mut &b, &lz.br)) { return Ok(None) }
+                    }
+                    append(mut &idx, r)
+                }
+            }
+            b.n += 1
             cur.at = after(&stopKey)
             continue
         }

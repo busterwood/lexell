@@ -7203,11 +7203,8 @@ fn dupKey(t: &Table, row: &[]Val): DbErr {
 
 fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits, pc: mut &PlanCache): Result[Res, DbErr] {
     if pc.keep {
-        let ver = try dmlVersion(st, txn)
-        if pc.ver != ver {
-            pc.dml = []
-            pc.ver = ver
-        } else if len(pc.dml) > 0 && pc.dml[0].kind == DML_INS {
+        try checkDmlCache(st, txn, pc)
+        if len(pc.dml) > 0 && pc.dml[0].kind == DML_INS {
             return runFastIns(st, txn, &pc.dml[0], params)
         }
     }
@@ -7906,11 +7903,8 @@ fn storeRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: [
 fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits, pc: mut &PlanCache): Result[Res, DbErr] {
     if s.copy.batchRows > 0 { return batchDml(st, txn, s, params, ptypes, lim) }
     if pc.keep {
-        let ver = try dmlVersion(st, txn)
-        if pc.ver != ver {
-            pc.dml = []
-            pc.ver = ver
-        } else if len(pc.dml) > 0 && pc.dml[0].kind == DML_UPD {
+        try checkDmlCache(st, txn, pc)
+        if len(pc.dml) > 0 && pc.dml[0].kind == DML_UPD {
             match try runFastUpd(st, txn, &pc.dml[0], params) {
                 Some(r) { return Ok(r) }
                 None {}
@@ -8133,11 +8127,8 @@ fn updNew(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats
 fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits, pc: mut &PlanCache): Result[Res, DbErr] {
     if s.copy.batchRows > 0 { return batchDml(st, txn, s, params, ptypes, lim) }
     if pc.keep {
-        let ver = try dmlVersion(st, txn)
-        if pc.ver != ver {
-            pc.dml = []
-            pc.ver = ver
-        } else if len(pc.dml) > 0 && pc.dml[0].kind == DML_DEL {
+        try checkDmlCache(st, txn, pc)
+        if len(pc.dml) > 0 && pc.dml[0].kind == DML_DEL {
             match try runFastDel(st, txn, &pc.dml[0], params) {
                 Some(r) { return Ok(r) }
                 None {}
@@ -9353,11 +9344,29 @@ fn orderValue(o: &Expr, outs: &[]OutCol, vals: &[]Val, env: &Env): Result[Val, D
 fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
           lim: Limits, pc: mut &PlanCache, sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
     if pc.keep {
-        let ver = try planVersion(st, txn)
-        if pc.ver != ver {
-            pc.sels = []
-            pc.looks = []
-            pc.ver = ver
+        var fastHit = false
+        if pc.fastGen > 0 && len(txn.sql.path) == 0 && len(txn.tmp) == 0 && txn.sql.zone.isUtc() &&
+           pc.fastRules == txn.sql.rules && pc.fastMem == txn.sql.memMax && pc.fastNoting == txn.noting() &&
+           st.memo.roleGen() == pc.fastRole &&
+           st.fastCatMatch(txn, lexdb_catalog.CATALOG, CAT_VERSION, pc.fastGen) {
+            fastHit = true
+        }
+        if !fastHit {
+            let ver = try planVersion(st, txn)
+            if pc.ver != ver {
+                pc.sels = []
+                pc.looks = []
+                pc.ver = ver
+            }
+            if len(txn.sql.path) == 0 && len(txn.tmp) == 0 && txn.sql.zone.isUtc() {
+                pc.fastGen = st.catGenNow(txn, lexdb_catalog.CATALOG)
+                pc.fastRole = st.memo.roleGen()
+                pc.fastRules = txn.sql.rules
+                pc.fastMem = txn.sql.memMax
+                pc.fastNoting = txn.noting()
+            } else {
+                pc.fastGen = -1
+            }
         }
         for i in 0..len(pc.sels) {
             if lexdb_plan.looksHold(&pc.looks[i], params) { return runSelTo(st, txn, &pc.sels[i], params, lim, sink) }
@@ -10616,11 +10625,47 @@ type DmlPlan = record {
     lmode: int
 }
 
-pub type PlanCache = record { sels: []Sel; looks: [][]Look; dml: []DmlPlan; ver: str; keep: bool; pub plans: int }
+pub type PlanCache = record {
+    sels: []Sel
+    looks: [][]Look
+    dml: []DmlPlan
+    ver: str
+    keep: bool
+    pub plans: int
+    fastGen: int
+    fastRole: int
+    fastRules: bool
+    fastMem: int
+    fastNoting: bool
+}
 
-pub fn newPlanCache(): PlanCache { return PlanCache{sels: [], looks: [], dml: [], ver: "", keep: true, plans: 0} }
+pub fn newPlanCache(): PlanCache {
+    return PlanCache{sels: [], looks: [], dml: [], ver: "", keep: true, plans: 0, fastGen: -1, fastRole: -1, fastRules: false, fastMem: 0, fastNoting: false}
+}
 
-pub fn oneShot(): PlanCache { return PlanCache{sels: [], looks: [], dml: [], ver: "", keep: false, plans: 0} }
+pub fn oneShot(): PlanCache {
+    return PlanCache{sels: [], looks: [], dml: [], ver: "", keep: false, plans: 0, fastGen: -1, fastRole: -1, fastRules: false, fastMem: 0, fastNoting: false}
+}
+
+fn checkDmlCache(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pc: mut &PlanCache): Result[Unit, DbErr] {
+    if pc.fastGen > 0 && len(txn.sql.path) == 0 && len(txn.tmp) == 0 && txn.sql.zone.isUtc() &&
+       st.memo.roleGen() == pc.fastRole &&
+       st.fastCatMatch(txn, lexdb_catalog.CATALOG, CAT_VERSION, pc.fastGen) {
+        return Ok(Unit{})
+    }
+    let ver = try dmlVersion(st, txn)
+    if pc.ver != ver {
+        pc.dml = []
+        pc.ver = ver
+    }
+    if len(txn.sql.path) == 0 && len(txn.tmp) == 0 && txn.sql.zone.isUtc() {
+        pc.fastGen = st.catGenNow(txn, lexdb_catalog.CATALOG)
+        pc.fastRole = st.memo.roleGen()
+    } else {
+        pc.fastGen = -1
+    }
+    return Ok(Unit{})
+}
 
 fn dmlVersion(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[str, DbErr] {
     var ver = try catVersion(st, txn)

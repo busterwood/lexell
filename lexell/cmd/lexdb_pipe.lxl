@@ -3738,7 +3738,7 @@ fn aggFirst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.P
             append(mut &slots, sc.first + i)
         }
     }
-    var rg = RowGroups{row: array(len(cols), Val.Null), index: newMap(), firsts: [], accs: [], specs: callSpecs(a), added: 0, kb: "", sets: []}
+    var rg = RowGroups{row: array(len(cols), Val.Null), index: newMap(), firsts: [], accs: [], starCnt: [], allStar: false, specs: callSpecs(a), added: 0, kb: "", sets: []}
     let maxHeld = bud.maxHeld
     var vals: []Val = []
     var noSort = noSortRun()
@@ -4028,6 +4028,11 @@ type AggSt = record {
     byInt: Map[int, int]
     byKey: Map[str, int]
     byText: Map[str, int]
+    twoInt: bool            // two integer/bool keys: flat open-addressing hash table (zero string alloc)
+    ht: []int               // slot -> group id + 1 (0 = empty)
+    hk0: []int              // per group: key 0
+    hk1: []int              // per group: key 1
+    hnu: []byte             // per group: bit 0 = key 0 null, bit 1 = key 1 null
     nullGroup: int
     oneKey: bool
     sorted: bool            // grouped by the scan's order (one key, the primary key's first column)
@@ -4290,7 +4295,8 @@ fn aggState(a: &lexdb_plan.PAgg, ks: &[]int, cols: &[]lexdb_sql.ColDef, kinds: &
     for i in 0..len(need) { if need[i] && i < len(a.keep) && a.keep[i] { append(mut &fcols, i) } }
     let ns = len(specs)
     var ag = AggSt{keys: keys, specs: specs, gens: gens, gcs: gcs, kinds: collections.copyOf(kinds), fcols: fcols, fv: [], ngroups: 0,
-                   an: [], asum: [], amm: [], aval: [], adec: [], afs: [], afq: [], asets: [], byInt: newMap(), byKey: newMap(), byText: newMap(), nullGroup: -1,
+                   an: [], asum: [], amm: [], aval: [], adec: [], afs: [], afq: [], asets: [], byInt: newMap(), byKey: newMap(), byText: newMap(),
+                   twoInt: false, ht: [], hk0: [], hk1: [], hnu: [], nullGroup: -1,
                    oneKey: false, sorted: false, lastKey: 0, lastG: -1, textCol: -1, added: 0, room: room, maxHeld: maxHeld,
                    track: false, base: 0, born: []}
     for i in 0..ns {
@@ -4304,6 +4310,9 @@ fn aggState(a: &lexdb_plan.PAgg, ks: &[]int, cols: &[]lexdb_sql.ColDef, kinds: &
         append(mut &ag.asets, [])
     }
     ag.oneKey = len(ag.keys) == 1 && ag.keys[0].typ != BT_OTHER
+    ag.twoInt = len(ag.keys) == 2 &&
+                (ag.keys[0].typ == BT_INT || ag.keys[0].typ == BT_BOOL) &&
+                (ag.keys[1].typ == BT_INT || ag.keys[1].typ == BT_BOOL)
     if len(ag.keys) == 1 && ag.keys[0].typ == BT_OTHER {
         match ag.keys[0].n {
             BNode.Col(c) {
@@ -4323,25 +4332,53 @@ fn (ag: &AggSt) anyDec(kinds: &[]int, need: &[]bool): bool {
     return false
 }
 
+fn hashTwoInt(k0: int, k1: int, nu: byte): int {
+    let h1 = k1.hash()
+    let h = k0.hash() ^ (h1 << 1) ^ (h1 >> 7) ^ (u64(nu) << 29)
+    return int(h & u64(0x7fffffffffffffff))
+}
+
+fn (ag: mut &AggSt) growTwoInt() {
+    let cap = if len(ag.ht) == 0 { 1024 } else { len(ag.ht) * 2 }
+    let mask = cap - 1
+    var nht: []int = array(cap, 0)
+    for g in 0..len(ag.hk0) {
+        var sl = hashTwoInt(ag.hk0[g], ag.hk1[g], ag.hnu[g]) & mask
+        while nht[sl] != 0 { sl = (sl + 1) & mask }
+        nht[sl] = g + 1
+    }
+    ag.ht = nht
+}
+
 // A new group's states (born: the place of the row that makes it, in the
 // rows eaten so far).
 fn (ag: mut &AggSt) newGroup(born: int) {
     if ag.track { append(mut &ag.born, born) }
     for i in 0..len(ag.specs) {
-        if ag.specs[i].kind == BA_GEN {
+        let kd = ag.specs[i].kind
+        if kd == BA_GEN {
             append(mut &ag.gcs[i].accs, lexdb_agg.newAcc())
             continue
         }
-        if ag.specs[i].kind == BA_CNTD { append(mut &ag.asets[i], newMap()) }
-        if ag.specs[i].kind == BA_VAR {
-            append(mut &ag.afs[i], 0.0f)
-            append(mut &ag.afq[i], 0.0f)
+        if kd == BA_CNTD {
+            append(mut &ag.asets[i], newMap())
+            continue
         }
         append(mut &ag.an[i], 0)
-        append(mut &ag.asum[i], 0)
-        append(mut &ag.amm[i], 0)
-        append(mut &ag.aval[i], Val.Null)
-        append(mut &ag.adec[i], i128(0))
+        if kd == BA_VAR {
+            append(mut &ag.afs[i], 0.0f)
+            append(mut &ag.afq[i], 0.0f)
+        } else if kd == BA_AND || kd == BA_OR {
+            append(mut &ag.amm[i], 0)
+        } else if ag.specs[i].vcol >= 0 || ag.gens[i].isSome() {
+            append(mut &ag.aval[i], Val.Null)
+        } else if ag.specs[i].dsc >= 0 && (kd == BA_SUM || kd == BA_AVG) {
+            append(mut &ag.adec[i], i128(0))
+        } else if kd == BA_SUM || kd == BA_AVG {
+            append(mut &ag.asum[i], 0)
+        } else if kd == BA_MIN || kd == BA_MAX {
+            append(mut &ag.amm[i], 0)
+        }
     }
 }
 
@@ -4408,6 +4445,28 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
                         else { return Ok(false) }
                     }
                 }
+            } else if ag.twoInt {
+                let n0 = kvs[0].nul[j]
+                let n1 = kvs[1].nul[j]
+                let k0 = if n0 { 0 } else { kvs[0].v[j] }
+                let k1 = if n1 { 0 } else { kvs[1].v[j] }
+                let nu = byte((if n0 { 1 } else { 0 }) | (if n1 { 2 } else { 0 }))
+                klen = (if n0 { 1 } else if ag.keys[0].typ == BT_BOOL { 2 } else { 9 }) +
+                       (if n1 { 1 } else if ag.keys[1].typ == BT_BOOL { 2 } else { 9 })
+                if len(ag.ht) > 0 {
+                    let mask = len(ag.ht) - 1
+                    var sl = hashTwoInt(k0, k1, nu) & mask
+                    while true {
+                        let e = ag.ht[sl]
+                        if e == 0 { break }
+                        let eg = e - 1
+                        if ag.hk0[eg] == k0 && ag.hk1[eg] == k1 && ag.hnu[eg] == nu {
+                            g = eg
+                            break
+                        }
+                        sl = (sl + 1) & mask
+                    }
+                }
             } else if !ag.oneKey {
                 kb.clear()
                 for ki in 0..len(ag.keys) { bKeyEnc(mut &kb, &ag.keys[ki], &kvs[ki], j, b, idx[j], ktxt[ki]) }
@@ -4443,6 +4502,23 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
                         ag.lastG = g
                     } else {
                         ag.byInt.put(kvs[0].v[j], g)
+                    }
+                } else if ag.twoInt {
+                    let n0 = kvs[0].nul[j]
+                    let n1 = kvs[1].nul[j]
+                    let k0 = if n0 { 0 } else { kvs[0].v[j] }
+                    let k1 = if n1 { 0 } else { kvs[1].v[j] }
+                    let nu = byte((if n0 { 1 } else { 0 }) | (if n1 { 2 } else { 0 }))
+                    append(mut &ag.hk0, k0)
+                    append(mut &ag.hk1, k1)
+                    append(mut &ag.hnu, nu)
+                    if len(ag.ht) == 0 || ag.ngroups * 10 >= len(ag.ht) * 7 {
+                        ag.growTwoInt()
+                    } else {
+                        let mask = len(ag.ht) - 1
+                        var sl = hashTwoInt(k0, k1, nu) & mask
+                        while ag.ht[sl] != 0 { sl = (sl + 1) & mask }
+                        ag.ht[sl] = g + 1
                     }
                 } else {
                     ag.byKey.put(kb.clone(), g)
@@ -4565,14 +4641,20 @@ fn (ag: mut &AggSt) groupAt(g: int, first: mut &[]Val, accs: mut &[]Acc): Result
             accs[si] = replace(mut &ag.gcs[si].accs[g], lexdb_agg.newAcc())
             continue
         }
+        if kd == BA_CNTD {
+            let acc = mut &accs[si]
+            acc.n = ag.asets[si][g].size()
+            acc.sum = Val.Null
+            acc.sumsq = Val.Null
+            acc.val = Val.Null
+            continue
+        }
         let acc = mut &accs[si]
         acc.n = ag.an[si][g]
         acc.sum = Val.Null
         acc.sumsq = Val.Null
         acc.val = Val.Null
-        if kd == BA_CNTD {
-            acc.n = ag.asets[si][g].size()
-        } else if kd == BA_VAR {
+        if kd == BA_VAR {
             if acc.n > 0 {
                 acc.sum = Val.Float(ag.afs[si][g])
                 acc.sumsq = Val.Float(ag.afq[si][g])
@@ -4712,6 +4794,8 @@ type RowGroups = record {
     index: Map[str, int]
     firsts: [][]Val
     accs: []Acc
+    starCnt: []int          // allStar fast path: single COUNT(*) without FILTER/sets (zero Acc alloc)
+    allStar: bool
     specs: []lexdb_agg.AggSpec     // per call: what lexdb_agg reads of it
     added: int
     kb: str    // the key being looked up, reused row to row
@@ -4740,9 +4824,9 @@ fn aggRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
         }
     }
     if src.held || rowLen == 0 { rowLen = len(cols) }
-    var rg = RowGroups{row: array(rowLen, Val.Null), index: newMap(), firsts: [], accs: [], specs: callSpecs(a), added: 0, kb: "", sets: []}
+    let allStar = len(a.calls) == 1 && a.calls[0].star && a.calls[0].filter.isNone() && len(a.sets) == 0
+    var rg = RowGroups{row: array(rowLen, Val.Null), index: newMap(), firsts: [], accs: [], starCnt: [], allStar: allStar, specs: callSpecs(a), added: 0, kb: "", sets: []}
     let maxHeld = bud.maxHeld
-    var vals: []Val = []
     var noSort = noSortRun()
     if src.held && !src.batch {
         // a few rows the run holds: each straight into the groups' row
@@ -4773,8 +4857,7 @@ fn aggRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
             return Ok(true)
         }
         for j in 0..ob.n {
-            obRow(ob, j, mut &vals)
-            for k in 0..len(slots) { rg.row[slots[k]] = replace(mut &vals[k], Val.Null) }
+            obRowInto(ob, j, &slots, mut &rg.row)
             try groupRow(mut &rg, a, cx, room, maxHeld)
         }
         return Ok(true)
@@ -4785,12 +4868,39 @@ fn aggRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
 
 // Each group of rg (ns calls), its first row and accumulators, to give.
 fn giveGroups(rg: mut &RowGroups, ns: int, give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[Unit, DbErr] {
+    if rg.allStar {
+        for g in 0..len(rg.firsts) {
+            var acc = lexdb_agg.newAcc()
+            acc.n = rg.starCnt[g]
+            var accs: []Acc = [acc]
+            try give(mut &rg.firsts[g], -1, mut &accs)
+        }
+        return Ok(Unit{})
+    }
     for g in 0..len(rg.firsts) {
         var accs: []Acc = withCapacity(ns)
         for i in 0..ns { append(mut &accs, replace(mut &rg.accs[g * ns + i], lexdb_agg.newAcc())) }
         try give(mut &rg.firsts[g], if len(rg.sets) > 0 { rg.sets[g] } else { -1 }, mut &accs)
     }
     return Ok(Unit{})
+}
+
+fn obRowInto(ob: &lexdb_rows.OutBatch, j: int, slots: &[]int, row: mut &[]Val) {
+    let r = ob.idx[j]
+    for o in 0..len(slots) {
+        let sl = slots[o]
+        let k = ob.kinds[o]
+        let c = ob.src[o]
+        if c < 0 {
+            let x = &ob.ex[o]
+            row[sl] = if x.nul[j] { Val.Null } else if k == BK_BOOL { Val.Bool(x.v[j] == 1) } else { Val.Int(x.v[j]) }
+        } else if ob.cols[c].nul[r] {
+            row[sl] = Val.Null
+        } else {
+            row[sl] = if k == lexdb_rows.BK_INT { Val.Int(ob.cols[c].v[r]) } else if k == BK_BOOL { Val.Bool(ob.cols[c].v[r] == 1) }
+                      else if k == lexdb_rows.BK_TEXT { Val.Text(lexdb_rows.obText(ob, o, j).clone()) } else { ob.vals[c][r].clone() }
+        }
+    }
 }
 
 // Fast injective hash-key encoding for RowGroups (avoids byte-by-byte \x00 escaping
@@ -4818,6 +4928,35 @@ fn encHashVal(b: mut &str, v: &Val) {
             b.addByte(byte((n >> 16) & 255))
             b.addByte(byte((n >> 24) & 255))
             b += s
+        }
+        Val.Num(d) {
+            var c = d.coefficient()
+            var e = d.exponent()
+            if c == u128(0) {
+                b.addByte(6)
+                for _ in 0..8 { b.addByte(0) }
+            } else {
+                while e < 0 && c % u128(10) == u128(0) {
+                    c = c / u128(10)
+                    e += 1
+                }
+                if e == 0 && c <= u128(0x7fffffffffffffff) {
+                    let n0 = int(c)
+                    let n = if d.isNeg() { -n0 } else { n0 }
+                    b.addByte(6)
+                    b.addByte(byte(n & 255))
+                    b.addByte(byte((n >> 8) & 255))
+                    b.addByte(byte((n >> 16) & 255))
+                    b.addByte(byte((n >> 24) & 255))
+                    b.addByte(byte((n >> 32) & 255))
+                    b.addByte(byte((n >> 40) & 255))
+                    b.addByte(byte((n >> 48) & 255))
+                    b.addByte(byte((n >> 56) & 255))
+                } else {
+                    b.addByte(5)
+                    lexdb_access.encIdxPart(b, v)
+                }
+            }
         }
         else {
             b.addByte(5)
@@ -4870,6 +5009,10 @@ fn groupRow(rg: mut &RowGroups, a: &lexdb_plan.PAgg, cx: &Ctx, room: int, maxHel
                 rg.index.put(rg.kb.clone(), g)
                 let rlen = len(rg.row)
                 append(mut &rg.firsts, replace(mut &rg.row, array(rlen, Val.Null)))
+                if rg.allStar {
+                    append(mut &rg.starCnt, 1)
+                    return Ok(Unit{})
+                }
                 for i in 0..ns { append(mut &rg.accs, lexdb_agg.newAcc()) }
                 moved = true
             }
@@ -4877,8 +5020,16 @@ fn groupRow(rg: mut &RowGroups, a: &lexdb_plan.PAgg, cx: &Ctx, room: int, maxHel
     } else if len(rg.firsts) == 0 {
         let rlen = len(rg.row)
         append(mut &rg.firsts, replace(mut &rg.row, array(rlen, Val.Null)))
+        if rg.allStar {
+            append(mut &rg.starCnt, 1)
+            return Ok(Unit{})
+        }
         for i in 0..ns { append(mut &rg.accs, lexdb_agg.newAcc()) }
         moved = true
+    }
+    if rg.allStar {
+        rg.starCnt[g] += 1
+        return Ok(Unit{})
     }
     if moved {
         for i in 0..ns { try accOne(&a.calls[i], &rg.specs[i], mut &rg.accs[g * ns + i], &rg.firsts[g], cx) }
@@ -7888,7 +8039,8 @@ fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top0: &lexdb_plan.
     let want = aggWant(a, nq, &ap)
     var wl: []int = []
     for c in 0..nq { if want[c] { append(mut &wl, c) } }
-    var rg = RowGroups{row: array(nq, Val.Null), index: newMap(), firsts: [], accs: [], specs: callSpecs(a), added: 0, kb: "", sets: []}
+    let allStar = len(a.calls) == 1 && a.calls[0].star && a.calls[0].filter.isNone() && len(a.sets) == 0
+    var rg = RowGroups{row: array(nq, Val.Null), index: newMap(), firsts: [], accs: [], starCnt: [], allStar: allStar, specs: callSpecs(a), added: 0, kb: "", sets: []}
     let ks = collections.copyOf(&kinds)
     try joinRows(st, txn, top, cols, tabs, srcs, vrows, cx, false, kinds, owner, collections.copyOf(&want), false, bud, cnt, &ap,
                  fn(tx: mut &lexdb_store.Txn, f: mut &Batch): Result[bool, DbErr] {
@@ -8160,9 +8312,9 @@ fn (sr: mut &SortSt) begin(ob: &lexdb_rows.OutBatch, ncol: int) {
         sr.dmode = if sr.shown == 1 && sr.kinds[0] != BK_VAL { 1 } else if sr.shown == 1 { 2 } else { 3 }
     }
     if sr.sorting && !sr.distinct && sr.topK < 0 && sr.shown == 1 && len(sr.keyCol) == 1 && sr.keyCol[0] == 0 &&
-       sr.coll[0] == lexdb_sql.COLL_EXACT && ob.n > 0 && ob.src[0] >= 0 && ob.kinds[0] == lexdb_rows.BK_TEXT {
+       (sr.coll[0] == lexdb_sql.COLL_EXACT || sr.coll[0] == lexdb_sql.COLL_PAD) && ob.n > 0 && ob.src[0] >= 0 && ob.kinds[0] == lexdb_rows.BK_TEXT {
         sr.text1 = true
-        sr.set.keys[0] = lexdb_sort.newSKey(lexdb_sort.SK_TEXT, sr.desc[0], sr.nf[0])
+        sr.set.keys[0] = lexdb_sort.newSKey(if sr.coll[0] == lexdb_sql.COLL_PAD { lexdb_sort.SK_PAD } else { lexdb_sort.SK_TEXT }, sr.desc[0], sr.nf[0])
     }
 }
 
@@ -8184,7 +8336,8 @@ fn (sr: mut &SortSt) dropText1() {
             append(mut &bs, 80)
         } else {
             let s = &sr.set.keys[0].strs[i]
-            append(mut &kvals, Val.Text(s.clone()))
+            let kv = if sr.coll[0] == lexdb_sql.COLL_PAD { lexdb_sort.collVal(sr.coll[0], &Val.Text(s.clone())) } else { Val.Text(s.clone()) }
+            append(mut &kvals, kv)
             append(mut &ovals, Val.Text(s.clone()))
             append(mut &nuls, false)
             append(mut &bs, 80 + 2 * len(s))
@@ -10199,25 +10352,37 @@ fn groupsBody(txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, c
             }
         }
     }
+    let starKey = aggKey >= 0 && specs[aggKey].star && !specs[aggKey].distinct
+    let oneOrd = len(go.desc) == 1
     var hasBar = false
     var barVal: Val = Val.Null
+    var barInt = 0
     let capN = if topN > 0 { max(topN * 2, 64) } else { 0 }
     var bases: []WinRow = []
     for gi in 0..len(firsts) {
         let si = if sets { gsets[gi] } else { -1 }
         if aggKey >= 0 && hasBar {
-            let kv = try lexdb_agg.finish(&specs[aggKey], &accss[gi][aggKey])
-            let na = lexdb_ops.isNull(&kv)
-            let nb = lexdb_ops.isNull(&barVal)
-            var c = 0
-            if na && nb { c = 0 }
-            else if na { c = if go.nf[0] { -1 } else { 1 } }
-            else if nb { c = if go.nf[0] { 1 } else { -1 } }
-            else {
-                c = lexdb_sort.sortCmp(&kv, &barVal)
-                if go.desc[0] { c = -c }
+            if starKey {
+                let n = accss[gi][aggKey].n
+                if go.desc[0] {
+                    if n < barInt || (oneOrd && n == barInt) { continue }
+                } else {
+                    if n > barInt || (oneOrd && n == barInt) { continue }
+                }
+            } else {
+                let kv = try lexdb_agg.finish(&specs[aggKey], &accss[gi][aggKey])
+                let na = lexdb_ops.isNull(&kv)
+                let nb = lexdb_ops.isNull(&barVal)
+                var c = 0
+                if na && nb { c = 0 }
+                else if na { c = if go.nf[0] { -1 } else { 1 } }
+                else if nb { c = if go.nf[0] { 1 } else { -1 } }
+                else {
+                    c = lexdb_sort.sortCmp(&kv, &barVal)
+                    if go.desc[0] { c = -c }
+                }
+                if c > 0 || (oneOrd && c == 0) { continue }
             }
-            if c > 0 { continue }
         }
         var vals: []Val = withCapacity(ns)
         for k in 0..ns { append(mut &vals, try lexdb_agg.finish(&specs[k], &accss[gi][k])) }
@@ -10239,6 +10404,12 @@ fn groupsBody(txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, c
             collections.sortBy(mut &go.rows, fn(a: &GRow, b: &GRow): int { return ordCmpOf(desc, nf, &a.ord, &b.ord) })
             while len(go.rows) > topN { let gone = pop(mut &go.rows) }
             barVal = go.rows[topN - 1].ord[0].clone()
+            if starKey {
+                match &barVal {
+                    Val.Int(x) { barInt = x }
+                    else {}
+                }
+            }
             hasBar = true
         }
     }
