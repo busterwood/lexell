@@ -307,6 +307,14 @@ fn tableOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str): Result
     }
 }
 
+// A table for the checks: shared with the cache of tables decoded (lexdb_catalog.decTableCached), not changed.
+fn tableRc(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str): Result[Option[rc Table], DbErr] {
+    match try st.get(txn, lexdb_catalog.CATALOG, key) {
+        Some(v) { return Ok(Some(try lexdb_catalog.decTableCached(key, &v, lexdb_parse.parseExpr))) }
+        None { return Ok(None) }
+    }
+}
+
 fn putTable(txn: mut &lexdb_store.Txn, t: &Table): Result[Unit, DbErr] {
     try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(t)))
     return Ok(Unit{})
@@ -1213,8 +1221,7 @@ fn planCache(): task.Shared[Plans] {
     return PLANS.get().share()
 }
 
-fn planOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion): Result[rc Plan, DbErr] {
-    let row = encode(a)
+fn planOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, row: &str): Result[rc Plan, DbErr] {
     let c = planCache()
     var hit: Option[rc Plan] = None
     c.with(fn(pc: mut &Plans) {
@@ -1234,14 +1241,17 @@ fn planOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion): Res
     let keep = p.share()
     c.with(fn(pc: mut &Plans) {
         if pc.m.size() >= 1024 { pc.m = newMap() }
-        pc.m.put(a.key.clone(), PlanEnt{row: row.clone(), p: keep.share()})
+        pc.m.put(a.key.clone(), PlanEnt{row: row.toStr(), p: keep.share()})
     })
     return Ok(p)
 }
 
 // Past this many rows a statement put to an instance's table, the whole query is run (for a VALIDATED assertion: the same
 // answer); up to it, the query with the instance restricted to them, CHUNK at a time.
-const MAX_KEYS = 64
+var MAX_KEYS: int = 64
+
+// For the tests and measurements: past n rows put, the whole query (0: always).
+pub fn setWholeOver(n: int) { MAX_KEYS = n }
 const CHUNK = 16
 
 // x with c ANDed to the WHERE of the block at path.
@@ -1382,12 +1392,12 @@ fn putRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, mark: i
 
 // Assertion a after statements that wrote ws: its query run for what they may have broken; under its lock (taken first)
 // when another transaction's rows may take part in a row breaking it (more than one instance, or an EXISTS).
-fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ws: &[]Wr, up: &Up): Result[Unit, DbErr] {
-    let plan = try planOf(st, txn, a)
+fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, row: &str, ws: &[]Wr, up: &Up): Result[Unit, DbErr] {
+    let plan = try planOf(st, txn, a, row)
     let an = &plan.an
     var whole = false
     var ix: []int = []          // the instances to restrict: each with its table and the rows put to it
-    var ts: []Table = []
+    var ts: []rc Table = []
     var rs: [][][]Val = []
     for i in 0..len(an.insts) {
         let x = &an.insts[i]
@@ -1398,13 +1408,13 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ws
             if ws[wi].any && txn.wroteSince(ws[wi].tree, ws[wi].mark) { whole = true }
             continue
         }
-        let ks = txn.putKeys(ws[wi].tree, ws[wi].mark, MAX_KEYS)
+        let ks = txn.putKeys(ws[wi].tree, ws[wi].mark, max(MAX_KEYS, 1))
         if len(ks) == 0 { continue }
         if len(ks) > MAX_KEYS && a.validated {
             whole = true
             continue
         }
-        match try tableOf(st, txn, &x.key) {
+        match try tableRc(st, txn, &x.key) {
             Some(t) {
                 let rows = try putRows(st, txn, &t, ws[wi].mark)
                 if len(rows) == 0 { continue }
@@ -1439,11 +1449,11 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ws
             }
             if len(keep) == 0 { return Ok(Unit{}) }
             var ix2: []int = []
-            var ts2: []Table = []
+            var ts2: []rc Table = []
             var rs2: [][][]Val = []
             for j in keep {
                 append(mut &ix2, ix[j])
-                append(mut &ts2, ts[j].clone())
+                append(mut &ts2, ts[j].share())
                 append(mut &rs2, rs[j].clone())
             }
             ix = ix2
@@ -1516,7 +1526,7 @@ pub fn stmtEnd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ok: bool, s: &
     if !ok { return Ok(Unit{}) }
     var akeys: []str = []
     for k in 0..len(ws) {
-        match try tableOf(st, txn, &ws[k].key) {
+        match try tableRc(st, txn, &ws[k].key) {
             Some(t) {
                 ws[k].tree = t.tree
                 for m in marksOf(&t.refBy) { addOnce(mut &akeys, &m) }
@@ -1525,8 +1535,9 @@ pub fn stmtEnd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ok: bool, s: &
         }
     }
     for ak in akeys {
-        match try readAt(st, txn, &ak) {
-            Some(a) {
+        match try st.get(txn, lexdb_catalog.CATALOG, &ak) {
+            Some(row) {
+                let a = decode(&row)
                 if !a.enabled { continue }
                 if txn.inBlock() && deferredNow(txn, &a) {
                     var m = 1 << 60
@@ -1534,7 +1545,7 @@ pub fn stmtEnd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ok: bool, s: &
                     deferTo(txn, &a, m)
                     continue
                 }
-                try checkOne(st, txn, &a, &ws, up)
+                try checkOne(st, txn, &a, &row, &ws, up)
             }
             None {}
         }
@@ -1610,8 +1621,9 @@ fn pendingAt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, which: &Option[[
             append(mut &txn.onCommit, p0.clone())
             continue
         }
-        match try readAt(st, txn, &assertKey(&key)) {
-            Some(a) {
+        match try st.get(txn, lexdb_catalog.CATALOG, &assertKey(&key)) {
+            Some(row) {
+                let a = decode(&row)
                 if !commit && deferredNow(txn, &a) {
                     append(mut &txn.onCommit, p0.clone())
                     continue
@@ -1635,7 +1647,7 @@ fn pendingAt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, which: &Option[[
                         None {}
                     }
                 }
-                match checkOne(st, txn, &a, &ws, up) {
+                match checkOne(st, txn, &a, &row, &ws, up) {
                     Ok(_) {}
                     Err(x) { err = Some(x) }
                 }
