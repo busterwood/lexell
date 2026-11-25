@@ -52,7 +52,7 @@ differences of its statement.
     `mode() WITHIN GROUP (...)`, PostgreSQL 19's `GROUP BY ALL` without elements.
   - A subquery in `LIMIT` is 0A000.
   - `FOR UPDATE` with `FETCH ... WITH TIES` is 0A000.
-  - `json_agg`, `corr`, `regr_slope`, `covar_pop` and the other statistics aggregates do not exist (42883).
+  - `corr`, `regr_slope`, `covar_pop` and the other statistics aggregates do not exist (42883).
 - **WITH:**
   - A recursive CTE under `LIMIT`, `FETCH FIRST` or `TOP` stops when a `WHERE`, a join, a left join or a derived table
     filters it (`WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r) SELECT * FROM r WHERE n % 7 = 0 LIMIT
@@ -223,8 +223,8 @@ differences of its statement.
     (PostgreSQL: one).
   - `generate_series` works only in `FROM` (`SELECT generate_series(1, 3)` is 42883), and has no time-zone form;
     `generate_subscripts` works only in the select list.
-  - `array_append(ARRAY[1, 2], 'x')` gives `{1,2,x}` (PostgreSQL: 22P02); `array_fill`, `array_to_json` and
-    `array_sort` do not exist.
+  - `array_append(ARRAY[1, 2], 'x')` gives `{1,2,x}` (PostgreSQL: 22P02); `array_fill` and `array_sort` do
+    not exist.
   - `current_catalog`, `current_schemas`, `pg_client_encoding`, `pg_postmaster_start_time`, `current_query` and
     `pg_my_temp_schema` do not exist (42883).
   - `current_schema` names a schema of `search_path` that does not exist (PostgreSQL skips it).
@@ -234,8 +234,6 @@ differences of its statement.
   - `pg_wal_lsn_diff`, `pg_last_xact_replay_timestamp` and `pg_stat_replication` do not exist; there is no `pg_lsn`
     type, and LSNs are text with eight hex digits after the slash (`0/00000004`; PostgreSQL: `0/4`).
   - `has_column_privilege`, `pg_has_role`, `pg_column_size` and `to_regproc` do not exist.
-  - Only `json_build_object` and `jsonb_build_object` exist; the second returns the same text as the first, with
-    its keys neither sorted nor de-duplicated.
 - **Operators and expressions:**
   - Reserved words are not taken as column aliases after `AS` (`SELECT 1 AS cast` is 42601).
   - `NOTNULL` and `ISNULL` are read as aliases, not operators.
@@ -282,7 +280,7 @@ differences of its statement.
   - Views are read-only (50000), and a CTE cannot be the target of `UPDATE`, `DELETE` or `MERGE` (208).
   - `SELECT INTO` loses column attributes: `nvarchar(30)` becomes `nvarchar(max)`, a decimal gets wider, `NOT NULL`
     and `IDENTITY` are lost. `SELECT IDENTITY(int, 1, 1) AS n ... INTO` is 207.
-  - Error 156 for `PIVOT`, `UNPIVOT` and `TABLESAMPLE`, and 102 for `FOR XML`, `FOR JSON`, `$IDENTITY`, join hints
+  - Error 156 for `PIVOT`, `UNPIVOT` and `TABLESAMPLE`, and 102 for `FOR XML`, `$IDENTITY`, join hints
     (`INNER LOOP JOIN`), `FOR SYSTEM_TIME`, `GROUP BY ... WITH ROLLUP` / `WITH CUBE` (SQL Server accepts them all);
     `GROUPING_ID` is 195.
   - `TOP (subquery)` is 156 (SQL Server accepts it); `MERGE TOP ... PERCENT` is 50000.
@@ -507,7 +505,7 @@ differences of its statement.
   - `FOR UPDATE OF e.name` (columns) is ORA-00942 (a table or alias works); `FOR UPDATE WAIT n` is ORA-00900;
     `FOR UPDATE` on an inline view is accepted.
   - `FETCH FIRST n PERCENT ROWS ONLY`, `SELECT UNIQUE`, `GROUPING_ID` and `GROUP_ID` are not supported.
-  - Not supported (ORA-00900): `SAMPLE`, `AS OF`, `PIVOT`, `UNPIVOT`, `MODEL`, `XMLTABLE`, `JSON_TABLE`, a partitioned
+  - Not supported (ORA-00900): `SAMPLE`, `AS OF`, `PIVOT`, `UNPIVOT`, `MODEL`, `XMLTABLE`, a partitioned
     outer join, `UPDATE SET (a, b) = (SELECT ...)`, `UPDATE (subquery)`, `DELETE FROM (subquery)`, `LOG ERRORS`,
     `WHERE CURRENT OF`, `WITH FUNCTION`, `TRUNCATE ... DROP STORAGE`. Accepted although Oracle refuses them: `LIMIT n`,
     `UPDATE ... FROM`, `DELETE ... USING`, `WITH RECURSIVE`.
