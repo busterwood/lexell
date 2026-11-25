@@ -102,7 +102,7 @@ annotations_clause:
 
 - **Not supported (ORA-00900):** `INTERVAL YEAR TO MONTH` and `INTERVAL DAY TO SECOND` columns (the types work in
   expressions), `INVISIBLE` columns, `TABLESPACE`, storage clauses such as `PCTFREE`, `PARTITION BY`,
-  `ORGANIZATION INDEX` and `DEFERRABLE`; a column's annotations in `CREATE TABLE ... AS` (Oracle: ORA-11559).
+  `ORGANIZATION INDEX` and `DEFERRABLE`.
 - A global temporary table's annotations are kept but not listed in `USER_ANNOTATIONS_USAGE`.
 - **Constraint states** (`DISABLE`, `ENABLE`, `NOVALIDATE`) are taken on `CHECK` and foreign key constraints only: on a
   `PRIMARY KEY`, `UNIQUE` or `NOT NULL` they are ORA-00900. `NOT ENFORCED` is ORA-00900 (Oracle 23.26 has none either:

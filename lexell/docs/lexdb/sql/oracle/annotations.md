@@ -92,13 +92,6 @@ ALTER INDEX index annotations_clause
 
 ## Differences from Oracle
 
-- **A column's annotations in `CREATE TABLE ... AS`** (`CREATE TABLE c (id ANNOTATIONS (...), name) AS ...`) are
-  ORA-00900; Oracle gives ORA-11559 (`Column level annotations not allowed in CREATE TABLE AS SELECT statements`).
-  The table's own clause works there.
-- **One column twice in `MODIFY`** (`MODIFY (price ANNOTATIONS (...), price ANNOTATIONS (...))`) applies both; Oracle
-  refuses it with ORA-00957.
-- **`ALTER INDEX` of an index that does not exist** is ORA-00942; Oracle gives ORA-01418.
-- **`ALTER TABLE` of a view, or `ALTER VIEW` of a table,** is ORA-20000; Oracle gives ORA-00942.
 - **No domains:** `ALL_` and `DBA_ANNOTATIONS_USAGE` have no rows for the built-in domains of `SYS` (Oracle Free lists
   about a hundred, `OBJECT_TYPE` `DOMAIN`), and `DOMAIN_NAME` and `DOMAIN_OWNER` are always NULL.
 - **A global temporary table's annotations** are kept but not listed in the views.
@@ -349,10 +342,11 @@ ERROR:
 ORA-11548: missing or invalid annotation name 'SELECT' in the ANNOTATIONS sequence
 ```
 
-### G. Where lexdb differs
+### G. Annotations that are refused, and a temporary table
 
-Oracle gives ORA-11559, ORA-00957 (and no annotation is added), ORA-01418, ORA-00942 and ORA-00942 for the
-statements below, and counts 1 annotation on the global temporary table.
+A column's annotations in `CREATE TABLE ... AS`, one column twice in a `MODIFY`, an index that does not exist, a view
+in `ALTER TABLE` and a table in `ALTER VIEW` are refused, with Oracle's errors. The global temporary table's
+annotation is kept but not listed: Oracle counts 1.
 
 <!-- example: oracle -->
 ```sql
@@ -368,25 +362,21 @@ SELECT COUNT(*) AS n FROM user_annotations_usage WHERE object_name = 'SCRATCH';
 
 ```text
 ERROR:
-ORA-00900: invalid SQL statement
-
-Table altered.
-
-ANNOTATION_NAME
----------------
-A1
-A2
-
-2 rows selected.
+ORA-11559: Column level annotations not allowed in CREATE TABLE AS SELECT statements.
 
 ERROR:
-ORA-00942: table or view "SA"."NOTHERE_IX" does not exist
+ORA-00957: duplicate column name
+
+no rows selected
 
 ERROR:
-ORA-20000: "cheap" is a view (use ALTER VIEW)
+ORA-01418: specified index does not exist
 
 ERROR:
-ORA-20000: "product" is not a view
+ORA-00942: table or view "SA"."CHEAP" does not exist
+
+ERROR:
+ORA-00942: table or view "SA"."PRODUCT" does not exist
 
 Table created.
 

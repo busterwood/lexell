@@ -13,6 +13,7 @@ CREATE [ UNIQUE ] INDEX [ schema. ] index
 
 ALTER INDEX [ schema. ] index RENAME TO new_name
 ALTER INDEX [ schema. ] index annotations_clause
+ALTER INDEX [ schema. ] index { REBUILD [ ONLINE ] | COALESCE | PARALLEL | NOPARALLEL | LOGGING | NOLOGGING }
 
 annotations_clause:
     ANNOTATIONS ( [ ADD [ IF NOT EXISTS ] | DROP [ IF EXISTS ] | REPLACE ] name [ 'value' ] [, ...] )
@@ -45,8 +46,9 @@ annotations_clause:
 ## Differences from Oracle
 
 - **Not supported (ORA-00900):** `BITMAP` indexes, `TABLESPACE`, `COMPRESS` and the other physical clauses.
-- **`ALTER INDEX` takes only `RENAME TO` and `ANNOTATIONS`;** `REBUILD` and the others are ORA-03001.
-- `ALTER INDEX ... ANNOTATIONS` of an index that does not exist is ORA-00942 (Oracle ORA-01418).
+- **`ALTER INDEX` changes only the name and the annotations.** `REBUILD [ONLINE]`, `COALESCE`, `[NO]PARALLEL` and
+  `[NO]LOGGING` are accepted and do nothing (example H). `UNUSABLE` and the other clauses are ORA-03001, where
+  Oracle marks the index unusable.
 - An index on an expression that a virtual column's index already covers is accepted (Oracle: ORA-01408).
 
 ## Examples
@@ -197,7 +199,7 @@ ORA-00904: "NOTHERE": invalid identifier
 CREATE BITMAP INDEX ix_bm ON ix (a);
 CREATE INDEX ix_ab2 ON ix (a) TABLESPACE users;
 CREATE INDEX ix_part ON ix (a) COMPRESS;
-ALTER INDEX ix_c2 REBUILD;
+ALTER INDEX ix_c2 UNUSABLE;
 ```
 
 ```text
@@ -211,7 +213,7 @@ ERROR:
 ORA-00900: invalid SQL statement
 
 ERROR:
-ORA-03001: unimplemented feature: lexdb: ALTER INDEX takes RENAME TO only
+ORA-03001: unimplemented feature: lexdb: ALTER INDEX takes RENAME TO, ANNOTATIONS, REBUILD, COALESCE, [NO]PARALLEL and [NO]LOGGING only
 ```
 
 ### G. Annotations
@@ -242,6 +244,36 @@ INDEX       IX_B2       PURPOSE         lookup by b
 
 ERROR:
 ORA-11552: Provided annotation 'OWNER' already exists for the object 'IX_B2'.
+```
+
+### H. Maintenance clauses
+
+`REBUILD`, `COALESCE` and the parallel and logging settings are accepted, as for an index that needs nothing done; an
+index that does not exist is ORA-01418.
+
+<!-- example: oracle -->
+```sql
+ALTER INDEX ix_c2 REBUILD;
+ALTER INDEX ix_c2 REBUILD ONLINE;
+ALTER INDEX ix_c2 COALESCE;
+ALTER INDEX ix_c2 NOPARALLEL;
+ALTER INDEX ix_c2 LOGGING;
+ALTER INDEX nothere REBUILD;
+```
+
+```text
+Index altered.
+
+Index altered.
+
+Index altered.
+
+Index altered.
+
+Index altered.
+
+ERROR:
+ORA-01418: specified index does not exist
 ```
 
 ## See also

@@ -97,8 +97,6 @@ constraint states mean.
   or of `NOT NULL` is ORA-00900. `RELY` and `NORELY` are read and not kept (`USER_CONSTRAINTS.RELY` is empty).
   Oracle has no `NOT ENFORCED`; neither has lexdb (ORA-00900).
 - `ALTER TABLE ... ALTER COLUMN` (T-SQL and PostgreSQL's form) is ORA-01735.
-- `ALTER TABLE` of a view is ORA-20000 (Oracle ORA-00942). One column twice in a `MODIFY` with annotations
-  (`MODIFY (c ANNOTATIONS (...), c ANNOTATIONS (...))`) applies both, where Oracle gives ORA-00957.
 
 ## Examples
 
