@@ -24,6 +24,10 @@ against it, Oracle Free 23.26.3, SQL Server 2022 and PostgreSQL 18; the entries 
 1d5fb7d3, 2026-11-25 (Oracle's overloaded nested subprograms and PLS-00231, `SELECT *` views keeping their columns,
 assertions under `NOVALIDATE`, the T-SQL texts as written, DROP INDEX's errors, DOMAINS and COLUMN_PRIVILEGES, schema
 owners, PostgreSQL's DROP TABLE DETAIL and SET TRANSACTION READ ONLY), are removed or reworded to what is left, checked
+against it, Oracle Free 23.26.3, SQL Server 2022 and PostgreSQL 18; the entries that the eighth bug slice fixed, main
+d9564763, 2026-11-25 (the overloaded members of an Oracle package, the positions of PLS-00306 and PLS-00307 and PLS-00703,
+T-SQL's 159 severity, the names in 4512 and 2010, ALTER VIEW of a missing view, DOMAINS listing the table types,
+PostgreSQL's SET SESSION CHARACTERISTICS and schemata.schema_owner), are removed or reworded to what is left, checked
 against it, Oracle Free 23.26.3, SQL Server 2022 and PostgreSQL 18).
 They are not fixed here: the pages describe what lexdb does. Each "Differences" section of the reference lists the smaller
 differences of its statement.
@@ -110,9 +114,12 @@ differences of its statement.
     btree are 0A000; `CONCURRENTLY` is accepted and changes nothing.
 - **Transactions** (found writing the transaction pages):
   - `BEGIN` ignores words it does not know: `BEGIN nonsense words here` starts a block (PostgreSQL: 42601).
-  - `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` / `READ WRITE` are accepted and do nothing (`SHOW
-    default_transaction_read_only` stays `off`, and writes go on). `SET TRANSACTION` outside a block gives no WARNING
-    (PostgreSQL: `can only be used in transaction blocks`).
+  - `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY` / `READ WRITE` set `default_transaction_read_only`, as `SET
+    default_transaction_read_only` and `RESET` do: later blocks start read-only, `BEGIN READ WRITE` and `SET TRANSACTION
+    READ WRITE` override it, and a statement outside a block is 25006 (writes to an existing temporary table
+    excepted). Not undone when the block that set it rolls back (PostgreSQL undoes it: after `BEGIN; SET SESSION
+    CHARACTERISTICS AS TRANSACTION READ ONLY; ROLLBACK;` it is `off` there, `on` in lexdb). `SET TRANSACTION` outside a
+    block gives no WARNING (PostgreSQL: `can only be used in transaction blocks`).
   - The default isolation level is `serializable` (PostgreSQL: `read committed`); `READ COMMITTED` is opt-in
     (`BEGIN ISOLATION LEVEL`, `SET TRANSACTION`, `SET default_transaction_isolation`). `READ UNCOMMITTED` shows as
     `read committed` and `REPEATABLE READ` as `serializable` in `SHOW transaction_isolation` (PostgreSQL: their own
@@ -124,9 +131,8 @@ differences of its statement.
   and `EXPLAIN ANALYZE` of anything but a `SELECT` are 0A000; the plan is lexdb's own text, not PostgreSQL's node
   tree, so tools that parse PostgreSQL plans cannot read it.
 - **Schemas:**
-  - `information_schema.schemata.schema_owner` says `postgres` for a schema made `AUTHORIZATION alice`
-    (`pg_namespace.nspowner` is right).
-  - `CREATE SCHEMA s CREATE TABLE ...` (schema elements) and `DROP SCHEMA a, b` are syntax errors.
+  - `CREATE SCHEMA s CREATE TABLE ...` and `CREATE SCHEMA s AUTHORIZATION x CREATE TABLE ...` (schema elements) are
+    42601 (found on main d9564763, not fixed), and `DROP SCHEMA a, b` is a syntax error.
   - `DROP SCHEMA public` and `ALTER SCHEMA public RENAME` are 0A000; `DROP SCHEMA pg_catalog` says it does not
     exist.
   - A schema that holds a view, or that a view reads from, cannot be renamed (2BP01, "lexdb keeps a view's text").
@@ -315,7 +321,7 @@ differences of its statement.
     generates `PK__emp__3213E83F...`.
   - `DROP INDEX ix ON dbo.t`, `DROP INDEX t.ix` and `DROP INDEX dbo.t.ix` work; a bare name is 159, `DROP INDEX
     dbo.ix` is 3701 (it reads `dbo` as the table), and 3701 and 3723 come with SQL Server's texts and states, as in SQL
-    Server, except that 159 has severity 16 (SQL Server: 15; found on main 1d5fb7d3, not fixed). A list of indexes
+    Server (159 has severity 15). A list of indexes
     (`DROP INDEX a.x, b.y`) is still 102 (SQL Server takes it).
   - `ALTER TABLE t ADD CONSTRAINT df DEFAULT 0 FOR col` is 102; a DEFAULT constraint's own name is not kept (it shows
     as `DF_table_col`), and `DROP CONSTRAINT` finds it by neither name.
@@ -342,9 +348,7 @@ differences of its statement.
     Server (208 when the view is read, 3729 for a schema-bound view). A `SELECT *` view keeps its CREATE-time columns
     by position until `sp_refreshview`, and a view that names its own columns is 8158 once the table has gained one,
     as in SQL Server; 4502 and 8158 are compile errors that a `TRY` block in the same scope does not catch, as in SQL
-    Server. Found on main 1d5fb7d3, not fixed: the 4512 of `CREATE VIEW dbo.v WITH SCHEMABINDING AS SELECT ... FROM t`
-    names `'v'` (SQL Server: `'dbo.v'`; 4513's is right), `ALTER VIEW` of a missing view is 208 with state 1 (SQL
-    Server: 6), and 2010 names `'emp'` (SQL Server: `'dbo.emp'`).
+    Server.
   - `WITH SCHEMABINDING` is read and kept (`sys.sql_modules.is_schema_bound`): `ALTER TABLE ... DROP COLUMN` or
     `ALTER COLUMN` of a column such a view uses is 5074, `SELECT *` in one is 1054, a one-part name in the view 4512,
     a view over a view or function that is not schema-bound 4513, as in SQL Server.
@@ -473,8 +477,8 @@ differences of its statement.
     `SCHEMATA` (its schemas, `dbo`, `guest`, `INFORMATION_SCHEMA`, `sys` and the `db_*` ones, and the schemas made with
     `CREATE SCHEMA`, owned by `dbo` or their `AUTHORIZATION` owner), `ROUTINES`, `PARAMETERS`,
     `CONSTRAINT_COLUMN_USAGE` (a foreign key's own columns), `VIEW_TABLE_USAGE` and `VIEW_COLUMN_USAGE`; `DOMAINS`
-    and `COLUMN_PRIVILEGES` exist with no rows (their columns are PostgreSQL's, in lower case; SQL Server's `DOMAINS`
-    has 17 and lists table types and alias types, which lexdb's does not), the column names are in lower case and the
+    lists the table types (schema, name, `data_type` `table type`) and `COLUMN_PRIVILEGES` has no rows (their columns
+    are PostgreSQL's, in lower case; SQL Server's `DOMAINS` has 17 and lists alias types too, which lexdb cannot make), the column names are in lower case and the
     catalog name is `lexdb` (SQL Server: upper case, the database's name); `sys.database_role_members`,
     `sys.partitions` and `sys.dm_exec_requests` do not exist (208); `sys.types` gives `decimal` scale 38; every decimal expression is `decimal(38,6)` in
     `sys.columns`. A CHECK's text (`INFORMATION_SCHEMA.CHECK_CONSTRAINTS.CHECK_CLAUSE`,
@@ -631,12 +635,21 @@ differences of its statement.
   - **Nested subprograms** (in a stored unit's, a package member's or a block's declarations) work: forward
     declarations, recursion, the enclosing variables and overloads (a call is matched by the number, names and type
     families of its arguments; PLS-00307 when more than one fits, PLS-00306 when none does; a call from SQL inside
-    the unit is PLS-00231 at compile time, ORA-06550 in a block). **Found on main 1d5fb7d3, not fixed:** the
-    overloaded members of a **package** are not told apart: they are found by name, and the first one declared answers
-    every call, from SQL and from PL/SQL (with `sq(number)` before `sq(varchar2)`, `pko.sq('abc')` is ORA-06502; with
-    the other order `pko.sq(4)` answers with the `VARCHAR2` member, 1; Oracle picks by the arguments). Also found: the
-    ORA-06550 of a PLS-00306 in an anonymous block (a nested call with the wrong arguments) points at column 11, the
-    argument list (Oracle: column 3, the call).
+    the unit is PLS-00231 at compile time, ORA-06550 in a block).
+  - **Overloaded package members** are picked by the call's arguments, from SQL and from PL/SQL (PLS-00306 none
+    fits, PLS-00307 more than one; from SQL ORA-06553 with them); `f(x => 1)` and `pkg.f(x => 1)` work in SQL; the
+    ORA-06550 column of PLS-00306 / 00307 is the call's name; a repeated named argument is PLS-00703. **Found on main
+    d9564763, not fixed:**
+    - an aggregate, or another stored function, as an argument of a stored function in SQL is ORA-03001
+      (`f(sum(v))`; Oracle runs it);
+    - an overloaded call whose arguments are a correlated subquery's outer columns (`SELECT (SELECT pkg.f(t.v) FROM
+      dual) FROM t`, or in a correlated `EXISTS`) is PLS-00307 (Oracle resolves it by the column types);
+    - a DATE converted implicitly to text in a call gives ISO text (`2020-01-01 00:00:00`; Oracle: `01-JAN-20` under
+      the default `NLS_DATE_FORMAT`);
+    - calling a private package member from outside is `ORA-00904: invalid identifier` (Oracle: `ORA-00904:
+      "PV"."PRIV": invalid identifier`);
+    - `CALL p(...)` of a missing procedure or with wrong arguments is ORA-06550 with PLS-00201 / PLS-00306 (Oracle's
+      `CALL` statement: ORA-06576 and ORA-06553 with PLS-306; `EXEC` and a block give ORA-06550, as lexdb does).
   - Annotations (supported since main 6c2e83f1; see [annotations](sql/oracle/annotations.md)): `ALL_` and
     `DBA_ANNOTATIONS_USAGE` have no rows for the built-in domains of `SYS` and `DOMAIN_NAME` / `DOMAIN_OWNER` are
     always NULL (lexdb has no domains); a global temporary table's annotations are kept but not listed.

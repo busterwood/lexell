@@ -90,7 +90,8 @@ PL/SQL, `FLASHBACK`, `PURGE`, `AUDIT`, `EXPLAIN PLAN`, object types, collections
 | [Built-in packages](plsql-builtin-packages.md) | `DBMS_OUTPUT`, `DBMS_LOCK`, `DBMS_SESSION`, `DBMS_SQL.RETURN_RESULT`, and packages accepted and ignored. |
 
 Subprograms declared inside a block, a procedure or a function may be overloaded ([PL/SQL blocks](plsql-blocks.md),
-example F; [CREATE FUNCTION](create-function.md), example L).
+example F; [CREATE FUNCTION](create-function.md), example L), and so may the members of a package
+([CREATE PACKAGE](create-package.md), example I).
 
 Not available: collections (nested tables, varrays, associative arrays), `FORALL`, `BULK COLLECT`, `GOTO`, DDL
 directly in a block (use `EXECUTE IMMEDIATE`).
