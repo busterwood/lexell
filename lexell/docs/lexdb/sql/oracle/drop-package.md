@@ -25,8 +25,7 @@ DROP PACKAGE [ BODY ] [ schema. ] package
 - A view that calls one of the package's functions gives ORA-04067 after `DROP PACKAGE BODY` and ORA-04063 after
   `DROP PACKAGE`, as Oracle does (example B). ORA-04067 is its one line; Oracle adds ORA-06508 and ORA-06512 lines.
   `USER_OBJECTS.STATUS` of the view is `INVALID` after `DROP PACKAGE` and `VALID` after `DROP PACKAGE BODY`, as in
-  Oracle. In a transaction that wrote something before the drop, a read of the view is ORA-00904 until the
-  transaction ends (see [CREATE VIEW](create-view.md)).
+  Oracle, also in a transaction that wrote something before the drop (see [CREATE VIEW](create-view.md)).
 
 ## Examples
 

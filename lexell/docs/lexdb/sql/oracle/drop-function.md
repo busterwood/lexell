@@ -21,8 +21,8 @@ DROP FUNCTION [ schema. ] function
 
 - `USER_OBJECTS.STATUS` of the view is `VALID` again as soon as the function is created again; Oracle shows it
   `INVALID` until the view's next use (example B).
-- In a transaction that wrote something before the drop, a read of the view gives ORA-00904, not ORA-04063, until the
-  transaction ends (see [CREATE VIEW](create-view.md)).
+- A transaction that wrote something before the drop gets ORA-04063 at once, as Oracle does (see
+  [CREATE VIEW](create-view.md)).
 
 ## Examples
 

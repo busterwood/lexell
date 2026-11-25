@@ -97,6 +97,12 @@ Names are read first: an unknown column is ORA-00904, a table ORA-00942 (a dicti
   moves the check: `IMMEDIATE` checks at once and, on a failure, gives ORA-08601 and keeps the transaction.
 - Each write path is checked: see [Assertions in the three doors](../../assertions.md#the-write-paths).
 
+## Whose rights the check has
+
+The check runs with the rights of the assertion's owner, in every door, as Oracle's does: a user who has `INSERT`,
+`UPDATE` or `DELETE` on an asserted table but no `SELECT` on it is not refused; the write is checked (ORA-08601 when
+it breaks the assertion). The user's own `WHERE` and `SELECT` in the statement still need the privilege.
+
 ## What DDL does to its tables
 
 | Statement | Result |
@@ -106,7 +112,7 @@ Names are read first: an unknown column is ORA-00904, a table ORA-00942 (a dicti
 | `ALTER TABLE ... MODIFY` of a column it reads | ORA-08702. |
 | `RENAME` or `ALTER TABLE ... RENAME TO` of its table | ORA-08694. |
 | `TRUNCATE TABLE` of a table it reads | Checked, as in Oracle: ORA-08601 when the table is the `EXISTS` one, or the one a `NOT EXISTS` looks for (`TRUNCATE` ends the transaction, so it cannot be rolled back; nothing was removed). |
-| `ADD COLUMN`, `DROP` or `RENAME` of another column | Allowed. |
+| `ADD COLUMN`, or `DROP` or `RENAME` of another column | Allowed. `ALTER TABLE` that adds, drops, retypes or renames a column of a table the assertion reads sets `USER_ASSERTIONS.INVALID` to `INVALID`, as in Oracle; the assertion is still checked, and `INVALID` stays until the assertion is dropped and made again (example H). `CREATE INDEX`, `COMMENT`, `ADD CONSTRAINT` and `TRUNCATE` leave it. |
 
 ## Concurrency
 
@@ -125,17 +131,11 @@ pays nothing. Many rows put at once (a `COPY`, an array insert) are checked by k
 
 ## Differences from Oracle
 
-- `USER_ASSERTION_LOCK_MATRIX` is empty, and `USER_ASSERTIONS.INVALID` is always NULL (Oracle marks an assertion
-  `INVALID` at DDL on its tables, an `ADD COLUMN` too, and still checks it).
+- `USER_ASSERTION_LOCK_MATRIX` is empty.
 - Writers of rows that meet in an assertion's join key wait for each other. Oracle's locks can be finer, for chains of
   joins.
 - Under `NOVALIDATE`, an `UPDATE` or `DELETE` of a table under the assertion's inner `NOT EXISTS` runs the whole query,
   so it fails when rows already break the assertion, where Oracle's row-only check passes (example G).
-- The check reads the tables with the rights of the session that writes, not of the assertion's owner. A user who has
-  `INSERT` on an asserted table but not `SELECT` is refused with ORA-41900 (`missing READ privilege`); in Oracle the
-  insert goes through and is checked.
-- Quoted names are matched folded: `CREATE ASSERTION "xd"` is shown as `XD` (Oracle keeps `xd`).
-- `SET CONSTRAINT` of a name that does not exist is ORA-02443 (Oracle: ORA-02448).
 
 ## Examples
 
@@ -457,6 +457,57 @@ N
 0
 
 1 row selected.
+```
+
+### H. INVALID, a quoted name and SET CONSTRAINT
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE stock (id NUMBER PRIMARY KEY, qty NUMBER);
+CREATE ASSERTION qty_ok CHECK (NOT EXISTS (SELECT 1 FROM stock WHERE qty < 0));
+CREATE ASSERTION "low_ok" CHECK (NOT EXISTS (SELECT 1 FROM stock WHERE qty < -100));
+SELECT assertion_name, status, invalid FROM user_assertions WHERE assertion_name IN ('QTY_OK', 'low_ok') ORDER BY assertion_name;
+ALTER TABLE stock ADD (note VARCHAR2(10));
+SELECT assertion_name, status, invalid FROM user_assertions WHERE assertion_name IN ('QTY_OK', 'low_ok') ORDER BY assertion_name;
+INSERT INTO stock VALUES (1, -5, 'x');
+SET CONSTRAINT nosuch DEFERRED;
+SET CONSTRAINT qty_ok IMMEDIATE;
+DROP ASSERTION "low_ok";
+```
+
+```text
+Table created.
+
+Assertion created.
+
+Assertion created.
+
+ASSERTION_NAME STATUS  INVALID
+-------------- ------- -------
+QTY_OK         ENABLED
+low_ok         ENABLED
+
+2 rows selected.
+
+Table altered.
+
+ASSERTION_NAME STATUS  INVALID
+-------------- ------- -------
+QTY_OK         ENABLED INVALID
+low_ok         ENABLED INVALID
+
+2 rows selected.
+
+ERROR:
+ORA-08601: Assertion (SA.QTY_OK) violated.
+
+ERROR:
+ORA-02448: constraint does not exist
+
+ERROR:
+ORA-08687: Cannot defer an assertion that is not deferrable.
+
+Assertion dropped.
 ```
 
 ## See also

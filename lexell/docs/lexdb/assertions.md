@@ -118,5 +118,5 @@ cannot. An unrelated column may be added, dropped or renamed.
 
 ## Known gaps
 
-See [Known issues](KNOWN-ISSUES.md#oracle-door): the Oracle door's views leave `USER_ASSERTION_LOCK_MATRIX` empty and
-`INVALID` NULL, and a few checks differ from Oracle's in the finer points.
+See [Known issues](KNOWN-ISSUES.md#oracle-door): the Oracle door's views leave `USER_ASSERTION_LOCK_MATRIX` empty,
+and a few checks differ from Oracle's in the finer points.

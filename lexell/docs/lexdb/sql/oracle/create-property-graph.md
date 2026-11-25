@@ -100,10 +100,13 @@ Without any `LABEL`, an element has the default label (its own name), with the p
   all there, and `VALID` again at its next use; `ADD` of a column and `CREATE INDEX` leave it `VALID`.
 - `USER_PG_ELEMENTS.OBJECT_NAME`, `USER_PG_PROP_DEFINITIONS.COLUMN_NAME` and the types in
   `USER_PG_LABEL_PROPERTIES` are as they were at `CREATE`; Oracle's follow a rename and an `ALTER TABLE ... MODIFY`.
-- `ALTER TABLE ... DROP COLUMN` of a column of a table that a view reads (directly, as by `SELECT`) is ORA-02449: the
-  view's text is kept, so the view has to be dropped first. Oracle drops the column and marks the view, and a graph
-  that names the column, `INVALID`. A view that reads the table only through `GRAPH_TABLE` does not stop it, and
-  stays `VALID` after the drop where Oracle marks it `INVALID`, and reading it is ORA-04045 (Oracle: ORA-04063).
+- `ALTER TABLE ... DROP COLUMN` of a column that a graph names, or that a view reads (directly or through
+  `GRAPH_TABLE`), drops it, as in Oracle. The graph is `INVALID`, a view over it is `INVALID` too, and reading the view
+  is ORA-04063; `USER_ERRORS` has the view's error, ORA-04045 and its cause (example J). `USER_OBJECTS.STATUS` and
+  `USER_ERRORS` say what the view's query does now: Oracle fills `USER_ERRORS` at the view's next use, and when the
+  column is back it keeps the graph and the view `INVALID`, with ORA-04063 on every read until the view is compiled
+  (`ALTER VIEW v COMPILE`); lexdb's are `VALID`, and the view readable, as soon as the column is back (the last two
+  statements of example J).
 - `COMMENT ON PROPERTY GRAPH` is accepted and not kept (`USER_PG_COMMENTS.COMMENTS` stays empty), as for every
   `COMMENT ON` in lexdb. `ALTER PROPERTY GRAPH ... COMPILE` is ORA-03001, and privileges on a graph
   (`GRANT READ ON PROPERTY GRAPH`) ORA-00942: `GRAPH_TABLE` reads the tables with the session's privileges.
@@ -557,6 +560,59 @@ ORA-00942: table or view does not exist
 
 The first statement is ORA-42431 as in Oracle (`knows` has two foreign keys to `people`). Oracle also keeps the comment
 and runs the last two.
+
+### J. DROP COLUMN under a view over GRAPH_TABLE
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE dc_rooms (id NUMBER PRIMARY KEY, town VARCHAR2(20), floor_no NUMBER);
+INSERT INTO dc_rooms VALUES (1, 'Oslo', 3);
+CREATE PROPERTY GRAPH g_rooms VERTEX TABLES (dc_rooms KEY (id) PROPERTIES (town, floor_no));
+CREATE VIEW v_towns AS SELECT * FROM GRAPH_TABLE (g_rooms MATCH (r) COLUMNS (r.town AS town));
+ALTER TABLE dc_rooms DROP COLUMN floor_no;
+SELECT * FROM v_towns;
+SELECT name, type, text FROM user_errors WHERE name = 'V_TOWNS' ORDER BY sequence;
+ALTER TABLE dc_rooms ADD (floor_no NUMBER);
+SELECT * FROM v_towns;
+SELECT object_name, status FROM user_objects WHERE object_name IN ('G_ROOMS', 'V_TOWNS') ORDER BY object_name;
+```
+
+```text
+Table created.
+
+1 row created.
+
+Property graph created.
+
+View created.
+
+Table altered.
+
+ERROR:
+ORA-04063: view "SA.V_TOWNS" has errors
+
+NAME    TYPE TEXT
+------- ---- ---------------------------------------------------------------------
+V_TOWNS VIEW ORA-04045: errors during recompilation or revalidation of SA.G_ROOMS
+V_TOWNS VIEW ORA-00904: "FLOOR_NO": invalid identifier
+
+2 rows selected.
+
+Table altered.
+
+TOWN
+----
+Oslo
+
+1 row selected.
+
+OBJECT_NAME STATUS
+----------- ------
+G_ROOMS     VALID
+V_TOWNS     VALID
+
+2 rows selected.
+```
 
 ## See also
 

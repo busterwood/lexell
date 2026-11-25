@@ -42,11 +42,13 @@ SET { CONSTRAINT | CONSTRAINTS } { assertion [, ...] | ALL } { IMMEDIATE | DEFER
   and lasts to its end; the assertion's own `INITIALLY` setting applies again in the next one.
 - A deferred check covers the writes made since the assertion's first statement in the transaction. At `COMMIT` a
   failure is ORA-02091 over ORA-08601 and the transaction is rolled back.
-- `ALTER ASSERTION` of a name that does not exist is ORA-13650.
+- `ALTER ASSERTION` of a name that does not exist is ORA-13650. `SET CONSTRAINT` of a name that does not exist is
+  ORA-02448.
 
 ## Differences from Oracle
 
-- `SET CONSTRAINT` of a name that is no constraint or assertion is ORA-02443; Oracle gives ORA-02448.
+- `SET CONSTRAINT` of a name that is no constraint or assertion is ORA-02448, as in Oracle; `IMMEDIATE` of an
+  assertion that is not deferrable is ORA-08687 too (create-assertion.md, example H). No other difference is known.
 
 ## Examples
 

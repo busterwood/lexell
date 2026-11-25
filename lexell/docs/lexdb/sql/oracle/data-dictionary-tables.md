@@ -92,7 +92,8 @@ All of them have `ALL_` and `DBA_` forms with an `OWNER` column. Example J below
   `DISABLED`), `DEFERRABLE` (`DEFERRABLE` or `NOT DEFERRABLE`), `DEFERRED` (`DEFERRED` or `IMMEDIATE`), `VALIDATED`
   (`VALIDATED` or `NOT VALIDATED`), `DEFINITION_SQL` (a CLOB: `CREATE ASSERTION "APP"."A1" CHECK`, a line with the
   condition as written, then the state words, each on a line of its own, joined by carriage return and line feed),
-  and `INVALID`, which is always NULL. `OWNER` in `ALL_` and `DBA_`; an assertion made in the PostgreSQL or SQL Server
+  and `INVALID` (`INVALID` once an `ALTER TABLE` added, dropped, retyped or renamed a column of a table the assertion
+  reads, as in Oracle; NULL otherwise). `OWNER` in `ALL_` and `DBA_`; an assertion made in the PostgreSQL or SQL Server
   door is owned by the user, or by `SYS` for a user with a schema of its own, as public's tables are. A `DBA_` view is
   not readable by an ordinary user.
 

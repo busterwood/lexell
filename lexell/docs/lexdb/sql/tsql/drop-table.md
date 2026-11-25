@@ -30,7 +30,8 @@ DROP TABLE [ IF EXISTS ] { database_name.schema_name.table_name | schema_name.ta
 ## Differences from SQL Server
 
 - **A table that a view reads cannot be dropped** (error 50000, "cannot drop table emp because other objects depend
-  on it"). SQL Server drops it, and the view fails when it is next used. Drop the view first.
+  on it"), schema-bound or not. SQL Server drops it, and the view fails when it is next used, unless the view is
+  `WITH SCHEMABINDING` (error 3729). Drop the view first.
 - A table that a foreign key refers to gives error 50000 with lexdb's text (SQL Server: 3726).
 
 ## Examples

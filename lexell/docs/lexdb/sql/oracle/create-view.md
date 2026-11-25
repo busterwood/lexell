@@ -61,8 +61,13 @@ annotations_clause:
 - After `DROP FUNCTION` or `DROP PACKAGE` of a function a view calls, reading the view is ORA-04063 (`view ... has
   errors`; ORA-04067 after `DROP PACKAGE BODY`), as in Oracle (see [DROP FUNCTION](drop-function.md), example B).
   `USER_OBJECTS.STATUS` of the view is `INVALID` while the function is gone and `VALID` as soon as it is back (Oracle:
-  `INVALID` until the view's next use). In a transaction that wrote something before the drop, its snapshot still
-  holds the function and a read of the view gives ORA-00904 until the transaction ends.
+  `INVALID` until the view's next use). A transaction that wrote something before the drop gets ORA-04063 too.
+- `ALTER TABLE ... DROP COLUMN` of a column a view reads is done, as in Oracle: the view is `INVALID`, reading it is
+  ORA-04063, and `USER_ERRORS` holds its error (`TYPE` `VIEW`, ORA-00904 for the column). A view over that view is
+  `INVALID` too (ORA-04063). When the column is back the views are `VALID` (example I). Oracle fills `USER_ERRORS` at
+  the view's next use and keeps a view `INVALID` until its next use; lexdb's `STATUS` and `USER_ERRORS` say what
+  the view's query does now. A `SELECT *` view over a table that lost a column and gained another reads the columns
+  by position, where Oracle reads them by name.
 - `CREATE VIEW` over a function that was created with compilation errors (`INVALID`) is ORA-06575, as in Oracle (see
   [CREATE FUNCTION](create-function.md), example I).
 - `ALTER VIEW ... READ ONLY` is ORA-03001; Oracle gives ORA-42310 for a view that is not an editioning view.
@@ -363,6 +368,69 @@ ORA-00942: table or view "SA"."EMP" does not exist
 ERROR:
 ORA-00942: table or view "SA"."NOTHERE" does not exist
 ```
+
+### I. DROP COLUMN under a view
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE crew (id NUMBER PRIMARY KEY, name VARCHAR2(20), rank_no NUMBER, notes VARCHAR2(20));
+INSERT INTO crew VALUES (1, 'Ann', 3, 'lead');
+COMMIT;
+CREATE VIEW v_crew AS SELECT id, name FROM crew;
+CREATE VIEW v_crew_top AS SELECT id, name FROM v_crew;
+ALTER TABLE crew DROP COLUMN name;
+SELECT * FROM v_crew;
+SELECT name, type, text FROM user_errors WHERE name = 'V_CREW' ORDER BY sequence;
+ALTER TABLE crew ADD (name VARCHAR2(20));
+UPDATE crew SET name = 'Ann';
+COMMIT;
+SELECT * FROM v_crew;
+SELECT object_name, status FROM user_objects WHERE object_name = 'V_CREW';
+```
+
+```text
+Table created.
+
+1 row created.
+
+Commit complete.
+
+View created.
+
+View created.
+
+Table altered.
+
+ERROR:
+ORA-04063: view "SA.V_CREW" has errors
+
+NAME   TYPE TEXT
+------ ---- --------------------------------------
+V_CREW VIEW ORA-00904: "NAME": invalid identifier
+
+1 row selected.
+
+Table altered.
+
+1 row updated.
+
+Commit complete.
+
+ID NAME
+-- ----
+ 1 Ann
+
+1 row selected.
+
+OBJECT_NAME STATUS
+----------- ------
+V_CREW      VALID
+
+1 row selected.
+```
+
+`V_CREW_TOP`, the view over `V_CREW`, is `INVALID` while the column is gone, in both. When the column is back, Oracle
+keeps it `INVALID` until it is read; lexdb's status follows what the view's query does, so it is `VALID` at once.
 
 ## See also
 

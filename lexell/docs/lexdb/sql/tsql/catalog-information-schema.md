@@ -44,7 +44,8 @@ PostgreSQL's values. They answer from the same catalog as [the `sys` views](cata
   `UNIQUE`, `FOREIGN KEY`, `CHECK`).
 
 `KEY_COLUMN_USAGE`, `CONSTRAINT_COLUMN_USAGE`
-: The columns of each key: `constraint_name`, `table_name`, `column_name`, `ordinal_position`.
+: The columns of each key: `constraint_name`, `table_name`, `column_name`, `ordinal_position`. (For a foreign key,
+  `CONSTRAINT_COLUMN_USAGE` gives the referenced column, not the key's own: see the differences below.)
 
 `REFERENTIAL_CONSTRAINTS`
 : `constraint_name`, `unique_constraint_name` (the key it points to), `match_option`, `update_rule`, `delete_rule`.
@@ -87,8 +88,13 @@ PostgreSQL's values. They answer from the same catalog as [the `sys` views](cata
   `varchar`, `numeric`. Use `sys.columns` and `sys.types` when you need SQL Server's forms.
   `CHECK_CONSTRAINTS.check_clause` is SQL Server's text, `([salary]>=(0))`, as `sys.check_constraints.definition` is
   (see [constraints](catalog-constraints.md) for where it differs).
-- An assertion's `constraint_schema` shows `public` where `dbo` is meant.
-- `SCHEMATA` lists the schemas made with `CREATE SCHEMA`; `dbo` and the system schemas are not in it.
+- The schema columns (`table_schema`, `constraint_schema`, `routine_schema`, `schema_name` ...) show `dbo` where
+  lexdb's schema is `public`, as `sys.schemas` does.
+- `SCHEMATA` lists `dbo` (its owner is `dbo`), the schemas made with `CREATE SCHEMA` (owned by the user who made
+  them; SQL Server: `dbo` unless `AUTHORIZATION` says otherwise), and PostgreSQL's `information_schema` and
+  `pg_catalog`. SQL Server's `guest`, `sys`, `INFORMATION_SCHEMA` and `db_*` schemas are not in it.
+- `CONSTRAINT_COLUMN_USAGE` gives a foreign key's referenced column (`p.id` for `fk`), where SQL Server gives the
+  key's own column (`c.pid`).
 - Constraint names are lexdb's, `table_pkey`, `table_column_fkey`, and `view_definition` is the text of the query.
 - `ROUTINES` and `PARAMETERS` have no rows for T-SQL procedures and functions: use `sys.procedures`,
   `sys.parameters` and `sys.sql_modules`.
@@ -269,15 +275,16 @@ sq            bigint    5           1         NO
 
 <!-- example: tsql -->
 ```sql
-SELECT schema_name FROM INFORMATION_SCHEMA.SCHEMATA WHERE schema_name IN ('dbo', 'hr') ORDER BY schema_name;
+SELECT schema_name, schema_owner FROM INFORMATION_SCHEMA.SCHEMATA WHERE schema_name IN ('dbo', 'hr') ORDER BY schema_name;
 ```
 
 ```text
-schema_name
------------
-hr
+schema_name schema_owner
+----------- ------------
+dbo         dbo
+hr          sa
 
-(1 row affected)
+(2 rows affected)
 ```
 
 ### G. Procedures and functions

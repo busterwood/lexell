@@ -49,9 +49,10 @@ SELECT ... FROM { USER_ | ALL_ | DBA_ }{ VIEWS | SEQUENCES | SOURCE | PROCEDURES
 ## Differences from Oracle
 
 - `USER_SOURCE` does not hold the `CREATE OR REPLACE` words that Oracle keeps in line 1.
-- `USER_ERRORS` has rows for procedures and functions only. A view that is `INVALID` because the function it calls is
-  gone (see [CREATE VIEW](create-view.md)) has none; Oracle lists it with `TYPE` `VIEW` and the error (`ORA-00904:
-  "DBL": invalid identifier`).
+- `USER_ERRORS` has rows for procedures and functions and for a view that is `INVALID` because the function it calls is
+  gone or a column it reads was dropped (see [CREATE VIEW](create-view.md)): `TYPE` `VIEW`, `LINE` and `POSITION` 0,
+  and the error (`ORA-00904: "DBL": invalid identifier`, ORA-04063 for a view over a view with errors, ORA-04045 and
+  its cause for a graph). The rows say what the view's query does now; Oracle fills them when the view is next used.
 - `USER_TRIGGERS` and `USER_SYNONYMS` are always empty.
 - `USER_SEQUENCES.CACHE_SIZE` is 0 and `LAST_NUMBER` is the start value or the last value handed out.
 

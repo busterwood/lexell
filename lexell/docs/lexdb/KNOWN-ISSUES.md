@@ -502,8 +502,10 @@ differences of its statement.
     `USER_PG_ELEMENTS.OBJECT_NAME`, `USER_PG_PROP_DEFINITIONS.COLUMN_NAME` and the types in `USER_PG_LABEL_PROPERTIES`
     stay as they were at `CREATE` (Oracle's follow a rename and a `MODIFY`).
   - `ALTER TABLE ... DROP COLUMN` of a column a view reads through `GRAPH_TABLE` drops it: the view is `INVALID`,
-    reading it is ORA-04063, and `USER_ERRORS` shows ORA-04045 and its cause, as in Oracle. `USER_OBJECTS.STATUS` of
-    a view over a graph that was dropped and made again is `VALID` at once (Oracle: `INVALID` until its next use).
+    reading it is ORA-04063, and `USER_ERRORS` shows ORA-04045 and its cause, as in Oracle. Once the column is
+    back, the graph and the view are `VALID` and the view readable at once; Oracle keeps both `INVALID`, with
+    ORA-04063 on every read, until `ALTER VIEW ... COMPILE` (checked on Oracle Free 23.26.3). The same holds for a
+    view over a graph that was dropped and made again: `VALID` at once (Oracle: `INVALID` until its next use).
 - **Assertions** (`CREATE ASSERTION`, supported since main f23d0ebc; see [CREATE ASSERTION](sql/oracle/create-assertion.md)
   and [Assertions in the three doors](assertions.md)). What is left, checked against main and Oracle Free 23.26.3:
   - `USER_ASSERTION_LOCK_MATRIX` has no rows.

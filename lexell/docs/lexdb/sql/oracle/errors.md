@@ -47,7 +47,7 @@ The errors of [CREATE PROPERTY GRAPH](create-property-graph.md), [DROP PROPERTY 
 | Error | Meaning |
 |---|---|
 | ORA-42421 | A property graph that does not exist (`GRAPH_TABLE`, `DROP PROPERTY GRAPH`). |
-| ORA-04045 | `GRAPH_TABLE` over a graph whose table, or a column it names, has been dropped or renamed (a second line gives the cause: ORA-00942 or ORA-00904). |
+| ORA-04045 | `GRAPH_TABLE` over a graph whose table, or a column it names, has been dropped or renamed (a second line gives the cause: ORA-00942 or ORA-00904). A view over such a `GRAPH_TABLE` gives ORA-04063, with ORA-04045 in `USER_ERRORS`. |
 | ORA-42402, ORA-42442 | An element table without a primary key and without `KEY`; a view without `KEY`. |
 | ORA-42404, ORA-42416 | Two elements of one name; a column twice in a `KEY`. |
 | ORA-42405 | `REFERENCES` of a name that is no vertex element (a table's name where the element has an alias). |
@@ -73,6 +73,7 @@ The errors of [CREATE PROPERTY GRAPH](create-property-graph.md), [DROP PROPERTY 
 |---|---|
 | ORA-00001 | A unique or primary key violated. The message names the constraint (`SA.P_PKEY`). |
 | ORA-01400 | NULL in a `NOT NULL` column, and an empty string (which is NULL). |
+| ORA-32795, ORA-32796 | A value for a `GENERATED ALWAYS` identity column in an `INSERT` (32795) or in an `UPDATE` or `MERGE`'s `UPDATE`, `SET id = DEFAULT` too (32796). |
 | ORA-02290 | A `CHECK` constraint violated. |
 | ORA-02291 | No parent key for a foreign key. |
 | ORA-02292 | A child row exists for a parent key being deleted. |
@@ -127,7 +128,7 @@ in [Assertions in the three doors](../../assertions.md#errors-of-each-door).
 | ORA-08725 | `ALTER ASSERTION ... DEFERRABLE`: a deferrability cannot be changed. |
 | ORA-08701 | `DISABLE VALIDATE`. |
 | ORA-13650 | `DROP` or `ALTER ASSERTION` of an assertion that does not exist. |
-| ORA-02443 | `SET CONSTRAINT` of a name that is no constraint or assertion (Oracle: ORA-02448). |
+| ORA-02448 | `SET CONSTRAINT` of a name that is no constraint or assertion. |
 
 ### Users, privileges and the session
 
@@ -161,7 +162,7 @@ in [Assertions in the three doors](../../assertions.md#errors-of-each-door).
 | ORA-04042 | `GRANT EXECUTE` on a procedure that does not exist. |
 | ORA-04043 | `ALTER PROCEDURE`, `FUNCTION` or `PACKAGE ... COMPILE` of a unit that does not exist. |
 | ORA-06575, PLS-00905 | A call of a unit that is invalid (it was stored with compile errors): `CALL` or a function in SQL (and so a `CREATE VIEW` over it); a block that names one. |
-| ORA-04063, ORA-04067 | A view over a function, package or property graph that was dropped (`view ... has errors`); a package body that was dropped. |
+| ORA-04063, ORA-04067 | A view that has errors: over a function, package or property graph that was dropped, or over a table that lost a column the view reads (`view ... has errors`; `USER_ERRORS` has the cause); a package body that was dropped. |
 
 ### Refusals
 
