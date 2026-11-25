@@ -61,6 +61,12 @@ NULL, zero, false or empty.
 : `constraint_catalog`, `constraint_schema`, `constraint_name`, `check_clause`. A `NOT NULL` constraint's clause is
   `column IS NOT NULL`.
 
+`information_schema.assertions`
+: One row per [assertion](create-assertion.md) (the standard's view; PostgreSQL has none): `constraint_catalog`,
+  `constraint_schema`, `constraint_name`, `is_deferrable`, `initially_deferred`. An assertion also has a row in
+  `check_constraints` (`check_clause`: its condition as written) and a row in `constraint_column_usage` for each column
+  it reads, the table named in `table_name`. It has **no `pg_constraint` row** and no row in `table_constraints`.
+
 ## Remarks
 
 - psql's `\d table` lists a table's indexes, checks and foreign keys from these relations.
@@ -70,6 +76,10 @@ NULL, zero, false or empty.
 - `pg_get_constraintdef` and `pg_get_indexdef` give a constraint's or an index's definition as SQL (see [catalog
   functions](functions-catalog.md)). The definition of a constraint that is not enforced ends in `NOT ENFORCED`, and
   that of one added `NOT VALID` in `NOT VALID` (example G).
+- An assertion is not in `pg_constraint`: every row there has a `conrelid` or `contypid` that clients join (psql's `\d`
+  lists by `conrelid`, pgjdbc's metadata by `contype`), and a constraint of no table would break them. psql's `\d` of
+  a table an assertion reads works and does not show it; `pg_class.relhastriggers` is true for the table (the checks
+  are its triggers, in effect) and `pg_trigger` has no rows. Read `information_schema.assertions`.
 - `information_schema.check_constraints` lists a `CHECK` that is not enforced like any other; its `check_clause` has
   no `NOT ENFORCED`. Read `pg_constraint` or `table_constraints` for the state.
 

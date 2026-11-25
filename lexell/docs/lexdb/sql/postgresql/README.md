@@ -42,6 +42,7 @@ This index lists everything the door takes today. Pages not written yet are list
 | [CREATE SEQUENCE](create-sequence.md), [ALTER SEQUENCE](alter-sequence.md), [DROP SEQUENCE](drop-sequence.md) | Sequences. |
 | [CREATE SCHEMA](create-schema.md), [ALTER SCHEMA](alter-schema.md), [DROP SCHEMA](drop-schema.md) | Schemas. |
 | [CREATE TYPE](create-type.md), [ALTER TYPE](alter-type.md), [DROP TYPE](drop-type.md) | Enum types. |
+| [CREATE ASSERTION](create-assertion.md), [DROP ASSERTION](drop-assertion.md) | The SQL standard's constraint across tables; lexdb's own here (PostgreSQL has none); `DEFERRABLE`. |
 | [CREATE FUNCTION](create-function.md), [CREATE PROCEDURE](create-procedure.md), [DROP FUNCTION, DROP PROCEDURE](drop-function.md) | Routines in `LANGUAGE sql` (`AS '...'`, `BEGIN ATOMIC`, `RETURN`). |
 | [CALL](call.md) | Calls a procedure. |
 
@@ -62,7 +63,7 @@ This index lists everything the door takes today. Pages not written yet are list
 | [COMMIT, END](commit.md) | |
 | [ROLLBACK, ABORT](rollback.md) | |
 | [SAVEPOINT](savepoint.md), [RELEASE SAVEPOINT](release-savepoint.md), [ROLLBACK TO SAVEPOINT](rollback-to-savepoint.md) | |
-| [SET CONSTRAINTS](set-constraints.md) | |
+| [SET CONSTRAINTS](set-constraints.md) | Foreign keys and assertions: deferred or immediate. |
 
 ### Session and server
 

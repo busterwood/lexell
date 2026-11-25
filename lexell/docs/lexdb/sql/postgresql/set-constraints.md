@@ -1,6 +1,6 @@
 # SET CONSTRAINTS
 
-Sets when a transaction block checks its deferrable foreign keys: at the end of each statement, or at the commit.
+Sets when a transaction block checks its deferrable foreign keys and assertions: at the end of each statement, or at the commit.
 
 **Door:** PostgreSQL. **Follows:** PostgreSQL 18.
 
@@ -13,11 +13,11 @@ SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }
 ## Arguments
 
 `ALL`
-: Every deferrable constraint.
+: Every deferrable constraint and assertion.
 
 *name*
-: A constraint, optionally schema-qualified. It must be a foreign key declared `DEFERRABLE` (42809 otherwise; 42704
-  if there is no constraint of the name).
+: A constraint or an [assertion](create-assertion.md), optionally schema-qualified. It must be a foreign key or an
+  assertion declared `DEFERRABLE` (42809 otherwise; 42704 if there is no constraint or assertion of the name).
 
 `DEFERRED`
 : The checks wait for `COMMIT`.
@@ -30,7 +30,12 @@ SET CONSTRAINTS { ALL | name [, ...] } { DEFERRED | IMMEDIATE }
 
 - It lasts until the end of the block. A constraint's own setting (`INITIALLY DEFERRED` or `INITIALLY IMMEDIATE`)
   applies again in the next block.
-- Only foreign keys can be deferrable in lexdb, so only they are affected.
+- Only foreign keys and assertions can be deferrable in lexdb, so only they are affected.
+- An assertion set `IMMEDIATE` is checked at once for the writes made since it was deferred: a violation is 23514
+  `assertion "name" is violated`, and the transaction is aborted as after any error. At `COMMIT` a deferred assertion
+  that fails gives 23514 and the transaction is rolled back (see [CREATE ASSERTION](create-assertion.md), example C).
+- `SET CONSTRAINTS` is the standard's statement (ISO/IEC 9075-2, 17.4); PostgreSQL has no assertions, and this form is
+  lexdb's own.
 
 ## Differences from PostgreSQL
 
@@ -148,6 +153,44 @@ ERROR:  constraint "nosuch" does not exist
 ROLLBACK
 ```
 
+### E. An assertion
+
+<!-- example: postgresql -->
+```sql
+CREATE TABLE cap (n int);
+CREATE ASSERTION cap_small CHECK (NOT EXISTS (SELECT 1 FROM cap WHERE n > 10)) DEFERRABLE;
+BEGIN;
+SET CONSTRAINTS cap_small DEFERRED;
+INSERT INTO cap VALUES (50);
+SET CONSTRAINTS cap_small IMMEDIATE;
+ROLLBACK;
+BEGIN;
+SET CONSTRAINTS ALL DEFERRED;
+INSERT INTO cap VALUES (50);
+UPDATE cap SET n = 5;
+COMMIT;
+SELECT n FROM cap;
+```
+
+```text
+CREATE TABLE
+CREATE ASSERTION
+BEGIN
+SET CONSTRAINTS
+INSERT 0 1
+ERROR:  assertion "cap_small" is violated
+ROLLBACK
+BEGIN
+SET CONSTRAINTS
+INSERT 0 1
+UPDATE 1
+COMMIT
+ n
+---
+ 5
+(1 row)
+```
+
 ## See also
 
-[BEGIN](begin.md) · [COMMIT](commit.md) · [CREATE TABLE](create-table.md)
+[BEGIN](begin.md) · [COMMIT](commit.md) · [CREATE TABLE](create-table.md) · [CREATE ASSERTION](create-assertion.md)

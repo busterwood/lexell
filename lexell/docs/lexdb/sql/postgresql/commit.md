@@ -18,6 +18,8 @@ END [ WORK | TRANSACTION ]
 
 ## Remarks
 
+- A deferred [assertion](create-assertion.md) is checked here, with the deferred foreign keys: a violation fails the
+  `COMMIT` with 23514 and the transaction is rolled back.
 - The block's changes become visible to other sessions, and are on disk before `COMMIT` answers (unless the server
   runs with `--unsafe-no-sync`).
 - A read-write block is checked at its commit: if a transaction that committed first changed what it read, the commit

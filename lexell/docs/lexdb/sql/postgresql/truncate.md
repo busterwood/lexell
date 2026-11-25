@@ -30,6 +30,8 @@ TRUNCATE [ TABLE ] [ ONLY ] name [ * ] [, ... ]
 
 ## Remarks
 
+- A table an [assertion](create-assertion.md) reads is checked: `TRUNCATE` that leaves an `EXISTS` assertion false, or
+  empties the table under a `NOT EXISTS` (the whole query runs), is 23514 and the statement is undone.
 - `TRUNCATE` gives each table and each of its indexes a new, empty tree and frees the old one, without reading the
   rows. It takes the same short time for any number of rows.
 - It is transactional: in a transaction block, `ROLLBACK` brings the rows back.

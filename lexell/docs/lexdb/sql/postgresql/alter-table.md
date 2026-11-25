@@ -110,6 +110,8 @@ action:
 
 ## Remarks
 
+- `ALTER COLUMN ... TYPE` of a column an [assertion](create-assertion.md) reads casts the values, and then runs the
+  assertion's whole query: 23514 if it fails. `DROP COLUMN` of one is 2BP01 and a rename 0A000.
 - Several actions may be given at once, separated by commas.
 - `ALTER TABLE` is transactional: in a block, `ROLLBACK` takes it back.
 - Adding, dropping or changing the primary key, and changing a column's type, rewrite the table: 1 million rows take
