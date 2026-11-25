@@ -22,10 +22,10 @@ results in `~/Work/lexdb-bench/saved/results/2026-11-25-mview/`.**
 | replica lag under the mixed load, p50 / p99 | 0.24-0.26 / 0.49-0.55 ms | **0.21–0.23 / 0.48 ms** | |
 | 35 analytic queries, lexdb CPU / PG 1c, wall / PG 4p | 0.54 / 1.04 | **0.48 / 0.95** (with 4 MVs: **0.30 vs PG1 / 0.49 vs PG4**) | |
 | TPC-H SF1, summed (boost off) | 8,943 ms | **7,115 ms** (geomean 0.49 vs PG1, 0.79 vs PG4; 22/22) | 14,670 one core / 8,839 four processes |
-| ClickBench 1M, summed (boost off) | — | **19,337 ms** (geomean 0.81 vs PG1; with 4 MVs: **0.28 / 0.61**) | 22,363 one core / 11,326 four processes |
+| ClickBench 1M, summed (boost off) | — | **19,337 ms** (geomean 0.81 vs PG1; with 4 MVs: **0.23 / 0.51**) | 22,363 one core / 11,326 four processes |
 | COPY narrow / wide / wide + 2 indexes / no key / 10M narrow | 0.46 / 1.44 / 6.31 / 2.98 / 4.85 s | **0.24 / 1.04 / 1.80 / 1.05 / 2.44 s** | 0.64 / 1.92 / 4.93 / 1.54 / 5.78 s |
 | COPY peak RSS, wide / wide + 2 indexes / 10M narrow | 764 / 1,680 / 3,256 MB | **619 / 1,330 / 2,870 MB** | |
-| MV `FAST` update (1M rows, 1 row: grp / sketch / 3-level DAG) | — | **0.71 / 0.52 / 0.49 ms** | 145.3 / 367.3 / 142.6 ms (1c); 59.0 / 365.0 / 140.8 ms (4p) |
+| MV `FAST` update (1M rows, 1 row: grp / sketch / 3-level DAG) | — | **0.72 / 0.48 / 0.50 ms** (sketch build **224** vs PG 372 ms) | 147.4 / 363.6 / 141.5 ms (1c); 60.3 / 363.9 / 142.0 ms (4p) |
 
 ### 1.0a The 2026-11-23 refresh
 
@@ -499,6 +499,7 @@ below 1 for times.
 
 | date | lexdb | suite | headline | detail |
 |---|---|---|---|---|
+| 2026-11-25 | 2b5b92a2 (MV perf opt) | Materialized views & transparent Query Rewrite (1M rows, boost off, pinned) | Zero-overhead `tryRewrite` fast path (`pk_point20k` 712 → 649 ms, level with MV-free 652 ms); exact-group `AVG` rewrite (`q27` 492.6 → 0.41 ms; ClickBench + 4 MVs: 9 rewritten, geomean 0.23 vs PG1 / 0.51 vs PG4); single-pass sketch MV build + ARX HLL + quadratic t-digest (`build_sk` 483 → 224 ms vs PG 372 ms; `scan_sk` 269 → 239 ms; `FAST` 0.48/4.53/6.51 ms); v2 delta codec (`realtime` OQC 16-writer 21.7k → 23.5k/s, 0 err) | PERFORMANCE.md |
 | 2026-11-25 | 5d93ced1 (MVs Stages 1–4) | Materialized views & transparent Query Rewrite (1M rows, boost off, pinned) | 35 analytic queries w/ 4 MVs: 9 queries rewritten 8–95 → 3–4 ms (geomean 0.30 vs PG1, 0.49 vs PG4; 1/100/1000-row live insert 4.7/7.0/23.9 ms vs PG 719/249 ms); ClickBench 1M w/ 4 MVs: 8 queries 51–430 → 0.31–5.29 ms (geomean 0.28 / 0.61); dedicated 1M MVs: grp/sketch/3-DAG `FAST` 0.71/0.52/0.49 ms vs PG `REFRESH` 59–367 ms; 16-writer hot-key `realtime` OQC 21.7k/s (0 err) | PERFORMANCE.md |
 | 2026-11-25 | 5d93ced1 (MVs Stages 1–4) | full LexDB refresh (TPC-H SF1, ClickBench 1M, sysbench 1M, pgbench/replicas/commitlat, 35 analytic, COPY) | TPC-H 7,115 ms (geomean 0.49 vs PG1, 0.79 vs PG4, 22/22); ClickBench 19,337 ms (0.81 vs PG1); 35 analytic CPU 0.48 / wall 0.95 vs PG4; pgbench 3-rep 500–504k/s, updates 67k/s (2.59×), commit p99 0.81–0.83 ms; COPY 0.24 / 1.04 / 1.80 / 1.05 / 2.44 s (0.37–0.68× PG on all 5) | this page, 1; PERFORMANCE.md |
 | 2026-11-23 | indexed COPY fast path (this commit) | bulk load, 1M wide rows with two secondary indexes (lexdb and PG, same session) | 5.81 to 2.71 s (PG 4.88: runs 5.45 4.88 4.55); wide without indexes 1.46 s unchanged | lexdb-copy-fast.md |
