@@ -362,6 +362,35 @@ pub fn viewPlf(q: Stmt, text: &str): Stmt {
     return mapStmt(&q, fn(x: &Expr): Option[Expr] { return plfOf(x, &ents) })
 }
 
+// What an Oracle view's kept calls of stored functions find (their source, lexdb_plsql's "\x02src\x00" catalog entries: a standalone
+// FUNCTION, a package's PACKAGE and PACKAGE BODY): "" all there; "!" one gone or stored with a compile error (the view has errors,
+// ORA-04063: Oracle marks it INVALID); else "OWNER.PKG", a package whose body is gone (ORA-04067). Without this the calls found no
+// function and the view's column read NULL.
+pub fn viewPlfGone(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str): Result[str, DbErr] {
+    let m = lexdb_sql.viewPlf(text)
+    if len(m) == 0 { return Ok("") }
+    for e in strings.split(&m, "\x02") {
+        let f = strings.split(e, "\x01")
+        if len(f) != 3 { continue }
+        let id = strings.split(&f[1], ".")
+        if len(id) == 2 {
+            if !(try srcValid(st, txn, &id[0], &"FUNCTION", &id[1])) { return Ok("!") }
+        } else if len(id) == 3 {
+            if !(try srcValid(st, txn, &id[0], &"PACKAGE", &id[1])) { return Ok("!") }
+            if !(try srcValid(st, txn, &id[0], &"PACKAGE BODY", &id[1])) { return Ok(id[0] + "." + id[1]) }
+        }
+    }
+    return Ok("")
+}
+
+// Whether a PL/SQL unit's source is stored without a compile error.
+fn srcValid(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, owner: &str, kind: &str, name: &str): Result[bool, DbErr] {
+    match try st.get(txn, lexdb_catalog.CATALOG, &("\x02src\x00" + owner + "\x00" + kind + "\x00" + name)) {
+        Some(v) { return Ok(strings.indexOf(&v, "\x00", 0) < 0) }
+        None { return Ok(false) }
+    }
+}
+
 fn plfOf(x: &Expr, ents: &[][]str): Option[Expr] {
     match x {
         Expr.Call(nm, args, star) {

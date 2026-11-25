@@ -22,9 +22,9 @@ DROP PACKAGE [ BODY ] [ schema. ] package
 
 ## Differences from Oracle
 
-- A view that calls one of the package's functions is still read after `DROP PACKAGE` or `DROP PACKAGE BODY`, with
-  NULL in that column; Oracle gives ORA-04063 (the view has errors) after `DROP PACKAGE` and ORA-04067 (no package
-  body) after `DROP PACKAGE BODY` (see [CREATE VIEW](create-view.md)).
+- A view that calls one of the package's functions gives ORA-04063 after `DROP PACKAGE` and ORA-04067 after `DROP
+  PACKAGE BODY`, as Oracle does, but a session that read the view before the drop gets ORA-00900 once (see [CREATE
+  VIEW](create-view.md)).
 
 ## Examples
 

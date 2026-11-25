@@ -501,9 +501,12 @@ differences of its statement.
     of a DML statement when the subquery reads the statement's own table or refers to its columns; a function whose
     argument is an aggregate or another stored function's call (`f(SUM(x))`, `f(g(x))`). A view may call one (since
     main 84ceec7e), but an `INSERT`, `UPDATE`, `DELETE` or `CREATE TABLE AS` that reads such a view is ORA-03001.
-    After `DROP FUNCTION`, `DROP PACKAGE` or `DROP PACKAGE BODY` of the function, reading the view gives NULL in the
-    function's column and `USER_OBJECTS.STATUS` stays `VALID` (Oracle: ORA-04063, the view has errors, and `INVALID`;
-    ORA-04067 after `DROP PACKAGE BODY`; found on main 84ceec7e).
+    After `DROP FUNCTION`, `DROP PACKAGE` or `DROP PACKAGE BODY` of the function, reading the view is ORA-04063 (ORA-04067
+    after `DROP PACKAGE BODY`), as in Oracle, except in a session that read the view before the drop: there the first
+    read gives ORA-00904 or ORA-00900. `USER_OBJECTS.STATUS` of such a view stays `VALID` (Oracle: `INVALID`).
+  - A stored function or procedure whose body has errors Oracle finds when it compiles (an undeclared name, `return n
+    +;`) is created valid; Oracle creates it with compilation errors, `INVALID`, and a view that calls it is ORA-04063.
+    In lexdb the error comes when the code runs.
   - Annotations (supported since main 6c2e83f1; see [annotations](sql/oracle/annotations.md)): `ALL_` and
     `DBA_ANNOTATIONS_USAGE` have no rows for the built-in domains of `SYS` and `DOMAIN_NAME` / `DOMAIN_OWNER` are
     always NULL (lexdb has no domains); a global temporary table's annotations are kept but not listed.
