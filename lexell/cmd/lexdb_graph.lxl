@@ -283,9 +283,27 @@ fn newKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str): Result[st
     return Ok(n.toStr())
 }
 
+// Whether the database has had a property graph since the process started (bootstrap's look, or a CREATE PROPERTY GRAPH): a
+// database without them reads nothing more where a table, view or sequence is made (freeKey).
+var graphsSeen: bool = false
+
+// At the start (lexdb_exec.bootstrap): whether there are graphs.
+pub fn noteGraphs(st: &lexdb_store.Store): Result[Unit, DbErr] {
+    var t = lexdb_store.begin()
+    var any = false
+    let r = st.scan(mut &t, lexdb_catalog.CATALOG, GRAPH_PRE, GRAPH_END, fn(en: &lexdb_store.Entry): bool {
+        any = true
+        return false
+    })
+    st.abort(t)
+    let ok = try r
+    if any { graphsSeen = true }
+    return Ok(Unit{})
+}
+
 // CREATE TABLE, VIEW, SEQUENCE ... of key k (lexdb_exec.createKey): Oracle's ORA-00955 where a graph has the name.
 pub fn freeKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: str): Result[str, DbErr] {
-    if (try st.get(txn, lexdb_catalog.CATALOG, &graphKey(&k))).isSome() {
+    if graphsSeen && (try st.get(txn, lexdb_catalog.CATALOG, &graphKey(&k))).isSome() {
         return Err(e("42P07", &("relation \"" + lexdb_sql.baseName(&k) + "\" already exists")))
     }
     return Ok(k)
@@ -425,6 +443,7 @@ pub fn ddl(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, up: &Up)
     let name = shownOf(&lexdb_sql.baseName(&key), &s.spell)
     let g = try define(st, txn, &s.index, &key, &name, up)
     try txn.put(lexdb_catalog.CATALOG, &graphKey(&key), &encode(&g))
+    graphsSeen = true
     try up.bump(st, txn)
     return Ok("CREATE PROPERTY GRAPH")
 }
