@@ -1300,8 +1300,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
         var lateral = false
         if f.sub >= 0 {
             sc.names.frames[me].hidden = !f.lateral
-            // (GRAPH_TABLE: the query it stands for, O22)
-            let planning = if lexdb_graph.isGraph(&subs[f.sub]) { planSub(st, txn, &(try lexdb_graph.expand(st, txn, &subs[f.sub])), params, sc, false) } else { planSub(st, txn, &subs[f.sub], params, sc, false) }
+            let planning = if lexdb_graph.isGraph(&subs[f.sub]) { planSub(st, txn, &(try lexdb_graph.expand(st, txn, &subs[f.sub])), params, sc, false) } else { planSub(st, txn, &subs[f.sub], params, sc, false) }     // (GRAPH_TABLE: its query, O22)
             sc.names.frames[me].hidden = false
             var sp = try planning
             // (a CTE's use: its body's plan stays in its SubPlan, bound per use today)
@@ -21212,10 +21211,20 @@ fn (s: mut &Session) tsqlFunctions(stmt: &lexdb_sql.Stmt): Result[Option[lexdb_s
     return lexdb_routine.tsqlCalls(stmt, &fns, lexdb_routine.udfQuery)
 }
 
+fn (s: mut &Session) graphFlat(stmt: &lexdb_sql.Stmt): Result[Option[lexdb_sql.Stmt], DbErr] {
+    if len(s.txn) > 0 { return lexdb_graph.flatQuery(&s.st, mut &s.txn[0], stmt) }
+    var t = try s.st.beginSnapshot()
+    s.setUp(mut &t)
+    let r = lexdb_graph.flatQuery(&s.st, mut &t, stmt)
+    s.st.abort(t)
+    return r
+}
+
 // The statement with PostgreSQL's SQL functions it calls written as their bodies; None when it calls none.
 fn (s: mut &Session) inlineFunctions(stmt: &lexdb_sql.Stmt): Result[Option[lexdb_sql.Stmt], DbErr] {
     // T-SQL's functions of the user's, and PostgreSQL's in FROM: the parser marked the statement (a flag test, nothing more, for the rest)
     if stmt.udf {
+        if lexdb_graph.hasGraph(stmt) { match try s.graphFlat(stmt) { Some(t) { return Ok(Some(t)) } None {} } }        // (O22: a query of GRAPH_TABLE alone, as its join)
         if lexdb_priv.doorOf(&s.st, s.id) == "tds" { return s.tsqlFunctions(stmt) }
         var fns = try s.allRoutines(lexdb_sql.RD_PG)
         try s.markDeniedFns(mut &fns, &[])

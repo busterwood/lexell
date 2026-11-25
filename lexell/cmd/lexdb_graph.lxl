@@ -836,6 +836,21 @@ type Exp = record {
 fn noEP(): EP { return EP{vertex: true, vname: "", lab: [], wlo: -1, whi: -1, dir: 0} }
 
 fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str): Result[str, DbErr] {
+    var mn = false
+    let branches = try branchTexts(st, txn, text, mut &mn)
+    let body = strings.join(&branches, " union all ")
+    if !mn { return Ok(body) }
+    // MATCHNUM(): the matches numbered (the names: the first branch's columns)
+    var gt = try parseGT(st, txn, text)
+    var sel: []str = []
+    for c in gt.cols {
+        if c.matchnum { append(mut &sel, "row_number() over (order by null) " + q(&c.name)) } else { append(mut &sel, "\"gt$m\"." + q(&c.name) + " " + q(&c.name)) }
+    }
+    return Ok("select " + strings.join(&sel, ", ") + " from (" + body + ") \"gt$m\"")
+}
+
+// The joins GRAPH_TABLE's text stands for, each a SELECT (their UNION ALL its query); mn: it has MATCHNUM().
+fn branchTexts(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str, mn: mut &bool): Result[[]str, DbErr] {
     var gt = try parseGT(st, txn, text)
     // the lengths of each quantified part: every combination, an expansion
     var exps: []Exp = []
@@ -863,16 +878,174 @@ fn rewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str): Resul
         // nothing can match: the first expansion with its first elements, under a false condition (for the columns' types)
         try fallback(&gt, &exps[0], mut &branches)
     }
-    var any = false
-    for c in gt.cols { if c.matchnum { any = true } }
-    let body = strings.join(&branches, " union all ")
-    if !any { return Ok(body) }
-    // MATCHNUM(): the matches numbered
-    var sel: []str = []
-    for c in gt.cols {
-        if c.matchnum { append(mut &sel, "row_number() over (order by null) " + q(&c.name)) } else { append(mut &sel, "\"gt$m\"." + q(&c.name) + " " + q(&c.name)) }
+    for c in gt.cols { if c.matchnum { let old = replace(mn, true) } }
+    return Ok(branches)
+}
+
+// ---- a query of GRAPH_TABLE alone written as its join (a subquery in FROM costs the row engine a copy of each row)
+
+// Whether a statement reads GRAPH_TABLE in its own FROM (the parser marks such a statement: Stmt.udf).
+pub fn hasGraph(s: &Stmt): bool {
+    for f in s.from { if f.sub >= 0 && f.sub < len(s.subs) && isGraph(&s.subs[f.sub]) { return true } }
+    return false
+}
+
+// SELECT ... FROM GRAPH_TABLE (...) [alias] [WHERE ...] [GROUP BY ...] [ORDER BY ...] whose pattern is one join (no UNION ALL, no
+// MATCHNUM), and no other FROM item or subquery: the statement with that join in FROM, its conditions added to WHERE, and each
+// GRAPH_TABLE column it names its COLUMNS expression. None where that does not hold (or a name is not one of GRAPH_TABLE's
+// columns): the subquery is planned as it is (lexdb_exec.bindFrom, expand).
+pub fn flatQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt): Result[Option[Stmt], DbErr] {
+    if s.kind != lexdb_sql.S_SELECT || s.setop != 0 || len(s.from) != 1 || len(s.subs) != 1 || len(s.windows) > 0 || len(s.mr) > 0 ||
+       s.lockMode != 0 || len(s.into) > 0 || s.waitFor || len(s.inner) > 0 || len(s.distinctOn) > 0 {
+        return Ok(None)
     }
-    return Ok("select " + strings.join(&sel, ", ") + " from (" + body + ") \"gt$m\"")
+    let f = &s.from[0]
+    if f.sub != 0 || !isGraph(&s.subs[0]) || len(f.cols) > 0 || f.lateral { return Ok(None) }
+    let g = &s.subs[0]
+    var mn = false
+    let branches = try branchTexts(st, txn, &g.index, mut &mn)
+    if len(branches) != 1 || mn { return Ok(None) }
+    var bs = try lexdb_parse.oraParseNls(&branches[0], g.names.clone())
+    if len(bs) != 1 { return Ok(None) }
+    let b = pop(mut &bs)
+    if len(b.subs) > 0 || len(b.wins) > 0 || len(b.group) > 0 { return Ok(None) }
+    var names: []str = []
+    var exprs: []Expr = []
+    for it in b.items {
+        match it.expr {
+            Some(x) {
+                append(mut &names, it.alias.clone())
+                append(mut &exprs, lexdb_sql.cloneExpr(&x))
+            }
+            None { return Ok(None) }
+        }
+    }
+    var own: []str = []                 // the select list's own aliases (ORDER BY and GROUP BY may name them)
+    for it in s.items { if len(it.alias) > 0 { append(mut &own, it.alias.clone()) } }
+    let sb = Sub{al: f.alias.clone(), names: names, exprs: exprs, own: []}
+    var miss = false
+    var out = s.clone()
+    out.subs = []
+    out.udf = false
+    out.from = b.from.clone()
+    if b.params > out.params { out.params = b.params }
+    var items: []lexdb_sql.SelItem = []
+    for it in s.items {
+        if it.star {
+            if len(it.qual) > 0 && it.qual != f.alias { return Ok(None) }
+            for x in b.items { append(mut &items, x.clone()) }
+            continue
+        }
+        var n = it.clone()
+        match it.expr {
+            Some(x) {
+                n.expr = Some(subst(&x, &sb, mut &miss))
+                // a column of GRAPH_TABLE's named alone keeps its name
+                if len(it.alias) == 0 {
+                    match x {
+                        Expr.Col(cn, _) {
+                            let k = colAt(&sb, &cn)
+                            if k >= 0 {
+                                n.alias = b.items[k].alias.clone()
+                                n.spell = b.items[k].spell.clone()
+                            }
+                        }
+                        else {}
+                    }
+                }
+            }
+            None {}
+        }
+        append(mut &items, n)
+    }
+    out.items = items
+    var sw: Option[Expr] = None
+    match &s.where {
+        Some(w) { sw = Some(subst(&w, &sb, mut &miss)) }
+        None {}
+    }
+    out.where = andOf(&b.where, sw)
+    let sbo = Sub{al: f.alias.clone(), names: sb.names.clone(), exprs: sb.exprs.clone(), own: own}
+    var group: []Expr = []
+    for x in s.group { append(mut &group, subst(&x, &sbo, mut &miss)) }
+    out.group = group
+    out.having = match &s.having {
+        Some(h) { Some(subst(&h, &sbo, mut &miss)) }
+        None { None }
+    }
+    var order: []lexdb_sql.OrderItem = []
+    for o in s.order { append(mut &order, lexdb_sql.OrderItem{expr: subst(&o.expr, &sbo, mut &miss), desc: o.desc, nullsFirst: o.nullsFirst}) }
+    out.order = order
+    var wins: []lexdb_sql.WinDef = []
+    for w in s.wins {
+        var d = w.clone()
+        d.call = subst(&w.call, &sb, mut &miss)
+        var part: []Expr = []
+        for x in w.part { append(mut &part, subst(&x, &sb, mut &miss)) }
+        d.part = part
+        var wo: []lexdb_sql.WinOrder = []
+        for o in w.order { append(mut &wo, lexdb_sql.WinOrder{expr: subst(&o.expr, &sb, mut &miss), desc: o.desc, nullsFirst: o.nullsFirst}) }
+        d.order = wo
+        append(mut &wins, d)
+    }
+    out.wins = wins
+    if miss { return Ok(None) }
+    return Ok(Some(out))
+}
+
+type Expr = lexdb_sql.Expr
+
+fn andOf(a: &Option[Expr], b: Option[Expr]): Option[Expr] {
+    match a {
+        Some(x) {
+            match b {
+                Some(y) { return Some(Expr.Bin("and", lexdb_sql.cloneExpr(&x), y)) }
+                None { return Some(lexdb_sql.cloneExpr(&x)) }
+            }
+        }
+        None { return b }
+    }
+}
+
+// GRAPH_TABLE's columns (names folded, as the select list's aliases) and their expressions, the FROM item's alias, the select
+// list's own aliases (a name of ORDER BY or GROUP BY that is one of them is left as it is).
+type Sub = record { al: str; names: []str; exprs: []Expr; own: []str }
+
+// The column of GRAPH_TABLE a name is (alias.name or name), -1 none.
+fn colAt(sb: &Sub, n: &str): int {
+    var c = n.toStr()
+    if strings.contains(n, ".") {
+        if !strings.startsWith(n, &(sb.al + ".")) { return -1 }
+        c = n[len(sb.al) + 1..len(n)].toStr()
+    }
+    for i in 0..len(sb.names) { if sb.names[i] == c { return i } }
+    return -1
+}
+
+// x with GRAPH_TABLE's columns made their expressions; miss: a name that is none of them (nor, sb.own, a select alias).
+fn subst(x: &Expr, sb: &Sub, miss: mut &bool): Expr {
+    match x {
+        Expr.Col(n, _) {
+            let k = colAt(sb, n)
+            if k >= 0 { return lexdb_sql.cloneExpr(&sb.exprs[k]) }
+            if !(len(n) > 0 && n[0] == '#') && !lexdb_base.hasStr(&sb.own, n) { let old = replace(miss, true) }
+            return lexdb_sql.cloneExpr(x)
+        }
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), subst(&a, sb, miss)) }
+        Expr.Bin(op, a, b) { return Expr.Bin(op.clone(), subst(&a, sb, miss), subst(&b, sb, miss)) }
+        Expr.IsNull(a, not) { return Expr.IsNull(subst(&a, sb, miss), not) }
+        Expr.Call(n, args, star) {
+            if lexdb_sql.isSubCall(n) {
+                let old = replace(miss, true)
+                return lexdb_sql.cloneExpr(x)
+            }
+            var xs: []Expr = []
+            for y in args { append(mut &xs, subst(&y, sb, miss)) }
+            return Expr.Call(n.clone(), xs, star)
+        }
+        Expr.Cast(a, t) { return Expr.Cast(subst(&a, sb, miss), t) }
+        else { return lexdb_sql.cloneExpr(x) }
+    }
 }
 
 // ---- reading GRAPH_TABLE's text
