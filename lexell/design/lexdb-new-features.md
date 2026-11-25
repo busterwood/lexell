@@ -1099,7 +1099,7 @@ Branch from main `84ceec7e`, commits `af49fb6c` (the graph object and GRAPH_TABL
 
 **What lexdb did:** ORA-00900 (CREATE, DROP, GRAPH_TABLE), ORA-00922 (CREATE OR REPLACE). **Now:** the parser keeps the DDL's text after the name (`S_CREATE_GRAPH`,
 `S_DROP_GRAPH`) and GRAPH_TABLE's text (a subquery marked `lexdb_sql.GRAPH_MARK`, binds written `$n`; `lexdb_parse.graphTable`, reached from the table-name
-path of `fromItem0` only after a name and "(", so a point select's parse is as it was). `lexdb_graph` (a core module, ~1,950 lines) reads both with the Oracle
+path of `fromItem0` only after a name and "(", so a point select's parse is as it was). `lexdb_graph` (a core module, ~2,080 lines) reads both with the Oracle
 lexer: the graph is a catalog row of its own (`\x02pgraph\x00` and the key a table of that name would have), its elements with their tables' keys, key columns,
 labels, properties (a column's name, or an expression's text with the columns it reads and its type, from a query of the table: `lexdb_exec.describe`), an edge's
 two ends. Tables keep their layout, encoding and read paths. GRAPH_TABLE is written as SQL: per combination of the quantifiers' lengths and per binding of the
