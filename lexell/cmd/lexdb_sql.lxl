@@ -822,6 +822,61 @@ pub fn baseName(n: &str): str {
 // A possibly qualified name as SQL shows it: schema.name.
 pub fn shown(n: &str): str { return strings.replaceAll(n, QSEP, ".") }
 
+// Oracle's quoted names are exact (design/lexdb-oracle.md, "Exact names"): "qt" and QT are two tables there. lexdb's keys
+// are folded (lower case: L6), and a bare Oracle name keeps its fold (QT is qt, which the other doors write qt). A quoted
+// Oracle name with a lower-case letter gets a key of its own that no fold reaches and that every fold leaves as it is: the
+// name in lower case, ORA_UPC after each letter that was upper case, ORA_EXACT at the end ("MixT": m^ixt^$, "qt": qt$).
+// Any stored text that is read again (a view's, a default's) keeps it, and oraShown gives the name back.
+pub const ORA_UPC: byte = 0x1c
+pub const ORA_EXACT: byte = 0x1d
+
+// The key of Oracle's quoted name q (as written): its fold when it has no lower-case letter ("QT" is QT, qt), else exact.
+pub fn oraQuoted(q: &str): str {
+    var lower = false
+    for i in 0..len(q) { if q[i] >= 'a' && q[i] <= 'z' { lower = true } }
+    if !lower { return strings.toLowerAscii(q) }
+    var b = ""
+    for i in 0..len(q) {
+        let c = q[i]
+        if c >= 'A' && c <= 'Z' {
+            b.addByte(c + 32)
+            b.addByte(ORA_UPC)
+        } else { b.addByte(c) }
+    }
+    b.addByte(ORA_EXACT)
+    return b
+}
+
+pub fn isOraExact(k: &str): bool { return len(k) > 0 && k[len(k) - 1] == ORA_EXACT }
+
+// The name Oracle shows for key k (each part of a qualified one): an exact key's name as written, a folded one in upper
+// case, one with a spelling of its own (made in another door before L6) as it is. A name made from an exact one (its
+// generated constraint's, "Emp"_pkey) shows its exact part as written and the rest in upper case (Emp_PKEY).
+pub fn oraShown(k: &str): str {
+    if strings.indexOf(k, QSEP, 0) >= 0 { return oraShown(&schemaOf(k)) + QSEP + oraShown(&baseName(k)) }
+    let e = strings.lastIndexOf(k, "\x1d")
+    if e < 0 { return if k == strings.toLowerAscii(k) { strings.toUpperAscii(k) } else { k.toStr() } }
+    var b = ""
+    for i in 0..e {
+        let c = k[i]
+        if c == ORA_UPC || c == ORA_EXACT { continue }
+        if i + 1 < len(k) && k[i + 1] == ORA_UPC { b.addByte(c - 32) } else { b.addByte(c) }
+    }
+    return b + strings.toUpperAscii(&k[e + 1..len(k)])
+}
+
+// T-SQL's index names are per table (lexdb_ixname): one another table's index has in the schema is kept with IX_OF and its
+// table's name after it; ixShown gives the name as written.
+pub const IX_OF: str = "\x0e"
+
+pub fn ixShown(n: &str): str {
+    let i = strings.indexOf(n, IX_OF, 0)
+    return if i < 0 { n.toStr() } else { n[0..i].toStr() }
+}
+
+// What the catalog stores for a column's name: its spelling (L6), but an exact key itself (spelledCol reads it back).
+pub fn colStored(c: &ColDef): str { return if isOraExact(&c.name) { c.name.clone() } else { colShown(c) } }
+
 // A stored procedure or function (design/lexdb-dialect-gaps.md, package F): one record for every dialect that has them,
 // kept in the catalog tree (lexdb_catalog.routineKey). Oracle's PL/SQL units are not these (lexdb_plsql keeps and runs
 // them). A routine runs only for the dialect that made it (RD_*): its body is that dialect's text.

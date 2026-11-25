@@ -687,6 +687,9 @@ fn copyPrms(a: &[]Prm): []Prm {
 
 fn upperName(s: &str): str { return strings.toUpperAscii(s) }
 
+// A name as SQL text writes it, quoted (PL/SQL keeps a bare one upper case, a quoted one as written).
+fn qn(s: &str): str { return "\"" + strings.replaceAll(s, "\"", "\"\"") + "\"" }
+
 fn (cx: &Cx) sigOf(names: &[]str): Sig {
     if len(names) == 0 || len(names) > 3 { return noSig() }
     let nm = &names[len(names) - 1]
@@ -1392,8 +1395,9 @@ fn (cx: mut &Cx) parseType(sess: mut &lexdb_exec.Session): Result[PT, DbErr] {
             if len(names) >= 2 && len(names) <= 3 {
                 // [schema.]table.column
                 let col = &names[len(names) - 1]
-                var tab = names[len(names) - 2].clone()
-                if len(names) == 3 { tab = names[0] + "." + tab }
+                // (quoted in the SQL: a bare name is upper case already, a quoted one exact)
+                var tab = qn(&names[len(names) - 2])
+                if len(names) == 3 { tab = qn(&names[0]) + "." + tab }
                 if len(names) == 2 {
                     let vi = cx.find(&names[0])
                     if vi >= 0 && cx.vars[vi].pt.k == PK_REC {
@@ -1401,7 +1405,7 @@ fn (cx: mut &Cx) parseType(sess: mut &lexdb_exec.Session): Result[PT, DbErr] {
                         if f >= 0 { return Ok(cx.recs[cx.vars[vi].pt.rec].fields[f].pt) }
                     }
                 }
-                match cx.describeText(sess, &("SELECT " + col + " FROM " + tab)) {
+                match cx.describeText(sess, &("SELECT " + qn(col) + " FROM " + tab)) {
                     Ok(cols) { if len(cols) == 1 { return Ok(ptOfOut(&cols[0])) } }
                     Err(e) { return Err(cx.sqlErr(t0.line, &e)) }
                 }
@@ -1420,7 +1424,9 @@ fn (cx: mut &Cx) parseType(sess: mut &lexdb_exec.Session): Result[PT, DbErr] {
         }
         var tab = names[0].clone()
         for k in 1..len(names) { tab = tab + "." + names[k] }
-        match cx.describeText(sess, &("SELECT * FROM " + tab)) {
+        var qtab = qn(&names[0])
+        for k in 1..len(names) { qtab = qtab + "." + qn(&names[k]) }
+        match cx.describeText(sess, &("SELECT * FROM " + qtab)) {
             Ok(cols) {
                 var r = pt(PK_REC)
                 r.rec = cx.recOf(&tab, &cols)
@@ -4686,7 +4692,7 @@ pub type FnInfo = record { pub id: str; pub ret: lexdb_sql.TypeName; pub oid: in
 pub fn findFunction(pg: &Prog, ip: &Ip, name: &str): Option[FnInfo] {
     if len(pg.units) == 0 || len(name) == 0 { return None }
     var names: []str = []
-    for part in strings.split(&strings.replaceAll(name, lexdb_sql.QSEP, "."), ".") { append(mut &names, strings.toUpperAscii(&part)) }
+    for part in strings.split(&strings.replaceAll(name, lexdb_sql.QSEP, "."), ".") { append(mut &names, lexdb_sql.oraShown(&part)) }
     let i = pg.find(&names, &ip.user)
     if i < 0 { return None }
     let u = &pg.units[i]
@@ -4700,7 +4706,7 @@ pub fn findFunction(pg: &Prog, ip: &Ip, name: &str): Option[FnInfo] {
 pub fn invalidFunction(pg: &Prog, ip: &Ip, name: &str): Option[DbErr] {
     if len(pg.units) == 0 || len(name) == 0 { return None }
     var names: []str = []
-    for part in strings.split(&strings.replaceAll(name, lexdb_sql.QSEP, "."), ".") { append(mut &names, strings.toUpperAscii(&part)) }
+    for part in strings.split(&strings.replaceAll(name, lexdb_sql.QSEP, "."), ".") { append(mut &names, lexdb_sql.oraShown(&part)) }
     let i = pg.find(&names, &ip.user)
     if i < 0 || pg.units[i].kind != U_FUNC || len(pg.units[i].bad) == 0 { return None }
     return Some(ora(6575, &("Package or function " + pg.units[i].name + " is in an invalid state")))
@@ -4731,7 +4737,10 @@ pub fn callFunctionIn(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: 
 // A stored function called with these values: its result, or the error it raised.
 pub fn callFunction(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, id: &str, args: &[]Val): Result[Val, DbErr] {
     var binds: []BindIn = [BindIn{name: "R__", v: Val.Null, array: false, cursor: false}]
-    var blk = "BEGIN :r__ := " + id + "("
+    // (the id's names quoted: a function's name is exact, "MixF")
+    var qid: []str = []
+    for part in strings.split(id, ".") { append(mut &qid, "\"" + part + "\"") }
+    var blk = "BEGIN :r__ := " + strings.join(&qid, ".") + "("
     for k in 0..len(args) {
         if k > 0 { blk += ", " }
         blk += ":a" + k.toStr()
@@ -4764,9 +4773,10 @@ pub fn expandCalls(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, text: 
         let t = &toks[i]
         var ni = i
         var names: []str = []
-        if t.kind == TK_ID && !(i > 0 && toks[i - 1].kind == TK_OP && toks[i - 1].text == ".") {
+        // (a quoted name too: "MixF"(2), the name as written)
+        if (t.kind == TK_ID || t.kind == TK_QID) && !(i > 0 && toks[i - 1].kind == TK_OP && toks[i - 1].text == ".") {
             append(mut &names, t.up.clone())
-            while ni + 2 < len(toks) && toks[ni + 1].kind == TK_OP && toks[ni + 1].text == "." && toks[ni + 2].kind == TK_ID {
+            while ni + 2 < len(toks) && toks[ni + 1].kind == TK_OP && toks[ni + 1].text == "." && (toks[ni + 2].kind == TK_ID || toks[ni + 2].kind == TK_QID) {
                 append(mut &names, toks[ni + 2].up.clone())
                 ni += 2
             }
