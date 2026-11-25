@@ -9,6 +9,7 @@ and 271ca36e): 6.1's items 6 and 7, the missing scalar functions and aggregates,
 (later, commits 96be5d41, 4e1cf747, 269cfa25): a panic that ended the server, and 6.2's items 3 (IGNORE NULLS) and 5 (ON
 CONFLICT DO SELECT) built; items 4 (QUALIFY) and 6 (unenforced constraints) planned. Section 10.8 (later, commits 443310eb and fe8daf59): QUALIFY and the
 unenforced constraints built, marked *works* with the commit. Section 13 (later, 2026-11-25): SQL/PGQ in the Oracle door (O22, 6.3 item 1) built.
+Section 14 (later, 2026-11-25): Oracle's assertions (O23, 6.3 item 2) built.
 
 **What was audited.** The SQL a user of each product's newest release would reach for: PostgreSQL 19 (and 18, and
 older features met on the way), SQL Server 2025 (compatibility level 170) with 2022's additions, Oracle AI Database 26ai
@@ -132,7 +133,7 @@ Checked on 2025 RTM-CU10 at level 170 unless marked 2022.
 | O20 | `DEFAULT ON NULL [FOR INSERT ONLY \| FOR INSERT AND UPDATE] v` (12c; UPDATE 23ai) | a NULL written becomes the default, the column NOT NULL; an UPDATE to NULL ORA-01407 unless FOR INSERT AND UPDATE; USER_TAB_COLUMNS' DEFAULT_ON_NULL, DEFAULT_ON_NULL_UPD | as Oracle (ec3c5c17): INSERT, INSERT ... SELECT, UPDATE, MERGE, ALTER TABLE ADD / MODIFY, the views, ORA-02000, 00936, 30665 | works (ec3c5c17) | S | none | lexdb_parse `oraDefault`, lexdb_exec `onNullFill`, lexdb_oracat |
 | O21 | annotations: `ANNOTATIONS (name 'value', ...)` on tables and columns, `USER_ANNOTATIONS_USAGE` | | ORA-00900 | works (section 12) | M: kept in the catalog, listed in the views | none | lexdb_parse, lexdb_oracat |
 | O22 | SQL/PGQ: `CREATE PROPERTY GRAPH`, `GRAPH_TABLE (g MATCH ... WHERE ... COLUMNS (...))`, bounded quantifiers `->{1,2}` | rows as the joins of the pattern; ORA-42421 for an unknown graph | as Oracle (section 13): CREATE [OR REPLACE] PROPERTY GRAPH [IF NOT EXISTS], DROP, GRAPH_TABLE with labels, directions, bounded quantifiers, aggregates of quantified variables, IS LABELED, IS SOURCE OF, VERTEX_ID / EDGE_ID (as text), MATCHNUM, the 424xx and 409xx errors, the PG_* views (was ORA-00900); not ONE ROW PER VERTEX / STEP (0A000) | works (af49fb6c) | L (section 6.3) | none (PostgreSQL 19 has not; SQL Server's MATCH over NODE/EDGE tables is another design) | new lexdb_graph, lexdb_parse `graphTable`, lexdb_oracat |
-| O23 | `CREATE ASSERTION a CHECK (NOT EXISTS (...) \| ALL (...) SATISFY (...))` (23.26.1) | ORA-08601 `Assertion (APP.A1) violated` at the DML; no aggregates (ORA-08689, ORA-00934); `USER_ASSERTIONS` | ORA-00900 | missing | L (section 6.3: a design note) | none | new lexdb_assert |
+| O23 | `CREATE ASSERTION a CHECK (NOT EXISTS (...) \| ALL (...) SATISFY (...))` (23.26.1) | ORA-08601 `Assertion (APP.A1) violated.` at the DML, ORA-02091 at the COMMIT of a deferred one; no aggregates (ORA-08689 over ORA-08661) and the other refusals of section 14; `USER_ASSERTIONS` | as Oracle (section 14): CREATE [IF NOT EXISTS], DROP, ALTER ... ENABLE / DISABLE, NOT EXISTS, EXISTS, ALL ... SATISFY, the state words, the refusals at CREATE, the check for the rows written (FAST) or the whole query, deferred ones, SET CONSTRAINT[S], the writers' locks on the join key's values, ORA-08702 / 08694 for DDL on its tables, the views (was ORA-00900); USER_ASSERTION_LOCK_MATRIX empty | works (01c392ae) | L (section 6.3) | none (the SQL standard's; neither PostgreSQL nor SQL Server has it) | new lexdb_assert, lexdb_parse `assertStmt`, lexdb_oracat |
 | O24 | `IS [NOT] DISTINCT FROM` | not Oracle's (ORA-00908, 23.26.3) | accepted (lexdb's extension in this door) | works (kept: the user's decision, 2026-11-23) | none: the user wants it in the Oracle door too, as an extension; test tns_distinct | PostgreSQL, T-SQL 2022 | lexdb_parse |
 | O25 | `IGNORE NULLS` in `FIRST_VALUE(x IGNORE NULLS)`, `LAST_VALUE`, `LAG(x) IGNORE NULLS`, `LEAD`, `NTH_VALUE` | PostgreSQL's values; ORA-01428 for an offset or n below 1 | as Oracle, both spellings; ORA-30484, 01428 (was ORA-00900); not NTH_VALUE's FROM FIRST / FROM LAST (10.4) | works (4e1cf747) | (P5) | PostgreSQL 19, T-SQL 2022 | lexdb_window |
 | O26 | `CONSTRAINT c CHECK (...) DISABLE`, `ENABLE [NO]VALIDATE` | DISABLE; ENABLE [VALIDATE] checks the rows (ORA-02293, ORA-02298), ENABLE NOVALIDATE checks the new ones (ORA-02290, ORA-02291); 23.26.3 has no NOT ENFORCED (ORA-02000, ORA-03075) | as Oracle: DISABLE, ENABLE [NO]VALIDATE in CREATE TABLE and ADD CONSTRAINT, ENABLE | DISABLE CONSTRAINT, MODIFY CONSTRAINT; USER_CONSTRAINTS STATUS and VALIDATED (was ORA-00900) (10.8) | works (fe8daf59) | (P6) | PostgreSQL NOT ENFORCED, T-SQL NOCHECK | lexdb_parse `stateWord`, `oraStateAlter` |
@@ -152,12 +153,13 @@ the rows.
 |---|---|---|---|---|---|
 | PostgreSQL 19/18 (and older met on the way) | 19 (P1, P2, P4, P5, P6, P7's syntax, P8, P9 but array_sort, P10-P12, P14 but random of dates, P15, P18-P22, P23's VALUES in WITH and functions) | 0 | 0 | 8 (P3, P7's catalogs, P9's array_sort, P13, P14's random of dates, P16, P17, P23's CREATE DOMAIN and pg_input_*) | 27 / 23 |
 | SQL Server 2025/2022 | 23 (S1-S9, S12-S25) | 0 | 0 | 3 (S10, S11, S20's STRING_SPLIT) | 26 / 25, and S26 (note) |
-| Oracle 26ai/23ai | 24 (O1-O10, O12-O20 but O17's CHECKSUM, O24 as an extension, O25, O26, O27, O28) | 1 (O5's literal type) | 0 | 7 (O11, O17's CHECKSUM, O21-O23, O29, O30) | 32 / 30 |
+| Oracle 26ai/23ai | 27 (O1-O10, O12-O20 but O17's CHECKSUM, O21-O23, O24 as an extension, O25, O26, O27, O28) | 1 (O5's literal type) | 0 | 4 (O11, O17's CHECKSUM, O29, O30) | 32 / 30 |
 
 Before the fixes of section 7 (the audit as run): PostgreSQL 2 / 4 / 1 / 16; SQL Server 3 / 8 / 5 / 13; Oracle 5 / 4 / 2 / 26. After
 section 7, before section 8: PostgreSQL 7 / 0 / 0 / 16; SQL Server 14 / 0 / 0 / 13; Oracle 10 / 2 / 1 / 26. After section 8,
 before section 9: PostgreSQL 11 / 0 / 0 / 14; SQL Server 15 / 0 / 0 / 11; Oracle 14 / 2 / 1 / 18. After section 9, before
 section 10: PostgreSQL 16 / 0 / 0 / 11; SQL Server 21 / 0 / 0 / 5; Oracle 20 / 1 / 1 / 10. After section 10.8: PostgreSQL 19 / 0 / 0 / 8; SQL Server 23 / 0 / 0 / 3; Oracle 24 / 1 / 0 / 7.
+After sections 12-14 (annotations, property graphs, assertions): Oracle 27 / 1 / 0 / 4.
 
 ## 5. IS [NOT] DISTINCT FROM in the T-SQL door: the test
 
@@ -244,7 +246,7 @@ containers above), batches on and off.
    long bounds a recursive CTE through lexdb_recur (section 10's machinery: its depth limit is the bound). Errors
    ORA-42421 and the 424xx family; `USER_PROPERTY_GRAPHS`, `USER_PG_ELEMENTS`, `USER_PG_LABELS`. New module
    `lexdb_graph` (catalog record, rewrite), a hook in the Oracle FROM parse, views in lexdb_oracat. Three to five days.
-2. **CREATE ASSERTION** (O23; design note). Oracle 23.26.1: `CREATE ASSERTION n CHECK (NOT EXISTS (q) | ALL (q)
+2. **CREATE ASSERTION** (O23; design note; built: section 14). Oracle 23.26.1: `CREATE ASSERTION n CHECK (NOT EXISTS (q) | ALL (q)
    SATISFY (c))`, optionally DEFERRABLE / INITIALLY DEFERRED, no aggregates (ORA-08689 at CREATE), ORA-08601 at the
    statement that breaks it, `USER_ASSERTIONS`, and the guarantee that two transactions cannot break it together.
    What it takes in lexdb: (a) a catalog object with its query and the tables it reads; (b) after each statement that
@@ -1150,3 +1152,114 @@ graph DDL: the graphs, their views and GRAPH_TABLE as before; a graph's name ORA
 - `v.*` and PROPERTY_ORDER follow the labels' order as written; Oracle put a label of explicit properties before one of ALL COLUMNS on one edge table (not
   understood; the test avoids it). A table that is both a vertex and an edge element gave Oracle results not understood (not tested).
 - COMMENT ON PROPERTY GRAPH, ALTER PROPERTY GRAPH, privileges on graphs (lexdb reads the tables with the session's rights): not built.
+
+## 14. Oracle's assertions (O23, as built, 2026-11-25)
+
+Branch from main `e7691bd6`, commits `9e11d100` (the views' shapes), `01c392ae` (`lexdb_assert`: the catalog object, the check, deferral, the locks),
+`523057ef` ([NOT] IN, an UPDATE of columns not read, DROP COLUMN's error first), `033a0036` (`tns_assert`), `49ce88ed` (`exec_assert`), `246b9718`
+(`replica.py`), `14142dc5` (the check's tables through the cache, `setWholeOver`), `195e7388` (batch_rows refused), `1e4de330` (`blockEnd`). The plan of 6.3 item 2 held, with the product's corrections below and
+the finer locks of its "later" (per value of the join key) built now; Oracle Free 23.26.3 was probed first, two sessions included.
+
+**What the product does** (each checked on `lxl-oracle`):
+- `CREATE ASSERTION [IF NOT EXISTS] [schema.]name CHECK (cond) [state]`, cond (in brackets as many as wanted) `NOT EXISTS (q)`, `NOT (EXISTS (q))`,
+  `EXISTS (q)` or `ALL (q) SATISFY (c)` (c over q's column names: `x.v` is ORA-00904, `select v + 1` names no V); state ENABLE | DISABLE, VALIDATE |
+  NOVALIDATE, [NOT] DEFERRABLE, INITIALLY IMMEDIATE | DEFERRED, each once in any order (a word twice, or another, ORA-00911 `r: invalid character after
+  )`); NOT DEFERRABLE INITIALLY DEFERRED ORA-08724, DISABLE VALIDATE ORA-08701; INITIALLY DEFERRED alone is DEFERRABLE, DISABLE alone NOVALIDATE. No OR
+  REPLACE (ORA-00922). ORA-00955 for a table's, view's or sequence's name, and the other way round (an index's name is apart). `DROP ASSERTION [IF EXISTS]`
+  (none: ORA-13650, ALTER's too); `ALTER ASSERTION n [ENABLE | DISABLE] [VALIDATE | NOVALIDATE]` (nothing after the name: accepted, no change; its
+  deferrability ORA-08725; RENAME ORA-00911); ENABLE [VALIDATE] checks the rows (ORA-08601), ENABLE NOVALIDATE does not.
+- The names are read first (an unknown column ORA-00904, a table ORA-00942, a dictionary view too; ORDER BY ORA-00907, a bind ORA-01027, `CHECK (1 = 1)`
+  ORA-00936), then the refusals, ORA-08689 `CREATE ASSERTION failed` over the reason: aggregates, GROUP BY, HAVING (08661), a subquery under an OR (08695),
+  two conditions ANDed, a set operation, a subquery in SATISFY (08680), FETCH FIRST (08697 `SYS owned tables are not supported`), SYSDATE, ROWNUM and the
+  like (08677), a window (08664), DUAL (08678), a view (08651), an ANSI join (08735), a scalar subquery, IN with an aggregate (08659), WITH (08660), and an
+  equijoin of two instances either of whose columns may be NULL: not NOT NULL (a key's), nor kept from NULL in its own block by a condition with a constant
+  (`c = 5`, `c > 0`, `c IS NOT NULL`, IN, LIKE) or an equality there to such a column (08673 `Equijoin "A"."G"="B"."G" found does not meet the criteria to
+  do a FAST validation.`; a condition of the block around it does not count). Accepted: NOT EXISTS, EXISTS and [NOT] IN (subquery) at any depth,
+  correlated, inline views in FROM, self-joins, functions of a row (UPPER, NVL). Then the rows: one breaking it is ORA-08689 over ORA-08601.
+- The check: after each INSERT, UPDATE, DELETE, MERGE and a PL/SQL block's statement (the block's work undone with it unless a handler takes the error),
+  ORA-08601 `Assertion (APP.A1) violated.`, the statement undone. Oracle validates the rows a statement wrote (FAST, USER_ASSERTION_DEPENDENCIES): an
+  assertion made NOVALIDATE over rows that break it refuses a row that breaks it and lets the others in, and an UPDATE that sets no column it reads passes
+  over such a row. A deferred one is checked at COMMIT: ORA-02091 `transaction rolled back` over ORA-08601, rolled back; SET CONSTRAINT[S] name, ... | ALL
+  DEFERRED | IMMEDIATE apply to assertions (IMMEDIATE checks then: ORA-08601, the transaction goes on); DEFERRED of one not deferrable ORA-08687. (SET
+  CONSTRAINT of no such name is ORA-02448; lexdb's ORA-02443, older, not changed.)
+- Two sessions: the second of two adding rows that only together break a join waits for the first's COMMIT, then ORA-08601 (USER_ASSERTION_LOCK_MATRIX:
+  locks on the join columns' values); rows of other join values do not wait; rows that cannot take part (their table's own conditions false) take no
+  lock; an assertion without an equijoin locks its tables (the second waits, and passes after the first's ROLLBACK); a DELETE does not wait for an INSERT.
+- DDL: DROP or RENAME COLUMN of a column it reads ORA-08702 `Columns are referenced by assertion APP.A1.`; DROP TABLE ORA-08702 unless CASCADE CONSTRAINTS,
+  which drops its assertions; RENAME and ALTER TABLE ... RENAME TO ORA-08694; another column's ADD, DROP, RENAME, and TRUNCATE pass.
+- Views USER_, ALL_, DBA_ ASSERTIONS (DEFINITION_SQL `CREATE ASSERTION "APP"."A1" CHECK \r\n(cond as written)\r\n ENABLE\r\n NOT DEFERRABLE\r\n INITIALLY
+  IMMEDIATE\r\n VALIDATE`, a CLOB), ASSERTION_DEPENDENCIES (an instance a row: REFERENCED_ID in Oracle's order, the query's own and its EXISTS' tables by
+  their age, then each NOT EXISTS's; VALIDATION_TYPE FAST, COMPLETE for an EXISTS; VALIDATION_EVENT `ROWS INSERTED OR UPDATED`, `ROWS DELETED OR UPDATED` under
+  a NOT EXISTS and for an EXISTS), ASSERTION_LOCK_MATRIX; USER_OBJECTS' OBJECT_TYPE of an assertion is `UNDEFINED`. APP cannot read DBA_ASSERTIONS.
+
+**What lexdb did:** ORA-00900. **Now:** the parser keeps the text after the name (`S_ASSERT`, verb in alias; `lexdb_parse.assertStmt`) and SET CONSTRAINT
+(singular) in the Oracle door; the TNS door begins a transaction for SET CONSTRAINT[S], as for LOCK TABLE. `lexdb_assert` (a core module, ~1,700 lines)
+reads the text with the Oracle lexer and lexdb's parser: the condition's form, the state, Oracle's refusals (the words, then a walk of q's blocks: its
+tables and polarity, [NOT] EXISTS and [NOT] IN as blocks, the equijoin rule). The assertion is a catalog row of its own (`\x02assert\x00` and the key a
+table of that name would have): its CHECK text, form, q and c, state, search path, instances (table, polarity) and the columns it reads. Each table it reads
+names it in its `refBy` (the assertion's row key, which no table's key starts as), so the statements that look for the foreign keys referencing a table
+find it there: `lexdb_exec.fkTables`, once a statement, notes such a table (its write mark, insert only or not) in the transaction's onCommit list, and the
+fast paths that refuse a table with references (range DELETE, DELETE's narrow read) refuse it too; a table no assertion reads pays nothing. At the
+statement's end in a block (`lexdb_exec.runStmt`, when the onCommit list is not empty) and before a statement's own commit (`onCommitDo`), each assertion
+of a table written is checked: for each instance whose rows coming may break it (q's own and its EXISTS' tables), the query with that instance restricted
+to the keys the statement put (16 a query; past 64 rows the whole query for a VALIDATED one); for one whose rows going may (under NOT EXISTS, an EXISTS
+assertion's), and for a statement that may update or delete, the whole query; an UPDATE that sets none of the columns the assertion reads is not checked.
+Under the lock of more than one instance or an EXISTS: rows that do not meet their table's own conditions are left out first (a query of the row alone);
+then the values of the join key (the one class of equijoined columns every instance has a column of: `joinKeys`) are locked, each exclusive under the
+assertion's weakest lock, or without such a key the assertion exclusive (lexdb_locks, held to the transaction's end; a deadlock 40P01, ORA-00060). The
+check reads the latest committed rows (a block's DML reads the live tree) and its reads are not noted for the commit check (the locks keep them; two
+writers of different keys do not fail each other's COMMIT). A deferred one waits in the onCommit list for COMMIT (ORA-02091 over ORA-08601, `atCommit`) or
+SET CONSTRAINT[S] ... IMMEDIATE (`lexdb_exec.checkPending`), checked for the writes since its first statement. DROP TABLE's `unlinkTable`, DROP and RENAME
+COLUMN and RENAME TO call it for ORA-08702, CASCADE CONSTRAINTS, ORA-08694; the walks of refBy that look for the referencing tables take the tables only
+(`refs`). An assertion's name is ORA-00955 for a table, view, sequence (`lexdb_graph.freeKey` asks `lexdb_assert.freeKey`, only once an assertion has been
+seen: `noteAsserts` at bootstrap). The rows go through the log as any catalog row: restart, replay and replicas need nothing more. The PostgreSQL door's
+writes to an asserted table are checked too (23514 `assertion "A1" is violated`), its parser and the T-SQL door's refuse CREATE ASSERTION as before (42601
+at `assertion`). UPDATE, DELETE and COPY with lexdb's batch_rows, which commit as they go, are refused on a table an assertion reads (0A000,
+`noBatch`). `lexdb_oracat` serves the views (`oraAssertRows`, USER_OBJECTS' UNDEFINED rows; the lock matrix empty), their shapes from
+`tools/gen_oracle_catalog.py` (the new views' lines, DICTIONARY rows and synonyms merged into `lexdb_oradata`).
+
+Tests: `tns_assert` (34 setup statements, 139 lines each with batches off and on, each line's statements in one transaction rolled back after them all, a
+failing one undone alone; `gen_oracle.py --check tns_assert`: 0 differences); `exec_assert` (1,200 random statements over two tables four assertions read,
+each run also on a copy without assertions whose four queries decide which must fail: 200 refused, 0 differences, batches off for the first half and on
+for the second; two sessions in tasks: write skew on the join key (the second waits, then 23514), keys apart (no wait), two DELETEs of an anti-join's last
+two rows (the second waits, then 23514), no join key (waits, passes after a ROLLBACK); no lock left; the PostgreSQL and T-SQL doors; a reopened store);
+`replica.py` (an assertion each round, the replica's USER_ASSERTIONS the master's, ORA-16000 there, ORA-08601 on the master; the one made before the master's
+SIGKILL there after replay and checked; all after the clean close, and ORA-00955 for a table of an assertion's name after the start again, bootstrap's note).
+Planted: no whole query after a DELETE from a NOT EXISTS's table (exec_assert: statement 3).
+
+**Cost** (base `e7691bd6`, branch `1e4de330`, both `-O`, trees at paths of equal length):
+- In process (`LXL_HASH_SEED=1`, `perf stat -e instructions:u`, `taskset -c 6`, `(I(20000) - I(0)) / 20000`, two rounds), base -> branch: prepared
+  (a 10,000-row table) point select 31,436.2 -> 31,436.2, INSERT 217,515.1 / 217,515.0 -> 217,515.0 / 217,515.0, UPDATE by key 201,362.8 -> 201,362.8;
+  as text (a 2,000-row table) select 111,072.8 -> 111,072.8, INSERT 241,012.6 -> 241,012.6, UPDATE 228,838.6 -> 228,836.4 (both rounds). No assertion's
+  code runs on these paths: a table no assertion reads has nothing in its refBy, and a statement on its own is checked in `onCommitDo`, which it reaches
+  only with temporary tables or notes. In a block (one BEGIN, 20,000 prepared statements; not the gate's measure): INSERT 50,369.3 -> 50,373.3, UPDATE
+  85,283.9 -> 85,286.9, the one test of the onCommit list after each statement (written inline, with the statement's Result copied, it was 12-15).
+- Over the wire (`icount6.sh BIN 3`, points.sql, base and branch alternated twice), per statement: instructions 160,886 / 160,866 -> 160,960 / 160,849
+  (level); cycles 91,205 / 88,572 -> 85,963 / 85,782; L1 i-cache misses 246.7 / 248.2 -> 347.6 / 354.8; iTLB misses 138.8 / 136.4 -> 31.5 / 31.5;
+  branch misses 386.4 / 377.0 -> 370.5 / 366.8 (placement: the instructions are the same).
+- TPC-H SF1 (lexdb only, `run.sh` with TPCH_REF, base and branch `14142dc5` alternated twice, the best of each side): 8,114 -> 8,033 ms in all (0.99);
+  checksums equal on all 22; no query 1.5% slower (q17 21.2 -> 21.5 ms, q3 504.5 -> 510.4, q15 353.2 -> 357.0: 1.4%, 1.2%, 1.1%). The write path gains
+  one call in `fkTables` for tables with references, none for the others (TPC-H's load).
+- A single-row INSERT (prepared, on its own) into a table of 1,000 and of 100,000 rows (`apt`: `(I(N) - I(0)) / N` and the time a statement), the
+  assertion `NOT EXISTS (SELECT 1 FROM u WHERE v < 0)`: no assertion 221,800 instructions / 60 us, 219,388 / 60 us; the check for the row put (delta)
+  353,264 / 99 us, 352,282 / 97 us (+131,000 instructions, +59%, the same at both sizes); its whole query each time (`setWholeOver(0)`) 1,823,761 / 195
+  us, 245,193,489 / 12.5 ms. A join of u with a 1,000-row w on an indexed key (`NOT EXISTS (SELECT 1 FROM u x, w y WHERE x.k = y.k AND y.kind = 'X' AND
+  x.v > 50)`: half the rows put meet `x.v > 50`, and those lock their key's value): 510,385 / 130 us, 505,213 / 119 us; whole 6,304,045 / 464 us,
+  653,090,779 / 34.5 ms. The delta check's cost is mostly the planning of its query, made again each time.
+- lexdb_exec: 21,516 -> 21,546 lines (the import; `assertUp` and `assertRows`, the Up a check runs its queries with; S_ASSERT in isWrite, stmtName and
+  execStmt; `blockEnd` and its call in runStmt; the calls in onCommitDo, checkPending, setConstraints, fkTables (two), parentSide, unlinkTable, DROP and
+  RENAME COLUMN, RENAME TO, batchDml and COPY; the walks of refBy for referencing tables through `refs`); the rest in lexdb_assert (1,700), lexdb_parse (+30),
+  lexdb_oracat (+55), lexdb_store (+27: `putKeys`, `wroteSince`), lexdb_catalog, lexdb_sql, lexdb_graph, lexdb_tns, lexdb_oradata.
+
+**Left, not built:**
+- USER_ASSERTION_LOCK_MATRIX is empty (lexdb's locks are the assertion's and its join key's values, not Oracle's per-instance SX/S modes); the INVALID column
+  is always NULL (Oracle marks an assertion INVALID at DDL on its tables, an ADD COLUMN too, and still checks it).
+- lexdb serializes the writers of rows that meet in the join key's value or, without a join key, every writer of rows that meet their own conditions;
+  Oracle's matrix is finer for chains of joins.
+- Under NOVALIDATE, rows that already break the assertion fail a statement that must run the whole query: a DELETE from a NOT EXISTS's table, or more than
+  64 rows put (Oracle checks only the rows written: FAST).
+- Each check plans its query again (its parsed form is kept per assertion): the INSERT's cost above is mostly that planning.
+- An asserted table's refBy is not empty: the PostgreSQL door's pg_class.relhastriggers is true for it (the checks are its triggers, in effect).
+- Quoted names are matched folded (L6: `"xd"` is shown XD); the check reads the tables with the session's rights (not the owner's); TRUNCATE of an EXISTS
+  assertion's table is not checked; ALTER TABLE ... MODIFY of a column it reads is not refused; SET CONSTRAINT of no such name is ORA-02443 (Oracle
+  ORA-02448).
