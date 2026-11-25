@@ -112,5 +112,5 @@ service, libpq's and pgjdbc's `target_session_attrs` / `targetServerType`. See [
   replication to another machine yet.
 - **No parallel query.** One statement runs on one core. Replicas add cores for reads.
 - **Not in memory.** The data lives on disk; the cache (`--cache-mb`) holds what is in use.
-- **Missing subsystems.** No JSON type, no extensions, no full-text search, no partitioning, no triggers, no
+- **Missing subsystems.** No extensions, no full-text search, no partitioning, no triggers, no
   tablespaces. Collations exist in the SQL Server door only (lexdb's other doors compare text by bytes).

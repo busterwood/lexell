@@ -119,7 +119,8 @@ select_list:
 - Some errors have other numbers: `SELECT DISTINCT name ... ORDER BY salary` is ORA-20000 (Oracle ORA-01791), and
   `ORDER BY` on a column that a set operator's first query does not name is ORA-20000 (Oracle ORA-00904).
 - Hints (`/*+ ... */`) are read as comments. `SAMPLE`, `AS OF` (flashback), `PIVOT`, `UNPIVOT`, `MODEL`,
-  partitioned outer joins, `XMLTABLE` and `JSON_TABLE` are not supported (ORA-00900).
+  partitioned outer joins and `XMLTABLE` are not supported (ORA-00900); for `JSON_TABLE` see
+  [JSON and SQL/JSON](functions-json.md).
 
 ## Examples
 

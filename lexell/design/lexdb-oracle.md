@@ -1344,3 +1344,10 @@ whole-query check, the check's plan made each time.
 - A `SELECT *` view keeps its columns (by name) when its table gains one, as Oracle expands `*` at CREATE (`lexdb_viewdep.narrowed`); USER_VIEWS.TEXT stays as written.
 - **Assertions**: a DELETE or UPDATE of a table under NOT EXISTS checks the outer rows of the join key's values of the rows taken out only (`lexdb_assert.goneVals`, the old
   rows from `Store.beforeMark`), so NOVALIDATE over rows that break it takes writes that break nothing (example G). Test `tns_bugs7`.
+
+## As built: the eighth bug slice (lexdb-robust.md, 2026-11-25)
+
+- **A package's overloaded members** are picked by the call's arguments (`Cx.overload`, `pickOf`; `PUnit.ovl`): from PL/SQL and from SQL (`lexdb_plcall.block`: the arguments'
+  types from a query of them, a bind's from the client; ORA-06553 PLS-306 / PLS-307 when none or more than one fits; a view keeps the resolved overload). Overload resolution's
+  implicit conversions are Oracle's (`famConv`). `f(x => 1)` and `pkg.f(x => 1)` work in SQL. Test `tns_bugs8`.
+- PLS-00306 and PLS-00307 point at the call's name; a repeated named argument is PLS-00703.
