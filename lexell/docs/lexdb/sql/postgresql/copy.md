@@ -53,6 +53,9 @@ loading](../../bulk-load.md#postgresql-copy).
   psql, Java and other clients.
 - A `COPY FROM` is one statement: all its rows go in, or none do, unless `batch_rows` commits it in parts.
 - The command tag is `COPY n`.
+- An error in the statement itself (an unknown table or column, an option that is not valid or is given twice) comes
+  before any data is sent. psql then skips the lines of the script up to a line `\.`, with lexdb as with PostgreSQL:
+  put one right after a `COPY ... FROM STDIN` whose options may be wrong (example F).
 
 ## Differences from PostgreSQL
 
@@ -60,11 +63,9 @@ loading](../../bulk-load.md#postgresql-copy).
   only. Use psql's `\copy` for files on the client.
 - The binary format is not supported (0A000).
 - `WITH (batch_rows n)` is lexdb's own.
-- `ON_ERROR set_null` (PostgreSQL 19) is 0A000. An option given twice is not refused.
-- An error that PostgreSQL finds before it asks for the data (an unknown table, an option that is not valid) is
-  reported by lexdb after the client has sent the data, up to its end marker. In a psql script the lines after such a
-  `COPY ... FROM STDIN` are taken as its data until a line `\.`: put one right after the statement when its options
-  may be wrong (example F).
+- `ON_ERROR set_null` (PostgreSQL 19) is 0A000.
+- A view as the target of `COPY ... FROM STDIN` is refused before the client is asked for the data; PostgreSQL
+  refuses it after. The other errors of the table, the columns and the options come first in both.
 
 ## Examples
 
@@ -206,7 +207,8 @@ CONTEXT:  COPY reading, line 1: "f	2026-05-01"
 
 ### F. Option errors
 
-Put the end marker right after a statement whose options may be wrong (see the differences above):
+Put the end marker right after a statement whose options may be wrong: psql skips the script's lines up to it when
+the `COPY` fails.
 
 <!-- example: postgresql -->
 ```sql
@@ -220,6 +222,14 @@ COPY reading FROM STDIN WITH (FORMAT json);
 \.
 COPY reading FROM STDIN WITH (ON_ERROR set_null);
 \.
+COPY reading FROM STDIN WITH (FORMAT csv, FORMAT text);
+\.
+COPY reading FROM STDIN WITH (FORMAT csv, FORCE_NULL (nosuch));
+\.
+COPY reading (sensor) FROM STDIN WITH (FORMAT csv, FORCE_NULL (val));
+\.
+COPY reading FROM STDIN WITH (HEADER 2);
+\.
 COPY reading TO STDOUT WITH (FORMAT json, HEADER);
 COPY reading TO STDOUT WITH (FORCE_ARRAY);
 COPY reading TO STDOUT WITH (ON_ERROR ignore);
@@ -231,6 +241,10 @@ ERROR:  REJECT_LIMIT (0) must be greater than zero
 ERROR:  COPY ON_ERROR "bogus" not recognized
 ERROR:  COPY FORMAT JSON is not supported for COPY FROM
 ERROR:  lexdb: COPY's ON_ERROR set_null is not supported
+ERROR:  conflicting or redundant options
+ERROR:  column "nosuch" of relation "reading" does not exist
+ERROR:  FORCE_NULL column "val" not referenced by COPY
+ERROR:  header requires a Boolean value or "match"
 ERROR:  cannot specify HEADER in JSON mode
 ERROR:  COPY FORCE_ARRAY requires JSON mode
 ERROR:  COPY ON_ERROR cannot be used with COPY TO
