@@ -845,24 +845,44 @@ type TxnBuf = record {
     pending: []PendingDelta
 }
 
-var SESS_BUFS: once task.Shared[Map[int, TxnBuf]]
+type BufStore = record {
+    keys: []int
+    vals: []TxnBuf
+}
 
-fn bufs(): task.Shared[Map[int, TxnBuf]] {
-    if !SESS_BUFS.isSet() { SESS_BUFS.set(task.shared(newMap())) }
+var SESS_BUFS: once task.Shared[BufStore]
+
+fn bufs(): task.Shared[BufStore] {
+    if !SESS_BUFS.isSet() { SESS_BUFS.set(task.shared(BufStore{keys: [], vals: []})) }
     return SESS_BUFS.get().share()
 }
 
+fn bufSlot(st: mut &BufStore, sess: int): int {
+    for i in 0..len(st.keys) { if st.keys[i] == sess { return i } }
+    append(mut &st.keys, sess)
+    append(mut &st.vals, TxnBuf{deltas: [], pending: []})
+    return len(st.keys) - 1
+}
+
+fn findSlot(st: &BufStore, sess: int): int {
+    for i in 0..len(st.keys) { if st.keys[i] == sess { return i } }
+    return -1
+}
+
+fn removeSlot(st: mut &BufStore, i: int) {
+    let last = len(st.keys) - 1
+    if i != last {
+        st.keys[i] = st.keys[last]
+        st.vals[i] = replace(mut &st.vals[last], TxnBuf{deltas: [], pending: []})
+    }
+    let _k = pop(mut &st.keys)
+    let _v = pop(mut &st.vals)
+}
+
 fn pushDelta(sess: int, mark: int, table: &str, sign: int, row: &[]Val, chg: &[]int) {
-    bufs().with(fn(m: mut &Map[int, TxnBuf]) {
-        let rec = DeltaRec{mark: mark, table: table.toStr(), sign: sign, row: collections.copyOf(row), changed: collections.copyOf(chg)}
-        match m.get(&sess) {
-            Some(b) {
-                var b2 = b.clone()
-                append(mut &b2.deltas, rec)
-                m.put(sess, b2)
-            }
-            None { m.put(sess, TxnBuf{deltas: [rec], pending: []}) }
-        }
+    bufs().with(fn(st: mut &BufStore) {
+        let i = bufSlot(st, sess)
+        append(mut &st.vals[i].deltas, DeltaRec{mark: mark, table: table.toStr(), sign: sign, row: collections.copyOf(row), changed: collections.copyOf(chg)})
     })
 }
 
@@ -901,83 +921,69 @@ pub fn recordTruncate(txn: &lexdb_store.Txn, t: &Table) {
 
 pub fn hasWork(sess: int): bool {
     var any = false
-    bufs().with(fn(m: mut &Map[int, TxnBuf]) {
-        match m.get(&sess) {
-            Some(b) { any = len(b.deltas) > 0 || len(b.pending) > 0 }
-            None {}
-        }
+    bufs().with(fn(st: mut &BufStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 { any = len(st.vals[i].deltas) > 0 || len(st.vals[i].pending) > 0 }
     })
     return any
 }
 
 pub fn hasStmtDeltas(sess: int): bool {
     var any = false
-    bufs().with(fn(m: mut &Map[int, TxnBuf]) {
-        match m.get(&sess) {
-            Some(b) { any = len(b.deltas) > 0 }
-            None {}
-        }
+    bufs().with(fn(st: mut &BufStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 { any = len(st.vals[i].deltas) > 0 }
     })
     return any
 }
 
 pub fn undoTo(sess: int, mark: int) {
-    bufs().with(fn(m: mut &Map[int, TxnBuf]) {
-        match m.get(&sess) {
-            Some(b) {
-                var ds: []DeltaRec = []
-                for d in b.deltas { if d.mark < mark { append(mut &ds, d.clone()) } }
-                var ps: []PendingDelta = []
-                for p in b.pending { if p.mark < mark { append(mut &ps, p.clone()) } }
-                if len(ds) == 0 && len(ps) == 0 { let _ = m.remove(&sess) } else { m.put(sess, TxnBuf{deltas: ds, pending: ps}) }
-            }
-            None {}
+    bufs().with(fn(st: mut &BufStore) {
+        let i = findSlot(st, sess)
+        if i < 0 { return }
+        while len(st.vals[i].deltas) > 0 && st.vals[i].deltas[len(st.vals[i].deltas) - 1].mark >= mark {
+            let _d = pop(mut &st.vals[i].deltas)
         }
+        while len(st.vals[i].pending) > 0 && st.vals[i].pending[len(st.vals[i].pending) - 1].mark >= mark {
+            let _p = pop(mut &st.vals[i].pending)
+        }
+        if len(st.vals[i].deltas) == 0 && len(st.vals[i].pending) == 0 { removeSlot(st, i) }
     })
 }
 
 pub fn clearTxn(sess: int) {
-    bufs().with(fn(m: mut &Map[int, TxnBuf]) { let _ = m.remove(&sess) })
+    bufs().with(fn(st: mut &BufStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 { removeSlot(st, i) }
+    })
 }
 
 fn takeStmtDeltas(sess: int): []DeltaRec {
     var out: []DeltaRec = []
-    bufs().with(fn(m: mut &Map[int, TxnBuf]) {
-        match m.get(&sess) {
-            Some(b) {
-                for d in b.deltas { append(mut &out, d.clone()) }
-                if len(b.pending) == 0 { let _ = m.remove(&sess) } else { m.put(sess, TxnBuf{deltas: [], pending: b.pending.clone()}) }
-            }
-            None {}
-        }
+    bufs().with(fn(st: mut &BufStore) {
+        let i = findSlot(st, sess)
+        if i < 0 { return }
+        out = replace(mut &st.vals[i].deltas, [])
+        if len(st.vals[i].pending) == 0 { removeSlot(st, i) }
     })
     return out
 }
 
 fn pushPending(sess: int, items: &[]PendingDelta) {
     if len(items) == 0 { return }
-    bufs().with(fn(m: mut &Map[int, TxnBuf]) {
-        match m.get(&sess) {
-            Some(b) {
-                var b2 = b.clone()
-                for x in items { append(mut &b2.pending, x.clone()) }
-                m.put(sess, b2)
-            }
-            None { m.put(sess, TxnBuf{deltas: [], pending: items.clone()}) }
-        }
+    bufs().with(fn(st: mut &BufStore) {
+        let i = bufSlot(st, sess)
+        for x in items { append(mut &st.vals[i].pending, x.clone()) }
     })
 }
 
 fn takePending(sess: int): []PendingDelta {
     var out: []PendingDelta = []
-    bufs().with(fn(m: mut &Map[int, TxnBuf]) {
-        match m.get(&sess) {
-            Some(b) {
-                for p in b.pending { append(mut &out, p.clone()) }
-                if len(b.deltas) == 0 { let _ = m.remove(&sess) } else { m.put(sess, TxnBuf{deltas: b.deltas.clone(), pending: []}) }
-            }
-            None {}
-        }
+    bufs().with(fn(st: mut &BufStore) {
+        let i = findSlot(st, sess)
+        if i < 0 { return }
+        out = replace(mut &st.vals[i].pending, [])
+        if len(st.vals[i].deltas) == 0 { removeSlot(st, i) }
     })
     return out
 }
