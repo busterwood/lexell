@@ -4,7 +4,8 @@ Bugs and gaps found while writing and checking these pages (lexdb built from mai
 that main ca687450, a15b9a64, 02646472, 436468d8, 81ee25d1, e689d814 and 7b6b1235, 2026-11-24, fixed are removed or
 reworded to what is left; the new pages and examples were checked against main 60c08a84; the time zone entries were
 reworded after the merge of timestamps that keep their offset, main 178ea2df, and checked against main 55040a20; the
-Oracle annotation entry was reworded to what is left after the merge of annotations, main 6c2e83f1). They
+Oracle annotation entry was reworded to what is left after the merge of annotations, main 6c2e83f1; the entries that
+the third bug slice fixed, main 84ceec7e, 2026-11-25, are removed or reworded to what is left, checked against it). They
 are not fixed here: the pages describe what lexdb does. Each "Differences" section of the reference lists the smaller
 differences of its statement.
 
@@ -143,13 +144,11 @@ differences of its statement.
 - **Maintenance and statistics:** `pg_stats` does not exist (42P01) and `pg_class.reltuples` stays -1 after `ANALYZE`
   (`pg_stat_user_tables.n_live_tup` is right). `REINDEX` and `CLUSTER` are checked and do nothing; `VACUUM` (and
   `VACUUM FULL`) rewrites row-form leaves as column leaves and gives no space back.
-- **COPY:** `WITH (FORMAT binary)` is 0A000; once, after a COPY error at the end of a psql script, the session gave
-  no answer for 120 s (not narrowed down). `ON_ERROR set_null` (PostgreSQL 19) is 0A000; `FORMAT json` is for `COPY TO`
-  only (`COPY FROM` with it is 22023, as in PostgreSQL); an option given twice is not refused.
-  - **An error in a `COPY ... FROM STDIN` statement's table or options is sent after the data.** PostgreSQL answers it
-    at once (an unknown table, `REJECT_LIMIT` without `ON_ERROR`, a bad option); lexdb has already asked the client
-    for data, so in a psql script the lines after the statement are taken as its data up to a line `\.`, and the
-    error shows only then (found checking the new COPY options on main 60c08a84, not fixed).
+- **COPY:** `WITH (FORMAT binary)` is 0A000. `ON_ERROR set_null` (PostgreSQL 19) is 0A000; `FORMAT json` is for `COPY
+  TO` only (`COPY FROM` with it is 22023, as in PostgreSQL). A view as `COPY FROM`'s target is refused before the
+  CopyInResponse (PostgreSQL refuses it after, once the client is sending data). The other errors of a `COPY ... FROM
+  STDIN` statement's table or options come before it, as in PostgreSQL; psql 18 then skips the script's lines up to a
+  line `\.` with either server.
 - **Data types** (found writing the type pages):
   - **Bare integer constants are checked only in a select list:** integer-literal arithmetic there is 22003 (int4 and
     bigint), as in PostgreSQL (`SELECT 2147483647 + 1`). In `WHERE`, `ON`, `HAVING` and `ORDER BY` it is not checked
@@ -252,8 +251,7 @@ differences of its statement.
   - `TRUNCATE TABLE` does not reset the `IDENTITY` (the next id goes on; SQL Server starts again at the seed).
   - Views are read-only (50000), and a CTE cannot be the target of `UPDATE`, `DELETE` or `MERGE` (208).
   - `SELECT INTO` loses column attributes: `nvarchar(30)` becomes `nvarchar(max)`, a decimal gets wider, `NOT NULL`
-    and `IDENTITY` are lost. `SELECT IDENTITY(int, 1, 1) AS n ... INTO` is 207. It gives no `(n rows affected)`
-    message (SQL Server: the rows put in; found on main 55040a20).
+    and `IDENTITY` are lost. `SELECT IDENTITY(int, 1, 1) AS n ... INTO` is 207.
   - Error 102 for `PIVOT`, `UNPIVOT`, `FOR XML`, `FOR JSON`, `TABLESAMPLE`, `$IDENTITY`, join hints (`INNER LOOP
     JOIN`), `FOR SYSTEM_TIME`, `GROUP BY ... WITH ROLLUP` / `WITH CUBE`; `GROUPING_ID` is 195.
   - `TOP (subquery)` is 156; `UPDATE TOP (n) PERCENT` 102; `DELETE TOP (n) PERCENT` 208; `MERGE TOP ... PERCENT`
@@ -393,14 +391,13 @@ differences of its statement.
     types](sql/tsql/data-types-datetime.md)): its string form (`CAST` to `varchar`, and the styles that show a
     fraction) has seven fractional digits whatever its scale (`datetimeoffset(0)` gives `10:00:00.0000000 +02:00`; SQL
     Server `10:00:00 +02:00`), and styles 126 and 127 print none, three or seven by the value (`.500` for `.5`; SQL
-    Server the scale's digits); `SWITCHOFFSET`, `TODATETIMEOFFSET`, `AT TIME ZONE`, `MIN` and `MAX` give a
-    `datetimeoffset(7)` whatever their argument's scale (SQL Server keeps it, so a client shows `10:00:00 +02:00` where
-    lexdb's shows `10:00:00.0000000 +02:00`; found on main 55040a20); `FORMAT` does not know `zzz` (it is printed as it
-    is; SQL Server `+02:00`); a `VALUES` list or a derived column typed only by its type id keeps the instant, not the
-    offset (`(VALUES (CAST('2026-03-15 10:00 +02:00' AS datetimeoffset)))` gives `08:00:00 +00:00`); `MIN` and `MAX` show the offset of the last of equal instants (SQL
-    Server: the first); `datetimeoffset - datetimeoffset` is an interval (`01:00:00`; SQL Server: 8117), and a
-    variable plus a number (`@d + 1`) is 195 (SQL Server: 206); `AT TIME ZONE` knows about 45 Windows zone names, and
-    another (`'Mountain Standard Time (Mexico)'`) is 9820.
+    Server the scale's digits); `FORMAT` does not know `zzz` (it is printed as it is; SQL Server `+02:00`); a `VALUES`
+    list or a derived column typed only by its type id keeps the instant, not the offset (`(VALUES (CAST('2026-03-15
+    10:00 +02:00' AS datetimeoffset)))` gives `08:00:00 +00:00`); `MAX` alone over an index on the column: SQL Server
+    reads the index backwards and shows the last of equal instants in key order, lexdb the first (`MIN`, and `MAX`
+    without an index, show the first in both); `datetimeoffset - datetimeoffset` is an interval (`01:00:00`; SQL
+    Server: 8117), and a variable plus a number (`@d + 1`) is 195 (SQL Server: 206); `AT TIME ZONE` knows about 45
+    Windows zone names, and another (`'Mountain Standard Time (Mexico)'`) is 9820.
   - **Maths:** `ROUND(123.4567, -1)` on a decimal is 8115; `SQRT(-1)` and `LOG(0)` are 50000, `ASIN(2)` and `EXP(710)` 8115 with PostgreSQL's text; `5 / 2.0E0` is
     a decimal (6 places); `real / int` is computed as a float.
   - **Functions that are lenient:** `IIF(1, 'a', 'b')` gives `b` (SQL Server: 4145); `GREATEST(1)`, `CONCAT('a')`,
@@ -410,8 +407,7 @@ differences of its statement.
     sv-SE and 36 more, with genitive month names, the time separator and Thai Buddhist years). ar-SA (the Hijri
     calendar) and cultures outside the 46 get en-US dates. A valid-form unknown name gets the invariant culture, as SQL
     Server 2022 does; a name of the wrong form is error 9818. 61 cultures are known for numbers; a real culture outside
-    them is read as the invariant one. `FORMAT(1234.5, 'C', 'ja-JP')` is `¥1,234.50` (SQL Server `¥1,235`: the yen
-    has no decimals; found on main 55040a20).
+    them is read as the invariant one.
   - **Conversion errors:** a comparison of a string with a number is 195 (`'abc' = 1`; SQL Server: 245).
   - **Operators:** `!<` and `!>` are 102; `SELECT 1 = 1` and `SELECT NOT 1 = 2` are accepted (SQL Server: 102); `||`
     joins strings.
@@ -426,7 +422,11 @@ differences of its statement.
     `PARAMETERS` have no T-SQL procedures; `INFORMATION_SCHEMA.DOMAINS`, `COLUMN_PRIVILEGES` and
     `VIEW_COLUMN_USAGE` do not exist; `sys.database_role_members`, `sys.partitions` and `sys.dm_exec_requests` do
     not exist (208); `sys.types` gives `decimal` scale 38; every decimal expression is `decimal(38,6)` in
-    `sys.columns`.
+    `sys.columns`. A CHECK's text (`INFORMATION_SCHEMA.CHECK_CONSTRAINTS.CHECK_CLAUSE`,
+    `sys.check_constraints.definition`) is SQL Server's form (`([salary]>=(0))`) except a `CAST`, which shows as what
+    lexdb made of it (`CAST(a AS varchar(3))` is `left(bin2str([a],(0),(3)),(3))`; SQL Server
+    `CONVERT([varchar](3),[a])`), an `N'...'` literal (the `N` is dropped) and a system-named constraint's name
+    (`ck_c_check`; SQL Server `CK__ck__c__3C69FB99`).
   - A `datetime` column takes PostgreSQL's special strings (`INSERT ... VALUES ('tomorrow')`).
 
 ## Oracle door
@@ -438,8 +438,8 @@ differences of its statement.
 - **Queries and DML** (found writing the Oracle query pages):
   - `ROWNUM` in a join with an aggregate or `GROUP BY` limits the groups, not the rows grouped (`SELECT COUNT(*) FROM
     emp e, dept d WHERE e.dept_id = d.id AND ROWNUM < 3` is 4; Oracle: 2). With one table in `FROM` it works.
-  - `MIN` and `MAX` of a `DATE` show as a timestamp (`2019-03-01 00:00:00.0`); `SELECT *` over `NATURAL JOIN` and
-    `JOIN ... USING` does the same and prints column names in lower case.
+  - `SELECT *` over `NATURAL JOIN` and `JOIN ... USING` shows a `DATE` as a timestamp (`2019-03-01 00:00:00.0`) and
+    prints column names in lower case.
   - `UNION` of a number column and a text column returns both as text (Oracle: ORA-01790).
   - `(+)` works only when the marked table comes after the one it joins; the other order is ORA-03001, and a `(+)`
     inside `OR` is not refused.
@@ -450,8 +450,6 @@ differences of its statement.
   - `FOR UPDATE OF e.name` (columns) is ORA-00942 (a table or alias works); `FOR UPDATE WAIT n` is ORA-00900;
     `FOR UPDATE` on an inline view is accepted.
   - `FETCH FIRST n PERCENT ROWS ONLY`, `SELECT UNIQUE`, `GROUPING_ID` and `GROUP_ID` are not supported.
-  - `OFFSET` and `LIMIT` as column aliases (`SELECT 1 AS offset FROM dual`, with or without `AS`) are ORA-00900;
-    Oracle takes them (found on main 55040a20).
   - Not supported (ORA-00900): `SAMPLE`, `AS OF`, `PIVOT`, `UNPIVOT`, `MODEL`, `XMLTABLE`, `JSON_TABLE`, a partitioned
     outer join, `UPDATE SET (a, b) = (SELECT ...)`, `UPDATE (subquery)`, `DELETE FROM (subquery)`, `LOG ERRORS`,
     `WHERE CURRENT OF`, `WITH FUNCTION`, `TRUNCATE ... DROP STORAGE`. Accepted although Oracle refuses them: `LIMIT n`,
@@ -475,11 +473,12 @@ differences of its statement.
     `GENERATED BY DEFAULT ON NULL AS IDENTITY` does not fill a NULL key (ORA-01400); `USER_TAB_COLUMNS` shows a
     `RAW` as `BLOB` and a `TIMESTAMP WITH LOCAL TIME ZONE` as `TIMESTAMP(6) WITH TIME ZONE`.
   - Views are read-only (`INSERT`, `UPDATE`, `DELETE` through a view are ORA-03001); `WITH READ ONLY` and `WITH CHECK
-    OPTION` are refused; a view another view reads cannot be dropped (ORA-02449). `ALTER VIEW ... COMPILE` is ORA-03001
-    (`ALTER VIEW supports RENAME TO only`; Oracle accepts it), and `ALTER VIEW v RENAME TO w` renames the view (Oracle
-    ORA-00922); found on main 6c2e83f1.
-  - `ALTER TABLE ... READ ONLY` and `ALTER INDEX ... REBUILD` are ORA-03001; `COMMIT COMMENT` and
-    `COMMIT WRITE` are ORA-00900; `COMMENT ON` does not keep the comment and accepts a missing table.
+    OPTION` are refused; a view another view reads cannot be dropped (ORA-02449). `ALTER VIEW ... READ ONLY` is
+    ORA-03001 (Oracle ORA-42310: only an editioning view).
+  - `ALTER TABLE ... READ ONLY` and `ALTER INDEX ... UNUSABLE` are ORA-03001 (Oracle marks the index unusable);
+    `ALTER INDEX ... REBUILD`, `COALESCE`, `[NO]PARALLEL`, `[NO]LOGGING` and `ALTER VIEW ... COMPILE` are accepted and do
+    nothing; `COMMIT COMMENT` and `COMMIT WRITE` are ORA-00900; `COMMENT ON` does not keep the comment and accepts a
+    missing table.
   - `USER_TAB_COLUMNS.DATA_DEFAULT` of a column whose default is a sequence shows `nextval('s')` (Oracle:
     `"APP"."S"."NEXTVAL"`).
   - Sequences: past `MAXVALUE` the error is ORA-20000 (Oracle ORA-08004); `CURRVAL` before `NEXTVAL` is ORA-20000
@@ -500,12 +499,12 @@ differences of its statement.
     `INSERT ... SELECT`, `UPDATE`, `DELETE` and `CREATE TABLE AS` (fixed on main 7b6b1235). Still refused (the Oracle
     door says ORA-03001, `unimplemented feature`; 0A000 inside): a `MERGE` that calls one; a function in a subquery
     of a DML statement when the subquery reads the statement's own table or refers to its columns; a function whose
-    argument is an aggregate or another stored function's call (`f(SUM(x))`, `f(g(x))`). A view that calls one
-    cannot be created (ORA-00904; Oracle allows it).
-  - Annotations (supported since main 6c2e83f1; see [annotations](sql/oracle/annotations.md)): a column's annotation
-    in `CREATE TABLE ... AS` is ORA-00900 (Oracle ORA-11559); the same column twice in one `ALTER ... MODIFY`
-    applies both (Oracle ORA-00957); `ALTER INDEX` of an index that does not exist is ORA-00942 (Oracle ORA-01418);
-    `ALTER TABLE` of a view or `ALTER VIEW` of a table is ORA-20000 (Oracle ORA-00942); `ALL_` and
+    argument is an aggregate or another stored function's call (`f(SUM(x))`, `f(g(x))`). A view may call one (since
+    main 84ceec7e), but an `INSERT`, `UPDATE`, `DELETE` or `CREATE TABLE AS` that reads such a view is ORA-03001.
+    After `DROP FUNCTION`, `DROP PACKAGE` or `DROP PACKAGE BODY` of the function, reading the view gives NULL in the
+    function's column and `USER_OBJECTS.STATUS` stays `VALID` (Oracle: ORA-04063, the view has errors, and `INVALID`;
+    ORA-04067 after `DROP PACKAGE BODY`; found on main 84ceec7e).
+  - Annotations (supported since main 6c2e83f1; see [annotations](sql/oracle/annotations.md)): `ALL_` and
     `DBA_ANNOTATIONS_USAGE` have no rows for the built-in domains of `SYS` and `DOMAIN_NAME` / `DOMAIN_OWNER` are
     always NULL (lexdb has no domains); a global temporary table's annotations are kept but not listed.
   - `USER_CONSTRAINTS` does not list `NOT NULL` constraints (Oracle lists them as type `C` rows with the search
@@ -522,9 +521,7 @@ differences of its statement.
     38-digit result prints in exponent form (`1.41666...E00`); `REMAINDER`, `NANVL`, `PI` and `BIN_TO_NUM` are
     ORA-00904.
   - **Date and time:** `EXTRACT(HOUR FROM DATE ...)` is 0 (Oracle ORA-30076) and `QUARTER` and `DOW` are accepted;
-    `TIME_BUCKET` needs its origin argument; `CAST(timestamp AS DATE)` rounds; `TIMESTAMPADD` does not exist;
-    `DATE '2026-01-31' + INTERVAL '1' MONTH` is 28 February, and so for a timestamp (Oracle ORA-01839; found on main
-    55040a20).
+    `TIME_BUCKET` needs its origin argument; `CAST(timestamp AS DATE)` rounds; `TIMESTAMPADD` does not exist.
   - **Time zones** (a `TIMESTAMP WITH TIME ZONE` keeps its offset since main 178ea2df; see [date and time
     types](sql/oracle/data-types-datetime.md)): a region name is kept only as the offset it had at that instant
     (`FROM_TZ(..., 'Europe/Berlin')`, `AT TIME ZONE 'Europe/Berlin'`, a session in a region): `TZR` shows `+01:00` where
@@ -536,12 +533,16 @@ differences of its statement.
     10:00:00 +02:00' AS VARCHAR2(60))`). A column made before main 178ea2df behaves as `TIMESTAMP WITH LOCAL TIME ZONE`
     (an instant, shown at the session zone's offset) until `ALTER TABLE ... MODIFY (c TIMESTAMP WITH TIME ZONE)`. A
     `VALUES` list (`FROM (VALUES (...)) v (a, b)`) or a derived column typed only by its type id keeps the instant, not
-    the offset (`10:00 +02:00` comes out as `08:00 +00:00`). Found on main 55040a20: `MIN` and `MAX` show the offset of
-    the last of equal instants (Oracle: the first); a session starts at `+00:00` whatever time zone the client sends
-    at logon (Oracle takes it: a JDBC client in `Asia/Kolkata` gets `SESSIONTIMEZONE` `Asia/Kolkata` and
-    `CURRENT_TIMESTAMP` at `+05:30`); a `TIMESTAMP WITH LOCAL TIME ZONE` value reaches the client at `+00:00`
-    (`getString` gives `2026-03-15 08:00:00.0 +0:00` in a session at `-05:00`; Oracle `2026-03-15 03:00:00.0 -05:00`;
-    `TO_CHAR` is right).
+    the offset (`10:00 +02:00` comes out as `08:00 +00:00`). After `ALTER SESSION SET TIME_ZONE`, a JDBC client still
+    converts a `TIMESTAMP WITH LOCAL TIME ZONE` value by its logon zone (`getString` gives `2026-03-15 13:30:00.0
+    Asia/Kolkata` in a session set to `-05:00`; Oracle `2026-03-15 03:00:00.0 -05:00`: it tells the driver the new zone
+    in a session-state message lexdb does not send; `TO_CHAR` is right). A logon time zone lexdb does not know (a
+    client's `ORA_SDTZ` of `Foo/Bar`) leaves the session at `+00:00` (Oracle refuses the logon, ORA-00604); the zone
+    `UTC`, at logon (a JDBC client in UTC) or by `ALTER SESSION SET TIME_ZONE = 'UTC'`, is kept as `+00:00`, so
+    `SESSIONTIMEZONE` shows `+00:00` (Oracle `UTC`; found on main 84ceec7e). `MIN` and `MAX` of equal instants with
+    different offsets show the first in lexdb's scan order, which is primary key order (Oracle's is the order the rows
+    were inserted). `TO_CHAR` of a `TIMESTAMP WITH LOCAL TIME ZONE` takes the zone elements (`TZH:TZM` gives the
+    session's offset; Oracle: ORA-01821; found on main 84ceec7e).
   - **Conversion:** `TO_CHAR` number elements `EEEE`, `RN`, `XXXX`, `TM`, `B`, `V`, `C` are ORA-01481 and date elements
     `CC`, `E`, `RM`, `YEAR`, `SYYYY`, `DS`, `DL`, `TS` are ORA-01821 (the zone elements `TZH`, `TZM`, `TZR` and `TZD`
     work on a value with a time zone, and are ORA-01821 on one without, as in Oracle); `CAST(TRUE AS CHAR(5))` is
