@@ -80,6 +80,7 @@ import "./lexdb_recprobe"
 import "./lexdb_standby"
 import "./lexdb_assert"
 import "./lexdb_viewdep"
+import "./lexdb_txmode"
 import "./lexdb_ixname"
 
 type Val = lexdb_sql.Val
@@ -13449,7 +13450,7 @@ fn (s: &Session) setting(name: &str): Option[str] {
         }
         // PostgreSQL's that clients ask for, fixed in lexdb (9.80)
         "standard_conforming_strings", "integer_datetimes", "is_superuser" { return Some("on") }
-        "transaction_read_only", "default_transaction_read_only", "in_hot_standby" { return Some(lexdb_standby.standbySetting(&s.st)) }   // (on a replica, 9.137)
+        "transaction_read_only", "default_transaction_read_only", "in_hot_standby" { return Some(if name == "transaction_read_only" && s.readOnly && len(s.txn) > 0 { "on".toStr() } else { lexdb_standby.standbySetting(&s.st) }) }   // (on a replica, 9.137)
         "server_version" { return Some("16.0") }
         "server_version_num" { return Some("160000") }
         "server_encoding", "client_encoding" { return Some("UTF8") }
@@ -13580,7 +13581,7 @@ fn (s: mut &Session) applySetting(name: &str, value: &str, local: bool): Result[
     if k == "transaction_isolation" {
         let rc = if value == "\x01" { s.rcDefault } else { try parseIsolation(value) }
         if len(s.txn) > 0 {
-            if !s.fresh { return Err(e("25001", "SET TRANSACTION ISOLATION LEVEL must be called before any query")) }
+            if !s.fresh && rc != s.txn[0].rc { return Err(e("25001", "SET TRANSACTION ISOLATION LEVEL must be called before any query")) }
             s.txn[0].setRc(rc)
         }
         return Ok(Unit{})
@@ -14353,7 +14354,8 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                         None {}
                     }
                 }
-                try s.applySetting(&stmt.table, &val, false)
+                if stmt.limit.isSome() || len(stmt.names) == 0 { try s.applySetting(&stmt.table, &val, false) }
+                if len(stmt.names) > 0 && len(s.txn) > 0 { try lexdb_txmode.setReadOnly(&s.st, mut &s.txn[0], mut &s.readOnly, s.fresh, stmt.names[0] == "read only") }
             } else if stmt.table != "" {
                 var v = -1                          // DEFAULT, RESET
                 match stmt.limit {

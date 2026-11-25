@@ -249,8 +249,9 @@ pub fn refreshStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_
 // door: the session's (lexdb_priv.doorOf: "tds", "tns" or the PostgreSQL door's; DROP TABLE's statement does not say).
 pub fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, k: &str, door: &str): Result[Unit, DbErr] {
     let deps = try lexdb_catalog.dependentViews(st, txn, k)
-    if len(deps) == 0 || door == "tns" || s.mdialect == lexdb_sql.MD_ORA { return Ok(Unit{}) }
+    if door == "tns" || s.mdialect == lexdb_sql.MD_ORA { return Ok(Unit{}) }
     if door == "tds" || s.mdialect == lexdb_sql.MD_TSQL {
+        if len(deps) == 0 { return Ok(Unit{}) }
         for v in try lexdb_catalog.allViews(st, txn) {
             if lexdb_base.hasStr(&deps, &v.name) && lexdb_sql.viewBound(&v.view) && lexdb_base.hasStr(&v.deps, k) {
                 return Err(err("TS3729", &("Cannot DROP TABLE '" + lexdb_sql.baseName(k) + "' because it is being referenced by object '" + lexdb_sql.baseName(&v.name) + "'.")))
@@ -266,7 +267,10 @@ pub fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sq
         }
         return Ok(Unit{})
     }
-    var detail: []str = []
+    // (PostgreSQL's DETAIL: the foreign keys of other tables on it, then the views; CASCADE drops the keys where the executor
+    // unlinks the table)
+    var detail = try fkLines(st, txn, k)
+    if len(deps) == 0 && len(detail) == 0 { return Ok(Unit{}) }
     for v in try lexdb_catalog.allViews(st, txn) {
         if !lexdb_base.hasStr(&deps, &v.name) { continue }
         var on = ""
@@ -277,6 +281,29 @@ pub fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sq
     }
     return Err(lexdb_base.errDetail("2BP01", &("cannot drop table " + lexdb_sql.shown(k) + " because other objects depend on it"),
                                     &strings.join(&detail, "\n"), "Use DROP ... CASCADE to drop the dependent objects too."))
+}
+
+// PostgreSQL's DETAIL lines for the foreign keys of other tables that reference table k ("constraint fk on table c depends on
+// table k"), by the referencing tables in k's refBy order.
+fn fkLines(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str): Result[[]str, DbErr] {
+    var out: []str = []
+    let tv = try st.get(txn, lexdb_catalog.CATALOG, k)
+    if tv.isNone() { return Ok(out) }
+    let t = try lexdb_catalog.decTable(k, &tv.unwrap(), lexdb_parse.parseExpr)
+    for ck in lexdb_assert.refs(&t.refBy) {
+        if ck == k { continue }
+        match try st.get(txn, lexdb_catalog.CATALOG, &ck) {
+            Some(cv) {
+                var c = try lexdb_catalog.decTable(&ck, &cv, lexdb_parse.parseExpr)
+                lexdb_catalog.joinFks(mut &c)
+                for f in c.fks {
+                    if f.ref == k { append(mut &out, "constraint " + f.name + " on table " + lexdb_sql.shown(&ck) + " depends on table " + lexdb_sql.shown(k)) }
+                }
+            }
+            None {}
+        }
+    }
+    return Ok(out)
 }
 
 // information_schema.VIEW_TABLE_USAGE (cols false) and VIEW_COLUMN_USAGE (cols true), in both doors (lexdb_pg.viewRows; the T-SQL
