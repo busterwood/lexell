@@ -587,7 +587,35 @@ fn bumpVer(st: &lexdb_store.Store) { let nv = (memoVer(st) + 1).toStr()
 // Writes (src nonempty) or deletes (src empty) a unit's source, in a transaction of its own.
 // (err: the compile error of a unit stored invalid, kept after the source behind a NUL.)
 pub fn putSource(st: &lexdb_store.Store, owner: &str, kind: &str, name: &str, src: &str, err: &str): Result[Unit, DbErr] {
+    return storeSource(st, owner, kind, name, src, err, false)
+}
+
+// The same for CREATE and DROP of a unit: the catalog's version moved too, so a plan kept over the unit (a view's that calls
+// a function, in any session) is made again, and a view over a function dropped is ORA-04063 at its next read, not its old
+// plan's error (the fourth bug slice, design/lexdb-robust.md).
+fn putUnit(st: &lexdb_store.Store, owner: &str, kind: &str, name: &str, src: &str, err: &str): Result[Unit, DbErr] {
+    return storeSource(st, owner, kind, name, src, err, true)
+}
+
+fn storeSource(st: &lexdb_store.Store, owner: &str, kind: &str, name: &str, src: &str, err: &str, ddl: bool): Result[Unit, DbErr] {
     var t = lexdb_store.begin()
+    if ddl {
+        var v = "0"
+        match st.get(mut &t, lexdb_catalog.CATALOG, lexdb_catalog.CAT_VERSION_KEY) {
+            Ok(o) { v = o.unwrapOr("0") }
+            Err(e) {
+                st.abort(t)
+                return Err(e)
+            }
+        }
+        match t.put(lexdb_catalog.CATALOG, lexdb_catalog.CAT_VERSION_KEY, &(lexdb_catalog.nextVersion(&v))) {
+            Ok(_) {}
+            Err(e) {
+                st.abort(t)
+                return Err(e)
+            }
+        }
+    }
     if len(src) > 0 {
         let val = if len(err) > 0 { src + "\x00" + err } else { src.toStr() }
         match t.put(lexdb_catalog.CATALOG, &(srcKey(owner, kind, name)), &val) {
@@ -4366,7 +4394,7 @@ pub fn createUnit(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, text: &
             if !replace || s.kind != kind { return Err(ora(955, "name is already used by an existing object")) }
         }
     }
-    try putSource(&ip.st, &u.owner, &kind, &u.name, &src, &cerr)
+    try putUnit(&ip.st, &u.owner, &kind, &u.name, &src, &cerr)
     ip.ddl += 1
     return Ok(warn)
 }
@@ -4403,7 +4431,7 @@ fn createPackage(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, src: &st
             cerr = e.msg.clone()
         }
     }
-    try putSource(&ip.st, &owner, &kind, &nm, src, &cerr)
+    try putUnit(&ip.st, &owner, &kind, &nm, src, &cerr)
     ip.ddl += 1
     forgetPkg(ip, &owner, &nm)
     return Ok(warn)
@@ -4431,7 +4459,7 @@ pub fn dropUnit(ip: mut &Ip, text: &str, super: bool): Result[Unit, DbErr] {
     for i in 0..len(ip.stored) {
         if ip.stored[i].owner == owner && ip.stored[i].name == nm && (ip.stored[i].kind == kw || (kw == "PACKAGE" && ip.stored[i].kind == "PACKAGE BODY")) {
             found = true
-            try putSource(&ip.st, &ip.stored[i].owner, &ip.stored[i].kind, &ip.stored[i].name, &"", &"")
+            try putUnit(&ip.st, &ip.stored[i].owner, &ip.stored[i].kind, &ip.stored[i].name, &"", &"")
         }
     }
     if !found { return Err(ora(4043, &("object " + nm + " does not exist"))) }
@@ -4464,7 +4492,7 @@ pub fn compileUnit(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, text: 
         Ok(_) {}
         Err(e) { cerr = e.msg.clone() }
     }
-    try putSource(&ip.st, &owner, &kw, &nm, &src, &cerr)
+    try putUnit(&ip.st, &owner, &kw, &nm, &src, &cerr)
     ip.ddl += 1
     return Ok(len(cerr) > 0)
 }
