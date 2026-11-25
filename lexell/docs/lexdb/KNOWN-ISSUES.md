@@ -424,9 +424,9 @@ differences of its statement.
     not exist (208); `sys.types` gives `decimal` scale 38; every decimal expression is `decimal(38,6)` in
     `sys.columns`. A CHECK's text (`INFORMATION_SCHEMA.CHECK_CONSTRAINTS.CHECK_CLAUSE`,
     `sys.check_constraints.definition`) is SQL Server's form (`([salary]>=(0))`) except a `CAST`, which shows as what
-    lexdb made of it (`CAST(a AS varchar(3))` is `left(bin2str([a],(0),(3)),(3))`; SQL Server
-    `CONVERT([varchar](3),[a])`), an `N'...'` literal (the `N` is dropped) and a system-named constraint's name
-    (`ck_c_check`; SQL Server `CK__ck__c__3C69FB99`).
+    lexdb made of it (`CAST(a AS varchar(3))` is `left(bin2str([a],(0),(3)),(3))`; SQL Server writes a `CONVERT` with
+    the type in brackets), an `N'...'` literal (the `N` is dropped) and a system-named constraint's name (`ck_c_check`;
+    SQL Server `CK__ck__c__3C69FB99`).
   - A `datetime` column takes PostgreSQL's special strings (`INSERT ... VALUES ('tomorrow')`).
 
 ## Oracle door

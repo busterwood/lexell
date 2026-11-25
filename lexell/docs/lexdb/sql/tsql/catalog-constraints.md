@@ -57,8 +57,8 @@ fixed value. Every view except `sys.foreign_key_columns` also has the columns of
 ## Differences from SQL Server
 
 - A `CHECK`'s `definition` is SQL Server's text (example G) except for a `CAST`, which shows as what lexdb made of it
-  (`CAST(a AS varchar(3))` gives `left(bin2str([a],(0),(3)),(3))`, SQL Server `CONVERT([varchar](3),[a])`), and an
-  `N'...'` literal, which loses its `N`.
+  (`CAST(a AS varchar(3))` gives `left(bin2str([a],(0),(3)),(3))`, where SQL Server writes a `CONVERT` with the type in
+  brackets), and an `N'...'` literal, which loses its `N`.
 - Unnamed constraints have PostgreSQL's names (`dept_pkey`, `emp_dept_id_fkey`), not SQL Server's
   `PK__dept__3213E83F...`; `is_system_named` is 1 for them as in SQL Server.
 - A default constraint is named `DF_table_column` whatever name `CONSTRAINT name DEFAULT` gave it (here `df_sal` is
