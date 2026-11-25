@@ -1,0 +1,383 @@
+// lexdb over TDS: the SQL standard's assertions in the T-SQL door (design/lexdb-new-features.md O23 and section 14). SQL Server
+// has none, so these answers are lexdb's own, reviewed against the standard and SQL Server's conventions for its constraints:
+// CREATE ASSERTION [schema.]name CHECK (...) [[NOT] DEFERRABLE] [INITIALLY IMMEDIATE | DEFERRED], DROP ASSERTION [IF EXISTS],
+// SET CONSTRAINTS name, ... | ALL DEFERRED | IMMEDIATE (lexdb's: the standard's statement); a violation is error 547 (severity
+// 16) naming the assertion and the table, the statement ended and the transaction kept (as SQL Server's 547 for a CHECK); with
+// XACT_ABORT ON the transaction rolled back; caught by TRY ... CATCH; a deferred one is checked at the outermost COMMIT TRAN (547
+// naming COMMIT TRANSACTION, the transaction rolled back, @@TRANCOUNT 0), outside a transaction at the statement's end, at SET
+// CONSTRAINTS ... IMMEDIATE; SAVE TRAN / ROLLBACK TRAN to it drops the writes it undid; 2714, 3701, 5074, 15336 (sp_rename), 3729
+// (DROP TABLE); the refused shapes (50000); INFORMATION_SCHEMA.ASSERTIONS and CHECK_CONSTRAINTS, no sys.objects row. The write
+// paths: INSERT, UPDATE, DELETE, MERGE, INSERT ... SELECT from a table variable and from a table-valued parameter, OUTPUT ...
+// INTO an asserted table, INSERT ... EXEC, a procedure's statements, a foreign key's ON DELETE CASCADE, TRUNCATE TABLE, the bulk
+// load (INSERT BULK and its rows: what bcp and SqlBulkCopy send; checked with or without CHECK_CONSTRAINTS, in a transaction
+// too), SELECT ... INTO (a new table: nothing to check). Each line's batches (split at ";;") run with SET lexdb_batch = off and on:
+// "same" and the answer, or DIFFERENT and both. The store reopened after: the assertions made here still checked.
+// timeout: 120
+// expect: setup: 19 batches
+// expect: same: error 547 (16): The INSERT statement conflicted with the assertion "sal_pos". The conflict occurred in database "lexdb", table "dbo.emp". // n = 2
+// expect: same: error 547 (16): The INSERT statement conflicted with the assertion "sal_pos". The conflict occurred in database "lexdb", table "dbo.emp". / tc,n = 0|2
+// expect: same: error 547 (16): The INSERT statement conflicted with the assertion "sal_pos". The conflict occurred in database "lexdb", table "dbo.emp". / tc,xs,n = 1|1|2
+// expect: same: n = 4
+// expect: same: error 547 (16): The UPDATE statement conflicted with the assertion "sal_pos". The conflict occurred in database "lexdb", table "dbo.emp". // sal = 30
+// expect: same: error 547 (16): The UPDATE statement conflicted with the assertion "in_budget". The conflict occurred in database "lexdb", table "dbo.emp". // id,sal = 1|50;2|30
+// expect: same: error 547 (16): The DELETE statement conflicted with the assertion "any_dept". The conflict occurred in database "lexdb", table "dbo.dept". // n = 3
+// expect: same: error 547 (16): The MERGE statement conflicted with the assertion "sal_pos". The conflict occurred in database "lexdb", table "dbo.emp". // sal = 30
+// expect: same: error 547 (16): The MERGE statement conflicted with the assertion "sal_pos". The conflict occurred in database "lexdb", table "dbo.emp". // n = 2
+// expect: same: error 547 (16): The INSERT statement conflicted with the assertion "sal_pos". The conflict occurred in database "lexdb", table "dbo.emp". // n = 2
+// expect: same: n,sev,m = 547|16|The INSERT statement conflicted with the assertion "sal_pos". The conflict occurred in database "lexdb", table "dbo.emp".
+// expect: same: error 547 (16): The INSERT statement conflicted with the assertion "sal_pos". The conflict occurred in database "lexdb", table "dbo.emp". // tc,n = 0|2 // ok
+// expect: same: error 547 (16): The INSERT statement conflicted with the assertion "log_pos". The conflict occurred in database "lexdb", table "dbo.logt". // n = 0
+// expect: same: (2) / (2) // n = 2 // (2)
+// expect: same: error 547 (16): The INSERT statement conflicted with the assertion "log_pos". The conflict occurred in database "lexdb", table "dbo.logt". // n = 0
+// expect: same: (2) // n = 2 // (2)
+// expect: same: error 547 (16): The INSERT statement conflicted with the assertion "log_pos". The conflict occurred in database "lexdb", table "dbo.logt". // sal = 50 // n = 0
+// expect: same: (1) // sal = 51 // n = 1 // (1) / (1)
+// expect: same: error 547 (16): The INSERT statement conflicted with the assertion "log_pos". The conflict occurred in database "lexdb", table "dbo.logt". // n = 0
+// expect: same: (1) // n = 1 // (1)
+// expect: same: (1) // n = 1 // ok
+// expect: same: error 547 (16): The INSERT statement conflicted with the assertion "sal_pos". The conflict occurred in database "lexdb", table "dbo.emp". // n = 3 // (1)
+// expect: same: (1) / (1) // n = 4 // (2)
+// expect: same: error 547 (16): The DELETE statement conflicted with the assertion "kc_any". The conflict occurred in database "lexdb", table "dbo.kc". // n = 1
+// expect: same: (1) // n = 1 // (1)
+// expect: same: error 547 (16): The TRUNCATE TABLE statement conflicted with the assertion "any_dept". The conflict occurred in database "lexdb", table "dbo.dept". // n = 3
+// expect: same: ok // n = 0
+// expect: same: error 547 (16): The COMMIT TRANSACTION statement conflicted with the assertion "d1_neg". The conflict occurred in database "lexdb", table "dbo.d1". / n = 1 // tc,xs,n = 0|0|0
+// expect: same: error 547 (16): The COMMIT TRANSACTION statement conflicted with the assertion "d1_neg". The conflict occurred in database "lexdb", table "dbo.d1". / tc = 1 // tc,n = 0|0
+// expect: same: error 547 (16): The INSERT statement conflicted with the assertion "d1_neg". The conflict occurred in database "lexdb", table "dbo.d1". // n = 0
+// expect: same: error 547 (16): The SET CONSTRAINTS statement conflicted with the assertion "d1_neg". The conflict occurred in database "lexdb", table "dbo.d1". / tc,n = 1|1
+// expect: same: error 547 (16): The SET CONSTRAINTS statement conflicted with the assertion "d1_big". The conflict occurred in database "lexdb", table "dbo.d1". / tc = 1
+// expect: same: (1) / (1) // n = 1 // (1)
+// expect: same: (1) / (1) // n = 1 // (1)
+// expect: same: error 547 (16): The COMMIT TRANSACTION statement conflicted with the assertion "d1_neg". The conflict occurred in database "lexdb", table "dbo.d1". // n = 0
+// expect: same: error 547 (16): The COMMIT TRANSACTION statement conflicted with the assertion "d1_neg". The conflict occurred in database "lexdb", table "dbo.d1". // tc,n = 0|0 // ok
+// expect: same: error 547 (16): The INSERT statement conflicted with the assertion "d1_neg". The conflict occurred in database "lexdb", table "dbo.d1". / tc = 1 // n = 0
+// expect: same: error 50000 (16): constraint "sal_pos" is not deferrable
+// expect: same: ok // error 547 (16): The INSERT statement conflicted with the assertion "d1_neg". The conflict occurred in database "lexdb", table "dbo.d1". // n = 0
+// expect: same: bulk 100 // n = 100 // (100)
+// expect: same: bulk error 547: The INSERT statement conflicted with the assertion "big_pos". The conflict occurred in database "lexdb", table "dbo.big". // n = 0
+// expect: same: bulk error 547: The INSERT statement conflicted with the assertion "d1_neg". The conflict occurred in database "lexdb", table "dbo.d1". // n = 0
+// expect: same: ok // bulk 10 // bulk error 547: The INSERT statement conflicted with the assertion "big_pos". The conflict occurred in database "lexdb", table "dbo.big". // 1|10 // ok
+// expect: same: ok // ok // error 3701 (11): Cannot drop the assertion 'a1', because it does not exist or you do not have permission.
+// expect: same: error 2714 (16): There is already an object named 'sal_pos' in the database.
+// expect: same: error 2714 (16): There is already an object named 'emp' in the database.
+// expect: same: error 2714 (16): There is already an object named 'sal_pos' in the database.
+// expect: same: ok
+// expect: same: error 2760 (16): The specified schema name "nosuch" either does not exist or you do not have permission to use it.
+// expect: same: error 547 (16): The CREATE ASSERTION statement conflicted with the assertion "a1". The conflict occurred in database "lexdb", table "dbo.emp".
+// expect: same: error 50000 (16): Cannot create assertion 'a1': its query is not supported: aggregates, GROUP BY or HAVING.
+// expect: same: error 50000 (16): Cannot create assertion 'a1': its query is not supported: FETCH FIRST, LIMIT, OFFSET or TOP.
+// expect: same: error 50000 (16): Cannot create assertion 'a1': its query is not supported: a function whose value the rows do not decide (the time, the user, random values, a sequence).
+// expect: same: error 50000 (16): Cannot create assertion 'a1': its query is not supported: JOIN (write the join's condition in WHERE).
+// expect: same: error 102 (15): constraint declared INITIALLY DEFERRED must be DEFERRABLE
+// expect: same: error 102 (15): Incorrect syntax near 'enable'.
+// expect: same: error 156 (15): Incorrect syntax near the keyword 'not'.
+// expect: same: ok // is_deferrable,initially_deferred = YES|YES // ok
+// expect: same: error 5074 (16): The object 'sal_pos' is dependent on column 'sal'.
+// expect: same: error 15336 (16): Object 'dbo.emp.sal' cannot be renamed because the object participates in enforced dependencies.
+// expect: same: error 15336 (16): Object 'dbo.emp' cannot be renamed because the object participates in enforced dependencies.
+// expect: same: error 3729 (16): Cannot DROP TABLE 'dbo.dept' because it is being referenced by object 'in_budget'.
+// expect: same: ok // ok // n = 2
+// expect: same: constraint_schema,constraint_name,is_deferrable,initially_deferred = public|any_dept|NO|NO;public|big_pos|NO|NO;public|d1_big|YES|NO;public|d1_neg|YES|YES;public|in_budget|NO|NO;public|kc_any|NO|NO;public|log_pos|NO|NO;public|sal_pos|NO|NO
+// expect: same: constraint_name,check_clause = d1_neg|(not exists (select 1 from d1 where v < 0));log_pos|(all (select v from logt) satisfy (v >= 0));sal_pos|(not exists (select 1 from emp where sal < 0))
+// expect: same: n = 0 // n = 0 // o = NULL
+// expect: reopened: error 23514 assertion "sal_pos" is violated / error 23514 assertion "d1_big" is violated / any_dept;big_pos;d1_big;d1_neg;in_budget;kc_any;log_pos;sal_pos
+import "strings"
+import "task"
+import "net"
+import "tds"
+import "sqldialect"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+type V = sqldialect.Value
+
+fn setup(): []str {
+    return ["create table dept (id int primary key, budget int)",
+            "create table emp (id int primary key, dept int not null, sal int, role varchar(10))",
+            "create table d1 (id int primary key, v int)",
+            "create table big (id int primary key, v int)",
+            "create table par (id int primary key)",
+            "create table kc (id int primary key, pid int references par (id) on delete cascade on update cascade, w int)",
+            "create table logt (id int primary key, v int)",
+            "create type ItemsT as table (id int, v int)",
+            "insert into dept values (1, 100), (2, 200), (3, null); insert into emp values (1, 1, 50, 'boss'), (2, 1, 30, 'dev')",
+            "insert into par values (1), (2); insert into kc values (100, 1, 0)",
+            "create assertion sal_pos check (not exists (select 1 from emp where sal < 0))",
+            "create assertion in_budget check (not exists (select 1 from emp e, dept d where e.dept = d.id and e.sal > d.budget))",
+            "create assertion dbo.any_dept check (exists (select 1 from dept))",
+            "create assertion d1_neg check (not exists (select 1 from d1 where v < 0)) deferrable initially deferred",
+            "create assertion d1_big check (not exists (select 1 from d1 where v > 100)) deferrable",
+            "create assertion big_pos check (not exists (select 1 from big where v < 0)) create assertion kc_any check (exists (select 1 from kc where pid = 1))",
+            "create assertion log_pos check (all (select v from logt) satisfy (v >= 0))",
+            "create procedure p_ins @s int as begin insert into emp values (50, 1, 7, 'dev'); insert into emp values (51, 1, @s, 'dev') end",
+            "create procedure p_def as begin set constraints d1_neg immediate; insert into d1 values (1, -1) end"]
+}
+
+fn lines(): []str {
+    return [// the statements, their errors (547) and the batch going on
+            "insert into emp values (5, 1, -1, 'dev') ;; select count(*) n from emp",
+            "insert into emp values (5, 1, -1, 'dev'); select @@trancount tc, count(*) n from emp",
+            "begin tran; insert into emp values (5, 1, -1, 'dev'); select @@trancount tc, xact_state() xs, count(*) n from emp; rollback",
+            "insert into emp values (5, 1, 10, 'dev'), (6, 3, 1000, 'dev'); select count(*) n from emp; delete from emp where id > 4",
+            "update emp set sal = -5 where id = 2 ;; select sal from emp where id = 2",
+            "update emp set sal = sal + 60 ;; select id, sal from emp order by id",
+            "delete from dept ;; select count(*) n from dept",
+            "merge emp t using (values (2, -3)) s (id, sal) on t.id = s.id when matched then update set sal = s.sal; ;; select sal from emp where id = 2",
+            "merge emp t using (values (9, -3)) s (id, sal) on t.id = s.id when not matched then insert values (s.id, 1, s.sal, 'dev'); ;; select count(*) n from emp",
+            "insert into emp select 10 + id, 1, -id, 'dev' from par ;; select count(*) n from emp",
+            "begin try insert into emp values (5, 1, -1, 'dev') end try begin catch select error_number() n, error_severity() sev, error_message() m end catch",
+            "set xact_abort on; begin tran; insert into emp values (5, 1, 10, 'dev'); insert into emp values (6, 1, -1, 'dev'); select 1 x ;; select @@trancount tc, count(*) n from emp ;; set xact_abort off",
+            // table variables, table-valued parameters, OUTPUT ... INTO, INSERT ... EXEC, SELECT ... INTO, a procedure
+            "declare @x ItemsT; insert @x values (20, 5), (21, -5); insert into logt select id, v from @x ;; select count(*) n from logt",
+            "declare @x ItemsT; insert @x values (20, 5), (21, 6); insert into logt select id, v from @x ;; select count(*) n from logt ;; delete from logt",
+            "tvp insert into logt select id, v from @t ;; select count(*) n from logt",
+            "tvp insert into logt select id, abs(v) from @t ;; select count(*) n from logt ;; delete from logt",
+            "update emp set sal = sal + 1 output inserted.id, -inserted.sal into logt where id = 1 ;; select sal from emp where id = 1 ;; select count(*) n from logt",
+            "update emp set sal = sal + 1 output inserted.id, inserted.sal into logt where id = 1 ;; select sal from emp where id = 1 ;; select count(*) n from logt ;; delete from logt; update emp set sal = 50 where id = 1",
+            "insert into logt exec ('select 30, -1') ;; select count(*) n from logt",
+            "insert into logt exec ('select 30, 1') ;; select count(*) n from logt ;; delete from logt",
+            "select * into emp_copy from emp where sal > 40 ;; select count(*) n from emp_copy ;; drop table emp_copy",
+            "exec p_ins -1 ;; select count(*) n from emp ;; delete from emp where id >= 50",
+            "exec p_ins 8 ;; select count(*) n from emp ;; delete from emp where id >= 50",
+            // a foreign key's action, TRUNCATE
+            "delete from par where id = 1 ;; select count(*) n from kc",
+            "delete from par where id = 2 ;; select count(*) n from kc ;; insert into par values (2)",
+            "truncate table dept ;; select count(*) n from dept",
+            "truncate table logt ;; select count(*) n from logt",
+            // deferred ones: the outermost COMMIT TRAN, a statement on its own, SET CONSTRAINTS, savepoints, XACT_ABORT, a procedure
+            "begin tran; insert into d1 values (1, -1); select count(*) n from d1; commit tran ;; select @@trancount tc, xact_state() xs, count(*) n from d1",
+            "begin tran; begin tran; insert into d1 values (1, -1); commit tran; select @@trancount tc; commit tran ;; select @@trancount tc, count(*) n from d1",
+            "insert into d1 values (1, -1) ;; select count(*) n from d1",
+            "begin tran; insert into d1 values (1, -1); set constraints d1_neg immediate; select @@trancount tc, count(*) n from d1; rollback",
+            "begin tran; set constraints all deferred; insert into d1 values (2, 500); set constraints all immediate; select @@trancount tc; rollback",
+            "begin tran; set constraints d1_big deferred; insert into d1 values (2, 500); update d1 set v = 5 where id = 2; commit tran ;; select count(*) n from d1 ;; delete from d1",
+            "begin tran; save tran s1; insert into d1 values (3, -1); rollback tran s1; insert into d1 values (4, 1); commit tran ;; select count(*) n from d1 ;; delete from d1",
+            "begin tran; insert into d1 values (3, -1); save tran s1; update d1 set v = 1 where id = 3; rollback tran s1; commit tran ;; select count(*) n from d1",
+            "set xact_abort on; begin tran; insert into d1 values (5, -1); commit tran; select 1 x ;; select @@trancount tc, count(*) n from d1 ;; set xact_abort off",
+            "begin tran; exec p_def; select @@trancount tc; rollback ;; select count(*) n from d1",
+            "begin tran; set constraints sal_pos deferred; rollback",
+            "set constraints d1_neg immediate ;; insert into d1 values (6, -1) ;; select count(*) n from d1",
+            // the bulk load (INSERT BULK)
+            "bulk big 0 100 0 ;; select count(*) n from big ;; delete from big",
+            "bulk big 0 100 77 ;; select count(*) n from big",
+            "bulk d1 0 10 4 ;; select count(*) n from d1",
+            "begin tran ;; bulk big 0 10 0 ;; bulk big 10 10 3 ;; select @@trancount tc, count(*) n from big ;; rollback",
+            // CREATE, DROP, the errors
+            "create assertion a1 check (not exists (select 1 from emp where sal > 1000)) ;; drop assertion a1 ;; drop assertion a1",
+            "create assertion sal_pos check (not exists (select 1 from emp where sal = 3))",
+            "create assertion emp check (not exists (select 1 from emp where sal = 3))",
+            "create table sal_pos (x int)",
+            "drop assertion if exists nosuch",
+            "create assertion nosuch.a1 check (not exists (select 1 from emp where sal = 3))",
+            "create assertion a1 check (not exists (select 1 from emp where sal > 40))",
+            "create assertion a1 check (not exists (select count(*) from emp having count(*) > 3))",
+            "create assertion a1 check (not exists (select top 1 1 from emp))",
+            "create assertion a1 check (not exists (select 1 from emp where sal > datepart(day, getdate())))",
+            "create assertion a1 check (not exists (select 1 from emp a join dept b on a.dept = b.id))",
+            "create assertion a1 check (not exists (select 1 from emp where sal = 3)) not deferrable initially deferred",
+            "create assertion a1 check (not exists (select 1 from emp where sal = 3)) enable",
+            "create assertion if not exists a1 check (not exists (select 1 from emp where sal = 3))",
+            "create assertion a1 check (not exists (select 1 from emp where sal = 3)) initially deferred ;; select is_deferrable, initially_deferred from information_schema.assertions where constraint_name = 'a1' ;; drop assertion a1",
+            "alter table emp drop column sal",
+            "exec sp_rename 'emp.sal', 's', 'COLUMN'",
+            "exec sp_rename 'emp', 'emp2'",
+            "drop table dept",
+            "alter table emp add x int ;; alter table emp drop column x ;; select count(*) n from emp",
+            // the catalog
+            "select constraint_schema, constraint_name, is_deferrable, initially_deferred from INFORMATION_SCHEMA.ASSERTIONS order by constraint_name",
+            "select constraint_name, check_clause from INFORMATION_SCHEMA.CHECK_CONSTRAINTS where constraint_name in ('sal_pos', 'd1_neg', 'log_pos') order by 1",
+            "select count(*) n from sys.objects where name = 'sal_pos' ;; select count(*) n from sys.check_constraints where name = 'sal_pos' ;; select object_id('sal_pos') o"]
+}
+
+fn cellText(c: &tds.Column, v: &tds.Cell): str {
+    match v {
+        tds.Cell.Null { return "NULL" }
+        else { return tds.cellText(c, v).unwrapOr("?") }
+    }
+}
+
+// A reply: each error (number, severity, text), then its result sets' rows and the counts of statements without rows.
+fn said(r: Result[tds.Reply, sqldialect.DbError]): str {
+    match r {
+        Ok(rep) {
+            var parts: []str = []
+            for e in rep.errors { append(mut &parts, "error " + e.number.toStr() + " (" + e.class.toStr() + "): " + e.text) }
+            for rs in rep.results {
+                var rows: []str = []
+                for row in rs.rows {
+                    var cells: []str = []
+                    for i in 0..len(row) { append(mut &cells, cellText(&rs.columns[i], &row[i])) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                var names: []str = []
+                for c in rs.columns { append(mut &names, c.name.clone()) }
+                append(mut &parts, strings.join(&names, ",") + " = " + strings.join(&rows, ";"))
+            }
+            if len(rep.results) == 0 && len(rep.errors) == 0 {
+                for c in rep.counts { if c.resultSet < 0 && c.rows >= 0 { append(mut &parts, "(" + c.rows.toStr() + ")") } }
+            }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "failed " + e.code.toStr() + " " + e.msg }
+    }
+}
+
+fn tvp(rows: &[][]V): tds.Param {
+    var p = tds.tableParam(&"dbo.ItemsT", rows, &[], &[], &tds.noCollation()).unwrap()
+    p.name = "@t"
+    return p
+}
+
+fn text(t: &str): tds.Param { return tds.textParam(&(t.toStr()), &tds.noCollation()).unwrap() }
+
+// rows (start + 1 .. start + n, i % 50), the k-th's value -1 (0: none)
+fn bulkRows(start: int, n: int, k: int): [][]V {
+    var out: [][]V = []
+    for i in 1..n + 1 { append(mut &out, [V.Int(start + i), V.Int(if i == k { -1 } else { i % 50 })]) }
+    return out
+}
+
+// A batch of a line: "tvp SQL" (with @t a table of (20, 5), (21, -5)), "bulk TABLE START N K" (a bulk load, lib/sqlserver's
+// bulkInsert on the second connection c), or T-SQL.
+fn one(s: mut &tds.Session, c: mut &sqlserver.Conn, x: &str): str {
+    if strings.startsWith(x, "tvp ") {
+        let sql = x[4..len(x)].toStr()
+        return said(s.callProc("sp_executesql", &[text(&sql), text(&"@t dbo.ItemsT READONLY"), tvp(&[[V.Int(20), V.Int(5)], [V.Int(21), V.Int(-5)]])]))
+    }
+    if strings.startsWith(x, "bulk ") {
+        let ws = strings.split(x, " ")
+        let rows = bulkRows(lexdb_base.num(&ws[2]), lexdb_base.num(&ws[3]), lexdb_base.num(&ws[4]))
+        match c.bulkInsert(&ws[1], &["id", "v"], &rows, &sqlserver.bulkOptions()) {
+            Ok(n) { return "bulk " + n.toStr() }
+            Err(e) { return "bulk error " + e.code.toStr() + ": " + e.msg }
+        }
+    }
+    return said(s.batch(x))
+}
+
+fn answer(s: mut &tds.Session, c: mut &sqlserver.Conn, line: &str): str {
+    var out: []str = []
+    for b in strings.split(line, " ;; ") {
+        // the bulk load's connection is the other one: a line's transaction is on it when the line begins one
+        append(mut &out, one(s, c, &b))
+    }
+    return strings.join(&out, " // ")
+}
+
+fn client(dsn: &str) {
+    let st = sqlserver.parseConnString(&(dsn.toStr())).unwrap()
+    var s = tds.open(&st.config).unwrap()
+    var c = sqlserver.connect(&(dsn.toStr())).unwrap()
+    var n = 0
+    for x in setup() {
+        let r = said(s.batch(&x))
+        if r != "ok" && !strings.startsWith(&r, "(") { println("setup: " + x + ": " + r) } else { n += 1 }
+    }
+    println("setup: " + n.toStr() + " batches")
+    for l in lines() {
+        // (a line that begins a transaction for a bulk load runs it on the bulk load's connection)
+        let onBulk = strings.startsWith(&l, "begin tran ;; bulk")
+        let a = said(s.batch("SET lexdb_batch = off"))
+        let a2 = c.run("SET lexdb_batch = off", &[])
+        let off = if onBulk { bulkTx(mut &c, &l) } else { answer(mut &s, mut &c, &l) }
+        let b = said(s.batch("SET lexdb_batch = on"))
+        let b2 = c.run("SET lexdb_batch = on", &[])
+        let on = if onBulk { bulkTx(mut &c, &l) } else { answer(mut &s, mut &c, &l) }
+        if off == on { println("same: " + on) } else {
+            println("DIFFERENT: " + l)
+            println("  rows:    " + off)
+            println("  batches: " + on)
+        }
+    }
+    c.close()
+}
+
+// A line of batches on the bulk load's connection (its transaction is the loads').
+fn bulkTx(c: mut &sqlserver.Conn, line: &str): str {
+    var out: []str = []
+    for b in strings.split(line, " ;; ") {
+        if strings.startsWith(&b, "bulk ") {
+            let ws = strings.split(&b, " ")
+            let rows = bulkRows(lexdb_base.num(&ws[2]), lexdb_base.num(&ws[3]), lexdb_base.num(&ws[4]))
+            match c.bulkInsert(&ws[1], &["id", "v"], &rows, &sqlserver.bulkOptions()) {
+                Ok(n) { append(mut &out, "bulk " + n.toStr()) }
+                Err(e) { append(mut &out, "bulk error " + e.code.toStr() + ": " + e.msg) }
+            }
+            continue
+        }
+        match c.queryAll(&b, &[]) {
+            Ok(r) {
+                var parts: []str = []
+                for rs in r.sets {
+                    var rows: []str = []
+                    for i in 0..rs.rowCount() {
+                        var cells: []str = []
+                        for j in 0..rs.columnCount() {
+                            match rs.value(i, j) {
+                                Ok(v) { append(mut &cells, v.toStr()) }
+                                Err(e) { append(mut &cells, "error") }
+                            }
+                        }
+                        append(mut &rows, strings.join(&cells, "|"))
+                    }
+                    append(mut &parts, strings.join(&rows, ";"))
+                }
+                append(mut &out, if len(parts) == 0 { "ok" } else { strings.join(&parts, " / ") })
+            }
+            Err(e) { append(mut &out, "error " + e.code.toStr() + ": " + e.msg) }
+        }
+    }
+    return strings.join(&out, " // ")
+}
+
+fn opts(): lexdb_store.Options { return lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000} }
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(sc: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        client(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag.clone() }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "error " + e.state + " " + e.msg }
+    }
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(97)
+    lexdb_store.run(fs.share(), opts(), body).unwrap()
+    // reopened: the assertions made in T-SQL, checked in the PostgreSQL door too
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st)
+        println("reopened: " + q(mut &s, "insert into emp values (70, 1, -1)") + " / " + q(mut &s, "insert into d1 values (70, 200)") + " / " +
+                q(mut &s, "select constraint_name from information_schema.assertions order by 1"))
+        s.close()
+        return 0
+    }).unwrap()
+}
