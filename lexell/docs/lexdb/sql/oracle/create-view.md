@@ -12,6 +12,7 @@ CREATE [ OR REPLACE ] [ NOFORCE ] VIEW [ schema. ] view [ ( alias [ annotations_
 
 ALTER VIEW [ schema. ] view annotations_clause
 ALTER VIEW [ schema. ] view MODIFY ( column annotations_clause [, ...] )
+ALTER VIEW [ schema. ] view { COMPILE | EDITIONABLE | NONEDITIONABLE }
 
 annotations_clause:
     ANNOTATIONS ( [ ADD [ IF NOT EXISTS ] | DROP [ IF EXISTS ] | REPLACE ] name [ 'value' ] [, ...] )
@@ -27,7 +28,8 @@ annotations_clause:
   select list's expressions (give an alias to a computed column).
 
 *subquery*
-: Any query, with joins, grouping and subqueries.
+: Any query, with joins, grouping and subqueries. It may call a stored function, a standalone one or a package's
+  (example G).
 
 `ANNOTATIONS`
 : Names, with or without a value, kept for the view or one of its columns and shown in `USER_ANNOTATIONS_USAGE`
@@ -40,6 +42,10 @@ annotations_clause:
 - A view is read like a table in `SELECT`, `JOIN` and other views. `USER_VIEWS` has its name and text, and
   `USER_TAB_COLUMNS` its columns.
 - **Views are read-only in lexdb:** `INSERT`, `UPDATE` and `DELETE` through a view are ORA-03001.
+- A view that calls a stored function runs the function's current body each time it is read: `CREATE OR REPLACE
+  FUNCTION` changes what the view gives. `USER_VIEWS.TEXT` shows the query as it was written.
+- `ALTER VIEW ... COMPILE`, `EDITIONABLE` and `NONEDITIONABLE` are accepted and do nothing (example H). A view is
+  renamed by [RENAME](rename.md): `ALTER VIEW ... RENAME TO` is ORA-00922, as in Oracle.
 - A view is dropped with [DROP VIEW](drop-view.md).
 
 ## Differences from Oracle
@@ -50,9 +56,12 @@ annotations_clause:
   for both). Every view is read-only anyway.
 - `FORCE` (a view over a table that does not exist yet) is ORA-00900; `NOFORCE` is the default and is accepted.
 - `CREATE MATERIALIZED VIEW` is ORA-03001.
-- `ALTER VIEW` of a table is ORA-20000 (Oracle ORA-00942). `ALTER VIEW ... COMPILE` is ORA-03001 (message `ALTER VIEW
-  supports RENAME TO only`), where Oracle accepts it; `ALTER VIEW v RENAME TO w` renames the view, where Oracle gives
-  ORA-00922 (use [RENAME](rename.md)).
+- **A view that calls a stored function cannot be read by DML:** an `INSERT`, `UPDATE`, `DELETE` or `CREATE TABLE ...
+  AS` that reads one is ORA-03001 (example G). A query reads it.
+- After `DROP FUNCTION` (or `DROP PACKAGE`) of a function a view calls, reading the view gives NULL in that column and
+  `USER_OBJECTS.STATUS` stays `VALID`; Oracle marks the view `INVALID` and reading it is ORA-04063 (`view ... has
+  errors`).
+- `ALTER VIEW ... READ ONLY` is ORA-03001; Oracle gives ORA-42310 for a view that is not an editioning view.
 
 ## Examples
 
@@ -218,6 +227,137 @@ SALARY      UNIT            EUR
 
 ERROR:
 ORA-11553: Provided annotation 'RESTRICTED' does not exist for the object 'V_PAY'.
+```
+
+### G. A view that calls a stored function
+
+<!-- example: oracle -->
+```sql
+CREATE FUNCTION bonus (sal NUMBER) RETURN NUMBER IS
+BEGIN
+  RETURN ROUND(sal * 0.1);
+END;
+/
+CREATE VIEW v_bonus AS SELECT id, name, bonus(salary) AS bonus FROM emp WHERE bonus(salary) > 10;
+SELECT * FROM v_bonus ORDER BY id;
+SELECT text FROM user_views WHERE view_name = 'V_BONUS';
+CREATE OR REPLACE FUNCTION bonus (sal NUMBER) RETURN NUMBER IS
+BEGIN
+  RETURN ROUND(sal * 0.2);
+END;
+/
+SELECT id, bonus FROM v_bonus ORDER BY id;
+CREATE TABLE bonus_copy AS SELECT * FROM v_bonus;
+INSERT INTO emp (id, name, salary, dept) SELECT id + 10, name, bonus, 3 FROM v_bonus;
+```
+
+```text
+Function created.
+
+View created.
+
+ID NAME BONUS
+-- ---- -----
+ 2 bob     20
+ 3 cy      30
+
+2 rows selected.
+
+TEXT
+-------------------------------------------------------------------------
+SELECT id, name, bonus(salary) AS bonus FROM emp WHERE bonus(salary) > 10
+
+1 row selected.
+
+Function created.
+
+ID BONUS
+-- -----
+ 1    20
+ 2    40
+ 3    60
+
+3 rows selected.
+
+ERROR:
+ORA-03001: unimplemented feature: lexdb: a view that calls a stored function is not supported in INSERT, UPDATE, DELETE and CREATE TABLE AS
+
+ERROR:
+ORA-03001: unimplemented feature: lexdb: a view that calls a stored function is not supported in INSERT, UPDATE, DELETE and CREATE TABLE AS
+```
+
+A function of a package works the same way:
+
+<!-- example: oracle -->
+```sql
+CREATE PACKAGE pay IS
+  FUNCTION grade (sal NUMBER) RETURN VARCHAR2;
+END;
+/
+CREATE PACKAGE BODY pay IS
+  FUNCTION grade (sal NUMBER) RETURN VARCHAR2 IS
+  BEGIN
+    RETURN CASE WHEN sal >= 200 THEN 'senior' ELSE 'junior' END;
+  END;
+END;
+/
+CREATE VIEW v_grade AS SELECT dept, pay.grade(salary) AS grade, COUNT(*) AS n FROM emp GROUP BY dept, pay.grade(salary);
+SELECT * FROM v_grade ORDER BY dept, grade;
+SELECT e.name, g.n FROM emp e JOIN v_grade g ON g.dept = e.dept AND g.grade = pay.grade(e.salary) ORDER BY e.id;
+```
+
+```text
+Package created.
+
+Package body created.
+
+View created.
+
+DEPT GRADE  N
+---- ------ -
+   1 junior 1
+   1 senior 1
+   2 senior 1
+
+3 rows selected.
+
+NAME N
+---- -
+ann  1
+bob  1
+cy   1
+
+3 rows selected.
+```
+
+### H. ALTER VIEW
+
+<!-- example: oracle -->
+```sql
+ALTER VIEW v_dept COMPILE;
+ALTER VIEW v_dept EDITIONABLE;
+ALTER VIEW v_dept RENAME TO v_depts;
+ALTER VIEW v_dept READ ONLY;
+ALTER VIEW emp COMPILE;
+ALTER VIEW nothere COMPILE;
+```
+
+```text
+View altered.
+
+View altered.
+
+ERROR:
+ORA-00922: missing or invalid option
+
+ERROR:
+ORA-03001: unimplemented feature: lexdb: ALTER VIEW takes COMPILE, ANNOTATIONS, MODIFY and [NON]EDITIONABLE only
+
+ERROR:
+ORA-00942: table or view "SA"."EMP" does not exist
+
+ERROR:
+ORA-00942: table or view "SA"."NOTHERE" does not exist
 ```
 
 ## See also

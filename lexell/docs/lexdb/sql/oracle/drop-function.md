@@ -17,7 +17,9 @@ DROP FUNCTION [ schema. ] function
 
 ## Differences from Oracle
 
-- None known.
+- A view that calls the function is still read after it is dropped, with NULL in the function's column, and
+  `USER_OBJECTS.STATUS` stays `VALID`; Oracle marks the view `INVALID` and reading it is ORA-04063 (see [CREATE
+  VIEW](create-view.md)).
 
 ## Examples
 

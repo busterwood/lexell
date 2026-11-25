@@ -35,8 +35,8 @@ Oracle. Each page names what lexdb lacks or does differently.
 | [CREATE TABLE](create-table.md) | Constraints (`DISABLE`, `ENABLE NOVALIDATE`), identity columns, `DEFAULT ON NULL`, virtual columns, `GLOBAL TEMPORARY ... ON COMMIT`. |
 | [ALTER TABLE](alter-table.md) | `ADD`, `MODIFY`, `DROP`, `RENAME COLUMN`, constraints (`ENABLE`, `DISABLE`, `MODIFY CONSTRAINT`). |
 | [DROP TABLE](drop-table.md) | `CASCADE CONSTRAINTS`, `PURGE`. |
-| [CREATE INDEX](create-index.md), [DROP INDEX](drop-index.md) | Unique and function-based indexes; `ALTER INDEX ... RENAME` and `ANNOTATIONS`. |
-| [CREATE VIEW](create-view.md), [DROP VIEW](drop-view.md) | `OR REPLACE`; views are read-only. |
+| [CREATE INDEX](create-index.md), [DROP INDEX](drop-index.md) | Unique and function-based indexes; `ALTER INDEX ... RENAME` and `ANNOTATIONS` (`REBUILD` and the like are accepted). |
+| [CREATE VIEW](create-view.md), [DROP VIEW](drop-view.md) | `OR REPLACE`; views are read-only and may call stored functions; `ALTER VIEW ... COMPILE`. |
 | [CREATE SEQUENCE](create-sequence.md), [ALTER SEQUENCE](alter-sequence.md), [DROP SEQUENCE](drop-sequence.md) | `NEXTVAL`, `CURRVAL`. |
 | [RENAME](rename.md) | Tables, views, sequences. |
 | [COMMENT ON](comment-on.md) | Accepted; comments are not kept. |

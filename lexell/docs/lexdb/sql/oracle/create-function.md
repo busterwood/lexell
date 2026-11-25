@@ -52,8 +52,8 @@ END [ function ] ;
   write `f()`. Inside PL/SQL both forms work for a package function.
 - A stored function is refused (ORA-03001, `unimplemented feature`) in a `MERGE`, in a subquery of an `INSERT`,
   `UPDATE` or `DELETE` that reads the statement's own table or refers to its columns, and with an argument that is an aggregate or another
-  stored function's call (`f(SUM(x))`, `f(g(x))`). `CREATE VIEW` of a query that calls one is ORA-00904 (Oracle
-  allows it). Example H.
+  stored function's call (`f(SUM(x))`, `f(g(x))`). A view may call one, but an `INSERT`, `UPDATE`, `DELETE` or
+  `CREATE TABLE ... AS` that reads such a view is ORA-03001 (Oracle allows it). Example H.
 - Pipelined and table functions, `RESULT_CACHE`, `PARALLEL_ENABLE`, `AGGREGATE USING` and `AUTHID` are not supported.
 - A `SYS_REFCURSOR` result works from PL/SQL; a JDBC client reads it as a cursor.
 
@@ -243,7 +243,7 @@ ORA-06512: at "SA.STRICT_PAY", line 4
 ### G. A function in the SQL of a block, and in DML
 
 A stored function works in every SQL statement: a query of a block, a cursor, `EXECUTE IMMEDIATE`, `INSERT ... SELECT`,
-`UPDATE`, `DELETE` and `CREATE TABLE AS`.
+`UPDATE`, `DELETE`, `CREATE TABLE AS` and a view (see [CREATE VIEW](create-view.md), example G).
 
 <!-- example: oracle -->
 ```sql
@@ -310,6 +310,7 @@ Rollback complete.
 MERGE INTO bonus b USING emp e ON (b.id = e.id) WHEN MATCHED THEN UPDATE SET b.amount = double_it(e.salary);
 UPDATE bonus SET amount = 0 WHERE EXISTS (SELECT 1 FROM emp e WHERE e.salary > double_it(bonus.amount));
 CREATE VIEW doubled_pay AS SELECT id, double_it(salary) AS pay FROM emp;
+INSERT INTO bonus SELECT id, pay FROM doubled_pay;
 SELECT double_it(SUM(salary)) AS total FROM emp;
 SELECT double_it(double_it(salary)) AS quad FROM emp ORDER BY id;
 ```
@@ -321,8 +322,10 @@ ORA-03001: unimplemented feature: lexdb: a stored function called in a MERGE sta
 ERROR:
 ORA-03001: unimplemented feature: lexdb: a stored function called in a subquery that reads the statement's table is not supported in INSERT, UPDATE and DELETE
 
+View created.
+
 ERROR:
-ORA-00904: invalid identifier
+ORA-03001: unimplemented feature: lexdb: a view that calls a stored function is not supported in INSERT, UPDATE, DELETE and CREATE TABLE AS
 
 ERROR:
 ORA-03001: unimplemented feature: lexdb: an argument of a stored function that is an aggregate or calls a stored function is not supported
