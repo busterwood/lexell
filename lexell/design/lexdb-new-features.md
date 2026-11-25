@@ -1058,9 +1058,8 @@ before the master's SIGKILL there after its log is replayed, all of them after t
   lexdb_dialect, lexdb_sql, lexdb_oradata.
 
 **Left, met on the way, not changed:**
-- CREATE TABLE ... AS with a column's annotations (`(id annotations (...)) as select`): Oracle ORA-11559, lexdb ORA-00900; one column twice in MODIFY (`modify (v
-  annotations (...), v annotations (...))`): Oracle ORA-00957, lexdb applies both; ALTER INDEX of an index that is not there: Oracle ORA-01418, lexdb ORA-00942;
-  ALTER TABLE ... ANNOTATIONS of a view and ALTER VIEW of a table: Oracle ORA-00942, lexdb ORA-20000 (the messages of 42809).
+- (Done in the third bug slice, lexdb-robust.md: ORA-11559 for a column's annotations in CREATE TABLE ... AS, ORA-00957 for a column twice in MODIFY, ORA-01418 for
+  ALTER INDEX of no index, ORA-00942 for ALTER TABLE of a view and ALTER VIEW of a table.)
 - ALL_ and DBA_ views list no rows of SYS's 23ai domains (Oracle Free lists about a hundred, OBJECT_TYPE DOMAIN): lexdb has no domains; DOMAIN_NAME and
   DOMAIN_OWNER are always NULL.
 - A global temporary table's annotations are kept but not listed: lexdb's GTT is a session's temporary table, which USER_TABLES does not list either (older).

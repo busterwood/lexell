@@ -25,6 +25,7 @@ import "./lexdb_sql"
 import "./lexdb_time"
 import "./lexdb_parse"
 import "./lexdb_dbopt"
+import "./lexdb_tsqldef"
 
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
@@ -240,6 +241,19 @@ pub fn typeId(typ: &str): int {
 // lexdb_tds: code + n * 1024. Codes start at 34, above a time type's
 // scale (0 to 7), which OutCol.scale otherwise holds.
 pub fn hint(code: int, n: int): int { return code + n * 1024 }
+
+// The scale (OutCol.scale) of MIN or MAX of a time value whose scale is a, and of SWITCHOFFSET, TODATETIMEOFFSET and AT TIME
+// ZONE of one: MIN and MAX keep a time type's fractional digits (0 to 9: an Oracle DATE stays one) and a datetime's hint; the
+// others are a datetimeoffset of the argument's digits (a datetime's 3, a smalldatetime's 0), as SQL Server 2022 types them;
+// -1 for another argument (datetimeoffset(7)).
+pub fn timeScale(f: &str, a: int): int {
+    let code = hintCode(a)
+    if f == "min" || f == "max" { return if (a >= 0 && a <= 9) || code == TS_DATETIME || code == TS_SMALLDATETIME { a } else { -1 } }
+    if a >= 0 && a <= 7 { return a }
+    if code == TS_DATETIME { return 3 }
+    if code == TS_SMALLDATETIME { return 0 }
+    return -1
+}
 
 // The parts of a hint: its code and its length.
 pub fn hintCode(h: int): int { return if h >= 34 { h % 1024 } else { 0 } }
@@ -588,6 +602,22 @@ fn sysDefName(ct: &CatTab, c: &lexdb_sql.ColDef): str { return "DF_" + ct.name +
 
 fn sysHasDefault(c: &lexdb_sql.ColDef): bool {
     return c.def.isSome() && c.identity != lexdb_sql.ID_ALWAYS && c.identity != lexdb_sql.ID_BY_DEFAULT && c.name != ROWID
+}
+
+// The catalog the T-SQL door's INFORMATION_SCHEMA reads: no NOT NULL constraints (PostgreSQL 18's, lexdb_nncon), and a CHECK's
+// CHECK_CLAUSE as SQL Server writes it (lexdb_tsqldef), not PostgreSQL's text.
+pub fn tsqlIs(snap: mut &CatSnap) {
+    snap.nns = []
+    for i in 0..len(snap.cons) {
+        if snap.cons[i].typ != "c" { continue }
+        let ti = lexdb_catalog.catTabIdx(snap, snap.cons[i].rel)
+        if ti < 0 { continue }
+        for ck in snap.tabs[ti].t.checks {
+            if ck.name != snap.cons[i].name { continue }
+            let off = lexdb_catalog.isOff(&snap.tabs[ti].t, &ck.name)
+            snap.cons[i].check = lexdb_tsqldef.checkText(&(if off { lexdb_catalog.offInner(&ck.expr) } else { lexdb_sql.cloneExpr(&ck.expr) }))
+        }
+    }
 }
 
 // An expression as SQL Server shows a definition: [names], (literals),
@@ -1242,8 +1272,7 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] 
                     var pc = 0
                     if len(used) == 1 { pc = sysColId(&ct.t, lexdb_catalog.colNum(&ct.t, &used[0])) }
                     r.set(&"parent_column_id", iv(pc))
-                    let x = tsqlText(&cx)
-                    r.set(&"definition", tv(&(if strings.startsWith(&x, "(") { x } else { "(" + x + ")" })))
+                    r.set(&"definition", tv(&lexdb_tsqldef.checkText(&cx)))
                     let auto = strings.startsWith(&ck.name, &(ct.name + "_")) && strings.endsWith(&ck.name, "_check")
                     r.set(&"is_system_named", bv(auto))
                     append(mut &rows, r.row())

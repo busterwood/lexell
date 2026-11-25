@@ -1,0 +1,79 @@
+// lexdb_tds: SELECT ... INTO's DONE carries the rows it put in with CurCmd 0xC2 (SELECT INTO), as SQL Server 2022 sends it
+// (design/lexdb-robust.md, "The third bug slice"): mssql-jdbc takes it as an update count (Statement.getUpdateCount 2, not -1)
+// and sqlcmd prints "(n rows affected)" only for it; lexdb sent CurCmd 0. Each batch's counted DONEs (count and CurCmd),
+// through lib/tds's own session; run with LEXDB_MSSQL set to a connection string, the program asks that SQL Server instead:
+// the same output (checked against SQL Server 2022, database b3).
+// expect: DROP TABLE IF EXISTS b7j; DROP TABLE IF EXISTS b7k; DROP TABLE IF EXISTS b7m; DROP TABLE IF EXISTS b7s: none
+// expect: CREATE TABLE b7s (x int); INSERT INTO b7s VALUES (1), (2), (NULL): 3 c3
+// expect: SELECT x INTO b7j FROM b7s: 3 c2
+// expect: SELECT x INTO #b7t FROM b7s WHERE x > 1: 1 c2
+// expect: SELECT x INTO b7k FROM b7s WHERE x > 5: 0 c2
+// expect: SET NOCOUNT ON; SELECT x INTO b7m FROM b7s: none
+// expect: SELECT x INTO b7n FROM b7s; SELECT COUNT(*) AS n FROM b7n; DROP TABLE b7n: 3 c2, 1 c1
+// expect: DROP TABLE b7j; DROP TABLE b7k; DROP TABLE b7m; DROP TABLE b7s: none
+import "os"
+import "strings"
+import "task"
+import "net"
+import "tds"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+const BATCHES: []str = ["DROP TABLE IF EXISTS b7j; DROP TABLE IF EXISTS b7k; DROP TABLE IF EXISTS b7m; DROP TABLE IF EXISTS b7s",
+                        "CREATE TABLE b7s (x int); INSERT INTO b7s VALUES (1), (2), (NULL)", "SELECT x INTO b7j FROM b7s",
+                        "SELECT x INTO #b7t FROM b7s WHERE x > 1", "SELECT x INTO b7k FROM b7s WHERE x > 5", "SET NOCOUNT ON; SELECT x INTO b7m FROM b7s",
+                        "SELECT x INTO b7n FROM b7s; SELECT COUNT(*) AS n FROM b7n; DROP TABLE b7n",
+                        "DROP TABLE b7j; DROP TABLE b7k; DROP TABLE b7m; DROP TABLE b7s"]
+
+fn hex2(n: int): str {
+    let d = "0123456789abcdef"
+    return d[(n >> 4) & 15..((n >> 4) & 15) + 1].toStr() + d[n & 15..(n & 15) + 1]
+}
+
+fn shown(r: &tds.Reply): str {
+    var ds: []str = []
+    for d in r.dones {
+        if d.token != tds.TK_DONE || d.status & tds.DONE_COUNT == 0 { continue }
+        append(mut &ds, d.count.toStr() + " " + hex2(d.curCmd))
+    }
+    return if len(ds) == 0 { "none" } else { strings.join(&ds, ", ") }
+}
+
+fn client(dsn: &str) {
+    let st = sqlserver.parseConnString(&(dsn.toStr())).unwrap()
+    var s = tds.open(&st.config).unwrap()
+    for b in BATCHES {
+        match s.batch(&b) {
+            Ok(r) { println(b + ": " + shown(&r)) }
+            Err(e) { println(b + ": failed " + e.msg) }
+        }
+        let reset = s.batch("SET NOCOUNT OFF")
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(sc: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        client(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    match os.env("LEXDB_MSSQL") {
+        Some(dsn) { client(&dsn) }
+        None {
+            lexdb_store.run(lexdb_disk.sim(75), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                                    snapNodes: 50000}, body).unwrap()
+        }
+    }
+}

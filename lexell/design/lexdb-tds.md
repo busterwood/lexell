@@ -1197,7 +1197,7 @@ time), `CAST` and `CONVERT` to a string (`2026-03-15 10:00:00.0000000 +02:00`; s
 carries the offset both ways (`lexdb_tds`: UTC time and date, then the offset in minutes; an RPC parameter decodes to a Tsz). Checked: `tds_dto` (89 batches as SQL Server 2022 answers),
 `MssqlJdbc.dto` (OffsetDateTime, `microsoft.sql.DateTimeOffset`; the old KNOWN line is a check now). Left: a string's fractional digits are seven whatever the type's scale (styles 126 and 127 print none,
 three or seven by the value); `FORMAT` of `zzz`; text forms SQL Server reads and lexdb does not (`March 15, 2026 10:00:00 AM +02:00`, `20260315 10:00:00 +02:00`); a VALUES list or derived column typed by
-OID alone is an instant; `MIN` and `MAX` show the last of equal instants' offsets (SQL Server the first); `datetimeoffset - datetimeoffset` and `+ n` are an interval and a text (SQL Server 8117, 206).
+OID alone is an instant; `datetimeoffset - datetimeoffset` and `+ n` are an interval and a text (SQL Server 8117, 206).
 
 ### As built: output parameters' RETURNVALUE and EXEC of a scalar function (2026-11-24)
 - A RETURNVALUE's ordinal is the parameter's place in the RPC call (sp_executesql's first parameter after `@stmt` and `@params` is 2,
@@ -1210,3 +1210,10 @@ OID alone is an instant; `MIN` and `MAX` show the last of equal instants' offset
   `SET @r = dbo.f(...)` in a nested batch. That is what mssql-jdbc sends for `{? = call dbo.f(?)}`.
 - `tds_rpcout` (expect lines from SQL Server 2022) has both; `MssqlJdbc` now runs to its end on lexdb: 211 passed, 0 failed (5
   KNOWN or SKIP lines, as before).
+
+## As built: the third bug slice (lexdb-robust.md, 2026-11-25)
+
+- SELECT ... INTO's DONE: CurCmd 0xC2 with the rows put in (mssql-jdbc's update count, sqlcmd's "(n rows affected)"); `tds_selectinto`.
+- SWITCHOFFSET, TODATETIMEOFFSET, AT TIME ZONE, MIN and MAX keep their argument's scale (`lexdb_syscat.timeScale`); MIN and MAX of equal instants keep the first's offset.
+- FORMAT's C has no decimals for ja-JP, ko-KR, id-ID, es-CO, ja, ko.
+- CHECK_CLAUSE and sys.check_constraints.definition in SQL Server's form (`lexdb_tsqldef`); CAST, N'...' and system-named constraints' names stay lexdb's. Test `tds_bugs3`.

@@ -1258,4 +1258,16 @@ row), with Oracle Free 23.26.3's errors and duplicates (by name and value), and 
 USER_, ALL_ and DBA_ ANNOTATIONS_USAGE, ANNOTATIONS and ANNOTATION_VALUES (shapes from `tools/gen_oracle_catalog.py`). The door's FROM-name lookup of the
 dictionary views (`lexdb_dialect.oraRelOf`) compares each entry's head now, without a search or a copy (a point select's parse 234,582 -> 55,529 instructions).
 Test `tns_annotations` (118 statements, 0 differences in `gen_oracle.py --check`); `replica.py` checks them on a replica, after a kill -9 and after a clean close.
-Left: ORA-11559, ORA-00957 and ORA-01418 not given (lexdb-new-features.md 12); no SYS domain rows in ALL_ and DBA_; a global temporary table's not listed.
+Left: no SYS domain rows in ALL_ and DBA_; a global temporary table's not listed.
+
+## As built: the third bug slice (lexdb-robust.md, 2026-11-25)
+
+- Logon: the TIME_ZONE of AUTH_ALTER_SESSION is the session's and LOCAL's (`logonZone`); `+00:00` sets nothing.
+- Type 231 for a TIMESTAMP WITH LOCAL TIME ZONE column (Val.Tstz values): 11 bytes in UTC, the column's fractional digits. Oracle's SYNC piggyback after ALTER SESSION SET TIME_ZONE (JDBC's
+  session zone) is not sent.
+- MIN and MAX of a TIMESTAMP WITH TIME ZONE keep the first of equal instants; of a DATE they are a DATE (type 12), of a TIMESTAMP(n) a TIMESTAMP(n).
+- A datetime + INTERVAL YEAR TO MONTH past the month's last day is ORA-01839; a TSTZ moves in UTC.
+- OFFSET and LIMIT are names unless their clause follows (`lexdb_parse.oraWordNames`).
+- A view may call stored functions (`PLF_MARK` after its text, `lexdb_routine.viewPlf`, `lexdb_plcall.again`); a cursor run again reloads the program before calling a function.
+- ORA-11559, 00957, 01418, 00942 (ALTER TABLE of a view, ALTER VIEW of a table), 00922 (ALTER VIEW ... RENAME TO); ALTER INDEX ... REBUILD / COALESCE / [NO]PARALLEL / [NO]LOGGING and ALTER VIEW
+  ... COMPILE / [NON]EDITIONABLE accepted as no-ops. Test `tns_bugs3` (91 answers as Oracle Free gives them), `tns_logonzone`.
