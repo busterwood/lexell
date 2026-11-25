@@ -122,7 +122,7 @@ The codes are PostgreSQL's, with PostgreSQL's meaning. The first two characters 
 | 42701 | duplicate_column | A column named twice. |
 | 42702 | ambiguous_column | A column name that more than one table in `FROM` has. |
 | 42703 | undefined_column | A column that does not exist. |
-| 42704 | undefined_object | A type, role, index, setting, assertion or other object that does not exist. |
+| 42704 | undefined_object | A type, role, index, setting, assertion, property graph or other object that does not exist. |
 | 42710 | duplicate_object | A role, type, enum label, constraint or assertion that already exists (an assertion shares its namespace with tables: a table's name is 42P07). |
 | 42712 | duplicate_alias | A table name or alias used twice in `FROM`. |
 | 42725 | ambiguous_function | A call that more than one function matches. |
@@ -136,11 +136,11 @@ The codes are PostgreSQL's, with PostgreSQL's meaning. The first two characters 
 | 428C9 | generated_always | A value for a `GENERATED ALWAYS` column. |
 | 42P01 | undefined_table | A table, view or sequence that does not exist. |
 | 42P06 | duplicate_schema | A schema that already exists. |
-| 42P07 | duplicate_table | A table, view, index or sequence that already exists, or an assertion's name taken by one. |
+| 42P07 | duplicate_table | A table, view, index, sequence or property graph that already exists, or an assertion's name taken by one. |
 | 42P10 | invalid_column_reference | An `ORDER BY` or `GROUP BY` position past the select list; a bad `ON CONFLICT` target. |
 | 42P13 | invalid_function_definition | `CREATE OR REPLACE FUNCTION` that changes the result type or a parameter's name. |
 | 42P16 | invalid_table_definition | Bad table options: `ON COMMIT` on a permanent table, a temporary table in a permanent schema, a second `PRIMARY KEY`. |
-| 42P17 | invalid_object_definition | A bad generated column. |
+| 42P17 | invalid_object_definition | A bad generated column or property graph property expression. |
 | 42P19 | invalid_recursion | A misplaced recursive reference in `WITH RECURSIVE`. |
 | 42P20 | windowing_error | A bad window frame. |
 

@@ -35,6 +35,7 @@ from_item:
     from_item CROSS JOIN from_item
     ( from_item join_type from_item ... ) [ [ AS ] alias [ ( column_alias [, ...] ) ] ]
     from_item MATCH_RECOGNIZE ( ... ) [ [ AS ] alias [ ( column_alias [, ...] ) ] ]
+    GRAPH_TABLE ( ... ) [ [ AS ] alias [ ( column_alias [, ...] ) ] ]
 ```
 
 A query in parentheses, `( select )`, may stand where a `select` does, and takes its own `ORDER BY` and `LIMIT`.
@@ -71,7 +72,8 @@ A query in parentheses, `( select )`, may stand where a `select` does, and takes
     `string_to_table`, or a `LANGUAGE sql` function of the user's that returns rows. `WITH ORDINALITY` adds a
     column numbering the rows from 1;
   - joins of these. See [Joins](select-join.md);
-  - a `MATCH_RECOGNIZE` clause after any of these. See [MATCH_RECOGNIZE](match-recognize.md).
+  - a `MATCH_RECOGNIZE` clause after any of these. See [MATCH_RECOGNIZE](match-recognize.md);
+  - a `GRAPH_TABLE (...)` pattern match over a property graph. See [GRAPH_TABLE](graph-table.md).
 
   An alias renames the item; a column alias list renames its columns from the left.
 
@@ -531,4 +533,4 @@ ERROR:  relation "only" does not exist
 
 [Joins](select-join.md) · [GROUP BY](select-group-by.md) · [Window functions](over.md) · [WITH](with.md) ·
 [VALUES](values.md) · [SELECT ... WAIT](select-wait.md) · [MATCH_RECOGNIZE](match-recognize.md) ·
-[INSERT](insert.md) · [UPDATE](update.md) · [DELETE](delete.md)
+[GRAPH_TABLE](graph-table.md) · [INSERT](insert.md) · [UPDATE](update.md) · [DELETE](delete.md)

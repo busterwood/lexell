@@ -131,8 +131,7 @@ quantifier:
   `COLUMNS` is the same text; the JSON functions do not exist outside `GRAPH_TABLE`.
 - `MATCHNUM()` numbers the matches one each, as Oracle does, but the numbers are lexdb's own: a match does not have
   Oracle's number.
-- The PostgreSQL and SQL Server doors have no `GRAPH_TABLE` (a syntax error, 42601 and Msg 102), as PostgreSQL 19
-  and SQL Server 2022 have none.
+- The PostgreSQL door also supports `GRAPH_TABLE` (see [PostgreSQL GRAPH_TABLE](../postgresql/graph-table.md)). The SQL Server door has none (a syntax error, Msg 102).
 
 ## Examples
 

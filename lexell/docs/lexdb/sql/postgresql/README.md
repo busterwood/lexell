@@ -12,7 +12,7 @@ This index lists everything the door takes today. Pages not written yet are list
 
 | Statement | What it does |
 |---|---|
-| [SELECT](select.md) | Queries: [joins](select-join.md), `LATERAL`, [grouping and `GROUPING SETS`](select-group-by.md), [windows](over.md), `DISTINCT ON`, `LIMIT`/`OFFSET`/`FETCH`, `FOR UPDATE`, set operations, [`MATCH_RECOGNIZE`](match-recognize.md). `SELECT ... INTO` makes a table. lexdb's [`WAIT n SECONDS`](select-wait.md) suffix waits for rows. |
+| [SELECT](select.md) | Queries: [joins](select-join.md), `LATERAL`, [grouping and `GROUPING SETS`](select-group-by.md), [windows](over.md), `DISTINCT ON`, `LIMIT`/`OFFSET`/`FETCH`, `FOR UPDATE`, set operations, [`MATCH_RECOGNIZE`](match-recognize.md), [`GRAPH_TABLE`](graph-table.md). `SELECT ... INTO` makes a table. lexdb's [`WAIT n SECONDS`](select-wait.md) suffix waits for rows. |
 | [VALUES](values.md) | A table of literal rows. |
 | [WITH](with.md) | Common table expressions, `WITH RECURSIVE`, before `SELECT`, `INSERT`, `UPDATE`, `DELETE` or `MERGE`. |
 | [EXPLAIN](explain.md) | The plan of a `SELECT`, `UPDATE`, `DELETE` or `MERGE`; `EXPLAIN ANALYZE` of a `SELECT`. |
@@ -43,6 +43,7 @@ This index lists everything the door takes today. Pages not written yet are list
 | [CREATE SCHEMA](create-schema.md), [ALTER SCHEMA](alter-schema.md), [DROP SCHEMA](drop-schema.md) | Schemas. |
 | [CREATE TYPE](create-type.md), [ALTER TYPE](alter-type.md), [DROP TYPE](drop-type.md) | Enum types. |
 | [CREATE ASSERTION](create-assertion.md), [DROP ASSERTION](drop-assertion.md) | The SQL standard's constraint across tables; lexdb's own here (PostgreSQL has none); `DEFERRABLE`. |
+| [CREATE PROPERTY GRAPH](create-property-graph.md), [DROP PROPERTY GRAPH](drop-property-graph.md) | SQL:2023 property graphs (SQL/PGQ; PostgreSQL has none), queried with [`GRAPH_TABLE`](graph-table.md). |
 | [CREATE FUNCTION](create-function.md), [CREATE PROCEDURE](create-procedure.md), [DROP FUNCTION, DROP PROCEDURE](drop-function.md) | Routines in `LANGUAGE sql` (`AS '...'`, `BEGIN ATOMIC`, `RETURN`). |
 | [CALL](call.md) | Calls a procedure. |
 
