@@ -35,11 +35,12 @@ Oracle. Each page names what lexdb lacks or does differently.
 | [CREATE TABLE](create-table.md) | Constraints (`DISABLE`, `ENABLE NOVALIDATE`), identity columns, `DEFAULT ON NULL`, virtual columns, `GLOBAL TEMPORARY ... ON COMMIT`. |
 | [ALTER TABLE](alter-table.md) | `ADD`, `MODIFY`, `DROP`, `RENAME COLUMN`, constraints (`ENABLE`, `DISABLE`, `MODIFY CONSTRAINT`). |
 | [DROP TABLE](drop-table.md) | `CASCADE CONSTRAINTS`, `PURGE`. |
-| [CREATE INDEX](create-index.md), [DROP INDEX](drop-index.md) | Unique and function-based indexes; `ALTER INDEX ... RENAME`. |
+| [CREATE INDEX](create-index.md), [DROP INDEX](drop-index.md) | Unique and function-based indexes; `ALTER INDEX ... RENAME` and `ANNOTATIONS`. |
 | [CREATE VIEW](create-view.md), [DROP VIEW](drop-view.md) | `OR REPLACE`; views are read-only. |
 | [CREATE SEQUENCE](create-sequence.md), [ALTER SEQUENCE](alter-sequence.md), [DROP SEQUENCE](drop-sequence.md) | `NEXTVAL`, `CURRVAL`. |
 | [RENAME](rename.md) | Tables, views, sequences. |
 | [COMMENT ON](comment-on.md) | Accepted; comments are not kept. |
+| [Annotations](annotations.md) | `ANNOTATIONS (...)` on tables, views, indexes and columns; `ALTER ... ANNOTATIONS` with `ADD`, `DROP` and `REPLACE`. |
 
 ### PL/SQL units
 
@@ -126,7 +127,7 @@ Not available: `NANVL`, `LNNVL`, `SOUNDEX`, `ORA_HASH`, `STANDARD_HASH`, `VSIZE`
 
 | Page | Views |
 |---|---|
-| [Tables, columns, indexes and constraints](data-dictionary-tables.md) | `USER_`, `ALL_` and `DBA_` `TABLES`, `TAB_COLUMNS`, `INDEXES`, `IND_COLUMNS`, `IND_EXPRESSIONS`, `CONSTRAINTS`, `CONS_COLUMNS`, `TAB_IDENTITY_COLS`, `OBJECTS`, `CATALOG`; `TABS`, `COLS`, `DICT`, `DICTIONARY`, `DUAL` |
+| [Tables, columns, indexes and constraints](data-dictionary-tables.md) | `USER_`, `ALL_` and `DBA_` `TABLES`, `TAB_COLUMNS`, `INDEXES`, `IND_COLUMNS`, `IND_EXPRESSIONS`, `CONSTRAINTS`, `CONS_COLUMNS`, `TAB_IDENTITY_COLS`, `OBJECTS`, `CATALOG`, `ANNOTATIONS_USAGE`, `ANNOTATIONS`, `ANNOTATION_VALUES`; `TABS`, `COLS`, `DICT`, `DICTIONARY`, `DUAL` |
 | [Views, sequences, procedures and source](data-dictionary-programs.md) | `VIEWS`, `SEQUENCES`, `SOURCE`, `PROCEDURES`, `ARGUMENTS`, `ERRORS`, `TRIGGERS`, `SYNONYMS` |
 | [Users, privileges, parameters and V$ views](data-dictionary-system.md) | `USER_USERS`, `ALL_USERS`, `DBA_USERS`, `USER_TAB_PRIVS`, `SESSION_PRIVS`, `NLS_SESSION_PARAMETERS`, `DATABASE_PROPERTIES`, `PRODUCT_COMPONENT_VERSION`, `V$VERSION`, `V$INSTANCE`, `V$DATABASE`, `V$SESSION`, `V$PARAMETER` |
 

@@ -37,6 +37,7 @@ it.
 | ORA-02289 | A sequence that does not exist (in `DROP SEQUENCE`, and `NEXTVAL` or `CURRVAL` of a missing or dropped one, and an `INSERT` whose default calls a dropped one). |
 | ORA-03049 | `HAVING`, `WINDOW` or a second `QUALIFY` after a `QUALIFY` condition, and `QUALIFY` after `ORDER BY` or `FOR UPDATE`. |
 | ORA-01786 | `FOR UPDATE` after `QUALIFY`. |
+| ORA-11543 to ORA-11562, ORA-11602 | An `ANNOTATIONS` clause that is not right: a name that is reserved or missing, a value that is empty or not text, a name and value given twice, `DROP` or `REPLACE` in a `CREATE`, an annotation to drop that is not there or to add that is; see [Annotations](annotations.md). ORA-03099, ORA-03076, ORA-03062: something after a column's `ANNOTATIONS`. |
 
 ### Constraints and data
 
