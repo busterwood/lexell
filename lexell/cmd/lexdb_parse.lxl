@@ -7930,7 +7930,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 return p.createRoutine(orReplace, proc)
             }
             if p.graphNext() { return p.createGraph(orReplace) }
-            if p.ora && p.isKw("assertion") { return p.assertStmt("create") }
+            if p.isKw("assertion") { return p.assertStmt("create") }
             // [GLOBAL | LOCAL] {TEMPORARY | TEMP}, or UNLOGGED (a table as any:
             // lexdb's are logged), before TABLE, SEQUENCE or VIEW (9.96)
             var temp = false
@@ -8074,7 +8074,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 return p.dropRoutine(&kw)
             }
             if p.graphNext() { return p.dropGraph() }
-            if p.ora && p.isKw("assertion") { return p.assertStmt("drop") }
+            if p.isKw("assertion") { return p.assertStmt("drop") }
             if p.acceptKw("view") {
                 var v = lexdb_sql.newStmt(S_DROP_VIEW)
                 if p.acceptKw("if") {
@@ -11056,29 +11056,76 @@ fn (p: mut &P) graphTable(join: int): Result[FromItem, lexdb_base.DbErr] {
     return Ok(FromItem{table: "", alias: alias, join: join, on: None, sub: len(p.subs) - 1, cols: cols, work: -1, lateral: false, using: [], natural: false, comma: false})
 }
 
-// ---- Oracle's assertions (design/lexdb-new-features.md O23; lexdb_assert reads the text kept here)
+// ---- assertions (design/lexdb-new-features.md O23 and section 14; lexdb_assert reads the text kept here): Oracle's, and
+// the SQL standard's in the PostgreSQL and T-SQL doors
 
 // CREATE [IF NOT EXISTS] | DROP [IF EXISTS] | ALTER ASSERTION name ...: the name, and the rest of the statement as its text
-// (verb "create", "drop", "alter"). A bind in it is ORA-01027, as Oracle's DDL; CREATE ASSERTION CHECK (...) ORA-00931.
+// (verb "create", "drop", "alter"; ALTER is Oracle's only). A bind in it is ORA-01027, as Oracle's DDL (PostgreSQL's
+// 42P02); CREATE ASSERTION CHECK (...) ORA-00931 (a syntax error elsewhere). T-SQL has no IF NOT EXISTS for CREATE, and
+// its statements need no ";": the text ends after CHECK (...) and the constraint characteristics.
 fn (p: mut &P) assertStmt(verb: &str): Result[Stmt, lexdb_base.DbErr] {
     p.pos += 1
     var s = lexdb_sql.newStmt(lexdb_sql.S_ASSERT)
     s.alias = verb.toStr()
+    s.mdialect = p.md()
     let w = if verb == "create" { "not" } else { "exists" }
-    if verb != "alter" && p.isKw("if") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == w &&
+    if verb != "alter" && !(p.tsql && verb == "create") && p.isKw("if") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == w &&
        (verb != "create" || (p.peekAt(2).kind == T_IDENT && p.peekAt(2).text == "exists")) {
         p.pos += if verb == "create" { 3 } else { 2 }
         s.ifFlag = true
     }
-    if verb == "create" && p.isKw("check") && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(" { return Err(oraErr(931, "missing identifier")) }
+    if verb == "create" && p.isKw("check") && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(" {
+        return Err(if p.ora { oraErr(931, "missing identifier") } else { near(&p.peek()) })
+    }
     s.table = try p.qname()
     s.spell = p.spelled.clone()
     let from = p.peek().at
     let k0 = p.pos
-    p.skipToEnd()
-    for k in k0..p.pos { if p.toks[k].kind == T_PARAM { return Err(oraErr(1027, "bind variables not allowed for data definition operations")) } }
+    if p.tsql { p.assertEnd(verb) } else { p.skipToEnd() }
+    for k in k0..p.pos {
+        if p.toks[k].kind == T_PARAM {
+            if p.ora { return Err(oraErr(1027, "bind variables not allowed for data definition operations")) }
+            return Err(lexdb_base.err("42P02", &("there is no parameter " + p.toks[k].text)))
+        }
+    }
     s.index = p.src[from..p.peek().at].toStr()
     return Ok(s)
+}
+
+// T-SQL: past CHECK (...) and [NOT] DEFERRABLE, INITIALLY IMMEDIATE | DEFERRED (the next statement may follow without ";").
+fn (p: mut &P) assertEnd(verb: &str) {
+    if verb != "create" || !p.acceptKw("check") { return }
+    if !p.isKw("(") { return }
+    var d = 0
+    while p.peek().kind != T_EOF {
+        let t = p.next()
+        if t.kind == T_OP && t.text == "(" { d += 1 }
+        if t.kind == T_OP && t.text == ")" {
+            d -= 1
+            if d == 0 { break }
+        }
+    }
+    while true {
+        if p.isKw("deferrable") || p.isKw("immediate") || p.isKw("deferred") { p.pos += 1 }
+        else if p.isKw("not") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "deferrable" { p.pos += 2 }
+        else if p.isKw("initially") { p.pos += 1 }
+        else { break }
+    }
+}
+
+// An assertion's text as its dialect's tokens (MD_PG, MD_TSQL, MD_ORA: the dialect it was made in).
+pub fn tokensIn(sql: &str, md: int): Result[[]Tok, lexdb_base.DbErr] {
+    if md == MD_ORA { return oraTokens(sql) }
+    return lexIn(sql, Dialect{tsql: md == MD_TSQL, quotedIdent: true})
+}
+
+// A query of an assertion, read as its dialect reads it.
+pub fn parseFor(sql: &str, md: int): Result[[]Stmt, lexdb_base.DbErr] {
+    if md == MD_ORA { return oraParse(sql) }
+    if md == MD_PG { return parse(sql) }
+    var q = try tsqlParser(sql, Dialect{tsql: true, quotedIdent: true}, &[])
+    let st = try q.statement()
+    return Ok([st])
 }
 
 // Oracle's SQL text as its tokens (lexdb_graph reads a graph's definition and GRAPH_TABLE's text with them).

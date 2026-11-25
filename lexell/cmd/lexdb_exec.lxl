@@ -4182,6 +4182,7 @@ fn truncate(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             txn.dropTree(oi)
         }
         try putTable(txn, &t)
+        lexdb_assert.truncated(txn, &t, s.mdialect)     // (O23)
         for d in seqs { if d.ownerT == t.name { try setVal(st, &d, d.start, false) } }
     }
     try bumpKeys(st, txn, &keys)
@@ -5264,7 +5265,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 }
                 return Err(e("42703", &("column \"" + a.name + "\" of relation \"" + rel + "\" does not exist")))
             }
-            try lexdb_assert.colChange(st, txn, &t, &a.name)
+            try lexdb_assert.colChange(st, txn, mut &t, &a.name, s.mdialect, true, a.cascade)
             // SQL Server refuses the drop of a column a CHECK reads, Oracle one a multi-column CHECK reads (PostgreSQL drops them)
             match lexdb_conerr.checkDropErr(&t.checks, &a.name, s.mdialect) {
                 Some(x) { return Err(x) }
@@ -5309,7 +5310,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             }
             // its key's index keeps its name, as PostgreSQL's
             if lexdb_catalog.hasPk(&t) && len(t.pkName) == 0 { t.pkName = lexdb_catalog.pkConName(&t) }
-            try lexdb_assert.renamed(&t)
+            try lexdb_assert.renamed(st, txn, &t, s.mdialect)
             lexdb_nnalter.beforeRenameTable(mut &t)
             txn.del(lexdb_catalog.CATALOG, &t.name)
             let old = t.name.clone()
@@ -5336,7 +5337,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                     return Err(e(if s.mdialect == lexdb_sql.MD_ORA { "ORA00957" } else { "42701" },
                                  &("column \"" + a.to + "\" of relation \"" + rel + "\" already exists")))
                 }
-                try lexdb_assert.colChange(st, txn, &t, &a.name)
+                try lexdb_assert.colChange(st, txn, mut &t, &a.name, s.mdialect, false, false)
                 lexdb_nnalter.renameColumn(mut &t, &a.name, &a.to)
                 lexdb_annot.renameColumn(mut &t.invalid, &a.name, &a.to)
                 t.cols[i].name = a.to.clone()
@@ -5477,6 +5478,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         if s.mdialect != lexdb_sql.MD_TSQL && (try fkUses(st, txn, &t, &a.name)) {
             return Err(e("0A000", &("lexdb: column \"" + a.name + "\" is in a foreign key, so its type cannot be changed (drop the constraint first)")))
         }
+        if s.mdialect == lexdb_sql.MD_ORA { try lexdb_assert.colChange(st, txn, mut &t, &a.name, s.mdialect, false, false) }     // (Oracle's ORA-08702, O23)
         if s.mdialect == lexdb_sql.MD_ORA { try oracleModify(st, txn, &t, i, &a.col.typ) }
         if s.mdialect == lexdb_sql.MD_PG && a.using.isNone() && !autoCast(&t.cols[i].typ, &a.col.typ) {
             return Err(e("42804", &("column \"" + a.name + "\" cannot be cast automatically to type " + lexdb_sql.typeText(&a.col.typ) +
@@ -5541,6 +5543,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
         if c >= 0 { append(mut &rw.fills, c) }
     }
     if retyped || rw.rekey || len(rw.fills) > 0 {
+        if retyped { lexdb_assert.retyped(txn, &t) }        // (O23)
         let rr = rewrite(st, txn, mut &t, &changes, &rw, lim)
         let n = match rr {
             Ok(x) { x }
@@ -7635,7 +7638,6 @@ fn batchDml(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     if len(s.items) > 0 { return Err(e("0A000", &("lexdb: " + what + " with batch_rows cannot return rows (RETURNING, OUTPUT)"))) }
     if len(s.from) > 0 { return Err(e("0A000", &("lexdb: " + what + " with batch_rows cannot join (" + (if del { "USING" } else { "FROM" }) + ")"))) }
     if s.limit.isSome() { return Err(e("0A000", &("lexdb: " + what + " with batch_rows cannot have TOP"))) }
-    try lexdb_assert.noBatch(st, txn, &s.table)
     var win = noWin()
     win.n = s.copy.batchRows
     win.first = true
@@ -7658,6 +7660,7 @@ fn batchDml(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         }
         if BATCH_HOOK.isSet() { BATCH_HOOK.get()[0](st.handle(), BATCH_RUNS) }
         win.first = false
+        match lexdb_assert.stmtEnd(st, txn, true, s, &assertUp(st, txn.sql.sess, lim)) { Ok(_) {} Err(x) { return Err(batchFail(x, total, &what, win.n)) } }   // (each batch's own check, O23)
         let fresh = freshTxn(txn)
         let done = replace(txn, fresh)
         match st.commit(done) {
@@ -12685,6 +12688,9 @@ fn (s: mut &Session) restore() {
 }
 
 // The limits for a statement starting now.
+// The TNS door's array DML: the assertions' checks held over its runs (on), then made for them all (lexdb_assert.hold).
+pub fn (s: mut &Session) holdAsserts(on: bool, stmt: &lexdb_sql.Stmt): Result[bool, DbErr] { return if len(s.txn) == 0 { Ok(false) } else { lexdb_assert.hold(&s.st, mut &s.txn[0], on, stmt, &assertUp(&s.st, s.id, s.limits())) } }
+
 fn (s: &Session) limits(): Limits {
     // (without a timeout the word is the session's number as it is, kept in dword: lexdb_pipe.deadlineWord)
     var dl = s.dword
@@ -13046,7 +13052,8 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
 }
 
 // Oracle's assertions' checks (lexdb_assert, O23): a query's rows counted in the transaction, with the statement's limits.
-fn assertUp(st: &lexdb_store.Store, sess: int, lim: Limits): lexdb_assert.Up { return lexdb_assert.Up{rows: assertRows, bump: bumpCatalog, batch: lim.batch, deadline: lim.deadline, ora: st.memo.get(&lexdb_priv.doorKey(sess)).unwrapOr("") == "tns"} }
+fn assertUp(st: &lexdb_store.Store, sess: int, lim: Limits): lexdb_assert.Up { return lexdb_assert.Up{rows: assertRows, bump: bumpCatalog, batch: lim.batch, deadline: lim.deadline, door: doorMd(st, sess)} }
+fn doorMd(st: &lexdb_store.Store, sess: int): int { let d = lexdb_priv.doorOf(st, sess); return if d == "tns" { lexdb_sql.MD_ORA } else if d == "tds" { lexdb_sql.MD_TSQL } else { lexdb_sql.MD_PG } }
 fn assertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &lexdb_sql.Stmt, up: &lexdb_assert.Up): Result[int, DbErr] {
     var pc = oneShot()
     return Ok(len((try execIn(st, txn, q, &[], &[], Limits{rounds: MAX_RECURSION, steps: MAX_MATCH_STEPS, mem: txn.sql.memMax, deadline: up.deadline, batch: up.batch, rules: txn.sql.rules, auto: false, rdel: true}, mut &pc, &noInput(), noOut, noPull, noSink)).rows))
@@ -14047,7 +14054,7 @@ fn fkTables(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, parent
             var seen = false
             for x in written { if x == ck { seen = true } }
             if acts && !seen {
-                lexdb_assert.note(txn, &out[ci], true)
+                lexdb_assert.noteKid(txn, &out[ci])
                 append(mut &written, ck.clone())
                 for r in refs { let ri = try loadTab(st, txn, mut &out, &r) }
             }
@@ -14338,7 +14345,7 @@ fn setConstraints(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, stmt: &lexd
         return Ok(Unit{})
     }
     for n in stmt.names {
-        if try lexdb_assert.setCons(st, txn, &n, deferred) { continue }
+        if try lexdb_assert.setCons(st, txn, &n, deferred, doorMd(st, txn.sql.sess)) { continue }
         var found = false
         var deferrable = true
         for t in try allTables(st, txn) {
@@ -14601,7 +14608,7 @@ fn dropNeeded(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, 
 // cascade their foreign keys dropped), and those it references no longer
 // naming it.
 fn unlinkTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cascade: bool): Result[Unit, DbErr] {
-    try lexdb_assert.unlink(st, txn, t, cascade)    // (its assertions: O23)
+    try lexdb_assert.unlink(st, txn, t, cascade, doorMd(st, txn.sql.sess))    // (its assertions: O23)
     var k = 0
     while k < len(t.fks) {
         if t.fks[k].ref == t.name { try dropOwnFk(st, txn, t, k) } else { k += 1 }
@@ -15896,7 +15903,6 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     if batch > 0 && txn.inBlock() {
         return Err(e("25001", "lexdb: COPY with batch_rows cannot run inside a transaction block"))
     }
-    if batch > 0 { try lexdb_assert.noBatch(st, txn, &t.name) }
     // its identity columns take the values given (as OVERRIDING SYSTEM VALUE)
     let defs = try defaultsOf(st, txn, &t)
     let fw = try fkTables(st, txn, &t, true, false)
@@ -16058,7 +16064,9 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             try fkFinish(st, txn, &fw, mut &later)
             later = []
             noUp.fk.forget()
+            match lexdb_assert.stmtEnd(st, txn, true, s, &assertUp(st, txn.sql.sess, lim)) { Ok(_) {} Err(x) { return Err(within(x, &(where + rd.line.toStr() + " (" + (count - batch).toStr() + " rows committed before)"))) } }
             let done = replace(txn, freshTxn(txn))
+            lexdb_assert.note(txn, &t, false)       // (the next batch's check, O23)
             match st.commit(done) {
                 Ok(_) {}
                 Err(x) { return Err(within(x, &(where + rd.line.toStr() + " (" + (count - batch).toStr() + " rows committed before)"))) }
@@ -16103,7 +16111,7 @@ fn fastCopyPlan(t: &Table, targets: &[]int, s: &lexdb_sql.Stmt): Option[FastCopy
     if s.copy.csv || s.copy.header || s.copy.bulk() || s.copy.batchRows > 0 || s.copy.onErr() > 0 { return None }
     if s.copy.delim != "\t" || s.copy.null != "\\N" { return None }
     if len(s.copy.forceNotNull) > 0 || len(s.copy.forceNull) > 0 || len(s.copy.forceQuote) > 0 || s.copy.quoteAll { return None }
-    if len(t.view) > 0 || len(t.slots) != 0 || len(t.checks) != 0 || len(t.fks) != 0 { return None }
+    if len(t.view) > 0 || len(t.slots) != 0 || len(t.checks) != 0 || len(t.fks) != 0 || lexdb_assert.marked(&t.refBy) { return None }
     // (a unique index's clash is an error at its row, before a later row's: the generic path)
     var ixs: []int = []
     for i in 0..len(t.indexes) {

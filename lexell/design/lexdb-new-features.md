@@ -9,7 +9,8 @@ and 271ca36e): 6.1's items 6 and 7, the missing scalar functions and aggregates,
 (later, commits 96be5d41, 4e1cf747, 269cfa25): a panic that ended the server, and 6.2's items 3 (IGNORE NULLS) and 5 (ON
 CONFLICT DO SELECT) built; items 4 (QUALIFY) and 6 (unenforced constraints) planned. Section 10.8 (later, commits 443310eb and fe8daf59): QUALIFY and the
 unenforced constraints built, marked *works* with the commit. Section 13 (later, 2026-11-25): SQL/PGQ in the Oracle door (O22, 6.3 item 1) built.
-Section 14 (later, 2026-11-25): Oracle's assertions (O23, 6.3 item 2) built.
+Section 14 (later, 2026-11-25): Oracle's assertions (O23, 6.3 item 2) built; 14.1: the standard's in the PostgreSQL and T-SQL doors (P24,
+S27, extensions), and every write path checked.
 
 **What was audited.** The SQL a user of each product's newest release would reach for: PostgreSQL 19 (and 18, and
 older features met on the way), SQL Server 2025 (compatibility level 170) with 2022's additions, Oracle AI Database 26ai
@@ -73,6 +74,7 @@ Checked on 19.0 unless marked. "P18" etc.: the release that added it.
 | P21 | `x IS DISTINCT FROM y` in a select list | column named `?column?` | as PostgreSQL (was `distinct`) | works (91781b58) | S | | lexdb_bind `exprName` |
 | P22 | `0x1F`, `0o17`, `0b101`, `1_000` (P16) | 31, 15, 5, 1000 | as PostgreSQL 16: the literals (of any length: past int8 a numeric), `_` between digits, a number running into a name 42601 ("trailing junk"), a text constant cast to an integer or numeric (`'0x1F'::int`, `'1_000'::bigint`; not a text column's value: below) | works (91781b58) | S | T-SQL `0x..` stays T-SQL's; Oracle has neither: `1_000` is ORA-00911 there now (was `1` aliased `_000`), `0x1F` is 0 aliased X1F as Oracle's | lexdb_parse lexer |
 | P23 | met on the way, older: `CREATE DOMAIN` (lexdb-gaps.md 2.2), `WITH v (x) AS (VALUES ...)`, `bit_and`/`bit_or` aggregates, `any_value` (P16), `date_bin` (P14), `unistr` (P14), `date_add`/`date_subtract` (P16), `trim_array` (P14), `array_shuffle`/`array_sample` (P16), `bit_count` (P14), `erf`/`erfc` (P16), `pg_input_is_valid`/`pg_input_error_info` (P16), `to_bin`/`to_oct` (P17) | | `WITH v (x) AS (VALUES ...)` as PostgreSQL (ec3c5c17); bit_and, bit_or, bit_xor, any_value, date_bin, unistr (f8c07339) and date_add, date_subtract, trim_array, array_shuffle, array_sample, bit_count(bytea), erf, erfc, to_bin, to_oct (271ca36e) as PostgreSQL; CREATE DOMAIN 0A000, pg_input_is_valid / _error_info 42883 still | works / missing (CREATE DOMAIN, pg_input_*) | S each but CREATE DOMAIN (L, with O11) | `unistr`: S16/O27 (works); `date_bin`: S13/O12 (works); `any_value`: O18 (works); `bit_and`: O17 (works); domains: O11 | lexdb_newfn, lexdb_agg, lexdb_parse |
+| P24 | the SQL standard's `CREATE ASSERTION` (ISO/IEC 9075-2, 11.47); PostgreSQL has none (an extension, not counted) | | CREATE [IF NOT EXISTS] / DROP [IF EXISTS] ASSERTION, [NOT] DEFERRABLE, INITIALLY IMMEDIATE / DEFERRED, SET CONSTRAINTS; 23514 at the statement and at COMMIT; the refusals 0A000; 2BP01 for DROP TABLE / COLUMN (CASCADE drops it); information_schema.ASSERTIONS, CHECK_CONSTRAINTS (was 42601 at `assertion`) (section 14.1) | works (7a22e3c3) | (O23) | Oracle O23, T-SQL S27 | lexdb_assert, lexdb_parse `assertStmt`, lexdb_pg |
 
 ## 2. SQL Server 2025 (compatibility level 170) and 2022
 
@@ -106,6 +108,7 @@ Checked on 2025 RTM-CU10 at level 170 unless marked 2022.
 | S24 | an unknown function over no rows | 195 when the batch is compiled | 42883 / 195 / ORA-00904 when the statement is bound, over no rows too (91781b58) | works | S | all doors | lexdb_bind `knownCall`, lexdb_lib `entryOf`'s misses |
 | S25 | DATEADD of a string literal | a `datetime` (`2020-01-03 00:00:00.000`) | as SQL Server; DATEADD's type is its date's (datetime, smalldatetime, datetime2) (91781b58) | works | S | | lexdb_parse `tsqlCall`, lexdb_exec `exprScale` |
 | S26 | TDS 8.0 strict encryption (`Encrypt=Strict`: TLS before PRELOGIN, ALPN `tds/8.0`) | 2025 supports it for every component | lexdb speaks TDS 7.4 with TLS inside PRELOGIN (not tried with a strict client) | note only | M: the TLS-first path exists for TCPS (lexdb_tns), the handshake order is the work | | lexdb_tds |
+| S27 | the SQL standard's `CREATE ASSERTION`; SQL Server has none (an extension, not counted) | | CREATE / DROP [IF EXISTS] ASSERTION, deferral and SET CONSTRAINTS (lexdb's statement), 547 naming the assertion (COMMIT TRANSACTION for a deferred one, the transaction rolled back), 2714, 3701, 5074, 15336, 3729, the refusals 50000; INFORMATION_SCHEMA.ASSERTIONS, no sys.objects row (was 102) (section 14.1) | works (7a22e3c3, 4710980c) | (O23) | Oracle O23, PostgreSQL P24 | lexdb_assert, lexdb_parse `assertStmt`, lexdb_tsql |
 
 ## 3. Oracle AI Database 26ai (23.26.3) and 23ai
 
@@ -159,7 +162,8 @@ Before the fixes of section 7 (the audit as run): PostgreSQL 2 / 4 / 1 / 16; SQL
 section 7, before section 8: PostgreSQL 7 / 0 / 0 / 16; SQL Server 14 / 0 / 0 / 13; Oracle 10 / 2 / 1 / 26. After section 8,
 before section 9: PostgreSQL 11 / 0 / 0 / 14; SQL Server 15 / 0 / 0 / 11; Oracle 14 / 2 / 1 / 18. After section 9, before
 section 10: PostgreSQL 16 / 0 / 0 / 11; SQL Server 21 / 0 / 0 / 5; Oracle 20 / 1 / 1 / 10. After section 10.8: PostgreSQL 19 / 0 / 0 / 8; SQL Server 23 / 0 / 0 / 3; Oracle 24 / 1 / 0 / 7.
-After sections 12-14 (annotations, property graphs, assertions): Oracle 27 / 1 / 0 / 4.
+After sections 12-14 (annotations, property graphs, assertions): Oracle 27 / 1 / 0 / 4. P24 and S27 (14.1) are extensions: neither
+product has assertions, so they are not counted.
 
 ## 5. IS [NOT] DISTINCT FROM in the T-SQL door: the test
 
@@ -1263,3 +1267,102 @@ Planted: no whole query after a DELETE from a NOT EXISTS's table (exec_assert: s
 - Quoted names are matched folded (L6: `"xd"` is shown XD); the check reads the tables with the session's rights (not the owner's); TRUNCATE of an EXISTS
   assertion's table is not checked; ALTER TABLE ... MODIFY of a column it reads is not refused; SET CONSTRAINT of no such name is ORA-02443 (Oracle
   ORA-02448).
+
+### 14.1 The PostgreSQL and T-SQL doors, and every write path (as built, 2026-11-25)
+
+Branch from main `ad2ff242`; commits `7a22e3c3` (the doors, the write paths), `fb2caab0` (`pg_assert`), `4710980c` (`tds_assert`, XACT_ABORT at
+COMMIT), `625664c7` (three doors, Oracle's array DML, MODIFY), `bf84c8a6` (`replica.py`), `e06e56fb` (temporary tables), `858ce266` (many rows
+by key). Neither PostgreSQL nor SQL Server has assertions: the form is the SQL standard's (ISO/IEC 9075-2, 11.47 <assertion definition>, 10.8
+<constraint characteristics>, 17.4 SET CONSTRAINTS), the errors in each product's conventions for its own constraints. The answers of `pg_assert`
+and `tds_assert` are lexdb's own (each test's header says so); Oracle's were checked again on Oracle Free 23.26.3, SQL Server's texts for 3729,
+5074 and 15336 on SQL Server 2022 (a schema-bound view and a CHECK in their place).
+
+**Syntax.** `CREATE ASSERTION [IF NOT EXISTS] [schema.]name CHECK (NOT EXISTS (q) | EXISTS (q) | ALL (q) SATISFY (c)) [[NOT] DEFERRABLE]
+[INITIALLY IMMEDIATE | DEFERRED]` (each once, any order; INITIALLY DEFERRED alone is DEFERRABLE, as PostgreSQL's constraints), `DROP ASSERTION
+[IF EXISTS] name` (no CASCADE / RESTRICT: the standard's has none), `SET CONSTRAINTS name, ... | ALL DEFERRED | IMMEDIATE`. T-SQL takes the same
+(the coordinator's change: deferral too), without IF NOT EXISTS (T-SQL has none for CREATE); its statement ends after CHECK (...) and the
+characteristics (no `;` needed). No ALTER ASSERTION outside Oracle's door (the standard has none). The parser keeps the text and the dialect it
+was made in (a new last field of the catalog row; rows made before are Oracle's), and the check reads the query with that dialect's parser
+whichever door writes: an assertion made in one door is enforced for every door's writes and listed in every door's catalog.
+
+**Errors (PostgreSQL / T-SQL).** Syntax 42601 at the word (T-SQL's door gives it as 102 or 156); `constraint declared INITIALLY DEFERRED must be
+DEFERRABLE`, `multiple DEFERRABLE/NOT DEFERRABLE clauses not allowed`, `multiple INITIALLY IMMEDIATE/DEFERRED clauses not allowed` (PostgreSQL's
+texts for a table constraint; T-SQL 102 with them). The refused shapes, Oracle's rules (the delta check needs them): 0A000 `assertion's query is
+not supported: <reason>` / T-SQL 50000 `Cannot create assertion 'a': its query is not supported: <reason>.` (50000 is the door's number for
+lexdb's own errors; a real SQL Server number such as 1046 would tell a client something else); the reasons: aggregates, GROUP BY or HAVING; a
+subquery under OR; a condition other than one [NOT] EXISTS / ALL ... SATISFY (two ANDed, a set operation, `CHECK (1 = 1)`, a scalar subquery
+compared); FETCH FIRST, LIMIT, OFFSET or TOP; a function the rows do not decide (now, random, current_user, nextval, getdate, newid, ...); a
+window function; no table (no FROM, VALUES); a view, a function in FROM or WITH; JOIN syntax (the join in WHERE); another subquery; an equijoin of
+columns that may be NULL; a session's temporary table (0A000 in every door: it goes with its session). ORDER BY in the query is allowed outside
+Oracle's door. A violation: 23514 `assertion "a" is violated` / 547 `The INSERT statement conflicted with the assertion "a". The conflict occurred
+in database "lexdb", table "dbo.t".` (severity 16; the statement's word, the table written; the statement ended, the transaction kept, as for a
+CHECK's 547; XACT_ABORT ON rolls back; TRY ... CATCH catches it); the rows there at CREATE 23514 `... is violated by some row` / 547 naming
+CREATE ASSERTION. A deferred one at COMMIT: 23514 / 547 naming COMMIT TRANSACTION, the transaction rolled back (@@TRANCOUNT 0; with XACT_ABORT
+ON the batch ends there too); at SET CONSTRAINTS ... IMMEDIATE: the same naming SET CONSTRAINTS, the transaction kept. A name taken: an
+assertion's 42710 `assertion "a" already exists`, a relation's 42P07 (they share the relation namespace) / 2714 either way; DROP of none 42704 /
+3701; a schema not there 3F000 / 2760; SET CONSTRAINTS ... DEFERRED of one not deferrable 42809 (T-SQL 50000). DDL on a table one reads: DROP
+TABLE 2BP01 `cannot drop table t because other objects depend on it` (DETAIL `assertion a depends on table t`, the CASCADE hint), CASCADE drops
+it / 3729 `Cannot DROP TABLE 'dbo.t' because it is being referenced by object 'a'.`; DROP COLUMN of a column read 2BP01 (CASCADE drops it) /
+5074 `The object 'a' is dependent on column 'c'.`; RENAME of the table or a read column 0A000 (its text names them; PostgreSQL renames follow
+dependents, lexdb's stored text cannot) / sp_rename 15336 `... cannot be renamed because the object participates in enforced dependencies.`
+
+**Catalog.** information_schema.ASSERTIONS (the standard's view; PostgreSQL has none): constraint_catalog, constraint_schema, constraint_name,
+is_deferrable, initially_deferred; the standard's CHECK_CONSTRAINTS row (check_clause: the search condition as written) and
+CONSTRAINT_COLUMN_USAGE rows (the columns it reads). The T-SQL door's INFORMATION_SCHEMA is the same views (schema `public` as its other rows
+show it). No pg_constraint row: PostgreSQL keeps none for assertions, every contype row has a conrelid or contypid that clients join (psql's
+`\d` lists by conrelid, pgjdbc's metadata by contype p/u/f), and a row of neither would be a constraint of nothing; psql's `\d` of an asserted
+table works (relhastriggers is true, pg_trigger empty). No sys.objects row (SQL Server has no type for one; a made-up type would be listed by
+SSMS's Object Explorer and sp_help under nothing): SSMS, sqlcmd's `sp_help` and mssql-jdbc's DatabaseMetaData see none, INFORMATION_SCHEMA has
+it, OBJECT_ID('a') is NULL. Oracle's views name a public-schema assertion's owner as they name public's tables (the user, or SYS for a user with
+a schema of its own), whichever door made it.
+
+**The write paths** (what each did before this branch, on `ad2ff242`; what it does now; the test):
+
+| Path | Door | Before | Now | Test |
+|---|---|---|---|---|
+| INSERT, UPDATE, DELETE, MERGE, INSERT ... SELECT | all | checked (fkTables notes the table) | checked; errors per door | pg_assert, tds_assert, tns_assert |
+| INSERT ... ON CONFLICT DO UPDATE / NOTHING | PG | checked | checked | pg_assert |
+| a procedure's or PL/SQL block's statements | all | checked at each statement's end (a CALL's, an EXEC's in its block) | the same; a T-SQL procedure's 547 ends that statement only | pg_assert, tds_assert, tns_assert |
+| FK ON DELETE CASCADE / SET NULL / SET DEFAULT | all | checked | checked | pg_assert, tds_assert |
+| FK ON UPDATE CASCADE / SET DEFAULT | all | **not checked** when the UPDATE's own SET columns were not read by the assertion (the statement's SET was applied to the child) | checked (a child's note says any column) | pg_assert |
+| COPY FROM STDIN, text and CSV, HEADER | PG | checked, but COPY's fast path (empty table, own statement) wrote rows the check could not read: **not checked** | the fast path not taken for an asserted table; checked as one statement (a violation undoes it) | pg_assert |
+| COPY ON_ERROR ignore, REJECT_LIMIT | PG | as COPY | the rows skipped are not put, not counted | pg_assert |
+| COPY binary, COPY FROM json | PG | not supported (0A000) | the same | |
+| COPY into a FK child | PG | checked | checked; an insert fires no action, so no cascade writes another table | pg_assert |
+| UPDATE / DELETE / COPY WITH (batch_rows n) | PG, T-SQL | refused (0A000) | each batch checked before it commits; a failure in batch k: batches 1..k-1 stay committed (each left the assertion true), batch k undone, the error's context says how many rows were committed | pg_assert |
+| TRUNCATE | PG, T-SQL | not checked | the whole query (an EXISTS's or a NOT EXISTS's table may break it) | pg_assert, tds_assert |
+| TRUNCATE | Oracle | not checked (Oracle does not) | the same | tns_assert |
+| ALTER TABLE ... TYPE (values cast) | PG, T-SQL | not checked | the whole query at the statement's end (SQL Server refuses ALTER COLUMN of a column a CHECK reads, 5074: lexdb checks instead) | pg_assert |
+| ALTER TABLE ... MODIFY of a column read | Oracle | not refused | ORA-08702, as Oracle 23.26.3 | tns_assert |
+| ALTER TABLE ADD COLUMN (with a default) | all | nothing to check (no assertion reads a new column) | the same | pg_assert |
+| TDS bulk load (INSERT BULK + rows: bcp, SqlBulkCopy) | T-SQL | checked | checked with or without CHECK_CONSTRAINTS (SQL Server skips CHECKs without it; an assertion has no untrusted state); in a transaction the load alone undone | tds_assert |
+| BULK INSERT from a file, INSERT ALL / FIRST | | not in lexdb | | |
+| table variable / TVP into INSERT ... SELECT, INSERT ... EXEC | T-SQL | checked | checked | tds_assert |
+| OUTPUT ... INTO an asserted table | T-SQL | checked | checked (the INTO's insert; 547 names INSERT) | tds_assert |
+| SELECT ... INTO, CREATE TABLE AS | all | a new table: nothing to check | the same | tds_assert, pg_assert |
+| array DML (executemany, executeBatch) | Oracle | each run checked: a violating row a batch error, the others kept | one check after the last run, as Oracle 23.26.3: ORA-08601 fails the call, every run undone, batch errors or not | python-oracledb by hand against lexdb and Oracle Free (no client in lib/ sends array DML) |
+| a deferred one under array DML | Oracle | at COMMIT | at COMMIT (ORA-02091), as Oracle | by hand |
+| a replica applying the log, WAL replay at restart | all | no check | no check (the store applies records); `replica.py`: rows breaking a disabled assertion reach the replica | replica.py |
+| triggers, PL/pgSQL | | not in lexdb | | |
+
+**Many rows.** Past 64 rows put to a table that is one instance of the query, the check was the whole query; the store reads a table whose rows
+are the transaction's own writes again from each batch's start (`Txn.ownRange`), so a 1,000,000-row COPY into an asserted table took 113 s. Now
+the query runs with that instance restricted to the rows put, `key IN (...)` 4,096 keys at a time, under the assertion's exclusive lock (not a
+lock per join-key value): 1.8 s. A table read by two instances (a self-join) keeps the whole query.
+
+**Cost** (base `ad2ff242`, branch, both `-O`, trees at paths of equal length): in process (`LXL_HASH_SEED=1`, two rounds) prepared point select
+31,436.2 -> 31,436.2, INSERT 217,515.1 / 217,515.1 -> 217,515.0 / 217,515.0, UPDATE by key 201,362.8 -> 201,362.7 / 201,362.8; as text select
+111,072.8, INSERT 241,012.6, UPDATE 228,836.4 both; in a block (one BEGIN, 20,000 prepared statements) INSERT 50,356.3, UPDATE 85,269.9 both
+(the final build; the builds before it the same). Over the wire (`icount6.sh`, alternated twice) instructions 160,786 / 160,796 -> 160,782 /
+160,869, cycles 88,852 / 88,053 -> 87,071 / 87,150, L1 i-cache misses 298.8 / 298.0 -> 295.8 / 293.8 (an earlier build of the branch: 390 / 388,
+placement). COPY of
+1,000,000 rows into an unasserted table (in process, ms): base 469, 476, 546, 456, 460, 469, 540; branch 471, 512, 532, 490, 459, 531, 452;
+instructions 11,645,674,746 -> 11,645,673,875. Into an asserted table: one table 1,762 / 1,755 ms, a join with a 1,000-row table 2,143 / 2,117;
+a TDS bulk load of 100,000 rows 101 / 108 (base) and 97 / 99 ms unasserted, 186 / 174 ms asserted. TPC-H SF1 (lexdb only, base and branch alternated twice, the best of each): 8,147 -> 8,009 ms in all, checksums equal on all 22, no
+query 1.5% slower (q19 36.3 -> 36.7 ms, q5 155.4 -> 156.5: 1.1%, 0.7%); the data was loaded once, by the base (the COPY timings above are the
+load's). lexdb_exec 21,550 -> 21,558
+lines (assertUp's door, doorMd, holdAsserts; the batch checks in batchDml and COPY; truncated, retyped, MODIFY's check; the rest moved calls).
+
+**Left.** The T-SQL door's INFORMATION_SCHEMA shows `public` for dbo, as its other rows do. Oracle's array DML is checked only by hand (no
+lib/ client sends it). A huge UPDATE or DELETE of a table under a NOT EXISTS's inner query (rows going) still runs the whole query, which reads
+the transaction's own writes slowly (the store's `ownRange`, above). A rename in the PostgreSQL door is refused rather than followed.

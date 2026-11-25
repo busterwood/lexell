@@ -32,7 +32,12 @@ by many checkpoints. Through psql:
   the replica's USER_ASSERTIONS the master's, CREATE ASSERTION there ORA-16000, a row that
   breaks one refused on the master (ORA-08601); the one made just before the master is
   killed is there after its log is replayed and still checked, and so are all after the
-  clean close (an assertion's name taken for a table's again: ORA-00955).
+  clean close (an assertion's name taken for a table's again: ORA-00955). One made in the
+  PostgreSQL door and one in the T-SQL door (deferred) are the replica's too (its
+  information_schema.ASSERTIONS the master's), checked on the master in their doors every round
+  and after the restarts; rows that break av_pos written while it is disabled (Oracle's ALTER
+  ASSERTION ... DISABLE, then ENABLE NOVALIDATE) reach the replica: a replica applies the log and
+  never checks an assertion.
 
 Then the supervised form, lexdb DATADIR ADDR --replicas 2 --tds ... --tns ...: both replicas
 answer on the replicas' port, and on the TDS and TNS ports one above the master's
@@ -397,10 +402,11 @@ def main():
     if r.returncode != 0:
         sys.exit('replica.py: building doorsql failed:\n' + r.stdout + r.stderr)
     data = os.path.join(work, 'data')
-    mport, rport, rtds, rtns, mtns = free_port(), free_port(), free_port(), free_port(), free_port()
+    mport, rport, rtds, rtns, mtns, mtds = free_port(), free_port(), free_port(), free_port(), free_port(), free_port()
     env = dict(os.environ, LEXDB_CACHE_MB='4', LEXDB_SEG_KB='1024', LEXDB_CKPT_KB='512')
     # (the master's Oracle door: the annotations, design/lexdb-new-features.md 8.5, made there)
-    master = Proc([exe, data, '127.0.0.1:%d' % mport, '--tns', '127.0.0.1:%d' % mtns], [mport, mtns], os.path.join(work, 'master.log'), env)
+    master = Proc([exe, data, '127.0.0.1:%d' % mport, '--tns', '127.0.0.1:%d' % mtns, '--tds', '127.0.0.1:%d' % mtds], [mport, mtns, mtds],
+                  os.path.join(work, 'master.log'), env)
     # the replica serves the SQL Server and Oracle doors too (9.137)
     replica = Proc([exe, '--replica', data, '127.0.0.1:%d' % rport, '--tds', '127.0.0.1:%d' % rtds, '--tns', '127.0.0.1:%d' % rtns],
                    [rport, rtds, rtns], os.path.join(work, 'replica.log'), env)
@@ -479,6 +485,28 @@ def main():
         if not w.startswith('error 8601:'):
             fail('round %d: a row breaking an assertion on the master: %s' % (rnd, w))
 
+    # the assertions made in the PostgreSQL door (pg_av) and the T-SQL door (ts_av, deferred: checked at a statement's end on its
+    # own) checked on the master in their doors, and the replica's information_schema.ASSERTIONS the master's
+    ISQ = 'select constraint_schema, constraint_name, is_deferrable, initially_deferred from information_schema.assertions order by 2'
+    def doors_asserted(rnd):
+        w = psql(mport, 'insert into sa.av values (%d, 555)' % (200000 + rnd), check=False)
+        if 'assertion "pg_av" is violated' not in w.stderr:
+            fail('round %d: a row breaking pg_av on the master: %s %s' % (rnd, w.stdout, w.stderr))
+        w = door('tds', mtds, 'insert into sa.av values (%d, 666)' % (200000 + rnd))
+        if not w.startswith('error 547:') or 'ts_av' not in w:
+            fail('round %d: a row breaking ts_av on the master: %s' % (rnd, w))
+        want = psql(mport, ISQ).stdout
+        if 'pg_av' not in want or 'ts_av' not in want:
+            fail('round %d: the master lost pg_av or ts_av: %s' % (rnd, want))
+        end = time.time() + 10
+        got = None
+        while time.time() < end:
+            got = psql(rport, ISQ, check=False).stdout
+            if got == want:
+                return
+            time.sleep(0.05)
+        fail('round %d: the replica\'s information_schema.assertions is not the master\'s:\n  master  %s\n  replica %s' % (rnd, want, got))
+
     master.start()
     if not master.ready():
         fail('the master did not start')
@@ -486,6 +514,12 @@ def main():
         w = door('tns', mtns, q)
         if not w.startswith('ok'):
             fail('the assertion was not made: %s: %s' % (q, w))
+    w = psql(mport, 'create assertion pg_av check (not exists (select 1 from sa.av where v = 555))', check=False)
+    if w.returncode != 0:
+        fail('pg_av was not made: ' + w.stderr)
+    w = door('tds', mtds, 'create assertion ts_av check (not exists (select 1 from sa.av where v = 666)) deferrable initially deferred')
+    if not w.startswith('ok'):
+        fail('ts_av was not made: ' + w)
     w = door('tns', mtns, "create table an (id number primary key annotations (Display 'Id'), v number annotations (Hidden)) annotations (Note 'n')")
     if not w.startswith('ok'):
         fail('the annotated table was not made: ' + w)
@@ -505,6 +539,20 @@ def main():
     if not replica.ready():
         fail('the replica did not start')
     caught_up(0)
+    # rows that break av_pos, written while it is disabled: in the log, applied by the replica (no assertion is checked there)
+    for q in ['alter assertion av_pos disable', 'insert into av values (300000, -5)', 'alter assertion av_pos enable novalidate']:
+        w = door('tns', mtns, q)
+        if not w.startswith('ok'):
+            fail('%s: %s' % (q, w))
+    end = time.time() + 10
+    got = None
+    while time.time() < end:
+        got = door('tns', rtns, 'select count(*) from av where v = -5')
+        if got == '1':
+            break
+        time.sleep(0.05)
+    if got != '1':
+        fail('the replica did not apply a row breaking a disabled assertion: ' + str(got))
     refused = 0
     for rnd in range(1, a.rounds + 1):
         sql = writes(rng, rnd)
@@ -546,6 +594,7 @@ def main():
         asserts_same(rnd)
         asserted(rnd)
         asserted(rnd, 1000 + rnd)
+        doors_asserted(rnd)
         w = door('tns', rtns, 'create assertion on_replica check (not exists (select 1 from av where v = 0))')
         if not w.startswith('error 16000:'):
             fail('round %d: CREATE ASSERTION on the replica: %s' % (rnd, w))
@@ -599,6 +648,7 @@ def main():
             graphs_same(rnd, 'BEFORE_KILL')
             asserts_same(rnd, 'BEFORE_KILL_A')
             asserted(rnd, 77777)
+            doors_asserted(rnd)
     gt_before = door('tns', mtns, GTQ)
     code = master.stop()
     if code != 0:
@@ -625,6 +675,12 @@ def main():
         fail('the assertions after a clean close: ' + got)
     asserted(a.rounds + 1)
     asserted(a.rounds + 1, 77777)
+    w = psql(mport, 'insert into sa.av values (400001, 555)', check=False)
+    if 'assertion "pg_av" is violated' not in w.stderr:
+        fail('pg_av after a clean close: %s %s' % (w.stdout, w.stderr))
+    w = door('tds', mtds, 'insert into sa.av values (400002, 666)')
+    if not w.startswith('error 547:'):
+        fail('ts_av after a clean close: ' + w)
     w = door('tns', mtns, 'create table av_pos (x number)')
     if not w.startswith('error 955:'):
         fail('a table of an assertion\'s name after a clean close: ' + w)

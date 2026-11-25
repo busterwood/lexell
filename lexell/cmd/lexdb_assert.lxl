@@ -94,8 +94,12 @@ pub type Up = record {
     pub bump: BumpFn
     pub batch: bool
     pub deadline: int
-    pub ora: bool               // the session's door is Oracle's: Oracle's errors
+    pub door: int               // the session's door (MD_PG, MD_TSQL, MD_ORA): its errors for a violation
 }
+
+const MD_PG = lexdb_sql.MD_PG
+const MD_TSQL = lexdb_sql.MD_TSQL
+const MD_ORA = lexdb_sql.MD_ORA
 
 // A table instance of the query: the table's key, and whether its rows going (not coming) may break the assertion.
 pub type Dep = record {
@@ -118,6 +122,7 @@ pub type Assertion = record {
     pub deferred: bool          // INITIALLY DEFERRED
     pub deps: []Dep             // its instances, in USER_ASSERTION_DEPENDENCIES' order
     pub cols: []str             // the columns it reads: the table's key, "\x00", the column
+    pub dialect: int            // the dialect it was made in (MD_PG, MD_TSQL, MD_ORA): its text is read as that dialect reads it
 }
 
 fn e(code: &str, msg: &str): DbErr { return lexdb_base.err(code, msg) }
@@ -150,6 +155,7 @@ pub fn encode(a: &Assertion): str {
         append(mut &xs, flag(d.neg))
     }
     addList(mut &xs, &a.cols)
+    append(mut &xs, a.dialect.toStr())
     var b = ""
     lexdb_catalog.addStrs(mut &b, &xs)
     return b
@@ -195,8 +201,10 @@ pub fn decode(v: &str): Assertion {
         append(mut &deps, Dep{table: t, neg: r.b()})
     }
     let cols = r.list()
+    let md = r.s()
     return Assertion{key: key, name: name, owner: owner, cond: cond, form: form, query: query, sat: sat, path: path, enabled: en,
-                     validated: va, deferrable: df, deferred: dd, deps: deps, cols: cols}
+                     validated: va, deferrable: df, deferred: dd, deps: deps, cols: cols,
+                     dialect: if len(md) == 0 { MD_ORA } else { lexdb_base.num(&md) }}
 }
 
 // Every assertion, as their catalog rows are (lexdb_catalog.catSnap keeps them for the dictionary views).
@@ -217,8 +225,8 @@ fn readAt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rowKey: &str): Resu
 pub fn complete(a: &Assertion): bool { return a.form == F_EXISTS }
 
 // The text DEFINITION_SQL shows: Oracle's own form of the statement.
-pub fn definition(a: &Assertion): str {
-    var b = "CREATE ASSERTION " + q(&a.owner) + "." + q(&a.name) + " CHECK \r\n" + a.cond + "\r\n " + (if a.enabled { "ENABLE" } else { "DISABLE" })
+pub fn definition(a: &Assertion, owner: &str): str {
+    var b = "CREATE ASSERTION " + q(owner) + "." + q(&nameIn(a, MD_ORA)) + " CHECK \r\n" + a.cond + "\r\n " + (if a.enabled { "ENABLE" } else { "DISABLE" })
     b += if a.deferrable { "\r\n DEFERRABLE" } else { "\r\n NOT DEFERRABLE" }
     b += if a.deferred { "\r\n INITIALLY DEFERRED" } else { "\r\n INITIALLY IMMEDIATE" }
     b += if a.validated { "\r\n VALIDATE" } else { "\r\n NOVALIDATE" }
@@ -226,6 +234,76 @@ pub fn definition(a: &Assertion): str {
 }
 
 fn q(n: &str): str { return "\"" + strings.replaceAll(n, "\"", "\"\"") + "\"" }
+
+// The name an assertion has in a door's texts and views (md): Oracle's (upper case unless written otherwise), or
+// PostgreSQL's and T-SQL's (as folded, unless written otherwise).
+pub fn nameIn(a: &Assertion, md: int): str {
+    if md == MD_ORA { return if a.dialect == MD_ORA { a.name.clone() } else { shownOf(&a.name, &"") } }
+    if a.dialect == MD_ORA && a.name == strings.toUpperAscii(&lexdb_sql.baseName(&a.key)) { return lexdb_sql.baseName(&a.key).toStr() }
+    return a.name.clone()
+}
+
+// The standard's views (information_schema.ASSERTIONS, CHECK_CONSTRAINTS) in the PostgreSQL and T-SQL doors: the schema,
+// the name, the check clause (the search condition as written), whether deferrable and initially deferred.
+pub fn schemaIn(a: &Assertion, md: int): str {
+    let sc = lexdb_sql.schemaOf(&a.key)
+    return if md == MD_TSQL && sc == "public" { "dbo" } else { sc.toStr() }
+}
+
+// A table as SQL Server's texts name it: dbo for public.
+fn objName(key: &str): str {
+    let sc = lexdb_sql.schemaOf(key)
+    return (if len(sc) == 0 || sc == "public" { "dbo" } else { sc.toStr() }) + "." + lexdb_sql.baseName(key)
+}
+
+fn tsErr(n: int, msg: &str): DbErr { return lexdb_base.err(&("TS" + n.toStr()), msg) }
+
+// The PostgreSQL and T-SQL doors' reason for a refusal (Oracle's ORA-08689 over ORA-n).
+fn reasonOf(n: int, msg: &str): str {
+    if n == 8661 { return "aggregates, GROUP BY or HAVING" }
+    if n == 8695 { return "a subquery under OR" }
+    if n == 8697 { return "FETCH FIRST, LIMIT, OFFSET or TOP" }
+    if n == 8677 { return "a function whose value the rows do not decide (the time, the user, random values, a sequence)" }
+    if n == 8664 { return "a window function" }
+    if n == 8678 { return "a query without a table (no FROM, or VALUES)" }
+    if n == 8651 { return "a view, a function in FROM or a WITH query" }
+    if n == 8735 { return "JOIN (write the join's condition in WHERE)" }
+    if n == 8659 { return "a subquery other than [NOT] EXISTS (query) or [NOT] IN (a query of one column)" }
+    if n == 8660 { return "WITH" }
+    if n == 8673 {
+        let a = strings.indexOf(msg, "Equijoin ", 0)
+        let b = strings.indexOf(msg, " found", 0)
+        let pair = if a >= 0 && b > a { strings.toLowerAscii(&strings.replaceAll(&msg[a + 9..b], "\"", "")) } else { "" }
+        return "an equijoin of columns that may be NULL (" + pair + "): each column must be NOT NULL, a key's, or kept from NULL by a condition of its own block"
+    }
+    return "a condition other than one NOT EXISTS (query), EXISTS (query) or ALL (query) SATISFY (condition) of one SELECT (split it into several assertions)"
+}
+
+// An error of CREATE ASSERTION in the PostgreSQL or T-SQL door (md): Oracle's refusals (ORA-08689 over the reason) as
+// lexdb's own error there (PostgreSQL's 0A000, T-SQL's 50000: neither product has assertions, nor an error for them).
+fn forDoor(x: DbErr, md: int, name: &str): DbErr {
+    if md == MD_ORA || !strings.startsWith(&x.state, "ORA") { return x }
+    if x.state == "ORA08689" {
+        let z = strings.indexOf(&x.msg, "\nORA-", 0)
+        let n = if z >= 0 { lexdb_base.num(&x.msg[z + 5..z + 10]) } else { 0 }
+        let reason = reasonOf(n, &x.msg)
+        if md == MD_TSQL { return tsErr(50000, &("Cannot create assertion '" + name + "': its query is not supported: " + reason + ".")) }
+        return e("0A000", &("assertion's query is not supported: " + reason))
+    }
+    if x.state == "ORA00942" { return e("42P01", "relation in the assertion's query does not exist") }
+    return x
+}
+
+// The statement's word in SQL Server's texts of a violation (547's).
+fn verbOf(s: &Stmt): str {
+    let k = s.kind
+    if k == lexdb_sql.S_UPDATE { return "UPDATE" }
+    if k == lexdb_sql.S_DELETE { return "DELETE" }
+    if k == lexdb_sql.S_MERGE { return "MERGE" }
+    if k == lexdb_sql.S_TRUNCATE { return "TRUNCATE TABLE" }
+    if k == lexdb_sql.S_ALTER { return "ALTER TABLE" }
+    return "INSERT"
+}
 
 // ---- names
 
@@ -257,10 +335,14 @@ fn keyOn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, path: &[]str, n: &st
 }
 
 // The key CREATE ASSERTION n makes: in its schema, or the first on the path that exists.
-fn newKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str): Result[str, DbErr] {
+fn newKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, md: int): Result[str, DbErr] {
     if lexdb_sql.isQual(n) {
         let sc = lexdb_sql.schemaOf(n)
-        if !(try schemaHas(st, txn, &sc)) { return Err(ora(1918, &("user '" + strings.toUpperAscii(&sc) + "' does not exist"))) }
+        if !(try schemaHas(st, txn, &sc)) {
+            if md == MD_PG { return Err(e("3F000", &("schema \"" + sc + "\" does not exist"))) }
+            if md == MD_TSQL { return Err(tsErr(2760, &("The specified schema name \"" + sc + "\" either does not exist or you do not have permission to use it."))) }
+            return Err(ora(1918, &("user '" + strings.toUpperAscii(&sc) + "' does not exist")))
+        }
         return Ok(if sc == "public" { lexdb_sql.baseName(n) } else { n.toStr() })
     }
     let path = txn.sql.path.clone()
@@ -326,9 +408,19 @@ fn putTable(txn: mut &lexdb_store.Txn, t: &Table): Result[Unit, DbErr] {
 
 // ---- a token reader
 
-type Rdr = record { toks: []Tok; pos: int; src: str }
+type Rdr = record { toks: []Tok; pos: int; src: str; md: int }
 
-fn reader(text: &str): Result[Rdr, DbErr] { return Ok(Rdr{toks: try lexdb_parse.oraTokens(text), pos: 0, src: text.toStr()}) }
+fn reader(text: &str, md: int): Result[Rdr, DbErr] { return Ok(Rdr{toks: try lexdb_parse.tokensIn(text, md), pos: 0, src: text.toStr(), md: md}) }
+
+// PostgreSQL's syntax error at token k (the T-SQL door gives it as 102 or 156).
+fn (r: &Rdr) near(k: int): DbErr {
+    let t = r.at(k)
+    if t.kind == T_EOF { return e("42601", "syntax error at end of input") }
+    return e("42601", &("syntax error at or near \"" + (if len(t.spell) > 0 { t.spell.clone() } else { t.text.clone() }) + "\""))
+}
+
+// A syntax error at token k: Oracle's ORA-n (msg), or the others' at the token.
+fn (r: &Rdr) syn(k: int, n: int, msg: &str): DbErr { return if r.md == MD_ORA { ora(n, msg) } else { r.near(k) } }
 
 fn (r: &Rdr) peek(): &Tok { return &r.toks[r.pos] }
 fn (r: &Rdr) at(k: int): &Tok { return &r.toks[if k < len(r.toks) { k } else { len(r.toks) - 1 }] }
@@ -375,6 +467,7 @@ fn (r: &Rdr) span(lo: int, hi: int): str {
 
 // Oracle's ORA-00911 for an unexpected word after the clause before it.
 fn (r: &Rdr) badChar(): DbErr {
+    if r.md != MD_ORA { return r.near(r.pos) }
     let t = r.peek()
     if t.kind == T_EOF { return ora(921, "unexpected end of SQL command") }
     let ch = if len(t.text) > 0 { strings.toLowerAscii(&r.src[t.at..t.at + 1]) } else { "" }
@@ -390,8 +483,19 @@ fn (r: &Rdr) badChar(): DbErr {
 const NONDET: []str = ["rownum", "sysdate", "systimestamp", "current_date", "current_timestamp", "localtimestamp", "sys_guid", "sys_context",
                        "userenv", "uid", "user", "dbtimezone", "sessiontimezone", "level", "ora_rowscn", "dbms_random"]
 
-fn isNondet(w: &str): bool {
-    for x in NONDET { if x == w { return true } }
+// The PostgreSQL and T-SQL doors' (the standard's rule: no function whose value the rows do not decide).
+const NONDET_STD: []str = ["now", "current_date", "current_time", "current_timestamp", "localtime", "localtimestamp", "clock_timestamp",
+                           "statement_timestamp", "transaction_timestamp", "timeofday", "random", "current_user", "session_user", "user",
+                           "current_role", "gen_random_uuid", "nextval", "currval", "setval", "lastval", "getdate", "getutcdate", "sysdatetime",
+                           "sysutcdatetime", "sysdatetimeoffset", "newid", "newsequentialid", "rand", "suser_sname", "suser_name", "user_name",
+                           "host_name", "app_name", "system_user", "inet_client_addr", "pg_backend_pid", "txid_current"]
+
+fn isNondet(w: &str, md: int): bool {
+    if md == MD_ORA {
+        for x in NONDET { if x == w { return true } }
+        return false
+    }
+    for x in NONDET_STD { if x == w { return true } }
     return false
 }
 
@@ -403,7 +507,7 @@ fn syntaxChecks(r: &Rdr, lo: int, hi: int): Result[Unit, DbErr] {
     for i in lo..hi {
         if r.toks[i].kind == T_PARAM { return Err(ora(1027, "bind variables not allowed for data definition operations")) }
         if r.kwAt(i, "over") && r.opAt(i + 1, "(") && i > inOver { inOver = r.closing(i + 1) }
-        if r.kwAt(i, "order") && r.kwAt(i + 1, "by") && i > inOver { return Err(ora(907, "missing right parenthesis")) }
+        if r.md == MD_ORA && r.kwAt(i, "order") && r.kwAt(i + 1, "by") && i > inOver { return Err(ora(907, "missing right parenthesis")) }
     }
     return Ok(Unit{})
 }
@@ -419,14 +523,15 @@ fn wordChecks(r: &Rdr, lo: int, hi: int): Result[Unit, DbErr] {
     for i in lo..hi {
         if r.toks[i].kind != T_IDENT { continue }
         let w = r.toks[i].text.clone()
-        if (w == "fetch" && (r.kwAt(i + 1, "first") || r.kwAt(i + 1, "next"))) || (w == "offset" && r.at(i + 1).kind == T_NUM) {
+        if (w == "fetch" && (r.kwAt(i + 1, "first") || r.kwAt(i + 1, "next"))) || (w == "offset" && r.at(i + 1).kind == T_NUM) ||
+           (r.md != MD_ORA && (w == "limit" || w == "top" || w == "offset")) {
             return Err(refused(8697, "SYS owned tables are not supported."))
         }
         if w == "over" && r.opAt(i + 1, "(") { return Err(refused(8664, "Window function is not allowed.")) }
         if w == "join" { return Err(refused(8735, "ANSI joins are not supported.")) }
         let called = r.opAt(i + 1, "(")
         let dotted = i > 0 && r.opAt(i - 1, ".")
-        if isNondet(&w) && !dotted && (!called || w == "sys_context" || w == "userenv" || w == "sys_guid") {
+        if isNondet(&w, r.md) && !dotted && (!called || w == "sys_context" || w == "userenv" || w == "sys_guid" || r.md != MD_ORA) {
             return Err(refused(8677, "Certain SQL functions are not supported."))
         }
     }
@@ -495,10 +600,10 @@ fn condOf(r: &Rdr, lo0: int, hi0: int, d: mut &Def): Result[Unit, DbErr] {
         d.form = F_ALL
         qlo = lo + 2
         qhi = r.closing(lo + 1)
-        if !r.kwAt(qhi + 1, "satisfy") { return Err(ora(905, "missing keyword")) }
-        if !r.opAt(qhi + 2, "(") { return Err(ora(906, "missing left parenthesis")) }
+        if !r.kwAt(qhi + 1, "satisfy") { return Err(r.syn(qhi + 1, 905, "missing keyword")) }
+        if !r.opAt(qhi + 2, "(") { return Err(r.syn(qhi + 2, 906, "missing left parenthesis")) }
         let sc = r.closing(qhi + 2)
-        if sc >= hi { return Err(ora(907, "missing right parenthesis")) }
+        if sc >= hi { return Err(r.syn(hi, 907, "missing right parenthesis")) }
         if hasSelect(r, qhi + 3, sc) { return Err(refused(8680, "Consider splitting the assertion definition.")) }
         try syntaxChecks(r, qhi + 3, sc)
         match wordChecks(r, qhi + 3, sc) {
@@ -506,20 +611,20 @@ fn condOf(r: &Rdr, lo0: int, hi0: int, d: mut &Def): Result[Unit, DbErr] {
             Err(x) { d.words = Some(x) }
         }
         d.sat = r.text(qhi + 3, sc)
-        if sc + 1 < hi { return Err(ora(907, "missing right parenthesis")) }
+        if sc + 1 < hi { return Err(r.syn(sc + 1, 907, "missing right parenthesis")) }
         rest = hi
     }
     if qlo < 0 {
-        if !hasSelect(r, lo, hi) { return Err(ora(936, "missing expression")) }
+        if !hasSelect(r, lo, hi) && r.md == MD_ORA { return Err(ora(936, "missing expression")) }
         return Err(refused(8680, "Consider splitting the assertion definition."))
     }
-    if qhi >= hi { return Err(ora(907, "missing right parenthesis")) }
+    if qhi >= hi { return Err(r.syn(hi, 907, "missing right parenthesis")) }
     if rest < hi {
         if r.kwAt(rest, "and") { return Err(refused(8680, "Consider splitting the assertion definition.")) }
         if r.kwAt(rest, "or") { return Err(refused(8695, "A subquery within an OR condition is not supported.")) }
-        return Err(ora(907, "missing right parenthesis"))
+        return Err(r.syn(rest, 907, "missing right parenthesis"))
     }
-    if !r.kwAt(qlo, "select") && !r.kwAt(qlo, "with") { return Err(ora(928, "missing SELECT keyword")) }
+    if !r.kwAt(qlo, "select") && !r.kwAt(qlo, "with") { return Err(r.syn(qlo, 928, "missing SELECT keyword")) }
     try syntaxChecks(r, qlo, qhi)
     if d.words.isNone() {
         match wordChecks(r, qlo, qhi) {
@@ -533,14 +638,14 @@ fn condOf(r: &Rdr, lo0: int, hi0: int, d: mut &Def): Result[Unit, DbErr] {
 
 // CHECK (condition) and the state after it: ENABLE | DISABLE, VALIDATE | NOVALIDATE, [NOT] DEFERRABLE, INITIALLY
 // IMMEDIATE | DEFERRED, each once, in any order.
-fn defOf(text: &str): Result[Def, DbErr] {
-    var r = try reader(text)
+fn defOf(text: &str, md: int): Result[Def, DbErr] {
+    var r = try reader(text, md)
     var d = Def{cond: "", form: F_NOT, query: "", sat: "", enabled: true, validated: true, deferrable: false, deferred: false, words: None}
-    if !r.accept("check") { return Err(ora(905, "missing keyword")) }
-    if !r.opAt(r.pos, "(") { return Err(ora(906, "missing left parenthesis")) }
+    if !r.accept("check") { return Err(r.syn(r.pos, 905, "missing keyword")) }
+    if !r.opAt(r.pos, "(") { return Err(r.syn(r.pos, 906, "missing left parenthesis")) }
     let open = r.pos
     let close = r.closing(open)
-    if r.at(close).kind == T_EOF { return Err(ora(907, "missing right parenthesis")) }
+    if r.at(close).kind == T_EOF { return Err(r.syn(close, 907, "missing right parenthesis")) }
     d.cond = r.span(open, close)
     try condOf(&r, open + 1, close, mut &d)
     r.pos = close + 1
@@ -557,6 +662,7 @@ fn defOf(text: &str): Result[Def, DbErr] {
 type State = record { en: int; va: int; df: int; ini: int }
 
 fn stateOf(r: mut &Rdr, s: mut &State, alter: bool): Result[Unit, DbErr] {
+    if r.md != MD_ORA { return stdState(r, s) }
     while r.peek().kind != T_EOF && !(r.peek().kind == T_OP && r.peek().text == ";") {
         if (r.kw("enable") || r.kw("disable")) && s.en < 0 {
             s.en = if r.kw("enable") { 1 } else { 0 }
@@ -582,6 +688,27 @@ fn stateOf(r: mut &Rdr, s: mut &State, alter: bool): Result[Unit, DbErr] {
     }
     if s.df == 0 && s.ini == 1 { return Err(ora(8724, "Attempting to set assertion to INITIALLY DEFERRED NOT DEFERRABLE.")) }
     if s.en == 0 && s.va == 1 { return Err(ora(8701, "Attempting to set assertion to DISABLE VALIDATE.")) }
+    return Ok(Unit{})
+}
+
+// The standard's constraint characteristics (PostgreSQL's spelling, and T-SQL's in lexdb): [NOT] DEFERRABLE, INITIALLY
+// IMMEDIATE | DEFERRED, each once, in any order, with PostgreSQL's errors.
+fn stdState(r: mut &Rdr, s: mut &State): Result[Unit, DbErr] {
+    while r.peek().kind != T_EOF && !(r.peek().kind == T_OP && r.peek().text == ";") {
+        if r.kw("deferrable") || (r.kw("not") && r.kwAt(r.pos + 1, "deferrable")) {
+            if s.df >= 0 { return Err(e("42601", "multiple DEFERRABLE/NOT DEFERRABLE clauses not allowed")) }
+            s.df = if r.kw("not") { 0 } else { 1 }
+            r.pos += if s.df == 0 { 2 } else { 1 }
+        } else if r.kw("initially") {
+            if !r.kwAt(r.pos + 1, "immediate") && !r.kwAt(r.pos + 1, "deferred") { return Err(r.near(r.pos + 1)) }
+            if s.ini >= 0 { return Err(e("42601", "multiple INITIALLY IMMEDIATE/DEFERRED clauses not allowed")) }
+            s.ini = if r.kwAt(r.pos + 1, "deferred") { 1 } else { 0 }
+            r.pos += 2
+        } else {
+            return Err(r.near(r.pos))
+        }
+    }
+    if s.df == 0 && s.ini == 1 { return Err(e("42601", "constraint declared INITIALLY DEFERRED must be DEFERRABLE")) }
     return Ok(Unit{})
 }
 
@@ -674,6 +801,10 @@ fn walk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, path0: &[]str, s: &St
         if lexdb_sql.baseName(&f.table) == "dual" { return Err(refused(8678, "Synonym (\"DUAL\") is not supported.")) }
         let key = try keyOn(st, txn, path0, &f.table, &"")
         if len(key) == 0 { return Err(ora(942, "table or view does not exist")) }
+        // (a session's temporary table goes with its session; the assertion would stay: the standard refuses one too)
+        if lexdb_base.isTempSchema(&lexdb_sql.schemaOf(&key)) {
+            return Err(e("0A000", &("lexdb: an assertion cannot read a temporary table (\"" + lexdb_sql.baseName(&key) + "\")")))
+        }
         match try tableOf(st, txn, &key) {
             Some(t) {
                 if len(t.view) > 0 {
@@ -954,8 +1085,8 @@ fn violationText(a: &Assertion): str {
     return a.query.clone()
 }
 
-fn parseQuery(text: &str): Result[Stmt, DbErr] {
-    let ss = try lexdb_parse.oraParse(text)
+fn parseQuery(text: &str, md: int): Result[Stmt, DbErr] {
+    let ss = try lexdb_parse.parseFor(text, md)
     if len(ss) != 1 { return Err(refused(8680, "Consider splitting the assertion definition.")) }
     return Ok(ss[0].clone())
 }
@@ -1006,9 +1137,15 @@ fn hasInt(xs: &[]int, x: int): bool {
 
 fn broken(a: &Assertion, n: int): bool { return if a.form == F_EXISTS { n == 0 } else { n > 0 } }
 
-fn violated(up: &Up, a: &Assertion): DbErr {
-    if up.ora { return ora(8601, &("Assertion (" + a.owner + "." + a.name + ") violated.")) }
-    return e("23514", &("assertion \"" + a.name + "\" is violated"))
+// A violation in the session's door: Oracle's ORA-08601; PostgreSQL's 23514 (a CHECK's state); SQL Server's 547 (a CHECK's
+// and a foreign key's number, its text naming the assertion and the table written: table, the statement's word verb).
+fn violated(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, up: &Up, a: &Assertion, table: &str, verb: &str): DbErr {
+    if up.door == MD_ORA { return ora(8601, &("Assertion (" + ownerNow(st, txn, a) + "." + nameIn(a, MD_ORA) + ") violated.")) }
+    if up.door == MD_TSQL {
+        return tsErr(547, &("The " + verb + " statement conflicted with the assertion \"" + nameIn(a, MD_TSQL) + "\". The conflict occurred in database \"lexdb\", table \"" +
+                            objName(if len(table) > 0 { table } else if len(a.deps) > 0 { &a.deps[0].table } else { &a.key }) + "\"."))
+    }
+    return e("23514", &("assertion \"" + nameIn(a, MD_PG) + "\" is violated"))
 }
 
 // The rows (at most one) of query s with the assertion's names (its path). A check's (quiet) reads are not noted for the
@@ -1054,10 +1191,26 @@ fn mark(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, on: bo
 
 // CREATE ASSERTION, DROP ASSERTION, ALTER ASSERTION: the statement's tag (lexdb_exec runs it).
 pub fn ddl(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, up: &Up): Result[str, DbErr] {
+    match ddlIn(st, txn, s, up) {
+        Ok(t) { return Ok(t) }
+        Err(x) { return Err(forDoor(x, s.mdialect, &(if len(s.spell) > 0 { s.spell.clone() } else { lexdb_sql.baseName(&s.table).toStr() }))) }
+    }
+}
+
+fn ddlIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, up: &Up): Result[str, DbErr] {
+    let md = s.mdialect
+    let shown = if len(s.spell) > 0 { s.spell.clone() } else { lexdb_sql.baseName(&s.table).toStr() }
     if s.alias == "drop" || s.alias == "alter" {
+        if md != MD_ORA && len(strings.trim(&s.index)) > 0 {
+            // (the standard's DROP ASSERTION has no CASCADE or RESTRICT)
+            let r = try reader(&s.index, md)
+            return Err(r.near(0))
+        }
         let k = try keyOn(st, txn, &txn.sql.path.clone(), &s.table, &ASSERT_PRE)
         if len(k) == 0 {
             if s.alias == "drop" && s.ifFlag { return Ok("DROP ASSERTION") }
+            if md == MD_PG { return Err(e("42704", &("assertion \"" + shown + "\" does not exist"))) }
+            if md == MD_TSQL { return Err(tsErr(3701, &("Cannot drop the assertion '" + shown + "', because it does not exist or you do not have permission."))) }
             return Err(ora(13650, "The specified object does not exist for this execution."))
         }
         var a = (try readAt(st, txn, &assertKey(&k))).unwrap()
@@ -1067,7 +1220,7 @@ pub fn ddl(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, up: &Up)
             try up.bump(st, txn)
             return Ok("DROP ASSERTION")
         }
-        var r = try reader(&s.index)
+        var r = try reader(&s.index, a.dialect)
         var x = State{en: -1, va: -1, df: -1, ini: -1}
         if r.peek().kind == T_EOF { return Ok("ALTER ASSERTION") }
         try stateOf(mut &r, mut &x, true)
@@ -1075,27 +1228,30 @@ pub fn ddl(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, up: &Up)
         if x.en >= 0 { a.enabled = x.en == 1 }
         a.validated = if x.va >= 0 { x.va == 1 } else { a.enabled }
         if a.enabled && a.validated && !was {
-            let qs = try parseQuery(&violationText(&a))
-            if broken(&a, try runOn(st, txn, &a, &qs, up, false)) { return Err(violated(up, &a)) }
+            let qs = try parseQuery(&violationText(&a), a.dialect)
+            if broken(&a, try runOn(st, txn, &a, &qs, up, false)) { return Err(violated(st, txn, up, &a, &"", &"ALTER ASSERTION")) }
         }
         try txn.put(lexdb_catalog.CATALOG, &assertKey(&k), &encode(&a))
         try up.bump(st, txn)
         return Ok("ALTER ASSERTION")
     }
-    let key = try newKey(st, txn, &s.table)
+    let key = try newKey(st, txn, &s.table, md)
+    let taken = if md == MD_TSQL { tsErr(2714, &("There is already an object named '" + shown + "' in the database.")) }
+                else if md == MD_ORA { ora(955, "name is already used by an existing object") }
+                else { e("42P07", &("relation \"" + shown + "\" already exists")) }
     if (try st.get(txn, lexdb_catalog.CATALOG, &assertKey(&key))).isSome() {
         if s.ifFlag { return Ok("CREATE ASSERTION") }
-        return Err(ora(955, "name is already used by an existing object"))
+        return Err(if md == MD_PG { e("42710", &("assertion \"" + shown + "\" already exists")) } else { taken })
     }
     if (try st.get(txn, lexdb_catalog.CATALOG, &key)).isSome() || (try st.get(txn, lexdb_catalog.CATALOG, &lexdb_catalog.seqRow(&key))).isSome() ||
        (try st.get(txn, lexdb_catalog.CATALOG, &(lexdb_catalog.GRAPH_PRE + key))).isSome() {
-        return Err(ora(955, "name is already used by an existing object"))
+        return Err(taken)
     }
-    var d = try defOf(&s.index)
-    var a = Assertion{key: key.clone(), name: shownOf(&lexdb_sql.baseName(&key), &s.spell), owner: ownerOf(st, txn, &key), cond: replace(mut &d.cond, ""), form: d.form,
-                      query: replace(mut &d.query, ""), sat: replace(mut &d.sat, ""), path: collections.copyOf(&txn.sql.path), enabled: d.enabled, validated: d.validated,
-                      deferrable: d.deferrable, deferred: d.deferred, deps: [], cols: []}
-    let qs = try parseQuery(&violationText(&a))
+    var d = try defOf(&s.index, md)
+    var a = Assertion{key: key.clone(), name: if md == MD_ORA { shownOf(&lexdb_sql.baseName(&key), &s.spell) } else { shown.clone() }, owner: ownerOf(st, txn, &key),
+                      cond: replace(mut &d.cond, ""), form: d.form, query: replace(mut &d.query, ""), sat: replace(mut &d.sat, ""), path: collections.copyOf(&txn.sql.path),
+                      enabled: d.enabled, validated: d.validated, deferrable: d.deferrable, deferred: d.deferred, deps: [], cols: [], dialect: md}
+    let qs = try parseQuery(&violationText(&a), a.dialect)
     // its query planned and run first (Oracle reads its names before its refusals), its rows used when it is validated
     let n = try runOn(st, txn, &a, &qs, up, false)
     match d.words {
@@ -1107,6 +1263,8 @@ pub fn ddl(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, up: &Up)
     a.deps = depsOf(&an)
     a.cols = colsRead(&an)
     if a.enabled && a.validated && broken(&a, n) {
+        if md == MD_PG { return Err(e("23514", &("assertion \"" + a.name + "\" is violated by some row"))) }
+        if md == MD_TSQL { return Err(violated(st, txn, up, &a, &"", &"CREATE ASSERTION")) }
         return Err(ora(8689, &("CREATE ASSERTION failed\nORA-08601: Assertion (" + a.owner + "." + a.name + ") violated.")))
     }
     try txn.put(lexdb_catalog.CATALOG, &assertKey(&key), &encode(&a))
@@ -1130,62 +1288,93 @@ fn assertionsOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): R
     return Ok(out)
 }
 
-fn depends(a: &Assertion): DbErr { return ora(8702, &("Columns are referenced by assertion " + a.owner + "." + a.name + ".")) }
+fn depends(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion): DbErr {
+    return ora(8702, &("Columns are referenced by assertion " + ownerNow(st, txn, a) + "." + nameIn(a, MD_ORA) + "."))
+}
 
-// Column col of t dropped or renamed.
-pub fn colChange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, col: &str): Result[Unit, DbErr] {
+// The owner Oracle's texts name for assertion a in the session's eyes, as lexdb_oracat's views do: its schema's name; for
+// public's, the session's user, or SYS when the user has a schema of its own name.
+fn ownerNow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion): str {
+    let sc = lexdb_sql.schemaOf(&a.key)
+    if sc != "public" { return shownOf(&sc, &"") }
+    let u = st.memo.get(&lexdb_catalog.userKey(txn.sql.sess)).unwrapOr("lexdb")
+    let low = strings.toLowerAscii(&u)
+    if low != "public" && (st.get(txn, lexdb_catalog.CATALOG, &("\x03" + low)).unwrapOr(None)).isSome() { return "SYS" }
+    return strings.toUpperAscii(&u)
+}
+
+const CASCADE_HINT = "Use DROP ... CASCADE to drop the dependent objects too."
+
+// Column col of t dropped (drop) or renamed, in dialect md: refused where an assertion reads it (ORA-08702; PostgreSQL's
+// 2BP01, its DROP COLUMN ... CASCADE dropping the assertions; SQL Server's 5074 and, for a rename, 15336; a rename in
+// PostgreSQL's door 0A000: the assertion's text names the column).
+pub fn colChange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, col: &str, md: int, drop: bool, cascade: bool): Result[Unit, DbErr] {
     if len(marksOf(&t.refBy)) == 0 { return Ok(Unit{}) }
+    var gone: []Assertion = []
     for a in try assertionsOf(st, txn, t) {
-        if lexdb_base.hasStr(&a.cols, &(t.name + "\x00" + col)) { return Err(depends(&a)) }
+        if !lexdb_base.hasStr(&a.cols, &(t.name + "\x00" + col)) { continue }
+        if md == MD_ORA { return Err(depends(st, txn, &a)) }
+        let tn = lexdb_sql.baseName(&t.name)
+        if md == MD_TSQL {
+            if drop { return Err(tsErr(5074, &("The object '" + nameIn(&a, md) + "' is dependent on column '" + col + "'."))) }
+            return Err(tsErr(15336, &("Object '" + objName(&t.name) + "." + col + "' cannot be renamed because the object participates in enforced dependencies.")))
+        }
+        if !drop { return Err(e("0A000", &("cannot rename column " + col + " of table " + tn + " because assertion " + nameIn(&a, md) + " reads it"))) }
+        if !cascade {
+            return Err(lexdb_base.errDetail("2BP01", &("cannot drop column " + col + " of table " + tn + " because other objects depend on it"),
+                                            &("assertion " + nameIn(&a, md) + " depends on column " + col + " of table " + tn), CASCADE_HINT))
+        }
+        append(mut &gone, a)
     }
+    for a in gone { try dropFor(st, txn, t, &a) }
     return Ok(Unit{})
 }
 
-// UPDATE, DELETE, COPY ... with batch_rows (lexdb's) of table name: they commit as they go, past the checks (which are at
-// a statement's end): refused on a table an assertion reads.
-pub fn noBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str): Result[Unit, DbErr] {
-    if !assertsSeen { return Ok(Unit{}) }
-    let k = try keyOn(st, txn, &txn.sql.path.clone(), name, &"")
-    if len(k) == 0 { return Ok(Unit{}) }
-    match try tableRc(st, txn, &k) {
-        Some(t) {
-            if len(marksOf(&t.refBy)) > 0 {
-                return Err(e("0A000", &("lexdb: batch_rows cannot write table \"" + lexdb_sql.baseName(&k) + "\", which an assertion reads")))
+// Assertion a dropped as table t's DDL drops it: its catalog row, the other tables it reads unmarked, t's refBy without it.
+fn dropFor(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, a: &Assertion): Result[Unit, DbErr] {
+    let m = assertKey(&a.key)
+    txn.del(lexdb_catalog.CATALOG, &m)
+    for k in tablesOf(a) {
+        if k == t.name { continue }
+        match try tableOf(st, txn, &k) {
+            Some(o0) {
+                var o = o0
+                o.refBy = refsExcept(&o.refBy, &m)
+                try putTable(txn, &o)
             }
+            None {}
         }
-        None {}
     }
+    t.refBy = refsExcept(&t.refBy, &m)
     return Ok(Unit{})
 }
 
 // Table t renamed (ALTER TABLE ... RENAME TO, RENAME).
-pub fn renamed(t: &Table): Result[Unit, DbErr] {
-    if len(marksOf(&t.refBy)) > 0 { return Err(ora(8694, "Cannot rename a table referenced in assertion.")) }
-    return Ok(Unit{})
+pub fn renamed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, md: int): Result[Unit, DbErr] {
+    if len(marksOf(&t.refBy)) == 0 { return Ok(Unit{}) }
+    if md == MD_ORA { return Err(ora(8694, "Cannot rename a table referenced in assertion.")) }
+    if md == MD_TSQL { return Err(tsErr(15336, &("Object '" + objName(&t.name) + "' cannot be renamed because the object participates in enforced dependencies."))) }
+    let xs = try assertionsOf(st, txn, t)
+    let n = if len(xs) > 0 { nameIn(&xs[0], md) } else { "" }
+    return Err(e("0A000", &("cannot rename table " + lexdb_sql.baseName(&t.name) + " because assertion " + n + " reads it")))
 }
 
 // Table t dropped (lexdb_exec.unlinkTable): refused, or with cascade its assertions dropped (each table they read
 // unmarked); t's refBy left without them.
-pub fn unlink(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cascade: bool): Result[Unit, DbErr] {
+// (md: the session's door: ORA-08702; PostgreSQL's 2BP01; SQL Server's 3729, which has no CASCADE)
+pub fn unlink(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, cascade: bool, md: int): Result[Unit, DbErr] {
     if len(marksOf(&t.refBy)) == 0 { return Ok(Unit{}) }
     let xs = try assertionsOf(st, txn, t)
-    if !cascade && len(xs) > 0 { return Err(depends(&xs[0])) }
-    for a in xs {
-        txn.del(lexdb_catalog.CATALOG, &assertKey(&a.key))
-        // (the other tables it reads; t's own row is being dropped)
-        let m = assertKey(&a.key)
-        for k in tablesOf(&a) {
-            if k == t.name { continue }
-            match try tableOf(st, txn, &k) {
-                Some(o0) {
-                    var o = o0
-                    o.refBy = refsExcept(&o.refBy, &m)
-                    try putTable(txn, &o)
-                }
-                None {}
-            }
+    if !cascade && len(xs) > 0 {
+        let tn = lexdb_sql.baseName(&t.name)
+        if md == MD_PG {
+            return Err(lexdb_base.errDetail("2BP01", &("cannot drop table " + tn + " because other objects depend on it"),
+                                            &("assertion " + nameIn(&xs[0], md) + " depends on table " + tn), CASCADE_HINT))
         }
+        if md == MD_TSQL { return Err(tsErr(3729, &("Cannot DROP TABLE '" + objName(&t.name) + "' because it is being referenced by object '" + nameIn(&xs[0], md) + "'."))) }
+        return Err(depends(st, txn, &xs[0]))
     }
+    for a in xs { try dropFor(st, txn, t, &a) }
     t.refBy = refs(&t.refBy)
     return Ok(Unit{})
 }
@@ -1198,22 +1387,42 @@ fn refsExcept(xs: &[]str, m: &str): []str {
 
 // ---- the check
 
-// A statement's note (in Txn.onCommit): NOTE, its write mark, "w" (it may update or delete) or "i" (it only inserts), the
-// table's key.
+// A statement's note (in Txn.onCommit): NOTE, its write mark, "w" (it may update or delete), "i" (it only inserts), "c" (a
+// foreign key's action wrote it: any column) or "a" (its rows rewritten: the whole query), the table's key.
 const NOTE = "\x02n\x00"
 
 // Table t (one whose refBy names an assertion or a table) about to be written by a statement (lexdb_exec.fkTables, once a
 // statement and table): noted for its end.
 pub fn note(txn: mut &lexdb_store.Txn, t: &Table, any: bool) {
-    var has = false
-    for x in t.refBy { if isMark(&x) { has = true } }
-    if !has { return }
+    if !marked(&t.refBy) { return }
     append(mut &txn.onCommit, NOTE + txn.mark().toStr() + "\x00" + (if any { "w" } else { "i" }) + "\x00" + t.name)
+}
+
+// Table t written by a foreign key's action of a statement on another table (lexdb_exec.fkTables): any of its columns may
+// change, whatever the statement's SET says.
+pub fn noteKid(txn: mut &lexdb_store.Txn, t: &Table) {
+    if marked(&t.refBy) { append(mut &txn.onCommit, NOTE + txn.mark().toStr() + "\x00c\x00" + t.name) }
+}
+
+// Whether a table's refBy names an assertion (COPY's fast path, which a check cannot read back, is not for it).
+pub fn marked(refBy: &[]str): bool {
+    for x in refBy { if isMark(&x) { return true } }
+    return false
+}
+
+// Table t emptied by TRUNCATE in dialect md (Oracle does not check a TRUNCATE; the PostgreSQL and T-SQL doors do): its
+// assertions' whole queries run at the statement's end.
+pub fn truncated(txn: mut &lexdb_store.Txn, t: &Table, md: int) { if md != MD_ORA { retyped(txn, t) } }
+
+// Table t's rows rewritten by ALTER TABLE (a column's new type, its values cast): its assertions' whole queries run at the
+// statement's end, in every door.
+pub fn retyped(txn: mut &lexdb_store.Txn, t: &Table) {
+    if marked(&t.refBy) { append(mut &txn.onCommit, NOTE + txn.mark().toStr() + "\x00a\x00" + t.name) }
 }
 
 // A table a statement wrote: its key, tree, the statement's first write mark, whether it may have updated or deleted.
 // sets: an UPDATE's SET columns, [] for any other statement (its rows' every column may be new).
-type Wr = record { key: str; tree: int; mark: int; any: bool; sets: []str }
+type Wr = record { key: str; tree: int; mark: int; any: bool; sets: []str; whole: bool }
 
 // An UPDATE's SET columns (its rows' other columns are as they were); [] for any other statement.
 fn setCols(s: &Stmt): []str {
@@ -1255,7 +1464,7 @@ fn planOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, row:
         Some(p) { return Ok(p) }
         None {}
     }
-    let qs = try parseQuery(&violationText(a))
+    let qs = try parseQuery(&violationText(a), a.dialect)
     let an = try analyze(st, txn, a, &qs)
     let keys = joinKeys(&an)
     let p = rc(Plan{stmt: qs, an: an, keys: keys})
@@ -1383,10 +1592,10 @@ fn ownConds(an: &An, i: int): []Expr {
 }
 
 // The query of instance i's table alone: its rows of rows that meet its own conditions (whether any can take part).
-fn ownQuery(an: &An, i: int, t: &Table, rows: &[][]Val): Stmt {
+fn ownQuery(an: &An, i: int, t: &Table, rows: &[][]Val, md: int): Stmt {
     let x = &an.insts[i]
     var q = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
-    q.mdialect = lexdb_sql.MD_ORA
+    q.mdialect = md
     append(mut &q.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(Expr.Lit(Val.Int(1))), alias: "", spell: ""})
     append(mut &q.from, lexdb_sql.FromItem{table: x.name.clone(), alias: x.alias.clone(), join: lexdb_sql.J_FIRST, on: None, sub: -1, cols: [], work: -1,
                                            lateral: false, using: [], natural: false, comma: true})
@@ -1413,26 +1622,37 @@ fn putRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, mark: i
 
 // Assertion a after statements that wrote ws: its query run for what they may have broken; under its lock (taken first)
 // when another transaction's rows may take part in a row breaking it (more than one instance, or an EXISTS).
-fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, row: &str, ws: &[]Wr, up: &Up): Result[Unit, DbErr] {
+fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, row: &str, ws: &[]Wr, up: &Up, verb: &str): Result[Unit, DbErr] {
     let plan = try planOf(st, txn, a, row)
     let an = &plan.an
     var whole = false
+    var first = ""              // the table written that the whole query is run for (SQL Server's text names it)
     var ix: []int = []          // the instances to restrict: each with its table and the rows put to it
     var ts: []rc Table = []
     var rs: [][][]Val = []
+    var big: []int = []         // the instances whose table the statements put more than MAX_KEYS rows to: checked BIG_CHUNK at a time
+    var bigW: []int = []        // (their writes, in ws)
     for i in 0..len(an.insts) {
         let x = &an.insts[i]
         var wi = -1
         for k in 0..len(ws) { if ws[k].key == x.key { wi = k } }
-        if wi < 0 || !touches(a, &ws[wi]) { continue }
-        if x.neg {
-            if ws[wi].any && txn.wroteSince(ws[wi].tree, ws[wi].mark) { whole = true }
+        if wi < 0 { continue }
+        if ws[wi].whole || (x.neg && touches(a, &ws[wi]) && ws[wi].any && txn.wroteSince(ws[wi].tree, ws[wi].mark)) {
+            whole = true
+            if len(first) == 0 { first = x.key.clone() }
             continue
         }
+        if x.neg || !touches(a, &ws[wi]) { continue }
         let ks = txn.putKeys(ws[wi].tree, ws[wi].mark, max(MAX_KEYS, 1))
         if len(ks) == 0 { continue }
+        if len(ks) > MAX_KEYS && oneInstance(an, &x.key) {
+            append(mut &big, i)
+            append(mut &bigW, wi)
+            continue
+        }
         if len(ks) > MAX_KEYS && a.validated {
             whole = true
+            if len(first) == 0 { first = x.key.clone() }
             continue
         }
         match try tableRc(st, txn, &x.key) {
@@ -1446,9 +1666,11 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ro
             None {}
         }
     }
-    if !whole && len(ix) == 0 { return Ok(Unit{}) }
+    if !whole && len(ix) == 0 && len(big) == 0 { return Ok(Unit{}) }
     let locks = len(an.insts) > 1 || a.form == F_EXISTS
-    if locks && !whole {
+    // (many rows: the assertion's own lock, exclusive, not a lock per row's join key)
+    let excl = whole || len(big) > 0
+    if locks && !excl {
         {
             // (the instances none of whose new rows meets its own conditions: they take part in nothing, and take no lock)
             var keep: []int = []
@@ -1463,7 +1685,7 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ro
                     let hi = min(at + CHUNK, len(rs[j]))
                     var part: [][]Val = []
                     for k in at..hi { append(mut &part, collections.copyOf(&rs[j][k])) }
-                    if (try runOn(st, txn, a, &ownQuery(an, ix[j], &ts[j], &part), up, true)) > 0 { hit = true }
+                    if (try runOn(st, txn, a, &ownQuery(an, ix[j], &ts[j], &part, a.dialect), up, true)) > 0 { hit = true }
                     at = hi
                 }
                 if hit { append(mut &keep, j) }
@@ -1482,7 +1704,7 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ro
             rs = rs2
         }
     }
-    if locks && (whole || len(plan.keys) == 0) {
+    if locks && (excl || len(plan.keys) == 0) {
         try lockFor(st, txn, a, lexdb_sql.LOCK_UPDATE)
     } else if locks {
         // the join key's values of the rows to check, each locked (after the assertion's weakest lock)
@@ -1498,7 +1720,7 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ro
         }
     }
     if whole {
-        if broken(a, try runOn(st, txn, a, &plan.stmt, up, true)) { return Err(violated(up, a)) }
+        if broken(a, try runOn(st, txn, a, &plan.stmt, up, true)) { return Err(violated(st, txn, up, a, &first, verb)) }
         return Ok(Unit{})
     }
     for j in 0..len(ix) {
@@ -1510,17 +1732,68 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ro
             for k in at..hi { append(mut &part, collections.copyOf(&rs[j][k])) }
             var q = plan.stmt.clone()
             addConj(mut &q, &x.path, 0, keyIn(&x.alias, &ts[j], &part))
-            if broken(a, try runOn(st, txn, a, &q, up, true)) { return Err(violated(up, a)) }
+            if broken(a, try runOn(st, txn, a, &q, up, true)) { return Err(violated(st, txn, up, a, &x.key, verb)) }
             at = hi
         }
     }
+    // the many rows put (a COPY, a bulk load, an INSERT ... SELECT): the query with the instance restricted to them, BIG_CHUNK keys
+    // at a time (its key IN (...): lookups of the rows, not a scan of a table whose rows are the transaction's own writes)
+    for j in 0..len(big) {
+        let x = &an.insts[big[j]]
+        let w = &ws[bigW[j]]
+        match try tableRc(st, txn, &x.key) {
+            Some(t) {
+                let rel = lexdb_catalog.relOf(&t)
+                let none: []bool = []
+                let rr = lexdb_access.rowRead(&rel, &none)
+                let keys = txn.putKeys(w.tree, w.mark, 1 << 30)
+                var at = 0
+                while at < len(keys) {
+                    let hi = min(at + BIG_CHUNK, len(keys))
+                    var part: [][]Val = []
+                    for k in at..hi {
+                        match try lexdb_access.getRow(st, txn, &rel, &rr, &keys[k]) {
+                            Some(r) { append(mut &part, r) }
+                            None {}
+                        }
+                    }
+                    if len(part) > 0 {
+                        var q = plan.stmt.clone()
+                        addConj(mut &q, &x.path, 0, keyList(&x.alias, &t, &part))
+                        if broken(a, try runOn(st, txn, a, &q, up, true)) { return Err(violated(st, txn, up, a, &x.key, verb)) }
+                    }
+                    at = hi
+                }
+            }
+            None {}
+        }
+    }
     return Ok(Unit{})
+}
+
+const BIG_CHUNK = 4096
+
+// Whether table key is one instance of the query only (another instance of it would read its rows put: the whole query then).
+fn oneInstance(an: &An, key: &str): bool {
+    var n = 0
+    for x in an.insts { if x.key == key { n += 1 } }
+    return n == 1
+}
+
+// The condition that an instance's row is one of rows: its key IN (...) for a key of one column, else keyIn's.
+fn keyList(alias: &str, t: &Table, rows: &[][]Val): Expr {
+    if len(t.pk) != 1 { return keyIn(alias, t, rows) }
+    let p = t.pk[0]
+    var args: []Expr = [Expr.Col(alias.toStr() + "." + t.cols[p].name, -1)]
+    for r in rows { append(mut &args, Expr.Lit(r[p].clone())) }
+    return Expr.Call("in", args, false)
 }
 
 // The statements' notes in the transaction's onCommit list, taken out of it; with ok (the statement ran) each assertion of
 // the tables they wrote is checked, or kept for the COMMIT when deferred (lexdb_exec.runStmt in a block, onCommitDo before
 // a statement's own commit).
 pub fn stmtEnd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ok: bool, s: &Stmt, up: &Up): Result[Unit, DbErr] {
+    for x in txn.onCommit { if x == HOLD { return Ok(Unit{}) } }
     var ws: []Wr = []
     var keep: []str = []
     var any = false
@@ -1537,10 +1810,12 @@ pub fn stmtEnd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ok: bool, s: &
             if ws[k].key == f[2] {
                 found = true
                 if m < ws[k].mark { ws[k].mark = m }
-                if f[1] == "w" { ws[k].any = true }
+                if f[1] != "i" { ws[k].any = true }
+                if f[1] == "a" { ws[k].whole = true }
+                if f[1] == "c" { ws[k].sets = [] }
             }
         }
-        if !found { append(mut &ws, Wr{key: f[2].clone(), tree: -1, mark: m, any: f[1] == "w", sets: setCols(s)}) }
+        if !found { append(mut &ws, Wr{key: f[2].clone(), tree: -1, mark: m, any: f[1] != "i", sets: if f[1] == "c" { [] } else { setCols(s) }, whole: f[1] == "a"}) }
     }
     if !any { return Ok(Unit{}) }
     txn.onCommit = keep
@@ -1566,12 +1841,32 @@ pub fn stmtEnd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ok: bool, s: &
                     deferTo(txn, &a, m)
                     continue
                 }
-                try checkOne(st, txn, &a, &row, &ws, up)
+                try checkOne(st, txn, &a, &row, &ws, up, &verbOf(s))
             }
             None {}
         }
     }
     return Ok(Unit{})
+}
+
+// Oracle's array DML (the TNS door's runs of one statement for each row of binds, python-oracledb's executemany, JDBC's
+// executeBatch) is one statement for its assertions: Oracle 23.26.3 checks them once after the last run, and a violation
+// fails the call (ORA-08601, every run undone, batch errors or not). on: the checks after each run held (HOLD in the
+// onCommit list; false, nothing held, when the database has had no assertion since the process started); off: they are made
+// for all the runs (s, the statement).
+const HOLD = "\x02h"
+
+pub fn hold(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, on: bool, s: &Stmt, up: &Up): Result[bool, DbErr] {
+    if on {
+        if !assertsSeen { return Ok(false) }
+        append(mut &txn.onCommit, HOLD)
+        return Ok(true)
+    }
+    var keep: []str = []
+    for x in txn.onCommit { if x != HOLD { append(mut &keep, x.clone()) } }
+    txn.onCommit = keep
+    try stmtEnd(st, txn, true, s, up)
+    return Ok(true)
 }
 
 // ---- deferred assertions (DEFERRABLE INITIALLY DEFERRED, SET CONSTRAINT[S] ... DEFERRED): checked at the COMMIT or at SET
@@ -1607,12 +1902,15 @@ fn deferTo(txn: mut &lexdb_store.Txn, a: &Assertion, m: int) {
 
 // SET CONSTRAINT[S] name ... (lexdb_exec.setConstraints): whether name is an assertion (then set for the transaction, as a
 // deferrable foreign key's name is; ORA-08687 for one not deferrable made DEFERRED).
-pub fn setCons(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, deferred: bool): Result[bool, DbErr] {
+pub fn setCons(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, deferred: bool, md: int): Result[bool, DbErr] {
     if !assertsSeen { return Ok(false) }
     let k = try keyOn(st, txn, &txn.sql.path.clone(), n, &ASSERT_PRE)
     if len(k) == 0 { return Ok(false) }
     let a = (try readAt(st, txn, &assertKey(&k))).unwrap()
-    if deferred && !a.deferrable { return Err(ora(8687, "Cannot defer an assertion that is not deferrable.")) }
+    if deferred && !a.deferrable {
+        if md != MD_ORA { return Err(e("42809", &("constraint \"" + nameIn(&a, md) + "\" is not deferrable"))) }
+        return Err(ora(8687, "Cannot defer an assertion that is not deferrable."))
+    }
     append(mut &txn.sql.consNames, k.clone())
     append(mut &txn.sql.consDeferred, deferred)
     return Ok(true)
@@ -1664,11 +1962,11 @@ fn pendingAt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, which: &Option[[
                 var ws: []Wr = []
                 for k in tablesOf(&a) {
                     match try tableOf(st, txn, &k) {
-                        Some(t) { append(mut &ws, Wr{key: k.clone(), tree: t.tree, mark: m, any: true, sets: []}) }
+                        Some(t) { append(mut &ws, Wr{key: k.clone(), tree: t.tree, mark: m, any: true, sets: [], whole: false}) }
                         None {}
                     }
                 }
-                match checkOne(st, txn, &a, &row, &ws, up) {
+                match checkOne(st, txn, &a, &row, &ws, up, if commit { "COMMIT TRANSACTION" } else { "SET CONSTRAINTS" }) {
                     Ok(_) {}
                     Err(x) { err = Some(x) }
                 }
