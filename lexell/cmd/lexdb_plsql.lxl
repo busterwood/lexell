@@ -450,11 +450,14 @@ type Cx = record {
     nested: []NestSig       // the nested subprograms in scope, innermost last
     nestN: int              // nested subprograms numbered in the text
     subs: []PUnit           // the nested subprograms compiled so far
+    declScope: int          // the declarations being compiled: their id (a nested subprogram's scope; overloads share one)
+    scopeN: int             // declaration sections numbered in the text
 }
 
 // A nested subprogram in scope: its signature and its scope's id (PUnit.nest); defined once its body was read (a forward
 // declaration has none yet).
-type NestSig = record { name: str; kind: int; prms: []Prm; ret: PT; nest: str; defined: bool }
+// scope: the declarations that declare it (the overloads of a name are those of one scope).
+type NestSig = record { name: str; kind: int; prms: []Prm; ret: PT; nest: str; defined: bool; scope: int }
 
 fn (cx: &Cx) tk(i: int): Tok { return cx.toks[min(i, len(cx.toks) - 1)].clone() }
 fn (cx: &Cx) isK(i: int, w: &str): bool {
@@ -736,6 +739,157 @@ fn (cx: &Cx) sigOf(names: &[]str): Sig {
     if pick < 0 { return noSig() }
     let e = &cx.sigs[pick]
     return Sig{found: true, kind: e.kind, prms: copyPrms(&e.prms), ret: e.ret, canon: [e.owner.clone(), e.pkg.clone(), e.name.clone()]}
+}
+
+// ---- overloads of nested subprograms
+
+// The family of a type in overload resolution (Oracle's: NUMBER and its subtypes one, the character types one, ...); 0 not known.
+fn famOf(t: &PT): int {
+    if t.k == PK_NUM || t.k == PK_INT { return PK_NUM }
+    if t.k == PK_ANY { return 0 }
+    if t.k == PK_REC { return 100 + t.rec }
+    return t.k
+}
+
+fn famOfVal(v: &Val): int {
+    match v {
+        Val.Int(_) { return PK_NUM }
+        Val.Num(_) { return PK_NUM }
+        Val.Text(_) { return PK_TEXT }
+        Val.Bool(_) { return PK_BOOL }
+        else { return 0 }
+    }
+}
+
+// Whether a value of family f is taken by a parameter of family p by an implicit conversion (scalars into each other; not
+// booleans, records or cursors).
+fn famConv(f: int, p: int): bool {
+    if f == 0 || f == p { return true }
+    return famScalar(f) && famScalar(p)
+}
+
+fn famScalar(f: int): bool { return f != PK_BOOL && f != PK_REFCUR && f != PK_CUR && f != PK_EXC && f < 100 }
+
+// Whether two parameter lists are one signature (a forward declaration and its body): as many, each of one family.
+fn samePrms(a: &[]Prm, b: &[]Prm): bool {
+    if len(a) != len(b) { return false }
+    for i in 0..len(a) { if famOf(&a[i].pt) != famOf(&b[i].pt) { return false } }
+    return true
+}
+
+// The parameters a call's arguments go to (names2: each argument's name, "" by position), or None when they do not fit (a
+// name that is no parameter, too many, a parameter without a default not given).
+fn argMap(prms: &[]Prm, names2: &[]str): Option[[]int] {
+    var given: []bool = array(len(prms), false)
+    var out: []int = []
+    for i in 0..len(names2) {
+        var pi = i
+        if len(names2[i]) > 0 {
+            pi = -1
+            for k in 0..len(prms) { if prms[k].name == names2[i] { pi = k } }
+        }
+        if pi < 0 || pi >= len(prms) || given[pi] { return None }
+        given[pi] = true
+        append(mut &out, pi)
+    }
+    for k in 0..len(prms) { if !given[k] && !prms[k].hasDef { return None } }
+    return Some(out)
+}
+
+// The type family of the argument in tokens s..e: a literal's, a variable's, else the type of the SQL expression it runs as
+// (0: not known, which any parameter takes).
+fn (cx: mut &Cx) argFam(ip: mut &Ip, sess: mut &lexdb_exec.Session, s: int, e: int): Result[int, DbErr] {
+    if e - s == 1 {
+        let t = cx.tk(s)
+        if t.kind == TK_NUM { return Ok(PK_NUM) }
+        if t.kind == TK_STR { return Ok(PK_TEXT) }
+        if cx.isK(s, "NULL") { return Ok(0) }
+        if cx.isK(s, "TRUE") || cx.isK(s, "FALSE") { return Ok(PK_BOOL) }
+        if cx.ident(s) {
+            let vi = cx.find(&t.up)
+            if vi >= 0 { return Ok(famOf(&cx.vars[vi].pt)) }
+        }
+    }
+    let x = try cx.expr(ip, sess, s, e, false)
+    if x.isLit { return Ok(famOfVal(&x.lit)) }
+    if len(x.sql) == 0 {
+        if x.slot >= 0 && x.slot < len(cx.slotPt) { return Ok(famOf(&cx.slotPt[x.slot])) }
+        return Ok(0)
+    }
+    match cx.describeText(sess, &x.sql) {
+        Ok(cols) { if len(cols) == 1 { return Ok(famOf(&ptOfOut(&cols[0]))) } }
+        Err(_) {}
+    }
+    return Ok(0)
+}
+
+// A call's subprogram among the overloads of the nested subprogram sg found (those of its name and kind, 0 any, in the scope
+// that declares it), by its arguments (tokens a..b; none when b <= a): their number, names and type families, as Oracle's
+// resolution: the one that takes each argument in its own family, else the one that takes them by conversion; PLS-00306 when
+// none fits, PLS-00307 when more than one does (a refusal where lexdb cannot tell them apart, never a guess). sg itself when
+// the name has no overloads (a stored unit or a package member: their resolution is by name, as before).
+fn (cx: mut &Cx) overload(ip: mut &Ip, sess: mut &lexdb_exec.Session, sg: Sig, kind: int, a: int, b: int, nameTok: int): Result[Sig, DbErr] {
+    if !sg.found || len(sg.canon) != 4 { return Ok(sg) }
+    var scope = -1
+    for ns in cx.nested { if ns.nest == sg.canon[3] { scope = ns.scope } }
+    var cands: []int = []
+    for k in 0..len(cx.nested) {
+        let ns = &cx.nested[k]
+        if ns.name == sg.canon[2] && ns.scope == scope && (kind == 0 || ns.kind == kind) { append(mut &cands, k) }
+    }
+    if len(cands) <= 1 { return Ok(sg) }
+    let rs = cx.splitArgs(a, b)
+    var names2: []str = []
+    var fams: []int = []
+    var q = 0
+    while q < len(rs) {
+        var s = rs[q]
+        if cx.ident(s) && cx.isO(s + 1, "=>") {
+            append(mut &names2, cx.tk(s).up)
+            s += 2
+        } else {
+            append(mut &names2, "")
+        }
+        append(mut &fams, try cx.argFam(ip, sess, s, rs[q + 1]))
+        q += 2
+    }
+    var exact: []int = []
+    var conv: []int = []
+    for k in cands {
+        match argMap(&cx.nested[k].prms, &names2) {
+            Some(m) {
+                var ex = true
+                var cv = true
+                for i in 0..len(m) {
+                    let pf = famOf(&cx.nested[k].prms[m[i]].pt)
+                    if fams[i] != 0 && fams[i] != pf {
+                        ex = false
+                        if !famConv(fams[i], pf) { cv = false }
+                    }
+                }
+                if ex { append(mut &exact, k) } else if cv { append(mut &conv, k) }
+            }
+            None {}
+        }
+    }
+    let pick = if len(exact) > 0 { exact } else { conv }
+    let nt = cx.tk(nameTok)
+    if len(pick) != 1 {
+        let msg = if len(pick) == 0 { "PLS-00306: wrong number or types of arguments in call to '" + nt.up + "'" } else { "PLS-00307: too many declarations of '" + nt.up + "' match this call" }
+        return Err(plErr("ORA06550", &("line " + nt.line.toStr() + ", column " + nt.col.toStr() + ":\n" + msg + cx.ignored())))
+    }
+    let ns = &cx.nested[pick[0]]
+    return Ok(Sig{found: true, kind: ns.kind, prms: copyPrms(&ns.prms), ret: ns.ret, canon: [cx.owner.clone(), cx.pkg.clone(), ns.name.clone(), ns.nest.clone()]})
+}
+
+// Whether a bare name is a nested function in scope (which SQL cannot call: PLS-00231).
+fn (cx: &Cx) nestedFunc(nm: &str): bool {
+    var k = len(cx.nested) - 1
+    while k >= 0 {
+        if cx.nested[k].name == nm { return cx.nested[k].kind == U_FUNC }
+        k -= 1
+    }
+    return false
 }
 
 // The public variable of a package that names (PKG.VAR or OWNER.PKG.VAR) mean: its entry in sigs, -1 none.
@@ -1053,6 +1207,12 @@ fn (cx: mut &Cx) render(ip: mut &Ip, sess: mut &lexdb_exec.Session, a: int, b: i
                           !cx.sigOf(&[t.up.clone(), cx.tk(i + 2).up.clone()]).found {
                     let nm = cx.tk(i + 2)
                     return Err(plErr("ORA06550", &("line " + nm.line.toStr() + ", column " + nm.col.toStr() + ":\nPLS-00302: component '" + nm.up + "' must be declared" + cx.ignored())))
+                } else if !(hoist && cx.hoistOk) && t.kind == TK_ID && cx.isO(i + 1, "(") && cx.nestedFunc(&t.up) {
+                    // a nested function called from SQL: Oracle's compile refuses it
+                    let at = "line " + t.line.toStr() + ", column " + t.col.toStr() + ":\n"
+                    return Err(plErr("ORA06550", &(at + "PLS-00231: function '" + t.up + "' may not be used in SQL\nORA-06550: " + at +
+                                     "PL/SQL: ORA-03066: invalid PL/SQL expression\nORA-06550: line " + cx.stmtLine.toStr() + ", column " +
+                                     cx.stmtCol.toStr() + ":\nPL/SQL: SQL Statement ignored")))
                 } else if hoist && cx.hoistOk {
                     var names: []str = [t.up.clone()]
                     var j = i
@@ -1063,7 +1223,7 @@ fn (cx: mut &Cx) render(ip: mut &Ip, sess: mut &lexdb_exec.Session, a: int, b: i
                     if cx.isO(j + 1, "(") {
                         let m = cx.matchParen(j + 1)
                         if m < 0 { return Err(cx.bad(j + 1, "")) }
-                        let sg = cx.sigOf(&names)
+                        let sg = try cx.overload(ip, sess, cx.sigOf(&names), U_FUNC, j + 2, m, j)
                         if sg.found && sg.kind == U_FUNC {
                             let tmp = try cx.hoistCall(ip, sess, &sg.canon, j + 2, m, &sg, pre)
                             rep = dollar(tmp)
@@ -1073,7 +1233,7 @@ fn (cx: mut &Cx) render(ip: mut &Ip, sess: mut &lexdb_exec.Session, a: int, b: i
                         }
                     } else {
                         // a function called without arguments (and without brackets)
-                        let sg = cx.sigOf(&names)
+                        let sg = try cx.overload(ip, sess, cx.sigOf(&names), U_FUNC, j + 1, j + 1, j)
                         if sg.found && sg.kind == U_FUNC {
                             let tmp = try cx.hoistCall(ip, sess, &sg.canon, j + 1, j + 1, &sg, pre)
                             rep = dollar(tmp)
@@ -1221,7 +1381,7 @@ fn (cx: mut &Cx) expr(ip: mut &Ip, sess: mut &lexdb_exec.Session, a: int, b: int
                 append(mut &names, cx.tk(q).up)
                 q += 2
             }
-            let sg = cx.sigOf(&names)
+            let sg = try cx.overload(ip, sess, cx.sigOf(&names), U_FUNC, a, a, a)
             if sg.found && sg.kind == U_FUNC {
                 let tmp = try cx.hoistCall(ip, sess, &sg.canon, a, a, &sg, mut &n.pre)
                 n.slot = tmp
@@ -2463,7 +2623,7 @@ fn (cx: mut &Cx) callStmt(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[P,
        strings.startsWith(&full, "DBMS_STATS.") {
         return Ok(node(K_NULL, line))
     }
-    let sg = cx.sigOf(&names)
+    let sg = try cx.overload(ip, sess, cx.sigOf(&names), U_PROC, a, b, i)
     if !sg.found && len(names) >= 2 {
         // a package that has no such member (or not public)
         var isPkg = false
@@ -2590,6 +2750,15 @@ fn (cx: mut &Cx) bodyOf(ip: mut &Ip, sess: mut &lexdb_exec.Session, n: mut &P): 
 
 // Declarations up to BEGIN (not read): K_DECL nodes, in order.
 fn (cx: mut &Cx) decls(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[[]P, DbErr] {
+    let wasScope = cx.declScope
+    cx.scopeN += 1
+    cx.declScope = cx.scopeN
+    let r = cx.decls1(ip, sess)
+    cx.declScope = wasScope
+    return r
+}
+
+fn (cx: mut &Cx) decls1(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[[]P, DbErr] {
     var out: []P = []
     while !cx.isK(cx.pos, "BEGIN") && !(cx.stopAtEnd && cx.isK(cx.pos, "END")) {
         let i = cx.pos
@@ -2737,7 +2906,7 @@ fn newCx(src: &str, toks: []Tok, owner: &str, nls: []str, sigs: []SigEntry, uid:
     var cx = Cx{src: src.toStr(), toks: toks, pos: 0, vars: [], marks: [], slotPt: [], recs: [], curs: [], excs: [], types: [], bindNames: [],
                 bindUse: [], bindSlot: [], nsid: 0, uid: uid, unit: "", owner: owner.toStr(), retPt: pt(PK_ANY), isFunc: false,
                 self: emptyUnit(), hasSelf: false, sigs: sigs, nls: nls, pkg: "", inMember: false, stopAtEnd: false, members: [], ranges: [], pubs: [], specMode: false, stmtLine: 1, stmtCol: 1, uses: false, hoistOk: true, colScope: [], noSubA: -1, noSubB: -1, post: [], strict: false,
-                nested: [], nestN: 0, subs: []}
+                nested: [], nestN: 0, subs: [], declScope: 0, scopeN: 0}
     append(mut &cx.slotPt, pt(PK_INT))
     append(mut &cx.slotPt, pt(PK_BOOL))
     append(mut &cx.slotPt, pt(PK_BOOL))
@@ -5033,7 +5202,7 @@ fn (cx: mut &Cx) nestedUnit(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[
     var ni = -1
     var k = len(cx.nested) - 1
     while k >= 0 {
-        if cx.nested[k].name == u.name && !cx.nested[k].defined && cx.nested[k].kind == kind {
+        if cx.nested[k].name == u.name && !cx.nested[k].defined && cx.nested[k].kind == kind && cx.nested[k].scope == cx.declScope && samePrms(&cx.nested[k].prms, &u.prms) {
             ni = k
             break
         }
@@ -5042,7 +5211,7 @@ fn (cx: mut &Cx) nestedUnit(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[
     if ni < 0 {
         cx.nestN += 1
         let root = if len(cx.self.name) > 0 { cx.self.name.clone() } else { "" }
-        append(mut &cx.nested, NestSig{name: u.name.clone(), kind: kind, prms: copyPrms(&u.prms), ret: u.ret, nest: root + "#" + cx.nestN.toStr(), defined: false})
+        append(mut &cx.nested, NestSig{name: u.name.clone(), kind: kind, prms: copyPrms(&u.prms), ret: u.ret, nest: root + "#" + cx.nestN.toStr(), defined: false, scope: cx.declScope})
         ni = len(cx.nested) - 1
     }
     if cx.isO(cx.pos, ";") {
