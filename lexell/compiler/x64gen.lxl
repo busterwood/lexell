@@ -169,6 +169,7 @@ type Gen = record {
     coal: []int                 // per double: the local its initializer reads as its first operand alone, or -1
     coalBy: []int               // ... and the other way: the local whose initializer reads it so, or -1
     declLoop: []int             // per local: the innermost loop (regions) its declaration is in, or -1
+    declDepth: []int            // per local: loopDepth when declared (0 outside loops)
     tailEnd: []int              // per position: in the statements before a return that run straight
                                 // into it, the return's position; else -1
     pos: int                    // the scan's position: its count of statements
@@ -294,7 +295,7 @@ fn newGen(u: ir.Ir): Gen {
         strs: [], flts: [], fltSym: newMap(), funcPos: [], pend: [], pendLo: 0, pendN: 0, order: [], gLive: [], gQueue: [], relocSeen: 0, slots: [], frame: 0, maxFrame: 0, outArgs: 0, declMark: 0, breakL: [], contL: [],
         caseL: newMap(), retPtr: 0, wideAt: -1, initVia: 0, viaLoaded: false, retTy: 0, epiL: -1, epiJmps: [], loopTops: [], funcAlign: padFromEnv("LXL_FALIGN", FUNC_ALIGN), padBefore: padFromEnv("LXL_PADB", 0), shortJ: padFromEnv("LXL_SHORTJ", 1) != 0, loopLines: padFromEnv("LXL_LOOPLINES", LOOP_LINES), loopEnds: [], entrySym: -1, dyn: false, libs: [], imports: [], importSym: newMapWith[str, int](fxHashStr), stubs: [], grows: [],
         stubOf: newMapWith[str, int](fxHashStr), codeEnd: 0, reg: [], freg: [], preg: [], preg2: [], fpLoud: [], fpKeep: newMapWith[str, bool](fxHashStr), uses: [], weight: [], rawW: [], bad: [], touched: [], first: [], last: [],
-        noInit: [], inner: [], pts: [], defAt: [], coal: [], coalBy: [], declLoop: [], tmpRegs: [], tmpUsed: 0, unused: false, prevDecl: -1, tailEnd: [], pos: 0, scanExpr: 0, loud: [], loud89: [], loud1011: [], any89: false, regions: [], openLoops: [],
+        noInit: [], inner: [], pts: [], defAt: [], coal: [], coalBy: [], declLoop: [], declDepth: [], tmpRegs: [], tmpUsed: 0, unused: false, prevDecl: -1, tailEnd: [], pos: 0, scanExpr: 0, loud: [], loud89: [], loud1011: [], any89: false, regions: [], openLoops: [],
         saved: [], seen: [], stamp: 1, counting: false, scanStack: [], inlStack: [], inlEnd: [], inl: [], curFunc: -1,
         loops: 0, aTaken: [], emptyS: -1, callDest: NO_MEM, callFresh: false, simpF: -1, destUsed: false, byteDest: 0, posOf: [], posSeen: [],
         inlPos: -1, held: [], nLocalRegs: 0, bareRet: false, rm: newMap(), noCopy: -1, sites: [],
@@ -337,6 +338,7 @@ fn newGen(u: ir.Ir): Gen {
         append(mut &g.coal, -1)
         append(mut &g.coalBy, -1)
         append(mut &g.declLoop, -1)
+        append(mut &g.declDepth, 0)
         append(mut &g.spillSlot, 0)
     }
     g.countUses()
@@ -1196,12 +1198,11 @@ fn (g: mut &Gen) allocRegs(f: int) {
             if r < 0 && g.regFree(&given, LOCAL_REGS[i], l) { r = LOCAL_REGS[i] }
         }
         // r10 or r11 where no position of the range changes them (clobbers1011): nothing to save;
-        // for a local used in a loop (raw weight 128: two uses there), which is where it pays (and
-        // the registers' lists of locals stay short: regFree compares a range with each)
-        if r < 0 && !g.inner[l] && g.rawW[l] >= 128 {
+        // helps hot leaf functions as well as loops (capped list length keeps regFree fast).
+        if r < 0 && !g.inner[l] && g.rawW[l] >= 16 {
             var q = -1
             for x in SCRATCH_REGS {
-                if q < 0 && g.regFree(&given, x, l) { q = x }
+                if q < 0 && len(given[x]) < 64 && g.regFree(&given, x, l) { q = x }
             }
             if q >= 0 && len(l1011Before) == 0 {
                 append(mut &l1011Before, 0)
@@ -2113,6 +2114,7 @@ fn (g: mut &Gen) touch(l: int) {
         g.coal[l] = -1
         g.coalBy[l] = -1
         g.declLoop[l] = -1
+        g.declDepth[l] = 0
     }
 }
 
@@ -2669,6 +2671,7 @@ fn (g: mut &Gen) scan(x: int, depth: int) {
         let l = n.a
         g.occur(l)
         g.declLoop[l] = if len(g.openLoops) > 0 { g.openLoops[len(g.openLoops) - 1] } else { -1 }
+        g.declDepth[l] = g.loopDepth
         if n.b >= 0 && n.c < 0 && g.first[l] == g.pos {
             g.defAt[l] = g.pos
             if g.isF(g.u.locals[l].ty) {
@@ -6083,10 +6086,35 @@ fn (g: mut &Gen) genAssign(e: int) {
         return
     }
     if g.regOf(lhs) >= 0 {
-        if unused && g.u.nodes[n.b].ty == t && g.loadInto(n.b, g.regOf(lhs)) { return }
+        let r = g.regOf(lhs)
+        if unused && g.u.nodes[n.b].ty == t {
+            if g.loadInto(n.b, r) { return }
+            let rk = g.rotl(n.b)
+            if rk > 0 && g.regOf(g.u.nodes[g.u.nodes[n.b].a].a) == r {
+                g.a.shiftI(x64.ROL, 8, r, rk)
+                return
+            }
+            let vn = g.u.nodes[n.b]
+            if vn.k == ir.E_BIN && (vn.v == ir.OP_XOR || vn.v == ir.OP_OR || vn.v == ir.OP_AND || vn.v == ir.OP_ADD) &&
+                g.size(vn.c) == 8 {
+                let xop = if vn.v == ir.OP_XOR { x64.XOR } else if vn.v == ir.OP_OR { x64.OR } else if vn.v == ir.OP_AND { x64.AND } else { x64.ADD }
+                let rk1 = g.rotl(vn.a)
+                if rk1 > 0 && g.regOf(g.u.nodes[g.u.nodes[vn.a].a].a) == r && g.regOf(vn.b) >= 0 && g.regOf(vn.b) != r {
+                    g.a.shiftI(x64.ROL, 8, r, rk1)
+                    g.a.alu(xop, 8, r, g.regOf(vn.b))
+                    return
+                }
+                let rk2 = g.rotl(vn.b)
+                if rk2 > 0 && g.regOf(g.u.nodes[g.u.nodes[vn.b].a].a) == r && g.regOf(vn.a) >= 0 && g.regOf(vn.a) != r {
+                    g.a.shiftI(x64.ROL, 8, r, rk2)
+                    g.a.alu(xop, 8, r, g.regOf(vn.a))
+                    return
+                }
+            }
+        }
         g.gen(n.b)
         if !g.normAs(g.u.nodes[n.b].ty, t) { g.normR(g.tk(t), RAX) }
-        g.a.movRR(8, g.regOf(lhs), RAX)
+        g.a.movRR(8, r, RAX)
         return
     }
     var m = g.staticMem(lhs)
@@ -6189,6 +6217,25 @@ fn (g: mut &Gen) genAssign(e: int) {
     if g.u.nk(lhs) == ir.E_GLOBAL {
         g.gen(n.b)
         g.a.movRSym(R11, g.globalSym[g.u.nodes[lhs].a], 0)
+    } else if g.isAggr(t) && g.u.nk(n.b) == ir.E_LOCAL && g.u.nodes[n.b].ty == t && g.slots[g.u.nodes[n.b].a] != 0 {
+        let srcL = g.u.nodes[n.b].a
+        let srcM = rbp(g.slots[srcL])
+        let sz = g.size(t)
+        g.genAddr(lhs)
+        g.a.movRR(8, R11, RAX)
+        if sz >= 32 && g.declDepth[srcL] < g.loops {
+            var o = 0
+            while sz - o >= 16 {
+                g.a.movdquLoad(15, at(srcM, o))
+                g.a.movdquStore(x64.mem(R11, o), 15)
+                o += 16
+            }
+            if o < sz { g.copyMem(x64.mem(R11, o), at(srcM, o), sz - o) }
+        } else {
+            g.copyMem(x64.mem(R11, 0), srcM, sz)
+        }
+        if !unused { g.a.movRR(8, RAX, R11) }
+        return
     } else if g.simple(n.b) && !g.isAggr(t) && !g.isF(t) && !g.is128(t) {
         g.genAddr(lhs)
         g.a.movRR(8, R11, RAX)
@@ -6538,7 +6585,7 @@ fn (g: mut &Gen) genBin(e: int) {
 // local x with 0 < k < 64: a rotate left, one rol (std's SipHash); else 0.
 fn (g: &Gen) rotl(e: int): int {
     let n = g.u.nodes[e]
-    if n.v != ir.OP_OR || g.size(n.c) != 8 || g.u.isSigned(n.c) || g.isF(n.c) || g.is128(n.c) { return 0 }
+    if n.k != ir.E_BIN || n.v != ir.OP_OR || g.size(n.c) != 8 || g.u.isSigned(n.c) || g.isF(n.c) || g.is128(n.c) { return 0 }
     var l = n.a
     var r = n.b
     if g.u.nodes[l].k != ir.E_BIN || g.u.nodes[r].k != ir.E_BIN { return 0 }
@@ -8663,6 +8710,20 @@ fn (g: &Gen) isWhere(w: int): bool {
     return g.u.nk(w) == ir.E_DECAY && g.u.nk(g.u.nodes[w].a) == ir.E_STR
 }
 
+// Whether shift count expression b is guaranteed in 0..bits-1 (e.g. `x & 31`).
+fn (g: &Gen) shiftSafe(b: int, bits: int): bool {
+    var x = b
+    while g.noopCast(x) { x = g.u.nodes[x].a }
+    let n = g.u.nodes[x]
+    if n.k == ir.E_BIN && n.v == ir.OP_AND {
+        let a = g.u.nodes[n.a]
+        let c = g.u.nodes[n.b]
+        if a.k == ir.E_INT && a.v >= 0 && a.v < bits { return true }
+        if c.k == ir.E_INT && c.v >= 0 && c.v < bits { return true }
+    }
+    return false
+}
+
 // The overflow test of a checked operation ar (rt_add_int, ...) whose result is in register r:
 // a jump to the trap stub for the location string w. Only a u32 multiply uses another register
 // (rcx).
@@ -9108,20 +9169,21 @@ fn (g: mut &Gen) inlineRt(e: int, name: &str): bool {
             g.a.load(4, RDX, x64.mem(RAX, 8))
             g.a.aluRM(x64.CMP, 4, RDX, x64.mem(RAX, 12))
             g.a.jcc(x64.CC_AE, slow)
-            g.a.aluMI(x64.ADD, 4, x64.mem(RAX, 8), 1)
+            g.a.aluI(x64.ADD, 4, RDX, 1)
+            g.a.store(4, x64.mem(RAX, 8), RDX)
             g.a.load(8, RAX, x64.mem(RAX, 0))
-            g.a.storeI(1, x64.memx(RAX, RDX, 1, 0), v)
-            g.a.storeI(1, x64.memx(RAX, RDX, 1, 1), 0)
+            g.a.storeI(2, x64.memx(RAX, RDX, 1, -1), v)
         } else {
             g.pair(sArg, cArg)
             append(mut &g.grows, Grow{label: slow, back: done, size: -1, mem: 3})
             g.a.load(4, RDX, x64.mem(RAX, 8))
             g.a.aluRM(x64.CMP, 4, RDX, x64.mem(RAX, 12))
             g.a.jcc(x64.CC_AE, slow)
-            g.a.aluMI(x64.ADD, 4, x64.mem(RAX, 8), 1)
+            g.a.aluI(x64.ADD, 4, RDX, 1)
+            g.a.store(4, x64.mem(RAX, 8), RDX)
             g.a.load(8, RAX, x64.mem(RAX, 0))
-            g.a.store(1, x64.memx(RAX, RDX, 1, 0), RCX)
-            g.a.storeI(1, x64.memx(RAX, RDX, 1, 1), 0)
+            g.a.zx(1, RCX, RCX)
+            g.a.store(2, x64.memx(RAX, RDX, 1, -1), RCX)
         }
         g.a.bind(done)
         return true
@@ -9250,8 +9312,10 @@ fn (g: mut &Gen) inlineDiv(dv: ArOp, e: int) {
             if bn.v != 0 { g.a.shiftI(sop, sz, RAX, bn.v) }
         } else {
             g.srcRCX(g.pairSrc(a, b))
-            g.a.aluI(x64.CMP, 8, RCX, bits - 1)
-            g.a.jcc(x64.CC_A, g.stub(10, "shift count out of range", w))
+            if !g.shiftSafe(b, bits) {
+                g.a.aluI(x64.CMP, 8, RCX, bits - 1)
+                g.a.jcc(x64.CC_A, g.stub(10, "shift count out of range", w))
+            }
             g.a.shiftCL(sop, sz, RAX)
         }
         g.normR(k, RAX)
@@ -9679,7 +9743,23 @@ fn (g: mut &Gen) link(): []byte {
     if rmem > 0 { append(mut &segs, elf.Seg{vaddr: rtx.DATA_ADDR, flags: elf.PF_R | elf.PF_W, data: rdata, memsz: rmem}) }
     if memEnd == 0 { memEnd = 16 }
     append(mut &segs, elf.Seg{vaddr: dataBase, flags: elf.PF_R | elf.PF_W, data: data, memsz: memEnd})
-    return elf.image(codeBase, &segs, dynAt, dynLen)
+    var elfSyms: []elf.Sym = []
+    for i in 0..len(rtx.SEC_KIND) {
+        if g.rtLive[i] && int(rtx.SEC_KIND[i]) == rtx.K_CODE && int(rtx.SEC_SIZE[i]) > 0 {
+            append(mut &elfSyms, elf.Sym{name: rtx.SEC_NAMES[i].clone(), addr: g.rtAt[i], size: int(rtx.SEC_SIZE[i])})
+        }
+    }
+    let startEnd = if len(g.order) > 0 { g.funcPos[g.order[0]] } else { g.codeEnd }
+    if startEnd > 0 {
+        append(mut &elfSyms, elf.Sym{name: "_start", addr: codeBase, size: startEnd})
+    }
+    let fs = &g.order
+    for i in 0..len(fs) {
+        let f = fs[i]
+        let end = if i + 1 < len(fs) { g.funcPos[fs[i + 1]] } else { g.codeEnd }
+        append(mut &elfSyms, elf.Sym{name: g.u.funcs[f].name.clone(), addr: codeBase + g.funcPos[f], size: end - g.funcPos[f]})
+    }
+    return elf.image(codeBase, &segs, dynAt, dynLen, &elfSyms)
 }
 
 // Finds the library of every import (the first of libs that defines it, as a linker searches

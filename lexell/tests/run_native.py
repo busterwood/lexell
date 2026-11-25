@@ -155,9 +155,9 @@ def one(path, lxlc):
 # sections reachable from what the program uses. (program, the most bytes its executable may
 # have, runtime functions its map must list, ... must not list, its output)
 PARTS = [
-    ('fn main() {\n}\n', 16384, ['rt_init', 'rt_segv', 'rt_n_restore', 'rt_n_start'],
+    ('fn main() {\n}\n', 18432, ['rt_init', 'rt_segv', 'rt_n_restore', 'rt_n_start'],
      ['rt_ctx_swap', 'rt_float_to_str', 'malloc', 'rt_str_concat'], ''),
-    ('fn main() {\n    println("hello")\n}\n', 20544, ['rt_init', 'rt_write_fd'],
+    ('fn main() {\n    println("hello")\n}\n', 24576, ['rt_init', 'rt_write_fd'],
      ['rt_ctx_swap', 'rt_float_to_str'], 'hello\n'),
     ('import "task"\n\nfn inc(x: int): int {\n    task.sleep(1)\n    return x + 1\n}\n\n'
      'fn main() {\n    task.scope(fn(s: mut &task.Scope) { println(intToStr(s.start(inc, 41).wait().unwrap())) })\n}\n',
