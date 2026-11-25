@@ -13091,3 +13091,13 @@ COPY FROM STDIN refuses an option given twice (42601), FORCE_NOT_NULL / FORCE_NU
 does (`wire_copyerr`). The core's share of the slice's other doors: MIN and MAX keep the first of equal Val.Tsz instants (`lexdb_agg.takes`), an index-only scan does not read a Val.Tsz column
 from its key (the instant alone, `lexdb_access.idCode`), MIN and MAX keep a time type's scale in OutCol.scale, an Oracle view's calls of stored functions are kept after its text
 (`lexdb_sql.PLF_MARK`) and made lookups when it is read (`lexdb_routine.viewPlf`).
+
+### 9.146 Assertions in the PostgreSQL and T-SQL doors; every write path checked (lexdb-new-features.md 14.1, 2026-11-25)
+
+The SQL standard's CREATE ASSERTION / DROP ASSERTION / SET CONSTRAINTS in the PostgreSQL and T-SQL doors (Oracle's were built in section 14):
+an assertion keeps the dialect it was made in and is checked for every door's writes, each door's error (23514, 547, ORA-08601), listed in
+each door's catalog (information_schema.ASSERTIONS and CHECK_CONSTRAINTS; USER_/ALL_ASSERTIONS). The write paths audited (the table in 14.1):
+UPDATE / DELETE / COPY with batch_rows are checked per batch (were refused), TRUNCATE and ALTER ... TYPE run the whole query, a foreign key's
+ON UPDATE action is checked whatever the statement's SET, COPY's fast path is not taken for an asserted table (its rows could not be read back:
+they went unchecked), Oracle's array DML is one check after its last run (as Oracle), and many rows put are checked by key 4,096 at a time
+(a 1,000,000-row COPY into an asserted table 113 s -> 1.8 s). Tests pg_assert, tds_assert, tns_assert_doors; replica.py. lexdb_exec +8 lines.

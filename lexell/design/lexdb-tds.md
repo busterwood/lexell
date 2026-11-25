@@ -1217,3 +1217,17 @@ OID alone is an instant; `datetimeoffset - datetimeoffset` and `+ n` are an inte
 - SWITCHOFFSET, TODATETIMEOFFSET, AT TIME ZONE, MIN and MAX keep their argument's scale (`lexdb_syscat.timeScale`); MIN and MAX of equal instants keep the first's offset.
 - FORMAT's C has no decimals for ja-JP, ko-KR, id-ID, es-CO, ja, ko.
 - CHECK_CLAUSE and sys.check_constraints.definition in SQL Server's form (`lexdb_tsqldef`); CAST, N'...' and system-named constraints' names stay lexdb's. Test `tds_bugs3`.
+
+## As built: assertions (lexdb-new-features.md 14.1, 2026-11-25)
+
+SQL Server has none; the door takes the SQL standard's `CREATE ASSERTION [schema.]name CHECK (...) [[NOT] DEFERRABLE] [INITIALLY IMMEDIATE |
+DEFERRED]`, `DROP ASSERTION [IF EXISTS]` and `SET CONSTRAINTS name, ... | ALL DEFERRED | IMMEDIATE` as statements of its own (a CREATE ASSERTION
+ends after its CHECK and characteristics: no `;` needed). A violation is 547, severity 16, `The INSERT statement conflicted with the assertion
+"a". The conflict occurred in database "lexdb", table "dbo.t".` (the statement's word: UPDATE, DELETE, MERGE, TRUNCATE TABLE, ALTER TABLE,
+CREATE ASSERTION, SET CONSTRAINTS, COMMIT TRANSACTION), the statement ended and the transaction kept as for a CHECK's 547, XACT_ABORT ON rolling it
+back and ending the batch, TRY ... CATCH catching it. A deferred one is checked at the outermost COMMIT TRAN (nested BEGIN TRAN's inner COMMITs
+do not), the transaction rolled back (@@TRANCOUNT 0, XACT_STATE() 0; with XACT_ABORT ON the batch ends there), outside a transaction at the
+statement's end; SAVE TRAN / ROLLBACK TRAN to it drops the writes it undid from the check. 2714, 3701, 2760, 5074 (DROP COLUMN), 15336
+(sp_rename), 3729 (DROP TABLE); the refused shapes 50000 (lexdb's own error number in this door). INFORMATION_SCHEMA.ASSERTIONS and the
+assertion's CHECK_CONSTRAINTS row; no sys.objects row (no type for one: SSMS, sp_help and mssql-jdbc's metadata do not see it). The bulk load
+(INSERT BULK) is checked with or without CHECK_CONSTRAINTS. Test `tds_assert`.
