@@ -1,0 +1,217 @@
+// lexdb over TDS: SQL:2023 property graphs (SQL/PGQ) in the SQL Server door.
+// Covers CREATE [OR REPLACE | OR ALTER] PROPERTY GRAPH [IF NOT EXISTS], DROP PROPERTY GRAPH [IF EXISTS] [RESTRICT | CASCADE],
+// NODE/RELATIONSHIP synonyms, multi-statement batches without ';', dbo/case-insensitive/[bracket] names, computed properties,
+// AS alias (col_aliases), quantified paths + COUNT/SUM/STRING_AGG/LISTAGG, MATCHNUM(), VERTEX_ID/EDGE_ID,
+// undirected edges + IS SOURCE/DESTINATION OF + IS LABELED, heterogeneous label disjunction, T-SQL @vars + sp_executesql,
+// CREATE VIEW over GRAPH_TABLE, TRY ... CATCH, cross-door persistence, and SQL Server error numbers (2714, 3701, 208, 207, 2760, 137, 102, 50000).
+// expect: setup: 5 batches
+// expect: same: ok // ok // ok // ok // ok // ok
+// expect: same: n = 3
+// expect: same: id,name,double_age,town = 1|Ann|60|OSLO;2|Bob|80|ROME;3|Cid|50|OSLO
+// expect: same: p1,p2 = Ann|Bob;Bob|Cid;Cid|Ann
+// expect: same: a,b,tot,yrs = Ann|Bob|2010|2010;Ann|Cid|4022|2010,2012;Bob|Ann|4027|2012,2015;Bob|Cid|2012|2012;Cid|Ann|2015|2015;Cid|Bob|4025|2015,2010
+// expect: same: m,a,b = 1|Ann|Bob;2|Bob|Cid;3|Cid|Ann
+// expect: same: vid = {"GRAPH_OWNER":"dbo","GRAPH_NAME":"sg","ELEM_TABLE":"person","KEY_VALUE":{"id":1}}
+// expect: same: a,b = Ann|Bob;Bob|Cid;Cid|Ann
+// expect: same: src,dst,kind,since,role = Ann|Acme|company|NULL|dev;Ann|Bob|person|2010|NULL
+// expect: same: a,b = Ann|Bob;Bob|Cid;Cid|Ann
+// expect: same: a,b = Ann|Bob;Bob|Cid
+// expect: same: a,b = Bob|Cid
+// expect: same: a,b = Ann|Bob;Bob|Cid;Cid|Ann // ok // error 208 (16): Invalid object name 'sg'. // ok // a,b = Ann|Bob;Bob|Cid;Cid|Ann
+// expect: same: errno = 3701
+// expect: same: error 2714 (16): There is already an object named 'sg' in the database.
+// expect: same: error 2714 (16): There is already an object named 'person' in the database.
+// expect: same: error 3701 (11): Cannot drop the property graph 'nope', because it does not exist or you do not have permission.
+// expect: same: error 208 (16): Invalid object name 'nope'.
+// expect: same: error 208 (16): table or view "no_such_table" does not exist
+// expect: same: error 207 (16): property "no_such_prop" is never defined
+// expect: same: error 2760 (16): The specified schema name "no_such_schema" either does not exist or you do not have permission to use it.
+// expect: same: error 137 (16): Must declare the scalar variable "@missing".
+// expect: same: error 137 (16): Must declare the scalar variable "@x".
+// expect: same: error 50000 (16): only pure functions can be specified in a column expression used to define a property
+// expect: same: error 50000 (16): unknown label
+// expect: same: error 50000 (16): unsupported quantifier for variable path pattern in a GRAPH_TABLE operator
+// expect: same: error 50000 (16): lexdb: GRAPH_TABLE's ONE ROW PER VERTEX and ONE ROW PER STEP are not supported (ONE ROW PER MATCH is)
+// expect: same: error 102 (15): invalid value specified for bounded quantifier in a GRAPH_TABLE operator
+// expect: reopened: Ann|Bob;Bob|Cid;Cid|Ann
+import "strings"
+import "task"
+import "net"
+import "tds"
+import "sqldialect"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+fn cellText(c: &tds.Column, v: &tds.Cell): str {
+    match v {
+        tds.Cell.Null { return "NULL" }
+        else { return tds.cellText(c, v).unwrapOr("?") }
+    }
+}
+
+fn said(r: Result[tds.Reply, sqldialect.DbError]): str {
+    match r {
+        Ok(rep) {
+            var parts: []str = []
+            for e in rep.errors { append(mut &parts, "error " + e.number.toStr() + " (" + e.class.toStr() + "): " + e.text) }
+            for rs in rep.results {
+                var rows: []str = []
+                for row in rs.rows {
+                    var cells: []str = []
+                    for i in 0..len(row) { append(mut &cells, cellText(&rs.columns[i], &row[i])) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                var names: []str = []
+                for c in rs.columns { append(mut &names, c.name.clone()) }
+                append(mut &parts, strings.join(&names, ",") + " = " + strings.join(&rows, ";"))
+            }
+            if len(rep.results) == 0 && len(rep.errors) == 0 {
+                for c in rep.counts { if c.resultSet < 0 && c.rows >= 0 { append(mut &parts, "(" + c.rows.toStr() + ")") } }
+            }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "failed " + e.code.toStr() + " " + e.msg }
+    }
+}
+
+fn setup(): []str {
+    return [
+        "CREATE TABLE dbo.Person (Id int PRIMARY KEY, Name nvarchar(30), Age int, City nvarchar(30))",
+        "CREATE TABLE dbo.Company (Id int PRIMARY KEY, Name nvarchar(30), City nvarchar(30))",
+        "CREATE TABLE dbo.Knows (Id int PRIMARY KEY, Src int REFERENCES dbo.Person(Id), Dst int REFERENCES dbo.Person(Id), Since int)",
+        "CREATE TABLE dbo.Works_At (Pid int REFERENCES dbo.Person(Id), Cid int REFERENCES dbo.Company(Id), Role nvarchar(20), PRIMARY KEY (Pid, Cid))",
+        "INSERT dbo.Person VALUES (1, N'Ann', 30, N'Oslo'), (2, N'Bob', 40, N'Rome'), (3, N'Cid', 25, N'Oslo'); INSERT dbo.Company VALUES (10, N'Acme', N'Oslo'); INSERT dbo.Knows VALUES (10, 1, 2, 2010), (11, 2, 3, 2012), (12, 3, 1, 2015); INSERT dbo.Works_At VALUES (1, 10, N'dev')",
+    ]
+}
+
+fn lines(): []str {
+    let sgDef = "dbo.sg VERTEX TABLES (dbo.Person KEY (Id) LABEL Person PROPERTIES (Id, Name, Age, Age * 2 AS double_age, UPPER(City) AS town), dbo.Company KEY (Id) LABEL Company PROPERTIES (Id, Name, City)) EDGE TABLES (dbo.Knows SOURCE KEY (Src) REFERENCES Person (Id) DESTINATION KEY (Dst) REFERENCES Person (Id) LABEL Knows PROPERTIES (Since), dbo.Works_At SOURCE Person DESTINATION Company LABEL Works_At PROPERTIES (Role))"
+    return [
+        // 1. DDL variants: CREATE, IF NOT EXISTS, OR REPLACE, OR ALTER, DROP IF EXISTS RESTRICT, DROP CASCADE
+        "CREATE PROPERTY GRAPH " + sgDef + " ;; CREATE PROPERTY GRAPH IF NOT EXISTS sg VERTEX TABLES (Person) ;; CREATE OR REPLACE PROPERTY GRAPH " + sgDef + " ;; CREATE OR ALTER PROPERTY GRAPH " + sgDef + " ;; DROP PROPERTY GRAPH IF EXISTS no_such RESTRICT ;; CREATE PROPERTY GRAPH tmp_g VERTEX TABLES (Person); DROP PROPERTY GRAPH tmp_g CASCADE",
+        // 2. Multi-statement T-SQL batch without semicolons
+        "CREATE PROPERTY GRAPH batch_g VERTEX TABLES (dbo.Person) SELECT COUNT(*) AS n FROM GRAPH_TABLE (batch_g MATCH (p) COLUMNS (p.id)) DROP PROPERTY GRAPH batch_g",
+        // 3. Case-insensitive & [bracket] names + computed properties
+        "SELECT id, name, double_age, town FROM GRAPH_TABLE (dbo.SG MATCH (a IS person) COLUMNS (a.Id, a.[Name], a.DOUBLE_AGE, a.Town)) ORDER BY id",
+        // 4. AS alias and column alias list
+        "SELECT g.p1, g.p2 FROM GRAPH_TABLE (sg MATCH (a IS person) -[e IS knows]-> (b IS person) COLUMNS (a.name AS x, b.name AS y)) AS g (p1, p2) ORDER BY g.p1",
+        // 5. Quantified path + SUM + STRING_AGG
+        "SELECT a, b, tot, yrs FROM GRAPH_TABLE (sg MATCH (a IS person) -[e IS knows]->{1,2} (b IS person) COLUMNS (a.name AS a, b.name AS b, SUM(e.since) AS tot, STRING_AGG(e.since, ',') AS yrs)) ORDER BY a, b",
+        // 6. MATCHNUM()
+        "SELECT m, a, b FROM GRAPH_TABLE (sg MATCH (a IS person) -[e IS knows]-> (b IS person) ONE ROW PER MATCH COLUMNS (MATCHNUM() AS m, a.name AS a, b.name AS b)) ORDER BY m",
+        // 7. VERTEX_ID
+        "SELECT vid FROM GRAPH_TABLE (sg MATCH (a IS person) WHERE a.id = 1 COLUMNS (VERTEX_ID(a) AS vid))",
+        // 8. Undirected edge + IS SOURCE OF / IS DESTINATION OF
+        "SELECT a, b FROM GRAPH_TABLE (sg MATCH (a IS person) -[e IS knows]- (b IS person) WHERE a IS SOURCE OF e AND b IS DESTINATION OF e COLUMNS (a.name AS a, b.name AS b)) ORDER BY a",
+        // 9. Label disjunction + IS LABELED + heterogeneous NULL properties
+        "SELECT src, dst, kind, since, role FROM GRAPH_TABLE (sg MATCH (a IS person WHERE a.name = N'Ann') -[e]-> (b IS person|company) COLUMNS (a.name AS src, b.name AS dst, CASE WHEN b IS LABELED company THEN 'company' ELSE 'person' END AS kind, e.since, e.role)) ORDER BY kind, dst",
+        // 10. ISO NODE TABLES / RELATIONSHIP TABLES + inferred FK
+        "CREATE OR ALTER PROPERTY GRAPH iso_g NODE TABLES (Person, Company) RELATIONSHIP TABLES (Works_At SOURCE Person DESTINATION Company); SELECT a, b FROM GRAPH_TABLE (sg MATCH (a IS person) -[k IS knows]-> (b IS person) COLUMNS (a.name AS a, b.name AS b)) ORDER BY a; DROP PROPERTY GRAPH iso_g",
+        // 11. Local T-SQL @variable in GRAPH_TABLE
+        "DECLARE @min_age int = 28; SELECT a, b FROM GRAPH_TABLE (sg MATCH (a IS person WHERE a.age >= @min_age) -[k IS knows]-> (b IS person) COLUMNS (a.name AS a, b.name AS b)) ORDER BY a",
+        // 12. sp_executesql with @id parameter
+        "sp_executesql N'SELECT a, b FROM GRAPH_TABLE (sg MATCH (a IS person) -[k IS knows]-> (b IS person) WHERE a.id = @id COLUMNS (a.name AS a, b.name AS b))', N'@id int', @id = 2",
+        // 13. View over GRAPH_TABLE: drop graph -> 208, recreate -> works
+        "CREATE OR ALTER VIEW dbo.v_knows AS SELECT a, b FROM GRAPH_TABLE (sg MATCH (a IS person) -[k IS knows]-> (b IS person) COLUMNS (a.name AS a, b.name AS b)); SELECT a, b FROM dbo.v_knows ORDER BY a ;; DROP PROPERTY GRAPH sg ;; SELECT a, b FROM dbo.v_knows ;; CREATE PROPERTY GRAPH " + sgDef + " ;; SELECT a, b FROM dbo.v_knows ORDER BY a",
+        // 14. TRY ... CATCH around DROP PROPERTY GRAPH
+        "BEGIN TRY DROP PROPERTY GRAPH nope END TRY BEGIN CATCH SELECT ERROR_NUMBER() AS errno END CATCH",
+        // 15. SQL Server error numbers
+        "CREATE PROPERTY GRAPH sg VERTEX TABLES (Person)",
+        "CREATE PROPERTY GRAPH Person VERTEX TABLES (Company)",
+        "DROP PROPERTY GRAPH nope",
+        "SELECT * FROM GRAPH_TABLE (nope MATCH (a) COLUMNS (a.id))",
+        "CREATE PROPERTY GRAPH bad1 VERTEX TABLES (no_such_table)",
+        "SELECT * FROM GRAPH_TABLE (sg MATCH (a IS person) COLUMNS (a.no_such_prop))",
+        "CREATE PROPERTY GRAPH no_such_schema.g VERTEX TABLES (Person)",
+        "SELECT * FROM GRAPH_TABLE (sg MATCH (a IS person) WHERE a.id = @missing COLUMNS (a.id))",
+        "CREATE PROPERTY GRAPH bad_var VERTEX TABLES (Person PROPERTIES (Id + @x AS v))",
+        "CREATE PROPERTY GRAPH bad_impure VERTEX TABLES (Person PROPERTIES (GETDATE() AS ts))",
+        "SELECT * FROM GRAPH_TABLE (sg MATCH (a IS no_such_label) COLUMNS (a.id))",
+        "SELECT * FROM GRAPH_TABLE (sg MATCH (a IS person) -[k]->* (b IS person) COLUMNS (a.id))",
+        "SELECT * FROM GRAPH_TABLE (sg MATCH (a IS person) ONE ROW PER VERTEX COLUMNS (a.id))",
+        "SELECT * FROM GRAPH_TABLE (sg MATCH (a IS person) -[k]->{3,1} (b IS person) COLUMNS (a.id))",
+    ]
+}
+
+fn answer(s: mut &tds.Session, line: &str): str {
+    var out: []str = []
+    for b in strings.split(line, " ;; ") {
+        append(mut &out, said(s.batch(&b)))
+    }
+    return strings.join(&out, " // ")
+}
+
+fn client(dsn: &str) {
+    let st = sqlserver.parseConnString(&(dsn.toStr())).unwrap()
+    var s = tds.open(&st.config).unwrap()
+    var n = 0
+    for x in setup() {
+        let r = said(s.batch(&x))
+        if r != "ok" && !strings.startsWith(&r, "(") { println("setup: " + x + ": " + r) } else { n += 1 }
+    }
+    println("setup: " + n.toStr() + " batches")
+    for l in lines() {
+        let a = said(s.batch("SET lexdb_batch = off"))
+        let off = answer(mut &s, &l)
+        // Clean up sg before second pass only if this is the first test (line 0 recreates sg)
+        if strings.startsWith(&l, "CREATE PROPERTY GRAPH dbo.sg ") { let dr = said(s.batch("DROP PROPERTY GRAPH IF EXISTS sg")) }
+        let b = said(s.batch("SET lexdb_batch = on"))
+        let on = answer(mut &s, &l)
+        if off == on { println("same: " + on) } else {
+            println("DIFFERENT: " + l)
+            println("  rows:    " + off)
+            println("  batches: " + on)
+        }
+    }
+}
+
+fn opts(): lexdb_store.Options { return lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000} }
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(sc: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        client(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag.clone() }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "error " + e.state + " " + e.msg }
+    }
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(99)
+    lexdb_store.run(fs.share(), opts(), body).unwrap()
+    // Reopened store: graph created via TDS is persisted and readable from PostgreSQL door too
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st)
+        println("reopened: " + q(mut &s, "select a, b from graph_table (sg match (a is person) -[k is knows]-> (b is person) columns (a.name as a, b.name as b)) order by a"))
+        s.close()
+        return 0
+    }).unwrap()
+}

@@ -419,7 +419,8 @@ fn quoted(s: &str, i: int, q: byte, b: mut &str): Result[int, lexdb_base.DbErr] 
     return Ok(j)
 }
 
-fn lexIn(s: &str, dialect: Dialect): Result[[]Tok, lexdb_base.DbErr] { return lexOra(s, dialect, false) }
+fn lexIn(s: &str, dialect: Dialect): Result[[]Tok, lexdb_base.DbErr] { return lexInGt(s, dialect, false, 0) }
+fn lexOra(s: &str, dialect: Dialect, ora: bool): Result[[]Tok, lexdb_base.DbErr] { return lexInGt(s, dialect, ora, 0) }
 
 // A name as Oracle folds a bare one: upper case in its spelling (the text
 // stays folded for lexdb's matching, as T-SQL's, L6).
@@ -437,9 +438,15 @@ fn oraQTok(raw: &str, at: int): Tok {
     return Tok{kind: T_QIDENT, text: k.clone(), at: at, spell: if k == raw { "" } else { raw.toStr() }}
 }
 
-fn lexOra(s: &str, dialect: Dialect, ora: bool): Result[[]Tok, lexdb_base.DbErr] {
+fn lexInGt(s: &str, dialect: Dialect, ora: bool, initGt: int): Result[[]Tok, lexdb_base.DbErr] {
     var out: []Tok = []
     var bindNames: []str = []
+    var gtDepth = initGt
+    var gtMatch = false
+    var gtWhere = false
+    var gtWhereDepth = 0
+    var gtWhereBrack = false
+    var edgeBrack = false
     var i = 0
     let n = len(s)
     while i < n {
@@ -477,6 +484,23 @@ fn lexOra(s: &str, dialect: Dialect, ora: bool): Result[[]Tok, lexdb_base.DbErr]
             if c == '$' && i + 7 <= n && strings.toLowerAscii(s[i + 1..i + 7]) == "action" && (i + 7 == n || !isIdentChar(s[i + 7])) {
                 i += 7
                 append(mut &out, Tok{kind: T_IDENT, text: "$action", at: start, spell: ""})
+                continue
+            }
+            // Inside GRAPH_TABLE's MATCH pattern, -[ ... ]- uses [ ] as edge pattern brackets (not T-SQL quoted identifiers)
+            if c == '[' && gtDepth > 0 && gtMatch && !gtWhere && !edgeBrack && len(out) > 0 && out[len(out) - 1].kind == T_OP && out[len(out) - 1].text == "-" {
+                edgeBrack = true
+                i += 1
+                append(mut &out, Tok{kind: T_OP, text: "[", at: start, spell: ""})
+                continue
+            }
+            if c == ']' && edgeBrack {
+                edgeBrack = false
+                if gtWhere && gtWhereBrack {
+                    gtWhere = false
+                    gtWhereBrack = false
+                }
+                i += 1
+                append(mut &out, Tok{kind: T_OP, text: "]", at: start, spell: ""})
                 continue
             }
             if c == '[' || (c == '"' && dialect.quotedIdent) {
@@ -579,7 +603,20 @@ fn lexOra(s: &str, dialect: Dialect, ora: bool): Result[[]Tok, lexdb_base.DbErr]
             while i < n && isIdentChar(s[i]) { i += 1 }
             // a bare name: in T-SQL spelled as written, in PostgreSQL folded
             if ora { append(mut &out, oraName(&s[start..i], start)) }
-            else if dialect.tsql { append(mut &out, nameTok(T_IDENT, &(s[start..i].toStr()), start)) }
+            else if dialect.tsql {
+                let tok = nameTok(T_IDENT, &(s[start..i].toStr()), start)
+                if gtDepth > 0 {
+                    if gtDepth == 1 && !edgeBrack {
+                        if tok.text == "match" { gtMatch = true; gtWhere = false }
+                        else if tok.text == "where" || tok.text == "columns" || tok.text == "one" { gtMatch = false; gtWhere = false }
+                    } else if gtMatch && !gtWhere && tok.text == "where" {
+                        gtWhere = true
+                        gtWhereDepth = gtDepth
+                        gtWhereBrack = edgeBrack
+                    }
+                }
+                append(mut &out, tok)
+            }
             else { append(mut &out, Tok{kind: T_IDENT, text: strings.toLowerAscii(s[start..i]), at: start, spell: ""}) }
             continue
         }
@@ -689,6 +726,25 @@ fn lexOra(s: &str, dialect: Dialect, ora: bool): Result[[]Tok, lexdb_base.DbErr]
             return Err(syntax(&("syntax error at or near \"" + op + "\"")))
         }
         i += len(op)
+        if dialect.tsql {
+            if op == "(" {
+                if gtDepth > 0 { gtDepth += 1 }
+                else if len(out) > 0 && out[len(out) - 1].kind == T_IDENT && out[len(out) - 1].text == "graph_table" {
+                    gtDepth = 1
+                    gtMatch = false
+                    gtWhere = false
+                    edgeBrack = false
+                }
+            } else if op == ")" && gtDepth > 0 {
+                gtDepth -= 1
+                if gtWhere && !gtWhereBrack && gtDepth < gtWhereDepth { gtWhere = false }
+                if gtDepth == 0 {
+                    gtMatch = false
+                    gtWhere = false
+                    edgeBrack = false
+                }
+            }
+        }
         append(mut &out, Tok{kind: T_OP, text: op, at: start, spell: ""})
     }
     append(mut &out, Tok{kind: T_EOF, text: "", at: n, spell: ""})
@@ -6172,7 +6228,7 @@ fn (p: mut &P) fromItem0(join: int): Result[FromItem, lexdb_base.DbErr] {
         let h = p.peekAt(k + 2)
         let hint = h.kind == T_IDENT && (h.text == "nolock" || h.text == "readuncommitted" || h.text == "holdlock" || h.text == "updlock" ||
                                          h.text == "rowlock" || h.text == "tablock" || h.text == "readcommitted" || h.text == "serializable" || h.text == "index")
-        if p.peekAt(k + 1).kind == T_OP && p.peekAt(k + 1).text == "(" && !hint && !(p.peek().kind == T_IDENT && lexdb_sql.isReserved(&p.peek().text)) {
+        if p.peekAt(k + 1).kind == T_OP && p.peekAt(k + 1).text == "(" && !hint && !(p.peek().kind == T_IDENT && (lexdb_sql.isReserved(&p.peek().text) || (k == 0 && p.peek().text == "graph_table"))) {
             return p.udfFrom(join)
         }
     }
@@ -6208,10 +6264,10 @@ fn (p: mut &P) fromItem0(join: int): Result[FromItem, lexdb_base.DbErr] {
     }
     let at0 = p.pos
     let table = try p.rname()
-    // PostgreSQL & Oracle: GRAPH_TABLE (...) (SQL/PGQ, O22), or PostgreSQL set-returning SQL function [schema.]f(...)
-    if p.toks[p.pos].kind == T_OP && p.isKw("(") && !p.tsql {
+    // PostgreSQL, SQL Server & Oracle: GRAPH_TABLE (...) (SQL/PGQ, O22), or PostgreSQL set-returning SQL function [schema.]f(...)
+    if p.toks[p.pos].kind == T_OP && p.isKw("(") {
         if table == "graph_table" { return p.graphTable(join) }
-        if !p.ora {
+        if !p.tsql && !p.ora {
             p.pos = at0
             return p.pgFunctionFrom(join)
         }
@@ -8091,7 +8147,9 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             var orReplace = false
             if p.isKw("or") {
                 let w = p.peekAt(1).clone()
-                if w.kind == T_IDENT && ((p.tsql && w.text == "alter") || (!p.tsql && w.text == "replace")) {
+                let tsqlReplaceGraph = p.tsql && w.text == "replace" && p.peekAt(2).kind == T_IDENT && p.peekAt(2).text == "property" &&
+                                       p.peekAt(3).kind == T_IDENT && p.peekAt(3).text == "graph"
+                if w.kind == T_IDENT && ((p.tsql && w.text == "alter") || (!p.tsql && w.text == "replace") || tsqlReplaceGraph) {
                     p.pos += 2
                     orReplace = true
                     if p.ora && p.isKw("force") {
@@ -8926,6 +8984,9 @@ fn parseIn(sql0: &str, ora: bool, nls: []str): Result[[]Stmt, lexdb_base.DbErr] 
             s.subs = replace(mut &p.subs, [])
             s.wins = replace(mut &p.wins, [])
         }
+        if s.kind == S_SELECT && !s.udf {
+            for sub in s.subs { if sub.srf == lexdb_sql.GRAPH_MARK { s.udf = true; break } }
+        }
         let t = p.peek().clone()
         if t.kind == T_EOF {
             // CTE uses marked in out, not through mut &s (that cost every
@@ -9255,6 +9316,9 @@ fn (p: mut &P) finish(s: mut &Stmt) {
     if s.kind != S_EXPLAIN {
         s.subs = replace(mut &p.subs, [])
         s.wins = replace(mut &p.wins, [])
+    }
+    if s.kind == S_SELECT && !s.udf {
+        for sub in s.subs { if sub.srf == lexdb_sql.GRAPH_MARK { s.udf = true; break } }
     }
     if p.nextCte > 0 { markCtes(mut &s, p.nextCte) }
 }
@@ -11316,14 +11380,43 @@ fn (p: mut &P) annotAlters(s: mut &Stmt, cols: bool): Result[Unit, lexdb_base.Db
     return Ok(Unit{})
 }
 
-// ---- SQL/PGQ property graphs (Oracle and PostgreSQL doors; lexdb_graph reads the texts kept here)
+// ---- SQL/PGQ property graphs (Oracle, PostgreSQL and SQL Server doors; lexdb_graph reads the texts kept here)
 
-// PROPERTY GRAPH next (Oracle and PostgreSQL).
+// PROPERTY GRAPH next.
 fn (p: &P) graphNext(): bool {
-    return !p.tsql && p.isKw("property") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "graph"
+    return p.isKw("property") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "graph"
 }
 
-// CREATE [OR REPLACE] PROPERTY GRAPH [IF NOT EXISTS] name ...: the name, and the rest of the statement as its text.
+// T-SQL: past {VERTEX|NODE} TABLES (...) [{EDGE|RELATIONSHIP} TABLES (...)] (the next statement may follow without ";").
+fn (p: mut &P) graphEnd() {
+    if !((p.isKw("vertex") || p.isKw("node")) && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "tables" &&
+         p.peekAt(2).kind == T_OP && p.peekAt(2).text == "(") {
+        p.skipToEnd()
+        return
+    }
+    p.pos += 2
+    p.skipParens()
+    if (p.isKw("edge") || p.isKw("relationship")) && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "tables" &&
+       p.peekAt(2).kind == T_OP && p.peekAt(2).text == "(" {
+        p.pos += 2
+        p.skipParens()
+    }
+}
+
+fn (p: mut &P) skipParens() {
+    if !p.isKw("(") { return }
+    var d = 0
+    while p.peek().kind != T_EOF {
+        let t = p.next()
+        if t.kind == T_OP && t.text == "(" { d += 1 }
+        if t.kind == T_OP && t.text == ")" {
+            d -= 1
+            if d == 0 { break }
+        }
+    }
+}
+
+// CREATE [OR REPLACE | OR ALTER] PROPERTY GRAPH [IF NOT EXISTS] name ...: the name, and the rest of the statement as its text.
 fn (p: mut &P) createGraph(orReplace: bool): Result[Stmt, lexdb_base.DbErr] {
     p.pos += 2
     var s = lexdb_sql.newStmt(lexdb_sql.S_CREATE_GRAPH)
@@ -11337,11 +11430,14 @@ fn (p: mut &P) createGraph(orReplace: bool): Result[Stmt, lexdb_base.DbErr] {
     s.spell = p.spelled.clone()
     let from = p.peek().at
     let k0 = p.pos
-    p.skipToEnd()
+    if p.tsql { p.graphEnd() } else { p.skipToEnd() }
     if !p.ora {
         for k in k0..p.pos {
             if p.toks[k].kind == T_PARAM {
                 return Err(lexdb_base.err("42P02", &("there is no parameter $" + p.toks[k].text)))
+            }
+            if p.tsql && p.toks[k].kind == T_VAR && !strings.startsWith(&p.toks[k].text, "@@") {
+                return Err(lexdb_base.err("TS137", &("Must declare the scalar variable \"" + p.toks[k].text + "\".")))
             }
         }
     }
@@ -11370,7 +11466,8 @@ fn (p: mut &P) dropGraph(): Result[Stmt, lexdb_base.DbErr] {
 }
 
 // GRAPH_TABLE (...) [AS] [alias] in FROM (the name read, "(" next): a subquery marked GRAPH_MARK with the text inside the brackets
-// (a bind written $n, its number the statement's), which lexdb_graph.expand writes as its query where it is planned.
+// (a bind written $n, its number the statement's; in T-SQL @var checked against p.vars and kept for re-parsing with s.names),
+// which lexdb_graph.expand writes as its query where it is planned.
 fn (p: mut &P) graphTable(join: int): Result[FromItem, lexdb_base.DbErr] {
     let open = p.pos
     var depth = 0
@@ -11393,12 +11490,15 @@ fn (p: mut &P) graphTable(join: int): Result[FromItem, lexdb_base.DbErr] {
     }
     var text = ""
     for i in open + 1..close {
-        let t = &p.toks[i]
+        let t = p.toks[i].clone()
         if t.kind == T_PARAM {
             let n = strings.parseIntOpt(&t.text).unwrapOr(0)
             if n > p.params { p.params = n }
             text += "$" + t.text + " "
         } else {
+            if p.tsql && t.kind == T_VAR {
+                let checked = try p.variable(&t)
+            }
             text += &p.src[t.at..p.toks[i + 1].at]
         }
     }
@@ -11407,11 +11507,14 @@ fn (p: mut &P) graphTable(join: int): Result[FromItem, lexdb_base.DbErr] {
     var s = lexdb_sql.newStmt(S_SELECT)
     s.srf = lexdb_sql.GRAPH_MARK.toStr()
     s.index = text
-    for x in p.nls { append(mut &s.names, x.clone()) }
+    if p.tsql {
+        for x in p.vars { append(mut &s.names, x.clone()) }
+    } else {
+        for x in p.nls { append(mut &s.names, x.clone()) }
+    }
     s.use = SUB_FROM
     s.mdialect = p.md()
     append(mut &p.subs, s)
-    p.udf = true            // (lexdb_exec.inlineFunctions: a query of GRAPH_TABLE alone is written as its join, lexdb_graph.flatQuery)
     var alias = "\x01graph_table" + len(p.subs).toStr()
     var cols: []str = []
     try p.aliasOf(mut &alias, mut &cols, true)
@@ -11479,17 +11582,30 @@ fn (p: mut &P) assertEnd(verb: &str) {
     }
 }
 
-// An assertion's text as its dialect's tokens (MD_PG, MD_TSQL, MD_ORA: the dialect it was made in).
+// An assertion's or property graph's text as its dialect's tokens (MD_PG, MD_TSQL, MD_ORA).
 pub fn tokensIn(sql: &str, md: int): Result[[]Tok, lexdb_base.DbErr] {
     if md == MD_ORA { return oraTokens(sql) }
     return lexIn(sql, Dialect{tsql: md == MD_TSQL, quotedIdent: true})
 }
 
-// A query of an assertion, read as its dialect reads it.
+// GRAPH_TABLE's inner text as its dialect's tokens (in T-SQL, -[ ... ]- inside MATCH uses [ ] as edge brackets).
+pub fn graphTokens(sql: &str, md: int): Result[[]Tok, lexdb_base.DbErr] {
+    if md == MD_ORA { return oraTokens(sql) }
+    return lexInGt(sql, Dialect{tsql: md == MD_TSQL, quotedIdent: true}, false, if md == MD_TSQL { 1 } else { 0 })
+}
+
+// A query of an assertion or GRAPH_TABLE, read as its dialect reads it.
 pub fn parseFor(sql: &str, md: int): Result[[]Stmt, lexdb_base.DbErr] {
     if md == MD_ORA { return oraParse(sql) }
     if md == MD_PG { return parse(sql) }
     var q = try tsqlParser(sql, Dialect{tsql: true, quotedIdent: true}, &[])
+    let st = try q.statement()
+    return Ok([st])
+}
+
+// T-SQL query parsed with the enclosing batch's variables in scope (lexdb_graph.expand).
+pub fn parseTsqlVars(sql: &str, vars: &[]str): Result[[]Stmt, lexdb_base.DbErr] {
+    var q = try tsqlParser(sql, Dialect{tsql: true, quotedIdent: true}, vars)
     let st = try q.statement()
     return Ok([st])
 }

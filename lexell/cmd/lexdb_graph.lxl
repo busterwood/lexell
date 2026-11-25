@@ -37,6 +37,10 @@ const T_STR = lexdb_parse.T_STR
 const T_PARAM = lexdb_parse.T_PARAM
 const T_OP = lexdb_parse.T_OP
 
+const MD_PG = lexdb_sql.MD_PG
+const MD_TSQL = lexdb_sql.MD_TSQL
+const MD_ORA = lexdb_sql.MD_ORA
+
 pub const GRAPH_PRE = lexdb_catalog.GRAPH_PRE
 pub const GRAPH_END = lexdb_catalog.GRAPH_END
 
@@ -91,6 +95,7 @@ pub type Graph = record {
 
 fn e(code: &str, msg: &str): DbErr { return lexdb_base.err(code, msg) }
 fn ora(n: int, msg: &str): DbErr { return lexdb_base.err(&("ORA" + strings.padLeft(&(n.toStr()), 5, '0')), msg) }
+fn tsErr(n: int, msg: &str): DbErr { return lexdb_base.err(&("TS" + n.toStr()), msg) }
 fn gerr(oraMode: bool, n: int, pgCode: &str, msg: &str): DbErr { return if oraMode { ora(n, msg) } else { e(pgCode, msg) } }
 
 // ---- the catalog row: its strings (lexdb_catalog.addStrs), in order
@@ -244,9 +249,10 @@ fn readGraph(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str): Resu
 // ---- names
 
 // A name's token as its dialect keeps it: in Oracle bare upper case and quoted as written;
-// in PostgreSQL bare lower case and quoted as written.
-fn canonIn(t: &Tok, oraMode: bool): str {
-    if oraMode { return if len(t.spell) > 0 { t.spell.clone() } else { t.text.clone() } }
+// in PostgreSQL bare lower case and quoted as written; in T-SQL case-insensitive (lower case).
+fn canonIn(t: &Tok, md: int): str {
+    if md == MD_ORA { return if len(t.spell) > 0 { t.spell.clone() } else { t.text.clone() } }
+    if md == MD_TSQL { return t.text.clone() }
     return if t.kind == T_QIDENT && len(t.spell) > 0 { t.spell.clone() } else { t.text.clone() }
 }
 
@@ -258,22 +264,28 @@ pub fn shownOf(n: &str, spell: &str): str {
     return lexdb_sql.oraShown(n)
 }
 
-fn shownIn(n: &str, spell: &str, oraMode: bool): str {
-    if oraMode { return shownOf(n, spell) }
+fn shownIn(n: &str, spell: &str, md: int): str {
+    if md == MD_ORA { return shownOf(n, spell) }
+    if md == MD_TSQL { return n.toStr() }
     return if len(spell) > 0 { spell.toStr() } else { n.toStr() }
 }
 
-// A name quoted for SQL text in oraMode (Oracle) or PostgreSQL (!oraMode).
-fn qIn(n: &str, oraMode: bool): str {
-    if oraMode { return "\"" + strings.replaceAll(&lexdb_sql.oraShown(n), "\"", "\"\"") + "\"" }
+// A name quoted for SQL text in md (Oracle, PostgreSQL, or T-SQL).
+fn qIn(n: &str, md: int): str {
+    if md == MD_ORA { return "\"" + strings.replaceAll(&lexdb_sql.oraShown(n), "\"", "\"\"") + "\"" }
     return "\"" + strings.replaceAll(n, "\"", "\"\"") + "\""
 }
 
 // A relation's catalog key as SQL text.
-fn relTextIn(key: &str, oraMode: bool): str { return qIn(&lexdb_sql.schemaOf(key), oraMode) + "." + qIn(&lexdb_sql.baseName(key), oraMode) }
+fn relTextIn(key: &str, md: int): str {
+    let sc = lexdb_sql.schemaOf(key)
+    let outSc = if md == MD_TSQL && sc == "public" { "dbo".toStr() } else { sc }
+    return qIn(&outSc, md) + "." + qIn(&lexdb_sql.baseName(key), md)
+}
 
-fn parseSql(sql: &str, oraMode: bool, nls: []str): Result[[]Stmt, DbErr] {
-    if oraMode { return lexdb_parse.oraParseNls(sql, nls) }
+fn parseSql(sql: &str, md: int, nls: []str): Result[[]Stmt, DbErr] {
+    if md == MD_ORA { return lexdb_parse.oraParseNls(sql, nls) }
+    if md == MD_TSQL { return lexdb_parse.parseTsqlVars(sql, &nls) }
     return lexdb_parse.parse(sql)
 }
 
@@ -311,11 +323,12 @@ fn graphOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str): Result[s
 }
 
 // The key CREATE PROPERTY GRAPH n makes: in its schema, or the first on the path that exists.
-fn newKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, oraMode: bool): Result[str, DbErr] {
+fn newKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, n: &str, md: int): Result[str, DbErr] {
     if lexdb_sql.isQual(n) {
         let sc = lexdb_sql.schemaOf(n)
         if !(try schemaHas(st, txn, &sc)) {
-            if oraMode { return Err(ora(1918, &("user '" + strings.toUpperAscii(&sc) + "' does not exist"))) }
+            if md == MD_ORA { return Err(ora(1918, &("user '" + strings.toUpperAscii(&sc) + "' does not exist"))) }
+            if md == MD_TSQL { return Err(tsErr(2760, &("The specified schema name \"" + sc + "\" either does not exist or you do not have permission to use it."))) }
             return Err(e("3F000", &("schema \"" + sc + "\" does not exist")))
         }
         return Ok(if sc == "public" { lexdb_sql.baseName(n) } else { n.toStr() })
@@ -373,11 +386,16 @@ fn colIdx(t: &Table, n: &str): int {
 
 // ---- a token reader
 
-type Rdr = record { toks: []Tok; pos: int; src: str; ora: bool }
+type Rdr = record { toks: []Tok; pos: int; src: str; ora: bool; md: int }
 
-fn readerIn(text: &str, oraMode: bool): Result[Rdr, DbErr] {
-    let toks = if oraMode { try lexdb_parse.oraTokens(text) } else { try lexdb_parse.pgTokens(text) }
-    return Ok(Rdr{toks: toks, pos: 0, src: text.toStr(), ora: oraMode})
+fn readerIn(text: &str, md: int): Result[Rdr, DbErr] {
+    let toks = try lexdb_parse.tokensIn(text, md)
+    return Ok(Rdr{toks: toks, pos: 0, src: text.toStr(), ora: md == MD_ORA, md: md})
+}
+
+fn graphReaderIn(text: &str, md: int): Result[Rdr, DbErr] {
+    let toks = try lexdb_parse.graphTokens(text, md)
+    return Ok(Rdr{toks: toks, pos: 0, src: text.toStr(), ora: md == MD_ORA, md: md})
 }
 
 fn (r: &Rdr) peek(): &Tok { return &r.toks[r.pos] }
@@ -430,16 +448,28 @@ fn (r: mut &Rdr) nameTok(): Result[Tok, DbErr] {
     return Ok(t)
 }
 
-// [schema.]name: folded, qualified with lexdb_sql.qual; and the last part as its dialect shows it.
+// [db.][schema.]name: folded, qualified with lexdb_sql.qual (dbo -> public in T-SQL); and the last part as its dialect shows it.
 fn (r: mut &Rdr) relName(shown: mut &str): Result[str, DbErr] {
     let a = try r.nameTok()
+    if r.md == MD_TSQL && r.op(".") && isName(r.at(1)) {
+        r.pos += 1
+        let b = try r.nameTok()
+        if r.op(".") && isName(r.at(1)) {
+            r.pos += 1
+            let c = try r.nameTok()
+            let old = replace(shown, canonIn(&c, r.md))
+            return Ok(if b.text == "dbo" { c.text.clone() } else { lexdb_sql.qual(&b.text, &c.text) })
+        }
+        let old = replace(shown, canonIn(&b, r.md))
+        return Ok(if a.text == "dbo" { b.text.clone() } else { lexdb_sql.qual(&a.text, &b.text) })
+    }
     if r.op(".") && isName(r.at(1)) {
         r.pos += 1
         let b = try r.nameTok()
-        let old = replace(shown, canonIn(&b, r.ora))
+        let old = replace(shown, canonIn(&b, r.md))
         return Ok(lexdb_sql.qual(&a.text, &b.text))
     }
-    let old = replace(shown, canonIn(&a, r.ora))
+    let old = replace(shown, canonIn(&a, r.md))
     return Ok(a.text.clone())
 }
 
@@ -472,18 +502,23 @@ fn (r: &Rdr) text(lo: int, hi: int): str {
 
 // The statement's tag (lexdb_exec runs it).
 pub fn ddl(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, up: &Up): Result[str, DbErr] {
-    let oraMode = s.mdialect == lexdb_sql.MD_ORA
+    let md = s.mdialect
+    let oraMode = md == MD_ORA
     if s.kind == lexdb_sql.S_DROP_GRAPH {
         let k = try graphOf(st, txn, &s.table)
         if len(k) == 0 {
             if s.ifFlag { return Ok("DROP PROPERTY GRAPH") }
+            if md == MD_TSQL {
+                let shown = if len(s.spell) > 0 { s.spell.clone() } else { lexdb_sql.baseName(&s.table).toStr() }
+                return Err(tsErr(3701, &("Cannot drop the property graph '" + shown + "', because it does not exist or you do not have permission.")))
+            }
             return Err(gerr(oraMode, 42421, "42704", "property graph does not exist"))
         }
         txn.del(lexdb_catalog.CATALOG, &graphKey(&k))
         try up.bump(st, txn)
         return Ok("DROP PROPERTY GRAPH")
     }
-    let key = try newKey(st, txn, &s.table, oraMode)
+    let key = try newKey(st, txn, &s.table, md)
     if (try st.get(txn, lexdb_catalog.CATALOG, &graphKey(&key))).isSome() {
         if s.unique { return Ok("CREATE PROPERTY GRAPH") }
         if !s.ifFlag {
@@ -494,8 +529,8 @@ pub fn ddl(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, up: &Up)
         let msg = if oraMode { "name is already used by an existing object".toStr() } else { "relation \"" + lexdb_sql.baseName(&key) + "\" already exists" }
         return Err(gerr(oraMode, 955, "42P07", &msg))
     }
-    let name = shownIn(&lexdb_sql.baseName(&key), &s.spell, oraMode)
-    let g = try define(st, txn, &s.index, &key, &name, up, oraMode)
+    let name = shownIn(&lexdb_sql.baseName(&key), &s.spell, md)
+    let g = try define(st, txn, &s.index, &key, &name, up, md)
     try txn.put(lexdb_catalog.CATALOG, &graphKey(&key), &encode(&g))
     graphsSeen = true
     try up.bump(st, txn)
@@ -505,8 +540,9 @@ pub fn ddl(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, up: &Up)
 // An element being read: its table too.
 type Def = record { el: Elem; t: Table; srcAt: int; dstAt: int }
 
-fn define(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str, key: &str, name: &str, up: &Up, oraMode: bool): Result[Graph, DbErr] {
-    var r = try readerIn(text, oraMode)
+fn define(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str, key: &str, name: &str, up: &Up, md: int): Result[Graph, DbErr] {
+    let oraMode = md == MD_ORA
+    var r = try readerIn(text, md)
     if !(r.accept("vertex") || (!oraMode && r.accept("node"))) { return Err(gerr(oraMode, 2000, "42601", "missing VERTEX keyword")) }
     try r.expectKw("tables")
     try r.expectOp("(")
@@ -575,9 +611,9 @@ fn elemDef(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: mut &Rdr, verte
     var ename = shown.clone()
     let words = ["key", "label", "default", "properties", "no", "source", "destination"]
     if r.accept("as") {
-        ename = canonIn(&(try r.nameTok()), r.ora)
+        ename = canonIn(&(try r.nameTok()), r.md)
     } else if isName(r.peek()) && !(r.peek().kind == T_IDENT && lexdb_base.hasStr(&words, &r.peek().text)) {
-        ename = canonIn(&(try r.nameTok()), r.ora)
+        ename = canonIn(&(try r.nameTok()), r.md)
     }
     for d in defs { if d.el.name == ename { return Err(gerr(r.ora, 42404, "42710", &("graph element table name " + ename + " already defined"))) } }
     var el = Elem{name: ename.clone(), vertex: vertex, table: tk.clone(), keys: [], labels: [], src: noEnd(), dst: noEnd()}
@@ -585,7 +621,7 @@ fn elemDef(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: mut &Rdr, verte
         el.keys = try colList(r, &t)
         for i in 0..len(el.keys) {
             for j in 0..i {
-                if el.keys[i] == el.keys[j] { return Err(gerr(r.ora, 42416, "42701", &("duplicate column name " + shownIn(&el.keys[i], &"", r.ora) + " in key definition"))) }
+                if el.keys[i] == el.keys[j] { return Err(gerr(r.ora, 42416, "42701", &("duplicate column name " + shownIn(&el.keys[i], &"", r.md) + " in key definition"))) }
             }
         }
     } else {
@@ -605,7 +641,7 @@ fn elemDef(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: mut &Rdr, verte
     var any = false
     while true {
         if r.accept("label") {
-            let l = canonIn(&(try r.nameTok()), r.ora)
+            let l = canonIn(&(try r.nameTok()), r.md)
             append(mut &el.labels, Label{name: l, props: try propsDef(st, txn, r, &t, &tk, up)})
             any = true
         } else if r.kw("default") && r.kwAt(1, "label") {
@@ -620,7 +656,7 @@ fn elemDef(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: mut &Rdr, verte
             break
         }
     }
-    if !any { append(mut &el.labels, Label{name: el.name.clone(), props: allCols(&t, &[], r.ora)}) }
+    if !any { append(mut &el.labels, Label{name: el.name.clone(), props: allCols(&t, &[], r.md)}) }
     for l in el.labels {
         for i in 0..len(l.props) {
             for j in 0..i {
@@ -638,7 +674,7 @@ fn colList(r: mut &Rdr, t: &Table): Result[[]str, DbErr] {
     if r.op(")") { return Err(gerr(r.ora, 936, "42601", "missing expression")) }
     while true {
         let c = try r.nameTok()
-        if colIdx(t, &c.text) < 0 { return Err(gerr(r.ora, 904, "42703", &("\"" + canonIn(&c, r.ora) + "\": invalid identifier"))) }
+        if colIdx(t, &c.text) < 0 { return Err(gerr(r.ora, 904, "42703", &("\"" + canonIn(&c, r.md) + "\": invalid identifier"))) }
         append(mut &out, c.text.clone())
         if !r.acceptOp(",") { break }
     }
@@ -656,7 +692,7 @@ fn endDef(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: mut &Rdr, t: &Ta
         try r.expectKw("references")
     }
     let vt = try r.nameTok()
-    let vn = canonIn(&vt, r.ora)
+    let vn = canonIn(&vt, r.md)
     var vi = -1
     for i in 0..len(defs) { if defs[i].el.vertex && defs[i].el.name == vn { vi = i } }
     if vi < 0 { return Err(gerr(r.ora, 42405, "42P01", &("Referenced vertex table " + vn + " does not exist."))) }
@@ -681,21 +717,22 @@ fn endDef(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: mut &Rdr, t: &Ta
 }
 
 // Every column of t as a property, but those in except.
-fn allCols(t: &Table, except: &[]str, oraMode: bool): []Prop {
+fn allCols(t: &Table, except: &[]str, md: int): []Prop {
     var out: []Prop = []
     for c in t.cols {
         if c.name == lexdb_catalog.ROWID || lexdb_base.hasStr(except, &c.name) { continue }
-        append(mut &out, Prop{name: shownIn(&c.name, &c.spell, oraMode), expr: c.name.clone(), col: c.name.clone(), uses: [c.name.clone()], typ: viewTyp(t, &c.typ)})
+        append(mut &out, Prop{name: shownIn(&c.name, &c.spell, md), expr: c.name.clone(), col: c.name.clone(), uses: [c.name.clone()], typ: viewTyp(t, &c.typ)})
     }
     return out
 }
 
 // The functions a property's expression may not call (only pure/immutable functions).
-fn impureIn(w: &str, oraMode: bool): bool {
+fn impureIn(w: &str, md: int): bool {
     match w.toStr() {
         "sysdate", "systimestamp", "current_date", "current_timestamp", "localtimestamp", "sys_guid", "dbms_random", "user", "uid",
         "userenv", "sys_context", "rownum", "level", "dbtimezone", "sessiontimezone", "uuid" { return true }
-        "random", "gen_random_uuid", "now", "clock_timestamp", "statement_timestamp", "timeofday" { return !oraMode }
+        "random", "gen_random_uuid", "now", "clock_timestamp", "statement_timestamp", "timeofday" { return md != MD_ORA }
+        "getdate", "getutcdate", "sysdatetime", "sysutcdatetime", "sysdatetimeoffset", "newid", "rand", "user_name", "suser_sname", "db_name", "host_name", "app_name" { return md == MD_TSQL }
         else { return false }
     }
 }
@@ -706,13 +743,13 @@ fn propsDef(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: mut &Rdr, t: &
         r.pos += 2
         return Ok([])
     }
-    if !r.accept("properties") { return Ok(allCols(t, &[], r.ora)) }
+    if !r.accept("properties") { return Ok(allCols(t, &[], r.md)) }
     let are = r.accept("are")
     if r.accept("all") {
         try r.expectKw("columns")
         var except: []str = []
         if r.accept("except") { except = try colList(r, t) }
-        return Ok(allCols(t, &except, r.ora))
+        return Ok(allCols(t, &except, r.md))
     }
     if are { return Err(gerr(r.ora, 2000, "42601", "missing ALL keyword")) }
     try r.expectOp("(")
@@ -728,22 +765,22 @@ fn propsDef(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: mut &Rdr, t: &
         var end = hi
         var pname = ""
         if hi - lo >= 2 && r.toks[hi - 2].kind == T_IDENT && r.toks[hi - 2].text == "as" && isName(&r.toks[hi - 1]) {
-            pname = canonIn(&r.toks[hi - 1], r.ora)
+            pname = canonIn(&r.toks[hi - 1], r.md)
             end = hi - 2
         }
         if end - lo == 1 && isName(&r.toks[lo]) {
             let c = &r.toks[lo]
             let ci = colIdx(t, &c.text)
-            if ci < 0 && c.kind == T_IDENT && impureIn(&c.text, r.ora) { return Err(gerr(r.ora, 42439, "42P17", "only pure functions can be specified in a column expression used to define a property")) }
-            if ci < 0 { return Err(gerr(r.ora, 904, "42703", &("\"" + canonIn(c, r.ora) + "\": invalid identifier"))) }
-            if len(pname) == 0 { pname = shownIn(&t.cols[ci].name, &t.cols[ci].spell, r.ora) }
+            if ci < 0 && c.kind == T_IDENT && impureIn(&c.text, r.md) { return Err(gerr(r.ora, 42439, "42P17", "only pure functions can be specified in a column expression used to define a property")) }
+            if ci < 0 { return Err(gerr(r.ora, 904, "42703", &("\"" + canonIn(c, r.md) + "\": invalid identifier"))) }
+            if len(pname) == 0 { pname = shownIn(&t.cols[ci].name, &t.cols[ci].spell, r.md) }
             append(mut &out, Prop{name: pname, expr: c.text.clone(), col: c.text.clone(), uses: [c.text.clone()], typ: viewTyp(t, &t.cols[ci].typ)})
         } else {
             if len(pname) == 0 { return Err(gerr(r.ora, 42424, "42601", "An expression based label property definition must use the AS clause.")) }
             var uses: []str = []
             for i in lo..end {
                 let x = &r.toks[i]
-                if x.kind == T_IDENT && impureIn(&x.text, r.ora) { return Err(gerr(r.ora, 42439, "42P17", "only pure functions can be specified in a column expression used to define a property")) }
+                if x.kind == T_IDENT && impureIn(&x.text, r.md) { return Err(gerr(r.ora, 42439, "42P17", "only pure functions can be specified in a column expression used to define a property")) }
                 if isName(x) && !(i + 1 < end && r.toks[i + 1].kind == T_OP && r.toks[i + 1].text == "(") && !(i > lo && r.toks[i - 1].kind == T_OP && r.toks[i - 1].text == ".") &&
                    colIdx(t, &x.text) >= 0 && !lexdb_base.hasStr(&uses, &x.text) {
                     append(mut &uses, x.text.clone())
@@ -761,13 +798,13 @@ fn propsDef(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: mut &Rdr, t: &
     try r.expectOp(")")
     if len(exprs) > 0 {
         // the expressions' types: as a query of the table gives them
-        var ss = try parseSql(&("select " + sel + " from " + relTextIn(tk, r.ora)), r.ora, [])
+        var ss = try parseSql(&("select " + sel + " from " + relTextIn(tk, r.md)), r.md, [])
         let none: []int = []
         let cols = try up.describe(st, &ss[0], &none, &txn.sql.path)
         for i in 0..len(exprs) {
             if i >= len(cols) { continue }
             var ty = lexdb_catalog.typeOfMod(cols[i].oid, -1)
-            // (a query's text column has no length: an expression's is its text columns' longest, or their sum for ||, else 4,000)
+            // (a query's text column has no length: an expression's is its text columns' longest, or their sum for ||/+, else 4,000)
             if ty.kind == lexdb_sql.K_TEXT && ty.len == 0 { ty.len = textLen(t, &out[exprs[i]]) }
             out[exprs[i]].typ = ty
         }
@@ -785,7 +822,7 @@ fn textLen(t: &Table, p: &Prop): int {
             if t.cols[ci].typ.len > most { most = t.cols[ci].typ.len }
         }
     }
-    let n = if strings.contains(&p.expr, "||") { sum } else { most }
+    let n = if strings.contains(&p.expr, "||") || strings.contains(&p.expr, "+") { sum } else { most }
     return if n > 0 && n <= 4000 { n } else { 4000 }
 }
 
@@ -795,9 +832,9 @@ pub fn isGraph(s: &Stmt): bool { return s.srf == lexdb_sql.GRAPH_MARK }
 
 // A GRAPH_TABLE subquery (isGraph) as the query it stands for, parsed, to be planned in its place.
 pub fn expand(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt): Result[Stmt, DbErr] {
-    let oraMode = s.mdialect == lexdb_sql.MD_ORA
-    let sql = try rewriteIn(st, txn, &s.index, oraMode)
-    var ss = try parseSql(&sql, oraMode, s.names.clone())
+    let md = s.mdialect
+    let sql = try rewriteIn(st, txn, &s.index, md)
+    var ss = try parseSql(&sql, md, s.names.clone())
     if len(ss) != 1 { return Err(lexdb_base.corrupt("GRAPH_TABLE's query")) }
     var out = pop(mut &ss)
     out.use = lexdb_sql.SUB_FROM
@@ -806,7 +843,7 @@ pub fn expand(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt): Resu
 }
 
 // GRAPH_TABLE's text as the SQL of its query (exec_graph's tests compare the two).
-pub fn rewriteText(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str): Result[str, DbErr] { return rewriteIn(st, txn, text, true) }
+pub fn rewriteText(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str): Result[str, DbErr] { return rewriteIn(st, txn, text, MD_ORA) }
 
 const DIR_R = 1                 // ->
 const DIR_L = 2                 // <-
@@ -855,6 +892,7 @@ type Col = record {
 type GT = record {
     r: Rdr
     ora: bool
+    md: int
     g: Graph
     tabs: []Table               // per element, its table
     paths: [][]PI
@@ -895,24 +933,24 @@ type Exp = record {
 
 fn noEP(): EP { return EP{vertex: true, vname: "", lab: [], wlo: -1, whi: -1, dir: 0} }
 
-fn rewriteIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str, oraMode: bool): Result[str, DbErr] {
+fn rewriteIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str, md: int): Result[str, DbErr] {
     var mn = false
-    let branches = try branchTextsIn(st, txn, text, oraMode, mut &mn)
+    let branches = try branchTextsIn(st, txn, text, md, mut &mn)
     let body = strings.join(&branches, " union all ")
     if !mn { return Ok(body) }
     // MATCHNUM(): the matches numbered (the names: the first branch's columns)
-    var gt = try parseGT(st, txn, text, oraMode)
+    var gt = try parseGT(st, txn, text, md)
     var sel: []str = []
-    let rn = if oraMode { "row_number() over (order by null) " } else { "row_number() over () " }
+    let rn = if md == MD_ORA { "row_number() over (order by null) " } else { "row_number() over () " }
     for c in gt.cols {
-        if c.matchnum { append(mut &sel, rn + qIn(&c.name, oraMode)) } else { append(mut &sel, "\"gt$m\"." + qIn(&c.name, oraMode) + " " + qIn(&c.name, oraMode)) }
+        if c.matchnum { append(mut &sel, rn + qIn(&c.name, md)) } else { append(mut &sel, "\"gt$m\"." + qIn(&c.name, md) + " " + qIn(&c.name, md)) }
     }
     return Ok("select " + strings.join(&sel, ", ") + " from (" + body + ") \"gt$m\"")
 }
 
 // The joins GRAPH_TABLE's text stands for, each a SELECT (their UNION ALL its query); mn: it has MATCHNUM().
-fn branchTextsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str, oraMode: bool, mn: mut &bool): Result[[]str, DbErr] {
-    var gt = try parseGT(st, txn, text, oraMode)
+fn branchTextsIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str, md: int, mn: mut &bool): Result[[]str, DbErr] {
+    var gt = try parseGT(st, txn, text, md)
     // the lengths of each quantified part: every combination, an expansion
     var exps: []Exp = []
     var counts: []int = []
@@ -963,12 +1001,12 @@ pub fn flatQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt): R
     let f = &s.from[0]
     if f.sub != 0 || !isGraph(&s.subs[0]) || len(f.cols) > 0 || f.lateral { return Ok(None) }
     let g = &s.subs[0]
-    let oraMode = g.mdialect == lexdb_sql.MD_ORA
+    let md = g.mdialect
     var mn = false
-    let branches = try branchTextsIn(st, txn, &g.index, oraMode, mut &mn)
-    if len(branches) > 1 && !mn { return unionOnly(s, &branches, oraMode) }
+    let branches = try branchTextsIn(st, txn, &g.index, md, mut &mn)
+    if len(branches) > 1 && !mn { return unionOnly(s, &branches, md) }
     if len(branches) != 1 || mn { return Ok(None) }
-    var bs = try parseSql(&branches[0], oraMode, g.names.clone())
+    var bs = try parseSql(&branches[0], md, g.names.clone())
     if len(bs) != 1 { return Ok(None) }
     let b = pop(mut &bs)
     if len(b.subs) > 0 || len(b.wins) > 0 || len(b.group) > 0 { return Ok(None) }
@@ -1059,7 +1097,7 @@ pub fn flatQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt): R
 type Expr = lexdb_sql.Expr
 
 // SELECT * FROM GRAPH_TABLE (...) [ORDER BY positions] whose pattern is several joins: their UNION ALL itself (with the ORDER BY).
-fn unionOnly(s: &Stmt, branches: &[]str, oraMode: bool): Result[Option[Stmt], DbErr] {
+fn unionOnly(s: &Stmt, branches: &[]str, md: int): Result[Option[Stmt], DbErr] {
     if len(s.items) != 1 || !s.items[0].star || s.where.isSome() || len(s.group) > 0 || s.having.isSome() || s.distinct ||
        len(s.wins) > 0 || s.limit.isSome() || s.offset.isSome() || len(s.gsets) > 0 {
         return Ok(None)
@@ -1072,7 +1110,7 @@ fn unionOnly(s: &Stmt, branches: &[]str, oraMode: bool): Result[Option[Stmt], Db
         append(mut &ord, k.toStr() + (if o.desc { " desc" } else { "" }) + (if o.nullsFirst { " nulls first" } else { " nulls last" }))
     }
     if len(ord) > 0 { text += " order by " + strings.join(&ord, ", ") }
-    var ss = try parseSql(&text, oraMode, s.subs[0].names.clone())
+    var ss = try parseSql(&text, md, s.subs[0].names.clone())
     if len(ss) != 1 { return Ok(None) }
     var out = pop(mut &ss)
     out.mdialect = s.mdialect
@@ -1135,16 +1173,22 @@ fn subst(x: &Expr, sb: &Sub, miss: mut &bool): Expr {
 
 // ---- reading GRAPH_TABLE's text
 
-fn parseGT(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str, oraMode: bool): Result[GT, DbErr] {
-    var r = try readerIn(text, oraMode)
+fn parseGT(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str, md: int): Result[GT, DbErr] {
+    let oraMode = md == MD_ORA
+    var r = try graphReaderIn(text, md)
     var shown = ""
     let gn = try r.relName(mut &shown)
     let gk = try graphOf(st, txn, &gn)
-    if len(gk) == 0 { return Err(gerr(oraMode, 42421, "42704", "property graph does not exist")) }
+    if len(gk) == 0 {
+        if md == MD_TSQL { return Err(tsErr(208, &("Invalid object name '" + shown + "'."))) }
+        return Err(gerr(oraMode, 42421, "42704", "property graph does not exist"))
+    }
     let g = (try readGraph(st, txn, &gk)).unwrap()
     let sc = lexdb_sql.schemaOf(&gk)
     let owner = if oraMode {
         if sc == "public" { strings.toUpperAscii(&st.memo.get(&lexdb_catalog.userKey(txn.sql.sess)).unwrapOr("lexdb")) } else { shownOf(&sc, &"") }
+    } else if md == MD_TSQL {
+        if sc == "public" { "dbo".toStr() } else { sc.clone() }
     } else {
         sc.clone()
     }
@@ -1180,7 +1224,7 @@ fn parseGT(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str, oraMod
         append(mut &tabs, t)
     }
     // (an edge's vertex columns are its vertex's key: checked with it)
-    var gt = GT{r: Rdr{toks: [], pos: 0, src: "", ora: oraMode}, ora: oraMode, g: g, tabs: tabs, paths: [], decls: [], groups: [], glo: [], ghi: [], wlo: -1, whi: -1, cols: [], owner: owner, allCols: allCols}
+    var gt = GT{r: Rdr{toks: [], pos: 0, src: "", ora: oraMode, md: md}, ora: oraMode, md: md, g: g, tabs: tabs, paths: [], decls: [], groups: [], glo: [], ghi: [], wlo: -1, whi: -1, cols: [], owner: owner, allCols: allCols}
     if !r.accept("match") { return Err(gerr(oraMode, 2000, "42601", "missing MATCH keyword")) }
     while true {
         var path: []PI = []
@@ -1264,7 +1308,7 @@ fn labelFactor(r: mut &Rdr): Result[[][]str, DbErr] {
     if r.op("!") { return Err(gerr(r.ora, 40951, "0A000", "unsupported operation for GRAPH_TABLE: Complex label expressions")) }
     if r.op("%") { return Err(gerr(r.ora, 911, "42601", "%: invalid character after IS")) }
     let t = try r.nameTok()
-    return Ok([[canonIn(&t, r.ora)]])
+    return Ok([[canonIn(&t, r.md)]])
 }
 
 // The inside of an element pattern: [var] [IS labels] [WHERE cond], up to close.
@@ -1273,7 +1317,7 @@ fn epBody(r: mut &Rdr, gt: mut &GT, vertex: bool, close: &str, group: int): Resu
     ep.vertex = vertex
     if isName(r.peek()) && !r.kw("is") && !r.kw("where") {
         let t = try r.nameTok()
-        ep.vname = canonIn(&t, r.ora)
+        ep.vname = canonIn(&t, r.md)
     }
     if r.accept("is") { ep.lab = try labelExpr(r) }
     if r.accept("where") {
@@ -1460,12 +1504,12 @@ fn colItem(r: &Rdr, gt: mut &GT, lo: int, hi: int): Result[Unit, DbErr] {
     var end = hi
     var name = ""
     if hi - lo >= 3 && r.toks[hi - 2].kind == T_IDENT && r.toks[hi - 2].text == "as" && isName(&r.toks[hi - 1]) {
-        name = canonIn(&r.toks[hi - 1], r.ora)
+        name = canonIn(&r.toks[hi - 1], r.md)
         end = hi - 2
     }
     let t = &r.toks[lo]
     if end - lo == 3 && isName(t) && r.toks[lo + 1].kind == T_OP && r.toks[lo + 1].text == "." && r.toks[lo + 2].kind == T_OP && r.toks[lo + 2].text == "*" && len(name) == 0 {
-        let v = canonIn(t, r.ora)
+        let v = canonIn(t, r.md)
         let d = try declOf(gt, &v)
         if gt.decls[d].group >= 0 { return Err(gerr(r.ora, 40990, "42P10", &("invalid reference of group variable " + v + " in the COLUMNS clause of a GRAPH_TABLE operator"))) }
         for p in propsOf(gt, d) {
@@ -1474,8 +1518,8 @@ fn colItem(r: &Rdr, gt: mut &GT, lo: int, hi: int): Result[Unit, DbErr] {
         return Ok(Unit{})
     }
     if end - lo == 3 && isName(t) && r.toks[lo + 1].kind == T_OP && r.toks[lo + 1].text == "." && isName(&r.toks[lo + 2]) {
-        let v = canonIn(t, r.ora)
-        let p = canonIn(&r.toks[lo + 2], r.ora)
+        let v = canonIn(t, r.md)
+        let p = canonIn(&r.toks[lo + 2], r.md)
         if len(name) == 0 { name = p.clone() }
         append(mut &gt.cols, Col{lo: lo, hi: end, name: name, vname: v, prop: p, matchnum: false})
         return Ok(Unit{})
@@ -1557,10 +1601,10 @@ fn checkRefs(gt: &GT): Result[Unit, DbErr] {
         while i + 2 < sp[1] {
             let t = &r.toks[i]
             if isName(t) && r.toks[i + 1].kind == T_OP && r.toks[i + 1].text == "." && isName(&r.toks[i + 2]) && !(i > 0 && r.toks[i - 1].kind == T_OP && r.toks[i - 1].text == ".") {
-                let v = canonIn(t, gt.ora)
+                let v = canonIn(t, gt.md)
                 var d = -1
                 for k in 0..len(gt.decls) { if gt.decls[k].name == v { d = k } }
-                if d >= 0 { try checkProp(gt, d, &canonIn(&r.toks[i + 2], gt.ora)) }
+                if d >= 0 { try checkProp(gt, d, &canonIn(&r.toks[i + 2], gt.md)) }
                 i += 3
                 continue
             }
@@ -1810,7 +1854,7 @@ fn branchSql(gt: &GT, x: &Exp, b: &Bind, noRows: bool): Result[str, DbErr] {
     for i in 0..len(x.vars) {
         if repOf(x, i) != i { continue }
         if b.el[i] < 0 { return Err(lexdb_base.corrupt("GRAPH_TABLE: a variable without an element")) }
-        append(mut &from, relTextIn(&gt.g.elems[b.el[i]].table, gt.ora) + " " + alias(i))
+        append(mut &from, relTextIn(&gt.g.elems[b.el[i]].table, gt.md) + " " + alias(i))
     }
     for k in 0..len(x.occs) {
         let oc = &x.occs[k]
@@ -1820,13 +1864,13 @@ fn branchSql(gt: &GT, x: &Exp, b: &Bind, noRows: bool): Result[str, DbErr] {
         let rr = repOf(x, oc.y)
         let srcV = if b.fwd[k] { l } else { rr }
         let dstV = if b.fwd[k] { rr } else { l }
-        for j in 0..len(el.src.cols) { append(mut &conds, alias(ei) + "." + qIn(&el.src.cols[j], gt.ora) + " = " + alias(srcV) + "." + qIn(&el.src.refs[j], gt.ora)) }
-        for j in 0..len(el.dst.cols) { append(mut &conds, alias(ei) + "." + qIn(&el.dst.cols[j], gt.ora) + " = " + alias(dstV) + "." + qIn(&el.dst.refs[j], gt.ora)) }
+        for j in 0..len(el.src.cols) { append(mut &conds, alias(ei) + "." + qIn(&el.src.cols[j], gt.md) + " = " + alias(srcV) + "." + qIn(&el.src.refs[j], gt.md)) }
+        for j in 0..len(el.dst.cols) { append(mut &conds, alias(ei) + "." + qIn(&el.dst.cols[j], gt.md) + " = " + alias(dstV) + "." + qIn(&el.dst.refs[j], gt.md)) }
         // an edge pattern without a direction matches an edge from a vertex to itself once
         if oc.dir == DIR_ANY && !b.fwd[k] && el.src.elem == el.dst.elem {
             let v = &gt.g.elems[b.el[l]]
             var same: []str = []
-            for c in v.keys { append(mut &same, alias(l) + "." + qIn(&c, gt.ora) + " = " + alias(rr) + "." + qIn(&c, gt.ora)) }
+            for c in v.keys { append(mut &same, alias(l) + "." + qIn(&c, gt.md) + " = " + alias(rr) + "." + qIn(&c, gt.md)) }
             append(mut &conds, "not (" + strings.join(&same, " and ") + ")")
         }
     }
@@ -1845,7 +1889,7 @@ fn branchSql(gt: &GT, x: &Exp, b: &Bind, noRows: bool): Result[str, DbErr] {
         } else {
             try exprSql(gt, x, b, c.lo, c.hi, 0, -1, 0)
         }
-        append(mut &items, v + " " + qIn(&c.name, gt.ora))
+        append(mut &items, v + " " + qIn(&c.name, gt.md))
     }
     if len(items) == 0 { append(mut &items, "null \"gt$none\"") }
     var sql = "select " + strings.join(&items, ", ") + " from " + strings.join(&from, ", ")
@@ -1877,7 +1921,7 @@ fn propRef(gt: &GT, x: &Exp, b: &Bind, v: &str, p: &str, where: int, group: int,
     for l in el.labels {
         if !lexdb_base.hasStr(&ls, &l.name) { continue }
         for pr in l.props {
-            if pr.name == p { return qualified(&pr, &alias(i), gt.ora) }
+            if pr.name == p { return qualified(&pr, &alias(i), gt.md) }
         }
     }
     return Ok(nullOf(gt, p))
@@ -1897,6 +1941,24 @@ fn nullOf(gt: &GT, p: &str): str {
                     if k == lexdb_sql.K_DATE { return "cast(null as date)" }
                     if k == lexdb_sql.K_TS { return "cast(null as timestamp)" }
                     if k == lexdb_sql.K_TSTZ { return "cast(null as timestamp with time zone)" }
+                    return "null"
+                }
+                if gt.md == MD_TSQL {
+                    if k == lexdb_sql.K_INT {
+                        if pr.typ.oid == lexdb_sql.OID_INT2 { return "cast(null as smallint)" }
+                        if pr.typ.oid == lexdb_sql.OID_INT4 { return "cast(null as int)" }
+                        return "cast(null as bigint)"
+                    }
+                    if k == lexdb_sql.K_NUM { return "cast(null as decimal)" }
+                    if k == lexdb_sql.K_FLOAT { return if pr.typ.oid == lexdb_sql.OID_FLOAT4 { "cast(null as real)" } else { "cast(null as float)" } }
+                    if k == lexdb_sql.K_TEXT { return "cast(null as nvarchar(max))" }
+                    if k == lexdb_sql.K_BOOL { return "cast(null as bit)" }
+                    if k == lexdb_sql.K_DATE { return "cast(null as date)" }
+                    if k == lexdb_sql.K_TIME { return "cast(null as time)" }
+                    if k == lexdb_sql.K_TS { return "cast(null as datetime2)" }
+                    if k == lexdb_sql.K_TSTZ { return "cast(null as datetimeoffset)" }
+                    if k == lexdb_sql.K_UUID { return "cast(null as uniqueidentifier)" }
+                    if k == lexdb_sql.K_BYTEA { return "cast(null as varbinary(max))" }
                     return "null"
                 }
                 if k == lexdb_sql.K_INT {
@@ -1929,16 +1991,16 @@ fn viewTyp(t: &Table, ty: &TypeName): TypeName {
 }
 
 // A property's definition with its columns qualified by the alias.
-fn qualified(p: &Prop, al: &str, oraMode: bool): Result[str, DbErr] {
-    if len(p.col) > 0 { return Ok(al + "." + qIn(&p.col, oraMode)) }
-    let r = try readerIn(&p.expr, oraMode)
+fn qualified(p: &Prop, al: &str, md: int): Result[str, DbErr] {
+    if len(p.col) > 0 { return Ok(al + "." + qIn(&p.col, md)) }
+    let r = try readerIn(&p.expr, md)
     var out = ""
     for i in 0..len(r.toks) - 1 {
         let t = &r.toks[i]
         let piece = &r.src[t.at..r.toks[i + 1].at]
         if isName(t) && lexdb_base.hasStr(&p.uses, &t.text) && !(r.toks[i + 1].kind == T_OP && r.toks[i + 1].text == "(") &&
            !(i > 0 && r.toks[i - 1].kind == T_OP && r.toks[i - 1].text == ".") {
-            out += al + "." + qIn(&t.text, oraMode) + " "
+            out += al + "." + qIn(&t.text, md) + " "
             continue
         }
         out += piece
@@ -1947,8 +2009,8 @@ fn qualified(p: &Prop, al: &str, oraMode: bool): Result[str, DbErr] {
 }
 
 // The aggregates COLUMNS may take of a quantified part's variable.
-fn isAggNameIn(n: &str, oraMode: bool): bool {
-    return n == "count" || n == "sum" || n == "min" || n == "max" || n == "avg" || n == "listagg" || (!oraMode && n == "string_agg")
+fn isAggNameIn(n: &str, md: int): bool {
+    return n == "count" || n == "sum" || n == "min" || n == "max" || n == "avg" || n == "listagg" || (md != MD_ORA && n == "string_agg")
 }
 
 // The matching ")" of the "(" at i.
@@ -1981,11 +2043,11 @@ fn exprSql(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, where: int, group: int,
             return Err(gerr(gt.ora, 40988, "0A000", "Subquery is not allowed in a GRAPH_TABLE operator."))
         }
         if isName(t) && nx.kind == T_OP && nx.text == "." && !(i > lo && r.toks[i - 1].kind == T_OP && r.toks[i - 1].text == ".") {
-            let v = canonIn(t, gt.ora)
+            let v = canonIn(t, gt.md)
             var d = -1
             for k in 0..len(gt.decls) { if gt.decls[k].name == v { d = k } }
             if d >= 0 && i + 2 < hi && isName(&r.toks[i + 2]) {
-                out += "(" + try propRef(gt, x, b, &v, &canonIn(&r.toks[i + 2], gt.ora), where, group, copy) + ") "
+                out += "(" + try propRef(gt, x, b, &v, &canonIn(&r.toks[i + 2], gt.md), where, group, copy) + ") "
                 i += 3
                 continue
             }
@@ -2010,14 +2072,14 @@ fn exprSql(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, where: int, group: int,
             }
             if t.text == "element_number" { return Err(gerr(gt.ora, 49033, "42P10", "ELEMENT_NUMBER can only be used in combination with ONE ROW PER VERTEX or STEP.")) }
             if t.text == "matchnum" { return Err(e("0A000", "lexdb: MATCHNUM() is supported as a COLUMNS item by itself")) }
-            if isAggNameIn(&t.text, gt.ora) && group < 0 {
+            if isAggNameIn(&t.text, gt.md) && group < 0 {
                 out += try aggSql(gt, x, b, &t.text, i + 2, c, where) + " "
                 i = c + 1
                 continue
             }
         }
         if isName(t) && !(nx.kind == T_OP && (nx.text == "(" || nx.text == ".")) && !(i > lo && r.toks[i - 1].kind == T_OP && r.toks[i - 1].text == ".") {
-            let v = canonIn(t, gt.ora)
+            let v = canonIn(t, gt.md)
             var d = -1
             for k in 0..len(gt.decls) { if gt.decls[k].name == v { d = k } }
             if d >= 0 && nx.kind == T_IDENT && nx.text == "is" {
@@ -2042,17 +2104,21 @@ fn exprSql(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, where: int, group: int,
 fn idSql(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, vertex: bool, where: int, group: int, copy: int): Result[str, DbErr] {
     let r = &gt.r
     if hi - lo != 1 || !isName(&r.toks[lo]) { return Err(gerr(gt.ora, 40956, "42601", "invalid property name format")) }
-    let v = canonIn(&r.toks[lo], gt.ora)
+    let v = canonIn(&r.toks[lo], gt.md)
     let i = try varFor(gt, x, &v, where, group, copy)
     let el = &gt.g.elems[b.el[i]]
     let t = &gt.tabs[b.el[i]]
     var parts: []str = []
     for k in el.keys {
         let ci = colIdx(t, &k)
-        let name = shownIn(&t.cols[ci].name, &t.cols[ci].spell, gt.ora)
-        let ref = alias(i) + "." + qIn(&k, gt.ora)
+        let name = shownIn(&t.cols[ci].name, &t.cols[ci].spell, gt.md)
+        let ref = alias(i) + "." + qIn(&k, gt.md)
         let kind = t.cols[ci].typ.kind
-        let val = if kind == lexdb_sql.K_INT || kind == lexdb_sql.K_NUM || kind == lexdb_sql.K_FLOAT { ref } else { "'\"' || " + ref + " || '\"'" }
+        let val = if kind == lexdb_sql.K_INT || kind == lexdb_sql.K_NUM || kind == lexdb_sql.K_FLOAT {
+            if gt.md == MD_TSQL { "cast(" + ref + " as nvarchar(max))" } else { ref }
+        } else {
+            "'\"' || " + ref + " || '\"'"
+        }
         append(mut &parts, "'\"" + name + "\":' || " + val)
     }
     return Ok("('{\"GRAPH_OWNER\":\"" + gt.owner + "\",\"GRAPH_NAME\":\"" + gt.g.name + "\",\"ELEM_TABLE\":\"" + el.name + "\",\"KEY_VALUE\":{' || " +
@@ -2068,13 +2134,13 @@ fn isSql(gt: &GT, x: &Exp, b: &Bind, i: int, hi: int, where: int, group: int, co
         neg = true
         k += 1
     }
-    let v = canonIn(&r.toks[i], gt.ora)
+    let v = canonIn(&r.toks[i], gt.md)
     let vi = try varFor(gt, x, &v, where, group, copy)
     let el = &gt.g.elems[b.el[vi]]
     if k < hi && r.toks[k].kind == T_IDENT && r.toks[k].text == "labeled" {
         k += 1
         if k >= hi || !isName(&r.toks[k]) { return Err(gerr(gt.ora, 931, "42601", "missing identifier")) }
-        let l = canonIn(&r.toks[k], gt.ora)
+        let l = canonIn(&r.toks[k], gt.md)
         var known = false
         for g in gt.g.elems { for x2 in g.labels { if x2.name == l { known = true } } }
         if !known { return Err(gerr(gt.ora, 40954, "42704", "unknown label")) }
@@ -2086,7 +2152,7 @@ fn isSql(gt: &GT, x: &Exp, b: &Bind, i: int, hi: int, where: int, group: int, co
     if k + 2 < hi + 1 && r.toks[k].kind == T_IDENT && (r.toks[k].text == "source" || r.toks[k].text == "destination") &&
        r.toks[k + 1].kind == T_IDENT && r.toks[k + 1].text == "of" && isName(&r.toks[k + 2]) {
         let src = r.toks[k].text == "source"
-        let ev = canonIn(&r.toks[k + 2], gt.ora)
+        let ev = canonIn(&r.toks[k + 2], gt.md)
         let ei = try varFor(gt, x, &ev, where, group, copy)
         let ed = &gt.g.elems[b.el[ei]]
         let end = if src { &ed.src } else { &ed.dst }
@@ -2096,7 +2162,7 @@ fn isSql(gt: &GT, x: &Exp, b: &Bind, i: int, hi: int, where: int, group: int, co
             return Ok(if neg { "1 = 1" } else { "1 = 0" })
         }
         var eq: []str = []
-        for j in 0..len(end.cols) { append(mut &eq, alias(ei) + "." + qIn(&end.cols[j], gt.ora) + " = " + alias(vi) + "." + qIn(&end.refs[j], gt.ora)) }
+        for j in 0..len(end.cols) { append(mut &eq, alias(ei) + "." + qIn(&end.cols[j], gt.md) + " = " + alias(vi) + "." + qIn(&end.refs[j], gt.md)) }
         let c = "(" + strings.join(&eq, " and ") + ")"
         return Ok(if neg { "not " + c } else { c })
     }
@@ -2135,11 +2201,11 @@ fn aggSql(gt: &GT, x: &Exp, b: &Bind, f: &str, lo: int, hi: int, where: int): Re
     for k in lo..aend {
         let t = &r.toks[k]
         if isName(t) && k + 1 < aend && r.toks[k + 1].kind == T_OP && r.toks[k + 1].text == "." {
-            let v = canonIn(t, gt.ora)
+            let v = canonIn(t, gt.md)
             for dd in gt.decls { if dd.name == v && dd.group >= 0 { grp = dd.group } }
         }
         if isName(t) && !(k + 1 < aend && r.toks[k + 1].kind == T_OP && (r.toks[k + 1].text == "." || r.toks[k + 1].text == "(")) {
-            for dd in gt.decls { if dd.name == canonIn(t, gt.ora) { return Err(gerr(gt.ora, 40956, "42601", "invalid property name format")) } }
+            for dd in gt.decls { if dd.name == canonIn(t, gt.md) { return Err(gerr(gt.ora, 40956, "42601", "invalid property name format")) } }
         }
     }
     if grp < 0 { return Err(gerr(gt.ora, 49011, "42P10", "A group function inside GRAPH_TABLE() must have a group reference.")) }
@@ -2177,9 +2243,10 @@ fn aggSql(gt: &GT, x: &Exp, b: &Bind, f: &str, lo: int, hi: int, where: int): Re
     }
     // LISTAGG / STRING_AGG: the values not NULL in the path's order, the separator between them
     let lit = "'" + strings.replaceAll(&sep, "'", "''") + "'"
+    let castTyp = if gt.md == MD_TSQL { "nvarchar(max)" } else { "text" }
     var ps: []str = []
     for v in vals {
-        let tv = if gt.ora { if len(sep) > 0 { lit + " || " + v } else { "to_char(" + v + ")" } } else { if len(sep) > 0 { lit + " || cast(" + v + " as text)" } else { "cast(" + v + " as text)" } }
+        let tv = if gt.ora { if len(sep) > 0 { lit + " || " + v } else { "to_char(" + v + ")" } } else { if len(sep) > 0 { lit + " || cast(" + v + " as " + castTyp + ")" } else { "cast(" + v + " as " + castTyp + ")" } }
         append(mut &ps, "(case when " + v + " is not null then " + tv + " end)")
     }
     let cat = "(" + strings.join(&ps, " || ") + ")"
