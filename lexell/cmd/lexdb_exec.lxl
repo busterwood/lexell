@@ -13467,7 +13467,7 @@ fn (s: &Session) setting(name: &str): Option[str] {
         // PostgreSQL's that clients ask for, fixed in lexdb (9.80)
         "standard_conforming_strings", "integer_datetimes", "is_superuser" { return Some("on") }
         "transaction_read_only", "default_transaction_read_only", "in_hot_standby" {
-            let on = if name == "transaction_read_only" && len(s.txn) > 0 { s.readOnly } else if name == "in_hot_standby" { false } else { s.roDefault }
+            let on = if name == "transaction_read_only" && len(s.txn) > 0 { s.readOnly } else { name != "in_hot_standby" && s.roDefault }
             return Some(if on { "on".toStr() } else { lexdb_standby.standbySetting(&s.st) })
         }   // (on a replica, 9.137)
         "server_version" { return Some("16.0") }
@@ -13928,28 +13928,17 @@ fn (s: mut &Session) tempWrite(stmt: &lexdb_sql.Stmt): bool {
     }
 }
 
-// SET SESSION CHARACTERISTICS ... READ ONLY | READ WRITE, SET default_transaction_read_only: the session's later transactions are
-// read-only (a block's s.readOnly at its BEGIN; a statement alone is refused in execStmt by its store's ro flag).
-fn (s: mut &Session) setRoDefault(on: bool) {
-    s.roDefault = on
-    s.st.ro = on || s.st.follower().isSome()
-}
-
-// A write statement outside a block of a session whose transactions are read-only: 25006 as PostgreSQL's, a temporary table's
-// writes apart.
+// A write outside a block of a session whose transactions are read-only (SET SESSION CHARACTERISTICS ... READ ONLY; its store's ro
+// flag): 25006 as PostgreSQL's, a temporary table's writes apart.
 fn roDefaultRefuses(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Unit, DbErr] {
-    match writesOn(s) {
-        Some(what) {
-            if s.kind == lexdb_sql.S_INSERT || s.kind == lexdb_sql.S_UPDATE || s.kind == lexdb_sql.S_DELETE || s.kind == lexdb_sql.S_MERGE || (s.kind == lexdb_sql.S_COPY && s.copy.from) {
-                match catKey(st, txn, &s.table, false) {
-                    Ok(k) { if lexdb_catalog.tempRel(&k) { return Ok(Unit{}) } }
-                    Err(_) {}
-                }
-            }
-            return Err(e("25006", &("cannot execute " + what + " in a read-only transaction")))
+    let what = match writesOn(s) { Some(w) { w } None { return Ok(Unit{}) } }
+    if s.kind == lexdb_sql.S_INSERT || s.kind == lexdb_sql.S_UPDATE || s.kind == lexdb_sql.S_DELETE || s.kind == lexdb_sql.S_MERGE || (s.kind == lexdb_sql.S_COPY && s.copy.from) {
+        match catKey(st, txn, &s.table, false) {
+            Ok(k) { if lexdb_catalog.tempRel(&k) { return Ok(Unit{}) } }
+            Err(_) {}
         }
-        None { return Ok(Unit{}) }
     }
+    return Err(e("25006", &("cannot execute " + what + " in a read-only transaction")))
 }
 
 fn isWrite(kind: int): bool {
@@ -14400,8 +14389,10 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                     }
                 }
                 if stmt.limit.isSome() || len(stmt.names) == 0 { try s.applySetting(&stmt.table, &val, false) }
-                if len(stmt.names) > 0 && stmt.table == "default_transaction_isolation" { s.setRoDefault(stmt.names[0] == "read only") }
-                else if len(stmt.names) > 0 && len(s.txn) > 0 { try lexdb_txmode.setReadOnly(&s.st, mut &s.txn[0], mut &s.readOnly, s.fresh, stmt.names[0] == "read only") }
+                if len(stmt.names) > 0 && stmt.table == "default_transaction_isolation" {
+                    s.roDefault = stmt.names[0] == "read only"          // (its later transactions; a statement alone: the store's ro flag, execStmt)
+                    s.st.ro = s.roDefault || s.st.follower().isSome()
+                } else if len(stmt.names) > 0 && len(s.txn) > 0 { try lexdb_txmode.setReadOnly(&s.st, mut &s.txn[0], mut &s.readOnly, s.fresh, stmt.names[0] == "read only") }
             } else if stmt.table != "" {
                 var v = -1                          // DEFAULT, RESET
                 match stmt.limit {
