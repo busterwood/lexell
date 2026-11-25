@@ -112,8 +112,8 @@ select_list:
 - A set operator over columns of different types is not refused: `SELECT id FROM emp UNION SELECT name FROM dept`
   returns numbers and names together as text (Oracle: ORA-01790), though `SELECT 1 ... UNION SELECT 'a' ...` is
   ORA-01722.
-- `MIN` and `MAX` of a `DATE` column show as a timestamp with a fraction (`2019-03-01 00:00:00.0`); use `TO_CHAR`.
-- `SELECT *` over a `NATURAL JOIN` or `JOIN ... USING` names its columns in lower case; see [Joins](select-join.md).
+- `SELECT *` over a `NATURAL JOIN` or `JOIN ... USING` names its columns in lower case and shows a `DATE` column as a
+  timestamp with a fraction (`2019-03-01 00:00:00.0`); see [Joins](select-join.md).
 - Some errors have other numbers: `SELECT DISTINCT name ... ORDER BY salary` is ORA-20000 (Oracle ORA-01791), and
   `ORDER BY` on a column that a set operator's first query does not name is ORA-20000 (Oracle ORA-00904).
 - Hints (`/*+ ... */`) are read as comments. `SAMPLE`, `AS OF` (flashback), `PIVOT`, `UNPIVOT`, `MODEL`,

@@ -54,14 +54,16 @@ INTERVAL 'text' { YEAR TO MONTH | DAY TO SECOND | unit }
   `ORDER BY`, `GROUP BY`, `DISTINCT`, joins, `IN` and indexes go by instant too (a unique index takes only one of the
   two); a group shows the offset of its first row. `TO_CHAR` with `TZH:TZM` shows each value's own offset, and
   `SYS_EXTRACT_UTC` the instant in UTC (example F).
-- Arithmetic keeps the offset: `TIMESTAMP WITH TIME ZONE + INTERVAL` is at the same offset (months and days count in
-  the local time); the difference of two is an `INTERVAL DAY TO SECOND` between the instants; `+ n` (days) gives a
+- Arithmetic keeps the offset: `TIMESTAMP WITH TIME ZONE + INTERVAL` is at the same offset (months count in UTC, as in
+  Oracle, and a day that is not in the month reached is ORA-01839); the difference of two is an `INTERVAL DAY TO SECOND` between the instants; `+ n` (days) gives a
   `DATE` of the local time (example G).
 - A `TIMESTAMP` or `DATE` that becomes a `TIMESTAMP WITH TIME ZONE` (`CAST`, an `INSERT` into such a column) is read
   in the session's time zone; `CAST(x AS TIMESTAMP)` and `CAST(x AS DATE)` of one give its local time.
 - Without a format, `TO_CHAR` and `CAST(... AS VARCHAR2(n))` of a `TIMESTAMP WITH TIME ZONE` use
   `NLS_TIMESTAMP_TZ_FORMAT` (`DD-MON-RR HH.MI.SSXFF AM TZR`). JDBC clients get the value with its offset (Oracle's type
   181): `getString` shows `2026-03-15 10:00:00.0 +2:00`, and `getObject(i, OffsetDateTime.class)` keeps the offset.
+  A `TIMESTAMP WITH LOCAL TIME ZONE` value goes as Oracle's type 231, which the driver shows in its session's zone
+  (`2026-03-15 08:00:00.0 UTC` for a client in UTC, example H).
 
 ## Differences from Oracle
 
@@ -76,10 +78,13 @@ INTERVAL 'text' { YEAR TO MONTH | DAY TO SECOND | unit }
   `NLS_TIMESTAMP_TZ_FORMAT` (`'15-MAR-26 10.00.00.000000 AM +02:00'` is ORA-01861; Oracle does the opposite and gives
   ORA-01843 for the ISO text). `CAST` and `TO_TIMESTAMP_TZ` read the NLS format, as in Oracle.
 - A `TIMESTAMP` literal shown as text has six fractional digits (`10.00.00.000000 AM +02:00`; Oracle nine).
-- A `TIMESTAMP WITH LOCAL TIME ZONE` value reaches a JDBC client at `+00:00` (`getString` gives `2026-03-15
-  08:00:00.0 +0:00` in a session at `-05:00`; Oracle `2026-03-15 03:00:00.0 -05:00`). `TO_CHAR` shows it in the
+- After `ALTER SESSION SET TIME_ZONE`, a JDBC client still shows a `TIMESTAMP WITH LOCAL TIME ZONE` value in the zone
+  it logged on with (`getString` gives `2026-03-15 13:30:00.0 Asia/Kolkata` in a session set to `-05:00`; Oracle
+  `2026-03-15 03:00:00.0 -05:00`): Oracle tells the driver the new zone, lexdb does not. `TO_CHAR` shows it in the
   session's zone, as in Oracle (example H).
-- `MIN` and `MAX` of equal instants show the offset of the last row (Oracle: of the first).
+- `TO_CHAR` of a `TIMESTAMP WITH LOCAL TIME ZONE` takes `TZH` and `TZM` (the session's offset); Oracle gives ORA-01821.
+- `MIN` and `MAX` of equal instants at different offsets show the first in lexdb's scan order, which is primary key
+  order; Oracle's is the order the rows were inserted.
 - A `VALUES` list (`FROM (VALUES (...)) v (a, b)`) keeps the instant, not the offset: `10:00 +02:00` comes out as
   `08:00 +00:00`.
 - A `TIMESTAMP WITH TIME ZONE` column made by a lexdb older than main 178ea2df holds instants without offsets: it
@@ -282,12 +287,14 @@ PLUS_90_MINUTES         PLUS_MONTH              PLUS_DAY_AS_DATE SINCE_UTC_MIDNI
 
 ### H. WITH LOCAL TIME ZONE
 
-The value is an instant; `TO_CHAR` shows it in the session's time zone.
+The value is an instant. The JDBC client shows it in its own zone (UTC here); `TO_CHAR` shows it in the session's time
+zone.
 
 <!-- example: oracle -->
 ```sql
 CREATE TABLE seen (id NUMBER PRIMARY KEY, at_local TIMESTAMP WITH LOCAL TIME ZONE);
 INSERT INTO seen VALUES (1, TIMESTAMP '2026-03-15 10:00:00 +02:00');
+SELECT at_local FROM seen;
 ALTER SESSION SET TIME_ZONE = '-05:00';
 SELECT TO_CHAR(at_local, 'YYYY-MM-DD HH24:MI') AS at_local, TO_CHAR(CAST(at_local AS TIMESTAMP WITH TIME ZONE), 'TZH:TZM') AS zone FROM seen;
 ALTER SESSION SET TIME_ZONE = '+00:00';
@@ -298,6 +305,12 @@ SELECT TO_CHAR(at_local, 'YYYY-MM-DD HH24:MI') AS at_local FROM seen;
 Table created.
 
 1 row created.
+
+AT_LOCAL
+-------------------------
+2026-03-15 08:00:00.0 UTC
+
+1 row selected.
 
 Session altered.
 

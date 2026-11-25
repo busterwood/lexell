@@ -21,7 +21,8 @@ ALTER SESSION SET parameter = value [ parameter = value ]...
   the offset of `CURRENT_TIMESTAMP`, the zone a `TIMESTAMP` or `DATE` is read in when it becomes a `TIMESTAMP WITH TIME
   ZONE`, the zone `AT LOCAL` moves to, and the zone a `TIMESTAMP WITH LOCAL TIME ZONE` is shown in (example C).
   `SYSTIMESTAMP` stays at the server's `+00:00`. An unknown region is ORA-01882, an hour beyond 15 ORA-01874, an offset
-  without its minutes (`'+02'`) ORA-01861. A session starts at `+00:00`.
+  without its minutes (`'+02'`) ORA-01861. A session starts in the zone the client sends at logon (python-oracledb
+  sends its local offset or `ORA_SDTZ`, JDBC its JVM's zone); `ALTER SESSION SET TIME_ZONE = LOCAL` goes back to it.
 
 `NLS_DATE_FORMAT`, `NLS_TIMESTAMP_FORMAT`, `NLS_TIMESTAMP_TZ_FORMAT`
 : The default format of `TO_CHAR`, `TO_DATE` and the other conversions of dates; `NLS_TIMESTAMP_TZ_FORMAT` (`DD-MON-RR
@@ -51,8 +52,10 @@ Other `NLS_*` parameters, `OPTIMIZER_*`, `SQL_TRACE`, `ISOLATION_LEVEL`, `CURSOR
 - `NLS_NUMERIC_CHARACTERS` and `NLS_LANGUAGE` do not change the output of `TO_CHAR` of numbers or the language of
   messages: the group and decimal characters stay `,` and `.`, the messages those of `AMERICAN`.
 - `SYS_CONTEXT('USERENV', 'NLS_CURRENCY')` is `$` until a territory is set.
-- A session starts at `+00:00` whatever time zone the client sends at logon; Oracle starts it there (a JDBC client
-  sends its JVM's zone).
+- A logon zone lexdb does not know leaves the session at `+00:00`; Oracle refuses the logon. `'UTC'`, at logon or set
+  here, is kept as `+00:00`: `SESSIONTIMEZONE` shows `+00:00` (Oracle `UTC`).
+- After `ALTER SESSION SET TIME_ZONE`, a JDBC client still shows a `TIMESTAMP WITH LOCAL TIME ZONE` value in its logon
+  zone (`getString`); Oracle tells the driver the new zone and lexdb does not. `TO_CHAR` follows the new zone in both.
 - A region set as `TIME_ZONE` is used as the offset it has at each instant: `TO_CHAR(CURRENT_TIMESTAMP, 'TZR')` is
   `+01:00` in a session at `'Europe/Berlin'` (Oracle `EUROPE/BERLIN`).
 

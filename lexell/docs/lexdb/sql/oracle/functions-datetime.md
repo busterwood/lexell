@@ -123,8 +123,12 @@ offset it has at that instant (see the differences). An unknown region is ORA-01
 
 - Subtracting two dates gives a number of days (with a fraction); subtracting two timestamps gives an `INTERVAL DAY TO
   SECOND`. A number added to a date is days: `DATE '2026-11-23' + 1.5` is noon on the 24th.
+- A date or timestamp plus an `INTERVAL YEAR TO MONTH` (or a `NUMTOYMINTERVAL`) whose day is not in the month it
+  reaches is ORA-01839: `DATE '2026-01-31' + INTERVAL '1' MONTH` (example H). `ADD_MONTHS` moves such a day to the end
+  of the month.
 - A `TIMESTAMP WITH TIME ZONE` keeps its offset through arithmetic: `+ INTERVAL` gives one at the same offset (months
-  and days count in the local time), the difference of two is an `INTERVAL DAY TO SECOND` between the instants, and
+  count in UTC: `TIMESTAMP '2026-01-31 23:00:00 -05:00' + INTERVAL '1' MONTH` is 28 February 23:00 at `-05:00`, 1 March
+  in UTC), the difference of two is an `INTERVAL DAY TO SECOND` between the instants, and
   `+ n` gives a `DATE` of the local time. Two of them compare by instant (example L).
 - The examples on this page never print the clock. They compare it with a fixed date or reduce it with `CASE`.
 - The week starts on Sunday (NLS territory AMERICA): `TO_CHAR(DATE, 'D')` is 1 for Sunday, `TRUNC(date, 'D')` goes to
@@ -137,11 +141,11 @@ offset it has at that instant (see the differences). An unknown region is ORA-01
   and a session in a region give the offset alone: `EXTRACT(TIMEZONE_REGION ...)` is `UNKNOWN` and `TIMEZONE_ABBR`
   `UNK` (Oracle: `Europe/Paris`, `CET`), and `TO_CHAR(..., 'TZR')` shows `+01:00`. Adding an interval keeps the offset,
   not the region's summer time.
-- `DATE '2026-01-31' + INTERVAL '1' MONTH` is 28 February (the day is moved to the end of the shorter month), and so
-  for a timestamp; Oracle gives ORA-01839. `ADD_MONTHS` is the same in both.
-- `MIN` and `MAX` of equal instants show the offset of the last row; Oracle shows the first's.
-- A session starts at `+00:00`, whatever time zone the client sends at logon; Oracle starts it there (a JDBC client
-  sends its JVM's zone, so example B's first `SESSIONTIMEZONE` is `UTC` in Oracle).
+- `MIN` and `MAX` of equal instants at different offsets show the first in lexdb's scan order, which is primary key
+  order; Oracle's is the order the rows were inserted.
+- A session starts in the time zone the client sends at logon, as in Oracle, but `UTC` is kept as `+00:00`: example
+  B's first `SESSIONTIMEZONE` (a JDBC client in UTC) is `UTC` in Oracle, and so after `ALTER SESSION SET TIME_ZONE =
+  'UTC'`. A zone lexdb does not know leaves the session at `+00:00`, where Oracle refuses the logon.
 - `EXTRACT(HOUR FROM DATE ...)` returns 0; Oracle refuses a `DATE` with a time field (ORA-30076). `QUARTER` and `DOW`
   are accepted by `EXTRACT`; Oracle does not know them.
 - `TIME_BUCKET` needs the *origin* argument and fails without it (ORA-00909, example I); Oracle makes it optional.
@@ -419,9 +423,10 @@ SELECT EXTRACT(HOUR FROM NUMTODSINTERVAL(90, 'MINUTE')) AS hours, EXTRACT(MINUTE
 FROM dual;
 SELECT TO_CHAR(DATE '2026-11-23' + NUMTODSINTERVAL(36, 'HOUR'), 'YYYY-MM-DD HH24:MI') AS plus_36_hours,
        TO_CHAR(DATE '2026-11-23' + NUMTOYMINTERVAL(3, 'MONTH'), 'YYYY-MM-DD') AS plus_3_months,
-       TO_CHAR(DATE '2026-11-23' + 1.5, 'YYYY-MM-DD HH24:MI') AS plus_1_5_days, DATE '2026-11-25' - DATE '2026-11-23' AS days_between,
-       TO_CHAR(DATE '2026-01-31' + INTERVAL '1' MONTH, 'YYYY-MM-DD') AS end_of_month
+       TO_CHAR(DATE '2026-11-23' + 1.5, 'YYYY-MM-DD HH24:MI') AS plus_1_5_days, DATE '2026-11-25' - DATE '2026-11-23' AS days_between
 FROM dual;
+SELECT TO_CHAR(DATE '2026-01-31' + INTERVAL '1' MONTH, 'YYYY-MM-DD') AS no_feb_31 FROM dual;
+SELECT TO_CHAR(TIMESTAMP '2026-01-31 23:00:00 -05:00' + INTERVAL '1' MONTH, 'YYYY-MM-DD HH24:MI TZH:TZM') AS utc_month FROM dual;
 SELECT TIMESTAMP '2026-11-25 12:00:00' - TIMESTAMP '2026-11-23 06:30:00' AS timestamp_difference FROM dual;
 ```
 
@@ -432,9 +437,18 @@ HOURS MINUTES DAYS DAY_HOURS YEARS MONTHS
 
 1 row selected.
 
-PLUS_36_HOURS    PLUS_3_MONTHS PLUS_1_5_DAYS    DAYS_BETWEEN END_OF_MONTH
----------------- ------------- ---------------- ------------ ------------
-2026-11-24 12:00 2027-02-23    2026-11-24 12:00            2 2026-02-28
+PLUS_36_HOURS    PLUS_3_MONTHS PLUS_1_5_DAYS    DAYS_BETWEEN
+---------------- ------------- ---------------- ------------
+2026-11-24 12:00 2027-02-23    2026-11-24 12:00            2
+
+1 row selected.
+
+ERROR:
+ORA-01839: date not valid for month specified
+
+UTC_MONTH
+-----------------------
+2026-02-28 23:00 -05:00
 
 1 row selected.
 
