@@ -348,6 +348,36 @@ fn mapWin(w: &lexdb_sql.WinDef, f: &fn(&Expr): Option[Expr]): lexdb_sql.WinDef {
     return out
 }
 
+// An Oracle view's query with its calls of stored PL/SQL functions written as lexdb_plcall's lookups (Call "#plf" cast to the
+// function's type), by the calls kept with its text (lexdb_sql.viewPlf); as it is where it keeps none.
+pub fn viewPlf(q: Stmt, text: &str): Stmt {
+    let m = lexdb_sql.viewPlf(text)
+    if len(m) == 0 { return q }
+    var ents: [][]str = []
+    for e in strings.split(&m, "\x02") {
+        var f: []str = []
+        for p in strings.split(e, "\x01") { append(mut &f, p.toStr()) }
+        if len(f) == 3 { append(mut &ents, f) }
+    }
+    return mapStmt(&q, fn(x: &Expr): Option[Expr] { return plfOf(x, &ents) })
+}
+
+fn plfOf(x: &Expr, ents: &[][]str): Option[Expr] {
+    match x {
+        Expr.Call(nm, args, star) {
+            if star || len(nm) == 0 || nm[0] == '#' { return None }
+            for f in ents {
+                if f[0] != nm { continue }
+                var xs: []Expr = [Expr.Lit(Val.Text(f[1].clone()))]
+                for a in args { append(mut &xs, mapE(&a, fn(y: &Expr): Option[Expr] { return plfOf(y, ents) })) }
+                return Some(Expr.Cast(Expr.Call("#plf", xs, false), lexdb_sql.oidType(strings.parseIntOpt(&f[2]).unwrapOr(lexdb_sql.OID_TEXT))))
+            }
+            return None
+        }
+        else { return None }
+    }
+}
+
 // s with f applied to each of its expressions (and its subqueries'): f's Some replaces the expression it was given.
 pub fn mapStmt(s: &Stmt, f: &fn(&Expr): Option[Expr]): Stmt {
     var out = mapStmtTop(s, f)

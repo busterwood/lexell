@@ -1805,6 +1805,8 @@ fn (c: mut &Conn) prepare(i: int): Result[Unit, DbErr] {
         if len(stmts) != 1 { return Err(lexdb_base.err("42601", "SQL command not properly ended")) }
         // a query's calls of stored functions of a column are written as lookups (lexdb_plcall)
         c.cursors[i].plan = lexdb_plcall.noPlan()
+        // (a view's calls are resolved as the functions are now)
+        if stmts[0].kind == lexdb_sql.S_CREATE_VIEW { let ep = lexdb_plsql.ensureProg(mut &c.prog, mut &c.pl, mut &c.sess) }
         if (sk == tns.S_QUERY || sk == tns.S_DML || sk == tns.S_DDL) && lexdb_plsql.hasUnits(&c.prog) {
             match lexdb_plcall.rewrite(&c.prog, &c.pl, &stmts[0]) {
                 Ok(rw) {
@@ -1857,8 +1859,19 @@ fn newRuns(): Runs {
 
 // The cursor's statement run: with the values of the stored functions it calls (lexdb_plcall) when it calls any.
 fn (c: mut &Conn) runPlan(i: int, stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &lexdb_exec.PlanCache): Result[lexdb_exec.Res, DbErr] {
-    if len(c.cursors[i].plan.sites) > 0 { return lexdb_plcall.run(&c.prog, mut &c.pl, mut &c.sess, &c.cursors[i].plan, stmt, params, ptypes, pc) }
-    return c.sess.runCached(stmt, params, ptypes, pc)
+    // (the functions as they are now: one replaced since the cursor was parsed runs its new body, as Oracle's)
+    if len(c.cursors[i].plan.sites) > 0 {
+        let ep = lexdb_plsql.ensureProg(mut &c.prog, mut &c.pl, mut &c.sess)
+        return lexdb_plcall.run(&c.prog, mut &c.pl, mut &c.sess, &c.cursors[i].plan, stmt, params, ptypes, pc)
+    }
+    let r = c.sess.runCached(stmt, params, ptypes, pc)
+    // (a view that calls a stored function: the values it missed computed, and the statement run again)
+    let misses = if lexdb_plsql.hasUnits(&c.prog) { c.sess.plfMisses() } else { [] }
+    if len(misses) > 0 {
+        let ep = lexdb_plsql.ensureProg(mut &c.prog, mut &c.pl, mut &c.sess)
+        return lexdb_plcall.again(&c.prog, mut &c.pl, mut &c.sess, &misses, stmt, params, ptypes, pc)
+    }
+    return r
 }
 
 // Cursor i's statement run once per element of params, on lexdb's transactions: a DML statement starts one
