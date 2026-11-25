@@ -225,8 +225,8 @@ fn readAt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rowKey: &str): Resu
 pub fn complete(a: &Assertion): bool { return a.form == F_EXISTS }
 
 // The text DEFINITION_SQL shows: Oracle's own form of the statement.
-pub fn definition(a: &Assertion): str {
-    var b = "CREATE ASSERTION " + q(&a.owner) + "." + q(&nameIn(a, MD_ORA)) + " CHECK \r\n" + a.cond + "\r\n " + (if a.enabled { "ENABLE" } else { "DISABLE" })
+pub fn definition(a: &Assertion, owner: &str): str {
+    var b = "CREATE ASSERTION " + q(owner) + "." + q(&nameIn(a, MD_ORA)) + " CHECK \r\n" + a.cond + "\r\n " + (if a.enabled { "ENABLE" } else { "DISABLE" })
     b += if a.deferrable { "\r\n DEFERRABLE" } else { "\r\n NOT DEFERRABLE" }
     b += if a.deferred { "\r\n INITIALLY DEFERRED" } else { "\r\n INITIALLY IMMEDIATE" }
     b += if a.validated { "\r\n VALIDATE" } else { "\r\n NOVALIDATE" }
@@ -1135,8 +1135,8 @@ fn broken(a: &Assertion, n: int): bool { return if a.form == F_EXISTS { n == 0 }
 
 // A violation in the session's door: Oracle's ORA-08601; PostgreSQL's 23514 (a CHECK's state); SQL Server's 547 (a CHECK's
 // and a foreign key's number, its text naming the assertion and the table written: table, the statement's word verb).
-fn violated(up: &Up, a: &Assertion, table: &str, verb: &str): DbErr {
-    if up.door == MD_ORA { return ora(8601, &("Assertion (" + a.owner + "." + nameIn(a, MD_ORA) + ") violated.")) }
+fn violated(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, up: &Up, a: &Assertion, table: &str, verb: &str): DbErr {
+    if up.door == MD_ORA { return ora(8601, &("Assertion (" + ownerNow(st, txn, a) + "." + nameIn(a, MD_ORA) + ") violated.")) }
     if up.door == MD_TSQL {
         return tsErr(547, &("The " + verb + " statement conflicted with the assertion \"" + nameIn(a, MD_TSQL) + "\". The conflict occurred in database \"lexdb\", table \"" +
                             objName(if len(table) > 0 { table } else if len(a.deps) > 0 { &a.deps[0].table } else { &a.key }) + "\"."))
@@ -1225,7 +1225,7 @@ fn ddlIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, up: &Up): 
         a.validated = if x.va >= 0 { x.va == 1 } else { a.enabled }
         if a.enabled && a.validated && !was {
             let qs = try parseQuery(&violationText(&a), a.dialect)
-            if broken(&a, try runOn(st, txn, &a, &qs, up, false)) { return Err(violated(up, &a, &"", &"ALTER ASSERTION")) }
+            if broken(&a, try runOn(st, txn, &a, &qs, up, false)) { return Err(violated(st, txn, up, &a, &"", &"ALTER ASSERTION")) }
         }
         try txn.put(lexdb_catalog.CATALOG, &assertKey(&k), &encode(&a))
         try up.bump(st, txn)
@@ -1260,7 +1260,7 @@ fn ddlIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, up: &Up): 
     a.cols = colsRead(&an)
     if a.enabled && a.validated && broken(&a, n) {
         if md == MD_PG { return Err(e("23514", &("assertion \"" + a.name + "\" is violated by some row"))) }
-        if md == MD_TSQL { return Err(violated(up, &a, &"", &"CREATE ASSERTION")) }
+        if md == MD_TSQL { return Err(violated(st, txn, up, &a, &"", &"CREATE ASSERTION")) }
         return Err(ora(8689, &("CREATE ASSERTION failed\nORA-08601: Assertion (" + a.owner + "." + a.name + ") violated.")))
     }
     try txn.put(lexdb_catalog.CATALOG, &assertKey(&key), &encode(&a))
@@ -1284,7 +1284,20 @@ fn assertionsOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): R
     return Ok(out)
 }
 
-fn depends(a: &Assertion): DbErr { return ora(8702, &("Columns are referenced by assertion " + a.owner + "." + nameIn(a, MD_ORA) + ".")) }
+fn depends(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion): DbErr {
+    return ora(8702, &("Columns are referenced by assertion " + ownerNow(st, txn, a) + "." + nameIn(a, MD_ORA) + "."))
+}
+
+// The owner Oracle's texts name for assertion a in the session's eyes, as lexdb_oracat's views do: its schema's name; for
+// public's, the session's user, or SYS when the user has a schema of its own name.
+fn ownerNow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion): str {
+    let sc = lexdb_sql.schemaOf(&a.key)
+    if sc != "public" { return shownOf(&sc, &"") }
+    let u = st.memo.get(&lexdb_catalog.userKey(txn.sql.sess)).unwrapOr("lexdb")
+    let low = strings.toLowerAscii(&u)
+    if low != "public" && (st.get(txn, lexdb_catalog.CATALOG, &("\x03" + low)).unwrapOr(None)).isSome() { return "SYS" }
+    return strings.toUpperAscii(&u)
+}
 
 const CASCADE_HINT = "Use DROP ... CASCADE to drop the dependent objects too."
 
@@ -1296,7 +1309,7 @@ pub fn colChange(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Tabl
     var gone: []Assertion = []
     for a in try assertionsOf(st, txn, t) {
         if !lexdb_base.hasStr(&a.cols, &(t.name + "\x00" + col)) { continue }
-        if md == MD_ORA { return Err(depends(&a)) }
+        if md == MD_ORA { return Err(depends(st, txn, &a)) }
         let tn = lexdb_sql.baseName(&t.name)
         if md == MD_TSQL {
             if drop { return Err(tsErr(5074, &("The object '" + nameIn(&a, md) + "' is dependent on column '" + col + "'."))) }
@@ -1355,7 +1368,7 @@ pub fn unlink(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table, 
                                             &("assertion " + nameIn(&xs[0], md) + " depends on table " + tn), CASCADE_HINT))
         }
         if md == MD_TSQL { return Err(tsErr(3729, &("Cannot DROP TABLE '" + objName(&t.name) + "' because it is being referenced by object '" + nameIn(&xs[0], md) + "'."))) }
-        return Err(depends(&xs[0]))
+        return Err(depends(st, txn, &xs[0]))
     }
     for a in xs { try dropFor(st, txn, t, &a) }
     t.refBy = refs(&t.refBy)
@@ -1694,7 +1707,7 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ro
         }
     }
     if whole {
-        if broken(a, try runOn(st, txn, a, &plan.stmt, up, true)) { return Err(violated(up, a, &first, verb)) }
+        if broken(a, try runOn(st, txn, a, &plan.stmt, up, true)) { return Err(violated(st, txn, up, a, &first, verb)) }
         return Ok(Unit{})
     }
     for j in 0..len(ix) {
@@ -1706,7 +1719,7 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ro
             for k in at..hi { append(mut &part, collections.copyOf(&rs[j][k])) }
             var q = plan.stmt.clone()
             addConj(mut &q, &x.path, 0, keyIn(&x.alias, &ts[j], &part))
-            if broken(a, try runOn(st, txn, a, &q, up, true)) { return Err(violated(up, a, &x.key, verb)) }
+            if broken(a, try runOn(st, txn, a, &q, up, true)) { return Err(violated(st, txn, up, a, &x.key, verb)) }
             at = hi
         }
     }
@@ -1717,6 +1730,7 @@ fn checkOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, a: &Assertion, ro
 // the tables they wrote is checked, or kept for the COMMIT when deferred (lexdb_exec.runStmt in a block, onCommitDo before
 // a statement's own commit).
 pub fn stmtEnd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ok: bool, s: &Stmt, up: &Up): Result[Unit, DbErr] {
+    for x in txn.onCommit { if x == HOLD { return Ok(Unit{}) } }
     var ws: []Wr = []
     var keep: []str = []
     var any = false
@@ -1770,6 +1784,23 @@ pub fn stmtEnd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ok: bool, s: &
         }
     }
     return Ok(Unit{})
+}
+
+// Oracle's array DML (the TNS door's runs of one statement for each row of binds, python-oracledb's executemany, JDBC's
+// executeBatch) is one statement for its assertions: Oracle 23.26.3 checks them once after the last run, and a violation
+// fails the call (ORA-08601, every run undone, batch errors or not). on: the checks after each run held (HOLD in the
+// onCommit list); off: they are made for all the runs (s, the statement).
+const HOLD = "\x02h"
+
+pub fn hold(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, on: bool, s: &Stmt, up: &Up): Result[Unit, DbErr] {
+    if on {
+        append(mut &txn.onCommit, HOLD)
+        return Ok(Unit{})
+    }
+    var keep: []str = []
+    for x in txn.onCommit { if x != HOLD { append(mut &keep, x.clone()) } }
+    txn.onCommit = keep
+    return stmtEnd(st, txn, true, s, up)
 }
 
 // ---- deferred assertions (DEFERRABLE INITIALLY DEFERRED, SET CONSTRAINT[S] ... DEFERRED): checked at the COMMIT or at SET

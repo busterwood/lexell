@@ -1,0 +1,181 @@
+// lexdb's assertions across its three doors (design/lexdb-new-features.md O23 and section 14): one made in any door is enforced
+// for the writes of every door and listed in each door's catalog in its own form (USER_ASSERTIONS in Oracle's,
+// information_schema.ASSERTIONS in PostgreSQL's and T-SQL's). An assertion made in the PostgreSQL door (in process), one made in
+// the T-SQL door (DEFERRABLE INITIALLY DEFERRED, over TDS) and one in Oracle's (over TNS); each broken from the other two doors
+// with each door's error (23514, 547, ORA-08601; the deferred one at COMMIT: 23514, 547 naming COMMIT TRANSACTION, ORA-02091);
+// each dropped from another door. (Oracle's APP has a schema of its own: its assertion is APP's, the public schema's are
+// shown as SYS's, as lexdb's Oracle door shows public's tables to such a user.) The texts are lexdb's own (neither PostgreSQL nor SQL Server has assertions; Oracle's are as
+// tns_assert checked them against Oracle Free).
+// timeout: 120
+// expect: tables: CREATE TABLE
+// expect: made in PostgreSQL's: CREATE ASSERTION
+// expect: made in T-SQL's: ok
+// expect: made in Oracle's: 0
+// expect: PostgreSQL's catalog: app|ora_a|NO|NO;public|pg_a|NO|NO;public|ts_a|YES|YES
+// expect: T-SQL's catalog: app|ora_a|NO|NO;public|pg_a|NO|NO;public|ts_a|YES|YES
+// expect: Oracle's catalog: 'APP'|'ORA_A'|'NOT DEFERRABLE'|'IMMEDIATE';'SYS'|'PG_A'|'NOT DEFERRABLE'|'IMMEDIATE';'SYS'|'TS_A'|'DEFERRABLE'|'DEFERRED'
+// expect: Oracle's dependencies: 'APP'|'ORA_A'|'SYS'|'T3';'SYS'|'PG_A'|'SYS'|'T1';'SYS'|'TS_A'|'SYS'|'T2'
+// expect: pg_a from T-SQL: error 547: The INSERT statement conflicted with the assertion "pg_a". The conflict occurred in database "lexdb", table "dbo.t1". / 0
+// expect: pg_a from Oracle: error 8601: ORA-08601: Assertion (SYS.PG_A) violated. / 0
+// expect: ts_a from PostgreSQL: BEGIN / INSERT 0 1 / error 23514 assertion "ts_a" is violated / error 23514 assertion "ts_a" is violated / 0
+// expect: ts_a from Oracle: 1 / 1 / commit: error 2091: ORA-02091: transaction rolled back | ORA-08601: Assertion (SYS.TS_A) violated. / 0
+// expect: ts_a from T-SQL: error 547: The COMMIT TRANSACTION statement conflicted with the assertion "ts_a". The conflict occurred in database "lexdb", table "dbo.t2". / 0|0
+// expect: ts_a fixed before COMMIT, from Oracle: 1 / 1 / committed / 1 / 1
+// expect: SET CONSTRAINTS from PostgreSQL: BEGIN / INSERT 0 1 / error 23514 assertion "ts_a" is violated / ROLLBACK
+// expect: ora_a from PostgreSQL: error 23514 assertion "ora_a" is violated / INSERT 0 1
+// expect: ora_a from T-SQL: error 547: The UPDATE statement conflicted with the assertion "ora_a". The conflict occurred in database "lexdb", table "dbo.t3". / NULL
+// expect: drop table t1 from T-SQL: error 3729: Cannot DROP TABLE 'dbo.t1' because it is being referenced by object 'pg_a'.
+// expect: drop column from Oracle: error 8702: ORA-08702: Columns are referenced by assertion SYS.TS_A.
+// expect: drop table t3 from PostgreSQL: error 2BP01 cannot drop table t3 because other objects depend on it
+// expect: dropped across: 0 / DROP ASSERTION / error 3701: Cannot drop the assertion 'ora_a', because it does not exist or you do not have permission. / ok / 0 / INSERT 0 1
+import "strings"
+import "task"
+import "net"
+import "tds"
+import "oracle"
+import "sqldialect"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+import "../../../cmd/lexdb_tns"
+
+fn pg(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if !r.hasRows { return r.tag.clone() }
+            var out: []str = []
+            for row in r.rows {
+                var vs: []str = []
+                for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                append(mut &out, strings.join(&vs, "|"))
+            }
+            return strings.join(&out, ";")
+        }
+        Err(e) { return "error " + e.state + " " + e.msg }
+    }
+}
+
+fn ts(s: mut &tds.Session, sql: &str): str {
+    match s.batch(sql) {
+        Ok(rep) {
+            var parts: []str = []
+            for e in rep.errors { append(mut &parts, "error " + e.number.toStr() + ": " + e.text) }
+            for rs in rep.results {
+                var rows: []str = []
+                for row in rs.rows {
+                    var cells: []str = []
+                    for i in 0..len(row) {
+                        match row[i] {
+                            tds.Cell.Null { append(mut &cells, "NULL") }
+                            else { append(mut &cells, tds.cellText(&rs.columns[i], &row[i]).unwrapOr("?")) }
+                        }
+                    }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                append(mut &parts, strings.join(&rows, ";"))
+            }
+            return if len(parts) == 0 { "ok" } else { strings.join(&parts, " / ") }
+        }
+        Err(e) { return "failed " + e.msg }
+    }
+}
+
+fn ora(c: mut &oracle.Conn, sql: &str): str {
+    let low = strings.toLowerAscii(sql)
+    if strings.startsWith(&low, "select") {
+        match c.query(&(sql.toStr()), &[]) {
+            Ok(rows) {
+                var rs: []str = []
+                for i in 0..rows.rowCount() {
+                    var cells: []str = []
+                    for j in 0..rows.columnCount() { append(mut &cells, rows.value(i, j).unwrap().toStr()) }
+                    append(mut &rs, strings.join(&cells, "|"))
+                }
+                return strings.join(&rs, ";")
+            }
+            Err(e) { return "error " + e.code.toStr() + ": " + e.msg }
+        }
+    }
+    match c.run(&(sql.toStr()), &[]) {
+        Ok(n) { return n.toStr() }
+        Err(e) { return "error " + e.code.toStr() + ": " + e.msg }
+    }
+}
+
+// Statements in one Oracle transaction, then its COMMIT: their answers, then the COMMIT's.
+fn oraTx(c: mut &oracle.Conn, sqls: &[]str): str {
+    var out: []str = []
+    let r = c.transaction(fn(c2: mut &oracle.Conn): Result[int, oracle.Error] {
+        for x in sqls { append(mut &out, ora(c2, &x)) }
+        return Ok(0)
+    })
+    match r {
+        Ok(_) { append(mut &out, "committed") }
+        Err(e) { append(mut &out, "commit: error " + e.code.toStr() + ": " + strings.replaceAll(&e.msg, "\n", " | ")) }
+    }
+    return strings.join(&out, " / ")
+}
+
+fn doors(st: &lexdb_store.Store, tdsAddr: &str, tnsAddr: &str) {
+    var p = lexdb_exec.newSession(st.share())
+    let cs = sqlserver.parseConnString(&("Server=127.0.0.1," + tdsAddr + ";UID=sa;PWD=x;Encrypt=no")).unwrap()
+    var t = tds.open(&cs.config).unwrap()
+    var o = oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + tnsAddr + "/lexdb")).unwrap()
+    println("tables: " + pg(mut &p, "create table t1 (id int primary key, v int); create table t2 (id int primary key, v int); create table t3 (id int primary key, v int)"))
+    println("made in PostgreSQL's: " + pg(mut &p, "create assertion pg_a check (not exists (select 1 from t1 where v < 0))"))
+    println("made in T-SQL's: " + ts(mut &t, "create assertion ts_a check (not exists (select 1 from t2 where v < 0)) deferrable initially deferred"))
+    println("made in Oracle's: " + ora(mut &o, "create assertion ora_a check (all (select v from t3) satisfy (v >= 0))"))
+    println("PostgreSQL's catalog: " + pg(mut &p, "select constraint_schema, constraint_name, is_deferrable, initially_deferred from information_schema.assertions order by 2"))
+    println("T-SQL's catalog: " + ts(mut &t, "select constraint_schema, constraint_name, is_deferrable, initially_deferred from INFORMATION_SCHEMA.ASSERTIONS order by 2"))
+    println("Oracle's catalog: " + ora(mut &o, "select owner, assertion_name, deferrable, deferred from all_assertions order by 2"))
+    println("Oracle's dependencies: " + ora(mut &o, "select owner, assertion_name, referenced_owner, referenced_name from all_assertion_dependencies order by 2"))
+    // PostgreSQL's assertion broken from T-SQL's and Oracle's doors
+    println("pg_a from T-SQL: " + ts(mut &t, "insert into t1 values (1, -1); select count(*) from t1"))
+    println("pg_a from Oracle: " + ora(mut &o, "insert into t1 values (1, -1)") + " / " + ora(mut &o, "select count(*) from t1"))
+    // T-SQL's (deferred) from PostgreSQL's and Oracle's: at COMMIT, and at a statement on its own
+    println("ts_a from PostgreSQL: " + pg(mut &p, "begin") + " / " + pg(mut &p, "insert into t2 values (1, -1)") + " / " + pg(mut &p, "commit") + " / " +
+            pg(mut &p, "insert into t2 values (1, -1)") + " / " + pg(mut &p, "select count(*) from t2"))
+    println("ts_a from Oracle: " + oraTx(mut &o, &["insert into t2 values (1, -1)", "select count(*) from t2"]) + " / " + ora(mut &o, "select count(*) from t2"))
+    println("ts_a from T-SQL: " + ts(mut &t, "begin tran; insert into t2 values (1, -1); commit tran; select @@trancount, count(*) from t2"))
+    println("ts_a fixed before COMMIT, from Oracle: " + oraTx(mut &o, &["insert into t2 values (1, -1)", "update t2 set v = 1 where id = 1"]) + " / " +
+            ora(mut &o, "select count(*) from t2") + " / " + ora(mut &o, "delete from t2"))
+    println("SET CONSTRAINTS from PostgreSQL: " + pg(mut &p, "begin") + " / " + pg(mut &p, "insert into t2 values (1, -1)") + " / " + pg(mut &p, "set constraints ts_a immediate") +
+            " / " + pg(mut &p, "rollback"))
+    // Oracle's from PostgreSQL's and T-SQL's
+    println("ora_a from PostgreSQL: " + pg(mut &p, "insert into t3 values (1, -1)") + " / " + pg(mut &p, "insert into t3 values (1, null)"))
+    println("ora_a from T-SQL: " + ts(mut &t, "update t3 set v = -1; select v from t3"))
+    // DDL from another door
+    println("drop table t1 from T-SQL: " + ts(mut &t, "drop table t1"))
+    println("drop column from Oracle: " + ora(mut &o, "alter table t2 drop column v"))
+    println("drop table t3 from PostgreSQL: " + pg(mut &p, "drop table t3"))
+    println("dropped across: " + ora(mut &o, "drop assertion pg_a") + " / " + pg(mut &p, "drop assertion ts_a") + " / " + ts(mut &t, "drop assertion ora_a") + " / " + ts(mut &t, "drop assertion app.ora_a") + " / " +
+            pg(mut &p, "select count(*) from information_schema.assertions") + " / " + pg(mut &p, "insert into t1 values (2, -2)"))
+    o.logoff()
+    p.close()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(sc: mut &task.Scope) {
+        let l1 = net.listen("127.0.0.1:0").unwrap()
+        let a1 = l1.localAddr()
+        let l2 = net.listen("127.0.0.1:0").unwrap()
+        let a2 = l2.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f1 = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: l1, st: st.share()})
+        let f2 = sc.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: l2, st: st.share()})
+        doors(&st, &a1[10..len(a1)], &a2[10..len(a2)])
+        { let stop1 = f1 }
+        { let stop2 = f2 }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(59), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}
