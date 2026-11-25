@@ -221,6 +221,7 @@ public class DocRun {
             String what = w[1].charAt(0) + w[1].substring(1).toLowerCase(Locale.ROOT);
             if (w.length >= 3 && w[1].equals("PACKAGE") && w[2].equals("BODY")) what = "Package body";
             if (w.length >= 3 && w[1].equals("MATERIALIZED")) what = "Materialized view";
+            if (w.length >= 3 && w[1].equals("PROPERTY") && w[2].equals("GRAPH")) what = "Property graph";
             String verb = w[0].equals("CREATE") ? "created." : w[0].equals("ALTER") ? "altered." : "dropped.";
             return what + " " + verb;
         }
