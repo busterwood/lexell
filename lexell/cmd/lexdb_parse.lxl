@@ -55,6 +55,7 @@ const K_BYTEA = lexdb_sql.K_BYTEA
 const K_FLOAT = lexdb_sql.K_FLOAT
 const K_REG = lexdb_sql.K_REG
 const K_ENUM = lexdb_sql.K_ENUM
+const K_JSON = lexdb_sql.K_JSON
 const TYPE_MARK = lexdb_sql.TYPE_MARK
 const OID_BOOL = lexdb_sql.OID_BOOL
 const OID_INT8 = lexdb_sql.OID_INT8
@@ -81,6 +82,8 @@ const OID_REGNAMESPACE = lexdb_sql.OID_REGNAMESPACE
 const OID_REGPROC = lexdb_sql.OID_REGPROC
 const OID_FLOAT8 = lexdb_sql.OID_FLOAT8
 const OID_UNKNOWN = lexdb_sql.OID_UNKNOWN
+const OID_JSON = lexdb_sql.OID_JSON
+const OID_JSONB = lexdb_sql.OID_JSONB
 const CAT_MARK = lexdb_sql.CAT_MARK
 const SET_MARK = lexdb_sql.SET_MARK
 const SERIAL_MARK = lexdb_sql.SERIAL_MARK
@@ -721,6 +724,11 @@ fn lexInGt(s: &str, dialect: Dialect, ora: bool, initGt: int): Result[[]Tok, lex
             if two == "<=" || two == ">=" || two == "<>" || two == "!=" || two == "||" || two == "::" || two == "!~" || two == "~*" ||
                two == "<<" || two == ">>" || two == "@>" || two == "<@" || two == "&&" { op = two.clone() }
             if two == "!~" && i + 2 < n && s[i + 2] == '*' { op = "!~*" }
+            if !ora && !dialect.tsql {
+                if two == "->" { op = if i + 2 < n && s[i + 2] == '>' { "->>" } else { "->" } }
+                else if two == "#>" { op = if i + 2 < n && s[i + 2] == '>' { "#>>" } else { "#>" } }
+                else if two == "?|" || two == "?&" || two == "@?" || two == "@@" || two == "#-" { op = two.clone() }
+            }
         }
         if !strings.contains(&"(),;.*+-/%=<>|:![]~&#^@{}?$", &op[0..1]) {
             return Err(syntax(&("syntax error at or near \"" + op + "\"")))
@@ -995,6 +1003,8 @@ fn (p: mut &P) typeName(): Result[TypeName, lexdb_base.DbErr] {
             return Ok(try p.arraySuffix(lexdb_sql.floatType(oid)))
         }
         "bytea" { t = TypeName{kind: K_BYTEA, oid: OID_BYTEA, prec: 0, scale: 0, len: 0} }
+        "json" { t = TypeName{kind: K_JSON, oid: OID_JSON, prec: 0, scale: 0, len: 0} }
+        "jsonb" { t = TypeName{kind: K_JSON, oid: OID_JSONB, prec: 0, scale: 0, len: 0} }
         "time", "timestamp", "timestamptz", "timetz", "interval" {
             var oid = if w == "time" { OID_TIME } else if w == "interval" { OID_IVAL } else if w == "timestamptz" { OID_TSTZ } else if w == "timetz" { 0 } else { OID_TS }
             t = lexdb_sql.timeType(oid)
@@ -1359,6 +1369,24 @@ fn (p: mut &P) isTail(e: Expr): Result[Expr, lexdb_base.DbErr] {
             p.pos += 1
             return Ok(Expr.IsNull(e, isNot))
         }
+        if p.acceptKw("json") {
+            var kind = ""
+            if p.acceptKw("value") { kind = "value" }
+            else if p.acceptKw("scalar") { kind = "scalar" }
+            else if p.acceptKw("array") { kind = "array" }
+            else if p.acceptKw("object") { kind = "object" }
+            var uniq = 0
+            if p.acceptKw("with") {
+                try p.expectKw("unique")
+                let _k = p.acceptKw("keys")
+                uniq = 1
+            } else if p.acceptKw("without") {
+                try p.expectKw("unique")
+                let _k = p.acceptKw("keys")
+            }
+            let call = Expr.Call("#is_json", [e, Expr.Lit(Val.Text(kind)), Expr.Lit(Val.Int(uniq))], false)
+            return Ok(if isNot { Expr.Unary("not", call) } else { call })
+        }
         return Err(near(&p.peek()))
     }
     return Ok(e)
@@ -1369,13 +1397,25 @@ fn (p: mut &P) isTail(e: Expr): Result[Expr, lexdb_base.DbErr] {
 fn (p: mut &P) catExpr(): Result[Expr, lexdb_base.DbErr] {
     var e = try p.addExpr()
     while p.isKw("||") || p.isKw("&") || p.isKw("|") || p.isKw("#") || p.isKw("<<") || p.isKw(">>") || p.isKw("@>") ||
-          p.isKw("<@") || p.isKw("&&") {
+          p.isKw("<@") || p.isKw("&&") ||
+          (!p.ora && !p.tsql && (p.isKw("->") || p.isKw("->>") || p.isKw("#>") || p.isKw("#>>") || p.isKw("?") ||
+                                 p.isKw("?|") || p.isKw("?&") || p.isKw("@?") || p.isKw("@@") || p.isKw("#-"))) {
         let op = p.next().text
         let r = try p.addExpr()
         // the array operators (9.92) are calls; T-SQL's ^ is # (XOR: its lexer)
         if p.tsql && (op == "&" || op == "|" || op == "#" || op == "<<" || op == ">>") {
             e = tsqlBitOp(&op, e, r)
-        } else {
+        } else if op == "->" { e = Expr.Call("#json_arrow", [e, r], false) }
+        else if op == "->>" { e = Expr.Call("#json_arrow_text", [e, r], false) }
+        else if op == "#>" { e = Expr.Call("#json_hash", [e, r], false) }
+        else if op == "#>>" { e = Expr.Call("#json_hash_text", [e, r], false) }
+        else if op == "?" { e = Expr.Call("#jsonb_has", [e, r], false) }
+        else if op == "?|" { e = Expr.Call("#jsonb_has_any", [e, r], false) }
+        else if op == "?&" { e = Expr.Call("#jsonb_has_all", [e, r], false) }
+        else if op == "@?" { e = Expr.Call("#jsonb_path_exists_op", [e, r], false) }
+        else if op == "@@" { e = Expr.Call("#jsonb_path_match_op", [e, r], false) }
+        else if op == "#-" { e = Expr.Call("#jsonb_del_path", [e, r], false) }
+        else {
             e = if op == "@>" || op == "<@" || op == "&&" { Expr.Call(op, [e, r], false) } else { Expr.Bin(op, e, r) }
         }
     }
@@ -2269,6 +2309,39 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
             "null" { return Ok(Expr.Lit(Val.Null)) }
             "true" { return Ok(Expr.Lit(Val.Bool(true))) }
             "false" { return Ok(Expr.Lit(Val.Bool(false))) }
+            "json" {
+                if p.peek().kind == T_STR {
+                    let lit = p.next().text
+                    return Ok(Expr.Cast(Expr.Lit(Val.Text(lit)), TypeName{kind: K_JSON, oid: OID_JSON, prec: 0, scale: 0, len: 0}))
+                }
+                if p.isKw("(") { return p.jsonCtorExpr() }
+            }
+            "jsonb" {
+                if p.peek().kind == T_STR {
+                    let lit = p.next().text
+                    return Ok(Expr.Cast(Expr.Lit(Val.Text(lit)), TypeName{kind: K_JSON, oid: OID_JSONB, prec: 0, scale: 0, len: 0}))
+                }
+            }
+            "json_value" { if p.isKw("(") { return p.jsonValueExpr() } }
+            "json_query" { if p.isKw("(") { return p.jsonQueryExpr() } }
+            "json_exists" { if p.isKw("(") { return p.jsonExistsExpr() } }
+            "json_object" {
+                if p.isKw("(") {
+                    match try p.jsonObjectExpr() {
+                        Some(x) { return Ok(x) }
+                        None {}
+                    }
+                }
+            }
+            "json_array" { if p.isKw("(") { return p.jsonArrayExpr() } }
+            "json_scalar" { if p.isKw("(") { return p.jsonScalarExpr() } }
+            "json_serialize" { if p.isKw("(") { return p.jsonSerializeExpr() } }
+            "json_mergepatch" { if p.isKw("(") { return p.jsonMergePatchExpr() } }
+            "json_equal" { if p.isKw("(") { return p.jsonEqualExpr() } }
+            "json_transform" { if p.isKw("(") { return p.jsonTransformExpr() } }
+            "json_arrayagg" { if p.isKw("(") { return p.jsonArrayAggExpr() } }
+            "json_objectagg" { if p.isKw("(") { return p.jsonObjectAggExpr() } }
+            "isjson" { if p.tsql && p.isKw("(") { return p.tsqlIsJsonExpr() } }
             "cast" {
                 try p.expectKw("(")
                 let e = try p.expr()
@@ -2825,6 +2898,10 @@ fn (p: mut &P) tsqlCall(name: &str, args: []Expr, star: bool): Result[Expr, lexd
         // the batch's @@IDENTITY (refreshed before each statement): a value WHERE can read
         return p.variable(&Tok{kind: T_VAR, text: "@@identity", at: 0, spell: ""})
     }
+    // SQL Server JSON functions
+    if name == "json_modify" && n == 3 { return Ok(Expr.Call("#json_modify", a, false)) }
+    if name == "json_path_exists" && n == 2 { return Ok(Expr.Call("#tsql_json_path_exists", a, false)) }
+    if name == "json_contains" && (n == 2 || n == 3) { return Ok(Expr.Call("#tsql_json_contains", a, false)) }
     // SQL Server 2025's REGEXP_ functions: lexdb's, their omitted arguments SQL Server's defaults (REGEXP_REPLACE's
     // occurrence 0: every match), their flags read as SQL Server's (lexdb_sql.RE_TSQL)
     if strings.startsWith(name, "regexp_") {
@@ -5978,7 +6055,8 @@ fn (p: mut &P) orderLimit(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     var offset = false
     while p.isKw("limit") || p.isKw("offset") || p.isKw("for") || p.isKw("fetch") {
         if p.acceptKw("for") {
-            try p.lockClause(s)
+            if p.tsql && p.acceptKw("json") { try p.forJsonClause(s) }
+            else { try p.lockClause(s) }
         } else if p.isKw("limit") || p.isKw("fetch") {
             if limited { return Err(lexdb_base.err("42601", "multiple LIMIT clauses not allowed")) }
             limited = true
@@ -6203,7 +6281,10 @@ fn (p: mut &P) parenTree(join: int): Result[FromItem, lexdb_base.DbErr] {
 // The functions that may be a FROM item.
 pub fn isFromFn(n: &str): bool {
     return n == "generate_series" || n == "unnest" || n == "pg_partition_ancestors" || n == "pg_available_extensions" || n == "regexp_matches" ||
-           n == "regexp_split_to_table" || n == "string_to_table"
+           n == "regexp_split_to_table" || n == "string_to_table" ||
+           n == "json_each" || n == "jsonb_each" || n == "json_each_text" || n == "jsonb_each_text" ||
+           n == "json_array_elements" || n == "jsonb_array_elements" || n == "json_array_elements_text" || n == "jsonb_array_elements_text" ||
+           n == "json_object_keys" || n == "jsonb_object_keys" || n == "jsonb_path_query"
 }
 
 fn (p: mut &P) fromItem(join: int): Result[FromItem, lexdb_base.DbErr] {
@@ -6217,6 +6298,14 @@ fn (p: mut &P) fromItem0(join: int): Result[FromItem, lexdb_base.DbErr] {
     if p.peek().kind == T_IDENT && p.peek().text == "pg_catalog" && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." &&
        p.peekAt(3).kind == T_OP && p.peekAt(3).text == "(" {
         p.pos += 2
+    }
+    if p.peek().kind == T_IDENT && p.peek().text == "json_table" &&
+       p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].kind == T_OP && p.toks[p.pos + 1].text == "(" {
+        return p.jsonTableFrom(join)
+    }
+    if p.tsql && p.peek().kind == T_IDENT && p.peek().text == "openjson" &&
+       p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].kind == T_OP && p.toks[p.pos + 1].text == "(" {
+        return p.openJsonFrom(join)
     }
     if p.peek().kind == T_IDENT && isFromFn(&p.peek().text) &&
        p.pos + 1 < len(p.toks) && p.toks[p.pos + 1].kind == T_OP && p.toks[p.pos + 1].text == "(" {
@@ -6394,10 +6483,13 @@ fn (p: mut &P) fromFunction(join: int): Result[FromItem, lexdb_base.DbErr] {
         }
     }
     // one column, an alias and no column names: the column is the alias
-    let single = !strings.startsWith(&p.subs[i].srf, "tsql_") &&
+    let isEach = name == "json_each" || name == "jsonb_each" || name == "json_each_text" || name == "jsonb_each_text"
+    let single = !strings.startsWith(&p.subs[i].srf, "tsql_") && !isEach &&
                  (name == "generate_series" || name == "regexp_matches" || name == "regexp_split_to_table" || name == "string_to_table" ||
+                  name == "json_array_elements" || name == "jsonb_array_elements" || name == "json_array_elements_text" || name == "jsonb_array_elements_text" ||
+                  name == "json_object_keys" || name == "jsonb_object_keys" || name == "jsonb_path_query" ||
                   len(p.subs[i].items) == 1)
-    if single && alias != name && len(cols) == 0 { append(mut &cols, alias.clone()) }
+    if single && !p.subs[i].ordin && alias != name && len(cols) == 0 { append(mut &cols, alias.clone()) }
     return Ok(FromItem{table: name, alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: true, using: [], natural: false, comma: false})
 }
 
@@ -9114,6 +9206,7 @@ fn (p: mut &P) tsqlType(w: &str): Result[Option[TypeName], lexdb_base.DbErr] {
         "money" { return Ok(Some(TypeName{kind: K_NUM, oid: OID_NUMERIC, prec: 19, scale: 4, len: 0})) }
         "smallmoney" { return Ok(Some(TypeName{kind: K_NUM, oid: OID_NUMERIC, prec: 10, scale: 4, len: 0})) }
         "uniqueidentifier" { return Ok(Some(TypeName{kind: K_UUID, oid: OID_UUID, prec: 0, scale: 0, len: 0})) }
+        "json" { return Ok(Some(TypeName{kind: K_JSON, oid: OID_JSON, prec: 0, scale: 0, len: 0})) }
         "varbinary", "binary", "image", "rowversion", "timestamp" {
             let n = try p.tsqlLen()
             let code = if w == "varbinary" { lexdb_dialect.TS_VARBINARY } else if w == "binary" { lexdb_dialect.TS_BINARY } else if w == "image" { lexdb_dialect.TS_IMAGE } else { lexdb_dialect.TS_TIMESTAMP }
@@ -9731,6 +9824,7 @@ fn (p: mut &P) oraType(w: &str): Result[Option[TypeName], lexdb_base.DbErr] {
         }
         "binary_float" { return Ok(Some(lexdb_sql.floatType(OID_FLOAT4))) }
         "binary_double" { return Ok(Some(lexdb_sql.floatType(OID_FLOAT8))) }
+        "json" { return Ok(Some(TypeName{kind: K_JSON, oid: OID_JSON, prec: 0, scale: 0, len: 0})) }
         "integer", "int", "smallint", "pls_integer", "binary_integer", "simple_integer" {
             return Ok(Some(TypeName{kind: K_INT, oid: OID_INT8, prec: 0, scale: 0, len: 0}))
         }
@@ -11613,3 +11707,777 @@ pub fn parseTsqlVars(sql: &str, vars: &[]str): Result[[]Stmt, lexdb_base.DbErr] 
 // Oracle's and PostgreSQL's SQL text as tokens (lexdb_graph reads a graph's definition and GRAPH_TABLE's text with them).
 pub fn oraTokens(sql: &str): Result[[]Tok, lexdb_base.DbErr] { return lexOra(sql, pgDialect(), true) }
 pub fn pgTokens(sql: &str): Result[[]Tok, lexdb_base.DbErr] { return lexOra(sql, pgDialect(), false) }
+
+// ---- SQL/JSON expressions, aggregates, JSON_TABLE, OPENJSON, and FOR JSON (all 3 doors)
+
+fn (p: mut &P) strLit(): Result[str, lexdb_base.DbErr] {
+    let t = p.next()
+    if t.kind != T_STR { return Err(near(&t)) }
+    return Ok(t.text)
+}
+
+const J_ON_NULL = 0
+const J_ON_ERROR = 1
+const J_ON_DEFAULT = 2
+const J_ON_EMPTY_ARR = 3
+const J_ON_EMPTY_OBJ = 4
+const J_ON_TRUE = 5
+const J_ON_FALSE = 6
+const J_ON_UNKNOWN = 7
+
+const J_WRAP_NONE = 0
+const J_WRAP_UNCOND = 1
+const J_WRAP_COND = 2
+
+const J_QUOTES_KEEP = 0
+const J_QUOTES_OMIT = 1
+
+// PASSING expr AS name [, expr AS name ...] -> pairs [Lit(name), expr, ...]
+fn (p: mut &P) parseJsonPassing(out: mut &[]Expr): Result[Unit, lexdb_base.DbErr] {
+    if !p.acceptKw("passing") { return Ok(Unit{}) }
+    while true {
+        let v = try p.expr()
+        try p.expectKw("as")
+        let nm = try p.name()
+        append(out, Expr.Lit(Val.Text(nm)))
+        append(out, v)
+        if !p.acceptKw(",") { break }
+    }
+    return Ok(Unit{})
+}
+
+// Parses optional ON EMPTY and ON ERROR clauses (in either order).
+fn (p: mut &P) parseJsonOnClauses(onEmpty: mut &int, emptyDef: mut &Expr, onErr: mut &int, errDef: mut &Expr): Result[bool, lexdb_base.DbErr] {
+    var any = false
+    while true {
+        let save = p.pos
+        var mode = -1
+        var def = Expr.Lit(Val.Null)
+        if p.acceptKw("null") {
+            mode = J_ON_NULL
+        } else if p.acceptKw("error") {
+            mode = J_ON_ERROR
+        } else if p.acceptKw("empty") {
+            if p.acceptKw("array") { mode = J_ON_EMPTY_ARR }
+            else if p.acceptKw("object") { mode = J_ON_EMPTY_OBJ }
+            else { mode = J_ON_EMPTY_ARR }
+        } else if p.acceptKw("default") {
+            mode = J_ON_DEFAULT
+            def = try p.expr()
+        } else if p.acceptKw("true") {
+            mode = J_ON_TRUE
+        } else if p.acceptKw("false") {
+            mode = J_ON_FALSE
+        } else if p.acceptKw("unknown") {
+            mode = J_ON_UNKNOWN
+        } else {
+            break
+        }
+        if !p.acceptKw("on") {
+            p.pos = save
+            break
+        }
+        any = true
+        if p.acceptKw("empty") {
+            onEmpty = mode
+            emptyDef = def
+        } else if p.acceptKw("error") {
+            onErr = mode
+            errDef = def
+        } else {
+            return Err(near(&p.peek()))
+        }
+    }
+    return Ok(any)
+}
+
+// Parses optional RETURNING type [FORMAT JSON].
+fn (p: mut &P) parseJsonReturning(): Result[Option[TypeName], lexdb_base.DbErr] {
+    if !p.acceptKw("returning") { return Ok(None) }
+    let ty = try p.typeName()
+    if p.acceptKw("format") { try p.expectKw("json") }
+    return Ok(Some(ty))
+}
+
+// Parses optional WRAPPER clause: WITHOUT [ARRAY] WRAPPER | WITH [CONDITIONAL | UNCONDITIONAL] [ARRAY] WRAPPER.
+fn (p: mut &P) parseJsonWrapper(wrapper: mut &int): Result[bool, lexdb_base.DbErr] {
+    let save = p.pos
+    if p.acceptKw("without") {
+        let _a = p.acceptKw("array")
+        if p.acceptKw("wrapper") {
+            wrapper = J_WRAP_NONE
+            return Ok(true)
+        }
+        p.pos = save
+        return Ok(false)
+    }
+    if p.acceptKw("with") {
+        var w = J_WRAP_UNCOND
+        if p.acceptKw("conditional") { w = J_WRAP_COND }
+        else if p.acceptKw("unconditional") { w = J_WRAP_UNCOND }
+        let _a = p.acceptKw("array")
+        if p.acceptKw("wrapper") {
+            wrapper = w
+            return Ok(true)
+        }
+        p.pos = save
+        return Ok(false)
+    }
+    return Ok(false)
+}
+
+// Parses optional KEEP | OMIT QUOTES [ON SCALAR STRING].
+fn (p: mut &P) parseJsonQuotes(quotes: mut &int): Result[bool, lexdb_base.DbErr] {
+    let save = p.pos
+    if p.acceptKw("keep") || p.acceptKw("omit") {
+        let omit = p.toks[p.pos - 1].text == "omit"
+        if p.acceptKw("quotes") {
+            if p.acceptKw("on") {
+                try p.expectKw("scalar")
+                try p.expectKw("string")
+            }
+            quotes = if omit { J_QUOTES_OMIT } else { J_QUOTES_KEEP }
+            return Ok(true)
+        }
+        p.pos = save
+    }
+    return Ok(false)
+}
+
+fn (p: mut &P) jsonCtorExpr(): Result[Expr, lexdb_base.DbErr] {
+    try p.expectKw("(")
+    let x = try p.expr()
+    var uniq = 0
+    if p.acceptKw("with") {
+        try p.expectKw("unique")
+        let _k = p.acceptKw("keys")
+        uniq = 1
+    } else if p.acceptKw("without") {
+        try p.expectKw("unique")
+        let _k = p.acceptKw("keys")
+    }
+    try p.expectKw(")")
+    return Ok(Expr.Call("#json_ctor", [x, Expr.Lit(Val.Int(uniq)), Expr.Lit(Val.Int(if p.ora { 1 } else { 0 }))], false))
+}
+
+fn (p: mut &P) jsonValueExpr(): Result[Expr, lexdb_base.DbErr] {
+    try p.expectKw("(")
+    let doc = try p.expr()
+    try p.expectKw(",")
+    let path = try p.expr()
+    var passing: []Expr = []
+    try p.parseJsonPassing(mut &passing)
+    let ret = try p.parseJsonReturning()
+    var onEmpty = J_ON_NULL
+    var emptyDef = Expr.Lit(Val.Null)
+    var onErr = J_ON_NULL
+    var errDef = Expr.Lit(Val.Null)
+    let hadOn = try p.parseJsonOnClauses(mut &onEmpty, mut &emptyDef, mut &onErr, mut &errDef)
+    try p.expectKw(")")
+    if p.tsql && len(passing) == 0 && ret.isNone() && !hadOn {
+        return Ok(Expr.Call("#tsql_json_value", [doc, path], false))
+    }
+    let retOid = match ret { Some(t) { t.oid } None { 0 } }
+    var args: []Expr = [doc, path, Expr.Lit(Val.Int(onEmpty)), emptyDef, Expr.Lit(Val.Int(onErr)), errDef, Expr.Lit(Val.Int(retOid))]
+    for px in passing { append(mut &args, px) }
+    let call = Expr.Call("#json_value", args, false)
+    match ret {
+        Some(ty) { return Ok(Expr.Cast(call, ty)) }
+        None { return Ok(call) }
+    }
+}
+
+fn (p: mut &P) jsonQueryExpr(): Result[Expr, lexdb_base.DbErr] {
+    try p.expectKw("(")
+    let doc = try p.expr()
+    var path = Expr.Lit(Val.Text("$"))
+    if p.acceptKw(",") { path = try p.expr() }
+    var passing: []Expr = []
+    try p.parseJsonPassing(mut &passing)
+    var ret = try p.parseJsonReturning()
+    var wrapper = J_WRAP_NONE
+    var quotes = J_QUOTES_KEEP
+    var hadOpt = false
+    while true {
+        if try p.parseJsonWrapper(mut &wrapper) { hadOpt = true; continue }
+        if try p.parseJsonQuotes(mut &quotes) { hadOpt = true; continue }
+        if ret.isNone() {
+            let r2 = try p.parseJsonReturning()
+            if r2.isSome() { ret = r2; continue }
+        }
+        break
+    }
+    var onEmpty = J_ON_NULL
+    var emptyDef = Expr.Lit(Val.Null)
+    var onErr = J_ON_NULL
+    var errDef = Expr.Lit(Val.Null)
+    let hadOn = try p.parseJsonOnClauses(mut &onEmpty, mut &emptyDef, mut &onErr, mut &errDef)
+    try p.expectKw(")")
+    if p.tsql && len(passing) == 0 && ret.isNone() && !hadOpt && !hadOn {
+        return Ok(Expr.Call("#tsql_json_query", [doc, path], false))
+    }
+    let isJsonb = match ret { Some(t) { t.oid == OID_JSONB } None { false } }
+    var args: []Expr = [doc, path, Expr.Lit(Val.Int(wrapper)), Expr.Lit(Val.Int(quotes)),
+                        Expr.Lit(Val.Int(onEmpty)), emptyDef, Expr.Lit(Val.Int(onErr)), errDef,
+                        Expr.Lit(Val.Int(if isJsonb { 1 } else { 0 }))]
+    for px in passing { append(mut &args, px) }
+    let call = Expr.Call("#json_query", args, false)
+    match ret {
+        Some(ty) { return Ok(Expr.Cast(call, ty)) }
+        None { return Ok(call) }
+    }
+}
+
+fn (p: mut &P) jsonExistsExpr(): Result[Expr, lexdb_base.DbErr] {
+    try p.expectKw("(")
+    let doc = try p.expr()
+    try p.expectKw(",")
+    let path = try p.expr()
+    var passing: []Expr = []
+    try p.parseJsonPassing(mut &passing)
+    var onEmpty = J_ON_NULL
+    var emptyDef = Expr.Lit(Val.Null)
+    var onErr = J_ON_FALSE
+    var errDef = Expr.Lit(Val.Null)
+    let _h = try p.parseJsonOnClauses(mut &onEmpty, mut &emptyDef, mut &onErr, mut &errDef)
+    try p.expectKw(")")
+    var args: []Expr = [doc, path, Expr.Lit(Val.Int(onErr))]
+    for px in passing { append(mut &args, px) }
+    return Ok(Expr.Call("#json_exists", args, false))
+}
+
+fn (p: mut &P) jsonObjectExpr(): Result[Option[Expr], lexdb_base.DbErr] {
+    let save = p.pos
+    try p.expectKw("(")
+    var pairs: []Expr = []
+    var isSqlJson = false
+    if p.isKw(")") || p.isKw("returning") || p.isKw("null") || p.isKw("absent") || p.isKw("with") || p.isKw("without") {
+        isSqlJson = true
+    } else {
+        while true {
+            if p.isKw("null") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "on" { break }
+            if p.isKw("absent") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "on" { break }
+            if (p.isKw("with") || p.isKw("without")) && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "unique" { break }
+            if p.isKw("returning") || p.isKw(")") { break }
+            let hadKey = p.isKw("key") && !(p.peekAt(1).kind == T_OP && (p.peekAt(1).text == ")" || p.peekAt(1).text == ","))
+            if hadKey { p.pos += 1; isSqlJson = true }
+            let k = try p.expr()
+            if p.acceptKw(":") || p.acceptKw("value") {
+                isSqlJson = true
+            } else {
+                if !isSqlJson {
+                    p.pos = save
+                    return Ok(None)
+                }
+                return Err(near(&p.peek()))
+            }
+            let v = try p.expr()
+            append(mut &pairs, k)
+            append(mut &pairs, v)
+            if !p.acceptKw(",") { break }
+        }
+    }
+    var absent = 0
+    var uniq = 0
+    var ret: Option[TypeName] = None
+    while true {
+        if p.isKw("null") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "on" {
+            p.pos += 2
+            try p.expectKw("null")
+            absent = 0
+            continue
+        }
+        if p.isKw("absent") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "on" {
+            p.pos += 2
+            try p.expectKw("null")
+            absent = 1
+            continue
+        }
+        if p.acceptKw("with") {
+            try p.expectKw("unique")
+            let _k = p.acceptKw("keys")
+            uniq = 1
+            continue
+        }
+        if p.acceptKw("without") {
+            try p.expectKw("unique")
+            let _k = p.acceptKw("keys")
+            uniq = 0
+            continue
+        }
+        if p.isKw("returning") {
+            ret = try p.parseJsonReturning()
+            continue
+        }
+        break
+    }
+    try p.expectKw(")")
+    let isJsonb = match ret { Some(t) { t.oid == OID_JSONB } None { false } }
+    var args: []Expr = [Expr.Lit(Val.Int(absent)), Expr.Lit(Val.Int(uniq)), Expr.Lit(Val.Int(if isJsonb { 1 } else { 0 }))]
+    for x in pairs { append(mut &args, x) }
+    let call = Expr.Call("#json_object", args, false)
+    match ret {
+        Some(ty) { return Ok(Some(Expr.Cast(call, ty))) }
+        None { return Ok(Some(call)) }
+    }
+}
+
+fn (p: mut &P) jsonArrayExpr(): Result[Expr, lexdb_base.DbErr] {
+    try p.expectKw("(")
+    if p.isKw("select") || p.isKw("with") || p.parenQuery() {
+        return p.jsonArraySub()
+    }
+    var elems: []Expr = []
+    if !p.isKw(")") && !p.isKw("returning") && !(p.isKw("null") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "on") &&
+       !(p.isKw("absent") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "on") {
+        while true {
+            if (p.isKw("null") || p.isKw("absent")) && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "on" { break }
+            if p.isKw("returning") || p.isKw(")") { break }
+            append(mut &elems, try p.expr())
+            if !p.acceptKw(",") { break }
+        }
+    }
+    var absent = 1
+    var ret: Option[TypeName] = None
+    while true {
+        if p.isKw("null") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "on" {
+            p.pos += 2
+            try p.expectKw("null")
+            absent = 0
+            continue
+        }
+        if p.isKw("absent") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "on" {
+            p.pos += 2
+            try p.expectKw("null")
+            absent = 1
+            continue
+        }
+        if p.isKw("returning") {
+            ret = try p.parseJsonReturning()
+            continue
+        }
+        break
+    }
+    try p.expectKw(")")
+    let isJsonb = match ret { Some(t) { t.oid == OID_JSONB } None { false } }
+    var args: []Expr = [Expr.Lit(Val.Int(absent)), Expr.Lit(Val.Int(if isJsonb { 1 } else { 0 }))]
+    for x in elems { append(mut &args, x) }
+    let call = Expr.Call("#json_array", args, false)
+    match ret {
+        Some(ty) { return Ok(Expr.Cast(call, ty)) }
+        None { return Ok(call) }
+    }
+}
+
+fn (p: mut &P) jsonArraySub(): Result[Expr, lexdb_base.DbErr] {
+    p.depth += 1
+    let saved = replace(mut &p.subs, [])
+    let inner = try p.subquery(SUB_FROM)
+    // Note: subquery() consumed the closing ')' of JSON_ARRAY(SELECT ...), OR wait: what if ABSENT/NULL ON NULL / RETURNING follows?
+    // Handle both JSON_ARRAY(SELECT ...) and JSON_ARRAY((SELECT ...) NULL ON NULL RETURNING jsonb) cleanly!
+    var w = lexdb_sql.newStmt(S_SELECT)
+    append(mut &w.from, FromItem{table: "", alias: "#jarr", join: J_FIRST, on: None, sub: inner, cols: ["#a"], work: -1, lateral: false, using: [], natural: false, comma: false})
+    let agg = Expr.Call("json_arrayagg", [Expr.Col("#jarr.#a", -1)], false)
+    append(mut &w.items, SelItem{star: false, qual: "", expr: Some(Expr.Call("coalesce", [agg, Expr.Cast(Expr.Lit(Val.Text("[]")), TypeName{kind: K_JSON, oid: OID_JSON, prec: 0, scale: 0, len: 0})], false)), alias: "json_array", spell: ""})
+    w.subs = replace(mut &p.subs, saved)
+    w.use = SUB_SCALAR
+    p.depth -= 1
+    append(mut &p.subs, w)
+    return Ok(subRef("#sub", len(p.subs) - 1))
+}
+
+fn (p: mut &P) jsonScalarExpr(): Result[Expr, lexdb_base.DbErr] {
+    try p.expectKw("(")
+    let x = try p.expr()
+    try p.expectKw(")")
+    return Ok(Expr.Call("#json_scalar", [x], false))
+}
+
+fn (p: mut &P) jsonSerializeExpr(): Result[Expr, lexdb_base.DbErr] {
+    try p.expectKw("(")
+    let x = try p.expr()
+    var ret: Option[TypeName] = None
+    var pretty = 0
+    while !p.isKw(")") {
+        if p.isKw("returning") { ret = try p.parseJsonReturning(); continue }
+        if p.acceptKw("pretty") { pretty = 1; continue }
+        if p.acceptKw("truncate") { continue }
+        if p.acceptKw("ascii") { continue }
+        break
+    }
+    try p.expectKw(")")
+    let call = Expr.Call("#json_serialize", [x, Expr.Lit(Val.Int(pretty))], false)
+    match ret {
+        Some(ty) { return Ok(Expr.Cast(call, ty)) }
+        None { return Ok(call) }
+    }
+}
+
+fn (p: mut &P) jsonMergePatchExpr(): Result[Expr, lexdb_base.DbErr] {
+    try p.expectKw("(")
+    let a = try p.expr()
+    try p.expectKw(",")
+    let b = try p.expr()
+    var ret: Option[TypeName] = None
+    var pretty = 0
+    while !p.isKw(")") {
+        if p.isKw("returning") { ret = try p.parseJsonReturning(); continue }
+        if p.acceptKw("pretty") { pretty = 1; continue }
+        break
+    }
+    try p.expectKw(")")
+    let call = Expr.Call("#json_mergepatch", [a, b, Expr.Lit(Val.Int(pretty))], false)
+    match ret {
+        Some(ty) { return Ok(Expr.Cast(call, ty)) }
+        None { return Ok(call) }
+    }
+}
+
+fn (p: mut &P) jsonEqualExpr(): Result[Expr, lexdb_base.DbErr] {
+    try p.expectKw("(")
+    let a = try p.expr()
+    try p.expectKw(",")
+    let b = try p.expr()
+    try p.expectKw(")")
+    return Ok(Expr.Call("#json_equal", [a, b], false))
+}
+
+fn (p: mut &P) jsonTransformExpr(): Result[Expr, lexdb_base.DbErr] {
+    try p.expectKw("(")
+    let doc = try p.expr()
+    var args: []Expr = [doc]
+    while p.acceptKw(",") {
+        let ot = p.next()
+        if ot.kind != T_IDENT { return Err(near(&ot)) }
+        let op = strings.toLowerAscii(&ot.text)
+        let path = try p.catExpr()
+        var val = Expr.Lit(Val.Null)
+        if op != "remove" && op != "keep" {
+            try p.expectKw("=")
+            val = try p.expr()
+        }
+        append(mut &args, Expr.Lit(Val.Text(op)))
+        append(mut &args, path)
+        append(mut &args, val)
+    }
+    var ret: Option[TypeName] = None
+    if p.isKw("returning") { ret = try p.parseJsonReturning() }
+    try p.expectKw(")")
+    let call = Expr.Call("#json_transform", args, false)
+    match ret {
+        Some(ty) { return Ok(Expr.Cast(call, ty)) }
+        None { return Ok(call) }
+    }
+}
+
+fn (p: mut &P) jsonArrayAggExpr(): Result[Expr, lexdb_base.DbErr] {
+    try p.expectKw("(")
+    let distinct = p.acceptKw("distinct")
+    if !distinct { let _al = p.acceptKw("all") }
+    let x = try p.expr()
+    var args: []Expr = [x]
+    var dirs = ""
+    var absent = 1
+    var ret: Option[TypeName] = None
+    while !p.isKw(")") {
+        if p.acceptKw("order") {
+            try p.expectKw("by")
+            while true {
+                append(mut &args, try p.expr())
+                var desc = false
+                if p.acceptKw("desc") { desc = true } else { let _asc = p.acceptKw("asc") }
+                var flip = false
+                if p.acceptKw("nulls") {
+                    if p.acceptKw("first") { flip = !desc } else { try p.expectKw("last"); flip = desc }
+                }
+                dirs = dirs + (if desc { if flip { "D" } else { "d" } } else { if flip { "A" } else { "a" } })
+                if !p.acceptKw(",") { break }
+            }
+            continue
+        }
+        if p.isKw("null") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "on" {
+            p.pos += 2; try p.expectKw("null"); absent = 0; continue
+        }
+        if p.isKw("absent") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "on" {
+            p.pos += 2; try p.expectKw("null"); absent = 1; continue
+        }
+        if p.isKw("returning") { ret = try p.parseJsonReturning(); continue }
+        break
+    }
+    try p.expectKw(")")
+    // Optional SQL Server / Oracle WITHIN GROUP (ORDER BY ...)
+    if p.isKw("within") && len(dirs) == 0 {
+        p.pos += 1
+        try p.expectKw("group")
+        try p.expectKw("(")
+        try p.expectKw("order")
+        try p.expectKw("by")
+        while true {
+            append(mut &args, try p.expr())
+            var desc = false
+            if p.acceptKw("desc") { desc = true } else { let _asc = p.acceptKw("asc") }
+            dirs = dirs + (if p.ora { if desc { "d" } else { "a" } } else { if desc { "D" } else { "A" } })
+            if !p.acceptKw(",") { break }
+        }
+        try p.expectKw(")")
+    }
+    let isJsonb = match ret { Some(t) { t.oid == OID_JSONB } None { false } }
+    var fname = if isJsonb { if absent == 0 { "jsonb_arrayagg_null" } else { "jsonb_arrayagg" } }
+                else { if absent == 0 { "json_arrayagg_null" } else { "json_arrayagg" } }
+    if distinct { fname = fname + " distinct" }
+    if len(dirs) > 0 { fname = fname + " order:" + dirs }
+    if p.acceptKw("filter") {
+        try p.expectKw("(")
+        try p.expectKw("where")
+        append(mut &args, try p.expr())
+        try p.expectKw(")")
+        fname = fname + " filter"
+    }
+    let call = Expr.Call(fname, args, false)
+    match ret {
+        Some(ty) { return Ok(Expr.Cast(call, ty)) }
+        None { return Ok(call) }
+    }
+}
+
+fn (p: mut &P) jsonObjectAggExpr(): Result[Expr, lexdb_base.DbErr] {
+    try p.expectKw("(")
+    let hadKey = p.isKw("key") && !(p.peekAt(1).kind == T_OP && (p.peekAt(1).text == ":" || p.peekAt(1).text == ","))
+    if hadKey { p.pos += 1 }
+    let k = try p.expr()
+    if !p.acceptKw(":") && !p.acceptKw("value") {
+        try p.expectKw(",")
+    }
+    let v = try p.expr()
+    var absent = 0
+    var uniq = 0
+    var ret: Option[TypeName] = None
+    while !p.isKw(")") {
+        if p.isKw("null") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "on" {
+            p.pos += 2; try p.expectKw("null"); absent = 0; continue
+        }
+        if p.isKw("absent") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "on" {
+            p.pos += 2; try p.expectKw("null"); absent = 1; continue
+        }
+        if p.acceptKw("with") {
+            try p.expectKw("unique"); let _k = p.acceptKw("keys"); uniq = 1; continue
+        }
+        if p.acceptKw("without") {
+            try p.expectKw("unique"); let _k = p.acceptKw("keys"); uniq = 0; continue
+        }
+        if p.isKw("returning") { ret = try p.parseJsonReturning(); continue }
+        break
+    }
+    try p.expectKw(")")
+    let isJsonb = match ret { Some(t) { t.oid == OID_JSONB } None { false } }
+    var fname = if isJsonb { "jsonb_objectagg" } else { "json_objectagg" }
+    if absent == 1 && uniq == 1 { fname += "_abs_uniq" }
+    else if absent == 1 { fname += "_abs" }
+    else if uniq == 1 { fname += "_uniq" }
+    var args: []Expr = [k, v]
+    if p.acceptKw("filter") {
+        try p.expectKw("(")
+        try p.expectKw("where")
+        append(mut &args, try p.expr())
+        try p.expectKw(")")
+        fname = fname + " filter"
+    }
+    let call = Expr.Call(fname, args, false)
+    match ret {
+        Some(ty) { return Ok(Expr.Cast(call, ty)) }
+        None { return Ok(call) }
+    }
+}
+
+fn (p: mut &P) tsqlIsJsonExpr(): Result[Expr, lexdb_base.DbErr] {
+    try p.expectKw("(")
+    let x = try p.expr()
+    var kind = ""
+    if p.acceptKw(",") {
+        let t = p.next()
+        if t.kind == T_IDENT || t.kind == T_STR { kind = strings.toLowerAscii(&t.text) }
+        else { return Err(near(&t)) }
+    }
+    try p.expectKw(")")
+    return Ok(Expr.Call("#tsql_isjson", [x, Expr.Lit(Val.Text(kind))], false))
+}
+
+// Encodes one JSON_TABLE / OPENJSON WITH column spec (13 fields: 11 for lexdb_json.decodeCols + name + spell).
+fn encJTabCol(kind: &str, path: &str, oid: int, wrapper: int, onEmpty: int, hasED: bool, eDef: &str,
+              onErr: int, hasRD: bool, rDef: &str, nested: &str, name: &str, spell: &str): str {
+    let fs: []str = [kind.clone(), path.clone(), oid.toStr(), wrapper.toStr(), onEmpty.toStr(),
+                     if hasED { "1" } else { "0" }, eDef.clone(), onErr.toStr(),
+                     if hasRD { "1" } else { "0" }, rDef.clone(), nested.clone(), name.clone(), spell.clone()]
+    return strings.join(&fs, "\x1f")
+}
+
+fn (p: mut &P) parseJTabColList(nestedPrefix: &str, out: mut &[]str): Result[Unit, lexdb_base.DbErr] {
+    while true {
+        if p.acceptKw("nested") {
+            let _pa = p.acceptKw("path")
+            let np = try p.strLit()
+            try p.expectKw("columns")
+            try p.expectKw("(")
+            try p.parseJTabColList(&np, out)
+            try p.expectKw(")")
+        } else {
+            let cname = try p.name()
+            let cspell = p.spelled.clone()
+            if p.acceptKw("for") {
+                try p.expectKw("ordinality")
+                append(out, encJTabCol(&"ord", &"", OID_INT8, J_WRAP_NONE, J_ON_NULL, false, &"", J_ON_NULL, false, &"", nestedPrefix, &cname, &cspell))
+            } else {
+                let ty = try p.typeName()
+                var kind = "val"
+                if p.acceptKw("format") {
+                    try p.expectKw("json")
+                    kind = "json"
+                } else if ty.oid == OID_JSON || ty.oid == OID_JSONB {
+                    kind = "json"
+                }
+                if p.acceptKw("exists") { kind = "exists" }
+                var path = "$." + cname
+                if p.acceptKw("path") { path = try p.strLit() }
+                var wrapper = J_WRAP_NONE
+                let _w = try p.parseJsonWrapper(mut &wrapper)
+                var onEmpty = J_ON_NULL
+                var emptyDef = Expr.Lit(Val.Null)
+                var onErr = J_ON_NULL
+                var errDef = Expr.Lit(Val.Null)
+                let _on = try p.parseJsonOnClauses(mut &onEmpty, mut &emptyDef, mut &onErr, mut &errDef)
+                let ed = lexdb_sql.litText(&emptyDef).unwrapOr(lexdb_sql.exprText(&emptyDef))
+                let hasED = onEmpty == J_ON_DEFAULT
+                let rd = lexdb_sql.litText(&errDef).unwrapOr(lexdb_sql.exprText(&errDef))
+                let hasRD = onErr == J_ON_DEFAULT
+                append(out, encJTabCol(&kind, &path, ty.oid, wrapper, onEmpty, hasED, &ed, onErr, hasRD, &rd, nestedPrefix, &cname, &cspell))
+            }
+        }
+        if !p.acceptKw(",") { break }
+    }
+    return Ok(Unit{})
+}
+
+fn (p: mut &P) jsonTableFrom(join: int): Result[FromItem, lexdb_base.DbErr] {
+    try p.expectKw("json_table")
+    try p.expectKw("(")
+    p.depth += 1
+    let saved = replace(mut &p.subs, [])
+    let savedW = replace(mut &p.wins, [])
+    let doc = try p.expr()
+    try p.expectKw(",")
+    let path = try p.expr()
+    var passing: []Expr = []
+    try p.parseJsonPassing(mut &passing)
+    try p.expectKw("columns")
+    try p.expectKw("(")
+    var colSpecs: []str = []
+    try p.parseJTabColList(&"", mut &colSpecs)
+    try p.expectKw(")")
+    var onEmpty = J_ON_NULL
+    var emptyDef = Expr.Lit(Val.Null)
+    var onErr = J_ON_NULL
+    var errDef = Expr.Lit(Val.Null)
+    let _on = try p.parseJsonOnClauses(mut &onEmpty, mut &emptyDef, mut &onErr, mut &errDef)
+    try p.expectKw(")")
+    var s = lexdb_sql.newStmt(S_SELECT)
+    s.srf = "json_table:" + strings.join(&colSpecs, "\x1e")
+    s.use = SUB_FROM
+    append(mut &s.items, SelItem{star: false, qual: "", expr: Some(doc), alias: "", spell: ""})
+    append(mut &s.items, SelItem{star: false, qual: "", expr: Some(path), alias: "", spell: ""})
+    append(mut &s.items, SelItem{star: false, qual: "", expr: Some(Expr.Lit(Val.Int(onErr))), alias: "", spell: ""})
+    for px in passing { append(mut &s.items, SelItem{star: false, qual: "", expr: Some(px), alias: "", spell: ""}) }
+    s.subs = replace(mut &p.subs, saved)
+    s.wins = replace(mut &p.wins, savedW)
+    p.depth -= 1
+    append(mut &p.subs, s)
+    let i = len(p.subs) - 1
+    var alias = "json_table"
+    var cols: []str = []
+    try p.aliasOf(mut &alias, mut &cols, false)
+    return Ok(FromItem{table: "json_table", alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: true, using: [], natural: false, comma: false})
+}
+
+fn (p: mut &P) openJsonFrom(join: int): Result[FromItem, lexdb_base.DbErr] {
+    try p.expectKw("openjson")
+    try p.expectKw("(")
+    p.depth += 1
+    let saved = replace(mut &p.subs, [])
+    let savedW = replace(mut &p.wins, [])
+    let doc = try p.expr()
+    var hasPath = false
+    var path = Expr.Lit(Val.Null)
+    if p.acceptKw(",") {
+        hasPath = true
+        path = try p.expr()
+    }
+    try p.expectKw(")")
+    var s = lexdb_sql.newStmt(S_SELECT)
+    s.use = SUB_FROM
+    if p.acceptKw("with") {
+        try p.expectKw("(")
+        var colSpecs: []str = []
+        while true {
+            let cname = try p.name()
+            let cspell = p.spelled.clone()
+            let ty = try p.typeName()
+            var pathStr = "$." + (if len(cspell) > 0 { cspell.clone() } else { cname.clone() })
+            if p.peek().kind == T_STR { pathStr = p.next().text }
+            var kind = "val"
+            if p.acceptKw("as") {
+                try p.expectKw("json")
+                kind = "json"
+            } else if ty.oid == OID_JSON {
+                kind = "json"
+            }
+            append(mut &colSpecs, encJTabCol(&kind, &pathStr, ty.oid, J_WRAP_NONE, J_ON_NULL, false, &"", J_ON_NULL, false, &"", &"", &cname, &cspell))
+            if !p.acceptKw(",") { break }
+        }
+        try p.expectKw(")")
+        s.srf = "openjson_with:" + strings.join(&colSpecs, "\x1e")
+        append(mut &s.items, SelItem{star: false, qual: "", expr: Some(doc), alias: "", spell: ""})
+        append(mut &s.items, SelItem{star: false, qual: "", expr: Some(path), alias: "", spell: ""})
+        append(mut &s.items, SelItem{star: false, qual: "", expr: Some(Expr.Lit(Val.Int(0))), alias: "", spell: ""})
+    } else {
+        s.srf = "openjson"
+        append(mut &s.items, SelItem{star: false, qual: "", expr: Some(doc), alias: "", spell: ""})
+        if hasPath { append(mut &s.items, SelItem{star: false, qual: "", expr: Some(path), alias: "", spell: ""}) }
+    }
+    s.subs = replace(mut &p.subs, saved)
+    s.wins = replace(mut &p.wins, savedW)
+    p.depth -= 1
+    append(mut &p.subs, s)
+    let i = len(p.subs) - 1
+    var alias = "openjson"
+    var cols: []str = []
+    try p.aliasOf(mut &alias, mut &cols, false)
+    return Ok(FromItem{table: "openjson", alias: alias, join: join, on: None, sub: i, cols: cols, work: -1, lateral: true, using: [], natural: false, comma: false})
+}
+
+fn (p: mut &P) forJsonClause(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    var pathMode = true
+    if p.acceptKw("path") { pathMode = true }
+    else if p.acceptKw("auto") { pathMode = false }
+    else { return Err(near(&p.peek())) }
+    var rootName = ""
+    var incNulls = false
+    var noWrap = false
+    while p.acceptKw(",") {
+        if p.acceptKw("root") {
+            if p.acceptKw("(") {
+                rootName = try p.strLit()
+                try p.expectKw(")")
+            } else {
+                rootName = "root"
+            }
+        } else if p.acceptKw("include_null_values") {
+            incNulls = true
+        } else if p.acceptKw("without_array_wrapper") {
+            noWrap = true
+        } else {
+            return Err(near(&p.peek()))
+        }
+    }
+    s.forJson = (if pathMode { "path" } else { "auto" }) + "\x1f" + rootName + "\x1f" +
+                (if incNulls { "1" } else { "0" }) + "\x1f" + (if noWrap { "1" } else { "0" })
+    return Ok(Unit{})
+}

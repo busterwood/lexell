@@ -46,7 +46,7 @@ CORE = {
     "lexdb_access", "lexdb_agg", "lexdb_base", "lexdb_bind", "lexdb_catalog", "lexdb_census", "lexdb_conerr", "lexdb_cols", "lexdb_dbopt", "lexdb_dialect", "lexdb_disk",
     "lexdb_enum", "lexdb_exec", "lexdb_fkconv", "lexdb_fkprobe", "lexdb_float", "lexdb_func", "lexdb_gen", "lexdb_held", "lexdb_leafk", "lexdb_lib", "lexdb_like",
     "lexdb_locks", "lexdb_match", "lexdb_recur", "lexdb_recrun", "lexdb_recprobe", "lexdb_litint",
-    "lexdb_memo", "lexdb_newfn", "lexdb_nncon", "lexdb_nnalter", "lexdb_annot", "lexdb_graph", "lexdb_assert", "lexdb_copyjson", "lexdb_oldnew", "lexdb_ops", "lexdb_vec", "lexdb_decfit",
+    "lexdb_memo", "lexdb_newfn", "lexdb_nncon", "lexdb_nnalter", "lexdb_annot", "lexdb_graph", "lexdb_assert", "lexdb_copyjson", "lexdb_json", "lexdb_oldnew", "lexdb_ops", "lexdb_vec", "lexdb_decfit",
     "lexdb_page", "lexdb_parse", "lexdb_pct", "lexdb_pipe", "lexdb_plan", "lexdb_priv", "lexdb_repl", "lexdb_rows", "lexdb_routine",
     "lexdb_session", "lexdb_setop", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_srf", "lexdb_standby", "lexdb_stats", "lexdb_viewdep", "lexdb_ixname", "lexdb_tsqlname", "lexdb_txmode",
     "lexdb_store", "lexdb_time", "lexdb_tmpstore", "lexdb_tz", "lexdb_udf", "lexdb_window",
@@ -81,7 +81,7 @@ KNOWN_CORE_DIALECT = {
 # model, the catalog and the dialect facts, and below the planner and the
 # executor: it imports only these (and lexell's own libraries).
 BIND = "lexdb_bind"
-BIND_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_catalog", "lexdb_dialect", "lexdb_time", "lexdb_float", "lexdb_ops", "lexdb_lib", "lexdb_newfn"}
+BIND_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_catalog", "lexdb_dialect", "lexdb_time", "lexdb_float", "lexdb_ops", "lexdb_lib", "lexdb_newfn", "lexdb_json"}
 
 # The access layer (design/lexdb-layers.md 4.2) sits above the store and the
 # row codecs and below the catalog, the planner and the executor: what it may
@@ -96,7 +96,7 @@ BELOW_ACCESS = {"lexdb_store", "lexdb_rows", "lexdb_page", "lexdb_cols", "lexdb_
 # the binder and the executor: values, types and the time and number
 # libraries only.
 OPS = "lexdb_ops"
-OPS_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_func", "lexdb_dialect", "lexdb_decfit", "lexdb_tz"}
+OPS_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_func", "lexdb_dialect", "lexdb_decfit", "lexdb_tz", "lexdb_json"}
 
 # The function library (lexdb_lib, design/lexdb-layers.md 4.4.1, slice 2c
 # item 3) sits beside the value operations, below the binder and the
@@ -156,7 +156,7 @@ SORT_USERS = {"lexdb_pipe", "lexdb_exec", "lexdb_agg", "lexdb_setop", "lexdb_win
 # values and their orders only; the row engine and the pipeline import them
 # (and the planner, for the aggregate spec type a plan holds).
 AGG = "lexdb_agg"
-AGG_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_access", "lexdb_sort", "lexdb_pct"}
+AGG_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_access", "lexdb_sort", "lexdb_pct", "lexdb_json"}
 AGG_USERS = {"lexdb_pipe", "lexdb_exec", "lexdb_window", "lexdb_plan"}
 
 # How a set operation combines its parts' rows (lexdb_setop, design/
@@ -181,7 +181,7 @@ HELD_USERS = {"lexdb_pipe"}
 # serves the catalog's relations; exec and the pipeline (its ProjectSet)
 # import it.
 SRF = "lexdb_srf"
-SRF_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_lib", "lexdb_time"}
+SRF_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_lib", "lexdb_time", "lexdb_json"}
 SRF_USERS = {"lexdb_exec", "lexdb_pipe"}
 
 # The window functions' values (lexdb_window, design/lexdb-batch-gaps.md item

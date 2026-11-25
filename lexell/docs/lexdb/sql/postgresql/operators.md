@@ -106,7 +106,8 @@ As in PostgreSQL, `-2 ^ 2` is 4 (the minus binds first) and `2 ^ 3 ^ 2` is 64 (l
   `WHERE`, `ON`, `HAVING` and `ORDER BY` it is not checked (computed as `bigint`). With a cast or on columns it
   overflows everywhere (see [numeric types](data-types-numeric.md)).
 - `~~`, `~~*`, `!~~`, `!~~*` (LIKE spelled as operators), `^@` (starts with), `@` (absolute value), `|/` and `||/`
-  (roots), `!` (factorial), `OVERLAPS` and the JSON, range, geometric and network operators do not exist.
+  (roots), `!` (factorial), `OVERLAPS` and the range, geometric and network operators do not exist. (For JSON and
+  `jsonb` operators see [JSON and SQL/JSON](functions-json.md).)
 - `OPERATOR(pg_catalog.+)` syntax and user-defined operators are not taken.
 - `NOTNULL` and `ISNULL` are not operators: `SELECT 1 NOTNULL` gives 1 in a column named `notnull`.
 - `a BETWEEN x AND y = b` is a syntax error (PostgreSQL reads `(a BETWEEN x AND y) = b`); use parentheses.

@@ -9,6 +9,7 @@ The boolean-like `bit`, GUIDs, XML kept as text, and the types left out.
 ```
 bit
 uniqueidentifier
+json
 xml
 sql_variant
 type_name                  -- a table type made by CREATE TYPE ... AS TABLE
@@ -23,6 +24,9 @@ type_name                  -- a table type made by CREATE TYPE ... AS TABLE
 `uniqueidentifier`
 : A 16-byte GUID, written as 36 characters (`6F9619FF-8B86-D011-B42D-00C04FC964FF`); braces are accepted.
   `NEWID()` makes a random one.
+
+`json`
+: Validated RFC 8259 JSON text (sent as `nvarchar(max)` over TDS). See [JSON, OPENJSON and FOR JSON](functions-json.md).
 
 `xml`
 : A column that holds XML text. lexdb keeps the text and checks nothing.

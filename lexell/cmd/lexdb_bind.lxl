@@ -744,9 +744,52 @@ pub fn exprOid(x: &Expr, cols: &[]lexdb_sql.ColDef, ptypes: &[]int, ty: &Typing)
                 "pg_current_wal_lsn", "pg_current_wal_insert_lsn", "pg_current_wal_flush_lsn", "pg_last_wal_replay_lsn",
                 "pg_last_wal_receive_lsn" { return lexdb_sql.OID_TEXT }
                 "format_type", "pg_get_expr", "pg_get_constraintdef", "pg_get_indexdef", "pg_get_serial_sequence", "quote_ident",
-                "array_to_string", "obj_description", "col_description", "shobj_description", "pg_get_viewdef", "json_build_object",
-                "jsonb_build_object", "pg_get_userbyid", "repeat", "pg_get_triggerdef", "pg_get_ruledef", "pg_get_statisticsobjdef_columns",
+                "array_to_string", "obj_description", "col_description", "shobj_description", "pg_get_viewdef",
+                "pg_get_userbyid", "repeat", "pg_get_triggerdef", "pg_get_ruledef", "pg_get_statisticsobjdef_columns",
                 "pg_get_function_result", "pg_get_function_arguments", "pg_get_functiondef", "pg_get_function_identity_arguments", "pg_size_pretty" {
+                    return lexdb_sql.OID_TEXT
+                }
+                // JSON / JSONB functions, operators, and aggregates
+                "to_json", "#to_json", "array_to_json", "#array_to_json", "json_build_object", "#json_build_object",
+                "json_build_array", "#json_build_array", "json_extract_path", "json_strip_nulls", "json_object",
+                "json_agg", "json_object_agg", "json_arrayagg", "json_arrayagg_null",
+                "json_objectagg", "json_objectagg_abs", "json_objectagg_uniq", "json_objectagg_abs_uniq",
+                "json_array_elements", "#json_arrow", "#json_hash", "#json_ctor", "#json_scalar", "#json_mergepatch",
+                "#json_transform", "#json_transform_t", "#tsql_json_query" {
+                    return lexdb_sql.OID_JSON
+                }
+                "to_jsonb", "#to_jsonb", "jsonb_build_object", "#jsonb_build_object", "jsonb_build_array", "#jsonb_build_array",
+                "jsonb_extract_path", "jsonb_strip_nulls", "jsonb_set", "jsonb_insert", "jsonb_object",
+                "jsonb_path_query_first", "jsonb_path_query_array", "jsonb_path_query",
+                "jsonb_agg", "jsonb_object_agg", "jsonb_arrayagg", "jsonb_arrayagg_null",
+                "jsonb_objectagg", "jsonb_objectagg_abs", "jsonb_objectagg_uniq", "jsonb_objectagg_abs_uniq",
+                "jsonb_array_elements", "#jsonb_arrow", "#jsonb_hash", "#jsonb_concat", "#jsonb_del", "#jsonb_del_path" {
+                    return lexdb_sql.OID_JSONB
+                }
+                "#json_object", "#json_object_t" {
+                    let jb = if len(args) >= 3 && lexdb_sql.litInt(&args[2]) == 1 { true } else { false }
+                    return if jb { lexdb_sql.OID_JSONB } else { lexdb_sql.OID_JSON }
+                }
+                "#json_array", "#json_array_t" {
+                    let jb = if len(args) >= 2 && lexdb_sql.litInt(&args[1]) == 1 { true } else { false }
+                    return if jb { lexdb_sql.OID_JSONB } else { lexdb_sql.OID_JSON }
+                }
+                "#json_query" {
+                    let jb = if len(args) >= 9 && lexdb_sql.litInt(&args[8]) == 1 { true } else { false }
+                    return if jb { lexdb_sql.OID_JSONB } else { lexdb_sql.OID_JSON }
+                }
+                "#is_json", "#json_exists", "#json_equal", "#jsonb_contains", "#jsonb_contained", "#jsonb_has",
+                "#jsonb_has_any", "#jsonb_has_all", "#jsonb_path_exists_op", "#jsonb_path_match_op",
+                "jsonb_path_exists", "jsonb_path_match" {
+                    return lexdb_sql.OID_BOOL
+                }
+                "#tsql_isjson", "#tsql_json_path_exists", "#tsql_json_contains", "json_array_length", "jsonb_array_length", "#jsonb_cmp" {
+                    return lexdb_sql.OID_INT4
+                }
+                "#json_arrow_text", "#json_hash_text", "#json_value", "#tsql_json_value",
+                "#json_serialize", "#json_modify", "#json_modify_t", "json_typeof", "jsonb_typeof",
+                "json_extract_path_text", "jsonb_extract_path_text", "jsonb_pretty",
+                "json_array_elements_text", "jsonb_array_elements_text", "json_object_keys", "jsonb_object_keys" {
                     return lexdb_sql.OID_TEXT
                 }
                 "current_user", "session_user", "current_schema", "pg_encoding_to_char" { return lexdb_sql.OID_NAME }
@@ -1472,7 +1515,7 @@ pub fn refTyped(oid: int): bool {
     return isIntOid(oid) || oid == lexdb_sql.OID_NUMERIC || oid == lexdb_sql.OID_FLOAT4 || oid == lexdb_sql.OID_FLOAT8 ||
            oid == lexdb_sql.OID_TEXT || oid == lexdb_sql.OID_VARCHAR || oid == lexdb_sql.OID_BPCHAR || oid == lexdb_sql.OID_BOOL ||
            oid == lexdb_sql.OID_DATE || oid == lexdb_sql.OID_TIME || oid == lexdb_sql.OID_TS || oid == lexdb_sql.OID_TSTZ ||
-           oid == lexdb_sql.OID_UUID
+           oid == lexdb_sql.OID_UUID || oid == lexdb_sql.OID_JSON || oid == lexdb_sql.OID_JSONB
 }
 
 // A parameter, bare or as outerRef types an outer column: a cast of one.
@@ -1752,6 +1795,10 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
             let l = try resolve(&a, cols, n, ns)
             let r = try resolve(&b, cols, n, ns)
             if op == "||" {
+                let ptj = ptypesOf(ns)
+                if exprOid(&l, cols, &ptj, &ns.ty) == lexdb_sql.OID_JSONB || exprOid(&r, cols, &ptj, &ns.ty) == lexdb_sql.OID_JSONB {
+                    return Ok(Expr.Call("#jsonb_concat", [l, r], false))
+                }
                 // with an array: array_cat, array_append or array_prepend (9.92)
                 let f = arrayConcat(&l, &r, cols, &[], &ns.ty)
                 if len(f) > 0 { return Ok(Expr.Call(f, [l, r], false)) }
@@ -1760,6 +1807,13 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
                 let lt = if isBp(&l, cols, &ns.ty) { trimmed(l) } else { l }
                 let rt = if isBp(&r, cols, &ns.ty) { trimmed(r) } else { r }
                 return Ok(Expr.Bin(op.clone(), lt, rt))
+            }
+            if op == "-" {
+                let ptj = ptypesOf(ns)
+                if exprOid(&l, cols, &ptj, &ns.ty) == lexdb_sql.OID_JSONB {
+                    let isArr = if lexdb_sql.elemOid(exprOid(&r, cols, &ptj, &ns.ty)) > 0 { 1 } else { 0 }
+                    return Ok(Expr.Call("#jsonb_del", [l, r, Expr.Lit(Val.Int(isArr))], false))
+                }
             }
             if len(ns.coll) > 0 {
                 // T-SQL's varbinary and datetime operands (their own function: the PostgreSQL door's frame stays as it was)
@@ -1782,6 +1836,19 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
             if isCmp(&op) {
                 var lx = l
                 var rx = r
+                let ptjb = ptypesOf(ns)
+                let lojb = exprOid(&lx, cols, &ptjb, &ns.ty)
+                let rojb = exprOid(&rx, cols, &ptjb, &ns.ty)
+                if lojb == lexdb_sql.OID_JSONB || rojb == lexdb_sql.OID_JSONB {
+                    let jbt = lexdb_sql.oidType(lexdb_sql.OID_JSONB)
+                    if lojb != lexdb_sql.OID_JSONB && (untyped(&lx) || isTextOid(lojb)) {
+                        lx = Expr.Cast(replace(mut &lx, Expr.Lit(Val.Null)), jbt)
+                    }
+                    if rojb != lexdb_sql.OID_JSONB && (untyped(&rx) || isTextOid(rojb)) {
+                        rx = Expr.Cast(replace(mut &rx, Expr.Lit(Val.Null)), jbt)
+                    }
+                    return Ok(Expr.Bin(op.clone(), Expr.Call("#jsonb_cmp", [lx, rx], false), Expr.Lit(Val.Int(0))))
+                }
                 // an untyped text constant beside a number or a bool: read as its type (22P02 for a text that is not one)
                 if pgRules(ns) {
                     let pl = try readLit(&lx, &rx, cols, ns)
@@ -1892,6 +1959,93 @@ pub fn resolve(x: &Expr, cols: &[]lexdb_sql.ColDef, n: int, ns: mut &Names): Res
             // a function no evaluator has: refused when the statement is bound, as each product does (42883: SQL Server's 195,
             // Oracle's ORA-00904), not when a row first calls it (an empty input gave no error)
             if !knownCall(&nm, len(args)) { return Err(e("42883", &("function " + nm + " with " + len(args).toStr() + " arguments does not exist"))) }
+            // JSON / JSONB operator & value-type preservation rewrites
+            if (nm == "@>" || nm == "<@") && len(out) == 2 {
+                let pt = ptypesOf(ns)
+                if exprOid(&out[0], cols, &pt, &ns.ty) == lexdb_sql.OID_JSONB || exprOid(&out[1], cols, &pt, &ns.ty) == lexdb_sql.OID_JSONB {
+                    return Ok(Expr.Call(if nm == "@>" { "#jsonb_contains" } else { "#jsonb_contained" }, out, false))
+                }
+            }
+            if (nm == "#json_arrow" || nm == "#json_hash") && len(out) == 2 {
+                let pt = ptypesOf(ns)
+                if exprOid(&out[0], cols, &pt, &ns.ty) == lexdb_sql.OID_JSONB {
+                    return Ok(Expr.Call(if nm == "#json_arrow" { "#jsonb_arrow" } else { "#jsonb_hash" }, out, false))
+                }
+            }
+            if (nm == "to_json" || nm == "to_jsonb") && len(out) == 1 {
+                let pt = ptypesOf(ns)
+                let o = exprOid(&out[0], cols, &pt, &ns.ty)
+                append(mut &out, Expr.Lit(Val.Int(o)))
+                return Ok(Expr.Call("#" + nm, out, false))
+            }
+            if nm == "array_to_json" && (len(out) == 1 || len(out) == 2) {
+                let pt = ptypesOf(ns)
+                let o = exprOid(&out[0], cols, &pt, &ns.ty)
+                var a2: []Expr = [replace(mut &out[0], Expr.Lit(Val.Null)), Expr.Lit(Val.Int(o))]
+                if len(out) == 2 { append(mut &a2, replace(mut &out[1], Expr.Lit(Val.Null))) }
+                return Ok(Expr.Call("#array_to_json", a2, false))
+            }
+            if (nm == "json_build_object" || nm == "jsonb_build_object") && len(out) % 2 == 0 {
+                let pt = ptypesOf(ns)
+                var os: []str = []
+                var k = 1
+                while k < len(out) {
+                    append(mut &os, exprOid(&out[k], cols, &pt, &ns.ty).toStr())
+                    k += 2
+                }
+                var a2: []Expr = [Expr.Lit(Val.Text(strings.join(&os, ",")))]
+                for ox in out { append(mut &a2, clone(&ox)) }
+                return Ok(Expr.Call("#" + nm, a2, false))
+            }
+            if nm == "json_build_array" || nm == "jsonb_build_array" {
+                let pt = ptypesOf(ns)
+                var os: []str = []
+                for ox in out { append(mut &os, exprOid(&ox, cols, &pt, &ns.ty).toStr()) }
+                var a2: []Expr = [Expr.Lit(Val.Text(strings.join(&os, ",")))]
+                for ox in out { append(mut &a2, clone(&ox)) }
+                return Ok(Expr.Call("#" + nm, a2, false))
+            }
+            if nm == "#json_object" && len(out) >= 3 {
+                let pt = ptypesOf(ns)
+                var os: []str = []
+                var k = 4
+                while k < len(out) {
+                    append(mut &os, exprOid(&out[k], cols, &pt, &ns.ty).toStr())
+                    k += 2
+                }
+                append(mut &out, Expr.Lit(Val.Text(strings.join(&os, ","))))
+                return Ok(Expr.Call("#json_object_t", out, false))
+            }
+            if nm == "#json_array" && len(out) >= 2 {
+                let pt = ptypesOf(ns)
+                var os: []str = []
+                for k in 2..len(out) { append(mut &os, exprOid(&out[k], cols, &pt, &ns.ty).toStr()) }
+                append(mut &out, Expr.Lit(Val.Text(strings.join(&os, ","))))
+                return Ok(Expr.Call("#json_array_t", out, false))
+            }
+            if nm == "#json_scalar" && len(out) == 1 {
+                let pt = ptypesOf(ns)
+                let o = exprOid(&out[0], cols, &pt, &ns.ty)
+                append(mut &out, Expr.Lit(Val.Int(o)))
+                return Ok(Expr.Call("#json_scalar_t", out, false))
+            }
+            if nm == "#json_modify" && len(out) == 3 {
+                let pt = ptypesOf(ns)
+                let o = exprOid(&out[2], cols, &pt, &ns.ty)
+                append(mut &out, Expr.Lit(Val.Int(o)))
+                return Ok(Expr.Call("#json_modify_t", out, false))
+            }
+            if nm == "#json_transform" && len(out) >= 1 {
+                let pt = ptypesOf(ns)
+                var os: []str = []
+                var k = 3
+                while k < len(out) {
+                    append(mut &os, exprOid(&out[k], cols, &pt, &ns.ty).toStr())
+                    k += 3
+                }
+                append(mut &out, Expr.Lit(Val.Text(strings.join(&os, ","))))
+                return Ok(Expr.Call("#json_transform_t", out, false))
+            }
             if nm == "#win" && len(out) == 2 {
                 // a window's sum of bigints: the window's value made the sum's type (wideSum), its call left as it is
                 match wideInner(&out[1]) {
@@ -3165,6 +3319,8 @@ fn oidWord(o: int, tsql: bool): str {
     if o == lexdb_sql.OID_BOOL { return if tsql { "bit" } else { "boolean" } }
     if o == lexdb_sql.OID_DATE { return "date" }
     if o == lexdb_sql.OID_UUID { return if tsql { "uniqueidentifier" } else { "uuid" } }
+    if o == lexdb_sql.OID_JSON { return "json" }
+    if o == lexdb_sql.OID_JSONB { return "jsonb" }
     return if tsql { "datetime2" } else { "timestamp without time zone" }
 }
 

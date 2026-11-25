@@ -87,8 +87,10 @@ percentile_disc ( fraction ) WITHIN GROUP ( ORDER BY value ) → type of value
 
 ## Differences from PostgreSQL
 
-- `json_agg`, `jsonb_agg`, `xmlagg`, `corr`, `covar_pop`, `covar_samp`, `regr_*` and the hypothetical-set
-  aggregates (`rank(x) WITHIN GROUP`) do not exist (42883). `mode() WITHIN GROUP (...)` is a syntax error.
+- `xmlagg`, `corr`, `covar_pop`, `covar_samp`, `regr_*` and the hypothetical-set
+  aggregates (`rank(x) WITHIN GROUP`) do not exist (42883). `mode() WITHIN GROUP (...)` is a syntax error. (For
+  `json_agg`, `jsonb_agg`, `json_object_agg`, `jsonb_object_agg`, `JSON_ARRAYAGG` and `JSON_OBJECTAGG` see
+  [JSON and SQL/JSON](functions-json.md).)
 - `percentile_cont` and `percentile_disc` take one fraction, not an array of them.
 - There is no `CREATE AGGREGATE`.
 - `pg_typeof` of an aggregate is computed for each row instead of once: `SELECT pg_typeof(sum(x)) FROM t` over two

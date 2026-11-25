@@ -101,9 +101,9 @@ directly in a block (use `EXECUTE IMMEDIATE`).
 | [Numbers](data-types-number.md) | `NUMBER(p, s)`, `FLOAT`, `INTEGER`, `INT`, `SMALLINT`, `DECIMAL`, `NUMERIC`, `BINARY_FLOAT`, `BINARY_DOUBLE` |
 | [Character](data-types-character.md) | `VARCHAR2(n [BYTE | CHAR])`, `NVARCHAR2(n)`, `CHAR(n)`, `NCHAR(n)`, `CLOB`, `NCLOB`, `LONG` |
 | [Date and time](data-types-datetime.md) | `DATE`, `TIMESTAMP(p)`, `TIMESTAMP WITH TIME ZONE`, `TIMESTAMP WITH LOCAL TIME ZONE`, `INTERVAL YEAR TO MONTH`, `INTERVAL DAY TO SECOND` |
-| [Binary, boolean and others](data-types-other.md) | `RAW(n)`, `BLOB`, `LONG RAW`, `BOOLEAN` (23ai), `ROWID`, `UROWID`; PL/SQL-only types are on the [declarations](plsql-declarations.md) page |
+| [Binary, boolean and others](data-types-other.md) | `RAW(n)`, `BLOB`, `LONG RAW`, `BOOLEAN` (23ai), `JSON` (21c/23ai), `ROWID`, `UROWID`; PL/SQL-only types are on the [declarations](plsql-declarations.md) page |
 
-Not available: `XMLTYPE`, `JSON`, `VECTOR`, `BFILE` contents, object and collection types, negative `NUMBER` scales.
+Not available: `XMLTYPE`, `VECTOR`, `BFILE` contents, object and collection types, negative `NUMBER` scales.
 
 ## Functions
 
@@ -119,9 +119,10 @@ Not available: `XMLTYPE`, `JSON`, `VECTOR`, `BFILE` contents, object and collect
 | [Aggregate functions](functions-aggregate.md) | `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `STDDEV`, `VARIANCE`, `LISTAGG`, `ANY_VALUE`, `PERCENTILE_CONT`, `PERCENTILE_DISC`, `BIT_AND_AGG`, `BIT_OR_AGG`, `BIT_XOR_AGG`, `BOOLEAN_AND_AGG`, `BOOLEAN_OR_AGG`, `KURTOSIS_*`, `SKEWNESS_*` |
 | [Analytic functions](functions-analytic.md) | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `PERCENT_RANK`, `CUME_DIST`, `NTILE`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, and aggregates with `OVER` |
 | [Environment and sequence functions](functions-environment.md) | `USER`, `UID`, `SYS_CONTEXT('USERENV', ...)`, `SYS_GUID`, `UUID`, `IS_UUID`, `RAW_TO_UUID`, `UUID_TO_RAW`, `ROWNUM`, `NEXTVAL`, `CURRVAL` |
+| [JSON and SQL/JSON](functions-json.md) | `JSON`, `IS JSON`, `JSON_VALUE`, `JSON_QUERY`, `JSON_EXISTS`, `JSON_OBJECT`, `JSON_ARRAY`, `JSON_ARRAYAGG`, `JSON_OBJECTAGG`, `JSON_SERIALIZE`, `JSON_MERGEPATCH`, `JSON_EQUAL`, `JSON_TRANSFORM`, `JSON_TABLE` |
 
 Not available: `NANVL`, `LNNVL`, `SOUNDEX`, `ORA_HASH`, `STANDARD_HASH`, `VSIZE`, `DUMP`, `TO_DSINTERVAL`,
-`TO_YMINTERVAL`, `MEDIAN`, `STATS_MODE`, `CORR`, `COVAR_*`, `REGR_*`, `RATIO_TO_REPORT`, the XML and JSON functions.
+`TO_YMINTERVAL`, `MEDIAN`, `STATS_MODE`, `CORR`, `COVAR_*`, `REGR_*`, `RATIO_TO_REPORT`, and the XML functions.
 
 ## Operators
 

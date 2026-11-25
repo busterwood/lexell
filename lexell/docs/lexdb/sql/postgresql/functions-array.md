@@ -91,7 +91,7 @@ generate_subscripts ( array, dimension [, reverse ] ) → setof integer
 - `generate_subscripts` works in the select list only: in `FROM` it is 42883 (`function
   generate_subscripts(unknown, unknown) does not exist`).
 - An element of another type is not refused: `array_append(ARRAY[1, 2], 'x')` gives `{1,2,x}` (PostgreSQL: 22P02).
-- `array_fill`, `array_to_json` and `array_sort` do not exist.
+- `array_fill` and `array_sort` do not exist. (For `array_to_json` see [JSON and SQL/JSON](functions-json.md).)
 
 ## Examples
 

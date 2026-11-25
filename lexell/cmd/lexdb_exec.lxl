@@ -41,6 +41,7 @@ import "./lexdb_nnalter"
 import "./lexdb_annot"
 import "./lexdb_graph"
 import "./lexdb_sql"
+import "./lexdb_json"
 import "./lexdb_plan"
 import "./lexdb_enum"
 import "./lexdb_stats"
@@ -263,6 +264,49 @@ fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
         // (9.92) their values made by the call, as in a select list
         append(mut &out, OutCol{name: name.clone(), oid: if name == "regexp_matches" { lexdb_sql.arrayOid(lexdb_sql.OID_TEXT) } else { lexdb_sql.OID_TEXT }, spell: "", coll: "", scale: -1})
         if ordin { append(mut &out, OutCol{name: "ordinality", oid: lexdb_sql.OID_INT8, spell: "", coll: "", scale: -1}) }
+        return Ok(out)
+    }
+    if name == "json_each" || name == "jsonb_each" || name == "json_each_text" || name == "jsonb_each_text" {
+        let vOid = if name == "json_each" { lexdb_sql.OID_JSON } else if name == "jsonb_each" { lexdb_sql.OID_JSONB } else { lexdb_sql.OID_TEXT }
+        append(mut &out, OutCol{name: "key", oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1})
+        append(mut &out, OutCol{name: "value", oid: vOid, spell: "", coll: "", scale: -1})
+        if ordin { append(mut &out, OutCol{name: "ordinality", oid: lexdb_sql.OID_INT8, spell: "", coll: "", scale: -1}) }
+        return Ok(out)
+    }
+    if name == "json_array_elements" || name == "jsonb_array_elements" || name == "json_array_elements_text" || name == "jsonb_array_elements_text" {
+        let vOid = if name == "json_array_elements" { lexdb_sql.OID_JSON } else if name == "jsonb_array_elements" { lexdb_sql.OID_JSONB } else { lexdb_sql.OID_TEXT }
+        append(mut &out, OutCol{name: "value", oid: vOid, spell: "", coll: "", scale: -1})
+        if ordin { append(mut &out, OutCol{name: "ordinality", oid: lexdb_sql.OID_INT8, spell: "", coll: "", scale: -1}) }
+        return Ok(out)
+    }
+    if name == "json_object_keys" || name == "jsonb_object_keys" {
+        append(mut &out, OutCol{name: name.clone(), oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1})
+        if ordin { append(mut &out, OutCol{name: "ordinality", oid: lexdb_sql.OID_INT8, spell: "", coll: "", scale: -1}) }
+        return Ok(out)
+    }
+    if name == "jsonb_path_query" {
+        append(mut &out, OutCol{name: "jsonb_path_query", oid: lexdb_sql.OID_JSONB, spell: "", coll: "", scale: -1})
+        if ordin { append(mut &out, OutCol{name: "ordinality", oid: lexdb_sql.OID_INT8, spell: "", coll: "", scale: -1}) }
+        return Ok(out)
+    }
+    if name == "openjson" {
+        append(mut &out, OutCol{name: "key", oid: lexdb_sql.OID_TEXT, spell: "key", coll: "", scale: -1})
+        append(mut &out, OutCol{name: "value", oid: lexdb_sql.OID_TEXT, spell: "value", coll: "", scale: -1})
+        append(mut &out, OutCol{name: "type", oid: lexdb_sql.OID_INT4, spell: "type", coll: "", scale: -1})
+        return Ok(out)
+    }
+    if strings.startsWith(&name, "json_table:") || strings.startsWith(&name, "openjson_with:") {
+        let spec = if strings.startsWith(&name, "openjson_with:") { name[14..len(name)].toStr() } else { name[11..len(name)].toStr() }
+        if len(spec) > 0 {
+            for part in strings.split(&spec, "\x1e") {
+                let fs = strings.split(&part, "\x1f")
+                if len(fs) < 13 { continue }
+                let oid = lexdb_base.num(&fs[2])
+                let cn = fs[11].clone()
+                let sp = fs[12].clone()
+                append(mut &out, OutCol{name: cn, oid: if oid > 0 { oid } else { lexdb_sql.OID_TEXT }, spell: sp, coll: "", scale: -1})
+            }
+        }
         return Ok(out)
     }
     if name == "generate_series" {
@@ -2689,8 +2733,8 @@ fn planSubIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
                  else { lexdb_bind.LPlan.Func(s.srf.toStr(), s.ordin, args, outBCols(&sel.outs)) }
     }
     if s.use == lexdb_sql.SUB_IN && len(sel.outs) != 1 { return Err(e("42601", "subquery has too many columns")) }
-    if s.use == lexdb_sql.SUB_SCALAR && len(sel.outs) != 1 { return Err(e("42601", "subquery must return only one column")) }
-    let oid = if s.use == lexdb_sql.SUB_EXISTS || len(sel.outs) == 0 { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
+    if s.use == lexdb_sql.SUB_SCALAR && len(sel.outs) != 1 && len(sel.forJson) == 0 { return Err(e("42601", "subquery must return only one column")) }
+    let oid = if len(sel.forJson) > 0 { lexdb_sql.OID_JSON } else if s.use == lexdb_sql.SUB_EXISTS || len(sel.outs) == 0 { lexdb_sql.OID_BOOL } else { sel.outs[0].oid }
     let name = if s.use == lexdb_sql.SUB_EXISTS { "exists" } else if s.use == lexdb_sql.SUB_SCALAR { sel.outs[0].name.clone() } else { "?column?" }
     // (in FROM: its columns are its outs)
     var sp = SubPlan{use: s.use, sel: sel, oid: oid, name: name, hashed: false, keyOuter: [], keyText: [], cte: s.cte, kind: lexdb_sql.COLL_EXACT, semi: false, res: [], resText: [], readAs: 0, view: None, lat: [], need: if s.use == lexdb_sql.SUB_FROM && s.cteOnce && sel.rec >= 0 { -2 } else { -1 }, viewKey: "", rollup: [], sipCol: -1}
@@ -2995,7 +3039,7 @@ fn exprsPure(xs: &[]Expr): bool {
 // Whether sel is deterministic and side-effect free within one read-only statement
 // (safe to cache a view's rows across multiple unmodified references).
 fn selPure(sel: &Sel): bool {
-    if len(sel.q.refs) > 0 || len(sel.locks) > 0 || len(sel.srf) > 0 || sel.rec >= 0 || len(sel.wins) > 0 || len(sel.mr) > 0 || len(sel.feedback) > 0 { return false }
+    if len(sel.q.refs) > 0 || len(sel.locks) > 0 || len(sel.srf) > 0 || sel.rec >= 0 || len(sel.wins) > 0 || len(sel.mr) > 0 || len(sel.forJson) > 0 || len(sel.feedback) > 0 { return false }
     for lv in sel.q.levels {
         if lv.work >= 0 || !exprsPure(&lv.cond) || !exprsPure(&lv.post) || !exprsPure(&lv.local) { return false }
     }
@@ -3344,7 +3388,7 @@ fn rollupMatch(outer: &Sel, subIdx: int): []int {
 
 fn markRollups(sel: mut &Sel) {
     if sel.aggQ && len(sel.groupBy) > 0 && len(sel.gsets) == 0 && len(sel.wins) == 0 && len(sel.q.refs) == 0 &&
-       len(sel.q.subs) > 0 && len(sel.mr) == 0 && len(sel.locks) == 0 && len(sel.srf) == 0 && sel.rec < 0 && sel.setop == 0 {
+       len(sel.q.subs) > 0 && len(sel.mr) == 0 && len(sel.forJson) == 0 && len(sel.locks) == 0 && len(sel.srf) == 0 && sel.rec < 0 && sel.setop == 0 {
         for i in 0..len(sel.q.subs) {
             let m = rollupMatch(sel, i)
             if len(m) > 0 { sel.q.subs[i].rollup = m }
@@ -9468,6 +9512,7 @@ fn (sh: mut &Share) giveBack(rs: mut &Run) {
 // runSelTo, its runs starting from sh and handing back to it.
 fn runSelToIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, lim: Limits,
               sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool, sh: mut &Share): Result[Res, DbErr] {
+    if len(sel.forJson) > 0 { return runSelIn(st, txn, sel, params, lim, sh) }
     let noRow: []Val = []
     let noB = noBatch()
     if sel.setop != 0 && streamsSet(sel) {
@@ -10907,7 +10952,8 @@ fn collectAggs(x: &Expr, specs: mut &[]AggSpec): Result[Expr, DbErr] {
                 Some(f) { if lexdb_bind.hasAgg(&f) { return Err(e("42803", "aggregate functions are not allowed in FILTER")) } }
                 None {}
             }
-            let want = if base == "string_agg" || pct { 2 } else { 1 }
+            let isJsonObj = base == "json_object_agg" || base == "jsonb_object_agg" || strings.startsWith(&base, "json_objectagg") || strings.startsWith(&base, "jsonb_objectagg")
+            let want = if base == "string_agg" || pct || isJsonObj { 2 } else { 1 }
             let dia = lexdb_pct.dialectOf(&name)
             // the fraction, checked now where it is a literal, as the dialects do (before any row)
             if pct && !star && len(aargs) == 2 { try lexdb_pct.checkArg(dia, &base, &aargs[1]) }
@@ -11670,6 +11716,15 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             }
             bw = replace(mut &wdefs, cw)
         }
+        // Record value OIDs for JSON aggregates so nested JSON/array values are preserved without double-quoting
+        let noPt: []int = []
+        for si in 0..len(specs) {
+            if specs[si].op == lexdb_agg.OP_JSON_ARRAY && len(specs[si].args) >= 1 {
+                specs[si].valOid = lexdb_bind.exprOid(&specs[si].args[0], &q.cols, &noPt, &typing())
+            } else if specs[si].op == lexdb_agg.OP_JSON_OBJ && len(specs[si].args) >= 2 {
+                specs[si].valOid = lexdb_bind.exprOid(&specs[si].args[1], &q.cols, &noPt, &typing())
+            }
+        }
         var gtexts: []str = []
         for g in groupBy { append(mut &gtexts, lexdb_sql.exprText(&g)) }
         var okLevels: []bool = []
@@ -11824,7 +11879,7 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                   parts: [], setop: 0, setAll: false, split: 0, rec: -1, srf: s.srf.clone(), ordin: s.ordin, wins: wins, nAggs: nAggs,
                   locks: locks, nOut: nOut, donKey: donKey, withTies: s.withTies, gsets: lexdb_plan.copySets(&s.gsets), gx: gx, gord: gord, gh: gh,
                   groupKinds: groupKinds, ordKinds: ordKinds, outKinds: lexdb_bind.distKinds(&outs),
-                  topMode: s.topMode, topN: topN, feedback: if aggQ || s.distinct || len(wins) > 0 { [] } else { feedbackOf(s, &exprs) }, mr: [], conv: [], ox: [], oxParam: false, lp: lp, pipe: None})
+                  topMode: s.topMode, topN: topN, feedback: if aggQ || s.distinct || len(wins) > 0 { [] } else { feedbackOf(s, &exprs) }, mr: [], conv: [], ox: [], oxParam: false, lp: lp, pipe: None, forJson: s.forJson.clone()})
 }
 
 // The outputs of a SELECT as a logical operator's columns (lexdb_bind.outBCol),
@@ -11978,7 +12033,7 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
                   setop: s.setop, setAll: s.setAll, split: split, rec: if s.rec { s.cte } else { -1 }, srf: "", ordin: false,
                   wins: [], nAggs: 0, locks: [], nOut: len(outs), donKey: 0, withTies: s.withTies, gsets: [], gx: [], gord: [], gh: [],
                   groupKinds: [], ordKinds: ordKinds, outKinds: setKinds,
-                  topMode: 0, topN: -1, feedback: [], mr: [], conv: conv, ox: [], oxParam: false, lp: lp, pipe: None})
+                  topMode: 0, topN: -1, feedback: [], mr: [], conv: conv, ox: [], oxParam: false, lp: lp, pipe: None, forJson: s.forJson.clone()})
 }
 
 // The type of a set operation's side's i-th column for its common type:
@@ -12166,7 +12221,7 @@ fn runSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: 
 // or WITH TIES (those need every row first). ORDER BY goes through a sort
 // fed by the parts (runSetSorted); OFFSET skips rows as they come.
 fn streamsSet(sel: &Sel): bool {
-    if sel.rec >= 0 || sel.withTies || len(sel.locks) > 0 || len(sel.mr) > 0 { return false }
+    if sel.rec >= 0 || sel.withTies || len(sel.locks) > 0 || len(sel.mr) > 0 || len(sel.forJson) > 0 { return false }
     for c in sel.conv { if c != 0 { return false } }
     return true
 }
@@ -12543,12 +12598,36 @@ fn sortOutRows(sel: &Sel, rows: mut &[]OutRow) {
 // subquery: EXISTS 1, in any order; a scalar 2).
 fn execSel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int,
            rs: mut &Run): Result[Res, DbErr] {
+    if len(sel.forJson) > 0 {
+        let r = try execSelIn(st, txn, sel, params, -1, rs)
+        return execForJson(&sel.forJson, &sel.outs, &r, &txn.sql.zone)
+    }
     if len(sel.mr) > 0 {
         // (its input's rows: the pipeline's when it runs the Sel, Q8 R3; their run noted by execSelIn)
         let r = try execSelIn(st, txn, sel, params, -1, rs)
         return execMatch(&sel.mr[0], r, params, rs)
     }
     return execSelIn(st, txn, sel, params, cap, rs)
+}
+
+fn execForJson(spec: &str, outs: &[]OutCol, r: &Res, z: &lexdb_time.Zone): Result[Res, DbErr] {
+    let fs = strings.split(spec, "\x1f")
+    let pathMode = len(fs) == 0 || fs[0] == "path"
+    let rootName = if len(fs) > 1 { fs[1].clone() } else { "" }
+    let incNulls = len(fs) > 2 && fs[2] == "1"
+    let noWrap = len(fs) > 3 && fs[3] == "1"
+    var colNames: []str = []
+    var colOids: []int = []
+    for o in outs {
+        append(mut &colNames, if len(o.spell) > 0 { o.spell.clone() } else { o.name.clone() })
+        append(mut &colOids, o.oid)
+    }
+    let body = lexdb_json.forJson(&r.rows, &colNames, &colOids, pathMode, &rootName, incNulls, noWrap, z)
+    let jcol: []OutCol = [OutCol{name: "json_f52e2b61-18a1-11d1-b105-00805f49916b", oid: lexdb_sql.OID_JSON, spell: "JSON_F52E2B61-18A1-11d1-B105-00805F49916B", coll: "", scale: -1}]
+    if len(body) == 0 {
+        return Ok(Res{cols: jcol, rows: [], tag: "SELECT 0", hasRows: true, copy: COPY_NONE})
+    }
+    return Ok(Res{cols: jcol, rows: [[Val.Text(body)]], tag: "SELECT 1", hasRows: true, copy: COPY_NONE})
 }
 
 // execSel but MATCH_RECOGNIZE.

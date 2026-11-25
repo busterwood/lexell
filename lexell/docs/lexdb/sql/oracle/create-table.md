@@ -121,7 +121,8 @@ annotations_clause:
   table made in the SQL Server door as `Orders` is `ORDERS` to the Oracle door (`orders` and `"ORDERS"` find it) and is
   listed there as `Orders`. Names that lexdb makes from an exact table's name (the key `Emp_PKEY` of `"Emp"`) show their
   raw bytes in the other doors.
-- `XMLTYPE`, `JSON` and `VECTOR` are ORA-00902 (invalid datatype); object and collection types are not supported.
+- `XMLTYPE` and `VECTOR` are ORA-00902 (invalid datatype); object and collection types are not supported. (For `JSON`
+  columns see [JSON and SQL/JSON](functions-json.md).)
 - `USER_CONSTRAINTS` lists no `NOT NULL` constraint, where Oracle lists each as a row of type `C` with the search
   condition `"A" IS NOT NULL` (example K).
 - Key names are lexdb's (`EMP_PKEY`, `EMP_DEPT_ID_FKEY`); Oracle uses `SYS_C00...` for a name you did not give.

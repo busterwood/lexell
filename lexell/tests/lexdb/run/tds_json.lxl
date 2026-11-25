@@ -1,0 +1,161 @@
+// lexdb over TDS: SQL Server JSON support (SQL Server 2016/2022/2025).
+// Covers json column type, ISJSON (VALUE/SCALAR/ARRAY/OBJECT), IS [NOT] JSON, JSON_VALUE (lax/strict + errors),
+// JSON_QUERY (1-arg/2-arg lax/strict), JSON_PATH_EXISTS, JSON_EXISTS, JSON_MODIFY (update/insert/delete/append/nested),
+// JSON_CONTAINS, JSON_OBJECT, JSON_ARRAY, JSON_ARRAYAGG (ORDER BY, NULL/ABSENT ON NULL), JSON_OBJECTAGG,
+// OPENJSON (default schema & WITH ... AS JSON + CROSS APPLY), JSON_TABLE, FOR JSON PATH (nested dotted aliases,
+// ROOT, INCLUDE_NULL_VALUES, WITHOUT_ARRAY_WRAPPER, scalar subquery), FOR JSON AUTO, batches off & on, and persistence.
+// expect: setup: 2 batches
+// expect: same: o1,a1,o2,s1,b1,n1 = 1|1|1|1|0|NULL
+// expect: same: ok1,ok2 = 1|1
+// expect: same: Id,st,sku,miss = 1|paid|A1|NULL;2|open|C3|NULL;3|NULL|NULL|NULL
+// expect: same: error 13608: JSON object does not contain key "missing"
+// expect: same: error 13609: JSON text is not properly formatted. Unexpected character.
+// expect: same: Id,items,scalar_null = 1|[{"sku":"A1","qty":2},{"sku":"B2","qty":1}]|NULL
+// expect: same: whole = {"a":1}
+// expect: same: ex1,ex2 = 1|0
+// expect: same: m1,m2,m3,m4 = {"a":99,"b":[1,2]}|{}|{"b":[1,2,3]}|{"a":1,"obj":{"x":2}}
+// expect: same: c1,c2 = 1|0
+// expect: same: o1,a1,a2 = {"id":1,"name":"Ann"}|[1,"two",{"k":3}]|[1,null,2]
+// expect: same: names,map = ["Ann","Bob","Cid"]|{"Ann":1,"Bob":2,"Cid":3}
+// expect: same: key,value,type = a|1|2;b|hi|1;c|true|3;d|NULL|0;e|[1]|4
+// expect: same: Id,sku,qty = 1|A1|2;1|B2|1;2|C3|5
+// expect: same: ord,sku,qty = 1|A1|2;2|B2|1
+// expect: same: JSON_F52E2B61-18A1-11d1-B105-00805F49916B = [{"Id":1,"info":{"name":"Ann"}},{"Id":2,"info":{"name":"Bob"}}]
+// expect: same: JSON_F52E2B61-18A1-11d1-B105-00805F49916B = {"orders":[{"Id":1,"Customer":"Ann"},{"Id":2,"Customer":"Bob"}]}
+// expect: same: JSON_F52E2B61-18A1-11d1-B105-00805F49916B = {"Id":3,"Payload":null}
+// expect: same: JSON_F52E2B61-18A1-11d1-B105-00805F49916B = 
+// expect: same: JSON_F52E2B61-18A1-11d1-B105-00805F49916B = {"empty":[]}
+// expect: same: sub_json = [{"Id":1,"Customer":"Ann"},{"Id":2,"Customer":"Bob"}]
+// expect: reopened: 1|"paid"
+import "strings"
+import "task"
+import "net"
+import "tds"
+import "sqldialect"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+fn cellText(c: &tds.Column, v: &tds.Cell): str {
+    match v {
+        tds.Cell.Null { return "NULL" }
+        else { return tds.cellText(c, v).unwrapOr("?") }
+    }
+}
+
+fn said(r: Result[tds.Reply, sqldialect.DbError]): str {
+    match r {
+        Ok(rep) {
+            var parts: []str = []
+            for e in rep.errors { append(mut &parts, "error " + e.number.toStr() + ": " + e.text) }
+            for rs in rep.results {
+                var rows: []str = []
+                for row in rs.rows {
+                    var cells: []str = []
+                    for i in 0..len(row) { append(mut &cells, cellText(&rs.columns[i], &row[i])) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                var names: []str = []
+                for c in rs.columns { append(mut &names, c.name.clone()) }
+                append(mut &parts, strings.join(&names, ",") + " = " + strings.join(&rows, ";"))
+            }
+            if len(rep.results) == 0 && len(rep.errors) == 0 {
+                for c in rep.counts { if c.resultSet < 0 && c.rows >= 0 { append(mut &parts, "(" + c.rows.toStr() + ")") } }
+            }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "failed " + e.code.toStr() + " " + e.msg }
+    }
+}
+
+fn setup(): []str {
+    return [
+        "CREATE TABLE dbo.Orders (Id int PRIMARY KEY, Customer nvarchar(30), Payload json)",
+        "INSERT dbo.Orders VALUES (1, N'Ann', N'{\"total\":120,\"status\":\"paid\",\"items\":[{\"sku\":\"A1\",\"qty\":2},{\"sku\":\"B2\",\"qty\":1}]}'), (2, N'Bob', N'{\"total\":50,\"status\":\"open\",\"items\":[{\"sku\":\"C3\",\"qty\":5}]}'), (3, N'Cid', NULL)",
+    ]
+}
+
+fn queries(): []str {
+    return [
+        "SELECT ISJSON(N'{\"a\":1}') AS o1, ISJSON(N'[1,2]', ARRAY) AS a1, ISJSON(N'{\"a\":1}', OBJECT) AS o2, ISJSON(N'42', SCALAR) AS s1, ISJSON(N'{bad}') AS b1, ISJSON(NULL) AS n1",
+        "SELECT CASE WHEN N'{\"a\":1}' IS JSON OBJECT THEN 1 ELSE 0 END AS ok1, CASE WHEN N'bad' IS NOT JSON THEN 1 ELSE 0 END AS ok2",
+        "SELECT Id, JSON_VALUE(Payload, '$.status') AS st, JSON_VALUE(Payload, '$.items[0].sku') AS sku, JSON_VALUE(Payload, '$.missing') AS miss FROM dbo.Orders ORDER BY Id",
+        "SELECT JSON_VALUE(N'{\"a\":1}', 'strict $.missing') AS v",
+        "SELECT JSON_VALUE(N'{bad}', '$.a') AS v",
+        "SELECT Id, JSON_QUERY(Payload, '$.items') AS items, JSON_QUERY(Payload, '$.status') AS scalar_null FROM dbo.Orders WHERE Id = 1",
+        "SELECT JSON_QUERY(N'{\"a\":1}') AS whole",
+        "SELECT JSON_PATH_EXISTS(Payload, '$.items[1].sku') AS ex1, JSON_PATH_EXISTS(Payload, '$.items[9].sku') AS ex2 FROM dbo.Orders WHERE Id = 1",
+        "SELECT JSON_MODIFY(N'{\"a\":1,\"b\":[1,2]}', '$.a', 99) AS m1, JSON_MODIFY(N'{\"a\":1}', '$.a', NULL) AS m2, JSON_MODIFY(N'{\"b\":[1,2]}', 'append $.b', 3) AS m3, JSON_MODIFY(N'{\"a\":1}', '$.obj', JSON_QUERY(N'{\"x\":2}')) AS m4",
+        "SELECT JSON_CONTAINS(N'{\"tags\":[\"sql\",\"json\"]}', N'\"json\"', '$.tags') AS c1, JSON_CONTAINS(N'{\"tags\":[\"sql\"]}', N'\"xml\"', '$.tags') AS c2",
+        "SELECT JSON_OBJECT('id': 1, 'name': N'Ann', 'opt': NULL ABSENT ON NULL) AS o1, JSON_ARRAY(1, N'two', NULL, JSON_OBJECT('k': 3)) AS a1, JSON_ARRAY(1, NULL, 2 NULL ON NULL) AS a2",
+        "SELECT JSON_ARRAYAGG(Customer ORDER BY Id) AS names, JSON_OBJECTAGG(Customer: Id) AS map FROM dbo.Orders",
+        "SELECT [key], [value], [type] FROM OPENJSON(N'{\"a\":1,\"b\":\"hi\",\"c\":true,\"d\":null,\"e\":[1]}') ORDER BY [key]",
+        "SELECT o.Id, j.sku, j.qty FROM dbo.Orders o CROSS APPLY OPENJSON(o.Payload, '$.items') WITH (sku nvarchar(20) '$.sku', qty int '$.qty') j ORDER BY o.Id, j.sku",
+        "SELECT jt.ord, jt.sku, jt.qty FROM dbo.Orders o, JSON_TABLE(o.Payload, '$.items[*]' COLUMNS (ord FOR ORDINALITY, sku nvarchar(20) PATH '$.sku', qty int PATH '$.qty')) jt WHERE o.Id = 1 ORDER BY jt.ord",
+        "SELECT Id, Customer AS [info.name] FROM dbo.Orders WHERE Id <= 2 ORDER BY Id FOR JSON PATH",
+        "SELECT Id, Customer FROM dbo.Orders WHERE Id <= 2 ORDER BY Id FOR JSON PATH, ROOT('orders')",
+        "SELECT Id, Payload FROM dbo.Orders WHERE Id = 3 FOR JSON PATH, INCLUDE_NULL_VALUES, WITHOUT_ARRAY_WRAPPER",
+        "SELECT Id, Customer FROM dbo.Orders WHERE Id = 999 FOR JSON PATH",
+        "SELECT Id, Customer FROM dbo.Orders WHERE Id = 999 FOR JSON PATH, ROOT('empty')",
+        "SELECT (SELECT Id, Customer FROM dbo.Orders WHERE Id <= 2 ORDER BY Id FOR JSON AUTO) AS sub_json",
+    ]
+}
+
+fn client(dsn: &str) {
+    let st = sqlserver.parseConnString(&(dsn.toStr())).unwrap()
+    var s = tds.open(&st.config).unwrap()
+    var n = 0
+    for x in setup() {
+        let r = said(s.batch(&x))
+        if r != "ok" && !strings.startsWith(&r, "(") { println("setup: " + x + ": " + r) } else { n += 1 }
+    }
+    println("setup: " + n.toStr() + " batches")
+    for q in queries() {
+        let _a = said(s.batch("SET lexdb_batch = off"))
+        let off = said(s.batch(&q))
+        let _b = said(s.batch("SET lexdb_batch = on"))
+        let on = said(s.batch(&q))
+        if off == on { println("same: " + on) } else {
+            println("DIFFERENT: " + q)
+            println("  rows:    " + off)
+            println("  batches: " + on)
+        }
+    }
+}
+
+fn opts(): lexdb_store.Options { return lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000} }
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(sc: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        client(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(105)
+    lexdb_store.run(fs.share(), opts(), body).unwrap()
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int {
+        var s = lexdb_exec.newSession(st)
+        match s.exec(&"select id, payload::jsonb -> 'status' from orders where id = 1") {
+            Ok(rs) {
+                let r = &rs[len(rs) - 1]
+                println("reopened: " + lexdb_sql.text(&r.rows[0][0]) + "|" + lexdb_sql.text(&r.rows[0][1]))
+            }
+            Err(e) { println("reopened err: " + e.state + " " + e.msg) }
+        }
+        s.close()
+        return 0
+    }).unwrap()
+}

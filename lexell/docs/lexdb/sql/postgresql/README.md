@@ -96,9 +96,10 @@ This index lists everything the door takes today. Pages not written yet are list
 | [UUID](data-types-uuid.md) | `uuid` |
 | [Arrays](data-types-arrays.md) | `type[]` of the types above (one dimension) |
 | [Enums](data-types-enum.md) | `CREATE TYPE ... AS ENUM` |
+| [JSON](functions-json.md) | `json`, `jsonb` (`json[]`, `jsonb[]`) |
 | [System](data-types-system.md) | `oid`, `regclass`, `regtype`, `regnamespace`, `regproc`, `regprocedure`, `regrole`, `int2vector`, `oidvector` |
 
-Not available: `json`, `jsonb`, `xml`, `money`, `bit`, network and geometric types, ranges, domains, composite types.
+Not available: `xml`, `money`, `bit`, network and geometric types, ranges, domains, composite types.
 
 Casts, typed constants and the common type of mixed values: [type conversion](type-conversion.md).
 
@@ -115,7 +116,7 @@ Casts, typed constants and the common type of mixed values: [type conversion](ty
 | [Conditional](functions-conditional.md) | `CASE`, `coalesce`, `nullif`, `greatest`, `least`, `error_on_null` |
 | [Arrays](functions-array.md) | `array_append`, `array_prepend`, `array_cat`, `array_remove`, `array_replace`, `array_position`, `array_positions`, `array_to_string`, `array_length`, `array_lower`, `array_upper`, `array_ndims`, `array_dims`, `cardinality`, `trim_array`, `array_reverse`, `array_shuffle`, `array_sample`, `unnest`, `generate_subscripts` |
 | [UUID](functions-uuid.md) | `gen_random_uuid`, `uuidv4`, `uuidv7`, `uuid_extract_version`, `uuid_extract_timestamp` |
-| [JSON](functions-json.md) | `json_build_object`, `jsonb_build_object` (text results; there is no JSON type) |
+| [JSON](functions-json.md) | `json` / `jsonb` operators (`->`, `->>`, `#>`, `#>>`, `@>`, `<@`, `?`, `?|`, `?&`, `||`, `-`, `#-`, `@?`, `@@`), `to_json`/`to_jsonb`, `array_to_json`, `json_build_*`, `json_typeof`, `json_array_length`, `json_extract_path*`, `json_strip_nulls`, `jsonb_set`, `jsonb_insert`, `jsonb_pretty`, `jsonb_path_*`, `json_each*`, `json_array_elements*`, `json_object_keys`, `json_agg`, `json_object_agg`, and SQL/JSON (`IS JSON`, `JSON`, `JSON_SCALAR`, `JSON_SERIALIZE`, `JSON_VALUE`, `JSON_QUERY`, `JSON_EXISTS`, `JSON_OBJECT`, `JSON_ARRAY`, `JSON_ARRAYAGG`, `JSON_OBJECTAGG`, `JSON_TABLE`) |
 | [Aggregate](functions-aggregate.md) | `count`, `sum`, `avg`, `min`, `max`, `string_agg`, `array_agg`, `bool_and`, `bool_or`, `every`, `bit_and`, `bit_or`, `bit_xor`, `any_value`, `stddev`, `stddev_samp`, `stddev_pop`, `variance`, `var_samp`, `var_pop`, `percentile_cont`, `percentile_disc` |
 | [Window](functions-window.md) | `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value` (with `IGNORE NULLS`), and every aggregate with `OVER` |
 | [Set-returning](functions-srf.md) | `generate_series`, `unnest [WITH ORDINALITY]`, `regexp_matches`, `regexp_split_to_table`, `string_to_table` |

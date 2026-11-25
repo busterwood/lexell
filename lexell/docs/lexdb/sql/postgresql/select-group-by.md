@@ -82,8 +82,9 @@ aggregate_name ( fraction ) WITHIN GROUP ( ORDER BY sort_item ) [ FILTER ( WHERE
   plain `GROUP BY` it works.
 - `GROUP BY ALL` with no elements after it (PostgreSQL 19's "group by every column that is not an aggregate") is a
   syntax error; `ALL` is read as PostgreSQL 18 reads it, the opposite of `DISTINCT`.
-- `json_agg` and the statistical aggregates `corr`, `regr_*` and `covar_*` do not exist (42883). `mode() WITHIN
-  GROUP (...)` is a syntax error.
+- The statistical aggregates `corr`, `regr_*` and `covar_*` do not exist (42883). `mode() WITHIN
+  GROUP (...)` is a syntax error. (For `json_agg`, `jsonb_agg`, `JSON_ARRAYAGG` and `JSON_OBJECTAGG` see
+  [JSON and SQL/JSON](functions-json.md).)
 
 ## Examples
 

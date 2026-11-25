@@ -42,8 +42,9 @@ UROWID
 - **`RAW(n)` is not limited:** `HEXTORAW('0102030405')` is stored in a `RAW(4)` column without an error.
 - `USER_TAB_COLUMNS` shows a `RAW` column as `BLOB`.
 - **The pseudo-column `ROWID`** does not exist (ORA-00904); a `ROWID` column has no values of its own.
-- `BFILE`, `XMLTYPE`, `JSON`, `VECTOR`, object types, `VARRAY` and nested tables are not supported: `XMLTYPE`,
-  `JSON` and `VECTOR` are ORA-00902, and `CREATE TYPE ... AS OBJECT` is ORA-03001.
+- `BFILE`, `XMLTYPE`, `VECTOR`, object types, `VARRAY` and nested tables are not supported: `XMLTYPE`
+  and `VECTOR` are ORA-00902, and `CREATE TYPE ... AS OBJECT` is ORA-03001. (For `JSON` columns see
+  [JSON and SQL/JSON](functions-json.md).)
 
 ## Examples
 
@@ -139,7 +140,6 @@ true    6f9619ff-8b86-d011-b42d-00c04fc964ff true true
 <!-- example: oracle -->
 ```sql
 CREATE TABLE x1 (a XMLTYPE);
-CREATE TABLE x2 (a JSON);
 CREATE TABLE x3 (a VECTOR);
 CREATE TYPE ot AS OBJECT (a NUMBER);
 /
@@ -147,9 +147,6 @@ SELECT ROWID FROM dual;
 ```
 
 ```text
-ERROR:
-ORA-00902: invalid datatype
-
 ERROR:
 ORA-00902: invalid datatype
 

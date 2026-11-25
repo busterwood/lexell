@@ -1,0 +1,144 @@
+// PostgreSQL JSON & JSONB + SQL/JSON tests: types, casts, canonicalization, jsonb comparison/sorting,
+// operators (->, ->>, #>, #>>, @>, <@, ?, ?|, ?&, ||, -, #-, @?, @@), PG functions, aggregates
+// (json_agg, jsonb_agg, json_object_agg, jsonb_object_agg, json_arrayagg, json_objectagg),
+// SRFs (json_each*, json_array_elements*, json_object_keys, jsonb_path_query),
+// SQL/JSON (IS [NOT] JSON, JSON(), JSON_SCALAR, JSON_SERIALIZE, JSON_VALUE, JSON_QUERY, JSON_EXISTS,
+// JSON_OBJECT, JSON_ARRAY, JSON_TABLE with lateral join & NESTED PATH), batches off & on, and errors.
+// expect: types: 1|{"b": 2, "a": 1, "tags": ["x", "y"]}|{"a": 1, "b": 2, "tags": ["x", "y"], "nested": {"k": "v", "n": 10}}
+// expect: casts: 42|t|1.5|{"z":1,"a":2}|{"a": 2, "z": 1}
+// expect: bad_json: ERR:22P02
+// expect: bad_jsonb: ERR:22P02
+// expect: jb_cmp: t|t|t|t|t|t|t
+// expect: arrows: 1|1|y|y|"v"|v
+// expect: contains: 1;2
+// expect: contained: t
+// expect: haskeys: t|t|t|f
+// expect: concat_del: {"a": 3, "b": 2}|[1, 2, 3]|{"a": 1, "c": 3}|{"b": 2}|{"a": {"y": 2}}
+// expect: path_ops: t|t|f
+// expect: to_json: 123|"hi"|[1,2,3]|{"k":1}|{"a": 1, "b": 2}
+// expect: build: {"a" : 1, "b" : [2,true,null,"x"]}|{"a": {"nested": 1}, "z": 1}
+// expect: inspect: array|array|3|1
+// expect: extract_strip: v|{"a":1,"c":[1,null,2]}|{"a":1,"c":[1,2]}
+// expect: set_ins: {"a": [1, 99, 3]}|{"a": [1, 2, 3]}|{"a": [1, 2, 3]}
+// expect: pg_obj: {"a":"1","b":"2"}|{"x": "10", "y": null}
+// expect: path_fns: t|"x"|["x", "y"]
+// expect: pg_aggs: a|[1,2]|[1, 1]|{"1":1,"2":1};b|[3]|[2]|{"3":2}
+// expect: sql_aggs: [1,3]|[1,null,3]|{"a":1,"c":3}|{"a":1,"b":null,"c":3}
+// expect: objagg_uniq_err: ERR:22030
+// expect: each: a|hi;b|2
+// expect: arr_elems: 1|x|1;1|y|2;2|z|1
+// expect: obj_keys: a;b
+// expect: path_query_srf: 20;30
+// expect: is_json: t|t|t|t|f|t
+// expect: ctors: {"a":1}|42|{"a":1}
+// expect: ctor_uniq_err: ERR:22030
+// expect: sql_obj_arr: {"a":1}|{"a":1,"b":[1,2]}|[1,null,2]|[1,2,3]
+// expect: json_val_qry: 10|-1|["x","y"]|t
+// expect: json_table: 1|Ann|t|a;1|Ann|t|b;2|Bob|f|c
+// expect: json_table_lat: 1|v|10;2|w|20
+// expect: err_uniq: ERR:22030
+// expect: err_null_key: ERR:22004
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return "ERR:" + e.state }
+    }
+}
+
+fn checkBoth(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    let _1 = q(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    let _2 = q(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    if off == on {
+        println(label + ": " + on)
+    } else {
+        println("DIFF " + label + ": off=[" + off + "] on=[" + on + "]")
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(81), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024,
+        ckptBytes: 128 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+
+        let setup = [
+            "create table docs (id int primary key, grp text, j json, jb jsonb)",
+            "insert into docs values (1, 'a', '{\"b\": 2, \"a\": 1, \"tags\": [\"x\", \"y\"]}', '{\"b\": 2, \"a\": 1, \"tags\": [\"x\", \"y\"], \"nested\": {\"k\": \"v\", \"n\": 10}}')",
+            "insert into docs values (2, 'a', '[10, 20, 30]', '{\"a\": 1, \"b\": 2, \"tags\": [\"z\"], \"nested\": {\"k\": \"w\", \"n\": 20}}')",
+            "insert into docs values (3, 'b', '{\"x\": null, \"y\": [1, null, 2]}', '{\"a\": 2, \"b\": 1, \"extra\": true}')",
+        ]
+        for x in setup { let r = q(mut &s, &x); if strings.startsWith(&r, "ERR:") { println("setup err: " + x + " -> " + r) } }
+
+        // Types, validation, canonicalization, casts
+        checkBoth(mut &s, &"types", &"select id, j, jb from docs where id = 1")
+        checkBoth(mut &s, &"casts", &"select '42'::jsonb::int, 'true'::jsonb::boolean, '1.5'::jsonb::numeric, json '{\"z\":1,\"a\":2}', jsonb '{\"z\":1,\"a\":2}'")
+        checkBoth(mut &s, &"bad_json", &"select '{bad}'::json")
+        checkBoth(mut &s, &"bad_jsonb", &"select '{bad}'::jsonb")
+        checkBoth(mut &s, &"jb_cmp", &"select '{\"a\":1,\"b\":2}'::jsonb = '{\"b\":2, \"a\":1}', '1.0'::jsonb = '1'::jsonb, 'null'::jsonb < '\"a\"'::jsonb, '\"a\"'::jsonb < '1'::jsonb, '1'::jsonb < 'true'::jsonb, 'true'::jsonb < '[]'::jsonb, '[]'::jsonb < '{}'::jsonb")
+
+        // PG extraction & containment & existence & modification operators
+        checkBoth(mut &s, &"arrows", &"select jb -> 'a', jb ->> 'a', jb -> 'tags' ->> 1, jb -> 'tags' ->> -1, jb #> '{nested,k}', jb #>> '{nested,k}' from docs where id = 1")
+        checkBoth(mut &s, &"contains", &"select id from docs where jb @> '{\"a\": 1}' order by id")
+        checkBoth(mut &s, &"contained", &"select '{\"a\":1}'::jsonb <@ jb from docs where id = 1")
+        checkBoth(mut &s, &"haskeys", &"select jb ? 'tags', jb ?| array['tags','nope'], jb ?& array['a','b'], jb ?& array['a','nope'] from docs where id = 1")
+        checkBoth(mut &s, &"concat_del", &"select '{\"a\":1}'::jsonb || '{\"b\":2,\"a\":3}'::jsonb, '[1,2]'::jsonb || '[3]'::jsonb, '{\"a\":1,\"b\":2,\"c\":3}'::jsonb - 'b', '{\"a\":1,\"b\":2,\"c\":3}'::jsonb - array['a','c'], '{\"a\":{\"x\":1,\"y\":2}}'::jsonb #- '{a,x}'")
+        checkBoth(mut &s, &"path_ops", &"select jb @? '$.nested.n ? (@ > 5)', jb @@ '$.nested.n == 10', jb @@ '$.nested.n == 99' from docs where id = 1")
+
+        // PG functions
+        checkBoth(mut &s, &"to_json", &"select to_json(123), to_json('hi'), to_json(array[1,2,3]), to_json('{\"k\":1}'::json), to_jsonb('{\"b\":2,\"a\":1}'::json)")
+        checkBoth(mut &s, &"build", &"select json_build_object('a', 1, 'b', json_build_array(2, true, null, 'x')), jsonb_build_object('z', 1, 'a', '{\"nested\":1}'::jsonb)")
+        checkBoth(mut &s, &"inspect", &"select json_typeof(j), jsonb_typeof(jb -> 'tags'), json_array_length(j), jsonb_array_length(jb -> 'tags') from docs where id = 2")
+        checkBoth(mut &s, &"extract_strip", &"select jsonb_extract_path_text(jb, 'nested', 'k'), json_strip_nulls('{\"a\":1,\"b\":null,\"c\":[1,null,2]}'::json), json_strip_nulls('{\"a\":1,\"b\":null,\"c\":[1,null,2]}'::json, true) from docs where id = 1")
+        checkBoth(mut &s, &"set_ins", &"select jsonb_set('{\"a\":[1,2,3]}'::jsonb, '{a,1}', '99'::jsonb), jsonb_insert('{\"a\":[1,3]}'::jsonb, '{a,1}', '2'::jsonb), jsonb_insert('{\"a\":[1,3]}'::jsonb, '{a,0}', '2'::jsonb, true)")
+        checkBoth(mut &s, &"pg_obj", &"select json_object('{a,1,b,2}'), jsonb_object(array['x','y'], array['10', null])")
+        checkBoth(mut &s, &"path_fns", &"select jsonb_path_exists(jb, '$.nested.n ? (@ >= $min)', '{\"min\": 10}'::jsonb), jsonb_path_query_first(jb, '$.tags[*]'), jsonb_path_query_array(jb, '$.tags[*]') from docs where id = 1")
+
+        // Aggregates (PG + SQL/JSON)
+        checkBoth(mut &s, &"pg_aggs", &"select grp, json_agg(id order by id), jsonb_agg(jb -> 'a' order by id), json_object_agg(id::text, jb -> 'a') from docs group by grp order by grp")
+        checkBoth(mut &s, &"sql_aggs", &"select json_arrayagg(v order by k), json_arrayagg(v order by k null on null), json_objectagg(k: v absent on null), json_objectagg(k: v null on null) from (values ('a', 1), ('b', null), ('c', 3)) as t(k, v)")
+        checkBoth(mut &s, &"objagg_uniq_err", &"select json_objectagg(k: v with unique keys) from (values ('a', 1), ('a', 2)) as t(k, v)")
+
+        // PG SRFs (FROM + lateral + select-list)
+        checkBoth(mut &s, &"each", &"select k, v from jsonb_each_text('{\"b\":2,\"a\":\"hi\"}') as t(k, v) order by k")
+        checkBoth(mut &s, &"arr_elems", &"select d.id, e.value, e.ordinality from docs d, jsonb_array_elements_text(d.jb -> 'tags') with ordinality as e where d.id <= 2 order by d.id, e.ordinality")
+        checkBoth(mut &s, &"obj_keys", &"select k from jsonb_object_keys('{\"b\":1,\"a\":2}') as k order by k")
+        checkBoth(mut &s, &"path_query_srf", &"select v from jsonb_path_query('{\"a\":[10,20,30]}'::jsonb, '$.a[*] ? (@ > 15)') as v")
+
+        // SQL/JSON standard predicates, constructors, query functions, JSON_TABLE
+        checkBoth(mut &s, &"is_json", &"select '{\"a\":1}' is json object, '[1,2]' is json array, '42' is json scalar, '{bad}' is not json, '{\"a\":1,\"a\":2}' is json with unique keys, '{\"a\":1,\"b\":2}' is json with unique keys")
+        checkBoth(mut &s, &"ctors", &"select json('{\"a\":1}'), json_scalar(42), json_serialize('{\"a\": 1}'::json)")
+        checkBoth(mut &s, &"ctor_uniq_err", &"select json('{\"a\":1,\"a\":2}' with unique keys)")
+        checkBoth(mut &s, &"sql_obj_arr", &"select json_object('a': 1, 'b': null absent on null), json_object(key 'a' value 1, key 'b' value json_array(1, null, 2)), json_array(1, null, 2 null on null), json_array(select id from docs order by id)")
+        checkBoth(mut &s, &"json_val_qry", &"select json_value(jb, '$.nested.n' returning int), json_value(jb, '$.missing' returning int default -1 on empty), json_query(jb, '$.tags[*]' with wrapper), json_exists(jb, '$.nested.n ? (@ > $x)' passing 5 as x) from docs where id = 1")
+        checkBoth(mut &s, &"json_table", &"select jt.ord, jt.name, jt.has_vip, jt.tag from json_table('{\"users\":[{\"name\":\"Ann\",\"vip\":true,\"tags\":[\"a\",\"b\"]},{\"name\":\"Bob\",\"tags\":[\"c\"]}]}', '$.users[*]' columns (ord for ordinality, name text path '$.name', has_vip bool exists path '$.vip', nested path '$.tags[*]' columns (tag text path '$'))) as jt order by jt.ord, jt.tag")
+        checkBoth(mut &s, &"json_table_lat", &"select d.id, jt.k, jt.n from docs d, json_table(d.jb, '$.nested' columns (k text path '$.k', n int path '$.n')) as jt order by d.id")
+
+        // Errors
+        checkBoth(mut &s, &"err_uniq", &"select json_object('a': 1, 'a': 2 with unique keys)")
+        checkBoth(mut &s, &"err_null_key", &"select json_build_object(null, 1)")
+
+        return 0
+    }).unwrap()
+}

@@ -23,6 +23,7 @@ import "./lexdb_access"
 import "./lexdb_catalog"
 import "./lexdb_newfn"
 import "./lexdb_decfit"
+import "./lexdb_json"
 
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
@@ -344,7 +345,55 @@ pub fn entryOf(name: &str, n: int): LibFn {
         "array_lower" { if n == 2 { return arrLowerFn } }
         "cardinality" { if n == 1 || n == 2 { return cardinalityFn } }
         "pg_encoding_to_char" { if n == 1 { return encodingFn } }
-        "json_build_object", "jsonb_build_object" { return jsonObjectFn }
+        "json_build_object", "jsonb_build_object" { return jsonBuildObjFn }
+        "#json_build_object", "#jsonb_build_object" { return jsonBuildObjTypedFn }
+        "json_build_array", "jsonb_build_array" { return jsonBuildArrFn }
+        "#json_build_array", "#jsonb_build_array" { return jsonBuildArrTypedFn }
+        "to_json", "to_jsonb", "array_to_json" { return toJsonFn }
+        "#to_json", "#to_jsonb", "#array_to_json" { return toJsonTypedFn }
+        "json_typeof", "jsonb_typeof" { if n == 1 { return jsonTypeofFn } }
+        "json_array_length", "jsonb_array_length" { if n == 1 { return jsonArrLenFn } }
+        "json_extract_path", "jsonb_extract_path", "json_extract_path_text", "jsonb_extract_path_text" { if n >= 1 { return jsonExtractPathFn } }
+        "json_strip_nulls", "jsonb_strip_nulls" { if n == 1 || n == 2 { return jsonStripNullsFn } }
+        "jsonb_set" { if n == 3 || n == 4 { return jsonbSetFn } }
+        "jsonb_insert" { if n == 3 || n == 4 { return jsonbInsertFn } }
+        "jsonb_pretty" { if n == 1 { return jsonbPrettyFn } }
+        "json_object", "jsonb_object" { if n == 1 || n == 2 { return pgJsonObjFn } }
+        "jsonb_path_exists" { if n >= 2 && n <= 4 { return jsonbPathExistsFn } }
+        "jsonb_path_match" { if n >= 2 && n <= 4 { return jsonbPathMatchFn } }
+        "jsonb_path_query_first" { if n >= 2 && n <= 4 { return jsonbPathQueryFirstFn } }
+        "jsonb_path_query_array" { if n >= 2 && n <= 4 { return jsonbPathQueryArrFn } }
+        "json_array_elements", "jsonb_array_elements", "json_array_elements_text", "jsonb_array_elements_text" { if n == 1 { return jsonArrElemSrfFn } }
+        "json_object_keys", "jsonb_object_keys" { if n == 1 { return jsonObjKeysSrfFn } }
+        "jsonb_path_query" { if n >= 2 && n <= 4 { return jsonbPathQuerySrfFn } }
+        "#json_arrow", "#jsonb_arrow", "#json_arrow_text" { if n == 2 { return jsonArrowFn } }
+        "#json_hash", "#jsonb_hash", "#json_hash_text" { if n == 2 { return jsonHashFn } }
+        "#jsonb_contains", "#jsonb_contained" { if n == 2 { return jsonbContainsFn } }
+        "#jsonb_has", "#jsonb_has_any", "#jsonb_has_all" { if n == 2 { return jsonbHasFn } }
+        "#jsonb_concat" { if n == 2 { return jsonbConcatFn } }
+        "#jsonb_del" { if n == 2 || n == 3 { return jsonbDelFn } }
+        "#jsonb_del_path" { if n == 2 { return jsonbDelPathFn } }
+        "#jsonb_path_exists_op" { if n == 2 { return jsonbPathExistsOpFn } }
+        "#jsonb_path_match_op" { if n == 2 { return jsonbPathMatchOpFn } }
+        "#jsonb_cmp" { if n == 2 { return jsonbCmpFn } }
+        "#is_json" { if n == 3 { return isJsonFn } }
+        "#tsql_isjson" { if n == 2 { return tsqlIsJsonFn } }
+        "#json_value" { if n >= 7 { return sqlJsonValueFn } }
+        "#tsql_json_value" { if n == 2 { return tsqlJsonValueFn } }
+        "#json_query" { if n >= 9 { return sqlJsonQueryFn } }
+        "#tsql_json_query" { if n == 2 { return tsqlJsonQueryFn } }
+        "#json_exists" { if n >= 3 { return sqlJsonExistsFn } }
+        "#tsql_json_path_exists" { if n == 2 { return tsqlJsonPathExistsFn } }
+        "#tsql_json_contains" { if n == 2 || n == 3 { return tsqlJsonContainsFn } }
+        "#json_object", "#json_object_t" { if n >= 3 { return sqlJsonObjectFn } }
+        "#json_array", "#json_array_t" { if n >= 2 { return sqlJsonArrayFn } }
+        "#json_scalar", "#json_scalar_t" { if n == 1 || n == 2 { return sqlJsonScalarFn } }
+        "#json_serialize" { if n == 2 { return sqlJsonSerializeFn } }
+        "#json_ctor" { if n == 3 { return sqlJsonCtorFn } }
+        "#json_mergepatch" { if n == 3 { return sqlJsonMergePatchFn } }
+        "#json_equal" { if n == 2 { return sqlJsonEqualFn } }
+        "#json_modify", "#json_modify_t" { if n == 3 || n == 4 { return sqlJsonModifyFn } }
+        "#json_transform", "#json_transform_t" { if n >= 1 { return sqlJsonTransformFn } }
         "pg_type_is_visible", "pg_function_is_visible", "pg_collation_is_visible" { if n == 1 { return visibleFn } }
         "obj_description", "col_description", "shobj_description", "pg_get_triggerdef", "pg_get_ruledef", "pg_get_statisticsobjdef_columns" { return nullFn }
         "pg_get_expr" { if n == 2 || n == 3 { return getExprFn } }
@@ -2348,17 +2397,424 @@ fn jsonText(v: &Val): str {
     }
 }
 
-fn jsonObjectFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+fn parseOidsCsv(s: &str): []int {
+    var out: []int = []
+    if len(s) == 0 { return out }
+    for p in strings.split(s, ",") {
+        append(mut &out, lexdb_base.num(&p))
+    }
+    return out
+}
+
+fn jsonBuildObjFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
     let n = len(vs)
     if n % 2 != 0 { return Err(e("22023", "argument list must have even number of elements")) }
-    var parts: []str = []
+    var ks: []Val = []
+    var vals: []Val = []
+    var oids: []int = []
     var k = 0
     while k < n {
-        if lexdb_ops.isNull(&vs[k]) { return Err(e("22004", "null value not allowed for object key")) }
-        append(mut &parts, jsonText(&Val.Text(lexdb_sql.text(&vs[k]))) + " : " + jsonText(&vs[k + 1]))
+        append(mut &ks, vs[k].clone())
+        append(mut &vals, vs[k + 1].clone())
+        append(mut &oids, lexdb_ops.kindOid(&vs[k + 1]))
         k += 2
     }
-    return Ok(Val.Text("{" + strings.join(&parts, ", ") + "}"))
+    if name == "jsonb_build_object" { return lexdb_json.jsonObjectBuild(&ks, &vals, &oids, false, false, true, z) }
+    return lexdb_json.jsonObjectBuildPg(&ks, &vals, &oids, z)
+}
+
+fn jsonBuildObjTypedFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if len(vs) < 1 { return Err(e("22023", "invalid json_build_object call")) }
+    let oids = parseOidsCsv(&lexdb_sql.text(&vs[0]))
+    let n = len(vs) - 1
+    if n % 2 != 0 { return Err(e("22023", "argument list must have even number of elements")) }
+    var ks: []Val = []
+    var vals: []Val = []
+    var k = 0
+    while k < n {
+        append(mut &ks, vs[1 + k].clone())
+        append(mut &vals, vs[1 + k + 1].clone())
+        k += 2
+    }
+    if name == "#jsonb_build_object" { return lexdb_json.jsonObjectBuild(&ks, &vals, &oids, false, false, true, z) }
+    return lexdb_json.jsonObjectBuildPg(&ks, &vals, &oids, z)
+}
+
+fn jsonBuildArrFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    var oids: []int = []
+    for v in vs { append(mut &oids, lexdb_ops.kindOid(v)) }
+    return lexdb_json.jsonArrayBuild(vs, &oids, false, name == "jsonb_build_array", z)
+}
+
+fn jsonBuildArrTypedFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if len(vs) < 1 { return Err(e("22023", "invalid json_build_array call")) }
+    let oids = parseOidsCsv(&lexdb_sql.text(&vs[0]))
+    var vals: []Val = []
+    for i in 1..len(vs) { append(mut &vals, vs[i].clone()) }
+    return lexdb_json.jsonArrayBuild(&vals, &oids, false, name == "#jsonb_build_array", z)
+}
+
+fn toJsonFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if len(vs) < 1 { return Err(e("42883", &(name + " takes 1 argument"))) }
+    if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
+    let oid = lexdb_ops.kindOid(&vs[0])
+    let j = lexdb_json.valToJson(&vs[0], oid, z)
+    if name == "array_to_json" && len(vs) >= 2 && lexdb_ops.truth(&vs[1]).unwrapOr(false) {
+        return Ok(Val.Text(lexdb_json.formatPretty(&j)))
+    }
+    return Ok(Val.Text(lexdb_json.formatOut(&j, name == "to_jsonb")))
+}
+
+fn toJsonTypedFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if len(vs) < 2 { return Err(e("42883", &(name + " takes 2 arguments"))) }
+    if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
+    let oid = match vs[1] { Val.Int(x) { x } else { lexdb_ops.kindOid(&vs[0]) } }
+    let j = lexdb_json.valToJson(&vs[0], oid, z)
+    if name == "#array_to_json" && len(vs) >= 3 && lexdb_ops.truth(&vs[2]).unwrapOr(false) {
+        return Ok(Val.Text(lexdb_json.formatPretty(&j)))
+    }
+    return Ok(Val.Text(lexdb_json.formatOut(&j, name == "#to_jsonb")))
+}
+
+fn jsonTypeofFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return lexdb_json.jsonTypeof(&vs[0])
+}
+
+fn jsonArrLenFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return lexdb_json.jsonArrayLength(&vs[0])
+}
+
+fn jsonExtractPathFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
+    var keys: []str = []
+    for i in 1..len(vs) {
+        if lexdb_ops.isNull(&vs[i]) { return Ok(Val.Null) }
+        append(mut &keys, lexdb_sql.text(&vs[i]))
+    }
+    let asText = strings.endsWith(name, "_text")
+    let jsonb = strings.startsWith(name, "jsonb_")
+    return lexdb_json.extractPathKeys(&lexdb_sql.text(&vs[0]), &keys, asText, jsonb)
+}
+
+fn jsonStripNullsFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let inArr = if len(vs) >= 2 { lexdb_ops.truth(&vs[1]).unwrapOr(false) } else { false }
+    return lexdb_json.jsonStripNulls(&vs[0], inArr, name == "jsonb_strip_nulls")
+}
+
+fn jsonbSetFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let cm = if len(vs) >= 4 { lexdb_ops.truth(&vs[3]).unwrapOr(true) } else { true }
+    return lexdb_json.jsonbSet(&vs[0], &vs[1], &vs[2], cm)
+}
+
+fn jsonbInsertFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let after = if len(vs) >= 4 { lexdb_ops.truth(&vs[3]).unwrapOr(false) } else { false }
+    return lexdb_json.jsonbInsert(&vs[0], &vs[1], &vs[2], after)
+}
+
+fn jsonbPrettyFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
+    let j = try lexdb_json.parse(&lexdb_sql.text(&vs[0]), true)
+    return Ok(Val.Text(lexdb_json.formatPretty(&j)))
+}
+
+fn pgJsonObjFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
+    let jsonb = name == "jsonb_object"
+    var ks: []Val = []
+    var vals: []Val = []
+    var oids: []int = []
+    if len(vs) == 1 {
+        let parts = try lexdb_ops.arrayParts(&lexdb_sql.text(&vs[0]))
+        if len(parts) % 2 != 0 { return Err(e("22023", "array must have even number of elements")) }
+        var i = 0
+        while i < len(parts) {
+            match parts[i] {
+                Some(k) { append(mut &ks, Val.Text(k.clone())) }
+                None { return Err(e("22004", "null value not allowed for object key")) }
+            }
+            match parts[i + 1] {
+                Some(v) { append(mut &vals, Val.Text(v.clone())) }
+                None { append(mut &vals, Val.Null) }
+            }
+            append(mut &oids, lexdb_sql.OID_TEXT)
+            i += 2
+        }
+    } else {
+        if lexdb_ops.isNull(&vs[1]) { return Ok(Val.Null) }
+        let kp = try lexdb_ops.arrayParts(&lexdb_sql.text(&vs[0]))
+        let vp = try lexdb_ops.arrayParts(&lexdb_sql.text(&vs[1]))
+        if len(kp) != len(vp) { return Err(e("2202E", "mismatched array dimensions")) }
+        for i in 0..len(kp) {
+            match kp[i] {
+                Some(k) { append(mut &ks, Val.Text(k.clone())) }
+                None { return Err(e("22004", "null value not allowed for object key")) }
+            }
+            match vp[i] {
+                Some(v) { append(mut &vals, Val.Text(v.clone())) }
+                None { append(mut &vals, Val.Null) }
+            }
+            append(mut &oids, lexdb_sql.OID_TEXT)
+        }
+    }
+    return lexdb_json.jsonObjectBuild(&ks, &vals, &oids, false, false, jsonb, z)
+}
+
+fn jsonbPathExistsFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let vars = if len(vs) >= 3 { vs[2].clone() } else { Val.Null }
+    let silent = if len(vs) >= 4 { lexdb_ops.truth(&vs[3]).unwrapOr(false) } else { false }
+    return lexdb_json.jsonbPathExists(&vs[0], &vs[1], &vars, silent, z)
+}
+
+fn jsonbPathMatchFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let vars = if len(vs) >= 3 { vs[2].clone() } else { Val.Null }
+    let silent = if len(vs) >= 4 { lexdb_ops.truth(&vs[3]).unwrapOr(false) } else { false }
+    return lexdb_json.jsonbPathMatch(&vs[0], &vs[1], &vars, silent, z)
+}
+
+fn jsonbPathQueryFirstFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let vars = if len(vs) >= 3 { vs[2].clone() } else { Val.Null }
+    let silent = if len(vs) >= 4 { lexdb_ops.truth(&vs[3]).unwrapOr(false) } else { false }
+    return lexdb_json.jsonbPathQueryFirst(&vs[0], &vs[1], &vars, silent, z)
+}
+
+fn jsonbPathQueryArrFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let vars = if len(vs) >= 3 { vs[2].clone() } else { Val.Null }
+    let silent = if len(vs) >= 4 { lexdb_ops.truth(&vs[3]).unwrapOr(false) } else { false }
+    return lexdb_json.jsonbPathQueryArray(&vs[0], &vs[1], &vars, silent, z)
+}
+
+fn jsonArrElemSrfFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let jsonb = name == "jsonb_array_elements" || name == "jsonb_array_elements_text"
+    let asText = name == "json_array_elements_text" || name == "jsonb_array_elements_text"
+    let rows = try lexdb_json.arrayElemRows(&vs[0], asText, jsonb)
+    var out: []Val = []
+    for r in rows { append(mut &out, r[0].clone()) }
+    return Ok(srfMark(&out))
+}
+
+fn jsonObjKeysSrfFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let rows = try lexdb_json.objectKeyRows(&vs[0], name == "jsonb_object_keys")
+    var out: []Val = []
+    for r in rows { append(mut &out, r[0].clone()) }
+    return Ok(srfMark(&out))
+}
+
+fn jsonbPathQuerySrfFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let vars = if len(vs) >= 3 { vs[2].clone() } else { Val.Null }
+    let silent = if len(vs) >= 4 { lexdb_ops.truth(&vs[3]).unwrapOr(false) } else { false }
+    let rows = try lexdb_json.jsonbPathQueryRows(&vs[0], &vs[1], &vars, silent, z)
+    var out: []Val = []
+    for r in rows { append(mut &out, r[0].clone()) }
+    return Ok(srfMark(&out))
+}
+
+fn jsonArrowFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return lexdb_json.arrow(&vs[0], &vs[1], name == "#json_arrow_text", name == "#jsonb_arrow")
+}
+
+fn jsonHashFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return lexdb_json.hashArrow(&vs[0], &vs[1], name == "#json_hash_text", name == "#jsonb_hash")
+}
+
+fn jsonbContainsFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if name == "#jsonb_contained" { return lexdb_json.contains(&vs[1], &vs[0]) }
+    return lexdb_json.contains(&vs[0], &vs[1])
+}
+
+fn jsonbHasFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if name == "#jsonb_has" { return lexdb_json.hasKey(&vs[0], &vs[1]) }
+    if name == "#jsonb_has_any" { return lexdb_json.hasAnyKey(&vs[0], &vs[1]) }
+    return lexdb_json.hasAllKeys(&vs[0], &vs[1])
+}
+
+fn jsonbConcatFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return lexdb_json.concatJsonb(&vs[0], &vs[1])
+}
+
+fn jsonbDelFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let isArr = if len(vs) >= 3 { match vs[2] { Val.Int(x) { x != 0 } else { false } } } else { false }
+    return lexdb_json.deleteKey(&vs[0], &vs[1], isArr)
+}
+
+fn jsonbDelPathFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return lexdb_json.deletePath(&vs[0], &vs[1])
+}
+
+fn jsonbPathExistsOpFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return lexdb_json.jsonbPathExists(&vs[0], &vs[1], &Val.Null, false, z)
+}
+
+fn jsonbPathMatchOpFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return lexdb_json.jsonbPathMatch(&vs[0], &vs[1], &Val.Null, false, z)
+}
+
+fn jsonbCmpFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) || lexdb_ops.isNull(&vs[1]) { return Ok(Val.Null) }
+    return Ok(Val.Int(lexdb_json.jsonbCmp(&lexdb_sql.text(&vs[0]), &lexdb_sql.text(&vs[1]))))
+}
+
+fn isJsonFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let kind = lexdb_sql.text(&vs[1])
+    let uniq = match vs[2] { Val.Int(x) { x != 0 } else { false } }
+    return lexdb_json.isJson(&vs[0], &kind, uniq, false)
+}
+
+fn tsqlIsJsonFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return lexdb_json.tsqlIsJson(&vs[0], &lexdb_sql.text(&vs[1]))
+}
+
+fn passVarsFrom(vs: &[]Val, start: int): []lexdb_json.PassVar {
+    var out: []lexdb_json.PassVar = []
+    var i = start
+    while i + 1 < len(vs) {
+        append(mut &out, lexdb_json.PassVar{name: lexdb_sql.text(&vs[i]), val: vs[i + 1].clone(), oid: lexdb_ops.kindOid(&vs[i + 1])})
+        i += 2
+    }
+    return out
+}
+
+fn sqlJsonValueFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let onEmpty = match vs[2] { Val.Int(x) { x } else { 0 } }
+    let onErr = match vs[4] { Val.Int(x) { x } else { 0 } }
+    let retOid = match vs[6] { Val.Int(x) { x } else { 0 } }
+    let passing = passVarsFrom(vs, 7)
+    let v = try lexdb_json.jsonValue(&vs[0], &vs[1], &passing, onEmpty, &vs[3], onErr, &vs[5], z)
+    if retOid != 0 && !lexdb_ops.isNull(&v) {
+        let ty = lexdb_sql.oidType(retOid)
+        match lexdb_ops.coerceZ(v.clone(), &ty, z) {
+            Ok(cv) { return Ok(cv) }
+            Err(er) {
+                if onErr == lexdb_json.ON_NULL { return Ok(Val.Null) }
+                if onErr == lexdb_json.ON_DEFAULT { return lexdb_ops.coerceZ(vs[5].clone(), &ty, z) }
+                return Err(er)
+            }
+        }
+    }
+    return Ok(v)
+}
+
+fn tsqlJsonValueFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return lexdb_json.tsqlJsonValue(&vs[0], &vs[1], z)
+}
+
+fn sqlJsonQueryFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let wrapper = match vs[2] { Val.Int(x) { x } else { 0 } }
+    let quotes = match vs[3] { Val.Int(x) { x } else { 0 } }
+    let onEmpty = match vs[4] { Val.Int(x) { x } else { 0 } }
+    let onErr = match vs[6] { Val.Int(x) { x } else { 0 } }
+    let jsonb = match vs[8] { Val.Int(x) { x != 0 } else { false } }
+    let passing = passVarsFrom(vs, 9)
+    return lexdb_json.jsonQuery(&vs[0], &vs[1], &passing, wrapper, quotes, onEmpty, &vs[5], onErr, &vs[7], jsonb, z)
+}
+
+fn tsqlJsonQueryFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return lexdb_json.tsqlJsonQuery(&vs[0], &vs[1], z)
+}
+
+fn sqlJsonExistsFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let onErr = match vs[2] { Val.Int(x) { x } else { lexdb_json.ON_FALSE } }
+    let passing = passVarsFrom(vs, 3)
+    return lexdb_json.jsonExists(&vs[0], &vs[1], &passing, onErr, z)
+}
+
+fn tsqlJsonPathExistsFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    return lexdb_json.tsqlJsonPathExists(&vs[0], &vs[1], z)
+}
+
+fn tsqlJsonContainsFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let p = if len(vs) >= 3 { vs[2].clone() } else { Val.Null }
+    return lexdb_json.tsqlJsonContains(&vs[0], &vs[1], &p, z)
+}
+
+fn sqlJsonObjectFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let typed = name == "#json_object_t"
+    let absent = match vs[0] { Val.Int(x) { x != 0 } else { false } }
+    let uniq = match vs[1] { Val.Int(x) { x != 0 } else { false } }
+    let jsonb = match vs[2] { Val.Int(x) { x != 0 } else { false } }
+    let end = if typed { len(vs) - 1 } else { len(vs) }
+    var oids: []int = if typed { parseOidsCsv(&lexdb_sql.text(&vs[end])) } else { [] }
+    var ks: []Val = []
+    var vals: []Val = []
+    var i = 3
+    while i + 1 < end {
+        append(mut &ks, vs[i].clone())
+        append(mut &vals, vs[i + 1].clone())
+        if !typed { append(mut &oids, lexdb_ops.kindOid(&vs[i + 1])) }
+        i += 2
+    }
+    return lexdb_json.jsonObjectBuild(&ks, &vals, &oids, absent, uniq, jsonb, z)
+}
+
+fn sqlJsonArrayFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let typed = name == "#json_array_t"
+    let absent = match vs[0] { Val.Int(x) { x != 0 } else { true } }
+    let jsonb = match vs[1] { Val.Int(x) { x != 0 } else { false } }
+    let end = if typed { len(vs) - 1 } else { len(vs) }
+    var oids: []int = if typed { parseOidsCsv(&lexdb_sql.text(&vs[end])) } else { [] }
+    var vals: []Val = []
+    for i in 2..end {
+        append(mut &vals, vs[i].clone())
+        if !typed { append(mut &oids, lexdb_ops.kindOid(&vs[i])) }
+    }
+    return lexdb_json.jsonArrayBuild(&vals, &oids, absent, jsonb, z)
+}
+
+fn sqlJsonScalarFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let oid = if len(vs) >= 2 { match vs[1] { Val.Int(x) { x } else { lexdb_ops.kindOid(&vs[0]) } } } else { lexdb_ops.kindOid(&vs[0]) }
+    return lexdb_json.jsonScalar(&vs[0], oid, z)
+}
+
+fn sqlJsonSerializeFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let pretty = match vs[1] { Val.Int(x) { x != 0 } else { false } }
+    return lexdb_json.jsonSerialize(&vs[0], pretty)
+}
+
+fn sqlJsonCtorFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) { return Ok(Val.Null) }
+    let uniq = match vs[1] { Val.Int(x) { x != 0 } else { false } }
+    let s = lexdb_sql.text(&vs[0])
+    let v = try lexdb_json.validate(&s, false)
+    if uniq {
+        if !(try lexdb_json.checkUniqueKeys(&s)) { return Err(e("22030", "duplicate JSON object key value")) }
+    }
+    return Ok(Val.Text(v))
+}
+
+fn sqlJsonMergePatchFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let pretty = match vs[2] { Val.Int(x) { x != 0 } else { false } }
+    let r = try lexdb_json.jsonMergePatch(&vs[0], &vs[1], false)
+    if pretty && !lexdb_ops.isNull(&r) { return lexdb_json.jsonSerialize(&r, true) }
+    return Ok(r)
+}
+
+fn sqlJsonEqualFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if lexdb_ops.isNull(&vs[0]) || lexdb_ops.isNull(&vs[1]) { return Ok(Val.Null) }
+    return Ok(Val.Bool(try lexdb_json.jsonEqual(&lexdb_sql.text(&vs[0]), &lexdb_sql.text(&vs[1]))))
+}
+
+fn sqlJsonModifyFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let valOid = if len(vs) >= 4 { match vs[3] { Val.Int(x) { x } else { lexdb_ops.kindOid(&vs[2]) } } } else { lexdb_ops.kindOid(&vs[2]) }
+    return lexdb_json.jsonModify(&vs[0], &vs[1], &vs[2], valOid, z)
+}
+
+fn sqlJsonTransformFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    let typed = name == "#json_transform_t"
+    let end = if typed { len(vs) - 1 } else { len(vs) }
+    let oids = if typed { parseOidsCsv(&lexdb_sql.text(&vs[end])) } else { [] }
+    var tOps: []lexdb_json.TransformOp = []
+    var i = 1
+    var k = 0
+    while i + 2 < end {
+        append(mut &tOps, lexdb_json.TransformOp{
+            kind: lexdb_sql.text(&vs[i]),
+            path: lexdb_sql.text(&vs[i + 1]),
+            val: vs[i + 2].clone(),
+            oid: if typed && k < len(oids) { oids[k] } else { lexdb_ops.kindOid(&vs[i + 2]) },
+        })
+        i += 3
+        k += 1
+    }
+    return lexdb_json.jsonTransform(&vs[0], &tOps, false, z)
 }
 
 // ---- math (9.79)

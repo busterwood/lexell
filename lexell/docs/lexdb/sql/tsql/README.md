@@ -111,7 +111,7 @@ Triggers, synonyms, cursors (`DECLARE CURSOR`, `FETCH`), `WAITFOR`, `GOTO`, `DEN
 | [Character types](data-types-character.md) | `char(n)`, `varchar(n | max)`, `nchar(n)`, `nvarchar(n | max)`, `text`, `ntext`, `sysname` |
 | [Binary types](data-types-binary.md) | `binary(n)`, `varbinary(n | max)`, `image`, `rowversion` |
 | [Date and time types](data-types-datetime.md) | `date`, `time(p)`, `datetime`, `smalldatetime`, `datetime2(p)`, `datetimeoffset(p)` |
-| [Other types](data-types-other.md) | `bit`, `uniqueidentifier`, `xml` (as text), `sql_variant`, table types |
+| [Other types](data-types-other.md) | `bit`, `uniqueidentifier`, `json`, `xml` (as text), `sql_variant`, table types |
 
 Not available: `hierarchyid`, `geography`, `geometry`, `cursor`, CLR types.
 
@@ -126,14 +126,15 @@ Not available: `hierarchyid`, `geography`, `geometry`, `cursor`, CLR types.
 | [Logical functions and CASE](functions-logical.md) | `IIF`, `CHOOSE`, `ISNULL`, `COALESCE`, `NULLIF`, `GREATEST`, `LEAST`, `CASE` |
 | [Conversion functions](functions-conversion.md) | `CAST`, `CONVERT` (with styles), `TRY_CAST`, `TRY_CONVERT` |
 | [Date and time functions](functions-datetime.md) | `GETDATE`, `GETUTCDATE`, `SYSDATETIME`, `SYSUTCDATETIME`, `SYSDATETIMEOFFSET`, `CURRENT_TIMESTAMP`, `DATEADD`, `DATEDIFF`, `DATEDIFF_BIG`, `DATEPART`, `DATENAME`, `YEAR`, `MONTH`, `DAY`, `EOMONTH`, `DATEFROMPARTS`, `DATETRUNC`, `DATE_BUCKET`, `SWITCHOFFSET`, `TODATETIMEOFFSET`, `AT TIME ZONE` |
-| [Aggregate functions](functions-aggregate.md) | `COUNT`, `COUNT_BIG`, `SUM`, `AVG`, `MIN`, `MAX`, `STRING_AGG`, `PRODUCT`, `APPROX_PERCENTILE_CONT`, `APPROX_PERCENTILE_DISC` |
+| [Aggregate functions](functions-aggregate.md) | `COUNT`, `COUNT_BIG`, `SUM`, `AVG`, `MIN`, `MAX`, `STRING_AGG`, `PRODUCT`, `APPROX_PERCENTILE_CONT`, `APPROX_PERCENTILE_DISC`, `JSON_ARRAYAGG`, `JSON_OBJECTAGG` |
+| [JSON, OPENJSON and FOR JSON](functions-json.md) | `json`, `ISJSON`, `IS JSON`, `JSON_VALUE`, `JSON_QUERY`, `JSON_PATH_EXISTS`, `JSON_EXISTS`, `JSON_MODIFY`, `JSON_CONTAINS`, `JSON_OBJECT`, `JSON_ARRAY`, `JSON_ARRAYAGG`, `JSON_OBJECTAGG`, `OPENJSON`, `JSON_TABLE`, `FOR JSON PATH` / `AUTO` |
 | [Window functions](functions-window.md) | `ROW_NUMBER`, `RANK`, `DENSE_RANK`, `NTILE`, `PERCENT_RANK`, `CUME_DIST`, `LAG`, `LEAD`, `FIRST_VALUE`, `LAST_VALUE`, `NTH_VALUE`, `PERCENTILE_CONT`, `PERCENTILE_DISC`; see also [OVER](over.md) |
 | [System, identity, error and metadata functions](functions-system.md) | `@@ROWCOUNT`, `@@ERROR`, `@@TRANCOUNT`, `SCOPE_IDENTITY`, `@@IDENTITY`, `NEXT VALUE FOR`, `NEWID`, `ERROR_NUMBER` and the other error functions, `XACT_STATE`, `@@VERSION` and the other system variables, `SERVERPROPERTY`, `DB_NAME`, `OBJECT_ID`, `OBJECT_NAME`, `OBJECTPROPERTY`, `COLUMNPROPERTY`, `TYPE_NAME`, `USER_NAME`, `SUSER_SNAME`, `IS_MEMBER`, `HAS_PERMS_BY_NAME` and others |
 
 `GENERATE_SERIES` and inline table-valued functions are on [FROM](from.md) and [CREATE FUNCTION](create-function.md).
 
 Not available: `UNICODE`, `STDEV`, `STDEVP`, `VAR`, `VARP`, `ATN2`, `SOUNDEX`, `DIFFERENCE`, `STR`, `ISNUMERIC`,
-`ISDATE`, `HASHBYTES`, `CHECKSUM`, JSON functions (`JSON_VALUE`, `OPENJSON`), `STRING_SPLIT`, `PARSE`, `TRY_PARSE`,
+`ISDATE`, `HASHBYTES`, `CHECKSUM`, `STRING_SPLIT`, `PARSE`, `TRY_PARSE`,
 `RAND`, `IDENT_CURRENT`. The pages above show each one's error.
 
 ## Operators

@@ -15,6 +15,7 @@ import "./lexdb_ops"
 import "./lexdb_access"
 import "./lexdb_sort"
 import "./lexdb_pct"
+import "./lexdb_json"
 
 type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
@@ -35,6 +36,7 @@ pub type AggSpec = record {
     pub kind: int               // its argument's collation kind (L2): min, max and DISTINCT compare its keys
     pub op: int                 // fname as an OP_* (set by spec: what add dispatches on)
     pub dia: int                // lexdb_pct.DIA_*: the dialect whose types and errors percentile_cont and percentile_disc give
+    pub valOid: int             // for OP_JSON_ARRAY / OP_JSON_OBJ: value expression's OID (preserves nested JSON/arrays)
 }
 
 pub const OP_COUNT = 0
@@ -51,6 +53,8 @@ pub const OP_PRODUCT = 10           // T-SQL's PRODUCT
 pub const OP_BITS = 11              // bit_and, bit_or, bit_xor (Oracle's BIT_AND_AGG, ...)
 pub const OP_ANY = 12               // any_value
 pub const OP_MOMENT = 13            // Oracle's KURTOSIS_POP / _SAMP, SKEWNESS_POP / _SAMP
+pub const OP_JSON_ARRAY = 14        // json_agg, jsonb_agg, json_arrayagg, jsonb_arrayagg
+pub const OP_JSON_OBJ = 15          // json_object_agg, jsonb_object_agg, json_objectagg, jsonb_objectagg
 
 fn opOf(f: &str): int {
     if f == "count" { return OP_COUNT }
@@ -66,13 +70,15 @@ fn opOf(f: &str): int {
     if f == "bit_and" || f == "bit_or" || f == "bit_xor" { return OP_BITS }
     if f == "any_value" { return OP_ANY }
     if strings.startsWith(f, "#kurtosis") || strings.startsWith(f, "#skewness") { return OP_MOMENT }
+    if f == "json_agg" || f == "jsonb_agg" || strings.startsWith(f, "json_arrayagg") || strings.startsWith(f, "jsonb_arrayagg") { return OP_JSON_ARRAY }
+    if f == "json_object_agg" || f == "jsonb_object_agg" || strings.startsWith(f, "json_objectagg") || strings.startsWith(f, "jsonb_objectagg") { return OP_JSON_OBJ }
     return OP_VAR
 }
 
 // A call's spec.
 pub fn spec(fname: str, args: []Expr, star: bool, distinct: bool, filter: Option[Expr], order: []Expr, dirs: str, text: str, kind: int): AggSpec {
     let op = opOf(&fname)
-    return AggSpec{fname: fname, args: args, star: star, distinct: distinct, filter: filter, order: order, dirs: dirs, text: text, kind: kind, op: op, dia: lexdb_pct.DIA_PG}
+    return AggSpec{fname: fname, args: args, star: star, distinct: distinct, filter: filter, order: order, dirs: dirs, text: text, kind: kind, op: op, dia: lexdb_pct.DIA_PG, valOid: 0}
 }
 
 pub type Acc = record {
@@ -108,17 +114,21 @@ pub fn extras(sp: &AggSpec): int {
 // Whether a call reads its second argument with each row (as a value besides
 // its first): string_agg's separator, a percentile's fraction. The engines
 // give it to add as more[0].
-pub fn hasSep(sp: &AggSpec): bool { return sp.op == OP_STRING || sp.op == OP_PCT }
+pub fn hasSep(sp: &AggSpec): bool { return sp.op == OP_STRING || sp.op == OP_PCT || sp.op == OP_JSON_OBJ }
 
 // Whether a percentile call's ORDER BY is descending (its dirs: a, A, d, D).
 fn pctDesc(sp: &AggSpec): bool { return len(sp.dirs) > 0 && (sp.dirs[0] == 'd' || sp.dirs[0] == 'D') }
+
+fn jsonArrKeepsNull(f: &str): bool { return f == "json_agg" || f == "jsonb_agg" || f == "json_arrayagg_null" || f == "jsonb_arrayagg_null" }
 
 // Whether the value v of a row is accumulated: not a NULL (array_agg keeps
 // them, as elements), and for DISTINCT not one seen in this accumulator
 // (it is now).
 pub fn admit(sp: &AggSpec, acc: mut &Acc, v: &Val): bool {
     match v {
-        Val.Null { if sp.op != OP_ARRAY { return false } }
+        Val.Null {
+            if sp.op != OP_ARRAY && sp.op != OP_JSON_OBJ && !(sp.op == OP_JSON_ARRAY && jsonArrKeepsNull(&sp.fname)) { return false }
+        }
         else {}
     }
     if sp.distinct {
@@ -194,6 +204,23 @@ pub fn add(sp: &AggSpec, acc: mut &Acc, v: Val, more: []Val): Result[Unit, DbErr
         try lexdb_pct.checkValue(sp.dia, f, &v)
         if acc.n == 0 { acc.sum = more[0].clone() }
         append(mut &acc.seps, v)
+    } else if op == OP_JSON_ARRAY {
+        append(mut &acc.seps, v)
+        append(mut &acc.parts, "")
+        if len(sp.dirs) > 0 { append(mut &acc.ords, more) }
+    } else if op == OP_JSON_OBJ {
+        if lexdb_ops.isNull(&v) { return Err(e("22004", "field name must not be null")) }
+        let val = &more[0]
+        let absent = strings.contains(f, "_abs")
+        if absent && lexdb_ops.isNull(val) { return Ok(Unit{}) }
+        let k = lexdb_sql.text(&v)
+        let uniq = strings.contains(f, "_uniq")
+        if uniq {
+            if acc.seen.has(&k) { return Err(e("22030", &("duplicate JSON object key value: \"" + k + "\""))) }
+            acc.seen.put(k.clone(), 1)
+        }
+        append(mut &acc.parts, k)
+        append(mut &acc.seps, val.clone())
     } else if op >= OP_PRODUCT {
         try addNew(sp, acc, v)
         return Ok(Unit{})
@@ -326,6 +353,30 @@ fn orderIdx(sp: &AggSpec, acc: &Acc): Result[[]int, DbErr] {
 pub fn finish(sp: &AggSpec, acc: &Acc): Result[Val, DbErr] {
     let f = &sp.fname
     if f == "count" { return Ok(Val.Int(acc.n)) }
+    if sp.op == OP_JSON_ARRAY {
+        if acc.n == 0 { return Ok(Val.Null) }
+        let idx = if len(sp.dirs) > 0 { try orderIdx(sp, acc) } else { [] }
+        var vals: []Val = []
+        if len(sp.dirs) > 0 { for i in idx { append(mut &vals, acc.seps[i].clone()) } } else { for v in acc.seps { append(mut &vals, v.clone()) } }
+        var oids: []int = []
+        let vo = if sp.valOid != 0 { sp.valOid } else { lexdb_sql.OID_TEXT }
+        for _ in 0..len(vals) { append(mut &oids, vo) }
+        let jsonb = strings.startsWith(f, "jsonb")
+        return lexdb_json.jsonArrayBuildUtc(&vals, &oids, false, jsonb)
+    }
+    if sp.op == OP_JSON_OBJ {
+        if acc.n == 0 { return Ok(Val.Null) }
+        var ks: []Val = []
+        var oids: []int = []
+        let vo = if sp.valOid != 0 { sp.valOid } else { lexdb_sql.OID_TEXT }
+        for i in 0..len(acc.parts) {
+            append(mut &ks, Val.Text(acc.parts[i].clone()))
+            append(mut &oids, vo)
+        }
+        let jsonb = strings.startsWith(f, "jsonb")
+        let uniq = strings.contains(f, "_uniq")
+        return lexdb_json.jsonObjectBuildUtc(&ks, &acc.seps, &oids, false, uniq, jsonb)
+    }
     if sp.op >= OP_PRODUCT { return finishNew(sp, acc) }
     if acc.n == 0 { return Ok(Val.Null) }
     if sp.op == OP_PCT {

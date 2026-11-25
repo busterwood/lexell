@@ -1,0 +1,2697 @@
+// lexdb_json: SQL/JSON (ISO/IEC 9075-2) and dialect-native JSON engine for all three doors
+// (PostgreSQL json/jsonb, SQL Server JSON / OPENJSON / FOR JSON, Oracle JSON / JSON_TABLE / JSON_TRANSFORM).
+//
+// Built on Lexell's RFC 8259 lib/json. JSON and JSONB values are stored as validated UTF-8 text (Val.Text)
+// under K_JSON (OID_JSON = 114, OID_JSONB = 3802): OID_JSON preserves original text; OID_JSONB canonicalizes
+// (deduplicating keys keeping the last value and sorting keys by length then lexicographically, as PostgreSQL jsonb).
+import "json"
+import "strings"
+import "collections"
+import "math"
+import "regex"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_time"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+type J = json.Json
+type JK = json.Kind
+
+// Error handling & wrapper constants shared with parser/executor.
+pub const ON_NULL = 0
+pub const ON_ERROR = 1
+pub const ON_DEFAULT = 2
+pub const ON_EMPTY_ARR = 3
+pub const ON_EMPTY_OBJ = 4
+pub const ON_TRUE = 5
+pub const ON_FALSE = 6
+
+pub const WRAP_NONE = 0
+pub const WRAP_UNCOND = 1
+pub const WRAP_COND = 2
+
+pub const QUOTES_KEEP = 0
+pub const QUOTES_OMIT = 1
+
+pub type PassVar = record {
+    pub name: str
+    pub val: Val
+    pub oid: int
+}
+
+fn e(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+fn badJson(s: &str, jsonb: bool): DbErr {
+    return e("22P02", &("invalid input syntax for type " + (if jsonb { "jsonb" } else { "json" }) + ": \"" + s[0..min(len(s), 80)] + "\""))
+}
+
+// ---- validation, canonicalization and comparison
+
+// Checks whether every object in raw JSON text s has unique keys (valid JSON assumed or checked here).
+pub fn checkUniqueKeys(s: &str): Result[bool, DbErr] {
+    var pos = 0
+    return scanUnique(s, mut &pos, 0)
+}
+
+fn skipWs(s: &str, pos: mut &int) {
+    let n = len(s)
+    while pos < n && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\n' || s[pos] == '\r') { pos += 1 }
+}
+
+fn scanJsonStr(s: &str, pos: mut &int): Result[str, DbErr] {
+    let n = len(s)
+    if pos >= n || s[pos] != '"' { return Err(e("22P02", "expected JSON string")) }
+    let start = pos + 0
+    pos += 1
+    while pos < n {
+        let c = s[pos]
+        if c == '\\' {
+            pos += 2
+            continue
+        }
+        if c == '"' {
+            pos += 1
+            let raw = s[start..pos].toStr()
+            match json.parse(&raw) {
+                Ok(jv) { return Ok(jv.asStr().unwrapOr("")) }
+                Err(er) { return Err(e("22P02", &er.toStr())) }
+            }
+        }
+        pos += 1
+    }
+    return Err(e("22P02", "unterminated JSON string"))
+}
+
+fn scanUnique(s: &str, pos: mut &int, depth: int): Result[bool, DbErr] {
+    if depth > 512 { return Err(e("22P02", "JSON nesting too deep")) }
+    skipWs(s, pos)
+    let n = len(s)
+    if pos >= n { return Err(e("22P02", "unexpected end of JSON")) }
+    let c = s[pos]
+    if c == '{' {
+        pos += 1
+        skipWs(s, pos)
+        if pos < n && s[pos] == '}' {
+            pos += 1
+            return Ok(true)
+        }
+        var seen: Map[str, int] = newMap()
+        var unique = true
+        while true {
+            skipWs(s, pos)
+            let k = try scanJsonStr(s, pos)
+            if seen.has(&k) { unique = false } else { seen.put(k, 1) }
+            skipWs(s, pos)
+            if pos >= n || s[pos] != ':' { return Err(e("22P02", "expected ':' in JSON object")) }
+            pos += 1
+            if !(try scanUnique(s, pos, depth + 1)) { unique = false }
+            skipWs(s, pos)
+            if pos < n && s[pos] == ',' {
+                pos += 1
+                continue
+            }
+            if pos < n && s[pos] == '}' {
+                pos += 1
+                return Ok(unique)
+            }
+            return Err(e("22P02", "expected ',' or '}' in JSON object"))
+        }
+    }
+    if c == '[' {
+        pos += 1
+        skipWs(s, pos)
+        if pos < n && s[pos] == ']' {
+            pos += 1
+            return Ok(true)
+        }
+        var unique = true
+        while true {
+            if !(try scanUnique(s, pos, depth + 1)) { unique = false }
+            skipWs(s, pos)
+            if pos < n && s[pos] == ',' {
+                pos += 1
+                continue
+            }
+            if pos < n && s[pos] == ']' {
+                pos += 1
+                return Ok(unique)
+            }
+            return Err(e("22P02", "expected ',' or ']' in JSON array"))
+        }
+    }
+    if c == '"' {
+        let _s = try scanJsonStr(s, pos)
+        return Ok(true)
+    }
+    // primitive (number, true, false, null)
+    while pos < n && s[pos] != ',' && s[pos] != ']' && s[pos] != '}' && s[pos] != ' ' && s[pos] != '\t' && s[pos] != '\n' && s[pos] != '\r' {
+        pos += 1
+    }
+    return Ok(true)
+}
+
+// Validates RFC 8259 JSON text; for jsonb returns canonical sorted-key form, for json returns input unchanged.
+pub fn validate(s: &str, jsonb: bool): Result[str, DbErr] {
+    match json.parse(s) {
+        Ok(j) {
+            if !jsonb { return Ok(s.toStr()) }
+            return Ok(formatJsonb(&j))
+        }
+        Err(_) { return Err(badJson(s, jsonb)) }
+    }
+}
+
+pub fn parse(s: &str, jsonb: bool): Result[J, DbErr] {
+    match json.parse(s) {
+        Ok(j) { return Ok(j) }
+        Err(_) { return Err(badJson(s, jsonb)) }
+    }
+}
+
+// PostgreSQL jsonb key order: shorter keys first, then byte-order lexicographical.
+fn cmpJsonbKey(a: &str, b: &str): int {
+    if len(a) != len(b) { return if len(a) < len(b) { -1 } else { 1 } }
+    return a.cmp(b)
+}
+
+fn sortKeysJsonb(ks: mut &[]str) {
+    collections.sortBy(ks, fn(a: &str, b: &str): int { return cmpJsonbKey(a, b) })
+}
+
+// Canonical PostgreSQL jsonb formatting: sorted keys, ", " and ": ".
+pub fn formatJsonb(j: &J): str {
+    var b = json.newBuf()
+    writeJsonbTo(mut &b, j)
+    return b.toStr()
+}
+
+fn writeJsonbTo(b: mut &json.Buf, j: &J) {
+    match j {
+        J.Null { b.write("null") }
+        J.Bool(v) { b.write(if v { "true" } else { "false" }) }
+        J.Num(n) { b.write(&json.formatNumber(&n, false)) }
+        J.Str(s) { json.writeString(b, &s, false) }
+        J.Arr(_) {
+            b.writeByte('[')
+            let items = j.items()
+            for i in 0..len(items) {
+                if i > 0 { b.write(", ") }
+                writeJsonbTo(b, &items[i])
+            }
+            b.writeByte(']')
+        }
+        J.Obj(_) {
+            b.writeByte('{')
+            var ks = j.keys()
+            sortKeysJsonb(mut &ks)
+            for i in 0..len(ks) {
+                if i > 0 { b.write(", ") }
+                json.writeString(b, &ks[i], false)
+                b.write(": ")
+                let v = j.field(&ks[i])
+                writeJsonbTo(b, &v)
+            }
+            b.writeByte('}')
+        }
+    }
+}
+
+pub fn formatCompact(j: &J): str { return json.write(j, &json.compact()) }
+pub fn formatPretty(j: &J): str { return json.write(j, &json.pretty()) }
+pub fn formatOut(j: &J, jsonb: bool): str { return if jsonb { formatJsonb(j) } else { formatCompact(j) } }
+
+// PostgreSQL jsonb total order: Null < String < Number < Bool < Array < Object.
+fn jsonbRank(j: &J): int {
+    match j.kind() {
+        JK.Null { return 0 }
+        JK.String { return 1 }
+        JK.Number { return 2 }
+        JK.Bool { return 3 }
+        JK.Array { return 4 }
+        JK.Object { return 5 }
+    }
+}
+
+pub fn cmpJsonVal(a: &J, b: &J): int {
+    let ra = jsonbRank(a)
+    let rb = jsonbRank(b)
+    if ra != rb { return if ra < rb { -1 } else { 1 } }
+    match a {
+        J.Null { return 0 }
+        J.Bool(x) {
+            let y = b.asBool().unwrapOr(false)
+            return if x == y { 0 } else if !x && y { -1 } else { 1 }
+        }
+        J.Num(x) {
+            let y = b.asNumber().unwrap()
+            return json.cmpNumbers(&x, &y)
+        }
+        J.Str(x) {
+            let y = b.asStr().unwrapOr("")
+            return x.cmp(&y)
+        }
+        J.Arr(_) {
+            let xs = a.items()
+            let ys = b.items()
+            if len(xs) != len(ys) { return if len(xs) < len(ys) { -1 } else { 1 } }
+            for i in 0..len(xs) {
+                let c = cmpJsonVal(&xs[i], &ys[i])
+                if c != 0 { return c }
+            }
+            return 0
+        }
+        J.Obj(_) {
+            var ks1 = a.keys()
+            var ks2 = b.keys()
+            if len(ks1) != len(ks2) { return if len(ks1) < len(ks2) { -1 } else { 1 } }
+            sortKeysJsonb(mut &ks1)
+            sortKeysJsonb(mut &ks2)
+            for i in 0..len(ks1) {
+                let ck = cmpJsonbKey(&ks1[i], &ks2[i])
+                if ck != 0 { return ck }
+                let va = a.field(&ks1[i])
+                let vb = b.field(&ks2[i])
+                let cv = cmpJsonVal(&va, &vb)
+                if cv != 0 { return cv }
+            }
+            return 0
+        }
+    }
+}
+
+pub fn jsonbCmp(a: &str, b: &str): int {
+    let ja = json.parse(a)
+    let jb = json.parse(b)
+    if ja.isOk() && jb.isOk() {
+        let xa = ja.unwrap()
+        let xb = jb.unwrap()
+        return cmpJsonVal(&xa, &xb)
+    }
+    return a.cmp(b)
+}
+
+pub fn jsonEqual(a: &str, b: &str): Result[bool, DbErr] {
+    let ja = try parse(a, false)
+    let jb = try parse(b, false)
+    return Ok(cmpJsonVal(&ja, &jb) == 0)
+}
+
+// ---- SQL Val <-> Json conversions
+
+pub fn valToJson(v: &Val, oid: int, z: &lexdb_time.Zone): J {
+    match v {
+        Val.Null { return json.null() }
+        Val.Bool(b) { return json.boolean(b) }
+        Val.Int(n) { return json.integer(n) }
+        Val.Num(d) { return json.decimal(d) }
+        Val.Float(x) {
+            if x != x || x == math.inf() || x == -math.inf() { return json.string(&lexdb_sql.text(v)) }
+            return json.number(x)
+        }
+        Val.Real(x) {
+            if x != x || x == math.inf() || x == -math.inf() { return json.string(&lexdb_sql.text(v)) }
+            return json.number(x)
+        }
+        Val.Tstz(u) { return json.string(&lexdb_time.fmtTstz(u, z)) }
+        Val.Tsz(u, _) { return json.string(&lexdb_time.fmtTstz(u, z)) }
+        Val.Text(t) {
+            if oid == lexdb_sql.OID_JSON || oid == lexdb_sql.OID_JSONB {
+                match json.parse(&t) {
+                    Ok(jv) { return jv }
+                    Err(_) { return json.string(&t) }
+                }
+            }
+            let el = lexdb_sql.elemOid(oid)
+            if el > 0 { return pgArrayToJson(&t, el) }
+            return json.string(&t)
+        }
+        else { return json.string(&lexdb_sql.text(v)) }
+    }
+}
+
+// Parses a PostgreSQL text-encoded 1-D array ({1,2,NULL}) into a Json array.
+fn pgArrayToJson(t: &str, elemOid: int): J {
+    let s = strings.trim(t)
+    if len(s) < 2 || s[0] != '{' || s[len(s) - 1] != '}' { return json.string(t) }
+    if len(s) == 2 { return json.emptyArray() }
+    var items: []J = []
+    var i = 1
+    let end = len(s) - 1
+    while i < end {
+        var quoted = false
+        var elem = ""
+        if s[i] == '"' {
+            quoted = true
+            i += 1
+            while i < end {
+                if s[i] == '\\' && i + 1 < end {
+                    elem.addByte(s[i + 1])
+                    i += 2
+                    continue
+                }
+                if s[i] == '"' {
+                    i += 1
+                    break
+                }
+                elem.addByte(s[i])
+                i += 1
+            }
+        } else {
+            let st = i
+            while i < end && s[i] != ',' { i += 1 }
+            elem = s[st..i].toStr()
+        }
+        if !quoted && strings.toUpperAscii(&elem) == "NULL" {
+            append(mut &items, json.null())
+        } else {
+            append(mut &items, scalarStrToJson(&elem, elemOid))
+        }
+        if i < end && s[i] == ',' { i += 1 }
+    }
+    return json.arrayOf(items)
+}
+
+fn scalarStrToJson(s: &str, oid: int): J {
+    if oid == lexdb_sql.OID_JSON || oid == lexdb_sql.OID_JSONB {
+        match json.parse(s) {
+            Ok(j) { return j }
+            Err(_) { return json.string(s) }
+        }
+    }
+    if oid == lexdb_sql.OID_BOOL { return json.boolean(s == "t" || s == "true") }
+    if oid == lexdb_sql.OID_INT2 || oid == lexdb_sql.OID_INT4 || oid == lexdb_sql.OID_INT8 || oid == lexdb_sql.OID_NUMERIC || oid == lexdb_sql.OID_OID ||
+       oid == lexdb_sql.OID_FLOAT4 || oid == lexdb_sql.OID_FLOAT8 {
+        match json.numberLiteral(s) {
+            Some(jn) { return jn }
+            None { return json.string(s) }
+        }
+    }
+    return json.string(s)
+}
+
+// Extracts scalar Json to unquoted SQL Val.Text (Val.Null for JSON null).
+pub fn scalarToTextVal(j: &J): Val {
+    match j {
+        J.Null { return Val.Null }
+        J.Bool(b) { return Val.Text(if b { "true" } else { "false" }) }
+        J.Num(n) { return Val.Text(json.formatNumber(&n, false)) }
+        J.Str(s) { return Val.Text(s.clone()) }
+        else { return Val.Text(formatCompact(j)) }
+    }
+}
+
+// ---- SQL/JSON Path Engine (ISO/IEC 9075-2 + PostgreSQL + SQL Server + Oracle)
+
+const PT_EOF = 0
+const PT_IDENT = 1
+const PT_STR = 2
+const PT_NUM = 3
+const PT_VAR = 4        // $name (not bare $)
+const PT_OP = 5
+
+type PTok = record { kind: int; text: str }
+
+fn lexPath(p: &str): Result[[]PTok, DbErr] {
+    var out: []PTok = []
+    var i = 0
+    let n = len(p)
+    while i < n {
+        let c = p[i]
+        if c == ' ' || c == '\t' || c == '\n' || c == '\r' { i += 1; continue }
+        if c == '"' || c == '\'' {
+            let q = c
+            i += 1
+            var b = ""
+            while i < n && p[i] != q {
+                if p[i] == '\\' && i + 1 < n {
+                    i += 1
+                    let e2 = p[i]
+                    if e2 == 'n' { b.addByte('\n') }
+                    else if e2 == 't' { b.addByte('\t') }
+                    else if e2 == 'r' { b.addByte('\r') }
+                    else if e2 == 'b' { b.addByte(byte(8)) }
+                    else if e2 == 'f' { b.addByte(byte(12)) }
+                    else if e2 == 'u' && i + 4 < n {
+                        let cp = parseHex4(&p[i + 1..i + 5])
+                        if cp >= 0 { json.addCodePoint(mut &b, cp); i += 4 } else { b.addByte(e2) }
+                    } else { b.addByte(e2) }
+                    i += 1
+                    continue
+                }
+                b.addByte(p[i])
+                i += 1
+            }
+            if i >= n { return Err(e("42601", "unterminated string in jsonpath")) }
+            i += 1
+            append(mut &out, PTok{kind: PT_STR, text: b})
+            continue
+        }
+        if c == '$' {
+            if i + 1 < n && isPathIdentStart(p[i + 1]) {
+                let st = i + 1
+                i += 1
+                while i < n && isPathIdentChar(p[i]) { i += 1 }
+                append(mut &out, PTok{kind: PT_VAR, text: p[st..i].toStr()})
+            } else {
+                i += 1
+                append(mut &out, PTok{kind: PT_OP, text: "$"})
+            }
+            continue
+        }
+        if c >= '0' && c <= '9' {
+            let st = i
+            while i < n && p[i] >= '0' && p[i] <= '9' { i += 1 }
+            if i < n && p[i] == '.' && i + 1 < n && p[i + 1] >= '0' && p[i + 1] <= '9' {
+                i += 1
+                while i < n && p[i] >= '0' && p[i] <= '9' { i += 1 }
+            }
+            if i < n && (p[i] == 'e' || p[i] == 'E') {
+                i += 1
+                if i < n && (p[i] == '+' || p[i] == '-') { i += 1 }
+                while i < n && p[i] >= '0' && p[i] <= '9' { i += 1 }
+            }
+            append(mut &out, PTok{kind: PT_NUM, text: p[st..i].toStr()})
+            continue
+        }
+        if isPathIdentStart(c) {
+            let st = i
+            while i < n && isPathIdentChar(p[i]) { i += 1 }
+            append(mut &out, PTok{kind: PT_IDENT, text: p[st..i].toStr()})
+            continue
+        }
+        // two-char ops
+        if i + 1 < n {
+            let two = p[i..i + 2]
+            if two == "==" || two == "!=" || two == "<>" || two == "<=" || two == ">=" || two == "&&" || two == "||" || two == ".." {
+                append(mut &out, PTok{kind: PT_OP, text: two.toStr()})
+                i += 2
+                continue
+            }
+        }
+        if strings.contains(".[]()@*?,+-/%!<>=", &p[i..i + 1]) {
+            append(mut &out, PTok{kind: PT_OP, text: p[i..i + 1].toStr()})
+            i += 1
+            continue
+        }
+        return Err(e("42601", &("invalid character in jsonpath: " + p[i..i + 1])))
+    }
+    append(mut &out, PTok{kind: PT_EOF, text: ""})
+    return Ok(out)
+}
+
+fn parseHex4(s: &str): int {
+    var v = 0
+    for i in 0..4 {
+        let c = s[i]
+        var d = -1
+        if c >= '0' && c <= '9' { d = int(c - '0') }
+        else if c >= 'a' && c <= 'f' { d = int(c - 'a') + 10 }
+        else if c >= 'A' && c <= 'F' { d = int(c - 'A') + 10 }
+        if d < 0 { return -1 }
+        v = v * 16 + d
+    }
+    return v
+}
+
+fn isPathIdentStart(c: byte): bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c >= 128 }
+fn isPathIdentChar(c: byte): bool { return isPathIdentStart(c) || (c >= '0' && c <= '9') }
+
+type PathCtx = record {
+    toks: []PTok
+    pos: int
+    strict: bool
+    root: J
+    vars: []PassVar
+    z: lexdb_time.Zone
+}
+
+fn (c: &PathCtx) peek(): &PTok { return &c.toks[c.pos] }
+fn (c: &PathCtx) at(k: int): &PTok { return &c.toks[min(c.pos + k, len(c.toks) - 1)] }
+fn (c: &PathCtx) isOp(o: &str): bool { return c.peek().kind == PT_OP && c.peek().text == o }
+fn (c: &PathCtx) isKw(w: &str): bool { return c.peek().kind == PT_IDENT && strings.toLowerAscii(&c.peek().text) == w }
+fn (c: mut &PathCtx) acceptOp(o: &str): bool { if c.isOp(o) { c.pos += 1; return true }; return false }
+fn (c: mut &PathCtx) acceptKw(w: &str): bool { if c.isKw(w) { c.pos += 1; return true }; return false }
+
+pub type PathRes = record {
+    pub items: []J
+    pub strict: bool
+}
+
+// Evaluates a SQL/JSON path expression against root with optional PASSING variables.
+pub fn evalPath(root: &J, path: &str, vars: &[]PassVar, z: &lexdb_time.Zone): Result[PathRes, DbErr] {
+    let toks = try lexPath(path)
+    var ctx = PathCtx{toks: toks, pos: 0, strict: false, root: root.clone(), vars: vars.clone(), z: z.clone()}
+    if ctx.acceptKw("strict") { ctx.strict = true } else { let _l = ctx.acceptKw("lax") }
+    let res = try evalPathExpr(mut &ctx, root, -1)
+    if ctx.peek().kind != PT_EOF { return Err(e("42601", &("unexpected token in jsonpath: " + ctx.peek().text))) }
+    return Ok(PathRes{items: res, strict: ctx.strict})
+}
+
+// Evaluates a jsonpath predicate (for jsonb @@ jsonpath and jsonb_path_match).
+pub fn evalPathPred(root: &J, path: &str, vars: &[]PassVar, z: &lexdb_time.Zone): Result[Option[bool], DbErr] {
+    let toks = try lexPath(path)
+    var ctx = PathCtx{toks: toks, pos: 0, strict: false, root: root.clone(), vars: vars.clone(), z: z.clone()}
+    if ctx.acceptKw("strict") { ctx.strict = true } else { let _l = ctx.acceptKw("lax") }
+    let r = try evalPredOr(mut &ctx, root, -1)
+    if ctx.peek().kind != PT_EOF {
+        // Might be a value expression returning boolean (e.g. "$.ok")
+        ctx.pos = 0
+        if ctx.acceptKw("strict") { ctx.strict = true } else { let _l = ctx.acceptKw("lax") }
+        let items = try evalPathExpr(mut &ctx, root, -1)
+        if ctx.peek().kind != PT_EOF { return Err(e("42601", &("unexpected token in jsonpath: " + ctx.peek().text))) }
+        if len(items) == 1 {
+            match items[0].asBool() {
+                Some(b) { return Ok(Some(b)) }
+                None { return Ok(None) }
+            }
+        }
+        return Ok(None)
+    }
+    return Ok(r)
+}
+
+fn evalPathExpr(ctx: mut &PathCtx, cur: &J, lastIdx: int): Result[[]J, DbErr] {
+    var left = try evalPathMul(ctx, cur, lastIdx)
+    while ctx.isOp("+") || ctx.isOp("-") {
+        let op = ctx.peek().text.clone()
+        ctx.pos += 1
+        let right = try evalPathMul(ctx, cur, lastIdx)
+        left = try pathArith(&op, &left, &right)
+    }
+    return Ok(left)
+}
+
+fn evalPathMul(ctx: mut &PathCtx, cur: &J, lastIdx: int): Result[[]J, DbErr] {
+    var left = try evalPathUnary(ctx, cur, lastIdx)
+    while ctx.isOp("*") || ctx.isOp("/") || ctx.isOp("%") {
+        let op = ctx.peek().text.clone()
+        ctx.pos += 1
+        let right = try evalPathUnary(ctx, cur, lastIdx)
+        left = try pathArith(&op, &left, &right)
+    }
+    return Ok(left)
+}
+
+fn evalPathUnary(ctx: mut &PathCtx, cur: &J, lastIdx: int): Result[[]J, DbErr] {
+    if ctx.acceptOp("-") {
+        let xs = try evalPathUnary(ctx, cur, lastIdx)
+        var out: []J = []
+        for x in xs {
+            match x.asDecimal() {
+                Some(d) { append(mut &out, json.decimal(-d)) }
+                None {
+                    match x.asFloat() {
+                        Some(f) { append(mut &out, json.number(-f)) }
+                        None { return Err(e("2203B", "non-numeric operand to unary minus in jsonpath")) }
+                    }
+                }
+            }
+        }
+        return Ok(out)
+    }
+    if ctx.acceptOp("+") { return evalPathUnary(ctx, cur, lastIdx) }
+    return evalPathPrimary(ctx, cur, lastIdx)
+}
+
+fn pathArith(op: &str, a: &[]J, b: &[]J): Result[[]J, DbErr] {
+    if len(a) != 1 || len(b) != 1 { return Err(e("2203B", "arithmetic operands in jsonpath must be single numbers")) }
+    let da = a[0].asDecimal()
+    let db = b[0].asDecimal()
+    if da.isSome() && db.isSome() {
+        let x = da.unwrap()
+        let y = db.unwrap()
+        if op == "+" { return Ok([json.decimal(x + y)]) }
+        if op == "-" { return Ok([json.decimal(x - y)]) }
+        if op == "*" { return Ok([json.decimal(x * y)]) }
+        if op == "/" {
+            if y == Decimal.fromInt(0) { return Err(e("22012", "division by zero in jsonpath")) }
+            match x.div(y, 16, Rounding.HALF_AWAY) {
+                Ok(q) { return Ok([json.decimal(q)]) }
+                Err(_) { return Ok([json.number(x.toFloat() / y.toFloat())]) }
+            }
+        }
+        if op == "%" {
+            if y == Decimal.fromInt(0) { return Err(e("22012", "division by zero in jsonpath")) }
+            let xi = a[0].asInt()
+            let yi = b[0].asInt()
+            if xi.isSome() && yi.isSome() { return Ok([json.integer(xi.unwrap() % yi.unwrap())]) }
+            let fx = x.toFloat()
+            let fy = y.toFloat()
+            return Ok([json.number(fx - float(int(fx / fy)) * fy)])
+        }
+    }
+    let fa = a[0].asFloat()
+    let fb = b[0].asFloat()
+    if fa.isNone() || fb.isNone() { return Err(e("2203B", "non-numeric operand in jsonpath")) }
+    let x = fa.unwrap()
+    let y = fb.unwrap()
+    if op == "+" { return Ok([json.number(x + y)]) }
+    if op == "-" { return Ok([json.number(x - y)]) }
+    if op == "*" { return Ok([json.number(x * y)]) }
+    if op == "/" {
+        if y == 0.0f { return Err(e("22012", "division by zero in jsonpath")) }
+        return Ok([json.number(x / y)])
+    }
+    if y == 0.0f { return Err(e("22012", "division by zero in jsonpath")) }
+    return Ok([json.number(x - float(int(x / y)) * y)])
+}
+
+fn evalPathPrimary(ctx: mut &PathCtx, cur: &J, lastIdx: int): Result[[]J, DbErr] {
+    var seq: []J = []
+    if ctx.acceptOp("$") {
+        append(mut &seq, ctx.root.clone())
+    } else if ctx.acceptOp("@") {
+        append(mut &seq, cur.clone())
+    } else if ctx.peek().kind == PT_VAR {
+        let vn = ctx.peek().text.clone()
+        ctx.pos += 1
+        var found = false
+        for pv in ctx.vars {
+            if strings.toLowerAscii(&pv.name) == strings.toLowerAscii(&vn) {
+                append(mut &seq, valToJson(&pv.val, pv.oid, &ctx.z))
+                found = true
+                break
+            }
+        }
+        if !found { return Err(e("22023", &("could not find jsonpath variable \"" + vn + "\""))) }
+    } else if ctx.acceptOp("(") {
+        seq = try evalPathExpr(ctx, cur, lastIdx)
+        if !ctx.acceptOp(")") { return Err(e("42601", "missing ')' in jsonpath")) }
+    } else if ctx.peek().kind == PT_STR {
+        append(mut &seq, json.string(&ctx.peek().text))
+        ctx.pos += 1
+    } else if ctx.peek().kind == PT_NUM {
+        let nt = ctx.peek().text.clone()
+        ctx.pos += 1
+        match json.numberLiteral(&nt) {
+            Some(jn) { append(mut &seq, jn) }
+            None { return Err(e("42601", &("invalid number in jsonpath: " + nt))) }
+        }
+    } else if ctx.acceptKw("true") {
+        append(mut &seq, json.boolean(true))
+    } else if ctx.acceptKw("false") {
+        append(mut &seq, json.boolean(false))
+    } else if ctx.acceptKw("null") {
+        append(mut &seq, json.null())
+    } else if ctx.acceptKw("last") {
+        if lastIdx < 0 { return Err(e("42601", "LAST is allowed only in array subscripts")) }
+        append(mut &seq, json.integer(lastIdx))
+    } else {
+        return Err(e("42601", &("unexpected token in jsonpath: " + ctx.peek().text)))
+    }
+    return evalPathSteps(ctx, seq, cur, lastIdx)
+}
+
+fn evalPathSteps(ctx: mut &PathCtx, seq0: []J, cur: &J, lastIdx: int): Result[[]J, DbErr] {
+    var seq = seq0
+    while true {
+        if ctx.acceptOp("..") {
+            // recursive descent: ..*, ..key, .."key"
+            if ctx.acceptOp("*") {
+                var out: []J = []
+                for it in seq { collectAllDesc(&it, mut &out) }
+                seq = out
+                continue
+            }
+            if ctx.peek().kind == PT_IDENT || ctx.peek().kind == PT_STR {
+                let k = ctx.peek().text.clone()
+                ctx.pos += 1
+                var out: []J = []
+                for it in seq { collectKeyDesc(&it, &k, mut &out) }
+                seq = out
+                continue
+            }
+            return Err(e("42601", "expected member name or '*' after '..' in jsonpath"))
+        }
+        if ctx.acceptOp(".") {
+            if ctx.acceptOp("*") {
+                var out: []J = []
+                for it in seq {
+                    try stepWildcardObj(&it, ctx.strict, mut &out)
+                }
+                seq = out
+                continue
+            }
+            if ctx.peek().kind == PT_IDENT && ctx.at(1).kind == PT_OP && ctx.at(1).text == "(" {
+                let meth = strings.toLowerAscii(&ctx.peek().text)
+                ctx.pos += 2
+                var margs: []J = []
+                if !ctx.isOp(")") {
+                    while true {
+                        let a = try evalPathExpr(ctx, cur, lastIdx)
+                        if len(a) > 0 { append(mut &margs, a[0].clone()) }
+                        if !ctx.acceptOp(",") { break }
+                    }
+                }
+                if !ctx.acceptOp(")") { return Err(e("42601", "missing ')' in jsonpath method")) }
+                seq = try applyMethod(&meth, &seq, &margs, ctx.strict)
+                continue
+            }
+            if ctx.peek().kind == PT_IDENT || ctx.peek().kind == PT_STR {
+                let k = ctx.peek().text.clone()
+                ctx.pos += 1
+                var out: []J = []
+                for it in seq {
+                    try stepMember(&it, &k, ctx.strict, mut &out)
+                }
+                seq = out
+                continue
+            }
+            return Err(e("42601", "expected member name after '.' in jsonpath"))
+        }
+        if ctx.acceptOp("[") {
+            if ctx.acceptOp("*") {
+                if !ctx.acceptOp("]") { return Err(e("42601", "missing ']' after '[*' in jsonpath")) }
+                var out: []J = []
+                for it in seq {
+                    try stepWildcardArr(&it, ctx.strict, mut &out)
+                }
+                seq = out
+                continue
+            }
+            // String key subscript ['key'] (SQL Server / JSONPath style)
+            if ctx.peek().kind == PT_STR && ctx.at(1).kind == PT_OP && ctx.at(1).text == "]" {
+                let k = ctx.peek().text.clone()
+                ctx.pos += 2
+                var out: []J = []
+                for it in seq { try stepMember(&it, &k, ctx.strict, mut &out) }
+                seq = out
+                continue
+            }
+            // Array subscript list: expr [to expr], ...
+            let subStart = ctx.pos
+            let subEnd = findCloseBracket(ctx, subStart)
+            var out: []J = []
+            for it in seq {
+                try stepSubscript(ctx, &it, subStart, subEnd, mut &out)
+            }
+            ctx.pos = subEnd + 1
+            seq = out
+            continue
+        }
+        if ctx.acceptOp("?") {
+            if !ctx.acceptOp("(") { return Err(e("42601", "expected '(' after '?' in jsonpath filter")) }
+            let fStart = ctx.pos
+            let fEnd = findCloseParen(ctx, fStart)
+            var out: []J = []
+            for it in seq {
+                // In lax mode, unwrap top-level array elements for filter evaluation
+                if !ctx.strict && it.isArray() {
+                    for el in it.items() {
+                        ctx.pos = fStart
+                        match try evalPredOr(ctx, &el, -1) {
+                            Some(b) { if b { append(mut &out, el.clone()) } }
+                            None {}
+                        }
+                    }
+                } else {
+                    ctx.pos = fStart
+                    match try evalPredOr(ctx, &it, -1) {
+                        Some(b) { if b { append(mut &out, it.clone()) } }
+                        None {}
+                    }
+                }
+            }
+            ctx.pos = fEnd + 1
+            seq = out
+            continue
+        }
+        break
+    }
+    return Ok(seq)
+}
+
+fn findCloseBracket(ctx: &PathCtx, from: int): int {
+    var d = 1
+    var i = from
+    while i < len(ctx.toks) && ctx.toks[i].kind != PT_EOF {
+        if ctx.toks[i].kind == PT_OP && ctx.toks[i].text == "[" { d += 1 }
+        if ctx.toks[i].kind == PT_OP && ctx.toks[i].text == "]" {
+            d -= 1
+            if d == 0 { return i }
+        }
+        i += 1
+    }
+    return i
+}
+
+fn findCloseParen(ctx: &PathCtx, from: int): int {
+    var d = 1
+    var i = from
+    while i < len(ctx.toks) && ctx.toks[i].kind != PT_EOF {
+        if ctx.toks[i].kind == PT_OP && ctx.toks[i].text == "(" { d += 1 }
+        if ctx.toks[i].kind == PT_OP && ctx.toks[i].text == ")" {
+            d -= 1
+            if d == 0 { return i }
+        }
+        i += 1
+    }
+    return i
+}
+
+fn collectAllDesc(j: &J, out: mut &[]J) {
+    append(out, j.clone())
+    if j.isArray() {
+        for el in j.items() { collectAllDesc(&el, out) }
+    } else if j.isObject() {
+        for k in j.keys() {
+            let v = j.field(&k)
+            collectAllDesc(&v, out)
+        }
+    }
+}
+
+fn collectKeyDesc(j: &J, key: &str, out: mut &[]J) {
+    if j.isObject() {
+        if j.has(key) { append(out, j.field(key)) }
+        for k in j.keys() {
+            let v = j.field(&k)
+            collectKeyDesc(&v, key, out)
+        }
+    } else if j.isArray() {
+        for el in j.items() { collectKeyDesc(&el, key, out) }
+    }
+}
+
+fn stepMember(j: &J, key: &str, strict: bool, out: mut &[]J): Result[Unit, DbErr] {
+    if j.isObject() {
+        if j.has(key) {
+            append(out, j.field(key))
+            return Ok(Unit{})
+        }
+        if strict { return Err(e("2203A", &("JSON object does not contain key \"" + key + "\""))) }
+        return Ok(Unit{})
+    }
+    if !strict && j.isArray() {
+        for el in j.items() {
+            if el.isObject() && el.has(key) { append(out, el.field(key)) }
+        }
+        return Ok(Unit{})
+    }
+    if strict { return Err(e("2203A", &("jsonpath member accessor can only be applied to an object"))) }
+    return Ok(Unit{})
+}
+
+fn stepWildcardObj(j: &J, strict: bool, out: mut &[]J): Result[Unit, DbErr] {
+    if j.isObject() {
+        for k in j.keys() { append(out, j.field(&k)) }
+        return Ok(Unit{})
+    }
+    if !strict && j.isArray() {
+        for el in j.items() {
+            if el.isObject() {
+                for k in el.keys() { append(out, el.field(&k)) }
+            }
+        }
+        return Ok(Unit{})
+    }
+    if strict { return Err(e("2203A", "jsonpath wildcard member accessor can only be applied to an object")) }
+    return Ok(Unit{})
+}
+
+fn stepWildcardArr(j: &J, strict: bool, out: mut &[]J): Result[Unit, DbErr] {
+    if j.isArray() {
+        for el in j.items() { append(out, el) }
+        return Ok(Unit{})
+    }
+    if !strict {
+        append(out, j.clone())
+        return Ok(Unit{})
+    }
+    return Err(e("22033", "jsonpath wildcard array accessor can only be applied to an array"))
+}
+
+fn stepSubscript(ctx: mut &PathCtx, j: &J, start: int, end: int, out: mut &[]J): Result[Unit, DbErr] {
+    if end >= len(ctx.toks) || ctx.toks[end].kind != PT_OP || ctx.toks[end].text != "]" {
+        return Err(e("42601", "missing ']' in jsonpath"))
+    }
+    var items: []J = []
+    if j.isArray() {
+        items = j.items()
+    } else if !ctx.strict {
+        items = [j.clone()]
+    } else {
+        return Err(e("22033", "jsonpath array accessor can only be applied to an array"))
+    }
+    let lastIdx = len(items) - 1
+    ctx.pos = start
+    while ctx.pos < end {
+        let loSeq = try evalPathExpr(ctx, j, lastIdx)
+        if len(loSeq) != 1 || loSeq[0].asInt().isNone() { return Err(e("22033", "jsonpath array subscript is not an integer")) }
+        let lo = loSeq[0].asInt().unwrap()
+        var hi = lo
+        if ctx.acceptKw("to") {
+            let hiSeq = try evalPathExpr(ctx, j, lastIdx)
+            if len(hiSeq) != 1 || hiSeq[0].asInt().isNone() { return Err(e("22033", "jsonpath array subscript is not an integer")) }
+            hi = hiSeq[0].asInt().unwrap()
+        }
+        if lo > hi {
+            if ctx.strict { return Err(e("22033", "jsonpath array subscript range is invalid")) }
+        } else {
+            for idx in lo..hi + 1 {
+                if idx >= 0 && idx < len(items) {
+                    append(out, items[idx].clone())
+                } else if ctx.strict {
+                    return Err(e("22033", "jsonpath array subscript is out of bounds"))
+                }
+            }
+        }
+        if !ctx.acceptOp(",") { break }
+    }
+    return Ok(Unit{})
+}
+
+fn applyMethod(meth: &str, seq: &[]J, args: &[]J, strict: bool): Result[[]J, DbErr] {
+    var out: []J = []
+    if meth == "type" {
+        for x in seq { append(mut &out, json.string(&x.kind().toStr())) }
+        return Ok(out)
+    }
+    if meth == "size" {
+        for x in seq {
+            if x.isArray() { append(mut &out, json.integer(x.size())) }
+            else if !strict { append(mut &out, json.integer(1)) }
+            else { return Err(e("2203B", "jsonpath .size() requires an array in strict mode")) }
+        }
+        return Ok(out)
+    }
+    if meth == "keyvalue" {
+        for x in seq {
+            if !x.isObject() {
+                if strict { return Err(e("2203B", "jsonpath .keyvalue() can only be applied to an object")) }
+                continue
+            }
+            for k in x.keys() {
+                var o = json.object()
+                o.set("key", json.string(&k))
+                o.set("value", x.field(&k))
+                append(mut &out, o)
+            }
+        }
+        return Ok(out)
+    }
+    for x in seq {
+        match meth.toStr() {
+            "double" {
+                match x.asFloat() {
+                    Some(f) { append(mut &out, json.number(f)) }
+                    None {
+                        match x.asStr() {
+                            Some(s) {
+                                match json.numberLiteral(&strings.trim(&s)) {
+                                    Some(jn) { append(mut &out, json.number(jn.asFloat().unwrap())) }
+                                    None { return Err(e("2203B", "jsonpath .double() argument is not a number")) }
+                                }
+                            }
+                            None { return Err(e("2203B", "jsonpath .double() argument is not a number")) }
+                        }
+                    }
+                }
+            }
+            "ceiling" {
+                match x.asFloat() {
+                    Some(f) { append(mut &out, json.integer(int(f.ceil()))) }
+                    None { return Err(e("2203B", "jsonpath .ceiling() requires a number")) }
+                }
+            }
+            "floor" {
+                match x.asFloat() {
+                    Some(f) { append(mut &out, json.integer(int(f.floor()))) }
+                    None { return Err(e("2203B", "jsonpath .floor() requires a number")) }
+                }
+            }
+            "abs" {
+                match x.asDecimal() {
+                    Some(d) { append(mut &out, json.decimal(if d.isNeg() { -d } else { d })) }
+                    None {
+                        match x.asFloat() {
+                            Some(f) { append(mut &out, json.number(if f < 0.0f { -f } else { f })) }
+                            None { return Err(e("2203B", "jsonpath .abs() requires a number")) }
+                        }
+                    }
+                }
+            }
+            "string" {
+                match x {
+                    J.Str(s) { append(mut &out, json.string(&s)) }
+                    J.Bool(b) { append(mut &out, json.string(if b { "true" } else { "false" })) }
+                    J.Num(n) { append(mut &out, json.string(&json.formatNumber(&n, false))) }
+                    else { return Err(e("2203B", "jsonpath .string() requires a scalar value")) }
+                }
+            }
+            "number", "decimal" {
+                match x.asDecimal() {
+                    Some(d) { append(mut &out, json.decimal(d)) }
+                    None {
+                        match x.asStr() {
+                            Some(s) {
+                                match json.numberLiteral(&strings.trim(&s)) {
+                                    Some(jn) { append(mut &out, jn) }
+                                    None { return Err(e("2203B", "jsonpath .number() invalid numeric string")) }
+                                }
+                            }
+                            None { return Err(e("2203B", "jsonpath .number() requires number or string")) }
+                        }
+                    }
+                }
+            }
+            "bigint", "integer" {
+                match x.asInt() {
+                    Some(n) { append(mut &out, json.integer(n)) }
+                    None {
+                        match x.asFloat() {
+                            Some(f) { append(mut &out, json.integer(int(f))) }
+                            None {
+                                match x.asStr() {
+                                    Some(s) {
+                                        match strings.parseIntOpt(&strings.trim(&s)) {
+                                            Some(n) { append(mut &out, json.integer(n)) }
+                                            None { return Err(e("2203B", "jsonpath .integer() invalid integer string")) }
+                                        }
+                                    }
+                                    None { return Err(e("2203B", "jsonpath .integer() requires number or string")) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            "boolean" {
+                match x {
+                    J.Bool(b) { append(mut &out, json.boolean(b)) }
+                    J.Num(n) { append(mut &out, json.boolean(n.toFloat() != 0.0f)) }
+                    J.Str(s) {
+                        let lo = strings.toLowerAscii(&strings.trim(&s))
+                        if lo == "true" || lo == "t" || lo == "1" { append(mut &out, json.boolean(true)) }
+                        else if lo == "false" || lo == "f" || lo == "0" { append(mut &out, json.boolean(false)) }
+                        else { return Err(e("2203B", "jsonpath .boolean() invalid boolean string")) }
+                    }
+                    else { return Err(e("2203B", "jsonpath .boolean() requires boolean, number, or string")) }
+                }
+            }
+            "lower" {
+                match x.asStr() {
+                    Some(s) { append(mut &out, json.string(&strings.toLowerAscii(&s))) }
+                    None { return Err(e("2203B", "jsonpath .lower() requires a string")) }
+                }
+            }
+            "upper" {
+                match x.asStr() {
+                    Some(s) { append(mut &out, json.string(&strings.toUpperAscii(&s))) }
+                    None { return Err(e("2203B", "jsonpath .upper() requires a string")) }
+                }
+            }
+            "ltrim" {
+                match x.asStr() {
+                    Some(s) {
+                        let chars = if len(args) > 0 { args[0].asStr().unwrapOr(" ") } else { " ".toStr() }
+                        append(mut &out, json.string(&trimChars(&s, &chars, true, false)))
+                    }
+                    None { return Err(e("2203B", "jsonpath .ltrim() requires a string")) }
+                }
+            }
+            "rtrim" {
+                match x.asStr() {
+                    Some(s) {
+                        let chars = if len(args) > 0 { args[0].asStr().unwrapOr(" ") } else { " ".toStr() }
+                        append(mut &out, json.string(&trimChars(&s, &chars, false, true)))
+                    }
+                    None { return Err(e("2203B", "jsonpath .rtrim() requires a string")) }
+                }
+            }
+            "btrim" {
+                match x.asStr() {
+                    Some(s) {
+                        let chars = if len(args) > 0 { args[0].asStr().unwrapOr(" ") } else { " ".toStr() }
+                        append(mut &out, json.string(&trimChars(&s, &chars, true, true)))
+                    }
+                    None { return Err(e("2203B", "jsonpath .btrim() requires a string")) }
+                }
+            }
+            "replace" {
+                match x.asStr() {
+                    Some(s) {
+                        if len(args) < 2 { return Err(e("42601", "jsonpath .replace() requires 2 arguments")) }
+                        let a = args[0].asStr().unwrapOr("")
+                        let b = args[1].asStr().unwrapOr("")
+                        append(mut &out, json.string(&strings.replaceAll(&s, &a, &b)))
+                    }
+                    None { return Err(e("2203B", "jsonpath .replace() requires a string")) }
+                }
+            }
+            "split_part" {
+                match x.asStr() {
+                    Some(s) {
+                        if len(args) < 2 { return Err(e("42601", "jsonpath .split_part() requires 2 arguments")) }
+                        let sep = args[0].asStr().unwrapOr("")
+                        let idx = args[1].asInt().unwrapOr(0)
+                        let parts = strings.split(&s, &sep)
+                        let k = if idx > 0 { idx - 1 } else if idx < 0 { len(parts) + idx } else { -1 }
+                        append(mut &out, json.string(if k >= 0 && k < len(parts) { &parts[k] } else { "" }))
+                    }
+                    None { return Err(e("2203B", "jsonpath .split_part() requires a string")) }
+                }
+            }
+            else { return Err(e("42601", &("unknown jsonpath method: ." + meth + "()"))) }
+        }
+    }
+    return Ok(out)
+}
+
+fn trimChars(s: &str, chars: &str, left: bool, right: bool): str {
+    var a = 0
+    var b = len(s)
+    if left {
+        while a < b && strings.contains(chars, &s[a..a + 1]) { a += 1 }
+    }
+    if right {
+        while b > a && strings.contains(chars, &s[b - 1..b]) { b -= 1 }
+    }
+    return s[a..b].toStr()
+}
+
+// Three-valued filter predicates: Some(true), Some(false), None (unknown).
+fn evalPredOr(ctx: mut &PathCtx, cur: &J, lastIdx: int): Result[Option[bool], DbErr] {
+    var left = try evalPredAnd(ctx, cur, lastIdx)
+    while ctx.acceptOp("||") {
+        let right = try evalPredAnd(ctx, cur, lastIdx)
+        if left == Some(true) || right == Some(true) { left = Some(true) }
+        else if left == Some(false) && right == Some(false) { left = Some(false) }
+        else { left = None }
+    }
+    return Ok(left)
+}
+
+fn evalPredAnd(ctx: mut &PathCtx, cur: &J, lastIdx: int): Result[Option[bool], DbErr] {
+    var left = try evalPredNot(ctx, cur, lastIdx)
+    while ctx.acceptOp("&&") {
+        let right = try evalPredNot(ctx, cur, lastIdx)
+        if left == Some(false) || right == Some(false) { left = Some(false) }
+        else if left == Some(true) && right == Some(true) { left = Some(true) }
+        else { left = None }
+    }
+    return Ok(left)
+}
+
+fn evalPredNot(ctx: mut &PathCtx, cur: &J, lastIdx: int): Result[Option[bool], DbErr] {
+    if ctx.acceptOp("!") {
+        match try evalPredNot(ctx, cur, lastIdx) {
+            Some(b) { return Ok(Some(!b)) }
+            None { return Ok(None) }
+        }
+    }
+    var r = try evalPredAtom(ctx, cur, lastIdx)
+    if ctx.isKw("is") && ctx.at(1).kind == PT_IDENT && strings.toLowerAscii(&ctx.at(1).text) == "unknown" {
+        ctx.pos += 2
+        return Ok(Some(r.isNone()))
+    }
+    return Ok(r)
+}
+
+fn evalPredAtom(ctx: mut &PathCtx, cur: &J, lastIdx: int): Result[Option[bool], DbErr] {
+    if ctx.acceptKw("exists") {
+        if !ctx.acceptOp("(") { return Err(e("42601", "expected '(' after exists in jsonpath")) }
+        let saveStrict = ctx.strict
+        let res = evalPathExpr(ctx, cur, lastIdx)
+        ctx.strict = saveStrict
+        if !ctx.acceptOp(")") { return Err(e("42601", "missing ')' after exists in jsonpath")) }
+        match res {
+            Ok(xs) { return Ok(Some(len(xs) > 0)) }
+            Err(_) { return Ok(None) }
+        }
+    }
+    // Check if parenthesized predicate vs parenthesized value expr
+    if ctx.isOp("(") {
+        let save = ctx.pos
+        ctx.pos += 1
+        match evalPredOr(ctx, cur, lastIdx) {
+            Ok(pr) {
+                if ctx.acceptOp(")") {
+                    if !(ctx.isOp("==") || ctx.isOp("!=") || ctx.isOp("<>") || ctx.isOp("<") || ctx.isOp("<=") || ctx.isOp(">") || ctx.isOp(">=") || ctx.isKw("like_regex") || ctx.isKw("starts")) {
+                        return Ok(pr)
+                    }
+                }
+            }
+            Err(_) {}
+        }
+        ctx.pos = save
+    }
+    let lhs = match evalPathExpr(ctx, cur, lastIdx) {
+        Ok(xs) { xs }
+        Err(_) { return Ok(None) }
+    }
+    if ctx.acceptKw("like_regex") {
+        if ctx.peek().kind != PT_STR { return Err(e("42601", "like_regex expects string pattern")) }
+        var pat = ctx.peek().text.clone()
+        ctx.pos += 1
+        var flags = ""
+        if ctx.acceptKw("flag") {
+            if ctx.peek().kind != PT_STR { return Err(e("42601", "flag expects string")) }
+            flags = ctx.peek().text.clone()
+            ctx.pos += 1
+        }
+        var pfx = ""
+        if strings.contains(&flags, "i") { pfx += "i" }
+        if strings.contains(&flags, "m") { pfx += "m" }
+        if strings.contains(&flags, "s") { pfx += "s" }
+        if len(pfx) > 0 { pat = "(?" + pfx + ")" + pat }
+        let rx = match regex.compile(&pat) {
+            Ok(r) { r }
+            Err(_) { return Err(e("2201B", "invalid regular expression in jsonpath like_regex")) }
+        }
+        for x in lhs {
+            match x.asStr() {
+                Some(s) { if rx.isMatch(&s) { return Ok(Some(true)) } }
+                None {}
+            }
+        }
+        return Ok(Some(false))
+    }
+    if ctx.isKw("starts") && ctx.at(1).kind == PT_IDENT && strings.toLowerAscii(&ctx.at(1).text) == "with" {
+        ctx.pos += 2
+        let rhs = try evalPathExpr(ctx, cur, lastIdx)
+        if len(rhs) != 1 { return Ok(None) }
+        match rhs[0].asStr() {
+            Some(pfx) {
+                for x in lhs {
+                    match x.asStr() {
+                        Some(s) { if strings.startsWith(&s, &pfx) { return Ok(Some(true)) } }
+                        None {}
+                    }
+                }
+                return Ok(Some(false))
+            }
+            None { return Ok(None) }
+        }
+    }
+    if ctx.isOp("==") || ctx.isOp("!=") || ctx.isOp("<>") || ctx.isOp("<") || ctx.isOp("<=") || ctx.isOp(">") || ctx.isOp(">=") {
+        let op = ctx.peek().text.clone()
+        ctx.pos += 1
+        let rhs = match evalPathExpr(ctx, cur, lastIdx) {
+            Ok(xs) { xs }
+            Err(_) { return Ok(None) }
+        }
+        return Ok(cmpPathSeq(&op, &lhs, &rhs))
+    }
+    // Bare boolean expression in filter (e.g. ?(@.active))
+    for x in lhs {
+        match x.asBool() {
+            Some(b) { if b { return Ok(Some(true)) } }
+            None {}
+        }
+    }
+    if len(lhs) == 0 { return Ok(Some(false)) }
+    return Ok(Some(false))
+}
+
+fn cmpPathSeq(op: &str, a: &[]J, b: &[]J): Option[bool] {
+    var anyUnknown = false
+    for x in a {
+        for y in b {
+            match cmpPathItem(op, &x, &y) {
+                Some(ok) { if ok { return Some(true) } }
+                None { anyUnknown = true }
+            }
+        }
+    }
+    return if anyUnknown { None } else { Some(false) }
+}
+
+fn cmpPathItem(op: &str, a: &J, b: &J): Option[bool] {
+    let ka = a.kind()
+    let kb = b.kind()
+    if ka == JK.Null || kb == JK.Null {
+        if op == "==" { return Some(ka == JK.Null && kb == JK.Null) }
+        if op == "!=" || op == "<>" { return Some(ka != kb) }
+        return None
+    }
+    if ka != kb {
+        if op == "==" { return Some(false) }
+        if op == "!=" || op == "<>" { return Some(true) }
+        return None
+    }
+    let c = cmpJsonVal(a, b)
+    if op == "==" { return Some(c == 0) }
+    if op == "!=" || op == "<>" { return Some(c != 0) }
+    if op == "<" { return Some(c < 0) }
+    if op == "<=" { return Some(c <= 0) }
+    if op == ">" { return Some(c > 0) }
+    return Some(c >= 0)
+}
+
+// ---- Standard SQL/JSON functions (shared across PG, SQL Server, Oracle)
+
+// IS [NOT] JSON [VALUE | SCALAR | ARRAY | OBJECT] [{WITH | WITHOUT} UNIQUE [KEYS]]
+pub fn isJson(v: &Val, kind: &str, unique: bool, notFlag: bool): Result[Val, DbErr] {
+    if isNullVal(v) { return Ok(Val.Null) }
+    let s = lexdb_sql.text(v)
+    var ok = false
+    match json.parse(&s) {
+        Ok(j) {
+            let k = j.kind()
+            ok = if len(kind) == 0 || kind == "value" { true }
+                 else if kind == "object" { k == JK.Object }
+                 else if kind == "array" { k == JK.Array }
+                 else if kind == "scalar" { k != JK.Object && k != JK.Array }
+                 else { false }
+            if ok && unique {
+                match checkUniqueKeys(&s) {
+                    Ok(u) { ok = u }
+                    Err(_) { ok = false }
+                }
+            }
+        }
+        Err(_) { ok = false }
+    }
+    if notFlag { ok = !ok }
+    return Ok(Val.Bool(ok))
+}
+
+// SQL Server ISJSON(expr [, VALUE | ARRAY | OBJECT | SCALAR]) -> int (1, 0, NULL)
+pub fn tsqlIsJson(v: &Val, kind: &str): Result[Val, DbErr] {
+    if isNullVal(v) { return Ok(Val.Null) }
+    let r = try isJson(v, kind, false, false)
+    match r {
+        Val.Bool(b) { return Ok(Val.Int(if b { 1 } else { 0 })) }
+        else { return Ok(Val.Null) }
+    }
+}
+
+fn isNullVal(v: &Val): bool {
+    match v { Val.Null { return true } else { return false } }
+}
+
+fn isScalarJson(j: &J): bool {
+    let k = j.kind()
+    return k != JK.Array && k != JK.Object
+}
+
+fn applyOnEmpty(onEmpty: int, emptyDef: &Val, jsonb: bool): Result[Val, DbErr] {
+    if onEmpty == ON_ERROR { return Err(e("22035", "no SQL/JSON item")) }
+    if onEmpty == ON_DEFAULT { return Ok(emptyDef.clone()) }
+    if onEmpty == ON_EMPTY_ARR { return Ok(Val.Text("[]")) }
+    if onEmpty == ON_EMPTY_OBJ { return Ok(Val.Text("{}")) }
+    return Ok(Val.Null)
+}
+
+fn applyOnErr(onErr: int, errDef: &Val, err: DbErr): Result[Val, DbErr] {
+    if onErr == ON_ERROR { return Err(err) }
+    if onErr == ON_DEFAULT { return Ok(errDef.clone()) }
+    if onErr == ON_EMPTY_ARR { return Ok(Val.Text("[]")) }
+    if onErr == ON_EMPTY_OBJ { return Ok(Val.Text("{}")) }
+    if onErr == ON_TRUE { return Ok(Val.Bool(true)) }
+    if onErr == ON_FALSE { return Ok(Val.Bool(false)) }
+    return Ok(Val.Null)
+}
+
+// JSON_VALUE(doc, path [PASSING ...] [ON EMPTY] [ON ERROR])
+pub fn jsonValue(doc: &Val, path: &Val, passing: &[]PassVar, onEmpty: int, emptyDef: &Val, onErr: int, errDef: &Val, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(path) { return Ok(Val.Null) }
+    let docStr = lexdb_sql.text(doc)
+    let pathStr = lexdb_sql.text(path)
+    let root = match json.parse(&docStr) {
+        Ok(j) { j }
+        Err(_) { return applyOnErr(onErr, errDef, badJson(&docStr, false)) }
+    }
+    let pr = match evalPath(&root, &pathStr, passing, z) {
+        Ok(x) { x }
+        Err(er) { return applyOnErr(onErr, errDef, er) }
+    }
+    if len(pr.items) == 0 {
+        return applyOnEmpty(onEmpty, emptyDef, false)
+    }
+    if len(pr.items) > 1 {
+        return applyOnErr(onErr, errDef, e("22034", "JSON path expression in JSON_VALUE should return singleton scalar item"))
+    }
+    let item = &pr.items[0]
+    if !isScalarJson(item) {
+        if pr.strict || onErr == ON_ERROR {
+            return applyOnErr(onErr, errDef, e("2203F", "SQL/JSON scalar required"))
+        }
+        return applyOnErr(onErr, errDef, e("2203F", "SQL/JSON scalar required"))
+    }
+    return Ok(scalarToTextVal(item))
+}
+
+// JSON_QUERY(doc, path [PASSING ...] [WRAPPER] [QUOTES] [ON EMPTY] [ON ERROR])
+pub fn jsonQuery(doc: &Val, path: &Val, passing: &[]PassVar, wrapper: int, quotes: int, onEmpty: int, emptyDef: &Val, onErr: int, errDef: &Val, jsonb: bool, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(path) { return Ok(Val.Null) }
+    let docStr = lexdb_sql.text(doc)
+    let pathStr = lexdb_sql.text(path)
+    let root = match json.parse(&docStr) {
+        Ok(j) { j }
+        Err(_) { return applyOnErr(onErr, errDef, badJson(&docStr, jsonb)) }
+    }
+    var pr = match evalPath(&root, &pathStr, passing, z) {
+        Ok(x) { x }
+        Err(er) { return applyOnErr(onErr, errDef, er) }
+    }
+    if len(pr.items) == 0 {
+        return applyOnEmpty(onEmpty, emptyDef, jsonb)
+    }
+    if wrapper == WRAP_UNCOND {
+        let arr = json.arrayOf(replace(mut &pr.items, []))
+        return Ok(Val.Text(formatOut(&arr, jsonb)))
+    }
+    if wrapper == WRAP_COND {
+        if len(pr.items) > 1 || isScalarJson(&pr.items[0]) {
+            let arr = json.arrayOf(replace(mut &pr.items, []))
+            return Ok(Val.Text(formatOut(&arr, jsonb)))
+        }
+        return Ok(Val.Text(formatOut(&pr.items[0], jsonb)))
+    }
+    // WRAP_NONE
+    if len(pr.items) > 1 {
+        return applyOnErr(onErr, errDef, e("22034", "JSON path expression in JSON_QUERY should return singleton item without wrapper"))
+    }
+    let it = &pr.items[0]
+    if quotes == QUOTES_OMIT {
+        match it.asStr() {
+            Some(s) { return Ok(Val.Text(s)) }
+            None {}
+        }
+    }
+    return Ok(Val.Text(formatOut(it, jsonb)))
+}
+
+// SQL Server JSON_QUERY(doc [, path]): returns only objects/arrays (scalars yield NULL in lax, error in strict).
+pub fn tsqlJsonQuery(doc: &Val, path: &Val, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(path) { return Ok(Val.Null) }
+    let docStr = lexdb_sql.text(doc)
+    let pathStr = lexdb_sql.text(path)
+    let root = match json.parse(&docStr) {
+        Ok(j) { j }
+        Err(_) { return Err(lexdb_base.err("TS13609", "JSON text is not properly formatted. Unexpected character.")) }
+    }
+    let pr = match evalPath(&root, &pathStr, &[], z) {
+        Ok(x) { x }
+        Err(er) {
+            if strings.startsWith(&strings.trim(&pathStr), "strict") { return Err(lexdb_base.err("TS13608", &er.msg)) } else { return Ok(Val.Null) }
+        }
+    }
+    if len(pr.items) == 0 {
+        if pr.strict { return Err(lexdb_base.err("TS13608", "Property cannot be found on the specified JSON path.")) }
+        return Ok(Val.Null)
+    }
+    if len(pr.items) > 1 || isScalarJson(&pr.items[0]) {
+        if pr.strict { return Err(lexdb_base.err("TS13608", "Object or array cannot be found in the specified JSON path.")) }
+        return Ok(Val.Null)
+    }
+    return Ok(Val.Text(formatCompact(&pr.items[0])))
+}
+
+// SQL Server JSON_VALUE(doc, path): returns scalar nvarchar(max) (object/array yield NULL in lax, error in strict).
+pub fn tsqlJsonValue(doc: &Val, path: &Val, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(path) { return Ok(Val.Null) }
+    let docStr = lexdb_sql.text(doc)
+    let pathStr = lexdb_sql.text(path)
+    let root = match json.parse(&docStr) {
+        Ok(j) { j }
+        Err(_) { return Err(lexdb_base.err("TS13609", "JSON text is not properly formatted. Unexpected character.")) }
+    }
+    let pr = match evalPath(&root, &pathStr, &[], z) {
+        Ok(x) { x }
+        Err(er) {
+            if strings.startsWith(&strings.trim(&pathStr), "strict") { return Err(lexdb_base.err("TS13608", &er.msg)) } else { return Ok(Val.Null) }
+        }
+    }
+    if len(pr.items) == 0 {
+        if pr.strict { return Err(lexdb_base.err("TS13608", "Property cannot be found on the specified JSON path.")) }
+        return Ok(Val.Null)
+    }
+    if len(pr.items) > 1 || !isScalarJson(&pr.items[0]) {
+        if pr.strict { return Err(lexdb_base.err("TS13608", "Scalar value cannot be found in the specified JSON path.")) }
+        return Ok(Val.Null)
+    }
+    return Ok(scalarToTextVal(&pr.items[0]))
+}
+
+// JSON_EXISTS(doc, path [PASSING ...] [ON ERROR])
+pub fn jsonExists(doc: &Val, path: &Val, passing: &[]PassVar, onErr: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(path) { return Ok(Val.Null) }
+    let docStr = lexdb_sql.text(doc)
+    let pathStr = lexdb_sql.text(path)
+    let root = match json.parse(&docStr) {
+        Ok(j) { j }
+        Err(_) { return applyOnErr(onErr, &Val.Null, badJson(&docStr, false)) }
+    }
+    match evalPath(&root, &pathStr, passing, z) {
+        Ok(pr) { return Ok(Val.Bool(len(pr.items) > 0)) }
+        Err(er) { return applyOnErr(onErr, &Val.Null, er) }
+    }
+}
+
+// SQL Server JSON_PATH_EXISTS(doc, path) -> int (1, 0, NULL)
+pub fn tsqlJsonPathExists(doc: &Val, path: &Val, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(path) { return Ok(Val.Null) }
+    let docStr = lexdb_sql.text(doc)
+    let pathStr = lexdb_sql.text(path)
+    let root = match json.parse(&docStr) {
+        Ok(j) { j }
+        Err(_) { return Err(lexdb_base.err("TS13609", "JSON text is not properly formatted.")) }
+    }
+    match evalPath(&root, &pathStr, &[], z) {
+        Ok(pr) { return Ok(Val.Int(if len(pr.items) > 0 { 1 } else { 0 })) }
+        Err(_) { return Ok(Val.Int(0)) }
+    }
+}
+
+// JSON_OBJECT([KEY] k VALUE v, ... [{NULL|ABSENT} ON NULL] [{WITH|WITHOUT} UNIQUE KEYS])
+pub fn jsonObjectBuild(ks: &[]Val, vs: &[]Val, oids: &[]int, absentOnNull: bool, uniqueKeys: bool, jsonb: bool, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    var obj = json.object()
+    var seen: Map[str, int] = newMap()
+    for i in 0..len(ks) {
+        if isNullVal(&ks[i]) { return Err(e("22004", "null value not allowed for object key")) }
+        let k = lexdb_sql.text(&ks[i])
+        if isNullVal(&vs[i]) && absentOnNull { continue }
+        if uniqueKeys && seen.has(&k) { return Err(e("22030", &("duplicate JSON object key value: \"" + k + "\""))) }
+        seen.put(k.clone(), 1)
+        let oid = if i < len(oids) { oids[i] } else { lexdb_sql.OID_TEXT }
+        obj.set(&k, valToJson(&vs[i], oid, z))
+    }
+    return Ok(Val.Text(formatOut(&obj, jsonb)))
+}
+
+// JSON_ARRAY(v, ... [{NULL|ABSENT} ON NULL])
+pub fn jsonArrayBuild(vs: &[]Val, oids: &[]int, absentOnNull: bool, jsonb: bool, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    var items: []J = []
+    for i in 0..len(vs) {
+        if isNullVal(&vs[i]) && absentOnNull { continue }
+        let oid = if i < len(oids) { oids[i] } else { lexdb_sql.OID_TEXT }
+        append(mut &items, valToJson(&vs[i], oid, z))
+    }
+    let arr = json.arrayOf(items)
+    return Ok(Val.Text(formatOut(&arr, jsonb)))
+}
+
+// JSON_SCALAR(expr)
+pub fn jsonObjectBuildPg(ks: &[]Val, vs: &[]Val, oids: &[]int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    var b = json.newBuf()
+    b.writeByte('{')
+    for i in 0..len(ks) {
+        if isNullVal(&ks[i]) { return Err(e("22004", "null value not allowed for object key")) }
+        if i > 0 { b.write(", ") }
+        json.writeString(mut &b, &lexdb_sql.text(&ks[i]), false)
+        b.write(" : ")
+        let oid = if i < len(oids) { oids[i] } else { lexdb_sql.OID_TEXT }
+        let jv = valToJson(&vs[i], oid, z)
+        b.write(&formatCompact(&jv))
+    }
+    b.writeByte('}')
+    return Ok(Val.Text(b.toStr()))
+}
+
+pub fn jsonObjectBuildUtc(ks: &[]Val, vs: &[]Val, oids: &[]int, absentOnNull: bool, uniqueKeys: bool, jsonb: bool): Result[Val, DbErr] {
+    return jsonObjectBuild(ks, vs, oids, absentOnNull, uniqueKeys, jsonb, &lexdb_time.utc())
+}
+
+pub fn jsonArrayBuildUtc(vs: &[]Val, oids: &[]int, absentOnNull: bool, jsonb: bool): Result[Val, DbErr] {
+    return jsonArrayBuild(vs, oids, absentOnNull, jsonb, &lexdb_time.utc())
+}
+
+pub fn jsonScalar(v: &Val, oid: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNullVal(v) { return Ok(Val.Null) }
+    let j = valToJson(v, oid, z)
+    return Ok(Val.Text(formatCompact(&j)))
+}
+
+// JSON_SERIALIZE(expr [PRETTY])
+pub fn jsonSerialize(v: &Val, pretty: bool): Result[Val, DbErr] {
+    if isNullVal(v) { return Ok(Val.Null) }
+    let s = lexdb_sql.text(v)
+    let j = try parse(&s, false)
+    return Ok(Val.Text(if pretty { formatPretty(&j) } else { formatCompact(&j) }))
+}
+
+// RFC 7396 JSON_MERGEPATCH(target, patch) (Oracle)
+pub fn jsonMergePatch(target: &Val, patch: &Val, jsonb: bool): Result[Val, DbErr] {
+    if isNullVal(target) || isNullVal(patch) { return Ok(Val.Null) }
+    let jt = try parse(&lexdb_sql.text(target), jsonb)
+    let jp = try parse(&lexdb_sql.text(patch), jsonb)
+    let merged = mergePatchVal(&jt, &jp)
+    return Ok(Val.Text(formatOut(&merged, jsonb)))
+}
+
+fn mergePatchVal(target: &J, patch: &J): J {
+    if !patch.isObject() { return patch.clone() }
+    var res = if target.isObject() { target.clone() } else { json.object() }
+    for k in patch.keys() {
+        let pv = patch.field(&k)
+        if pv.isNull() {
+            let _old = res.remove(&k)
+        } else {
+            let tv = if res.has(&k) { res.field(&k) } else { json.object() }
+            res.set(&k, mergePatchVal(&tv, &pv))
+        }
+    }
+    return res
+}
+
+// ---- SQL Server JSON_MODIFY & JSON_CONTAINS & Oracle JSON_TRANSFORM
+
+// Simple path step for modification: either object key or array index.
+type ModStep = record { isIdx: bool; key: str; idx: int }
+
+fn parseModPath(raw: &str, strict: mut &bool, appendMode: mut &bool): Result[[]ModStep, DbErr] {
+    var s = strings.trim(raw).toStr()
+    if strings.startsWith(&strings.toLowerAscii(&s), "append ") {
+        let _a = replace(appendMode, true)
+        s = strings.trim(&s[7..len(s)]).toStr()
+    }
+    if strings.startsWith(&strings.toLowerAscii(&s), "strict ") {
+        let _s = replace(strict, true)
+        s = strings.trim(&s[7..len(s)]).toStr()
+    } else if strings.startsWith(&strings.toLowerAscii(&s), "lax ") {
+        s = strings.trim(&s[4..len(s)]).toStr()
+    }
+    let toks = try lexPath(&s)
+    var i = 0
+    if len(toks) == 0 || toks[0].kind != PT_OP || toks[0].text != "$" {
+        return Err(e("42601", "JSON path must start with '$'"))
+    }
+    i = 1
+    var steps: []ModStep = []
+    while i < len(toks) && toks[i].kind != PT_EOF {
+        if toks[i].kind == PT_OP && toks[i].text == "." {
+            i += 1
+            if i >= len(toks) || (toks[i].kind != PT_IDENT && toks[i].kind != PT_STR) {
+                return Err(e("42601", "expected key name after '.' in JSON path"))
+            }
+            append(mut &steps, ModStep{isIdx: false, key: toks[i].text.clone(), idx: 0})
+            i += 1
+            continue
+        }
+        if toks[i].kind == PT_OP && toks[i].text == "[" {
+            i += 1
+            if i < len(toks) && toks[i].kind == PT_STR {
+                append(mut &steps, ModStep{isIdx: false, key: toks[i].text.clone(), idx: 0})
+                i += 1
+            } else if i < len(toks) && toks[i].kind == PT_NUM {
+                let idx = strings.parseIntOpt(&toks[i].text).unwrapOr(-1)
+                if idx < 0 { return Err(e("42601", "invalid array index in JSON path")) }
+                append(mut &steps, ModStep{isIdx: true, key: "", idx: idx})
+                i += 1
+            } else {
+                return Err(e("42601", "invalid subscript in JSON path"))
+            }
+            if i >= len(toks) || toks[i].kind != PT_OP || toks[i].text != "]" {
+                return Err(e("42601", "missing ']' in JSON path"))
+            }
+            i += 1
+            continue
+        }
+        return Err(e("42601", &("unexpected token in JSON path: " + toks[i].text)))
+    }
+    return Ok(steps)
+}
+
+fn modApply(cur: &J, steps: &[]ModStep, depth: int, op: &str, newVal: &J, isNullArg: bool, strict: bool): Result[J, DbErr] {
+    if depth >= len(steps) {
+        if op == "append" {
+            if cur.isArray() {
+                var res = cur.clone()
+                res.push(newVal.clone())
+                return Ok(res)
+            }
+            if strict { return Err(e("22033", "target of append is not an array")) }
+            return Ok(cur.clone())
+        }
+        return Ok(newVal.clone())
+    }
+    let st = &steps[depth]
+    let last = depth == len(steps) - 1
+    if !st.isIdx {
+        if !cur.isObject() {
+            if strict { return Err(e("2203A", "target is not a JSON object")) }
+            return Ok(cur.clone())
+        }
+        var res = cur.clone()
+        if last {
+            if op == "remove" || (op == "modify" && isNullArg && !strict) {
+                if !res.has(&st.key) {
+                    if strict && op == "remove" { return Err(e("2203A", "key not found")) }
+                    return Ok(res)
+                }
+                let _r = res.remove(&st.key)
+                return Ok(res)
+            }
+            if op == "insert" {
+                if res.has(&st.key) { return Ok(res) }
+                res.set(&st.key, newVal.clone())
+                return Ok(res)
+            }
+            if op == "replace" {
+                if !res.has(&st.key) { return Ok(res) }
+                res.set(&st.key, newVal.clone())
+                return Ok(res)
+            }
+            if op == "append" {
+                if res.has(&st.key) {
+                    let sub = res.field(&st.key)
+                    if sub.isArray() {
+                        var arr = sub.clone()
+                        arr.push(newVal.clone())
+                        res.set(&st.key, arr)
+                        return Ok(res)
+                    }
+                    if strict { return Err(e("22033", "target of append is not an array")) }
+                    return Ok(res)
+                }
+                res.set(&st.key, json.arrayOf([newVal.clone()]))
+                return Ok(res)
+            }
+            // set / modify
+            if op == "modify" && strict && !res.has(&st.key) {
+                return Err(lexdb_base.err("TS13608", "Property cannot be found on the specified JSON path."))
+            }
+            res.set(&st.key, if isNullArg { json.null() } else { newVal.clone() })
+            return Ok(res)
+        }
+        if !res.has(&st.key) {
+            if strict { return Err(lexdb_base.err("TS13608", "Property cannot be found on the specified JSON path.")) }
+            return Ok(res)
+        }
+        let sub = res.field(&st.key)
+        let upd = try modApply(&sub, steps, depth + 1, op, newVal, isNullArg, strict)
+        res.set(&st.key, upd)
+        return Ok(res)
+    }
+    // array index
+    if !cur.isArray() {
+        if strict { return Err(e("22033", "target is not a JSON array")) }
+        return Ok(cur.clone())
+    }
+    var res = cur.clone()
+    let sz = res.size()
+    if st.idx < 0 || st.idx >= sz {
+        if strict { return Err(e("22033", "array index out of bounds")) }
+        return Ok(res)
+    }
+    if last {
+        if op == "remove" {
+            var items: []J = []
+            let orig = res.items()
+            for i in 0..len(orig) { if i != st.idx { append(mut &items, orig[i].clone()) } }
+            return Ok(json.arrayOf(items))
+        }
+        if op == "append" {
+            let sub = res.item(st.idx)
+            if sub.isArray() {
+                var arr = sub.clone()
+                arr.push(newVal.clone())
+                res.setAt(st.idx, arr)
+            }
+            return Ok(res)
+        }
+        res.setAt(st.idx, if isNullArg { json.null() } else { newVal.clone() })
+        return Ok(res)
+    }
+    let sub = res.item(st.idx)
+    let upd = try modApply(&sub, steps, depth + 1, op, newVal, isNullArg, strict)
+    res.setAt(st.idx, upd)
+    return Ok(res)
+}
+
+// SQL Server JSON_MODIFY(expr, path, newValue)
+pub fn jsonModify(doc: &Val, path: &Val, newVal: &Val, newOid: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(path) { return Ok(Val.Null) }
+    let root = match json.parse(&lexdb_sql.text(doc)) {
+        Ok(j) { j }
+        Err(_) { return Err(lexdb_base.err("TS13609", "JSON text is not properly formatted.")) }
+    }
+    var strict = false
+    var appendMode = false
+    let steps = try parseModPath(&lexdb_sql.text(path), mut &strict, mut &appendMode)
+    let jv = valToJson(newVal, newOid, z)
+    let op = if appendMode { "append" } else { "modify" }
+    let res = try modApply(&root, &steps, 0, op, &jv, isNullVal(newVal), strict)
+    return Ok(Val.Text(formatCompact(&res)))
+}
+
+// SQL Server 2025 JSON_CONTAINS(target, search [, path]) -> int (1, 0, NULL)
+pub fn tsqlJsonContains(target: &Val, search: &Val, path: &Val, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNullVal(target) || isNullVal(search) { return Ok(Val.Null) }
+    let jt = match json.parse(&lexdb_sql.text(target)) {
+        Ok(j) { j }
+        Err(_) { return Err(lexdb_base.err("TS13609", "JSON text is not properly formatted.")) }
+    }
+    let js = valToJson(search, lexdb_sql.OID_JSON, z)
+    if isNullVal(path) {
+        return Ok(Val.Int(if containsVal(&jt, &js) { 1 } else { 0 }))
+    }
+    let pr = match evalPath(&jt, &lexdb_sql.text(path), &[], z) {
+        Ok(x) { x }
+        Err(_) { return Ok(Val.Int(0)) }
+    }
+    for it in pr.items {
+        if containsVal(&it, &js) { return Ok(Val.Int(1)) }
+    }
+    return Ok(Val.Int(0))
+}
+
+// Oracle JSON_TRANSFORM(doc, op path [= val], ...)
+pub type TransformOp = record {
+    pub kind: str       // "set", "insert", "replace", "remove", "append", "keep"
+    pub path: str
+    pub val: Val
+    pub oid: int
+}
+
+pub fn jsonTransform(doc: &Val, ops: &[]TransformOp, jsonb: bool, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNullVal(doc) { return Ok(Val.Null) }
+    var cur = try parse(&lexdb_sql.text(doc), jsonb)
+    for op in ops {
+        if op.kind == "keep" {
+            // Keep only top-level key(s) named in path
+            var strict = false
+            var app = false
+            let steps = try parseModPath(&op.path, mut &strict, mut &app)
+            if cur.isObject() && len(steps) == 1 && !steps[0].isIdx {
+                var kept = json.object()
+                if cur.has(&steps[0].key) { kept.set(&steps[0].key, cur.field(&steps[0].key)) }
+                cur = kept
+            }
+            continue
+        }
+        var strict = false
+        var app = false
+        let steps = try parseModPath(&op.path, mut &strict, mut &app)
+        let jv = valToJson(&op.val, op.oid, z)
+        cur = try modApply(&cur, &steps, 0, &op.kind, &jv, isNullVal(&op.val), strict)
+    }
+    return Ok(Val.Text(formatOut(&cur, jsonb)))
+}
+
+// ---- PostgreSQL json/jsonb operators and functions
+
+// -> (asText = false) and ->> (asText = true)
+pub fn arrow(doc: &Val, key: &Val, asText: bool, jsonb: bool): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(key) { return Ok(Val.Null) }
+    let j = try parse(&lexdb_sql.text(doc), jsonb)
+    match key {
+        Val.Int(idx) {
+            if !j.isArray() { return Ok(Val.Null) }
+            let sz = j.size()
+            let k = if idx < 0 { sz + idx } else { idx }
+            if k < 0 || k >= sz { return Ok(Val.Null) }
+            let el = j.item(k)
+            return Ok(if asText { scalarToTextVal(&el) } else { Val.Text(formatOut(&el, jsonb)) })
+        }
+        else {
+            if !j.isObject() { return Ok(Val.Null) }
+            let k = lexdb_sql.text(key)
+            if !j.has(&k) { return Ok(Val.Null) }
+            let el = j.field(&k)
+            return Ok(if asText { scalarToTextVal(&el) } else { Val.Text(formatOut(&el, jsonb)) })
+        }
+    }
+}
+
+// #> (asText = false) and #>> (asText = true)
+pub fn hashArrow(doc: &Val, pathArr: &Val, asText: bool, jsonb: bool): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(pathArr) { return Ok(Val.Null) }
+    let keys = parsePgTextArray(&lexdb_sql.text(pathArr))
+    return extractPathKeys(&lexdb_sql.text(doc), &keys, asText, jsonb)
+}
+
+pub fn extractPathKeys(docStr: &str, keys: &[]str, asText: bool, jsonb: bool): Result[Val, DbErr] {
+    var cur = try parse(docStr, jsonb)
+    for k in keys {
+        if cur.isObject() {
+            if !cur.has(&k) { return Ok(Val.Null) }
+            cur = cur.field(&k)
+        } else if cur.isArray() {
+            match strings.parseIntOpt(&k) {
+                Some(idx) {
+                    let sz = cur.size()
+                    let p = if idx < 0 { sz + idx } else { idx }
+                    if p < 0 || p >= sz { return Ok(Val.Null) }
+                    cur = cur.item(p)
+                }
+                None { return Ok(Val.Null) }
+            }
+        } else {
+            return Ok(Val.Null)
+        }
+    }
+    return Ok(if asText { scalarToTextVal(&cur) } else { Val.Text(formatOut(&cur, jsonb)) })
+}
+
+fn parsePgTextArray(t: &str): []str {
+    let s = strings.trim(t)
+    if len(s) < 2 || s[0] != '{' || s[len(s) - 1] != '}' { return [t.toStr()] }
+    if len(s) == 2 { return [] }
+    var out: []str = []
+    var i = 1
+    let end = len(s) - 1
+    while i < end {
+        var elem = ""
+        if s[i] == '"' {
+            i += 1
+            while i < end {
+                if s[i] == '\\' && i + 1 < end { elem.addByte(s[i + 1]); i += 2; continue }
+                if s[i] == '"' { i += 1; break }
+                elem.addByte(s[i])
+                i += 1
+            }
+        } else {
+            let st = i
+            while i < end && s[i] != ',' { i += 1 }
+            elem = s[st..i].toStr()
+        }
+        append(mut &out, elem)
+        if i < end && s[i] == ',' { i += 1 }
+    }
+    return out
+}
+
+// PostgreSQL jsonb containment: a @> b
+pub fn contains(a: &Val, b: &Val): Result[Val, DbErr] {
+    if isNullVal(a) || isNullVal(b) { return Ok(Val.Null) }
+    let ja = try parse(&lexdb_sql.text(a), true)
+    let jb = try parse(&lexdb_sql.text(b), true)
+    return Ok(Val.Bool(containsVal(&ja, &jb)))
+}
+
+pub fn containsVal(a: &J, b: &J): bool {
+    if a.isObject() && b.isObject() {
+        for k in b.keys() {
+            if !a.has(&k) { return false }
+            let va = a.field(&k)
+            let vb = b.field(&k)
+            if !containsVal(&va, &vb) { return false }
+        }
+        return true
+    }
+    if a.isArray() && b.isArray() {
+        let xs = a.items()
+        for yb in b.items() {
+            var found = false
+            for xa in xs { if containsVal(&xa, &yb) { found = true; break } }
+            if !found { return false }
+        }
+        return true
+    }
+    if a.isArray() && !b.isArray() && !b.isObject() {
+        for xa in a.items() { if containsVal(&xa, b) { return true } }
+        return false
+    }
+    return cmpJsonVal(a, b) == 0
+}
+
+// ? (key/string element exists), ?| (any exists), ?& (all exist)
+pub fn hasKey(doc: &Val, key: &Val): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(key) { return Ok(Val.Null) }
+    let j = try parse(&lexdb_sql.text(doc), true)
+    return Ok(Val.Bool(jsonHasKey(&j, &lexdb_sql.text(key))))
+}
+
+pub fn hasAnyKey(doc: &Val, keysArr: &Val): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(keysArr) { return Ok(Val.Null) }
+    let j = try parse(&lexdb_sql.text(doc), true)
+    for k in parsePgTextArray(&lexdb_sql.text(keysArr)) {
+        if jsonHasKey(&j, &k) { return Ok(Val.Bool(true)) }
+    }
+    return Ok(Val.Bool(false))
+}
+
+pub fn hasAllKeys(doc: &Val, keysArr: &Val): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(keysArr) { return Ok(Val.Null) }
+    let j = try parse(&lexdb_sql.text(doc), true)
+    for k in parsePgTextArray(&lexdb_sql.text(keysArr)) {
+        if !jsonHasKey(&j, &k) { return Ok(Val.Bool(false)) }
+    }
+    return Ok(Val.Bool(true))
+}
+
+fn jsonHasKey(j: &J, k: &str): bool {
+    if j.isObject() { return j.has(k) }
+    if j.isArray() {
+        for el in j.items() {
+            match el.asStr() {
+                Some(s) { if s == k { return true } }
+                None {}
+            }
+        }
+        return false
+    }
+    match j.asStr() {
+        Some(s) { return s == k }
+        None { return false }
+    }
+}
+
+// jsonb || jsonb
+pub fn concatJsonb(a: &Val, b: &Val): Result[Val, DbErr] {
+    if isNullVal(a) || isNullVal(b) { return Ok(Val.Null) }
+    let ja = try parse(&lexdb_sql.text(a), true)
+    let jb = try parse(&lexdb_sql.text(b), true)
+    if ja.isObject() && jb.isObject() {
+        var res = ja.clone()
+        for k in jb.keys() { res.set(&k, jb.field(&k)) }
+        return Ok(Val.Text(formatJsonb(&res)))
+    }
+    if ja.isArray() && jb.isArray() {
+        var items = ja.items()
+        for el in jb.items() { append(mut &items, el) }
+        let arr = json.arrayOf(items)
+        return Ok(Val.Text(formatJsonb(&arr)))
+    }
+    if ja.isArray() {
+        var items = ja.items()
+        append(mut &items, jb)
+        let arr = json.arrayOf(items)
+        return Ok(Val.Text(formatJsonb(&arr)))
+    }
+    if jb.isArray() {
+        var items: []J = [ja]
+        for el in jb.items() { append(mut &items, el) }
+        let arr = json.arrayOf(items)
+        return Ok(Val.Text(formatJsonb(&arr)))
+    }
+    let arr = json.arrayOf([ja, jb])
+    return Ok(Val.Text(formatJsonb(&arr)))
+}
+
+// jsonb - text | int | text[]
+pub fn deleteKey(doc: &Val, key: &Val, isArr: bool): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(key) { return Ok(Val.Null) }
+    var j = try parse(&lexdb_sql.text(doc), true)
+    match key {
+        Val.Int(idx) {
+            if !j.isArray() { return Err(e("22023", "cannot delete from scalar or object by integer index")) }
+            let sz = j.size()
+            let p = if idx < 0 { sz + idx } else { idx }
+            if p < 0 || p >= sz { return Ok(Val.Text(formatJsonb(&j))) }
+            var items: []J = []
+            let orig = j.items()
+            for i in 0..len(orig) { if i != p { append(mut &items, orig[i].clone()) } }
+            let arr = json.arrayOf(items)
+            return Ok(Val.Text(formatJsonb(&arr)))
+        }
+        else {
+            let ks = if isArr { parsePgTextArray(&lexdb_sql.text(key)) } else { [lexdb_sql.text(key)] }
+            if j.isObject() {
+                for k in ks { let _r = j.remove(&k) }
+                return Ok(Val.Text(formatJsonb(&j)))
+            }
+            if j.isArray() {
+                var items: []J = []
+                for el in j.items() {
+                    var drop = false
+                    match el.asStr() {
+                        Some(s) { if lexdb_base.hasStr(&ks, &s) { drop = true } }
+                        None {}
+                    }
+                    if !drop { append(mut &items, el) }
+                }
+                let arr = json.arrayOf(items)
+                return Ok(Val.Text(formatJsonb(&arr)))
+            }
+            return Err(e("22023", "cannot delete from scalar"))
+        }
+    }
+}
+
+// jsonb #- text[]
+pub fn deletePath(doc: &Val, pathArr: &Val): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(pathArr) { return Ok(Val.Null) }
+    let j = try parse(&lexdb_sql.text(doc), true)
+    let ks = parsePgTextArray(&lexdb_sql.text(pathArr))
+    if len(ks) == 0 { return Ok(Val.Text(formatJsonb(&j))) }
+    let res = deleteAtPath(&j, &ks, 0)
+    return Ok(Val.Text(formatJsonb(&res)))
+}
+
+fn deleteAtPath(cur: &J, ks: &[]str, depth: int): J {
+    let k = &ks[depth]
+    let last = depth == len(ks) - 1
+    if cur.isObject() {
+        var res = cur.clone()
+        if !res.has(k) { return res }
+        if last { let _r = res.remove(k); return res }
+        let sub = res.field(k)
+        res.set(k, deleteAtPath(&sub, ks, depth + 1))
+        return res
+    }
+    if cur.isArray() {
+        match strings.parseIntOpt(k) {
+            Some(idx) {
+                let sz = cur.size()
+                let p = if idx < 0 { sz + idx } else { idx }
+                if p < 0 || p >= sz { return cur.clone() }
+                if last {
+                    var items: []J = []
+                    let orig = cur.items()
+                    for i in 0..len(orig) { if i != p { append(mut &items, orig[i].clone()) } }
+                    return json.arrayOf(items)
+                }
+                var res = cur.clone()
+                let sub = res.item(p)
+                res.setAt(p, deleteAtPath(&sub, ks, depth + 1))
+                return res
+            }
+            None { return cur.clone() }
+        }
+    }
+    return cur.clone()
+}
+
+pub fn jsonTypeof(doc: &Val): Result[Val, DbErr] {
+    if isNullVal(doc) { return Ok(Val.Null) }
+    let j = try parse(&lexdb_sql.text(doc), false)
+    return Ok(Val.Text(j.kind().toStr()))
+}
+
+pub fn jsonArrayLength(doc: &Val): Result[Val, DbErr] {
+    if isNullVal(doc) { return Ok(Val.Null) }
+    let j = try parse(&lexdb_sql.text(doc), false)
+    if !j.isArray() { return Err(e("22023", "cannot get array length of a non-array")) }
+    return Ok(Val.Int(j.size()))
+}
+
+pub fn jsonStripNulls(doc: &Val, stripInArrays: bool, jsonb: bool): Result[Val, DbErr] {
+    if isNullVal(doc) { return Ok(Val.Null) }
+    let j = try parse(&lexdb_sql.text(doc), jsonb)
+    let res = stripNullsVal(&j, stripInArrays)
+    return Ok(Val.Text(formatOut(&res, jsonb)))
+}
+
+fn stripNullsVal(j: &J, inArr: bool): J {
+    if j.isObject() {
+        var o = json.object()
+        for k in j.keys() {
+            let v = j.field(&k)
+            if v.isNull() { continue }
+            o.set(&k, stripNullsVal(&v, inArr))
+        }
+        return o
+    }
+    if j.isArray() {
+        var items: []J = []
+        for el in j.items() {
+            if inArr && el.isNull() { continue }
+            append(mut &items, stripNullsVal(&el, inArr))
+        }
+        return json.arrayOf(items)
+    }
+    return j.clone()
+}
+
+// jsonb_set(target, path, new_value [, create_if_missing])
+pub fn jsonbSet(doc: &Val, pathArr: &Val, newVal: &Val, createMissing: bool): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(pathArr) || isNullVal(newVal) { return Ok(Val.Null) }
+    let j = try parse(&lexdb_sql.text(doc), true)
+    let nv = try parse(&lexdb_sql.text(newVal), true)
+    let ks = parsePgTextArray(&lexdb_sql.text(pathArr))
+    if len(ks) == 0 { return Ok(Val.Text(formatJsonb(&nv))) }
+    let res = setAtPath(&j, &ks, 0, &nv, createMissing)
+    return Ok(Val.Text(formatJsonb(&res)))
+}
+
+fn setAtPath(cur: &J, ks: &[]str, depth: int, nv: &J, createMissing: bool): J {
+    let k = &ks[depth]
+    let last = depth == len(ks) - 1
+    if cur.isObject() {
+        var res = cur.clone()
+        if last {
+            if res.has(k) || createMissing { res.set(k, nv.clone()) }
+            return res
+        }
+        if !res.has(k) { return res }
+        let sub = res.field(k)
+        res.set(k, setAtPath(&sub, ks, depth + 1, nv, createMissing))
+        return res
+    }
+    if cur.isArray() {
+        match strings.parseIntOpt(k) {
+            Some(idx) {
+                var res = cur.clone()
+                let sz = res.size()
+                let p = if idx < 0 { sz + idx } else { idx }
+                if last {
+                    if p >= 0 && p < sz { res.setAt(p, nv.clone()) }
+                    else if createMissing {
+                        if idx >= sz { res.push(nv.clone()) }
+                        else {
+                            var items: []J = [nv.clone()]
+                            for el in res.items() { append(mut &items, el) }
+                            res = json.arrayOf(items)
+                        }
+                    }
+                    return res
+                }
+                if p < 0 || p >= sz { return res }
+                let sub = res.item(p)
+                res.setAt(p, setAtPath(&sub, ks, depth + 1, nv, createMissing))
+                return res
+            }
+            None { return cur.clone() }
+        }
+    }
+    return cur.clone()
+}
+
+// jsonb_insert(target, path, new_value [, insert_after])
+pub fn jsonbInsert(doc: &Val, pathArr: &Val, newVal: &Val, after: bool): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(pathArr) || isNullVal(newVal) { return Ok(Val.Null) }
+    let j = try parse(&lexdb_sql.text(doc), true)
+    let nv = try parse(&lexdb_sql.text(newVal), true)
+    let ks = parsePgTextArray(&lexdb_sql.text(pathArr))
+    if len(ks) == 0 { return Err(e("22023", "path cannot be empty")) }
+    let res = try insertAtPath(&j, &ks, 0, &nv, after)
+    return Ok(Val.Text(formatJsonb(&res)))
+}
+
+fn insertAtPath(cur: &J, ks: &[]str, depth: int, nv: &J, after: bool): Result[J, DbErr] {
+    let k = &ks[depth]
+    let last = depth == len(ks) - 1
+    if cur.isObject() {
+        var res = cur.clone()
+        if last {
+            if !res.has(k) { res.set(k, nv.clone()) }
+            return Ok(res)
+        }
+        if !res.has(k) { return Ok(res) }
+        let sub = res.field(k)
+        res.set(k, try insertAtPath(&sub, ks, depth + 1, nv, after))
+        return Ok(res)
+    }
+    if cur.isArray() {
+        match strings.parseIntOpt(k) {
+            Some(idx) {
+                let sz = cur.size()
+                if last {
+                    var pos = if idx < 0 { sz + idx } else { idx }
+                    if after { pos += 1 }
+                    if pos < 0 { pos = 0 }
+                    if pos > sz { pos = sz }
+                    var items: []J = []
+                    let orig = cur.items()
+                    for i in 0..sz {
+                        if i == pos { append(mut &items, nv.clone()) }
+                        append(mut &items, orig[i].clone())
+                    }
+                    if pos == sz { append(mut &items, nv.clone()) }
+                    return Ok(json.arrayOf(items))
+                }
+                let p = if idx < 0 { sz + idx } else { idx }
+                if p < 0 || p >= sz { return Ok(cur.clone()) }
+                var res = cur.clone()
+                let sub = res.item(p)
+                res.setAt(p, try insertAtPath(&sub, ks, depth + 1, nv, after))
+                return Ok(res)
+            }
+            None { return Ok(cur.clone()) }
+        }
+    }
+    return Ok(cur.clone())
+}
+
+// jsonb_path_exists / jsonb_path_match / jsonb_path_query_first / jsonb_path_query_array
+pub fn jsonbPathExists(doc: &Val, path: &Val, varsVal: &Val, silent: bool, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(path) { return Ok(Val.Null) }
+    let j = try parse(&lexdb_sql.text(doc), true)
+    let pv = try parseVarsObj(varsVal)
+    match evalPath(&j, &lexdb_sql.text(path), &pv, z) {
+        Ok(pr) { return Ok(Val.Bool(len(pr.items) > 0)) }
+        Err(er) { if silent { return Ok(Val.Null) }; return Err(er) }
+    }
+}
+
+pub fn jsonbPathMatch(doc: &Val, path: &Val, varsVal: &Val, silent: bool, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(path) { return Ok(Val.Null) }
+    let j = try parse(&lexdb_sql.text(doc), true)
+    let pv = try parseVarsObj(varsVal)
+    match evalPathPred(&j, &lexdb_sql.text(path), &pv, z) {
+        Ok(opt) {
+            match opt {
+                Some(b) { return Ok(Val.Bool(b)) }
+                None { return Ok(Val.Null) }
+            }
+        }
+        Err(er) { if silent { return Ok(Val.Null) }; return Err(er) }
+    }
+}
+
+pub fn jsonbPathQueryFirst(doc: &Val, path: &Val, varsVal: &Val, silent: bool, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(path) { return Ok(Val.Null) }
+    let j = try parse(&lexdb_sql.text(doc), true)
+    let pv = try parseVarsObj(varsVal)
+    match evalPath(&j, &lexdb_sql.text(path), &pv, z) {
+        Ok(pr) {
+            if len(pr.items) == 0 { return Ok(Val.Null) }
+            return Ok(Val.Text(formatJsonb(&pr.items[0])))
+        }
+        Err(er) { if silent { return Ok(Val.Null) }; return Err(er) }
+    }
+}
+
+pub fn jsonbPathQueryArray(doc: &Val, path: &Val, varsVal: &Val, silent: bool, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if isNullVal(doc) || isNullVal(path) { return Ok(Val.Null) }
+    let j = try parse(&lexdb_sql.text(doc), true)
+    let pv = try parseVarsObj(varsVal)
+    match evalPath(&j, &lexdb_sql.text(path), &pv, z) {
+        Ok(pr) {
+            var p = pr
+            let arr = json.arrayOf(replace(mut &p.items, []))
+            return Ok(Val.Text(formatJsonb(&arr)))
+        }
+        Err(er) { if silent { return Ok(Val.Null) }; return Err(er) }
+    }
+}
+
+pub fn jsonbPathQueryRows(doc: &Val, path: &Val, varsVal: &Val, silent: bool, z: &lexdb_time.Zone): Result[[][]Val, DbErr] {
+    if isNullVal(doc) || isNullVal(path) { return Ok([]) }
+    let j = try parse(&lexdb_sql.text(doc), true)
+    let pv = try parseVarsObj(varsVal)
+    match evalPath(&j, &lexdb_sql.text(path), &pv, z) {
+        Ok(pr) {
+            var rows: [][]Val = []
+            for it in pr.items { append(mut &rows, [Val.Text(formatJsonb(&it))]) }
+            return Ok(rows)
+        }
+        Err(er) { if silent { return Ok([]) }; return Err(er) }
+    }
+}
+
+fn parseVarsObj(v: &Val): Result[[]PassVar, DbErr] {
+    if isNullVal(v) { return Ok([]) }
+    let j = try parse(&lexdb_sql.text(v), true)
+    if !j.isObject() { return Err(e("22023", "vars argument to jsonb_path_* must be a JSON object")) }
+    var out: []PassVar = []
+    for k in j.keys() {
+        let fv = j.field(&k)
+        append(mut &out, PassVar{name: k, val: Val.Text(formatCompact(&fv)), oid: lexdb_sql.OID_JSON})
+    }
+    return Ok(out)
+}
+
+// ---- Set-Returning Functions (PG json_each / json_array_elements / json_object_keys, T-SQL OPENJSON, SQL/JSON JSON_TABLE)
+
+pub fn eachRows(doc: &Val, asText: bool, jsonb: bool): Result[[][]Val, DbErr] {
+    if isNullVal(doc) { return Ok([]) }
+    let j = try parse(&lexdb_sql.text(doc), jsonb)
+    if !j.isObject() { return Err(e("22023", "cannot call json_each on a non-object")) }
+    var ks = j.keys()
+    if jsonb { sortKeysJsonb(mut &ks) }
+    var rows: [][]Val = []
+    for k in ks {
+        let fv = j.field(&k)
+        let v = if asText { scalarToTextVal(&fv) } else { Val.Text(formatOut(&fv, jsonb)) }
+        append(mut &rows, [Val.Text(k), v])
+    }
+    return Ok(rows)
+}
+
+pub fn arrayElemRows(doc: &Val, asText: bool, jsonb: bool): Result[[][]Val, DbErr] {
+    if isNullVal(doc) { return Ok([]) }
+    let j = try parse(&lexdb_sql.text(doc), jsonb)
+    if !j.isArray() { return Err(e("22023", "cannot extract elements from a non-array")) }
+    var rows: [][]Val = []
+    for el in j.items() {
+        let v = if asText { scalarToTextVal(&el) } else { Val.Text(formatOut(&el, jsonb)) }
+        append(mut &rows, [v])
+    }
+    return Ok(rows)
+}
+
+pub fn objectKeyRows(doc: &Val, jsonb: bool): Result[[][]Val, DbErr] {
+    if isNullVal(doc) { return Ok([]) }
+    let j = try parse(&lexdb_sql.text(doc), jsonb)
+    if !j.isObject() { return Err(e("22023", "cannot call json_object_keys on a non-object")) }
+    var ks = j.keys()
+    if jsonb { sortKeysJsonb(mut &ks) }
+    var rows: [][]Val = []
+    for k in ks { append(mut &rows, [Val.Text(k)]) }
+    return Ok(rows)
+}
+
+// SQL Server OPENJSON type code: 0=null, 1=string, 2=number, 3=boolean, 4=array, 5=object.
+fn openJsonType(j: &J): int {
+    match j.kind() {
+        JK.Null { return 0 }
+        JK.String { return 1 }
+        JK.Number { return 2 }
+        JK.Bool { return 3 }
+        JK.Array { return 4 }
+        JK.Object { return 5 }
+    }
+}
+
+// SQL Server OPENJSON(doc [, path]) default schema: (key, value, type).
+pub fn openJsonDefault(doc: &Val, path: &Val, z: &lexdb_time.Zone): Result[[][]Val, DbErr] {
+    if isNullVal(doc) { return Ok([]) }
+    let root = match json.parse(&lexdb_sql.text(doc)) {
+        Ok(j) { j }
+        Err(_) { return Err(lexdb_base.err("TS13609", "JSON text is not properly formatted.")) }
+    }
+    var target = root.clone()
+    if !isNullVal(path) {
+        let ps = lexdb_sql.text(path)
+        let pr = match evalPath(&root, &ps, &[], z) {
+            Ok(x) { x }
+            Err(er) {
+                if strings.startsWith(&strings.trim(&ps), "strict") { return Err(lexdb_base.err("TS13608", &er.msg)) } else { return Ok([]) }
+            }
+        }
+        if len(pr.items) == 0 {
+            if pr.strict { return Err(lexdb_base.err("TS13608", "Property cannot be found on the specified JSON path.")) }
+            return Ok([])
+        }
+        target = pr.items[0].clone()
+    }
+    var rows: [][]Val = []
+    if target.isObject() {
+        for k in target.keys() {
+            let v = target.field(&k)
+            let tv = if v.isNull() { Val.Null } else if isScalarJson(&v) { scalarToTextVal(&v) } else { Val.Text(formatCompact(&v)) }
+            append(mut &rows, [Val.Text(k), tv, Val.Int(openJsonType(&v))])
+        }
+        return Ok(rows)
+    }
+    if target.isArray() {
+        let items = target.items()
+        for i in 0..len(items) {
+            let v = &items[i]
+            let tv = if v.isNull() { Val.Null } else if isScalarJson(v) { scalarToTextVal(v) } else { Val.Text(formatCompact(v)) }
+            append(mut &rows, [Val.Text(i.toStr()), tv, Val.Int(openJsonType(v))])
+        }
+        return Ok(rows)
+    }
+    return Ok(rows)
+}
+
+// Column spec for OPENJSON ... WITH (...) and JSON_TABLE (...) COLUMNS (...).
+// Encoded as tab-separated spec strings in a JSON_TABLE / OPENJSON call so no new AST structs are needed.
+// Kind: "ord" (FOR ORDINALITY), "val" (regular/scalar PATH), "json" (FORMAT JSON / AS JSON), "exists" (EXISTS PATH).
+pub type JTabCol = record {
+    pub kind: str
+    pub path: str
+    pub oid: int
+    pub wrapper: int
+    pub onEmpty: int
+    pub emptyDef: str
+    pub hasEmptyDef: bool
+    pub onErr: int
+    pub errDef: str
+    pub hasErrDef: bool
+    pub nested: str         // non-empty: nested path prefix (relative to row) for NESTED PATH
+}
+
+// Encodes a JTabCol list into a compact string (using \x1e between cols, \x1f between fields).
+pub fn encodeCols(cols: &[]JTabCol): str {
+    var parts: []str = []
+    for c in cols {
+        let fs: []str = [c.kind.clone(), c.path.clone(), c.oid.toStr(), c.wrapper.toStr(), c.onEmpty.toStr(),
+                         if c.hasEmptyDef { "1" } else { "0" }, c.emptyDef.clone(), c.onErr.toStr(),
+                         if c.hasErrDef { "1" } else { "0" }, c.errDef.clone(), c.nested.clone()]
+        append(mut &parts, strings.join(&fs, "\x1f"))
+    }
+    return strings.join(&parts, "\x1e")
+}
+
+pub fn decodeCols(s: &str): []JTabCol {
+    if len(s) == 0 { return [] }
+    var out: []JTabCol = []
+    for part in strings.split(s, "\x1e") {
+        let fs = strings.split(&part, "\x1f")
+        if len(fs) < 11 { continue }
+        append(mut &out, JTabCol{
+            kind: fs[0].clone(),
+            path: fs[1].clone(),
+            oid: lexdb_base.num(&fs[2]),
+            wrapper: lexdb_base.num(&fs[3]),
+            onEmpty: lexdb_base.num(&fs[4]),
+            hasEmptyDef: fs[5] == "1",
+            emptyDef: fs[6].clone(),
+            onErr: lexdb_base.num(&fs[7]),
+            hasErrDef: fs[8] == "1",
+            errDef: fs[9].clone(),
+            nested: fs[10].clone(),
+        })
+    }
+    return out
+}
+
+// Evaluates JSON_TABLE / OPENJSON WITH (...) rows; returns raw text/bool/int Vals (caller coerces to column OIDs).
+pub fn jsonTableRows(doc: &Val, path: &Val, passing: &[]PassVar, colsSpec: &str, openJson: bool, onErr: int, z: &lexdb_time.Zone): Result[[][]Val, DbErr] {
+    if isNullVal(doc) { return Ok([]) }
+    let docStr = lexdb_sql.text(doc)
+    let root = match json.parse(&docStr) {
+        Ok(j) { j }
+        Err(_) {
+            if openJson { return Err(lexdb_base.err("TS13609", "JSON text is not properly formatted.")) }
+            else if onErr == ON_ERROR { return Err(badJson(&docStr, false)) }
+            else { return Ok([]) }
+        }
+    }
+    var rowItems: []J = []
+    if isNullVal(path) {
+        if openJson && root.isArray() {
+            rowItems = root.items()
+        } else {
+            rowItems = [root]
+        }
+    } else {
+        let ps = lexdb_sql.text(path)
+        var pr = match evalPath(&root, &ps, passing, z) {
+            Ok(x) { x }
+            Err(er) {
+                if openJson && strings.startsWith(&strings.trim(&ps), "strict") { return Err(lexdb_base.err("TS13608", &er.msg)) }
+                else if onErr == ON_ERROR { return Err(er) }
+                else { return Ok([]) }
+            }
+        }
+        if openJson && len(pr.items) == 1 && pr.items[0].isArray() {
+            rowItems = pr.items[0].items()
+        } else {
+            rowItems = replace(mut &pr.items, [])
+        }
+    }
+    let cols = decodeCols(colsSpec)
+    // Detect if any column has a NESTED PATH (group nested columns by their nested path)
+    var nestedPath = ""
+    for c in cols { if len(c.nested) > 0 && len(nestedPath) == 0 { nestedPath = c.nested.clone() } }
+    var rows: [][]Val = []
+    var ord = 0
+    for item in rowItems {
+        ord += 1
+        if len(nestedPath) == 0 {
+            var r: []Val = []
+            for c in cols {
+                append(mut &r, try evalJTabCol(&item, &c, ord, passing, openJson, z))
+            }
+            append(mut &rows, r)
+        } else {
+            // Outer-join style NESTED PATH: if nested yields 0 items, emit 1 row with NULLs for nested columns
+            var nItems: []J = []
+            match evalPath(&item, &nestedPath, passing, z) {
+                Ok(pr) {
+                    var p = pr
+                    nItems = replace(mut &p.items, [])
+                }
+                Err(_) {}
+            }
+            if len(nItems) == 0 {
+                var r: []Val = []
+                for c in cols {
+                    if len(c.nested) > 0 { append(mut &r, Val.Null) }
+                    else { append(mut &r, try evalJTabCol(&item, &c, ord, passing, openJson, z)) }
+                }
+                append(mut &rows, r)
+            } else {
+                var nOrd = 0
+                for ni in nItems {
+                    nOrd += 1
+                    var r: []Val = []
+                    for c in cols {
+                        if len(c.nested) > 0 { append(mut &r, try evalJTabCol(&ni, &c, nOrd, passing, openJson, z)) }
+                        else { append(mut &r, try evalJTabCol(&item, &c, ord, passing, openJson, z)) }
+                    }
+                    append(mut &rows, r)
+                }
+            }
+        }
+    }
+    return Ok(rows)
+}
+
+fn evalJTabCol(item: &J, c: &JTabCol, ord: int, passing: &[]PassVar, openJson: bool, z: &lexdb_time.Zone): Result[Val, DbErr] {
+    if c.kind == "ord" { return Ok(Val.Int(ord)) }
+    let eDef = if c.hasEmptyDef { Val.Text(c.emptyDef.clone()) } else { Val.Null }
+    let rDef = if c.hasErrDef { Val.Text(c.errDef.clone()) } else { Val.Null }
+    let itemVal = Val.Text(formatCompact(item))
+    let pathVal = Val.Text(c.path.clone())
+    if c.kind == "exists" {
+        return jsonExists(&itemVal, &pathVal, passing, c.onErr, z)
+    }
+    if c.kind == "json" {
+        let jsonb = c.oid == lexdb_sql.OID_JSONB
+        if openJson {
+            return tsqlJsonQuery(&itemVal, &pathVal, z)
+        }
+        return jsonQuery(&itemVal, &pathVal, passing, c.wrapper, QUOTES_KEEP, c.onEmpty, &eDef, c.onErr, &rDef, jsonb, z)
+    }
+    // scalar value
+    if openJson {
+        return tsqlJsonValue(&itemVal, &pathVal, z)
+    }
+    return jsonValue(&itemVal, &pathVal, passing, c.onEmpty, &eDef, c.onErr, &rDef, z)
+}
+
+// ---- SQL Server FOR JSON PATH / FOR JSON AUTO
+
+pub fn forJson(rows: &[][]Val, colNames: &[]str, colOids: &[]int, pathMode: bool, rootName: &str, includeNulls: bool, withoutWrapper: bool, z: &lexdb_time.Zone): str {
+    var objs: []J = []
+    for row in rows {
+        var obj = json.object()
+        for i in 0..len(row) {
+            if isNullVal(&row[i]) && !includeNulls { continue }
+            let nm = if i < len(colNames) && len(colNames[i]) > 0 { colNames[i].clone() } else { "col" + (i + 1).toStr() }
+            let oid = if i < len(colOids) { colOids[i] } else { lexdb_sql.OID_TEXT }
+            let jv = valToJson(&row[i], oid, z)
+            if pathMode && strings.contains(&nm, ".") {
+                let segs = strings.split(&nm, ".")
+                obj = setNestedObj(&obj, &segs, 0, jv)
+            } else {
+                obj.set(&nm, jv)
+            }
+        }
+        append(mut &objs, obj)
+    }
+    if len(objs) == 0 && len(rootName) == 0 {
+        return ""
+    }
+    var body = ""
+    if withoutWrapper {
+        var parts: []str = []
+        for o in objs { append(mut &parts, formatCompact(&o)) }
+        body = strings.join(&parts, ",")
+    } else {
+        let arr = json.arrayOf(objs)
+        body = formatCompact(&arr)
+    }
+    if len(rootName) > 0 {
+        var b = json.newBuf()
+        b.writeByte('{')
+        json.writeString(mut &b, rootName, false)
+        b.writeByte(':')
+        if len(body) == 0 { b.write("[]") } else { b.write(&body) }
+        b.writeByte('}')
+        return b.toStr()
+    }
+    return body
+}
+
+fn setNestedObj(cur: &J, segs: &[]&str, depth: int, val: J): J {
+    var res = if cur.isObject() { cur.clone() } else { json.object() }
+    let k = segs[depth]
+    if depth == len(segs) - 1 {
+        res.set(k, val)
+        return res
+    }
+    let sub = if res.has(k) { res.field(k) } else { json.object() }
+    res.set(k, setNestedObj(&sub, segs, depth + 1, val))
+    return res
+}

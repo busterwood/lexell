@@ -19,6 +19,7 @@ import "./lexdb_sql"
 import "./lexdb_ops"
 import "./lexdb_lib"
 import "./lexdb_time"
+import "./lexdb_json"
 
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
@@ -94,6 +95,97 @@ pub fn rows(f: &Fn, args: []Val, zone: &lexdb_time.Zone, held: &fn(&[]Val, bool)
                 }
             }
             None {}
+        }
+    } else if f.name == "json_each" || f.name == "jsonb_each" || f.name == "json_each_text" || f.name == "jsonb_each_text" {
+        if len(av) != 1 { return Err(e("42883", &(f.name + " takes 1 argument"))) }
+        let jsonb = f.name == "jsonb_each" || f.name == "jsonb_each_text"
+        let asText = f.name == "json_each_text" || f.name == "jsonb_each_text"
+        var n = 0
+        for row in try lexdb_json.eachRows(&av[0], asText, jsonb) {
+            if cap >= 0 && len(rows) >= cap { break }
+            n += 1
+            var r = row
+            if f.ordin { append(mut &r, Val.Int(n)) }
+            try held(&r, false)
+            append(mut &rows, r)
+        }
+    } else if f.name == "json_array_elements" || f.name == "jsonb_array_elements" || f.name == "json_array_elements_text" || f.name == "jsonb_array_elements_text" {
+        if len(av) != 1 { return Err(e("42883", &(f.name + " takes 1 argument"))) }
+        let jsonb = f.name == "jsonb_array_elements" || f.name == "jsonb_array_elements_text"
+        let asText = f.name == "json_array_elements_text" || f.name == "jsonb_array_elements_text"
+        var n = 0
+        for row in try lexdb_json.arrayElemRows(&av[0], asText, jsonb) {
+            if cap >= 0 && len(rows) >= cap { break }
+            n += 1
+            var r = row
+            if f.ordin { append(mut &r, Val.Int(n)) }
+            try held(&r, false)
+            append(mut &rows, r)
+        }
+    } else if f.name == "json_object_keys" || f.name == "jsonb_object_keys" {
+        if len(av) != 1 { return Err(e("42883", &(f.name + " takes 1 argument"))) }
+        let jsonb = f.name == "jsonb_object_keys"
+        var n = 0
+        for row in try lexdb_json.objectKeyRows(&av[0], jsonb) {
+            if cap >= 0 && len(rows) >= cap { break }
+            n += 1
+            var r = row
+            if f.ordin { append(mut &r, Val.Int(n)) }
+            try held(&r, false)
+            append(mut &rows, r)
+        }
+    } else if f.name == "jsonb_path_query" {
+        if len(av) < 2 || len(av) > 4 { return Err(e("42883", "jsonb_path_query takes 2 to 4 arguments")) }
+        let vars = if len(av) >= 3 { av[2].clone() } else { Val.Null }
+        let silent = if len(av) >= 4 { lexdb_ops.truth(&av[3]).unwrapOr(false) } else { false }
+        var n = 0
+        for row in try lexdb_json.jsonbPathQueryRows(&av[0], &av[1], &vars, silent, zone) {
+            if cap >= 0 && len(rows) >= cap { break }
+            n += 1
+            var r = row
+            if f.ordin { append(mut &r, Val.Int(n)) }
+            try held(&r, false)
+            append(mut &rows, r)
+        }
+    } else if f.name == "openjson" {
+        if len(av) < 1 || len(av) > 2 { return Err(e("42883", "OPENJSON takes 1 or 2 arguments")) }
+        let p = if len(av) >= 2 { av[1].clone() } else { Val.Null }
+        for row in try lexdb_json.openJsonDefault(&av[0], &p, zone) {
+            if cap >= 0 && len(rows) >= cap { break }
+            try held(&row, false)
+            append(mut &rows, row)
+        }
+    } else if strings.startsWith(&f.name, "json_table:") || strings.startsWith(&f.name, "openjson_with:") {
+        let isOpen = strings.startsWith(&f.name, "openjson_with:")
+        let spec = if isOpen { f.name[14..len(f.name)].toStr() } else { f.name[11..len(f.name)].toStr() }
+        let doc = if len(av) >= 1 { av[0].clone() } else { Val.Null }
+        let path = if len(av) >= 2 { av[1].clone() } else { Val.Null }
+        let onErr = if len(av) >= 3 { match av[2] { Val.Int(x) { x } else { 0 } } } else { 0 }
+        var passing: []lexdb_json.PassVar = []
+        var pi = 3
+        while pi + 1 < len(av) {
+            append(mut &passing, lexdb_json.PassVar{name: lexdb_sql.text(&av[pi]), val: av[pi + 1].clone(), oid: lexdb_ops.kindOid(&av[pi + 1])})
+            pi += 2
+        }
+        let rawRows = try lexdb_json.jsonTableRows(&doc, &path, &passing, &spec, isOpen, onErr, zone)
+        for rr in rawRows {
+            if cap >= 0 && len(rows) >= cap { break }
+            var row: []Val = []
+            for c in 0..len(rr) {
+                let oid = if c < len(f.oids) { f.oids[c] } else { lexdb_sql.OID_TEXT }
+                let ty = lexdb_sql.oidType(oid)
+                if lexdb_ops.isNull(&rr[c]) || ty.kind == lexdb_sql.K_TEXT {
+                    append(mut &row, rr[c].clone())
+                } else {
+                    var cv = rr[c].clone()
+                    if ty.kind == lexdb_sql.K_NUM || ty.kind == lexdb_sql.K_INT {
+                        match cv { Val.Bool(b) { cv = Val.Int(if b { 1 } else { 0 }) } else {} }
+                    }
+                    append(mut &row, try lexdb_ops.coerceZ(cv, &ty, zone))
+                }
+            }
+            try held(&row, false)
+            append(mut &rows, row)
         }
     } else if f.name == "generate_series" {
         for a in av { if lexdb_ops.isNull(&a) { return Ok([]) } }

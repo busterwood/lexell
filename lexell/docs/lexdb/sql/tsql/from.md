@@ -94,7 +94,8 @@ join_type ::=
 - `PIVOT` and `UNPIVOT` are not supported (error 156, `Incorrect syntax near the keyword 'PIVOT'`).
 - Join hints (`INNER LOOP JOIN`, `LEFT HASH JOIN`, `MERGE JOIN`, `REMOTE`) are error 102. A join hint in
   `OPTION (HASH JOIN)` is read and ignored.
-- `TABLESAMPLE` is error 156. `OPENROWSET`, `OPENJSON` and `STRING_SPLIT` are not available.
+- `TABLESAMPLE` is error 156. `OPENROWSET` and `STRING_SPLIT` are not available. (For `OPENJSON` and `JSON_TABLE` see
+  [JSON, OPENJSON and FOR JSON](functions-json.md).)
 - `VALUES` in `FROM` without column aliases names its columns `column1`, `column2` ...; SQL Server needs the
   aliases (error 8155).
 - PostgreSQL's `NATURAL JOIN`, `JOIN ... USING (...)` and `LATERAL` are taken; SQL Server refuses them.

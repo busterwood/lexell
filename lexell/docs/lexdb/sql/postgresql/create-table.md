@@ -407,7 +407,7 @@ CREATE TABLE customer (x int);
 CREATE TABLE dup (a int, a int);
 CREATE TABLE twokeys (a int PRIMARY KEY, b int PRIMARY KEY);
 CREATE TABLE copy (LIKE customer);
-CREATE TABLE doc (body json);
+CREATE TABLE doc (body xml);
 CREATE TABLE bad (p text REFERENCES customer);
 CREATE TABLE ex (a int, EXCLUDE USING gist (a WITH =));
 CREATE TABLE ne1 (a int PRIMARY KEY NOT ENFORCED);
@@ -425,7 +425,7 @@ ERROR:  relation "customer" already exists
 ERROR:  column "a" specified more than once
 ERROR:  multiple primary keys for table "twokeys" are not allowed
 ERROR:  syntax error at or near "like"
-ERROR:  type "json" does not exist
+ERROR:  type "xml" does not exist
 ERROR:  foreign key constraint "bad_p_fkey" cannot be implemented: Key columns "p" and "id" are of incompatible types: text and integer.
 ERROR:  lexdb: EXCLUDE constraints are not supported
 ERROR:  misplaced NOT ENFORCED clause

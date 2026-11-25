@@ -107,7 +107,8 @@ select_list ::=
 ## Differences from SQL Server
 
 - `PIVOT`, `UNPIVOT` and `TABLESAMPLE` are not supported: each is error 156 (`Incorrect syntax near the keyword
-  'PIVOT'`). `FOR XML`, `FOR JSON`, `FOR BROWSE`, `$IDENTITY` and `$ROWGUID` are error 102.
+  'PIVOT'`). `FOR XML`, `FOR BROWSE`, `$IDENTITY` and `$ROWGUID` are error 102. (For `FOR JSON PATH` and
+  `FOR JSON AUTO` see [JSON, OPENJSON and FOR JSON](functions-json.md).)
 - A reserved word as an alias, with `AS` or without it (`SELECT 1 rule`), is error 156, as in SQL Server (example K).
 - Some errors carry 50000 and lexdb's text where SQL Server has a number of its own: an ambiguous column (SQL
   Server 209), a column that is neither grouped nor in an aggregate (8120), a window function in `WHERE` (4108),
@@ -353,7 +354,7 @@ Invalid object name 'dbo.employee'.
 SELECT * FROM (SELECT dept_id, salary FROM dbo.emp) AS s
 PIVOT (SUM(salary) FOR dept_id IN ([1], [2])) AS p;
 GO
-SELECT TOP 1 name FROM dbo.emp FOR JSON PATH;
+SELECT TOP 1 name FROM dbo.emp FOR XML PATH;
 GO
 ```
 
@@ -361,7 +362,7 @@ GO
 Msg 156, Level 15, State 1, Line 2
 Incorrect syntax near the keyword 'PIVOT'.
 Msg 102, Level 15, State 1, Line 1
-Incorrect syntax near 'JSON'.
+Incorrect syntax near 'XML'.
 ```
 
 ### K. Reserved words as names

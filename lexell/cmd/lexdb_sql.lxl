@@ -24,6 +24,7 @@ pub const K_BYTEA = 12      // its value Val.Bytes
 pub const K_FLOAT = 13      // real (OID 700, Val.Real) and double precision (701, Val.Float): 9.79
 pub const K_REG = 14        // regclass, regtype, regnamespace, regproc: Val.Reg, an OID and its name (9.80)
 pub const K_ENUM = 15       // a CREATE TYPE ... AS ENUM's (9.90): its OID the type's; its values texts, its labels
+pub const K_JSON = 16       // json (OID 114) and jsonb (OID 3802): Val.Text (canonicalized for jsonb)
 
 // The marker in Stmt.seqNames of a type of the user's a statement names
 // (9.90), then its name: found (or 42704) when the statement runs.
@@ -64,12 +65,14 @@ pub const OID_REGNAMESPACE = 4089
 pub const OID_REGPROC = 24
 pub const OID_FLOAT8 = 701
 pub const OID_UNKNOWN = 705
+pub const OID_JSON = 114
+pub const OID_JSONB = 3802
 
 // The array types: element OIDs and, at the same places, their arrays'.
 // int2vector (22) and oidvector (30) are arrays of int2 and oid here, after
 // int2[] and oid[] so that those are the arrays of int2 and oid (9.80).
-const ELEM_OIDS: []int = [16, 21, 23, 25, 1043, 20, 1700, 1082, 1083, 1114, 1184, 1186, 2950, 17, 700, 701, 26, 19, 18, 2205, 2206, 21, 26, 1042]
-const ARRAY_OIDS: []int = [1000, 1005, 1007, 1009, 1015, 1016, 1231, 1182, 1183, 1115, 1185, 1187, 2951, 1001, 1021, 1022, 1028, 1003, 1002, 2210, 2211, 22, 30, 1014]
+const ELEM_OIDS: []int = [16, 21, 23, 25, 1043, 20, 1700, 1082, 1083, 1114, 1184, 1186, 2950, 17, 700, 701, 26, 19, 18, 2205, 2206, 21, 26, 1042, 114, 3802]
+const ARRAY_OIDS: []int = [1000, 1005, 1007, 1009, 1015, 1016, 1231, 1182, 1183, 1115, 1185, 1187, 2951, 1001, 1021, 1022, 1028, 1003, 1002, 2210, 2211, 22, 30, 1014, 199, 3807]
 
 // The array type of an element type (0: none).
 pub fn arrayOid(elem: int): int {
@@ -371,7 +374,12 @@ pub const AGGS: []str = ["count", "sum", "avg", "min", "max", "string_agg", "arr
                          // the newest releases' (lexdb_agg; design/lexdb-new-features.md 6.1 item 7): T-SQL's PRODUCT, PostgreSQL's
                          // and Oracle's bit_and, bit_or, bit_xor (Oracle's marked " dia:o") and any_value, Oracle's moments
                          "#product", "#product4", "#product6", "bit_and", "bit_or", "bit_xor", "any_value", "#kurtosis_pop", "#kurtosis_samp", "#skewness_pop",
-                         "#skewness_samp"]
+                         "#skewness_samp",
+                         // SQL/JSON and PostgreSQL JSON aggregates
+                         "json_agg", "jsonb_agg", "json_object_agg", "jsonb_object_agg",
+                         "json_arrayagg", "json_arrayagg_null", "jsonb_arrayagg", "jsonb_arrayagg_null",
+                         "json_objectagg", "json_objectagg_abs", "json_objectagg_uniq", "json_objectagg_abs_uniq",
+                         "jsonb_objectagg", "jsonb_objectagg_abs", "jsonb_objectagg_uniq", "jsonb_objectagg_abs_uniq"]
 
 pub fn isAgg(name: &str): bool {
     let b = aggBase(name)
@@ -1034,6 +1042,7 @@ pub type Stmt = record {
     pub runAs: str              // a function's body written into a query (package F): its tables are read with this owner's rights ("" the session's)
     pub udf: bool               // T-SQL: it calls a function by a schema-qualified name, or reads one in FROM (package F: the executor writes them out)
     pub cteOnce: bool           // a CTE's use (cte >= 0): the statement's only use of it (optimizer 48.3: a filter may go into it)
+    pub forJson: str            // T-SQL SELECT ... FOR JSON PATH|AUTO: "path|root|incNulls|noWrap" ("" none)
 }
 
 // A result column with no name (T-SQL's 1 + 1, count(*)): its OutCol's
@@ -1115,7 +1124,7 @@ pub fn newStmt(kind: int): Stmt {
                 unique: false, inner: [], distinct: false, having: None, subs: [], use: 0, setop: 0, setAll: false,
                 cte: -1, rec: false, cascade: false, src: "", srf: "", ordin: false, alters: [], cons: [], seqNames: [], seq: noSeqOpts(), idOpts: [], overriding: OVR_NONE,
                 copy: noCopyOpts(), wins: [], windows: [], conflict: CONFLICT_NONE, conflictCols: [], conflictCon: "", alias: "", conc: false, lockMode: 0, lockOf: [], lockWait: 0, noData: false, into: "", exprs: [],
-                distinctOn: [], withTies: false, gsets: [], maintCols: [], temp: false, onCommit: ONC_NONE, assign: [], assignAt: [], topMode: 0, spell: "", spells: [], waitFor: false, waitMs: None, waitMul: 1, pkName: "", pkCluster: 0, cluster: 0, merges: [], mdialect: MD_PG, alter: false, mr: [], rtn: [], outInto: "", outCols: [], udf: false, runAs: "", cteOnce: false}
+                distinctOn: [], withTies: false, gsets: [], maintCols: [], temp: false, onCommit: ONC_NONE, assign: [], assignAt: [], topMode: 0, spell: "", spells: [], waitFor: false, waitMs: None, waitMul: 1, pkName: "", pkCluster: 0, cluster: 0, merges: [], mdialect: MD_PG, alter: false, mr: [], rtn: [], outInto: "", outCols: [], udf: false, runAs: "", cteOnce: false, forJson: ""}
 }
 
 // ---- the lexer
@@ -1417,7 +1426,7 @@ pub fn viewShown(text: &str): str {
 pub fn typeText(t: &TypeName): str {
     if t.kind == K_ARRAY {
         let e = elemOid(t.oid)
-        let k = if e == OID_BOOL { K_BOOL } else if e == OID_NUMERIC { K_NUM } else if e == OID_INT2 || e == OID_INT4 || e == OID_INT8 { K_INT } else if timeKind(e) > 0 { timeKind(e) } else if e == OID_UUID { K_UUID } else if e == OID_BYTEA { K_BYTEA } else if e == OID_FLOAT4 || e == OID_FLOAT8 { K_FLOAT } else if e == OID_OID { K_INT } else if e == OID_REGCLASS || e == OID_REGTYPE { K_REG } else { K_TEXT }
+        let k = if e == OID_BOOL { K_BOOL } else if e == OID_NUMERIC { K_NUM } else if e == OID_INT2 || e == OID_INT4 || e == OID_INT8 { K_INT } else if timeKind(e) > 0 { timeKind(e) } else if e == OID_UUID { K_UUID } else if e == OID_BYTEA { K_BYTEA } else if e == OID_FLOAT4 || e == OID_FLOAT8 { K_FLOAT } else if e == OID_OID { K_INT } else if e == OID_REGCLASS || e == OID_REGTYPE { K_REG } else if e == OID_JSON || e == OID_JSONB { K_JSON } else { K_TEXT }
         return typeText(&TypeName{kind: k, oid: e, prec: 0, scale: 0, len: 0}) + "[]"
     }
     if t.oid == OID_INT2 { return "smallint" }
@@ -1449,6 +1458,8 @@ pub fn typeText(t: &TypeName): str {
     if t.oid == OID_REGPROC { return "regproc" }
     if t.oid == OID_FLOAT8 { return "double precision" }
     if t.oid == OID_BYTEA { return "bytea" }
+    if t.oid == OID_JSON { return "json" }
+    if t.oid == OID_JSONB { return "jsonb" }
     if t.oid == OID_TIME { return "time" + p + " without time zone" }
     if t.oid == OID_TS { return "timestamp" + p + " without time zone" }
     if t.oid == OID_TSTZ { return "timestamp" + p + " with time zone" }
@@ -1623,6 +1634,7 @@ pub fn oidType(oid: int): TypeName {
     if timeKind(oid) > 0 { return timeType(oid) }
     if oid == OID_UUID { return TypeName{kind: K_UUID, oid: oid, prec: 0, scale: 0, len: 0} }
     if oid == OID_BYTEA { return TypeName{kind: K_BYTEA, oid: oid, prec: 0, scale: 0, len: 0} }
+    if oid == OID_JSON || oid == OID_JSONB { return TypeName{kind: K_JSON, oid: oid, prec: 0, scale: 0, len: 0} }
     if oid == OID_FLOAT4 || oid == OID_FLOAT8 { return floatType(oid) }
     if elemOid(oid) > 0 { return TypeName{kind: K_ARRAY, oid: oid, prec: 0, scale: 0, len: 0} }
     var kind = K_TEXT
