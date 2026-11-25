@@ -547,6 +547,7 @@ fn collectEqPairs(x: &Expr, tabOffsets: &[]int, tables: &[]Table, out: mut &[]Eq
 
 type CachedPlan = record {
     mvKey: str
+    mvCatKey: str
     query: str
     mdialect: int
     mvTree: int
@@ -573,11 +574,69 @@ pub fn invalidatePlan(mvKeyStr: &str) {
             if pc.entries[i].mvKey == mvKeyStr {
                 let last = len(pc.entries) - 1
                 if i != last {
-                    pc.entries[i] = replace(mut &pc.entries[last], CachedPlan{mvKey: "", query: "", mdialect: 0, mvTree: 0, mvCols: 0, baseTrees: [], fp: emptyFastPlan()})
+                    pc.entries[i] = replace(mut &pc.entries[last], CachedPlan{mvKey: "", mvCatKey: "", query: "", mdialect: 0, mvTree: 0, mvCols: 0, baseTrees: [], fp: emptyFastPlan()})
                 }
                 let _x = pop(mut &pc.entries)
             } else { i += 1 }
         }
+    })
+}
+
+// Fast-path shape check against PLAN_CACHE for tryRewrite (uses only immutable query-shape facts: isAgg & numTables).
+// Returns false ONLY when EVERY candidate mark is cached and NONE can possibly match (nFrom, qHasAgg).
+fn mayMatchAnyCachedShape(candMarks: &[]str, nFrom: int, qHasAgg: bool): bool {
+    var possible = false
+    planCache().with(fn(pc: mut &PlanCacheStore) {
+        for mk in candMarks {
+            var found = false
+            for e in pc.entries {
+                if e.mvCatKey == mk {
+                    found = true
+                    if e.fp.kind != FAST_NONE && len(e.fp.tables) == nFrom && (!e.fp.isAgg || qHasAgg) {
+                        possible = true
+                    }
+                    break
+                }
+            }
+            if !found { possible = true }
+            if possible { break }
+        }
+    })
+    return possible
+}
+
+// Per-mark immutable shape pre-filter before doing catalog B+tree lookups in tryRewrite.
+fn markShapeCompatible(mk: &str, nFrom: int, qHasAgg: bool): bool {
+    var ok = true
+    planCache().with(fn(pc: mut &PlanCacheStore) {
+        for e in pc.entries {
+            if e.mvCatKey == mk {
+                ok = e.fp.kind != FAST_NONE && len(e.fp.tables) == nFrom && (!e.fp.isAgg || qHasAgg)
+                break
+            }
+        }
+    })
+    return ok
+}
+
+fn cachePutPlan(mv: &MvMeta, mvTab: &Table, baseTrees: &[]int, fp: &FastPlan) {
+    let fpCopy = fp.clone()
+    let mvKeyC = mv.key.clone()
+    let mvCatKeyC = mvKey(&mv.key)
+    let qC = mv.query.clone()
+    let mdC = mv.mdialect
+    let treeC = mvTab.tree
+    let colsC = len(mvTab.cols)
+    let btC = collections.copyOf(baseTrees)
+    planCache().with(fn(pc: mut &PlanCacheStore) {
+        for i in 0..len(pc.entries) {
+            if pc.entries[i].mvKey == mvKeyC {
+                pc.entries[i] = CachedPlan{mvKey: mvKeyC.clone(), mvCatKey: mvCatKeyC.clone(), query: qC.clone(), mdialect: mdC, mvTree: treeC, mvCols: colsC, baseTrees: collections.copyOf(&btC), fp: fpCopy.clone()}
+                return
+            }
+        }
+        if len(pc.entries) >= 256 { let _d = pop(mut &pc.entries) }
+        append(mut &pc.entries, CachedPlan{mvKey: mvKeyC.clone(), mvCatKey: mvCatKeyC.clone(), query: qC.clone(), mdialect: mdC, mvTree: treeC, mvCols: colsC, baseTrees: collections.copyOf(&btC), fp: fpCopy.clone()})
     })
 }
 
@@ -610,23 +669,7 @@ fn getCachedPlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mv: &MvMeta,
     if fa.fp.kind == FAST_NONE { return Ok(emptyFastPlan()) }
     var fp = replace(mut &fa.fp, emptyFastPlan())
     bindHiddenCols(mut &fp, mvTab)
-    let fpCopy = fp.clone()
-    let mvKeyC = mv.key.clone()
-    let qC = mv.query.clone()
-    let mdC = mv.mdialect
-    let treeC = mvTab.tree
-    let colsC = len(mvTab.cols)
-    let btC = collections.copyOf(&baseTrees)
-    planCache().with(fn(pc: mut &PlanCacheStore) {
-        for i in 0..len(pc.entries) {
-            if pc.entries[i].mvKey == mvKeyC {
-                pc.entries[i] = CachedPlan{mvKey: mvKeyC.clone(), query: qC.clone(), mdialect: mdC, mvTree: treeC, mvCols: colsC, baseTrees: collections.copyOf(&btC), fp: fpCopy.clone()}
-                return
-            }
-        }
-        if len(pc.entries) >= 256 { let _d = pop(mut &pc.entries) }
-        append(mut &pc.entries, CachedPlan{mvKey: mvKeyC.clone(), query: qC.clone(), mdialect: mdC, mvTree: treeC, mvCols: colsC, baseTrees: collections.copyOf(&btC), fp: fpCopy.clone()})
-    })
+    cachePutPlan(mv, mvTab, &baseTrees, &fp)
     return Ok(fp)
 }
 
@@ -1878,43 +1921,43 @@ fn nextDeltaSeq(): int {
     return out
 }
 
-fn addU64BE(b: mut &str, x: int) {
-    b.addByte(byte((x >> 56) & 0xff))
-    b.addByte(byte((x >> 48) & 0xff))
-    b.addByte(byte((x >> 40) & 0xff))
-    b.addByte(byte((x >> 32) & 0xff))
-    b.addByte(byte((x >> 24) & 0xff))
-    b.addByte(byte((x >> 16) & 0xff))
-    b.addByte(byte((x >> 8) & 0xff))
-    b.addByte(byte(x & 0xff))
+fn appendU64BE(b: mut &[]byte, x: int) {
+    append(b, byte((x >> 56) & 0xff))
+    append(b, byte((x >> 48) & 0xff))
+    append(b, byte((x >> 40) & 0xff))
+    append(b, byte((x >> 32) & 0xff))
+    append(b, byte((x >> 24) & 0xff))
+    append(b, byte((x >> 16) & 0xff))
+    append(b, byte((x >> 8) & 0xff))
+    append(b, byte(x & 0xff))
 }
 
-fn addU32BE(b: mut &str, x: int) {
-    b.addByte(byte((x >> 24) & 0xff))
-    b.addByte(byte((x >> 16) & 0xff))
-    b.addByte(byte((x >> 8) & 0xff))
-    b.addByte(byte(x & 0xff))
+fn appendU32BE(b: mut &[]byte, x: int) {
+    append(b, byte((x >> 24) & 0xff))
+    append(b, byte((x >> 16) & 0xff))
+    append(b, byte((x >> 8) & 0xff))
+    append(b, byte(x & 0xff))
 }
 
 // 16-byte big-endian delta key: (seq, shard/session, itemIdx). Never collides across writers!
 fn encDeltaKey(seq: int, sess: int, idx: int): str {
-    var b = ""
-    addU64BE(mut &b, seq)
-    addU32BE(mut &b, sess & 0x7fffffff)
-    addU32BE(mut &b, idx & 0x7fffffff)
-    return b
+    var b: []byte = withCapacity(16)
+    appendU64BE(mut &b, seq)
+    appendU32BE(mut &b, sess & 0x7fffffff)
+    appendU32BE(mut &b, idx & 0x7fffffff)
+    return strFromBytes(&b)
 }
 
 // Strict upper bound for all delta keys with entrySeq < seq.
 fn encDeltaSeqHi(seq: int): str {
-    var b = ""
-    addU64BE(mut &b, seq)
-    return b
+    var b: []byte = withCapacity(8)
+    appendU64BE(mut &b, seq)
+    return strFromBytes(&b)
 }
 
-fn addLenStr(b: mut &str, s: &str) {
-    binary.addU32LE(b, len(s))
-    b = b + s
+fn addLenBytes(b: mut &[]byte, s: &str) {
+    binary.appendU32LE(b, len(s))
+    if len(s) > 0 { appendStr(b, s) }
 }
 
 fn readLenStr(s: &str, at: mut &int): str {
@@ -1927,12 +1970,32 @@ fn readLenStr(s: &str, at: mut &int): str {
     return out
 }
 
-fn encValSlice(b: mut &str, vs: &[]Val) {
-    binary.addU32LE(b, len(vs))
+fn encValSliceBytes(b: mut &[]byte, vs: &[]Val) {
+    binary.appendU32LE(b, len(vs))
     if len(vs) > 0 {
         let enc = lexdb_rows.encodeRow(vs)
-        addLenStr(b, &enc)
+        addLenBytes(b, &enc)
     }
+}
+
+fn anyNonNull(vs: &[]Val): bool {
+    for v in vs { if !lexdb_ops.isNull(&v) { return true } }
+    return false
+}
+
+fn anyNonZeroInt(xs: &[]int): bool {
+    for x in xs { if x != 0 { return true } }
+    return false
+}
+
+fn anyTrueBool(bs: &[]bool): bool {
+    for b in bs { if b { return true } }
+    return false
+}
+
+fn anyNonEmptyStr(ss: &[]str): bool {
+    for s in ss { if len(s) > 0 { return true } }
+    return false
 }
 
 fn decValSlice(s: &str, at: mut &int): Result[[]Val, DbErr] {
@@ -1947,37 +2010,51 @@ fn decValSlice(s: &str, at: mut &int): Result[[]Val, DbErr] {
     return lexdb_rows.decodeRowNeed(&enc, n, &emptyNeed, &emptyMiss, &emptyLays)
 }
 
+// Compact single-buffer binary delta codec (v2 omits empty optional vectors; decPending reads both v1 & v2).
 fn encPending(pd: &PendingDelta): str {
-    var b = ""
-    b.addByte(byte(1))
+    var b: []byte = withCapacity(96)
+    append(mut &b, byte(2))
+    let nItems = len(pd.dNn)
     var flags = 0
     if pd.isAgg { flags = flags | 1 }
     if pd.globalAgg { flags = flags | 2 }
     if pd.fullRefresh { flags = flags | 4 }
     if pd.truncate { flags = flags | 8 }
-    b.addByte(byte(flags))
-    binary.addU64LE(mut &b, pd.dCnt)
-    binary.addU64LE(mut &b, pd.dSign)
-    let nItems = len(pd.dNn)
-    binary.addU32LE(mut &b, nItems)
-    addLenStr(mut &b, &pd.gk)
-    encValSlice(mut &b, &pd.gVals)
-    encValSlice(mut &b, &pd.visRow)
+    let hasSum = pd.isAgg && nItems > 0 && anyNonNull(&pd.dSum)
+    let hasSumSq = pd.isAgg && nItems > 0 && anyNonNull(&pd.dSumSq)
+    let hasXorNeg = pd.isAgg && nItems > 0 && (anyNonZeroInt(&pd.dXor) || anyTrueBool(&pd.dHasNeg))
+    let hasExtSk = pd.isAgg && nItems > 0 && (anyNonNull(&pd.dExtAdd) || anyNonNull(&pd.dExtDel) || anyNonEmptyStr(&pd.dSketch))
+    if hasSum { flags = flags | 16 }
+    if hasSumSq { flags = flags | 32 }
+    if hasXorNeg { flags = flags | 64 }
+    if hasExtSk { flags = flags | 128 }
+    append(mut &b, byte(flags))
+    binary.appendU64LE(mut &b, pd.dCnt)
+    binary.appendU64LE(mut &b, pd.dSign)
+    binary.appendU32LE(mut &b, nItems)
+    addLenBytes(mut &b, &pd.gk)
+    encValSliceBytes(mut &b, &pd.gVals)
+    encValSliceBytes(mut &b, &pd.visRow)
     if pd.isAgg && nItems > 0 {
-        for x in pd.dNn { binary.addU64LE(mut &b, x) }
-        for x in pd.dXor { binary.addU64LE(mut &b, x) }
-        for f in pd.dHasNeg { b.addByte(byte(if f { 1 } else { 0 })) }
-        encValSlice(mut &b, &pd.dSum)
-        encValSlice(mut &b, &pd.dSumSq)
-        encValSlice(mut &b, &pd.dExtAdd)
-        encValSlice(mut &b, &pd.dExtDel)
-        for sk in pd.dSketch { addLenStr(mut &b, &sk) }
+        for x in pd.dNn { binary.appendU64LE(mut &b, x) }
+        if hasXorNeg {
+            for x in pd.dXor { binary.appendU64LE(mut &b, x) }
+            for f in pd.dHasNeg { append(mut &b, byte(if f { 1 } else { 0 })) }
+        }
+        if hasSum { encValSliceBytes(mut &b, &pd.dSum) }
+        if hasSumSq { encValSliceBytes(mut &b, &pd.dSumSq) }
+        if hasExtSk {
+            encValSliceBytes(mut &b, &pd.dExtAdd)
+            encValSliceBytes(mut &b, &pd.dExtDel)
+            for sk in pd.dSketch { addLenBytes(mut &b, &sk) }
+        }
     }
-    return b
+    return strFromBytes(&b)
 }
 
 fn decPending(mvKey: &str, s: &str): Result[PendingDelta, DbErr] {
-    if len(s) < 22 || int(s[0]) != 1 { return Err(err("XX000", "corrupt materialized view delta entry")) }
+    let ver = if len(s) >= 22 { int(s[0]) } else { 0 }
+    if ver != 1 && ver != 2 { return Err(err("XX000", "corrupt materialized view delta entry")) }
     let flags = int(s[1])
     let isAgg = (flags & 1) != 0
     let globalAgg = (flags & 2) != 0
@@ -2003,19 +2080,34 @@ fn decPending(mvKey: &str, s: &str): Result[PendingDelta, DbErr] {
             append(mut &dNn, binary.readI64LEStr(s, at))
             at += 8
         }
-        for _ in 0..nItems {
-            append(mut &dXor, binary.readI64LEStr(s, at))
-            at += 8
+        let hasSum = ver == 1 || (flags & 16) != 0
+        let hasSumSq = ver == 1 || (flags & 32) != 0
+        let hasXorNeg = ver == 1 || (flags & 64) != 0
+        let hasExtSk = ver == 1 || (flags & 128) != 0
+        if hasXorNeg {
+            for _ in 0..nItems {
+                append(mut &dXor, binary.readI64LEStr(s, at))
+                at += 8
+            }
+            for _ in 0..nItems {
+                append(mut &dHasNeg, int(s[at]) != 0)
+                at += 1
+            }
+        } else {
+            dXor = array(nItems, 0)
+            dHasNeg = array(nItems, false)
         }
-        for _ in 0..nItems {
-            append(mut &dHasNeg, int(s[at]) != 0)
-            at += 1
+        dSum = if hasSum { try decValSlice(s, mut &at) } else { array(nItems, Val.Null) }
+        dSumSq = if hasSumSq { try decValSlice(s, mut &at) } else { array(nItems, Val.Null) }
+        if hasExtSk {
+            dExtAdd = try decValSlice(s, mut &at)
+            dExtDel = try decValSlice(s, mut &at)
+            for _ in 0..nItems { append(mut &dSketch, readLenStr(s, mut &at)) }
+        } else {
+            dExtAdd = array(nItems, Val.Null)
+            dExtDel = array(nItems, Val.Null)
+            dSketch = array(nItems, "")
         }
-        dSum = try decValSlice(s, mut &at)
-        dSumSq = try decValSlice(s, mut &at)
-        dExtAdd = try decValSlice(s, mut &at)
-        dExtDel = try decValSlice(s, mut &at)
-        for _ in 0..nItems { append(mut &dSketch, readLenStr(s, mut &at)) }
     }
     return Ok(PendingDelta{mark: 0, mvKey: mvKey.toStr(), fullRefresh: fullRefresh, truncate: truncate,
                            isAgg: isAgg, globalAgg: globalAgg, gk: gk, gVals: gVals, visRow: visRow,
@@ -2237,12 +2329,15 @@ fn mergeAggRow(fp: &FastPlan, mvTab: &Table, mv: &MvMeta, oldOpt: &Option[[]Val]
             if newCnt <= 0 {
                 newRow[skCol] = Val.Null
                 if ak == AGG_HLL { newRow[it.visCol] = Val.Int(0) }
-            } else {
+            } else if len(d.dSketch[k]) > 0 {
                 let oldSk = match &newRow[skCol] { Val.Bytes(b) { b.clone() } else { "" } }
                 let merged = try lexdb_sketch.hllMergeBytes(&oldSk, &d.dSketch[k])
-                newRow[skCol] = if len(merged) == 0 { Val.Null } else { Val.Bytes(merged.clone()) }
-                if ak == AGG_HLL {
-                    newRow[it.visCol] = Val.Int(try lexdb_sketch.hllEstimateBytes(&merged))
+                let changed = oldOpt.isNone() || merged != oldSk
+                if changed {
+                    newRow[skCol] = if len(merged) == 0 { Val.Null } else { Val.Bytes(merged.clone()) }
+                    if ak == AGG_HLL {
+                        newRow[it.visCol] = Val.Int(try lexdb_sketch.hllEstimateBytes(&merged))
+                    }
                 }
             }
         } else if isTdAgg(ak) {
@@ -2250,7 +2345,7 @@ fn mergeAggRow(fp: &FastPlan, mvTab: &Table, mv: &MvMeta, oldOpt: &Option[[]Val]
             if newCnt <= 0 {
                 newRow[skCol] = Val.Null
                 if ak == AGG_TDIGEST { newRow[it.visCol] = Val.Null }
-            } else {
+            } else if len(d.dSketch[k]) > 0 {
                 let oldSk = match &newRow[skCol] { Val.Bytes(b) { b.clone() } else { "" } }
                 let merged = try lexdb_sketch.tdMergeBytes(&oldSk, &d.dSketch[k])
                 newRow[skCol] = if len(merged) == 0 { Val.Null } else { Val.Bytes(merged.clone()) }
@@ -2863,13 +2958,14 @@ fn buildAugmentedSelect(q: &Stmt, fp: &FastPlan, mvTab: &Table): Stmt {
             append(mut &aq.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(Expr.Call(sqName, sqArgs, false)), alias: "", spell: ""})
         }
         if ak == AGG_HLL {
+            // Single-pass sketch build: replace visible item i with _detail and derive visCol once per output group!
             var hName = "approx_count_distinct_detail"
             var hArgs: []Expr = [lexdb_sql.cloneExpr(&ar.arg)]
             match ar.flt {
                 Some(fx) { hName = "approx_count_distinct_detail filter"; append(mut &hArgs, lexdb_sql.cloneExpr(&fx)) }
                 None {}
             }
-            append(mut &aq.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(Expr.Call(hName, hArgs, false)), alias: "", spell: ""})
+            aq.items[i].expr = Some(Expr.Call(hName, hArgs, false))
         } else if ak == AGG_TDIGEST {
             var tName = "approx_percentile_detail"
             var tArgs: []Expr = [lexdb_sql.cloneExpr(&ar.arg)]
@@ -2877,7 +2973,7 @@ fn buildAugmentedSelect(q: &Stmt, fp: &FastPlan, mvTab: &Table): Stmt {
                 Some(fx) { tName = "approx_percentile_detail filter"; append(mut &tArgs, lexdb_sql.cloneExpr(&fx)) }
                 None {}
             }
-            append(mut &aq.items, lexdb_sql.SelItem{star: false, qual: "", expr: Some(Expr.Call(tName, tArgs, false)), alias: "", spell: ""})
+            aq.items[i].expr = Some(Expr.Call(tName, tArgs, false))
         }
     }
     return aq
@@ -2888,7 +2984,23 @@ fn populateAggRow(r: &[]Val, mvTab: &Table, fp: &FastPlan, z: &lexdb_time.Zone):
     let nVis = len(fp.items)
     var row = array(len(mvTab.cols), Val.Null)
     for k in 0..nVis {
-        row[fp.items[k].visCol] = try lexdb_ops.coerceZ(r[k].clone(), &mvTab.cols[fp.items[k].visCol].typ, z)
+        let it = &fp.items[k]
+        let ak = it.aggKind
+        if ak == AGG_HLL {
+            row[it.sketchCol] = r[k].clone()
+            let sk = match &r[k] { Val.Bytes(b) { b.clone() } else { "" } }
+            row[it.visCol] = Val.Int(try lexdb_sketch.hllEstimateBytes(&sk))
+        } else if ak == AGG_TDIGEST {
+            row[it.sketchCol] = r[k].clone()
+            let sk = match &r[k] { Val.Bytes(b) { b.clone() } else { "" } }
+            let p = if it.pctDesc { 1.0f - it.pctFrac } else { it.pctFrac }
+            match try lexdb_sketch.tdQuantileBytes(&sk, p) {
+                Some(qv) { row[it.visCol] = Val.Float(qv) }
+                None { row[it.visCol] = Val.Null }
+            }
+        } else {
+            row[it.visCol] = try lexdb_ops.coerceZ(r[k].clone(), &mvTab.cols[it.visCol].typ, z)
+        }
     }
     var colPos = nVis
     var gVals: []Val = []
@@ -2922,10 +3034,6 @@ fn populateAggRow(r: &[]Val, mvTab: &Table, fp: &FastPlan, z: &lexdb_time.Zone):
         }
         if needsSumSqCol(ak) {
             row[it.sumSqCol] = try lexdb_ops.coerceZ(r[colPos].clone(), &mvTab.cols[it.sumSqCol].typ, z)
-            colPos += 1
-        }
-        if needsSketchCol(ak) {
-            row[it.sketchCol] = r[colPos].clone()
             colPos += 1
         }
     }
@@ -2989,6 +3097,9 @@ pub fn refreshComplete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &
         var fa = try analyzeFast(st, txn, &q, &mv.path, up)
         var fp = replace(mut &fa.fp, emptyFastPlan())
         bindHiddenCols(mut &fp, &mvTab)
+        var bts: []int = []
+        for bt in fp.tables { append(mut &bts, bt.tree) }
+        cachePutPlan(&mv, &mvTab, &bts, &fp)
         let aq = buildAugmentedSelect(&q, &fp, &mvTab)
         let qr = try (up.runQuery)(st, txn, &aq, &mv.path)
         let nVis = len(fp.items)
@@ -3536,6 +3647,24 @@ fn translateAggExpr(x: &Expr, fp: &FastPlan, mvTab: &Table, exactGroup: bool, gl
                 Some(cn) { return Some(Expr.Col(cn, -1)) }
                 None {}
             }
+            // Exact group: AVG(x) can be computed from stored SUM(x) and COUNT(x) columns!
+            if ar.kind == AGG_AVG {
+                let sCol = findMvAggCol(fp, mvTab, AGG_SUM, &ar.arg, &ar.flt, 0.0f, false)
+                let cCol = findMvAggCol(fp, mvTab, AGG_COUNT_EXPR, &ar.arg, &ar.flt, 0.0f, false)
+                match sCol {
+                    Some(sc) {
+                        match cCol {
+                            Some(cc) {
+                                let numT = lexdb_sql.TypeName{kind: lexdb_sql.K_NUM, oid: lexdb_sql.OID_NUMERIC, prec: 0, scale: 0, len: 0}
+                                let den = Expr.Call("nullif", [Expr.Col(cc, -1), Expr.Lit(Val.Int(0))], false)
+                                return Some(Expr.Bin("/", Expr.Cast(Expr.Col(sc, -1), numT.clone()), Expr.Cast(den, numT)))
+                            }
+                            None {}
+                        }
+                    }
+                    None {}
+                }
+            }
             // Exact group: can also finalize a stored _DETAIL sketch column!
             if ar.kind == AGG_HLL {
                 match findMvSketchCol(fp, mvTab, true, &ar.arg, &ar.flt) {
@@ -3752,7 +3881,21 @@ pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, p
         if f.sub >= 0 || f.work >= 0 || f.lateral || len(f.using) > 0 || f.natural { return Ok(None) }
         if fi > 0 && f.join != lexdb_sql.J_INNER && f.join != lexdb_sql.J_CROSS && f.join != lexdb_sql.J_FIRST { return Ok(None) }
     }
-    // Zero-overhead gate: check first FROM table's refBy marks!
+    // Zero-allocation raw-AST pre-scan: reject SELECT * and determine qHasAgg before any catalog/expr work!
+    var qHasAgg = len(s.group) > 0 || s.having.isSome()
+    for it in s.items {
+        if it.star { return Ok(None) }
+        match &it.expr {
+            Some(ex) { if !qHasAgg && lexdb_bind.hasAgg(ex) { qHasAgg = true } }
+            None { return Ok(None) }
+        }
+    }
+    if !qHasAgg {
+        for oi in s.order {
+            if lexdb_bind.hasAgg(&oi.expr) { qHasAgg = true; break }
+        }
+    }
+    // Zero-overhead gate: check first FROM table's refBy marks and PLAN_CACHE immutable shape!
     let t0 = match try (up.findTable)(st, txn, &s.from[0].table, path) {
         Some(t) { t }
         None { return Ok(None) }
@@ -3760,6 +3903,7 @@ pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, p
     if len(t0.view) > 0 || !hasMarks(&t0.refBy) { return Ok(None) }
     let candMarks = marksOf(&t0.refBy)
     if len(candMarks) == 0 { return Ok(None) }
+    if !mayMatchAnyCachedShape(&candMarks, len(s.from), qHasAgg) { return Ok(None) }
 
     // Load all query FROM tables and build query's allCols for canonical expression resolution.
     var qTabs: []Table = [t0]
@@ -3891,6 +4035,7 @@ pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, p
     var bestStmt: Option[Stmt] = None
 
     for mk in candMarks {
+        if !markShapeCompatible(&mk, len(qTabs), qIsAgg) { continue }
         let mv = match try readMetaAt(st, txn, &mk) { Some(m) { m } None { continue } }
         if !mv.rewrite || !mv.populated || mv.fastKind == FAST_NONE { continue }
         if mv.stale && mv.deltaTree == 0 { continue }
