@@ -9,8 +9,13 @@ Creates an index on one or more columns, or on an expression.
 ```
 CREATE [ UNIQUE ] INDEX [ schema. ] index
     ON [ schema. ] table ( { column | expr } [ ASC | DESC ] [, { column | expr } [ ASC | DESC ] ]... )
+    [ annotations_clause ]
 
 ALTER INDEX [ schema. ] index RENAME TO new_name
+ALTER INDEX [ schema. ] index annotations_clause
+
+annotations_clause:
+    ANNOTATIONS ( [ ADD [ IF NOT EXISTS ] | DROP [ IF EXISTS ] | REPLACE ] name [ 'value' ] [, ...] )
 ```
 
 ## Arguments
@@ -21,6 +26,12 @@ ALTER INDEX [ schema. ] index RENAME TO new_name
 *column*, *expr*
 : The key. An expression (`UPPER(name)`, `a + c`, `CASE WHEN ... END`) makes a function-based index. A key may be
   `DESC`.
+
+`ANNOTATIONS`
+: Names, with or without a value, kept for the index and shown in `USER_ANNOTATIONS_USAGE` (`OBJECT_TYPE`
+  `INDEX`). `CREATE INDEX` adds them, `ALTER INDEX` adds, drops and replaces them; they follow `ALTER INDEX ...
+  RENAME TO` and go with `DROP INDEX`. A primary key's index takes them by the key's index name. See
+  [annotations](annotations.md) and example G below.
 
 ## Remarks
 
@@ -34,7 +45,8 @@ ALTER INDEX [ schema. ] index RENAME TO new_name
 ## Differences from Oracle
 
 - **Not supported (ORA-00900):** `BITMAP` indexes, `TABLESPACE`, `COMPRESS` and the other physical clauses.
-- **`ALTER INDEX` takes only `RENAME TO`;** `REBUILD` and the others are ORA-03001.
+- **`ALTER INDEX` takes only `RENAME TO` and `ANNOTATIONS`;** `REBUILD` and the others are ORA-03001.
+- `ALTER INDEX ... ANNOTATIONS` of an index that does not exist is ORA-00942 (Oracle ORA-01418).
 - An index on an expression that a virtual column's index already covers is accepted (Oracle: ORA-01408).
 
 ## Examples
@@ -202,6 +214,37 @@ ERROR:
 ORA-03001: unimplemented feature: lexdb: ALTER INDEX takes RENAME TO only
 ```
 
+### G. Annotations
+
+<!-- example: oracle -->
+```sql
+CREATE INDEX ix_b ON ix (b) ANNOTATIONS (Purpose 'lookup by b', Temporary);
+ALTER INDEX ix_b ANNOTATIONS (DROP Temporary, ADD Owner 'ops');
+ALTER INDEX ix_b RENAME TO ix_b2;
+SELECT object_type, object_name, annotation_name, annotation_value FROM user_annotations_usage
+WHERE object_type = 'INDEX' ORDER BY annotation_name;
+ALTER INDEX ix_b2 ANNOTATIONS (ADD Owner 'ops');
+```
+
+```text
+Index created.
+
+Index altered.
+
+Index altered.
+
+OBJECT_TYPE OBJECT_NAME ANNOTATION_NAME ANNOTATION_VALUE
+----------- ----------- --------------- ----------------
+INDEX       IX_B2       OWNER           ops
+INDEX       IX_B2       PURPOSE         lookup by b
+
+2 rows selected.
+
+ERROR:
+ORA-11552: Provided annotation 'OWNER' already exists for the object 'IX_B2'.
+```
+
 ## See also
 
-[DROP INDEX](drop-index.md), [CREATE TABLE](create-table.md), [Data dictionary views](README.md#data-dictionary)
+[DROP INDEX](drop-index.md), [CREATE TABLE](create-table.md), [Data dictionary views](README.md#data-dictionary),
+[Annotations](annotations.md)

@@ -83,7 +83,7 @@ annotations_clause:
 
 `ANNOTATIONS`
 : Names, with or without a value, kept for the table (after the column list) or a column (the last part of its
-  definition) and shown in `USER_ANNOTATIONS_USAGE`; see [annotations](annotations.md) (example M).
+  definition) and shown in `USER_ANNOTATIONS_USAGE`; see [annotations](annotations.md) and example M below.
 
 ## Remarks
 
