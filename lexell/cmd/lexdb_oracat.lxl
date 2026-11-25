@@ -24,6 +24,8 @@ import "./lexdb_oradata"
 import "./lexdb_oraadm"
 import "./lexdb_sql"
 import "./lexdb_annot"
+import "./lexdb_graph"
+import "./lexdb_parse"
 
 type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
@@ -178,7 +180,8 @@ pub fn isBuilt(base: &str): bool {
     match base.toStr() {
         "TABLES", "TAB_COLUMNS", "TAB_COLS", "INDEXES", "IND_COLUMNS", "IND_EXPRESSIONS", "CONSTRAINTS", "CONS_COLUMNS", "OBJECTS", "SEQUENCES",
         "VIEWS", "TAB_COMMENTS", "COL_COMMENTS", "TAB_IDENTITY_COLS", "CATALOG", "SOURCE", "PROCEDURES", "ERRORS", "ANNOTATIONS_USAGE", "ANNOTATIONS",
-        "ANNOTATION_VALUES" { return true }
+        "ANNOTATION_VALUES", "PROPERTY_GRAPHS", "PG_ELEMENTS", "PG_LABELS", "PG_ELEMENT_LABELS", "PG_LABEL_PROPERTIES", "PG_PROP_DEFINITIONS",
+        "PG_KEYS", "PG_EDGE_RELATIONSHIPS", "PG_COMMENTS" { return true }
         else { return false }
     }
 }
@@ -624,12 +627,214 @@ fn oraAnnotRows(out: mut &[]OraPend, seen: mut &[]str, ct: &CatTab, user: &str, 
     }
 }
 
+// A property graph's table (by catalog key), its CatTab: a table's or a view's.
+fn oraTabByKey(snap: &CatSnap, key: &str): Option[CatTab] {
+    for ct in snap.tabs { if ct.key == key { return Some(ct.clone()) } }
+    for ct in snap.views { if ct.key == key { return Some(ct.clone()) } }
+    return None
+}
+
+// Whether a graph's tables and the columns it names are there (USER_OBJECTS' STATUS; lexdb_graph's ORA-04045 where it is used).
+fn oraGraphValid(snap: &CatSnap, g: &lexdb_graph.Graph): bool {
+    for el in g.elems {
+        match oraTabByKey(snap, &el.table) {
+            Some(ct) {
+                var need: []str = el.keys.clone()
+                for c in el.src.cols { append(mut &need, c.clone()) }
+                for c in el.dst.cols { append(mut &need, c.clone()) }
+                for l in el.labels { for p in l.props { for u in p.uses { append(mut &need, u.clone()) } } }
+                for n in need {
+                    var has = false
+                    for c in ct.t.cols { if c.name == n { has = true } }
+                    if !has { return false }
+                }
+            }
+            None { return false }
+        }
+    }
+    return true
+}
+
+// The rows of USER_/ALL_/DBA_ PROPERTY_GRAPHS and PG_* (base) for Oracle's property graphs (lexdb_graph, O22).
+fn oraGraphRows(out: mut &[]OraPend, snap: &CatSnap, user: &str, base: &str) {
+    for g in lexdb_graph.all(&snap.graphs) {
+        let owner = oraOwner(&lexdb_sql.schemaOf(&g.key), user)
+        if base == "PG_COMMENTS" {
+            // (COMMENT ON PROPERTY GRAPH is not lexdb's: every graph's COMMENTS is NULL)
+            var p = oraPend(&owner, &"")
+            p.s("OWNER", &owner)
+            p.s("GRAPH_NAME", &g.name)
+            p.null("COMMENTS")
+            append(out, p)
+            continue
+        }
+        if base == "PROPERTY_GRAPHS" {
+            var p = oraPend(&owner, &"")
+            p.s("OWNER", &owner)
+            p.s("GRAPH_NAME", &g.name)
+            p.s("GRAPH_MODE", "TRUSTED")
+            p.s("ALLOWS_MIXED_TYPES", "NO")
+            p.s("INMEMORY", "NO")
+            append(out, p)
+            continue
+        }
+        var labels: []str = []
+        for el in g.elems {
+            let ct = oraTabByKey(snap, &el.table)
+            let tname = oraGraphTab(&ct, &el.table)
+            if base == "PG_ELEMENTS" {
+                var p = oraPend(&owner, &"")
+                p.s("OWNER", &owner)
+                p.s("GRAPH_NAME", &g.name)
+                p.s("ELEMENT_NAME", &el.name)
+                p.s("ELEMENT_KIND", if el.vertex { "VERTEX" } else { "EDGE" })
+                p.s("OBJECT_OWNER", &oraOwner(&lexdb_sql.schemaOf(&el.table), user))
+                p.s("OBJECT_NAME", &tname)
+                append(out, p)
+            }
+            if base == "PG_KEYS" {
+                for k in el.keys {
+                    var p = oraPend(&owner, &"")
+                    p.s("OWNER", &owner)
+                    p.s("GRAPH_NAME", &g.name)
+                    p.s("ELEMENT_NAME", &el.name)
+                    p.s("COLUMN_NAME", &oraGraphCol(&ct, &k))
+                    append(out, p)
+                }
+            }
+            if base == "PG_EDGE_RELATIONSHIPS" && !el.vertex {
+                for side in 0..2 {
+                    let end = if side == 0 { &el.src } else { &el.dst }
+                    var vct: Option[CatTab] = None
+                    for v in g.elems { if v.vertex && v.name == end.elem { vct = oraTabByKey(snap, &v.table) } }
+                    for j in 0..len(end.cols) {
+                        var p = oraPend(&owner, &"")
+                        p.s("OWNER", &owner)
+                        p.s("GRAPH_NAME", &g.name)
+                        p.s("EDGE_TAB_NAME", &el.name)
+                        p.s("VERTEX_TAB_NAME", &end.elem)
+                        p.s("EDGE_END", if side == 0 { "SOURCE" } else { "DESTINATION" })
+                        p.s("EDGE_COL_NAME", &oraGraphCol(&ct, &end.cols[j]))
+                        p.s("VERTEX_COL_NAME", &oraGraphCol(&vct, &end.refs[j]))
+                        append(out, p)
+                    }
+                }
+            }
+            var defined: []str = []        // (an element's property is defined once, whichever of its labels have it)
+            for l in el.labels {
+                if base == "PG_ELEMENT_LABELS" {
+                    var p = oraPend(&owner, &"")
+                    p.s("OWNER", &owner)
+                    p.s("GRAPH_NAME", &g.name)
+                    p.s("ELEMENT_NAME", &el.name)
+                    p.s("LABEL_NAME", &l.name)
+                    append(out, p)
+                }
+                if base == "PG_PROP_DEFINITIONS" {
+                    for pr in l.props {
+                        if lexdb_base.hasStr(&defined, &pr.name) { continue }
+                        append(mut &defined, pr.name.clone())
+                        var p = oraPend(&owner, &"")
+                        p.s("OWNER", &owner)
+                        p.s("GRAPH_NAME", &g.name)
+                        p.s("ELEMENT_NAME", &el.name)
+                        p.s("PROPERTY_NAME", &pr.name)
+                        if len(pr.col) > 0 {
+                            p.s("COLUMN_NAME", &oraGraphCol(&ct, &pr.col))
+                            p.null("COLUMN_EXPR")
+                        } else {
+                            p.null("COLUMN_NAME")
+                            p.s("COLUMN_EXPR", &oraGraphExpr(&pr))
+                        }
+                        append(out, p)
+                    }
+                }
+                if lexdb_base.hasStr(&labels, &l.name) { continue }
+                append(mut &labels, l.name.clone())
+                if base == "PG_LABELS" {
+                    var p = oraPend(&owner, &"")
+                    p.s("OWNER", &owner)
+                    p.s("GRAPH_NAME", &g.name)
+                    p.s("LABEL_NAME", &l.name)
+                    append(out, p)
+                }
+                if base == "PG_LABEL_PROPERTIES" {
+                    for k in 0..len(l.props) {
+                        let pr = &l.props[k]
+                        let ot = oraTypeOf(&pr.typ)
+                        var p = oraPend(&owner, &"")
+                        p.s("OWNER", &owner)
+                        p.s("GRAPH_NAME", &g.name)
+                        p.s("LABEL_NAME", &l.name)
+                        p.s("PROPERTY_NAME", &pr.name)
+                        p.s("DATA_TYPE", &ot.dtype)
+                        p.i("DATA_LENGTH", ot.len)
+                        p.set("DATA_PRECISION", oraOptInt(ot.prec))
+                        p.set("DATA_SCALE", oraOptInt(ot.scale))
+                        p.i("DATA_CHAR_LENGTH", ot.chars)
+                        if ot.chars > 0 {
+                            p.s("CHARACTER_SET_NAME", "CHAR_CS")
+                            p.s("COLLATION", "USING_NLS_COMP")
+                        } else {
+                            p.null("CHARACTER_SET_NAME")
+                            p.null("COLLATION")
+                        }
+                        p.i("PROPERTY_ORDER", k + 1)
+                        append(out, p)
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn oraGraphTab(ct: &Option[CatTab], key: &str): str {
+    match ct {
+        Some(c) { return oraTabName(&c) }
+        None { return oraUp(&lexdb_sql.baseName(key)) }
+    }
+}
+
+// A graph's column (lexdb's name) as Oracle shows it: as its table spells it.
+fn oraGraphCol(ct: &Option[CatTab], n: &str): str {
+    match ct {
+        Some(c) { for col in c.t.cols { if col.name == n { return oraColName(&col) } } }
+        None {}
+    }
+    return oraUp(n)
+}
+
+// A property's expression as Oracle keeps it: its names quoted in upper case, no spaces around operators ("AGE"*2).
+fn oraGraphExpr(p: &lexdb_graph.Prop): str {
+    var out = ""
+    var prevWord = false
+    for t in lexdb_graph.exprToks(&p.expr) {
+        let word = t.kind == lexdb_parse.T_IDENT || t.kind == lexdb_parse.T_QIDENT || t.kind == lexdb_parse.T_NUM || t.kind == lexdb_parse.T_STR
+        if word && prevWord { out += " " }
+        if (t.kind == lexdb_parse.T_IDENT || t.kind == lexdb_parse.T_QIDENT) && lexdb_base.hasStr(&p.uses, &t.text) {
+            out += "\"" + (if len(t.spell) > 0 { t.spell.clone() } else { strings.toUpperAscii(&t.text) }) + "\""
+        } else if t.kind == lexdb_parse.T_IDENT {
+            out += strings.toUpperAscii(&t.text)
+        } else if t.kind == lexdb_parse.T_STR {
+            out += "'" + strings.replaceAll(&t.text, "'", "''") + "'"
+        } else {
+            out += &t.text
+        }
+        prevWord = word
+    }
+    return out
+}
+
 fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role): []OraPend {
     // objects of the public schema are the login's own only when it has no schema of its name; a user with one
     // has them as the system's (USER_ views list a user's own schema alone)
     var user = snap.user.clone()
     for sc in snap.schemas { if sc == strings.toLowerAscii(&snap.user) && sc != "public" { user = "SYS" } }
     var out: []OraPend = []
+    if base == "PROPERTY_GRAPHS" || strings.startsWith(base, "PG_") {
+        oraGraphRows(mut &out, snap, &user, base)
+        return out
+    }
     if base == "ANNOTATIONS_USAGE" || base == "ANNOTATIONS" || base == "ANNOTATION_VALUES" {
         var seen: []str = []
         for ct in snap.tabs { oraAnnotRows(mut &out, mut &seen, &ct, &user, base, false) }
@@ -678,6 +883,16 @@ fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role): []OraPend {
             if lexdb_base.isTempSchema(&sc) { continue }
             var p = oraPend(&oraOwner(&sc, &user), &"SEQUENCE")
             oraObject(mut &p, &oraUp(&lexdb_sql.baseName(&d.key)), lexdb_catalog.seqOid(&d), &"SEQUENCE", false)
+            append(mut &out, p)
+        }
+        for g in lexdb_graph.all(&snap.graphs) {
+            var p = oraPend(&oraOwner(&lexdb_sql.schemaOf(&g.key), &user), &"PROPERTY GRAPH")
+            oraObject(mut &p, &g.name, lexdb_sql.nameOid("pg", &g.key), &"PROPERTY GRAPH", false)
+            p.null("DATA_OBJECT_ID")
+            p.s("STATUS", if oraGraphValid(snap, &g) { "VALID" } else { "INVALID" })
+            p.s("TEMPORARY", "N")
+            p.s("SECONDARY", "N")
+            p.i("NAMESPACE", 1)
             append(mut &out, p)
         }
         for pr in snap.procs {
