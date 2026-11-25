@@ -36,7 +36,7 @@ feature, the number is **50000**.
 | 179 | `OUTPUT` with a constant argument in `EXEC`. |
 | 195 | An unknown function or system variable (`function x with n arguments does not exist`). |
 | 207 | An invalid column name. |
-| 208 | An invalid object name (a table, view or other relation that is not there, also the table of a view read after the table was dropped). |
+| 208 | An invalid object name (a table, view, property graph or other relation that is not there, also the table of a view or graph read after the table was dropped). |
 | 213 | The number of values in an `INSERT` does not match the table. |
 | 468 | A collation conflict between two strings. |
 | 1002 | An invalid scale in a type such as `datetime2(8)`. |
@@ -82,9 +82,9 @@ feature, the number is **50000**.
 | Number | Meaning |
 |---|---|
 | 218, 219 | A type that does not exist (on `DROP TYPE`), or one that exists already (`CREATE TYPE`). |
-| 2714 | An object, role or user that exists already, and an assertion's name taken by a table or the other way round. |
+| 2714 | An object, role or user that exists already, and an assertion's or property graph's name taken by a table or the other way round. |
 | 2715 | A data type that does not exist. |
-| 3701 | `DROP` of a table, view, procedure, function or assertion that does not exist (severity 11). |
+| 3701 | `DROP` of a table, view, procedure, function, assertion or property graph that does not exist (severity 11). |
 | 4121 | A column, function or method that cannot be found by that name. |
 | 4902 | A table named by `TRUNCATE` or similar that cannot be found. |
 | 5074 | An object depends on the column you are dropping or changing: an assertion reads it, or a `WITH SCHEMABINDING` view uses it (`DROP COLUMN` and `ALTER COLUMN`). |

@@ -121,8 +121,8 @@ quantifier:
 - `DISTINCT` inside a quantified aggregate and `WITHIN GROUP` / `OVER` after one are not supported (0A000).
 - A pattern that expands to more than 4,096 joins is refused (0A000).
 - `VERTEX_ID` and `EDGE_ID` return JSON text (`text`), as lexdb has no `json` type.
-- The Oracle door has the same `GRAPH_TABLE` operator (see [Oracle GRAPH_TABLE](../oracle/graph-table.md)); the SQL
-  Server door has none.
+- The [Oracle](../oracle/graph-table.md) and [SQL Server](../tsql/graph-table.md) doors have the same `GRAPH_TABLE`
+  operator.
 
 ## Examples
 

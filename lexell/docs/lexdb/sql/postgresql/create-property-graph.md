@@ -101,8 +101,8 @@ Without any `LABEL`, an element has the default label (its own name), with the p
   does not include property graphs).
 - `GRAPH_TABLE` reads the underlying tables with the session's own table privileges; there are no separate privileges
   on a property graph object.
-- The Oracle door has the same statement (see [Oracle CREATE PROPERTY GRAPH](../oracle/create-property-graph.md)); the
-  SQL Server door has no property graphs.
+- The [Oracle](../oracle/create-property-graph.md) and [SQL Server](../tsql/create-property-graph.md) doors have the
+  same statement.
 
 ## Examples
 

@@ -61,7 +61,8 @@ select_list ::=
 
 `FROM` *table_source*
 : Where the rows come from: tables, views, derived tables, `VALUES`, table variables, `#temp` tables, table-valued
-  functions, and their joins. See [FROM, JOIN and APPLY](from.md). Without `FROM`, the statement returns one row.
+  functions, [`GRAPH_TABLE`](graph-table.md), and their joins. See [FROM, JOIN and APPLY](from.md). Without `FROM`,
+  the statement returns one row.
 
 `WHERE` *search_condition*
 : Keeps the rows for which the condition is true.
@@ -408,6 +409,6 @@ Incorrect syntax near the keyword 'plan'.
 
 ## See also
 
-[TOP](top.md) · [FROM, JOIN and APPLY](from.md) · [GROUP BY](select-group-by.md) · [OVER](over.md) ·
+[TOP](top.md) · [FROM, JOIN and APPLY](from.md) · [GRAPH_TABLE](graph-table.md) · [GROUP BY](select-group-by.md) · [OVER](over.md) ·
 [ORDER BY](order-by.md) · [SELECT INTO](select-into.md) · [Set operators](set-operators.md) · [WITH](with.md) ·
 [Table value constructor](values.md)

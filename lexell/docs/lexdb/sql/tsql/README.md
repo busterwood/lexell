@@ -14,7 +14,7 @@ This index lists everything the door takes today. Pages not written yet are list
 |---|---|
 | [SELECT](select.md) | Queries; table hints (read and ignored), `OPTION (MAXRECURSION n)`. |
 | [TOP](top.md) | `TOP (n) [PERCENT] [WITH TIES]`. |
-| [FROM, JOIN and APPLY](from.md) | Joins, `CROSS APPLY` / `OUTER APPLY`, derived tables, table-valued functions. |
+| [FROM, JOIN and APPLY](from.md) | Joins, `CROSS APPLY` / `OUTER APPLY`, derived tables, table-valued functions, [`GRAPH_TABLE`](graph-table.md). |
 | [GROUP BY](select-group-by.md) | Grouping, `ROLLUP`, `CUBE`, `GROUPING SETS`, `HAVING`. |
 | [OVER](over.md) | Window functions and the `WINDOW` clause. |
 | [ORDER BY](order-by.md) | Sorting, `OFFSET ... FETCH`. |
@@ -49,6 +49,7 @@ This index lists everything the door takes today. Pages not written yet are list
 | [CREATE TYPE](create-type.md) (and `DROP TYPE`) | Table types (for table-valued parameters). |
 | [CREATE SEQUENCE](create-sequence.md), [ALTER SEQUENCE](alter-sequence.md), [DROP SEQUENCE](drop-sequence.md) | `NEXT VALUE FOR`. |
 | [CREATE ASSERTION](create-assertion.md), [DROP ASSERTION](drop-assertion.md) | The SQL standard's constraint across tables; lexdb's own here (SQL Server has none); `DEFERRABLE`. |
+| [CREATE PROPERTY GRAPH](create-property-graph.md), [DROP PROPERTY GRAPH](drop-property-graph.md) | SQL:2023 property graphs (SQL/PGQ; SQL Server has none), queried with [`GRAPH_TABLE`](graph-table.md). |
 | [CREATE SCHEMA](create-schema.md), [DROP SCHEMA](drop-schema.md) | |
 | [ALTER DATABASE](alter-database.md) | `SET` options (most read and kept; `READ_ONLY`, `SINGLE_USER`, `OFFLINE` refused). |
 | [sp_rename](sp-rename.md) | Renames a table, column or index. |

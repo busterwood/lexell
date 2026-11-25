@@ -110,7 +110,7 @@ Without any `LABEL`, an element has the default label (its own name), with the p
 - `COMMENT ON PROPERTY GRAPH` is accepted and not kept (`USER_PG_COMMENTS.COMMENTS` stays empty), as for every
   `COMMENT ON` in lexdb. `ALTER PROPERTY GRAPH ... COMPILE` is ORA-03001, and privileges on a graph
   (`GRANT READ ON PROPERTY GRAPH`) ORA-00942: `GRAPH_TABLE` reads the tables with the session's privileges.
-- The PostgreSQL door also supports property graphs (see [PostgreSQL CREATE PROPERTY GRAPH](../postgresql/create-property-graph.md)). SQL Server has none: the statement is a syntax error in that door (Msg 102).
+- The [PostgreSQL](../postgresql/create-property-graph.md) and [SQL Server](../tsql/create-property-graph.md) doors also support property graphs.
 
 ## Examples
 

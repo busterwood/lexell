@@ -18,6 +18,7 @@ table_source ::=
   | derived_table [ AS ] table_alias [ ( column_alias [ ,...n ] ) ]
   | ( VALUES ( expression [ ,...n ] ) [ ,...n ] ) [ AS ] table_alias [ ( column_alias [ ,...n ] ) ]
   | table_valued_function ( [ argument [ ,...n ] ] ) [ [ AS ] table_alias ]
+  | GRAPH_TABLE ( ... ) [ [ AS ] table_alias [ ( column_alias [ ,...n ] ) ] ]
   | joined_table
 }
 
@@ -59,6 +60,9 @@ join_type ::=
 *table_valued_function*
 : `GENERATE_SERIES (start, stop [, step])`, whose column is `value`, or an inline or multi-statement table-valued
   function of the user's.
+
+`GRAPH_TABLE (...)`
+: Matches a pattern over a property graph (SQL/PGQ). See [GRAPH_TABLE](graph-table.md).
 
 `INNER JOIN`
 : The pairs of rows for which the `ON` condition is true. `JOIN` alone is `INNER JOIN`.
@@ -290,4 +294,4 @@ Incorrect syntax near the keyword 'UNPIVOT'.
 
 ## See also
 
-[SELECT](select.md) · [Table value constructor](values.md) · [UPDATE](update.md) · [DELETE](delete.md)
+[SELECT](select.md) · [GRAPH_TABLE](graph-table.md) · [Table value constructor](values.md) · [UPDATE](update.md) · [DELETE](delete.md)
