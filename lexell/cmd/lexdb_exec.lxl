@@ -15843,6 +15843,11 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         append(mut &cols, OutCol{name: t.cols[i].name.clone(), oid: t.cols[i].typ.oid, spell: t.cols[i].spell.clone(), coll: t.cols[i].coll.clone(), scale: -1})
         append(mut &names, t.cols[i].name.clone())
     }
+    // (FORCE_NOT_NULL's and FORCE_NULL's columns checked before the client is asked for the data, as PostgreSQL: a name that is
+    // no column of the table is 42703 "column ... of relation ... does not exist")
+    for x in lexdb_copyjson.unknownCol(&s.copy.forceNotNull, &s.copy.forceNull, &t.cols) { return Err(e("42703", &("column \"" + x + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" does not exist"))) }
+    let fnn = try forced(&s.copy.forceNotNull, &names, &"FORCE_NOT_NULL")
+    let fnl = try forced(&s.copy.forceNull, &names, &"FORCE_NULL")
     if !input.have { return Ok(Res{cols: cols, rows: [], tag: "", hasRows: false, copy: COPY_IN}) }
     // WITH (batch_rows n): a commit each n rows (9.87), so a large load
     // holds no more than n rows' writes; not inside a block, which commits
@@ -15871,8 +15876,7 @@ fn copyStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         }
         None {}
     }
-    var rd = CopyRd{at: 0, line: 0, start: 0, stops: s.copy.delim[0..1] + "\n\r\\", notNull: try forced(&s.copy.forceNotNull, &names, &"FORCE_NOT_NULL"),
-                    forceNull: try forced(&s.copy.forceNull, &names, &"FORCE_NULL")}
+    var rd = CopyRd{at: 0, line: 0, start: 0, stops: s.copy.delim[0..1] + "\n\r\\", notNull: fnn, forceNull: fnl}
     var vs: []Val = []
     var count = 0
     var skipped = 0                         // the rows ON_ERROR ignore skipped
@@ -16619,7 +16623,7 @@ fn forced(list: &[]str, names: &[]str, opt: &str): Result[[]bool, DbErr] {
                 found = true
             }
         }
-        if !found { return Err(e("42703", &(opt + " column \"" + x + "\" not referenced by COPY"))) }
+        if !found { return Err(e("42P10", &(opt + " column \"" + x + "\" not referenced by COPY"))) }
     }
     return Ok(r)
 }
