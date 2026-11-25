@@ -1,13 +1,7 @@
 # Lexell performance
 
-Measured on 24–25 November 2026 (applications, LexDB PostgreSQL baseline and commands at `b28afb4c`;
-microbenchmarks and LexDB TPC-H SF1 updated on `main` at `870cb22a` after three rounds of compiler
-optimizations: single-pointer immutable borrows for boxed records and closed types, forward
-consuming `for` loops, `const` `cap == 0` string drop elision, `quietRt` inline float math, loop
-mask/shift range facts with `MAX_FACTS = 256`, fused 2-, 4- and 8-byte little-endian loads on both
-byte slices and `&str`, 8-arm exhaustive `match` jump tables, self-tail-call optimization, `movdqu`
-16-byte stack-parameter forwarding, `arithInto` shifts and direct loads, and loop range-check
-elimination via versioning).
+Measured on 24–25 November 2026 on `main` (microbenchmarks and LexDB TPC-H at `870cb22a`;
+applications, commands and the remaining LexDB suites at `b28afb4c`).
 Every number compares Lexell only with external tools or databases.
 Lexell's own C backend and earlier builds are not compared.
 
@@ -60,21 +54,21 @@ warm-up run, so the JIT has compiled the hot code and JVM startup is not counted
 thread stack (`-Xss64m`) for the 10,000-deep recursion of `lists`. Arithmetic
 that Lexell checks for overflow uses `Math.addExact` and `multiplyExact` in Java.
 
-Twenty programs, native `-O`, wall time, best of 5 (`bench/bench.py --opt`). The first ten are
-the original set; `nbody` (floating point), `interp` (a stack machine: an enum with payloads run
-by a match), `closures` (stable sorts with comparator closures, calls through an array of
-functions), `matmul` (a 400 x 400 product over arrays of rows) and `pingpong` (two tasks handing
-a counter back and forth 2,000,000 times) were added on 23 November; five LexDB-shaped kernels —
+Twenty programs, native `-O`, wall time, best of 5 (`bench/bench.py --opt`): `fib`, `loop`,
+`array`, `sieve`, `alloc`, `strings`, `lists`, `trees`, `tokens`, `maps`, `nbody` (floating
+point), `interp` (a stack machine: an enum with payloads run by a match), `closures` (stable sorts
+with comparator closures and calls through an array of functions), `matmul` (a 400 x 400 product
+over arrays of rows), `pingpong` (two tasks handing a counter back and forth 2,000,000 times),
 `bitpack` (columnar bit-packed integer decode, filter and multiply-sum), `btree` (in-memory
 order-32 B-tree inserts, splits, lookups and range scans), `hashagg` (open-addressing columnar
 hash aggregation with COUNT/SUM/MIN/MAX), `varint_csv` (delimited text parsing and LEB128 varint
-encoding) and `enum_eval` (boxed closed-type SQL expression AST evaluation over columnar batches)
-— were added on 25 November. `pingpong` has no Rust port
-(Rust's lightweight tasks are an async runtime crate, and the ports use none); its Go port uses
-goroutines and channels, its Java port virtual threads and a `SynchronousQueue`. The `maps` ports
-use std `HashMap` (Rust, with its default SipHash) and `java.util.HashMap`, whose layouts differ
-from Lexell's `Map` (insertion-ordered, with u32 index slots), so for `maps` the comparison is of
-the same operations and keys, not the same data structure. Every port prints the same checksum.
+encoding) and `enum_eval` (boxed closed-type SQL expression AST evaluation over columnar batches).
+`pingpong` has no Rust port (Rust's lightweight tasks are an async runtime crate, and the ports
+use none); its Go port uses goroutines and channels, its Java port virtual threads and a
+`SynchronousQueue`. The `maps` ports use std `HashMap` (Rust, with its default SipHash) and
+`java.util.HashMap`, whose layouts differ from Lexell's `Map` (insertion-ordered, with u32 index
+slots), so for `maps` the comparison is of the same operations and keys, not the same data
+structure. Every port prints the same checksum.
 
 | program | Lexell | Rust | Lexell / Rust | Java (warm) | Lexell / Java |
 |---|---:|---:|---:|---:|---:|
@@ -132,46 +126,26 @@ runs, with its default heap, which may grow to a quarter of RAM):
 
 Java's speed here does not depend on that memory. With its heap capped at 64 MB (`-Xmx64m`),
 `lists`, `strings` and `trees` run in 60, 46 and 42 ms at a peak of 86 to 105 MB; at 16 MB they
-run 10 to 45% slower. Where Java leads on the original ten, the work is per object: `lists`,
-`trees` and `strings` allocate and free a node or string at a time. The JVM allocates by bumping
-a pointer and its young-generation collector spends its time on the objects still live, so the
-many that die young cost nothing to free: collection is about 1% of its time here, while Lexell
-frees each node when its owner is dropped (section 22). Lexell's nodes are no larger: since an
-`Option` of a box is a pointer (section 24), its `lists` and `trees` nodes are 16 and 24 bytes
-with their headers, against Java's 24, and a tree's drop makes no call but the inline free
-(section 26). What remains of Java's lead in `lists` is the recursive walk. `array` uses 4-byte `int` elements in Java against Lexell's 8-byte `int`.
-`fib` is ahead of both because a recursive function is inlined into itself one level, as C2 does
-(section 18).
+run 10 to 45% slower. Where Java leads on the allocation-heavy programs (`lists`, `trees`,
+`strings`), the work is per object: the JVM allocates by bumping a pointer and its
+young-generation collector spends its time only on live objects, so short-lived objects cost
+nothing to free, whereas Lexell frees each node when its owner is dropped. Lexell's nodes are no
+larger: an `Option` of a box is a pointer, so its `lists` and `trees` nodes are 16 and 24 bytes
+with their headers, against Java's 24.
 
-The added programs found the generated code's weak cases, and the fixes are in
-(`lexell/design/opt-experiments.md`, sections 20, 21, 23, 25 and 30, plus direct float memory
-stores in `genAssign` and `0.0f` `fillLoop` at `615087ea`): `matmul` dropped from 148 ms to
-98 ms and is now ahead of Rust (104 ms, 0.94), though Lexell still does not vectorise loops
-as Java's C2 JIT does (30 ms). `nbody` is level with Java and 1.54 times Rust's, where LLVM
-unrolls the loop over the five bodies and computes two pairs at a time with vector instructions.
-Rust's `sort_by` is still ahead of `sortBy` in `closures`, which is ahead of Java's `List.sort`.
-The interpreter loop (`interp`, 151 ms) is 26% ahead of Rust's (205 ms) and more than twice
-Java's speed (327 ms). A task switch is Lexell's own: a round trip of two hand-overs takes 96 ns,
-against Go's 185 ns over channels and 924 ns for Java's virtual threads in this run.
+On `matmul` (88 ms), Lexell is 1.59× faster than Rust (140 ms), while Java's C2 JIT auto-vectorises
+the inner loop (31 ms). On `nbody` (241 ms), Lexell is level with Java (242 ms) and behind Rust
+(159 ms), where LLVM unrolls and vectorises the pairwise force loop. Rust's `sort_by` leads on
+`closures` (61 vs 98 ms), while Lexell is ahead of Java's `List.sort` (162 ms). `interp` (154 ms)
+is 26% ahead of Rust (206 ms) and more than twice Java's speed (328 ms). In `pingpong`, a round
+trip of two task hand-overs takes 95 ns in Lexell, against 174 ns over Go channels and 828 ns for
+Java virtual threads. `tokens` uses `&str` views of the source in all three languages (104 ms vs
+Rust's 95 ms and Java's 187 ms).
 
-`tokens` uses views of the source (identifiers are `&str` slices, and the intern
-table holds them), in all three languages, with the same output; at 102 ms it is within 8% of
-Rust (95 ms) and ahead of Java (173 ms).
-
-The five LexDB-shaped benchmarks added on 25 November exposed specific native-backend gaps that
-were closed across Rounds 2 and 3 (`9614ce09` and `870cb22a`): fused 2-, 4- and 8-byte
-little-endian loads (for both byte slices and `&str`), loop range-check elimination via versioning
-(`versionLoop`), `arithInto` constant shifts and direct loads, raising `loops.lxl`'s `MAX_FACTS` to
-256 with loop-invariant mask tracking (`h = (h + 1) & mask`), 8-arm exhaustive `match` jump tables,
-self-tail-call optimization, and `movdqu` 16-byte stack-parameter forwarding. Together, these cut
-`bitpack` instructions by 46% (407 ms, 1.49× faster than Java's 606 ms), `array` by 25% (253 ms,
-1.33× faster than Rust's 337 ms and faster than Java's 273 ms), `matmul` by 19.5% (88 ms, 1.59×
-faster than Rust's 140 ms), `enum_eval` by 31% (141 ms, within 9% of Rust's 130 ms), and `hashagg`
-by 21.5% (154 ms). `varint_csv` (75 ms) is ahead of both Rust (77 ms) and Java (103 ms), and
-`btree` (101 ms) is level with Rust (101 ms) and within 5% of Java (96 ms). On LexDB itself
-(`lexdb.lxl`), the series shrank the binary by ~510 KB (14.51 to 14.06 MB) and reduced TPC-H SF1
-total wall time by ~2.0% across the three rounds, bringing all 22 queries below 8 seconds
-(7,941 ms, with `q9` down 53 ms and all 22 checksums unchanged).
+On the five database-kernel benchmarks, Lexell leads Java on `bitpack` (407 vs 606 ms) and leads
+both Rust and Java on `varint_csv` (75 vs 77 and 103 ms), matches Rust on `btree` (101 vs 101 ms;
+Java 96 ms), and trails Rust and Java on `enum_eval` (141 vs 130 and 112 ms) and `hashagg` (154 vs
+125 and 121 ms).
 
 ## Applications
 
@@ -315,7 +289,7 @@ The full record, the rules and the commands are in `lexell/design/lexdb-benchmar
 ### TPC-H derived (SF1)
 
 22 queries, SF1, warm, median of 3, at a fixed clock with boost off; every result checked against
-PostgreSQL's (LexDB at `870cb22a` / `0e3250e9`, PostgreSQL 18.6 from the `b28afb4c` run):
+PostgreSQL's:
 
 | | LexDB (one core) | PostgreSQL, one core | PostgreSQL, four processes |
 |---|---:|---:|---:|
@@ -369,7 +343,7 @@ with 8 clients is 0.43–0.44 ms at the median and 0.96 ms at p99.
 
 ### Analytic queries
 
-35 queries over 1M-row tables (scans, joins, groups, windows; median of 5, at `b28afb4c`):
+35 queries over 1M-row tables (scans, joins, groups, windows; median of 5):
 LexDB's CPU is 0.49 of PostgreSQL's on one core (geometric mean; wall 0.60), and its wall time
 0.98 of PostgreSQL's on four processes; 33 of 35 are level with or ahead of PostgreSQL on one core
 on CPU (34 of 35 on wall time).
@@ -415,7 +389,7 @@ on CPU (34 of 35 on wall time).
 
 ### Bulk loads
 
-`\copy`, median of 3, not pinned (at `b28afb4c`):
+`\copy`, median of 3, not pinned:
 
 | workload | LexDB | PostgreSQL 18 | LexDB / PG | LexDB peak RSS |
 |---|---:|---:|---:|---:|
