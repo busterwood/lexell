@@ -88,8 +88,24 @@ type SlotMeta = value record {
 type LastLeaf = record { tree: int; shape: int; path: []int; lo: []str; hasLo: []bool; hi: []str; hasHi: []bool }
 
 // An old version of a node, kept while a snapshot can see it: the commits
-// [since, until) saw it.
-type Hist = record { since: int; until: int; node: lexdb_page.Node }
+// [since, until) saw it. Single-entry leaf mutations store a tiny undo delta
+// (H_OVER/H_INS/H_DEL) instead of eagerly copying the full leaf, and
+// materialize full nodes only when a snapshot actually reads that slot.
+const H_FULL = 0
+const H_OVER = 1
+const H_INS = 2
+const H_DEL = 3
+
+type Hist = record {
+    since: int
+    until: int
+    op: int
+    at: int
+    oldSize: int
+    oldKey: Option[rc str]
+    oldVal: Option[rc str]
+    node: []lexdb_page.Node
+}
 
 // A live snapshot: it sees the store as it was after commit seq.
 type Snap = value record { id: int; seq: int; cancelled: bool }
@@ -362,6 +378,8 @@ pub type Txn = record {
     snapLate: int               // Db.lateRoots when it began
     track: bool                 // a snapshot's reads are noted (Mark) for its writes' commit: a transaction block
     pub live: bool              // a block's reads go to the live tree for now (its UPDATE and DELETE: 9.16)
+    pub lazySnap: bool          // a block whose snapshot has not been taken yet (taken lazily on first SELECT)
+    pub rc: bool                // READ COMMITTED isolation: per-statement snapshot, row-locked writes
     pub sql: lexdb_session.SqlTxn // the SQL layer's state; store carries it, never reads it
     pub now: int                // when it began, Unix microseconds: SQL's now() (9.76) and a renewed snapshot's
     // Read-ahead's run size where the last scan left it, and its tree: a
@@ -392,13 +410,18 @@ pub type Txn = record {
 }
 
 pub fn begin(): Txn {
-    return Txn{reads: [], writes: [], cuts: [], idxTrees: [], idx: [], runs: [], sortedN: [], created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), snapLate: 0, track: false, live: false, sql: lexdb_session.newSqlTxn(), now: time.now().unixMicros(),
+    return Txn{reads: [], writes: [], cuts: [], idxTrees: [], idx: [], runs: [], sortedN: [], created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), snapLate: 0, track: false, live: false, lazySnap: false, rc: false, sql: lexdb_session.newSqlTxn(), now: time.now().unixMicros(),
                raTree: -1, ra: AHEAD_MIN, fsnap: [], lockId: 0, held: [], quiet: false, openEnd: false,
                tmp: "", tmpDdl: false, onCommit: []}
 }
 
 // A transaction block's (BEGIN ... COMMIT), not a statement's own.
-pub fn (t: &Txn) inBlock(): bool { return t.track }
+pub fn (t: &Txn) inBlock(): bool { return t.track || t.rc }
+
+pub fn (t: mut &Txn) setRc(rc: bool) {
+    t.rc = rc
+    t.track = !rc
+}
 
 // The owner id of its row locks (0 before its first lock).
 pub fn (t: &Txn) lockOwner(): int { return t.lockId }
@@ -832,18 +855,100 @@ fn copyNode(n: &lexdb_page.Node): lexdb_page.Node {
     return c
 }
 
+fn (db: &Db) hasDelta(s: int): bool {
+    let n = len(db.hist[s])
+    return n > 0 && db.hist[s][n - 1].op != H_FULL
+}
+
+// Reconstructs any trailing undo-delta entries on slot s into materialized
+// H_FULL nodes (walking backward from the live leaf) and drops bridge deltas.
+fn (db: mut &Db) materializeHist(s: int) {
+    let n = len(db.hist[s])
+    if n == 0 || db.hist[s][n - 1].op == H_FULL { return }
+    var first = n - 1
+    while first > 0 && db.hist[s][first - 1].op != H_FULL { first -= 1 }
+    var cur = copyNode(&db.pool[db.meta[s].frame])
+    cur.loosen()
+    let cnt = n - first
+    var nodes: [][]lexdb_page.Node = []
+    for _ in 0..cnt { append(mut &nodes, []) }
+    var i = n - 1
+    while i >= first {
+        let h = &db.hist[s][i]
+        if h.op == H_OVER {
+            match &h.oldVal {
+                Some(ov) { cur.vals[h.at] = ov.share() }
+                None {}
+            }
+        } else if h.op == H_INS {
+            let gk = collections.removeAt(cur.keys.unshare(), h.at)
+            let gv = collections.removeAt(mut &cur.vals, h.at)
+        } else if h.op == H_DEL {
+            match &h.oldKey {
+                Some(ok) { collections.insert(cur.keys.unshare(), h.at, ok.share()) }
+                None {}
+            }
+            match &h.oldVal {
+                Some(ov) { collections.insert(mut &cur.vals, h.at, ov.share()) }
+                None {}
+            }
+        }
+        cur.size = h.oldSize
+        if h.since >= 0 {
+            nodes[i - first] = [copyNode(&cur)]
+        }
+        i -= 1
+    }
+    var w = first
+    for j in first..n {
+        if db.hist[s][j].since >= 0 {
+            let h = Hist{since: db.hist[s][j].since, until: db.hist[s][j].until, op: H_FULL, at: 0, oldSize: 0,
+                         oldKey: None, oldVal: None, node: replace(mut &nodes[j - first], [])}
+            db.hist[s][w] = h
+            w += 1
+        } else {
+            db.histCount -= 1
+        }
+    }
+    while len(db.hist[s]) > w { let gone = pop(mut &db.hist[s]) }
+}
+
+// Records a single-entry leaf undo delta when possible, avoiding a full
+// copyNode on OLTP writes. Returns false if caller must fall back to willChange.
+fn (db: mut &Db) recordLeafDelta(s: int, op: int, at: int, oldSize: int, oldKey: Option[rc str], oldVal: Option[rc str]): bool {
+    let need = db.meta[s].since != db.seq && (db.meta[s].since <= db.flushedUpto || db.maxSnap() >= db.meta[s].since) && db.meta[s].loaded
+    let chain = db.hasDelta(s)
+    if !need && !chain {
+        db.meta[s].since = db.seq
+        return true
+    }
+    if len(db.hist[s]) >= 16 { return false }
+    if !db.meta[s].listed {
+        append(mut &db.histSlots, s)
+        db.meta[s].listed = true
+    }
+    let since = if need { db.meta[s].since } else { -1 }
+    let until = if need { db.seq } else { -1 }
+    append(mut &db.hist[s], Hist{since: since, until: until, op: op, at: at, oldSize: oldSize, oldKey: oldKey, oldVal: oldVal, node: []})
+    db.histCount += 1
+    db.histAdded += 1
+    db.meta[s].since = db.seq
+    return true
+}
+
 // Called before a commit changes node s's contents: its current version is
 // kept while a snapshot may read it (4.5): one that is live, or one that
 // begins before this commit is durable (snapshots read as of the last
 // durable commit, so readers never wait for the log: 9.16).
 fn (db: mut &Db) willChange(s: int) {
+    if db.hasDelta(s) { db.materializeHist(s) }
     if db.meta[s].since == db.seq { return }
     if (db.meta[s].since <= db.flushedUpto || db.maxSnap() >= db.meta[s].since) && db.meta[s].loaded {
         if !db.meta[s].listed {
             append(mut &db.histSlots, s)
             db.meta[s].listed = true
         }
-        append(mut &db.hist[s], Hist{since: db.meta[s].since, until: db.seq, node: copyNode(&db.pool[db.meta[s].frame])})
+        append(mut &db.hist[s], Hist{since: db.meta[s].since, until: db.seq, op: H_FULL, at: 0, oldSize: 0, oldKey: None, oldVal: None, node: [copyNode(&db.pool[db.meta[s].frame])]})
         db.histCount += 1
         db.histAdded += 1
     }
@@ -907,22 +1012,30 @@ fn (db: mut &Db) prune() {
             let s = db.histSlots[r]
             let hs = &db.hist[s]
             var anyDrop = false
+            var anyKeep = false
+            var hasD = false
             for j in 0..len(hs) {
-                if !snapNeeds(&live, minL, maxL, hs[j].since, hs[j].until, db.durableSeq) {
-                    anyDrop = true
-                    break
-                }
+                if hs[j].op != H_FULL { hasD = true }
+                let keep = hs[j].since >= 0 && snapNeeds(&live, minL, maxL, hs[j].since, hs[j].until, db.durableSeq)
+                if keep { anyKeep = true } else { anyDrop = true }
             }
             if !anyDrop {
                 db.histSlots[w] = s
                 w += 1
                 continue
             }
+            if !anyKeep {
+                db.histCount -= len(db.hist[s])
+                db.hist[s] = []
+                db.meta[s].listed = false
+                continue
+            }
+            if hasD { db.materializeHist(s) }
             var kept: []Hist = []
             var old = replace(mut &db.hist[s], [])
             while len(old) > 0 {
                 let h = pop(mut &old)
-                if snapNeeds(&live, minL, maxL, h.since, h.until, db.durableSeq) {
+                if h.since >= 0 && snapNeeds(&live, minL, maxL, h.since, h.until, db.durableSeq) {
                     append(mut &kept, h)
                 } else {
                     db.histCount -= 1
@@ -1712,8 +1825,11 @@ fn (db: mut &Db) applyPut(tree: int, key: &str, val: &str) {
     if len(d.path) == 0 { return }       // no such tree (recovery replays a dropped tree's rows)
     for s in d.path { db.markDirty(s) }
     let leaf = d.path[len(d.path) - 1]
-    db.willChange(leaf)
-    db.pool[db.meta[leaf].frame].loosen()
+    let wasLazy = db.pool[db.meta[leaf].frame].lazy
+    if wasLazy {
+        db.willChange(leaf)
+        db.pool[db.meta[leaf].frame].loosen()
+    }
     let i = db.pool[db.meta[leaf].frame].lower(key)
     // A key past every key in the tree (the rightmost leaf, at its end): an
     // ascending load. Its splits leave the left node full, not half (as
@@ -1725,9 +1841,18 @@ fn (db: mut &Db) applyPut(tree: int, key: &str, val: &str) {
     // the next entry's after it rather than after that one (lexdb_page T_FLEAF)
     let prev = if i > 0 { db.pool[db.meta[leaf].frame].keys[i - 1].toStr() } else { "" }
     if i < cnt && db.pool[db.meta[leaf].frame].keyView(i) == key {
+        if !wasLazy {
+            let oldSize = db.pool[db.meta[leaf].frame].size
+            let oldVal = db.pool[db.meta[leaf].frame].vals[i].share()
+            if !db.recordLeafDelta(leaf, H_OVER, i, oldSize, None, Some(oldVal)) { db.willChange(leaf) }
+        }
         db.pool[db.meta[leaf].frame].size += lexdb_page.frontEntry(&prev, key, val) - lexdb_page.frontEntry(&prev, key, &db.pool[db.meta[leaf].frame].vals[i])
         db.pool[db.meta[leaf].frame].vals[i] = rc(val.clone())
     } else {
+        if !wasLazy {
+            let oldSize = db.pool[db.meta[leaf].frame].size
+            if !db.recordLeafDelta(leaf, H_INS, i, oldSize, None, None) { db.willChange(leaf) }
+        }
         var grow = lexdb_page.frontEntry(&prev, key, val)
         if i < cnt {
             grow += lexdb_page.frontEntry(key, &db.pool[db.meta[leaf].frame].keys[i], &db.pool[db.meta[leaf].frame].vals[i]) -
@@ -1750,8 +1875,16 @@ fn (db: mut &Db) applyDel(tree: int, key: &str) {
     let i = db.pool[db.meta[leaf].frame].lower(key)
     if i >= db.pool[db.meta[leaf].frame].count() || db.pool[db.meta[leaf].frame].keyView(i) != key { return }
     for s in d.path { db.markDirty(s) }
-    db.willChange(leaf)
-    db.pool[db.meta[leaf].frame].loosen()
+    let wasLazy = db.pool[db.meta[leaf].frame].lazy
+    if wasLazy {
+        db.willChange(leaf)
+        db.pool[db.meta[leaf].frame].loosen()
+    } else {
+        let oldSize = db.pool[db.meta[leaf].frame].size
+        let oldKey = db.pool[db.meta[leaf].frame].keys[i].share()
+        let oldVal = db.pool[db.meta[leaf].frame].vals[i].share()
+        if !db.recordLeafDelta(leaf, H_DEL, i, oldSize, Some(oldKey), Some(oldVal)) { db.willChange(leaf) }
+    }
     // the size front coded (as applyPut's): the next entry then follows the key before this one
     let prev = if i > 0 { db.pool[db.meta[leaf].frame].keys[i - 1].toStr() } else { "" }
     var shrink = lexdb_page.frontEntry(&prev, &db.pool[db.meta[leaf].frame].keys[i], &db.pool[db.meta[leaf].frame].vals[i])
@@ -2666,7 +2799,7 @@ fn leafIn(n: &lexdb_page.Node, lo: &str, hi: &str): int {
 // A slot not in memory is left as an item to read, with its page,
 // generation and the page it was read from. Nothing is loaded, so the
 // cache is as it was.
-fn (db: &Db) countSlot(c: mut &Cnt, s: int, nlo: &str, hasNlo: bool, nhi: &str, hasNhi: bool, whole: bool) {
+fn (db: mut &Db) countSlot(c: mut &Cnt, s: int, nlo: &str, hasNlo: bool, nhi: &str, hasNhi: bool, whole: bool) {
     if len(c.err) > 0 { return }
     var v = -3
     if c.q < 0 {
@@ -2687,19 +2820,21 @@ fn (db: &Db) countSlot(c: mut &Cnt, s: int, nlo: &str, hasNlo: bool, nhi: &str, 
         append(mut &c.items, CItem{page: db.meta[s].disk, top: len(c.tops) - 1, nlo: nlo.toStr(), hasNlo: hasNlo, nhi: nhi.toStr(), hasNhi: hasNhi, whole: whole, depth: 0})
         return
     }
-    let n = db.snapNode(s, v)
-    if n.leaf {
+    if db.snapNode(s, v).leaf {
+        let n = db.snapNode(s, v)
         c.total += if whole { n.count() } else { leafIn(n, &c.lo, &c.hi) }
         return
     }
-    for i in 0..len(n.kids) {
+    let nk = len(db.snapNode(s, v).kids)
+    for i in 0..nk {
+        let kid = db.snapNode(s, v).kids[i]
         if whole {
-            db.countSlot(c, n.kids[i], &"", false, &"", false, true)
+            db.countSlot(c, kid, &"", false, &"", false, true)
             continue
         }
-        let sp = childSpan(&c.lo, &c.hi, &n.keys, i, nlo, hasNlo, nhi, hasNhi)
+        let sp = childSpan(&c.lo, &c.hi, &db.snapNode(s, v).keys, i, nlo, hasNlo, nhi, hasNhi)
         if sp.act == 0 { continue }
-        db.countSlot(c, n.kids[i], &sp.cl, sp.hasCl, &sp.ch, sp.hasCh, sp.act == 2)
+        db.countSlot(c, kid, &sp.cl, sp.hasCl, &sp.ch, sp.hasCh, sp.act == 2)
     }
 }
 
@@ -3018,7 +3153,7 @@ fn (f: mut &Finger) pop() {
 
 // A node's version for a read as of q (snap: a snapshot's; else the live
 // tree's, -1 when loaded): verOf's codes, -2 to load it, -3 missing.
-fn (db: &Db) fingerVer(s: int, snap: bool, q: int): int {
+fn (db: mut &Db) fingerVer(s: int, snap: bool, q: int): int {
     if snap { return db.verOf(s, q) }
     return if db.meta[s].loaded { -1 } else { -2 }
 }
@@ -4492,6 +4627,30 @@ pub fn (st: &Store) beginSnapshot(): Result[Txn, lexdb_base.DbErr] { return st.s
 // commit with writes checks that none changed since (9.16).
 pub fn (st: &Store) beginBlock(): Result[Txn, lexdb_base.DbErr] { return st.snapshotTxn(true) }
 
+// A transaction block whose snapshot is taken lazily on its first snapshot read
+// (matches PostgreSQL's snapshot-on-first-query, and avoids pinning snapshots on
+// write-only blocks). rc=true runs READ COMMITTED (per-statement snapshots).
+pub fn beginBlockLazy(rc: bool): Txn {
+    var t = begin()
+    t.track = !rc
+    t.lazySnap = true
+    t.rc = rc
+    return t
+}
+
+// Installs a fresh snapshot onto t without disturbing t.reads, t.writes, or t.now.
+pub fn (st: &Store) takeSnapshot(t: mut &Txn): Result[Unit, lexdb_base.DbErr] {
+    var fresh = try st.snapshotTxn(t.track)
+    if t.snap >= 0 { st.endSnap(t.snap) }
+    t.snap = fresh.snap
+    t.snapSeq = fresh.snapSeq
+    t.snapTrees = replace(mut &fresh.snapTrees, newMap())
+    t.snapLate = fresh.snapLate
+    t.fsnap = replace(mut &fresh.fsnap, [])
+    t.lazySnap = false
+    return Ok(Unit{})
+}
+
 fn (st: &Store) snapshotTxn(track: bool): Result[Txn, lexdb_base.DbErr] {
     var t = begin()
     t.track = track
@@ -4545,6 +4704,7 @@ pub fn (t: &Txn) snapshotSeq(): int { return t.snapSeq }
 pub fn (st: &Store) releaseSnapshot(t: mut &Txn) {
     st.endSnap(t.snap)
     t.snap = -1
+    t.lazySnap = true
 }
 
 // A block's snapshot taken again, as of now, and its now() with it: for a
@@ -4559,6 +4719,7 @@ pub fn (st: &Store) renewSnapshot(t: mut &Txn): Result[Unit, lexdb_base.DbErr] {
     t.snapSeq = fresh.snapSeq
     t.snapTrees = replace(mut &fresh.snapTrees, newMap())
     t.snapLate = fresh.snapLate
+    t.lazySnap = false
     t.now = fresh.now
     t.reads = []                    // (an earlier run's, gone with its snapshot)
     return Ok(Unit{})
@@ -4617,17 +4778,27 @@ pub fn (st: &Store) lockRow(t: mut &Txn, tree: int, key: &str, mode: int, wait: 
 // The version of slot s a snapshot at seq q sees: -1 the current one (in
 // memory), -2 the current one (to load), -3 none (a bug), else the index of
 // an old version.
-fn (db: &Db) verOf(s: int, q: int): int {
+fn (db: mut &Db) verOf(s: int, q: int): int {
     if !db.meta[s].used { return -3 }
     if db.meta[s].since <= q { return if db.meta[s].loaded { -1 } else { -2 } }
     for i in 0..len(db.hist[s]) {
-        if db.hist[s][i].since <= q && q < db.hist[s][i].until { return i }
+        let h = &db.hist[s][i]
+        if h.since >= 0 && h.since <= q && q < h.until {
+            if h.op != H_FULL {
+                db.materializeHist(s)
+                for j in 0..len(db.hist[s]) {
+                    if db.hist[s][j].since >= 0 && db.hist[s][j].since <= q && q < db.hist[s][j].until { return j }
+                }
+                return -3
+            }
+            return i
+        }
     }
     return -3
 }
 
 fn (db: &Db) snapNode(s: int, v: int): &lexdb_page.Node {
-    if v >= 0 { return &db.hist[s][v].node }
+    if v >= 0 { return &db.hist[s][v].node[0] }
     return &db.pool[db.meta[s].frame]
 }
 
@@ -5859,7 +6030,7 @@ fn (db: &Db) cutSlot(s: int, tree: int, c: mut &CkCut) {
 }
 
 // Whether the snapshot still has every inner node of the cut.
-fn (db: &Db) innersAt(c: &CkCut): bool {
+fn (db: mut &Db) innersAt(c: &CkCut): bool {
     for cn in c.nodes {
         if cn.leaf { continue }
         if db.meta[cn.slot].gen != cn.gen { return false }

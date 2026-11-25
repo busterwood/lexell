@@ -8315,12 +8315,22 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             if t.text == "start" { try p.expectKw("transaction") } else {
                 let a = p.acceptKw("transaction") || p.acceptKw("work")
             }
-            // READ ONLY makes a snapshot; ISOLATION LEVEL and the rest are
-            // accepted (read-write blocks are serializable).
+            // READ ONLY makes a snapshot; ISOLATION LEVEL selects READ COMMITTED
+            // or SERIALIZABLE (REPEATABLE READ maps to SERIALIZABLE, READ UNCOMMITTED to READ COMMITTED).
             var b = lexdb_sql.newStmt(S_BEGIN)
             while p.peek().kind != T_EOF && !(p.peek().kind == T_OP && p.peek().text == ";") {
                 if p.acceptKw("read") {
                     if p.acceptKw("only") { b.ifFlag = true } else { let wr = p.acceptKw("write") }
+                } else if p.acceptKw("isolation") {
+                    let lv = p.acceptKw("level")
+                    if p.acceptKw("read") {
+                        if p.acceptKw("committed") || p.acceptKw("uncommitted") { b.table = "read committed" }
+                    } else if p.acceptKw("serializable") {
+                        b.table = "serializable"
+                    } else if p.acceptKw("repeatable") {
+                        let rr = p.acceptKw("read")
+                        b.table = "serializable"
+                    }
                 } else {
                     p.pos += 1
                 }
@@ -8436,7 +8446,34 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 if v.kind == T_STR { p.pos += 1; append(mut &st.names, v.text.clone()) } else { append(mut &st.names, try p.name()) }
                 return Ok(st)
             }
-            var known = false
+            // SET [SESSION CHARACTERISTICS AS] TRANSACTION ISOLATION LEVEL ...
+            let txChar = t.text == "set" && p.acceptKw("characteristics")
+            if txChar {
+                let asKw = p.acceptKw("as")
+            }
+            if t.text == "set" && p.acceptKw("transaction") {
+                if p.acceptKw("isolation") {
+                    let lv = p.acceptKw("level")
+                    var iso = ""
+                    if p.acceptKw("read") {
+                        if p.acceptKw("committed") || p.acceptKw("uncommitted") { iso = "read committed" }
+                    } else if p.acceptKw("serializable") {
+                        iso = "serializable"
+                    } else if p.acceptKw("repeatable") {
+                        let rr = p.acceptKw("read")
+                        iso = "serializable"
+                    }
+                    if len(iso) > 0 {
+                        st.table = if txChar { "default_transaction_isolation" } else { "transaction_isolation" }
+                        st.limit = Some(Expr.Lit(Val.Text(iso)))
+                        p.skipToEnd()
+                        return Ok(st)
+                    }
+                }
+                p.skipToEnd()
+                return Ok(st)
+            }
+            var known = p.isKw("default_transaction_isolation") || p.isKw("transaction_isolation")
             for name in lexdb_sql.settingsList() { if p.isKw(&name) { known = true } }
             if known && (t.text == "set" || t.text == "reset") {
                 st.table = p.toks[p.pos].text.clone()

@@ -597,6 +597,40 @@ fn keepCommon(keys: mut &[]str, cnts: mut &[]int, key: &str, c: int) {
     }
 }
 
+// Target sample size for ANALYZE on large tables (matching PostgreSQL's
+// 300 * default_statistics_target = 30,000 rows). Tables at or below this
+// size are scanned exactly.
+const SAMPLE_TARGET: int = 30000
+
+fn scaleDist(d: int, s: int, n: int, f1: int): int {
+    if s <= 0 || n <= s || d <= 0 { return d }
+    if f1 >= 0 {
+        let denom = float(s - f1) + float(f1) * float(s) / float(n)
+        var est = if denom > 0.0f { int(float(s) * float(d) / denom + 0.5f) } else { n }
+        if est < d { est = d }
+        if est > n { est = n }
+        return est
+    }
+    if d >= s * 4 / 5 {
+        var est = int(float(d) * float(n) / float(s) + 0.5f)
+        if est < d { est = d }
+        if est > n { est = n }
+        return est
+    }
+    return if d > n { n } else { d }
+}
+
+fn scaleSamp(sp: mut &Samp, scale: float, tot: int) {
+    if scale == 1.0f { return }
+    sp.nn = if tot > 0 { min(tot, int(float(sp.nn) * scale + 0.5f)) } else { int(float(sp.nn) * scale + 0.5f) }
+    for i in 0..len(sp.lt) {
+        sp.lt[i] = int(float(sp.lt[i]) * scale + 0.5f)
+        var eq = int(float(sp.eq[i]) * scale + 0.5f)
+        if eq < 1 { eq = 1 }
+        sp.eq[i] = eq
+    }
+}
+
 // Table t's statistics counted from its rows on snap, written in txn; its
 // rows. deadline: the statement's timeout (0 none). It takes turns (9.15)
 // as a statement does: after lexdb_base.TURN_NS of reading, the other
@@ -604,6 +638,11 @@ fn keepCommon(keys: mut &[]str, cnts: mut &[]int, key: &str, c: int) {
 // second; the automatic one runs beside them: optimizer 44).
 fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &lexdb_store.Txn, t: &Table,
                 deadline: int, up: &Up): Result[int, DbErr] {
+    let rel = lexdb_catalog.relOf(t)
+    let exactRows = try lexdb_access.rowCount(st, snap, &rel)
+    let sampling = exactRows > SAMPLE_TARGET
+    let stride = if sampling { max(2, exactRows / SAMPLE_TARGET) } else { 1 }
+    var skip = 0
     var rows = 0
     var turnEnd = time.monotonicNs() + lexdb_base.TURN_NS
     var entries: []int = []
@@ -666,7 +705,11 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
             turnEnd = time.monotonicNs() + lexdb_base.TURN_NS
         }
         var batch: [][]Val = []
-        try lexdb_access.fetch(st, snap, &lexdb_catalog.relOf(t), -1, false, &sc, &all, mut &cur, mut &batch)
+        if sampling {
+            try lexdb_access.sampleFetch(st, snap, &rel, stride, mut &cur, mut &skip, mut &batch)
+        } else {
+            try lexdb_access.fetch(st, snap, &rel, -1, false, &sc, &all, mut &cur, mut &batch)
+        }
         for r in batch {
             rows += 1
             // (a batch's rows counted take milliseconds with several indexes)
@@ -747,24 +790,44 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
             }
         }
     }
+    let finalRows = if sampling { exactRows } else { rows }
+    let scale = if sampling && rows > 0 { float(exactRows) / float(rows) } else { 1.0f }
     var out = ""
-    out += &(t.tree.toStr() + ";" + rows.toStr())
+    out += &(t.tree.toStr() + ";" + finalRows.toStr())
     if pkn > 0 {
         // the primary key's, under the table's tree
         if rows > 0 && pkn >= 2 { keepCommon(mut &pkKeys, mut &pkCnts, &runKey, run) }
         if rows > 0 { pkSamp.add(&runKey, runLt, run, runNum) }
+        if sampling {
+            for j in 0..pkn - 1 { pkDist[j] = scaleDist(pkDist[j], rows, finalRows, -1) }
+            pkDist[pkn - 1] = finalRows
+            for x in 0..len(pkCnts) { pkCnts[x] = int(float(pkCnts[x]) * scale + 0.5f) }
+        }
         var ds: []str = []
         for d in pkDist { append(mut &ds, d.toStr()) }
-        out += &(";" + t.tree.toStr() + ":" + rows.toStr() + ":" + strings.join(&ds, ","))
-        let avg = if pkDist[0] > 0 { rows / pkDist[0] } else { 0 }
+        out += &(";" + t.tree.toStr() + ":" + finalRows.toStr() + ":" + strings.join(&ds, ","))
+        let avg = if pkDist[0] > 0 { finalRows / pkDist[0] } else { 0 }
         var parts: []str = []
         for x in 0..len(pkKeys) { if pkCnts[x] > avg { append(mut &parts, toHex(&pkKeys[x]) + "=" + pkCnts[x].toStr()) } }
-        out += &(":" + strings.join(&parts, ",") + spanText(pkNums, pkMin, pkMax) + ":" + sampText(&pkSamp.done(rows, pkNums > 0)))
+        var sp = pkSamp.done(rows, pkNums > 0)
+        if sampling { scaleSamp(mut &sp, scale, finalRows) }
+        out += &(":" + strings.join(&parts, ",") + spanText(pkNums, pkMin, pkMax) + ":" + sampText(&sp))
     }
     for i in 0..len(t.indexes) {
+        let finalEnt = if !sampling { entries[i] } else if t.indexes[i].pred.isNone() { exactRows } else { min(exactRows, int(float(entries[i]) * scale + 0.5f)) }
+        let iScale = if sampling && entries[i] > 0 { float(finalEnt) / float(entries[i]) } else { 1.0f }
+        var f1 = -1
+        if sampling && len(seen[i]) > 0 {
+            f1 = 0
+            let m0 = &seen[i][0]
+            for x in 0..m0.size() { if m0.getOr(m0.keyAt(x), 0) == 1 { f1 += 1 } }
+        }
         var ds: []str = []
-        for m in seen[i] { append(mut &ds, m.size().toStr()) }
-        out += &(";" + t.indexes[i].tree.toStr() + ":" + entries[i].toStr() + ":" + strings.join(&ds, ","))
+        for j in 0..len(seen[i]) {
+            let d = if sampling { scaleDist(seen[i][j].size(), entries[i], finalEnt, if j == 0 { f1 } else { -1 }) } else { seen[i][j].size() }
+            append(mut &ds, d.toStr())
+        }
+        out += &(";" + t.indexes[i].tree.toStr() + ":" + finalEnt.toStr() + ":" + strings.join(&ds, ","))
         // the most common values of its leading column: above the average,
         // at most COMMON_MAX, as hex=count (optimizer 23)
         if len(seen[i]) > 0 && seen[i][0].size() > 0 {
@@ -778,8 +841,13 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
                 keepCommon(mut &keys, mut &cnts, m.keyAt(x), c)
             }
             var parts: []str = []
-            for x in 0..len(keys) { append(mut &parts, toHex(&keys[x]) + "=" + cnts[x].toStr()) }
-            out += &(":" + strings.join(&parts, ",") + spanText(nums[i], mins[i], maxs[i]) + ":" + sampText(&(try mapSamples(m, &keyNums[i], nums[i] > 0))))
+            for x in 0..len(keys) {
+                let scCnt = if sampling { int(float(cnts[x]) * iScale + 0.5f) } else { cnts[x] }
+                append(mut &parts, toHex(&keys[x]) + "=" + scCnt.toStr())
+            }
+            var sp = try mapSamples(m, &keyNums[i], nums[i] > 0)
+            if sampling { scaleSamp(mut &sp, iScale, finalEnt) }
+            out += &(":" + strings.join(&parts, ",") + spanText(nums[i], mins[i], maxs[i]) + ":" + sampText(&sp))
         } else {
             out += &(":" + spanText(0, 0.0f, 0.0f) + ":")
         }
@@ -787,11 +855,14 @@ fn analyzeTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, snap: mut &le
     if len(others) > 0 {
         // the other columns' distinct values, hexname=count
         var parts: []str = []
-        for x in 0..len(others) { append(mut &parts, toHex(&t.cols[others[x]].name) + "=" + sketches[x].count().toStr()) }
+        for x in 0..len(others) {
+            let d = if sampling { scaleDist(sketches[x].count(), rows, finalRows, -1) } else { sketches[x].count() }
+            append(mut &parts, toHex(&t.cols[others[x]].name) + "=" + d.toStr())
+        }
         out += &(";d:" + strings.join(&parts, ","))
     }
     try txn.put(lexdb_catalog.CATALOG, &(statKey(&t.name)), &(out))
-    return Ok(rows)
+    return Ok(finalRows)
 }
 
 // ---- automatic statistics (optimizer 44), as PostgreSQL's autovacuum

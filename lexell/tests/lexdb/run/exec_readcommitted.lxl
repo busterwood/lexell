@@ -1,0 +1,154 @@
+// lexdb_exec: READ COMMITTED isolation level (opt-in; default stays SERIALIZABLE):
+// - SHOW [default_]transaction_isolation defaults to serializable;
+// - BEGIN ISOLATION LEVEL READ COMMITTED takes a fresh snapshot per statement;
+// - SET TRANSACTION ISOLATION LEVEL and SET SESSION CHARACTERISTICS AS TRANSACTION
+//   ISOLATION LEVEL / SET default_transaction_isolation work and restore cleanly;
+// - Concurrent range read + disjoint update in READ COMMITTED commits without
+//   40001, while default SERIALIZABLE raises 40001;
+// - Concurrent updates to the same row in READ COMMITTED serialize via row locks
+//   with no lost updates and zero 40001 errors.
+// expect: defaults: serializable / serializable
+// expect: begin rc: read committed, sees 3 60 then 4 105, after commit: serializable
+// expect: set tx: SET / read committed, late set: 25001, after rollback: serializable
+// expect: set default: read committed / read committed, reset: serializable
+// expect: rc disjoint: COMMIT / COMMIT
+// expect: ser disjoint: COMMIT / 40001
+// expect: rc lock wait: UPDATE 1 / COMMIT, final 30
+// expect: rc concurrent: 70, failures 0
+import "task"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+fn one(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows && len(r.rows) > 0 {
+                var out = ""
+                for v in r.rows[0] { out = out + (if out == "" { "" } else { " " }) + lexdb_sql.text(&v) }
+                return out
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return e.state.clone() }
+    }
+}
+
+type Job = record { s: lexdb_exec.Session; sqls: []str }
+type Done = record { s: lexdb_exec.Session; out: str }
+
+fn runJob(j: Job): Done {
+    let Job{s: s0, sqls: sqls} = move(j)
+    var s = s0
+    var outs: []str = []
+    for q in sqls { append(mut &outs, one(mut &s, q.toStr())) }
+    return Done{s: s, out: strings.join(&outs, " / ")}
+}
+
+type Inc = record { st: lexdb_store.Store; n: int }
+
+fn rcWorker(a: Inc): int {
+    var s = lexdb_exec.newSession(a.st.share())
+    let d = one(mut &s, "set default_transaction_isolation = 'read committed'")
+    var bad = 0
+    for i in 0..a.n {
+        let b = one(mut &s, "begin")
+        let r = one(mut &s, "select sum(v) from t")
+        let yd = task.yield()
+        let u = one(mut &s, "update t set v = v + 1 where id = 1")
+        if u != "UPDATE 1" || one(mut &s, "commit") != "COMMIT" { bad += 1 }
+    }
+    s.close()
+    return bad
+}
+
+fn pause() { let z = task.sleep(30) }
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var a = lexdb_exec.newSession(st.share())
+    var b = lexdb_exec.newSession(st.share())
+    let c1 = one(mut &a, "create table t (id int primary key, v int)")
+    let c2 = one(mut &a, "insert into t values (1, 10), (2, 20), (3, 30)")
+
+    println("defaults: " + one(mut &a, "show default_transaction_isolation") + " / " + one(mut &a, "show transaction_isolation"))
+
+    // Per-statement snapshot inside BEGIN ISOLATION LEVEL READ COMMITTED
+    let b1 = one(mut &a, "begin isolation level read committed")
+    let iso1 = one(mut &a, "show transaction_isolation")
+    let s1 = one(mut &a, "select count(*), sum(v) from t")
+    let w1 = one(mut &b, "insert into t values (4, 40)")
+    let w2 = one(mut &b, "update t set v = 15 where id = 1")
+    let s2 = one(mut &a, "select count(*), sum(v) from t")
+    let cm1 = one(mut &a, "commit")
+    println("begin rc: " + iso1 + ", sees " + s1 + " then " + s2 + ", after commit: " + one(mut &a, "show transaction_isolation"))
+
+    // SET TRANSACTION ISOLATION LEVEL inside a block, rejected after a query, restored on ROLLBACK
+    let b2 = one(mut &a, "begin")
+    let st1 = one(mut &a, "set transaction isolation level read committed")
+    let iso2 = one(mut &a, "show transaction_isolation")
+    let q2 = one(mut &a, "select count(*) from t")
+    let late = one(mut &a, "set transaction isolation level serializable")
+    let rb2 = one(mut &a, "rollback")
+    println("set tx: " + st1 + " / " + iso2 + ", late set: " + late + ", after rollback: " + one(mut &a, "show transaction_isolation"))
+
+    // SET default_transaction_isolation and SET SESSION CHARACTERISTICS AS TRANSACTION ISOLATION LEVEL
+    let sd1 = one(mut &a, "set default_transaction_isolation = 'read committed'")
+    let d1 = one(mut &a, "show default_transaction_isolation")
+    let d2 = one(mut &a, "show transaction_isolation")
+    let sd2 = one(mut &a, "set session characteristics as transaction isolation level serializable")
+    println("set default: " + d1 + " / " + d2 + ", reset: " + one(mut &a, "show default_transaction_isolation"))
+
+    // Disjoint updates after full-table range read: commits in READ COMMITTED, 40001 in SERIALIZABLE
+    let x1 = one(mut &a, "begin isolation level read committed")
+    let x2 = one(mut &b, "begin isolation level read committed")
+    let xr1 = one(mut &a, "select sum(v) from t")
+    let xr2 = one(mut &b, "select sum(v) from t")
+    let xu1 = one(mut &a, "update t set v = v + 1 where id = 2")
+    let xu2 = one(mut &b, "update t set v = v + 1 where id = 3")
+    println("rc disjoint: " + one(mut &a, "commit") + " / " + one(mut &b, "commit"))
+
+    let y1 = one(mut &a, "begin")
+    let y2 = one(mut &b, "begin")
+    let yr1 = one(mut &a, "select sum(v) from t")
+    let yr2 = one(mut &b, "select sum(v) from t")
+    let yu1 = one(mut &a, "update t set v = v + 1 where id = 2")
+    let yu2 = one(mut &b, "update t set v = v + 1 where id = 3")
+    println("ser disjoint: " + one(mut &a, "commit") + " / " + one(mut &b, "commit"))
+    let rb3 = one(mut &b, "rollback")
+
+    // Concurrent updates to the same row in READ COMMITTED: wait on row lock + re-evaluate fresh row
+    task.scope(fn(sc: mut &task.Scope) {
+        let l1 = one(mut &a, "begin isolation level read committed")
+        let l2 = one(mut &a, "update t set v = v + 10 where id = 1")
+        let fb = sc.start(runJob, Job{s: lexdb_exec.newSession(st.share()), sqls: [
+            "begin isolation level read committed",
+            "update t set v = v + 5 where id = 1",
+            "commit"
+        ]})
+        pause()
+        let l3 = one(mut &a, "commit")
+        let Done{s: bs0, out: bout} = fb.wait().unwrap()
+        var bs = bs0
+        bs.close()
+        let parts = strings.split(&bout, " / ")
+        println("rc lock wait: " + parts[1] + " / " + parts[2] + ", final " + one(mut &a, "select v from t where id = 1"))
+
+        var ws: []task.Future[int] = []
+        for i in 0..4 { append(mut &ws, sc.start(rcWorker, Inc{st: st.share(), n: 10})) }
+        var bad = 0
+        while len(ws) > 0 { bad += pop(mut &ws).wait().unwrap() }
+        println("rc concurrent: " + one(mut &a, "select v from t where id = 1") + ", failures " + bad.toStr())
+    })
+
+    a.close()
+    b.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(17), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

@@ -977,7 +977,7 @@ pub const FN_EVAL = 2
 pub const FN_LAZY = 3           // COALESCE: its arguments evaluated in order up to the first not NULL (f: all at once)
 
 // An output or condition its plan's owner evaluates (FN_EVAL).
-pub fn evalMark(): BX { return BX.Call(FnRef{name: "#eval", way: FN_EVAL, f: lexdb_lib.restFn, f1: lexdb_lib.no1, dialect: false}, []) }
+pub fn evalMark(): BX { return BX.Call(FnRef{name: "#eval", way: FN_EVAL, f: lexdb_lib.restFn, f1: lexdb_lib.no1, dialect: false, re: None}, []) }
 
 // Whether x is evalMark's.
 pub fn isEvalMark(x: &BX): bool {
@@ -996,6 +996,7 @@ pub type FnRef = record {
     pub f: lexdb_lib.LibFn      // the function's entry for its arguments (lexdb_lib.entryOf; restFn for FN_NONE)
     pub f1: lexdb_lib.Lib1      // FN_ONE: the function's entry for one argument (lexdb_lib.no1 else)
     pub dialect: bool           // a T-SQL or Oracle function's name: its dialect's call first, as eval
+    pub re: Option[lexdb_lib.ReCompiled]    // pre-compiled regex for constant-pattern regexp_replace
 }
 
 // x bound; None: eval evaluates it. cols: the row's columns (a column is
@@ -1083,7 +1084,7 @@ fn bindIn(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, aggs: bool, subs:
             // Oracle's timestamp minus timestamp is an interval (oraSubStamp)
             let none: []int = []
             let callName: str = if name == "#ora_sub" && oraSubStamp(&args, cols, &none, ty) { "#ora_tsdiff" } else { name.clone() }
-            let fr = if special { FnRef{name: "", way: FN_NONE, f: lexdb_lib.restFn, f1: lexdb_lib.no1, dialect: false} } else { ty.fnBind(&callName, len(args)) }
+            var fr = if special { FnRef{name: "", way: FN_NONE, f: lexdb_lib.restFn, f1: lexdb_lib.no1, dialect: false, re: None} } else { ty.fnBind(&callName, len(args)) }
             if !special && fr.way == FN_NONE { return None }
             var bs: []BX = []
             for a in args {
@@ -1097,6 +1098,26 @@ fn bindIn(x: &Expr, cols: &[]lexdb_sql.ColDef, params: &[]Val, aggs: bool, subs:
                 let tr = ty.fnBind(&name, len(bs))
                 if tr.way == FN_NONE { return None }
                 return Some(BX.Call(tr, bs))
+            }
+            if callName == "regexp_replace" && !fr.dialect && (len(bs) == 3 || len(bs) == 4) {
+                match &bs[1] {
+                    BX.Const(pv) {
+                        match pv {
+                            Val.Text(pat) {
+                                var okRepl = false
+                                match &bs[2] { BX.Const(rv) { match rv { Val.Text(_) { okRepl = true } else {} } } else {} }
+                                var flags = ""
+                                var okFlags = len(bs) == 3
+                                if len(bs) == 4 {
+                                    match &bs[3] { BX.Const(fv) { match fv { Val.Text(fs) { flags = fs.clone(); okFlags = true } else {} } } else {} }
+                                }
+                                if okRepl && okFlags { fr.re = lexdb_lib.tryCompileReplace(pat, &flags) }
+                            }
+                            else {}
+                        }
+                    }
+                    else {}
+                }
             }
             return Some(BX.Call(fr, bs))
         }
@@ -1205,7 +1226,7 @@ pub fn reslot(x: &BX, slots: mut &[]int, par: mut &bool): BX {
         BX.Call(fr, cs) {
             var bs: []BX = withCapacity(len(cs))
             for c in cs { append(mut &bs, reslot(&c, slots, par)) }
-            return BX.Call(FnRef{name: fr.name.clone(), way: fr.way, f: fr.f, f1: fr.f1, dialect: fr.dialect}, bs)
+            return BX.Call(FnRef{name: fr.name.clone(), way: fr.way, f: fr.f, f1: fr.f1, dialect: fr.dialect, re: lexdb_lib.cloneReCompiled(&fr.re)}, bs)
         }
         BX.Sub(u, i, xs) {
             par = true

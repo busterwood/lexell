@@ -1015,20 +1015,46 @@ fn startup(w: mut &Wire, ctx: &[]tls.Context): Result[bool, io.IoError] {
                 var at = 4
                 var user = ""
                 var zone = ""
+                var iso = ""
                 while at < len(m.body) {
                     let ke = strings.indexOf(&m.body, "\x00", at)
                     if ke <= at { break }
                     let ve = strings.indexOf(&m.body, "\x00", ke + 1)
                     if ve < 0 { break }
-                    if m.body[at..ke] == "user" { user = m.body[ke + 1..ve].toStr() }
+                    let pname = strings.toLowerAscii(m.body[at..ke])
+                    let pval = m.body[ke + 1..ve].toStr()
+                    if pname == "user" { user = pval }
                     // TimeZone as a startup parameter (pgJDBC sends it; PGTZ libpq's)
-                    if strings.toLowerAscii(m.body[at..ke]) == "timezone" { zone = m.body[ke + 1..ve].toStr() }
+                    else if pname == "timezone" { zone = pval }
+                    else if pname == "default_transaction_isolation" { iso = pval }
+                    else if pname == "options" {
+                        let k = "default_transaction_isolation="
+                        let pos = strings.indexOf(&strings.toLowerAscii(&pval), k, 0)
+                        if pos >= 0 {
+                            var v = strings.trim(&(pval[pos + len(k)..len(pval)].toStr()))
+                            if len(v) >= 2 && (v[0] == '\'' || v[0] == '"') {
+                                let q = v[0]
+                                let e = strings.indexOf(&v, &(v[0..1].toStr()), 1)
+                                if e > 0 { v = v[1..e].toStr() }
+                            } else {
+                                let sp = strings.indexOf(&v, " -", 0)
+                                if sp > 0 { v = v[0..sp].toStr() }
+                            }
+                            iso = strings.replaceAll(&v, "\\ ", " ")
+                        }
+                    }
                     at = ve + 1
                 }
                 if len(user) == 0 { return w.fatal(&"28000", &"no PostgreSQL user name specified in startup packet") }
                 w.sess.setUser(&user)
                 if zone != "" {
                     match w.sess.startupZone(&zone) {
+                        Ok(_) {}
+                        Err(x) { return w.fatal(&x.state, &x.msg) }
+                    }
+                }
+                if iso != "" {
+                    match w.sess.startupIsolation(&iso) {
                         Ok(_) {}
                         Err(x) { return w.fatal(&x.state, &x.msg) }
                     }

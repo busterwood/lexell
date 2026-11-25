@@ -610,6 +610,46 @@ pub fn getRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rr: &R
     }
 }
 
+// Fetches up to BATCH rows sampled every stride rows across table t, skipping
+// intermediate rows inside leaves without decoding them (for ANALYZE).
+pub fn sampleFetch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, stride: int, cur: mut &Cursor,
+                   skip: mut &int, out: mut &[][]Val): Result[Unit, DbErr] {
+    let n = rowWidth(t)
+    let places: []bool = []
+    let missing = placesMissing(t)
+    let from = if cur.started { cur.at.clone() } else { "" }
+    cur.started = true
+    var keys: []str = []
+    var vals: []str = []
+    var stopped = false
+    var nextAt = ""
+    try st.scanLeaves(txn, t.tree, &from, "", fn(leaf: &lexdb_rows.LeafView, a: int, b: int): bool {
+        let cnt = b - a
+        if cnt <= skip {
+            skip -= cnt
+            return true
+        }
+        var idx = a + skip
+        while idx < b {
+            append(mut &keys, lexdb_rows.leafKey(leaf, idx))
+            append(mut &vals, lexdb_rows.leafVal(leaf, idx))
+            idx += stride
+        }
+        skip = idx - b
+        if len(keys) >= BATCH {
+            stopped = true
+            nextAt = lexdb_rows.leafKey(leaf, b - 1) + "\x00"
+            return false
+        }
+        return true
+    })
+    if stopped { cur.at = nextAt } else { cur.done = true }
+    for i in 0..len(keys) {
+        append(out, try rowOf(st, txn, t, &keys[i], &vals[i], n, &places, &missing))
+    }
+    return Ok(Unit{})
+}
+
 // Appends up to BATCH rows of a scan to out, from the cursor on. Rows are
 // read in batches so that what is done with them (a join's lookups, an
 // index's entries) can use the transaction between.
@@ -1680,10 +1720,10 @@ pub type Picked = record {
     pub kept: int
 }
 
-// Whether stored row s is a tagged one (decodeRow's last way): not in the
-// fixed layout, not stored apart, not one with long texts kept whole.
+// Whether stored row s is a tagged one (decodeRow handles plain tagged and format-6 inline):
+// not in the fixed layout, not stored apart (0xFF BIG stub).
 fn plainTagged(s: &str): bool {
-    if len(s) > 0 && (s[0] == FIXED || s[0] == 6 || s[0] == 0xFF) { return false }
+    if len(s) > 0 && (s[0] == FIXED || s[0] == 0xFF) { return false }
     return lexdb_rows.partOf(s).isNone()
 }
 
@@ -2194,11 +2234,30 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
             break
         }
         if stop == 2 {
-            let got = if part { try st.getPart(txn, t.tree, &stopKey) } else { try st.get(txn, t.tree, &stopKey) }
+            // Decode filter columns (lz.bf) from the inline prefix first (st.getPart);
+            // only fetch full overflow and decode remaining columns (lz.br) if the row
+            // passes both WHERE and any top-N bar.
+            let got = try st.getPart(txn, t.tree, &stopKey)
             match got {
                 Some(v) {
-                    if !(try bRowOf(st, txn, t, &stopKey, &v, b.n, mut &b, bp)) { return Ok(None) }
-                    append(mut &pend, b.n)
+                    let r = b.n
+                    if !(try bRowOf(st, txn, t, &stopKey, &v, r, mut &b, &lz.bf)) { return Ok(None) }
+                    let none: []bool = []
+                    let chOpt = narrow(&none, &b, [r])
+                    if chOpt.isNone() { return Ok(None) }
+                    let ch = chOpt.unwrap()
+                    if len(ch) > 0 {
+                        kept += 1
+                        var keep = true
+                        if bar.on {
+                            let kc = &b.cols[bar.col]
+                            if barAfter(bar, kc.v[r], kc.nul[r]) { keep = false }
+                        }
+                        if keep {
+                            if !(try bRowOf(st, txn, t, &stopKey, &v, r, mut &b, &lz.br)) { return Ok(None) }
+                            append(mut &idx, r)
+                        }
+                    }
                     b.n += 1
                 }
                 None {}

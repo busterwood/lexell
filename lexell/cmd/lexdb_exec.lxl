@@ -601,7 +601,7 @@ fn callDialectFn(name: &str, vs: &[]Val, z: &lexdb_time.Zone): Result[Option[Val
 fn fnRefOf(name: &str, n: int): lexdb_bind.FnRef {
     if lexdb_bind.isAgg(name) || name == "#win" || name == "#wmark" || name == "#udf" || name == "#plf" || name == "row" || lexdb_bind.isWinFn(name) ||
        lexdb_bind.isSeqFn(name) || isSessFn(name) || lexdb_bind.isAdvFn(name) || lexdb_sql.isCatFn(name) || name == "current_schema" {
-        return lexdb_bind.FnRef{name: name.toStr(), way: lexdb_bind.FN_NONE, f: lexdb_lib.restFn, f1: lexdb_lib.no1, dialect: false}
+        return lexdb_bind.FnRef{name: name.toStr(), way: lexdb_bind.FN_NONE, f: lexdb_lib.restFn, f1: lexdb_lib.no1, dialect: false, re: None}
     }
     var way = if name == "coalesce" { lexdb_bind.FN_LAZY } else { lexdb_bind.FN_GEN }
     var f1: lexdb_lib.Lib1 = lexdb_lib.no1
@@ -614,7 +614,7 @@ fn fnRefOf(name: &str, n: int): lexdb_bind.FnRef {
             None {}
         }
     }
-    return lexdb_bind.FnRef{name: name.toStr(), way: way, f: lexdb_pipe.entryAt(name, n, catEntry), f1: f1, dialect: isDialectFn(name)}
+    return lexdb_bind.FnRef{name: name.toStr(), way: way, f: lexdb_pipe.entryAt(name, n, catEntry), f1: f1, dialect: isDialectFn(name), re: None}
 }
 
 // name's call at the clock's time, in UTC.
@@ -7201,7 +7201,16 @@ fn dupKey(t: &Table, row: &[]Val): DbErr {
                                 &("Key (" + strings.join(&names, ", ") + ")=(" + strings.join(&vals, ", ") + ") already exists."), "")
 }
 
-fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits): Result[Res, DbErr] {
+fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits, pc: mut &PlanCache): Result[Res, DbErr] {
+    if pc.keep {
+        let ver = try dmlVersion(st, txn)
+        if pc.ver != ver {
+            pc.dml = []
+            pc.ver = ver
+        } else if len(pc.dml) > 0 && pc.dml[0].kind == DML_INS {
+            return runFastIns(st, txn, &pc.dml[0], params)
+        }
+    }
     try notView(st, txn, &s.table, &"insert into")
     try dmlCheck(st, txn, s, &"a")
     let sqe = seqEnv(st, txn)
@@ -7332,6 +7341,21 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         let v = up.idMax[j]
         let next = try seqPeek(st, txn, &d)
         if (d.inc > 0 && v >= next) || (d.inc < 0 && v <= next) { try setVal(st, &d, v, true) }
+    }
+    if pc.keep && len(pc.dml) == 0 && len(s.inner) == 0 && len(s.rows) == 1 && len(s.subs) == 0 && len(s.items) == 0 &&
+       s.conflict == lexdb_sql.CONFLICT_NONE && s.mdialect == lexdb_sql.MD_PG && len(t.cols) == len(targets) &&
+       len(s.rows[0]) == len(targets) && dmlTableSimple(&t) && ovr == lexdb_sql.OVR_NONE {
+        var simple = true
+        for x in s.rows[0] { if !dmlSimpleExpr(&x) { simple = false; break } }
+        var seen: []bool = array(len(t.cols), false)
+        for ci in targets { if seen[ci] { simple = false } else { seen[ci] = true } }
+        if simple {
+            let emptyNeed: []bool = []
+            let rr = lexdb_access.rowRead(&lexdb_catalog.relOf(&t), &emptyNeed)
+            pc.dml = [DmlPlan{kind: DML_INS, t: t, rr: rr, cols: [], pkParam: -1, targets: targets,
+                              exprs: lexdb_sql.cloneAllExpr(&s.rows[0]), lmode: 0}]
+            pc.plans += 1
+        }
     }
     return Ok(retRes(ret, &("INSERT 0 " + count.toStr())))
 }
@@ -7879,10 +7903,56 @@ fn storeRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: [
     return Ok(row)
 }
 
-fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits): Result[Res, DbErr] {
+fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits, pc: mut &PlanCache): Result[Res, DbErr] {
     if s.copy.batchRows > 0 { return batchDml(st, txn, s, params, ptypes, lim) }
+    if pc.keep {
+        let ver = try dmlVersion(st, txn)
+        if pc.ver != ver {
+            pc.dml = []
+            pc.ver = ver
+        } else if len(pc.dml) > 0 && pc.dml[0].kind == DML_UPD {
+            match try runFastUpd(st, txn, &pc.dml[0], params) {
+                Some(r) { return Ok(r) }
+                None {}
+            }
+        }
+    }
     var win = noWin()
-    return updateB(st, txn, s, params, ptypes, lim, mut &win)
+    let r = try updateB(st, txn, s, params, ptypes, lim, mut &win)
+    if pc.keep && len(pc.dml) == 0 && len(s.from) == 0 && len(s.subs) == 0 && len(s.items) == 0 && s.limit.isNone() && s.mdialect == lexdb_sql.MD_PG {
+        let t = try needTable(st, txn, &s.table)
+        if dmlTableSimple(&t) {
+            match dmlPkEq(&s.where, &t) {
+                Some(pkp) {
+                    var sc = newScopeIn(st, txn, params, ptypes)
+                    sc.target = try catKey(st, txn, &s.table, false)
+                    var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, &newMap(), true, mut &sc, false)
+                    var targets: []int = []
+                    var sets: []Expr = []
+                    var simple = true
+                    var lmode = lexdb_sql.LOCK_NO_KEY_UPDATE
+                    for set in s.sets {
+                        let ci = lexdb_bind.colIndex(&q.levels[0].t.cols, &set.col)
+                        if ci < 0 { simple = false; break }
+                        let rx = try lexdb_bind.resolveAssign(&set.expr, &q.levels[0].t.cols[ci].typ, &q.cols, len(q.cols), mut &sc.names)
+                        if !dmlSimpleExpr(&rx) { simple = false; break }
+                        for p in t.pk { if p == ci { lmode = lexdb_sql.LOCK_UPDATE } }
+                        append(mut &targets, ci)
+                        append(mut &sets, rx)
+                    }
+                    endScope(mut &sc, mut &q)
+                    if simple {
+                        let emptyNeed: []bool = []
+                        let rr = lexdb_access.rowRead(&lexdb_catalog.relOf(&t), &emptyNeed)
+                        pc.dml = [DmlPlan{kind: DML_UPD, t: t, rr: rr, cols: q.cols, pkParam: pkp, targets: targets, exprs: sets, lmode: lmode}]
+                        pc.plans += 1
+                    }
+                }
+                None {}
+            }
+        }
+    }
+    return Ok(r)
 }
 
 fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits, win: mut &Win): Result[Res, DbErr] {
@@ -7950,7 +8020,8 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         }, mut &rs)
         if len(s.from) > 0 { found = onceEach(t, found, true) }
         if s.limit.isSome() { found = firstN(found, try lexdb_plan.topOf(&s.limit, params, s.topMode, len(found))) }     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
-        if !(try lockFound(st, txn, t, &found, lmode)) { break }
+        let waited = try lockFound(st, txn, t, &found, lmode)
+        if !waited && (!txn.rc || !st.liveStale(txn)) { break }
         // a lock waited for: the rows found again, holding the locks
         found = []
         held = 0
@@ -8059,10 +8130,48 @@ fn updNew(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats
     return Ok(all)
 }
 
-fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits): Result[Res, DbErr] {
+fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits, pc: mut &PlanCache): Result[Res, DbErr] {
     if s.copy.batchRows > 0 { return batchDml(st, txn, s, params, ptypes, lim) }
+    if pc.keep {
+        let ver = try dmlVersion(st, txn)
+        if pc.ver != ver {
+            pc.dml = []
+            pc.ver = ver
+        } else if len(pc.dml) > 0 && pc.dml[0].kind == DML_DEL {
+            match try runFastDel(st, txn, &pc.dml[0], params) {
+                Some(r) { return Ok(r) }
+                None {}
+            }
+        }
+    }
     var win = noWin()
-    return deleteB(st, txn, s, params, ptypes, lim, mut &win)
+    let r = try deleteB(st, txn, s, params, ptypes, lim, mut &win)
+    if pc.keep && len(pc.dml) == 0 && len(s.from) == 0 && len(s.subs) == 0 && len(s.items) == 0 && s.limit.isNone() && s.mdialect == lexdb_sql.MD_PG {
+        let t = try needTable(st, txn, &s.table)
+        if dmlTableSimple(&t) {
+            match dmlPkEq(&s.where, &t) {
+                Some(pkp) {
+                    var need: []bool = array(len(t.cols), false)
+                    for p in t.pk { need[p] = true }
+                    var ixNames: []str = []
+                    for ix in t.indexes {
+                        for c in ix.cols { if c >= 0 { need[c] = true } }
+                        for x in ix.exprs { lexdb_sql.colNames(&x, mut &ixNames) }
+                        match ix.pred { Some(p) { lexdb_sql.colNames(&p, mut &ixNames) } None {} }
+                    }
+                    for n in ixNames {
+                        let ci = lexdb_bind.colIndex(&t.cols, &lexdb_bind.colPart(&n))
+                        if ci >= 0 { need[ci] = true }
+                    }
+                    let rr = lexdb_access.rowRead(&lexdb_catalog.relOf(&t), &need)
+                    pc.dml = [DmlPlan{kind: DML_DEL, t: t, rr: rr, cols: [], pkParam: pkp, targets: [], exprs: [], lmode: lexdb_sql.LOCK_UPDATE}]
+                    pc.plans += 1
+                }
+                None {}
+            }
+        }
+    }
+    return Ok(r)
 }
 
 fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits, win: mut &Win): Result[Res, DbErr] {
@@ -8114,7 +8223,8 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         }, mut &rs)
         if len(s.from) > 0 { found = onceEach(t, found, true) }
         if s.limit.isSome() { found = firstN(found, try lexdb_plan.topOf(&s.limit, params, s.topMode, len(found))) }     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
-        if !(try lockFound(st, txn, t, &found, lexdb_sql.LOCK_UPDATE)) { break }
+        let waited = try lockFound(st, txn, t, &found, lexdb_sql.LOCK_UPDATE)
+        if !waited && (!txn.rc || !st.liveStale(txn)) { break }
         found = []
         held = 0
         txn.forgetReads(reads0)
@@ -10491,11 +10601,216 @@ fn pipeHeld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
 
 // A prepared statement's plan (select), with the catalog version it was
 // made for. keep false: never kept (a statement run once).
-pub type PlanCache = record { sels: []Sel; looks: [][]Look; ver: str; keep: bool; pub plans: int }
+const DML_UPD = 1
+const DML_DEL = 2
+const DML_INS = 3
 
-pub fn newPlanCache(): PlanCache { return PlanCache{sels: [], looks: [], ver: "", keep: true, plans: 0} }
+type DmlPlan = record {
+    kind: int
+    t: Table
+    rr: lexdb_access.RowRead
+    cols: []lexdb_sql.ColDef
+    pkParam: int
+    targets: []int
+    exprs: []Expr
+    lmode: int
+}
 
-pub fn oneShot(): PlanCache { return PlanCache{sels: [], looks: [], ver: "", keep: false, plans: 0} }
+pub type PlanCache = record { sels: []Sel; looks: [][]Look; dml: []DmlPlan; ver: str; keep: bool; pub plans: int }
+
+pub fn newPlanCache(): PlanCache { return PlanCache{sels: [], looks: [], dml: [], ver: "", keep: true, plans: 0} }
+
+pub fn oneShot(): PlanCache { return PlanCache{sels: [], looks: [], dml: [], ver: "", keep: false, plans: 0} }
+
+fn dmlVersion(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[str, DbErr] {
+    var ver = try catVersion(st, txn)
+    if len(txn.sql.path) > 0 { ver = ver + "|" + strings.join(&txn.sql.path, ",") }
+    if len(txn.tmp) > 0 { ver = ver + "|t" + st.memo.get(&tmpVerKey(txn.sql.sess)).unwrapOr("0") }
+    if !txn.sql.zone.isUtc() { ver = ver + "|z" + txn.sql.zone.name }
+    match st.memo.get(&lexdb_priv.roleKeyOf(txn.sql.sess)) {
+        Some(r) { if len(r) > 0 { ver = ver + "|r" + r } }
+        None {}
+    }
+    match st.memo.get(&lexdb_priv.sessAuthKey(txn.sql.sess)) {
+        Some(r) { if len(r) > 0 { ver = ver + "|s" + r } }
+        None {}
+    }
+    return Ok(ver)
+}
+
+fn dmlSimpleExpr(x: &Expr): bool {
+    match x {
+        Expr.Lit(_) { return true }
+        Expr.Param(_) { return true }
+        Expr.Col(_, _) { return true }
+        Expr.Unary(_, a) { return dmlSimpleExpr(&a) }
+        Expr.Bin(_, a, b) { return dmlSimpleExpr(&a) && dmlSimpleExpr(&b) }
+        Expr.IsNull(a, _) { return dmlSimpleExpr(&a) }
+        Expr.Cast(a, _) { return dmlSimpleExpr(&a) }
+        else { return false }
+    }
+}
+
+fn dmlTableSimple(t: &Table): bool {
+    if len(t.fks) > 0 || len(t.refBy) > 0 { return false }
+    for c in t.cols {
+        if c.genKind != lexdb_sql.GEN_NONE || c.identity == lexdb_sql.ID_ALWAYS || lexdb_sql.onNullOf(&c.def) != 0 || c.name == lexdb_catalog.ROWID { return false }
+    }
+    return true
+}
+
+fn dmlPkEq(w: &Option[Expr], t: &Table): Option[int] {
+    if len(t.pk) != 1 { return None }
+    let pkc = &t.cols[t.pk[0]]
+    let okType = pkc.typ.kind == lexdb_sql.K_INT ||
+                 (pkc.typ.kind == lexdb_sql.K_TEXT && pkc.typ.oid != lexdb_sql.OID_BPCHAR && lexdb_access.colCollKind(pkc) == lexdb_sql.COLL_EXACT)
+    if !okType { return None }
+    match w {
+        Some(x) {
+            match x {
+                Expr.Bin(op, a, b) {
+                    if op != "=" { return None }
+                    match &a {
+                        Expr.Col(n, _) {
+                            if lexdb_bind.colPart(n) == pkc.name {
+                                match &b { Expr.Param(p) { if p >= 1 { return Some(p - 1) } } else {} }
+                            }
+                        }
+                        Expr.Param(p) {
+                            if p >= 1 {
+                                match &b { Expr.Col(n, _) { if lexdb_bind.colPart(n) == pkc.name { return Some(p - 1) } } else {} }
+                            }
+                        }
+                        else {}
+                    }
+                }
+                else {}
+            }
+        }
+        None {}
+    }
+    return None
+}
+
+fn dmlPkKey(t: &Table, pv: &Val): Option[str] {
+    let pkc = &t.cols[t.pk[0]]
+    if pkc.typ.kind == lexdb_sql.K_INT {
+        match pv {
+            Val.Int(v) {
+                if pkc.typ.oid == lexdb_sql.OID_INT2 && (v < -32768 || v > 32767) { return None }
+                if pkc.typ.oid == lexdb_sql.OID_INT4 && (v < -2147483648 || v > 2147483647) { return None }
+                var b = ""
+                lexdb_access.encKeyPart(mut &b, pv)
+                return Some(b)
+            }
+            else { return None }
+        }
+    }
+    if pkc.typ.kind == lexdb_sql.K_TEXT {
+        match pv {
+            Val.Text(_) {
+                var b = ""
+                lexdb_access.encKeyPart(mut &b, pv)
+                return Some(b)
+            }
+            else { return None }
+        }
+    }
+    return None
+}
+
+fn runFastUpd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &DmlPlan, params: &[]Val): Result[Option[Res], DbErr] {
+    if d.pkParam < 0 || d.pkParam >= len(params) { return Ok(None) }
+    let pv = &params[d.pkParam]
+    if lexdb_ops.isNull(pv) { return Ok(Some(tagOnly("UPDATE 0"))) }
+    let pkKey = match dmlPkKey(&d.t, pv) {
+        Some(k) { k }
+        None { return Ok(None) }
+    }
+    let keep = txn.inBlock()
+    let rel = lexdb_catalog.relOf(&d.t)
+    while true {
+        let reads0 = txn.readCount()
+        match try lexdb_access.getRow(st, txn, &rel, &d.rr, &pkKey) {
+            None { return Ok(Some(tagOnly("UPDATE 0"))) }
+            Some(old) {
+                if keep || st.locks.count() > 0 {
+                    let got = try lockOf(st, txn, &d.t, &pkKey, d.lmode, lexdb_sql.WAIT_BLOCK, keep)
+                    if got == lexdb_locks.LOCKED_AFTER_WAIT || (txn.rc && st.liveStale(txn)) {
+                        txn.forgetReads(reads0)
+                        continue
+                    }
+                }
+                var next = collections.copyOf(&old)
+                let noAggs: []Val = []
+                let noSubs: []SubRes = []
+                let noSeq: Option[SeqEnv] = None
+                let env = Env{cols: &d.cols, row: &old, aggs: &noAggs, params: params, subs: &noSubs, cur: &noAggs, seq: &noSeq}
+                for k in 0..len(d.targets) {
+                    let ci = d.targets[k]
+                    next[ci] = try lexdb_ops.coerceZ(try eval(&d.exprs[k], &env), &d.t.cols[ci].typ, &txn.sql.zone)
+                }
+                let noTabs: []Table = []
+                var later: []FkLater = []
+                try updRow(st, txn, &d.t, &old, &next, &noTabs, mut &later)
+                return Ok(Some(tagOnly("UPDATE 1")))
+            }
+        }
+    }
+    return Ok(None)
+}
+
+fn runFastDel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &DmlPlan, params: &[]Val): Result[Option[Res], DbErr] {
+    if d.pkParam < 0 || d.pkParam >= len(params) { return Ok(None) }
+    let pv = &params[d.pkParam]
+    if lexdb_ops.isNull(pv) { return Ok(Some(tagOnly("DELETE 0"))) }
+    let pkKey = match dmlPkKey(&d.t, pv) {
+        Some(k) { k }
+        None { return Ok(None) }
+    }
+    let keep = txn.inBlock()
+    let rel = lexdb_catalog.relOf(&d.t)
+    while true {
+        let reads0 = txn.readCount()
+        match try lexdb_access.getRow(st, txn, &rel, &d.rr, &pkKey) {
+            None { return Ok(Some(tagOnly("DELETE 0"))) }
+            Some(old) {
+                if keep || st.locks.count() > 0 {
+                    let got = try lockOf(st, txn, &d.t, &pkKey, lexdb_sql.LOCK_UPDATE, lexdb_sql.WAIT_BLOCK, keep)
+                    if got == lexdb_locks.LOCKED_AFTER_WAIT || (txn.rc && st.liveStale(txn)) {
+                        txn.forgetReads(reads0)
+                        continue
+                    }
+                }
+                let noTabs: []Table = []
+                var later: []FkLater = []
+                try delRow(st, txn, &d.t, &old, &noTabs, mut &later)
+                return Ok(Some(tagOnly("DELETE 1")))
+            }
+        }
+    }
+    return Ok(None)
+}
+
+fn runFastIns(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &DmlPlan, params: &[]Val): Result[Res, DbErr] {
+    var row = array(len(d.t.cols), Val.Null)
+    let noCols: []lexdb_sql.ColDef = []
+    let noAggs: []Val = []
+    let noSubs: []SubRes = []
+    let noSeq: Option[SeqEnv] = None
+    let env = Env{cols: &noCols, row: &noAggs, aggs: &noAggs, params: params, subs: &noSubs, cur: &noAggs, seq: &noSeq}
+    for k in 0..len(d.targets) {
+        let ci = d.targets[k]
+        row[ci] = try lexdb_ops.coerceZ(try eval(&d.exprs[k], &env), &d.t.cols[ci].typ, &txn.sql.zone)
+    }
+    try checkRow(&d.t, &row)
+    try checkChecks(&d.t, &row)
+    let noTabs: []Table = []
+    var later: []FkLater = []
+    var np = lexdb_fkprobe.none()
+    let r = try storeRow(st, txn, &d.t, row, &noTabs, mut &later, mut &np)
+    return Ok(tagOnly("INSERT 0 1"))
+}
 
 // ---- aggregates: one accumulator per call and group, so a grouped
 // query holds its groups, not its rows
@@ -12947,6 +13262,21 @@ pub type Session = record {
     // one integer, not the store's memo, to know whether it may call one (inlineFunctions)
     fnGen: int
     fnNames: []str
+    rcDefault: bool             // SET default_transaction_isolation: true = read committed, false = serializable
+    savedRc: []bool             // in a transaction block: rcDefault at its BEGIN
+}
+
+fn parseIsolation(v: &str): Result[bool, DbErr] {
+    let s = strings.toLowerAscii(&(strings.trim(v)))
+    if s == "read committed" || s == "read_committed" || s == "read uncommitted" || s == "read_uncommitted" { return Ok(true) }
+    if s == "serializable" || s == "repeatable read" || s == "repeatable_read" || s == "default" { return Ok(false) }
+    return Err(e("22023", &("invalid value for parameter \"default_transaction_isolation\": \"" + v + "\"")))
+}
+
+// Isolation level given at the connection's start (startup packet / PGOPTIONS).
+pub fn (s: mut &Session) startupIsolation(v: &str): Result[Unit, DbErr] {
+    s.rcDefault = try parseIsolation(v)
+    return Ok(Unit{})
 }
 
 // The session's time zone (SET TimeZone, 9.95).
@@ -13059,7 +13389,11 @@ fn (s: &Session) setting(name: &str): Option[str] {
         "max_match_steps" { return Some(s.maxSteps.toStr()) }
         "statement_timeout" { return Some(if s.timeoutMs == 0 { "0" } else { s.timeoutMs.toStr() + "ms" }) }
         "max_statement_mem" { return Some(if s.maxMem == 0 { "0" } else { (s.maxMem / 1024).toStr() + "kB" }) }
-        "transaction_isolation", "default_transaction_isolation" { return Some("serializable") }
+        "default_transaction_isolation" { return Some(if s.rcDefault { "read committed" } else { "serializable" }) }
+        "transaction_isolation" {
+            let rc = if len(s.txn) > 0 { s.txn[0].rc } else { s.rcDefault }
+            return Some(if rc { "read committed" } else { "serializable" })
+        }
         // PostgreSQL's that clients ask for, fixed in lexdb (9.80)
         "standard_conforming_strings", "integer_datetimes", "is_superuser" { return Some("on") }
         "transaction_read_only", "default_transaction_read_only", "in_hot_standby" { return Some(lexdb_standby.standbySetting(&s.st)) }   // (on a replica, 9.137)
@@ -13186,6 +13520,18 @@ fn (s: mut &Session) applySetting(name: &str, value: &str, local: bool): Result[
         }
         return Ok(Unit{})
     }
+    if k == "default_transaction_isolation" {
+        if value == "\x01" { s.rcDefault = false } else { s.rcDefault = try parseIsolation(value) }
+        return Ok(Unit{})
+    }
+    if k == "transaction_isolation" {
+        let rc = if value == "\x01" { s.rcDefault } else { try parseIsolation(value) }
+        if len(s.txn) > 0 {
+            if !s.fresh { return Err(e("25001", "SET TRANSACTION ISOLATION LEVEL must be called before any query")) }
+            s.txn[0].setRc(rc)
+        }
+        return Ok(Unit{})
+    }
     if k == "lexdb_range_delete" {
         match lexdb_ops.parseBool(&strings.toLowerAscii(&(strings.trim(value)))) {
             Some(y) { s.rdel = y }
@@ -13257,7 +13603,7 @@ fn (s: &Session) waitLsn(stmt: &lexdb_sql.Stmt): Result[Res, DbErr] {
 pub fn parkedSession(st: lexdb_store.Store): Session {
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS, timeoutMs: 0, dword: 0, maxMem: MAX_STATEMENT_MEM,
                    saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: 0, batch: true, rules: false, auto: true, rdel: true, saves: [], savedRoles: [],
-                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc().clone(), savedZone: [], tmp: "", onCommit: [], fresh: false, fnGen: -1, fnNames: []}
+                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc().clone(), savedZone: [], tmp: "", onCommit: [], fresh: false, fnGen: -1, fnNames: [], rcDefault: false, savedRc: []}
 }
 
 pub fn newSession(st: lexdb_store.Store): Session {
@@ -13266,7 +13612,7 @@ pub fn newSession(st: lexdb_store.Store): Session {
     st.memo.put(&"sessions", &id.toStr())
     return Session{st: st, txn: [], failed: false, maxRecursion: MAX_RECURSION, maxSteps: MAX_MATCH_STEPS, timeoutMs: 0, dword: id, maxMem: MAX_STATEMENT_MEM,
                    saved: [], readOnly: false, path: [], pathAt: 0, savedPath: [], id: id, batch: true, rules: false, auto: true, rdel: true, saves: [], savedRoles: [],
-                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc().clone(), savedZone: [], tmp: "", onCommit: [], fresh: false, fnGen: -1, fnNames: []}
+                   custom: [], savedCustom: [], localUndo: [], zone: lexdb_time.utc().clone(), savedZone: [], tmp: "", onCommit: [], fresh: false, fnGen: -1, fnNames: [], rcDefault: false, savedRc: []}
 }
 
 // max_statement_mem's default.
@@ -13275,6 +13621,7 @@ pub const MAX_STATEMENT_MEM = 256 * 1024 * 1024
 // A transaction block rolled back: its SETs with it (as PostgreSQL's).
 fn (s: mut &Session) restore() {
     s.localUndo = []
+    if len(s.savedRc) > 0 { s.rcDefault = pop(mut &s.savedRc) }
     if len(s.savedZone) > 0 { s.zone = pop(mut &s.savedZone) }
     if len(s.savedCustom) > 0 { s.custom = pop(mut &s.savedCustom) }
     if len(s.savedRoles) > 0 {
@@ -13628,10 +13975,10 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             return Ok(made)
         }
         lexdb_sql.S_DROP { return dropTable(st, txn, s) }
-        lexdb_sql.S_INSERT { return insert(st, txn, s, params, ptypes, lim) }
+        lexdb_sql.S_INSERT { return insert(st, txn, s, params, ptypes, lim, pc) }
         lexdb_sql.S_SELECT { return select(st, txn, s, params, ptypes, lim, pc, sink) }
-        lexdb_sql.S_UPDATE { return update(st, txn, s, params, ptypes, lim) }
-        lexdb_sql.S_DELETE { return delete(st, txn, s, params, ptypes, lim) }
+        lexdb_sql.S_UPDATE { return update(st, txn, s, params, ptypes, lim, pc) }
+        lexdb_sql.S_DELETE { return delete(st, txn, s, params, ptypes, lim, pc) }
         lexdb_sql.S_MERGE { return merge(st, txn, s, params, ptypes, lim) }
         lexdb_sql.S_CREATE_INDEX { return createIndex(st, txn, s) }
         lexdb_sql.S_ANALYZE { return analyzeStmt(st, txn, s, lim) }
@@ -13810,7 +14157,8 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
     // a block's first statement may be a WAITFOR: any other but a
     // savepoint's (and BEGIN's, which does nothing in a block) ends that
     if !stmt.waitFor && stmt.kind != lexdb_sql.S_SAVEPOINT && stmt.kind != lexdb_sql.S_RELEASE &&
-       stmt.kind != lexdb_sql.S_ROLLBACK_TO && stmt.kind != lexdb_sql.S_BEGIN { s.fresh = false }
+       stmt.kind != lexdb_sql.S_ROLLBACK_TO && stmt.kind != lexdb_sql.S_BEGIN &&
+       !(stmt.kind == lexdb_sql.S_SET && stmt.table == "transaction_isolation") { s.fresh = false }
     // PostgreSQL's SQL functions it calls, written as their bodies (package F)
     if stmt.kind == lexdb_sql.S_SELECT || stmt.kind == lexdb_sql.S_INSERT || stmt.kind == lexdb_sql.S_UPDATE || stmt.kind == lexdb_sql.S_DELETE ||
        stmt.kind == lexdb_sql.S_MERGE {
@@ -13937,6 +14285,22 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                     None {}
                 }
                 s.rdel = on
+            } else if stmt.table == "default_transaction_isolation" || stmt.table == "transaction_isolation" {
+                var val = if stmt.table == "transaction_isolation" && s.rcDefault { "read committed" } else { "serializable" }
+                if !stmt.ifFlag {
+                    match stmt.limit {
+                        Some(x) {
+                            let noCols: []lexdb_sql.ColDef = []
+                            let none: []Val = []
+                            let noSubs: []SubRes = []
+                            let noSeq: Option[SeqEnv] = None
+                            let env = Env{cols: &noCols, row: &none, aggs: &none, params: params, subs: &noSubs, cur: &none, seq: &noSeq}
+                            val = lexdb_sql.text(&(try eval(&x, &env)))
+                        }
+                        None {}
+                    }
+                }
+                try s.applySetting(&stmt.table, &val, false)
             } else if stmt.table != "" {
                 var v = -1                          // DEFAULT, RESET
                 match stmt.limit {
@@ -13963,10 +14327,12 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         lexdb_sql.S_BEGIN {
             if len(s.txn) == 0 {
                 lexdb_stats.chgEnd(&s.st, s.id, false)          // (counts an earlier failed statement left: optimizer 44)
+                let rc = if stmt.table == "read committed" { true } else if stmt.table == "serializable" { false } else { s.rcDefault }
                 if stmt.ifFlag {
                     append(mut &s.txn, try s.st.beginSnapshot())     // READ ONLY: a snapshot (4.5)
+                    s.txn[0].rc = rc
                 } else {
-                    append(mut &s.txn, try s.st.beginBlock())       // a snapshot with its writes (9.16)
+                    append(mut &s.txn, lexdb_store.beginBlockLazy(rc))
                 }
                 s.readOnly = stmt.ifFlag
                 s.failed = false
@@ -13982,6 +14348,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 s.savedCustom = [cs]
                 s.localUndo = []
                 s.savedZone = [s.zone.clone()]
+                s.savedRc = [s.rcDefault]
                 let q = s.txnPath()
                 s.txn[0].sql.path = q
                 s.txn[0].tmp = s.tmp.clone()
@@ -14043,6 +14410,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             s.undoLocal()
             s.savedCustom = []
             s.savedZone = []
+            s.savedRc = []
             let ddl = t.tmpDdl
             match s.st.commit(t) {
                 Ok(_) {
@@ -14120,10 +14488,24 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         let st = &s.st
         // UPDATE and DELETE read the live tree: the rows they change are
         // checked at COMMIT either way, and the latest is less often stale
-        s.txn[0].live = stmt.kind == lexdb_sql.S_UPDATE || stmt.kind == lexdb_sql.S_DELETE || stmt.kind == lexdb_sql.S_INSERT || stmt.kind == lexdb_sql.S_MERGE ||
-                        (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from) || (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode > 0)
-        if s.readOnly { s.txn[0].live = false }       // (a temporary table's writes: its snapshot is the session's own, 9.96)
+        var isLive = stmt.kind == lexdb_sql.S_UPDATE || stmt.kind == lexdb_sql.S_DELETE || stmt.kind == lexdb_sql.S_INSERT || stmt.kind == lexdb_sql.S_MERGE ||
+                     (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from) || (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode > 0)
+        if s.readOnly { isLive = false }       // (a temporary table's writes: its snapshot is the session's own, 9.96)
+        s.txn[0].live = isLive
+        let rcSnap = s.txn[0].rc && !isLive && !s.readOnly
+        if rcSnap {
+            try s.st.takeSnapshot(mut &s.txn[0])
+        } else if !isLive && s.txn[0].lazySnap && !s.readOnly {
+            try s.st.takeSnapshot(mut &s.txn[0])
+        }
+        let reads0 = s.txn[0].readCount()
+        s.fresh = false
         let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits(), pc, input, out, pull, sink)
+        if rcSnap { s.st.releaseSnapshot(mut &s.txn[0]) }
+        if r.isOk() && s.txn[0].rc && (stmt.kind == lexdb_sql.S_UPDATE || stmt.kind == lexdb_sql.S_DELETE || stmt.kind == lexdb_sql.S_MERGE ||
+                                       (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode > 0)) {
+            s.txn[0].forgetReads(reads0)
+        }
         if len(s.txn[0].onCommit) > 0 { return s.blockEnd(stmt, r) }        // (its assertions, O23; a temporary schema it made: TMP_MADE)
         s.txn[0].live = false
         if r.isErr() { s.failed = true }
