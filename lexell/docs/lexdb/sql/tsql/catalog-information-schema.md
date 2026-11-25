@@ -76,8 +76,9 @@ PostgreSQL's values. They answer from the same catalog as [the `sys` views](cata
 
 - **The values are PostgreSQL's.** `data_type` is `integer`, `character varying`, `numeric`, `timestamp without
   time zone` and `bytea`, not `int`, `varchar`, `decimal`, `datetime2` and `varbinary`; `udt_name` is `int4`,
-  `varchar`, `numeric`. `CHECK_CONSTRAINTS.check_clause` is PostgreSQL's text, `(salary >= 0)`, where SQL Server
-  writes `([salary]>=(0))`. Use `sys.columns`, `sys.types` and `sys.check_constraints` when you need SQL Server's forms.
+  `varchar`, `numeric`. Use `sys.columns` and `sys.types` when you need SQL Server's forms.
+  `CHECK_CONSTRAINTS.check_clause` is SQL Server's text, `([salary]>=(0))`, as `sys.check_constraints.definition` is
+  (see [constraints](catalog-constraints.md) for where it differs).
 - `SCHEMATA` lists the schemas made with `CREATE SCHEMA`; `dbo` and the system schemas are not in it.
 - Constraint names are lexdb's, `table_pkey`, `table_column_fkey`, and `view_definition` is the text of the query.
 - `ROUTINES` and `PARAMETERS` have no rows for T-SQL procedures and functions: use `sys.procedures`,
@@ -227,8 +228,8 @@ emp_dept_id_fkey dept_pkey              NO ACTION   NO ACTION
 (1 row affected)
 
 constraint_name check_clause
---------------- -------------
-ck_sal          (salary >= 0)
+--------------- ---------------
+ck_sal          ([salary]>=(0))
 
 (1 row affected)
 ```

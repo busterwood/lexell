@@ -56,6 +56,9 @@ fixed value. Every view except `sys.foreign_key_columns` also has the columns of
 
 ## Differences from SQL Server
 
+- A `CHECK`'s `definition` is SQL Server's text (example G) except for a `CAST`, which shows as what lexdb made of it
+  (`CAST(a AS varchar(3))` gives `left(bin2str([a],(0),(3)),(3))`, SQL Server `CONVERT([varchar](3),[a])`), and an
+  `N'...'` literal, which loses its `N`.
 - Unnamed constraints have PostgreSQL's names (`dept_pkey`, `emp_dept_id_fkey`), not SQL Server's
   `PK__dept__3213E83F...`; `is_system_named` is 1 for them as in SQL Server.
 - A default constraint is named `DF_table_column` whatever name `CONSTRAINT name DEFAULT` gave it (here `df_sal` is
@@ -274,6 +277,34 @@ name          is_disabled is_not_trusted
 fk_badge_dept 0           0
 
 (1 row affected)
+```
+
+### G. The text of a CHECK
+
+`definition` is the condition as SQL Server writes it: names in brackets, numbers in parentheses, `BETWEEN` as two
+comparisons, `IN` as `OR`s.
+
+<!-- example: tsql -->
+```sql
+CREATE TABLE hr.grading (
+    id int PRIMARY KEY,
+    code varchar(10) CONSTRAINT ck_code CHECK (code LIKE 'R%'),
+    grade int CONSTRAINT ck_grade CHECK (grade BETWEEN 1 AND 5),
+    kind int CONSTRAINT ck_kind CHECK (kind IN (1, 2, 3) OR kind IS NULL),
+    price decimal(8,2), qty int,
+    CONSTRAINT ck_total CHECK (price * qty < 1000 AND NOT price < 0));
+SELECT name, definition FROM sys.check_constraints WHERE parent_object_id = OBJECT_ID('hr.grading') ORDER BY name;
+```
+
+```text
+name     definition
+-------- ----------------------------------------------------------
+ck_code  ([code] like 'R%')
+ck_grade ([grade]>=(1) AND [grade]<=(5))
+ck_kind  ([kind]=(3) OR [kind]=(2) OR [kind]=(1) OR [kind] IS NULL)
+ck_total ([price]*[qty]<(1000) AND NOT [price]<(0))
+
+(4 rows affected)
 ```
 
 ## See also
