@@ -38,6 +38,9 @@ ALTER SESSION SET parameter = value [ parameter = value ]...
 `GROUP_BY_POSITION_ENABLED`
 : `TRUE` lets `GROUP BY 1` name the first column of the select list (23ai).
 
+`QUERY_REWRITE_ENABLED`
+: `TRUE` (default) or `FORCE` enables automatic query rewrite onto materialized views created with `ENABLE QUERY REWRITE`; `FALSE` disables it for the session.
+
 Other `NLS_*` parameters, `OPTIMIZER_*`, `SQL_TRACE`, `ISOLATION_LEVEL`, `CURSOR_SHARING` and many more
 : Accepted and ignored.
 

@@ -47,6 +47,15 @@ DROP MATERIALIZED VIEW [ IF EXISTS ] [ schema_name . ] mview_name [ ,...n ] [ CA
 - Real-time materialized views (`WITH (refresh = 'realtime')` or `ENABLE ON QUERY COMPUTATION`) append signed deltas to
   a contention-free companion delta tree, merge deltas on read in the reader's MVCC snapshot, and fold into the base
   tree in the background or on `REFRESH MATERIALIZED VIEW ... FAST`.
+- **Cascading materialized views:** A materialized view may query another materialized view (forming multi-level rollup
+  DAGs, including cascading sketch rollups from `APPROX_COUNT_DISTINCT_DETAIL` / `APPROX_PERCENTILE_DETAIL` to
+  `APPROX_COUNT_DISTINCT_AGG` / `APPROX_PERCENTILE_AGG`), with incremental deltas propagating topologically in
+  $O(\Delta)$.
+- **Automatic query rewrite:** Materialized views created with `ENABLE QUERY REWRITE` (or `WITH (query_rewrite = true)`)
+  automatically accelerate eligible `SELECT` queries against their base table(s) — supporting exact matches, `HAVING`,
+  subsumed `WHERE` predicates, coarser `GROUP BY` / global / `AVG` / sketch rollups, and equi-joins, while skipping
+  stale `ON DEMAND` views and uncommitted `ON COMMIT` changes. Control per session with
+  `SET query_rewrite_enabled = on | off` (default `on`).
 
 ## Examples
 
@@ -152,23 +161,23 @@ dept_id cnt tot
 (2 rows affected)
 ```
 
-### D. On-demand snapshot materialized view and cleanup
+### D. Cascading rollup DAG and automatic query rewrite
 
 <!-- example: tsql -->
 ```sql
-CREATE MATERIALIZED VIEW dbo.mv_snap
-    REFRESH COMPLETE ON DEMAND
-AS SELECT dept_id, SUM(amount) AS tot FROM dbo.sales GROUP BY dept_id;
+CREATE MATERIALIZED VIEW dbo.mv_dept
+    REFRESH FAST ON STATEMENT ENABLE QUERY REWRITE
+AS SELECT dept_id, COUNT(*) AS cnt, SUM(amount) AS tot FROM dbo.sales GROUP BY dept_id;
 GO
-INSERT dbo.sales VALUES (8, 2, 75);
+CREATE MATERIALIZED VIEW dbo.mv_grand
+    REFRESH FAST ON STATEMENT
+AS SELECT SUM(cnt) AS total_rows, SUM(tot) AS grand_tot FROM dbo.mv_dept;
 GO
-REFRESH MATERIALIZED VIEW dbo.mv_snap;
+INSERT dbo.sales VALUES (8, 3, 200);
 GO
-SELECT dept_id, tot FROM dbo.mv_snap ORDER BY dept_id;
+SELECT total_rows, grand_tot FROM dbo.mv_grand;
 GO
-DROP MATERIALIZED VIEW dbo.mv_stats, dbo.mv_rt, dbo.mv_snap;
-DROP INDEX ix_v_sales ON dbo.v_sales;
-DROP VIEW dbo.v_sales;
+SELECT SUM(amount) AS grand_tot FROM dbo.sales;
 ```
 
 ```text
@@ -176,12 +185,53 @@ DROP VIEW dbo.v_sales;
 
 (1 row affected)
 
+(1 row affected)
+
+total_rows grand_tot
+---------- ---------
+8          1175
+
+(1 row affected)
+
+grand_tot
+---------
+1175
+
+(1 row affected)
+```
+
+### E. On-demand snapshot materialized view and cleanup
+
+<!-- example: tsql -->
+```sql
+CREATE MATERIALIZED VIEW dbo.mv_snap
+    REFRESH COMPLETE ON DEMAND
+AS SELECT dept_id, SUM(amount) AS tot FROM dbo.sales GROUP BY dept_id;
+GO
+INSERT dbo.sales VALUES (9, 2, 75);
+GO
+REFRESH MATERIALIZED VIEW dbo.mv_snap;
+GO
+SELECT dept_id, tot FROM dbo.mv_snap ORDER BY dept_id;
+GO
+DROP MATERIALIZED VIEW dbo.mv_dept CASCADE;
+DROP MATERIALIZED VIEW dbo.mv_stats, dbo.mv_rt, dbo.mv_snap;
+DROP INDEX ix_v_sales ON dbo.v_sales;
+DROP VIEW dbo.v_sales;
+```
+
+```text
+(3 rows affected)
+
+(1 row affected)
+
 dept_id tot
 ------- ---
 1       750
 2       300
+3       200
 
-(2 rows affected)
+(3 rows affected)
 ```
 
 ## See also

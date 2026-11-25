@@ -48,6 +48,10 @@ DROP MATERIALIZED VIEW LOG ON [ schema. ] table
 
 `ENABLE QUERY REWRITE` / `ENABLE ON QUERY COMPUTATION`
 : Recorded in `USER_MVIEWS` (`REWRITE_ENABLED`, `ON_QUERY_COMPUTATION`) and changeable via `ALTER MATERIALIZED VIEW`.
+  When `QUERY REWRITE` is enabled and `ALTER SESSION SET QUERY_REWRITE_ENABLED = TRUE` (default), the planner
+  transparently rewrites eligible `SELECT` queries against the base table(s) onto the materialized view (supporting
+  exact matches, `HAVING`, subsumed `WHERE` predicates, coarser `GROUP BY` / global / `AVG` / sketch rollups, and
+  equi-joins, while skipping stale `ON DEMAND` views and uncommitted `ON COMMIT` changes).
   When `ON QUERY COMPUTATION` is enabled on a fast-refreshable materialized view, DML appends signed deltas to a
   contention-free companion delta tree, `SELECT` queries merge base + delta rows on the fly in the reader's MVCC
   snapshot (even on `ON DEMAND` views before refresh), and `DBMS_MVIEW.REFRESH(..., 'F')` or the background folder
@@ -69,6 +73,13 @@ DROP MATERIALIZED VIEW LOG ON [ schema. ] table
   multi-table inner equi-joins across `INSERT`, `UPDATE`, `DELETE`, `MERGE`, and `TRUNCATE`.
 - Composable HyperLogLog++ and t-digest sketch aggregates merge associatively in $O(\Delta)$ on appends and re-probe
   affected groups on deletes.
+- **Cascading materialized views:** A materialized view may query another materialized view (including cascading sketch
+  rollups from `APPROX_COUNT_DISTINCT_DETAIL` / `APPROX_PERCENTILE_DETAIL` to `APPROX_COUNT_DISTINCT_AGG` /
+  `APPROX_PERCENTILE_AGG`). Incremental deltas propagate topologically in $O(\Delta)$ down the DAG across `ON STATEMENT`,
+  `ON COMMIT`, and `FAST` delta folding.
+- **Automatic query rewrite:** Controlled per session with `ALTER SESSION SET QUERY_REWRITE_ENABLED = TRUE | FALSE | FORCE`
+  (see [ALTER SESSION](alter-session.md)). Eligible queries transparently read fresh `ENABLE QUERY REWRITE` views
+  (including `ON QUERY COMPUTATION` views).
 
 ## Differences from Oracle
 
@@ -227,12 +238,59 @@ MV_OQC     Y                    FRESH
 1 row selected.
 ```
 
-### D. `ALTER` and `DROP`
+### D. Cascading rollup DAG and automatic query rewrite
+
+<!-- example: oracle -->
+```sql
+CREATE MATERIALIZED VIEW mv_total
+    REFRESH FAST ON STATEMENT
+AS SELECT SUM(n) AS total_emp, SUM(tot) AS grand_tot FROM mv_fast;
+INSERT INTO emp VALUES (7, 'c', 250);
+COMMIT;
+SELECT total_emp, grand_tot FROM mv_total;
+SELECT SUM(sal) AS grand_tot FROM emp;
+ALTER SESSION SET QUERY_REWRITE_ENABLED = FALSE;
+SELECT SUM(sal) AS grand_tot FROM emp;
+ALTER SESSION SET QUERY_REWRITE_ENABLED = TRUE;
+```
+
+```text
+Materialized view created.
+
+1 row created.
+
+Commit complete.
+
+TOTAL_EMP GRAND_TOT
+--------- ---------
+        6      1350
+
+1 row selected.
+
+GRAND_TOT
+---------
+     1350
+
+1 row selected.
+
+Statement processed.
+
+GRAND_TOT
+---------
+     1350
+
+1 row selected.
+
+Statement processed.
+```
+
+### E. `ALTER` and `DROP`
 
 <!-- example: oracle -->
 ```sql
 ALTER MATERIALIZED VIEW mv_demand ENABLE QUERY REWRITE REFRESH COMPLETE ON COMMIT;
 SELECT mview_name, refresh_mode, rewrite_enabled FROM user_mviews WHERE mview_name = 'MV_DEMAND';
+DROP MATERIALIZED VIEW mv_total;
 DROP MATERIALIZED VIEW mv_demand;
 DROP MATERIALIZED VIEW mv_fast;
 DROP MATERIALIZED VIEW mv_stats;
@@ -248,6 +306,8 @@ MVIEW_NAME REFRESH_MODE REWRITE_ENABLED
 MV_DEMAND  COMMIT       Y
 
 1 row selected.
+
+Materialized view dropped.
 
 Materialized view dropped.
 
