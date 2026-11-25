@@ -3,7 +3,8 @@
 Bugs and gaps found while writing and checking these pages (lexdb built from main at 4fba817b, 2026-11-23; the entries
 that main ca687450, a15b9a64, 02646472, 436468d8, 81ee25d1, e689d814 and 7b6b1235, 2026-11-24, fixed are removed or
 reworded to what is left; the new pages and examples were checked against main 60c08a84; the time zone entries were
-reworded after the merge of timestamps that keep their offset, main 178ea2df, and checked against main 55040a20). They
+reworded after the merge of timestamps that keep their offset, main 178ea2df, and checked against main 55040a20; the
+Oracle annotation entry was reworded to what is left after the merge of annotations, main 6c2e83f1). They
 are not fixed here: the pages describe what lexdb does. Each "Differences" section of the reference lists the smaller
 differences of its statement.
 
@@ -499,7 +500,12 @@ differences of its statement.
     of a DML statement when the subquery reads the statement's own table or refers to its columns; a function whose
     argument is an aggregate or another stored function's call (`f(SUM(x))`, `f(g(x))`). A view that calls one
     cannot be created (ORA-00904; Oracle allows it).
-  - Annotations (`ANNOTATIONS (...)` on a table or column, `USER_ANNOTATIONS_USAGE`) are not supported (ORA-00900).
+  - Annotations (supported since main 6c2e83f1; see [annotations](sql/oracle/annotations.md)): a column's annotation
+    in `CREATE TABLE ... AS` is ORA-00900 (Oracle ORA-11559); the same column twice in one `ALTER ... MODIFY`
+    applies both (Oracle ORA-00957); `ALTER INDEX` of an index that does not exist is ORA-00942 (Oracle ORA-01418);
+    `ALTER TABLE` of a view or `ALTER VIEW` of a table is ORA-20000 (Oracle ORA-00942); `ALL_` and
+    `DBA_ANNOTATIONS_USAGE` have no rows for the built-in domains of `SYS` and `DOMAIN_NAME` / `DOMAIN_OWNER` are
+    always NULL (lexdb has no domains); a global temporary table's annotations are kept but not listed.
   - `USER_CONSTRAINTS` does not list `NOT NULL` constraints (Oracle lists them as type `C` rows with the search
     condition `"A" IS NOT NULL`).
 - **Functions** (found writing the Oracle function pages):
