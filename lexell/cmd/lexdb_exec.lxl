@@ -80,6 +80,7 @@ import "./lexdb_recprobe"
 import "./lexdb_standby"
 import "./lexdb_assert"
 import "./lexdb_viewdep"
+import "./lexdb_ixname"
 
 type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
@@ -1022,14 +1023,17 @@ pub fn bootstrap(st: &lexdb_store.Store): Result[Unit, DbErr] {
         if id != lexdb_catalog.CATALOG { return Err(lexdb_base.corrupt("the store has trees but no catalog")) }
         try st.commit(t)
     }
-    // the sequences' values (9.43): a tree of their own, made once
+    // the sequences' values (9.43): a tree of their own, made once. Its number is written with a leading 0 in a store made now, whose
+    // Oracle names are exact (lexdb_sql.oraQuoted; one made before keeps folding them): a mark that adds no key and no page.
     var r = lexdb_store.begin()
     let seqs = try st.get(mut &r, lexdb_catalog.CATALOG, SEQ_TREE)
     if seqs.isSome() {
+        lexdb_sql.setOraExact(strings.startsWith(&seqs.unwrap(), "0"))
         st.abort(r)
     } else {
         let tree = st.createTree(mut &r)
-        try r.put(lexdb_catalog.CATALOG, SEQ_TREE, &(tree.toStr()))
+        try r.put(lexdb_catalog.CATALOG, SEQ_TREE, &((if have { "" } else { "0" }) + tree.toStr()))
+        lexdb_sql.setOraExact(!have)
         try st.commit(r)
     }
     // temporary objects left by a crash (9.96); a replica's go with the master's
@@ -4705,7 +4709,7 @@ fn dropTableNamed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str,
         Some(t) {
             if len(t.view) > 0 { return Err(e("42809", &("\"" + lexdb_sql.shown(name) + "\" is not a table (use DROP VIEW)"))) }
             try lexdb_priv.needRelOwner(st, txn, &t.name, &"table")
-            try dropDependentViews(st, txn, &t.name, s.cascade, &"table")
+            try lexdb_viewdep.dropTable(st, txn, s, &t.name, &lexdb_priv.doorOf(st, txn.sql.sess))
             var d = t
             lexdb_catalog.joinFks(mut &d)
             try unlinkTable(st, txn, mut &d, s.cascade)
@@ -6750,7 +6754,8 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         }
         ixName = try chooseIndexName(st, txn, &t, &cns)
     }
-    let ixKey = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &ixName)     // in its table's schema
+    var ixKey = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &ixName)     // in its table's schema (T-SQL's: per table)
+    if s.mdialect == lexdb_sql.MD_TSQL { ixKey = try lexdb_ixname.createKey(st, txn, &t, &ixKey) }
     let exists = try relExists(st, txn, &ixKey)
     if exists {
         if s.ifFlag {
@@ -7116,7 +7121,8 @@ fn dropConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Tab
 
 fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     if s.conc && txn.inBlock() { return Err(e("25001", "DROP INDEX CONCURRENTLY cannot run inside a transaction block")) }
-    let ixKey = try catKey(st, txn, &s.index, true)
+    var ixKey = try catKey(st, txn, &s.index, true)
+    if s.mdialect == lexdb_sql.MD_TSQL && len(s.table) > 0 { ixKey = try lexdb_ixname.onTable(st, txn, &ixKey, &(try needTable(st, txn, &s.table)).name) }
     match try st.get(txn, lexdb_catalog.CATALOG, &(idxName(&ixKey))) {
         Some(tn) {
             var t = try needTable(st, txn, &tn)
@@ -19433,7 +19439,7 @@ fn catRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str, tsqlIs:
         }
     }
     let rows = try lexdb_pg.viewRows(&cq, &stats, rel)
-    return Ok(if tsqlIs { lexdb_syscat.dboRows(&lexdb_pgcat.relColNames(rel), rows) } else { rows })     // (SQL Server's dbo)
+    return Ok(if tsqlIs { lexdb_syscat.dboRows(&lexdb_pgcat.relColNames(rel), lexdb_syscat.infoRows(&cq, rel, &lexdb_pgcat.relColNames(rel), rows)) } else { rows })     // (SQL Server's dbo)
 }
 
 // A column as SQL Server describes it (lexdb_tds: SET FMTONLY ON, sp_prepare's
@@ -20080,6 +20086,7 @@ fn dropDependentViews(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, k: &str
 }
 
 fn createView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    if s.alias == lexdb_sql.REFRESH_VIEW { return createView(st, txn, &(try lexdb_viewdep.refreshStmt(st, txn, s))) }
     var key = s.table.clone()
     if s.temp || (lexdb_sql.isQual(&s.table) && lexdb_sql.schemaOf(&s.table) == "pg_temp") {
         key = try createKey(st, txn, &s.table, true)
@@ -20110,6 +20117,7 @@ fn createView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
     // a column's typmod, where the query's column is a table's
     var deps: []str = []
     try readsOf(st, txn, &q, mut &deps)
+    try lexdb_viewdep.boundOver(st, txn, s, &deps)
     // a view reading a temporary relation is temporary (PostgreSQL says so
     // in a NOTICE; lexdb has none), and may not be made elsewhere (9.96)
     if !lexdb_catalog.tempRel(&key) {

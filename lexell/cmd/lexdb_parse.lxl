@@ -431,6 +431,12 @@ fn oraName(raw: &str, at: int): Tok {
     return Tok{kind: T_IDENT, text: f, at: at, spell: if up == f { "" } else { up }}
 }
 
+// Oracle's quoted name: exact (lexdb_sql.oraQuoted), spelled as written.
+fn oraQTok(raw: &str, at: int): Tok {
+    let k = lexdb_sql.oraQuoted(raw)
+    return Tok{kind: T_QIDENT, text: k.clone(), at: at, spell: if k == raw { "" } else { raw.toStr() }}
+}
+
 fn lexOra(s: &str, dialect: Dialect, ora: bool): Result[[]Tok, lexdb_base.DbErr] {
     var out: []Tok = []
     var bindNames: []str = []
@@ -594,7 +600,7 @@ fn lexOra(s: &str, dialect: Dialect, ora: bool): Result[[]Tok, lexdb_base.DbErr]
                 b.addByte(s[i])
                 i += 1
             }
-            append(mut &out, nameTok(T_QIDENT, &(b), start))
+            append(mut &out, if ora { oraQTok(&b, start) } else { nameTok(T_QIDENT, &(b), start) })
             continue
         }
         if dialect.tsql && c == '0' && i + 1 < n && (s[i + 1] == 'x' || s[i + 1] == 'X') {
@@ -2341,7 +2347,7 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         return Ok(if t.text == "convert" { c } else { Expr.Call("#try", [c], false) })
     }
     if t.kind == T_IDENT || t.kind == T_QIDENT {
-        if p.isKw("(") && t.kind == T_IDENT {
+        if p.isKw("(") && (t.kind == T_IDENT || p.ora) {
             p.pos += 1
             var args: []Expr = []
             var argNames: []str = []        // name => value arguments' names ("" a positional one)
@@ -5011,6 +5017,8 @@ fn (p: mut &P) createView(orReplace: bool, alterOnly: bool): Result[Stmt, lexdb_
     if p.tsql && p.acceptKw("with") {
         while true {
             let o = p.next()
+            // (WITH CHECK OPTION before AS: SQL Server's 102 at WITH)
+            if o.kind == T_IDENT && o.text == "check" { return Err(lexdb_base.err("TS102", "Incorrect syntax near 'with'.")) }
             if o.kind != T_IDENT || (o.text != "schemabinding" && o.text != "view_metadata" && o.text != "encryption") { return Err(lexdb_base.err("TS195", &("'" + o.text + "' is not a recognized option."))) }
             if o.text == "schemabinding" { bound = true }
             if !p.acceptKw(",") { break }
@@ -5040,6 +5048,7 @@ fn (p: mut &P) createView(orReplace: bool, alterOnly: bool): Result[Stmt, lexdb_
     let end = p.peek().at
     if p.isKw("with") { return Err(lexdb_base.err("0A000", "lexdb: WITH CHECK OPTION is not supported")) }
     if bound { for it in q.items { if it.star { return Err(lexdb_base.err("TS1054", "Syntax '*' is not allowed in schema-bound objects.")) } } }
+    if bound { try p.boundNames(start, end, &(if len(v.spell) > 0 { v.spell.clone() } else { lexdb_sql.baseName(&v.table) })) }
     v.index = strings.trim(&p.src[start..end]).toStr()
     // made over TDS: T-SQL, tagged so (parseView)
     if p.tsql {
@@ -6892,6 +6901,13 @@ fn (p: mut &P) inlineIndex(s: mut &Stmt, col: &str): Result[Unit, lexdb_base.DbE
     ci.unique = p.acceptKw("unique")
     ci.cluster = p.clusterWord()
     ci.table = s.table.clone()
+    // (SQL Server's: a name twice among the table's indexes, two CLUSTERED ones)
+    for x in s.inner {
+        if x.kind != S_CREATE_INDEX { continue }
+        if x.index == ci.index { return Err(lexdb_base.err("TS8168", &("Cannot create, drop, enable, or disable more than one constraint, column, index, or trigger named '" + ci.index + "' in this context. Duplicate names are not allowed."))) }
+        if x.cluster == 1 && ci.cluster == 1 { return Err(clusterTwice(&s.table)) }
+    }
+    if ci.cluster == 1 && s.pkCluster == 1 { return Err(clusterTwice(&s.table)) }
     // (a CLUSTERED one makes a primary key not said to be either NONCLUSTERED, as SQL Server's)
     if ci.cluster == 1 && s.pkCluster == 0 { s.pkCluster = 2 }
     if len(col) > 0 {
@@ -6903,6 +6919,44 @@ fn (p: mut &P) inlineIndex(s: mut &Stmt, col: &str): Result[Unit, lexdb_base.DbE
     }
     append(mut &s.inner, ci)
     return Ok(Unit{})
+}
+
+// T-SQL: a schema-bound view's FROM items named in two parts (schema.name), SQL Server's 4512 for one that is not (the query's
+// text a..b; view: the view's name as written).
+fn (p: &P) boundNames(a: int, b: int, view: &str): Result[Unit, lexdb_base.DbErr] {
+    var i = 0
+    while i < len(p.toks) && p.toks[i].at < a { i += 1 }
+    var depth = 0
+    var fromDepth = -1
+    while i + 1 < len(p.toks) && p.toks[i].at < b {
+        let t = &p.toks[i]
+        var item = false
+        if t.kind == T_OP && t.text == "(" { depth += 1 }
+        else if t.kind == T_OP && t.text == ")" {
+            depth -= 1
+            if depth < fromDepth { fromDepth = -1 }
+        } else if t.kind == T_IDENT && (t.text == "from" || t.text == "join") {
+            item = true
+            fromDepth = depth
+        } else if t.kind == T_OP && t.text == "," && depth == fromDepth {
+            item = true
+        } else if t.kind == T_IDENT && depth == fromDepth && (t.text == "where" || t.text == "group" || t.text == "having" || t.text == "order" ||
+                                                             t.text == "union" || t.text == "except" || t.text == "intersect" || t.text == "on") {
+            fromDepth = -1
+        }
+        let n = &p.toks[i + 1]
+        if item && (n.kind == T_IDENT || n.kind == T_QIDENT) && !(i + 2 < len(p.toks) && p.toks[i + 2].kind == T_OP && p.toks[i + 2].text == ".") {
+            let w = if len(n.spell) > 0 { n.spell.clone() } else { n.text.clone() }
+            return Err(lexdb_base.err("TS4512", &("Cannot schema bind view '" + view + "' because name '" + w +
+                                                  "' is invalid for schema binding. Names must be in two-part format and an object cannot reference itself.")))
+        }
+        i += 1
+    }
+    return Ok(Unit{})
+}
+
+fn clusterTwice(t: &str): lexdb_base.DbErr {
+    return lexdb_base.err("TS8112", &("Cannot add more than one clustered index for constraints on table '" + lexdb_sql.baseName(t) + "'."))
 }
 
 // An index's (columns) and what follows them: INCLUDE, WHERE, Oracle's ANNOTATIONS, T-SQL's storage.
@@ -8246,11 +8300,22 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     try p.expectKw("exists")
                     s.ifFlag = true
                 }
+                // T-SQL: DROP INDEX name ON table, or table.name (the index is its table's: lexdb_ixname)
+                if p.tsql && !(p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "on") && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "." {
+                    s.mdialect = MD_TSQL
+                    var parts: []str = [try p.name()]
+                    while p.acceptKw(".") { append(mut &parts, try p.name()) }
+                    let n = len(parts)
+                    s.table = if n >= 3 { lexdb_sql.qual(&parts[n - 3], &parts[n - 2]) } else { parts[0].clone() }
+                    if n >= 3 && parts[n - 3] == "dbo" { s.table = parts[n - 2].clone() }
+                    s.index = lexdb_sql.qual(&lexdb_sql.schemaOf(&s.table), &parts[n - 1])
+                    return Ok(s)
+                }
                 s.index = try p.qname()
-                // T-SQL: DROP INDEX name ON table (the index is in its table's schema)
                 if p.tsql && p.acceptKw("on") {
-                    let tn = try p.qname()
-                    s.index = lexdb_sql.qual(&lexdb_sql.schemaOf(&tn), &lexdb_sql.baseName(&s.index))
+                    s.mdialect = MD_TSQL
+                    s.table = try p.qname()
+                    s.index = lexdb_sql.qual(&lexdb_sql.schemaOf(&s.table), &lexdb_sql.baseName(&s.index))
                 }
                 return Ok(s)
             }
@@ -9641,7 +9706,7 @@ fn (p: mut &P) oraType(w: &str): Result[Option[TypeName], lexdb_base.DbErr] {
 }
 
 // The text of an expression's tokens, as Oracle names a column made by one:
-// upper case outside "quotes".
+// upper case, "quoted" names too (Oracle 23.26: "Id"+1 is "ID"+1).
 fn (p: &P) oraLabel(a: int, b: int): str {
     let from = p.toks[a].at
     let to = p.toks[b].at
@@ -9669,12 +9734,12 @@ fn (p: &P) oraLabel(a: int, b: int): str {
         if !q && (c == ' ' || c == '\n' || c == '\t' || c == '\r') { continue }
         if c == '"' && !sq { q = !q }
         if c == '\'' && !q { sq = !sq }
-        out.addByte(if !q && c >= 'a' && c <= 'z' { c - 32 } else { c })
+        out.addByte(if c >= 'a' && c <= 'z' { c - 32 } else { c })
     }
     return out
 }
 
-// oraLabel's text of s: blanks outside quotes dropped, upper case outside "quotes".
+// oraLabel's text of s: blanks outside quotes dropped, upper case.
 fn labelText(s: &str): str {
     var out = ""
     var q = false
@@ -9684,7 +9749,7 @@ fn labelText(s: &str): str {
         if !q && (c == ' ' || c == '\n' || c == '\t' || c == '\r') { continue }
         if c == '"' && !sq { q = !q }
         if c == '\'' && !q { sq = !sq }
-        out.addByte(if !q && c >= 'a' && c <= 'z' { c - 32 } else { c })
+        out.addByte(if c >= 'a' && c <= 'z' { c - 32 } else { c })
     }
     return out
 }

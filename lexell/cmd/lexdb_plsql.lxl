@@ -381,6 +381,10 @@ pub type PUnit = record {
     isPub: bool               // a member the package's specification declares
     pkgSlots: []int         // a package's variables: their slots (in every member's frame too)
     pubVars: []PubVar       // a package's: the variables and constants its specification declares
+    nest: str               // a nested subprogram's (declared in a unit's declarations): its scope's id, "" none
+    nfrom: int              // ... its own slots, from and to: the others are its enclosing unit's, copied from the caller's frame and back
+    nto: int
+    subs: []PUnit           // the nested subprograms a unit's text declares (moved into the program beside it)
 }
 
 // A variable or constant a package's specification declares: its slot in the package's frame.
@@ -443,7 +447,14 @@ type Cx = record {
     noSubB: int
     post: []P               // K_PVSETs of the statement being compiled: a package variable it takes as a target (INTO, OUT) is set from a slot after it
     strict: bool            // a stored procedure's or function's: its expressions and DML checked as Oracle's compile does (checkExpr, checkTarget)
+    nested: []NestSig       // the nested subprograms in scope, innermost last
+    nestN: int              // nested subprograms numbered in the text
+    subs: []PUnit           // the nested subprograms compiled so far
 }
+
+// A nested subprogram in scope: its signature and its scope's id (PUnit.nest); defined once its body was read (a forward
+// declaration has none yet).
+type NestSig = record { name: str; kind: int; prms: []Prm; ret: PT; nest: str; defined: bool }
 
 fn (cx: &Cx) tk(i: int): Tok { return cx.toks[min(i, len(cx.toks) - 1)].clone() }
 fn (cx: &Cx) isK(i: int, w: &str): bool {
@@ -563,12 +574,13 @@ pub type Ip = record {
     pkgs: []PkgInst         // the packages' state in this session
     ddl: int                // bumped by DDL: cached units' types may be stale
     lines: int
+    subs: []PUnit           // the nested subprograms of the anonymous block that runs
 }
 
 pub fn newIp(st: lexdb_store.Store): Ip {
     return Ip{st: st, out: [], outOn: false, outPart: "", scache: [], scalls: [], stored: [], storedVer: -1, storedOk: false,
               curs: [], results: [], nls: [], user: "", sqlRows: 0, sqlFound: -1, errCode: 0, errMsg: "", depth: 0, uid: 0, sps: false, sp0: false,
-              exitLabel: "", ctl: [], curErr: plErr("", ""), outPos: 0, outBytes: 0, arrOut: [], outLimit: 20000, keep: 0, pkgs: [], ddl: 0, lines: 0}
+              exitLabel: "", ctl: [], curErr: plErr("", ""), outPos: 0, outBytes: 0, arrOut: [], outLimit: 20000, keep: 0, pkgs: [], ddl: 0, lines: 0, subs: []}
 }
 
 // ---- stored source (the catalog tree's "\x02src\x00" keys: owner, kind and name)
@@ -687,9 +699,21 @@ fn copyPrms(a: &[]Prm): []Prm {
 
 fn upperName(s: &str): str { return strings.toUpperAscii(s) }
 
+// A name as SQL text writes it, quoted (PL/SQL keeps a bare one upper case, a quoted one as written).
+fn qn(s: &str): str { return "\"" + strings.replaceAll(s, "\"", "\"\"") + "\"" }
+
 fn (cx: &Cx) sigOf(names: &[]str): Sig {
     if len(names) == 0 || len(names) > 3 { return noSig() }
     let nm = &names[len(names) - 1]
+    // a nested subprogram in scope, the innermost of the name
+    if len(names) == 1 && len(cx.nested) > 0 {
+        var k = len(cx.nested) - 1
+        while k >= 0 {
+            let ns = &cx.nested[k]
+            if ns.name == nm { return Sig{found: true, kind: ns.kind, prms: copyPrms(&ns.prms), ret: ns.ret, canon: [cx.owner.clone(), cx.pkg.clone(), ns.name.clone(), ns.nest.clone()]} }
+            k -= 1
+        }
+    }
     if cx.hasSelf && nm == cx.self.name && len(names) == 1 && len(cx.self.pkg) == 0 {
         return Sig{found: true, kind: cx.self.kind, prms: copyPrms(&cx.self.prms), ret: cx.self.ret, canon: [cx.self.owner.clone(), "", cx.self.name.clone()]}
     }
@@ -755,7 +779,7 @@ fn (pg: &Prog) find(names: &[]str, user: &str): int {
     var pick = -1
     for i in 0..len(pg.units) {
         let u = &pg.units[i]
-        if u.name != nm || (u.kind != U_PROC && u.kind != U_FUNC) { continue }
+        if u.name != nm || (u.kind != U_PROC && u.kind != U_FUNC) || len(u.nest) > 0 { continue }
         if len(u.pkg) == 0 && pg.deniedUnit(&u.owner, &u.name) { continue }
         if len(names) == 1 {
             if len(u.pkg) == 0 && (pick < 0 || u.owner == user) { pick = i }
@@ -769,10 +793,11 @@ fn (pg: &Prog) find(names: &[]str, user: &str): int {
 
 // The unit a compile resolved a call to: owner, package ("" none) and name.
 fn (pg: &Prog) findC(c: &[]str): int {
-    if len(c) != 3 { return -1 }
+    if len(c) != 3 && len(c) != 4 { return -1 }
+    let nest: &str = if len(c) == 4 { &c[3] } else { "" }
     for i in 0..len(pg.units) {
         let u = &pg.units[i]
-        if (u.kind == U_PROC || u.kind == U_FUNC) && u.owner == c[0] && u.pkg == c[1] && u.name == c[2] { return i }
+        if (u.kind == U_PROC || u.kind == U_FUNC) && u.owner == c[0] && u.pkg == c[1] && u.name == c[2] && u.nest == nest { return i }
     }
     return -1
 }
@@ -790,7 +815,7 @@ fn sigsOf(pg: &Prog): []SigEntry {
     var out: []SigEntry = []
     for u in pg.units {
         if len(u.pkg) == 0 && pg.deniedUnit(&u.owner, &u.name) { continue }
-        if (u.kind == U_PROC || u.kind == U_FUNC) && (u.isPub || len(u.pkg) == 0) { append(mut &out, SigEntry{owner: u.owner.clone(), pkg: u.pkg.clone(), name: u.name.clone(), kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: u.isPub, slot: 0, konst: false}) }
+        if (u.kind == U_PROC || u.kind == U_FUNC) && (u.isPub || len(u.pkg) == 0) && len(u.nest) == 0 { append(mut &out, SigEntry{owner: u.owner.clone(), pkg: u.pkg.clone(), name: u.name.clone(), kind: u.kind, prms: copyPrms(&u.prms), ret: u.ret, isPub: u.isPub, slot: 0, konst: false}) }
         for v in u.pubVars { append(mut &out, varSig(&u, &v)) }
     }
     return out
@@ -1133,7 +1158,7 @@ fn (cx: mut &Cx) hoistCall(ip: mut &Ip, sess: mut &lexdb_exec.Session, names: &[
         append(mut &n.names2, an)
         k += 2
     }
-    try cx.argCheck(&sg.prms, &n.names2, &names[len(names) - 1], cx.tk(a).line, cx.tk(a).col)
+    try cx.argCheck(&sg.prms, &n.names2, &names[if len(names) >= 3 { 2 } else { len(names) - 1 }], cx.tk(a).line, cx.tk(a).col)
     n.slot = cx.newSlot(sg.ret)
     let r = n.slot
     append(pre, n)
@@ -1392,8 +1417,9 @@ fn (cx: mut &Cx) parseType(sess: mut &lexdb_exec.Session): Result[PT, DbErr] {
             if len(names) >= 2 && len(names) <= 3 {
                 // [schema.]table.column
                 let col = &names[len(names) - 1]
-                var tab = names[len(names) - 2].clone()
-                if len(names) == 3 { tab = names[0] + "." + tab }
+                // (quoted in the SQL: a bare name is upper case already, a quoted one exact)
+                var tab = qn(&names[len(names) - 2])
+                if len(names) == 3 { tab = qn(&names[0]) + "." + tab }
                 if len(names) == 2 {
                     let vi = cx.find(&names[0])
                     if vi >= 0 && cx.vars[vi].pt.k == PK_REC {
@@ -1401,7 +1427,7 @@ fn (cx: mut &Cx) parseType(sess: mut &lexdb_exec.Session): Result[PT, DbErr] {
                         if f >= 0 { return Ok(cx.recs[cx.vars[vi].pt.rec].fields[f].pt) }
                     }
                 }
-                match cx.describeText(sess, &("SELECT " + col + " FROM " + tab)) {
+                match cx.describeText(sess, &("SELECT " + qn(col) + " FROM " + tab)) {
                     Ok(cols) { if len(cols) == 1 { return Ok(ptOfOut(&cols[0])) } }
                     Err(e) { return Err(cx.sqlErr(t0.line, &e)) }
                 }
@@ -1420,7 +1446,9 @@ fn (cx: mut &Cx) parseType(sess: mut &lexdb_exec.Session): Result[PT, DbErr] {
         }
         var tab = names[0].clone()
         for k in 1..len(names) { tab = tab + "." + names[k] }
-        match cx.describeText(sess, &("SELECT * FROM " + tab)) {
+        var qtab = qn(&names[0])
+        for k in 1..len(names) { qtab = qtab + "." + qn(&names[k]) }
+        match cx.describeText(sess, &("SELECT * FROM " + qtab)) {
             Ok(cols) {
                 var r = pt(PK_REC)
                 r.rec = cx.recOf(&tab, &cols)
@@ -1872,6 +1900,18 @@ fn (cx: mut &Cx) stmt1(ip: mut &Ip, sess: mut &lexdb_exec.Session, label: &str):
                     break
                 }
                 j += 1
+            }
+            // (a parenthesis left open before INTO: ORA-00907 at the INTO, as Oracle's, not PLS-00428)
+            if intoAt < 0 && d > 0 {
+                j = i + 1
+                while j < e {
+                    if cx.isK(j, "INTO") {
+                        let it = cx.tk(j)
+                        return Err(plErr("ORA06550", &("line " + it.line.toStr() + ", column " + it.col.toStr() + ":\nPL/SQL: ORA-00907: missing right parenthesis" +
+                                         "\nORA-06550: line " + line.toStr() + ", column " + t.col.toStr() + ":\nPL/SQL: SQL Statement ignored")))
+                    }
+                    j += 1
+                }
             }
             if intoAt < 0 {
                 // a SELECT with no INTO: not PL/SQL
@@ -2488,11 +2528,13 @@ fn (cx: mut &Cx) blockStmt(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[P
 fn (cx: mut &Cx) block(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[P, DbErr] {
     var n = node(K_BLOCK, cx.tk(cx.pos).line)
     cx.push()
+    let n0 = len(cx.nested)
     if cx.isK(cx.pos, "DECLARE") {
         cx.pos += 1
         n.decl = try cx.decls(ip, sess)
     }
     try cx.bodyOf(ip, sess, mut &n)
+    while len(cx.nested) > n0 { let x = pop(mut &cx.nested) }
     cx.pop()
     return Ok(n)
 }
@@ -2646,7 +2688,8 @@ fn (cx: mut &Cx) decls(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[[]P, 
                 try cx.pkgMember(ip, sess)
                 continue
             }
-            return Err(plErr("ORA06550", &("line " + t.line.toStr() + ", column " + t.col.toStr() + ":\nPLS-00103: subprograms declared in a block are not supported")))
+            try cx.nestedUnit(ip, sess)
+            continue
         }
         if !cx.ident(i) { return Err(cx.bad(i, "")) }
         let nm = &t.up
@@ -2693,7 +2736,8 @@ fn (cx: mut &Cx) decls(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[[]P, 
 fn newCx(src: &str, toks: []Tok, owner: &str, nls: []str, sigs: []SigEntry, uid: int): Cx {
     var cx = Cx{src: src.toStr(), toks: toks, pos: 0, vars: [], marks: [], slotPt: [], recs: [], curs: [], excs: [], types: [], bindNames: [],
                 bindUse: [], bindSlot: [], nsid: 0, uid: uid, unit: "", owner: owner.toStr(), retPt: pt(PK_ANY), isFunc: false,
-                self: emptyUnit(), hasSelf: false, sigs: sigs, nls: nls, pkg: "", inMember: false, stopAtEnd: false, members: [], ranges: [], pubs: [], specMode: false, stmtLine: 1, stmtCol: 1, uses: false, hoistOk: true, colScope: [], noSubA: -1, noSubB: -1, post: [], strict: false}
+                self: emptyUnit(), hasSelf: false, sigs: sigs, nls: nls, pkg: "", inMember: false, stopAtEnd: false, members: [], ranges: [], pubs: [], specMode: false, stmtLine: 1, stmtCol: 1, uses: false, hoistOk: true, colScope: [], noSubA: -1, noSubB: -1, post: [], strict: false,
+                nested: [], nestN: 0, subs: []}
     append(mut &cx.slotPt, pt(PK_INT))
     append(mut &cx.slotPt, pt(PK_BOOL))
     append(mut &cx.slotPt, pt(PK_BOOL))
@@ -2705,7 +2749,8 @@ fn newCx(src: &str, toks: []Tok, owner: &str, nls: []str, sigs: []SigEntry, uid:
 
 fn emptyUnit(): PUnit {
     return PUnit{owner: "", name: "", kind: U_BLOCK, prms: [], defs: [], ret: pt(PK_ANY), retSlot: -1, nslots: 0, slotPt: [], body: node(K_NULL, 0), src: "",
-                 bindUse: [], bindSlot: [], nbinds: 0, sid0: 0, sid1: 0, curs: [], bad: "", pkg: "", isPub: true, pkgSlots: [], pubVars: []}
+                 bindUse: [], bindSlot: [], nbinds: 0, sid0: 0, sid1: 0, curs: [], bad: "", pkg: "", isPub: true, pkgSlots: [], pubVars: [], nest: "",
+                 nfrom: 0, nto: 0, subs: []}
 }
 
 // The unit cx has compiled, with its tables moved into it.
@@ -2739,7 +2784,9 @@ fn compileBlock(ip: mut &Ip, sess: mut &lexdb_exec.Session, src: &str, binds: &[
     if cx.tk(cx.pos).kind != TK_EOF { return Err(cx.bad(cx.pos, "")) }
     ip.uid = cx.uid
     while len(ip.scache) < cx.nsid { append(mut &ip.scache, None) }
+    let subs = cx.nestedDone(&[])
     var u = cx.finish(U_BLOCK, n)
+    u.subs = subs
     return Ok(u)
 }
 
@@ -2860,7 +2907,9 @@ fn compileStored(ip: mut &Ip, sess: mut &lexdb_exec.Session, src: &str, owner: &
     while len(ip.scache) < cx.nsid { append(mut &ip.scache, None) }
     let prms = replace(mut &u.prms, [])
     let defs = replace(mut &u.defs, [])
+    let subs = cx.nestedDone(&[])
     var r = cx.finish(h.kind, n)
+    r.subs = subs
     r.owner = u.owner.clone()
     r.name = u.name.clone()
     r.prms = prms
@@ -3337,14 +3386,28 @@ fn undefinedErr(names: &[]str): DbErr {
 // A call of a stored procedure or function (a K_CALL or K_HOIST node of unit u, in frame fr): its result.
 fn callUnit(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p: &P, fr: mut &Fr): Result[Val, DbErr] {
     let ci = pg.findC(&p.names)
-    if ci < 0 { return Err(undefinedErr(&p.names)) }
-    let cu = &pg.units[ci]
+    // (a nested subprogram of the anonymous block that runs: a copy, the block's live in ip)
+    var held = emptyUnit()
+    var heldOk = false
+    if ci < 0 && len(p.names) == 4 {
+        for s in ip.subs {
+            if !heldOk && s.name == p.names[2] && s.nest == p.names[3] {
+                held = cloneUnit(&s)
+                heldOk = true
+            }
+        }
+    }
+    if ci < 0 && !heldOk { return Err(undefinedErr(&p.names)) }
+    let cu = if heldOk { &held } else { &pg.units[ci] }
     if len(cu.bad) > 0 {
         return Err(plErr("ORA06550", &("line " + p.line.toStr() + ", column 1:\nPLS-00905: object " + cu.owner + "." + cu.name + " is invalid\nORA-06550: line " +
                          p.line.toStr() + ", column 1:\nPL/SQL: Statement ignored")))
     }
     if ip.depth > 60 { return Err(ora(4030, "out of process memory when trying to allocate PL/SQL stack")) }
     var f2 = newFr(cu)
+    // a nested subprogram: the enclosing units' variables are the caller's
+    let nested = len(cu.nest) > 0 && len(fr.vals) == len(f2.vals)
+    if nested { nestCopy(cu, fr, mut &f2) }
     var given: []bool = array(len(cu.prms), false)
     for i in 0..len(p.x) {
         var pi = i
@@ -3390,6 +3453,7 @@ fn callUnit(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p:
     if switched { sess.backToSchema(&callerSave) }
     if calleePi >= 0 { pkgSave(cu, &f2, ip, calleePi) }
     if callerPi >= 0 { pkgLoad(u, fr, ip, callerPi) }
+    if nested { nestCopy(cu, &f2, fr) }
     match r {
         Ok(_) {}
         Err(e) { return Err(withTrace(&e, &unitWhere(cu), f2.line)) }
@@ -3405,6 +3469,15 @@ fn callUnit(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: &PUnit, p:
     }
     if cu.kind == U_FUNC { return conv(&cu.ret, replace(mut &f2.ret, Val.Null)) }
     return Ok(Val.Null)
+}
+
+// The slots of frame a that are not nested subprogram cu's own (nfrom..nto) copied into frame b.
+fn nestCopy(cu: &PUnit, a: &Fr, b: mut &Fr) {
+    for s in 0..len(a.vals) {
+        if s >= cu.nfrom && s < cu.nto { continue }
+        b.vals[s] = a.vals[s].clone()
+        b.oids[s] = a.oids[s]
+    }
 }
 
 fn (u: &PUnit) kindName(): str { return if u.kind == U_FUNC { "FUNCTION" } else if u.kind == U_PROC { "PROCEDURE" } else { "PACKAGE BODY" } }
@@ -4249,8 +4322,11 @@ pub fn ensureProg(pg: mut &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session): Re
         let built = compileStored(ip, sess, &s.src, &s.owner, cloneSigs(&sigs), false)
         if s.owner != ip.user { sess.backToSchema(&save) }
         match built {
-            Ok(u) {
+            Ok(u0) {
+                var u = u0
+                var subs = replace(mut &u.subs, [])
                 append(mut &units, u)
+                for k in 0..len(subs) { append(mut &units, replace(mut &subs[k], emptyUnit())) }
                 // (a unit stored invalid that compiles now is valid again when it is used: Oracle revalidates it then, `revalidate`)
                 if len(s.err) > 0 { append(mut &revals, Stored{owner: s.owner.clone(), name: s.name.clone(), kind: s.kind.clone(), src: s.src.clone(), err: ""}) }
             }
@@ -4287,7 +4363,7 @@ pub fn ensureProg(pg: mut &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session): Re
     }
     // the units of other owners the user may not run
     var names: []str = []
-    for u in units { if len(u.pkg) == 0 && (u.kind == U_PROC || u.kind == U_FUNC) { append(mut &names, u.owner + "." + u.name) } }
+    for u in units { if len(u.pkg) == 0 && len(u.nest) == 0 && (u.kind == U_PROC || u.kind == U_FUNC) { append(mut &names, u.owner + "." + u.name) } }
     pg.units = units
     pg.ver = ip.storedVer
     pg.ddl = ip.ddl
@@ -4398,6 +4474,14 @@ pub fn setNls(ip: mut &Ip, nls: []str, user: &str) {
 
 // Runs an anonymous block with its binds. commit: the call's commit flag.
 pub fn runBlock(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, text: &str, binds: &[]BindIn, commit: bool): BlockRes {
+    // (a block run inside another's keeps the outer one's nested subprograms)
+    let outer = replace(mut &ip.subs, [])
+    let r = runBlockIn(pg, ip, sess, text, binds, commit)
+    ip.subs = outer
+    return r
+}
+
+fn runBlockIn(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, text: &str, binds: &[]BindIn, commit: bool): BlockRes {
     var res = emptyRes()
     var names: []str = []
     for b in binds { append(mut &names, b.name.clone()) }
@@ -4412,6 +4496,7 @@ pub fn runBlock(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, text: &st
         }
     }
     var fr = newFr(&u)
+    ip.subs = replace(mut &u.subs, [])
     for k in 0..len(binds) {
         if k < len(u.bindSlot) { putv(&u, mut &fr, u.bindSlot[k], binds[k].v.clone()) }
     }
@@ -4686,7 +4771,7 @@ pub type FnInfo = record { pub id: str; pub ret: lexdb_sql.TypeName; pub oid: in
 pub fn findFunction(pg: &Prog, ip: &Ip, name: &str): Option[FnInfo] {
     if len(pg.units) == 0 || len(name) == 0 { return None }
     var names: []str = []
-    for part in strings.split(&strings.replaceAll(name, lexdb_sql.QSEP, "."), ".") { append(mut &names, strings.toUpperAscii(&part)) }
+    for part in strings.split(&strings.replaceAll(name, lexdb_sql.QSEP, "."), ".") { append(mut &names, lexdb_sql.oraShown(&part)) }
     let i = pg.find(&names, &ip.user)
     if i < 0 { return None }
     let u = &pg.units[i]
@@ -4700,7 +4785,7 @@ pub fn findFunction(pg: &Prog, ip: &Ip, name: &str): Option[FnInfo] {
 pub fn invalidFunction(pg: &Prog, ip: &Ip, name: &str): Option[DbErr] {
     if len(pg.units) == 0 || len(name) == 0 { return None }
     var names: []str = []
-    for part in strings.split(&strings.replaceAll(name, lexdb_sql.QSEP, "."), ".") { append(mut &names, strings.toUpperAscii(&part)) }
+    for part in strings.split(&strings.replaceAll(name, lexdb_sql.QSEP, "."), ".") { append(mut &names, lexdb_sql.oraShown(&part)) }
     let i = pg.find(&names, &ip.user)
     if i < 0 || pg.units[i].kind != U_FUNC || len(pg.units[i].bad) == 0 { return None }
     return Some(ora(6575, &("Package or function " + pg.units[i].name + " is in an invalid state")))
@@ -4731,7 +4816,10 @@ pub fn callFunctionIn(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, u: 
 // A stored function called with these values: its result, or the error it raised.
 pub fn callFunction(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, id: &str, args: &[]Val): Result[Val, DbErr] {
     var binds: []BindIn = [BindIn{name: "R__", v: Val.Null, array: false, cursor: false}]
-    var blk = "BEGIN :r__ := " + id + "("
+    // (the id's names quoted: a function's name is exact, "MixF")
+    var qid: []str = []
+    for part in strings.split(id, ".") { append(mut &qid, "\"" + part + "\"") }
+    var blk = "BEGIN :r__ := " + strings.join(&qid, ".") + "("
     for k in 0..len(args) {
         if k > 0 { blk += ", " }
         blk += ":a" + k.toStr()
@@ -4764,9 +4852,10 @@ pub fn expandCalls(pg: &Prog, ip: mut &Ip, sess: mut &lexdb_exec.Session, text: 
         let t = &toks[i]
         var ni = i
         var names: []str = []
-        if t.kind == TK_ID && !(i > 0 && toks[i - 1].kind == TK_OP && toks[i - 1].text == ".") {
+        // (a quoted name too: "MixF"(2), the name as written)
+        if (t.kind == TK_ID || t.kind == TK_QID) && !(i > 0 && toks[i - 1].kind == TK_OP && toks[i - 1].text == ".") {
             append(mut &names, t.up.clone())
-            while ni + 2 < len(toks) && toks[ni + 1].kind == TK_OP && toks[ni + 1].text == "." && toks[ni + 2].kind == TK_ID {
+            while ni + 2 < len(toks) && toks[ni + 1].kind == TK_OP && toks[ni + 1].text == "." && (toks[ni + 2].kind == TK_ID || toks[ni + 2].kind == TK_QID) {
                 append(mut &names, toks[ni + 2].up.clone())
                 ni += 2
             }
@@ -4907,8 +4996,10 @@ fn (cx: mut &Cx) pkgMember(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[U
     var n = node(K_BLOCK, cx.tk(cx.pos).line)
     let was = cx.stopAtEnd
     cx.stopAtEnd = false
+    let n0 = len(cx.nested)
     n.decl = try cx.decls(ip, sess)
     try cx.bodyOf(ip, sess, mut &n)
+    while len(cx.nested) > n0 { let x = pop(mut &cx.nested) }
     cx.stopAtEnd = was
     try cx.needO(cx.pos, ";")
     cx.pos += 1
@@ -4920,6 +5011,115 @@ fn (cx: mut &Cx) pkgMember(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[U
     cx.inMember = false
     cx.pop()
     return Ok(Unit{})
+}
+
+// A procedure or function declared in a unit's declarations (a nested subprogram): a forward declaration (its signature) or
+// the subprogram, compiled as a package's member is, in the slots of the unit that declares it: its parameters and variables
+// get slots of their own (nfrom..nto), it reads and writes the others (the enclosing units' variables) in the caller's frame
+// (callUnit copies them in and back). Its name is in scope to the end of the declaring block, for itself (recursion) and for
+// what is declared after it; a call resolves to it (Sig.canon's fourth name, its scope's id) before any stored unit.
+fn (cx: mut &Cx) nestedUnit(ip: mut &Ip, sess: mut &lexdb_exec.Session): Result[Unit, DbErr] {
+    let kind = if cx.isK(cx.pos, "PROCEDURE") { U_PROC } else { U_FUNC }
+    cx.pos += 1
+    cx.push()
+    let first = len(cx.slotPt)
+    let wasUnit = cx.unit.clone()
+    var u = emptyUnit()
+    u.owner = cx.owner.clone()
+    try cx.header(ip, sess, kind, mut &u)
+    u.owner = cx.owner.clone()
+    u.pkg = cx.pkg.clone()
+    // its forward declaration's entry, or a new one
+    var ni = -1
+    var k = len(cx.nested) - 1
+    while k >= 0 {
+        if cx.nested[k].name == u.name && !cx.nested[k].defined && cx.nested[k].kind == kind {
+            ni = k
+            break
+        }
+        k -= 1
+    }
+    if ni < 0 {
+        cx.nestN += 1
+        let root = if len(cx.self.name) > 0 { cx.self.name.clone() } else { "" }
+        append(mut &cx.nested, NestSig{name: u.name.clone(), kind: kind, prms: copyPrms(&u.prms), ret: u.ret, nest: root + "#" + cx.nestN.toStr(), defined: false})
+        ni = len(cx.nested) - 1
+    }
+    if cx.isO(cx.pos, ";") {
+        cx.pos += 1
+        cx.unit = wasUnit
+        cx.pop()
+        return Ok(Unit{})
+    }
+    if !(cx.isK(cx.pos, "IS") || cx.isK(cx.pos, "AS")) { return Err(cx.bad(cx.pos, "IS")) }
+    cx.pos += 1
+    cx.nested[ni].defined = true
+    cx.nested[ni].prms = copyPrms(&u.prms)
+    cx.nested[ni].ret = u.ret
+    let n0 = len(cx.nested)
+    var n = node(K_BLOCK, cx.tk(cx.pos).line)
+    let wasStop = cx.stopAtEnd
+    let wasMember = cx.inMember
+    cx.stopAtEnd = false
+    cx.inMember = true
+    n.decl = try cx.decls(ip, sess)
+    try cx.bodyOf(ip, sess, mut &n)
+    cx.stopAtEnd = wasStop
+    cx.inMember = wasMember
+    while len(cx.nested) > n0 { let x = pop(mut &cx.nested) }
+    try cx.needO(cx.pos, ";")
+    cx.pos += 1
+    u.body = n
+    u.nest = cx.nested[ni].nest.clone()
+    u.nfrom = first
+    u.nto = len(cx.slotPt)
+    u.isPub = false
+    append(mut &cx.subs, u)
+    cx.unit = wasUnit
+    cx.pop()
+    return Ok(Unit{})
+}
+
+// The nested subprograms cx compiled, given the slots and cursors of the unit that declares them (all of the text's).
+fn (cx: mut &Cx) nestedDone(pkgSlots: &[]int): []PUnit {
+    var out = replace(mut &cx.subs, [])
+    for k in 0..len(out) {
+        out[k].nslots = len(cx.slotPt)
+        out[k].slotPt = cloneSlotPt(&cx.slotPt)
+        out[k].pkgSlots = cloneInts(pkgSlots)
+        out[k].curs = cloneCurs(&cx.curs)
+    }
+    return out
+}
+
+// A copy of a unit (a block's nested subprogram, which lives in the block's run only).
+fn cloneUnit(u: &PUnit): PUnit {
+    var c = emptyUnit()
+    c.owner = u.owner.clone()
+    c.name = u.name.clone()
+    c.kind = u.kind
+    c.prms = copyPrms(&u.prms)
+    for d in u.defs { append(mut &c.defs, cloneP(&d)) }
+    c.ret = u.ret
+    c.retSlot = u.retSlot
+    c.nslots = u.nslots
+    c.slotPt = cloneSlotPt(&u.slotPt)
+    c.body = cloneP(&u.body)
+    c.src = u.src.clone()
+    c.bindUse = cloneInts(&u.bindUse)
+    c.bindSlot = cloneInts(&u.bindSlot)
+    c.nbinds = u.nbinds
+    c.sid0 = u.sid0
+    c.sid1 = u.sid1
+    c.curs = cloneCurs(&u.curs)
+    c.bad = u.bad.clone()
+    c.pkg = u.pkg.clone()
+    c.isPub = u.isPub
+    c.pkgSlots = cloneInts(&u.pkgSlots)
+    c.nest = u.nest.clone()
+    c.nfrom = u.nfrom
+    c.nto = u.nto
+    return c
 }
 
 // The index of the token after `PACKAGE [BODY] name IS|AS` in a package's text, -1 when it is not one.
@@ -5023,6 +5223,9 @@ fn compilePackage(ip: mut &Ip, sess: mut &lexdb_exec.Session, owner: &str, name:
         m.curs = cloneCurs(&cx.curs)
         append(mut &out, m)
     }
+    // the members' nested subprograms
+    var subs = cx.nestedDone(&pkgSlots)
+    for k in 0..len(subs) { append(mut &out, replace(mut &subs[k], emptyUnit())) }
     return Ok(out)
 }
 

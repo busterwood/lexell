@@ -1245,3 +1245,15 @@ assertion's CHECK_CONSTRAINTS row; no sys.objects row (no type for one: SSMS, sp
 - INFORMATION_SCHEMA shows dbo for lexdb's public schema. An assertion's check reads with its owner's rights.
 - A parenthesized UNION operand with its own ORDER BY is 156; a reserved word as a bare alias 156; CREATE TABLE HOLDLOCK / INDEX and `FROM t HOLDLOCK` 1018. Tests `tds_bugs5`,
   `tds_assertpriv`.
+
+## As built: the sixth bug slice (lexdb-robust.md, 2026-11-25)
+
+- Index names are per table (`lexdb_ixname`): `CREATE INDEX ix ON t2` is taken when another table has an `ix` (kept under a name the T-SQL door shows as `ix`), the same name on
+  the same table is 1913, a repeated inline name in CREATE TABLE 8168, two CLUSTERED ones 8112; `DROP INDEX ix ON t`, `DROP INDEX t.ix` and `schema.t.ix` find the table's.
+- DROP TABLE under a view is done (208 when the view is read; 3729 for a view WITH SCHEMABINDING); the view reads the table again once it is made.
+- INFORMATION_SCHEMA: SCHEMATA lists SQL Server's schemas (dbo, guest, INFORMATION_SCHEMA, sys, the db_* roles' and those made, owned by dbo); ROUTINES and PARAMETERS list
+  the T-SQL procedures and functions; CONSTRAINT_COLUMN_USAGE gives a foreign key's own columns; VIEW_TABLE_USAGE and VIEW_COLUMN_USAGE exist. `sp_refreshview` makes a view
+  again from its text (a `SELECT *` view takes the table's columns as they are now). lexdb does not keep SQL Server's 4502 after a failed read until sp_refreshview.
+- 4512 (a one-part name in a schema-bound view), 4513 (over a view that is not schema-bound, or a function), 5074 for ALTER COLUMN under a schema-bound view; WITH CHECK
+  OPTION before AS is 102; 1054's state is 6. INSERT TOP (n) ... SELECT ... ORDER BY keeps following the ORDER BY (SQL Server ignores it: its choice is undefined).
+  Not done: 4502's text without the schema written in the query. Test `tds_bugs6`.
