@@ -111,6 +111,17 @@ pub fn afterAlter(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_s
     }
     // (the assertions that read the table: INVALID, as Oracle's)
     if cols { try lexdb_assert.columnsChanged(st, txn, k) }
+    // SQL Server: ALTER COLUMN of a column a view WITH SCHEMABINDING names is 5074
+    if s.mdialect == lexdb_sql.MD_TSQL {
+        for a in s.alters {
+            if a.kind != lexdb_sql.A_TYPE { continue }
+            for v in try lexdb_catalog.allViews(st, txn) {
+                if lexdb_sql.viewBound(&v.view) && lexdb_base.hasStr(&v.deps, k) && wordIn(&lexdb_sql.viewKept(&v.view), &a.name) {
+                    return Err(err("TS5074", &("The object '" + lexdb_sql.baseName(&v.name) + "' is dependent on column '" + a.name + "'.")))
+                }
+            }
+        }
+    }
     if len(col) == 0 || s.mdialect == lexdb_sql.MD_ORA { return Ok(Unit{}) }
     let deps = try lexdb_catalog.dependentViews(st, txn, k)
     if len(deps) == 0 { return Ok(Unit{}) }
@@ -164,41 +175,34 @@ pub fn viewErrs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &str, sn
     return Ok(out)
 }
 
-// DROP TABLE k under views (the sixth bug slice), per door, as each product does: PostgreSQL refuses it (2BP01, the views in
-// its DETAIL) and its CASCADE drops the views (and the views over them); SQL Server drops the table unless a view made WITH
-// SCHEMABINDING reads it (3729), and a view over it fails when read (208); Oracle drops it, and a view over it has errors
-// (ORA-04063 when read, INVALID, ORA-00942 in USER_ERRORS). Such a view reads the table again once one of its name is made.
-// door: the session's (lexdb_priv.doorOf: "tds", "tns" or the PostgreSQL door's; DROP TABLE's statement does not say).
-pub fn dropTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, k: &str, door: &str): Result[Unit, DbErr] {
-    let deps = try lexdb_catalog.dependentViews(st, txn, k)
-    if len(deps) == 0 || door == "tns" || s.mdialect == lexdb_sql.MD_ORA { return Ok(Unit{}) }
-    if door == "tds" || s.mdialect == lexdb_sql.MD_TSQL {
-        for v in try lexdb_catalog.allViews(st, txn) {
-            if lexdb_base.hasStr(&deps, &v.name) && lexdb_sql.viewBound(&v.view) && lexdb_base.hasStr(&v.deps, k) {
-                return Err(err("TS3729", &("Cannot DROP TABLE '" + lexdb_sql.baseName(k) + "' because it is being referenced by object '" + lexdb_sql.baseName(&v.name) + "'.")))
-            }
-        }
-        return Ok(Unit{})
+// Whether text has name w as a word of its own (no letter, digit, _, @, # or $ beside it), case ignored.
+fn wordIn(text: &str, w: &str): bool {
+    let t = strings.toLowerAscii(text)
+    let x = strings.toLowerAscii(w)
+    var at = 0
+    while true {
+        let i = strings.indexOf(&t, &x, at)
+        if i < 0 { return false }
+        let j = i + len(x)
+        if (i == 0 || !nameByte(t[i - 1])) && (j >= len(t) || !nameByte(t[j])) { return true }
+        at = i + 1
     }
-    if s.cascade {
-        // (the views and their grants, as DROP VIEW ... CASCADE drops them)
-        for b in deps {
-            txn.del(lexdb_catalog.CATALOG, &b)
-            txn.del(lexdb_catalog.CATALOG, &(lexdb_catalog.ACL_PRE + lexdb_catalog.relObj(&b)))
-        }
-        return Ok(Unit{})
-    }
-    var detail: []str = []
+    return false
+}
+
+fn nameByte(c: byte): bool { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '@' || c == '#' || c == '$' || c >= 128 }
+
+// T-SQL: a view WITH SCHEMABINDING (s, CREATE VIEW) reads views that are schema-bound too (SQL Server's 4513); deps: the
+// relations its query reads.
+pub fn boundOver(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, deps: &[]str): Result[Unit, DbErr] {
+    if s.mdialect != lexdb_sql.MD_TSQL || !lexdb_sql.viewBound(&s.index) || len(deps) == 0 { return Ok(Unit{}) }
     for v in try lexdb_catalog.allViews(st, txn) {
-        if !lexdb_base.hasStr(&deps, &v.name) { continue }
-        var on = ""
-        if lexdb_base.hasStr(&v.deps, k) { on = "table " + lexdb_sql.shown(k) } else {
-            for d in v.deps { if len(on) == 0 && lexdb_base.hasStr(&deps, &d) { on = "view " + lexdb_sql.shown(&d) } }
-        }
-        append(mut &detail, "view " + lexdb_sql.shown(&v.name) + " depends on " + on)
+        if !lexdb_base.hasStr(deps, &v.name) || lexdb_sql.viewBound(&v.view) { continue }
+        let vn = if len(s.spell) > 0 { s.spell.clone() } else { lexdb_sql.baseName(&s.table) }
+        let on = (if lexdb_sql.isQual(&v.name) { lexdb_sql.schemaOf(&v.name) } else { "dbo" }) + "." + lexdb_sql.baseName(&v.name)
+        return Err(err("TS4513", &("Cannot schema bind view '" + vn + "'. '" + on + "' is not schema bound.")))
     }
-    return Err(lexdb_base.errDetail("2BP01", &("cannot drop table " + lexdb_sql.shown(k) + " because other objects depend on it"),
-                                    &strings.join(&detail, "\n"), "Use DROP ... CASCADE to drop the dependent objects too."))
+    return Ok(Unit{})
 }
 
 // T-SQL's sp_refreshview (s: its CREATE VIEW, alias REFRESH_VIEW, the name as given in table): the CREATE OR ALTER VIEW that
