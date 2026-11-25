@@ -792,6 +792,18 @@ fn (p: mut &P) name(): Result[str, lexdb_base.DbErr] {
     return Err(near(&t))
 }
 
+// T-SQL: the name token at i is not one of SQL Server's reserved words written bare (lexdb_sql.tsqlReserved: 156, as SQL Server's).
+fn (p: &P) notTsqlReserved(i: int): Result[Unit, lexdb_base.DbErr] {
+    // (IF NOT EXISTS, which SQL Server does not have: its error is at NOT)
+    let ifNot = p.toks[i].text == "if" && i + 1 < len(p.toks) && p.toks[i + 1].kind == T_IDENT && p.toks[i + 1].text == "not"
+    if i >= 0 && p.toks[i].kind == T_IDENT && lexdb_sql.tsqlReserved(&p.toks[i].text) && !ifNot {
+        // (156 itself: whether SQL Server says 156 or 102 for a word depends on where it is, so lexdb_tsql's mapping of a syntax error does not decide it)
+        let w = if len(p.toks[i].spell) > 0 { p.toks[i].spell.clone() } else { p.toks[i].text.clone() }
+        return Err(lexdb_base.err("TS156", &("Incorrect syntax near the keyword '" + w + "'.")))
+    }
+    return Ok(Unit{})
+}
+
 // A table's (or an index's) name: name or schema.name (qual).
 fn (p: mut &P) qname(): Result[str, lexdb_base.DbErr] {
     // T-SQL: @t, a table variable: the temporary table #@t
@@ -802,7 +814,8 @@ fn (p: mut &P) qname(): Result[str, lexdb_base.DbErr] {
     }
     let first = try p.name()
     if p.tsql {
-        // T-SQL: [db.][schema.]name, db..name; dbo is public (design/lexdb-tds.md L3)
+        // T-SQL: [db.][schema.]name, db..name; dbo is public (design/lexdb-tds.md L3); a reserved word only quoted (156)
+        try p.notTsqlReserved(p.pos - 1)
         var parts: []str = [first]
         var spell = p.spelled.clone()
         while p.acceptKw(".") {
@@ -811,6 +824,7 @@ fn (p: mut &P) qname(): Result[str, lexdb_base.DbErr] {
                 continue
             }
             append(mut &parts, try p.name())
+            try p.notTsqlReserved(p.pos - 1)
             spell = p.spelled.clone()
         }
         p.spelled = spell
@@ -2996,7 +3010,8 @@ fn (p: mut &P) tsqlCatCall(name: &str, a: mut &[]Expr): Result[Option[Expr], lex
 fn (p: mut &P) createTable(): Result[Stmt, lexdb_base.DbErr] {
     var s = lexdb_sql.newStmt(S_CREATE)
     s.mdialect = if p.tsql { MD_TSQL } else if p.ora { MD_ORA } else { MD_PG }
-    if p.acceptKw("if") {
+    // (SQL Server has no IF NOT EXISTS here (156 at NOT, as before), and IF alone is a reserved word there: 156)
+    if (!p.tsql || (p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "not")) && p.acceptKw("if") {
         try p.expectKw("not")
         try p.expectKw("exists")
         s.ifFlag = true
@@ -3071,6 +3086,7 @@ fn (p: mut &P) tableBody(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
         } else {
             let colAt = p.pos
             let n = try p.name()
+            if p.tsql { try p.notTsqlReserved(colAt) }
             var c = lexdb_sql.noCol()
             c.name = n.clone()
             c.spell = p.spelled.clone()
@@ -5139,11 +5155,12 @@ fn (p: mut &P) itemListAssign(items: mut &[]SelItem, assign: mut &[]str): Result
                 spell = t.text.clone()
             } else if p.acceptKw("as") {
                 alias = try p.name()
+                if p.tsql { try p.notTsqlReserved(p.pos - 1) }
                 spell = p.spelled.clone()
             } else {
                 let t = p.peek().clone()
                 let fetch = t.kind == T_IDENT && t.text == "fetch" && p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "first" || p.peekAt(1).text == "next")
-                if !fetch && !p.waitAhead() && (t.kind == T_QIDENT || (t.kind == T_IDENT && !lexdb_sql.isReserved(&t.text) && !(p.tsql && tsqlStarts(&t.text)))) {
+                if !fetch && !p.waitAhead() && (t.kind == T_QIDENT || (t.kind == T_IDENT && !lexdb_sql.isReserved(&t.text) && !(p.tsql && (tsqlStarts(&t.text) || lexdb_sql.tsqlReserved(&t.text))))) {
                     alias = t.text.clone()
                     spell = t.spell.clone()
                     p.pos += 1
@@ -6336,6 +6353,7 @@ fn (p: mut &P) aliasOf(alias: mut &str, cols: mut &[]str, spelled: bool): Result
     var got = false
     if p.acceptKw("as") {
         let old = replace(alias, try p.name())
+        if p.tsql { try p.notTsqlReserved(p.pos - 1) }
         got = true
     } else {
         let t = p.peek().clone()
@@ -6344,7 +6362,7 @@ fn (p: mut &P) aliasOf(alias: mut &str, cols: mut &[]str, spelled: bool): Result
                  (t.kind == T_IDENT && t.text == "match_recognize" && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(")
         // (FETCH FIRST ... after a table: a clause, as OFFSET)
         let fetch = t.kind == T_IDENT && t.text == "fetch" && p.peekAt(1).kind == T_IDENT && (p.peekAt(1).text == "first" || p.peekAt(1).text == "next")
-        if !tw && !fetch && !p.waitAhead() && (t.kind == T_QIDENT || (t.kind == T_IDENT && !lexdb_sql.isReserved(&t.text))) {
+        if !tw && !fetch && !p.waitAhead() && (t.kind == T_QIDENT || (t.kind == T_IDENT && !lexdb_sql.isReserved(&t.text) && !(p.tsql && lexdb_sql.tsqlReserved(&t.text)))) {
             // (Oracle: START WITH and CONNECT BY after a table are a hierarchical query's clauses)
             if !(p.ora && t.kind == T_IDENT && ((p.peekAt(1).kind == T_IDENT && ((t.text == "start" && p.peekAt(1).text == "with") ||
                                                                                (t.text == "connect" && p.peekAt(1).text == "by"))) ||
@@ -10780,8 +10798,19 @@ fn oraKwErr(src: &str, t: &Tok): lexdb_base.DbErr {
         pre = pre[sp + 1..len(pre)].toStr()
         cut = true
     }
+    return kwErr(&pre, cut, t)
+}
+
+// The same with the text cut at the tokens before token k (Oracle's cut of GRAPH_TABLE's text: ') columns (a.name as x)) ').
+fn oraKwErrToks(src: &str, toks: &[]Tok, k: int): lexdb_base.DbErr {
+    var s = k
+    while s > 0 && toks[k].at - toks[s - 1].at <= 28 { s -= 1 }
+    return kwErr(&(src[toks[s].at..toks[k].at].toStr()), s > 0, &toks[k])
+}
+
+fn kwErr(pre: &str, cut: bool, t: &Tok): lexdb_base.DbErr {
     let word = strings.toUpperAscii(&t.text)
-    let reserved = word == "HAVING" || word == "WINDOW" || word == "(" || word == "DATE" || word == "ORDER" || word == "GROUP"
+    let reserved = word == "HAVING" || word == "WINDOW" || word == "(" || word == "DATE" || word == "ORDER" || word == "GROUP" || word == "AS"
     return lexdb_base.err(if reserved { "ORA03048" } else { "ORA03049" },
                           &("SQL " + (if reserved { "reserved word" } else { "keyword" }) + " '" + word + "' is not syntactically valid following '" + (if cut { "..." } else { "" }) + pre + "'"))
 }
@@ -11004,6 +11033,8 @@ fn (p: mut &P) dropGraph(): Result[Stmt, lexdb_base.DbErr] {
     }
     s.table = try p.qname()
     s.spell = p.spelled.clone()
+    // (Oracle has no CASCADE or PURGE here: ORA-03049)
+    if p.isKw("cascade") || p.isKw("purge") { return Err(oraKwErr(&p.src, &p.toks[p.pos])) }
     return Ok(s)
 }
 
@@ -11039,7 +11070,7 @@ fn (p: mut &P) graphTable(join: int): Result[FromItem, lexdb_base.DbErr] {
         }
     }
     p.pos = close + 1
-    if p.isKw("as") { return Err(lexdb_base.err("ORA03048", "SQL reserved word 'AS' is not syntactically valid following '...)'")) }
+    if p.isKw("as") { return Err(oraKwErrToks(&p.src, &p.toks, p.pos)) }
     var s = lexdb_sql.newStmt(S_SELECT)
     s.srf = lexdb_sql.GRAPH_MARK.toStr()
     s.index = text

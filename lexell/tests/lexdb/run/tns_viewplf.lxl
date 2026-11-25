@@ -1,0 +1,127 @@
+// lexdb over TNS: a view that calls a stored function, read again on the same cursor after the function (or its package, or
+// the package's body) is dropped in another session (the fourth bug slice, design/lexdb-robust.md). The cursor's plan was
+// kept: its first read after the drop gave ORA-00904 (ORA-00900 for a package's function) where Oracle gives ORA-04063
+// (ORA-04067 for a body gone), as every later read did. A PL/SQL unit's CREATE and DROP now move the catalog's version, so
+// the kept plan is made again. USER_OBJECTS.STATUS of the view: INVALID while the function is gone, VALID once it is back
+// (Oracle keeps it INVALID until the view's next use), VALID with only a package's body gone (as Oracle). Python-oracledb
+// reuses a cursor this way (its statement cache); Oracle Database Free 23.26 answered the same statements as expected here.
+// expect: vf first: ok
+// expect: vg first: ok
+// expect: status: 'VF' 'VALID' | 'VG' 'VALID'
+// expect: vf after drop function: error 4063
+// expect: vf again: error 4063
+// expect: status: 'VF' 'INVALID' | 'VG' 'VALID'
+// expect: vf after the function is back: ok
+// expect: status: 'VF' 'VALID' | 'VG' 'VALID'
+// expect: vg after drop package body: error 4067
+// expect: vg again: error 4067
+// expect: status: 'VF' 'VALID' | 'VG' 'VALID'
+// expect: vg after drop package: error 4063
+// expect: status: 'VF' 'VALID' | 'VG' 'INVALID'
+// expect: vg after the package is back: ok
+import "task"
+import "net"
+import "strings"
+import "tns"
+import "oracle"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+fn connect(s: &str): oracle.Conn {
+    match oracle.connect(&(s.toStr())) {
+        Ok(c) { return c }
+        Err(e) {
+            println("connect: error " + e.code.toStr() + " " + e.msg)
+            exit(1)
+        }
+    }
+}
+
+// A query parsed on cursor id (0: a new one); the cursor's id.
+fn read(s: mut &tns.Session, label: &str, sql: &str, id: int): int {
+    let e = tns.Execute{sql: sql.toStr(), kind: tns.S_QUERY, cursorId: id, binds: [], prefetch: 10, commit: false, fetchOnly: false, valuesOnly: false}
+    match s.execute(&e, &[]) {
+        Ok(r) {
+            if r.hasError && r.error.num != 0 && r.error.num != 1403 {
+                println(label + ": error " + r.error.num.toStr())
+            } else {
+                println(label + ": ok")
+            }
+            return if r.error.cursorId != 0 { r.error.cursorId } else { id }
+        }
+        Err(x) {
+            println(label + ": wire error " + x.code.toStr() + " " + x.msg)
+            return id
+        }
+    }
+}
+
+fn status(c: mut &oracle.Conn) {
+    match c.query("select object_name, status from user_objects where object_name in ('VF', 'VG') order by 1", &[]) {
+        Ok(rows) {
+            var out: []str = []
+            for i in 0..rows.rowCount() { append(mut &out, rows.value(i, 0).unwrap().toStr() + " " + rows.value(i, 1).unwrap().toStr()) }
+            println("status: " + strings.join(&out, " | "))
+        }
+        Err(e) { println("status: error " + e.code.toStr()) }
+    }
+}
+
+fn client(port: &str) {
+    let cs = "User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb"
+    var c = connect(&cs)
+    c.exec("create table tv (a number)").unwrap()
+    c.exec("insert into tv values (1)").unwrap()
+    let f2 = "create or replace function f2 (x number) return number is begin return x + 1; end;"
+    let spec = "create or replace package pk2 as function g (x number) return number; end;"
+    let body = "create or replace package body pk2 as function g (x number) return number is begin return x * 10; end; end;"
+    c.exec(&f2).unwrap()
+    c.exec(&spec).unwrap()
+    c.exec(&body).unwrap()
+    c.exec("create view vf as select a, f2(a) b from tv").unwrap()
+    c.exec("create view vg as select a, pk2.g(a) c from tv").unwrap()
+    let st = oracle.parseConnString(&cs).unwrap()
+    var s = tns.open(&st.config).unwrap()
+    let qf = "select a, b from vf"
+    let qg = "select a, c from vg"
+    let vf = read(mut &s, "vf first", &qf, 0)
+    let vg = read(mut &s, "vg first", &qg, 0)
+    status(mut &c)
+    c.exec("drop function f2").unwrap()
+    let vf2 = read(mut &s, "vf after drop function", &qf, vf)
+    let vf3 = read(mut &s, "vf again", &qf, vf2)
+    status(mut &c)
+    c.exec(&f2).unwrap()
+    let vf4 = read(mut &s, "vf after the function is back", &qf, 0)
+    status(mut &c)
+    c.exec("drop package body pk2").unwrap()
+    let vg2 = read(mut &s, "vg after drop package body", &qg, vg)
+    let vg3 = read(mut &s, "vg again", &qg, vg2)
+    status(mut &c)
+    c.exec("drop package pk2").unwrap()
+    let vg4 = read(mut &s, "vg after drop package", &qg, vg3)
+    status(mut &c)
+    c.exec(&spec).unwrap()
+    c.exec(&body).unwrap()
+    let vg5 = read(mut &s, "vg after the package is back", &qg, 0)
+    s.close()
+    c.logoff()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(5), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

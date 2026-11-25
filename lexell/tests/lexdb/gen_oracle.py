@@ -213,6 +213,7 @@ CHECKED = {
     'tns_graph': ('consts', 'QS'),
     'tns_assert': ('consts', 'QS'),
     'tns_bugs3': ('consts', 'QS'),
+    'tns_bugs4': ('consts', 'QS'),
 }
 
 

@@ -274,3 +274,55 @@ selects x 3, base and branch alternated twice, a quiet machine): instructions 16
 twice, checksums equal on all 22, best of two: total 8,036 ms against 8,076 ms; q6 (+4.4%), q8, q9, q17 (+1.9%) and q12 (+1.5%) slower in time with the server's instructions per query equal
 (q6 1,528.2 M against 1,529.5 M, q9 13,492 M against 13,493 M, q12 3,887.5 M against 3,889.1 M; q8 and q17 fewer): placement and the runs' spread (q6's base runs 190.0 and 174.5 ms).
 lexdb_exec.lxl 21,492 lines before, 21,499 after.
+
+## The fourth bug slice (2026-11-25)
+
+The bugs the documentation passes listed in KNOWN-ISSUES.md (found on main e7691bd6 and 84ceec7e), on `worktree-agent-a6e32fbef48a2c168` (from main f23d0ebc, tags `b4-base` and `b4`). Each
+was checked on the product before and after (Oracle Free 23.26.3, SQL Server 2022, PostgreSQL 18). Tests: `tns_bugs4` (`gen_oracle.py --check tns_bugs4`: 72 answers, 0 differences),
+`tns_viewplf`, `tns_graphtext` (texts as Oracle gives them), `tds_bugs4` (`gen_mssql.py bugs4`), `exec_bugs4` (`gen_pg.py bugs4`).
+
+### Oracle
+- **A NUMBER foreign key to an identity key.** lexdb keeps NUMBER GENERATED AS IDENTITY and INTEGER as bigints and other NUMBERs as numerics; makeFk refused a key between them (ORA-00932). The
+  Oracle door takes an integer and a number either way (`lexdb_fkconv.compatible`; the PostgreSQL door refuses numeric to bigint as PostgreSQL does, `exec_bugs4`), and the lookups compare values:
+  a parent found by its primary key's key made from the values (`lexdb_fkconv.pkKey`, no row built: 5 and 5.0 find 5, 5.5 and numbers past bigint's range find nothing), another unique key and the
+  parent's side (`refRows`: DELETE, UPDATE, ON DELETE CASCADE / SET NULL, NO ACTION) through `needs` and `fit`; a statement's probes leave such a key to the row's lookup (`fkProbes`, via -2);
+  ON UPDATE CASCADE (which lexdb's Oracle door reads and Oracle does not) coerces into the child's type. A pair Oracle refuses (VARCHAR2 or BINARY_DOUBLE to NUMBER) is ORA-02267.
+  NUMBER to NUMBER(10) and NUMBER(10) to INTEGER behave as Oracle's (a NUMBER(10) child rounds 1.4 to 1 before the check). pkKey also made an INSERT into a table with a foreign key about 500
+  instructions cheaper (no row is built for the lookup).
+- **A view over a dropped function, read again.** A PL/SQL unit's CREATE and DROP did not move the catalog's version, so a cursor's kept plan of a view calling the function ran its old call
+  (ORA-00904, ORA-00900 for a package's). `lexdb_plsql.putUnit` (CREATE, DROP; not a compile's status flips) bumps it in the unit's own transaction (`lexdb_catalog.CAT_VERSION_KEY`); the
+  plan is made again and gives ORA-04063 (ORA-04067 for a package's body). As with every DDL in lexdb, a write transaction open in another session that read the version fails at COMMIT
+  (08177). USER_OBJECTS.STATUS of the view is INVALID while a function or package it calls is gone (`lexdb_routine.viewPlfBad`), VALID once it is back (Oracle keeps it INVALID until its next
+  use). Not done: in a transaction opened before the DROP, the first read is still ORA-00904 (its snapshot sees the function's source).
+- **Units created with compilation errors.** A stored procedure's or function's compile (`Cx.strict`) checks each expression's SQL: one that does not parse is PLS-00103 at the token after it, a
+  name that is no variable, column or function PLS-00201 (`checkExpr`), and DML on a missing table `PL/SQL: ORA-00942` at the table's name (`checkTarget`). The unit is stored INVALID with
+  USER_ERRORS' rows (the second, "Statement ignored" or "SQL Statement ignored", at the statement's start). SQL's call of an invalid function is ORA-06575 (`sqlError`, `invalidFunction`) and
+  CREATE VIEW over one is refused with it (Oracle's; the entry said ORA-04063); the program's invalid units keep their parameters (a call was PLS-00306). Found only when the code runs, as
+  before: type errors, a wrong argument count to a built-in, unknown columns of a SELECT INTO; package bodies and anonymous blocks are compiled as before (Oracle compiles a block first:
+  ORA-06550 where lexdb gives the run's ORA-00904 or ORA-00942). PLS-00103's text has no "expecting" list. Subprograms declared in a block remain unsupported.
+- **The zone UTC by its name.** `ALTER SESSION SET TIME_ZONE = 'UTC'` and a logon in UTC load the region from the zone database (`lexdb_time.REGION_UTC`, the setting `lexdb_tns.zoneSetting`
+  gives), so SESSIONTIMEZONE shows UTC (and Etc/UTC, GMT by their names); only a session's default, lexdb's own UTC, shows +00:00. TZR of CURRENT_TIMESTAMP is +00:00 still (regions are kept
+  as offsets in values: KNOWN-ISSUES' entry).
+- **TO_CHAR of a TIMESTAMP WITH LOCAL TIME ZONE** refuses TZH and TZM (ORA-01821, `TzOut.ltz`); TZR and TZD are taken (+00:00 and NULL, as Oracle). Without a format it is the timestamp's
+  (NLS_TIMESTAMP_FORMAT), as Oracle shows one (it was DD-MON-RR, or the TSTZ format with TZR).
+- **Property graphs' errors** (lexdb_graph): "is never defined" (the text said "noRows"); a property no label of the variable's kind has is ORA-40983 (ORA-49044 when another label of that kind
+  has it); `{m,}` ORA-40984; SOURCE v without KEY and two foreign keys to v's table ORA-42431; ORA-42442 "KEY is not specified for view graph element table V."; ORA-04045 with its cause on a
+  second line (a table gone, ORA-00942, before a column, ORA-00904); DROP PROPERTY GRAPH ... CASCADE | PURGE ORA-03049; `GRAPH_TABLE (...) AS` ORA-03048 with the statement's text cut at tokens
+  (`oraKwErrToks`); a view over a dropped graph ORA-04063 and INVALID (`viewGraphGone`); USER_PG_LABEL_PROPERTIES.DATA_LENGTH the longest of the graph's properties of the name; a PL/SQL
+  variable inside GRAPH_TABLE ORA-49028 when the block compiles. tns_graph's expect lines did not change (they hold numbers only); `--check tns_graph` 159 answers, 0 differences.
+  Found on the way: ALTER TABLE ... DROP COLUMN of a column a view reads through GRAPH_TABLE is ORA-02449 in lexdb (Oracle drops it and invalidates the graph and the view).
+
+### SQL Server
+- **Reserved words as names.** `lexdb_sql.tsqlReserved` is SQL Server's list, checked against SQL Server 2022 (DISK, DUMP, LOAD, PRECISION and SECURITYAUDIT, on the list, are names there);
+  a bare one is 156 as a table's name (`qname`), a column's in CREATE TABLE and an alias after AS (`notTsqlReserved`, error TS156: whether SQL Server says 156 or 102 for a word depends on where it
+  is, so lexdb_tsql's mapping of a syntax error does not decide it), and a bare alias is not taken. CREATE TABLE IF (no NOT) is the name IF. Checked in the T-SQL paths only, so the PostgreSQL
+  door's parse is unchanged. Different still: a bare reserved alias (`SELECT 1 rule`) is 102 (SQL Server 156); CREATE TABLE HOLDLOCK and INDEX are 156 (SQL Server 1018, a table hint).
+
+### Measured
+In process (`pt.lxl`, 20,000 statements, `LXL_HASH_SEED=1`, two rounds, base = main f23d0ebc built the same way, trees at paths of equal length), equal in both rounds: point select 30,626.2,
+INSERT 216,528.7, UPDATE by key 199,616.9, as text 105,091.3 / 238,008.8 / 224,547.0; in a transaction block INSERT 49,647.0, UPDATE 83,776.3. An INSERT into a table with a foreign key
+(the same with `v int not null references t (id)`): 245,023.3 against 244,524.2 (text 266,342.0 / 265,833.0, block 75,338.5 / 74,829.5): pkKey builds no row. Over the wire (`icount6.sh`,
+20,000 point selects x 3, base and branch alternated twice): instructions 160,774 and 160,971 against 155,517 and 155,590, cycles 88,216 and 88,208 against 86,258 and 84,509, L1 i-cache misses 567
+and 559 against 314 and 315 (the server's hash seed is not fixed there). TPC-H SF1, 22 queries, base and branch alternated twice (base's first run cold, so best of two): checksums equal on all 22,
+total 8,082 ms against 7,958 ms; q1 (+2.9%), q6 (+2.2%) slower in time with fewer server instructions (q1 16,637 M against 16,244 M, q6 1,524.6 M against 1,484.9 M; `iq.sh`). Suite 392 passed;
+replica.py passed. lexdb_exec.lxl 21,558 lines before, 21,564 after.

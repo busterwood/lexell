@@ -1231,3 +1231,8 @@ statement's end; SAVE TRAN / ROLLBACK TRAN to it drops the writes it undid from 
 (sp_rename), 3729 (DROP TABLE); the refused shapes 50000 (lexdb's own error number in this door). INFORMATION_SCHEMA.ASSERTIONS and the
 assertion's CHECK_CONSTRAINTS row; no sys.objects row (no type for one: SSMS, sp_help and mssql-jdbc's metadata do not see it). The bulk load
 (INSERT BULK) is checked with or without CHECK_CONSTRAINTS. Test `tds_assert`.
+
+## As built: the fourth bug slice (lexdb-robust.md, 2026-11-25)
+
+- SQL Server's reserved words (`lexdb_sql.tsqlReserved`, its list checked against SQL Server 2022) are 156 as a bare table name, column name in CREATE TABLE or alias after AS; quoted
+  they are names, and its other keywords stay names. A bare reserved alias is 102 (SQL Server 156). Test `tds_bugs4`.
