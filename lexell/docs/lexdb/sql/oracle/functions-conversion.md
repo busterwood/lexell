@@ -38,7 +38,8 @@ CAST ( expr AS type )
   AM`), and for timestamps with a time zone `NLS_TIMESTAMP_TZ_FORMAT` (`DD-MON-RR HH.MI.SSXFF AM TZR`).
   The time zone elements take a `TIMESTAMP WITH TIME ZONE`: `TZH` is the offset's sign and hours (`+05`), `TZM` its
   minutes (`30`), `TZR` the zone (`+05:30`) and `TZD` its abbreviation (empty for an offset). On a value without a
-  zone they are ORA-01821, as in Oracle.
+  zone they are ORA-01821, as in Oracle; on a `TIMESTAMP WITH LOCAL TIME ZONE` `TZH` and `TZM` are ORA-01821 too, and `TZR`
+  and `TZD` are taken (see [date and time types](data-types-datetime.md)).
 
 `TO_NCHAR`
 : As `TO_CHAR`, giving an `NVARCHAR2`.

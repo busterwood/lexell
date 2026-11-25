@@ -143,9 +143,9 @@ offset it has at that instant (see the differences). An unknown region is ORA-01
   not the region's summer time.
 - `MIN` and `MAX` of equal instants at different offsets show the first in lexdb's scan order, which is primary key
   order; Oracle's is the order the rows were inserted.
-- A session starts in the time zone the client sends at logon, as in Oracle, but `UTC` is kept as `+00:00`: example
-  B's first `SESSIONTIMEZONE` (a JDBC client in UTC) is `UTC` in Oracle, and so after `ALTER SESSION SET TIME_ZONE =
-  'UTC'`. A zone lexdb does not know leaves the session at `+00:00`, where Oracle refuses the logon.
+- A session starts in the time zone the client sends at logon, as in Oracle (example B's first `SESSIONTIMEZONE`, a JDBC
+  client in UTC, is `UTC`, as it is after `ALTER SESSION SET TIME_ZONE = 'UTC'`; `Etc/UTC` and `GMT` too). A zone lexdb
+  does not know leaves the session at `+00:00`, where Oracle refuses the logon.
 - `EXTRACT(HOUR FROM DATE ...)` returns 0; Oracle refuses a `DATE` with a time field (ORA-30076). `QUARTER` and `DOW`
   are accepted by `EXTRACT`; Oracle does not know them.
 - `TIME_BUCKET` needs the *origin* argument and fails without it (ORA-00909, example I); Oracle makes it optional.
@@ -204,7 +204,7 @@ ALTER SESSION SET TIME_ZONE = 'UTC';
 ```text
 SESSION_TZ DATABASE_TZ
 ---------- -----------
-+00:00     +00:00
+UTC        +00:00
 
 1 row selected.
 
