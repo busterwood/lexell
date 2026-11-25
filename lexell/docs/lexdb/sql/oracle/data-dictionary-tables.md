@@ -49,10 +49,22 @@ read them, and return no rows).
   `IDENTITY_OPTIONS`.
 
 `USER_OBJECTS`, `ALL_OBJECTS`, `DBA_OBJECTS`, `USER_CATALOG` (`CAT` is not present)
-: Every table, view, index, sequence, procedure, function, package and property graph (`OBJECT_TYPE` `PROPERTY
-  GRAPH`): `OBJECT_NAME`, `OBJECT_TYPE`, `STATUS`,
+: Every table, view, materialized view (`OBJECT_TYPE` `MATERIALIZED VIEW`), index, sequence, procedure, function,
+  package and property graph (`OBJECT_TYPE` `PROPERTY GRAPH`): `OBJECT_NAME`, `OBJECT_TYPE`, `STATUS`,
   `CREATED` and `LAST_DDL_TIME` (always 2000-01-01), `OBJECT_ID` (derived from the name). `USER_CATALOG` lists
   tables, views and sequences with `TABLE_TYPE`.
+
+`USER_MVIEWS`, `ALL_MVIEWS`, `DBA_MVIEWS`
+: One row for each [materialized view](create-materialized-view.md): `MVIEW_NAME`, `CONTAINER_NAME`, `QUERY`,
+  `REFRESH_MODE` (`DEMAND`, `COMMIT`, `STATEMENT`), `REFRESH_METHOD` (`COMPLETE`, `FAST`, `FORCE`), `BUILD_MODE`
+  (`IMMEDIATE`, `DEFERRED`), `FAST_REFRESHABLE` (`DML` or `NO`), `LAST_REFRESH_TYPE`, `STALENESS` (`FRESH`,
+  `NEEDS_COMPILE`, `UNUSABLE`), `REWRITE_ENABLED` (`Y` or `N`), and `ON_QUERY_COMPUTATION` (`Y` or `N`). `OWNER` in
+  `ALL_` and `DBA_`.
+
+`USER_MVIEW_LOGS`, `ALL_MVIEW_LOGS`, `DBA_MVIEW_LOGS`
+: One row for each materialized view log created with `CREATE MATERIALIZED VIEW LOG`: `MASTER`, `LOG_TABLE`
+  (`MLOG$_table`), `PRIMARY_KEY`, `ROWIDS`, `SEQUENCE`, and `INCLUDE_NEW_VALUES` (`YES` or `NO`). `LOG_OWNER` in
+  `ALL_` and `DBA_`.
 
 `USER_ANNOTATIONS_USAGE`, `ALL_ANNOTATIONS_USAGE`, `DBA_ANNOTATIONS_USAGE`
 : One row for each [annotation](annotations.md) of a table, view or index or of one of their columns:

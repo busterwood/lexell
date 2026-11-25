@@ -70,8 +70,12 @@ AS select_statement
 
 - **Views are read-only.** `INSERT`, `UPDATE`, `DELETE` and `MERGE` through a view are error 50000 ("cannot update
   view "v" (lexdb's views are read-only)").
-- `WITH CHECK OPTION` after the query is error 50000 (written before `AS` it is 102, as in SQL Server). There are no
-  indexed views.
+- `WITH CHECK OPTION` after the query is error 50000 (written before `AS` it is 102, as in SQL Server).
+- **Indexed views:** Creating a `UNIQUE CLUSTERED INDEX` on a view defined `WITH SCHEMABINDING` materializes the view
+  into a synchronously maintained (`ON STATEMENT`) indexed view. Additional `NONCLUSTERED` indexes may be added on it.
+  Dropping the unique clustered index demotes it back to a regular schema-bound view. `sys.views` and `sys.objects`
+  continue to list it as type `'V'`, `sys.indexes` lists its indexes, and `sys.tables` excludes it. Creating an index
+  on a view without `WITH SCHEMABINDING` raises error 1939.
 - The 4512 of a `WITH SCHEMABINDING` view names the view being made without the schema the statement wrote
   (`'v_bad1'` for `CREATE VIEW dbo.v_bad1`; SQL Server: `'dbo.v_bad1'`); its 4513 is right.
 - `CREATE VIEW` need not be the first statement of its batch (SQL Server: 111).

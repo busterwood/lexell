@@ -19,6 +19,15 @@ PERCENTILE_DISC ( fraction ) WITHIN GROUP ( ORDER BY expr )
 BIT_AND_AGG ( expr )  BIT_OR_AGG ( expr )  BIT_XOR_AGG ( expr )
 BOOLEAN_AND_AGG ( expr )  BOOLEAN_OR_AGG ( expr )
 KURTOSIS_POP ( expr )  KURTOSIS_SAMP ( expr )  SKEWNESS_POP ( expr )  SKEWNESS_SAMP ( expr )
+APPROX_COUNT_DISTINCT ( expr )
+APPROX_COUNT_DISTINCT_DETAIL ( expr )
+APPROX_COUNT_DISTINCT_AGG ( detail )
+TO_APPROX_COUNT_DISTINCT ( detail )
+APPROX_PERCENTILE ( fraction ) WITHIN GROUP ( ORDER BY expr [ ASC | DESC ] )
+APPROX_PERCENTILE ( expr, fraction )
+APPROX_PERCENTILE_DETAIL ( expr )
+APPROX_PERCENTILE_AGG ( detail )
+TO_APPROX_PERCENTILE ( detail, fraction )
 ```
 
 ## Functions
@@ -56,6 +65,16 @@ KURTOSIS_POP ( expr )  KURTOSIS_SAMP ( expr )  SKEWNESS_POP ( expr )  SKEWNESS_S
 
 `KURTOSIS_*`, `SKEWNESS_*`
 : The kurtosis and skewness of the values, of the whole population (`_POP`) or of a sample (`_SAMP`) (23ai).
+
+`APPROX_COUNT_DISTINCT`, `APPROX_COUNT_DISTINCT_DETAIL`, `APPROX_COUNT_DISTINCT_AGG`, `TO_APPROX_COUNT_DISTINCT`
+: Approximate distinct count via HyperLogLog++ (0 over no rows; exact up to 256 distinct values). `_DETAIL` produces a
+  mergeable binary sketch, `_AGG` merges sketches across groups or partitions, and `TO_APPROX_COUNT_DISTINCT` extracts
+  the integer estimate.
+
+`APPROX_PERCENTILE`, `APPROX_PERCENTILE_DETAIL`, `APPROX_PERCENTILE_AGG`, `TO_APPROX_PERCENTILE`
+: Approximate quantile at *fraction* (0 to 1) via a Dunning merging t-digest. Accepts Oracle's `WITHIN GROUP (ORDER BY
+  expr [ASC | DESC])` form as well as the two-argument `APPROX_PERCENTILE(expr, fraction)` form. `_DETAIL`, `_AGG`, and
+  `TO_APPROX_PERCENTILE` build, merge, and finalize reusable binary digests.
 
 ## Remarks
 
@@ -250,7 +269,36 @@ SKEW_POP SKEW_SAMP KURT_POP KURT_SAMP
 1 row selected.
 ```
 
-### H. Aggregates that are not available
+### H. Approximate distinct counts and percentiles (sketches)
+
+<!-- example: oracle -->
+```sql
+SELECT APPROX_COUNT_DISTINCT(product) AS approx_products,
+       APPROX_PERCENTILE(0.5) WITHIN GROUP (ORDER BY qty) AS approx_median
+FROM sale;
+SELECT TO_APPROX_COUNT_DISTINCT(APPROX_COUNT_DISTINCT_AGG(h)) AS merged_products,
+       TO_APPROX_PERCENTILE(APPROX_PERCENTILE_AGG(td), 0.5) AS merged_median
+FROM (SELECT region,
+             APPROX_COUNT_DISTINCT_DETAIL(product) AS h,
+             APPROX_PERCENTILE_DETAIL(qty) AS td
+      FROM sale GROUP BY region);
+```
+
+```text
+APPROX_PRODUCTS APPROX_MEDIAN
+--------------- -------------
+              2             5
+
+1 row selected.
+
+MERGED_PRODUCTS MERGED_MEDIAN
+--------------- -------------
+              2             5
+
+1 row selected.
+```
+
+### I. Aggregates that are not available
 
 <!-- example: oracle -->
 ```sql

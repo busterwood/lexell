@@ -35,6 +35,15 @@ var_samp ( number ) → numeric | double precision
 var_pop ( number ) → numeric | double precision
 percentile_cont ( fraction ) WITHIN GROUP ( ORDER BY number ) → double precision
 percentile_disc ( fraction ) WITHIN GROUP ( ORDER BY value ) → type of value
+approx_count_distinct ( value ) → bigint
+approx_count_distinct_detail ( value ) → bytea
+approx_count_distinct_agg ( bytea ) → bytea
+to_approx_count_distinct ( bytea ) → bigint
+approx_percentile ( number, fraction ) → double precision
+approx_percentile ( fraction ) WITHIN GROUP ( ORDER BY number [ ASC | DESC ] ) → double precision
+approx_percentile_detail ( number ) → bytea
+approx_percentile_agg ( bytea ) → bytea
+to_approx_percentile ( bytea, fraction ) → double precision
 ```
 
 ## Functions
@@ -76,6 +85,17 @@ percentile_disc ( fraction ) WITHIN GROUP ( ORDER BY value ) → type of value
 
 `percentile_disc`
 : The first value whose place in the order is at or past *fraction*: always one of the values.
+
+`approx_count_distinct`, `approx_count_distinct_detail`, `approx_count_distinct_agg`, `to_approx_count_distinct`
+: Approximate distinct count backed by a HyperLogLog++ sketch (exact up to 256 distinct values, ~1.6% standard error
+  above; 0 over no rows). `_detail` returns the mergeable `bytea` sketch, `_agg` merges sketches associatively, and
+  `to_approx_count_distinct` finalizes a sketch to `bigint`.
+
+`approx_percentile`, `approx_percentile_detail`, `approx_percentile_agg`, `to_approx_percentile`
+: Approximate quantile at *fraction* (0 to 1) backed by a Dunning merging t-digest. Accepts either two-argument
+  `approx_percentile(value, fraction)` or `approx_percentile(fraction) WITHIN GROUP (ORDER BY value [ASC | DESC])`.
+  `_detail` returns the mergeable `bytea` digest, `_agg` merges digests associatively, and `to_approx_percentile`
+  evaluates any quantile from a saved digest.
 
 ## Remarks
 
@@ -254,7 +274,35 @@ SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY units) AS median,
 (1 row)
 ```
 
-### I. Over no rows
+### I. Approximate distinct counts and percentiles (sketches)
+
+<!-- example: postgresql -->
+```sql
+SELECT approx_count_distinct(rep) AS approx_reps,
+       approx_percentile(units, 0.5) AS approx_median,
+       approx_percentile(0.5) WITHIN GROUP (ORDER BY units) AS approx_median_wg
+FROM sale;
+SELECT to_approx_count_distinct(approx_count_distinct_agg(h)) AS merged_reps,
+       to_approx_percentile(approx_percentile_agg(td), 0.5) AS merged_median
+FROM (SELECT region,
+             approx_count_distinct_detail(rep) AS h,
+             approx_percentile_detail(units) AS td
+      FROM sale GROUP BY region) parts;
+```
+
+```text
+ approx_reps | approx_median | approx_median_wg
+-------------+---------------+------------------
+           5 |           3.5 |              3.5
+(1 row)
+
+ merged_reps | merged_median
+-------------+---------------
+           5 |           3.5
+(1 row)
+```
+
+### J. Over no rows
 
 <!-- example: postgresql -->
 ```sql
@@ -268,7 +316,7 @@ SELECT count(*) AS n, sum(amount) AS total, max(rep) AS rep, bool_and(paid) AS a
 (1 row)
 ```
 
-### J. Errors
+### K. Errors
 
 <!-- example: postgresql -->
 ```sql

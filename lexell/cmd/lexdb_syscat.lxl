@@ -26,6 +26,7 @@ import "./lexdb_time"
 import "./lexdb_parse"
 import "./lexdb_dbopt"
 import "./lexdb_tsqldef"
+import "./lexdb_mview"
 
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
@@ -581,7 +582,7 @@ fn sysColIds(t: &Table): []int {
     var out: []int = []
     var n = 0
     for c in t.cols {
-        if c.name == ROWID {
+        if lexdb_catalog.hiddenName(&c.name) {
             append(mut &out, 0)
         } else {
             n += 1
@@ -760,6 +761,11 @@ fn sysObjects(snap: &CatSnap): [][]Val {
     for ct in snap.tabs {
         if lexdb_base.isTempSchema(&ct.schema) { continue }
         let sid = sysSchemaId(&ct.schema)
+        let isIv = match lexdb_mview.findInSnap(&snap.mviews, &ct.key) { Some(m) { m.indexedView } None { false } }
+        if isIv {
+            append(mut &rows, sysObj(&tabShown(&ct), ct.oid, sid, 0, &"V", &"VIEW", false))
+            continue
+        }
         append(mut &rows, sysObj(&tabShown(&ct), ct.oid, sid, 0, &"U", &"USER_TABLE", false))
         for c in ct.t.cols {
             if sysHasDefault(&c) { append(mut &rows, sysObj(&sysDefName(&ct, &c), sysDefOid(&ct, &c), sid, ct.oid, &"D", &"DEFAULT_CONSTRAINT", false)) }
@@ -1040,10 +1046,20 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] 
         }
         "system_objects" { rows = sysSysObjects() }
         "tables" {
-            for ct in snap.tabs { if !lexdb_base.isTempSchema(&ct.schema) { append(mut &rows, sysTableRow(&ct, &"tables")) } }
+            for ct in snap.tabs {
+                if lexdb_base.isTempSchema(&ct.schema) { continue }
+                let isIv = match lexdb_mview.findInSnap(&snap.mviews, &ct.key) { Some(m) { m.indexedView } None { false } }
+                if isIv { continue }
+                append(mut &rows, sysTableRow(&ct, &"tables"))
+            }
         }
         "views", "all_views" {
             for v in snap.views { if !lexdb_base.isTempSchema(&v.schema) { append(mut &rows, sysViewRow(&v, view)) } }
+            for ct in snap.tabs {
+                if lexdb_base.isTempSchema(&ct.schema) { continue }
+                let isIv = match lexdb_mview.findInSnap(&snap.mviews, &ct.key) { Some(m) { m.indexedView } None { false } }
+                if isIv { append(mut &rows, sysViewRow(&ct, view)) }
+            }
             if view == "all_views" { appendRows(mut &rows, sysSysViewRows(&"all_views")) }
         }
         "system_views" { rows = sysSysViewRows(&"system_views") }

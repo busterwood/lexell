@@ -141,6 +141,11 @@ const S_DROP_ROLE = lexdb_sql.S_DROP_ROLE
 const S_CREATE_VIEW = lexdb_sql.S_CREATE_VIEW
 const S_DROP_VIEW = lexdb_sql.S_DROP_VIEW
 const S_ALTER_VIEW = lexdb_sql.S_ALTER_VIEW
+const S_CREATE_MVIEW = lexdb_sql.S_CREATE_MVIEW
+const S_DROP_MVIEW = lexdb_sql.S_DROP_MVIEW
+const S_REFRESH_MVIEW = lexdb_sql.S_REFRESH_MVIEW
+const S_ALTER_MVIEW = lexdb_sql.S_ALTER_MVIEW
+const S_MVIEW_LOG = lexdb_sql.S_MVIEW_LOG
 const S_GRANT = lexdb_sql.S_GRANT
 const S_REVOKE = lexdb_sql.S_REVOKE
 const S_OWNER = lexdb_sql.S_OWNER
@@ -2569,7 +2574,28 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
             if p.ora && len(paramsOf(&fname)) == 0 && anyNamed(&argNames) { args = oraNamed(args, &argNames) }
             else if len(argNames) > 0 || len(paramsOf(&fname)) > len(args) { args = try namedArgs(&fname, args, &argNames) }
             if p.ora && fname == "string_agg" && len(args) == 1 { append(mut &args, Expr.Lit(Val.Text(""))) }     // LISTAGG(x): no separator
-            if p.tsql && (fname == "approx_percentile_cont" || fname == "approx_percentile_disc") && !star {
+            if fname == "approx_percentile" && !star {
+                if p.isKw("within") {
+                    if len(args) != 1 { return Err(lexdb_base.err("42883", "approx_percentile(p) WITHIN GROUP requires 1 percentile argument")) }
+                    p.pos += 1
+                    try p.expectKw("group")
+                    try p.expectKw("(")
+                    try p.expectKw("order")
+                    try p.expectKw("by")
+                    let key = try p.expr()
+                    var desc = false
+                    if p.acceptKw("desc") { desc = true } else { let asc = p.acceptKw("asc") }
+                    if p.acceptKw("nulls") {
+                        if !p.acceptKw("first") { try p.expectKw("last") }
+                    }
+                    try p.expectKw(")")
+                    let fr = replace(mut &args[0], Expr.Lit(Val.Null))
+                    args = [key, fr]
+                    if desc { fname = "approx_percentile order:d" }
+                } else if len(args) != 2 {
+                    return Err(lexdb_base.err("42883", "approx_percentile requires 2 arguments (expr, percentile) or WITHIN GROUP (ORDER BY expr)"))
+                }
+            } else if p.tsql && (fname == "approx_percentile_cont" || fname == "approx_percentile_disc") && !star {
                 // SQL Server 2022's APPROX_PERCENTILE_CONT / _DISC (S21): PostgreSQL's ordered-set aggregates (exact; SQL
                 // Server's estimate is exact on these sizes), no OVER (4113)
                 if !p.isKw("within") { return Err(lexdb_base.err("TS10754", &("The function '" + fname + "' must have a WITHIN GROUP clause."))) }
@@ -5238,6 +5264,316 @@ fn (p: mut &P) createView(orReplace: bool, alterOnly: bool): Result[Stmt, lexdb_
     p.wins = []
     if q.params > 0 || p.params > 0 { return Err(lexdb_base.err("42P02", "there is no parameter $1")) }
     return Ok(v)
+}
+
+fn encMvOpts(mode: int, timing: int, rewrite: bool, oqc: bool, deferred: bool,
+             hasMode: bool, hasTiming: bool, hasRewrite: bool, hasOqc: bool, compile: bool): str {
+    return mode.toStr() + "|" + timing.toStr() + "|" + (if rewrite { "1" } else { "0" }) + "|" +
+           (if oqc { "1" } else { "0" }) + "|" + (if deferred { "1" } else { "0" }) + "|" +
+           (if hasMode { "1" } else { "0" }) + "|" + (if hasTiming { "1" } else { "0" }) + "|" +
+           (if hasRewrite { "1" } else { "0" }) + "|" + (if hasOqc { "1" } else { "0" }) + "|" +
+           (if compile { "1" } else { "0" })
+}
+
+// CREATE MATERIALIZED VIEW [IF NOT EXISTS] name [(col, ...)] [options] AS query [WITH [NO] DATA]
+// and Oracle's CREATE MATERIALIZED VIEW LOG ON tbl [WITH ...]
+fn (p: mut &P) createMview(): Result[Stmt, lexdb_base.DbErr] {
+    try p.expectKw("view")
+    if p.acceptKw("log") {
+        try p.expectKw("on")
+        var s = lexdb_sql.newStmt(S_MVIEW_LOG)
+        s.alias = "create"
+        s.mdialect = p.md()
+        s.table = try p.rname()
+        s.spell = p.spelled.clone()
+        // Consume optional Oracle clauses: [TABLESPACE ...] [WITH [PRIMARY KEY | ROWID | SEQUENCE | (cols)] [, ...] [INCLUDING|EXCLUDING NEW VALUES]]
+        var pk = false
+        var rid = false
+        var seq = false
+        var newVals = false
+        while p.peek().kind != T_EOF && !(p.peek().kind == T_OP && p.peek().text == ";") {
+            if p.acceptKw("tablespace") { let ts = try p.name(); continue }
+            if p.acceptKw("with") {
+                while true {
+                    if p.acceptKw("primary") { try p.expectKw("key"); pk = true }
+                    else if p.acceptKw("rowid") { rid = true }
+                    else if p.acceptKw("sequence") { seq = true }
+                    else if p.acceptKw("object") { try p.expectKw("id") }
+                    else if p.acceptKw("(") {
+                        while true {
+                            append(mut &s.names, try p.name())
+                            if !p.acceptKw(",") { break }
+                        }
+                        try p.expectKw(")")
+                    } else { break }
+                    if !p.acceptKw(",") && !p.isKw("(") { break }
+                }
+                continue
+            }
+            if p.acceptKw("including") { try p.expectKw("new"); try p.expectKw("values"); newVals = true; continue }
+            if p.acceptKw("excluding") { try p.expectKw("new"); try p.expectKw("values"); newVals = false; continue }
+            if p.acceptKw("purge") {
+                let pm = p.acceptKw("immediate") || p.acceptKw("deferred")
+                continue
+            }
+            break
+        }
+        if !pk && !rid { pk = true }
+        s.mvOpts = (if rid { "1" } else { "0" }) + "|" + (if pk { "1" } else { "0" }) + "|" +
+                   (if seq { "1" } else { "0" }) + "|" + (if newVals { "1" } else { "0" })
+        return Ok(s)
+    }
+
+    var mv = lexdb_sql.newStmt(S_CREATE_MVIEW)
+    mv.mdialect = p.md()
+    if p.acceptKw("if") {
+        try p.expectKw("not")
+        try p.expectKw("exists")
+        mv.ifFlag = true
+    }
+    mv.table = try p.rname()
+    mv.spell = p.spelled.clone()
+    if p.acceptKw("(") {
+        while true {
+            append(mut &mv.names, try p.name())
+            append(mut &mv.spells, p.spelled.clone())
+            if !p.acceptKw(",") { break }
+        }
+        try p.expectKw(")")
+    }
+
+    var mode = if p.ora { lexdb_sql.MV_FORCE } else { lexdb_sql.MV_COMPLETE }
+    var timing = lexdb_sql.MV_DEMAND
+    var rewrite = false
+    var oqc = false
+    var deferred = false
+    var hasMode = false
+    var hasTiming = false
+    var hasRewrite = false
+    var hasOqc = false
+
+    // Parse PostgreSQL & Oracle clauses before AS.
+    while !p.isKw("as") && p.peek().kind != T_EOF {
+        if p.acceptKw("using") {
+            let um = try p.name()
+        } else if p.acceptKw("tablespace") {
+            let ts = try p.name()
+        } else if p.acceptKw("with") {
+            try p.expectKw("(")
+            while true {
+                let opt = try p.name()
+                try p.expectKw("=")
+                let valTok = p.next()
+                let v = strings.toLowerAscii(&valTok.text)
+                if opt == "refresh" {
+                    if v == "demand" || v == "complete" || v == "complete_on_demand" {
+                        mode = lexdb_sql.MV_COMPLETE; timing = lexdb_sql.MV_DEMAND; hasMode = true; hasTiming = true
+                    } else if v == "fast_on_commit" || v == "incremental" {
+                        mode = lexdb_sql.MV_FAST; timing = lexdb_sql.MV_COMMIT; hasMode = true; hasTiming = true
+                    } else if v == "fast_on_statement" || v == "immediate" {
+                        mode = lexdb_sql.MV_FAST; timing = lexdb_sql.MV_STATEMENT; hasMode = true; hasTiming = true
+                    } else if v == "force_on_commit" {
+                        mode = lexdb_sql.MV_FORCE; timing = lexdb_sql.MV_COMMIT; hasMode = true; hasTiming = true
+                    } else if v == "force_on_statement" {
+                        mode = lexdb_sql.MV_FORCE; timing = lexdb_sql.MV_STATEMENT; hasMode = true; hasTiming = true
+                    } else if v == "complete_on_commit" {
+                        mode = lexdb_sql.MV_COMPLETE; timing = lexdb_sql.MV_COMMIT; hasMode = true; hasTiming = true
+                    } else if v == "fast_on_demand" {
+                        mode = lexdb_sql.MV_FAST; timing = lexdb_sql.MV_DEMAND; hasMode = true; hasTiming = true
+                    } else if v == "realtime" {
+                        mode = lexdb_sql.MV_FAST; timing = lexdb_sql.MV_REALTIME; oqc = true; hasMode = true; hasTiming = true; hasOqc = true
+                    } else {
+                        return Err(lexdb_base.err("22023", &("invalid value for materialized view option \"refresh\": \"" + v + "\"")))
+                    }
+                } else if opt == "query_rewrite" {
+                    rewrite = v == "true" || v == "on" || v == "1"
+                    hasRewrite = true
+                }
+                if !p.acceptKw(",") { break }
+            }
+            try p.expectKw(")")
+        } else if p.acceptKw("build") {
+            if p.acceptKw("immediate") { deferred = false }
+            else if p.acceptKw("deferred") { deferred = true; mv.noData = true }
+            else { return Err(near(&p.peek())) }
+        } else if p.acceptKw("refresh") {
+            if p.acceptKw("fast") { mode = lexdb_sql.MV_FAST; hasMode = true }
+            else if p.acceptKw("complete") { mode = lexdb_sql.MV_COMPLETE; hasMode = true }
+            else if p.acceptKw("force") { mode = lexdb_sql.MV_FORCE; hasMode = true }
+            if p.acceptKw("on") {
+                if p.acceptKw("demand") { timing = lexdb_sql.MV_DEMAND; hasTiming = true }
+                else if p.acceptKw("commit") { timing = lexdb_sql.MV_COMMIT; hasTiming = true }
+                else if p.acceptKw("statement") { timing = lexdb_sql.MV_STATEMENT; hasTiming = true }
+                else { return Err(near(&p.peek())) }
+            }
+        } else if p.acceptKw("never") {
+            try p.expectKw("refresh")
+            mode = lexdb_sql.MV_COMPLETE
+            timing = lexdb_sql.MV_DEMAND
+        } else if p.acceptKw("enable") {
+            if p.acceptKw("query") { try p.expectKw("rewrite"); rewrite = true; hasRewrite = true }
+            else if p.acceptKw("on") { try p.expectKw("query"); try p.expectKw("computation"); oqc = true; hasOqc = true }
+            else { return Err(near(&p.peek())) }
+        } else if p.acceptKw("disable") {
+            if p.acceptKw("query") { try p.expectKw("rewrite"); rewrite = false; hasRewrite = true }
+            else if p.acceptKw("on") { try p.expectKw("query"); try p.expectKw("computation"); oqc = false; hasOqc = true }
+            else { return Err(near(&p.peek())) }
+        } else {
+            return Err(near(&p.peek()))
+        }
+    }
+
+    try p.expectKw("as")
+    let start = p.peek().at
+    let pq = p.isKw("(") && p.parenQueryStart()
+    let t = if pq { p.peek().clone() } else { p.next() }
+    var q = lexdb_sql.newStmt(S_SELECT)
+    if pq {
+        q = try p.parenSelect()
+    } else if t.kind == T_IDENT && t.text == "select" {
+        q = try p.select()
+    } else if t.kind == T_IDENT && t.text == "values" {
+        q = try p.valuesQuery()
+        try p.orderLimit(mut &q)
+    } else if t.kind == T_IDENT && t.text == "with" {
+        let n = try p.withList()
+        try p.expectKw("select")
+        q = try p.select()
+        p.popCtes(n)
+    } else {
+        return Err(near(&t))
+    }
+    let end = p.peek().at
+    if p.acceptKw("with") {
+        if p.acceptKw("no") { mv.noData = true; deferred = true }
+        try p.expectKw("data")
+    }
+    mv.index = strings.trim(&p.src[start..end]).toStr()
+    mv.mvOpts = encMvOpts(mode, timing, rewrite, oqc, deferred, hasMode, hasTiming, hasRewrite, hasOqc, false)
+    p.subs = []
+    p.wins = []
+    if q.params > 0 || p.params > 0 { return Err(lexdb_base.err("42P02", "there is no parameter $1")) }
+    return Ok(mv)
+}
+
+fn (p: mut &P) refreshMview(): Result[Stmt, lexdb_base.DbErr] {
+    try p.expectKw("materialized")
+    try p.expectKw("view")
+    var s = lexdb_sql.newStmt(S_REFRESH_MVIEW)
+    s.mdialect = p.md()
+    if p.acceptKw("concurrently") { s.conc = true }
+    s.table = try p.rname()
+    var mode = lexdb_sql.MV_COMPLETE
+    var hasMode = false
+    if p.acceptKw("fast") { mode = lexdb_sql.MV_FAST; hasMode = true }
+    else if p.acceptKw("complete") { mode = lexdb_sql.MV_COMPLETE; hasMode = true }
+    else if p.acceptKw("force") { mode = lexdb_sql.MV_FORCE; hasMode = true }
+    if p.acceptKw("with") {
+        if p.acceptKw("no") { s.noData = true }
+        try p.expectKw("data")
+    }
+    s.mvOpts = encMvOpts(mode, lexdb_sql.MV_DEMAND, false, false, s.noData, hasMode, false, false, false, false)
+    return Ok(s)
+}
+
+fn (p: mut &P) dropMview(): Result[Stmt, lexdb_base.DbErr] {
+    try p.expectKw("view")
+    if p.acceptKw("log") {
+        try p.expectKw("on")
+        var s = lexdb_sql.newStmt(S_MVIEW_LOG)
+        s.alias = "drop"
+        s.mdialect = p.md()
+        s.table = try p.rname()
+        return Ok(s)
+    }
+    var s = lexdb_sql.newStmt(S_DROP_MVIEW)
+    s.mdialect = p.md()
+    if p.acceptKw("if") {
+        try p.expectKw("exists")
+        s.ifFlag = true
+    }
+    while true {
+        append(mut &s.cols, lexdb_sql.colDef(&(try p.rname()), TypeName{kind: K_TEXT, oid: OID_TEXT, prec: 0, scale: 0, len: 0}, false))
+        if !p.acceptKw(",") { break }
+    }
+    if p.acceptKw("cascade") { s.cascade = true } else { let _ = p.acceptKw("restrict") }
+    return Ok(s)
+}
+
+fn (p: mut &P) alterMview(): Result[Stmt, lexdb_base.DbErr] {
+    try p.expectKw("view")
+    var s = lexdb_sql.newStmt(S_ALTER_MVIEW)
+    s.mdialect = p.md()
+    if p.acceptKw("if") {
+        try p.expectKw("exists")
+        s.ifFlag = true
+    }
+    s.table = try p.qname()
+    if p.acceptKw("rename") {
+        if p.acceptKw("to") {
+            s.alias = "rename"
+            s.index = try p.name()
+            return Ok(s)
+        }
+        let _ = p.acceptKw("column")
+        s.alias = "rename_col"
+        append(mut &s.names, try p.name())
+        try p.expectKw("to")
+        s.index = try p.name()
+        return Ok(s)
+    }
+    if p.acceptKw("owner") {
+        try p.expectKw("to")
+        var o = lexdb_sql.newStmt(S_OWNER)
+        o.index = "materialized view"
+        o.table = s.table.clone()
+        o.ifFlag = s.ifFlag
+        append(mut &o.names, try p.roleSpec())
+        return Ok(o)
+    }
+    var mode = lexdb_sql.MV_COMPLETE
+    var timing = lexdb_sql.MV_DEMAND
+    var rewrite = false
+    var oqc = false
+    var hasMode = false
+    var hasTiming = false
+    var hasRewrite = false
+    var hasOqc = false
+    var compile = false
+    var any = false
+    while p.peek().kind != T_EOF && !(p.peek().kind == T_OP && p.peek().text == ";") {
+        if p.acceptKw("refresh") {
+            any = true
+            if p.acceptKw("fast") { mode = lexdb_sql.MV_FAST; hasMode = true }
+            else if p.acceptKw("complete") { mode = lexdb_sql.MV_COMPLETE; hasMode = true }
+            else if p.acceptKw("force") { mode = lexdb_sql.MV_FORCE; hasMode = true }
+            if p.acceptKw("on") {
+                if p.acceptKw("demand") { timing = lexdb_sql.MV_DEMAND; hasTiming = true }
+                else if p.acceptKw("commit") { timing = lexdb_sql.MV_COMMIT; hasTiming = true }
+                else if p.acceptKw("statement") { timing = lexdb_sql.MV_STATEMENT; hasTiming = true }
+                else { return Err(near(&p.peek())) }
+            }
+        } else if p.acceptKw("enable") {
+            any = true
+            if p.acceptKw("query") { try p.expectKw("rewrite"); rewrite = true; hasRewrite = true }
+            else if p.acceptKw("on") { try p.expectKw("query"); try p.expectKw("computation"); oqc = true; hasOqc = true }
+            else { return Err(near(&p.peek())) }
+        } else if p.acceptKw("disable") {
+            any = true
+            if p.acceptKw("query") { try p.expectKw("rewrite"); rewrite = false; hasRewrite = true }
+            else if p.acceptKw("on") { try p.expectKw("query"); try p.expectKw("computation"); oqc = false; hasOqc = true }
+            else { return Err(near(&p.peek())) }
+        } else if p.acceptKw("compile") {
+            any = true
+            compile = true
+        } else {
+            return Err(near(&p.peek()))
+        }
+    }
+    if !any { return Err(near(&p.peek())) }
+    s.alias = "opts"
+    s.mvOpts = encMvOpts(mode, timing, rewrite, oqc, false, hasMode, hasTiming, hasRewrite, hasOqc, compile)
+    return Ok(s)
 }
 
 // A role's options, after its name: [WITH] LOGIN, NOLOGIN, SUPERUSER,
@@ -8118,6 +8454,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         }
         "alter" {
             if p.ora && p.isKw("assertion") { return p.assertStmt("alter") }
+            if p.acceptKw("materialized") { return p.alterMview() }
             // ALTER TABLE | VIEW | SEQUENCE | SCHEMA [IF EXISTS] name OWNER TO role (9.83)
             if p.isKw("table") || p.isKw("view") || p.isKw("sequence") || p.isKw("schema") {
                 let back = p.pos
@@ -8310,6 +8647,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             }
             if p.graphNext() { return p.createGraph(orReplace) }
             if p.isKw("assertion") { return p.assertStmt("create") }
+            if !orReplace && p.acceptKw("materialized") { return p.createMview() }
             // [GLOBAL | LOCAL] {TEMPORARY | TEMP}, or UNLOGGED (a table as any:
             // lexdb's are logged), before TABLE, SEQUENCE or VIEW (9.96)
             var temp = false
@@ -8445,6 +8783,9 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             append(mut &s.inner, inner)
             return Ok(s)
         }
+        "refresh" {
+            return p.refreshMview()
+        }
         "drop" {
             if p.tsql && p.isKw("routine") { return Err(lexdb_base.err("TS343", "Unknown object type 'ROUTINE' used in a CREATE, DROP, or ALTER statement.")) }
             if p.isKw("function") || p.isKw("procedure") || (!p.tsql && p.isKw("routine")) || (p.tsql && p.isKw("proc")) {
@@ -8454,6 +8795,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             }
             if p.graphNext() { return p.dropGraph() }
             if p.isKw("assertion") { return p.assertStmt("drop") }
+            if p.acceptKw("materialized") { return p.dropMview() }
             if p.acceptKw("view") {
                 var v = lexdb_sql.newStmt(S_DROP_VIEW)
                 if p.acceptKw("if") {

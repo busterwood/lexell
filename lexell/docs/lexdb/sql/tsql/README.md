@@ -43,7 +43,8 @@ This index lists everything the door takes today. Pages not written yet are list
 | [CREATE TABLE](create-table.md) | `IDENTITY(s, i)`, computed columns, constraints, `#temp` tables. |
 | [ALTER TABLE](alter-table.md), [DROP TABLE](drop-table.md) | Columns and constraints; `WITH NOCHECK`, `NOCHECK CONSTRAINT`, `CHECK CONSTRAINT`. |
 | [CREATE INDEX](create-index.md), [DROP INDEX](drop-index.md) | Unique, filtered, `INCLUDE`. |
-| [CREATE VIEW](create-view.md) (and `CREATE OR ALTER VIEW`), [ALTER VIEW](alter-view.md), [DROP VIEW](drop-view.md) | |
+| [CREATE VIEW](create-view.md) (and `CREATE OR ALTER VIEW`), [ALTER VIEW](alter-view.md), [DROP VIEW](drop-view.md) | Includes indexed views (`WITH SCHEMABINDING` + `CREATE UNIQUE CLUSTERED INDEX`). |
+| [CREATE MATERIALIZED VIEW](create-materialized-view.md) | Cross-door `CREATE`/`REFRESH`/`ALTER`/`DROP MATERIALIZED VIEW` with `COMPLETE`/`FAST`/`FORCE` and `ON DEMAND`/`COMMIT`/`STATEMENT`. |
 | [CREATE PROCEDURE](create-procedure.md) (and `ALTER`, `CREATE OR ALTER`), [DROP PROCEDURE](drop-procedure.md) | Procedures with parameters, `OUTPUT` parameters and return codes. |
 | [CREATE FUNCTION](create-function.md) (and `ALTER`, `CREATE OR ALTER`), [DROP FUNCTION](drop-function.md) | Scalar functions and inline table-valued functions (multi-statement ones are made but cannot be read yet). |
 | [CREATE TYPE](create-type.md) (and `DROP TYPE`) | Table types (for table-valued parameters). |

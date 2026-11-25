@@ -1,0 +1,298 @@
+// Materialized views (Stage 2): composable algebraic aggregate states & ClickHouse-style
+// mergeable sketch aggregates (HyperLogLog++ and t-digest) across row & batch engines,
+// incremental FAST maintenance for VAR_POP/VAR_SAMP/STDDEV_POP/STDDEV_SAMP, BOOL_AND/BOOL_OR/EVERY,
+// BIT_XOR, MIN/MAX (including targeted extremum-deletion re-probe), APPROX_COUNT_DISTINCT*,
+// APPROX_PERCENTILE*, scalar finalizers TO_APPROX_*, join MVs, FILTER, and reopen persistence.
+// expect: empty_sketches: 0|NULL|NULL|NULL
+// expect: sparse_hll_exact: 50|50
+// expect: dense_hll_ok: ok|exact_merge
+// expect: tdigest_ok: ok|within_group_ok|desc_ok|merge_ok|err_bad_p
+// expect: var_init_diff: 0
+// expect: var_ins_diff: 0
+// expect: var_upd_diff: 0
+// expect: var_del_1row: a|0|NULL|0|NULL
+// expect: var_del_diff: 0
+// expect: bool_xor_init_diff: 0
+// expect: bool_xor_flip_true: a|t|t|6
+// expect: bool_xor_flip_false: a|f|f|0
+// expect: bool_xor_del_diff: 0
+// expect: minmax_init_diff: 0
+// expect: minmax_nonext_diff: 0
+// expect: minmax_ext_del_diff: 0
+// expect: minmax_upd_ext_diff: 0
+// expect: minmax_null_diff: 0
+// expect: minmax_join_diff: 0
+// expect: sketch_mv_append_ok: ok|rollup_ok
+// expect: sketch_mv_del_reprobe_ok: ok
+// expect: sketch_global_empty: 0|NULL|1|42
+// expect: reopen_ok: 0|ok
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_parse"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return "ERR:" + e.state }
+    }
+}
+
+fn qBoth(s: mut &lexdb_exec.Session, sql: &str): str {
+    let _1 = s.exec("SET lexdb_batch = off")
+    let off = q(s, sql)
+    let _2 = s.exec("SET lexdb_batch = on")
+    let on = q(s, sql)
+    if off == on { return on }
+    return "DIFF(off=" + off + ",on=" + on + ")"
+}
+
+fn qInt(s: mut &lexdb_exec.Session, sql: &str): int {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows && len(r.rows) > 0 && len(r.rows[0]) > 0 {
+                match r.rows[0][0] {
+                    lexdb_sql.Val.Int(i) { return i }
+                    else { return -999999 }
+                }
+            }
+            return -999999
+        }
+        Err(_) { return -999999 }
+    }
+}
+
+fn qFloat(s: mut &lexdb_exec.Session, sql: &str): float {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows && len(r.rows) > 0 && len(r.rows[0]) > 0 {
+                return lexdb_ops.asFloat(&r.rows[0][0]).unwrapOr(-999999.0f)
+            }
+            return -999999.0f
+        }
+        Err(_) { return -999999.0f }
+    }
+}
+
+fn diffCount(s: mut &lexdb_exec.Session, mvSql: &str, baseSql: &str): int {
+    let sql = "SELECT count(*) FROM ((" + mvSql + " EXCEPT " + baseSql + ") UNION ALL (" + baseSql + " EXCEPT " + mvSql + ")) d"
+    return qInt(s, &sql)
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 32 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}
+}
+
+fn runTest(st: lexdb_store.Store, reopen: bool): int {
+    if !reopen { lexdb_exec.bootstrap(&st).unwrap() }
+    var s = lexdb_exec.newSession(st.share())
+    if reopen {
+        // Verify persisted Stage 2 MV state and post-reopen incremental updates.
+        let _1 = q(mut &s, "INSERT INTO metrics VALUES (99, 'a', 80, true, 9)")
+        let dVar = diffCount(mut &s,
+            "SELECT grp, var_pop, var_samp, stddev_pop, stddev_samp FROM mv_var",
+            "SELECT grp, var_pop(val), var_samp(val), stddev_pop(val), stddev_samp(val) FROM metrics GROUP BY grp")
+        let _2 = q(mut &s, "INSERT INTO events VALUES (9001, 'eu', 7777, 500.0)")
+        let hEst = qInt(mut &s, "SELECT approx_users FROM mv_sketches WHERE region = 'eu'")
+        let okStr = if hEst >= 190 && hEst <= 215 { "ok" } else { "bad:" + hEst.toStr() }
+        println("reopen_ok: " + dVar.toStr() + "|" + okStr)
+        return 0
+    }
+
+    // 1. Direct SQL sketch aggregates (empty, sparse HLL, dense HLL, associative merge, t-digest, WITHIN GROUP, errors)
+    let _c0 = q(mut &s, "CREATE TABLE empty_t (x int)")
+    println("empty_sketches: " + qBoth(mut &s, "SELECT approx_count_distinct(x), approx_count_distinct_detail(x), approx_percentile(x, 0.5), approx_percentile_detail(x) FROM empty_t"))
+
+    let _c1 = q(mut &s, "CREATE TABLE nums (id int PRIMARY KEY, part int, u int, v double precision)")
+    var insSparse = "INSERT INTO nums VALUES "
+    for i in 1..101 {
+        if i > 1 { insSparse += "," }
+        let u = (i % 50) + 1
+        insSparse += "(" + i.toStr() + "," + (i % 2).toStr() + "," + u.toStr() + "," + float(i).toStr() + ")"
+    }
+    let _i1 = q(mut &s, &insSparse)
+    let spDirect = qBoth(mut &s, "SELECT approx_count_distinct(u) FROM nums")
+    let spMerge = qBoth(mut &s, "SELECT to_approx_count_distinct(approx_count_distinct_agg(d)) FROM (SELECT part, approx_count_distinct_detail(u) AS d FROM nums GROUP BY part) t")
+    println("sparse_hll_exact: " + spDirect + "|" + spMerge)
+
+    // Dense HLL (> 256 distinct: 2000 distinct values across 2 partitions) + 1000 values for t-digest
+    let _c2 = q(mut &s, "CREATE TABLE big_sk (id int PRIMARY KEY, part int, u int, v double precision)")
+    var bIdx = 0
+    for chunk in 0..10 {
+        var sql = "INSERT INTO big_sk VALUES "
+        for j in 0..200 {
+            if j > 0 { sql += "," }
+            bIdx += 1
+            let p = bIdx % 2
+            let v = float(((bIdx - 1) % 1000) + 1)
+            sql += "(" + bIdx.toStr() + "," + p.toStr() + "," + bIdx.toStr() + "," + v.toStr() + ")"
+        }
+        let _ic = q(mut &s, &sql)
+    }
+    let hOff = qInt(mut &s, "SET lexdb_batch = off; SELECT approx_count_distinct(u) FROM big_sk")
+    let hOn = qInt(mut &s, "SET lexdb_batch = on; SELECT approx_count_distinct(u) FROM big_sk")
+    let hMerged = qInt(mut &s, "SELECT to_approx_count_distinct(approx_count_distinct_agg(d)) FROM (SELECT part, approx_count_distinct_detail(u) AS d FROM big_sk GROUP BY part) t")
+    let hOk = if hOff == hOn && hOff >= 1900 && hOff <= 2100 { "ok" } else { "bad:" + hOff.toStr() + "/" + hOn.toStr() }
+    let hExactMerge = if hMerged == hOff { "exact_merge" } else { "merge_diff:" + hMerged.toStr() + "/" + hOff.toStr() }
+    println("dense_hll_ok: " + hOk + "|" + hExactMerge)
+
+    // t-digest accuracy: 2 copies of 1..1000 -> p50 ~= 500.5, p95 ~= 950.5, DESC p10 ~= 900.5
+    let p50Off = qFloat(mut &s, "SET lexdb_batch = off; SELECT approx_percentile(v, 0.5) FROM big_sk")
+    let p50On = qFloat(mut &s, "SET lexdb_batch = on; SELECT approx_percentile(v, 0.5) FROM big_sk")
+    let p95Wg = qFloat(mut &s, "SELECT approx_percentile(0.95) WITHIN GROUP (ORDER BY v) FROM big_sk")
+    let p10Desc = qFloat(mut &s, "SELECT approx_percentile(0.1) WITHIN GROUP (ORDER BY v DESC) FROM big_sk")
+    let p50Merge = qFloat(mut &s, "SELECT to_approx_percentile(approx_percentile_agg(d), 0.5) FROM (SELECT part, approx_percentile_detail(v) AS d FROM big_sk GROUP BY part) t")
+    let tdErr = q(mut &s, "SELECT approx_percentile(v, 1.5) FROM big_sk")
+    let tdOk1 = if (p50Off - 500.5f).abs() < 15.0f && (p50On - 500.5f).abs() < 15.0f { "ok" } else { "bad50:" + p50Off.toStr() }
+    let tdOk2 = if (p95Wg - 950.5f).abs() < 15.0f { "within_group_ok" } else { "bad95:" + p95Wg.toStr() }
+    let tdOk3 = if (p10Desc - 900.5f).abs() < 15.0f { "desc_ok" } else { "badDesc:" + p10Desc.toStr() }
+    let tdOk4 = if (p50Merge - 500.5f).abs() < 15.0f { "merge_ok" } else { "badM:" + p50Merge.toStr() }
+    let tdOk5 = if tdErr == "ERR:22023" { "err_bad_p" } else { "badErr:" + tdErr }
+    println("tdigest_ok: " + tdOk1 + "|" + tdOk2 + "|" + tdOk3 + "|" + tdOk4 + "|" + tdOk5)
+
+    // 2. Incremental MV: VAR_POP, VAR_SAMP, STDDEV_POP, STDDEV_SAMP (+ NULLs, UPDATE, DELETE to 1 row / 0 rows)
+    let _m0 = q(mut &s, "CREATE TABLE metrics (id int PRIMARY KEY, grp text, val int, flag boolean, bits int)")
+    let _m1 = q(mut &s, "INSERT INTO metrics VALUES (1, 'a', 10, true, 3), (2, 'a', 20, true, 5), (3, 'a', 30, false, 6), (4, 'b', 100, true, 12), (5, 'b', NULL, NULL, NULL)")
+    let _mv1 = q(mut &s, "CREATE MATERIALIZED VIEW mv_var WITH (refresh = 'fast_on_statement') AS SELECT grp, var_pop(val) AS var_pop, var_samp(val) AS var_samp, stddev_pop(val) AS stddev_pop, stddev_samp(val) AS stddev_samp FROM metrics GROUP BY grp")
+    let varBase = "SELECT grp, var_pop(val), var_samp(val), stddev_pop(val), stddev_samp(val) FROM metrics GROUP BY grp"
+    let varMv = "SELECT grp, var_pop, var_samp, stddev_pop, stddev_samp FROM mv_var"
+    println("var_init_diff: " + diffCount(mut &s, varMv, varBase).toStr())
+
+    let _m2 = q(mut &s, "INSERT INTO metrics VALUES (6, 'a', 40, true, 1), (7, 'b', 200, false, 7), (8, 'c', 55, true, 15)")
+    println("var_ins_diff: " + diffCount(mut &s, varMv, varBase).toStr())
+
+    let _m3 = q(mut &s, "UPDATE metrics SET val = 50 WHERE id = 2; UPDATE metrics SET val = NULL WHERE id = 6; UPDATE metrics SET grp = 'c' WHERE id = 4")
+    println("var_upd_diff: " + diffCount(mut &s, varMv, varBase).toStr())
+
+    // Delete group 'a' down to 1 non-null row (id=1, val=10): var_pop=0, var_samp=NULL, stddev_pop=0, stddev_samp=NULL!
+    let _m4 = q(mut &s, "DELETE FROM metrics WHERE id IN (2, 3)")
+    println("var_del_1row: " + qBoth(mut &s, "SELECT grp, var_pop, var_samp, stddev_pop, stddev_samp FROM mv_var WHERE grp = 'a'"))
+    // Delete all of 'b' non-nulls (leaves id=5 with NULL val) and delete 'c' completely
+    let _m5 = q(mut &s, "DELETE FROM metrics WHERE id IN (7, 4, 8)")
+    println("var_del_diff: " + diffCount(mut &s, varMv, varBase).toStr())
+
+    // 3. Incremental MV: BOOL_AND / EVERY, BOOL_OR, BIT_XOR (exact O(delta) self-inverse & true-counter)
+    let _b0 = q(mut &s, "CREATE TABLE flags (id int PRIMARY KEY, grp text, ok boolean, mask int)")
+    let _b1 = q(mut &s, "INSERT INTO flags VALUES (1, 'a', true, 3), (2, 'a', false, 5), (3, 'b', false, 8), (4, 'b', NULL, NULL)")
+    let _mv2 = q(mut &s, "CREATE MATERIALIZED VIEW mv_bx WITH (refresh = 'fast_on_statement') AS SELECT grp, bool_and(ok) AS all_ok, bool_or(ok) AS any_ok, bit_xor(mask) AS xmask FROM flags GROUP BY grp")
+    let bxBase = "SELECT grp, bool_and(ok), bool_or(ok), bit_xor(mask) FROM flags GROUP BY grp"
+    let bxMv = "SELECT grp, all_ok, any_ok, xmask FROM mv_bx"
+    println("bool_xor_init_diff: " + diffCount(mut &s, bxMv, bxBase).toStr())
+
+    // Flip last false in 'a' to true (3 ^ 5 = 6) -> bool_and flips from f to t!
+    let _b2 = q(mut &s, "UPDATE flags SET ok = true WHERE id = 2")
+    println("bool_xor_flip_true: " + qBoth(mut &s, "SELECT grp, all_ok, any_ok, xmask FROM mv_bx WHERE grp = 'a'"))
+
+    // Flip all 'a' rows to false and update mask 2 -> 3 (3 ^ 3 = 0) -> bool_or flips to f!
+    let _b3 = q(mut &s, "UPDATE flags SET ok = false WHERE grp = 'a'; UPDATE flags SET mask = 3 WHERE id = 2")
+    println("bool_xor_flip_false: " + qBoth(mut &s, "SELECT grp, all_ok, any_ok, xmask FROM mv_bx WHERE grp = 'a'"))
+
+    // Delete & insert mix
+    let _b4 = q(mut &s, "DELETE FROM flags WHERE id IN (1, 3); INSERT INTO flags VALUES (5, 'c', true, 42)")
+    println("bool_xor_del_diff: " + diffCount(mut &s, bxMv, bxBase).toStr())
+
+    // 4. Incremental MV: MIN / MAX (fast path + targeted extremum-deletion re-probe + JOIN MV!)
+    let _x0 = q(mut &s, "CREATE TABLE dims (id int PRIMARY KEY, name text)")
+    let _x1 = q(mut &s, "INSERT INTO dims VALUES (1, 'East'), (2, 'West')")
+    let _x2 = q(mut &s, "CREATE TABLE scores (id int PRIMARY KEY, did int, sc int)")
+    let _x3 = q(mut &s, "INSERT INTO scores VALUES (1, 1, 10), (2, 1, 50), (3, 1, 90), (4, 2, 20), (5, 2, 80)")
+    let _mv3 = q(mut &s, "CREATE MATERIALIZED VIEW mv_mm WITH (refresh = 'fast_on_statement') AS SELECT did, min(sc) AS mn, max(sc) AS mx, min(sc) FILTER (WHERE sc > 15) AS mn_hi FROM scores GROUP BY did")
+    let _mv3j = q(mut &s, "CREATE MATERIALIZED VIEW mv_mm_join WITH (refresh = 'fast_on_commit') AS SELECT d.name, min(s.sc) AS mn, max(s.sc) AS mx FROM scores s JOIN dims d ON s.did = d.id GROUP BY d.name")
+    let mmBase = "SELECT did, min(sc), max(sc), min(sc) FILTER (WHERE sc > 15) FROM scores GROUP BY did"
+    let mmMv = "SELECT did, mn, mx, mn_hi FROM mv_mm"
+    println("minmax_init_diff: " + diffCount(mut &s, mmMv, mmBase).toStr())
+
+    // Delete non-extremum (id=2, sc=50) + insert new interior value (sc=40) -> pure O(1) path!
+    let _x4 = q(mut &s, "DELETE FROM scores WHERE id = 2; INSERT INTO scores VALUES (6, 1, 40)")
+    println("minmax_nonext_diff: " + diffCount(mut &s, mmMv, mmBase).toStr())
+
+    // Delete current MIN (id=1, sc=10) AND current MAX (id=3, sc=90) -> targeted single-group re-probe!
+    let _x5 = q(mut &s, "DELETE FROM scores WHERE id IN (1, 3)")
+    println("minmax_ext_del_diff: " + diffCount(mut &s, mmMv, mmBase).toStr())
+
+    // Update current MIN upward (id=4, 20 -> 120, becoming new MAX too!) -> targeted re-probe!
+    let _x6 = q(mut &s, "UPDATE scores SET sc = 120 WHERE id = 4")
+    println("minmax_upd_ext_diff: " + diffCount(mut &s, mmMv, mmBase).toStr())
+
+    // Set all rows of did=1 to NULL sc, then insert a non-null back
+    let _x7 = q(mut &s, "UPDATE scores SET sc = NULL WHERE did = 1")
+    let dNull1 = diffCount(mut &s, mmMv, mmBase)
+    let _x8 = q(mut &s, "INSERT INTO scores VALUES (7, 1, 33)")
+    let dNull2 = diffCount(mut &s, mmMv, mmBase)
+    println("minmax_null_diff: " + (dNull1 + dNull2).toStr())
+
+    let mmjBase = "SELECT d.name, min(s.sc), max(s.sc) FROM scores s JOIN dims d ON s.did = d.id GROUP BY d.name"
+    let mmjMv = "SELECT name, mn, mx FROM mv_mm_join"
+    println("minmax_join_diff: " + diffCount(mut &s, mmjMv, mmjBase).toStr())
+
+    // 5. Incremental MV with HyperLogLog++ & t-digest sketches (O(delta) append merge + delete re-probe + global empty)
+    let _e0 = q(mut &s, "CREATE TABLE events (id int PRIMARY KEY, region text, user_id int, lat double precision)")
+    var eSql = "INSERT INTO events VALUES "
+    for i in 1..201 {
+        if i > 1 { eSql += "," }
+        eSql += "(" + i.toStr() + ",'us'," + i.toStr() + "," + float(i).toStr() + ")"
+    }
+    let _e1 = q(mut &s, &eSql)
+    let _mv4 = q(mut &s, "CREATE MATERIALIZED VIEW mv_sketches WITH (refresh = 'fast_on_statement') AS SELECT region, approx_count_distinct(user_id) AS approx_users, approx_count_distinct_detail(user_id) AS user_hll, approx_percentile(lat, 0.5) AS p50, approx_percentile_detail(lat) AS lat_td FROM events GROUP BY region")
+
+    // Append batch 2: 200 more rows for 'us' (users 101..300 -> 300 distinct, lat 201..400 -> p50 ~= 200.5) + 200 rows for 'eu' (users 201..400)
+    var eSql2 = "INSERT INTO events VALUES "
+    var cnt2 = 0
+    for i in 1..201 {
+        if cnt2 > 0 { eSql2 += "," }
+        cnt2 += 1
+        eSql2 += "(" + (200 + i).toStr() + ",'us'," + (100 + i).toStr() + "," + float(200 + i).toStr() + ")"
+        eSql2 += ",(" + (400 + i).toStr() + ",'eu'," + (200 + i).toStr() + "," + float(i).toStr() + ")"
+    }
+    let _e2 = q(mut &s, &eSql2)
+    let usUsers = qInt(mut &s, "SELECT approx_users FROM mv_sketches WHERE region = 'us'")
+    let usP50 = qFloat(mut &s, "SELECT p50 FROM mv_sketches WHERE region = 'us'")
+    let totUsers = qInt(mut &s, "SELECT to_approx_count_distinct(approx_count_distinct_agg(user_hll)) FROM mv_sketches")
+    let totP50 = qFloat(mut &s, "SELECT to_approx_percentile(approx_percentile_agg(lat_td), 0.5) FROM mv_sketches")
+    let appOk = if usUsers >= 285 && usUsers <= 315 && (usP50 - 200.5f).abs() < 10.0f { "ok" } else { "bad:" + usUsers.toStr() + "/" + usP50.toStr() }
+    let rolOk = if totUsers >= 380 && totUsers <= 420 && totP50 >= 140.0f && totP50 <= 165.0f { "rollup_ok" } else { "badRol:" + totUsers.toStr() + "/" + totP50.toStr() }
+    println("sketch_mv_append_ok: " + appOk + "|" + rolOk)
+
+    // Delete 200 rows from 'us' (ids 201..400 -> leaves ids 1..200, exact 200 distinct users, p50 ~= 100.5!)
+    let _e3 = q(mut &s, "DELETE FROM events WHERE region = 'us' AND id > 200")
+    let usAfterU = qInt(mut &s, "SELECT approx_users FROM mv_sketches WHERE region = 'us'")
+    let usAfterP = qFloat(mut &s, "SELECT p50 FROM mv_sketches WHERE region = 'us'")
+    let delOk = if usAfterU == 200 && (usAfterP - 100.5f).abs() < 5.0f { "ok" } else { "badDel:" + usAfterU.toStr() + "/" + usAfterP.toStr() }
+    println("sketch_mv_del_reprobe_ok: " + delOk)
+
+    // Global sketch MV going down to 0 rows and back to 1 row
+    let _g0 = q(mut &s, "CREATE TABLE gsk (id int PRIMARY KEY, u int, v double precision)")
+    let _g1 = q(mut &s, "INSERT INTO gsk VALUES (1, 10, 5.0)")
+    let _mv5 = q(mut &s, "CREATE MATERIALIZED VIEW mv_gsk WITH (refresh = 'fast_on_statement') AS SELECT approx_count_distinct(u) AS du, approx_percentile(v, 0.5) AS p50 FROM gsk")
+    let _g2 = q(mut &s, "DELETE FROM gsk WHERE id = 1")
+    let gEmpty = qBoth(mut &s, "SELECT du, p50 FROM mv_gsk")
+    let _g3 = q(mut &s, "INSERT INTO gsk VALUES (2, 20, 42.0)")
+    let gOne = qBoth(mut &s, "SELECT du, p50 FROM mv_gsk")
+    println("sketch_global_empty: " + gEmpty + "|" + gOne)
+
+    return 0
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(197)
+    lexdb_store.run(fs.share(), opts(), fn(st: lexdb_store.Store): int { return runTest(st, false) }).unwrap()
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int { return runTest(st, true) }).unwrap()
+}

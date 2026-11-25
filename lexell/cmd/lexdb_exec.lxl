@@ -21,6 +21,7 @@ import "strings"
 import "collections"
 import "time"
 import "task"
+import "os"
 import "./lexdb_base"
 import "./lexdb_time"
 import "./lexdb_float"
@@ -40,6 +41,7 @@ import "./lexdb_nncon"
 import "./lexdb_nnalter"
 import "./lexdb_annot"
 import "./lexdb_graph"
+import "./lexdb_mview"
 import "./lexdb_sql"
 import "./lexdb_json"
 import "./lexdb_plan"
@@ -243,6 +245,9 @@ fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
         for c in seqRelation(&lexdb_catalog.noSeq()).cols { append(mut &out, OutCol{name: c.name.clone(), oid: c.typ.oid, spell: "", coll: "", scale: -1}) }
         return Ok(out)
     }
+    if strings.startsWith(name, &("#" + MV_OQC_REL)) {
+        return Ok(mvOqcOutCols(name))
+    }
     if strings.startsWith(&name, "#") {
         // a catalog relation (9.80)
         for c in lexdb_pgcat.relCols(&lexdb_sql.catRelName(name)) { append(mut &out, OutCol{name: c.name.clone(), oid: c.oid, spell: "", coll: "", scale: -1}) }
@@ -388,6 +393,11 @@ fn srfRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, args: [
             Some(v) { append(mut &rows, try seqState(st, &lexdb_catalog.decSeq(&v))) }
             None {}
         }
+    } else if strings.startsWith(&sel.srf, &("#" + MV_OQC_REL)) {
+        let key = mvOqcKey(&sel.srf)
+        let lim = Limits{rounds: MAX_RECURSION, steps: MAX_MATCH_STEPS, mem: txn.sql.memMax, deadline: rs.bud.deadline, batch: rs.batch, rules: txn.sql.rules, auto: false, rdel: true}
+        let up = mvUp(st, txn.sql.sess, lim)
+        rows = try lexdb_mview.readMergedRows(st, txn, &key, &up)
     } else {
         rows = try catRows(st, txn, &lexdb_sql.catRelName(&sel.srf), strings.endsWith(&sel.srf, lexdb_sql.TSQL_IS))
     }
@@ -802,6 +812,60 @@ fn statsUp(): lexdb_stats.Up { return lexdb_stats.Up{idxVal: idxVal, inIndex: in
 // The automatic statistics' task (lexdb's master starts it) and one look
 // (lexdb_stats.autoAnalyzer, autoAnalyzeStep), with the executor's hooks.
 pub fn autoAnalyzer(st: lexdb_store.Store): int { return lexdb_stats.autoAnalyzer(st, &statsUp()) }
+
+// Folds all pending entries in every populated OQC/realtime MV's deltaTree into its base B+tree.
+pub fn foldAll(st: &lexdb_store.Store): Result[int, DbErr] {
+    let keys = try lexdb_mview.listFoldable(st)
+    if len(keys) == 0 { return Ok(0) }
+    var total = 0
+    let lim = Limits{rounds: MAX_RECURSION, steps: MAX_MATCH_STEPS, mem: 0, deadline: 0, batch: true, rules: false, auto: false, rdel: true}
+    for key in keys {
+        for attempt in 0..3 {
+            var txn = lexdb_store.begin()
+            let up = mvUp(st, txn.sql.sess, lim)
+            match lexdb_mview.foldDeltas(st, mut &txn, &key, &up) {
+                Ok(n) {
+                    if n == 0 {
+                        st.abort(txn)
+                        break
+                    }
+                    match st.commit(txn) {
+                        Ok(_) { total += n; break }
+                        Err(x) {
+                            if x.state != "40001" { break }
+                        }
+                    }
+                }
+                Err(x) {
+                    st.abort(txn)
+                    if x.state != "40001" { break }
+                }
+            }
+        }
+    }
+    return Ok(total)
+}
+
+fn mvFoldOn(): bool {
+    match os.env("LEXDB_MV_FOLD") {
+        Some(v) { return strings.toLowerAscii(&v) != "off" }
+        None { return true }
+    }
+}
+
+// Background materialized view delta folder coroutine (started alongside autoAnalyzer in lexdb.lxl).
+pub fn mvFolder(st: lexdb_store.Store): int {
+    if st.follower().isSome() || !mvFoldOn() { return 0 }
+    while true {
+        let due = st.memo.get(&lexdb_mview.MV_FOLD_DUE).isSome()
+        if due { st.memo.del(&lexdb_mview.MV_FOLD_DUE) }
+        if task.sleep(if due { 50 } else { 500 }).isErr() { return 0 }
+        if !due && st.memo.get(&lexdb_mview.MV_FOLD_DUE).isNone() { continue }
+        st.memo.del(&lexdb_mview.MV_FOLD_DUE)
+        let _r = foldAll(&st)
+    }
+    return 0
+}
 pub fn autoAnalyzeStep(st: &lexdb_store.Store): Result[int, DbErr] { return lexdb_stats.autoAnalyzeStep(st, &statsUp()) }
 
 // ---- schemas (9.20): a table's catalog key is its name qualified by its
@@ -1429,7 +1493,16 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
             } else {
                 t = found.unwrap()
             }
-            if t.name != sc.target { try scCheck(st, txn, sc, &t.name, &(if len(t.view) > 0 { "view" } else { "table" })) }
+            if t.name != sc.target {
+                try scCheck(st, txn, sc, &t.name, &(if len(t.view) > 0 { "view" } else { "table" }))
+                if len(t.view) == 0 && lexdb_mview.isUnpopPgMv(&t) {
+                    return Err(lexdb_base.errDetail("55000", &("materialized view \"" + lexdb_sql.baseName(&t.name) + "\" has not been populated"),
+                                                    "", "Use the REFRESH MATERIALIZED VIEW command."))
+                }
+                if len(t.view) == 0 && lexdb_mview.isOqcMv(&t) {
+                    t = rc(mvOqcRelation(&t))
+                }
+            }
             if len(t.view) > 0 {
                 // a view: its query planned as a subquery in FROM (9.82),
                 // its plan after the statement's own subqueries; its
@@ -1469,7 +1542,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 }
                 viewSrc = len(subs) + len(views)
                 sp.view = Some(lexdb_plan.ViewSrc{stmt: vs, owner: vowner, rn: t.rn.clone()})  // for the planner's pushdown (optimizer 48.3)
-                if !strings.startsWith(&t.view, SEQ_REL) && len(sc.works) == 0 && selPure(&sp.sel) {
+                if !strings.startsWith(&t.view, SEQ_REL) && !strings.startsWith(&t.view, MV_OQC_REL) && len(sc.works) == 0 && selPure(&sp.sel) {
                     sp.viewKey = t.name.toStr()
                 }
                 append(mut &views, sp)
@@ -4755,12 +4828,16 @@ fn dropTableNamed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str,
     match try findTable(st, txn, name) {
         Some(t) {
             if len(t.view) > 0 { return Err(e("42809", &("\"" + lexdb_sql.shown(name) + "\" is not a table (use DROP VIEW)"))) }
+            if lexdb_mview.isMvTable(&t) { return Err(e("42809", &("\"" + lexdb_sql.shown(name) + "\" is not a table (use DROP MATERIALIZED VIEW)"))) }
             try lexdb_priv.needRelOwner(st, txn, &t.name, &"table")
             try lexdb_viewdep.dropTable(st, txn, s, &t.name, &lexdb_priv.doorOf(st, txn.sql.sess))
-            var d = t
+            let depMvs = try lexdb_mview.checkDropBase(st, txn, &t, s.cascade, doorMd(st, txn.sql.sess))
+            for mk in depMvs { try dropMviewKey(st, txn, &mk, true) }
+            var d = if len(depMvs) > 0 { try byKey(st, txn, &t.name) } else { t }
             lexdb_catalog.joinFks(mut &d)
             try unlinkTable(st, txn, mut &d, s.cascade)
             try dropOwnedSeqs(st, txn, &d, &"")
+            if !lexdb_catalog.tempRel(&d.name) && (try lexdb_mview.readLog(st, txn, &d.name)).isSome() { lexdb_mview.delLog(txn, &d.name) }
             dropOne(txn, &d)
             try bumpFor(st, txn, &d.name)
             return Ok(tagOnly("DROP TABLE"))
@@ -4789,6 +4866,7 @@ fn truncate(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         match try findTable(st, txn, &n) {
             Some(t) {
                 if len(t.view) > 0 { return Err(e("42809", &("\"" + lexdb_sql.baseName(&n) + "\" is not a table"))) }
+                if lexdb_mview.isMvTable(&t) { return Err(e("42809", &("cannot truncate materialized view \"" + lexdb_sql.baseName(&n) + "\""))) }
                 addKey(mut &keys, &t.name)
             }
             None { return Err(e("42P01", &("relation \"" + lexdb_sql.shown(&n) + "\" does not exist"))) }
@@ -4826,6 +4904,7 @@ fn truncate(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         }
         try putTable(txn, &t)
         lexdb_assert.truncated(txn, &t, s.mdialect)     // (O23)
+        lexdb_mview.recordTruncate(txn, &t)
         for d in seqs { if d.ownerT == t.name { try setVal(st, &d, d.start, false) } }
     }
     try bumpKeys(st, txn, &keys)
@@ -4901,6 +4980,7 @@ fn dropLeftTemps(st: &lexdb_store.Store): Result[Unit, DbErr] {
 // DELETE ROWS tables known before (Session.onCommit), the transaction's own
 // made ones added; gives those still there.
 fn onCommitDo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, have: &[]str, lim: Limits, s: &lexdb_sql.Stmt): Result[[]str, DbErr] {
+    try lexdb_mview.beforeCommit(st, txn, &mvUp(st, txn.sql.sess, lim))
     try lexdb_assert.beforeCommit(st, txn, s, &assertUp(st, txn.sql.sess, lim))      // (O23)
     var keys = collections.copyOf(have)
     for k in txn.onCommit { addKey(mut &keys, &k) }
@@ -5909,6 +5989,9 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                 return Err(e("42703", &("column \"" + a.name + "\" of relation \"" + rel + "\" does not exist")))
             }
             try lexdb_assert.colChange(st, txn, mut &t, &a.name, s.mdialect, true, a.cascade)
+            let dropDepMvs = try lexdb_mview.checkAlterCol(st, txn, &t, &a.name, true, a.cascade, s.mdialect)
+            for mk in dropDepMvs { try dropMviewKey(st, txn, &mk, true) }
+            if len(dropDepMvs) > 0 { t = try byKey(st, txn, &t.name) }
             // SQL Server refuses the drop of a column a CHECK reads, Oracle one a multi-column CHECK reads (PostgreSQL drops them)
             match lexdb_conerr.checkDropErr(&t.checks, &a.name, s.mdialect) {
                 Some(x) { return Err(x) }
@@ -5981,6 +6064,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                                  &("column \"" + a.to + "\" of relation \"" + rel + "\" already exists")))
                 }
                 try lexdb_assert.colChange(st, txn, mut &t, &a.name, s.mdialect, false, false)
+                let _ = try lexdb_mview.checkAlterCol(st, txn, &t, &a.name, false, false, s.mdialect)
                 lexdb_nnalter.renameColumn(mut &t, &a.name, &a.to)
                 lexdb_annot.renameColumn(mut &t.invalid, &a.name, &a.to)
                 t.cols[i].name = a.to.clone()
@@ -6789,6 +6873,15 @@ fn dropSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
 // the same transaction.
 fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     if s.conc && txn.inBlock() { return Err(e("25001", "CREATE INDEX CONCURRENTLY cannot run inside a transaction block")) }
+    // SQL Server Indexed Views: CREATE UNIQUE CLUSTERED INDEX on a WITH SCHEMABINDING view promotes it to a FAST ON STATEMENT MV.
+    if s.mdialect == lexdb_sql.MD_TSQL {
+        match try findTable(st, txn, &s.table) {
+            Some(vt) {
+                if len(vt.view) > 0 { return promoteIndexedView(st, txn, &vt, s) }
+            }
+            None {}
+        }
+    }
     var t = try needTable(st, txn, &s.table)
     try lexdb_priv.needRelOwner(st, txn, &t.name, &"table")
     if s.cluster == 1 { try clusterClash(&t) }
@@ -7182,6 +7275,18 @@ fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
                 }
                 if t.indexes[k].name == ixKey {
                     try dropNeeded(st, txn, mut &t, k, false, &("index " + lexdb_sql.baseName(&ixKey)))
+                }
+            }
+            let wasCluster = lexdb_catalog.clusterLabel(&t) == lexdb_sql.baseName(&ixKey)
+            if wasCluster {
+                match try lexdb_mview.readMeta(st, txn, &t.name) {
+                    Some(mv) {
+                        if mv.indexedView {
+                            try demoteIndexedView(st, txn, &t, &mv)
+                            return Ok(tagOnly("DROP INDEX"))
+                        }
+                    }
+                    None {}
                 }
             }
             var old = replace(mut &t.indexes, [])
@@ -7950,6 +8055,7 @@ fn storeRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: [
         let none: []Val = []
         try childSide(st, txn, t, fw, &row, &none, later, pr)
     }
+    lexdb_mview.recordInsert(txn, t, &row)
     return Ok(row)
 }
 
@@ -8408,6 +8514,7 @@ fn batchDml(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         }
         if BATCH_HOOK.isSet() { BATCH_HOOK.get()[0](st.handle(), BATCH_RUNS) }
         win.first = false
+        match lexdb_mview.beforeCommit(st, txn, &mvUp(st, txn.sql.sess, lim)) { Ok(_) {} Err(x) { lexdb_mview.clearTxn(txn.sql.sess); return Err(batchFail(x, total, &what, win.n)) } }
         match lexdb_assert.stmtEnd(st, txn, true, s, &assertUp(st, txn.sql.sess, lim)) { Ok(_) {} Err(x) { return Err(batchFail(x, total, &what, win.n)) } }   // (each batch's own check, O23)
         let fresh = freshTxn(txn)
         let done = replace(txn, fresh)
@@ -10939,7 +11046,7 @@ fn collectAggs(x: &Expr, specs: mut &[]AggSpec): Result[Expr, DbErr] {
                 let rest = name[oi + 7..len(name)]
                 let sp = strings.indexOf(&rest, " ", 0)
                 dirs = if sp < 0 { rest.clone() } else { rest[0..sp].clone() }
-                if !pct {
+                if !pct && base != "approx_percentile" {
                     var rev: []Expr = []
                     for k in 0..len(dirs) { append(mut &rev, pop(mut &aargs)) }
                     while len(rev) > 0 { append(mut &order, pop(mut &rev)) }
@@ -10953,7 +11060,7 @@ fn collectAggs(x: &Expr, specs: mut &[]AggSpec): Result[Expr, DbErr] {
                 None {}
             }
             let isJsonObj = base == "json_object_agg" || base == "jsonb_object_agg" || strings.startsWith(&base, "json_objectagg") || strings.startsWith(&base, "jsonb_objectagg")
-            let want = if base == "string_agg" || pct || isJsonObj { 2 } else { 1 }
+            let want = if base == "string_agg" || pct || isJsonObj || base == "approx_percentile" { 2 } else { 1 }
             let dia = lexdb_pct.dialectOf(&name)
             // the fraction, checked now where it is a literal, as the dialects do (before any row)
             if pct && !star && len(aargs) == 2 { try lexdb_pct.checkArg(dia, &base, &aargs[1]) }
@@ -14039,7 +14146,8 @@ fn isWrite(kind: int): bool {
            kind == lexdb_sql.S_GRANT || kind == lexdb_sql.S_REVOKE || kind == lexdb_sql.S_OWNER ||
            kind == lexdb_sql.S_CREATE_TYPE || kind == lexdb_sql.S_DROP_TYPE || kind == lexdb_sql.S_ALTER_TYPE ||
            kind == lexdb_sql.S_TRUNCATE || kind == lexdb_sql.S_ANALYZE || kind == lexdb_sql.S_MERGE || kind == lexdb_sql.S_ALTER_DB || kind == lexdb_sql.S_SP_RENAME ||
-           kind == lexdb_sql.S_CREATE_ROUTINE || kind == lexdb_sql.S_DROP_ROUTINE || kind == lexdb_sql.S_CREATE_GRAPH || kind == lexdb_sql.S_DROP_GRAPH || kind == lexdb_sql.S_ASSERT
+           kind == lexdb_sql.S_CREATE_ROUTINE || kind == lexdb_sql.S_DROP_ROUTINE || kind == lexdb_sql.S_CREATE_GRAPH || kind == lexdb_sql.S_DROP_GRAPH || kind == lexdb_sql.S_ASSERT ||
+           kind == lexdb_sql.S_CREATE_MVIEW || kind == lexdb_sql.S_DROP_MVIEW || kind == lexdb_sql.S_REFRESH_MVIEW || kind == lexdb_sql.S_ALTER_MVIEW || kind == lexdb_sql.S_MVIEW_LOG
 }
 
 fn stmtName(kind: int): str {
@@ -14080,6 +14188,11 @@ fn stmtName(kind: int): str {
         lexdb_sql.S_SP_RENAME { "EXECUTE" }
         lexdb_sql.S_CREATE_GRAPH, lexdb_sql.S_DROP_GRAPH { if kind == lexdb_sql.S_CREATE_GRAPH { "CREATE PROPERTY GRAPH" } else { "DROP PROPERTY GRAPH" } }
         lexdb_sql.S_ASSERT { "CREATE ASSERTION" }
+        lexdb_sql.S_CREATE_MVIEW { "CREATE MATERIALIZED VIEW" }
+        lexdb_sql.S_DROP_MVIEW { "DROP MATERIALIZED VIEW" }
+        lexdb_sql.S_REFRESH_MVIEW { "REFRESH MATERIALIZED VIEW" }
+        lexdb_sql.S_ALTER_MVIEW { "ALTER MATERIALIZED VIEW" }
+        lexdb_sql.S_MVIEW_LOG { "CREATE MATERIALIZED VIEW LOG" }
         else { "DELETE" }
     }
 }
@@ -14183,6 +14296,11 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_DROP_ROUTINE { return dropRoutine(st, txn, s) }
         lexdb_sql.S_CREATE_GRAPH, lexdb_sql.S_DROP_GRAPH { return Ok(tagOnly(&(try lexdb_graph.ddl(st, txn, s, &lexdb_graph.Up{describe: describe, bump: bumpCatalog})))) }
         lexdb_sql.S_ASSERT { return Ok(tagOnly(&(try lexdb_assert.ddl(st, txn, s, &assertUp(st, txn.sql.sess, lim))))) }
+        lexdb_sql.S_CREATE_MVIEW { return createMview(st, txn, s, lim) }
+        lexdb_sql.S_DROP_MVIEW { return dropMview(st, txn, s) }
+        lexdb_sql.S_REFRESH_MVIEW { return refreshMview(st, txn, s, lim) }
+        lexdb_sql.S_ALTER_MVIEW { return alterMview(st, txn, s, lim) }
+        lexdb_sql.S_MVIEW_LOG { return mviewLogStmt(st, txn, s) }
         lexdb_sql.S_COPY { return copyStmt(st, txn, s, params, ptypes, lim, pc, input, out, pull) }
         lexdb_sql.S_EXPLAIN { return explain(st, txn, s, params, lim, ptypes) }
         else { return Err(e("XX000", "not a data statement")) }
@@ -14319,7 +14437,8 @@ fn (s: mut &Session) runIn(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
 // A block's statement's end when its transaction has notes for the assertions (lexdb_assert.stmtEnd), its reads still the
 // live tree's (its own function: the statement's Result moved, not copied, on runStmt's path).
 fn (s: mut &Session) blockEnd(stmt: &lexdb_sql.Stmt, r0: Result[Res, DbErr]): Result[Res, DbErr] {
-    let r = if len(s.txn[0].onCommit) == 0 { r0 } else { match lexdb_assert.stmtEnd(&s.st, mut &s.txn[0], r0.isOk(), stmt, &assertUp(&s.st, s.id, s.limits())) { Ok(_) { r0 } Err(x) { Err(x) } } }
+    let r1 = if !lexdb_mview.hasStmtDeltas(s.id) { r0 } else { match lexdb_mview.stmtEnd(&s.st, mut &s.txn[0], r0.isOk(), &mvUp(&s.st, s.id, s.limits())) { Ok(_) { r0 } Err(x) { Err(x) } } }
+    let r = if len(s.txn[0].onCommit) == 0 { r1 } else { match lexdb_assert.stmtEnd(&s.st, mut &s.txn[0], r1.isOk(), stmt, &assertUp(&s.st, s.id, s.limits())) { Ok(_) { r1 } Err(x) { Err(x) } } }
     s.txn[0].live = false
     if len(s.tmp) == 0 && len(s.txn[0].tmp) > 0 { s.tmp = s.txn[0].tmp.clone() }
     if r.isErr() { s.failed = true }
@@ -14557,14 +14676,15 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                     }
                 }
             }
-            // its temporary tables' ON COMMIT (9.96)
+            // its temporary tables' ON COMMIT (9.96) and materialized view ON COMMIT deltas
             var kept: []str = []
-            if !s.failed && ((len(s.onCommit) > 0 && s.txn[0].hasWrites()) || len(s.txn[0].onCommit) > 0) {
+            if !s.failed && ((len(s.onCommit) > 0 && s.txn[0].hasWrites()) || len(s.txn[0].onCommit) > 0 || lexdb_mview.hasWork(s.id)) {
                 let st = &s.st
                 let have = collections.copyOf(&s.onCommit)
                 match onCommitDo(&st, mut &s.txn[0], &have, s.limits(), stmt) {
                     Ok(k) { kept = k }
                     Err(x) {
+                        lexdb_mview.clearTxn(s.id)
                         let t = pop(mut &s.txn)
                         s.tmpUndo(&t)
                         s.st.abort(t)
@@ -14577,6 +14697,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             }
             let t = pop(mut &s.txn)
             if s.failed {
+                lexdb_mview.clearTxn(s.id)
                 s.failed = false
                 s.tmpUndo(&t)
                 s.st.abort(t)
@@ -14606,6 +14727,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             return Ok(tagOnly("COMMIT"))
         }
         lexdb_sql.S_ROLLBACK {
+            lexdb_mview.clearTxn(s.id)
             if len(s.txn) > 0 {
                 let t = pop(mut &s.txn)
                 s.tmpUndo(&t)
@@ -14639,6 +14761,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             }
             // ROLLBACK TO: its writes since, and the error if any, gone; it stays
             s.txn[0].undoTo(s.saves[i].mark)
+            lexdb_mview.undoTo(s.id, s.saves[i].mark)
             if s.txn[0].tmpDdl { tmpChanged(&s.st, s.id) }          // (temporary objects' DDL may be gone, 9.96)
             while len(s.saves) > i + 1 { let x = pop(mut &s.saves) }
             s.failed = false
@@ -14686,7 +14809,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                                        (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode > 0)) {
             s.txn[0].forgetReads(reads0)
         }
-        if len(s.txn[0].onCommit) > 0 { return s.blockEnd(stmt, r) }        // (its assertions, O23; a temporary schema it made: TMP_MADE)
+        if len(s.txn[0].onCommit) > 0 || lexdb_mview.hasStmtDeltas(s.id) { return s.blockEnd(stmt, r) }        // (its assertions, O23; materialized views; a temporary schema it made: TMP_MADE)
         s.txn[0].live = false
         if r.isErr() { s.failed = true }
         return r
@@ -14710,6 +14833,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         let snap = (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode == 0) || explained || (stmt.kind == lexdb_sql.S_COPY && !stmt.copy.from)
         var t = if snap { try s.st.beginSnapshot() } else { lexdb_store.begin() }
         s.setUp(mut &t)
+        lexdb_mview.clearTxn(s.id)
         lexdb_stats.chgEnd(&s.st, s.id, false)          // (a try before that failed: its counts go, optimizer 44)
         // (and its notices: those of the statements before kept)
         if len(noticesWere) > 0 { s.st.memo.put(&noticeKey(s.id), &noticesWere) } else { s.st.memo.del(&noticeKey(s.id)) }
@@ -14722,12 +14846,13 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         match move(ran) {
             Ok(r) {
                 s.adopt(&t)
-                // its temporary tables' ON COMMIT (9.96)
+                // its temporary tables' ON COMMIT (9.96) and materialized view deltas
                 var kept = collections.copyOf(&s.onCommit)
-                if (len(s.onCommit) > 0 && t.hasWrites()) || len(t.onCommit) > 0 {
+                if (len(s.onCommit) > 0 && t.hasWrites()) || len(t.onCommit) > 0 || lexdb_mview.hasWork(s.id) {
                     match onCommitDo(&s.st, mut &t, &kept, lim, stmt) {
                         Ok(k) { kept = k }
                         Err(x) {
+                            lexdb_mview.clearTxn(s.id)
                             s.tmpUndo(&t)
                             s.st.abort(t)
                             return Err(x)
@@ -14751,6 +14876,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                 }
             }
             Err(x) {
+                lexdb_mview.clearTxn(s.id)
                 s.adopt(&t)
                 s.tmpUndo(&t)
                 s.st.abort(t)
@@ -15337,6 +15463,7 @@ fn updRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, old: &[]
                                        fn(tx: &lexdb_store.Txn) { lexdb_stats.noteChg(st, tx.sql.sess, t, 1) })
     if c == lexdb_access.PK_CONFLICT { return Err(dupKey(t, row)) }
     if c >= 0 { return Err(try uniqueErr(t, &t.indexes[c], row)) }
+    lexdb_mview.recordUpdate(txn, t, old, row)
     if len(t.fks) > 0 {
         var np = lexdb_fkprobe.none()
         try childSide(st, txn, t, fw, row, old, later, mut &np)
@@ -15352,6 +15479,7 @@ fn delRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: &[]
                                fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
                                fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) },
                                fn(tx: &lexdb_store.Txn) { lexdb_stats.noteChg(st, tx.sql.sess, t, 2) })
+    lexdb_mview.recordDelete(txn, t, row)
     if len(t.refBy) > 0 {
         let none: []Val = []
         try parentSide(st, txn, t, fw, row, &none, false, later)
@@ -16249,6 +16377,42 @@ fn seqForget(st: &lexdb_store.Store, d: &Seq) {
 
 // The mark of a sequence's view (Table.view): then its catalog key.
 const SEQ_REL: str = "\x00seq:"
+const MV_OQC_REL: str = "\x00mvoqc:"
+
+// Virtual relation wrapper for an ON QUERY COMPUTATION / realtime MV: merges mv.tree + mv.deltaTree on read.
+fn mvOqcRelation(t: &Table): Table {
+    var vt = lexdb_catalog.emptyTable(&t.name)
+    vt.tree = -1
+    var specs: []str = []
+    for c in t.cols {
+        if lexdb_catalog.hiddenName(&c.name) { continue }
+        append(mut &vt.cols, c.clone())
+        append(mut &specs, c.name + "\x02" + c.typ.oid.toStr() + "\x02" + c.spell + "\x02" + c.coll)
+    }
+    vt.view = MV_OQC_REL + t.name + "\x01" + strings.join(&specs, "\x03")
+    return vt
+}
+
+fn mvOqcKey(srf: &str): str {
+    let start = 1 + len(MV_OQC_REL)
+    let sep = strings.indexOf(srf, "\x01", start)
+    return if sep < 0 { srf[start..len(srf)].toStr() } else { srf[start..sep].toStr() }
+}
+
+fn mvOqcOutCols(srf: &str): []OutCol {
+    var out: []OutCol = []
+    let sep = strings.indexOf(srf, "\x01", 1 + len(MV_OQC_REL))
+    if sep < 0 || sep + 1 >= len(srf) { return out }
+    let rest = &srf[sep + 1..len(srf)]
+    for part in strings.split(rest, "\x03") {
+        let fs = strings.split(&part, "\x02")
+        if len(fs) >= 4 {
+            append(mut &out, OutCol{name: fs[0].clone(), oid: strings.parseIntOpt(&fs[1]).unwrapOr(lexdb_sql.OID_TEXT),
+                                    spell: fs[2].clone(), coll: fs[3].clone(), scale: -1})
+        }
+    }
+    return out
+}
 
 // A table standing for sequence d in FROM: a view whose query is its row.
 fn seqRelation(d: &Seq): Table {
@@ -20481,8 +20645,8 @@ fn roleStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
 
 // A view's query, parsed to be planned where the view is used.
 fn viewQuery(t: &Table): Result[lexdb_sql.Stmt, DbErr] {
-    if strings.startsWith(&t.view, SEQ_REL) {
-        // a sequence's row: made by the executor, as a catalog relation's
+    if strings.startsWith(&t.view, SEQ_REL) || strings.startsWith(&t.view, MV_OQC_REL) {
+        // a sequence's row or OQC materialized view's merged rows: made by the executor, as a catalog relation's
         var q = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
         q.srf = "#" + t.view
         q.use = lexdb_sql.SUB_FROM
@@ -20501,6 +20665,9 @@ fn notView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str, what: 
         Some(t) {
             if len(t.view) > 0 {
                 return Err(e("0A000", &("cannot " + what + " view \"" + lexdb_sql.shown(name) + "\" (lexdb's views are read-only)")))
+            }
+            if lexdb_mview.isMvTable(&t) {
+                return Err(e("42809", &("cannot change materialized view \"" + lexdb_sql.shown(name) + "\"")))
             }
         }
         None {
@@ -20651,7 +20818,20 @@ fn dropView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     for c in s.cols {
         match try findTable(st, txn, &c.name) {
             Some(t) {
-                if len(t.view) == 0 { return Err(e("42809", &("\"" + lexdb_sql.shown(&c.name) + "\" is not a view (use DROP TABLE)"))) }
+                if len(t.view) == 0 {
+                    match try lexdb_mview.readMeta(st, txn, &t.name) {
+                        Some(mv) {
+                            if mv.indexedView {
+                                try lexdb_priv.needRelOwner(st, txn, &t.name, &"view")
+                                try dropMviewKey(st, txn, &t.name, s.cascade)
+                                append(mut &keys, t.name.clone())
+                                continue
+                            }
+                            return Err(e("42809", &("\"" + lexdb_sql.shown(&c.name) + "\" is not a view (use DROP MATERIALIZED VIEW)")))
+                        }
+                        None { return Err(e("42809", &("\"" + lexdb_sql.shown(&c.name) + "\" is not a view (use DROP TABLE)"))) }
+                    }
+                }
                 try lexdb_priv.needRelOwner(st, txn, &t.name, &"view")
                 try dropDependentViews(st, txn, &t.name, s.cascade, &"view")
                 txn.del(lexdb_catalog.CATALOG, &t.name)
@@ -20667,6 +20847,448 @@ fn dropView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     if len(keys) == 0 { append(mut &keys, "") }
     try bumpKeys(st, txn, &keys)
     return Ok(tagOnly("DROP VIEW"))
+}
+
+// ---- Materialized Views (lexdb_mview, Stage 1)
+
+fn mvUp(st: &lexdb_store.Store, sess: int, lim: Limits): lexdb_mview.Up {
+    return lexdb_mview.Up{
+        eval: mvEval,
+        runQuery: mvRunQuery,
+        planOuts: mvPlanOuts,
+        loadTable: mvLoadTable,
+        findTable: mvFindTable,
+        saveTable: mvSaveTable,
+        rebuildIdx: mvRebuildIdx,
+        bump: bumpFor,
+        inIdx: inIndex,
+        idxVal: idxVal,
+        door: doorMd(st, sess)
+    }
+}
+
+fn mvEval(cols: &[]lexdb_sql.ColDef, row: &[]Val, x: &Expr, _: &lexdb_time.Zone): Result[Val, DbErr] {
+    let none: []Val = []
+    let noSubs: []SubRes = []
+    let noSeq: Option[SeqEnv] = None
+    let env = Env{cols: cols, row: row, aggs: &none, params: &none, subs: &noSubs, cur: &none, seq: &noSeq}
+    return eval(x, &env)
+}
+
+fn mvRunQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &lexdb_sql.Stmt, path: &[]str): Result[lexdb_mview.QueryRows, DbErr] {
+    let saved = replace(mut &txn.sql.path, collections.copyOf(path))
+    var pc = oneShot()
+    let lim = Limits{rounds: MAX_RECURSION, steps: MAX_MATCH_STEPS, mem: txn.sql.memMax, deadline: 0, batch: true, rules: txn.sql.rules, auto: false, rdel: true}
+    let res = execIn(st, txn, q, &[], &[], lim, mut &pc, &noInput(), noOut, noPull, noSink)
+    txn.sql.path = saved
+    var r = try res
+    return Ok(lexdb_mview.QueryRows{cols: replace(mut &r.cols, []), rows: replace(mut &r.rows, [])})
+}
+
+fn mvPlanOuts(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &lexdb_sql.Stmt, path: &[]str): Result[[]OutCol, DbErr] {
+    let saved = replace(mut &txn.sql.path, collections.copyOf(path))
+    var sc = newScopeIn(st, txn, &[], &[])
+    let res = planSelect(st, txn, q, &[], mut &sc)
+    txn.sql.path = saved
+    let sel = try res
+    return Ok(sel.outs)
+}
+
+fn mvLoadTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str): Result[Option[Table], DbErr] {
+    return byKeyOpt(st, txn, key)
+}
+
+fn mvFindTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str, path: &[]str): Result[Option[Table], DbErr] {
+    let saved = replace(mut &txn.sql.path, collections.copyOf(path))
+    let res = findTable(st, txn, name)
+    txn.sql.path = saved
+    return res
+}
+
+fn mvSaveTable(txn: mut &lexdb_store.Txn, t: &Table): Result[Unit, DbErr] {
+    return txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(t)))
+}
+
+fn mvRebuildIdx(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table): Result[Unit, DbErr] {
+    for i in 0..len(t.indexes) {
+        let ix = &t.indexes[i]
+        match try lexdb_access.buildIndex(st, txn, &lexdb_catalog.relOf(t), ix,
+                                          fn(xi: &Index, r: &[]Val): Result[bool, DbErr] { return inIndex(t, xi, r) },
+                                          fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) }) {
+            Some(row) { return Err(dupMade(t, &lexdb_sql.baseName(&ix.name), &ix.cols, &ix.exprs, &row)) }
+            None {}
+        }
+    }
+    return Ok(Unit{})
+}
+
+fn createMview(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, lim: Limits): Result[Res, DbErr] {
+    let key = try createKey(st, txn, &s.table, false)
+    let base = lexdb_sql.baseName(&key)
+    if try relExists(st, txn, &key) {
+        if s.ifFlag {
+            notice(st, txn, &"42P07", &("relation \"" + base + "\" already exists, skipping"), &"")
+            return Ok(tagOnly("CREATE MATERIALIZED VIEW"))
+        }
+        return Err(e("42P07", &("relation \"" + base + "\" already exists")))
+    }
+    try lexdb_priv.needCreate(st, txn, &key)
+
+    let opts = lexdb_mview.decOpts(&s.mvOpts, s.mdialect)
+    let q = try lexdb_mview.parseQuery(&s.index, s.mdialect)
+    let path = collections.copyOf(&txn.sql.path)
+    let up = mvUp(st, txn.sql.sess, lim)
+
+    let outs = try mvPlanOuts(st, txn, &q, &path)
+    if len(s.names) > len(outs) { return Err(e("42601", "CREATE MATERIALIZED VIEW specifies more column names than columns")) }
+
+    // Analyze FAST refresh eligibility and base table dependencies.
+    var fa = try lexdb_mview.analyzeFast(st, txn, &q, &path, &up)
+    var fastKind = fa.fp.kind
+    if opts.mode == lexdb_sql.MV_FAST && fastKind == lexdb_mview.FAST_NONE {
+        if s.mdialect == lexdb_sql.MD_ORA {
+            return Err(e("ORA12015", &("cannot create a fast refresh materialized view from a complex query (" + fa.reason + ")")))
+        }
+        return Err(e("0A000", &("cannot create FAST refresh materialized view: " + fa.reason)))
+    }
+    if opts.mode == lexdb_sql.MV_COMPLETE { fastKind = lexdb_mview.FAST_NONE }
+
+    // Collect base table deps (use fastDeps when available, otherwise readsOf).
+    var deps: []lexdb_mview.MvDep = []
+    if fastKind != lexdb_mview.FAST_NONE {
+        deps = replace(mut &fa.deps, [])
+    } else {
+        var rkeys: []str = []
+        try readsOf(st, txn, &q, mut &rkeys)
+        for rk in rkeys {
+            if rk == key { return Err(e("42P17", &("infinite recursion detected in rules for relation \"" + base + "\""))) }
+            append(mut &deps, lexdb_mview.MvDep{table: rk, cols: []})
+        }
+    }
+
+    // Build backing Table with visible columns + hidden key/state columns.
+    var t = lexdb_catalog.emptyTable(&key)
+    t.spell = s.spell.clone()
+    for i in 0..len(outs) {
+        let n: &str = if i < len(s.names) { &s.names[i] } else { &outs[i].name }
+        for c in t.cols { if c.name == n { return Err(e("42701", &("column \"" + n + "\" specified more than once"))) } }
+        let o = outs[i].oid
+        let ty = if o == 0 || o == 705 { lexdb_sql.oidType(lexdb_sql.OID_TEXT) } else { lexdb_sql.madeType(o, s.mdialect) }
+        var col = lexdb_sql.colDef(n, ty, false)
+        col.spell = if i < len(s.names) { if i < len(s.spells) { s.spells[i].clone() } else { "" } } else { outs[i].spell.clone() }
+        if ty.kind == lexdb_sql.K_TEXT { col.coll = outs[i].coll.clone() }
+        append(mut &t.cols, col)
+    }
+
+    if fastKind != lexdb_mview.FAST_NONE {
+        let gkIdx = lexdb_mview.appendHiddenCols(&fa.fp, mut &t.cols)
+        append(mut &t.pk, gkIdx)
+    } else {
+        var rc = lexdb_sql.colDef(lexdb_catalog.ROWID, lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}, true)
+        rc.identity = lexdb_sql.ID_ALWAYS
+        append(mut &t.pk, len(t.cols))
+        append(mut &t.cols, rc)
+    }
+    t.tree = st.createTree(txn)
+    let useDelta = fastKind != lexdb_mview.FAST_NONE && (opts.onQueryComp || opts.timing == lexdb_sql.MV_REALTIME)
+    let deltaTree = if useDelta { st.createTree(txn) } else { 0 }
+    append(mut &t.invalid, lexdb_mview.MV_MARK.toStr())
+    if useDelta { append(mut &t.invalid, lexdb_mview.OQC_MARK.toStr()) }
+    if (s.noData || opts.buildDeferred) && s.mdialect == lexdb_sql.MD_PG {
+        append(mut &t.invalid, lexdb_mview.UNPOP_MARK.toStr())
+    }
+    try txn.put(lexdb_catalog.CATALOG, &key, &(lexdb_catalog.encTable(&t)))
+    try lexdb_priv.ownNew(st, txn, &lexdb_catalog.relObj(&key))
+
+    let meta = lexdb_mview.MvMeta{
+        key: key.clone(), query: s.index.clone(), mdialect: s.mdialect, mode: opts.mode, timing: opts.timing,
+        rewrite: opts.rewrite, onQueryComp: opts.onQueryComp, populated: false, stale: false, indexedView: false,
+        viewDef: "", fastKind: fastKind, deps: deps, deltaTree: deltaTree, foldedSeq: 0, lastRefresh: 0, lastType: "NA", path: path
+    }
+    try lexdb_mview.writeMeta(txn, &meta)
+    try lexdb_mview.subscribeDeps(st, txn, &meta, &up)
+    try bumpFor(st, txn, &key)
+
+    if !s.noData && !opts.buildDeferred {
+        let n = try lexdb_mview.refreshComplete(st, txn, &key, &up)
+        return Ok(tagOnly(&("SELECT " + n.toStr())))
+    }
+    return Ok(tagOnly("CREATE MATERIALIZED VIEW"))
+}
+
+fn refreshMview(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, lim: Limits): Result[Res, DbErr] {
+    let t = match try findTable(st, txn, &s.table) {
+        Some(x) { x }
+        None { return Err(e("42P01", &("relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist"))) }
+    }
+    let mv = match try lexdb_mview.readMeta(st, txn, &t.name) {
+        Some(m) { m }
+        None { return Err(e("42809", &("\"" + lexdb_sql.shown(&s.table) + "\" is not a materialized view"))) }
+    }
+    try lexdb_priv.needRelOwner(st, txn, &t.name, &"materialized view")
+    let up = mvUp(st, txn.sql.sess, lim)
+
+    if s.noData {
+        if s.conc { return Err(e("0A000", "CONCURRENTLY and WITH NO DATA options cannot be used together")) }
+        try lexdb_mview.clearData(st, txn, &t.name, &up)
+        return Ok(tagOnly("REFRESH MATERIALIZED VIEW"))
+    }
+    if s.conc {
+        if !mv.populated {
+            return Err(e("55000", "CONCURRENTLY cannot be used when the materialized view is not populated"))
+        }
+        var hasUniq = false
+        for ix in t.indexes {
+            if ix.unique && ix.pred.isNone() && len(ix.exprs) == 0 { hasUniq = true }
+        }
+        if !hasUniq {
+            return Err(lexdb_base.errDetail("55000", &("cannot refresh materialized view \"" + lexdb_sql.baseName(&t.name) + "\" concurrently"),
+                                            "", &("Create a unique index with no WHERE clause on one or more columns of the materialized view.")))
+        }
+    }
+    let opts = lexdb_mview.decOpts(&s.mvOpts, s.mdialect)
+    if opts.hasMode && opts.mode == lexdb_sql.MV_FAST && mv.fastKind == lexdb_mview.FAST_NONE {
+        if s.mdialect == lexdb_sql.MD_ORA {
+            return Err(e("ORA12004", &("REFRESH FAST cannot be used for materialized view \"" + lexdb_sql.baseName(&t.name) + "\"")))
+        }
+        return Err(e("0A000", &("FAST refresh cannot be used for materialized view \"" + lexdb_sql.baseName(&t.name) + "\"")))
+    }
+    // When deltaTree is active and FAST/FORCE refresh is requested (non-CONCURRENTLY), fold companion deltaTree in O(delta)!
+    let wantFold = !s.conc && mv.populated && mv.deltaTree > 0 &&
+                   ((opts.hasMode && (opts.mode == lexdb_sql.MV_FAST || opts.mode == lexdb_sql.MV_FORCE)) ||
+                    (!opts.hasMode && (mv.mode == lexdb_sql.MV_FAST || mv.mode == lexdb_sql.MV_FORCE)))
+    if wantFold {
+        let _f = try lexdb_mview.foldDeltas(st, txn, &t.name, &up)
+        return Ok(tagOnly("REFRESH MATERIALIZED VIEW"))
+    }
+    // Atomic CoW B+tree swap refresh (also satisfies CONCURRENTLY lock-free!).
+    let _ = try lexdb_mview.refreshComplete(st, txn, &t.name, &up)
+    return Ok(tagOnly("REFRESH MATERIALIZED VIEW"))
+}
+
+fn dropMviewKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, cascade: bool): Result[Unit, DbErr] {
+    let lim = Limits{rounds: MAX_RECURSION, steps: MAX_MATCH_STEPS, mem: txn.sql.memMax, deadline: 0, batch: true, rules: txn.sql.rules, auto: false, rdel: true}
+    let up = mvUp(st, txn.sql.sess, lim)
+    match try lexdb_mview.readMeta(st, txn, key) {
+        Some(mv) {
+            if mv.deltaTree > 0 { txn.dropTree(mv.deltaTree) }
+            try lexdb_mview.unsubscribeDeps(st, txn, &mv, &up)
+            lexdb_mview.delMeta(txn, key)
+        }
+        None {}
+    }
+    match try byKeyOpt(st, txn, key) {
+        Some(t) {
+            try dropDependentViews(st, txn, &t.name, cascade, &"materialized view")
+            dropOne(txn, &t)
+        }
+        None {}
+    }
+    return Ok(Unit{})
+}
+
+fn dropMview(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    var keys: []str = []
+    for c in s.cols {
+        match try findTable(st, txn, &c.name) {
+            Some(t) {
+                if !(try lexdb_mview.isMview(st, txn, &t.name)) {
+                    return Err(e("42809", &("\"" + lexdb_sql.shown(&c.name) + "\" is not a materialized view")))
+                }
+                try lexdb_priv.needRelOwner(st, txn, &t.name, &"materialized view")
+                try dropMviewKey(st, txn, &t.name, s.cascade)
+                append(mut &keys, t.name.clone())
+            }
+            None {
+                if !s.ifFlag { return Err(e("42P01", &("materialized view \"" + lexdb_sql.shown(&c.name) + "\" does not exist"))) }
+                notice(st, txn, &"00000", &("materialized view \"" + lexdb_sql.shown(&c.name) + "\" does not exist, skipping"), &"")
+            }
+        }
+    }
+    if len(keys) == 0 { append(mut &keys, "") }
+    try bumpKeys(st, txn, &keys)
+    return Ok(tagOnly("DROP MATERIALIZED VIEW"))
+}
+
+fn alterMview(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, lim: Limits): Result[Res, DbErr] {
+    var t0 = lexdb_catalog.emptyTable(&"")
+    match try findTable(st, txn, &s.table) {
+        Some(x) { t0 = x }
+        None {
+            if s.ifFlag {
+                notice(st, txn, &"00000", &("relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist, skipping"), &"")
+                return Ok(tagOnly("ALTER MATERIALIZED VIEW"))
+            }
+            return Err(e("42P01", &("relation \"" + lexdb_sql.shown(&s.table) + "\" does not exist")))
+        }
+    }
+    var mv = match try lexdb_mview.readMeta(st, txn, &t0.name) {
+        Some(m) { m }
+        None { return Err(e("42809", &("\"" + lexdb_sql.shown(&s.table) + "\" is not a materialized view"))) }
+    }
+    try lexdb_priv.needRelOwner(st, txn, &t0.name, &"materialized view")
+    let up = mvUp(st, txn.sql.sess, lim)
+
+    if s.alias == "rename" {
+        var t = t0
+        let newKey = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &s.index)
+        if try relExists(st, txn, &newKey) { return Err(e("42P07", &("relation \"" + s.index + "\" already exists"))) }
+        let oldKey = t.name.clone()
+        txn.del(lexdb_catalog.CATALOG, &oldKey)
+        t.name = newKey.clone()
+        t.spell = ""
+        for ix in t.indexes { try txn.put(lexdb_catalog.CATALOG, &(idxName(&ix.name)), &newKey) }
+        try txn.put(lexdb_catalog.CATALOG, &newKey, &(lexdb_catalog.encTable(&t)))
+        try lexdb_priv.moveAcl(st, txn, &lexdb_catalog.relObj(&oldKey), &lexdb_catalog.relObj(&newKey))
+        try lexdb_mview.renameMeta(st, txn, &oldKey, &newKey, &up)
+        try bumpFor(st, txn, &newKey)
+        return Ok(tagOnly("ALTER MATERIALIZED VIEW"))
+    }
+    if s.alias == "rename_col" {
+        var t = t0
+        let ci = lexdb_bind.colIndex(&t.cols, &s.names[0])
+        if ci < 0 || lexdb_catalog.hiddenName(&t.cols[ci].name) {
+            return Err(e("42703", &("column \"" + s.names[0] + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" does not exist")))
+        }
+        if lexdb_bind.colIndex(&t.cols, &s.index) >= 0 {
+            return Err(e("42701", &("column \"" + s.index + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" already exists")))
+        }
+        t.cols[ci].name = s.index.clone()
+        t.cols[ci].spell = ""
+        try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(&t)))
+        try bumpFor(st, txn, &t.name)
+        return Ok(tagOnly("ALTER MATERIALIZED VIEW"))
+    }
+
+    let opts = lexdb_mview.decOpts(&s.mvOpts, s.mdialect)
+    if opts.hasMode {
+        if opts.mode == lexdb_sql.MV_FAST && mv.fastKind == lexdb_mview.FAST_NONE {
+            return Err(e("ORA12015", "cannot set FAST refresh on a complex materialized view"))
+        }
+        mv.mode = opts.mode
+    }
+    if opts.hasTiming { mv.timing = opts.timing }
+    if opts.hasRewrite { mv.rewrite = opts.rewrite }
+    if opts.hasOqc { mv.onQueryComp = opts.onQueryComp }
+    let wantDelta = mv.fastKind != lexdb_mview.FAST_NONE && (mv.onQueryComp || mv.timing == lexdb_sql.MV_REALTIME)
+    if wantDelta && mv.deltaTree == 0 {
+        mv.deltaTree = st.createTree(txn)
+        var t = t0
+        lexdb_mview.setOqcMark(mut &t, true)
+        try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(&t)))
+    } else if !wantDelta && mv.deltaTree > 0 {
+        let _f = try lexdb_mview.foldDeltas(st, txn, &mv.key, &up)
+        txn.dropTree(mv.deltaTree)
+        mv.deltaTree = 0
+        var t = t0
+        lexdb_mview.setOqcMark(mut &t, false)
+        try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(&t)))
+    }
+    try lexdb_mview.writeMeta(txn, &mv)
+    try bumpFor(st, txn, &mv.key)
+    return Ok(tagOnly("ALTER MATERIALIZED VIEW"))
+}
+
+fn mviewLogStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    let t = try needTable(st, txn, &s.table)
+    try lexdb_priv.needRelOwner(st, txn, &t.name, &"table")
+    if s.alias == "drop" {
+        if (try lexdb_mview.readLog(st, txn, &t.name)).isNone() {
+            return Err(e("ORA12002", &("there is no materialized view log on table \"" + lexdb_sql.baseName(&t.name) + "\"")))
+        }
+        lexdb_mview.delLog(txn, &t.name)
+        try bumpFor(st, txn, &t.name)
+        return Ok(tagOnly("DROP MATERIALIZED VIEW LOG"))
+    }
+    if (try lexdb_mview.readLog(st, txn, &t.name)).isSome() {
+        return Err(e("ORA12000", &("a materialized view log already exists on table \"" + lexdb_sql.baseName(&t.name) + "\"")))
+    }
+    let p = strings.split(&s.mvOpts, "|")
+    let rid = len(p) > 0 && p[0] == "1"
+    let pk = len(p) > 1 && p[1] == "1"
+    let seq = len(p) > 2 && p[2] == "1"
+    let nv = len(p) > 3 && p[3] == "1"
+    let log = lexdb_mview.MvLog{
+        key: t.name.clone(),
+        logTable: "MLOG$_" + strings.toUpperAscii(&lexdb_sql.baseName(&t.name)),
+        rowids: rid, pk: pk, seq: seq, newVals: nv, cols: collections.copyOf(&s.names)
+    }
+    try lexdb_mview.writeLog(txn, &log)
+    try bumpFor(st, txn, &t.name)
+    return Ok(tagOnly("CREATE MATERIALIZED VIEW LOG"))
+}
+
+// SQL Server Indexed View promotion: CREATE UNIQUE CLUSTERED INDEX on a WITH SCHEMABINDING view.
+fn promoteIndexedView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, vt: &Table, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    let base = lexdb_sql.baseName(&vt.name)
+    if !s.unique || s.cluster != 1 {
+        return Err(e("TS1940", &("Cannot create index on view '" + base + "'. It does not have a unique clustered index.")))
+    }
+    if !strings.contains(&vt.view, lexdb_sql.SB_MARK) {
+        return Err(e("TS1939", &("Cannot create index on view '" + base + "' because the view is not schema bound.")))
+    }
+    try lexdb_priv.needRelOwner(st, txn, &vt.name, &"view")
+    let rawSql = lexdb_sql.viewShown(&vt.view)
+    let lim = Limits{rounds: MAX_RECURSION, steps: MAX_MATCH_STEPS, mem: txn.sql.memMax, deadline: 0, batch: true, rules: txn.sql.rules, auto: false, rdel: true}
+    let up = mvUp(st, txn.sql.sess, lim)
+    let path = collections.copyOf(&txn.sql.path)
+    let q = try lexdb_mview.parseQuery(&rawSql, lexdb_sql.MD_TSQL)
+    var fa = try lexdb_mview.analyzeFast(st, txn, &q, &path, &up)
+    if fa.fp.kind == lexdb_mview.FAST_NONE {
+        return Err(e("TS1939", &("Cannot create index on view '" + base + "': " + fa.reason)))
+    }
+    let outs = try mvPlanOuts(st, txn, &q, &path)
+
+    // Replace the catalog view entry with a real backing Table (keeping the same key & ACL!).
+    var t = lexdb_catalog.emptyTable(&vt.name)
+    t.spell = vt.spell.clone()
+    for i in 0..len(outs) {
+        let cn = if i < len(vt.cols) { vt.cols[i].name.clone() } else { outs[i].name.clone() }
+        let ty = if outs[i].oid == 0 || outs[i].oid == 705 { lexdb_sql.oidType(lexdb_sql.OID_TEXT) } else { lexdb_sql.madeType(outs[i].oid, lexdb_sql.MD_TSQL) }
+        var col = lexdb_sql.colDef(&cn, ty, false)
+        col.spell = if i < len(vt.cols) { vt.cols[i].spell.clone() } else { outs[i].spell.clone() }
+        if ty.kind == lexdb_sql.K_TEXT { col.coll = outs[i].coll.clone() }
+        append(mut &t.cols, col)
+    }
+    let gkIdx = lexdb_mview.appendHiddenCols(&fa.fp, mut &t.cols)
+    append(mut &t.pk, gkIdx)
+    t.tree = st.createTree(txn)
+    append(mut &t.invalid, lexdb_mview.MV_MARK.toStr())
+    try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(&t)))
+
+    let meta = lexdb_mview.MvMeta{
+        key: t.name.clone(), query: rawSql, mdialect: lexdb_sql.MD_TSQL, mode: lexdb_sql.MV_FAST,
+        timing: lexdb_sql.MV_STATEMENT, rewrite: true, onQueryComp: false, populated: false, stale: false,
+        indexedView: true, viewDef: vt.view.clone(), fastKind: fa.fp.kind, deps: replace(mut &fa.deps, []), deltaTree: 0, foldedSeq: 0,
+        lastRefresh: 0, lastType: "NA", path: path
+    }
+    try lexdb_mview.writeMeta(txn, &meta)
+    try lexdb_mview.subscribeDeps(st, txn, &meta, &up)
+    // Populate the materialized view first, then create the UNIQUE CLUSTERED INDEX (which validates uniqueness!).
+    let _ = try lexdb_mview.refreshComplete(st, txn, &t.name, &up)
+    return createIndex(st, txn, s)
+}
+
+// SQL Server Indexed View demotion: dropping the unique clustered index restores the original schema-bound view.
+fn demoteIndexedView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, mv: &lexdb_mview.MvMeta): Result[Unit, DbErr] {
+    let lim = Limits{rounds: MAX_RECURSION, steps: MAX_MATCH_STEPS, mem: txn.sql.memMax, deadline: 0, batch: true, rules: txn.sql.rules, auto: false, rdel: true}
+    let up = mvUp(st, txn.sql.sess, lim)
+    try lexdb_mview.unsubscribeDeps(st, txn, mv, &up)
+    lexdb_mview.delMeta(txn, &t.name)
+    // Drop the backing tree and all indexes on the view.
+    for ix in t.indexes {
+        txn.dropTree(ix.tree)
+        txn.del(lexdb_catalog.CATALOG, &(idxName(&ix.name)))
+    }
+    txn.dropTree(t.tree)
+    // Restore original view catalog row (visible columns only).
+    var visCols: []lexdb_sql.ColDef = []
+    for c in t.cols { if !lexdb_catalog.hiddenName(&c.name) { append(mut &visCols, c.clone()) } }
+    var depKeys: []str = []
+    for d in mv.deps { append(mut &depKeys, d.table.clone()) }
+    try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encViewRn(&visCols, &mv.viewDef, &depKeys, &t.spell, &[], &[])))
+    try bumpFor(st, txn, &t.name)
+    return Ok(Unit{})
 }
 
 // ---- T-SQL's sp_rename (design/lexdb-dialect-gaps.md, package B, S10)
@@ -21279,7 +21901,11 @@ fn ownerStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     } else {
         match try findTable(st, txn, &s.table) {
             Some(t) {
-                if (s.index == "view") != (len(t.view) > 0) {
+                if s.index == "materialized view" {
+                    if !(try lexdb_mview.isMview(st, txn, &t.name)) {
+                        return Err(e("42809", &("\"" + lexdb_sql.shown(&s.table) + "\" is not a materialized view")))
+                    }
+                } else if (s.index == "view") != (len(t.view) > 0) {
                     return Err(e("42809", &("\"" + lexdb_sql.shown(&s.table) + "\" is not a " + s.index)))
                 }
                 obj = lexdb_catalog.relObj(&t.name)

@@ -46,9 +46,9 @@ CORE = {
     "lexdb_access", "lexdb_agg", "lexdb_base", "lexdb_bind", "lexdb_catalog", "lexdb_census", "lexdb_conerr", "lexdb_cols", "lexdb_dbopt", "lexdb_dialect", "lexdb_disk",
     "lexdb_enum", "lexdb_exec", "lexdb_fkconv", "lexdb_fkprobe", "lexdb_float", "lexdb_func", "lexdb_gen", "lexdb_held", "lexdb_leafk", "lexdb_lib", "lexdb_like",
     "lexdb_locks", "lexdb_match", "lexdb_recur", "lexdb_recrun", "lexdb_recprobe", "lexdb_litint",
-    "lexdb_memo", "lexdb_newfn", "lexdb_nncon", "lexdb_nnalter", "lexdb_annot", "lexdb_graph", "lexdb_assert", "lexdb_copyjson", "lexdb_json", "lexdb_oldnew", "lexdb_ops", "lexdb_vec", "lexdb_decfit",
+    "lexdb_memo", "lexdb_mview", "lexdb_newfn", "lexdb_nncon", "lexdb_nnalter", "lexdb_annot", "lexdb_graph", "lexdb_assert", "lexdb_copyjson", "lexdb_json", "lexdb_oldnew", "lexdb_ops", "lexdb_vec", "lexdb_decfit",
     "lexdb_page", "lexdb_parse", "lexdb_pct", "lexdb_pipe", "lexdb_plan", "lexdb_priv", "lexdb_repl", "lexdb_rows", "lexdb_routine",
-    "lexdb_session", "lexdb_setop", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_srf", "lexdb_standby", "lexdb_stats", "lexdb_viewdep", "lexdb_ixname", "lexdb_tsqlname", "lexdb_txmode",
+    "lexdb_session", "lexdb_setop", "lexdb_sketch", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_srf", "lexdb_standby", "lexdb_stats", "lexdb_viewdep", "lexdb_ixname", "lexdb_tsqlname", "lexdb_txmode",
     "lexdb_store", "lexdb_time", "lexdb_tmpstore", "lexdb_tz", "lexdb_udf", "lexdb_window",
 }
 
@@ -102,7 +102,7 @@ OPS_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb
 # item 3) sits beside the value operations, below the binder and the
 # executor: what it may import.
 LIB = "lexdb_lib"
-LIB_MAY_IMPORT = OPS_MAY_IMPORT | {"lexdb_ops", "lexdb_like", "lexdb_rows", "lexdb_catalog", "lexdb_access", "lexdb_newfn"}
+LIB_MAY_IMPORT = OPS_MAY_IMPORT | {"lexdb_ops", "lexdb_like", "lexdb_rows", "lexdb_catalog", "lexdb_access", "lexdb_newfn", "lexdb_sketch"}
 
 # The pipeline module (design/lexdb-layers.md 6.2.3): what it may import
 # (and lexell's own libraries), the store names it may use, and who may
@@ -156,8 +156,8 @@ SORT_USERS = {"lexdb_pipe", "lexdb_exec", "lexdb_agg", "lexdb_setop", "lexdb_win
 # values and their orders only; the row engine and the pipeline import them
 # (and the planner, for the aggregate spec type a plan holds).
 AGG = "lexdb_agg"
-AGG_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_access", "lexdb_sort", "lexdb_pct", "lexdb_json"}
-AGG_USERS = {"lexdb_pipe", "lexdb_exec", "lexdb_window", "lexdb_plan"}
+AGG_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_ops", "lexdb_access", "lexdb_sort", "lexdb_pct", "lexdb_json", "lexdb_sketch"}
+AGG_USERS = {"lexdb_pipe", "lexdb_exec", "lexdb_window", "lexdb_plan", "lexdb_mview"}
 
 # How a set operation combines its parts' rows (lexdb_setop, design/
 # lexdb-batch-gaps.md item 11): their keys and the streamed run, with the

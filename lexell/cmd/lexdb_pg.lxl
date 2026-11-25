@@ -8,6 +8,7 @@ import "./lexdb_pgcat"
 import "./lexdb_catalog"
 import "./lexdb_routine"
 import "./lexdb_assert"
+import "./lexdb_mview"
 import "./lexdb_viewdep"
 
 type Routine = lexdb_sql.Routine
@@ -469,11 +470,16 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
         "pg_class" {
             for ct in snap.tabs {
                 let hasIdx = len(ct.idxs) > 0
-                let trig = len(ct.t.fks) > 0 || len(ct.t.refBy) > 0
+                let trig = len(ct.t.fks) > 0 || len(lexdb_assert.refs(&ct.t.refBy)) > 0 || lexdb_assert.hasAsserts(&ct.t.refBy)
                 let ta = aclOf(&snap, &lexdb_catalog.relObj(&ct.key))
+                let mvOpt = lexdb_mview.findInSnap(&snap.mviews, &ct.key)
+                let rk = if mvOpt.isSome() { "m" } else { "r" }
+                let pop = match &mvOpt { Some(m) { m.populated } None { true } }
+                var visCols = 0
+                for c in ct.t.cols { if !lexdb_catalog.hiddenName(&c.name) { visCols += 1 } }
                 append(mut &rows, [iv(ct.oid), tv(if len(ct.t.spell) > 0 { &ct.t.spell } else { &ct.name }), iv(nspOid(&ct.schema)), iv(0), iv(0), iv(roleOid(&ownerName(&snap, &ta), roles)), iv(2), iv(ct.oid), iv(0),
-                                   iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(hasIdx), bv(false), tv(&persistOf(&ct.schema)), tv(&"r"), iv(len(ct.t.cols) - (if lexdb_catalog.rowidKeyed(&ct.t) { 1 } else { 0 })),
-                                   iv(len(ct.t.checks)), bv(false), bv(trig), bv(false), bv(false), bv(false), bv(true), tv(&"d"),
+                                   iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(hasIdx), bv(false), tv(&persistOf(&ct.schema)), tv(&rk), iv(visCols),
+                                   iv(len(ct.t.checks)), bv(false), bv(trig), bv(false), bv(false), bv(false), bv(pop), tv(&"d"),
                                    bv(false), iv(0), iv(0), iv(0), aclText(&snap, &ta, &"arwdDxt"), Val.Null, Val.Null])
                 for ix in ct.idxs {
                     append(mut &rows, [iv(ix.oid), tv(&ix.name), iv(nspOid(&ct.schema)), iv(0), iv(0), iv(OID_OWNER), iv(403), iv(ix.oid),
@@ -514,7 +520,7 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
             for ct in snap.tabs {
                 for i in 0..len(ct.t.cols) {
                     let c = &ct.t.cols[i]
-                    if c.name == ROWID { continue }
+                    if lexdb_catalog.hiddenName(&c.name) { continue }
                     var nn = c.notNull
                     for p in ct.t.pk { if p == i { nn = true } }
                     append(mut &rows, attRow(ct.oid, &lexdb_sql.colShown(c), c.typ.oid, typmodOf(&c.typ), i + 1, nn, defaultText(&snap, c).isSome() || c.genKind != lexdb_sql.GEN_NONE, &(identOf(c)), &(genOf(c))))
@@ -544,7 +550,7 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
         "pg_attrdef" {
             for ct in snap.tabs {
                 for i in 0..len(ct.t.cols) {
-                    if ct.t.cols[i].name == ROWID { continue }
+                    if lexdb_catalog.hiddenName(&ct.t.cols[i].name) { continue }
                     var shown = defaultText(&snap, &ct.t.cols[i])
                     if shown.isNone() { shown = genText(&ct.t.cols[i]) }
                     match shown {
@@ -816,8 +822,21 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
         }
         "pg_tables" {
             for ct in snap.tabs {
+                if lexdb_mview.findInSnap(&snap.mviews, &ct.key).isSome() { continue }
                 append(mut &rows, [tv(&ct.schema), tv(if len(ct.t.spell) > 0 { &ct.t.spell } else { &ct.name }), tv(&ownerName(&snap, &aclOf(&snap, &lexdb_catalog.relObj(&ct.key)))), Val.Null, bv(len(ct.idxs) > 0), bv(false),
-                                   bv(len(ct.t.fks) > 0 || len(ct.t.refBy) > 0), bv(false)])
+                                   bv(len(ct.t.fks) > 0 || len(lexdb_assert.refs(&ct.t.refBy)) > 0 || lexdb_assert.hasAsserts(&ct.t.refBy)), bv(false)])
+            }
+        }
+        "pg_matviews" {
+            for ct in snap.tabs {
+                match lexdb_mview.findInSnap(&snap.mviews, &ct.key) {
+                    Some(mv) {
+                        append(mut &rows, [tv(&ct.schema), tv(if len(ct.t.spell) > 0 { &ct.t.spell } else { &ct.name }),
+                                           tv(&ownerName(&snap, &aclOf(&snap, &lexdb_catalog.relObj(&ct.key)))), Val.Null,
+                                           bv(len(ct.idxs) > 0), bv(mv.populated), tv(&(mv.query + ";"))])
+                    }
+                    None {}
+                }
             }
         }
         "pg_indexes" {
@@ -847,6 +866,7 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
         }
         "information_schema.tables" {
             for ct in snap.tabs {
+                if lexdb_mview.findInSnap(&snap.mviews, &ct.key).isSome() { continue }
                 append(mut &rows, [tv(&db), tv(&ct.schema), tv(if len(ct.t.spell) > 0 { &ct.t.spell } else { &ct.name }), tv(&if persistOf(&ct.schema) == "t" { "LOCAL TEMPORARY" } else { "BASE TABLE" }), Val.Null, Val.Null, Val.Null, Val.Null, Val.Null,
                                    tv(&"YES"), tv(&"NO"), Val.Null])
             }
@@ -938,7 +958,7 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
             for ct in (if which == 0 { &snap.tabs } else { &snap.views }) {
                 for i in 0..len(ct.t.cols) {
                     let c = &ct.t.cols[i]
-                    if c.name == ROWID { continue }
+                    if lexdb_catalog.hiddenName(&c.name) { continue }
                     var nn = c.notNull
                     for p in ct.t.pk { if p == i { nn = true } }
                     let o = c.typ.oid
