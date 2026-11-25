@@ -494,24 +494,25 @@ fn (c: mut &Checker) T(t: int): int {
 // A C type of the runtime by name.
 fn (c: mut &Checker) ct(s: &str): int { return c.x.ct(s) }
 
-// The C of a shared borrow of the place x (an lvalue) of type t: &x, or x itself for a str (a
-// shared &str is the header, uncounted), or a hole when t mentions type parameters.
+// The C of a shared borrow of the place x (an lvalue) of type t: &x, or x itself for a type
+// passed by value as a shared borrow (str: the header; a boxed record or closed type: its heap
+// pointer S*), or a hole when t mentions type parameters.
 fn (c: mut &Checker) addrOf(t: int, x: int): int {
-    if t == sema.T_STR { return x }
+    if c.pg.isRefByVal(t) { return x }
     if c.pg.tk(t) == sema.TK_TP { return c.hole(mkHoleX(H_ADDR, t, x)) }
     return c.x.par(c.x.pre("&", x))
 }
 
 // The C of the place a shared borrow x of a t points to.
 fn (c: mut &Checker) derefOf(t: int, x: int): int {
-    if t == sema.T_STR { return x }
+    if c.pg.isRefByVal(t) { return x }
     if c.pg.tk(t) == sema.TK_TP { return c.hole(mkHoleX(H_DEREF, t, x)) }
     return c.x.par(c.x.pre("*", x))
 }
 
 // The C of a mut &t borrow x used as a shared &t.
 fn (c: mut &Checker) shareOf(t: int, x: int): int {
-    if t == sema.T_STR { return c.x.par(c.x.pre("*", x)) }
+    if c.pg.isRefByVal(t) { return c.x.par(c.x.pre("*", x)) }
     if c.pg.tk(t) == sema.TK_TP { return c.hole(mkHoleX(H_SHARE, t, x)) }
     return x
 }
@@ -1884,7 +1885,7 @@ fn (c: mut &Checker) seq(v: Val): Val {
     if !c.checks(v.c) { return v }
     let k = c.pg.tk(v.t)
     if k == sema.TK_REF || k == sema.TK_SLICE || (v.cat == CAT_PLACE && !c.isCopy(v.t)) {
-        let x = if v.cat != CAT_PLACE { v.c } else { c.x.pre("&", v.c) }
+        let x = if v.cat != CAT_PLACE { v.c } else { c.addrOf(v.t, v.c) }
         c.emitx(c.x.cast(c.ct("void"), c.x.par(x)))
         return v
     }
@@ -2810,6 +2811,51 @@ fn (c: mut &Checker) forMoves(a: int): int {
     return c.synth(sx.N_CALL, line, "", mv, c.synthList(&[arg]), 0)
 }
 
+// Whether the AST subtree x may leave the enclosing loop early (a break targeting it, or a
+// return or try outside any nested closure). Conservative: unknown node kinds return true.
+fn (c: &Checker) hasEarlyExit(x: int, inLoop: bool): bool {
+    if x < 0 { return false }
+    let n = c.nd(x)
+    let k = n.kind
+    if k == sx.N_RETURN || k == sx.N_TRY { return true }
+    if k == sx.N_BREAK { return !inLoop }
+    if k == sx.N_CLOSURE || k == sx.N_CONTINUE || k == sx.N_INT || k == sx.N_CHAR || k == sx.N_FRAC ||
+        k == sx.N_STR || k == sx.N_BOOL || k == sx.N_NAME || k == sx.N_TARG || k == sx.N_LINT ||
+        k == sx.N_LCHAR || k == sx.N_LSTR || k == sx.N_LNAME || k == sx.N_IDENT {
+        return false
+    }
+    if k == sx.N_WHILE { return c.hasEarlyExit(n.a, inLoop) || c.hasEarlyExit(n.b, true) }
+    if k == sx.N_FOR { return c.hasEarlyExit(n.a, inLoop) || c.hasEarlyExit(n.b, inLoop) || c.hasEarlyExit(n.c, true) }
+    if k == sx.N_BLOCK || k == sx.N_ARRLIT { return c.hasEarlyExitList(n.a, inLoop) }
+    if k == sx.N_LET { return c.hasEarlyExit(n.b, inLoop) }
+    if k == sx.N_DESTRUCTURE { return c.hasEarlyExit(n.c, inLoop) }
+    if k == sx.N_IF || k == sx.N_IFX || k == sx.N_SUB {
+        return c.hasEarlyExit(n.a, inLoop) || c.hasEarlyExit(n.b, inLoop) || c.hasEarlyExit(n.c, inLoop)
+    }
+    if k == sx.N_MATCH || k == sx.N_MATCHX {
+        if c.hasEarlyExit(n.a, inLoop) { return true }
+        for i in 0..c.count(n.b) {
+            if c.hasEarlyExit(c.nd(c.item(n.b, i)).d, inLoop) { return true }
+        }
+        return false
+    }
+    if k == sx.N_ASSIGN || k == sx.N_BIN { return c.hasEarlyExit(n.a, inLoop) || c.hasEarlyExit(n.b, inLoop) }
+    if k == sx.N_EXPR || k == sx.N_UN || k == sx.N_BORROW || k == sx.N_FIELDX || k == sx.N_INIT {
+        return c.hasEarlyExit(n.a, inLoop)
+    }
+    if k == sx.N_INDEX || k == sx.N_CALL || k == sx.N_LIT {
+        return c.hasEarlyExit(n.a, inLoop) || c.hasEarlyExitList(n.b, inLoop)
+    }
+    return true
+}
+
+fn (c: &Checker) hasEarlyExitList(h: int, inLoop: bool): bool {
+    for i in 0..c.count(h) {
+        if c.hasEarlyExit(c.item(h, i), inLoop) { return true }
+    }
+    return false
+}
+
 fn (c: mut &Checker) forConsume(s: int, v0: Val, et: int) {
     let n = c.node(s)
     let name = &n.s
@@ -2822,6 +2868,27 @@ fn (c: mut &Checker) forConsume(s: int, v0: Val, et: int) {
     let apn = c.nm(&ap)
     let len = c.x.arrow(apn, "len")
     let data = c.x.par(c.x.pcast(c.x.ptr(ct), c.x.arrow(apn, "data")))
+    if !c.hasEarlyExit(n.c, false) {
+        // no break/return/try out of this loop: take elements forward without reversing; ap->len
+        // is zeroed first so the statement's array drop frees only the backing buffer afterwards
+        let fn_ = c.fresh("fn")
+        let fnn = c.nm(&fn_)
+        let i = c.fresh("i")
+        let ixn = c.nm(&i)
+        c.emit(c.x.decl(i64, &fn_, len))
+        c.emitx(c.x.asg(len, c.lit(0)))
+        c.emit(c.x.sfor(c.x.decl(i64, &i, c.lit(0)), c.x.bin("<", ixn, fnn), c.x.post(ixn, "++")))
+        c.cx.ind += 1
+        c.loopStart(c.snapshot(), false)
+        let xn = c.fresh(&("v_" + name + "_"))
+        c.emit(c.x.decl(ct, &xn, c.x.idx(data, ixn)))
+        let x = c.newVar(&name, &xn, et, false, VK_LOCAL, n.line)
+        c.declare(x)
+        c.loopEnd(n.c, n.line)
+        c.cx.ind -= 1
+        c.emit(c.x.send())
+        return
+    }
     // reversed with two indices meeting in the middle (no len / 2 and len - 1 - i per turn)
     let i = c.fresh("i")
     let ixn = c.nm(&i)
@@ -3057,8 +3124,13 @@ fn (c: mut &Checker) sMatch(s: int, mx: bool) {
         if p.gk >= 0 { p = c.holdtmp(c.dup(p.c, p.t), p.t) }
         let sp = c.fresh("sp")
         let ct = c.T(base)
-        c.emit(c.x.decl(c.x.ptr(ct), &sp, c.x.pre("&", p.c)))
-        acc = c.x.par(c.x.pre("*", c.nm(&sp)))
+        if !c.pg.types[d].value {
+            c.emit(c.x.decl(ct, &sp, p.c))
+            acc = c.nm(&sp)
+        } else {
+            c.emit(c.x.decl(c.x.ptr(ct), &sp, c.x.pre("&", p.c)))
+            acc = c.x.par(c.x.pre("*", c.nm(&sp)))
+        }
         root = p.root
         pcr = p.cr
     } else {
@@ -5933,7 +6005,9 @@ fn (c: mut &Checker) slotType(pt: int, at: int): int {
     let k = c.pg.tk(pt)
     if at == sema.T_STR || pt == sema.T_STR { return c.ct("const char*") }
     if k == sema.TK_SLICE || (k == sema.TK_REF && c.pg.tk(c.pg.ta(pt)) == sema.TK_ARR) { return c.ct("void*") }
-    if k == sema.TK_REF { return c.x.ptr(c.T(c.pg.ta(pt))) }
+    if k == sema.TK_REF {
+        return if !c.pg.tm(pt) && c.pg.isRefByVal(c.pg.ta(pt)) { c.T(c.pg.ta(pt)) } else { c.x.ptr(c.T(c.pg.ta(pt))) }
+    }
     return c.T(pt)
 }
 
@@ -6389,7 +6463,7 @@ fn (c: mut &Checker) globalWith(g: int, st: St, gnode: int, e: int): Val {
     c.emit(c.x.if1(open, c.x.sx(c.x.call("rt_trap", [c.lit(13), c.x.str(&("with on global " + gname + ", whose with is open")), W]))))
     c.emit(c.x.sx(c.x.asg(open, c.lit(1))))
     let ft = c.T(c.pg.mkFn(&[sema.T_PTR, c.pg.mkRef(gt, true)], sema.T_VOID))
-    c.emit(c.x.sx(c.x.callx(c.x.pcast(ft, c.x.dot(c.x.par(fv.c), "fn")), [c.x.dot(c.x.par(fv.c), "env"), c.addrOf(gt, place.c)])))
+    c.emit(c.x.sx(c.x.callx(c.x.pcast(ft, c.x.dot(c.x.par(fv.c), "fn")), [c.x.dot(c.x.par(fv.c), "env"), c.x.par(c.x.pre("&", place.c))])))
     c.emit(c.x.sx(c.x.asg(open, c.lit(0))))
     return voidVal(false)
 }

@@ -64,7 +64,7 @@ const F_ST = 5          // the element of type c at pointer local a + index loca
 const F_LE = 6          // local a <= local b, both of the integer kind c
 const F_ADD = 7         // local a holds local b + v exactly (no overflow), both of the integer kind c
 
-const MAX_FACTS = 64
+const MAX_FACTS = 256
 const DEPTH = 2         // how many facts between locals a bound or an order goes through
 const MAX_FILL = 1099511627776      // 2^40: rt_arr_fill traps above this length (both runtimes)
 
@@ -76,6 +76,9 @@ const RC_PURE = 3       // writes no memory: conversions, checked division, wrap
 const RC_ADD = 4        // checked addition, subtraction, multiplication of a kind (rtk)
 const RC_SUB = 5
 const RC_MUL = 6
+const RC_REM = 7        // checked remainder of a kind (rtk)
+const RC_SHL = 8        // checked left shift (rt_shl_*)
+const RC_SHR = 9        // checked right shift (rt_shr_*)
 
 type Fact = value record {
     k: int
@@ -204,6 +207,20 @@ pub fn optimize(p: ir.Ir): ir.Ir {
                 }
             }
         }
+        for ki in 0..4 {
+            if name == "rt_rem_" + kindName(ki) {
+                c = RC_REM
+                kx = ki
+            } else if name == "rt_shl_" + kindName(ki) {
+                c = RC_SHL
+                kx = ki
+            } else if name == "rt_shr_" + kindName(ki) {
+                c = RC_SHR
+                kx = ki
+            }
+        }
+        if name == "rt_shl_u64" { c = RC_SHL }
+        if name == "rt_shr_u64" { c = RC_SHR }
         if name == "rt_arr_fill" { o.fillFn = f }
         if name == "rt_str_byte" { o.byteFn = f }
         if name == "rt_sidx" { o.sidxFn = f }
@@ -1623,6 +1640,12 @@ fn (o: &Loops) loL(l: int, k: int, d: int): int {
             if m > kmin(k) && (f.v <= 0 || m <= kmax(k) - f.v) && (f.v >= 0 || m >= kmin(k) - f.v) && m + f.v > v {
                 v = m + f.v
             }
+        } else if f.k == F_ADD && f.b == l {
+            // a == l + v exactly, so l >= lo(a) - v (direct only to avoid F_ADD ping-pong)
+            let m = o.direct(f.a, k, false)
+            if m > kmin(k) && (f.v >= 0 || m <= kmax(k) + f.v) && (f.v <= 0 || m >= kmin(k) + f.v) && m - f.v > v {
+                v = m - f.v
+            }
         }
     }
     return v
@@ -1644,6 +1667,12 @@ fn (o: &Loops) hiL(l: int, k: int, d: int): int {
             let m = o.hiL(f.b, k, d - 1)
             if m < kmax(k) && (f.v <= 0 || m <= kmax(k) - f.v) && (f.v >= 0 || m >= kmin(k) - f.v) && m + f.v < v {
                 v = m + f.v
+            }
+        } else if f.k == F_ADD && f.b == l {
+            // a == l + v exactly, so l <= hi(a) - v (direct only to avoid F_ADD ping-pong)
+            let m = o.direct(f.a, k, true)
+            if m < kmax(k) && (f.v >= 0 || m <= kmax(k) + f.v) && (f.v <= 0 || m >= kmin(k) + f.v) && m - f.v < v {
+                v = m - f.v
             }
         }
     }
@@ -1835,28 +1864,59 @@ fn (o: mut &Loops) define(l: int, v: int) {
             }
         } else if o.u.nk(v) == ir.E_BIN && o.u.nodes[v].v == ir.OP_AND {
             o.defineBand(l, v, k)
+        } else if o.u.nk(v) == ir.E_BIN && o.u.nodes[v].v == ir.OP_SHR {
+            o.defineShr(l, o.u.nodes[v].a, o.u.nodes[v].b, k)
         } else {
             o.defineArith(l, v, k)
         }
     }
 }
 
-// After `l = x & c` with c a non-negative constant: in two's complement the
-// result's set bits are a subset of c's, so it is in [0, c] whatever x is.
-// (The mask behind a state, a hash or a UTF-8 lead byte often has a range the
-// arithmetic facts alone cannot see.)
+// After `l = x & y`: in two's complement, for any operand y known >= 0, the result's set bits
+// are a subset of y's, so 0 <= l <= y (covers both literal masks and local `mask = cap - 1`).
 fn (o: mut &Loops) defineBand(l: int, v: int, k: int) {
-    let a = o.u.nodes[v].a
-    let b = o.u.nodes[v].b
-    var c = -1
-    if o.u.nk(a) == ir.E_INT && o.u.nodes[a].v >= 0 {
-        c = o.u.nodes[a].v
-    } else if o.u.nk(b) == ir.E_INT && o.u.nodes[b].v >= 0 {
-        c = o.u.nodes[b].v
+    o.defineBandSide(l, o.u.nodes[v].a, k)
+    o.defineBandSide(l, o.u.nodes[v].b, k)
+}
+
+fn (o: mut &Loops) defineBandSide(l: int, x: int, k: int) {
+    if o.u.nk(x) == ir.E_INT {
+        let c = o.u.nodes[x].v
+        if c < 0 || c >= kmax(k) { return }
+        o.add(Fact{k: F_LO, a: l, b: -1, c: 0, d: -1, v: 0})
+        if c > kmin(k) { o.add(Fact{k: F_HI, a: l, b: -1, c: 0, d: -1, v: c}) }
+        return
     }
-    if c < 0 || c >= kmax(k) { return }
+    let s = o.symOf(x)
+    if s.l == -2 || (s.l >= 0 && o.killed(s.l)) || !inKind(s, k) || o.lo(s, k) < 0 { return }
     o.add(Fact{k: F_LO, a: l, b: -1, c: 0, d: -1, v: 0})
-    if c > kmin(k) { o.add(Fact{k: F_HI, a: l, b: -1, c: 0, d: -1, v: c}) }
+    if s.l == -1 {
+        if s.c < kmax(k) { o.add(Fact{k: F_HI, a: l, b: -1, c: 0, d: -1, v: s.c}) }
+    } else if s.l >= 0 && s.l != l {
+        o.add(Fact{k: F_LE, a: l, b: s.l, c: k, d: -1, v: 0})
+        let shi = o.hi(s, k)
+        if shi < kmax(k) { o.add(Fact{k: F_HI, a: l, b: -1, c: 0, d: -1, v: shi}) }
+    }
+}
+
+// After `l = a >> b`: when a >= 0 (always for unsigned), the result is >= 0, and for a constant
+// shift count c >= 0 it is at most hi(a) >> c.
+fn (o: mut &Loops) defineShr(l: int, ax: int, bx: int, k: int) {
+    let bits = if k == ir.TY_I64 { 64 } else if k == ir.TY_I32 || k == ir.TY_U32 { 32 } else if k == ir.TY_U8 { 8 } else { 0 }
+    if bits == 0 { return }
+    let a = o.symOf(ax)
+    let unsigned = k == ir.TY_U32 || k == ir.TY_U8
+    if !unsigned {
+        if a.l == -2 || (a.l >= 0 && o.killed(a.l)) || !inKind(a, k) || o.lo(a, k) < 0 { return }
+    }
+    o.add(Fact{k: F_LO, a: l, b: -1, c: 0, d: -1, v: 0})
+    let b = o.symOf(bx)
+    if b.l == -1 && b.c >= 0 && b.c < bits {
+        let ahi = if a.l == -2 || (a.l >= 0 && o.killed(a.l)) || !inKind(a, k) { kmax(k) } else { o.hi(a, k) }
+        if ahi >= 0 && (ahi >> b.c) < kmax(k) {
+            o.add(Fact{k: F_HI, a: l, b: -1, c: 0, d: -1, v: ahi >> b.c})
+        }
+    }
 }
 
 // After `l = v` with v a checked or wrapping `+ - *` of l's kind k: l's range, and for `m + c`,
@@ -1870,7 +1930,32 @@ fn (o: mut &Loops) defineArith(l: int, v: int, k: int) {
     var checked = false
     var ki = -1
     let rc = o.rtc[f]
-    if rc >= RC_ADD && o.nargs(v) == 3 {
+    if rc == RC_SHR && o.nargs(v) == 3 {
+        if o.u.tk(o.u.nodes[v].ty) == k { o.defineShr(l, o.arg(v, 0), o.arg(v, 1), k) }
+        return
+    }
+    if rc == RC_REM && o.nargs(v) == 3 {
+        let rki = o.rtk[f]
+        if kindAt(rki) != k { return }
+        let ra = o.symOf(o.arg(v, 0))
+        let rb = o.symOf(o.arg(v, 1))
+        let unsigned = k == ir.TY_U32 || k == ir.TY_U8
+        if !unsigned {
+            if ra.l == -2 || (ra.l >= 0 && o.killed(ra.l)) || !inKind(ra, k) || o.lo(ra, k) < 0 { return }
+        }
+        if rb.l == -2 || (rb.l >= 0 && o.killed(rb.l)) || !inKind(rb, k) || o.lo(rb, k) < 0 { return }
+        // ra >= 0 and rb > 0 (rb == 0 trapped in rt_rem): 0 <= ra % rb < rb
+        o.add(Fact{k: F_LO, a: l, b: -1, c: 0, d: -1, v: 0})
+        if rb.l == -1 && rb.c > 0 {
+            o.add(Fact{k: F_HI, a: l, b: -1, c: 0, d: -1, v: rb.c - 1})
+        } else if rb.l >= 0 && rb.l != l {
+            o.add(Fact{k: F_LT, a: l, b: rb.l, c: k, d: -1, v: 0})
+            let bhi = o.hi(rb, k)
+            if bhi > 0 && bhi < kmax(k) { o.add(Fact{k: F_HI, a: l, b: -1, c: 0, d: -1, v: bhi - 1}) }
+        }
+        return
+    }
+    if rc >= RC_ADD && rc <= RC_MUL && o.nargs(v) == 3 {
         op = rc - RC_ADD
         checked = true
         ki = o.rtk[f]
@@ -2218,21 +2303,47 @@ fn (o: mut &Loops) loop(s: int) {
     // [0, h] at the entry: l stays in [0, max(c, h)] throughout (a hash `h = (h * 33 + b) & m`)
     var mls: []int = []
     var mhs: []int = []
+    // ... or every write in the loop `l = x & ml` for a loop-invariant non-negative local ml
+    // (`h = (h + 1) & mask` in an open-addressing hash probe loop)
+    var mlls: []int = []
+    var mlms: []int = []
+    var mlks: []int = []
     for l in written {
         let k = o.u.tk(o.u.locals[l].ty)
         if !o.trackable(l) || !ranged(k) { continue }
         let sl = Sym{l: o.canon(l), c: 0}
         if o.lo(sl, k) < 0 { continue }
         let h0 = o.hi(sl, k)
-        if h0 >= kmax(k) { continue }
-        var mw = 0
-        for x in [a, b, c, d] {
-            let m = o.maskWrites(x, l)
-            if m < 0 || mw < 0 { mw = -1 } else if m > mw { mw = m }
+        var gotConst = false
+        if h0 < kmax(k) {
+            var mw = 0
+            for x in [a, b, c, d] {
+                let m = o.maskWrites(x, l)
+                if m < 0 || mw < 0 { mw = -1 } else if m > mw { mw = m }
+            }
+            if mw > 0 {
+                append(mut &mls, l)
+                append(mut &mhs, if mw > h0 { mw } else { h0 })
+                gotConst = true
+            }
         }
-        if mw > 0 {
-            append(mut &mls, l)
-            append(mut &mhs, if mw > h0 { mw } else { h0 })
+        if !gotConst {
+            let cl = o.canon(l)
+            for f in o.facts {
+                if f.k == F_LE && f.a == cl && f.c == k && f.b >= 0 && o.kmark[f.b] != stamp &&
+                    o.lo(Sym{l: f.b, c: 0}, k) >= 0 {
+                    var ok = true
+                    for x in [a, b, c, d] {
+                        if ok && !o.maskLocalWrites(x, l, f.b) { ok = false }
+                    }
+                    if ok {
+                        append(mut &mlls, l)
+                        append(mut &mlms, f.b)
+                        append(mut &mlks, k)
+                        break
+                    }
+                }
+            }
         }
     }
     for l in written { o.kill(l) }
@@ -2240,6 +2351,12 @@ fn (o: mut &Loops) loop(s: int) {
     for j in 0..len(mls) {
         o.add(Fact{k: F_LO, a: mls[j], b: -1, c: 0, d: -1, v: 0})
         o.add(Fact{k: F_HI, a: mls[j], b: -1, c: 0, d: -1, v: mhs[j]})
+    }
+    for j in 0..len(mlls) {
+        o.add(Fact{k: F_LO, a: mlls[j], b: -1, c: 0, d: -1, v: 0})
+        o.add(Fact{k: F_LE, a: mlls[j], b: mlms[j], c: mlks[j], d: -1, v: 0})
+        let mhi = o.hi(Sym{l: mlms[j], c: 0}, mlks[j])
+        if mhi < kmax(mlks[j]) { o.add(Fact{k: F_HI, a: mlls[j], b: -1, c: 0, d: -1, v: mhi}) }
     }
     for j in 0..len(ind) { o.add(Fact{k: F_LO, a: ind[j], b: -1, c: 0, d: -1, v: los[j]}) }
     for j in 0..len(cnt) { o.add(Fact{k: F_HI, a: cnt[j], b: -1, c: 0, d: -1, v: his[j]}) }
@@ -2259,6 +2376,51 @@ fn (o: mut &Loops) loop(s: int) {
     o.facts = base
 }
 
+// Whether every write of local l in the tree x is `l = y & ml` (with canonical operand ml),
+// and l is neither declared nor post-incremented there.
+fn (o: &Loops) maskLocalWrites(x: int, l: int, ml: int): bool {
+    if x < 0 { return true }
+    let n = o.u.nodes[x]
+    let k = n.k
+    if (k == ir.E_ASSIGN || k == ir.E_POSTINC) && o.u.nk(n.a) == ir.E_LOCAL && o.u.nodes[n.a].a == l {
+        if k == ir.E_POSTINC { return false }
+        let v = n.b
+        if o.u.nk(v) != ir.E_BIN || o.u.nodes[v].v != ir.OP_AND { return false }
+        let sa = o.symOf(o.u.nodes[v].a)
+        let sb = o.symOf(o.u.nodes[v].b)
+        if sa.l != ml && sb.l != ml { return false }
+    }
+    if k == ir.S_DECL && n.a == l { return false }
+    let kc = ir.KIDS[k]
+    if kc <= ir.K_NONE { return true }
+    if kc == ir.K_A { return o.maskLocalWrites(n.a, l, ml) }
+    if kc == ir.K_AB { return o.maskLocalWrites(n.a, l, ml) && o.maskLocalWrites(n.b, l, ml) }
+    if kc == ir.K_ABC { return o.maskLocalWrites(n.a, l, ml) && o.maskLocalWrites(n.b, l, ml) && o.maskLocalWrites(n.c, l, ml) }
+    if kc == ir.K_CALL {
+        if !o.maskLocalWrites(n.a, l, ml) { return false }
+        if n.b >= 0 {
+            for j in 0..o.u.listLen(n.b) { if !o.maskLocalWrites(o.u.listAt(n.b, j), l, ml) { return false } }
+        }
+        return true
+    }
+    if kc == ir.K_BLOCK {
+        for j in 0..o.u.listLen(n.a) { if !o.maskLocalWrites(o.u.listAt(n.a, j), l, ml) { return false } }
+        return true
+    }
+    if kc == ir.K_CLIT {
+        for j in 0..o.u.listLen(n.b) { if !o.maskLocalWrites(o.u.listAt(n.b, j), l, ml) { return false } }
+        return true
+    }
+    if kc == ir.K_DECL {
+        if !o.maskLocalWrites(n.b, l, ml) { return false }
+        if n.c >= 0 {
+            for j in 0..o.u.listLen(n.c) { if !o.maskLocalWrites(o.u.listAt(n.c, j), l, ml) { return false } }
+        }
+        return true
+    }
+    return o.maskLocalWrites(n.a, l, ml) && o.maskLocalWrites(n.b, l, ml) && o.maskLocalWrites(n.c, l, ml) && o.maskLocalWrites(n.d, l, ml)
+}
+
 // The largest mask c of the writes of local l in the tree x when each is `l = y & c` (c a
 // non-negative constant; 0 when x writes l nowhere), else -1: an increment, a declaration or a
 // write of another shape.
@@ -2273,10 +2435,12 @@ fn (o: &Loops) maskWrites(x: int, l: int): int {
         if o.u.nk(v) != ir.E_BIN || o.u.nodes[v].v != ir.OP_AND { return -1 }
         let va = o.u.nodes[v].a
         let vb = o.u.nodes[v].b
-        if o.u.nk(vb) == ir.E_INT && o.u.nodes[vb].v >= 0 {
-            m = o.u.nodes[vb].v
-        } else if o.u.nk(va) == ir.E_INT && o.u.nodes[va].v >= 0 {
-            m = o.u.nodes[va].v
+        let sa = o.symOf(va)
+        let sb = o.symOf(vb)
+        if sb.l == -1 && sb.c >= 0 {
+            m = sb.c
+        } else if sa.l == -1 && sa.c >= 0 {
+            m = sa.c
         } else {
             return -1
         }
@@ -2458,7 +2622,23 @@ fn (o: mut &Loops) call(x: int) {
         }
         return
     }
-    if rc < RC_ADD { return }
+    if rc == RC_SHL || rc == RC_SHR {
+        let tk = o.u.tk(o.u.nodes[x].ty)
+        let bits = if tk == ir.TY_I64 || tk == ir.TY_U64 { 64 } else if tk == ir.TY_I32 || tk == ir.TY_U32 { 32 } else if tk == ir.TY_U8 { 8 } else { 0 }
+        let bnode = o.arg(x, 1)
+        let b = o.symOf(bnode)
+        let bk = o.u.tk(o.u.nodes[bnode].ty)
+        if bits > 0 && b.l != -2 && ranged(bk) && inKind(b, bk) && o.lo(b, bk) >= 0 && o.hi(b, bk) < bits {
+            o.u.nodes[x].k = ir.E_BIN
+            o.u.nodes[x].a = o.arg(x, 0)
+            o.u.nodes[x].b = bnode
+            o.u.nodes[x].c = o.u.nodes[x].ty
+            o.u.nodes[x].v = if rc == RC_SHL { ir.OP_SHL } else { ir.OP_SHR }
+            o.nWrap += 1
+        }
+        return
+    }
+    if rc < RC_ADD || rc > RC_MUL { return }
     let op = if rc == RC_ADD { ir.OP_ADD } else if rc == RC_SUB { ir.OP_SUB } else { ir.OP_MUL }
     let ki = o.rtk[f]
     let w = o.wfn[op * 4 + ki]

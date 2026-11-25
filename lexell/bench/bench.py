@@ -49,14 +49,16 @@ LXLC = os.environ.get('LXLC') or os.path.join(ROOT, 'lexell', 'compiler', 'out',
 OBO = os.path.join(ROOT, 'archive', 'obo')
 OBO_SRC = os.path.join(OBO, 'bench')
 NAMES = ['fib', 'loop', 'array', 'alloc', 'lists', 'strings', 'trees', 'tokens', 'sieve', 'maps',
-         'nbody', 'interp', 'closures', 'matmul', 'pingpong']
+         'nbody', 'interp', 'closures', 'matmul', 'pingpong',
+         'bitpack', 'btree', 'hashagg', 'varint_csv', 'enum_eval']
 TOKENS_INPUT = os.path.join(ROOT, 'lexell', 'compiler', 'sema.lxl')   # any text file; same for both
 RUST_DIR = os.path.join(HERE, 'rust')
 # maps: the Rust port uses std HashMap (same operations and keys, same checksum),
 # not Lexell's Map layout: Lexell's Map is insertion-ordered with u32 index slots,
 # HashMap is not. So the comparison is of the operations, not the data structure.
 RUST_NAMES = {'fib', 'loop', 'array', 'alloc', 'lists', 'strings', 'trees', 'tokens', 'sieve', 'maps',
-              'nbody', 'interp', 'closures', 'matmul'}
+              'nbody', 'interp', 'closures', 'matmul',
+              'bitpack', 'btree', 'hashagg', 'varint_csv', 'enum_eval'}
 # pingpong has no Rust port (Rust's lightweight tasks are an async runtime crate; the ports use
 # none) but a Go one (goroutines and channels), the Go column.
 GO_DIR = os.path.join(HERE, 'go')

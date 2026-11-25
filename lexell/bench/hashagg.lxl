@@ -1,0 +1,71 @@
+// LexDB-shaped benchmark: columnar open-addressing hash aggregation
+// (GROUP BY k1, k2 -> COUNT, SUM, MIN, MAX; mirrors lexdb_agg in TPC-H Q1/Q3/Q9/Q18).
+
+fn hash2(k1: int, k2: int): int {
+    var h = (k1 *% 2654435761) ^ (k2 *% 2246822519)
+    h = (h ^ (h >> 16)) *% 2246822519
+    h = h ^ (h >> 13)
+    return h & 4611686018427387903
+}
+
+fn main() {
+    let n = 1000000
+    var colK1 = array(n, 0)
+    var colK2 = array(n, 0)
+    var colVal = array(n, 0)
+    var s = 42424242
+    for i in 0..n {
+        s = ((s *% 6364136223846793005) +% 1442695040888963407) & 4611686018427387903
+        colK1[i] = (s >> 16) & 255          // 256 values
+        colK2[i] = (s >> 24) & 63           // 64 values -> up to 16,384 groups
+        colVal[i] = ((s >> 32) & 65535) - 32768
+    }
+
+    let cap = 32768
+    let mask = cap - 1
+    var slots = array(cap, -1)
+    var gK1 = array(cap, 0)
+    var gK2 = array(cap, 0)
+    var gCnt = array(cap, 0)
+    var gSum = array(cap, 0)
+    var gMin = array(cap, 0)
+    var gMax = array(cap, 0)
+
+    var checksum = 0
+    for round in 0..10 {
+        for i in 0..cap { slots[i] = -1 }
+        var ng = 0
+        for i in 0..n {
+            let k1 = colK1[i]
+            let k2 = colK2[i]
+            let v = colVal[i] + round
+            var h = hash2(k1, k2) & mask
+            while true {
+                let g = slots[h]
+                if g < 0 {
+                    slots[h] = ng
+                    gK1[ng] = k1
+                    gK2[ng] = k2
+                    gCnt[ng] = 1
+                    gSum[ng] = v
+                    gMin[ng] = v
+                    gMax[ng] = v
+                    ng += 1
+                    break
+                }
+                if gK1[g] == k1 && gK2[g] == k2 {
+                    gCnt[g] += 1
+                    gSum[g] += v
+                    if v < gMin[g] { gMin[g] = v }
+                    if v > gMax[g] { gMax[g] = v }
+                    break
+                }
+                h = (h + 1) & mask
+            }
+        }
+        for g in 0..ng {
+            checksum += gCnt[g] + gSum[g] + gMin[g] + gMax[g]
+        }
+    }
+    println(checksum)
+}

@@ -145,8 +145,176 @@ pub fn optimize(p: ir.Ir): ir.Ir {
         if o.u.funcs[f].body >= 0 { o.visit(f) }
     }
     o.dropDead()
+    o.elideStaticStrs()
     o.fwdReceivers()
     return replace(mut &o.u, ir.newIr())
+}
+
+// ---------------------------------------------------------------- static string literal drops
+//
+// A local initialized to a const lxl_str global with cap == 0 (a string literal) that is never
+// assigned and never has its address taken stands for that global directly, and rt_str_drop(t)
+// on it is a no-op (cap == 0). Replacing t with the global eliminates both the frame copy and
+// the drop check.
+
+fn (o: &Opt) isStaticStrGlob(g: int, strSid: int): bool {
+    let gl = &o.u.globals[g]
+    if !gl.isConst || o.u.tk(gl.ty) != ir.TY_STRUCT || o.u.tys[gl.ty].sid != strSid { return false }
+    if gl.init < 0 { return true }
+    for j in 0..o.u.listLen(gl.init) {
+        let ei = o.u.listAt(gl.init, j)
+        if o.u.nodes[ei].v == 12 {
+            let a = o.u.nodes[ei].a
+            if o.u.nk(a) != ir.E_INT || o.u.nodes[a].v != 0 { return false }
+        }
+    }
+    return true
+}
+
+fn (o: mut &Opt) elideStaticStrs() {
+    if o.dropF < 0 { return }
+    var strSid = -1
+    for s in 0..o.u.nRtStructs {
+        if o.u.structs[s].name == "lxl_str" { strSid = s }
+    }
+    if strSid < 0 { return }
+    var isSt: []bool = []
+    var anyGlob = false
+    for g in 0..len(o.u.globals) {
+        let ok = o.isStaticStrGlob(g, strSid)
+        append(mut &isSt, ok)
+        if ok { anyGlob = true }
+    }
+    if !anyGlob { return }
+    let nl = len(o.u.locals)
+    var globOf = array(nl, -1)
+    var bad = array(nl, false)
+    var decls = array(nl, 0)
+    var seen: []int = []
+    for f in 0..len(o.u.funcs) {
+        let b = o.u.funcs[f].body
+        if b < 0 { continue }
+        o.ssScan(b, &isSt, mut &globOf, mut &bad, mut &decls, mut &seen)
+        var any = false
+        for l in seen {
+            if !bad[l] && decls[l] == 1 && globOf[l] >= 0 { any = true } else { globOf[l] = -1 }
+        }
+        if any { o.ssRewrite(b, &globOf) }
+        for l in seen {
+            globOf[l] = -1
+            bad[l] = false
+            decls[l] = 0
+        }
+        seen = []
+    }
+}
+
+fn (o: &Opt) ssMark(l: int, bad: &[]bool, decls: &[]int, seen: mut &[]int) {
+    if !bad[l] && decls[l] == 0 { append(seen, l) }
+}
+
+fn (o: &Opt) ssScan(x: int, isSt: &[]bool, globOf: mut &[]int, bad: mut &[]bool, decls: mut &[]int, seen: mut &[]int) {
+    if x < 0 { return }
+    let n = o.u.nodes[x]
+    let k = n.k
+    if k == ir.S_DECL {
+        let l = n.a
+        o.ssMark(l, bad, decls, seen)
+        decls[l] += 1
+        if n.b >= 0 && n.c < 0 && o.u.nk(n.b) == ir.E_GLOBAL && isSt[o.u.nodes[n.b].a] &&
+            o.u.nodes[n.b].ty == o.u.locals[l].ty {
+            globOf[l] = o.u.nodes[n.b].a
+        } else {
+            bad[l] = true
+        }
+        o.ssScan(n.b, isSt, globOf, bad, decls, seen)
+        if n.c >= 0 {
+            for j in 0..o.u.listLen(n.c) { o.ssScan(o.u.listAt(n.c, j), isSt, globOf, bad, decls, seen) }
+        }
+        return
+    }
+    if k == ir.E_ASSIGN || k == ir.E_POSTINC || k == ir.E_ADDR || k == ir.E_DECAY {
+        let r = o.root(n.a)
+        if r >= 0 {
+            o.ssMark(r, bad, decls, seen)
+            bad[r] = true
+        }
+    }
+    let kc = ir.KIDS[k]
+    if kc <= 0 { return }
+    if kc == ir.K_BLOCK {
+        for j in 0..o.u.listLen(n.a) { o.ssScan(o.u.listAt(n.a, j), isSt, globOf, bad, decls, seen) }
+        return
+    }
+    if kc == ir.K_CLIT {
+        for j in 0..o.u.listLen(n.b) { o.ssScan(o.u.listAt(n.b, j), isSt, globOf, bad, decls, seen) }
+        return
+    }
+    if kc == ir.K_CALL {
+        o.ssScan(n.a, isSt, globOf, bad, decls, seen)
+        for j in 0..o.u.listLen(n.b) { o.ssScan(o.u.listAt(n.b, j), isSt, globOf, bad, decls, seen) }
+        return
+    }
+    o.ssScan(n.a, isSt, globOf, bad, decls, seen)
+    if kc == ir.K_AB || kc == ir.K_ABC || kc == ir.K_FOR { o.ssScan(n.b, isSt, globOf, bad, decls, seen) }
+    if kc == ir.K_ABC || kc == ir.K_FOR { o.ssScan(n.c, isSt, globOf, bad, decls, seen) }
+    if kc == ir.K_FOR { o.ssScan(n.d, isSt, globOf, bad, decls, seen) }
+}
+
+fn (o: mut &Opt) ssRewrite(x: int, globOf: &[]int) {
+    if x < 0 { return }
+    let n = o.u.nodes[x]
+    let k = n.k
+    if k == ir.S_DECL {
+        if globOf[n.a] >= 0 {
+            o.u.nodes[x].k = ir.S_EMPTY
+            o.u.nodes[x].a = -1
+            o.u.nodes[x].b = -1
+            return
+        }
+        o.ssRewrite(n.b, globOf)
+        if n.c >= 0 {
+            for j in 0..o.u.listLen(n.c) { o.ssRewrite(o.u.listAt(n.c, j), globOf) }
+        }
+        return
+    }
+    if k == ir.S_EXPR {
+        let e = n.a
+        if o.callee(e) == o.dropF && o.u.listLen(o.u.nodes[e].b) == 1 {
+            let arg = o.u.listAt(o.u.nodes[e].b, 0)
+            if o.u.nk(arg) == ir.E_LOCAL && globOf[o.u.nodes[arg].a] >= 0 {
+                o.u.nodes[x].k = ir.S_EMPTY
+                o.u.nodes[x].a = -1
+                return
+            }
+        }
+        o.ssRewrite(e, globOf)
+        return
+    }
+    if k == ir.E_LOCAL && globOf[n.a] >= 0 {
+        o.u.nodes[x].k = ir.E_GLOBAL
+        o.u.nodes[x].a = globOf[n.a]
+        return
+    }
+    let kc = ir.KIDS[k]
+    if kc <= 0 { return }
+    if kc == ir.K_BLOCK {
+        for j in 0..o.u.listLen(n.a) { o.ssRewrite(o.u.listAt(n.a, j), globOf) }
+        return
+    }
+    if kc == ir.K_CLIT {
+        for j in 0..o.u.listLen(n.b) { o.ssRewrite(o.u.listAt(n.b, j), globOf) }
+        return
+    }
+    if kc == ir.K_CALL {
+        o.ssRewrite(n.a, globOf)
+        for j in 0..o.u.listLen(n.b) { o.ssRewrite(o.u.listAt(n.b, j), globOf) }
+        return
+    }
+    o.ssRewrite(n.a, globOf)
+    if kc == ir.K_AB || kc == ir.K_ABC || kc == ir.K_FOR { o.ssRewrite(n.b, globOf) }
+    if kc == ir.K_ABC || kc == ir.K_FOR { o.ssRewrite(n.c, globOf) }
+    if kc == ir.K_FOR { o.ssRewrite(n.d, globOf) }
 }
 
 // ---------------------------------------------------------------- receiver temporaries

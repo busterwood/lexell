@@ -1,0 +1,181 @@
+// LexDB-shaped benchmark: in-memory B-tree insert (with splits), point lookups, and range scans
+// (mirrors lexdb_store / lexdb_page OLTP index operations).
+
+const MAX_KEYS = 31
+const MID = 15
+
+type Node = record {
+    leaf: bool
+    keys: []int
+    vals: []int
+    kids: []Node
+}
+
+type Split = value record {
+    promoted: bool
+    key: int
+    right: Option[Node]
+}
+
+fn newLeaf(): Node { return Node{leaf: true, keys: [], vals: [], kids: []} }
+
+fn lowerBound(keys: &[int], key: int): int {
+    var lo = 0
+    var hi = len(keys)
+    while lo < hi {
+        let mid = (lo + hi) >> 1
+        if keys[mid] < key {
+            lo = mid + 1
+        } else {
+            hi = mid
+        }
+    }
+    return lo
+}
+
+fn search(node: &Node, key: int): int {
+    var cur = node
+    while true {
+        let i = lowerBound(&cur.keys, key)
+        if cur.leaf {
+            if i < len(cur.keys) && cur.keys[i] == key { return cur.vals[i] }
+            return -1
+        }
+        if i < len(cur.keys) && cur.keys[i] == key {
+            cur = &cur.kids[i + 1]
+        } else {
+            cur = &cur.kids[i]
+        }
+    }
+    return -1
+}
+
+fn rangeSum(node: &Node, lo: int, hi: int): int {
+    let i = lowerBound(&node.keys, lo)
+    var sum = 0
+    if node.leaf {
+        var j = i
+        while j < len(node.keys) && node.keys[j] <= hi {
+            sum += node.vals[j]
+            j += 1
+        }
+        return sum
+    }
+    var j = i
+    while j < len(node.keys) {
+        sum += rangeSum(&node.kids[j], lo, hi)
+        if node.keys[j] > hi { return sum }
+        j += 1
+    }
+    sum += rangeSum(&node.kids[len(node.keys)], lo, hi)
+    return sum
+}
+
+fn insertIntAt(a: mut &[]int, pos: int, v: int) {
+    append(a, 0)
+    var i = len(a) - 1
+    while i > pos {
+        a[i] = a[i - 1]
+        i -= 1
+    }
+    a[pos] = v
+}
+
+fn insertNodeAt(a: mut &[]Node, pos: int, v: Node) {
+    append(a, v)
+    var i = len(a) - 1
+    while i > pos {
+        swap(a, i, i - 1)
+        i -= 1
+    }
+}
+
+fn insertRec(node: mut &Node, key: int, val: int): Split {
+    let pos = lowerBound(&node.keys, key)
+    if node.leaf {
+        if pos < len(node.keys) && node.keys[pos] == key {
+            node.vals[pos] = val
+            return Split{promoted: false, key: 0, right: Option.None}
+        }
+        insertIntAt(mut &node.keys, pos, key)
+        insertIntAt(mut &node.vals, pos, val)
+        if len(node.keys) <= MAX_KEYS {
+            return Split{promoted: false, key: 0, right: Option.None}
+        }
+        var rkeys: []int = []
+        var rvals: []int = []
+        for i in MID..len(node.keys) {
+            append(mut &rkeys, node.keys[i])
+            append(mut &rvals, node.vals[i])
+        }
+        while len(node.keys) > MID {
+            pop(mut &node.keys)
+            pop(mut &node.vals)
+        }
+        let pkey = rkeys[0]
+        return Split{promoted: true, key: pkey, right: Option.Some(Node{leaf: true, keys: rkeys, vals: rvals, kids: []})}
+    }
+    let ci = if pos < len(node.keys) && node.keys[pos] == key { pos + 1 } else { pos }
+    let Split{promoted, key: skey, right} = insertRec(mut &node.kids[ci], key, val)
+    if !promoted { return Split{promoted: false, key: 0, right: Option.None} }
+    let rightNode = match right {
+        Some(rn) { rn }
+        None { newLeaf() }
+    }
+    insertIntAt(mut &node.keys, ci, skey)
+    insertNodeAt(mut &node.kids, ci + 1, rightNode)
+    if len(node.keys) <= MAX_KEYS {
+        return Split{promoted: false, key: 0, right: Option.None}
+    }
+    let pkey = node.keys[MID]
+    var rkeys: []int = []
+    for i in MID + 1..len(node.keys) { append(mut &rkeys, node.keys[i]) }
+    while len(node.keys) > MID { pop(mut &node.keys) }
+    var rkidsRev: []Node = []
+    while len(node.kids) > MID + 1 { append(mut &rkidsRev, pop(mut &node.kids)) }
+    var rkids: []Node = []
+    while len(rkidsRev) > 0 { append(mut &rkids, pop(mut &rkidsRev)) }
+    return Split{promoted: true, key: pkey, right: Option.Some(Node{leaf: false, keys: rkeys, vals: [], kids: rkids})}
+}
+
+fn insertRoot(root: mut &Node, key: int, val: int) {
+    let Split{promoted, key: skey, right} = insertRec(root, key, val)
+    if promoted {
+        let rightNode = match right {
+            Some(rn) { rn }
+            None { newLeaf() }
+        }
+        let oldRoot = replace(root, newLeaf())
+        var kids: []Node = []
+        append(mut &kids, oldRoot)
+        append(mut &kids, rightNode)
+        let _ = replace(root, Node{leaf: false, keys: [skey], vals: [], kids: kids})
+    }
+}
+
+fn main() {
+    let n = 100000
+    var root = newLeaf()
+    var s = 987654321
+    for i in 0..n {
+        s = ((s *% 6364136223846793005) +% 1442695040888963407) & 4611686018427387903
+        let k = (s >> 12) & 1048575
+        insertRoot(mut &root, k, i + 1)
+    }
+
+    var total = 0
+    s = 987654321
+    for round in 0..10 {
+        for i in 0..n {
+            s = ((s *% 6364136223846793005) +% 1442695040888963407) & 4611686018427387903
+            let k = (s >> 12) & 1048575
+            let v = search(&root, k)
+            if v >= 0 { total += v }
+        }
+    }
+    for i in 0..30000 {
+        let lo = (i * 31) & 1048575
+        total += rangeSum(&root, lo, lo + 200)
+    }
+    println(total)
+}

@@ -375,6 +375,363 @@ public class Bench {
         return total + " " + count[0];
     }
 
+    // bitpack
+    static byte[] packCol(long[] vals, int bits) {
+        int n = vals.length;
+        byte[] out = new byte[(n * bits + 7) / 8 + 8];
+        int bitPos = 0;
+        for (int i = 0; i < n; i++) {
+            long v = vals[i];
+            int b = 0;
+            while (b < bits) {
+                int byteIdx = (bitPos + b) >> 3;
+                int bitOff = (bitPos + b) & 7;
+                int take = 8 - bitOff;
+                int rem = bits - b;
+                int k = Math.min(take, rem);
+                long mask = (1L << k) - 1;
+                long chunk = (v >> b) & mask;
+                out[byteIdx] = (byte) ((out[byteIdx] & 0xFFL) | (chunk << bitOff));
+                b += k;
+            }
+            bitPos += bits;
+        }
+        return out;
+    }
+    static void unpackBatch(byte[] buf, int startIdx, int count, int bits, long baseVal, long[] dst) {
+        long mask = (1L << bits) - 1;
+        int bitPos = startIdx * bits;
+        for (int i = 0; i < count; i++) {
+            int byteIdx = bitPos >> 3;
+            int bitOff = bitPos & 7;
+            long w = (buf[byteIdx] & 0xFFL)
+                | ((buf[byteIdx + 1] & 0xFFL) << 8)
+                | ((buf[byteIdx + 2] & 0xFFL) << 16)
+                | ((buf[byteIdx + 3] & 0xFFL) << 24);
+            dst[i] = Math.addExact(baseVal, (w >> bitOff) & mask);
+            bitPos += bits;
+        }
+    }
+    static String bitpackMain() {
+        int n = 1000000, batch = 1024;
+        long[] rawQty = new long[n], rawDisc = new long[n], rawPrice = new long[n];
+        long s = 123456789L;
+        for (int i = 0; i < n; i++) {
+            s = (s * 6364136223846793005L + 1442695040888963407L) & 4611686018427387903L;
+            rawQty[i] = (s >> 16) & 63;
+            rawDisc[i] = (s >> 24) & 15;
+            rawPrice[i] = (s >> 30) & 131071;
+        }
+        byte[] pQty = packCol(rawQty, 6), pDisc = packCol(rawDisc, 4), pPrice = packCol(rawPrice, 17);
+        long[] qty = new long[batch], disc = new long[batch], price = new long[batch];
+        int[] sel = new int[batch];
+        long total = 0;
+        for (long round = 0; round < 60; round++) {
+            long loDisc = 4 + (round & 3), hiDisc = loDisc + 4, maxQty = 30 + (round & 7);
+            int pos = 0;
+            while (pos < n) {
+                int cnt = Math.min(batch, n - pos);
+                unpackBatch(pQty, pos, cnt, 6, 1, qty);
+                unpackBatch(pDisc, pos, cnt, 4, 0, disc);
+                unpackBatch(pPrice, pos, cnt, 17, 90000, price);
+                int nsel = 0;
+                for (int i = 0; i < cnt; i++) {
+                    long d = disc[i];
+                    if (d >= loDisc && d <= hiDisc && qty[i] < maxQty) sel[nsel++] = i;
+                }
+                long acc = 0;
+                for (int j = 0; j < nsel; j++) {
+                    int idx = sel[j];
+                    acc = Math.addExact(acc, Math.multiplyExact(price[idx], disc[idx]));
+                }
+                total = Math.addExact(total, acc);
+                pos += cnt;
+            }
+        }
+        return Long.toString(total);
+    }
+
+    // btree
+    static final int BT_MAX_KEYS = 31, BT_MID = 15;
+    static final class BtNode {
+        boolean leaf;
+        long[] keys = new long[4]; int nkeys = 0;
+        long[] vals = new long[4]; int nvals = 0;
+        BtNode[] kids = new BtNode[0]; int nkids = 0;
+        BtNode(boolean leaf) { this.leaf = leaf; }
+        void insertKey(int pos, long k) {
+            if (nkeys == keys.length) keys = Arrays.copyOf(keys, Math.max(4, keys.length * 2));
+            System.arraycopy(keys, pos, keys, pos + 1, nkeys - pos);
+            keys[pos] = k; nkeys++;
+        }
+        void insertVal(int pos, long v) {
+            if (nvals == vals.length) vals = Arrays.copyOf(vals, Math.max(4, vals.length * 2));
+            System.arraycopy(vals, pos, vals, pos + 1, nvals - pos);
+            vals[pos] = v; nvals++;
+        }
+        void insertKid(int pos, BtNode c) {
+            if (nkids == kids.length) kids = Arrays.copyOf(kids, Math.max(4, kids.length * 2));
+            System.arraycopy(kids, pos, kids, pos + 1, nkids - pos);
+            kids[pos] = c; nkids++;
+        }
+    }
+    static final class BtSplit {
+        final boolean promoted; final long key; final BtNode right;
+        BtSplit(boolean p, long k, BtNode r) { promoted = p; key = k; right = r; }
+    }
+    static final BtSplit NO_SPLIT = new BtSplit(false, 0, null);
+    static int btLowerBound(long[] keys, int n, long key) {
+        int lo = 0, hi = n;
+        while (lo < hi) {
+            int mid = (lo + hi) >> 1;
+            if (keys[mid] < key) lo = mid + 1; else hi = mid;
+        }
+        return lo;
+    }
+    static long btSearch(BtNode cur, long key) {
+        while (true) {
+            int i = btLowerBound(cur.keys, cur.nkeys, key);
+            if (cur.leaf) return (i < cur.nkeys && cur.keys[i] == key) ? cur.vals[i] : -1;
+            cur = (i < cur.nkeys && cur.keys[i] == key) ? cur.kids[i + 1] : cur.kids[i];
+        }
+    }
+    static long btRangeSum(BtNode node, long lo, long hi) {
+        int i = btLowerBound(node.keys, node.nkeys, lo);
+        long sum = 0;
+        if (node.leaf) {
+            for (int j = i; j < node.nkeys && node.keys[j] <= hi; j++) sum = Math.addExact(sum, node.vals[j]);
+            return sum;
+        }
+        for (int j = i; j < node.nkeys; j++) {
+            sum = Math.addExact(sum, btRangeSum(node.kids[j], lo, hi));
+            if (node.keys[j] > hi) return sum;
+        }
+        return Math.addExact(sum, btRangeSum(node.kids[node.nkeys], lo, hi));
+    }
+    static BtSplit btInsertRec(BtNode node, long key, long val) {
+        int pos = btLowerBound(node.keys, node.nkeys, key);
+        if (node.leaf) {
+            if (pos < node.nkeys && node.keys[pos] == key) { node.vals[pos] = val; return NO_SPLIT; }
+            node.insertKey(pos, key);
+            node.insertVal(pos, val);
+            if (node.nkeys <= BT_MAX_KEYS) return NO_SPLIT;
+            BtNode rn = new BtNode(true);
+            int rc = node.nkeys - BT_MID;
+            rn.keys = Arrays.copyOfRange(node.keys, BT_MID, node.nkeys); rn.nkeys = rc;
+            rn.vals = Arrays.copyOfRange(node.vals, BT_MID, node.nvals); rn.nvals = rc;
+            node.nkeys = BT_MID; node.nvals = BT_MID;
+            return new BtSplit(true, rn.keys[0], rn);
+        }
+        int ci = (pos < node.nkeys && node.keys[pos] == key) ? pos + 1 : pos;
+        BtSplit sp = btInsertRec(node.kids[ci], key, val);
+        if (!sp.promoted) return sp;
+        node.insertKey(ci, sp.key);
+        node.insertKid(ci + 1, sp.right);
+        if (node.nkeys <= BT_MAX_KEYS) return NO_SPLIT;
+        long pkey = node.keys[BT_MID];
+        BtNode rn = new BtNode(false);
+        rn.keys = Arrays.copyOfRange(node.keys, BT_MID + 1, node.nkeys); rn.nkeys = rn.keys.length;
+        rn.kids = Arrays.copyOfRange(node.kids, BT_MID + 1, node.nkids); rn.nkids = rn.kids.length;
+        node.nkeys = BT_MID; node.nkids = BT_MID + 1;
+        return new BtSplit(true, pkey, rn);
+    }
+    static String btreeMain() {
+        int n = 100000;
+        BtNode root = new BtNode(true);
+        long s = 987654321L;
+        for (long i = 0; i < n; i++) {
+            s = (s * 6364136223846793005L + 1442695040888963407L) & 4611686018427387903L;
+            long k = (s >> 12) & 1048575;
+            BtSplit sp = btInsertRec(root, k, i + 1);
+            if (sp.promoted) {
+                BtNode nr = new BtNode(false);
+                nr.insertKey(0, sp.key);
+                nr.insertKid(0, root);
+                nr.insertKid(1, sp.right);
+                root = nr;
+            }
+        }
+        long total = 0;
+        s = 987654321L;
+        for (int round = 0; round < 10; round++) {
+            for (int i = 0; i < n; i++) {
+                s = (s * 6364136223846793005L + 1442695040888963407L) & 4611686018427387903L;
+                long v = btSearch(root, (s >> 12) & 1048575);
+                if (v >= 0) total = Math.addExact(total, v);
+            }
+        }
+        for (long i = 0; i < 30000; i++) {
+            long lo = (i * 31) & 1048575;
+            total = Math.addExact(total, btRangeSum(root, lo, lo + 200));
+        }
+        return Long.toString(total);
+    }
+
+    // hashagg
+    static long hashaggHash2(long k1, long k2) {
+        long h = (k1 * 2654435761L) ^ (k2 * 2246822519L);
+        h = (h ^ (h >> 16)) * 2246822519L;
+        h = h ^ (h >> 13);
+        return h & 4611686018427387903L;
+    }
+    static String hashaggMain() {
+        int n = 1000000, cap = 32768, mask = cap - 1;
+        long[] colK1 = new long[n], colK2 = new long[n], colVal = new long[n];
+        long s = 42424242L;
+        for (int i = 0; i < n; i++) {
+            s = (s * 6364136223846793005L + 1442695040888963407L) & 4611686018427387903L;
+            colK1[i] = (s >> 16) & 255;
+            colK2[i] = (s >> 24) & 63;
+            colVal[i] = ((s >> 32) & 65535) - 32768;
+        }
+        int[] slots = new int[cap];
+        long[] gK1 = new long[cap], gK2 = new long[cap], gCnt = new long[cap], gSum = new long[cap], gMin = new long[cap], gMax = new long[cap];
+        long checksum = 0;
+        for (long round = 0; round < 10; round++) {
+            Arrays.fill(slots, -1);
+            int ng = 0;
+            for (int i = 0; i < n; i++) {
+                long k1 = colK1[i], k2 = colK2[i], v = Math.addExact(colVal[i], round);
+                int h = (int) (hashaggHash2(k1, k2) & mask);
+                while (true) {
+                    int g = slots[h];
+                    if (g < 0) {
+                        slots[h] = ng;
+                        gK1[ng] = k1; gK2[ng] = k2; gCnt[ng] = 1; gSum[ng] = v; gMin[ng] = v; gMax[ng] = v;
+                        ng++;
+                        break;
+                    }
+                    if (gK1[g] == k1 && gK2[g] == k2) {
+                        gCnt[g] = Math.addExact(gCnt[g], 1L);
+                        gSum[g] = Math.addExact(gSum[g], v);
+                        if (v < gMin[g]) gMin[g] = v;
+                        if (v > gMax[g]) gMax[g] = v;
+                        break;
+                    }
+                    h = (h + 1) & mask;
+                }
+            }
+            for (int g = 0; g < ng; g++) {
+                checksum = Math.addExact(checksum, Math.addExact(Math.addExact(gCnt[g], gSum[g]), Math.addExact(gMin[g], gMax[g])));
+            }
+        }
+        return Long.toString(checksum);
+    }
+
+    // varint_csv
+    static final class ByteBuf {
+        byte[] a = new byte[16]; int len = 0;
+        void push(byte b) {
+            if (len == a.length) a = Arrays.copyOf(a, a.length * 2);
+            a[len++] = b;
+        }
+    }
+    static void putVarint(ByteBuf out, long v) {
+        while (v >= 128) { out.push((byte) ((v & 127) | 128)); v >>= 7; }
+        out.push((byte) v);
+    }
+    static long parseCsvInt(byte[] buf, int start, int end) {
+        int i = start; boolean neg = false;
+        if (i < end && buf[i] == '-') { neg = true; i++; }
+        long acc = 0;
+        while (i < end) { acc = Math.addExact(Math.multiplyExact(acc, 10L), (buf[i++] - '0')); }
+        return neg ? -acc : acc;
+    }
+    static void appendCsvInt(ByteBuf out, long v) {
+        if (v < 0) { out.push((byte) '-'); v = -v; }
+        if (v == 0) { out.push((byte) '0'); return; }
+        byte[] tmp = new byte[24]; int k = 0;
+        while (v > 0) { tmp[k++] = (byte) ('0' + (v % 10)); v /= 10; }
+        while (k > 0) out.push(tmp[--k]);
+    }
+    static byte[] buildCsv(int rows) {
+        ByteBuf buf = new ByteBuf();
+        byte[] codes = "ABCDEFGHIJKLMNOP".getBytes();
+        long s = 7777777L;
+        for (int i = 0; i < rows; i++) {
+            s = (s * 6364136223846793005L + 1442695040888963407L) & 4611686018427387903L;
+            appendCsvInt(buf, i + 1); buf.push((byte) '|');
+            appendCsvInt(buf, ((s >> 16) & 63) + 1); buf.push((byte) '|');
+            appendCsvInt(buf, ((s >> 24) & 65535) + 1000); buf.push((byte) '|');
+            int c1 = (int) ((s >> 40) & 15), c2 = (int) ((s >> 44) & 15);
+            buf.push(codes[c1]); buf.push(codes[c2]); buf.push(codes[(c1 + c2) & 15]);
+            buf.push((byte) '\n');
+        }
+        return Arrays.copyOf(buf.a, buf.len);
+    }
+    static String varintCsvMain() {
+        byte[] csv = buildCsv(120000);
+        int n = csv.length;
+        long total = 0;
+        for (long round = 0; round < 25; round++) {
+            ByteBuf out = new ByteBuf();
+            int pos = 0; long rowHash = 0;
+            while (pos < n) {
+                int f0 = pos; while (csv[pos] != '|') pos++;
+                long id = parseCsvInt(csv, f0, pos++);
+                int f1 = pos; while (csv[pos] != '|') pos++;
+                long qty = parseCsvInt(csv, f1, pos++);
+                int f2 = pos; while (csv[pos] != '|') pos++;
+                long price = parseCsvInt(csv, f2, pos++);
+                long codeH = 0;
+                while (csv[pos] != '\n') { codeH = Math.addExact(Math.multiplyExact(codeH, 31L), csv[pos++] & 0xFFL); }
+                pos++;
+                putVarint(out, id); putVarint(out, qty); putVarint(out, price);
+                rowHash = Math.addExact(rowHash, codeH);
+            }
+            long sumB = 0;
+            for (int i = 0; i < out.len; i++) sumB = Math.addExact(sumB, out.a[i] & 0xFFL);
+            total = Math.addExact(total, Math.addExact(Math.addExact(out.len, sumB), Math.addExact(rowHash, round)));
+        }
+        return Long.toString(total);
+    }
+
+    // enum_eval
+    static final int E_COL = 0, E_LIT = 1, E_ADD = 2, E_SUB = 3, E_MUL = 4, E_LT = 5, E_AND = 6, E_IF = 7;
+    static final class Expr {
+        final int tag; final long v; final Expr a, b, c;
+        Expr(int tag, long v, Expr a, Expr b, Expr c) { this.tag = tag; this.v = v; this.a = a; this.b = b; this.c = c; }
+    }
+    static long evalRow(Expr e, long[] c0, long[] c1, long[] c2, long[] c3, int row) {
+        switch (e.tag) {
+            case E_COL: return e.v == 0 ? c0[row] : e.v == 1 ? c1[row] : e.v == 2 ? c2[row] : c3[row];
+            case E_LIT: return e.v;
+            case E_ADD: return Math.addExact(evalRow(e.a, c0, c1, c2, c3, row), evalRow(e.b, c0, c1, c2, c3, row));
+            case E_SUB: return Math.subtractExact(evalRow(e.a, c0, c1, c2, c3, row), evalRow(e.b, c0, c1, c2, c3, row));
+            case E_MUL: return Math.multiplyExact(evalRow(e.a, c0, c1, c2, c3, row), evalRow(e.b, c0, c1, c2, c3, row));
+            case E_LT: return evalRow(e.a, c0, c1, c2, c3, row) < evalRow(e.b, c0, c1, c2, c3, row) ? 1 : 0;
+            case E_AND: return evalRow(e.a, c0, c1, c2, c3, row) == 0 ? 0 : (evalRow(e.b, c0, c1, c2, c3, row) != 0 ? 1 : 0);
+            case E_IF: return evalRow(e.a, c0, c1, c2, c3, row) != 0 ? evalRow(e.b, c0, c1, c2, c3, row) : evalRow(e.c, c0, c1, c2, c3, row);
+            default: throw new AssertionError();
+        }
+    }
+    static String enumEvalMain() {
+        Expr expr = new Expr(E_IF, 0,
+            new Expr(E_AND, 0,
+                new Expr(E_LT, 0, new Expr(E_COL, 0, null, null, null), new Expr(E_LIT, 25, null, null, null), null),
+                new Expr(E_LT, 0, new Expr(E_COL, 1, null, null, null), new Expr(E_LIT, 8, null, null, null), null), null),
+            new Expr(E_MUL, 0, new Expr(E_COL, 2, null, null, null),
+                new Expr(E_SUB, 0, new Expr(E_LIT, 100, null, null, null), new Expr(E_COL, 1, null, null, null), null), null),
+            new Expr(E_ADD, 0,
+                new Expr(E_MUL, 0, new Expr(E_COL, 2, null, null, null),
+                    new Expr(E_SUB, 0, new Expr(E_LIT, 100, null, null, null), new Expr(E_COL, 3, null, null, null), null), null),
+                new Expr(E_COL, 0, null, null, null), null));
+        int n = 500000;
+        long[] c0 = new long[n], c1 = new long[n], c2 = new long[n], c3 = new long[n];
+        long s = 135792468L;
+        for (int i = 0; i < n; i++) {
+            s = (s * 6364136223846793005L + 1442695040888963407L) & 4611686018427387903L;
+            c0[i] = (s >> 16) & 63; c1[i] = (s >> 22) & 15; c2[i] = ((s >> 26) & 4095) + 100; c3[i] = (s >> 38) & 15;
+        }
+        long total = 0;
+        for (long round = 0; round < 8; round++) {
+            long acc = 0;
+            for (int i = 0; i < n; i++) acc = Math.addExact(acc, evalRow(expr, c0, c1, c2, c3, i));
+            total = Math.addExact(total, Math.addExact(acc, round));
+        }
+        return Long.toString(total);
+    }
+
     static String run(String name) {
         switch (name) {
             case "fib": return fibMain();
@@ -392,6 +749,11 @@ public class Bench {
             case "closures": return closuresMain();
             case "matmul": return matmulMain();
             case "pingpong": return pingpongMain();
+            case "bitpack": return bitpackMain();
+            case "btree": return btreeMain();
+            case "hashagg": return hashaggMain();
+            case "varint_csv": return varintCsvMain();
+            case "enum_eval": return enumEvalMain();
         }
         throw new IllegalArgumentException(name);
     }
