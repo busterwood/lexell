@@ -1,0 +1,242 @@
+// Materialized views (Stage 4): cascading MV-on-MV rollup DAGs (base -> hourly -> daily -> region,
+// including sketch _DETAIL -> _AGG cascading rollups, ON COMMIT cascades, COMPLETE refresh cascades,
+// and DROP CASCADE) + automatic cost-based query rewrite (exact match, HAVING, predicate subsumption,
+// coarser GROUP BY / global / AVG / sketch rollup re-aggregation, join rewrite, staleness & uncommitted
+// safety guards, query_rewrite_enabled toggle, EXPLAIN verification, and reopen persistence).
+// expect: dag_init_diff: 0|0|0|ok
+// expect: dag_dml_diff: 0|0|0|ok
+// expect: dag_commit_diff: 0|0
+// expect: dag_drop_guard: ERR:2BP01|DROP MATERIALIZED VIEW|0
+// expect: rw_exact: ok|0|0
+// expect: rw_subsumption: ok|not_rw|0
+// expect: rw_rollup_group: ok|0
+// expect: rw_rollup_global: ok|0
+// expect: rw_rollup_sketch: ok|ok
+// expect: rw_join: ok|0
+// expect: rw_safety_stale: stale_not_rw|fresh_rw
+// expect: rw_safety_oqc: oqc_rw|0
+// expect: rw_safety_uncommitted: uncomm_not_rw|4|comm_rw|4
+// expect: rw_session_toggle: on|off|off_not_rw|on|on_rw
+// expect: reopen_ok: 0|ok|0
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return "ERR:" + e.state }
+    }
+}
+
+fn qInt(s: mut &lexdb_exec.Session, sql: &str): int {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows && len(r.rows) > 0 && len(r.rows[0]) > 0 {
+                match r.rows[0][0] {
+                    lexdb_sql.Val.Int(i) { return i }
+                    else { return -999999 }
+                }
+            }
+            return -999999
+        }
+        Err(_) { return -999999 }
+    }
+}
+
+fn diffCount(s: mut &lexdb_exec.Session, sqlA: &str, sqlB: &str): int {
+    let sql = "SELECT count(*) FROM ((" + sqlA + " EXCEPT " + sqlB + ") UNION ALL (" + sqlB + " EXCEPT " + sqlA + ")) d"
+    return qInt(s, &sql)
+}
+
+fn explainHas(s: mut &lexdb_exec.Session, sql: &str, needle: &str): bool {
+    let plan = q(s, &("EXPLAIN " + sql))
+    return strings.contains(&plan, needle)
+}
+
+// Verifies query returns identical results with query_rewrite_enabled = on vs off (in both batch off & on).
+fn rwMatch(s: mut &lexdb_exec.Session, sql: &str): int {
+    let _1 = q(s, "SET query_rewrite_enabled = off; SET lexdb_batch = on")
+    let base = q(s, sql)
+    let _2 = q(s, "SET query_rewrite_enabled = on; SET lexdb_batch = off")
+    let rwOff = q(s, sql)
+    let _3 = q(s, "SET query_rewrite_enabled = on; SET lexdb_batch = on")
+    let rwOn = q(s, sql)
+    if base == rwOff && base == rwOn { return 0 }
+    return 1
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 32 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}
+}
+
+fn runTest(st: lexdb_store.Store, reopen: bool): int {
+    if !reopen { lexdb_exec.bootstrap(&st).unwrap() }
+    var s = lexdb_exec.newSession(st.share())
+    if reopen {
+        // Verify cascading DAG and query rewrite persist across reopen!
+        let _1 = q(mut &s, "INSERT INTO rw_sales VALUES (99, 'a', 'us', 999, 100, true)")
+        let d1 = diffCount(mut &s, "SELECT dept, region, cnt, tot FROM mv_dr", "SELECT dept, region, count(*), sum(amt) FROM rw_sales GROUP BY dept, region")
+        let rw = if explainHas(mut &s, "SELECT dept, sum(amt) FROM rw_sales GROUP BY dept", "mv_dr") { "ok" } else { "no" }
+        let m = rwMatch(mut &s, "SELECT dept, sum(amt) FROM rw_sales GROUP BY dept ORDER BY dept")
+        println("reopen_ok: " + d1.toStr() + "|" + rw + "|" + m.toStr())
+        return 0
+    }
+
+    // ---- PART 4A: 3-Level Cascading MV-on-MV Rollup DAG (events -> mv_hourly -> mv_daily -> mv_region)
+    let _e0 = q(mut &s, "CREATE TABLE events (id int PRIMARY KEY, dy int, hr int, region text, uid int, amt int, lat double precision)")
+    let _e1 = q(mut &s, "INSERT INTO events VALUES (1,1,0,'us',10,100,10.0),(2,1,0,'us',20,200,20.0),(3,1,1,'us',20,300,30.0),(4,1,1,'eu',30,400,40.0),(5,2,0,'us',40,500,50.0)")
+    let _h1 = q(mut &s, "CREATE MATERIALIZED VIEW mv_hourly WITH (refresh = 'fast_on_statement') AS SELECT dy, hr, region, count(*) AS cnt, sum(amt) AS tot, min(amt) AS lo, max(amt) AS hi, approx_count_distinct_detail(uid) AS u_hll, approx_percentile_detail(lat) AS l_td FROM events GROUP BY dy, hr, region")
+    let _d1 = q(mut &s, "CREATE MATERIALIZED VIEW mv_daily WITH (refresh = 'fast_on_statement') AS SELECT dy, region, sum(cnt) AS cnt, sum(tot) AS tot, min(lo) AS lo, max(hi) AS hi, approx_count_distinct_agg(u_hll) AS u_hll, approx_percentile_agg(l_td) AS l_td FROM mv_hourly GROUP BY dy, region")
+    let _r1 = q(mut &s, "CREATE MATERIALIZED VIEW mv_region WITH (refresh = 'fast_on_statement') AS SELECT region, sum(cnt) AS cnt, sum(tot) AS tot FROM mv_daily GROUP BY region")
+
+    let dh0 = diffCount(mut &s, "SELECT dy, hr, region, cnt, tot, lo, hi FROM mv_hourly", "SELECT dy, hr, region, count(*), sum(amt), min(amt), max(amt) FROM events GROUP BY dy, hr, region")
+    let dd0 = diffCount(mut &s, "SELECT dy, region, cnt, tot, lo, hi FROM mv_daily", "SELECT dy, region, count(*), sum(amt), min(amt), max(amt) FROM events GROUP BY dy, region")
+    let dr0 = diffCount(mut &s, "SELECT region, cnt, tot FROM mv_region", "SELECT region, count(*), sum(amt) FROM events GROUP BY region")
+    let du0 = qInt(mut &s, "SELECT to_approx_count_distinct(u_hll) FROM mv_daily WHERE dy = 1 AND region = 'us'")
+    println("dag_init_diff: " + dh0.toStr() + "|" + dd0.toStr() + "|" + dr0.toStr() + "|" + (if du0 == 2 { "ok" } else { "bad:" + du0.toStr() }))
+
+    // DML on base table cascades through all 3 levels: INSERT, UPDATE, and DELETE emptying an hour!
+    let _e2 = q(mut &s, "INSERT INTO events VALUES (6, 1, 0, 'us', 50, 50, 5.0), (7, 2, 1, 'eu', 60, 250, 60.0)")
+    let _e3 = q(mut &s, "UPDATE events SET amt = 350 WHERE id = 3")
+    let _e4 = q(mut &s, "DELETE FROM events WHERE id = 4")    // empties (dy=1, hr=1, region='eu') in mv_hourly AND (dy=1, region='eu') in mv_daily!
+    let dh1 = diffCount(mut &s, "SELECT dy, hr, region, cnt, tot, lo, hi FROM mv_hourly", "SELECT dy, hr, region, count(*), sum(amt), min(amt), max(amt) FROM events GROUP BY dy, hr, region")
+    let dd1 = diffCount(mut &s, "SELECT dy, region, cnt, tot, lo, hi FROM mv_daily", "SELECT dy, region, count(*), sum(amt), min(amt), max(amt) FROM events GROUP BY dy, region")
+    let dr1 = diffCount(mut &s, "SELECT region, cnt, tot FROM mv_region", "SELECT region, count(*), sum(amt) FROM events GROUP BY region")
+    let du1 = qInt(mut &s, "SELECT to_approx_count_distinct(u_hll) FROM mv_daily WHERE dy = 1 AND region = 'us'")
+    println("dag_dml_diff: " + dh1.toStr() + "|" + dd1.toStr() + "|" + dr1.toStr() + "|" + (if du1 == 3 { "ok" } else { "bad:" + du1.toStr() }))
+
+    // ON COMMIT cascading DAG (events -> mv_c1 -> mv_c2)
+    let _c1 = q(mut &s, "CREATE MATERIALIZED VIEW mv_c1 WITH (refresh = 'fast_on_commit') AS SELECT dy, region, count(*) AS cnt, sum(amt) AS tot FROM events GROUP BY dy, region")
+    let _c2 = q(mut &s, "CREATE MATERIALIZED VIEW mv_c2 WITH (refresh = 'fast_on_commit') AS SELECT region, sum(cnt) AS cnt, sum(tot) AS tot FROM mv_c1 GROUP BY region")
+    let _c3 = q(mut &s, "BEGIN; INSERT INTO events VALUES (8, 2, 2, 'ap', 70, 888, 70.0); COMMIT")
+    let dc1 = diffCount(mut &s, "SELECT dy, region, cnt, tot FROM mv_c1", "SELECT dy, region, count(*), sum(amt) FROM events GROUP BY dy, region")
+    let dc2 = diffCount(mut &s, "SELECT region, cnt, tot FROM mv_c2", "SELECT region, count(*), sum(amt) FROM events GROUP BY region")
+    println("dag_commit_diff: " + dc1.toStr() + "|" + dc2.toStr())
+
+    // DROP MATERIALIZED VIEW guard & CASCADE on MV-on-MV
+    let dropErr = q(mut &s, "DROP MATERIALIZED VIEW mv_hourly")
+    let dropCas = q(mut &s, "DROP MATERIALIZED VIEW mv_hourly CASCADE")
+    let leftCnt = qInt(mut &s, "SELECT count(*) FROM pg_matviews WHERE matviewname IN ('mv_hourly', 'mv_daily', 'mv_region')")
+    println("dag_drop_guard: " + dropErr + "|" + dropCas + "|" + leftCnt.toStr())
+
+    // ---- PART 4B: Automatic Cost-Based Query Rewrite (ENABLE QUERY REWRITE)
+    let _s0 = q(mut &s, "CREATE TABLE rw_dims (id int PRIMARY KEY, name text)")
+    let _s1 = q(mut &s, "INSERT INTO rw_dims VALUES (1, 'Alpha'), (2, 'Beta')")
+    let _s2 = q(mut &s, "CREATE TABLE rw_sales (id int PRIMARY KEY, dept text, region text, uid int, amt int, paid boolean)")
+    let _s3 = q(mut &s, "INSERT INTO rw_sales VALUES (1,'a','us',10,100,true),(2,'a','us',20,200,true),(3,'a','eu',20,300,false),(4,'b','us',30,50,true),(5,'b','eu',40,150,true)")
+
+    // MV 1: grouped by (dept, region) with full rollup + sketch detail columns + ENABLE QUERY REWRITE!
+    let _mvDr = q(mut &s, "CREATE MATERIALIZED VIEW mv_dr WITH (refresh = 'fast_on_statement', query_rewrite = true) AS SELECT dept, region, count(*) AS cnt, count(amt) AS cnt_amt, sum(amt) AS tot, min(amt) AS lo, max(amt) AS hi, approx_count_distinct_detail(uid) AS u_hll, approx_percentile_detail(amt) AS a_td FROM rw_sales GROUP BY dept, region")
+
+    // Class 1: Exact match + HAVING + ORDER BY
+    let exSql = "SELECT dept, region, count(*) AS c, sum(amt) AS s FROM rw_sales GROUP BY dept, region HAVING sum(amt) > 100 ORDER BY dept, region"
+    let exRw = if explainHas(mut &s, exSql, "mv_dr") { "ok" } else { "no" }
+    let exM1 = rwMatch(mut &s, exSql)
+    let exM2 = rwMatch(mut &s, "SELECT dept, region, min(amt) AS mn, max(amt) AS mx FROM rw_sales GROUP BY dept, region ORDER BY dept, region")
+    println("rw_exact: " + exRw + "|" + exM1.toStr() + "|" + exM2.toStr())
+
+    // Class 2: Predicate subsumption (MV with WHERE paid = true)
+    let _mvPaid = q(mut &s, "CREATE MATERIALIZED VIEW mv_paid WITH (refresh = 'fast_on_statement', query_rewrite = true) AS SELECT id, dept, region, amt FROM rw_sales WHERE paid = true")
+    let subSql = "SELECT id, dept, amt FROM rw_sales WHERE paid = true AND dept = 'a' ORDER BY id"
+    let noSubSql = "SELECT id, dept, amt FROM rw_sales WHERE dept = 'a' ORDER BY id"
+    let subHit = if explainHas(mut &s, subSql, "mv_paid") { "ok" } else { "no" }
+    let subMiss = if !explainHas(mut &s, noSubSql, "mv_paid") { "not_rw" } else { "bad_rw" }
+    let subM = rwMatch(mut &s, subSql)
+    println("rw_subsumption: " + subHit + "|" + subMiss + "|" + subM.toStr())
+
+    // Class 3a: Coarser GROUP BY rollup (dept, region -> dept) including COUNT, SUM, AVG, MIN, MAX + residual WHERE!
+    let rolGrpSql = "SELECT dept, count(*) AS c, sum(amt) AS s, avg(amt) AS a, min(amt) AS mn, max(amt) AS mx FROM rw_sales WHERE region = 'us' GROUP BY dept ORDER BY dept"
+    let rolGrpHit = if explainHas(mut &s, rolGrpSql, "mv_dr") { "ok" } else { "no" }
+    let rolGrpM = rwMatch(mut &s, rolGrpSql)
+    println("rw_rollup_group: " + rolGrpHit + "|" + rolGrpM.toStr())
+
+    // Class 3b: Global aggregate rollup (dept, region -> global)
+    let rolGlobSql = "SELECT count(*) AS c, sum(amt) AS s, min(amt) AS mn, max(amt) AS mx FROM rw_sales"
+    let rolGlobHit = if explainHas(mut &s, rolGlobSql, "mv_dr") { "ok" } else { "no" }
+    let rolGlobM = rwMatch(mut &s, rolGlobSql)
+    println("rw_rollup_global: " + rolGlobHit + "|" + rolGlobM.toStr())
+
+    // Class 3c: Sketch rollup rewrite (APPROX_COUNT_DISTINCT & APPROX_PERCENTILE merged from MV's _DETAIL columns!)
+    let skSql = "SELECT dept, approx_count_distinct(uid) AS du, approx_percentile(amt, 0.5) AS p50 FROM rw_sales GROUP BY dept ORDER BY dept"
+    let skHit = if explainHas(mut &s, skSql, "mv_dr") { "ok" } else { "no" }
+    let skRes = q(mut &s, skSql)
+    // dept 'a' has uids {10, 20} -> 2 distinct, amts {100,200,300} -> p50=200; dept 'b' has uids {30,40} -> 2 distinct, amts {50,150} -> p50=100
+    let skOk = if skRes == "a|2|200;b|2|100" { "ok" } else { "bad:" + skRes }
+    println("rw_rollup_sketch: " + skHit + "|" + skOk)
+
+    // Join MV rewrite (with reversed ON condition d.id = f.did vs f.did = d.id!)
+    let _f0 = q(mut &s, "CREATE TABLE rw_fact (id int PRIMARY KEY, did int, v int)")
+    let _f1 = q(mut &s, "INSERT INTO rw_fact VALUES (1, 1, 10), (2, 1, 20), (3, 2, 50)")
+    let _mvJ = q(mut &s, "CREATE MATERIALIZED VIEW mv_join WITH (refresh = 'fast_on_statement', query_rewrite = true) AS SELECT d.name, count(*) AS c, sum(f.v) AS tot FROM rw_fact f JOIN rw_dims d ON f.did = d.id GROUP BY d.name")
+    let jSql = "SELECT d.name, sum(f.v) AS tot FROM rw_dims d JOIN rw_fact f ON d.id = f.did GROUP BY d.name ORDER BY d.name"
+    let jHit = if explainHas(mut &s, jSql, "mv_join") { "ok" } else { "no" }
+    let jM = rwMatch(mut &s, jSql)
+    println("rw_join: " + jHit + "|" + jM.toStr())
+
+    // Safety 1: Stale ON DEMAND MV (without OQC) is NOT rewritten until refreshed!
+    let _st0 = q(mut &s, "CREATE TABLE st_t (id int PRIMARY KEY, g text, v int)")
+    let _st1 = q(mut &s, "INSERT INTO st_t VALUES (1, 'x', 10), (2, 'x', 20)")
+    let _stMv = q(mut &s, "CREATE MATERIALIZED VIEW mv_stale REFRESH FAST ON DEMAND ENABLE QUERY REWRITE AS SELECT g, sum(v) AS tot FROM st_t GROUP BY g")
+    let _stIns = q(mut &s, "INSERT INTO st_t VALUES (3, 'x', 30)")
+    let stNotRw = if !explainHas(mut &s, "SELECT g, sum(v) FROM st_t GROUP BY g", "mv_stale") { "stale_not_rw" } else { "bad_stale_rw" }
+    let _stRef = q(mut &s, "REFRESH MATERIALIZED VIEW mv_stale")
+    let stNowRw = if explainHas(mut &s, "SELECT g, sum(v) FROM st_t GROUP BY g", "mv_stale") { "fresh_rw" } else { "bad_no_rw" }
+    println("rw_safety_stale: " + stNotRw + "|" + stNowRw)
+
+    // Safety 2: ON DEMAND ENABLE ON QUERY COMPUTATION ENABLE QUERY REWRITE IS rewritten even with pending deltas!
+    let _oq0 = q(mut &s, "CREATE TABLE oq_t (id int PRIMARY KEY, g text, v int)")
+    let _oq1 = q(mut &s, "INSERT INTO oq_t VALUES (1, 'x', 10)")
+    let _oqMv = q(mut &s, "CREATE MATERIALIZED VIEW mv_oq_rw REFRESH FAST ON DEMAND ENABLE ON QUERY COMPUTATION ENABLE QUERY REWRITE AS SELECT g, count(*) AS c, sum(v) AS tot FROM oq_t GROUP BY g")
+    let _oqIns = q(mut &s, "INSERT INTO oq_t VALUES (2, 'x', 25)")
+    let oqHit = if explainHas(mut &s, "SELECT g, sum(v) FROM oq_t GROUP BY g", "mv_oq_rw") { "oqc_rw" } else { "no" }
+    let oqM = rwMatch(mut &s, "SELECT g, sum(v) FROM oq_t GROUP BY g")
+    println("rw_safety_oqc: " + oqHit + "|" + oqM.toStr())
+
+    // Safety 3: Uncommitted ON COMMIT MV is NOT rewritten inside writer's own uncommitted txn, then rewrites after COMMIT!
+    let _oc0 = q(mut &s, "CREATE TABLE oc_t (id int PRIMARY KEY, g text, v int)")
+    let _oc1 = q(mut &s, "INSERT INTO oc_t VALUES (1, 'x', 10), (2, 'x', 20), (3, 'x', 30)")
+    let _ocMv = q(mut &s, "CREATE MATERIALIZED VIEW mv_oc_rw WITH (refresh = 'fast_on_commit', query_rewrite = true) AS SELECT g, count(*) AS c FROM oc_t GROUP BY g")
+    let _ocBeg = q(mut &s, "BEGIN; INSERT INTO oc_t VALUES (4, 'x', 40)")
+    let ocNotRw = if !explainHas(mut &s, "SELECT g, count(*) FROM oc_t GROUP BY g", "mv_oc_rw") { "uncomm_not_rw" } else { "bad_uncomm_rw" }
+    let ocValUncomm = qInt(mut &s, "SELECT count(*) FROM oc_t WHERE g = 'x'")
+    let _ocCom = q(mut &s, "COMMIT")
+    let ocNowRw = if explainHas(mut &s, "SELECT g, count(*) FROM oc_t GROUP BY g", "mv_oc_rw") { "comm_rw" } else { "bad_no_rw" }
+    let ocValComm = qInt(mut &s, "SELECT count(*) FROM oc_t WHERE g = 'x'")
+    println("rw_safety_uncommitted: " + ocNotRw + "|" + ocValUncomm.toStr() + "|" + ocNowRw + "|" + ocValComm.toStr())
+
+    // Session toggle SET / SHOW query_rewrite_enabled
+    let sh1 = q(mut &s, "SHOW query_rewrite_enabled")
+    let _off = q(mut &s, "SET query_rewrite_enabled = off")
+    let sh2 = q(mut &s, "SHOW query_rewrite_enabled")
+    let offNoRw = if !explainHas(mut &s, rolGrpSql, "mv_dr") { "off_not_rw" } else { "bad" }
+    let _on = q(mut &s, "SET query_rewrite_enabled = on")
+    let sh3 = q(mut &s, "SHOW query_rewrite_enabled")
+    let onRw = if explainHas(mut &s, rolGrpSql, "mv_dr") { "on_rw" } else { "bad" }
+    println("rw_session_toggle: " + sh1 + "|" + sh2 + "|" + offNoRw + "|" + sh3 + "|" + onRw)
+
+    return 0
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(203)
+    lexdb_store.run(fs.share(), opts(), fn(st: lexdb_store.Store): int { return runTest(st, false) }).unwrap()
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int { return runTest(st, true) }).unwrap()
+}

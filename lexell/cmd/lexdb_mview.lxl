@@ -436,11 +436,13 @@ pub const AGG_HLL = 14
 pub const AGG_HLL_DETAIL = 15
 pub const AGG_TDIGEST = 16
 pub const AGG_TDIGEST_DETAIL = 17
+pub const AGG_HLL_AGG = 18
+pub const AGG_TDIGEST_AGG = 19
 
 fn isVarAgg(ak: int): bool { return ak >= AGG_VAR_POP && ak <= AGG_STDDEV_SAMP }
-fn isHllAgg(ak: int): bool { return ak == AGG_HLL || ak == AGG_HLL_DETAIL }
-fn isTdAgg(ak: int): bool { return ak == AGG_TDIGEST || ak == AGG_TDIGEST_DETAIL }
-fn isSketchAgg(ak: int): bool { return ak >= AGG_HLL && ak <= AGG_TDIGEST_DETAIL }
+fn isHllAgg(ak: int): bool { return ak == AGG_HLL || ak == AGG_HLL_DETAIL || ak == AGG_HLL_AGG }
+fn isTdAgg(ak: int): bool { return ak == AGG_TDIGEST || ak == AGG_TDIGEST_DETAIL || ak == AGG_TDIGEST_AGG }
+fn isSketchAgg(ak: int): bool { return ak >= AGG_HLL && ak <= AGG_TDIGEST_AGG }
 
 fn varFname(ak: int): str {
     if ak == AGG_VAR_POP { return "var_pop" }
@@ -708,7 +710,9 @@ fn parseFastAgg(x: &Expr): FastAggRes {
                     "max" { AGG_MAX }
                     "approx_count_distinct" { AGG_HLL }
                     "approx_count_distinct_detail" { AGG_HLL_DETAIL }
+                    "approx_count_distinct_agg" { AGG_HLL_AGG }
                     "approx_percentile_detail" { AGG_TDIGEST_DETAIL }
+                    "approx_percentile_agg" { AGG_TDIGEST_AGG }
                     else { AGG_NONE }
                 }
                 if k != AGG_NONE {
@@ -827,7 +831,6 @@ pub fn analyzeFast(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Stmt, 
         match try (up.findTable)(st, txn, &f.table, path) {
             Some(t) {
                 if len(t.view) > 0 { return Ok(noFast("FAST refresh over views is not supported")) }
-                if try isMview(st, txn, &t.name) { return Ok(noFast("cascading FAST MVs are planned for Stage 4")) }
                 if len(t.pk) == 0 { return Ok(noFast("base table has no primary key")) }
                 // Reject duplicate base table (self-join) in Stage 1 for simplicity; FORCE falls back to COMPLETE.
                 for prev in tables { if prev.name == t.name { return Ok(noFast("self-joins are not supported for FAST refresh")) } }
@@ -1807,8 +1810,28 @@ fn computeMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mv: &MvMet
                 } else {
                     out[idx].dExtDel[k] = try extPick(&out[idx].dExtDel[k], &cv, isMax)
                 }
+            } else if ak == AGG_HLL_AGG {
+                if sg > 0 {
+                    match &av {
+                        Val.Bytes(b) {
+                            let hh = try lexdb_sketch.hllFromBytes(b)
+                            grpHlls[idx][k].merge(&hh)
+                        }
+                        else { return Err(err("42883", "approx_count_distinct_agg requires a bytea sketch")) }
+                    }
+                }
             } else if isHllAgg(ak) {
                 if sg > 0 { grpHlls[idx][k].addVal(&av) }
+            } else if ak == AGG_TDIGEST_AGG {
+                if sg > 0 {
+                    match &av {
+                        Val.Bytes(b) {
+                            let tt = try lexdb_sketch.tdFromBytes(b)
+                            grpTds[idx][k].merge(&tt)
+                        }
+                        else { return Err(err("42883", "approx_percentile_agg requires a bytea sketch")) }
+                    }
+                }
             } else if isTdAgg(ak) {
                 if sg > 0 {
                     match lexdb_ops.asFloat(&av) {
@@ -2413,6 +2436,10 @@ pub fn foldDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, 
     mv.lastRefresh = time.now().unixMicros()
     mv.lastType = "FAST"
     try writeMeta(txn, &mv)
+    // Propagate any cascading deltas emitted to downstream MVs!
+    if hasWork(txn.sql.sess) {
+        try beforeCommit(st, txn, up)
+    }
     return Ok(len(delKeys))
 }
 
@@ -2507,6 +2534,7 @@ fn applyMvDeltasEx(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: 
     let exprFn = fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return (up.idxVal)(&mvTab, xi, k, r) }
     let noWrote = fn(_: &lexdb_store.Txn) {}
 
+    let hasDownstream = hasMarks(&mvTab.refBy)
     // Coalesce deltas by gk (ClickHouse-style collapsing across statements in a transaction!).
     if !fp.isAgg {
         let coal = coalesceNonAgg(deltas)
@@ -2517,7 +2545,10 @@ fn applyMvDeltasEx(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: 
             let oldOpt = try lexdb_access.getRow(st, txn, &rel, &rr, &pkKey)
             if d.dSign < 0 {
                 match oldOpt {
-                    Some(oldRow) { try lexdb_access.deleteRow(st, txn, &rel, &oldRow, predFn, exprFn, noWrote) }
+                    Some(oldRow) {
+                        try lexdb_access.deleteRow(st, txn, &rel, &oldRow, predFn, exprFn, noWrote)
+                        if hasDownstream { recordDelete(txn, &mvTab, &oldRow) }
+                    }
                     None {}
                 }
             } else if d.dSign >= 0 && len(d.visRow) > 0 {
@@ -2528,11 +2559,13 @@ fn applyMvDeltasEx(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: 
                     Some(oldRow) {
                         let c = try lexdb_access.updateRow(st, txn, &rel, &oldRow, &newRow, predFn, exprFn, noWrote)
                         if c >= 0 { return Err(err("23505", &("duplicate key value violates unique index on materialized view \"" + lexdb_sql.baseName(&mvTab.name) + "\""))) }
+                        if hasDownstream { recordUpdate(txn, &mvTab, &oldRow, &newRow) }
                     }
                     None {
                         if d.dSign > 0 {
                             let c = try lexdb_access.insertRow(st, txn, &rel, &newRow, predFn, exprFn, noWrote)
                             if c >= 0 { return Err(err("23505", &("duplicate key value violates unique index on materialized view \"" + lexdb_sql.baseName(&mvTab.name) + "\""))) }
+                            if hasDownstream { recordInsert(txn, &mvTab, &newRow) }
                         }
                     }
                 }
@@ -2558,7 +2591,10 @@ fn applyMvDeltasEx(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: 
             let newCnt = oldCnt + d.dCnt
             if newCnt <= 0 && !fp.globalAgg {
                 match oldOpt {
-                    Some(oldRow) { try lexdb_access.deleteRow(st, txn, &rel, &oldRow, predFn, exprFn, noWrote) }
+                    Some(oldRow) {
+                        try lexdb_access.deleteRow(st, txn, &rel, &oldRow, predFn, exprFn, noWrote)
+                        if hasDownstream { recordDelete(txn, &mvTab, &oldRow) }
+                    }
                     None {}
                 }
                 continue
@@ -2578,16 +2614,21 @@ fn applyMvDeltasEx(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: 
                             Some(oldRow) {
                                 let c = try lexdb_access.updateRow(st, txn, &rel, &oldRow, &freshRow, predFn, exprFn, noWrote)
                                 if c >= 0 { return Err(err("23505", &("duplicate key value violates unique index on materialized view \"" + lexdb_sql.baseName(&mvTab.name) + "\""))) }
+                                if hasDownstream { recordUpdate(txn, &mvTab, &oldRow, &freshRow) }
                             }
                             None {
                                 let c = try lexdb_access.insertRow(st, txn, &rel, &freshRow, predFn, exprFn, noWrote)
                                 if c >= 0 { return Err(err("23505", &("duplicate key value violates unique index on materialized view \"" + lexdb_sql.baseName(&mvTab.name) + "\""))) }
+                                if hasDownstream { recordInsert(txn, &mvTab, &freshRow) }
                             }
                         }
                     }
                     None {
                         match oldOpt {
-                            Some(oldRow) { try lexdb_access.deleteRow(st, txn, &rel, &oldRow, predFn, exprFn, noWrote) }
+                            Some(oldRow) {
+                                try lexdb_access.deleteRow(st, txn, &rel, &oldRow, predFn, exprFn, noWrote)
+                                if hasDownstream { recordDelete(txn, &mvTab, &oldRow) }
+                            }
                             None {}
                         }
                     }
@@ -2600,10 +2641,12 @@ fn applyMvDeltasEx(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: 
                 Some(oldRow) {
                     let c = try lexdb_access.updateRow(st, txn, &rel, &oldRow, &newRow, predFn, exprFn, noWrote)
                     if c >= 0 { return Err(err("23505", &("duplicate key value violates unique index on materialized view \"" + lexdb_sql.baseName(&mvTab.name) + "\""))) }
+                    if hasDownstream { recordUpdate(txn, &mvTab, &oldRow, &newRow) }
                 }
                 None {
                     let c = try lexdb_access.insertRow(st, txn, &rel, &newRow, predFn, exprFn, noWrote)
                     if c >= 0 { return Err(err("23505", &("duplicate key value violates unique index on materialized view \"" + lexdb_sql.baseName(&mvTab.name) + "\""))) }
+                    if hasDownstream { recordInsert(txn, &mvTab, &newRow) }
                 }
             }
         }
@@ -2623,104 +2666,115 @@ fn applyMvDeltasEx(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mvKeyStr: 
 pub fn stmtEnd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, ok: bool, up: &Up): Result[Unit, DbErr] {
     let sess = txn.sql.sess
     if !hasStmtDeltas(sess) { return Ok(Unit{}) }
-    let stmtDeltas = takeStmtDeltas(sess)
-    if !ok || len(stmtDeltas) == 0 { return Ok(Unit{}) }
-
-    // Find all distinct MV marks subscribed to any modified base table.
-    var mvMarks: []str = []
-    var seenTabs: []str = []
-    for d in stmtDeltas {
-        if lexdb_base.hasStr(&seenTabs, &d.table) { continue }
-        append(mut &seenTabs, d.table.clone())
-        match try (up.loadTable)(st, txn, &d.table) {
-            Some(bt) {
-                for mk in marksOf(&bt.refBy) {
-                    if !lexdb_base.hasStr(&mvMarks, &mk) { append(mut &mvMarks, mk) }
-                }
-            }
-            None {}
-        }
+    if !ok {
+        let _d = takeStmtDeltas(sess)
+        return Ok(Unit{})
     }
-    if len(mvMarks) == 0 { return Ok(Unit{}) }
+    // Loop in topological waves so cascading MV-on-MV rollup DAGs (base -> mv1 -> mv2 -> ...) propagate in O(delta)!
+    var wave = 0
+    while hasStmtDeltas(sess) && wave < 16 {
+        wave += 1
+        let stmtDeltas = takeStmtDeltas(sess)
+        if len(stmtDeltas) == 0 { break }
 
-    let stmtMark = stmtDeltas[0].mark
-    for mk in mvMarks {
-        let mvOpt = try readMetaAt(st, txn, &mk)
-        var mv = match mvOpt { Some(m) { m } None { continue } }
-        if !mv.populated { continue }
-
-        if mv.timing == MV_DEMAND && mv.deltaTree == 0 {
-            if !mv.stale {
-                mv.stale = true
-                try writeMeta(txn, &mv)
+        // Find all distinct MV marks subscribed to any modified base table or upstream MV.
+        var mvMarks: []str = []
+        var seenTabs: []str = []
+        for d in stmtDeltas {
+            if lexdb_base.hasStr(&seenTabs, &d.table) { continue }
+            append(mut &seenTabs, d.table.clone())
+            match try (up.loadTable)(st, txn, &d.table) {
+                Some(bt) {
+                    for mk in marksOf(&bt.refBy) {
+                        if !lexdb_base.hasStr(&mvMarks, &mk) { append(mut &mvMarks, mk) }
+                    }
+                }
+                None {}
             }
-            continue
         }
+        if len(mvMarks) == 0 { break }
 
-        let mvTab = match try (up.loadTable)(st, txn, &mv.key) {
-            Some(t) { t }
-            None { continue }
-        }
-        let pd = try computeMvDeltas(st, txn, &mv, &mvTab, &stmtDeltas, stmtMark, up)
-        if len(pd) == 0 { continue }
+        let stmtMark = stmtDeltas[0].mark
+        for mk in mvMarks {
+            let mvOpt = try readMetaAt(st, txn, &mk)
+            var mv = match mvOpt { Some(m) { m } None { continue } }
+            if !mv.populated { continue }
 
-        if mv.deltaTree > 0 {
-            // Stage 3 sharded append-only companion deltaTree path!
-            if mv.timing == MV_COMMIT {
-                pushPending(sess, &pd)
-            } else if anyResetDelta(&pd) {
-                try applyMvDeltas(st, txn, &mv.key, &pd, up)
-            } else {
-                try appendDeltas(st, txn, &mv, &pd)
-                if mv.timing == MV_DEMAND && !mv.stale {
+            if mv.timing == MV_DEMAND && mv.deltaTree == 0 {
+                if !mv.stale {
                     mv.stale = true
                     try writeMeta(txn, &mv)
                 }
+                continue
             }
-            continue
-        }
 
-        if mv.timing == MV_STATEMENT {
-            try applyMvDeltas(st, txn, &mv.key, &pd, up)
-        } else if mv.timing == MV_COMMIT {
-            pushPending(sess, &pd)
+            let mvTab = match try (up.loadTable)(st, txn, &mv.key) {
+                Some(t) { t }
+                None { continue }
+            }
+            let pd = try computeMvDeltas(st, txn, &mv, &mvTab, &stmtDeltas, stmtMark, up)
+            if len(pd) == 0 { continue }
+
+            if mv.deltaTree > 0 {
+                if mv.timing == MV_COMMIT {
+                    pushPending(sess, &pd)
+                } else if anyResetDelta(&pd) {
+                    try applyMvDeltas(st, txn, &mv.key, &pd, up)
+                } else {
+                    try appendDeltas(st, txn, &mv, &pd)
+                    if mv.timing == MV_DEMAND && !mv.stale {
+                        mv.stale = true
+                        try writeMeta(txn, &mv)
+                    }
+                }
+                continue
+            }
+
+            if mv.timing == MV_STATEMENT {
+                try applyMvDeltas(st, txn, &mv.key, &pd, up)
+            } else if mv.timing == MV_COMMIT {
+                pushPending(sess, &pd)
+            }
         }
     }
     return Ok(Unit{})
 }
 
 pub fn beforeCommit(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, up: &Up): Result[Unit, DbErr] {
-    // Flush any remaining statement deltas (autocommit statements outside a block).
-    try stmtEnd(st, txn, true, up)
     let sess = txn.sql.sess
-    let pend = takePending(sess)
-    if len(pend) == 0 { return Ok(Unit{}) }
+    var wave = 0
+    while wave < 16 {
+        try stmtEnd(st, txn, true, up)
+        let pend = takePending(sess)
+        if len(pend) == 0 { break }
+        wave += 1
 
-    // Group pending deltas by MV key preserving order.
-    var mvKeys: []str = []
-    var groups: [][]PendingDelta = []
-    for p in pend {
-        var at = -1
-        for i in 0..len(mvKeys) { if mvKeys[i] == p.mvKey { at = i; break } }
-        if at < 0 {
-            append(mut &mvKeys, p.mvKey.clone())
-            append(mut &groups, [p.clone()])
-        } else {
-            append(mut &groups[at], p.clone())
-        }
-    }
-    for i in 0..len(mvKeys) {
-        let mvOpt = try readMeta(st, txn, &mvKeys[i])
-        match mvOpt {
-            Some(mv) {
-                if mv.deltaTree > 0 && !anyResetDelta(&groups[i]) {
-                    try appendDeltas(st, txn, &mv, &groups[i])
-                    continue
-                }
+        // Group pending deltas by MV key preserving order.
+        var mvKeys: []str = []
+        var groups: [][]PendingDelta = []
+        for p in pend {
+            var at = -1
+            for i in 0..len(mvKeys) { if mvKeys[i] == p.mvKey { at = i; break } }
+            if at < 0 {
+                append(mut &mvKeys, p.mvKey.clone())
+                append(mut &groups, [p.clone()])
+            } else {
+                append(mut &groups[at], p.clone())
             }
-            None {}
         }
-        try applyMvDeltas(st, txn, &mvKeys[i], &groups[i], up)
+        for i in 0..len(mvKeys) {
+            let mvOpt = try readMeta(st, txn, &mvKeys[i])
+            match mvOpt {
+                Some(mv) {
+                    if mv.deltaTree > 0 && !anyResetDelta(&groups[i]) {
+                        try appendDeltas(st, txn, &mv, &groups[i])
+                        continue
+                    }
+                }
+                None {}
+            }
+            try applyMvDeltas(st, txn, &mvKeys[i], &groups[i], up)
+        }
     }
     return Ok(Unit{})
 }
@@ -3026,6 +3080,26 @@ pub fn refreshComplete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &
     mv.lastType = "COMPLETE"
     try writeMeta(txn, &mv)
     try (up.bump)(st, txn, &mv.key)
+    // Cascade COMPLETE refresh or staleness to any downstream MVs subscribed to this MV.
+    if hasMarks(&mvTab.refBy) {
+        for dmk in marksOf(&mvTab.refBy) {
+            match try readMetaAt(st, txn, &dmk) {
+                Some(dmv0) {
+                    if !dmv0.populated { continue }
+                    if dmv0.timing == MV_DEMAND && dmv0.deltaTree == 0 {
+                        if !dmv0.stale {
+                            var dmv = dmv0
+                            dmv.stale = true
+                            try writeMeta(txn, &dmv)
+                        }
+                    } else {
+                        let _rn = try refreshComplete(st, txn, &dmv0.key, up)
+                    }
+                }
+                None {}
+            }
+        }
+    }
     return Ok(rowCount)
 }
 
@@ -3201,4 +3275,795 @@ pub fn stalenessText(m: &MvMeta): str {
     if !m.populated { return "UNUSABLE" }
     if m.stale { return "NEEDS_COMPILE" }
     return "FRESH"
+}
+
+// ---- Stage 4B: Automatic Cost-Based Query Rewrite (ENABLE QUERY REWRITE)
+
+type RwState = record {
+    disabled: []int             // sessions with query_rewrite_enabled = off
+    suppressed: []int           // sessions currently inside MV refresh/reprobe/rewrite (stack entries)
+}
+
+var RW_STATE: once task.Shared[RwState]
+
+fn rwState(): task.Shared[RwState] {
+    if !RW_STATE.isSet() { RW_STATE.set(task.shared(RwState{disabled: [], suppressed: []})) }
+    return RW_STATE.get().share()
+}
+
+pub fn setQueryRewrite(sess: int, on: bool) {
+    rwState().with(fn(st: mut &RwState) {
+        var keep: []int = []
+        for x in st.disabled { if x != sess { append(mut &keep, x) } }
+        if !on { append(mut &keep, sess) }
+        st.disabled = keep
+    })
+}
+
+pub fn isQueryRewriteOn(sess: int): bool {
+    var on = true
+    rwState().with(fn(st: mut &RwState) {
+        for x in st.disabled { if x == sess { on = false; break } }
+    })
+    return on
+}
+
+pub fn pushSuppressRewrite(sess: int) {
+    rwState().with(fn(st: mut &RwState) { append(mut &st.suppressed, sess) })
+}
+
+pub fn popSuppressRewrite(sess: int) {
+    rwState().with(fn(st: mut &RwState) {
+        var i = len(st.suppressed) - 1
+        while i >= 0 {
+            if st.suppressed[i] == sess {
+                let last = len(st.suppressed) - 1
+                if i != last { st.suppressed[i] = st.suppressed[last] }
+                let _x = pop(mut &st.suppressed)
+                return
+            }
+            i -= 1
+        }
+    })
+}
+
+fn suppressCount(sess: int): int {
+    var n = 0
+    rwState().with(fn(st: mut &RwState) {
+        for x in st.suppressed { if x == sess { n += 1 } }
+    })
+    return n
+}
+
+fn hasPendingForMv(sess: int, mvKeyStr: &str): bool {
+    var any = false
+    bufs().with(fn(st: mut &BufStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 {
+            for p in st.vals[i].pending {
+                if p.mvKey == mvKeyStr { any = true; break }
+            }
+        }
+    })
+    return any
+}
+
+// Remaps slotted column indices from query's table order to MV's canonical table order.
+fn remapSlots(x: &Expr, qOffsets: &[]int, qTables: &[]Table, tabPerm: &[]int, mvOffsets: &[]int, mvAllCols: &[]lexdb_sql.ColDef): Expr {
+    match x {
+        Expr.Col(nm, s) {
+            if s >= 0 {
+                for qi in 0..len(qTables) {
+                    let off = qOffsets[qi]
+                    let end = off + len(qTables[qi].cols)
+                    if s >= off && s < end {
+                        let mi = tabPerm[qi]
+                        let ns = mvOffsets[mi] + (s - off)
+                        return Expr.Col(mvAllCols[ns].name.clone(), ns)
+                    }
+                }
+            }
+            return Expr.Col(nm.clone(), s)
+        }
+        Expr.Lit(v) { return Expr.Lit(v.clone()) }
+        Expr.Param(i) { return Expr.Param(i) }
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), remapSlots(&a, qOffsets, qTables, tabPerm, mvOffsets, mvAllCols)) }
+        Expr.Bin(op, a, b) {
+            return Expr.Bin(op.clone(), remapSlots(&a, qOffsets, qTables, tabPerm, mvOffsets, mvAllCols),
+                            remapSlots(&b, qOffsets, qTables, tabPerm, mvOffsets, mvAllCols))
+        }
+        Expr.IsNull(a, not) { return Expr.IsNull(remapSlots(&a, qOffsets, qTables, tabPerm, mvOffsets, mvAllCols), not) }
+        Expr.Cast(a, t) { return Expr.Cast(remapSlots(&a, qOffsets, qTables, tabPerm, mvOffsets, mvAllCols), t.clone()) }
+        Expr.Call(n, args, star) {
+            var out: []Expr = []
+            for a in args { append(mut &out, remapSlots(&a, qOffsets, qTables, tabPerm, mvOffsets, mvAllCols)) }
+            return Expr.Call(n.clone(), out, star)
+        }
+    }
+}
+
+// Structural equality of canonical slotted expressions (commutative for =, +, *, and, or).
+fn exprEq(a: &Expr, b: &Expr): bool {
+    match a {
+        Expr.Col(_, sa) {
+            match b { Expr.Col(_, sb) { return sa == sb } else { return false } }
+        }
+        Expr.Lit(va) {
+            match b { Expr.Lit(vb) { return valExactEq(&va, &vb) } else { return false } }
+        }
+        Expr.Param(ia) {
+            match b { Expr.Param(ib) { return ia == ib } else { return false } }
+        }
+        Expr.Unary(opa, xa) {
+            match b { Expr.Unary(opb, xb) { return opa == opb && exprEq(&xa, &xb) } else { return false } }
+        }
+        Expr.Bin(opa, la, ra) {
+            match b {
+                Expr.Bin(opb, lb, rb) {
+                    if opa != opb { return false }
+                    if exprEq(&la, &lb) && exprEq(&ra, &rb) { return true }
+                    if opa == "=" || opa == "+" || opa == "*" || opa == "and" || opa == "or" {
+                        return exprEq(&la, &rb) && exprEq(&ra, &lb)
+                    }
+                    return false
+                }
+                else { return false }
+            }
+        }
+        Expr.IsNull(xa, na) {
+            match b { Expr.IsNull(xb, nb) { return na == nb && exprEq(&xa, &xb) } else { return false } }
+        }
+        Expr.Cast(xa, ta) {
+            match b { Expr.Cast(xb, tb) { return ta.oid == tb.oid && exprEq(&xa, &xb) } else { return false } }
+        }
+        Expr.Call(na, aa, sa) {
+            match b {
+                Expr.Call(nb, ab, sb) {
+                    if na != nb || sa != sb || len(aa) != len(ab) { return false }
+                    for i in 0..len(aa) { if !exprEq(&aa[i], &ab[i]) { return false } }
+                    return true
+                }
+                else { return false }
+            }
+        }
+    }
+}
+
+fn optExprEq(a: &Option[Expr], b: &Option[Expr]): bool {
+    match a {
+        Some(xa) { match b { Some(xb) { return exprEq(&xa, &xb) } None { return false } } }
+        None { return b.isNone() }
+    }
+}
+
+fn splitAnd(x: &Expr, out: mut &[]Expr) {
+    match x {
+        Expr.Bin(op, a, b) {
+            if op == "and" { splitAnd(&a, out); splitAnd(&b, out); return }
+            append(out, lexdb_sql.cloneExpr(x))
+        }
+        else { append(out, lexdb_sql.cloneExpr(x)) }
+    }
+}
+
+fn joinAnd(xs: &[]Expr): Option[Expr] {
+    if len(xs) == 0 { return None }
+    var cur = lexdb_sql.cloneExpr(&xs[0])
+    for i in 1..len(xs) { cur = Expr.Bin("and", cur, lexdb_sql.cloneExpr(&xs[i])) }
+    return Some(cur)
+}
+
+// Translates a non-aggregate canonical expression into an expression over MV's visible non-agg columns.
+fn translateNonAgg(x: &Expr, fp: &FastPlan, mvTab: &Table): Option[Expr] {
+    for it in fp.items {
+        if it.aggKind == AGG_NONE && exprEq(x, &it.expr) {
+            return Some(Expr.Col(mvTab.cols[it.visCol].name.clone(), -1))
+        }
+    }
+    match x {
+        Expr.Lit(v) { return Some(Expr.Lit(v.clone())) }
+        Expr.Param(i) { return Some(Expr.Param(i)) }
+        Expr.Col(_, _) { return None }
+        Expr.Unary(op, a) {
+            match translateNonAgg(&a, fp, mvTab) {
+                Some(ta) { return Some(Expr.Unary(op.clone(), ta)) }
+                None { return None }
+            }
+        }
+        Expr.Bin(op, a, b) {
+            let ta = match translateNonAgg(&a, fp, mvTab) { Some(v) { v } None { return None } }
+            let tb = match translateNonAgg(&b, fp, mvTab) { Some(v) { v } None { return None } }
+            return Some(Expr.Bin(op.clone(), ta, tb))
+        }
+        Expr.IsNull(a, not) {
+            match translateNonAgg(&a, fp, mvTab) {
+                Some(ta) { return Some(Expr.IsNull(ta, not)) }
+                None { return None }
+            }
+        }
+        Expr.Cast(a, t) {
+            match translateNonAgg(&a, fp, mvTab) {
+                Some(ta) { return Some(Expr.Cast(ta, t.clone())) }
+                None { return None }
+            }
+        }
+        Expr.Call(n, args, star) {
+            if lexdb_sql.isAgg(&n) { return None }
+            var out: []Expr = []
+            for a in args {
+                match translateNonAgg(&a, fp, mvTab) {
+                    Some(ta) { append(mut &out, ta) }
+                    None { return None }
+                }
+            }
+            return Some(Expr.Call(n.clone(), out, star))
+        }
+    }
+}
+
+// Finds an MV item matching aggregate (kind, arg, filter) and returns its visible column name.
+fn findMvAggCol(fp: &FastPlan, mvTab: &Table, kind: int, arg: &Expr, flt: &Option[Expr], pctFrac: float, pctDesc: bool): Option[str] {
+    for it in fp.items {
+        if it.aggKind != kind { continue }
+        if !optExprEq(&it.filter, flt) { continue }
+        if kind != AGG_COUNT_STAR && !exprEq(&it.expr, arg) { continue }
+        if kind == AGG_TDIGEST && (it.pctFrac != pctFrac || it.pctDesc != pctDesc) { continue }
+        return Some(mvTab.cols[it.visCol].name.clone())
+    }
+    return None
+}
+
+fn findMvSketchCol(fp: &FastPlan, mvTab: &Table, isHll: bool, arg: &Expr, flt: &Option[Expr]): Option[str] {
+    for it in fp.items {
+        let matchKind = if isHll { it.aggKind == AGG_HLL_DETAIL || it.aggKind == AGG_HLL_AGG }
+                        else { it.aggKind == AGG_TDIGEST_DETAIL || it.aggKind == AGG_TDIGEST_AGG }
+        if matchKind && optExprEq(&it.filter, flt) && exprEq(&it.expr, arg) {
+            return Some(mvTab.cols[it.visCol].name.clone())
+        }
+    }
+    return None
+}
+
+// Translates a canonical expression (possibly containing aggregates) against an aggregate MV:
+// - exactGroup == true: direct lookup of MV agg columns (no re-aggregation needed!)
+// - exactGroup == false: algebraic rollup re-aggregation over MV columns!
+fn translateAggExpr(x: &Expr, fp: &FastPlan, mvTab: &Table, exactGroup: bool, globalRollup: bool): Option[Expr] {
+    let ar = parseFastAgg(x)
+    if ar.wasAgg {
+        if ar.kind == AGG_NONE { return None }
+        if exactGroup {
+            match findMvAggCol(fp, mvTab, ar.kind, &ar.arg, &ar.flt, ar.pctFrac, ar.pctDesc) {
+                Some(cn) { return Some(Expr.Col(cn, -1)) }
+                None {}
+            }
+            // Exact group: can also finalize a stored _DETAIL sketch column!
+            if ar.kind == AGG_HLL {
+                match findMvSketchCol(fp, mvTab, true, &ar.arg, &ar.flt) {
+                    Some(cn) { return Some(Expr.Call("coalesce", [Expr.Call("to_approx_count_distinct", [Expr.Col(cn, -1)], false), Expr.Lit(Val.Int(0))], false)) }
+                    None {}
+                }
+            }
+            if ar.kind == AGG_TDIGEST {
+                match findMvSketchCol(fp, mvTab, false, &ar.arg, &ar.flt) {
+                    Some(cn) {
+                        let p = if ar.pctDesc { 1.0f - ar.pctFrac } else { ar.pctFrac }
+                        return Some(Expr.Call("to_approx_percentile", [Expr.Col(cn, -1), Expr.Lit(Val.Float(p))], false))
+                    }
+                    None {}
+                }
+            }
+            return None
+        }
+        // Rollup re-aggregation over finer-grain MV!
+        let int8T = lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}
+        if ar.kind == AGG_COUNT_STAR || ar.kind == AGG_COUNT_EXPR {
+            match findMvAggCol(fp, mvTab, ar.kind, &ar.arg, &ar.flt, 0.0f, false) {
+                Some(cn) {
+                    let s = Expr.Call("sum", [Expr.Col(cn, -1)], false)
+                    let base = if globalRollup { Expr.Call("coalesce", [s, Expr.Lit(Val.Int(0))], false) } else { s }
+                    return Some(Expr.Cast(base, int8T))
+                }
+                None { return None }
+            }
+        }
+        if ar.kind == AGG_SUM {
+            match findMvAggCol(fp, mvTab, AGG_SUM, &ar.arg, &ar.flt, 0.0f, false) {
+                Some(cn) { return Some(Expr.Call("sum", [Expr.Col(cn, -1)], false)) }
+                None { return None }
+            }
+        }
+        if ar.kind == AGG_MIN || ar.kind == AGG_MAX {
+            match findMvAggCol(fp, mvTab, ar.kind, &ar.arg, &ar.flt, 0.0f, false) {
+                Some(cn) { return Some(Expr.Call(if ar.kind == AGG_MIN { "min" } else { "max" }, [Expr.Col(cn, -1)], false)) }
+                None { return None }
+            }
+        }
+        if ar.kind == AGG_BOOL_AND || ar.kind == AGG_BOOL_OR {
+            match findMvAggCol(fp, mvTab, ar.kind, &ar.arg, &ar.flt, 0.0f, false) {
+                Some(cn) { return Some(Expr.Call(if ar.kind == AGG_BOOL_AND { "bool_and" } else { "bool_or" }, [Expr.Col(cn, -1)], false)) }
+                None { return None }
+            }
+        }
+        if ar.kind == AGG_BIT_XOR {
+            match findMvAggCol(fp, mvTab, AGG_BIT_XOR, &ar.arg, &ar.flt, 0.0f, false) {
+                Some(cn) { return Some(Expr.Call(if ar.oraDia { "bit_xor dia:o" } else { "bit_xor" }, [Expr.Col(cn, -1)], false)) }
+                None { return None }
+            }
+        }
+        if ar.kind == AGG_AVG {
+            let sCol = findMvAggCol(fp, mvTab, AGG_SUM, &ar.arg, &ar.flt, 0.0f, false)
+            let cCol = findMvAggCol(fp, mvTab, AGG_COUNT_EXPR, &ar.arg, &ar.flt, 0.0f, false)
+            match sCol {
+                Some(sc) {
+                    match cCol {
+                        Some(cc) {
+                            let numT = lexdb_sql.TypeName{kind: lexdb_sql.K_NUM, oid: lexdb_sql.OID_NUMERIC, prec: 0, scale: 0, len: 0}
+                            return Some(Expr.Bin("/", Expr.Cast(Expr.Call("sum", [Expr.Col(sc, -1)], false), numT.clone()),
+                                                 Expr.Cast(Expr.Call("sum", [Expr.Col(cc, -1)], false), numT)))
+                        }
+                        None { return None }
+                    }
+                }
+                None { return None }
+            }
+        }
+        if ar.kind == AGG_HLL {
+            match findMvSketchCol(fp, mvTab, true, &ar.arg, &ar.flt) {
+                Some(cn) {
+                    let agg = Expr.Call("approx_count_distinct_agg", [Expr.Col(cn, -1)], false)
+                    let fin = Expr.Call("to_approx_count_distinct", [agg], false)
+                    return Some(if globalRollup { Expr.Call("coalesce", [fin, Expr.Lit(Val.Int(0))], false) } else { fin })
+                }
+                None { return None }
+            }
+        }
+        if ar.kind == AGG_HLL_DETAIL || ar.kind == AGG_HLL_AGG {
+            match findMvSketchCol(fp, mvTab, true, &ar.arg, &ar.flt) {
+                Some(cn) { return Some(Expr.Call("approx_count_distinct_agg", [Expr.Col(cn, -1)], false)) }
+                None { return None }
+            }
+        }
+        if ar.kind == AGG_TDIGEST {
+            match findMvSketchCol(fp, mvTab, false, &ar.arg, &ar.flt) {
+                Some(cn) {
+                    let p = if ar.pctDesc { 1.0f - ar.pctFrac } else { ar.pctFrac }
+                    let agg = Expr.Call("approx_percentile_agg", [Expr.Col(cn, -1)], false)
+                    return Some(Expr.Call("to_approx_percentile", [agg, Expr.Lit(Val.Float(p))], false))
+                }
+                None { return None }
+            }
+        }
+        if ar.kind == AGG_TDIGEST_DETAIL || ar.kind == AGG_TDIGEST_AGG {
+            match findMvSketchCol(fp, mvTab, false, &ar.arg, &ar.flt) {
+                Some(cn) { return Some(Expr.Call("approx_percentile_agg", [Expr.Col(cn, -1)], false)) }
+                None { return None }
+            }
+        }
+        return None
+    }
+    // Non-aggregate subexpression (or compound expression wrapping aggregates like SUM(x) + 1)
+    if !lexdb_bind.hasAgg(x) { return translateNonAgg(x, fp, mvTab) }
+    match x {
+        Expr.Unary(op, a) {
+            match translateAggExpr(&a, fp, mvTab, exactGroup, globalRollup) {
+                Some(ta) { return Some(Expr.Unary(op.clone(), ta)) }
+                None { return None }
+            }
+        }
+        Expr.Bin(op, a, b) {
+            let ta = match translateAggExpr(&a, fp, mvTab, exactGroup, globalRollup) { Some(v) { v } None { return None } }
+            let tb = match translateAggExpr(&b, fp, mvTab, exactGroup, globalRollup) { Some(v) { v } None { return None } }
+            return Some(Expr.Bin(op.clone(), ta, tb))
+        }
+        Expr.IsNull(a, not) {
+            match translateAggExpr(&a, fp, mvTab, exactGroup, globalRollup) {
+                Some(ta) { return Some(Expr.IsNull(ta, not)) }
+                None { return None }
+            }
+        }
+        Expr.Cast(a, t) {
+            match translateAggExpr(&a, fp, mvTab, exactGroup, globalRollup) {
+                Some(ta) { return Some(Expr.Cast(ta, t.clone())) }
+                None { return None }
+            }
+        }
+        Expr.Call(n, args, star) {
+            var out: []Expr = []
+            for a in args {
+                match translateAggExpr(&a, fp, mvTab, exactGroup, globalRollup) {
+                    Some(ta) { append(mut &out, ta) }
+                    None { return None }
+                }
+            }
+            return Some(Expr.Call(n.clone(), out, star))
+        }
+        else { return None }
+    }
+}
+
+// Default column label when an original SELECT item had no explicit alias (preserves exact output column names!).
+fn defaultItemAlias(x: &Expr): str {
+    match x {
+        Expr.Col(nm, _) {
+            let d = strings.indexOf(&nm, ".", 0)
+            return if d >= 0 { nm[d + 1..len(nm)].toStr() } else { nm.clone() }
+        }
+        Expr.Call(nm, _, _) { return lexdb_sql.aggBase(&nm) }
+        else { return "" }
+    }
+}
+
+// Translates a non-agg expression into MV column refs while preserving aggregates inside a query over a non-agg MV.
+fn translateOverProj(x: &Expr, fp: &FastPlan, mvTab: &Table): Option[Expr] {
+    match x {
+        Expr.Call(n, args, star) {
+            if lexdb_sql.isAgg(&n) {
+                var out: []Expr = []
+                for a in args {
+                    match translateOverProj(&a, fp, mvTab) {
+                        Some(ta) { append(mut &out, ta) }
+                        None { return None }
+                    }
+                }
+                return Some(Expr.Call(n.clone(), out, star))
+            }
+        }
+        else {}
+    }
+    if !lexdb_bind.hasAgg(x) { return translateNonAgg(x, fp, mvTab) }
+    match x {
+        Expr.Unary(op, a) {
+            match translateOverProj(&a, fp, mvTab) { Some(ta) { return Some(Expr.Unary(op.clone(), ta)) } None { return None } }
+        }
+        Expr.Bin(op, a, b) {
+            let ta = match translateOverProj(&a, fp, mvTab) { Some(v) { v } None { return None } }
+            let tb = match translateOverProj(&b, fp, mvTab) { Some(v) { v } None { return None } }
+            return Some(Expr.Bin(op.clone(), ta, tb))
+        }
+        Expr.IsNull(a, not) {
+            match translateOverProj(&a, fp, mvTab) { Some(ta) { return Some(Expr.IsNull(ta, not)) } None { return None } }
+        }
+        Expr.Cast(a, t) {
+            match translateOverProj(&a, fp, mvTab) { Some(ta) { return Some(Expr.Cast(ta, t.clone())) } None { return None } }
+        }
+        Expr.Call(n, args, star) {
+            var out: []Expr = []
+            for a in args {
+                match translateOverProj(&a, fp, mvTab) { Some(ta) { append(mut &out, ta) } None { return None } }
+            }
+            return Some(Expr.Call(n.clone(), out, star))
+        }
+        else { return None }
+    }
+}
+
+// Attempts automatic cost-based query rewrite of SELECT s against any fresh, ENABLE QUERY REWRITE MV.
+// Fast path: returns None in O(1) when the query's base table has no MV marks (zero overhead!).
+pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, path: &[]str, up: &Up): Result[Option[Stmt], DbErr] {
+    let sess = txn.sql.sess
+    if !isQueryRewriteOn(sess) || suppressCount(sess) >= 2 { return Ok(None) }
+    if s.kind != lexdb_sql.S_SELECT || s.setop != 0 || s.distinct || len(s.distinctOn) > 0 ||
+       len(s.wins) > 0 || len(s.subs) > 0 || len(s.gsets) > 0 || s.cte >= 0 || len(s.mr) > 0 ||
+       s.lockMode > 0 || len(s.srf) > 0 || len(s.from) == 0 {
+        return Ok(None)
+    }
+    for fi in 0..len(s.from) {
+        let f = &s.from[fi]
+        if f.sub >= 0 || f.work >= 0 || f.lateral || len(f.using) > 0 || f.natural { return Ok(None) }
+        if fi > 0 && f.join != lexdb_sql.J_INNER && f.join != lexdb_sql.J_CROSS && f.join != lexdb_sql.J_FIRST { return Ok(None) }
+    }
+    // Zero-overhead gate: check first FROM table's refBy marks!
+    let t0 = match try (up.findTable)(st, txn, &s.from[0].table, path) {
+        Some(t) { t }
+        None { return Ok(None) }
+    }
+    if len(t0.view) > 0 || !hasMarks(&t0.refBy) { return Ok(None) }
+    let candMarks = marksOf(&t0.refBy)
+    if len(candMarks) == 0 { return Ok(None) }
+
+    // Load all query FROM tables and build query's allCols for canonical expression resolution.
+    var qTabs: []Table = [t0]
+    var qAliases: []str = []
+    var qAllCols: []lexdb_sql.ColDef = []
+    var qOffsets: []int = [0]
+    let al0 = if len(s.from[0].alias) > 0 { s.from[0].alias.clone() } else { lexdb_sql.baseName(&qTabs[0].name) }
+    append(mut &qAliases, al0.clone())
+    for c in qTabs[0].cols {
+        var cc = c.clone()
+        cc.name = al0 + "." + c.name
+        append(mut &qAllCols, cc)
+    }
+    for fi in 1..len(s.from) {
+        match try (up.findTable)(st, txn, &s.from[fi].table, path) {
+            Some(t) {
+                if len(t.view) > 0 { return Ok(None) }
+                for prev in qTabs { if prev.name == t.name { return Ok(None) } }
+                append(mut &qOffsets, len(qAllCols))
+                let al = if len(s.from[fi].alias) > 0 { s.from[fi].alias.clone() } else { lexdb_sql.baseName(&t.name) }
+                for c in t.cols {
+                    var cc = c.clone()
+                    cc.name = al + "." + c.name
+                    append(mut &qAllCols, cc)
+                }
+                append(mut &qTabs, t)
+                append(mut &qAliases, al)
+            }
+            None { return Ok(None) }
+        }
+    }
+
+    // Resolve query WHERE, JOIN ONs, GROUP BY, SELECT items, HAVING, ORDER BY in query slot space.
+    var qJoinExprs: []Expr = []
+    for fi in 1..len(s.from) {
+        match s.from[fi].on {
+            Some(onx) {
+                match resolveFastExpr(&onx, &qAllCols) {
+                    Ok(rx) { splitAnd(&rx, mut &qJoinExprs) }
+                    Err(_) { return Ok(None) }
+                }
+            }
+            None {}
+        }
+    }
+    var qWhereConj: []Expr = []
+    match s.where {
+        Some(wx) {
+            match resolveFastExpr(&wx, &qAllCols) {
+                Ok(rx) { splitAnd(&rx, mut &qWhereConj) }
+                Err(_) { return Ok(None) }
+            }
+        }
+        None {}
+    }
+
+    var qIsAgg = len(s.group) > 0 || s.having.isSome()
+    var qItemsRaw: []Expr = []
+    var qItemAliases: []str = []
+    var qItemSpells: []str = []
+    for it in s.items {
+        if it.star { return Ok(None) }
+        match it.expr {
+            Some(ex) {
+                if lexdb_bind.hasAgg(&ex) { qIsAgg = true }
+                let rx = match resolveFastExpr(&ex, &qAllCols) { Ok(v) { v } Err(_) { return Ok(None) } }
+                append(mut &qItemsRaw, rx)
+                let al = if len(it.alias) > 0 { it.alias.clone() } else { defaultItemAlias(&ex) }
+                append(mut &qItemAliases, al)
+                append(mut &qItemSpells, it.spell.clone())
+            }
+            None { return Ok(None) }
+        }
+    }
+    var qGrpRaw: []Expr = []
+    for gx in s.group {
+        if lexdb_sql.isGbAll(&gx) { return Ok(None) }
+        let pos = lexdb_sql.litInt(&gx)
+        if pos >= 1 && pos <= len(qItemsRaw) {
+            append(mut &qGrpRaw, lexdb_sql.cloneExpr(&qItemsRaw[pos - 1]))
+        } else {
+            match resolveFastExpr(&gx, &qAllCols) {
+                Ok(rx) { append(mut &qGrpRaw, rx) }
+                Err(_) { return Ok(None) }
+            }
+        }
+    }
+    var qHavingRaw: Option[Expr] = None
+    match s.having {
+        Some(hx) {
+            match resolveFastExpr(&hx, &qAllCols) {
+                Ok(rx) { qHavingRaw = Some(rx) }
+                Err(_) { return Ok(None) }
+            }
+        }
+        None {}
+    }
+    var qOrdRaw: []Expr = []
+    var qOrdPos: []int = []      // >= 0 if ORDER BY references SELECT output alias or position
+    for oi in s.order {
+        let pos = lexdb_sql.litInt(&oi.expr)
+        if pos >= 1 && pos <= len(qItemsRaw) {
+            append(mut &qOrdPos, pos - 1)
+            append(mut &qOrdRaw, Expr.Lit(Val.Null))
+            continue
+        }
+        var byAlias = -1
+        match &oi.expr {
+            Expr.Col(nm, _) {
+                if strings.indexOf(nm, ".", 0) < 0 {
+                    for k in 0..len(qItemAliases) { if qItemAliases[k] == nm { byAlias = k; break } }
+                }
+            }
+            else {}
+        }
+        if byAlias >= 0 {
+            append(mut &qOrdPos, byAlias)
+            append(mut &qOrdRaw, Expr.Lit(Val.Null))
+        } else {
+            if lexdb_bind.hasAgg(&oi.expr) { qIsAgg = true }
+            match resolveFastExpr(&oi.expr, &qAllCols) {
+                Ok(rx) { append(mut &qOrdPos, -1); append(mut &qOrdRaw, rx) }
+                Err(_) { return Ok(None) }
+            }
+        }
+    }
+
+    var bestScore = 1000000
+    var bestStmt: Option[Stmt] = None
+
+    for mk in candMarks {
+        let mv = match try readMetaAt(st, txn, &mk) { Some(m) { m } None { continue } }
+        if !mv.rewrite || !mv.populated || mv.fastKind == FAST_NONE { continue }
+        if mv.stale && mv.deltaTree == 0 { continue }
+        if hasPendingForMv(sess, &mv.key) { continue }
+        let mvTab = match try (up.loadTable)(st, txn, &mv.key) { Some(t) { t } None { continue } }
+        let fp = try getCachedPlan(st, txn, &mv, &mvTab, up)
+        if fp.kind == FAST_NONE || len(fp.tables) != len(qTabs) { continue }
+        if fp.isAgg && !qIsAgg { continue }
+
+        // Match FROM tables permutation qTabs[qi] -> fp.tables[mi].
+        var tabPerm = array(len(qTabs), -1)
+        var permOk = true
+        for qi in 0..len(qTabs) {
+            var foundM = -1
+            for mi in 0..len(fp.tables) { if fp.tables[mi].name == qTabs[qi].name { foundM = mi; break } }
+            if foundM < 0 { permOk = false; break }
+            tabPerm[qi] = foundM
+        }
+        if !permOk { continue }
+
+        // Remap query's JOIN ON + WHERE conjuncts into MV slot space and check join + predicate subsumption.
+        var mvJoinConj: []Expr = []
+        for j in fp.joins { match j { Some(jx) { splitAnd(&jx, mut &mvJoinConj) } None {} } }
+        var mvWhereConj: []Expr = []
+        match fp.where { Some(wx) { splitAnd(&wx, mut &mvWhereConj) } None {} }
+
+        var allQPreds: []Expr = []
+        for jx in qJoinExprs { append(mut &allQPreds, remapSlots(&jx, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols)) }
+        for wx in qWhereConj { append(mut &allQPreds, remapSlots(&wx, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols)) }
+
+        var allMvPreds: []Expr = []
+        for jx in mvJoinConj { append(mut &allMvPreds, lexdb_sql.cloneExpr(&jx)) }
+        for wx in mvWhereConj { append(mut &allMvPreds, lexdb_sql.cloneExpr(&wx)) }
+
+        var qUsed = array(len(allQPreds), false)
+        var subsOk = true
+        for mp in allMvPreds {
+            var matched = false
+            for qi in 0..len(allQPreds) {
+                if !qUsed[qi] && exprEq(&mp, &allQPreds[qi]) { qUsed[qi] = true; matched = true; break }
+            }
+            if !matched { subsOk = false; break }
+        }
+        if !subsOk { continue }
+
+        // Translate residual WHERE conjuncts onto MV's visible non-agg columns.
+        var resWhere: []Expr = []
+        var resOk = true
+        for qi in 0..len(allQPreds) {
+            if qUsed[qi] { continue }
+            match translateNonAgg(&allQPreds[qi], &fp, &mvTab) {
+                Some(tx) { append(mut &resWhere, tx) }
+                None { resOk = false; break }
+            }
+        }
+        if !resOk { continue }
+
+        // Determine mode: non-agg MV vs exact-group agg MV vs rollup agg MV.
+        var exactGroup = false
+        var globalRollup = false
+        var rwGroup: []Expr = []
+        var score = 400
+
+        if !fp.isAgg {
+            // Non-aggregate (projection/filter) MV: can serve both plain SELECT and aggregate queries!
+            for g in qGrpRaw {
+                let rg = remapSlots(&g, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols)
+                match translateNonAgg(&rg, &fp, &mvTab) {
+                    Some(tg) { append(mut &rwGroup, tg) }
+                    None { resOk = false; break }
+                }
+            }
+            if !resOk { continue }
+            score = if len(allMvPreds) > 0 { 300 } else { 400 }
+        } else {
+            // Aggregate MV: check exact group match vs rollup subset!
+            var qGrpMapped: []Expr = []
+            for g in qGrpRaw { append(mut &qGrpMapped, remapSlots(&g, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols)) }
+            var allInMv = true
+            for qg in qGrpMapped {
+                var found = false
+                for mg in fp.group { if exprEq(&qg, &mg) { found = true; break } }
+                if !found { allInMv = false; break }
+            }
+            if !allInMv { continue }
+            exactGroup = len(qGrpMapped) == len(fp.group)
+            globalRollup = !exactGroup && len(qGrpMapped) == 0
+            if !exactGroup {
+                for qg in qGrpMapped {
+                    match translateNonAgg(&qg, &fp, &mvTab) {
+                        Some(tg) { append(mut &rwGroup, tg) }
+                        None { resOk = false; break }
+                    }
+                }
+                if !resOk { continue }
+            }
+            score = (if exactGroup { 100 } else { 200 }) + len(fp.group)
+        }
+
+        // Translate SELECT items.
+        var rwItems: []lexdb_sql.SelItem = []
+        var itemsOk = true
+        for k in 0..len(qItemsRaw) {
+            let rm = remapSlots(&qItemsRaw[k], &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols)
+            let txOpt = if !fp.isAgg { translateOverProj(&rm, &fp, &mvTab) }
+                        else { translateAggExpr(&rm, &fp, &mvTab, exactGroup, globalRollup) }
+            match txOpt {
+                Some(tx) {
+                    append(mut &rwItems, lexdb_sql.SelItem{star: false, qual: "", expr: Some(tx),
+                                                           alias: qItemAliases[k].clone(), spell: qItemSpells[k].clone()})
+                }
+                None { itemsOk = false; break }
+            }
+        }
+        if !itemsOk { continue }
+
+        // Translate HAVING (becomes WHERE when exactGroup == true, else stays HAVING!).
+        var rwHaving: Option[Expr] = None
+        match &qHavingRaw {
+            Some(hx) {
+                let rm = remapSlots(hx, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols)
+                let txOpt = if !fp.isAgg { translateOverProj(&rm, &fp, &mvTab) }
+                            else { translateAggExpr(&rm, &fp, &mvTab, exactGroup, globalRollup) }
+                match txOpt {
+                    Some(tx) {
+                        if fp.isAgg && exactGroup { append(mut &resWhere, tx) } else { rwHaving = Some(tx) }
+                    }
+                    None { itemsOk = false }
+                }
+            }
+            None {}
+        }
+        if !itemsOk { continue }
+
+        // Translate ORDER BY.
+        var rwOrder: []lexdb_sql.OrderItem = []
+        for oi in 0..len(s.order) {
+            if qOrdPos[oi] >= 0 {
+                let idx = qOrdPos[oi]
+                let ox = match &rwItems[idx].expr { Some(ex) { lexdb_sql.cloneExpr(ex) } None { Expr.Lit(Val.Null) } }
+                append(mut &rwOrder, lexdb_sql.OrderItem{expr: ox, desc: s.order[oi].desc, nullsFirst: s.order[oi].nullsFirst})
+            } else {
+                let rm = remapSlots(&qOrdRaw[oi], &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols)
+                let txOpt = if !fp.isAgg { translateOverProj(&rm, &fp, &mvTab) }
+                            else { translateAggExpr(&rm, &fp, &mvTab, exactGroup, globalRollup) }
+                match txOpt {
+                    Some(tx) { append(mut &rwOrder, lexdb_sql.OrderItem{expr: tx, desc: s.order[oi].desc, nullsFirst: s.order[oi].nullsFirst}) }
+                    None { itemsOk = false; break }
+                }
+            }
+        }
+        if !itemsOk { continue }
+
+        if score < bestScore {
+            var ns = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
+            ns.mdialect = s.mdialect
+            let mvName = mvTab.name.clone()
+            append(mut &ns.from, lexdb_sql.FromItem{table: mvName, alias: lexdb_sql.baseName(&mvTab.name), cols: [],
+                                                    join: lexdb_sql.J_FIRST, on: None, using: [], natural: false,
+                                                    sub: -1, lateral: false, work: -1, comma: true})
+            ns.items = rwItems
+            ns.where = joinAnd(&resWhere)
+            ns.group = rwGroup
+            ns.having = rwHaving
+            ns.order = rwOrder
+            ns.limit = match &s.limit { Some(lx) { Some(lexdb_sql.cloneExpr(lx)) } None { None } }
+            ns.offset = match &s.offset { Some(ox) { Some(lexdb_sql.cloneExpr(ox)) } None { None } }
+            ns.withTies = s.withTies
+            ns.params = s.params
+            bestScore = score
+            bestStmt = Some(ns)
+        }
+    }
+
+    return Ok(bestStmt)
 }

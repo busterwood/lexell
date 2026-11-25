@@ -11470,6 +11470,20 @@ fn groupKeys(s: &lexdb_sql.Stmt, q: &Query, outs: &[]OutCol, exprs: &[]Expr, sc:
 
 fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
               sc: mut &Scope): Result[Sel, DbErr] {
+    if s.kind == lexdb_sql.S_SELECT && s.setop == 0 && len(s.from) > 0 && s.lockMode == 0 {
+        let lim = Limits{rounds: MAX_RECURSION, steps: MAX_MATCH_STEPS, mem: txn.sql.memMax, deadline: 0, batch: true, rules: txn.sql.rules, auto: false, rdel: true}
+        let up = mvUp(st, txn.sql.sess, lim)
+        let qPath = collections.copyOf(&txn.sql.path)
+        match try lexdb_mview.tryRewrite(st, txn, s, &qPath, &up) {
+            Some(rw) {
+                lexdb_mview.pushSuppressRewrite(txn.sql.sess)
+                let res = planSelect(st, txn, &rw, params, sc)
+                lexdb_mview.popSuppressRewrite(txn.sql.sess)
+                return res
+            }
+            None {}
+        }
+    }
     if s.rec && s.setop != lexdb_sql.SET_UNION {
         return Err(e("42P19", "recursive query does not have the form non-recursive-term UNION [ALL] recursive-term"))
     }
@@ -13679,6 +13693,7 @@ fn (s: &Session) setting(name: &str): Option[str] {
         "lexdb_batch" { return Some(if s.batch { "on" } else { "off" }) }
         "lexdb_autoanalyze" { return Some(if s.auto { "on" } else { "off" }) }
         "lexdb_range_delete" { return Some(if s.rdel { "on" } else { "off" }) }
+        "query_rewrite_enabled" { return Some(if lexdb_mview.isQueryRewriteOn(s.id) { "on" } else { "off" }) }
         else {}
     }
     let k = strings.toLowerAscii(&name)
@@ -13695,7 +13710,7 @@ const SHOWN: []str = ["search_path", "max_recursion", "max_match_steps", "statem
                       "transaction_read_only", "default_transaction_read_only", "in_hot_standby", "server_version",
                       "server_version_num", "server_encoding", "client_encoding", "datestyle", "timezone", "log_timezone",
                       "intervalstyle", "lc_collate", "lc_ctype", "lc_messages", "lc_monetary", "lc_numeric", "lc_time",
-                      "max_identifier_length", "application_name", "bytea_output", "lexdb_batch", "lexdb_planner", "lexdb_autoanalyze", "lexdb_range_delete"]
+                      "max_identifier_length", "application_name", "bytea_output", "lexdb_batch", "lexdb_planner", "lexdb_autoanalyze", "lexdb_range_delete", "query_rewrite_enabled"]
 
 // The session's settings for current_setting and set_config (9.92), in the
 // memo while a statement calling them runs: a line each, name TAB value.
@@ -13803,6 +13818,13 @@ fn (s: mut &Session) applySetting(name: &str, value: &str, local: bool): Result[
         match lexdb_ops.parseBool(&strings.toLowerAscii(&(strings.trim(value)))) {
             Some(y) { s.rdel = y }
             None { return Err(e("22023", "parameter \"lexdb_range_delete\" requires a Boolean value")) }
+        }
+        return Ok(Unit{})
+    }
+    if k == "query_rewrite_enabled" {
+        match lexdb_ops.parseBool(&strings.toLowerAscii(&(strings.trim(value)))) {
+            Some(y) { lexdb_mview.setQueryRewrite(s.id, y) }
+            None { return Err(e("22023", "parameter \"query_rewrite_enabled\" requires a Boolean value")) }
         }
         return Ok(Unit{})
     }
@@ -14106,6 +14128,7 @@ fn (s: mut &Session) resetAll() {
     if len(s.txn) > 0 { s.txn[0].sql.rules = false }
     s.auto = true
     s.rdel = true
+    lexdb_mview.setQueryRewrite(s.id, true)
 }
 
 // Whether a statement a READ ONLY block refuses writes only temporary
@@ -14560,6 +14583,25 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                     None {}
                 }
                 s.auto = on
+            } else if stmt.table == "query_rewrite_enabled" {
+                var on = true
+                match stmt.limit {
+                    Some(x) {
+                        let noCols: []lexdb_sql.ColDef = []
+                        let none: []Val = []
+                        let noSubs: []SubRes = []
+                        let noSeq: Option[SeqEnv] = None
+                        let env = Env{cols: &noCols, row: &none, aggs: &none, params: params, subs: &noSubs, cur: &none, seq: &noSeq}
+                        let v = try eval(&x, &env)
+                        let b = match v { Val.Text(t) { lexdb_ops.parseBool(&t) } Val.Bool(y) { Some(y) } else { None } }
+                        match b {
+                            Some(y) { on = y }
+                            None { return Err(e("22023", "parameter \"query_rewrite_enabled\" requires a Boolean value")) }
+                        }
+                    }
+                    None {}
+                }
+                lexdb_mview.setQueryRewrite(s.id, on)
             } else if stmt.table == "lexdb_range_delete" {
                 var on = true                       // DEFAULT, RESET
                 match stmt.limit {
@@ -20877,9 +20919,13 @@ fn mvEval(cols: &[]lexdb_sql.ColDef, row: &[]Val, x: &Expr, _: &lexdb_time.Zone)
 
 fn mvRunQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &lexdb_sql.Stmt, path: &[]str): Result[lexdb_mview.QueryRows, DbErr] {
     let saved = replace(mut &txn.sql.path, collections.copyOf(path))
+    lexdb_mview.pushSuppressRewrite(txn.sql.sess)
+    lexdb_mview.pushSuppressRewrite(txn.sql.sess)
     var pc = oneShot()
     let lim = Limits{rounds: MAX_RECURSION, steps: MAX_MATCH_STEPS, mem: txn.sql.memMax, deadline: 0, batch: true, rules: txn.sql.rules, auto: false, rdel: true}
     let res = execIn(st, txn, q, &[], &[], lim, mut &pc, &noInput(), noOut, noPull, noSink)
+    lexdb_mview.popSuppressRewrite(txn.sql.sess)
+    lexdb_mview.popSuppressRewrite(txn.sql.sess)
     txn.sql.path = saved
     var r = try res
     return Ok(lexdb_mview.QueryRows{cols: replace(mut &r.cols, []), rows: replace(mut &r.rows, [])})
@@ -20887,8 +20933,12 @@ fn mvRunQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &lexdb_sql.S
 
 fn mvPlanOuts(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &lexdb_sql.Stmt, path: &[]str): Result[[]OutCol, DbErr] {
     let saved = replace(mut &txn.sql.path, collections.copyOf(path))
+    lexdb_mview.pushSuppressRewrite(txn.sql.sess)
+    lexdb_mview.pushSuppressRewrite(txn.sql.sess)
     var sc = newScopeIn(st, txn, &[], &[])
     let res = planSelect(st, txn, q, &[], mut &sc)
+    lexdb_mview.popSuppressRewrite(txn.sql.sess)
+    lexdb_mview.popSuppressRewrite(txn.sql.sess)
     txn.sql.path = saved
     let sel = try res
     return Ok(sel.outs)
@@ -21079,6 +21129,8 @@ fn dropMviewKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, ca
     }
     match try byKeyOpt(st, txn, key) {
         Some(t) {
+            let depMvs = try lexdb_mview.checkDropBase(st, txn, &t, cascade, doorMd(st, txn.sql.sess))
+            for mk in depMvs { try dropMviewKey(st, txn, &mk, true) }
             try dropDependentViews(st, txn, &t.name, cascade, &"materialized view")
             dropOne(txn, &t)
         }

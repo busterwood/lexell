@@ -36,6 +36,7 @@ SET SCHEMA 'schema_name'
   | `lexdb_batch` | `on` | Whether scans and operators work on batches of rows; `off` runs them a row at a time. |
   | `lexdb_autoanalyze` | `on` | Whether the session's changes count towards the statistics that are gathered on their own. |
   | `lexdb_range_delete` | `on` | Whether a `DELETE` of a primary key range drops the range whole (see [DELETE](delete.md)). |
+  | `query_rewrite_enabled` | `on` | Whether the planner rewrites eligible `SELECT` queries onto materialized views created with `ENABLE QUERY REWRITE`. |
 
   A name with a dot (`myapp.user_id`) is a custom setting: any text, read with `SHOW` or `current_setting`.
 

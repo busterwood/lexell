@@ -55,6 +55,8 @@ DROP MATERIALIZED VIEW [ IF EXISTS ] name [, ...] [ CASCADE | RESTRICT ]
     delta tree (avoiding hot-leaf `40001` write-write conflicts across concurrent writers), merges base + deltas on
     read in the reader's MVCC snapshot, and folds deltas into the base tree automatically in the background (or on
     `REFRESH MATERIALIZED VIEW name FAST`). Set `LEXDB_MV_FOLD=off` to disable background folding.
+  - `query_rewrite = true | false` (or `ENABLE | DISABLE QUERY REWRITE`): allows the planner to transparently rewrite
+    eligible `SELECT` queries against the base table(s) to read this materialized view instead.
 
 `WITH [ NO ] DATA`
 : `WITH DATA` (the default) populates the view immediately. `WITH NO DATA` creates it empty; reading it before the
@@ -82,7 +84,19 @@ DROP MATERIALIZED VIEW [ IF EXISTS ] name [, ...] [ CASCADE | RESTRICT ]
   `TRUNCATE`.
 - Sketch aggregates (`APPROX_COUNT_DISTINCT` via HyperLogLog++, `APPROX_PERCENTILE` via Dunning merging t-digest)
   merge associatively in $O(\Delta)$ on appends and automatically re-probe affected groups on deletes.
-- Dropping a base table or column referenced by a materialized view is refused (`2BP01`) unless `CASCADE` is given.
+- **Cascading materialized views:** A materialized view may query another materialized view, forming a multi-level
+  rollup DAG (for example `base -> mv_hourly -> mv_daily -> mv_total`, including cascading sketch rollups from
+  `APPROX_COUNT_DISTINCT_DETAIL` / `APPROX_PERCENTILE_DETAIL` to `APPROX_COUNT_DISTINCT_AGG` /
+  `APPROX_PERCENTILE_AGG`). Incremental deltas propagate topologically in $O(\Delta)$ across `ON STATEMENT`,
+  `ON COMMIT`, and background/explicit `FAST` delta folding.
+- **Automatic query rewrite:** When `ENABLE QUERY REWRITE` (or `WITH (query_rewrite = true)`) is set on a materialized
+  view and session parameter `query_rewrite_enabled` is `on` (default), the planner automatically rewrites eligible
+  `SELECT` queries against the base table(s) onto the lowest-cost matching materialized view. Supported rewrites
+  include exact matches, `HAVING` filters, subsumed `WHERE` predicates, coarser `GROUP BY` / global / `AVG` / sketch
+  rollups, and equi-joins. Stale `ON DEMAND` views (without `ON QUERY COMPUTATION`) and uncommitted `ON COMMIT` changes
+  are automatically skipped for correctness.
+- Dropping a base table, column, or upstream materialized view referenced by a downstream materialized view is refused
+  (`2BP01`) unless `CASCADE` is given.
 
 ## Differences from PostgreSQL
 
@@ -214,24 +228,77 @@ REFRESH MATERIALIZED VIEW
 (3 rows)
 ```
 
-### D. Catalog views and `ALTER` / `DROP`
+### D. Cascading materialized view rollup DAG and automatic query rewrite
+
+<!-- example: postgresql -->
+```sql
+CREATE MATERIALIZED VIEW mv_dept
+    WITH (refresh = 'fast_on_statement', query_rewrite = true) AS
+SELECT dept, count(*) AS n, sum(amt) AS total FROM sales GROUP BY dept;
+CREATE MATERIALIZED VIEW mv_grand
+    WITH (refresh = 'fast_on_statement') AS
+SELECT sum(n) AS total_rows, sum(total) AS grand_total FROM mv_dept;
+INSERT INTO sales VALUES (8, 'c', 200, true);
+SELECT * FROM mv_grand;
+EXPLAIN SELECT sum(amt) AS grand_total FROM sales;
+SELECT sum(amt) AS grand_total FROM sales;
+SET query_rewrite_enabled = off;
+EXPLAIN SELECT sum(amt) AS grand_total FROM sales;
+SET query_rewrite_enabled = on;
+```
+
+```text
+SELECT 3
+SELECT 1
+INSERT 0 1
+ total_rows | grand_total
+------------+-------------
+          7 |        1200
+(1 row)
+
+       QUERY PLAN
+-------------------------
+ scan mv_dept: full scan
+ aggregate
+(2 rows)
+
+ grand_total
+-------------
+        1200
+(1 row)
+
+SET
+      QUERY PLAN
+-----------------------
+ scan sales: full scan
+ aggregate
+(2 rows)
+
+SET
+```
+
+### E. Catalog views and `ALTER` / `DROP`
 
 <!-- example: postgresql -->
 ```sql
 SELECT matviewname, hasindexes, ispopulated FROM pg_matviews ORDER BY matviewname;
 ALTER MATERIALIZED VIEW mv_sales RENAME TO mv_sales_snap;
+DROP MATERIALIZED VIEW mv_dept CASCADE;
 DROP MATERIALIZED VIEW mv_sales_snap, mv_live, mv_rt;
 ```
 
 ```text
  matviewname | hasindexes | ispopulated
 -------------+------------+-------------
+ mv_dept     | f          | t
+ mv_grand    | f          | t
  mv_live     | f          | t
  mv_rt       | f          | t
  mv_sales    | t          | t
-(3 rows)
+(5 rows)
 
 ALTER MATERIALIZED VIEW
+DROP MATERIALIZED VIEW
 DROP MATERIALIZED VIEW
 ```
 
