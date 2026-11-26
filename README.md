@@ -70,7 +70,7 @@ Lexell is slightly behind cmark on long Markdown documents (ahead on the spec ex
 
 Java is ahead on division and comparison, and .NET is slightly ahead on 19-digit addition.
 
-Measured on one AMD Ryzen 7 8745HS running Linux 7.2, 24–25 November 2026. The [performance report](PERFORMANCE.md) has every result, what each benchmark does, and how to reproduce them.
+Measured on one AMD Ryzen 7 8745HS running Linux 7.2, 24–26 November 2026. The [performance report](PERFORMANCE.md) has every result, what each benchmark does, and how to reproduce them.
 
 ## Concurrency without threads or locks
 
@@ -159,11 +159,34 @@ This also prints `24.49`. The repository includes [other command-line tools, a R
 
 ## LexDB
 
-LexDB is a SQL database server written in Lexell (`lexell/cmd/lexdb.lxl`). It is designed for SSDs and NVMe drives, consumer drives first, and keeps its data on disk with memory as a cache. Pages are copy-on-write, so a write torn by a power cut can never damage a page in use, and its disk I/O goes through io_uring where the kernel allows it. It speaks three wire protocols: PostgreSQL's, SQL Server's TDS and Oracle's TNS, each with its own SQL dialect. Existing clients and drivers, such as `psql`, `pgbench`, the JDBC drivers and Lexell's own database clients, connect unchanged. Read-write transactions default to serializable isolation (with opt-in `READ COMMITTED`), and read-only transactions read from a snapshot. Tables are stored by column and queries run over batches of rows, planned by a cost-based optimizer. A server can run read-only replicas as separate processes.
+LexDB is a full-featured, single-binary SQL database server written in Lexell (`lexell/cmd/lexdb.lxl`), designed from the ground up for NVMe/SSD storage to handle both OLTP and analytical workloads in one engine — with no locks, no page latches, and no separate analytics cluster.
 
-On TPC-H at scale factor 1, LexDB on one core finishes the 22 queries in less total time than PostgreSQL on four processes (7.20 against 8.84 s) and takes 0.49 of PostgreSQL's time on one core (geometric mean, 22 of 22 faster than one core; 0.79 against four processes). On ClickBench (1M rows, 43 queries on a 105-column wide table), LexDB on one core beats PostgreSQL on one core on both total wall time (14.10 against 22.36 s, `0.63×`) and geometric mean (0.68 wall, 0.64 CPU; 40 of 43 level or ahead; adding eight general-purpose `ENABLE QUERY REWRITE` materialized views transparently rewrites 21 unmodified queries — including exact `COUNT(DISTINCT)`, wide `URL`/`SearchPhrase` keys, and derived `GROUP BY` — cutting total wall time to 9.07 s, ahead of 4-core PostgreSQL's 11.33 s on one core, with geomean 0.10 vs one core / 0.21 vs four processes and 6.5–10.3 ms live incremental writes across all 8 views, while optional hierarchical data skipping indexes cut selective point and `LIKE` filters by up to 4.07×). On sysbench OLTP (1M rows), LexDB leads PostgreSQL 18 on all six workloads at 1 thread (`1.09×`–`2.81×`), commits durable updates faster from a single process at every concurrency up to 32 threads (`2.36×`–`3.13×` non-indexed, `1.32×`–`2.54×` indexed; pgbench 1M updates `2.41×`–`2.67×` up to 63.3k/s) as well as `oltp_write_only` through 8 threads (`1.34×`–`1.96×`), and with three read replicas beats four-core PostgreSQL on pgbench point selects (`470–490k/s` vs `397k/s`, `1.18×`–`1.23×`) and sysbench `oltp_point_select` (`1.05×`, 29% less CPU) at 32 threads. On bulk `\copy` loads, LexDB beats PostgreSQL on all five workloads (`0.37×`–`0.94×`). Incremental materialized views (`FAST`, composable HyperLogLog++/t-digest sketches, `ON QUERY COMPUTATION`, and cascading rollup DAGs) build 42% faster than PostgreSQL on sketch rollups (`220` vs `379 ms`) and update in `0.43–0.66 ms` per row against `60–369 ms` for PostgreSQL `REFRESH MATERIALIZED VIEW`. PostgreSQL is ahead on single-process multi-thread reads and multi-statement read-write blocks ([details](PERFORMANCE.md#lexdb)).
+One server speaks **three native wire protocols and SQL dialects simultaneously** — PostgreSQL, SQL Server (TDS / T-SQL), and Oracle (TNS / PL/SQL) — over the same tables. Existing clients and drivers (`psql`, `pgbench`, JDBC, ODBC, `sqlcmd`, and Lexell's own clients) connect unchanged.
 
-For now, the [program notes](lexell/cmd/README.md#lexdb) cover running it, and the [design](lexell/design/lexdb.md) covers how it works. A full LexDB guide is in progress.
+### Highlights
+
+- **Lock-free, crash-safe storage on `io_uring`.** Every session runs as a lightweight task on one thread, eliminating page latches and lock contention. Copy-on-write B+trees prevent torn writes on power loss, durable commits group-flush automatically, transactions default to `SERIALIZABLE` (with opt-in `READ COMMITTED`), and separate read-replica processes scale reads linearly across cores.
+- **Hybrid OLTP + columnar analytics.** Tables pack into columnar leaves and execute through vectorized batch operators, adaptive two-level hash aggregation, and a cost-based optimizer — supporting joins, window functions, CTEs, subqueries, and full ACID transactions on the same data.
+- **Incremental [materialized views & transparent query rewrite](lexell/docs/lexdb/materialized-views.md).** Views stay current automatically in under a millisecond (`FAST` incremental updates), support contention-free real-time delta merging for hot keys, cascading rollup DAGs, and composable HyperLogLog++ / t-digest sketches, and transparently accelerate unmodified base-table queries with zero application changes.
+- **Automatic zone maps & [data skipping indexes](lexell/docs/lexdb/skipping-indexes.md).** Always-on hierarchical min/max pruning (including dynamic Top-N) plus optional `minmax`/`brin`, `set`, `bloom_filter`, `ngrambf`, and `tokenbf` skipping indexes cut selective point and `LIKE '%substring%'` filters by up to **4.1×** with tiny storage overhead and zero write slowdown.
+- **Complete relational feature set across all three doors.** Secondary B+tree indexes, foreign keys, views, stored procedures and triggers, cross-door [`CREATE ASSERTION`](lexell/docs/lexdb/assertions.md) invariants, roles and privileges, and fast native bulk loading (`COPY`, `bcp`/`SqlBulkCopy`, Oracle array DML).
+
+### Performance against PostgreSQL 18
+
+| Workload | LexDB | PostgreSQL 18 | Result |
+|---|---:|---:|---:|
+| **TPC-H SF1** (22 queries, 1 core) | 7.20 s | 14.67 s (1 core) / 8.84 s (4 proc) | **2.0× faster** than 1 core (22/22); **1.23× faster** than 4 proc |
+| **ClickBench 1M** (43 queries, 105 cols, 1 core) | 14.10 s | 22.36 s (1 core) / 11.33 s (4 proc) | **1.59× faster** than 1 core (40/43 level or ahead) |
+| **ClickBench 1M + 8 MVs** (unmodified queries, 1 core) | **9.07 s** | 11.33 s (4 proc) | **1.25× faster than 4-core PG on one core** (21 rewritten) |
+| **35 Analytic Queries** (1M rows, 1 core) | 0.46× CPU / 0.91× wall | 1 core / 4 proc | **2.2× less CPU** than 1 core; ahead of 4 proc on wall time |
+| **Durable updates** (pgbench / sysbench, 1–32 clients) | up to 63.3k / 54.2k/s | 25.7k / 23.0k/s | **2.4–3.1× faster** (indexed updates **1.3–2.5×**) |
+| **Point selects** (3 read replicas, 32 clients) | 470–490k/s (pgbench) | 397k/s (4 cores) | **1.18–1.23× faster** (sysbench **1.05×**, 29% less CPU) |
+| **Bulk `\copy` loads** (5 cases, 1M–10M rows) | 0.24–2.44 s | 0.61–5.93 s | **1.1–2.7× faster** on all 5 workloads |
+| **Materialized view maintenance** (1M rows, 1-row insert) | **0.43–0.66 ms** (`FAST`) | 60–369 ms (`REFRESH`) | **90–780× faster** incremental updates |
+
+PostgreSQL is ahead on single-process multi-thread reads and multi-statement read-write blocks. See the [performance report](PERFORMANCE.md#lexdb) for query-by-query numbers, caveats, and reproduction steps.
+
+Start with the [LexDB documentation](lexell/docs/lexdb/README.md) (quickstart, guides, and SQL references for PostgreSQL, SQL Server, and Oracle), or see the [program notes](lexell/cmd/README.md#lexdb) and [design](lexell/design/lexdb.md).
 
 ## Why I built Lexell
 
@@ -197,7 +220,7 @@ See the [database streaming design](lexell/design/db-streaming.md) for an exampl
 | [Programs and examples](lexell/cmd/README.md) | How to build and run the programs, with supported behaviour and test instructions. |
 | [Database streaming](lexell/design/db-streaming.md) | How typed row mapping and bounded batches work. |
 | [Concurrency](lexell/design/concurrency.md) | Tasks, the event loop and worker processes. |
-| [LexDB](lexell/cmd/README.md#lexdb) and [its design](lexell/design/lexdb.md) | Running the database server, and how it works. |
+| [LexDB documentation](lexell/docs/lexdb/README.md) and [design](lexell/design/lexdb.md) | User guide, materialized views, skipping indexes, SQL references for all three doors, and internals. |
 | [Performance](PERFORMANCE.md) and [native versus C](lexell/design/native-vs-c.md) | Measurements, caveats and the two backends. |
 | [Repository guide](lexell/README.md) and [project history](HISTORY.md) | The source tree, test suites and how the project evolved. |
 
