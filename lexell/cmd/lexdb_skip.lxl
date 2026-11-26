@@ -14,6 +14,8 @@
 //    - TOKENBF       : alphanumeric token Bloom filter for = / delimiter-bounded LIKE '%.tok.%'
 //    ILIKE prunes through NGRAMBF (each gram probed in its spellings) or a case_insensitive NGRAMBF /
 //    TOKENBF (folded summaries); an OR prunes a node when every alternative does (SkipQuery.alts).
+//    has_token(col, 'word') and a constant regular expression's literal runs (lexdb_token.reRuns)
+//    prune through TOKENBF (whole tokens next to a word boundary) and NGRAMBF (SkipQuery.tokRuns).
 //    All four index kinds form commutative monoids (min/max union, set union, bitwise-OR of Bloom filters),
 //    so summaries roll up hierarchically across internal B+tree nodes and persist by immutable diskPageNo
 //    in a companion B+tree for instant cold-restart skipping without re-reading data pages.
@@ -194,6 +196,11 @@ pub type SkipQuery = record {
     pub likePl: []int           // place index for simple LIKE / ILIKE
     pub likePieces: [][]str     // likeSplit pieces (for NGRAMBF / TOKENBF / SET); ILIKE's folded
     pub likeFold: []bool        // ILIKE: matched with ASCII letters folded (likeMatch)
+    // Runs of text every matching value holds (has_token's word, a regular expression's
+    // literal runs: lexdb_token.reRuns), with TF_* flags; folded when TF_ASCII or TF_UNI
+    pub tokPl: []int
+    pub tokRuns: []str
+    pub tokFlags: []int
     // OR groups: a node is skipped when every alternative of one group is
     // proved false on it (each alternative its own conjunction of the above)
     pub alts: [][]SkipQuery
@@ -208,12 +215,22 @@ pub type SkipQuery = record {
 pub fn emptyQuery(): SkipQuery {
     return SkipQuery{active: false, ranges: [], nes: [], eqPl: [], eqInt: [], inPl: [], inInts: [],
                      strPl: [], strOp: [], strVals: [], likePl: [], likePieces: [], likeFold: [], alts: [],
+                     tokPl: [], tokRuns: [], tokFlags: [],
                      barOn: false, barPl: -1, barKind: 0, barVal: 0, barDesc: false, barNf: false}
 }
 
+// SkipQuery.tokFlags: a word boundary before the run (its first token whole) and after it
+// (its last), as lexdb_token.RUN_START / RUN_END; matched with ASCII letters folded
+// (has_token_ci); matched as a case-insensitive regular expression does (Unicode's simple
+// folding: k and s also match the Kelvin sign and the long s, which no token holds).
+pub const TF_START = 1
+pub const TF_END = 2
+pub const TF_ASCII = 4
+pub const TF_UNI = 8
+
 pub fn (q: &SkipQuery) hasFilters(): bool {
     return len(q.ranges) > 0 || len(q.nes) > 0 || len(q.eqPl) > 0 || len(q.inPl) > 0 ||
-           len(q.strPl) > 0 || len(q.likePl) > 0 || len(q.alts) > 0 || q.barOn
+           len(q.strPl) > 0 || len(q.likePl) > 0 || len(q.alts) > 0 || len(q.tokPl) > 0 || q.barOn
 }
 
 pub fn (q: &SkipQuery) hasAutoFilters(): bool {
@@ -444,22 +461,27 @@ const FOLD_MAX_LETTERS = 6
 // letter in either case: what likeMatch folds to it). False when some gram
 // has none. ng <= 8 (createSkipIndex), so a gram is ngramHashPair's word,
 // and a spelling is that word with 0x20 cleared in some letters' bytes.
-fn bloomHasNgramsFold(bits: &[byte], hashes: int, ng: int, s: &str): bool {
+// variants false: s's own spelling only (a folded filter). noKS: a gram with
+// k or s is taken as present (a case-insensitive regular expression: they
+// also match a character outside ASCII).
+fn bloomHasNgramsFold(bits: &[byte], hashes: int, ng: int, s: &str, variants: bool, noKS: bool): bool {
     let n = len(s)
     if n < ng || ng > 8 { return true }
     for i in 0..(n - ng + 1) {
         var w: u64 = u64(ng) << 56
         var lmask: u64 = 0
         var letters = 0
+        var ks = false
         for j in 0..ng {
             let c = s[i + j]
             w |= u64(int(c)) << (j * 8)
-            if c >= 'a' && c <= 'z' {
+            if c == 'k' || c == 's' { ks = true }
+            if variants && c >= 'a' && c <= 'z' {
                 lmask |= u64(0x20) << (j * 8)
                 letters += 1
             }
         }
-        if letters > FOLD_MAX_LETTERS { continue }
+        if letters > FOLD_MAX_LETTERS || (noKS && ks) { continue }
         var sub = lmask
         var any = false
         while true {
@@ -495,20 +517,29 @@ fn bloomAddTokens(bits: mut &[]byte, hashes: int, s: &str) {
 // - exact = true: every token in s must be present
 // - exact = false (LIKE piece): only tokens bounded on BOTH sides by non-token bytes inside s
 //   (or anchored at start/end when anchorStart/anchorEnd is true).
-// - noLetters: only tokens without an ASCII letter (ILIKE against a filter of the text as
-//   written: a token's other spellings are not in s, but one of digits has none).
-fn bloomHasTokens(bits: &[byte], hashes: int, s: &str, anchorStart: bool, anchorEnd: bool, noLetters: bool): bool {
+// - mode TOK_NO_LETTERS: only tokens without an ASCII letter (ILIKE against a filter of the
+//   text as written: a token's other spellings are not in s, but one of digits has none);
+//   TOK_NO_KS: not tokens with a k or an s (a case-insensitive regular expression: those
+//   letters also match the Kelvin sign and the long s, which split tokens).
+const TOK_ALL = 0
+const TOK_NO_LETTERS = 1
+const TOK_NO_KS = 2
+
+fn bloomHasTokens(bits: &[byte], hashes: int, s: &str, anchorStart: bool, anchorEnd: bool, mode: int): bool {
     let n = len(s)
     var i = 0
     while i < n {
         while i < n && !isTokenByte(s[i]) { i += 1 }
         let st = i
         var letter = false
+        var ks = false
         while i < n && isTokenByte(s[i]) {
-            if s[i] > '9' { letter = true }
+            let c = s[i]
+            if c > '9' { letter = true }
+            if c == 'k' || c == 's' || c == 'K' || c == 'S' { ks = true }
             i += 1
         }
-        if i > st && !(noLetters && letter) {
+        if i > st && !(mode == TOK_NO_LETTERS && letter) && !(mode == TOK_NO_KS && ks) {
             let leftOk = st > 0 || anchorStart
             let rightOk = i < n || anchorEnd
             if leftOk && rightOk {
@@ -1133,10 +1164,10 @@ fn idxExcludes(ix: &IdxSum, q: &SkipQuery): bool {
                 if !any { return true }
             }
         } else if ix.kind == SKIP_TOKEN {
-            if op == 0 { if !bloomHasTokens(&ix.bits, ix.hashes, &ks[0], true, true, false) { return true } }
+            if op == 0 { if !bloomHasTokens(&ix.bits, ix.hashes, &ks[0], true, true, TOK_ALL) { return true } }
             else if op == 6 {
                 var any = false
-                for k in ks { if bloomHasTokens(&ix.bits, ix.hashes, &k, true, true, false) { any = true; break } }
+                for k in ks { if bloomHasTokens(&ix.bits, ix.hashes, &k, true, true, TOK_ALL) { any = true; break } }
                 if !any { return true }
             }
         }
@@ -1165,7 +1196,7 @@ fn idxExcludes(ix: &IdxSum, q: &SkipQuery): bool {
                 if len(p) >= ix.ngramN {
                     if fold && !ix.ci {
                         // an n-gram filter of the text as written: each gram in any case
-                        if !bloomHasNgramsFold(&ix.bits, ix.hashes, ix.ngramN, &p) { return true }
+                        if !bloomHasNgramsFold(&ix.bits, ix.hashes, ix.ngramN, &p, true, false) { return true }
                     } else {
                         let f = if ix.ci { strings.toLowerAscii(&p) } else { "" }
                         let qStr: &str = if ix.ci { &f } else { &p }
@@ -1182,8 +1213,34 @@ fn idxExcludes(ix: &IdxSum, q: &SkipQuery): bool {
                 let qStr: &str = if ix.ci { &f } else { p }
                 let aStart = k == 0
                 let aEnd = k == np - 1
-                if !bloomHasTokens(&ix.bits, ix.hashes, qStr, aStart, aEnd, fold && !ix.ci) { return true }
+                if !bloomHasTokens(&ix.bits, ix.hashes, qStr, aStart, aEnd, if fold && !ix.ci { TOK_NO_LETTERS } else { TOK_ALL }) { return true }
             }
+        }
+    }
+    // Runs every match holds (has_token(col, 'word'), col ~ '\yword\y')
+    for i in 0..len(q.tokPl) {
+        if q.tokPl[i] != pl { continue }
+        if !ix.hasVal { return true }
+        let r = &q.tokRuns[i]
+        let fl = q.tokFlags[i]
+        let folded = (fl & (TF_ASCII | TF_UNI)) != 0    // r is folded; the match is too
+        let uni = (fl & TF_UNI) != 0
+        if ix.kind == SKIP_NGRAM {
+            if len(r) >= ix.ngramN {
+                if folded {
+                    // a filter as written: each gram in its spellings; folded: as it is
+                    if !bloomHasNgramsFold(&ix.bits, ix.hashes, ix.ngramN, r, !ix.ci, uni) { return true }
+                } else {
+                    let f = if ix.ci { strings.toLowerAscii(r) } else { "" }
+                    let qStr: &str = if ix.ci { &f } else { r }
+                    if !bloomHasNgrams(&ix.bits, ix.hashes, ix.ngramN, qStr) { return true }
+                }
+            }
+        } else if ix.kind == SKIP_TOKEN {
+            let f = if ix.ci && !folded { strings.toLowerAscii(r) } else { "" }
+            let qStr: &str = if ix.ci && !folded { &f } else { r }
+            let mode = if !folded { TOK_ALL } else if !ix.ci { TOK_NO_LETTERS } else if uni { TOK_NO_KS } else { TOK_ALL }
+            if !bloomHasTokens(&ix.bits, ix.hashes, qStr, (fl & TF_START) != 0, (fl & TF_END) != 0, mode) { return true }
         }
     }
     return false

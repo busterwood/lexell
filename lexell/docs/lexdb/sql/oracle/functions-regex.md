@@ -12,6 +12,8 @@ REGEXP_REPLACE ( source_char, pattern [, replace_string [, position [, occurrenc
 REGEXP_SUBSTR ( source_char, pattern [, position [, occurrence [, match_param [, subexpr ] ] ] ] )
 REGEXP_INSTR ( source_char, pattern [, position [, occurrence [, return_option [, match_param [, subexpr ] ] ] ] ] )
 REGEXP_COUNT ( source_char, pattern [, position [, match_param ] ] )
+HAS_TOKEN ( source_char, word )
+HAS_TOKEN_CI ( source_char, word )
 ```
 
 The fuzzy matching functions of the `UTL_MATCH` package are on the [package functions page](functions-packages.md).
@@ -21,6 +23,12 @@ The fuzzy matching functions of the `UTL_MATCH` package are on the [package func
 `REGEXP_LIKE`
 : A condition: true when *source_char* contains a match of *pattern*. It is not a value, so it appears in `WHERE`,
   `HAVING`, `CASE WHEN` and `ON`. Selecting it directly gives `true` or `false` in lexdb's output.
+
+`HAS_TOKEN`, `HAS_TOKEN_CI`
+: lexdb's own (not in Oracle): a condition, true when *word* is one of *source_char*'s tokens (the runs of ASCII
+  letters and digits between any other characters); `HAS_TOKEN_CI` ignores the case of ASCII letters. *word* must be
+  one token. A `tokenbf` [skipping index](../../skipping-indexes.md) skips blocks for it, and for `REGEXP_LIKE` with
+  `^`, `$` or `\b` next to a word.
 
 `REGEXP_REPLACE`
 : *source_char* with matches of *pattern* replaced by *replace_string*. *position* is where the search starts and

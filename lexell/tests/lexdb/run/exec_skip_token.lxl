@@ -1,0 +1,202 @@
+// Whole-word search with skipping indexes (design/lexdb.md, "As built: whole-word
+// search for tokenbf"):
+// - lexdb_token.reRuns: the literal runs a regular expression's every match holds
+// - has_token / has_token_ci: tokenbf's tokens, as a function
+// - has_token, ~, ~* and regexp_like pruned by tokenbf (exact and case_insensitive)
+//   and ngrambf, in an OR too, and from the summaries persisted for a cold start
+// Every count is the answer the rows give (no false negatives).
+// expect: re_runs: ok
+// expect: has_token_fn: ok
+// expect: tok_exact: ok
+// expect: regex_exact: ok
+// expect: tok_ci: ok
+// expect: ngram_runs: ok
+// expect: or_tokens: ok
+// expect: reopen_cold: ok
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_skip"
+import "../../../cmd/lexdb_token"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return "ERR:" + e.state + ":" + e.msg }
+    }
+}
+
+fn qInt(s: mut &lexdb_exec.Session, sql: &str): int {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows && len(r.rows) > 0 && len(r.rows[0]) > 0 {
+                match r.rows[0][0] {
+                    lexdb_sql.Val.Int(i) { return i }
+                    else { return -999999 }
+                }
+            }
+            return -999999
+        }
+        Err(_) { return -999999 }
+    }
+}
+
+fn must(s: mut &lexdb_exec.Session, sql: &str) {
+    let r = q(s, sql)
+    if strings.startsWith(&r, "ERR:") { panic("SQL failed: " + sql + " -> " + r) }
+}
+
+type Got = value record { n: int; skipped: int }
+
+fn cnt(s: mut &lexdb_exec.Session, where: &str): Got {
+    lexdb_skip.resetCounters()
+    let n = qInt(s, &("SELECT COUNT(*) FROM logs WHERE " + where))
+    return Got{n: n, skipped: lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()}
+}
+
+fn show(g: Got): str { return g.n.toStr() + "/" + g.skipped.toStr() }
+
+fn runs(pat: &str, tsql: bool): str {
+    var rs: []str = []
+    var an: []int = []
+    if !lexdb_token.reRuns(pat, tsql, mut &rs, mut &an) { return "none" }
+    var out: []str = []
+    for i in 0..len(rs) { append(mut &out, "[" + rs[i] + "]" + an[i].toStr()) }
+    return strings.join(&out, ",")
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 512 * 1024, ckptBytes: 256 * 1024, snapNodes: 50000}
+}
+
+const MISS_TOK = "has_token(msg, 'zzqq')"
+const MISS_RE = "msg ~ '\\yzzqq\\y'"
+const HIT_RE = "msg ~ '\\ycheckout\\y'"
+
+fn runPhase1(st: lexdb_store.Store): int {
+    // 1. The runs of a pattern (anchors: 1 a boundary before, 2 after)
+    var bad: []str = []
+    let cases = [
+        ["\\ytimeout\\y", "[timeout]3"], ["\\mcheck\\M.*\\yout", "[check]3,[out]1"], ["error 503", "[error 503]0"],
+        ["^GET /api/v1", "[GET /api/v1]1"], ["colou?r", "[colo]0,[r]0"], ["ab+c", "[ab]0,[c]0"], ["foo|bar", "none"],
+        ["(?i)foo", "none"], ["[abc]x(yz)w", "[x]0,[w]0"], ["\\d+ items\\b", "[ items]2"], ["a\\.b", "[a.b]0"],
+        ["x{2,3}y", "[y]0"], ["\\Bfoo", "[foo]0"], ["***=lit", "none"], ["café$", "[café]2"], ["a\\x41", "none"],
+        ["[]a]b", "[b]0"], ["(a(b)c)d", "[d]0"], ["\\b*x", "none"]]
+    for c in cases {
+        let got = runs(&c[0], false)
+        if got != c[1] { append(mut &bad, c[0] + " -> " + got) }
+    }
+    if runs(&"\\btoken\\b", true) != "[token]3" { append(mut &bad, "tsql \\b") }
+    if runs(&"\\ytoken", true) != "none" { append(mut &bad, "tsql \\y") }
+    println("re_runs: " + (if len(bad) == 0 { "ok" } else { "FAIL:" + strings.join(&bad, " | ") }))
+
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st.share())
+    must(mut &s, "CREATE TABLE logs (id BIGINT PRIMARY KEY, msg TEXT)")
+    // 12,000 rows; the few that differ:
+    //   100, 7100 'ERROR checkout_timeout on node-7'   (tokens checkout, timeout: _ splits; no \y between them)
+    //   3000      'retry checkout now'
+    //   5000      'Error: Checkout Timeout'
+    //   9000      'mycheckout ok'                       (a substring, not a token)
+    must(mut &s, "INSERT INTO logs SELECT g, CASE WHEN g IN (100, 7100) THEN 'ERROR checkout_timeout on node-7' WHEN g = 3000 THEN 'retry checkout now' WHEN g = 5000 THEN 'Error: Checkout Timeout' WHEN g = 9000 THEN 'mycheckout ok' ELSE 'INFO request ' || CAST(g AS TEXT) || ' served in 12ms' END FROM generate_series(1, 12000) AS g")
+    st.checkpoint().unwrap()
+
+    // 2. The functions themselves
+    let f1 = q(mut &s, "SELECT has_token('a checkout_timeout b', 'checkout'), has_token('mycheckout', 'checkout'), has_token('Checkout', 'checkout'), has_token_ci('Checkout!', 'CHECKOUT'), hastoken('x-1', '1'), has_token(NULL, 'a')")
+    let f2 = q(mut &s, "SELECT has_token(msg, 'two words') FROM logs WHERE id = 1")
+    let f3 = q(mut &s, "SELECT has_token('abc', '')")
+    let fnOk = f1 == "t|f|f|t|t|NULL" && strings.startsWith(&f2, "ERR:22023:") && strings.startsWith(&f3, "ERR:22023:")
+    println("has_token_fn: " + (if fnOk { "ok" } else { "FAIL:" + f1 + "|" + f2 + "|" + f3 }))
+
+    // 3. tokenbf of the text as written: has_token
+    must(mut &s, "CREATE SKIPPING INDEX ix_msg_tok ON logs (msg) USING tokenbf")
+    let a1 = cnt(mut &s, "has_token(msg, 'checkout')")
+    let a2 = cnt(mut &s, MISS_TOK)
+    let a3 = cnt(mut &s, "has_token_ci(msg, 'CHECKOUT')")     // letters, folded: not pruned here, still right
+    let a4 = cnt(mut &s, "has_token(msg, '7')")
+    let tokOk = a1.n == 3 && a1.skipped > 0 && a2.n == 0 && a2.skipped > 0 && a3.n == 4 && a4.n == 3 && a4.skipped > 0
+    println("tok_exact: " + (if tokOk { "ok" } else { "FAIL:" + show(a1) + ":" + show(a2) + ":" + show(a3) + ":" + show(a4) }))
+
+    // 4. ... and regular expressions
+    let r1 = cnt(mut &s, HIT_RE)
+    let r2 = cnt(mut &s, MISS_RE)
+    let r3 = cnt(mut &s, "msg ~* '\\ycheckout\\y'")            // case-insensitive on a filter as written: not pruned
+    let r4 = cnt(mut &s, "regexp_like(msg, '\\yzzqq\\y')")
+    let r5 = cnt(mut &s, "regexp_like(msg, '\\yCHECKOUT\\y', 'i')")
+    let r6 = cnt(mut &s, "msg ~ 'checkout|zzz'")                // an alternation: not pruned
+    let r7 = cnt(mut &s, "msg ~ 'served in \\d+ms'")
+    let r8 = q(mut &s, "SELECT COUNT(*) FROM logs WHERE msg ~ '(\\yzzqq'")     // its error, not hidden by skipping
+    let r9 = cnt(mut &s, "msg ~ '^retry checkout'")
+    let reOk = r1.n == 1 && r1.skipped > 0 && r2.n == 0 && r2.skipped > 0 && r3.n == 2 && r4.n == 0 && r4.skipped > 0 &&
+               r5.n == 2 && r6.n == 4 && r7.n == 11995 && strings.startsWith(&r8, "ERR:2201B:") && r9.n == 1 && r9.skipped > 0
+    println("regex_exact: " + (if reOk { "ok" } else { "FAIL:" + show(r1) + ":" + show(r2) + ":" + show(r3) + ":" + show(r4) + ":" + show(r5) + ":" + show(r6) + ":" + show(r7) + ":" + r8 + ":" + show(r9) }))
+
+    // 5. tokenbf WITH (case_insensitive = true)
+    must(mut &s, "DROP SKIPPING INDEX ix_msg_tok")
+    must(mut &s, "CREATE SKIPPING INDEX ix_msg_tokci ON logs (msg) USING tokenbf WITH (case_insensitive = true)")
+    let c1 = cnt(mut &s, "msg ~* '\\ytimeout\\y'")
+    let c2 = cnt(mut &s, "msg ~* '\\yzzqq\\y'")
+    let c3 = cnt(mut &s, "msg ~* '\\yzzsk\\y'")      // k and s: not pruned (the Kelvin sign, the long s)
+    let c4 = cnt(mut &s, "has_token_ci(msg, 'TIMEOUT')")
+    let c5 = cnt(mut &s, HIT_RE)                       // case-sensitive, its run folded to check
+    let ciOk = c1.n == 1 && c1.skipped > 0 && c2.n == 0 && c2.skipped > 0 && c3.n == 0 && c3.skipped == 0 &&
+               c4.n == 3 && c4.skipped > 0 && c5.n == 1 && c5.skipped > 0
+    println("tok_ci: " + (if ciOk { "ok" } else { "FAIL:" + show(c1) + ":" + show(c2) + ":" + show(c3) + ":" + show(c4) + ":" + show(c5) }))
+
+    // 6. ngrambf: a run is a substring every match holds
+    must(mut &s, "DROP SKIPPING INDEX ix_msg_tokci")
+    must(mut &s, "CREATE SKIPPING INDEX ix_msg_ng ON logs (msg) USING ngrambf")
+    let n1 = cnt(mut &s, "msg ~ 'zzqqx'")
+    let n2 = cnt(mut &s, "msg ~* 'CHECKOUT'")
+    let n3 = cnt(mut &s, MISS_TOK)
+    let n4 = cnt(mut &s, "msg ~* 'zzsks'")           // every gram has a k or an s: not pruned
+    let ngOk = n1.n == 0 && n1.skipped > 0 && n2.n == 5 && n2.skipped > 0 && n3.n == 0 && n3.skipped > 0 && n4.n == 0 && n4.skipped == 0
+    println("ngram_runs: " + (if ngOk { "ok" } else { "FAIL:" + show(n1) + ":" + show(n2) + ":" + show(n3) + ":" + show(n4) }))
+
+    // 7. In an OR, with the tokenbf back too
+    must(mut &s, "CREATE SKIPPING INDEX ix_msg_tok ON logs (msg) USING tokenbf")
+    let o1 = cnt(mut &s, MISS_TOK + " OR " + MISS_RE)
+    let o2 = cnt(mut &s, MISS_TOK + " OR " + HIT_RE)
+    let o3 = cnt(mut &s, MISS_TOK + " OR msg LIKE '%qqzzx%' OR msg ILIKE '%XXQQZ%'")
+    let o4 = cnt(mut &s, "(" + MISS_TOK + " OR id < 3) AND msg ~ 'request'")
+    let orOk = o1.n == 0 && o1.skipped > 0 && o2.n == 1 && o2.skipped > 0 && o3.n == 0 && o3.skipped > 0 && o4.n == 2
+    println("or_tokens: " + (if orOk { "ok" } else { "FAIL:" + show(o1) + ":" + show(o2) + ":" + show(o3) + ":" + show(o4) }))
+
+    st.checkpoint().unwrap()
+    must(mut &s, "ANALYZE logs")
+    st.checkpoint().unwrap()
+    return 0
+}
+
+fn runPhase2(st: lexdb_store.Store): int {
+    var s = lexdb_exec.newSession(st.share())
+    let k1 = cnt(mut &s, MISS_RE)
+    let k2 = cnt(mut &s, MISS_TOK)
+    let k3 = cnt(mut &s, HIT_RE)
+    let coldOk = k1.n == 0 && k1.skipped > 0 && k2.n == 0 && k2.skipped > 0 && k3.n == 1 && k3.skipped > 0
+    println("reopen_cold: " + (if coldOk { "ok" } else { "FAIL:" + show(k1) + ":" + show(k2) + ":" + show(k3) }))
+    must(mut &s, "DROP TABLE logs")
+    return 0
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(232)
+    lexdb_store.run(fs.share(), opts(), fn(st: lexdb_store.Store): int { return runPhase1(st) }).unwrap()
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int { return runPhase2(st) }).unwrap()
+}

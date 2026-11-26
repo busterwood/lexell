@@ -49,7 +49,7 @@ With zero configuration, lexdb automatically skips non-matching subtrees and blo
 | `WHERE status = 'failed'` or `WHERE country IN ('JP', 'KR')` (**few distinct values** per block, unsorted) | **`set`** |
 | `WHERE user_id = 435090932899640449` or `WHERE trace_id = '...'` (**many distinct values**, exact `=` / `IN`) | **`bloom_filter`** (alias `bloom`) |
 | `WHERE url LIKE '%google%'` or `WHERE title ILIKE '%error%'` (**any substring** match in text) | **`ngrambf`** |
-| `WHERE log_msg LIKE '% timeout %'` or `WHERE url LIKE '%/checkout/%'` (**delimiter-bounded whole-word / token** match in long text) | **`tokenbf`** (add `WITH (case_insensitive = true)` for `ILIKE`) |
+| `WHERE has_token(log_msg, 'timeout')`, `WHERE log_msg ~ '\ytimeout\y'` or `WHERE log_msg LIKE '% timeout %'` (**whole-word / token** match in long text) | **`tokenbf`** (add `WITH (case_insensitive = true)` for `ILIKE`, `has_token_ci` and `~*`) |
 
 Conditions joined by `OR` can use skipping indexes too, as long as every branch of the `OR` has a condition one of the
 table's indexes (or the automatic zone maps) can check — see [OR conditions](#or-conditions).
@@ -174,7 +174,9 @@ punctuation, slashes, hyphens). For example, `'https://news.example.com/checkout
 - **Unbounded or mid-word substring matches:** `WHERE msg LIKE '%timeout%'` (with `%` directly touching the word) will
   *not* prune blocks with `tokenbf` because `%` could match part of a longer word like `'mytimeout'`. Include
   non-alphanumeric separators around the token — such as `LIKE '% timeout %'`, `LIKE '%/checkout/%'`, or
-  `LIKE '%.google.%'` — or use `ngrambf` when you need arbitrary `%substring%` matching.
+  `LIKE '%.google.%'` — or, better, ask for the whole word: `has_token(msg, 'timeout')` or `msg ~ '\ytimeout\y'`
+  (see [Whole-word search](#whole-word-search-has_token-and-regular-expressions)). Use `ngrambf` when you need
+  arbitrary `%substring%` matching.
 - **`ILIKE` on an index of the text as written:** a word could be stored as `Timeout`, `TIMEOUT` or `timeout`, so only
   tokens with no letters (`'% 503 %'`) are checked. Create the index `WITH (case_insensitive = true)` to prune `ILIKE`
   on words.
@@ -211,6 +213,49 @@ CREATE SKIPPING INDEX ix_logs_msg_tok ON app_logs (message) USING tokenbf WITH (
 CREATE SKIPPING INDEX ix_pages_title_ng ON pages (title) USING ngrambf(3, 4096, 3);
 -- Helps: WHERE title ILIKE '%google%'   (no option needed for ngrambf)
 ```
+
+## Whole-word search (`has_token` and regular expressions)
+
+`LIKE` cannot say "this word, whole": `'%timeout%'` also matches `mytimeout`, so `tokenbf` cannot use it. Two ways to
+ask for a whole word let `tokenbf` skip blocks:
+
+**`has_token(text, word)`** (lexdb's, in all three doors; also spelled `hasToken` as in ClickHouse) is true when
+*word* is one of the text's tokens, split exactly as `tokenbf` splits them: runs of ASCII letters and digits, with
+everything else (spaces, punctuation, `_`, characters outside ASCII) between. `has_token_ci` (`hasTokenCaseInsensitive`)
+ignores the case of ASCII letters. *word* must be a single token (`22023` otherwise); NULL in, NULL out.
+
+```sql
+SELECT has_token('ERROR checkout_timeout on node-7', 'timeout');   -- true: _ separates tokens
+SELECT has_token('mycheckout ok', 'checkout');                     -- false: not a whole token
+SELECT count(*) FROM app_logs WHERE has_token(message, 'timeout');
+SELECT count(*) FROM app_logs WHERE has_token_ci(message, 'Timeout');
+```
+
+**Regular expressions with word boundaries** — PostgreSQL's `~`, `~*` and `regexp_like`, SQL Server's and Oracle's
+`REGEXP_LIKE` — are pruned when the pattern is a constant. lexdb reads the literal text the pattern requires in every
+match, and a run next to a word boundary (`\y`, `\m`, `\M`, `\b`) or an anchor (`^`, `$`) gives whole tokens to check:
+
+```sql
+SELECT count(*) FROM app_logs WHERE message ~ '\ytimeout\y';            -- tokenbf checks "timeout"
+SELECT count(*) FROM app_logs WHERE message ~ '^GET /api/v[0-9]';        -- checks "GET" and "api"
+SELECT count(*) FROM app_logs WHERE regexp_like(message, '\yerror 503\y');
+```
+
+A literal run that is not next to a boundary still lets `ngrambf` skip blocks (`message ~ 'google'`). What is not
+read: alternation (`a|b`), embedded options (`(?i)`), back references and other escapes lexdb does not know, the `x`
+(expanded) flag; text inside a group or a bracket, or before `*`, `?` or `{...}`, is not taken as required. Those
+patterns still give the right rows; they just scan every block.
+
+How case affects these:
+
+| Condition | `tokenbf` as written | `tokenbf` `WITH (case_insensitive = true)` | `ngrambf` |
+|---|---|---|---|
+| `has_token`, `~`, `regexp_like` | every token | every token (folded to check) | every n-gram |
+| `has_token_ci` | tokens of digits | every token | every n-gram, in all spellings |
+| `~*`, `regexp_like(..., 'i')` | tokens of digits | tokens without `k` or `s` | n-grams without `k` or `s`, in all spellings |
+
+A case-insensitive regular expression folds every Unicode letter: `k` also matches the Kelvin sign (`K`) and `s` the
+long s (`ſ`), which are not part of any token, so words with those letters cannot be checked.
 
 ## OR conditions
 
@@ -281,8 +326,8 @@ Constraints:
 | `minmax` (`brin`) | none | none | — | integer, date, time, timestamp, `text`/`varchar`/`nvarchar` | `=`, `<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, dynamic Top-N |
 | `set` | `(max_rows)` — default `32` | `max_rows` | `1..4096` | integer, date, time, timestamp, `text`/`varchar`/`nvarchar` | `=`, `<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `LIKE` (case-sensitive text) |
 | `bloom_filter` (`bloom`) | `(bits_per_key, size_bytes, hashes)` — default `(10, 2048, 3)` | `bits_per_key`, `size` / `size_bytes`, `hashes` | `size`: `64..65536`, `hashes`: `1..8` | integer, date, time, timestamp, `text`/`varchar`/`nvarchar` | `=`, `IN`, `OR` of equalities |
-| `ngrambf` (`ngrambf_v1`) | `(n, size_bytes, hashes)` — default `(3, 2048, 3)` | `n` / `ngram`, `size` / `size_bytes`, `hashes`, `case_insensitive` | `n`: `2..8`, `size`: `128..65536`, `hashes`: `1..8` | `text`/`varchar`/`nvarchar` | `=`, `IN`, `LIKE`, `ILIKE` (any literal piece of length `>= n`; case-insensitive on `COLL_CI` or `case_insensitive`) |
-| `tokenbf` (`tokenbf_v1`) | `(size_bytes, hashes)` — default `(2048, 3)` | `size` / `size_bytes`, `hashes`, `case_insensitive` | `size`: `128..65536`, `hashes`: `1..8` | `text`/`varchar`/`nvarchar` | `=`, `IN`, `LIKE` (complete alphanumeric tokens; case-insensitive on `COLL_CI` or `case_insensitive`), `ILIKE` (tokens of digits; every token with `case_insensitive`) |
+| `ngrambf` (`ngrambf_v1`) | `(n, size_bytes, hashes)` — default `(3, 2048, 3)` | `n` / `ngram`, `size` / `size_bytes`, `hashes`, `case_insensitive` | `n`: `2..8`, `size`: `128..65536`, `hashes`: `1..8` | `text`/`varchar`/`nvarchar` | `=`, `IN`, `LIKE`, `ILIKE` (any literal piece of length `>= n`; case-insensitive on `COLL_CI` or `case_insensitive`), `has_token`, `~` / `regexp_like` (their literal runs) |
+| `tokenbf` (`tokenbf_v1`) | `(size_bytes, hashes)` — default `(2048, 3)` | `size` / `size_bytes`, `hashes`, `case_insensitive` | `size`: `128..65536`, `hashes`: `1..8` | `text`/`varchar`/`nvarchar` | `=`, `IN`, `LIKE` (complete alphanumeric tokens; case-insensitive on `COLL_CI` or `case_insensitive`), `ILIKE` (tokens of digits; every token with `case_insensitive`), `has_token` / `has_token_ci`, `~` / `~*` / `regexp_like` (whole tokens next to a word boundary) |
 
 All of these predicates are also pruned inside an `OR` when every branch has one (see [OR conditions](#or-conditions)).
 

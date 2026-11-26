@@ -18,6 +18,7 @@ import "./lexdb_time"
 import "./lexdb_ops"
 import "./lexdb_func"
 import "./lexdb_like"
+import "./lexdb_token"
 import "./lexdb_rows"
 import "./lexdb_access"
 import "./lexdb_catalog"
@@ -307,6 +308,8 @@ pub fn entryOf(name: &str, n: int): LibFn {
         "quote_literal" { if n == 1 { return quoteLiteralFn } }
         "quote_nullable" { if n == 1 { return quoteNullableFn } }
         "starts_with" { if n == 2 { return startsWithFn } }
+        "has_token", "hastoken" { if n == 2 { return hasTokenFn } }
+        "has_token_ci", "hastokencaseinsensitive" { if n == 2 { return hasTokenCiFn } }
         "to_hex" { return toHexFn }                 // (typed: a hint after the arguments)
         "translate" { if n == 3 { return translateFn } }
         "overlay" { if n == 3 || n == 4 { return overlayFn } }
@@ -957,6 +960,34 @@ fn quoteNullableFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Resul
 fn startsWithFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] {
     if anyNull(vs) { return Ok(Val.Null) }
     return Ok(Val.Bool(strings.startsWith(&(lexdb_sql.text(&vs[0])), &(lexdb_sql.text(&vs[1])))))
+}
+
+// has_token(text, word): whether word is one of text's tokens (lexdb_token: runs of
+// ASCII letters and digits), as a tokenbf skipping index splits them; has_token_ci
+// with ASCII letters folded. word must be one token (22023).
+fn hasTokenFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return hasTokenOf(vs, false) }
+fn hasTokenCiFn(name: &str, vs: &[]Val, now: int, z: &lexdb_time.Zone): Result[Val, DbErr] { return hasTokenOf(vs, true) }
+
+// A constant regular expression as a skipping index reads it (lexdb_pipe.cSkipCall): its
+// case (Unicode's simple folding), SQL Server's syntax, literal text. None: its flags or
+// pattern are an error (the rows give it), or global or white space ignored (not read).
+pub type ReSkip = value record { pub icase: bool; pub tsql: bool; pub quote: bool }
+
+pub fn reSkipOf(pat: &str, flags: &str): Option[ReSkip] {
+    let fl = match lexdb_func.reFlags(flags) { Ok(f) { f } Err(_) { return None } }
+    if fl.glob || fl.expanded { return None }
+    match lexdb_func.reCompileTest(pat, &fl) { Ok(_) {} Err(_) { return None } }
+    return Some(ReSkip{icase: fl.icase, tsql: fl.tsql, quote: fl.quote})
+}
+
+fn hasTokenOf(vs: &[]Val, fold: bool): Result[Val, DbErr] {
+    if anyNull(vs) { return Ok(Val.Null) }
+    let w0 = lexdb_sql.text(&vs[1])
+    if !lexdb_token.validToken(&w0) {
+        return Err(e("22023", &("has_token: the token \"" + w0 + "\" must be one word of ASCII letters and digits")))
+    }
+    let w = if fold { strings.toLowerAscii(&w0) } else { w0 }
+    return Ok(Val.Bool(lexdb_token.hasToken(&(lexdb_sql.text(&vs[0])), &w, fold)))
 }
 
 // to_hex: of a bigint 64 bits, else 32 (the hint gives the argument's type)

@@ -12,6 +12,8 @@ REGEXP_REPLACE ( string, pattern, replacement [, start [, occurrence [, flags ] 
 REGEXP_SUBSTR ( string, pattern [, start [, occurrence [, flags [, group ] ] ] ] ) → varchar | nvarchar
 REGEXP_INSTR ( string, pattern [, start [, occurrence [, return_option [, flags [, group ] ] ] ] ] ) → int
 REGEXP_COUNT ( string, pattern [, start [, flags ] ] ) → int
+HAS_TOKEN ( string, word )
+HAS_TOKEN_CI ( string, word )
 
 EDIT_DISTANCE ( string1, string2 [, max_distance ] ) → int
 EDIT_DISTANCE_SIMILARITY ( string1, string2 ) → int
@@ -24,6 +26,12 @@ JARO_WINKLER_SIMILARITY ( string1, string2 ) → int
 `REGEXP_LIKE`
 : A predicate: true when the string contains a match of the pattern. Like `LIKE` and `EXISTS`, it can stand where a
   condition does (`WHERE`, `HAVING`, `CASE WHEN`, `IIF`), but not in a select list by itself (example A).
+
+`HAS_TOKEN`, `HAS_TOKEN_CI`
+: lexdb's own (not in SQL Server): a condition, true when *word* is one of the string's tokens (the runs of ASCII
+  letters and digits between any other characters); `HAS_TOKEN_CI` ignores the case of ASCII letters. *word* must be
+  one token. A `tokenbf` [skipping index](../../skipping-indexes.md) skips blocks for it, and for `REGEXP_LIKE` with
+  `\b` around a word.
 
 `REGEXP_REPLACE`
 : The string with the matches of *pattern* replaced by *replacement*, from character *start* (default 1). *occurrence*

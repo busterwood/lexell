@@ -13161,3 +13161,31 @@ Two gaps in `lexdb_skip`'s pruning, found reviewing whether skipping indexes cov
 Tested by `exec_skip_like` (counts against the answer with no index; skipped-node counters; a cold restart) and the
 OR and option cases added to `tds_skip_index` and `tns_skip_index`. Not done: patterns with `_` or an escape are still
 not pruned (`likeSimple`), and `NOT LIKE` is not.
+
+## As built: whole-word search for tokenbf (2026-11-26)
+
+`tokenbf` could only prune a LIKE whose pattern put separators on both sides of a word (`'% timeout %'`): `'%timeout%'`
+cannot be pruned soundly, since `%` may hold the rest of a longer word. Two ways to ask for a whole word now reach it:
+
+- **`has_token(text, word)` and `has_token_ci`** (`lexdb_lib`; ClickHouse's `hasToken` / `hasTokenCaseInsensitive`
+  names too), in every door (each binds through `lexdb_lib.entryOf`). Tokens are `tokenbf`'s exactly (`lexdb_token`:
+  runs of ASCII letters and digits), so the index check is the function's own; a word that is not one token is 22023
+  (and not pruned, so the rows give the error).
+- **Constant regular expressions**: `~`, `~*` and `regexp_like` (SQL Server's and Oracle's flags too, read by
+  `lexdb_lib.reSkipOf`, which also refuses a pattern that does not compile, global, and expanded).
+  `lexdb_token.reRuns` reads the literal runs every match holds, conservatively (an alternation, `(?`, `***`, an
+  unknown escape: nothing; a group or bracket skipped whole; a character before `* ? {` dropped), and per run whether a
+  word boundary or anchor is next to it (`\y \m \M \b \A \Z ^ $`; RE2's `\b` is ASCII, so the character beyond is not
+  a token byte). A run gives `tokenbf` its whole tokens (as a LIKE piece, `bloomHasTokens`) and `ngrambf` its n-grams.
+- **Case.** A case-insensitive regular expression folds by Unicode's simple folding, under which `k` and `s` also match
+  U+212A and U+017F, which split tokens: such a run is checked without the tokens (`TOK_NO_KS`) or n-grams (`noKS`)
+  holding k or s. Against a filter of the text as written, n-grams are probed in each spelling and only tokens without
+  letters are checked, as for ILIKE.
+- **Where.** `cSkipBX` (`lexdb_pipe`) reads a compiled condition's bound tree (`BNode.Gen`), AND and OR in it too,
+  since an OR with such a call compiles as one expression; LIKE and ILIKE calls inside it are read as `cSkipOf` reads
+  `BNode.Like`. `SkipQuery.tokPl` / `tokRuns` / `tokFlags` carry the runs. `lexdb_token` is a new core module the
+  library and the pipeline may import (`tests/lexdb/imports.py`).
+
+Tested by `exec_skip_token` (the runs of 21 patterns; the functions; exact, case-insensitive and n-gram indexes;
+OR; a pattern's error not hidden; a cold restart) and `has_token` / `REGEXP_LIKE` cases in `tds_skip_index` and
+`tns_skip_index`.

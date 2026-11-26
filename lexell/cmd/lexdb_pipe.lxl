@@ -19,6 +19,7 @@ import "./lexdb_sql"
 import "./lexdb_time"
 import "./lexdb_ops"
 import "./lexdb_lib"
+import "./lexdb_token"
 import "./lexdb_like"
 import "./lexdb_rows"
 import "./lexdb_held"
@@ -2058,7 +2059,115 @@ fn cSkipOf(n: &BNode, kinds: &[]int, t: &lexdb_catalog.Table, q: mut &lexdb_skip
                 append(mut &q.likeFold, lp.fold)
             }
         }
+        BNode.Gen(g) { cSkipBX(&g.cx, &g, t, q) }
         else {}
+    }
+}
+
+// A compiled condition's skippable parts (its tree as bound: a condition the batch
+// kernels do not take is one, an OR or AND around such a call too): has_token(col,
+// 'word') and has_token_ci, col ~ 'pattern', col ~* 'pattern', regexp_like(col,
+// 'pattern' [, flags]) in each door, LIKE and ILIKE, each with a constant. The runs of
+// text every match holds (lexdb_token.reRuns) go into q.
+fn cSkipBX(x: &lexdb_bind.BX, g: &BGen, t: &lexdb_catalog.Table, q: mut &lexdb_skip.SkipQuery) {
+    match x {
+        lexdb_bind.BX.And(a, b) {
+            cSkipBX(&a, g, t, q)
+            cSkipBX(&b, g, t, q)
+        }
+        lexdb_bind.BX.Or(_, _) {
+            var alts: []lexdb_skip.SkipQuery = []
+            if cSkipBXAlts(x, g, t, mut &alts) { append(mut &q.alts, alts) }
+        }
+        lexdb_bind.BX.Call(fr, args) { cSkipCall(&fr.name, &args, g, t, q) }
+        else {}
+    }
+}
+
+// cSkipAlts for a bound OR.
+fn cSkipBXAlts(x: &lexdb_bind.BX, g: &BGen, t: &lexdb_catalog.Table, out: mut &[]lexdb_skip.SkipQuery): bool {
+    match x {
+        lexdb_bind.BX.Or(a, b) { return cSkipBXAlts(&a, g, t, out) && cSkipBXAlts(&b, g, t, out) }
+        else {
+            var aq = lexdb_skip.emptyQuery()
+            cSkipBX(x, g, t, mut &aq)
+            if !aq.hasFilters() { return false }
+            aq.active = true
+            append(out, aq)
+            return true
+        }
+    }
+}
+
+fn cSkipCall(nm: &str, args: &[]lexdb_bind.BX, g: &BGen, t: &lexdb_catalog.Table, q: mut &lexdb_skip.SkipQuery) {
+    let tok = nm == "has_token" || nm == "hastoken" || nm == "has_token_ci" || nm == "hastokencaseinsensitive"
+    let re = nm == "~" || nm == "~*" || nm == "regexp_like"
+    let lk = nm == "like" || nm == "ilike"
+    if !(tok && len(args) == 2) && !(re && (len(args) == 2 || (nm == "regexp_like" && len(args) == 3))) &&
+       !(lk && (len(args) == 2 || len(args) == 3)) { return }
+    var c = -1
+    match &args[0] {
+        lexdb_bind.BX.Col(i) { if i >= 0 && i < len(g.cols) { c = g.cols[i] } }
+        else {}
+    }
+    if c < 0 || c >= len(t.cols) || t.cols[c].typ.kind != lexdb_sql.K_TEXT { return }
+    let ck = lexdb_sql.collKind(&t.cols[c].coll)
+    if ck != lexdb_sql.COLL_EXACT && ck != lexdb_sql.COLL_CI { return }
+    let pat = match constText(&args[1]) { Some(s) { s } None { return } }
+    let pl = placeOfCol(t, c)
+    if lk {
+        let esc = if len(args) == 3 { match constText(&args[2]) { Some(s) { s } None { return } } } else { "\\" }
+        if !lexdb_like.likeSimple(&pat, &esc) || len(strings.runes(&esc)) > 1 { return }
+        let fold = nm == "ilike"
+        let p2 = if fold { strings.toLowerAscii(&pat) } else { pat }
+        append(mut &q.likePl, pl)
+        append(mut &q.likePieces, lexdb_like.likeSplit(&p2))
+        append(mut &q.likeFold, fold)
+        return
+    }
+    if tok {
+        // a word that is not one token: the call's error, from the rows
+        if !lexdb_token.validToken(&pat) { return }
+        let fold = nm == "has_token_ci" || nm == "hastokencaseinsensitive"
+        append(mut &q.tokPl, pl)
+        append(mut &q.tokRuns, if fold { strings.toLowerAscii(&pat) } else { pat })
+        append(mut &q.tokFlags, lexdb_skip.TF_START | lexdb_skip.TF_END | (if fold { lexdb_skip.TF_ASCII } else { 0 }))
+        return
+    }
+    var flags = if nm == "~*" { "i" } else { "" }
+    if len(args) == 3 {
+        match constText(&args[2]) { Some(s) { flags = s } None { return } }
+    }
+    // flags or a pattern that are an error: its error, from the rows
+    let fl = match lexdb_lib.reSkipOf(&pat, &flags) { Some(f) { f } None { return } }
+    var runs: []str = []
+    var anchors: []int = []
+    if fl.quote {
+        append(mut &runs, pat.clone())
+        append(mut &anchors, 0)
+    } else if !lexdb_token.reRuns(&pat, fl.tsql, mut &runs, mut &anchors) {
+        return
+    }
+    for k in 0..len(runs) {
+        let a = anchors[k]
+        append(mut &q.tokPl, pl)
+        append(mut &q.tokRuns, if fl.icase { strings.toLowerAscii(&runs[k]) } else { runs[k].clone() })
+        append(mut &q.tokFlags, (if (a & lexdb_token.RUN_START) != 0 { lexdb_skip.TF_START } else { 0 }) |
+                                (if (a & lexdb_token.RUN_END) != 0 { lexdb_skip.TF_END } else { 0 }) |
+                                (if fl.icase { lexdb_skip.TF_UNI } else { 0 }))
+    }
+}
+
+// A bound constant's text; None another value (or not a constant).
+fn constText(x: &lexdb_bind.BX): Option[str] {
+    match x {
+        lexdb_bind.BX.Const(v) {
+            match v {
+                Val.Text(s) { return Some(s.clone()) }
+                else { return None }
+            }
+        }
+        else { return None }
     }
 }
 

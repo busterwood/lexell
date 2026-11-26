@@ -25,6 +25,8 @@ regexp_matches ( text, regex [, flags ] ) → setof text[]
 regexp_replace ( text, regex, replacement [, start [, n ] ] [, flags ] ) → text
 regexp_split_to_array ( text, regex [, flags ] ) → text[]
 regexp_split_to_table ( text, regex [, flags ] ) → setof text
+has_token ( text, word ) → boolean
+has_token_ci ( text, word ) → boolean
 ```
 
 ## Functions
@@ -75,6 +77,11 @@ regexp_split_to_table ( text, regex [, flags ] ) → setof text
 : `i` ignores case, `c` respects it, `g` takes every match, `n` makes `.` and `[^...]` not match a newline, `x`
   ignores spaces and comments in the expression.
 
+`has_token`, `has_token_ci`
+: lexdb's own (not in PostgreSQL; ClickHouse's `hasToken` and `hasTokenCaseInsensitive`, whose names are taken too):
+  whether *word* is one of the text's tokens, the runs of ASCII letters and digits between any other characters.
+  `has_token_ci` ignores the case of ASCII letters. *word* must be one token, else 22023.
+
 ## Remarks
 
 - The regular expressions take PostgreSQL's usual syntax: POSIX classes (`[[:alpha:]]`), `\d`, `\w`, `\s`, the
@@ -82,6 +89,9 @@ regexp_split_to_table ( text, regex [, flags ] ) → setof text
 - `.` matches a newline unless the `n` flag is given, as in PostgreSQL.
 - A `LIKE` with a fixed prefix (`'abc%'`) can use a B-tree index on the column.
 - A bad regular expression is 2201B.
+- `ngrambf` and `tokenbf` [skipping indexes](../../skipping-indexes.md) skip blocks for `LIKE` and `ILIKE`, for a
+  constant regular expression's literal text (whole words next to `\y`, `\m`, `\M`, `^` or `$` for `tokenbf`), and for
+  `has_token`.
 
 ## Differences from PostgreSQL
 

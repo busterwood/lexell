@@ -44,7 +44,7 @@ IMPORT = re.compile(r'import\s+"\./([A-Za-z0-9_]+)"')
 
 CORE = {
     "lexdb_access", "lexdb_agg", "lexdb_base", "lexdb_bind", "lexdb_catalog", "lexdb_census", "lexdb_conerr", "lexdb_cols", "lexdb_dbopt", "lexdb_dialect", "lexdb_disk",
-    "lexdb_enum", "lexdb_exec", "lexdb_fkconv", "lexdb_fkprobe", "lexdb_float", "lexdb_func", "lexdb_gen", "lexdb_held", "lexdb_ht", "lexdb_leafk", "lexdb_lib", "lexdb_like",
+    "lexdb_enum", "lexdb_exec", "lexdb_fkconv", "lexdb_fkprobe", "lexdb_float", "lexdb_func", "lexdb_gen", "lexdb_held", "lexdb_ht", "lexdb_leafk", "lexdb_lib", "lexdb_like", "lexdb_token",
     "lexdb_locks", "lexdb_match", "lexdb_recur", "lexdb_recrun", "lexdb_recprobe", "lexdb_litint",
     "lexdb_memo", "lexdb_mview", "lexdb_newfn", "lexdb_nncon", "lexdb_nnalter", "lexdb_annot", "lexdb_csr", "lexdb_graph", "lexdb_assert", "lexdb_copyjson", "lexdb_json", "lexdb_oldnew", "lexdb_ops", "lexdb_vec", "lexdb_decfit",
     "lexdb_page", "lexdb_parse", "lexdb_pct", "lexdb_pipe", "lexdb_plan", "lexdb_priv", "lexdb_repl", "lexdb_rows", "lexdb_routine",
@@ -102,13 +102,13 @@ OPS_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb
 # item 3) sits beside the value operations, below the binder and the
 # executor: what it may import.
 LIB = "lexdb_lib"
-LIB_MAY_IMPORT = OPS_MAY_IMPORT | {"lexdb_ops", "lexdb_like", "lexdb_rows", "lexdb_catalog", "lexdb_access", "lexdb_newfn", "lexdb_sketch"}
+LIB_MAY_IMPORT = OPS_MAY_IMPORT | {"lexdb_ops", "lexdb_like", "lexdb_rows", "lexdb_catalog", "lexdb_access", "lexdb_newfn", "lexdb_sketch", "lexdb_token"}
 
 # The pipeline module (design/lexdb-layers.md 6.2.3): what it may import
 # (and lexell's own libraries), the store names it may use, and who may
 # import it. Session state reaches it in its context (lexdb_pipe.Ctx).
 PIPE = "lexdb_pipe"
-PIPE_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_rows", "lexdb_vec", "lexdb_like", "lexdb_leafk", "lexdb_skip",
+PIPE_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_rows", "lexdb_vec", "lexdb_like", "lexdb_token", "lexdb_leafk", "lexdb_skip",
                    "lexdb_sqlcoll", "lexdb_ops", "lexdb_lib", "lexdb_catalog", "lexdb_bind", "lexdb_plan",
                    "lexdb_access", "lexdb_store", "lexdb_sort", "lexdb_agg", "lexdb_held", "lexdb_ht", "lexdb_census", "lexdb_srf",
                    "lexdb_window"}
