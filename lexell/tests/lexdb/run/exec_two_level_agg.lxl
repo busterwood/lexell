@@ -1,0 +1,185 @@
+// lexdb_pipe / lexdb_ht: adaptive two-level hash aggregation (TwoLevelInt,
+// TwoLevelTwoInt, TwoLevelArena), zero-copy key elision, constant GROUP BY
+// key folding, direct Top-N integer group pruning, and vectorized
+// EXTRACT(minute|hour FROM ts) + CASE WHEN cond THEN text ELSE lit END.
+// Crosses the 16,384-group two-level promotion threshold and checks exact
+// parity between vectorized (lexdb_batch = on) and row engine (lexdb_batch = off).
+// expect: twolevel-int: 20001 groups, top10 ok, parity ok
+// expect: twolevel-twoint: 20003 groups, top10 1-key ok, top10 2-key ok, parity ok
+// expect: twolevel-arena: 20003 groups, top10 ok, const-fold ok, offset ok, parity ok
+// expect: vec-extract-case: q18-shape ok, q39-shape ok, pre2000 ok, inf-err 22008, parity ok
+// expect: edge-cases: having ok, rollup ok, gsets ok, distinct ok, count-col ok, mem-err 53200, parity ok
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERR:" + e.state + ":" + e.msg }
+    }
+}
+
+fn one(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(sql) {
+        Ok(_) {}
+        Err(e) { println("SETUP ERR " + sql + ": " + e.state + " " + e.msg) }
+    }
+}
+
+fn checkParity(s: mut &lexdb_exec.Session, label: &str, sql: &str): str {
+    one(s, &"set lexdb_batch = on")
+    let a = q(s, sql)
+    one(s, &"set lexdb_batch = off")
+    let b = q(s, sql)
+    one(s, &"set lexdb_batch = on")
+    if a != b {
+        println("PARITY MISMATCH [" + label + "]: on=" + a + " off=" + b)
+        return "DIFF"
+    }
+    return a
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(91), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 4 * 1024 * 1024, snapNodes: 200000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+
+        one(mut &s, &"create table t (id int primary key, k1 int, k2 int, s text, ts timestamp, f1 int, f2 int, v int)")
+        // Insert 22,000 rows covering:
+        // - 20,000 distinct k1 (including negatives and NULLs -> 20,001 groups)
+        // - 20,003 distinct (k1, k2) pairs (including NULLs in k1, k2, both)
+        // - 20,002 distinct strings (including '', >300-byte wide string, NULL)
+        // - timestamps before and after 2000-01-01, plus NULL
+        let wide = strings.repeat(&"abcdefghij", 32) // 320 bytes
+        for b in 0..22 {
+            var vals: []str = []
+            for j in 0..1000 {
+                let i = b * 1000 + j
+                var k1s = ""
+                var k2s = ""
+                var ss = ""
+                var tss = ""
+                if i < 20000 {
+                    let kk = if i % 5 == 0 { -i - 1 } else { i }
+                    k1s = kk.toStr()
+                    k2s = (kk * 3 + 7).toStr()
+                    if i == 0 {
+                        ss = "''"
+                    } else if i == 1 {
+                        ss = "'" + wide + "'"
+                    } else {
+                        ss = "'url://host/" + i.toStr() + "/path'"
+                    }
+                    let yr = if i % 11 == 0 { "1998" } else { "2013" }
+                    let hr = i % 24
+                    let mn = (i * 7) % 60
+                    let hrs = (if hr < 10 { "0" } else { "" }) + hr.toStr()
+                    let mns = (if mn < 10 { "0" } else { "" }) + mn.toStr()
+                    tss = "'" + yr + "-07-15 " + hrs + ":" + mns + ":12'"
+                } else if i < 20100 {
+                    // Hot group 0 (100 extra rows -> 101 total)
+                    k1s = "-1"
+                    k2s = "4"
+                    ss = "''"
+                    tss = "'2013-07-15 00:00:12'"
+                } else if i < 20180 {
+                    // Hot group 1 (80 extra rows -> 81 total)
+                    k1s = "1"
+                    k2s = "10"
+                    ss = "'" + wide + "'"
+                    tss = "'2013-07-15 01:07:12'"
+                } else if i < 20240 {
+                    // Hot NULL group (60 rows)
+                    k1s = "null"
+                    k2s = "null"
+                    ss = "null"
+                    tss = "null"
+                } else if i < 20280 {
+                    // NULL k1, non-NULL k2 (40 rows)
+                    k1s = "null"
+                    k2s = "999"
+                    ss = "'only-k2'"
+                    tss = "'1999-12-31 23:59:59'"
+                } else if i < 20310 {
+                    // non-NULL k1, NULL k2 (30 rows)
+                    k1s = "1"
+                    k2s = "null"
+                    ss = "'only-k1'"
+                    tss = "'2013-07-15 12:34:00'"
+                } else {
+                    // Spread across top 20 groups so ties and Top-10 are well-exercised
+                    let g = (i - 20310) % 25 + 2
+                    let kk = if g % 5 == 0 { -g - 1 } else { g }
+                    k1s = kk.toStr()
+                    k2s = (kk * 3 + 7).toStr()
+                    ss = "'url://host/" + g.toStr() + "/path'"
+                    tss = "'2013-07-15 05:15:00'"
+                }
+                let f1 = if i % 3 == 0 { 0 } else { 1 }
+                let f2 = if i % 4 == 0 { 0 } else { 1 }
+                let vs = if i % 13 == 0 { "null" } else { (i % 100).toStr() }
+                append(mut &vals, "(" + i.toStr() + "," + k1s + "," + k2s + "," + ss + "," + tss + "," + f1.toStr() + "," + f2.toStr() + "," + vs + ")")
+            }
+            one(mut &s, &("insert into t values " + strings.join(&vals, ",")))
+        }
+
+        // 1. TwoLevelInt (>16,384 groups)
+        let nInt = checkParity(mut &s, &"int-cnt", &"select count(*) from (select k1, count(*) as c from t group by k1) x")
+        let topInt = checkParity(mut &s, &"int-top10", &"select k1, count(*) as c, sum(v) from t group by k1 order by c desc, k1 asc limit 10")
+        let intOk = nInt == "20001" && strings.startsWith(&topInt, "1|111|")
+        println("twolevel-int: " + nInt + " groups, " + (if intOk { "top10 ok, parity ok" } else { "FAIL: " + topInt }))
+
+        // 2. TwoLevelTwoInt (>16,384 groups, NULL keys, Top-N 1-key and 2-key tie-breaking)
+        let nTwo = checkParity(mut &s, &"two-cnt", &"select count(*) from (select k1, k2, count(*) as c from t group by k1, k2) x")
+        let topTwo1 = checkParity(mut &s, &"two-top10-1k", &"select c from (select k1, k2, count(*) as c from t group by k1, k2 order by c desc limit 10) x")
+        let topTwo2 = checkParity(mut &s, &"two-top10-2k", &"select k1, k2, count(*) as c, sum(v) from t group by k1, k2 order by c desc, k1 asc nulls last, k2 asc nulls last limit 10")
+        let twoOk = nTwo == "20003" && strings.startsWith(&topTwo1, "101 81 69") && strings.startsWith(&topTwo2, "-1|4|101|")
+        println("twolevel-twoint: " + nTwo + " groups, " + (if twoOk { "top10 1-key ok, top10 2-key ok, parity ok" } else { "FAIL: " + topTwo1 + " / " + topTwo2 }))
+
+        // 3. TwoLevelArena (>16,384 distinct strings, wide strings, '', NULL, const-folding, OFFSET)
+        let nTxt = checkParity(mut &s, &"txt-cnt", &"select count(*) from (select s, count(*) as c from t group by s) x")
+        let topTxt = checkParity(mut &s, &"txt-top10", &"select length(s), count(*) as c from t group by s order by c desc, s asc nulls last limit 5")
+        let foldTxt = checkParity(mut &s, &"txt-fold", &"select 1, length(s), count(*) as c from t group by 1, s order by c desc, s asc nulls last limit 5")
+        let offTxt = checkParity(mut &s, &"txt-off", &"select s, count(*) as c from t group by s order by c desc, s asc nulls last limit 5 offset 20")
+        let txtOk = nTxt == "20003" && strings.startsWith(&topTxt, "0|101 320|81 ") && strings.startsWith(&foldTxt, "1|0|101 1|320|81 ") && offTxt != "DIFF" && len(offTxt) > 0
+        println("twolevel-arena: " + nTxt + " groups, " + (if txtOk { "top10 ok, const-fold ok, offset ok, parity ok" } else { "FAIL: " + topTxt + " / " + foldTxt }))
+
+        // 4. Vectorized EXTRACT(minute|hour FROM ts) + CASE WHEN cond THEN s ELSE '' END (q18 & q39 shapes)
+        let q18 = checkParity(mut &s, &"q18", &"select k1, extract(minute from ts) as m, s, count(*) as c from t where id < 500 or id >= 20000 group by k1, m, s order by c desc, k1 asc nulls last, m asc nulls last limit 10")
+        let q39 = checkParity(mut &s, &"q39", &"select f1, f2, case when f1 = 0 and f2 = 0 then s else '' end as src, count(*) as c from t group by f1, f2, src order by c desc, f1 asc, f2 asc, src asc nulls last limit 10 offset 5")
+        let pre2k = checkParity(mut &s, &"pre2k", &"select extract(hour from ts) as h, extract(minute from ts) as m, count(*) as c from t where ts < '2000-01-01 00:00:00' group by h, m order by c desc, h asc, m asc limit 5")
+        one(mut &s, &"create table tinf (id int primary key, ts timestamp)")
+        one(mut &s, &"insert into tinf values (1, 'infinity')")
+        let infRes = q(mut &s, &"select extract(minute from ts) as m, count(*) from tinf group by m")
+        let infState = if strings.startsWith(&infRes, "ERR:22008:") { "22008" } else { infRes.clone() }
+        let vecOk = q18 != "DIFF" && q39 != "DIFF" && pre2k != "DIFF" && strings.startsWith(&pre2k, "23|59|40") && infState == "22008"
+        println("vec-extract-case: " + (if vecOk { "q18-shape ok, q39-shape ok, pre2000 ok, inf-err " + infState + ", parity ok" } else { "FAIL: " + pre2k + " / " + infRes }))
+
+        // 5. Edge cases: HAVING, ROLLUP, GROUPING SETS, DISTINCT, COUNT(v) with NULLs, max_statement_mem
+        let hav = checkParity(mut &s, &"having", &"select k1, count(*) as c from t group by k1 having count(*) > 60 order by c desc, k1 asc nulls last")
+        let rol = checkParity(mut &s, &"rollup", &"select f1, f2, count(*) as c from t group by rollup(f1, f2) order by f1 asc nulls last, f2 asc nulls last")
+        let gs = checkParity(mut &s, &"gsets", &"select f1, f2, count(*) as c from t group by grouping sets ((f1), (f2), ()) order by f1 asc nulls last, f2 asc nulls last")
+        let dst = checkParity(mut &s, &"distinct", &"select distinct count(*) as c from t group by k1 order by c desc limit 5")
+        let cntv = checkParity(mut &s, &"count-v", &"select k1, count(v) as cv from t group by k1 order by cv desc, k1 asc nulls last limit 5")
+        one(mut &s, &"set max_statement_mem = '64kB'")
+        let memRes = q(mut &s, &"select s, count(*) from t group by s")
+        one(mut &s, &"reset max_statement_mem")
+        let memState = if strings.startsWith(&memRes, "ERR:53200:") { "53200" } else { memRes.clone() }
+        let edgeOk = hav != "DIFF" && rol != "DIFF" && gs != "DIFF" && dst != "DIFF" && cntv != "DIFF" && memState == "53200"
+        println("edge-cases: " + (if edgeOk { "having ok, rollup ok, gsets ok, distinct ok, count-col ok, mem-err " + memState + ", parity ok" } else { "FAIL: mem=" + memRes }))
+        return 0
+    })
+}

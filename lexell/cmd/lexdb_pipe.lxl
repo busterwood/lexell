@@ -22,6 +22,7 @@ import "./lexdb_lib"
 import "./lexdb_like"
 import "./lexdb_rows"
 import "./lexdb_held"
+import "./lexdb_ht"
 import "./lexdb_srf"
 import "./lexdb_vec"
 import "./lexdb_sort"
@@ -429,6 +430,9 @@ pub type BNode = closed {
     // b at sb (DArith(op, a, sa, b, sb)); = <> < <= > >= as 0 to 5
     DArith(int, BNode, int, BNode, int)
     DCmp(int, BNode, int, BNode, int)
+    // GROUP BY key fast paths: extract(minute|hour FROM ts_col) and CASE WHEN cond THEN textCol ELSE lit END
+    TsPart(int, int)            // col, part (0 = minute, 1 = hour)
+    CondText(BNode, int, str)   // cond, textCol, elseLit
 }
 
 // A compiled expression over a batch (9.108): per row, the columns it
@@ -1187,6 +1191,30 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
             let c = try bEval(&y, b, idx)
             lexdb_vec.cmp(op, mut &a, sa, &c, sb)
             return Ok(a)
+        }
+        BNode.TsPart(col, part) {
+            var out = lexdb_rows.bvec(m)
+            for j in 0..m {
+                let r = idx[j]
+                if b.cols[col].nul[r] {
+                    out.nul[j] = true
+                    continue
+                }
+                match &b.vals[col][r] {
+                    Val.Ts(us) {
+                        if us == lexdb_time.INF || us == lexdb_time.NINF {
+                            return Err(lexdb_base.err("22008", "extract of an infinite timestamp"))
+                        }
+                        let tod = lexdb_time.floorMod(us, lexdb_time.DAY_US)
+                        out.v[j] = if part == 0 { (tod / 60000000) % 60 } else { tod / 3600000000 }
+                    }
+                    else { return Err(batErr()) }
+                }
+            }
+            return Ok(out)
+        }
+        BNode.CondText(cond, _, _) {
+            return bEval(&cond, b, idx)
         }
     }
 }
@@ -2130,6 +2158,81 @@ fn bKeyEnc(kb: mut &str, c: &BComp, kv: &BVec, j: int, b: &Batch, r: int, txt: b
     lexdb_access.encIdxPart(kb, &bKeyVal(c, kv, j, b, r))
 }
 
+fn addHashText(kb: mut &str, s: &str) {
+    let n = len(s)
+    if n < 65536 {
+        kb.addByte(4)
+        kb.addByte(byte(n & 255))
+        kb.addByte(byte((n >> 8) & 255))
+    } else {
+        kb.addByte(7)
+        kb.addByte(byte(n & 255))
+        kb.addByte(byte((n >> 8) & 255))
+        kb.addByte(byte((n >> 16) & 255))
+        kb.addByte(byte((n >> 24) & 255))
+    }
+    kb += s
+}
+
+// Fast injective binary hash-key encoding for AggSt composite keys (avoids byte-by-byte \x00 escaping
+// of encIdxPart on long strings like URL/SearchPhrase/Referer, and evaluates CondText zero-copy).
+fn bKeyEncFast(kb: mut &str, c: &BComp, kv: &BVec, j: int, b: &Batch, r: int, txt: bool) {
+    match &c.n {
+        BNode.CondText(_, tc, elseLit) {
+            if kv.v[j] == 1 && !kv.nul[j] {
+                if b.cols[tc].nul[r] {
+                    kb.addByte(0)
+                } else if lexdb_rows.isTextCol(b, tc) {
+                    addHashText(kb, lexdb_rows.textAt(b, tc, r))
+                } else {
+                    encHashVal(kb, &b.vals[tc][r])
+                }
+            } else {
+                addHashText(kb, elseLit)
+            }
+            return
+        }
+        else {}
+    }
+    if c.typ == BT_INT {
+        if kv.nul[j] { kb.addByte(0); return }
+        let n = kv.v[j]
+        kb.addByte(1)
+        kb.addByte(byte(n & 255))
+        kb.addByte(byte((n >> 8) & 255))
+        kb.addByte(byte((n >> 16) & 255))
+        kb.addByte(byte((n >> 24) & 255))
+        kb.addByte(byte((n >> 32) & 255))
+        kb.addByte(byte((n >> 40) & 255))
+        kb.addByte(byte((n >> 48) & 255))
+        kb.addByte(byte((n >> 56) & 255))
+        return
+    }
+    if c.typ == BT_BOOL {
+        if kv.nul[j] { kb.addByte(0) } else { kb.addByte(2); kb.addByte(if kv.v[j] != 0 { 1 } else { 0 }) }
+        return
+    }
+    if c.typ == BT_NULL { kb.addByte(0); return }
+    if c.typ == BT_OTHER {
+        match &c.n {
+            BNode.Col(i) {
+                if txt {
+                    if b.cols[i].nul[r] {
+                        kb.addByte(0)
+                    } else {
+                        addHashText(kb, lexdb_rows.textAt(b, i, r))
+                    }
+                } else {
+                    encHashVal(kb, &b.vals[i][r])
+                }
+                return
+            }
+            else {}
+        }
+    }
+    encHashVal(kb, &bKeyVal(c, kv, j, b, r))
+}
+
 // Marks the columns n reads.
 pub fn bColsOf(n: &BNode, used: mut &[]bool) {
     match n {
@@ -2172,6 +2275,11 @@ pub fn bColsOf(n: &BNode, used: mut &[]bool) {
         BNode.DCmp(_, a, _, b, _) {
             bColsOf(&a, used)
             bColsOf(&b, used)
+        }
+        BNode.TsPart(col, _) { used[col] = true }
+        BNode.CondText(cond, col, _) {
+            bColsOf(&cond, used)
+            used[col] = true
         }
     }
 }
@@ -3853,6 +3961,13 @@ pub fn aggCounts(): []int { return [decRuns, decSpills, groupRuns] }
 pub fn runAgg(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
               src: &Src, hrows: &[][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
               give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[int, DbErr] {
+    let noTop = noTopAgg()
+    return runAggTop(st, txn, pg, cols, t, src, hrows, cx, room, bud, cnt, &noTop, give)
+}
+
+fn runAggTop(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
+             src: &Src, hrows: &[][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts, top: &TopAgg,
+             give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[int, DbErr] {
     runs += 1
     heldRun(src)
     while len(cnt) < pg.ops { append(cnt, noCounts()) }
@@ -3864,7 +3979,7 @@ pub fn runAgg(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols
                     match i {
                         lexdb_plan.PPlan.Filter(j, cs) {
                             match j {
-                                lexdb_plan.PPlan.Scan(sc, _) { return aggRun(st, txn, &sc, &cs, &a, cols, t, src, hrows, cx, room, bud, cnt, give) }
+                                lexdb_plan.PPlan.Scan(sc, _) { return aggRun(st, txn, &sc, &cs, &a, cols, t, src, hrows, cx, room, bud, cnt, top, give) }
                                 else {}
                             }
                         }
@@ -3880,7 +3995,7 @@ pub fn runAgg(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols
                                 else {}
                             }
                         }
-                        lexdb_plan.PPlan.Scan(sc, _) { return aggRun(st, txn, &sc, &none, &a, cols, t, src, hrows, cx, room, bud, cnt, give) }
+                        lexdb_plan.PPlan.Scan(sc, _) { return aggRun(st, txn, &sc, &none, &a, cols, t, src, hrows, cx, room, bud, cnt, top, give) }
                         else {}
                     }
                 }
@@ -3931,7 +4046,7 @@ fn aggFirst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.P
             append(mut &slots, sc.first + i)
         }
     }
-    var rg = RowGroups{row: array(len(cols), Val.Null), index: newMap(), firsts: [], accs: [], starCnt: [], allStar: false, specs: callSpecs(a), added: 0, kb: "", sets: []}
+    var rg = RowGroups{row: array(len(cols), Val.Null), ht: lexdb_ht.newTwoLevelArena(false), firsts: [], accs: [], starCnt: [], allStar: false, specs: callSpecs(a), added: 0, kb: "", sets: []}
     let maxHeld = bud.maxHeld
     var vals: []Val = []
     var noSort = noSortRun()
@@ -3952,7 +4067,7 @@ fn aggFirst(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.P
 // The aggregate a over scan sc filtered by conds: units, values, rows.
 fn aggRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PScan, conds: &[]BX, a: &lexdb_plan.PAgg,
           cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, hrows: &[][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
-          give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[int, DbErr] {
+          top: &TopAgg, give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[int, DbErr] {
     // the counts so far: each try counts from the start again
     let c0 = cnt[0]
     // (a collation's key or call: row by row, Q8 R2)
@@ -3960,7 +4075,7 @@ fn aggRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PSc
         batchRuns += 1
         var usedDec = false
         var values = false
-        match aggBatches(st, txn, sc, conds, a, cols, t, src, hrows, cx, room, bud, cnt, give, true, mut &usedDec) {
+        match aggBatches(st, txn, sc, conds, a, cols, t, src, hrows, cx, room, bud, cnt, top, give, true, mut &usedDec) {
             Ok(x) {
                 match x {
                     Some(n) { return Ok(n) }
@@ -3979,13 +4094,13 @@ fn aggRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PSc
         }
         if values {
             var none = false
-            match try aggBatches(st, txn, sc, conds, a, cols, t, src, hrows, cx, room, bud, cnt, give, false, mut &none) {
+            match try aggBatches(st, txn, sc, conds, a, cols, t, src, hrows, cx, room, bud, cnt, top, give, false, mut &none) {
                 Some(n) { return Ok(n) }
                 None { cnt[0] = c0 }
             }
         }
     }
-    return aggRows(st, txn, sc, conds, a, cols, t, src, hrows, cx, room, bud, cnt, give)
+    return aggRows(st, txn, sc, conds, a, cols, t, src, hrows, cx, room, bud, cnt, top, give)
 }
 
 // Whether x calls a volatile or user function (cannot be re-evaluated if a
@@ -4024,7 +4139,7 @@ fn bxVolatile(x: &BX): bool {
 // (nothing given).
 fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PScan, conds: &[]BX, a: &lexdb_plan.PAgg,
               cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, hrows: &[][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
-              give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr], dec: bool, usedDec: mut &bool): Result[Option[int], DbErr] {
+              top: &TopAgg, give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr], dec: bool, usedDec: mut &bool): Result[Option[int], DbErr] {
     let rel = lexdb_catalog.relOf(t)
     // the table's columns' kinds (the query's: they are its only ones)
     var kinds: []int = []
@@ -4058,7 +4173,16 @@ fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan
         for k in 0..len(ag.ags) {
             if !ag.ags[k].oneKey { continue }
             match ag.ags[k].keys[0].n {
-                BNode.Col(c) { ag.ags[k].sorted = c == t.pk[0] }
+                BNode.Col(c) {
+                    if c == t.pk[0] {
+                        ag.ags[k].sorted = true
+                        if ag.ags[k].keyCol0 >= 0 {
+                            append(mut &ag.ags[k].fcols, ag.ags[k].keyCol0)
+                            ag.ags[k].keyCol0 = -1
+                            ag.ags[k].intHt.trackKeys = false
+                        }
+                    }
+                }
                 else {}
             }
         }
@@ -4192,7 +4316,7 @@ fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan
     cnt[0].joined += nJoined
     cnt[0].batches += nBatches
     cnt[len(cnt) - 1].joined += ag.ngroups()
-    try ag.finish(len(cols), give)
+    try ag.finishTop(len(cols), top, give)
     return Ok(Some(ag.added()))
 }
 
@@ -4201,13 +4325,26 @@ fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan
 // units), its value (vcol), its sum as units in 128 bits (dsc); the groups
 // by their key; each group's first row's kept columns. A call of any other
 // kind (BA_GEN) keeps lexdb_agg's accumulator per group (gcs).
+// Direct Top-N early group filter (when ORDER BY leads with COUNT(*) / COUNT(x) and LIMIT+OFFSET <= 4096):
+// scans the flat integer count array in O(ngroups) (~0.3 ms for 1M groups) and materializes Val/Acc
+// ONLY for the surviving Top-N (or tie-bearing) groups instead of all ngroups.
+type TopAgg = value record {
+    on: bool
+    aggIdx: int
+    desc: bool
+    oneOrd: bool
+    topN: int
+}
+
+fn noTopAgg(): TopAgg { return TopAgg{on: false, aggIdx: -1, desc: false, oneOrd: false, topN: -1} }
+
 type AggSt = record {
     keys: []BComp
     specs: []BSpec
     gens: []Option[BGen]    // per call: its argument by the generic step (its values a column added per batch: vcol)
     gcs: []GCall            // per call: what a BA_GEN call accumulates by (the others': nothing)
     kinds: []int            // per column of the batches eaten
-    fcols: []int            // a group's first row's columns kept
+    fcols: []int            // a group's first row's columns kept (excluding elided key columns)
     fv: []Val
     ngroups: int
     an: [][]int
@@ -4218,20 +4355,23 @@ type AggSt = record {
     afs: [][]float          // BA_VAR: per group the sum ...
     afq: [][]float          // ... and the sum of squares
     asets: [][]Map[int, int]    // BA_CNTD: per group its values
-    byInt: Map[int, int]
-    byKey: Map[str, int]
-    byText: Map[str, int]
-    twoInt: bool            // two integer/bool keys: flat open-addressing hash table (zero string alloc)
-    ht: []int               // slot -> group id + 1 (0 = empty)
-    hk0: []int              // per group: key 0
-    hk1: []int              // per group: key 1
-    hnu: []byte             // per group: bit 0 = key 0 null, bit 1 = key 1 null
+    intHt: lexdb_ht.TwoLevelInt
+    twoHt: lexdb_ht.TwoLevelTwoInt
+    textHt: lexdb_ht.TwoLevelArena
+    keyHt: lexdb_ht.TwoLevelArena
+    twoInt: bool            // two integer/bool keys: adaptive two-level flat open-addressing hash table
     nullGroup: int
     oneKey: bool
     sorted: bool            // grouped by the scan's order (one key, the primary key's first column)
     lastKey: int
     lastG: int
-    textCol: int            // one key a text or varchar column: grouped by its text
+    textCol: int            // one key a text or varchar column: grouped by its text in bump-arena
+    // Zero-copy key column elision: key columns reconstructed directly from intHt/twoHt/textHt at finish()
+    elideText: bool
+    keyCol0: int
+    keyCol1: int
+    keyCol0Bool: bool
+    keyCol1Bool: bool
     added: int
     room: int
     maxHeld: int
@@ -4421,6 +4561,111 @@ fn typedSpec(c: &lexdb_plan.PCall, cols: &[]lexdb_sql.ColDef, kinds: &[]int, nee
     return true
 }
 
+// Compiles a GROUP BY key expression into a BComp, adding fast paths for:
+// - extract(minute|hour FROM ts_col) on TIMESTAMP columns (ClickBench q18)
+// - CASE WHEN cond THEN text_col ELSE text_lit END (ClickBench q39)
+fn aggKeyCompile(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, cx: &Ctx, dec: bool): Option[BComp] {
+    match bCompileD(x, cols, kinds, cx, 0, dec) {
+        Some(cc) {
+            if cc.typ == BT_OTHER {
+                match cc.n {
+                    BNode.Col(_) { return Some(cc) }
+                    else { return None }
+                }
+            }
+            return Some(cc)
+        }
+        None {}
+    }
+    match x {
+        BX.Call(fr, args) {
+            if (fr.name == "extract" || fr.name == "date_part") && len(args) == 2 {
+                var part = -1
+                if bxConst(&args[0]) {
+                    let none: []Val = []
+                    match bxEval(&args[0], &none, &none, cx) {
+                        Ok(v) {
+                            match v {
+                                Val.Text(f) {
+                                    let lo = strings.toLowerAscii(&f)
+                                    if lo == "minute" || lo == "minutes" { part = 0 }
+                                    else if lo == "hour" || lo == "hours" { part = 1 }
+                                }
+                                else {}
+                            }
+                        }
+                        Err(_) {}
+                    }
+                }
+                if part >= 0 {
+                    match &args[1] {
+                        BX.Col(c) {
+                            if c >= 0 && c < len(cols) && c < len(kinds) && kinds[c] == BK_VAL && cols[c].typ.oid == lexdb_sql.OID_TS {
+                                return Some(BComp{n: BNode.TsPart(c, part), typ: BT_INT})
+                            }
+                        }
+                        else {}
+                    }
+                }
+            }
+        }
+        BX.Case(cs, hasElse) {
+            if hasElse && len(cs) == 3 {
+                match bCompileD(&cs[0], cols, kinds, cx, 0, dec) {
+                    Some(condC) {
+                        if boolLike(condC.typ) {
+                            match &cs[1] {
+                                BX.Col(tc) {
+                                    if tc >= 0 && tc < len(cols) && tc < len(kinds) &&
+                                       (cols[tc].typ.oid == lexdb_sql.OID_TEXT || cols[tc].typ.oid == lexdb_sql.OID_VARCHAR) &&
+                                       bxConst(&cs[2]) {
+                                        let none: []Val = []
+                                        match bxEval(&cs[2], &none, &none, cx) {
+                                            Ok(ev) {
+                                                match ev {
+                                                    Val.Text(lit) {
+                                                        return Some(BComp{n: BNode.CondText(takeN(condC), tc, lit), typ: BT_OTHER})
+                                                    }
+                                                    else {}
+                                                }
+                                            }
+                                            Err(_) {}
+                                        }
+                                    }
+                                }
+                                else {}
+                            }
+                        }
+                    }
+                    None {}
+                }
+            }
+        }
+        else {}
+    }
+    return None
+}
+
+fn isConstKey(c: &BComp): bool {
+    match c.n {
+        BNode.Const(_, _) { return true }
+        else { return false }
+    }
+}
+
+fn plainIntKeyCol(c: &BComp, kinds: &[]int): int {
+    if c.typ != BT_INT && c.typ != BT_BOOL { return -1 }
+    match c.n {
+        BNode.Col(ci) {
+            if ci >= 0 && ci < len(kinds) && !lexdb_rows.isDecKind(kinds[ci]) && (kinds[ci] == BK_INT || kinds[ci] == BK_BOOL) {
+                return ci
+            }
+            return -1
+        }
+        else { return -1 }
+    }
+}
+
 // a's state over batches of the columns kinds (need: those decoded), keyed
 // by the keys ks (places in a.keys); None: a key or call the batches do not
 // evaluate.
@@ -4428,16 +4673,12 @@ fn aggState(a: &lexdb_plan.PAgg, ks: &[]int, cols: &[]lexdb_sql.ColDef, kinds: &
             maxHeld: int): Option[AggSt] {
     var keys: []BComp = []
     for ki in ks {
-        let got = bCompileD(&a.keys[ki], cols, kinds, cx, 0, dec)
+        let got = aggKeyCompile(&a.keys[ki], cols, kinds, cx, dec)
         if got.isNone() { return None }
         let cc = got.unwrap()
-        if cc.typ == BT_OTHER {
-            match cc.n {
-                BNode.Col(_) {}
-                else { return None }
-            }
-        }
-        append(mut &keys, cc)
+        // Constant GROUP BY keys (e.g. ClickBench q34: GROUP BY 1, URL) do not vary per row:
+        // fold them out of hash key lookup so single-column fast paths apply directly!
+        if !isConstKey(&cc) { append(mut &keys, cc) }
     }
     var specs: []BSpec = []
     var gens: []Option[BGen] = []
@@ -4488,9 +4729,13 @@ fn aggState(a: &lexdb_plan.PAgg, ks: &[]int, cols: &[]lexdb_sql.ColDef, kinds: &
     for i in 0..len(need) { if need[i] && i < len(a.keep) && a.keep[i] { append(mut &fcols, i) } }
     let ns = len(specs)
     var ag = AggSt{keys: keys, specs: specs, gens: gens, gcs: gcs, kinds: collections.copyOf(kinds), fcols: fcols, fv: [], ngroups: 0,
-                   an: [], asum: [], amm: [], aval: [], adec: [], afs: [], afq: [], asets: [], byInt: newMap(), byKey: newMap(), byText: newMap(),
-                   twoInt: false, ht: [], hk0: [], hk1: [], hnu: [], nullGroup: -1,
-                   oneKey: false, sorted: false, lastKey: 0, lastG: -1, textCol: -1, added: 0, room: room, maxHeld: maxHeld,
+                   an: [], asum: [], amm: [], aval: [], adec: [], afs: [], afq: [], asets: [],
+                   intHt: lexdb_ht.newTwoLevelInt(false), twoHt: lexdb_ht.newTwoLevelTwoInt(),
+                   textHt: lexdb_ht.newTwoLevelArena(false), keyHt: lexdb_ht.newTwoLevelArena(false),
+                   twoInt: false, nullGroup: -1,
+                   oneKey: false, sorted: false, lastKey: 0, lastG: -1, textCol: -1,
+                   elideText: false, keyCol0: -1, keyCol1: -1, keyCol0Bool: false, keyCol1Bool: false,
+                   added: 0, room: room, maxHeld: maxHeld,
                    track: false, base: 0, born: []}
     for i in 0..ns {
         append(mut &ag.an, [])
@@ -4515,7 +4760,47 @@ fn aggState(a: &lexdb_plan.PAgg, ks: &[]int, cols: &[]lexdb_sql.ColDef, kinds: &
             else {}
         }
     }
+    // Zero-copy fv elision: avoid duplicating key columns into ag.fv when they are already
+    // stored in textHt (bump-arena) or twoHt (flat key arrays)!
+    if ag.textCol >= 0 && hasIntIn(&ag.fcols, ag.textCol) {
+        var nf: []int = []
+        for fc in ag.fcols { if fc != ag.textCol { append(mut &nf, fc) } }
+        ag.fcols = nf
+        ag.elideText = true
+        ag.textHt.trackKeys = true
+    } else if ag.oneKey {
+        let c0 = plainIntKeyCol(&ag.keys[0], kinds)
+        if c0 >= 0 && hasIntIn(&ag.fcols, c0) {
+            ag.keyCol0 = c0
+            ag.keyCol0Bool = ag.keys[0].typ == BT_BOOL
+            ag.intHt.trackKeys = true
+            var nf: []int = []
+            for fc in ag.fcols { if fc != c0 { append(mut &nf, fc) } }
+            ag.fcols = nf
+        }
+    } else if ag.twoInt {
+        let c0 = plainIntKeyCol(&ag.keys[0], kinds)
+        let c1 = plainIntKeyCol(&ag.keys[1], kinds)
+        if c0 >= 0 && hasIntIn(&ag.fcols, c0) {
+            ag.keyCol0 = c0
+            ag.keyCol0Bool = ag.keys[0].typ == BT_BOOL
+        }
+        if c1 >= 0 && c1 != c0 && hasIntIn(&ag.fcols, c1) {
+            ag.keyCol1 = c1
+            ag.keyCol1Bool = ag.keys[1].typ == BT_BOOL
+        }
+        if ag.keyCol0 >= 0 || ag.keyCol1 >= 0 {
+            var nf: []int = []
+            for fc in ag.fcols { if fc != ag.keyCol0 && fc != ag.keyCol1 { append(mut &nf, fc) } }
+            ag.fcols = nf
+        }
+    }
     return Some(ag)
+}
+
+fn hasIntIn(xs: &[]int, x: int): bool {
+    for v in xs { if v == x { return true } }
+    return false
 }
 
 // Whether the aggregate read a numeric as units (its calls, or the columns kinds/need).
@@ -4523,24 +4808,6 @@ fn (ag: &AggSt) anyDec(kinds: &[]int, need: &[]bool): bool {
     for sp in ag.specs { if sp.dsc >= 0 { return true } }
     for i in 0..len(kinds) { if need[i] && lexdb_rows.isDecKind(kinds[i]) { return true } }
     return false
-}
-
-fn hashTwoInt(k0: int, k1: int, nu: byte): int {
-    let h1 = k1.hash()
-    let h = k0.hash() ^ (h1 << 1) ^ (h1 >> 7) ^ (u64(nu) << 29)
-    return int(h & u64(0x7fffffffffffffff))
-}
-
-fn (ag: mut &AggSt) growTwoInt() {
-    let cap = if len(ag.ht) == 0 { 1024 } else { len(ag.ht) * 2 }
-    let mask = cap - 1
-    var nht: []int = array(cap, 0)
-    for g in 0..len(ag.hk0) {
-        var sl = hashTwoInt(ag.hk0[g], ag.hk1[g], ag.hnu[g]) & mask
-        while nht[sl] != 0 { sl = (sl + 1) & mask }
-        nht[sl] = g + 1
-    }
-    ag.ht = nht
 }
 
 // A new group's states (born: the place of the row that makes it, in the
@@ -4581,140 +4848,180 @@ fn (ag: mut &AggSt) newGroup(born: int) {
 fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
     let nc = len(idx)
     let ns = len(ag.specs)
+    let hasFcols = len(ag.fcols) > 0
     var gid: []int = array(nc, 0)
     if len(ag.keys) == 0 {
         if ag.ngroups == 0 {
-            let cost = bFirstVals(b, idx[0], &ag.kinds, &ag.fcols, mut &ag.fv) + 64 * (ns + 1)
+            let fcost = if hasFcols { bFirstVals(b, idx[0], &ag.kinds, &ag.fcols, mut &ag.fv) } else { 32 }
+            let cost = fcost + 64 * (ns + 1)
             ag.ngroups += 1
             ag.added += cost
             if ag.room >= 0 && ag.added > ag.room { return Err(memErr(ag.maxHeld)) }
             ag.newGroup(ag.base)
         }
-    } else {
-        // (per batch: which keys are texts, the text key's column a text one)
-        let ktxt = keyTexts(&ag.keys, b)
-        let tcol = ag.textCol >= 0 && lexdb_rows.isTextCol(b, ag.textCol)
-        var kvs: []BVec = []
-        for k in ag.keys { append(mut &kvs, try bEval(&k.n, b, idx)) }
-        // a composite key built in one reused string; copied only for a new group
-        var kb = ""
+    } else if ag.oneKey && !ag.sorted {
+        // Adaptive two-level single-integer GROUP BY (batch-grouped probe + row-order miss insert)
+        let kv0 = try bEval(&ag.keys[0].n, b, idx)
+        ag.intHt.probeBatch(&kv0.v, &kv0.nul, nc, mut &gid)
         for j in 0..nc {
+            if gid[j] >= 0 { continue }
             var g = -1
-            var klen = 9
-            if ag.oneKey {
-                if kvs[0].nul[j] {
-                    g = ag.nullGroup
-                } else if ag.sorted {
-                    if ag.lastG >= 0 && kvs[0].v[j] == ag.lastKey { g = ag.lastG }
-                } else {
-                    match ag.byInt.get(&kvs[0].v[j]) {
-                        Some(x) { g = x }
-                        None {}
-                    }
-                }
-            }
-            if ag.textCol >= 0 {
-                let r = idx[j]
-                if b.cols[ag.textCol].nul[r] {
-                    g = ag.nullGroup
-                } else if tcol {
-                    // looked up by the batch's bytes; copied only for a new group
-                    let x = lexdb_rows.textAt(b, ag.textCol, r)
-                    klen = len(x)
-                    match ag.byText.get(x) {
-                        Some(y) { g = y }
-                        None {}
-                    }
-                } else {
-                    // looked up by the batch's own text; copied only for a new group
-                    match b.vals[ag.textCol][r] {
-                        Val.Text(x) {
-                            klen = len(x)
-                            match ag.byText.get(x) {
-                                Some(y) { g = y }
-                                None {}
-                            }
-                        }
-                        else { return Ok(false) }
-                    }
-                }
-            } else if ag.twoInt {
-                let n0 = kvs[0].nul[j]
-                let n1 = kvs[1].nul[j]
-                let k0 = if n0 { 0 } else { kvs[0].v[j] }
-                let k1 = if n1 { 0 } else { kvs[1].v[j] }
-                let nu = byte((if n0 { 1 } else { 0 }) | (if n1 { 2 } else { 0 }))
-                klen = (if n0 { 1 } else if ag.keys[0].typ == BT_BOOL { 2 } else { 9 }) +
-                       (if n1 { 1 } else if ag.keys[1].typ == BT_BOOL { 2 } else { 9 })
-                if len(ag.ht) > 0 {
-                    let mask = len(ag.ht) - 1
-                    var sl = hashTwoInt(k0, k1, nu) & mask
-                    while true {
-                        let e = ag.ht[sl]
-                        if e == 0 { break }
-                        let eg = e - 1
-                        if ag.hk0[eg] == k0 && ag.hk1[eg] == k1 && ag.hnu[eg] == nu {
-                            g = eg
-                            break
-                        }
-                        sl = (sl + 1) & mask
-                    }
-                }
-            } else if !ag.oneKey {
-                kb.clear()
-                for ki in 0..len(ag.keys) { bKeyEnc(mut &kb, &ag.keys[ki], &kvs[ki], j, b, idx[j], ktxt[ki]) }
-                klen = len(kb)
-                match ag.byKey.get(&kb) {
-                    Some(x) { g = x }
-                    None {}
-                }
+            if kv0.nul[j] {
+                g = ag.nullGroup
+            } else {
+                g = ag.intHt.get(kv0.v[j])
             }
             if g < 0 {
                 g = ag.ngroups
                 ag.ngroups += 1
-                let cost = bFirstVals(b, idx[j], &ag.kinds, &ag.fcols, mut &ag.fv) + 64 * (ns + 1) + klen
+                let fcost = if hasFcols { bFirstVals(b, idx[j], &ag.kinds, &ag.fcols, mut &ag.fv) } else { 32 }
+                let cost = fcost + 64 * (ns + 1) + 9
                 ag.added += cost
                 if ag.room >= 0 && ag.added > ag.room { return Err(memErr(ag.maxHeld)) }
                 ag.newGroup(ag.base + j)
-                if ag.textCol >= 0 {
-                    if b.cols[ag.textCol].nul[idx[j]] {
+                if kv0.nul[j] { ag.nullGroup = g } else { ag.intHt.put(kv0.v[j], g) }
+            }
+            gid[j] = g
+        }
+    } else if ag.twoInt {
+        // Adaptive two-level two-integer GROUP BY (ClickBench q32: 256 L1/L2 buckets + zero-copy fv elision)
+        let kv0 = try bEval(&ag.keys[0].n, b, idx)
+        let kv1 = try bEval(&ag.keys[1].n, b, idx)
+        ag.twoHt.probeBatch(&kv0.v, &kv0.nul, &kv1.v, &kv1.nul, nc, mut &gid)
+        for j in 0..nc {
+            if gid[j] >= 0 { continue }
+            let n0 = kv0.nul[j]
+            let n1 = kv1.nul[j]
+            let k0 = if n0 { 0 } else { kv0.v[j] }
+            let k1 = if n1 { 0 } else { kv1.v[j] }
+            let nu = byte((if n0 { 1 } else { 0 }) | (if n1 { 2 } else { 0 }))
+            var g = ag.twoHt.get(k0, k1, nu)
+            if g < 0 {
+                g = ag.ngroups
+                ag.ngroups += 1
+                let klen = (if n0 { 1 } else if ag.keys[0].typ == BT_BOOL { 2 } else { 9 }) +
+                           (if n1 { 1 } else if ag.keys[1].typ == BT_BOOL { 2 } else { 9 })
+                let fcost = if hasFcols { bFirstVals(b, idx[j], &ag.kinds, &ag.fcols, mut &ag.fv) } else { 32 }
+                let cost = fcost + 64 * (ns + 1) + klen
+                ag.added += cost
+                if ag.room >= 0 && ag.added > ag.room { return Err(memErr(ag.maxHeld)) }
+                ag.newGroup(ag.base + j)
+                ag.twoHt.put(k0, k1, nu, g)
+            }
+            gid[j] = g
+        }
+    } else if ag.textCol >= 0 {
+        // Adaptive two-level bump-arena single-text GROUP BY (ClickBench q33/q34/q36/q37: batch-grouped probe + zero per-key malloc!)
+        let tc = ag.textCol
+        let tcol = lexdb_rows.isTextCol(b, tc)
+        if tcol {
+            var hs: []u64 = array(nc, u64(0))
+            ag.textHt.probeTextBatch(&b.txt[tc], &b.cols[tc].v, &b.cols[tc].nul, idx, nc, mut &hs, mut &gid)
+            for j in 0..nc {
+                if gid[j] >= 0 { continue }
+                let r = idx[j]
+                let isNul = b.cols[tc].nul[r]
+                var g = -1
+                var klen = 9
+                if isNul {
+                    g = ag.nullGroup
+                } else {
+                    let x = lexdb_rows.textAt(b, tc, r)
+                    klen = len(x)
+                    g = ag.textHt.getHash(x, hs[j])
+                }
+                if g < 0 {
+                    g = ag.ngroups
+                    ag.ngroups += 1
+                    let fcost = if hasFcols { bFirstVals(b, r, &ag.kinds, &ag.fcols, mut &ag.fv) } else { 32 + klen }
+                    let cost = fcost + 64 * (ns + 1) + klen
+                    ag.added += cost
+                    if ag.room >= 0 && ag.added > ag.room { return Err(memErr(ag.maxHeld)) }
+                    ag.newGroup(ag.base + j)
+                    if isNul {
                         ag.nullGroup = g
-                    } else if tcol {
-                        ag.byText.put(lexdb_rows.textAt(b, ag.textCol, idx[j]).clone(), g)
                     } else {
-                        match b.vals[ag.textCol][idx[j]] {
-                            Val.Text(x) { ag.byText.put(x.clone(), g) }
+                        ag.textHt.putHash(lexdb_rows.textAt(b, tc, r), hs[j], g)
+                    }
+                }
+                gid[j] = g
+            }
+        } else {
+            for j in 0..nc {
+                let r = idx[j]
+                var g = -1
+                var klen = 9
+                var h = u64(0)
+                let isNul = b.cols[tc].nul[r]
+                if isNul {
+                    g = ag.nullGroup
+                } else {
+                    match b.vals[tc][r] {
+                        Val.Text(x) {
+                            klen = len(x)
+                            h = lexdb_ht.hashStr(x)
+                            g = ag.textHt.getHash(x, h)
+                        }
+                        else { return Ok(false) }
+                    }
+                }
+                if g < 0 {
+                    g = ag.ngroups
+                    ag.ngroups += 1
+                    let fcost = if hasFcols { bFirstVals(b, r, &ag.kinds, &ag.fcols, mut &ag.fv) } else { 32 + klen }
+                    let cost = fcost + 64 * (ns + 1) + klen
+                    ag.added += cost
+                    if ag.room >= 0 && ag.added > ag.room { return Err(memErr(ag.maxHeld)) }
+                    ag.newGroup(ag.base + j)
+                    if isNul {
+                        ag.nullGroup = g
+                    } else {
+                        match b.vals[tc][r] {
+                            Val.Text(x) { ag.textHt.putHash(x, h, g) }
                             else {}
                         }
                     }
-                } else if ag.oneKey {
-                    if kvs[0].nul[j] {
-                        ag.nullGroup = g
-                    } else if ag.sorted {
-                        ag.lastKey = kvs[0].v[j]
-                        ag.lastG = g
-                    } else {
-                        ag.byInt.put(kvs[0].v[j], g)
-                    }
-                } else if ag.twoInt {
-                    let n0 = kvs[0].nul[j]
-                    let n1 = kvs[1].nul[j]
-                    let k0 = if n0 { 0 } else { kvs[0].v[j] }
-                    let k1 = if n1 { 0 } else { kvs[1].v[j] }
-                    let nu = byte((if n0 { 1 } else { 0 }) | (if n1 { 2 } else { 0 }))
-                    append(mut &ag.hk0, k0)
-                    append(mut &ag.hk1, k1)
-                    append(mut &ag.hnu, nu)
-                    if len(ag.ht) == 0 || ag.ngroups * 10 >= len(ag.ht) * 7 {
-                        ag.growTwoInt()
-                    } else {
-                        let mask = len(ag.ht) - 1
-                        var sl = hashTwoInt(k0, k1, nu) & mask
-                        while ag.ht[sl] != 0 { sl = (sl + 1) & mask }
-                        ag.ht[sl] = g + 1
-                    }
+                }
+                gid[j] = g
+            }
+        }
+    } else {
+        // Sorted single-key OR composite keys in adaptive two-level bump-arena (ClickBench q18/q39!)
+        let ktxt = keyTexts(&ag.keys, b)
+        var kvs: []BVec = []
+        for k in ag.keys { append(mut &kvs, try bEval(&k.n, b, idx)) }
+        var kb = ""
+        for j in 0..nc {
+            var g = -1
+            var klen = 9
+            var h = u64(0)
+            if ag.oneKey {
+                // ag.sorted == true
+                if kvs[0].nul[j] {
+                    g = ag.nullGroup
+                } else if ag.lastG >= 0 && kvs[0].v[j] == ag.lastKey {
+                    g = ag.lastG
+                }
+            } else {
+                kb.clear()
+                for ki in 0..len(ag.keys) { bKeyEncFast(mut &kb, &ag.keys[ki], &kvs[ki], j, b, idx[j], ktxt[ki]) }
+                klen = len(kb)
+                h = lexdb_ht.hashStr(&kb)
+                g = ag.keyHt.getHash(&kb, h)
+            }
+            if g < 0 {
+                g = ag.ngroups
+                ag.ngroups += 1
+                let fcost = if hasFcols { bFirstVals(b, idx[j], &ag.kinds, &ag.fcols, mut &ag.fv) } else { 32 }
+                let cost = fcost + 64 * (ns + 1) + klen
+                ag.added += cost
+                if ag.room >= 0 && ag.added > ag.room { return Err(memErr(ag.maxHeld)) }
+                ag.newGroup(ag.base + j)
+                if ag.oneKey {
+                    if kvs[0].nul[j] { ag.nullGroup = g }
+                    else { ag.lastKey = kvs[0].v[j]; ag.lastG = g }
                 } else {
-                    ag.byKey.put(kb.clone(), g)
+                    ag.keyHt.putHash(&kb, h, g)
                 }
             }
             gid[j] = g
@@ -4828,6 +5135,26 @@ fn (ag: mut &AggSt) groupAt(g: int, first: mut &[]Val, accs: mut &[]Acc): Result
     let nf = len(ag.fcols)
     let ns = len(ag.specs)
     for fi in 0..nf { first[ag.fcols[fi]] = replace(mut &ag.fv[g * nf + fi], Val.Null) }
+    if ag.elideText {
+        first[ag.textCol] = if g == ag.nullGroup { Val.Null } else { Val.Text(ag.textHt.keyAt(g)) }
+    } else if ag.oneKey && ag.keyCol0 >= 0 {
+        first[ag.keyCol0] = if g == ag.nullGroup { Val.Null }
+                            else if ag.keyCol0Bool { Val.Bool(ag.intHt.keyAt(g) != 0) }
+                            else { Val.Int(ag.intHt.keyAt(g)) }
+    } else if ag.twoInt {
+        if ag.keyCol0 >= 0 {
+            let nu = ag.twoHt.nuAt(g)
+            first[ag.keyCol0] = if (int(nu) & 1) != 0 { Val.Null }
+                                else if ag.keyCol0Bool { Val.Bool(ag.twoHt.key0At(g) != 0) }
+                                else { Val.Int(ag.twoHt.key0At(g)) }
+        }
+        if ag.keyCol1 >= 0 {
+            let nu = ag.twoHt.nuAt(g)
+            first[ag.keyCol1] = if (int(nu) & 2) != 0 { Val.Null }
+                                else if ag.keyCol1Bool { Val.Bool(ag.twoHt.key1At(g) != 0) }
+                                else { Val.Int(ag.twoHt.key1At(g)) }
+        }
+    }
     for si in 0..ns {
         let kd = ag.specs[si].kind
         if kd == BA_GEN {
@@ -4950,10 +5277,34 @@ fn (ag: mut &AggSets) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
 // give may take the accumulators (leaving none). The sets' groups in the order
 // of the rows that made them, a row's in the sets' order.
 fn (ag: mut &AggSets) finish(nq: int, give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[Unit, DbErr] {
+    let noTop = noTopAgg()
+    return ag.finishTop(nq, &noTop, give)
+}
+
+fn (ag: mut &AggSets) finishTop(nq: int, top: &TopAgg, give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[Unit, DbErr] {
     let ns = len(ag.ags[0].specs)
     var rowLen = 0
     for x in ag.ags {
         for c in x.fcols { if c + 1 > rowLen { rowLen = c + 1 } }
+        if x.elideText && x.textCol + 1 > rowLen { rowLen = x.textCol + 1 }
+        if x.keyCol0 >= 0 && x.keyCol0 + 1 > rowLen { rowLen = x.keyCol0 + 1 }
+        if x.keyCol1 >= 0 && x.keyCol1 + 1 > rowLen { rowLen = x.keyCol1 + 1 }
+    }
+    // Direct Top-N pruning BEFORE allocating Val/Acc arrays for rejected groups!
+    if !ag.set && top.on && ag.ags[0].ngroups > 8192 && top.aggIdx >= 0 && top.aggIdx < ns {
+        let kd = ag.ags[0].specs[top.aggIdx].kind
+        if kd == BA_STAR || kd == BA_COUNT {
+            let keepGids = lexdb_ht.selectTopIntGroups(&ag.ags[0].an[top.aggIdx], ag.ags[0].ngroups, top.topN, top.desc, top.oneOrd)
+            var first: []Val = array(rowLen, Val.Null)
+            var accs = lexdb_agg.newAccs(ns)
+            for g in keepGids {
+                try ag.ags[0].groupAt(g, mut &first, mut &accs)
+                try give(mut &first, -1, mut &accs)
+                if len(first) != rowLen { first = array(rowLen, Val.Null) }
+                if len(accs) != ns { accs = lexdb_agg.newAccs(ns) }
+            }
+            return Ok(Unit{})
+        }
     }
     var first: []Val = array(rowLen, Val.Null)
     var accs = lexdb_agg.newAccs(ns)
@@ -4984,7 +5335,7 @@ fn (ag: mut &AggSets) finish(nq: int, give: &fn(mut &[]Val, int, mut &[]Acc): Re
 // group); the bytes counted.
 type RowGroups = record {
     row: []Val
-    index: Map[str, int]
+    ht: lexdb_ht.TwoLevelArena
     firsts: [][]Val
     accs: []Acc
     starCnt: []int          // allStar fast path: single COUNT(*) without FILTER/sets (zero Acc alloc)
@@ -5003,7 +5354,7 @@ type RowGroups = record {
 // evaluator.
 fn aggRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PScan, conds: &[]BX, a: &lexdb_plan.PAgg,
            cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table, src: &Src, hrows: &[][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
-           give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[int, DbErr] {
+           top: &TopAgg, give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[int, DbErr] {
     // the scan's outputs: its columns decoded, at their slots
     var xs: []BX = []
     var slots: []int = []
@@ -5018,7 +5369,7 @@ fn aggRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
     }
     if src.held || rowLen == 0 { rowLen = len(cols) }
     let allStar = len(a.calls) == 1 && a.calls[0].star && a.calls[0].filter.isNone() && len(a.sets) == 0
-    var rg = RowGroups{row: array(rowLen, Val.Null), index: newMap(), firsts: [], accs: [], starCnt: [], allStar: allStar, specs: callSpecs(a), added: 0, kb: "", sets: []}
+    var rg = RowGroups{row: array(rowLen, Val.Null), ht: lexdb_ht.newTwoLevelArena(false), firsts: [], accs: [], starCnt: [], allStar: allStar, specs: callSpecs(a), added: 0, kb: "", sets: []}
     let maxHeld = bud.maxHeld
     var noSort = noSortRun()
     if src.held && !src.batch {
@@ -5040,7 +5391,7 @@ fn aggRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
             cnt[0].joined += 1
             try groupRow(mut &rg, a, cx, room, maxHeld)
         }
-        try giveGroups(mut &rg, len(a.calls), give)
+        try giveGroupsTop(mut &rg, len(a.calls), top, give)
         return Ok(rg.added)
     }
     let n = try runScan(st, txn, sc, conds, &xs, cols, t, src, hrows, cx, -1, bud, cnt, mut &noSort, fn(tx: mut &lexdb_store.Txn, ob: &lexdb_rows.OutBatch, r: &[]Val): Result[bool, DbErr] {
@@ -5055,13 +5406,28 @@ fn aggRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PS
         }
         return Ok(true)
     })
-    try giveGroups(mut &rg, len(a.calls), give)
+    try giveGroupsTop(mut &rg, len(a.calls), top, give)
     return Ok(rg.added)
 }
 
 // Each group of rg (ns calls), its first row and accumulators, to give.
 fn giveGroups(rg: mut &RowGroups, ns: int, give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[Unit, DbErr] {
+    let noTop = noTopAgg()
+    return giveGroupsTop(rg, ns, &noTop, give)
+}
+
+fn giveGroupsTop(rg: mut &RowGroups, ns: int, top: &TopAgg, give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[Unit, DbErr] {
     if rg.allStar {
+        if top.on && top.aggIdx == 0 && len(rg.starCnt) > 8192 {
+            let keepGids = lexdb_ht.selectTopIntGroups(&rg.starCnt, len(rg.starCnt), top.topN, top.desc, top.oneOrd)
+            for g in keepGids {
+                var acc = lexdb_agg.newAcc()
+                acc.n = rg.starCnt[g]
+                var accs: []Acc = [acc]
+                try give(mut &rg.firsts[g], -1, mut &accs)
+            }
+            return Ok(Unit{})
+        }
         for g in 0..len(rg.firsts) {
             var acc = lexdb_agg.newAcc()
             acc.n = rg.starCnt[g]
@@ -5112,16 +5478,8 @@ fn encHashVal(b: mut &str, v: &Val) {
             b.addByte(byte((n >> 48) & 255))
             b.addByte(byte((n >> 56) & 255))
         }
-        Val.Bool(y) { b.addByte(if y { 2 } else { 3 }) }
-        Val.Text(s) {
-            b.addByte(4)
-            let n = len(s)
-            b.addByte(byte(n & 255))
-            b.addByte(byte((n >> 8) & 255))
-            b.addByte(byte((n >> 16) & 255))
-            b.addByte(byte((n >> 24) & 255))
-            b += s
-        }
+        Val.Bool(y) { b.addByte(2); b.addByte(if y { 1 } else { 0 }) }
+        Val.Text(s) { addHashText(b, s) }
         Val.Num(d) {
             var c = d.coefficient()
             var e = d.exponent()
@@ -5192,23 +5550,24 @@ fn groupRow(rg: mut &RowGroups, a: &lexdb_plan.PAgg, cx: &Ctx, room: int, maxHel
             if !exact { encHashVal(mut &rg.kb, &lexdb_sort.collVal(a.kinds[i], &v)) }
             else { encHashVal(mut &rg.kb, &v) }
         }
-        match rg.index.get(&rg.kb) {
-            Some(x) { g = x }
-            None {
-                g = len(rg.firsts)
-                let rb = if room >= 0 { rowBytes(&rg.row) } else { 0 }
-                rg.added += rb + 64 * (ns + 1) + len(rg.kb)
-                if room >= 0 && rg.added > room { return Err(memErr(maxHeld)) }
-                rg.index.put(rg.kb.clone(), g)
-                let rlen = len(rg.row)
-                append(mut &rg.firsts, replace(mut &rg.row, array(rlen, Val.Null)))
-                if rg.allStar {
-                    append(mut &rg.starCnt, 1)
-                    return Ok(Unit{})
-                }
-                for i in 0..ns { append(mut &rg.accs, lexdb_agg.newAcc()) }
-                moved = true
+        let kh = lexdb_ht.hashStr(&rg.kb)
+        let gotG = rg.ht.getHash(&rg.kb, kh)
+        if gotG >= 0 {
+            g = gotG
+        } else {
+            g = len(rg.firsts)
+            let rb = if room >= 0 { rowBytes(&rg.row) } else { 0 }
+            rg.added += rb + 64 * (ns + 1) + len(rg.kb)
+            if room >= 0 && rg.added > room { return Err(memErr(maxHeld)) }
+            rg.ht.putHash(&rg.kb, kh, g)
+            let rlen = len(rg.row)
+            append(mut &rg.firsts, replace(mut &rg.row, array(rlen, Val.Null)))
+            if rg.allStar {
+                append(mut &rg.starCnt, 1)
+                return Ok(Unit{})
             }
+            for i in 0..ns { append(mut &rg.accs, lexdb_agg.newAcc()) }
+            moved = true
         }
     } else if len(rg.firsts) == 0 {
         let rlen = len(rg.row)
@@ -5245,18 +5604,19 @@ fn groupRowSets(rg: mut &RowGroups, a: &lexdb_plan.PAgg, cx: &Ctx, room: int, ma
         rg.kb += &si.toStr()
         rg.kb.addByte(0)
         for j in a.sets[si] { lexdb_access.encIdxPart(mut &rg.kb, &vals[j]) }
+        let kh = lexdb_ht.hashStr(&rg.kb)
+        let gotG = rg.ht.getHash(&rg.kb, kh)
         var g = 0
-        match rg.index.get(&rg.kb) {
-            Some(x) { g = x }
-            None {
-                g = len(rg.firsts)
-                rg.added += rowBytes(&rg.row) + 64 * (ns + 1) + len(rg.kb)
-                if room >= 0 && rg.added > room { return Err(memErr(maxHeld)) }
-                rg.index.put(rg.kb.clone(), g)
-                append(mut &rg.firsts, collections.copyOf(&rg.row))
-                append(mut &rg.sets, si)
-                for i in 0..ns { append(mut &rg.accs, lexdb_agg.newAcc()) }
-            }
+        if gotG >= 0 {
+            g = gotG
+        } else {
+            g = len(rg.firsts)
+            rg.added += rowBytes(&rg.row) + 64 * (ns + 1) + len(rg.kb)
+            if room >= 0 && rg.added > room { return Err(memErr(maxHeld)) }
+            rg.ht.putHash(&rg.kb, kh, g)
+            append(mut &rg.firsts, collections.copyOf(&rg.row))
+            append(mut &rg.sets, si)
+            for i in 0..ns { append(mut &rg.accs, lexdb_agg.newAcc()) }
         }
         for i in 0..ns { try accOne(&a.calls[i], &rg.specs[i], mut &rg.accs[g * ns + i], &rg.row, cx) }
     }
@@ -8103,9 +8463,17 @@ pub fn runAggAny(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, c
                  src: &Src, tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
                  give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr],
                  ask: &fn(mut &lexdb_store.Txn, &[]Val, mut &[][]Val): Result[bool, DbErr]): Result[int, DbErr] {
+    let noTop = noTopAgg()
+    return runAggAnyTop(st, txn, pg, cols, t, src, tabs, srcs, vrows, cx, room, bud, cnt, &noTop, give, ask)
+}
+
+fn runAggAnyTop(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
+                src: &Src, tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
+                top: &TopAgg, give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr],
+                ask: &fn(mut &lexdb_store.Txn, &[]Val, mut &[][]Val): Result[bool, DbErr]): Result[int, DbErr] {
     if pg.joins { return runAggJ(st, txn, pg, cols, tabs, srcs, vrows, cx, room, bud, cnt, give, ask) }
     let none: [][]Val = []
-    return runAgg(st, txn, pg, cols, t, src, if len(vrows) > 0 { &vrows[0] } else { &none }, cx, room, bud, cnt, give)
+    return runAggTop(st, txn, pg, cols, t, src, if len(vrows) > 0 { &vrows[0] } else { &none }, cx, room, bud, cnt, top, give)
 }
 
 // Runs an aggregate over joins (pg.groups, pg.joins: Agg (joins) under
@@ -8233,7 +8601,7 @@ fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top0: &lexdb_plan.
     var wl: []int = []
     for c in 0..nq { if want[c] { append(mut &wl, c) } }
     let allStar = len(a.calls) == 1 && a.calls[0].star && a.calls[0].filter.isNone() && len(a.sets) == 0
-    var rg = RowGroups{row: array(nq, Val.Null), index: newMap(), firsts: [], accs: [], starCnt: [], allStar: allStar, specs: callSpecs(a), added: 0, kb: "", sets: []}
+    var rg = RowGroups{row: array(nq, Val.Null), ht: lexdb_ht.newTwoLevelArena(false), firsts: [], accs: [], starCnt: [], allStar: allStar, specs: callSpecs(a), added: 0, kb: "", sets: []}
     let ks = collections.copyOf(&kinds)
     try joinRows(st, txn, top, cols, tabs, srcs, vrows, cx, false, kinds, owner, collections.copyOf(&want), false, bud, cnt, &ap,
                  fn(tx: mut &lexdb_store.Txn, f: mut &Batch): Result[bool, DbErr] {
@@ -10356,33 +10724,76 @@ fn havingUnder(p: &lexdb_plan.PPlan): &lexdb_plan.PPlan {
 // An aggregate's groups by its program (pg.groups, lexdb_plan.grpViews'
 // plan), as runAggAny makes them (ask: its Apply's), into gm; specs: its
 // calls' (the Sel's, which finish them). Then groupsView.
+// Checks whether pg.plan's outer Sort+Limit allows direct Top-N integer group pruning
+// inside AggSt.finishTop / RowGroups.giveGroupsTop BEFORE allocating Val/Acc per group!
+fn topAggOf(pg: &Prog, specs: &[]lexdb_agg.AggSpec, hs: &[]BX, canTop: bool): TopAgg {
+    if !canTop || len(hs) > 0 { return noTopAgg() }
+    let top = underMatch(&pg.plan)
+    var go = GOut{rows: [], held: 0, sorting: false, desc: [], nf: [], don: 0, ties: 0, pct: false, top: -1, limit: -1, offset: 0}
+    var srt = lexdb_plan.PSort{shown: -1, out: [], desc: [], nf: [], coll: [], don: 0, ties: 0, pct: false, top: -1}
+    groupsCutOf(top, -1, mut &go, mut &srt)
+    let topN = if go.limit >= 0 { go.limit + max(go.offset, 0) } else { -1 }
+    if !go.sorting || go.don != 0 || go.ties != 0 || go.pct || topN <= 0 || topN > 4096 ||
+       len(srt.desc) == 0 || len(srt.out) == 0 || len(srt.coll) == 0 || srt.coll[0] != lexdb_sql.COLL_EXACT {
+        return noTopAgg()
+    }
+    match distUnder(top) {
+        lexdb_plan.PPlan.Distinct(_, _, _) { return noTopAgg() }
+        else {}
+    }
+    match projUnder(top) {
+        lexdb_plan.PPlan.Project(i, xs) {
+            match i {
+                lexdb_plan.PPlan.Window(_, _) { return noTopAgg() }
+                lexdb_plan.PPlan.Filter(_, _) { return noTopAgg() }
+                else {}
+            }
+            let sc0 = srt.out[0]
+            if sc0 >= 0 && sc0 < len(xs) {
+                match &xs[sc0] {
+                    lexdb_bind.BX.Agg(ai) {
+                        if ai >= 0 && ai < len(specs) && !specs[ai].distinct && (specs[ai].star || specs[ai].op == lexdb_agg.OP_COUNT) {
+                            return TopAgg{on: true, aggIdx: ai, desc: srt.desc[0], oneOrd: len(srt.desc) == 1, topN: topN}
+                        }
+                    }
+                    else {}
+                }
+            }
+        }
+        else {}
+    }
+    return noTopAgg()
+}
+
 pub fn groupsMake(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
                   src: &Src, tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, specs: &[]lexdb_agg.AggSpec,
-                  bud: mut &Budget, cnt: mut &[]Counts, gm: mut &GMade,
+                  bud: mut &Budget, cnt: mut &[]Counts, gm: mut &GMade, canTop: bool,
                   ask: &fn(mut &lexdb_store.Txn, &[]Val, mut &[][]Val): Result[bool, DbErr]): Result[Unit, DbErr] {
     grpRuns0 += 1
     let noHs: []BX = []
     match havingUnder(&pg.plan) {
-        lexdb_plan.PPlan.Filter(_, hs) { return groupsCollect(st, txn, pg, cols, t, src, tabs, srcs, vrows, cx, room, specs, bud, cnt, gm, &hs, ask) }
-        else { return groupsCollect(st, txn, pg, cols, t, src, tabs, srcs, vrows, cx, room, specs, bud, cnt, gm, &noHs, ask) }
+        lexdb_plan.PPlan.Filter(_, hs) { return groupsCollect(st, txn, pg, cols, t, src, tabs, srcs, vrows, cx, room, specs, bud, cnt, gm, &hs, false, ask) }
+        else { return groupsCollect(st, txn, pg, cols, t, src, tabs, srcs, vrows, cx, room, specs, bud, cnt, gm, &noHs, canTop, ask) }
     }
 }
 
 fn groupsCollect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, t: &lexdb_catalog.Table,
                  src: &Src, tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, specs: &[]lexdb_agg.AggSpec,
-                 bud: mut &Budget, cnt: mut &[]Counts, gm: mut &GMade, hs: &[]BX,
+                 bud: mut &Budget, cnt: mut &[]Counts, gm: mut &GMade, hs: &[]BX, canTop: bool,
                  ask: &fn(mut &lexdb_store.Txn, &[]Val, mut &[][]Val): Result[bool, DbErr]): Result[Unit, DbErr] {
     // the aggregate's: a fused HAVING, no GROUP BY (one group for no rows),
     // its grouping sets
     var fuse = false
     var plain = false
     var esets: []int = []
+    var hasSets = false
     match aggUnder(&pg.plan) {
         lexdb_plan.PPlan.Agg(_, _, pa) {
             match pa {
                 Some(a) {
                     fuse = a.fuse && len(hs) == 1
                     plain = len(a.keys) == 0 && len(a.sets) == 0
+                    hasSets = len(a.sets) > 0
                     for si in 0..len(a.sets) { if len(a.sets[si]) == 0 { append(mut &esets, si) } }
                 }
                 None {}
@@ -10391,12 +10802,13 @@ fn groupsCollect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, c
         else {}
     }
     let ns = len(specs)
+    let topAgg = topAggOf(pg, specs, hs, canTop && !hasSets && !plain)
     var firsts: [][]Val = []
     var accss: [][]Acc = []
     var gsets: []int = []
     var fusing = fuse
     var fv: []Val = []
-    let got = runAggAny(st, txn, pg, cols, t, src, tabs, srcs, vrows, cx, room, bud, cnt,
+    let got = runAggAnyTop(st, txn, pg, cols, t, src, tabs, srcs, vrows, cx, room, bud, cnt, &topAgg,
                         fn(first: mut &[]Val, set: int, ps: mut &[]Acc): Result[Unit, DbErr] {
         if fusing {
             while len(fv) > 0 { let gone = pop(mut &fv) }

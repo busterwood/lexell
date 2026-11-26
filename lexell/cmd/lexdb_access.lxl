@@ -517,12 +517,25 @@ pub fn tailOf(ix: int, los: &[]Val, his: &[]Val, capNulls: bool): Tail {
 // entries' primary keys up to at, sorted (a counted handle: a copy of the
 // cursor shares it), pos the next of them to read; at, the index's key to
 // go on from after the chunk; tail, the range has no entries after it.
-pub type Cursor = record { at: str; started: bool; pub done: bool; pub want: int; pub pos: int; pub sorted: bool; chunk: Option[rc []str]; tail: bool }
+pub type Cursor = record {
+    at: str; started: bool; pub done: bool; pub want: int; pub pos: int; pub sorted: bool
+    chunk: Option[rc []str]; tail: bool
+    skipReady: bool; skipHasMetas: bool; skipEpoch: int
+    skipBarOn: bool; skipBarVal: int
+    skipSc: lexdb_store.SkipScanScratch
+}
 
-pub fn newCursor(): Cursor { return Cursor{at: "", started: false, done: false, want: 0, pos: 0, sorted: false, chunk: None, tail: false} }
+pub fn newCursor(): Cursor {
+    return Cursor{at: "", started: false, done: false, want: 0, pos: 0, sorted: false, chunk: None, tail: false,
+                  skipReady: false, skipHasMetas: false, skipEpoch: 0,
+                  skipBarOn: false, skipBarVal: 0, skipSc: lexdb_store.newSkipScanScratch()}
+}
 
 pub fn (c: &Cursor) copy(): Cursor {
-    return Cursor{at: c.at.clone(), started: c.started, done: c.done, want: c.want, pos: c.pos, sorted: c.sorted, chunk: c.chunk.clone(), tail: c.tail}
+    return Cursor{at: c.at.clone(), started: c.started, done: c.done, want: c.want, pos: c.pos, sorted: c.sorted,
+                  chunk: c.chunk.clone(), tail: c.tail,
+                  skipReady: c.skipReady, skipHasMetas: c.skipHasMetas, skipEpoch: c.skipEpoch,
+                  skipBarOn: false, skipBarVal: 0, skipSc: lexdb_store.newSkipScanScratch()}
 }
 
 // The first batch size of a backward or point read, and the next one.
@@ -1015,10 +1028,16 @@ fn barPlaceOf(bp: &BPlan, bar: &Bar): int {
 // otherwise uses the standard scanLeaves fast path.
 fn scanLeavesWithSkip(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rw: &lexdb_rows.Rows,
                       from: &str, to: str, sq: &lexdb_skip.SkipQuery, bar: &Bar, barPl: int,
+                      cur: mut &Cursor,
                       f: &fn(&lexdb_rows.LeafView, int, int): bool): Result[Unit, DbErr] {
     let bOn = bar.on && !bar.nul && barPl >= 0
-    if !sq.active && !bOn {
+    if (!sq.active && !bOn) || (!cur.skipHasMetas && !bOn && !sq.hasAutoFilters()) {
         return st.scanLeaves(txn, t.tree, from, to, f)
+    }
+    if bOn != cur.skipBarOn || (bOn && bar.v != cur.skipBarVal) {
+        cur.skipSc.clearPass()
+        cur.skipBarOn = bOn
+        cur.skipBarVal = if bOn { bar.v } else { 0 }
     }
     let sid = st.id
     let tree = t.tree
@@ -1035,7 +1054,7 @@ fn scanLeavesWithSkip(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel
                  kidSlots: &[]int, kidGens: &[]int, kidSubVers: &[]int) {
         lexdb_skip.recordInner(sid, tree, slot, gen, subVer, seq, kidSlots, kidGens, kidSubVers)
     }
-    return st.scanLeavesSkip(txn, tree, from, to, chk, onL, onI, f)
+    return st.scanLeavesSkip(txn, tree, from, to, cur.skipHasMetas, cur.skipEpoch, mut &cur.skipSc, chk, onL, onI, f)
 }
 
 fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Scan, part: bool, cur: mut &Cursor,
@@ -1050,16 +1069,32 @@ fn fillBatchSkip(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc:
     var b = lexdb_rows.reuse(spare, bp)
     let rw = rowsFor(t)
     let barPl = barPlaceOf(bp, bar)
-    if sq.active || barPl >= 0 { let _ = try lexdb_skip.ensureTreeLoaded(st, txn, t.tree, t.name) }
+    let bOn = bar.on && !bar.nul && barPl >= 0
+    if (sq.active || bOn) && !cur.skipReady {
+        let info = try lexdb_skip.ensureTreeInfo(st, txn, t.tree, t.name)
+        cur.skipReady = true
+        cur.skipHasMetas = info.hasMetas
+        cur.skipEpoch = info.epoch
+    }
+    let hasExtraAuto = !cur.skipHasMetas && (sq.hasExtraAutoFilters() || bOn)
+    var autoSkipped = 0
     while b.n < BROWS && !cur.done {
-        let from: &str = if cur.started { &cur.at } else { &sc.lo }
+        let from = if cur.started { cur.at.clone() } else { sc.lo.clone() }
         cur.started = true
         var stopKey = ""
         var stop = 0                // 1 the batch is full, 2 a value stored apart
         var bail = false
         var bad: []DbErr = []
-        try scanLeavesWithSkip(st, txn, t, &rw, from, sc.hi.clone(), sq, bar, barPl, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
-            if len(bp.ranges) > 0 && leaf.isCols && lexdb_rows.excluded(leaf, bp, &rw) { return true }
+        try scanLeavesWithSkip(st, txn, t, &rw, &from, sc.hi.clone(), sq, bar, barPl, cur, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+            if len(bp.ranges) > 0 && leaf.isCols && lexdb_rows.excluded(leaf, bp, &rw) {
+                autoSkipped += 1
+                return true
+            }
+            if hasExtraAuto && leaf.isCols && lexdb_rows.layoutOk(leaf, &rw) &&
+               lexdb_skip.colLeafExcludesExtra(leaf, sq, bOn, barPl, bar.v, bar.desc, bar.nf) {
+                autoSkipped += 1
+                return true
+            }
             var k = i
             while k < j {
                 if b.n == BROWS {
@@ -1112,6 +1147,7 @@ fn fillBatchSkip(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc:
             }
             return true
         })
+        if autoSkipped > 0 { lexdb_skip.addLeavesSkipped(autoSkipped); autoSkipped = 0 }
         if len(bad) > 0 { return Err(bad[0].clone()) }
         if bail { return Ok(None) }
                 if stop == 1 {
@@ -2227,12 +2263,20 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
     var b = lexdb_rows.reuse(spare, bp)
     let rw = rowsFor(t)
     let barPl = barPlaceOf(bp, bar)
-    if lz.skipQ.active || barPl >= 0 { let _ = try lexdb_skip.ensureTreeLoaded(st, txn, t.tree, t.name) }
+    let bOn = bar.on && !bar.nul && barPl >= 0
+    if (lz.skipQ.active || bOn) && !cur.skipReady {
+        let info = try lexdb_skip.ensureTreeInfo(st, txn, t.tree, t.name)
+        cur.skipReady = true
+        cur.skipHasMetas = info.hasMetas
+        cur.skipEpoch = info.epoch
+    }
+    let hasExtraAuto = !cur.skipHasMetas && (lz.skipQ.hasExtraAutoFilters() || bOn)
+    var autoSkipped = 0
     var idx: []int = []
     var pend: []int = []                // rows decoded whole: chosen at the end
     var kept = 0
     while b.n < BROWS && !cur.done {
-        let from: &str = if cur.started { &cur.at } else { &sc.lo }
+        let from = if cur.started { cur.at.clone() } else { sc.lo.clone() }
         cur.started = true
         var stopKey = ""
         var stopVal = ""
@@ -2242,8 +2286,16 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
         var bigR: []int = []
         var bigK: []str = []
         var bigV: []str = []
-        try scanLeavesWithSkip(st, txn, t, &rw, from, sc.hi.clone(), &lz.skipQ, bar, barPl, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
-            if len(bp.ranges) > 0 && leaf.isCols && lexdb_rows.excluded(leaf, bp, &rw) { return true }
+        try scanLeavesWithSkip(st, txn, t, &rw, &from, sc.hi.clone(), &lz.skipQ, bar, barPl, cur, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+            if len(bp.ranges) > 0 && leaf.isCols && lexdb_rows.excluded(leaf, bp, &rw) {
+                autoSkipped += 1
+                return true
+            }
+            if hasExtraAuto && leaf.isCols && lexdb_rows.layoutOk(leaf, &rw) &&
+               lexdb_skip.colLeafExcludesExtra(leaf, &lz.skipQ, bOn, barPl, bar.v, bar.desc, bar.nf) {
+                autoSkipped += 1
+                return true
+            }
             var k = i
             while k < j {
                 if b.n == BROWS {
@@ -2315,6 +2367,7 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
             }
             return true
         })
+        if autoSkipped > 0 { lexdb_skip.addLeavesSkipped(autoSkipped); autoSkipped = 0 }
         if len(bad) > 0 { return Err(bad[0].clone()) }
         if bail { return Ok(None) }
         // Finish decoding lz.br for any surviving BIG rows deferred from cRunLazy

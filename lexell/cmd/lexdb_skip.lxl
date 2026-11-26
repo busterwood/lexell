@@ -210,6 +210,59 @@ pub fn (q: &SkipQuery) hasFilters(): bool {
            len(q.strPl) > 0 || len(q.likePl) > 0 || q.barOn
 }
 
+pub fn (q: &SkipQuery) hasAutoFilters(): bool {
+    return len(q.ranges) > 0 || len(q.nes) > 0 || len(q.inPl) > 0 || q.barOn
+}
+
+pub fn (q: &SkipQuery) hasExtraAutoFilters(): bool {
+    return len(q.nes) > 0 || len(q.inPl) > 0 || q.barOn
+}
+
+// Direct zero-lock, zero-alloc exclusion check against an in-memory T_CLEAF column leaf header
+// for predicates not already checked by lexdb_rows.excluded (nes, inPl, dynamic Top-N bar).
+pub fn colLeafExcludesExtra(leaf: &LeafView, q: &SkipQuery, barOn: bool, barPl: int, barVal: int, barDesc: bool, barNf: bool): bool {
+    let dir = leaf.dir
+    let np = lexdb_cols.places(dir)
+    var y = 0
+    while y + 2 < len(q.nes) {
+        let pl = q.nes[y]
+        let want = q.nes[y + 1]
+        let val = q.nes[y + 2]
+        y += 3
+        if pl >= np { continue }
+        let pk = lexdb_cols.kindOf(leaf.cols, pl)
+        if !(if want == 0 { lexdb_rows.isIntKind(pk) } else { int(pk) == want }) { continue }
+        if !lexdb_cols.hasRange(dir, pl) || (lexdb_cols.least(dir, pl) == val && lexdb_cols.greatest(dir, pl) == val) {
+            return true
+        }
+    }
+    for i in 0..len(q.inPl) {
+        let pl = q.inPl[i]
+        if pl >= np || !lexdb_rows.isIntKind(lexdb_cols.kindOf(leaf.cols, pl)) { continue }
+        if !lexdb_cols.hasRange(dir, pl) || len(q.inInts[i]) == 0 {
+            return true
+        }
+        let mn = lexdb_cols.least(dir, pl)
+        let mx = lexdb_cols.greatest(dir, pl)
+        var any = false
+        for val in q.inInts[i] {
+            if val >= mn && val <= mx { any = true; break }
+        }
+        if !any { return true }
+    }
+    if barOn && barPl >= 0 && barPl < np {
+        let pk = lexdb_cols.kindOf(leaf.cols, barPl)
+        if lexdb_rows.isIntKind(pk) && !(barNf && lexdb_cols.hasNulls(dir, barPl)) {
+            if !lexdb_cols.hasRange(dir, barPl) {
+                if !barNf { return true }
+            } else if (!barDesc && lexdb_cols.least(dir, barPl) > barVal) || (barDesc && lexdb_cols.greatest(dir, barPl) < barVal) {
+                return true
+            }
+        }
+    }
+    return false
+}
+
 // ---- Per-node summaries (automatic column-leaf zone maps + explicit skipping index summaries)
 
 // Per-explicit-index summary on one B+tree node (leaf or rolled-up internal node).
@@ -1135,11 +1188,22 @@ type CachedNode = record {
 
 type TreeSkip = record {
     metasLoaded: bool
+    epoch: int
     metas: []SkipMeta
-    nodeIdx: Map[int, int]              // slot -> index in nodes
+    slotMap: []int                      // O(1) slot -> index in nodes + 1 (0 = empty)
     nodes: []CachedNode
     diskIdx: Map[int, int]              // diskPageNo -> index in diskSums
     diskSums: [][]IdxSum                // persisted explicit IdxSums (loaded once on reopen!)
+}
+
+pub type TreeSkipInfo = value record {
+    pub hasMetas: bool
+    pub epoch: int
+}
+
+fn slotGet(ts: &TreeSkip, slot: int): int {
+    if slot < 0 || slot >= len(ts.slotMap) { return -1 }
+    return ts.slotMap[slot] - 1
 }
 
 type SkipStore = record {
@@ -1174,6 +1238,11 @@ pub fn leavesSkipped(): int {
     return v
 }
 
+pub fn addLeavesSkipped(n: int) {
+    if n <= 0 { return }
+    skipStore().with(fn(ss: mut &SkipStore) { ss.leavesSkipped += n })
+}
+
 pub fn resetCounters() {
     skipStore().with(fn(ss: mut &SkipStore) { ss.subtreesSkipped = 0; ss.leavesSkipped = 0 })
 }
@@ -1183,7 +1252,8 @@ pub fn invalidateTree(storeId: int, tree: int) {
     skipStore().with(fn(ss: mut &SkipStore) {
         match ss.treeIdx.get(&sk) {
             Some(ti) {
-                ss.trees[ti] = TreeSkip{metasLoaded: false, metas: [], nodeIdx: newMap(), nodes: [], diskIdx: newMap(), diskSums: []}
+                let nextEp = ss.trees[ti].epoch + 1
+                ss.trees[ti] = TreeSkip{metasLoaded: false, epoch: nextEp, metas: [], slotMap: [], nodes: [], diskIdx: newMap(), diskSums: []}
             }
             None {}
         }
@@ -1195,7 +1265,7 @@ fn getOrCreateTree(ss: mut &SkipStore, sk: int): int {
         Some(ti) { return ti }
         None {
             let ti = len(ss.trees)
-            append(mut &ss.trees, TreeSkip{metasLoaded: false, metas: [], nodeIdx: newMap(), nodes: [], diskIdx: newMap(), diskSums: []})
+            append(mut &ss.trees, TreeSkip{metasLoaded: false, epoch: 1, metas: [], slotMap: [], nodes: [], diskIdx: newMap(), diskSums: []})
             ss.treeIdx.put(sk, ti)
             return ti
         }
@@ -1203,13 +1273,15 @@ fn getOrCreateTree(ss: mut &SkipStore, sk: int): int {
 }
 
 fn putCachedNode(ts: mut &TreeSkip, slot: int, cn: CachedNode) {
-    match ts.nodeIdx.get(&slot) {
-        Some(ni) { ts.nodes[ni] = cn }
-        None {
-            let ni = len(ts.nodes)
-            append(mut &ts.nodes, cn)
-            ts.nodeIdx.put(slot, ni)
-        }
+    if slot < 0 { return }
+    while len(ts.slotMap) <= slot { append(mut &ts.slotMap, 0) }
+    let e = ts.slotMap[slot]
+    if e > 0 {
+        ts.nodes[e - 1] = cn
+    } else {
+        let ni = len(ts.nodes)
+        append(mut &ts.nodes, cn)
+        ts.slotMap[slot] = ni + 1
     }
 }
 
@@ -1229,6 +1301,35 @@ fn putDiskIdx(ts: mut &TreeSkip, disk: int, idxPos: int, ix: IdxSum) {
             ts.diskIdx.put(disk, di)
         }
     }
+}
+
+// Fast metadata-only check: returns (hasMetas, epoch) without cloning SkipMeta slices.
+pub fn ensureTreeInfo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, tree: int, tableKey: &str): Result[TreeSkipInfo, DbErr] {
+    let sk = skipKey(st.id, tree)
+    var needLoad = false
+    var info = TreeSkipInfo{hasMetas: false, epoch: 1}
+    skipStore().with(fn(ss: mut &SkipStore) {
+        match ss.treeIdx.get(&sk) {
+            Some(ti) {
+                if ss.trees[ti].metasLoaded {
+                    info = TreeSkipInfo{hasMetas: len(ss.trees[ti].metas) > 0, epoch: ss.trees[ti].epoch}
+                } else {
+                    needLoad = true
+                }
+            }
+            None { needLoad = true }
+        }
+    })
+    if !needLoad { return Ok(info) }
+    let metas = try ensureTreeLoaded(st, txn, tree, tableKey)
+    var ep = 1
+    skipStore().with(fn(ss: mut &SkipStore) {
+        match ss.treeIdx.get(&sk) {
+            Some(ti) { ep = ss.trees[ti].epoch }
+            None {}
+        }
+    })
+    return Ok(TreeSkipInfo{hasMetas: len(metas) > 0, epoch: ep})
 }
 
 // Ensures TreeSkip entry exists and its explicit SkipMeta list + persisted disk summaries are loaded.
@@ -1316,26 +1417,23 @@ pub fn checkNodeSkipBar(storeId: int, tree: int, slot: int, gen: int, subVer: in
         match ss.treeIdx.get(&sk) {
             Some(ti) {
                 let ts = &ss.trees[ti]
-                match ts.nodeIdx.get(&slot) {
-                    Some(ni) {
-                        let cn = &ts.nodes[ni]
-                        let valid = cn.gen == gen && cn.subVer == subVer && (!isSnap || cn.seq <= snapSeq)
-                        if valid {
-                            skip = nodeExcludes(&cn.sum, q)
-                            if !skip && barOn && barPl >= 0 {
-                                skip = barExcludes(&cn.sum, barPl, barVal, barDesc, barNf)
-                            }
-                            if skip {
-                                if isLeaf { ss.leavesSkipped += 1 } else { ss.subtreesSkipped += 1 }
-                            }
-                            return
+                let ni = slotGet(ts, slot)
+                if ni >= 0 {
+                    let cn = &ts.nodes[ni]
+                    let valid = cn.gen == gen && cn.subVer == subVer && (!isSnap || cn.seq <= snapSeq)
+                    if valid {
+                        skip = nodeExcludes(&cn.sum, q)
+                        if !skip && barOn && barPl >= 0 {
+                            skip = barExcludes(&cn.sum, barPl, barVal, barDesc, barNf)
                         }
+                        if skip {
+                            if isLeaf { ss.leavesSkipped += 1 } else { ss.subtreesSkipped += 1 }
+                        }
+                        return
                     }
-                    None {}
                 }
                 // Cold-restart fast path: if node is clean on disk (disk >= 0) and persisted explicit IdxSums exist, check them without loading the page!
-                // (scanLeavesSkip only invokes checkNode in snap mode when the node's clean disk version is visible to the snapshot.)
-                if disk >= 0 {
+                if disk >= 0 && len(ts.diskSums) > 0 {
                     match ts.diskIdx.get(&disk) {
                         Some(di) {
                             for ix in ts.diskSums[di] {
@@ -1389,14 +1487,12 @@ pub fn recordLeaf(storeId: int, tree: int, slot: int, gen: int, subVer: int, seq
         match ss.treeIdx.get(&sk) {
             Some(ti) {
                 let ts = &ss.trees[ti]
-                match ts.nodeIdx.get(&slot) {
-                    Some(ni) {
-                        let cn = &ts.nodes[ni]
-                        if cn.gen == gen && cn.subVer == subVer { already = true; return }
-                    }
-                    None {}
+                let ni = slotGet(ts, slot)
+                if ni >= 0 {
+                    let cn = &ts.nodes[ni]
+                    if cn.gen == gen && cn.subVer == subVer { already = true; return }
                 }
-                metas = cloneMetas(&ts.metas)
+                if len(ts.metas) > 0 { metas = cloneMetas(&ts.metas) }
             }
             None {}
         }
@@ -1418,23 +1514,18 @@ pub fn recordInner(storeId: int, tree: int, slot: int, gen: int, subVer: int, se
         match ss.treeIdx.get(&sk) {
             Some(ti) {
                 let ts = &ss.trees[ti]
-                match ts.nodeIdx.get(&slot) {
-                    Some(ni) {
-                        let cn = &ts.nodes[ni]
-                        if cn.gen == gen && cn.subVer == subVer { return }
-                    }
-                    None {}
+                let ni = slotGet(ts, slot)
+                if ni >= 0 {
+                    let cn = &ts.nodes[ni]
+                    if cn.gen == gen && cn.subVer == subVer { return }
                 }
                 var kidSums: []NodeSum = withCapacity(len(kidSlots))
                 for i in 0..len(kidSlots) {
-                    match ts.nodeIdx.get(&kidSlots[i]) {
-                        Some(kni) {
-                            let kc = &ts.nodes[kni]
-                            if kc.gen != kidGens[i] || kc.subVer != kidSubVers[i] { return }
-                            append(mut &kidSums, cloneNodeSum(&kc.sum))
-                        }
-                        None { return }
-                    }
+                    let kni = slotGet(ts, kidSlots[i])
+                    if kni < 0 { return }
+                    let kc = &ts.nodes[kni]
+                    if kc.gen != kidGens[i] || kc.subVer != kidSubVers[i] { return }
+                    append(mut &kidSums, cloneNodeSum(&kc.sum))
                 }
                 let rolled = mergeNodeSums(&kidSums)
                 putCachedNode(mut &ss.trees[ti], slot, CachedNode{gen: gen, subVer: subVer, seq: seq, sum: rolled})
@@ -1458,16 +1549,19 @@ pub fn buildAndPersistIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m
     var innerVals: []str = []
     // Find m's index in TreeSkip.metas so we extract the right IdxSum
     var idxPos = -1
+    var ep = 1
     skipStore().with(fn(ss: mut &SkipStore) {
         match ss.treeIdx.get(&sk) {
             Some(ti) {
                 let ts = &ss.trees[ti]
+                ep = ts.epoch
                 for i in 0..len(ts.metas) { if ts.metas[i].key == m.key { idxPos = i; break } }
             }
             None {}
         }
     })
-    try st.scanLeavesSkip(txn, m.tableTree, "", "",
+    var scratch = lexdb_store.newSkipScanScratch()
+    try st.scanLeavesSkip(txn, m.tableTree, "", "", true, ep, mut &scratch,
         fn(slot: int, gen: int, subVer: int, disk: int, isSnap: bool, snapSeq: int, isLeaf: bool): bool { return false },
         fn(slot: int, gen: int, subVer: int, seq: int, disk: int, lv: &LeafView) {
             recordLeaf(sid, m.tableTree, slot, gen, subVer, seq, lv, rw)
@@ -1477,15 +1571,13 @@ pub fn buildAndPersistIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m
                     match ss.treeIdx.get(&sk) {
                         Some(ti) {
                             let ts = &ss.trees[ti]
-                            match ts.nodeIdx.get(&slot) {
-                                Some(ni) {
-                                    let cn = &ts.nodes[ni]
-                                    if idxPos < len(cn.sum.idxs) && !cn.sum.idxs[idxPos].saturated {
-                                        append(mut &leafDisks, disk)
-                                        append(mut &leafVals, encIdxSum(&cn.sum.idxs[idxPos]))
-                                    }
+                            let ni = slotGet(ts, slot)
+                            if ni >= 0 {
+                                let cn = &ts.nodes[ni]
+                                if idxPos < len(cn.sum.idxs) && !cn.sum.idxs[idxPos].saturated {
+                                    append(mut &leafDisks, disk)
+                                    append(mut &leafVals, encIdxSum(&cn.sum.idxs[idxPos]))
                                 }
-                                None {}
                             }
                         }
                         None {}
@@ -1501,15 +1593,13 @@ pub fn buildAndPersistIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m
                     match ss.treeIdx.get(&sk) {
                         Some(ti) {
                             let ts = &ss.trees[ti]
-                            match ts.nodeIdx.get(&slot) {
-                                Some(ni) {
-                                    let cn = &ts.nodes[ni]
-                                    if idxPos < len(cn.sum.idxs) && !cn.sum.idxs[idxPos].saturated {
-                                        append(mut &innerDisks, disk)
-                                        append(mut &innerVals, encIdxSum(&cn.sum.idxs[idxPos]))
-                                    }
+                            let ni = slotGet(ts, slot)
+                            if ni >= 0 {
+                                let cn = &ts.nodes[ni]
+                                if idxPos < len(cn.sum.idxs) && !cn.sum.idxs[idxPos].saturated {
+                                    append(mut &innerDisks, disk)
+                                    append(mut &innerVals, encIdxSum(&cn.sum.idxs[idxPos]))
                                 }
-                                None {}
                             }
                         }
                         None {}
