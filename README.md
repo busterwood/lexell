@@ -1,8 +1,18 @@
 # Lexell
 
-Lexell is a small, straightforward language for command-line tools and database-backed services. It writes Linux executables directly, checks ownership and borrowing at compile time, and has a built-in decimal type. Servers handle thousands of connections as cooperative tasks, written as plain sequential code, with no threads, locks or `async`.
+Lexell is a memory-safe language that compiles in milliseconds and produces small, fast native executables. Like Rust, it rules out the memory errors behind many of the security holes in C and C++ programs, and it does so without a garbage collector. Unlike Rust, the compiler is about 3 MB, rebuilds itself in about half a second, and needs no lifetime annotations.
 
-I wanted the quick edit–compile–run loop I remember from Turbo Pascal, with runtime performance competitive with established native toolchains. The compiler is about 3 MB and rebuilds itself in about half a second. The [benchmarks](#performance) compare compile time and generated code with Rust, and the regex, JSON, jq, Markdown, decimal and command-line programs with their usual external tools.
+- **Memory safe, without a garbage collector.** Every value has one owner, and the compiler checks that a borrow never outlives what it borrows, so there is no use after free and no double free. Memory is released as soon as its owner goes away: no collector, no pauses, and a small footprint (2–31 MB peak in the benchmarks, where the JVM takes 51 MB–1.4 GB). Reference counting is there when you ask for it (`rc T`).
+- **No nulls, no unchecked memory access.** A value that may be missing is an `Option`, and the compiler makes you handle the missing case. Indexes are bounds-checked, and integer overflow stops the program instead of wrapping silently. There is no pointer arithmetic and no `unsafe` block; the only unchecked code is a call into a C library declared `extern`, which the standard library wraps.
+- **No data races.** Servers handle thousands of connections as cooperative tasks on one thread, written as plain sequential code, with no threads, locks or `async` (see [concurrency](#concurrency-without-threads-or-locks)).
+- **A quick feedback loop.** Hello world compiles in 13 ms, against 48 ms for Rust, and the nine benchmark programs in 131 ms, against 3.19 s.
+- **Small, fast executables.** The compiler writes Linux executables directly. Hello world is 20 KB, against Rust's 330 KB, and the generated code is faster than Rust's on 10 of the 18 [benchmarks](#performance) they share, and level on two more.
+
+These guarantees come from the language's rules and the compiler's checks. They have not been formally proved, and the compiler is young, so treat it as you would any new toolchain.
+
+Lexell is aimed at command-line tools and database-backed services. It has a built-in 38-digit decimal type and clients for PostgreSQL, SQL Server, Oracle, SQLite and Redis. [LexDB](#lexdb), a SQL database server written in Lexell, is its largest program.
+
+I wanted the quick edit–compile–run loop I remember from Turbo Pascal, with runtime performance competitive with established native toolchains. The [benchmarks](#performance) compare compile time and generated code with Rust, and the regex, JSON, jq, Markdown, decimal and command-line programs with their usual external tools.
 
 **In active development.** The language and library APIs may change. The native target is Linux x86-64-v3, which includes AVX2. You can try it today from a source checkout.
 
@@ -159,34 +169,9 @@ This also prints `24.49`. The repository includes [other command-line tools, a R
 
 ## LexDB
 
-LexDB is a full-featured, single-binary SQL database server written in Lexell (`lexell/cmd/lexdb.lxl`), designed from the ground up for NVMe/SSD storage to handle both OLTP and analytical workloads in one engine — with no locks, no page latches, and no separate analytics cluster.
+[LexDB](LEXDB.md) is a SQL database server written in Lexell, and the largest program in the repository. One executable speaks the PostgreSQL, SQL Server and Oracle wire protocols and SQL dialects over the same tables, so `psql`, `sqlcmd`, JDBC and the other usual clients connect unchanged. It runs every session as a task on one thread, with the same no-locks design as Lexell's servers, and handles both transactions and analytics in one engine.
 
-One server speaks **three native wire protocols and SQL dialects simultaneously** — PostgreSQL, SQL Server (TDS / T-SQL), and Oracle (TNS / PL/SQL) — over the same tables. Existing clients and drivers (`psql`, `pgbench`, JDBC, ODBC, `sqlcmd`, and Lexell's own clients) connect unchanged.
-
-### Highlights
-
-- **Lock-free, crash-safe storage on `io_uring`.** Every session runs as a lightweight task on one thread, eliminating page latches and lock contention. Copy-on-write B+trees prevent torn writes on power loss, durable commits group-flush automatically, transactions default to `SERIALIZABLE` (with opt-in `READ COMMITTED`), and separate read-replica processes scale reads linearly across cores.
-- **Hybrid OLTP + columnar analytics.** Tables pack into columnar leaves and execute through vectorized batch operators, adaptive two-level hash aggregation, and a cost-based optimizer — supporting joins, window functions, CTEs, subqueries, and full ACID transactions on the same data.
-- **Incremental [materialized views & transparent query rewrite](lexell/docs/lexdb/materialized-views.md).** Views stay current automatically in under a millisecond (`FAST` incremental updates), support contention-free real-time delta merging for hot keys, cascading rollup DAGs, and composable HyperLogLog++ / t-digest sketches, and transparently accelerate unmodified base-table queries with zero application changes.
-- **Automatic zone maps & [data skipping indexes](lexell/docs/lexdb/skipping-indexes.md).** Always-on hierarchical min/max pruning (including dynamic Top-N) plus optional `minmax`/`brin`, `set`, `bloom_filter`, `ngrambf`, and `tokenbf` skipping indexes cut selective point and `LIKE '%substring%'` filters by up to **4.1×** with tiny storage overhead and zero write slowdown.
-- **Unique & rare SQL features across doors.** SQL-standard [`CREATE ASSERTION`](lexell/docs/lexdb/assertions.md) cross-table invariants (currently only in Oracle 26ai, available here in all three doors), transactional event streaming via [`SELECT ... WAIT`](lexell/docs/lexdb/sql/postgresql/select-wait.md) (enabled by lightweight cooperative tasks so thousands of consumers can wait for commits without polling) plus replica [`WAIT FOR LSN`](lexell/docs/lexdb/sql/postgresql/wait-for-lsn.md), SQL:2016 [`MATCH_RECOGNIZE`](lexell/docs/lexdb/sql/postgresql/match-recognize.md) row pattern recognition (in PostgreSQL and Oracle doors), SQL:2023 [`GRAPH_TABLE`](lexell/docs/lexdb/sql/postgresql/graph-table.md) property graphs, plus secondary B+tree indexes, foreign keys, views, stored procedures and functions, roles, and fast native bulk loading (`COPY`, `bcp`/`SqlBulkCopy`, Oracle array DML).
-
-### Performance against PostgreSQL 18
-
-| Workload | LexDB | PostgreSQL 18 | Result |
-|---|---:|---:|---:|
-| **TPC-H SF1** (22 queries, 1 core) | 7.20 s | 14.67 s (1 core) / 8.84 s (4 proc) | **2.0× faster** than 1 core (22/22); **1.23× faster** than 4 proc |
-| **ClickBench 1M** (43 queries, 105 cols, 1 core) | 14.10 s | 22.36 s (1 core) / 11.33 s (4 proc) | **1.59× faster** than 1 core (40/43 level or ahead) |
-| **ClickBench 1M + 8 MVs** (unmodified queries, 1 core) | **9.07 s** | 11.33 s (4 proc) | **1.25× faster than 4-core PG on one core** (21 rewritten) |
-| **35 Analytic Queries** (1M rows, 1 core) | 0.46× CPU / 0.91× wall | 1 core / 4 proc | **2.2× less CPU** than 1 core; ahead of 4 proc on wall time |
-| **Durable updates** (pgbench / sysbench, 1–32 clients) | up to 63.3k / 54.2k/s | 25.7k / 23.0k/s | **2.4–3.1× faster** (indexed updates **1.3–2.5×**) |
-| **Point selects** (3 read replicas, 32 clients) | 470–490k/s (pgbench) | 397k/s (4 cores) | **1.18–1.23× faster** (sysbench **1.05×**, 29% less CPU) |
-| **Bulk `\copy` loads** (5 cases, 1M–10M rows) | 0.24–2.44 s | 0.61–5.93 s | **1.1–2.7× faster** on all 5 workloads |
-| **Materialized view maintenance** (1M rows, 1-row insert) | **0.43–0.66 ms** (`FAST`) | 60–369 ms (`REFRESH`) | **90–780× faster** incremental updates |
-
-PostgreSQL is ahead on single-process multi-thread reads and multi-statement read-write blocks.
-
-Read **[LEXDB.md](LEXDB.md)** for the full introduction (architecture, scaling with read replicas, materialized views, skipping indexes, and quick start), the **[LexDB performance report](lexell/docs/lexdb/performance.md)** for query-by-query numbers, or browse the [LexDB documentation](lexell/docs/lexdb/README.md) and [internals](lexell/design/lexdb.md).
+[LEXDB.md](LEXDB.md) introduces it, with its features and benchmarks against PostgreSQL 18. The [LexDB documentation](lexell/docs/lexdb/README.md) has the SQL references for all three dialects.
 
 ## Why I built Lexell
 
