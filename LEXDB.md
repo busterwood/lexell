@@ -92,7 +92,7 @@ See [Materialized views](lexell/docs/lexdb/materialized-views.md), [Data skippin
 
 SQL:2016 `MATCH_RECOGNIZE` lets you run regular-expression pattern matching directly over ordered sequences of rows — finding user sessions, V-shaped price reversals, gaps and islands, consecutive failure streaks, or fraud patterns in a single declarative query (`PARTITION BY`, `ORDER BY`, `PATTERN`, `DEFINE`, `MEASURES`, `SUBSET`, `PERMUTE`, `AFTER MATCH SKIP`).
 
-PostgreSQL 18 has no `MATCH_RECOGNIZE`; LexDB supports it in both the **PostgreSQL** and **Oracle** doors:
+PostgreSQL 18 and SQL Server 2022/2025 have no `MATCH_RECOGNIZE`; LexDB supports it across **all three doors** (PostgreSQL, SQL Server, and Oracle):
 
 ```sql
 SELECT usr, sid, n, t0, t1
@@ -104,7 +104,7 @@ FROM events MATCH_RECOGNIZE (
 ) AS m;
 ```
 
-See [MATCH_RECOGNIZE (PostgreSQL door)](lexell/docs/lexdb/sql/postgresql/match-recognize.md) and [MATCH_RECOGNIZE (Oracle door)](lexell/docs/lexdb/sql/oracle/match-recognize.md).
+See [MATCH_RECOGNIZE (PostgreSQL)](lexell/docs/lexdb/sql/postgresql/match-recognize.md), [MATCH_RECOGNIZE (SQL Server)](lexell/docs/lexdb/sql/tsql/match-recognize.md), and [MATCH_RECOGNIZE (Oracle)](lexell/docs/lexdb/sql/oracle/match-recognize.md).
 
 ### 5. SQL:2023 Property Graphs (`CREATE PROPERTY GRAPH`, `GRAPH_TABLE` & `ANY SHORTEST`)
 

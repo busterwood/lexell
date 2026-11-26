@@ -1,0 +1,242 @@
+// T-SQL-specific MATCH_RECOGNIZE idioms over TDS: @variables, @table variables,
+// #temp tables, [bracketed] identifiers and pattern variables, WITH (NOLOCK),
+// CROSS/OUTER APPLY, TOP, SELECT INTO, stored procedures, COUNT_BIG(v.*),
+// CLASSIFIER() spelling preservation, views, and SET MAX_MATCH_STEPS with TRY/CATCH.
+// expect: v-shape: symbol,start_day,bottom_day,end_day = 'ACME'|5|6|10;'ACME'|10|12|13;'ZED'|1|3|5
+// expect: declare-var: usr,sid,n,t0,t1 = 'a'|1|3|1|15;'a'|2|2|40|45;'b'|1|2|2|8
+// expect: bracketed: Symbol Name,Start Day,Last Move,Down Rows,Total Rows = 'ACME'|5|'Up Move'|1|6;'ACME'|10|'Up Move'|2|4;'ZED'|1|'Up Move'|2|5
+// expect: table-var: f,l,n = 1|3|3;4|6|3
+// expect: temp-table: f,l = 1|3;4|6
+// expect: nolock-top: symbol,start_day = 'ACME'|5;'ACME'|10
+// expect: select-into: cnt,min_end = 3|5
+// expect: cross-apply: symbol,start_day,end_day = 'ACME'|5|10;'ACME'|10|13;'ZED'|1|5
+// expect: outer-apply: symbol,start_day = 'ACME'|5;'ACME'|10;'NONE'|NULL;'ZED'|1
+// expect: proc-exec: symbol,start_day,bottom_day,drop_amt = 'ACME'|5|6|13;'ACME'|10|12|10
+// expect: view-mr: symbol,start_day,end_day = 'ACME'|5|10;'ACME'|10|13;'ZED'|1|5
+// expect: classifier-case: day,cls = 1|'Strt';2|'Down';3|'Down';4|'Up';5|'Up'
+// expect: step-limit-caught: err = 50000
+// expect: step-limit-raised: n = 1
+import "task"
+import "net"
+import "strings"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+fn fmtRows(r: &sqlserver.Rows): str {
+    var names: []str = []
+    for j in 0..r.columnCount() { append(mut &names, r.columnName(j).unwrap()) }
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() {
+            match r.value(i, j) {
+                Ok(v) { append(mut &cells, v.toStr()) }
+                Err(e) { append(mut &cells, "ERR(" + e.code.toStr() + ")") }
+            }
+        }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&names, ",") + " = " + strings.join(&out, ";")
+}
+
+fn run1(c: mut &sqlserver.Conn, sql: &str): str {
+    match c.queryAll(&(sql.toStr()), &[]) {
+        Ok(r) {
+            if len(r.sets) == 0 { return "ok" }
+            return fmtRows(&r.sets[len(r.sets) - 1])
+        }
+        Err(e) { return "ERROR " + e.code.toStr() + ": " + e.msg }
+    }
+}
+
+fn check(c: mut &sqlserver.Conn, label: &str, sql: &str) {
+    println(label + ": " + run1(mut &c, sql))
+}
+
+fn exec(c: mut &sqlserver.Conn, sql: &str) {
+    let r = run1(mut &c, sql)
+    if strings.startsWith(&r, "ERROR") { println("SETUP FAIL: " + r + " :: " + sql) }
+}
+
+fn batches(dsn: &str) {
+    match sqlserver.connect(&(dsn.toStr())) {
+        Ok(c0) {
+            var c = c0
+            exec(mut &c, "CREATE TABLE dbo.ticker (symbol nvarchar(10), [day] int, price int)")
+            exec(mut &c, "INSERT INTO dbo.ticker VALUES (N'ACME', 1, 12), (N'ACME', 2, 17), (N'ACME', 3, 19), (N'ACME', 4, 21), (N'ACME', 5, 25), (N'ACME', 6, 12), (N'ACME', 7, 15), (N'ACME', 8, 20), (N'ACME', 9, 24), (N'ACME', 10, 25), (N'ACME', 11, 19), (N'ACME', 12, 15), (N'ACME', 13, 25), (N'ZED', 1, 8), (N'ZED', 2, 7), (N'ZED', 3, 5), (N'ZED', 4, 6), (N'ZED', 5, 9)")
+            exec(mut &c, "CREATE TABLE dbo.events (usr nvarchar(10), ts int)")
+            exec(mut &c, "INSERT INTO dbo.events VALUES (N'a', 1), (N'a', 5), (N'a', 15), (N'a', 40), (N'a', 45), (N'b', 2), (N'b', 8)")
+            exec(mut &c, "CREATE TABLE dbo.symbols (symbol nvarchar(10) PRIMARY KEY)")
+            exec(mut &c, "INSERT INTO dbo.symbols VALUES (N'ACME'), (N'NONE'), (N'ZED')")
+
+            // 1. Standard V-shape query
+            check(mut &c, "v-shape",
+                "SELECT * FROM dbo.ticker MATCH_RECOGNIZE (" +
+                " PARTITION BY symbol ORDER BY [day]" +
+                " MEASURES strt.[day] AS start_day, LAST(down.[day]) AS bottom_day, LAST(up.[day]) AS end_day" +
+                " ONE ROW PER MATCH AFTER MATCH SKIP TO LAST up" +
+                " PATTERN (strt down+ up+)" +
+                " DEFINE down AS price < PREV(price), up AS price > PREV(price)" +
+                ") AS v ORDER BY symbol, start_day")
+
+            // 2. DECLARE @var used inside DEFINE
+            check(mut &c, "declare-var",
+                "DECLARE @gap INT = 10; " +
+                "SELECT usr, sid, n, t0, t1 FROM dbo.events MATCH_RECOGNIZE (" +
+                " PARTITION BY usr ORDER BY ts" +
+                " MEASURES MATCH_NUMBER() AS sid, COUNT_BIG(*) AS n, FIRST(ts) AS t0, LAST(ts) AS t1" +
+                " PATTERN (strt cont*)" +
+                " DEFINE cont AS ts - PREV(ts) <= @gap" +
+                ") AS m ORDER BY usr, sid")
+
+            // 3. [Bracketed] identifiers, pattern variables, SUBSET, SKIP TO LAST, and COUNT_BIG(v.*)
+            check(mut &c, "bracketed",
+                "SELECT symbol AS [Symbol Name], [Start Day], [Last Move], [Down Rows], [Total Rows]" +
+                " FROM [dbo].[ticker] MATCH_RECOGNIZE (" +
+                " PARTITION BY [symbol] ORDER BY [day]" +
+                " MEASURES [Strt].[day] AS [Start Day], CLASSIFIER() AS [Last Move], COUNT_BIG([Down].*) AS [Down Rows], COUNT_BIG(*) AS [Total Rows]" +
+                " AFTER MATCH SKIP TO LAST [Up Move]" +
+                " PATTERN ([Strt] [Down]+ [Up Move]+)" +
+                " SUBSET [Both] = ([Down], [Up Move])" +
+                " DEFINE [Down] AS price < PREV(price), [Up Move] AS price > PREV(price)" +
+                ") AS [V Shapes] ORDER BY [Symbol Name], [Start Day]")
+
+            // 4. @table variable as MATCH_RECOGNIZE input
+            check(mut &c, "table-var",
+                "DECLARE @t TABLE (id int, v int); " +
+                "INSERT INTO @t VALUES (1, 10), (2, 20), (3, 30), (4, 5), (5, 12), (6, 15); " +
+                "SELECT f, l, n FROM @t MATCH_RECOGNIZE (" +
+                " ORDER BY id MEASURES FIRST(id) AS f, LAST(id) AS l, COUNT(*) AS n" +
+                " PATTERN (a b+) DEFINE b AS v > PREV(v)" +
+                ") AS m ORDER BY f")
+
+            // 5. #temp table as MATCH_RECOGNIZE input
+            exec(mut &c, "CREATE TABLE #tmp (id int, v int); INSERT INTO #tmp VALUES (1, 10), (2, 20), (3, 30), (4, 5), (5, 12), (6, 15)")
+            check(mut &c, "temp-table",
+                "SELECT f, l FROM #tmp MATCH_RECOGNIZE (" +
+                " ORDER BY id MEASURES FIRST(id) AS f, LAST(id) AS l" +
+                " PATTERN (a b+) DEFINE b AS v > PREV(v)" +
+                ") AS m ORDER BY f")
+
+            // 6. WITH (NOLOCK) table hint + SELECT TOP (2)
+            check(mut &c, "nolock-top",
+                "SELECT TOP (2) symbol, start_day FROM dbo.ticker WITH (NOLOCK) MATCH_RECOGNIZE (" +
+                " PARTITION BY symbol ORDER BY [day]" +
+                " MEASURES strt.[day] AS start_day" +
+                " AFTER MATCH SKIP TO LAST up" +
+                " PATTERN (strt down+ up+)" +
+                " DEFINE down AS price < PREV(price), up AS price > PREV(price)" +
+                ") AS v ORDER BY symbol, start_day")
+
+            // 7. SELECT ... INTO #res FROM ... MATCH_RECOGNIZE
+            exec(mut &c,
+                "SELECT symbol, start_day, end_day INTO #v_out FROM dbo.ticker MATCH_RECOGNIZE (" +
+                " PARTITION BY symbol ORDER BY [day]" +
+                " MEASURES strt.[day] AS start_day, LAST(up.[day]) AS end_day" +
+                " AFTER MATCH SKIP TO LAST up" +
+                " PATTERN (strt down+ up+)" +
+                " DEFINE down AS price < PREV(price), up AS price > PREV(price)" +
+                ") AS v")
+            check(mut &c, "select-into", "SELECT COUNT(*) AS cnt, MIN(end_day) AS min_end FROM #v_out")
+
+            // 8. CROSS APPLY over a correlated subquery with MATCH_RECOGNIZE
+            check(mut &c, "cross-apply",
+                "SELECT s.symbol, m.start_day, m.end_day FROM dbo.symbols s" +
+                " CROSS APPLY (SELECT t.[day], t.price FROM dbo.ticker t WHERE t.symbol = s.symbol) sub" +
+                " MATCH_RECOGNIZE (" +
+                " ORDER BY [day] MEASURES strt.[day] AS start_day, LAST(up.[day]) AS end_day" +
+                " AFTER MATCH SKIP TO LAST up" +
+                " PATTERN (strt down+ up+)" +
+                " DEFINE down AS price < PREV(price), up AS price > PREV(price)" +
+                ") AS m ORDER BY s.symbol, m.start_day")
+
+            // 9. OUTER APPLY over a correlated subquery with MATCH_RECOGNIZE
+            check(mut &c, "outer-apply",
+                "SELECT s.symbol, m.start_day FROM dbo.symbols s" +
+                " OUTER APPLY (SELECT t.[day], t.price FROM dbo.ticker t WHERE t.symbol = s.symbol) sub" +
+                " MATCH_RECOGNIZE (" +
+                " ORDER BY [day] MEASURES strt.[day] AS start_day" +
+                " AFTER MATCH SKIP TO LAST up" +
+                " PATTERN (strt down+ up+)" +
+                " DEFINE down AS price < PREV(price), up AS price > PREV(price)" +
+                ") AS m ORDER BY s.symbol, m.start_day")
+
+            // 10. Stored procedure with @min_drop parameter inside MATCH_RECOGNIZE
+            exec(mut &c,
+                "CREATE PROCEDURE dbo.find_drops @min_drop INT AS " +
+                "SELECT symbol, start_day, bottom_day, drop_amt FROM dbo.ticker MATCH_RECOGNIZE (" +
+                " PARTITION BY symbol ORDER BY [day]" +
+                " MEASURES strt.[day] AS start_day, LAST(down.[day]) AS bottom_day, strt.price - LAST(down.price) AS drop_amt" +
+                " AFTER MATCH SKIP TO LAST up" +
+                " PATTERN (strt down+ up+)" +
+                " DEFINE down AS price < PREV(price), up AS price > PREV(price) AND FIRST(strt.price) - LAST(down.price) >= @min_drop" +
+                ") AS v ORDER BY symbol, start_day")
+            check(mut &c, "proc-exec", "EXEC dbo.find_drops @min_drop = 10")
+
+            // 11. View using MATCH_RECOGNIZE
+            exec(mut &c,
+                "CREATE VIEW dbo.v_shapes AS " +
+                "SELECT symbol, start_day, end_day FROM dbo.ticker MATCH_RECOGNIZE (" +
+                " PARTITION BY symbol ORDER BY [day]" +
+                " MEASURES strt.[day] AS start_day, LAST(up.[day]) AS end_day" +
+                " AFTER MATCH SKIP TO LAST up" +
+                " PATTERN (strt down+ up+)" +
+                " DEFINE down AS price < PREV(price), up AS price > PREV(price)" +
+                ") AS v")
+            check(mut &c, "view-mr", "SELECT symbol, start_day, end_day FROM dbo.v_shapes ORDER BY symbol, start_day")
+
+            // 12. CLASSIFIER() preserves T-SQL spelling case
+            check(mut &c, "classifier-case",
+                "SELECT [day], cls FROM dbo.ticker MATCH_RECOGNIZE (" +
+                " PARTITION BY symbol ORDER BY [day]" +
+                " MEASURES CLASSIFIER() AS cls" +
+                " ALL ROWS PER MATCH" +
+                " PATTERN (Strt Down+ Up+)" +
+                " DEFINE Down AS price < PREV(price), Up AS price > PREV(price)" +
+                ") AS v WHERE symbol = N'ZED' ORDER BY [day]")
+
+            // 13. SET MAX_MATCH_STEPS caught in TRY/CATCH, then raised so query succeeds
+            exec(mut &c, "CREATE TABLE dbo.seq20 (id int PRIMARY KEY); INSERT INTO dbo.seq20 SELECT value FROM GENERATE_SERIES(1, 20)")
+            check(mut &c, "step-limit-caught",
+                "SET MAX_MATCH_STEPS = 50; " +
+                "BEGIN TRY " +
+                "  SELECT COUNT(*) AS n FROM dbo.seq20 MATCH_RECOGNIZE (" +
+                "    ORDER BY id MEASURES COUNT(*) AS c" +
+                "    PATTERN ((a | b)+ c)" +
+                "    DEFINE a AS SUM(a.id) >= 0, b AS SUM(b.id) >= 0, c AS id = 999" +
+                "  ) AS m; " +
+                "END TRY BEGIN CATCH SELECT ERROR_NUMBER() AS err; END CATCH")
+            check(mut &c, "step-limit-raised",
+                "SET MAX_MATCH_STEPS 10000000; " +
+                "SELECT COUNT(*) AS n FROM dbo.seq20 MATCH_RECOGNIZE (" +
+                "  ORDER BY id MEASURES COUNT(*) AS c" +
+                "  PATTERN (a+) DEFINE a AS SUM(a.id) > 0" +
+                ") AS m")
+
+            c.close()
+        }
+        Err(e) { println("connect: ERROR " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        batches(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(71), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                             snapNodes: 50000}, body).unwrap()
+}

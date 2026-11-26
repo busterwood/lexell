@@ -19,6 +19,7 @@ table_source ::=
   | ( VALUES ( expression [ ,...n ] ) [ ,...n ] ) [ AS ] table_alias [ ( column_alias [ ,...n ] ) ]
   | table_valued_function ( [ argument [ ,...n ] ] ) [ [ AS ] table_alias ]
   | GRAPH_TABLE ( ... ) [ [ AS ] table_alias [ ( column_alias [ ,...n ] ) ] ]
+  | table_source MATCH_RECOGNIZE ( ... ) [ [ AS ] table_alias [ ( column_alias [ ,...n ] ) ] ]
   | joined_table
 }
 
@@ -63,6 +64,9 @@ join_type ::=
 
 `GRAPH_TABLE (...)`
 : Matches a pattern over a property graph (SQL/PGQ). See [GRAPH_TABLE](graph-table.md).
+
+`MATCH_RECOGNIZE (...)`
+: Matches regular-expression patterns over ordered sequences of rows (SQL:2016 R010). See [MATCH_RECOGNIZE](match-recognize.md).
 
 `INNER JOIN`
 : The pairs of rows for which the `ON` condition is true. `JOIN` alone is `INNER JOIN`.
