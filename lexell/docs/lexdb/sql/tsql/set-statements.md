@@ -27,6 +27,7 @@ SET option value
 | `QUOTED_IDENTIFIER { ON \| OFF }` | `OFF`: double quotes enclose strings, not names. It applies from the next batch. |
 | `FMTONLY { ON \| OFF }` | `ON`: a `SELECT` returns its columns and no rows, and nothing else runs. |
 | `LEXDB_DIALECT { POSTGRES \| TSQL }` | lexdb's own: see [SET LEXDB_DIALECT](set-lexdb-dialect.md). |
+| `MAX_MATCH_STEPS [=] n` | lexdb's own: per-row step limit for [`MATCH_RECOGNIZE`](match-recognize.md) (default 10,000,000; 0 is no limit). |
 
 ### Options taken without an effect
 

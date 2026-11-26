@@ -26,7 +26,7 @@ showcase, start with [LEXDB.md](../../../LEXDB.md). The storage internals and hi
 | [Data skipping indexes](skipping-indexes.md) | Automatic columnar zone maps and explicit `minmax`/`brin`, `set`, `bloom_filter`, `ngrambf`, and `tokenbf` skipping indexes across all three doors. |
 | [Assertions](assertions.md) | SQL-standard `CREATE ASSERTION` (currently only in Oracle 26ai) enforced across all three doors, with join-key concurrency locking. |
 | [Waiting for new data](sql/postgresql/select-wait.md) | `SELECT ... WAIT n SECONDS\|MILLISECONDS`: turn any indexed table into a zero-polling transactional event stream across all three doors, plus replica [`WAIT FOR LSN`](sql/postgresql/wait-for-lsn.md). |
-| [Row pattern recognition](sql/postgresql/match-recognize.md) | SQL:2016 `MATCH_RECOGNIZE` over ordered rows in the [PostgreSQL](sql/postgresql/match-recognize.md) and [Oracle](sql/oracle/match-recognize.md) doors. |
+| [Row pattern recognition](sql/postgresql/match-recognize.md) | SQL:2016 `MATCH_RECOGNIZE` over ordered rows across all three doors: [PostgreSQL](sql/postgresql/match-recognize.md), [SQL Server](sql/tsql/match-recognize.md), and [Oracle](sql/oracle/match-recognize.md). |
 | [Property graphs](property-graphs.md) | SQL:2023 `CREATE PROPERTY GRAPH`, `GRAPH_TABLE`, and `ANY SHORTEST` over existing relational tables (CSR + bidirectional BFS), with 4-engine benchmarks against PostgreSQL 18, DuckPGQ, and Kùzu. |
 | [Known issues](KNOWN-ISSUES.md) | Bugs and gaps found while writing these pages. |
 

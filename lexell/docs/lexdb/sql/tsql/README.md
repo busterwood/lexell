@@ -14,7 +14,8 @@ This index lists everything the door takes today. Pages not written yet are list
 |---|---|
 | [SELECT](select.md) | Queries; table hints (read and ignored), `OPTION (MAXRECURSION n)`. |
 | [TOP](top.md) | `TOP (n) [PERCENT] [WITH TIES]`. |
-| [FROM, JOIN and APPLY](from.md) | Joins, `CROSS APPLY` / `OUTER APPLY`, derived tables, table-valued functions, [`GRAPH_TABLE`](graph-table.md). |
+| [FROM, JOIN and APPLY](from.md) | Joins, `CROSS APPLY` / `OUTER APPLY`, derived tables, table-valued functions, [`MATCH_RECOGNIZE`](match-recognize.md), [`GRAPH_TABLE`](graph-table.md). |
+| [MATCH_RECOGNIZE](match-recognize.md) | SQL:2016 row pattern recognition over ordered rows (lexdb's own here; SQL Server has none). |
 | [GROUP BY](select-group-by.md) | Grouping, `ROLLUP`, `CUBE`, `GROUPING SETS`, `HAVING`. |
 | [OVER](over.md) | Window functions and the `WINDOW` clause. |
 | [ORDER BY](order-by.md) | Sorting, `OFFSET ... FETCH`. |
