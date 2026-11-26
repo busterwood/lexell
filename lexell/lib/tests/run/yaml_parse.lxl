@@ -1,0 +1,207 @@
+// expect: ok
+import "yaml"
+import "math"
+
+fn assertEq(cond: bool, msg: &str) {
+    if !cond { panic("FAIL: " + msg) }
+}
+
+fn main() {
+    // 1. YAML 1.2 Core Schema scalars
+    let s1 = try_parse(`
+null1: null
+null2: ~
+null3: Null
+null4: NULL
+null5:
+bool_t: true
+bool_T: True
+bool_f: FALSE
+norway_no: no
+norway_yes: yes
+norway_on: on
+norway_off: off
+oct_legacy: 010
+oct_12: 0o755
+hex_12: 0xFF
+dec_neg: -42
+dec_pos: +100
+flt1: 3.14
+flt2: .5
+flt3: 1e3
+flt4: -2.5E-2
+inf_pos: .inf
+inf_neg: -.INF
+nan_val: .NaN
+money: 12.50
+quoted_int: "42"
+quoted_bool: 'true'
+quoted_null: "null"
+`)
+    assertEq(s1.get("null1").unwrap().isNull(), "null1")
+    assertEq(s1.get("null2").unwrap().isNull(), "null2")
+    assertEq(s1.get("null3").unwrap().isNull(), "null3")
+    assertEq(s1.get("null4").unwrap().isNull(), "null4")
+    assertEq(s1.get("null5").unwrap().isNull(), "null5")
+    assertEq(s1.get("bool_t").unwrap().asBool().unwrap(), "bool_t")
+    assertEq(s1.get("bool_T").unwrap().asBool().unwrap(), "bool_T")
+    assertEq(!s1.get("bool_f").unwrap().asBool().unwrap(), "bool_f")
+    // YAML 1.2: no/yes/on/off are strings, 010 is decimal 10
+    assertEq(s1.get("norway_no").unwrap().asStr().unwrap() == "no", "norway_no")
+    assertEq(s1.get("norway_yes").unwrap().asStr().unwrap() == "yes", "norway_yes")
+    assertEq(s1.get("norway_on").unwrap().asStr().unwrap() == "on", "norway_on")
+    assertEq(s1.get("norway_off").unwrap().asStr().unwrap() == "off", "norway_off")
+    assertEq(s1.get("oct_legacy").unwrap().asInt().unwrap() == 10, "oct_legacy")
+    assertEq(s1.get("oct_12").unwrap().asInt().unwrap() == 493, "oct_12")
+    assertEq(s1.get("hex_12").unwrap().asInt().unwrap() == 255, "hex_12")
+    assertEq(s1.get("dec_neg").unwrap().asInt().unwrap() == -42, "dec_neg")
+    assertEq(s1.get("dec_pos").unwrap().asInt().unwrap() == 100, "dec_pos")
+    assertEq(s1.get("flt1").unwrap().isFloat(), "flt1 kind")
+    assertEq(s1.get("flt2").unwrap().asFloat().unwrap() == 0.5f, "flt2")
+    assertEq(s1.get("flt3").unwrap().asFloat().unwrap() == 1000.0f, "flt3")
+    assertEq(s1.get("inf_pos").unwrap().asFloat().unwrap().isInf(), "inf_pos")
+    assertEq(s1.get("inf_neg").unwrap().asFloat().unwrap() < 0.0f && s1.get("inf_neg").unwrap().asFloat().unwrap().isInf(), "inf_neg")
+    assertEq(s1.get("nan_val").unwrap().asFloat().unwrap().isNaN(), "nan_val")
+    assertEq(s1.get("money").unwrap().asDecimal().unwrap() == 12.50m, "money exact")
+    assertEq(s1.get("money").unwrap().asDecimal().unwrap().toStr() == "12.50", "money scale")
+    assertEq(s1.get("quoted_int").unwrap().asStr().unwrap() == "42", "quoted_int")
+    assertEq(s1.get("quoted_bool").unwrap().asStr().unwrap() == "true", "quoted_bool")
+    assertEq(s1.get("quoted_null").unwrap().asStr().unwrap() == "null", "quoted_null")
+
+    // 2. Block scalars (|, |-, |+, >, >-, >+, explicit indent)
+    let bs = try_parse(`
+lit_clip: |
+  line 1
+  line 2
+
+lit_strip: |-
+  line 1
+  line 2
+
+lit_keep: |+
+  line 1
+
+folded: >
+  hello
+  world
+
+  paragraph 2
+    indented
+  back
+explicit: |2
+    two leading spaces
+`)
+    assertEq(bs.get("lit_clip").unwrap().asStr().unwrap() == "line 1\nline 2\n", "lit_clip")
+    assertEq(bs.get("lit_strip").unwrap().asStr().unwrap() == "line 1\nline 2", "lit_strip")
+    assertEq(bs.get("lit_keep").unwrap().asStr().unwrap() == "line 1\n\n", "lit_keep")
+    assertEq(bs.get("folded").unwrap().asStr().unwrap() == "hello world\nparagraph 2\n  indented\nback\n", "folded")
+    assertEq(bs.get("explicit").unwrap().asStr().unwrap() == "  two leading spaces\n", "explicit")
+
+    // 3. Double & single quoted escapes and folding
+    let qs = try_parse(`
+dq: "a\nb\tc\"d\\e\x41\u0042\U00000043"
+sq: 'it''s fine'
+dq_fold: "hello
+  world
+
+  next"
+dq_esc_nl: "foo\
+  bar"
+`)
+    assertEq(qs.get("dq").unwrap().asStr().unwrap() == "a\nb\tc\"d\\eABC", "dq escapes")
+    assertEq(qs.get("sq").unwrap().asStr().unwrap() == "it's fine", "sq escape")
+    assertEq(qs.get("dq_fold").unwrap().asStr().unwrap() == "hello world\nnext", "dq fold")
+    assertEq(qs.get("dq_esc_nl").unwrap().asStr().unwrap() == "foobar", "dq esc nl")
+
+    // 4. Nested block/flow, indentless seq, compact seq-of-maps, single-pair flow maps
+    let col = try_parse(`
+items:
+- a
+- b
+nested:
+  - name: first
+    ports: [80, 443,]
+  - name: second
+    meta: {"k":1, 'q': true}
+pairs: [a: 1, b: 2]
+`)
+    assertEq(col.path(&["items", "1"]).unwrap().asStr().unwrap() == "b", "indentless seq")
+    assertEq(col.path(&["nested", "0", "ports", "1"]).unwrap().asInt().unwrap() == 443, "flow seq trailing comma")
+    assertEq(col.path(&["nested", "1", "meta", "k"]).unwrap().asInt().unwrap() == 1, "json-like adjacent value")
+    assertEq(col.path(&["pairs", "1", "b"]).unwrap().asInt().unwrap() == 2, "single-pair flow map")
+
+    // 5. Explicit keys & non-string keys
+    let nk = try_parse(`
+200: OK
+true: yes_val
+? [1, 2]
+: pair_val
+`)
+    assertEq(nk.getKey(&yaml.integer(200)).unwrap().asStr().unwrap() == "OK", "int key")
+    assertEq(nk.getKey(&yaml.boolean(true)).unwrap().asStr().unwrap() == "yes_val", "bool key")
+    let seqKey = yaml.seqOf([yaml.integer(1), yaml.integer(2)])
+    assertEq(nk.getKey(&seqKey).unwrap().asStr().unwrap() == "pair_val", "seq key")
+
+    // 6. Anchors, aliases, and merge keys (<<)
+    let mg = try_parse(`
+base1: &b1
+  host: localhost
+  port: 8080
+  mode: dev
+base2: &b2
+  port: 9000
+  timeout: 30
+svc1:
+  <<: *b1
+  port: 7070
+svc2:
+  port: 6060
+  <<: [*b1, *b2]
+literal_merge:
+  "<<": not_a_merge
+`)
+    assertEq(mg.path(&["svc1", "host"]).unwrap().asStr().unwrap() == "localhost", "merge host")
+    assertEq(mg.path(&["svc1", "port"]).unwrap().asInt().unwrap() == 7070, "merge override after")
+    assertEq(mg.path(&["svc2", "port"]).unwrap().asInt().unwrap() == 6060, "merge override before")
+    assertEq(mg.path(&["svc2", "mode"]).unwrap().asStr().unwrap() == "dev", "merge list first")
+    assertEq(mg.path(&["svc2", "timeout"]).unwrap().asInt().unwrap() == 30, "merge list second")
+    assertEq(mg.path(&["literal_merge", "<<"]).unwrap().asStr().unwrap() == "not_a_merge", "quoted << not merge")
+
+    // 7. Multi-document streams & directives
+    let docs = yaml.parseAll(`%YAML 1.2
+---
+a: 1
+...
+---
+b: 2
+`).unwrap()
+    assertEq(len(docs) == 2, "two docs")
+    assertEq(docs[0].get("a").unwrap().asInt().unwrap() == 1, "doc 0")
+    assertEq(docs[1].get("b").unwrap().asInt().unwrap() == 2, "doc 1")
+
+    // 8. Error cases
+    assertEq(yaml.parse("a: 1\na: 2").unwrapErr().kind == yaml.ErrorKind.DuplicateKey, "dup key")
+    assertEq(yaml.parse("a: *missing").unwrapErr().kind == yaml.ErrorKind.UndefinedAlias, "undef alias")
+    assertEq(yaml.parse("a: &x\n  b: *x").unwrapErr().kind == yaml.ErrorKind.CyclicAlias, "cyclic alias")
+    assertEq(yaml.parse("---\n1\n---\n2").unwrapErr().kind == yaml.ErrorKind.MultipleDocs, "multi docs in parse")
+
+    // Billion laughs protection
+    let bomb = `
+a: &a ["lol", "lol", "lol", "lol", "lol", "lol", "lol", "lol", "lol"]
+b: &b [*a, *a, *a, *a, *a, *a, *a, *a, *a]
+c: &c [*b, *b, *b, *b, *b, *b, *b, *b, *b]
+d: &d [*c, *c, *c, *c, *c, *c, *c, *c, *c]
+e: &e [*d, *d, *d, *d, *d, *d, *d, *d, *d]
+f: &f [*e, *e, *e, *e, *e, *e, *e, *e, *e]
+`
+    assertEq(yaml.parse(bomb).unwrapErr().kind == yaml.ErrorKind.AliasLimit, "alias bomb blocked")
+
+    println("ok")
+}
+
+fn try_parse(s: &str): yaml.Node {
+    match yaml.parse(s) {
+        Ok(n) { return n }
+        Err(e) { panic("parse failed: " + e.toStr()) }
+    }
+}

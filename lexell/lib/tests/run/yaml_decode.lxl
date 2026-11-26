@@ -1,0 +1,162 @@
+// expect: ok
+import "yaml"
+import "time"
+
+type Tls = value record {
+    cert: str
+    key: str
+    minVersion: str
+}
+
+type Server = record {
+    host: str
+    port: int
+    rate: Decimal
+    debug: bool
+    launchDate: time.Date
+    note: Option[str]
+    tags: []str
+    headers: Map[str, str]
+    tls: Option[Tls]
+}
+
+fn decodeTls(n: &yaml.Node): Result[Tls, yaml.Error] {
+    var m = try n.map()
+    let cert = try m.reqStr("cert")
+    let key = try m.reqStr("key")
+    let minV = try m.optStr("min_version", "1.3")
+    try m.finish()
+    return Ok(Tls{cert: cert, key: key, minVersion: minV})
+}
+
+fn decodeServer(n: &yaml.Node): Result[Server, yaml.Error] {
+    var m = try n.map()
+    let host = try m.reqStr("host")
+    let port = try m.optInt("port", 8080)
+    let rate = try m.reqDecimal("rate")
+    let debug = try m.optBool("debug", false)
+    let dt = try m.reqDate("launch_date")
+    let note = try m.optStrOpt("note")
+    let tags = try m.optSeq("tags", yaml.decodeStr)
+    let headers = try m.optMap("headers", yaml.decodeStr)
+    let tls = try m.optWith("tls", decodeTls)
+    try m.finish()
+    return Ok(Server{
+        host: host,
+        port: port,
+        rate: rate,
+        debug: debug,
+        launchDate: dt,
+        note: note,
+        tags: tags,
+        headers: headers,
+        tls: tls,
+    })
+}
+
+fn assertEq(cond: bool, msg: &str) {
+    if !cond { panic("FAIL: " + msg) }
+}
+
+fn main() {
+    // 1. Happy path decoding into typed Lexell records
+    let src = `
+host: api.example.com
+port: 9443
+rate: 19.95
+debug: true
+launch_date: 2026-11-26
+note: null
+tags:
+  - prod
+  - edge
+headers:
+  X-Env: production
+  X-Region: eu-west
+tls:
+  cert: /etc/ssl/cert.pem
+  key: /etc/ssl/key.pem
+`
+    let root = yaml.parse(src).unwrap()
+    let srv = decodeServer(&root).unwrap()
+    assertEq(srv.host == "api.example.com", "host")
+    assertEq(srv.port == 9443, "port")
+    assertEq(srv.rate == 19.95m, "rate exact")
+    assertEq(srv.rate.toStr() == "19.95", "rate scale")
+    assertEq(srv.debug, "debug")
+    assertEq(srv.launchDate.year == 2026 && srv.launchDate.month == 11 && srv.launchDate.day == 26, "date")
+    assertEq(srv.note.isNone(), "null optStrOpt is None")
+    assertEq(len(srv.tags) == 2 && srv.tags[0] == "prod" && srv.tags[1] == "edge", "tags")
+    assertEq(srv.headers.find("X-Env").unwrap() == "production", "headers")
+    assertEq(srv.tls.isSome(), "tls some")
+    let t = srv.tls.unwrap()
+    assertEq(t.cert == "/etc/ssl/cert.pem" && t.minVersion == "1.3", "tls defaults")
+
+    // 2. Unknown key caught by finish() with exact path and line number
+    let typo = `host: localhost
+prot: 8080
+rate: 1.00
+launch_date: 2026-01-01
+`
+    let typoNode = yaml.parse(typo).unwrap()
+    let typoErr = decodeServer(&typoNode).unwrapErr()
+    assertEq(typoErr.kind == yaml.ErrorKind.UnknownKey, "unknown key kind")
+    assertEq(typoErr.path == "prot", "unknown key path")
+    assertEq(typoErr.span.line == 2, "unknown key line")
+
+    // 3. Nested unknown key propagates full dotted path
+    let nestedTypo = `host: localhost
+rate: 1.00
+launch_date: 2026-01-01
+tls:
+  cert: a
+  key: b
+  extra_bad: 1
+`
+    let nestedNode = yaml.parse(nestedTypo).unwrap()
+    let nestedErr = decodeServer(&nestedNode).unwrapErr()
+    assertEq(nestedErr.kind == yaml.ErrorKind.UnknownKey, "nested unknown key kind")
+    assertEq(nestedErr.path == "tls.extra_bad", "nested unknown key path")
+    assertEq(nestedErr.span.line == 7, "nested unknown key line")
+
+    // 4. Wrong type error carries path and exact line
+    let badType = `host: localhost
+port: "not-a-port"
+rate: 1.00
+launch_date: 2026-01-01
+`
+    let badTypeNode = yaml.parse(badType).unwrap()
+    let badTypeErr = decodeServer(&badTypeNode).unwrapErr()
+    assertEq(badTypeErr.kind == yaml.ErrorKind.WrongType, "wrong type kind")
+    assertEq(badTypeErr.path == "port", "wrong type path")
+    assertEq(badTypeErr.span.line == 2, "wrong type line")
+
+    // 5. Missing required key
+    let missing = `port: 8080`
+    let missingNode = yaml.parse(missing).unwrap()
+    let missingErr = decodeServer(&missingNode).unwrapErr()
+    assertEq(missingErr.kind == yaml.ErrorKind.MissingKey, "missing key kind")
+    assertEq(missingErr.path == "host", "missing key path")
+
+    // 6. On-demand datetime and binary decoding
+    let extra = yaml.parse(`
+ts: "2026-11-26T16:45:00+02:00"
+local: "2026-11-26T16:45:00"
+blob: !!binary |
+  SGVsbG8g
+  V29ybGQ=
+`).unwrap()
+    let odt = extra.get("ts").unwrap().asOffsetDateTime().unwrap()
+    assertEq(odt.offset == 120, "offset minutes")
+    assertEq(extra.get("local").unwrap().asLocalDateTime().isSome(), "local datetime")
+    assertEq(extra.get("blob").unwrap().asBinary().unwrap() == "Hello World", "binary base64")
+
+    // 7. Sequence element error reports index path
+    let badSeq = yaml.parse(`nums: [1, 2, "oops"]`).unwrap()
+    var bm = badSeq.map().unwrap()
+    let seqErr = bm.reqSeq("nums", yaml.decodeInt).unwrapErr()
+    assertEq(seqErr.kind == yaml.ErrorKind.WrongType, "seq elem wrong type")
+    assertEq(seqErr.path == "nums[2]", "seq elem path")
+
+    println("ok")
+}

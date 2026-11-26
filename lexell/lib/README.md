@@ -76,6 +76,7 @@ for leaks.
 | `regex_syntax.lxl` | 3,057 | the regex parser, simplifier and compiler to a program, forward and reversed (Go's regexp/syntax) |
 | `regex_unicode.lxl` | 2,019 | generated (`gen_regex_unicode.py`): Unicode 15.0.0 categories, scripts and simple case folding |
 | `json.lxl` | 1,944 | JSON values (shared, copy on write; objects in insertion order), parsing with positioned errors, a decoder for sequences, compact and indented writing with jq's options |
+| `yaml.lxl` | 5,293 | YAML 1.2 (Core Schema): comment- and style-preserving `Node` tree (shared, copy on write; insertion-ordered arbitrary keys), borrow-class `MapDecoder` with unknown-key rejection, pull `EventParser`, multi-document streams, anchors/aliases, merge keys (`<<`), round-trip writing and `json` bridge |
 
 ### std (prelude)
 
@@ -1604,6 +1605,54 @@ json.write(&out, &json.pretty())    // two spaces per level, newline at the end
 **Tests:** `tests/run/json_*.lxl`, and `tests/jsonsuite.py`, which runs
 JSONTestSuite (fetched at test time). **Speed:** `bench/json/bench.py`; the
 results are in design/json.md, section 9.
+
+### yaml
+
+YAML 1.2 (Core Schema) parsing, typed decoding, comment- and style-preserving
+round-trip editing, streaming writing, and JSON interop (`design/yaml.md`).
+
+```lxl
+import "yaml"
+
+let doc = try yaml.parse("host: localhost # local\nport: 8080\nrate: 12.50\n")
+var m = try doc.map()
+let host = try m.reqStr("host")
+let port = try m.optInt("port", 8080)
+let rate = try m.reqDecimal("rate")
+try m.finish()                          // rejects unknown keys with path + line:col
+
+var editable = doc.clone()
+editable.set("port", yaml.integer(9090)) // preserves key order and inline comments
+let out = yaml.write(&editable, &yaml.writeDefaults())
+```
+
+- **Nodes.** A `Node` wraps a `Value` (`Null`, `Bool`, `Num`, `Str`, `Seq`,
+  `Map`) plus `span`, `tag`, `anchor`, `style` (`Plain`, `Single`, `Double`,
+  `Literal`, `Folded`, `Block`, `Flow`, `Any`) and `comments` (`head`, `line`,
+  `foot`, `blankBefore`). Sequences and mappings are `rc` copy-on-write;
+  mappings preserve insertion order, allow arbitrary YAML keys, and index keys
+  with SipHash above 16 entries.
+- **YAML 1.2 Core Schema.** Plain untagged scalars resolve `null`/`~`,
+  `true`/`false`, decimal/octal (`0o`)/hex (`0x`) integers and floats
+  (`.inf`/`.nan`), without YAML 1.1 legacy booleans (`yes`/`no`/`on`/`off`) or
+  leading-zero octals. Numbers preserve literal text for exact `asDecimal()` and
+  verbatim round-tripping. Dates and `!!binary` decode on demand (`asDate`,
+  `asLocalDateTime`, `asOffsetDateTime`, `asBinary`).
+- **Typed decoding.** `n.map()` returns a borrow-class `MapDecoder` with
+  `req*`/`opt*`/`opt*Opt`/`reqWith`/`optWith`/`reqSeq`/`optSeq`/`reqMap` and
+  `finish()`, attaching dotted paths and source `Span`s to every `Error`.
+- **Anchors, aliases and merge keys.** Anchors/aliases resolve per document with
+  cycle detection (`CyclicAlias`) and expansion caps (`maxAliases`,
+  `maxAliasNodes`). Merge keys (`<<`) are enabled by default
+  (`ParseOptions.mergeKeys`), and duplicate keys are rejected by default
+  (`ParseOptions.allowDuplicateKeys`).
+- **Multi-doc, events and JSON bridge.** `parse`, `parseAll`, `parseDoc`,
+  `parseDocs`, `decoder`, pull `events` (`EventParser`), streaming
+  `writeTo[W: Sink]`, `writeAll`, `toJson` and `fromJson`.
+
+**Tests:** `tests/run/yaml_*.lxl`, and `tests/yamlsuite.py`, which runs the
+official YAML 1.2 Test Suite (`402/402` passing on native and C with round-trip
+checks).
 
 ### sqldialect, sqlite, postgres
 

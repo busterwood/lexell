@@ -1,0 +1,5293 @@
+// yaml: YAML 1.2 (Core Schema) parsing, typed decoding, round-trip editing
+// with comments and styles, streaming writing, and JSON interop.
+// design/yaml.md has the design rationale.
+//
+//     let doc = try yaml.parse(`
+//       # Server configuration
+//       host: localhost
+//       port: 8080 # HTTP port
+//       rate: 12.50
+//     `)
+//     var m = try doc.map()
+//     let host = try m.reqStr("host")
+//     let port = try m.optInt("port", 8080)
+//     let rate = try m.reqDecimal("rate")
+//     try m.finish()
+//
+//     var editable = doc.clone()
+//     editable.set("port", yaml.integer(9090))         // keeps key order and # HTTP port
+//     let out = yaml.write(&editable, &yaml.writeDefaults())
+
+import "strings"
+import "math"
+import "json"
+import "time"
+import "base64"
+
+// ---------------------------------------------------------------- core types
+
+// Source location in the input text. Lines and columns count from 1 (column
+// in bytes); offset is the 0-based byte offset. All zero for constructed nodes.
+pub type Span = value record {
+    pub line: int
+    pub col: int
+    pub offset: int
+}
+
+pub fn noSpan(): Span { return Span{line: 0, col: 0, offset: 0} }
+
+pub fn (s: Span) hasPos(): bool { return s.line > 0 }
+
+pub fn (s: Span) toStr(): str {
+    if s.line <= 0 { return "" }
+    var out = "line "
+    out.addInt(s.line)
+    out += ", column "
+    out.addInt(s.col)
+    return out
+}
+
+// Presentation style of a scalar or collection, preserved for round-tripping.
+pub type Style = value closed {
+    Any         // writer picks the cleanest style
+    Plain       // unquoted scalar
+    Single      // 'single quoted'
+    Double      // "double quoted"
+    Literal     // | block scalar
+    Folded      // > block scalar
+    Block       // block sequence or mapping
+    Flow        // [a, b] or {a: b}
+}
+
+pub fn (s: Style) toStr(): str {
+    return match s {
+        Style.Any { "any" }
+        Style.Plain { "plain" }
+        Style.Single { "single" }
+        Style.Double { "double" }
+        Style.Literal { "literal" }
+        Style.Folded { "folded" }
+        Style.Block { "block" }
+        Style.Flow { "flow" }
+    }
+}
+
+// What kind of YAML value a Node holds.
+pub type Kind = value closed {
+    Null
+    Bool
+    Int
+    Float
+    Str
+    Seq
+    Map
+}
+
+pub fn (k: Kind) toStr(): str {
+    return match k {
+        Kind.Null { "null" }
+        Kind.Bool { "bool" }
+        Kind.Int { "int" }
+        Kind.Float { "float" }
+        Kind.Str { "string" }
+        Kind.Seq { "sequence" }
+        Kind.Map { "mapping" }
+    }
+}
+
+// Comments attached to a Node for round-trip formatting.
+// Lines in head/line/foot keep their leading '#'; if a caller sets text
+// without '#', the writer prefixes "# " automatically.
+pub type Comments = value record {
+    pub head: str
+    pub line: str
+    pub foot: str
+    pub blankBefore: bool
+}
+
+pub fn noComments(): Comments {
+    return Comments{head: "", line: "", foot: "", blankBefore: false}
+}
+
+pub fn (c: &Comments) isEmpty(): bool {
+    return len(c.head) == 0 && len(c.line) == 0 && len(c.foot) == 0 && !c.blankBefore
+}
+
+// A numeric YAML value (YAML 1.2 !!int or !!float). Keeps the original literal
+// text so "0xFF", "0o755", "12.50" and ".inf" round-trip verbatim, and
+// asDecimal() reads exact base-10 decimals.
+pub type Number = value record {
+    pub isFloat: bool   // false for !!int, true for !!float
+    pub i: int          // exact int64 when !isFloat && hasInt
+    pub hasInt: bool
+    pub f: float        // nearest IEEE 754 double (or inf/nan)
+    pub text: str       // original literal text, or "" when constructed from float
+}
+
+pub type Value = value closed {
+    Null
+    Bool(bool)
+    Num(Number)
+    Str(str)
+    Seq(rc SeqBox)
+    Map(rc MapBox)
+}
+
+pub type Node = value record {
+    pub value: Value
+    pub span: Span
+    pub tag: str
+    pub anchor: str
+    pub style: Style
+    pub comments: Comments
+}
+
+pub type Entry = value record {
+    pub key: Node
+    pub value: Node
+}
+
+type SeqBox = record {
+    items: []Node
+}
+
+type MapBox = record {
+    entries: []Entry
+    index: []int    // empty, or power-of-two slots of -1 / entry index
+}
+
+// A parsed YAML document, including document markers and header comments.
+pub type Doc = value record {
+    pub root: Node
+    pub hasStart: bool      // explicit "---" marker
+    pub hasEnd: bool        // explicit "..." marker
+    pub headComment: str    // comments before "---"
+    pub version: str        // e.g. "1.2" if %YAML directive was present
+}
+
+// ---------------------------------------------------------------- errors
+
+pub type ErrorKind = value closed {
+    Eof
+    Syntax
+    Indent
+    Escape
+    Unicode
+    Scalar
+    Tag
+    Directive
+    Anchor
+    UndefinedAlias
+    CyclicAlias
+    AliasLimit
+    DuplicateKey
+    MergeKey
+    Depth
+    MultipleDocs
+    MissingKey
+    UnknownKey
+    WrongType
+    InvalidValue
+    JsonCompat
+}
+
+pub fn (k: ErrorKind) toStr(): str {
+    return match k {
+        ErrorKind.Eof { "unexpected end of input" }
+        ErrorKind.Syntax { "syntax error" }
+        ErrorKind.Indent { "indentation error" }
+        ErrorKind.Escape { "invalid escape" }
+        ErrorKind.Unicode { "invalid unicode" }
+        ErrorKind.Scalar { "invalid scalar" }
+        ErrorKind.Tag { "invalid tag" }
+        ErrorKind.Directive { "invalid directive" }
+        ErrorKind.Anchor { "invalid anchor" }
+        ErrorKind.UndefinedAlias { "undefined alias" }
+        ErrorKind.CyclicAlias { "cyclic alias" }
+        ErrorKind.AliasLimit { "alias expansion limit exceeded" }
+        ErrorKind.DuplicateKey { "duplicate key" }
+        ErrorKind.MergeKey { "invalid merge key" }
+        ErrorKind.Depth { "nesting depth exceeded" }
+        ErrorKind.MultipleDocs { "multiple documents" }
+        ErrorKind.MissingKey { "missing key" }
+        ErrorKind.UnknownKey { "unknown key" }
+        ErrorKind.WrongType { "wrong type" }
+        ErrorKind.InvalidValue { "invalid value" }
+        ErrorKind.JsonCompat { "not representable in JSON" }
+    }
+}
+
+pub type Error = value record {
+    pub kind: ErrorKind
+    pub message: str
+    pub path: str
+    pub span: Span
+}
+
+pub fn (e: &Error) toStr(): str {
+    var out = "yaml: "
+    if len(e.path) > 0 {
+        out += &e.path
+        out += ": "
+    }
+    out += &e.message
+    if e.span.line > 0 {
+        out += " at line "
+        out.addInt(e.span.line)
+        out += ", column "
+        out.addInt(e.span.col)
+    }
+    return out
+}
+
+fn makeError(kind: ErrorKind, msg: &str, span: Span): Error {
+    return Error{kind: kind, message: msg.clone(), path: "", span: span}
+}
+
+fn decodeError(kind: ErrorKind, path: &str, msg: &str, span: Span): Error {
+    return Error{kind: kind, message: msg.clone(), path: path.clone(), span: span}
+}
+
+// ---------------------------------------------------------------- options
+
+pub type ParseOptions = value record {
+    pub maxDepth: int               // maximum collection nesting depth (default 128)
+    pub maxAliases: int             // maximum alias references per document (default 1000)
+    pub maxAliasNodes: int          // maximum total nodes expanded via aliases (default 100000)
+    pub mergeKeys: bool             // expand YAML 1.1 '<<' merge keys (default true)
+    pub allowDuplicateKeys: bool    // allow duplicate keys, last wins (default false)
+    pub comments: bool              // capture comments for round-trip formatting (default true)
+}
+
+pub fn parseDefaults(): ParseOptions {
+    return ParseOptions{
+        maxDepth: 128,
+        maxAliases: 1000,
+        maxAliasNodes: 100000,
+        mergeKeys: true,
+        allowDuplicateKeys: false,
+        comments: true,
+    }
+}
+
+pub type WriteOptions = value record {
+    pub indent: int             // spaces per indentation level (default 2)
+    pub sortKeys: bool          // sort mapping keys (default false: insertion order)
+    pub comments: bool          // emit comments and blank lines (default true)
+    pub preserveStyle: bool     // honor Node.style from parsing (default true)
+    pub literalMultiline: bool  // emit multi-line Style.Any strings as '|' blocks (default true)
+    pub flowLevel: int          // force flow style at depth >= flowLevel (-1 = never)
+    pub docStart: bool          // emit "---" before document (default false)
+    pub docEnd: bool            // emit "..." after document (default false)
+    pub indentSeq: bool         // indent block sequences under mapping keys (default false)
+}
+
+pub fn writeDefaults(): WriteOptions {
+    return WriteOptions{
+        indent: 2,
+        sortKeys: false,
+        comments: true,
+        preserveStyle: true,
+        literalMultiline: true,
+        flowLevel: -1,
+        docStart: false,
+        docEnd: false,
+        indentSeq: false,
+    }
+}
+
+// Compact flow-only style (single-line YAML / JSON-like flow).
+pub fn writeFlow(): WriteOptions {
+    return WriteOptions{
+        indent: 2,
+        sortKeys: false,
+        comments: false,
+        preserveStyle: false,
+        literalMultiline: false,
+        flowLevel: 0,
+        docStart: false,
+        docEnd: false,
+        indentSeq: false,
+    }
+}
+
+// ---------------------------------------------------------------- map indexing
+
+const SMALL_MAP = 16
+
+fn newSeqBox(items: []Node): Value {
+    return Value.Seq(rc(SeqBox{items: items}))
+}
+
+fn newMapBox(entries: []Entry): Value {
+    var b = MapBox{entries: entries, index: []}
+    if len(b.entries) > SMALL_MAP { reindexMap(mut &b) }
+    return Value.Map(rc(b))
+}
+
+fn reindexMap(b: mut &MapBox) {
+    let n = len(b.entries)
+    if n <= SMALL_MAP {
+        replace(mut &b.index, [])
+        return
+    }
+    var cap = 32
+    while cap < n * 2 { cap *= 2 }
+    var slots = array(cap, -1)
+    let mask = cap - 1
+    for i in 0..n {
+        let h = b.entries[i].key.hash()
+        var s = int(h & u64(mask))
+        while slots[s] >= 0 {
+            s = (s + 1) & mask
+        }
+        slots[s] = i
+    }
+    replace(mut &b.index, slots)
+}
+
+fn findStrKey(b: &MapBox, k: &str): int {
+    let n = len(b.entries)
+    if len(b.index) == 0 {
+        for i in 0..n {
+            match b.entries[i].key.value {
+                Value.Str(s) {
+                    if s == k { return i }
+                }
+                else {}
+            }
+        }
+        return -1
+    }
+    let mask = len(b.index) - 1
+    let h = hashStrValue(k)
+    var s = int(h & u64(mask))
+    while true {
+        let e = b.index[s]
+        if e < 0 { return -1 }
+        match b.entries[e].key.value {
+            Value.Str(ks) {
+                if ks == k { return e }
+            }
+            else {}
+        }
+        s = (s + 1) & mask
+    }
+    return -1
+}
+
+fn findNodeKey(b: &MapBox, k: &Node): int {
+    let n = len(b.entries)
+    if len(b.index) == 0 {
+        for i in 0..n {
+            if b.entries[i].key.eq(k) { return i }
+        }
+        return -1
+    }
+    let mask = len(b.index) - 1
+    let h = k.hash()
+    var s = int(h & u64(mask))
+    while true {
+        let e = b.index[s]
+        if e < 0 { return -1 }
+        if b.entries[e].key.eq(k) { return e }
+        s = (s + 1) & mask
+    }
+    return -1
+}
+
+// ---------------------------------------------------------------- constructors
+
+fn makeNode(v: Value, style: Style): Node {
+    return Node{
+        value: v,
+        span: noSpan(),
+        tag: "",
+        anchor: "",
+        style: style,
+        comments: noComments(),
+    }
+}
+
+pub fn null(): Node { return makeNode(Value.Null, Style.Any) }
+pub fn boolean(b: bool): Node { return makeNode(Value.Bool(b), Style.Any) }
+
+pub fn integer(n: int): Node {
+    return makeNode(Value.Num(Number{isFloat: false, i: n, hasInt: true, f: float(n), text: intToStr(n)}), Style.Any)
+}
+
+pub fn number(f: float): Node {
+    return makeNode(Value.Num(Number{isFloat: true, i: 0, hasInt: false, f: f, text: ""}), Style.Any)
+}
+
+pub fn decimal(d: Decimal): Node {
+    let t = d.toStr()
+    return makeNode(Value.Num(Number{isFloat: true, i: 0, hasInt: false, f: d.toFloat(), text: t}), Style.Any)
+}
+
+pub fn string(s: &str): Node { return makeNode(Value.Str(s.clone()), Style.Any) }
+pub fn quotedString(s: &str): Node { return makeNode(Value.Str(s.clone()), Style.Double) }
+pub fn singleQuotedString(s: &str): Node { return makeNode(Value.Str(s.clone()), Style.Single) }
+pub fn literalString(s: &str): Node { return makeNode(Value.Str(s.clone()), Style.Literal) }
+pub fn foldedString(s: &str): Node { return makeNode(Value.Str(s.clone()), Style.Folded) }
+
+pub fn emptySeq(): Node { return makeNode(newSeqBox([]), Style.Block) }
+pub fn seqOf(items: []Node): Node { return makeNode(newSeqBox(items), Style.Block) }
+pub fn flowSeq(items: []Node): Node { return makeNode(newSeqBox(items), Style.Flow) }
+
+pub fn seqOfStrings(xs: &[str]): Node {
+    var out: []Node = []
+    for s in xs { append(mut &out, string(s)) }
+    return makeNode(newSeqBox(out), Style.Block)
+}
+
+pub fn mapping(): Node { return makeNode(newMapBox([]), Style.Block) }
+pub fn flowMapping(): Node { return makeNode(newMapBox([]), Style.Flow) }
+
+// Chainable builders on Node.
+pub fn (var n: Node) with(key: &str, val: Node): Node {
+    n.set(key, val)
+    return n
+}
+
+pub fn (var n: Node) withEntry(key: Node, val: Node): Node {
+    n.setKey(key, val)
+    return n
+}
+
+pub fn (var n: Node) withStyle(s: Style): Node {
+    n.style = s
+    return n
+}
+
+pub fn (var n: Node) withTag(t: &str): Node {
+    n.tag = t.clone()
+    return n
+}
+
+pub fn (var n: Node) withAnchor(a: &str): Node {
+    n.anchor = a.clone()
+    return n
+}
+
+pub fn (var n: Node) withHeadComment(c: &str): Node {
+    n.comments.head = c.clone()
+    return n
+}
+
+pub fn (var n: Node) withLineComment(c: &str): Node {
+    n.comments.line = c.clone()
+    return n
+}
+
+pub fn (var n: Node) withFootComment(c: &str): Node {
+    n.comments.foot = c.clone()
+    return n
+}
+
+pub fn (var n: Node) withBlankBefore(b: bool): Node {
+    n.comments.blankBefore = b
+    return n
+}
+
+// ---------------------------------------------------------------- clone, eq, hash
+
+pub fn (v: &Value) clone(): Value {
+    match v {
+        Value.Null { return Value.Null }
+        Value.Bool(b) { return Value.Bool(b) }
+        Value.Num(n) { return Value.Num(n.clone()) }
+        Value.Str(s) { return Value.Str(s.clone()) }
+        Value.Seq(s) { return Value.Seq(s.share()) }
+        Value.Map(m) { return Value.Map(m.share()) }
+    }
+}
+
+pub fn (n: &Node) clone(): Node {
+    return Node{
+        value: n.value.clone(),
+        span: n.span,
+        tag: n.tag.clone(),
+        anchor: n.anchor.clone(),
+        style: n.style,
+        comments: n.comments.clone(),
+    }
+}
+
+fn isNegZero(f: float): bool {
+    return f == 0.0f && math.bitsOf(f) < 0
+}
+
+pub fn (a: &Number) eq(b: &Number): bool {
+    if a.hasInt && b.hasInt { return a.i == b.i }
+    if a.f != a.f && b.f != b.f { return true } // NaN == NaN for structural YAML equality
+    if a.f != a.f || b.f != b.f { return false }
+    if a.f != b.f { return false }
+    // Same double: check exact decimal/int when both have decimal text
+    if a.hasInt && !b.hasInt {
+        match b.toDecimal() {
+            Some(bd) { return Decimal.fromInt(a.i) == bd }
+            None { return false }
+        }
+    }
+    if !a.hasInt && b.hasInt {
+        match a.toDecimal() {
+            Some(ad) { return ad == Decimal.fromInt(b.i) }
+            None { return false }
+        }
+    }
+    if len(a.text) > 0 && len(b.text) > 0 && a.f.isFinite() && b.f.isFinite() {
+        match a.toDecimal() {
+            Some(ad) {
+                match b.toDecimal() {
+                    Some(bd) { return ad == bd }
+                    None {}
+                }
+            }
+            None {}
+        }
+    }
+    return true
+}
+
+// Semantic equality: compares values (ignoring span, style, anchor, comments).
+pub fn (a: &Value) eq(b: &Value): bool {
+    match a {
+        Value.Null {
+            match b {
+                Value.Null { return true }
+                else { return false }
+            }
+        }
+        Value.Bool(x) {
+            match b {
+                Value.Bool(y) { return x == y }
+                else { return false }
+            }
+        }
+        Value.Num(x) {
+            match b {
+                Value.Num(y) { return x.eq(&y) }
+                else { return false }
+            }
+        }
+        Value.Str(x) {
+            match b {
+                Value.Str(y) { return x == y }
+                else { return false }
+            }
+        }
+        Value.Seq(x) {
+            match b {
+                Value.Seq(y) {
+                    if len(x.items) != len(y.items) { return false }
+                    for i in 0..len(x.items) {
+                        if !x.items[i].eq(&y.items[i]) { return false }
+                    }
+                    return true
+                }
+                else { return false }
+            }
+        }
+        Value.Map(x) {
+            match b {
+                Value.Map(y) {
+                    if len(x.entries) != len(y.entries) { return false }
+                    for i in 0..len(x.entries) {
+                        let idx = findNodeKey(y, &x.entries[i].key)
+                        if idx < 0 { return false }
+                        if !x.entries[i].value.eq(&y.entries[idx].value) { return false }
+                    }
+                    return true
+                }
+                else { return false }
+            }
+        }
+    }
+}
+
+pub fn (a: &Node) eq(b: &Node): bool {
+    return a.value.eq(&b.value)
+}
+
+fn mixHash(h: u64, v: u64): u64 {
+    return (h ^ (v +% 0x9e3779b97f4a7c15)) *% 0xbf58476d1ce4e5b9
+}
+
+fn hashStrValue(s: &str): u64 {
+    return mixHash(4, s.hash())
+}
+
+pub fn (n: &Number) hash(): u64 {
+    if n.f != n.f { return mixHash(3, 0x7ff8000000000000) }
+    if n.hasInt { return mixHash(3, u64(n.i)) }
+    if n.f == 0.0f { return mixHash(3, 0) }
+    return mixHash(3, u64(math.bitsOf(n.f)))
+}
+
+pub fn (v: &Value) hash(): u64 {
+    match v {
+        Value.Null { return 0x517cc1b727220a95 }
+        Value.Bool(b) { return if b { 0x9e3779b97f4a7c15 } else { 0xbf58476d1ce4e5b9 } }
+        Value.Num(n) { return n.hash() }
+        Value.Str(s) { return hashStrValue(s) }
+        Value.Seq(s) {
+            var h: u64 = 5
+            for i in 0..len(s.items) {
+                h = mixHash(h, s.items[i].hash())
+            }
+            return h
+        }
+        Value.Map(m) {
+            // Order-independent XOR sum so equal maps with different key orders hash identically
+            var h: u64 = 6
+            for i in 0..len(m.entries) {
+                let eh = mixHash(m.entries[i].key.hash(), m.entries[i].value.hash())
+                h = h ^ eh
+            }
+            return h
+        }
+    }
+}
+
+pub fn (n: &Node) hash(): u64 { return n.value.hash() }
+
+// ---------------------------------------------------------------- number accessors
+
+pub fn (n: &Number) toInt(): Option[int] {
+    if !n.isFloat && n.hasInt { return Some(n.i) }
+    return None
+}
+
+pub fn (n: &Number) toFloat(): float { return n.f }
+
+pub fn (n: &Number) literal(): str { return n.text.clone() }
+
+pub fn (n: &Number) toDecimal(): Option[Decimal] {
+    if !n.isFloat && n.hasInt {
+        // If decimal literal with text (e.g. "42"), Decimal.parse preserves exact form;
+        // for hex/octal ("0x10", "0o10"), use the parsed int value.
+        if len(n.text) > 0 && !isBasePrefixed(&n.text) {
+            match Decimal.parse(&n.text) {
+                Ok(d) { return Some(d) }
+                Err(_) {}
+            }
+        }
+        return Some(Decimal.fromInt(n.i))
+    }
+    if len(n.text) > 0 && !isBasePrefixed(&n.text) {
+        if !n.f.isFinite() { return None }
+        match Decimal.parse(&n.text) {
+            Ok(d) { return Some(d) }
+            Err(_) {}
+        }
+    }
+    if !n.f.isFinite() { return None }
+    let t = n.f.toStr()
+    match Decimal.parse(&t) {
+        Ok(d) { return Some(d) }
+        Err(_) { return None }
+    }
+}
+
+fn isBasePrefixed(s: &str): bool {
+    var i = 0
+    if i < len(s) && (s[i] == '+' || s[i] == '-') { i += 1 }
+    if i + 1 < len(s) && s[i] == '0' && (s[i + 1] == 'x' || s[i + 1] == 'X' || s[i + 1] == 'o' || s[i + 1] == 'O') {
+        return true
+    }
+    return false
+}
+
+// ---------------------------------------------------------------- ad-hoc reading
+
+pub fn (n: &Node) kind(): Kind {
+    match n.value {
+        Value.Null { return Kind.Null }
+        Value.Bool(_) { return Kind.Bool }
+        Value.Num(num) { return if num.isFloat { Kind.Float } else { Kind.Int } }
+        Value.Str(_) { return Kind.Str }
+        Value.Seq(_) { return Kind.Seq }
+        Value.Map(_) { return Kind.Map }
+    }
+}
+
+pub fn (n: &Node) isNull(): bool { return n.kind() == Kind.Null }
+pub fn (n: &Node) isBool(): bool { return n.kind() == Kind.Bool }
+pub fn (n: &Node) isInt(): bool { return n.kind() == Kind.Int }
+pub fn (n: &Node) isFloat(): bool { return n.kind() == Kind.Float }
+pub fn (n: &Node) isNumber(): bool { return n.kind() == Kind.Int || n.kind() == Kind.Float }
+pub fn (n: &Node) isStr(): bool { return n.kind() == Kind.Str }
+pub fn (n: &Node) isSeq(): bool { return n.kind() == Kind.Seq }
+pub fn (n: &Node) isMap(): bool { return n.kind() == Kind.Map }
+
+pub fn (n: &Node) asBool(): Option[bool] {
+    match n.value {
+        Value.Bool(b) { return Some(b) }
+        else { return None }
+    }
+}
+
+// Exact int64 for YAML !!int values.
+pub fn (n: &Node) asInt(): Option[int] {
+    match n.value {
+        Value.Num(num) { return num.toInt() }
+        else { return None }
+    }
+}
+
+// Float for both YAML !!float and !!int values.
+pub fn (n: &Node) asFloat(): Option[float] {
+    match n.value {
+        Value.Num(num) { return Some(num.f) }
+        else { return None }
+    }
+}
+
+pub fn (n: &Node) asNumber(): Option[Number] {
+    match n.value {
+        Value.Num(num) { return Some(num.clone()) }
+        else { return None }
+    }
+}
+
+// Exact Decimal from numeric literal text (or exact int / shortest float).
+pub fn (n: &Node) asDecimal(): Option[Decimal] {
+    match n.value {
+        Value.Num(num) { return num.toDecimal() }
+        else { return None }
+    }
+}
+
+pub fn (n: &Node) asStr(): Option[str] {
+    match n.value {
+        Value.Str(s) { return Some(s.clone()) }
+        else { return None }
+    }
+}
+
+// Borrowed string view with no copy.
+pub fn (n: &Node) strView(): Option[&str] {
+    match n.value {
+        Value.Str(s) { return Some(&s) }
+        else { return None }
+    }
+}
+
+// On-demand date/time parsing from string scalars (YAML 1.2 Core keeps dates as strings).
+pub fn (n: &Node) asDate(): Option[time.Date] {
+    match n.value {
+        Value.Str(s) { return time.parseDate(&s) }
+        else { return None }
+    }
+}
+
+pub fn (n: &Node) asLocalDateTime(): Option[time.LocalDateTime] {
+    match n.value {
+        Value.Str(s) { return time.parseLocalDateTime(&s) }
+        else { return None }
+    }
+}
+
+pub fn (n: &Node) asOffsetDateTime(): Option[time.OffsetDateTime] {
+    match n.value {
+        Value.Str(s) { return time.parseOffsetDateTime(&s) }
+        else { return None }
+    }
+}
+
+// Decodes base64 string (ignoring whitespace, as YAML !!binary allows).
+pub fn (n: &Node) asBinary(): Option[str] {
+    match n.value {
+        Value.Str(s) {
+            var clean = ""
+            for i in 0..len(s) {
+                let c = s[i]
+                if c != ' ' && c != '\t' && c != '\n' && c != '\r' {
+                    clean.addByte(c)
+                }
+            }
+            return base64.decodeStrict(&clean)
+        }
+        else { return None }
+    }
+}
+
+// Number of items in a sequence, entries in a mapping, bytes in a string; 0 otherwise.
+pub fn (n: &Node) size(): int {
+    match n.value {
+        Value.Seq(s) { return len(s.items) }
+        Value.Map(m) { return len(m.entries) }
+        Value.Str(s) { return len(s) }
+        else { return 0 }
+    }
+}
+
+// Borrowed element i of a sequence (negative counts from the end).
+pub fn (n: &Node) at(i: int): Option[&Node] {
+    match n.value {
+        Value.Seq(s) {
+            var k = i
+            if k < 0 { k += len(s.items) }
+            if k >= 0 && k < len(s.items) { return Some(&s.items[k]) }
+            return None
+        }
+        else { return None }
+    }
+}
+
+// Owned copy of element i, or Null when missing/not a sequence.
+pub fn (n: &Node) item(i: int): Node {
+    match n.at(i) {
+        Some(v) { return v.clone() }
+        None { return null() }
+    }
+}
+
+// Borrowed value for string key k in a mapping (zero copy).
+pub fn (n: &Node) get(k: &str): Option[&Node] {
+    match n.value {
+        Value.Map(m) {
+            let idx = findStrKey(m, k)
+            if idx >= 0 { return Some(&m.entries[idx].value) }
+            return None
+        }
+        else { return None }
+    }
+}
+
+// Borrowed value for an arbitrary YAML Node key (zero copy).
+pub fn (n: &Node) getKey(k: &Node): Option[&Node] {
+    match n.value {
+        Value.Map(m) {
+            let idx = findNodeKey(m, k)
+            if idx >= 0 { return Some(&m.entries[idx].value) }
+            return None
+        }
+        else { return None }
+    }
+}
+
+// Borrowed entry (key + value) for string key k.
+pub fn (n: &Node) getEntry(k: &str): Option[&Entry] {
+    match n.value {
+        Value.Map(m) {
+            let idx = findStrKey(m, k)
+            if idx >= 0 { return Some(&m.entries[idx]) }
+            return None
+        }
+        else { return None }
+    }
+}
+
+// Owned copy of value for string key k, or Null when missing.
+pub fn (n: &Node) field(k: &str): Node {
+    match n.get(k) {
+        Some(v) { return v.clone() }
+        None { return null() }
+    }
+}
+
+pub fn (n: &Node) has(k: &str): bool {
+    match n.value {
+        Value.Map(m) { return findStrKey(m, k) >= 0 }
+        else { return false }
+    }
+}
+
+pub fn (n: &Node) hasKey(k: &Node): bool {
+    match n.value {
+        Value.Map(m) { return findNodeKey(m, k) >= 0 }
+        else { return false }
+    }
+}
+
+// Path traversal: n.path(&["server", "ports", "0"]).
+pub fn (n: &Node) path(keys: &[str]): Option[Node] {
+    var cur = n.clone()
+    for k in keys {
+        var next: Option[Node] = None
+        if cur.isSeq() {
+            match strings.parseIntOpt(&k) {
+                Some(idx) {
+                    match cur.at(idx) {
+                        Some(v) { next = Some(v.clone()) }
+                        None {}
+                    }
+                }
+                None {}
+            }
+        } else {
+            match cur.get(&k) {
+                Some(v) { next = Some(v.clone()) }
+                None {}
+            }
+        }
+        match move(next) {
+            Some(v) { cur = v }
+            None { return None }
+        }
+    }
+    return Some(cur)
+}
+
+pub fn (n: &Node) items(): []Node {
+    var out: []Node = []
+    match n.value {
+        Value.Seq(s) {
+            for x in s.items { append(mut &out, x.clone()) }
+        }
+        else {}
+    }
+    return out
+}
+
+pub fn (n: &Node) entries(): []Entry {
+    var out: []Entry = []
+    match n.value {
+        Value.Map(m) {
+            for e in m.entries { append(mut &out, e.clone()) }
+        }
+        else {}
+    }
+    return out
+}
+
+pub fn (n: &Node) keys(): []Node {
+    var out: []Node = []
+    match n.value {
+        Value.Map(m) {
+            for e in m.entries { append(mut &out, e.key.clone()) }
+        }
+        else {}
+    }
+    return out
+}
+
+pub fn (n: &Node) eachItem(f: &fn(int, &Node): bool): bool {
+    match n.value {
+        Value.Seq(s) {
+            var i = 0
+            while i < len(s.items) {
+                if !f(i, &s.items[i]) { return false }
+                i += 1
+            }
+            return true
+        }
+        else { return true }
+    }
+}
+
+pub fn (n: &Node) eachEntry(f: &fn(&Node, &Node): bool): bool {
+    match n.value {
+        Value.Map(m) {
+            var i = 0
+            while i < len(m.entries) {
+                if !f(&m.entries[i].key, &m.entries[i].value) { return false }
+                i += 1
+            }
+            return true
+        }
+        else { return true }
+    }
+}
+
+// ---------------------------------------------------------------- mutations (copy-on-write)
+
+// Sets string key k to val in a mapping (converting Null to a new mapping).
+// When updating an existing key, keeps its position, key comments, and
+// preserves the old value's inline comment if val has none.
+pub fn (n: mut &Node) set(k: &str, val: Node) {
+    if n.isNull() {
+        n.value = newMapBox([Entry{key: string(k), value: val}])
+        if n.style == Style.Any { n.style = Style.Block }
+        return
+    }
+    if !n.isMap() { panic("yaml: set on a " + n.kind().toStr()) }
+    var cur = replace(mut &n.value, Value.Null)
+    match move(cur) {
+        Value.Map(m0) {
+            var m = m0
+            let b = m.unshare()
+            let idx = findStrKey(b, k)
+            if idx >= 0 {
+                var nextVal = val
+                if len(nextVal.comments.line) == 0 && len(b.entries[idx].value.comments.line) > 0 {
+                    nextVal.comments.line = b.entries[idx].value.comments.line.clone()
+                }
+                b.entries[idx].value = nextVal
+            } else {
+                append(mut &b.entries, Entry{key: string(k), value: val})
+                if len(b.entries) > SMALL_MAP {
+                    if len(b.index) == 0 || len(b.entries) * 2 > len(b.index) {
+                        reindexMap(b)
+                    } else {
+                        let mask = len(b.index) - 1
+                        var s = int(hashStrValue(k) & u64(mask))
+                        while b.index[s] >= 0 { s = (s + 1) & mask }
+                        b.index[s] = len(b.entries) - 1
+                    }
+                }
+            }
+            n.value = Value.Map(m)
+        }
+        else {}
+    }
+}
+
+// Sets an arbitrary YAML key Node to val.
+pub fn (n: mut &Node) setKey(key: Node, val: Node) {
+    if n.isNull() {
+        n.value = newMapBox([Entry{key: key, value: val}])
+        if n.style == Style.Any { n.style = Style.Block }
+        return
+    }
+    if !n.isMap() { panic("yaml: setKey on a " + n.kind().toStr()) }
+    var cur = replace(mut &n.value, Value.Null)
+    match move(cur) {
+        Value.Map(m0) {
+            var m = m0
+            let b = m.unshare()
+            let idx = findNodeKey(b, &key)
+            if idx >= 0 {
+                var nextVal = val
+                if len(nextVal.comments.line) == 0 && len(b.entries[idx].value.comments.line) > 0 {
+                    nextVal.comments.line = b.entries[idx].value.comments.line.clone()
+                }
+                b.entries[idx].value = nextVal
+            } else {
+                let h = key.hash()
+                append(mut &b.entries, Entry{key: key, value: val})
+                if len(b.entries) > SMALL_MAP {
+                    if len(b.index) == 0 || len(b.entries) * 2 > len(b.index) {
+                        reindexMap(b)
+                    } else {
+                        let mask = len(b.index) - 1
+                        var s = int(h & u64(mask))
+                        while b.index[s] >= 0 { s = (s + 1) & mask }
+                        b.index[s] = len(b.entries) - 1
+                    }
+                }
+            }
+            n.value = Value.Map(m)
+        }
+        else {}
+    }
+}
+
+// Removes string key k from a mapping, keeping remaining key order.
+pub fn (n: mut &Node) remove(k: &str): Option[Node] {
+    if !n.has(k) { return None }
+    var r: Option[Node] = None
+    var cur = replace(mut &n.value, Value.Null)
+    match move(cur) {
+        Value.Map(m0) {
+            var m = m0
+            let b = m.unshare()
+            let idx = findStrKey(b, k)
+            if idx >= 0 { r = Some(removeEntryAt(b, idx)) }
+            n.value = Value.Map(m)
+        }
+        else {}
+    }
+    return r
+}
+
+pub fn (n: mut &Node) removeKey(k: &Node): Option[Node] {
+    if !n.hasKey(k) { return None }
+    var r: Option[Node] = None
+    var cur = replace(mut &n.value, Value.Null)
+    match move(cur) {
+        Value.Map(m0) {
+            var m = m0
+            let b = m.unshare()
+            let idx = findNodeKey(b, k)
+            if idx >= 0 { r = Some(removeEntryAt(b, idx)) }
+            n.value = Value.Map(m)
+        }
+        else {}
+    }
+    return r
+}
+
+fn removeEntryAt(b: mut &MapBox, idx: int): Node {
+    let last = len(b.entries) - 1
+    var i = idx
+    while i < last {
+        swap(mut &b.entries, i, i + 1)
+        i += 1
+    }
+    let e = pop(mut &b.entries)
+    reindexMap(b)
+    return e.value
+}
+
+// Appends val to a sequence (converting Null to a new sequence).
+pub fn (n: mut &Node) push(val: Node) {
+    if n.isNull() {
+        n.value = newSeqBox([val])
+        if n.style == Style.Any { n.style = Style.Block }
+        return
+    }
+    if !n.isSeq() { panic("yaml: push on a " + n.kind().toStr()) }
+    var cur = replace(mut &n.value, Value.Null)
+    match move(cur) {
+        Value.Seq(s0) {
+            var s = s0
+            let b = s.unshare()
+            append(mut &b.items, val)
+            n.value = Value.Seq(s)
+        }
+        else {}
+    }
+}
+
+pub fn (n: mut &Node) setAt(i: int, val: Node) {
+    if !n.isSeq() { panic("yaml: setAt on a " + n.kind().toStr()) }
+    var cur = replace(mut &n.value, Value.Null)
+    match move(cur) {
+        Value.Seq(s0) {
+            var s = s0
+            let b = s.unshare()
+            var k = i
+            if k < 0 { k += len(b.items) }
+            b.items[k] = val
+            n.value = Value.Seq(s)
+        }
+        else {}
+    }
+}
+
+pub fn (n: mut &Node) pop(): Option[Node] {
+    if !n.isSeq() || n.size() == 0 { return None }
+    var r: Option[Node] = None
+    var cur = replace(mut &n.value, Value.Null)
+    match move(cur) {
+        Value.Seq(s0) {
+            var s = s0
+            let b = s.unshare()
+            if len(b.items) > 0 { r = Some(pop(mut &b.items)) }
+            n.value = Value.Seq(s)
+        }
+        else {}
+    }
+    return r
+}
+
+// ---------------------------------------------------------------- typed decoding
+
+fn joinPath(base: &str, seg: &str): str {
+    if len(base) == 0 { return seg.clone() }
+    var out = base.clone()
+    out.addByte('.')
+    out += seg
+    return out
+}
+
+fn joinIndex(base: &str, idx: int): str {
+    var out = base.clone()
+    out.addByte('[')
+    out.addInt(idx)
+    out.addByte(']')
+    return out
+}
+
+// Standalone decoder functions, convenient for reqSeq / optSeq / decodeMap.
+pub fn decodeStr(n: &Node): Result[str, Error] { return n.expectStr() }
+pub fn decodeInt(n: &Node): Result[int, Error] { return n.expectInt() }
+pub fn decodeFloat(n: &Node): Result[float, Error] { return n.expectFloat() }
+pub fn decodeDecimal(n: &Node): Result[Decimal, Error] { return n.expectDecimal() }
+pub fn decodeBool(n: &Node): Result[bool, Error] { return n.expectBool() }
+pub fn decodeDate(n: &Node): Result[time.Date, Error] { return n.expectDate() }
+
+pub fn (n: &Node) expectBool(): Result[bool, Error] {
+    return n.expectBoolAt("")
+}
+
+pub fn (n: &Node) expectBoolAt(path: &str): Result[bool, Error] {
+    match n.asBool() {
+        Some(b) { return Ok(b) }
+        None { return Err(decodeError(ErrorKind.WrongType, path, &("expected bool, got " + n.kind().toStr()), n.span)) }
+    }
+}
+
+pub fn (n: &Node) expectInt(): Result[int, Error] {
+    return n.expectIntAt("")
+}
+
+pub fn (n: &Node) expectIntAt(path: &str): Result[int, Error] {
+    match n.value {
+        Value.Num(num) {
+            if num.isFloat {
+                return Err(decodeError(ErrorKind.WrongType, path, "expected int, got float", n.span))
+            }
+            if !num.hasInt {
+                return Err(decodeError(ErrorKind.InvalidValue, path, &("integer out of int64 range: " + num.text), n.span))
+            }
+            return Ok(num.i)
+        }
+        else {
+            return Err(decodeError(ErrorKind.WrongType, path, &("expected int, got " + n.kind().toStr()), n.span))
+        }
+    }
+}
+
+pub fn (n: &Node) expectFloat(): Result[float, Error] {
+    return n.expectFloatAt("")
+}
+
+pub fn (n: &Node) expectFloatAt(path: &str): Result[float, Error] {
+    match n.asFloat() {
+        Some(f) { return Ok(f) }
+        None { return Err(decodeError(ErrorKind.WrongType, path, &("expected float, got " + n.kind().toStr()), n.span)) }
+    }
+}
+
+pub fn (n: &Node) expectDecimal(): Result[Decimal, Error] {
+    return n.expectDecimalAt("")
+}
+
+pub fn (n: &Node) expectDecimalAt(path: &str): Result[Decimal, Error] {
+    match n.value {
+        Value.Num(num) {
+            match num.toDecimal() {
+                Some(d) { return Ok(d) }
+                None { return Err(decodeError(ErrorKind.InvalidValue, path, "number cannot be represented as Decimal", n.span)) }
+            }
+        }
+        else {
+            return Err(decodeError(ErrorKind.WrongType, path, &("expected number, got " + n.kind().toStr()), n.span))
+        }
+    }
+}
+
+pub fn (n: &Node) expectStr(): Result[str, Error] {
+    return n.expectStrAt("")
+}
+
+pub fn (n: &Node) expectStrAt(path: &str): Result[str, Error] {
+    match n.asStr() {
+        Some(s) { return Ok(s) }
+        None { return Err(decodeError(ErrorKind.WrongType, path, &("expected string, got " + n.kind().toStr()), n.span)) }
+    }
+}
+
+pub fn (n: &Node) expectDate(): Result[time.Date, Error] {
+    return n.expectDateAt("")
+}
+
+pub fn (n: &Node) expectDateAt(path: &str): Result[time.Date, Error] {
+    match n.value {
+        Value.Str(s) {
+            match time.parseDate(&s) {
+                Some(d) { return Ok(d) }
+                None { return Err(decodeError(ErrorKind.InvalidValue, path, &("invalid date: " + s), n.span)) }
+            }
+        }
+        else {
+            return Err(decodeError(ErrorKind.WrongType, path, &("expected date string, got " + n.kind().toStr()), n.span))
+        }
+    }
+}
+
+pub fn (n: &Node) expectOffsetDateTime(): Result[time.OffsetDateTime, Error] {
+    return n.expectOffsetDateTimeAt("")
+}
+
+pub fn (n: &Node) expectOffsetDateTimeAt(path: &str): Result[time.OffsetDateTime, Error] {
+    match n.value {
+        Value.Str(s) {
+            match time.parseOffsetDateTime(&s) {
+                Some(dt) { return Ok(dt) }
+                None { return Err(decodeError(ErrorKind.InvalidValue, path, &("invalid date-time: " + s), n.span)) }
+            }
+        }
+        else {
+            return Err(decodeError(ErrorKind.WrongType, path, &("expected date-time string, got " + n.kind().toStr()), n.span))
+        }
+    }
+}
+
+pub fn (n: &Node) decodeSeq[T](f: &fn(&Node): Result[T, Error]): Result[[]T, Error] {
+    return n.decodeSeqAt("", f)
+}
+
+pub fn (n: &Node) decodeSeqAt[T](path: &str, f: &fn(&Node): Result[T, Error]): Result[[]T, Error] {
+    match n.value {
+        Value.Seq(s) {
+            var out: []T = []
+            for i in 0..len(s.items) {
+                let itemPath = joinIndex(path, i)
+                match f(&s.items[i]) {
+                    Ok(v) { append(mut &out, v) }
+                    Err(e) {
+                        var err = e
+                        if len(err.path) == 0 {
+                            err.path = itemPath
+                        } else {
+                            err.path = itemPath + "." + err.path
+                        }
+                        return Err(err)
+                    }
+                }
+            }
+            return Ok(out)
+        }
+        else {
+            return Err(decodeError(ErrorKind.WrongType, path, &("expected sequence, got " + n.kind().toStr()), n.span))
+        }
+    }
+}
+
+pub fn (n: &Node) decodeMap[V](f: &fn(&Node): Result[V, Error]): Result[Map[str, V], Error] {
+    return n.decodeMapAt("", f)
+}
+
+pub fn (n: &Node) decodeMapAt[V](path: &str, f: &fn(&Node): Result[V, Error]): Result[Map[str, V], Error] {
+    match n.value {
+        Value.Map(m) {
+            var out: Map[str, V] = newMap()
+            for i in 0..len(m.entries) {
+                let kStr = match m.entries[i].key.asStr() {
+                    Some(s) { s }
+                    None {
+                        return Err(decodeError(ErrorKind.WrongType, path, &("expected string mapping key, got " + m.entries[i].key.kind().toStr()), m.entries[i].key.span))
+                    }
+                }
+                let entryPath = joinPath(path, &kStr)
+                match f(&m.entries[i].value) {
+                    Ok(v) { out.put(kStr, v) }
+                    Err(e) {
+                        var err = e
+                        if len(err.path) == 0 {
+                            err.path = entryPath
+                        } else {
+                            err.path = entryPath + "." + err.path
+                        }
+                        return Err(err)
+                    }
+                }
+            }
+            return Ok(out)
+        }
+        else {
+            return Err(decodeError(ErrorKind.WrongType, path, &("expected mapping, got " + n.kind().toStr()), n.span))
+        }
+    }
+}
+
+// Borrow-class typed mapping decoder: borrows the Node, tracks read keys so
+// finish() rejects unknown/misspelled keys with their exact source Span.
+pub type MapDecoder = value record {
+    node: &Node
+    path: str
+    seen: []bool
+}
+
+pub fn (n: &Node) map(): Result[MapDecoder, Error] {
+    return n.mapAt("")
+}
+
+pub fn (n: &Node) mapAt(path: &str): Result[MapDecoder, Error] {
+    match n.value {
+        Value.Map(m) {
+            return Ok(MapDecoder{node: n, path: path.clone(), seen: array(len(m.entries), false)})
+        }
+        else {
+            return Err(decodeError(ErrorKind.WrongType, path, &("expected mapping, got " + n.kind().toStr()), n.span))
+        }
+    }
+}
+
+fn (m: mut &MapDecoder) lookup(key: &str): Option[&Node] {
+    match m.node.value {
+        Value.Map(mb) {
+            let idx = findStrKey(mb, key)
+            if idx >= 0 {
+                m.seen[idx] = true
+                return Some(&mb.entries[idx].value)
+            }
+            return None
+        }
+        else { return None }
+    }
+}
+
+pub fn (m: &MapDecoder) has(key: &str): bool { return m.node.has(key) }
+
+pub fn (m: mut &MapDecoder) reqNode(key: &str): Result[&Node, Error] {
+    match m.lookup(key) {
+        Some(v) { return Ok(v) }
+        None {
+            let p = joinPath(&m.path, key)
+            return Err(decodeError(ErrorKind.MissingKey, &p, &("missing required key '" + key + "'"), m.node.span))
+        }
+    }
+}
+
+pub fn (m: mut &MapDecoder) optNode(key: &str): Option[&Node] {
+    return m.lookup(key)
+}
+
+pub fn (m: mut &MapDecoder) reqStr(key: &str): Result[str, Error] {
+    let v = try m.reqNode(key)
+    return v.expectStrAt(&(joinPath(&m.path, key)))
+}
+
+pub fn (m: mut &MapDecoder) optStr(key: &str, def: &str): Result[str, Error] {
+    match m.lookup(key) {
+        Some(v) {
+            if v.isNull() { return Ok(def.clone()) }
+            return v.expectStrAt(&(joinPath(&m.path, key)))
+        }
+        None { return Ok(def.clone()) }
+    }
+}
+
+pub fn (m: mut &MapDecoder) optStrOpt(key: &str): Result[Option[str], Error] {
+    match m.lookup(key) {
+        Some(v) {
+            if v.isNull() { return Ok(None) }
+            let s = try v.expectStrAt(&(joinPath(&m.path, key)))
+            return Ok(Some(s))
+        }
+        None { return Ok(None) }
+    }
+}
+
+pub fn (m: mut &MapDecoder) reqInt(key: &str): Result[int, Error] {
+    let v = try m.reqNode(key)
+    return v.expectIntAt(&(joinPath(&m.path, key)))
+}
+
+pub fn (m: mut &MapDecoder) optInt(key: &str, def: int): Result[int, Error] {
+    match m.lookup(key) {
+        Some(v) {
+            if v.isNull() { return Ok(def) }
+            return v.expectIntAt(&(joinPath(&m.path, key)))
+        }
+        None { return Ok(def) }
+    }
+}
+
+pub fn (m: mut &MapDecoder) optIntOpt(key: &str): Result[Option[int], Error] {
+    match m.lookup(key) {
+        Some(v) {
+            if v.isNull() { return Ok(None) }
+            let n = try v.expectIntAt(&(joinPath(&m.path, key)))
+            return Ok(Some(n))
+        }
+        None { return Ok(None) }
+    }
+}
+
+pub fn (m: mut &MapDecoder) reqFloat(key: &str): Result[float, Error] {
+    let v = try m.reqNode(key)
+    return v.expectFloatAt(&(joinPath(&m.path, key)))
+}
+
+pub fn (m: mut &MapDecoder) optFloat(key: &str, def: float): Result[float, Error] {
+    match m.lookup(key) {
+        Some(v) {
+            if v.isNull() { return Ok(def) }
+            return v.expectFloatAt(&(joinPath(&m.path, key)))
+        }
+        None { return Ok(def) }
+    }
+}
+
+pub fn (m: mut &MapDecoder) optFloatOpt(key: &str): Result[Option[float], Error] {
+    match m.lookup(key) {
+        Some(v) {
+            if v.isNull() { return Ok(None) }
+            let f = try v.expectFloatAt(&(joinPath(&m.path, key)))
+            return Ok(Some(f))
+        }
+        None { return Ok(None) }
+    }
+}
+
+pub fn (m: mut &MapDecoder) reqDecimal(key: &str): Result[Decimal, Error] {
+    let v = try m.reqNode(key)
+    return v.expectDecimalAt(&(joinPath(&m.path, key)))
+}
+
+pub fn (m: mut &MapDecoder) optDecimal(key: &str, def: Decimal): Result[Decimal, Error] {
+    match m.lookup(key) {
+        Some(v) {
+            if v.isNull() { return Ok(def) }
+            return v.expectDecimalAt(&(joinPath(&m.path, key)))
+        }
+        None { return Ok(def) }
+    }
+}
+
+pub fn (m: mut &MapDecoder) optDecimalOpt(key: &str): Result[Option[Decimal], Error] {
+    match m.lookup(key) {
+        Some(v) {
+            if v.isNull() { return Ok(None) }
+            let d = try v.expectDecimalAt(&(joinPath(&m.path, key)))
+            return Ok(Some(d))
+        }
+        None { return Ok(None) }
+    }
+}
+
+pub fn (m: mut &MapDecoder) reqBool(key: &str): Result[bool, Error] {
+    let v = try m.reqNode(key)
+    return v.expectBoolAt(&(joinPath(&m.path, key)))
+}
+
+pub fn (m: mut &MapDecoder) optBool(key: &str, def: bool): Result[bool, Error] {
+    match m.lookup(key) {
+        Some(v) {
+            if v.isNull() { return Ok(def) }
+            return v.expectBoolAt(&(joinPath(&m.path, key)))
+        }
+        None { return Ok(def) }
+    }
+}
+
+pub fn (m: mut &MapDecoder) optBoolOpt(key: &str): Result[Option[bool], Error] {
+    match m.lookup(key) {
+        Some(v) {
+            if v.isNull() { return Ok(None) }
+            let b = try v.expectBoolAt(&(joinPath(&m.path, key)))
+            return Ok(Some(b))
+        }
+        None { return Ok(None) }
+    }
+}
+
+pub fn (m: mut &MapDecoder) reqDate(key: &str): Result[time.Date, Error] {
+    let v = try m.reqNode(key)
+    return v.expectDateAt(&(joinPath(&m.path, key)))
+}
+
+pub fn (m: mut &MapDecoder) optDateOpt(key: &str): Result[Option[time.Date], Error] {
+    match m.lookup(key) {
+        Some(v) {
+            if v.isNull() { return Ok(None) }
+            let d = try v.expectDateAt(&(joinPath(&m.path, key)))
+            return Ok(Some(d))
+        }
+        None { return Ok(None) }
+    }
+}
+
+fn prependPath(prefix: &str, e: Error): Error {
+    var err = e
+    if len(err.path) == 0 {
+        err.path = prefix.clone()
+    } else {
+        err.path = prefix + "." + err.path
+    }
+    return err
+}
+
+pub fn (m: mut &MapDecoder) reqWith[T](key: &str, f: &fn(&Node): Result[T, Error]): Result[T, Error] {
+    let v = try m.reqNode(key)
+    let p = joinPath(&m.path, key)
+    match f(v) {
+        Ok(val) { return Ok(val) }
+        Err(e) { return Err(prependPath(&p, e)) }
+    }
+}
+
+pub fn (m: mut &MapDecoder) optWith[T](key: &str, f: &fn(&Node): Result[T, Error]): Result[Option[T], Error] {
+    match m.lookup(key) {
+        Some(v) {
+            if v.isNull() { return Ok(None) }
+            let p = joinPath(&m.path, key)
+            match f(v) {
+                Ok(val) { return Ok(Some(val)) }
+                Err(e) { return Err(prependPath(&p, e)) }
+            }
+        }
+        None { return Ok(None) }
+    }
+}
+
+pub fn (m: mut &MapDecoder) reqSeq[T](key: &str, f: &fn(&Node): Result[T, Error]): Result[[]T, Error] {
+    let v = try m.reqNode(key)
+    let p = joinPath(&m.path, key)
+    return v.decodeSeqAt(&p, f)
+}
+
+pub fn (m: mut &MapDecoder) optSeq[T](key: &str, f: &fn(&Node): Result[T, Error]): Result[[]T, Error] {
+    match m.lookup(key) {
+        Some(v) {
+            if v.isNull() { return Ok([]) }
+            let p = joinPath(&m.path, key)
+            return v.decodeSeqAt(&p, f)
+        }
+        None { return Ok([]) }
+    }
+}
+
+pub fn (m: mut &MapDecoder) reqMap[V](key: &str, f: &fn(&Node): Result[V, Error]): Result[Map[str, V], Error] {
+    let v = try m.reqNode(key)
+    let p = joinPath(&m.path, key)
+    return v.decodeMapAt(&p, f)
+}
+
+pub fn (m: mut &MapDecoder) optMap[V](key: &str, f: &fn(&Node): Result[V, Error]): Result[Map[str, V], Error] {
+    match m.lookup(key) {
+        Some(v) {
+            if v.isNull() {
+                let empty: Map[str, V] = newMap()
+                return Ok(empty)
+            }
+            let p = joinPath(&m.path, key)
+            return v.decodeMapAt(&p, f)
+        }
+        None {
+            let empty: Map[str, V] = newMap()
+            return Ok(empty)
+        }
+    }
+}
+
+// Lists any keys in the mapping that were not read through this MapDecoder.
+pub fn (m: &MapDecoder) unknownKeys(): []str {
+    var out: []str = []
+    match m.node.value {
+        Value.Map(mb) {
+            for i in 0..len(mb.entries) {
+                if !m.seen[i] {
+                    match mb.entries[i].key.asStr() {
+                        Some(s) { append(mut &out, s) }
+                        None { append(mut &out, mb.entries[i].key.toStr()) }
+                    }
+                }
+            }
+        }
+        else {}
+    }
+    return out
+}
+
+// Succeeds if every key in the mapping was read; otherwise returns
+// ErrorKind.UnknownKey pointing at the first unread key's Span.
+pub fn (m: &MapDecoder) finish(): Result[Unit, Error] {
+    match m.node.value {
+        Value.Map(mb) {
+            for i in 0..len(mb.entries) {
+                if !m.seen[i] {
+                    let kName = match mb.entries[i].key.asStr() {
+                        Some(s) { s }
+                        None { mb.entries[i].key.toStr() }
+                    }
+                    let p = joinPath(&m.path, &kName)
+                    return Err(decodeError(ErrorKind.UnknownKey, &p, &("unknown key '" + kName + "'"), mb.entries[i].key.span))
+                }
+            }
+        }
+        else {}
+    }
+    return Ok(Unit{})
+}
+
+// ---------------------------------------------------------------- YAML 1.2 Core Schema resolution
+
+// Parses a YAML 1.2 Core integer: [-+]?[0-9]+ | 0o[0-7]+ | 0x[0-9a-fA-F]+.
+// Returns Some(Number) if s matches the grammar (hasInt=false if int64 overflows).
+fn parseCoreInt(s: &str): Option[Number] {
+    let n = len(s)
+    if n == 0 { return None }
+    if n >= 3 && s[0] == '0' && s[1] == 'x' {
+        return parseRadixInt(s, 2, 16, false)
+    }
+    if n >= 3 && s[0] == '0' && s[1] == 'o' {
+        return parseRadixInt(s, 2, 8, false)
+    }
+    var i = 0
+    var neg = false
+    if s[0] == '-' {
+        neg = true
+        i = 1
+    } else if s[0] == '+' {
+        i = 1
+    }
+    if i >= n { return None }
+    var k = i
+    while k < n {
+        if s[k] < '0' || s[k] > '9' { return None }
+        k += 1
+    }
+    return parseRadixInt(s, i, 10, neg)
+}
+
+fn hexDigit(c: byte): int {
+    if c >= '0' && c <= '9' { return int(c - '0') }
+    if c >= 'a' && c <= 'f' { return int(c - 'a') + 10 }
+    if c >= 'A' && c <= 'F' { return int(c - 'A') + 10 }
+    return -1
+}
+
+fn parseRadixInt(s: &str, start: int, base: int, neg: bool): Option[Number] {
+    let n = len(s)
+    if start >= n { return None }
+    var val: int = 0
+    var overflow = false
+    var i = start
+    while i < n {
+        let d = hexDigit(s[i])
+        if d < 0 || d >= base { return None }
+        if !overflow {
+            if neg {
+                match val.checkedMul(base) {
+                    Some(v1) {
+                        match v1.checkedSub(d) {
+                            Some(v2) { val = v2 }
+                            None { overflow = true }
+                        }
+                    }
+                    None { overflow = true }
+                }
+            } else {
+                match val.checkedMul(base) {
+                    Some(v1) {
+                        match v1.checkedAdd(d) {
+                            Some(v2) { val = v2 }
+                            None { overflow = true }
+                        }
+                    }
+                    None { overflow = true }
+                }
+            }
+        }
+        i += 1
+    }
+    if !overflow {
+        return Some(Number{isFloat: false, i: val, hasInt: true, f: float(val), text: s.clone()})
+    }
+    // Overflowed int64: compute approximate float (for base 10 via math.parse, else accumulate float)
+    var fval = 0.0f
+    if base == 10 {
+        match math.parse(s) {
+            Some(fv) { fval = fv }
+            None { fval = if neg { -math.inf() } else { math.inf() } }
+        }
+    } else {
+        var j = start
+        let fb = float(base)
+        while j < n {
+            fval = fval * fb + float(hexDigit(s[j]))
+            j += 1
+        }
+        if neg { fval = -fval }
+    }
+    return Some(Number{isFloat: false, i: 0, hasInt: false, f: fval, text: s.clone()})
+}
+
+// Parses a YAML 1.2 Core float:
+//   [-+]?(\.[0-9]+|[0-9]+(\.[0-9]*)?)([eE][-+]?[0-9]+)?
+//   [-+]?(\.inf|\.Inf|\.INF)
+//   (\.nan|\.NaN|\.NAN)
+fn parseCoreFloat(s: &str): Option[Number] {
+    let n = len(s)
+    if n == 0 { return None }
+    if s == ".nan" || s == ".NaN" || s == ".NAN" {
+        return Some(Number{isFloat: true, i: 0, hasInt: false, f: math.nan(), text: s.clone()})
+    }
+    var i = 0
+    var neg = false
+    if s[0] == '-' {
+        neg = true
+        i = 1
+    } else if s[0] == '+' {
+        i = 1
+    }
+    let rest = s[i..]
+    if rest == ".inf" || rest == ".Inf" || rest == ".INF" {
+        return Some(Number{isFloat: true, i: 0, hasInt: false, f: if neg { -math.inf() } else { math.inf() }, text: s.clone()})
+    }
+    if i >= n { return None }
+    var hasDot = false
+    var hasExp = false
+    var intDigits = 0
+    var fracDigits = 0
+    while i < n && s[i] >= '0' && s[i] <= '9' {
+        intDigits += 1
+        i += 1
+    }
+    if i < n && s[i] == '.' {
+        hasDot = true
+        i += 1
+        while i < n && s[i] >= '0' && s[i] <= '9' {
+            fracDigits += 1
+            i += 1
+        }
+    }
+    if intDigits == 0 && fracDigits == 0 { return None }
+    if i < n && (s[i] == 'e' || s[i] == 'E') {
+        hasExp = true
+        i += 1
+        if i < n && (s[i] == '+' || s[i] == '-') { i += 1 }
+        var expDigits = 0
+        while i < n && s[i] >= '0' && s[i] <= '9' {
+            expDigits += 1
+            i += 1
+        }
+        if expDigits == 0 { return None }
+    }
+    if i != n { return None }
+    if !hasDot && !hasExp { return None }
+    var fv = 0.0f
+    match math.parse(s) {
+        Some(x) { fv = x }
+        None {
+            // Very large exponent overflows to +-inf; tiny exponent underflows to +-0.0
+            if hasExp {
+                let ePos = strings.indexOfAny(s, "eE", 0)
+                let negExp = ePos >= 0 && ePos + 1 < n && s[ePos + 1] == '-'
+                fv = if negExp { if neg { -0.0f } else { 0.0f } } else { if neg { -math.inf() } else { math.inf() } }
+            } else {
+                fv = if neg { -math.inf() } else { math.inf() }
+            }
+        }
+    }
+    return Some(Number{isFloat: true, i: 0, hasInt: false, f: fv, text: s.clone()})
+}
+
+fn isCoreNull(s: &str): bool {
+    return len(s) == 0 || s == "null" || s == "Null" || s == "NULL" || s == "~"
+}
+
+fn parseCoreBool(s: &str): Option[bool] {
+    if s == "true" || s == "True" || s == "TRUE" { return Some(true) }
+    if s == "false" || s == "False" || s == "FALSE" { return Some(false) }
+    return None
+}
+
+fn resolveScalar(raw: &str, style: Style, tag: &str, span: Span): Result[Value, Error] {
+    if len(tag) > 0 {
+        if tag == "!" || tag == "!!str" || tag == "tag:yaml.org,2002:str" {
+            return Ok(Value.Str(raw.clone()))
+        }
+        if tag == "!!null" || tag == "tag:yaml.org,2002:null" {
+            if isCoreNull(raw) { return Ok(Value.Null) }
+            return Err(makeError(ErrorKind.Tag, &("invalid !!null scalar: " + raw), span))
+        }
+        if tag == "!!bool" || tag == "tag:yaml.org,2002:bool" {
+            match parseCoreBool(raw) {
+                Some(b) { return Ok(Value.Bool(b)) }
+                None { return Err(makeError(ErrorKind.Tag, &("invalid !!bool scalar: " + raw), span)) }
+            }
+        }
+        if tag == "!!int" || tag == "tag:yaml.org,2002:int" {
+            match parseCoreInt(raw) {
+                Some(num) { return Ok(Value.Num(num)) }
+                None { return Err(makeError(ErrorKind.Tag, &("invalid !!int scalar: " + raw), span)) }
+            }
+        }
+        if tag == "!!float" || tag == "tag:yaml.org,2002:float" {
+            match parseCoreFloat(raw) {
+                Some(num) { return Ok(Value.Num(num)) }
+                None {
+                    // YAML 1.2 !!float also accepts integer forms like !!float "42"
+                    match parseCoreInt(raw) {
+                        Some(inum) {
+                            var fnum = inum
+                            fnum.isFloat = true
+                            fnum.hasInt = false
+                            return Ok(Value.Num(fnum))
+                        }
+                        None { return Err(makeError(ErrorKind.Tag, &("invalid !!float scalar: " + raw), span)) }
+                    }
+                }
+            }
+        }
+        // Custom tags (!env, !custom, !!binary, etc.) keep raw string value
+        return Ok(Value.Str(raw.clone()))
+    }
+    if style != Style.Plain {
+        return Ok(Value.Str(raw.clone()))
+    }
+    if isCoreNull(raw) { return Ok(Value.Null) }
+    match parseCoreBool(raw) {
+        Some(b) { return Ok(Value.Bool(b)) }
+        None {}
+    }
+    match parseCoreInt(raw) {
+        Some(num) { return Ok(Value.Num(num)) }
+        None {}
+    }
+    match parseCoreFloat(raw) {
+        Some(num) { return Ok(Value.Num(num)) }
+        None {}
+    }
+    return Ok(Value.Str(raw.clone()))
+}
+
+// ---------------------------------------------------------------- JSON bridge
+
+// Converts a YAML Node to json.Json. Returns ErrorKind.JsonCompat on
+// non-string mapping keys or non-finite floats (.inf, .nan).
+pub fn toJson(n: &Node): Result[json.Json, Error] {
+    match n.value {
+        Value.Null { return Ok(json.null()) }
+        Value.Bool(b) { return Ok(json.boolean(b)) }
+        Value.Num(num) {
+            if !num.isFloat && num.hasInt {
+                return Ok(json.integer(num.i))
+            }
+            if !num.f.isFinite() {
+                return Err(makeError(ErrorKind.JsonCompat, "non-finite float cannot be converted to JSON", n.span))
+            }
+            if len(num.text) > 0 && !isBasePrefixed(&num.text) {
+                match json.numberLiteral(&num.text) {
+                    Some(jn) { return Ok(jn) }
+                    None {}
+                }
+            }
+            match num.toDecimal() {
+                Some(d) { return Ok(json.decimal(d)) }
+                None { return Ok(json.number(num.f)) }
+            }
+        }
+        Value.Str(s) { return Ok(json.string(&s)) }
+        Value.Seq(s) {
+            var out: []json.Json = []
+            for i in 0..len(s.items) {
+                append(mut &out, try toJson(&s.items[i]))
+            }
+            return Ok(json.arrayOf(out))
+        }
+        Value.Map(m) {
+            var out = json.object()
+            for i in 0..len(m.entries) {
+                let k = match m.entries[i].key.asStr() {
+                    Some(ks) { ks }
+                    None {
+                        return Err(makeError(ErrorKind.JsonCompat, &("non-string mapping key (" + m.entries[i].key.kind().toStr() + ") cannot be converted to JSON"), m.entries[i].key.span))
+                    }
+                }
+                let v = try toJson(&m.entries[i].value)
+                out.set(&k, v)
+            }
+            return Ok(out)
+        }
+    }
+}
+
+// Converts a json.Json value to a YAML Node, preserving key order and exact numbers.
+pub fn fromJson(j: &json.Json): Node {
+    match j {
+        json.Json.Null { return null() }
+        json.Json.Bool(b) { return boolean(b) }
+        json.Json.Num(n) {
+            let lit = n.literal()
+            if len(lit) > 0 {
+                match parseCoreInt(&lit) {
+                    Some(num) { return makeNode(Value.Num(num), Style.Plain) }
+                    None {}
+                }
+                match parseCoreFloat(&lit) {
+                    Some(num) { return makeNode(Value.Num(num), Style.Plain) }
+                    None {}
+                }
+            }
+            match n.toInt() {
+                Some(iv) { return integer(iv) }
+                None { return number(n.toFloat()) }
+            }
+        }
+        json.Json.Str(s) { return string(&s) }
+        json.Json.Arr(_) {
+            var out: []Node = []
+            let n = j.size()
+            for i in 0..n {
+                let it = j.item(i)
+                append(mut &out, fromJson(&it))
+            }
+            return seqOf(out)
+        }
+        json.Json.Obj(_) {
+            var out = mapping()
+            let n = j.size()
+            for i in 0..n {
+                let k = j.keyAt(i)
+                let v = j.valueAt(i)
+                out.set(&k, fromJson(&v))
+            }
+            return out
+        }
+    }
+}
+
+// ---------------------------------------------------------------- YAML 1.2 scanner
+
+type TokKind = value closed {
+    StreamStart
+    StreamEnd
+    VersionDirective
+    TagDirective
+    DocStart
+    DocEnd
+    BlockSeqStart
+    BlockMapStart
+    BlockEnd
+    FlowSeqStart
+    FlowSeqEnd
+    FlowMapStart
+    FlowMapEnd
+    BlockEntry
+    FlowEntry
+    Key
+    Value
+    Anchor
+    Alias
+    Tag
+    Scalar
+    Comment
+}
+
+type Token = value record {
+    kind: TokKind
+    val: str
+    extra: str      // TAG directive prefix, or tag handle
+    style: Style
+    span: Span
+    endLine: int
+    inline: bool        // Comment: same line as previous token
+    blankBefore: bool   // Comment: preceded by at least one blank line
+}
+
+type SimpleKey = value record {
+    possible: bool
+    required: bool
+    tokenNumber: int
+    offset: int
+    line: int
+    col: int
+    jsonLike: bool  // true after "...", '...', [...], {...} where ':' needs no trailing space
+    isFlowMap: bool // true inside {...} where multi-line simple keys are valid
+}
+
+type Scanner = record {
+    src: str
+    pos: int
+    line: int
+    col: int
+    opts: ParseOptions
+    started: bool
+    done: bool
+    flowLevel: int
+    indent: int
+    indents: []int
+    simpleKeys: []SimpleKey
+    allowSimpleKey: bool
+    tokens: []Token
+    tokHead: int
+    tokensParsed: int
+    lastTokenLine: int
+    lastTokenEndPos: int
+    adjacentValueAllowed: bool  // true after a JSON-like token in flow context
+    flowMapStack: []bool        // true for '{', false for '[' at each flow level
+    tabIndentLine: int          // line number that used a tab as leading block indentation
+    afterBlockIndicTab: bool    // true if a tab immediately followed '-', '?', or ':' on this line
+}
+
+fn newScanner(src: &str, opts: &ParseOptions): Scanner {
+    var startPos = 0
+    // Skip UTF-8 BOM if present
+    if len(src) >= 3 && src[0] == 0xEF && src[1] == 0xBB && src[2] == 0xBF {
+        startPos = 3
+    }
+    return Scanner{
+        src: src.clone(),
+        pos: startPos,
+        line: 1,
+        col: 1,
+        opts: opts.clone(),
+        started: false,
+        done: false,
+        flowLevel: 0,
+        indent: -1,
+        indents: [],
+        simpleKeys: [SimpleKey{possible: false, required: false, tokenNumber: 0, offset: 0, line: 0, col: 0, jsonLike: false, isFlowMap: false}],
+        allowSimpleKey: true,
+        tokens: [],
+        tokHead: 0,
+        tokensParsed: 0,
+        lastTokenLine: 0,
+        lastTokenEndPos: -1,
+        adjacentValueAllowed: false,
+        flowMapStack: [],
+        tabIndentLine: 0,
+        afterBlockIndicTab: false,
+    }
+}
+
+fn (sc: &Scanner) span(): Span {
+    return Span{line: sc.line, col: sc.col, offset: sc.pos}
+}
+
+fn (sc: &Scanner) eof(): bool { return sc.pos >= len(sc.src) }
+
+fn (sc: &Scanner) peekAt(off: int): byte {
+    let i = sc.pos + off
+    if i >= 0 && i < len(sc.src) { return sc.src[i] }
+    return 0
+}
+
+fn isBreakByte(c: byte): bool { return c == '\n' || c == '\r' }
+fn isBlankByte(c: byte): bool { return c == ' ' || c == '\t' }
+fn isBlankOrBreak(c: byte): bool { return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == 0 }
+fn isFlowIndic(c: byte): bool { return c == ',' || c == '[' || c == ']' || c == '{' || c == '}' }
+
+fn (sc: &Scanner) isDocMarker(ch: byte): bool {
+    if sc.col != 1 { return false }
+    if sc.pos + 3 > len(sc.src) { return false }
+    if sc.src[sc.pos] != ch || sc.src[sc.pos + 1] != ch || sc.src[sc.pos + 2] != ch { return false }
+    return isBlankOrBreak(sc.peekAt(3))
+}
+
+fn (sc: mut &Scanner) advance() {
+    if sc.pos >= len(sc.src) { return }
+    let c = sc.src[sc.pos]
+    if c == '\r' {
+        sc.pos += 1
+        if sc.pos < len(sc.src) && sc.src[sc.pos] == '\n' { sc.pos += 1 }
+        sc.line += 1
+        sc.col = 1
+    } else if c == '\n' {
+        sc.pos += 1
+        sc.line += 1
+        sc.col = 1
+    } else {
+        sc.pos += 1
+        sc.col += 1
+    }
+}
+
+fn (sc: mut &Scanner) advanceN(n: int) {
+    for _i in 0..n { sc.advance() }
+}
+
+fn (sc: &Scanner) nextTokNum(): int {
+    return sc.tokensParsed + (len(sc.tokens) - sc.tokHead)
+}
+
+fn (sc: mut &Scanner) pushTok(t: Token) {
+    append(mut &sc.tokens, t)
+}
+
+fn (sc: mut &Scanner) insertTokAt(relIdx: int, t: Token) {
+    let idx = sc.tokHead + relIdx
+    append(mut &sc.tokens, t)
+    var i = len(sc.tokens) - 1
+    while i > idx {
+        swap(mut &sc.tokens, i - 1, i)
+        i -= 1
+    }
+}
+
+fn (sc: mut &Scanner) compactTokens() {
+    if sc.tokHead > 64 && sc.tokHead * 2 >= len(sc.tokens) {
+        var next: []Token = []
+        for i in sc.tokHead..len(sc.tokens) {
+            append(mut &next, sc.tokens[i].clone())
+        }
+        replace(mut &sc.tokens, next)
+        sc.tokHead = 0
+    }
+}
+
+fn makeTok(kind: TokKind, sp: Span): Token {
+    return Token{kind: kind, val: "", extra: "", style: Style.Any, span: sp, endLine: sp.line, inline: false, blankBefore: false}
+}
+
+fn (sc: mut &Scanner) staleSimpleKeys(): Result[Unit, Error] {
+    var i = 0
+    while i < len(sc.simpleKeys) {
+        let sk = sc.simpleKeys[i]
+        let allowMultiLine = sk.isFlowMap
+        if sk.possible && ((!allowMultiLine && sk.line < sc.line) || sc.pos - sk.offset > 1024) {
+            if sk.required {
+                return Err(makeError(ErrorKind.Syntax, "could not find expected ':'", Span{line: sk.line, col: sk.col, offset: sk.offset}))
+            }
+            sc.simpleKeys[i].possible = false
+        }
+        i += 1
+    }
+    return Ok(Unit{})
+}
+
+fn (sc: mut &Scanner) saveSimpleKey(): Result[Unit, Error] {
+    let required = sc.flowLevel == 0 && sc.indent == sc.col - 1
+    if sc.allowSimpleKey {
+        try sc.removeSimpleKey()
+        let tokNum = sc.nextTokNum()
+        let inFlowMap = len(sc.flowMapStack) > 0 && sc.flowMapStack[len(sc.flowMapStack) - 1]
+        sc.simpleKeys[len(sc.simpleKeys) - 1] = SimpleKey{
+            possible: true,
+            required: required,
+            tokenNumber: tokNum,
+            offset: sc.pos,
+            line: sc.line,
+            col: sc.col,
+            jsonLike: false,
+            isFlowMap: inFlowMap,
+        }
+    }
+    return Ok(Unit{})
+}
+
+fn (sc: mut &Scanner) removeSimpleKey(): Result[Unit, Error] {
+    let last = len(sc.simpleKeys) - 1
+    if sc.simpleKeys[last].possible {
+        if sc.simpleKeys[last].required {
+            let sk = sc.simpleKeys[last]
+            return Err(makeError(ErrorKind.Syntax, "could not find expected ':'", Span{line: sk.line, col: sk.col, offset: sk.offset}))
+        }
+        sc.simpleKeys[last].possible = false
+    }
+    return Ok(Unit{})
+}
+
+fn (sc: mut &Scanner) addIndent(col: int): bool {
+    if sc.indent < col {
+        append(mut &sc.indents, sc.indent)
+        sc.indent = col
+        return true
+    }
+    return false
+}
+
+fn (sc: mut &Scanner) unwindIndent(col: int) {
+    if sc.flowLevel > 0 { return }
+    while sc.indent > col {
+        sc.indent = pop(mut &sc.indents)
+        sc.pushTok(makeTok(TokKind.BlockEnd, sc.span()))
+    }
+}
+
+fn (sc: &Scanner) needMoreTokens(): bool {
+    if sc.done { return false }
+    if sc.tokHead >= len(sc.tokens) { return true }
+    for i in 0..len(sc.simpleKeys) {
+        if sc.simpleKeys[i].possible && sc.simpleKeys[i].tokenNumber == sc.tokensParsed {
+            return true
+        }
+    }
+    return false
+}
+
+fn (sc: mut &Scanner) nextToken(): Result[Token, Error] {
+    if !sc.started {
+        sc.started = true
+        sc.pushTok(makeTok(TokKind.StreamStart, sc.span()))
+    }
+    while sc.needMoreTokens() {
+        try sc.staleSimpleKeys()
+        if !sc.needMoreTokens() { break }
+        try sc.fetchMoreTokens()
+    }
+    let tok = sc.tokens[sc.tokHead].clone()
+    sc.tokHead += 1
+    sc.tokensParsed += 1
+    sc.compactTokens()
+    return Ok(tok)
+}
+
+fn (sc: mut &Scanner) peekToken(): Result[Token, Error] {
+    if !sc.started {
+        sc.started = true
+        sc.pushTok(makeTok(TokKind.StreamStart, sc.span()))
+    }
+    while sc.needMoreTokens() {
+        try sc.staleSimpleKeys()
+        if !sc.needMoreTokens() { break }
+        try sc.fetchMoreTokens()
+    }
+    return Ok(sc.tokens[sc.tokHead].clone())
+}
+
+// Skips whitespace, line breaks, and comments to the next significant byte.
+// Emits Comment tokens when opts.comments is true.
+fn (sc: mut &Scanner) scanToNextToken(): Result[Unit, Error] {
+    var blankLines = 0
+    var seenNewline = false
+    while !sc.eof() {
+        // Track spaces on the current line
+        var sawTabInIndent = false
+        var sawTabAfterSpaces = false
+        let lineStart = sc.col == 1
+        var leadSpaces = 0
+        while !sc.eof() && sc.peekAt(0) == ' ' {
+            if lineStart { leadSpaces += 1 }
+            sc.advance()
+        }
+        // Tabs in flow context or after indentation spaces
+        while !sc.eof() && (sc.peekAt(0) == ' ' || sc.peekAt(0) == '\t') {
+            if sc.peekAt(0) == '\t' {
+                if lineStart {
+                    sawTabInIndent = true
+                } else {
+                    sawTabAfterSpaces = true
+                }
+            }
+            sc.advance()
+        }
+        if sc.eof() { break }
+        let c = sc.peekAt(0)
+        if c == '#' {
+            // '#' only starts a comment if preceded by whitespace or at start of line
+            if sc.pos == sc.lastTokenEndPos && !lineStart && !seenNewline {
+                break
+            }
+            let sp = sc.span()
+            let start = sc.pos
+            while !sc.eof() && !isBreakByte(sc.peekAt(0)) {
+                sc.advance()
+            }
+            var end = sc.pos
+            while end > start && (sc.src[end - 1] == ' ' || sc.src[end - 1] == '\t') {
+                end -= 1
+            }
+            if sc.opts.comments {
+                let isInline = !seenNewline && sc.lastTokenLine == sp.line && sc.lastTokenLine > 0
+                var ct = makeTok(TokKind.Comment, sp)
+                ct.val = sc.src[start..end].clone()
+                ct.inline = isInline
+                ct.blankBefore = blankLines > 0
+                sc.pushTok(ct)
+            }
+            blankLines = 0
+            if !sc.eof() && isBreakByte(sc.peekAt(0)) {
+                sc.advance()
+                seenNewline = true
+                sc.afterBlockIndicTab = false
+                if sc.flowLevel == 0 { sc.allowSimpleKey = true }
+            }
+        } else if isBreakByte(c) {
+            if seenNewline { blankLines += 1 }
+            sc.advance()
+            seenNewline = true
+            sc.afterBlockIndicTab = false
+            if sc.flowLevel == 0 { sc.allowSimpleKey = true }
+        } else {
+            // Check flow-context continuation line indentation
+            if lineStart && sc.flowLevel > 0 && sc.indent >= 0 {
+                if leadSpaces <= sc.indent {
+                    return Err(makeError(ErrorKind.Indent, "flow collection line must be more indented than enclosing block", sc.span()))
+                }
+            }
+            // Check illegal tab indentation in block context
+            if sawTabInIndent && sc.flowLevel == 0 {
+                sc.tabIndentLine = sc.line
+                if (c == '-' || c == '?' || c == ':') && isBlankOrBreak(sc.peekAt(1)) {
+                    return Err(makeError(ErrorKind.Indent, "tabs are not allowed as block indentation", sc.span()))
+                }
+            }
+            if sawTabAfterSpaces && sc.flowLevel == 0 && !seenNewline {
+                // Tab after '-', '?', or ':' on the same line cannot indent a nested block collection
+                if sc.afterBlockIndicTab {
+                    sc.tabIndentLine = sc.line
+                    if (c == '-' || c == '?' || c == ':') && isBlankOrBreak(sc.peekAt(1)) {
+                        return Err(makeError(ErrorKind.Indent, "tab cannot separate nested block indicators", sc.span()))
+                    }
+                }
+            }
+            if blankLines > 0 && sc.opts.comments && sc.flowLevel == 0 && sc.lastTokenLine > 0 {
+                var bt = makeTok(TokKind.Comment, sc.span())
+                bt.val = ""
+                bt.inline = false
+                bt.blankBefore = true
+                sc.pushTok(bt)
+            }
+            break
+        }
+    }
+    return Ok(Unit{})
+}
+
+fn (sc: mut &Scanner) fetchMoreTokens(): Result[Unit, Error] {
+    try sc.scanToNextToken()
+    try sc.staleSimpleKeys()
+    sc.unwindIndent(sc.col - 1)
+
+    if sc.eof() {
+        sc.unwindIndent(-1)
+        try sc.removeSimpleKey()
+        sc.allowSimpleKey = false
+        sc.done = true
+        sc.pushTok(makeTok(TokKind.StreamEnd, sc.span()))
+        return Ok(Unit{})
+    }
+
+    let c = sc.peekAt(0)
+    if c == '%' && sc.col == 1 && sc.flowLevel == 0 {
+        return sc.fetchDirective()
+    }
+    if c == '-' && sc.isDocMarker('-') {
+        return sc.fetchDocIndicator(TokKind.DocStart)
+    }
+    if c == '.' && sc.isDocMarker('.') {
+        return sc.fetchDocIndicator(TokKind.DocEnd)
+    }
+    if c == '[' { return sc.fetchFlowStart(TokKind.FlowSeqStart) }
+    if c == '{' { return sc.fetchFlowStart(TokKind.FlowMapStart) }
+    if c == ']' { return sc.fetchFlowEnd(TokKind.FlowSeqEnd) }
+    if c == '}' { return sc.fetchFlowEnd(TokKind.FlowMapEnd) }
+    if c == ',' { return sc.fetchFlowEntry() }
+    if c == '-' && isBlankOrBreak(sc.peekAt(1)) { return sc.fetchBlockEntry() }
+    if c == '?' && (isBlankOrBreak(sc.peekAt(1)) || (sc.flowLevel > 0 && isFlowIndic(sc.peekAt(1)))) { return sc.fetchKey() }
+    if c == ':' && (isBlankOrBreak(sc.peekAt(1)) || (sc.flowLevel > 0 && (isFlowIndic(sc.peekAt(1)) || sc.adjacentValueAllowed))) {
+        return sc.fetchValue()
+    }
+    sc.adjacentValueAllowed = false
+    if c == '*' { return sc.fetchAnchorOrAlias(TokKind.Alias) }
+    if c == '&' { return sc.fetchAnchorOrAlias(TokKind.Anchor) }
+    if c == '!' { return sc.fetchTag() }
+    if c == '|' && sc.flowLevel == 0 { return sc.fetchBlockScalar(false) }
+    if c == '>' && sc.flowLevel == 0 { return sc.fetchBlockScalar(true) }
+    if c == '\'' { return sc.fetchFlowScalar(true) }
+    if c == '"' { return sc.fetchFlowScalar(false) }
+
+    // Check if valid start of a plain scalar
+    if sc.canStartPlain() {
+        return sc.fetchPlainScalar()
+    }
+    return Err(makeError(ErrorKind.Syntax, &("unexpected character '" + strings.fromRune(int(c)) + "'"), sc.span()))
+}
+
+fn (sc: &Scanner) canStartPlain(): bool {
+    let c = sc.peekAt(0)
+    if c == 0 { return false }
+    if c == '-' || c == '?' || c == ':' {
+        let next = sc.peekAt(1)
+        if isBlankOrBreak(next) { return false }
+        if sc.flowLevel > 0 && isFlowIndic(next) { return false }
+        return true
+    }
+    if isBlankOrBreak(c) || isFlowIndic(c) || c == '#' || c == '&' || c == '*' || c == '!' || c == '|' || c == '>' || c == '\'' || c == '"' || c == '%' || c == '@' || c == '`' {
+        return false
+    }
+    return true
+}
+
+fn (sc: mut &Scanner) fetchDirective(): Result[Unit, Error] {
+    sc.unwindIndent(-1)
+    try sc.removeSimpleKey()
+    sc.allowSimpleKey = false
+    let sp = sc.span()
+    sc.advance() // '%'
+    let nameStart = sc.pos
+    while !sc.eof() && !isBlankOrBreak(sc.peekAt(0)) { sc.advance() }
+    let name = sc.src[nameStart..sc.pos].clone()
+    if len(name) == 0 {
+        return Err(makeError(ErrorKind.Directive, "empty directive name", sp))
+    }
+    while !sc.eof() && isBlankByte(sc.peekAt(0)) { sc.advance() }
+    if name == "YAML" {
+        let vStart = sc.pos
+        while !sc.eof() && !isBlankOrBreak(sc.peekAt(0)) { sc.advance() }
+        let ver = sc.src[vStart..sc.pos].clone()
+        // Validate X.Y
+        match strings.cut(&ver, ".") {
+            Some(c) {
+                match strings.parseIntOpt(c.before) {
+                    Some(maj) {
+                        if maj != 1 {
+                            return Err(makeError(ErrorKind.Directive, &("unsupported YAML major version: " + ver), sp))
+                        }
+                        if strings.parseIntOpt(c.after).isNone() {
+                            return Err(makeError(ErrorKind.Directive, &("invalid YAML version: " + ver), sp))
+                        }
+                    }
+                    None { return Err(makeError(ErrorKind.Directive, &("invalid YAML version: " + ver), sp)) }
+                }
+            }
+            None { return Err(makeError(ErrorKind.Directive, &("invalid YAML version: " + ver), sp)) }
+        }
+        try sc.skipDirectiveTail(sp)
+        var tok = makeTok(TokKind.VersionDirective, sp)
+        tok.val = ver
+        sc.lastTokenLine = sp.line
+        sc.pushTok(tok)
+        return Ok(Unit{})
+    }
+    if name == "TAG" {
+        let hStart = sc.pos
+        while !sc.eof() && !isBlankOrBreak(sc.peekAt(0)) { sc.advance() }
+        let handle = sc.src[hStart..sc.pos].clone()
+        if len(handle) == 0 || handle[0] != '!' {
+            return Err(makeError(ErrorKind.Directive, "invalid %TAG handle", sp))
+        }
+        while !sc.eof() && isBlankByte(sc.peekAt(0)) { sc.advance() }
+        let pStart = sc.pos
+        while !sc.eof() && !isBlankOrBreak(sc.peekAt(0)) { sc.advance() }
+        let prefix = sc.src[pStart..sc.pos].clone()
+        if len(prefix) == 0 {
+            return Err(makeError(ErrorKind.Directive, "missing %TAG prefix", sp))
+        }
+        try sc.skipDirectiveTail(sp)
+        var tok = makeTok(TokKind.TagDirective, sp)
+        tok.val = handle
+        tok.extra = prefix
+        sc.lastTokenLine = sp.line
+        sc.pushTok(tok)
+        return Ok(Unit{})
+    }
+    // Reserved directives are ignored in YAML 1.2 (skip to end of line)
+    while !sc.eof() && !isBreakByte(sc.peekAt(0)) { sc.advance() }
+    if !sc.eof() { sc.advance() }
+    sc.lastTokenLine = sp.line
+    return Ok(Unit{})
+}
+
+fn (sc: mut &Scanner) skipDirectiveTail(sp: Span): Result[Unit, Error] {
+    while !sc.eof() && isBlankByte(sc.peekAt(0)) { sc.advance() }
+    if !sc.eof() && sc.peekAt(0) == '#' {
+        while !sc.eof() && !isBreakByte(sc.peekAt(0)) { sc.advance() }
+    }
+    if !sc.eof() && !isBreakByte(sc.peekAt(0)) {
+        return Err(makeError(ErrorKind.Directive, "unexpected trailing content on directive line", sp))
+    }
+    if !sc.eof() { sc.advance() }
+    return Ok(Unit{})
+}
+
+fn (sc: mut &Scanner) fetchDocIndicator(kind: TokKind): Result[Unit, Error] {
+    sc.unwindIndent(-1)
+    try sc.removeSimpleKey()
+    sc.allowSimpleKey = false
+    let sp = sc.span()
+    sc.advanceN(3)
+    if kind == TokKind.DocEnd {
+        // Nothing except spaces/tabs and an optional comment may follow '...' on the same line
+        let savedPos = sc.pos
+        let savedLine = sc.line
+        let savedCol = sc.col
+        while !sc.eof() && isBlankByte(sc.peekAt(0)) { sc.advance() }
+        if !sc.eof() && !isBreakByte(sc.peekAt(0)) && sc.peekAt(0) != '#' {
+            return Err(makeError(ErrorKind.Syntax, "unexpected content after '...' on the same line", sc.span()))
+        }
+        sc.pos = savedPos
+        sc.line = savedLine
+        sc.col = savedCol
+    }
+    sc.lastTokenLine = sp.line
+    sc.lastTokenEndPos = sc.pos
+    sc.pushTok(makeTok(kind, sp))
+    return Ok(Unit{})
+}
+
+fn (sc: mut &Scanner) fetchFlowStart(kind: TokKind): Result[Unit, Error] {
+    try sc.saveSimpleKey()
+    if sc.flowLevel >= sc.opts.maxDepth {
+        return Err(makeError(ErrorKind.Depth, "flow collection nesting depth exceeded", sc.span()))
+    }
+    sc.flowLevel += 1
+    let isMap = kind == TokKind.FlowMapStart
+    append(mut &sc.flowMapStack, isMap)
+    append(mut &sc.simpleKeys, SimpleKey{possible: false, required: false, tokenNumber: 0, offset: 0, line: 0, col: 0, jsonLike: false, isFlowMap: isMap})
+    sc.allowSimpleKey = true
+    sc.adjacentValueAllowed = false
+    let sp = sc.span()
+    sc.advance()
+    sc.lastTokenLine = sp.line
+    sc.lastTokenEndPos = sc.pos
+    sc.pushTok(makeTok(kind, sp))
+    return Ok(Unit{})
+}
+
+fn (sc: mut &Scanner) fetchFlowEnd(kind: TokKind): Result[Unit, Error] {
+    try sc.removeSimpleKey()
+    if sc.flowLevel == 0 {
+        return Err(makeError(ErrorKind.Syntax, "unexpected closing flow bracket", sc.span()))
+    }
+    sc.flowLevel -= 1
+    let _dropped = pop(mut &sc.simpleKeys)
+    if len(sc.flowMapStack) > 0 { let _fm = pop(mut &sc.flowMapStack) }
+    sc.allowSimpleKey = false
+    let sp = sc.span()
+    sc.advance()
+    sc.lastTokenLine = sp.line
+    sc.lastTokenEndPos = sc.pos
+    sc.adjacentValueAllowed = true
+    let top = len(sc.simpleKeys) - 1
+    if sc.simpleKeys[top].possible { sc.simpleKeys[top].jsonLike = true }
+    sc.pushTok(makeTok(kind, sp))
+    return Ok(Unit{})
+}
+
+fn (sc: mut &Scanner) fetchFlowEntry(): Result[Unit, Error] {
+    try sc.removeSimpleKey()
+    sc.allowSimpleKey = true
+    sc.adjacentValueAllowed = false
+    let sp = sc.span()
+    sc.advance()
+    sc.lastTokenLine = sp.line
+    sc.lastTokenEndPos = sc.pos
+    sc.pushTok(makeTok(TokKind.FlowEntry, sp))
+    return Ok(Unit{})
+}
+
+fn (sc: mut &Scanner) fetchBlockEntry(): Result[Unit, Error] {
+    let sp = sc.span()
+    if sc.flowLevel == 0 {
+        if !sc.allowSimpleKey {
+            return Err(makeError(ErrorKind.Syntax, "sequence entries are not allowed here", sp))
+        }
+        if sc.addIndent(sc.col - 1) {
+            sc.pushTok(makeTok(TokKind.BlockSeqStart, sp))
+        }
+    }
+    try sc.removeSimpleKey()
+    sc.allowSimpleKey = true
+    sc.advance()
+    sc.afterBlockIndicTab = true
+    sc.lastTokenLine = sp.line
+    sc.lastTokenEndPos = sc.pos
+    sc.pushTok(makeTok(TokKind.BlockEntry, sp))
+    return Ok(Unit{})
+}
+
+fn (sc: mut &Scanner) fetchKey(): Result[Unit, Error] {
+    let sp = sc.span()
+    if sc.flowLevel == 0 {
+        if !sc.allowSimpleKey {
+            return Err(makeError(ErrorKind.Syntax, "mapping keys are not allowed here", sp))
+        }
+        if sc.addIndent(sc.col - 1) {
+            sc.pushTok(makeTok(TokKind.BlockMapStart, sp))
+        }
+    }
+    try sc.removeSimpleKey()
+    sc.allowSimpleKey = sc.flowLevel == 0
+    sc.advance()
+    sc.afterBlockIndicTab = sc.flowLevel == 0
+    sc.lastTokenLine = sp.line
+    sc.lastTokenEndPos = sc.pos
+    sc.pushTok(makeTok(TokKind.Key, sp))
+    return Ok(Unit{})
+}
+
+fn (sc: mut &Scanner) fetchValue(): Result[Unit, Error] {
+    let sp = sc.span()
+    sc.adjacentValueAllowed = false
+    let top = len(sc.simpleKeys) - 1
+    let sk = sc.simpleKeys[top]
+    if sk.possible {
+        if sc.flowLevel == 0 && sk.line == sc.tabIndentLine {
+            return Err(makeError(ErrorKind.Indent, "tabs are not allowed as block mapping indentation", Span{line: sk.line, col: sk.col, offset: sk.offset}))
+        }
+        let skSpan = Span{line: sk.line, col: sk.col, offset: sk.offset}
+        let rel = sk.tokenNumber - sc.tokensParsed
+        sc.insertTokAt(rel, makeTok(TokKind.Key, skSpan))
+        if sc.flowLevel == 0 {
+            if sc.addIndent(sk.col - 1) {
+                sc.insertTokAt(rel, makeTok(TokKind.BlockMapStart, skSpan))
+            }
+        }
+        sc.simpleKeys[top].possible = false
+        sc.allowSimpleKey = false
+    } else {
+        if sc.flowLevel == 0 {
+            if !sc.allowSimpleKey {
+                return Err(makeError(ErrorKind.Syntax, "mapping values are not allowed here", sp))
+            }
+            if sc.addIndent(sc.col - 1) {
+                sc.pushTok(makeTok(TokKind.BlockMapStart, sp))
+            }
+        }
+        sc.allowSimpleKey = sc.flowLevel == 0
+    }
+    sc.advance()
+    sc.afterBlockIndicTab = sc.flowLevel == 0
+    sc.lastTokenLine = sp.line
+    sc.lastTokenEndPos = sc.pos
+    sc.pushTok(makeTok(TokKind.Value, sp))
+    return Ok(Unit{})
+}
+
+fn (sc: mut &Scanner) fetchAnchorOrAlias(kind: TokKind): Result[Unit, Error] {
+    try sc.saveSimpleKey()
+    sc.allowSimpleKey = false
+    let sp = sc.span()
+    sc.advance() // '&' or '*'
+    let start = sc.pos
+    while !sc.eof() && !isBlankOrBreak(sc.peekAt(0)) && !isFlowIndic(sc.peekAt(0)) {
+        sc.advance()
+    }
+    let name = sc.src[start..sc.pos].clone()
+    if len(name) == 0 {
+        return Err(makeError(ErrorKind.Anchor, "empty anchor or alias name", sp))
+    }
+    var tok = makeTok(kind, sp)
+    tok.val = name
+    sc.lastTokenLine = sp.line
+    sc.pushTok(tok)
+    return Ok(Unit{})
+}
+
+fn (sc: mut &Scanner) fetchTag(): Result[Unit, Error] {
+    try sc.saveSimpleKey()
+    sc.allowSimpleKey = false
+    let sp = sc.span()
+    sc.advance() // '!'
+    var tok = makeTok(TokKind.Tag, sp)
+    if !sc.eof() && sc.peekAt(0) == '<' {
+        // Verbatim tag !<uri>
+        sc.advance()
+        let start = sc.pos
+        while !sc.eof() && sc.peekAt(0) != '>' && !isBlankOrBreak(sc.peekAt(0)) {
+            sc.advance()
+        }
+        if sc.eof() || sc.peekAt(0) != '>' {
+            return Err(makeError(ErrorKind.Tag, "unterminated verbatim tag", sp))
+        }
+        tok.val = sc.src[start..sc.pos].clone()
+        tok.extra = "" // verbatim
+        sc.advance() // '>'
+    } else {
+        // Handle + suffix: !, !!str, !foo, !e!bar
+        let start = sc.pos - 1
+        while !sc.eof() && !isBlankOrBreak(sc.peekAt(0)) && !isFlowIndic(sc.peekAt(0)) {
+            sc.advance()
+        }
+        let raw = sc.src[start..sc.pos].clone()
+        tok.val = raw
+        tok.extra = "shorthand"
+    }
+    sc.lastTokenLine = sp.line
+    sc.pushTok(tok)
+    return Ok(Unit{})
+}
+
+// Scans a literal ('|') or folded ('>') block scalar.
+fn (sc: mut &Scanner) fetchBlockScalar(folded: bool): Result[Unit, Error] {
+    try sc.removeSimpleKey()
+    sc.allowSimpleKey = true
+    let sp = sc.span()
+    sc.advance() // '|' or '>'
+
+    var chomp = 0       // 0 = clip, -1 = strip (-), 1 = keep (+)
+    var explicitIndent = 0
+    while !sc.eof() {
+        let c = sc.peekAt(0)
+        if (c == '-' || c == '+') && chomp == 0 {
+            chomp = if c == '-' { -1 } else { 1 }
+            sc.advance()
+        } else if c >= '1' && c <= '9' && explicitIndent == 0 {
+            explicitIndent = int(c - '0')
+            sc.advance()
+        } else {
+            break
+        }
+    }
+    var sawHeaderBlank = false
+    while !sc.eof() && isBlankByte(sc.peekAt(0)) {
+        sawHeaderBlank = true
+        sc.advance()
+    }
+    var headerComment = ""
+    var headerCommentSpan = noSpan()
+    if !sc.eof() && sc.peekAt(0) == '#' {
+        if !sawHeaderBlank {
+            return Err(makeError(ErrorKind.Scalar, "comment after block scalar header requires preceding space", sc.span()))
+        }
+        headerCommentSpan = sc.span()
+        let cs = sc.pos
+        while !sc.eof() && !isBreakByte(sc.peekAt(0)) { sc.advance() }
+        var ce = sc.pos
+        while ce > cs && (sc.src[ce - 1] == ' ' || sc.src[ce - 1] == '\t') { ce -= 1 }
+        headerComment = sc.src[cs..ce].clone()
+    }
+    if !sc.eof() && !isBreakByte(sc.peekAt(0)) {
+        return Err(makeError(ErrorKind.Scalar, "unexpected character in block scalar header", sc.span()))
+    }
+    if !sc.eof() { sc.advance() }
+
+    let minIndent = if sc.indent >= 0 { sc.indent + 1 } else { 0 }
+    var blockIndent = if explicitIndent > 0 {
+        (if sc.indent >= 0 { sc.indent } else { 0 }) + explicitIndent
+    } else {
+        0
+    }
+
+    // Read leading blank lines and auto-detect indentation if not explicit.
+    var leadingBreaks = ""
+    var maxEmptySpaces = 0
+    var maxEmptySpan = sp
+    var foundContent = false
+    while !sc.eof() {
+        let savedPos = sc.pos
+        let savedLine = sc.line
+        let savedCol = sc.col
+        var spaces = 0
+        while !sc.eof() && sc.peekAt(0) == ' ' && (blockIndent == 0 || spaces < blockIndent) {
+            spaces += 1
+            sc.advance()
+        }
+        if sc.eof() {
+            if blockIndent == 0 && spaces > maxEmptySpaces {
+                maxEmptySpaces = spaces
+                maxEmptySpan = Span{line: savedLine, col: savedCol, offset: savedPos}
+            }
+            if spaces > 0 && chomp == 1 {
+                leadingBreaks.addByte('\n')
+            }
+            break
+        }
+        if isBreakByte(sc.peekAt(0)) {
+            if blockIndent == 0 && spaces > maxEmptySpaces {
+                maxEmptySpaces = spaces
+                maxEmptySpan = Span{line: savedLine, col: savedCol, offset: savedPos}
+            }
+            leadingBreaks.addByte('\n')
+            sc.advance()
+        } else {
+            // Check document marker at column 1 when minIndent == 0
+            if spaces == 0 && (sc.isDocMarker('-') || sc.isDocMarker('.')) {
+                sc.pos = savedPos
+                sc.line = savedLine
+                sc.col = savedCol
+                break
+            }
+            // Reject tab used as indentation before block content
+            if sc.peekAt(0) == '\t' && spaces < minIndent {
+                return Err(makeError(ErrorKind.Indent, "tab cannot be used as block scalar indentation", sc.span()))
+            }
+            // Non-blank line!
+            if blockIndent == 0 {
+                if spaces < minIndent {
+                    sc.pos = savedPos
+                    sc.line = savedLine
+                    sc.col = savedCol
+                    break
+                }
+                if maxEmptySpaces > spaces {
+                    return Err(makeError(ErrorKind.Indent, "leading all-spaces line has more spaces than block scalar content", maxEmptySpan))
+                }
+                blockIndent = spaces
+                foundContent = true
+                break
+            } else {
+                if spaces < blockIndent {
+                    sc.pos = savedPos
+                    sc.line = savedLine
+                    sc.col = savedCol
+                    break
+                }
+                foundContent = true
+                break
+            }
+        }
+    }
+
+    var out = ""
+    var endLine = sp.line
+    if !foundContent {
+        // Empty block scalar: only '+' keep chomp retains leading breaks
+        if chomp == 1 { out += &leadingBreaks }
+    } else {
+        out += &leadingBreaks
+        var breaks = ""
+        var prevMoreIndented = false
+        var firstLine = true
+
+        while true {
+            // Current position is right after `blockIndent` spaces on a content line.
+            let lineMoreIndented = !sc.eof() && (sc.peekAt(0) == ' ' || sc.peekAt(0) == '\t')
+            if !firstLine {
+                if folded && !prevMoreIndented && !lineMoreIndented {
+                    if len(breaks) == 1 {
+                        out.addByte(' ')
+                    } else if len(breaks) > 1 {
+                        // k breaks -> k-1 newlines
+                        out += breaks[1..]
+                    }
+                } else {
+                    out += &breaks
+                }
+            }
+            firstLine = false
+            prevMoreIndented = lineMoreIndented
+            breaks.clear()
+
+            let ls = sc.pos
+            while !sc.eof() && !isBreakByte(sc.peekAt(0)) {
+                sc.advance()
+            }
+            out += sc.src[ls..sc.pos]
+            endLine = sc.line
+            if !sc.eof() && isBreakByte(sc.peekAt(0)) {
+                breaks.addByte('\n')
+                sc.advance()
+            }
+
+            // Scan ahead through blank lines to see if another content line belongs to this block
+            var hasNext = false
+            while !sc.eof() {
+                let savedPos = sc.pos
+                let savedLine = sc.line
+                let savedCol = sc.col
+                var spaces = 0
+                while !sc.eof() && sc.peekAt(0) == ' ' && spaces < blockIndent {
+                    spaces += 1
+                    sc.advance()
+                }
+                if sc.eof() {
+                    break
+                }
+                if isBreakByte(sc.peekAt(0)) {
+                    breaks.addByte('\n')
+                    sc.advance()
+                } else if spaces == 0 && (sc.isDocMarker('-') || sc.isDocMarker('.')) {
+                    sc.pos = savedPos
+                    sc.line = savedLine
+                    sc.col = savedCol
+                    break
+                } else if spaces < blockIndent {
+                    // Rewind: next line is less indented, ends block scalar
+                    sc.pos = savedPos
+                    sc.line = savedLine
+                    sc.col = savedCol
+                    break
+                } else {
+                    hasNext = true
+                    break
+                }
+            }
+            if !hasNext {
+                // Apply chomping to trailing breaks (at EOF with content, YAML 1.2 clip appends '\n')
+                if chomp == 0 {
+                    if len(breaks) > 0 || (sc.eof() && len(out) > 0) { out.addByte('\n') }
+                } else if chomp == 1 {
+                    if len(breaks) > 0 {
+                        out += &breaks
+                    } else if sc.eof() && len(out) > 0 {
+                        out.addByte('\n')
+                    }
+                }
+                // strip (-1): drop all trailing breaks
+                break
+            }
+        }
+    }
+
+    var tok = makeTok(TokKind.Scalar, sp)
+    tok.val = out
+    tok.style = if folded { Style.Folded } else { Style.Literal }
+    tok.endLine = endLine
+    sc.lastTokenLine = endLine
+    sc.lastTokenEndPos = sc.pos
+    sc.pushTok(tok)
+
+    if len(headerComment) > 0 && sc.opts.comments {
+        var ct = makeTok(TokKind.Comment, headerCommentSpan)
+        ct.val = headerComment
+        ct.inline = true
+        sc.pushTok(ct)
+    }
+    return Ok(Unit{})
+}
+
+// Scans a single-quoted ('...') or double-quoted ("...") flow scalar.
+fn (sc: mut &Scanner) fetchFlowScalar(single: bool): Result[Unit, Error] {
+    try sc.saveSimpleKey()
+    sc.allowSimpleKey = false
+    let sp = sc.span()
+    sc.advance() // opening quote
+
+    var out = ""
+    var lastEscapedLen = 0
+    while !sc.eof() {
+        let c = sc.peekAt(0)
+        if single {
+            if c == '\'' {
+                if sc.peekAt(1) == '\'' {
+                    out.addByte('\'')
+                    sc.advanceN(2)
+                    continue
+                }
+                sc.advance()
+                var tok = makeTok(TokKind.Scalar, sp)
+                tok.val = out
+                tok.style = Style.Single
+                tok.endLine = sc.line
+                sc.lastTokenLine = sc.line
+                sc.lastTokenEndPos = sc.pos
+                sc.adjacentValueAllowed = true
+                let top = len(sc.simpleKeys) - 1
+                if sc.simpleKeys[top].possible { sc.simpleKeys[top].jsonLike = true }
+                sc.pushTok(tok)
+                return Ok(Unit{})
+            }
+        } else {
+            if c == '"' {
+                sc.advance()
+                var tok = makeTok(TokKind.Scalar, sp)
+                tok.val = out
+                tok.style = Style.Double
+                tok.endLine = sc.line
+                sc.lastTokenLine = sc.line
+                sc.lastTokenEndPos = sc.pos
+                sc.adjacentValueAllowed = true
+                let top = len(sc.simpleKeys) - 1
+                if sc.simpleKeys[top].possible { sc.simpleKeys[top].jsonLike = true }
+                sc.pushTok(tok)
+                return Ok(Unit{})
+            }
+            if c == '\\' {
+                let escSpan = sc.span()
+                sc.advance()
+                if sc.eof() {
+                    return Err(makeError(ErrorKind.Escape, "unterminated escape sequence", escSpan))
+                }
+                let e = sc.peekAt(0)
+                if isBreakByte(e) {
+                    // Escaped line break: skip break and leading spaces/tabs on next line
+                    sc.advance()
+                    while !sc.eof() && isBlankByte(sc.peekAt(0)) { sc.advance() }
+                    lastEscapedLen = len(out)
+                    continue
+                }
+                try decodeDoubleEscape(sc, mut &out, escSpan)
+                lastEscapedLen = len(out)
+                continue
+            }
+        }
+
+        if isBreakByte(c) {
+            // Trim unescaped trailing spaces/tabs before a raw line break
+            out = trimTrailingBlanksMin(&out, lastEscapedLen)
+            var breaks = 0
+            var contSpaces = 0
+            var contSawTabBeforeIndent = false
+            while !sc.eof() {
+                if isBreakByte(sc.peekAt(0)) {
+                    breaks += 1
+                    sc.advance()
+                    contSpaces = 0
+                    contSawTabBeforeIndent = false
+                    while !sc.eof() && sc.peekAt(0) == ' ' {
+                        contSpaces += 1
+                        sc.advance()
+                    }
+                    if !sc.eof() && sc.peekAt(0) == '\t' && sc.flowLevel == 0 && sc.indent >= 0 && contSpaces <= sc.indent {
+                        contSawTabBeforeIndent = true
+                    }
+                    while !sc.eof() && isBlankByte(sc.peekAt(0)) { sc.advance() }
+                } else {
+                    break
+                }
+            }
+            if sc.eof() {
+                return Err(makeError(ErrorKind.Eof, "unterminated quoted string", sp))
+            }
+            if sc.flowLevel == 0 && sc.indent >= 0 {
+                if contSawTabBeforeIndent || contSpaces <= sc.indent {
+                    return Err(makeError(ErrorKind.Indent, "quoted scalar continuation line must be more indented than enclosing block", sc.span()))
+                }
+            }
+            if sc.col == 1 && (sc.isDocMarker('-') || sc.isDocMarker('.')) {
+                return Err(makeError(ErrorKind.Scalar, "document marker inside quoted string", sc.span()))
+            }
+            if breaks == 1 {
+                out.addByte(' ')
+            } else {
+                for _k in 1..breaks { out.addByte('\n') }
+            }
+        } else if isBlankByte(c) {
+            // Copy blanks, but check if they immediately precede a line break
+            let bs = sc.pos
+            while !sc.eof() && isBlankByte(sc.peekAt(0)) { sc.advance() }
+            if !sc.eof() && isBreakByte(sc.peekAt(0)) {
+                // Drop trailing blanks before break; next iteration handles the break
+            } else {
+                out += sc.src[bs..sc.pos]
+            }
+        } else {
+            out.addByte(c)
+            sc.advance()
+        }
+    }
+    return Err(makeError(ErrorKind.Eof, "unterminated quoted string", sp))
+}
+
+fn trimTrailingBlanksMin(s: &str, minLen: int): str {
+    var n = len(s)
+    while n > minLen && (s[n - 1] == ' ' || s[n - 1] == '\t') { n -= 1 }
+    return s[..n].clone()
+}
+
+fn decodeDoubleEscape(sc: mut &Scanner, out: mut &str, escSpan: Span): Result[Unit, Error] {
+    let c = sc.peekAt(0)
+    sc.advance()
+    if c == '0' { out.addByte(0) }
+    else if c == 'a' { out.addByte(7) }
+    else if c == 'b' { out.addByte(8) }
+    else if c == 't' || c == '\t' { out.addByte(9) }
+    else if c == 'n' { out.addByte(10) }
+    else if c == 'v' { out.addByte(11) }
+    else if c == 'f' { out.addByte(12) }
+    else if c == 'r' { out.addByte(13) }
+    else if c == 'e' { out.addByte(27) }
+    else if c == ' ' { out.addByte(' ') }
+    else if c == '"' { out.addByte('"') }
+    else if c == '/' { out.addByte('/') }
+    else if c == '\\' { out.addByte('\\') }
+    else if c == 'N' { json.addCodePoint(out, 0x85) }
+    else if c == '_' { json.addCodePoint(out, 0xA0) }
+    else if c == 'L' { json.addCodePoint(out, 0x2028) }
+    else if c == 'P' { json.addCodePoint(out, 0x2029) }
+    else if c == 'x' || c == 'u' || c == 'U' {
+        let count = if c == 'x' { 2 } else if c == 'u' { 4 } else { 8 }
+        var cp = 0
+        for _i in 0..count {
+            if sc.eof() {
+                return Err(makeError(ErrorKind.Escape, "truncated hex escape", escSpan))
+            }
+            let d = hexDigit(sc.peekAt(0))
+            if d < 0 {
+                return Err(makeError(ErrorKind.Escape, "invalid hex digit in escape", escSpan))
+            }
+            cp = cp * 16 + d
+            sc.advance()
+        }
+        if cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) {
+            return Err(makeError(ErrorKind.Unicode, "invalid Unicode scalar value in escape", escSpan))
+        }
+        json.addCodePoint(out, cp)
+    } else {
+        return Err(makeError(ErrorKind.Escape, "unknown escape sequence", escSpan))
+    }
+    return Ok(Unit{})
+}
+
+// Scans a plain (unquoted) scalar, supporting YAML 1.2 multi-line folding.
+fn (sc: mut &Scanner) fetchPlainScalar(): Result[Unit, Error] {
+    try sc.saveSimpleKey()
+    sc.allowSimpleKey = false
+    let sp = sc.span()
+    let minIndent = sc.indent + 1
+    var out = ""
+    var spaces = ""
+    var breaks = ""
+    var endLine = sp.line
+
+    while !sc.eof() {
+        if sc.peekAt(0) == '#' { break }
+        while !sc.eof() {
+            let c = sc.peekAt(0)
+            if isBlankOrBreak(c) { break }
+            if c == ':' {
+                let next = sc.peekAt(1)
+                if isBlankOrBreak(next) || (sc.flowLevel > 0 && isFlowIndic(next)) { break }
+            }
+            if sc.flowLevel > 0 && isFlowIndic(c) { break }
+
+            // Flush pending whitespace/breaks before appending content
+            if len(breaks) > 0 {
+                if len(breaks) == 1 {
+                    out.addByte(' ')
+                } else {
+                    out += breaks[1..]
+                }
+                breaks.clear()
+                spaces.clear()
+            } else if len(spaces) > 0 {
+                out += &spaces
+                spaces.clear()
+            }
+            out.addByte(c)
+            endLine = sc.line
+            sc.advance()
+        }
+
+        // Check for whitespace / line breaks that might continue the plain scalar
+        if sc.eof() || !isBlankOrBreak(sc.peekAt(0)) { break }
+
+        let savedPos = sc.pos
+        let savedLine = sc.line
+        let savedCol = sc.col
+        spaces.clear()
+        breaks.clear()
+        while !sc.eof() && isBlankOrBreak(sc.peekAt(0)) {
+            let c = sc.peekAt(0)
+            if isBlankByte(c) {
+                if len(breaks) == 0 { spaces.addByte(c) }
+                sc.advance()
+            } else {
+                breaks.addByte('\n')
+                sc.advance()
+            }
+        }
+        if sc.eof() {
+            // Rewind trailing breaks? No, trailing spaces/breaks at EOF don't matter,
+            // except if we want to leave comments/breaks for scanToNextToken: rewind!
+            sc.pos = savedPos
+            sc.line = savedLine
+            sc.col = savedCol
+            break
+        }
+        // If we crossed a newline, check if continuation is still inside this plain scalar
+        if len(breaks) > 0 {
+            if sc.col == 1 && (sc.isDocMarker('-') || sc.isDocMarker('.')) {
+                sc.pos = savedPos
+                sc.line = savedLine
+                sc.col = savedCol
+                break
+            }
+            if sc.flowLevel == 0 && sc.col - 1 < minIndent {
+                sc.pos = savedPos
+                sc.line = savedLine
+                sc.col = savedCol
+                break
+            }
+            let nc = sc.peekAt(0)
+            if nc == '#' {
+                sc.pos = savedPos
+                sc.line = savedLine
+                sc.col = savedCol
+                break
+            }
+            if nc == ':' && (isBlankOrBreak(sc.peekAt(1)) || (sc.flowLevel > 0 && isFlowIndic(sc.peekAt(1)))) {
+                sc.pos = savedPos
+                sc.line = savedLine
+                sc.col = savedCol
+                break
+            }
+            if sc.flowLevel > 0 && isFlowIndic(nc) {
+                sc.pos = savedPos
+                sc.line = savedLine
+                sc.col = savedCol
+                break
+            }
+            // Valid continuation line: plain scalar spans multiple lines, so not a simple key anymore
+            if sc.flowLevel == 0 {
+                // Keep scanning
+            }
+        } else {
+            // Same line: check if '#' or ':' or flow indicator ends the scalar
+            let nc = sc.peekAt(0)
+            if nc == '#' {
+                sc.pos = savedPos
+                sc.line = savedLine
+                sc.col = savedCol
+                break
+            }
+            if nc == ':' && (isBlankOrBreak(sc.peekAt(1)) || (sc.flowLevel > 0 && isFlowIndic(sc.peekAt(1)))) {
+                sc.pos = savedPos
+                sc.line = savedLine
+                sc.col = savedCol
+                break
+            }
+            if sc.flowLevel > 0 && isFlowIndic(nc) {
+                sc.pos = savedPos
+                sc.line = savedLine
+                sc.col = savedCol
+                break
+            }
+        }
+    }
+
+    var tok = makeTok(TokKind.Scalar, sp)
+    tok.val = out
+    tok.style = Style.Plain
+    tok.endLine = endLine
+    sc.lastTokenLine = endLine
+    sc.pushTok(tok)
+    return Ok(Unit{})
+}
+
+// ---------------------------------------------------------------- pull event parser
+
+pub type EventKind = value closed {
+    StreamStart
+    StreamEnd
+    DocStart
+    DocEnd
+    MapStart
+    MapEnd
+    SeqStart
+    SeqEnd
+    Scalar
+    Alias
+    Comment
+}
+
+pub fn (k: EventKind) toStr(): str {
+    return match k {
+        EventKind.StreamStart { "stream-start" }
+        EventKind.StreamEnd { "stream-end" }
+        EventKind.DocStart { "doc-start" }
+        EventKind.DocEnd { "doc-end" }
+        EventKind.MapStart { "map-start" }
+        EventKind.MapEnd { "map-end" }
+        EventKind.SeqStart { "seq-start" }
+        EventKind.SeqEnd { "seq-end" }
+        EventKind.Scalar { "scalar" }
+        EventKind.Alias { "alias" }
+        EventKind.Comment { "comment" }
+    }
+}
+
+pub type Event = value record {
+    pub kind: EventKind
+    pub val: str
+    pub anchor: str
+    pub tag: str
+    pub style: Style
+    pub span: Span
+    pub endLine: int
+    pub explicit: bool      // DocStart (---) / DocEnd (...)
+    pub inline: bool        // Comment: on same line as previous token
+    pub blankBefore: bool   // Comment: preceded by a blank line
+    pub version: str        // DocStart: %YAML version if declared
+}
+
+fn makeEvent(kind: EventKind, sp: Span): Event {
+    return Event{
+        kind: kind,
+        val: "",
+        anchor: "",
+        tag: "",
+        style: Style.Any,
+        span: sp,
+        endLine: sp.line,
+        explicit: false,
+        inline: false,
+        blankBefore: false,
+        version: "",
+    }
+}
+
+type PState = value closed {
+    StreamStart
+    ImplicitDocStart
+    DocStart
+    DocContent
+    DocEnd
+    BlockNode
+    BlockNodeOrIndentlessSeq
+    FlowNode
+    BlockSeqFirstEntry
+    BlockSeqEntry
+    BlockSeqAfterEntry
+    IndentlessSeqEntry
+    IndentlessSeqAfterEntry
+    BlockMapFirstKey
+    BlockMapKey
+    BlockMapAfterKey
+    BlockMapValue
+    BlockMapAfterValue
+    FlowSeqFirstEntry
+    FlowSeqEntry
+    FlowSeqAfterComma
+    FlowSeqEntryMapKey
+    FlowSeqEntryMapAfterKey
+    FlowSeqEntryMapValue
+    FlowSeqEntryMapAfterValue
+    FlowSeqEntryMapEnd
+    FlowMapFirstKey
+    FlowMapKey
+    FlowMapAfterComma
+    FlowMapAfterKey
+    FlowMapValue
+    FlowMapAfterValue
+    FlowMapEmptyValue
+    Done
+}
+
+pub type EventParser = record {
+    sc: Scanner
+    state: PState
+    states: []PState
+    depth: int
+    tagHandles: Map[str, str]
+    docVersion: str
+    hasDirectives: bool
+    prevDocExplicitEnd: bool
+    seenAnyDoc: bool
+    pendingAnchor: str
+    pendingTag: str
+    hasProps: bool
+    propsSpan: Span
+}
+
+pub fn events(src: &str): EventParser {
+    return eventsWith(src, &parseDefaults())
+}
+
+pub fn eventsWith(src: &str, opts: &ParseOptions): EventParser {
+    return EventParser{
+        sc: newScanner(src, opts),
+        state: PState.StreamStart,
+        states: [],
+        depth: 0,
+        tagHandles: defaultTagHandles(),
+        docVersion: "",
+        hasDirectives: false,
+        prevDocExplicitEnd: false,
+        seenAnyDoc: false,
+        pendingAnchor: "",
+        pendingTag: "",
+        hasProps: false,
+        propsSpan: noSpan(),
+    }
+}
+
+fn defaultTagHandles(): Map[str, str] {
+    var m: Map[str, str] = newMap()
+    m.put("!", "!")
+    m.put("!!", "tag:yaml.org,2002:")
+    return m
+}
+
+fn (p: mut &EventParser) popState() {
+    if len(p.states) == 0 {
+        p.state = PState.Done
+    } else {
+        p.state = pop(mut &p.states)
+    }
+}
+
+fn (p: mut &EventParser) pushState(st: PState) {
+    append(mut &p.states, st)
+}
+
+fn (p: mut &EventParser) resolveTagToken(raw: &str, extra: &str, sp: Span): Result[str, Error] {
+    if len(extra) == 0 {
+        // Verbatim !<uri>
+        return Ok(raw.clone())
+    }
+    // Primary '!', secondary '!!', or named '!handle!'
+    if raw == "!" { return Ok("!".clone()) }
+    if strings.startsWith(raw, "!!") {
+        // Keep short "!!str", "!!int", etc. unless overridden by custom %TAG !!
+        match p.tagHandles.find("!!") {
+            Some(pref) {
+                if pref == "tag:yaml.org,2002:" {
+                    return Ok(raw.clone())
+                }
+                return Ok(pref + raw[2..])
+            }
+            None { return Ok(raw.clone()) }
+        }
+    }
+    // Check named handle !name!suffix
+    let secondBang = strings.indexOf(raw, "!", 1)
+    if secondBang > 0 {
+        let handle = raw[..secondBang + 1]
+        let suffix = raw[secondBang + 1..]
+        match p.tagHandles.find(handle) {
+            Some(pref) { return Ok(pref + suffix) }
+            None { return Err(makeError(ErrorKind.Tag, &("undefined tag handle " + handle), sp)) }
+        }
+    }
+    // Local tag !foo (uses '!' handle)
+    match p.tagHandles.find("!") {
+        Some(pref) {
+            if pref == "!" { return Ok(raw.clone()) }
+            return Ok(pref + raw[1..])
+        }
+        None { return Ok(raw.clone()) }
+    }
+}
+
+fn (p: mut &EventParser) enterCollection(sp: Span): Result[Unit, Error] {
+    p.depth += 1
+    if p.depth > p.sc.opts.maxDepth {
+        return Err(makeError(ErrorKind.Depth, "maximum nesting depth exceeded", sp))
+    }
+    return Ok(Unit{})
+}
+
+fn (p: mut &EventParser) leaveCollection() {
+    if p.depth > 0 { p.depth -= 1 }
+}
+
+// Pulls the next YAML Event; returns Ok(None) after StreamEnd.
+pub fn (p: mut &EventParser) next(): Result[Option[Event], Error] {
+    while true {
+        if p.state == PState.Done { return Ok(None) }
+        let tok = try p.sc.peekToken()
+        // Pass Comment tokens straight through without disturbing parser state
+        if tok.kind == TokKind.Comment {
+            let ct = try p.sc.nextToken()
+            var ev = makeEvent(EventKind.Comment, ct.span)
+            ev.inline = ct.inline
+            ev.blankBefore = ct.blankBefore
+            ev.val = ct.val
+            return Ok(Some(ev))
+        }
+
+        match p.state {
+            PState.StreamStart {
+                let st = try p.sc.nextToken()
+                p.state = PState.ImplicitDocStart
+                return Ok(Some(makeEvent(EventKind.StreamStart, st.span)))
+            }
+            PState.ImplicitDocStart {
+                if tok.kind == TokKind.StreamEnd {
+                    let et = try p.sc.nextToken()
+                    p.state = PState.Done
+                    return Ok(Some(makeEvent(EventKind.StreamEnd, et.span)))
+                }
+                if tok.kind == TokKind.DocEnd {
+                    let _skip = try p.sc.nextToken()
+                    p.prevDocExplicitEnd = true
+                    p.state = PState.DocStart
+                    continue
+                }
+                if tok.kind == TokKind.VersionDirective || tok.kind == TokKind.TagDirective || tok.kind == TokKind.DocStart {
+                    p.state = PState.DocStart
+                    continue
+                }
+                p.tagHandles = defaultTagHandles()
+                p.docVersion = ""
+                p.hasDirectives = false
+                p.pushState(PState.DocEnd)
+                p.state = PState.BlockNode
+                return Ok(Some(makeEvent(EventKind.DocStart, tok.span)))
+            }
+            PState.DocStart {
+                if tok.kind == TokKind.DocEnd {
+                    let _skip = try p.sc.nextToken()
+                    p.prevDocExplicitEnd = true
+                    continue
+                }
+                if tok.kind == TokKind.StreamEnd {
+                    let et = try p.sc.nextToken()
+                    if p.hasDirectives {
+                        return Err(makeError(ErrorKind.Directive, "expected '---' after directives", et.span))
+                    }
+                    p.state = PState.Done
+                    return Ok(Some(makeEvent(EventKind.StreamEnd, et.span)))
+                }
+                if tok.kind == TokKind.VersionDirective {
+                    let vt = try p.sc.nextToken()
+                    if p.seenAnyDoc && !p.prevDocExplicitEnd {
+                        return Err(makeError(ErrorKind.Directive, "directive after document requires preceding '...'", vt.span))
+                    }
+                    if len(p.docVersion) > 0 {
+                        return Err(makeError(ErrorKind.Directive, "duplicate %YAML directive", vt.span))
+                    }
+                    p.docVersion = vt.val
+                    p.hasDirectives = true
+                    continue
+                }
+                if tok.kind == TokKind.TagDirective {
+                    let tt = try p.sc.nextToken()
+                    if p.seenAnyDoc && !p.prevDocExplicitEnd {
+                        return Err(makeError(ErrorKind.Directive, "directive after document requires preceding '...'", tt.span))
+                    }
+                    p.tagHandles.put(tt.val.clone(), tt.extra.clone())
+                    p.hasDirectives = true
+                    continue
+                }
+                if tok.kind == TokKind.DocStart {
+                    let dt = try p.sc.nextToken()
+                    var ev = makeEvent(EventKind.DocStart, dt.span)
+                    ev.explicit = true
+                    ev.version = p.docVersion.clone()
+                    p.hasDirectives = false
+                    p.prevDocExplicitEnd = false
+                    p.seenAnyDoc = true
+                    p.pushState(PState.DocEnd)
+                    p.state = PState.DocContent
+                    return Ok(Some(ev))
+                }
+                if !p.prevDocExplicitEnd || p.hasDirectives {
+                    return Err(makeError(ErrorKind.Syntax, "expected '---' or end of stream", tok.span))
+                }
+                // Implicit document following an explicit '...'
+                p.tagHandles = defaultTagHandles()
+                p.docVersion = ""
+                p.hasDirectives = false
+                p.prevDocExplicitEnd = false
+                p.seenAnyDoc = true
+                p.pushState(PState.DocEnd)
+                p.state = PState.BlockNode
+                return Ok(Some(makeEvent(EventKind.DocStart, tok.span)))
+            }
+            PState.DocContent {
+                if tok.kind == TokKind.VersionDirective || tok.kind == TokKind.TagDirective ||
+                   tok.kind == TokKind.DocStart || tok.kind == TokKind.DocEnd || tok.kind == TokKind.StreamEnd {
+                    p.popState()
+                    var ev = makeEvent(EventKind.Scalar, tok.span)
+                    ev.style = Style.Plain
+                    return Ok(Some(ev))
+                }
+                p.state = PState.BlockNode
+                continue
+            }
+            PState.DocEnd {
+                var ev = makeEvent(EventKind.DocEnd, tok.span)
+                if tok.kind == TokKind.DocEnd {
+                    let _et = try p.sc.nextToken()
+                    ev.explicit = true
+                }
+                p.prevDocExplicitEnd = ev.explicit
+                p.seenAnyDoc = true
+                p.tagHandles = defaultTagHandles()
+                p.docVersion = ""
+                p.hasDirectives = false
+                p.state = PState.DocStart
+                return Ok(Some(ev))
+            }
+            PState.BlockNode, PState.BlockNodeOrIndentlessSeq, PState.FlowNode {
+                let isBlock = p.state != PState.FlowNode
+                let allowIndentless = p.state == PState.BlockNodeOrIndentlessSeq
+                if tok.kind == TokKind.Alias && !p.hasProps {
+                    let at = try p.sc.nextToken()
+                    p.popState()
+                    var ev = makeEvent(EventKind.Alias, at.span)
+                    ev.val = at.val
+                    return Ok(Some(ev))
+                }
+                if tok.kind == TokKind.Anchor {
+                    let at = try p.sc.nextToken()
+                    if len(p.pendingAnchor) > 0 {
+                        return Err(makeError(ErrorKind.Anchor, "duplicate anchor on node", at.span))
+                    }
+                    if !p.hasProps { p.propsSpan = at.span }
+                    p.pendingAnchor = at.val
+                    p.hasProps = true
+                    continue
+                }
+                if tok.kind == TokKind.Tag {
+                    let tt = try p.sc.nextToken()
+                    if len(p.pendingTag) > 0 {
+                        return Err(makeError(ErrorKind.Tag, "duplicate tag on node", tt.span))
+                    }
+                    if !p.hasProps { p.propsSpan = tt.span }
+                    p.pendingTag = try p.resolveTagToken(&tt.val, &tt.extra, tt.span)
+                    p.hasProps = true
+                    continue
+                }
+
+                let anchor = replace(mut &p.pendingAnchor, "")
+                let tag = replace(mut &p.pendingTag, "")
+                let hadProps = p.hasProps
+                let propSp = p.propsSpan
+                p.hasProps = false
+
+                if allowIndentless && tok.kind == TokKind.BlockEntry {
+                    try p.enterCollection(tok.span)
+                    p.state = PState.IndentlessSeqEntry
+                    var ev = makeEvent(EventKind.SeqStart, if hadProps { propSp } else { tok.span })
+                    ev.anchor = anchor
+                    ev.tag = tag
+                    ev.style = Style.Block
+                    return Ok(Some(ev))
+                }
+                if tok.kind == TokKind.Scalar {
+                    let st = try p.sc.nextToken()
+                    p.popState()
+                    var ev = makeEvent(EventKind.Scalar, st.span)
+                    ev.style = st.style
+                    ev.endLine = st.endLine
+                    ev.val = st.val
+                    ev.anchor = anchor
+                    ev.tag = tag
+                    return Ok(Some(ev))
+                }
+                if tok.kind == TokKind.FlowSeqStart {
+                    let st = try p.sc.nextToken()
+                    try p.enterCollection(st.span)
+                    p.state = PState.FlowSeqFirstEntry
+                    var ev = makeEvent(EventKind.SeqStart, st.span)
+                    ev.anchor = anchor
+                    ev.tag = tag
+                    ev.style = Style.Flow
+                    return Ok(Some(ev))
+                }
+                if tok.kind == TokKind.FlowMapStart {
+                    let st = try p.sc.nextToken()
+                    try p.enterCollection(st.span)
+                    p.state = PState.FlowMapFirstKey
+                    var ev = makeEvent(EventKind.MapStart, st.span)
+                    ev.anchor = anchor
+                    ev.tag = tag
+                    ev.style = Style.Flow
+                    return Ok(Some(ev))
+                }
+                if isBlock && tok.kind == TokKind.BlockSeqStart {
+                    let st = try p.sc.nextToken()
+                    try p.enterCollection(st.span)
+                    p.state = PState.BlockSeqFirstEntry
+                    var ev = makeEvent(EventKind.SeqStart, st.span)
+                    ev.anchor = anchor
+                    ev.tag = tag
+                    ev.style = Style.Block
+                    return Ok(Some(ev))
+                }
+                if isBlock && tok.kind == TokKind.BlockMapStart {
+                    let st = try p.sc.nextToken()
+                    try p.enterCollection(st.span)
+                    p.state = PState.BlockMapFirstKey
+                    var ev = makeEvent(EventKind.MapStart, st.span)
+                    ev.anchor = anchor
+                    ev.tag = tag
+                    ev.style = Style.Block
+                    return Ok(Some(ev))
+                }
+                if hadProps {
+                    // Empty scalar with anchor/tag
+                    p.popState()
+                    var ev = makeEvent(EventKind.Scalar, propSp)
+                    ev.anchor = anchor
+                    ev.tag = tag
+                    ev.style = Style.Plain
+                    return Ok(Some(ev))
+                }
+                return Err(makeError(ErrorKind.Syntax, "expected a YAML node", tok.span))
+            }
+            PState.BlockSeqFirstEntry, PState.BlockSeqEntry {
+                if tok.kind == TokKind.BlockEntry {
+                    let _bt = try p.sc.nextToken()
+                    p.state = PState.BlockSeqAfterEntry
+                    continue
+                }
+                if tok.kind == TokKind.BlockEnd {
+                    let et = try p.sc.nextToken()
+                    p.leaveCollection()
+                    p.popState()
+                    return Ok(Some(makeEvent(EventKind.SeqEnd, et.span)))
+                }
+                return Err(makeError(ErrorKind.Syntax, "expected '-' or end of block sequence", tok.span))
+            }
+            PState.BlockSeqAfterEntry {
+                if tok.kind == TokKind.BlockEntry || tok.kind == TokKind.BlockEnd {
+                    p.state = PState.BlockSeqEntry
+                    var ev = makeEvent(EventKind.Scalar, tok.span)
+                    ev.style = Style.Plain
+                    return Ok(Some(ev))
+                }
+                p.pushState(PState.BlockSeqEntry)
+                p.state = PState.BlockNode
+                continue
+            }
+            PState.IndentlessSeqEntry {
+                if tok.kind == TokKind.BlockEntry {
+                    let _bt = try p.sc.nextToken()
+                    p.state = PState.IndentlessSeqAfterEntry
+                    continue
+                }
+                p.leaveCollection()
+                p.popState()
+                return Ok(Some(makeEvent(EventKind.SeqEnd, tok.span)))
+            }
+            PState.IndentlessSeqAfterEntry {
+                if tok.kind == TokKind.BlockEntry || tok.kind == TokKind.Key || tok.kind == TokKind.Value || tok.kind == TokKind.BlockEnd ||
+                   tok.kind == TokKind.DocStart || tok.kind == TokKind.DocEnd || tok.kind == TokKind.StreamEnd {
+                    p.state = PState.IndentlessSeqEntry
+                    var ev = makeEvent(EventKind.Scalar, tok.span)
+                    ev.style = Style.Plain
+                    return Ok(Some(ev))
+                }
+                p.pushState(PState.IndentlessSeqEntry)
+                p.state = PState.BlockNode
+                continue
+            }
+            PState.BlockMapFirstKey, PState.BlockMapKey {
+                if tok.kind == TokKind.Key {
+                    let _kt = try p.sc.nextToken()
+                    p.state = PState.BlockMapAfterKey
+                    continue
+                }
+                if tok.kind == TokKind.Value {
+                    // Empty key before ':'
+                    p.state = PState.BlockMapValue
+                    var ev = makeEvent(EventKind.Scalar, tok.span)
+                    ev.style = Style.Plain
+                    return Ok(Some(ev))
+                }
+                if tok.kind == TokKind.BlockEnd {
+                    let et = try p.sc.nextToken()
+                    p.leaveCollection()
+                    p.popState()
+                    return Ok(Some(makeEvent(EventKind.MapEnd, et.span)))
+                }
+                return Err(makeError(ErrorKind.Syntax, "expected mapping key or end of block mapping", tok.span))
+            }
+            PState.BlockMapAfterKey {
+                if tok.kind == TokKind.Key || tok.kind == TokKind.Value || tok.kind == TokKind.BlockEnd {
+                    p.state = PState.BlockMapValue
+                    var ev = makeEvent(EventKind.Scalar, tok.span)
+                    ev.style = Style.Plain
+                    return Ok(Some(ev))
+                }
+                p.pushState(PState.BlockMapValue)
+                p.state = PState.BlockNodeOrIndentlessSeq
+                continue
+            }
+            PState.BlockMapValue {
+                if tok.kind == TokKind.Value {
+                    let _vt = try p.sc.nextToken()
+                    p.state = PState.BlockMapAfterValue
+                    continue
+                }
+                p.state = PState.BlockMapKey
+                var ev = makeEvent(EventKind.Scalar, tok.span)
+                ev.style = Style.Plain
+                return Ok(Some(ev))
+            }
+            PState.BlockMapAfterValue {
+                if tok.kind == TokKind.Key || tok.kind == TokKind.Value || tok.kind == TokKind.BlockEnd {
+                    p.state = PState.BlockMapKey
+                    var ev = makeEvent(EventKind.Scalar, tok.span)
+                    ev.style = Style.Plain
+                    return Ok(Some(ev))
+                }
+                p.pushState(PState.BlockMapKey)
+                p.state = PState.BlockNodeOrIndentlessSeq
+                continue
+            }
+            PState.FlowSeqFirstEntry {
+                if tok.kind == TokKind.FlowSeqEnd {
+                    let et = try p.sc.nextToken()
+                    p.leaveCollection()
+                    p.popState()
+                    return Ok(Some(makeEvent(EventKind.SeqEnd, et.span)))
+                }
+                if tok.kind == TokKind.Key {
+                    let _kt = try p.sc.nextToken()
+                    try p.enterCollection(tok.span)
+                    p.pushState(PState.FlowSeqEntry)
+                    p.state = PState.FlowSeqEntryMapAfterKey
+                    var ev = makeEvent(EventKind.MapStart, tok.span)
+                    ev.style = Style.Flow
+                    return Ok(Some(ev))
+                }
+                if tok.kind == TokKind.Value {
+                    try p.enterCollection(tok.span)
+                    p.pushState(PState.FlowSeqEntry)
+                    p.state = PState.FlowSeqEntryMapAfterKey
+                    var ev = makeEvent(EventKind.MapStart, tok.span)
+                    ev.style = Style.Flow
+                    return Ok(Some(ev))
+                }
+                p.pushState(PState.FlowSeqEntry)
+                p.state = PState.FlowNode
+                continue
+            }
+            PState.FlowSeqEntry {
+                if tok.kind == TokKind.FlowSeqEnd {
+                    let et = try p.sc.nextToken()
+                    p.leaveCollection()
+                    p.popState()
+                    return Ok(Some(makeEvent(EventKind.SeqEnd, et.span)))
+                }
+                if tok.kind == TokKind.FlowEntry {
+                    let _ct = try p.sc.nextToken()
+                    p.state = PState.FlowSeqAfterComma
+                    continue
+                }
+                return Err(makeError(ErrorKind.Syntax, "expected ',' or ']' in flow sequence", tok.span))
+            }
+            PState.FlowSeqAfterComma {
+                if tok.kind == TokKind.FlowSeqEnd {
+                    let et = try p.sc.nextToken()
+                    p.leaveCollection()
+                    p.popState()
+                    return Ok(Some(makeEvent(EventKind.SeqEnd, et.span)))
+                }
+                if tok.kind == TokKind.Key {
+                    let _kt = try p.sc.nextToken()
+                    try p.enterCollection(tok.span)
+                    p.pushState(PState.FlowSeqEntry)
+                    p.state = PState.FlowSeqEntryMapAfterKey
+                    var ev = makeEvent(EventKind.MapStart, tok.span)
+                    ev.style = Style.Flow
+                    return Ok(Some(ev))
+                }
+                if tok.kind == TokKind.Value {
+                    try p.enterCollection(tok.span)
+                    p.pushState(PState.FlowSeqEntry)
+                    p.state = PState.FlowSeqEntryMapAfterKey
+                    var ev = makeEvent(EventKind.MapStart, tok.span)
+                    ev.style = Style.Flow
+                    return Ok(Some(ev))
+                }
+                p.pushState(PState.FlowSeqEntry)
+                p.state = PState.FlowNode
+                continue
+            }
+            PState.FlowSeqEntryMapKey {
+                let _kt = try p.sc.nextToken()
+                p.state = PState.FlowSeqEntryMapAfterKey
+                continue
+            }
+            PState.FlowSeqEntryMapAfterKey {
+                if tok.kind == TokKind.Value || tok.kind == TokKind.FlowEntry || tok.kind == TokKind.FlowSeqEnd {
+                    p.state = PState.FlowSeqEntryMapValue
+                    var ev = makeEvent(EventKind.Scalar, tok.span)
+                    ev.style = Style.Plain
+                    return Ok(Some(ev))
+                }
+                p.pushState(PState.FlowSeqEntryMapValue)
+                p.state = PState.FlowNode
+                continue
+            }
+            PState.FlowSeqEntryMapValue {
+                if tok.kind == TokKind.Value {
+                    let _vt = try p.sc.nextToken()
+                    p.state = PState.FlowSeqEntryMapAfterValue
+                    continue
+                }
+                p.state = PState.FlowSeqEntryMapEnd
+                var ev = makeEvent(EventKind.Scalar, tok.span)
+                ev.style = Style.Plain
+                return Ok(Some(ev))
+            }
+            PState.FlowSeqEntryMapAfterValue {
+                if tok.kind == TokKind.FlowEntry || tok.kind == TokKind.FlowSeqEnd {
+                    p.state = PState.FlowSeqEntryMapEnd
+                    var ev = makeEvent(EventKind.Scalar, tok.span)
+                    ev.style = Style.Plain
+                    return Ok(Some(ev))
+                }
+                p.pushState(PState.FlowSeqEntryMapEnd)
+                p.state = PState.FlowNode
+                continue
+            }
+            PState.FlowSeqEntryMapEnd {
+                p.leaveCollection()
+                p.popState()
+                return Ok(Some(makeEvent(EventKind.MapEnd, tok.span)))
+            }
+            PState.FlowMapFirstKey {
+                if tok.kind == TokKind.FlowMapEnd {
+                    let et = try p.sc.nextToken()
+                    p.leaveCollection()
+                    p.popState()
+                    return Ok(Some(makeEvent(EventKind.MapEnd, et.span)))
+                }
+                if tok.kind == TokKind.Key {
+                    let _kt = try p.sc.nextToken()
+                    p.state = PState.FlowMapAfterKey
+                    continue
+                }
+                if tok.kind == TokKind.Value {
+                    p.state = PState.FlowMapValue
+                    var ev = makeEvent(EventKind.Scalar, tok.span)
+                    ev.style = Style.Plain
+                    return Ok(Some(ev))
+                }
+                p.pushState(PState.FlowMapEmptyValue)
+                p.state = PState.FlowNode
+                continue
+            }
+            PState.FlowMapKey {
+                if tok.kind == TokKind.FlowMapEnd {
+                    let et = try p.sc.nextToken()
+                    p.leaveCollection()
+                    p.popState()
+                    return Ok(Some(makeEvent(EventKind.MapEnd, et.span)))
+                }
+                if tok.kind == TokKind.FlowEntry {
+                    let _ct = try p.sc.nextToken()
+                    p.state = PState.FlowMapAfterComma
+                    continue
+                }
+                return Err(makeError(ErrorKind.Syntax, "expected ',' or '}' in flow mapping", tok.span))
+            }
+            PState.FlowMapAfterComma {
+                if tok.kind == TokKind.FlowMapEnd {
+                    let et = try p.sc.nextToken()
+                    p.leaveCollection()
+                    p.popState()
+                    return Ok(Some(makeEvent(EventKind.MapEnd, et.span)))
+                }
+                if tok.kind == TokKind.Key {
+                    let _kt = try p.sc.nextToken()
+                    p.state = PState.FlowMapAfterKey
+                    continue
+                }
+                if tok.kind == TokKind.Value {
+                    p.state = PState.FlowMapValue
+                    var ev = makeEvent(EventKind.Scalar, tok.span)
+                    ev.style = Style.Plain
+                    return Ok(Some(ev))
+                }
+                p.pushState(PState.FlowMapEmptyValue)
+                p.state = PState.FlowNode
+                continue
+            }
+            PState.FlowMapAfterKey {
+                if tok.kind == TokKind.Value || tok.kind == TokKind.FlowEntry || tok.kind == TokKind.FlowMapEnd {
+                    p.state = PState.FlowMapValue
+                    var ev = makeEvent(EventKind.Scalar, tok.span)
+                    ev.style = Style.Plain
+                    return Ok(Some(ev))
+                }
+                p.pushState(PState.FlowMapValue)
+                p.state = PState.FlowNode
+                continue
+            }
+            PState.FlowMapValue {
+                if tok.kind == TokKind.Value {
+                    let _vt = try p.sc.nextToken()
+                    p.state = PState.FlowMapAfterValue
+                    continue
+                }
+                p.state = PState.FlowMapKey
+                var ev = makeEvent(EventKind.Scalar, tok.span)
+                ev.style = Style.Plain
+                return Ok(Some(ev))
+            }
+            PState.FlowMapAfterValue {
+                if tok.kind == TokKind.FlowEntry || tok.kind == TokKind.FlowMapEnd {
+                    p.state = PState.FlowMapKey
+                    var ev = makeEvent(EventKind.Scalar, tok.span)
+                    ev.style = Style.Plain
+                    return Ok(Some(ev))
+                }
+                p.pushState(PState.FlowMapKey)
+                p.state = PState.FlowNode
+                continue
+            }
+            PState.FlowMapEmptyValue {
+                p.state = PState.FlowMapKey
+                var ev = makeEvent(EventKind.Scalar, tok.span)
+                ev.style = Style.Plain
+                return Ok(Some(ev))
+            }
+            PState.Done { return Ok(None) }
+        }
+    }
+    return Ok(None)
+}
+
+// ---------------------------------------------------------------- document builder & decoder
+
+pub type Decoder = record {
+    ep: EventParser
+    opts: ParseOptions
+    peeked: Option[Event]
+    started: bool
+    finished: bool
+    anchors: Map[str, Node]
+    activeAnchors: []str
+    aliasCount: int
+    aliasNodes: int
+}
+
+pub fn decoder(src: &str): Decoder {
+    return decoderWith(src, &parseDefaults())
+}
+
+pub fn decoderWith(src: &str, opts: &ParseOptions): Decoder {
+    return Decoder{
+        ep: eventsWith(src, opts),
+        opts: opts.clone(),
+        peeked: None,
+        started: false,
+        finished: false,
+        anchors: newMap(),
+        activeAnchors: [],
+        aliasCount: 0,
+        aliasNodes: 0,
+    }
+}
+
+fn (d: mut &Decoder) peekEv(): Result[Option[Event], Error] {
+    match d.peeked {
+        Some(_) { return Ok(d.peeked.clone()) }
+        None {}
+    }
+    let next = try d.ep.next()
+    d.peeked = next.clone()
+    return Ok(next)
+}
+
+fn (d: mut &Decoder) nextEv(): Result[Option[Event], Error] {
+    let cur = replace(mut &d.peeked, None)
+    match cur {
+        Some(ev) { return Ok(Some(ev)) }
+        None { return d.ep.next() }
+    }
+}
+
+type PendingComments = value record {
+    head: str
+    blankBefore: bool
+}
+
+fn appendHeadComment(buf: mut &str, text: &str, blankBefore: bool) {
+    if len(text) == 0 { return }
+    if len(buf) > 0 {
+        buf.addByte('\n')
+        if blankBefore { buf.addByte('\n') }
+    }
+    buf += text
+}
+
+// Collects comments ahead of the next structural event.
+fn (d: mut &Decoder) drainHeadComments(): Result[PendingComments, Error] {
+    var head = ""
+    var blankBefore = false
+    while true {
+        match try d.peekEv() {
+            Some(ev) {
+                if ev.kind != EventKind.Comment { break }
+                let _c = try d.nextEv()
+                if len(ev.val) == 0 {
+                    // Synthetic blank-line marker
+                    if len(head) == 0 {
+                        blankBefore = true
+                    } else {
+                        // A blank line after a comment stays between comment blocks when another follows
+                        blankBefore = true
+                    }
+                } else {
+                    if len(head) == 0 && ev.blankBefore {
+                        blankBefore = true
+                    }
+                    appendHeadComment(mut &head, &ev.val, len(head) > 0 && (ev.blankBefore || blankBefore))
+                }
+            }
+            None { break }
+        }
+    }
+    return Ok(PendingComments{head: head, blankBefore: blankBefore})
+}
+
+// Consumes an inline comment if the very next event is one on the given line (or any inline comment).
+fn (d: mut &Decoder) takeInlineComment(line: int): Result[str, Error] {
+    match try d.peekEv() {
+        Some(ev) {
+            if ev.kind == EventKind.Comment && ev.inline && (line <= 0 || ev.span.line == line) {
+                let c = try d.nextEv()
+                match c {
+                    Some(cev) { return Ok(cev.val) }
+                    None {}
+                }
+            }
+        }
+        None {}
+    }
+    return Ok("".clone())
+}
+
+fn countSubtreeNodes(n: &Node, limit: int): int {
+    var count = 1
+    if count > limit { return count }
+    match n.value {
+        Value.Seq(s) {
+            for i in 0..len(s.items) {
+                count += countSubtreeNodes(&s.items[i], limit - count)
+                if count > limit { return count }
+            }
+        }
+        Value.Map(m) {
+            for i in 0..len(m.entries) {
+                count += countSubtreeNodes(&m.entries[i].key, limit - count)
+                if count > limit { return count }
+                count += countSubtreeNodes(&m.entries[i].value, limit - count)
+                if count > limit { return count }
+            }
+        }
+        else {}
+    }
+    return count
+}
+
+fn (d: &Decoder) isActiveAnchor(name: &str): bool {
+    for a in d.activeAnchors {
+        if a == name { return true }
+    }
+    return false
+}
+
+fn (d: mut &Decoder) popActiveAnchor() {
+    if len(d.activeAnchors) > 0 {
+        let _a = pop(mut &d.activeAnchors)
+    }
+}
+
+// Reads the next Document from the stream, or Ok(None) at end of stream.
+pub fn (d: mut &Decoder) next(): Result[Option[Doc], Error] {
+    if d.finished { return Ok(None) }
+    if !d.started {
+        d.started = true
+        let st = try d.nextEv()
+        match st {
+            Some(_) {}
+            None {
+                d.finished = true
+                return Ok(None)
+            }
+        }
+    }
+
+    let beforeDoc = try d.drainHeadComments()
+    match try d.peekEv() {
+        None {
+            d.finished = true
+            return Ok(None)
+        }
+        Some(ev) {
+            if ev.kind == EventKind.StreamEnd {
+                let _e = try d.nextEv()
+                d.finished = true
+                return Ok(None)
+            }
+        }
+    }
+
+    // Expect DocStart
+    var ds = makeEvent(EventKind.StreamEnd, noSpan())
+    match try d.nextEv() {
+        Some(ev) { ds = ev }
+        None {
+            d.finished = true
+            return Ok(None)
+        }
+    }
+    if ds.kind != EventKind.DocStart {
+        return Err(makeError(ErrorKind.Syntax, "expected start of document", ds.span))
+    }
+
+    d.anchors.clear()
+    replace(mut &d.activeAnchors, [])
+    d.aliasCount = 0
+    d.aliasNodes = 0
+
+    let insideDocHead = try d.drainHeadComments()
+    var root = try d.buildNode(true)
+    let afterRoot = try d.drainHeadComments()
+    if len(afterRoot.head) > 0 {
+        appendHeadComment(mut &root.comments.foot, &afterRoot.head, afterRoot.blankBefore)
+    }
+
+    var hasEnd = false
+    match try d.peekEv() {
+        Some(ev) {
+            if ev.kind == EventKind.DocEnd {
+                let de = try d.nextEv()
+                match de {
+                    Some(dev) { hasEnd = dev.explicit }
+                    None {}
+                }
+            }
+        }
+        None {}
+    }
+
+    // Attach document header comments
+    var docHead = ""
+    if ds.explicit {
+        docHead = beforeDoc.head.clone()
+        if len(insideDocHead.head) > 0 {
+            if len(root.comments.head) > 0 {
+                var combined = insideDocHead.head.clone()
+                appendHeadComment(mut &combined, &root.comments.head, root.comments.blankBefore)
+                root.comments.head = combined
+            } else {
+                root.comments.head = insideDocHead.head.clone()
+            }
+        }
+    } else {
+        var combined = beforeDoc.head.clone()
+        if len(insideDocHead.head) > 0 {
+            appendHeadComment(mut &combined, &insideDocHead.head, insideDocHead.blankBefore)
+        }
+        if len(combined) > 0 {
+            if len(root.comments.head) > 0 {
+                appendHeadComment(mut &combined, &root.comments.head, root.comments.blankBefore)
+            }
+            root.comments.head = combined
+        }
+    }
+
+    return Ok(Some(Doc{
+        root: root,
+        hasStart: ds.explicit,
+        hasEnd: hasEnd,
+        headComment: docHead,
+        version: ds.version.clone(),
+    }))
+}
+
+fn (d: mut &Decoder) buildNode(isRoot: bool): Result[Node, Error] {
+    let lead = try d.drainHeadComments()
+    let ev = match try d.nextEv() {
+        Some(e) { e }
+        None { return Err(makeError(ErrorKind.Eof, "unexpected end of stream", noSpan())) }
+    }
+
+    match ev.kind {
+        EventKind.Alias {
+            if d.isActiveAnchor(&ev.val) {
+                return Err(makeError(ErrorKind.CyclicAlias, &("cyclic alias '*" + ev.val + "'"), ev.span))
+            }
+            d.aliasCount += 1
+            if d.aliasCount > d.opts.maxAliases {
+                return Err(makeError(ErrorKind.AliasLimit, "too many alias references", ev.span))
+            }
+            var foundTarget: Option[Node] = None
+            var aliasCost = 0
+            match d.anchors.find(&ev.val) {
+                Some(target) {
+                    aliasCost = countSubtreeNodes(target, d.opts.maxAliasNodes - d.aliasNodes + 1)
+                    foundTarget = Some(target.clone())
+                }
+                None {}
+            }
+            match move(foundTarget) {
+                Some(t0) {
+                    d.aliasNodes += aliasCost
+                    if d.aliasNodes > d.opts.maxAliasNodes {
+                        return Err(makeError(ErrorKind.AliasLimit, "alias expansion exceeds maxAliasNodes", ev.span))
+                    }
+                    var node = t0
+                    node.anchor = ""
+                    let leadBlank = lead.blankBefore
+                    node.comments = Comments{head: lead.head.clone(), line: try d.takeInlineComment(ev.endLine), foot: "", blankBefore: leadBlank}
+                    return Ok(node)
+                }
+                None {
+                    return Err(makeError(ErrorKind.UndefinedAlias, &("undefined alias '*" + ev.val + "'"), ev.span))
+                }
+            }
+        }
+        EventKind.Scalar {
+            let val = try resolveScalar(&ev.val, ev.style, &ev.tag, ev.span)
+            let lineC = try d.takeInlineComment(ev.endLine)
+            let node = Node{
+                value: val,
+                span: ev.span,
+                tag: ev.tag.clone(),
+                anchor: ev.anchor.clone(),
+                style: ev.style,
+                comments: Comments{head: lead.head.clone(), line: lineC, foot: "", blankBefore: lead.blankBefore},
+            }
+            if len(node.anchor) > 0 {
+                d.anchors.put(node.anchor.clone(), node.clone())
+            }
+            return Ok(node)
+        }
+        EventKind.SeqStart {
+            if len(ev.anchor) > 0 { append(mut &d.activeAnchors, ev.anchor.clone()) }
+            var items: []Node = []
+            var foot = ""
+            while true {
+                let itemLead = try d.drainHeadComments()
+                let pk = match try d.peekEv() {
+                    Some(p) { p }
+                    None { return Err(makeError(ErrorKind.Eof, "unterminated sequence", ev.span)) }
+                }
+                if pk.kind == EventKind.SeqEnd {
+                    let _end = try d.nextEv()
+                    foot = itemLead.head.clone()
+                    break
+                }
+                var item = try d.buildNode(false)
+                if len(itemLead.head) > 0 || itemLead.blankBefore {
+                    if len(item.comments.head) > 0 {
+                        var combined = itemLead.head.clone()
+                        appendHeadComment(mut &combined, &item.comments.head, item.comments.blankBefore)
+                        item.comments.head = combined
+                    } else {
+                        item.comments.head = itemLead.head.clone()
+                    }
+                    if itemLead.blankBefore { item.comments.blankBefore = true }
+                }
+                append(mut &items, item)
+            }
+            if len(ev.anchor) > 0 { d.popActiveAnchor() }
+            let lineC = if ev.style == Style.Flow { try d.takeInlineComment(0) } else { "" }
+            var seqHead = lead.head.clone()
+            var seqBlank = lead.blankBefore
+            if !isRoot && ev.style == Style.Block && len(items) > 0 && len(seqHead) > 0 && len(items[0].comments.head) == 0 {
+                items[0].comments.head = seqHead
+                items[0].comments.blankBefore = seqBlank
+                seqHead = ""
+                seqBlank = false
+            }
+            let node = Node{
+                value: newSeqBox(items),
+                span: ev.span,
+                tag: ev.tag.clone(),
+                anchor: ev.anchor.clone(),
+                style: ev.style,
+                comments: Comments{head: seqHead, line: lineC, foot: foot, blankBefore: seqBlank},
+            }
+            if len(node.anchor) > 0 {
+                d.anchors.put(node.anchor.clone(), node.clone())
+            }
+            return Ok(node)
+        }
+        EventKind.MapStart {
+            if len(ev.anchor) > 0 { append(mut &d.activeAnchors, ev.anchor.clone()) }
+            var rawEntries: []Entry = []
+            var isMergeSlot: []bool = []
+            var foot = ""
+            while true {
+                let keyLead = try d.drainHeadComments()
+                let pk = match try d.peekEv() {
+                    Some(p) { p }
+                    None { return Err(makeError(ErrorKind.Eof, "unterminated mapping", ev.span)) }
+                }
+                if pk.kind == EventKind.MapEnd {
+                    let _end = try d.nextEv()
+                    foot = keyLead.head.clone()
+                    break
+                }
+                var key = try d.buildNode(false)
+                if len(keyLead.head) > 0 || keyLead.blankBefore {
+                    if len(key.comments.head) > 0 {
+                        var combined = keyLead.head.clone()
+                        appendHeadComment(mut &combined, &key.comments.head, key.comments.blankBefore)
+                        key.comments.head = combined
+                    } else {
+                        key.comments.head = keyLead.head.clone()
+                    }
+                    if keyLead.blankBefore { key.comments.blankBefore = true }
+                }
+                // Check for inline comment on the key line (e.g. "server: # comment\n  host: a")
+                let keyInline = try d.takeInlineComment(key.span.line)
+                if len(keyInline) > 0 && len(key.comments.line) == 0 {
+                    key.comments.line = keyInline
+                }
+                let val = try d.buildNode(false)
+                let merge = d.opts.mergeKeys && isMergeKeyNode(&key)
+                append(mut &rawEntries, Entry{key: key, value: val})
+                append(mut &isMergeSlot, merge)
+            }
+            if len(ev.anchor) > 0 { d.popActiveAnchor() }
+
+            // Assemble final entries: check duplicate explicit keys & expand '<<' merges
+            let entries = try assembleMapEntries(rawEntries, &isMergeSlot, d.opts.allowDuplicateKeys)
+            let lineC = if ev.style == Style.Flow { try d.takeInlineComment(0) } else { "" }
+            var mapHead = lead.head.clone()
+            var mapBlank = lead.blankBefore
+            var finalEntries = entries
+            if !isRoot && ev.style == Style.Block && len(finalEntries) > 0 && len(mapHead) > 0 && len(finalEntries[0].key.comments.head) == 0 {
+                finalEntries[0].key.comments.head = mapHead
+                finalEntries[0].key.comments.blankBefore = mapBlank
+                mapHead = ""
+                mapBlank = false
+            }
+            let node = Node{
+                value: newMapBox(finalEntries),
+                span: ev.span,
+                tag: ev.tag.clone(),
+                anchor: ev.anchor.clone(),
+                style: ev.style,
+                comments: Comments{head: mapHead, line: lineC, foot: foot, blankBefore: mapBlank},
+            }
+            if len(node.anchor) > 0 {
+                d.anchors.put(node.anchor.clone(), node.clone())
+            }
+            return Ok(node)
+        }
+        else {
+            return Err(makeError(ErrorKind.Syntax, &("unexpected event " + ev.kind.toStr()), ev.span))
+        }
+    }
+}
+
+fn isMergeKeyNode(k: &Node): bool {
+    if len(k.tag) > 0 && k.tag != "!!merge" && k.tag != "tag:yaml.org,2002:merge" { return false }
+    if k.style != Style.Plain && len(k.tag) == 0 { return false }
+    match k.value {
+        Value.Str(s) { return s == "<<" }
+        else { return false }
+    }
+}
+
+fn assembleMapEntries(raw: []Entry, isMerge: &[]bool, allowDup: bool): Result[[]Entry, Error] {
+    var hasMerge = false
+    for i in 0..len(isMerge) {
+        if isMerge[i] {
+            hasMerge = true
+            break
+        }
+    }
+
+    // Fast path: no merge keys
+    if !hasMerge {
+        var box = MapBox{entries: [], index: []}
+        for e in move(raw) {
+            let idx = findNodeKey(&box, &e.key)
+            if idx >= 0 {
+                if !allowDup {
+                    return Err(makeError(ErrorKind.DuplicateKey, &("duplicate mapping key '" + keyDisplay(&e.key) + "'"), e.key.span))
+                }
+                box.entries[idx].value = e.value
+            } else {
+                append(mut &box.entries, e)
+                if len(box.entries) > SMALL_MAP && (len(box.index) == 0 || len(box.entries) * 2 > len(box.index)) {
+                    reindexMap(mut &box)
+                } else if len(box.index) > 0 {
+                    let mask = len(box.index) - 1
+                    var s = int(box.entries[len(box.entries) - 1].key.hash() & u64(mask))
+                    while box.index[s] >= 0 { s = (s + 1) & mask }
+                    box.index[s] = len(box.entries) - 1
+                }
+            }
+        }
+        return Ok(box.entries)
+    }
+
+    // With merge keys: collect all explicit keys first so explicit keys ALWAYS win
+    var explicitBox = MapBox{entries: [], index: []}
+    for i in 0..len(raw) {
+        if isMerge[i] { continue }
+        let idx = findNodeKey(&explicitBox, &raw[i].key)
+        if idx >= 0 {
+            if !allowDup {
+                return Err(makeError(ErrorKind.DuplicateKey, &("duplicate mapping key '" + keyDisplay(&raw[i].key) + "'"), raw[i].key.span))
+            }
+            explicitBox.entries[idx].value = raw[i].value.clone()
+        } else {
+            append(mut &explicitBox.entries, Entry{key: raw[i].key.clone(), value: raw[i].value.clone()})
+            if len(explicitBox.entries) > SMALL_MAP && (len(explicitBox.index) == 0 || len(explicitBox.entries) * 2 > len(explicitBox.index)) {
+                reindexMap(mut &explicitBox)
+            } else if len(explicitBox.index) > 0 {
+                let mask = len(explicitBox.index) - 1
+                var s = int(raw[i].key.hash() & u64(mask))
+                while explicitBox.index[s] >= 0 { s = (s + 1) & mask }
+                explicitBox.index[s] = len(explicitBox.entries) - 1
+            }
+        }
+    }
+
+    // Now build final entries in source order, expanding each '<<' where it appears
+    var outBox = MapBox{entries: [], index: []}
+    for i in 0..len(raw) {
+        if !isMerge[i] {
+            let idx = findNodeKey(&outBox, &raw[i].key)
+            if idx >= 0 {
+                outBox.entries[idx].value = raw[i].value.clone()
+            } else {
+                appendMapBox(mut &outBox, Entry{key: raw[i].key.clone(), value: raw[i].value.clone()})
+            }
+        } else {
+            try expandMergeValue(&raw[i].value, &explicitBox, mut &outBox)
+        }
+    }
+    return Ok(outBox.entries)
+}
+
+fn appendMapBox(b: mut &MapBox, e: Entry) {
+    let h = e.key.hash()
+    append(mut &b.entries, e)
+    if len(b.entries) > SMALL_MAP {
+        if len(b.index) == 0 || len(b.entries) * 2 > len(b.index) {
+            reindexMap(b)
+        } else {
+            let mask = len(b.index) - 1
+            var s = int(h & u64(mask))
+            while b.index[s] >= 0 { s = (s + 1) & mask }
+            b.index[s] = len(b.entries) - 1
+        }
+    }
+}
+
+fn expandMergeValue(val: &Node, explicitBox: &MapBox, outBox: mut &MapBox): Result[Unit, Error] {
+    match val.value {
+        Value.Map(m) {
+            for i in 0..len(m.entries) {
+                let k = &m.entries[i].key
+                if findNodeKey(explicitBox, k) < 0 && findNodeKey(outBox, k) < 0 {
+                    appendMapBox(outBox, m.entries[i].clone())
+                }
+            }
+            return Ok(Unit{})
+        }
+        Value.Seq(s) {
+            for i in 0..len(s.items) {
+                match s.items[i].value {
+                    Value.Map(m) {
+                        for j in 0..len(m.entries) {
+                            let k = &m.entries[j].key
+                            if findNodeKey(explicitBox, k) < 0 && findNodeKey(outBox, k) < 0 {
+                                appendMapBox(outBox, m.entries[j].clone())
+                            }
+                        }
+                    }
+                    else {
+                        return Err(makeError(ErrorKind.MergeKey, "merge key sequence element must be a mapping", s.items[i].span))
+                    }
+                }
+            }
+            return Ok(Unit{})
+        }
+        else {
+            return Err(makeError(ErrorKind.MergeKey, "merge key '<<' value must be a mapping or sequence of mappings", val.span))
+        }
+    }
+}
+
+fn keyDisplay(k: &Node): str {
+    match k.value {
+        Value.Str(s) { return s.clone() }
+        else { return write(k, &writeFlow()) }
+    }
+}
+
+// ---------------------------------------------------------------- top-level parse functions
+
+// Parses a single YAML document into a Node. Empty / comment-only input returns
+// Null (preserving comments). Multiple documents return ErrorKind.MultipleDocs.
+pub fn parse(src: &str): Result[Node, Error] {
+    return parseWith(src, &parseDefaults())
+}
+
+pub fn parseWith(src: &str, opts: &ParseOptions): Result[Node, Error] {
+    let doc = try parseDocWith(src, opts)
+    return Ok(doc.root)
+}
+
+pub fn parseDoc(src: &str): Result[Doc, Error] {
+    return parseDocWith(src, &parseDefaults())
+}
+
+pub fn parseDocWith(src: &str, opts: &ParseOptions): Result[Doc, Error] {
+    var d = decoderWith(src, opts)
+    // Capture comments if input is completely empty/comment-only
+    let first = try d.next()
+    match first {
+        None {
+            // Re-scan comments on comment-only input so round-trip keeps them
+            var head = ""
+            if opts.comments {
+                var ep = eventsWith(src, opts)
+                while true {
+                    match try ep.next() {
+                        Some(ev) {
+                            if ev.kind == EventKind.Comment && len(ev.val) > 0 {
+                                appendHeadComment(mut &head, &ev.val, ev.blankBefore)
+                            }
+                        }
+                        None { break }
+                    }
+                }
+            }
+            var n = null()
+            n.comments.head = head
+            return Ok(Doc{root: n, hasStart: false, hasEnd: false, headComment: "", version: ""})
+        }
+        Some(doc) {
+            match try d.next() {
+                Some(extra) {
+                    return Err(makeError(ErrorKind.MultipleDocs, "expected a single YAML document (use parseAll for multi-document streams)", extra.root.span))
+                }
+                None { return Ok(doc) }
+            }
+        }
+    }
+}
+
+// Parses all documents in a YAML stream (0 or more).
+pub fn parseAll(src: &str): Result[[]Node, Error] {
+    return parseAllWith(src, &parseDefaults())
+}
+
+pub fn parseAllWith(src: &str, opts: &ParseOptions): Result[[]Node, Error] {
+    let docs = try parseDocsWith(src, opts)
+    var out: []Node = []
+    for d in move(docs) { append(mut &out, d.root) }
+    return Ok(out)
+}
+
+pub fn parseDocs(src: &str): Result[[]Doc, Error] {
+    return parseDocsWith(src, &parseDefaults())
+}
+
+pub fn parseDocsWith(src: &str, opts: &ParseOptions): Result[[]Doc, Error] {
+    var dec = decoderWith(src, opts)
+    var out: []Doc = []
+    while true {
+        match try dec.next() {
+            Some(doc) { append(mut &out, doc) }
+            None { break }
+        }
+    }
+    return Ok(out)
+}
+
+// ---------------------------------------------------------------- writing
+
+// Streaming output sink (satisfied by io.Writer and yaml.Buf).
+pub type Sink = interface {
+    fn (mut &Self) write(s: &str)
+    fn (mut &Self) writeByte(c: byte)
+}
+
+// In-memory string buffer satisfying Sink.
+pub type Buf = record { text: str }
+
+pub fn newBuf(): Buf { return Buf{text: ""} }
+pub fn (b: mut &Buf) write(s: &str) { b.text += s }
+pub fn (b: mut &Buf) writeByte(c: byte) { b.text.addByte(c) }
+pub fn (b: &Buf) toStr(): str { return b.text.clone() }
+pub fn (b: &Buf) size(): int { return len(b.text) }
+pub fn (b: mut &Buf) clear() { b.text.clear() }
+
+pub fn write(n: &Node, opts: &WriteOptions): str {
+    var b = newBuf()
+    writeTo(mut &b, n, opts)
+    return b.toStr()
+}
+
+pub fn writeDoc(d: &Doc, opts: &WriteOptions): str {
+    var b = newBuf()
+    writeDocTo(mut &b, d, opts)
+    return b.toStr()
+}
+
+pub fn writeAll(docs: &[Node], opts: &WriteOptions): str {
+    var b = newBuf()
+    for i in 0..len(docs) {
+        if i > 0 || opts.docStart {
+            b.write("---\n")
+        }
+        var sub = opts.clone()
+        sub.docStart = false
+        writeTo(mut &b, &docs[i], &sub)
+        if b.size() > 0 && b.text[b.size() - 1] != '\n' {
+            b.writeByte('\n')
+        }
+    }
+    return b.toStr()
+}
+
+pub fn (n: &Node) toStr(): str {
+    return write(n, &writeDefaults())
+}
+
+pub fn writeDocTo[W: Sink](w: mut &W, d: &Doc, opts: &WriteOptions) {
+    if opts.comments && len(d.headComment) > 0 {
+        writeCommentBlock(w, &d.headComment, 0)
+    }
+    if len(d.version) > 0 {
+        w.write("%YAML ")
+        w.write(&d.version)
+        w.writeByte('\n')
+    }
+    var sub = opts.clone()
+    if d.hasStart || len(d.version) > 0 { sub.docStart = true }
+    if d.hasEnd { sub.docEnd = true }
+    writeTo(w, &d.root, &sub)
+}
+
+pub fn writeTo[W: Sink](w: mut &W, n: &Node, opts: &WriteOptions) {
+    if opts.docStart {
+        w.write("---\n")
+    }
+    if opts.comments && len(n.comments.head) > 0 {
+        writeCommentBlock(w, &n.comments.head, 0)
+    }
+    writeNode(w, n, opts, 0, true)
+    if !isFlowNode(n, opts, 0) {
+        // Block output ends with a newline
+        if !nodeEndsWithNewline(n, opts, 0) {
+            if opts.comments && len(n.comments.line) > 0 {
+                writeInlineComment(w, &n.comments.line)
+            }
+            w.writeByte('\n')
+        }
+    }
+    if opts.comments && len(n.comments.foot) > 0 {
+        writeCommentBlock(w, &n.comments.foot, 0)
+    }
+    if opts.docEnd {
+        w.write("...\n")
+    }
+}
+
+fn nodeEndsWithNewline(n: &Node, opts: &WriteOptions, depth: int): bool {
+    if isFlowNode(n, opts, depth) { return false }
+    match n.value {
+        Value.Seq(s) { return len(s.items) > 0 }
+        Value.Map(m) { return len(m.entries) > 0 }
+        else { return false }
+    }
+}
+
+fn isFlowNode(n: &Node, opts: &WriteOptions, depth: int): bool {
+    if opts.flowLevel >= 0 && depth >= opts.flowLevel { return true }
+    if opts.preserveStyle && n.style == Style.Flow { return true }
+    return false
+}
+
+fn writeSpaces[W: Sink](w: mut &W, n: int) {
+    var k = 0
+    while k + 16 <= n {
+        w.write("                ")
+        k += 16
+    }
+    while k < n {
+        w.writeByte(' ')
+        k += 1
+    }
+}
+
+fn writeCommentBlock[W: Sink](w: mut &W, text: &str, indent: int) {
+    var start = 0
+    let n = len(text)
+    while start <= n {
+        let nl = strings.indexOfByte(text, '\n', start)
+        let end = if nl < 0 { n } else { nl }
+        let line = text[start..end]
+        if len(line) > 0 {
+            writeSpaces(w, indent)
+            if line[0] != '#' { w.write("# ") }
+            w.write(line)
+        }
+        w.writeByte('\n')
+        if nl < 0 { break }
+        start = nl + 1
+    }
+}
+
+fn writeInlineComment[W: Sink](w: mut &W, text: &str) {
+    if len(text) == 0 { return }
+    w.writeByte(' ')
+    if text[0] != '#' { w.write("# ") }
+    w.write(text)
+}
+
+fn writeNodeProps[W: Sink](w: mut &W, n: &Node): bool {
+    var wrote = false
+    if len(n.anchor) > 0 {
+        w.writeByte('&')
+        w.write(&n.anchor)
+        wrote = true
+    }
+    if len(n.tag) > 0 {
+        if wrote { w.writeByte(' ') }
+        if strings.startsWith(&n.tag, "!") {
+            w.write(&n.tag)
+        } else {
+            w.write("!<")
+            w.write(&n.tag)
+            w.writeByte('>')
+        }
+        wrote = true
+    }
+    return wrote
+}
+
+fn writeNode[W: Sink](w: mut &W, n: &Node, opts: &WriteOptions, depth: int, topLevel: bool) {
+    let indStep = if opts.indent > 0 { opts.indent } else { 2 }
+    let flow = isFlowNode(n, opts, depth)
+
+    match n.value {
+        Value.Null {
+            if writeNodeProps(w, n) { w.writeByte(' ') }
+            w.write("null")
+        }
+        Value.Bool(b) {
+            if writeNodeProps(w, n) { w.writeByte(' ') }
+            w.write(if b { "true" } else { "false" })
+        }
+        Value.Num(num) {
+            if writeNodeProps(w, n) { w.writeByte(' ') }
+            writeNumber(w, &num)
+        }
+        Value.Str(s) {
+            if writeNodeProps(w, n) { w.writeByte(' ') }
+            writeScalarStr(w, &s, n.style, opts, depth * indStep, flow)
+        }
+        Value.Seq(s) {
+            if len(s.items) == 0 {
+                if writeNodeProps(w, n) { w.writeByte(' ') }
+                w.write("[]")
+                return
+            }
+            if flow {
+                if writeNodeProps(w, n) { w.writeByte(' ') }
+                w.writeByte('[')
+                for i in 0..len(s.items) {
+                    if i > 0 { w.write(", ") }
+                    writeNode(w, &s.items[i], opts, depth + 1, false)
+                }
+                w.writeByte(']')
+                return
+            }
+            let col = depth * indStep
+            if hasNodeProps(n) {
+                writeSpaces(w, col)
+                let _p = writeNodeProps(w, n)
+                w.writeByte('\n')
+            }
+            for i in 0..len(s.items) {
+                let it = &s.items[i]
+                if opts.comments {
+                    if it.comments.blankBefore && i > 0 { w.writeByte('\n') }
+                    if len(it.comments.head) > 0 { writeCommentBlock(w, &it.comments.head, col) }
+                }
+                writeSpaces(w, col)
+                let itFlow = isFlowNode(it, opts, depth + 1)
+                let itBlockColl = !itFlow && ((it.isMap() && it.size() > 0) || (it.isSeq() && it.size() > 0))
+                if itBlockColl {
+                    w.write("-")
+                    if hasNodeProps(it) {
+                        w.writeByte(' ')
+                        let _p = writeNodeProps(w, it)
+                    }
+                    w.writeByte('\n')
+                    writeNodeNoProps(w, it, opts, depth + 1)
+                } else {
+                    w.write("- ")
+                    writeNode(w, it, opts, depth + 1, false)
+                    if opts.comments && len(it.comments.line) > 0 {
+                        writeInlineComment(w, &it.comments.line)
+                    }
+                    w.writeByte('\n')
+                }
+            }
+        }
+        Value.Map(m) {
+            if len(m.entries) == 0 {
+                if writeNodeProps(w, n) { w.writeByte(' ') }
+                w.write("{}")
+                return
+            }
+            var order: []int = []
+            for i in 0..len(m.entries) { append(mut &order, i) }
+            if opts.sortKeys { sortEntryIndices(mut &order, &m.entries) }
+
+            if flow {
+                if writeNodeProps(w, n) { w.writeByte(' ') }
+                w.writeByte('{')
+                for x in 0..len(order) {
+                    let i = order[x]
+                    if x > 0 { w.write(", ") }
+                    writeFlowKey(w, &m.entries[i].key, opts, depth + 1)
+                    w.write(": ")
+                    writeNode(w, &m.entries[i].value, opts, depth + 1, false)
+                }
+                w.writeByte('}')
+                return
+            }
+            let col = depth * indStep
+            if hasNodeProps(n) {
+                writeSpaces(w, col)
+                let _p = writeNodeProps(w, n)
+                w.writeByte('\n')
+            }
+            for x in 0..len(order) {
+                let i = order[x]
+                let k = &m.entries[i].key
+                let v = &m.entries[i].value
+                if opts.comments {
+                    if k.comments.blankBefore && x > 0 { w.writeByte('\n') }
+                    if len(k.comments.head) > 0 { writeCommentBlock(w, &k.comments.head, col) }
+                }
+                writeSpaces(w, col)
+                let complexKey = k.isMap() || k.isSeq() || isMultilineStr(k)
+                if complexKey {
+                    w.write("? ")
+                    writeFlowKey(w, k, opts, depth + 1)
+                    w.writeByte('\n')
+                    writeSpaces(w, col)
+                    w.write(":")
+                } else {
+                    writeSimpleKey(w, k, opts)
+                    w.writeByte(':')
+                }
+
+                let vFlow = isFlowNode(v, opts, depth + 1)
+                let vBlockMap = !vFlow && v.isMap() && v.size() > 0
+                let vBlockSeq = !vFlow && v.isSeq() && v.size() > 0
+                if vBlockMap || vBlockSeq {
+                    if hasNodeProps(v) {
+                        w.writeByte(' ')
+                        let _p = writeNodeProps(w, v)
+                    }
+                    if opts.comments && len(k.comments.line) > 0 {
+                        writeInlineComment(w, &k.comments.line)
+                    }
+                    w.writeByte('\n')
+                    if opts.comments && len(v.comments.head) > 0 {
+                        let cIndent = if vBlockSeq && !opts.indentSeq { col } else { col + indStep }
+                        writeCommentBlock(w, &v.comments.head, cIndent)
+                    }
+                    let childDepth = if vBlockSeq && !opts.indentSeq { depth } else { depth + 1 }
+                    writeNodeNoProps(w, v, opts, childDepth)
+                    if opts.comments && len(v.comments.foot) > 0 {
+                        let fIndent = if vBlockSeq && !opts.indentSeq { col } else { col + indStep }
+                        writeCommentBlock(w, &v.comments.foot, fIndent)
+                    }
+                } else {
+                    w.writeByte(' ')
+                    writeNode(w, v, opts, depth + 1, false)
+                    if opts.comments && len(v.comments.line) > 0 {
+                        writeInlineComment(w, &v.comments.line)
+                    }
+                    w.writeByte('\n')
+                }
+            }
+        }
+    }
+}
+
+fn hasNodeProps(n: &Node): bool {
+    return len(n.anchor) > 0 || len(n.tag) > 0
+}
+
+fn writeNodeNoProps[W: Sink](w: mut &W, n: &Node, opts: &WriteOptions, depth: int) {
+    if !hasNodeProps(n) {
+        writeNode(w, n, opts, depth, false)
+        return
+    }
+    var tmp = n.clone()
+    tmp.anchor = ""
+    tmp.tag = ""
+    writeNode(w, &tmp, opts, depth, false)
+}
+
+fn isMultilineStr(n: &Node): bool {
+    match n.value {
+        Value.Str(s) { return strings.indexOfByte(&s, '\n', 0) >= 0 }
+        else { return false }
+    }
+}
+
+fn writeSimpleKey[W: Sink](w: mut &W, k: &Node, opts: &WriteOptions) {
+    match k.value {
+        Value.Null { w.write("null") }
+        Value.Bool(b) { w.write(if b { "true" } else { "false" }) }
+        Value.Num(num) { writeNumber(w, &num) }
+        Value.Str(s) {
+            let st = if opts.preserveStyle { k.style } else { Style.Any }
+            if st == Style.Single && canSingleQuote(&s) {
+                writeSingleQuoted(w, &s)
+            } else if st == Style.Double {
+                writeDoubleQuoted(w, &s)
+            } else if isSafePlainScalar(&s, false) {
+                w.write(&s)
+            } else {
+                writeDoubleQuoted(w, &s)
+            }
+        }
+        else {
+            var flowOpts = opts.clone()
+            flowOpts.flowLevel = 0
+            writeNode(w, k, &flowOpts, 0, false)
+        }
+    }
+}
+
+fn writeFlowKey[W: Sink](w: mut &W, k: &Node, opts: &WriteOptions, depth: int) {
+    var flowOpts = opts.clone()
+    flowOpts.flowLevel = 0
+    writeNode(w, k, &flowOpts, depth, false)
+}
+
+fn writeNumber[W: Sink](w: mut &W, num: &Number) {
+    if len(num.text) > 0 {
+        w.write(&num.text)
+        return
+    }
+    if !num.isFloat && num.hasInt {
+        w.write(&(intToStr(num.i)))
+        return
+    }
+    if num.f != num.f {
+        w.write(".nan")
+        return
+    }
+    if !num.f.isFinite() {
+        w.write(if num.f < 0.0f { "-.inf" } else { ".inf" })
+        return
+    }
+    let t = num.f.toStr()
+    // Ensure a float without '.' or 'e' (like "1") writes as "1.0" so it round-trips as !!float
+    if strings.indexOfByte(&t, '.', 0) < 0 && strings.indexOfByte(&t, 'e', 0) < 0 && strings.indexOfByte(&t, 'E', 0) < 0 {
+        w.write(&t)
+        w.write(".0")
+    } else {
+        w.write(&t)
+    }
+}
+
+fn writeScalarStr[W: Sink](w: mut &W, s: &str, style: Style, opts: &WriteOptions, indentCol: int, flow: bool) {
+    let eff = if opts.preserveStyle { style } else { Style.Any }
+    if !flow {
+        if eff == Style.Literal && canBlockScalar(s) {
+            writeBlockLiteral(w, s, indentCol)
+            return
+        }
+        if eff == Style.Folded && canBlockScalar(s) {
+            writeBlockLiteral(w, s, indentCol) // literal preserves exact newlines & spaces losslessly
+            return
+        }
+        if eff == Style.Any && opts.literalMultiline && strings.indexOfByte(s, '\n', 0) >= 0 && canBlockScalar(s) {
+            writeBlockLiteral(w, s, indentCol)
+            return
+        }
+    }
+    if eff == Style.Single && canSingleQuote(s) {
+        writeSingleQuoted(w, s)
+        return
+    }
+    if eff == Style.Double {
+        writeDoubleQuoted(w, s)
+        return
+    }
+    if isSafePlainScalar(s, flow) {
+        w.write(s)
+        return
+    }
+    writeDoubleQuoted(w, s)
+}
+
+fn canBlockScalar(s: &str): bool {
+    if len(s) == 0 { return false }
+    for i in 0..len(s) {
+        let c = s[i]
+        if c < 0x20 && c != '\n' && c != '\t' { return false }
+        if c == 0x7F { return false }
+    }
+    // Reject if the string is only newlines/spaces (hard to keep exact indent unambiguously)
+    var hasNonSpace = false
+    for i in 0..len(s) {
+        if s[i] != ' ' && s[i] != '\n' {
+            hasNonSpace = true
+            break
+        }
+    }
+    return hasNonSpace
+}
+
+fn writeBlockLiteral[W: Sink](w: mut &W, s: &str, contentIndent: int) {
+    let n = len(s)
+    // Determine chomp indicator from trailing newlines
+    var trailingNl = 0
+    var k = n
+    while k > 0 && s[k - 1] == '\n' {
+        trailingNl += 1
+        k -= 1
+    }
+    // Check if first non-empty line starts with spaces (needs explicit indent indicator)
+    var needsExplicit = false
+    var p = 0
+    while p < n && s[p] == '\n' { p += 1 }
+    if p < n && s[p] == ' ' { needsExplicit = true }
+
+    w.writeByte('|')
+    if needsExplicit { w.writeByte('2') }
+    if trailingNl == 0 {
+        w.writeByte('-')
+    } else if trailingNl >= 2 {
+        w.writeByte('+')
+    }
+
+    let bodyEnd = if trailingNl == 1 { n - 1 } else if trailingNl >= 2 { n - 1 } else { n }
+    let ind = if contentIndent > 0 { contentIndent } else { 2 }
+    var start = 0
+    while start <= bodyEnd {
+        let nl = strings.indexOfByte(s, '\n', start)
+        let end = if nl < 0 || nl > bodyEnd { bodyEnd } else { nl }
+        w.writeByte('\n')
+        if end > start {
+            writeSpaces(w, ind)
+            w.write(s[start..end])
+        }
+        if nl < 0 || nl >= bodyEnd { break }
+        start = nl + 1
+    }
+}
+
+fn canSingleQuote(s: &str): bool {
+    for i in 0..len(s) {
+        let c = s[i]
+        if c < 0x20 || c == 0x7F { return false }
+    }
+    return true
+}
+
+fn writeSingleQuoted[W: Sink](w: mut &W, s: &str) {
+    w.writeByte('\'')
+    for i in 0..len(s) {
+        let c = s[i]
+        if c == '\'' {
+            w.write("''")
+        } else {
+            w.writeByte(c)
+        }
+    }
+    w.writeByte('\'')
+}
+
+const HEX_CHARS = "0123456789abcdef"
+
+fn writeDoubleQuoted[W: Sink](w: mut &W, s: &str) {
+    w.writeByte('"')
+    for i in 0..len(s) {
+        let c = s[i]
+        if c == '"' { w.write("\\\"") }
+        else if c == '\\' { w.write("\\\\") }
+        else if c == '\n' { w.write("\\n") }
+        else if c == '\r' { w.write("\\r") }
+        else if c == '\t' { w.write("\\t") }
+        else if c == 0 { w.write("\\0") }
+        else if c == 7 { w.write("\\a") }
+        else if c == 8 { w.write("\\b") }
+        else if c == 11 { w.write("\\v") }
+        else if c == 12 { w.write("\\f") }
+        else if c == 27 { w.write("\\e") }
+        else if c < 0x20 || c == 0x7F {
+            w.write("\\x")
+            w.writeByte(HEX_CHARS[(int(c) >> 4) & 15])
+            w.writeByte(HEX_CHARS[int(c) & 15])
+        } else {
+            w.writeByte(c)
+        }
+    }
+    w.writeByte('"')
+}
+
+// Returns true iff s can be written unquoted and will re-parse as the exact same Str
+// under YAML 1.2 Core Schema.
+fn isSafePlainScalar(s: &str, flow: bool): bool {
+    let n = len(s)
+    if n == 0 { return false }
+    if s[0] == ' ' || s[0] == '\t' || s[n - 1] == ' ' || s[n - 1] == '\t' { return false }
+    // Must not start with indicator characters
+    let c0 = s[0]
+    if c0 == '-' || c0 == '?' || c0 == ':' || c0 == ',' || c0 == '[' || c0 == ']' ||
+       c0 == '{' || c0 == '}' || c0 == '#' || c0 == '&' || c0 == '*' || c0 == '!' ||
+       c0 == '|' || c0 == '>' || c0 == '\'' || c0 == '"' || c0 == '%' || c0 == '@' || c0 == '`' {
+        return false
+    }
+    if s == "---" || s == "..." { return false }
+    // Must not resolve as null, bool, int, or float under YAML 1.2 Core
+    if isCoreNull(s) { return false }
+    if parseCoreBool(s).isSome() { return false }
+    if parseCoreInt(s).isSome() { return false }
+    if parseCoreFloat(s).isSome() { return false }
+
+    for i in 0..n {
+        let c = s[i]
+        if c < 0x20 || c == 0x7F { return false }
+        if flow && isFlowIndic(c) { return false }
+        if c == ':' {
+            if i + 1 >= n || isBlankOrBreak(s[i + 1]) || (flow && isFlowIndic(s[i + 1])) {
+                return false
+            }
+        }
+        if c == '#' && i > 0 && isBlankByte(s[i - 1]) {
+            return false
+        }
+    }
+    return true
+}
+
+fn sortEntryIndices(order: mut &[]int, entries: &[]Entry) {
+    let n = len(order)
+    for i in 1..n {
+        var k = i
+        while k > 0 && keyDisplay(&entries[order[k - 1]].key) > keyDisplay(&entries[order[k]].key) {
+            swap(order, k - 1, k)
+            k -= 1
+        }
+    }
+}

@@ -1,0 +1,136 @@
+// expect: ok
+import "yaml"
+import "json"
+import "strings"
+
+fn assertEq(cond: bool, msg: &str) {
+    if !cond { panic("FAIL: " + msg) }
+}
+
+fn main() {
+    // 1. Round-trip with comments, blank lines, and editing
+    let original = `# Application config
+# Generated 2026
+host: localhost # local bind
+
+# Network settings
+port: 8080 # HTTP port
+server: # nested block
+  # Worker count
+  workers: 4
+items:
+  # First entry
+  - alpha # first
+  - beta
+# End of file
+`
+    var doc = yaml.parse(original).unwrap()
+    // Edit port: must preserve key order, '# Network settings', and '# HTTP port'
+    doc.set("port", yaml.integer(9090))
+    let edited = yaml.write(&doc, &yaml.writeDefaults())
+    assertEq(strings.contains(&edited, "# Application config"), "file header preserved")
+    assertEq(strings.contains(&edited, "# Generated 2026"), "file header line 2 preserved")
+    assertEq(strings.contains(&edited, "host: localhost # local bind"), "host inline comment")
+    assertEq(strings.contains(&edited, "# Network settings\nport: 9090 # HTTP port"), "port head + inline comment preserved on edit")
+    assertEq(strings.contains(&edited, "server: # nested block"), "key inline comment before block")
+    assertEq(strings.contains(&edited, "# Worker count"), "nested key head comment")
+    assertEq(strings.contains(&edited, "# First entry"), "seq item head comment")
+    assertEq(strings.contains(&edited, "- alpha # first"), "seq item inline comment")
+    assertEq(strings.contains(&edited, "# End of file"), "foot comment preserved")
+
+    // Re-parse edited output and check semantic equality
+    let reparsed = yaml.parse(&edited).unwrap()
+    assertEq(reparsed.eq(&doc), "edited doc round-trips semantically equal")
+    assertEq(reparsed.get("port").unwrap().asInt().unwrap() == 9090, "edited port value")
+
+    // 2. Style preservation & safe quoting on tricky strings
+    var tricky = yaml.mapping()
+    let weirds: []str = [
+        "", "true", "false", "null", "~", "123", "0x10", "0o77", "1.5", ".inf", "-.inf", ".nan",
+        "a: b", "a # b", "- item", " leading", "trailing ", "---", "...", "multi\nline\ntext\n",
+        "no-trailing\nnewline", "has\ttab\x07bell", "normal_text", "hello world", "yes", "no"
+    ]
+    for i in 0..len(weirds) {
+        tricky.set(&("k" + intToStr(i)), yaml.string(&weirds[i]))
+    }
+    let written = yaml.write(&tricky, &yaml.writeDefaults())
+    let back = yaml.parse(&written).unwrap()
+    assertEq(back.eq(&tricky), "all tricky strings round-trip identically")
+    for i in 0..len(weirds) {
+        let got = back.get(&("k" + intToStr(i))).unwrap().asStr().unwrap()
+        assertEq(got == weirds[i], "tricky string exact match: " + intToStr(i))
+    }
+
+    // Check style preservation (single, double, flow, literal)
+    let styled = yaml.parse("a: 'single'\nb: \"double\"\nc: [1, 2, 3]\nd: {x: 1, y: 2}\n").unwrap()
+    let styledOut = yaml.write(&styled, &yaml.writeDefaults())
+    assertEq(strings.contains(&styledOut, "a: 'single'"), "single style preserved")
+    assertEq(strings.contains(&styledOut, "b: \"double\""), "double style preserved")
+    assertEq(strings.contains(&styledOut, "c: [1, 2, 3]"), "flow seq preserved")
+    assertEq(strings.contains(&styledOut, "d: {x: 1, y: 2}"), "flow map preserved")
+
+    // 3. Copy-on-write independence
+    let a = yaml.mapping().with("x", yaml.integer(1))
+    var b = a.clone()
+    b.set("x", yaml.integer(2))
+    assertEq(a.get("x").unwrap().asInt().unwrap() == 1, "cow original unchanged")
+    assertEq(b.get("x").unwrap().asInt().unwrap() == 2, "cow copy updated")
+
+    // 4. Large mapping (> 16 keys exercises hash index)
+    var big = yaml.mapping()
+    for i in 0..40 {
+        big.set(&("key_" + intToStr(i)), yaml.integer(i * 10))
+    }
+    assertEq(big.size() == 40, "big size")
+    assertEq(big.get("key_37").unwrap().asInt().unwrap() == 370, "big indexed lookup")
+    let rem = big.remove("key_15").unwrap()
+    assertEq(rem.asInt().unwrap() == 150 && big.size() == 39 && !big.has("key_15"), "big remove")
+    assertEq(big.get("key_39").unwrap().asInt().unwrap() == 390, "big lookup after remove")
+
+    // 5. Sort keys option
+    let uns = yaml.mapping().with("z", yaml.integer(1)).with("a", yaml.integer(2)).with("m", yaml.integer(3))
+    var sortOpts = yaml.writeDefaults()
+    sortOpts.sortKeys = true
+    assertEq(yaml.write(&uns, &sortOpts) == "a: 2\nm: 3\nz: 1\n", "sortKeys")
+
+    // 6. writeAll & parseAll multi-doc round-trip
+    let d1 = yaml.mapping().with("kind", yaml.string("Service"))
+    let d2 = yaml.mapping().with("kind", yaml.string("Deployment"))
+    let multi = yaml.writeAll(&[d1.clone(), d2.clone()], &yaml.writeDefaults())
+    let multiBack = yaml.parseAll(&multi).unwrap()
+    assertEq(len(multiBack) == 2 && multiBack[0].eq(&d1) && multiBack[1].eq(&d2), "multi-doc roundtrip")
+
+    // 7. JSON bridge (toJson / fromJson)
+    let yj = yaml.parse("name: lexell\nprice: 12.50\nhex: 0x10\ntags: [a, b]\nok: true\nnil: null\n").unwrap()
+    let jv = yaml.toJson(&yj).unwrap()
+    assertEq(jv.field("name").asStr().unwrap() == "lexell", "toJson str")
+    assertEq(jv.field("price").asDecimal().unwrap() == 12.50m, "toJson decimal")
+    assertEq(jv.field("hex").asInt().unwrap() == 16, "toJson hex -> int")
+    let yback = yaml.fromJson(&jv)
+    assertEq(yback.eq(&yj), "fromJson round-trip equal")
+    // Non-string key fails toJson cleanly
+    let badJson = yaml.parse("1: one").unwrap()
+    assertEq(yaml.toJson(&badJson).unwrapErr().kind == yaml.ErrorKind.JsonCompat, "non-str key JsonCompat")
+    // .inf fails toJson cleanly
+    let infJson = yaml.parse("x: .inf").unwrap()
+    assertEq(yaml.toJson(&infJson).unwrapErr().kind == yaml.ErrorKind.JsonCompat, "inf JsonCompat")
+
+    // 8. Pull event stream
+    var ep = yaml.events("# hi\na: [1, 2]\n")
+    var evCount = 0
+    var sawComment = false
+    var sawSeqStart = false
+    while true {
+        match ep.next().unwrap() {
+            Some(ev) {
+                evCount += 1
+                if ev.kind == yaml.EventKind.Comment { sawComment = true }
+                if ev.kind == yaml.EventKind.SeqStart { sawSeqStart = true }
+            }
+            None { break }
+        }
+    }
+    assertEq(evCount >= 8 && sawComment && sawSeqStart, "event stream")
+
+    println("ok")
+}
