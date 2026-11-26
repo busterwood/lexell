@@ -999,18 +999,29 @@ pub fn hasGraph(s: &Stmt): bool {
 // GRAPH_TABLE column it names its COLUMNS expression. None where that does not hold (or a name is not one of GRAPH_TABLE's
 // columns): the subquery is planned as it is (lexdb_exec.bindFrom, expand).
 pub fn flatQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt): Result[Option[Stmt], DbErr] {
-    if s.kind != lexdb_sql.S_SELECT || s.setop != 0 || len(s.from) != 1 || len(s.subs) != 1 || len(s.windows) > 0 || len(s.mr) > 0 ||
+    if s.kind != lexdb_sql.S_SELECT || s.setop != 0 || len(s.from) < 1 || len(s.subs) != 1 || len(s.windows) > 0 || len(s.mr) > 0 ||
        s.lockMode != 0 || len(s.into) > 0 || s.waitFor || len(s.inner) > 0 || len(s.distinctOn) > 0 {
         return Ok(None)
     }
     let f = &s.from[0]
     if f.sub != 0 || !isGraph(&s.subs[0]) || len(f.cols) > 0 || f.lateral { return Ok(None) }
+    let multi = len(s.from) > 1
+    if multi {
+        if len(f.alias) == 0 { return Ok(None) }
+        for j in 1..len(s.from) {
+            let fj = &s.from[j]
+            if fj.sub >= 0 || fj.work >= 0 || fj.lateral || len(fj.using) > 0 || fj.natural ||
+               fj.join == lexdb_sql.J_RIGHT || fj.join == lexdb_sql.J_FULL || strings.startsWith(&fj.alias, "gt$") {
+                return Ok(None)
+            }
+        }
+    }
     let g = &s.subs[0]
     if strings.contains(&strings.toLowerAscii(&g.index), "shortest") { return Ok(None) }
     let md = g.mdialect
     var mn = false
     let branches = try branchTextsIn(st, txn, &g.index, md, mut &mn)
-    if len(branches) > 1 && !mn { return unionOnly(s, &branches, md) }
+    if !multi && len(branches) > 1 && !mn { return unionOnly(s, &branches, md) }
     if len(branches) != 1 || mn { return Ok(None) }
     var bs = try parseSql(&branches[0], md, g.names.clone())
     if len(bs) != 1 { return Ok(None) }
@@ -1029,17 +1040,34 @@ pub fn flatQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt): R
     }
     var own: []str = []                 // the select list's own aliases (ORDER BY and GROUP BY may name them)
     for it in s.items { if len(it.alias) > 0 { append(mut &own, it.alias.clone()) } }
-    let sb = Sub{al: f.alias.clone(), names: names, exprs: exprs, own: []}
+    let sb = Sub{al: f.alias.clone(), names: names, exprs: exprs, own: [], multi: multi}
     var miss = false
     var out = s.clone()
     out.subs = []
     out.udf = false
     out.from = b.from.clone()
+    if multi {
+        for j in 1..len(s.from) {
+            var fj = s.from[j].clone()
+            match &s.from[j].on {
+                Some(ox) { fj.on = Some(subst(&ox, &sb, mut &miss)) }
+                None {}
+            }
+            append(mut &out.from, fj)
+        }
+    }
     if b.params > out.params { out.params = b.params }
     var items: []lexdb_sql.SelItem = []
     for it in s.items {
         if it.star {
-            if len(it.qual) > 0 && it.qual != f.alias { return Ok(None) }
+            if multi && len(it.qual) == 0 { return Ok(None) }
+            if len(it.qual) > 0 && it.qual != f.alias {
+                if multi {
+                    append(mut &items, it.clone())
+                    continue
+                }
+                return Ok(None)
+            }
             for x in b.items { append(mut &items, x.clone()) }
             continue
         }
@@ -1072,7 +1100,7 @@ pub fn flatQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt): R
         None {}
     }
     out.where = andOf(&b.where, sw)
-    let sbo = Sub{al: f.alias.clone(), names: sb.names.clone(), exprs: sb.exprs.clone(), own: own}
+    let sbo = Sub{al: f.alias.clone(), names: sb.names.clone(), exprs: sb.exprs.clone(), own: own, multi: multi}
     var group: []Expr = []
     for x in s.group { append(mut &group, subst(&x, &sbo, mut &miss)) }
     out.group = group
@@ -1138,7 +1166,7 @@ fn andOf(a: &Option[Expr], b: Option[Expr]): Option[Expr] {
 
 // GRAPH_TABLE's columns (names folded, as the select list's aliases) and their expressions, the FROM item's alias, the select
 // list's own aliases (a name of ORDER BY or GROUP BY that is one of them is left as it is).
-type Sub = record { al: str; names: []str; exprs: []Expr; own: []str }
+type Sub = record { al: str; names: []str; exprs: []Expr; own: []str; multi: bool }
 
 // The column of GRAPH_TABLE a name is (alias.name or name), -1 none.
 fn colAt(sb: &Sub, n: &str): int {
@@ -1155,6 +1183,17 @@ fn colAt(sb: &Sub, n: &str): int {
 fn subst(x: &Expr, sb: &Sub, miss: mut &bool): Expr {
     match x {
         Expr.Col(n, _) {
+            if sb.multi {
+                if strings.startsWith(n, &(sb.al + ".")) {
+                    let k = colAt(sb, n)
+                    if k >= 0 { return lexdb_sql.cloneExpr(&sb.exprs[k]) }
+                    let old = replace(miss, true)
+                    return lexdb_sql.cloneExpr(x)
+                }
+                if strings.contains(n, ".") { return lexdb_sql.cloneExpr(x) }
+                if colAt(sb, n) >= 0 { let old = replace(miss, true) }
+                return lexdb_sql.cloneExpr(x)
+            }
             let k = colAt(sb, n)
             if k >= 0 { return lexdb_sql.cloneExpr(&sb.exprs[k]) }
             if !(len(n) > 0 && n[0] == '#') && !lexdb_base.hasStr(&sb.own, n) { let old = replace(miss, true) }

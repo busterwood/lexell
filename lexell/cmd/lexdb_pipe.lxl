@@ -6586,6 +6586,7 @@ const JK_GEN = 0        // the keys' values made as the row engine makes them (k
 const JK_INT = 1        // one integer key of an integer column: by its value
 const JK_TEXT = 2       // one text key of a text column, no collation: by its text
 const JK_INT2 = 3       // two int2/int4 keys packed into one 64-bit integer: (v0 << 32) | (v1 & 0xffffffff)
+const JK_INT2_64 = 4    // two int2/int4/int8 keys in flat (k0, k1) open-addressed table (FastInt2Count / FastInt2Map)
 
 // A value a batch cannot hold in a join's run (a chunk's, a lookup's): the
 // caller runs the query another way. Counted (batErrs: the tests' look,
@@ -6668,12 +6669,17 @@ type JL = record {
     nk: int
     sumAll: int
     colls: []int            // per key: its collation (lexdb_sql.COLL_*; [] none): JK_GEN, the keys' collated values (Q8 R4)
-    countOnly: bool         // JK_INT / JK_INT2 inner join with no columns read above: fastCnt / dense holds key -> row count, no rows stored
+    countOnly: bool         // JK_INT / JK_INT2 / JK_INT2_64 join with no columns read above: fastCnt/fastCnt2/dense holds key -> row count
     fastCnt: lexdb_ht.FastIntCount // open-addressed int -> count for countOnly JK_INT / JK_INT2
+    fastCnt2: lexdb_ht.FastInt2Count // open-addressed (int64, int64) -> count for countOnly JK_INT2_64
+    ints2: lexdb_ht.FastInt2Map      // open-addressed (int64, int64) -> bucket for JK_INT2_64
     dense: []int            // direct-indexed JK_INT lookup (key - denseMin -> bucket or count; empty if sparse)
     denseMin: int
     kCol0: int              // bare column index of key[0] (-1 if expression) for zero-gather probe
     kCol1: int              // bare column index of key[1] (-1 if expression) for zero-gather probe
+    neqOut: int             // inline residual "outer_col <> inner_col" (-1 none): query slot of outer BK_INT col
+    neqIn: int              // ... and local column offset of inner BK_INT col in jl.rows
+    antiNull: bool          // MK_ANTI lowered from "LEFT JOIN ... WHERE right.col IS NULL" (for exact EXPLAIN ANALYZE counters)
 }
 
 const NA_NOTIN: int = 1
@@ -6687,7 +6693,8 @@ fn newJL(how: int, level: int, first: int, ncol: int): JL {
               bp: BPlan{kinds: [], needCol: [], placeCol: [], usedP: [], stopAt: 0, missing: [], needP: [], width: 0, ranges: []},
               perRow: 0, mark: 0, los: [], his: [], noNulls: false, right: false, cross: false, raw: false, resCol: -1, mixed: [], single: [], res: BNode.Const(0, true), resTyp: BT_INT,
               cutB: [], cutTo: -1, na: 0, nk: 0, sumAll: 0, colls: [], countOnly: false,
-              fastCnt: lexdb_ht.newFastIntCount(), dense: [], denseMin: 0, kCol0: -1, kCol1: -1}
+              fastCnt: lexdb_ht.newFastIntCount(), fastCnt2: lexdb_ht.newFastInt2Count(), ints2: lexdb_ht.newFastInt2Map(),
+              dense: [], denseMin: 0, kCol0: -1, kCol1: -1, neqOut: -1, neqIn: -1, antiNull: false}
 }
 
 // A join's run: its levels, the query's columns' kinds (all tables'),
@@ -6711,6 +6718,7 @@ type JRun = record {
     // scalar subquery's first rows: PScan.stops) and no Apply: its rows
     // joined in slices that grow (joinGrow, Q8 R4)
     grow: bool
+    weighted: bool          // plain SELECT count(*): propagate row multiplicities instead of replicating countOnly matches
 }
 
 // The query's columns x reads, in order of first read.
@@ -7357,6 +7365,30 @@ fn joinKey(x: &BX, cols: &[]lexdb_sql.ColDef, jr: &JRun, cx: &Ctx, dec: bool, av
 
 fn isInt32Oid(oid: int): bool { return oid == lexdb_sql.OID_INT2 || oid == lexdb_sql.OID_INT4 }
 
+fn isIntOid(oid: int): bool { return oid == lexdb_sql.OID_INT2 || oid == lexdb_sql.OID_INT4 || oid == lexdb_sql.OID_INT8 }
+
+fn isIntHashMode(mode: int): bool { return mode == JK_INT || mode == JK_INT2 || mode == JK_INT2_64 }
+
+// Whether a single post-filter on a LEFT JOIN is "right_col IS NULL" where right_col
+// is guaranteed non-null on every matched row (NOT NULL column or hash equijoin key).
+fn isLeftNullAnti(post: &[]BX, first: int, t: &lexdb_catalog.Table, hcols: &[]int): bool {
+    if len(post) != 1 { return false }
+    match post[0] {
+        BX.IsNull(inner, neg) {
+            if neg { return false }
+            match inner {
+                BX.Col(c) {
+                    let rc = c - first
+                    if rc < 0 || rc >= len(t.cols) { return false }
+                    return t.cols[rc].notNull || lexdb_plan.hasIdx(hcols, rc)
+                }
+                else { return false }
+            }
+        }
+        else { return false }
+    }
+}
+
 fn packInt2(v0: int, v1: int): int { return (v0 << 32) | (v1 & 4294967295) }
 
 fn inInt32(v: int): bool { return v >= -2147483648 && v <= 2147483647 }
@@ -7435,26 +7467,76 @@ fn joinSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.P
                 } else if len(j.keys) == 1 && jl.keyTyp[0] == BT_INT && jl.rkinds[hc] == BK_INT {
                     jl.mode = JK_INT
                 } else if len(j.keys) == 2 && jl.keyTyp[0] == BT_INT && jl.keyTyp[1] == BT_INT &&
-                          jl.rkinds[j.hcols[0]] == BK_INT && jl.rkinds[j.hcols[1]] == BK_INT &&
-                          isInt32Oid(t.cols[j.hcols[0]].typ.oid) && isInt32Oid(t.cols[j.hcols[1]].typ.oid) &&
-                          isInt32Oid(j.ktypes[0].oid) && isInt32Oid(j.ktypes[1].oid) {
-                    jl.mode = JK_INT2
+                          jl.rkinds[j.hcols[0]] == BK_INT && jl.rkinds[j.hcols[1]] == BK_INT {
+                    if isInt32Oid(t.cols[j.hcols[0]].typ.oid) && isInt32Oid(t.cols[j.hcols[1]].typ.oid) &&
+                       isInt32Oid(j.ktypes[0].oid) && isInt32Oid(j.ktypes[1].oid) {
+                        jl.mode = JK_INT2
+                    } else if isIntOid(t.cols[j.hcols[0]].typ.oid) && isIntOid(t.cols[j.hcols[1]].typ.oid) &&
+                              isIntOid(j.ktypes[0].oid) && isIntOid(j.ktypes[1].oid) {
+                        jl.mode = JK_INT2_64
+                    }
                 } else if len(j.keys) == 1 && jl.keyTyp[0] == BT_OTHER && jl.keyCol[0] >= 0 && jl.keyCol[0] < jr.nq {
                     let ho = t.cols[hc].typ.oid
                     let ko = cols[jl.keyCol[0]].typ.oid
                     if (ho == lexdb_sql.OID_TEXT || ho == lexdb_sql.OID_VARCHAR) && (ko == lexdb_sql.OID_TEXT || ko == lexdb_sql.OID_VARCHAR) && !textVals(jl.rkinds[hc], jr.kinds[jl.keyCol[0]]) { jl.mode = JK_TEXT }
                 }
             }
+            // Detect single inline "outer_int_col <> inner_int_col" residual condition on inner hash joins
+            var neqSkip = -1
+            if (j.how == lexdb_plan.JH_HASH || j.how == lexdb_plan.JH_ROWS) && jl.mode == JK_INT && jl.kCol0 >= 0 &&
+               jl.mark == lexdb_plan.MK_JOIN && !jl.left && !jl.right && jl.resCol < 0 && jl.na == 0 && len(j.post) == 0 {
+                var remIdx = -1
+                var remCnt = 0
+                for k in 0..len(j.conds) {
+                    if (k == j.keq || (k == j.keq2 && (jl.mode == JK_INT2 || jl.mode == JK_INT2_64))) && jl.mode != JK_GEN { continue }
+                    remIdx = k
+                    remCnt += 1
+                }
+                if remCnt == 1 {
+                    match j.conds[remIdx] {
+                        BX.Op(op, lhs, rhs) {
+                            if op == lexdb_ops.OP_EQ + 1 {
+                                match lhs {
+                                    BX.Col(ca) {
+                                        match rhs {
+                                            BX.Col(cb) {
+                                                if ca >= 0 && ca < jr.nq && cb >= 0 && cb < jr.nq &&
+                                                   jr.kinds[ca] == BK_INT && jr.kinds[cb] == BK_INT &&
+                                                   isIntOid(cols[ca].typ.oid) && isIntOid(cols[cb].typ.oid) {
+                                                    let aIn = ca >= sc.first && ca < sc.first + len(t.cols)
+                                                    let bIn = cb >= sc.first && cb < sc.first + len(t.cols)
+                                                    if aIn && !bIn && jr.owner[cb] >= 0 && jr.owner[cb] < lvl {
+                                                        jl.neqOut = cb
+                                                        jl.neqIn = ca - sc.first
+                                                        neqSkip = remIdx
+                                                    } else if bIn && !aIn && jr.owner[ca] >= 0 && jr.owner[ca] < lvl {
+                                                        jl.neqOut = ca
+                                                        jl.neqIn = cb - sc.first
+                                                        neqSkip = remIdx
+                                                    }
+                                                }
+                                            }
+                                            else {}
+                                        }
+                                    }
+                                    else {}
+                                }
+                            }
+                        }
+                        else {}
+                    }
+                }
+            }
             for k in 0..len(j.conds) {
                 // (the key equalities, when the hash compares by value: applied by the probe)
-                if (k == j.keq || (k == j.keq2 && jl.mode == JK_INT2)) && jl.mode != JK_GEN { continue }
+                if k == neqSkip || ((k == j.keq || (k == j.keq2 && (jl.mode == JK_INT2 || jl.mode == JK_INT2_64))) && jl.mode != JK_GEN) { continue }
                 match condNodeD(&j.conds[k], cols, &jr.kinds, cx, 0, &avail, dec) {
                     Some(n) { append(mut &jl.conds, n) }
                     None { return Err(batErr()) }
                 }
             }
             for k in 0..len(j.conds) {
-                if (k == j.keq || (k == j.keq2 && jl.mode == JK_INT2)) && jl.mode != JK_GEN { continue }
+                if k == neqSkip || ((k == j.keq || (k == j.keq2 && (jl.mode == JK_INT2 || jl.mode == JK_INT2_64))) && jl.mode != JK_GEN) { continue }
                 readsOf1(&j.conds[k], mut &jl.creads)
             }
             for k in 0..len(j.post) {
@@ -7467,8 +7549,19 @@ fn joinSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.P
             if j.how == lexdb_plan.JH_HASH || j.how == lexdb_plan.JH_ROWS {
                 var anyAbove = false
                 for c in 0..len(t.cols) { if sc.first + c < len(above) && above[sc.first + c] { anyAbove = true; break } }
-                if j.how == lexdb_plan.JH_HASH && jl.mark == lexdb_plan.MK_JOIN && (jl.mode == JK_INT || jl.mode == JK_INT2) &&
-                   !anyAbove && !jl.right && !jl.left && jl.resCol < 0 && jl.na == 0 && len(jl.conds) == 0 && len(jl.post) == 0 && len(jr.apReads) == 0 {
+                // Convert "LEFT JOIN t ON eq WHERE t.not_null_col IS NULL" into a countOnly hash anti-join
+                if j.how == lexdb_plan.JH_HASH && jl.left && !jl.right && jl.mark == lexdb_plan.MK_JOIN &&
+                   isIntHashMode(jl.mode) && !anyAbove && jl.resCol < 0 && jl.na == 0 && jl.neqOut < 0 && len(jl.conds) == 0 &&
+                   len(jr.apReads) == 0 && isLeftNullAnti(&j.post, sc.first, t, &j.hcols) {
+                    jl.mark = lexdb_plan.MK_ANTI
+                    jl.left = false
+                    jl.antiNull = true
+                    jl.post = []
+                    jl.preads = []
+                    jl.countOnly = true
+                } else if j.how == lexdb_plan.JH_HASH && jl.mark == lexdb_plan.MK_JOIN && isIntHashMode(jl.mode) &&
+                   !anyAbove && !jl.right && (!jl.left || jr.weighted) && jl.resCol < 0 && jl.na == 0 && jl.neqOut < 0 &&
+                   len(jl.conds) == 0 && len(jl.post) == 0 && len(jr.apReads) == 0 {
                     jl.countOnly = true
                 }
                 try hashBuild(st, txn, t, &j, &srcs[sc.level], &vrows[sc.level], cols, cx, mut &jl, jr, dec, bud, mut &cnt[sc.level])
@@ -7540,6 +7633,15 @@ fn grpSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, j: &lexdb_plan.PJ
     let hc = j.hcols[0]
     if len(j.keys) == 1 && jl.keyTyp[0] == BT_INT && jl.rkinds[hc] == BK_INT {
         jl.mode = JK_INT
+    } else if len(j.keys) == 2 && jl.keyTyp[0] == BT_INT && jl.keyTyp[1] == BT_INT &&
+              jl.rkinds[j.hcols[0]] == BK_INT && jl.rkinds[j.hcols[1]] == BK_INT {
+        if isInt32Oid(cols[j.hcols[0]].typ.oid) && isInt32Oid(cols[j.hcols[1]].typ.oid) &&
+           isInt32Oid(j.ktypes[0].oid) && isInt32Oid(j.ktypes[1].oid) {
+            jl.mode = JK_INT2
+        } else if isIntOid(cols[j.hcols[0]].typ.oid) && isIntOid(cols[j.hcols[1]].typ.oid) &&
+                  isIntOid(j.ktypes[0].oid) && isIntOid(j.ktypes[1].oid) {
+            jl.mode = JK_INT2_64
+        }
     } else if len(j.keys) == 1 && jl.keyTyp[0] == BT_OTHER && jl.keyCol[0] >= 0 && jl.keyCol[0] < nq {
         let ho = cols[hc].typ.oid
         let ko = cols[jl.keyCol[0]].typ.oid
@@ -7547,12 +7649,12 @@ fn grpSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, j: &lexdb_plan.PJ
     }
     var hasExtraCond = false
     for k in 0..len(j.conds) {
-        if k == j.keq && jl.mode != JK_GEN { continue }
+        if (k == j.keq || (k == j.keq2 && (jl.mode == JK_INT2 || jl.mode == JK_INT2_64))) && jl.mode != JK_GEN { continue }
         hasExtraCond = true
     }
     var needAbove = false
     for c in 0..nq { if want[c] && above[c] { needAbove = true } }
-    let countOnly = !hasExtraCond && !needAbove && jl.mode == JK_INT
+    let countOnly = !hasExtraCond && !needAbove && isIntHashMode(jl.mode)
     jl.countOnly = countOnly
     var buildWant = collections.copyOf(&want)
     if countOnly {
@@ -7567,7 +7669,8 @@ fn grpSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, j: &lexdb_plan.PJ
     var rows0 = lexdb_rows.newBatch(&bp, 0)
     rows0.n = 0
     var bd = Builder{rows: rows0, head: [], tail: [], next: [], ints: newMap(), txts: collections.newMapWith(collections.fxHashStr), gens: collections.newMapWith(collections.fxHashStr), mixed: [], single: [],
-                     held: 0, kept: 0, fastCnt: lexdb_ht.newFastIntCount(), hasRange: false, minK: 0, maxK: 0, tDict: [], tDictOn: []}
+                     held: 0, kept: 0, fastCnt: lexdb_ht.newFastIntCount(), fastCnt2: lexdb_ht.newFastInt2Count(), ints2: lexdb_ht.newFastInt2Map(),
+                     hasRange: false, minK: 0, maxK: 0, tDict: [], tDictOn: []}
     initTDict(mut &bd, &bp)
     let mode = jl.mode
     let h0 = bud.held
@@ -7611,10 +7714,12 @@ fn grpSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, j: &lexdb_plan.PJ
     jl.txts = replace(mut &bd.txts, collections.newMapWith(collections.fxHashStr))
     jl.gens = replace(mut &bd.gens, collections.newMapWith(collections.fxHashStr))
     jl.fastCnt = replace(mut &bd.fastCnt, lexdb_ht.newFastIntCount())
+    jl.fastCnt2 = replace(mut &bd.fastCnt2, lexdb_ht.newFastInt2Count())
+    jl.ints2 = replace(mut &bd.ints2, lexdb_ht.newFastInt2Map())
     buildDense(mut &jl, bd.hasRange, bd.minK, bd.maxK, bud.room())
     for k in 0..len(j.conds) {
         // (the key's equality, when the hash compares by value: applied by the probe)
-        if k == j.keq && jl.mode != JK_GEN { continue }
+        if (k == j.keq || (k == j.keq2 && (jl.mode == JK_INT2 || jl.mode == JK_INT2_64))) && jl.mode != JK_GEN { continue }
         match condNodeD(&j.conds[k], cols, &jr.kinds, cx, 0, &avail, dec) {
             Some(n) { append(mut &jl.conds, n) }
             None { return Err(batErr()) }
@@ -7677,7 +7782,7 @@ fn reduceHashes(jr: mut &JRun) {
         var plain = true
         for m in k..j {
             let ml = &jr.jls[m]
-            if len(ml.conds) > 0 || len(ml.post) > 0 || ml.resCol >= 0 { plain = false }
+            if len(ml.conds) > 0 || len(ml.post) > 0 || ml.resCol >= 0 || ml.neqOut >= 0 { plain = false }
             for x in ml.key {
                 match x {
                     BNode.Col(_) {}
@@ -7766,6 +7871,8 @@ type Builder = record {
     held: int
     kept: int
     fastCnt: lexdb_ht.FastIntCount
+    fastCnt2: lexdb_ht.FastInt2Count
+    ints2: lexdb_ht.FastInt2Map
     hasRange: bool
     minK: int
     maxK: int
@@ -7833,6 +7940,17 @@ fn (bd: mut &Builder) addCount(b: &Batch, idx: &[]int, hc: &[]int, mode: int, ro
     }
     let kc0 = &b.cols[hc[0]]
     let kc1 = &b.cols[hc[1]]
+    if mode == JK_INT2_64 {
+        for r in idx {
+            if kc0.nul[r] || kc1.nul[r] { continue }
+            if bd.fastCnt2.inc(kc0.v[r], kc1.v[r]) {
+                bd.held += 32
+                if room >= 0 && bd.held > room { return Err(memErr(maxHeld)) }
+            }
+            bd.kept += 1
+        }
+        return Ok(Unit{})
+    }
     for r in idx {
         if kc0.nul[r] || kc1.nul[r] { continue }
         let k = packInt2(kc0.v[r], kc1.v[r])
@@ -7889,6 +8007,12 @@ fn (bd: mut &Builder) add(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, mode: 
                         bd.ints.put(pk, bk)
                     }
                 }
+            }
+        } else if mode == JK_INT2_64 {
+            let kc0 = &b.cols[hc[0]]
+            let kc1 = &b.cols[hc[1]]
+            if kc0.nul[r] || kc1.nul[r] { nul = true } else {
+                bk = bd.ints2.getOrPut(kc0.v[r], kc1.v[r], len(bd.head))
             }
         } else if mode == JK_TEXT && bp.kinds[hc[0]] == BK_TEXT {
             if b.cols[hc[0]].nul[r] { nul = true } else {
@@ -8032,7 +8156,8 @@ fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalo
     var rows0 = lexdb_rows.newBatch(&bp, 0)
     rows0.n = 0
     var bd = Builder{rows: rows0, head: [], tail: [], next: [], ints: newMap(), txts: collections.newMapWith(collections.fxHashStr), gens: collections.newMapWith(collections.fxHashStr), mixed: [], single: [],
-                     held: 0, kept: 0, fastCnt: lexdb_ht.newFastIntCount(), hasRange: false, minK: 0, maxK: 0, tDict: [], tDictOn: []}
+                     held: 0, kept: 0, fastCnt: lexdb_ht.newFastIntCount(), fastCnt2: lexdb_ht.newFastInt2Count(), ints2: lexdb_ht.newFastInt2Map(),
+                     hasRange: false, minK: 0, maxK: 0, tDict: [], tDictOn: []}
     initTDict(mut &bd, &bp)
     let mode = jl.mode
     let raw = j.how == lexdb_plan.JH_ROWS
@@ -8092,6 +8217,8 @@ fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalo
     jl.txts = replace(mut &bd.txts, collections.newMapWith(collections.fxHashStr))
     jl.gens = replace(mut &bd.gens, collections.newMapWith(collections.fxHashStr))
     jl.fastCnt = replace(mut &bd.fastCnt, lexdb_ht.newFastIntCount())
+    jl.fastCnt2 = replace(mut &bd.fastCnt2, lexdb_ht.newFastInt2Count())
+    jl.ints2 = replace(mut &bd.ints2, lexdb_ht.newFastInt2Map())
     buildDense(mut &jl, bd.hasRange, bd.minK, bd.maxK, bud.room())
     jl.mixed = replace(mut &bd.mixed, [])
     jl.single = replace(mut &bd.single, [])
@@ -8279,6 +8406,10 @@ fn naBucket(jl: &JL, kv: &[]BVec, w: &Batch, r: int, kb: &str): int {
         let pk = packInt2(v0, v1)
         return jl.ints.getOr(&pk, -1)
     }
+    if jl.mode == JK_INT2_64 {
+        if kv[0].nul[r] || kv[1].nul[r] { return -1 }
+        return jl.ints2.get(kv[0].v[r], kv[1].v[r])
+    }
     if jl.mode == JK_TEXT {
         match keyAt(jl, kv, w, 0, r) {
             Val.Text(x) { return jl.txts.getOr(&x, -1) }
@@ -8331,7 +8462,7 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
     var pi: []int = withCapacity(n)
     var held = 0
     if hashed(jl) && jl.resCol < 0 && jl.mode == JK_INT && jl.kCol0 >= 0 {
-        let first = jl.mark == lexdb_plan.MK_SEMI && len(jl.conds) == 0
+        let first = (jl.mark == lexdb_plan.MK_SEMI || (jl.mark == lexdb_plan.MK_ANTI && !jl.antiNull)) && len(jl.conds) == 0
         let o0 = jr.owner[jl.kCol0]
         let sJl = &jr.jls[o0]
         let src = if hashed(sJl) && sJl.na < NA_MARK_EX { &sJl.rows } else { &js.cur[o0] }
@@ -8374,6 +8505,41 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
                 }
             }
         } else {
+        if jl.neqOut >= 0 {
+            let on = jr.owner[jl.neqOut]
+            let nJl = &jr.jls[on]
+            let nSrc = if hashed(nJl) && nJl.na < NA_MARK_EX { &nJl.rows } else { &js.cur[on] }
+            let ncOff = jl.neqOut - nJl.first
+            let nkc = &nSrc.cols[ncOff]
+            let nat = &at[on]
+            let inCol = &jl.rows.cols[jl.neqIn]
+            for r in 0..n {
+                let sr = at0[r]
+                let nsr = nat[r]
+                if sr < 0 || nsr < 0 || kc.nul[sr] || nkc.nul[nsr] { continue }
+                var bk = -1
+                if useDense {
+                    let d = kc.v[sr] - dMin
+                    if d >= 0 && d < dLen { bk = jl.dense[d] }
+                } else {
+                    match jl.ints.get(&kc.v[sr]) {
+                        Some(x) { bk = x }
+                        None {}
+                    }
+                }
+                if bk >= 0 {
+                    let ov = nkc.v[nsr]
+                    var x = jl.head[bk]
+                    while x >= 0 {
+                        if !inCol.nul[x] && inCol.v[x] != ov {
+                            append(mut &pj, r)
+                            append(mut &pi, x)
+                        }
+                        x = jl.next[x]
+                    }
+                }
+            }
+        } else {
             let cutTo = jl.cutTo
             for r in 0..n {
                 let sr = at0[r]
@@ -8405,9 +8571,10 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
             }
         }
         }
+        }
         cnt[lv].starts += n
-    } else if hashed(jl) && jl.resCol < 0 && jl.mode == JK_INT2 && jl.kCol0 >= 0 && jl.kCol1 >= 0 {
-        let first = jl.mark == lexdb_plan.MK_SEMI && len(jl.conds) == 0
+    } else if hashed(jl) && jl.resCol < 0 && (jl.mode == JK_INT2 || jl.mode == JK_INT2_64) && jl.kCol0 >= 0 && jl.kCol1 >= 0 {
+        let first = (jl.mark == lexdb_plan.MK_SEMI || (jl.mark == lexdb_plan.MK_ANTI && !jl.antiNull)) && len(jl.conds) == 0
         let o0 = jr.owner[jl.kCol0]
         let sJl0 = &jr.jls[o0]
         let src0 = if hashed(sJl0) && sJl0.na < NA_MARK_EX { &sJl0.rows } else { &js.cur[o0] }
@@ -8421,7 +8588,38 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
         let at0 = &at[o0]
         let kc1 = &src1.cols[cOff1]
         let at1 = &at[o1]
-        if jl.countOnly {
+        if jl.mode == JK_INT2_64 {
+            if jl.countOnly {
+                for r in 0..n {
+                    let sr0 = at0[r]
+                    let sr1 = at1[r]
+                    if sr0 < 0 || sr1 < 0 || kc0.nul[sr0] || kc1.nul[sr1] { continue }
+                    let m = jl.fastCnt2.get(kc0.v[sr0], kc1.v[sr1])
+                    if m > 0 {
+                        let rep = if first { 1 } else { m }
+                        for _ in 0..rep {
+                            append(mut &pj, r)
+                            append(mut &pi, -1)
+                        }
+                    }
+                }
+            } else {
+                for r in 0..n {
+                    let sr0 = at0[r]
+                    let sr1 = at1[r]
+                    if sr0 < 0 || sr1 < 0 || kc0.nul[sr0] || kc1.nul[sr1] { continue }
+                    let bk = jl.ints2.get(kc0.v[sr0], kc1.v[sr1])
+                    if bk >= 0 {
+                        var x = jl.head[bk]
+                        while x >= 0 {
+                            append(mut &pj, r)
+                            append(mut &pi, x)
+                            x = if first { -1 } else { jl.next[x] }
+                        }
+                    }
+                }
+            }
+        } else if jl.countOnly {
             for r in 0..n {
                 let sr0 = at0[r]
                 let sr1 = at1[r]
@@ -8473,8 +8671,8 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
             for r in 0..n { append(mut &all, r) }
             rv = try bEval(&jl.res, &w, &all)
         }
-        // a semi join with no condition: its first match only
-        let first = jl.mark == lexdb_plan.MK_SEMI && len(jl.conds) == 0
+        // a semi/anti join with no condition: its first match only
+        let first = (jl.mark == lexdb_plan.MK_SEMI || (jl.mark == lexdb_plan.MK_ANTI && !jl.antiNull)) && len(jl.conds) == 0
         // (per chunk: a text key's column BK_TEXT)
         let wtxt = jl.mode == JK_TEXT && lexdb_rows.isTextCol(&w, jl.keyCol[0])
         if jl.countOnly {
@@ -8491,6 +8689,18 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
                     } else {
                         m = jl.fastCnt.get(kv[0].v[r])
                     }
+                    if m > 0 {
+                        let rep = if first { 1 } else { m }
+                        for _ in 0..rep {
+                            append(mut &pj, r)
+                            append(mut &pi, -1)
+                        }
+                    }
+                }
+            } else if jl.mode == JK_INT2_64 {
+                for r in 0..n {
+                    if kv[0].nul[r] || kv[1].nul[r] { continue }
+                    let m = jl.fastCnt2.get(kv[0].v[r], kv[1].v[r])
                     if m > 0 {
                         let rep = if first { 1 } else { m }
                         for _ in 0..rep {
@@ -8546,6 +8756,10 @@ fn joinFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mu
                             None {}
                         }
                     }
+                }
+            } else if jl.mode == JK_INT2_64 {
+                if !kv[0].nul[r] && !kv[1].nul[r] {
+                    bk = jl.ints2.get(kv[0].v[r], kv[1].v[r])
                 }
             } else if jl.mode == JK_TEXT {
                 let c = jl.keyCol[0]
@@ -8973,15 +9187,20 @@ fn joinTail(jr: &JRun, js: mut &JState, j: int, at: &[][]int, n: int, pj: &[]int
     if jl.mark == lexdb_plan.MK_JOIN {
         cnt[lv].read += nc
     } else {
-        // a semi or anti join's: as the row engine reads them, up to each
-        // row's first passing candidate
-        var ki = 0
-        var doneRow = -1
-        for x in 0..nc {
-            if pj[x] == doneRow { continue }
-            cnt[lv].read += 1
-            while ki < len(keep) && keep[ki] < x { ki += 1 }
-            if ki < len(keep) && keep[ki] == x { doneRow = pj[x] }
+        if jl.mark == lexdb_plan.MK_ANTI && jl.antiNull {
+            cnt[lv].read += nc
+            cnt[lv].joined += nc
+        } else {
+            // a semi or anti join's: as the row engine reads them, up to each
+            // row's first passing candidate
+            var ki = 0
+            var doneRow = -1
+            for x in 0..nc {
+                if pj[x] == doneRow { continue }
+                cnt[lv].read += 1
+                while ki < len(keep) && keep[ki] < x { ki += 1 }
+                if ki < len(keep) && keep[ki] == x { doneRow = pj[x] }
+            }
         }
     }
     // a RIGHT JOIN's rows that joined
@@ -8992,11 +9211,12 @@ fn joinTail(jr: &JRun, js: mut &JState, j: int, at: &[][]int, n: int, pj: &[]int
         // with one (dropped)
         var have: []bool = array(n, false)
         for x in keep {
-            if !have[pj[x]] { cnt[lv].joined += 1 }
+            if !jl.antiNull && !have[pj[x]] { cnt[lv].joined += 1 }
             have[pj[x]] = true
         }
         var aj: []int = []
         for r in 0..n { if !have[r] { append(mut &aj, r) } }
+        if jl.antiNull { cnt[lv].nulls += len(aj) }
         outAt = compose(at, &aj)
         append(mut &outAt, array(len(aj), -1))
     } else if jl.mark == lexdb_plan.MK_SEMI {
@@ -9060,7 +9280,7 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
     let nq = len(cols)
     var wl: []int = []
     for c in 0..len(want) { if want[c] { append(mut &wl, c) } }
-    var jr = JRun{jls: [], kinds: kinds, owner: owner, want: want, wantList: wl, nq: nq, zone: cx.zone.clone(), apAt: -1, apReads: collections.copyOf(&ap.reads), one: ap.one, grow: false}
+    var jr = JRun{jls: [], kinds: kinds, owner: owner, want: want, wantList: wl, nq: nq, zone: cx.zone.clone(), apAt: -1, apReads: collections.copyOf(&ap.reads), one: ap.one, grow: false, weighted: false}
     let ab0 = collections.copyOf(&jr.want)
     try joinSetup(st, txn, top, cols, tabs, srcs, vrows, cx, mut &jr, dec, bud, cnt, &ab0)
     if ap.level >= 0 {
@@ -9527,6 +9747,859 @@ fn aggWant(a: &lexdb_plan.PAgg, nq: int, ap: &Apply): []bool {
     return want
 }
 
+// Plain ungrouped SELECT count(*) eligibility for weighted countOnly join execution.
+fn isPlainCountStar(a: &lexdb_plan.PAgg, ap: &Apply): bool {
+    if len(a.keys) != 0 || len(a.sets) != 0 || len(a.calls) != 1 || ap.level >= 0 { return false }
+    let c = &a.calls[0]
+    if c.fname != "count" || !c.star || c.filter.isSome() || c.distinct { return false }
+    for k in a.keep { if k { return false } }
+    return true
+}
+
+// Weighted joinTail for plain SELECT count(*): returns (outAt, outWeights).
+fn joinTailW(jr: &JRun, js: mut &JState, j: int, at: &[][]int, ws: &[]int, n: int, pj: &[]int, pi: []int, bud: mut &Budget,
+             cnt: mut &[]Counts, outW: mut &[]int): Result[[][]int, DbErr] {
+    let jl = &jr.jls[j]
+    let lv = jl.level
+    let nc = len(pj)
+    try bud.tickN(nc)
+    if len(jl.conds) == 0 && len(jl.post) == 0 && jl.mark == lexdb_plan.MK_JOIN && !jl.left && !jl.right {
+        cnt[lv].read += nc
+        cnt[lv].joined += nc
+        var ident = nc == n
+        if ident {
+            for r in 0..nc { if pj[r] != r { ident = false; break } }
+        }
+        var outAt = if ident { at.clone() } else { compose(at, pj) }
+        append(mut &outAt, pi)
+        if ident {
+            outW = collections.copyOf(ws)
+        } else {
+            var nw: []int = withCapacity(nc)
+            for r in 0..nc { append(mut &nw, ws[pj[r]]) }
+            outW = nw
+        }
+        return Ok(outAt)
+    }
+    var cat = compose(at, pj)
+    append(mut &cat, pi)
+    var keep: []int = withCapacity(nc)
+    for x in 0..nc { append(mut &keep, x) }
+    if len(jl.conds) > 0 {
+        let w = gatherAt(jr, &js.cur, &cat, nc, &jl.creads)
+        keep = try pick(&jl.conds, &w, keep)
+    }
+    var wRead = 0
+    for r in 0..nc { wRead += ws[pj[r]] }
+    cnt[lv].read += wRead
+    var outAt: [][]int = []
+    var curW: []int = []
+    if jl.mark == lexdb_plan.MK_ANTI {
+        var have: []bool = array(n, false)
+        for x in keep {
+            if !have[pj[x]] {
+                if !jl.antiNull { cnt[lv].joined += ws[pj[x]] }
+                have[pj[x]] = true
+            }
+        }
+        if jl.antiNull { cnt[lv].joined += wRead }
+        var aj: []int = []
+        for r in 0..n {
+            if !have[r] {
+                append(mut &aj, r)
+                append(mut &curW, ws[r])
+                if jl.antiNull { cnt[lv].nulls += ws[r] }
+            }
+        }
+        outAt = compose(at, &aj)
+        append(mut &outAt, array(len(aj), -1))
+    } else if jl.mark == lexdb_plan.MK_SEMI {
+        var fst: []int = []
+        var prev = -1
+        var wJoin = 0
+        for x in keep {
+            if pj[x] != prev {
+                append(mut &fst, x)
+                let wr = ws[pj[x]]
+                append(mut &curW, wr)
+                wJoin += wr
+                prev = pj[x]
+            }
+        }
+        cnt[lv].joined += wJoin
+        outAt = compose(&cat, &fst)
+    } else if jl.left {
+        var wJoin = 0
+        var wNull = 0
+        var outJ: []int = withCapacity(n)
+        var outI: []int = withCapacity(n)
+        var k = 0
+        for r in 0..n {
+            var any = false
+            while k < len(keep) && pj[keep[k]] == r {
+                append(mut &outJ, r)
+                append(mut &outI, cat[j][keep[k]])
+                append(mut &curW, ws[r])
+                wJoin += ws[r]
+                any = true
+                k += 1
+            }
+            if !any {
+                append(mut &outJ, r)
+                append(mut &outI, -1)
+                append(mut &curW, ws[r])
+                wNull += ws[r]
+            }
+        }
+        cnt[lv].joined += wJoin
+        cnt[lv].nulls += wNull
+        outAt = compose(at, &outJ)
+        append(mut &outAt, outI)
+    } else if len(keep) == nc {
+        cnt[lv].joined += wRead
+        outAt = cat
+        curW = withCapacity(nc)
+        for r in 0..nc { append(mut &curW, ws[pj[r]]) }
+    } else {
+        var wJoin = 0
+        outAt = compose(&cat, &keep)
+        curW = withCapacity(len(keep))
+        for x in keep {
+            let wr = ws[pj[x]]
+            append(mut &curW, wr)
+            wJoin += wr
+        }
+        cnt[lv].joined += wJoin
+    }
+    if len(jl.post) > 0 {
+        let m = len(outAt[0])
+        let w = gatherAt(jr, &js.cur, &outAt, m, &jl.preads)
+        var all: []int = withCapacity(m)
+        for x in 0..m { append(mut &all, x) }
+        let k2 = try pick(&jl.post, &w, all)
+        if len(k2) < m {
+            outAt = compose(&outAt, &k2)
+            var nw: []int = withCapacity(len(k2))
+            for x in k2 { append(mut &nw, curW[x]) }
+            curW = nw
+        }
+    }
+    outW = curW
+    return Ok(outAt)
+}
+
+// Weighted join traversal for plain SELECT count(*): countOnly levels multiply row weights
+// instead of replicating rows, and the last level accumulates directly into total without allocating.
+fn joinFromW(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: mut &JState, tabs: &[]&lexdb_catalog.Table, j: int,
+             at: &[][]int, ws: &[]int, n: int, cx: &Ctx, bud: mut &Budget, cnt: mut &[]Counts, total: mut &int): Result[Unit, DbErr] {
+    if n == 0 { return Ok(Unit{}) }
+    if j == len(jr.jls) {
+        var s = 0
+        for r in 0..n { s += ws[r] }
+        total += s
+        return Ok(Unit{})
+    }
+    let jl = &jr.jls[j]
+    let lv = jl.level
+    let isLast = j == len(jr.jls) - 1
+    // Fast path for countOnly hash levels (inner, LEFT, or anti): multiply weights with ZERO row replication!
+    if hashed(jl) && jl.countOnly && jl.resCol < 0 {
+        try bud.tickN(n)
+        var sumW = 0
+        for r in 0..n { sumW += ws[r] }
+        cnt[lv].starts += sumW
+        var direct = false
+        if jl.mode == JK_INT && jl.kCol0 >= 0 {
+            let o0 = jr.owner[jl.kCol0]
+            let sJl = &jr.jls[o0]
+            let src = if hashed(sJl) && sJl.na < NA_MARK_EX { &sJl.rows } else { &js.cur[o0] }
+            let cOff = jl.kCol0 - sJl.first
+            if o0 >= 0 && o0 < len(at) && cOff >= 0 && cOff < len(src.cols) {
+                direct = true
+                let kc = &src.cols[cOff]
+                let at0 = &at[o0]
+                let useDense = len(jl.dense) > 0
+                let dMin = jl.denseMin
+                let dLen = len(jl.dense)
+                if isLast {
+                    var acc = 0
+                    var matched = 0
+                    var nulls = 0
+                    if jl.mark == lexdb_plan.MK_ANTI {
+                        if useDense {
+                            for r in 0..n {
+                                let sr = at0[r]
+                                var m = 0
+                                if sr >= 0 && !kc.nul[sr] {
+                                    let d = kc.v[sr] - dMin
+                                    if d >= 0 && d < dLen { m = jl.dense[d] }
+                                }
+                                if m == 0 { acc += ws[r]; if jl.antiNull { nulls += ws[r] } }
+                                else { matched += ws[r] * (if jl.antiNull { m } else { 1 }) }
+                            }
+                        } else {
+                            for r in 0..n {
+                                let sr = at0[r]
+                                let m = if sr >= 0 && !kc.nul[sr] { jl.fastCnt.get(kc.v[sr]) } else { 0 }
+                                if m == 0 { acc += ws[r]; if jl.antiNull { nulls += ws[r] } }
+                                else { matched += ws[r] * (if jl.antiNull { m } else { 1 }) }
+                            }
+                        }
+                    } else if jl.left {
+                        if useDense {
+                            for r in 0..n {
+                                let sr = at0[r]
+                                var m = 0
+                                if sr >= 0 && !kc.nul[sr] {
+                                    let d = kc.v[sr] - dMin
+                                    if d >= 0 && d < dLen { m = jl.dense[d] }
+                                }
+                                if m > 0 { let t = ws[r] * m; acc += t; matched += t } else { acc += ws[r]; nulls += ws[r] }
+                            }
+                        } else {
+                            for r in 0..n {
+                                let sr = at0[r]
+                                let m = if sr >= 0 && !kc.nul[sr] { jl.fastCnt.get(kc.v[sr]) } else { 0 }
+                                if m > 0 { let t = ws[r] * m; acc += t; matched += t } else { acc += ws[r]; nulls += ws[r] }
+                            }
+                        }
+                    } else {
+                        if useDense {
+                            for r in 0..n {
+                                let sr = at0[r]
+                                if sr < 0 || kc.nul[sr] { continue }
+                                let d = kc.v[sr] - dMin
+                                if d >= 0 && d < dLen {
+                                    let m = jl.dense[d]
+                                    if m > 0 { acc += ws[r] * m }
+                                }
+                            }
+                        } else {
+                            for r in 0..n {
+                                let sr = at0[r]
+                                if sr < 0 || kc.nul[sr] { continue }
+                                let m = jl.fastCnt.get(kc.v[sr])
+                                if m > 0 { acc += ws[r] * m }
+                            }
+                        }
+                        matched = acc
+                    }
+                    cnt[lv].read += matched
+                    cnt[lv].joined += matched
+                    cnt[lv].nulls += nulls
+                    total += acc
+                    return Ok(Unit{})
+                }
+                // Intermediate JK_INT countOnly level
+                var kr: []int = withCapacity(n)
+                var w2: []int = withCapacity(n)
+                var matched = 0
+                var nulls = 0
+                for r in 0..n {
+                    let sr = at0[r]
+                    var m = 0
+                    if sr >= 0 && !kc.nul[sr] {
+                        if useDense {
+                            let d = kc.v[sr] - dMin
+                            if d >= 0 && d < dLen { m = jl.dense[d] }
+                        } else {
+                            m = jl.fastCnt.get(kc.v[sr])
+                        }
+                    }
+                    if jl.mark == lexdb_plan.MK_ANTI {
+                        if m == 0 { append(mut &kr, r); append(mut &w2, ws[r]); if jl.antiNull { nulls += ws[r] } }
+                        else { matched += ws[r] * (if jl.antiNull { m } else { 1 }) }
+                    } else if jl.left {
+                        append(mut &kr, r)
+                        if m > 0 { let t = ws[r] * m; append(mut &w2, t); matched += t } else { append(mut &w2, ws[r]); nulls += ws[r] }
+                    } else if m > 0 {
+                        let t = ws[r] * m
+                        append(mut &kr, r)
+                        append(mut &w2, t)
+                        matched += t
+                    }
+                }
+                cnt[lv].read += matched
+                cnt[lv].joined += matched
+                cnt[lv].nulls += nulls
+                let n2 = len(kr)
+                if n2 == 0 { return Ok(Unit{}) }
+                var outAt = if n2 == n { at.clone() } else { compose(at, &kr) }
+                append(mut &outAt, array(n2, -1))
+                return joinFromW(st, txn, jr, js, tabs, j + 1, &outAt, &w2, n2, cx, bud, cnt, total)
+            }
+        } else if (jl.mode == JK_INT2 || jl.mode == JK_INT2_64) && jl.kCol0 >= 0 && jl.kCol1 >= 0 {
+            let o0 = jr.owner[jl.kCol0]
+            let sJl0 = &jr.jls[o0]
+            let src0 = if hashed(sJl0) && sJl0.na < NA_MARK_EX { &sJl0.rows } else { &js.cur[o0] }
+            let o1 = jr.owner[jl.kCol1]
+            let sJl1 = &jr.jls[o1]
+            let src1 = if hashed(sJl1) && sJl1.na < NA_MARK_EX { &sJl1.rows } else { &js.cur[o1] }
+            let cOff0 = jl.kCol0 - sJl0.first
+            let cOff1 = jl.kCol1 - sJl1.first
+            if o0 >= 0 && o0 < len(at) && o1 >= 0 && o1 < len(at) && cOff0 >= 0 && cOff0 < len(src0.cols) && cOff1 >= 0 && cOff1 < len(src1.cols) {
+                direct = true
+                let kc0 = &src0.cols[cOff0]
+                let at0 = &at[o0]
+                let kc1 = &src1.cols[cOff1]
+                let at1 = &at[o1]
+                let is64 = jl.mode == JK_INT2_64
+                if isLast {
+                    var acc = 0
+                    var matched = 0
+                    var nulls = 0
+                    if jl.mark == lexdb_plan.MK_ANTI {
+                        if is64 {
+                            for r in 0..n {
+                                let sr0 = at0[r]
+                                let sr1 = at1[r]
+                                let m = if sr0 >= 0 && sr1 >= 0 && !kc0.nul[sr0] && !kc1.nul[sr1] { jl.fastCnt2.get(kc0.v[sr0], kc1.v[sr1]) } else { 0 }
+                                if m == 0 { acc += ws[r]; if jl.antiNull { nulls += ws[r] } }
+                                else { matched += ws[r] * (if jl.antiNull { m } else { 1 }) }
+                            }
+                        } else {
+                            for r in 0..n {
+                                let sr0 = at0[r]
+                                let sr1 = at1[r]
+                                var m = 0
+                                if sr0 >= 0 && sr1 >= 0 && !kc0.nul[sr0] && !kc1.nul[sr1] {
+                                    let v0 = kc0.v[sr0]; let v1 = kc1.v[sr1]
+                                    if inInt32(v0) && inInt32(v1) { m = jl.fastCnt.get(packInt2(v0, v1)) }
+                                }
+                                if m == 0 { acc += ws[r]; if jl.antiNull { nulls += ws[r] } }
+                                else { matched += ws[r] * (if jl.antiNull { m } else { 1 }) }
+                            }
+                        }
+                    } else if jl.left {
+                        for r in 0..n {
+                            let sr0 = at0[r]
+                            let sr1 = at1[r]
+                            var m = 0
+                            if sr0 >= 0 && sr1 >= 0 && !kc0.nul[sr0] && !kc1.nul[sr1] {
+                                let v0 = kc0.v[sr0]; let v1 = kc1.v[sr1]
+                                if is64 { m = jl.fastCnt2.get(v0, v1) } else if inInt32(v0) && inInt32(v1) { m = jl.fastCnt.get(packInt2(v0, v1)) }
+                            }
+                            if m > 0 { let t = ws[r] * m; acc += t; matched += t } else { acc += ws[r]; nulls += ws[r] }
+                        }
+                    } else {
+                        if is64 {
+                            for r in 0..n {
+                                let sr0 = at0[r]
+                                let sr1 = at1[r]
+                                if sr0 < 0 || sr1 < 0 || kc0.nul[sr0] || kc1.nul[sr1] { continue }
+                                let m = jl.fastCnt2.get(kc0.v[sr0], kc1.v[sr1])
+                                if m > 0 { acc += ws[r] * m }
+                            }
+                        } else {
+                            for r in 0..n {
+                                let sr0 = at0[r]
+                                let sr1 = at1[r]
+                                if sr0 < 0 || sr1 < 0 || kc0.nul[sr0] || kc1.nul[sr1] { continue }
+                                let v0 = kc0.v[sr0]; let v1 = kc1.v[sr1]
+                                if inInt32(v0) && inInt32(v1) {
+                                    let m = jl.fastCnt.get(packInt2(v0, v1))
+                                    if m > 0 { acc += ws[r] * m }
+                                }
+                            }
+                        }
+                        matched = acc
+                    }
+                    cnt[lv].read += matched
+                    cnt[lv].joined += matched
+                    cnt[lv].nulls += nulls
+                    total += acc
+                    return Ok(Unit{})
+                }
+                // Intermediate JK_INT2 / JK_INT2_64 countOnly level
+                var kr: []int = withCapacity(n)
+                var w2: []int = withCapacity(n)
+                var matched = 0
+                var nulls = 0
+                for r in 0..n {
+                    let sr0 = at0[r]
+                    let sr1 = at1[r]
+                    var m = 0
+                    if sr0 >= 0 && sr1 >= 0 && !kc0.nul[sr0] && !kc1.nul[sr1] {
+                        let v0 = kc0.v[sr0]; let v1 = kc1.v[sr1]
+                        if is64 { m = jl.fastCnt2.get(v0, v1) } else if inInt32(v0) && inInt32(v1) { m = jl.fastCnt.get(packInt2(v0, v1)) }
+                    }
+                    if jl.mark == lexdb_plan.MK_ANTI {
+                        if m == 0 { append(mut &kr, r); append(mut &w2, ws[r]); if jl.antiNull { nulls += ws[r] } }
+                        else { matched += ws[r] * (if jl.antiNull { m } else { 1 }) }
+                    } else if jl.left {
+                        append(mut &kr, r)
+                        if m > 0 { let t = ws[r] * m; append(mut &w2, t); matched += t } else { append(mut &w2, ws[r]); nulls += ws[r] }
+                    } else if m > 0 {
+                        let t = ws[r] * m
+                        append(mut &kr, r)
+                        append(mut &w2, t)
+                        matched += t
+                    }
+                }
+                cnt[lv].read += matched
+                cnt[lv].joined += matched
+                cnt[lv].nulls += nulls
+                let n2 = len(kr)
+                if n2 == 0 { return Ok(Unit{}) }
+                var outAt = if n2 == n { at.clone() } else { compose(at, &kr) }
+                append(mut &outAt, array(n2, -1))
+                return joinFromW(st, txn, jr, js, tabs, j + 1, &outAt, &w2, n2, cx, bud, cnt, total)
+            }
+        }
+        if !direct {
+            // Expression key fallback for countOnly
+            var w = gatherAt(jr, &js.cur, &at, n, &jl.kreads)
+            let kv = try keyVecs(jl, mut &w)
+            var kr: []int = withCapacity(n)
+            var w2: []int = withCapacity(n)
+            var acc = 0
+            var matched = 0
+            var nulls = 0
+            for r in 0..n {
+                var m = 0
+                if jl.mode == JK_INT {
+                    if !kv[0].nul[r] {
+                        if len(jl.dense) > 0 {
+                            let d = kv[0].v[r] - jl.denseMin
+                            if d >= 0 && d < len(jl.dense) { m = jl.dense[d] }
+                        } else {
+                            m = jl.fastCnt.get(kv[0].v[r])
+                        }
+                    }
+                } else if jl.mode == JK_INT2_64 {
+                    if !kv[0].nul[r] && !kv[1].nul[r] { m = jl.fastCnt2.get(kv[0].v[r], kv[1].v[r]) }
+                } else {
+                    if !kv[0].nul[r] && !kv[1].nul[r] && inInt32(kv[0].v[r]) && inInt32(kv[1].v[r]) {
+                        m = jl.fastCnt.get(packInt2(kv[0].v[r], kv[1].v[r]))
+                    }
+                }
+                if jl.mark == lexdb_plan.MK_ANTI {
+                    if m == 0 {
+                        if jl.antiNull { nulls += ws[r] }
+                        if isLast { acc += ws[r] } else { append(mut &kr, r); append(mut &w2, ws[r]) }
+                    } else {
+                        matched += ws[r] * (if jl.antiNull { m } else { 1 })
+                    }
+                } else if jl.left {
+                    let nw = ws[r] * (if m > 0 { m } else { 1 })
+                    if m > 0 { matched += nw } else { nulls += ws[r] }
+                    if isLast { acc += nw } else { append(mut &kr, r); append(mut &w2, nw) }
+                } else if m > 0 {
+                    let nw = ws[r] * m
+                    matched += nw
+                    if isLast { acc += nw } else { append(mut &kr, r); append(mut &w2, nw) }
+                }
+            }
+            cnt[lv].read += matched
+            cnt[lv].joined += matched
+            cnt[lv].nulls += nulls
+            if isLast {
+                total += acc
+                return Ok(Unit{})
+            }
+            let n2 = len(kr)
+            if n2 == 0 { return Ok(Unit{}) }
+            var outAt = if n2 == n { at.clone() } else { compose(at, &kr) }
+            append(mut &outAt, array(n2, -1))
+            return joinFromW(st, txn, jr, js, tabs, j + 1, &outAt, &w2, n2, cx, bud, cnt, total)
+        }
+    }
+    // Non-countOnly level in weighted mode: probe normally, then propagate weights via joinTailW
+    var pj: []int = withCapacity(n)
+    var pi: []int = withCapacity(n)
+    var held = 0
+    if hashed(jl) && jl.resCol < 0 && jl.mode == JK_INT && jl.kCol0 >= 0 {
+        let first = (jl.mark == lexdb_plan.MK_SEMI || (jl.mark == lexdb_plan.MK_ANTI && !jl.antiNull)) && len(jl.conds) == 0
+        let o0 = jr.owner[jl.kCol0]
+        let sJl = &jr.jls[o0]
+        let src = if hashed(sJl) && sJl.na < NA_MARK_EX { &sJl.rows } else { &js.cur[o0] }
+        let cOff = jl.kCol0 - sJl.first
+        if o0 >= 0 && o0 < len(at) && cOff >= 0 && cOff < len(src.cols) {
+            let kc = &src.cols[cOff]
+            let at0 = &at[o0]
+            let useDense = len(jl.dense) > 0
+            let dMin = jl.denseMin
+            let dLen = len(jl.dense)
+            if jl.neqOut >= 0 {
+                let on = jr.owner[jl.neqOut]
+                let nJl = &jr.jls[on]
+                let nSrc = if hashed(nJl) && nJl.na < NA_MARK_EX { &nJl.rows } else { &js.cur[on] }
+                let ncOff = jl.neqOut - nJl.first
+                let nkc = &nSrc.cols[ncOff]
+                let nat = &at[on]
+                let inCol = &jl.rows.cols[jl.neqIn]
+                if isLast && len(jl.conds) == 0 && len(jl.post) == 0 && jl.mark == lexdb_plan.MK_JOIN && !jl.left && !jl.right {
+                    try bud.tickN(n)
+                    var acc = 0
+                    var totRead = 0
+                    var sumW = 0
+                    for r in 0..n {
+                        let wr = ws[r]
+                        sumW += wr
+                        let sr = at0[r]
+                        let nsr = nat[r]
+                        if sr < 0 || nsr < 0 || kc.nul[sr] || nkc.nul[nsr] { continue }
+                        var bk = -1
+                        if useDense {
+                            let d = kc.v[sr] - dMin
+                            if d >= 0 && d < dLen { bk = jl.dense[d] }
+                        } else {
+                            match jl.ints.get(&kc.v[sr]) { Some(x) { bk = x } None {} }
+                        }
+                        if bk >= 0 {
+                            let ov = nkc.v[nsr]
+                            var hits = 0
+                            var seen = 0
+                            var x = jl.head[bk]
+                            while x >= 0 {
+                                seen += 1
+                                if !inCol.nul[x] && inCol.v[x] != ov { hits += 1 }
+                                x = jl.next[x]
+                            }
+                            totRead += wr * seen
+                            acc += wr * hits
+                        }
+                    }
+                    total += acc
+                    cnt[lv].starts += sumW
+                    cnt[lv].read += totRead
+                    cnt[lv].joined += acc
+                    return Ok(Unit{})
+                }
+                for r in 0..n {
+                    let sr = at0[r]
+                    let nsr = nat[r]
+                    if sr < 0 || nsr < 0 || kc.nul[sr] || nkc.nul[nsr] { continue }
+                    var bk = -1
+                    if useDense {
+                        let d = kc.v[sr] - dMin
+                        if d >= 0 && d < dLen { bk = jl.dense[d] }
+                    } else {
+                        match jl.ints.get(&kc.v[sr]) { Some(x) { bk = x } None {} }
+                    }
+                    if bk >= 0 {
+                        let ov = nkc.v[nsr]
+                        var x = jl.head[bk]
+                        while x >= 0 {
+                            if !inCol.nul[x] && inCol.v[x] != ov {
+                                append(mut &pj, r)
+                                append(mut &pi, x)
+                            }
+                            x = jl.next[x]
+                        }
+                    }
+                }
+            } else {
+                let cutTo = jl.cutTo
+                for r in 0..n {
+                    let sr = at0[r]
+                    if sr < 0 || kc.nul[sr] { continue }
+                    var bk = -1
+                    if useDense {
+                        let d = kc.v[sr] - dMin
+                        if d >= 0 && d < dLen { bk = jl.dense[d] }
+                    } else {
+                        match jl.ints.get(&kc.v[sr]) { Some(x) { bk = x } None {} }
+                    }
+                    if bk >= 0 {
+                        if cutTo >= 0 {
+                            let m = jl.cutB[bk] * ws[r]
+                            cnt[lv].read += m
+                            cnt[lv].joined += m
+                            cnt[jr.jls[cutTo].level].starts += m
+                        }
+                        var x = jl.head[bk]
+                        while x >= 0 {
+                            append(mut &pj, r)
+                            append(mut &pi, x)
+                            x = if first { -1 } else { jl.next[x] }
+                        }
+                    }
+                }
+            }
+        }
+        var sumW = 0
+        for r in 0..n { sumW += ws[r] }
+        cnt[lv].starts += sumW
+    } else if hashed(jl) && jl.resCol < 0 && (jl.mode == JK_INT2 || jl.mode == JK_INT2_64) && jl.kCol0 >= 0 && jl.kCol1 >= 0 {
+        let first = (jl.mark == lexdb_plan.MK_SEMI || (jl.mark == lexdb_plan.MK_ANTI && !jl.antiNull)) && len(jl.conds) == 0
+        let o0 = jr.owner[jl.kCol0]
+        let sJl0 = &jr.jls[o0]
+        let src0 = if hashed(sJl0) && sJl0.na < NA_MARK_EX { &sJl0.rows } else { &js.cur[o0] }
+        let o1 = jr.owner[jl.kCol1]
+        let sJl1 = &jr.jls[o1]
+        let src1 = if hashed(sJl1) && sJl1.na < NA_MARK_EX { &sJl1.rows } else { &js.cur[o1] }
+        let cOff0 = jl.kCol0 - sJl0.first
+        let cOff1 = jl.kCol1 - sJl1.first
+        if o0 >= 0 && o0 < len(at) && o1 >= 0 && o1 < len(at) && cOff0 >= 0 && cOff0 < len(src0.cols) && cOff1 >= 0 && cOff1 < len(src1.cols) {
+            let kc0 = &src0.cols[cOff0]
+            let at0 = &at[o0]
+            let kc1 = &src1.cols[cOff1]
+            let at1 = &at[o1]
+            let is64 = jl.mode == JK_INT2_64
+            for r in 0..n {
+                let sr0 = at0[r]
+                let sr1 = at1[r]
+                if sr0 < 0 || sr1 < 0 || kc0.nul[sr0] || kc1.nul[sr1] { continue }
+                var bk = -1
+                if is64 {
+                    bk = jl.ints2.get(kc0.v[sr0], kc1.v[sr1])
+                } else if inInt32(kc0.v[sr0]) && inInt32(kc1.v[sr1]) {
+                    let pk = packInt2(kc0.v[sr0], kc1.v[sr1])
+                    match jl.ints.get(&pk) { Some(x) { bk = x } None {} }
+                }
+                if bk >= 0 {
+                    var x = jl.head[bk]
+                    while x >= 0 {
+                        append(mut &pj, r)
+                        append(mut &pi, x)
+                        x = if first { -1 } else { jl.next[x] }
+                    }
+                }
+            }
+        }
+        cnt[lv].starts += n
+    } else {
+        var w = gatherAt(jr, &js.cur, &at, n, &jl.kreads)
+        let kv = try keyVecs(jl, mut &w)
+        if hashed(jl) {
+            let first = (jl.mark == lexdb_plan.MK_SEMI || (jl.mark == lexdb_plan.MK_ANTI && !jl.antiNull)) && len(jl.conds) == 0
+            let wtxt = jl.mode == JK_TEXT && lexdb_rows.isTextCol(&w, jl.keyCol[0])
+            var kb = ""
+            for r in 0..n {
+                var bk = -1
+                if jl.mode == JK_INT {
+                    if !kv[0].nul[r] {
+                        match jl.ints.get(&kv[0].v[r]) { Some(x) { bk = x } None {} }
+                        if bk >= 0 && jl.cutTo >= 0 {
+                            let m = jl.cutB[bk] * ws[r]
+                            cnt[lv].read += m
+                            cnt[lv].joined += m
+                            cnt[jr.jls[jl.cutTo].level].starts += m
+                        }
+                    }
+                } else if jl.mode == JK_INT2 {
+                    if !kv[0].nul[r] && !kv[1].nul[r] && inInt32(kv[0].v[r]) && inInt32(kv[1].v[r]) {
+                        let pk = packInt2(kv[0].v[r], kv[1].v[r])
+                        match jl.ints.get(&pk) { Some(x) { bk = x } None {} }
+                    }
+                } else if jl.mode == JK_INT2_64 {
+                    if !kv[0].nul[r] && !kv[1].nul[r] { bk = jl.ints2.get(kv[0].v[r], kv[1].v[r]) }
+                } else if jl.mode == JK_TEXT {
+                    let c = jl.keyCol[0]
+                    if !w.cols[c].nul[r] && wtxt {
+                        match jl.txts.get(lexdb_rows.textAt(&w, c, r)) { Some(y) { bk = y } None {} }
+                    } else if !w.cols[c].nul[r] {
+                        match w.vals[c][r] { Val.Text(x) { match jl.txts.get(&x) { Some(y) { bk = y } None {} } } else { return Err(batErr()) } }
+                    }
+                } else {
+                    kb.clear()
+                    var nul = false
+                    for i in 0..len(jl.key) {
+                        if jl.raw {
+                            let v = keyAt(jl, &kv, &w, i, r)
+                            if lexdb_ops.isNull(&v) { nul = true }
+                            keyPart(mut &kb, &v)
+                            continue
+                        }
+                        match try keyOf(keyAt(jl, &kv, &w, i, r), &jl.ktypes[i], &jr.zone) {
+                            Some(x) {
+                                if lexdb_ops.isNull(&x) { nul = true }
+                                if len(jl.colls) > 0 { lexdb_access.encIdxPart(mut &kb, &lexdb_sort.collVal(jl.colls[i], &x)) } else { lexdb_access.encIdxPart(mut &kb, &x) }
+                            }
+                            None { nul = true }
+                        }
+                    }
+                    if !nul { match jl.gens.get(&kb) { Some(x) { bk = x } None {} } }
+                }
+                if bk >= 0 {
+                    var x = jl.head[bk]
+                    while x >= 0 {
+                        append(mut &pj, r)
+                        append(mut &pi, x)
+                        x = if first { -1 } else { jl.next[x] }
+                    }
+                }
+            }
+            cnt[lv].starts += n
+        } else {
+            // JH_LOOK / JH_RANGE / JH_ANY in weighted mode
+            let t = tabs[lv]
+            let rel = lexdb_catalog.relOf(t)
+            let arr = jl.how == lexdb_plan.JH_ANY
+            let look = jl.how == lexdb_plan.JH_LOOK || arr
+            var pr = lexdb_access.probes(if look { -1 } else { jl.index }, n)
+            var of: []int = withCapacity(n)
+            let o0 = if len(jl.ktypes) > 0 { jl.ktypes[0].oid } else { 0 }
+            let intKey = look && len(jl.key) == 1 && jl.keyTyp[0] == BT_INT && jl.ktypes[0].kind == lexdb_sql.K_INT && isIntOid(o0)
+            let kmin = if o0 == lexdb_sql.OID_INT2 { -32768 } else if o0 == lexdb_sql.OID_INT4 { -2147483648 } else { -9223372036854775807 - 1 }
+            let kmax = if o0 == lexdb_sql.OID_INT2 { 32767 } else if o0 == lexdb_sql.OID_INT4 { 2147483647 } else { 9223372036854775807 }
+            var prev = 0
+            for r in 0..n {
+                if arr { try anyProbes(jl, &kv, &w, r, &jr.zone, mut &pr, mut &of); continue }
+                if intKey {
+                    if kv[0].nul[r] { continue }
+                    let x = kv[0].v[r]
+                    if x < kmin || x > kmax { continue }
+                    if pr.count() > 0 && x == prev { pr.again() } else { pr.intKey(x); prev = x }
+                    append(mut &of, r)
+                    continue
+                }
+                var none = false
+                for i in 0..len(jl.key) {
+                    match try keyOf(keyAt(jl, &kv, &w, i, r), &jl.ktypes[i], &jr.zone) {
+                        Some(x) { if lexdb_ops.isNull(&x) { none = true } else { pr.part(&x) } }
+                        None { none = true }
+                    }
+                    if none { break }
+                }
+                if none { pr.clear(); continue }
+                pr.end()
+                append(mut &of, r)
+            }
+            let nk = pr.count()
+            if look {
+                let fetched = match try lexdb_access.fetchMany(st, txn, &rel, &pr, true, &jl.bp) {
+                    Some(f) { f }
+                    None { return Err(batErr()) }
+                }
+                var f2 = fetched
+                js.cur[j] = replace(mut &f2.rows, lexdb_rows.noRows())
+                for i in 0..nk {
+                    let ri = f2.at[i]
+                    if ri < 0 { continue }
+                    append(mut &pj, of[i])
+                    append(mut &pi, ri)
+                }
+            } else {
+                let room0 = if bud.maxHeld > 0 { bud.maxHeld - bud.held - bud.aside } else { -1 }
+                let one1 = jl.mark != lexdb_plan.MK_JOIN && len(jl.conds) == 0
+                let got = try lexdb_access.rangeMany(st, txn, &rel, jl.index, &pr, &jl.tail, jl.noRange, one1, &jl.bp, true, room0, jl.perRow)
+                if got.isNone() { return Err(batErr()) }
+                var rg = got.unwrap()
+                let rows = replace(mut &rg.rows, lexdb_rows.noRows())
+                held = (rows.n + rg.pks) * jl.perRow
+                try bud.tickN(rows.n)
+                for i in 0..nk {
+                    for x in rg.lo[i]..rg.hi[i] {
+                        append(mut &pj, of[i])
+                        append(mut &pi, x)
+                    }
+                }
+                js.cur[j] = rows
+            }
+            cnt[lv].starts += n
+        }
+    }
+    bud.held += held
+    var w2: []int = []
+    let next = joinTailW(jr, js, j, at, ws, n, &pj, pi, bud, cnt, mut &w2)
+    if next.isErr() { bud.held -= held }
+    let at2 = try next
+    let n2 = len(at2[0])
+    if isLast {
+        var s = 0
+        for r in 0..n2 { s += w2[r] }
+        total += s
+        bud.held -= held
+        return Ok(Unit{})
+    }
+    let go = joinFromW(st, txn, jr, js, tabs, j + 1, &at2, &w2, n2, cx, bud, cnt, total)
+    bud.held -= held
+    return go
+}
+
+// Runs a plain SELECT count(*) join tree in weighted mode (returning Ok(Some(count)) or Ok(None) to fall back).
+fn joinRowsCount(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef,
+                 tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, bud: mut &Budget,
+                 cnt: mut &[]Counts): Result[Option[int], DbErr] {
+    let nq = len(cols)
+    var kinds: []int = []
+    var owner: []int = []
+    kindsFor(top, tabs, vrows, nq, false, mut &kinds, mut &owner)
+    let want: []bool = array(nq, false)
+    var jr = JRun{jls: [], kinds: kinds, owner: owner, want: want, wantList: [], nq: nq, zone: cx.zone.clone(), apAt: -1, apReads: [], one: false, grow: false, weighted: true}
+    let ab0: []bool = array(nq, false)
+    try joinSetup(st, txn, top, cols, tabs, srcs, vrows, cx, mut &jr, false, bud, cnt, &ab0)
+    // Only use weighted fast path when all levels are clean (no RIGHT/FULL, cross, resCol, na, APPLY) and at least one level is countOnly
+    var anyCountOnly = false
+    for x in 1..len(jr.jls) {
+        let jl = &jr.jls[x]
+        if jl.right || jl.cross || jl.resCol >= 0 || jl.na != 0 || jl.how == lexdb_plan.JH_APPLY { return Ok(None) }
+        if jl.countOnly || jl.neqOut >= 0 { anyCountOnly = true }
+    }
+    if !anyCountOnly { return Ok(None) }
+    reduceHashes(mut &jr)
+    let bottom = joinBottom(top)
+    let none: []BX = []
+    let conds = match bottom {
+        lexdb_plan.PPlan.Filter(_, cs) { &cs }
+        else { &none }
+    }
+    let sc = match bottom {
+        lexdb_plan.PPlan.Filter(i, _) {
+            match i { lexdb_plan.PPlan.Scan(s, _) { &s } else { return Ok(None) } }
+        }
+        lexdb_plan.PPlan.Scan(s, _) { &s }
+        else { return Ok(None) }
+    }
+    let t = tabs[sc.level]
+    let bp = projOf(t, sc, &jr.kinds)
+    var cn: []BNode = []
+    for x in conds {
+        match condNodeD(&x, cols, &jr.kinds, cx, sc.first, &sc.need, false) {
+            Some(n) { append(mut &cn, n) }
+            None { return Ok(None) }
+        }
+    }
+    var pushCol = -1
+    if len(jr.jls) > 1 &&
+       (jr.jls[1].how == lexdb_plan.JH_HASH || jr.jls[1].how == lexdb_plan.JH_JOIN || jr.jls[1].how == lexdb_plan.JH_ROWS) &&
+       jr.jls[1].mode == JK_INT && !jr.jls[1].left && jr.jls[1].resCol < 0 && jr.jls[1].na == 0 && jr.jls[1].mark != lexdb_plan.MK_ANTI {
+        match jr.jls[1].key[0] {
+            BNode.Col(c) { if jr.owner[c] == 0 { pushCol = c - sc.first } }
+            else {}
+        }
+    }
+    cnt[sc.level].starts += 1
+    heldRun(&srcs[sc.level])
+    var js = JState{cur: [], seen: [], sk: Skip{skip: 0, given: 0}, applied: false}
+    for i in 0..len(jr.jls) { append(mut &js.cur, lexdb_rows.noRows()); append(mut &js.seen, []) }
+    var rc = RC{read: 0, kept: 0, batches: 0, pushed: 0, cut: 0}
+    let pl = &jr.jls[if pushCol >= 0 { 1 } else { 0 }]
+    let ph = PushH{keys: &pl.ints, head: &pl.head, cutB: &pl.cutB, dense: &pl.dense, denseMin: pl.denseMin, countOnly: pl.countOnly, fastCnt: &pl.fastCnt}
+    var total = 0
+    let _ = try readRows(st, txn, t, sc, &srcs[sc.level], &vrows[sc.level], &bp, &cn, pushCol, &ph, false, mut &rc,
+                         fn(tx: mut &lexdb_store.Txn, b: mut &Batch, idx: []int, raw: bool): Result[bool, DbErr] {
+        if raw { return Err(batErr()) }
+        joinChunks += 1
+        try bud.tickN(b.n)
+        let n = len(idx)
+        if n == 0 { return Ok(true) }
+        js.cur[0] = replace(b, lexdb_rows.noRows())
+        var at: [][]int = []
+        append(mut &at, idx)
+        let ws: []int = array(n, 1)
+        let r = joinFromW(st, tx, &jr, mut &js, tabs, 1, &at, &ws, n, cx, bud, cnt, mut &total)
+        b = replace(mut &js.cur[0], lexdb_rows.noRows())
+        try r
+        return Ok(true)
+    })
+    cnt[sc.level].read += rc.read
+    cnt[sc.level].joined += rc.kept
+    cnt[sc.level].batches += rc.batches
+    if pushCol >= 0 {
+        cnt[jr.jls[1].level].starts += rc.pushed
+        pushDrops += rc.pushed
+        if rc.cut > 0 {
+            cnt[jr.jls[1].level].read += rc.cut
+            cnt[jr.jls[1].level].joined += rc.cut
+            cnt[jr.jls[jr.jls[1].cutTo].level].starts += rc.cut
+        }
+    }
+    return Ok(Some(total))
+}
+
 fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top0: &lexdb_plan.PPlan, a: &lexdb_plan.PAgg, cols: &[]lexdb_sql.ColDef,
            tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
            give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr],
@@ -9539,6 +10612,36 @@ fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top0: &lexdb_plan.
     let h0 = bud.held
     let maxHeld = bud.maxHeld
     let last = len(cnt) - 1
+    // Fast weighted countOnly path for plain ungrouped SELECT count(*) over joins
+    if isPlainCountStar(a, &ap) {
+        match joinRowsCount(st, txn, top, cols, tabs, srcs, vrows, cx, bud, cnt) {
+            Ok(opt) {
+                match opt {
+                    Some(total) {
+                        groupRuns += 1
+                        if total > 0 {
+                            cnt[last].joined += 1
+                            var acc = lexdb_agg.newAcc()
+                            acc.n = total
+                            var accs: []Acc = [acc]
+                            var first: []Val = array(nq, Val.Null)
+                            try give(mut &first, -1, mut &accs)
+                        }
+                        return Ok(0)
+                    }
+                    None {
+                        for k in 0..len(c0) { cnt[k] = c0[k] }
+                        bud.held = h0
+                    }
+                }
+            }
+            Err(x) {
+                if !isBat(&x) { return Err(x) }
+                for k in 0..len(c0) { cnt[k] = c0[k] }
+                bud.held = h0
+            }
+        }
+    }
     // a group's first row's columns and the keys' and calls': decoded where kept
     var avail: []bool = array(nq, false)
     // (a collation's key or call: row by row, Q8 R2)
