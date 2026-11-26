@@ -1983,14 +1983,20 @@ fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
             ch0 = ok
         }
         if useTwo {
+            let isAny = lexdb_rows.isAnyLeaf(leaf)
             for r in ch0 {
                 let k = from + r - r0
-                let row = lexdb_rows.leafVal(leaf, k)
-                let code = try lexdb_rows.decodeRow(&row, r, b, &lz.br, &rw)
+                var code = 0
+                if isAny {
+                    code = try lexdb_rows.decodeRow(lexdb_rows.anyLeafValAt(leaf, k), r, b, &lz.br, &rw)
+                } else {
+                    let row = lexdb_rows.leafVal(leaf, k)
+                    code = try lexdb_rows.decodeRow(&row, r, b, &lz.br, &rw)
+                }
                 if code == 2 {
                     append(bigR, r)
                     append(bigK, lexdb_rows.leafKey(leaf, k))
-                    append(bigV, row)
+                    append(bigV, lexdb_rows.leafVal(leaf, k))
                 } else if code != 0 {
                     return Ok(-1)
                 }
@@ -2002,25 +2008,7 @@ fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
         return Ok(m)
     }
     let np = lexdb_rows.leafPlaces(leaf)
-    // the simple LIKEs on the leaf's bytes
-    for x in 0..len(lz.raw) {
-        if len(rs) == 0 { break }
-        let ci = lz.raw[x]
-        let pl = lz.rawPl[x]
-        if pl < np && lexdb_rows.leafPlaceKind(leaf, pl) == PK_TEXT {
-            rs = lexdb_rows.likeInLeaf(leaf, from, &rs, r0, pl, &lz.pieces[x])
-            continue
-        }
-        var qs1: []int = withCapacity(len(rs))
-        for r in rs { append(mut &qs1, r - r0) }
-        if !(try lexdb_rows.colsInto(leaf, from, &qs1, false, r0, &[pl], b, bp)) { return Ok(-1) }
-        var only: []bool = array(len(lz.skip), true)
-        only[ci] = false
-        let got1 = narrow(&only, b, rs)
-        if got1.isNone() { return Ok(-2) }
-        rs = got1.unwrap()
-    }
-    // the kernels on the leaf's bytes
+    // Run cheap column kernels (integer/date ranges, =, <>, text =/<>/IN) BEFORE expensive substring LIKEs!
     var kerned = false
     if len(lz.kern) > 0 {
         var cur = collections.copyOf(&rs)
@@ -2039,6 +2027,24 @@ fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
             rs = cur
             lexdb_leafk.noteRun()
         }
+    }
+    // the simple LIKEs on the leaf's bytes (only on rows surviving the cheap kernels!)
+    for x in 0..len(lz.raw) {
+        if len(rs) == 0 { break }
+        let ci = lz.raw[x]
+        let pl = lz.rawPl[x]
+        if pl < np && lexdb_rows.leafPlaceKind(leaf, pl) == PK_TEXT {
+            rs = lexdb_rows.likeInLeaf(leaf, from, &rs, r0, pl, &lz.pieces[x])
+            continue
+        }
+        var qs1: []int = withCapacity(len(rs))
+        for r in rs { append(mut &qs1, r - r0) }
+        if !(try lexdb_rows.colsInto(leaf, from, &qs1, false, r0, &[pl], b, bp)) { return Ok(-1) }
+        var only: []bool = array(len(lz.skip), true)
+        only[ci] = false
+        let got1 = narrow(&only, b, rs)
+        if got1.isNone() { return Ok(-2) }
+        rs = got1.unwrap()
     }
     // (after the kernels, half the run or more kept: all of it decoded, together)
     let wide0 = kerned && 2 * len(rs) >= n

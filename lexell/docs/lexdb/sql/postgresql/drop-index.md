@@ -7,7 +7,7 @@ Removes an index.
 ## Syntax
 
 ```
-DROP INDEX [ CONCURRENTLY ] [ IF EXISTS ] name
+DROP [ SKIPPING ] INDEX [ CONCURRENTLY ] [ IF EXISTS ] name
 ```
 
 ## Arguments

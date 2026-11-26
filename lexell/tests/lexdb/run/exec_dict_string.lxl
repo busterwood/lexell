@@ -1,0 +1,136 @@
+// lexdb_pipe / lexdb_ht / lexdb_access:
+// - Per-batch C_DICT word deduplication in TwoLevelArena.probeTextBatch & StrLen
+// - Reusable regex.Searcher (submatchIndexWith) + zero-copy reReplaceSliceWith
+// - Vectorized memoized REGEXP_REPLACE GROUP BY + AVG(length(text)) (q28 shape)
+// - Ungrouped SUM(col +/- const) batch column cache with int2/int4/int64 overflow safety (q29 shape)
+// - Zero-copy C_ANY row decode (anyRowAt) + lz.kern-before-lz.raw predicate order (q22 shape)
+// Verifies exact parity between lexdb_batch = on and lexdb_batch = off.
+// expect: dict-group: ok
+// expect: regex-group: ok
+// expect: utf8-strlen: ok
+// expect: sum-offset: ok
+// expect: like-cany: ok
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERR:" + e.state + ":" + e.msg }
+    }
+}
+
+fn one(s: mut &lexdb_exec.Session, sql: &str) {
+    match s.exec(sql) {
+        Ok(_) {}
+        Err(e) { println("SETUP ERR " + sql + ": " + e.state + " " + e.msg) }
+    }
+}
+
+fn checkParity(s: mut &lexdb_exec.Session, label: &str, sql: &str): str {
+    one(s, &"set lexdb_batch = on")
+    let a = q(s, sql)
+    one(s, &"set lexdb_batch = off")
+    let b = q(s, sql)
+    one(s, &"set lexdb_batch = on")
+    if a != b {
+        println("PARITY MISMATCH [" + label + "]: on=" + a + " off=" + b)
+        return "DIFF"
+    }
+    return a
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(103), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 4 * 1024 * 1024, snapNodes: 200000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+
+        one(mut &s, &"create table hits_t (id int primary key, grp smallint, w int, ref text, title text, sp text, pad text)")
+        // Insert 20,000 rows: repeated hosts/titles (C_DICT), UTF-8 Cyrillic/CJK/emoji, NULLs, empty strings,
+        // and some wide (>1500B) rows to exercise C_ANY / BIG stubs too.
+        let hosts = ["https://www.google.com", "http://news.example.org", "https://shop.test.net", "http://www.wiki.io", "https://docs.alpha.dev"]
+        let widePad = strings.repeat(&"wxyz012345", 160) // 1600 bytes
+        for b in 0..20 {
+            var vals: []str = []
+            for j in 0..1000 {
+                let i = b * 1000 + j
+                let grp = (i % 50) + 1
+                let w = (i % 1000) + 10
+                var rf = ""
+                if i % 29 == 0 {
+                    rf = "null"
+                } else if i % 17 == 0 {
+                    rf = "''"
+                } else if i % 23 == 0 {
+                    rf = "'no-scheme-literal-" + (i % 7).toStr() + "'"
+                } else {
+                    // Zipf-like repetition + tail unique URLs
+                    let pathId = if i % 4 == 0 { i } else { i % 120 }
+                    rf = "'" + hosts[i % len(hosts)] + "/page/" + pathId.toStr() + "/item'"
+                }
+                var ti = ""
+                if i % 31 == 0 {
+                    ti = "null"
+                } else if i % 19 == 0 {
+                    ti = "'Поиск Google Тест " + (i % 9).toStr() + "'"
+                } else if i % 13 == 0 {
+                    ti = "'日本語テスト😀" + (i % 5).toStr() + "'"
+                } else {
+                    ti = "'Common Title " + (i % 12).toStr() + "'"
+                }
+                let sp = if i % 15 == 0 { "'query_" + (i % 8).toStr() + "'" } else { "''" }
+                let pd = if i % 500 == 0 { "'" + widePad + "'" } else { "'ok'" }
+                append(mut &vals, "(" + i.toStr() + "," + grp.toStr() + "," + w.toStr() + "," + rf + "," + ti + "," + sp + "," + pd + ")")
+            }
+            one(mut &s, &("insert into hits_t values " + strings.join(&vals, ",")))
+        }
+        // Checkpoint to pack T_CLEAF (with C_DICT) and C_ANY leaves!
+        st.checkpoint().unwrap()
+
+        // 1. C_DICT text GROUP BY (low-card and high-card)
+        let d1 = checkParity(mut &s, &"dict-lo", &"select title, count(*) as c from hits_t group by title order by c desc, title asc nulls last limit 10")
+        let d2 = checkParity(mut &s, &"dict-hi", &"select ref, count(*) as c from hits_t group by ref order by c desc, ref asc nulls last limit 10")
+        let dOk = d1 != "DIFF" && d2 != "DIFF" && len(d1) > 0 && len(d2) > 0
+        println("dict-group: " + (if dOk { "ok" } else { "FAIL" }))
+
+        // 2. Vectorized memoized REGEXP_REPLACE GROUP BY + AVG(length(...)) + MIN(...) (q28 shape!)
+        let r1 = checkParity(mut &s, &"re-q28", &"select regexp_replace(ref, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') as k, avg(length(ref)) as l, count(*) as c, min(ref) from hits_t where ref <> '' group by k having count(*) > 100 order by c desc, k asc limit 10")
+        let r2 = checkParity(mut &s, &"re-null", &"select regexp_replace(ref, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') as k, count(*) as c from hits_t group by k order by c desc, k asc nulls last limit 10")
+        let r3 = checkParity(mut &s, &"re-glob", &"select regexp_replace(sp, '[0-9]', 'X', 'g') as k, count(*) as c from hits_t group by k order by c desc, k asc")
+        let r4 = checkParity(mut &s, &"re-comp", &"select grp % 3, regexp_replace(ref, '^https?://(?:www\\.)?([^/]+)/.*$', '\\1') as k, count(*) as c from hits_t where id < 2000 group by grp % 3, k order by c desc, 1, 2 nulls last limit 10")
+        let rOk = r1 != "DIFF" && r2 != "DIFF" && r3 != "DIFF" && r4 != "DIFF" && strings.contains(&r1, "google.com|")
+        println("regex-group: " + (if rOk { "ok" } else { "FAIL: " + r1 }))
+
+        // 3. Vectorized UTF-8 length() / char_length() (ASCII, 2B Cyrillic, 3B CJK, 4B emoji, NULL)
+        let u1 = checkParity(mut &s, &"utf8-agg", &"select sum(length(title)), min(char_length(title)), max(character_length(title)), count(length(title)) from hits_t")
+        let u2 = checkParity(mut &s, &"utf8-grp", &"select length(title) as ln, count(*) as c from hits_t group by ln order by ln nulls last")
+        let uOk = u1 != "DIFF" && u2 != "DIFF" && len(u1) > 0
+        println("utf8-strlen: " + (if uOk { "ok" } else { "FAIL" }))
+
+        // 4. Ungrouped SUM(col +/- const) batch column cache (q29 shape + smallint overflow safety!)
+        let s1 = checkParity(mut &s, &"sum-off", &"select sum(w), sum(w + 1), sum(w + 2), sum(w - 5), sum(10 + w), sum(grp), sum(grp + 1), sum(grp + 20) from hits_t")
+        let s2 = checkParity(mut &s, &"sum-ovf", &"select sum(grp + 32760::smallint) from hits_t")
+        let sOk = s1 != "DIFF" && s2 != "DIFF" && strings.startsWith(&s2, "ERR:22003:")
+        println("sum-offset: " + (if sOk { "ok" } else { "FAIL: " + s2 }))
+
+        // 5. lz.kern-before-lz.raw + zero-copy C_ANY (q22 shape)
+        let l1 = checkParity(mut &s, &"q22-shape", &"select sp, min(ref), min(title), count(*) as c from hits_t where title like '%Google%' and ref not like '%.alpha.%' and sp <> '' group by sp order by c desc, sp asc limit 10")
+        let l2 = checkParity(mut &s, &"cany-wide", &"select count(*), min(length(pad)) from hits_t where pad <> 'ok' and grp > 0")
+        let lOk = l1 != "DIFF" && l2 != "DIFF" && len(l1) > 0 && l2 == "40|1600"
+        println("like-cany: " + (if lOk { "ok" } else { "FAIL: " + l2 }))
+        return 0
+    })
+}

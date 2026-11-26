@@ -7,7 +7,7 @@ Removes an index.
 ## Syntax
 
 ```
-DROP INDEX [ IF EXISTS ] index_name ON { schema_name.table_name | table_name }
+DROP [ SKIPPING ] INDEX [ IF EXISTS ] index_name [ ON { schema_name.table_name | table_name } ]
 DROP INDEX [ IF EXISTS ] [ schema_name. ] table_name.index_name
 [ ; ]
 ```

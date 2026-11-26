@@ -905,6 +905,34 @@ pub type ReCompiled = record {
     pub all: bool
 }
 
+pub type ReSearcher = regex.Searcher
+
+pub fn (rc: &ReCompiled) searcher(): ReSearcher { return rc.re.searcher() }
+
+// Fast regex replace reusing a warm Searcher (zero Exec/capture allocations per call).
+// Returns packed `(start << 28) | end` when the result is a zero-copy slice of `s` (when len(s) < 2^28),
+// or -1 when the replaced result was written into `tmp`.
+pub fn reReplaceSliceWith(rc: &ReCompiled, sr: mut &ReSearcher, s: &str, repl: &str, tmp: mut &str): int {
+    if !rc.all && len(s) < (1 << 28) {
+        if !rc.re.submatchIndexWith(sr, s, 0) { return len(s) }
+        let m = sr.submatch()
+        if m[0] == 0 && m[1] == len(s) && len(repl) == 2 && repl[0] == '\\' && repl[1] >= '1' && repl[1] <= '9' {
+            let g = int(repl[1] - '0')
+            if 2 * g + 1 < len(m) && m[2 * g] >= 0 { return (m[2 * g] << 28) | m[2 * g + 1] }
+            tmp.clear()
+            return -1
+        }
+        tmp.clear()
+        if m[0] > 0 { tmp += &s[0..m[0]] }
+        replText(s, m, repl, tmp)
+        if m[1] < len(s) { tmp += &s[m[1]..len(s)] }
+        return -1
+    }
+    tmp.clear()
+    tmp += &reReplace(&rc.re, s, repl, 0, 0, rc.all)
+    return -1
+}
+
 pub fn tryCompileReplace(pat: &str, flags: &str): Option[ReCompiled] {
     match reFlags(flags) {
         Ok(fl) {

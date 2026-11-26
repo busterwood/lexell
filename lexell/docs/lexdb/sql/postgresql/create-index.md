@@ -203,13 +203,16 @@ ROLLBACK
 
 ### F. Data skipping indexes
 
-Data skipping indexes prune B+tree subtrees for equality, `IN`, range, and substring `LIKE` predicates without secondary B+tree write amplification.
+Data skipping indexes prune B+tree subtrees for equality, `IN`, range, and substring `LIKE` predicates without secondary B+tree write amplification. Supported methods are `minmax` (alias `brin`), `set(max_rows)` (default `32`), `bloom_filter(bits_per_key, size_bytes, hashes)` (default `10, 2048, 3`), `ngrambf(n, size_bytes, hashes)` (default `3, 2048, 3`), and `tokenbf(size_bytes, hashes)` (default `2048, 3`); parameters can also be passed via `WITH (max_rows = ..., bits_per_key = ..., n = ..., size = ..., hashes = ...)`. See [Data skipping indexes](../../skipping-indexes.md) for the full parameter, predicate, and persistence reference.
 
 <!-- example: postgresql -->
 ```sql
 CREATE INDEX customer_score_bf ON customer USING bloom_filter (score);
 CREATE SKIPPING INDEX customer_email_ng ON customer (email) USING ngrambf(3, 2048, 3);
+CREATE SKIPPING INDEX customer_city_set ON customer (city) USING set WITH (max_rows = 16);
 SELECT count(*) FROM customer WHERE email LIKE '%user42%';
+SELECT count(*) FROM customer WHERE city = 'york';
+DROP SKIPPING INDEX customer_city_set;
 DROP SKIPPING INDEX customer_email_ng;
 DROP INDEX customer_score_bf;
 ```
@@ -217,15 +220,22 @@ DROP INDEX customer_score_bf;
 ```text
 CREATE INDEX
 CREATE INDEX
+CREATE INDEX
  count
 -------
      1
 (1 row)
 
+ count
+-------
+   101
+(1 row)
+
+DROP INDEX
 DROP INDEX
 DROP INDEX
 ```
 
 ## See also
 
-[ALTER INDEX](alter-index.md) · [DROP INDEX](drop-index.md) · [CREATE TABLE](create-table.md) · EXPLAIN · ANALYZE
+[Data skipping indexes](../../skipping-indexes.md) · [ALTER INDEX](alter-index.md) · [DROP INDEX](drop-index.md) · [CREATE TABLE](create-table.md) · EXPLAIN · ANALYZE

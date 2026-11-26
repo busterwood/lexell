@@ -7,7 +7,7 @@ Removes an index.
 ## Syntax
 
 ```
-DROP INDEX [ schema. ] index
+DROP [ SKIPPING ] INDEX [ IF EXISTS ] [ schema. ] index
 ```
 
 ## Remarks

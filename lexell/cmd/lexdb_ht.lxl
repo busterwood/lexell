@@ -648,9 +648,16 @@ pub fn (t: mut &TwoLevelArena) put(s: &str, gid: int) {
 }
 
 // Batch-grouped cache-friendly probe for BK_TEXT column (radix-scatters 1024-row batch into 256 L2 buckets).
+// Exploits T_CLEAF C_DICT encoding where repeated dictionary entries share identical `words[r]`
+// ((offset << 24) | len): a tiny per-batch direct-mapped word cache skips hashStr + probe + memcmp!
 // Writes precomputed hashes into outHash[j] and found group ID (or -1 on miss/null) into outGid[j].
 pub fn (t: &TwoLevelArena) probeTextBatch(buf: &str, words: &[]int, nul: &[]bool, idx: &[]int, nc: int,
                                           outHash: mut &[]u64, outGid: mut &[]int) {
+    // Direct-mapped 64-slot per-batch C_DICT word cache (word -> gid when hit >= 0)
+    var wcW: []int = array(64, -1)
+    var wcG: []int = array(64, -1)
+    var prevW = -1
+    var prevG = -1
     if !t.twoLevel {
         for j in 0..nc {
             let r = idx[j]
@@ -659,11 +666,30 @@ pub fn (t: &TwoLevelArena) probeTextBatch(buf: &str, words: &[]int, nul: &[]bool
                 continue
             }
             let w = words[r]
+            if w == prevW && prevG >= 0 {
+                outGid[j] = prevG
+                continue
+            }
+            let wi = ((w >> 24) ^ w) & 63
+            if wcW[wi] == w && wcG[wi] >= 0 {
+                let g = wcG[wi]
+                outGid[j] = g
+                prevW = w
+                prevG = g
+                continue
+            }
             let a = w >> 24
             let sl = &buf[a..a + (w & 0xffffff)]
             let h = hashStr(sl)
             outHash[j] = h
-            outGid[j] = t.l1.find(sl, h)
+            let g = t.l1.find(sl, h)
+            outGid[j] = g
+            if g >= 0 {
+                wcW[wi] = w
+                wcG[wi] = g
+                prevW = w
+                prevG = g
+            }
         }
         return
     }
@@ -701,14 +727,78 @@ pub fn (t: &TwoLevelArena) probeTextBatch(buf: &str, words: &[]int, nul: &[]bool
             for p in st..(st + n) { outGid[ord[p]] = -1 }
             continue
         }
+        var bPrevW = -1
+        var bPrevG = -1
         for p in st..(st + n) {
             let j = ord[p]
             let r = idx[j]
             let w = words[r]
+            if w == bPrevW && bPrevG >= 0 {
+                outGid[j] = bPrevG
+                continue
+            }
             let a = w >> 24
-            outGid[j] = bk.find(&buf[a..a + (w & 0xffffff)], outHash[j])
+            let g = bk.find(&buf[a..a + (w & 0xffffff)], outHash[j])
+            outGid[j] = g
+            if g >= 0 { bPrevW = w; bPrevG = g }
         }
     }
+}
+
+// ============================================================================
+// 3b. StrGidMemo: Direct-Mapped Input-String -> GroupID Memoization Cache
+//     (speeds up expensive pure unary text transforms like REGEXP_REPLACE in GROUP BY!)
+// ============================================================================
+
+const MEMO_SLOTS = 16384
+const MEMO_MASK = 16383
+const MEMO_ARENA_MAX = 4 * 1024 * 1024   // cap arena at 4 MB; resets cleanly when full
+
+pub type StrGidMemo = record {
+    arena: str
+    hash: []u64
+    off: []int
+    slen: []int
+    gid: []int
+    ready: bool
+}
+
+pub fn newStrGidMemo(): StrGidMemo {
+    return StrGidMemo{arena: "", hash: [], off: [], slen: [], gid: [], ready: false}
+}
+
+pub fn (m: mut &StrGidMemo) init() {
+    if m.ready { return }
+    m.hash = array(MEMO_SLOTS, u64(0))
+    m.off = array(MEMO_SLOTS, -1)
+    m.slen = array(MEMO_SLOTS, 0)
+    m.gid = array(MEMO_SLOTS, -1)
+    m.ready = true
+}
+
+pub fn (m: &StrGidMemo) get(s: &str, h: u64): int {
+    if !m.ready { return -1 }
+    let sl = int(h & u64(MEMO_MASK))
+    let o = m.off[sl]
+    if o >= 0 && m.hash[sl] == h && m.slen[sl] == len(s) && &m.arena[o..o + len(s)] == s {
+        return m.gid[sl]
+    }
+    return -1
+}
+
+pub fn (m: mut &StrGidMemo) put(s: &str, h: u64, g: int) {
+    if !m.ready { m.init() }
+    if len(m.arena) + len(s) > MEMO_ARENA_MAX {
+        m.arena = ""
+        for i in 0..MEMO_SLOTS { m.off[i] = -1 }
+    }
+    let sl = int(h & u64(MEMO_MASK))
+    let o = len(m.arena)
+    m.arena += s
+    m.hash[sl] = h
+    m.off[sl] = o
+    m.slen[sl] = len(s)
+    m.gid[sl] = g
 }
 
 // Reconstructs key text for global group id (only called for surviving groups at finish()!).

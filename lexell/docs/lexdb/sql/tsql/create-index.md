@@ -277,7 +277,7 @@ lexdb: ALTER INDEX takes RENAME TO only
 
 ### H. Data skipping indexes
 
-lexdb supports hierarchical B+tree data skipping indexes (`minmax`/`brin`, `set`, `bloom_filter`, `ngrambf`, `tokenbf`) for pruning subtrees on analytical equality, `IN`, range, and substring `LIKE` queries with zero OLTP write-path maintenance.
+lexdb supports hierarchical B+tree data skipping indexes (`minmax`/`brin`, `set(max_rows)`, `bloom_filter(bits_per_key, size_bytes, hashes)`, `ngrambf(n, size_bytes, hashes)`, `tokenbf(size_bytes, hashes)`, plus `WITH (...)` options) for pruning subtrees on analytical equality, `IN`, range, and substring `LIKE` queries with zero OLTP write-path maintenance. Case-insensitive `NVARCHAR` columns automatically fold ASCII case in `ngrambf` and `tokenbf` summaries. See [Data skipping indexes](../../skipping-indexes.md) for the full method and parameter reference.
 
 <!-- example: tsql -->
 ```sql
@@ -299,4 +299,4 @@ hits
 
 ## See also
 
-[DROP INDEX](drop-index.md) · [CREATE TABLE](create-table.md) · [sp_rename](sp-rename.md)
+[Data skipping indexes](../../skipping-indexes.md) · [DROP INDEX](drop-index.md) · [CREATE TABLE](create-table.md) · [sp_rename](sp-rename.md)
