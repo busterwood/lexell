@@ -32,6 +32,7 @@ Quick gate, after every change (`lexell/tools/gate.sh quick`):
     python3 lexell/tests/run.py                  # conformance
     python3 lexell/tests/compiler/run_tests.py   # compiler tests
     python3 lexell/lib/run_tests.py -j 8
+    python3 lexell/tools/doc_check.py            # the lxl blocks of AGENTS.md and docs/lang/
     python3 lexell/tests/run_native.py --lib     # native backend against the C backend
     bash lexell/tools/native_selfbuild.sh
 
