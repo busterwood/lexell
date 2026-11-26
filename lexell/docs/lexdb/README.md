@@ -13,6 +13,7 @@ showcase, start with [LEXDB.md](../../../LEXDB.md). The storage internals and hi
 |---|---|
 | [Overview](overview.md) | The idea: one engine, three doors; the store; transactions; replicas; what lexdb is not. |
 | [Quick start](quickstart.md) | Build, start with all three doors, use one table from each. |
+| [Driver & ORM compatibility](compatibility.md) | Verified compatibility matrix and reproducible test suite (`SQLAlchemy`, `Alembic`, `Django`, `EF Core`, `asyncpg`, `psycopg`, `pymssql`, `oracledb`, `ODP.NET`, `Knex`) across all three doors. |
 | [Performance](performance.md) | Full TPC-H, ClickBench, analytic, OLTP (`pgbench`/`sysbench`), materialized view, skipping index, property graph, and bulk load benchmarks. |
 | [Server options](server-options.md) | Every command-line option and environment variable, with defaults. |
 | [Read replicas](replicas.md) | Replicas, routing per door, read-your-writes with `WAIT FOR LSN`. |

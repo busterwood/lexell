@@ -191,6 +191,7 @@ psql -h 127.0.0.1 -p 5433 -U postgres lexdb
 | Page | What it covers |
 |---|---|
 | [Quick start](lexell/docs/lexdb/quickstart.md) | Step-by-step walkthrough using one table from PostgreSQL, SQL Server, and Oracle clients. |
+| [Driver & ORM compatibility](lexell/docs/lexdb/compatibility.md) | Verified matrix and reproducible test suite across SQLAlchemy, Alembic, Django, Entity Framework Core, psycopg, asyncpg, pymssql, oracledb, ODP.NET, and Knex on all three doors. |
 | [LexDB performance report](lexell/docs/lexdb/performance.md) | Full query-by-query TPC-H, ClickBench, 35 analytic, OLTP (`pgbench`/`sysbench`), materialized view, and bulk load numbers against PostgreSQL 18. |
 | [Materialized views](lexell/docs/lexdb/materialized-views.md) | Incremental `FAST` updates, transparent query rewrite, real-time delta merging, sketches, and cascading DAGs. |
 | [Data skipping indexes](lexell/docs/lexdb/skipping-indexes.md) | When to use `minmax`/`brin`, `set`, `bloom_filter`, `ngrambf`, and `tokenbf` — with plain-English examples. |
