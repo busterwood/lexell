@@ -13,7 +13,7 @@ showcase, start with [LEXDB.md](../../../LEXDB.md). The storage internals and hi
 |---|---|
 | [Overview](overview.md) | The idea: one engine, three doors; the store; transactions; replicas; what lexdb is not. |
 | [Quick start](quickstart.md) | Build, start with all three doors, use one table from each. |
-| [Performance](performance.md) | Full TPC-H, ClickBench, analytic, OLTP (`pgbench`/`sysbench`), materialized view, skipping index, and bulk load benchmarks against PostgreSQL 18. |
+| [Performance](performance.md) | Full TPC-H, ClickBench, analytic, OLTP (`pgbench`/`sysbench`), materialized view, skipping index, property graph, and bulk load benchmarks. |
 | [Server options](server-options.md) | Every command-line option and environment variable, with defaults. |
 | [Read replicas](replicas.md) | Replicas, routing per door, read-your-writes with `WAIT FOR LSN`. |
 | [Architecture](architecture.md) | The files, commits, checkpoints and recovery, from a user's point of view. |
@@ -25,7 +25,7 @@ showcase, start with [LEXDB.md](../../../LEXDB.md). The storage internals and hi
 | [Assertions](assertions.md) | SQL-standard `CREATE ASSERTION` (currently only in Oracle 26ai) enforced across all three doors, with join-key concurrency locking. |
 | [Waiting for new data](sql/postgresql/select-wait.md) | `SELECT ... WAIT n SECONDS\|MILLISECONDS`: turn any indexed table into a zero-polling transactional event stream across all three doors, plus replica [`WAIT FOR LSN`](sql/postgresql/wait-for-lsn.md). |
 | [Row pattern recognition](sql/postgresql/match-recognize.md) | SQL:2016 `MATCH_RECOGNIZE` over ordered rows in the [PostgreSQL](sql/postgresql/match-recognize.md) and [Oracle](sql/oracle/match-recognize.md) doors. |
-| [Property graphs](sql/postgresql/graph-table.md) | SQL:2023 `CREATE PROPERTY GRAPH` and `GRAPH_TABLE` over existing relational tables across all three doors. |
+| [Property graphs](property-graphs.md) | SQL:2023 `CREATE PROPERTY GRAPH`, `GRAPH_TABLE`, and `ANY SHORTEST` over existing relational tables (CSR + bidirectional BFS), with 4-engine benchmarks against PostgreSQL 18, DuckPGQ, and Kùzu. |
 | [Known issues](KNOWN-ISSUES.md) | Bugs and gaps found while writing these pages. |
 
 Still to be written: monitoring (catalog views, statistics).

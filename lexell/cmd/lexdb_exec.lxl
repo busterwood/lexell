@@ -40,6 +40,7 @@ import "./lexdb_copyjson"
 import "./lexdb_nncon"
 import "./lexdb_nnalter"
 import "./lexdb_annot"
+import "./lexdb_csr"
 import "./lexdb_graph"
 import "./lexdb_mview"
 import "./lexdb_skip"
@@ -249,6 +250,9 @@ fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
     if strings.startsWith(name, &("#" + MV_OQC_REL)) {
         return Ok(mvOqcOutCols(name))
     }
+    if strings.startsWith(name, lexdb_graph.PGQ_SHORTEST_PRE) {
+        return Ok(pgqShortestOutCols(name))
+    }
     if strings.startsWith(&name, "#") {
         // a catalog relation (9.80)
         for c in lexdb_pgcat.relCols(&lexdb_sql.catRelName(name)) { append(mut &out, OutCol{name: c.name.clone(), oid: c.oid, spell: "", coll: "", scale: -1}) }
@@ -366,12 +370,12 @@ fn execSrf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params:
     let env = Env{cols: &sel.q.cols, row: &noRow, aggs: &noRow, params: params, subs: &m.subs, cur: &noRow, seq: &sqe}
     var args: []Val = []
     for x in sel.exprs { append(mut &args, try evalX(st, txn, &sel.q, &x, &env, rs)) }
-    return srfRows(st, txn, sel, args, cap, rs)
+    return srfRows(st, txn, sel, args, params, cap, rs)
 }
 
 // A function's rows from its arguments' values: a catalog relation's or a
 // sequence's read here, the others made by lexdb_srf.
-fn srfRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, args: []Val, cap: int, rs: mut &Run): Result[Res, DbErr] {
+fn srfRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, args: []Val, params: &[]Val, cap: int, rs: mut &Run): Result[Res, DbErr] {
     var rows: [][]Val = []
     if lexdb_srf.ours(&sel.srf) {
         var oids: []int = withCapacity(len(sel.outs))
@@ -399,6 +403,8 @@ fn srfRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, args: [
         let lim = Limits{rounds: MAX_RECURSION, steps: MAX_MATCH_STEPS, mem: txn.sql.memMax, deadline: rs.bud.deadline, batch: rs.batch, rules: txn.sql.rules, auto: false, rdel: true}
         let up = mvUp(st, txn.sql.sess, lim)
         rows = try lexdb_mview.readMergedRows(st, txn, &key, &up)
+    } else if strings.startsWith(&sel.srf, lexdb_graph.PGQ_SHORTEST_PRE) {
+        rows = try pgqShortestRows(st, txn, &sel.srf, params, rs)
     } else {
         rows = try catRows(st, txn, &lexdb_sql.catRelName(&sel.srf), strings.endsWith(&sel.srf, lexdb_sql.TSQL_IS))
     }
@@ -16597,6 +16603,119 @@ fn mvOqcOutCols(srf: &str): []OutCol {
     return out
 }
 
+fn pgqShortestOutCols(srf: &str): []OutCol {
+    let spec = lexdb_catalog.strsAt(&srf[len(lexdb_graph.PGQ_SHORTEST_PRE)..len(srf)], 0)
+    let vOid = if len(spec) > 3 { lexdb_base.num(&spec[3]) } else { lexdb_sql.OID_INT8 }
+    return [
+        OutCol{name: "src", oid: vOid, spell: "", coll: "", scale: -1},
+        OutCol{name: "dst", oid: vOid, spell: "", coll: "", scale: -1},
+        OutCol{name: "hops", oid: lexdb_sql.OID_INT8, spell: "", coll: "", scale: -1}
+    ]
+}
+
+fn pgqParamOid(v: &Val): int {
+    match v {
+        Val.Int(_) { return lexdb_sql.OID_INT8 }
+        Val.Bool(_) { return lexdb_sql.OID_BOOL }
+        Val.Text(_) { return lexdb_sql.OID_TEXT }
+        Val.Num(_) { return lexdb_sql.OID_NUMERIC }
+        Val.Float(_) { return lexdb_sql.OID_FLOAT8 }
+        Val.Real(_) { return lexdb_sql.OID_FLOAT4 }
+        Val.Date(_) { return lexdb_sql.OID_DATE }
+        Val.Time(_) { return lexdb_sql.OID_TIME }
+        Val.Ts(_) { return lexdb_sql.OID_TS }
+        Val.Tstz(_) { return lexdb_sql.OID_TSTZ }
+        Val.Uuid(_) { return lexdb_sql.OID_UUID }
+        Val.Bytes(_) { return lexdb_sql.OID_BYTEA }
+        else { return 0 }
+    }
+}
+
+fn pgqRunSubSql(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sql: &str, md: int, params: &[]Val, rs: &Run): Result[Res, DbErr] {
+    var ss = try lexdb_graph.parseSql(sql, md, [])
+    if len(ss) != 1 { return Err(lexdb_base.corrupt("GRAPH_TABLE ANY SHORTEST subquery")) }
+    var ptypes: []int = withCapacity(len(params))
+    for v in params { append(mut &ptypes, pgqParamOid(&v)) }
+    var pc = oneShot()
+    let lim = Limits{rounds: MAX_RECURSION, steps: MAX_MATCH_STEPS, mem: txn.sql.memMax, deadline: rs.bud.deadline, batch: rs.batch, rules: txn.sql.rules, auto: false, rdel: true}
+    return execIn(st, txn, &ss[0], params, &ptypes, lim, mut &pc, &noInput(), noOut, noPull, noSink)
+}
+
+fn pgqShortestRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, srf: &str, params: &[]Val, rs: mut &Run): Result[[][]Val, DbErr] {
+    let spec = lexdb_catalog.strsAt(&srf[len(lexdb_graph.PGQ_SHORTEST_PRE)..len(srf)], 0)
+    if len(spec) < 11 { return Err(lexdb_base.corrupt("GRAPH_TABLE ANY SHORTEST spec")) }
+    let edgeKey = &spec[0]
+    let srcCol = lexdb_base.num(&spec[1])
+    let dstCol = lexdb_base.num(&spec[2])
+    let dir = lexdb_base.num(&spec[4])
+    let minHops = lexdb_base.num(&spec[5])
+    let maxHops = lexdb_base.num(&spec[6])
+    let md = lexdb_base.num(&spec[7])
+    let srcSql = &spec[8]
+    let dstSql = &spec[9]
+    let edgeSql = &spec[10]
+
+    let eTabOpt = try byKeyOpt(st, txn, edgeKey)
+    if eTabOpt.isNone() { return Err(e("42P01", &("relation \"" + edgeKey + "\" does not exist"))) }
+    let eTab = eTabOpt.unwrap()
+    let rel = lexdb_catalog.relOf(&eTab)
+
+    let sRes = try pgqRunSubSql(st, txn, srcSql, md, params, rs)
+    var srcs: []int = withCapacity(len(sRes.rows))
+    for r in sRes.rows {
+        if len(r) > 0 {
+            match r[0] { Val.Int(x) { append(mut &srcs, x) } else {} }
+        }
+    }
+    if len(srcs) == 0 { return Ok([]) }
+
+    var dsts: []int = []
+    var dstAll = true
+    if len(dstSql) > 0 {
+        dstAll = false
+        let dRes = try pgqRunSubSql(st, txn, dstSql, md, params, rs)
+        for r in dRes.rows {
+            if len(r) > 0 {
+                match r[0] { Val.Int(x) { append(mut &dsts, x) } else {} }
+            }
+        }
+        if len(dsts) == 0 { return Ok([]) }
+    }
+
+    var edgePairs: []int = []
+    var useEdgePairs = false
+    if len(edgeSql) > 0 {
+        useEdgePairs = true
+        let eRes = try pgqRunSubSql(st, txn, edgeSql, md, params, rs)
+        for r in eRes.rows {
+            if len(r) >= 2 {
+                var u = 0
+                var v = 0
+                var okU = false
+                var okV = false
+                match r[0] { Val.Int(x) { u = x; okU = true } else {} }
+                match r[1] { Val.Int(x) { v = x; okV = true } else {} }
+                if okU && okV {
+                    append(mut &edgePairs, u)
+                    append(mut &edgePairs, v)
+                }
+            }
+        }
+    }
+
+    let flat = try lexdb_csr.shortest(st, txn, &rel, srcCol, dstCol, dir, minHops, maxHops,
+                                      &srcs, &dsts, dstAll, &edgePairs, useEdgePairs,
+                                      fn(): Result[Unit, DbErr] { return rs.bud.tick() })
+    let nRows = len(flat) / 3
+    var rows: [][]Val = withCapacity(nRows)
+    var i = 0
+    while i + 2 < len(flat) {
+        append(mut &rows, [Val.Int(flat[i]), Val.Int(flat[i + 1]), Val.Int(flat[i + 2])])
+        i += 3
+    }
+    return Ok(rows)
+}
+
 // A table standing for sequence d in FROM: a view whose query is its row.
 fn seqRelation(d: &Seq): Table {
     var t = lexdb_catalog.emptyTable(&d.key)
@@ -23755,7 +23874,7 @@ fn pipeFunc(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params
                     var args: []Val = withCapacity(len(xs))
                     for x in xs { append(mut &args, try lexdb_pipe.bxEval(&x, &none, &none, &cx)) }
                     lexdb_srf.pipedRun()
-                    return srfRows(st, txn, sel, args, cap, rs)
+                    return srfRows(st, txn, sel, args, params, cap, rs)
                 }
                 else {}
             }

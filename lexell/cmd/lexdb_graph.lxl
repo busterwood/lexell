@@ -43,6 +43,7 @@ const MD_ORA = lexdb_sql.MD_ORA
 
 pub const GRAPH_PRE = lexdb_catalog.GRAPH_PRE
 pub const GRAPH_END = lexdb_catalog.GRAPH_END
+pub const PGQ_SHORTEST_PRE = "#pgq_shortest:"
 
 // A graph's catalog row's key.
 pub fn graphKey(key: &str): str { return GRAPH_PRE + key }
@@ -283,7 +284,7 @@ fn relTextIn(key: &str, md: int): str {
     return qIn(&outSc, md) + "." + qIn(&lexdb_sql.baseName(key), md)
 }
 
-fn parseSql(sql: &str, md: int, nls: []str): Result[[]Stmt, DbErr] {
+pub fn parseSql(sql: &str, md: int, nls: []str): Result[[]Stmt, DbErr] {
     if md == MD_ORA { return lexdb_parse.oraParseNls(sql, nls) }
     if md == MD_TSQL { return lexdb_parse.parseTsqlVars(sql, &nls) }
     return lexdb_parse.parse(sql)
@@ -833,6 +834,8 @@ pub fn isGraph(s: &Stmt): bool { return s.srf == lexdb_sql.GRAPH_MARK }
 // A GRAPH_TABLE subquery (isGraph) as the query it stands for, parsed, to be planned in its place.
 pub fn expand(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt): Result[Stmt, DbErr] {
     let md = s.mdialect
+    var gt = try parseGT(st, txn, &s.index, md)
+    if gt.shortest { return expandShortest(st, txn, &gt, md, s.names.clone()) }
     let sql = try rewriteIn(st, txn, &s.index, md)
     var ss = try parseSql(&sql, md, s.names.clone())
     if len(ss) != 1 { return Err(lexdb_base.corrupt("GRAPH_TABLE's query")) }
@@ -905,6 +908,8 @@ type GT = record {
     cols: []Col
     owner: str
     allCols: []str              // every column of every element table (a bare name that is one is an undeclared variable)
+    shortest: bool              // MATCH [p =] ANY SHORTEST [PATH] ...
+    pathVar: str                // optional path variable name (p)
 }
 
 // A variable of one expansion: its occurrences' constraints.
@@ -1001,6 +1006,7 @@ pub fn flatQuery(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt): R
     let f = &s.from[0]
     if f.sub != 0 || !isGraph(&s.subs[0]) || len(f.cols) > 0 || f.lateral { return Ok(None) }
     let g = &s.subs[0]
+    if strings.contains(&strings.toLowerAscii(&g.index), "shortest") { return Ok(None) }
     let md = g.mdialect
     var mn = false
     let branches = try branchTextsIn(st, txn, &g.index, md, mut &mn)
@@ -1224,8 +1230,18 @@ fn parseGT(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, text: &str, md: in
         append(mut &tabs, t)
     }
     // (an edge's vertex columns are its vertex's key: checked with it)
-    var gt = GT{r: Rdr{toks: [], pos: 0, src: "", ora: oraMode, md: md}, ora: oraMode, md: md, g: g, tabs: tabs, paths: [], decls: [], groups: [], glo: [], ghi: [], wlo: -1, whi: -1, cols: [], owner: owner, allCols: allCols}
+    var gt = GT{r: Rdr{toks: [], pos: 0, src: "", ora: oraMode, md: md}, ora: oraMode, md: md, g: g, tabs: tabs, paths: [], decls: [], groups: [], glo: [], ghi: [], wlo: -1, whi: -1, cols: [], owner: owner, allCols: allCols, shortest: false, pathVar: ""}
     if !r.accept("match") { return Err(gerr(oraMode, 2000, "42601", "missing MATCH keyword")) }
+    if isName(r.peek()) && r.opAt(1, "=") && r.kwAt(2, "any") && r.kwAt(3, "shortest") {
+        gt.pathVar = canonIn(r.peek(), md)
+        gt.shortest = true
+        r.pos += 4
+        let _ = r.accept("path")
+    } else if r.kw("any") && r.kwAt(1, "shortest") {
+        gt.shortest = true
+        r.pos += 2
+        let _ = r.accept("path")
+    }
     while true {
         var path: []PI = []
         try pathOf(mut &r, mut &gt, mut &path, -1, 0)
@@ -1359,7 +1375,46 @@ fn epBody(r: mut &Rdr, gt: mut &GT, vertex: bool, close: &str, group: int): Resu
 }
 
 // A quantifier after an edge or a bracketed path: {n}, {m,n}, {,n}; lo and hi -1: none.
-fn quant(r: mut &Rdr, lo: mut &int, hi: mut &int): Result[Unit, DbErr] {
+// Under ANY SHORTEST (allowUnbounded = true), also accepts +, *, ?, {m,} (hi = -1: unbounded) and {0,n}.
+fn quant(r: mut &Rdr, allowUnbounded: bool, lo: mut &int, hi: mut &int): Result[Unit, DbErr] {
+    if allowUnbounded {
+        if r.acceptOp("+") {
+            let x = replace(lo, 1)
+            let y = replace(hi, -1)
+            return Ok(Unit{})
+        }
+        if r.acceptOp("*") {
+            let x = replace(lo, 0)
+            let y = replace(hi, -1)
+            return Ok(Unit{})
+        }
+        if r.acceptOp("?") {
+            let x = replace(lo, 0)
+            let y = replace(hi, 1)
+            return Ok(Unit{})
+        }
+        if !r.acceptOp("{") { return Ok(Unit{}) }
+        var a = 0
+        var b = -1
+        if r.peek().kind == T_NUM {
+            a = lexdb_base.num(&r.peek().text)
+            r.pos += 1
+            b = a
+        }
+        if r.acceptOp(",") {
+            if r.peek().kind == T_NUM {
+                b = lexdb_base.num(&r.peek().text)
+                r.pos += 1
+            } else {
+                b = -1
+            }
+        }
+        if !r.acceptOp("}") { return Err(gerr(r.ora, 40984, "42601", "invalid value specified for quantifier in a GRAPH_TABLE operator")) }
+        if a < 0 || (b >= 0 && a > b) { return Err(gerr(r.ora, 40984, "42601", "invalid value specified for quantifier in a GRAPH_TABLE operator")) }
+        let x = replace(lo, a)
+        let y = replace(hi, b)
+        return Ok(Unit{})
+    }
     if r.op("+") || r.op("*") { return Err(gerr(r.ora, 40985, "0A000", "unsupported quantifier for variable path pattern in a GRAPH_TABLE operator")) }
     if r.op("?") { return Err(gerr(r.ora, 49003, "0A000", "Using a question mark in path pattern is not supported.")) }
     if !r.acceptOp("{") { return Ok(Unit{}) }
@@ -1414,7 +1469,7 @@ fn pathOf(r: mut &Rdr, gt: mut &GT, out: mut &[]PI, group: int, depth: int): Res
             try r.expectOp(")")
             var lo = -1
             var hi = -1
-            try quant(r, mut &lo, mut &hi)
+            try quant(r, gt.shortest, mut &lo, mut &hi)
             if lo < 0 { lo = 1; hi = 1 }
             gt.glo[gid] = lo
             gt.ghi[gid] = hi
@@ -1473,7 +1528,7 @@ fn pathOf(r: mut &Rdr, gt: mut &GT, out: mut &[]PI, group: int, depth: int): Res
                 if quantified && group < 0 {
                     var lo = -1
                     var hi = -1
-                    try quant(r, mut &lo, mut &hi)
+                    try quant(r, gt.shortest, mut &lo, mut &hi)
                     gt.glo[gid] = lo
                     gt.ghi[gid] = hi
                     append(out, PI{group: true, ep: noEP(), sub: [PI{group: false, ep: ep, sub: [], lo: 1, hi: 1, gid: -1}], lo: lo, hi: hi, gid: gid})
@@ -1494,7 +1549,7 @@ fn pathOf(r: mut &Rdr, gt: mut &GT, out: mut &[]PI, group: int, depth: int): Res
             if (r.op("{") || r.op("+") || r.op("*") || r.op("?")) && group < 0 {
                 var lo = -1
                 var hi = -1
-                try quant(r, mut &lo, mut &hi)
+                try quant(r, gt.shortest, mut &lo, mut &hi)
                 let gid = newGroup(gt, lo, hi)
                 append(out, PI{group: true, ep: noEP(), sub: [PI{group: false, ep: ep, sub: [], lo: 1, hi: 1, gid: -1}], lo: lo, hi: hi, gid: gid})
                 continue
@@ -2465,4 +2520,531 @@ fn aggSql(gt: &GT, x: &Exp, b: &Bind, f: &str, lo: int, hi: int, where: int, kee
     let cat = "(" + strings.join(&ps, " || ") + ")"
     if len(sep) == 0 { return Ok(cat) }
     return Ok("substr(" + cat + ", " + (len(sep) + 1).toStr() + ")")
+}
+
+// ---- SQL:2023 ANY SHORTEST [PATH] (CSR / bidirectional BFS via #pgq_shortest: SRF)
+
+fn isIntOid(oid: int): bool {
+    return oid == lexdb_sql.OID_INT2 || oid == lexdb_sql.OID_INT4 || oid == lexdb_sql.OID_INT8
+}
+
+// Split tokens [lo, hi) on top-level AND (ignoring AND inside BETWEEN ... AND ...).
+fn splitAnds(r: &Rdr, lo: int, hi: int): [][]int {
+    var out: [][]int = []
+    var start = lo
+    var d = 0
+    var inBetween = false
+    for i in lo..hi {
+        let t = &r.toks[i]
+        if t.kind == T_OP && (t.text == "(" || t.text == "[") { d += 1 }
+        else if t.kind == T_OP && (t.text == ")" || t.text == "]") { d -= 1 }
+        else if d == 0 && t.kind == T_IDENT && t.text == "between" { inBetween = true }
+        else if d == 0 && t.kind == T_IDENT && t.text == "and" {
+            if inBetween {
+                inBetween = false
+            } else {
+                if i > start { append(mut &out, [start, i]) }
+                start = i + 1
+            }
+        }
+    }
+    if hi > start { append(mut &out, [start, hi]) }
+    return out
+}
+
+// Bitmask of variables referenced in tokens [lo, hi): 1=a, 2=b, 4=e, 8=pathVar/agg.
+fn shortestTokVars(gt: &GT, lo: int, hi: int, aName: &str, bName: &str, eName: &str): int {
+    let r = &gt.r
+    var mask = 0
+    var i = lo
+    while i < hi {
+        let t = &r.toks[i]
+        let nx = &r.toks[i + 1]
+        if isName(t) && nx.kind == T_OP && nx.text == "." && !(i > lo && r.toks[i - 1].kind == T_OP && r.toks[i - 1].text == ".") {
+            let v = canonIn(t, gt.md)
+            if len(aName) > 0 && v == aName { mask |= 1 }
+            if len(bName) > 0 && v == bName { mask |= 2 }
+            if len(eName) > 0 && v == eName { mask |= 4 }
+            i += 3
+            continue
+        }
+        if t.kind == T_IDENT && nx.kind == T_OP && nx.text == "(" {
+            if t.text == "path_length" || isAggNameIn(&t.text, gt.md) {
+                mask |= 8
+            } else if t.text == "vertex_id" || t.text == "edge_id" {
+                let c = closeOf(r, i + 1, hi)
+                if c - (i + 2) == 1 && isName(&r.toks[i + 2]) {
+                    let v = canonIn(&r.toks[i + 2], gt.md)
+                    if len(aName) > 0 && v == aName { mask |= 1 }
+                    if len(bName) > 0 && v == bName { mask |= 2 }
+                    if len(eName) > 0 && v == eName { mask |= 4 }
+                }
+            }
+        }
+        if isName(t) && !(nx.kind == T_OP && (nx.text == "(" || nx.text == ".")) && !(i > lo && r.toks[i - 1].kind == T_OP && r.toks[i - 1].text == ".") {
+            let v = canonIn(t, gt.md)
+            if len(gt.pathVar) > 0 && v == gt.pathVar { mask |= 8 }
+            if nx.kind == T_IDENT && nx.text == "is" {
+                if len(aName) > 0 && v == aName { mask |= 1 }
+                if len(bName) > 0 && v == bName { mask |= 2 }
+                if len(eName) > 0 && v == eName { mask |= 4 }
+            }
+        }
+        i += 1
+    }
+    return mask
+}
+
+fn qualPropSimple(p: &Prop, al: &str, md: int): Result[str, DbErr] {
+    if len(p.col) > 0 { return Ok(al.toStr() + "." + qIn(&p.col, md)) }
+    let r = try readerIn(&p.expr, md)
+    var out = ""
+    for i in 0..len(r.toks) - 1 {
+        let t = &r.toks[i]
+        let piece = &r.src[t.at..r.toks[i + 1].at]
+        if isName(t) && lexdb_base.hasStr(&p.uses, &t.text) && !(r.toks[i + 1].kind == T_OP && r.toks[i + 1].text == "(") &&
+           !(i > 0 && r.toks[i - 1].kind == T_OP && r.toks[i - 1].text == ".") {
+            out += al.toStr() + "." + qIn(&t.text, md) + " "
+            continue
+        }
+        out += piece
+    }
+    return Ok(out)
+}
+
+fn shortestPropSql(gt: &GT, elIdx: int, al: &str, vKeyCol: &str, spCol: &str, pName: &str, needJoin: mut &bool): Result[str, DbErr] {
+    let el = &gt.g.elems[elIdx]
+    for l in el.labels {
+        for pr in l.props {
+            if pr.name == pName {
+                if len(spCol) > 0 && len(pr.col) > 0 && pr.col == vKeyCol {
+                    return Ok("\"gt$sp\"." + qIn(spCol, gt.md))
+                }
+                let _ = replace(needJoin, true)
+                return qualPropSimple(&pr, al, gt.md)
+            }
+        }
+    }
+    return Ok(nullOf(gt, pName))
+}
+
+fn shortestVertexIdSql(gt: &GT, vElIdx: int, vKeyCol: &str, spCol: &str): str {
+    let el = &gt.g.elems[vElIdx]
+    let t = &gt.tabs[vElIdx]
+    let ci = colIdx(t, vKeyCol)
+    let name = shownIn(&t.cols[ci].name, &t.cols[ci].spell, gt.md)
+    let ref = "\"gt$sp\"." + qIn(spCol, gt.md)
+    let val = if gt.md == MD_TSQL { "cast(" + ref + " as nvarchar(max))" } else { ref }
+    return "('{\"GRAPH_OWNER\":\"" + gt.owner + "\",\"GRAPH_NAME\":\"" + gt.g.name + "\",\"ELEM_TABLE\":\"" + el.name + "\",\"KEY_VALUE\":{\"" + name + "\":' || " + val + " || '}}')"
+}
+
+fn edgePropNonNull(gt: &GT, eElIdx: int, pName: &str): bool {
+    let el = &gt.g.elems[eElIdx]
+    let t = &gt.tabs[eElIdx]
+    for l in el.labels {
+        for pr in l.props {
+            if pr.name != pName { continue }
+            if len(pr.col) == 0 { return false }
+            let ci = colIdx(t, &pr.col)
+            if ci < 0 { return false }
+            if t.cols[ci].notNull { return true }
+            for pi in t.pk { if pi == ci { return true } }
+            return false
+        }
+    }
+    return false
+}
+
+// Render tokens [lo, hi) for ANY SHORTEST:
+// mode: 0 = outer COLUMNS/WHERE, 1 = srcSql (a), 2 = dstSql (b), 3 = edgeSql (e).
+fn shortestExprSql(gt: &GT, lo: int, hi: int, mode: int, aName: &str, bName: &str, eName: &str,
+                   sameVar: bool, vElIdx: int, eElIdx: int, vKeyCol: &str,
+                   needA: mut &bool, needB: mut &bool): Result[str, DbErr] {
+    let r = &gt.r
+    var out = ""
+    var i = lo
+    while i < hi {
+        let t = &r.toks[i]
+        let nx = &r.toks[i + 1]
+        let piece = &r.src[t.at..r.toks[i + 1].at]
+        if t.kind == T_OP && t.text == "(" && nx.kind == T_IDENT && (nx.text == "select" || nx.text == "with") {
+            return Err(gerr(gt.ora, 40988, "0A000", "Subquery is not allowed in a GRAPH_TABLE operator."))
+        }
+        // v.p
+        if isName(t) && nx.kind == T_OP && nx.text == "." && !(i > lo && r.toks[i - 1].kind == T_OP && r.toks[i - 1].text == ".") {
+            let v = canonIn(t, gt.md)
+            var d = -1
+            for k in 0..len(gt.decls) { if gt.decls[k].name == v { d = k } }
+            if d >= 0 && i + 2 < hi && isName(&r.toks[i + 2]) {
+                let p = canonIn(&r.toks[i + 2], gt.md)
+                if mode == 1 {
+                    var ign = false
+                    out += "(" + try shortestPropSql(gt, vElIdx, "\"gt$s\"", vKeyCol, "", &p, mut &ign) + ") "
+                } else if mode == 2 {
+                    var ign = false
+                    out += "(" + try shortestPropSql(gt, vElIdx, "\"gt$d\"", vKeyCol, "", &p, mut &ign) + ") "
+                } else if mode == 3 {
+                    var ign = false
+                    out += "(" + try shortestPropSql(gt, eElIdx, "\"gt$e\"", "", "", &p, mut &ign) + ") "
+                } else {
+                    if len(aName) > 0 && v == aName {
+                        out += "(" + try shortestPropSql(gt, vElIdx, "\"gt$a\"", vKeyCol, "src", &p, needA) + ") "
+                    } else if len(bName) > 0 && v == bName {
+                        out += "(" + try shortestPropSql(gt, vElIdx, "\"gt$b\"", vKeyCol, "dst", &p, needB) + ") "
+                    } else if len(eName) > 0 && v == eName {
+                        return Err(gerr(gt.ora, 40990, "42P10", &("invalid reference of group variable " + v + " in the COLUMNS clause of a GRAPH_TABLE operator")))
+                    } else {
+                        return Err(gerr(gt.ora, 40996, "42704", &("Variable " + v + " is not declared in the MATCH clause of a GRAPH_TABLE operator.")))
+                    }
+                }
+                i += 3
+                continue
+            }
+            if d >= 0 { return Err(gerr(gt.ora, 40956, "42601", "invalid property name format")) }
+        }
+        // Function calls: path_length(p), count(e.prop), vertex_id(v)
+        if t.kind == T_IDENT && nx.kind == T_OP && nx.text == "(" {
+            let c = closeOf(r, i + 1, hi)
+            if t.text == "path_length" {
+                if mode != 0 { return Err(e("0A000", "lexdb: PATH_LENGTH() is supported in COLUMNS and outer WHERE only")) }
+                if c - (i + 2) != 1 || !isName(&r.toks[i + 2]) { return Err(gerr(gt.ora, 40956, "42601", "invalid argument to PATH_LENGTH()")) }
+                let pv = canonIn(&r.toks[i + 2], gt.md)
+                if len(gt.pathVar) == 0 || pv != gt.pathVar {
+                    return Err(gerr(gt.ora, 40996, "42704", &("Path variable \"" + pv + "\" is not declared in the MATCH clause of a GRAPH_TABLE operator.")))
+                }
+                out += "\"gt$sp\".\"hops\" "
+                i = c + 1
+                continue
+            }
+            if t.text == "count" && mode == 0 {
+                // count(e.prop) or count(e) on the quantified edge variable -> hops
+                let alo = i + 2
+                var handled = false
+                if c - alo == 3 && isName(&r.toks[alo]) && r.toks[alo + 1].kind == T_OP && r.toks[alo + 1].text == "." && isName(&r.toks[alo + 2]) {
+                    let ev = canonIn(&r.toks[alo], gt.md)
+                    let ep = canonIn(&r.toks[alo + 2], gt.md)
+                    if len(eName) > 0 && ev == eName {
+                        if !edgePropNonNull(gt, eElIdx, &ep) {
+                            return Err(e("0A000", "lexdb: COUNT() over a nullable edge property in ANY SHORTEST is not supported (use PATH_LENGTH(p) or a NOT NULL key property)"))
+                        }
+                        out += "\"gt$sp\".\"hops\" "
+                        handled = true
+                    }
+                } else if c - alo == 1 && isName(&r.toks[alo]) && len(eName) > 0 && canonIn(&r.toks[alo], gt.md) == eName {
+                    out += "\"gt$sp\".\"hops\" "
+                    handled = true
+                }
+                if handled {
+                    i = c + 1
+                    continue
+                }
+            }
+            if t.text == "vertex_id" || (t.text == "json_serialize" && i + 3 < hi && r.toks[i + 2].kind == T_IDENT && r.toks[i + 2].text == "vertex_id") {
+                let innerLo = if t.text == "vertex_id" { i + 2 } else { i + 4 }
+                let innerHi = if t.text == "vertex_id" { c } else { closeOf(r, i + 3, hi) }
+                if innerHi - innerLo != 1 || !isName(&r.toks[innerLo]) { return Err(gerr(gt.ora, 40956, "42601", "invalid property name format")) }
+                let v = canonIn(&r.toks[innerLo], gt.md)
+                if mode == 0 && len(aName) > 0 && v == aName {
+                    out += shortestVertexIdSql(gt, vElIdx, vKeyCol, "src") + " "
+                    i = c + 1
+                    continue
+                }
+                if mode == 0 && len(bName) > 0 && v == bName {
+                    out += shortestVertexIdSql(gt, vElIdx, vKeyCol, "dst") + " "
+                    i = c + 1
+                    continue
+                }
+            }
+            if t.text == "element_number" { return Err(gerr(gt.ora, 49033, "42P10", "ELEMENT_NUMBER can only be used in combination with ONE ROW PER VERTEX or STEP.")) }
+            if t.text == "matchnum" { return Err(e("0A000", "lexdb: MATCHNUM() is supported as a COLUMNS item by itself")) }
+            if isAggNameIn(&t.text, gt.md) {
+                return Err(e("0A000", "lexdb: only PATH_LENGTH(p) and COUNT(e.key) aggregates are supported in ANY SHORTEST"))
+            }
+        }
+        // v IS [NOT] LABELED l
+        if isName(t) && !(nx.kind == T_OP && (nx.text == "(" || nx.text == ".")) && !(i > lo && r.toks[i - 1].kind == T_OP && r.toks[i - 1].text == ".") {
+            let v = canonIn(t, gt.md)
+            var d = -1
+            for k in 0..len(gt.decls) { if gt.decls[k].name == v { d = k } }
+            if d >= 0 && nx.kind == T_IDENT && nx.text == "is" {
+                var k = i + 2
+                var neg = false
+                if k < hi && r.toks[k].kind == T_IDENT && r.toks[k].text == "not" { neg = true; k += 1 }
+                if k + 1 < hi && r.toks[k].kind == T_IDENT && r.toks[k].text == "labeled" && isName(&r.toks[k + 1]) {
+                    let l = canonIn(&r.toks[k + 1], gt.md)
+                    var known = false
+                    for g2 in gt.g.elems { for x2 in g2.labels { if x2.name == l { known = true } } }
+                    if !known { return Err(gerr(gt.ora, 40954, "42704", "unknown label")) }
+                    let elIdx = if gt.decls[d].vertex { vElIdx } else { eElIdx }
+                    var has = false
+                    for x2 in gt.g.elems[elIdx].labels { if x2.name == l { has = true } }
+                    out += if has != neg { "1 = 1 " } else { "1 = 0 " }
+                    i = k + 2
+                    continue
+                }
+            }
+            if d >= 0 { return Err(gerr(gt.ora, 40956, "42601", "invalid property name format")) }
+        }
+        out += piece
+        i += 1
+    }
+    return Ok(out)
+}
+
+fn expandShortest(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, gt: &GT, md: int, nls: []str): Result[Stmt, DbErr] {
+    try checkRefs(gt)
+    if len(gt.paths) != 1 || len(gt.paths[0]) != 3 {
+        return Err(e("0A000", "lexdb: ANY SHORTEST requires a single path pattern of the form (a)-[e]->{...}(b)"))
+    }
+    let p0 = &gt.paths[0][0]
+    let p1 = &gt.paths[0][1]
+    let p2 = &gt.paths[0][2]
+    if p0.group || !p0.ep.vertex || p2.group || !p2.ep.vertex {
+        return Err(e("0A000", "lexdb: ANY SHORTEST requires vertex patterns at both endpoints"))
+    }
+    var minHops = 1
+    var maxHops = 1
+    var eEp = noEP()
+    if p1.group {
+        if len(p1.sub) != 1 || p1.sub[0].group || p1.sub[0].ep.vertex {
+            return Err(e("0A000", "lexdb: ANY SHORTEST currently supports a single quantified edge pattern"))
+        }
+        eEp = p1.sub[0].ep.clone()
+        minHops = p1.lo
+        maxHops = p1.hi
+    } else {
+        if p1.ep.vertex {
+            return Err(e("0A000", "lexdb: ANY SHORTEST requires an edge pattern between endpoints"))
+        }
+        eEp = p1.ep.clone()
+    }
+
+    let aName = p0.ep.vname.clone()
+    let bName = p2.ep.vname.clone()
+    let eName = eEp.vname.clone()
+    let sameVar = len(aName) > 0 && aName == bName
+
+    var aLabs: [][][]str = []
+    if len(p0.ep.lab) > 0 { append(mut &aLabs, p0.ep.lab.clone()) }
+    var bLabs: [][][]str = []
+    if len(p2.ep.lab) > 0 { append(mut &bLabs, p2.ep.lab.clone()) }
+    if sameVar {
+        for l in bLabs { append(mut &aLabs, l.clone()) }
+        bLabs = aLabs.clone()
+    }
+    var eLabs: [][][]str = []
+    if len(eEp.lab) > 0 { append(mut &eLabs, eEp.lab.clone()) }
+
+    let aCands = candidates(gt, true, &aLabs)
+    let bCands = candidates(gt, true, &bLabs)
+    let eCands = candidates(gt, false, &eLabs)
+
+    // Find compatible (vEl, eEl) where eEl connects vEl -> vEl
+    var matchV = -1
+    var matchE = -1
+    var matchCount = 0
+    for ei in eCands {
+        let el = &gt.g.elems[ei]
+        let sx = elemIndex(gt, &el.src.elem)
+        let dx = elemIndex(gt, &el.dst.elem)
+        if sx < 0 || dx < 0 { continue }
+        if sx == dx && hasInt(&aCands, sx) && hasInt(&bCands, dx) {
+            matchV = sx
+            matchE = ei
+            matchCount += 1
+        }
+    }
+    if matchCount == 0 {
+        // No compatible elements: return empty result with properly typed columns
+        var items: []str = []
+        for c in gt.cols {
+            if c.matchnum {
+                append(mut &items, "cast(null as bigint) " + qIn(&c.name, md))
+            } else if len(c.vname) > 0 {
+                append(mut &items, nullOf(gt, &c.prop) + " " + qIn(&c.name, md))
+            } else {
+                append(mut &items, "cast(null as bigint) " + qIn(&c.name, md))
+            }
+        }
+        let emptySql = "select " + strings.join(&items, ", ") + " where 1 = 0"
+        var ss = try parseSql(&emptySql, md, nls)
+        var out = pop(mut &ss)
+        out.use = lexdb_sql.SUB_FROM
+        out.mdialect = md
+        return Ok(out)
+    }
+    if matchCount > 1 {
+        return Err(e("0A000", "lexdb: ANY SHORTEST currently supports a single edge element table (specify an edge label with IS)"))
+    }
+
+    let vEl = &gt.g.elems[matchV]
+    let eEl = &gt.g.elems[matchE]
+    let vt = &gt.tabs[matchV]
+    let et = &gt.tabs[matchE]
+    if len(vEl.keys) != 1 || len(eEl.src.cols) != 1 || len(eEl.dst.cols) != 1 ||
+       len(eEl.src.refs) != 1 || len(eEl.dst.refs) != 1 ||
+       eEl.src.refs[0] != vEl.keys[0] || eEl.dst.refs[0] != vEl.keys[0] {
+        return Err(e("0A000", "lexdb: ANY SHORTEST requires single-column vertex and edge endpoint keys"))
+    }
+    let vKeyCol = vEl.keys[0].clone()
+    let eSrcCol = eEl.src.cols[0].clone()
+    let eDstCol = eEl.dst.cols[0].clone()
+    let vKeyIdx = colIdx(vt, &vKeyCol)
+    let eSrcIdx = colIdx(et, &eSrcCol)
+    let eDstIdx = colIdx(et, &eDstCol)
+    if vKeyIdx < 0 || eSrcIdx < 0 || eDstIdx < 0 ||
+       !isIntOid(vt.cols[vKeyIdx].typ.oid) || !isIntOid(et.cols[eSrcIdx].typ.oid) || !isIntOid(et.cols[eDstIdx].typ.oid) {
+        return Err(e("0A000", "lexdb: ANY SHORTEST requires integer vertex and edge key columns"))
+    }
+    let vKeyOid = vt.cols[vKeyIdx].typ.oid
+    let csrDir = if eEp.dir == DIR_R { 0 } else if eEp.dir == DIR_L { 1 } else { 2 }
+
+    // Partition element WHEREs and outer MATCH WHERE conjuncts
+    var aSpans: [][]int = []
+    var bSpans: [][]int = []
+    var eSpans: [][]int = []
+    var postSpans: [][]int = []
+    if p0.ep.wlo >= 0 {
+        append(mut &aSpans, [p0.ep.wlo, p0.ep.whi])
+        if sameVar { append(mut &bSpans, [p0.ep.wlo, p0.ep.whi]) }
+    }
+    if p2.ep.wlo >= 0 {
+        append(mut &bSpans, [p2.ep.wlo, p2.ep.whi])
+        if sameVar { append(mut &aSpans, [p2.ep.wlo, p2.ep.whi]) }
+    }
+    if eEp.wlo >= 0 { append(mut &eSpans, [eEp.wlo, eEp.whi]) }
+    if gt.wlo >= 0 {
+        for sp in splitAnds(&gt.r, gt.wlo, gt.whi) {
+            let m = shortestTokVars(gt, sp[0], sp[1], &aName, &bName, &eName)
+            if sameVar {
+                if (m & 12) == 0 && (m & 3) != 0 {
+                    append(mut &aSpans, sp.clone())
+                    append(mut &bSpans, sp)
+                } else if m == 4 {
+                    append(mut &eSpans, sp)
+                } else {
+                    append(mut &postSpans, sp)
+                }
+            } else {
+                if m == 1 { append(mut &aSpans, sp) }
+                else if m == 2 { append(mut &bSpans, sp) }
+                else if m == 4 { append(mut &eSpans, sp) }
+                else { append(mut &postSpans, sp) }
+            }
+        }
+    }
+
+    var ignA = false
+    var ignB = false
+    var aConds: []str = []
+    for sp in aSpans {
+        append(mut &aConds, "(" + try shortestExprSql(gt, sp[0], sp[1], 1, &aName, &bName, &eName, sameVar, matchV, matchE, &vKeyCol, mut &ignA, mut &ignB) + ")")
+    }
+    var bConds: []str = []
+    for sp in bSpans {
+        append(mut &bConds, "(" + try shortestExprSql(gt, sp[0], sp[1], 2, &aName, &bName, &eName, sameVar, matchV, matchE, &vKeyCol, mut &ignA, mut &ignB) + ")")
+    }
+    var eConds: []str = []
+    for sp in eSpans {
+        append(mut &eConds, "(" + try shortestExprSql(gt, sp[0], sp[1], 3, &aName, &bName, &eName, sameVar, matchV, matchE, &vKeyCol, mut &ignA, mut &ignB) + ")")
+    }
+
+    let srcSql = "select \"gt$s\"." + qIn(&vKeyCol, md) + " from " + relTextIn(&vEl.table, md) + " \"gt$s\"" +
+                 (if len(aConds) > 0 { " where " + strings.join(&aConds, " and ") } else { "" })
+    let dstSql = if len(bConds) > 0 {
+        "select \"gt$d\"." + qIn(&vKeyCol, md) + " from " + relTextIn(&vEl.table, md) + " \"gt$d\" where " + strings.join(&bConds, " and ")
+    } else { "" }
+    let edgeSql = if len(eConds) > 0 {
+        "select \"gt$e\"." + qIn(&eSrcCol, md) + ", \"gt$e\"." + qIn(&eDstCol, md) + " from " + relTextIn(&eEl.table, md) + " \"gt$e\" where " + strings.join(&eConds, " and ")
+    } else { "" }
+
+    // Render outer post-conditions and COLUMNS, tracking whether vertex table joins are needed
+    var needA = false
+    var needB = false
+    var postConds: []str = []
+    if sameVar { append(mut &postConds, "\"gt$sp\".\"src\" = \"gt$sp\".\"dst\"") }
+    for sp in postSpans {
+        append(mut &postConds, "(" + try shortestExprSql(gt, sp[0], sp[1], 0, &aName, &bName, &eName, sameVar, matchV, matchE, &vKeyCol, mut &needA, mut &needB) + ")")
+    }
+    var items: []str = []
+    var hasMn = false
+    let rn = if md == MD_ORA { "row_number() over (order by null) " } else { "row_number() over () " }
+    for c in gt.cols {
+        if c.matchnum {
+            hasMn = true
+            append(mut &items, rn + qIn(&c.name, md))
+            continue
+        }
+        let ex = if len(c.vname) > 0 {
+            if len(aName) > 0 && c.vname == aName {
+                "(" + try shortestPropSql(gt, matchV, "\"gt$a\"", &vKeyCol, "src", &c.prop, mut &needA) + ")"
+            } else if len(bName) > 0 && c.vname == bName {
+                "(" + try shortestPropSql(gt, matchV, "\"gt$b\"", &vKeyCol, "dst", &c.prop, mut &needB) + ")"
+            } else {
+                return Err(gerr(gt.ora, 40990, "42P10", &("invalid reference of variable " + c.vname + " in the COLUMNS clause of a GRAPH_TABLE operator")))
+            }
+        } else {
+            try shortestExprSql(gt, c.lo, c.hi, 0, &aName, &bName, &eName, sameVar, matchV, matchE, &vKeyCol, mut &needA, mut &needB)
+        }
+        append(mut &items, ex + " " + qIn(&c.name, md))
+    }
+    if len(items) == 0 { append(mut &items, "null \"gt$none\"") }
+
+    var from: []str = ["\"gt$sp_placeholder\" \"gt$sp\""]
+    var conds: []str = []
+    if needA {
+        append(mut &from, relTextIn(&vEl.table, md) + " \"gt$a\"")
+        append(mut &conds, "\"gt$a\"." + qIn(&vKeyCol, md) + " = \"gt$sp\".\"src\"")
+    }
+    if needB {
+        append(mut &from, relTextIn(&vEl.table, md) + " \"gt$b\"")
+        append(mut &conds, "\"gt$b\"." + qIn(&vKeyCol, md) + " = \"gt$sp\".\"dst\"")
+    }
+    for pc in postConds { append(mut &conds, pc) }
+
+    var outerSql = "select " + strings.join(&items, ", ") + " from " + strings.join(&from, ", ")
+    if len(conds) > 0 { outerSql += " where " + strings.join(&conds, " and ") }
+    var ss = try parseSql(&outerSql, md, nls)
+    if len(ss) != 1 { return Err(lexdb_base.corrupt("GRAPH_TABLE ANY SHORTEST query")) }
+    var out = pop(mut &ss)
+
+    // Encode #pgq_shortest: SRF spec and attach as subquery replacing gt$sp_placeholder
+    var specBuf = ""
+    let specParts: []str = [
+        eEl.table.clone(),
+        eSrcIdx.toStr(),
+        eDstIdx.toStr(),
+        vKeyOid.toStr(),
+        csrDir.toStr(),
+        minHops.toStr(),
+        maxHops.toStr(),
+        md.toStr(),
+        srcSql,
+        dstSql,
+        edgeSql
+    ]
+    lexdb_catalog.addStrs(mut &specBuf, &specParts)
+    var sp = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
+    sp.use = lexdb_sql.SUB_FROM
+    sp.srf = PGQ_SHORTEST_PRE + specBuf
+    sp.mdialect = md
+    let spIdx = len(out.subs)
+    append(mut &out.subs, sp)
+    for fi in 0..len(out.from) {
+        if out.from[fi].table == "gt$sp_placeholder" {
+            out.from[fi].table = ""
+            out.from[fi].sub = spIdx
+        }
+    }
+    // Preserve max $n parameter count across srcSql / dstSql / edgeSql / outer
+    for tk in gt.r.toks {
+        if tk.kind == T_PARAM && len(tk.text) > 1 {
+            let pn = lexdb_base.num(&tk.text[1..len(tk.text)])
+            if pn > out.params { out.params = pn }
+        }
+    }
+    out.use = lexdb_sql.SUB_FROM
+    out.mdialect = md
+    let _ = hasMn
+    return Ok(out)
 }

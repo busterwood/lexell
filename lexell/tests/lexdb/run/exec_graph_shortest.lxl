@@ -1,0 +1,221 @@
+// SQL:2023 GRAPH_TABLE ANY SHORTEST [PATH]: Strategy A (cold bidirectional index-only BFS),
+// Strategy B (cached dense & sparse 64-bit CSR BFS), directed/reverse/undirected, bounded &
+// unbounded quantifiers (+, *, ?, {m,n}, {m,}, {,n}), minHops > 1 with shortcut edge, 0-hop
+// isolated vertices, cycles, edge WHERE filter, vertex join-back, VERTEX_ID, COUNT(k.key),
+// parameters ($1/$2), MVCC uncommitted visibility + rollback + committed cache invalidation,
+// EXPLAIN, and preserved non-ANY-SHORTEST unbounded quantifier rejection.
+// expect: p2p_cold: 1|5|4
+// expect: sssp: 2|p2|1;3|p3|2;4|p4|3;5|p5|4;6|p6|2
+// expect: p2p_warm: 1|5|4
+// expect: p2p_count: 1|5|4
+// expect: unreachable: 
+// expect: rev_flip: 1|5|4;2|5|3;3|5|2;4|5|1;6|5|2
+// expect: m2m: 1|5|4;1|6|2;2|5|3;2|6|1
+// expect: bounded_12: 2|1;3|2;6|2
+// expect: min2_skip1: 1|2|3
+// expect: zero_hop_iso: 7|7|0
+// expect: zero_hop_star: 1|1|0;1|2|1;1|3|2;1|4|3;1|5|4;1|6|2
+// expect: rev_dir: 5|1|4
+// expect: undir: 5|1|2
+// expect: cycle: 1|1|3
+// expect: edge_where: 1|4|3
+// expect: params: 1|5|4
+// expect: vid: {"GRAPH_OWNER":"public","GRAPH_NAME":"sg","ELEM_TABLE":"person","KEY_VALUE":{"id":5}}|4
+// expect: mvcc_uncomm: 1|5|1
+// expect: mvcc_rollback: 1|5|4
+// expect: mvcc_commit: 1|5|1
+// expect: mvcc_delete: 1|5|4
+// expect: sparse64: 1000000000001|9000000000004|3
+// expect: non_shortest_err: 0A000
+// expect: explain_ok: true
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_parse"
+import "../../../cmd/lexdb_sql"
+
+type Val = lexdb_sql.Val
+
+fn q(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return e.state }
+    }
+}
+
+fn qParams(s: mut &lexdb_exec.Session, sql: str, ps: &[]Val): str {
+    let stmts = match lexdb_parse.parse(&sql) {
+        Ok(xs) { xs }
+        Err(e) { return "PARSE " + e.state }
+    }
+    match s.run(&stmts[0], ps, &[]) {
+        Ok(r) {
+            var rows: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                append(mut &rows, strings.join(&cells, "|"))
+            }
+            return strings.join(&rows, ";")
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(83), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 1024 * 1024, snapNodes: 10000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+        // Graph layout:
+        //   1 -> 2 -> 3 -> 4 -> 5  (length 4; 3 -> 1 cycle of length 3)
+        //   2 -> 6 -> 4            (length 4 also: 1->2->6->4->5)
+        //   5 -> 2                 (reverse shortcut for undirected: 1->2<-5 => length 2? wait: 5->2, 1->2 => 5-2-1 is 2! Let's make 5->3 so undir 5-3-2-1 is 3!)
+        //   7                      (isolated vertex)
+        //   8 -> 9                 (disconnected component)
+        // Also edge (1->3, since=2022), (3->4, since=2022), (4->5, since=2022) -- wait keep 1->2->3->4->5 clean and put an older/newer path!
+        // Let's use clean edges:
+        //   1->2 (2020), 2->3 (2020), 3->4 (2020), 4->5 (2020)   [4 hops 1->5]
+        //   2->6 (2022), 6->4 (2022)                              [4 hops 1->5; 2 hops 1->6]
+        //   3->1 (2020)                                           [cycle 1->2->3->1 length 3; also 1->2 length 1, 1->2 via 1->2->3->1->2 length 4? Wait for min2_skip1: 1->6->2? Let's test 1->2 via 1->3? No, keep 1->5 = 4!]
+        //   5->3 (2020)                                           [undirected 5-3-2-1 = 3 hops!]
+        //   1->6 (2023)?? No, that would make 1->6->4->5 = 3 hops!
+        // Instead, for edge_where (since >= 2022), let's make edges with since=2022:
+        //   (1->2, 2022), (2->6, 2022), (6->5, 2021) ... wait if 6->5 is 2021 then without filter 1->5 is 3!
+        // Better: put edge_where test with since >= 2022 where 1->2(2022), 2->6(2022), 6->4(2022), 4->5(2022) = 4 hops,
+        // and add a separate 2020 edge 1->3(2020)?? No, keep 1->2->3->4->5 = 4 hops (2020), and for edge_where test:
+        // filter since >= 2022 where 1->2(2022), 2->6(2022), 6->5 is NOT there, instead 1->2(2022), 2->3(2022), 3->5(2020)...
+        // Simplest & crystal clear:
+        //   Base edges (all since=2020 unless noted):
+        //     1->2 (2022), 2->3 (2022), 3->4 (2020), 4->5 (2022)
+        //     2->6 (2022), 6->4 (2022)
+        //     3->1 (2020)   [1->2->3->1 = 3-hop cycle]
+        //     5->3 (2020)   [undir 5-3-2-1 = 3 hops]
+        //     6->2 (2020)   [min2_skip1: 1->2 is 1 hop, 1->2->6->2 is 3 hops!]
+        //     8->9 (2020)   [disconnected]
+        //   Let's check distances!
+        //     1->5 directed: 1->2->3->4->5 (4) or 1->2->6->4->5 (4) => 4 hops!
+        //     1->5 with since >= 2022: 1->2->6->4->5 (4) ... wait let's add 1->6(2020) NO, add 6->5(2022) NO.
+        //     Wait: if 2->3 is 2020, 3->4 is 2020, 1->2(2022), 2->6(2022), 6->4(2022), 4->5(2022) -> 4 hops!
+        //     And to test edge_where changing the answer: what if 2->4 is (2020)? Then unfiltered 1->5 would be 3!
+        //     Let's just test edge_where with 1->4 (unfiltered 1->2->3->4 = 3, with since >= 2022: 1->2(2022)->6(2022)->4(2022) = 3; or 1->5 with since >= 2022 vs since <= 2020):
+        //     Wait: if 2->6 (2022), 6->5 (2020): then 1->2->6->5 = 3 hops unfiltered? No, let's check our expected outputs:
+        //       p2p_cold: 1|5|4
+        //       edge_where: 1|5|3  -> oh, only if filtered is LONGER than unfiltered (filtering can only remove edges, never shorten paths!).
+        //       Haha, great catch! Filtering removes edges so filtered distance >= unfiltered distance!
+        //       So let's have 1->6(2020) NOT present; instead test edge_where on 1->4 where 1->2->3->4 is 3 hops (2020), or test 1->5 with since >= 2022 removing 3->4 so 1->2->6->4->5 is still 4, OR add 3->5(2020)??
+        //       Even cleaner: test edge_where with `WHERE k.since >= 2022` on 1->5 where 1->2(2022)->6(2022)->4(2022)->5(2022) = 4, AND `WHERE k.since = 2020` gives unreachable (or 1->5 = 4)!
+        //       Let's make edge_where test `1 -> 3` with `since >= 2022` vs unfiltered!
+        //       Wait: with 1->2(2022), 2->3(2020), 2->6(2022), 6->4(2022), 4->3(2022):
+        //         Unfiltered 1->3: 1->2->3 = 2 hops!
+        //         Filtered (since >= 2022) 1->3: 1->2->6->4->3 = 4 hops! (And 1->5 is STILL 4 hops!)
+        let ddl = [
+            "CREATE TABLE person (id INT PRIMARY KEY, name TEXT, city TEXT)",
+            "CREATE INDEX person_city ON person (city)",
+            "INSERT INTO person VALUES (1,'p1','A'),(2,'p2','A'),(3,'p3','B'),(4,'p4','B'),(5,'p5','C'),(6,'p6','C'),(7,'p7','D'),(8,'p8','E'),(9,'p9','E')",
+            "CREATE TABLE knows (src INT NOT NULL, dst INT NOT NULL, since INT NOT NULL, PRIMARY KEY (src, dst))",
+            "CREATE INDEX knows_dst_src ON knows (dst, src)",
+            "INSERT INTO knows VALUES (1,2,2022),(2,3,2020),(3,4,2020),(4,5,2022),(2,6,2022),(6,4,2022),(4,3,2022),(3,1,2020),(5,3,2020),(6,2,2020),(8,9,2020)",
+            "CREATE PROPERTY GRAPH sg VERTEX TABLES (person) EDGE TABLES (knows SOURCE KEY (src) REFERENCES person(id) DESTINATION KEY (dst) REFERENCES person(id))"
+        ]
+        for x in ddl {
+            let r = q(mut &s, x.clone())
+            if r != "CREATE TABLE" && r != "CREATE INDEX" && r != "CREATE PROPERTY GRAPH" && !strings.startsWith(&r, "INSERT") {
+                println("DDL ERR: " + r + " on " + x)
+            }
+        }
+
+        // 1. Point-to-point cold (Strategy A: bidirectional index-only BFS)
+        println("p2p_cold: " + q(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.id = 1)-[k IS knows]->+(b IS person WHERE b.id = 5) COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops))"))
+
+        // 2. SSSP (triggers CSR build & cache) + vertex property join-back (b.name)
+        println("sssp: " + q(mut &s, "SELECT dst, nm, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.id = 1)-[k IS knows]->+(b IS person) WHERE b.id <> 1 COLUMNS (b.id AS dst, b.name AS nm, path_length(p) AS hops)) ORDER BY dst"))
+
+        // 3. Point-to-point warm (Strategy B: hits cached CSR)
+        println("p2p_warm: " + q(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person)-[k IS knows]->+(b IS person) WHERE a.id = 1 AND b.id = 5 COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops))"))
+
+        // 4. count(k.src) as hop count
+        println("p2p_count: " + q(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH ANY SHORTEST (a IS person WHERE a.id = 1)-[k IS knows]->+(b IS person WHERE b.id = 5) COLUMNS (a.id AS src, b.id AS dst, count(k.src) AS hops))"))
+
+        // 5. Unreachable pair
+        println("unreachable: " + q(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.id = 1)-[k IS knows]->+(b IS person WHERE b.id = 9) COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops))"))
+
+        // 6. Many sources -> 1 target (triggers direction flip)
+        println("rev_flip: " + q(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person)-[k IS knows]->+(b IS person WHERE b.id = 5) WHERE a.id <> 5 COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops)) ORDER BY src"))
+
+        // 7. Multi-source -> multi-target
+        println("m2m: " + q(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.city = 'A')-[k IS knows]->+(b IS person WHERE b.city = 'C') COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops)) ORDER BY src, dst"))
+
+        // 8. Bounded {1,2}
+        println("bounded_12: " + q(mut &s, "SELECT dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.id = 1)-[k IS knows]->{1,2}(b IS person) COLUMNS (b.id AS dst, path_length(p) AS hops)) ORDER BY dst"))
+
+        // 9. minHops = 2 with direct 1-hop edge (1->2 exists at 1 hop, shortest >=2 hop path is 1->2->6->2 = 3 hops!)
+        println("min2_skip1: " + q(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.id = 1)-[k IS knows]->{2,5}(b IS person WHERE b.id = 2) COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops))"))
+
+        // 10. 0-hop isolated vertex (*)
+        println("zero_hop_iso: " + q(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.id = 7)-[k IS knows]->*(b IS person WHERE b.id = 7) COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops))"))
+
+        // 11. 0-hop reachable (*)
+        println("zero_hop_star: " + q(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.id = 1)-[k IS knows]->*(b IS person) COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops)) ORDER BY dst"))
+
+        // 12. Reverse arrow <-+
+        println("rev_dir: " + q(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.id = 5)<-[k IS knows]-+(b IS person WHERE b.id = 1) COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops))"))
+
+        // 13. Undirected -+ (5-3-2-1 = 3 hops)
+        println("undir: " + q(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.id = 5)-[k IS knows]-+(b IS person WHERE b.id = 1) COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops))"))
+
+        // 14. Cycle (same variable a at both ends: 1->2->3->1 = 3 hops)
+        println("cycle: " + q(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.id = 1)-[k IS knows]->+(a) COLUMNS (a.id AS src, a.id AS dst, path_length(p) AS hops))"))
+
+        // 15. Edge WHERE filter (1->3 unfiltered = 2 hops; with since >= 2022: 1->2->6->4->3 = 4 hops, wait let's check 1->3: 1->2->6->4->3 is 4! Let's check 1->4 with since>=2022 = 3!)
+        println("edge_where: " + q(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.id = 1)-[k IS knows WHERE k.since >= 2022]->+(b IS person WHERE b.id = 4) COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops))"))
+
+        // 16. Parameters ($1, $2)
+        println("params: " + qParams(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.id = $1)-[k IS knows]->+(b IS person WHERE b.id = $2) COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops))", &[Val.Int(1), Val.Int(5)]))
+
+        // 17. VERTEX_ID(b)
+        println("vid: " + q(mut &s, "SELECT vid, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.id = 1)-[k IS knows]->+(b IS person WHERE b.id = 5) COLUMNS (VERTEX_ID(b) AS vid, path_length(p) AS hops))"))
+
+        // 18. MVCC: uncommitted INSERT visible inside txn, invisible after ROLLBACK
+        let _b1 = q(mut &s, "BEGIN")
+        let _i1 = q(mut &s, "INSERT INTO knows VALUES (1, 5, 2025)")
+        println("mvcc_uncomm: " + q(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.id = 1)-[k IS knows]->+(b IS person WHERE b.id = 5) COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops))"))
+        let _r1 = q(mut &s, "ROLLBACK")
+        println("mvcc_rollback: " + q(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.id = 1)-[k IS knows]->+(b IS person WHERE b.id = 5) COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops))"))
+
+        // 19. Committed INSERT invalidates cached CSR immediately; DELETE invalidates again
+        let _i2 = q(mut &s, "INSERT INTO knows VALUES (1, 5, 2025)")
+        println("mvcc_commit: " + q(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.id = 1)-[k IS knows]->+(b IS person WHERE b.id = 5) COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops))"))
+        let _d2 = q(mut &s, "DELETE FROM knows WHERE src = 1 AND dst = 5")
+        println("mvcc_delete: " + q(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.id = 1)-[k IS knows]->+(b IS person WHERE b.id = 5) COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops))"))
+
+        // 20. Sparse 64-bit vertex IDs (LDBC-style)
+        let _sp1 = q(mut &s, "CREATE TABLE sp_v (id BIGINT PRIMARY KEY)")
+        let _sp2 = q(mut &s, "CREATE TABLE sp_e (src BIGINT NOT NULL, dst BIGINT NOT NULL, PRIMARY KEY (src, dst))")
+        let _sp3 = q(mut &s, "INSERT INTO sp_v VALUES (1000000000001),(5000000000002),(7000000000003),(9000000000004)")
+        let _sp4 = q(mut &s, "INSERT INTO sp_e VALUES (1000000000001,5000000000002),(5000000000002,7000000000003),(7000000000003,9000000000004)")
+        let _sp5 = q(mut &s, "CREATE PROPERTY GRAPH spg VERTEX TABLES (sp_v) EDGE TABLES (sp_e SOURCE KEY (src) REFERENCES sp_v(id) DESTINATION KEY (dst) REFERENCES sp_v(id))")
+        println("sparse64: " + q(mut &s, "SELECT src, dst, hops FROM GRAPH_TABLE (spg MATCH p = ANY SHORTEST (a IS sp_v WHERE a.id = 1000000000001)-[k IS sp_e]->+(b IS sp_v WHERE b.id = 9000000000004) COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops))"))
+
+        // 21. Non-ANY-SHORTEST unbounded quantifier still rejected with 0A000
+        println("non_shortest_err: " + q(mut &s, "SELECT * FROM GRAPH_TABLE (sg MATCH (a IS person)-[k IS knows]->+(b IS person) COLUMNS (a.id AS x))"))
+
+        // 22. EXPLAIN works
+        let ex = q(mut &s, "EXPLAIN SELECT src, dst, hops FROM GRAPH_TABLE (sg MATCH p = ANY SHORTEST (a IS person WHERE a.id = 1)-[k IS knows]->+(b IS person WHERE b.id = 5) COLUMNS (a.id AS src, b.id AS dst, path_length(p) AS hops))")
+        println("explain_ok: " + (!strings.startsWith(&ex, "42") && !strings.startsWith(&ex, "XX") && len(ex) > 0).toStr())
+        return 0
+    })
+}

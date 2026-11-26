@@ -1,0 +1,894 @@
+// lexdb_csr: Compressed Sparse Row (CSR) adjacency cache and shortest-path BFS engine
+// for SQL/PGQ ANY SHORTEST queries.
+//
+// Two execution strategies:
+// 1. Strategy A (Cold point-to-point): Bidirectional index-only BFS using covering
+//    forward (src, dst) and reverse (dst, src) B+tree indexes directly from leaf keys
+//    without scanning the full edge table. Falls back to Strategy B if probes exceed
+//    the work cap or covering indexes are absent.
+// 2. Strategy B (CSR BFS): Builds a compact dense (or sparse 64-bit) CSR via columnar
+//    table scan decoding only (srcCol, dstCol), cached in a bounded LRU keyed by
+//    (storeId, tree, srcCol, dstCol, treeStamp) for MVCC-safe, zero-stale-read reuse.
+//    Supports directed forward/reverse and undirected traversals, bounded and unbounded
+//    hop ranges [minHops, maxHops], 1-to-1 bidirectional CSR BFS, 1-to-many / many-to-many
+//    generation-stamped level-synchronous BFS, and automatic target-side direction flip.
+import "strings"
+import "task"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_rows"
+import "./lexdb_store"
+import "./lexdb_access"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+type Rel = lexdb_access.Rel
+
+pub const DIR_FWD = 0
+pub const DIR_REV = 1
+pub const DIR_UNDIR = 2
+
+const MAX_CACHE_ENTRIES = 4
+const MAX_CACHE_BYTES = 128 * 1024 * 1024
+const MAX_DENSE_SPAN = 16000000
+const MAX_IDX_PROBES = 4096
+
+type Adj = record {
+    off: []int
+    dst: []int
+}
+
+type IdMap = record {
+    dense: bool
+    minId: int
+    nV: int
+    toIdx: Map[int, int]
+    toId: []int
+}
+
+type Csr = record {
+    storeId: int
+    tree: int
+    srcCol: int
+    dstCol: int
+    stamp: int
+    ids: rc IdMap
+    fwd: rc Adj
+    bwd: Option[rc Adj]
+    bytes: int
+}
+
+type CsrCache = record {
+    entries: []Csr
+    usedBytes: int
+}
+
+var CSR_CACHE: once task.Shared[CsrCache]
+
+fn csrCache(): task.Shared[CsrCache] {
+    if !CSR_CACHE.isSet() {
+        CSR_CACHE.set(task.shared(CsrCache{entries: [], usedBytes: 0}))
+    }
+    return CSR_CACHE.get().share()
+}
+
+fn cacheLookup(storeId: int, tree: int, srcCol: int, dstCol: int, stamp: int): Option[Csr] {
+    if stamp < 0 { return None }
+    var hit: Option[Csr] = None
+    csrCache().with(fn(c: mut &CsrCache) {
+        var idx = -1
+        for i in 0..len(c.entries) {
+            let e = &c.entries[i]
+            if e.storeId == storeId && e.tree == tree && e.srcCol == srcCol && e.dstCol == dstCol {
+                if e.stamp == stamp {
+                    idx = i
+                } else {
+                    // Stale entry for this tree/columns: evict immediately
+                    c.usedBytes -= e.bytes
+                    var next: []Csr = []
+                    for j in 0..len(c.entries) { if j != i { append(mut &next, c.entries[j].clone()) } }
+                    c.entries = next
+                }
+                break
+            }
+        }
+        if idx >= 0 {
+            let got = c.entries[idx].clone()
+            // Move to MRU (end of slice)
+            if idx + 1 < len(c.entries) {
+                var next: []Csr = []
+                for j in 0..len(c.entries) { if j != idx { append(mut &next, c.entries[j].clone()) } }
+                append(mut &next, got.clone())
+                c.entries = next
+            }
+            hit = Some(got)
+        }
+    })
+    return hit
+}
+
+fn cachePut(entry: Csr) {
+    if entry.stamp < 0 || entry.bytes > MAX_CACHE_BYTES { return }
+    csrCache().with(fn(c: mut &CsrCache) {
+        // Remove any existing entry for the same (storeId, tree, srcCol, dstCol)
+        var kept: []Csr = []
+        var used = 0
+        for e in c.entries {
+            if e.storeId == entry.storeId && e.tree == entry.tree && e.srcCol == entry.srcCol && e.dstCol == entry.dstCol {
+                continue
+            }
+            used += e.bytes
+            append(mut &kept, e.clone())
+        }
+        // Evict LRU from front until within both entry count and byte budget
+        var start = 0
+        while start < len(kept) && (len(kept) - start >= MAX_CACHE_ENTRIES || used + entry.bytes > MAX_CACHE_BYTES) {
+            used -= kept[start].bytes
+            start += 1
+        }
+        var fin: []Csr = []
+        for i in start..len(kept) { append(mut &fin, kept[i].clone()) }
+        append(mut &fin, entry.clone())
+        c.entries = fin
+        c.usedBytes = used + entry.bytes
+    })
+}
+
+fn (m: &IdMap) lookup(id: int): int {
+    if m.nV == 0 { return -1 }
+    if m.dense {
+        let idx = id - m.minId
+        if idx < 0 || idx >= m.nV { return -1 }
+        return idx
+    }
+    return m.toIdx.get(&id).unwrapOr(-1)
+}
+
+fn (m: &IdMap) idOf(idx: int): int {
+    if m.dense { return m.minId + idx }
+    return m.toId[idx]
+}
+
+// Build reverse CSR (dst -> src) from forward CSR in O(V + E).
+fn buildReverse(nV: int, fwd: &Adj): Adj {
+    let m = len(fwd.dst)
+    var off: []int = array(nV + 1, 0)
+    for i in 0..m {
+        off[fwd.dst[i] + 1] += 1
+    }
+    for i in 0..nV {
+        off[i + 1] += off[i]
+    }
+    var cur = off.clone()
+    var src: []int = array(m, 0)
+    for u in 0..nV {
+        let a = fwd.off[u]
+        let b = fwd.off[u + 1]
+        for k in a..b {
+            let v = fwd.dst[k]
+            src[cur[v]] = u
+            cur[v] += 1
+        }
+    }
+    return Adj{off: off, dst: src}
+}
+
+fn ensureBwd(csr: mut &Csr, cacheable: bool): rc Adj {
+    match &csr.bwd {
+        Some(b) { return b.clone() }
+        None {}
+    }
+    let rev = rc(buildReverse(csr.ids.nV, &csr.fwd))
+    csr.bytes += (len(rev.off) + len(rev.dst)) * 8
+    csr.bwd = Some(rev.clone())
+    if cacheable { cachePut(csr.clone()) }
+    return rev
+}
+
+// Build CSR from flat [u0, v0, u1, v1, ...] edge pairs.
+fn buildCsrFromPairs(storeId: int, tree: int, srcCol: int, dstCol: int, stamp: int, pairs: &[]int): Csr {
+    let m = len(pairs) / 2
+    if m == 0 {
+        let ids = rc(IdMap{dense: true, minId: 0, nV: 0, toIdx: newMap(), toId: []})
+        let fwd = rc(Adj{off: [0], dst: []})
+        return Csr{storeId: storeId, tree: tree, srcCol: srcCol, dstCol: dstCol, stamp: stamp, ids: ids, fwd: fwd, bwd: None, bytes: 64}
+    }
+    var rawU: []int = withCapacity(m)
+    var rawV: []int = withCapacity(m)
+    var minId = pairs[0]
+    var maxId = pairs[0]
+    var i = 0
+    while i + 1 < len(pairs) {
+        let u = pairs[i]
+        let v = pairs[i + 1]
+        if u < minId { minId = u }
+        if u > maxId { maxId = u }
+        if v < minId { minId = v }
+        if v > maxId { maxId = v }
+        append(mut &rawU, u)
+        append(mut &rawV, v)
+        i += 2
+    }
+    return finalizeCsr(storeId, tree, srcCol, dstCol, stamp, mut &rawU, mut &rawV, minId, maxId)
+}
+
+fn finalizeCsr(storeId: int, tree: int, srcCol: int, dstCol: int, stamp: int,
+               rawU: mut &[]int, rawV: mut &[]int, minId: int, maxId: int): Csr {
+    let m = len(rawU)
+    if m == 0 {
+        let ids = rc(IdMap{dense: true, minId: 0, nV: 0, toIdx: newMap(), toId: []})
+        let fwd = rc(Adj{off: [0], dst: []})
+        return Csr{storeId: storeId, tree: tree, srcCol: srcCol, dstCol: dstCol, stamp: stamp, ids: ids, fwd: fwd, bwd: None, bytes: 64}
+    }
+    var dense = false
+    var span = 0
+    if minId >= 0 && maxId >= minId && maxId - minId < MAX_DENSE_SPAN {
+        span = maxId - minId + 1
+        if span <= 65536 || span <= 4 * m { dense = true }
+    }
+    var nV = 0
+    var toIdx: Map[int, int] = newMap()
+    var toId: []int = []
+    if dense {
+        nV = span
+        for i in 0..m {
+            rawU[i] -= minId
+            rawV[i] -= minId
+        }
+    } else {
+        for i in 0..m {
+            let u = rawU[i]
+            var ui = 0
+            match toIdx.get(&u) {
+                Some(x) { ui = x }
+                None {
+                    ui = nV
+                    toIdx.put(u, ui)
+                    append(mut &toId, u)
+                    nV += 1
+                }
+            }
+            rawU[i] = ui
+            let v = rawV[i]
+            var vi = 0
+            match toIdx.get(&v) {
+                Some(x) { vi = x }
+                None {
+                    vi = nV
+                    toIdx.put(v, vi)
+                    append(mut &toId, v)
+                    nV += 1
+                }
+            }
+            rawV[i] = vi
+        }
+    }
+    var off: []int = array(nV + 1, 0)
+    for i in 0..m { off[rawU[i] + 1] += 1 }
+    for i in 0..nV { off[i + 1] += off[i] }
+    var cur = off.clone()
+    var dst: []int = array(m, 0)
+    for i in 0..m {
+        let u = rawU[i]
+        dst[cur[u]] = rawV[i]
+        cur[u] += 1
+    }
+    let mapBytes = if dense { 0 } else { nV * 32 }
+    let bytes = (nV + 1 + m) * 8 + mapBytes + 128
+    let ids = rc(IdMap{dense: dense, minId: minId, nV: nV, toIdx: toIdx, toId: toId})
+    let fwd = rc(Adj{off: off, dst: dst})
+    return Csr{storeId: storeId, tree: tree, srcCol: srcCol, dstCol: dstCol, stamp: stamp, ids: ids, fwd: fwd, bwd: None, bytes: bytes}
+}
+
+// Build CSR from edge relation using columnar batch scan decoding only (srcCol, dstCol).
+fn buildCsrFromRel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &Rel,
+                   srcCol: int, dstCol: int, stamp: int, tick: &fn(): Result[Unit, DbErr]): Result[Csr, DbErr] {
+    let nc = len(rel.cols)
+    var kinds: []int = array(nc, lexdb_rows.BK_VAL)
+    var needCol: []bool = array(nc, false)
+    kinds[srcCol] = lexdb_rows.BK_INT
+    kinds[dstCol] = lexdb_rows.BK_INT
+    needCol[srcCol] = true
+    needCol[dstCol] = true
+    let needP = lexdb_access.placesNeeded(rel, &needCol)
+    let missing = lexdb_access.placesMissing(rel)
+    let bp = lexdb_rows.projectionOf(kinds, needCol, rel.slots, lexdb_access.rowWidth(rel), missing, needP)
+    let sc = lexdb_access.wholeScan()
+    let rd = lexdb_access.noIxRead()
+    var cur = lexdb_access.newCursor()
+    var spare = lexdb_rows.noRows()
+    var rawU: []int = []
+    var rawV: []int = []
+    var haveAny = false
+    var minId = 0
+    var maxId = 0
+    var batches = 0
+    while !cur.done {
+        batches += 1
+        if (batches & 15) == 0 { try tick() }
+        match try lexdb_access.fillLevel(st, txn, rel, &rd, &sc, false, mut &cur, &bp, mut &spare) {
+            Some(b) {
+                let n = b.n
+                if n > 0 {
+                    let su = &b.cols[srcCol]
+                    let sv = &b.cols[dstCol]
+                    for r in 0..n {
+                        if su.nul[r] || sv.nul[r] { continue }
+                        let u = su.v[r]
+                        let v = sv.v[r]
+                        if !haveAny {
+                            minId = u
+                            maxId = u
+                            haveAny = true
+                        }
+                        if u < minId { minId = u }
+                        if u > maxId { maxId = u }
+                        if v < minId { minId = v }
+                        if v > maxId { maxId = v }
+                        append(mut &rawU, u)
+                        append(mut &rawV, v)
+                    }
+                }
+                spare = b
+            }
+            None {
+                // Fallback to row-based fetch if a batch value didn't fit BK_INT
+                var rcur = lexdb_access.newCursor()
+                rawU = []
+                rawV = []
+                haveAny = false
+                while !rcur.done {
+                    var rows: [][]Val = []
+                    try lexdb_access.fetch(st, txn, rel, -1, false, &sc, &bp.needCol, mut &rcur, mut &rows)
+                    for row in rows {
+                        var u = 0
+                        var v = 0
+                        var okU = false
+                        var okV = false
+                        match row[srcCol] { Val.Int(x) { u = x; okU = true } else {} }
+                        match row[dstCol] { Val.Int(x) { v = x; okV = true } else {} }
+                        if !okU || !okV { continue }
+                        if !haveAny { minId = u; maxId = u; haveAny = true }
+                        if u < minId { minId = u }
+                        if u > maxId { maxId = u }
+                        if v < minId { minId = v }
+                        if v > maxId { maxId = v }
+                        append(mut &rawU, u)
+                        append(mut &rawV, v)
+                    }
+                }
+                break
+            }
+        }
+    }
+    return Ok(finalizeCsr(st.id, rel.tree, srcCol, dstCol, stamp, mut &rawU, mut &rawV, minId, maxId))
+}
+
+// ---- Strategy A: Cold point-to-point bidirectional index-only BFS ----
+
+type IdxAccess = value record {
+    ix: int         // -1 = primary key, >= 0 = secondary index
+    tree: int
+    off: int        // byte offset of neighbor int64 in index key
+    marked: bool    // whether byte at (off - 1) is a NULL marker (2 = NULL)
+}
+
+fn isIntCol(rel: &Rel, c: int): bool {
+    let o = rel.cols[c].typ.oid
+    let k = rel.cols[c].typ.kind
+    return k == lexdb_sql.K_INT && (o == lexdb_sql.OID_INT2 || o == lexdb_sql.OID_INT4 || o == lexdb_sql.OID_INT8)
+}
+
+fn hasDescOpt(opts: &[]str): bool {
+    for o in opts {
+        if strings.contains(&strings.toLowerAscii(&o), "desc") { return true }
+    }
+    return false
+}
+
+// Find a covering B+tree index starting on leadCol that directly encodes wantCol as an 8-byte int64.
+fn findCoveringIdx(rel: &Rel, leadCol: int, wantCol: int): Option[IdxAccess] {
+    if !isIntCol(rel, leadCol) || !isIntCol(rel, wantCol) { return None }
+    // Primary key: unmarked 8-byte big-endian int64s
+    if len(rel.pk) >= 2 && rel.pk[0] == leadCol && rel.pk[1] == wantCol {
+        return Some(IdxAccess{ix: -1, tree: rel.tree, off: 8, marked: false})
+    }
+    // Secondary indexes: each index column has a 1-byte NULL marker + 8-byte int64,
+    // followed by unmarked PK columns.
+    for i in 0..len(rel.indexes) {
+        let x = &rel.indexes[i]
+        if x.pred.isSome() || len(x.exprs) > 0 || hasDescOpt(&x.opts) { continue }
+        if len(x.cols) == 0 || x.cols[0] != leadCol { continue }
+        if len(x.cols) >= 2 && x.cols[1] == wantCol {
+            return Some(IdxAccess{ix: i, tree: x.tree, off: 10, marked: true})
+        }
+        if len(x.cols) == 1 && len(rel.pk) >= 1 && rel.pk[0] == wantCol {
+            return Some(IdxAccess{ix: i, tree: x.tree, off: 9, marked: false})
+        }
+    }
+    return None
+}
+
+fn idxNeighbors(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &Rel,
+                acc: &IdxAccess, u: int, out: mut &[]int): Result[Unit, DbErr] {
+    return lexdb_access.scanIntNeighbors(st, txn, rel, acc.ix, acc.tree, u, acc.off, acc.marked, out)
+}
+
+// Returns Ok(Some(dist)) if resolved (>=0 found, -1 proven unreachable), or Ok(None) if
+// covering indexes are unavailable or probe budget was exceeded (caller falls back to CSR).
+fn bidirIndexBfs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &Rel,
+                 srcCol: int, dstCol: int, dir: int, minHops: int, maxHops: int,
+                 s: int, t: int, tick: &fn(): Result[Unit, DbErr]): Result[Option[int], DbErr] {
+    if minHops > 1 || s == t { return Ok(None) }
+    let fwdOpt = findCoveringIdx(rel, srcCol, dstCol)
+    let revOpt = findCoveringIdx(rel, dstCol, srcCol)
+    if fwdOpt.isNone() || revOpt.isNone() { return Ok(None) }
+    let fwdAcc = fwdOpt.unwrap()
+    let revAcc = revOpt.unwrap()
+    var fVis: Map[int, int] = newMap()
+    var bVis: Map[int, int] = newMap()
+    fVis.put(s, 0)
+    bVis.put(t, 0)
+    var fCur: []int = [s]
+    var bCur: []int = [t]
+    var fDepth = 0
+    var bDepth = 0
+    var probes = 0
+    var nbs: []int = []
+    while len(fCur) > 0 && len(bCur) > 0 {
+        if maxHops >= 0 && fDepth + bDepth >= maxHops { return Ok(Some(-1)) }
+        if len(fCur) <= len(bCur) {
+            fDepth += 1
+            var fNext: []int = []
+            for u in fCur {
+                probes += 1
+                if probes > MAX_IDX_PROBES { return Ok(None) }
+                if (probes & 255) == 0 { try tick() }
+                nbs = []
+                if dir == DIR_FWD {
+                    try idxNeighbors(st, txn, rel, &fwdAcc, u, mut &nbs)
+                } else if dir == DIR_REV {
+                    try idxNeighbors(st, txn, rel, &revAcc, u, mut &nbs)
+                } else {
+                    try idxNeighbors(st, txn, rel, &fwdAcc, u, mut &nbs)
+                    try idxNeighbors(st, txn, rel, &revAcc, u, mut &nbs)
+                }
+                for v in nbs {
+                    if bVis.has(&v) { return Ok(Some(fDepth + bDepth)) }
+                    if !fVis.has(&v) {
+                        fVis.put(v, fDepth)
+                        append(mut &fNext, v)
+                    }
+                }
+            }
+            fCur = fNext
+        } else {
+            bDepth += 1
+            var bNext: []int = []
+            for u in bCur {
+                probes += 1
+                if probes > MAX_IDX_PROBES { return Ok(None) }
+                if (probes & 255) == 0 { try tick() }
+                nbs = []
+                if dir == DIR_FWD {
+                    try idxNeighbors(st, txn, rel, &revAcc, u, mut &nbs)
+                } else if dir == DIR_REV {
+                    try idxNeighbors(st, txn, rel, &fwdAcc, u, mut &nbs)
+                } else {
+                    try idxNeighbors(st, txn, rel, &fwdAcc, u, mut &nbs)
+                    try idxNeighbors(st, txn, rel, &revAcc, u, mut &nbs)
+                }
+                for v in nbs {
+                    if fVis.has(&v) { return Ok(Some(fDepth + bDepth)) }
+                    if !bVis.has(&v) {
+                        bVis.put(v, bDepth)
+                        append(mut &bNext, v)
+                    }
+                }
+            }
+            bCur = bNext
+        }
+    }
+    return Ok(Some(-1))
+}
+
+// ---- Strategy B: CSR BFS kernels ----
+
+// 1-to-1 bidirectional BFS on CSR using compact hash maps (zero O(V) array allocation!).
+fn csrBidirOneToOne(csr: mut &Csr, cacheable: bool, dir: int, maxHops: int,
+                    si: int, ti: int, tick: &fn(): Result[Unit, DbErr]): Result[int, DbErr] {
+    let bwd = ensureBwd(csr, cacheable)
+    let fwd = &csr.fwd
+    var fVis: Map[int, int] = newMap()
+    var bVis: Map[int, int] = newMap()
+    fVis.put(si, 0)
+    bVis.put(ti, 0)
+    var fCur: []int = [si]
+    var bCur: []int = [ti]
+    var fDepth = 0
+    var bDepth = 0
+    var steps = 0
+    while len(fCur) > 0 && len(bCur) > 0 {
+        if maxHops >= 0 && fDepth + bDepth >= maxHops { return Ok(-1) }
+        if len(fCur) <= len(bCur) {
+            fDepth += 1
+            var fNext: []int = []
+            for u in fCur {
+                steps += 1
+                if (steps & 4095) == 0 { try tick() }
+                if dir == DIR_FWD || dir == DIR_UNDIR {
+                    let a = fwd.off[u]
+                    let b = fwd.off[u + 1]
+                    for k in a..b {
+                        let v = fwd.dst[k]
+                        if bVis.has(&v) { return Ok(fDepth + bDepth) }
+                        if !fVis.has(&v) {
+                            fVis.put(v, fDepth)
+                            append(mut &fNext, v)
+                        }
+                    }
+                }
+                if dir == DIR_REV || dir == DIR_UNDIR {
+                    let a = bwd.off[u]
+                    let b = bwd.off[u + 1]
+                    for k in a..b {
+                        let v = bwd.dst[k]
+                        if bVis.has(&v) { return Ok(fDepth + bDepth) }
+                        if !fVis.has(&v) {
+                            fVis.put(v, fDepth)
+                            append(mut &fNext, v)
+                        }
+                    }
+                }
+            }
+            fCur = fNext
+        } else {
+            bDepth += 1
+            var bNext: []int = []
+            for u in bCur {
+                steps += 1
+                if (steps & 4095) == 0 { try tick() }
+                if dir == DIR_FWD || dir == DIR_UNDIR {
+                    let a = bwd.off[u]
+                    let b = bwd.off[u + 1]
+                    for k in a..b {
+                        let v = bwd.dst[k]
+                        if fVis.has(&v) { return Ok(fDepth + bDepth) }
+                        if !bVis.has(&v) {
+                            bVis.put(v, bDepth)
+                            append(mut &bNext, v)
+                        }
+                    }
+                }
+                if dir == DIR_REV || dir == DIR_UNDIR {
+                    let a = fwd.off[u]
+                    let b = fwd.off[u + 1]
+                    for k in a..b {
+                        let v = fwd.dst[k]
+                        if fVis.has(&v) { return Ok(fDepth + bDepth) }
+                        if !bVis.has(&v) {
+                            bVis.put(v, bDepth)
+                            append(mut &bNext, v)
+                        }
+                    }
+                }
+            }
+            bCur = bNext
+        }
+    }
+    return Ok(-1)
+}
+
+// Single-source / multi-source flat generation-stamped level-synchronous CSR BFS.
+// When flipOut is true, emits (vId, sId, hops) instead of (sId, vId, hops) (for reversed search).
+fn csrMultiBfs(csr: mut &Csr, cacheable: bool, dir: int, minHops: int, maxHops: int,
+               srcs: &[]int, dsts: &[]int, dstAll: bool, flipOut: bool,
+               out: mut &[]int, tick: &fn(): Result[Unit, DbErr]): Result[Unit, DbErr] {
+    let useFwd = dir == DIR_FWD || dir == DIR_UNDIR
+    let useBwd = dir == DIR_REV || dir == DIR_UNDIR
+    let bwd = if useBwd { ensureBwd(csr, cacheable) } else { rc(Adj{off: [], dst: []}) }
+    let ids = &csr.ids
+    let nV = ids.nV
+    if nV == 0 { return Ok(Unit{}) }
+    let fwd = &csr.fwd
+
+    var isDst: []bool = []
+    var totalDstInCsr = 0
+    if !dstAll {
+        isDst = array(nV, false)
+        for d in dsts {
+            let di = ids.lookup(d)
+            if di >= 0 && !isDst[di] {
+                isDst[di] = true
+                totalDstInCsr += 1
+            }
+        }
+        if totalDstInCsr == 0 { return Ok(Unit{}) }
+    }
+
+    var visGen: []int = array(nV, 0)
+    var stepGen: []int = if minHops > 1 { array(nV, 0) } else { [] }
+    var gen = 0
+    var sGen = 0
+    var steps = 0
+
+    for sId in srcs {
+        let si = ids.lookup(sId)
+        if si < 0 { continue }
+        if maxHops == 0 { continue }
+        var cur: []int = [si]
+        var remaining = if dstAll { -1 } else { totalDstInCsr }
+
+        // Handle minHops == 0: already emitted (sId, sId, 0) by caller, so mark si visited
+        // so we don't emit a longer cycle back to si.
+        if minHops == 0 {
+            gen += 1
+            visGen[si] = gen
+            if !dstAll && isDst[si] { remaining -= 1 }
+            if !dstAll && remaining == 0 { continue }
+        } else if minHops == 1 {
+            // Standard visited-once BFS for all other vertices; allow returning to si at >=1 hop
+            // whenever si can be a target (dstAll or isDst[si]) so shortest cycles work cleanly.
+            gen += 1
+            if !dstAll && !isDst[si] {
+                visGen[si] = gen
+            }
+        } else {
+            // Exact reachability for steps 1 .. minHops - 1 without permanently blocking vertices
+            // reachable at < minHops (they may still be reached again at >= minHops!).
+            var d = 0
+            while d < minHops - 1 && len(cur) > 0 {
+                d += 1
+                sGen += 1
+                var next: []int = []
+                for u in cur {
+                    steps += 1
+                    if (steps & 4095) == 0 { try tick() }
+                    if useFwd {
+                        let a = fwd.off[u]
+                        let b = fwd.off[u + 1]
+                        for k in a..b {
+                            let v = fwd.dst[k]
+                            if stepGen[v] != sGen {
+                                stepGen[v] = sGen
+                                append(mut &next, v)
+                            }
+                        }
+                    }
+                    if useBwd {
+                        let a = bwd.off[u]
+                        let b = bwd.off[u + 1]
+                        for k in a..b {
+                            let v = bwd.dst[k]
+                            if stepGen[v] != sGen {
+                                stepGen[v] = sGen
+                                append(mut &next, v)
+                            }
+                        }
+                    }
+                }
+                cur = next
+            }
+            if len(cur) == 0 { continue }
+            gen += 1
+        }
+
+        var depth = if minHops > 1 { minHops - 1 } else { 0 }
+        let wantMin = if minHops > 1 { minHops } else { 1 }
+        while len(cur) > 0 && (maxHops < 0 || depth < maxHops) {
+            depth += 1
+            var next: []int = []
+            for u in cur {
+                steps += 1
+                if (steps & 4095) == 0 { try tick() }
+                if useFwd {
+                    let a = fwd.off[u]
+                    let b = fwd.off[u + 1]
+                    for k in a..b {
+                        let v = fwd.dst[k]
+                        if visGen[v] != gen {
+                            visGen[v] = gen
+                            if !(minHops == 1 && v == si) { append(mut &next, v) }
+                            if depth >= wantMin && (dstAll || isDst[v]) {
+                                let vId = ids.idOf(v)
+                                if flipOut {
+                                    append(out, vId)
+                                    append(out, sId)
+                                    append(out, depth)
+                                } else {
+                                    append(out, sId)
+                                    append(out, vId)
+                                    append(out, depth)
+                                }
+                                if !dstAll {
+                                    remaining -= 1
+                                    if remaining == 0 { break }
+                                }
+                            }
+                        }
+                    }
+                    if !dstAll && remaining == 0 { break }
+                }
+                if useBwd {
+                    let a = bwd.off[u]
+                    let b = bwd.off[u + 1]
+                    for k in a..b {
+                        let v = bwd.dst[k]
+                        if visGen[v] != gen {
+                            visGen[v] = gen
+                            if !(minHops == 1 && v == si) { append(mut &next, v) }
+                            if depth >= wantMin && (dstAll || isDst[v]) {
+                                let vId = ids.idOf(v)
+                                if flipOut {
+                                    append(out, vId)
+                                    append(out, sId)
+                                    append(out, depth)
+                                } else {
+                                    append(out, sId)
+                                    append(out, vId)
+                                    append(out, depth)
+                                }
+                                if !dstAll {
+                                    remaining -= 1
+                                    if remaining == 0 { break }
+                                }
+                            }
+                        }
+                    }
+                    if !dstAll && remaining == 0 { break }
+                }
+            }
+            if !dstAll && remaining == 0 { break }
+            cur = next
+        }
+    }
+    return Ok(Unit{})
+}
+
+fn flipDir(dir: int): int {
+    if dir == DIR_FWD { return DIR_REV }
+    if dir == DIR_REV { return DIR_FWD }
+    return DIR_UNDIR
+}
+
+fn dedupInts(xs: &[]int): []int {
+    if len(xs) <= 1 { return xs.clone() }
+    var seen: Map[int, int] = newMap()
+    var out: []int = withCapacity(len(xs))
+    for x in xs {
+        if !seen.has(&x) {
+            seen.put(x, 1)
+            append(mut &out, x)
+        }
+    }
+    return out
+}
+
+// Main entry point: returns flat [src0, dst0, hops0, ...].
+pub fn shortest(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &Rel,
+                srcCol: int, dstCol: int, dir: int, minHops: int, maxHops: int,
+                srcsIn: &[]int, dstsIn: &[]int, dstAll: bool,
+                edgePairs: &[]int, useEdgePairs: bool,
+                tick: &fn(): Result[Unit, DbErr]): Result[[]int, DbErr] {
+    var out: []int = []
+    if len(srcsIn) == 0 || (!dstAll && len(dstsIn) == 0) { return Ok(out) }
+    if maxHops >= 0 && minHops > maxHops { return Ok(out) }
+    let srcs = dedupInts(srcsIn)
+    let dsts: []int = if dstAll { [] } else { dedupInts(dstsIn) }
+
+    // 0-hop self-matches (valid even for isolated vertices absent from the edge table)
+    if minHops == 0 {
+        if dstAll {
+            for s in srcs {
+                append(mut &out, s)
+                append(mut &out, s)
+                append(mut &out, 0)
+            }
+        } else {
+            var dset: Map[int, int] = newMap()
+            for d in dsts { dset.put(d, 1) }
+            for s in srcs {
+                if dset.has(&s) {
+                    append(mut &out, s)
+                    append(mut &out, s)
+                    append(mut &out, 0)
+                }
+            }
+        }
+        if maxHops == 0 { return Ok(out) }
+    }
+
+    // Fast path: 1-to-1 query
+    if len(srcs) == 1 && !dstAll && len(dsts) == 1 {
+        let s = srcs[0]
+        let t = dsts[0]
+        if minHops == 0 && s == t { return Ok(out) }
+        if !useEdgePairs {
+            let stamp = st.treeStamp(txn, rel.tree)
+            match cacheLookup(st.id, rel.tree, srcCol, dstCol, stamp) {
+                Some(c) {
+                    var csr = c
+                    if minHops <= 1 && s != t {
+                        let si = csr.ids.lookup(s)
+                        let ti = csr.ids.lookup(t)
+                        if si >= 0 && ti >= 0 {
+                            let d = try csrBidirOneToOne(mut &csr, stamp >= 0, dir, maxHops, si, ti, tick)
+                            if d >= minHops {
+                                append(mut &out, s)
+                                append(mut &out, t)
+                                append(mut &out, d)
+                            }
+                        }
+                        return Ok(out)
+                    }
+                    try csrMultiBfs(mut &csr, stamp >= 0, dir, minHops, maxHops, &srcs, &dsts, false, false, mut &out, tick)
+                    return Ok(out)
+                }
+                None {
+                    // Strategy A: Cold bidirectional index-only BFS before building CSR
+                    if minHops <= 1 && s != t {
+                        match try bidirIndexBfs(st, txn, rel, srcCol, dstCol, dir, minHops, maxHops, s, t, tick) {
+                            Some(d) {
+                                if d >= minHops {
+                                    append(mut &out, s)
+                                    append(mut &out, t)
+                                    append(mut &out, d)
+                                }
+                                return Ok(out)
+                            }
+                            None {}
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Strategy B: Acquire cached CSR or build one
+    var cacheable = false
+    var csr = Csr{storeId: st.id, tree: rel.tree, srcCol: srcCol, dstCol: dstCol, stamp: -1,
+                  ids: rc(IdMap{dense: true, minId: 0, nV: 0, toIdx: newMap(), toId: []}),
+                  fwd: rc(Adj{off: [0], dst: []}), bwd: None, bytes: 0}
+    if useEdgePairs {
+        csr = buildCsrFromPairs(st.id, rel.tree, srcCol, dstCol, -1, edgePairs)
+    } else {
+        let stamp = st.treeStamp(txn, rel.tree)
+        match cacheLookup(st.id, rel.tree, srcCol, dstCol, stamp) {
+            Some(c) {
+                cacheable = stamp >= 0
+                csr = c
+            }
+            None {
+                csr = try buildCsrFromRel(st, txn, rel, srcCol, dstCol, stamp, tick)
+                if stamp >= 0 {
+                    cacheable = true
+                    cachePut(csr.clone())
+                }
+            }
+        }
+    }
+
+    // 1-to-1 on CSR
+    if len(srcs) == 1 && !dstAll && len(dsts) == 1 && minHops <= 1 && srcs[0] != dsts[0] {
+        let si = csr.ids.lookup(srcs[0])
+        let ti = csr.ids.lookup(dsts[0])
+        if si >= 0 && ti >= 0 {
+            let d = try csrBidirOneToOne(mut &csr, cacheable, dir, maxHops, si, ti, tick)
+            if d >= minHops {
+                append(mut &out, srcs[0])
+                append(mut &out, dsts[0])
+                append(mut &out, d)
+            }
+        }
+        return Ok(out)
+    }
+
+    // Direction flip when target set is strictly smaller than source set
+    if !dstAll && len(dsts) < len(srcs) {
+        try csrMultiBfs(mut &csr, cacheable, flipDir(dir), minHops, maxHops, &dsts, &srcs, false, true, mut &out, tick)
+        return Ok(out)
+    }
+
+    try csrMultiBfs(mut &csr, cacheable, dir, minHops, maxHops, &srcs, &dsts, dstAll, false, mut &out, tick)
+    return Ok(out)
+}
