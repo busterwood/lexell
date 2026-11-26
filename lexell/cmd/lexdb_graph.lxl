@@ -1750,9 +1750,22 @@ fn unite(x: mut &Exp, a0: int, b0: int) {
 
 // ---- the joins of one expansion
 
+// A vertex variable eliminated because an enforced non-deferred FK on an incident edge guarantees an exact 1-to-1 match on its
+// unique key, and no non-key column of the vertex table is read.
+type VSub = record {
+    edgeVar: int
+    occ: int
+    isSrc: bool
+    vCols: []str
+    eCols: []str
+    nullable: []bool
+}
+
+fn noVSub(): VSub { return VSub{edgeVar: -1, occ: -1, isSrc: false, vCols: [], eCols: [], nullable: []} }
+
 // A binding of an expansion's variables to elements: per variable (its representative's), the element; per edge occurrence,
-// whether the edge's source is on its left.
-type Bind = record { el: []int; fwd: []bool }
+// whether the edge's source is on its left; per variable, its vertex-table elimination (if any).
+type Bind = record { el: []int; fwd: []bool; elim: []VSub }
 
 fn branchesOf(gt: &GT, x: &Exp, out: mut &[]str): Result[Unit, DbErr] {
     var cands: [][]int = []
@@ -1763,7 +1776,7 @@ fn branchesOf(gt: &GT, x: &Exp, out: mut &[]str): Result[Unit, DbErr] {
         }
         append(mut &cands, candidates(gt, x.vars[i].vertex, &x.vars[i].labs))
     }
-    var b = Bind{el: array(len(x.vars), -1), fwd: array(len(x.occs), true)}
+    var b = Bind{el: array(len(x.vars), -1), fwd: array(len(x.occs), true), elim: []}
     try bindEdges(gt, x, &cands, 0, mut &b, out)
     return Ok(Unit{})
 }
@@ -1841,7 +1854,7 @@ fn elemIndex(gt: &GT, n: &str): int {
 
 // No binding holds: one made of the first elements of each kind, its condition false.
 fn fallback(gt: &GT, x: &Exp, out: mut &[]str): Result[Unit, DbErr] {
-    var b = Bind{el: array(len(x.vars), -1), fwd: array(len(x.occs), true)}
+    var b = Bind{el: array(len(x.vars), -1), fwd: array(len(x.occs), true), elim: []}
     for i in 0..len(x.vars) {
         if repOf(x, i) != i { continue }
         let cs = candidates(gt, x.vars[i].vertex, &x.vars[i].labs)
@@ -1855,15 +1868,177 @@ fn fallback(gt: &GT, x: &Exp, out: mut &[]str): Result[Unit, DbErr] {
 
 fn alias(i: int): str { return "\"gt$" + i.toStr() + "\"" }
 
+fn isUniqueKey(t: &Table, cols: &[]str): bool {
+    if len(cols) == 0 { return false }
+    if len(t.pk) == len(cols) {
+        var ok = true
+        for c in cols {
+            var found = false
+            for pi in t.pk { if t.cols[pi].name == c { found = true } }
+            if !found { ok = false }
+        }
+        if ok { return true }
+    }
+    for ix in t.indexes {
+        if !ix.unique || ix.pred.isSome() || len(ix.exprs) > 0 || len(ix.cols) != len(cols) { continue }
+        var ok = true
+        for c in cols {
+            var found = false
+            for ci in ix.cols { if ci >= 0 && t.cols[ci].name == c { found = true } }
+            if !found { ok = false }
+        }
+        if ok { return true }
+    }
+    return false
+}
+
+fn hasEnforcedFk(te: &Table, eCols: &[]str, vTable: &str, vRefs: &[]str): bool {
+    if len(eCols) == 0 || len(eCols) != len(vRefs) { return false }
+    for fk in te.fks {
+        if fk.ref != vTable || fk.deferred || lexdb_base.hasStr(&te.invalid, &fk.name) { continue }
+        if len(fk.cols) != len(eCols) || len(fk.refCols) != len(vRefs) { continue }
+        var ok = true
+        for j in 0..len(eCols) {
+            var found = false
+            for m in 0..len(fk.cols) {
+                if fk.cols[m] == eCols[j] && fk.refCols[m] == vRefs[j] { found = true }
+            }
+            if !found { ok = false }
+        }
+        if ok { return true }
+    }
+    return false
+}
+
+// Whether every (eCols[j], vRefs[j]) pair has the exact same column type OID and collation, so substituting edge columns for
+// vertex key columns preserves Describe OIDs and comparisons identically.
+fn sameEndTypes(te: &Table, eCols: &[]str, tv: &Table, vRefs: &[]str, nulls: mut &[]bool): bool {
+    var ns: []bool = []
+    for j in 0..len(eCols) {
+        let ec = colIdx(te, &eCols[j])
+        let vc = colIdx(tv, &vRefs[j])
+        if ec < 0 || vc < 0 { return false }
+        if te.cols[ec].typ.oid != tv.cols[vc].typ.oid || te.cols[ec].coll != tv.cols[vc].coll { return false }
+        append(mut &ns, !te.cols[ec].notNull)
+    }
+    let old = replace(nulls, ns)
+    return true
+}
+
+fn tryElim(gt: &GT, x: &Exp, b: &Bind, noRows: bool): []VSub {
+    var out: []VSub = []
+    for i in 0..len(x.vars) { append(mut &out, noVSub()) }
+    if noRows { return out }
+    for k in 0..len(x.occs) {
+        let oc = &x.occs[k]
+        let ei = repOf(x, oc.e)
+        let el = &gt.g.elems[b.el[ei]]
+        let te = &gt.tabs[b.el[ei]]
+        let l = repOf(x, oc.x)
+        let rr = repOf(x, oc.y)
+        let srcV = if b.fwd[k] { l } else { rr }
+        let dstV = if b.fwd[k] { rr } else { l }
+        if out[srcV].edgeVar < 0 {
+            let tv = &gt.tabs[b.el[srcV]]
+            let ev = &gt.g.elems[b.el[srcV]]
+            var ns: []bool = []
+            if len(tv.view) == 0 && isUniqueKey(tv, &el.src.refs) && hasEnforcedFk(te, &el.src.cols, &ev.table, &el.src.refs) &&
+               sameEndTypes(te, &el.src.cols, tv, &el.src.refs, mut &ns) {
+                out[srcV] = VSub{edgeVar: ei, occ: k, isSrc: true, vCols: el.src.refs.clone(), eCols: el.src.cols.clone(), nullable: ns}
+            }
+        }
+        if out[dstV].edgeVar < 0 {
+            let tv = &gt.tabs[b.el[dstV]]
+            let ev = &gt.g.elems[b.el[dstV]]
+            var ns: []bool = []
+            if len(tv.view) == 0 && isUniqueKey(tv, &el.dst.refs) && hasEnforcedFk(te, &el.dst.cols, &ev.table, &el.dst.refs) &&
+               sameEndTypes(te, &el.dst.cols, tv, &el.dst.refs, mut &ns) {
+                out[dstV] = VSub{edgeVar: ei, occ: k, isSrc: false, vCols: el.dst.refs.clone(), eCols: el.dst.cols.clone(), nullable: ns}
+            }
+        }
+    }
+    return out
+}
+
+fn colRef(b: &Bind, vi: int, col: &str, md: int, keep: mut &[]bool): str {
+    if vi < len(b.elim) && b.elim[vi].edgeVar >= 0 {
+        for j in 0..len(b.elim[vi].vCols) {
+            if b.elim[vi].vCols[j] == col {
+                return alias(b.elim[vi].edgeVar) + "." + qIn(&b.elim[vi].eCols[j], md)
+            }
+        }
+        if vi < len(keep) { keep[vi] = true }
+    }
+    return alias(vi) + "." + qIn(col, md)
+}
+
+fn renderParts(gt: &GT, x: &Exp, b: &Bind, wconds: mut &[]str, items: mut &[]str, keep: mut &[]bool): Result[Unit, DbErr] {
+    var wc: []str = []
+    var its: []str = []
+    for k in 0..len(x.occs) {
+        let oc = &x.occs[k]
+        let ei = repOf(x, oc.e)
+        let el = &gt.g.elems[b.el[ei]]
+        let l = repOf(x, oc.x)
+        let rr = repOf(x, oc.y)
+        if oc.dir == DIR_ANY && !b.fwd[k] && el.src.elem == el.dst.elem {
+            let v = &gt.g.elems[b.el[l]]
+            var same: []str = []
+            for c in v.keys { append(mut &same, colRef(b, l, &c, gt.md, keep) + " = " + colRef(b, rr, &c, gt.md, keep)) }
+            append(mut &wc, "not (" + strings.join(&same, " and ") + ")")
+        }
+    }
+    for i in 0..len(x.vars) {
+        for w in x.vars[i].wheres {
+            append(mut &wc, "(" + try exprSql(gt, x, b, w.lo, w.hi, 2, w.group, w.copy, keep) + ")")
+        }
+    }
+    if gt.wlo >= 0 { append(mut &wc, "(" + try exprSql(gt, x, b, gt.wlo, gt.whi, 1, -1, 0, keep) + ")") }
+    for c in gt.cols {
+        if c.matchnum { continue }
+        let v = if len(c.vname) > 0 {
+            "(" + try propRef(gt, x, b, &c.vname, &c.prop, 0, -1, 0, keep) + ")"
+        } else {
+            try exprSql(gt, x, b, c.lo, c.hi, 0, -1, 0, keep)
+        }
+        append(mut &its, v + " " + qIn(&c.name, gt.md))
+    }
+    let old1 = replace(wconds, wc)
+    let old2 = replace(items, its)
+    return Ok(Unit{})
+}
+
 // The SQL of one binding: its tables, joined on the edges' keys, with the conditions and COLUMNS' items.
-fn branchSql(gt: &GT, x: &Exp, b: &Bind, noRows: bool): Result[str, DbErr] {
+fn branchSql(gt: &GT, x: &Exp, b0: &Bind, noRows: bool): Result[str, DbErr] {
+    var b = Bind{el: b0.el.clone(), fwd: b0.fwd.clone(), elim: tryElim(gt, x, b0, noRows)}
+    var keep: []bool = array(len(x.vars), false)
+    var wconds: []str = []
+    var items: []str = []
+    try renderParts(gt, x, &b, mut &wconds, mut &items, mut &keep)
+    var redo = false
+    for i in 0..len(x.vars) {
+        if b.elim[i].edgeVar >= 0 && keep[i] {
+            b.elim[i].edgeVar = -1
+            redo = true
+        }
+    }
+    if redo {
+        keep = array(len(x.vars), false)
+        try renderParts(gt, x, &b, mut &wconds, mut &items, mut &keep)
+    }
     var from: []str = []
     var conds: []str = []
     for i in 0..len(x.vars) {
         if repOf(x, i) != i { continue }
         if b.el[i] < 0 { return Err(lexdb_base.corrupt("GRAPH_TABLE: a variable without an element")) }
+        if b.elim[i].edgeVar >= 0 { continue }
         append(mut &from, relTextIn(&gt.g.elems[b.el[i]].table, gt.md) + " " + alias(i))
     }
+    // Track first incident edge per kept vertex so multiple edges meeting at a kept vertex also get direct transitive equalities.
+    var firstEdge: []int = array(len(x.vars), -1)
+    var firstIsSrc: []bool = array(len(x.vars), false)
+    var firstOcc: []int = array(len(x.vars), -1)
+    var noKeep: []bool = []
     for k in 0..len(x.occs) {
         let oc = &x.occs[k]
         let ei = repOf(x, oc.e)
@@ -1872,33 +2047,63 @@ fn branchSql(gt: &GT, x: &Exp, b: &Bind, noRows: bool): Result[str, DbErr] {
         let rr = repOf(x, oc.y)
         let srcV = if b.fwd[k] { l } else { rr }
         let dstV = if b.fwd[k] { rr } else { l }
-        for j in 0..len(el.src.cols) { append(mut &conds, alias(ei) + "." + qIn(&el.src.cols[j], gt.md) + " = " + alias(srcV) + "." + qIn(&el.src.refs[j], gt.md)) }
-        for j in 0..len(el.dst.cols) { append(mut &conds, alias(ei) + "." + qIn(&el.dst.cols[j], gt.md) + " = " + alias(dstV) + "." + qIn(&el.dst.refs[j], gt.md)) }
-        // an edge pattern without a direction matches an edge from a vertex to itself once
-        if oc.dir == DIR_ANY && !b.fwd[k] && el.src.elem == el.dst.elem {
-            let v = &gt.g.elems[b.el[l]]
-            var same: []str = []
-            for c in v.keys { append(mut &same, alias(l) + "." + qIn(&c, gt.md) + " = " + alias(rr) + "." + qIn(&c, gt.md)) }
-            append(mut &conds, "not (" + strings.join(&same, " and ") + ")")
-        }
-    }
-    for i in 0..len(x.vars) {
-        for w in x.vars[i].wheres {
-            append(mut &conds, "(" + try exprSql(gt, x, b, w.lo, w.hi, 2, w.group, w.copy) + ")")
-        }
-    }
-    if gt.wlo >= 0 { append(mut &conds, "(" + try exprSql(gt, x, b, gt.wlo, gt.whi, 1, -1, 0) + ")") }
-    if noRows { append(mut &conds, "1 = 0") }
-    var items: []str = []
-    for c in gt.cols {
-        if c.matchnum { continue }
-        let v = if len(c.vname) > 0 {
-            "(" + try propRef(gt, x, b, &c.vname, &c.prop, 0, -1, 0) + ")"
+        if b.elim[srcV].edgeVar >= 0 && b.elim[srcV].occ == k && b.elim[srcV].isSrc {
+            for j in 0..len(el.src.cols) {
+                if b.elim[srcV].nullable[j] { append(mut &conds, alias(ei) + "." + qIn(&el.src.cols[j], gt.md) + " is not null") }
+            }
         } else {
-            try exprSql(gt, x, b, c.lo, c.hi, 0, -1, 0)
+            for j in 0..len(el.src.cols) {
+                append(mut &conds, alias(ei) + "." + qIn(&el.src.cols[j], gt.md) + " = " + colRef(&b, srcV, &el.src.refs[j], gt.md, mut &noKeep))
+            }
+            if b.elim[srcV].edgeVar < 0 {
+                if firstEdge[srcV] < 0 {
+                    firstEdge[srcV] = ei
+                    firstIsSrc[srcV] = true
+                    firstOcc[srcV] = k
+                } else if firstEdge[srcV] != ei || !firstIsSrc[srcV] {
+                    let fei = firstEdge[srcV]
+                    let fel = &gt.g.elems[b.el[fei]]
+                    let fend = if firstIsSrc[srcV] { &fel.src } else { &fel.dst }
+                    for j in 0..len(el.src.cols) {
+                        for m in 0..len(fend.refs) {
+                            if fend.refs[m] == el.src.refs[j] {
+                                append(mut &conds, alias(ei) + "." + qIn(&el.src.cols[j], gt.md) + " = " + alias(fei) + "." + qIn(&fend.cols[m], gt.md))
+                            }
+                        }
+                    }
+                }
+            }
         }
-        append(mut &items, v + " " + qIn(&c.name, gt.md))
+        if b.elim[dstV].edgeVar >= 0 && b.elim[dstV].occ == k && !b.elim[dstV].isSrc {
+            for j in 0..len(el.dst.cols) {
+                if b.elim[dstV].nullable[j] { append(mut &conds, alias(ei) + "." + qIn(&el.dst.cols[j], gt.md) + " is not null") }
+            }
+        } else {
+            for j in 0..len(el.dst.cols) {
+                append(mut &conds, alias(ei) + "." + qIn(&el.dst.cols[j], gt.md) + " = " + colRef(&b, dstV, &el.dst.refs[j], gt.md, mut &noKeep))
+            }
+            if b.elim[dstV].edgeVar < 0 {
+                if firstEdge[dstV] < 0 {
+                    firstEdge[dstV] = ei
+                    firstIsSrc[dstV] = false
+                    firstOcc[dstV] = k
+                } else if firstEdge[dstV] != ei || firstIsSrc[dstV] {
+                    let fei = firstEdge[dstV]
+                    let fel = &gt.g.elems[b.el[fei]]
+                    let fend = if firstIsSrc[dstV] { &fel.src } else { &fel.dst }
+                    for j in 0..len(el.dst.cols) {
+                        for m in 0..len(fend.refs) {
+                            if fend.refs[m] == el.dst.refs[j] {
+                                append(mut &conds, alias(ei) + "." + qIn(&el.dst.cols[j], gt.md) + " = " + alias(fei) + "." + qIn(&fend.cols[m], gt.md))
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
+    for c in wconds { append(mut &conds, c) }
+    if noRows { append(mut &conds, "1 = 0") }
     if len(items) == 0 { append(mut &items, "null \"gt$none\"") }
     var sql = "select " + strings.join(&items, ", ") + " from " + strings.join(&from, ", ")
     if len(conds) > 0 { sql += " where " + strings.join(&conds, " and ") }
@@ -1921,7 +2126,7 @@ fn varFor(gt: &GT, x: &Exp, v: &str, where: int, group: int, copy: int): Result[
 }
 
 // v.p in a binding: the property's definition over v's table (NULL where v's element has not the property among its labels).
-fn propRef(gt: &GT, x: &Exp, b: &Bind, v: &str, p: &str, where: int, group: int, copy: int): Result[str, DbErr] {
+fn propRef(gt: &GT, x: &Exp, b: &Bind, v: &str, p: &str, where: int, group: int, copy: int, keep: mut &[]bool): Result[str, DbErr] {
     let i = try varFor(gt, x, v, where, group, copy)
     let d = try declOf(gt, v)
     let ls = labelsOf(gt, d)
@@ -1929,7 +2134,7 @@ fn propRef(gt: &GT, x: &Exp, b: &Bind, v: &str, p: &str, where: int, group: int,
     for l in el.labels {
         if !lexdb_base.hasStr(&ls, &l.name) { continue }
         for pr in l.props {
-            if pr.name == p { return qualified(&pr, &alias(i), gt.md) }
+            if pr.name == p { return qualified(&pr, b, i, gt.md, keep) }
         }
     }
     return Ok(nullOf(gt, p))
@@ -1998,9 +2203,9 @@ fn viewTyp(t: &Table, ty: &TypeName): TypeName {
     return x
 }
 
-// A property's definition with its columns qualified by the alias.
-fn qualified(p: &Prop, al: &str, md: int): Result[str, DbErr] {
-    if len(p.col) > 0 { return Ok(al + "." + qIn(&p.col, md)) }
+// A property's definition with its columns qualified by the alias (or substituted from an anchor edge when eliminated).
+fn qualified(p: &Prop, b: &Bind, vi: int, md: int, keep: mut &[]bool): Result[str, DbErr] {
+    if len(p.col) > 0 { return Ok(colRef(b, vi, &p.col, md, keep)) }
     let r = try readerIn(&p.expr, md)
     var out = ""
     for i in 0..len(r.toks) - 1 {
@@ -2008,7 +2213,7 @@ fn qualified(p: &Prop, al: &str, md: int): Result[str, DbErr] {
         let piece = &r.src[t.at..r.toks[i + 1].at]
         if isName(t) && lexdb_base.hasStr(&p.uses, &t.text) && !(r.toks[i + 1].kind == T_OP && r.toks[i + 1].text == "(") &&
            !(i > 0 && r.toks[i - 1].kind == T_OP && r.toks[i - 1].text == ".") {
-            out += al + "." + qIn(&t.text, md) + " "
+            out += colRef(b, vi, &t.text, md, keep) + " "
             continue
         }
         out += piece
@@ -2039,7 +2244,7 @@ fn closeOf(r: &Rdr, i: int, hi: int): int {
 
 // The SQL of tokens [lo, hi) of an expression in a binding: v.p its property's definition, VERTEX_ID and EDGE_ID their JSON's
 // text, IS LABELED and IS SOURCE OF / IS DESTINATION OF conditions, a quantified part's aggregate an expression over its copies.
-fn exprSql(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, where: int, group: int, copy: int): Result[str, DbErr] {
+fn exprSql(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, where: int, group: int, copy: int, keep: mut &[]bool): Result[str, DbErr] {
     let r = &gt.r
     var out = ""
     var i = lo
@@ -2055,7 +2260,7 @@ fn exprSql(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, where: int, group: int,
             var d = -1
             for k in 0..len(gt.decls) { if gt.decls[k].name == v { d = k } }
             if d >= 0 && i + 2 < hi && isName(&r.toks[i + 2]) {
-                out += "(" + try propRef(gt, x, b, &v, &canonIn(&r.toks[i + 2], gt.md), where, group, copy) + ") "
+                out += "(" + try propRef(gt, x, b, &v, &canonIn(&r.toks[i + 2], gt.md), where, group, copy, keep) + ") "
                 i += 3
                 continue
             }
@@ -2068,20 +2273,20 @@ fn exprSql(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, where: int, group: int,
         if t.kind == T_IDENT && nx.kind == T_OP && nx.text == "(" {
             let c = closeOf(r, i + 1, hi)
             if t.text == "vertex_id" || t.text == "edge_id" {
-                out += try idSql(gt, x, b, i + 2, c, t.text == "vertex_id", where, group, copy) + " "
+                out += try idSql(gt, x, b, i + 2, c, t.text == "vertex_id", where, group, copy, keep) + " "
                 i = c + 1
                 continue
             }
             if t.text == "json_serialize" && i + 3 < hi && r.toks[i + 2].kind == T_IDENT && (r.toks[i + 2].text == "vertex_id" || r.toks[i + 2].text == "edge_id") {
                 let c2 = closeOf(r, i + 3, hi)
-                out += try idSql(gt, x, b, i + 4, c2, r.toks[i + 2].text == "vertex_id", where, group, copy) + " "
+                out += try idSql(gt, x, b, i + 4, c2, r.toks[i + 2].text == "vertex_id", where, group, copy, keep) + " "
                 i = c + 1
                 continue
             }
             if t.text == "element_number" { return Err(gerr(gt.ora, 49033, "42P10", "ELEMENT_NUMBER can only be used in combination with ONE ROW PER VERTEX or STEP.")) }
             if t.text == "matchnum" { return Err(e("0A000", "lexdb: MATCHNUM() is supported as a COLUMNS item by itself")) }
             if isAggNameIn(&t.text, gt.md) && group < 0 {
-                out += try aggSql(gt, x, b, &t.text, i + 2, c, where) + " "
+                out += try aggSql(gt, x, b, &t.text, i + 2, c, where, keep) + " "
                 i = c + 1
                 continue
             }
@@ -2092,7 +2297,7 @@ fn exprSql(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, where: int, group: int,
             for k in 0..len(gt.decls) { if gt.decls[k].name == v { d = k } }
             if d >= 0 && nx.kind == T_IDENT && nx.text == "is" {
                 var n = 0
-                out += try isSql(gt, x, b, i, hi, where, group, copy, mut &n) + " "
+                out += try isSql(gt, x, b, i, hi, where, group, copy, mut &n, keep) + " "
                 i += n
                 continue
             }
@@ -2109,7 +2314,7 @@ fn exprSql(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, where: int, group: int,
 }
 
 // VERTEX_ID(v) or EDGE_ID(e) (its argument tokens [lo, hi)): JSON text.
-fn idSql(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, vertex: bool, where: int, group: int, copy: int): Result[str, DbErr] {
+fn idSql(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, vertex: bool, where: int, group: int, copy: int, keep: mut &[]bool): Result[str, DbErr] {
     let r = &gt.r
     if hi - lo != 1 || !isName(&r.toks[lo]) { return Err(gerr(gt.ora, 40956, "42601", "invalid property name format")) }
     let v = canonIn(&r.toks[lo], gt.md)
@@ -2120,7 +2325,7 @@ fn idSql(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, vertex: bool, where: int,
     for k in el.keys {
         let ci = colIdx(t, &k)
         let name = shownIn(&t.cols[ci].name, &t.cols[ci].spell, gt.md)
-        let ref = alias(i) + "." + qIn(&k, gt.md)
+        let ref = colRef(b, i, &k, gt.md, keep)
         let kind = t.cols[ci].typ.kind
         let val = if kind == lexdb_sql.K_INT || kind == lexdb_sql.K_NUM || kind == lexdb_sql.K_FLOAT {
             if gt.md == MD_TSQL { "cast(" + ref + " as nvarchar(max))" } else { ref }
@@ -2134,7 +2339,7 @@ fn idSql(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, vertex: bool, where: int,
 }
 
 // v IS [NOT] LABELED l, v IS [NOT] SOURCE OF e, v IS [NOT] DESTINATION OF e (from i): its condition; n the tokens read.
-fn isSql(gt: &GT, x: &Exp, b: &Bind, i: int, hi: int, where: int, group: int, copy: int, n: mut &int): Result[str, DbErr] {
+fn isSql(gt: &GT, x: &Exp, b: &Bind, i: int, hi: int, where: int, group: int, copy: int, n: mut &int, keep: mut &[]bool): Result[str, DbErr] {
     let r = &gt.r
     var k = i + 2
     var neg = false
@@ -2170,7 +2375,7 @@ fn isSql(gt: &GT, x: &Exp, b: &Bind, i: int, hi: int, where: int, group: int, co
             return Ok(if neg { "1 = 1" } else { "1 = 0" })
         }
         var eq: []str = []
-        for j in 0..len(end.cols) { append(mut &eq, alias(ei) + "." + qIn(&end.cols[j], gt.md) + " = " + alias(vi) + "." + qIn(&end.refs[j], gt.md)) }
+        for j in 0..len(end.cols) { append(mut &eq, alias(ei) + "." + qIn(&end.cols[j], gt.md) + " = " + colRef(b, vi, &end.refs[j], gt.md, keep)) }
         let c = "(" + strings.join(&eq, " and ") + ")"
         return Ok(if neg { "not " + c } else { c })
     }
@@ -2179,7 +2384,7 @@ fn isSql(gt: &GT, x: &Exp, b: &Bind, i: int, hi: int, where: int, group: int, co
 
 // An aggregate of COLUMNS over a quantified part's copies (its argument tokens [lo, hi)): COUNT, SUM, MIN, MAX, AVG, LISTAGG/STRING_AGG,
 // each an expression over the copies' values (none at length 0: COUNT 0, the others NULL).
-fn aggSql(gt: &GT, x: &Exp, b: &Bind, f: &str, lo: int, hi: int, where: int): Result[str, DbErr] {
+fn aggSql(gt: &GT, x: &Exp, b: &Bind, f: &str, lo: int, hi: int, where: int, keep: mut &[]bool): Result[str, DbErr] {
     let r = &gt.r
     if where != 0 { return Err(e("0A000", "lexdb: an aggregate of a quantified variable is supported in COLUMNS only")) }
     if lo < hi && r.toks[lo].kind == T_OP && r.toks[lo].text == "*" { return Err(gerr(gt.ora, 49011, "42P10", "A group function inside GRAPH_TABLE() must have a group reference.")) }
@@ -2219,7 +2424,7 @@ fn aggSql(gt: &GT, x: &Exp, b: &Bind, f: &str, lo: int, hi: int, where: int): Re
     if grp < 0 { return Err(gerr(gt.ora, 49011, "42P10", "A group function inside GRAPH_TABLE() must have a group reference.")) }
     let n = x.counts[grp]
     var vals: []str = []
-    for c in 1..n + 1 { append(mut &vals, "(" + try exprSql(gt, x, b, lo, aend, 0, grp, c) + ")") }
+    for c in 1..n + 1 { append(mut &vals, "(" + try exprSql(gt, x, b, lo, aend, 0, grp, c, keep) + ")") }
     if n == 0 { return Ok(if f == "count" { "0" } else { "null" }) }
     if f == "count" {
         var ps: []str = []

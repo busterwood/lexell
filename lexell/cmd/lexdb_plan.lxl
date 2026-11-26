@@ -163,7 +163,7 @@ pub type WayCand = record { pub index: int; pub tree: int; pub unique: bool; pub
 // the levels placed. rows -1: none.
 // cost: as the first table (scanned in batches) or per lookup; inner: read
 // once as a hashed table (row by row, optimizer 36).
-pub type Way = record { pub rows: float; pub cost: float; pub outer: bool; pub inner: float }
+pub type Way = record { pub rows: float; pub cost: float; pub outer: bool; pub inner: float; pub nEqs: int }
 
 // What the statistics say a path reads (optimizer 24): rows, and whether that is an
 // estimate or only a bound (at most rows). rows -1: no figure (no
@@ -312,7 +312,8 @@ pub type PJoin = record {
     // [] none): both sides' keys made its collated values (Q8 R4)
     pub colls: []int
     pub conds: []lexdb_bind.BX  // per candidate row: the join's conditions but those its hash applied
-    pub keq: int                // JH_HASH: the one key's equality among conds (-1 none): left out where the hash compares by value
+    pub keq: int                // JH_HASH: the first key's equality among conds (-1 none): left out where the hash compares by value
+    pub keq2: int               // JH_HASH: the second key's equality among conds (-1 none, JK_INT2)
     pub post: []lexdb_bind.BX   // a LEFT JOIN's WHERE conjuncts, after its NULL rows are made
     pub index: int              // JH_RANGE: the path's index (-1 the primary key)
     pub rng: []PBound           // JH_RANGE: its bounds on the column after the equalities (constants of the run)
@@ -1859,8 +1860,8 @@ fn (q: &Query) constWay(k: int, cands: &[]WayCand, cs: &[]Expr, cols: &[]int): b
 fn (q: &Query) wayInto(k: int, cands: &[]WayCand, mask: int, outer: bool, cs: &[]Expr): Way {
     let lv = &q.levels[k]
     let t = float(lv.est.rows)
-    var best = if outer { Way{rows: -1.0f, cost: 0.0f, outer: true, inner: 0.0f} } else {
-        Way{rows: t, cost: t * COST_SCAN, outer: false, inner: t * COST_SCAN_INNER}
+    var best = if outer { Way{rows: -1.0f, cost: 0.0f, outer: true, inner: 0.0f, nEqs: 0} } else {
+        Way{rows: t, cost: t * COST_SCAN, outer: false, inner: t * COST_SCAN_INNER, nEqs: 0}
     }
     for ci in 0..len(cands) {
         let wc = &cands[ci]
@@ -1904,7 +1905,7 @@ fn (q: &Query) wayInto(k: int, cands: &[]WayCand, mask: int, outer: bool, cs: &[
         let perRow = if point || (wc.index >= 0 && outer) { COST_KEY_ROW } else if wc.index >= 0 { COST_IX_ROW } else if outer { COST_SCAN_INNER } else { COST_PK_RANGE }
         let cost = COST_DESCENT + m * perRow
         let inner = COST_DESCENT + m * (if wc.index >= 0 || point { COST_KEY_ROW } else { COST_SCAN_INNER })
-        if best.rows < 0.0f || cost < best.cost { best = Way{rows: m, cost: cost, outer: outer, inner: fmin(inner, best.inner)} }
+        if best.rows < 0.0f || cost < best.cost { best = Way{rows: m, cost: cost, outer: outer, inner: fmin(inner, best.inner), nEqs: n} }
         else if !outer && inner < best.inner { best.inner = inner }
     }
     return best
@@ -2338,9 +2339,13 @@ fn (q: &Query) nBest(init: &[]int, nl: int, cands: &[][]WayCand, owns: &[][]Expr
 fn (q: &Query) joinStep(k: int, cands: &[]WayCand, own: &[]Expr, base: &Way, mask: int, rin: float, rnext: float, lookups: bool,
                         cap: float, hashed: mut &bool): float {
     let out = rnext * ROW_COST
-    var add = base.inner + base.rows * HASH_BUILD + rin * HASH_PROBE + out
-    hashed = true
     let w = q.wayInto(k, cands, mask, true, own)
+    var add = if w.rows >= 0.0f && w.nEqs >= 2 {
+        base.cost + base.rows * 6.0f + rin * HASH_PROBE + out
+    } else {
+        base.inner + base.rows * HASH_BUILD + rin * HASH_PROBE + out
+    }
+    hashed = true
     if w.rows >= 0.0f {
         let big = base.rows * float(estRowBytes(&q.levels[k].t)) > cap
         if lookups || big || rin * w.cost + out < add {
@@ -2355,11 +2360,16 @@ fn (q: &Query) joinStep(k: int, cands: &[]WayCand, own: &[]Expr, base: &Way, mas
 // quarter of the default statement memory (MAX_STATEMENT_MEM); less when
 // the session's max_statement_mem is lower (half of it).
 
-// A row's size in a hash, estimated as rowBytes counts a row held: 32
-// bytes, 24 a value, and a text's bytes (32 taken as its length).
+// A row's size in a columnar batch hash: header plus fixed-width (9 B),
+// value-boxed (24 B) or text (40 B) columns.
 fn estRowBytes(t: &Table): int {
-    var n = 32
-    for c in t.cols { n += 24 + (if c.typ.kind == lexdb_sql.K_TEXT { 32 } else { 0 }) }
+    var n = 12
+    for c in t.cols {
+        let k = c.typ.kind
+        if k == lexdb_sql.K_TEXT { n += 40 }
+        else if k == lexdb_sql.K_NUM || k == lexdb_sql.K_UUID || k == lexdb_sql.K_BYTEA { n += 24 }
+        else { n += 9 }
+    }
     return n
 }
 
@@ -2559,7 +2569,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
         let w = q.wayInto(k, &cands[k], 0, false, &own)
         let t = float(q.levels[k].est.rows)
         var g = false
-        append(mut &base, Way{rows: fmax(t * q.localShare(k, &own, &ownMasks, mut &g), 1.0f), cost: w.cost, outer: false, inner: w.inner})
+        append(mut &base, Way{rows: fmax(t * q.localShare(k, &own, &ownMasks, mut &g), 1.0f), cost: w.cost, outer: false, inner: w.inner, nEqs: w.nEqs})
         append(mut &guessed, g)
         append(mut &owns, own)
     }
@@ -5226,7 +5236,7 @@ fn (q: &Query) orderRows(): []float {
         }
         let t = float(q.levels[k].est.rows)
         var g = false
-        append(mut &base, Way{rows: fmax(t * q.localShare(k, &own, &ownMasks, mut &g), 1.0f), cost: 0.0f, outer: false, inner: 0.0f})
+        append(mut &base, Way{rows: fmax(t * q.localShare(k, &own, &ownMasks, mut &g), 1.0f), cost: 0.0f, outer: false, inner: 0.0f, nEqs: 0})
     }
     var cmask: []int = []
     var cdist: []float = []
@@ -7879,7 +7889,7 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
         let t = &lv.t
         var j = PJoin{how: JH_HASH, kind: if inner { lexdb_sql.J_INNER } else { lv.join }, mark: MK_JOIN, resCol: -1, res: [],
                                  scan: joinScan(q, k),
-                                 build: [], hcols: [], keys: [], ktypes: [], exact: true, colls: [], conds: [], keq: -1, post: [], index: lv.path.index,
+                                 build: [], hcols: [], keys: [], ktypes: [], exact: true, colls: [], conds: [], keq: -1, keq2: -1, post: [], index: lv.path.index,
                                  rng: [], capNulls: false, noNulls: lv.path.noNulls, sub: []}
         j.mark = mark
         if !lv.perRow {
@@ -7944,7 +7954,11 @@ pub fn joinsOver(q: &Query, base: PPlan): Result[PPlan, PPlan] {
                 // (a semi join's and a RIGHT JOIN's: every one, none applied as read)
                 if !rj && !lv.semi && q.minLevel(&x) >= k { continue }
                 if applied(q, &x) { continue }
-                if len(lv.hashCols) == 1 && isKeyEq(&x, q, lv) { j.keq = len(j.conds) }
+                if len(lv.hashCols) == 1 && isKeyEqAt(&x, q, lv, 0) { j.keq = len(j.conds) }
+                if len(lv.hashCols) == 2 {
+                    if isKeyEqAt(&x, q, lv, 0) { j.keq = len(j.conds) }
+                    else if isKeyEqAt(&x, q, lv, 1) { j.keq2 = len(j.conds) }
+                }
                 match planX(&x, q) {
                     Some(b) { append(mut &j.conds, b) }
                     None {
@@ -8155,7 +8169,7 @@ fn grpArm(q: &Query, g: int): Option[PJoin] {
     if g + q.levels[g].grp >= len(q.levels) || !grpPlain(q, g) { return None }
     let hub = &q.levels[g]
     var j = PJoin{how: JH_JOIN, kind: lexdb_sql.J_INNER, mark: MK_JOIN, resCol: -1, res: [], scan: noScan(), build: [], hcols: [], keys: [],
-                  ktypes: [], exact: true, colls: [], conds: [], keq: -1, post: [], index: -1, rng: [], capNulls: false, noNulls: false, sub: []}
+                  ktypes: [], exact: true, colls: [], conds: [], keq: -1, keq2: -1, post: [], index: -1, rng: [], capNulls: false, noNulls: false, sub: []}
     j.scan.level = g
     var hb: []BX = []
     for x in hub.local {
@@ -8170,7 +8184,7 @@ fn grpArm(q: &Query, g: int): Option[PJoin] {
     for l in g..grpEnd(q, g) + 1 {
         let lv = &q.levels[l]
         var m = PJoin{how: JH_HASH, kind: lexdb_sql.J_INNER, mark: MK_JOIN, resCol: -1, res: [], scan: joinScan(q, l), build: [], hcols: [], keys: [],
-                      ktypes: [], exact: true, colls: [], conds: [], keq: -1, post: [], index: lv.path.index, rng: [], capNulls: false, noNulls: lv.path.noNulls, sub: []}
+                      ktypes: [], exact: true, colls: [], conds: [], keq: -1, keq2: -1, post: [], index: lv.path.index, rng: [], capNulls: false, noNulls: lv.path.noNulls, sub: []}
         var mkey = -1
         for x in lv.cond {
             let lo = q.minLevel(&x)
@@ -9268,19 +9282,19 @@ fn bConst(x: &Expr): bool {
     }
 }
 
-// Whether x is the equality of level lv's one hash column with its value
-// (hashVals[0]): col = x or x = col, under no collation.
-fn isKeyEq(x: &Expr, q: &Query, lv: &Level): bool {
+// Whether x is the equality of level lv's i-th hash column with its value
+// (hashVals[i]): col = x or x = col, under no collation.
+fn isKeyEqAt(x: &Expr, q: &Query, lv: &Level, i: int): bool {
     match x {
         Expr.Bin(op, a, b) {
             if op != "=" { return false }
-            let want = lv.first + lv.hashCols[0]
+            let want = lv.first + lv.hashCols[i]
             match a {
-                Expr.Col(n, sl) { if lexdb_bind.colSlot(&q.cols, &n, sl) == want && sameExpr(&b, &lv.hashVals[0]) { return true } }
+                Expr.Col(n, sl) { if lexdb_bind.colSlot(&q.cols, &n, sl) == want && sameExpr(&b, &lv.hashVals[i]) { return true } }
                 else {}
             }
             match b {
-                Expr.Col(n, sl) { if lexdb_bind.colSlot(&q.cols, &n, sl) == want && sameExpr(&a, &lv.hashVals[0]) { return true } }
+                Expr.Col(n, sl) { if lexdb_bind.colSlot(&q.cols, &n, sl) == want && sameExpr(&a, &lv.hashVals[i]) { return true } }
                 else {}
             }
             return false
@@ -9813,7 +9827,7 @@ fn latArm(q: &Query, k: int): Option[PJoin] {
         return None
     }
     var j = PJoin{how: JH_APPLY, kind: if inner { lexdb_sql.J_INNER } else { lexdb_sql.J_LEFT }, mark: MK_JOIN, resCol: -1, res: [],
-                  scan: joinScan(q, k), build: [], hcols: [], keys: [], ktypes: [], exact: true, colls: [], conds: [], keq: -1, post: [],
+                  scan: joinScan(q, k), build: [], hcols: [], keys: [], ktypes: [], exact: true, colls: [], conds: [], keq: -1, keq2: -1, post: [],
                   index: -1, rng: [], capNulls: false, noNulls: false, sub: []}
     for x in q.subs[lv.src].sel.q.refs { colsRead(&x, &q.cols, mut &j.hcols) }
     for x in lv.cond {
