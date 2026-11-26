@@ -3,8 +3,9 @@
 lexdb is a SQL database server on disk, written in Lexell, that serves the same data through three doors: the
 PostgreSQL protocol with PostgreSQL's SQL, SQL Server's TDS with T-SQL, and Oracle's TNS with Oracle SQL and PL/SQL.
 
-These pages are for people who run lexdb and write programs against it. The design and its measurements are in
-[design/lexdb.md](../../design/lexdb.md) and the other `design/lexdb-*.md` notes.
+These pages are for people who run lexdb and write programs against it. For a high-level introduction and feature
+showcase, start with [LEXDB.md](../../../LEXDB.md). The storage internals and historical benchmark log are in
+[design/lexdb.md](../../design/lexdb.md) and [design/lexdb-benchmarks.md](../../design/lexdb-benchmarks.md).
 
 ## Guide
 
@@ -12,6 +13,7 @@ These pages are for people who run lexdb and write programs against it. The desi
 |---|---|
 | [Overview](overview.md) | The idea: one engine, three doors; the store; transactions; replicas; what lexdb is not. |
 | [Quick start](quickstart.md) | Build, start with all three doors, use one table from each. |
+| [Performance](performance.md) | Full TPC-H, ClickBench, analytic, OLTP (`pgbench`/`sysbench`), materialized view, skipping index, and bulk load benchmarks against PostgreSQL 18. |
 | [Server options](server-options.md) | Every command-line option and environment variable, with defaults. |
 | [Read replicas](replicas.md) | Replicas, routing per door, read-your-writes with `WAIT FOR LSN`. |
 | [Architecture](architecture.md) | The files, commits, checkpoints and recovery, from a user's point of view. |

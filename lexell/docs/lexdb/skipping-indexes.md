@@ -175,7 +175,7 @@ CREATE SKIPPING INDEX ix_logs_msg_tok ON app_logs (message) USING tokenbf(2048, 
 
 ## Measured impact
 
-On the ClickBench 1M benchmark ([PERFORMANCE.md](../../../PERFORMANCE.md#clickbench-1m-rows)), adding three skipping
+On the ClickBench 1M benchmark ([LexDB performance report](performance.md#clickbench-1m-rows)), adding three skipping
 indexes on the 105-column `hits` table (`bloom_filter` on `UserID`, `ngrambf(3, 2048, 3)` on `URL` and `Title`)
 accelerates selective point and substring-`LIKE` queries with exact output parity and zero OLTP write regression:
 

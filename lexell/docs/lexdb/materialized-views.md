@@ -93,7 +93,7 @@ just as you would on a regular table.
 
 ## How big is the impact?
 
-All figures below are single-core measurements from [PERFORMANCE.md](../../../PERFORMANCE.md):
+All figures below are single-core measurements from the [LexDB performance report](performance.md):
 
 | Benchmark | Without MVs | With MVs (unmodified queries) | Incremental write cost |
 |---|---:|---:|---|

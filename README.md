@@ -169,7 +169,7 @@ One server speaks **three native wire protocols and SQL dialects simultaneously*
 - **Hybrid OLTP + columnar analytics.** Tables pack into columnar leaves and execute through vectorized batch operators, adaptive two-level hash aggregation, and a cost-based optimizer — supporting joins, window functions, CTEs, subqueries, and full ACID transactions on the same data.
 - **Incremental [materialized views & transparent query rewrite](lexell/docs/lexdb/materialized-views.md).** Views stay current automatically in under a millisecond (`FAST` incremental updates), support contention-free real-time delta merging for hot keys, cascading rollup DAGs, and composable HyperLogLog++ / t-digest sketches, and transparently accelerate unmodified base-table queries with zero application changes.
 - **Automatic zone maps & [data skipping indexes](lexell/docs/lexdb/skipping-indexes.md).** Always-on hierarchical min/max pruning (including dynamic Top-N) plus optional `minmax`/`brin`, `set`, `bloom_filter`, `ngrambf`, and `tokenbf` skipping indexes cut selective point and `LIKE '%substring%'` filters by up to **4.1×** with tiny storage overhead and zero write slowdown.
-- **Complete relational feature set across all three doors.** Secondary B+tree indexes, foreign keys, views, stored procedures and triggers, cross-door [`CREATE ASSERTION`](lexell/docs/lexdb/assertions.md) invariants, roles and privileges, and fast native bulk loading (`COPY`, `bcp`/`SqlBulkCopy`, Oracle array DML).
+- **Complete relational feature set across all three doors.** Secondary B+tree indexes, foreign keys, views, stored procedures and functions, cross-door [`CREATE ASSERTION`](lexell/docs/lexdb/assertions.md) invariants, roles and privileges, and fast native bulk loading (`COPY`, `bcp`/`SqlBulkCopy`, Oracle array DML).
 
 ### Performance against PostgreSQL 18
 
@@ -184,9 +184,9 @@ One server speaks **three native wire protocols and SQL dialects simultaneously*
 | **Bulk `\copy` loads** (5 cases, 1M–10M rows) | 0.24–2.44 s | 0.61–5.93 s | **1.1–2.7× faster** on all 5 workloads |
 | **Materialized view maintenance** (1M rows, 1-row insert) | **0.43–0.66 ms** (`FAST`) | 60–369 ms (`REFRESH`) | **90–780× faster** incremental updates |
 
-PostgreSQL is ahead on single-process multi-thread reads and multi-statement read-write blocks. See the [performance report](PERFORMANCE.md#lexdb) for query-by-query numbers, caveats, and reproduction steps.
+PostgreSQL is ahead on single-process multi-thread reads and multi-statement read-write blocks.
 
-Start with the [LexDB documentation](lexell/docs/lexdb/README.md) (quickstart, guides, and SQL references for PostgreSQL, SQL Server, and Oracle), or see the [program notes](lexell/cmd/README.md#lexdb) and [design](lexell/design/lexdb.md).
+Read **[LEXDB.md](LEXDB.md)** for the full introduction (architecture, scaling with read replicas, materialized views, skipping indexes, and quick start), the **[LexDB performance report](lexell/docs/lexdb/performance.md)** for query-by-query numbers, or browse the [LexDB documentation](lexell/docs/lexdb/README.md) and [internals](lexell/design/lexdb.md).
 
 ## Why I built Lexell
 
@@ -220,8 +220,8 @@ See the [database streaming design](lexell/design/db-streaming.md) for an exampl
 | [Programs and examples](lexell/cmd/README.md) | How to build and run the programs, with supported behaviour and test instructions. |
 | [Database streaming](lexell/design/db-streaming.md) | How typed row mapping and bounded batches work. |
 | [Concurrency](lexell/design/concurrency.md) | Tasks, the event loop and worker processes. |
-| [LexDB documentation](lexell/docs/lexdb/README.md) and [design](lexell/design/lexdb.md) | User guide, materialized views, skipping indexes, SQL references for all three doors, and internals. |
-| [Performance](PERFORMANCE.md) and [native versus C](lexell/design/native-vs-c.md) | Measurements, caveats and the two backends. |
+| [LexDB](LEXDB.md), [documentation](lexell/docs/lexdb/README.md), and [performance](lexell/docs/lexdb/performance.md) | Introduction, shared-nothing design, benchmarks, materialized views, skipping indexes, and SQL references for all three doors. |
+| [Lexell performance](PERFORMANCE.md) and [native versus C](lexell/design/native-vs-c.md) | Language, library, HTTP server, and CLI measurements, caveats, and the two backends. |
 | [Repository guide](lexell/README.md) and [project history](HISTORY.md) | The source tree, test suites and how the project evolved. |
 
 ## Status and feedback
