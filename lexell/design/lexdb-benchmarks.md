@@ -6,26 +6,26 @@ run, newest first. Each run's detail (plans, profiles, what changed) stays
 in the design note it came from, linked from its row. When a suite is run
 again, add its row to section 4 and update section 1.
 
-## 1. Now (2026-11-25)
+## 1. Now (2026-11-26)
 
-**Refresh at `5d93ced1` (main, after Materialized Views Stages 1–4 across PostgreSQL, Oracle, and SQL Server),
-pinned (section 2), boost off for TPC-H, ClickBench, sysbench, and dedicated MV suites;
-results in `~/Work/lexdb-bench/saved/results/2026-11-25-mview/`.**
+**Full LexDB refresh at `59797d55` (main, after hierarchical data skipping indexes, adaptive two-level hash aggregation,
+and dictionary/string/regex execution), pinned (section 2), boost off for TPC-H, ClickBench, sysbench, and dedicated MV suites;
+results in `~/Work/lexdb-bench/saved/results/2026-11-26-refresh-59797d55/` and `2026-11-26-item3/`.**
 
-| | 2026-11-23 | 2026-11-25 (`5d93ced1`) | PostgreSQL 18 |
+| | 2026-11-25 (`5d93ced1`) | 2026-11-26 (`59797d55`) | PostgreSQL 18 |
 |---|---:|---:|---:|
-| point selects, 1 / 8 / 32 clients (1 process) | 92,300 / 164,800 / 160,100/s | **98,794 / 188,196 / 180,704/s** | 81,548 / 440,141 / 407,971/s |
-| point selects, 3 replicas, 1 / 8 / 32 clients | 91,000 / 363,000-368,000 / 434,000-439,000/s | 97,924–98,622 / 349,157–392,047 / **499,549–503,649/s** | (4 cores: above) |
-| updates, 1 / 8 / 32 clients | 3,654 / 16,400 / 42,300/s | **4,079 / 18,296 / 67,022/s** | 1,627 / 6,743 / 25,923/s |
-| mixed: replica selects / master updates | 347,600-349,600 / 15,100-15,300/s | **408,392–415,567 / 16,052–16,404/s** | |
-| commit latency p50 / p99 / p99.9 / max (8 clients) | 0.44 / 1.35-1.40 / 3.84-3.86 / 8.4-9.9 ms | **0.41 / 0.81–0.83 / 3.65–3.79 / 8.07–8.23 ms** | |
-| replica lag under the mixed load, p50 / p99 | 0.24-0.26 / 0.49-0.55 ms | **0.21–0.23 / 0.48 ms** | |
-| 35 analytic queries, lexdb CPU / PG 1c, wall / PG 4p | 0.54 / 1.04 | **0.48 / 0.95** (with 4 MVs: **0.30 vs PG1 / 0.49 vs PG4**) | |
-| TPC-H SF1, summed (boost off) | 8,943 ms | **7,437 ms** (geomean 0.51 vs PG1, 0.82 vs PG4; 22/22) | 14,670 one core / 8,839 four processes |
-| ClickBench 1M, summed (boost off) | — | **14,104 ms** (geomean 0.68 vs PG1, 40/43; with 8 MVs: **9,068 ms**, ahead of PG4, geomean **0.10 / 0.21**) | 22,363 one core / 11,326 four processes |
-| COPY narrow / wide / wide + 2 indexes / no key / 10M narrow | 0.46 / 1.44 / 6.31 / 2.98 / 4.85 s | **0.24 / 1.04 / 1.80 / 1.05 / 2.44 s** | 0.64 / 1.92 / 4.93 / 1.54 / 5.78 s |
-| COPY peak RSS, wide / wide + 2 indexes / 10M narrow | 764 / 1,680 / 3,256 MB | **619 / 1,330 / 2,870 MB** | |
-| MV `FAST` update (1M rows, 1 row: grp / sketch / 3-level DAG) | — | **0.72 / 0.48 / 0.50 ms** (sketch build **224** vs PG 372 ms) | 147.4 / 363.6 / 141.5 ms (1c); 60.3 / 363.9 / 142.0 ms (4p) |
+| point selects, 1 / 8 / 32 clients (1 process) | 98,794 / 188,196 / 180,704/s | **90,358 / 168,897 / 162,732/s** | 74,476 / 427,460 / 397,465/s |
+| point selects, 3 replicas, 1 / 8 / 32 clients | 97,924–98,622 / 349,157–392,047 / 499,549–503,649/s | 95,628–97,255 / 323,686–345,622 / **470,054–490,451/s** | (4 cores: above) |
+| updates, 1 / 8 / 32 clients | 4,079 / 18,296 / 67,022/s | **3,943 / 17,811 / 63,304/s** | 1,637 / 6,668 / 25,673/s |
+| mixed: replica selects / master updates | 408,392–415,567 / 16,052–16,404/s | **368,138–402,845 / 15,479–16,088/s** | |
+| commit latency p50 / p99 / p99.9 / max (8 clients) | 0.41 / 0.81–0.83 / 3.65–3.79 / 8.07–8.23 ms | **0.42 / 0.86–0.89 / 3.86–3.92 / 8.24–10.25 ms** | |
+| replica lag under the mixed load, p50 / p99 | 0.21–0.23 / 0.48 ms | **0.22–0.23 / 0.41–0.44 ms** | |
+| 35 analytic queries, lexdb CPU / PG 1c, wall / PG 4p | 0.48 / 0.95 (with 4 MVs: 0.30 / 0.49) | **0.46 / 0.91** (with 4 MVs: **0.31 vs PG1 / 0.49 vs PG4**) | |
+| TPC-H SF1, summed (boost off) | 7,115 ms | **7,197 ms** (geomean 0.49 vs PG1, 0.79 vs PG4; 22/22) | 14,670 one core / 8,839 four processes |
+| ClickBench 1M, summed (boost off) | 19,337 ms | **14,104 ms** (geomean 0.68 vs PG1, 40/43; with 8 MVs: **9,068 ms**, ahead of PG4, geomean **0.10 / 0.21**) | 22,363 one core / 11,326 four processes |
+| COPY narrow / wide / wide + 2 indexes / no key / 10M narrow | 0.24 / 1.04 / 1.80 / 1.05 / 2.44 s | **0.24 / 1.07 / 1.79 / 1.32 / 2.44 s** | 0.61 / 2.00 / 4.90 / 1.41 / 5.93 s |
+| COPY peak RSS, wide / wide + 2 indexes / 10M narrow | 619 / 1,330 / 2,870 MB | **621 / 1,331 / 2,873 MB** | |
+| MV `FAST` update (1M rows, 1 row: grp / sketch / 3-level DAG) | 0.72 / 0.48 / 0.50 ms (sketch build 224 vs PG 372 ms) | **0.66 / 0.47 / 0.43 ms** (sketch build **220** vs PG 379 ms) | 144.4 / 368.6 / 136.2 ms (1c); 59.7 / 363.2 / 136.1 ms (4p) |
 
 ### 1.0a The 2026-11-23 refresh
 
@@ -499,6 +499,7 @@ below 1 for times.
 
 | date | lexdb | suite | headline | detail |
 |---|---|---|---|---|
+| 2026-11-26 | 59797d55 (full LexDB refresh) | TPC-H SF1, 35 Analytic (+ 4 MVs), COPY, sysbench 1M, pgbench/replicas/commitlat, Dedicated MVs | Full LexDB refresh unifying all suites on `59797d55`: TPC-H SF1 **7,197 ms** (geomean **0.49** vs PG1, **0.45** CPU, **0.79** vs PG4; 22/22); 35 analytic CPU **0.46** vs PG1 / wall **0.91** vs PG4 (`sort_lim` 19 → **6 ms**, `grp_int` 29 → **24 ms**, `grp_text` 53 → **40 ms** [0.93× PG4]; with 4 MVs **0.31 / 0.49**, 9 rewritten to 3–4 ms, 4.40/7.09/25.90 ms live inserts); dedicated MVs build **65.4 / 220.0 / 39.9 ms**, `FAST` 1-row **0.66 / 0.47 / 0.43 ms** vs PG 60–369 ms, `realtime` 16-writer 22.1k/s (0 err, 1.40 ms OQC read); COPY 0.24 / 1.07 / 1.79 / 1.32 / 2.44 s (0.37–0.94× PG); pgbench 3-rep 470–490k/s (1.18–1.23× PG), updates 2.41–2.67× (63.3k/s), lag p99 0.41–0.44 ms, commit p99 0.86–0.89 ms; sysbench 1t leads all 6 workloads (1.09–2.81×), index updates 27.7k/s (1.32×), non-index updates 54.2k/s (2.36×) | this page, 1; PERFORMANCE.md |
 | 2026-11-26 | 59797d55 (dict/string/regex exec) | ClickBench 1M (43 queries + 8 MVs, boost off, pinned) | Reusable `regex.Searcher` (`submatchIndexWith`) + zero-copy `reReplaceSliceWith` + vectorized memoized `REGEXP_REPLACE` `GROUP BY` (`StrGidMemo`) + vectorized UTF-8 `length()` (`BNode.StrLen`) + `SUM(col +/- const)` per-batch column cache + zero-copy `C_ANY` row slicing (`anyRowAt`) + `lz.kern`-before-`lz.raw` filter order + `C_DICT` word dedup: ClickBench 1M MV-free sum **14,104 ms** vs 22,363 ms PG1 (**0.63**, geomean **0.68** wall / **0.64** CPU, **40/43** level or ahead, **1.25×** vs PG4; `q28` 2,829 → **1,015.2 ms** [0.25× PG1, 0.96× PG4], `q29` 757 → **180.2 ms** [0.21× PG1, 0.54× PG4], `q27` 492 → **395.6 ms**, `q36` 533 → **478.9 ms**); ClickBench + 8 MVs sum **9,068 ms** (**0.80× PG4 — 2.26 s faster than 4-core PostgreSQL on one core!** geomean **0.10 vs PG1 / 0.21 vs PG4**, **29/43** vs PG4; live `FAST` 1/100-row insert 6.51/10.34 ms) | PERFORMANCE.md |
 | 2026-11-26 | e59eecc2 (skip-index + two-level agg) | ClickBench 1M (43 queries + 8 MVs + skipping indexes) & TPC-H SF1 (22 queries, boost off, pinned) | Hierarchical B+tree data skipping indexes (`minmax`/`set`/`bloom_filter`/`ngrambf`/`tokenbf` + auto `T_CLEAF` zone maps) + adaptive two-level hash aggregation (`lexdb_ht`), bump-arena string keys, zero-copy `fv` elision, direct Top-N integer group pruning, vectorized `EXTRACT(minute|hour)` / `CASE` text keys, and zero-overhead `scanLeavesSkip`: ClickBench 1M MV-free sum **17,059 ms** vs 22,363 ms PG1 (**0.76**, geomean **0.75** wall / **0.70** CPU, **40/43** level or ahead; `q32` 1,522 → 412.8 ms, `q18` 914 → 456.4 ms, `q33` 623 → 433.9 ms, `q34` 734 → 432.5 ms, `q36` 614 → 532.6 ms, `q39` 858 → 672.1 ms); ClickBench + 8 MVs sum **11,799 ms** (geomean **0.10 vs PG1 / 0.23 vs PG4**, 27/43 vs PG4; live `FAST` 1/100-row insert 5.57/10.30 ms); explicit skipping indexes on `hits` (`q19` 173 → 42.6 ms 4.07×, `q21` 340 → 167.7 ms 2.03×, `q23` 332 → 168.7 ms 1.97×, `q22` 620 → 485.4 ms 1.28×; OLTP 0% regression); TPC-H SF1 **7,437 ms** (geomean 0.51 vs PG1 / 0.82 vs PG4, 22/22) | PERFORMANCE.md |
 | 2026-11-26 | 2db23d5b (MV rewrite v2) | ClickBench 1M + 8 general-purpose MVs (boost off, pinned) | Derived `GROUP BY` + range/`IN`/`IS NOT NULL` subsumption + join-back + `VAR_*`/`STDDEV_*` rollups + exact `COUNT/SUM/AVG(DISTINCT)` rewrite + hashed oversized (`>512B`) `MV_GK` + functionally dependent exact-grain `GROUP BY`: 21 of 43 unmodified ClickBench queries transparently rewritten (sum 13,558 ms vs 19,337 ms MV-free / 22,363 ms PG1; geomean **0.11 vs PG1 / 0.24 vs PG4**; `q4`/`q8`/`q9` 5.3–11.3 ms, `q10`/`q11` 0.74–0.83 ms, `q33`/`q34` 34.8 ms, `q35` 4.26 ms; live `FAST` 1/100-row insert across all 8 MVs 7.32/10.72 ms) | PERFORMANCE.md |
