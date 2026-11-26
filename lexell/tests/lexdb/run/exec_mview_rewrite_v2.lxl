@@ -14,7 +14,9 @@
 // expect: rw_oqc_v2: ok|0|ok|0
 // expect: rw_dml_v2: 0|0|0
 // expect: rw_row_vs_batch: 0|0|0
-// expect: reopen_v2_ok: ok|0|ok|0
+// expect: rw_count_distinct: ok|0|ok|0|ok|0|ok|0|ok|0|0
+// expect: rw_wide_key: ok|0|ok|0|ok|0|0|0
+// expect: reopen_v2_ok: ok|0|ok|0|ok|0|0
 import "strings"
 import "../../../cmd/lexdb_base"
 import "../../../cmd/lexdb_store"
@@ -128,7 +130,13 @@ fn runTest(st: lexdb_store.Store, reopen: bool): int {
         let q2 = "SELECT region, VAR_POP(amount), STDDEV_SAMP(amount) FROM stat_t GROUP BY region ORDER BY region"
         let h2 = if explainHas(mut &s, q2, "mv_stat") { "ok" } else { "no" }
         let m2 = rwMatch(mut &s, q2)
-        println("reopen_v2_ok: " + h1 + "|" + m1.toStr() + "|" + h2 + "|" + m2.toStr())
+        // Verify oversized (>512-byte) hashed MV_GK persists across reopen AND supports live DML after reopen!
+        let _wIns = q(mut &s, "INSERT INTO web_hits VALUES (99, repeat('https://example.com/path/', 80) || 'a', 5)")
+        let q3 = "SELECT 1, url, count(*), sum(hits) FROM web_hits GROUP BY 1, url ORDER BY url"
+        let h3 = if explainHas(mut &s, q3, "mv_wide_url") { "ok" } else { "no" }
+        let m3 = rwMatch(mut &s, q3)
+        let m4 = rwMatch(mut &s, "SELECT count(distinct url) FROM web_hits")
+        println("reopen_v2_ok: " + h1 + "|" + m1.toStr() + "|" + h2 + "|" + m2.toStr() + "|" + h3 + "|" + m3.toStr() + "|" + m4.toStr())
         return 0
     }
 
@@ -279,6 +287,60 @@ fn runTest(st: lexdb_store.Store, reopen: bool): int {
     let rb3 = rwMatch(mut &s, oqQ2)
     let _bon = q(mut &s, "SET lexdb_batch = on")
     println("rw_row_vs_batch: " + rb1.toStr() + "|" + rb2.toStr() + "|" + rb3.toStr())
+
+    // ---- 8. Exact COUNT(DISTINCT) / SUM(DISTINCT) / AVG(DISTINCT) query rewrite!
+    let _cd0 = q(mut &s, "CREATE TABLE cd_t (id int PRIMARY KEY, region text, store_id int, cust_id int, amt int)")
+    let _cd1 = q(mut &s, "INSERT INTO cd_t VALUES (1,'US',1,101,10),(2,'US',1,101,20),(3,'US',1,102,30),(4,'US',2,102,40),(5,'US',2,103,50),(6,'EU',3,201,60),(7,'EU',3,NULL,70),(8,'EU',4,NULL,80)")
+    let _cdMv1 = q(mut &s, "CREATE MATERIALIZED VIEW mv_cd_u WITH (refresh = 'fast_on_statement', query_rewrite = true) AS SELECT cust_id, count(*) AS c FROM cd_t GROUP BY cust_id")
+    let _cdMv2 = q(mut &s, "CREATE MATERIALIZED VIEW mv_cd_rsu WITH (refresh = 'fast_on_statement', query_rewrite = true) AS SELECT region, store_id, cust_id, count(*) AS c, sum(amt) AS s FROM cd_t GROUP BY region, store_id, cust_id")
+    // Global COUNT(DISTINCT cust_id) -> rewrites onto mv_cd_u as COUNT(cust_id) (skips NULL!)
+    let cdQ1 = "SELECT COUNT(DISTINCT cust_id) FROM cd_t"
+    let cd1h = if explainHas(mut &s, cdQ1, "mv_cd_u") { "ok" } else { "no" }
+    let cd1m = rwMatch(mut &s, cdQ1)
+    // Finer-grain MV (region, store_id, cust_id) serving COUNT/SUM/AVG(DISTINCT cust_id) + SUM(amt) per region!
+    let cdQ2 = "SELECT region, COUNT(DISTINCT cust_id), SUM(DISTINCT cust_id), AVG(DISTINCT cust_id), SUM(amt), COUNT(*) FROM cd_t GROUP BY region ORDER BY region"
+    let cd2h = if explainHas(mut &s, cdQ2, "mv_cd_rsu") { "ok" } else { "no" }
+    let cd2m = rwMatch(mut &s, cdQ2)
+    // Grouped COUNT(DISTINCT cust_id) per (region, store_id) -> simplifies to COUNT(cust_id)!
+    let cdQ3 = "SELECT region, store_id, COUNT(DISTINCT cust_id) FROM cd_t GROUP BY region, store_id ORDER BY region, store_id"
+    let cd3h = if explainHas(mut &s, cdQ3, "mv_cd_rsu") { "ok" } else { "no" }
+    let cd3m = rwMatch(mut &s, cdQ3)
+    // Filtered COUNT(DISTINCT cust_id) FILTER (WHERE store_id >= 2)
+    let cdQ4 = "SELECT region, COUNT(DISTINCT cust_id) FILTER (WHERE store_id >= 2) FROM cd_t GROUP BY region ORDER BY region"
+    let cd4h = if explainHas(mut &s, cdQ4, "mv_cd_rsu") { "ok" } else { "no" }
+    let cd4m = rwMatch(mut &s, cdQ4)
+    // Exact-grain COUNT(DISTINCT cust_id) (CASE WHEN cust_id IS NOT NULL THEN 1 ELSE 0 END)
+    let cdQ5 = "SELECT region, store_id, cust_id, COUNT(DISTINCT cust_id) FROM cd_t GROUP BY region, store_id, cust_id ORDER BY region, store_id, cust_id"
+    let cd5h = if explainHas(mut &s, cdQ5, "mv_cd_rsu") { "ok" } else { "no" }
+    let cd5m = rwMatch(mut &s, cdQ5)
+    // 0 matching rows -> returns 0!
+    let cd6m = rwMatch(mut &s, "SELECT COUNT(DISTINCT cust_id) FROM cd_t WHERE region = 'NONE'")
+    println("rw_count_distinct: " + cd1h + "|" + cd1m.toStr() + "|" + cd2h + "|" + cd2m.toStr() + "|" + cd3h + "|" + cd3m.toStr() + "|" + cd4h + "|" + cd4m.toStr() + "|" + cd5h + "|" + cd5m.toStr() + "|" + cd6m.toStr())
+
+    // ---- 9. Oversized (> 512-byte) MV group keys (2,000-byte URLs: build, FAST DML, OQC fold, rewrite, reopen!)
+    let _wh0 = q(mut &s, "CREATE TABLE web_hits (id int PRIMARY KEY, url text, hits int)")
+    let _wh1 = q(mut &s, "INSERT INTO web_hits VALUES (1, repeat('https://example.com/path/', 80) || 'a', 10), (2, repeat('https://example.com/path/', 80) || 'a', 20), (3, repeat('https://example.com/path/', 80) || 'b', 30), (4, 'short', 5)")
+    let _whMv = q(mut &s, "CREATE MATERIALIZED VIEW mv_wide_url WITH (refresh = 'fast_on_statement', query_rewrite = true) AS SELECT url, count(*) AS c, sum(hits) AS tot FROM web_hits GROUP BY url")
+    let _whRt = q(mut &s, "CREATE MATERIALIZED VIEW mv_wide_rt WITH (refresh = 'realtime') AS SELECT url, count(*) AS c, sum(hits) AS tot FROM web_hits GROUP BY url")
+    // Live DML on 2,000-byte keys sharing their first 1,999 bytes!
+    let _whD1 = q(mut &s, "INSERT INTO web_hits VALUES (5, repeat('https://example.com/path/', 80) || 'c', 40)")
+    let _whD2 = q(mut &s, "UPDATE web_hits SET url = repeat('https://example.com/path/', 80) || 'b', hits = 35 WHERE id = 2")
+    let _whD3 = q(mut &s, "DELETE FROM web_hits WHERE id = 5")
+    // ClickBench q33 & q34 shapes (GROUP BY url and GROUP BY 1, url) + q5 shape (COUNT(DISTINCT url))!
+    let wQ1 = "SELECT url, count(*), sum(hits) FROM web_hits GROUP BY url ORDER BY url"
+    let w1h = if explainHas(mut &s, wQ1, "mv_wide_url") { "ok" } else { "no" }
+    let w1m = rwMatch(mut &s, wQ1)
+    let wQ2 = "SELECT 1, url, count(*) FROM web_hits GROUP BY 1, url ORDER BY url"
+    let w2h = if explainHas(mut &s, wQ2, "mv_wide_url") { "ok" } else { "no" }
+    let w2m = rwMatch(mut &s, wQ2)
+    let wQ3 = "SELECT count(distinct url) FROM web_hits"
+    let w3h = if explainHas(mut &s, wQ3, "mv_wide_url") { "ok" } else { "no" }
+    let w3m = rwMatch(mut &s, wQ3)
+    // Verify realtime OQC MV on 2,000-byte keys before and after REFRESH FAST fold!
+    let rt1 = if q(mut &s, "SELECT url, c, tot FROM mv_wide_rt ORDER BY url") == q(mut &s, "SELECT url, c, tot FROM mv_wide_url ORDER BY url") { 0 } else { 1 }
+    let _rtF = q(mut &s, "REFRESH MATERIALIZED VIEW mv_wide_rt FAST")
+    let rt2 = if q(mut &s, "SELECT url, c, tot FROM mv_wide_rt ORDER BY url") == q(mut &s, "SELECT url, c, tot FROM mv_wide_url ORDER BY url") { 0 } else { 1 }
+    println("rw_wide_key: " + w1h + "|" + w1m.toStr() + "|" + w2h + "|" + w2m.toStr() + "|" + w3h + "|" + w3m.toStr() + "|" + rt1.toStr() + "|" + rt2.toStr())
 
     return 0
 }

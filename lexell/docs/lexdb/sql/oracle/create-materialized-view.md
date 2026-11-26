@@ -51,8 +51,10 @@ DROP MATERIALIZED VIEW LOG ON [ schema. ] table
   When `QUERY REWRITE` is enabled and `ALTER SESSION SET QUERY_REWRITE_ENABLED = TRUE` (default), the planner
   transparently rewrites eligible `SELECT` queries against the base table(s) onto the materialized view (supporting
   exact matches, `HAVING`, subsumed `WHERE` predicates including range/`IN`/`IS NOT NULL`, coarser and derived
-  `GROUP BY` expressions, join-back to extra dimension tables, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`VAR_*`/`STDDEV_*`/sketch
-  rollups, while skipping stale `ON DEMAND` views and uncommitted `ON COMMIT` changes).
+  `GROUP BY` expressions, join-back to extra dimension tables, exact `COUNT(DISTINCT)`/`SUM(DISTINCT)`/`AVG(DISTINCT)`
+  rollups over MV keys, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`VAR_*`/`STDDEV_*`/sketch rollups, while skipping stale
+  `ON DEMAND` views and uncommitted `ON COMMIT` changes). Oversized `GROUP BY` keys exceeding 512 bytes are
+  fingerprinted automatically.
   When `ON QUERY COMPUTATION` is enabled on a fast-refreshable materialized view, DML appends signed deltas to a
   contention-free companion delta tree, `SELECT` queries merge base + delta rows on the fly in the reader's MVCC
   snapshot (even on `ON DEMAND` views before refresh), and `DBMS_MVIEW.REFRESH(..., 'F')` or the background folder

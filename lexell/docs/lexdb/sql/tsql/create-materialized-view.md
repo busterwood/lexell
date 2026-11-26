@@ -54,9 +54,11 @@ DROP MATERIALIZED VIEW [ IF EXISTS ] [ schema_name . ] mview_name [ ,...n ] [ CA
 - **Automatic query rewrite:** Materialized views created with `ENABLE QUERY REWRITE` (or `WITH (query_rewrite = true)`)
   automatically accelerate eligible `SELECT` queries against their base table(s) — supporting exact matches, `HAVING`,
   subsumed `WHERE` predicates (including range, `BETWEEN`, `IN`, `<>`, and `IS NOT NULL`), coarser and derived
-  `GROUP BY` expressions, join-back to extra dimension tables (including `LEFT JOIN`), and
+  `GROUP BY` expressions, join-back to extra dimension tables (including `LEFT JOIN`), exact
+  `COUNT(DISTINCT)`/`SUM(DISTINCT)`/`AVG(DISTINCT)` rollups over MV keys, and
   `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`VAR_*`/`STDDEV_*`/sketch rollups, while skipping stale `ON DEMAND` views and
-  uncommitted `ON COMMIT` changes. Control per session with `SET query_rewrite_enabled = on | off` (default `on`).
+  uncommitted `ON COMMIT` changes. Oversized `GROUP BY` keys exceeding 512 bytes are fingerprinted automatically.
+  Control per session with `SET query_rewrite_enabled = on | off` (default `on`).
 
 ## Examples
 

@@ -94,10 +94,13 @@ DROP MATERIALIZED VIEW [ IF EXISTS ] name [, ...] [ CASCADE | RESTRICT ]
   `SELECT` queries against the base table(s) onto the lowest-cost matching materialized view. Supported rewrites
   include exact matches, `HAVING` filters, subsumed `WHERE` predicates (exact, range, `BETWEEN`, `IN`, `<>`, and
   `IS NOT NULL`), coarser and derived `GROUP BY` expressions (such as `DATE_TRUNC` or `EXTRACT` over an MV key),
-  join-back to extra dimension tables (including `LEFT JOIN`), and algebraic/sketch rollups (`COUNT`, `SUM`, `AVG`,
-  `MIN`, `MAX`, `VAR_*`, `STDDEV_*`, `BOOL_AND`/`BOOL_OR`, `BIT_XOR`, and HyperLogLog++/t-digest sketches, including
-  from internal hidden MV state). Stale `ON DEMAND` views (without `ON QUERY COMPUTATION`) and uncommitted `ON COMMIT`
-  changes are automatically skipped for correctness.
+  join-back to extra dimension tables (including `LEFT JOIN`), exact `COUNT(DISTINCT)` / `SUM(DISTINCT)` /
+  `AVG(DISTINCT)` rollups over MV group keys (simplifying to non-distinct `COUNT`/`SUM`/`AVG` when keys match), and
+  algebraic/sketch rollups (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `VAR_*`, `STDDEV_*`, `BOOL_AND`/`BOOL_OR`, `BIT_XOR`,
+  and HyperLogLog++/t-digest sketches, including from internal hidden MV state). Oversized `GROUP BY` keys (such as
+  long `TEXT`/`URL` values exceeding 512 bytes) are fingerprinted automatically into a fixed-width internal key. Stale
+  `ON DEMAND` views (without `ON QUERY COMPUTATION`) and uncommitted `ON COMMIT` changes are automatically skipped for
+  correctness.
 - Dropping a base table, column, or upstream materialized view referenced by a downstream materialized view is refused
   (`2BP01`) unless `CASCADE` is given.
 

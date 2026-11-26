@@ -15,6 +15,7 @@
 //   multi-table inner equi-joins (bilinear telescoping deltas).
 import "strings"
 import "binary"
+import "hash"
 import "task"
 import "collections"
 import "time"
@@ -438,6 +439,9 @@ pub const AGG_TDIGEST = 16
 pub const AGG_TDIGEST_DETAIL = 17
 pub const AGG_HLL_AGG = 18
 pub const AGG_TDIGEST_AGG = 19
+pub const AGG_COUNT_DISTINCT = 20
+pub const AGG_SUM_DISTINCT = 21
+pub const AGG_AVG_DISTINCT = 22
 
 fn isVarAgg(ak: int): bool { return ak >= AGG_VAR_POP && ak <= AGG_STDDEV_SAMP }
 fn isHllAgg(ak: int): bool { return ak == AGG_HLL || ak == AGG_HLL_DETAIL || ak == AGG_HLL_AGG }
@@ -685,13 +689,14 @@ type FastAggRes = record {
     arg: Expr
     flt: Option[Expr]
     wasAgg: bool
+    isDistinct: bool
     pctFrac: float
     pctDesc: bool
     oraDia: bool
 }
 
 fn noAggRes(wasAgg: bool): FastAggRes {
-    return FastAggRes{kind: AGG_NONE, arg: Expr.Lit(Val.Null), flt: None, wasAgg: wasAgg, pctFrac: 0.0f, pctDesc: false, oraDia: false}
+    return FastAggRes{kind: AGG_NONE, arg: Expr.Lit(Val.Null), flt: None, wasAgg: wasAgg, isDistinct: false, pctFrac: 0.0f, pctDesc: false, oraDia: false}
 }
 
 fn litFloat(x: &Expr): Option[float] {
@@ -709,17 +714,19 @@ fn parseFastAgg(x: &Expr): FastAggRes {
             let parts = strings.split(&name, " ")
             let base = parts[0]
             var hasFilter = false
+            var hasDistinct = false
             var pctDesc = false
             var oraDia = false
             for i in 1..len(parts) {
                 let p = &parts[i]
                 if p == "filter" { hasFilter = true; continue }
+                if p == "distinct" { hasDistinct = true; continue }
                 if p == "dia:o" { oraDia = true; continue }
                 if base == "approx_percentile" && strings.startsWith(p, "order:") {
                     if len(p) > 6 && (p[6] == 'd' || p[6] == 'D') { pctDesc = true }
                     continue
                 }
-                if p == "distinct" || strings.startsWith(p, "order:") || p == "within" {
+                if strings.startsWith(p, "order:") || p == "within" {
                     return noAggRes(true)
                 }
             }
@@ -729,11 +736,27 @@ fn parseFastAgg(x: &Expr): FastAggRes {
                 flt = Some(lexdb_sql.cloneExpr(&args[nArgs - 1]))
                 nArgs -= 1
             }
+            if hasDistinct {
+                if !star && nArgs == 1 && !lexdb_bind.hasAgg(&args[0]) {
+                    let dk = match base.toStr() {
+                        "count" { AGG_COUNT_DISTINCT }
+                        "sum" { AGG_SUM_DISTINCT }
+                        "avg" { AGG_AVG_DISTINCT }
+                        "min" { AGG_MIN }
+                        "max" { AGG_MAX }
+                        else { AGG_NONE }
+                    }
+                    if dk != AGG_NONE {
+                        return FastAggRes{kind: dk, arg: lexdb_sql.cloneExpr(&args[0]), flt: flt, wasAgg: true, isDistinct: true, pctFrac: 0.0f, pctDesc: false, oraDia: oraDia}
+                    }
+                }
+                return noAggRes(true)
+            }
             if base == "count" {
-                if star && nArgs == 0 { return FastAggRes{kind: AGG_COUNT_STAR, arg: Expr.Lit(Val.Int(1)), flt: flt, wasAgg: true, pctFrac: 0.0f, pctDesc: false, oraDia: oraDia} }
+                if star && nArgs == 0 { return FastAggRes{kind: AGG_COUNT_STAR, arg: Expr.Lit(Val.Int(1)), flt: flt, wasAgg: true, isDistinct: false, pctFrac: 0.0f, pctDesc: false, oraDia: oraDia} }
                 if !star && nArgs == 1 {
                     if lexdb_bind.hasAgg(&args[0]) { return noAggRes(true) }
-                    return FastAggRes{kind: AGG_COUNT_EXPR, arg: lexdb_sql.cloneExpr(&args[0]), flt: flt, wasAgg: true, pctFrac: 0.0f, pctDesc: false, oraDia: oraDia}
+                    return FastAggRes{kind: AGG_COUNT_EXPR, arg: lexdb_sql.cloneExpr(&args[0]), flt: flt, wasAgg: true, isDistinct: false, pctFrac: 0.0f, pctDesc: false, oraDia: oraDia}
                 }
                 return noAggRes(true)
             }
@@ -759,7 +782,7 @@ fn parseFastAgg(x: &Expr): FastAggRes {
                     else { AGG_NONE }
                 }
                 if k != AGG_NONE {
-                    return FastAggRes{kind: k, arg: lexdb_sql.cloneExpr(&args[0]), flt: flt, wasAgg: true, pctFrac: 0.0f, pctDesc: false, oraDia: oraDia}
+                    return FastAggRes{kind: k, arg: lexdb_sql.cloneExpr(&args[0]), flt: flt, wasAgg: true, isDistinct: false, pctFrac: 0.0f, pctDesc: false, oraDia: oraDia}
                 }
                 return noAggRes(true)
             }
@@ -768,7 +791,7 @@ fn parseFastAgg(x: &Expr): FastAggRes {
                 match litFloat(&args[1]) {
                     Some(pf) {
                         if pf.isNaN() || pf < 0.0f || pf > 1.0f { return noAggRes(true) }
-                        return FastAggRes{kind: AGG_TDIGEST, arg: lexdb_sql.cloneExpr(&args[0]), flt: flt, wasAgg: true, pctFrac: pf, pctDesc: pctDesc, oraDia: oraDia}
+                        return FastAggRes{kind: AGG_TDIGEST, arg: lexdb_sql.cloneExpr(&args[0]), flt: flt, wasAgg: true, isDistinct: false, pctFrac: pf, pctDesc: pctDesc, oraDia: oraDia}
                     }
                     None { return noAggRes(true) }
                 }
@@ -984,7 +1007,7 @@ pub fn analyzeFast(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Stmt, 
         if anyAgg {
             let ar = parseFastAgg(&ex)
             if ar.wasAgg {
-                if ar.kind == AGG_NONE { return Ok(noFast("aggregate function not supported for FAST refresh")) }
+                if ar.kind == AGG_NONE || ar.isDistinct { return Ok(noFast("aggregate function not supported for FAST refresh")) }
                 if !lexdb_bind.immutable(&ar.arg) { return Ok(noFast("volatile expression inside aggregate")) }
                 let rArg = match resolveFastExpr(&ar.arg, &allCols) {
                     Ok(rx) { rx }
@@ -1391,12 +1414,43 @@ fn avgVal(sum: &Val, nn: int, targetTyp: &lexdb_sql.TypeName, md: int): Result[V
     }
 }
 
+fn appendU64Bits(b: mut &[]byte, v: u64) {
+    append(b, byte(v & 255))
+    append(b, byte((v >> 8) & 255))
+    append(b, byte((v >> 16) & 255))
+    append(b, byte((v >> 24) & 255))
+    append(b, byte((v >> 32) & 255))
+    append(b, byte((v >> 40) & 255))
+    append(b, byte((v >> 48) & 255))
+    append(b, byte((v >> 56) & 255))
+}
+
+// Bounds an MV_GK key so its B+tree-encoded BYTEA key always fits well under LexDB's 512-byte limit.
+// Keys <= 220 bytes stay raw (exact backwards compatibility, <= 442 bytes worst-case after 0x00 escaping);
+// oversized keys (> 220 bytes, e.g. wide URL/TEXT group keys) map to a deterministic 41-byte fingerprint:
+// 0xFF (unused by encIdxPart/'G') || 4x domain-separated SipHash-1-3 (256-bit) || len (64-bit).
+fn fitMvGk(raw: str): str {
+    if len(raw) <= 220 { return raw }
+    let h0 = hash.sipHash13(0x4c455844424d5630, 0x1122334455667788, &raw)
+    let h1 = hash.sipHash13(0x4c455844424d5631, 0x2233445566778899, &raw)
+    let h2 = hash.sipHash13(0x4c455844424d5632, 0x33445566778899aa, &raw)
+    let h3 = hash.sipHash13(0x4c455844424d5633, 0x445566778899aabb, &raw)
+    var b: []byte = withCapacity(41)
+    append(mut &b, byte(255))
+    appendU64Bits(mut &b, h0)
+    appendU64Bits(mut &b, h1)
+    appendU64Bits(mut &b, h2)
+    appendU64Bits(mut &b, h3)
+    appendU64Bits(mut &b, u64(len(raw)))
+    return strFromBytes(&b)
+}
+
 // Encodes the MV_GK key for a group or non-agg row.
 fn encGroupKey(vals: &[]Val): str {
     if len(vals) == 0 { return "G" }
     var b = ""
     for v in vals { lexdb_access.encIdxPart(mut &b, &v) }
-    return b
+    return fitMvGk(b)
 }
 
 // Encodes the PK key of a single base table row.
@@ -1652,7 +1706,7 @@ fn expandJoinDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, fp: &Fast
                 }
                 append(mut &joinedRows, collections.copyOf(&partials[pi]))
                 append(mut &signs, d.sign)
-                append(mut &pks, pkKey)
+                append(mut &pks, fitMvGk(pkKey))
             }
         }
     }
@@ -1714,7 +1768,7 @@ fn computeMvDeltas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, mv: &MvMet
                 if try passesConds(&fp, &d.row, &z, up) {
                     append(mut &rows, collections.copyOf(&d.row))
                     append(mut &signs, d.sign)
-                    if !fp.isAgg { append(mut &rowPks, encBasePk(&fp.tables[0], &d.row)) }
+                    if !fp.isAgg { append(mut &rowPks, fitMvGk(encBasePk(&fp.tables[0], &d.row))) }
                 }
             }
         } else {
@@ -3120,7 +3174,7 @@ pub fn refreshComplete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &
                         lexdb_access.encIdxPart(mut &gkBytes, &Val.Bytes(onePk))
                     }
                 }
-                row[fp.gkCol] = Val.Bytes(gkBytes)
+                row[fp.gkCol] = Val.Bytes(fitMvGk(gkBytes))
             } else {
                 row = try populateAggRow(&r, &mvTab, &fp, &z)
             }
@@ -3935,14 +3989,74 @@ fn avgDivType(mvTab: &Table, sumColIdx: int): lexdb_sql.TypeName {
     return lexdb_sql.TypeName{kind: lexdb_sql.K_NUM, oid: lexdb_sql.OID_NUMERIC, prec: 0, scale: 0, len: 0}
 }
 
+// Returns true when every MV row in a query group has a distinct value of d:
+// no join-back, d equals some MV group key fp.group[di], and every other MV group key appears in qGrpMapped.
+fn distinctKeyUnique(fp: &FastPlan, d: &Expr, qGrpMapped: &[]Expr, extraCount: int): bool {
+    if extraCount > 0 || len(fp.group) == 0 { return false }
+    var di = -1
+    for mi in 0..len(fp.group) {
+        if exprEq(&fp.group[mi], d) { di = mi; break }
+    }
+    if di < 0 { return false }
+    for mi in 0..len(fp.group) {
+        if mi == di { continue }
+        var inQ = false
+        for qg in qGrpMapped {
+            if exprEq(&fp.group[mi], &qg) { inQ = true; break }
+        }
+        if !inQ { return false }
+    }
+    return true
+}
+
 // Translates a canonical expression (possibly containing aggregates) against an aggregate MV:
 // - exactGroup == true: direct lookup of MV agg columns (no re-aggregation needed!)
 // - exactGroup == false: algebraic rollup re-aggregation over MV columns!
 fn translateAggExpr(x: &Expr, fp: &FastPlan, mvTab: &Table, mvAlias: &str, extraBase: int,
-                    qAllCols: &[]lexdb_sql.ColDef, exactGroup: bool, globalRollup: bool): Option[Expr] {
+                    qAllCols: &[]lexdb_sql.ColDef, qGrpMapped: &[]Expr, extraCount: int,
+                    exactGroup: bool, globalRollup: bool): Option[Expr] {
     let ar = parseFastAgg(x)
     if ar.wasAgg {
         if ar.kind == AGG_NONE { return None }
+        let int8T = lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}
+        // Exact COUNT(DISTINCT d), SUM(DISTINCT d), AVG(DISTINCT d) over an MV whose group keys cover d!
+        if ar.kind == AGG_COUNT_DISTINCT || ar.kind == AGG_SUM_DISTINCT || ar.kind == AGG_AVG_DISTINCT {
+            if len(fp.group) == 0 { return None }
+            let td = match translateNonAgg(&ar.arg, fp, mvTab, mvAlias, extraBase, qAllCols) {
+                Some(v) { v }
+                None { return None }
+            }
+            var tfx: Option[Expr] = None
+            match &ar.flt {
+                Some(fx) {
+                    match translateNonAgg(fx, fp, mvTab, mvAlias, extraBase, qAllCols) {
+                        Some(v) { tfx = Some(v) }
+                        None { return None }
+                    }
+                }
+                None {}
+            }
+            if exactGroup {
+                if ar.kind == AGG_COUNT_DISTINCT {
+                    let nn = Expr.IsNull(td, true)
+                    let cond = match &tfx {
+                        Some(f) { Expr.Bin("and", nn, lexdb_sql.cloneExpr(f)) }
+                        None { nn }
+                    }
+                    return Some(Expr.Cast(Expr.Call("case else", [cond, Expr.Lit(Val.Int(1)), Expr.Lit(Val.Int(0))], false), int8T))
+                }
+                return None
+            }
+            let uniq = distinctKeyUnique(fp, &ar.arg, qGrpMapped, extraCount)
+            let baseFn = if ar.kind == AGG_COUNT_DISTINCT { "count" } else if ar.kind == AGG_SUM_DISTINCT { "sum" } else { "avg" }
+            var callName = if uniq { baseFn.toStr() } else { baseFn + " distinct" }
+            var callArgs: []Expr = [td]
+            match &tfx {
+                Some(f) { callName = callName + " filter"; append(mut &callArgs, lexdb_sql.cloneExpr(f)) }
+                None {}
+            }
+            return Some(Expr.Call(callName, callArgs, false))
+        }
         if exactGroup {
             let vis = findMvAggColIdx(fp, ar.kind, &ar.arg, &ar.flt, ar.pctFrac, ar.pctDesc)
             if vis >= 0 { return Some(mvColExpr(mvAlias, mvTab, vis)) }
@@ -3988,7 +4102,6 @@ fn translateAggExpr(x: &Expr, fp: &FastPlan, mvTab: &Table, mvAlias: &str, extra
             return None
         }
         // Rollup re-aggregation over finer-grain MV!
-        let int8T = lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}
         if ar.kind == AGG_COUNT_STAR || ar.kind == AGG_COUNT_EXPR {
             let ci = findMvCountColIdx(fp, ar.kind, &ar.arg, &ar.flt)
             if ci >= 0 {
@@ -4073,24 +4186,24 @@ fn translateAggExpr(x: &Expr, fp: &FastPlan, mvTab: &Table, mvAlias: &str, extra
     if !lexdb_bind.hasAgg(x) { return translateNonAgg(x, fp, mvTab, mvAlias, extraBase, qAllCols) }
     match x {
         Expr.Unary(op, a) {
-            match translateAggExpr(&a, fp, mvTab, mvAlias, extraBase, qAllCols, exactGroup, globalRollup) {
+            match translateAggExpr(&a, fp, mvTab, mvAlias, extraBase, qAllCols, qGrpMapped, extraCount, exactGroup, globalRollup) {
                 Some(ta) { return Some(Expr.Unary(op.clone(), ta)) }
                 None { return None }
             }
         }
         Expr.Bin(op, a, b) {
-            let ta = match translateAggExpr(&a, fp, mvTab, mvAlias, extraBase, qAllCols, exactGroup, globalRollup) { Some(v) { v } None { return None } }
-            let tb = match translateAggExpr(&b, fp, mvTab, mvAlias, extraBase, qAllCols, exactGroup, globalRollup) { Some(v) { v } None { return None } }
+            let ta = match translateAggExpr(&a, fp, mvTab, mvAlias, extraBase, qAllCols, qGrpMapped, extraCount, exactGroup, globalRollup) { Some(v) { v } None { return None } }
+            let tb = match translateAggExpr(&b, fp, mvTab, mvAlias, extraBase, qAllCols, qGrpMapped, extraCount, exactGroup, globalRollup) { Some(v) { v } None { return None } }
             return Some(Expr.Bin(op.clone(), ta, tb))
         }
         Expr.IsNull(a, not) {
-            match translateAggExpr(&a, fp, mvTab, mvAlias, extraBase, qAllCols, exactGroup, globalRollup) {
+            match translateAggExpr(&a, fp, mvTab, mvAlias, extraBase, qAllCols, qGrpMapped, extraCount, exactGroup, globalRollup) {
                 Some(ta) { return Some(Expr.IsNull(ta, not)) }
                 None { return None }
             }
         }
         Expr.Cast(a, t) {
-            match translateAggExpr(&a, fp, mvTab, mvAlias, extraBase, qAllCols, exactGroup, globalRollup) {
+            match translateAggExpr(&a, fp, mvTab, mvAlias, extraBase, qAllCols, qGrpMapped, extraCount, exactGroup, globalRollup) {
                 Some(ta) { return Some(Expr.Cast(ta, t.clone())) }
                 None { return None }
             }
@@ -4098,7 +4211,7 @@ fn translateAggExpr(x: &Expr, fp: &FastPlan, mvTab: &Table, mvAlias: &str, extra
         Expr.Call(n, args, star) {
             var out: []Expr = []
             for a in args {
-                match translateAggExpr(&a, fp, mvTab, mvAlias, extraBase, qAllCols, exactGroup, globalRollup) {
+                match translateAggExpr(&a, fp, mvTab, mvAlias, extraBase, qAllCols, qGrpMapped, extraCount, exactGroup, globalRollup) {
                     Some(ta) { append(mut &out, ta) }
                     None { return None }
                 }
@@ -4461,6 +4574,7 @@ pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, p
         var exactGroup = false
         var globalRollup = false
         var rwGroup: []Expr = []
+        var qGrpMapped: []Expr = []
         var score = 400
 
         if !fp.isAgg {
@@ -4476,7 +4590,6 @@ pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, p
             score = (if len(allMvPreds) > 0 { 300 } else { 400 }) + extraCount * 10
         } else {
             // Aggregate MV: check 1-to-1 exact group match (only without join-back), else rollup!
-            var qGrpMapped: []Expr = []
             for g in qGrpRaw { append(mut &qGrpMapped, remapSlots(&g, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols, &qAllCols)) }
             if extraCount == 0 && len(qGrpMapped) == len(fp.group) {
                 var mvGrpUsed = array(len(fp.group), false)
@@ -4510,7 +4623,7 @@ pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, p
         for k in 0..len(qItemsRaw) {
             let rm = remapSlots(&qItemsRaw[k], &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols, &qAllCols)
             let txOpt = if !fp.isAgg { translateOverProj(&rm, &fp, &mvTab, &mvAlias, extraBase, &qAllCols) }
-                        else { translateAggExpr(&rm, &fp, &mvTab, &mvAlias, extraBase, &qAllCols, exactGroup, globalRollup) }
+                        else { translateAggExpr(&rm, &fp, &mvTab, &mvAlias, extraBase, &qAllCols, &qGrpMapped, extraCount, exactGroup, globalRollup) }
             match txOpt {
                 Some(tx) {
                     append(mut &rwItems, lexdb_sql.SelItem{star: false, qual: "", expr: Some(tx),
@@ -4527,7 +4640,7 @@ pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, p
             Some(hx) {
                 let rm = remapSlots(hx, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols, &qAllCols)
                 let txOpt = if !fp.isAgg { translateOverProj(&rm, &fp, &mvTab, &mvAlias, extraBase, &qAllCols) }
-                            else { translateAggExpr(&rm, &fp, &mvTab, &mvAlias, extraBase, &qAllCols, exactGroup, globalRollup) }
+                            else { translateAggExpr(&rm, &fp, &mvTab, &mvAlias, extraBase, &qAllCols, &qGrpMapped, extraCount, exactGroup, globalRollup) }
                 match txOpt {
                     Some(tx) {
                         if fp.isAgg && exactGroup { append(mut &resWhere, tx) } else { rwHaving = Some(tx) }
@@ -4549,7 +4662,7 @@ pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, p
             } else {
                 let rm = remapSlots(&qOrdRaw[oi], &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols, &qAllCols)
                 let txOpt = if !fp.isAgg { translateOverProj(&rm, &fp, &mvTab, &mvAlias, extraBase, &qAllCols) }
-                            else { translateAggExpr(&rm, &fp, &mvTab, &mvAlias, extraBase, &qAllCols, exactGroup, globalRollup) }
+                            else { translateAggExpr(&rm, &fp, &mvTab, &mvAlias, extraBase, &qAllCols, &qGrpMapped, extraCount, exactGroup, globalRollup) }
                 match txOpt {
                     Some(tx) { append(mut &rwOrder, lexdb_sql.OrderItem{expr: tx, desc: s.order[oi].desc, nullsFirst: s.order[oi].nullsFirst}) }
                     None { itemsOk = false; break }
