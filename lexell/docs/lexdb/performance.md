@@ -25,7 +25,7 @@ For a high-level introduction to LexDB's architecture, features, and performance
 | **Durable OLTP updates** (1–32 clients) | up to **63.3k/s** (`pgbench`) / **54.2k/s** (`sysbench`) | 25.7k/s / 23.0k/s | **2.41–2.67×** (`pgbench`); **2.36–3.13×** (`sysbench` non-index); **1.32–2.54×** (`sysbench` indexed) |
 | **Point selects (3 read replicas, 32 clients)** | **470–490k/s** (`pgbench`) / **350.5k/s** (`sysbench`) | 397k/s / 334k/s (4 cores) | **1.18–1.23×** (`pgbench`); **1.05×** (`sysbench`, 29% less CPU); replica lag **0.22 ms** p50 / **0.44 ms** p99 |
 | **Bulk `\copy` loads** (5 cases, 1M–10M rows) | 0.24–2.44 s | 0.61–5.93 s | **1.1–2.7× faster** (`0.37–0.94×`) on all 5 workloads |
-| **Property graphs (SQL/PGQ)** (11 queries, 1.1M edges, 1 core) | **860 ms** (`0.38 ms` G10 / `6.41 ms` G11 / `396 ms` G9) | 5,661 ms (PG1) / 962 ms (DuckPGQ) / 1,367 ms (Kùzu) | **Fastest total time of all 4**; geomean **6.04× faster** than PG1, **2.37× faster** than DuckPGQ, **4.54× faster** than Kùzu ([full report](property-graphs.md)) |
+| **Property graphs (SQL/PGQ)** (11 queries, 1.1M edges, 1 core) | **822 ms** (`0.41 ms` G10 / `7.37 ms` G11 / `388 ms` G9) | 5,661 ms (PG1) / 962 ms (DuckPGQ) / 1,367 ms (Kùzu) | **Fastest total time of all 4**; geomean **6.38× faster** than PG1, **2.50× faster** than DuckPGQ, **4.79× faster** than Kùzu ([full report](property-graphs.md)) |
 
 PostgreSQL is ahead on single-process multi-thread reads (before adding replicas) and multi-statement read-write blocks.
 
@@ -316,11 +316,11 @@ LexDB (3 read replicas, 4 processes) vs PostgreSQL 18 (4 cores) — read workloa
 
 | Metric (11 queries, 1 core / 1 thread) | LexDB | PostgreSQL 18 | DuckDB 2.0 + DuckPGQ | Kùzu 0.11.3 |
 |---|---:|---:|---:|---:|
-| Sum of all 11 queries | **859.6 ms** | 5,660.5 ms | 962.2 ms | 1,367.4 ms |
-| Geometric mean (LexDB / peer) | — | **0.17× (6.04× faster)** | **0.42× (2.37× faster)** | **0.22× (4.54× faster)** |
-| 5-hop shortest path (`G10`) | **0.38 ms** (`0.70 ms` cold) | 1,080.53 ms | 61.89 ms | 40.59 ms |
-| Single-source shortest paths (`G11`, 2k targets) | **6.41 ms** (`24.76 ms` cold) | 1,263.90 ms | 64.31 ms | 48.26 ms |
-| Full-graph 1M-edge triangles (`G9`) | **396.28 ms** | 1,813.83 ms | 518.85 ms | 521.31 ms |
+| Sum of all 11 queries | **822.0 ms** | 5,660.5 ms | 962.2 ms | 1,367.4 ms |
+| Geometric mean (LexDB / peer) | — | **0.16× (6.38× faster)** | **0.40× (2.50× faster)** | **0.21× (4.79× faster)** |
+| 5-hop shortest path (`G10`) | **0.41 ms** (`0.71 ms` cold) | 1,080.53 ms | 61.89 ms | 40.59 ms |
+| Single-source shortest paths (`G11`, 2k targets) | **7.37 ms** (`23.92 ms` cold) | 1,263.90 ms | 64.31 ms | 48.26 ms |
+| Full-graph 1M-edge triangles (`G9`) | **388.46 ms** | 1,813.83 ms | 518.85 ms | 521.31 ms |
 
 ## Not measured in this run
 

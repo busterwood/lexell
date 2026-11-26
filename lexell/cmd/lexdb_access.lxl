@@ -2033,7 +2033,16 @@ fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
     let np = lexdb_rows.leafPlaces(leaf)
     // Run cheap column kernels (integer/date ranges, =, <>, text =/<>/IN) BEFORE expensive substring LIKEs!
     var kerned = false
-    if len(lz.kern) > 0 {
+    if len(lz.kern) == 1 {
+        match lexdb_leafk.rowsOf(leaf, from, &rs, r0, n, &lz.kern[0]) {
+            Some(x) {
+                rs = x
+                kerned = true
+                lexdb_leafk.noteRun()
+            }
+            None {}
+        }
+    } else if len(lz.kern) > 1 {
         var cur = collections.copyOf(&rs)
         kerned = true
         for k in lz.kern {
@@ -2070,10 +2079,13 @@ fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
         rs = got1.unwrap()
     }
     // (after the kernels, half the run or more kept: all of it decoded, together)
-    let wide0 = kerned && 2 * len(rs) >= n
-    var qs0: []int = withCapacity(if wide0 { n } else { len(rs) })
-    if wide0 { for q in 0..n { append(mut &qs0, q) } } else { for r in rs { append(mut &qs0, r - r0) } }
-    if !(try lexdb_rows.colsInto(leaf, from, &qs0, len(qs0) == n, r0, if kerned { &lz.firstK } else { &lz.first }, b, bp)) { return Ok(-1) }
+    let firstPs = if kerned { &lz.firstK } else { &lz.first }
+    if len(firstPs) > 0 && len(rs) > 0 {
+        let wide0 = kerned && 2 * len(rs) >= n
+        var qs0: []int = withCapacity(if wide0 { n } else { len(rs) })
+        if wide0 { for q in 0..n { append(mut &qs0, q) } } else { for r in rs { append(mut &qs0, r - r0) } }
+        if !(try lexdb_rows.colsInto(leaf, from, &qs0, len(qs0) == n, r0, firstPs, b, bp)) { return Ok(-1) }
+    }
     let got = narrow(if kerned { &lz.skipK } else { &lz.skip }, b, rs)
     if got.isNone() { return Ok(-2) }
     var ch = got.unwrap()
@@ -2084,10 +2096,13 @@ fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
         for r in ch { if !barAfter(bar, kc.v[r], kc.nul[r]) { append(mut &ok, r) } }
         ch = ok
     }
-    let wide = kerned && 2 * len(ch) >= n
-    var qs: []int = withCapacity(if wide { n } else { len(ch) })
-    if wide { for q in 0..n { append(mut &qs, q) } } else { for r in ch { append(mut &qs, r - r0) } }
-    if !(try lexdb_rows.colsInto(leaf, from, &qs, len(qs) == n, r0, if kerned { &lz.restK } else { &lz.rest }, b, bp)) { return Ok(-1) }
+    let restPs = if kerned { &lz.restK } else { &lz.rest }
+    if len(restPs) > 0 && len(ch) > 0 {
+        let wide = kerned && 2 * len(ch) >= n
+        var qs: []int = withCapacity(if wide { n } else { len(ch) })
+        if wide { for q in 0..n { append(mut &qs, q) } } else { for r in ch { append(mut &qs, r - r0) } }
+        if !(try lexdb_rows.colsInto(leaf, from, &qs, len(qs) == n, r0, restPs, b, bp)) { return Ok(-1) }
+    }
     for r in ch { append(idx, r) }
     return Ok(n)
 }

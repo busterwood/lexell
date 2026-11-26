@@ -1889,6 +1889,23 @@ fn (q: &Query) wayInto(k: int, cands: &[]WayCand, mask: int, outer: bool, cs: &[
         } else if n < len(wc.cols) || !wc.unique {
             let r = lv.est.rowsFor(wc.tree, n, &key)
             m = if r >= 0 { float(r) } else { fmax(t / 10.0f, 1.0f) }
+            // FK Pigeonhole Principle: a single-column FK referencing a table of R rows
+            // has at most R distinct values, so average fan-out is at least entries / R.
+            if n == 1 && len(key) == 0 && len(wc.colIds) > 0 && wc.colIds[0] >= 0 && len(lv.t.fks) > 0 {
+                let cname = &lv.t.cols[wc.colIds[0]].name
+                let ents = lv.est.entriesOf(wc.tree)
+                let tot = if ents >= 0 { float(ents) } else { t }
+                for fk in lv.t.fks {
+                    if len(fk.cols) == 1 && &fk.cols[0] == cname {
+                        for rl in q.levels {
+                            if rl.t.name == fk.ref && rl.est.rows > 0 {
+                                let floor = tot / float(rl.est.rows)
+                                if floor > m { m = floor }
+                            }
+                        }
+                    }
+                }
+            }
         }
         if n < len(wc.colIds) && wc.colIds[n] >= 0 {
             // a range of the next column (optimizer 29), by constants:
@@ -1902,7 +1919,8 @@ fn (q: &Query) wayInto(k: int, cands: &[]WayCand, mask: int, outer: bool, cs: &[
         // a row by key through an index, or the primary key's own (one: a
         // point; more: a range, in batches as the first table)
         let point = wc.index < 0 && n == len(wc.cols) && wc.unique
-        let perRow = if point || (wc.index >= 0 && outer) { COST_KEY_ROW } else if wc.index >= 0 { COST_IX_ROW } else if outer { COST_SCAN_INNER } else { COST_PK_RANGE }
+        let nonCovIx = wc.index >= 0 && outer && len(lv.need) > 0 && lexdb_access.idxDecOf(&lexdb_catalog.relOf(&lv.t), wc.index, &lv.need).isNone()
+        let perRow = if point { COST_KEY_ROW } else if nonCovIx { COST_IX_ROW } else if wc.index >= 0 && outer { COST_KEY_ROW } else if wc.index >= 0 { COST_IX_ROW } else if outer { COST_SCAN_INNER } else { COST_PK_RANGE }
         let cost = COST_DESCENT + m * perRow
         let inner = COST_DESCENT + m * (if wc.index >= 0 || point { COST_KEY_ROW } else { COST_SCAN_INNER })
         if best.rows < 0.0f || cost < best.cost { best = Way{rows: m, cost: cost, outer: outer, inner: fmin(inner, best.inner), nEqs: n} }
@@ -2190,6 +2208,24 @@ fn (q: &Query) distinctOf(name: &str, k: int): float {
     return fmax(fmax(float(q.levels[k].est.rows), 1.0f) / 10.0f, 1.0f)
 }
 
+// FK Pigeonhole cap: a single-column FK referencing a table of R rows present
+// in q.levels has at most R distinct values.
+fn (q: &Query) fkDistinctCap(lv: &Level, col: int, d: float): float {
+    if col < 0 || col >= len(lv.t.cols) || len(lv.t.fks) == 0 { return d }
+    let cname = &lv.t.cols[col].name
+    var out = d
+    for fk in lv.t.fks {
+        if len(fk.cols) == 1 && &fk.cols[0] == cname {
+            for rl in q.levels {
+                if rl.t.name == fk.ref && rl.est.rows > 0 && float(rl.est.rows) < out {
+                    out = float(rl.est.rows)
+                }
+            }
+        }
+    }
+    return out
+}
+
 // A column's distinct values when a key or an index (with statistics) leads
 // with it; -1 not known.
 fn (q: &Query) distinctKnown(name: &str, k: int): float {
@@ -2204,13 +2240,16 @@ fn (q: &Query) distinctKnown(name: &str, k: int): float {
         if len(cols) == 0 || cols[0] != i { continue }
         if len(cols) == 1 && (c < 0 || lv.t.indexes[c].unique) { return t }
         let tree = if c < 0 { lv.t.tree } else { lv.t.indexes[c].tree }
-        for j in 0..len(lv.est.trees) { if lv.est.trees[j] == tree && lv.est.cm[j].d > 0 { return float(lv.est.cm[j].d) } }
+        for j in 0..len(lv.est.trees) { if lv.est.trees[j] == tree && lv.est.cm[j].d > 0 { return q.fkDistinctCap(lv, i, float(lv.est.cm[j].d)) } }
     }
     // ANALYZE's count of another column (optimizer 39); none but NULLs: an
     // equality keeps a row at most
     if i >= 0 && i < len(lv.t.cols) {
         for j in 0..len(lv.est.cols) {
-            if lv.est.cols[j] == lv.t.cols[i].name && lv.est.cnd[j] >= 0 { return if lv.est.cnd[j] > 0 { float(lv.est.cnd[j]) } else { t } }
+            if lv.est.cols[j] == lv.t.cols[i].name && lv.est.cnd[j] >= 0 {
+                let raw = if lv.est.cnd[j] > 0 { float(lv.est.cnd[j]) } else { t }
+                return q.fkDistinctCap(lv, i, raw)
+            }
         }
     }
     return -1.0f
@@ -2351,6 +2390,9 @@ fn (q: &Query) joinStep(k: int, cands: &[]WayCand, own: &[]Expr, base: &Way, mas
     }
     var add = if w.rows >= 0.0f && nJoinEqs >= 2 {
         base.cost + base.rows * 6.0f + rin * HASH_PROBE + out
+    } else if float(q.levels[k].est.rows) >= 50000.0f {
+        // hashBuild uses vectorized columnar readRows scans, not row-by-row decoding.
+        base.cost + base.rows * HASH_BUILD + rin * HASH_PROBE + out
     } else {
         base.inner + base.rows * HASH_BUILD + rin * HASH_PROBE + out
     }
@@ -2854,18 +2896,20 @@ fn (q: &Query) grpCost(h: int, a: int, b: int, mask: int, nl: int, base: &[]Way,
     let rin = q.setRows(mask, nl, base, cmask, cdist, memo)
     var pre = 1 << h
     var r = q.setRows(pre, nl, base, cmask, cdist, memo)
-    var c = base[h].inner
+    let hScan = if float(q.levels[h].est.rows) >= 50000.0f { base[h].cost } else { base[h].inner }
+    var c = hScan
     var rb = bytes[h]
     // left-deep: the hub hashed (its read as the group's), then each member
     var lr = q.setRows(mask | pre, nl, base, cmask, cdist, memo)
-    var ld = base[h].inner + base[h].rows * HASH_BUILD + rin * HASH_PROBE + lr * ROW_COST
+    var ld = hScan + base[h].rows * HASH_BUILD + rin * HASH_PROBE + lr * ROW_COST
     for i in 0..2 {
         let m = if i == 0 { a } else { b }
         if m < 0 { break }
         if base[m].rows * bytes[m] > cap { return -1.0f }
         let nx = pre | (1 << m)
         let rn = q.setRows(nx, nl, base, cmask, cdist, memo)
-        let build = base[m].inner + base[m].rows * HASH_BUILD
+        let mScan = if float(q.levels[m].est.rows) >= 50000.0f { base[m].cost } else { base[m].inner }
+        let build = mScan + base[m].rows * HASH_BUILD
         c += build + r * HASH_PROBE + rn * ROW_COST
         let lr2 = q.setRows(mask | nx, nl, base, cmask, cdist, memo)
         ld += build + lr * HASH_PROBE + lr2 * ROW_COST

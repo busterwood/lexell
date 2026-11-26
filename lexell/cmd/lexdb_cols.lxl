@@ -235,6 +235,22 @@ pub fn unpack(s: &str, d: int, w: int, base: int, from: int, cnt: int, out: mut 
         for q in 0..cnt { out[r0 + q] = base }
         return
     }
+    if w == 8 {
+        var o = d + from
+        for q in 0..cnt {
+            out[r0 + q] = base +% int(s[o])
+            o += 1
+        }
+        return
+    }
+    if w == 16 {
+        var o = d + 2 * from
+        for q in 0..cnt {
+            out[r0 + q] = base +% u16At(s, o)
+            o += 2
+        }
+        return
+    }
     let mask = (1 << w) - 1
     let bp = from * w
     var pos = d + (bp >> 3)
@@ -1281,6 +1297,188 @@ pub fn intsInto(s: &str, dir: &[]int, p: int, from: int, cnt: int, out: mut &[]i
             o += 2
         }
     }
+}
+
+// Rows from + qs[x] of an integer place (or a units place's units) into
+// out[r0 + rs[x]], hoisting codec/base/width once per leaf.
+pub fn intsPick(s: &str, dir: &[]int, p: int, from: int, qs: &[]int, rs: &[]int, out: mut &[]int, r0: int) {
+    let n = len(qs)
+    if n <= 0 { return }
+    let x = DIR_HDR + D * p
+    let c = dir[x + F_CODEC]
+    if c == C_FOR || c == C_UNITS {
+        let w = dir[x + F_W]
+        let base = dir[x + F_BASE]
+        if w == 0 {
+            for q in 0..n { out[r0 + rs[q]] = base }
+            return
+        }
+        let data = dir[x + F_DATA]
+        if w == 8 {
+            for q in 0..n { out[r0 + rs[q]] = base +% int(s[data + from + qs[q]]) }
+            return
+        }
+        if w == 16 {
+            for q in 0..n { out[r0 + rs[q]] = base +% u16At(s, data + 2 * (from + qs[q])) }
+            return
+        }
+        let mask = (1 << w) - 1
+        for q in 0..n {
+            let bp = (from + qs[q]) * w
+            var pos = data + (bp >> 3)
+            let sk = bp & 7
+            var acc = int(s[pos]) >> sk
+            var have = 8 - sk
+            pos += 1
+            while have < w {
+                acc = acc | (int(s[pos]) << have)
+                pos += 1
+                have += 8
+            }
+            out[r0 + rs[q]] = base +% (acc & mask)
+        }
+        return
+    }
+    let wb = dir[x + F_W]
+    let data = dir[x + F_DATA]
+    if wb == 8 {
+        for q in 0..n { out[r0 + rs[q]] = binary.readI64LEStr(s, data + 8 * (from + qs[q])) }
+    } else if wb == 4 {
+        for q in 0..n { out[r0 + rs[q]] = binary.readI32LEStr(s, data + 4 * (from + qs[q])) }
+    } else {
+        for q in 0..n { out[r0 + rs[q]] = binary.readI16LEStr(s, data + 2 * (from + qs[q])) }
+    }
+}
+
+// Rows from + (rs[q] - r0) of an integer place into out[q], hoisting codec/base/width.
+pub fn intsPickDense(s: &str, dir: &[]int, p: int, from: int, rs: &[]int, r0: int, out: mut &[]int) {
+    let n = len(rs)
+    if n <= 0 { return }
+    let x = DIR_HDR + D * p
+    let c = dir[x + F_CODEC]
+    let off = from - r0
+    if c == C_FOR || c == C_UNITS {
+        let w = dir[x + F_W]
+        let base = dir[x + F_BASE]
+        if w == 0 {
+            for q in 0..n { out[q] = base }
+            return
+        }
+        let data = dir[x + F_DATA]
+        if w == 8 {
+            for q in 0..n { out[q] = base +% int(s[data + off + rs[q]]) }
+            return
+        }
+        if w == 16 {
+            for q in 0..n { out[q] = base +% u16At(s, data + 2 * (off + rs[q])) }
+            return
+        }
+        let mask = (1 << w) - 1
+        for q in 0..n {
+            let bp = (off + rs[q]) * w
+            var pos = data + (bp >> 3)
+            let sk = bp & 7
+            var acc = int(s[pos]) >> sk
+            var have = 8 - sk
+            pos += 1
+            while have < w {
+                acc = acc | (int(s[pos]) << have)
+                pos += 1
+                have += 8
+            }
+            out[q] = base +% (acc & mask)
+        }
+        return
+    }
+    let wb = dir[x + F_W]
+    let data = dir[x + F_DATA]
+    if wb == 8 {
+        for q in 0..n { out[q] = binary.readI64LEStr(s, data + 8 * (off + rs[q])) }
+    } else if wb == 4 {
+        for q in 0..n { out[q] = binary.readI32LEStr(s, data + 4 * (off + rs[q])) }
+    } else {
+        for q in 0..n { out[q] = binary.readI16LEStr(s, data + 2 * (off + rs[q])) }
+    }
+}
+
+// Fused full-run range filter on a non-NULL integer/units place: returns row
+// indices r0 + q (q in 0..cnt) whose value is in [lo, hi], with no temporary
+// unpacked value array.
+pub fn rangeFilter(s: &str, dir: &[]int, p: int, from: int, cnt: int, r0: int, lo: int, hi: int): []int {
+    var out: []int = withCapacity(cnt)
+    if cnt <= 0 { return out }
+    let x = DIR_HDR + D * p
+    let c = dir[x + F_CODEC]
+    if c == C_FOR || c == C_UNITS {
+        let w = dir[x + F_W]
+        let base = dir[x + F_BASE]
+        if w == 0 {
+            if base >= lo && base <= hi {
+                for q in 0..cnt { append(mut &out, r0 + q) }
+            }
+            return out
+        }
+        let data = dir[x + F_DATA]
+        if w == 8 {
+            var o = data + from
+            for q in 0..cnt {
+                let v = base +% int(s[o])
+                if v >= lo && v <= hi { append(mut &out, r0 + q) }
+                o += 1
+            }
+            return out
+        }
+        if w == 16 {
+            var o = data + 2 * from
+            for q in 0..cnt {
+                let v = base +% u16At(s, o)
+                if v >= lo && v <= hi { append(mut &out, r0 + q) }
+                o += 2
+            }
+            return out
+        }
+        let mask = (1 << w) - 1
+        let bp = from * w
+        var pos = data + (bp >> 3)
+        let sk = bp & 7
+        var acc = int(s[pos]) >> sk
+        var have = 8 - sk
+        pos += 1
+        for q in 0..cnt {
+            while have < w {
+                acc = acc | (int(s[pos]) << have)
+                pos += 1
+                have += 8
+            }
+            let v = base +% (acc & mask)
+            if v >= lo && v <= hi { append(mut &out, r0 + q) }
+            acc = acc >> w
+            have -= w
+        }
+        return out
+    }
+    let wb = dir[x + F_W]
+    var o = dir[x + F_DATA] + wb * from
+    if wb == 8 {
+        for q in 0..cnt {
+            let v = binary.readI64LEStr(s, o)
+            if v >= lo && v <= hi { append(mut &out, r0 + q) }
+            o += 8
+        }
+    } else if wb == 4 {
+        for q in 0..cnt {
+            let v = binary.readI32LEStr(s, o)
+            if v >= lo && v <= hi { append(mut &out, r0 + q) }
+            o += 4
+        }
+    } else {
+        for q in 0..cnt {
+            let v = binary.readI16LEStr(s, o)
+            if v >= lo && v <= hi { append(mut &out, r0 + q) }
+            o += 2
+        }
+    }
+    return out
 }
 
 // Row i of an integer place (or a units place's units).

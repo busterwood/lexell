@@ -7243,7 +7243,7 @@ fn joinSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.P
             markReads(&j.post, mut &ab2)
             markReads(&j.res, mut &ab2)
             try joinSetup(st, txn, &i, cols, tabs, srcs, vrows, cx, jr, dec, bud, cnt, &ab2)
-            if j.how == lexdb_plan.JH_JOIN { return grpSetup(st, txn, &j, cols, tabs, srcs, vrows, cx, jr, dec, bud, cnt) }
+            if j.how == lexdb_plan.JH_JOIN { return grpSetup(st, txn, &j, cols, tabs, srcs, vrows, cx, jr, dec, bud, cnt, above) }
             let sc = &j.scan
             let t = tabs[sc.level]
             var jl = newJL(j.how, sc.level, sc.first, len(t.cols))
@@ -7380,7 +7380,7 @@ fn joinSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.P
 // the hub's (built, kept).
 fn grpSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, j: &lexdb_plan.PJoin, cols: &[]lexdb_sql.ColDef,
             tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, jr: mut &JRun, dec: bool, bud: mut &Budget,
-            cnt: mut &[]Counts): Result[Unit, DbErr] {
+            cnt: mut &[]Counts, above: &[]bool): Result[Unit, DbErr] {
     let nq = jr.nq
     let hub = j.scan.level
     var jl = newJL(lexdb_plan.JH_JOIN, hub, 0, nq)
@@ -7406,11 +7406,25 @@ fn grpSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, j: &lexdb_plan.PJ
         let ko = cols[jl.keyCol[0]].typ.oid
         if (ho == lexdb_sql.OID_TEXT || ho == lexdb_sql.OID_VARCHAR) && (ko == lexdb_sql.OID_TEXT || ko == lexdb_sql.OID_VARCHAR) && !textVals(jr.kinds[hc], jr.kinds[jl.keyCol[0]]) { jl.mode = JK_TEXT }
     }
+    var hasExtraCond = false
+    for k in 0..len(j.conds) {
+        if k == j.keq && jl.mode != JK_GEN { continue }
+        hasExtraCond = true
+    }
+    var needAbove = false
+    for c in 0..nq { if want[c] && above[c] { needAbove = true } }
+    let countOnly = !hasExtraCond && !needAbove && jl.mode == JK_INT
+    jl.countOnly = countOnly
+    var buildWant = collections.copyOf(&want)
+    if countOnly {
+        buildWant = array(nq, false)
+        for h in j.hcols { if h >= 0 && h < nq { buildWant[h] = true } }
+    }
     // the build run: its rows into the hash
     var kinds: []int = []
     var owner: []int = []
     kindsFor(build, tabs, vrows, nq, dec, mut &kinds, mut &owner)
-    let bp = BPlan{kinds: collections.copyOf(&jr.kinds), needCol: collections.copyOf(&want), placeCol: [], usedP: [], stopAt: 0, missing: [], needP: [], width: 0, ranges: []}
+    let bp = BPlan{kinds: collections.copyOf(&jr.kinds), needCol: collections.copyOf(&buildWant), placeCol: [], usedP: [], stopAt: 0, missing: [], needP: [], width: 0, ranges: []}
     var rows0 = lexdb_rows.newBatch(&bp, 0)
     rows0.n = 0
     var bd = Builder{rows: rows0, head: [], tail: [], next: [], ints: newMap(), txts: collections.newMapWith(collections.fxHashStr), gens: collections.newMapWith(collections.fxHashStr), mixed: [], single: [],
@@ -7423,11 +7437,15 @@ fn grpSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, j: &lexdb_plan.PJ
     var sub: []Counts = array(len(cnt), noCounts())
     hashBuilds += 1
     let na = noApply()
-    try joinRows(st, txn, build, cols, tabs, srcs, vrows, cx, dec, kinds, owner, collections.copyOf(&want), false, bud, mut &sub, &na,
+    try joinRows(st, txn, build, cols, tabs, srcs, vrows, cx, dec, kinds, owner, collections.copyOf(&buildWant), false, bud, mut &sub, &na,
                  fn(tx: mut &lexdb_store.Txn, f: mut &Batch): Result[bool, DbErr] {
         var all: []int = withCapacity(f.n)
         for r in 0..f.n { append(mut &all, r) }
-        try bd.add(f, &all, &bp, &j.hcols, mode, false, false, -1, room, maxHeld, &j.colls)
+        if countOnly {
+            try bd.addCount(f, &all, &j.hcols, mode, room, maxHeld)
+        } else {
+            try bd.add(f, &all, &bp, &j.hcols, mode, false, false, -1, room, maxHeld, &j.colls)
+        }
         return Ok(true)
     })
     // (the members' hashes freed: the group's held instead)
@@ -7453,6 +7471,7 @@ fn grpSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, j: &lexdb_plan.PJ
     jl.ints = replace(mut &bd.ints, newMap())
     jl.txts = replace(mut &bd.txts, collections.newMapWith(collections.fxHashStr))
     jl.gens = replace(mut &bd.gens, collections.newMapWith(collections.fxHashStr))
+    jl.fastCnt = replace(mut &bd.fastCnt, lexdb_ht.newFastIntCount())
     buildDense(mut &jl, bd.hasRange, bd.minK, bd.maxK, bud.room())
     for k in 0..len(j.conds) {
         // (the key's equality, when the hash compares by value: applied by the probe)
@@ -7501,7 +7520,7 @@ fn reduceHashes(jr: mut &JRun) {
     while j > 2 {
         j -= 1
         let jh = jr.jls[j].how
-        if !(jh == lexdb_plan.JH_HASH || jh == lexdb_plan.JH_ROWS || jh == lexdb_plan.JH_JOIN) || jr.jls[j].mode != JK_INT || jr.jls[j].countOnly || jr.jls[j].left || jr.jls[j].right ||
+        if !(jh == lexdb_plan.JH_HASH || jh == lexdb_plan.JH_ROWS || jh == lexdb_plan.JH_JOIN) || jr.jls[j].mode != JK_INT || jr.jls[j].left || jr.jls[j].right ||
            jr.jls[j].mark == lexdb_plan.MK_ANTI || jr.jls[j].na != 0 || len(jr.jls[j].key) != 1 { continue }
         var c = -1
         match jr.jls[j].key[0] {
@@ -7534,8 +7553,30 @@ fn reduceHashes(jr: mut &JRun) {
         var live: []bool = array(jr.jls[k].rows.n, false)
         {
             let rows = &jr.jls[k].rows
-            let held = &jr.jls[j].ints
-            for r in 0..rows.n { live[r] = !rows.cols[kc].nul[r] && held.get(&rows.cols[kc].v[r]).isSome() }
+            let jl2 = &jr.jls[j]
+            let col = &rows.cols[kc]
+            let dLen = len(jl2.dense)
+            if dLen > 0 {
+                let dMin = jl2.denseMin
+                if jl2.countOnly {
+                    for r in 0..rows.n {
+                        if col.nul[r] { continue }
+                        let d = col.v[r] - dMin
+                        live[r] = d >= 0 && d < dLen && jl2.dense[d] > 0
+                    }
+                } else {
+                    for r in 0..rows.n {
+                        if col.nul[r] { continue }
+                        let d = col.v[r] - dMin
+                        live[r] = d >= 0 && d < dLen && jl2.dense[d] >= 0
+                    }
+                }
+            } else if jl2.countOnly {
+                for r in 0..rows.n { live[r] = !col.nul[r] && jl2.fastCnt.get(col.v[r]) > 0 }
+            } else {
+                let held = &jl2.ints
+                for r in 0..rows.n { live[r] = !col.nul[r] && held.get(&col.v[r]).isSome() }
+            }
         }
         let cut = cutRows(mut &jr.jls[k], &live, j)
     }
@@ -7608,7 +7649,7 @@ fn buildDense(jl: mut &JL, hasRange: bool, minK: int, maxK: int, room: int) {
     if span <= 0 || span > 2000000 { return }
     let nKeys = if jl.countOnly { jl.fastCnt.size() } else { jl.ints.size() }
     if nKeys == 0 { return }
-    if span > 16384 && span > 8 * nKeys { return }
+    if span > 16384 && span > 16 * nKeys { return }
     if room >= 0 && span * 8 > room { return }
     if jl.countOnly {
         var d: []int = array(span, 0)
