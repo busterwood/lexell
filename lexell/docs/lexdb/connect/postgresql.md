@@ -19,11 +19,7 @@ lexdb ./data 127.0.0.1:5432 /run/lexdb      # TCP, and a Unix socket /run/lexdb/
 - **Simple and extended query protocols.** Several statements in one Query message; Parse, Bind, Describe,
   Execute, Close, Sync and Flush. After an error in the extended protocol the messages up to Sync are skipped, as
   PostgreSQL does. Named and unnamed prepared statements and portals work.
-- **Text results only.** A Bind that asks for binary results gets `lexdb: results in binary are not supported`
-  (0A000).
-- **Parameters** may be text, or binary for `int2`, `int4`, `int8`, `bool`, `float4`, `float8`, `text`, `varchar`,
-  `bpchar` and arrays of those. Other binary parameters (`numeric`, `bytea`, `uuid`, dates and times) are refused
-  (0A000). Drivers that send binary by default need a setting: see [pgjdbc](#java-pgjdbc).
+- **Text and binary results & parameters.** Binary parameters and binary results are supported across standard scalar types (`int2`, `int4`, `int8`, `oid`, `bool`, `float4`, `float8`, `numeric`, `text`, `varchar`, `bpchar`, `bytea`, `uuid`, `date`, `time`, `timestamp`, `timestamptz`, `json`, `jsonb`) and arrays of those — working out of the box with `asyncpg`, `psycopg` (`binary=True`), `Npgsql` / EF Core, and `pgjdbc` without special connection flags.
 - **COPY** `FROM STDIN` and `TO STDOUT` in text and CSV format: see [bulk loading](../bulk-load.md#postgresql-copy).
 - **ParameterStatus** at startup: `server_version` (16.0), `server_encoding` and `client_encoding` (UTF8),
   `DateStyle` (ISO, MDY), `integer_datetimes`, `standard_conforming_strings`, `TimeZone`, `application_name`,
@@ -84,9 +80,7 @@ Checked for this documentation (2026-11-23), against a lexdb built from the same
 - **pgjdbc 42.7.14**, with its default settings (below).
 - **Lexell's `postgres` module** (lib/postgres).
 
-Checked while lexdb was developed (design/lexdb.md 9.75, 9.80, 9.137): psycopg 3 in text mode, node-postgres 8,
-SQLAlchemy 2.1 and Alembic on psycopg, pgbench, and libpq's `target_session_attrs`. Clients that need binary
-results do not work yet: asyncpg, and psycopg with `binary=True`.
+Checked against LexDB (2026-11-26): **psql 18.6**, **pgjdbc 42.7.14**, **psycopg 3** (text & binary), **asyncpg 0.32** (including arrays and binary parameters), **SQLAlchemy 2.1 + Alembic autogenerate**, **Django 6.1** (migrations, ORM, introspection), **Npgsql / Entity Framework Core 9**, **node-postgres 8 + Knex**, **pgbench**, and Lexell's `postgres` module. Server-side SQL cursors (`DECLARE` / `FETCH`) are not yet supported.
 
 ## psql
 

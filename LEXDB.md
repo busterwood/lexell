@@ -4,7 +4,7 @@ LexDB is a fast, full-featured SQL database server written in [Lexell](README.md
 
 One server speaks **three native wire protocols and SQL dialects simultaneously** over the same tables and catalog:
 
-- **PostgreSQL** (`pgwire`, PostgreSQL SQL & PL/pgSQL)
+- **PostgreSQL** (`pgwire`, PostgreSQL SQL)
 - **SQL Server** (`TDS`, T-SQL, batches, collations, `TOP`, `@variables`)
 - **Oracle** (`TNS`, Oracle SQL & PL/SQL, `NUMBER`, `VARCHAR2`, `DUAL`, packages)
 

@@ -1,0 +1,176 @@
+// Multi-door driver & ORM compatibility regression suite:
+// - PostgreSQL door: pg_catalog.pg_range, pg_catalog.pg_cursors, default_table_access_method GUC,
+//   OID_OID column typing on pg_type/pg_attribute (required by asyncpg & Npgsql), strict PG bool->numeric error.
+// - SQL Server door: @@VERSION standard format (SQLAlchemy pymssql), INFORMATION_SCHEMA default collation
+//   (no 468 conflict with NVARCHAR casts), T-SQL table-qualified ORDER BY on UNION (SQLAlchemy FK reflection).
+// - Oracle door: USER_JSON_COLUMNS / ALL_JSON_COLUMNS / DBA_JSON_COLUMNS, CHECK constraint columns in
+//   USER_CONS_COLUMNS / ALL_CONS_COLUMNS (POSITION NULL), LIKEC/LIKE2/LIKE4, = ANY / <> ALL / < ALL
+//   expression lists, and Oracle 23ai BOOLEAN->NUMBER write coercion (Django Oracle).
+// expect: pg_range_cursors: 0|0
+// expect: pg_am_guc: heap|heap
+// expect: pg_oid_types: 26|26|26
+// expect: pg_bool_to_num: 42804
+// expect: tds_version_ok: true
+// expect: tds_is_coll_ok: 1
+// expect: tds_union_order: c_child;c_parent
+// expect: ora_json_cols: ORA_T|PAYLOAD|OSON|JSON
+// expect: ora_check_cons_col: CK_ORA_AGE|AGE|<null>
+// expect: ora_likec: 1|1|1|0
+// expect: ora_any_all: 1|1|1|0
+// expect: ora_bool_to_num: 1;0
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_parse"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_tsql"
+
+fn fmtRows(rows: &[][]lexdb_sql.Val): str {
+    var out: []str = []
+    for row in rows {
+        var cs: []str = []
+        for v in row {
+            match v {
+                lexdb_sql.Val.Null { append(mut &cs, "<null>") }
+                else { append(mut &cs, lexdb_sql.text(&v)) }
+            }
+        }
+        append(mut &out, strings.join(&cs, "|"))
+    }
+    return strings.join(&out, ";")
+}
+
+fn q(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            return if r.hasRows { fmtRows(&r.rows) } else { r.tag.clone() }
+        }
+        Err(e) { return "ERR:" + e.state + ":" + e.msg }
+    }
+}
+
+fn qErr(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(_) { return "OK" }
+        Err(e) { return e.state.clone() }
+    }
+}
+
+fn qTsql(s: mut &lexdb_exec.Session, st: mut &lexdb_tsql.State, sql: str): str {
+    var f = lexdb_tsql.newFrame()
+    var evs: []lexdb_tsql.Event = []
+    lexdb_tsql.run(s, st, &sql, mut &f, mut &evs)
+    var out: []str = []
+    for ev in evs {
+        if ev.kind == lexdb_tsql.EV_ERROR { return "ERR:" + ev.err.state + ":" + ev.err.msg }
+        if ev.kind == lexdb_tsql.EV_ROWS { append(mut &out, fmtRows(&ev.rows)) }
+    }
+    return strings.join(&out, ";")
+}
+
+fn qOra(s: mut &lexdb_exec.Session, sql: str, params: &[]lexdb_sql.Val, ptypes: &[]int): str {
+    match lexdb_parse.parseFor(&sql, lexdb_sql.MD_ORA) {
+        Ok(stmts) {
+            var last = ""
+            for st in stmts {
+                match s.run(&st, params, ptypes) {
+                    Ok(r) { last = if r.hasRows { fmtRows(&r.rows) } else { r.tag.clone() } }
+                    Err(e) { return "ERR:" + e.state + ":" + e.msg }
+                }
+            }
+            return last
+        }
+        Err(e) { return "PARSE:" + e.state + ":" + e.msg }
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(85), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 1024 * 1024, snapNodes: 10000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        // ---- PostgreSQL door checks ----
+        var pg = lexdb_exec.newSession(st.share())
+        pg.setUser(&"postgres")
+        let rc1 = q(mut &pg, "SELECT (SELECT count(*) FROM pg_catalog.pg_range), (SELECT count(*) FROM pg_catalog.pg_cursors)")
+        println("pg_range_cursors: " + rc1)
+
+        let am1 = q(mut &pg, "SHOW default_table_access_method")
+        let am2 = q(mut &pg, "SELECT current_setting('default_table_access_method')")
+        println("pg_am_guc: " + am1 + "|" + am2)
+
+        var oids: []str = []
+        match pg.exec(&"SELECT oid, typelem, typarray FROM pg_type WHERE oid = 1007") {
+            Ok(rs) {
+                for c in rs[0].cols { append(mut &oids, c.oid.toStr()) }
+            }
+            Err(e) { append(mut &oids, "ERR:" + e.msg) }
+        }
+        println("pg_oid_types: " + strings.join(&oids, "|"))
+
+        let _p1 = q(mut &pg, "CREATE TABLE pg_num_t (id int PRIMARY KEY, flag numeric(1,0))")
+        println("pg_bool_to_num: " + qErr(mut &pg, "INSERT INTO pg_num_t VALUES (1, true)"))
+
+        // ---- SQL Server (TDS) door checks ----
+        var tds = lexdb_exec.newSession(st.share())
+        tds.setDoor(&"tds")
+        tds.setUser(&"sa")
+        tds.setCollation(&lexdb_sql.TSQL_COLLATION)
+        var tst = lexdb_tsql.newState(1)
+        let ver = qTsql(mut &tds, mut &tst, "SELECT @@VERSION")
+        let verOk = strings.startsWith(&ver, "Microsoft SQL Server ") && strings.contains(&ver, " - 16.0.4315.2 ") && strings.contains(&ver, "lexdb")
+        println("tds_version_ok: " + (if verOk { "true" } else { "false:" + ver }))
+
+        let _t1 = qTsql(mut &tds, mut &tst, "CREATE TABLE dbo.c_parent (id INT PRIMARY KEY)")
+        let _t2 = qTsql(mut &tds, mut &tst, "CREATE TABLE dbo.c_child (id INT PRIMARY KEY, pid INT REFERENCES dbo.c_parent(id))")
+        let isColl = qTsql(mut &tds, mut &tst,
+            "SELECT COUNT(*) FROM INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS r " +
+            "INNER JOIN INFORMATION_SCHEMA.KEY_COLUMN_USAGE k ON k.table_schema = r.constraint_schema AND k.constraint_name = r.constraint_name " +
+            "WHERE k.table_schema = CAST('dbo' AS NVARCHAR(max)) AND k.table_name = CAST('c_child' AS NVARCHAR(max))")
+        println("tds_is_coll_ok: " + isColl)
+
+        let uo = qTsql(mut &tds, mut &tst,
+            "WITH fk_info AS (SELECT table_name FROM INFORMATION_SCHEMA.TABLES WHERE table_name IN ('c_parent', 'c_child')) " +
+            "SELECT fk_info.table_name FROM fk_info WHERE fk_info.table_name = 'c_parent' " +
+            "UNION " +
+            "SELECT fk_info.table_name FROM fk_info WHERE fk_info.table_name = 'c_child' " +
+            "ORDER BY fk_info.table_name")
+        println("tds_union_order: " + uo)
+
+        // ---- Oracle (TNS) door checks ----
+        var ora = lexdb_exec.newSession(st.share())
+        ora.setDoor(&"tns")
+        ora.setUser(&"sa")
+        let noP: []lexdb_sql.Val = []
+        let noT: []int = []
+        let _o1 = qOra(mut &ora, "CREATE TABLE ora_t (id NUMBER PRIMARY KEY, age NUMBER, active NUMBER(1), payload JSON, CONSTRAINT ck_ora_age CHECK (age >= 0))", &noP, &noT)
+        let jc = qOra(mut &ora, "SELECT table_name, column_name, format, data_type FROM user_json_columns WHERE table_name = 'ORA_T'", &noP, &noT)
+        println("ora_json_cols: " + jc)
+
+        let cc = qOra(mut &ora, "SELECT constraint_name, column_name, position FROM user_cons_columns WHERE table_name = 'ORA_T' AND constraint_name = 'CK_ORA_AGE'", &noP, &noT)
+        println("ora_check_cons_col: " + cc)
+
+        let lc = qOra(mut &ora,
+            "SELECT " +
+            "CASE WHEN 'hello_world' LIKEC 'hello\\_w%' ESCAPE '\\' THEN 1 ELSE 0 END, " +
+            "CASE WHEN 'abc' LIKE2 'a%' THEN 1 ELSE 0 END, " +
+            "CASE WHEN 'abc' NOT LIKE4 'z%' THEN 1 ELSE 0 END, " +
+            "CASE WHEN 'abc' LIKEC 'z%' THEN 1 ELSE 0 END FROM dual", &noP, &noT)
+        println("ora_likec: " + lc)
+
+        let aa = qOra(mut &ora,
+            "SELECT " +
+            "CASE WHEN 'P' = ANY('P', 'U', 'C') THEN 1 ELSE 0 END, " +
+            "CASE WHEN 'P' <> ALL('X', 'Y') THEN 1 ELSE 0 END, " +
+            "CASE WHEN 5 < ALL(10, 20) THEN 1 ELSE 0 END, " +
+            "CASE WHEN 'Z' = ANY('P', 'U', 'C') THEN 1 ELSE 0 END FROM dual", &noP, &noT)
+        println("ora_any_all: " + aa)
+
+        // Oracle 23ai BOOLEAN bind into NUMBER(1) column
+        let _b1 = qOra(mut &ora, "INSERT INTO ora_t (id, age, active) VALUES (1, 10, $1)", &[lexdb_sql.Val.Bool(true)], &[lexdb_sql.OID_BOOL])
+        let _b2 = qOra(mut &ora, "INSERT INTO ora_t (id, age, active) VALUES (2, 20, $1)", &[lexdb_sql.Val.Bool(false)], &[lexdb_sql.OID_BOOL])
+        let bn = qOra(mut &ora, "SELECT active FROM ora_t ORDER BY id", &noP, &noT)
+        println("ora_bool_to_num: " + bn)
+        return 0
+    })
+}

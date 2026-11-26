@@ -17,7 +17,7 @@ it.
 
 Each protocol listener is called a **door** in these pages. A door is more than a protocol:
 
-- **Syntax.** The PostgreSQL door takes PostgreSQL's SQL and PL/pgSQL. The SQL Server door takes T-SQL: batches,
+- **Syntax.** The PostgreSQL door takes PostgreSQL's SQL. The SQL Server door takes T-SQL: batches,
   `@variables`, `TOP`, `[quoted names]`, procedures. The Oracle door takes Oracle SQL and PL/SQL: `NUMBER`,
   `VARCHAR2`, `DUAL`, `ROWNUM`, packages.
 - **Semantics where programs depend on them.** In the Oracle door the empty string is NULL and `DATE` has a time of

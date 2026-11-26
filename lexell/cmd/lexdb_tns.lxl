@@ -920,10 +920,13 @@ fn readRequest(c: mut &tns.Cur, d: &str, fv: int, lenient: bool, jdbc: bool, cur
         }
         if mt == tns.MT_PROTOCOL {
             try c.skip(2, "protocol")
+            var drv = ""
             while true {
                 let b = try c.u8("protocol")
                 if b == 0 { break }
+                drv.addByte(byte(b))
             }
+            r.user = drv
             r.kind = R_PROTOCOL
             return Ok(r)
         }
@@ -931,6 +934,8 @@ fn readRequest(c: mut &tns.Cur, d: &str, fv: int, lenient: bool, jdbc: bool, cur
             try c.skip(5, "data types")
             r.caps = try c.bytesOrEmpty("compile capabilities")
             let rc = try c.bytesOrEmpty("runtime capabilities")
+            // ODP.NET sends a 2-byte NCHAR charset id (e.g. 0x07d0) before the data type table (which starts with type 1)
+            if c.pos + 4 <= len(d) && be16(d, c.pos) != 1 && be16(d, c.pos + 2) == 1 { try c.skip(2, "data types") }
             let at = c.pos
             while true {
                 let t = try c.u16be("data type")
@@ -1131,6 +1136,7 @@ type Conn = record {
     prog: lexdb_plsql.Prog  // the stored procedures and functions, compiled
     connId: int             // the listener's count of its connections (a redirect's round robin)
     local: str              // the address the client reached (a redirect's host for a wildcard one)
+    odp: bool               // ODP.NET Managed driver (universal SB1, but length-prefixed strings like python-oracledb)
 }
 
 // The session's state ALTER SESSION sets (O5).
@@ -1218,7 +1224,7 @@ fn (c: mut &Conn) endCall(num: int, text: &str, cursor: int, rows: int) {
     c.batch = []
     c.o.ub(if nb > 0 { 24381 } else { num })
     c.o.ub(rows)
-    if c.fv >= 14 { c.o.ubs(2) }
+    if c.fv >= 14 && !c.odp { c.o.ubs(2) }
     if nb > 0 { c.o.bytes(&(oraText(24381, "error(s) in array DML"))) } else if num != 0 { c.o.bytes(text) }
 }
 
@@ -1421,7 +1427,7 @@ fn (c: mut &Conn) auth1(rq: &Req) {
     append(mut &ps, kv("AUTH_PBKDF2_VGEN_COUNT", &(count.toStr()), 0))
     append(mut &ps, kv("AUTH_PBKDF2_SDER_COUNT", "3", 0))
     c.params(&ps)
-    c.statusMsg()
+    if c.odp { c.endCall(0, "", 0, 0) } else { c.statusMsg() }
 }
 
 // Whether the phase-two pairs prove the password; the combined key when they do.
@@ -1508,7 +1514,7 @@ fn (c: mut &Conn) auth2(rq: &Req) {
             append(mut &ps, kv("AUTH_SC_INSTANCE_NAME", SERVICE, 0))
             append(mut &ps, kv("AUTH_SC_DB_UNIQUE_NAME", SERVICE, 0))
             c.params(&ps)
-            c.statusMsg()
+            if c.odp { c.endCall(0, "", 0, 0) } else { c.statusMsg() }
         }
         Err(_) {
             c.auth = Auth{have: false, role: "", salt: "", count: 0, hash: "", partA: "", csk: "", noLogin: false}
@@ -3426,6 +3432,7 @@ fn (c: mut &Conn) dispatch(rq: &Req): bool {
     c.seq = rq.seq
     for id in rq.closes { c.closeCursor(id) }
     if rq.kind == R_PROTOCOL {
+        if strings.startsWith(&rq.user, "ODP.NET") { c.odp = true }
         c.protocolReply()
         return true
     }
@@ -3508,7 +3515,7 @@ fn (c: mut &Conn) requests(): Result[Unit, str] {
         pending = pending + p.data[2..len(p.data)]
         // before the login a request is a few hundred bytes: a small cap, so no one costs the server a 64 MiB re-parse
         if requestTooBig(c.loggedIn, len(pending)) { return Err("a request larger than " + (if c.loggedIn { MAX_REQUEST } else { MAX_PREAUTH_REQUEST }).toStr() + " bytes") }
-        match parseRequest(&pending, c.fv, len(p.data) < c.w.sdu - 24, c.o.sb1u, &c.cursors) {
+        match parseRequest(&pending, c.fv, len(p.data) < c.w.sdu - 24, c.o.sb1u && !c.odp, &c.cursors) {
             Ok(rq) {
                 pending = ""
                 let more = c.dispatch(&rq)
@@ -3605,18 +3612,24 @@ fn (c: mut &Conn) connect(): Result[bool, str] {
         return Ok(false)
     }
     let v = min(TNS_VERSION, version)
+    var s32 = max(512, min(sdu, 2097152))
+    let s16 = min(s32, 0xffff)
+    let t32 = 2097152
     var a = newOut()
     a.u16be(v)
-    a.zeros(6)                                  // service options, SDU, TDU (the 32-bit ones are below)
+    a.u16be(0)                                  // service options
+    a.u16be(s16)                                // 16-bit SDU (ODP.NET rejects 0)
+    a.u16be(0xffff)                             // 16-bit TDU (ODP.NET rejects 0)
     a.u16be(1)                                  // the byte order JDBC reads the FDO's length in
     a.zeros(4)
     a.u8(4)                                     // flags: NA disabled (JDBC sends no NA packet), not required
     a.zeros(9)
-    var s32 = max(512, min(sdu, 2097152))
     a.u16be((s32 >> 16) & 0xffff)
     a.u16be(s32 & 0xffff)
     if v >= 318 {
-        a.zeros(5)
+        a.u16be((t32 >> 16) & 0xffff)           // 32-bit TDU
+        a.u16be(t32 & 0xffff)
+        a.u8(0)
         a.u16be(0)                              // flags 2: no end of response, no fast authentication
         a.u16be(0)
         if v >= 319 { a.zeros(16) }             // the database's UUID (JDBC 23 reads it)
@@ -3665,7 +3678,7 @@ pub fn serve(a: ConnArg): int {
     lexdb_plcall.install()
     sess.setDoor(&"tns")
     let local = sock.localAddr()
-    var c = Conn{connId: id, local: local, w: newWire(sock), sess: sess, st: st, o: newOut(), secret: secret, fv: FV_SERVER, seq: 0, user: "",
+    var c = Conn{connId: id, local: local, odp: false, w: newWire(sock), sess: sess, st: st, o: newOut(), secret: secret, fv: FV_SERVER, seq: 0, user: "",
                  auth: Auth{have: false, role: "", salt: "", count: 0, hash: "", partA: "", csk: "", noLogin: false}, cursors: [],
                  nextCursor: 0, loggedIn: false, batch: [], secure: false, nls: newNls(), localZone: "UTC", lobs: [], nextLob: 0, lobBytes: 0, pl: lexdb_plsql.newIp(st.share()), prog: lexdb_plsql.newProg()}
     // Oracle has no limit on a recursive WITH's iterations (its cycle check ends the common runaway; lexdb's statement

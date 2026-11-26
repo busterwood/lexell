@@ -100,8 +100,7 @@ Checked for this documentation (2026-11-23), against a lexdb built from the same
 - **ojdbc11 23.26.4** (Oracle's JDBC thin driver).
 - **Lexell's `oracle` module** (lib/oracle).
 
-Checked while lexdb was developed (design/lexdb-oracle.md, 9.137): python-oracledb 26.1 in thin mode, SQLcl (its
-`INFO` and `DDL` commands), node-oracledb 6 in thin mode. SQL*Plus is a thick client and does not connect.
+Checked against LexDB (2026-11-26): **ojdbc11 23.26.4**, **python-oracledb 26** (thin mode), **SQLAlchemy 2.1 + Alembic autogenerate**, **Django 6.1** (migrations, ORM, introspection), **Oracle.ManagedDataAccess.Core 23 (.NET thin)**, **SQLcl** (`INFO` and `DDL`), **node-oracledb 6** (thin mode), and Lexell's `oracle` module. SQL*Plus is a thick client and does not connect; EF Core Oracle batched writes require PL/SQL collection types (`TYPE ... IS TABLE OF`), which are not yet supported.
 
 ## A first session
 

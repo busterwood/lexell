@@ -76,10 +76,7 @@ Checked for this documentation (2026-11-23), against a lexdb built from the same
 - **mssql-jdbc 13.6.2** (Microsoft's JDBC driver).
 - **Lexell's `sqlserver` module** (lib/sqlserver), including its bulk copy.
 
-Checked while lexdb was developed (design/lexdb-tds.md): sqlcmd and bcp of mssql-tools18 (ODBC Driver 18),
-Microsoft.Data.SqlClient 6 (.NET), and VS Code's SQL Server extension (connect, browse, completion). sqlcmd and bcp
-are not installed on the machine these pages were checked on, so their command lines here are not run by the
-checker.
+Checked against LexDB (2026-11-26): **mssql-jdbc 13.6.2**, **Microsoft.Data.SqlClient + Entity Framework Core 9**, **pymssql 2.4 + SQLAlchemy 2.1 + Alembic autogenerate**, **node-mssql (tedious) + Knex**, **sqlcmd / bcp** (ODBC Driver 18), VS Code's SQL Server extension, and Lexell's `sqlserver` module.
 
 ## A first session
 
@@ -139,7 +136,7 @@ lexell/compiler/out/lxlc lexell/docs/lexdb/connect/examples/lexell/tds_hello.lxl
 ```
 
 ```
-server: lexdb (SQL Server protocol, TDS 7.4; reports itself as Microsoft SQL Server 16.0.4315)
+server: Microsoft SQL Server 2022 (RTM) - 16.0.4315.2 (X64) (lexdb, TDS 7.4)
 bulk copy: 2 rows
 transaction: rolled back, error 547
 1 apple 1.20

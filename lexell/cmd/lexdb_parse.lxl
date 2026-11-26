@@ -1224,7 +1224,31 @@ fn (p: mut &P) cmpExpr0(): Result[Expr, lexdb_base.DbErr] {
                 return Ok(Expr.Call((if all { "all " } else { "any " }) + op, [e, arr], false))
             }
             let arr = try p.expr()
+            if p.ora && p.acceptKw(",") {
+                // Oracle's x op ANY|SOME|ALL (e1, e2, ...) expression list
+                var items: []Expr = [arr]
+                while true {
+                    append(mut &items, try p.expr())
+                    if !p.acceptKw(",") { break }
+                }
+                try p.expectKw(")")
+                if (op == "=" && !all) || (op == "<>" && all) {
+                    var args: []Expr = [e]
+                    for it in items { append(mut &args, lexdb_sql.cloneExpr(&it)) }
+                    return Ok(negate(all, Expr.Call("in", args, false)))
+                }
+                let joinOp = if all { "and" } else { "or" }
+                var acc = Expr.Bin(op.clone(), lexdb_sql.cloneExpr(&e), lexdb_sql.cloneExpr(&items[0]))
+                for k in 1..len(items) {
+                    acc = Expr.Bin(joinOp.clone(), acc, Expr.Bin(op.clone(), lexdb_sql.cloneExpr(&e), lexdb_sql.cloneExpr(&items[k])))
+                }
+                return Ok(acc)
+            }
             try p.expectKw(")")
+            if p.ora {
+                if (op == "=" && !all) || (op == "<>" && all) { return Ok(negate(all, Expr.Call("in", [e, arr], false))) }
+                return Ok(Expr.Bin(op, e, arr))
+            }
             return Ok(Expr.Call((if all { "all " } else { "any " }) + op, [e, arr], false))
         }
         if isRow(&e) && p.isKw("(") && (p.peekAt(1).text == "select" || p.peekAt(1).text == "with") {
@@ -1258,16 +1282,17 @@ fn (p: mut &P) cmpExpr0(): Result[Expr, lexdb_base.DbErr] {
         let r = try p.catExpr()
         return Ok(Expr.Call(rop, [e, r], false))
     }
-    // [NOT] LIKE, ILIKE, SIMILAR TO, IN, BETWEEN
+    // [NOT] LIKE, ILIKE, SIMILAR TO, IN, BETWEEN (plus Oracle's LIKEC/LIKE2/LIKE4)
     var neg = false
     let nt = p.peekAt(1).clone()
     if p.isKw("not") && nt.kind == T_IDENT && (nt.text == "like" || nt.text == "ilike" || nt.text == "in" || nt.text == "between" ||
-                                               nt.text == "similar") {
+                                               nt.text == "similar" || (p.ora && (nt.text == "likec" || nt.text == "like2" || nt.text == "like4"))) {
         p.pos += 1
         neg = true
     }
-    if p.isKw("like") || p.isKw("ilike") {
+    if p.isKw("like") || p.isKw("ilike") || (p.ora && (p.isKw("likec") || p.isKw("like2") || p.isKw("like4"))) {
         var kw = p.next().text
+        if p.ora && (kw == "likec" || kw == "like2" || kw == "like4") { kw = "like" }
         let q = p.peek().clone()
         if q.kind == T_IDENT && (q.text == "any" || q.text == "some" || q.text == "all") && p.peekAt(1).kind == T_OP && p.peekAt(1).text == "(" {
             // x [NOT] LIKE ANY | ALL (array or subquery) (9.94): the call "any like",

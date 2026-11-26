@@ -390,8 +390,8 @@ SELECT DATABASEPROPERTYEX('lexdb', 'Status') AS status, DATABASEPROPERTYEX('lexd
 
 ```text
 version
---------------------------------------------------------------------------------------
-lexdb (SQL Server protocol, TDS 7.4; reports itself as Microsoft SQL Server 16.0.4315)
+-----------------------------------------------------------------
+Microsoft SQL Server 2022 (RTM) - 16.0.4315.2 (X64) (lexdb, TDS 7.4)
 
 (1 row affected)
 

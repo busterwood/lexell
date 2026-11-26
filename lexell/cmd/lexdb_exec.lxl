@@ -255,7 +255,11 @@ fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
     }
     if strings.startsWith(&name, "#") {
         // a catalog relation (9.80)
-        for c in lexdb_pgcat.relCols(&lexdb_sql.catRelName(name)) { append(mut &out, OutCol{name: c.name.clone(), oid: c.oid, spell: "", coll: "", scale: -1}) }
+        let isTsql = strings.endsWith(&name, lexdb_sql.TSQL_IS)
+        for c in lexdb_pgcat.relCols(&lexdb_sql.catRelName(name)) {
+            let cc = if isTsql && lexdb_bind.isTextOid(c.oid) { lexdb_sql.TSQL_COLLATION } else { "" }
+            append(mut &out, OutCol{name: c.name.clone(), oid: c.oid, spell: "", coll: cc, scale: -1})
+        }
         return Ok(out)
     }
     if name == "tsql_regexp_matches" {
@@ -7929,6 +7933,18 @@ fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targ
     return Ok(count)
 }
 
+// Coerce a value to a table column's type on write. In the Oracle door, Oracle 23ai accepts a BOOLEAN bind into a
+// NUMBER column (TRUE -> 1, FALSE -> 0), which drivers like python-oracledb / Django send for NUMBER(1) booleans.
+fn coerceCol(st: &lexdb_store.Store, txn: &lexdb_store.Txn, v: Val, typ: &lexdb_sql.TypeName): Result[Val, DbErr] {
+    if doorMd(st, txn.sql.sess) == lexdb_sql.MD_ORA && (typ.kind == lexdb_sql.K_NUM || typ.kind == lexdb_sql.K_INT) {
+        match v {
+            Val.Bool(b) { return lexdb_ops.coerceZ(Val.Int(if b { 1 } else { 0 }), typ, &txn.sql.zone) }
+            else {}
+        }
+    }
+    return lexdb_ops.coerceZ(v, typ, &txn.sql.zone)
+}
+
 // A row of values for the target columns (the rest their defaults): the
 // row inserted, or under ON CONFLICT the row it updated instead (9.77);
 // None when it did neither (DO NOTHING, or DO UPDATE's WHERE false).
@@ -7940,7 +7956,7 @@ fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targe
     for i in 0..len(t.cols) { append(mut &given, false) }
     for k in 0..len(vs) {
         let ci = targets[k]
-        row[ci] = try lexdb_ops.coerceZ(vs[k].clone(), &t.cols[ci].typ, &txn.sql.zone)
+        row[ci] = try coerceCol(st, txn, vs[k].clone(), &t.cols[ci].typ)
         given[ci] = true
     }
     // the others their defaults (a sequence's taken only for these)
@@ -8139,7 +8155,7 @@ fn upsertOld(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, defs:
     for k in 0..len(up.sets) {
         let ci = up.targets[k]
         if lexdb_sql.isDefault(&up.sets[k]) { next[ci] = try defAt(st, txn, defs, t, ci) }
-        else { next[ci] = try lexdb_ops.coerceZ(try eval(&up.sets[k], &uenv), &t.cols[ci].typ, &txn.sql.zone) }
+        else { next[ci] = try coerceCol(st, txn, try eval(&up.sets[k], &uenv), &t.cols[ci].typ) }
     }
     if len(defs.fill) > 0 { try genFill(t, &defs.fill, mut &next, &txn.sql.zone) }
     match updRow(st, txn, t, old, &next, fw, later) {
@@ -8385,7 +8401,7 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         var all = collections.copyOf(&joined)
         for k in 0..len(sets) {
             if lexdb_sql.isDefault(&sets[k]) { all[targets[k]] = try defAt(st, txn, &defs, t, targets[k]) }
-            else { all[targets[k]] = try lexdb_ops.coerceZ(try evalX(st, txn, &q, &sets[k], &env, mut &rs), &t.cols[targets[k]].typ, &txn.sql.zone) }
+            else { all[targets[k]] = try coerceCol(st, txn, try evalX(st, txn, &q, &sets[k], &env, mut &rs), &t.cols[targets[k]].typ) }
         }
         if len(defs.fill) > 0 { try genFill(t, &defs.fill, mut &all, &txn.sql.zone) }
         // (the table's alone, without FROM: the rows as they are, not copied)
@@ -8414,7 +8430,7 @@ fn updNew(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, m: &Mats
     var all = collections.copyOf(joined)
     for k in 0..len(sets) {
         if lexdb_sql.isDefault(&sets[k]) { all[targets[k]] = try defAt(st, txn, defs, t, targets[k]) }
-        else { all[targets[k]] = try lexdb_ops.coerceZ(try evalX(st, txn, q, &sets[k], &env, rs), &t.cols[targets[k]].typ, &txn.sql.zone) }
+        else { all[targets[k]] = try coerceCol(st, txn, try evalX(st, txn, q, &sets[k], &env, rs), &t.cols[targets[k]].typ) }
     }
     if len(defs.fill) > 0 { try genFill(t, &defs.fill, mut &all, &txn.sql.zone) }
     return Ok(all)
@@ -9437,7 +9453,7 @@ fn mergePlan(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, c0: &MCtx, fw: &
     for k in 0..len(c.targets) {
         let ti = c.targets[k]
         if lexdb_sql.isDefault(&c.exprs[k]) { all[ns + ti] = try defAt(st, txn, c0.defs, t, ti) }
-        else { all[ns + ti] = try lexdb_ops.coerceZ(try evalX(st, txn, q, &c.exprs[k], &env, rs), &t.cols[ti].typ, &txn.sql.zone) }
+        else { all[ns + ti] = try coerceCol(st, txn, try evalX(st, txn, q, &c.exprs[k], &env, rs), &t.cols[ti].typ) }
     }
     touched.put(key, 1)
     var nw = rowSlice(&all, ns, nt)
@@ -11091,7 +11107,7 @@ fn runFastUpd(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &DmlPlan, pa
                 let env = Env{cols: &d.cols, row: &old, aggs: &noAggs, params: params, subs: &noSubs, cur: &noAggs, seq: &noSeq}
                 for k in 0..len(d.targets) {
                     let ci = d.targets[k]
-                    next[ci] = try lexdb_ops.coerceZ(try eval(&d.exprs[k], &env), &d.t.cols[ci].typ, &txn.sql.zone)
+                    next[ci] = try coerceCol(st, txn, try eval(&d.exprs[k], &env), &d.t.cols[ci].typ)
                 }
                 let noTabs: []Table = []
                 var later: []FkLater = []
@@ -11144,7 +11160,7 @@ fn runFastIns(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, d: &DmlPlan, pa
     let env = Env{cols: &noCols, row: &noAggs, aggs: &noAggs, params: params, subs: &noSubs, cur: &noAggs, seq: &noSeq}
     for k in 0..len(d.targets) {
         let ci = d.targets[k]
-        row[ci] = try lexdb_ops.coerceZ(try eval(&d.exprs[k], &env), &d.t.cols[ci].typ, &txn.sql.zone)
+        row[ci] = try coerceCol(st, txn, try eval(&d.exprs[k], &env), &d.t.cols[ci].typ)
     }
     try checkRow(&d.t, &row)
     try checkChecks(&d.t, &row)
@@ -12263,16 +12279,26 @@ fn planSet(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     // a char column sorted without its trailing blanks, as bpchar's order has 'a' and 'a  ' tie (W16's, fuzz)
     let setKinds = setKindsOf(&outs, pg)
     for o in s.order {
-        try lexdb_bind.orderPos(&o.expr, len(outs), len(sc.names.coll) > 0)
-        append(mut &ordKinds, refKindIn(&o.expr, &outs, &setKinds))
+        var ox = lexdb_sql.cloneExpr(&o.expr)
+        if s.mdialect == lexdb_sql.MD_TSQL {
+            match ox {
+                Expr.Col(n, sl) {
+                    let dot = strings.lastIndexOf(&n, ".")
+                    if dot >= 0 { ox = Expr.Col(n[dot + 1..len(n)].toStr(), sl) }
+                }
+                else {}
+            }
+        }
+        try lexdb_bind.orderPos(&ox, len(outs), len(sc.names.coll) > 0)
+        append(mut &ordKinds, refKindIn(&ox, &outs, &setKinds))
         var ok = false
-        match o.expr {
+        match ox {
             Expr.Lit(v) { match v { Val.Int(n) { ok = n >= 1 && n <= len(outs) } else {} } }
             Expr.Col(n, _) { for oc in outs { if oc.name == n { ok = true } } }
             else {}
         }
         if !ok { return Err(e("42P10", &("invalid " + what + " ORDER BY clause: name or number an output column"))) }
-        append(mut &order, lexdb_sql.cloneExpr(&o.expr))
+        append(mut &order, ox)
     }
     var desc: []bool = []
     var nullsFirst: []bool = []
@@ -13826,6 +13852,7 @@ fn (s: &Session) setting(name: &str): Option[str] {
         "max_identifier_length" { return Some("63") }
         "application_name" { return Some("") }
         "bytea_output" { return Some("hex") }
+        "default_table_access_method" { return Some("heap") }
         "lexdb_planner" { return Some(if s.rules { "rules" } else { "cost" }) }
         "lexdb_batch" { return Some(if s.batch { "on" } else { "off" }) }
         "lexdb_autoanalyze" { return Some(if s.auto { "on" } else { "off" }) }
@@ -13847,7 +13874,7 @@ const SHOWN: []str = ["search_path", "max_recursion", "max_match_steps", "statem
                       "transaction_read_only", "default_transaction_read_only", "in_hot_standby", "server_version",
                       "server_version_num", "server_encoding", "client_encoding", "datestyle", "timezone", "log_timezone",
                       "intervalstyle", "lc_collate", "lc_ctype", "lc_messages", "lc_monetary", "lc_numeric", "lc_time",
-                      "max_identifier_length", "application_name", "bytea_output", "lexdb_batch", "lexdb_planner", "lexdb_autoanalyze", "lexdb_range_delete", "query_rewrite_enabled"]
+                      "max_identifier_length", "application_name", "bytea_output", "default_table_access_method", "lexdb_batch", "lexdb_planner", "lexdb_autoanalyze", "lexdb_range_delete", "query_rewrite_enabled"]
 
 // The session's settings for current_setting and set_config (9.92), in the
 // memo while a statement calling them runs: a line each, name TAB value.
