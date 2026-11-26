@@ -16,6 +16,7 @@ import "fs"
 import "task"
 import "io"
 import "binary"
+import "collections"
 import "strings"
 import "math"
 import "./lexdb_base"
@@ -78,10 +79,20 @@ type Wire = record {
     texts: []str                // dataRow's values' texts, the array used again for each row
 }
 
-// The prepared statements and portals of a connection.
+// Cached auto-parameterized simple-query SELECT template (e.g. "select * from w where id = $1;")
+type AutoEntry = record {
+    stmt: lexdb_sql.Stmt
+    ptypes: []int
+    catAt: int
+    pathAt: int
+    plan: lexdb_exec.PlanCache
+}
+
+// The prepared statements, portals, and auto-parameterized simple-query templates of a connection.
 type Ps = record {
     stmts: Map[str, Prepared]
     portals: Map[str, Portal]
+    autos: Map[str, AutoEntry]
 }
 
 // ---- reading
@@ -725,10 +736,168 @@ fn (w: &Wire) hasMsg(): bool {
 
 // ---- the simple query protocol
 
-fn (w: mut &Wire) query(sql: &str): Result[Unit, io.IoError] {
+fn isAsciiSpace(b: byte): bool { return b == ' ' || b == '\t' || b == '\n' || b == '\r' }
+fn isIdentCh(b: byte): bool {
+    return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') || b == '_'
+}
+fn isDigit(b: byte): bool { return b >= '0' && b <= '9' }
+fn lowAscii(b: byte): byte { return if b >= 'A' && b <= 'Z' { byte(int(b) + 32) } else { b } }
+
+// Lightweight single-pass auto-parameterizer for simple ad-hoc SELECT ... WHERE ... = <int>
+// queries (no quotes, comments, multi-statements, casts, or existing params).
+fn autoParamSelect(sql: &str, tmpl: mut &str, params: mut &[]Val): bool {
+    let n = len(sql)
+    if n < 16 || n > 512 { return false }
+    var i = 0
+    while i < n && isAsciiSpace(sql[i]) { i += 1 }
+    if i + 7 > n { return false }
+    if lowAscii(sql[i]) != 's' || lowAscii(sql[i + 1]) != 'e' || lowAscii(sql[i + 2]) != 'l' ||
+       lowAscii(sql[i + 3]) != 'e' || lowAscii(sql[i + 4]) != 'c' || lowAscii(sql[i + 5]) != 't' ||
+       !isAsciiSpace(sql[i + 6]) { return false }
+    tmpl.clear()
+    var inWhere = false
+    var seenSemi = false
+    var p = 0
+    while p < n {
+        let ch = sql[p]
+        if seenSemi {
+            if !isAsciiSpace(ch) { return false }
+            tmpl.addByte(ch)
+            p += 1
+            continue
+        }
+        if ch == '\'' || ch == '"' || ch == '$' || ch == '?' || ch == ':' { return false }
+        if ch == '-' && p + 1 < n && sql[p + 1] == '-' { return false }
+        if ch == '/' && p + 1 < n && sql[p + 1] == '*' { return false }
+        if ch == ';' {
+            seenSemi = true
+            tmpl.addByte(ch)
+            p += 1
+            continue
+        }
+        if !inWhere && (ch == 'w' || ch == 'W') && p + 5 < n &&
+           (p == 0 || !isIdentCh(sql[p - 1])) &&
+           lowAscii(sql[p + 1]) == 'h' && lowAscii(sql[p + 2]) == 'e' &&
+           lowAscii(sql[p + 3]) == 'r' && lowAscii(sql[p + 4]) == 'e' &&
+           isAsciiSpace(sql[p + 5]) {
+            inWhere = true
+        }
+        if inWhere && ch == '=' {
+            let prevBad = p > 0 && (sql[p - 1] == '=' || sql[p - 1] == '!' || sql[p - 1] == '<' || sql[p - 1] == '>')
+            let nextBad = p + 1 < n && sql[p + 1] == '='
+            tmpl.addByte(ch)
+            p += 1
+            if !prevBad && !nextBad && len(params) < 4 {
+                while p < n && isAsciiSpace(sql[p]) {
+                    tmpl.addByte(sql[p])
+                    p += 1
+                }
+                if p < n && isDigit(sql[p]) {
+                    let st = p
+                    var v = 0
+                    while p < n && isDigit(sql[p]) && p - st < 18 {
+                        v = v * 10 + (int(sql[p]) - int('0'))
+                        p += 1
+                    }
+                    let tailOk = p == n || (!isDigit(sql[p]) && sql[p] != '.' && sql[p] != 'e' && sql[p] != 'E' && !isIdentCh(sql[p]))
+                    if tailOk {
+                        append(mut &params, Val.Int(v))
+                        tmpl.addByte('$')
+                        tmpl.addByte(byte(int('0') + len(params)))
+                        continue
+                    }
+                    // Not a plain <=18-digit int literal: emit verbatim
+                    for q in st..p { tmpl.addByte(sql[q]) }
+                    continue
+                }
+            }
+            continue
+        }
+        tmpl.addByte(ch)
+        p += 1
+    }
+    return len(params) > 0
+}
+
+fn autoParamsFit(ptypes: &[]int, params: &[]Val): bool {
+    if len(ptypes) != len(params) { return false }
+    for i in 0..len(ptypes) {
+        let oid = ptypes[i]
+        if oid != lexdb_sql.OID_INT2 && oid != lexdb_sql.OID_INT4 && oid != lexdb_sql.OID_INT8 { return false }
+        match params[i] {
+            Val.Int(v) {
+                if oid == lexdb_sql.OID_INT2 && (v < -32768 || v > 32767) { return false }
+                if oid == lexdb_sql.OID_INT4 && (v < -2147483648 || v > 2147483647) { return false }
+            }
+            else { return false }
+        }
+    }
+    return true
+}
+
+fn (w: mut &Wire) tryAutoQuery(ps: mut &Ps, sql: &str): Result[bool, io.IoError] {
+    var tmpl = ""
+    var params: []Val = []
+    if !autoParamSelect(sql, mut &tmpl, mut &params) { return Ok(false) }
+    let curCat = w.st.changes()
+    let curPath = w.sess.pathVersion()
+    if !ps.autos.has(&tmpl) {
+        match lexdb_parse.parse(&tmpl) {
+            Err(_) { return Ok(false) }
+            Ok(stmts) {
+                if len(stmts) != 1 || stmts[0].kind != lexdb_sql.S_SELECT ||
+                   len(stmts[0].wctes) > 0 || len(stmts[0].subs) > 0 ||
+                   stmts[0].params != len(params) {
+                    return Ok(false)
+                }
+                let given: []int = array(len(params), 0)
+                let ptypes = w.sess.paramTypes(&stmts[0], &given)
+                if !autoParamsFit(&ptypes, &params) { return Ok(false) }
+                if ps.autos.size() >= 64 { ps.autos = collections.newMapWith(collections.fxHashStr) }
+                ps.autos.put(tmpl.clone(), AutoEntry{
+                    stmt: stmts[0].clone(),
+                    ptypes: ptypes,
+                    catAt: curCat,
+                    pathAt: curPath,
+                    plan: lexdb_exec.newPlanCache(),
+                })
+            }
+        }
+    }
+    var ent = ps.autos.remove(&tmpl).unwrap()
+    if ent.catAt != curCat || ent.pathAt != curPath {
+        // Catalog or search_path changed: drop stale entry and fall through cleanly
+        return Ok(false)
+    }
+    if !autoParamsFit(&ent.ptypes, &params) {
+        ps.autos.put(tmpl, ent)
+        return Ok(false)
+    }
+    let noCheck: Option[[]lexdb_bind.OutCol] = None
+    let r = w.runStreamed(&ent.stmt, &params, &ent.ptypes, mut &ent.plan, true, &noCheck)
+    ps.autos.put(tmpl, ent)
+    match r {
+        Ok(res) {
+            if res.hasRows && !w.streamed {
+                w.rowDesc(&res.cols)
+                w.dataRows(&res.rows, &res.cols)
+            }
+            w.complete(&res.tag)
+        }
+        Err(e) { w.error(&e) }
+    }
+    if len(w.out) > 65536 { try w.flush() }
+    return Ok(true)
+}
+
+fn (w: mut &Wire) query(ps: mut &Ps, sql: &str): Result[Unit, io.IoError] {
     // a cancel request that came while the session was idle stops nothing (PostgreSQL's, 9.138)
     if lexdb_base.cancelPending() { let late = lexdb_base.takeCancel(w.sess.number()) }
     // census: lexdb_census.statement(sql)
+    if try w.tryAutoQuery(ps, sql) {
+        w.ready()
+        return w.flush()
+    }
     match lexdb_parse.parse(sql) {
         Err(e) { w.error(&e) }
         Ok(stmts) {
@@ -1256,7 +1425,7 @@ fn (w: mut &Wire) step(ps: mut &Ps, m: &Msg): Result[bool, io.IoError] {
         w.skipping = false
         var r = Rd{s: m.body.clone(), at: 0, bad: false}
         let sql = r.cstr()
-        try w.query(&sql)
+        try w.query(ps, &sql)
         return Ok(true)
     }
     // CopyData, CopyDone and CopyFail outside COPY (one that ended in an
@@ -1287,7 +1456,7 @@ pub fn serve(a: ConnArg): int {
     let nd = c.setNoDelay(true)
     var w = Wire{c: c, eng: [], raw: [], bind: "", inBuf: array(65536, byte(0)), inPos: 0, inEnd: 0, out: "", sess: lexdb_exec.newSession(st.share()), st: st,
                  skipping: false, tzShown: "", streamed: false, texts: []}
-    var ps = Ps{stmts: newMap(), portals: newMap()}
+    var ps = Ps{stmts: newMap(), portals: newMap(), autos: collections.newMapWith(collections.fxHashStr)}
     if startup(mut &w, &ctx).unwrapOr(false) {
         while true {
             let got = w.readMsg(false)
