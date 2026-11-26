@@ -39,7 +39,7 @@ DROP [ SKIPPING ] INDEX [ IF EXISTS ] name
 : A table, optionally schema-qualified. A view cannot have an index.
 
 `USING btree` | *skipping_method*
-: The index method. `btree` is the default. Data skipping methods (`minmax`/`brin`, `set(max_rows)`, `bloom_filter(bits_per_key, size_bytes, hashes)`, `ngrambf(n, size_bytes, hashes)`, `tokenbf(size_bytes, hashes)`) store compact per-node summaries across the table's B+tree hierarchy so analytical scans prune entire subtrees without reading non-matching leaves. Skipping indexes cannot be `UNIQUE` and index a single column; they incur zero maintenance work on OLTP writes (subtrees invalidate via a version counter and refresh lazily or on `ANALYZE`). Control runtime pruning with `SET data_skipping_enabled = on | off` (default `on`).
+: The index method. `btree` is the default. Data skipping methods (`minmax`/`brin`, `set(max_rows)`, `bloom_filter(bits_per_key, size_bytes, hashes)`, `ngrambf(n, size_bytes, hashes)`, `tokenbf(size_bytes, hashes)`) store compact per-node summaries across the table's B+tree hierarchy so analytical scans prune entire subtrees without reading non-matching leaves. Skipping indexes cannot be `UNIQUE` and index a single column; they incur zero maintenance work on OLTP writes (subtrees invalidate via a version counter and refresh lazily or on `ANALYZE`).
 
 *column_name*, `(` *expression* `)`, *function_call*
 : What the index holds: columns, or expressions of the row's columns (`lower(email)`, `(a + b)`), with no

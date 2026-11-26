@@ -1014,10 +1014,10 @@ fn barPlaceOf(bp: &BPlan, bar: &Bar): int {
 // Helper: scans leaves via scanLeavesSkip when skipQ or a live Top-N bar is active,
 // otherwise uses the standard scanLeaves fast path.
 fn scanLeavesWithSkip(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rw: &lexdb_rows.Rows,
-                      from: &str, to: str, sq: &lexdb_skip.SkipQuery, bar: &Bar, barPl: int, skipOn: bool,
+                      from: &str, to: str, sq: &lexdb_skip.SkipQuery, bar: &Bar, barPl: int,
                       f: &fn(&lexdb_rows.LeafView, int, int): bool): Result[Unit, DbErr] {
     let bOn = bar.on && !bar.nul && barPl >= 0
-    if !skipOn || (!sq.active && !bOn) {
+    if !sq.active && !bOn {
         return st.scanLeaves(txn, t.tree, from, to, f)
     }
     let sid = st.id
@@ -1049,9 +1049,8 @@ fn fillBatchSkip(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc:
     if sc.empty || sc.point { return fillPoint(st, txn, t, sc, part, cur, bp) }
     var b = lexdb_rows.reuse(spare, bp)
     let rw = rowsFor(t)
-    let skipOn = lexdb_skip.isEnabled(txn.sql.sess)
     let barPl = barPlaceOf(bp, bar)
-    if skipOn && (sq.active || barPl >= 0) { let _ = try lexdb_skip.ensureTreeLoaded(st, txn, t.tree, t.name) }
+    if sq.active || barPl >= 0 { let _ = try lexdb_skip.ensureTreeLoaded(st, txn, t.tree, t.name) }
     while b.n < BROWS && !cur.done {
         let from: &str = if cur.started { &cur.at } else { &sc.lo }
         cur.started = true
@@ -1059,7 +1058,7 @@ fn fillBatchSkip(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc:
         var stop = 0                // 1 the batch is full, 2 a value stored apart
         var bail = false
         var bad: []DbErr = []
-        try scanLeavesWithSkip(st, txn, t, &rw, from, sc.hi.clone(), sq, bar, barPl, skipOn, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+        try scanLeavesWithSkip(st, txn, t, &rw, from, sc.hi.clone(), sq, bar, barPl, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
             if len(bp.ranges) > 0 && leaf.isCols && lexdb_rows.excluded(leaf, bp, &rw) { return true }
             var k = i
             while k < j {
@@ -2212,7 +2211,7 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
     // (an index's read, 9.107, whole: an index-only entry's columns come
     // from its key all at once; its rows, fetched by their keys, as fillLevel reads them)
     if !lz.on || sc.empty || sc.point || (rd.ix >= 0 && !sc.whole) {
-        let canSkip = lexdb_skip.isEnabled(txn.sql.sess) && !sc.empty && !sc.point && (rd.ix < 0 || sc.whole) && !rd.desc && (lz.skipQ.active || (bar.on && !bar.nul))
+        let canSkip = !sc.empty && !sc.point && (rd.ix < 0 || sc.whole) && !rd.desc && (lz.skipQ.active || (bar.on && !bar.nul))
         let got = if canSkip { try fillBatchSkip(st, txn, t, sc, part, cur, bp, &lz.skipQ, bar, spare) }
                   else { try fillLevel(st, txn, t, rd, sc, part, cur, bp, spare) }
         if got.isNone() { return Ok(None) }
@@ -2227,9 +2226,8 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
     }
     var b = lexdb_rows.reuse(spare, bp)
     let rw = rowsFor(t)
-    let skipOn = lexdb_skip.isEnabled(txn.sql.sess)
     let barPl = barPlaceOf(bp, bar)
-    if skipOn && (lz.skipQ.active || barPl >= 0) { let _ = try lexdb_skip.ensureTreeLoaded(st, txn, t.tree, t.name) }
+    if lz.skipQ.active || barPl >= 0 { let _ = try lexdb_skip.ensureTreeLoaded(st, txn, t.tree, t.name) }
     var idx: []int = []
     var pend: []int = []                // rows decoded whole: chosen at the end
     var kept = 0
@@ -2244,7 +2242,7 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
         var bigR: []int = []
         var bigK: []str = []
         var bigV: []str = []
-        try scanLeavesWithSkip(st, txn, t, &rw, from, sc.hi.clone(), &lz.skipQ, bar, barPl, skipOn, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+        try scanLeavesWithSkip(st, txn, t, &rw, from, sc.hi.clone(), &lz.skipQ, bar, barPl, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
             if len(bp.ranges) > 0 && leaf.isCols && lexdb_rows.excluded(leaf, bp, &rw) { return true }
             var k = i
             while k < j {

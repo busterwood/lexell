@@ -277,7 +277,7 @@ lexdb: ALTER INDEX takes RENAME TO only
 
 ### H. Data skipping indexes
 
-lexdb supports hierarchical B+tree data skipping indexes (`minmax`/`brin`, `set`, `bloom_filter`, `ngrambf`, `tokenbf`) for pruning subtrees on analytical equality, `IN`, range, and substring `LIKE` queries with zero OLTP write-path maintenance. Toggle pruning with `SET data_skipping_enabled = on | off`.
+lexdb supports hierarchical B+tree data skipping indexes (`minmax`/`brin`, `set`, `bloom_filter`, `ngrambf`, `tokenbf`) for pruning subtrees on analytical equality, `IN`, range, and substring `LIKE` queries with zero OLTP write-path maintenance.
 
 <!-- example: tsql -->
 ```sql
