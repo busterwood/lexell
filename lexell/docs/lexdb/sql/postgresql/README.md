@@ -157,7 +157,7 @@ privileges](catalog-roles.md) · [statistics and other relations](catalog-other.
 ## Settings
 
 `SET` and `SHOW`: `search_path`, `TimeZone`, `statement_timeout`, `max_recursion`, `max_statement_mem`,
-`max_match_steps`, and lexdb's `lexdb_planner` (`cost` or `rules`), `lexdb_batch`, `lexdb_autoanalyze`,
+`max_match_steps`, `query_rewrite_enabled`, and lexdb's `lexdb_planner` (`cost` or `rules`), `lexdb_batch`, `lexdb_autoanalyze`,
 `lexdb_range_delete`. `SHOW` also gives `transaction_isolation`, `transaction_read_only`, `server_version`,
 `server_encoding`, `client_encoding`, `DateStyle`, `IntervalStyle`, `standard_conforming_strings`, `is_superuser`,
 `in_hot_standby` and other fixed values. Other names are accepted and ignored by `SET`.

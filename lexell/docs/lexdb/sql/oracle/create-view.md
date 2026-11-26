@@ -195,7 +195,6 @@ CREATE VIEW v_bad AS SELECT * FROM nothere;
 CREATE VIEW v_ro AS SELECT id, name FROM emp WITH READ ONLY;
 CREATE VIEW v_ck AS SELECT id, dept FROM emp WHERE dept = 1 WITH CHECK OPTION;
 CREATE FORCE VIEW v_force AS SELECT * FROM nothere;
-CREATE MATERIALIZED VIEW mv AS SELECT * FROM emp;
 ```
 
 ```text
@@ -210,9 +209,6 @@ ORA-03001: unimplemented feature: lexdb: WITH CHECK OPTION is not supported
 
 ERROR:
 ORA-00900: invalid SQL statement
-
-ERROR:
-ORA-03001: unimplemented feature: lexdb: CREATE MATERIALIZED is not supported yet (CREATE makes tables, views, indexes, schemas, sequences, types, roles and users)
 ```
 
 ### F. Annotations
@@ -500,4 +496,4 @@ SELECT * FROM tool
 
 ## See also
 
-[DROP VIEW](drop-view.md), [SELECT](select.md), [CREATE TABLE](create-table.md), [Annotations](annotations.md)
+[DROP VIEW](drop-view.md), [CREATE MATERIALIZED VIEW](create-materialized-view.md), [SELECT](select.md), [CREATE TABLE](create-table.md), [Annotations](annotations.md)

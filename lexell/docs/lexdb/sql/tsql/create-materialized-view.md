@@ -114,8 +114,6 @@ SELECT dept_id, mn, mx, du, vp FROM dbo.mv_stats ORDER BY dept_id;
 ```text
 (2 rows affected)
 
-(2 rows affected)
-
 dept_id mn  mx  du vp
 ------- --- --- -- ---------------------
 1       100 300 4  5468.7500000000000000
@@ -142,8 +140,6 @@ SELECT dept_id, cnt, tot FROM dbo.mv_rt ORDER BY dept_id;
 ```
 
 ```text
-(2 rows affected)
-
 (1 row affected)
 
 dept_id cnt tot
@@ -181,10 +177,6 @@ SELECT SUM(amount) AS grand_tot FROM dbo.sales;
 ```
 
 ```text
-(2 rows affected)
-
-(1 row affected)
-
 (1 row affected)
 
 total_rows grand_tot
@@ -221,8 +213,6 @@ DROP VIEW dbo.v_sales;
 ```
 
 ```text
-(3 rows affected)
-
 (1 row affected)
 
 dept_id tot

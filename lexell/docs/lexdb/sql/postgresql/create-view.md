@@ -181,16 +181,14 @@ CREATE VIEW
 UPDATE well_paid SET salary = 1 WHERE id = 1;
 CREATE VIEW well_paid AS SELECT 1;
 CREATE VIEW checked AS SELECT * FROM emp WHERE salary > 0 WITH CHECK OPTION;
-CREATE MATERIALIZED VIEW mv AS SELECT 1;
 ```
 
 ```text
 ERROR:  cannot update view "well_paid" (lexdb's views are read-only)
 ERROR:  relation "well_paid" already exists
 ERROR:  lexdb: WITH CHECK OPTION is not supported
-ERROR:  lexdb: CREATE MATERIALIZED is not supported yet (CREATE makes tables, views, indexes, schemas, sequences, types, roles and users)
 ```
 
 ## See also
 
-[ALTER VIEW](alter-view.md) · [DROP VIEW](drop-view.md) · [SELECT](select.md) · [CREATE TABLE AS](create-table-as.md)
+[ALTER VIEW](alter-view.md) · [DROP VIEW](drop-view.md) · [CREATE MATERIALIZED VIEW](create-materialized-view.md) · [SELECT](select.md) · [CREATE TABLE AS](create-table-as.md)

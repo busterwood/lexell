@@ -109,18 +109,19 @@ SHOW ALL;
 ```
 
 ```text
-        name        | setting
---------------------+----------
- max_recursion      | 1000
- statement_timeout  | 0
- max_statement_mem  | 262144kB
- search_path        | public
- lexdb_batch        | on
- lexdb_planner      | cost
- lexdb_autoanalyze  | on
- lexdb_range_delete | on
- max_match_steps    | 10000000
-(9 rows)
+         name          | setting
+-----------------------+----------
+ max_recursion         | 1000
+ statement_timeout     | 0
+ max_statement_mem     | 262144kB
+ search_path           | public
+ lexdb_batch           | on
+ lexdb_planner         | cost
+ lexdb_autoanalyze     | on
+ lexdb_range_delete    | on
+ max_match_steps       | 10000000
+ query_rewrite_enabled | on
+(10 rows)
 ```
 
 ### C. Errors

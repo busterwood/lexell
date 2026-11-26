@@ -273,7 +273,7 @@ GRAND_TOT
 
 1 row selected.
 
-Statement processed.
+Session altered.
 
 GRAND_TOT
 ---------
@@ -281,7 +281,7 @@ GRAND_TOT
 
 1 row selected.
 
-Statement processed.
+Session altered.
 ```
 
 ### E. `ALTER` and `DROP`
