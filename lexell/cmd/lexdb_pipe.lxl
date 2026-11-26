@@ -5108,10 +5108,8 @@ fn (ag: mut &AggSt) newGroup(born: int) {
             append(mut &ag.amm[i], 0)
         } else if ag.specs[i].vcol >= 0 || ag.gens[i].isSome() {
             append(mut &ag.aval[i], Val.Null)
-        } else if ag.specs[i].dsc >= 0 && (kd == BA_SUM || kd == BA_AVG) {
-            append(mut &ag.adec[i], i128(0))
         } else if kd == BA_SUM || kd == BA_AVG {
-            append(mut &ag.asum[i], 0)
+            append(mut &ag.adec[i], i128(0))
         } else if kd == BA_MIN || kd == BA_MAX {
             append(mut &ag.amm[i], 0)
         }
@@ -5496,14 +5494,14 @@ fn sumColOffset(n: &BNode, kinds: &[]int): SumColOff {
 fn (ag: mut &AggSt) accum(specs: &[]BSpec, b: &Batch, idx: &[]int, gid: &[]int, one: bool): Result[Unit, DbErr] {
     // Per-batch single-column sum cache for ungrouped SUM(col +/- const) chains (e.g. ClickBench q29: 90 SUMs!)
     var sumCol = -1
-    var sumColS = 0
+    var sumColS = i128(0)
     var sumColC = 0
     var sumColMin = 0
     var sumColMax = 0
     var sumColOk = false
     for si in 0..len(specs) {
         let sp = &specs[si]
-        if one && sp.kind == BA_SUM && sp.filter.isNone() && sp.vcol < 0 && sp.dsc < 0 {
+        if one && (sp.kind == BA_SUM || sp.kind == BA_AVG) && sp.filter.isNone() && sp.vcol < 0 && sp.dsc < 0 {
             match &sp.arg {
                 Some(ax) {
                     let sco = sumColOffset(ax, &ag.kinds)
@@ -5513,7 +5511,7 @@ fn (ag: mut &AggSt) accum(specs: &[]BSpec, b: &Batch, idx: &[]int, gid: &[]int, 
                     if col >= 0 {
                         if col != sumCol {
                             sumCol = col
-                            sumColS = 0
+                            sumColS = i128(0)
                             sumColC = 0
                             sumColMin = 9223372036854775807
                             sumColMax = -9223372036854775807 - 1
@@ -5526,44 +5524,28 @@ fn (ag: mut &AggSt) accum(specs: &[]BSpec, b: &Batch, idx: &[]int, gid: &[]int, 
                                 let v = cv[r]
                                 if v < sumColMin { sumColMin = v }
                                 if v > sumColMax { sumColMax = v }
-                                match sumColS.checkedAdd(v) {
-                                    Some(w) { sumColS = w }
-                                    None { sumColOk = false; break }
-                                }
+                                sumColS += i128(v)
                                 sumColC += 1
                             }
                         }
                         if sumColOk {
                             if sumColC == 0 { continue }
                             var fits = true
-                            if fitBits == 16 {
-                                match sumColMin.checkedAdd(delta) { Some(lo) { if lo < -32768 { fits = false } } None { fits = false } }
-                                match sumColMax.checkedAdd(delta) { Some(hi) { if hi > 32767 { fits = false } } None { fits = false } }
-                            } else if fitBits == 32 {
-                                match sumColMin.checkedAdd(delta) { Some(lo) { if lo < -2147483648 { fits = false } } None { fits = false } }
-                                match sumColMax.checkedAdd(delta) { Some(hi) { if hi > 2147483647 { fits = false } } None { fits = false } }
-                            } else {
-                                if sumColMin.checkedAdd(delta).isNone() || sumColMax.checkedAdd(delta).isNone() { fits = false }
+                            if delta != 0 {
+                                if fitBits == 16 {
+                                    match sumColMin.checkedAdd(delta) { Some(lo) { if lo < -32768 { fits = false } } None { fits = false } }
+                                    match sumColMax.checkedAdd(delta) { Some(hi) { if hi > 32767 { fits = false } } None { fits = false } }
+                                } else if fitBits == 32 {
+                                    match sumColMin.checkedAdd(delta) { Some(lo) { if lo < -2147483648 { fits = false } } None { fits = false } }
+                                    match sumColMax.checkedAdd(delta) { Some(hi) { if hi > 2147483647 { fits = false } } None { fits = false } }
+                                } else {
+                                    if sumColMin.checkedAdd(delta).isNone() || sumColMax.checkedAdd(delta).isNone() { fits = false }
+                                }
                             }
                             if fits {
-                                match delta.checkedMul(sumColC) {
-                                    Some(offSum) {
-                                        match sumColS.checkedAdd(offSum) {
-                                            Some(bSum) {
-                                                match ag.asum[si][0].checkedAdd(bSum) {
-                                                    Some(tot) {
-                                                        ag.asum[si][0] = tot
-                                                        ag.an[si][0] += sumColC
-                                                        continue
-                                                    }
-                                                    None {}
-                                                }
-                                            }
-                                            None {}
-                                        }
-                                    }
-                                    None {}
-                                }
+                                ag.adec[si][0] += sumColS + i128(delta) * i128(sumColC)
+                                ag.an[si][0] += sumColC
+                                continue
                             }
                         }
                     }
@@ -5594,7 +5576,7 @@ fn (ag: mut &AggSt) accCall(si: int, sp: &BSpec, b: &Batch, rows: &[]int, gids: 
     if sp.kind == BA_CNTD { return bAccDist(sp, b, rows, gids, one, mut &ag.asets[si]) }
     if sp.kind == BA_VAR { return bAccVar(sp, b, rows, gids, one, mut &ag.an[si], mut &ag.afs[si], mut &ag.afq[si]) }
     if sp.vcol >= 0 { return bAccVal(sp, b, rows, gids, mut &ag.an[si], mut &ag.aval[si]) }
-    if sp.dsc >= 0 && (sp.kind == BA_SUM || sp.kind == BA_AVG) { return bAccDec(sp, b, rows, gids, one, mut &ag.an[si], mut &ag.adec[si]) }
+    if sp.kind == BA_SUM || sp.kind == BA_AVG { return bAccDec(sp, b, rows, gids, one, mut &ag.an[si], mut &ag.adec[si]) }
     return bAccum(sp, b, rows, gids, one, mut &ag.an[si], mut &ag.asum[si], mut &ag.amm[si])
 }
 
@@ -5705,7 +5687,17 @@ fn (ag: mut &AggSt) groupAt(g: int, first: mut &[]Val, accs: mut &[]Acc): Result
             }
             if kd == BA_MIN || kd == BA_MAX { acc.val = lexdb_rows.decVal(ag.amm[si][g], ds) }
         } else if ag.an[si][g] > 0 {
-            if kd == BA_SUM || kd == BA_AVG { acc.sum = Val.Int(ag.asum[si][g]) }
+            if kd == BA_SUM || kd == BA_AVG {
+                let u = ag.adec[si][g]
+                if u >= i128(-9223372036854775807 - 1) && u <= i128(9223372036854775807) {
+                    acc.sum = Val.Int(int(u))
+                } else {
+                    match lexdb_vec.sumVal(u, 0) {
+                        Some(v) { acc.sum = v }
+                        None { return Err(lexdb_ops.decErr()) }
+                    }
+                }
+            }
             if kd == BA_MIN || kd == BA_MAX { acc.val = Val.Int(ag.amm[si][g]) }
         }
     }
@@ -11387,7 +11379,7 @@ fn sortRun(p: &lexdb_plan.PPlan, cap: int, bud: &Budget): SortSt {
             sr.distinct = false
         }
     }
-    if sr.distinct { append(mut &sr.ds, DistSet{ints: newMap(), keys: newMap(), nul: false, kb: ""}) }
+    if sr.distinct { append(mut &sr.ds, DistSet{ints: newMap(), keys: collections.newMapWith(collections.fxHashStr), nul: false, kb: ""}) }
     return sr
 }
 
@@ -11500,7 +11492,21 @@ fn (sr: mut &SortSt) begin(ob: &lexdb_rows.OutBatch, ncol: int) {
         append(mut &sr.set.vk, 0)
     }
     if sr.distinct {
-        sr.dmode = if sr.shown == 1 && sr.kinds[0] != BK_VAL { 1 } else if sr.shown == 1 { 2 } else { 3 }
+        if sr.shown == 1 && sr.kinds[0] != BK_VAL {
+            sr.dmode = 1
+        } else if sr.shown == 1 {
+            sr.dmode = 2
+        } else {
+            var fastMulti = ob.n > 0 && sr.shown >= 2
+            if fastMulti {
+                for o in 0..sr.shown {
+                    if o < len(sr.dcoll) && sr.dcoll[o] != lexdb_sql.COLL_EXACT { fastMulti = false; break }
+                    let ok = ob.kinds[o]
+                    if !(isIntKind(ok) || (ok == lexdb_rows.BK_TEXT && ob.src[o] >= 0)) { fastMulti = false; break }
+                }
+            }
+            sr.dmode = if fastMulti { 4 } else { 3 }
+        }
     }
     if sr.sorting && !sr.distinct && sr.topK < 0 && sr.shown == 1 && len(sr.keyCol) == 1 && sr.keyCol[0] == 0 &&
        (sr.coll[0] == lexdb_sql.COLL_EXACT || sr.coll[0] == lexdb_sql.COLL_PAD) && ob.n > 0 && ob.src[0] >= 0 && ob.kinds[0] == lexdb_rows.BK_TEXT {
@@ -11654,7 +11660,7 @@ fn intVal(kind: int, x: int): Val { return if kind == BK_BOOL { Val.Bool(x == 1)
 // A DISTINCT of one output by the outputs' encoding from now on (dmode 3),
 // the values seen (and NULL, if seen) encoded so.
 fn (sr: mut &SortSt) encodeSeen(seen: []Val) {
-    var keys: Map[str, int] = newMap()
+    var keys: Map[str, int] = collections.newMapWith(collections.fxHashStr)
     for v in seen {
         var kb = ""
         lexdb_access.encIdxPart(mut &kb, &v)
@@ -11667,6 +11673,82 @@ fn (sr: mut &SortSt) encodeSeen(seen: []Val) {
     }
     sr.ds[0].keys = keys
     sr.dmode = 3
+}
+
+// Re-encodes previously seen dmode=4 rows using generic encIdxPart when a later
+// chunk has incompatible types or comes from the row path (ob.n == 0).
+fn (sr: mut &SortSt) downgradeDist4() {
+    var keys: Map[str, int] = collections.newMapWith(collections.fxHashStr)
+    var kb = ""
+    for s in 0..sr.set.n {
+        kb.clear()
+        for o in 0..sr.shown {
+            let v = if sr.set.outs[o].nul[s] { Val.Null }
+                    else if sr.kinds[o] == lexdb_rows.BK_INT { Val.Int(sr.set.outs[o].v[s]) }
+                    else if sr.kinds[o] == BK_BOOL { Val.Bool(sr.set.outs[o].v[s] == 1) }
+                    else { sr.set.ovals[o][s].clone() }
+            lexdb_access.encIdxPart(mut &kb, &(if o < len(sr.dcoll) { lexdb_sort.collVal(sr.dcoll[o], &v) } else { v }))
+        }
+        keys.put(kb.clone(), 1)
+    }
+    sr.ds[0].keys = keys
+    sr.dmode = 3
+}
+
+fn distAddIntBytes(kb: mut &str, v: int) {
+    kb.addByte(byte(v & 255))
+    kb.addByte(byte((v >> 8) & 255))
+    kb.addByte(byte((v >> 16) & 255))
+    kb.addByte(byte((v >> 24) & 255))
+    kb.addByte(byte((v >> 32) & 255))
+    kb.addByte(byte((v >> 40) & 255))
+    kb.addByte(byte((v >> 48) & 255))
+    kb.addByte(byte((v >> 56) & 255))
+}
+
+fn distAddLenBytes(kb: mut &str, n: int) {
+    kb.addByte(byte(n & 255))
+    kb.addByte(byte((n >> 8) & 255))
+    kb.addByte(byte((n >> 16) & 255))
+    kb.addByte(byte((n >> 24) & 255))
+}
+
+fn distCanFast4(sr: &SortSt, ob: &lexdb_rows.OutBatch): bool {
+    if ob.n <= 0 { return false }
+    for o in 0..sr.shown {
+        let ok = ob.kinds[o]
+        if !(isIntKind(ok) || (ok == lexdb_rows.BK_TEXT && ob.src[o] >= 0)) { return false }
+    }
+    return true
+}
+
+fn distBuildKey4(shown: int, kb: mut &str, ob: &lexdb_rows.OutBatch, j: int) {
+    kb.clear()
+    let rr = ob.idx[j]
+    for o in 0..shown {
+        let src = ob.src[o]
+        let ok = ob.kinds[o]
+        if src < 0 {
+            if ob.ex[o].nul[j] {
+                kb.addByte(0)
+            } else {
+                kb.addByte(1)
+                distAddIntBytes(kb, ob.ex[o].v[j])
+            }
+        } else if ob.cols[src].nul[rr] {
+            kb.addByte(0)
+        } else if ok == lexdb_rows.BK_TEXT {
+            let w = ob.cols[src].v[rr]
+            let a = w >> 24
+            let l = w & lexdb_rows.TEXT_MAX
+            kb.addByte(2)
+            distAddLenBytes(kb, l)
+            kb += ob.txt[src][a..a + l]
+        } else {
+            kb.addByte(1)
+            distAddIntBytes(kb, ob.cols[src].v[rr])
+        }
+    }
 }
 
 // Row j's ORDER BY keys into slot s; their bytes in bytes. A key's value
@@ -11735,12 +11817,28 @@ fn (sr: mut &SortSt) seen(ob: &lexdb_rows.OutBatch, r: &[]Val, j: int): bool {
         }
     }
     if sr.dmode == 2 {
+        let k0 = if len(sr.dcoll) > 0 { sr.dcoll[0] } else { lexdb_sql.COLL_EXACT }
+        if k0 == lexdb_sql.COLL_EXACT && ob.n > 0 && ob.src[0] >= 0 && ob.kinds[0] == lexdb_rows.BK_TEXT {
+            let c = ob.src[0]
+            let rr = ob.idx[j]
+            if ob.cols[c].nul[rr] {
+                if sr.ds[0].nul { return true }
+                sr.ds[0].nul = true
+                return false
+            }
+            let w = ob.cols[c].v[rr]
+            let a = w >> 24
+            let l = w & lexdb_rows.TEXT_MAX
+            let s = ob.txt[c][a..a + l]
+            if sr.ds[0].keys.get(&s).isSome() { return true }
+            sr.ds[0].keys.put(s.clone(), 1)
+            return false
+        }
         if sr.cell(BK_VAL, ob, r, j, 0, mut &iv, mut &vv) {
             if sr.ds[0].nul { return true }
             sr.ds[0].nul = true
             return false
         }
-        let k0 = if len(sr.dcoll) > 0 { sr.dcoll[0] } else { lexdb_sql.COLL_EXACT }
         match replace(mut &vv, Val.Null) {
             Val.Text(x) {
                 let tk = if k0 == lexdb_sql.COLL_EXACT { x } else if k0 == lexdb_sql.COLL_CI { lexdb_access.ciKey(&x) } else { lexdb_access.padKey(&x) }
@@ -11755,6 +11853,15 @@ fn (sr: mut &SortSt) seen(ob: &lexdb_rows.OutBatch, r: &[]Val, j: int): bool {
                 sr.encodeSeen(seen)
             }
         }
+    }
+    if sr.dmode == 4 {
+        if distCanFast4(sr, ob) {
+            distBuildKey4(sr.shown, mut &sr.ds[0].kb, ob, j)
+            if sr.ds[0].keys.get(&sr.ds[0].kb).isSome() { return true }
+            sr.ds[0].keys.put(sr.ds[0].kb.clone(), 1)
+            return false
+        }
+        sr.downgradeDist4()
     }
     sr.ds[0].kb.clear()
     for o in 0..sr.shown {
