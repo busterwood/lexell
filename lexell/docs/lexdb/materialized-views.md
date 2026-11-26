@@ -97,8 +97,8 @@ All figures below are single-core measurements from the [LexDB performance repor
 
 | Benchmark | Without MVs | With MVs (unmodified queries) | Incremental write cost |
 |---|---:|---:|---|
-| **ClickBench 1M** (43 queries, 105-column `hits` table) | 13.94 s total (0.67× PG 1-core) | **9.07 s total** — 2.26 s faster than **4-core** PostgreSQL (11.33 s) on one core; 21 queries rewritten; geomean **0.10×** PG1 / **0.21×** PG4 | 1 / 100 new rows maintaining all 8 MVs live: **6.51 / 10.34 ms** (total initial build: 6.01 s) |
-| **35 Analytic Queries** (1M rows) | geomean 0.51× PG1 / 0.83× PG4 | 9 aggregate & join queries drop from 8–74 ms to **3–4 ms** (geomean **0.31×** PG1 / **0.49×** PG4) | 1 / 100 / 1,000 new rows maintaining all 4 MVs live: **4.40 / 7.09 / 25.90 ms** vs PG `REFRESH` **758 / 264 ms** |
+| **ClickBench 1M** (43 queries, 105-column `hits` table) | 12.16 s total (0.58× PG 1-core) | **9.07 s total** — 2.26 s faster than **4-core** PostgreSQL (11.33 s) on one core; 21 queries rewritten; geomean **0.10×** PG1 / **0.21×** PG4 | 1 / 100 new rows maintaining all 8 MVs live: **6.51 / 10.34 ms** (total initial build: 6.01 s) |
+| **35 Analytic Queries** (1M rows) | geomean 0.48× PG1 / 0.78× PG4 | 9 aggregate & join queries drop from 8–74 ms to **3–4 ms** (geomean **0.31×** PG1 / **0.49×** PG4) | 1 / 100 / 1,000 new rows maintaining all 4 MVs live: **4.40 / 7.09 / 25.90 ms** vs PG `REFRESH` **758 / 264 ms** |
 | **Dedicated 1M-row event table** (grouped / sketch / 3-level DAG) | 23.7 ms grouped scan, 234.4 ms sketch scan | **0.18 ms** (132×) / **0.56 ms** (419×) / **0.07 ms** | 1-row `FAST` update: **0.66 / 0.47 / 0.43 ms** vs PG `REFRESH` **60–369 ms** (100×–750× less work) |
 
 ## Which refresh mode should I choose?

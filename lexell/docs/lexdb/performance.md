@@ -1,6 +1,6 @@
 # LexDB performance
 
-Measured on 24–26 November 2026 on `main` (analytics, joins, and graph suites refreshed after hash-join runtime filters and join-planner fixes; OLTP, bulk loads, and materialized views from `59797d55`). Every number compares LexDB directly against **PostgreSQL 18.6** on the same machine, data, disk, and transport.
+Measured on 24–26 November 2026 on `main` (analytics, joins, and graph suites refreshed at `4c1fb4cc` after vectorized `DISTINCT` / `i128` `SUM`/`AVG`, packed hash tables with L3 Bloom pre-filters and `neqCountOnly` joins, single-pass columnar wide-table decoding, and simple-query auto-parameterized PK selects; OLTP, bulk loads, and materialized views from `59797d55`). Every number compares LexDB directly against **PostgreSQL 18.6** on the same machine, data, disk, and transport.
 
 For a high-level introduction to LexDB's architecture, features, and performance highlights, see [LEXDB.md](../../../LEXDB.md). For the full historical benchmark log, test rules, and reproduction scripts, see [design/lexdb-benchmarks.md](../../design/lexdb-benchmarks.md). For Lexell compiler, language, HTTP server, and CLI benchmarks, see [PERFORMANCE.md](../../../PERFORMANCE.md).
 
@@ -16,18 +16,18 @@ For a high-level introduction to LexDB's architecture, features, and performance
 
 | Area | LexDB | PostgreSQL 18 | Result |
 |---|---:|---:|---|
-| **TPC-H SF1** (22 queries, 1 core) | **6,372 ms** | 14,670 ms (1 core) / 8,839 ms (4 proc) | **2.30× faster** than 1 core (22/22 faster, geomean `0.45` wall / `0.42` CPU); **1.39× faster** than 4 proc (`0.73` geomean) |
-| **ClickBench 1M** (43 queries, 105 cols, 1 core) | **13,938 ms** | 22,363 ms (1 core) / 11,326 ms (4 proc) | **1.60× faster** than 1 core (40/43 level or ahead; geomean `0.67` wall / `0.63` CPU) |
+| **TPC-H SF1** (22 queries, 1 core) | **6,286 ms** | 14,670 ms (1 core) / 8,839 ms (4 proc) | **2.33× faster** than 1 core (22/22 faster, geomean `0.45` wall / `0.42` CPU); **1.41× faster** than 4 proc (`0.72` geomean) |
+| **ClickBench 1M** (43 queries, 105 cols, 1 core) | **12,161 ms** | 22,363 ms (1 core) / 11,326 ms (4 proc) | **1.84× faster** than 1 core (42/43 level or ahead; geomean `0.58` wall / `0.55` CPU; within **7%** of 4-core PG on 1 core) |
 | **ClickBench 1M + 8 MVs** (unmodified queries, 1 core) | **9,068 ms** | 11,326 ms (4 proc) | **1.25× faster than 4-core PG on one core** (21 rewritten; geomean `0.10` vs PG1 / `0.21` vs PG4) |
 | **ClickBench 1M + 3 skipping indexes** | 42.6–485.4 ms | — | **1.28–4.07× faster** on selective point & `LIKE '%substring%'` filters; zero OLTP write/read regression |
 | **Selective star-schema joins** (1M fact rows, 6 patterns, 1 core) | **0.54–22.5 ms** | 0.21–77.0 ms (1 core) / 0.24–50.7 ms (4 proc) | **1.24–71.7× faster** (`4.87×` geomean) via hash-join runtime filters; **7.68× faster** than 1-core PG / **4.46×** vs 4-proc PG (geomean) |
-| **35 Analytic Queries** (1M rows, 1 core) | **`0.41×` CPU / `0.83×` wall** | 1 core / 4 proc | **2.47× less CPU** than 1 core (34/35 ahead on CPU and wall); **1.21× faster** than 4 proc on wall (`0.31 / 0.49` geomean with 4 MVs) |
+| **35 Analytic Queries** (1M rows, 1 core) | **`0.39×` CPU / `0.78×` wall** | 1 core / 4 proc | **2.59× less CPU** than 1 core (**35/35** ahead on CPU and wall); **1.28× faster** than 4 proc on wall (`0.31 / 0.49` geomean with 4 MVs) |
 | **Materialized view maintenance** (1M rows, 1 row) | **0.43–0.66 ms** (`FAST`) | 60–369 ms (`REFRESH`) | **90–780× faster** incremental updates; sketch MV build **220 vs 379 ms**; hot-key `realtime` **22,102 commits/s** |
 | **Durable OLTP updates** (1–32 clients) | up to **63.3k/s** (`pgbench`) / **54.2k/s** (`sysbench`) | 25.7k/s / 23.0k/s | **2.41–2.67×** (`pgbench`); **2.36–3.13×** (`sysbench` non-index); **1.32–2.54×** (`sysbench` indexed) |
 | **Point selects (3 read replicas, 32 clients)** | **470–490k/s** (`pgbench`) / **350.5k/s** (`sysbench`) | 397k/s / 334k/s (4 cores) | **1.18–1.23×** (`pgbench`); **1.05×** (`sysbench`, 29% less CPU); replica lag **0.22 ms** p50 / **0.44 ms** p99 |
 | **Bulk `\copy` loads** (5 cases, 1M–10M rows) | 0.24–2.44 s | 0.61–5.93 s | **1.1–2.7× faster** (`0.37–0.94×`) on all 5 workloads |
-| **Property graphs — LDBC LSQB SF1** (9 queries, 22.2M edges, 1 core) | **14.2 s** (`0.45 s` Q6 / `1.00 s` Q1) | 98.1 s (PG1, 8/9) / 4.56 s (DuckPGQ+FK) / 105.0 s (Kùzu) / 156.0 s (Neo4j CE) | **#2 overall behind in-memory DuckPGQ+FK; #1 disk-backed DB** — geomean **5.40×** vs PG1, **2.39×** vs Kùzu (**7.4×** total), **9.48×** vs Neo4j CE (**11.0×** total) ([full report](property-graphs.md#benchmark-2-ldbc-lsqb-sf01-and-sf1-5-engines)) |
-| **Property graphs — social suite** (11 queries, 1.1M edges, 1 core) | **822 ms** (`0.41 ms` G10 / `7.37 ms` G11 / `388 ms` G9) | 5,661 ms (PG1) / 962 ms (DuckPGQ) / 1,367 ms (Kùzu) | **Fastest total time of all 4**; geomean **6.38× faster** than PG1, **2.50× faster** than DuckPGQ, **4.79× faster** than Kùzu ([full report](property-graphs.md#benchmark-1-social-network-graph-suite-11-queries-11m-edges)) |
+| **Property graphs — LDBC LSQB SF1** (9 queries, 22.2M edges, 1 core) | **8.14 s** (`0.10 s` Q6 / `0.82 s` Q1 / `2.24 s` Q9) | 98.1 s (PG1, 8/9) / 4.56 s (DuckPGQ+FK) / 105.0 s (Kùzu) / 156.0 s (Neo4j CE) | **#2 overall behind in-memory DuckPGQ+FK; #1 disk-backed DB** — geomean **9.02×** vs PG1, **4.17×** vs Kùzu (**12.9×** total), **16.5×** vs Neo4j CE (**19.2×** total); `Q6` **5.51× faster than DuckPGQ** ([full report](property-graphs.md#benchmark-2-ldbc-lsqb-sf01-and-sf1-5-engines)) |
+| **Property graphs — social suite** (11 queries, 1.1M edges, 1 core) | **505.5 ms** (`0.41 ms` G10 / `5.78 ms` G11 / `226.5 ms` G9) | 5,661 ms (PG1) / 962 ms (DuckPGQ) / 1,367 ms (Kùzu) | **Fastest total time of all 4** (**1.90×** DuckPGQ, **2.71×** Kùzu, **11.2×** PG1); geomean **7.74×** vs PG1, **3.03×** vs DuckPGQ, **5.81×** vs Kùzu ([full report](property-graphs.md#benchmark-1-social-network-graph-suite-11-queries-11m-edges)) |
 
 PostgreSQL is ahead on single-process multi-thread reads (before adding replicas) and multi-statement read-write blocks.
 
@@ -37,37 +37,37 @@ PostgreSQL is ahead on single-process multi-thread reads (before adding replicas
 
 | | LexDB (one core) | PostgreSQL, one core | PostgreSQL, four processes |
 |---|---:|---:|---:|
-| all 22 queries, summed (wall) | **6,372 ms** | 14,670 ms | 8,839 ms |
-| geometric mean of LexDB / PostgreSQL (wall) | | **0.45** | **0.73** |
+| all 22 queries, summed (wall) | **6,286 ms** | 14,670 ms | 8,839 ms |
+| geometric mean of LexDB / PostgreSQL (wall) | | **0.45** | **0.72** |
 | geometric mean of LexDB / PostgreSQL (CPU) | | **0.42** | |
 | queries faster than one core | | **22 of 22** | |
 
 | query | LexDB wall | PG 1-core wall | LexDB / PG1 | LexDB CPU | PG1 CPU | CPU ratio | PG 4-proc wall | LexDB / PG4 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| q1 | 1,065.4 ms | 3,365.9 ms | 0.32 | 1,061.7 ms | 3,375.3 ms | 0.31 | 873.5 ms | 1.22 |
-| q2 | 32.8 ms | 160.9 ms | 0.20 | 32.7 ms | 166.9 ms | 0.20 | 137.6 ms | 0.24 |
-| q3 | 270.7 ms | 551.7 ms | 0.49 | 269.7 ms | 579.3 ms | 0.47 | 353.6 ms | 0.77 |
-| q4 | 116.8 ms | 184.9 ms | 0.63 | 116.3 ms | 211.6 ms | 0.55 | 102.9 ms | 1.14 |
-| q5 | 125.9 ms | 312.6 ms | 0.40 | 125.5 ms | 341.2 ms | 0.37 | 173.2 ms | 0.73 |
-| q6 | 176.1 ms | 274.8 ms | 0.64 | 175.3 ms | 294.1 ms | 0.60 | 203.4 ms | 0.87 |
-| q7 | 350.3 ms | 585.8 ms | 0.60 | 348.7 ms | 615.2 ms | 0.57 | 287.6 ms | 1.22 |
-| q8 | 146.6 ms | 226.2 ms | 0.65 | 145.9 ms | 253.5 ms | 0.58 | 141.9 ms | 1.03 |
-| q9 | 1,149.4 ms | 1,743.2 ms | 0.66 | 1,144.5 ms | 1,770.1 ms | 0.65 | 750.9 ms | 1.53 |
-| q10 | 253.0 ms | 389.0 ms | 0.65 | 251.8 ms | 417.2 ms | 0.60 | 167.3 ms | 1.51 |
-| q11 | 50.2 ms | 61.4 ms | 0.82 | 50.0 ms | 67.7 ms | 0.74 | 61.5 ms | 0.82 |
-| q12 | 400.7 ms | 854.9 ms | 0.47 | 399.0 ms | 880.7 ms | 0.45 | 253.6 ms | 1.58 |
-| q13 | 538.7 ms | 839.8 ms | 0.64 | 536.3 ms | 843.9 ms | 0.64 | 825.6 ms | 0.65 |
-| q14 | 122.2 ms | 141.6 ms | 0.86 | 121.7 ms | 159.8 ms | 0.76 | 95.1 ms | 1.28 |
-| q15 | 152.7 ms | 331.9 ms | 0.46 | 152.6 ms | 348.1 ms | 0.44 | 333.9 ms | 0.46 |
-| q16 | 201.1 ms | 267.9 ms | 0.75 | 198.7 ms | 273.4 ms | 0.73 | 105.3 ms | 1.91 |
-| q17 | 21.0 ms | 551.2 ms | 0.04 | 21.0 ms | 569.9 ms | 0.04 | 554.7 ms | 0.04 |
-| q18 | 531.4 ms | 2,753.9 ms | 0.19 | 529.4 ms | 2,722.6 ms | 0.19 | 2,933.0 ms | 0.18 |
-| q19 | 27.9 ms | 40.2 ms | 0.69 | 27.9 ms | 53.6 ms | 0.52 | 37.5 ms | 0.74 |
-| q20 | 27.9 ms | 125.8 ms | 0.22 | 27.8 ms | 149.3 ms | 0.19 | 127.8 ms | 0.22 |
-| q21 | 563.8 ms | 818.4 ms | 0.69 | 560.8 ms | 846.4 ms | 0.66 | 269.6 ms | 2.09 |
-| q22 | 46.9 ms | 88.4 ms | 0.53 | 46.9 ms | 94.1 ms | 0.50 | 49.5 ms | 0.95 |
-| **sum** | **6,371.5 ms** | **14,670.4 ms** | **0.43** | **6,344.1 ms** | **15,033.8 ms** | **0.42** | **8,839.0 ms** | **0.72** |
-| **geomean** | | | **0.45** | | | **0.42** | | **0.73** |
+| q1 | 1,061.9 ms | 3,365.9 ms | 0.32 | 1,058.2 ms | 3,375.3 ms | 0.31 | 873.5 ms | 1.22 |
+| q2 | 32.5 ms | 160.9 ms | 0.20 | 32.4 ms | 166.9 ms | 0.19 | 137.6 ms | 0.24 |
+| q3 | 262.8 ms | 551.7 ms | 0.48 | 261.7 ms | 579.3 ms | 0.45 | 353.6 ms | 0.74 |
+| q4 | 115.3 ms | 184.9 ms | 0.62 | 114.8 ms | 211.6 ms | 0.54 | 102.9 ms | 1.12 |
+| q5 | 124.0 ms | 312.6 ms | 0.40 | 123.5 ms | 341.2 ms | 0.36 | 173.2 ms | 0.72 |
+| q6 | 172.2 ms | 274.8 ms | 0.63 | 171.5 ms | 294.1 ms | 0.58 | 203.4 ms | 0.85 |
+| q7 | 335.1 ms | 585.8 ms | 0.57 | 333.7 ms | 615.2 ms | 0.54 | 287.6 ms | 1.17 |
+| q8 | 147.6 ms | 226.2 ms | 0.65 | 146.9 ms | 253.5 ms | 0.58 | 141.9 ms | 1.04 |
+| q9 | 1,117.2 ms | 1,743.2 ms | 0.64 | 1,112.3 ms | 1,770.1 ms | 0.63 | 750.9 ms | 1.49 |
+| q10 | 255.1 ms | 389.0 ms | 0.66 | 253.8 ms | 417.2 ms | 0.61 | 167.3 ms | 1.52 |
+| q11 | 51.2 ms | 61.4 ms | 0.83 | 51.0 ms | 67.7 ms | 0.75 | 61.5 ms | 0.83 |
+| q12 | 397.9 ms | 854.9 ms | 0.47 | 396.4 ms | 880.7 ms | 0.45 | 253.6 ms | 1.57 |
+| q13 | 520.3 ms | 839.8 ms | 0.62 | 517.8 ms | 843.9 ms | 0.61 | 825.6 ms | 0.63 |
+| q14 | 120.2 ms | 141.6 ms | 0.85 | 119.6 ms | 159.8 ms | 0.75 | 95.1 ms | 1.26 |
+| q15 | 152.6 ms | 331.9 ms | 0.46 | 152.4 ms | 348.1 ms | 0.44 | 333.9 ms | 0.46 |
+| q16 | 198.9 ms | 267.9 ms | 0.74 | 196.5 ms | 273.4 ms | 0.72 | 105.3 ms | 1.89 |
+| q17 | 21.1 ms | 551.2 ms | 0.04 | 21.1 ms | 569.9 ms | 0.04 | 554.7 ms | 0.04 |
+| q18 | 528.5 ms | 2,753.9 ms | 0.19 | 526.5 ms | 2,722.6 ms | 0.19 | 2,933.0 ms | 0.18 |
+| q19 | 27.7 ms | 40.2 ms | 0.69 | 27.8 ms | 53.6 ms | 0.52 | 37.5 ms | 0.74 |
+| q20 | 27.4 ms | 125.8 ms | 0.22 | 27.5 ms | 149.3 ms | 0.18 | 127.8 ms | 0.21 |
+| q21 | 569.2 ms | 818.4 ms | 0.70 | 566.9 ms | 846.4 ms | 0.67 | 269.6 ms | 2.11 |
+| q22 | 46.9 ms | 88.4 ms | 0.53 | 46.8 ms | 94.1 ms | 0.50 | 49.5 ms | 0.95 |
+| **sum** | **6,285.6 ms** | **14,670.4 ms** | **0.43** | **6,259.2 ms** | **15,033.9 ms** | **0.42** | **8,839.0 ms** | **0.71** |
+| **geomean** | | | **0.45** | | | **0.42** | | **0.72** |
 
 ## ClickBench (1M rows)
 
@@ -92,58 +92,58 @@ bit-for-bit identical; `q10` and `q11` match exact counts with tie-breaking at c
 
 | | LexDB (one core) | PostgreSQL, one core | PostgreSQL, four processes | LexDB + 8 MVs (transparent rewrite) |
 |---|---:|---:|---:|---:|
-| all 43 queries, summed (wall) | **13,938 ms** | 22,363 ms | 11,326 ms | 9,068 ms |
-| geometric mean of LexDB / PostgreSQL (wall) | | **0.67** | **1.48** | 0.10 vs PG1 / 0.21 vs PG4 |
-| geometric mean of LexDB / PostgreSQL (CPU) | | **0.63** | | |
-| queries level or ahead of one core (within 10%) | | 40 of 43 | | 40 of 43 (21 rewritten; 29 of 43 vs PG4) |
+| all 43 queries, summed (wall) | **12,161 ms** | 22,363 ms | 11,326 ms | 9,068 ms |
+| geometric mean of LexDB / PostgreSQL (wall) | | **0.58** | **1.29** | 0.10 vs PG1 / 0.21 vs PG4 |
+| geometric mean of LexDB / PostgreSQL (CPU) | | **0.55** | | |
+| queries level or ahead of one core (within 10%) | | **42 of 43** | | 42 of 43 (21 rewritten; 29 of 43 vs PG4) |
 
 | query | LexDB wall | PG 1-core wall | LexDB / PG1 | LexDB CPU | PG1 CPU | CPU ratio | PG 4-proc wall | LexDB / PG4 | LexDB + MV |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| q0 | 50.9 ms | 87.5 ms | 0.58 | 50.7 ms | 109.9 ms | 0.46 | 34.7 ms | 1.47 | **0.58 ms** |
-| q1 | 214.8 ms | 342.0 ms | 0.63 | 213.9 ms | 361.5 ms | 0.59 | 106.3 ms | 2.02 | **0.63 ms** |
-| q2 | 204.4 ms | 392.2 ms | 0.52 | 203.6 ms | 411.9 ms | 0.49 | 107.7 ms | 1.90 | **0.69 ms** |
-| q3 | 273.0 ms | 256.2 ms | 1.07 | 271.9 ms | 276.6 ms | 0.98 | 80.0 ms | 3.41 | **0.64 ms** |
-| q4 | 168.5 ms | 304.0 ms | 0.55 | 167.8 ms | 323.7 ms | 0.52 | 302.4 ms | 0.56 | **5.99 ms** |
-| q5 | 271.9 ms | 429.8 ms | 0.63 | 270.7 ms | 450.0 ms | 0.60 | 419.5 ms | 0.65 | — |
-| q6 | 195.9 ms | 252.1 ms | 0.78 | 195.0 ms | 273.4 ms | 0.71 | 79.3 ms | 2.47 | **0.54 ms** |
-| q7 | 215.3 ms | 337.2 ms | 0.64 | 214.3 ms | 357.9 ms | 0.60 | 107.1 ms | 2.01 | **0.47 ms** |
-| q8 | 183.1 ms | 489.4 ms | 0.37 | 182.3 ms | 509.3 ms | 0.36 | 479.0 ms | 0.38 | **5.06 ms** |
-| q9 | 263.4 ms | 624.1 ms | 0.42 | 262.2 ms | 643.1 ms | 0.41 | 604.6 ms | 0.44 | **12.69 ms** |
-| q10 | 211.9 ms | 347.7 ms | 0.61 | 211.1 ms | 368.2 ms | 0.57 | 101.3 ms | 2.09 | **0.83 ms** |
-| q11 | 214.3 ms | 352.4 ms | 0.61 | 213.3 ms | 371.1 ms | 0.57 | 103.8 ms | 2.06 | **0.90 ms** |
-| q12 | 235.8 ms | 365.6 ms | 0.64 | 233.1 ms | 385.4 ms | 0.60 | 113.6 ms | 2.08 | **41.38 ms** |
-| q13 | 262.5 ms | 381.5 ms | 0.69 | 261.1 ms | 402.8 ms | 0.65 | 143.7 ms | 1.83 | **32.80 ms** |
-| q14 | 249.0 ms | 363.1 ms | 0.69 | 247.8 ms | 383.8 ms | 0.65 | 346.7 ms | 0.72 | **48.82 ms** |
-| q15 | 185.5 ms | 336.5 ms | 0.55 | 184.7 ms | 359.0 ms | 0.51 | 132.2 ms | 1.40 | **144.53 ms** |
-| q16 | 356.9 ms | 468.6 ms | 0.76 | 355.2 ms | 488.9 ms | 0.73 | 442.8 ms | 0.81 | — |
-| q17 | 465.1 ms | 444.5 ms | 1.05 | 462.8 ms | 464.2 ms | 1.00 | 162.0 ms | 2.87 | — |
-| q18 | 438.2 ms | 674.1 ms | 0.65 | 436.0 ms | 692.9 ms | 0.63 | 635.6 ms | 0.69 | — |
-| q19 | 172.1 ms | 238.6 ms | 0.72 | 171.4 ms | 259.3 ms | 0.66 | 73.6 ms | 2.34 | — |
-| q20 | 308.0 ms | 375.3 ms | 0.82 | 306.7 ms | 397.4 ms | 0.77 | 106.5 ms | 2.89 | **54.86 ms** |
-| q21 | 307.9 ms | 456.5 ms | 0.67 | 306.5 ms | 476.3 ms | 0.64 | 134.2 ms | 2.29 | — |
-| q22 | 599.2 ms | 512.7 ms | 1.17 | 596.3 ms | 533.1 ms | 1.12 | 137.7 ms | 4.35 | — |
-| q23 | 342.2 ms | 370.6 ms | 0.92 | 340.7 ms | 390.8 ms | 0.87 | 104.2 ms | 3.28 | — |
-| q24 | 233.1 ms | 349.7 ms | 0.67 | 232.1 ms | 370.1 ms | 0.63 | 100.6 ms | 2.32 | — |
-| q25 | 226.3 ms | 347.4 ms | 0.65 | 225.3 ms | 367.8 ms | 0.61 | 100.5 ms | 2.25 | — |
-| q26 | 236.6 ms | 351.7 ms | 0.67 | 235.6 ms | 371.6 ms | 0.63 | 100.9 ms | 2.34 | — |
-| q27 | 390.7 ms | 501.9 ms | 0.78 | 388.8 ms | 523.8 ms | 0.74 | 169.1 ms | 2.31 | **0.50 ms** |
-| q28 | 997.5 ms | 4,030.8 ms | 0.25 | 993.3 ms | 4,039.0 ms | 0.25 | 1,057.0 ms | 0.94 | — |
-| q29 | 177.6 ms | 852.2 ms | 0.21 | 176.8 ms | 871.6 ms | 0.20 | 336.3 ms | 0.53 | — |
-| q30 | 251.6 ms | 362.4 ms | 0.69 | 249.9 ms | 382.1 ms | 0.65 | 353.7 ms | 0.71 | — |
-| q31 | 255.6 ms | 385.5 ms | 0.66 | 254.5 ms | 406.5 ms | 0.63 | 375.7 ms | 0.68 | — |
-| q32 | 404.2 ms | 917.0 ms | 0.44 | 402.4 ms | 935.4 ms | 0.43 | 905.7 ms | 0.45 | — |
-| q33 | 421.2 ms | 479.2 ms | 0.88 | 417.9 ms | 498.1 ms | 0.84 | 461.8 ms | 0.91 | **38.26 ms** |
-| q34 | 415.1 ms | 487.0 ms | 0.85 | 413.0 ms | 506.5 ms | 0.82 | 466.9 ms | 0.89 | **38.16 ms** |
-| q35 | 264.1 ms | 396.7 ms | 0.67 | 263.1 ms | 416.7 ms | 0.63 | 156.4 ms | 1.69 | **4.00 ms** |
-| q36 | 475.4 ms | 548.0 ms | 0.87 | 473.0 ms | 566.9 ms | 0.83 | 246.7 ms | 1.93 | — |
-| q37 | 621.6 ms | 494.2 ms | 1.26 | 618.8 ms | 514.5 ms | 1.20 | 169.9 ms | 3.66 | — |
-| q38 | 291.5 ms | 404.5 ms | 0.72 | 290.2 ms | 425.5 ms | 0.68 | 145.8 ms | 2.00 | — |
-| q39 | 652.4 ms | 536.6 ms | 1.22 | 648.9 ms | 556.1 ms | 1.17 | 532.5 ms | 1.23 | — |
-| q40 | 399.1 ms | 621.5 ms | 0.64 | 397.2 ms | 641.0 ms | 0.62 | 220.6 ms | 1.81 | — |
-| q41 | 400.4 ms | 599.1 ms | 0.67 | 398.6 ms | 618.9 ms | 0.64 | 198.9 ms | 2.01 | — |
-| q42 | 433.7 ms | 495.3 ms | 0.88 | 431.8 ms | 515.4 ms | 0.84 | 168.0 ms | 2.58 | **2.32 ms** |
-| **sum** | **13,937.5 ms** | **22,362.9 ms** | **0.62** | **13,864.4 ms** | **23,217.8 ms** | **0.60** | **11,325.5 ms** | **1.23** | **9,067.5 ms** |
-| **geomean** | | | **0.67** | | | **0.63** | | **1.48** | **0.10 / 0.21** |
+| q0 | 50.3 ms | 87.5 ms | 0.57 | 50.2 ms | 109.9 ms | 0.46 | 34.7 ms | 1.45 | **0.58 ms** |
+| q1 | 182.3 ms | 342.0 ms | 0.53 | 181.5 ms | 361.5 ms | 0.50 | 106.3 ms | 1.71 | **0.63 ms** |
+| q2 | 177.4 ms | 392.2 ms | 0.45 | 176.7 ms | 411.9 ms | 0.43 | 107.7 ms | 1.65 | **0.69 ms** |
+| q3 | 141.1 ms | 256.2 ms | 0.55 | 140.6 ms | 276.6 ms | 0.51 | 80.0 ms | 1.76 | **0.64 ms** |
+| q4 | 154.8 ms | 304.0 ms | 0.51 | 154.1 ms | 323.7 ms | 0.48 | 302.4 ms | 0.51 | **5.99 ms** |
+| q5 | 243.8 ms | 429.8 ms | 0.57 | 242.8 ms | 450.0 ms | 0.54 | 419.5 ms | 0.58 | — |
+| q6 | 184.4 ms | 252.1 ms | 0.73 | 183.6 ms | 273.4 ms | 0.67 | 79.3 ms | 2.33 | **0.54 ms** |
+| q7 | 182.7 ms | 337.2 ms | 0.54 | 181.8 ms | 357.9 ms | 0.51 | 107.1 ms | 1.71 | **0.47 ms** |
+| q8 | 171.7 ms | 489.4 ms | 0.35 | 171.0 ms | 509.3 ms | 0.34 | 479.0 ms | 0.36 | **5.06 ms** |
+| q9 | 236.6 ms | 624.1 ms | 0.38 | 235.6 ms | 643.1 ms | 0.37 | 604.6 ms | 0.39 | **12.69 ms** |
+| q10 | 183.6 ms | 347.7 ms | 0.53 | 182.7 ms | 368.2 ms | 0.50 | 101.3 ms | 1.81 | **0.83 ms** |
+| q11 | 185.6 ms | 352.4 ms | 0.53 | 184.8 ms | 371.1 ms | 0.50 | 103.8 ms | 1.79 | **0.90 ms** |
+| q12 | 200.4 ms | 365.6 ms | 0.55 | 199.4 ms | 385.4 ms | 0.52 | 113.6 ms | 1.76 | **41.38 ms** |
+| q13 | 232.0 ms | 381.5 ms | 0.61 | 231.0 ms | 402.8 ms | 0.57 | 143.7 ms | 1.61 | **32.80 ms** |
+| q14 | 216.9 ms | 363.1 ms | 0.60 | 215.9 ms | 383.8 ms | 0.56 | 346.7 ms | 0.63 | **48.82 ms** |
+| q15 | 171.3 ms | 336.5 ms | 0.51 | 170.6 ms | 359.0 ms | 0.48 | 132.2 ms | 1.30 | **144.53 ms** |
+| q16 | 332.4 ms | 468.6 ms | 0.71 | 330.8 ms | 488.9 ms | 0.68 | 442.8 ms | 0.75 | — |
+| q17 | 249.8 ms | 444.5 ms | 0.56 | 248.7 ms | 464.2 ms | 0.54 | 162.0 ms | 1.54 | — |
+| q18 | 409.9 ms | 674.1 ms | 0.61 | 407.8 ms | 692.9 ms | 0.59 | 635.6 ms | 0.64 | — |
+| q19 | 155.1 ms | 238.6 ms | 0.65 | 154.5 ms | 259.3 ms | 0.60 | 73.6 ms | 2.11 | — |
+| q20 | 272.8 ms | 375.3 ms | 0.73 | 271.6 ms | 397.4 ms | 0.68 | 106.5 ms | 2.56 | **54.86 ms** |
+| q21 | 266.7 ms | 456.5 ms | 0.58 | 265.4 ms | 476.3 ms | 0.56 | 134.2 ms | 1.99 | — |
+| q22 | 467.0 ms | 512.7 ms | 0.91 | 465.0 ms | 533.1 ms | 0.87 | 137.7 ms | 3.39 | — |
+| q23 | 306.8 ms | 370.6 ms | 0.83 | 305.4 ms | 390.8 ms | 0.78 | 104.2 ms | 2.94 | — |
+| q24 | 204.2 ms | 349.7 ms | 0.58 | 203.4 ms | 370.1 ms | 0.55 | 100.6 ms | 2.03 | — |
+| q25 | 198.7 ms | 347.4 ms | 0.57 | 197.8 ms | 367.8 ms | 0.54 | 100.5 ms | 1.98 | — |
+| q26 | 208.2 ms | 351.7 ms | 0.59 | 207.2 ms | 371.6 ms | 0.56 | 100.9 ms | 2.06 | — |
+| q27 | 350.6 ms | 501.9 ms | 0.70 | 349.0 ms | 523.8 ms | 0.67 | 169.1 ms | 2.07 | **0.50 ms** |
+| q28 | 952.4 ms | 4,030.8 ms | 0.24 | 948.5 ms | 4,039.0 ms | 0.23 | 1,057.0 ms | 0.90 | — |
+| q29 | 159.4 ms | 852.2 ms | 0.19 | 158.6 ms | 871.6 ms | 0.18 | 336.3 ms | 0.47 | — |
+| q30 | 218.0 ms | 362.4 ms | 0.60 | 216.9 ms | 382.1 ms | 0.57 | 353.7 ms | 0.62 | — |
+| q31 | 224.5 ms | 385.5 ms | 0.58 | 223.4 ms | 406.5 ms | 0.55 | 375.7 ms | 0.60 | — |
+| q32 | 389.6 ms | 917.0 ms | 0.42 | 387.7 ms | 935.4 ms | 0.41 | 905.7 ms | 0.43 | — |
+| q33 | 401.7 ms | 479.2 ms | 0.84 | 399.6 ms | 498.1 ms | 0.80 | 461.8 ms | 0.87 | **38.26 ms** |
+| q34 | 402.4 ms | 487.0 ms | 0.83 | 400.3 ms | 506.5 ms | 0.79 | 466.9 ms | 0.86 | **38.16 ms** |
+| q35 | 252.8 ms | 396.7 ms | 0.64 | 251.7 ms | 416.7 ms | 0.60 | 156.4 ms | 1.62 | **4.00 ms** |
+| q36 | 419.3 ms | 548.0 ms | 0.77 | 417.3 ms | 566.9 ms | 0.74 | 246.7 ms | 1.70 | — |
+| q37 | 509.1 ms | 494.2 ms | 1.03 | 506.7 ms | 514.5 ms | 0.98 | 169.9 ms | 3.00 | — |
+| q38 | 252.7 ms | 404.5 ms | 0.62 | 251.6 ms | 425.5 ms | 0.59 | 145.8 ms | 1.73 | — |
+| q39 | 599.2 ms | 536.6 ms | 1.12 | 596.0 ms | 556.1 ms | 1.07 | 532.5 ms | 1.13 | — |
+| q40 | 330.4 ms | 621.5 ms | 0.53 | 328.9 ms | 641.0 ms | 0.51 | 220.6 ms | 1.50 | — |
+| q41 | 327.9 ms | 599.1 ms | 0.55 | 326.4 ms | 618.9 ms | 0.53 | 198.9 ms | 1.65 | — |
+| q42 | 384.3 ms | 495.3 ms | 0.78 | 382.5 ms | 515.4 ms | 0.74 | 168.0 ms | 2.29 | **2.32 ms** |
+| **sum** | **12,160.8 ms** | **22,362.9 ms** | **0.54** | **12,104.9 ms** | **23,218.0 ms** | **0.52** | **11,325.5 ms** | **1.07** | **9,067.5 ms** |
+| **geomean** | | | **0.58** | | | **0.55** | | **1.29** | **0.10 / 0.21** |
 
 ### Optional data skipping indexes on ClickBench 1M
 
@@ -178,11 +178,12 @@ On non-selective full-table and graph joins, runtime filters show zero regressio
 
 35 queries over 1M-row tables (scans, joins, groups, windows; median of 5).
 The baseline columns (`LexDB`, `PG 1-core`, `PG 4-proc`) run strictly apples-to-apples with no materialized views:
-LexDB's CPU is **0.41** of PostgreSQL's on one core (geometric mean; wall **0.51**), and its wall time
-**0.83** of PostgreSQL's on four processes; **34 of 35** are level with or ahead of PostgreSQL on one core
-on both CPU and wall time, including `join_hash_agg` dropping 38 → 25 ms (`0.71×` of 4-core PG), `sub_in`/`sub_exists`
-dropping 25–26 → 17 ms (`0.68–0.71×` of 4-core PG), `join_text_rows` dropping 72 → 43 ms (`0.49×` of 4-core PG),
-`sort_lim` at 6 ms, and `grp_text` at 40 ms (`0.93×` of 4-core PG).
+LexDB's CPU is **0.39** of PostgreSQL's on one core (geometric mean; wall **0.48**), and its wall time
+**0.78** of PostgreSQL's on four processes; **35 of 35** are ahead of PostgreSQL on one core
+on both CPU and wall time, including `distinct` dropping 62 → 42 ms (`0.44×` PG1), `distinct2` dropping 134 → 79 ms (`0.72×` PG1),
+`pk_point20k` dropping 635 → 390 ms (`0.62×` wall / `0.83×` CPU vs PG1), `join_hash_agg` at 24 ms (`0.69×` of 4-core PG),
+`sub_in`/`sub_exists` at 17 ms (`0.68–0.71×` of 4-core PG), `join_text_rows` at 42 ms (`0.48×` of 4-core PG),
+`sort_lim` at 6 ms, and `grp_text` at 39 ms (`0.91×` of 4-core PG).
 
 The rightmost column (`LexDB + MV`) runs the **exact same 35 unmodified queries** after creating four
 general-purpose incremental `ENABLE QUERY REWRITE` rollup views (`mv_w_cube` 1,940 rows / 189 ms build,
@@ -196,42 +197,42 @@ geometric mean to **0.31** against PG 1-core and **0.49** against PG 4-proc. Aft
 
 | query | LexDB wall | PG 1-core wall | LexDB / PG1 | LexDB CPU | PG1 CPU | CPU ratio | PG 4-proc wall | LexDB / PG4 | LexDB + MV |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| `scan2` | 108 ms | 141 ms | 0.77 | 52 ms | 80 ms | 0.65 | 141 ms | 0.77 | 115 ms |
+| `scan2` | 109 ms | 141 ms | 0.77 | 53 ms | 80 ms | 0.66 | 141 ms | 0.77 | 115 ms |
 | `scan3` | 159 ms | 213 ms | 0.75 | 74 ms | 120 ms | 0.62 | 215 ms | 0.74 | 167 ms |
 | `scan9` | 503 ms | 532 ms | 0.95 | 248 ms | 250 ms | 0.99 | 532 ms | 0.95 | 532 ms |
 | `filt1pct` | 17 ms | 41 ms | 0.41 | 12 ms | 40 ms | 0.30 | 22 ms | 0.77 | 21 ms |
 | `filt10pct` | 32 ms | 59 ms | 0.54 | 19 ms | 50 ms | 0.38 | 59 ms | 0.54 | 37 ms |
 | `filt_like` | 54 ms | 81 ms | 0.67 | 49 ms | 80 ms | 0.61 | 32 ms | 1.69 | 57 ms |
-| `filt_agg` | 18 ms | 45 ms | 0.40 | 13 ms | 40 ms | 0.33 | 22 ms | 0.82 | 23 ms |
-| `expr_int` | 150 ms | 217 ms | 0.69 | 69 ms | 140 ms | 0.49 | 215 ms | 0.70 | 160 ms |
-| `expr_mix` | 360 ms | 422 ms | 0.85 | 244 ms | 300 ms | 0.81 | 418 ms | 0.86 | 381 ms |
-| `expr_agg` | 32 ms | 58 ms | 0.55 | 28 ms | 60 ms | 0.47 | 25 ms | 1.28 | **3 ms** |
+| `filt_agg` | 18 ms | 45 ms | 0.40 | 14 ms | 40 ms | 0.35 | 22 ms | 0.82 | 23 ms |
+| `expr_int` | 149 ms | 217 ms | 0.69 | 70 ms | 140 ms | 0.50 | 215 ms | 0.69 | 160 ms |
+| `expr_mix` | 362 ms | 422 ms | 0.86 | 244 ms | 300 ms | 0.81 | 418 ms | 0.87 | 381 ms |
+| `expr_agg` | 31 ms | 58 ms | 0.53 | 27 ms | 60 ms | 0.45 | 25 ms | 1.24 | **3 ms** |
 | `sort_all` | 116 ms | 447 ms | 0.26 | 61 ms | 390 ms | 0.16 | 443 ms | 0.26 | 120 ms |
 | `sort_lim` | 6 ms | 91 ms | 0.07 | 3 ms | 90 ms | 0.03 | 33 ms | 0.18 | 6 ms |
 | `count` | 8 ms | 36 ms | 0.22 | 4 ms | 30 ms | 0.13 | 18 ms | 0.44 | **3 ms** |
 | `grp_int` | 24 ms | 95 ms | 0.25 | 20 ms | 100 ms | 0.20 | 35 ms | 0.69 | **3 ms** |
-| `grp_text` | 40 ms | 127 ms | 0.31 | 35 ms | 130 ms | 0.27 | 43 ms | 0.93 | **4 ms** |
+| `grp_text` | 39 ms | 127 ms | 0.31 | 35 ms | 130 ms | 0.27 | 43 ms | 0.91 | **4 ms** |
 | `minmax_text` | 54 ms | 132 ms | 0.41 | 50 ms | 130 ms | 0.38 | 43 ms | 1.26 | **3 ms** |
-| `distinct` | 62 ms | 95 ms | 0.65 | 58 ms | 100 ms | 0.58 | 34 ms | 1.82 | 77 ms |
-| `distinct2` | 134 ms | 110 ms | 1.22 | 129 ms | 110 ms | 1.17 | 40 ms | 3.35 | 173 ms |
-| `idx_range1k` | 5 ms | 10 ms | 0.50 | 1 ms | 10 ms | 0.10 | 10 ms | 0.50 | 5 ms |
-| `idx_range100k` | 43 ms | 46 ms | 0.93 | 30 ms | 30 ms | 1.00 | 46 ms | 0.93 | 50 ms |
+| `distinct` | 42 ms | 95 ms | 0.44 | 37 ms | 100 ms | 0.37 | 34 ms | 1.24 | 77 ms |
+| `distinct2` | 79 ms | 110 ms | 0.72 | 74 ms | 110 ms | 0.67 | 40 ms | 1.98 | 173 ms |
+| `idx_range1k` | 4 ms | 10 ms | 0.40 | 1 ms | 10 ms | 0.10 | 10 ms | 0.40 | 5 ms |
+| `idx_range100k` | 42 ms | 46 ms | 0.91 | 30 ms | 30 ms | 1.00 | 46 ms | 0.91 | 50 ms |
 | `idx_range_agg` | 26 ms | 30 ms | 0.87 | 22 ms | 30 ms | 0.73 | 24 ms | 1.08 | 32 ms |
-| `pk_range100k` | 21 ms | 32 ms | 0.66 | 9 ms | 20 ms | 0.45 | 32 ms | 0.66 | 22 ms |
-| `pk_point20k` | 635 ms | 629 ms | 1.01 | 590 ms | 430 ms | 1.37 | 642 ms | 0.99 | 680 ms |
-| `join_hash_agg` | 25 ms | 95 ms | 0.26 | 20 ms | 100 ms | 0.20 | 35 ms | 0.71 | **3 ms** |
-| `join_hash_rows` | 31 ms | 63 ms | 0.49 | 21 ms | 60 ms | 0.35 | 63 ms | 0.49 | 36 ms |
+| `pk_range100k` | 20 ms | 32 ms | 0.62 | 8 ms | 20 ms | 0.40 | 32 ms | 0.62 | 22 ms |
+| `pk_point20k` | 390 ms | 629 ms | 0.62 | 356 ms | 430 ms | 0.83 | 642 ms | 0.61 | 680 ms |
+| `join_hash_agg` | 24 ms | 95 ms | 0.25 | 20 ms | 100 ms | 0.20 | 35 ms | 0.69 | **3 ms** |
+| `join_hash_rows` | 30 ms | 63 ms | 0.48 | 20 ms | 60 ms | 0.33 | 63 ms | 0.48 | 36 ms |
 | `join_lookup_agg` | 74 ms | 80 ms | 0.93 | 70 ms | 80 ms | 0.88 | 33 ms | 2.24 | **3 ms** |
 | `sub_in` | 17 ms | 50 ms | 0.34 | 13 ms | 50 ms | 0.26 | 24 ms | 0.71 | 26 ms |
 | `sub_exists` | 17 ms | 50 ms | 0.34 | 13 ms | 50 ms | 0.26 | 25 ms | 0.68 | 26 ms |
 | `sub_corr_sel` | 106 ms | 150 ms | 0.71 | 92 ms | 150 ms | 0.61 | 150 ms | 0.71 | 122 ms |
-| `window` | 110 ms | 144 ms | 0.76 | 93 ms | 130 ms | 0.72 | 91 ms | 1.21 | 120 ms |
-| `join_hash_sort` | 53 ms | 111 ms | 0.48 | 40 ms | 100 ms | 0.40 | 55 ms | 0.96 | 61 ms |
-| `join_text_agg` | 50 ms | 85 ms | 0.59 | 46 ms | 80 ms | 0.58 | 32 ms | 1.56 | **3 ms** |
-| `join_text_rows` | 43 ms | 86 ms | 0.50 | 31 ms | 80 ms | 0.39 | 87 ms | 0.49 | 73 ms |
-| `join_text_group` | 74 ms | 169 ms | 0.44 | 70 ms | 170 ms | 0.41 | 54 ms | 1.37 | **3 ms** |
+| `window` | 101 ms | 144 ms | 0.70 | 86 ms | 130 ms | 0.66 | 91 ms | 1.11 | 120 ms |
+| `join_hash_sort` | 52 ms | 111 ms | 0.47 | 40 ms | 100 ms | 0.40 | 55 ms | 0.95 | 61 ms |
+| `join_text_agg` | 49 ms | 85 ms | 0.58 | 45 ms | 80 ms | 0.56 | 32 ms | 1.53 | **3 ms** |
+| `join_text_rows` | 42 ms | 86 ms | 0.49 | 31 ms | 80 ms | 0.39 | 87 ms | 0.48 | 73 ms |
+| `join_text_group` | 74 ms | 169 ms | 0.44 | 69 ms | 170 ms | 0.41 | 54 ms | 1.37 | **3 ms** |
 | `join_left_rows` | 29 ms | 56 ms | 0.52 | 15 ms | 40 ms | 0.38 | 59 ms | 0.49 | 33 ms |
-| **geomean** | | | **0.51** | | | **0.41** | | **0.83** | **0.31 / 0.49** |
+| **geomean** | | | **0.48** | | | **0.39** | | **0.78** | **0.31 / 0.49** |
 
 ## Materialized views (1M rows)
 
@@ -337,11 +338,11 @@ LexDB (3 read replicas, 4 processes) vs PostgreSQL 18 (4 cores) — read workloa
 
 | Metric (11 queries, 1 core / 1 thread) | LexDB | PostgreSQL 18 | DuckDB 2.0 + DuckPGQ | Kùzu 0.11.3 |
 |---|---:|---:|---:|---:|
-| Sum of all 11 queries | **822.0 ms** | 5,660.5 ms | 962.2 ms | 1,367.4 ms |
-| Geometric mean (LexDB / peer) | — | **0.16× (6.38× faster)** | **0.40× (2.50× faster)** | **0.21× (4.79× faster)** |
+| Sum of all 11 queries | **505.5 ms** | 5,660.5 ms | 962.2 ms | 1,367.4 ms |
+| Geometric mean (LexDB / peer) | — | **0.13× (7.74× faster)** | **0.33× (3.03× faster)** | **0.17× (5.81× faster)** |
 | 5-hop shortest path (`G10`) | **0.41 ms** (`0.71 ms` cold) | 1,080.53 ms | 61.89 ms | 40.59 ms |
-| Single-source shortest paths (`G11`, 2k targets) | **7.37 ms** (`23.92 ms` cold) | 1,263.90 ms | 64.31 ms | 48.26 ms |
-| Full-graph 1M-edge triangles (`G9`) | **388.46 ms** | 1,813.83 ms | 518.85 ms | 521.31 ms |
+| Single-source shortest paths (`G11`, 2k targets) | **5.78 ms** (`23.92 ms` cold) | 1,263.90 ms | 64.31 ms | 48.26 ms |
+| Full-graph 1M-edge triangles (`G9`) | **226.52 ms** | 1,813.83 ms | 518.85 ms | 521.31 ms |
 
 ## Not measured in this run
 
