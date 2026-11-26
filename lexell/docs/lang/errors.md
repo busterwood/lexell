@@ -53,6 +53,15 @@ fn f() { let d: Decimal = 1.5f }
 // error: is float, not Decimal
 ```
 
+**`expected ;, found '<type>'`** after `[]`. There is no `[]T{}` literal. An
+empty array takes its type from where it goes: `let xs: []int = []`, or
+`f([])` for a `&[]T` parameter.
+
+```lxl
+fn f() { let xs = []int{} }
+// error: expected ;, found 'int'
+```
+
 ## Names and imports
 
 **`unknown name '<x>'`**. The name is misspelt or undeclared, a library function
@@ -346,6 +355,16 @@ fn big[T: Ord + copy](a: T, b: T): T { return if a < b { b } else { a } }
 
 fn f(): int { return big(P{x: 1}, P{x: 2}).x }
 // error: does not satisfy Ord
+```
+
+**`a borrow type (&str) cannot be a type argument (type parameter K): borrows
+are second class, and only a parameter declared K: borrow takes one`**. `Map`,
+`Set`, `Heap` and `task.Scope.start` take owned type arguments only; `Option`
+and `Result` take borrows. Store owned values (`w.clone()`) in the container.
+
+```lxl
+fn f() { var m: Map[&str, int] = newMap() }
+// error: a borrow type (&str) cannot be a type argument
 ```
 
 ## Closures and tasks

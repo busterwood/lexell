@@ -211,8 +211,11 @@ def show(mod, filters, short):
     if filters:
         keys = lambda sig: [k for k in (name_of(sig), receiver_of(sig)) if k]
         exact = [d for d in ds if any(k in filters for k in keys(d[2]))]
-        ds = exact or [d for d in ds
-                       if any(f.lower() in k.lower() for f in filters for k in keys(d[2]))]
+        near = [d for d in ds if d not in exact
+                and any(f.lower() in k.lower() for f in filters for k in keys(d[2]))]
+        if exact and near:
+            print('// also matching: ' + ', '.join(sorted({name_of(d[2]) for d in near})) + '\n')
+        ds = exact or near
     shown = 0
     for line, doc, sig, hidden in ds:
         shown += 1

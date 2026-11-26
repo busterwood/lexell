@@ -1222,7 +1222,7 @@ with a `drop` method that makes its use safe.
 **Varargs.** `...` after the parameters declares a C variadic function:
 
 ```lxl
-extern "c" fn printf(fmt: str, ...): i32
+extern "c" fn printf(fmt: &str, ...): i32
 printf("%s has %d items, %.2f each\n", name, i32(n), 2.5f)
 ```
 

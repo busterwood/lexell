@@ -115,7 +115,7 @@ lines anywhere in the file:
 | `// expect: text` | run | one line of expected stdout, in order; `// expect:` alone is an empty line. No `expect` lines means empty stdout. |
 | `// stderr: text` | run | one line of expected stderr, in order; when a test has any, stderr is compared exactly (a runtime error's message) |
 | `// exit: N` | run | expected exit code (default 0) |
-| `// stdin: text` | run | a line fed to stdin (unused so far) |
+| `// stdin: text` | run | a line fed to stdin, in order |
 | `// error: words` | error | compile must fail and the output must contain `words` (case-insensitive). `a\|b` accepts either; empty accepts any failure. Several lines must all match. |
 | `// line: N` | error | the output must contain `:N:` |
 | `// needs: name` | run | the test is skipped when no `lib<name>.so*` is installed (a C library its externs link) |

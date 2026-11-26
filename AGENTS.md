@@ -125,7 +125,7 @@ Run these from the repository root (`~/Work/lexell`).
     lexell/compiler/out/lxlc --help                # every option and environment variable
     python3 lexell/tools/libapi.py strings split   # a library function's signature and comment
 
-    lexell/tools/gate.sh quick                     # after every change (all suites, seed, native)
+    lexell/tools/gate.sh quick                     # after every change (seed, conformance, compiler, library, docs; not lexdb)
     lexell/tools/gate.sh full                      # before a merge: adds red-team rounds under sanitizers
     python3 lexell/tests/run.py [filters]          # conformance suite only
     python3 lexell/lib/run_tests.py -j 8 [filters] # library tests only
@@ -178,9 +178,14 @@ Run these from the repository root (`~/Work/lexell`).
   planning, binding, sessions or the row path. New executor code goes in its
   own module, not `lexdb_exec.lxl`. Builds for timing use `-O`.
 - **Benchmarks:** record every comparison with another engine in
-  `lexell/design/lexdb-benchmarks.md` (and its table in `PERFORMANCE.md`).
-  `PERFORMANCE.md` holds only the latest numbers, never history. Pin the
+  `lexell/design/lexdb-benchmarks.md` (and its tables in
+  `lexell/docs/lexdb/performance.md`, where `PERFORMANCE.md` now points for
+  lexdb). The published pages hold only the latest numbers, never history. Pin the
   server to CPUs 0-3 and clients to 4-7,12-15 (SMT siblings are N and N+8).
+  Other sessions share this machine: take `~/tpch/.bench.lock` exclusively
+  for a timing (`flock ~/tpch/.bench.lock taskset -c 4-7 ./prog`) and shared
+  for builds and test runs (`flock -s ~/tpch/.bench.lock ...`), so neither
+  disturbs the other.
 
 ## Where to read next
 
@@ -189,6 +194,11 @@ Run these from the repository root (`~/Work/lexell`).
 | [lexell/docs/lang/tour.md](lexell/docs/lang/tour.md) | writing Lexell for the first time: the language by example, beside Rust |
 | [lexell/docs/lang/idioms.md](lexell/docs/lang/idioms.md) | writing or reviewing code: the preferred patterns, each as do / don't / why |
 | [lexell/docs/lang/errors.md](lexell/docs/lang/errors.md) | a compile error you don't understand: message, cause, fix |
+| [lexell/docs/lang/testing.md](lexell/docs/lang/testing.md) | adding or running a test: which suite, the directives, the gate tiers, the generators |
+| [lexell/docs/lang/performance.md](lexell/docs/lang/performance.md) | timing, profiling or speeding up code: the `-O` and perf recipes, A/B by instructions, pinning and the bench lock |
+| [lexell/docs/lang/concurrency.md](lexell/docs/lang/concurrency.md) | writing code with tasks, timers, sockets, `Shared`, blocking C calls or `par.map`, or a program that stops with exit 13, 14 or 15 |
+| [lexell/docs/lang/c-interop.md](lexell/docs/lang/c-interop.md) | calling C: externs, `ptr` and `ffi`, strings and arrays, linking, and wrapping an extern safely |
+| [lexell/docs/lang/compiler.md](lexell/docs/lang/compiler.md) | changing the compiler: building it beside `out/`, the reseed, debugging a miscompile, what to run before a merge |
 | `python3 lexell/tools/libapi.py [MODULE [NAME...]] [-s]` | looking for a library function: no arguments lists the modules and their most-called functions; a module prints its `pub` API (signatures, comments, `file:line`); names filter it |
 | [lexell/lib/README.md](lexell/lib/README.md) | what each library module covers, and the library tests |
 | [lexell/SPEC.md](lexell/SPEC.md) | a precise rule: ownership (9), borrows (10), C interop (12), tasks (16) |

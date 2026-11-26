@@ -212,10 +212,14 @@ or `pop`. SPEC 8, 9.3.
 import "collections"
 
 fn main() {
-    var counts: Map[str, int] = newMap()
+    var counts: Map[str, int] = newMap()           // keys are owned: Map[&str, V] is an error
     for w in ["a", "b", "a"] {
-        let slot = counts.atOrPut(w.clone(), 0)   // a mut & to the value
-        slot += 1
+        if counts.has(w) {
+            let slot = counts.atMut(w)                // a mut & to the value
+            slot += 1
+        } else {
+            counts.put(w.clone(), 1)                  // clone a key only when it is new
+        }
     }
     match counts.find("a") {                      // a borrow, no copy
         Some(n) { println(n) }
@@ -235,7 +239,10 @@ second lookup.
 
 **Why** `Map` keeps insertion order and takes any key with `eq` and `hash`,
 including records that get them derived. `get` clones the value; `find` and
-`at` borrow it; `atOrPut` inserts and borrows in one lookup. `Set` is in
+`at` borrow it; `atMut` borrows it mutably; `atOrPut(k, d)` inserts and
+borrows in one lookup, but takes an owned key, so it clones on every call when
+the key is a view. The heap containers take no borrowed type arguments, so a key
+or value that is a view must be cloned into the map. `Set` is in
 `collections` (`newSet`, `add`, `has`). `sort` is an unstable heap sort;
 `sortBy` and `sortStable` are stable merge sorts.
 
