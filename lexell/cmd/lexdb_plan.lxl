@@ -2273,6 +2273,8 @@ fn (q: &Query) setRows(mask: int, nl: int, base: &[]Way, cmask: &[]int, cdist: &
     while (mask & (1 << low)) == 0 { low += 1 }
     let rest = mask & ~(1 << low)
     var r = base[low].rows * (if rest == 0 { 1.0f } else { q.setRows(rest, nl, base, cmask, cdist, memo) })
+    var hitOther: []int = []
+    var hitD: []float = []
     for ci in 0..len(cmask) {
         let cm = cmask[ci]
         if (cm & (1 << low)) == 0 { continue }
@@ -2294,7 +2296,39 @@ fn (q: &Query) setRows(mask: int, nl: int, base: &[]Way, cmask: &[]int, cdist: &
         // Cauchy-Schwarz skew adjustment for low-cardinality many-to-many joins
         // on substantial tables where neither side is unique on the join key.
         if !anyUnique && minRows >= 500.0f && d < 1000.0f && d > 4.0f { d = fmax(1.0f, fsqrt(d)) }
+        append(mut &hitOther, other)
+        append(mut &hitD, d)
         r = r / d
+    }
+    // Composite-key pigeonhole cap: when low shares 2+ equality classes with the
+    // exact same table l in rest (e.g. lineitem JOIN partsupp on (partkey, suppkey)),
+    // the distinct pairs between those two tables cannot exceed min(|low|, |l|).
+    // Triangles / cycles connect low to *different* tables in rest and are unaffected.
+    if len(hitD) >= 2 && q.levels[low].est.rows > 0 {
+        let tLow = float(q.levels[low].est.rows)
+        var used: []bool = array(len(hitD), false)
+        for l in 0..nl {
+            if (rest & (1 << l)) == 0 || q.levels[l].est.rows <= 0 { continue }
+            var cnt = 0
+            var prod = 1.0f
+            var maxD = 1.0f
+            for i in 0..len(hitD) {
+                if !used[i] && (hitOther[i] & (1 << l)) != 0 {
+                    cnt += 1
+                    prod *= hitD[i]
+                    if hitD[i] > maxD { maxD = hitD[i] }
+                }
+            }
+            if cnt >= 2 {
+                let pairCap = fmax(maxD, fmin(tLow, float(q.levels[l].est.rows)))
+                if prod > pairCap {
+                    r = r * (prod / pairCap)
+                    for i in 0..len(hitD) {
+                        if !used[i] && (hitOther[i] & (1 << l)) != 0 { used[i] = true }
+                    }
+                }
+            }
+        }
     }
     let v = fmax(r, 1.0f)
     memo.put(mask, v)
@@ -2395,6 +2429,59 @@ fn (q: &Query) nBest(init: &[]int, nl: int, cands: &[][]WayCand, owns: &[][]Expr
 // Where a lookup is possible, it is taken when lookups is set, or when the
 // hash would hold more than cap bytes (statement memory, optimizer 26
 // review).
+// Cost of scanning and building a hash table for level lv (base: its scan/inner cost,
+// rows: estimated surviving rows inserted into the hash, nJoinEqs: equality keys).
+// Narrow 2-column integer tables (graph edges) and zero-payload 2-key integer hashes
+// use compact flat hash tables (6-8/row) and the full cap; large tables projecting
+// 2 integer edge columns or selective L3-resident builds (<= 4 MB) use vectorized
+// base.cost; wide or large unfiltered builds pay calibrated base.inner and 64 MB cap.
+const HASH_SMALL_BYTES: float = 4194304.0f
+const HASH_WIDE_MAX_BYTES: float = 67108864.0f
+
+fn estNeedBytes(lv: &Level, nNeed: mut &int): int {
+    if len(lv.need) == 0 {
+        nNeed = len(lv.t.cols)
+        return estRowBytes(&lv.t)
+    }
+    var n = 12
+    var c = 0
+    for i in 0..len(lv.t.cols) {
+        if i >= len(lv.need) || !lv.need[i] { continue }
+        c += 1
+        let k = lv.t.cols[i].typ.kind
+        if k == lexdb_sql.K_TEXT { n += 40 }
+        else if k == lexdb_sql.K_NUM || k == lexdb_sql.K_UUID || k == lexdb_sql.K_BYTEA { n += 24 }
+        else { n += 9 }
+    }
+    nNeed = c
+    return n
+}
+
+fn isNarrowHash(lv: &Level, nJoinEqs: int, hasLookup: bool): bool {
+    let rb = estRowBytes(&lv.t)
+    if len(lv.t.cols) <= 2 && rb <= 36 { return true }
+    if hasLookup && nJoinEqs >= 2 {
+        var nNeed = 0
+        let nb = estNeedBytes(lv, mut &nNeed)
+        if nNeed <= 2 && nb <= 36 { return true }
+    }
+    return false
+}
+
+fn hashBuildCost(lv: &Level, base: &Way, rows: float, nJoinEqs: int, hasLookup: bool, minNarrowRows: float): float {
+    let rb = estRowBytes(&lv.t)
+    var nNeed = 0
+    let nb = estNeedBytes(lv, mut &nNeed)
+    let narrow = len(lv.t.cols) <= 2 && rb <= 36 && float(lv.est.rows) >= minNarrowRows
+    let narrow2 = hasLookup && nJoinEqs >= 2 && nNeed <= 2 && nb <= 36
+    if narrow2 { return base.cost + rows * 6.0f }
+    if narrow { return base.cost + rows * 8.0f }
+    let edgeProj = nNeed >= 2 && nNeed <= 3 && nb <= 40
+    let cheapScan = float(lv.est.rows) >= 50000.0f && (edgeProj || rows * float(rb) <= HASH_SMALL_BYTES)
+    let scanCost = if cheapScan { base.cost } else { base.inner }
+    return scanCost + rows * HASH_BUILD
+}
+
 fn (q: &Query) joinStep(k: int, cands: &[]WayCand, own: &[]Expr, base: &Way, mask: int, cmask: &[]int, rin: float, rnext: float, lookups: bool,
                         cap: float, hashed: mut &bool): float {
     let out = rnext * ROW_COST
@@ -2408,13 +2495,12 @@ fn (q: &Query) joinStep(k: int, cands: &[]WayCand, own: &[]Expr, base: &Way, mas
         }
         if eqc > nJoinEqs { nJoinEqs = eqc }
     }
-    let narrow = len(q.levels[k].t.cols) <= 2 && estRowBytes(&q.levels[k].t) <= 36
-    let bCost = if w.rows >= 0.0f && nJoinEqs >= 2 { 6.0f } else if narrow { 8.0f } else { HASH_BUILD }
-    let scanCost = if (w.rows >= 0.0f && nJoinEqs >= 2) || narrow || float(q.levels[k].est.rows) >= 50000.0f { base.cost } else { base.inner }
-    var add = scanCost + base.rows * bCost + rin * HASH_PROBE + out
+    let lv = &q.levels[k]
+    var add = hashBuildCost(lv, base, base.rows, nJoinEqs, w.rows >= 0.0f, 0.0f) + rin * HASH_PROBE + out
     hashed = true
     if w.rows >= 0.0f {
-        let big = base.rows * float(estRowBytes(&q.levels[k].t)) > cap
+        let effCap = if isNarrowHash(lv, nJoinEqs, true) { cap } else { fmin(cap, HASH_WIDE_MAX_BYTES) }
+        let big = base.rows * float(estRowBytes(&lv.t)) > effCap
         if lookups || big || rin * w.cost + out < add {
             add = rin * w.cost + out
             hashed = false
@@ -2523,11 +2609,9 @@ fn (q: &Query) outerReadOnce(ms: &[][]Expr, early: bool, cap: float, ro: mut &[]
             continue
         }
         let base = q.wayInto(k, &cands, 0, false, &own)
-        let narrowBig = len(lv.t.cols) <= 2 && estRowBytes(&lv.t) <= 36 && float(lv.est.rows) >= 20000.0f
-        let bCost = if w.nEqs >= 2 { 6.0f } else if narrowBig { 8.0f } else { HASH_BUILD }
-        let scanCost = if w.nEqs >= 2 || narrowBig || float(lv.est.rows) >= 50000.0f { base.cost } else { base.inner }
-        let hash = scanCost + rows * bCost + rin * HASH_PROBE
-        let big = rows * float(estRowBytes(&lv.t)) > cap
+        let hash = hashBuildCost(lv, &base, rows, w.nEqs, true, 20000.0f) + rin * HASH_PROBE
+        let effCap = if isNarrowHash(lv, w.nEqs, true) { cap } else { fmin(cap, HASH_WIDE_MAX_BYTES) }
+        let big = rows * float(estRowBytes(&lv.t)) > effCap
         if !early && !big && hash < rin * w.cost { out[k] = true }
         rin = if keepsLeft(lv.join) { rin * fmax(w.rows, 1.0f) } else { rin * w.rows }
     }
@@ -2937,8 +3021,13 @@ fn (q: &Query) grpCost(h: int, a: int, b: int, mask: int, nl: int, base: &[]Way,
     let rin = q.setRows(mask, nl, base, cmask, cdist, memo)
     var pre = 1 << h
     var r = q.setRows(pre, nl, base, cmask, cdist, memo)
-    let hNarrow = len(q.levels[h].t.cols) <= 2 && estRowBytes(&q.levels[h].t) <= 36
-    let hScan = if hNarrow || float(q.levels[h].est.rows) >= 50000.0f { base[h].cost } else { base[h].inner }
+    let hLv = &q.levels[h]
+    let hRb = estRowBytes(&hLv.t)
+    var hNNeed = 0
+    let hNb = estNeedBytes(hLv, mut &hNNeed)
+    let hNarrow = len(hLv.t.cols) <= 2 && hRb <= 36
+    let hCheap = hNarrow || (float(hLv.est.rows) >= 50000.0f && ((hNNeed >= 2 && hNNeed <= 3 && hNb <= 40) || base[h].rows * float(hRb) <= HASH_SMALL_BYTES))
+    let hScan = if hCheap { base[h].cost } else { base[h].inner }
     var c = hScan
     var rb = bytes[h]
     // left-deep: the hub hashed (its read as the group's), then each member
@@ -2951,10 +3040,7 @@ fn (q: &Query) grpCost(h: int, a: int, b: int, mask: int, nl: int, base: &[]Way,
         if base[m].rows * bytes[m] > cap { return -1.0f }
         let nx = pre | (1 << m)
         let rn = q.setRows(nx, nl, base, cmask, cdist, memo)
-        let mNarrow = len(q.levels[m].t.cols) <= 2 && estRowBytes(&q.levels[m].t) <= 36
-        let mScan = if mNarrow || float(q.levels[m].est.rows) >= 50000.0f { base[m].cost } else { base[m].inner }
-        let mBuild = if mNarrow { 8.0f } else { HASH_BUILD }
-        let build = mScan + base[m].rows * mBuild
+        let build = hashBuildCost(&q.levels[m], &base[m], base[m].rows, 0, false, 0.0f)
         c += build + r * HASH_PROBE + rn * ROW_COST
         let lr2 = q.setRows(mask | nx, nl, base, cmask, cdist, memo)
         ld += build + lr * HASH_PROBE + lr2 * ROW_COST

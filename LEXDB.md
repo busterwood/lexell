@@ -132,9 +132,9 @@ With **no materialized views and no explicit skipping indexes**, LexDB's single-
 
 | Workload | LexDB | PostgreSQL 18 | Takeaway |
 |---|---:|---:|---|
-| **TPC-H SF1** (22 queries, 1 core) | **7.20 s** | 14.67 s (1 core) / 8.84 s (4 proc) | **2.0× faster** than 1-core PG (faster on all 22/22); **1.23× faster** than 4-process PG overall |
-| **ClickBench 1M** (43 queries, 105 cols, 1 core) | **14.10 s** | 22.36 s (1 core) / 11.33 s (4 proc) | **1.59× faster** than 1-core PG (40/43 level or ahead; 0.64× CPU) |
-| **35 Analytic Queries** (1M rows, 1 core) | **0.46× CPU / 0.91× wall** | 1 core / 4 proc | **2.2× less CPU** than 1-core PG; faster wall time than 4-process PG |
+| **TPC-H SF1** (22 queries, 1 core) | **6.37 s** | 14.67 s (1 core) / 8.84 s (4 proc) | **2.30× faster** than 1-core PG (faster on all 22/22); **1.39× faster** than 4-process PG overall |
+| **ClickBench 1M** (43 queries, 105 cols, 1 core) | **13.94 s** | 22.36 s (1 core) / 11.33 s (4 proc) | **1.60× faster** than 1-core PG (40/43 level or ahead; 0.63× CPU) |
+| **35 Analytic Queries** (1M rows, 1 core) | **0.41× CPU / 0.83× wall** | 1 core / 4 proc | **2.47× less CPU** than 1-core PG (34/35 ahead); **1.21× faster** wall time than 4-process PG |
 | **Durable OLTP updates** (1–32 clients) | up to **63.3k/s** (`pgbench`) / **54.2k/s** (`sysbench`) | 25.7k/s / 23.0k/s | **2.4–3.1× faster** non-indexed updates; **1.3–2.5× faster** indexed updates (`27.7k/s`); commit latency **0.42 ms** median / **0.86–0.89 ms** p99 |
 | **Bulk `\copy` loads** (5 cases, 1M–10M rows) | **0.24–2.44 s** | 0.61–5.93 s | **1.1–2.7× faster** on every workload (including wide tables + secondary indexes) |
 | **Property graphs — LDBC LSQB SF1** (9 queries, 22.2M edges, 1 core) | **14.2 s total** (`0.45 s` 1.67B-match Q6) | 98.1 s (PG1, 8/9) / 4.56 s (DuckPGQ+FK) / 105.0 s (Kùzu) / 156.0 s (Neo4j CE) | **#2 overall behind in-memory DuckPGQ+FK; #1 disk-backed DB** — beats PG1 (**5.40×**), Kùzu (**2.39×** / **7.4×** total), Neo4j CE (**9.48×** / **11.0×** total), and DuckPGQ+FK on Q6 ([details](lexell/docs/lexdb/property-graphs.md#benchmark-2-ldbc-lsqb-sf01-and-sf1-5-engines)) |

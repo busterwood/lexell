@@ -1,0 +1,99 @@
+// Regression tests for cost-based join planning:
+// - Composite-key pigeonhole cap in setRows prevents 2-column FK-to-PK joins
+//   (e.g. TPC-H q9 lineitem JOIN partsupp) from underestimating cardinality by d1*d2
+//   and placing an unfiltered composite join ahead of a selective dimension filter.
+// - Triangle / cyclic 3-way joins (where a closing edge joins two *different* tables)
+//   remain unaffected by the same-pair cap and still hash the closing edge.
+// expect: composite_fk_cap: ok
+// expect: triangle_unaffected: ok
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return "ERR:" + e.state + ":" + e.msg }
+    }
+}
+
+fn must(s: mut &lexdb_exec.Session, sql: &str) {
+    let r = q(s, sql)
+    if strings.startsWith(&r, "ERR:") { panic("SQL failed: " + sql + " -> " + r) }
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 50000}
+}
+
+fn main() {
+    let _ = lexdb_store.run(lexdb_disk.sim(72), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+
+        // 1. Composite-key FK-to-PK join (TPC-H q9 shape: li JOIN ps ON (p, s) + filtered pt)
+        must(mut &s, &"CREATE TABLE pt (p_id INT PRIMARY KEY, p_name TEXT NOT NULL)")
+        must(mut &s, &"CREATE TABLE sp (s_id INT PRIMARY KEY, s_name TEXT NOT NULL)")
+        must(mut &s, &"CREATE TABLE ps (ps_p INT NOT NULL, ps_s INT NOT NULL, ps_cost NUMERIC(10,2) NOT NULL, ps_note TEXT NOT NULL, PRIMARY KEY (ps_p, ps_s))")
+        must(mut &s, &"CREATE TABLE li (l_id INT PRIMARY KEY, l_p INT NOT NULL, l_s INT NOT NULL, l_qty INT NOT NULL)")
+
+        must(mut &s, &"INSERT INTO pt SELECT g, CASE WHEN g % 20 = 0 THEN 'bright green item ' || g ELSE 'plain blue item ' || g END FROM generate_series(1, 500) g")
+        must(mut &s, &"INSERT INTO sp SELECT g, 'sup' || g FROM generate_series(1, 100) g")
+        must(mut &s, &"INSERT INTO ps SELECT p, ((p + k * 7) % 100) + 1, (p % 50) + 1.25, 'comment_' || p || '_' || k FROM generate_series(1, 500) p, generate_series(0, 3) k")
+        must(mut &s, &"INSERT INTO li SELECT g, (g % 500) + 1, (((g % 500) + 1 + ((g / 500) % 4) * 7) % 100) + 1, (g % 10) + 1 FROM generate_series(1, 12000) g")
+        must(mut &s, &"ANALYZE")
+
+        let sql1 = "SELECT count(*), sum(li.l_qty) FROM pt, sp, li, ps WHERE sp.s_id = li.l_s AND ps.ps_s = li.l_s AND ps.ps_p = li.l_p AND pt.p_id = li.l_p AND pt.p_name LIKE '%green%'"
+        let plan1 = q(mut &s, &("EXPLAIN " + sql1))
+        let idxPt = strings.indexOf(&plan1, &"pt:", 0)
+        let idxPs = strings.indexOf(&plan1, &"ps:", 0)
+        let badPk = strings.contains(&plan1, &"join pt: primary key lookup per row")
+        let rBatch1 = q(mut &s, &sql1)
+        must(mut &s, &"SET lexdb_batch = off")
+        let rRow1 = q(mut &s, &sql1)
+        must(mut &s, &"SET lexdb_batch = on")
+
+        if idxPt >= 0 && idxPs >= 0 && idxPt < idxPs && !badPk && rBatch1 == rRow1 && rBatch1 == "600|6000" {
+            println("composite_fk_cap: ok")
+        } else {
+            println("composite_fk_cap: FAIL idxPt=" + idxPt.toStr() + " idxPs=" + idxPs.toStr() + " badPk=" + badPk.toStr() + " r=" + rBatch1 + " plan=" + plan1)
+        }
+
+        // 2. Triangle / cyclic 3-way join: closing edge joins two *different* tables, unaffected by cap
+        must(mut &s, &"CREATE TABLE ed (a INT NOT NULL, b INT NOT NULL, PRIMARY KEY (a, b))")
+        must(mut &s, &"INSERT INTO ed SELECT g, g + 1 FROM generate_series(1, 1000) g")
+        must(mut &s, &"INSERT INTO ed SELECT g, g + 2 FROM generate_series(1, 1000) g")
+        must(mut &s, &"INSERT INTO ed SELECT g, ((g * 13) % 1000) + 1003 FROM generate_series(1, 1000) g")
+        must(mut &s, &"ANALYZE")
+
+        let sql2 = "SELECT count(*) FROM ed e1 JOIN ed e2 ON e1.b = e2.a JOIN ed e3 ON e3.a = e1.a AND e3.b = e2.b WHERE e1.a < e1.b AND e2.a < e2.b"
+        let plan2 = q(mut &s, &("EXPLAIN " + sql2))
+        let hasHash2 = strings.contains(&plan2, &"hash on (a, b)") || strings.contains(&plan2, &"hash on (b, a)")
+        let rBatch2 = q(mut &s, &sql2)
+        must(mut &s, &"SET lexdb_batch = off")
+        let rRow2 = q(mut &s, &sql2)
+        must(mut &s, &"SET lexdb_batch = on")
+
+        if hasHash2 && rBatch2 == rRow2 && rBatch2 == "999" {
+            println("triangle_unaffected: ok")
+        } else {
+            println("triangle_unaffected: FAIL hasHash2=" + hasHash2.toStr() + " r=" + rBatch2 + " plan=" + plan2)
+        }
+        return 0
+    })
+}
