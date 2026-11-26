@@ -8,24 +8,24 @@ again, add its row to section 4 and update section 1.
 
 ## 1. Now (2026-11-26)
 
-**Full LexDB refresh at `59797d55` (main, after hierarchical data skipping indexes, adaptive two-level hash aggregation,
-and dictionary/string/regex execution), pinned (section 2), boost off for TPC-H, ClickBench, sysbench, and dedicated MV suites;
-results in `~/Work/lexdb-bench/saved/results/2026-11-26-refresh-59797d55/` and `2026-11-26-item3/`.**
+**Analytics, joins, and graph suites refreshed at `43b71051` (main, after hash-join runtime filters and composite-key / wide-hash join-planner fixes; raw in `~/Work/lexdb-bench/saved/results/2026-11-26-rt-filters/` and `2026-11-26-planner-fix/`); OLTP, COPY, and MV suites from `59797d55` (`2026-11-26-refresh-59797d55/`). Pinned (section 2), boost off for TPC-H, ClickBench, Star-Schema, Social Graph, LSQB, sysbench, and dedicated MV suites.**
 
-| | 2026-11-25 (`5d93ced1`) | 2026-11-26 (`59797d55`) | PostgreSQL 18 |
+| | 2026-11-26 (`59797d55`) | 2026-11-26 (`43b71051`) | PostgreSQL 18 |
 |---|---:|---:|---:|
-| point selects, 1 / 8 / 32 clients (1 process) | 98,794 / 188,196 / 180,704/s | **90,358 / 168,897 / 162,732/s** | 74,476 / 427,460 / 397,465/s |
-| point selects, 3 replicas, 1 / 8 / 32 clients | 97,924–98,622 / 349,157–392,047 / 499,549–503,649/s | 95,628–97,255 / 323,686–345,622 / **470,054–490,451/s** | (4 cores: above) |
-| updates, 1 / 8 / 32 clients | 4,079 / 18,296 / 67,022/s | **3,943 / 17,811 / 63,304/s** | 1,637 / 6,668 / 25,673/s |
-| mixed: replica selects / master updates | 408,392–415,567 / 16,052–16,404/s | **368,138–402,845 / 15,479–16,088/s** | |
-| commit latency p50 / p99 / p99.9 / max (8 clients) | 0.41 / 0.81–0.83 / 3.65–3.79 / 8.07–8.23 ms | **0.42 / 0.86–0.89 / 3.86–3.92 / 8.24–10.25 ms** | |
-| replica lag under the mixed load, p50 / p99 | 0.21–0.23 / 0.48 ms | **0.22–0.23 / 0.41–0.44 ms** | |
-| 35 analytic queries, lexdb CPU / PG 1c, wall / PG 4p | 0.48 / 0.95 (with 4 MVs: 0.30 / 0.49) | **0.46 / 0.91** (with 4 MVs: **0.31 vs PG1 / 0.49 vs PG4**) | |
-| TPC-H SF1, summed (boost off) | 7,115 ms | **7,197 ms** (geomean 0.49 vs PG1, 0.79 vs PG4; 22/22) | 14,670 one core / 8,839 four processes |
-| ClickBench 1M, summed (boost off) | 19,337 ms | **14,104 ms** (geomean 0.68 vs PG1, 40/43; with 8 MVs: **9,068 ms**, ahead of PG4, geomean **0.10 / 0.21**) | 22,363 one core / 11,326 four processes |
-| COPY narrow / wide / wide + 2 indexes / no key / 10M narrow | 0.24 / 1.04 / 1.80 / 1.05 / 2.44 s | **0.24 / 1.07 / 1.79 / 1.32 / 2.44 s** | 0.61 / 2.00 / 4.90 / 1.41 / 5.93 s |
-| COPY peak RSS, wide / wide + 2 indexes / 10M narrow | 619 / 1,330 / 2,870 MB | **621 / 1,331 / 2,873 MB** | |
-| MV `FAST` update (1M rows, 1 row: grp / sketch / 3-level DAG) | 0.72 / 0.48 / 0.50 ms (sketch build 224 vs PG 372 ms) | **0.66 / 0.47 / 0.43 ms** (sketch build **220** vs PG 379 ms) | 144.4 / 368.6 / 136.2 ms (1c); 59.7 / 363.2 / 136.1 ms (4p) |
+| point selects, 1 / 8 / 32 clients (1 process) | 90,358 / 168,897 / 162,732/s | *(unchanged; PK select `-0.05%` `instructions:u`)* | 74,476 / 427,460 / 397,465/s |
+| point selects, 3 replicas, 1 / 8 / 32 clients | 95,628–97,255 / 323,686–345,622 / **470,054–490,451/s** | *(unchanged)* | (4 cores: above) |
+| updates, 1 / 8 / 32 clients | **3,943 / 17,811 / 63,304/s** | *(unchanged)* | 1,637 / 6,668 / 25,673/s |
+| mixed: replica selects / master updates | **368,138–402,845 / 15,479–16,088/s** | *(unchanged)* | |
+| commit latency p50 / p99 / p99.9 / max (8 clients) | **0.42 / 0.86–0.89 / 3.86–3.92 / 8.24–10.25 ms** | *(unchanged)* | |
+| replica lag under the mixed load, p50 / p99 | **0.22–0.23 / 0.41–0.44 ms** | *(unchanged)* | |
+| 35 analytic queries, lexdb CPU / PG 1c, wall / PG 4p | 0.46 / 0.91 (with 4 MVs: 0.31 / 0.49) | **0.41 / 0.83** (wall vs PG1 **0.51**, 34/35 ahead; with 4 MVs: **0.31 / 0.49**) | |
+| TPC-H SF1, summed (boost off) | 7,197 ms (0.49 vs PG1, 0.79 vs PG4) | **6,371.5 ms** (geomean **0.45** wall / **0.42** CPU vs PG1, **0.73** vs PG4; **22/22**) | 14,670 one core / 8,839 four processes |
+| ClickBench 1M, summed (boost off) | 14,104 ms (0.68 vs PG1) | **13,937.5 ms** (geomean **0.67** wall / **0.63** CPU vs PG1, 40/43; with 8 MVs: **9,068 ms**, geomean **0.10 / 0.21**) | 22,363 one core / 11,326 four processes |
+| Selective star-schema joins (1M rows, 6 patterns, boost off) | 107.4 ms sum (`b316681d`) | **40.0 ms sum** (`0.54–22.5 ms`; **4.87×** geomean speedup, **7.68×** vs PG1 / **4.46×** vs PG4) | 308.3 ms (1c) / 161.2 ms (4p) |
+| Property graphs: Social 11q / LSQB SF1 (1 core, boost off) | 822 ms / 14.23 s | **810.5 ms** / **14.09 s** | 5,661 ms / 98.1 s (8/9) |
+| COPY narrow / wide / wide + 2 indexes / no key / 10M narrow | **0.24 / 1.07 / 1.79 / 1.32 / 2.44 s** | *(unchanged)* | 0.61 / 2.00 / 4.90 / 1.41 / 5.93 s |
+| COPY peak RSS, wide / wide + 2 indexes / 10M narrow | **621 / 1,331 / 2,873 MB** | *(unchanged)* | |
+| MV `FAST` update (1M rows, 1 row: grp / sketch / 3-level DAG) | **0.66 / 0.47 / 0.43 ms** (sketch build **220** vs PG 379 ms) | *(unchanged)* | 144.4 / 368.6 / 136.2 ms (1c); 59.7 / 363.2 / 136.1 ms (4p) |
 
 ### 1.0a The 2026-11-23 refresh
 

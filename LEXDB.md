@@ -169,8 +169,8 @@ It also supports **cascading multi-level rollup DAGs** and **composable HyperLog
 
 | Benchmark (1M rows, single core) | Without MVs | With MVs (unmodified queries) | Live write cost |
 |---|---:|---:|---|
-| **ClickBench 1M** (43 queries, +8 general MVs) | 14.10 s | **9.07 s total** — **1.25× faster than 4-core PG (`11.33 s`) on one core** (21 queries rewritten; geomean `0.10×` PG1 / `0.21×` PG4) | 1 / 100 new rows updating all 8 MVs live: **6.51 / 10.34 ms** |
-| **35 Analytic Queries** (+4 general MVs) | geomean `0.56×` PG1 / `0.91×` PG4 | 9 aggregate & join queries drop from 8–91 ms to **3–4 ms** (geomean **`0.31×` PG1 / `0.49×` PG4**) | 1 / 100 / 1,000 new rows updating all 4 MVs live: **4.40 / 7.09 / 25.90 ms** vs PG `REFRESH` **758 / 264 ms** |
+| **ClickBench 1M** (43 queries, +8 general MVs) | 13.94 s | **9.07 s total** — **1.25× faster than 4-core PG (`11.33 s`) on one core** (21 queries rewritten; geomean `0.10×` PG1 / `0.21×` PG4) | 1 / 100 new rows updating all 8 MVs live: **6.51 / 10.34 ms** |
+| **35 Analytic Queries** (+4 general MVs) | geomean `0.51×` PG1 / `0.83×` PG4 | 9 aggregate & join queries drop from 8–74 ms to **3–4 ms** (geomean **`0.31×` PG1 / `0.49×` PG4**) | 1 / 100 / 1,000 new rows updating all 4 MVs live: **4.40 / 7.09 / 25.90 ms** vs PG `REFRESH` **758 / 264 ms** |
 | **Grouped / Sketch / 3-level DAG** | 23.7 ms grouped / 234.4 ms sketch | **0.18 ms** (132×) / **0.56 ms** (419×) / **0.07 ms** | 1-row `FAST` update: **0.43–0.66 ms** vs PG `REFRESH` **60–369 ms** (**90–780× faster**) |
 
 Read the user guide: **[Materialized views and transparent query rewrite](lexell/docs/lexdb/materialized-views.md)**.
