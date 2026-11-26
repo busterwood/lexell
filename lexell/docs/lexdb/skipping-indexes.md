@@ -48,8 +48,11 @@ With zero configuration, lexdb automatically skips non-matching subtrees and blo
 | `WHERE code BETWEEN 'US-001' AND 'US-099'` (clustered/ordered **text**) | **`minmax`** (alias `brin`) |
 | `WHERE status = 'failed'` or `WHERE country IN ('JP', 'KR')` (**few distinct values** per block, unsorted) | **`set`** |
 | `WHERE user_id = 435090932899640449` or `WHERE trace_id = '...'` (**many distinct values**, exact `=` / `IN`) | **`bloom_filter`** (alias `bloom`) |
-| `WHERE url LIKE '%google%'` or `WHERE title LIKE '%error%'` (**any substring** match in text) | **`ngrambf`** |
-| `WHERE log_msg LIKE '% timeout %'` or `WHERE url LIKE '%/checkout/%'` (**delimiter-bounded whole-word / token** match in long text) | **`tokenbf`** |
+| `WHERE url LIKE '%google%'` or `WHERE title ILIKE '%error%'` (**any substring** match in text) | **`ngrambf`** |
+| `WHERE log_msg LIKE '% timeout %'` or `WHERE url LIKE '%/checkout/%'` (**delimiter-bounded whole-word / token** match in long text) | **`tokenbf`** (add `WITH (case_insensitive = true)` for `ILIKE`) |
+
+Conditions joined by `OR` can use skipping indexes too, as long as every branch of the `OR` has a condition one of the
+table's indexes (or the automatic zone maps) can check — see [OR conditions](#or-conditions).
 
 ## The five index types explained
 
@@ -132,12 +135,19 @@ missing, the block is skipped.
   emails, user agents, or short identifiers — queries where a standard B+tree index cannot help at all because of the
   leading `%`.
 - Works for exact `=`, `IN (...)`, and any `LIKE` pattern that has at least one literal segment of length `>= n`.
+- Works for PostgreSQL's case-insensitive **`ILIKE`** with no extra setup: lexdb checks each n-gram of the pattern in
+  every upper/lower-case spelling (`'goo'`, `'Goo'`, `'GOO'`, ...), so `WHERE title ILIKE '%google%'` skips blocks that
+  contain no spelling of `google`. An n-gram with more than 6 letters is not checked this way; with `n` up to 6, every
+  n-gram is. For fewer checks and fewer false positives on `ILIKE`-heavy columns, create the index
+  `WITH (case_insensitive = true)` (see [Case-insensitive search](#case-insensitive-search-ilike)).
 - Automatically handles SQL Server's case-insensitive `NVARCHAR` columns (`COLL_CI`) by folding ASCII case so pruning
   matches T-SQL's case-insensitive `LIKE` semantics.
 
 **When it does not help:**
 - Patterns whose literal pieces are shorter than `n` (e.g., `LIKE '%ok%'` cannot be pruned by a 3-gram index; use
   `n = 2` if you frequently search 2-character substrings, at the cost of faster filter saturation).
+- Patterns containing `_` or an escape character (`LIKE '%err_503%'`): only patterns of literal text and `%` are
+  pruned today. The query still returns the right rows; it just scans every block.
 - Very common substrings that appear in nearly every block (e.g. `LIKE '%https://%'`).
 - Very long prose/log bodies where a single block generates thousands of distinct trigrams and fills up the filter —
   for long multi-word text, prefer `tokenbf` below.
@@ -165,6 +175,9 @@ punctuation, slashes, hyphens). For example, `'https://news.example.com/checkout
   *not* prune blocks with `tokenbf` because `%` could match part of a longer word like `'mytimeout'`. Include
   non-alphanumeric separators around the token — such as `LIKE '% timeout %'`, `LIKE '%/checkout/%'`, or
   `LIKE '%.google.%'` — or use `ngrambf` when you need arbitrary `%substring%` matching.
+- **`ILIKE` on an index of the text as written:** a word could be stored as `Timeout`, `TIMEOUT` or `timeout`, so only
+  tokens with no letters (`'% 503 %'`) are checked. Create the index `WITH (case_insensitive = true)` to prune `ILIKE`
+  on words.
 
 ```sql
 CREATE SKIPPING INDEX ix_logs_msg_tok ON app_logs (message) USING tokenbf(2048, 3);
@@ -172,6 +185,49 @@ CREATE SKIPPING INDEX ix_logs_msg_tok ON app_logs (message) USING tokenbf(2048, 
 -- Helps: WHERE message LIKE '%/checkout/%'
 -- Helps: WHERE message LIKE '%.google.%'
 ```
+
+## Case-insensitive search (`ILIKE`)
+
+PostgreSQL's `ILIKE` can skip blocks in two ways (`NOT ILIKE`, like `NOT LIKE`, is not pruned):
+
+| Index | What `ILIKE` gets |
+|---|---|
+| `ngrambf` on the text as written (the default) | Pruned: each n-gram is checked in all its upper/lower-case spellings. |
+| `tokenbf` on the text as written (the default) | Only tokens made of digits are checked. |
+| `ngrambf` or `tokenbf` `WITH (case_insensitive = true)` | Pruned directly: the index stores the text with ASCII letters folded to lower case. |
+
+A `case_insensitive` index still prunes ordinary case-sensitive `LIKE`: the pattern is folded the same way before the
+check, so it skips the blocks where no spelling of the pattern can occur (a little less selective than a
+case-sensitive index when the same letters occur in another case).
+
+lexdb's `ILIKE` folds ASCII letters only (`A`–`Z`), and so does the index; letters outside ASCII must match exactly,
+as in the query itself.
+
+```sql
+CREATE SKIPPING INDEX ix_logs_msg_tok ON app_logs (message) USING tokenbf WITH (case_insensitive = true);
+-- Helps: WHERE message ILIKE '% timeout %'
+-- Helps: WHERE message LIKE '% Timeout %'
+
+CREATE SKIPPING INDEX ix_pages_title_ng ON pages (title) USING ngrambf(3, 4096, 3);
+-- Helps: WHERE title ILIKE '%google%'   (no option needed for ngrambf)
+```
+
+## OR conditions
+
+A block is skipped for `WHERE a OR b` when the indexes prove that **neither** branch can match any row in it. Each
+branch can use a different column and a different index, and a branch can itself be a group of `AND`ed conditions:
+
+```sql
+-- ngrambf on title, tokenbf on url: a block is skipped only if it can match neither
+SELECT count(*) FROM pages WHERE title ILIKE '%release notes%' OR url LIKE '%/changelog/%';
+
+-- one branch with two conditions: skipped when (title cannot match OR id is out of range) and url cannot match
+SELECT count(*) FROM pages WHERE (title LIKE '%Release%' AND id > 9000) OR url ILIKE '%.google.%';
+```
+
+If one branch has no condition an index can check (for example `OR length(title) = 23`), the whole `OR` cannot skip
+anything; other `AND`ed conditions in the same `WHERE` still can. An `OR` of `=` on one column is checked as an `IN`
+list, as before.
 
 ## Measured impact
 
@@ -225,8 +281,13 @@ Constraints:
 | `minmax` (`brin`) | none | none | — | integer, date, time, timestamp, `text`/`varchar`/`nvarchar` | `=`, `<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, dynamic Top-N |
 | `set` | `(max_rows)` — default `32` | `max_rows` | `1..4096` | integer, date, time, timestamp, `text`/`varchar`/`nvarchar` | `=`, `<>`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN`, `LIKE` (case-sensitive text) |
 | `bloom_filter` (`bloom`) | `(bits_per_key, size_bytes, hashes)` — default `(10, 2048, 3)` | `bits_per_key`, `size` / `size_bytes`, `hashes` | `size`: `64..65536`, `hashes`: `1..8` | integer, date, time, timestamp, `text`/`varchar`/`nvarchar` | `=`, `IN`, `OR` of equalities |
-| `ngrambf` (`ngrambf_v1`) | `(n, size_bytes, hashes)` — default `(3, 2048, 3)` | `n` / `ngram`, `size` / `size_bytes`, `hashes` | `n`: `2..8`, `size`: `128..65536`, `hashes`: `1..8` | `text`/`varchar`/`nvarchar` | `=`, `IN`, `LIKE` (any literal piece of length `>= n`; case-insensitive on `COLL_CI`) |
-| `tokenbf` (`tokenbf_v1`) | `(size_bytes, hashes)` — default `(2048, 3)` | `size` / `size_bytes`, `hashes` | `size`: `128..65536`, `hashes`: `1..8` | `text`/`varchar`/`nvarchar` | `=`, `IN`, `LIKE` (complete alphanumeric tokens; case-insensitive on `COLL_CI`) |
+| `ngrambf` (`ngrambf_v1`) | `(n, size_bytes, hashes)` — default `(3, 2048, 3)` | `n` / `ngram`, `size` / `size_bytes`, `hashes`, `case_insensitive` | `n`: `2..8`, `size`: `128..65536`, `hashes`: `1..8` | `text`/`varchar`/`nvarchar` | `=`, `IN`, `LIKE`, `ILIKE` (any literal piece of length `>= n`; case-insensitive on `COLL_CI` or `case_insensitive`) |
+| `tokenbf` (`tokenbf_v1`) | `(size_bytes, hashes)` — default `(2048, 3)` | `size` / `size_bytes`, `hashes`, `case_insensitive` | `size`: `128..65536`, `hashes`: `1..8` | `text`/`varchar`/`nvarchar` | `=`, `IN`, `LIKE` (complete alphanumeric tokens; case-insensitive on `COLL_CI` or `case_insensitive`), `ILIKE` (tokens of digits; every token with `case_insensitive`) |
+
+All of these predicates are also pruned inside an `OR` when every branch has one (see [OR conditions](#or-conditions)).
+
+`case_insensitive` takes `true` / `false` (or `on` / `off`, `1` / `0`), defaults to `false`, and is accepted for
+`ngrambf` and `tokenbf` only (`22023` otherwise).
 
 **Tuning tip:** If a Bloom, n-gram, or token filter on a wide/verbose column is saturating (skipping few blocks),
 increase `size_bytes` (for example from `2048` to `8192` or `16384`). For `set`, raise `max_rows` if a low-cardinality

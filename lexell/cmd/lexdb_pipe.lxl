@@ -1858,8 +1858,9 @@ pub fn cRanges(conds: &[]BNode, kinds: &[]int, t: &lexdb_catalog.Table): []int {
     return out
 }
 
-// Extracts all skippable predicates (ranges, <>, =, IN, text comparisons, simple case-sensitive LIKE)
-// from WHERE conditions into a lexdb_skip.SkipQuery for hierarchical B+tree subtree pruning.
+// Extracts all skippable predicates (ranges, <>, =, IN, text comparisons, simple LIKE and ILIKE,
+// and OR groups of these) from WHERE conditions into a lexdb_skip.SkipQuery for hierarchical
+// B+tree subtree pruning.
 pub fn cSkipQuery(conds: &[]BNode, kinds: &[]int, t: &lexdb_catalog.Table): lexdb_skip.SkipQuery {
     var q = lexdb_skip.emptyQuery()
     q.ranges = cRanges(conds, kinds, t)
@@ -1932,7 +1933,12 @@ fn cSkipOf(n: &BNode, kinds: &[]int, t: &lexdb_catalog.Table, q: mut &lexdb_skip
                 append(mut &q.strPl, placeOfCol(t, cs))
                 append(mut &q.strOp, 6)
                 append(mut &q.strVals, svs)
+                return
             }
+            // Any other OR (url LIKE '%a%' OR title ILIKE '%b%'): a group of each
+            // alternative's own predicates, none if one alternative has none
+            var alts: []lexdb_skip.SkipQuery = []
+            if cSkipAlts(n, kinds, t, mut &alts) { append(mut &q.alts, alts) }
         }
         BNode.Cmp(op, a, b) {
             var col = -1
@@ -2034,18 +2040,42 @@ fn cSkipOf(n: &BNode, kinds: &[]int, t: &lexdb_catalog.Table, q: mut &lexdb_skip
             }
         }
         BNode.Like(c, lp) {
-            if lp.simple && c >= 0 && c < len(t.cols) && t.cols[c].typ.kind == lexdb_sql.K_TEXT {
+            if c >= 0 && c < len(t.cols) && t.cols[c].typ.kind == lexdb_sql.K_TEXT {
                 let ck = lexdb_sql.collKind(&t.cols[c].coll)
-                if (ck == lexdb_sql.COLL_EXACT && !lp.fold) || ck == lexdb_sql.COLL_CI {
-                    let pl = placeOfCol(t, c)
-                    var ps: []str = withCapacity(len(lp.pieces))
+                if ck != lexdb_sql.COLL_EXACT && ck != lexdb_sql.COLL_CI { return }
+                var ps: []str = []
+                if lp.simple {
                     for p in lp.pieces { append(mut &ps, p.clone()) }
-                    append(mut &q.likePl, pl)
-                    append(mut &q.likePieces, ps)
+                } else if lp.fold && lexdb_like.likeSimple(&lp.pat, &lp.esc) && len(strings.runes(&lp.esc)) <= 1 {
+                    // ILIKE: its pieces folded as likeMatch folds the pattern
+                    let lo = strings.toLowerAscii(&lp.pat)
+                    ps = lexdb_like.likeSplit(&lo)
+                } else {
+                    return
                 }
+                append(mut &q.likePl, placeOfCol(t, c))
+                append(mut &q.likePieces, ps)
+                append(mut &q.likeFold, lp.fold)
             }
         }
         else {}
+    }
+}
+
+// The alternatives of an OR (flattened), each its own SkipQuery; false when
+// one has nothing to skip on (then the OR cannot skip a node).
+fn cSkipAlts(n: &BNode, kinds: &[]int, t: &lexdb_catalog.Table, out: mut &[]lexdb_skip.SkipQuery): bool {
+    match n {
+        BNode.Or(a, b) { return cSkipAlts(&a, kinds, t, out) && cSkipAlts(&b, kinds, t, out) }
+        else {
+            var aq = lexdb_skip.emptyQuery()
+            cRangesOf(n, kinds, t, mut &aq.ranges)
+            cSkipOf(n, kinds, t, mut &aq)
+            if !aq.hasFilters() { return false }
+            aq.active = true
+            append(out, aq)
+            return true
+        }
     }
 }
 

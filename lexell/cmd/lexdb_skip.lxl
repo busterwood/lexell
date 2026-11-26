@@ -12,6 +12,8 @@
 //    - BLOOM_FILTER  : double-hashed SipHash-1-3 Bloom filter for = / IN on high-cardinality columns
 //    - NGRAMBF       : N-gram Bloom filter for arbitrary substring LIKE '%...%' (0% false negatives)
 //    - TOKENBF       : alphanumeric token Bloom filter for = / delimiter-bounded LIKE '%.tok.%'
+//    ILIKE prunes through NGRAMBF (each gram probed in its spellings) or a case_insensitive NGRAMBF /
+//    TOKENBF (folded summaries); an OR prunes a node when every alternative does (SkipQuery.alts).
 //    All four index kinds form commutative monoids (min/max union, set union, bitwise-OR of Bloom filters),
 //    so summaries roll up hierarchically across internal B+tree nodes and persist by immutable diskPageNo
 //    in a companion B+tree for instant cold-restart skipping without re-reading data pages.
@@ -189,8 +191,12 @@ pub type SkipQuery = record {
     pub strPl: []int            // place index for text comparisons (=, <>, <, <=, >, >=, IN)
     pub strOp: []int            // 0:=, 1:<>, 2:<, 3:<=, 4:>, 5:>=, 6:IN
     pub strVals: [][]str
-    pub likePl: []int           // place index for simple case-sensitive LIKE
-    pub likePieces: [][]str     // likeSplit pieces (for NGRAMBF / TOKENBF / SET)
+    pub likePl: []int           // place index for simple LIKE / ILIKE
+    pub likePieces: [][]str     // likeSplit pieces (for NGRAMBF / TOKENBF / SET); ILIKE's folded
+    pub likeFold: []bool        // ILIKE: matched with ASCII letters folded (likeMatch)
+    // OR groups: a node is skipped when every alternative of one group is
+    // proved false on it (each alternative its own conjunction of the above)
+    pub alts: [][]SkipQuery
     pub barOn: bool             // dynamic Top-N threshold (ORDER BY int LIMIT N)
     pub barPl: int
     pub barKind: int            // 0 = any int, else PK_*
@@ -201,13 +207,13 @@ pub type SkipQuery = record {
 
 pub fn emptyQuery(): SkipQuery {
     return SkipQuery{active: false, ranges: [], nes: [], eqPl: [], eqInt: [], inPl: [], inInts: [],
-                     strPl: [], strOp: [], strVals: [], likePl: [], likePieces: [],
+                     strPl: [], strOp: [], strVals: [], likePl: [], likePieces: [], likeFold: [], alts: [],
                      barOn: false, barPl: -1, barKind: 0, barVal: 0, barDesc: false, barNf: false}
 }
 
 pub fn (q: &SkipQuery) hasFilters(): bool {
     return len(q.ranges) > 0 || len(q.nes) > 0 || len(q.eqPl) > 0 || len(q.inPl) > 0 ||
-           len(q.strPl) > 0 || len(q.likePl) > 0 || q.barOn
+           len(q.strPl) > 0 || len(q.likePl) > 0 || len(q.alts) > 0 || q.barOn
 }
 
 pub fn (q: &SkipQuery) hasAutoFilters(): bool {
@@ -429,6 +435,47 @@ fn bloomHasNgrams(bits: &[byte], hashes: int, ng: int, s: &str): bool {
     return true
 }
 
+// A gram with more ASCII letters than this is taken as present by
+// bloomHasNgramsFold (2^letters spellings to probe).
+const FOLD_MAX_LETTERS = 6
+
+// ILIKE against an n-gram filter of the text as written: s is folded (ASCII
+// lower case), and a gram of s is present when one of its spellings is (each
+// letter in either case: what likeMatch folds to it). False when some gram
+// has none. ng <= 8 (createSkipIndex), so a gram is ngramHashPair's word,
+// and a spelling is that word with 0x20 cleared in some letters' bytes.
+fn bloomHasNgramsFold(bits: &[byte], hashes: int, ng: int, s: &str): bool {
+    let n = len(s)
+    if n < ng || ng > 8 { return true }
+    for i in 0..(n - ng + 1) {
+        var w: u64 = u64(ng) << 56
+        var lmask: u64 = 0
+        var letters = 0
+        for j in 0..ng {
+            let c = s[i + j]
+            w |= u64(int(c)) << (j * 8)
+            if c >= 'a' && c <= 'z' {
+                lmask |= u64(0x20) << (j * 8)
+                letters += 1
+            }
+        }
+        if letters > FOLD_MAX_LETTERS { continue }
+        var sub = lmask
+        var any = false
+        while true {
+            let v = w ^ sub
+            if bloomHas(bits, hashes, mixInt64(v, u64(0x243f6a8885a308d3)), mixInt64(v, u64(0x13198a2e03707344))) {
+                any = true
+                break
+            }
+            if sub == 0 { break }
+            sub = (sub - u64(1)) & lmask
+        }
+        if !any { return false }
+    }
+    return true
+}
+
 fn isTokenByte(c: byte): bool {
     return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
 }
@@ -448,14 +495,20 @@ fn bloomAddTokens(bits: mut &[]byte, hashes: int, s: &str) {
 // - exact = true: every token in s must be present
 // - exact = false (LIKE piece): only tokens bounded on BOTH sides by non-token bytes inside s
 //   (or anchored at start/end when anchorStart/anchorEnd is true).
-fn bloomHasTokens(bits: &[byte], hashes: int, s: &str, anchorStart: bool, anchorEnd: bool): bool {
+// - noLetters: only tokens without an ASCII letter (ILIKE against a filter of the text as
+//   written: a token's other spellings are not in s, but one of digits has none).
+fn bloomHasTokens(bits: &[byte], hashes: int, s: &str, anchorStart: bool, anchorEnd: bool, noLetters: bool): bool {
     let n = len(s)
     var i = 0
     while i < n {
         while i < n && !isTokenByte(s[i]) { i += 1 }
         let st = i
-        while i < n && isTokenByte(s[i]) { i += 1 }
-        if i > st {
+        var letter = false
+        while i < n && isTokenByte(s[i]) {
+            if s[i] > '9' { letter = true }
+            i += 1
+        }
+        if i > st && !(noLetters && letter) {
             let leftOk = st > 0 || anchorStart
             let rightOk = i < n || anchorEnd
             if leftOk && rightOk {
@@ -1080,31 +1133,44 @@ fn idxExcludes(ix: &IdxSum, q: &SkipQuery): bool {
                 if !any { return true }
             }
         } else if ix.kind == SKIP_TOKEN {
-            if op == 0 { if !bloomHasTokens(&ix.bits, ix.hashes, &ks[0], true, true) { return true } }
+            if op == 0 { if !bloomHasTokens(&ix.bits, ix.hashes, &ks[0], true, true, false) { return true } }
             else if op == 6 {
                 var any = false
-                for k in ks { if bloomHasTokens(&ix.bits, ix.hashes, &k, true, true) { any = true; break } }
+                for k in ks { if bloomHasTokens(&ix.bits, ix.hashes, &k, true, true, false) { any = true; break } }
                 if !any { return true }
             }
         }
     }
     }
 
-    // Simple LIKE predicates (URL LIKE '%google%', etc.)
+    // Simple LIKE / ILIKE predicates (URL LIKE '%google%', title ILIKE '%Google%', etc.)
     for i in 0..len(q.likePl) {
         if q.likePl[i] != pl { continue }
         if !ix.hasVal { return true }
         let ps = &q.likePieces[i]
-        if ix.kind == SKIP_SET && !ix.ci {
-            var any = false
-            for v in ix.strSet { if lexdb_like.likePieces(&v, ps) { any = true; break } }
-            if !any { return true }
+        let fold = q.likeFold[i]    // ILIKE: ps folded; the values match folded
+        if ix.kind == SKIP_SET {
+            if fold {
+                // a ci set's values are folded already (folding again changes nothing)
+                var any = false
+                for v in ix.strSet { if lexdb_like.likePiecesFold(&v, ps) { any = true; break } }
+                if !any { return true }
+            } else if !ix.ci {
+                var any = false
+                for v in ix.strSet { if lexdb_like.likePieces(&v, ps) { any = true; break } }
+                if !any { return true }
+            }
         } else if ix.kind == SKIP_NGRAM {
             for p in ps {
                 if len(p) >= ix.ngramN {
-                    let f = if ix.ci { strings.toLowerAscii(&p) } else { "" }
-                    let qStr: &str = if ix.ci { &f } else { &p }
-                    if !bloomHasNgrams(&ix.bits, ix.hashes, ix.ngramN, qStr) { return true }
+                    if fold && !ix.ci {
+                        // an n-gram filter of the text as written: each gram in any case
+                        if !bloomHasNgramsFold(&ix.bits, ix.hashes, ix.ngramN, &p) { return true }
+                    } else {
+                        let f = if ix.ci { strings.toLowerAscii(&p) } else { "" }
+                        let qStr: &str = if ix.ci { &f } else { &p }
+                        if !bloomHasNgrams(&ix.bits, ix.hashes, ix.ngramN, qStr) { return true }
+                    }
                 }
             }
         } else if ix.kind == SKIP_TOKEN {
@@ -1116,9 +1182,34 @@ fn idxExcludes(ix: &IdxSum, q: &SkipQuery): bool {
                 let qStr: &str = if ix.ci { &f } else { p }
                 let aStart = k == 0
                 let aEnd = k == np - 1
-                if !bloomHasTokens(&ix.bits, ix.hashes, qStr, aStart, aEnd) { return true }
+                if !bloomHasTokens(&ix.bits, ix.hashes, qStr, aStart, aEnd, fold && !ix.ci) { return true }
             }
         }
+    }
+    return false
+}
+
+// Whether the node's persisted index summaries (a page not loaded) prove no row
+// can match q: one summary excludes q's predicates, or every alternative of an
+// OR group is excluded (each by any of the summaries).
+fn idxsExclude(ixs: &[]IdxSum, q: &SkipQuery): bool {
+    for ix in ixs { if idxExcludes(&ix, q) { return true } }
+    for g in q.alts {
+        if len(g) == 0 { continue }
+        var all = true
+        for a in g { if !idxsExclude(ixs, &a) { all = false; break } }
+        if all { return true }
+    }
+    return false
+}
+
+// Whether every alternative of one of q's OR groups is proved false on the node.
+fn altsExclude(sum: &NodeSum, q: &SkipQuery): bool {
+    for g in q.alts {
+        if len(g) == 0 { continue }
+        var all = true
+        for a in g { if !nodeExcludes(sum, &a) { all = false; break } }
+        if all { return true }
     }
     return false
 }
@@ -1174,6 +1265,8 @@ pub fn nodeExcludes(sum: &NodeSum, q: &SkipQuery): bool {
     for ix in sum.idxs {
         if idxExcludes(&ix, q) { return true }
     }
+    // 3. OR groups
+    if len(q.alts) > 0 && altsExclude(sum, q) { return true }
     return false
 }
 
@@ -1436,12 +1529,16 @@ pub fn checkNodeSkipBar(storeId: int, tree: int, slot: int, gen: int, subVer: in
                 if disk >= 0 && len(ts.diskSums) > 0 {
                     match ts.diskIdx.get(&disk) {
                         Some(di) {
-                            for ix in ts.diskSums[di] {
-                                if idxExcludes(&ix, q) || (barOn && barPl >= 0 && barIdxExcludes(&ix, barPl, barVal, barDesc, barNf)) {
-                                    skip = true
-                                    if isLeaf { ss.leavesSkipped += 1 } else { ss.subtreesSkipped += 1 }
-                                    return
+                            var ex = idxsExclude(&ts.diskSums[di], q)
+                            if !ex && barOn && barPl >= 0 {
+                                for ix in ts.diskSums[di] {
+                                    if barIdxExcludes(&ix, barPl, barVal, barDesc, barNf) { ex = true; break }
                                 }
+                            }
+                            if ex {
+                                skip = true
+                                if isLeaf { ss.leavesSkipped += 1 } else { ss.subtreesSkipped += 1 }
+                                return
                             }
                         }
                         None {}

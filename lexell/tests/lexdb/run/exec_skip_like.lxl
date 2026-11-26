@@ -1,0 +1,185 @@
+// Data skipping indexes for ILIKE and for OR (design/lexdb.md, "As built: skipping
+// indexes for ILIKE and for OR"):
+// - ILIKE against an ngrambf of the text as written (each gram probed in its
+//   spellings) and against tokenbf's tokens without letters
+// - WITH (case_insensitive = true) on ngrambf / tokenbf: folded summaries,
+//   used by ILIKE and by LIKE
+// - an OR of skippable predicates: a node is skipped when every alternative
+//   is proved false on it, also from the summaries persisted for a cold start
+// Every count is checked against the answer with no index (no false negatives).
+// expect: token_noletters: ok
+// expect: ilike_ngram: ok
+// expect: ilike_ci_token: ok
+// expect: or_like: ok
+// expect: or_partial: ok
+// expect: ci_option_errors: ok
+// expect: reopen_cold: ok
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_skip"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return "ERR:" + e.state + ":" + e.msg }
+    }
+}
+
+fn qInt(s: mut &lexdb_exec.Session, sql: &str): int {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows && len(r.rows) > 0 && len(r.rows[0]) > 0 {
+                match r.rows[0][0] {
+                    lexdb_sql.Val.Int(i) { return i }
+                    else { return -999999 }
+                }
+            }
+            return -999999
+        }
+        Err(_) { return -999999 }
+    }
+}
+
+fn must(s: mut &lexdb_exec.Session, sql: &str) {
+    let r = q(s, sql)
+    if strings.startsWith(&r, "ERR:") { panic("SQL failed: " + sql + " -> " + r) }
+}
+
+// The count, and how many nodes the scan skipped.
+type Got = value record { n: int; skipped: int }
+
+fn cnt(s: mut &lexdb_exec.Session, where: &str): Got {
+    lexdb_skip.resetCounters()
+    let n = qInt(s, &("SELECT COUNT(*) FROM docs WHERE " + where))
+    return Got{n: n, skipped: lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()}
+}
+
+fn show(g: Got): str { return g.n.toStr() + "/" + g.skipped.toStr() }
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 512 * 1024, ckptBytes: 256 * 1024, snapNodes: 50000}
+}
+
+// The OR queries of or_like, run again after the restart.
+const OR_HIT = "title LIKE '%Release NOTES%' OR url ILIKE '%.google.%'"
+const OR_MISS = "title ILIKE '%qqqzzz%' OR url LIKE '%.nowhere.%'"
+const ILIKE_HIT = "title ILIKE '%release notes%'"
+
+fn runPhase1(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st.share())
+    must(mut &s, "CREATE TABLE docs (id BIGINT PRIMARY KEY, title TEXT, url TEXT)")
+    // 12,000 rows: three B+tree levels of column leaves. Mixed case where it matters:
+    // titles 321 and 9321 'Release NOTES ...', 6000 'release notes ...';
+    // urls 777 and 11777 on docs.GOOGLE.com, 4000 on Google.com.
+    must(mut &s, "INSERT INTO docs SELECT g, CASE WHEN g IN (321, 9321) THEN 'Release NOTES for LexDB ' || CAST(g AS TEXT) WHEN g = 6000 THEN 'release notes lowercase' ELSE 'Item ' || CAST(g AS TEXT) || ' plain text' END, CASE WHEN g IN (777, 11777) THEN 'https://docs.GOOGLE.com/x/' || CAST(g AS TEXT) WHEN g = 4000 THEN 'https://Google.com/y' ELSE 'https://site' || CAST(g % 200 AS TEXT) || '.example.org/p/' || CAST(g AS TEXT) END FROM generate_series(1, 12000) AS g")
+    st.checkpoint().unwrap()
+
+    // Answers with no skipping index, to compare with
+    let base1 = cnt(mut &s, ILIKE_HIT)
+    let base2 = cnt(mut &s, OR_HIT)
+
+    // 1. ILIKE against a tokenbf of the text as written: tokens of digits only
+    must(mut &s, "CREATE SKIPPING INDEX ix_title_tok ON docs (title) USING tokenbf")
+    let t1 = cnt(mut &s, "title ILIKE '% 99999 %'")
+    let t2 = cnt(mut &s, "title ILIKE '% 1234 %'")
+    let t3 = cnt(mut &s, "title ILIKE '% PLAIN %'")        // a token with letters: not pruned, still right
+    let tokOk = t1.n == 0 && t1.skipped > 0 && t2.n == 1 && t2.skipped > 0 && t3.n == 11997
+    must(mut &s, "DROP SKIPPING INDEX ix_title_tok")
+    // ... and a folded one (positional parameters with the WITH option): words too
+    must(mut &s, "CREATE SKIPPING INDEX ix_title_tok2 ON docs (title) USING tokenbf(4096, 2) WITH (case_insensitive = true)")
+    let t4 = cnt(mut &s, "title ILIKE '% PLAINLY %'")
+    let t5 = cnt(mut &s, "title ILIKE '% Plain %'")
+    must(mut &s, "DROP SKIPPING INDEX ix_title_tok2")
+    let tok2Ok = t4.n == 0 && t4.skipped > 0 && t5.n == 11997
+    println("token_noletters: " + (if tokOk && tok2Ok { "ok" } else { "FAIL:" + show(t1) + ":" + show(t2) + ":" + show(t3) + ":" + show(t4) + ":" + show(t5) }))
+
+    // 2. ILIKE against an ngrambf of the text as written
+    must(mut &s, "CREATE SKIPPING INDEX ix_title_ng ON docs (title) USING ngrambf(3, 2048, 3)")
+    let n1 = cnt(mut &s, ILIKE_HIT)
+    let n2 = cnt(mut &s, "title ILIKE '%RELEASE%'")
+    let n3 = cnt(mut &s, "title ILIKE '%qqqzzz%'")
+    let n4 = cnt(mut &s, "title LIKE '%Release NOTES%'")      // LIKE keeps its case
+    let n5 = cnt(mut &s, "title ILIKE '%release_notes%'")     // _ : not pruned, still right
+    let n6 = cnt(mut &s, "title NOT ILIKE '%release notes%'")
+    let ngOk = base1.n == 3 && n1.n == 3 && n1.skipped > 0 && n2.n == 3 && n2.skipped > 0 && n3.n == 0 && n3.skipped > 0 &&
+               n4.n == 2 && n4.skipped > 0 && n5.n == 3 && n6.n == 11997
+    println("ilike_ngram: " + (if ngOk { "ok" } else { "FAIL:" + show(base1) + ":" + show(n1) + ":" + show(n2) + ":" + show(n3) + ":" + show(n4) + ":" + show(n5) + ":" + show(n6) }))
+
+    // 3. WITH (case_insensitive = true): a tokenbf of the folded text
+    must(mut &s, "CREATE SKIPPING INDEX ix_url_tok ON docs (url) USING tokenbf WITH (size = 2048, case_insensitive = true)")
+    let c1 = cnt(mut &s, "url ILIKE '%.google.%'")
+    let c2 = cnt(mut &s, "url LIKE '%.GOOGLE.%'")
+    let c3 = cnt(mut &s, "url LIKE '%.google.%'")
+    let c4 = cnt(mut &s, "url ILIKE '%.NoWhere.%'")
+    let ciOk = c1.n == 2 && c1.skipped > 0 && c2.n == 2 && c2.skipped > 0 && c3.n == 0 && c4.n == 0 && c4.skipped > 0
+    println("ilike_ci_token: " + (if ciOk { "ok" } else { "FAIL:" + show(c1) + ":" + show(c2) + ":" + show(c3) + ":" + show(c4) }))
+
+    // 4. OR of LIKE / ILIKE, across columns and indexes
+    let o1 = cnt(mut &s, OR_HIT)
+    let o2 = cnt(mut &s, OR_MISS)
+    let o3 = cnt(mut &s, "title LIKE '%Release%' OR title LIKE '%zzzqqq%'")
+    let o4 = cnt(mut &s, "(title ILIKE '%release notes%' AND id > 9000) OR url ILIKE '%.google.%'")
+    let o5 = cnt(mut &s, "title ILIKE '%qqqzzz%' OR (url ILIKE '%.nowhere.%' OR title LIKE '%Release NOTES%')")
+    let orOk = base2.n == 4 && o1.n == 4 && o1.skipped > 0 && o2.n == 0 && o2.skipped > 0 && o3.n == 2 && o3.skipped > 0 &&
+               o4.n == 3 && o4.skipped > 0 && o5.n == 2 && o5.skipped > 0
+    println("or_like: " + (if orOk { "ok" } else { "FAIL:" + show(base2) + ":" + show(o1) + ":" + show(o2) + ":" + show(o3) + ":" + show(o4) + ":" + show(o5) }))
+
+    // 5. An OR with an alternative that has nothing to skip on: no pruning from it, still right
+    let p1 = cnt(mut &s, "title ILIKE '%qqqzzz%' OR length(title) = 23")
+    let p2 = cnt(mut &s, "title ILIKE '%qqqzzz%' OR url NOT LIKE '%example%'")
+    let p3 = cnt(mut &s, "(title ILIKE '%qqqzzz%' OR length(url) = 20) AND url ILIKE '%google%'")
+    let partOk = p1.n == 1 && p2.n == 3 && p3.n == 1
+    println("or_partial: " + (if partOk { "ok" } else { "FAIL:" + show(p1) + ":" + show(p2) + ":" + show(p3) }))
+
+    // 6. The option's errors
+    let e1 = q(mut &s, "CREATE SKIPPING INDEX ix_bad1 ON docs (id) USING bloom_filter WITH (case_insensitive = true)")
+    let e2 = q(mut &s, "CREATE SKIPPING INDEX ix_bad2 ON docs (title) USING minmax WITH (case_insensitive = 1)")
+    let e3 = q(mut &s, "CREATE SKIPPING INDEX ix_bad3 ON docs (title) USING ngrambf WITH (case_insensitive = maybe)")
+    let e4 = q(mut &s, "CREATE SKIPPING INDEX ix_ok4 ON docs (title) USING ngrambf WITH (case_insensitive = off, n = 4)")
+    let e5 = q(mut &s, "DROP SKIPPING INDEX ix_ok4")
+    let errOk = strings.startsWith(&e1, "ERR:22023:") && strings.startsWith(&e2, "ERR:22023:") &&
+                strings.startsWith(&e3, "ERR:42601:") && e4 == "CREATE INDEX" && e5 == "DROP INDEX"
+    println("ci_option_errors: " + (if errOk { "ok" } else { "FAIL:" + e1 + "|" + e2 + "|" + e3 + "|" + e4 + "|" + e5 }))
+
+    // Persist the summaries for the cold start
+    st.checkpoint().unwrap()
+    must(mut &s, "ANALYZE docs")
+    st.checkpoint().unwrap()
+    return 0
+}
+
+fn runPhase2(st: lexdb_store.Store): int {
+    var s = lexdb_exec.newSession(st.share())
+    // The first scans after a restart: the persisted summaries, pages not read
+    let r1 = cnt(mut &s, OR_MISS)
+    let r2 = cnt(mut &s, OR_HIT)
+    let r3 = cnt(mut &s, ILIKE_HIT)
+    let coldOk = r1.n == 0 && r1.skipped > 0 && r2.n == 4 && r2.skipped > 0 && r3.n == 3 && r3.skipped > 0
+    println("reopen_cold: " + (if coldOk { "ok" } else { "FAIL:" + show(r1) + ":" + show(r2) + ":" + show(r3) }))
+    must(mut &s, "DROP TABLE docs")
+    return 0
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(231)
+    lexdb_store.run(fs.share(), opts(), fn(st: lexdb_store.Store): int { return runPhase1(st) }).unwrap()
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int { return runPhase2(st) }).unwrap()
+}

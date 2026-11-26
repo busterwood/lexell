@@ -13136,3 +13136,28 @@ foreign keys on the table, `SET TRANSACTION READ ONLY` and `READ WRITE` take eff
 The core's share: `Store.ro` (a replica's store, or a PostgreSQL session whose default is read-only) in `execStmt`, with `Txn.inBlock` telling a block from a statement alone;
 `Session.roDefault` and `SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY | READ WRITE`, `SET default_transaction_read_only`; the package overloads (Oracle) in `lexdb_plsql` and
 `lexdb_plcall`; T-SQL texts and DOMAINS (`exec_bugs8`, `tns_bugs8`, `tds_bugs8`).
+
+## As built: skipping indexes for ILIKE and for OR (2026-11-26)
+
+Two gaps in `lexdb_skip`'s pruning, found reviewing whether skipping indexes cover simple text search:
+
+- **ILIKE.** `cSkipOf` (`lexdb_pipe`) took a LIKE only when it was simple and not folded, so PostgreSQL's `ILIKE` never
+  reached an index. Now an ILIKE of literal text and `%` gives its pieces folded (`strings.toLowerAscii`, as
+  `lexdb_lib.likeMatch` folds the pattern) with `SkipQuery.likeFold`. Against an index of the text as written:
+  `ngrambf` probes each gram in each spelling (`bloomHasNgramsFold`: the gram's word with 0x20 cleared in a subset of
+  its letters' bytes, at most 2^6 probes; a gram of more letters is taken as present); `tokenbf` checks only tokens
+  without letters (`bloomHasTokens`'s `noLetters`); `set` matches its values folded (`lexdb_like.likePiecesFold`, no
+  copy). `WITH (case_insensitive = true)` on `ngrambf` / `tokenbf` sets `SkipMeta.ci` (already persisted, until now set
+  only for COLL_CI columns), so the summaries are folded and ILIKE is checked directly; LIKE still prunes on such an
+  index, its pieces folded the same way. Other methods refuse the option (22023). ILIKE folds ASCII only, and so do
+  both paths: a byte outside ASCII has no other spelling.
+- **OR.** An OR prunes only as an IN list (equalities on one column) before. Now any other OR becomes a group in
+  `SkipQuery.alts`: each alternative (the OR flattened) its own `SkipQuery` built by the same `cRangesOf` / `cSkipOf`,
+  and no group when one alternative has nothing to check. `nodeExcludes` skips a node when every alternative of a group
+  is excluded on it (`altsExclude`), and the cold path checks the persisted summaries the same way (`idxsExclude`, all of
+  a page's summaries together, since alternatives may use different indexes). `hasAutoFilters` is unchanged: a table
+  with no skipping index takes `scanLeaves` as before.
+
+Tested by `exec_skip_like` (counts against the answer with no index; skipped-node counters; a cold restart) and the
+OR and option cases added to `tds_skip_index` and `tns_skip_index`. Not done: patterns with `_` or an escape are still
+not pruned (`likeSimple`), and `NOT LIKE` is not.

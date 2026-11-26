@@ -65,7 +65,7 @@ DROP [ SKIPPING ] INDEX [ IF EXISTS ] name
 ## Differences from PostgreSQL
 
 - Supported index methods are `btree` and the data skipping methods (`minmax`, `brin`, `set`, `bloom_filter`, `ngrambf`, `tokenbf`); `USING hash`, `gin`, `gist` and `spgist` are refused (0A000).
-- `INCLUDE (...)`, `TABLESPACE` and `NULLS NOT DISTINCT` are not supported. `WITH ( option = value )` is supported for data skipping index parameters (`max_rows`, `n`, `size`, `hashes`).
+- `INCLUDE (...)`, `TABLESPACE` and `NULLS NOT DISTINCT` are not supported. `WITH ( option = value )` is supported for data skipping index parameters (`max_rows`, `n`, `size`, `hashes`, and `case_insensitive` for `ngrambf` / `tokenbf`).
 - `CONCURRENTLY` does not change how the index is built.
 - `pg_indexes.indexdef` shows an index on `(n + 1)` as `(((n + 1)))`; PostgreSQL shows `((n + 1))`.
 
@@ -203,7 +203,7 @@ ROLLBACK
 
 ### F. Data skipping indexes
 
-Data skipping indexes prune B+tree subtrees for equality, `IN`, range, and substring `LIKE` predicates without secondary B+tree write amplification. Supported methods are `minmax` (alias `brin`), `set(max_rows)` (default `32`), `bloom_filter(bits_per_key, size_bytes, hashes)` (default `10, 2048, 3`), `ngrambf(n, size_bytes, hashes)` (default `3, 2048, 3`), and `tokenbf(size_bytes, hashes)` (default `2048, 3`); parameters can also be passed via `WITH (max_rows = ..., bits_per_key = ..., n = ..., size = ..., hashes = ...)`. See [Data skipping indexes](../../skipping-indexes.md) for the full parameter, predicate, and persistence reference.
+Data skipping indexes prune B+tree subtrees for equality, `IN`, range, and substring `LIKE` / `ILIKE` predicates (also inside `OR`, when every branch has one) without secondary B+tree write amplification. Supported methods are `minmax` (alias `brin`), `set(max_rows)` (default `32`), `bloom_filter(bits_per_key, size_bytes, hashes)` (default `10, 2048, 3`), `ngrambf(n, size_bytes, hashes)` (default `3, 2048, 3`), and `tokenbf(size_bytes, hashes)` (default `2048, 3`); parameters can also be passed via `WITH (max_rows = ..., bits_per_key = ..., n = ..., size = ..., hashes = ...)`, and `ngrambf` / `tokenbf` take `WITH (case_insensitive = true)` to store ASCII-folded summaries for `ILIKE`. See [Data skipping indexes](../../skipping-indexes.md) for the full parameter, predicate, and persistence reference.
 
 <!-- example: postgresql -->
 ```sql

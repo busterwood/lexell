@@ -285,7 +285,7 @@ ORA-01418: specified index does not exist
 
 ### I. Data skipping indexes
 
-lexdb also supports hierarchical B+tree data skipping indexes (`minmax`/`brin`, `set(max_rows)`, `bloom_filter(bits_per_key, size_bytes, hashes)`, `ngrambf(n, size_bytes, hashes)`, `tokenbf(size_bytes, hashes)`, plus `WITH (...)` options) to prune subtrees on analytical equality, `IN`, range, and substring `LIKE` filters with zero OLTP write-path maintenance. See [Data skipping indexes](../../skipping-indexes.md) for the full method and parameter reference.
+lexdb also supports hierarchical B+tree data skipping indexes (`minmax`/`brin`, `set(max_rows)`, `bloom_filter(bits_per_key, size_bytes, hashes)`, `ngrambf(n, size_bytes, hashes)`, `tokenbf(size_bytes, hashes)`, plus `WITH (...)` options) to prune subtrees on analytical equality, `IN`, range, and substring `LIKE` filters (also inside `OR`, when every branch has one) with zero OLTP write-path maintenance. `ngrambf` and `tokenbf` accept `WITH (case_insensitive = true)` to store ASCII-folded summaries. See [Data skipping indexes](../../skipping-indexes.md) for the full method and parameter reference.
 
 <!-- example: oracle -->
 ```sql
