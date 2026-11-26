@@ -1,0 +1,242 @@
+// Hash-join runtime filters (MinMax + small-set IN + L1-hot Bloom + text bounds/sets)
+// wired into hierarchical data skipping (lexdb_skip), BPlan.ranges, and LeafK (lexdb_leafk):
+// - Automatic zero-config hierarchical zone-map subtree/leaf skipping on clustered join keys
+// - Empty build-side short-circuit skipping 100% of T_CLEAF probe leaves
+// - Multi-way star-schema join pushing runtime filters from jls[1] AND jls[2] onto fact table
+// - Explicit bloom_filter and set skipping indexes pruned by small-set IN (<= 64) and IntBloom (> 64)
+// - Composite JK_INT2 / JK_INT2_64 dual-column runtime range skipping
+// - JK_TEXT small-set and range skipping via minmax/set/bloom skipping indexes & C_DICT LeafK
+// - Live DML invalidation, MVCC REPEATABLE READ snapshot isolation, and exact WHERE error semantics
+// - Exact result parity vs SET lexdb_batch = off across all cases
+// expect: auto_range: ok
+// expect: empty_build: ok
+// expect: multi_way: ok
+// expect: explicit_bloom_set: ok
+// expect: medium_bloom_set: ok
+// expect: composite_int2: ok
+// expect: text_join: ok
+// expect: dml_mvcc: ok
+// expect: error_exact: ok
+// expect: cross_door: ok
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_skip"
+import "../../../cmd/lexdb_pipe"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return "ERR:" + e.state + ":" + e.msg }
+    }
+}
+
+fn qInt(s: mut &lexdb_exec.Session, sql: &str): int {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows && len(r.rows) > 0 && len(r.rows[0]) > 0 {
+                match r.rows[0][0] {
+                    lexdb_sql.Val.Int(i) { return i }
+                    else { return -999999 }
+                }
+            }
+            return -999999
+        }
+        Err(_) { return -999999 }
+    }
+}
+
+fn must(s: mut &lexdb_exec.Session, sql: &str) {
+    let r = q(s, sql)
+    if strings.startsWith(&r, "ERR:") { panic("SQL failed: " + sql + " -> " + r) }
+}
+
+fn parity(s: mut &lexdb_exec.Session, sql: &str): bool {
+    let _1 = q(s, &"SET lexdb_batch = off")
+    let off = q(s, sql)
+    let _2 = q(s, &"SET lexdb_batch = on")
+    let on = q(s, sql)
+    if off == on { return true }
+    println("PARITY FAIL: " + sql + " off=" + off + " on=" + on)
+    return false
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 1024 * 1024, ckptBytes: 512 * 1024, snapNodes: 50000}
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(71), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+
+        // Fact table (12,000 rows, multi-level B+tree) + dimension tables
+        must(mut &s, "CREATE TABLE fact (id BIGINT PRIMARY KEY, ord_id BIGINT, part_id BIGINT, user_id BIGINT, grp BIGINT, code TEXT, amt BIGINT)")
+        must(mut &s, "CREATE TABLE dim_ord (id BIGINT PRIMARY KEY, ord_k BIGINT, bucket BIGINT, tag TEXT)")
+        must(mut &s, "CREATE TABLE dim_part (id BIGINT PRIMARY KEY, part_k BIGINT, color TEXT)")
+        must(mut &s, "CREATE TABLE dim_user (id BIGINT PRIMARY KEY, tier BIGINT)")
+        must(mut &s, "CREATE TABLE dim_grp (id BIGINT PRIMARY KEY, grp BIGINT, active BIGINT)")
+        must(mut &s, "CREATE TABLE dim_code (id BIGINT PRIMARY KEY, code TEXT, label TEXT)")
+        must(mut &s, "CREATE TABLE dim_pair (a BIGINT, b BIGINT, PRIMARY KEY (a, b))")
+
+        // ord_id follows id (clustered); part_id scattered across 1..2000; user_id scattered high-card;
+        // grp has 120 distinct values clustered in blocks of 100 rows; code follows id ('c_000001'..'c_012000').
+        must(mut &s, "INSERT INTO fact SELECT g, g, ((g * 37) % 2000) + 1, ((g * 2654435761) % 500000000) + 1000, (g - 1) / 100 + 1, 'c_' || LPAD(CAST(g AS TEXT), 6, '0'), g % 100 FROM generate_series(1, 12000) AS g")
+        must(mut &s, "INSERT INTO dim_ord SELECT g, g, g / 1000, 't' || (g % 5) FROM generate_series(1, 12000) AS g")
+        must(mut &s, "INSERT INTO dim_part SELECT g, g, CASE WHEN g % 20 = 0 THEN 'rare_green' ELSE 'blue' END FROM generate_series(1, 2000) AS g")
+        must(mut &s, "INSERT INTO dim_user SELECT ((g * 2654435761) % 500000000) + 1000, CASE WHEN g <= 10 THEN 99 ELSE 1 END FROM generate_series(1, 2000) AS g")
+        must(mut &s, "INSERT INTO dim_grp SELECT g, g, CASE WHEN g % 3 = 0 THEN 1 ELSE 0 END FROM generate_series(1, 120) AS g")
+        // Add 200 scattered dummy rows to dim_grp so active=1 has 40 live keys; add another table with 80 active keys (> 64 -> IntBloom!)
+        must(mut &s, "CREATE TABLE dim_grp2 (id BIGINT PRIMARY KEY, active BIGINT)")
+        must(mut &s, "INSERT INTO dim_grp2 SELECT g, CASE WHEN g <= 10 OR g >= 1000 THEN 1 ELSE 0 END FROM generate_series(1, 1080) AS g")
+        must(mut &s, "INSERT INTO dim_code SELECT g, 'c_' || LPAD(CAST(g AS TEXT), 6, '0'), CASE WHEN g BETWEEN 11900 AND 11910 THEN 'hot' ELSE 'cold' END FROM generate_series(1, 12000) AS g")
+        must(mut &s, "INSERT INTO dim_pair SELECT g, ((g * 37) % 2000) + 1 FROM generate_series(11800, 12000) AS g")
+        must(mut &s, "ANALYZE")
+        st.checkpoint().unwrap()
+
+        // 1. Automatic zero-config hierarchical zone-map skipping on clustered ord_id
+        let sqlAuto = "SELECT COUNT(*), SUM(f.amt) FROM fact f JOIN dim_ord o ON o.ord_k = f.ord_id WHERE o.id BETWEEN 11800 AND 11899"
+        let pAuto = parity(mut &s, &sqlAuto)
+        let _w = q(mut &s, &sqlAuto)
+        lexdb_skip.resetCounters()
+        let rt0 = lexdb_pipe.rtFilterCounts()
+        let rAuto = q(mut &s, &sqlAuto)
+        let rt1 = lexdb_pipe.rtFilterCounts()
+        let skAuto = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+        let okAuto = pAuto && rAuto == "100|4950" && skAuto > 50 && rt1[0] > rt0[0]
+        println("auto_range: " + (if okAuto { "ok" } else { "FAIL:" + rAuto + ":sk=" + skAuto.toStr() }))
+
+        // 2. Empty build side skips 100% of probe leaves
+        let sqlEmpty = "SELECT COUNT(*) FROM fact f JOIN dim_ord o ON o.ord_k = f.ord_id WHERE o.tag = 'nonexistent'"
+        let pEmpty = parity(mut &s, &sqlEmpty)
+        lexdb_skip.resetCounters()
+        let rEmpty = qInt(mut &s, &sqlEmpty)
+        let exEmpty = q(mut &s, &("EXPLAIN ANALYZE " + sqlEmpty))
+        let skEmpty = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+        let okEmpty = pEmpty && rEmpty == 0 && skEmpty > 0 && strings.contains(&exEmpty, "rows read 0")
+        println("empty_build: " + (if okEmpty { "ok" } else { "FAIL:" + rEmpty.toStr() + ":sk=" + skEmpty.toStr() + ":" + exEmpty }))
+
+        // 3. Multi-way star-schema join: jls[1] (dim_ord) AND jls[2] (dim_part sparse IntBloom) push onto fact
+        let sqlMulti = "SELECT COUNT(*), SUM(f.amt) FROM fact f JOIN dim_ord o ON o.ord_k = f.ord_id JOIN dim_part p ON p.part_k = f.part_id WHERE o.id BETWEEN 10000 AND 12000 AND p.color = 'rare_green'"
+        let pMulti = parity(mut &s, &sqlMulti)
+        lexdb_skip.resetCounters()
+        let bf0 = lexdb_pipe.rtFilterCounts()[1]
+        let rMulti = q(mut &s, &sqlMulti)
+        let bf1 = lexdb_pipe.rtFilterCounts()[1]
+        let skMulti = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+        let okMulti = pMulti && skMulti > 20 && bf1 > bf0
+        println("multi_way: " + (if okMulti { "ok" } else { "FAIL:" + rMulti + ":sk=" + skMulti.toStr() + ":bf=" + (bf1 - bf0).toStr() }))
+
+        // 4. Explicit bloom_filter on scattered user_id + set index on grp pruned by small-set IN (<= 64)
+        must(mut &s, "CREATE SKIPPING INDEX ix_fact_uid_bf ON fact (user_id) USING bloom_filter")
+        must(mut &s, "CREATE SKIPPING INDEX ix_fact_grp_set ON fact (grp) USING set(16)")
+        let sqlBf = "SELECT COUNT(*) FROM fact f JOIN dim_user u ON u.id = f.user_id WHERE u.tier = 99"
+        let pBf = parity(mut &s, &sqlBf)
+        lexdb_skip.resetCounters()
+        let cBf = qInt(mut &s, &sqlBf)
+        let skBf = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+        let sqlSet = "SELECT COUNT(*) FROM fact f JOIN dim_grp g ON g.grp = f.grp WHERE g.id IN (5, 115)"
+        let pSet = parity(mut &s, &sqlSet)
+        lexdb_skip.resetCounters()
+        let cSet = qInt(mut &s, &sqlSet)
+        let skSet = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+        let okBfSet = pBf && cBf == 10 && skBf > 10 && pSet && cSet == 200 && skSet > 50
+        println("explicit_bloom_set: " + (if okBfSet { "ok" } else { "FAIL:bf=" + cBf.toStr() + "/" + skBf.toStr() + ":set=" + cSet.toStr() + "/" + skSet.toStr() }))
+
+        // 5. Medium-cardinality (> 64 keys -> IntBloom) pruning through explicit SET skipping index!
+        // dim_grp2 active=1 has 91 keys (1..10 and 1000..1080), spanning 1..1080 (sparse -> IntBloom!).
+        // In fact, grp is 1..120, so blocks with grp in 11..120 are inside [1, 1080] (range alone can't skip them!)
+        // yet IntBloom vs ix_fact_grp_set proves 0 intersection and skips them!
+        let sqlMed = "SELECT COUNT(*) FROM fact f JOIN dim_grp2 g ON g.id = f.grp WHERE g.active = 1"
+        let pMed = parity(mut &s, &sqlMed)
+        lexdb_skip.resetCounters()
+        let bf2 = lexdb_pipe.rtFilterCounts()[1]
+        let cMed = qInt(mut &s, &sqlMed)
+        let bf3 = lexdb_pipe.rtFilterCounts()[1]
+        let skMed = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+        let okMed = pMed && cMed == 1000 && skMed > 50 && bf3 > bf2
+        println("medium_bloom_set: " + (if okMed { "ok" } else { "FAIL:c=" + cMed.toStr() + ":sk=" + skMed.toStr() + ":bf=" + (bf3 - bf2).toStr() }))
+
+        // 6. Composite JK_INT2_64 dual-column runtime range skipping (fact.ord_id = dim_pair.a AND fact.part_id = dim_pair.b)
+        let sqlPair = "SELECT COUNT(*) FROM fact f JOIN dim_pair p ON p.a = f.ord_id AND p.b = f.part_id"
+        let pPair = parity(mut &s, &sqlPair)
+        lexdb_skip.resetCounters()
+        let cPair = qInt(mut &s, &sqlPair)
+        let skPair = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+        let okPair = pPair && cPair == 201 && skPair > 50
+        println("composite_int2: " + (if okPair { "ok" } else { "FAIL:c=" + cPair.toStr() + ":sk=" + skPair.toStr() }))
+
+        // 7. JK_TEXT runtime filter via explicit minmax skipping index (small set <= 64 AND range > 64)
+        must(mut &s, "CREATE SKIPPING INDEX ix_fact_code_mm ON fact (code) USING minmax")
+        let sqlTxtSmall = "SELECT COUNT(*) FROM fact f JOIN dim_code c ON c.code = f.code WHERE c.label = 'hot'"
+        let pTxt1 = parity(mut &s, &sqlTxtSmall)
+        lexdb_skip.resetCounters()
+        let cTxt1 = qInt(mut &s, &sqlTxtSmall)
+        let skTxt1 = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+        let sqlTxtWide = "SELECT COUNT(*) FROM fact f JOIN dim_code c ON c.code = f.code WHERE c.code >= 'c_011800'"
+        let pTxt2 = parity(mut &s, &sqlTxtWide)
+        lexdb_skip.resetCounters()
+        let cTxt2 = qInt(mut &s, &sqlTxtWide)
+        let skTxt2 = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+        let okTxt = pTxt1 && cTxt1 == 11 && skTxt1 > 50 && pTxt2 && cTxt2 == 201 && skTxt2 > 50
+        println("text_join: " + (if okTxt { "ok" } else { "FAIL:s=" + cTxt1.toStr() + "/" + skTxt1.toStr() + ":w=" + cTxt2.toStr() + "/" + skTxt2.toStr() }))
+
+        // 8. Live DML invalidation & MVCC REPEATABLE READ snapshot isolation (0 false negatives!)
+        var s2 = lexdb_exec.newSession(st.share())
+        must(mut &s2, "BEGIN ISOLATION LEVEL REPEATABLE READ")
+        let snap0 = qInt(mut &s2, "SELECT COUNT(*) FROM fact f JOIN dim_ord o ON o.ord_k = f.ord_id WHERE o.id = 12001")
+        must(mut &s, "INSERT INTO dim_ord VALUES (12001, 12001, 12, 'new')")
+        must(mut &s, "INSERT INTO fact VALUES (12001, 12001, 40, 777777, 5, 'c_012001', 42)")
+        let live1 = qInt(mut &s, "SELECT COUNT(*) FROM fact f JOIN dim_ord o ON o.ord_k = f.ord_id WHERE o.id = 12001")
+        let snap1 = qInt(mut &s2, "SELECT COUNT(*) FROM fact f JOIN dim_ord o ON o.ord_k = f.ord_id WHERE o.id = 12001")
+        must(mut &s2, "COMMIT")
+        let afterCommit = qInt(mut &s2, "SELECT COUNT(*) FROM fact f JOIN dim_ord o ON o.ord_k = f.ord_id WHERE o.id = 12001")
+        must(mut &s, "BEGIN")
+        must(mut &s, "INSERT INTO dim_ord VALUES (12002, 12002, 12, 'rb')")
+        must(mut &s, "INSERT INTO fact VALUES (12002, 12002, 40, 888888, 5, 'c_012002', 99)")
+        let inTx = qInt(mut &s, "SELECT COUNT(*) FROM fact f JOIN dim_ord o ON o.ord_k = f.ord_id WHERE o.id = 12002")
+        must(mut &s, "ROLLBACK")
+        let afterRb = qInt(mut &s, "SELECT COUNT(*) FROM fact f JOIN dim_ord o ON o.ord_k = f.ord_id WHERE o.id = 12002")
+        let okMvcc = snap0 == 0 && live1 == 1 && snap1 == 0 && afterCommit == 1 && inTx == 1 && afterRb == 0
+        println("dml_mvcc: " + (if okMvcc { "ok" } else { "FAIL:" + snap0.toStr() + "," + live1.toStr() + "," + snap1.toStr() + "," + afterCommit.toStr() + "," + inTx.toStr() + "," + afterRb.toStr() }))
+
+        // 9. Error exactness: a WHERE predicate that can error (div by zero) must NOT be skipped past!
+        let errSql = "SELECT COUNT(*) FROM fact f JOIN dim_ord o ON o.ord_k = f.ord_id WHERE o.tag = 'nonexistent' AND 100 / (f.id - 5000) > 0"
+        let errOn = q(mut &s, &errSql)
+        let _off = q(mut &s, &"SET lexdb_batch = off")
+        let errOff = q(mut &s, &errSql)
+        let _on = q(mut &s, &"SET lexdb_batch = on")
+        let okErr = strings.startsWith(&errOn, "ERR:22012:") && errOn == errOff
+        println("error_exact: " + (if okErr { "ok" } else { "FAIL:on=" + errOn + ":off=" + errOff }))
+
+        // 10. Cross-door verification (T-SQL and Oracle dialects share the same runtime filters)
+        must(mut &s, "SET lexdb_dialect = tsql")
+        lexdb_skip.resetCounters()
+        let cTsql = qInt(mut &s, "SELECT COUNT(*) FROM fact f INNER JOIN dim_ord o ON o.ord_k = f.ord_id WHERE o.id BETWEEN 11800 AND 11899")
+        let skTsql = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+        must(mut &s, "SET lexdb_dialect = oracle")
+        lexdb_skip.resetCounters()
+        let cOra = qInt(mut &s, "SELECT COUNT(*) FROM fact f INNER JOIN dim_ord o ON o.ord_k = f.ord_id WHERE o.id BETWEEN 11800 AND 11899")
+        let skOra = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+        let okDoor = cTsql == 100 && skTsql > 50 && cOra == 100 && skOra > 50
+        println("cross_door: " + (if okDoor { "ok" } else { "FAIL:tsql=" + cTsql.toStr() + "/" + skTsql.toStr() + ":ora=" + cOra.toStr() + "/" + skOra.toStr() }))
+        return 0
+    }).unwrap()
+}

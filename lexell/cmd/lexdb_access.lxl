@@ -545,20 +545,23 @@ pub type Cursor = record {
     chunk: Option[rc []str]; tail: bool
     skipReady: bool; skipHasMetas: bool; skipEpoch: int
     skipBarOn: bool; skipBarVal: int
+    skipVisited: int; skipBypass: bool
     skipSc: lexdb_store.SkipScanScratch
 }
 
 pub fn newCursor(): Cursor {
     return Cursor{at: "", started: false, done: false, want: 0, pos: 0, sorted: false, chunk: None, tail: false,
                   skipReady: false, skipHasMetas: false, skipEpoch: 0,
-                  skipBarOn: false, skipBarVal: 0, skipSc: lexdb_store.newSkipScanScratch()}
+                  skipBarOn: false, skipBarVal: 0, skipVisited: 0, skipBypass: false,
+                  skipSc: lexdb_store.newSkipScanScratch()}
 }
 
 pub fn (c: &Cursor) copy(): Cursor {
     return Cursor{at: c.at.clone(), started: c.started, done: c.done, want: c.want, pos: c.pos, sorted: c.sorted,
                   chunk: c.chunk.clone(), tail: c.tail,
                   skipReady: c.skipReady, skipHasMetas: c.skipHasMetas, skipEpoch: c.skipEpoch,
-                  skipBarOn: false, skipBarVal: 0, skipSc: lexdb_store.newSkipScanScratch()}
+                  skipBarOn: false, skipBarVal: 0, skipVisited: 0, skipBypass: false,
+                  skipSc: lexdb_store.newSkipScanScratch()}
 }
 
 // The first batch size of a backward or point read, and the next one.
@@ -1054,7 +1057,7 @@ fn scanLeavesWithSkip(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel
                       cur: mut &Cursor,
                       f: &fn(&lexdb_rows.LeafView, int, int): bool): Result[Unit, DbErr] {
     let bOn = bar.on && !bar.nul && barPl >= 0
-    if (!sq.active && !bOn) || (!cur.skipHasMetas && !bOn && !sq.hasAutoFilters()) {
+    if (!sq.active && !bOn) || (!cur.skipHasMetas && !bOn && (!sq.hasAutoFilters() || cur.skipBypass)) {
         return st.scanLeaves(txn, t.tree, from, to, f)
     }
     if bOn != cur.skipBarOn || (bOn && bar.v != cur.skipBarVal) {
@@ -1067,17 +1070,27 @@ fn scanLeavesWithSkip(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel
     let bVal = bar.v
     let bDesc = bar.desc
     let bNf = bar.nf
-    let chk = fn(slot: int, gen: int, subVer: int, disk: int, isSnap: bool, snapSeq: int, isLeaf: bool): bool {
-        return lexdb_skip.checkNodeSkipBar(sid, tree, slot, gen, subVer, disk, isSnap, snapSeq, isLeaf, sq, bOn, barPl, bVal, bDesc, bNf)
+    var pruned = false
+    try st.scanLeavesSkip(txn, tree, from, to, cur.skipHasMetas, cur.skipEpoch, mut &cur.skipSc,
+        fn(slot: int, gen: int, subVer: int, disk: int, isSnap: bool, snapSeq: int, isLeaf: bool): bool {
+            let sk = lexdb_skip.checkNodeSkipBar(sid, tree, slot, gen, subVer, disk, isSnap, snapSeq, isLeaf, sq, bOn, barPl, bVal, bDesc, bNf)
+            if sk { pruned = true }
+            return sk
+        },
+        fn(slot: int, gen: int, subVer: int, seq: int, disk: int, lv: &lexdb_rows.LeafView) {
+            lexdb_skip.recordLeaf(sid, tree, slot, gen, subVer, seq, lv, rw)
+        },
+        fn(slot: int, gen: int, subVer: int, seq: int, disk: int,
+           kidSlots: &[]int, kidGens: &[]int, kidSubVers: &[]int) {
+            lexdb_skip.recordInner(sid, tree, slot, gen, subVer, seq, kidSlots, kidGens, kidSubVers)
+        }, f)
+    if pruned {
+        cur.skipVisited = -1
+    } else if sq.rtOnly && !cur.skipHasMetas && !bOn && cur.skipVisited >= 0 {
+        cur.skipVisited += 1
+        if cur.skipVisited >= 8 { cur.skipBypass = true }
     }
-    let onL = fn(slot: int, gen: int, subVer: int, seq: int, disk: int, lv: &lexdb_rows.LeafView) {
-        lexdb_skip.recordLeaf(sid, tree, slot, gen, subVer, seq, lv, rw)
-    }
-    let onI = fn(slot: int, gen: int, subVer: int, seq: int, disk: int,
-                 kidSlots: &[]int, kidGens: &[]int, kidSubVers: &[]int) {
-        lexdb_skip.recordInner(sid, tree, slot, gen, subVer, seq, kidSlots, kidGens, kidSubVers)
-    }
-    return st.scanLeavesSkip(txn, tree, from, to, cur.skipHasMetas, cur.skipEpoch, mut &cur.skipSc, chk, onL, onI, f)
+    return Ok(Unit{})
 }
 
 fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Scan, part: bool, cur: mut &Cursor,
@@ -1815,6 +1828,7 @@ pub type Lazy = record {
     // for the rows kept. A leaf whose places the kernels do not read is
     // read as first, skip and rest say.
     pub kern: []lexdb_leafk.LeafK
+    pub rtKern: []lexdb_leafk.LeafK   // runtime hash-join pre-decode leaf kernels (0 false negatives)
     pub firstK: []int
     pub restK: []int
     pub skipK: []bool
@@ -1828,6 +1842,8 @@ pub type Picked = record {
     pub b: Batch
     pub idx: []int
     pub kept: int
+    pub rtPreDrop: int                // rows dropped by lz.rtKern before narrow
+    pub rtPostDrop: int               // rows dropped by lz.rtKern after narrow
 }
 
 // Whether stored row s is a tagged one (decodeRow handles plain tagged and format-6 inline):
@@ -1920,9 +1936,9 @@ fn barAfter(bar: &Bar, x: int, nul: bool): bool {
 // decoded; 0, -1 as bRunInto; -2 a condition's error on one of them.
 fn bRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Rel, lz: &Lazy,
             narrow: &fn(&[]bool, &Batch, []int): Option[[]int],
-            bar: &Bar, idx: mut &[]int, kept: mut &int,
+            bar: &Bar, idx: mut &[]int, kept: mut &int, rtPre: mut &int, rtPost: mut &int,
             bigR: mut &[]int, bigK: mut &[]str, bigV: mut &[]str): Result[int, DbErr] {
-    if leaf.isCols { return cRunLazy(leaf, from, to, b, bp, t, lz, narrow, bar, idx, kept, bigR, bigK, bigV) }
+    if leaf.isCols { return cRunLazy(leaf, from, to, b, bp, t, lz, narrow, bar, idx, kept, rtPre, rtPost, bigR, bigK, bigV) }
     let rw = rowsFor(t)
     let rows = try lexdb_rows.fixedRunRows(leaf, from, to, &rw)
     if len(rows) == 0 { return Ok(0) }
@@ -1978,7 +1994,7 @@ fn bRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
 // entry. The rows decoded (to - from), -1 and -2 as bRunLazy.
 fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &BPlan, t: &Rel, lz: &Lazy,
             narrow: &fn(&[]bool, &Batch, []int): Option[[]int],
-            bar: &Bar, idx: mut &[]int, kept: mut &int,
+            bar: &Bar, idx: mut &[]int, kept: mut &int, rtPre: mut &int, rtPost: mut &int,
             bigR: mut &[]int, bigK: mut &[]str, bigV: mut &[]str): Result[int, DbErr] {
     let n = to - from
     let r0 = b.n
@@ -2078,18 +2094,49 @@ fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
         if got1.isNone() { return Ok(-2) }
         rs = got1.unwrap()
     }
+    // Check whether all table-local WHERE conditions are already evaluated above.
+    var allDone = true
+    let skArr = if kerned { &lz.skipK } else { &lz.skip }
+    for sk in skArr { if !sk { allDone = false; break } }
+    // When all local WHEREs are done, run runtime hash-join leaf kernels BEFORE decoding firstK/pushCol!
+    if len(lz.rtKern) > 0 && allDone && len(rs) > 0 {
+        let pre = len(rs)
+        for rk in lz.rtKern {
+            if len(rs) == 0 { break }
+            if lexdb_leafk.allPass(leaf, &rk) { continue }
+            match lexdb_leafk.rowsOf(leaf, from, &rs, r0, n, &rk) {
+                Some(x) { rs = x }
+                None {}
+            }
+        }
+        rtPre += pre - len(rs)
+    }
     // (after the kernels, half the run or more kept: all of it decoded, together)
     let firstPs = if kerned { &lz.firstK } else { &lz.first }
+    let didKern = kerned || (len(lz.rtKern) > 0 && allDone)
     if len(firstPs) > 0 && len(rs) > 0 {
-        let wide0 = kerned && 2 * len(rs) >= n
+        let wide0 = didKern && 2 * len(rs) >= n
         var qs0: []int = withCapacity(if wide0 { n } else { len(rs) })
         if wide0 { for q in 0..n { append(mut &qs0, q) } } else { for r in rs { append(mut &qs0, r - r0) } }
         if !(try lexdb_rows.colsInto(leaf, from, &qs0, len(qs0) == n, r0, firstPs, b, bp)) { return Ok(-1) }
     }
-    let got = narrow(if kerned { &lz.skipK } else { &lz.skip }, b, rs)
+    let got = narrow(skArr, b, rs)
     if got.isNone() { return Ok(-2) }
     var ch = got.unwrap()
     kept += len(ch)
+    // When non-kernel WHEREs ran inside narrow, run runtime hash-join kernels now BEFORE decoding restPs!
+    if len(lz.rtKern) > 0 && !allDone && len(ch) > 0 {
+        let pre = len(ch)
+        for rk in lz.rtKern {
+            if len(ch) == 0 { break }
+            if lexdb_leafk.allPass(leaf, &rk) { continue }
+            match lexdb_leafk.rowsOf(leaf, from, &ch, r0, n, &rk) {
+                Some(x) { ch = x }
+                None {}
+            }
+        }
+        rtPost += pre - len(ch)
+    }
     if bar.on && len(ch) > 0 {
         var ok: []int = withCapacity(len(ch))
         let kc = &b.cols[bar.col]
@@ -2098,7 +2145,7 @@ fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
     }
     let restPs = if kerned { &lz.restK } else { &lz.rest }
     if len(restPs) > 0 && len(ch) > 0 {
-        let wide = kerned && 2 * len(ch) >= n
+        let wide = (didKern || len(lz.rtKern) > 0) && 2 * len(ch) >= n
         var qs: []int = withCapacity(if wide { n } else { len(ch) })
         if wide { for q in 0..n { append(mut &qs, q) } } else { for r in ch { append(mut &qs, r - r0) } }
         if !(try lexdb_rows.colsInto(leaf, from, &qs, len(qs) == n, r0, restPs, b, bp)) { return Ok(-1) }
@@ -2140,13 +2187,13 @@ pub fn fillPoints(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ks
         cur.started = true
         cur.at = ks[to - 1].clone()
     }
-    if to == from { return Ok(Some(Picked{kept: 0, idx: [], b: lexdb_rows.newBatch(bp, 0)})) }
+    if to == from { return Ok(Some(Picked{kept: 0, idx: [], b: lexdb_rows.newBatch(bp, 0), rtPreDrop: 0, rtPostDrop: 0})) }
     let got = try fetchMany(st, txn, t, &pr, part, bp)
     match got {
         Some(f) {
             var idx: []int = withCapacity(len(f.at))
             for r in f.at { if r >= 0 { append(mut &idx, r) } }
-            return Ok(Some(Picked{kept: len(idx), idx: idx, b: f.rows}))
+            return Ok(Some(Picked{kept: len(idx), idx: idx, b: f.rows, rtPreDrop: 0, rtPostDrop: 0}))
         }
         None { return Ok(None) }
     }
@@ -2210,7 +2257,7 @@ pub fn fillRanges(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, ix
                 cur.started = true
                 cur.done = to >= len(scans)
                 cur.want = min(BROWS, n * 2)
-                return Ok(Some(Picked{kept: len(idx), idx: idx, b: rows}))
+                return Ok(Some(Picked{kept: len(idx), idx: idx, b: rows, rtPreDrop: 0, rtPostDrop: 0}))
             }
             None {
                 if !over || n == 1 { return Ok(None) }
@@ -2286,7 +2333,7 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
         let ch = narrow(&none, &b, all)
         if ch.isNone() { return Ok(None) }
         let idx = ch.unwrap()
-        return Ok(Some(Picked{kept: len(idx), idx: idx, b: b}))
+        return Ok(Some(Picked{kept: len(idx), idx: idx, b: b, rtPreDrop: 0, rtPostDrop: 0}))
     }
     // (an index's read, 9.107, whole: an index-only entry's columns come
     // from its key all at once; its rows, fetched by their keys, as fillLevel reads them)
@@ -2302,7 +2349,7 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
         let ch = narrow(&none, &b, all)
         if ch.isNone() { return Ok(None) }
         let idx = ch.unwrap()
-        return Ok(Some(Picked{kept: len(idx), idx: idx, b: b}))
+        return Ok(Some(Picked{kept: len(idx), idx: idx, b: b, rtPreDrop: 0, rtPostDrop: 0}))
     }
     var b = lexdb_rows.reuse(spare, bp)
     let rw = rowsFor(t)
@@ -2319,6 +2366,8 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
     var idx: []int = []
     var pend: []int = []                // rows decoded whole: chosen at the end
     var kept = 0
+    var rtPre = 0
+    var rtPost = 0
     while b.n < BROWS && !cur.done {
         let from = if cur.started { cur.at.clone() } else { sc.lo.clone() }
         cur.started = true
@@ -2347,7 +2396,7 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
                     stopKey = lexdb_rows.leafKey(leaf, k)
                     return false
                 }
-                match bRunLazy(leaf, k, min(j, k + BROWS - b.n), mut &b, bp, t, lz, narrow, bar, mut &idx, mut &kept, mut &bigR, mut &bigK, mut &bigV) {
+                match bRunLazy(leaf, k, min(j, k + BROWS - b.n), mut &b, bp, t, lz, narrow, bar, mut &idx, mut &kept, mut &rtPre, mut &rtPost, mut &bigR, mut &bigK, mut &bigV) {
                     Ok(got) {
                         if got == lexdb_rows.APART {
                             stop = 2
@@ -2501,7 +2550,7 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
         }
         idx = merged
     }
-    return Ok(Some(Picked{kept: kept, idx: idx, b: b}))
+    return Ok(Some(Picked{kept: kept, idx: idx, b: b, rtPreDrop: rtPre, rtPostDrop: rtPost}))
 }
 
 // The table's rows, counted until there are more than most.

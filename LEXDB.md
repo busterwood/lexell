@@ -179,8 +179,8 @@ Read the user guide: **[Materialized views and transparent query rewrite](lexell
 
 A regular B+tree index is great for exact key lookups, but indexing five or ten text and analytics columns on a wide table bloats storage and slows down writes. LexDB solves this in two layers:
 
-1. **Always-on automatic zone maps.** Every columnar table tracks min/max bounds hierarchically inside its B+tree automatically — pruning irrelevant blocks for range filters and dynamic `ORDER BY ... LIMIT` queries (`sort_lim` drops from 19 ms to **6 ms** with zero configuration).
-2. **Optional data skipping indexes.** Add lightweight per-block summaries (`minmax`/`brin`, `set`, `bloom_filter`, `ngrambf`, or `tokenbf`) on columns you filter on — including arbitrary substring searches like `WHERE URL LIKE '%google%'` that a standard B+tree cannot help with.
+1. **Always-on automatic zone maps & hash-join runtime filters.** Every columnar table tracks min/max bounds hierarchically inside its B+tree automatically — pruning irrelevant blocks for range filters, dynamic `ORDER BY ... LIMIT` queries (`sort_lim` drops from 19 ms to **6 ms**), and selective hash joins (pushing build-side MinMax bounds, small `IN` sets, and register-blocked L1 Bloom filters into probe scans for **1.24×–71.7×** faster star-schema joins — **7.7×** faster than 1-core PostgreSQL 18 and **4.5×** faster than 4-process PostgreSQL 18).
+2. **Optional data skipping indexes.** Add lightweight per-block summaries (`minmax`/`brin`, `set`, `bloom_filter`, `ngrambf`, or `tokenbf`) on columns you filter or join on — including arbitrary substring searches like `WHERE URL LIKE '%google%'` that a standard B+tree cannot help with.
 
 | ClickBench 1M query | Filter | Skipping index | Baseline | With skipping index | Speedup |
 |---|---|---|---:|---:|---:|

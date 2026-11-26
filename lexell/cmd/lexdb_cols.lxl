@@ -1481,6 +1481,164 @@ pub fn rangeFilter(s: &str, dir: &[]int, p: int, from: int, cnt: int, r0: int, l
     return out
 }
 
+// ---- Runtime integer Bloom filter (register-blocked 64-bit words, 3 bits per key)
+//
+// Built from a hash join's integer build keys and pushed into hierarchical
+// skipping indexes (lexdb_skip) and compressed-leaf kernels (lexdb_leafk).
+pub type IntBloom = record {
+    pub lo: int
+    pub hi: int
+    pub words: []u64
+    pub mask: int
+}
+
+fn rtBloomHash(k: int): u64 {
+    let h = k.hash()
+    let z = h ^ (h >> 30)
+    return z ^ (z << 13) ^ (z >> 17)
+}
+
+fn rtBloomMask(h: u64): u64 {
+    let b0 = int(h & u64(63))
+    let b1 = int((h >> 6) & u64(63))
+    let b2 = int((h >> 12) & u64(63))
+    return (u64(1) << b0) | (u64(1) << b1) | (u64(1) << b2)
+}
+
+pub fn newIntBloom(nKeys: int, lo: int, hi: int): IntBloom {
+    var nw = 4
+    let wantBits = nKeys * 12
+    while nw * 64 < wantBits && nw < 8192 { nw = nw * 2 }
+    return IntBloom{lo: lo, hi: hi, words: array(nw, u64(0)), mask: nw - 1}
+}
+
+pub fn cloneIntBloom(b: &IntBloom): IntBloom {
+    var ws: []u64 = withCapacity(len(b.words))
+    for w in b.words { append(mut &ws, w) }
+    return IntBloom{lo: b.lo, hi: b.hi, words: ws, mask: b.mask}
+}
+
+pub fn (b: mut &IntBloom) add(k: int) {
+    let h = rtBloomHash(k)
+    let wi = int((h >> 18) & u64(b.mask))
+    b.words[wi] = b.words[wi] | rtBloomMask(h)
+}
+
+pub fn (b: &IntBloom) has(k: int): bool {
+    if k < b.lo || k > b.hi { return false }
+    let h = rtBloomHash(k)
+    let wi = int((h >> 18) & u64(b.mask))
+    let m = rtBloomMask(h)
+    return (b.words[wi] & m) == m
+}
+
+// Fused full-run Bloom + range filter on a non-NULL integer place: returns row
+// indices r0 + q (q in 0..cnt) whose value is in [bf.lo, bf.hi] and passes bf.
+pub fn bloomFilter(s: &str, dir: &[]int, p: int, from: int, cnt: int, r0: int, bf: &IntBloom): []int {
+    var out: []int = withCapacity(cnt)
+    if cnt <= 0 { return out }
+    let lo = bf.lo
+    let hi = bf.hi
+    let words = &bf.words
+    let bmask = u64(bf.mask)
+    let x = DIR_HDR + D * p
+    let c = dir[x + F_CODEC]
+    if c == C_FOR || c == C_UNITS {
+        let w = dir[x + F_W]
+        let base = dir[x + F_BASE]
+        if w == 0 {
+            if bf.has(base) {
+                for q in 0..cnt { append(mut &out, r0 + q) }
+            }
+            return out
+        }
+        let data = dir[x + F_DATA]
+        if w == 8 {
+            var o = data + from
+            for q in 0..cnt {
+                let v = base +% int(s[o])
+                if v >= lo && v <= hi {
+                    let h = rtBloomHash(v)
+                    let m = rtBloomMask(h)
+                    if (words[int((h >> 18) & bmask)] & m) == m { append(mut &out, r0 + q) }
+                }
+                o += 1
+            }
+            return out
+        }
+        if w == 16 {
+            var o = data + 2 * from
+            for q in 0..cnt {
+                let v = base +% u16At(s, o)
+                if v >= lo && v <= hi {
+                    let h = rtBloomHash(v)
+                    let m = rtBloomMask(h)
+                    if (words[int((h >> 18) & bmask)] & m) == m { append(mut &out, r0 + q) }
+                }
+                o += 2
+            }
+            return out
+        }
+        let mask = (1 << w) - 1
+        let bp = from * w
+        var pos = data + (bp >> 3)
+        let sk = bp & 7
+        var acc = int(s[pos]) >> sk
+        var have = 8 - sk
+        pos += 1
+        for q in 0..cnt {
+            while have < w {
+                acc = acc | (int(s[pos]) << have)
+                pos += 1
+                have += 8
+            }
+            let v = base +% (acc & mask)
+            if v >= lo && v <= hi {
+                let h = rtBloomHash(v)
+                let m = rtBloomMask(h)
+                if (words[int((h >> 18) & bmask)] & m) == m { append(mut &out, r0 + q) }
+            }
+            acc = acc >> w
+            have -= w
+        }
+        return out
+    }
+    let wb = dir[x + F_W]
+    var o = dir[x + F_DATA] + wb * from
+    if wb == 8 {
+        for q in 0..cnt {
+            let v = binary.readI64LEStr(s, o)
+            if v >= lo && v <= hi {
+                let h = rtBloomHash(v)
+                let m = rtBloomMask(h)
+                if (words[int((h >> 18) & bmask)] & m) == m { append(mut &out, r0 + q) }
+            }
+            o += 8
+        }
+    } else if wb == 4 {
+        for q in 0..cnt {
+            let v = binary.readI32LEStr(s, o)
+            if v >= lo && v <= hi {
+                let h = rtBloomHash(v)
+                let m = rtBloomMask(h)
+                if (words[int((h >> 18) & bmask)] & m) == m { append(mut &out, r0 + q) }
+            }
+            o += 4
+        }
+    } else {
+        for q in 0..cnt {
+            let v = binary.readI16LEStr(s, o)
+            if v >= lo && v <= hi {
+                let h = rtBloomHash(v)
+                let m = rtBloomMask(h)
+                if (words[int((h >> 18) & bmask)] & m) == m { append(mut &out, r0 + q) }
+            }
+            o += 2
+        }
+    }
+    return out
+}
+
 // Row i of an integer place (or a units place's units).
 pub fn intAt(s: &str, dir: &[]int, p: int, i: int): int {
     let x = DIR_HDR + D * p

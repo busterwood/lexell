@@ -274,6 +274,24 @@ If one branch has no condition an index can check (for example `OR length(title)
 anything; other `AND`ed conditions in the same `WHERE` still can. An `OR` of `=` on one column is checked as an `IN`
 list, as before.
 
+## Hash-join runtime filters
+
+Data skipping does not stop at literal `WHERE` predicates. When lexdb executes a hash join (including multi-way star
+joins and semi-joins across all three doors), it summarizes the live build-side keys and pushes **runtime filters**
+directly into the probe table's scan:
+
+- **Min/Max bounds (always on, zero configuration):** Integer, date/time, composite-key, and text `[min, max]` bounds
+  prune non-matching B+tree subtrees and `T_CLEAF` blocks through automatic zone maps and `minmax` skipping indexes. An
+  empty build side (`0` matching rows) prunes 100% of probe leaves immediately.
+- **Exact small sets (`<= 64` live keys):** Pushed as `=` / `IN (...)` predicates into `bloom_filter`, `set`, and
+  `minmax` skipping indexes as well as columnar leaf kernels.
+- **L1-hot register-blocked Bloom filters (`<= 32,768` sparse integer keys):** A compact 64-bit register-blocked Bloom
+  filter (12 bits/key, capped at 64 KiB) prunes both `set` skipping index blocks (exact block-set intersection against
+  the Bloom filter) and individual compressed columnar runs before non-key columns are decoded.
+- **Zero overhead on unfiltered full-table joins:** When a probe table has no explicit skipping indexes and a runtime
+  filter skips nothing across the first several batches, the scan automatically bypasses `SkipStore` lookups and runs
+  lock-free.
+
 ## Measured impact
 
 On the ClickBench 1M benchmark ([LexDB performance report](performance.md#clickbench-1m-rows)), adding three skipping
@@ -289,6 +307,12 @@ accelerates selective point and substring-`LIKE` queries with exact output parit
 
 On the same table with all three skipping indexes present, 1,000 OLTP inserts ran in 303.9 ms vs 304.6 ms without them,
 and 1,000 primary-key lookups ran in 44.4 ms vs 45.1 ms.
+
+On a 1,000,000-row star-schema join benchmark ([full comparison against PostgreSQL 18](performance.md#selective-star-schema-joins-hash-join-runtime-filters-1m-fact-rows)),
+hash-join runtime filters speed up selective joins by **1.24×–71.7×** (`4.87×` geometric mean) with zero configuration
+on clustered numeric keys (`3.11×` via automatic zone maps, `13.7×` on empty builds) and up to **71.7×** when combined
+with explicit `minmax`, `set`, and `bloom_filter` skipping indexes (**7.68×** faster than 1-core PostgreSQL 18 and
+**4.46×** faster than 4-process PostgreSQL 18).
 
 ## Syntax across doors
 

@@ -1520,7 +1520,7 @@ pub fn lazyOf(bp: &BPlan, t: &lexdb_catalog.Table, conds: &[]BNode, extra: int):
     }
     let skipQ = cSkipQuery(conds, &bp.kinds, t)
     return Lazy{on: ((len(first) > 0 || len(raw) > 0) && len(rest) > 0) || len(kern) > 0, first: first, rest: rest, raw: raw, rawPl: rawPl,
-                pieces: pieces, skip: skip, bf: bf, br: br, kern: lexdb_leafk.merged(kern), firstK: firstK, restK: restK, skipK: skipK, skipQ: skipQ}
+                pieces: pieces, skip: skip, bf: bf, br: br, kern: lexdb_leafk.merged(kern), rtKern: [], firstK: firstK, restK: restK, skipK: skipK, skipQ: skipQ}
 }
 
 // Whether evaluating n cannot raise a runtime error (safe to run a later
@@ -4031,7 +4031,7 @@ fn heldPick(hrows: &[][]Val, ser: &lexdb_held.Series, pos: mut &lexdb_held.HPos,
             for r in 0..b.n { append(mut &all, r) }
             let none: []bool = []
             match bNarrow(cn, &none, &b, all) {
-                Some(idx) { return Some(lexdb_access.Picked{kept: len(idx), idx: idx, b: b}) }
+                Some(idx) { return Some(lexdb_access.Picked{kept: len(idx), idx: idx, b: b, rtPreDrop: 0, rtPostDrop: 0}) }
                 None { return None }
             }
         }
@@ -4065,7 +4065,7 @@ fn pointsPick(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_acc
             let none: []bool = []
             let idx0 = replace(mut &pk.idx, [])
             match bNarrow(cn, &none, &pk.b, idx0) {
-                Some(idx) { return Ok(Some(lexdb_access.Picked{kept: len(idx), idx: idx, b: replace(mut &pk.b, lexdb_rows.noRows())})) }
+                Some(idx) { return Ok(Some(lexdb_access.Picked{kept: len(idx), idx: idx, b: replace(mut &pk.b, lexdb_rows.noRows()), rtPreDrop: 0, rtPostDrop: 0})) }
                 None { return Ok(None) }
             }
         }
@@ -4086,7 +4086,7 @@ fn rangesPick(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_acc
             let none: []bool = []
             let idx0 = replace(mut &pk.idx, [])
             match bNarrow(cn, &none, &pk.b, idx0) {
-                Some(idx) { return Ok(Some(lexdb_access.Picked{kept: len(idx), idx: idx, b: replace(mut &pk.b, lexdb_rows.noRows())})) }
+                Some(idx) { return Ok(Some(lexdb_access.Picked{kept: len(idx), idx: idx, b: replace(mut &pk.b, lexdb_rows.noRows()), rtPreDrop: 0, rtPostDrop: 0})) }
                 None { return Ok(None) }
             }
         }
@@ -6609,8 +6609,11 @@ var hashBuilds: int = 0
 var pushDrops: int = 0
 
 var joinRuns: int = 0
+var rtFilterPushes: int = 0
+var rtBloomsBuilt: int = 0
 
 pub fn joinCounts(): []int { return [joinRuns, joinChunks, hashBuilds, pushDrops] }
+pub fn rtFilterCounts(): []int { return [rtFilterPushes, rtBloomsBuilt] }
 
 // A level of a join's run: the first table (how -1) or a table joined.
 type JL = record {
@@ -6680,6 +6683,17 @@ type JL = record {
     neqOut: int             // inline residual "outer_col <> inner_col" (-1 none): query slot of outer BK_INT col
     neqIn: int              // ... and local column offset of inner BK_INT col in jl.rows
     antiNull: bool          // MK_ANTI lowered from "LEFT JOIN ... WHERE right.col IS NULL" (for exact EXPLAIN ANALYZE counters)
+    // Build-side runtime filter summaries (pushed into probe SkipQuery, BPlan.ranges, and LeafK)
+    nLive: int              // count of live distinct keys in this hash table
+    hasRange0: bool         // key[0] integer bounds (JK_INT / JK_INT2 / JK_INT2_64)
+    minK0: int
+    maxK0: int
+    hasRange1: bool         // key[1] integer bounds (JK_INT2 / JK_INT2_64)
+    minK1: int
+    maxK1: int
+    hasStrRange: bool       // key[0] text bounds (JK_TEXT)
+    minS: str
+    maxS: str
 }
 
 const NA_NOTIN: int = 1
@@ -6694,7 +6708,8 @@ fn newJL(how: int, level: int, first: int, ncol: int): JL {
               perRow: 0, mark: 0, los: [], his: [], noNulls: false, right: false, cross: false, raw: false, resCol: -1, mixed: [], single: [], res: BNode.Const(0, true), resTyp: BT_INT,
               cutB: [], cutTo: -1, na: 0, nk: 0, sumAll: 0, colls: [], countOnly: false,
               fastCnt: lexdb_ht.newFastIntCount(), fastCnt2: lexdb_ht.newFastInt2Count(), ints2: lexdb_ht.newFastInt2Map(),
-              dense: [], denseMin: 0, kCol0: -1, kCol1: -1, neqOut: -1, neqIn: -1, antiNull: false}
+              dense: [], denseMin: 0, kCol0: -1, kCol1: -1, neqOut: -1, neqIn: -1, antiNull: false,
+              nLive: 0, hasRange0: false, minK0: 0, maxK0: 0, hasRange1: false, minK1: 0, maxK1: 0, hasStrRange: false, minS: "", maxS: ""}
 }
 
 // A join's run: its levels, the query's columns' kinds (all tables'),
@@ -6892,6 +6907,359 @@ fn projOf(t: &lexdb_catalog.Table, sc: &lexdb_plan.PScan, kinds: &[]int): BPlan 
 // batches, and the rows the first hash's keys dropped after them.
 type RC = record { read: int; kept: int; batches: int; pushed: int; cut: int }
 
+// Runtime hash-join filters pushed onto the probe table scan (SkipQuery + LeafK + BPlan.ranges).
+type RtFilters = record {
+    active: bool
+    bpRanges: []int
+    ranges: []int
+    eqPl: []int
+    eqInt: []int
+    inPl: []int
+    inInts: [][]int
+    strPl: []int
+    strOp: []int
+    strVals: [][]str
+    rtBloomPl: []int
+    rtBlooms: []lexdb_skip.IntBloom
+    kern: []lexdb_leafk.LeafK
+}
+
+fn noRtFilters(): RtFilters {
+    return RtFilters{active: false, bpRanges: [], ranges: [], eqPl: [], eqInt: [], inPl: [], inInts: [],
+                     strPl: [], strOp: [], strVals: [], rtBloomPl: [], rtBlooms: [], kern: []}
+}
+
+fn allNoErr(conds: &[]BNode, t: &lexdb_catalog.Table): bool {
+    for c in conds { if !bNoErr(&c, t) { return false } }
+    return true
+}
+
+fn isSparse(nKeys: int, lo: int, hi: int): bool {
+    if nKeys <= 1 || hi < lo { return false }
+    let lim = nKeys * 2
+    if lo <= 9223372036854775807 - lim && hi >= lo + lim { return true }
+    if lo > 9223372036854775807 - lim { return false }
+    return nKeys * 4 < (hi - lo + 1) * 3
+}
+
+fn canRtPush(jr: &JRun, j: int): bool {
+    if jr.apAt >= 0 && j >= jr.apAt { return false }
+    let jl = &jr.jls[j]
+    if !(jl.how == lexdb_plan.JH_HASH || jl.how == lexdb_plan.JH_JOIN || jl.how == lexdb_plan.JH_ROWS) { return false }
+    if jl.left || jl.resCol >= 0 || jl.na != 0 || jl.mark == lexdb_plan.MK_ANTI || jl.cross { return false }
+    for m in 1..j {
+        let ml = &jr.jls[m]
+        if ml.how == lexdb_plan.JH_APPLY || len(ml.conds) > 0 || len(ml.post) > 0 || ml.resCol >= 0 || ml.na != 0 { return false }
+        for x in ml.key {
+            match x {
+                BNode.Col(_) {}
+                else { return false }
+            }
+        }
+    }
+    return true
+}
+
+fn jlCollectIntKeys(jl: &JL, cap: int): []int {
+    var out: []int = withCapacity(cap)
+    if len(jl.dense) > 0 {
+        let dMin = jl.denseMin
+        if jl.countOnly {
+            for d in 0..len(jl.dense) {
+                if jl.dense[d] > 0 {
+                    append(mut &out, dMin + d)
+                    if len(out) >= cap { break }
+                }
+            }
+        } else {
+            for d in 0..len(jl.dense) {
+                let bk = jl.dense[d]
+                if bk >= 0 && jl.head[bk] >= 0 {
+                    append(mut &out, dMin + d)
+                    if len(out) >= cap { break }
+                }
+            }
+        }
+        return out
+    }
+    if jl.countOnly {
+        for i in 0..len(jl.fastCnt.vs) {
+            if jl.fastCnt.vs[i] > 0 {
+                append(mut &out, jl.fastCnt.ks[i])
+                if len(out) >= cap { break }
+            }
+        }
+        return out
+    }
+    for i in 0..jl.ints.size() {
+        let bk = jl.ints.valAt(i)
+        if jl.head[bk] >= 0 {
+            append(mut &out, jl.ints.keyAt(i))
+            if len(out) >= cap { break }
+        }
+    }
+    return out
+}
+
+fn jlBuildIntBloom(jl: &JL, nLive: int, lo: int, hi: int): lexdb_skip.IntBloom {
+    var bf = lexdb_skip.newIntBloom(nLive, lo, hi)
+    if len(jl.dense) > 0 {
+        let dMin = jl.denseMin
+        if jl.countOnly {
+            for d in 0..len(jl.dense) { if jl.dense[d] > 0 { bf.add(dMin + d) } }
+        } else {
+            for d in 0..len(jl.dense) {
+                let bk = jl.dense[d]
+                if bk >= 0 && jl.head[bk] >= 0 { bf.add(dMin + d) }
+            }
+        }
+        return bf
+    }
+    if jl.countOnly {
+        for i in 0..len(jl.fastCnt.vs) {
+            if jl.fastCnt.vs[i] > 0 { bf.add(jl.fastCnt.ks[i]) }
+        }
+        return bf
+    }
+    for i in 0..jl.ints.size() {
+        let bk = jl.ints.valAt(i)
+        if jl.head[bk] >= 0 { bf.add(jl.ints.keyAt(i)) }
+    }
+    return bf
+}
+
+fn addIntRangeRt(rt: mut &RtFilters, pl: int, hasR: bool, lo: int, hi: int, addSkip: bool, addKern: bool) {
+    let rLo = if hasR { lo } else { 1 }
+    let rHi = if hasR { hi } else { 0 }
+    append(mut &rt.bpRanges, pl)
+    append(mut &rt.bpRanges, 0)
+    append(mut &rt.bpRanges, rLo)
+    append(mut &rt.bpRanges, rHi)
+    if addSkip {
+        append(mut &rt.ranges, pl)
+        append(mut &rt.ranges, 0)
+        append(mut &rt.ranges, rLo)
+        append(mut &rt.ranges, rHi)
+        rt.active = true
+    }
+    if addKern {
+        append(mut &rt.kern, lexdb_leafk.LeafK.Range(pl, lexdb_rows.PK_INT, -1, rLo, rHi))
+        rt.active = true
+    }
+    rtFilterPushes += 1
+}
+
+// Builds runtime hash-join filters (ranges, small IN sets, text bounds/sets, and L1-hot
+// Bloom filters) from all eligible build levels targeting level 0's probe scan.
+fn buildRuntimeFilters(jr: &JRun, sc: &lexdb_plan.PScan, t: &lexdb_catalog.Table, bp: &BPlan,
+                       cn: &[]BNode, useSip: bool, sipCol: int, sipKeys: &Map[int, int], pushCol: int, hasMetas: bool): RtFilters {
+    var rt = noRtFilters()
+    if !allNoErr(cn, t) { return rt }
+    // 1. SIP key set pushed into a correlated semi-join's inner scan
+    if useSip && sipCol >= 0 && sipCol < len(bp.kinds) && bp.kinds[sipCol] == BK_INT &&
+       sipCol < len(t.cols) && lexdb_rows.isIntKind(lexdb_rows.placeKind(&t.cols[sipCol])) {
+        let pl = placeOfCol(t, sipCol)
+        let nLive = sipKeys.size()
+        if nLive == 0 {
+            addIntRangeRt(mut &rt, pl, false, 1, 0, true, true)
+        } else {
+            var lo = 0
+            var hi = 0
+            for i in 0..nLive {
+                let k = sipKeys.keyAt(i)
+                if i == 0 { lo = k; hi = k } else {
+                    if k < lo { lo = k }
+                    if k > hi { hi = k }
+                }
+            }
+            let addSkip = hasMetas || nLive <= 32768
+            addIntRangeRt(mut &rt, pl, true, lo, hi, addSkip, nLive <= 32768)
+            if nLive == 1 {
+                append(mut &rt.eqPl, pl)
+                append(mut &rt.eqInt, lo)
+                rt.active = true
+            } else if nLive <= 64 {
+                var ks: []int = withCapacity(nLive)
+                for i in 0..nLive { append(mut &ks, sipKeys.keyAt(i)) }
+                append(mut &rt.inPl, pl)
+                append(mut &rt.inInts, ks)
+                rt.active = true
+            }
+            if nLive <= 32768 && isSparse(nLive, lo, hi) {
+                var bf = lexdb_skip.newIntBloom(nLive, lo, hi)
+                for i in 0..nLive { bf.add(sipKeys.keyAt(i)) }
+                rtBloomsBuilt += 1
+                if hasMetas {
+                    append(mut &rt.rtBloomPl, pl)
+                    append(mut &rt.rtBlooms, lexdb_skip.cloneIntBloom(&bf))
+                }
+                append(mut &rt.kern, lexdb_leafk.intBloom(pl, lexdb_rows.PK_INT, bf))
+                rt.active = true
+            }
+        }
+    }
+    // 2. All eligible hash-join levels j >= 1 whose equijoin key reads a bare column of level 0
+    for j in 1..len(jr.jls) {
+        if !canRtPush(jr, j) { continue }
+        let jl = &jr.jls[j]
+        if jl.mode == JK_INT {
+            if jl.kCol0 < 0 || jr.owner[jl.kCol0] != 0 { continue }
+            let pc = jl.kCol0 - sc.first
+            if pc < 0 || pc >= len(bp.kinds) || bp.kinds[pc] != BK_INT || pc >= len(t.cols) { continue }
+            if !lexdb_rows.isIntKind(lexdb_rows.placeKind(&t.cols[pc])) { continue }
+            let pl = placeOfCol(t, pc)
+            // When reduceHashes cut jls[1] (cutTo >= 0) and pushCol handles exact cut accounting,
+            // still push subtree/leaf skip filters (ranges/IN/Bloom) into SkipQuery, and let pushCol do row-level drop.
+            let addKern = !(j == 1 && jl.cutTo >= 0 && pushCol == pc)
+            if jl.nLive == 0 || !jl.hasRange0 {
+                addIntRangeRt(mut &rt, pl, false, 1, 0, true, addKern)
+                continue
+            }
+            let addSkip = hasMetas || jl.nLive <= 32768
+            addIntRangeRt(mut &rt, pl, true, jl.minK0, jl.maxK0, addSkip, addKern && jl.nLive <= 32768)
+            if jl.nLive == 1 {
+                append(mut &rt.eqPl, pl)
+                append(mut &rt.eqInt, jl.minK0)
+                rt.active = true
+            } else if jl.nLive <= 64 {
+                let ks = jlCollectIntKeys(jl, 64)
+                if len(ks) > 0 {
+                    append(mut &rt.inPl, pl)
+                    append(mut &rt.inInts, ks)
+                    rt.active = true
+                }
+            }
+            if jl.nLive <= 32768 && isSparse(jl.nLive, jl.minK0, jl.maxK0) {
+                // Skip redundant row-level IntBloom when j == 1 already has an exact O(1) dense pushCol,
+                // or when j >= 2 is less selective than j == 1's dense pushCol (let pushCol filter first).
+                let j1Dense = pushCol >= 0 && len(jr.jls) > 1 && len(jr.jls[1].dense) > 0
+                let useBloomKern = addKern && !(j == 1 && pushCol == pc && len(jl.dense) > 0) &&
+                                   !(j >= 2 && j1Dense && jl.nLive >= jr.jls[1].nLive && jl.nLive > 2048)
+                if hasMetas || useBloomKern {
+                    let bf = jlBuildIntBloom(jl, jl.nLive, jl.minK0, jl.maxK0)
+                    rtBloomsBuilt += 1
+                    if hasMetas && useBloomKern {
+                        append(mut &rt.rtBloomPl, pl)
+                        append(mut &rt.rtBlooms, lexdb_skip.cloneIntBloom(&bf))
+                        append(mut &rt.kern, lexdb_leafk.intBloom(pl, lexdb_rows.PK_INT, bf))
+                    } else if hasMetas {
+                        append(mut &rt.rtBloomPl, pl)
+                        append(mut &rt.rtBlooms, bf)
+                    } else {
+                        append(mut &rt.kern, lexdb_leafk.intBloom(pl, lexdb_rows.PK_INT, bf))
+                    }
+                    rt.active = true
+                }
+            }
+        } else if jl.mode == JK_INT2 || jl.mode == JK_INT2_64 {
+            let addSkip = hasMetas || jl.nLive == 0 || jl.nLive <= 32768
+            let addKern = jl.nLive == 0 || jl.nLive <= 32768
+            if jl.kCol0 >= 0 && jr.owner[jl.kCol0] == 0 {
+                let pc0 = jl.kCol0 - sc.first
+                if pc0 >= 0 && pc0 < len(bp.kinds) && bp.kinds[pc0] == BK_INT && pc0 < len(t.cols) &&
+                   lexdb_rows.isIntKind(lexdb_rows.placeKind(&t.cols[pc0])) {
+                    addIntRangeRt(mut &rt, placeOfCol(t, pc0), jl.nLive > 0 && jl.hasRange0, jl.minK0, jl.maxK0, addSkip, addKern)
+                }
+            }
+            if jl.kCol1 >= 0 && jr.owner[jl.kCol1] == 0 {
+                let pc1 = jl.kCol1 - sc.first
+                if pc1 >= 0 && pc1 < len(bp.kinds) && bp.kinds[pc1] == BK_INT && pc1 < len(t.cols) &&
+                   lexdb_rows.isIntKind(lexdb_rows.placeKind(&t.cols[pc1])) {
+                    addIntRangeRt(mut &rt, placeOfCol(t, pc1), jl.nLive > 0 && jl.hasRange1, jl.minK1, jl.maxK1, addSkip, addKern)
+                }
+            }
+        } else if jl.mode == JK_TEXT {
+            if jl.kCol0 < 0 || jr.owner[jl.kCol0] != 0 { continue }
+            let pc = jl.kCol0 - sc.first
+            if pc < 0 || pc >= len(t.cols) || t.cols[pc].typ.kind != lexdb_sql.K_TEXT || len(t.cols[pc].coll) > 0 { continue }
+            let pl = placeOfCol(t, pc)
+            let nLive = jl.txts.size()
+            if nLive == 0 {
+                append(mut &rt.strPl, pl)
+                append(mut &rt.strOp, 6)
+                append(mut &rt.strVals, [])
+                append(mut &rt.kern, lexdb_leafk.LeafK.Texts(6, pl, []))
+                rt.active = true
+                rtFilterPushes += 1
+            } else if nLive <= 64 {
+                var ks: []str = withCapacity(nLive)
+                var ks2: []str = withCapacity(nLive)
+                for i in 0..nLive {
+                    let s = jl.txts.keyAt(i)
+                    append(mut &ks, s.clone())
+                    append(mut &ks2, s.clone())
+                }
+                let op = if nLive == 1 { 0 } else { 6 }
+                append(mut &rt.strPl, pl)
+                append(mut &rt.strOp, op)
+                append(mut &rt.strVals, ks)
+                append(mut &rt.kern, lexdb_leafk.LeafK.Texts(op, pl, ks2))
+                rt.active = true
+                rtFilterPushes += 1
+            } else if jl.hasStrRange && (hasMetas || nLive <= 32768) {
+                append(mut &rt.strPl, pl)
+                append(mut &rt.strOp, 5)
+                append(mut &rt.strVals, [jl.minS.clone()])
+                append(mut &rt.strPl, pl)
+                append(mut &rt.strOp, 3)
+                append(mut &rt.strVals, [jl.maxS.clone()])
+                rt.active = true
+                rtFilterPushes += 1
+            }
+        }
+    }
+    return rt
+}
+
+fn mergeRtIntoLazy(lz: mut &Lazy, rt: &RtFilters) {
+    if !rt.active { return }
+    let hadLocal = lz.skipQ.active
+    for r in rt.ranges { append(mut &lz.skipQ.ranges, r) }
+    for i in 0..len(rt.eqPl) {
+        append(mut &lz.skipQ.eqPl, rt.eqPl[i])
+        append(mut &lz.skipQ.eqInt, rt.eqInt[i])
+    }
+    for i in 0..len(rt.inPl) {
+        append(mut &lz.skipQ.inPl, rt.inPl[i])
+        append(mut &lz.skipQ.inInts, collections.copyOf(&rt.inInts[i]))
+    }
+    for i in 0..len(rt.strPl) {
+        append(mut &lz.skipQ.strPl, rt.strPl[i])
+        append(mut &lz.skipQ.strOp, rt.strOp[i])
+        var vs: []str = withCapacity(len(rt.strVals[i]))
+        for s in rt.strVals[i] { append(mut &vs, s.clone()) }
+        append(mut &lz.skipQ.strVals, vs)
+    }
+    for i in 0..len(rt.rtBloomPl) {
+        append(mut &lz.skipQ.rtBloomPl, rt.rtBloomPl[i])
+        append(mut &lz.skipQ.rtBlooms, lexdb_skip.cloneIntBloom(&rt.rtBlooms[i]))
+    }
+    lz.skipQ.active = lz.skipQ.hasFilters()
+    if lz.skipQ.active && !hadLocal { lz.skipQ.rtOnly = true }
+    if len(rt.kern) > 0 {
+        var ks: []lexdb_leafk.LeafK = []
+        var forceOn = false
+        for k in rt.kern {
+            match k {
+                lexdb_leafk.LeafK.Range(pl, pk, sc, lo, hi) { append(mut &ks, lexdb_leafk.LeafK.Range(pl, pk, sc, lo, hi)) }
+                lexdb_leafk.LeafK.IntBloom(pl, pk, bf) {
+                    append(mut &ks, lexdb_leafk.intBloom(pl, pk, lexdb_skip.cloneIntBloom(&bf)))
+                    forceOn = true
+                }
+                lexdb_leafk.LeafK.Texts(op, pl, vs) {
+                    var vs2: []str = withCapacity(len(vs))
+                    for s in vs { append(mut &vs2, s.clone()) }
+                    append(mut &ks, lexdb_leafk.LeafK.Texts(op, pl, vs2))
+                    forceOn = true
+                }
+                else {}
+            }
+        }
+        lz.rtKern = lexdb_leafk.merged(ks)
+        if forceOn { lz.on = true }
+    }
+}
+
 // Reads table t's rows as src says (the plan's arm sc), in chunks: each
 // batch (by the table's columns, bp) and the rows its conditions conds
 // keep, to each; false from each stops. With pushCol >= 0 (a column of
@@ -6900,7 +7268,7 @@ type RC = record { read: int; kept: int; batches: int; pushed: int; cut: int }
 // condition: raised. A value a batch cannot hold: batErr. Whether each
 // stopped it.
 fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog.Table, sc: &lexdb_plan.PScan, src: &Src, hrows: &[][]Val, bp: &BPlan,
-            conds: &[]BNode, pushCol: int, ph: &PushH, rawOnErr: bool, rc: mut &RC,
+            conds: &[]BNode, pushCol: int, ph: &PushH, rt: &RtFilters, rawOnErr: bool, rc: mut &RC,
             each: &fn(mut &lexdb_store.Txn, mut &Batch, []int, bool): Result[bool, DbErr]): Result[bool, DbErr] {
     let rel = lexdb_catalog.relOf(t)
     if src.held {
@@ -6981,7 +7349,8 @@ fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog
         }
         return Ok(false)
     }
-    let lazy = lazyOf(bp, t, conds, pushCol)
+    var lazy = lazyOf(bp, t, conds, pushCol)
+    if rt.active { mergeRtIntoLazy(mut &lazy, rt) }
     let hasCut = len(ph.cutB) > 0
     try lexdb_access.warmPoints(st, txn, &rel, &src.scans)
     for s in src.scans {
@@ -7095,8 +7464,8 @@ fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog
                 continue
             }
             rc.read += nr
-            rc.kept += keptN
-            rc.pushed += dropped
+            rc.kept += keptN + pk.rtPreDrop
+            rc.pushed += dropped + pk.rtPreDrop + pk.rtPostDrop
             rc.cut += cutRows
             rc.batches += 1
             if !(try each(txn, mut &b, idx, false)) { return Ok(true) }
@@ -7670,7 +8039,7 @@ fn grpSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, j: &lexdb_plan.PJ
     rows0.n = 0
     var bd = Builder{rows: rows0, head: [], tail: [], next: [], ints: newMap(), txts: collections.newMapWith(collections.fxHashStr), gens: collections.newMapWith(collections.fxHashStr), mixed: [], single: [],
                      held: 0, kept: 0, fastCnt: lexdb_ht.newFastIntCount(), fastCnt2: lexdb_ht.newFastInt2Count(), ints2: lexdb_ht.newFastInt2Map(),
-                     hasRange: false, minK: 0, maxK: 0, tDict: [], tDictOn: []}
+                     hasRange: false, minK: 0, maxK: 0, hasRange1: false, minK1: 0, maxK1: 0, hasStrRange: false, minS: "", maxS: "", tDict: [], tDictOn: []}
     initTDict(mut &bd, &bp)
     let mode = jl.mode
     let h0 = bud.held
@@ -7716,6 +8085,19 @@ fn grpSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, j: &lexdb_plan.PJ
     jl.fastCnt = replace(mut &bd.fastCnt, lexdb_ht.newFastIntCount())
     jl.fastCnt2 = replace(mut &bd.fastCnt2, lexdb_ht.newFastInt2Count())
     jl.ints2 = replace(mut &bd.ints2, lexdb_ht.newFastInt2Map())
+    jl.nLive = if jl.mode == JK_INT { if jl.countOnly { jl.fastCnt.size() } else { jl.ints.size() } }
+               else if jl.mode == JK_INT2 { if jl.countOnly { jl.fastCnt.size() } else { jl.ints.size() } }
+               else if jl.mode == JK_INT2_64 { if jl.countOnly { jl.fastCnt2.size() } else { jl.ints2.size() } }
+               else if jl.mode == JK_TEXT { jl.txts.size() } else { len(jl.head) }
+    jl.hasRange0 = bd.hasRange
+    jl.minK0 = bd.minK
+    jl.maxK0 = bd.maxK
+    jl.hasRange1 = bd.hasRange1
+    jl.minK1 = bd.minK1
+    jl.maxK1 = bd.maxK1
+    jl.hasStrRange = bd.hasStrRange
+    jl.minS = replace(mut &bd.minS, "")
+    jl.maxS = replace(mut &bd.maxS, "")
     buildDense(mut &jl, bd.hasRange, bd.minK, bd.maxK, bud.room())
     for k in 0..len(j.conds) {
         // (the key's equality, when the hash compares by value: applied by the probe)
@@ -7852,6 +8234,27 @@ fn cutRows(jl: mut &JL, live: &[]bool, to: int): int {
     if cut == 0 { return 0 }
     jl.cutTo = to
     jl.cutB = perB
+    if jl.mode == JK_INT && !jl.countOnly {
+        var nLive = 0
+        var hasR = false
+        var lo = 0
+        var hi = 0
+        for i in 0..jl.ints.size() {
+            let bk = jl.ints.valAt(i)
+            if jl.head[bk] >= 0 {
+                let kv = jl.ints.keyAt(i)
+                if !hasR { lo = kv; hi = kv; hasR = true } else {
+                    if kv < lo { lo = kv }
+                    if kv > hi { hi = kv }
+                }
+                nLive += 1
+            }
+        }
+        jl.nLive = nLive
+        jl.hasRange0 = hasR
+        jl.minK0 = lo
+        jl.maxK0 = hi
+    }
     return cut
 }
 
@@ -7876,6 +8279,12 @@ type Builder = record {
     hasRange: bool
     minK: int
     maxK: int
+    hasRange1: bool
+    minK1: int
+    maxK1: int
+    hasStrRange: bool
+    minS: str
+    maxS: str
     tDict: []Map[str, int]      // per BK_TEXT col: small-cardinality dedup (<= 256 distinct values)
     tDictOn: []bool
 }
@@ -7917,49 +8326,91 @@ fn buildDense(jl: mut &JL, hasRange: bool, minK: int, maxK: int, room: int) {
 }
 
 fn (bd: mut &Builder) addCount(b: &Batch, idx: &[]int, hc: &[]int, mode: int, room: int, maxHeld: int): Result[Unit, DbErr] {
+    var has0 = bd.hasRange
+    var min0 = bd.minK
+    var max0 = bd.maxK
     if mode == JK_INT {
         let kc = &b.cols[hc[0]]
         for r in idx {
             if kc.nul[r] { continue }
             let k = kc.v[r]
-            if !bd.hasRange {
-                bd.minK = k
-                bd.maxK = k
-                bd.hasRange = true
+            if !has0 {
+                min0 = k
+                max0 = k
+                has0 = true
             } else {
-                if k < bd.minK { bd.minK = k }
-                if k > bd.maxK { bd.maxK = k }
+                if k < min0 { min0 = k }
+                if k > max0 { max0 = k }
             }
             if bd.fastCnt.inc(k) {
                 bd.held += 24
-                if room >= 0 && bd.held > room { return Err(memErr(maxHeld)) }
+                if room >= 0 && bd.held > room {
+                    bd.hasRange = has0; bd.minK = min0; bd.maxK = max0
+                    return Err(memErr(maxHeld))
+                }
             }
             bd.kept += 1
         }
+        bd.hasRange = has0; bd.minK = min0; bd.maxK = max0
         return Ok(Unit{})
     }
+    var has1 = bd.hasRange1
+    var min1 = bd.minK1
+    var max1 = bd.maxK1
     let kc0 = &b.cols[hc[0]]
     let kc1 = &b.cols[hc[1]]
     if mode == JK_INT2_64 {
         for r in idx {
             if kc0.nul[r] || kc1.nul[r] { continue }
-            if bd.fastCnt2.inc(kc0.v[r], kc1.v[r]) {
+            let v0 = kc0.v[r]
+            let v1 = kc1.v[r]
+            if !has0 { min0 = v0; max0 = v0; has0 = true } else {
+                if v0 < min0 { min0 = v0 }
+                if v0 > max0 { max0 = v0 }
+            }
+            if !has1 { min1 = v1; max1 = v1; has1 = true } else {
+                if v1 < min1 { min1 = v1 }
+                if v1 > max1 { max1 = v1 }
+            }
+            if bd.fastCnt2.inc(v0, v1) {
                 bd.held += 32
-                if room >= 0 && bd.held > room { return Err(memErr(maxHeld)) }
+                if room >= 0 && bd.held > room {
+                    bd.hasRange = has0; bd.minK = min0; bd.maxK = max0
+                    bd.hasRange1 = has1; bd.minK1 = min1; bd.maxK1 = max1
+                    return Err(memErr(maxHeld))
+                }
             }
             bd.kept += 1
         }
+        bd.hasRange = has0; bd.minK = min0; bd.maxK = max0
+        bd.hasRange1 = has1; bd.minK1 = min1; bd.maxK1 = max1
         return Ok(Unit{})
     }
     for r in idx {
         if kc0.nul[r] || kc1.nul[r] { continue }
-        let k = packInt2(kc0.v[r], kc1.v[r])
+        let v0 = kc0.v[r]
+        let v1 = kc1.v[r]
+        if !has0 { min0 = v0; max0 = v0; has0 = true } else {
+            if v0 < min0 { min0 = v0 }
+            if v0 > max0 { max0 = v0 }
+        }
+        if !has1 { min1 = v1; max1 = v1; has1 = true } else {
+            if v1 < min1 { min1 = v1 }
+            if v1 > max1 { max1 = v1 }
+        }
+        let k = packInt2(v0, v1)
         if bd.fastCnt.inc(k) {
             bd.held += 24
-            if room >= 0 && bd.held > room { return Err(memErr(maxHeld)) }
+            if room >= 0 && bd.held > room {
+                bd.hasRange = has0; bd.minK = min0; bd.maxK = max0
+                bd.hasRange1 = has1; bd.minK1 = min1; bd.maxK1 = max1
+                return Err(memErr(maxHeld))
+            }
         }
         bd.kept += 1
     }
+    bd.hasRange = has0; bd.minK = min0; bd.maxK = max0
+    bd.hasRange1 = has1; bd.minK1 = min1; bd.maxK1 = max1
     return Ok(Unit{})
 }
 
@@ -7972,6 +8423,12 @@ fn (bd: mut &Builder) add(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, mode: 
                           room: int, maxHeld: int, colls: &[]int): Result[Unit, DbErr] {
     let ncol = len(bp.kinds)
     var kb = ""
+    var has0 = bd.hasRange
+    var min0 = bd.minK
+    var max0 = bd.maxK
+    var has1 = bd.hasRange1
+    var min1 = bd.minK1
+    var max1 = bd.maxK1
     for r in idx {
         var bk = -1
         var nul = false
@@ -7979,13 +8436,13 @@ fn (bd: mut &Builder) add(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, mode: 
             let kc = &b.cols[hc[0]]
             if kc.nul[r] { nul = true } else {
                 let kv = kc.v[r]
-                if !bd.hasRange {
-                    bd.minK = kv
-                    bd.maxK = kv
-                    bd.hasRange = true
+                if !has0 {
+                    min0 = kv
+                    max0 = kv
+                    has0 = true
                 } else {
-                    if kv < bd.minK { bd.minK = kv }
-                    if kv > bd.maxK { bd.maxK = kv }
+                    if kv < min0 { min0 = kv }
+                    if kv > max0 { max0 = kv }
                 }
                 match bd.ints.get(&kv) {
                     Some(x) { bk = x }
@@ -7999,7 +8456,17 @@ fn (bd: mut &Builder) add(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, mode: 
             let kc0 = &b.cols[hc[0]]
             let kc1 = &b.cols[hc[1]]
             if kc0.nul[r] || kc1.nul[r] { nul = true } else {
-                let pk = packInt2(kc0.v[r], kc1.v[r])
+                let v0 = kc0.v[r]
+                let v1 = kc1.v[r]
+                if !has0 { min0 = v0; max0 = v0; has0 = true } else {
+                    if v0 < min0 { min0 = v0 }
+                    if v0 > max0 { max0 = v0 }
+                }
+                if !has1 { min1 = v1; max1 = v1; has1 = true } else {
+                    if v1 < min1 { min1 = v1 }
+                    if v1 > max1 { max1 = v1 }
+                }
+                let pk = packInt2(v0, v1)
                 match bd.ints.get(&pk) {
                     Some(x) { bk = x }
                     None {
@@ -8012,7 +8479,17 @@ fn (bd: mut &Builder) add(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, mode: 
             let kc0 = &b.cols[hc[0]]
             let kc1 = &b.cols[hc[1]]
             if kc0.nul[r] || kc1.nul[r] { nul = true } else {
-                bk = bd.ints2.getOrPut(kc0.v[r], kc1.v[r], len(bd.head))
+                let v0 = kc0.v[r]
+                let v1 = kc1.v[r]
+                if !has0 { min0 = v0; max0 = v0; has0 = true } else {
+                    if v0 < min0 { min0 = v0 }
+                    if v0 > max0 { max0 = v0 }
+                }
+                if !has1 { min1 = v1; max1 = v1; has1 = true } else {
+                    if v1 < min1 { min1 = v1 }
+                    if v1 > max1 { max1 = v1 }
+                }
+                bk = bd.ints2.getOrPut(v0, v1, len(bd.head))
             }
         } else if mode == JK_TEXT && bp.kinds[hc[0]] == BK_TEXT {
             if b.cols[hc[0]].nul[r] { nul = true } else {
@@ -8022,6 +8499,14 @@ fn (bd: mut &Builder) add(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, mode: 
                     None {
                         bk = len(bd.head)
                         bd.txts.put(x.clone(), bk)
+                        if !bd.hasStrRange {
+                            bd.minS = x.clone()
+                            bd.maxS = x.clone()
+                            bd.hasStrRange = true
+                        } else {
+                            if x.cmp(&bd.minS) < 0 { bd.minS = x.clone() }
+                            if x.cmp(&bd.maxS) > 0 { bd.maxS = x.clone() }
+                        }
                     }
                 }
             }
@@ -8034,6 +8519,14 @@ fn (bd: mut &Builder) add(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, mode: 
                             None {
                                 bk = len(bd.head)
                                 bd.txts.put(x.clone(), bk)
+                                if !bd.hasStrRange {
+                                    bd.minS = x.clone()
+                                    bd.maxS = x.clone()
+                                    bd.hasStrRange = true
+                                } else {
+                                    if x.cmp(&bd.minS) < 0 { bd.minS = x.clone() }
+                                    if x.cmp(&bd.maxS) > 0 { bd.maxS = x.clone() }
+                                }
                             }
                         }
                     }
@@ -8133,6 +8626,8 @@ fn (bd: mut &Builder) add(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, mode: 
             bd.tail[bk] = at
         }
     }
+    bd.hasRange = has0; bd.minK = min0; bd.maxK = max0
+    bd.hasRange1 = has1; bd.minK1 = min1; bd.maxK1 = max1
     return Ok(Unit{})
 }
 
@@ -8145,7 +8640,7 @@ fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalo
              c: mut &Counts): Result[Unit, DbErr] {
     hashBuilds += 1
     let sc = &j.scan
-    let bp = projOf(t, sc, &jr.kinds)
+    var bp = projOf(t, sc, &jr.kinds)
     var conds: []BNode = []
     for x in j.build {
         match condNodeD(&x, cols, &jr.kinds, cx, sc.first, &sc.need, dec) {
@@ -8153,11 +8648,12 @@ fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalo
             None { return Err(batErr()) }
         }
     }
+    if !src.held { bp.ranges = cRanges(&conds, &bp.kinds, t) }
     var rows0 = lexdb_rows.newBatch(&bp, 0)
     rows0.n = 0
     var bd = Builder{rows: rows0, head: [], tail: [], next: [], ints: newMap(), txts: collections.newMapWith(collections.fxHashStr), gens: collections.newMapWith(collections.fxHashStr), mixed: [], single: [],
                      held: 0, kept: 0, fastCnt: lexdb_ht.newFastIntCount(), fastCnt2: lexdb_ht.newFastInt2Count(), ints2: lexdb_ht.newFastInt2Map(),
-                     hasRange: false, minK: 0, maxK: 0, tDict: [], tDictOn: []}
+                     hasRange: false, minK: 0, maxK: 0, hasRange1: false, minK1: 0, maxK1: 0, hasStrRange: false, minS: "", maxS: "", tDict: [], tDictOn: []}
     initTDict(mut &bd, &bp)
     let mode = jl.mode
     let raw = j.how == lexdb_plan.JH_ROWS
@@ -8195,7 +8691,8 @@ fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalo
         var rc = RC{read: 0, kept: 0, batches: 0, pushed: 0, cut: 0}
         let noHeld: [][]Val = []
         let countOnly = jl.countOnly
-        let stop = try readRows(st, txn, t, sc, src, &noHeld, &bp, &conds, -1, &ph, false, mut &rc,
+        let noRt = noRtFilters()
+        let stop = try readRows(st, txn, t, sc, src, &noHeld, &bp, &conds, -1, &ph, &noRt, false, mut &rc,
                                 fn(tx: mut &lexdb_store.Txn, b: mut &Batch, idx: []int, raw2: bool): Result[bool, DbErr] {
             if countOnly {
                 try bd.addCount(b, &idx, &j.hcols, mode, room, maxHeld)
@@ -8219,6 +8716,19 @@ fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalo
     jl.fastCnt = replace(mut &bd.fastCnt, lexdb_ht.newFastIntCount())
     jl.fastCnt2 = replace(mut &bd.fastCnt2, lexdb_ht.newFastInt2Count())
     jl.ints2 = replace(mut &bd.ints2, lexdb_ht.newFastInt2Map())
+    jl.nLive = if jl.mode == JK_INT { if jl.countOnly { jl.fastCnt.size() } else { jl.ints.size() } }
+               else if jl.mode == JK_INT2 { if jl.countOnly { jl.fastCnt.size() } else { jl.ints.size() } }
+               else if jl.mode == JK_INT2_64 { if jl.countOnly { jl.fastCnt2.size() } else { jl.ints2.size() } }
+               else if jl.mode == JK_TEXT { jl.txts.size() } else { len(jl.head) }
+    jl.hasRange0 = bd.hasRange
+    jl.minK0 = bd.minK
+    jl.maxK0 = bd.maxK
+    jl.hasRange1 = bd.hasRange1
+    jl.minK1 = bd.minK1
+    jl.maxK1 = bd.maxK1
+    jl.hasStrRange = bd.hasStrRange
+    jl.minS = replace(mut &bd.minS, "")
+    jl.maxS = replace(mut &bd.maxS, "")
     buildDense(mut &jl, bd.hasRange, bd.minK, bd.maxK, bud.room())
     jl.mixed = replace(mut &bd.mixed, [])
     jl.single = replace(mut &bd.single, [])
@@ -9308,7 +9818,7 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
         else { return Err(e("XX000", "a join plan without its scan")) }
     }
     let t = tabs[sc.level]
-    let bp = projOf(t, sc, &jr.kinds)
+    var bp = projOf(t, sc, &jr.kinds)
     jr.grow = sc.stops && jr.apAt < 0 && !jr.one
     var width = 1
     var unreached = 0
@@ -9319,6 +9829,7 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
             None { return Err(batErr()) }
         }
     }
+    if !srcs[sc.level].held { bp.ranges = cRanges(&cn, &bp.kinds, t) }
     // the first hash join's one integer key, a column of the scan: its
     // rows not in the hash are dropped as the scan reads them; or an outer
     // SIP key set pushed into an IN subquery's scan before its Apply runs
@@ -9357,7 +9868,13 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
         PushH{keys: &pl.ints, head: &pl.head, cutB: &pl.cutB, dense: &pl.dense, denseMin: pl.denseMin, countOnly: pl.countOnly, fastCnt: &pl.fastCnt}
     }
     var rawKept = 0
-    let stopped = try readRows(st, txn, t, sc, &srcs[sc.level], &vrows[sc.level], &bp, &cn, pushCol, &ph, exact, mut &rc,
+    var rt = noRtFilters()
+    if !srcs[sc.level].held {
+        let skInfo = try lexdb_skip.ensureTreeInfo(st, txn, t.tree, &t.name)
+        rt = buildRuntimeFilters(&jr, sc, t, &bp, &cn, useSip, cx.sipCol, &cx.sipKeys, pushCol, skInfo.hasMetas)
+    }
+    if len(rt.bpRanges) > 0 { for r in rt.bpRanges { append(mut &bp.ranges, r) } }
+    let stopped = try readRows(st, txn, t, sc, &srcs[sc.level], &vrows[sc.level], &bp, &cn, pushCol, &ph, &rt, exact, mut &rc,
                                fn(tx: mut &lexdb_store.Txn, b: mut &Batch, idx: []int, raw: bool): Result[bool, DbErr] {
         joinChunks += 1
         try bud.tickN(b.n)
@@ -9412,7 +9929,7 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
     cnt[sc.level].read += rc.read - unreached
     cnt[sc.level].joined += rc.kept - unreached
     cnt[sc.level].batches += rc.batches
-    if pushCol >= 0 && !useSip {
+    if len(jr.jls) > 1 && !useSip && rc.pushed > 0 {
         cnt[jr.jls[1].level].starts += rc.pushed
         pushDrops += rc.pushed
         if rc.cut > 0 {
@@ -10544,7 +11061,7 @@ fn joinRowsCount(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_
         else { return Ok(None) }
     }
     let t = tabs[sc.level]
-    let bp = projOf(t, sc, &jr.kinds)
+    var bp = projOf(t, sc, &jr.kinds)
     var cn: []BNode = []
     for x in conds {
         match condNodeD(&x, cols, &jr.kinds, cx, sc.first, &sc.need, false) {
@@ -10552,6 +11069,7 @@ fn joinRowsCount(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_
             None { return Ok(None) }
         }
     }
+    if !srcs[sc.level].held { bp.ranges = cRanges(&cn, &bp.kinds, t) }
     var pushCol = -1
     if len(jr.jls) > 1 &&
        (jr.jls[1].how == lexdb_plan.JH_HASH || jr.jls[1].how == lexdb_plan.JH_JOIN || jr.jls[1].how == lexdb_plan.JH_ROWS) &&
@@ -10569,7 +11087,14 @@ fn joinRowsCount(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_
     let pl = &jr.jls[if pushCol >= 0 { 1 } else { 0 }]
     let ph = PushH{keys: &pl.ints, head: &pl.head, cutB: &pl.cutB, dense: &pl.dense, denseMin: pl.denseMin, countOnly: pl.countOnly, fastCnt: &pl.fastCnt}
     var total = 0
-    let _ = try readRows(st, txn, t, sc, &srcs[sc.level], &vrows[sc.level], &bp, &cn, pushCol, &ph, false, mut &rc,
+    let noSip: Map[int, int] = newMap()
+    var rt = noRtFilters()
+    if !srcs[sc.level].held {
+        let skInfo = try lexdb_skip.ensureTreeInfo(st, txn, t.tree, &t.name)
+        rt = buildRuntimeFilters(&jr, sc, t, &bp, &cn, false, -1, &noSip, pushCol, skInfo.hasMetas)
+    }
+    if len(rt.bpRanges) > 0 { for r in rt.bpRanges { append(mut &bp.ranges, r) } }
+    let _ = try readRows(st, txn, t, sc, &srcs[sc.level], &vrows[sc.level], &bp, &cn, pushCol, &ph, &rt, false, mut &rc,
                          fn(tx: mut &lexdb_store.Txn, b: mut &Batch, idx: []int, raw: bool): Result[bool, DbErr] {
         if raw { return Err(batErr()) }
         joinChunks += 1
@@ -10588,7 +11113,7 @@ fn joinRowsCount(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_
     cnt[sc.level].read += rc.read
     cnt[sc.level].joined += rc.kept
     cnt[sc.level].batches += rc.batches
-    if pushCol >= 0 {
+    if len(jr.jls) > 1 && rc.pushed > 0 {
         cnt[jr.jls[1].level].starts += rc.pushed
         pushDrops += rc.pushed
         if rc.cut > 0 {

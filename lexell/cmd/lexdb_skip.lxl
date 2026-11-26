@@ -204,6 +204,10 @@ pub type SkipQuery = record {
     // OR groups: a node is skipped when every alternative of one group is
     // proved false on it (each alternative its own conjunction of the above)
     pub alts: [][]SkipQuery
+    // Runtime hash-join integer Bloom filters (checked against zone maps & SKIP_SET/MINMAX)
+    pub rtBloomPl: []int
+    pub rtBlooms: []lexdb_cols.IntBloom
+    pub rtOnly: bool            // true when all filters came from runtime join pushdown (enables adaptive bypass)
     pub barOn: bool             // dynamic Top-N threshold (ORDER BY int LIMIT N)
     pub barPl: int
     pub barKind: int            // 0 = any int, else PK_*
@@ -212,10 +216,15 @@ pub type SkipQuery = record {
     pub barNf: bool             // nullsFirst
 }
 
+pub type IntBloom = lexdb_cols.IntBloom
+
+pub fn newIntBloom(nKeys: int, lo: int, hi: int): IntBloom { return lexdb_cols.newIntBloom(nKeys, lo, hi) }
+pub fn cloneIntBloom(b: &IntBloom): IntBloom { return lexdb_cols.cloneIntBloom(b) }
+
 pub fn emptyQuery(): SkipQuery {
     return SkipQuery{active: false, ranges: [], nes: [], eqPl: [], eqInt: [], inPl: [], inInts: [],
                      strPl: [], strOp: [], strVals: [], likePl: [], likePieces: [], likeFold: [], alts: [],
-                     tokPl: [], tokRuns: [], tokFlags: [],
+                     tokPl: [], tokRuns: [], tokFlags: [], rtBloomPl: [], rtBlooms: [], rtOnly: false,
                      barOn: false, barPl: -1, barKind: 0, barVal: 0, barDesc: false, barNf: false}
 }
 
@@ -230,7 +239,8 @@ pub const TF_UNI = 8
 
 pub fn (q: &SkipQuery) hasFilters(): bool {
     return len(q.ranges) > 0 || len(q.nes) > 0 || len(q.eqPl) > 0 || len(q.inPl) > 0 ||
-           len(q.strPl) > 0 || len(q.likePl) > 0 || len(q.alts) > 0 || len(q.tokPl) > 0 || q.barOn
+           len(q.strPl) > 0 || len(q.likePl) > 0 || len(q.alts) > 0 || len(q.tokPl) > 0 ||
+           len(q.rtBloomPl) > 0 || q.barOn
 }
 
 pub fn (q: &SkipQuery) hasAutoFilters(): bool {
@@ -1117,6 +1127,19 @@ fn idxExcludes(ix: &IdxSum, q: &SkipQuery): bool {
             }
             if !any { return true }
         }
+        // 4b. Runtime hash-join integer Bloom filters (exact intersection against SKIP_SET; range against MINMAX/BLOOM)
+        for i in 0..len(q.rtBloomPl) {
+            if q.rtBloomPl[i] != pl { continue }
+            let bf = &q.rtBlooms[i]
+            if bf.lo > bf.hi || !ix.hasVal || ix.minI > bf.hi || ix.maxI < bf.lo { return true }
+            if ix.kind == SKIP_SET {
+                var any = false
+                for v in ix.intSet {
+                    if bf.has(v) { any = true; break }
+                }
+                if !any { return true }
+            }
+        }
         // 5. Dynamic Top-N Bar
         if q.barOn && q.barPl == pl && !(q.barNf && ix.hasNull) {
             if !ix.hasVal { return !q.barNf }
@@ -1307,6 +1330,12 @@ pub fn nodeExcludes(sum: &NodeSum, q: &SkipQuery): bool {
                 if val >= sum.minV[pl] && val <= sum.maxV[pl] { any = true; break }
             }
             if !any { return true }
+        }
+        for i in 0..len(q.rtBloomPl) {
+            let pl = q.rtBloomPl[i]
+            if pl >= np || !lexdb_rows.isIntKind(sum.kinds[pl]) { continue }
+            let bf = &q.rtBlooms[i]
+            if bf.lo > bf.hi || !sum.hasVal[pl] || sum.minV[pl] > bf.hi || sum.maxV[pl] < bf.lo { return true }
         }
         if q.barOn && q.barPl >= 0 && q.barPl < np {
             let pk = sum.kinds[q.barPl]

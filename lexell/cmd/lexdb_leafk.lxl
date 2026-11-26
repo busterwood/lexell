@@ -39,9 +39,29 @@ pub type LeafK = closed {
     // removed first when trim (a char(n)'s): substring(x from 1 for m) IN
     // (...) (pl, m, trim, ks; q22's)
     Prefix(int, int, bool, []str)
+    // runtime hash-join Bloom + range filter on integer place pl (pl, pk, bf)
+    IntBloom(int, byte, lexdb_cols.IntBloom)
     // every one holds; one at least holds
     All([]LeafK)
     Any([]LeafK)
+}
+
+pub fn intBloom(pl: int, pk: byte, bf: lexdb_cols.IntBloom): LeafK {
+    return LeafK.IntBloom(pl, pk, bf)
+}
+
+// Fast zero-allocation check: true when k is guaranteed to pass every row in leaf
+// (e.g. a non-NULL Range whose leaf [mn, mx] is completely inside [lo, hi]).
+pub fn allPass(leaf: &LeafView, k: &LeafK): bool {
+    match k {
+        LeafK.Range(pl, pk, sc, lo, hi) {
+            if !wordsOk(leaf, pl, pk, sc) { return false }
+            let dir = leaf.dir
+            if lexdb_cols.hasNulls(dir, pl) || !lexdb_cols.hasRange(dir, pl) { return false }
+            return lexdb_cols.least(dir, pl) >= lo && lexdb_cols.greatest(dir, pl) <= hi
+        }
+        else { return false }
+    }
 }
 
 pub const MIN_W: int = -9223372036854775807 - 1
@@ -272,6 +292,27 @@ pub fn rowsOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, k: &Lea
         }
         LeafK.Texts(op, pl, ks) { return textRows(leaf, from, rs, r0, cnt, pl, fn(t: &str): bool { return textHolds(op, t, &ks) }) }
         LeafK.Prefix(pl, m, trim, ks) { return textRows(leaf, from, rs, r0, cnt, pl, fn(t: &str): bool { return prefixIn(t, m, trim, &ks) }) }
+        LeafK.IntBloom(pl, pk, bf) {
+            if !wordsOk(leaf, pl, pk, -1) { return None }
+            let nulls = lexdb_cols.hasNulls(dir, pl)
+            if lexdb_cols.hasRange(dir, pl) {
+                let mn = lexdb_cols.least(dir, pl)
+                let mx = lexdb_cols.greatest(dir, pl)
+                if bf.lo > bf.hi || mx < bf.lo || mn > bf.hi { return Some([]) }
+            }
+            if n == cnt && !nulls {
+                return Some(lexdb_cols.bloomFilter(s, dir, pl, from, cnt, r0, &bf))
+            }
+            let w = wordsOf(leaf, from, rs, r0, cnt, pl)
+            var out: []int = withCapacity(n)
+            for x in 0..n {
+                if bf.has(w[x]) {
+                    if nulls && lexdb_cols.isNull(s, dir, pl, from + rs[x] - r0) { continue }
+                    append(mut &out, rs[x])
+                }
+            }
+            return Some(out)
+        }
         LeafK.All(ks) {
             var cur = collections.copyOf(rs)
             for k2 in ks {
