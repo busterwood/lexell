@@ -92,9 +92,12 @@ DROP MATERIALIZED VIEW [ IF EXISTS ] name [, ...] [ CASCADE | RESTRICT ]
 - **Automatic query rewrite:** When `ENABLE QUERY REWRITE` (or `WITH (query_rewrite = true)`) is set on a materialized
   view and session parameter `query_rewrite_enabled` is `on` (default), the planner automatically rewrites eligible
   `SELECT` queries against the base table(s) onto the lowest-cost matching materialized view. Supported rewrites
-  include exact matches, `HAVING` filters, subsumed `WHERE` predicates, coarser `GROUP BY` / global / `AVG` / sketch
-  rollups, and equi-joins. Stale `ON DEMAND` views (without `ON QUERY COMPUTATION`) and uncommitted `ON COMMIT` changes
-  are automatically skipped for correctness.
+  include exact matches, `HAVING` filters, subsumed `WHERE` predicates (exact, range, `BETWEEN`, `IN`, `<>`, and
+  `IS NOT NULL`), coarser and derived `GROUP BY` expressions (such as `DATE_TRUNC` or `EXTRACT` over an MV key),
+  join-back to extra dimension tables (including `LEFT JOIN`), and algebraic/sketch rollups (`COUNT`, `SUM`, `AVG`,
+  `MIN`, `MAX`, `VAR_*`, `STDDEV_*`, `BOOL_AND`/`BOOL_OR`, `BIT_XOR`, and HyperLogLog++/t-digest sketches, including
+  from internal hidden MV state). Stale `ON DEMAND` views (without `ON QUERY COMPUTATION`) and uncommitted `ON COMMIT`
+  changes are automatically skipped for correctness.
 - Dropping a base table, column, or upstream materialized view referenced by a downstream materialized view is refused
   (`2BP01`) unless `CASCADE` is given.
 
@@ -300,6 +303,66 @@ DROP MATERIALIZED VIEW mv_sales_snap, mv_live, mv_rt;
 ALTER MATERIALIZED VIEW
 DROP MATERIALIZED VIEW
 DROP MATERIALIZED VIEW
+```
+
+### F. Finer-grain rollup rewrite (derived `GROUP BY`, range subsumption, join-back, and `VAR_POP`)
+
+<!-- example: postgresql -->
+```sql
+CREATE TABLE dept_info (dept text PRIMARY KEY, region text);
+INSERT INTO dept_info VALUES ('a', 'EMEA'), ('b', 'EMEA'), ('c', 'AMER');
+CREATE MATERIALIZED VIEW mv_detail
+    WITH (refresh = 'fast_on_statement', query_rewrite = true) AS
+SELECT dept, amt, sum(amt) AS tot, stddev_samp(amt) AS sd
+FROM sales
+WHERE amt >= 50
+GROUP BY dept, amt;
+EXPLAIN SELECT d.region, sum(s.amt) AS region_tot, count(*) AS n
+FROM sales s JOIN dept_info d ON s.dept = d.dept
+WHERE s.amt >= 100
+GROUP BY d.region
+ORDER BY d.region;
+SELECT d.region, sum(s.amt) AS region_tot, count(*) AS n
+FROM sales s JOIN dept_info d ON s.dept = d.dept
+WHERE s.amt >= 100
+GROUP BY d.region
+ORDER BY d.region;
+SELECT upper(dept) AS dept_up, round(var_pop(amt), 2) AS vp
+FROM sales
+WHERE amt >= 50
+GROUP BY upper(dept)
+ORDER BY upper(dept);
+DROP MATERIALIZED VIEW mv_detail;
+DROP TABLE dept_info;
+```
+
+```text
+CREATE TABLE
+INSERT 0 3
+SELECT 7
+                     QUERY PLAN
+----------------------------------------------------
+ scan mv_detail: full scan
+ cross join dept_info d: primary key lookup per row
+ aggregate
+ order: sort
+(4 rows)
+
+ region | region_tot | n
+--------+------------+---
+ AMER   |        500 | 2
+ EMEA   |        600 | 3
+(2 rows)
+
+ dept_up |    vp
+---------+----------
+ A       |  3888.89
+ B       | 10000.00
+ C       |  2500.00
+(3 rows)
+
+DROP MATERIALIZED VIEW
+DROP TABLE
 ```
 
 ## See also

@@ -50,8 +50,9 @@ DROP MATERIALIZED VIEW LOG ON [ schema. ] table
 : Recorded in `USER_MVIEWS` (`REWRITE_ENABLED`, `ON_QUERY_COMPUTATION`) and changeable via `ALTER MATERIALIZED VIEW`.
   When `QUERY REWRITE` is enabled and `ALTER SESSION SET QUERY_REWRITE_ENABLED = TRUE` (default), the planner
   transparently rewrites eligible `SELECT` queries against the base table(s) onto the materialized view (supporting
-  exact matches, `HAVING`, subsumed `WHERE` predicates, coarser `GROUP BY` / global / `AVG` / sketch rollups, and
-  equi-joins, while skipping stale `ON DEMAND` views and uncommitted `ON COMMIT` changes).
+  exact matches, `HAVING`, subsumed `WHERE` predicates including range/`IN`/`IS NOT NULL`, coarser and derived
+  `GROUP BY` expressions, join-back to extra dimension tables, and `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`VAR_*`/`STDDEV_*`/sketch
+  rollups, while skipping stale `ON DEMAND` views and uncommitted `ON COMMIT` changes).
   When `ON QUERY COMPUTATION` is enabled on a fast-refreshable materialized view, DML appends signed deltas to a
   contention-free companion delta tree, `SELECT` queries merge base + delta rows on the fly in the reader's MVCC
   snapshot (even on `ON DEMAND` views before refresh), and `DBMS_MVIEW.REFRESH(..., 'F')` or the background folder
@@ -318,6 +319,68 @@ Materialized view dropped.
 Materialized view dropped.
 
 Materialized view dropped.
+```
+
+### F. Finer-grain rollup rewrite (derived `GROUP BY`, range subsumption, join-back, and `VAR_POP`)
+
+<!-- example: oracle -->
+```sql
+CREATE TABLE dept_info (dept VARCHAR2(10) PRIMARY KEY, region VARCHAR2(10));
+INSERT INTO dept_info VALUES ('a', 'EMEA');
+INSERT INTO dept_info VALUES ('b', 'EMEA');
+INSERT INTO dept_info VALUES ('c', 'AMER');
+COMMIT;
+CREATE MATERIALIZED VIEW mv_detail
+    REFRESH FAST ON STATEMENT ENABLE QUERY REWRITE
+AS SELECT dept, sal, SUM(sal) AS tot, STDDEV(sal) AS sd
+   FROM emp
+   WHERE sal >= 50
+   GROUP BY dept, sal;
+SELECT d.region, SUM(e.sal) AS region_tot, COUNT(*) AS n
+FROM emp e JOIN dept_info d ON e.dept = d.dept
+WHERE e.sal >= 100
+GROUP BY d.region
+ORDER BY d.region;
+SELECT UPPER(dept) AS dept_up, ROUND(VAR_POP(sal), 2) AS vp
+FROM emp
+WHERE sal >= 50
+GROUP BY UPPER(dept)
+ORDER BY UPPER(dept);
+DROP MATERIALIZED VIEW mv_detail;
+DROP TABLE dept_info;
+```
+
+```text
+Table created.
+
+1 row created.
+
+1 row created.
+
+1 row created.
+
+Commit complete.
+
+Materialized view created.
+
+REGION REGION_TOT N
+------ ---------- -
+AMER          650 2
+EMEA          650 3
+
+2 rows selected.
+
+DEPT_UP      VP
+------- -------
+A       3888.89
+B             0
+C          5625
+
+3 rows selected.
+
+Materialized view dropped.
+
+Table dropped.
 ```
 
 ## See also

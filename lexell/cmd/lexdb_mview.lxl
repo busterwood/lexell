@@ -592,7 +592,7 @@ fn mayMatchAnyCachedShape(candMarks: &[]str, nFrom: int, qHasAgg: bool): bool {
             for e in pc.entries {
                 if e.mvCatKey == mk {
                     found = true
-                    if e.fp.kind != FAST_NONE && len(e.fp.tables) == nFrom && (!e.fp.isAgg || qHasAgg) {
+                    if e.fp.kind != FAST_NONE && len(e.fp.tables) <= nFrom && (!e.fp.isAgg || qHasAgg) {
                         possible = true
                     }
                     break
@@ -611,7 +611,7 @@ fn markShapeCompatible(mk: &str, nFrom: int, qHasAgg: bool): bool {
     planCache().with(fn(pc: mut &PlanCacheStore) {
         for e in pc.entries {
             if e.mvCatKey == mk {
-                ok = e.fp.kind != FAST_NONE && len(e.fp.tables) == nFrom && (!e.fp.isAgg || qHasAgg)
+                ok = e.fp.kind != FAST_NONE && len(e.fp.tables) <= nFrom && (!e.fp.isAgg || qHasAgg)
                 break
             }
         }
@@ -2362,8 +2362,8 @@ fn mergeAggRow(fp: &FastPlan, mvTab: &Table, mv: &MvMeta, oldOpt: &Option[[]Val]
     return Ok(newRow)
 }
 
-// ON QUERY COMPUTATION merge-on-read: returns all visible rows of MV key, merging mv.tree with any
-// unfolded entries in mv.deltaTree inside txn's MVCC snapshot (works in read-only txns & replicas!).
+// ON QUERY COMPUTATION merge-on-read: returns all rows of MV key (including hidden state columns for
+// query rewrite; SELECT * hides them via hiddenName), merging mv.tree with unfolded entries in mv.deltaTree.
 pub fn readMergedRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str, up: &Up): Result[[][]Val, DbErr] {
     let mv = match try readMeta(st, txn, key) {
         Some(m) { m }
@@ -2372,15 +2372,6 @@ pub fn readMergedRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &s
     let mvTab = match try (up.loadTable)(st, txn, key) {
         Some(t) { t }
         None { return Ok([]) }
-    }
-    var visCols: []int = []
-    for ci in 0..len(mvTab.cols) {
-        if !lexdb_catalog.hiddenName(&mvTab.cols[ci].name) { append(mut &visCols, ci) }
-    }
-    let project = fn(row: &[]Val): []Val {
-        var v: []Val = withCapacity(len(visCols))
-        for ci in visCols { append(mut &v, row[ci].clone()) }
-        return v
     }
 
     // Collect pending delta entries from deltaTree in txn's snapshot.
@@ -2394,9 +2385,7 @@ pub fn readMergedRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &s
 
     let baseRows = try scanAllRows(st, txn, &mvTab)
     if len(rawVals) == 0 {
-        var out: [][]Val = withCapacity(len(baseRows))
-        for r in baseRows { append(mut &out, project(&r)) }
-        return Ok(out)
+        return Ok(baseRows)
     }
 
     var deltas: []PendingDelta = withCapacity(len(rawVals))
@@ -2404,9 +2393,7 @@ pub fn readMergedRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &s
 
     let fp = try getCachedPlan(st, txn, &mv, &mvTab, up)
     if fp.kind == FAST_NONE {
-        var out: [][]Val = withCapacity(len(baseRows))
-        for r in baseRows { append(mut &out, project(&r)) }
-        return Ok(out)
+        return Ok(baseRows)
     }
 
     var rows = baseRows
@@ -2499,7 +2486,7 @@ pub fn readMergedRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &s
 
     var out: [][]Val = []
     for i in 0..len(rows) {
-        if alive[i] { append(mut &out, project(&rows[i])) }
+        if alive[i] { append(mut &out, rows[i].clone()) }
     }
     return Ok(out)
 }
@@ -3460,7 +3447,10 @@ fn hasPendingForMv(sess: int, mvKeyStr: &str): bool {
 }
 
 // Remaps slotted column indices from query's table order to MV's canonical table order.
-fn remapSlots(x: &Expr, qOffsets: &[]int, qTables: &[]Table, tabPerm: &[]int, mvOffsets: &[]int, mvAllCols: &[]lexdb_sql.ColDef): Expr {
+// Columns from extra join-back tables (tabPerm[qi] < 0) are placed at slot >= len(mvAllCols).
+fn remapSlots(x: &Expr, qOffsets: &[]int, qTables: &[]Table, tabPerm: &[]int, mvOffsets: &[]int,
+              mvAllCols: &[]lexdb_sql.ColDef, qAllCols: &[]lexdb_sql.ColDef): Expr {
+    let extraBase = len(mvAllCols)
     match x {
         Expr.Col(nm, s) {
             if s >= 0 {
@@ -3469,8 +3459,11 @@ fn remapSlots(x: &Expr, qOffsets: &[]int, qTables: &[]Table, tabPerm: &[]int, mv
                     let end = off + len(qTables[qi].cols)
                     if s >= off && s < end {
                         let mi = tabPerm[qi]
-                        let ns = mvOffsets[mi] + (s - off)
-                        return Expr.Col(mvAllCols[ns].name.clone(), ns)
+                        if mi >= 0 {
+                            let ns = mvOffsets[mi] + (s - off)
+                            return Expr.Col(mvAllCols[ns].name.clone(), ns)
+                        }
+                        return Expr.Col(qAllCols[s].name.clone(), extraBase + s)
                     }
                 }
             }
@@ -3478,16 +3471,16 @@ fn remapSlots(x: &Expr, qOffsets: &[]int, qTables: &[]Table, tabPerm: &[]int, mv
         }
         Expr.Lit(v) { return Expr.Lit(v.clone()) }
         Expr.Param(i) { return Expr.Param(i) }
-        Expr.Unary(op, a) { return Expr.Unary(op.clone(), remapSlots(&a, qOffsets, qTables, tabPerm, mvOffsets, mvAllCols)) }
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), remapSlots(&a, qOffsets, qTables, tabPerm, mvOffsets, mvAllCols, qAllCols)) }
         Expr.Bin(op, a, b) {
-            return Expr.Bin(op.clone(), remapSlots(&a, qOffsets, qTables, tabPerm, mvOffsets, mvAllCols),
-                            remapSlots(&b, qOffsets, qTables, tabPerm, mvOffsets, mvAllCols))
+            return Expr.Bin(op.clone(), remapSlots(&a, qOffsets, qTables, tabPerm, mvOffsets, mvAllCols, qAllCols),
+                            remapSlots(&b, qOffsets, qTables, tabPerm, mvOffsets, mvAllCols, qAllCols))
         }
-        Expr.IsNull(a, not) { return Expr.IsNull(remapSlots(&a, qOffsets, qTables, tabPerm, mvOffsets, mvAllCols), not) }
-        Expr.Cast(a, t) { return Expr.Cast(remapSlots(&a, qOffsets, qTables, tabPerm, mvOffsets, mvAllCols), t.clone()) }
+        Expr.IsNull(a, not) { return Expr.IsNull(remapSlots(&a, qOffsets, qTables, tabPerm, mvOffsets, mvAllCols, qAllCols), not) }
+        Expr.Cast(a, t) { return Expr.Cast(remapSlots(&a, qOffsets, qTables, tabPerm, mvOffsets, mvAllCols, qAllCols), t.clone()) }
         Expr.Call(n, args, star) {
             var out: []Expr = []
-            for a in args { append(mut &out, remapSlots(&a, qOffsets, qTables, tabPerm, mvOffsets, mvAllCols)) }
+            for a in args { append(mut &out, remapSlots(&a, qOffsets, qTables, tabPerm, mvOffsets, mvAllCols, qAllCols)) }
             return Expr.Call(n.clone(), out, star)
         }
     }
@@ -3564,36 +3557,284 @@ fn joinAnd(xs: &[]Expr): Option[Expr] {
     return Some(cur)
 }
 
-// Translates a non-aggregate canonical expression into an expression over MV's visible non-agg columns.
-fn translateNonAgg(x: &Expr, fp: &FastPlan, mvTab: &Table): Option[Expr] {
+// ---- Predicate implication / range subsumption (for WHERE subsumption in query rewrite)
+
+type CmpAtom = record {
+    lhs: Expr
+    op: str
+    lit: Val
+}
+
+fn extractLitVal(x: &Expr, z: &lexdb_time.Zone): Option[Val] {
+    match x {
+        Expr.Lit(v) {
+            if lexdb_ops.isNull(&v) { return None }
+            return Some(v.clone())
+        }
+        Expr.Unary(op, a) {
+            if op == "-" {
+                match extractLitVal(&a, z) {
+                    Some(v) {
+                        match lexdb_ops.arith(lexdb_ops.OP_SUB, &Val.Int(0), &v) {
+                            Ok(nv) { return Some(nv) }
+                            Err(_) { return None }
+                        }
+                    }
+                    None { return None }
+                }
+            }
+            return None
+        }
+        Expr.Cast(a, t) {
+            match extractLitVal(&a, z) {
+                Some(v) {
+                    match lexdb_ops.coerceZ(v, &t, z) {
+                        Ok(cv) { return Some(cv) }
+                        Err(_) { return None }
+                    }
+                }
+                None { return None }
+            }
+        }
+        else { return None }
+    }
+}
+
+fn flipCmpOp(op: &str): str {
+    if op == "<" { return ">" }
+    if op == "<=" { return ">=" }
+    if op == ">" { return "<" }
+    if op == ">=" { return "<=" }
+    return op.toStr()
+}
+
+fn isCmpOp(op: &str): bool {
+    return op == "=" || op == "<>" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">="
+}
+
+fn normCmpOp(op: &str): str {
+    return if op == "!=" { "<>" } else { op.toStr() }
+}
+
+fn extractCmp(x: &Expr, z: &lexdb_time.Zone): Option[CmpAtom] {
+    match x {
+        Expr.Bin(op, a, b) {
+            if !isCmpOp(&op) { return None }
+            let nop = normCmpOp(&op)
+            match extractLitVal(&b, z) {
+                Some(lv) { return Some(CmpAtom{lhs: lexdb_sql.cloneExpr(&a), op: nop, lit: lv}) }
+                None {}
+            }
+            match extractLitVal(&a, z) {
+                Some(lv) { return Some(CmpAtom{lhs: lexdb_sql.cloneExpr(&b), op: flipCmpOp(&nop), lit: lv}) }
+                None {}
+            }
+            return None
+        }
+        else { return None }
+    }
+}
+
+// Coerces literal v to lhs's column type when lhs is an MV column (returns None on custom collations or type errors).
+fn coerceForLhs(v: Val, lhs: &Expr, mvAllCols: &[]lexdb_sql.ColDef, z: &lexdb_time.Zone): Option[Val] {
+    match lhs {
+        Expr.Col(_, slot) {
+            if slot >= 0 && slot < len(mvAllCols) {
+                let col = &mvAllCols[slot]
+                if col.typ.kind == lexdb_sql.K_TEXT && len(col.coll) > 0 { return None }
+                match lexdb_ops.coerceZ(v, &col.typ, z) {
+                    Ok(cv) { return Some(cv) }
+                    Err(_) { return None }
+                }
+            }
+            return None
+        }
+        else { return Some(v) }
+    }
+}
+
+// Returns true when (x opQ litQ) logically implies (x opM litM), given c = compare(litQ, litM).
+fn cmpImplies(opQ: &str, c: int, opM: &str): bool {
+    if opM == ">" { return (opQ == "=" && c > 0) || (opQ == ">" && c >= 0) || (opQ == ">=" && c > 0) }
+    if opM == ">=" { return (opQ == "=" && c >= 0) || (opQ == ">" && c >= 0) || (opQ == ">=" && c >= 0) }
+    if opM == "<" { return (opQ == "=" && c < 0) || (opQ == "<" && c <= 0) || (opQ == "<=" && c < 0) }
+    if opM == "<=" { return (opQ == "=" && c <= 0) || (opQ == "<" && c <= 0) || (opQ == "<=" && c <= 0) }
+    if opM == "<>" {
+        return (opQ == "=" && c != 0) || (opQ == ">" && c >= 0) || (opQ == ">=" && c > 0) ||
+               (opQ == "<" && c <= 0) || (opQ == "<=" && c < 0)
+    }
+    if opM == "=" { return opQ == "=" && c == 0 }
+    return false
+}
+
+// Sound 3-valued-SQL implication check: returns true only when qp == TRUE guarantees mp == TRUE.
+fn predImplies(qp: &Expr, mp: &Expr, mvAllCols: &[]lexdb_sql.ColDef, z: &lexdb_time.Zone): bool {
+    // 1. mp is (lhs IS NOT NULL): implied by any strict comparison or IN(...) on the same lhs.
+    match mp {
+        Expr.IsNull(mlhs, notNull) {
+            if !notNull { return false }
+            match extractCmp(qp, z) {
+                Some(cq) { if exprEq(&cq.lhs, &mlhs) { return true } }
+                None {}
+            }
+            match qp {
+                Expr.Call(qn, qargs, _) {
+                    if qn == "in" && len(qargs) >= 2 && exprEq(&qargs[0], &mlhs) { return true }
+                }
+                else {}
+            }
+            return false
+        }
+        else {}
+    }
+
+    // 2. mp is (lhs opM litM): check range/eq/neq implication from cmp or IN-list on same lhs.
+    match extractCmp(mp, z) {
+        Some(cm) {
+            let mv = match coerceForLhs(cm.lit.clone(), &cm.lhs, mvAllCols, z) {
+                Some(v) { v }
+                None { return false }
+            }
+            match extractCmp(qp, z) {
+                Some(cq) {
+                    if !exprEq(&cq.lhs, &cm.lhs) { return false }
+                    let qv = match coerceForLhs(cq.lit.clone(), &cm.lhs, mvAllCols, z) {
+                        Some(v) { v }
+                        None { return false }
+                    }
+                    match lexdb_ops.compare(&qv, &mv) {
+                        Ok(c) { return cmpImplies(&cq.op, c, &cm.op) }
+                        Err(_) { return false }
+                    }
+                }
+                None {}
+            }
+            match qp {
+                Expr.Call(qn, qargs, _) {
+                    if qn == "in" && len(qargs) >= 2 && exprEq(&qargs[0], &cm.lhs) {
+                        var anyNonNull = false
+                        for i in 1..len(qargs) {
+                            match &qargs[i] {
+                                Expr.Lit(lv) { if lexdb_ops.isNull(lv) { continue } }
+                                else {}
+                            }
+                            let qraw = match extractLitVal(&qargs[i], z) { Some(v) { v } None { return false } }
+                            let qv = match coerceForLhs(qraw, &cm.lhs, mvAllCols, z) { Some(v) { v } None { return false } }
+                            match lexdb_ops.compare(&qv, &mv) {
+                                Ok(c) { if !cmpImplies(&"=", c, &cm.op) { return false } }
+                                Err(_) { return false }
+                            }
+                            anyNonNull = true
+                        }
+                        return anyNonNull
+                    }
+                }
+                else {}
+            }
+            return false
+        }
+        None {}
+    }
+
+    // 3. mp is (lhs IN (m1, m2, ...)): implied by (lhs = v) or (lhs IN (subset)) with literal values.
+    match mp {
+        Expr.Call(mn, margs, _) {
+            if mn != "in" || len(margs) < 2 { return false }
+            let mlhs = &margs[0]
+            var mLits: []Val = []
+            for i in 1..len(margs) {
+                match &margs[i] {
+                    Expr.Lit(lv) { if lexdb_ops.isNull(lv) { continue } }
+                    else {}
+                }
+                let mraw = match extractLitVal(&margs[i], z) { Some(v) { v } None { return false } }
+                let mv = match coerceForLhs(mraw, mlhs, mvAllCols, z) { Some(v) { v } None { return false } }
+                append(mut &mLits, mv)
+            }
+            if len(mLits) == 0 { return false }
+            let inList = fn(qv: &Val): bool {
+                for mv in mLits {
+                    match lexdb_ops.compare(qv, &mv) {
+                        Ok(c) { if c == 0 { return true } }
+                        Err(_) {}
+                    }
+                }
+                return false
+            }
+            match extractCmp(qp, z) {
+                Some(cq) {
+                    if cq.op != "=" || !exprEq(&cq.lhs, mlhs) { return false }
+                    let qv = match coerceForLhs(cq.lit.clone(), mlhs, mvAllCols, z) { Some(v) { v } None { return false } }
+                    return inList(&qv)
+                }
+                None {}
+            }
+            match qp {
+                Expr.Call(qn, qargs, _) {
+                    if qn == "in" && len(qargs) >= 2 && exprEq(&qargs[0], mlhs) {
+                        var anyNonNull = false
+                        for i in 1..len(qargs) {
+                            match &qargs[i] {
+                                Expr.Lit(lv) { if lexdb_ops.isNull(lv) { continue } }
+                                else {}
+                            }
+                            let qraw = match extractLitVal(&qargs[i], z) { Some(v) { v } None { return false } }
+                            let qv = match coerceForLhs(qraw, mlhs, mvAllCols, z) { Some(v) { v } None { return false } }
+                            if !inList(&qv) { return false }
+                            anyNonNull = true
+                        }
+                        return anyNonNull
+                    }
+                }
+                else {}
+            }
+            return false
+        }
+        else {}
+    }
+    return false
+}
+
+fn mvColExpr(mvAlias: &str, mvTab: &Table, colIdx: int): Expr {
+    return Expr.Col(mvAlias + "." + mvTab.cols[colIdx].name, -1)
+}
+
+// Translates a non-aggregate canonical expression into an expression over MV's visible non-agg columns
+// and any extra join-back table columns (slot >= extraBase).
+fn translateNonAgg(x: &Expr, fp: &FastPlan, mvTab: &Table, mvAlias: &str, extraBase: int, qAllCols: &[]lexdb_sql.ColDef): Option[Expr] {
     for it in fp.items {
         if it.aggKind == AGG_NONE && exprEq(x, &it.expr) {
-            return Some(Expr.Col(mvTab.cols[it.visCol].name.clone(), -1))
+            return Some(mvColExpr(mvAlias, mvTab, it.visCol))
         }
     }
     match x {
         Expr.Lit(v) { return Some(Expr.Lit(v.clone())) }
         Expr.Param(i) { return Some(Expr.Param(i)) }
-        Expr.Col(_, _) { return None }
+        Expr.Col(_, s) {
+            if s >= extraBase && (s - extraBase) < len(qAllCols) {
+                return Some(Expr.Col(qAllCols[s - extraBase].name.clone(), -1))
+            }
+            return None
+        }
         Expr.Unary(op, a) {
-            match translateNonAgg(&a, fp, mvTab) {
+            match translateNonAgg(&a, fp, mvTab, mvAlias, extraBase, qAllCols) {
                 Some(ta) { return Some(Expr.Unary(op.clone(), ta)) }
                 None { return None }
             }
         }
         Expr.Bin(op, a, b) {
-            let ta = match translateNonAgg(&a, fp, mvTab) { Some(v) { v } None { return None } }
-            let tb = match translateNonAgg(&b, fp, mvTab) { Some(v) { v } None { return None } }
+            let ta = match translateNonAgg(&a, fp, mvTab, mvAlias, extraBase, qAllCols) { Some(v) { v } None { return None } }
+            let tb = match translateNonAgg(&b, fp, mvTab, mvAlias, extraBase, qAllCols) { Some(v) { v } None { return None } }
             return Some(Expr.Bin(op.clone(), ta, tb))
         }
         Expr.IsNull(a, not) {
-            match translateNonAgg(&a, fp, mvTab) {
+            match translateNonAgg(&a, fp, mvTab, mvAlias, extraBase, qAllCols) {
                 Some(ta) { return Some(Expr.IsNull(ta, not)) }
                 None { return None }
             }
         }
         Expr.Cast(a, t) {
-            match translateNonAgg(&a, fp, mvTab) {
+            match translateNonAgg(&a, fp, mvTab, mvAlias, extraBase, qAllCols) {
                 Some(ta) { return Some(Expr.Cast(ta, t.clone())) }
                 None { return None }
             }
@@ -3602,7 +3843,7 @@ fn translateNonAgg(x: &Expr, fp: &FastPlan, mvTab: &Table): Option[Expr] {
             if lexdb_sql.isAgg(&n) { return None }
             var out: []Expr = []
             for a in args {
-                match translateNonAgg(&a, fp, mvTab) {
+                match translateNonAgg(&a, fp, mvTab, mvAlias, extraBase, qAllCols) {
                     Some(ta) { append(mut &out, ta) }
                     None { return None }
                 }
@@ -3612,73 +3853,136 @@ fn translateNonAgg(x: &Expr, fp: &FastPlan, mvTab: &Table): Option[Expr] {
     }
 }
 
-// Finds an MV item matching aggregate (kind, arg, filter) and returns its visible column name.
-fn findMvAggCol(fp: &FastPlan, mvTab: &Table, kind: int, arg: &Expr, flt: &Option[Expr], pctFrac: float, pctDesc: bool): Option[str] {
+// Finds an MV item matching aggregate (kind, arg, filter) and returns its backing column index (-1 if none).
+fn findMvAggColIdx(fp: &FastPlan, kind: int, arg: &Expr, flt: &Option[Expr], pctFrac: float, pctDesc: bool): int {
     for it in fp.items {
         if it.aggKind != kind { continue }
         if !optExprEq(&it.filter, flt) { continue }
         if kind != AGG_COUNT_STAR && !exprEq(&it.expr, arg) { continue }
         if kind == AGG_TDIGEST && (it.pctFrac != pctFrac || it.pctDesc != pctDesc) { continue }
-        return Some(mvTab.cols[it.visCol].name.clone())
+        return it.visCol
     }
-    return None
+    return -1
 }
 
-fn findMvSketchCol(fp: &FastPlan, mvTab: &Table, isHll: bool, arg: &Expr, flt: &Option[Expr]): Option[str] {
+// Finds a column holding COUNT(*) or COUNT(arg) — prefers visible col, falls back to hidden __mv_cnt / __mv_nn.
+fn findMvCountColIdx(fp: &FastPlan, kind: int, arg: &Expr, flt: &Option[Expr]): int {
+    let vis = findMvAggColIdx(fp, kind, arg, flt, 0.0f, false)
+    if vis >= 0 { return vis }
+    if kind == AGG_COUNT_STAR && flt.isNone() && fp.cntCol >= 0 { return fp.cntCol }
+    if kind == AGG_COUNT_EXPR {
+        for it in fp.items {
+            if it.nnCol >= 0 && optExprEq(&it.filter, flt) && exprEq(&it.expr, arg) { return it.nnCol }
+        }
+    }
+    return -1
+}
+
+type SumNnPair = record {
+    ok: bool
+    sumIdx: int
+    nnIdx: int
+}
+
+// Finds (sum, non-null count) backing column indices for AVG — prefers visible SUM+COUNT, falls back to hidden AVG/VAR state.
+fn findMvSumNnCols(fp: &FastPlan, arg: &Expr, flt: &Option[Expr]): SumNnPair {
+    let sc = findMvAggColIdx(fp, AGG_SUM, arg, flt, 0.0f, false)
+    let cc = findMvCountColIdx(fp, AGG_COUNT_EXPR, arg, flt)
+    if sc >= 0 && cc >= 0 { return SumNnPair{ok: true, sumIdx: sc, nnIdx: cc} }
+    for it in fp.items {
+        if (it.aggKind == AGG_AVG || isVarAgg(it.aggKind)) && it.sumCol >= 0 && it.nnCol >= 0 &&
+           optExprEq(&it.filter, flt) && exprEq(&it.expr, arg) {
+            return SumNnPair{ok: true, sumIdx: it.sumCol, nnIdx: it.nnCol}
+        }
+    }
+    return SumNnPair{ok: false, sumIdx: -1, nnIdx: -1}
+}
+
+// Finds any VAR_*/STDDEV_* item for (arg, filter) that carries hidden (nn, sum, sumsq) state.
+fn findMvVarItem(fp: &FastPlan, arg: &Expr, flt: &Option[Expr]): int {
+    for i in 0..len(fp.items) {
+        let it = &fp.items[i]
+        if isVarAgg(it.aggKind) && it.nnCol >= 0 && it.sumCol >= 0 && it.sumSqCol >= 0 &&
+           optExprEq(&it.filter, flt) && exprEq(&it.expr, arg) {
+            return i
+        }
+    }
+    return -1
+}
+
+// Finds a column holding a serialized HLL++ or t-digest sketch — prefers visible _DETAIL/_AGG, falls back to hidden __mv_sk.
+fn findMvSketchColIdx(fp: &FastPlan, isHll: bool, arg: &Expr, flt: &Option[Expr]): int {
     for it in fp.items {
         let matchKind = if isHll { it.aggKind == AGG_HLL_DETAIL || it.aggKind == AGG_HLL_AGG }
                         else { it.aggKind == AGG_TDIGEST_DETAIL || it.aggKind == AGG_TDIGEST_AGG }
         if matchKind && optExprEq(&it.filter, flt) && exprEq(&it.expr, arg) {
-            return Some(mvTab.cols[it.visCol].name.clone())
+            return it.visCol
         }
     }
-    return None
+    for it in fp.items {
+        let matchKind = if isHll { it.aggKind == AGG_HLL } else { it.aggKind == AGG_TDIGEST }
+        if matchKind && it.sketchCol >= 0 && optExprEq(&it.filter, flt) && exprEq(&it.expr, arg) {
+            return it.sketchCol
+        }
+    }
+    return -1
+}
+
+fn avgDivType(mvTab: &Table, sumColIdx: int): lexdb_sql.TypeName {
+    if mvTab.cols[sumColIdx].typ.kind == lexdb_sql.K_FLOAT {
+        return lexdb_sql.floatType(lexdb_sql.OID_FLOAT8)
+    }
+    return lexdb_sql.TypeName{kind: lexdb_sql.K_NUM, oid: lexdb_sql.OID_NUMERIC, prec: 0, scale: 0, len: 0}
 }
 
 // Translates a canonical expression (possibly containing aggregates) against an aggregate MV:
 // - exactGroup == true: direct lookup of MV agg columns (no re-aggregation needed!)
 // - exactGroup == false: algebraic rollup re-aggregation over MV columns!
-fn translateAggExpr(x: &Expr, fp: &FastPlan, mvTab: &Table, exactGroup: bool, globalRollup: bool): Option[Expr] {
+fn translateAggExpr(x: &Expr, fp: &FastPlan, mvTab: &Table, mvAlias: &str, extraBase: int,
+                    qAllCols: &[]lexdb_sql.ColDef, exactGroup: bool, globalRollup: bool): Option[Expr] {
     let ar = parseFastAgg(x)
     if ar.wasAgg {
         if ar.kind == AGG_NONE { return None }
         if exactGroup {
-            match findMvAggCol(fp, mvTab, ar.kind, &ar.arg, &ar.flt, ar.pctFrac, ar.pctDesc) {
-                Some(cn) { return Some(Expr.Col(cn, -1)) }
-                None {}
+            let vis = findMvAggColIdx(fp, ar.kind, &ar.arg, &ar.flt, ar.pctFrac, ar.pctDesc)
+            if vis >= 0 { return Some(mvColExpr(mvAlias, mvTab, vis)) }
+            // Exact group: COUNT(*) / COUNT(x) from hidden __mv_cnt / __mv_nn!
+            if ar.kind == AGG_COUNT_STAR || ar.kind == AGG_COUNT_EXPR {
+                let ci = findMvCountColIdx(fp, ar.kind, &ar.arg, &ar.flt)
+                if ci >= 0 { return Some(mvColExpr(mvAlias, mvTab, ci)) }
             }
-            // Exact group: AVG(x) can be computed from stored SUM(x) and COUNT(x) columns!
+            // Exact group: AVG(x) from stored SUM(x) and COUNT(x) (or hidden AVG/VAR state)!
             if ar.kind == AGG_AVG {
-                let sCol = findMvAggCol(fp, mvTab, AGG_SUM, &ar.arg, &ar.flt, 0.0f, false)
-                let cCol = findMvAggCol(fp, mvTab, AGG_COUNT_EXPR, &ar.arg, &ar.flt, 0.0f, false)
-                match sCol {
-                    Some(sc) {
-                        match cCol {
-                            Some(cc) {
-                                let numT = lexdb_sql.TypeName{kind: lexdb_sql.K_NUM, oid: lexdb_sql.OID_NUMERIC, prec: 0, scale: 0, len: 0}
-                                let den = Expr.Call("nullif", [Expr.Col(cc, -1), Expr.Lit(Val.Int(0))], false)
-                                return Some(Expr.Bin("/", Expr.Cast(Expr.Col(sc, -1), numT.clone()), Expr.Cast(den, numT)))
-                            }
-                            None {}
-                        }
-                    }
-                    None {}
+                let sn = findMvSumNnCols(fp, &ar.arg, &ar.flt)
+                if sn.ok {
+                    let divT = avgDivType(mvTab, sn.sumIdx)
+                    let den = Expr.Call("nullif", [mvColExpr(mvAlias, mvTab, sn.nnIdx), Expr.Lit(Val.Int(0))], false)
+                    return Some(Expr.Bin("/", Expr.Cast(mvColExpr(mvAlias, mvTab, sn.sumIdx), divT.clone()), Expr.Cast(den, divT)))
                 }
             }
-            // Exact group: can also finalize a stored _DETAIL sketch column!
+            // Exact group: cross-stat VAR_*/STDDEV_* from hidden (nn, sum, sumsq) state!
+            if isVarAgg(ar.kind) {
+                let vi = findMvVarItem(fp, &ar.arg, &ar.flt)
+                if vi >= 0 {
+                    let it = &fp.items[vi]
+                    return Some(Expr.Call("#mv_var", [Expr.Lit(Val.Text(varFname(ar.kind))),
+                                                      mvColExpr(mvAlias, mvTab, it.nnCol),
+                                                      mvColExpr(mvAlias, mvTab, it.sumCol),
+                                                      mvColExpr(mvAlias, mvTab, it.sumSqCol)], false))
+                }
+            }
+            // Exact group: finalize a stored _DETAIL (or hidden) sketch column!
             if ar.kind == AGG_HLL {
-                match findMvSketchCol(fp, mvTab, true, &ar.arg, &ar.flt) {
-                    Some(cn) { return Some(Expr.Call("coalesce", [Expr.Call("to_approx_count_distinct", [Expr.Col(cn, -1)], false), Expr.Lit(Val.Int(0))], false)) }
-                    None {}
+                let si = findMvSketchColIdx(fp, true, &ar.arg, &ar.flt)
+                if si >= 0 {
+                    return Some(Expr.Call("coalesce", [Expr.Call("to_approx_count_distinct", [mvColExpr(mvAlias, mvTab, si)], false), Expr.Lit(Val.Int(0))], false))
                 }
             }
             if ar.kind == AGG_TDIGEST {
-                match findMvSketchCol(fp, mvTab, false, &ar.arg, &ar.flt) {
-                    Some(cn) {
-                        let p = if ar.pctDesc { 1.0f - ar.pctFrac } else { ar.pctFrac }
-                        return Some(Expr.Call("to_approx_percentile", [Expr.Col(cn, -1), Expr.Lit(Val.Float(p))], false))
-                    }
-                    None {}
+                let si = findMvSketchColIdx(fp, false, &ar.arg, &ar.flt)
+                if si >= 0 {
+                    let p = if ar.pctDesc { 1.0f - ar.pctFrac } else { ar.pctFrac }
+                    return Some(Expr.Call("to_approx_percentile", [mvColExpr(mvAlias, mvTab, si), Expr.Lit(Val.Float(p))], false))
                 }
             }
             return None
@@ -3686,112 +3990,107 @@ fn translateAggExpr(x: &Expr, fp: &FastPlan, mvTab: &Table, exactGroup: bool, gl
         // Rollup re-aggregation over finer-grain MV!
         let int8T = lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT8, prec: 0, scale: 0, len: 0}
         if ar.kind == AGG_COUNT_STAR || ar.kind == AGG_COUNT_EXPR {
-            match findMvAggCol(fp, mvTab, ar.kind, &ar.arg, &ar.flt, 0.0f, false) {
-                Some(cn) {
-                    let s = Expr.Call("sum", [Expr.Col(cn, -1)], false)
-                    let base = if globalRollup { Expr.Call("coalesce", [s, Expr.Lit(Val.Int(0))], false) } else { s }
-                    return Some(Expr.Cast(base, int8T))
-                }
-                None { return None }
+            let ci = findMvCountColIdx(fp, ar.kind, &ar.arg, &ar.flt)
+            if ci >= 0 {
+                let s = Expr.Call("sum", [mvColExpr(mvAlias, mvTab, ci)], false)
+                let base = if globalRollup { Expr.Call("coalesce", [s, Expr.Lit(Val.Int(0))], false) } else { s }
+                return Some(Expr.Cast(base, int8T))
             }
+            return None
         }
         if ar.kind == AGG_SUM {
-            match findMvAggCol(fp, mvTab, AGG_SUM, &ar.arg, &ar.flt, 0.0f, false) {
-                Some(cn) { return Some(Expr.Call("sum", [Expr.Col(cn, -1)], false)) }
-                None { return None }
-            }
+            let ci = findMvAggColIdx(fp, AGG_SUM, &ar.arg, &ar.flt, 0.0f, false)
+            if ci >= 0 { return Some(Expr.Call("sum", [mvColExpr(mvAlias, mvTab, ci)], false)) }
+            return None
         }
         if ar.kind == AGG_MIN || ar.kind == AGG_MAX {
-            match findMvAggCol(fp, mvTab, ar.kind, &ar.arg, &ar.flt, 0.0f, false) {
-                Some(cn) { return Some(Expr.Call(if ar.kind == AGG_MIN { "min" } else { "max" }, [Expr.Col(cn, -1)], false)) }
-                None { return None }
-            }
+            let ci = findMvAggColIdx(fp, ar.kind, &ar.arg, &ar.flt, 0.0f, false)
+            if ci >= 0 { return Some(Expr.Call(if ar.kind == AGG_MIN { "min" } else { "max" }, [mvColExpr(mvAlias, mvTab, ci)], false)) }
+            return None
         }
         if ar.kind == AGG_BOOL_AND || ar.kind == AGG_BOOL_OR {
-            match findMvAggCol(fp, mvTab, ar.kind, &ar.arg, &ar.flt, 0.0f, false) {
-                Some(cn) { return Some(Expr.Call(if ar.kind == AGG_BOOL_AND { "bool_and" } else { "bool_or" }, [Expr.Col(cn, -1)], false)) }
-                None { return None }
-            }
+            let ci = findMvAggColIdx(fp, ar.kind, &ar.arg, &ar.flt, 0.0f, false)
+            if ci >= 0 { return Some(Expr.Call(if ar.kind == AGG_BOOL_AND { "bool_and" } else { "bool_or" }, [mvColExpr(mvAlias, mvTab, ci)], false)) }
+            return None
         }
         if ar.kind == AGG_BIT_XOR {
-            match findMvAggCol(fp, mvTab, AGG_BIT_XOR, &ar.arg, &ar.flt, 0.0f, false) {
-                Some(cn) { return Some(Expr.Call(if ar.oraDia { "bit_xor dia:o" } else { "bit_xor" }, [Expr.Col(cn, -1)], false)) }
-                None { return None }
-            }
+            let ci = findMvAggColIdx(fp, AGG_BIT_XOR, &ar.arg, &ar.flt, 0.0f, false)
+            if ci >= 0 { return Some(Expr.Call(if ar.oraDia { "bit_xor dia:o" } else { "bit_xor" }, [mvColExpr(mvAlias, mvTab, ci)], false)) }
+            return None
         }
         if ar.kind == AGG_AVG {
-            let sCol = findMvAggCol(fp, mvTab, AGG_SUM, &ar.arg, &ar.flt, 0.0f, false)
-            let cCol = findMvAggCol(fp, mvTab, AGG_COUNT_EXPR, &ar.arg, &ar.flt, 0.0f, false)
-            match sCol {
-                Some(sc) {
-                    match cCol {
-                        Some(cc) {
-                            let numT = lexdb_sql.TypeName{kind: lexdb_sql.K_NUM, oid: lexdb_sql.OID_NUMERIC, prec: 0, scale: 0, len: 0}
-                            return Some(Expr.Bin("/", Expr.Cast(Expr.Call("sum", [Expr.Col(sc, -1)], false), numT.clone()),
-                                                 Expr.Cast(Expr.Call("sum", [Expr.Col(cc, -1)], false), numT)))
-                        }
-                        None { return None }
-                    }
-                }
-                None { return None }
+            let sn = findMvSumNnCols(fp, &ar.arg, &ar.flt)
+            if sn.ok {
+                let divT = avgDivType(mvTab, sn.sumIdx)
+                let num = Expr.Call("sum", [mvColExpr(mvAlias, mvTab, sn.sumIdx)], false)
+                let den = Expr.Call("nullif", [Expr.Call("sum", [mvColExpr(mvAlias, mvTab, sn.nnIdx)], false), Expr.Lit(Val.Int(0))], false)
+                return Some(Expr.Bin("/", Expr.Cast(num, divT.clone()), Expr.Cast(den, divT)))
             }
+            return None
+        }
+        if isVarAgg(ar.kind) {
+            let vi = findMvVarItem(fp, &ar.arg, &ar.flt)
+            if vi >= 0 {
+                let it = &fp.items[vi]
+                return Some(Expr.Call("#mv_var", [Expr.Lit(Val.Text(varFname(ar.kind))),
+                                                  Expr.Call("sum", [mvColExpr(mvAlias, mvTab, it.nnCol)], false),
+                                                  Expr.Call("sum", [mvColExpr(mvAlias, mvTab, it.sumCol)], false),
+                                                  Expr.Call("sum", [mvColExpr(mvAlias, mvTab, it.sumSqCol)], false)], false))
+            }
+            return None
         }
         if ar.kind == AGG_HLL {
-            match findMvSketchCol(fp, mvTab, true, &ar.arg, &ar.flt) {
-                Some(cn) {
-                    let agg = Expr.Call("approx_count_distinct_agg", [Expr.Col(cn, -1)], false)
-                    let fin = Expr.Call("to_approx_count_distinct", [agg], false)
-                    return Some(if globalRollup { Expr.Call("coalesce", [fin, Expr.Lit(Val.Int(0))], false) } else { fin })
-                }
-                None { return None }
+            let si = findMvSketchColIdx(fp, true, &ar.arg, &ar.flt)
+            if si >= 0 {
+                let agg = Expr.Call("approx_count_distinct_agg", [mvColExpr(mvAlias, mvTab, si)], false)
+                let fin = Expr.Call("to_approx_count_distinct", [agg], false)
+                return Some(if globalRollup { Expr.Call("coalesce", [fin, Expr.Lit(Val.Int(0))], false) } else { fin })
             }
+            return None
         }
         if ar.kind == AGG_HLL_DETAIL || ar.kind == AGG_HLL_AGG {
-            match findMvSketchCol(fp, mvTab, true, &ar.arg, &ar.flt) {
-                Some(cn) { return Some(Expr.Call("approx_count_distinct_agg", [Expr.Col(cn, -1)], false)) }
-                None { return None }
-            }
+            let si = findMvSketchColIdx(fp, true, &ar.arg, &ar.flt)
+            if si >= 0 { return Some(Expr.Call("approx_count_distinct_agg", [mvColExpr(mvAlias, mvTab, si)], false)) }
+            return None
         }
         if ar.kind == AGG_TDIGEST {
-            match findMvSketchCol(fp, mvTab, false, &ar.arg, &ar.flt) {
-                Some(cn) {
-                    let p = if ar.pctDesc { 1.0f - ar.pctFrac } else { ar.pctFrac }
-                    let agg = Expr.Call("approx_percentile_agg", [Expr.Col(cn, -1)], false)
-                    return Some(Expr.Call("to_approx_percentile", [agg, Expr.Lit(Val.Float(p))], false))
-                }
-                None { return None }
+            let si = findMvSketchColIdx(fp, false, &ar.arg, &ar.flt)
+            if si >= 0 {
+                let p = if ar.pctDesc { 1.0f - ar.pctFrac } else { ar.pctFrac }
+                let agg = Expr.Call("approx_percentile_agg", [mvColExpr(mvAlias, mvTab, si)], false)
+                return Some(Expr.Call("to_approx_percentile", [agg, Expr.Lit(Val.Float(p))], false))
             }
+            return None
         }
         if ar.kind == AGG_TDIGEST_DETAIL || ar.kind == AGG_TDIGEST_AGG {
-            match findMvSketchCol(fp, mvTab, false, &ar.arg, &ar.flt) {
-                Some(cn) { return Some(Expr.Call("approx_percentile_agg", [Expr.Col(cn, -1)], false)) }
-                None { return None }
-            }
+            let si = findMvSketchColIdx(fp, false, &ar.arg, &ar.flt)
+            if si >= 0 { return Some(Expr.Call("approx_percentile_agg", [mvColExpr(mvAlias, mvTab, si)], false)) }
+            return None
         }
         return None
     }
     // Non-aggregate subexpression (or compound expression wrapping aggregates like SUM(x) + 1)
-    if !lexdb_bind.hasAgg(x) { return translateNonAgg(x, fp, mvTab) }
+    if !lexdb_bind.hasAgg(x) { return translateNonAgg(x, fp, mvTab, mvAlias, extraBase, qAllCols) }
     match x {
         Expr.Unary(op, a) {
-            match translateAggExpr(&a, fp, mvTab, exactGroup, globalRollup) {
+            match translateAggExpr(&a, fp, mvTab, mvAlias, extraBase, qAllCols, exactGroup, globalRollup) {
                 Some(ta) { return Some(Expr.Unary(op.clone(), ta)) }
                 None { return None }
             }
         }
         Expr.Bin(op, a, b) {
-            let ta = match translateAggExpr(&a, fp, mvTab, exactGroup, globalRollup) { Some(v) { v } None { return None } }
-            let tb = match translateAggExpr(&b, fp, mvTab, exactGroup, globalRollup) { Some(v) { v } None { return None } }
+            let ta = match translateAggExpr(&a, fp, mvTab, mvAlias, extraBase, qAllCols, exactGroup, globalRollup) { Some(v) { v } None { return None } }
+            let tb = match translateAggExpr(&b, fp, mvTab, mvAlias, extraBase, qAllCols, exactGroup, globalRollup) { Some(v) { v } None { return None } }
             return Some(Expr.Bin(op.clone(), ta, tb))
         }
         Expr.IsNull(a, not) {
-            match translateAggExpr(&a, fp, mvTab, exactGroup, globalRollup) {
+            match translateAggExpr(&a, fp, mvTab, mvAlias, extraBase, qAllCols, exactGroup, globalRollup) {
                 Some(ta) { return Some(Expr.IsNull(ta, not)) }
                 None { return None }
             }
         }
         Expr.Cast(a, t) {
-            match translateAggExpr(&a, fp, mvTab, exactGroup, globalRollup) {
+            match translateAggExpr(&a, fp, mvTab, mvAlias, extraBase, qAllCols, exactGroup, globalRollup) {
                 Some(ta) { return Some(Expr.Cast(ta, t.clone())) }
                 None { return None }
             }
@@ -3799,7 +4098,7 @@ fn translateAggExpr(x: &Expr, fp: &FastPlan, mvTab: &Table, exactGroup: bool, gl
         Expr.Call(n, args, star) {
             var out: []Expr = []
             for a in args {
-                match translateAggExpr(&a, fp, mvTab, exactGroup, globalRollup) {
+                match translateAggExpr(&a, fp, mvTab, mvAlias, extraBase, qAllCols, exactGroup, globalRollup) {
                     Some(ta) { append(mut &out, ta) }
                     None { return None }
                 }
@@ -3822,14 +4121,14 @@ fn defaultItemAlias(x: &Expr): str {
     }
 }
 
-// Translates a non-agg expression into MV column refs while preserving aggregates inside a query over a non-agg MV.
-fn translateOverProj(x: &Expr, fp: &FastPlan, mvTab: &Table): Option[Expr] {
+// Translates a non-agg expression into MV + extra-table column refs while preserving aggregates over a non-agg MV.
+fn translateOverProj(x: &Expr, fp: &FastPlan, mvTab: &Table, mvAlias: &str, extraBase: int, qAllCols: &[]lexdb_sql.ColDef): Option[Expr] {
     match x {
         Expr.Call(n, args, star) {
             if lexdb_sql.isAgg(&n) {
                 var out: []Expr = []
                 for a in args {
-                    match translateOverProj(&a, fp, mvTab) {
+                    match translateOverProj(&a, fp, mvTab, mvAlias, extraBase, qAllCols) {
                         Some(ta) { append(mut &out, ta) }
                         None { return None }
                     }
@@ -3839,26 +4138,26 @@ fn translateOverProj(x: &Expr, fp: &FastPlan, mvTab: &Table): Option[Expr] {
         }
         else {}
     }
-    if !lexdb_bind.hasAgg(x) { return translateNonAgg(x, fp, mvTab) }
+    if !lexdb_bind.hasAgg(x) { return translateNonAgg(x, fp, mvTab, mvAlias, extraBase, qAllCols) }
     match x {
         Expr.Unary(op, a) {
-            match translateOverProj(&a, fp, mvTab) { Some(ta) { return Some(Expr.Unary(op.clone(), ta)) } None { return None } }
+            match translateOverProj(&a, fp, mvTab, mvAlias, extraBase, qAllCols) { Some(ta) { return Some(Expr.Unary(op.clone(), ta)) } None { return None } }
         }
         Expr.Bin(op, a, b) {
-            let ta = match translateOverProj(&a, fp, mvTab) { Some(v) { v } None { return None } }
-            let tb = match translateOverProj(&b, fp, mvTab) { Some(v) { v } None { return None } }
+            let ta = match translateOverProj(&a, fp, mvTab, mvAlias, extraBase, qAllCols) { Some(v) { v } None { return None } }
+            let tb = match translateOverProj(&b, fp, mvTab, mvAlias, extraBase, qAllCols) { Some(v) { v } None { return None } }
             return Some(Expr.Bin(op.clone(), ta, tb))
         }
         Expr.IsNull(a, not) {
-            match translateOverProj(&a, fp, mvTab) { Some(ta) { return Some(Expr.IsNull(ta, not)) } None { return None } }
+            match translateOverProj(&a, fp, mvTab, mvAlias, extraBase, qAllCols) { Some(ta) { return Some(Expr.IsNull(ta, not)) } None { return None } }
         }
         Expr.Cast(a, t) {
-            match translateOverProj(&a, fp, mvTab) { Some(ta) { return Some(Expr.Cast(ta, t.clone())) } None { return None } }
+            match translateOverProj(&a, fp, mvTab, mvAlias, extraBase, qAllCols) { Some(ta) { return Some(Expr.Cast(ta, t.clone())) } None { return None } }
         }
         Expr.Call(n, args, star) {
             var out: []Expr = []
             for a in args {
-                match translateOverProj(&a, fp, mvTab) { Some(ta) { append(mut &out, ta) } None { return None } }
+                match translateOverProj(&a, fp, mvTab, mvAlias, extraBase, qAllCols) { Some(ta) { append(mut &out, ta) } None { return None } }
             }
             return Some(Expr.Call(n.clone(), out, star))
         }
@@ -3867,7 +4166,9 @@ fn translateOverProj(x: &Expr, fp: &FastPlan, mvTab: &Table): Option[Expr] {
 }
 
 // Attempts automatic cost-based query rewrite of SELECT s against any fresh, ENABLE QUERY REWRITE MV.
-// Fast path: returns None in O(1) when the query's base table has no MV marks (zero overhead!).
+// Supports exact match, coarser & derived GROUP BY rollups, range/IN/IS NOT NULL predicate subsumption,
+// join-back to extra tables (including LEFT JOIN), and algebraic/sketch/variance rollups.
+// Fast path: returns None in O(|FROM|) when no FROM table has compatible MV marks (zero overhead!).
 pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, path: &[]str, up: &Up): Result[Option[Stmt], DbErr] {
     let sess = txn.sql.sess
     if !isQueryRewriteOn(sess) || suppressCount(sess) >= 2 { return Ok(None) }
@@ -3879,7 +4180,10 @@ pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, p
     for fi in 0..len(s.from) {
         let f = &s.from[fi]
         if f.sub >= 0 || f.work >= 0 || f.lateral || len(f.using) > 0 || f.natural { return Ok(None) }
-        if fi > 0 && f.join != lexdb_sql.J_INNER && f.join != lexdb_sql.J_CROSS && f.join != lexdb_sql.J_FIRST { return Ok(None) }
+        if fi > 0 && f.join != lexdb_sql.J_INNER && f.join != lexdb_sql.J_CROSS &&
+           f.join != lexdb_sql.J_FIRST && f.join != lexdb_sql.J_LEFT {
+            return Ok(None)
+        }
     }
     // Zero-allocation raw-AST pre-scan: reject SELECT * and determine qHasAgg before any catalog/expr work!
     var qHasAgg = len(s.group) > 0 || s.having.isSome()
@@ -3895,58 +4199,70 @@ pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, p
             if lexdb_bind.hasAgg(&oi.expr) { qHasAgg = true; break }
         }
     }
-    // Zero-overhead gate: check first FROM table's refBy marks and PLAN_CACHE immutable shape!
-    let t0 = match try (up.findTable)(st, txn, &s.from[0].table, path) {
-        Some(t) { t }
-        None { return Ok(None) }
-    }
-    if len(t0.view) > 0 || !hasMarks(&t0.refBy) { return Ok(None) }
-    let candMarks = marksOf(&t0.refBy)
-    if len(candMarks) == 0 { return Ok(None) }
-    if !mayMatchAnyCachedShape(&candMarks, len(s.from), qHasAgg) { return Ok(None) }
 
-    // Load all query FROM tables and build query's allCols for canonical expression resolution.
-    var qTabs: []Table = [t0]
-    var qAliases: []str = []
-    var qAllCols: []lexdb_sql.ColDef = []
-    var qOffsets: []int = [0]
-    let al0 = if len(s.from[0].alias) > 0 { s.from[0].alias.clone() } else { lexdb_sql.baseName(&qTabs[0].name) }
-    append(mut &qAliases, al0.clone())
-    for c in qTabs[0].cols {
-        var cc = c.clone()
-        cc.name = al0 + "." + c.name
-        append(mut &qAllCols, cc)
-    }
-    for fi in 1..len(s.from) {
+    // Load FROM tables and gather deduplicated candidate MV marks across ALL FROM tables (supports join-back!).
+    var qTabs: []Table = []
+    var candMarks: []str = []
+    for fi in 0..len(s.from) {
         match try (up.findTable)(st, txn, &s.from[fi].table, path) {
             Some(t) {
                 if len(t.view) > 0 { return Ok(None) }
                 for prev in qTabs { if prev.name == t.name { return Ok(None) } }
-                append(mut &qOffsets, len(qAllCols))
-                let al = if len(s.from[fi].alias) > 0 { s.from[fi].alias.clone() } else { lexdb_sql.baseName(&t.name) }
-                for c in t.cols {
-                    var cc = c.clone()
-                    cc.name = al + "." + c.name
-                    append(mut &qAllCols, cc)
+                if s.from[fi].join != lexdb_sql.J_LEFT && hasMarks(&t.refBy) {
+                    for mk in marksOf(&t.refBy) {
+                        if !lexdb_base.hasStr(&candMarks, &mk) { append(mut &candMarks, mk) }
+                    }
                 }
                 append(mut &qTabs, t)
-                append(mut &qAliases, al)
             }
             None { return Ok(None) }
         }
     }
+    if len(candMarks) == 0 { return Ok(None) }
+    if !mayMatchAnyCachedShape(&candMarks, len(s.from), qHasAgg) { return Ok(None) }
 
-    // Resolve query WHERE, JOIN ONs, GROUP BY, SELECT items, HAVING, ORDER BY in query slot space.
-    var qJoinExprs: []Expr = []
-    for fi in 1..len(s.from) {
-        match s.from[fi].on {
-            Some(onx) {
-                match resolveFastExpr(&onx, &qAllCols) {
-                    Ok(rx) { splitAnd(&rx, mut &qJoinExprs) }
-                    Err(_) { return Ok(None) }
+    // Build query's aliases and canonical allCols.
+    var qAliases: []str = []
+    var qAllCols: []lexdb_sql.ColDef = []
+    var qOffsets: []int = []
+    for fi in 0..len(qTabs) {
+        append(mut &qOffsets, len(qAllCols))
+        let al = if len(s.from[fi].alias) > 0 { s.from[fi].alias.clone() } else { lexdb_sql.baseName(&qTabs[fi].name) }
+        for c in qTabs[fi].cols {
+            var cc = c.clone()
+            cc.name = al + "." + c.name
+            append(mut &qAllCols, cc)
+        }
+        append(mut &qAliases, al)
+    }
+
+    // Resolve query WHERE, inner JOIN ONs, LEFT JOIN ONs, GROUP BY, SELECT items, HAVING, ORDER BY in query slot space.
+    var qInnerJoinExprs: []Expr = []
+    var qLeftOns: []Option[Expr] = []
+    for fi in 0..len(s.from) {
+        if fi > 0 && s.from[fi].join == lexdb_sql.J_LEFT {
+            match s.from[fi].on {
+                Some(onx) {
+                    match resolveFastExpr(&onx, &qAllCols) {
+                        Ok(rx) { append(mut &qLeftOns, Some(rx)) }
+                        Err(_) { return Ok(None) }
+                    }
+                }
+                None { append(mut &qLeftOns, None) }
+            }
+        } else {
+            append(mut &qLeftOns, None)
+            if fi > 0 {
+                match s.from[fi].on {
+                    Some(onx) {
+                        match resolveFastExpr(&onx, &qAllCols) {
+                            Ok(rx) { splitAnd(&rx, mut &qInnerJoinExprs) }
+                            Err(_) { return Ok(None) }
+                        }
+                    }
+                    None {}
                 }
             }
-            None {}
         }
     }
     var qWhereConj: []Expr = []
@@ -4031,6 +4347,7 @@ pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, p
         }
     }
 
+    let z = txn.sql.zone.clone()
     var bestScore = 1000000
     var bestStmt: Option[Stmt] = None
 
@@ -4042,29 +4359,49 @@ pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, p
         if hasPendingForMv(sess, &mv.key) { continue }
         let mvTab = match try (up.loadTable)(st, txn, &mv.key) { Some(t) { t } None { continue } }
         let fp = try getCachedPlan(st, txn, &mv, &mvTab, up)
-        if fp.kind == FAST_NONE || len(fp.tables) != len(qTabs) { continue }
+        if fp.kind == FAST_NONE || len(fp.tables) > len(qTabs) { continue }
         if fp.isAgg && !qIsAgg { continue }
 
-        // Match FROM tables permutation qTabs[qi] -> fp.tables[mi].
-        var tabPerm = array(len(qTabs), -1)
-        var permOk = true
-        for qi in 0..len(qTabs) {
-            var foundM = -1
-            for mi in 0..len(fp.tables) { if fp.tables[mi].name == qTabs[qi].name { foundM = mi; break } }
-            if foundM < 0 { permOk = false; break }
-            tabPerm[qi] = foundM
+        // Pick a readable, collision-free MV alias (uses the MV's real name so EXPLAIN shows it clearly!).
+        var mvAlias = lexdb_sql.baseName(&mvTab.name)
+        var suffix = 0
+        while lexdb_base.hasStr(&qAliases, &mvAlias) {
+            mvAlias = lexdb_sql.baseName(&mvTab.name) + "_" + suffix.toStr()
+            suffix += 1
         }
-        if !permOk { continue }
 
-        // Remap query's JOIN ON + WHERE conjuncts into MV slot space and check join + predicate subsumption.
+        // Match MV tables onto a subset of query FROM tables (tabPerm[qi] >= 0 if MV table, -1 if extra join-back table).
+        var tabPerm = array(len(qTabs), -1)
+        var mvMatched = 0
+        for mi in 0..len(fp.tables) {
+            var foundQ = -1
+            for qi in 0..len(qTabs) {
+                if tabPerm[qi] < 0 && s.from[qi].join != lexdb_sql.J_LEFT && qTabs[qi].name == fp.tables[mi].name {
+                    foundQ = qi
+                    break
+                }
+            }
+            if foundQ < 0 { break }
+            tabPerm[foundQ] = mi
+            mvMatched += 1
+        }
+        if mvMatched != len(fp.tables) { continue }
+
+        let extraCount = len(qTabs) - len(fp.tables)
+        // A global aggregate MV (0 group keys) keeps 1 row even when empty, so never join-back it with extra tables.
+        if extraCount > 0 && fp.isAgg && fp.globalAgg { continue }
+
+        let extraBase = len(fp.allCols)
+
+        // Remap query's inner JOIN ON + WHERE conjuncts into MV + extra slot space and check predicate subsumption.
         var mvJoinConj: []Expr = []
         for j in fp.joins { match j { Some(jx) { splitAnd(&jx, mut &mvJoinConj) } None {} } }
         var mvWhereConj: []Expr = []
         match fp.where { Some(wx) { splitAnd(&wx, mut &mvWhereConj) } None {} }
 
         var allQPreds: []Expr = []
-        for jx in qJoinExprs { append(mut &allQPreds, remapSlots(&jx, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols)) }
-        for wx in qWhereConj { append(mut &allQPreds, remapSlots(&wx, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols)) }
+        for jx in qInnerJoinExprs { append(mut &allQPreds, remapSlots(&jx, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols, &qAllCols)) }
+        for wx in qWhereConj { append(mut &allQPreds, remapSlots(&wx, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols, &qAllCols)) }
 
         var allMvPreds: []Expr = []
         for jx in mvJoinConj { append(mut &allMvPreds, lexdb_sql.cloneExpr(&jx)) }
@@ -4074,74 +4411,106 @@ pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, p
         var subsOk = true
         for mp in allMvPreds {
             var matched = false
+            // First try exact match (eliminates redundant filter from rewritten WHERE).
             for qi in 0..len(allQPreds) {
                 if !qUsed[qi] && exprEq(&mp, &allQPreds[qi]) { qUsed[qi] = true; matched = true; break }
+            }
+            // Otherwise try sound implication / range / IN / IS NOT NULL subsumption (keeps tighter qp in residual WHERE!).
+            if !matched {
+                for qi in 0..len(allQPreds) {
+                    if predImplies(&allQPreds[qi], &mp, &fp.allCols, &z) { matched = true; break }
+                }
             }
             if !matched { subsOk = false; break }
         }
         if !subsOk { continue }
 
-        // Translate residual WHERE conjuncts onto MV's visible non-agg columns.
+        // Translate residual WHERE conjuncts onto MV visible non-agg columns + extra join-back tables.
         var resWhere: []Expr = []
         var resOk = true
         for qi in 0..len(allQPreds) {
             if qUsed[qi] { continue }
-            match translateNonAgg(&allQPreds[qi], &fp, &mvTab) {
+            match translateNonAgg(&allQPreds[qi], &fp, &mvTab, &mvAlias, extraBase, &qAllCols) {
                 Some(tx) { append(mut &resWhere, tx) }
                 None { resOk = false; break }
             }
         }
         if !resOk { continue }
 
-        // Determine mode: non-agg MV vs exact-group agg MV vs rollup agg MV.
+        // Translate LEFT JOIN ON conditions for any extra LEFT-joined tables.
+        var rwLeftOns: []Option[Expr] = []
+        for qi in 0..len(qTabs) {
+            if tabPerm[qi] < 0 && s.from[qi].join == lexdb_sql.J_LEFT {
+                match &qLeftOns[qi] {
+                    Some(lx) {
+                        let rl = remapSlots(lx, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols, &qAllCols)
+                        match translateNonAgg(&rl, &fp, &mvTab, &mvAlias, extraBase, &qAllCols) {
+                            Some(tl) { append(mut &rwLeftOns, Some(tl)) }
+                            None { resOk = false; break }
+                        }
+                    }
+                    None { append(mut &rwLeftOns, None) }
+                }
+            } else {
+                append(mut &rwLeftOns, None)
+            }
+        }
+        if !resOk { continue }
+
+        // Determine mode: non-agg MV vs exact-group agg MV vs rollup agg MV (including derived GROUP BY & join-back!).
         var exactGroup = false
         var globalRollup = false
         var rwGroup: []Expr = []
         var score = 400
 
         if !fp.isAgg {
-            // Non-aggregate (projection/filter) MV: can serve both plain SELECT and aggregate queries!
+            // Non-aggregate (projection/filter/join) MV: can serve both plain SELECT and aggregate queries!
             for g in qGrpRaw {
-                let rg = remapSlots(&g, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols)
-                match translateNonAgg(&rg, &fp, &mvTab) {
+                let rg = remapSlots(&g, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols, &qAllCols)
+                match translateNonAgg(&rg, &fp, &mvTab, &mvAlias, extraBase, &qAllCols) {
                     Some(tg) { append(mut &rwGroup, tg) }
                     None { resOk = false; break }
                 }
             }
             if !resOk { continue }
-            score = if len(allMvPreds) > 0 { 300 } else { 400 }
+            score = (if len(allMvPreds) > 0 { 300 } else { 400 }) + extraCount * 10
         } else {
-            // Aggregate MV: check exact group match vs rollup subset!
+            // Aggregate MV: check 1-to-1 exact group match (only without join-back), else rollup!
             var qGrpMapped: []Expr = []
-            for g in qGrpRaw { append(mut &qGrpMapped, remapSlots(&g, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols)) }
-            var allInMv = true
-            for qg in qGrpMapped {
-                var found = false
-                for mg in fp.group { if exprEq(&qg, &mg) { found = true; break } }
-                if !found { allInMv = false; break }
+            for g in qGrpRaw { append(mut &qGrpMapped, remapSlots(&g, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols, &qAllCols)) }
+            if extraCount == 0 && len(qGrpMapped) == len(fp.group) {
+                var mvGrpUsed = array(len(fp.group), false)
+                var bijOk = true
+                for qg in qGrpMapped {
+                    var found = false
+                    for mi in 0..len(fp.group) {
+                        if !mvGrpUsed[mi] && exprEq(&qg, &fp.group[mi]) { mvGrpUsed[mi] = true; found = true; break }
+                    }
+                    if !found { bijOk = false; break }
+                }
+                exactGroup = bijOk
             }
-            if !allInMv { continue }
-            exactGroup = len(qGrpMapped) == len(fp.group)
             globalRollup = !exactGroup && len(qGrpMapped) == 0
             if !exactGroup {
                 for qg in qGrpMapped {
-                    match translateNonAgg(&qg, &fp, &mvTab) {
+                    if !lexdb_bind.immutable(&qg) { resOk = false; break }
+                    match translateNonAgg(&qg, &fp, &mvTab, &mvAlias, extraBase, &qAllCols) {
                         Some(tg) { append(mut &rwGroup, tg) }
                         None { resOk = false; break }
                     }
                 }
                 if !resOk { continue }
             }
-            score = (if exactGroup { 100 } else { 200 }) + len(fp.group)
+            score = (if exactGroup { 100 } else if extraCount == 0 { 200 } else { 250 + extraCount * 10 }) + len(fp.group)
         }
 
         // Translate SELECT items.
         var rwItems: []lexdb_sql.SelItem = []
         var itemsOk = true
         for k in 0..len(qItemsRaw) {
-            let rm = remapSlots(&qItemsRaw[k], &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols)
-            let txOpt = if !fp.isAgg { translateOverProj(&rm, &fp, &mvTab) }
-                        else { translateAggExpr(&rm, &fp, &mvTab, exactGroup, globalRollup) }
+            let rm = remapSlots(&qItemsRaw[k], &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols, &qAllCols)
+            let txOpt = if !fp.isAgg { translateOverProj(&rm, &fp, &mvTab, &mvAlias, extraBase, &qAllCols) }
+                        else { translateAggExpr(&rm, &fp, &mvTab, &mvAlias, extraBase, &qAllCols, exactGroup, globalRollup) }
             match txOpt {
                 Some(tx) {
                     append(mut &rwItems, lexdb_sql.SelItem{star: false, qual: "", expr: Some(tx),
@@ -4156,9 +4525,9 @@ pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, p
         var rwHaving: Option[Expr] = None
         match &qHavingRaw {
             Some(hx) {
-                let rm = remapSlots(hx, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols)
-                let txOpt = if !fp.isAgg { translateOverProj(&rm, &fp, &mvTab) }
-                            else { translateAggExpr(&rm, &fp, &mvTab, exactGroup, globalRollup) }
+                let rm = remapSlots(hx, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols, &qAllCols)
+                let txOpt = if !fp.isAgg { translateOverProj(&rm, &fp, &mvTab, &mvAlias, extraBase, &qAllCols) }
+                            else { translateAggExpr(&rm, &fp, &mvTab, &mvAlias, extraBase, &qAllCols, exactGroup, globalRollup) }
                 match txOpt {
                     Some(tx) {
                         if fp.isAgg && exactGroup { append(mut &resWhere, tx) } else { rwHaving = Some(tx) }
@@ -4178,9 +4547,9 @@ pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, p
                 let ox = match &rwItems[idx].expr { Some(ex) { lexdb_sql.cloneExpr(ex) } None { Expr.Lit(Val.Null) } }
                 append(mut &rwOrder, lexdb_sql.OrderItem{expr: ox, desc: s.order[oi].desc, nullsFirst: s.order[oi].nullsFirst})
             } else {
-                let rm = remapSlots(&qOrdRaw[oi], &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols)
-                let txOpt = if !fp.isAgg { translateOverProj(&rm, &fp, &mvTab) }
-                            else { translateAggExpr(&rm, &fp, &mvTab, exactGroup, globalRollup) }
+                let rm = remapSlots(&qOrdRaw[oi], &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols, &qAllCols)
+                let txOpt = if !fp.isAgg { translateOverProj(&rm, &fp, &mvTab, &mvAlias, extraBase, &qAllCols) }
+                            else { translateAggExpr(&rm, &fp, &mvTab, &mvAlias, extraBase, &qAllCols, exactGroup, globalRollup) }
                 match txOpt {
                     Some(tx) { append(mut &rwOrder, lexdb_sql.OrderItem{expr: tx, desc: s.order[oi].desc, nullsFirst: s.order[oi].nullsFirst}) }
                     None { itemsOk = false; break }
@@ -4193,9 +4562,21 @@ pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, p
             var ns = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
             ns.mdialect = s.mdialect
             let mvName = mvTab.name.clone()
-            append(mut &ns.from, lexdb_sql.FromItem{table: mvName, alias: lexdb_sql.baseName(&mvTab.name), cols: [],
+            append(mut &ns.from, lexdb_sql.FromItem{table: mvName, alias: mvAlias.clone(), cols: [],
                                                     join: lexdb_sql.J_FIRST, on: None, using: [], natural: false,
                                                     sub: -1, lateral: false, work: -1, comma: true})
+            for qi in 0..len(qTabs) {
+                if tabPerm[qi] < 0 {
+                    let isLeft = s.from[qi].join == lexdb_sql.J_LEFT
+                    let jKind = if isLeft { lexdb_sql.J_LEFT } else { lexdb_sql.J_CROSS }
+                    let jOn = if isLeft {
+                        match &rwLeftOns[qi] { Some(lx) { Some(lexdb_sql.cloneExpr(lx)) } None { None } }
+                    } else { None }
+                    append(mut &ns.from, lexdb_sql.FromItem{table: qTabs[qi].name.clone(), alias: qAliases[qi].clone(), cols: [],
+                                                            join: jKind, on: jOn, using: [], natural: false,
+                                                            sub: -1, lateral: false, work: -1, comma: false})
+                }
+            }
             ns.items = rwItems
             ns.where = joinAnd(&resWhere)
             ns.group = rwGroup

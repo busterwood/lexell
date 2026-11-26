@@ -1,0 +1,290 @@
+// Materialized views (Query Rewrite v2): derived GROUP BY expressions on MV keys (DATE_TRUNC, EXTRACT,
+// expressions), sound range / IN / BETWEEN / <> / IS NOT NULL predicate subsumption, join-back to extra
+// tables (INNER/multi-hop/LEFT JOIN + safety guards), VAR_*/STDDEV_* & hidden-state rollups (AVG, COUNT,
+// HLL/t-digest sketches, float & numeric, all-NULL/single-row edge cases), OQC realtime hidden-state
+// rollups, live DML incremental updates, and reopen persistence.
+// expect: rw_derived_group: ok|0|ok|0|ok|0|0
+// expect: rw_range_subsumption: ok|0|ok|0|not_rw|not_rw|ok|0|ok|0|not_rw|ok|0|ok|0|not_rw
+// expect: rw_joinback: ok|0|ok|0|ok|0|not_rw|not_rw|ok|0
+// expect: rw_var_exact: ok|0
+// expect: rw_var_rollup_grp: ok|0
+// expect: rw_var_rollup_global: ok|0
+// expect: rw_var_float_rollup: ok|ok
+// expect: rw_hidden_rollup: ok|0|ok|ok
+// expect: rw_oqc_v2: ok|0|ok|0
+// expect: rw_dml_v2: 0|0|0
+// expect: rw_row_vs_batch: 0|0|0
+// expect: reopen_v2_ok: ok|0|ok|0
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return "ERR:" + e.state + ":" + e.msg }
+    }
+}
+
+fn qInt(s: mut &lexdb_exec.Session, sql: &str): int {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows && len(r.rows) > 0 && len(r.rows[0]) > 0 {
+                match r.rows[0][0] {
+                    lexdb_sql.Val.Int(i) { return i }
+                    else { return -999999 }
+                }
+            }
+            return -999999
+        }
+        Err(_) { return -999999 }
+    }
+}
+
+fn explainHas(s: mut &lexdb_exec.Session, sql: &str, needle: &str): bool {
+    let plan = q(s, &("EXPLAIN " + sql))
+    return strings.contains(&plan, needle)
+}
+
+fn rwMatch(s: mut &lexdb_exec.Session, sql: &str): int {
+    let rOn = q(s, sql)
+    let _off = q(s, "SET query_rewrite_enabled = off")
+    let rOff = q(s, sql)
+    let _on = q(s, "SET query_rewrite_enabled = on")
+    if rOn == rOff && !strings.startsWith(&rOn, "ERR:") { return 0 }
+    println("MISMATCH on=" + rOn + " off=" + rOff)
+    return 1
+}
+
+fn rwCloseFloat(s: mut &lexdb_exec.Session, sql: &str): bool {
+    let rOn = s.exec(sql)
+    let _off = q(s, "SET query_rewrite_enabled = off")
+    let rOff = s.exec(sql)
+    let _on = q(s, "SET query_rewrite_enabled = on")
+    match rOn {
+        Ok(rsA) {
+            match rOff {
+                Ok(rsB) {
+                    let a = &rsA[len(rsA) - 1].rows
+                    let b = &rsB[len(rsB) - 1].rows
+                    if len(a) != len(b) { return false }
+                    for i in 0..len(a) {
+                        if len(a[i]) != len(b[i]) { return false }
+                        for j in 0..len(a[i]) {
+                            let va = &a[i][j]
+                            let vb = &b[i][j]
+                            if lexdb_ops.isNull(va) != lexdb_ops.isNull(vb) { return false }
+                            if lexdb_ops.isNull(va) { continue }
+                            match va {
+                                lexdb_sql.Val.Float(fa) {
+                                    let fb = lexdb_ops.asFloat(vb).unwrapOr(1.0e30f)
+                                    let diff = if fa > fb { fa - fb } else { fb - fa }
+                                    if diff > 1.0e-9f * (1.0f + (if fb < 0.0f { -fb } else { fb })) { return false }
+                                }
+                                else {
+                                    if lexdb_sql.text(va) != lexdb_sql.text(vb) { return false }
+                                }
+                            }
+                        }
+                    }
+                    return true
+                }
+                Err(_) { return false }
+            }
+        }
+        Err(_) { return false }
+    }
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}
+}
+
+fn runTest(st: lexdb_store.Store, reopen: bool): int {
+    if !reopen { lexdb_exec.bootstrap(&st).unwrap() }
+    var s = lexdb_exec.newSession(st.share())
+
+    if reopen {
+        let q1 = "SELECT r.name, DATE_TRUNC('month', sa.sale_day), SUM(sa.amount) FROM regions r JOIN stores st ON r.id = st.region_id JOIN sales sa ON st.id = sa.store_id GROUP BY r.name, DATE_TRUNC('month', sa.sale_day) ORDER BY 1, 2"
+        let h1 = if explainHas(mut &s, q1, "mv_sales_daily") { "ok" } else { "no" }
+        let m1 = rwMatch(mut &s, q1)
+        let q2 = "SELECT region, VAR_POP(amount), STDDEV_SAMP(amount) FROM stat_t GROUP BY region ORDER BY region"
+        let h2 = if explainHas(mut &s, q2, "mv_stat") { "ok" } else { "no" }
+        let m2 = rwMatch(mut &s, q2)
+        println("reopen_v2_ok: " + h1 + "|" + m1.toStr() + "|" + h2 + "|" + m2.toStr())
+        return 0
+    }
+
+    // ---- Setup base tables
+    let _t0 = q(mut &s, "CREATE TABLE regions (id int PRIMARY KEY, name text)")
+    let _t1 = q(mut &s, "CREATE TABLE stores (id int PRIMARY KEY, name text, region_id int, country text)")
+    let _t2 = q(mut &s, "CREATE TABLE sales (id int PRIMARY KEY, region text, store_id int, sale_day date, amount int)")
+    let _r0 = q(mut &s, "INSERT INTO regions VALUES (1, 'North'), (2, 'South')")
+    let _st0 = q(mut &s, "INSERT INTO stores VALUES (10, 'NYC', 1, 'US'), (11, 'BOS', 1, 'US'), (20, 'LON', 2, 'UK')")
+    let _sa0 = q(mut &s, "INSERT INTO sales VALUES (1, 'US', 10, DATE '2025-11-15', 100), (2, 'US', 10, DATE '2026-01-10', 200), (3, 'US', 11, DATE '2026-01-20', 300), (4, 'EU', 20, DATE '2026-02-05', 50), (5, 'EU', 20, DATE '2026-02-18', 150), (6, 'APAC', 99, DATE '2026-03-01', 400), (7, 'LATAM', 99, DATE '2024-06-01', -10), (8, 'US', 10, DATE '2026-03-10', 0)")
+
+    // ---- 1. Derived GROUP BY expressions on MV keys
+    let _mv1 = q(mut &s, "CREATE MATERIALIZED VIEW mv_sales_daily WITH (refresh = 'fast_on_statement', query_rewrite = true) AS SELECT region, store_id, sale_day, COUNT(*) AS cnt, SUM(amount) AS sum_amt, MIN(amount) AS mn, MAX(amount) AS mx FROM sales GROUP BY region, store_id, sale_day")
+    let dg1 = "SELECT region, DATE_TRUNC('month', sale_day), SUM(amount), COUNT(*) FROM sales GROUP BY region, DATE_TRUNC('month', sale_day) ORDER BY 1, 2"
+    let dg1h = if explainHas(mut &s, dg1, "mv_sales_daily") { "ok" } else { "no" }
+    let dg1m = rwMatch(mut &s, dg1)
+    let dg2 = "SELECT EXTRACT(YEAR FROM sale_day), AVG(amount) FROM sales GROUP BY 1 ORDER BY 1"
+    let dg2h = if explainHas(mut &s, dg2, "mv_sales_daily") { "ok" } else { "no" }
+    let dg2m = rwMatch(mut &s, dg2)
+    let dg3 = "SELECT UPPER(region), store_id / 10, SUM(amount) FROM sales WHERE sale_day >= DATE '2026-02-01' GROUP BY UPPER(region), store_id / 10 ORDER BY 1, 2"
+    let dg3h = if explainHas(mut &s, dg3, "mv_sales_daily") { "ok" } else { "no" }
+    let dg3m = rwMatch(mut &s, dg3)
+    // Duplicate GROUP BY key check: must NOT falsely claim exactGroup!
+    let dgDup = rwMatch(mut &s, "SELECT region, SUM(amount) FROM sales GROUP BY region, region, region ORDER BY 1")
+    println("rw_derived_group: " + dg1h + "|" + dg1m.toStr() + "|" + dg2h + "|" + dg2m.toStr() + "|" + dg3h + "|" + dg3m.toStr() + "|" + dgDup.toStr())
+
+    // ---- 2. Range, BETWEEN, IN, <>, IS NOT NULL predicate subsumption
+    let _s0 = q(mut &s, "CREATE TABLE filt_t (id int PRIMARY KEY, region text, sale_day date, amount int)")
+    let _s1 = q(mut &s, "INSERT INTO filt_t VALUES (1, 'US', DATE '2024-05-01', 50), (2, 'US', DATE '2025-06-01', 0), (3, 'US', DATE '2026-01-15', 10), (4, 'EU', DATE '2026-02-10', 50), (5, 'APAC', DATE '2026-03-20', -3), (6, 'LATAM', DATE '2026-03-25', 100), (7, 'US', DATE '2026-04-01', NULL)")
+    let _mvR1 = q(mut &s, "CREATE MATERIALIZED VIEW mv_range1 WITH (refresh = 'fast_on_statement', query_rewrite = true) AS SELECT region, sale_day, amount, COUNT(*) AS cnt, SUM(amount) AS s FROM filt_t WHERE sale_day >= DATE '2025-01-01' AND amount > 0 GROUP BY region, sale_day, amount")
+    let rs1 = "SELECT region, SUM(amount) FROM filt_t WHERE sale_day >= DATE '2026-01-01' AND amount >= 10 GROUP BY region ORDER BY region"
+    let rs1h = if explainHas(mut &s, rs1, "mv_range1") { "ok" } else { "no" }
+    let rs1m = rwMatch(mut &s, rs1)
+    let rs2 = "SELECT region, SUM(amount) FROM filt_t WHERE sale_day BETWEEN DATE '2026-01-01' AND DATE '2026-03-31' AND amount = 50 GROUP BY region ORDER BY region"
+    let rs2h = if explainHas(mut &s, rs2, "mv_range1") { "ok" } else { "no" }
+    let rs2m = rwMatch(mut &s, rs2)
+    let rsBad1 = if !explainHas(mut &s, "SELECT region, SUM(amount) FROM filt_t WHERE sale_day >= DATE '2024-01-01' AND amount > 0 GROUP BY region", "mv_range1") { "not_rw" } else { "BAD_RW" }
+    let rsBad2 = if !explainHas(mut &s, "SELECT region, SUM(amount) FROM filt_t WHERE sale_day >= DATE '2026-01-01' AND amount >= 0 GROUP BY region", "mv_range1") { "not_rw" } else { "BAD_RW" }
+
+    let _mvR2 = q(mut &s, "CREATE MATERIALIZED VIEW mv_range2 WITH (refresh = 'fast_on_statement', query_rewrite = true) AS SELECT region, amount, COUNT(*) AS cnt, SUM(amount) AS s FROM filt_t WHERE region IN ('US', 'EU', 'APAC') AND amount IS NOT NULL GROUP BY region, amount")
+    let rs3 = "SELECT region, SUM(amount) FROM filt_t WHERE region = 'US' AND amount > -5 GROUP BY region ORDER BY region"
+    let rs3h = if explainHas(mut &s, rs3, "mv_range2") { "ok" } else { "no" }
+    let rs3m = rwMatch(mut &s, rs3)
+    let rs4 = "SELECT region, SUM(amount) FROM filt_t WHERE region IN ('US', 'EU') AND amount IN (10, 50) GROUP BY region ORDER BY region"
+    let rs4h = if explainHas(mut &s, rs4, "mv_range2") { "ok" } else { "no" }
+    let rs4m = rwMatch(mut &s, rs4)
+    let rsBad3 = if !explainHas(mut &s, "SELECT region, SUM(amount) FROM filt_t WHERE region IN ('US', 'LATAM') AND amount > 0 GROUP BY region", "mv_range2") { "not_rw" } else { "BAD_RW" }
+
+    let _mvR3 = q(mut &s, "CREATE MATERIALIZED VIEW mv_range3 WITH (refresh = 'fast_on_statement', query_rewrite = true) AS SELECT region, amount, SUM(amount) AS s FROM filt_t WHERE amount <> 0 GROUP BY region, amount")
+    let rs5 = "SELECT region, SUM(amount) FROM filt_t WHERE amount > 0 GROUP BY region ORDER BY region"
+    let rs5h = if explainHas(mut &s, rs5, "mv_range3") { "ok" } else { "no" }
+    let rs5m = rwMatch(mut &s, rs5)
+    let rs6 = "SELECT region, SUM(amount) FROM filt_t WHERE amount < 0 GROUP BY region ORDER BY region"
+    let rs6h = if explainHas(mut &s, rs6, "mv_range3") { "ok" } else { "no" }
+    let rs6m = rwMatch(mut &s, rs6)
+    let rsBad4 = if !explainHas(mut &s, "SELECT region, SUM(amount) FROM filt_t WHERE amount >= 0 GROUP BY region", "mv_range3") { "not_rw" } else { "BAD_RW" }
+    println("rw_range_subsumption: " + rs1h + "|" + rs1m.toStr() + "|" + rs2h + "|" + rs2m.toStr() + "|" + rsBad1 + "|" + rsBad2 + "|" + rs3h + "|" + rs3m.toStr() + "|" + rs4h + "|" + rs4m.toStr() + "|" + rsBad3 + "|" + rs5h + "|" + rs5m.toStr() + "|" + rs6h + "|" + rs6m.toStr() + "|" + rsBad4)
+
+    // ---- 3. Join-back to extra tables (INNER, multi-hop reversed FROM order, LEFT JOIN, safety guards, non-agg MV)
+    let jb1 = "SELECT st.country, SUM(sa.amount), COUNT(*) FROM sales sa JOIN stores st ON sa.store_id = st.id WHERE sa.sale_day >= DATE '2026-01-01' GROUP BY st.country ORDER BY st.country"
+    let jb1h = if explainHas(mut &s, jb1, "mv_sales_daily") { "ok" } else { "no" }
+    let jb1m = rwMatch(mut &s, jb1)
+    let jb2 = "SELECT r.name, DATE_TRUNC('month', sa.sale_day), SUM(sa.amount) FROM regions r JOIN stores st ON r.id = st.region_id JOIN sales sa ON st.id = sa.store_id GROUP BY r.name, DATE_TRUNC('month', sa.sale_day) ORDER BY 1, 2"
+    let jb2h = if explainHas(mut &s, jb2, "mv_sales_daily") { "ok" } else { "no" }
+    let jb2m = rwMatch(mut &s, jb2)
+    let jb3 = "SELECT st.country, SUM(sa.amount), COUNT(*) FROM sales sa LEFT JOIN stores st ON sa.store_id = st.id GROUP BY st.country ORDER BY st.country"
+    let jb3h = if explainHas(mut &s, jb3, "mv_sales_daily") { "ok" } else { "no" }
+    let jb3m = rwMatch(mut &s, jb3)
+    // Safety 1: MV on nullable right side of LEFT JOIN must NOT rewrite!
+    let jbBad1 = if !explainHas(mut &s, "SELECT st.country, COUNT(*) FROM stores st LEFT JOIN sales sa ON st.id = sa.store_id GROUP BY st.country", "mv_sales_daily") { "not_rw" } else { "BAD_RW" }
+    // Safety 2: Aggregate over extra table column with agg MV must NOT rewrite!
+    let jbBad2 = if !explainHas(mut &s, "SELECT st.country, SUM(st.region_id) FROM sales sa JOIN stores st ON sa.store_id = st.id GROUP BY st.country", "mv_sales_daily") { "not_rw" } else { "BAD_RW" }
+    // Non-agg MV join-back (CAN aggregate extra table column safely!)
+    let _mvProj = q(mut &s, "CREATE MATERIALIZED VIEW mv_sales_pos WITH (refresh = 'fast_on_statement', query_rewrite = true) AS SELECT id, store_id, amount FROM sales WHERE amount > 100")
+    let jb4 = "SELECT st.country, SUM(sa.amount), SUM(st.region_id) FROM sales sa JOIN stores st ON sa.store_id = st.id WHERE sa.amount > 100 GROUP BY st.country ORDER BY st.country"
+    let jb4h = if explainHas(mut &s, jb4, "mv_sales_pos") { "ok" } else { "no" }
+    let jb4m = rwMatch(mut &s, jb4)
+    println("rw_joinback: " + jb1h + "|" + jb1m.toStr() + "|" + jb2h + "|" + jb2m.toStr() + "|" + jb3h + "|" + jb3m.toStr() + "|" + jbBad1 + "|" + jbBad2 + "|" + jb4h + "|" + jb4m.toStr())
+
+    // ---- 4. VAR_*/STDDEV_* & hidden-state rollups (numeric + float + single-row + all-NULL + sketches!)
+    let _stT = q(mut &s, "CREATE TABLE stat_t (id int PRIMARY KEY, region text, store_id int, amount int, fval double precision, cust_id int)")
+    let _stI = q(mut &s, "INSERT INTO stat_t VALUES (1, 'US', 1, 10, 1.5, 101), (2, 'US', 1, 20, 2.5, 102), (3, 'US', 2, 40, 4.0, 102), (4, 'US', 2, 50, 5.5, 103), (5, 'EU', 3, 100, 10.0, 201), (6, 'NULLS', 4, NULL, NULL, 301), (7, 'NULLS', 4, NULL, NULL, 302)")
+    // Note: MV only projects STDDEV_SAMP(amount), VAR_POP(fval), AVG(amount), APPROX_COUNT_DISTINCT(cust_id), APPROX_PERCENTILE(0.5)
+    // It does NOT explicitly project COUNT(*), COUNT(amount), SUM(amount), or *_DETAIL!
+    let _mvSt = q(mut &s, "CREATE MATERIALIZED VIEW mv_stat WITH (refresh = 'fast_on_statement', query_rewrite = true) AS SELECT region, store_id, STDDEV_SAMP(amount) AS sd_amt, VAR_POP(fval) AS vp_f, AVG(amount) AS avg_amt, APPROX_COUNT_DISTINCT(cust_id) AS u_cust, APPROX_PERCENTILE(0.5) WITHIN GROUP (ORDER BY fval) AS p50 FROM stat_t GROUP BY region, store_id")
+
+    // Exact-grain cross-stat query (VAR_POP & STDDEV_POP answered from STDDEV_SAMP's hidden state!)
+    let veSql = "SELECT region, store_id, VAR_POP(amount), VAR_SAMP(amount), STDDEV_POP(amount), STDDEV_SAMP(amount), AVG(amount), COUNT(*), COUNT(amount) FROM stat_t GROUP BY region, store_id ORDER BY region, store_id"
+    let veh = if explainHas(mut &s, veSql, "mv_stat") { "ok" } else { "no" }
+    let vem = rwMatch(mut &s, veSql)
+    println("rw_var_exact: " + veh + "|" + vem.toStr())
+
+    // Coarser group rollup of VAR_POP, VAR_SAMP, VARIANCE, STDDEV_POP, STDDEV_SAMP, STDDEV!
+    let vgSql = "SELECT region, VAR_POP(amount), VAR_SAMP(amount), VARIANCE(amount), STDDEV_POP(amount), STDDEV_SAMP(amount), STDDEV(amount) FROM stat_t GROUP BY region ORDER BY region"
+    let vgh = if explainHas(mut &s, vgSql, "mv_stat") { "ok" } else { "no" }
+    let vgm = rwMatch(mut &s, vgSql)
+    println("rw_var_rollup_grp: " + vgh + "|" + vgm.toStr())
+
+    // Global rollup (0 group keys) of VAR_*/STDDEV_*!
+    let vglSql = "SELECT VAR_POP(amount), VAR_SAMP(amount), STDDEV_POP(amount), STDDEV_SAMP(amount) FROM stat_t"
+    let vglh = if explainHas(mut &s, vglSql, "mv_stat") { "ok" } else { "no" }
+    let vglm = rwMatch(mut &s, vglSql)
+    println("rw_var_rollup_global: " + vglh + "|" + vglm.toStr())
+
+    // Float8 variance & stddev rollup (checks float8 type preservation & accuracy)!
+    let vfSql = "SELECT region, VAR_POP(fval), VAR_SAMP(fval), STDDEV_POP(fval), STDDEV_SAMP(fval) FROM stat_t GROUP BY region ORDER BY region"
+    let vfh = if explainHas(mut &s, vfSql, "mv_stat") { "ok" } else { "no" }
+    let vfm = if rwCloseFloat(mut &s, vfSql) { "ok" } else { "mismatch" }
+    println("rw_var_float_rollup: " + vfh + "|" + vfm)
+
+    // Hidden-state rollups for AVG (with all-NULL group!), COUNT(*), COUNT(amount), HLL, and t-digest (p90 from p50 MV!)
+    let hidSql = "SELECT region, COUNT(*), COUNT(amount), AVG(amount) FROM stat_t GROUP BY region ORDER BY region"
+    let hidH = if explainHas(mut &s, hidSql, "mv_stat") { "ok" } else { "no" }
+    let hidM = rwMatch(mut &s, hidSql)
+    let skSql = "SELECT region, APPROX_COUNT_DISTINCT(cust_id), APPROX_PERCENTILE(0.9) WITHIN GROUP (ORDER BY fval) FROM stat_t GROUP BY region ORDER BY region"
+    let skH = if explainHas(mut &s, skSql, "mv_stat") { "ok" } else { "no" }
+    let skU = qInt(mut &s, "SELECT APPROX_COUNT_DISTINCT(cust_id) FROM stat_t WHERE region = 'US'")
+    let skOk = if skU >= 2 && skU <= 4 { "ok" } else { "bad:" + skU.toStr() }
+    println("rw_hidden_rollup: " + hidH + "|" + hidM.toStr() + "|" + skH + "|" + skOk)
+
+    // ---- 5. OQC (realtime) MV with pending deltas + VAR/STDDEV rollup + join-back!
+    let _oqT = q(mut &s, "CREATE TABLE oq_sales (id int PRIMARY KEY, store_id int, sale_day date, amount int)")
+    let _oqI = q(mut &s, "INSERT INTO oq_sales VALUES (1, 10, DATE '2026-01-05', 100), (2, 10, DATE '2026-01-12', 200)")
+    let _oqMv = q(mut &s, "CREATE MATERIALIZED VIEW mv_oq_v2 WITH (refresh = 'realtime', query_rewrite = true) AS SELECT store_id, sale_day, SUM(amount) AS s, STDDEV_POP(amount) AS sd FROM oq_sales GROUP BY store_id, sale_day")
+    // Insert pending deltas into deltaTree (unfolded!)
+    let _oqD = q(mut &s, "INSERT INTO oq_sales VALUES (3, 11, DATE '2026-01-20', 400), (4, 20, DATE '2026-02-01', 50)")
+    let oqQ1 = "SELECT st.country, DATE_TRUNC('month', oq.sale_day), SUM(oq.amount), COUNT(*) FROM oq_sales oq JOIN stores st ON oq.store_id = st.id GROUP BY st.country, DATE_TRUNC('month', oq.sale_day) ORDER BY 1, 2"
+    let oq1h = if explainHas(mut &s, oqQ1, "mv_oq_v2") { "ok" } else { "no" }
+    let oq1m = rwMatch(mut &s, oqQ1)
+    let oqQ2 = "SELECT st.country, VAR_SAMP(oq.amount), STDDEV_POP(oq.amount) FROM oq_sales oq JOIN stores st ON oq.store_id = st.id GROUP BY st.country ORDER BY st.country"
+    let oq2h = if explainHas(mut &s, oqQ2, "mv_oq_v2") { "ok" } else { "no" }
+    let oq2m = rwMatch(mut &s, oqQ2)
+    println("rw_oqc_v2: " + oq1h + "|" + oq1m.toStr() + "|" + oq2h + "|" + oq2m.toStr())
+
+    // ---- 6. Live DML mutations keep all v2 rewrites 100% consistent!
+    let _d1 = q(mut &s, "INSERT INTO sales VALUES (9, 'US', 11, DATE '2026-02-15', 500)")
+    let _d2 = q(mut &s, "UPDATE stat_t SET amount = 80, fval = 8.5 WHERE id = 2")
+    let _d3 = q(mut &s, "DELETE FROM stat_t WHERE id = 4")
+    let dm1 = rwMatch(mut &s, jb2)
+    let dm2 = rwMatch(mut &s, vgSql)
+    let dm3 = rwMatch(mut &s, vglSql)
+    println("rw_dml_v2: " + dm1.toStr() + "|" + dm2.toStr() + "|" + dm3.toStr())
+
+    // ---- 7. Verify row engine (lexdb_batch = off) and batch engine (lexdb_batch = on) match identically!
+    let _boff = q(mut &s, "SET lexdb_batch = off")
+    let rb1 = rwMatch(mut &s, jb2)
+    let rb2 = rwMatch(mut &s, vgSql)
+    let rb3 = rwMatch(mut &s, oqQ2)
+    let _bon = q(mut &s, "SET lexdb_batch = on")
+    println("rw_row_vs_batch: " + rb1.toStr() + "|" + rb2.toStr() + "|" + rb3.toStr())
+
+    return 0
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(204)
+    lexdb_store.run(fs.share(), opts(), fn(st: lexdb_store.Store): int { return runTest(st, false) }).unwrap()
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int { return runTest(st, true) }).unwrap()
+}

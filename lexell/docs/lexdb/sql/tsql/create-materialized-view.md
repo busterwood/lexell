@@ -53,9 +53,10 @@ DROP MATERIALIZED VIEW [ IF EXISTS ] [ schema_name . ] mview_name [ ,...n ] [ CA
   $O(\Delta)$.
 - **Automatic query rewrite:** Materialized views created with `ENABLE QUERY REWRITE` (or `WITH (query_rewrite = true)`)
   automatically accelerate eligible `SELECT` queries against their base table(s) — supporting exact matches, `HAVING`,
-  subsumed `WHERE` predicates, coarser `GROUP BY` / global / `AVG` / sketch rollups, and equi-joins, while skipping
-  stale `ON DEMAND` views and uncommitted `ON COMMIT` changes. Control per session with
-  `SET query_rewrite_enabled = on | off` (default `on`).
+  subsumed `WHERE` predicates (including range, `BETWEEN`, `IN`, `<>`, and `IS NOT NULL`), coarser and derived
+  `GROUP BY` expressions, join-back to extra dimension tables (including `LEFT JOIN`), and
+  `COUNT`/`SUM`/`AVG`/`MIN`/`MAX`/`VAR_*`/`STDDEV_*`/sketch rollups, while skipping stale `ON DEMAND` views and
+  uncommitted `ON COMMIT` changes. Control per session with `SET query_rewrite_enabled = on | off` (default `on`).
 
 ## Examples
 
@@ -222,6 +223,54 @@ dept_id tot
 3       200
 
 (3 rows affected)
+```
+
+### F. Finer-grain rollup rewrite (derived `GROUP BY`, range subsumption, join-back, and `VAR_POP`)
+
+<!-- example: tsql -->
+```sql
+CREATE TABLE dbo.dept_info (dept_id INT PRIMARY KEY, region NVARCHAR(10));
+INSERT dbo.dept_info VALUES (1, 'EMEA'), (2, 'EMEA'), (3, 'AMER');
+GO
+CREATE MATERIALIZED VIEW dbo.mv_detail
+    REFRESH FAST ON STATEMENT ENABLE QUERY REWRITE
+AS SELECT dept_id, amount, SUM(amount) AS tot, STDDEV_SAMP(amount) AS sd
+   FROM dbo.sales
+   WHERE amount >= 50
+   GROUP BY dept_id, amount;
+GO
+SELECT d.region, SUM(s.amount) AS region_tot, COUNT(*) AS n
+FROM dbo.sales s JOIN dbo.dept_info d ON s.dept_id = d.dept_id
+WHERE s.amount >= 100
+GROUP BY d.region
+ORDER BY d.region;
+GO
+SELECT dept_id / 2 AS bucket, ROUND(VAR_POP(amount), 2) AS vp
+FROM dbo.sales
+WHERE amount >= 50
+GROUP BY dept_id / 2
+ORDER BY dept_id / 2;
+GO
+DROP MATERIALIZED VIEW dbo.mv_detail;
+DROP TABLE dbo.dept_info;
+```
+
+```text
+(3 rows affected)
+
+region region_tot n
+------ ---------- -
+AMER   200        1
+EMEA   900        5
+
+(2 rows affected)
+
+bucket vp
+------ ---------------------
+0      5468.7500000000000000
+1      3554.6900000000000000
+
+(2 rows affected)
 ```
 
 ## See also
