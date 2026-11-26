@@ -50,60 +50,80 @@ pub fn hashStr(s: &str): u64 {
 
 // ============================================================================
 // 0. FastIntCount: Flat power-of-2 open-addressed int -> count hash table
-//    for count-only JK_INT / JK_INT2 hash joins (zero SipHash, zero order array).
+//    with cache-line-packed [k, v] slots and an optional L3-resident
+//    register-blocked Bloom pre-filter for large high-miss joins.
 // ============================================================================
 
+fn bloomWords(nKeys: int, room: int): int {
+    if nKeys < 16384 { return 0 }
+    var words = 4096
+    // Target ~16-32 bits/key, capped at 1,048,576 words (8 MB) so it stays L3-resident.
+    while words < 1048576 && words * 4 < nKeys { words = words * 2 }
+    if room >= 0 {
+        while words >= 4096 && words * 8 > room { words = words / 2 }
+        if words < 4096 || words * 8 > room { return 0 }
+    }
+    return words
+}
+
 pub type FastIntCount = record {
-    pub ks: []int       // slot -> key
-    pub vs: []int       // slot -> count (0 = empty)
+    pub slots: []int    // interleaved [k, v] per slot (v == 0 means empty)
     mask: int
     len: int
+    bf: []u64           // optional register-blocked Bloom filter
+    bfMask: int         // len(bf) - 1, or -1 if disabled
 }
 
 pub fn newFastIntCount(): FastIntCount {
-    return FastIntCount{ks: [], vs: [], mask: 0, len: 0}
+    return FastIntCount{slots: [], mask: 0, len: 0, bf: [], bfMask: -1}
 }
 
 pub fn (t: &FastIntCount) size(): int { return t.len }
 
 fn (t: mut &FastIntCount) grow() {
-    let cap = if len(t.vs) == 0 { 1024 } else { len(t.vs) * 2 }
+    let cap = if len(t.slots) == 0 { 1024 } else { len(t.slots) } // len(slots) == oldCap * 2
     let mask = cap - 1
-    var nks: []int = array(cap, 0)
-    var nvs: []int = array(cap, 0)
-    for i in 0..len(t.vs) {
-        let v = t.vs[i]
-        if v == 0 { continue }
-        let k = t.ks[i]
-        let h = k.hash()
-        var sl = int((h ^ (h >> 32)) & u64(mask))
-        while nvs[sl] != 0 { sl = (sl + 1) & mask }
-        nks[sl] = k
-        nvs[sl] = v
+    var ns: []int = array(cap * 2, 0)
+    var i = 0
+    let nOld = len(t.slots)
+    while i < nOld {
+        let v = t.slots[i + 1]
+        if v != 0 {
+            let k = t.slots[i]
+            var h = (k ^ (k >> 30)) *% 0x2545f4914f6cdd1d
+            h = h ^ (h >> 27)
+            var sl = h & mask
+            while ns[sl * 2 + 1] != 0 { sl = (sl + 1) & mask }
+            ns[sl * 2] = k
+            ns[sl * 2 + 1] = v
+        }
+        i += 2
     }
-    t.ks = nks
-    t.vs = nvs
+    t.slots = ns
     t.mask = mask
 }
 
 // Increments count for key k; returns true if k was newly inserted.
 pub fn (t: mut &FastIntCount) inc(k: int): bool {
-    if len(t.vs) == 0 || (t.len + 1) * 10 >= len(t.vs) * 6 {
+    let cap = len(t.slots) / 2
+    if cap == 0 || (t.len + 1) * 10 >= cap * 6 {
         t.grow()
     }
     let mask = t.mask
-    let h = k.hash()
-    var sl = int((h ^ (h >> 32)) & u64(mask))
+    var h = (k ^ (k >> 30)) *% 0x2545f4914f6cdd1d
+    h = h ^ (h >> 27)
+    var sl = h & mask
     while true {
-        let v = t.vs[sl]
+        let base = sl * 2
+        let v = t.slots[base + 1]
         if v == 0 {
-            t.ks[sl] = k
-            t.vs[sl] = 1
+            t.slots[base] = k
+            t.slots[base + 1] = 1
             t.len += 1
             return true
         }
-        if t.ks[sl] == k {
-            t.vs[sl] = v + 1
+        if t.slots[base] == k {
+            t.slots[base + 1] = v + 1
             return false
         }
         sl = (sl + 1) & mask
@@ -111,86 +131,374 @@ pub fn (t: mut &FastIntCount) inc(k: int): bool {
     return false
 }
 
+pub fn (t: mut &FastIntCount) buildFilter(room: int) {
+    let words = bloomWords(t.len, room)
+    if words == 0 { return }
+    let bm = words - 1
+    var bf: []u64 = array(words, u64(0))
+    var i = 0
+    let n = len(t.slots)
+    while i < n {
+        if t.slots[i + 1] != 0 {
+            let k = t.slots[i]
+            var h = (k ^ (k >> 30)) *% 0x2545f4914f6cdd1d
+            h = h ^ (h >> 27)
+            let wi = h & bm
+            let b = (u64(1) << ((h >> 24) & 63)) |
+                    (u64(1) << ((h >> 30) & 63)) |
+                    (u64(1) << ((h >> 36) & 63))
+            bf[wi] = bf[wi] | b
+        }
+        i += 2
+    }
+    t.bf = bf
+    t.bfMask = bm
+}
+
 pub fn (t: &FastIntCount) get(k: int): int {
     if t.len == 0 { return 0 }
+    var h = (k ^ (k >> 30)) *% 0x2545f4914f6cdd1d
+    h = h ^ (h >> 27)
+    if t.bfMask >= 0 {
+        let b = (u64(1) << ((h >> 24) & 63)) |
+                (u64(1) << ((h >> 30) & 63)) |
+                (u64(1) << ((h >> 36) & 63))
+        if (t.bf[h & t.bfMask] & b) != b { return 0 }
+    }
     let mask = t.mask
-    let h = k.hash()
-    var sl = int((h ^ (h >> 32)) & u64(mask))
+    var sl = h & mask
     while true {
-        let v = t.vs[sl]
+        let base = sl * 2
+        let v = t.slots[base + 1]
         if v == 0 { return 0 }
-        if t.ks[sl] == k { return v }
+        if t.slots[base] == k { return v }
         sl = (sl + 1) & mask
     }
     return 0
 }
 
-// ============================================================================
-// 0b. FastInt2Count & FastInt2Map: Flat open-addressed (int64, int64) tables
-//     for 2-column 64-bit integer hash joins (JK_INT2_64), zero string allocs.
-// ============================================================================
-
-fn mix2(k0: int, k1: int): u64 {
-    let h0 = k0.hash()
-    let h1 = k1.hash()
-    let x = h0 ^ (h1 << 1) ^ (h1 >> 7)
-    return x ^ (x >> 32)
+// Vectorized batch weight-multiplication for an intermediate JK_INT countOnly level.
+// Writes w2[r] (0 for dropped rows) and returns the number of kept rows (w2[r] > 0).
+pub fn (t: &FastIntCount) mulWeights(at0: &[]int, kv: &[]int, knul: &[]bool, ws: &[]int, n: int,
+                                     left: bool, anti: bool, antiNull: bool,
+                                     w2: mut &[]int, matched: mut &int, nulls: mut &int): int {
+    let tLen = t.len
+    let mask = t.mask
+    let bfMask = t.bfMask
+    let hasBf = bfMask >= 0
+    var kept = 0
+    var mat = 0
+    var nul = 0
+    if !left && !anti {
+        if tLen == 0 { return 0 }
+        for r in 0..n {
+            let wr = ws[r]
+            if wr == 0 { continue }
+            let sr = at0[r]
+            if sr < 0 || knul[sr] { continue }
+            let k = kv[sr]
+            var h = (k ^ (k >> 30)) *% 0x2545f4914f6cdd1d
+            h = h ^ (h >> 27)
+            if hasBf {
+                let b = (u64(1) << ((h >> 24) & 63)) |
+                        (u64(1) << ((h >> 30) & 63)) |
+                        (u64(1) << ((h >> 36) & 63))
+                if (t.bf[h & bfMask] & b) != b { continue }
+            }
+            var sl = h & mask
+            while true {
+                let base = sl * 2
+                let v = t.slots[base + 1]
+                if v == 0 { break }
+                if t.slots[base] == k {
+                    let nw = wr * v
+                    w2[r] = nw
+                    mat += nw
+                    kept += 1
+                    break
+                }
+                sl = (sl + 1) & mask
+            }
+        }
+        matched += mat
+        return kept
+    }
+    for r in 0..n {
+        let wr = ws[r]
+        if wr == 0 { continue }
+        let sr = at0[r]
+        var m = 0
+        if tLen > 0 && sr >= 0 && !knul[sr] {
+            let k = kv[sr]
+            var h = (k ^ (k >> 30)) *% 0x2545f4914f6cdd1d
+            h = h ^ (h >> 27)
+            var ok = true
+            if hasBf {
+                let b = (u64(1) << ((h >> 24) & 63)) |
+                        (u64(1) << ((h >> 30) & 63)) |
+                        (u64(1) << ((h >> 36) & 63))
+                if (t.bf[h & bfMask] & b) != b { ok = false }
+            }
+            if ok {
+                var sl = h & mask
+                while true {
+                    let base = sl * 2
+                    let v = t.slots[base + 1]
+                    if v == 0 { break }
+                    if t.slots[base] == k { m = v; break }
+                    sl = (sl + 1) & mask
+                }
+            }
+        }
+        if anti {
+            if m == 0 { w2[r] = wr; kept += 1; if antiNull { nul += wr } }
+            else { mat += wr * (if antiNull { m } else { 1 }) }
+        } else {
+            kept += 1
+            if m > 0 { let nw = wr * m; w2[r] = nw; mat += nw } else { w2[r] = wr; nul += wr }
+        }
+    }
+    matched += mat
+    nulls += nul
+    return kept
 }
 
+// Vectorized batch terminal count probe for JK_INT (isLast).
+pub fn (t: &FastIntCount) sumLast1W(at0: &[]int, kv: &[]int, knul: &[]bool, ws: &[]int, n: int,
+                                    left: bool, anti: bool, antiNull: bool,
+                                    acc: mut &int, matched: mut &int, nulls: mut &int) {
+    let tLen = t.len
+    let mask = t.mask
+    let bfMask = t.bfMask
+    let hasBf = bfMask >= 0
+    var a = 0
+    var mat = 0
+    var nul = 0
+    if !left && !anti {
+        if tLen == 0 { return }
+        for r in 0..n {
+            let wr = ws[r]
+            if wr == 0 { continue }
+            let sr = at0[r]
+            if sr < 0 || knul[sr] { continue }
+            let k = kv[sr]
+            var h = (k ^ (k >> 30)) *% 0x2545f4914f6cdd1d
+            h = h ^ (h >> 27)
+            if hasBf {
+                let b = (u64(1) << ((h >> 24) & 63)) |
+                        (u64(1) << ((h >> 30) & 63)) |
+                        (u64(1) << ((h >> 36) & 63))
+                if (t.bf[h & bfMask] & b) != b { continue }
+            }
+            var sl = h & mask
+            while true {
+                let base = sl * 2
+                let v = t.slots[base + 1]
+                if v == 0 { break }
+                if t.slots[base] == k { a += wr * v; break }
+                sl = (sl + 1) & mask
+            }
+        }
+        acc += a
+        matched += a
+        return
+    }
+    for r in 0..n {
+        let wr = ws[r]
+        if wr == 0 { continue }
+        let sr = at0[r]
+        var m = 0
+        if tLen > 0 && sr >= 0 && !knul[sr] {
+            let k = kv[sr]
+            var h = (k ^ (k >> 30)) *% 0x2545f4914f6cdd1d
+            h = h ^ (h >> 27)
+            var ok = true
+            if hasBf {
+                let b = (u64(1) << ((h >> 24) & 63)) |
+                        (u64(1) << ((h >> 30) & 63)) |
+                        (u64(1) << ((h >> 36) & 63))
+                if (t.bf[h & bfMask] & b) != b { ok = false }
+            }
+            if ok {
+                var sl = h & mask
+                while true {
+                    let base = sl * 2
+                    let v = t.slots[base + 1]
+                    if v == 0 { break }
+                    if t.slots[base] == k { m = v; break }
+                    sl = (sl + 1) & mask
+                }
+            }
+        }
+        if anti {
+            if m == 0 { a += wr; if antiNull { nul += wr } }
+            else { mat += wr * (if antiNull { m } else { 1 }) }
+        } else {
+            if m > 0 { let nw = wr * m; a += nw; mat += nw } else { a += wr; nul += wr }
+        }
+    }
+    acc += a
+    matched += mat
+    nulls += nul
+}
+
+// Vectorized batch terminal count probe for packed 2x32-bit JK_INT2 (isLast).
+pub fn (t: &FastIntCount) sumLast2W(at0: &[]int, at1: &[]int, kv0: &[]int, nul0: &[]bool,
+                                    kv1: &[]int, nul1: &[]bool, ws: &[]int, n: int,
+                                    left: bool, anti: bool, antiNull: bool,
+                                    acc: mut &int, matched: mut &int, nulls: mut &int) {
+    let tLen = t.len
+    let mask = t.mask
+    let bfMask = t.bfMask
+    let hasBf = bfMask >= 0
+    var a = 0
+    var mat = 0
+    var nul = 0
+    if !left && !anti {
+        if tLen == 0 { return }
+        for r in 0..n {
+            let wr = ws[r]
+            if wr == 0 { continue }
+            let sr0 = at0[r]
+            let sr1 = at1[r]
+            if sr0 < 0 || sr1 < 0 || nul0[sr0] || nul1[sr1] { continue }
+            let v0 = kv0[sr0]
+            let v1 = kv1[sr1]
+            if v0 < -2147483648 || v0 > 2147483647 || v1 < -2147483648 || v1 > 2147483647 { continue }
+            let k = (v0 << 32) | (v1 & 0xFFFFFFFF)
+            var h = (k ^ (k >> 30)) *% 0x2545f4914f6cdd1d
+            h = h ^ (h >> 27)
+            if hasBf {
+                let b = (u64(1) << ((h >> 24) & 63)) |
+                        (u64(1) << ((h >> 30) & 63)) |
+                        (u64(1) << ((h >> 36) & 63))
+                if (t.bf[h & bfMask] & b) != b { continue }
+            }
+            var sl = h & mask
+            while true {
+                let base = sl * 2
+                let v = t.slots[base + 1]
+                if v == 0 { break }
+                if t.slots[base] == k { a += wr * v; break }
+                sl = (sl + 1) & mask
+            }
+        }
+        acc += a
+        matched += a
+        return
+    }
+    for r in 0..n {
+        let wr = ws[r]
+        if wr == 0 { continue }
+        let sr0 = at0[r]
+        let sr1 = at1[r]
+        var m = 0
+        if tLen > 0 && sr0 >= 0 && sr1 >= 0 && !nul0[sr0] && !nul1[sr1] {
+            let v0 = kv0[sr0]
+            let v1 = kv1[sr1]
+            if v0 >= -2147483648 && v0 <= 2147483647 && v1 >= -2147483648 && v1 <= 2147483647 {
+                let k = (v0 << 32) | (v1 & 0xFFFFFFFF)
+                var h = (k ^ (k >> 30)) *% 0x2545f4914f6cdd1d
+                h = h ^ (h >> 27)
+                var ok = true
+                if hasBf {
+                    let b = (u64(1) << ((h >> 24) & 63)) |
+                            (u64(1) << ((h >> 30) & 63)) |
+                            (u64(1) << ((h >> 36) & 63))
+                    if (t.bf[h & bfMask] & b) != b { ok = false }
+                }
+                if ok {
+                    var sl = h & mask
+                    while true {
+                        let base = sl * 2
+                        let v = t.slots[base + 1]
+                        if v == 0 { break }
+                        if t.slots[base] == k { m = v; break }
+                        sl = (sl + 1) & mask
+                    }
+                }
+            }
+        }
+        if anti {
+            if m == 0 { a += wr; if antiNull { nul += wr } }
+            else { mat += wr * (if antiNull { m } else { 1 }) }
+        } else {
+            if m > 0 { let nw = wr * m; a += nw; mat += nw } else { a += wr; nul += wr }
+        }
+    }
+    acc += a
+    matched += mat
+    nulls += nul
+}
+
+// ============================================================================
+// 0b. FastInt2Count & FastInt2Map: Flat open-addressed (int64, int64) tables
+//     with cache-line-packed [k0, k1, v] slots and L3 Bloom pre-filters.
+// ============================================================================
+
 pub type FastInt2Count = record {
-    pub ks0: []int
-    pub ks1: []int
-    pub vs: []int       // slot -> count (0 = empty)
+    slots: []int        // interleaved [k0, k1, v] per slot (v == 0 means empty)
     mask: int
     len: int
+    bf: []u64
+    bfMask: int
 }
 
 pub fn newFastInt2Count(): FastInt2Count {
-    return FastInt2Count{ks0: [], ks1: [], vs: [], mask: 0, len: 0}
+    return FastInt2Count{slots: [], mask: 0, len: 0, bf: [], bfMask: -1}
 }
 
 pub fn (t: &FastInt2Count) size(): int { return t.len }
 
 fn (t: mut &FastInt2Count) grow() {
-    let cap = if len(t.vs) == 0 { 1024 } else { len(t.vs) * 2 }
+    let cap = if len(t.slots) == 0 { 1024 } else { (len(t.slots) / 3) * 2 }
     let mask = cap - 1
-    var nks0: []int = array(cap, 0)
-    var nks1: []int = array(cap, 0)
-    var nvs: []int = array(cap, 0)
-    for i in 0..len(t.vs) {
-        let v = t.vs[i]
-        if v == 0 { continue }
-        let k0 = t.ks0[i]
-        let k1 = t.ks1[i]
-        var sl = int(mix2(k0, k1) & u64(mask))
-        while nvs[sl] != 0 { sl = (sl + 1) & mask }
-        nks0[sl] = k0
-        nks1[sl] = k1
-        nvs[sl] = v
+    var ns: []int = array(cap * 3, 0)
+    var i = 0
+    let nOld = len(t.slots)
+    while i < nOld {
+        let v = t.slots[i + 2]
+        if v != 0 {
+            let k0 = t.slots[i]
+            let k1 = t.slots[i + 1]
+            var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
+            h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
+            h = h ^ (h >> 31)
+            var sl = h & mask
+            while ns[sl * 3 + 2] != 0 { sl = (sl + 1) & mask }
+            let base = sl * 3
+            ns[base] = k0
+            ns[base + 1] = k1
+            ns[base + 2] = v
+        }
+        i += 3
     }
-    t.ks0 = nks0
-    t.ks1 = nks1
-    t.vs = nvs
+    t.slots = ns
     t.mask = mask
 }
 
 pub fn (t: mut &FastInt2Count) inc(k0: int, k1: int): bool {
-    if len(t.vs) == 0 || (t.len + 1) * 10 >= len(t.vs) * 6 {
+    let cap = len(t.slots) / 3
+    if cap == 0 || (t.len + 1) * 10 >= cap * 6 {
         t.grow()
     }
     let mask = t.mask
-    var sl = int(mix2(k0, k1) & u64(mask))
+    var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
+    h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
+    h = h ^ (h >> 31)
+    var sl = h & mask
     while true {
-        let v = t.vs[sl]
+        let base = sl * 3
+        let v = t.slots[base + 2]
         if v == 0 {
-            t.ks0[sl] = k0
-            t.ks1[sl] = k1
-            t.vs[sl] = 1
+            t.slots[base] = k0
+            t.slots[base + 1] = k1
+            t.slots[base + 2] = 1
             t.len += 1
             return true
         }
-        if t.ks0[sl] == k0 && t.ks1[sl] == k1 {
-            t.vs[sl] = v + 1
+        if t.slots[base] == k0 && t.slots[base + 1] == k1 {
+            t.slots[base + 2] = v + 1
             return false
         }
         sl = (sl + 1) & mask
@@ -198,73 +506,236 @@ pub fn (t: mut &FastInt2Count) inc(k0: int, k1: int): bool {
     return false
 }
 
+pub fn (t: mut &FastInt2Count) buildFilter(room: int) {
+    let words = bloomWords(t.len, room)
+    if words == 0 { return }
+    let bm = words - 1
+    var bf: []u64 = array(words, u64(0))
+    var i = 0
+    let n = len(t.slots)
+    while i < n {
+        if t.slots[i + 2] != 0 {
+            var h = (t.slots[i] *% 0x517cc1b727220a95) ^ (t.slots[i + 1] *% 0x2545f4914f6cdd1d)
+            h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
+            h = h ^ (h >> 31)
+            let wi = h & bm
+            let b = (u64(1) << ((h >> 24) & 63)) |
+                    (u64(1) << ((h >> 30) & 63)) |
+                    (u64(1) << ((h >> 36) & 63))
+            bf[wi] = bf[wi] | b
+        }
+        i += 3
+    }
+    t.bf = bf
+    t.bfMask = bm
+}
+
 pub fn (t: &FastInt2Count) get(k0: int, k1: int): int {
     if t.len == 0 { return 0 }
+    var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
+    h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
+    h = h ^ (h >> 31)
+    if t.bfMask >= 0 {
+        let b = (u64(1) << ((h >> 24) & 63)) |
+                (u64(1) << ((h >> 30) & 63)) |
+                (u64(1) << ((h >> 36) & 63))
+        if (t.bf[h & t.bfMask] & b) != b { return 0 }
+    }
     let mask = t.mask
-    var sl = int(mix2(k0, k1) & u64(mask))
+    var sl = h & mask
     while true {
-        let v = t.vs[sl]
+        let base = sl * 3
+        let v = t.slots[base + 2]
         if v == 0 { return 0 }
-        if t.ks0[sl] == k0 && t.ks1[sl] == k1 { return v }
+        if t.slots[base] == k0 && t.slots[base + 1] == k1 { return v }
         sl = (sl + 1) & mask
     }
     return 0
 }
 
+// Vectorized batch terminal count probe for JK_INT2_64 (isLast): zero per-row calls.
+pub fn (t: &FastInt2Count) sumLastW(at0: &[]int, at1: &[]int, kv0: &[]int, nul0: &[]bool,
+                                    kv1: &[]int, nul1: &[]bool, ws: &[]int, n: int,
+                                    left: bool, anti: bool, antiNull: bool,
+                                    acc: mut &int, matched: mut &int, nulls: mut &int) {
+    let tLen = t.len
+    let mask = t.mask
+    let bfMask = t.bfMask
+    let hasBf = bfMask >= 0
+    var a = 0
+    var mat = 0
+    var nul = 0
+    if anti {
+        for r in 0..n {
+            let wr = ws[r]
+            if wr == 0 { continue }
+            let sr0 = at0[r]
+            let sr1 = at1[r]
+            var m = 0
+            if tLen > 0 && sr0 >= 0 && sr1 >= 0 && !nul0[sr0] && !nul1[sr1] {
+                let k0 = kv0[sr0]
+                let k1 = kv1[sr1]
+                var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
+                h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
+                h = h ^ (h >> 31)
+                var ok = true
+                if hasBf {
+                    let b = (u64(1) << ((h >> 24) & 63)) |
+                            (u64(1) << ((h >> 30) & 63)) |
+                            (u64(1) << ((h >> 36) & 63))
+                    if (t.bf[h & bfMask] & b) != b { ok = false }
+                }
+                if ok {
+                    var sl = h & mask
+                    while true {
+                        let base = sl * 3
+                        let v = t.slots[base + 2]
+                        if v == 0 { break }
+                        if t.slots[base] == k0 && t.slots[base + 1] == k1 { m = v; break }
+                        sl = (sl + 1) & mask
+                    }
+                }
+            }
+            if m == 0 { a += wr; if antiNull { nul += wr } }
+            else { mat += wr * (if antiNull { m } else { 1 }) }
+        }
+        acc += a
+        matched += mat
+        nulls += nul
+        return
+    }
+    if !left {
+        if tLen == 0 { return }
+        for r in 0..n {
+            let wr = ws[r]
+            if wr == 0 { continue }
+            let sr0 = at0[r]
+            let sr1 = at1[r]
+            if sr0 < 0 || sr1 < 0 || nul0[sr0] || nul1[sr1] { continue }
+            let k0 = kv0[sr0]
+            let k1 = kv1[sr1]
+            var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
+            h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
+            h = h ^ (h >> 31)
+            if hasBf {
+                let b = (u64(1) << ((h >> 24) & 63)) |
+                        (u64(1) << ((h >> 30) & 63)) |
+                        (u64(1) << ((h >> 36) & 63))
+                if (t.bf[h & bfMask] & b) != b { continue }
+            }
+            var sl = h & mask
+            while true {
+                let base = sl * 3
+                let v = t.slots[base + 2]
+                if v == 0 { break }
+                if t.slots[base] == k0 && t.slots[base + 1] == k1 { a += wr * v; break }
+                sl = (sl + 1) & mask
+            }
+        }
+        acc += a
+        matched += a
+        return
+    }
+    for r in 0..n {
+        let wr = ws[r]
+        if wr == 0 { continue }
+        let sr0 = at0[r]
+        let sr1 = at1[r]
+        var m = 0
+        if tLen > 0 && sr0 >= 0 && sr1 >= 0 && !nul0[sr0] && !nul1[sr1] {
+            let k0 = kv0[sr0]
+            let k1 = kv1[sr1]
+            var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
+            h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
+            h = h ^ (h >> 31)
+            var ok = true
+            if hasBf {
+                let b = (u64(1) << ((h >> 24) & 63)) |
+                        (u64(1) << ((h >> 30) & 63)) |
+                        (u64(1) << ((h >> 36) & 63))
+                if (t.bf[h & bfMask] & b) != b { ok = false }
+            }
+            if ok {
+                var sl = h & mask
+                while true {
+                    let base = sl * 3
+                    let v = t.slots[base + 2]
+                    if v == 0 { break }
+                    if t.slots[base] == k0 && t.slots[base + 1] == k1 { m = v; break }
+                    sl = (sl + 1) & mask
+                }
+            }
+        }
+        if m > 0 { let nw = wr * m; a += nw; mat += nw } else { a += wr; nul += wr }
+    }
+    acc += a
+    matched += mat
+    nulls += nul
+}
+
 pub type FastInt2Map = record {
-    pub ks0: []int
-    pub ks1: []int
-    pub vs: []int       // slot -> bucket + 1 (0 = empty)
+    slots: []int        // interleaved [k0, k1, bucket + 1] per slot (0 = empty)
     mask: int
     len: int
+    bf: []u64
+    bfMask: int
 }
 
 pub fn newFastInt2Map(): FastInt2Map {
-    return FastInt2Map{ks0: [], ks1: [], vs: [], mask: 0, len: 0}
+    return FastInt2Map{slots: [], mask: 0, len: 0, bf: [], bfMask: -1}
 }
 
 pub fn (t: &FastInt2Map) size(): int { return t.len }
 
 fn (t: mut &FastInt2Map) grow() {
-    let cap = if len(t.vs) == 0 { 1024 } else { len(t.vs) * 2 }
+    let cap = if len(t.slots) == 0 { 1024 } else { (len(t.slots) / 3) * 2 }
     let mask = cap - 1
-    var nks0: []int = array(cap, 0)
-    var nks1: []int = array(cap, 0)
-    var nvs: []int = array(cap, 0)
-    for i in 0..len(t.vs) {
-        let v = t.vs[i]
-        if v == 0 { continue }
-        let k0 = t.ks0[i]
-        let k1 = t.ks1[i]
-        var sl = int(mix2(k0, k1) & u64(mask))
-        while nvs[sl] != 0 { sl = (sl + 1) & mask }
-        nks0[sl] = k0
-        nks1[sl] = k1
-        nvs[sl] = v
+    var ns: []int = array(cap * 3, 0)
+    var i = 0
+    let nOld = len(t.slots)
+    while i < nOld {
+        let v = t.slots[i + 2]
+        if v != 0 {
+            let k0 = t.slots[i]
+            let k1 = t.slots[i + 1]
+            var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
+            h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
+            h = h ^ (h >> 31)
+            var sl = h & mask
+            while ns[sl * 3 + 2] != 0 { sl = (sl + 1) & mask }
+            let base = sl * 3
+            ns[base] = k0
+            ns[base + 1] = k1
+            ns[base + 2] = v
+        }
+        i += 3
     }
-    t.ks0 = nks0
-    t.ks1 = nks1
-    t.vs = nvs
+    t.slots = ns
     t.mask = mask
 }
 
 // Returns existing bucket (>= 0) or inserts nextBk and returns nextBk.
 pub fn (t: mut &FastInt2Map) getOrPut(k0: int, k1: int, nextBk: int): int {
-    if len(t.vs) == 0 || (t.len + 1) * 10 >= len(t.vs) * 6 {
+    let cap = len(t.slots) / 3
+    if cap == 0 || (t.len + 1) * 10 >= cap * 6 {
         t.grow()
     }
     let mask = t.mask
-    var sl = int(mix2(k0, k1) & u64(mask))
+    var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
+    h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
+    h = h ^ (h >> 31)
+    var sl = h & mask
     while true {
-        let v = t.vs[sl]
+        let base = sl * 3
+        let v = t.slots[base + 2]
         if v == 0 {
-            t.ks0[sl] = k0
-            t.ks1[sl] = k1
-            t.vs[sl] = nextBk + 1
+            t.slots[base] = k0
+            t.slots[base + 1] = k1
+            t.slots[base + 2] = nextBk + 1
             t.len += 1
             return nextBk
         }
-        if t.ks0[sl] == k0 && t.ks1[sl] == k1 {
+        if t.slots[base] == k0 && t.slots[base + 1] == k1 {
             return v - 1
         }
         sl = (sl + 1) & mask
@@ -272,14 +743,48 @@ pub fn (t: mut &FastInt2Map) getOrPut(k0: int, k1: int, nextBk: int): int {
     return nextBk
 }
 
+pub fn (t: mut &FastInt2Map) buildFilter(room: int) {
+    let words = bloomWords(t.len, room)
+    if words == 0 { return }
+    let bm = words - 1
+    var bf: []u64 = array(words, u64(0))
+    var i = 0
+    let n = len(t.slots)
+    while i < n {
+        if t.slots[i + 2] != 0 {
+            var h = (t.slots[i] *% 0x517cc1b727220a95) ^ (t.slots[i + 1] *% 0x2545f4914f6cdd1d)
+            h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
+            h = h ^ (h >> 31)
+            let wi = h & bm
+            let b = (u64(1) << ((h >> 24) & 63)) |
+                    (u64(1) << ((h >> 30) & 63)) |
+                    (u64(1) << ((h >> 36) & 63))
+            bf[wi] = bf[wi] | b
+        }
+        i += 3
+    }
+    t.bf = bf
+    t.bfMask = bm
+}
+
 pub fn (t: &FastInt2Map) get(k0: int, k1: int): int {
     if t.len == 0 { return -1 }
+    var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
+    h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
+    h = h ^ (h >> 31)
+    if t.bfMask >= 0 {
+        let b = (u64(1) << ((h >> 24) & 63)) |
+                (u64(1) << ((h >> 30) & 63)) |
+                (u64(1) << ((h >> 36) & 63))
+        if (t.bf[h & t.bfMask] & b) != b { return -1 }
+    }
     let mask = t.mask
-    var sl = int(mix2(k0, k1) & u64(mask))
+    var sl = h & mask
     while true {
-        let v = t.vs[sl]
+        let base = sl * 3
+        let v = t.slots[base + 2]
         if v == 0 { return -1 }
-        if t.ks0[sl] == k0 && t.ks1[sl] == k1 { return v - 1 }
+        if t.slots[base] == k0 && t.slots[base + 1] == k1 { return v - 1 }
         sl = (sl + 1) & mask
     }
     return -1
