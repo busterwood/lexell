@@ -42,6 +42,7 @@ import "./lexdb_nnalter"
 import "./lexdb_annot"
 import "./lexdb_graph"
 import "./lexdb_mview"
+import "./lexdb_skip"
 import "./lexdb_sql"
 import "./lexdb_json"
 import "./lexdb_plan"
@@ -807,6 +808,18 @@ fn analyzeStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         }
     }
     try lexdb_stats.analyze(st, txn, &tabs, lexdb_pipe.deadlineNs(lim.deadline), &statsUp())
+    // Rebuild persisted skipping index summaries on analyzed tables so cold-restart skipping stays fresh
+    for t in tabs {
+        let sms = try lexdb_skip.listTableMetas(st, txn, &t.name)
+        if len(sms) > 0 {
+            let rel = lexdb_catalog.relOf(&t)
+            let rw = lexdb_access.rowsFor(&rel)
+            for sm in sms {
+                if sm.tree > 0 { txn.delRange(sm.tree, &"", &"") }
+                let _ = try lexdb_skip.buildAndPersistIndex(st, txn, &sm, &rw)
+            }
+        }
+    }
     // a temporary table's statistics are its session's alone: its kept
     // plans are made again (tmpBump), no other session's (optimizer 40)
     var perm = false
@@ -4850,6 +4863,7 @@ fn dropTableNamed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str,
             try unlinkTable(st, txn, mut &d, s.cascade)
             try dropOwnedSeqs(st, txn, &d, &"")
             if !lexdb_catalog.tempRel(&d.name) && (try lexdb_mview.readLog(st, txn, &d.name)).isSome() { lexdb_mview.delLog(txn, &d.name) }
+            try lexdb_skip.dropAllForTable(st, txn, &d.name, d.tree)
             dropOne(txn, &d)
             try bumpFor(st, txn, &d.name)
             return Ok(tagOnly("DROP TABLE"))
@@ -4915,6 +4929,7 @@ fn truncate(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             txn.dropTree(oi)
         }
         try putTable(txn, &t)
+        try lexdb_skip.onTruncate(st, txn, &t.name, old, t.tree)
         lexdb_assert.truncated(txn, &t, s.mdialect)     // (O23)
         lexdb_mview.recordTruncate(txn, &t)
         for d in seqs { if d.ownerT == t.name { try setVal(st, &d, d.start, false) } }
@@ -6884,6 +6899,7 @@ fn dropSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
 // CREATE [UNIQUE] INDEX: a tree of its own, filled from the table's rows in
 // the same transaction.
 fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    if len(s.skipMethod) > 0 { return createSkipIndex(st, txn, s) }
     if s.conc && txn.inBlock() { return Err(e("25001", "CREATE INDEX CONCURRENTLY cannot run inside a transaction block")) }
     // SQL Server Indexed Views: CREATE UNIQUE CLUSTERED INDEX on a WITH SCHEMABINDING view promotes it to a FAST ON STATEMENT MV.
     if s.mdialect == lexdb_sql.MD_TSQL {
@@ -6979,6 +6995,85 @@ fn createIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
     if s.cluster == 1 { lexdb_catalog.setCluster(mut &t, &ixBase) }
     try lexdb_annot.onIndex(mut &t, &ixBase, &s.alters)
     try txn.put(lexdb_catalog.CATALOG, &t.name, &(lexdb_catalog.encTable(&t)))
+    try bumpFor(st, txn, &t.name)
+    return Ok(tagOnly("CREATE INDEX"))
+}
+
+fn skipColPlaceKind(col: &lexdb_sql.ColDef): byte {
+    let oid = col.typ.oid
+    if oid == lexdb_sql.OID_INT2 { return lexdb_rows.PK_INT2 }
+    if oid == lexdb_sql.OID_INT4 { return lexdb_rows.PK_INT4 }
+    if oid == lexdb_sql.OID_INT8 { return lexdb_rows.PK_INT }
+    if oid == lexdb_sql.OID_DATE { return lexdb_rows.PK_DATE }
+    if oid == lexdb_sql.OID_TIME { return lexdb_rows.PK_TIME }
+    if oid == lexdb_sql.OID_TS { return lexdb_rows.PK_TS }
+    if oid == lexdb_sql.OID_TSTZ && !lexdb_sql.isTszType(&col.typ) { return lexdb_rows.PK_TSTZ }
+    if col.typ.kind == lexdb_sql.K_TEXT {
+        let ck = lexdb_sql.collKind(&col.coll)
+        if ck == lexdb_sql.COLL_EXACT || ck == lexdb_sql.COLL_CI { return lexdb_rows.PK_TEXT }
+    }
+    return lexdb_rows.PK_NONE
+}
+
+fn createSkipIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    if s.conc && txn.inBlock() { return Err(e("25001", "CREATE INDEX CONCURRENTLY cannot run inside a transaction block")) }
+    let kind = lexdb_skip.parseKind(&s.skipMethod)
+    if kind == 0 { return Err(e("0A000", &("skipping index method \"" + s.skipMethod + "\" is not supported"))) }
+    if len(s.names) != 1 || len(s.names[0]) == 0 {
+        return Err(e("0A000", "skipping indexes support a single plain column"))
+    }
+    let t = try needTable(st, txn, &s.table)
+    try lexdb_priv.needRelOwner(st, txn, &t.name, &"table")
+    let colName = s.names[0].clone()
+    let ci = lexdb_bind.colIndex(&t.cols, &colName)
+    if ci < 0 { return Err(e("42703", &("column \"" + colName + "\" does not exist"))) }
+    let pk = skipColPlaceKind(&t.cols[ci])
+    if pk == lexdb_rows.PK_NONE {
+        return Err(e("0A000", &("skipping index method \"" + lexdb_skip.kindName(kind) + "\" does not support column \"" + colName + "\" type")))
+    }
+    if (kind == lexdb_skip.SKIP_NGRAM || kind == lexdb_skip.SKIP_TOKEN) && pk != lexdb_rows.PK_TEXT {
+        return Err(e("0A000", &("skipping index method \"" + lexdb_skip.kindName(kind) + "\" requires a text column")))
+    }
+    var ixName = s.index.clone()
+    if len(ixName) == 0 { ixName = try chooseIndexName(st, txn, &t, &[colName.clone()]) }
+    var ixKey = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &ixName)
+    if s.mdialect == lexdb_sql.MD_TSQL { ixKey = try lexdb_ixname.createKey(st, txn, &t, &ixKey) }
+    let existsRel = try relExists(st, txn, &ixKey)
+    let existsSkip = (try lexdb_skip.findMeta(st, txn, &ixKey)).isSome()
+    if existsRel || existsSkip {
+        if s.ifFlag {
+            notice(st, txn, &"42P07", &("relation \"" + ixName + "\" already exists, skipping"), &"")
+            return Ok(tagOnly("CREATE INDEX"))
+        }
+        return Err(e("42P07", &("relation \"" + ixName + "\" already exists")))
+    }
+    let pl = if len(t.slots) == 0 { ci } else { t.slots[ci] }
+    var m = lexdb_skip.defaultMeta(ixKey.clone(), ixName, t.name.clone(), t.tree, colName, pl, pk, kind)
+    if pk == lexdb_rows.PK_TEXT && lexdb_sql.collKind(&t.cols[ci].coll) == lexdb_sql.COLL_CI { m.ci = true }
+    // Apply optional user parameters (positional or WITH options)
+    if len(s.skipParams) >= 1 && s.skipParams[0] > 0 { m.p1 = s.skipParams[0] }
+    if len(s.skipParams) >= 2 && s.skipParams[1] > 0 { m.p2 = s.skipParams[1] }
+    if len(s.skipParams) >= 3 && s.skipParams[2] > 0 { m.p3 = s.skipParams[2] }
+    // Clamp parameters to safe bounds
+    if kind == lexdb_skip.SKIP_SET { m.p1 = max(1, min(m.p1, 4096)) }
+    if kind == lexdb_skip.SKIP_BLOOM {
+        m.p2 = max(64, min(m.p2, 65536))
+        m.p3 = max(1, min(m.p3, 8))
+    }
+    if kind == lexdb_skip.SKIP_NGRAM {
+        m.p1 = max(2, min(m.p1, 8))
+        m.p2 = max(128, min(m.p2, 65536))
+        m.p3 = max(1, min(m.p3, 8))
+    }
+    if kind == lexdb_skip.SKIP_TOKEN {
+        m.p1 = max(128, min(m.p1, 65536))
+        m.p2 = max(1, min(m.p2, 8))
+    }
+    m.tree = st.createTree(txn)
+    try txn.put(lexdb_catalog.CATALOG, &(lexdb_skip.SKIP_PRE + m.key), &(lexdb_skip.encMeta(&m)))
+    let rel = lexdb_catalog.relOf(&t)
+    let rw = lexdb_access.rowsFor(&rel)
+    let _ = try lexdb_skip.buildAndPersistIndex(st, txn, &m, &rw)
     try bumpFor(st, txn, &t.name)
     return Ok(tagOnly("CREATE INDEX"))
 }
@@ -7274,7 +7369,12 @@ fn dropConstraint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Tab
 fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     if s.conc && txn.inBlock() { return Err(e("25001", "DROP INDEX CONCURRENTLY cannot run inside a transaction block")) }
     var ixKey = try catKey(st, txn, &s.index, true)
-    if s.mdialect == lexdb_sql.MD_TSQL && len(s.table) > 0 { ixKey = try lexdb_ixname.onTable(st, txn, &ixKey, &(try needTable(st, txn, &s.table)).name) }
+    let origIxKey = ixKey.clone()
+    var tblKey = ""
+    if s.mdialect == lexdb_sql.MD_TSQL && len(s.table) > 0 {
+        tblKey = (try needTable(st, txn, &s.table)).name.clone()
+        ixKey = try lexdb_ixname.onTable(st, txn, &ixKey, &tblKey)
+    }
     match try st.get(txn, lexdb_catalog.CATALOG, &(idxName(&ixKey))) {
         Some(tn) {
             var t = try needTable(st, txn, &tn)
@@ -7316,6 +7416,25 @@ fn dropIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
             return Ok(tagOnly("DROP INDEX"))
         }
         None {
+            // Check explicit data skipping indexes (DROP [SKIPPING] INDEX)
+            var smFound = try lexdb_skip.findMeta(st, txn, &ixKey)
+            if smFound.isNone() && origIxKey != ixKey { smFound = try lexdb_skip.findMeta(st, txn, &origIxKey) }
+            if smFound.isNone() && len(tblKey) > 0 {
+                let tk = lexdb_sql.qual(&lexdb_sql.schemaOf(&tblKey), &lexdb_sql.baseName(&origIxKey))
+                smFound = try lexdb_skip.findMeta(st, txn, &tk)
+            }
+            match smFound {
+                Some(sm) {
+                    let t = try needTable(st, txn, &sm.table)
+                    try lexdb_priv.needRelOwner(st, txn, &t.name, &"index")
+                    txn.del(lexdb_catalog.CATALOG, &(lexdb_skip.SKIP_PRE + sm.key))
+                    if sm.tree > 0 { txn.dropTree(sm.tree) }
+                    lexdb_skip.invalidateTree(st.id, sm.tableTree)
+                    try bumpFor(st, txn, &t.name)
+                    return Ok(tagOnly("DROP INDEX"))
+                }
+                None {}
+            }
             if s.ifFlag {
                 notice(st, txn, &"00000", &("index \"" + lexdb_sql.shown(&s.index) + "\" does not exist, skipping"), &"")
                 return Ok(tagOnly("DROP INDEX"))
@@ -13706,6 +13825,7 @@ fn (s: &Session) setting(name: &str): Option[str] {
         "lexdb_autoanalyze" { return Some(if s.auto { "on" } else { "off" }) }
         "lexdb_range_delete" { return Some(if s.rdel { "on" } else { "off" }) }
         "query_rewrite_enabled" { return Some(if lexdb_mview.isQueryRewriteOn(s.id) { "on" } else { "off" }) }
+        "data_skipping_enabled" { return Some(if lexdb_skip.isEnabled(s.id) { "on" } else { "off" }) }
         else {}
     }
     let k = strings.toLowerAscii(&name)
@@ -13722,7 +13842,7 @@ const SHOWN: []str = ["search_path", "max_recursion", "max_match_steps", "statem
                       "transaction_read_only", "default_transaction_read_only", "in_hot_standby", "server_version",
                       "server_version_num", "server_encoding", "client_encoding", "datestyle", "timezone", "log_timezone",
                       "intervalstyle", "lc_collate", "lc_ctype", "lc_messages", "lc_monetary", "lc_numeric", "lc_time",
-                      "max_identifier_length", "application_name", "bytea_output", "lexdb_batch", "lexdb_planner", "lexdb_autoanalyze", "lexdb_range_delete", "query_rewrite_enabled"]
+                      "max_identifier_length", "application_name", "bytea_output", "lexdb_batch", "lexdb_planner", "lexdb_autoanalyze", "lexdb_range_delete", "query_rewrite_enabled", "data_skipping_enabled"]
 
 // The session's settings for current_setting and set_config (9.92), in the
 // memo while a statement calling them runs: a line each, name TAB value.
@@ -13837,6 +13957,13 @@ fn (s: mut &Session) applySetting(name: &str, value: &str, local: bool): Result[
         match lexdb_ops.parseBool(&strings.toLowerAscii(&(strings.trim(value)))) {
             Some(y) { lexdb_mview.setQueryRewrite(s.id, y) }
             None { return Err(e("22023", "parameter \"query_rewrite_enabled\" requires a Boolean value")) }
+        }
+        return Ok(Unit{})
+    }
+    if k == "data_skipping_enabled" {
+        match lexdb_ops.parseBool(&strings.toLowerAscii(&(strings.trim(value)))) {
+            Some(y) { lexdb_skip.setEnabled(s.id, y) }
+            None { return Err(e("22023", "parameter \"data_skipping_enabled\" requires a Boolean value")) }
         }
         return Ok(Unit{})
     }
@@ -14141,6 +14268,7 @@ fn (s: mut &Session) resetAll() {
     s.auto = true
     s.rdel = true
     lexdb_mview.setQueryRewrite(s.id, true)
+    lexdb_skip.setEnabled(s.id, true)
 }
 
 // Whether a statement a READ ONLY block refuses writes only temporary
@@ -14614,6 +14742,25 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
                     None {}
                 }
                 lexdb_mview.setQueryRewrite(s.id, on)
+            } else if stmt.table == "data_skipping_enabled" {
+                var on = true
+                match stmt.limit {
+                    Some(x) {
+                        let noCols: []lexdb_sql.ColDef = []
+                        let none: []Val = []
+                        let noSubs: []SubRes = []
+                        let noSeq: Option[SeqEnv] = None
+                        let env = Env{cols: &noCols, row: &none, aggs: &none, params: params, subs: &noSubs, cur: &none, seq: &noSeq}
+                        let v = try eval(&x, &env)
+                        let b = match v { Val.Text(t) { lexdb_ops.parseBool(&t) } Val.Bool(y) { Some(y) } else { None } }
+                        match b {
+                            Some(y) { on = y }
+                            None { return Err(e("22023", "parameter \"data_skipping_enabled\" requires a Boolean value")) }
+                        }
+                    }
+                    None {}
+                }
+                lexdb_skip.setEnabled(s.id, on)
             } else if stmt.table == "lexdb_range_delete" {
                 var on = true                       // DEFAULT, RESET
                 match stmt.limit {

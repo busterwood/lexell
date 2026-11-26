@@ -1,0 +1,252 @@
+// Hierarchical B+tree Data Skipping Indexes & Automatic Zone Maps:
+// - Automatic zero-config hierarchical zone maps (range, <>, IN, dynamic Top-N Bar)
+// - Explicit skipping indexes: minmax/brin (text & int), set, bloom_filter, ngrambf, tokenbf
+// - Live DML invalidation (INSERT / UPDATE / DELETE + ROLLBACK) with 0 false negatives
+// - MVCC REPEATABLE READ snapshot isolation safety
+// - Cold-restart disk-page persistence (skipping on very first query after reopen!)
+// - DDL lifecycle: CREATE [SKIPPING] INDEX, IF NOT EXISTS, error checks, DROP [SKIPPING] INDEX,
+//   TRUNCATE, ANALYZE rebuild, DROP TABLE cleanup.
+// expect: auto_hier: ok
+// expect: auto_ne_in: ok
+// expect: auto_topn: ok
+// expect: explicit_minmax: ok
+// expect: explicit_set: ok
+// expect: explicit_bloom: ok
+// expect: explicit_ngram: ok
+// expect: explicit_token: ok
+// expect: dml_inval: ok
+// expect: mvcc_snap: ok
+// expect: reopen_cold: ok
+// expect: ddl_lifecycle: ok
+import "strings"
+import "../../../cmd/lexdb_base"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_skip"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return "ERR:" + e.state + ":" + e.msg }
+    }
+}
+
+fn qInt(s: mut &lexdb_exec.Session, sql: &str): int {
+    match s.exec(sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows && len(r.rows) > 0 && len(r.rows[0]) > 0 {
+                match r.rows[0][0] {
+                    lexdb_sql.Val.Int(i) { return i }
+                    else { return -999999 }
+                }
+            }
+            return -999999
+        }
+        Err(_) { return -999999 }
+    }
+}
+
+fn must(s: mut &lexdb_exec.Session, sql: &str) {
+    let r = q(s, sql)
+    if strings.startsWith(&r, "ERR:") { panic("SQL failed: " + sql + " -> " + r) }
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 512 * 1024, ckptBytes: 256 * 1024, snapNodes: 50000}
+}
+
+fn runPhase1(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var s = lexdb_exec.newSession(st.share())
+
+    // Build a table large enough to span dozens of leaves and multiple internal B+tree nodes!
+    must(mut &s, "CREATE TABLE events (id BIGINT PRIMARY KEY, ts BIGINT, grp BIGINT, user_id BIGINT, code TEXT, status TEXT, url TEXT)")
+    // Insert 12,000 rows so B+tree has 3 levels (root -> internal -> column leaves)
+    must(mut &s, "INSERT INTO events SELECT g, g * 10, CASE WHEN g = 11500 THEN 2 ELSE 1 END, ((g * 2654435761) % 900000000) + 1000, 'c_' || LPAD(CAST(g AS TEXT), 6, '0'), CASE WHEN g IN (500, 11500) THEN 'rare' ELSE 'common' END, CASE WHEN g IN (777, 11777) THEN 'https://docs.google.com/search?q=needle' ELSE 'https://site' || CAST(g % 200 AS TEXT) || '.example.org/page/' || CAST(g AS TEXT) END FROM generate_series(1, 12000) AS g")
+    // Force checkpoint so all leaves pack into T_CLEAF column leaves and get immutable disk page numbers!
+    st.checkpoint().unwrap()
+
+    // 1. Automatic zero-config hierarchical zone maps (NO explicit skipping index!)
+    // Warm the cache with one selective scan (visits leaves, rolls up internal nodes post-order!)
+    let w1 = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE ts BETWEEN 115000 AND 115050")
+    lexdb_skip.resetCounters()
+    let c1 = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE ts BETWEEN 115000 AND 115050")
+    let sub1 = lexdb_skip.subtreesSkipped()
+    let leaf1 = lexdb_skip.leavesSkipped()
+    let autoHierOk = w1 == 6 && c1 == 6 && (sub1 > 0 || leaf1 > 10)
+    println("auto_hier: " + (if autoHierOk { "ok" } else { "FAIL:" + w1.toStr() + ":" + c1.toStr() + ":sub=" + sub1.toStr() + ":leaf=" + leaf1.toStr() }))
+
+    // 2. Automatic <> (not-equal) and IN (...) skipping
+    lexdb_skip.resetCounters()
+    let cNe = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE grp <> 1")
+    let skNe = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+    lexdb_skip.resetCounters()
+    let cIn = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE ts IN (50, 119990)")
+    let skIn = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+    let autoNeInOk = cNe == 1 && skNe > 0 && cIn == 2 && skIn > 0
+    println("auto_ne_in: " + (if autoNeInOk { "ok" } else { "FAIL:ne=" + cNe.toStr() + "/" + skNe.toStr() + ":in=" + cIn.toStr() + "/" + skIn.toStr() }))
+
+    // 3. Dynamic Top-N Bar skipping (ORDER BY ts ASC / DESC LIMIT 3)
+    lexdb_skip.resetCounters()
+    let topAsc = q(mut &s, "SELECT id FROM events ORDER BY ts ASC LIMIT 3")
+    let skTopAsc = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+    lexdb_skip.resetCounters()
+    let topDesc = q(mut &s, "SELECT id FROM events ORDER BY ts DESC LIMIT 3")
+    let autoTopOk = topAsc == "1;2;3" && skTopAsc > 0 && topDesc == "12000;11999;11998"
+    println("auto_topn: " + (if autoTopOk { "ok" } else { "FAIL:asc=" + topAsc + "/" + skTopAsc.toStr() + ":desc=" + topDesc }))
+
+    // 4. Explicit MINMAX / BRIN index on TEXT column (`code`)
+    must(mut &s, "CREATE INDEX idx_code_mm ON events USING minmax (code)")
+    lexdb_skip.resetCounters()
+    let cMm = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE code >= 'c_011990'")
+    let skMm = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+    let mmOk = cMm == 11 && skMm > 0
+    println("explicit_minmax: " + (if mmOk { "ok" } else { "FAIL:" + cMm.toStr() + ":sk=" + skMm.toStr() }))
+
+    // 5. Explicit SET(16) index on low-cardinality `status`
+    must(mut &s, "CREATE SKIPPING INDEX idx_status_set ON events (status) USING set(16)")
+    lexdb_skip.resetCounters()
+    let cSet1 = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE status = 'rare'")
+    let skSet1 = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+    lexdb_skip.resetCounters()
+    let cSet2 = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE status = 'nonexistent'")
+    let skSet2 = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+    let setOk = cSet1 == 2 && skSet1 > 0 && cSet2 == 0 && skSet2 > 0
+    println("explicit_set: " + (if setOk { "ok" } else { "FAIL:" + cSet1.toStr() + "/" + skSet1.toStr() + ":" + cSet2.toStr() + "/" + skSet2.toStr() }))
+
+    // 6. Explicit BLOOM_FILTER index on high-cardinality scattered `user_id`
+    must(mut &s, "CREATE INDEX idx_uid_bf ON events USING bloom_filter (user_id)")
+    let targetUid = qInt(mut &s, "SELECT user_id FROM events WHERE id = 6000")
+    lexdb_skip.resetCounters()
+    let cBfHit = qInt(mut &s, &("SELECT COUNT(*) FROM events WHERE user_id = " + targetUid.toStr()))
+    let skBfHit = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+    lexdb_skip.resetCounters()
+    let cBfMiss = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE user_id = 999999999999")
+    let skBfMiss = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+    let bfOk = cBfHit == 1 && skBfHit > 0 && cBfMiss == 0 && skBfMiss > 0
+    println("explicit_bloom: " + (if bfOk { "ok" } else { "FAIL:hit=" + cBfHit.toStr() + "/" + skBfHit.toStr() + ":miss=" + cBfMiss.toStr() + "/" + skBfMiss.toStr() }))
+
+    // 7. Explicit NGRAMBF(3, 2048, 3) index on `url` for arbitrary substring LIKE '%google%'
+    must(mut &s, "CREATE SKIPPING INDEX idx_url_ng ON events (url) USING ngrambf(3, 2048, 3)")
+    lexdb_skip.resetCounters()
+    let cNg = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE url LIKE '%google%'")
+    let skNg = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+    lexdb_skip.resetCounters()
+    let cNgMiss = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE url LIKE '%zyxwvut%'")
+    let skNgMiss = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+    // Verify runtime feature flag SET data_skipping_enabled = off | on
+    must(mut &s, "SET data_skipping_enabled = off")
+    let showOff = q(mut &s, "SHOW data_skipping_enabled")
+    lexdb_skip.resetCounters()
+    let cFlagOff = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE url LIKE '%google%'")
+    let skFlagOff = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+    must(mut &s, "SET data_skipping_enabled = on")
+    let showOn = q(mut &s, "SHOW data_skipping_enabled")
+    let ngOk = cNg == 2 && skNg > 0 && cNgMiss == 0 && skNgMiss > 0 && showOff == "off" && showOn == "on" && cFlagOff == 2 && skFlagOff == 0
+    println("explicit_ngram: " + (if ngOk { "ok" } else { "FAIL:hit=" + cNg.toStr() + "/" + skNg.toStr() + ":miss=" + cNgMiss.toStr() + "/" + skNgMiss.toStr() + ":flag=" + showOff + "/" + showOn + "/" + skFlagOff.toStr() }))
+
+    // 8. Explicit TOKENBF(2048, 3) index on `url`
+    must(mut &s, "DROP SKIPPING INDEX idx_url_ng")
+    must(mut &s, "CREATE INDEX idx_url_tok ON events USING tokenbf (url) WITH (size = 2048, hashes = 3)")
+    lexdb_skip.resetCounters()
+    let cTok = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE url LIKE '%.google.%'")
+    let skTok = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+    let tokOk = cTok == 2 && skTok > 0
+    println("explicit_token: " + (if tokOk { "ok" } else { "FAIL:" + cTok.toStr() + "/" + skTok.toStr() }))
+
+    // Restore ngrambf too for DML & reopen tests
+    must(mut &s, "CREATE SKIPPING INDEX idx_url_ng ON events (url) USING ngrambf(3, 2048, 3)")
+
+    // 9. Live DML invalidation (INSERT / UPDATE / DELETE / ROLLBACK) — including negative int64 values — 0 false negatives!
+    must(mut &s, "INSERT INTO events VALUES (12001, 500000, 9, -9223372036854775800, 'c_999999', 'nonexistent', 'https://zyxwvut.google.com/new')")
+    let dml1 = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE user_id = -9223372036854775800")
+    let dml2 = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE url LIKE '%zyxwvut%'")
+    let dml3 = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE status = 'nonexistent'")
+    let dml4 = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE ts = 500000")
+    must(mut &s, "UPDATE events SET url = 'https://updated-needle.org/x', ts = 600000 WHERE id = 5000")
+    let dml5 = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE url LIKE '%updated-needle%'")
+    let dml6 = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE ts = 600000")
+    must(mut &s, "DELETE FROM events WHERE id = 12001")
+    let dml7 = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE user_id = -9223372036854775800")
+    must(mut &s, "BEGIN")
+    must(mut &s, "INSERT INTO events VALUES (12002, 700000, 9, 888888888888, 'c_888888', 'rolled', 'https://rolledback.org')")
+    let dmlInTx = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE url LIKE '%rolledback%'")
+    must(mut &s, "ROLLBACK")
+    let dmlAfterRb = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE url LIKE '%rolledback%'")
+    let dmlOk = dml1 == 1 && dml2 == 1 && dml3 == 1 && dml4 == 1 && dml5 == 1 && dml6 == 1 && dml7 == 0 && dmlInTx == 1 && dmlAfterRb == 0
+    println("dml_inval: " + (if dmlOk { "ok" } else { "FAIL:" + dml1.toStr() + "," + dml2.toStr() + "," + dml3.toStr() + "," + dml4.toStr() + "," + dml5.toStr() + "," + dml6.toStr() + "," + dml7.toStr() + "," + dmlInTx.toStr() + "," + dmlAfterRb.toStr() }))
+
+    // 10. MVCC REPEATABLE READ snapshot isolation safety
+    var s2 = lexdb_exec.newSession(st.share())
+    must(mut &s2, "BEGIN ISOLATION LEVEL REPEATABLE READ")
+    let snapBefore = qInt(mut &s2, "SELECT COUNT(*) FROM events WHERE url LIKE '%snapneedle%'")
+    must(mut &s, "INSERT INTO events VALUES (12003, 800000, 9, 777777777777, 'c_777777', 'snap', 'https://snapneedle.org')")
+    let liveAfter = qInt(mut &s, "SELECT COUNT(*) FROM events WHERE url LIKE '%snapneedle%'")
+    let snapAfter = qInt(mut &s2, "SELECT COUNT(*) FROM events WHERE url LIKE '%snapneedle%'")
+    must(mut &s2, "COMMIT")
+    let snapAfterCommit = qInt(mut &s2, "SELECT COUNT(*) FROM events WHERE url LIKE '%snapneedle%'")
+    let mvccOk = snapBefore == 0 && liveAfter == 1 && snapAfter == 0 && snapAfterCommit == 1
+    println("mvcc_snap: " + (if mvccOk { "ok" } else { "FAIL:" + snapBefore.toStr() + "," + liveAfter.toStr() + "," + snapAfter.toStr() + "," + snapAfterCommit.toStr() }))
+
+    // 11. Checkpoint dirty data pages first so every node has its final diskPageNo,
+    //     then rebuild persisted summaries via ANALYZE and checkpoint before close!
+    st.checkpoint().unwrap()
+    must(mut &s, "ANALYZE events")
+    st.checkpoint().unwrap()
+    return 0
+}
+
+fn runPhase2(st: lexdb_store.Store): int {
+    var sr = lexdb_exec.newSession(st.share())
+    // Cold-restart disk-page persistence!
+    lexdb_skip.resetCounters()
+    let coldNg = qInt(mut &sr, "SELECT COUNT(*) FROM events WHERE url LIKE '%google%'")
+    let coldSkNg = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+    lexdb_skip.resetCounters()
+    let coldBf = qInt(mut &sr, "SELECT COUNT(*) FROM events WHERE user_id = 999999999999")
+    let coldSkBf = lexdb_skip.subtreesSkipped() + lexdb_skip.leavesSkipped()
+    let reopenOk = coldNg == 2 && coldSkNg > 0 && coldBf == 0 && coldSkBf > 0
+    println("reopen_cold: " + (if reopenOk { "ok" } else { "FAIL:ng=" + coldNg.toStr() + "/" + coldSkNg.toStr() + ":bf=" + coldBf.toStr() + "/" + coldSkBf.toStr() }))
+
+    // 12. DDL lifecycle: IF NOT EXISTS, duplicate error, invalid options, DROP, TRUNCATE, DROP TABLE
+    let dupErr = q(mut &sr, "CREATE SKIPPING INDEX idx_url_ng ON events (url) USING ngrambf")
+    let ifneOk = q(mut &sr, "CREATE SKIPPING INDEX IF NOT EXISTS idx_url_ng ON events (url) USING ngrambf")
+    let uqErr = q(mut &sr, "CREATE UNIQUE INDEX idx_bad_uq ON events USING bloom_filter (user_id)")
+    let typeErr = q(mut &sr, "CREATE SKIPPING INDEX idx_bad_t ON events (ts) USING ngrambf")
+    let drop1 = q(mut &sr, "DROP INDEX idx_uid_bf")
+    let drop2 = q(mut &sr, "DROP SKIPPING INDEX IF EXISTS idx_uid_bf")
+    let dropMiss = q(mut &sr, "DROP SKIPPING INDEX idx_no_such")
+    must(mut &sr, "TRUNCATE TABLE events")
+    let afterTrunc = qInt(mut &sr, "SELECT COUNT(*) FROM events WHERE url LIKE '%google%'")
+    must(mut &sr, "INSERT INTO events VALUES (1, 10, 1, 100, 'a', 'ok', 'https://google.com/after-trunc')")
+    let afterReins = qInt(mut &sr, "SELECT COUNT(*) FROM events WHERE url LIKE '%google%'")
+    must(mut &sr, "DROP TABLE events")
+    let ddlOk = strings.startsWith(&dupErr, "ERR:42P07:") && ifneOk == "CREATE INDEX" &&
+                strings.startsWith(&uqErr, "ERR:0A000:") && strings.startsWith(&typeErr, "ERR:0A000:") &&
+                drop1 == "DROP INDEX" && drop2 == "DROP INDEX" && strings.startsWith(&dropMiss, "ERR:42704:") &&
+                afterTrunc == 0 && afterReins == 1
+    println("ddl_lifecycle: " + (if ddlOk { "ok" } else { "FAIL:" + dupErr + "|" + ifneOk + "|" + uqErr + "|" + typeErr + "|" + drop1 + "|" + drop2 + "|" + dropMiss + "|" + afterTrunc.toStr() + "|" + afterReins.toStr() }))
+    return 0
+}
+
+fn main() {
+    let fs = lexdb_disk.sim(205)
+    lexdb_store.run(fs.share(), opts(), fn(st: lexdb_store.Store): int { return runPhase1(st) }).unwrap()
+    lexdb_store.run(fs, opts(), fn(st: lexdb_store.Store): int { return runPhase2(st) }).unwrap()
+}

@@ -24,6 +24,7 @@ import "./lexdb_sqlcoll"
 import "./lexdb_like"
 import "./lexdb_vec"
 import "./lexdb_leafk"
+import "./lexdb_skip"
 
 type Val = lexdb_sql.Val
 type Expr = lexdb_sql.Expr
@@ -1001,11 +1002,56 @@ fn fillPoint(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Sc
 // through fillPoint; scanLeaves gives a replica's rows and the
 // transaction's own writes and cuts as one path too. Its batch is spare's
 // when that is of the plan (lexdb_rows.reuse), as fillPickIn's.
+// Helper: finds the fixed-layout place index for batch column bar.col (-1 if none).
+fn barPlaceOf(bp: &BPlan, bar: &Bar): int {
+    if !bar.on || bar.nul { return -1 }
+    for pl in 0..len(bp.placeCol) {
+        if bp.placeCol[pl] == bar.col { return pl }
+    }
+    return -1
+}
+
+// Helper: scans leaves via scanLeavesSkip when skipQ or a live Top-N bar is active,
+// otherwise uses the standard scanLeaves fast path.
+fn scanLeavesWithSkip(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, rw: &lexdb_rows.Rows,
+                      from: &str, to: str, sq: &lexdb_skip.SkipQuery, bar: &Bar, barPl: int, skipOn: bool,
+                      f: &fn(&lexdb_rows.LeafView, int, int): bool): Result[Unit, DbErr] {
+    let bOn = bar.on && !bar.nul && barPl >= 0
+    if !skipOn || (!sq.active && !bOn) {
+        return st.scanLeaves(txn, t.tree, from, to, f)
+    }
+    let sid = st.id
+    let tree = t.tree
+    let bVal = bar.v
+    let bDesc = bar.desc
+    let bNf = bar.nf
+    let chk = fn(slot: int, gen: int, subVer: int, disk: int, isSnap: bool, snapSeq: int, isLeaf: bool): bool {
+        return lexdb_skip.checkNodeSkipBar(sid, tree, slot, gen, subVer, disk, isSnap, snapSeq, isLeaf, sq, bOn, barPl, bVal, bDesc, bNf)
+    }
+    let onL = fn(slot: int, gen: int, subVer: int, seq: int, disk: int, lv: &lexdb_rows.LeafView) {
+        lexdb_skip.recordLeaf(sid, tree, slot, gen, subVer, seq, lv, rw)
+    }
+    let onI = fn(slot: int, gen: int, subVer: int, seq: int, disk: int,
+                 kidSlots: &[]int, kidGens: &[]int, kidSubVers: &[]int) {
+        lexdb_skip.recordInner(sid, tree, slot, gen, subVer, seq, kidSlots, kidGens, kidSubVers)
+    }
+    return st.scanLeavesSkip(txn, tree, from, to, chk, onL, onI, f)
+}
+
 fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Scan, part: bool, cur: mut &Cursor,
              bp: &BPlan, spare: mut &Batch): Result[Option[Batch], DbErr] {
+    let emptyQ = lexdb_skip.emptyQuery()
+    return fillBatchSkip(st, txn, t, sc, part, cur, bp, &emptyQ, &noBar(), spare)
+}
+
+fn fillBatchSkip(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Scan, part: bool, cur: mut &Cursor,
+                 bp: &BPlan, sq: &lexdb_skip.SkipQuery, bar: &Bar, spare: mut &Batch): Result[Option[Batch], DbErr] {
     if sc.empty || sc.point { return fillPoint(st, txn, t, sc, part, cur, bp) }
     var b = lexdb_rows.reuse(spare, bp)
     let rw = rowsFor(t)
+    let skipOn = lexdb_skip.isEnabled(txn.sql.sess)
+    let barPl = barPlaceOf(bp, bar)
+    if skipOn && (sq.active || barPl >= 0) { let _ = try lexdb_skip.ensureTreeLoaded(st, txn, t.tree, t.name) }
     while b.n < BROWS && !cur.done {
         let from: &str = if cur.started { &cur.at } else { &sc.lo }
         cur.started = true
@@ -1013,7 +1059,7 @@ fn fillBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Sc
         var stop = 0                // 1 the batch is full, 2 a value stored apart
         var bail = false
         var bad: []DbErr = []
-        try st.scanLeaves(txn, t.tree, from, sc.hi.clone(), fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+        try scanLeavesWithSkip(st, txn, t, &rw, from, sc.hi.clone(), sq, bar, barPl, skipOn, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
             if len(bp.ranges) > 0 && leaf.isCols && lexdb_rows.excluded(leaf, bp, &rw) { return true }
             var k = i
             while k < j {
@@ -1714,6 +1760,7 @@ pub type Lazy = record {
     pub firstK: []int
     pub restK: []int
     pub skipK: []bool
+    pub skipQ: lexdb_skip.SkipQuery
 }
 
 // A batch decoded and its rows chosen: the rows the conditions chose and
@@ -1791,7 +1838,7 @@ fn likeRaw(rows: &[]&str, rs: &[]int, r0: int, pl: int, lay: &FixedLay, ps: &[]s
         let e = binary.readU16LEStr(s, o)
         let st = if pv < 0 { 0 } else { binary.readU16LEStr(s, pv) }
         if st > e || v0 + e > len(s) { return Err(lexdb_base.corrupt("a row's variable part")) }
-        if lexdb_like.likeRange(s, v0 + st, v0 + e, ps) { append(mut &out, r) }
+        if lexdb_like.likeRange(&s[v0 + st..v0 + e], 0, e - st, ps) { append(mut &out, r) }
     }
     return Ok(out)
 }
@@ -2165,7 +2212,9 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
     // (an index's read, 9.107, whole: an index-only entry's columns come
     // from its key all at once; its rows, fetched by their keys, as fillLevel reads them)
     if !lz.on || sc.empty || sc.point || (rd.ix >= 0 && !sc.whole) {
-        let got = try fillLevel(st, txn, t, rd, sc, part, cur, bp, spare)
+        let canSkip = lexdb_skip.isEnabled(txn.sql.sess) && !sc.empty && !sc.point && (rd.ix < 0 || sc.whole) && !rd.desc && (lz.skipQ.active || (bar.on && !bar.nul))
+        let got = if canSkip { try fillBatchSkip(st, txn, t, sc, part, cur, bp, &lz.skipQ, bar, spare) }
+                  else { try fillLevel(st, txn, t, rd, sc, part, cur, bp, spare) }
         if got.isNone() { return Ok(None) }
         let b = got.unwrap()
         var all: []int = withCapacity(b.n)
@@ -2178,6 +2227,9 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
     }
     var b = lexdb_rows.reuse(spare, bp)
     let rw = rowsFor(t)
+    let skipOn = lexdb_skip.isEnabled(txn.sql.sess)
+    let barPl = barPlaceOf(bp, bar)
+    if skipOn && (lz.skipQ.active || barPl >= 0) { let _ = try lexdb_skip.ensureTreeLoaded(st, txn, t.tree, t.name) }
     var idx: []int = []
     var pend: []int = []                // rows decoded whole: chosen at the end
     var kept = 0
@@ -2192,7 +2244,7 @@ pub fn fillPickIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc
         var bigR: []int = []
         var bigK: []str = []
         var bigV: []str = []
-        try st.scanLeaves(txn, t.tree, from, sc.hi.clone(), fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+        try scanLeavesWithSkip(st, txn, t, &rw, from, sc.hi.clone(), &lz.skipQ, bar, barPl, skipOn, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
             if len(bp.ranges) > 0 && leaf.isCols && lexdb_rows.excluded(leaf, bp, &rw) { return true }
             var k = i
             while k < j {

@@ -1,0 +1,81 @@
+// lexdb over TDS: SQL Server Data Skipping Indexes (minmax, set, bloom_filter, ngrambf, tokenbf).
+// expect: setup: ok
+// expect: bf_hit: n = 1
+// expect: ng_hit: n = 2
+// expect: dml_ok: n = 3
+// expect: drop1: ok
+// expect: drop2: ok
+import "strings"
+import "task"
+import "net"
+import "tds"
+import "sqldialect"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+fn cellText(c: &tds.Column, v: &tds.Cell): str {
+    match v {
+        tds.Cell.Null { return "NULL" }
+        else { return tds.cellText(c, v).unwrapOr("?") }
+    }
+}
+
+fn said(r: Result[tds.Reply, sqldialect.DbError]): str {
+    match r {
+        Ok(rep) {
+            var parts: []str = []
+            for e in rep.errors { append(mut &parts, "error " + e.number.toStr() + ": " + e.text) }
+            for rs in rep.results {
+                var rows: []str = []
+                for row in rs.rows {
+                    var cells: []str = []
+                    for i in 0..len(row) { append(mut &cells, cellText(&rs.columns[i], &row[i])) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                var names: []str = []
+                for c in rs.columns { append(mut &names, c.name.clone()) }
+                append(mut &parts, strings.join(&names, ",") + " = " + strings.join(&rows, ";"))
+            }
+            if len(parts) == 0 { return "ok" }
+            return strings.join(&parts, " / ")
+        }
+        Err(e) { return "failed " + e.code.toStr() + " " + e.msg }
+    }
+}
+
+fn client(dsn: &str) {
+    let cfg = sqlserver.parseConnString(&(dsn.toStr())).unwrap()
+    var c = tds.open(&cfg.config).unwrap()
+    let _1 = c.batch("CREATE TABLE dbo.web_ev (id BIGINT PRIMARY KEY, uid_val BIGINT, url NVARCHAR(200))").unwrap()
+    let _2 = c.batch("INSERT INTO dbo.web_ev VALUES (1, 1001, 'https://docs.google.com/a'), (2, 2002, 'https://example.org/b'), (3, 3003, 'https://mail.google.com/c')").unwrap()
+    let _3 = c.batch("CREATE SKIPPING INDEX ix_uid_bf ON dbo.web_ev (uid_val) USING bloom_filter").unwrap()
+    let _4 = c.batch("CREATE INDEX ix_url_ng ON dbo.web_ev USING ngrambf(3, 1024, 3) (url)").unwrap()
+    println("setup: ok")
+    println("bf_hit: " + said(c.batch("SELECT COUNT(*) AS n FROM dbo.web_ev WHERE uid_val = 2002")))
+    println("ng_hit: " + said(c.batch("SELECT COUNT(*) AS n FROM dbo.web_ev WHERE url LIKE '%google%'")))
+    let _5 = c.batch("INSERT INTO dbo.web_ev VALUES (4, 4004, 'https://drive.google.com/d')").unwrap()
+    println("dml_ok: " + said(c.batch("SELECT COUNT(*) AS n FROM dbo.web_ev WHERE url LIKE '%google%'")))
+    println("drop1: " + said(c.batch("DROP SKIPPING INDEX ix_uid_bf")))
+    println("drop2: " + said(c.batch("DROP INDEX ix_url_ng ON dbo.web_ev")))
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(sc: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        client(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"))
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(207), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

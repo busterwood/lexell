@@ -31,6 +31,7 @@ import "./lexdb_bind"
 import "./lexdb_plan"
 import "./lexdb_access"
 import "./lexdb_leafk"
+import "./lexdb_skip"
 import "./lexdb_store"
 import "./lexdb_census"
 import "./lexdb_window"
@@ -1423,8 +1424,9 @@ pub fn lazyOf(bp: &BPlan, t: &lexdb_catalog.Table, conds: &[]BNode, extra: int):
     for pl in bp.usedP {
         if usedK[bp.placeCol[pl]] { append(mut &firstK, pl) } else { append(mut &restK, pl) }
     }
+    let skipQ = cSkipQuery(conds, &bp.kinds, t)
     return Lazy{on: ((len(first) > 0 || len(raw) > 0) && len(rest) > 0) || len(kern) > 0, first: first, rest: rest, raw: raw, rawPl: rawPl,
-                pieces: pieces, skip: skip, bf: bf, br: br, kern: lexdb_leafk.merged(kern), firstK: firstK, restK: restK, skipK: skipK}
+                pieces: pieces, skip: skip, bf: bf, br: br, kern: lexdb_leafk.merged(kern), firstK: firstK, restK: restK, skipK: skipK, skipQ: skipQ}
 }
 
 // Whether evaluating n cannot raise a runtime error (safe to run a later
@@ -1761,6 +1763,197 @@ pub fn cRanges(conds: &[]BNode, kinds: &[]int, t: &lexdb_catalog.Table): []int {
     var out: []int = []
     for c in conds { cRangesOf(&c, kinds, t, mut &out) }
     return out
+}
+
+// Extracts all skippable predicates (ranges, <>, =, IN, text comparisons, simple case-sensitive LIKE)
+// from WHERE conditions into a lexdb_skip.SkipQuery for hierarchical B+tree subtree pruning.
+pub fn cSkipQuery(conds: &[]BNode, kinds: &[]int, t: &lexdb_catalog.Table): lexdb_skip.SkipQuery {
+    var q = lexdb_skip.emptyQuery()
+    q.ranges = cRanges(conds, kinds, t)
+    for c in conds { cSkipOf(&c, kinds, t, mut &q) }
+    q.active = q.hasFilters()
+    return q
+}
+
+fn placeOfCol(t: &lexdb_catalog.Table, col: int): int {
+    return if len(t.slots) == 0 { col } else { t.slots[col] }
+}
+
+fn collectOrIntEq(n: &BNode, wantCol: mut &int, vals: mut &[]int): bool {
+    match n {
+        BNode.Or(a, b) { return collectOrIntEq(&a, wantCol, vals) && collectOrIntEq(&b, wantCol, vals) }
+        BNode.Cmp(op, a, b) {
+            if op != 0 { return false }
+            var c = -1
+            var v = 0
+            match a {
+                BNode.Col(ci) { match b { BNode.Const(x, nul) { if !nul { c = ci; v = x } } else {} } }
+                BNode.Const(x, nul) { match b { BNode.Col(ci) { if !nul { c = ci; v = x } } else {} } }
+                else {}
+            }
+            if c < 0 { return false }
+            if wantCol < 0 { wantCol = c } else if wantCol != c { return false }
+            append(vals, v)
+            return true
+        }
+        else { return false }
+    }
+}
+
+fn collectOrStrEq(n: &BNode, wantCol: mut &int, vals: mut &[]str): bool {
+    match n {
+        BNode.Or(a, b) { return collectOrStrEq(&a, wantCol, vals) && collectOrStrEq(&b, wantCol, vals) }
+        BNode.ValCmp(op, c, k, _, _) {
+            if op != 0 { return false }
+            match k {
+                Val.Text(s) {
+                    if wantCol < 0 { wantCol = c } else if wantCol != c { return false }
+                    append(vals, s.clone())
+                    return true
+                }
+                else { return false }
+            }
+        }
+        else { return false }
+    }
+}
+
+fn cSkipOf(n: &BNode, kinds: &[]int, t: &lexdb_catalog.Table, q: mut &lexdb_skip.SkipQuery) {
+    match n {
+        BNode.And(a, b) {
+            cSkipOf(&a, kinds, t, q)
+            cSkipOf(&b, kinds, t, q)
+        }
+        BNode.Or(_, _) {
+            var ci = -1
+            var ivs: []int = []
+            if collectOrIntEq(n, mut &ci, mut &ivs) && ci >= 0 && ci < len(kinds) && kinds[ci] == BK_INT && len(ivs) > 0 {
+                append(mut &q.inPl, placeOfCol(t, ci))
+                append(mut &q.inInts, ivs)
+                return
+            }
+            var cs = -1
+            var svs: []str = []
+            if collectOrStrEq(n, mut &cs, mut &svs) && cs >= 0 && cs < len(t.cols) &&
+               t.cols[cs].typ.kind == lexdb_sql.K_TEXT && len(t.cols[cs].coll) == 0 && len(svs) > 0 {
+                append(mut &q.strPl, placeOfCol(t, cs))
+                append(mut &q.strOp, 6)
+                append(mut &q.strVals, svs)
+            }
+        }
+        BNode.Cmp(op, a, b) {
+            var col = -1
+            var v = 0
+            var o = op
+            match a {
+                BNode.Col(c) {
+                    match b {
+                        BNode.Const(x, nul) { if !nul { col = c; v = x } }
+                        else {}
+                    }
+                }
+                BNode.Const(x, nul) {
+                    match b {
+                        BNode.Col(c) {
+                            if !nul {
+                                col = c
+                                v = x
+                                o = if op == 2 { 4 } else if op == 3 { 5 } else if op == 4 { 2 } else if op == 5 { 3 } else { op }
+                            }
+                        }
+                        else {}
+                    }
+                }
+                else {}
+            }
+            if col < 0 || col >= len(kinds) || kinds[col] != BK_INT { return }
+            let pl = placeOfCol(t, col)
+            if o == 0 {
+                append(mut &q.eqPl, pl)
+                append(mut &q.eqInt, v)
+            } else if o == 1 {
+                append(mut &q.nes, pl)
+                append(mut &q.nes, 0)
+                append(mut &q.nes, v)
+            }
+        }
+        BNode.ValCmp(op, c, k, left, _) {
+            if c < 0 || c >= len(t.cols) { return }
+            let pl = placeOfCol(t, c)
+            let o = if !left { op } else if op == 2 { 4 } else if op == 3 { 5 } else if op == 4 { 2 } else if op == 5 { 3 } else { op }
+            let pk = timeKindOf(t.cols[c].typ.oid)
+            if pk != lexdb_rows.PK_NONE && !lexdb_sql.isTszType(&t.cols[c].typ) {
+                var v = 0
+                var ok = false
+                match k {
+                    Val.Date(x) { if pk == lexdb_rows.PK_DATE { v = x; ok = true } }
+                    Val.Time(x) { if pk == lexdb_rows.PK_TIME { v = x; ok = true } }
+                    Val.Ts(x) { if pk == lexdb_rows.PK_TS { v = x; ok = true } }
+                    Val.Tstz(x) { if pk == lexdb_rows.PK_TSTZ { v = x; ok = true } }
+                    else {}
+                }
+                if ok {
+                    if o == 0 {
+                        append(mut &q.eqPl, pl)
+                        append(mut &q.eqInt, v)
+                    } else if o == 1 {
+                        append(mut &q.nes, pl)
+                        append(mut &q.nes, int(pk))
+                        append(mut &q.nes, v)
+                    }
+                }
+                return
+            }
+            if t.cols[c].typ.kind == lexdb_sql.K_TEXT && len(t.cols[c].coll) == 0 {
+                match k {
+                    Val.Text(s) {
+                        append(mut &q.strPl, pl)
+                        append(mut &q.strOp, o)
+                        append(mut &q.strVals, [s.clone()])
+                    }
+                    else {}
+                }
+            }
+        }
+        BNode.InInts(c, vs, _) {
+            if c < 0 || c >= len(kinds) || kinds[c] != BK_INT { return }
+            let pl = placeOfCol(t, c)
+            append(mut &q.inPl, pl)
+            append(mut &q.inInts, collections.copyOf(&vs))
+        }
+        BNode.InVals(c, vs, _, _) {
+            if c < 0 || c >= len(t.cols) { return }
+            let pl = placeOfCol(t, c)
+            if t.cols[c].typ.kind == lexdb_sql.K_TEXT && len(t.cols[c].coll) == 0 {
+                var ss: []str = withCapacity(len(vs))
+                var allText = true
+                for v in vs {
+                    match v {
+                        Val.Text(s) { append(mut &ss, s.clone()) }
+                        else { allText = false; break }
+                    }
+                }
+                if allText && len(ss) > 0 {
+                    append(mut &q.strPl, pl)
+                    append(mut &q.strOp, 6)
+                    append(mut &q.strVals, ss)
+                }
+            }
+        }
+        BNode.Like(c, lp) {
+            if lp.simple && c >= 0 && c < len(t.cols) && t.cols[c].typ.kind == lexdb_sql.K_TEXT {
+                let ck = lexdb_sql.collKind(&t.cols[c].coll)
+                if (ck == lexdb_sql.COLL_EXACT && !lp.fold) || ck == lexdb_sql.COLL_CI {
+                    let pl = placeOfCol(t, c)
+                    var ps: []str = withCapacity(len(lp.pieces))
+                    for p in lp.pieces { append(mut &ps, p.clone()) }
+                    append(mut &q.likePl, pl)
+                    append(mut &q.likePieces, ps)
+                }
+            }
+        }
+        else {}
+    }
 }
 
 pub fn cRangesOf(n: &BNode, kinds: &[]int, t: &lexdb_catalog.Table, out: mut &[]int) {

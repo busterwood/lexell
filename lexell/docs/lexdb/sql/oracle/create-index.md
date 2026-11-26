@@ -8,8 +8,15 @@ Creates an index on one or more columns, or on an expression.
 
 ```
 CREATE [ UNIQUE ] INDEX [ schema. ] index
-    ON [ schema. ] table ( { column | expr } [ ASC | DESC ] [, { column | expr } [ ASC | DESC ] ]... )
+    ON [ schema. ] table [ USING { btree | minmax | brin | set | bloom_filter | ngrambf | tokenbf } [ ( param [, ...] ) ] ]
+    ( { column | expr } [ ASC | DESC ] [, { column | expr } [ ASC | DESC ] ]... )
     [ annotations_clause ]
+
+CREATE SKIPPING INDEX [ IF NOT EXISTS ] [ schema. ] index
+    ON [ schema. ] table ( column )
+    [ USING { minmax | brin | set | bloom_filter | ngrambf | tokenbf } [ ( param [, ...] ) ] ]
+
+DROP [ SKIPPING ] INDEX [ IF EXISTS ] [ schema. ] index
 
 ALTER INDEX [ schema. ] index RENAME TO new_name
 ALTER INDEX [ schema. ] index annotations_clause
@@ -274,6 +281,29 @@ Index altered.
 
 ERROR:
 ORA-01418: specified index does not exist
+```
+
+### I. Data skipping indexes
+
+lexdb also supports hierarchical B+tree data skipping indexes (`minmax`/`brin`, `set`, `bloom_filter`, `ngrambf`, `tokenbf`) to prune subtrees on analytical equality, `IN`, range, and substring `LIKE` filters with zero OLTP write-path maintenance. Toggle pruning with `SET data_skipping_enabled = on | off`.
+
+<!-- example: oracle -->
+```sql
+CREATE SKIPPING INDEX ix_b_ng ON ix (b) USING ngrambf(3, 1024, 3);
+SELECT COUNT(*) AS hits FROM ix WHERE b LIKE '%a%';
+DROP SKIPPING INDEX ix_b_ng;
+```
+
+```text
+Index created.
+
+HITS
+----
+   1
+
+1 row selected.
+
+Index dropped.
 ```
 
 ## See also

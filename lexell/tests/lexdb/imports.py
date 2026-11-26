@@ -48,7 +48,7 @@ CORE = {
     "lexdb_locks", "lexdb_match", "lexdb_recur", "lexdb_recrun", "lexdb_recprobe", "lexdb_litint",
     "lexdb_memo", "lexdb_mview", "lexdb_newfn", "lexdb_nncon", "lexdb_nnalter", "lexdb_annot", "lexdb_graph", "lexdb_assert", "lexdb_copyjson", "lexdb_json", "lexdb_oldnew", "lexdb_ops", "lexdb_vec", "lexdb_decfit",
     "lexdb_page", "lexdb_parse", "lexdb_pct", "lexdb_pipe", "lexdb_plan", "lexdb_priv", "lexdb_repl", "lexdb_rows", "lexdb_routine",
-    "lexdb_session", "lexdb_setop", "lexdb_sketch", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_srf", "lexdb_standby", "lexdb_stats", "lexdb_viewdep", "lexdb_ixname", "lexdb_tsqlname", "lexdb_txmode",
+    "lexdb_session", "lexdb_setop", "lexdb_sketch", "lexdb_skip", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_srf", "lexdb_standby", "lexdb_stats", "lexdb_viewdep", "lexdb_ixname", "lexdb_tsqlname", "lexdb_txmode",
     "lexdb_store", "lexdb_time", "lexdb_tmpstore", "lexdb_tz", "lexdb_udf", "lexdb_window",
 }
 
@@ -87,10 +87,10 @@ BIND_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_catalog", "lexdb_dialect", 
 # row codecs and below the catalog, the planner and the executor: what it may
 # import, and the modules below it, which may not import it.
 ACCESS = "lexdb_access"
-ACCESS_MAY = {"lexdb_base", "lexdb_sql", "lexdb_rows", "lexdb_store", "lexdb_time", "lexdb_sqlcoll", "lexdb_like", "lexdb_vec", "lexdb_leafk"}
+ACCESS_MAY = {"lexdb_base", "lexdb_sql", "lexdb_rows", "lexdb_store", "lexdb_time", "lexdb_sqlcoll", "lexdb_like", "lexdb_vec", "lexdb_leafk", "lexdb_skip"}
 BELOW_ACCESS = {"lexdb_store", "lexdb_rows", "lexdb_page", "lexdb_cols", "lexdb_disk", "lexdb_locks", "lexdb_memo",
                 "lexdb_session", "lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_sqlcoll", "lexdb_like", "lexdb_dialect",
-                "lexdb_vec", "lexdb_leafk"}
+                "lexdb_vec", "lexdb_leafk", "lexdb_skip"}
 
 # The value operations (lexdb_ops, design/lexdb-layers.md 4.4.1) sit below
 # the binder and the executor: values, types and the time and number
@@ -108,7 +108,7 @@ LIB_MAY_IMPORT = OPS_MAY_IMPORT | {"lexdb_ops", "lexdb_like", "lexdb_rows", "lex
 # (and lexell's own libraries), the store names it may use, and who may
 # import it. Session state reaches it in its context (lexdb_pipe.Ctx).
 PIPE = "lexdb_pipe"
-PIPE_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_rows", "lexdb_vec", "lexdb_like", "lexdb_leafk",
+PIPE_MAY_IMPORT = {"lexdb_base", "lexdb_sql", "lexdb_time", "lexdb_float", "lexdb_rows", "lexdb_vec", "lexdb_like", "lexdb_leafk", "lexdb_skip",
                    "lexdb_sqlcoll", "lexdb_ops", "lexdb_lib", "lexdb_catalog", "lexdb_bind", "lexdb_plan",
                    "lexdb_access", "lexdb_store", "lexdb_sort", "lexdb_agg", "lexdb_held", "lexdb_census", "lexdb_srf",
                    "lexdb_window"}

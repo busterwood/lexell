@@ -73,6 +73,8 @@ type SlotMeta = value record {
     disk: int           // the page it was last written to, -1 when none
     ckpt: int           // the checkpoint that wrote that page
     version: int        // changes with every change to the node (leaf versions: 4.4)
+    subVer: int         // bumped on this node and every ancestor on any subtree write (lexdb_skip)
+    subSeq: int         // commit seq of the last subtree write (MVCC safety for SkipCache)
     ref: bool           // clock bit
     since: int          // the commit (seq) that made the node's current version
     pinned: bool        // freed, but a snapshot may still reach it: kept until it ends
@@ -288,9 +290,18 @@ pub fn testHooks(): TestHooks {
                      setWriteLogMax: setWriteLogMax, chunkKey: chunkKey, upgradeCounts: upgradeCounts}
 }
 
+var NEXT_STORE_ID: once task.Shared[int]
+
+fn nextStoreId(): int {
+    if !NEXT_STORE_ID.isSet() { NEXT_STORE_ID.set(task.shared(1)) }
+    var id = 1
+    NEXT_STORE_ID.get().with(fn(v: mut &int) { id = v; v += 1 })
+    return id
+}
+
 // ro: the session refuses writes outside a transaction block (a replica's store; a session after SET SESSION CHARACTERISTICS AS TRANSACTION
 // READ ONLY, default_transaction_read_only: lexdb_exec.Session.setRoDefault); one flag so that the statement path tests it once.
-pub type Store = value record { sh: task.Shared[Db]; fo: Option[Follower]; pub memo: lexdb_memo.Memo; pub locks: lexdb_locks.Locks; pub ro: bool }
+pub type Store = value record { sh: task.Shared[Db]; fo: Option[Follower]; pub memo: lexdb_memo.Memo; pub locks: lexdb_locks.Locks; pub ro: bool; pub id: int }
 
 // Another handle to the same store: its database, follower, memo and locks are shared (a Store is
 // a handle; clone, a copy, does not apply; design/consistency.md, finding 1).
@@ -299,7 +310,7 @@ pub fn (s: &Store) share(): Store {
         Some(f) { Some(f.share()) }
         None { None }
     }
-    return Store{sh: s.sh.share(), fo: fo, memo: s.memo.share(), locks: s.locks.share(), ro: s.ro}
+    return Store{sh: s.sh.share(), fo: fo, memo: s.memo.share(), locks: s.locks.share(), ro: s.ro, id: s.id}
 }
 
 // Which tree a transaction's reads see: the live tree, its snapshot, or a
@@ -773,6 +784,8 @@ fn (db: mut &Db) allocSlot(): int {
         db.meta[s].disk = -1
         db.meta[s].ckpt = 0
         db.meta[s].version = 0
+        db.meta[s].subVer = 0
+        db.meta[s].subSeq = 0
         db.meta[s].ref = false
         db.meta[s].since = 0
         db.meta[s].pinned = false
@@ -781,7 +794,7 @@ fn (db: mut &Db) allocSlot(): int {
         return s
     }
     append(mut &db.meta, SlotMeta{used: true, gen: 0, loaded: false, dirty: false, root: false, disk: -1,
-                                  ckpt: 0, version: 0, ref: false, since: 0, pinned: false, cost: 0,
+                                  ckpt: 0, version: 0, subVer: 0, subSeq: 0, ref: false, since: 0, pinned: false, cost: 0,
                                   listed: false, frame: -1, upg: 0})
     append(mut &db.hist, [])
     return len(db.meta) - 1
@@ -824,6 +837,7 @@ fn (db: mut &Db) newNode(n: lexdb_page.Node): int {
     db.meta[s].loaded = true
     db.meta[s].dirty = true
     db.meta[s].since = db.seq
+    db.meta[s].subSeq = db.seq
     db.loadedCount += 1
     db.recost(s)
     return s
@@ -924,8 +938,11 @@ fn (db: mut &Db) dropSlot(s: int) {
 }
 
 // Marks a node changed: its page belongs to the last checkpoint, and the
-// next one writes it elsewhere and frees that page.
+// next one writes it elsewhere and frees that page. Always bumps subVer and
+// updates subSeq so hierarchical skipping caches invalidate on every write.
 fn (db: mut &Db) markDirty(s: int) {
+    db.meta[s].subVer += 1
+    db.meta[s].subSeq = db.seq
     if !db.meta[s].dirty {
         db.meta[s].dirty = true
         db.meta[s].upg = 0
@@ -4149,6 +4166,342 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
     return Ok(Unit{})
 }
 
+// Hierarchical subtree-skipping leaf scan (lexdb_skip): walks top-down from the root
+// and asks checkNode(slot, gen, subVer, disk, isSnap, snapSeq, isLeaf) BEFORE loading
+// or descending into a child. When checkNode proves a subtree cannot match, the entire
+// subtree is skipped with zero disk I/O and cursor jumps past its fence.
+// Live visits call onLeaf(slot, gen, subVer, subSeq, disk, leafView) on visited leaves
+// and post-order onInner(slot, gen, subVer, subSeq, disk, kidSlots, kidGens, kidSubVers)
+// when finishing the rightmost child of each ancestor internal node.
+// Replicas and transactions with uncommitted writes/cuts fall back cleanly to scanLeaves.
+pub fn (st: &Store) scanLeavesSkip(t: mut &Txn, tree: int, from: &str, to: str,
+                                   checkNode: &fn(int, int, int, int, bool, int, bool): bool,
+                                   onLeaf: &fn(int, int, int, int, int, &lexdb_rows.LeafView),
+                                   onInner: &fn(int, int, int, int, int, &[]int, &[]int, &[]int),
+                                   f: &fn(&lexdb_rows.LeafView, int, int): bool): Result[Unit, lexdb_base.DbErr] {
+    let view = st.viewOf(t)
+    if view == View.Repl { return st.scanLeaves(t, tree, from, to, f) }
+    if len(t.ownRange(tree, &from, &to)) > 0 || t.cutsMeet(tree, &from, &to) { return st.scanLeaves(t, tree, from, to, f) }
+    let snap = view == View.Snap
+    var cursor: str = from.clone()
+    var more = true
+    let noting = t.noting()
+    var ahead = if t.raTree == tree { t.ra } else { AHEAD_MIN }
+    while more {
+        var rseq = 0
+        var need = -1
+        var run: []LoadReq = []
+        var bad: []lexdb_base.DbErr = []
+        var upper = ""
+        var hasUpper = false
+        var skipTo = ""
+        var hasSkipTo = false
+        var go = true
+        var empty = false
+        var seen = ""
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 {
+                append(mut &bad, db.failed[0].clone())
+                return
+            }
+            rseq = if snap { t.snapSeq } else { db.seq }
+            if snap {
+                if db.snapGone(t.snap) {
+                    append(mut &bad, snapCancelled())
+                    return
+                }
+                let root = db.snapRoot(t, tree)
+                if root < 0 { empty = true; return }
+                let rm = db.meta[root]
+                let rootClean = !rm.loaded && rm.disk >= 0 && len(db.hist[root]) == 0
+                if rm.subSeq <= t.snapSeq && (rootClean || db.verOf(root, t.snapSeq) == -1) {
+                    let rLeaf = rm.loaded && db.pool[rm.frame].leaf
+                    if checkNode(root, rm.gen, rm.subVer, rm.disk, true, t.snapSeq, rLeaf) {
+                        hasUpper = false
+                        go = false
+                        return
+                    }
+                }
+                var s = root
+                var fb = NO_BOUND
+                var par = -1
+                var pver = -1
+                var pat = -1
+                var spath: []int = []
+                var satIdx: []int = []
+                var spvers: []int = []
+                while true {
+                    let v = db.verOf(s, t.snapSeq)
+                    if v == -2 {
+                        need = s
+                        if par >= 0 { run = db.runAt(&db.snapNode(par, pver).kids, pat, ahead) }
+                        return
+                    }
+                    if v == -3 {
+                        append(mut &bad, lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: a node version is missing"))
+                        return
+                    }
+                    db.meta[s].ref = true
+                    if db.snapNode(s, v).leaf {
+                        if v == -1 { db.noteLeaf(tree, s) }
+                        let n = db.snapNode(s, v)
+                        let lv = lexdb_page.leafView(&n)
+                        if v == -1 {
+                            let sm = db.meta[s]
+                            onLeaf(s, sm.gen, sm.subVer, sm.subSeq, sm.disk, &lv)
+                        }
+                        let i = n.lower(&cursor)
+                        var j = n.count()
+                        if len(to) > 0 { j = n.lower(&to) }
+                        if j > i {
+                            if noting { seen = n.key(j - 1) }
+                            go = f(&lv, i, j)
+                        }
+                        if fb.s >= 0 { upper = db.boundKey(fb).clone(); hasUpper = true }
+                        // Post-order rollup up current-version ancestors whose rightmost child just finished
+                        var pi = len(spath) - 1
+                        while pi >= 0 {
+                            if spvers[pi] != -1 { break }
+                            let p = spath[pi]
+                            let pf = db.meta[p].frame
+                            let pnk = len(db.pool[pf].kids)
+                            if satIdx[pi] != pnk - 1 { break }
+                            var ks: []int = withCapacity(pnk)
+                            var kg: []int = withCapacity(pnk)
+                            var kv: []int = withCapacity(pnk)
+                            for ki in 0..pnk {
+                                let c = db.pool[pf].kids[ki]
+                                append(mut &ks, c)
+                                append(mut &kg, db.meta[c].gen)
+                                append(mut &kv, db.meta[c].subVer)
+                            }
+                            let pm = db.meta[p]
+                            onInner(p, pm.gen, pm.subVer, pm.subSeq, pm.disk, &ks, &kg, &kv)
+                            pi -= 1
+                        }
+                        return
+                    }
+                    let nk = len(db.snapNode(s, v).kids)
+                    var ci = db.snapNode(s, v).child(&cursor)
+                    let ci0 = ci
+                    while ci < nk {
+                        let kid = db.snapNode(s, v).kids[ci]
+                        let km = db.meta[kid]
+                        let kidClean = !km.loaded && km.disk >= 0 && len(db.hist[kid]) == 0
+                        if km.subSeq <= t.snapSeq && (kidClean || db.verOf(kid, t.snapSeq) == -1) {
+                            let kLeaf = km.loaded && db.pool[km.frame].leaf
+                            if checkNode(kid, km.gen, km.subVer, km.disk, true, t.snapSeq, kLeaf) {
+                                ci += 1
+                                if ci < nk {
+                                    let sep = db.snapNode(s, v).key(ci - 1)
+                                    if len(to) > 0 && sep >= to { upper = sep; hasUpper = true; return }
+                                }
+                                continue
+                            }
+                        }
+                        break
+                    }
+                    if ci >= nk {
+                        if v == -1 {
+                            let pf0 = db.meta[s].frame
+                            var ks0: []int = withCapacity(nk)
+                            var kg0: []int = withCapacity(nk)
+                            var kv0: []int = withCapacity(nk)
+                            for ki in 0..nk {
+                                let c = db.pool[pf0].kids[ki]
+                                append(mut &ks0, c)
+                                append(mut &kg0, db.meta[c].gen)
+                                append(mut &kv0, db.meta[c].subVer)
+                            }
+                            let sm0 = db.meta[s]
+                            onInner(s, sm0.gen, sm0.subVer, sm0.subSeq, sm0.disk, &ks0, &kg0, &kv0)
+                        }
+                        var pi = len(spath) - 1
+                        while pi >= 0 {
+                            if spvers[pi] != -1 { break }
+                            let p = spath[pi]
+                            let pf = db.meta[p].frame
+                            let pnk = len(db.pool[pf].kids)
+                            if satIdx[pi] != pnk - 1 { break }
+                            var ks: []int = withCapacity(pnk)
+                            var kg: []int = withCapacity(pnk)
+                            var kv: []int = withCapacity(pnk)
+                            for ki in 0..pnk {
+                                let c = db.pool[pf].kids[ki]
+                                append(mut &ks, c)
+                                append(mut &kg, db.meta[c].gen)
+                                append(mut &kv, db.meta[c].subVer)
+                            }
+                            let pm = db.meta[p]
+                            onInner(p, pm.gen, pm.subVer, pm.subSeq, pm.disk, &ks, &kg, &kv)
+                            pi -= 1
+                        }
+                        if fb.s >= 0 { upper = db.boundKey(fb).clone(); hasUpper = true }
+                        return
+                    }
+                    if ci > ci0 {
+                        skipTo = db.snapNode(s, v).key(ci - 1)
+                        hasSkipTo = true
+                    }
+                    append(mut &spath, s)
+                    append(mut &satIdx, ci)
+                    append(mut &spvers, v)
+                    if ci < db.snapNode(s, v).count() { fb = Bound{s: s, v: v, i: ci} }
+                    par = s; pver = v; pat = ci; s = db.snapNode(s, v).kids[ci]
+                }
+                return
+            }
+
+            // Live tree top-down descent with hierarchical subtree skipping
+            let root = match db.trees.get(&tree) { Some(r) { r } None { -1 } }
+            if root < 0 { empty = true; return }
+            let rm = db.meta[root]
+            let rLeaf = rm.loaded && db.pool[rm.frame].leaf
+            if checkNode(root, rm.gen, rm.subVer, rm.disk, false, rseq, rLeaf) {
+                hasUpper = false
+                go = false
+                return
+            }
+            var s = root
+            var path: []int = []
+            var atIdx: []int = []
+            while true {
+                if !db.meta[s].loaded {
+                    need = s
+                    if len(path) > 0 {
+                        let p = path[len(path) - 1]
+                        let pi = atIdx[len(atIdx) - 1]
+                        run = db.runAt(&db.pool[db.meta[p].frame].kids, pi, ahead)
+                    }
+                    return
+                }
+                db.meta[s].ref = true
+                let fidx = db.meta[s].frame
+                if db.pool[fidx].leaf {
+                    db.noteLeaf(tree, s)
+                    let n = &db.pool[fidx]
+                    let lv = lexdb_page.leafView(n)
+                    let sm = db.meta[s]
+                    onLeaf(s, sm.gen, sm.subVer, sm.subSeq, sm.disk, &lv)
+                    let i = n.lower(&cursor)
+                    var j = n.count()
+                    if len(to) > 0 { j = n.lower(&to) }
+                    if j > i {
+                        if noting { seen = n.key(j - 1) }
+                        go = f(&lv, i, j)
+                    }
+                    // Post-order rollup up ancestors whose rightmost child just finished
+                    var pi = len(path) - 1
+                    while pi >= 0 {
+                        let p = path[pi]
+                        let pf = db.meta[p].frame
+                        let nk = len(db.pool[pf].kids)
+                        if atIdx[pi] != nk - 1 { break }
+                        var ks: []int = withCapacity(nk)
+                        var kg: []int = withCapacity(nk)
+                        var kv: []int = withCapacity(nk)
+                        for ki in 0..nk {
+                            let c = db.pool[pf].kids[ki]
+                            append(mut &ks, c)
+                            append(mut &kg, db.meta[c].gen)
+                            append(mut &kv, db.meta[c].subVer)
+                        }
+                        let pm = db.meta[p]
+                        onInner(p, pm.gen, pm.subVer, pm.subSeq, pm.disk, &ks, &kg, &kv)
+                        pi -= 1
+                    }
+                    return
+                }
+                let nk = len(db.pool[fidx].kids)
+                var ci = db.pool[fidx].child(&cursor)
+                let ci0 = ci
+                while ci < nk {
+                    let kid = db.pool[fidx].kids[ci]
+                    let km = db.meta[kid]
+                    let kLeaf = km.loaded && db.pool[km.frame].leaf
+                    if checkNode(kid, km.gen, km.subVer, km.disk, false, rseq, kLeaf) {
+                        ci += 1
+                        if ci < nk {
+                            let sep = db.pool[fidx].key(ci - 1)
+                            if len(to) > 0 && sep >= to { upper = sep; hasUpper = true; return }
+                        }
+                        continue
+                    }
+                    break
+                }
+                if ci >= nk {
+                    // Every remaining child of s was skipped: try rolling up s and ancestors!
+                    var ks0: []int = withCapacity(nk)
+                    var kg0: []int = withCapacity(nk)
+                    var kv0: []int = withCapacity(nk)
+                    for ki in 0..nk {
+                        let c = db.pool[fidx].kids[ki]
+                        append(mut &ks0, c)
+                        append(mut &kg0, db.meta[c].gen)
+                        append(mut &kv0, db.meta[c].subVer)
+                    }
+                    let sm0 = db.meta[s]
+                    onInner(s, sm0.gen, sm0.subVer, sm0.subSeq, sm0.disk, &ks0, &kg0, &kv0)
+                    var pi = len(path) - 1
+                    while pi >= 0 {
+                        let p = path[pi]
+                        let pf = db.meta[p].frame
+                        let pnk = len(db.pool[pf].kids)
+                        if atIdx[pi] != pnk - 1 { break }
+                        var ks: []int = withCapacity(pnk)
+                        var kg: []int = withCapacity(pnk)
+                        var kv: []int = withCapacity(pnk)
+                        for ki in 0..pnk {
+                            let c = db.pool[pf].kids[ki]
+                            append(mut &ks, c)
+                            append(mut &kg, db.meta[c].gen)
+                            append(mut &kv, db.meta[c].subVer)
+                        }
+                        let pm = db.meta[p]
+                        onInner(p, pm.gen, pm.subVer, pm.subSeq, pm.disk, &ks, &kg, &kv)
+                        pi -= 1
+                    }
+                    return
+                }
+                if ci > ci0 {
+                    skipTo = db.pool[fidx].key(ci - 1)
+                    hasSkipTo = true
+                }
+                append(mut &path, s)
+                append(mut &atIdx, ci)
+                if ci < db.pool[fidx].count() {
+                    upper = db.pool[fidx].key(ci)
+                    hasUpper = true
+                }
+                s = db.pool[fidx].kids[ci]
+            }
+        })
+        if len(bad) > 0 { return Err(bad[0].clone()) }
+        if need >= 0 {
+            if hasSkipTo {
+                if noting { t.noteRead(tree, &cursor, &skipTo, rseq) }
+                cursor = skipTo
+            }
+            try st.loadAhead(need, &run)
+            if len(run) > 1 {
+                ahead = min(ahead * 2, AHEAD_MAX)
+                t.raTree = tree
+                t.ra = ahead
+            }
+            continue
+        }
+        if empty { return Ok(Unit{}) }
+        let last = !hasUpper || (len(to) > 0 && upper >= to)
+        if noting && last && t.openEnd {
+            if len(seen) > 0 { t.noteRead(tree, &cursor, &(seen + "\x00"), rseq) }
+        } else if noting {
+            if !last { t.noteRead(tree, &cursor, &upper, rseq) } else { t.noteRead(tree, &cursor, &to, rseq) }
+        }
+        if !go || last { more = false } else { cursor = upper }
+    }
+    return Ok(Unit{})
+}
+
 // scanLeaves over many ranges [los[x], his[x]) (his[x] "": to the end),
 // sorted by their starts: f(x, leaf, i, j) is given range x's entries in a
 // leaf, in order, and answers 0 (go on), 1 (range x is done) or 2 (stop).
@@ -6994,7 +7347,7 @@ fn openIn(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, split: bool, opts: Options): 
         db.trees.put(roots[i], s)
         i += 2
     }
-    let st = Store{sh: task.shared(db), fo: None, memo: lexdb_memo.newMemo(), locks: lexdb_locks.newLocks(), ro: false}
+    let st = Store{sh: task.shared(db), fo: None, memo: lexdb_memo.newMemo(), locks: lexdb_locks.newLocks(), ro: false, id: nextStoreId()}
     try st.replay(&m)
     return Ok(st)
 }
@@ -7506,15 +7859,15 @@ fn runWith[R](opened: Result[Store, lexdb_base.DbErr], f: &fn(Store): R): Result
 // An in-process follower's master, held weakly: a follower's state reaches its link and a store
 // reaches its follower, so a strong link would be a cycle of handles, which the compiler refuses
 // (design/consistency.md, finding 1). The master must stay open while its followers run.
-pub type StoreRef = value record { sh: task.Weak[Db]; memo: lexdb_memo.Memo; locks: lexdb_locks.Locks }
+pub type StoreRef = value record { sh: task.Weak[Db]; memo: lexdb_memo.Memo; locks: lexdb_locks.Locks; id: int }
 
 // A weak reference to the store, for an in-process follower's link (Link.Local).
-pub fn (st: &Store) weakRef(): StoreRef { return StoreRef{sh: st.sh.weak(), memo: st.memo.share(), locks: st.locks.share()} }
+pub fn (st: &Store) weakRef(): StoreRef { return StoreRef{sh: st.sh.weak(), memo: st.memo.share(), locks: st.locks.share(), id: st.id} }
 
 // The master store (a primary: no follower of its own); it must still be open.
 fn (r: &StoreRef) store(): Store {
     match r.sh.upgrade() {
-        Some(sh) { return Store{sh: sh, fo: None, memo: r.memo.share(), locks: r.locks.share(), ro: false} }
+        Some(sh) { return Store{sh: sh, fo: None, memo: r.memo.share(), locks: r.locks.share(), ro: false, id: r.id} }
         None { panic("lexdb: an in-process follower's master store was closed before it") }
     }
 }
@@ -8875,7 +9228,7 @@ fn openReplicaIn(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, split: bool, opts: Opt
     let m = lexdb_page.Meta{ckpt: 0, npages: 2, roots: 0, replaySeg: 1, replayOff: 0, replayBatch: 1, nextTree: lexdb_tmpstore.LOCAL_BASE,
                             dropped: 0, runs: 0, covers: -1}
     let db = newDb(fs, logFs, lexdb_disk.File.Real(-1, false), opts, &m)
-    return Ok(Store{sh: task.shared(db), fo: Some(fo), memo: lexdb_memo.newMemo(), locks: lexdb_locks.newLocks(), ro: true})
+    return Ok(Store{sh: task.shared(db), fo: Some(fo), memo: lexdb_memo.newMemo(), locks: lexdb_locks.newLocks(), ro: true, id: nextStoreId()})
 }
 
 // A replica's follower.

@@ -1,0 +1,71 @@
+// lexdb over TNS: Oracle Data Skipping Indexes (minmax, set, bloom_filter, ngrambf, tokenbf).
+// expect: setup: ok
+// expect: bf_hit: N = 1
+// expect: ng_hit: N = 2
+// expect: dml_ok: N = 3
+// expect: drop_ok: ok
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+fn qtext(c: mut &oracle.Conn, sql: &str): str {
+    match c.query(&(sql.toStr()), &[]) {
+        Ok(rows) {
+            var names: []str = []
+            for j in 0..rows.columnCount() { append(mut &names, rows.columnName(j).unwrap()) }
+            var rs: []str = []
+            for i in 0..rows.rowCount() {
+                var cells: []str = []
+                for j in 0..rows.columnCount() { append(mut &cells, rows.value(i, j).unwrap().toStr()) }
+                append(mut &rs, strings.join(&cells, "|"))
+            }
+            return strings.join(&names, ",") + " = " + strings.join(&rs, ";")
+        }
+        Err(e) { return "error " + e.code.toStr() + " " + e.msg }
+    }
+}
+
+fn client(port: &str) {
+    match oracle.connect(&("User Id=app;Password=app;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c0) {
+            var c = c0
+            c.run(&("create table web_ev (id integer primary key, uid_val integer, url varchar2(200))".toStr()), &[]).unwrap()
+            c.run(&("insert into web_ev values (1, 1001, 'https://docs.google.com/a')".toStr()), &[]).unwrap()
+            c.run(&("insert into web_ev values (2, 2002, 'https://example.org/b')".toStr()), &[]).unwrap()
+            c.run(&("insert into web_ev values (3, 3003, 'https://mail.google.com/c')".toStr()), &[]).unwrap()
+            c.run(&("create skipping index ix_uid_bf on web_ev (uid_val) using bloom_filter".toStr()), &[]).unwrap()
+            c.run(&("create index ix_url_ng on web_ev using ngrambf(3, 1024, 3) (url)".toStr()), &[]).unwrap()
+            println("setup: ok")
+            println("bf_hit: " + qtext(mut &c, &"select count(*) n from web_ev where uid_val = 2002"))
+            println("ng_hit: " + qtext(mut &c, &"select count(*) n from web_ev where url like '%google%'"))
+            c.run(&("insert into web_ev values (4, 4004, 'https://drive.google.com/d')".toStr()), &[]).unwrap()
+            println("dml_ok: " + qtext(mut &c, &"select count(*) n from web_ev where url like '%google%'"))
+            c.run(&("drop skipping index ix_uid_bf".toStr()), &[]).unwrap()
+            c.run(&("drop index ix_url_ng".toStr()), &[]).unwrap()
+            println("drop_ok: ok")
+            c.logoff()
+        }
+        Err(e) { println("connect: " + e.code.toStr() + " " + e.msg) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(206), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

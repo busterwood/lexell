@@ -7,10 +7,18 @@ Makes an index on a table's columns or expressions.
 ## Syntax
 
 ```
-CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ [ IF NOT EXISTS ] name ] ON table_name [ USING btree ]
+CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ [ IF NOT EXISTS ] name ] ON table_name
+    [ USING { btree | minmax | brin | set | bloom_filter | ngrambf | tokenbf } [ ( param [, ...] ) ] ]
     ( { column_name | ( expression ) | function_call } [ COLLATE collation ] [ opclass ]
       [ ASC | DESC ] [ NULLS { FIRST | LAST } ] [, ...] )
     [ WHERE predicate ]
+    [ WITH ( option = value [, ...] ) ]
+
+CREATE SKIPPING INDEX [ IF NOT EXISTS ] [ name ] ON table_name ( column_name )
+    [ USING { minmax | brin | set | bloom_filter | ngrambf | tokenbf } [ ( param [, ...] ) ] ]
+    [ WITH ( option = value [, ...] ) ]
+
+DROP [ SKIPPING ] INDEX [ IF EXISTS ] name
 ```
 
 ## Arguments
@@ -30,8 +38,8 @@ CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ [ IF NOT EXISTS ] name ] ON table_nam
 *table_name*
 : A table, optionally schema-qualified. A view cannot have an index.
 
-`USING btree`
-: The index method. B-tree is the only one.
+`USING btree` | *skipping_method*
+: The index method. `btree` is the default. Data skipping methods (`minmax`/`brin`, `set(max_rows)`, `bloom_filter(bits_per_key, size_bytes, hashes)`, `ngrambf(n, size_bytes, hashes)`, `tokenbf(size_bytes, hashes)`) store compact per-node summaries across the table's B+tree hierarchy so analytical scans prune entire subtrees without reading non-matching leaves. Skipping indexes cannot be `UNIQUE` and index a single column; they incur zero maintenance work on OLTP writes (subtrees invalidate via a version counter and refresh lazily or on `ANALYZE`). Control runtime pruning with `SET data_skipping_enabled = on | off` (default `on`).
 
 *column_name*, `(` *expression* `)`, *function_call*
 : What the index holds: columns, or expressions of the row's columns (`lower(email)`, `(a + b)`), with no
@@ -56,8 +64,8 @@ CREATE [ UNIQUE ] INDEX [ CONCURRENTLY ] [ [ IF NOT EXISTS ] name ] ON table_nam
 
 ## Differences from PostgreSQL
 
-- Only B-tree indexes: `USING hash`, `gin`, `gist`, `brin` and `spgist` are refused (0A000).
-- `INCLUDE (...)`, `WITH ( storage_parameter )`, `TABLESPACE` and `NULLS NOT DISTINCT` are not supported.
+- Supported index methods are `btree` and the data skipping methods (`minmax`, `brin`, `set`, `bloom_filter`, `ngrambf`, `tokenbf`); `USING hash`, `gin`, `gist` and `spgist` are refused (0A000).
+- `INCLUDE (...)`, `TABLESPACE` and `NULLS NOT DISTINCT` are not supported. `WITH ( option = value )` is supported for data skipping index parameters (`max_rows`, `n`, `size`, `hashes`).
 - `CONCURRENTLY` does not change how the index is built.
 - `pg_indexes.indexdef` shows an index on `(n + 1)` as `(((n + 1)))`; PostgreSQL shows `((n + 1))`.
 
@@ -191,6 +199,31 @@ DETAIL:  Key (city)=(hull) is duplicated.
 BEGIN
 ERROR:  CREATE INDEX CONCURRENTLY cannot run inside a transaction block
 ROLLBACK
+```
+
+### F. Data skipping indexes
+
+Data skipping indexes prune B+tree subtrees for equality, `IN`, range, and substring `LIKE` predicates without secondary B+tree write amplification.
+
+<!-- example: postgresql -->
+```sql
+CREATE INDEX customer_score_bf ON customer USING bloom_filter (score);
+CREATE SKIPPING INDEX customer_email_ng ON customer (email) USING ngrambf(3, 2048, 3);
+SELECT count(*) FROM customer WHERE email LIKE '%user42%';
+DROP SKIPPING INDEX customer_email_ng;
+DROP INDEX customer_score_bf;
+```
+
+```text
+CREATE INDEX
+CREATE INDEX
+ count
+-------
+     1
+(1 row)
+
+DROP INDEX
+DROP INDEX
 ```
 
 ## See also

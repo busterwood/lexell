@@ -7389,6 +7389,59 @@ fn (p: mut &P) mrPrimary(m: mut &MatchRec, exc: mut &bool, d: int): Result[lexdb
 }
 
 
+fn isSkipMethod(m: &str): bool {
+    return m == "minmax" || m == "brin" || m == "set" || m == "bloom_filter" || m == "bloom" ||
+           m == "ngrambf" || m == "ngrambf_v1" || m == "tokenbf" || m == "tokenbf_v1"
+}
+
+fn (p: mut &P) indexMethodName(): Result[str, lexdb_base.DbErr] {
+    if p.peek().kind == T_IDENT {
+        let t = p.next()
+        return Ok(strings.toLowerAscii(&t.text))
+    }
+    return Ok(strings.toLowerAscii(&(try p.name())))
+}
+
+fn (p: mut &P) skipMethodParams(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    // Optional positional numeric parameters right after method name: USING ngrambf(3, 2048, 3)
+    if p.peek().kind == T_OP && p.peek().text == "(" && p.peekAt(1).kind == T_NUM {
+        try p.expectKw("(")
+        let v0 = try p.intLit()
+        append(mut &s.skipParams, v0)
+        while p.acceptKw(",") { append(mut &s.skipParams, try p.intLit()) }
+        try p.expectKw(")")
+    }
+    return Ok(Unit{})
+}
+
+fn (p: mut &P) skipWithOpts(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
+    if !p.acceptKw("with") { return Ok(Unit{}) }
+    try p.expectKw("(")
+    var p1 = -1
+    var p2 = -1
+    var p3 = -1
+    while true {
+        let k = strings.toLowerAscii(&(try p.name()))
+        try p.expectKw("=")
+        let v = try p.intLit()
+        if k == "max_rows" || k == "bits_per_key" || k == "n" || k == "ngram" || (k == "size" && (s.skipMethod == "tokenbf" || s.skipMethod == "tokenbf_v1")) || (k == "size_bytes" && (s.skipMethod == "tokenbf" || s.skipMethod == "tokenbf_v1")) {
+            p1 = v
+        } else if k == "size" || k == "size_bytes" || (k == "hashes" && (s.skipMethod == "tokenbf" || s.skipMethod == "tokenbf_v1")) {
+            p2 = v
+        } else if k == "hashes" {
+            p3 = v
+        } else {
+            return Err(lexdb_base.err("22023", &("unrecognized skipping index option \"" + k + "\"")))
+        }
+        if !p.acceptKw(",") { break }
+    }
+    try p.expectKw(")")
+    if p1 >= 0 || p2 >= 0 || p3 >= 0 {
+        s.skipParams = [p1, p2, p3]
+    }
+    return Ok(Unit{})
+}
+
 fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
     var s = lexdb_sql.newStmt(S_CREATE_INDEX)
     s.mdialect = if p.tsql { MD_TSQL } else if p.ora { MD_ORA } else { MD_PG }
@@ -7404,10 +7457,35 @@ fn (p: mut &P) createIndex(unique: bool): Result[Stmt, lexdb_base.DbErr] {
     try p.expectKw("on")
     s.table = try p.rname()
     if p.acceptKw("using") {
-        let m = try p.name()
-        if m != "btree" { return Err(lexdb_base.err("0A000", &("index method \"" + m + "\" is not supported"))) }
+        let m = try p.indexMethodName()
+        if isSkipMethod(&m) {
+            if unique { return Err(lexdb_base.err("0A000", "skipping indexes cannot be UNIQUE")) }
+            s.skipMethod = m
+            try p.skipMethodParams(mut &s)
+        } else if m != "btree" {
+            return Err(lexdb_base.err("0A000", &("index method \"" + m + "\" is not supported")))
+        }
     }
     try p.indexCols(mut &s)
+    if len(s.skipMethod) == 0 && p.acceptKw("using") {
+        let m = try p.indexMethodName()
+        if isSkipMethod(&m) {
+            if unique { return Err(lexdb_base.err("0A000", "skipping indexes cannot be UNIQUE")) }
+            s.skipMethod = m
+            try p.skipMethodParams(mut &s)
+        } else if m != "btree" {
+            return Err(lexdb_base.err("0A000", &("index method \"" + m + "\" is not supported")))
+        }
+    }
+    if len(s.skipMethod) > 0 && p.isKw("with") {
+        try p.skipWithOpts(mut &s)
+    }
+    return Ok(s)
+}
+
+fn (p: mut &P) createSkippingIndex(): Result[Stmt, lexdb_base.DbErr] {
+    var s = try p.createIndex(false)
+    if len(s.skipMethod) == 0 { s.skipMethod = "minmax" }
     return Ok(s)
 }
 
@@ -8751,6 +8829,10 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 ci.cluster = cl
                 return Ok(ci)
             }
+            if p.acceptKw("skipping") {
+                try p.expectKw("index")
+                return p.createSkippingIndex()
+            }
             if p.acceptKw("index") { return p.createIndex(false) }
             if p.acceptKw("unique") {
                 try p.expectKw("index")
@@ -8821,8 +8903,11 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 }
                 return Ok(r)
             }
-            if p.acceptKw("index") {
+            let isSkipDrop = p.acceptKw("skipping")
+            if isSkipDrop || p.acceptKw("index") {
+                if isSkipDrop { try p.expectKw("index") }
                 var s = lexdb_sql.newStmt(S_DROP_INDEX)
+                if isSkipDrop { s.skipMethod = "skip" }
                 s.conc = p.acceptKw("concurrently")
                 if p.acceptKw("if") {
                     try p.expectKw("exists")
@@ -8844,7 +8929,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 }
                 s.index = try p.qname()
                 let ixWritten = lexdb_sql.writtenName(&p.src[at0..min(p.peek().at, len(p.src))])
-                if p.tsql && !p.isKw("on") { return Err(lexdb_base.err("TS159", "Must specify the table name and index name for the DROP INDEX statement.")) }
+                if p.tsql && !isSkipDrop && !p.isKw("on") { return Err(lexdb_base.err("TS159", "Must specify the table name and index name for the DROP INDEX statement.")) }
                 if p.tsql && p.acceptKw("on") {
                     s.mdialect = MD_TSQL
                     let at1 = p.peek().at
@@ -9123,7 +9208,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                     if len(st.names) == 0 { return Err(lexdb_base.err("22023", "search_path names no schema")) }
                     return Ok(st)
                 }
-                if t.text == "set" && (st.table == "lexdb_batch" || st.table == "lexdb_planner" || st.table == "lexdb_autoanalyze" || st.table == "lexdb_range_delete" || st.table == "query_rewrite_enabled") {
+                if t.text == "set" && (st.table == "lexdb_batch" || st.table == "lexdb_planner" || st.table == "lexdb_autoanalyze" || st.table == "lexdb_range_delete" || st.table == "query_rewrite_enabled" || st.table == "data_skipping_enabled") {
                     // lexdb_batch: on, off, true, false, 1, 0, a string of one of
                     // them, DEFAULT; lexdb_planner: cost, rules (optimizer 20), a word or a string
                     if !p.acceptKw("to") { try p.expectKw("=") }

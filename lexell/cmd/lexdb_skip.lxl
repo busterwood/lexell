@@ -1,0 +1,1610 @@
+// lexdb_skip: ClickHouse-style hierarchical B+tree Data Skipping Indexes & automatic Zone Maps.
+//
+// Two layers work together seamlessly inside Store.scanLeavesSkip:
+// 1. Automatic Zero-Config Hierarchical Zone Maps:
+//    Every column leaf (T_CLEAF) already stores (min, max, hasNulls) per integer/date/time/numeric-units
+//    place in its header. lexdb_skip caches these per B+tree node and rolls them up post-order from
+//    leaves -> internal nodes -> root, letting range, IN, <> (not-equal), and dynamic Top-N Bar filters
+//    prune entire B+tree subtrees without loading or visiting child leaves.
+// 2. Explicit Data Skipping Indexes (CREATE SKIPPING INDEX / CREATE INDEX ... USING <method>):
+//    - MINMAX / BRIN : min/max bounds for integers, dates/times, and text
+//    - SET(max_rows) : exact distinct value set up to max_rows (else saturated)
+//    - BLOOM_FILTER  : double-hashed SipHash-1-3 Bloom filter for = / IN on high-cardinality columns
+//    - NGRAMBF       : N-gram Bloom filter for arbitrary substring LIKE '%...%' (0% false negatives)
+//    - TOKENBF       : alphanumeric token Bloom filter for = / delimiter-bounded LIKE '%.tok.%'
+//    All four index kinds form commutative monoids (min/max union, set union, bitwise-OR of Bloom filters),
+//    so summaries roll up hierarchically across internal B+tree nodes and persist by immutable diskPageNo
+//    in a companion B+tree for instant cold-restart skipping without re-reading data pages.
+//
+// Correctness & MVCC:
+// - Every B+tree mutation bumps SlotMeta.subVer on every ancestor along root->leaf (in markDirty).
+// - Live reads require (slot.gen, slot.subVer) match; snapshot reads additionally require entry.seq <= snapSeq.
+// - Saturated Bloom filters (>75% fill) drop their bitset on upper internal nodes (0 waste, 0 false negatives).
+import "strings"
+import "binary"
+import "hash"
+import "task"
+import "collections"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_cols"
+import "./lexdb_rows"
+import "./lexdb_like"
+import "./lexdb_store"
+
+type Val = lexdb_sql.Val
+type DbErr = lexdb_base.DbErr
+type LeafView = lexdb_rows.LeafView
+
+pub const SKIP_PRE = "\x02skip\x00"
+pub const SKIP_END = "\x02skip\x01"
+const CATALOG_TREE = 1
+
+pub const SKIP_MINMAX = 1
+pub const SKIP_SET = 2
+pub const SKIP_BLOOM = 3
+pub const SKIP_NGRAM = 4
+pub const SKIP_TOKEN = 5
+
+pub fn kindName(k: int): str {
+    if k == SKIP_MINMAX { return "minmax" }
+    if k == SKIP_SET { return "set" }
+    if k == SKIP_BLOOM { return "bloom_filter" }
+    if k == SKIP_NGRAM { return "ngrambf" }
+    if k == SKIP_TOKEN { return "tokenbf" }
+    return "unknown"
+}
+
+pub fn parseKind(name: &str): int {
+    let lo = strings.toLowerAscii(name)
+    if lo == "minmax" || lo == "brin" { return SKIP_MINMAX }
+    if lo == "set" { return SKIP_SET }
+    if lo == "bloom_filter" || lo == "bloom" { return SKIP_BLOOM }
+    if lo == "ngrambf" || lo == "ngrambf_v1" { return SKIP_NGRAM }
+    if lo == "tokenbf" || lo == "tokenbf_v1" { return SKIP_TOKEN }
+    return 0
+}
+
+pub fn isSkippingMethod(name: &str): bool { return parseKind(name) > 0 }
+
+// Persisted catalog metadata for one explicit skipping index.
+pub type SkipMeta = record {
+    pub key: str            // catalog key (schema.idxname)
+    pub name: str           // index base name
+    pub table: str          // base table catalog key
+    pub tableTree: int      // base table B+tree id
+    pub colName: str        // indexed column name
+    pub colPlace: int       // column's fixed-layout place index
+    pub colKind: byte       // lexdb_rows.PK_*
+    pub kind: int           // SKIP_*
+    pub p1: int             // SET: max_rows (32); BLOOM: bits_per_key (10); NGRAM: n (3); TOKEN: size_bytes (2048)
+    pub p2: int             // BLOOM/NGRAM: size_bytes (512 / 2048); TOKEN: hashes (3)
+    pub p3: int             // BLOOM/NGRAM: hashes (3)
+    pub tree: int           // companion B+tree id storing diskPageNo -> IdxSum
+    pub ci: bool            // true for case-insensitive collated text columns (e.g. T-SQL NVARCHAR)
+}
+
+pub fn defaultMeta(key: str, name: str, table: str, tableTree: int, colName: str, colPlace: int, colKind: byte, kind: int): SkipMeta {
+    var p1 = 0
+    var p2 = 0
+    var p3 = 0
+    if kind == SKIP_SET { p1 = 32 }
+    else if kind == SKIP_BLOOM { p1 = 10; p2 = 2048; p3 = 3 }
+    else if kind == SKIP_NGRAM { p1 = 3; p2 = 2048; p3 = 3 }
+    else if kind == SKIP_TOKEN { p1 = 2048; p2 = 3 }
+    return SkipMeta{key: key, name: name, table: table, tableTree: tableTree, colName: colName, colPlace: colPlace,
+                    colKind: colKind, kind: kind, p1: p1, p2: p2, p3: p3, tree: 0, ci: false}
+}
+
+pub fn cloneMeta(m: &SkipMeta): SkipMeta {
+    return SkipMeta{key: m.key.clone(), name: m.name.clone(), table: m.table.clone(), tableTree: m.tableTree,
+                    colName: m.colName.clone(), colPlace: m.colPlace, colKind: m.colKind, kind: m.kind,
+                    p1: m.p1, p2: m.p2, p3: m.p3, tree: m.tree, ci: m.ci}
+}
+
+fn cloneMetas(ms: &[]SkipMeta): []SkipMeta {
+    var out: []SkipMeta = withCapacity(len(ms))
+    for m in ms { append(mut &out, cloneMeta(&m)) }
+    return out
+}
+
+fn cloneStrs(ss: &[]str): []str {
+    var out: []str = withCapacity(len(ss))
+    for s in ss { append(mut &out, s.clone()) }
+    return out
+}
+
+pub fn encMeta(m: &SkipMeta): str {
+    var b: []byte = withCapacity(128)
+    append(mut &b, byte(1)) // format version
+    encStr(mut &b, &m.key)
+    encStr(mut &b, &m.name)
+    encStr(mut &b, &m.table)
+    binary.appendU64LE(mut &b, m.tableTree)
+    encStr(mut &b, &m.colName)
+    binary.appendU32LE(mut &b, m.colPlace)
+    append(mut &b, m.colKind)
+    binary.appendU32LE(mut &b, m.kind)
+    binary.appendU32LE(mut &b, m.p1)
+    binary.appendU32LE(mut &b, m.p2)
+    binary.appendU32LE(mut &b, m.p3)
+    binary.appendU64LE(mut &b, m.tree)
+    append(mut &b, byte(if m.ci { 1 } else { 0 }))
+    return strFromBytes(&b)
+}
+
+pub fn decMeta(s: &str): Option[SkipMeta] {
+    if len(s) < 2 || s[0] != 1 { return None }
+    var at = 1
+    let key = match decStr(s, mut &at) { Some(v) { v } None { return None } }
+    let name = match decStr(s, mut &at) { Some(v) { v } None { return None } }
+    let table = match decStr(s, mut &at) { Some(v) { v } None { return None } }
+    if at + 8 > len(s) { return None }
+    let tableTree = readI64LE(s, at); at += 8
+    let colName = match decStr(s, mut &at) { Some(v) { v } None { return None } }
+    if at + 29 > len(s) { return None }
+    let colPlace = binary.readU32LEStr(s, at); at += 4
+    let colKind = s[at]; at += 1
+    let kind = binary.readU32LEStr(s, at); at += 4
+    let p1 = binary.readU32LEStr(s, at); at += 4
+    let p2 = binary.readU32LEStr(s, at); at += 4
+    let p3 = binary.readU32LEStr(s, at); at += 4
+    let tree = readI64LE(s, at); at += 8
+    let ci = at < len(s) && s[at] != 0
+    return Some(SkipMeta{key: key, name: name, table: table, tableTree: tableTree, colName: colName, colPlace: colPlace,
+                         colKind: colKind, kind: kind, p1: p1, p2: p2, p3: p3, tree: tree, ci: ci})
+}
+
+fn encStr(b: mut &[]byte, s: &str) {
+    binary.appendU32LE(b, len(s))
+    for i in 0..len(s) { append(b, s[i]) }
+}
+
+fn decStr(s: &str, at: mut &int): Option[str] {
+    if at + 4 > len(s) { return None }
+    let n = binary.readU32LEStr(s, at)
+    at += 4
+    if n < 0 || at + n > len(s) { return None }
+    let out = s[at..at + n].toStr()
+    at += n
+    return Some(out)
+}
+
+fn readI64LE(s: &str, at: int): int {
+    var v = 0
+    for i in 0..8 { v |= int(s[at + i]) << (i * 8) }
+    return v
+}
+
+// ---- Query predicates extracted from WHERE / Top-N Bar for subtree & leaf skipping
+
+pub type SkipQuery = record {
+    pub active: bool            // false => no skippable predicates (zero overhead!)
+    pub ranges: []int           // [pl, wantKind, lo, hi, ...] (same layout as bp.ranges)
+    pub nes: []int              // [pl, wantKind, val, ...] for col <> val
+    pub eqPl: []int             // place index for exact int equality (SET / BLOOM)
+    pub eqInt: []int
+    pub inPl: []int             // place index for IN (int list)
+    pub inInts: [][]int
+    pub strPl: []int            // place index for text comparisons (=, <>, <, <=, >, >=, IN)
+    pub strOp: []int            // 0:=, 1:<>, 2:<, 3:<=, 4:>, 5:>=, 6:IN
+    pub strVals: [][]str
+    pub likePl: []int           // place index for simple case-sensitive LIKE
+    pub likePieces: [][]str     // likeSplit pieces (for NGRAMBF / TOKENBF / SET)
+    pub barOn: bool             // dynamic Top-N threshold (ORDER BY int LIMIT N)
+    pub barPl: int
+    pub barKind: int            // 0 = any int, else PK_*
+    pub barVal: int
+    pub barDesc: bool
+    pub barNf: bool             // nullsFirst
+}
+
+pub fn emptyQuery(): SkipQuery {
+    return SkipQuery{active: false, ranges: [], nes: [], eqPl: [], eqInt: [], inPl: [], inInts: [],
+                     strPl: [], strOp: [], strVals: [], likePl: [], likePieces: [],
+                     barOn: false, barPl: -1, barKind: 0, barVal: 0, barDesc: false, barNf: false}
+}
+
+pub fn (q: &SkipQuery) hasFilters(): bool {
+    return len(q.ranges) > 0 || len(q.nes) > 0 || len(q.eqPl) > 0 || len(q.inPl) > 0 ||
+           len(q.strPl) > 0 || len(q.likePl) > 0 || q.barOn
+}
+
+// ---- Per-node summaries (automatic column-leaf zone maps + explicit skipping index summaries)
+
+// Per-explicit-index summary on one B+tree node (leaf or rolled-up internal node).
+pub type IdxSum = record {
+    pub idxKey: str
+    pub colPlace: int
+    pub kind: int               // SKIP_*
+    pub isText: bool
+    pub ci: bool
+    pub saturated: bool
+    pub hasVal: bool
+    pub hasNull: bool
+    pub minI: int
+    pub maxI: int
+    pub minS: str
+    pub maxS: str
+    pub intSet: []int
+    pub strSet: []str
+    pub maxSet: int
+    pub bits: []byte            // Bloom / NgramBF / TokenBF bytes (empty when saturated)
+    pub hashes: int
+    pub ngramN: int
+}
+
+fn emptyIdxSum(m: &SkipMeta): IdxSum {
+    let isText = m.colKind == lexdb_rows.PK_TEXT
+    let maxSet = if m.kind == SKIP_SET { max(m.p1, 1) } else { 0 }
+    let sz = if m.kind == SKIP_BLOOM { max(m.p2, 64) }
+             else if m.kind == SKIP_NGRAM { max(m.p2, 128) }
+             else if m.kind == SKIP_TOKEN { max(m.p1, 128) }
+             else { 0 }
+    let hs = if m.kind == SKIP_BLOOM { max(m.p3, 1) }
+             else if m.kind == SKIP_NGRAM { max(m.p3, 1) }
+             else if m.kind == SKIP_TOKEN { max(m.p2, 1) }
+             else { 0 }
+    let ng = if m.kind == SKIP_NGRAM { max(m.p1, 2) } else { 0 }
+    return IdxSum{idxKey: m.key.clone(), colPlace: m.colPlace, kind: m.kind, isText: isText, ci: m.ci,
+                  saturated: false, hasVal: false, hasNull: false, minI: 0, maxI: 0, minS: "", maxS: "",
+                  intSet: [], strSet: [], maxSet: maxSet,
+                  bits: if sz > 0 { array(sz, byte(0)) } else { [] },
+                  hashes: hs, ngramN: ng}
+}
+
+pub type NodeSum = record {
+    // Automatic zone map across all integer/date/time/units places of T_CLEAF leaves
+    pub hasAuto: bool
+    pub np: int
+    pub kinds: []byte
+    pub hasVal: []bool
+    pub hasNull: []bool
+    pub minV: []int
+    pub maxV: []int
+    // Explicit skipping index summaries (0 or more)
+    pub idxs: []IdxSum
+}
+
+fn emptyNodeSum(): NodeSum {
+    return NodeSum{hasAuto: false, np: 0, kinds: [], hasVal: [], hasNull: [], minV: [], maxV: [], idxs: []}
+}
+
+// ---- Fast zero-allocation Bloom hashing (deterministic across reopens)
+
+fn mixInt64(x: u64, seed: u64): u64 {
+    // 32-bit-lane ARX mixer (matches lexdb_sketch; zero allocations, cannot overflow u64).
+    let m32 = u64(0xffffffff)
+    var lo = ((x ^ seed) & m32) ^ u64(0x27220a95)
+    var hi = (((x ^ seed) >> 32) & m32) ^ u64(0x517cc1b7)
+    for _ in 0..3 {
+        lo = (lo + hi + u64(0x9e3779b9)) & m32
+        lo = ((lo << 13) | (lo >> 19)) & m32
+        hi = (hi + lo + u64(0x85ebca6b)) & m32
+        hi = ((hi << 17) | (hi >> 15)) & m32
+    }
+    return (hi << 32) | lo
+}
+
+fn bloomSet(bits: mut &[]byte, hashes: int, h1: u64, h2: u64) {
+    let nBits = u64(len(bits) * 8)
+    if nBits == 0 { return }
+    let step = h2 | u64(1)
+    var h = h1
+    for _ in 0..hashes {
+        let pos = int(h % nBits)
+        bits[pos >> 3] = bits[pos >> 3] | byte(1 << (pos & 7))
+        h = h +% step
+    }
+}
+
+fn bloomHas(bits: &[byte], hashes: int, h1: u64, h2: u64): bool {
+    let nBits = u64(len(bits) * 8)
+    if nBits == 0 { return true }
+    let step = h2 | u64(1)
+    var h = h1
+    for _ in 0..hashes {
+        let pos = int(h % nBits)
+        if (int(bits[pos >> 3]) & (1 << (pos & 7))) == 0 { return false }
+        h = h +% step
+    }
+    return true
+}
+
+fn intToU64(v: int): u64 {
+    let lo = u64(v & 0xffffffff)
+    let hi = u64((v >> 32) & 0xffffffff)
+    return (hi << 32) | lo
+}
+
+fn bloomAddInt(bits: mut &[]byte, hashes: int, v: int) {
+    let u = intToU64(v)
+    let h1 = mixInt64(u, u64(0x243f6a8885a308d3))
+    let h2 = mixInt64(u, u64(0x13198a2e03707344))
+    bloomSet(bits, hashes, h1, h2)
+}
+
+fn bloomHasInt(bits: &[byte], hashes: int, v: int): bool {
+    let u = intToU64(v)
+    let h1 = mixInt64(u, u64(0x243f6a8885a308d3))
+    let h2 = mixInt64(u, u64(0x13198a2e03707344))
+    return bloomHas(bits, hashes, h1, h2)
+}
+
+fn bloomAddStr(bits: mut &[]byte, hashes: int, s: &str) {
+    let h1 = hash.sipHash13(0x4c4558534b495030, 0x1122334455667788, s)
+    let h2 = hash.sipHash13(0x4c4558534b495031, 0x2233445566778899, s)
+    bloomSet(bits, hashes, h1, h2)
+}
+
+fn bloomHasStr(bits: &[byte], hashes: int, s: &str): bool {
+    let h1 = hash.sipHash13(0x4c4558534b495030, 0x1122334455667788, s)
+    let h2 = hash.sipHash13(0x4c4558534b495031, 0x2233445566778899, s)
+    return bloomHas(bits, hashes, h1, h2)
+}
+
+type HashPair = value record { h1: u64; h2: u64 }
+
+// Fast 3-byte / n-byte ngram hash without allocating substrings!
+fn ngramHashPair(s: &str, at: int, n: int): HashPair {
+    if n <= 8 {
+        var w: u64 = u64(n) << 56
+        for i in 0..n { w |= u64(int(s[at + i])) << (i * 8) }
+        return HashPair{h1: mixInt64(w, u64(0x243f6a8885a308d3)), h2: mixInt64(w, u64(0x13198a2e03707344))}
+    }
+    let sub = &s[at..at + n]
+    return HashPair{h1: hash.sipHash13(0x4c4558534b495030, 0x1122334455667788, sub),
+                    h2: hash.sipHash13(0x4c4558534b495031, 0x2233445566778899, sub)}
+}
+
+fn bloomAddNgrams(bits: mut &[]byte, hashes: int, ng: int, s: &str) {
+    let n = len(s)
+    if n < ng { return }
+    for i in 0..(n - ng + 1) {
+        let hp = ngramHashPair(s, i, ng)
+        bloomSet(bits, hashes, hp.h1, hp.h2)
+    }
+}
+
+fn bloomHasNgrams(bits: &[byte], hashes: int, ng: int, s: &str): bool {
+    let n = len(s)
+    if n < ng { return true }
+    for i in 0..(n - ng + 1) {
+        let hp = ngramHashPair(s, i, ng)
+        if !bloomHas(bits, hashes, hp.h1, hp.h2) { return false }
+    }
+    return true
+}
+
+fn isTokenByte(c: byte): bool {
+    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
+}
+
+fn bloomAddTokens(bits: mut &[]byte, hashes: int, s: &str) {
+    let n = len(s)
+    var i = 0
+    while i < n {
+        while i < n && !isTokenByte(s[i]) { i += 1 }
+        let st = i
+        while i < n && isTokenByte(s[i]) { i += 1 }
+        if i > st { bloomAddStr(bits, hashes, &s[st..i]) }
+    }
+}
+
+// Checks tokens guaranteed to appear whole in any matching text:
+// - exact = true: every token in s must be present
+// - exact = false (LIKE piece): only tokens bounded on BOTH sides by non-token bytes inside s
+//   (or anchored at start/end when anchorStart/anchorEnd is true).
+fn bloomHasTokens(bits: &[byte], hashes: int, s: &str, anchorStart: bool, anchorEnd: bool): bool {
+    let n = len(s)
+    var i = 0
+    while i < n {
+        while i < n && !isTokenByte(s[i]) { i += 1 }
+        let st = i
+        while i < n && isTokenByte(s[i]) { i += 1 }
+        if i > st {
+            let leftOk = st > 0 || anchorStart
+            let rightOk = i < n || anchorEnd
+            if leftOk && rightOk {
+                if !bloomHasStr(bits, hashes, &s[st..i]) { return false }
+            }
+        }
+    }
+    return true
+}
+
+fn popcountBytes(bs: &[byte]): int {
+    var c = 0
+    for b in bs {
+        var x = int(b)
+        while x != 0 { x &= x - 1; c += 1 }
+    }
+    return c
+}
+
+fn checkBloomSaturated(ix: mut &IdxSum) {
+    if ix.saturated || len(ix.bits) == 0 { return }
+    let ones = popcountBytes(&ix.bits)
+    if ones * 4 > len(ix.bits) * 8 * 3 {
+        ix.saturated = true
+        ix.bits = []
+    }
+}
+
+// ---- Feed values into IdxSum (leaf build)
+
+fn idxAddInt(ix: mut &IdxSum, v: int) {
+    if ix.saturated { return }
+    if !ix.hasVal {
+        ix.hasVal = true
+        ix.minI = v
+        ix.maxI = v
+    } else {
+        if v < ix.minI { ix.minI = v }
+        if v > ix.maxI { ix.maxI = v }
+    }
+    if ix.kind == SKIP_SET {
+        for x in ix.intSet { if x == v { return } }
+        if len(ix.intSet) >= ix.maxSet {
+            ix.saturated = true
+            ix.intSet = []
+        } else {
+            append(mut &ix.intSet, v)
+        }
+    } else if ix.kind == SKIP_BLOOM {
+        bloomAddInt(mut &ix.bits, ix.hashes, v)
+    }
+}
+
+fn idxAddStr(ix: mut &IdxSum, raw: &str) {
+    if ix.saturated { return }
+    let folded = if ix.ci { strings.toLowerAscii(raw) } else { "" }
+    let s: &str = if ix.ci { &folded } else { raw }
+    if !ix.hasVal {
+        ix.hasVal = true
+        if ix.kind == SKIP_MINMAX { ix.minS = s.toStr(); ix.maxS = s.toStr() }
+    } else if ix.kind == SKIP_MINMAX {
+        if s.cmp(&ix.minS) < 0 { ix.minS = s.toStr() }
+        if s.cmp(&ix.maxS) > 0 { ix.maxS = s.toStr() }
+    }
+    if ix.kind == SKIP_SET {
+        for x in ix.strSet { if x == s { return } }
+        if len(ix.strSet) >= ix.maxSet {
+            ix.saturated = true
+            ix.strSet = []
+        } else {
+            append(mut &ix.strSet, s.toStr())
+        }
+    } else if ix.kind == SKIP_BLOOM {
+        bloomAddStr(mut &ix.bits, ix.hashes, s)
+    } else if ix.kind == SKIP_NGRAM {
+        bloomAddNgrams(mut &ix.bits, ix.hashes, ix.ngramN, s)
+    } else if ix.kind == SKIP_TOKEN {
+        bloomAddTokens(mut &ix.bits, ix.hashes, s)
+    }
+}
+
+// ---- Monoidal merge of two IdxSums (leaf -> internal -> root rollup!)
+
+fn mergeIdxSum(dst: mut &IdxSum, src: &IdxSum) {
+    dst.hasNull = dst.hasNull || src.hasNull
+    if dst.saturated || src.saturated {
+        dst.saturated = true
+        dst.intSet = []
+        dst.strSet = []
+        dst.bits = []
+        return
+    }
+    if !src.hasVal { return }
+    if !dst.hasVal {
+        dst.hasVal = true
+        dst.minI = src.minI
+        dst.maxI = src.maxI
+        if dst.kind == SKIP_MINMAX && dst.isText {
+            dst.minS = src.minS.clone()
+            dst.maxS = src.maxS.clone()
+        }
+    } else if !dst.isText {
+        if src.minI < dst.minI { dst.minI = src.minI }
+        if src.maxI > dst.maxI { dst.maxI = src.maxI }
+    } else if dst.kind == SKIP_MINMAX {
+        if src.minS.cmp(&dst.minS) < 0 { dst.minS = src.minS.clone() }
+        if src.maxS.cmp(&dst.maxS) > 0 { dst.maxS = src.maxS.clone() }
+    }
+    if dst.kind == SKIP_SET {
+        if !dst.isText {
+            for v in src.intSet {
+                var found = false
+                for x in dst.intSet { if x == v { found = true; break } }
+                if !found {
+                    if len(dst.intSet) >= dst.maxSet { dst.saturated = true; dst.intSet = []; return }
+                    append(mut &dst.intSet, v)
+                }
+            }
+        } else {
+            for v in src.strSet {
+                var found = false
+                for x in dst.strSet { if x == v { found = true; break } }
+                if !found {
+                    if len(dst.strSet) >= dst.maxSet { dst.saturated = true; dst.strSet = []; return }
+                    append(mut &dst.strSet, v.clone())
+                }
+            }
+        }
+    } else if dst.kind == SKIP_BLOOM || dst.kind == SKIP_NGRAM || dst.kind == SKIP_TOKEN {
+        if len(dst.bits) != len(src.bits) { dst.saturated = true; dst.bits = []; return }
+        for i in 0..len(dst.bits) { dst.bits[i] = dst.bits[i] | src.bits[i] }
+    }
+}
+
+fn cloneIdxSum(s: &IdxSum): IdxSum {
+    return IdxSum{idxKey: s.idxKey.clone(), colPlace: s.colPlace, kind: s.kind, isText: s.isText, ci: s.ci,
+                  saturated: s.saturated, hasVal: s.hasVal, hasNull: s.hasNull,
+                  minI: s.minI, maxI: s.maxI, minS: s.minS.clone(), maxS: s.maxS.clone(),
+                  intSet: collections.copyOf(&s.intSet), strSet: cloneStrs(&s.strSet),
+                  maxSet: s.maxSet, bits: collections.copyOf(&s.bits), hashes: s.hashes, ngramN: s.ngramN}
+}
+
+fn cloneNodeSum(s: &NodeSum): NodeSum {
+    var idxs: []IdxSum = withCapacity(len(s.idxs))
+    for ix in s.idxs { append(mut &idxs, cloneIdxSum(&ix)) }
+    return NodeSum{hasAuto: s.hasAuto, np: s.np, kinds: collections.copyOf(&s.kinds),
+                   hasVal: collections.copyOf(&s.hasVal), hasNull: collections.copyOf(&s.hasNull),
+                   minV: collections.copyOf(&s.minV), maxV: collections.copyOf(&s.maxV), idxs: idxs}
+}
+
+// Rolls up children's NodeSums into a parent internal node's NodeSum.
+pub fn mergeNodeSums(kids: &[]NodeSum): NodeSum {
+    if len(kids) == 0 { return emptyNodeSum() }
+    var out = cloneNodeSum(&kids[0])
+    for ci in 1..len(kids) {
+        let k = &kids[ci]
+        if out.hasAuto && k.hasAuto && out.np == k.np {
+            var kindsMatch = true
+            for p in 0..out.np {
+                if out.kinds[p] != k.kinds[p] { kindsMatch = false; break }
+            }
+            if kindsMatch {
+                for p in 0..out.np {
+                    out.hasNull[p] = out.hasNull[p] || k.hasNull[p]
+                    if k.hasVal[p] {
+                        if !out.hasVal[p] {
+                            out.hasVal[p] = true
+                            out.minV[p] = k.minV[p]
+                            out.maxV[p] = k.maxV[p]
+                        } else {
+                            if k.minV[p] < out.minV[p] { out.minV[p] = k.minV[p] }
+                            if k.maxV[p] > out.maxV[p] { out.maxV[p] = k.maxV[p] }
+                        }
+                    }
+                }
+            } else {
+                out.hasAuto = false
+            }
+        } else {
+            out.hasAuto = false
+        }
+        if len(out.idxs) == len(k.idxs) {
+            for i in 0..len(out.idxs) {
+                mergeIdxSum(mut &out.idxs[i], &k.idxs[i])
+            }
+        } else {
+            out.idxs = []
+        }
+    }
+    for i in 0..len(out.idxs) { checkBloomSaturated(mut &out.idxs[i]) }
+    return out
+}
+
+// ---- Build NodeSum from a leaf (fast O(places) header read for T_CLEAF auto zone map,
+//      plus direct column/row read for any explicit SkipMeta indexes!)
+
+fn buildIdxOnColLeaf(leaf: &LeafView, m: &SkipMeta, rw: &lexdb_rows.Rows): IdxSum {
+    var ix = emptyIdxSum(m)
+    let dir = leaf.dir
+    let s = leaf.cols
+    let pl = m.colPlace
+    if pl < 0 || pl >= lexdb_cols.places(dir) {
+        ix.saturated = true; ix.bits = []; return ix
+    }
+    let pk = lexdb_cols.kindOf(s, pl)
+    let codec = lexdb_cols.codecOf(dir, pl)
+    if codec == lexdb_cols.C_ANY { return buildIdxOnRowLeaf(leaf, m, rw) }
+    let nulls = lexdb_cols.hasNulls(dir, pl)
+    ix.hasNull = nulls
+    let n = leaf.n
+    if !ix.isText {
+        // Integer / Date / Time / Ts / Tstz / Units column
+        if !(if lexdb_rows.isIntKind(m.colKind) { lexdb_rows.isIntKind(pk) } else { pk == m.colKind }) {
+            ix.saturated = true; ix.bits = []; return ix
+        }
+        if m.kind == SKIP_MINMAX && lexdb_cols.hasRange(dir, pl) {
+            ix.hasVal = true
+            ix.minI = lexdb_cols.least(dir, pl)
+            ix.maxI = lexdb_cols.greatest(dir, pl)
+            return ix
+        }
+        if codec != lexdb_cols.C_FOR && codec != lexdb_cols.C_RAW && codec != lexdb_cols.C_UNITS {
+            ix.saturated = true; ix.bits = []; return ix
+        }
+        var buf: []int = array(n, 0)
+        lexdb_cols.intsInto(s, dir, pl, 0, n, mut &buf, 0)
+        for i in 0..n {
+            if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
+            idxAddInt(mut &ix, buf[i])
+            if ix.saturated { return ix }
+        }
+        checkBloomSaturated(mut &ix)
+        return ix
+    }
+    // Text column: C_DICT (visit each dictionary entry ONCE!) or C_TEXT
+    if pk != lexdb_rows.PK_TEXT {
+        ix.saturated = true; ix.bits = []; return ix
+    }
+    if codec == lexdb_cols.C_DICT {
+        let nd = lexdb_cols.dictSize(dir, pl)
+        for j in 0..nd {
+            let sp = lexdb_cols.entryAt(s, dir, pl, j)
+            idxAddStr(mut &ix, &s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)])
+            if ix.saturated { return ix }
+        }
+        checkBloomSaturated(mut &ix)
+        return ix
+    }
+    if codec == lexdb_cols.C_TEXT {
+        for i in 0..n {
+            if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
+            let sp = lexdb_cols.varAt(s, dir, pl, i)
+            idxAddStr(mut &ix, &s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)])
+            if ix.saturated { return ix }
+        }
+        checkBloomSaturated(mut &ix)
+        return ix
+    }
+    ix.saturated = true; ix.bits = []
+    return ix
+}
+
+fn idxAddVal(ix: mut &IdxSum, v: &Val): bool {
+    match v {
+        Val.Null { ix.hasNull = true; return true }
+        Val.Int(x) { if !ix.isText { idxAddInt(ix, x); return true } return false }
+        Val.Date(x) { if !ix.isText { idxAddInt(ix, x); return true } return false }
+        Val.Time(x) { if !ix.isText { idxAddInt(ix, x); return true } return false }
+        Val.Ts(x) { if !ix.isText { idxAddInt(ix, x); return true } return false }
+        Val.Tstz(x) { if !ix.isText { idxAddInt(ix, x); return true } return false }
+        Val.Text(s) { if ix.isText { idxAddStr(ix, s); return true } return false }
+        else { return false }
+    }
+}
+
+// Fallback builder for row leaves (T_FLEAF) or C_ANY column leaves (including format-6 long-text rows
+// and inline BIG stubs whose prefix holds the indexed column): decodes ONLY the indexed column!
+fn buildIdxOnRowLeaf(leaf: &LeafView, m: &SkipMeta, rw: &lexdb_rows.Rows): IdxSum {
+    var ix = emptyIdxSum(m)
+    let pl = m.colPlace
+    if pl < 0 || pl >= rw.width {
+        ix.saturated = true; ix.bits = []; return ix
+    }
+    var needPl: []bool = array(pl + 1, false)
+    needPl[pl] = true
+    let noMiss: []Val = []
+    let n = leaf.n
+    for i in 0..n {
+        let row = lexdb_rows.leafVal(leaf, i)
+        if len(row) == 0 { ix.saturated = true; ix.bits = []; return ix }
+        if row[0] != lexdb_rows.FIXED {
+            // Handle inline BIG stub (version 2 prefix) or complete tagged / format-6 row!
+            var partBuf = ""
+            var usePart = false
+            if lexdb_rows.isStub(&row) {
+                match lexdb_rows.partOf(&row) {
+                    Some(p) {
+                        if !lexdb_rows.fitsIn(&p, pl + 1, &needPl) {
+                            ix.saturated = true; ix.bits = []; return ix
+                        }
+                        partBuf = p
+                        usePart = true
+                    }
+                    None { ix.saturated = true; ix.bits = []; return ix }
+                }
+            }
+            let dec = if usePart { lexdb_rows.decodeRowNeed(&partBuf, pl + 1, &needPl, &noMiss, rw.lays) }
+                      else { lexdb_rows.decodeRowNeed(&row, pl + 1, &needPl, &noMiss, rw.lays) }
+            match dec {
+                Ok(vs) {
+                    if pl >= len(vs) || !idxAddVal(mut &ix, &vs[pl]) {
+                        ix.saturated = true; ix.bits = []; return ix
+                    }
+                }
+                Err(_) { ix.saturated = true; ix.bits = []; return ix }
+            }
+            if ix.saturated { return ix }
+            continue
+        }
+        if len(row) < 4 { ix.saturated = true; ix.bits = []; return ix }
+        let lid = binary.readU16LEStr(&row, 1)
+        if lid < 0 || lid >= len(rw.lays) {
+            ix.saturated = true; ix.bits = []; return ix
+        }
+        let lay = &rw.lays[lid]
+        if pl >= len(lay.off) || pl >= len(lay.kinds) {
+            ix.saturated = true; ix.bits = []; return ix
+        }
+        let bmAt = lay.bm + pl / 8
+        if bmAt >= len(row) { ix.saturated = true; ix.bits = []; return ix }
+        if (int(row[bmAt]) >> (pl % 8)) & 1 == 1 {
+            ix.hasNull = true
+            continue
+        }
+        let o = lay.off[pl]
+        if !ix.isText {
+            let pk = lay.kinds[pl]
+            var v = 0
+            if pk == lexdb_rows.PK_INT || pk == lexdb_rows.PK_TIME || pk == lexdb_rows.PK_TS || pk == lexdb_rows.PK_TSTZ {
+                if o + 8 > len(row) { ix.saturated = true; ix.bits = []; return ix }
+                v = readI64LE(&row, o)
+            } else if pk == lexdb_rows.PK_INT4 || pk == lexdb_rows.PK_DATE {
+                if o + 4 > len(row) { ix.saturated = true; ix.bits = []; return ix }
+                let u = binary.readU32LEStr(&row, o)
+                v = if u >= 2147483648 { u - 4294967296 } else { u }
+            } else if pk == lexdb_rows.PK_INT2 {
+                if o + 2 > len(row) { ix.saturated = true; ix.bits = []; return ix }
+                let u = binary.readU16LEStr(&row, o)
+                v = if u >= 32768 { u - 65536 } else { u }
+            } else {
+                ix.saturated = true; ix.bits = []; return ix
+            }
+            idxAddInt(mut &ix, v)
+        } else {
+            if lay.kinds[pl] != lexdb_rows.PK_TEXT { ix.saturated = true; ix.bits = []; return ix }
+            if o + 2 > len(row) { ix.saturated = true; ix.bits = []; return ix }
+            let e = binary.readU16LEStr(&row, o)
+            let pv = lay.prev[pl]
+            let st = if pv < 0 { 0 } else { binary.readU16LEStr(&row, pv) }
+            if st > e || lay.v0 + e > len(row) { ix.saturated = true; ix.bits = []; return ix }
+            idxAddStr(mut &ix, &row[lay.v0 + st..lay.v0 + e])
+        }
+        if ix.saturated { return ix }
+    }
+    checkBloomSaturated(mut &ix)
+    return ix
+}
+
+// Builds a full NodeSum for one leaf (automatic O(places) T_CLEAF zone map + all explicit SkipMeta indexes).
+pub fn buildLeafSum(leaf: &LeafView, metas: &[]SkipMeta, rw: &lexdb_rows.Rows): NodeSum {
+    var out = emptyNodeSum()
+    let isColOk = leaf.isCols && lexdb_rows.layoutOk(leaf, rw)
+    if isColOk {
+        let dir = leaf.dir
+        let np = lexdb_cols.places(dir)
+        out.hasAuto = true
+        out.np = np
+        out.kinds = withCapacity(np)
+        out.hasVal = array(np, false)
+        out.hasNull = array(np, false)
+        out.minV = array(np, 0)
+        out.maxV = array(np, 0)
+        for p in 0..np {
+            append(mut &out.kinds, lexdb_cols.kindOf(leaf.cols, p))
+            out.hasNull[p] = lexdb_cols.hasNulls(dir, p)
+            if lexdb_cols.hasRange(dir, p) {
+                out.hasVal[p] = true
+                out.minV[p] = lexdb_cols.least(dir, p)
+                out.maxV[p] = lexdb_cols.greatest(dir, p)
+            }
+        }
+    }
+    if len(metas) > 0 {
+        out.idxs = withCapacity(len(metas))
+        for m in metas {
+            if isColOk { append(mut &out.idxs, buildIdxOnColLeaf(leaf, &m, rw)) }
+            else { append(mut &out.idxs, buildIdxOnRowLeaf(leaf, &m, rw)) }
+        }
+    }
+    return out
+}
+
+// ---- Persist / decode IdxSum in companion B+tree (keyed by diskPageNo)
+
+pub fn encIdxSum(ix: &IdxSum): str {
+    var b: []byte = withCapacity(64 + len(ix.bits))
+    append(mut &b, byte(1))
+    append(mut &b, byte(ix.kind))
+    var flags = 0
+    if ix.isText { flags |= 1 }
+    if ix.saturated { flags |= 2 }
+    if ix.hasVal { flags |= 4 }
+    if ix.hasNull { flags |= 8 }
+    if ix.ci { flags |= 16 }
+    append(mut &b, byte(flags))
+    binary.appendU32LE(mut &b, ix.colPlace)
+    binary.appendU32LE(mut &b, ix.maxSet)
+    binary.appendU32LE(mut &b, ix.hashes)
+    binary.appendU32LE(mut &b, ix.ngramN)
+    if ix.saturated { return strFromBytes(&b) }
+    if !ix.isText {
+        binary.appendU64LE(mut &b, ix.minI)
+        binary.appendU64LE(mut &b, ix.maxI)
+    } else if ix.kind == SKIP_MINMAX {
+        encStr(mut &b, &ix.minS)
+        encStr(mut &b, &ix.maxS)
+    }
+    if ix.kind == SKIP_SET {
+        if !ix.isText {
+            binary.appendU32LE(mut &b, len(ix.intSet))
+            for v in ix.intSet { binary.appendU64LE(mut &b, v) }
+        } else {
+            binary.appendU32LE(mut &b, len(ix.strSet))
+            for v in ix.strSet { encStr(mut &b, &v) }
+        }
+    } else if ix.kind == SKIP_BLOOM || ix.kind == SKIP_NGRAM || ix.kind == SKIP_TOKEN {
+        binary.appendU32LE(mut &b, len(ix.bits))
+        for x in ix.bits { append(mut &b, x) }
+    }
+    return strFromBytes(&b)
+}
+
+pub fn decIdxSum(idxKey: &str, s: &str): Option[IdxSum] {
+    if len(s) < 19 || s[0] != 1 { return None }
+    let kind = int(s[1])
+    let flags = int(s[2])
+    let isText = (flags & 1) != 0
+    let saturated = (flags & 2) != 0
+    let hasVal = (flags & 4) != 0
+    let hasNull = (flags & 8) != 0
+    let ci = (flags & 16) != 0
+    var at = 3
+    let colPlace = binary.readU32LEStr(s, at); at += 4
+    let maxSet = binary.readU32LEStr(s, at); at += 4
+    let hashes = binary.readU32LEStr(s, at); at += 4
+    let ngramN = binary.readU32LEStr(s, at); at += 4
+    var ix = IdxSum{idxKey: idxKey.toStr(), colPlace: colPlace, kind: kind, isText: isText, ci: ci,
+                    saturated: saturated, hasVal: hasVal, hasNull: hasNull,
+                    minI: 0, maxI: 0, minS: "", maxS: "",
+                    intSet: [], strSet: [], maxSet: maxSet, bits: [], hashes: hashes, ngramN: ngramN}
+    if saturated { return Some(ix) }
+    if !isText {
+        if at + 16 > len(s) { return None }
+        ix.minI = readI64LE(s, at); at += 8
+        ix.maxI = readI64LE(s, at); at += 8
+    } else if kind == SKIP_MINMAX {
+        ix.minS = match decStr(s, mut &at) { Some(v) { v } None { return None } }
+        ix.maxS = match decStr(s, mut &at) { Some(v) { v } None { return None } }
+    }
+    if kind == SKIP_SET {
+        if at + 4 > len(s) { return None }
+        let n = binary.readU32LEStr(s, at); at += 4
+        if !isText {
+            if at + n * 8 > len(s) { return None }
+            for _ in 0..n { append(mut &ix.intSet, readI64LE(s, at)); at += 8 }
+        } else {
+            for _ in 0..n {
+                match decStr(s, mut &at) {
+                    Some(v) { append(mut &ix.strSet, v) }
+                    None { return None }
+                }
+            }
+        }
+    } else if kind == SKIP_BLOOM || kind == SKIP_NGRAM || kind == SKIP_TOKEN {
+        if at + 4 > len(s) { return None }
+        let n = binary.readU32LEStr(s, at); at += 4
+        if at + n > len(s) { return None }
+        ix.bits = withCapacity(n)
+        for i in 0..n { append(mut &ix.bits, s[at + i]) }
+    }
+    return Some(ix)
+}
+
+pub fn encDiskKey(disk: int): str {
+    var b: []byte = withCapacity(8)
+    binary.appendU64LE(mut &b, disk)
+    return strFromBytes(&b)
+}
+
+// ---- Pruning check: returns true ONLY when NodeSum proves ZERO rows in the subtree can match q!
+
+fn strOpMatch(op: int, v: &str, ks: &[]str): bool {
+    if op == 6 {
+        for k in ks { if v == k { return true } }
+        return false
+    }
+    let c = v.cmp(&ks[0])
+    return if op == 0 { c == 0 } else if op == 1 { c != 0 } else if op == 2 { c < 0 }
+           else if op == 3 { c <= 0 } else if op == 4 { c > 0 } else { c >= 0 }
+}
+
+fn idxExcludes(ix: &IdxSum, q: &SkipQuery): bool {
+    if ix.saturated { return false }
+    let pl = ix.colPlace
+    if !ix.isText {
+        // 1. Ranges [lo, hi]
+        var x = 0
+        while x + 3 < len(q.ranges) {
+            if q.ranges[x] == pl {
+                let lo = q.ranges[x + 2]
+                let hi = q.ranges[x + 3]
+                if lo > hi || !ix.hasVal || ix.minI > hi || ix.maxI < lo { return true }
+                if ix.kind == SKIP_SET {
+                    var any = false
+                    for v in ix.intSet { if v >= lo && v <= hi { any = true; break } }
+                    if !any { return true }
+                } else if ix.kind == SKIP_BLOOM && lo == hi {
+                    if !bloomHasInt(&ix.bits, ix.hashes, lo) { return true }
+                }
+            }
+            x += 4
+        }
+        // 2. Not-equal (col <> val)
+        var y = 0
+        while y + 2 < len(q.nes) {
+            if q.nes[y] == pl {
+                let val = q.nes[y + 2]
+                if !ix.hasVal || (ix.minI == val && ix.maxI == val) { return true }
+                if ix.kind == SKIP_SET {
+                    var any = false
+                    for v in ix.intSet { if v != val { any = true; break } }
+                    if !any { return true }
+                }
+            }
+            y += 3
+        }
+        // 3. Exact equality (for SET / BLOOM)
+        for i in 0..len(q.eqPl) {
+            if q.eqPl[i] != pl { continue }
+            let val = q.eqInt[i]
+            if !ix.hasVal || val < ix.minI || val > ix.maxI { return true }
+            if ix.kind == SKIP_SET {
+                var found = false
+                for v in ix.intSet { if v == val { found = true; break } }
+                if !found { return true }
+            } else if ix.kind == SKIP_BLOOM {
+                if !bloomHasInt(&ix.bits, ix.hashes, val) { return true }
+            }
+        }
+        // 4. IN (int list)
+        for i in 0..len(q.inPl) {
+            if q.inPl[i] != pl { continue }
+            if !ix.hasVal || len(q.inInts[i]) == 0 { return true }
+            var any = false
+            for val in q.inInts[i] {
+                if val < ix.minI || val > ix.maxI { continue }
+                if ix.kind == SKIP_SET {
+                    for v in ix.intSet { if v == val { any = true; break } }
+                } else if ix.kind == SKIP_BLOOM {
+                    if bloomHasInt(&ix.bits, ix.hashes, val) { any = true }
+                } else {
+                    any = true
+                }
+                if any { break }
+            }
+            if !any { return true }
+        }
+        // 5. Dynamic Top-N Bar
+        if q.barOn && q.barPl == pl && !(q.barNf && ix.hasNull) {
+            if !ix.hasVal { return !q.barNf }
+            if !q.barDesc && ix.minI > q.barVal { return true }
+            if q.barDesc && ix.maxI < q.barVal { return true }
+        }
+        return false
+    }
+
+    // ---- Text skipping index predicates
+    if !ix.ci {
+    for i in 0..len(q.strPl) {
+        if q.strPl[i] != pl { continue }
+        let op = q.strOp[i]
+        let ks = &q.strVals[i]
+        if !ix.hasVal { return true }
+        if ix.kind == SKIP_MINMAX {
+            if op == 0 { if ks[0].cmp(&ix.minS) < 0 || ks[0].cmp(&ix.maxS) > 0 { return true } }
+            else if op == 1 { if ix.minS == ks[0] && ix.maxS == ks[0] { return true } }
+            else if op == 2 { if ix.minS.cmp(&ks[0]) >= 0 { return true } }
+            else if op == 3 { if ix.minS.cmp(&ks[0]) > 0 { return true } }
+            else if op == 4 { if ix.maxS.cmp(&ks[0]) <= 0 { return true } }
+            else if op == 5 { if ix.maxS.cmp(&ks[0]) < 0 { return true } }
+            else if op == 6 {
+                var any = false
+                for k in ks { if k.cmp(&ix.minS) >= 0 && k.cmp(&ix.maxS) <= 0 { any = true; break } }
+                if !any { return true }
+            }
+        } else if ix.kind == SKIP_SET {
+            var any = false
+            for v in ix.strSet { if strOpMatch(op, &v, ks) { any = true; break } }
+            if !any { return true }
+        } else if ix.kind == SKIP_BLOOM {
+            if op == 0 { if !bloomHasStr(&ix.bits, ix.hashes, &ks[0]) { return true } }
+            else if op == 6 {
+                var any = false
+                for k in ks { if bloomHasStr(&ix.bits, ix.hashes, &k) { any = true; break } }
+                if !any { return true }
+            }
+        } else if ix.kind == SKIP_NGRAM {
+            if op == 0 { if !bloomHasNgrams(&ix.bits, ix.hashes, ix.ngramN, &ks[0]) { return true } }
+            else if op == 6 {
+                var any = false
+                for k in ks { if bloomHasNgrams(&ix.bits, ix.hashes, ix.ngramN, &k) { any = true; break } }
+                if !any { return true }
+            }
+        } else if ix.kind == SKIP_TOKEN {
+            if op == 0 { if !bloomHasTokens(&ix.bits, ix.hashes, &ks[0], true, true) { return true } }
+            else if op == 6 {
+                var any = false
+                for k in ks { if bloomHasTokens(&ix.bits, ix.hashes, &k, true, true) { any = true; break } }
+                if !any { return true }
+            }
+        }
+    }
+    }
+
+    // Simple LIKE predicates (URL LIKE '%google%', etc.)
+    for i in 0..len(q.likePl) {
+        if q.likePl[i] != pl { continue }
+        if !ix.hasVal { return true }
+        let ps = &q.likePieces[i]
+        if ix.kind == SKIP_SET && !ix.ci {
+            var any = false
+            for v in ix.strSet { if lexdb_like.likePieces(&v, ps) { any = true; break } }
+            if !any { return true }
+        } else if ix.kind == SKIP_NGRAM {
+            for p in ps {
+                if len(p) >= ix.ngramN {
+                    let f = if ix.ci { strings.toLowerAscii(&p) } else { "" }
+                    let qStr: &str = if ix.ci { &f } else { &p }
+                    if !bloomHasNgrams(&ix.bits, ix.hashes, ix.ngramN, qStr) { return true }
+                }
+            }
+        } else if ix.kind == SKIP_TOKEN {
+            let np = len(ps)
+            for k in 0..np {
+                let p = &ps[k]
+                if len(p) == 0 { continue }
+                let f = if ix.ci { strings.toLowerAscii(p) } else { "" }
+                let qStr: &str = if ix.ci { &f } else { p }
+                let aStart = k == 0
+                let aEnd = k == np - 1
+                if !bloomHasTokens(&ix.bits, ix.hashes, qStr, aStart, aEnd) { return true }
+            }
+        }
+    }
+    return false
+}
+
+pub fn nodeExcludes(sum: &NodeSum, q: &SkipQuery): bool {
+    // 1. Automatic hierarchical zone map (int/date/time/units)
+    if sum.hasAuto {
+        let np = sum.np
+        var x = 0
+        while x + 3 < len(q.ranges) {
+            let pl = q.ranges[x]
+            let want = q.ranges[x + 1]
+            let lo = q.ranges[x + 2]
+            let hi = q.ranges[x + 3]
+            x += 4
+            if pl >= np { continue }
+            let pk = sum.kinds[pl]
+            if !(if want == 0 { lexdb_rows.isIntKind(pk) } else { int(pk) == want }) { continue }
+            if lo > hi || !sum.hasVal[pl] || sum.minV[pl] > hi || sum.maxV[pl] < lo { return true }
+        }
+        var y = 0
+        while y + 2 < len(q.nes) {
+            let pl = q.nes[y]
+            let want = q.nes[y + 1]
+            let val = q.nes[y + 2]
+            y += 3
+            if pl >= np { continue }
+            let pk = sum.kinds[pl]
+            if !(if want == 0 { lexdb_rows.isIntKind(pk) } else { int(pk) == want }) { continue }
+            if !sum.hasVal[pl] || (sum.minV[pl] == val && sum.maxV[pl] == val) { return true }
+        }
+        for i in 0..len(q.inPl) {
+            let pl = q.inPl[i]
+            if pl >= np || !lexdb_rows.isIntKind(sum.kinds[pl]) { continue }
+            if !sum.hasVal[pl] || len(q.inInts[i]) == 0 { return true }
+            var any = false
+            for val in q.inInts[i] {
+                if val >= sum.minV[pl] && val <= sum.maxV[pl] { any = true; break }
+            }
+            if !any { return true }
+        }
+        if q.barOn && q.barPl >= 0 && q.barPl < np {
+            let pk = sum.kinds[q.barPl]
+            let kindOk = if q.barKind == 0 { lexdb_rows.isIntKind(pk) } else { int(pk) == q.barKind }
+            if kindOk && !(q.barNf && sum.hasNull[q.barPl]) {
+                if !sum.hasVal[q.barPl] { return !q.barNf }
+                if !q.barDesc && sum.minV[q.barPl] > q.barVal { return true }
+                if q.barDesc && sum.maxV[q.barPl] < q.barVal { return true }
+            }
+        }
+    }
+    // 2. Explicit skipping indexes
+    for ix in sum.idxs {
+        if idxExcludes(&ix, q) { return true }
+    }
+    return false
+}
+
+// ---- Thread-safe per-store, per-tree hierarchical SkipCache + observability counters
+
+type CachedNode = record {
+    gen: int
+    subVer: int
+    seq: int
+    sum: NodeSum
+}
+
+type TreeSkip = record {
+    metasLoaded: bool
+    metas: []SkipMeta
+    nodeIdx: Map[int, int]              // slot -> index in nodes
+    nodes: []CachedNode
+    diskIdx: Map[int, int]              // diskPageNo -> index in diskSums
+    diskSums: [][]IdxSum                // persisted explicit IdxSums (loaded once on reopen!)
+}
+
+type SkipStore = record {
+    treeIdx: Map[int, int]              // skipKey(storeId, tree) -> index in trees
+    trees: []TreeSkip
+    disabledSess: Map[int, bool]        // sessions with SET data_skipping_enabled = off
+    subtreesSkipped: int
+    leavesSkipped: int
+}
+
+var SKIP_STORE: once task.Shared[SkipStore]
+
+fn skipKey(storeId: int, tree: int): int {
+    return (storeId << 28) | (tree & 0x0fffffff)
+}
+
+fn skipStore(): task.Shared[SkipStore] {
+    if !SKIP_STORE.isSet() {
+        SKIP_STORE.set(task.shared(SkipStore{treeIdx: newMap(), trees: [], disabledSess: newMap(), subtreesSkipped: 0, leavesSkipped: 0}))
+    }
+    return SKIP_STORE.get().share()
+}
+
+pub fn setEnabled(sess: int, on: bool) {
+    skipStore().with(fn(ss: mut &SkipStore) {
+        if on { let _ = ss.disabledSess.remove(&sess) }
+        else { ss.disabledSess.put(sess, true) }
+    })
+}
+
+pub fn isEnabled(sess: int): bool {
+    var ok = true
+    skipStore().with(fn(ss: mut &SkipStore) {
+        if ss.disabledSess.get(&sess).isSome() { ok = false }
+    })
+    return ok
+}
+
+pub fn subtreesSkipped(): int {
+    var v = 0
+    skipStore().with(fn(ss: mut &SkipStore) { v = ss.subtreesSkipped })
+    return v
+}
+
+pub fn leavesSkipped(): int {
+    var v = 0
+    skipStore().with(fn(ss: mut &SkipStore) { v = ss.leavesSkipped })
+    return v
+}
+
+pub fn resetCounters() {
+    skipStore().with(fn(ss: mut &SkipStore) { ss.subtreesSkipped = 0; ss.leavesSkipped = 0 })
+}
+
+pub fn invalidateTree(storeId: int, tree: int) {
+    let sk = skipKey(storeId, tree)
+    skipStore().with(fn(ss: mut &SkipStore) {
+        match ss.treeIdx.get(&sk) {
+            Some(ti) {
+                ss.trees[ti] = TreeSkip{metasLoaded: false, metas: [], nodeIdx: newMap(), nodes: [], diskIdx: newMap(), diskSums: []}
+            }
+            None {}
+        }
+    })
+}
+
+fn getOrCreateTree(ss: mut &SkipStore, sk: int): int {
+    match ss.treeIdx.get(&sk) {
+        Some(ti) { return ti }
+        None {
+            let ti = len(ss.trees)
+            append(mut &ss.trees, TreeSkip{metasLoaded: false, metas: [], nodeIdx: newMap(), nodes: [], diskIdx: newMap(), diskSums: []})
+            ss.treeIdx.put(sk, ti)
+            return ti
+        }
+    }
+}
+
+fn putCachedNode(ts: mut &TreeSkip, slot: int, cn: CachedNode) {
+    match ts.nodeIdx.get(&slot) {
+        Some(ni) { ts.nodes[ni] = cn }
+        None {
+            let ni = len(ts.nodes)
+            append(mut &ts.nodes, cn)
+            ts.nodeIdx.put(slot, ni)
+        }
+    }
+}
+
+fn putDiskIdx(ts: mut &TreeSkip, disk: int, idxPos: int, ix: IdxSum) {
+    match ts.diskIdx.get(&disk) {
+        Some(di) {
+            while len(ts.diskSums[di]) < idxPos { append(mut &ts.diskSums[di], emptyIdxSum(&ts.metas[len(ts.diskSums[di])])) }
+            if len(ts.diskSums[di]) == idxPos { append(mut &ts.diskSums[di], ix) }
+            else { ts.diskSums[di][idxPos] = ix }
+        }
+        None {
+            var arr: []IdxSum = []
+            while len(arr) < idxPos { append(mut &arr, emptyIdxSum(&ts.metas[len(arr)])) }
+            append(mut &arr, ix)
+            let di = len(ts.diskSums)
+            append(mut &ts.diskSums, arr)
+            ts.diskIdx.put(disk, di)
+        }
+    }
+}
+
+// Ensures TreeSkip entry exists and its explicit SkipMeta list + persisted disk summaries are loaded.
+pub fn ensureTreeLoaded(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, tree: int, tableKey: &str): Result[[]SkipMeta, DbErr] {
+    let sk = skipKey(st.id, tree)
+    var needLoad = false
+    var cachedMetas: []SkipMeta = []
+    skipStore().with(fn(ss: mut &SkipStore) {
+        match ss.treeIdx.get(&sk) {
+            Some(ti) {
+                if ss.trees[ti].metasLoaded { cachedMetas = cloneMetas(&ss.trees[ti].metas) }
+                else { needLoad = true }
+            }
+            None { needLoad = true }
+        }
+    })
+    if !needLoad { return Ok(cachedMetas) }
+
+    // Scan CATALOG for explicit skipping indexes belonging to tableKey
+    var metas: []SkipMeta = []
+    try st.scan(txn, CATALOG_TREE, SKIP_PRE, SKIP_END, fn(en: &lexdb_store.Entry): bool {
+        match decMeta(&en.val) {
+            Some(m) { if m.table == tableKey && m.tableTree == tree { append(mut &metas, m) } }
+            None {}
+        }
+        return true
+    })
+
+    // Load persisted diskPageNo -> IdxSum entries from each skipping index's companion B+tree!
+    var diskIdx: Map[int, int] = newMap()
+    var diskSums: [][]IdxSum = []
+    for mi in 0..len(metas) {
+        let m = &metas[mi]
+        if m.tree <= 0 { continue }
+        try st.scan(txn, m.tree, "", "", fn(en: &lexdb_store.Entry): bool {
+            if len(en.key) == 8 {
+                let disk = readI64LE(&en.key, 0)
+                match decIdxSum(&m.key, &en.val) {
+                    Some(ix) {
+                        match diskIdx.get(&disk) {
+                            Some(di) {
+                                while len(diskSums[di]) < mi { append(mut &diskSums[di], emptyIdxSum(&metas[len(diskSums[di])])) }
+                                if len(diskSums[di]) == mi { append(mut &diskSums[di], ix) }
+                                else { diskSums[di][mi] = ix }
+                            }
+                            None {
+                                var arr: []IdxSum = []
+                                while len(arr) < mi { append(mut &arr, emptyIdxSum(&metas[len(arr)])) }
+                                append(mut &arr, ix)
+                                let di = len(diskSums)
+                                append(mut &diskSums, arr)
+                                diskIdx.put(disk, di)
+                            }
+                        }
+                    }
+                    None {}
+                }
+            }
+            return true
+        })
+    }
+
+    skipStore().with(fn(ss: mut &SkipStore) {
+        let ti = getOrCreateTree(ss, sk)
+        ss.trees[ti].metasLoaded = true
+        ss.trees[ti].metas = cloneMetas(&metas)
+        ss.trees[ti].diskIdx = replace(mut &diskIdx, newMap())
+        ss.trees[ti].diskSums = replace(mut &diskSums, [])
+    })
+    return Ok(metas)
+}
+
+// Checks whether B+tree node (slot, gen, subVer, disk) can be pruned for query q
+// plus optional live Top-N bar (barOn, barPl, barVal, barDesc, barNf).
+// Works on BOTH loaded and UNLOADED subtrees (via persisted diskSums)!
+pub fn checkNodeSkip(storeId: int, tree: int, slot: int, gen: int, subVer: int, disk: int, isSnap: bool, snapSeq: int, isLeaf: bool, q: &SkipQuery): bool {
+    return checkNodeSkipBar(storeId, tree, slot, gen, subVer, disk, isSnap, snapSeq, isLeaf, q, false, -1, 0, false, false)
+}
+
+pub fn checkNodeSkipBar(storeId: int, tree: int, slot: int, gen: int, subVer: int, disk: int, isSnap: bool, snapSeq: int, isLeaf: bool,
+                        q: &SkipQuery, barOn: bool, barPl: int, barVal: int, barDesc: bool, barNf: bool): bool {
+    let sk = skipKey(storeId, tree)
+    var skip = false
+    skipStore().with(fn(ss: mut &SkipStore) {
+        match ss.treeIdx.get(&sk) {
+            Some(ti) {
+                let ts = &ss.trees[ti]
+                match ts.nodeIdx.get(&slot) {
+                    Some(ni) {
+                        let cn = &ts.nodes[ni]
+                        let valid = cn.gen == gen && cn.subVer == subVer && (!isSnap || cn.seq <= snapSeq)
+                        if valid {
+                            skip = nodeExcludes(&cn.sum, q)
+                            if !skip && barOn && barPl >= 0 {
+                                skip = barExcludes(&cn.sum, barPl, barVal, barDesc, barNf)
+                            }
+                            if skip {
+                                if isLeaf { ss.leavesSkipped += 1 } else { ss.subtreesSkipped += 1 }
+                            }
+                            return
+                        }
+                    }
+                    None {}
+                }
+                // Cold-restart fast path: if node is clean on disk (disk >= 0) and persisted explicit IdxSums exist, check them without loading the page!
+                // (scanLeavesSkip only invokes checkNode in snap mode when the node's clean disk version is visible to the snapshot.)
+                if disk >= 0 {
+                    match ts.diskIdx.get(&disk) {
+                        Some(di) {
+                            for ix in ts.diskSums[di] {
+                                if idxExcludes(&ix, q) || (barOn && barPl >= 0 && barIdxExcludes(&ix, barPl, barVal, barDesc, barNf)) {
+                                    skip = true
+                                    if isLeaf { ss.leavesSkipped += 1 } else { ss.subtreesSkipped += 1 }
+                                    return
+                                }
+                            }
+                        }
+                        None {}
+                    }
+                }
+            }
+            None {}
+        }
+    })
+    return skip
+}
+
+fn barIdxExcludes(ix: &IdxSum, barPl: int, barVal: int, barDesc: bool, barNf: bool): bool {
+    if ix.saturated || ix.isText || ix.colPlace != barPl { return false }
+    if barNf && ix.hasNull { return false }
+    if !ix.hasVal { return !barNf }
+    if !barDesc && ix.minI > barVal { return true }
+    if barDesc && ix.maxI < barVal { return true }
+    return false
+}
+
+fn barExcludes(sum: &NodeSum, barPl: int, barVal: int, barDesc: bool, barNf: bool): bool {
+    if sum.hasAuto && barPl < sum.np {
+        let pk = sum.kinds[barPl]
+        if lexdb_rows.isIntKind(pk) && !(barNf && sum.hasNull[barPl]) {
+            if !sum.hasVal[barPl] { return !barNf }
+            if !barDesc && sum.minV[barPl] > barVal { return true }
+            if barDesc && sum.maxV[barPl] < barVal { return true }
+        }
+    }
+    for ix in sum.idxs {
+        if barIdxExcludes(&ix, barPl, barVal, barDesc, barNf) { return true }
+    }
+    return false
+}
+
+// Populates leaf summary in SKIP_CACHE if not already valid for (slot, gen, subVer).
+pub fn recordLeaf(storeId: int, tree: int, slot: int, gen: int, subVer: int, seq: int, leaf: &LeafView, rw: &lexdb_rows.Rows) {
+    let sk = skipKey(storeId, tree)
+    var already = false
+    var metas: []SkipMeta = []
+    skipStore().with(fn(ss: mut &SkipStore) {
+        match ss.treeIdx.get(&sk) {
+            Some(ti) {
+                let ts = &ss.trees[ti]
+                match ts.nodeIdx.get(&slot) {
+                    Some(ni) {
+                        let cn = &ts.nodes[ni]
+                        if cn.gen == gen && cn.subVer == subVer { already = true; return }
+                    }
+                    None {}
+                }
+                metas = cloneMetas(&ts.metas)
+            }
+            None {}
+        }
+    })
+    if already { return }
+    var sum = buildLeafSum(leaf, &metas, rw)
+    skipStore().with(fn(ss: mut &SkipStore) {
+        let ti = getOrCreateTree(ss, sk)
+        putCachedNode(mut &ss.trees[ti], slot, CachedNode{gen: gen, subVer: subVer, seq: seq, sum: replace(mut &sum, emptyNodeSum())})
+    })
+}
+
+// Post-order rollup: if ALL children of internal node `slot` have valid cached summaries, rolls them up and caches `slot`!
+pub fn recordInner(storeId: int, tree: int, slot: int, gen: int, subVer: int, seq: int,
+                   kidSlots: &[]int, kidGens: &[]int, kidSubVers: &[]int) {
+    if len(kidSlots) == 0 { return }
+    let sk = skipKey(storeId, tree)
+    skipStore().with(fn(ss: mut &SkipStore) {
+        match ss.treeIdx.get(&sk) {
+            Some(ti) {
+                let ts = &ss.trees[ti]
+                match ts.nodeIdx.get(&slot) {
+                    Some(ni) {
+                        let cn = &ts.nodes[ni]
+                        if cn.gen == gen && cn.subVer == subVer { return }
+                    }
+                    None {}
+                }
+                var kidSums: []NodeSum = withCapacity(len(kidSlots))
+                for i in 0..len(kidSlots) {
+                    match ts.nodeIdx.get(&kidSlots[i]) {
+                        Some(kni) {
+                            let kc = &ts.nodes[kni]
+                            if kc.gen != kidGens[i] || kc.subVer != kidSubVers[i] { return }
+                            append(mut &kidSums, cloneNodeSum(&kc.sum))
+                        }
+                        None { return }
+                    }
+                }
+                let rolled = mergeNodeSums(&kidSums)
+                putCachedNode(mut &ss.trees[ti], slot, CachedNode{gen: gen, subVer: subVer, seq: seq, sum: rolled})
+            }
+            None {}
+        }
+    })
+}
+
+// Builds & persists all node summaries (leaves + internal nodes) for a newly created skipping index!
+pub fn buildAndPersistIndex(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, m: &SkipMeta, rw: &lexdb_rows.Rows): Result[int, DbErr] {
+    let sid = st.id
+    let sk = skipKey(sid, m.tableTree)
+    invalidateTree(sid, m.tableTree)
+    let _ = try ensureTreeLoaded(st, txn, m.tableTree, &m.table)
+    var built = 0
+    // Collect (diskPageNo -> IdxSum) to persist into m.tree after the scan (cannot mutate txn inside scanLeavesSkip lock!)
+    var leafDisks: []int = []
+    var leafVals: []str = []
+    var innerDisks: []int = []
+    var innerVals: []str = []
+    // Find m's index in TreeSkip.metas so we extract the right IdxSum
+    var idxPos = -1
+    skipStore().with(fn(ss: mut &SkipStore) {
+        match ss.treeIdx.get(&sk) {
+            Some(ti) {
+                let ts = &ss.trees[ti]
+                for i in 0..len(ts.metas) { if ts.metas[i].key == m.key { idxPos = i; break } }
+            }
+            None {}
+        }
+    })
+    try st.scanLeavesSkip(txn, m.tableTree, "", "",
+        fn(slot: int, gen: int, subVer: int, disk: int, isSnap: bool, snapSeq: int, isLeaf: bool): bool { return false },
+        fn(slot: int, gen: int, subVer: int, seq: int, disk: int, lv: &LeafView) {
+            recordLeaf(sid, m.tableTree, slot, gen, subVer, seq, lv, rw)
+            built += 1
+            if disk >= 0 && idxPos >= 0 {
+                skipStore().with(fn(ss: mut &SkipStore) {
+                    match ss.treeIdx.get(&sk) {
+                        Some(ti) {
+                            let ts = &ss.trees[ti]
+                            match ts.nodeIdx.get(&slot) {
+                                Some(ni) {
+                                    let cn = &ts.nodes[ni]
+                                    if idxPos < len(cn.sum.idxs) && !cn.sum.idxs[idxPos].saturated {
+                                        append(mut &leafDisks, disk)
+                                        append(mut &leafVals, encIdxSum(&cn.sum.idxs[idxPos]))
+                                    }
+                                }
+                                None {}
+                            }
+                        }
+                        None {}
+                    }
+                })
+            }
+        },
+        fn(slot: int, gen: int, subVer: int, seq: int, disk: int,
+           kidSlots: &[]int, kidGens: &[]int, kidSubVers: &[]int) {
+            recordInner(sid, m.tableTree, slot, gen, subVer, seq, kidSlots, kidGens, kidSubVers)
+            if disk >= 0 && idxPos >= 0 {
+                skipStore().with(fn(ss: mut &SkipStore) {
+                    match ss.treeIdx.get(&sk) {
+                        Some(ti) {
+                            let ts = &ss.trees[ti]
+                            match ts.nodeIdx.get(&slot) {
+                                Some(ni) {
+                                    let cn = &ts.nodes[ni]
+                                    if idxPos < len(cn.sum.idxs) && !cn.sum.idxs[idxPos].saturated {
+                                        append(mut &innerDisks, disk)
+                                        append(mut &innerVals, encIdxSum(&cn.sum.idxs[idxPos]))
+                                    }
+                                }
+                                None {}
+                            }
+                        }
+                        None {}
+                    }
+                })
+            }
+        },
+        fn(lv: &LeafView, i: int, j: int): bool { return true })
+    // Merge leaf + inner disk-page summaries and persist into m.tree!
+    var persistDisks = leafDisks
+    var persistVals = leafVals
+    for i in 0..len(innerDisks) {
+        append(mut &persistDisks, innerDisks[i])
+        append(mut &persistVals, innerVals[i].clone())
+    }
+    // Persist collected disk-page summaries into m.tree!
+    for i in 0..len(persistDisks) {
+        let dk = encDiskKey(persistDisks[i])
+        try txn.put(m.tree, &dk, &persistVals[i])
+    }
+    // Reload diskSums cache for this tree so reopen/cold paths match immediately
+    if len(persistDisks) > 0 && idxPos >= 0 {
+        skipStore().with(fn(ss: mut &SkipStore) {
+            match ss.treeIdx.get(&sk) {
+                Some(ti) {
+                    for i in 0..len(persistDisks) {
+                        match decIdxSum(&m.key, &persistVals[i]) {
+                            Some(ix) { putDiskIdx(mut &ss.trees[ti], persistDisks[i], idxPos, ix) }
+                            None {}
+                        }
+                    }
+                }
+                None {}
+            }
+        })
+    }
+    return Ok(built)
+}
+
+// Catalog helpers for CREATE/DROP SKIPPING INDEX, TRUNCATE, and DROP TABLE cleanup.
+pub fn findMeta(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str): Result[Option[SkipMeta], DbErr] {
+    match try st.get(txn, CATALOG_TREE, &(SKIP_PRE + key)) {
+        Some(v) { return Ok(decMeta(&v)) }
+        None { return Ok(None) }
+    }
+}
+
+pub fn listTableMetas(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, tableKey: &str): Result[[]SkipMeta, DbErr] {
+    var out: []SkipMeta = []
+    try st.scan(txn, CATALOG_TREE, SKIP_PRE, SKIP_END, fn(en: &lexdb_store.Entry): bool {
+        match decMeta(&en.val) {
+            Some(m) { if m.table == tableKey { append(mut &out, m) } }
+            None {}
+        }
+        return true
+    })
+    return Ok(out)
+}
+
+pub fn dropAllForTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, tableKey: &str, tableTree: int): Result[Unit, DbErr] {
+    let ms = try listTableMetas(st, txn, tableKey)
+    for m in ms {
+        txn.del(CATALOG_TREE, &(SKIP_PRE + m.key))
+        if m.tree > 0 { txn.dropTree(m.tree) }
+    }
+    invalidateTree(st.id, tableTree)
+    return Ok(Unit{})
+}
+
+pub fn onTruncate(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, tableKey: &str, oldTree: int, newTree: int): Result[Unit, DbErr] {
+    let ms = try listTableMetas(st, txn, tableKey)
+    for m0 in ms {
+        var m = cloneMeta(&m0)
+        if m.tree > 0 { txn.dropTree(m.tree) }
+        m.tableTree = newTree
+        m.tree = st.createTree(txn)
+        try txn.put(CATALOG_TREE, &(SKIP_PRE + m.key), &(encMeta(&m)))
+    }
+    invalidateTree(st.id, oldTree)
+    invalidateTree(st.id, newTree)
+    return Ok(Unit{})
+}
