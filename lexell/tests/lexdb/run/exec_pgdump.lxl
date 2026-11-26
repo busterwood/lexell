@@ -1,0 +1,193 @@
+// PostgreSQL pg_dump / pg_restore compatibility: dump header GUCs + search_path='',
+// COMMENT ON ... IS '...' | NULL, ALTER ... OWNER TO (current bootstrap user, explicit
+// role, type, function, procedure, routine, TABLE ONLY), ADD GENERATED {ALWAYS|BY DEFAULT}
+// AS IDENTITY (SEQUENCE NAME schema.seq ...), ALTER TABLE ONLY ... SET DEFAULT
+// nextval('public.t_id_seq'::regclass), pg_catalog.setval + post-restore INSERT
+// sequence continuation, OVERRIDING SYSTEM VALUE, --clean --if-exists drops on empty
+// and populated databases, and error checks for nonexistent roles / bad COMMENT syntax.
+// expect: headers_ok: true
+// expect: clean_empty_ok: true
+// expect: comment_tag: COMMENT
+// expect: comment_null_tag: COMMENT
+// expect: comment_bad: 42601
+// expect: owner_bootstrap: ALTER SCHEMA|ALTER TABLE|ALTER SEQUENCE|ALTER VIEW|ALTER MATERIALIZED VIEW|ALTER TYPE|ALTER FUNCTION|ALTER PROCEDURE
+// expect: owner_missing_role: 42704
+// expect: owner_explicit_role: ALTER TABLE|ALTER TYPE|ALTER FUNCTION|ALTER PROCEDURE
+// expect: serial_next: 4
+// expect: identity_by_default_next: 4|115
+// expect: identity_always_next: 3|20.00
+// expect: identity_override: 10|30.00
+// expect: clean_repopulate_ok: true
+// expect: summary_row: 3|101.50
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows {
+                var rows: []str = []
+                for row in r.rows {
+                    var cells: []str = []
+                    for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                    append(mut &rows, strings.join(&cells, "|"))
+                }
+                return strings.join(&rows, ";")
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return e.state + " " + e.msg }
+    }
+}
+
+fn qState(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) { return rs[len(rs) - 1].tag.clone() }
+        Err(e) { return e.state }
+    }
+}
+
+fn runAll(s: mut &lexdb_exec.Session, stmts: &[]str): str {
+    for sql in stmts {
+        match s.exec(&sql) {
+            Ok(_) {}
+            Err(e) { return e.state + ": " + e.msg + " [" + sql + "]" }
+        }
+    }
+    return "true"
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(84), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 1024 * 1024, snapNodes: 10000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+        s.setUser(&"postgres")
+        // 1. Standard PG 18 pg_dump header GUCs + empty search_path
+        let headers = [
+            "SET statement_timeout = 0",
+            "SET lock_timeout = 0",
+            "SET idle_in_transaction_session_timeout = 0",
+            "SET transaction_timeout = 0",
+            "SET client_encoding = 'UTF8'",
+            "SET standard_conforming_strings = on",
+            "SELECT pg_catalog.set_config('search_path', '', false)",
+            "SET check_function_bodies = false",
+            "SET xmloption = content",
+            "SET client_min_messages = warning",
+            "SET row_security = off",
+            "SET default_tablespace = ''",
+            "SET default_table_access_method = heap",
+        ]
+        println("headers_ok: " + runAll(mut &s, &headers))
+
+        // 2. --clean --if-exists statements on a brand-new empty DB
+        let cleanDrops = [
+            "ALTER TABLE IF EXISTS ONLY app.orders DROP CONSTRAINT IF EXISTS orders_user_id_fkey",
+            "ALTER TABLE IF EXISTS ONLY app.orders DROP CONSTRAINT IF EXISTS orders_pkey",
+            "ALTER TABLE IF EXISTS ONLY public.users DROP CONSTRAINT IF EXISTS users_pkey",
+            "ALTER TABLE IF EXISTS public.users ALTER COLUMN id DROP DEFAULT",
+            "DROP INDEX IF EXISTS app.idx_orders_user",
+            "DROP MATERIALIZED VIEW IF EXISTS app.item_summary",
+            "DROP VIEW IF EXISTS app.user_totals",
+            "DROP TABLE IF EXISTS app.orders",
+            "DROP TABLE IF EXISTS app.items",
+            "DROP SEQUENCE IF EXISTS public.users_id_seq",
+            "DROP TABLE IF EXISTS public.users",
+            "DROP SEQUENCE IF EXISTS app.order_seq",
+            "DROP PROCEDURE IF EXISTS app.touch_item(IN p_sku text)",
+            "DROP FUNCTION IF EXISTS app.add_tax(amount numeric, rate numeric)",
+            "DROP TYPE IF EXISTS app.order_status",
+            "DROP SCHEMA IF EXISTS app",
+        ]
+        println("clean_empty_ok: " + runAll(mut &s, &cleanDrops))
+
+        // 3. Schema + objects exactly as emitted by pg_dump
+        let buildDump = [
+            "CREATE SCHEMA app",
+            "CREATE TYPE app.order_status AS ENUM ('pending', 'paid', 'shipped')",
+            "CREATE SEQUENCE app.order_seq START WITH 100 INCREMENT BY 5 MINVALUE 10 MAXVALUE 100000 CACHE 1 CYCLE",
+            "CREATE TABLE public.users (id integer NOT NULL, email text NOT NULL, name character varying(100) NOT NULL)",
+            "CREATE SEQUENCE public.users_id_seq AS integer START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1",
+            "ALTER SEQUENCE public.users_id_seq OWNED BY public.users.id",
+            "ALTER TABLE ONLY public.users ALTER COLUMN id SET DEFAULT nextval('public.users_id_seq'::regclass)",
+            "CREATE TABLE app.orders (id bigint NOT NULL, user_id integer NOT NULL, order_no bigint DEFAULT nextval('app.order_seq'::regclass) NOT NULL, total numeric(10,2) NOT NULL, status app.order_status DEFAULT 'pending'::app.order_status NOT NULL)",
+            "ALTER TABLE app.orders ALTER COLUMN id ADD GENERATED BY DEFAULT AS IDENTITY (SEQUENCE NAME app.orders_id_seq START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1)",
+            "CREATE TABLE app.items (id integer NOT NULL, sku text NOT NULL, price numeric(10,2) NOT NULL, qty integer NOT NULL, line_total numeric(12,2) GENERATED ALWAYS AS (price * qty) STORED)",
+            "ALTER TABLE app.items ALTER COLUMN id ADD GENERATED ALWAYS AS IDENTITY (SEQUENCE NAME app.items_id_seq START WITH 1 INCREMENT BY 1 NO MINVALUE NO MAXVALUE CACHE 1)",
+            "CREATE VIEW app.user_totals AS SELECT u.id, count(o.id) AS cnt FROM public.users u LEFT JOIN app.orders o ON o.user_id = u.id GROUP BY u.id",
+            "CREATE MATERIALIZED VIEW app.item_summary AS SELECT count(*) AS cnt, sum(line_total) AS grand_total FROM app.items WITH NO DATA",
+            "CREATE FUNCTION app.add_tax(amount numeric, rate numeric DEFAULT 0.2) RETURNS numeric LANGUAGE sql IMMUTABLE AS $$ SELECT round(amount * (1 + rate), 2); $$",
+            "CREATE PROCEDURE app.touch_item(p_sku text) LANGUAGE sql AS $$ UPDATE app.items SET qty = qty WHERE sku = p_sku; $$",
+            "CREATE INDEX idx_orders_user ON app.orders USING btree (user_id)",
+        ]
+        let okBuild = runAll(mut &s, &buildDump)
+        if okBuild != "true" { println("build_err: " + okBuild) }
+
+        // 4. COMMENT ON in PostgreSQL mode
+        println("comment_tag: " + q(mut &s, "COMMENT ON TABLE public.users IS 'Registered users'"))
+        println("comment_null_tag: " + q(mut &s, "COMMENT ON FUNCTION app.add_tax(numeric, numeric) IS NULL"))
+        println("comment_bad: " + qState(mut &s, "COMMENT ON TABLE public.users"))
+
+        // 5. ALTER ... OWNER TO bootstrap session user ('postgres') + nonexistent role check
+        var ob: []str = []
+        append(mut &ob, q(mut &s, "ALTER SCHEMA app OWNER TO postgres"))
+        append(mut &ob, q(mut &s, "ALTER TABLE ONLY public.users OWNER TO postgres"))
+        append(mut &ob, q(mut &s, "ALTER SEQUENCE app.order_seq OWNER TO postgres"))
+        append(mut &ob, q(mut &s, "ALTER VIEW app.user_totals OWNER TO postgres"))
+        append(mut &ob, q(mut &s, "ALTER MATERIALIZED VIEW app.item_summary OWNER TO postgres"))
+        append(mut &ob, q(mut &s, "ALTER TYPE app.order_status OWNER TO postgres"))
+        append(mut &ob, q(mut &s, "ALTER FUNCTION app.add_tax(amount numeric, rate numeric) OWNER TO postgres"))
+        append(mut &ob, q(mut &s, "ALTER PROCEDURE app.touch_item(IN p_sku text) OWNER TO postgres"))
+        println("owner_bootstrap: " + strings.join(&ob, "|"))
+        println("owner_missing_role: " + qState(mut &s, "ALTER TABLE public.users OWNER TO no_such_role"))
+
+        // 6. ALTER ... OWNER TO explicit role
+        var ign = q(mut &s, "CREATE ROLE app_owner")
+        var oe: []str = []
+        append(mut &oe, q(mut &s, "ALTER TABLE app.orders OWNER TO app_owner"))
+        append(mut &oe, q(mut &s, "ALTER TYPE app.order_status OWNER TO app_owner"))
+        append(mut &oe, q(mut &s, "ALTER FUNCTION app.add_tax(numeric, numeric) OWNER TO app_owner"))
+        append(mut &oe, q(mut &s, "ALTER PROCEDURE app.touch_item(text) OWNER TO app_owner"))
+        println("owner_explicit_role: " + strings.join(&oe, "|"))
+
+        // 7. Data + setval + constraints + refresh MV (as emitted by pg_dump)
+        let loadData = [
+            "INSERT INTO public.users (id, email, name) VALUES (1, 'a@x', 'Alice'), (2, 'b@x', 'Bob'), (3, 'c@x', 'Carol')",
+            "INSERT INTO app.orders (id, user_id, order_no, total, status) VALUES (1, 1, 100, 99.95, 'paid'), (2, 1, 105, 49.50, 'pending'), (3, 3, 110, 250.00, 'shipped')",
+            "INSERT INTO app.items (id, sku, price, qty) OVERRIDING SYSTEM VALUE VALUES (1, 'A-1', 10.50, 3), (2, 'B-2', 25.00, 2)",
+            "SELECT pg_catalog.setval('public.users_id_seq', 3, true)",
+            "SELECT pg_catalog.setval('app.orders_id_seq', 3, true)",
+            "SELECT pg_catalog.setval('app.order_seq', 110, true)",
+            "SELECT pg_catalog.setval('app.items_id_seq', 2, true)",
+            "ALTER TABLE ONLY public.users ADD CONSTRAINT users_pkey PRIMARY KEY (id)",
+            "ALTER TABLE ONLY app.orders ADD CONSTRAINT orders_pkey PRIMARY KEY (id)",
+            "ALTER TABLE ONLY app.orders ADD CONSTRAINT orders_user_id_fkey FOREIGN KEY (user_id) REFERENCES public.users(id) ON DELETE CASCADE",
+            "REFRESH MATERIALIZED VIEW app.item_summary",
+        ]
+        let okLoad = runAll(mut &s, &loadData)
+        if okLoad != "true" { println("load_err: " + okLoad) }
+
+        // 8. Post-restore inserts on a fresh session (default search_path = public) verify regclass + named identity sequences
+        var s2 = lexdb_exec.newSession(st.share())
+        s2.setUser(&"postgres")
+        println("serial_next: " + q(mut &s2, "INSERT INTO public.users (email, name) VALUES ('d@x', 'Dave') RETURNING id"))
+        println("identity_by_default_next: " + q(mut &s2, "INSERT INTO app.orders (user_id, total) VALUES (4, 12.34) RETURNING id, order_no"))
+        println("identity_always_next: " + q(mut &s2, "INSERT INTO app.items (sku, price, qty) VALUES ('C-3', 5.00, 4) RETURNING id, line_total"))
+        println("identity_override: " + q(mut &s2, "INSERT INTO app.items (id, sku, price, qty) OVERRIDING SYSTEM VALUE VALUES (10, 'D-4', 15.00, 2) RETURNING id, line_total"))
+        ign = q(mut &s2, "REFRESH MATERIALIZED VIEW app.item_summary")
+
+        // 9. --clean --if-exists re-restore onto populated DB
+        println("clean_repopulate_ok: " + runAll(mut &s, &cleanDrops))
+        ign = runAll(mut &s, &buildDump)
+        ign = runAll(mut &s, &loadData)
+        ign = q(mut &s2, "INSERT INTO app.items (sku, price, qty) VALUES ('C-3', 5.00, 4)")
+        ign = q(mut &s2, "REFRESH MATERIALIZED VIEW app.item_summary")
+        println("summary_row: " + q(mut &s2, "SELECT cnt, grand_total FROM app.item_summary"))
+        return 0
+    })
+}

@@ -20,6 +20,7 @@ showcase, start with [LEXDB.md](../../../LEXDB.md). The storage internals and hi
 | [Transactions](transactions.md) | Isolation, how a transaction starts and ends in each door, retries. |
 | [Security](security.md) | Logins, roles and privileges per door. |
 | [Bulk loading](bulk-load.md) | `COPY`, SQL Server bulk copy (bcp, `SqlBulkCopy`), Oracle array DML. |
+| [Restoring PostgreSQL backups](pg-restore.md) | Restore real PostgreSQL `pg_dump` / `pg_restore` backups (`-Fp`, `-Fc`, `-Ft`, `-Fd`) directly into LexDB. |
 | [Materialized views](materialized-views.md) | Incremental (`FAST`) maintenance, real-time delta merging, cascading rollup DAGs, composable sketches, and automatic transparent query rewrite across all three doors. |
 | [Data skipping indexes](skipping-indexes.md) | Automatic columnar zone maps and explicit `minmax`/`brin`, `set`, `bloom_filter`, `ngrambf`, and `tokenbf` skipping indexes across all three doors. |
 | [Assertions](assertions.md) | SQL-standard `CREATE ASSERTION` (currently only in Oracle 26ai) enforced across all three doors, with join-key concurrency locking. |

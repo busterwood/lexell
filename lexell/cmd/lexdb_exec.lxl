@@ -14307,7 +14307,7 @@ fn isWrite(kind: int): bool {
            kind == lexdb_sql.S_CREATE_TYPE || kind == lexdb_sql.S_DROP_TYPE || kind == lexdb_sql.S_ALTER_TYPE ||
            kind == lexdb_sql.S_TRUNCATE || kind == lexdb_sql.S_ANALYZE || kind == lexdb_sql.S_MERGE || kind == lexdb_sql.S_ALTER_DB || kind == lexdb_sql.S_SP_RENAME ||
            kind == lexdb_sql.S_CREATE_ROUTINE || kind == lexdb_sql.S_DROP_ROUTINE || kind == lexdb_sql.S_CREATE_GRAPH || kind == lexdb_sql.S_DROP_GRAPH || kind == lexdb_sql.S_ASSERT ||
-           kind == lexdb_sql.S_CREATE_MVIEW || kind == lexdb_sql.S_DROP_MVIEW || kind == lexdb_sql.S_REFRESH_MVIEW || kind == lexdb_sql.S_ALTER_MVIEW || kind == lexdb_sql.S_MVIEW_LOG
+           kind == lexdb_sql.S_CREATE_MVIEW || kind == lexdb_sql.S_DROP_MVIEW || kind == lexdb_sql.S_REFRESH_MVIEW || kind == lexdb_sql.S_ALTER_MVIEW || kind == lexdb_sql.S_MVIEW_LOG || kind == lexdb_sql.S_COMMENT
 }
 
 fn stmtName(kind: int): str {
@@ -14353,6 +14353,7 @@ fn stmtName(kind: int): str {
         lexdb_sql.S_REFRESH_MVIEW { "REFRESH MATERIALIZED VIEW" }
         lexdb_sql.S_ALTER_MVIEW { "ALTER MATERIALIZED VIEW" }
         lexdb_sql.S_MVIEW_LOG { "CREATE MATERIALIZED VIEW LOG" }
+        lexdb_sql.S_COMMENT { "COMMENT" }
         else { "DELETE" }
     }
 }
@@ -14461,6 +14462,7 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_REFRESH_MVIEW { return refreshMview(st, txn, s, lim) }
         lexdb_sql.S_ALTER_MVIEW { return alterMview(st, txn, s, lim) }
         lexdb_sql.S_MVIEW_LOG { return mviewLogStmt(st, txn, s) }
+        lexdb_sql.S_COMMENT { return Ok(tagOnly("COMMENT")) }
         lexdb_sql.S_COPY { return copyStmt(st, txn, s, params, ptypes, lim, pc, input, out, pull) }
         lexdb_sql.S_EXPLAIN { return explain(st, txn, s, params, lim, ptypes) }
         else { return Err(e("XX000", "not a data statement")) }
@@ -16839,7 +16841,12 @@ fn bindSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, names: &[]str): R
             let a = try lexdb_priv.readAcl(st, txn, &lexdb_catalog.relObj(&d.key))
             if !lexdb_priv.allows(&w, &a, &"U") && !lexdb_priv.allows(&w, &a, &"w") && !lexdb_priv.allows(&w, &a, &"r") { return Err(lexdb_priv.denied(&"sequence", &d.key)) }
         }
-        st.memo.put(&bindKey(txn.sql.sess, &n), &(no.toStr() + "\n" + lexdb_catalog.encSeq(&d)))
+        let enc = no.toStr() + "\n" + lexdb_catalog.encSeq(&d)
+        st.memo.put(&bindKey(txn.sql.sess, &n), &enc)
+        let sh = lexdb_sql.shown(&d.key)
+        if sh != n { st.memo.put(&bindKey(txn.sql.sess, &sh), &enc) }
+        let sq = seqShown(&d.key)
+        if sq != n && sq != sh { st.memo.put(&bindKey(txn.sql.sess, &sq), &enc) }
     }
     return Ok(Unit{})
 }
@@ -17088,7 +17095,9 @@ fn defaultsOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Res
         append(mut &d.exprs, x)
     }
     if len(names) > 0 {
-        // (a default that names a sequence gone is no error while no row takes it, Oracle's: the call fails where the row takes it)
+        // (a default like nextval('public.t_id_seq'::regclass) needs catalog binding for ::regclass;
+        // a default that names a sequence gone is no error while no row takes it, Oracle's)
+        append(mut &names, lexdb_sql.CAT_MARK)
         match bindSeqs(st, txn, &names) {
             Ok(_) {}
             Err(x) { if x.state != "42P01" { return Err(x) } }
@@ -17431,8 +17440,14 @@ fn makeColSeqs(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: mut &Table,
         let none = lexdb_sql.noSeqOpts()
         let o = if oi >= 0 { &ids[oi].opts } else { &none }
         if len(o.owned) > 0 { return Err(e("42601", "lexdb: an identity column's sequence is owned by it (no OWNED BY)")) }
-        let name = try makeName(st, txn, t, &[cname.clone()], &"seq", true)
-        let key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &name)
+        var key = ""
+        if len(o.seqName) > 0 {
+            key = try createKey(st, txn, &o.seqName, false)
+            if try relExists(st, txn, &key) { return Err(e("42P07", &("relation \"" + lexdb_sql.baseName(&key) + "\" already exists"))) }
+        } else {
+            let name = try makeName(st, txn, t, &[cname.clone()], &"seq", true)
+            key = lexdb_sql.qual(&lexdb_sql.schemaOf(&t.name), &name)
+        }
         var d = try newSeq(st, txn, &key, ctyp.oid, o)
         d.ownerT = t.name.clone()
         d.ownerC = cname.clone()
@@ -22196,7 +22211,59 @@ fn grantStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
 fn ownerStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
     let tag = "ALTER " + strings.toUpperAscii(&s.index)
     let to = lexdb_priv.roleName(st, txn, &s.names[0])
-    if len(to) == 0 || !(try lexdb_priv.roleExists(st, txn, &to)) { return Err(e("42704", &("role \"" + (if len(to) == 0 { "public" } else { to }) + "\" does not exist"))) }
+    let cur = lexdb_priv.currentRole(st, txn.sql.sess)
+    let exists = len(to) > 0 && (try lexdb_priv.roleExists(st, txn, &to))
+    if len(to) == 0 || (!exists && to != cur) { return Err(e("42704", &("role \"" + (if len(to) == 0 { "public" } else { to }) + "\" does not exist"))) }
+    if s.index == "function" || s.index == "procedure" || s.index == "routine" {
+        let w = try lexdb_priv.whoNow(st, txn)
+        var rkey = s.table.clone()
+        if !lexdb_sql.isQual(&rkey) {
+            let path = lexdb_catalog.copyStrs(&txn.sql.path)
+            for sc in path {
+                let cand = lexdb_sql.qual(&sc, &rkey)
+                if len(try lexdb_routine.find(st, txn, lexdb_sql.RD_PG, &cand)) > 0 {
+                    rkey = cand
+                    break
+                }
+            }
+        }
+        let sig = if len(s.alias) > 0 { s.alias.clone() } else { "*" }
+        try lexdb_routine.setOwner(st, txn, lexdb_sql.RD_PG, &rkey, &sig, &s.index, &to, &w.roles, w.super, s.ifFlag, fn(o: int): str { return lexdb_pgcat.formatType(o, -1) })
+        try bumpCatalog(st, txn)
+        return Ok(tagOnly(&tag))
+    }
+    if s.index == "type" {
+        var tkey = s.table.clone()
+        var found = false
+        if lexdb_sql.isQual(&tkey) {
+            let oid = lexdb_sql.nameOid(&"T", &tkey)
+            found = (try lexdb_catalog.readEnum(st, txn, oid)).isSome()
+        } else {
+            let path = lexdb_catalog.copyStrs(&txn.sql.path)
+            for sc in path {
+                let cand = lexdb_sql.qual(&sc, &tkey)
+                let oid = lexdb_sql.nameOid(&"T", &cand)
+                if (try lexdb_catalog.readEnum(st, txn, oid)).isSome() {
+                    tkey = cand
+                    found = true
+                    break
+                }
+            }
+        }
+        if !found {
+            if s.ifFlag { return Ok(tagOnly(&tag)) }
+            return Err(e("42704", &("type \"" + lexdb_sql.shown(&s.table) + "\" does not exist")))
+        }
+        let w = try lexdb_priv.whoNow(st, txn)
+        let obj = "T:" + tkey
+        try lexdb_priv.needOwner(st, txn, &w, &obj, &"type", &tkey)
+        if !w.super && !lexdb_base.hasStr(&w.roles, &to) { return Err(e("42501", &("must be able to SET ROLE \"" + to + "\""))) }
+        var a = try lexdb_priv.readAcl(st, txn, &obj)
+        a.owner = to
+        try lexdb_priv.writeAcl(txn, &obj, &a)
+        try bumpCatalog(st, txn)
+        return Ok(tagOnly(&tag))
+    }
     var obj = ""
     var name = s.table.clone()
     if s.index == "schema" {

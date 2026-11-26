@@ -100,6 +100,53 @@ pub fn create(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, r: &Routine, re
     return Ok(Unit{})
 }
 
+// ALTER FUNCTION | PROCEDURE | ROUTINE name [(sig)] OWNER TO to: updates the
+// routine's owner in the catalog (and any ACL row).
+pub fn setOwner(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, dialect: int, key: &str, sig: &str, kw: &str, to: &str,
+                roles: &[]str, super: bool, ifExists: bool, fmt: &fn(int): str): Result[Unit, DbErr] {
+    let have = try find(st, txn, dialect, key)
+    var hit: []Routine = []
+    for h in have {
+        if sig == "*" {
+            if kw == "routine" || (kw == "function" && h.kind == lexdb_sql.RK_FUNC) || (kw == "procedure" && h.kind == lexdb_sql.RK_PROC) {
+                append(mut &hit, h)
+            }
+        } else if sigOf(&h) == sig {
+            append(mut &hit, h)
+        }
+    }
+    let spell = lexdb_sql.shown(key)
+    if len(hit) == 0 {
+        if ifExists { return Ok(Unit{}) }
+        var shown = "()"
+        if sig != "*" {
+            var ts: []str = []
+            if len(sig) > 0 { for o in strings.split(sig, ",") { append(mut &ts, fmt(lexdb_base.num(&o))) } }
+            shown = "(" + strings.join(&ts, ", ") + ")"
+        }
+        if sig == "*" { return Err(err("42883", &("could not find a " + kw + " named \"" + spell + "\""))) }
+        return Err(err("42883", &(kw + " " + spell + shown + " does not exist")))
+    }
+    if len(hit) > 1 { return Err(err("42725", &(kw + " name \"" + spell + "\" is not unique"))) }
+    var h = hit[0].clone()
+    let isProc = h.kind == lexdb_sql.RK_PROC
+    if (kw == "function" && isProc) || (kw == "procedure" && !isProc) {
+        var ts: []str = []
+        for p in h.params { if p.mode != "out" { append(mut &ts, fmt(p.typ.oid)) } }
+        return Err(err("42809", &(spell + "(" + strings.join(&ts, ", ") + ") is not a " + kw)))
+    }
+    if !super && !lexdb_base.hasStr(roles, &h.owner) {
+        return Err(err("42501", &("must be owner of " + (if isProc { "procedure" } else { "function" }) + " " + spell)))
+    }
+    if !super && !lexdb_base.hasStr(roles, to) {
+        return Err(err("42501", &("must be able to SET ROLE \"" + to + "\"")))
+    }
+    let hsig = sigOf(&h)
+    h.owner = to.toStr()
+    try txn.put(lexdb_catalog.CATALOG, &(lexdb_catalog.routineKey(dialect, &h.key, &hsig)), &(lexdb_catalog.encRoutine(&h)))
+    return Ok(Unit{})
+}
+
 // What DROP did to one name: the routines dropped, or the notice for IF EXISTS.
 pub type Dropped = record { pub notice: str; pub objs: []str }      // objs: the privileges' objects of the routines dropped (lexdb_catalog.routineObj)
 

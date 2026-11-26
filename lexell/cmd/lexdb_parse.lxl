@@ -149,6 +149,7 @@ const S_MVIEW_LOG = lexdb_sql.S_MVIEW_LOG
 const S_GRANT = lexdb_sql.S_GRANT
 const S_REVOKE = lexdb_sql.S_REVOKE
 const S_OWNER = lexdb_sql.S_OWNER
+const S_COMMENT = lexdb_sql.S_COMMENT
 const S_CREATE_TYPE = lexdb_sql.S_CREATE_TYPE
 const S_DROP_TYPE = lexdb_sql.S_DROP_TYPE
 const S_ALTER_TYPE = lexdb_sql.S_ALTER_TYPE
@@ -3961,6 +3962,9 @@ fn (p: mut &P) seqOptions(o: mut &SeqOpts, alter: bool): Result[Unit, lexdb_base
             if o.cache < 1 { return Err(lexdb_base.err("22023", &("CACHE (" + o.cache.toStr() + ") must be greater than zero"))) }
         } else if p.acceptKw("cycle") {
             o.cycle = 1
+        } else if !alter && p.isKw("sequence") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "name" {
+            p.pos += 2
+            o.seqName = try p.rname()
         } else if p.acceptKw("owned") {
             try p.expectKw("by")
             if p.acceptKw("none") {
@@ -8528,23 +8532,61 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 p.skipToEnd()
                 return Ok(lexdb_sql.newStmt(S_EMPTY))
             }
+            if !p.tsql && p.acceptKw("on") {
+                // PostgreSQL's COMMENT ON <target> IS <string | NULL>: accepted (not stored), returns COMMENT tag.
+                var depth = 0
+                var foundIs = false
+                while p.peek().kind != T_EOF && !(p.peek().kind == T_OP && p.peek().text == ";") {
+                    if p.isKw("(") { depth += 1; p.pos += 1; continue }
+                    if p.isKw(")") { if depth > 0 { depth -= 1 }; p.pos += 1; continue }
+                    if depth == 0 && p.acceptKw("is") {
+                        foundIs = true
+                        break
+                    }
+                    p.pos += 1
+                }
+                if !foundIs { return Err(near(&p.peek())) }
+                if !p.acceptKw("null") {
+                    let v = p.next()
+                    if v.kind != T_STR { return Err(near(&v)) }
+                }
+                return Ok(lexdb_sql.newStmt(S_COMMENT))
+            }
             return Err(near(&t))
         }
         "alter" {
             if p.ora && p.isKw("assertion") { return p.assertStmt("alter") }
             if p.acceptKw("materialized") { return p.alterMview() }
-            // ALTER TABLE | VIEW | SEQUENCE | SCHEMA [IF EXISTS] name OWNER TO role (9.83)
-            if p.isKw("table") || p.isKw("view") || p.isKw("sequence") || p.isKw("schema") {
+            // ALTER TABLE | VIEW | SEQUENCE | SCHEMA | TYPE | FUNCTION | PROCEDURE | ROUTINE [IF EXISTS] [ONLY] name [(sig)] OWNER TO role
+            if p.isKw("table") || p.isKw("view") || p.isKw("sequence") || p.isKw("schema") ||
+               (!p.tsql && !p.ora && (p.isKw("type") || p.isKw("function") || p.isKw("procedure") || p.isKw("routine"))) {
                 let back = p.pos
                 let kind = p.next().text
                 let ife = p.acceptKw("if")
                 if ife { try p.expectKw("exists") }
-                let nm = if kind == "schema" { try p.name() } else { try p.qname() }
-                if p.acceptKw("owner") {
+                let _ = kind == "table" && p.acceptKw("only")
+                var nm = ""
+                var sig = "*"
+                var ok = true
+                if kind == "schema" {
+                    match p.name() { Ok(v) { nm = v } Err(_) { ok = false } }
+                } else if kind == "function" || kind == "procedure" || kind == "routine" {
+                    match p.rname() {
+                        Ok(v) {
+                            nm = v
+                            match p.routineSig() { Ok(sg) { sig = sg } Err(_) { ok = false } }
+                        }
+                        Err(_) { ok = false }
+                    }
+                } else {
+                    match p.qname() { Ok(v) { nm = v } Err(_) { ok = false } }
+                }
+                if ok && p.acceptKw("owner") {
                     try p.expectKw("to")
                     var o = lexdb_sql.newStmt(S_OWNER)
                     o.index = kind
                     o.table = nm
+                    o.alias = sig
                     o.ifFlag = ife
                     append(mut &o.names, try p.roleSpec())
                     return Ok(o)
