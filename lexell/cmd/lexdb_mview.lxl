@@ -4589,19 +4589,29 @@ pub fn tryRewrite(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &Stmt, p
             if !resOk { continue }
             score = (if len(allMvPreds) > 0 { 300 } else { 400 }) + extraCount * 10
         } else {
-            // Aggregate MV: check 1-to-1 exact group match (only without join-back), else rollup!
+            // Aggregate MV: check exact-grain bijection (every MV group key in qGrpMapped, plus any
+            // deterministic functions of MV keys such as GROUP BY 1, url or GROUP BY ip, ip - 1), else rollup!
             for g in qGrpRaw { append(mut &qGrpMapped, remapSlots(&g, &qOffsets, &qTabs, &tabPerm, &fp.tabOffsets, &fp.allCols, &qAllCols)) }
-            if extraCount == 0 && len(qGrpMapped) == len(fp.group) {
-                var mvGrpUsed = array(len(fp.group), false)
-                var bijOk = true
-                for qg in qGrpMapped {
-                    var found = false
-                    for mi in 0..len(fp.group) {
-                        if !mvGrpUsed[mi] && exprEq(&qg, &fp.group[mi]) { mvGrpUsed[mi] = true; found = true; break }
+            if extraCount == 0 {
+                if len(fp.group) == 0 {
+                    exactGroup = len(qGrpMapped) == 0
+                } else if len(qGrpMapped) >= len(fp.group) {
+                    var allMvPresent = true
+                    for mg in fp.group {
+                        var found = false
+                        for qg in qGrpMapped { if exprEq(&qg, &mg) { found = true; break } }
+                        if !found { allMvPresent = false; break }
                     }
-                    if !found { bijOk = false; break }
+                    if allMvPresent {
+                        var allDet = true
+                        for qg in qGrpMapped {
+                            if !lexdb_bind.immutable(&qg) || translateNonAgg(&qg, &fp, &mvTab, &mvAlias, extraBase, &qAllCols).isNone() {
+                                allDet = false; break
+                            }
+                        }
+                        exactGroup = allDet
+                    }
                 }
-                exactGroup = bijOk
             }
             globalRollup = !exactGroup && len(qGrpMapped) == 0
             if !exactGroup {
