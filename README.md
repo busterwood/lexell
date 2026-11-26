@@ -4,7 +4,7 @@ Lexell is a memory-safe language that compiles in milliseconds and produces smal
 
 - **Memory safe, without a garbage collector.** Every value has one owner, and the compiler checks that a borrow never outlives what it borrows, so there is no use after free and no double free. Memory is released as soon as its owner goes away: no collector, no pauses, and a small footprint (2–31 MB peak in the benchmarks, where the JVM takes 51 MB–1.4 GB). Reference counting is there when you ask for it (`rc T`).
 - **No nulls, no unchecked memory access.** A value that may be missing is an `Option`, and the compiler makes you handle the missing case. Indexes are bounds-checked, and integer overflow stops the program instead of wrapping silently. There is no pointer arithmetic and no `unsafe` block; the only unchecked code is a call into a C library declared `extern`, which the standard library wraps.
-- **No data races.** Servers handle thousands of connections as cooperative tasks on one thread, written as plain sequential code, with no threads, locks or `async` (see [concurrency](#concurrency-without-threads-or-locks)).
+- **No data races, and scaling by sharing nothing.** A server handles thousands of connections as cooperative tasks on one thread, written as plain sequential code, with no threads, locks or `async`. One thread per process is a performance choice as well as a safety one: to use more cores you run more processes that share nothing, as nginx does, so adding cores adds no locks and no contention (see [concurrency](#concurrency-without-threads-or-locks)).
 - **A quick feedback loop.** Hello world compiles in 13 ms, against 48 ms for Rust, and the nine benchmark programs in 131 ms, against 3.19 s.
 - **Small, fast executables.** The compiler writes Linux executables directly. Hello world is 20 KB, against Rust's 330 KB, and the generated code is faster than Rust's on 10 of the 18 [benchmarks](#performance) they share, and level on two more.
 
@@ -86,7 +86,15 @@ Measured on one AMD Ryzen 7 8745HS running Linux 7.2, 24–26 November 2026. The
 
 A Lexell server runs each connection as a lightweight task on one thread, and you write the handler as plain sequential code. When a task waits for a socket, a database reply or a timer, it parks, and the event loop runs another task until the reply arrives. There is no `async` or `await` to write, and a function that waits looks like any other function.
 
-Only one task runs at a time, and a task can only be switched out where it waits. Code between two waits cannot be interrupted, so there are no data races and nothing to lock: no mutexes, no atomics, no lock ordering. To use more cores, run several worker processes, as nginx does. Each has its own event loop, memory and connections, and they share nothing, so there is still nothing to lock. `task.workers` starts them, restarts any that crash and stops them together.
+Only one task runs at a time, and a task can only be switched out where it waits. Code between two waits cannot be interrupted, so there are no data races and nothing to lock: no mutexes, no atomics, no lock ordering.
+
+### One thread per process, by design
+
+A single thread is not a limitation to be fixed later. On a multicore machine, threads that share memory pay for it all the time: in locks, in atomic counters, and in cache lines passed back and forth between cores. Those costs grow as cores are added. The fastest servers avoid them by sharing nothing between cores: nginx runs one process per core, Redis executes commands on one thread, and LMAX matched millions of orders a second on one. A Lexell process pays none of these costs. Reference counts are plain increments, the allocator takes no lock, and nothing waits for another core.
+
+To use more cores, run more processes. Each worker has its own event loop, memory and connections, and they share nothing but the database, so adding a core adds capacity without adding a lock. A crash stops one worker, not the server. `task.workers` starts the workers, restarts any that crash and stops them together. What you give up is memory that every core reads and writes, such as one in-process cache for all workers. Keep that state in the database or Redis, where it is shared safely already. For CPU-bound work on one batch, `par.map` spreads a closure that the compiler has proved pure over a pool of threads ([design](lexell/design/parallel.md)).
+
+This web server runs that way on four cores:
 
 ```lexell
 import "httpserver" as http
@@ -131,7 +139,7 @@ The same design runs through the library and LexDB:
 
 - **HTTP and HTTPS server.** One task per connection, with keep-alive, graceful shutdown, and worker processes sharing one port. On one core it serves 1.5 times as many requests a second as Go's `net/http` and 1.2 to 1.3 times as many as Node.js, each also on one core. At 100 clients its p99 latency is 0.61 ms, against Node's 0.87 ms and Go's 3.1 ms.
 - **Database clients.** The PostgreSQL, SQL Server, Oracle and Redis clients speak their wire protocols on the event loop, so a query parks only the task that sent it, and their connection pools hand out connections the same way. SQLite has only a blocking C API, so its calls run on a helper thread, which runs only C code, while the task waits.
-- **LexDB.** The database runs every session as a task on one thread. A commit never waits partway through, so no other session can run inside it, and the engine needs no latches on its pages and no locks to keep threads out of each other's way. Commits that arrive in the same turn of the event loop share one flush to disk. Read-only replicas are separate processes that follow the master's log, the same way LexDB uses more cores.
+- **LexDB.** The database runs every session as a task on one thread. A commit never waits partway through, so no other session can run inside it, and the engine needs no latches on its pages and no locks to keep threads out of each other's way. Commits that arrive in the same turn of the event loop share one flush to disk. On one core it runs the 22 TPC-H queries 2.0 times faster than PostgreSQL 18 on one core, and 1.23 times faster than PostgreSQL using four processes. It also takes 1.3–3.1 times as many durable updates a second. LexDB adds cores the same way a web server does. Read-only replicas are separate processes that follow the master's log about 0.2 ms behind, and a master with three replicas on four cores serves 1.18–1.23 times as many point selects a second as PostgreSQL on the same four cores. PostgreSQL is ahead on a single heavy query it splits across parallel workers, and on multi-statement read-write transactions under high concurrency ([LexDB performance](lexell/docs/lexdb/performance.md)).
 
 The event loop uses io_uring for sockets and files by default, where the kernel allows it. On older kernels, and in containers that block io_uring, it falls back to epoll and a pool of helper threads for file I/O, with no change to your code and little loss: in LexDB's measurements the fallback kept about seven-eighths of io_uring's select rate and matched it on updates.
 
@@ -169,7 +177,7 @@ This also prints `24.49`. The repository includes [other command-line tools, a R
 
 ## LexDB
 
-[LexDB](LEXDB.md) is a SQL database server written in Lexell, and the largest program in the repository. One executable speaks the PostgreSQL, SQL Server and Oracle wire protocols and SQL dialects over the same tables, so `psql`, `sqlcmd`, JDBC and the other usual clients connect unchanged. It runs every session as a task on one thread, with the same no-locks design as Lexell's servers, and handles both transactions and analytics in one engine.
+[LexDB](LEXDB.md) is a SQL database server written in Lexell, and the largest program in the repository. One executable speaks the PostgreSQL, SQL Server and Oracle wire protocols and SQL dialects over the same tables, so `psql`, `sqlcmd`, JDBC and the other usual clients connect unchanged. It runs every session as a task on one thread, with the same no-locks design as Lexell's servers, scales reads across cores with shared-nothing replica processes, and handles both transactions and analytics in one engine.
 
 [LEXDB.md](LEXDB.md) introduces it, with its features and benchmarks against PostgreSQL 18. The [LexDB documentation](lexell/docs/lexdb/README.md) has the SQL references for all three dialects.
 
