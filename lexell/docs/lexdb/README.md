@@ -22,7 +22,10 @@ showcase, start with [LEXDB.md](../../../LEXDB.md). The storage internals and hi
 | [Bulk loading](bulk-load.md) | `COPY`, SQL Server bulk copy (bcp, `SqlBulkCopy`), Oracle array DML. |
 | [Materialized views](materialized-views.md) | Incremental (`FAST`) maintenance, real-time delta merging, cascading rollup DAGs, composable sketches, and automatic transparent query rewrite across all three doors. |
 | [Data skipping indexes](skipping-indexes.md) | Automatic columnar zone maps and explicit `minmax`/`brin`, `set`, `bloom_filter`, `ngrambf`, and `tokenbf` skipping indexes across all three doors. |
-| [Assertions](assertions.md) | `CREATE ASSERTION` in the three doors: one assertion, enforced for every door's writes; the write paths, catalogs and errors. |
+| [Assertions](assertions.md) | SQL-standard `CREATE ASSERTION` (currently only in Oracle 26ai) enforced across all three doors, with join-key concurrency locking. |
+| [Waiting for new data](sql/postgresql/select-wait.md) | `SELECT ... WAIT n SECONDS\|MILLISECONDS`: turn any indexed table into a zero-polling transactional event stream across all three doors, plus replica [`WAIT FOR LSN`](sql/postgresql/wait-for-lsn.md). |
+| [Row pattern recognition](sql/postgresql/match-recognize.md) | SQL:2016 `MATCH_RECOGNIZE` over ordered rows in the [PostgreSQL](sql/postgresql/match-recognize.md) and [Oracle](sql/oracle/match-recognize.md) doors. |
+| [Property graphs](sql/postgresql/graph-table.md) | SQL:2023 `CREATE PROPERTY GRAPH` and `GRAPH_TABLE` over existing relational tables across all three doors. |
 | [Known issues](KNOWN-ISSUES.md) | Bugs and gaps found while writing these pages. |
 
 Still to be written: monitoring (catalog views, statistics).

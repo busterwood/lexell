@@ -24,17 +24,73 @@ LexDB follows the exact same **shared-nothing** architecture as the [Lexell lang
 
 ---
 
-## What it supports
+## Standout features you rarely find together
 
-LexDB is designed to feel like a complete relational database rather than a toy query engine:
+Beyond standard relational SQL (joins, CTEs, subqueries, window functions, secondary B+tree indexes, foreign keys, views, stored procedures and functions, roles, and fast native bulk loading via `COPY`, `bcp`/`SqlBulkCopy`, and Oracle array DML), LexDB ships several rare SQL capabilities — many of them unavailable in PostgreSQL or SQL Server today:
 
-| Capability | What you get |
-|---|---|
-| **SQL & Query Engine** | Cost-based optimizer with automatic statistics, inner/outer/semi/anti joins, CTEs, correlated & uncorrelated subqueries, window functions, vectorized expressions, and exact 38-digit decimals. |
-| **Indexes & Constraints** | Primary keys, secondary B+tree indexes, unique constraints, foreign keys, `CHECK` constraints, and cross-door [`CREATE ASSERTION`](lexell/docs/lexdb/assertions.md) database invariants enforced across all three protocols. |
-| **Programmability & Schema** | Views, stored procedures and functions, sequences, schemas, logins, roles, and privileges across all three doors. |
-| **Fast Bulk Loading** | Native PostgreSQL `COPY`, SQL Server `bcp` / `SqlBulkCopy`, and Oracle array DML — all streaming directly into columnar leaves. |
-| **Analytical Accelerators** | [Incremental materialized views with transparent query rewrite](lexell/docs/lexdb/materialized-views.md), automatic columnar zone maps, and five [data skipping index](lexell/docs/lexdb/skipping-indexes.md) types. |
+### 1. Database-wide `CREATE ASSERTION` across all three doors
+
+The SQL standard's `CREATE ASSERTION` lets you enforce invariants that span multiple rows or multiple tables — "no order without an active customer", "total allocations never exceed capacity", "no two rows in a group can both be primary" — without fragile application-level checks or trigger spaghetti.
+
+Today, **only Oracle AI Database 26ai ships `CREATE ASSERTION`** — neither PostgreSQL nor SQL Server supports it. LexDB implements `CREATE ASSERTION` (`NOT EXISTS`, `EXISTS`, `ALL (...) SATISFY (...)`, including `DEFERRABLE` / `INITIALLY DEFERRED`) across **all three doors**. Define an assertion once in any door and LexDB enforces it automatically on every write path from *every* door (`INSERT`, `UPDATE`, `DELETE`, `MERGE`, `COPY`, `bcp`/`SqlBulkCopy`, Oracle array DML, and `TRUNCATE`), with join-key concurrency locking so two concurrent transactions can never race past an invariant together.
+
+```sql
+CREATE ASSERTION no_overbooked_accounts CHECK (
+  NOT EXISTS (
+    SELECT 1 FROM accounts a, holds h
+    WHERE h.account_id = a.id AND h.amount > a.balance
+  )
+);
+```
+
+See [Assertions in the three doors](lexell/docs/lexdb/assertions.md).
+
+### 2. Waiting for new data with `SELECT ... WAIT` (and `WAIT FOR LSN`)
+
+Because every LexDB connection is a lightweight cooperative task on the `io_uring` event loop — not a heavy OS thread or forked backend process — **thousands of clients can park directly inside the database waiting for new rows to commit** with minimal memory and zero polling.
+
+Append `WAIT n SECONDS` (or `MILLISECONDS`) to any indexed cursor query to turn an ordinary table into a transactional event stream across all three doors. If matching rows are already there, it returns immediately; if not, the task parks and wakes the instant a commit adds matching rows — and you can advance the consumer's offset in the **exact same ACID transaction** (no polling loop, no separate message broker, no dual-write problem):
+
+```sql
+BEGIN;
+SELECT seq, body FROM event
+WHERE topic = 'order' AND seq > $1
+ORDER BY seq LIMIT 10
+WAIT 30 SECONDS;
+
+UPDATE consumer SET last_seen = $2 WHERE name = 'mailer' AND last_seen = $1;
+COMMIT;
+```
+
+On read replicas, PostgreSQL 19's **`WAIT FOR LSN`** gives clients zero-polling read-your-writes consistency: wait for a replica to replay the master's commit position (`WAIT FOR LSN '0/00000005' WITH (TIMEOUT '1s')`) before running your read.
+
+See [SELECT ... WAIT](lexell/docs/lexdb/sql/postgresql/select-wait.md) and [WAIT FOR LSN](lexell/docs/lexdb/sql/postgresql/wait-for-lsn.md).
+
+### 3. Row pattern recognition with `MATCH_RECOGNIZE`
+
+SQL:2016 `MATCH_RECOGNIZE` lets you run regular-expression pattern matching directly over ordered sequences of rows — finding user sessions, V-shaped price reversals, gaps and islands, consecutive failure streaks, or fraud patterns in a single declarative query (`PARTITION BY`, `ORDER BY`, `PATTERN`, `DEFINE`, `MEASURES`, `SUBSET`, `PERMUTE`, `AFTER MATCH SKIP`).
+
+PostgreSQL 18 has no `MATCH_RECOGNIZE`; LexDB supports it in both the **PostgreSQL** and **Oracle** doors:
+
+```sql
+SELECT usr, sid, n, t0, t1
+FROM events MATCH_RECOGNIZE (
+  PARTITION BY usr ORDER BY ts
+  MEASURES match_number() AS sid, count(*) AS n, first(ts) AS t0, last(ts) AS t1
+  PATTERN (strt cont*)
+  DEFINE cont AS ts - prev(ts) <= 10
+) AS m;
+```
+
+See [MATCH_RECOGNIZE (PostgreSQL door)](lexell/docs/lexdb/sql/postgresql/match-recognize.md) and [MATCH_RECOGNIZE (Oracle door)](lexell/docs/lexdb/sql/oracle/match-recognize.md).
+
+### 4. SQL:2023 Property Graphs (`CREATE PROPERTY GRAPH` & `GRAPH_TABLE`)
+
+Define property graphs directly over your existing relational tables with zero data duplication and query multi-hop patterns, label expressions, and bounded paths using standard SQL/PGQ `GRAPH_TABLE` across all three doors. See [GRAPH_TABLE](lexell/docs/lexdb/sql/postgresql/graph-table.md).
+
+### 5. Incremental materialized views & data skipping indexes
+
+Keep precomputed rollups, cascading rollup DAGs, and HyperLogLog++ / t-digest sketches fresh in under a millisecond with automatic transparent query rewrite, and prune wide-table scans (including `LIKE '%substring%'`) with automatic zone maps and five skipping index types — see [Unlocking even more performance](#unlocking-even-more-performance) below.
 
 ---
 
@@ -136,5 +192,7 @@ psql -h 127.0.0.1 -p 5433 -U postgres lexdb
 | [Materialized views](lexell/docs/lexdb/materialized-views.md) | Incremental `FAST` updates, transparent query rewrite, real-time delta merging, sketches, and cascading DAGs. |
 | [Data skipping indexes](lexell/docs/lexdb/skipping-indexes.md) | When to use `minmax`/`brin`, `set`, `bloom_filter`, `ngrambf`, and `tokenbf` — with plain-English examples. |
 | [Read replicas](lexell/docs/lexdb/replicas.md) | Scaling reads across cores, per-door read-only routing, and `WAIT FOR LSN`. |
-| [Full LexDB documentation](lexell/docs/lexdb/README.md) | Architecture, transactions, security, bulk loading, assertions, and complete SQL references for all three doors. |
+| [Assertions](lexell/docs/lexdb/assertions.md) | SQL-standard `CREATE ASSERTION` enforced across PostgreSQL, SQL Server, and Oracle doors. |
+| [SELECT ... WAIT](lexell/docs/lexdb/sql/postgresql/select-wait.md) & [MATCH_RECOGNIZE](lexell/docs/lexdb/sql/postgresql/match-recognize.md) | Transactional event streams (`WAIT n SECONDS`) and SQL:2016 row pattern recognition. |
+| [Full LexDB documentation](lexell/docs/lexdb/README.md) | Architecture, transactions, security, bulk loading, property graphs, and complete SQL references for all three doors. |
 | [Internals & benchmark history](lexell/design/lexdb.md) | Storage engine internals ([lexdb.md](lexell/design/lexdb.md)) and the full historical benchmark log ([lexdb-benchmarks.md](lexell/design/lexdb-benchmarks.md)). |
