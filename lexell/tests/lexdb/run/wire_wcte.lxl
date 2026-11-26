@@ -1,0 +1,82 @@
+// lexdb_wire: PostgreSQL wire protocol (simple & extended query: Parse/Describe/Bind/Execute)
+// with data-modifying CTEs and bound parameters ($1, $2).
+// expect: simple_ins: 1|'alpha'
+// expect: simple_snap: 1|'alpha'
+// expect: prep_no_exec: 1
+// expect: prep_exec_1: id,name = 2|'beta'
+// expect: prep_exec_2: id,name = 3|'gamma'
+// expect: prep_final: 1|'alpha';2|'beta';3|'gamma'
+// expect: dml_main_affected: 2
+// expect: dml_main_archive: 1|'alpha';2|'beta'
+import "task"
+import "net"
+import "postgres"
+import "sqldialect"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+
+fn showRows(r: &postgres.Rows): str {
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() { append(mut &cells, r.value(i, j).unwrap().toStr()) }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&out, ";")
+}
+
+fn colNames(r: &postgres.Rows): str {
+    var cols: []str = []
+    for k in 0..r.columnCount() { append(mut &cols, r.columnName(k).unwrap()) }
+    return strings.join(&cols, ",")
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = s.start(lexdb_wire.acceptLoop, lexdb_wire.AcceptArg{ln: ln, st: st.share()})
+        var c = postgres.connect(&("postgres://postgres@127.0.0.1:" + addr[10..len(addr)] + "/lexdb?sslmode=disable")).unwrap()
+        c.exec("create table items (id int primary key, name text)").unwrap()
+        c.exec("create table items_arch (id int primary key, name text)").unwrap()
+        let none: []sqldialect.Value = []
+
+        let r1 = c.query("with ins as (insert into items values (1, 'alpha') returning id, name) select id, name from ins", &none).unwrap()
+        println("simple_ins: " + showRows(&r1))
+        let r2 = c.query("select id, name from items order by id", &none).unwrap()
+        println("simple_snap: " + showRows(&r2))
+
+        // Prepared statement with parameters (Parse + Describe does NOT execute the INSERT!)
+        let stmt = c.prepare("with ins as (insert into items values ($1, $2) returning id, name) select id, name from ins").unwrap()
+        let rNoExec = c.query("select count(*) from items", &none).unwrap()
+        println("prep_no_exec: " + showRows(&rNoExec))
+
+        let p1 = c.queryPrepared(&stmt, &[sqldialect.Value.Int(2), sqldialect.Value.Text("beta")]).unwrap()
+        println("prep_exec_1: " + colNames(&p1) + " = " + showRows(&p1))
+        let p2 = c.queryPrepared(&stmt, &[sqldialect.Value.Int(3), sqldialect.Value.Text("gamma")]).unwrap()
+        println("prep_exec_2: " + colNames(&p2) + " = " + showRows(&p2))
+        c.closePrepared(stmt).unwrap()
+
+        let rFinal = c.query("select id, name from items order by id", &none).unwrap()
+        println("prep_final: " + showRows(&rFinal))
+
+        // Data-modifying CTE feeding main INSERT via parameterized query
+        let rMove = c.query("with moved as (delete from items where id <= $1 returning id, name) insert into items_arch select id, name from moved", &[sqldialect.Value.Int(2)]).unwrap()
+        println("dml_main_affected: " + rMove.affected().toStr())
+        let rArch = c.query("select id, name from items_arch order by id", &none).unwrap()
+        println("dml_main_archive: " + showRows(&rArch))
+
+        c.close()
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(11), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

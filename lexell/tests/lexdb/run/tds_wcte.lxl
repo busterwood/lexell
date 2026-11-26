@@ -1,0 +1,136 @@
+// lexdb over TDS: data-modifying CTEs in SQL Server (T-SQL) door using native OUTPUT (INSERTED/DELETED/$action),
+// @variables, #temp tables, @table variables, MERGE (no trailing semicolon inside CTE), snapshot visibility,
+// BEGIN TRAN/ROLLBACK, IMPLICIT_TRANSACTIONS, FMTONLY, and error checks (OUTPUT INTO in CTE, UDF side effects,
+// non-top-level CTE, missing OUTPUT clause).
+// expect: setup: (3)
+// expect: del_output: id,val: 1|10;2|20
+// expect: del_after: id,val: 3|30
+// expect: ins_output: id,val: 10|100;11|110
+// expect: upd_output: old_v,new_v: 30|40
+// expect: snap_base: val: 40
+// expect: snap_after: val: 999
+// expect: merge_wcte: act,id,val: 'UPDATE'|3|300;'INSERT'|12|120
+// expect: move_rows: (2) / id,val: 10|100;11|110
+// expect: var_assign: (1) / (1) / : 305
+// expect: tv_wcte: id,val: 1|42
+// expect: unref_runs: : 1 / : 1
+// expect: tx_rollback: id: 3 / id,val: 3|305;12|120
+// expect: implicit_tx_rb: id,val: 3|305;12|120
+// expect: fmtonly_cols: id,val: 
+// expect: fmtonly_no_exec: : 2
+// expect: err_out_into: error
+// expect: err_udf: error 443
+// expect: err_no_out: error
+// expect: err_nested: error
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+fn rows(r: &sqlserver.Rows): str {
+    var names: []str = []
+    for j in 0..r.columnCount() { append(mut &names, r.columnName(j).unwrap()) }
+    var out: []str = []
+    for i in 0..r.rowCount() {
+        var cells: []str = []
+        for j in 0..r.columnCount() {
+            match r.value(i, j) {
+                Ok(v) { append(mut &cells, v.toStr()) }
+                Err(e) { append(mut &cells, "error " + e.code.toStr()) }
+            }
+        }
+        append(mut &out, strings.join(&cells, "|"))
+    }
+    return strings.join(&names, ",") + ": " + strings.join(&out, ";")
+}
+
+fn show(c: mut &sqlserver.Conn, label: str, q: str) {
+    match c.queryAll(&q, &[]) {
+        Ok(r) {
+            var parts: []str = []
+            var shown = 0
+            for n in r.counts {
+                if n.resultSet >= 0 {
+                    append(mut &parts, rows(&r.sets[n.resultSet]))
+                    shown += 1
+                } else {
+                    append(mut &parts, "(" + n.rows.toStr() + ")")
+                }
+            }
+            if shown == 0 { for s in r.sets { append(mut &parts, rows(&s)) } }
+            println(label + ": " + (if len(parts) == 0 { "ok" } else { strings.join(&parts, " / ") }))
+        }
+        Err(e) { println(label + ": error" + (if e.code == 443 { " 443" } else { "" })) }
+    }
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = s.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        var c = sqlserver.connect(&("Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no")).unwrap()
+
+        show(mut &c, "setup", "CREATE TABLE dbo.t (id int PRIMARY KEY, val int); CREATE TABLE dbo.arch (id int PRIMARY KEY, val int); INSERT INTO dbo.t VALUES (1, 10), (2, 20), (3, 30);")
+        show(mut &c, "del_output", "WITH d AS (DELETE FROM dbo.t OUTPUT DELETED.id, DELETED.val WHERE id <= 2) SELECT id, val FROM d ORDER BY id;")
+        show(mut &c, "del_after", "SELECT id, val FROM dbo.t ORDER BY id;")
+        show(mut &c, "ins_output", "WITH i AS (INSERT INTO dbo.t OUTPUT INSERTED.id, INSERTED.val VALUES (10, 100), (11, 110)) SELECT id, val FROM i ORDER BY id;")
+        show(mut &c, "upd_output", "WITH u AS (UPDATE dbo.t SET val = val + 10 OUTPUT DELETED.val AS old_v, INSERTED.val AS new_v WHERE id = 3) SELECT old_v, new_v FROM u;")
+
+        // Snapshot visibility: outer SELECT sees pre-statement value
+        show(mut &c, "snap_base", "WITH u AS (UPDATE dbo.t SET val = 999 OUTPUT INSERTED.val WHERE id = 3) SELECT val FROM dbo.t WHERE id = 3;")
+        show(mut &c, "snap_after", "SELECT val FROM dbo.t WHERE id = 3;")
+
+        // MERGE inside CTE (no trailing semicolon required before ')')
+        show(mut &c, "merge_wcte", "WITH m AS (MERGE dbo.t AS tgt USING (VALUES (3, 300), (12, 120)) AS src(id, val) ON tgt.id = src.id WHEN MATCHED THEN UPDATE SET val = src.val WHEN NOT MATCHED THEN INSERT (id, val) VALUES (src.id, src.val) OUTPUT $action AS act, INSERTED.id, INSERTED.val) SELECT act, id, val FROM m ORDER BY id;")
+
+        // Move rows via DELETE CTE -> INSERT INTO archive
+        show(mut &c, "move_rows", "WITH moved AS (DELETE FROM dbo.t OUTPUT DELETED.id, DELETED.val WHERE id IN (10, 11)) INSERT INTO dbo.arch SELECT id, val FROM moved; SELECT id, val FROM dbo.arch ORDER BY id;")
+
+        // @variables + SELECT @v = ... from modifying CTE
+        show(mut &c, "var_assign", "DECLARE @inc int = 5, @res int; WITH u AS (UPDATE dbo.t SET val = val + @inc OUTPUT INSERTED.val WHERE id = 3) SELECT @res = val FROM u; SELECT @res;")
+
+        // @table variable as target of data-modifying CTE
+        show(mut &c, "tv_wcte", "DECLARE @tv TABLE (id int, val int); WITH i AS (INSERT INTO @tv OUTPUT INSERTED.id, INSERTED.val VALUES (1, 42)) SELECT id, val FROM i;")
+
+        // Unreferenced modifying CTE without OUTPUT still executes
+        show(mut &c, "unref_runs", "CREATE TABLE dbo.side (x int); WITH i AS (INSERT INTO dbo.side VALUES (7)) SELECT 1; SELECT COUNT(*) FROM dbo.side;")
+
+        // BEGIN TRAN / ROLLBACK undoes wCTE writes
+        show(mut &c, "tx_rollback", "BEGIN TRAN; WITH d AS (DELETE FROM dbo.t OUTPUT DELETED.id WHERE id = 3) SELECT id FROM d; ROLLBACK; SELECT id, val FROM dbo.t ORDER BY id;")
+
+        // SET IMPLICIT_TRANSACTIONS ON starts a transaction for modifying CTE even with SELECT 1
+        c.queryAll("SET IMPLICIT_TRANSACTIONS ON;", &[]).unwrap()
+        c.queryAll("WITH d AS (DELETE FROM dbo.t WHERE id = 3) SELECT 1;", &[]).unwrap()
+        c.queryAll("ROLLBACK;", &[]).unwrap()
+        c.queryAll("SET IMPLICIT_TRANSACTIONS OFF;", &[]).unwrap()
+        show(mut &c, "implicit_tx_rb", "SELECT id, val FROM dbo.t ORDER BY id;")
+
+        // SET FMTONLY ON describes without executing
+        c.queryAll("SET FMTONLY ON;", &[]).unwrap()
+        show(mut &c, "fmtonly_cols", "WITH i AS (INSERT INTO dbo.t OUTPUT INSERTED.id, INSERTED.val VALUES (99, 999)) SELECT id, val FROM i;")
+        c.queryAll("SET FMTONLY OFF;", &[]).unwrap()
+        show(mut &c, "fmtonly_no_exec", "SELECT COUNT(*) FROM dbo.t;")
+
+        // Error cases
+        show(mut &c, "err_out_into", "DECLARE @tv TABLE (id int); WITH i AS (INSERT INTO dbo.t OUTPUT INSERTED.id INTO @tv VALUES (50, 50)) SELECT 1;")
+        show(mut &c, "err_udf", "CREATE FUNCTION dbo.bad_fn() RETURNS int AS BEGIN DECLARE @r int; WITH d AS (DELETE FROM dbo.t OUTPUT DELETED.id) SELECT @r = COUNT(*) FROM d; RETURN @r; END;")
+        show(mut &c, "err_no_out", "WITH d AS (DELETE FROM dbo.t WHERE id = 999) SELECT * FROM d;")
+        show(mut &c, "err_nested", "SELECT * FROM (WITH d AS (DELETE FROM dbo.t OUTPUT DELETED.id) SELECT * FROM d) AS sub;")
+
+        c.close()
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(43), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

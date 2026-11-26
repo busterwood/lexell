@@ -1,0 +1,323 @@
+// lexdb_exec: PostgreSQL data-modifying CTEs (WITH name AS (INSERT|UPDATE|DELETE|MERGE ... [RETURNING ...]) ...).
+// Covers: INSERT/UPDATE/DELETE/MERGE in WITH; SELECT/VALUES/INSERT/UPDATE/DELETE/MERGE main statements;
+// snapshot visibility (pre-statement state both in autocommit and inside BEGIN blocks); run-once & run-to-completion
+// (unreferenced, LIMIT, WHERE false, multi-reference, shared volatile SELECT CTE); chaining & WITH RECURSIVE;
+// PK reuse & duplicate PK rollback; same-row double modification + secondary index integrity; column aliases;
+// RETURNING WITH (OLD/NEW); INSERT ON CONFLICT DO UPDATE; foreign keys (parent/child orderings & deferred end-of-statement);
+// CREATE ASSERTION; incremental MATERIALIZED VIEW; EXPLAIN & EXPLAIN ANALYZE; Describe without execution;
+// READ ONLY transaction enforcement (permanent vs TEMP tables); SAVEPOINT / ROLLBACK; and all PG error cases.
+// expect: setup -> OK
+// expect: ins_ret -> 10|fig|50
+// expect: ins_verify -> 1|apple|10; 2|banana|20; 3|cherry|30; 10|fig|50
+// expect: upd_snap_table -> 1|10; 2|20; 3|30; 10|50
+// expect: upd_snap_after -> 1|20; 2|40; 3|60; 10|100
+// expect: upd_ret -> 1|25; 2|45; 3|65; 10|105
+// expect: ins_snap_count -> 4
+// expect: ins_snap_after -> 5
+// expect: del_snap_count -> 5
+// expect: del_snap_after -> 4
+// expect: move_rows -> INSERT 0 2
+// expect: move_products -> 2|banana|45; 3|cherry|65
+// expect: move_archive -> 1|apple|25; 10|fig|105
+// expect: tag_only_main -> DELETE 1
+// expect: tag_verify_foo -> 0
+// expect: tag_verify_bar -> 1
+// expect: unref_no_ret -> 1
+// expect: unref_verify -> 1
+// expect: unref_with_ret -> 1
+// expect: unref_with_ret_verify -> 2|banana|999; 3|cherry|999
+// expect: limit_runs_all -> 1
+// expect: limit_verify_all -> 2|1000; 3|1000
+// expect: where_false_runs -> SELECT 0
+// expect: where_false_verify -> 2|banana|1000; 3|cherry|1000; 40|date|40
+// expect: multi_ref -> 2|2; 2|3; 3|3
+// expect: shared_volatile -> 1|1
+// expect: shared_volatile_seq -> 1
+// expect: chain_cte -> 1|2|banana|1000; 1|3|cherry|1000
+// expect: rec_and_dml -> 15
+// expect: rec_verify -> 1; 2; 3; 4; 5
+// expect: pk_reuse -> 1; 2; 3; 4; 5
+// expect: pk_reuse_verify -> 5
+// expect: dup_pk_err -> 23505 duplicate key value violates unique constraint "nums_pkey"
+// expect: dup_pk_rollback -> 5
+// expect: self_mod_double -> 1|0
+// expect: self_mod_val -> 1|100
+// expect: self_mod_idx -> 1
+// expect: col_aliases -> 20|grape
+// expect: old_new_ret -> 40|45
+// expect: on_conflict_wcte -> 20|grape-upd; 21|kiwi
+// expect: merge_wcte -> UPDATE|20|99; INSERT|22|22
+// expect: wcte_values_main -> f
+// expect: wcte_values_verify -> 0
+// expect: tx_snap_mid -> 1|10; 2|20
+// expect: tx_snap_after -> 1|10; 2|20; 3|30
+// expect: tx_rollback -> 1|10
+// expect: tx_savepoint -> 1|10
+// expect: fk_ins_parent_child -> INSERT 0 1
+// expect: fk_ins_verify -> 1|100|1
+// expect: fk_del_parent_then_child -> DELETE 1
+// expect: fk_del_verify -> 0|0
+// expect: fk_fail_rollback -> 23503 insert or update on table "ch" violates foreign key constraint "ch_pid_fkey"
+// expect: fk_fail_verify -> 0
+// expect: assert_ok -> INSERT 0 1
+// expect: assert_fail -> 23514 assertion "positive_bal" is violated
+// expect: assert_after -> 1|100
+// expect: mv_after_wcte -> 1|150
+// expect: explain_no_exec -> 3
+// expect: explain_analyze_exec -> 4
+// expect: describe_cols -> id,name
+// expect: describe_no_exec -> 4
+// expect: ro_perm_err -> 25006 cannot execute INSERT in a read-only transaction
+// expect: ro_temp_ok -> 1|tmp
+// expect: err_self_ref_from -> 42P19 recursive query "t" must not contain data-modifying statements
+// expect: err_self_ref_ret -> 42P19 recursive query "t" must not contain data-modifying statements
+// expect: err_no_ret_ref -> 0A000 WITH query "t" does not have a RETURNING clause
+// expect: err_nested_sub -> 0A000 WITH clause containing a data-modifying statement must be at the top level
+// expect: err_ins_with -> 0A000 WITH clause containing a data-modifying statement must be at the top level
+// expect: err_view -> 0A000 views must not contain data-modifying statements in WITH
+// expect: err_ctas -> 0A000 WITH clause containing a data-modifying statement must be at the top level
+// expect: err_too_many_cols -> 42P10 WITH query "t" has 1 columns available but 2 columns specified
+// expect: err_no_ret_cols -> 42P10 WITH query "t" has 0 columns available but 1 columns specified
+// expect: err_search -> 42601 WITH query is not recursive
+// expect: err_dup_name -> 42712 WITH query name "t" specified more than once
+// expect: batch_off_snap -> 1|10; 2|20
+// expect: batch_off_after -> 1|11; 2|21
+// expect: main_upd_from_wcte -> 2|30
+// expect: main_del_using_wcte -> 2
+// expect: main_merge_using_wcte -> UPDATE|1|110; INSERT|3|300
+// expect: rc_snap -> 1|110; 3|300
+// expect: rc_after -> 1|111; 3|301
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_ops"
+import "../../../cmd/lexdb_sql"
+import "../../../cmd/lexdb_parse"
+import "strings"
+
+fn run(s: mut &lexdb_exec.Session, label: str, sql: str) {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            var lines: []str = []
+            for row in r.rows {
+                var cells: []str = []
+                for v in row { append(mut &cells, if lexdb_ops.isNull(&v) { "NULL" } else { lexdb_sql.text(&v) }) }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            println(label + " -> " + (if len(lines) == 0 { r.tag.clone() } else { strings.join(&lines, "; ") }))
+        }
+        Err(e) { println(label + " -> " + e.state + " " + e.msg) }
+    }
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(7), lexdb_store.Options{cacheBytes: 128 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st)
+        s.exec("create table products (id int primary key, name text, price int)").unwrap()
+        s.exec("create table archive (id int primary key, name text, price int)").unwrap()
+        s.exec("insert into products values (1, 'apple', 10), (2, 'banana', 20), (3, 'cherry', 30)").unwrap()
+        s.exec("create table foo (x int)").unwrap()
+        s.exec("create table bar (x int)").unwrap()
+        s.exec("insert into foo values (1), (2)").unwrap()
+        s.exec("insert into bar values (1), (2)").unwrap()
+        println("setup -> OK")
+
+        // Basic INSERT ... RETURNING
+        run(mut &s, "ins_ret", "with ins as (insert into products values (10, 'fig', 50) returning *) select id, name, price from ins")
+        run(mut &s, "ins_verify", "select id, name, price from products order by id")
+
+        // Snapshot visibility: UPDATE in WITH, outer SELECT reads base table vs CTE
+        run(mut &s, "upd_snap_table", "with u as (update products set price = price * 2 returning *) select id, price from products order by id")
+        run(mut &s, "upd_snap_after", "select id, price from products order by id")
+        run(mut &s, "upd_ret", "with u as (update products set price = price + 5 returning *) select id, price from u order by id")
+
+        // Snapshot visibility: INSERT in WITH, outer SELECT does not see new row
+        run(mut &s, "ins_snap_count", "with i as (insert into products values (11, 'plum', 60) returning *) select count(*) from products")
+        run(mut &s, "ins_snap_after", "select count(*) from products")
+
+        // Snapshot visibility: DELETE in WITH, outer SELECT still sees deleted row
+        run(mut &s, "del_snap_count", "with d as (delete from products where id = 11 returning *) select count(*) from products")
+        run(mut &s, "del_snap_after", "select count(*) from products")
+
+        // Move rows: DELETE in WITH -> INSERT INTO archive
+        run(mut &s, "move_rows", "with moved as (delete from products where id in (1, 10) returning *) insert into archive select * from moved")
+        run(mut &s, "move_products", "select id, name, price from products order by id")
+        run(mut &s, "move_archive", "select id, name, price from archive order by id")
+
+        // Command tag comes ONLY from main statement; CTE without RETURNING still runs
+        run(mut &s, "tag_only_main", "with t as (delete from foo) delete from bar where x = 1")
+        run(mut &s, "tag_verify_foo", "select count(*) from foo")
+        run(mut &s, "tag_verify_bar", "select count(*) from bar")
+
+        // Unreferenced CTE without RETURNING still executes
+        run(mut &s, "unref_no_ret", "with t as (insert into foo values (42)) select 1")
+        run(mut &s, "unref_verify", "select count(*) from foo")
+
+        // Unreferenced CTE WITH RETURNING still executes
+        run(mut &s, "unref_with_ret", "with u as (update products set price = 999 returning *) select 1")
+        run(mut &s, "unref_with_ret_verify", "select id, name, price from products order by id")
+
+        // Outer LIMIT 1 still executes CTE to completion
+        run(mut &s, "limit_runs_all", "with u as (update products set price = price + 1 returning *) select count(*) from (select * from u limit 1) sub")
+        run(mut &s, "limit_verify_all", "select id, price from products order by id")
+
+        // Outer WHERE false still executes CTE
+        run(mut &s, "where_false_runs", "with i as (insert into products values (40, 'date', 40) returning *) select * from i where false")
+        run(mut &s, "where_false_verify", "select id, name, price from products order by id")
+
+        // Multi-reference to modifying CTE runs DML once and shares cached RETURNING rows
+        run(mut &s, "multi_ref", "with d as (delete from products where id in (2, 3) returning id) select a.id, b.id from d a join d b on a.id <= b.id order by 1, 2")
+
+        // Shared volatile SELECT CTE referenced by both modifying CTE and main SELECT
+        s.exec("create sequence wseq").unwrap()
+        s.exec("create table seqt (v int)").unwrap()
+        run(mut &s, "shared_volatile", "with s as (select nextval('wseq') as v), i as (insert into seqt select v from s returning v) select s.v, i.v from s, i")
+        run(mut &s, "shared_volatile_seq", "select count(*) from seqt")
+
+        // Chained CTEs: modifying CTE -> modifying CTE -> SELECT CTE -> main SELECT
+        s.exec("insert into products values (2, 'banana', 1000), (3, 'cherry', 1000)").unwrap()
+        s.exec("create table stage2 (id int primary key, name text, price int)").unwrap()
+        run(mut &s, "chain_cte", "with d as (delete from products where id in (2, 3) returning *), i as (insert into stage2 select * from d returning *), s as (select 1 as tag, id, name, price from i) select tag, id, name, price from s order by id")
+
+        // WITH RECURSIVE combining recursive SELECT CTE and data-modifying CTE
+        s.exec("create table nums (n int primary key)").unwrap()
+        run(mut &s, "rec_and_dml", "with recursive r(n) as (select 1 union all select n + 1 from r where n < 5), ins as (insert into nums select n from r returning n) select sum(n) from ins")
+        run(mut &s, "rec_verify", "select n from nums order by n")
+
+        // Delete & re-insert same primary keys in one statement
+        run(mut &s, "pk_reuse", "with d as (delete from nums returning n) insert into nums select n from d returning n")
+        run(mut &s, "pk_reuse_verify", "select count(*) from nums")
+
+        // Duplicate PK across two modifying CTEs fails and rolls back BOTH
+        run(mut &s, "dup_pk_err", "with a as (insert into nums values (99) returning n), b as (insert into nums values (99) returning n) select * from a union all select * from b")
+        run(mut &s, "dup_pk_rollback", "select count(*) from nums")
+
+        // Same-row double modification + secondary index integrity
+        s.exec("create table sm (id int primary key, v int)").unwrap()
+        s.exec("create index sm_v on sm (v)").unwrap()
+        s.exec("insert into sm values (1, 10)").unwrap()
+        run(mut &s, "self_mod_double", "with u1 as (update sm set v = 100 where id = 1 returning *), u2 as (update sm set v = 200 where id = 1 returning *) select (select count(*) from u1), (select count(*) from u2)")
+        run(mut &s, "self_mod_val", "select id, v from sm where id = 1")
+        run(mut &s, "self_mod_idx", "select count(*) from sm where v = 100")
+
+        // Explicit column alias list on modifying CTE
+        run(mut &s, "col_aliases", "with ins(x, y) as (insert into products values (20, 'grape', 20) returning id, name) select x, y from ins")
+
+        // RETURNING WITH (OLD/NEW) inside modifying CTE
+        run(mut &s, "old_new_ret", "with u as (update products set price = 45 where id = 40 returning with (old as o, new as n) o.price as old_p, n.price as new_p) select old_p, new_p from u")
+
+        // INSERT ... ON CONFLICT DO UPDATE RETURNING inside modifying CTE
+        run(mut &s, "on_conflict_wcte", "with up as (insert into products values (20, 'grape-upd', 25), (21, 'kiwi', 21) on conflict (id) do update set name = excluded.name, price = excluded.price returning id, name) select id, name from up order by id")
+
+        // MERGE ... RETURNING merge_action() inside modifying CTE
+        run(mut &s, "merge_wcte", "with m as (merge into products p using (values (20, 'g2', 99), (22, 'lime', 22)) v(id, name, price) on p.id = v.id when matched then update set price = v.price when not matched then insert values (v.id, v.name, v.price) returning merge_action() as act, p.id, p.price) select act, id, price from m order by id")
+
+        // WITH ... VALUES main statement
+        run(mut &s, "wcte_values_main", "with d as (delete from foo) values (false)")
+        run(mut &s, "wcte_values_verify", "select count(*) from foo")
+
+        // Snapshot visibility inside BEGIN block (baseMark > 0) + ROLLBACK + SAVEPOINT
+        s.exec("create table tx (id int primary key, v int)").unwrap()
+        s.exec("insert into tx values (1, 10)").unwrap()
+        s.exec("begin").unwrap()
+        s.exec("insert into tx values (2, 20)").unwrap()
+        run(mut &s, "tx_snap_mid", "with i as (insert into tx values (3, 30) returning *) select id, v from tx order by id")
+        run(mut &s, "tx_snap_after", "select id, v from tx order by id")
+        s.exec("rollback").unwrap()
+        run(mut &s, "tx_rollback", "select id, v from tx order by id")
+
+        s.exec("begin").unwrap()
+        s.exec("savepoint sp1").unwrap()
+        s.exec("with i as (insert into tx values (9, 90) returning *) select * from i").unwrap()
+        s.exec("rollback to savepoint sp1").unwrap()
+        s.exec("commit").unwrap()
+        run(mut &s, "tx_savepoint", "select id, v from tx order by id")
+
+        // Foreign keys: parent in CTE + child in main; delete parent in CTE + child in main; FK failure rollback
+        s.exec("create table par (id int primary key)").unwrap()
+        s.exec("create table ch (id int primary key, pid int references par(id))").unwrap()
+        run(mut &s, "fk_ins_parent_child", "with p as (insert into par values (1) returning id) insert into ch select 100, id from p")
+        run(mut &s, "fk_ins_verify", "select par.id, ch.id, ch.pid from par join ch on ch.pid = par.id")
+        run(mut &s, "fk_del_parent_then_child", "with dp as (delete from par where id = 1 returning id) delete from ch where pid in (select id from dp)")
+        run(mut &s, "fk_del_verify", "select (select count(*) from par), (select count(*) from ch)")
+        run(mut &s, "fk_fail_rollback", "with p as (insert into par values (5) returning id) insert into ch values (200, 999)")
+        run(mut &s, "fk_fail_verify", "select count(*) from par")
+
+        // CREATE ASSERTION across modifying CTE
+        s.exec("create table acct (id int primary key, bal int)").unwrap()
+        s.exec("insert into acct values (1, 100)").unwrap()
+        s.exec("create assertion positive_bal check (not exists (select 1 from acct where bal < 0))").unwrap()
+        run(mut &s, "assert_ok", "with u as (update acct set bal = bal - 50 where id = 1 returning id) insert into foo select id from u")
+        s.exec("update acct set bal = 100 where id = 1").unwrap()
+        run(mut &s, "assert_fail", "with u as (update acct set bal = -10 where id = 1 returning *) select * from u")
+        run(mut &s, "assert_after", "select id, bal from acct")
+
+        // Incremental MATERIALIZED VIEW stays in sync with modifying CTE
+        s.exec("create materialized view mv_acct refresh fast on commit as select id, sum(bal) as s from acct group by id").unwrap()
+        s.exec("with u as (update acct set bal = 150 where id = 1 returning *) select * from u").unwrap()
+        run(mut &s, "mv_after_wcte", "select id, s from mv_acct")
+
+        // EXPLAIN does not execute DML; EXPLAIN ANALYZE executes DML
+        s.exec("create table ex (id int primary key, name text)").unwrap()
+        s.exec("insert into ex values (1, 'a'), (2, 'b'), (3, 'c')").unwrap()
+        s.exec("explain with i as (insert into ex values (4, 'd') returning *) select * from i").unwrap()
+        run(mut &s, "explain_no_exec", "select count(*) from ex")
+        s.exec("explain analyze with i as (insert into ex values (4, 'd') returning *) select * from i").unwrap()
+        run(mut &s, "explain_analyze_exec", "select count(*) from ex")
+
+        // Describe describes columns WITHOUT executing DML
+        let parsed = lexdb_parse.parse("with i as (insert into ex values (5, 'e') returning id, name) select id, name from i").unwrap()
+        let cols = s.describe(&parsed[0], &[]).unwrap()
+        var cnames: []str = []
+        for c in cols { append(mut &cnames, c.name.clone()) }
+        println("describe_cols -> " + strings.join(&cnames, ","))
+        run(mut &s, "describe_no_exec", "select count(*) from ex")
+
+        // READ ONLY transaction: permanent table refused, TEMP table allowed
+        s.exec("create temp table tmp_w (id int primary key, name text)").unwrap()
+        s.exec("begin read only").unwrap()
+        run(mut &s, "ro_perm_err", "with i as (insert into ex values (99, 'z') returning *) select * from i")
+        s.exec("rollback").unwrap()
+        s.exec("begin read only").unwrap()
+        run(mut &s, "ro_temp_ok", "with i as (insert into tmp_w values (1, 'tmp') returning *) select id, name from i")
+        s.exec("commit").unwrap()
+
+        // Error cases
+        run(mut &s, "err_self_ref_from", "with recursive t as (insert into ex select * from t) values (false)")
+        run(mut &s, "err_self_ref_ret", "with recursive t(a, b) as (merge into ex using (values (11, 'k')) v(id, name) on ex.id = v.id when not matched then insert values (v.id, v.name) returning merge_action(), (select a from t)) select * from t")
+        run(mut &s, "err_no_ret_ref", "with t as (insert into ex values (50, 'x')) select * from t")
+        run(mut &s, "err_nested_sub", "select * from (with t as (update ex set name = 'x' returning *) select * from t) ss")
+        run(mut &s, "err_ins_with", "insert into ex with t as (delete from ex returning *) select * from t")
+        run(mut &s, "err_view", "create view bad_v as with t as (delete from ex returning *) select * from t")
+        run(mut &s, "err_ctas", "create table bad_t as with t as (delete from ex returning *) select * from t")
+        run(mut &s, "err_too_many_cols", "with t(a, b) as (insert into ex values (60, 'y') returning id) select * from t")
+        run(mut &s, "err_no_ret_cols", "with t(a) as (insert into ex values (60, 'y')) select 1")
+        run(mut &s, "err_search", "with recursive t(a) as (insert into ex values (60, 'y') returning id) search depth first by a set ord select * from t")
+        run(mut &s, "err_dup_name", "with t as (insert into ex values (60, 'y') returning id), t as (select 1) select * from t")
+
+        // Verify with lexdb_batch = off (row engine)
+        s.exec("set lexdb_batch = off").unwrap()
+        s.exec("create table bo (id int primary key, v int)").unwrap()
+        s.exec("insert into bo values (1, 10), (2, 20)").unwrap()
+        run(mut &s, "batch_off_snap", "with u as (update bo set v = v + 1 returning *) select id, v from bo order by id")
+        run(mut &s, "batch_off_after", "select id, v from bo order by id")
+
+        // Main statement UPDATE FROM wcte, DELETE USING wcte, MERGE USING wcte, and READ COMMITTED
+        s.exec("set lexdb_batch = on").unwrap()
+        s.exec("create table src_m (id int primary key, v int)").unwrap()
+        s.exec("create table dst_m (id int primary key, v int)").unwrap()
+        s.exec("insert into src_m values (1, 100), (2, 20), (3, 300)").unwrap()
+        s.exec("insert into dst_m values (1, 10), (2, 10)").unwrap()
+        run(mut &s, "main_upd_from_wcte", "with d as (delete from src_m where id = 2 returning id, v) update dst_m set v = dst_m.v + d.v from d where dst_m.id = d.id returning dst_m.id, dst_m.v")
+        run(mut &s, "main_del_using_wcte", "with i as (insert into src_m values (2, 20) returning id) delete from dst_m using i where dst_m.id = i.id returning dst_m.id")
+        run(mut &s, "main_merge_using_wcte", "with d as (delete from src_m where id in (1, 3) returning id, v) merge into dst_m using d on dst_m.id = d.id when matched then update set v = dst_m.v + d.v when not matched then insert values (d.id, d.v) returning merge_action(), dst_m.id, dst_m.v")
+        s.exec("begin isolation level read committed").unwrap()
+        run(mut &s, "rc_snap", "with u as (update dst_m set v = v + 1 returning *) select id, v from dst_m order by id")
+        s.exec("commit").unwrap()
+        run(mut &s, "rc_after", "select id, v from dst_m order by id")
+
+        return 0
+    }).unwrap()
+}

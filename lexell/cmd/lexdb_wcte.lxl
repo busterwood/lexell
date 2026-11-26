@@ -1,0 +1,139 @@
+// lexdb_wcte: data-modifying CTEs (WITH name AS (INSERT|UPDATE|DELETE|MERGE ... [RETURNING|OUTPUT ...]) ...).
+//
+// Each data-modifying CTE executes once and to completion in declaration order
+// before the main statement. All reads across the CTEs and the main statement
+// see the pre-statement state (txn.visCap = baseMark), while writes, conflict
+// checks, and end-of-statement foreign key checks see live writes (txn.visCap = -1).
+// Changes pass between CTEs and the main statement solely via RETURNING / OUTPUT.
+
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_bind"
+import "./lexdb_store"
+import "strings"
+
+pub const MARK: str = "#wcte:"
+
+pub fn isRef(srf: &str): bool {
+    return strings.startsWith(srf, MARK)
+}
+
+pub fn refId(srf: &str): int {
+    return strings.parseIntOpt(&srf[len(MARK)..len(srf)]).unwrapOr(-1)
+}
+
+// Negative Scope.works id so modifying CTE column schemas never collide with recursive CTE work ids (>= 0).
+pub fn workId(id: int): int { return -(id + 1) }
+
+pub fn cacheKey(id: int): str { return "c" + id.toStr() }
+
+pub fn hasWctes(s: &lexdb_sql.Stmt): bool { return len(s.wctes) > 0 }
+
+pub fn firstWriteKind(s: &lexdb_sql.Stmt): int {
+    if len(s.wctes) > 0 { return s.wctes[0].stmt.kind }
+    return s.kind
+}
+
+// Whether every write target of s (all its modifying CTEs, plus s itself if s writes) satisfies check(table).
+pub fn allWriteTargets(s: &lexdb_sql.Stmt, mainWrites: bool, check: &fn(&str): bool): bool {
+    for w in s.wctes {
+        if !check(&w.stmt.table) { return false }
+    }
+    if mainWrites { return check(&s.table) }
+    return true
+}
+
+// Converts OutCol descriptors to ColDef descriptors for Scope.works storage.
+pub fn colsToDefs(cols: &[]lexdb_bind.OutCol): []lexdb_sql.ColDef {
+    var out: []lexdb_sql.ColDef = []
+    for c in cols {
+        var ty = lexdb_sql.oidType(c.oid)
+        if c.scale >= 0 && ty.kind == lexdb_sql.K_NUM { ty.scale = c.scale }
+        var d = lexdb_sql.colDef(&c.name, ty, false)
+        d.spell = c.spell.clone()
+        d.coll = c.coll.clone()
+        append(mut &out, d)
+    }
+    return out
+}
+
+// Converts ColDef descriptors from Scope.works back to OutCol descriptors for planSubIn.
+pub fn defsToCols(defs: &[]lexdb_sql.ColDef): []lexdb_bind.OutCol {
+    var out: []lexdb_bind.OutCol = []
+    for d in defs {
+        let sc = if d.typ.kind == lexdb_sql.K_NUM && d.typ.scale > 0 { d.typ.scale } else { -1 }
+        append(mut &out, lexdb_bind.OutCol{name: d.name.clone(), oid: d.typ.oid, spell: d.spell.clone(), coll: d.coll.clone(), scale: sc})
+    }
+    return out
+}
+
+// Applies a modifying CTE's explicit column alias list (WITH name(c1, c2) AS (...)) and checks column count.
+pub fn applyAliases(w: &lexdb_sql.Wcte, cols: &[]lexdb_bind.OutCol): Result[[]lexdb_bind.OutCol, lexdb_base.DbErr] {
+    if len(w.cols) > len(cols) {
+        return Err(lexdb_base.err("42P10", &("WITH query \"" + w.name + "\" has " + len(cols).toStr() + " columns available but " + len(w.cols).toStr() + " columns specified")))
+    }
+    var out: []lexdb_bind.OutCol = []
+    for i in 0..len(cols) {
+        var c = cols[i].clone()
+        if i < len(w.cols) {
+            c.name = w.cols[i].clone()
+            if i < len(w.spells) && len(w.spells[i]) > 0 { c.spell = w.spells[i].clone() } else { c.spell = "" }
+        }
+        append(mut &out, c)
+    }
+    return Ok(out)
+}
+
+pub fn wcteVerb(kind: int): str {
+    return match kind {
+        lexdb_sql.S_INSERT { "INSERT" }
+        lexdb_sql.S_UPDATE { "UPDATE" }
+        lexdb_sql.S_DELETE { "DELETE" }
+        lexdb_sql.S_MERGE { "MERGE" }
+        else { "DML" }
+    }
+}
+
+pub fn explainHeader(w: &lexdb_sql.Wcte): str {
+    return "CTE " + w.name + " (" + wcteVerb(w.stmt.kind) + " " + lexdb_sql.shown(&w.stmt.table) + ")"
+}
+
+pub const PHASE_MAIN: int = -1
+pub const PHASE_FK: int = -2
+
+// Runs every data-modifying CTE in order (phase = 0..len(s.wctes)-1), then the main statement (PHASE_MAIN),
+// then end-of-statement FK checks (PHASE_FK). Restores txn.visCap and rolls back partial writes on error.
+pub fn runAll(txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
+              step: &fn(mut &lexdb_store.Txn, int, int): Result[Unit, lexdb_base.DbErr]): Result[Unit, lexdb_base.DbErr] {
+    let baseMark = txn.mark()
+    let prevVis = txn.visCap
+    for i in 0..len(s.wctes) {
+        match step(txn, i, baseMark) {
+            Ok(_) {}
+            Err(x) {
+                txn.visCap = prevVis
+                txn.undoTo(baseMark)
+                return Err(x)
+            }
+        }
+    }
+    match step(txn, PHASE_MAIN, baseMark) {
+        Ok(_) {}
+        Err(x) {
+            txn.visCap = prevVis
+            txn.undoTo(baseMark)
+            return Err(x)
+        }
+    }
+    txn.visCap = -1
+    match step(txn, PHASE_FK, baseMark) {
+        Ok(_) {}
+        Err(x) {
+            txn.visCap = prevVis
+            txn.undoTo(baseMark)
+            return Err(x)
+        }
+    }
+    txn.visCap = prevVis
+    return Ok(Unit{})
+}

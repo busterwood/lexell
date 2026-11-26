@@ -1627,7 +1627,8 @@ pub fn statementKind(sql: &str): int {
     var j = i
     while j < n && ((sql[j] >= 'a' && sql[j] <= 'z') || (sql[j] >= 'A' && sql[j] <= 'Z')) { j += 1 }
     let w = strings.toUpperAscii(&sql[min(i, n)..j])
-    if w == "SELECT" || w == "WITH" { return S_QUERY }
+    if w == "SELECT" { return S_QUERY }
+    if w == "WITH" { return withKind(sql, j) }
     if w == "INSERT" || w == "UPDATE" || w == "DELETE" || w == "MERGE" { return S_DML }
     if w == "BEGIN" || w == "DECLARE" || w == "CALL" { return S_PLSQL }
     if w == "CREATE" || w == "ALTER" || w == "DROP" || w == "GRANT" || w == "REVOKE" || w == "ANALYZE" || w == "AUDIT" ||
@@ -1688,6 +1689,53 @@ pub type Site = value record { pub name: str; pub returning: bool; pub start: in
 // PL/SQL) and where RETURNING ... INTO's INTO starts (-1: none).
 pub type Sites = value record { pub sites: []Site; pub into: int }
 
+// Classifies a WITH statement by scanning past its CTE bodies to its top-level main verb.
+fn withKind(sql: &str, start: int): int {
+    let n = len(sql)
+    var i = start
+    var depth = 0
+    var seenParen = false
+    var prev: byte = 0
+    while i < n {
+        let ch = sql[i]
+        if ch == '\'' || ch == '"' || (ch == '-' && i + 1 < n && sql[i + 1] == '-') || (ch == '/' && i + 1 < n && sql[i + 1] == '*') {
+            i = skipQuoted(sql, i, prev)
+            prev = 0
+            i += 1
+            continue
+        }
+        if ch == '(' {
+            depth += 1
+            seenParen = true
+            prev = ch
+            i += 1
+            continue
+        }
+        if ch == ')' {
+            if depth > 0 { depth -= 1 }
+            prev = ch
+            i += 1
+            continue
+        }
+        if depth == 0 && isAlpha(ch) {
+            var j = i
+            while j < n && (isAlpha(sql[j]) || isDigit(sql[j]) || sql[j] == '_') { j += 1 }
+            let w = strings.toUpperAscii(&sql[i..j])
+            if !seenParen && (w == "FUNCTION" || w == "PROCEDURE") { return S_QUERY }
+            if seenParen {
+                if w == "INSERT" || w == "UPDATE" || w == "DELETE" || w == "MERGE" { return S_DML }
+                if w == "SELECT" || w == "VALUES" { return S_QUERY }
+            }
+            prev = sql[j - 1]
+            i = j
+            continue
+        }
+        prev = ch
+        i += 1
+    }
+    return S_QUERY
+}
+
 pub fn bindSites(sql: &str): Sites {
     let kind = statementKind(&sql)
     var out: []Site = []
@@ -1697,6 +1745,7 @@ pub fn bindSites(sql: &str): Sites {
     var lastWasString = false
     var lastWasAlpha = false
     var alphaStart = 0
+    var depth = 0
     var prev: byte = 0
     var i = 0
     let n = len(sql)
@@ -1706,7 +1755,7 @@ pub fn bindSites(sql: &str): Sites {
         let alpha = isAlpha(ch)
         if alpha && !lastWasAlpha {
             alphaStart = i
-        } else if !alpha && lastWasAlpha && kind == S_DML {
+        } else if !alpha && lastWasAlpha && kind == S_DML && depth == 0 {
             let w = strings.toUpperAscii(&sql[alphaStart..i])
             if !returningSeen && w == "RETURNING" {
                 returningSeen = true
@@ -1719,6 +1768,11 @@ pub fn bindSites(sql: &str): Sites {
             lastWasString = true
             i = skipQuoted(&sql, i, prev)
         } else if !isBlank(ch) {
+            if ch == '(' {
+                depth += 1
+            } else if ch == ')' {
+                if depth > 0 { depth -= 1 }
+            }
             if ch == ':' && !lastWasString {
                 var j = i + 1
                 while j < n && isBlank(sql[j]) { j += 1 }

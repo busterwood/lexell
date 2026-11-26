@@ -69,9 +69,6 @@ differences of its statement.
   - The recursive term's checks are missing: an aggregate, a window function, `ORDER BY`, or the CTE on the nullable
     side of an outer join is not refused (PostgreSQL: 42P19 or 0A000), and the query runs to 54001.
   - Under `RECURSIVE` a CTE cannot name a later one (`relation "a2" does not exist`).
-  - Data-modifying CTEs (`WITH d AS (DELETE ... RETURNING *) ...`) are a syntax error (lexdb-gaps.md 2.2).
-  - `WITH ... VALUES` is refused; the message (`WITH must be followed by SELECT, INSERT, UPDATE or DELETE`) also
-    leaves out MERGE, which works.
 - **UPDATE:** `SET (a, b) = (SELECT ...)` is a syntax error.
 - **SELECT ... WAIT:** the refusals still say `lexdb: WAITFOR ...` (the clause is `WAIT n SECONDS`), and the clause
   is taken only by a statement that starts with `SELECT`, not after `WITH`.

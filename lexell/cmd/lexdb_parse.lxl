@@ -801,7 +801,7 @@ const SPELL_MARK = "\x00spell"
 // A CTE: kept as its text (where its tokens start), parsed again as a
 // subquery in FROM wherever it is used, seeing the CTEs before it (and a
 // recursive one itself).
-type Cte = record { name: str; cols: []str; start: int; id: int; rec: bool; spell: str; spec: str; spells: []str }
+type Cte = record { name: str; cols: []str; start: int; id: int; rec: bool; spell: str; spec: str; spells: []str; dml: bool; hasRet: bool }
 
 // A recursive CTE whose body is being read: its number, how deep its body is, its references read so far, and how many
 // subqueries of an expression (not FROM's) are open around where the reader is: a reference there is refused (one in a
@@ -1706,8 +1706,19 @@ fn (p: mut &P) subquery(use: int): Result[int, lexdb_base.DbErr] {
 }
 
 // WITH's list, after "with": the CTEs go in scope (how many: the result).
-// Each is parsed now to check it, and again where it is used.
+// Each SELECT CTE is parsed now to check it, and again where it is used.
+// Top-level data-modifying CTEs (INSERT/UPDATE/DELETE/MERGE) are parsed once and recorded in wctes.
 fn (p: mut &P) withList(): Result[int, lexdb_base.DbErr] {
+    var dummy: []lexdb_sql.Wcte = []
+    return p.withListIn(false, false, mut &dummy)
+}
+
+fn (p: mut &P) withListView(): Result[int, lexdb_base.DbErr] {
+    var dummy: []lexdb_sql.Wcte = []
+    return p.withListIn(false, true, mut &dummy)
+}
+
+fn (p: mut &P) withListIn(topLevel: bool, inView: bool, wctes: mut &[]lexdb_sql.Wcte): Result[int, lexdb_base.DbErr] {
     let rec = p.acceptKw("recursive")
     // T-SQL and Oracle: a CTE that names itself is recursive, without RECURSIVE (lexdb_recur)
     let selfRec = p.tsql || p.ora
@@ -1738,12 +1749,69 @@ fn (p: mut &P) withList(): Result[int, lexdb_base.DbErr] {
         let id = p.nextCte
         p.nextCte += 1
         let start = p.pos
+        let isDml = p.isKw("insert") || p.isKw("update") || p.isKw("delete") || p.isKw("merge")
+        if isDml {
+            if !topLevel {
+                if inView { return Err(lexdb_base.err("0A000", "views must not contain data-modifying statements in WITH")) }
+                return Err(lexdb_base.err("0A000", "WITH clause containing a data-modifying statement must be at the top level"))
+            }
+            if rec {
+                var cs: []str = []
+                for c in cols { append(mut &cs, c.clone()) }
+                append(mut &p.ctes, Cte{name: name.clone(), cols: cs, start: start, id: id, rec: false, spell: spell.clone(), spec: "", spells: spells.clone(), dml: true, hasRet: true})
+                append(mut &p.inCte, InCte{id: id, depth: p.depth + 1, refs: 0, sub: 0})
+            }
+            let savedSubs = replace(mut &p.subs, [])
+            let savedWins = replace(mut &p.wins, [])
+            p.depth += 1
+            let kw = p.next().text
+            var dr: Result[Stmt, lexdb_base.DbErr] = Err(near(&p.peek()))
+            if kw == "insert" { dr = p.insert() }
+            else if kw == "update" { dr = p.update() }
+            else if kw == "delete" { dr = p.delete() }
+            else { dr = p.merge() }
+            p.depth -= 1
+            let innerSubs = replace(mut &p.subs, savedSubs)
+            let innerWins = replace(mut &p.wins, savedWins)
+            var refs = 0
+            if rec { refs = pop(mut &p.inCte).refs }
+            var dml = try dr
+            dml.subs = innerSubs
+            dml.wins = innerWins
+            dml.params = p.params
+            try p.expectKw(")")
+            if rec && refs > 0 {
+                return Err(lexdb_base.err("42P19", &("recursive query \"" + name + "\" must not contain data-modifying statements")))
+            }
+            if p.isKw("search") || p.isKw("cycle") {
+                let sp = try p.searchCycle(&name, &spell, mut &cols, false)
+            }
+            let hasRet = len(dml.items) > 0
+            if !hasRet && len(cols) > 0 {
+                return Err(lexdb_base.err("42P10", &("WITH query \"" + name + "\" has 0 columns available but " + len(cols).toStr() + " columns specified")))
+            }
+            var wcols: []str = []
+            for c in cols { append(mut &wcols, c.clone()) }
+            var wspells: []str = []
+            for c in spells { append(mut &wspells, c.clone()) }
+            append(wctes, lexdb_sql.Wcte{id: id, name: name.clone(), cols: wcols, spells: wspells, stmt: dml})
+            if rec {
+                let at = len(p.ctes) - 1
+                p.ctes[at].cols = cols
+                p.ctes[at].hasRet = hasRet
+            } else {
+                append(mut &p.ctes, Cte{name: name, cols: cols, start: start, id: id, rec: false, spell: spell, spec: "", spells: spells, dml: true, hasRet: hasRet})
+            }
+            n += 1
+            if !p.acceptKw(",") { break }
+            continue
+        }
         // a recursive one is in scope in its own body
         let r = rec || selfRec
         if r {
             var cs: []str = []
             for c in cols { append(mut &cs, c.clone()) }
-            append(mut &p.ctes, Cte{name: name.clone(), cols: cs, start: start, id: id, rec: true, spell: spell.clone(), spec: "", spells: spells.clone()})
+            append(mut &p.ctes, Cte{name: name.clone(), cols: cs, start: start, id: id, rec: true, spell: spell.clone(), spec: "", spells: spells.clone(), dml: false, hasRet: true})
         }
         let keep = len(p.subs)
         if r { append(mut &p.inCte, InCte{id: id, depth: p.depth + 1, refs: 0, sub: 0}) }
@@ -1776,7 +1844,7 @@ fn (p: mut &P) withList(): Result[int, lexdb_base.DbErr] {
             p.ctes[at].cols = cols
             p.ctes[at].spec = spec
         } else {
-            append(mut &p.ctes, Cte{name: name, cols: cols, start: start, id: id, rec: false, spell: spell, spec: spec, spells: spells})
+            append(mut &p.ctes, Cte{name: name, cols: cols, start: start, id: id, rec: false, spell: spell, spec: spec, spells: spells, dml: false, hasRet: true})
         }
         n += 1
         if !p.acceptKw(",") { break }
@@ -1931,7 +1999,7 @@ fn (p: mut &P) cteRef(ci: int): Result[int, lexdb_base.DbErr] {
         var cols: []str = []
         for c in saved[i].cols { append(mut &cols, c.clone()) }
         append(mut &p.ctes, Cte{name: saved[i].name.clone(), cols: cols, start: saved[i].start, id: saved[i].id, rec: saved[i].rec,
-                                spell: saved[i].spell.clone(), spec: saved[i].spec.clone(), spells: saved[i].spells.clone()})
+                                spell: saved[i].spell.clone(), spec: saved[i].spec.clone(), spells: saved[i].spells.clone(), dml: saved[i].dml, hasRet: saved[i].hasRet})
     }
     let pos = p.pos
     p.pos = saved[ci].start
@@ -2788,6 +2856,7 @@ fn (p: mut &P) outputList(s: mut &Stmt, out: mut &[]SelItem): Result[Unit, lexdb
         }
     }
     if !p.acceptKw("into") { return Ok(Unit{}) }
+    if p.depth > 0 { return Err(lexdb_base.err("0A000", "lexdb: OUTPUT INTO is not allowed in a data-modifying CTE")) }
     let t = p.peek().clone()
     if t.kind == T_VAR { return Err(lexdb_base.err("TS1087", &("Must declare the table variable \"" + t.text + "\"."))) }
     s.outInto = try p.rname()
@@ -4765,7 +4834,7 @@ fn (p: mut &P) insert(): Result[Stmt, lexdb_base.DbErr] {
         q.params = p.params
         append(mut &s.inner, q)
         try p.onConflict(mut &s)
-        try p.oraNoReturning()
+        if p.depth == 0 { try p.oraNoReturning() }
         try p.returning(mut &s)
         return Ok(s)
     }
@@ -4856,7 +4925,7 @@ fn (p: mut &P) insertWith(s0: Stmt): Result[Stmt, lexdb_base.DbErr] {
     q.params = p.params
     append(mut &s.inner, q)
     try p.onConflict(mut &s)
-    try p.oraNoReturning()
+    if p.depth == 0 { try p.oraNoReturning() }
     try p.returning(mut &s)
     return Ok(s)
 }
@@ -5258,7 +5327,7 @@ fn (p: mut &P) createView(orReplace: bool, alterOnly: bool): Result[Stmt, lexdb_
         q = try p.valuesQuery()
         try p.orderLimit(mut &q)
     } else if t.kind == T_IDENT && t.text == "with" {
-        let n = try p.withList()
+        let n = try p.withListView()
         try p.expectKw("select")
         q = try p.select()
         p.popCtes(n)
@@ -5465,7 +5534,7 @@ fn (p: mut &P) createMview(): Result[Stmt, lexdb_base.DbErr] {
         q = try p.valuesQuery()
         try p.orderLimit(mut &q)
     } else if t.kind == T_IDENT && t.text == "with" {
-        let n = try p.withList()
+        let n = try p.withListView()
         try p.expectKw("select")
         q = try p.select()
         p.popCtes(n)
@@ -6803,10 +6872,30 @@ fn (p: mut &P) fromItem0(join: int): Result[FromItem, lexdb_base.DbErr] {
         // in its own body: its working table
         for k in 0..len(p.inCte) {
             if p.inCte[k].id == p.ctes[ci].id {
+                if p.ctes[ci].dml {
+                    p.inCte[k].refs += 1
+                    return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: -1, cols: cols, work: p.ctes[ci].id, lateral: false, using: [], natural: false, comma: false})
+                }
                 if p.inCte[k].depth != p.depth && (p.inCte[k].sub > 0 || p.ora) { return Err(lexdb_recur.inSubquery(&table, p.md())) }
                 p.inCte[k].refs += 1
                 return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: -1, cols: cols, work: p.ctes[ci].id, lateral: false, using: [], natural: false, comma: false})
             }
+        }
+        if p.ctes[ci].dml {
+            if !p.ctes[ci].hasRet {
+                return Err(lexdb_base.err("0A000", &("WITH query \"" + p.ctes[ci].name + "\" does not have a RETURNING clause")))
+            }
+            var ref = lexdb_sql.newStmt(S_SELECT)
+            ref.srf = "#wcte:" + p.ctes[ci].id.toStr()
+            ref.cte = p.ctes[ci].id
+            ref.use = SUB_FROM
+            if !given && (p.tsql || p.ora) && len(cols) > 0 {
+                var sp: []str = []
+                for c in p.ctes[ci].spells { append(mut &sp, c.clone()) }
+                ref.spells = sp
+            }
+            append(mut &p.subs, ref)
+            return Ok(FromItem{table: table, alias: alias, join: join, on: None, sub: len(p.subs) - 1, cols: cols, work: -1, lateral: false, using: [], natural: false, comma: false})
         }
         // (with the columns its SEARCH and CYCLE add)
         if !given && len(p.ctes[ci].spec) > 0 { cols = cteCols(&p.ctes[ci]) }
@@ -7802,10 +7891,12 @@ fn (p: mut &P) merge(): Result[Stmt, lexdb_base.DbErr] {
     if p.tsql {
         try tsqlMergeCheck(&s)
         try mergeOutput(mut &s, out)
-        // SQL Server: the statement ends with a semicolon
-        let t = p.peek().clone()
-        if !(t.kind == T_OP && t.text == ";") {
-            return Err(lexdb_base.err("TS10713", "A MERGE statement must be terminated by a semi-colon (;)."))
+        // SQL Server: a top-level MERGE ends with a semicolon (inside a data-modifying CTE it ends with ")")
+        if p.depth == 0 {
+            let t = p.peek().clone()
+            if !(t.kind == T_OP && t.text == ";") {
+                return Err(lexdb_base.err("TS10713", "A MERGE statement must be terminated by a semi-colon (;)."))
+            }
         }
     }
     return Ok(s)
@@ -8498,12 +8589,14 @@ fn cteUses(s: &Stmt, uses: mut &[]int) {
     if s.cte >= 0 && s.cte < len(uses) { uses[s.cte] += 1 }
     for x in s.subs { cteUses(&x, uses) }
     for x in s.inner { cteUses(&x, uses) }
+    for w in s.wctes { cteUses(&w.stmt, uses) }
 }
 
 fn cteOnce(s: mut &Stmt, uses: &[]int) {
-    if s.cte >= 0 { s.cteOnce = s.cte < len(uses) && uses[s.cte] == 1 }
+    if s.cte >= 0 && !strings.startsWith(&s.srf, "#wcte:") { s.cteOnce = s.cte < len(uses) && uses[s.cte] == 1 }
     for i in 0..len(s.subs) { cteOnce(mut &s.subs[i], uses) }
     for i in 0..len(s.inner) { cteOnce(mut &s.inner[i], uses) }
+    for i in 0..len(s.wctes) { cteOnce(mut &s.wctes[i].stmt, uses) }
 }
 
 fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
@@ -8538,17 +8631,33 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         }
         "with" {
             // its queries are used where they are named (cteRef): in an
-            // INSERT's SELECT, an UPDATE's or a DELETE's subqueries
-            let n = try p.withList()
+            // INSERT's SELECT, an UPDATE's or a DELETE's subqueries; data-modifying
+            // CTEs are collected in wctes and executed before the main statement
+            var wctes: []lexdb_sql.Wcte = []
+            let n = try p.withListIn(p.depth == 0, false, mut &wctes)
             var r: Result[Stmt, lexdb_base.DbErr] = Err(lexdb_base.err("42601", "WITH must be followed by SELECT, INSERT, UPDATE or DELETE"))
             if p.acceptKw("select") { r = p.select() }
             else if p.isKw("(") && p.parenQueryStart() { r = p.parenSelect() }
+            else if p.acceptKw("values") {
+                match p.valuesQuery() {
+                    Ok(vq0) {
+                        var vq = vq0
+                        match p.orderLimit(mut &vq) {
+                            Ok(_) { r = Ok(vq) }
+                            Err(e) { r = Err(e) }
+                        }
+                    }
+                    Err(e) { r = Err(e) }
+                }
+            }
             else if p.acceptKw("insert") { r = p.insert() }
             else if p.acceptKw("update") { r = p.update() }
             else if p.acceptKw("delete") { r = p.delete() }
             else if p.acceptKw("merge") { r = p.merge() }
             p.popCtes(n)
-            return r
+            var out = try r
+            if len(wctes) > 0 { out.wctes = wctes }
+            return Ok(out)
         }
         "insert" { return p.insert() }
         "comment" {
@@ -8929,7 +9038,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             if s.ifFlag && inner.kind != S_SELECT {
                 return Err(lexdb_base.err("0A000", "EXPLAIN ANALYZE takes SELECT"))
             }
-            if inner.kind != S_SELECT && inner.kind != S_UPDATE && inner.kind != S_DELETE && inner.kind != S_MERGE {
+            if inner.kind != S_SELECT && inner.kind != S_UPDATE && inner.kind != S_DELETE && inner.kind != S_MERGE && !(inner.kind == S_INSERT && len(inner.wctes) > 0) {
                 return Err(lexdb_base.err("0A000", "EXPLAIN takes SELECT, UPDATE, DELETE or MERGE"))
             }
             append(mut &s.inner, inner)
@@ -11126,8 +11235,14 @@ fn (p: mut &P) returningList(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
 fn (p: mut &P) oraOldNew(): Result[bool, lexdb_base.DbErr] {
     var at = -1
     var k = p.pos
-    while k < len(p.toks) && p.toks[k].kind != T_EOF && !(p.toks[k].kind == T_IDENT && p.toks[k].text == "into") &&
-          !(p.toks[k].kind == T_OP && p.toks[k].text == ";") {
+    var par = 0
+    while k < len(p.toks) && p.toks[k].kind != T_EOF && !(par == 0 && p.toks[k].kind == T_IDENT && p.toks[k].text == "into") &&
+          !(par == 0 && p.toks[k].kind == T_OP && p.toks[k].text == ";") {
+        if p.toks[k].kind == T_OP && p.toks[k].text == "(" { par += 1 }
+        else if p.toks[k].kind == T_OP && p.toks[k].text == ")" {
+            if par == 0 { break }
+            par -= 1
+        }
         if at < 0 && p.toks[k].kind == T_IDENT && (p.toks[k].text == "old" || p.toks[k].text == "new") { at = k }
         k += 1
     }

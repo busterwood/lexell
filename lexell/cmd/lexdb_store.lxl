@@ -428,12 +428,15 @@ pub type Txn = record {
     // Trees whose OP_PUT writes in this txn were appended in strictly ascending key order
     // (CREATE INDEX fast path): commitOrder, logWrites, and applyBulkLoad skip redundant key compares.
     sortedTrees: []int
+    // Data-modifying CTE read visibility cap: when >= 0, reads see only writes/cuts with index < visCap
+    // (the pre-statement state). -1 (the default) sees all writes in this transaction.
+    pub visCap: int
 }
 
 pub fn begin(): Txn {
     return Txn{reads: [], writes: [], cuts: [], idxTrees: [], idx: [], runs: [], sortedN: [], created: [], snap: -1, snapSeq: 0, snapTrees: newMap(), snapLate: 0, track: false, live: false, lazySnap: false, rc: false, sql: lexdb_session.newSqlTxn(), now: time.now().unixMicros(),
                raTree: -1, ra: AHEAD_MIN, fsnap: [], lockId: 0, held: [], quiet: false, openEnd: false,
-               tmp: "", tmpDdl: false, onCommit: [], sortedTrees: []}
+               tmp: "", tmpDdl: false, onCommit: [], sortedTrees: [], visCap: -1}
 }
 
 // A transaction block's (BEGIN ... COMMIT), not a statement's own.
@@ -500,10 +503,44 @@ fn readsText(t: &Txn): str {
     return b
 }
 
-// The transaction's last write of key in tree (its index in writes).
+// The transaction's last write of key in tree (its index in writes), respecting visCap when set.
 fn (t: &Txn) lastWrite(tree: int, key: &str): Option[int] {
-    for k in 0..len(t.idxTrees) { if t.idxTrees[k] == tree { return t.idx[k].get(key) } }
+    for k in 0..len(t.idxTrees) {
+        if t.idxTrees[k] == tree {
+            match t.idx[k].get(key) {
+                Some(i) {
+                    if t.visCap < 0 || i < t.visCap { return Some(i) }
+                    if t.visCap == 0 { return None }
+                    var j = t.visCap - 1
+                    while j >= 0 {
+                        let w = &t.writes[j]
+                        if w.tree == tree && w.op != OP_DELRANGE && w.key == key { return Some(j) }
+                        j -= 1
+                    }
+                    return None
+                }
+                None { return None }
+            }
+        }
+    }
     return None
+}
+
+// Whether key in tree was written (put, del, or range-deleted) at or after mark `from` in this txn (ignores visCap).
+pub fn (t: &Txn) wroteSinceKey(tree: int, key: &str, from: int): bool {
+    for k in 0..len(t.idxTrees) {
+        if t.idxTrees[k] == tree {
+            match t.idx[k].get(key) {
+                Some(i) { if i >= from { return true } }
+                None {}
+            }
+            break
+        }
+    }
+    for c in t.cuts {
+        if c.tree == tree && c.pos >= from && key >= c.lo && (len(c.hi) == 0 || key < c.hi) { return true }
+    }
+    return false
 }
 
 // Whether the transaction has written key in tree.
@@ -660,7 +697,7 @@ pub fn (t: mut &Txn) delRange(tree: int, lo: &str, hi: &str) {
 // counting its own write of the key, which the caller checked first).
 fn (t: &Txn) cutKey(tree: int, key: &str): bool {
     for c in t.cuts {
-        if c.tree == tree && key >= c.lo && (len(c.hi) == 0 || key < c.hi) { return true }
+        if c.tree == tree && (t.visCap < 0 || c.pos < t.visCap) && key >= c.lo && (len(c.hi) == 0 || key < c.hi) { return true }
     }
     return false
 }
@@ -669,7 +706,7 @@ fn (t: &Txn) cutKey(tree: int, key: &str): bool {
 // (hi "": no end).
 fn (t: &Txn) cutsMeet(tree: int, lo: &str, hi: &str): bool {
     for c in t.cuts {
-        if c.tree != tree { continue }
+        if c.tree != tree || (t.visCap >= 0 && c.pos >= t.visCap) { continue }
         if len(hi) > 0 && c.lo >= hi { continue }
         if len(c.hi) > 0 && c.hi <= lo { continue }
         return true
@@ -679,7 +716,7 @@ fn (t: &Txn) cutsMeet(tree: int, lo: &str, hi: &str): bool {
 
 // Whether the transaction has a range delete of tree.
 fn (t: &Txn) hasCuts(tree: int): bool {
-    for c in t.cuts { if c.tree == tree { return true } }
+    for c in t.cuts { if c.tree == tree && (t.visCap < 0 || c.pos < t.visCap) { return true } }
     return false
 }
 
@@ -3808,6 +3845,28 @@ fn (t: mut &Txn) ownRange(tree: int, from: &str, to: &str): []TxWrite {
     var k = 0
     while k < len(t.idxTrees) && t.idxTrees[k] != tree { k += 1 }
     if k == len(t.idxTrees) { return out }
+    if t.visCap >= 0 {
+        if t.visCap == 0 { return out }
+        var seen: Map[str, int] = newMap()
+        var keys: []str = []
+        var j = t.visCap - 1
+        while j >= 0 {
+            let w = &t.writes[j]
+            if w.tree == tree && w.op != OP_DELRANGE && w.key >= from && (len(to) == 0 || w.key < to) && !seen.has(&w.key) {
+                seen.put(w.key.clone(), j)
+                append(mut &keys, w.key.clone())
+            }
+            j -= 1
+        }
+        if len(keys) > 1 { collections.sortBy(mut &keys, fn(a: &str, b: &str): int { return a.cmp(b) }) }
+        for key in keys {
+            match seen.get(&key) {
+                Some(idx) { append(mut &out, t.writes[idx].clone()) }
+                None {}
+            }
+        }
+        return out
+    }
     let n = t.idx[k].size()
     if n - t.sortedN[k] >= OWN_PEND { t.ownFold(k) }
     // the keys added since, in the range, sorted: one more source, after the runs

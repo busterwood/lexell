@@ -51,6 +51,9 @@ AS
   run the recursion to `MAXRECURSION` (error 530) or, with `MAXRECURSION 0` and no end, to error 50000 when the
   statement holds more than `max_statement_mem` of rows.
 - `WITH RECURSIVE` (PostgreSQL's form) is taken; SQL Server refuses it.
+- Data-modifying CTEs (`WITH d AS (DELETE FROM t OUTPUT DELETED.* WHERE ...) SELECT * FROM d`, and `INSERT`, `UPDATE`,
+  or `MERGE` with `OUTPUT`) are supported as a LexDB extension, running against the pre-statement snapshot and passing
+  `OUTPUT` rows to later CTEs and the main statement. `OUTPUT ... INTO` is not allowed inside a CTE.
 - `WITH XMLNAMESPACES` is not supported.
 
 ## Examples

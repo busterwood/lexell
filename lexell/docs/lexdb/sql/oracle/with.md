@@ -70,8 +70,10 @@ where the recursive query reads *name* in its `FROM` clause.
 ## Differences from Oracle
 
 - `WITH FUNCTION ...` and `WITH PROCEDURE ...` (PL/SQL declared in the statement) are not supported (ORA-00900).
-- A statement that begins with `WITH` must be a query. `WITH ... INSERT` is not Oracle syntax either; write
-  `INSERT INTO t WITH ... SELECT ...`.
+- Data-modifying CTEs (`WITH d AS (DELETE FROM t WHERE ... RETURNING ...) SELECT * FROM d`, as well as `INSERT`,
+  `UPDATE` with `RETURNING [OLD|NEW]`, and `MERGE` inside `WITH`, and `WITH ... INSERT/UPDATE/DELETE/MERGE`) are
+  supported as a LexDB extension, running against the pre-statement snapshot and opening an Oracle transaction when
+  idle. Native Oracle only accepts `SELECT` inside `WITH` and `INSERT INTO t WITH ... SELECT ...`.
 - The text of some errors differs: a column list longer than the query's gives ORA-20000 and lexdb's text (Oracle
   ORA-32038), and a name used twice also ORA-20000 (Oracle ORA-32039).
 

@@ -1,0 +1,143 @@
+// lexdb over TNS: data-modifying CTEs in Oracle door using RETURNING (including Oracle 23ai OLD/NEW),
+// :binds, WITH ... SELECT, WITH ... INSERT/UPDATE/DELETE, MERGE in WITH, snapshot visibility,
+// Oracle transaction semantics (COMMIT / ROLLBACK), and error checks.
+// expect: setup: ok
+// expect: del_ret: ID,NAME = 1|'Ann';2|'Bob'
+// expect: del_after: ID,NAME,SAL = 3|'Cy'|300
+// expect: upd_old_new: OLD_S,NEW_S = 300|400
+// expect: snap_base: SAL = 400
+// expect: snap_after: SAL = 800
+// expect: ins_val_ret: ID,NAME = 10|'Zed'
+// expect: ins_sel_ret: ID,NAME = 3|'Cy';10|'Zed'
+// expect: move_dml: 1
+// expect: move_arch: ID,NAME = 3|'Cy';10|'Zed';10|'Zed'
+// expect: merge_wcte: WAS,NOW = 800|999
+// expect: bind_wcte: ID,SAL = 3|1005
+// expect: tx_rollback: ID,SAL = 3|1005
+// expect: tx_commit: ID,SAL = 3|1050
+// expect: outer_ret_into: 1 = '1050'
+// expect: err_top_ins_sel_ret: error 3049
+// expect: err_no_ret: error
+// expect: err_nested: error
+import "task"
+import "net"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+fn showQ(c: mut &oracle.Conn, label: str, sql: str) {
+    let none: []sqldialect.Value = []
+    match c.query(&sql, &none) {
+        Ok(r) {
+            var names: []str = []
+            for j in 0..r.columnCount() { append(mut &names, r.columnName(j).unwrap()) }
+            var lines: []str = []
+            for i in 0..r.rowCount() {
+                var cells: []str = []
+                for j in 0..r.columnCount() {
+                    if r.isNull(i, j).unwrap() { append(mut &cells, "NULL") }
+                    else { append(mut &cells, r.value(i, j).unwrap().toStr()) }
+                }
+                append(mut &lines, strings.join(&cells, "|"))
+            }
+            println(label + ": " + strings.join(&names, ",") + " = " + strings.join(&lines, ";"))
+        }
+        Err(e) { println(label + ": error" + (if e.code == 3049 { " 3049" } else { "" })) }
+    }
+}
+
+fn showX(c: mut &oracle.Conn, label: str, sql: str) {
+    let none: []sqldialect.Value = []
+    match c.run(&sql, &none) {
+        Ok(n) { println(label + ": " + n.toStr()) }
+        Err(e) { println(label + ": error" + (if e.code == 3049 { " 3049" } else { "" })) }
+    }
+}
+
+fn client(port: &str) {
+    var c = oracle.connect(&("User Id=sa;Password=sa;Data Source=127.0.0.1:" + port + "/lexdb")).unwrap()
+    let none: []sqldialect.Value = []
+    c.exec("create table emp (id number primary key, name varchar2(20), sal number)").unwrap()
+    c.exec("create table arch (id number, name varchar2(20))").unwrap()
+    c.exec("insert into emp values (1, 'Ann', 100)").unwrap()
+    c.exec("insert into emp values (2, 'Bob', 200)").unwrap()
+    c.exec("insert into emp values (3, 'Cy', 300)").unwrap()
+    println("setup: ok")
+
+    // DELETE ... RETURNING inside WITH
+    showQ(mut &c, "del_ret", "with d as (delete from emp where id <= 2 returning id, name) select id, name from d order by id")
+    c.exec("commit").unwrap()
+    showQ(mut &c, "del_after", "select id, name, sal from emp order by id")
+
+    // Oracle 23ai RETURNING OLD / NEW inside WITH
+    showQ(mut &c, "upd_old_new", "with u as (update emp set sal = sal + 100 where id = 3 returning old sal as old_s, new sal as new_s) select old_s, new_s from u")
+    c.exec("commit").unwrap()
+
+    // Snapshot visibility: outer SELECT sees pre-statement salary
+    showQ(mut &c, "snap_base", "with u as (update emp set sal = sal * 2 where id = 3 returning sal) select sal from emp where id = 3")
+    c.exec("commit").unwrap()
+    showQ(mut &c, "snap_after", "select sal from emp where id = 3")
+
+    // INSERT VALUES ... RETURNING inside WITH
+    showQ(mut &c, "ins_val_ret", "with i as (insert into emp values (10, 'Zed', 500) returning id, name) select id, name from i")
+    c.exec("commit").unwrap()
+
+    // INSERT ... SELECT ... RETURNING inside WITH (allowed in wCTE while top-level stays ORA-03049)
+    showQ(mut &c, "ins_sel_ret", "with i as (insert into arch select id, name from emp returning id, name) select id, name from i order by id")
+    c.exec("commit").unwrap()
+
+    // WITH ... INSERT (TNS S_DML classification + rowcount)
+    showX(mut &c, "move_dml", "with d as (delete from emp where id = 10 returning id, name) insert into arch select id, name from d")
+    showQ(mut &c, "move_arch", "select id, name from arch order by id")
+
+    // MERGE ... RETURNING OLD/NEW inside WITH
+    showQ(mut &c, "merge_wcte", "with m as (merge into emp e using (select 3 as id, 999 as sal from dual) s on (e.id = s.id) when matched then update set e.sal = s.sal returning old sal as was, new sal as now) select was, now from m")
+    c.exec("commit").unwrap()
+
+    // Bind parameters inside wCTE
+    let rBind = c.query("with u as (update emp set sal = sal + :1 where id = :2 returning id, sal) select id, sal from u", &[sqldialect.Value.Int(6), sqldialect.Value.Int(3)]).unwrap()
+    c.exec("commit").unwrap()
+    println("bind_wcte: " + rBind.columnName(0).unwrap() + "," + rBind.columnName(1).unwrap() + " = " + rBind.value(0, 0).unwrap().toStr() + "|" + rBind.value(0, 1).unwrap().toStr())
+
+    // Oracle transaction semantics: ROLLBACK undoes WITH (UPDATE ...) SELECT; COMMIT keeps it
+    let rRb = c.query("with u as (update emp set sal = 1 where id = 3 returning id) select id from u", &none).unwrap()
+    c.exec("rollback").unwrap()
+    showQ(mut &c, "tx_rollback", "select id, sal from emp where id = 3")
+
+    let rCm = c.query("with u as (update emp set sal = 1050 where id = 3 returning id) select id from u", &none).unwrap()
+    c.exec("commit").unwrap()
+    showQ(mut &c, "tx_commit", "select id, sal from emp where id = 3")
+
+    // Outer DML with RETURNING ... INTO :out alongside inner CTE RETURNING
+    var outs: []oracle.Out = [oracle.out("1", "VARCHAR2(100)")]
+    let rOut = c.call("with d as (insert into arch values (99, 'tmp') returning id) update emp set sal = sal where id = 3 returning sal into :1", &[], &outs).unwrap()
+    c.exec("commit").unwrap()
+    println("outer_ret_into: " + rOut.affected.toStr() + " = " + rOut.outputs.value(0, 0).unwrap().toStr())
+
+    // Error cases
+    showX(mut &c, "err_top_ins_sel_ret", "insert into arch select id, name from emp returning id")
+    showQ(mut &c, "err_no_ret", "with d as (delete from emp where id = 999) select * from d")
+    showQ(mut &c, "err_nested", "select * from (with d as (delete from emp where id = 999 returning id) select * from d)")
+
+    c.logoff()
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let f = s.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+        client(&addr[10..len(addr)])
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(6), lexdb_store.Options{cacheBytes: 64 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}

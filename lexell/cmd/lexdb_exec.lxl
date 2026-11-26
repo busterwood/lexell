@@ -54,6 +54,7 @@ import "./lexdb_ops"
 import "./lexdb_pipe"
 import "./lexdb_agg"
 import "./lexdb_pct"
+import "./lexdb_wcte"
 import "./lexdb_window"
 import "./lexdb_setop"
 import "./lexdb_sort"
@@ -2813,7 +2814,14 @@ fn planSubIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.St
     // first table's reading may stop early, so no switch to a scan (optimizer 19)
     if len(sel.q.levels) > 0 && (s.use == lexdb_sql.SUB_EXISTS || (s.use == lexdb_sql.SUB_SCALAR && !sel.aggQ)) { sel.q.levels[0].stops = true }
     if s.use == lexdb_sql.SUB_EXISTS { lexdb_plan.existsUnread(mut &sel, s) }
-    if len(s.srf) > 0 {
+    if lexdb_wcte.isRef(&s.srf) {
+        let wid = lexdb_wcte.workId(lexdb_wcte.refId(&s.srf))
+        var wi = -1
+        for k in 0..len(sc.works) { if sc.works[k].id == wid { wi = k; break } }
+        if wi < 0 { return Err(e("XX000", "missing modifying CTE schema")) }
+        sel.outs = lexdb_wcte.defsToCols(&sc.works[wi].cols)
+        sel.lp = lexdb_bind.LPlan.CteRef(s.cte, false, outBCols(&sel.outs))
+    } else if len(s.srf) > 0 {
         if strings.startsWith(&s.srf, "#values:") && len(sel.exprs) == len(sel.outs) {
             // an untyped literal or parameter takes its column's type (srfCols)
             let pt = lexdb_bind.ptypesOf(&sc.names)
@@ -7507,6 +7515,13 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
             return runFastIns(st, txn, &pc.dml[0], params)
         }
     }
+    var noW: []WcteRun = []
+    return insertIn(st, txn, s, params, ptypes, lim, pc, mut &noW)
+}
+
+fn insertIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits, pc: mut &PlanCache, wr: mut &[]WcteRun): Result[Res, DbErr] {
+    let wOn = len(wr) > 0
+    if wOn { txn.visCap = wr[0].baseMark }
     try notView(st, txn, &s.table, &"insert into")
     try dmlCheck(st, txn, s, &"a")
     let sqe = seqEnv(st, txn)
@@ -7542,6 +7557,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     }
     // its subqueries are run first; with RETURNING, over the table's columns
     var sc = newScopeIn(st, txn, params, ptypes)
+    addWcteWorks(mut &sc, wr)
     let noFrom: []lexdb_sql.FromItem = []
     let noWhere: Option[Expr] = None
     let from = if len(s.items) > 0 { insFrom(s) } else { noFrom }
@@ -7566,7 +7582,9 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     var rs = newRun(&q)
     rs.limit(&lim)
     rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
+    if wOn { rs.takeShare(mut &wr[0].sh) }
     let m = try prepare(st, txn, &q, params, mut &rs)
+    if wOn { wr[0].sh.giveBack(mut &rs) }
     var kept: [][]Val = []
     var count = 0
     let parents = up.mode == lexdb_sql.CONFLICT_UPDATE        // an update may change a key other rows refer to
@@ -7576,6 +7594,7 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         // table it inserts into runs to its end first, so it never reads the
         // rows it inserts.
         var ssc = newScopeIn(st, txn, params, ptypes)
+        addWcteWorks(mut &ssc, wr)
         var sel = try planSelect(st, txn, &s.inner[0], params, mut &ssc)
         // (its rows the pipeline's where it runs them)
         bindSel(mut &sel)
@@ -7587,12 +7606,21 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         var later: []FkLater = []
         let noAggs: []Val = []
         let env = Env{cols: &q.cols, row: &noAggs, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
-        if sel.topMode != 0 || try stmtReads(st, txn, &s.inner[0], &t.name) {      // (TOP n PERCENT, WITH TIES: the rows made whole)
+        if wOn {
+            var res = try runSelIn(st, txn, &sel, params, lim, mut &wr[0].sh)
+            txn.visCap = -1
+            for i in 0..len(res.rows) {
+                let r = replace(mut &res.rows[i], [])
+                count += try insertSelRow(st, txn, &t, &targets, &sel.outs, &r, &defs, ovr, &fw, mut &later, mut &up, &env, ret.on, mut &kept)
+            }
+            addWcteFks(wr, &fw, mut &later)
+        } else if sel.topMode != 0 || try stmtReads(st, txn, &s.inner[0], &t.name) {      // (TOP n PERCENT, WITH TIES: the rows made whole)
             var res = try runSel(st, txn, &sel, params, lim)
             for i in 0..len(res.rows) {
                 let r = replace(mut &res.rows[i], [])
                 count += try insertSelRow(st, txn, &t, &targets, &sel.outs, &r, &defs, ovr, &fw, mut &later, mut &up, &env, ret.on, mut &kept)
             }
+            try fkFinish(st, txn, &fw, mut &later)
         } else {
             // With foreign keys, rows are held up to a chunk (32, doubling to BROWS) and their parents probed
             // together (fkAhead), then written in order; a query's error comes after the writes of the rows
@@ -7619,18 +7647,29 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
             })
             if len(held) > 0 { count += try insertSelRows(st, txn, &t, &targets, &sel.outs, &held, &defs, ovr, &fw, mut &later, mut &up, &env, ret.on, mut &kept) }
             try ran
+            try fkFinish(st, txn, &fw, mut &later)
         }
-        try fkFinish(st, txn, &fw, mut &later)
     } else {
         // the logical plan (read by nothing yet): VALUES its source, its rows the statement's
         let lp = lexdb_bind.LPlan.Insert(t.name.toStr(), collections.copyOf(&targets),
                                          lexdb_bind.LPlan.Values(if len(s.rows) > 0 { len(s.rows[0]) } else { 0 }, [], []), retBCols(&ret))
         let noAggs: []Val = []
         let env = Env{cols: &q.cols, row: &noAggs, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
-        count = if resolved { try insertRows(st, txn, &t, &targets, &rows, &env, ovr, ret.on, mut &kept, mut &up) }
-                else { try insertRows(st, txn, &t, &targets, &s.rows, &env, ovr, ret.on, mut &kept, mut &up) }
+        if wOn { txn.visCap = -1 }
+        count = if resolved { try insertRows(st, txn, &t, &targets, &rows, &env, ovr, ret.on, mut &kept, mut &up, wr) }
+                else { try insertRows(st, txn, &t, &targets, &s.rows, &env, ovr, ret.on, mut &kept, mut &up, wr) }
     }
-    if len(kept) > 0 { try keptRet(st, txn, s, &q, &m, params, mut &ret, &kept, len(t.cols), mut &rs) }
+    if len(kept) > 0 {
+        if wOn {
+            txn.visCap = wr[0].baseMark
+            rs.takeShare(mut &wr[0].sh)
+            try keptRet(st, txn, s, &q, &m, params, mut &ret, &kept, len(t.cols), mut &rs)
+            wr[0].sh.giveBack(mut &rs)
+            txn.visCap = -1
+        } else {
+            try keptRet(st, txn, s, &q, &m, params, mut &ret, &kept, len(t.cols), mut &rs)
+        }
+    }
     // IDENTITY_INSERT: an identity given a value past its own goes on from there
     for j in 0..len(up.idCols) {
         let d = try needSeq(st, txn, &t.cols[up.idCols[j]].seq)
@@ -7890,7 +7929,7 @@ fn idDefault(t: &Table, i: int, isDef: bool, ovr: int): Result[bool, DbErr] {
 
 // The rows of VALUES inserted: their count (each kept, with keep).
 fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targets: &[]int, rows: &[][]Expr,
-              env: &Env, ovr: int, keep: bool, kept: mut &[][]Val, up: mut &Upsert): Result[int, DbErr] {
+              env: &Env, ovr: int, keep: bool, kept: mut &[][]Val, up: mut &Upsert, wr: mut &[]WcteRun): Result[int, DbErr] {
     let defs = try defaultsOf(st, txn, t)
     let fw = try fkTables(st, txn, t, true, up.mode == lexdb_sql.CONFLICT_UPDATE)
     var later: []FkLater = []
@@ -7929,7 +7968,7 @@ fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targ
             None {}
         }
     }
-    try fkFinish(st, txn, &fw, mut &later)
+    if len(wr) > 0 { addWcteFks(wr, &fw, mut &later) } else { try fkFinish(st, txn, &fw, mut &later) }
     return Ok(count)
 }
 
@@ -8224,7 +8263,8 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         }
     }
     var win = noWin()
-    let r = try updateB(st, txn, s, params, ptypes, lim, mut &win)
+    var noW: []WcteRun = []
+    let r = try updateB(st, txn, s, params, ptypes, lim, mut &win, mut &noW)
     if pc.keep && len(pc.dml) == 0 && len(s.from) == 0 && len(s.subs) == 0 && len(s.items) == 0 && s.limit.isNone() && s.mdialect == lexdb_sql.MD_PG {
         let t = try needTable(st, txn, &s.table)
         if dmlTableSimple(&t) {
@@ -8261,11 +8301,15 @@ fn update(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     return Ok(r)
 }
 
-fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits, win: mut &Win): Result[Res, DbErr] {
+fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits, win: mut &Win, wr: mut &[]WcteRun): Result[Res, DbErr] {
+    let wOn = len(wr) > 0
+    let baseMark = if wOn { wr[0].baseMark } else { -1 }
+    if wOn { txn.visCap = baseMark }
     try notView(st, txn, &s.table, &"update")
     try dmlCheck(st, txn, s, &"w")
     let sqe = seqEnv(st, txn)
     var sc = newScopeIn(st, txn, params, ptypes)
+    addWcteWorks(mut &sc, wr)
     sc.target = try catKey(st, txn, &s.table, false)
     var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, &newMap(), true, mut &sc, false)
     var targets: []int = []
@@ -8283,7 +8327,7 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let lp = lexdb_bind.LPlan.Update(replace(mut &q.lp, lexdb_bind.noPlan()), collections.copyOf(&targets), retBCols(&ret))
     endScope(mut &sc, mut &q)
     // (subqueries: their rows are read as the statement found them, the writes after every row's values)
-    var twoPhase = false
+    var twoPhase = wOn
     if len(q.subs) > 0 {
         pipeSubs(mut &q)
         twoPhase = true
@@ -8307,6 +8351,7 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     rs.limit(&lim)
     rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
     rs.after = win.after.clone()
+    if wOn { rs.takeShare(mut &wr[0].sh) }
     var m = try writePrep(st, txn, &q, params, mut &rs)
     let room = rs.bud.room()
     let max = rs.bud.maxHeld
@@ -8329,12 +8374,14 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         let waited = try lockFound(st, txn, t, &found, lmode)
         if !waited && (!txn.rc || !st.liveStale(txn)) { break }
         // a lock waited for: the rows found again, holding the locks
+        if wOn { wr[0].sh.giveBack(mut &rs) }
         found = []
         held = 0
         txn.forgetReads(reads0)
         rs = newRun(&q)
         rs.limit(&lim)
         rs.after = win.after.clone()
+        if wOn { rs.takeShare(mut &wr[0].sh) }
         m = try writePrep(st, txn, &q, params, mut &rs)
     }
     if win.n > 0 { winEnd(win, t, &found, rs.cnt[0].read) }
@@ -8357,13 +8404,21 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         // a subquery in SET or RETURNING reads the table as the statement found it, whatever the statement has written by then (as
         // PostgreSQL, SQL Server and Oracle do): every row's new values first, the writes after; an error of a row's values ends
         // them, and the rows before it are written first
+        var keptFound: [][]Val = []
         var news: [][]Val = []
         var failed: Option[DbErr] = None
         for joined in found {
+            if wOn {
+                let rk = if len(joined) == nt { keyOf(t, &joined) } else { keyOf(t, &rowPrefix(&joined, nt)) }
+                if txn.wroteSinceKey(t.tree, &rk, baseMark) { continue }
+            }
             match updNew(st, txn, &q, &m, &sets, &targets, t, &defs, params, &sqe, &joined, mut &rs) {
                 Ok(all) {
                     match retAddOld(st, txn, &q, &m, params, mut &ret, &all, &joined, mut &rs) {
-                        Ok(_) { append(mut &news, all) }
+                        Ok(_) {
+                            append(mut &keptFound, collections.copyOf(&joined))
+                            append(mut &news, all)
+                        }
                         Err(x) {
                             failed = Some(x)
                             break
@@ -8376,16 +8431,20 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
                 }
             }
         }
+        if wOn {
+            wr[0].sh.giveBack(mut &rs)
+            txn.visCap = -1
+        }
         for k in 0..len(news) {
-            if len(found[k]) == nt {
-                match updRow(st, txn, t, &found[k], &news[k], &fw, mut &later) {
+            if len(keptFound[k]) == nt {
+                match updRow(st, txn, t, &keptFound[k], &news[k], &fw, mut &later) {
                     Ok(_) {}
-                    Err(x) { try laxRow(st, txn, t, &found[k], &news[k], &fw, mut &later, x, &targets, s.mdialect) }
+                    Err(x) { try laxRow(st, txn, t, &keptFound[k], &news[k], &fw, mut &later, x, &targets, s.mdialect) }
                 }
             } else {
-                match updRow(st, txn, t, &rowPrefix(&found[k], nt), &rowPrefix(&news[k], nt), &fw, mut &later) {
+                match updRow(st, txn, t, &rowPrefix(&keptFound[k], nt), &rowPrefix(&news[k], nt), &fw, mut &later) {
                     Ok(_) {}
-                    Err(x) { try laxRow(st, txn, t, &rowPrefix(&found[k], nt), &rowPrefix(&news[k], nt), &fw, mut &later, x, &targets, s.mdialect) }
+                    Err(x) { try laxRow(st, txn, t, &rowPrefix(&keptFound[k], nt), &rowPrefix(&news[k], nt), &fw, mut &later, x, &targets, s.mdialect) }
                 }
             }
         }
@@ -8393,8 +8452,8 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
             Some(x) { return Err(x) }
             None {}
         }
-        try fkFinish(st, txn, &fw, mut &later)
-        return Ok(retRes(ret, &("UPDATE " + len(found).toStr())))
+        if wOn { addWcteFks(wr, &fw, mut &later) } else { try fkFinish(st, txn, &fw, mut &later) }
+        return Ok(retRes(ret, &("UPDATE " + len(keptFound).toStr())))
     }
     for joined in found {
         let env = Env{cols: &q.cols, row: &joined, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
@@ -8448,7 +8507,8 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
         }
     }
     var win = noWin()
-    let r = try deleteB(st, txn, s, params, ptypes, lim, mut &win)
+    var noW: []WcteRun = []
+    let r = try deleteB(st, txn, s, params, ptypes, lim, mut &win, mut &noW)
     if pc.keep && len(pc.dml) == 0 && len(s.from) == 0 && len(s.subs) == 0 && len(s.items) == 0 && s.limit.isNone() && s.mdialect == lexdb_sql.MD_PG {
         let t = try needTable(st, txn, &s.table)
         if dmlTableSimple(&t) {
@@ -8477,10 +8537,14 @@ fn delete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     return Ok(r)
 }
 
-fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits, win: mut &Win): Result[Res, DbErr] {
+fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits, win: mut &Win, wr: mut &[]WcteRun): Result[Res, DbErr] {
+    let wOn = len(wr) > 0
+    let baseMark = if wOn { wr[0].baseMark } else { -1 }
+    if wOn { txn.visCap = baseMark }
     try notView(st, txn, &s.table, &"delete from")
     try dmlCheck(st, txn, s, &"d")
     var sc = newScopeIn(st, txn, params, ptypes)
+    addWcteWorks(mut &sc, wr)
     sc.target = try catKey(st, txn, &s.table, false)
     var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, &newMap(), true, mut &sc, false)
     var ret = try retOf(s, &q, mut &sc)
@@ -8491,7 +8555,7 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     delNarrow(mut &q, s)
     // a batched DELETE (stage 8) takes the range path when it can, in its first batch: one write, so already bounded, and
     // atomic; not with entries of other indexes to delete one by one, which are writes too
-    if win.n == 0 || win.first {
+    if !wOn && (win.n == 0 || win.first) {
         match try rangeDelete(st, txn, s, &q, params, &lim, win.n > 0) {
             Some(r) {
                 win.done = true
@@ -8510,6 +8574,7 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     rs.limit(&lim)
     rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
     if win.keyed { rs.after = win.after.clone() }
+    if wOn { rs.takeShare(mut &wr[0].sh) }
     var m = try writePrep(st, txn, &q, params, mut &rs)
     let room = rs.bud.room()
     let max = rs.bud.maxHeld
@@ -8528,18 +8593,37 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
         if s.limit.isSome() { found = firstN(found, try lexdb_plan.topOf(&s.limit, params, s.topMode, len(found))) }     // T-SQL's UPDATE TOP (n), DELETE TOP (n)
         let waited = try lockFound(st, txn, t, &found, lexdb_sql.LOCK_UPDATE)
         if !waited && (!txn.rc || !st.liveStale(txn)) { break }
+        if wOn { wr[0].sh.giveBack(mut &rs) }
         found = []
         held = 0
         txn.forgetReads(reads0)
         rs = newRun(&q)
         rs.limit(&lim)
         if win.keyed { rs.after = win.after.clone() }
+        if wOn { rs.takeShare(mut &wr[0].sh) }
         m = try writePrep(st, txn, &q, params, mut &rs)
     }
     if win.n > 0 { winEnd(win, t, &found, rs.cnt[0].read) }
     let fw = try fkTables(st, txn, t, false, true)
     var later: []FkLater = []
     let nt = len(t.cols)
+    if wOn {
+        var liveFound: [][]Val = []
+        for joined in found {
+            let rk = if len(joined) == nt { keyOf(t, &joined) } else { keyOf(t, &rowPrefix(&joined, nt)) }
+            if txn.wroteSinceKey(t.tree, &rk, baseMark) { continue }
+            if ret.on { try retAdd(st, txn, &q, &m, params, mut &ret, &joined, mut &rs) }
+            append(mut &liveFound, collections.copyOf(&joined))
+        }
+        wr[0].sh.giveBack(mut &rs)
+        txn.visCap = -1
+        for joined in liveFound {
+            if len(joined) == nt { try delRow(st, txn, t, &joined, &fw, mut &later) }
+            else { try delRow(st, txn, t, &rowPrefix(&joined, nt), &fw, mut &later) }
+        }
+        addWcteFks(wr, &fw, mut &later)
+        return Ok(retRes(ret, &("DELETE " + len(liveFound).toStr())))
+    }
     // (a subquery in RETURNING reads the table as the statement found it: every row's RETURNING first)
     if len(q.subs) > 0 && ret.on { for joined in found { try retAdd(st, txn, &q, &m, params, mut &ret, &joined, mut &rs) } }
     for joined in found {
@@ -8651,7 +8735,8 @@ fn batchDml(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     var total = 0
     var tries = 0
     while true {
-        let r = if del { deleteB(st, txn, s, params, ptypes, lim, mut &win) } else { updateB(st, txn, s, params, ptypes, lim, mut &win) }
+        var noW: []WcteRun = []
+        let r = if del { deleteB(st, txn, s, params, ptypes, lim, mut &win, mut &noW) } else { updateB(st, txn, s, params, ptypes, lim, mut &win, mut &noW) }
         match move(r) {
             Ok(res) { if win.done { return Ok(res) } }
             Err(x) {
@@ -9147,10 +9232,19 @@ fn fewSource(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query, m
 }
 
 fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits): Result[Res, DbErr] {
+    var noW: []WcteRun = []
+    return mergeIn(st, txn, s, params, ptypes, lim, mut &noW)
+}
+
+fn mergeIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits, wr: mut &[]WcteRun): Result[Res, DbErr] {
+    let wOn = len(wr) > 0
+    let baseMark = if wOn { wr[0].baseMark } else { -1 }
+    if wOn { txn.visCap = baseMark }
     try notView(st, txn, &s.table, &"merge into")
     try mergeCheck(st, txn, s)
     let sqe = seqEnv(st, txn)
     var sc = newScopeIn(st, txn, params, ptypes)
+    addWcteWorks(mut &sc, wr)
     sc.target = try catKey(st, txn, &s.table, false)
     let none: Option[Expr] = None
     var q = try buildQuery(st, txn, &mergeFrom(s), &none, params, &s.subs, &newMap(), true, mut &sc, false)
@@ -9250,6 +9344,7 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
     var rs = newRun(&q)
     rs.limit(&lim)
     rs.writes = true                // optimizer 19: a write keeps its index paths (its read set)
+    if wOn { rs.takeShare(mut &wr[0].sh) }
     // (bound for the row engine too: fewSource may give a few rows to it)
     var m = try prepare(st, txn, &q, params, mut &rs)
     try fewSource(st, txn, mut &q, mut &m, params, mut &rs)
@@ -9273,11 +9368,13 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
         var held2: [][]Val = []
         for r in found { if tgtPresent(&t, &r, ns) { append(mut &held2, rowSlice(&r, ns, nt)) } }
         if !(try lockFound(st, txn, &t, &held2, lmode)) { break }
+        if wOn { wr[0].sh.giveBack(mut &rs) }
         found = []
         held = 0
         txn.forgetReads(reads0)
         rs = newRun(&q)
         rs.limit(&lim)
+        if wOn { rs.takeShare(mut &wr[0].sh) }
         m = try prepare(st, txn, &q, params, mut &rs)
     }
     let noAggs: []Val = []
@@ -9308,10 +9405,14 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
     // subqueries read the table as the statement found it, whatever the statement has written by then (as PostgreSQL, SQL Server
     // and Oracle do): every row's clause, values, conditions and RETURNING first, the writes after (an error ends the rows
     // worked out, and those before it are written first)
-    let two = len(q.subs) > 0
+    let two = len(q.subs) > 0 || wOn
     var acts: []MAct = []
     var failed: Option[DbErr] = None
     for joined in found {
+        if wOn && tgtPresent(&t, &joined, ns) {
+            let rk = keyOf(&t, &rowSlice(&joined, ns, nt))
+            if txn.wroteSinceKey(t.tree, &rk, baseMark) { continue }
+        }
         match mergePlan(st, txn, &mc, &fw, mut &later, mut &up, mut &touched, mut &ret, &joined, mut &rs) {
             Ok(a) {
                 match a {
@@ -9331,12 +9432,16 @@ fn merge(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, 
             }
         }
     }
+    if wOn {
+        wr[0].sh.giveBack(mut &rs)
+        txn.visCap = -1
+    }
     for k in 0..len(acts) { try mergeApply(st, txn, &t, mut &acts[k], &fw, mut &later, mut &up, mut &count) }
     match failed {
         Some(x) { return Err(x) }
         None {}
     }
-    try fkFinish(st, txn, &fw, mut &later)
+    if wOn { addWcteFks(wr, &fw, mut &later) } else { try fkFinish(st, txn, &fw, mut &later) }
     // IDENTITY_INSERT: an identity given a value past its own goes on from there
     for j in 0..len(up.idCols) {
         let d = try needSeq(st, txn, &t.cols[up.idCols[j]].seq)
@@ -9543,6 +9648,7 @@ fn explain(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, x: &lexdb_sql.Stmt
            ptypes: &[]int): Result[Res, DbErr] {
     let s = &x.inner[0]
     var res = Res{cols: [OutCol{name: "QUERY PLAN", oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1}], rows: [], tag: "EXPLAIN", hasRows: true, copy: COPY_NONE}
+    if len(s.wctes) > 0 { return explainWctes(st, txn, s, x.ifFlag, params, lim, ptypes) }
     var lines: []str = []
     let none: []lexdb_pipe.Counts = []
     if x.ifFlag {
@@ -11623,7 +11729,7 @@ fn groupKeys(s: &lexdb_sql.Stmt, q: &Query, outs: &[]OutCol, exprs: &[]Expr, sc:
 
 fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
               sc: mut &Scope): Result[Sel, DbErr] {
-    if s.kind == lexdb_sql.S_SELECT && s.setop == 0 && len(s.from) > 0 && s.lockMode == 0 {
+    if txn.visCap < 0 && s.kind == lexdb_sql.S_SELECT && s.setop == 0 && len(s.from) > 0 && s.lockMode == 0 {
         let lim = Limits{rounds: MAX_RECURSION, steps: MAX_MATCH_STEPS, mem: txn.sql.memMax, deadline: 0, batch: true, rules: txn.sql.rules, auto: false, rdel: true}
         let up = mvUp(st, txn.sql.sess, lim)
         let qPath = collections.copyOf(&txn.sql.path)
@@ -13619,26 +13725,15 @@ fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int, path: &[
     var txn = lexdb_store.begin()
     for x in path { append(mut &txn.sql.path, x.clone()) }
     txn.tmp = tmpOf(path)
+    var wworks: []Work = []
+    if len(s.wctes) > 0 { wworks = try describeWctes(st, mut &txn, s, ptypes) }
     if dml {
-        let none: Option[Expr] = None
-        let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
-        var sc = newScopeIn(st, &txn, &np, ptypes)
-        let from = if s.kind == lexdb_sql.S_INSERT { insFrom(s) } else if s.kind == lexdb_sql.S_MERGE { mergeFrom(s) } else { try dmlFrom(s) }
-        let q = try buildQuery(st, mut &txn, &from, &none, &np, &s.subs, &newMap(), true, mut &sc, false)
-        var exprs: []Expr = []
-        if s.kind == lexdb_sql.S_MERGE {
-            let items = mergeItems(s, &q.levels[len(q.levels) - 1].t, &(if len(s.alias) > 0 { s.alias.clone() } else { lexdb_sql.baseName(&s.table) }))
-            return lexdb_bind.itemCols(&items, true, &q.cols, mut &sc.names, mut &exprs)
-        }
-        if lexdb_oldnew.hasStars(&s.items) {
-            let items = lexdb_oldnew.items(&s.items, &q.levels[0].t.cols, lexdb_catalog.ROWID, &q.levels[0].alias)
-            return lexdb_bind.itemCols(&items, true, &q.cols, mut &sc.names, mut &exprs)
-        }
-        return lexdb_bind.itemCols(&s.items, true, &q.cols, mut &sc.names, mut &exprs)
+        return describeDmlWith(st, mut &txn, s, ptypes, &wworks)
     }
     if s.setop != 0 {
         let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
         var sc = newScopeIn(st, &txn, &np, ptypes)
+        for w in wworks { append(mut &sc.works, w.clone()) }
         let sel = try planSelect(st, mut &txn, s, &np, mut &sc)
         var outs: []OutCol = []
         for o in sel.outs { append(mut &outs, o.clone()) }
@@ -13647,9 +13742,40 @@ fn describe(st: &lexdb_store.Store, s: &lexdb_sql.Stmt, ptypes: &[]int, path: &[
     let none: Option[Expr] = None
     let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
     var sc = newScopeIn(st, &txn, &np, ptypes)
+    for w in wworks { append(mut &sc.works, w.clone()) }
     let q = try buildQuery(st, mut &txn, &s.from, &none, &np, &s.subs, &newMap(), true, mut &sc, false)
     var exprs: []Expr = []
     return lexdb_bind.selectCols(s, &q.cols, mut &sc.names, mut &exprs)
+}
+
+fn describeDmlWith(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, ptypes: &[]int, wworks: &[]Work): Result[[]OutCol, DbErr] {
+    if len(s.items) == 0 { return Ok([]) }
+    let none: Option[Expr] = None
+    let np: []Val = array(if s.params > len(ptypes) { s.params } else { len(ptypes) }, Val.Null)
+    var sc = newScopeIn(st, txn, &np, ptypes)
+    for w in wworks { append(mut &sc.works, w.clone()) }
+    let from = if s.kind == lexdb_sql.S_INSERT { insFrom(s) } else if s.kind == lexdb_sql.S_MERGE { mergeFrom(s) } else { try dmlFrom(s) }
+    let q = try buildQuery(st, txn, &from, &none, &np, &s.subs, &newMap(), true, mut &sc, false)
+    var exprs: []Expr = []
+    if s.kind == lexdb_sql.S_MERGE {
+        let items = mergeItems(s, &q.levels[len(q.levels) - 1].t, &(if len(s.alias) > 0 { s.alias.clone() } else { lexdb_sql.baseName(&s.table) }))
+        return lexdb_bind.itemCols(&items, true, &q.cols, mut &sc.names, mut &exprs)
+    }
+    if lexdb_oldnew.hasStars(&s.items) {
+        let items = lexdb_oldnew.items(&s.items, &q.levels[0].t.cols, lexdb_catalog.ROWID, &q.levels[0].alias)
+        return lexdb_bind.itemCols(&items, true, &q.cols, mut &sc.names, mut &exprs)
+    }
+    return lexdb_bind.itemCols(&s.items, true, &q.cols, mut &sc.names, mut &exprs)
+}
+
+fn describeWctes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, ptypes: &[]int): Result[[]Work, DbErr] {
+    var works: []Work = []
+    for w in s.wctes {
+        let cols = try describeDmlWith(st, txn, &w.stmt, ptypes, &works)
+        let aliased = try lexdb_wcte.applyAliases(&w, &cols)
+        append(mut &works, Work{id: lexdb_wcte.workId(w.id), cols: lexdb_wcte.colsToDefs(&aliased)})
+    }
+    return Ok(works)
 }
 
 // ---- sessions
@@ -14300,6 +14426,17 @@ fn (s: mut &Session) resetAll() {
 // DDL, nor TRUNCATE).
 fn (s: mut &Session) tempWrite(stmt: &lexdb_sql.Stmt): bool {
     if len(s.tmp) == 0 || len(s.txn) == 0 { return false }
+    if len(stmt.wctes) > 0 {
+        let st = s.st.share()
+        let mainW = stmt.kind == lexdb_sql.S_INSERT || stmt.kind == lexdb_sql.S_UPDATE || stmt.kind == lexdb_sql.S_DELETE || stmt.kind == lexdb_sql.S_MERGE
+        if isWrite(stmt.kind) && !mainW { return false }
+        return lexdb_wcte.allWriteTargets(stmt, mainW, fn(tbl: &str): bool {
+            match catKey(&st, mut &s.txn[0], tbl, false) {
+                Ok(k) { return lexdb_catalog.tempRel(&k) }
+                Err(_) { return false }
+            }
+        })
+    }
     if !(stmt.kind == lexdb_sql.S_INSERT || stmt.kind == lexdb_sql.S_UPDATE || stmt.kind == lexdb_sql.S_DELETE ||
          stmt.kind == lexdb_sql.S_MERGE || (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from)) { return false }
     let st = s.st.share()
@@ -14313,6 +14450,16 @@ fn (s: mut &Session) tempWrite(stmt: &lexdb_sql.Stmt): bool {
 // flag): 25006 as PostgreSQL's, a temporary table's writes apart.
 fn roDefaultRefuses(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Unit, DbErr] {
     let what = match writesOn(s) { Some(w) { w } None { return Ok(Unit{}) } }
+    if len(s.wctes) > 0 {
+        let mainW = s.kind == lexdb_sql.S_INSERT || s.kind == lexdb_sql.S_UPDATE || s.kind == lexdb_sql.S_DELETE || s.kind == lexdb_sql.S_MERGE
+        if (!isWrite(s.kind) || mainW) && lexdb_wcte.allWriteTargets(s, mainW, fn(tbl: &str): bool {
+            match catKey(st, txn, tbl, false) {
+                Ok(k) { return lexdb_catalog.tempRel(&k) }
+                Err(_) { return false }
+            }
+        }) { return Ok(Unit{}) }
+        return Err(e("25006", &("cannot execute " + what + " in a read-only transaction")))
+    }
     if s.kind == lexdb_sql.S_INSERT || s.kind == lexdb_sql.S_UPDATE || s.kind == lexdb_sql.S_DELETE || s.kind == lexdb_sql.S_MERGE || (s.kind == lexdb_sql.S_COPY && s.copy.from) {
         match catKey(st, txn, &s.table, false) {
             Ok(k) { if lexdb_catalog.tempRel(&k) { return Ok(Unit{}) } }
@@ -14423,9 +14570,177 @@ fn execIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
 }
 
 fn hasSubs(s: &lexdb_sql.Stmt): bool {
-    if len(s.subs) > 0 { return true }
+    if len(s.subs) > 0 || len(s.wctes) > 0 { return true }
     for x in s.inner { if hasSubs(&x) { return true } }
     return false
+}
+
+type WcteRun = record {
+    baseMark: int
+    works: []Work
+    sh: Share
+    fkTabs: []Table
+    fkLater: []FkLater
+}
+
+fn addWcteWorks(sc: mut &Scope, wr: &[]WcteRun) {
+    if len(wr) == 0 { return }
+    for w in wr[0].works { append(mut &sc.works, w.clone()) }
+}
+
+fn addWcteFks(wr: mut &[]WcteRun, fw: &[]Table, later: mut &[]FkLater) {
+    for t in fw {
+        if findTab(&wr[0].fkTabs, &t.name) < 0 { append(mut &wr[0].fkTabs, t.clone()) }
+    }
+    for l in replace(later, []) { append(mut &wr[0].fkLater, l) }
+}
+
+fn execWcteDml(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
+               lim: Limits, pc: mut &PlanCache, wr: mut &[]WcteRun): Result[Res, DbErr] {
+    if len(s.wins) > 0 {
+        let what = if len(s.items) > 0 { "RETURNING" } else { stmtName(s.kind) }
+        return Err(e("42P20", &("window functions are not allowed in " + what)))
+    }
+    if s.kind == lexdb_sql.S_INSERT { return insertIn(st, txn, s, params, ptypes, lim, pc, wr) }
+    if s.kind == lexdb_sql.S_UPDATE {
+        if s.copy.batchRows > 0 { return Err(e("0A000", "lexdb: batch_rows is not allowed with data-modifying CTEs")) }
+        var win = noWin()
+        return updateB(st, txn, s, params, ptypes, lim, mut &win, wr)
+    }
+    if s.kind == lexdb_sql.S_DELETE {
+        if s.copy.batchRows > 0 { return Err(e("0A000", "lexdb: batch_rows is not allowed with data-modifying CTEs")) }
+        var win = noWin()
+        return deleteB(st, txn, s, params, ptypes, lim, mut &win, wr)
+    }
+    if s.kind == lexdb_sql.S_MERGE { return mergeIn(st, txn, s, params, ptypes, lim, wr) }
+    return Err(e("XX000", "not a data-modifying statement"))
+}
+
+fn selectW(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
+           lim: Limits, wr: mut &[]WcteRun): Result[Res, DbErr] {
+    txn.visCap = wr[0].baseMark
+    let noted = try catVersion(st, txn)
+    var sc = newScopeIn(st, txn, params, ptypes)
+    sc.noLp = true
+    addWcteWorks(mut &sc, wr)
+    var sel = try planSelect(st, txn, s, params, mut &sc)
+    pruneViews(mut &sel)
+    bindSel(mut &sel)
+    pipeSel(mut &sel)
+    return runSelIn(st, txn, &sel, params, lim, mut &wr[0].sh)
+}
+
+fn execWithWctes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
+                 lim: Limits): Result[Res, DbErr] {
+    var wr: []WcteRun = [WcteRun{baseMark: txn.mark(), works: [], sh: newShare(), fkTabs: [], fkLater: []}]
+    var mainRes = tagOnly("")
+    try lexdb_wcte.runAll(txn, s, fn(tx: mut &lexdb_store.Txn, phase: int, mk: int): Result[Unit, DbErr] {
+        wr[0].baseMark = mk
+        if phase == lexdb_wcte.PHASE_FK {
+            if len(wr[0].fkLater) == 0 { return Ok(Unit{}) }
+            return fkFinish(st, tx, &wr[0].fkTabs, mut &wr[0].fkLater)
+        }
+        var pc1 = oneShot()
+        if phase == lexdb_wcte.PHASE_MAIN {
+            if s.kind == lexdb_sql.S_SELECT {
+                mainRes = try selectW(st, tx, s, params, ptypes, lim, mut &wr)
+            } else {
+                mainRes = try execWcteDml(st, tx, s, params, ptypes, lim, mut &pc1, mut &wr)
+            }
+            return Ok(Unit{})
+        }
+        let w = &s.wctes[phase]
+        let r = try execWcteDml(st, tx, &w.stmt, params, ptypes, lim, mut &pc1, mut &wr)
+        let aliased = try lexdb_wcte.applyAliases(w, &r.cols)
+        append(mut &wr[0].works, Work{id: lexdb_wcte.workId(w.id), cols: lexdb_wcte.colsToDefs(&aliased)})
+        if len(w.stmt.items) > 0 {
+            wr[0].sh.held += lexdb_pipe.rowsBytes(&r.rows)
+            if lim.mem > 0 && wr[0].sh.held > lim.mem { return Err(lexdb_pipe.memErr(lim.mem)) }
+            cachePut(mut &wr[0].sh.cache, lexdb_wcte.cacheKey(w.id), r.rows)
+        }
+        return Ok(Unit{})
+    })
+    return Ok(mainRes)
+}
+
+fn explainWctes(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, analyze: bool, params: &[]Val,
+                lim: Limits, ptypes: &[]int): Result[Res, DbErr] {
+    var res = Res{cols: [OutCol{name: "QUERY PLAN", oid: lexdb_sql.OID_TEXT, spell: "", coll: "", scale: -1}], rows: [], tag: "EXPLAIN", hasRows: true, copy: COPY_NONE}
+    var lines: []str = []
+    if analyze {
+        let t0 = time.monotonicNs()
+        var wr: []WcteRun = [WcteRun{baseMark: txn.mark(), works: [], sh: newShare(), fkTabs: [], fkLater: []}]
+        var mainRes = tagOnly("")
+        try lexdb_wcte.runAll(txn, s, fn(tx: mut &lexdb_store.Txn, phase: int, mk: int): Result[Unit, DbErr] {
+            wr[0].baseMark = mk
+            if phase == lexdb_wcte.PHASE_FK {
+                if len(wr[0].fkLater) == 0 { return Ok(Unit{}) }
+                return fkFinish(st, tx, &wr[0].fkTabs, mut &wr[0].fkLater)
+            }
+            var pc1 = oneShot()
+            if phase == lexdb_wcte.PHASE_MAIN {
+                if s.kind == lexdb_sql.S_SELECT {
+                    mainRes = try selectW(st, tx, s, params, ptypes, lim, mut &wr)
+                } else {
+                    mainRes = try execWcteDml(st, tx, s, params, ptypes, lim, mut &pc1, mut &wr)
+                }
+                return Ok(Unit{})
+            }
+            let w = &s.wctes[phase]
+            let r = try execWcteDml(st, tx, &w.stmt, params, ptypes, lim, mut &pc1, mut &wr)
+            let aliased = try lexdb_wcte.applyAliases(w, &r.cols)
+            append(mut &lines, lexdb_wcte.explainHeader(w) + " (" + r.tag + ")")
+            append(mut &wr[0].works, Work{id: lexdb_wcte.workId(w.id), cols: lexdb_wcte.colsToDefs(&aliased)})
+            if len(w.stmt.items) > 0 {
+                cachePut(mut &wr[0].sh.cache, lexdb_wcte.cacheKey(w.id), r.rows)
+            }
+            return Ok(Unit{})
+        })
+        let us = (time.monotonicNs() - t0) / 1000
+        append(mut &lines, "result: " + len(mainRes.rows).toStr() + " rows in " + (us / 1000).toStr() + "." +
+               strings.padLeft(&((us % 1000).toStr()), 3, '0') + " ms")
+        for l in move(lines) { append(mut &res.rows, [Val.Text(l)]) }
+        return Ok(res)
+    }
+    let none: []lexdb_pipe.Counts = []
+    let noStats: []SubStat = []
+    var works: []Work = []
+    for w in s.wctes {
+        append(mut &lines, lexdb_wcte.explainHeader(&w))
+        let cols = try describeDmlWith(st, txn, &w.stmt, ptypes, &works)
+        let aliased = try lexdb_wcte.applyAliases(&w, &cols)
+        append(mut &works, Work{id: lexdb_wcte.workId(w.id), cols: lexdb_wcte.colsToDefs(&aliased)})
+    }
+    if s.kind == lexdb_sql.S_SELECT {
+        var sc = newScopeIn(st, txn, params, ptypes)
+        for w in works { append(mut &sc.works, w.clone()) }
+        var sel = try planSelect(st, txn, s, params, mut &sc)
+        bindSel(mut &sel)
+        pipeSel(mut &sel)
+        for l in selLines(&sel, &none, &noStats) { append(mut &lines, l) }
+    } else if s.kind == lexdb_sql.S_INSERT {
+        append(mut &lines, "insert " + lexdb_sql.shown(&s.table))
+        if len(s.inner) > 0 {
+            var sc = newScopeIn(st, txn, params, ptypes)
+            for w in works { append(mut &sc.works, w.clone()) }
+            var sel = try planSelect(st, txn, &s.inner[0], params, mut &sc)
+            bindSel(mut &sel)
+            pipeSel(mut &sel)
+            for l in selLines(&sel, &none, &noStats) { append(mut &lines, "  " + l) }
+        }
+    } else {
+        var sc = newScopeIn(st, txn, params, ptypes)
+        for w in works { append(mut &sc.works, w.clone()) }
+        let noOn: Option[Expr] = None
+        var q = if s.kind == lexdb_sql.S_MERGE { try buildQuery(st, txn, &mergeFrom(s), &noOn, params, &s.subs, &newMap(), true, mut &sc, false) }
+                else { try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, &newMap(), true, mut &sc, false) }
+        endScope(mut &sc, mut &q)
+        if len(q.subs) > 0 { pipeSubs(mut &q) }
+        for l in explainLines(&q, &none) { append(mut &lines, l) }
+        subLines(&q, &lexdb_plan.subsOf(&q), &noStats, mut &lines)
+    }
+    for l in move(lines) { append(mut &res.rows, [Val.Text(l)]) }
+    return Ok(res)
 }
 
 fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int,
@@ -14439,6 +14754,7 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
             }
         } else if !txn.inBlock() { try roDefaultRefuses(st, txn, s) }
     }
+    if len(s.wctes) > 0 { return execWithWctes(st, txn, s, params, ptypes, lim) }
     if len(s.wins) > 0 && s.kind != lexdb_sql.S_SELECT {
         let what = if len(s.items) > 0 && s.kind != lexdb_sql.S_SELECT { "RETURNING" } else { stmtName(s.kind) }
         return Err(e("42P20", &("window functions are not allowed in " + what)))
@@ -14509,6 +14825,7 @@ fn assertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &lexdb_sql.S
 // ANALYZE of a write. A write the statement gets to anyway (a sequence's
 // nextval) fails at its commit (lexdb_store.readOnly).
 fn writesOn(s: &lexdb_sql.Stmt): Option[str] {
+    if len(s.wctes) > 0 { return Some(stmtName(lexdb_wcte.firstWriteKind(s))) }
     if s.kind == lexdb_sql.S_SELECT && s.lockMode > 0 { return Some("SELECT " + lexdb_sql.lockName(s.lockMode)) }
     if s.kind == lexdb_sql.S_SELECT { return None }
     if s.kind == lexdb_sql.S_COPY { return if s.copy.from { Some("COPY FROM") } else { None } }
@@ -14998,9 +15315,10 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             if r.isErr() { s.failed = true }
             return r
         }
-        if s.readOnly && (isWrite(stmt.kind) || (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from)) && !s.tempWrite(stmt) {
+        let wcteW = len(stmt.wctes) > 0
+        if s.readOnly && (isWrite(stmt.kind) || wcteW || (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from)) && !s.tempWrite(stmt) {
             s.failed = true
-            return Err(e("25006", &("cannot execute " + stmtName(stmt.kind) + " in a read-only transaction")))
+            return Err(e("25006", &("cannot execute " + stmtName(if wcteW { lexdb_wcte.firstWriteKind(stmt) } else { stmt.kind }) + " in a read-only transaction")))
         }
         if s.readOnly && stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode > 0 {
             s.failed = true
@@ -15010,7 +15328,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         // UPDATE and DELETE read the live tree: the rows they change are
         // checked at COMMIT either way, and the latest is less often stale
         var isLive = stmt.kind == lexdb_sql.S_UPDATE || stmt.kind == lexdb_sql.S_DELETE || stmt.kind == lexdb_sql.S_INSERT || stmt.kind == lexdb_sql.S_MERGE ||
-                     (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from) || (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode > 0)
+                     wcteW || (stmt.kind == lexdb_sql.S_COPY && stmt.copy.from) || (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode > 0)
         if s.readOnly { isLive = false }       // (a temporary table's writes: its snapshot is the session's own, 9.96)
         s.txn[0].live = isLive
         let rcSnap = s.txn[0].rc && !isLive && !s.readOnly
@@ -15024,7 +15342,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits(), pc, input, out, pull, sink)
         if rcSnap { s.st.releaseSnapshot(mut &s.txn[0]) }
         if r.isOk() && s.txn[0].rc && (stmt.kind == lexdb_sql.S_UPDATE || stmt.kind == lexdb_sql.S_DELETE || stmt.kind == lexdb_sql.S_MERGE ||
-                                       (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode > 0)) {
+                                       wcteW || (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode > 0)) {
             s.txn[0].forgetReads(reads0)
         }
         if len(s.txn[0].onCommit) > 0 || lexdb_mview.hasStmtDeltas(s.id) { return s.blockEnd(stmt, r) }        // (its assertions, O23; materialized views; a temporary schema it made: TMP_MADE)
@@ -15047,8 +15365,8 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         // kind of transaction as the SELECT it shows, so that it shows what
         // the SELECT does (the index-to-scan switch is off where reads are
         // noted); EXPLAIN alone writes nothing
-        let explained = stmt.kind == lexdb_sql.S_EXPLAIN && len(stmt.inner) > 0 && stmt.inner[0].lockMode == 0
-        let snap = (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode == 0) || explained || (stmt.kind == lexdb_sql.S_COPY && !stmt.copy.from)
+        let explained = stmt.kind == lexdb_sql.S_EXPLAIN && len(stmt.inner) > 0 && stmt.inner[0].lockMode == 0 && !(stmt.ifFlag && len(stmt.inner[0].wctes) > 0)
+        let snap = (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode == 0 && len(stmt.wctes) == 0) || explained || (stmt.kind == lexdb_sql.S_COPY && !stmt.copy.from)
         var t = if snap { try s.st.beginSnapshot() } else { lexdb_store.begin() }
         s.setUp(mut &t)
         lexdb_mview.clearTxn(s.id)
@@ -23947,6 +24265,12 @@ fn pipeSub(sel: mut &Sel, lazy: bool) {
 // A function in FROM run: by its program with batches on, else (or when
 // its arguments did not bind) by the row engine (execSrf).
 fn srfRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, params: &[]Val, cap: int, rs: mut &Run): Result[Res, DbErr] {
+    if lexdb_wcte.isRef(&sel.srf) {
+        let key = lexdb_wcte.cacheKey(lexdb_wcte.refId(&sel.srf))
+        let at = cacheAt(&rs.cache, &key)
+        let rows: [][]Val = if at >= 0 { copyRows(&rs.cache.rows[at]) } else { [] }
+        return Ok(Res{cols: [], rows: rows, tag: "", hasRows: true, copy: COPY_NONE})
+    }
     if rs.batch && sel.pipe.isSome() {
         // census: lexdb_census.note("pipe", "")
         return pipeFunc(st, txn, sel, params, cap, rs)

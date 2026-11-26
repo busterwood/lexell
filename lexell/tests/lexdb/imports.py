@@ -49,7 +49,7 @@ CORE = {
     "lexdb_memo", "lexdb_mview", "lexdb_newfn", "lexdb_nncon", "lexdb_nnalter", "lexdb_annot", "lexdb_csr", "lexdb_graph", "lexdb_assert", "lexdb_copyjson", "lexdb_json", "lexdb_oldnew", "lexdb_ops", "lexdb_vec", "lexdb_decfit",
     "lexdb_page", "lexdb_parse", "lexdb_pct", "lexdb_pipe", "lexdb_plan", "lexdb_priv", "lexdb_repl", "lexdb_rows", "lexdb_routine",
     "lexdb_session", "lexdb_setop", "lexdb_sketch", "lexdb_skip", "lexdb_sort", "lexdb_sql", "lexdb_sqlcoll", "lexdb_srf", "lexdb_standby", "lexdb_stats", "lexdb_viewdep", "lexdb_ixname", "lexdb_tsqlname", "lexdb_txmode",
-    "lexdb_store", "lexdb_time", "lexdb_tmpstore", "lexdb_tz", "lexdb_udf", "lexdb_window",
+    "lexdb_store", "lexdb_time", "lexdb_tmpstore", "lexdb_tz", "lexdb_udf", "lexdb_wcte", "lexdb_window",
 }
 
 PG_DATA = {"lexdb_pgdata"}

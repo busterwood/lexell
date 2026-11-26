@@ -9,10 +9,10 @@ rows.
 
 ```
 WITH [ RECURSIVE ] with_query [, ...]
-{ SELECT ... | ( SELECT ... ) | INSERT ... | UPDATE ... | DELETE ... | MERGE ... }
+{ SELECT ... | ( SELECT ... ) | VALUES ... | INSERT ... | UPDATE ... | DELETE ... | MERGE ... }
 
 with_query:
-    name [ ( column_name [, ...] ) ] AS [ [ NOT ] MATERIALIZED ] ( query )
+    name [ ( column_name [, ...] ) ] AS [ [ NOT ] MATERIALIZED ] ( query | INSERT ... | UPDATE ... | DELETE ... | MERGE ... )
         [ SEARCH { BREADTH | DEPTH } FIRST BY column_name [, ...] SET search_seq_col_name ]
         [ CYCLE column_name [, ...] SET cycle_mark_col_name [ TO cycle_mark_value DEFAULT cycle_mark_default ]
               USING cycle_path_col_name ]
@@ -33,7 +33,10 @@ recursive query:
 : Accepted. The planner decides how the query is run.
 
 *query*
-: A `SELECT` or `VALUES`. Each query may read the ones listed before it.
+: A `SELECT`, `VALUES`, or (at the top level) a data-modifying statement (`INSERT`, `UPDATE`, `DELETE` or `MERGE`,
+  usually with `RETURNING`). Each query may read the ones listed before it. Data-modifying CTEs run once to
+  completion against the same pre-statement snapshot and pass rows to later CTEs and the main statement via
+  `RETURNING`.
 
 `RECURSIVE`
 : Lets a query read its own name. Such a query is a *non-recursive term*, `UNION` or `UNION ALL`, and a *recursive
@@ -63,8 +66,6 @@ recursive query:
 
 ## Differences from PostgreSQL
 
-- Data-modifying statements in `WITH` (`WITH d AS (DELETE ... RETURNING *) SELECT ...`) are not supported (42601,
-  lexdb-gaps.md 2.2).
 - A recursive query stops at a `LIMIT` when the statement has no `ORDER BY`, grouping, `DISTINCT` or window, and
   reads the query as its first table (a derived table of such a query too). It still runs until `max_recursion` and
   fails with 54001 for a join where lexdb's planner reads the other table first (`FROM rt JOIN n`), for a subquery
@@ -75,8 +76,6 @@ recursive query:
   rows, and ends with 54001 at `max_recursion`.
 - With `RECURSIVE`, a query of the list may not read one listed after it (42P01); PostgreSQL allows it.
 - PostgreSQL has no `max_recursion` setting; it recurses until the query ends or runs out of memory.
-- `WITH ... VALUES ...` (a `VALUES` statement after `WITH`) is a syntax error. `VALUES` works as a `WITH` query, and
-  after `WITH` in a `SELECT * FROM (VALUES ...)`.
 
 ## Examples
 
@@ -322,13 +321,13 @@ RESET
 
 <!-- example: postgresql -->
 ```sql
-WITH d AS (DELETE FROM emp WHERE id = 6 RETURNING *) SELECT * FROM d;
+WITH d AS (DELETE FROM emp WHERE id = 6) SELECT * FROM d;
 WITH t AS (SELECT 1), t AS (SELECT 2) SELECT 1;
 WITH RECURSIVE r(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM r WHERE n IN (SELECT n FROM r)) SELECT * FROM r;
 ```
 
 ```text
-ERROR:  syntax error at or near "delete"
+ERROR:  WITH query "d" does not have a RETURNING clause
 ERROR:  WITH query name "t" specified more than once
 ERROR:  recursive reference to query "r" must not appear within a subquery
 ```
