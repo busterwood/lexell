@@ -25,7 +25,8 @@ For a high-level introduction to LexDB's architecture, features, and performance
 | **Durable OLTP updates** (1–32 clients) | up to **63.3k/s** (`pgbench`) / **54.2k/s** (`sysbench`) | 25.7k/s / 23.0k/s | **2.41–2.67×** (`pgbench`); **2.36–3.13×** (`sysbench` non-index); **1.32–2.54×** (`sysbench` indexed) |
 | **Point selects (3 read replicas, 32 clients)** | **470–490k/s** (`pgbench`) / **350.5k/s** (`sysbench`) | 397k/s / 334k/s (4 cores) | **1.18–1.23×** (`pgbench`); **1.05×** (`sysbench`, 29% less CPU); replica lag **0.22 ms** p50 / **0.44 ms** p99 |
 | **Bulk `\copy` loads** (5 cases, 1M–10M rows) | 0.24–2.44 s | 0.61–5.93 s | **1.1–2.7× faster** (`0.37–0.94×`) on all 5 workloads |
-| **Property graphs (SQL/PGQ)** (11 queries, 1.1M edges, 1 core) | **822 ms** (`0.41 ms` G10 / `7.37 ms` G11 / `388 ms` G9) | 5,661 ms (PG1) / 962 ms (DuckPGQ) / 1,367 ms (Kùzu) | **Fastest total time of all 4**; geomean **6.38× faster** than PG1, **2.50× faster** than DuckPGQ, **4.79× faster** than Kùzu ([full report](property-graphs.md)) |
+| **Property graphs — LDBC LSQB SF1** (9 queries, 22.2M edges, 1 core) | **14.2 s** (`0.45 s` Q6 / `1.00 s` Q1) | 98.1 s (PG1, 8/9) / 19.6 s (DuckPGQ) / 105.0 s (Kùzu) / 156.0 s (Neo4j) | **Fastest of all 5 engines**; geomean **1.58× faster** than DuckPGQ (7/9), **5.40×** vs PG1, **2.39×** vs Kùzu, **9.48×** vs Neo4j ([full report](property-graphs.md#benchmark-2-ldbc-lsqb-sf01-and-sf1-5-engines)) |
+| **Property graphs — social suite** (11 queries, 1.1M edges, 1 core) | **822 ms** (`0.41 ms` G10 / `7.37 ms` G11 / `388 ms` G9) | 5,661 ms (PG1) / 962 ms (DuckPGQ) / 1,367 ms (Kùzu) | **Fastest total time of all 4**; geomean **6.38× faster** than PG1, **2.50× faster** than DuckPGQ, **4.79× faster** than Kùzu ([full report](property-graphs.md#benchmark-1-social-network-graph-suite-11-queries-11m-edges)) |
 
 PostgreSQL is ahead on single-process multi-thread reads (before adding replicas) and multi-statement read-write blocks.
 

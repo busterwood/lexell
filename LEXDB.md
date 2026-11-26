@@ -86,9 +86,17 @@ See [MATCH_RECOGNIZE (PostgreSQL door)](lexell/docs/lexdb/sql/postgresql/match-r
 
 ### 4. SQL:2023 Property Graphs (`CREATE PROPERTY GRAPH`, `GRAPH_TABLE` & `ANY SHORTEST`)
 
-Define property graphs directly over your existing relational tables with zero data duplication and query multi-hop patterns, cyclic patterns, label expressions, and **`ANY SHORTEST`** paths (bounded or unbounded `+`/`*`) across all three doors — backed by FK-verified vertex-table elimination, edge-local predicate rewriting, direct-indexed and packed composite integer hash joins, cold bidirectional index-only BFS, and an MVCC-safe cached CSR engine.
+Define property graphs directly over your existing relational tables with zero data duplication and query multi-hop patterns, cyclic patterns, label expressions, and **`ANY SHORTEST`** paths (bounded or unbounded `+`/`*`) across all three doors — backed by FK-verified vertex-table elimination, `GRAPH_TABLE` join flattening, direct-indexed and 64-bit composite integer hash joins, weighted count-only pipelines, cold bidirectional index-only BFS, and an MVCC-safe cached CSR engine.
 
-On a 100k-vertex / 1.1M-edge social-graph benchmark (11 queries, single core / single thread, exact 11/11 parity), LexDB's `GRAPH_TABLE` posts the **fastest total time of all four engines (`0.82 s`)** — beating **PostgreSQL 18** (`5.66 s`, **6.38×** geomean), **DuckDB 2.0 + DuckPGQ** (`0.96 s`, **2.50×** geomean), and **Kùzu 0.11** (`1.37 s`, **4.79×** geomean), counting full-graph 1M-edge triangles in **388 ms** (fastest of all four), finding 5-hop shortest paths in **0.41 ms warm / 0.71 ms cold**, and computing single-source shortest paths to 2,000 targets in **7.37 ms**. See **[Property graphs in LexDB](lexell/docs/lexdb/property-graphs.md)**.
+Measured single-core / single-thread with 100% exact result parity across all engines:
+
+| Graph benchmark (1 core / 1 thread) | LexDB | DuckDB 2.0 + DuckPGQ | PostgreSQL 18 | Kùzu 0.11 | Neo4j 5.26 |
+|---|---:|---:|---:|---:|---:|
+| **LDBC LSQB SF1** (9 queries, 4.0M vertices / 22.2M edges) | **14.2 s** | 19.6 s | 98.1 s *(8/9, Q9 timeout)* | 105.0 s | 156.0 s |
+| **LDBC LSQB SF0.1** (9 queries, 432k vertices / 2.1M edges) | **0.64 s** | 0.67 s | 3.93 s *(8/9, Q9 timeout)* | 3.95 s | 7.60 s |
+| **Social-graph suite** (11 queries, 100k vertices / 1.1M edges, incl. `ANY SHORTEST`) | **0.82 s** | 0.96 s | 5.66 s | 1.37 s | — |
+
+LexDB posts the **fastest total time across all three suites** — beating DuckPGQ on 7/9 LSQB SF1 queries (**1.58×** geomean), Kùzu (**2.39×** geomean, **7.4×** total), PostgreSQL 18 (**5.40×** geomean on completed queries), and Neo4j (**9.48×** geomean, **11.0×** total), while finding 5-hop shortest paths in **0.41 ms warm / 0.71 ms cold** and counting 1M-edge triangles in **388 ms**. See **[Property graphs in LexDB](lexell/docs/lexdb/property-graphs.md)** for full query-by-query tables and details.
 
 ### 5. Incremental materialized views & data skipping indexes
 
@@ -111,7 +119,8 @@ With **no materialized views and no explicit skipping indexes**, LexDB's single-
 | **35 Analytic Queries** (1M rows, 1 core) | **0.46× CPU / 0.91× wall** | 1 core / 4 proc | **2.2× less CPU** than 1-core PG; faster wall time than 4-process PG |
 | **Durable OLTP updates** (1–32 clients) | up to **63.3k/s** (`pgbench`) / **54.2k/s** (`sysbench`) | 25.7k/s / 23.0k/s | **2.4–3.1× faster** non-indexed updates; **1.3–2.5× faster** indexed updates (`27.7k/s`); commit latency **0.42 ms** median / **0.86–0.89 ms** p99 |
 | **Bulk `\copy` loads** (5 cases, 1M–10M rows) | **0.24–2.44 s** | 0.61–5.93 s | **1.1–2.7× faster** on every workload (including wide tables + secondary indexes) |
-| **Property graphs (SQL/PGQ)** (11 queries, 1.1M edges, 1 core) | **0.82 s total** (`0.41 ms` 5-hop shortest path, `388 ms` 1M-edge triangles) | 5.66 s (PG1) / 0.96 s (DuckPGQ) / 1.37 s (Kùzu) | **Fastest total time of all 4 engines**; geomean **6.38× faster** than PG1, **2.50× faster** than DuckPGQ, **4.79× faster** than Kùzu ([details](lexell/docs/lexdb/property-graphs.md)) |
+| **Property graphs — LDBC LSQB SF1** (9 queries, 22.2M edges, 1 core) | **14.2 s total** (`0.45 s` 1.67B-match Q6) | 98.1 s (PG1, 8/9) / 19.6 s (DuckPGQ) / 105.0 s (Kùzu) / 156.0 s (Neo4j) | **Fastest of all 5 engines**; beats DuckPGQ on 7/9 (**1.58×** geomean), PG1 (**5.40×**), Kùzu (**2.39×**), Neo4j (**9.48×**) ([details](lexell/docs/lexdb/property-graphs.md#benchmark-2-ldbc-lsqb-sf01-and-sf1-5-engines)) |
+| **Property graphs — social suite** (11 queries, 1.1M edges, 1 core) | **0.82 s total** (`0.41 ms` 5-hop shortest path, `388 ms` 1M-edge triangles) | 5.66 s (PG1) / 0.96 s (DuckPGQ) / 1.37 s (Kùzu) | **Fastest total time of all 4 engines**; geomean **6.38× faster** than PG1, **2.50× faster** than DuckPGQ, **4.79× faster** than Kùzu ([details](lexell/docs/lexdb/property-graphs.md#benchmark-1-social-network-graph-suite-11-queries-11m-edges)) |
 
 ### 2. Scaling reads across cores with read replicas
 
