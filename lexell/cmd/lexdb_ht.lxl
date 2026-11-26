@@ -126,6 +126,166 @@ pub fn (t: &FastIntCount) get(k: int): int {
 }
 
 // ============================================================================
+// 0b. FastInt2Count & FastInt2Map: Flat open-addressed (int64, int64) tables
+//     for 2-column 64-bit integer hash joins (JK_INT2_64), zero string allocs.
+// ============================================================================
+
+fn mix2(k0: int, k1: int): u64 {
+    let h0 = k0.hash()
+    let h1 = k1.hash()
+    let x = h0 ^ (h1 << 1) ^ (h1 >> 7)
+    return x ^ (x >> 32)
+}
+
+pub type FastInt2Count = record {
+    pub ks0: []int
+    pub ks1: []int
+    pub vs: []int       // slot -> count (0 = empty)
+    mask: int
+    len: int
+}
+
+pub fn newFastInt2Count(): FastInt2Count {
+    return FastInt2Count{ks0: [], ks1: [], vs: [], mask: 0, len: 0}
+}
+
+pub fn (t: &FastInt2Count) size(): int { return t.len }
+
+fn (t: mut &FastInt2Count) grow() {
+    let cap = if len(t.vs) == 0 { 1024 } else { len(t.vs) * 2 }
+    let mask = cap - 1
+    var nks0: []int = array(cap, 0)
+    var nks1: []int = array(cap, 0)
+    var nvs: []int = array(cap, 0)
+    for i in 0..len(t.vs) {
+        let v = t.vs[i]
+        if v == 0 { continue }
+        let k0 = t.ks0[i]
+        let k1 = t.ks1[i]
+        var sl = int(mix2(k0, k1) & u64(mask))
+        while nvs[sl] != 0 { sl = (sl + 1) & mask }
+        nks0[sl] = k0
+        nks1[sl] = k1
+        nvs[sl] = v
+    }
+    t.ks0 = nks0
+    t.ks1 = nks1
+    t.vs = nvs
+    t.mask = mask
+}
+
+pub fn (t: mut &FastInt2Count) inc(k0: int, k1: int): bool {
+    if len(t.vs) == 0 || (t.len + 1) * 10 >= len(t.vs) * 6 {
+        t.grow()
+    }
+    let mask = t.mask
+    var sl = int(mix2(k0, k1) & u64(mask))
+    while true {
+        let v = t.vs[sl]
+        if v == 0 {
+            t.ks0[sl] = k0
+            t.ks1[sl] = k1
+            t.vs[sl] = 1
+            t.len += 1
+            return true
+        }
+        if t.ks0[sl] == k0 && t.ks1[sl] == k1 {
+            t.vs[sl] = v + 1
+            return false
+        }
+        sl = (sl + 1) & mask
+    }
+    return false
+}
+
+pub fn (t: &FastInt2Count) get(k0: int, k1: int): int {
+    if t.len == 0 { return 0 }
+    let mask = t.mask
+    var sl = int(mix2(k0, k1) & u64(mask))
+    while true {
+        let v = t.vs[sl]
+        if v == 0 { return 0 }
+        if t.ks0[sl] == k0 && t.ks1[sl] == k1 { return v }
+        sl = (sl + 1) & mask
+    }
+    return 0
+}
+
+pub type FastInt2Map = record {
+    pub ks0: []int
+    pub ks1: []int
+    pub vs: []int       // slot -> bucket + 1 (0 = empty)
+    mask: int
+    len: int
+}
+
+pub fn newFastInt2Map(): FastInt2Map {
+    return FastInt2Map{ks0: [], ks1: [], vs: [], mask: 0, len: 0}
+}
+
+pub fn (t: &FastInt2Map) size(): int { return t.len }
+
+fn (t: mut &FastInt2Map) grow() {
+    let cap = if len(t.vs) == 0 { 1024 } else { len(t.vs) * 2 }
+    let mask = cap - 1
+    var nks0: []int = array(cap, 0)
+    var nks1: []int = array(cap, 0)
+    var nvs: []int = array(cap, 0)
+    for i in 0..len(t.vs) {
+        let v = t.vs[i]
+        if v == 0 { continue }
+        let k0 = t.ks0[i]
+        let k1 = t.ks1[i]
+        var sl = int(mix2(k0, k1) & u64(mask))
+        while nvs[sl] != 0 { sl = (sl + 1) & mask }
+        nks0[sl] = k0
+        nks1[sl] = k1
+        nvs[sl] = v
+    }
+    t.ks0 = nks0
+    t.ks1 = nks1
+    t.vs = nvs
+    t.mask = mask
+}
+
+// Returns existing bucket (>= 0) or inserts nextBk and returns nextBk.
+pub fn (t: mut &FastInt2Map) getOrPut(k0: int, k1: int, nextBk: int): int {
+    if len(t.vs) == 0 || (t.len + 1) * 10 >= len(t.vs) * 6 {
+        t.grow()
+    }
+    let mask = t.mask
+    var sl = int(mix2(k0, k1) & u64(mask))
+    while true {
+        let v = t.vs[sl]
+        if v == 0 {
+            t.ks0[sl] = k0
+            t.ks1[sl] = k1
+            t.vs[sl] = nextBk + 1
+            t.len += 1
+            return nextBk
+        }
+        if t.ks0[sl] == k0 && t.ks1[sl] == k1 {
+            return v - 1
+        }
+        sl = (sl + 1) & mask
+    }
+    return nextBk
+}
+
+pub fn (t: &FastInt2Map) get(k0: int, k1: int): int {
+    if t.len == 0 { return -1 }
+    let mask = t.mask
+    var sl = int(mix2(k0, k1) & u64(mask))
+    while true {
+        let v = t.vs[sl]
+        if v == 0 { return -1 }
+        if t.ks0[sl] == k0 && t.ks1[sl] == k1 { return v - 1 }
+        sl = (sl + 1) & mask
+    }
+    return -1
+}
+
+// ============================================================================
 // 1. TwoLevelInt: Adaptive two-level flat hash table for 1-int/bool GROUP BY
 // ============================================================================
 
