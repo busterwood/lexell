@@ -75,6 +75,7 @@ fn isNullVal(v: &Val): bool { match v { Val.Null { return true } else { return f
 // it starts the variable part).
 pub type FixedLay = record {
     pub kinds: []byte
+    pub kindsStr: str           // raw bytes of kinds for O(1) memcmp in layoutOk
     pub off: []int              // per place
     pub prev: []int
     pub bm: int                 // the bitmap's offset
@@ -448,7 +449,9 @@ pub fn layOfKinds(kinds: &[]byte): FixedLay {
         }
         at += fixedSize(k)
     }
-    return FixedLay{kinds: ks, off: off, prev: prev, bm: bm, v0: at}
+    var kstr = ""
+    for p in 0..np { kstr.addByte(kinds[p]) }
+    return FixedLay{kinds: ks, kindsStr: kstr, off: off, prev: prev, bm: bm, v0: at}
 }
 
 // Rows written in the fixed layout when every value fits it (9.50); a test
@@ -1283,26 +1286,193 @@ pub fn leafValAt(l: &LeafView, i: int): &str {
 // needed place up to stopAt inline, with no needed place stored as a long text
 // (tag 5) and every byte in bounds.
 pub fn fitsInStop(p: &str, stopAt: int, placeCol: &[]int): bool {
-    if len(p) < 5 || p[0] != 6 { return false }
+    let plen = len(p)
+    if plen < 5 || p[0] != 6 { return false }
     let cols = binary.readU32LEStr(p, 1)
     let lim = if stopAt < cols { stopAt } else { cols }
     var at = 5
     for pl in 0..lim {
-        if at >= len(p) { return false }
+        if at >= plen { return false }
         let tag = p[at]
         at += 1
-        if tag == 5 {
+        if tag == 0 {
+        } else if tag == 1 || (tag >= 7 && tag <= 10) || tag == 14 {
+            at += 8
+        } else if tag == 2 {
+            at += 1
+        } else if tag == 5 {
             if placeCol[pl] >= 0 { return false }
             at += 4
+        } else if tag == 3 || tag == 4 || tag == 13 {
+            if at + 4 > plen { return false }
+            at += 4 + binary.readU32LEStr(p, at)
+        } else if tag == 11 {
+            at += 24
+        } else if tag == 12 {
+            at += 16
+        } else if tag == 15 {
+            at += 4
+        } else if tag == 16 {
+            at += 10
         } else {
-            if (tag == 3 || tag == 4 || tag == 13) && at + 4 > len(p) { return false }
-            let sz = valSize(p, at, tag)
-            if sz < 0 { return false }
-            at += sz
+            return false
         }
-        if at > len(p) { return false }
+        if at > plen { return false }
     }
     return true
+}
+
+// Single-pass decoder for format-6 rows (whole row with optional long-text tail)
+// directly into row r of Batch b: avoids double-pass fitsInStop and avoids the
+// full-width []Val allocation + double string clone of decodeRowNeed.
+fn decodeFormat6(s: &str, r: int, b: mut &Batch, bp: &Projection): Result[int, DbErr] {
+    let slen = len(s)
+    if slen < 5 { return Err(lexdb_base.corrupt("a row's header")) }
+    let cols = binary.readU32LEStr(s, 1)
+    let kinds = &bp.kinds
+    let placeCol = &bp.placeCol
+    let missing = &bp.missing
+    let stopAt = bp.stopAt
+    var at = 5
+    var tailSkip = 0
+    var lCols: []int = []
+    var lOffs: []int = []
+    var lLens: []int = []
+    for pl in 0..stopAt {
+        let c = placeCol[pl]
+        if pl >= cols {
+            if c >= 0 {
+                let mv = if pl < len(missing) { missing[pl].clone() } else { Val.Null }
+                if !put(b, c, r, mv, kinds[c]) { return Ok(1) }
+            }
+            continue
+        }
+        if at >= slen { return Err(lexdb_base.corrupt("a row's value tag")) }
+        let tag = s[at]
+        at += 1
+        if tag == 5 {
+            if at + 4 > slen { return Err(lexdb_base.corrupt("a row's long text")) }
+            let l = binary.readU32LEStr(s, at)
+            at += 4
+            if c >= 0 {
+                append(mut &lCols, c)
+                append(mut &lOffs, tailSkip)
+                append(mut &lLens, l)
+            }
+            tailSkip += l
+            continue
+        }
+        if c < 0 {
+            if tag == 0 {
+            } else if tag == 1 || (tag >= 7 && tag <= 10) || tag == 14 {
+                at += 8
+            } else if tag == 2 {
+                at += 1
+            } else if tag == 3 || tag == 4 || tag == 13 {
+                at += 4 + binary.readU32LEStr(s, at)
+            } else if tag == 11 {
+                at += 24
+            } else if tag == 12 {
+                at += 16
+            } else if tag == 15 {
+                at += 4
+            } else if tag == 16 {
+                at += 10
+            } else {
+                return Err(lexdb_base.corrupt("a row's value tag"))
+            }
+            continue
+        }
+        let k = kinds[c]
+        if tag == 0 {
+            setNull(b, c, r)
+        } else if tag == 1 && k == BK_INT {
+            b.cols[c].v[r] = binary.readI64LEStr(s, at)
+            at += 8
+        } else if tag == 2 && k == BK_BOOL {
+            b.cols[c].v[r] = if s[at] == 1 { 1 } else { 0 }
+            at += 1
+        } else if isDecKind(k) {
+            if tag != 3 { return Ok(1) }
+            let l = binary.readU32LEStr(s, at)
+            let tx = s[at + 4..at + 4 + l]
+            at += 4 + l
+            match Decimal.parse(&tx) {
+                Ok(d) { if !put(b, c, r, Val.Num(d), k) { return Ok(1) } }
+                Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
+            }
+        } else if k == BK_TEXT {
+            if tag != 4 { return Ok(1) }
+            let l = binary.readU32LEStr(s, at)
+            if !putText(b, c, r, &s[at + 4..at + 4 + l]) { return Ok(1) }
+            at += 4 + l
+        } else if k != BK_VAL {
+            return Ok(1)
+        } else if tag == 1 {
+            b.vals[c][r] = Val.Int(binary.readI64LEStr(s, at))
+            at += 8
+        } else if tag == 2 {
+            b.vals[c][r] = Val.Bool(s[at] == 1)
+            at += 1
+        } else if tag == 3 || tag == 4 {
+            let l = binary.readU32LEStr(s, at)
+            let tx = s[at + 4..at + 4 + l]
+            at += 4 + l
+            if tag == 4 {
+                b.vals[c][r] = Val.Text(tx.clone())
+            } else {
+                match Decimal.parse(&tx) {
+                    Ok(d) { b.vals[c][r] = Val.Num(d) }
+                    Err(_) { return Err(lexdb_base.corrupt("a numeric value in a row")) }
+                }
+            }
+        } else if tag >= 7 && tag <= 16 {
+            b.vals[c][r] = timeVal(s, at, tag)
+            at += valSize(s, at, tag)
+        } else {
+            return Err(lexdb_base.corrupt("a row's value tag"))
+        }
+    }
+    if len(lCols) == 0 { return Ok(0) }
+    // Advance past remaining inline headers (stopAt..cols) to reach the long-text tail
+    for pl in stopAt..cols {
+        if at >= slen { return Err(lexdb_base.corrupt("a row's value tag")) }
+        let tag = s[at]
+        at += 1
+        if tag == 0 {
+        } else if tag == 1 || (tag >= 7 && tag <= 10) || tag == 14 {
+            at += 8
+        } else if tag == 2 {
+            at += 1
+        } else if tag == 5 || tag == 15 {
+            at += 4
+        } else if tag == 3 || tag == 4 || tag == 13 {
+            at += 4 + binary.readU32LEStr(s, at)
+        } else if tag == 11 {
+            at += 24
+        } else if tag == 12 {
+            at += 16
+        } else if tag == 16 {
+            at += 10
+        } else {
+            return Err(lexdb_base.corrupt("a row's value tag"))
+        }
+    }
+    for k in 0..len(lCols) {
+        let c = lCols[k]
+        let off = at + lOffs[k]
+        let l = lLens[k]
+        if off + l > slen { return Err(lexdb_base.corrupt("a row's long text")) }
+        let kk = kinds[c]
+        if kk == BK_TEXT {
+            if !putText(b, c, r, &s[off..off + l]) { return Ok(1) }
+        } else if kk == BK_VAL {
+            b.vals[c][r] = Val.Text(s[off..off + l].clone())
+        } else {
+            return Ok(1)
+        }
+    }
+    return Ok(0)
 }
 
 // Decodes tagged row bytes starting at s[at0..] (cols >= 0 for format-6 rows /
@@ -1326,9 +1496,24 @@ fn decodeTaggedAt(s: &str, at0: int, cols: int, r: int, b: mut &Batch, bp: &Proj
         let tag = s[at]
         at += 1
         if c < 0 {
-            let sz = valSize(s, at, tag)
-            if sz < 0 { return Err(lexdb_base.corrupt("a row's value tag")) }
-            at += sz
+            if tag == 0 {
+            } else if tag == 1 || (tag >= 7 && tag <= 10) || tag == 14 {
+                at += 8
+            } else if tag == 2 {
+                at += 1
+            } else if tag == 5 || tag == 15 {
+                at += 4
+            } else if tag == 3 || tag == 4 || tag == 13 {
+                at += 4 + binary.readU32LEStr(s, at)
+            } else if tag == 11 {
+                at += 24
+            } else if tag == 12 {
+                at += 16
+            } else if tag == 16 {
+                at += 10
+            } else {
+                return Err(lexdb_base.corrupt("a row's value tag"))
+            }
             continue
         }
         let k = kinds[c]
@@ -1437,17 +1622,7 @@ pub fn decodeRow(s: &str, r: int, b: mut &Batch, bp: &Projection, rw: &Rows): Re
         return Ok(2)
     }
     if len(s) > 0 && s[0] == 6 {
-        if fitsInStop(s, bp.stopAt, placeCol) {
-            return decodeTaggedAt(s, 5, binary.readU32LEStr(s, 1), r, b, bp)
-        }
-        // a row with long texts, kept whole in its leaf: read as the row path reads it
-        let places = try decodeRowNeed(s, bp.width, &bp.needP, missing, rw.lays)
-        for i in 0..len(kinds) {
-            if !bp.needCol[i] { continue }
-            let pl = if len(rw.slots) == 0 { i } else { rw.slots[i] }
-            if !put(b, i, r, places[pl].clone(), kinds[i]) { return Ok(1) }
-        }
-        return Ok(0)
+        return decodeFormat6(s, r, b, bp)
     }
     return decodeTaggedAt(s, 0, -1, r, b, bp)
 }
@@ -1731,7 +1906,7 @@ pub fn runCols(rows: &[]&str, qs: &[]int, r0: int, ps: &[]int, b: mut &Batch, bp
 // Whether column leaf leaf's rows are in a layout of rw with the same kinds.
 pub fn layoutOk(leaf: &LeafView, rw: &Rows): bool {
     let lid = lexdb_cols.layoutOf(leaf.dir)
-    return lid < len(rw.lays) && lexdb_cols.kindsAre(leaf.cols, leaf.dir, &rw.lays[lid].kinds)
+    return lid < len(rw.lays) && lexdb_cols.kindsAreStr(leaf.cols, leaf.dir, &rw.lays[lid].kindsStr)
 }
 
 // The text of dictionary coded columns, kept for the program (strStatic):
