@@ -66,7 +66,29 @@ On read replicas, PostgreSQL 19's **`WAIT FOR LSN`** gives clients zero-polling 
 
 See [SELECT ... WAIT](lexell/docs/lexdb/sql/postgresql/select-wait.md) and [WAIT FOR LSN](lexell/docs/lexdb/sql/postgresql/wait-for-lsn.md).
 
-### 3. Row pattern recognition with `MATCH_RECOGNIZE`
+### 3. Incremental materialized views & data skipping indexes
+
+In most databases (including PostgreSQL), materialized views are static snapshots that require expensive full `REFRESH` scans and force you to rewrite every application query to name the view. LexDB removes both limits across all three doors:
+
+- **Automatic incremental maintenance (`FAST`).** Inserts, updates, deletes, and bulk loads update only the affected summary rows in **under 1 ms** — supporting cascading multi-level rollup DAGs, composable **HyperLogLog++ / t-digest sketches** for approximate distinct counts and percentiles, and sharded append-only delta trees (`refresh = 'realtime'`) for high-contention hot keys (**22,100+ durable commits/s**).
+- **Transparent query rewrite (`query_rewrite = true`).** Your application keeps querying the base tables unchanged; the planner automatically rewrites coarser rollups, filtered slices, `DATE_TRUNC` groupings, exact `COUNT(DISTINCT)` over MV keys, and dimension join-backs onto the materialized view.
+- **Automatic zone maps & five data skipping index types.** Every columnar table automatically tracks hierarchical min/max bounds for range and Top-N pruning, and optional per-block skipping indexes (`minmax`/`brin`, `set`, `bloom_filter`, `ngrambf`, `tokenbf`) prune wide-table scans — including leading-wildcard `LIKE '%substring%'` and `ILIKE` — with **zero OLTP write slowdown**.
+
+```sql
+-- Maintained incrementally on every write; base-table queries rewrite onto it automatically
+CREATE MATERIALIZED VIEW mv_orders_daily
+WITH (refresh = 'fast_on_statement', query_rewrite = true) AS
+SELECT order_date, region_id, status, COUNT(*) AS n, SUM(amount) AS total
+FROM orders
+GROUP BY order_date, region_id, status;
+
+-- Prunes non-matching blocks for leading-wildcard substring searches (zero write amplification)
+CREATE SKIPPING INDEX ix_hits_url ON hits (url) USING ngrambf(3, 2048, 3);
+```
+
+See [Materialized views](lexell/docs/lexdb/materialized-views.md), [Data skipping indexes](lexell/docs/lexdb/skipping-indexes.md), and the ClickBench / 1M-row benchmarks in [Unlocking even more performance](#unlocking-even-more-performance) below.
+
+### 4. Row pattern recognition with `MATCH_RECOGNIZE`
 
 SQL:2016 `MATCH_RECOGNIZE` lets you run regular-expression pattern matching directly over ordered sequences of rows — finding user sessions, V-shaped price reversals, gaps and islands, consecutive failure streaks, or fraud patterns in a single declarative query (`PARTITION BY`, `ORDER BY`, `PATTERN`, `DEFINE`, `MEASURES`, `SUBSET`, `PERMUTE`, `AFTER MATCH SKIP`).
 
@@ -84,7 +106,7 @@ FROM events MATCH_RECOGNIZE (
 
 See [MATCH_RECOGNIZE (PostgreSQL door)](lexell/docs/lexdb/sql/postgresql/match-recognize.md) and [MATCH_RECOGNIZE (Oracle door)](lexell/docs/lexdb/sql/oracle/match-recognize.md).
 
-### 4. SQL:2023 Property Graphs (`CREATE PROPERTY GRAPH`, `GRAPH_TABLE` & `ANY SHORTEST`)
+### 5. SQL:2023 Property Graphs (`CREATE PROPERTY GRAPH`, `GRAPH_TABLE` & `ANY SHORTEST`)
 
 Define property graphs directly over your existing relational tables with zero data duplication and query multi-hop patterns, cyclic patterns, label expressions, and **`ANY SHORTEST`** paths (bounded or unbounded `+`/`*`) across all three doors — backed by FK-verified vertex-table elimination, `GRAPH_TABLE` join flattening, direct-indexed and 64-bit composite integer hash joins, weighted count-only pipelines, cold bidirectional index-only BFS, and an MVCC-safe cached CSR engine.
 
@@ -97,10 +119,6 @@ Measured single-core / single-thread with 100% exact result parity across all en
 | **Social-graph suite** (11 queries, 100k vertices / 1.1M edges, incl. `ANY SHORTEST`) | **0.82 s** | 0.96 s | 5.66 s | 1.37 s | — |
 
 On the **11-query social-graph suite** (local traversals, triangles, and shortest paths), LexDB is the **fastest of all four engines** (`0.82 s` total, `0.41 ms` warm / `0.71 ms` cold 5-hop shortest path, `388 ms` 1M-edge triangles). On **LDBC LSQB** (pure full-graph analytical pattern counting), in-memory DuckDB 2.0 + DuckPGQ (with matching `PRIMARY KEY` / `FOREIGN KEY` constraints) leads overall (`4.56 s` SF1), while LexDB is **#2 overall and #1 among disk-backed transactional & graph databases** — beating PostgreSQL 18 (**5.40×** geomean on completed queries), Kùzu (**2.39×** geomean, **7.4×** total), and Neo4j Community (**9.48×** geomean, **11.0×** total), and beating DuckPGQ on 1.67B-match SF1 `Q6` (`446 ms` vs `569 ms`). See **[Property graphs in LexDB](lexell/docs/lexdb/property-graphs.md)** for full query-by-query tables and methodology.
-
-### 5. Incremental materialized views & data skipping indexes
-
-Keep precomputed rollups, cascading rollup DAGs, and HyperLogLog++ / t-digest sketches fresh in under a millisecond with automatic transparent query rewrite, and prune wide-table scans (including `LIKE '%substring%'`) with automatic zone maps and five skipping index types — see [Unlocking even more performance](#unlocking-even-more-performance) below.
 
 ---
 
