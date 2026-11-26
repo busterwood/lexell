@@ -123,6 +123,7 @@ Run these from the repository root (`~/Work/lexell`).
     LXL_CHECK=1 ./prog                             # exit 5 if anything leaked
     lexell/compiler/out/lxlc --borrow-report prog.lxl   # str parameters that should be &str
     lexell/compiler/out/lxlc --help                # every option and environment variable
+    python3 lexell/tools/libapi.py strings split   # a library function's signature and comment
 
     lexell/tools/gate.sh quick                     # after every change (all suites, seed, native)
     lexell/tools/gate.sh full                      # before a merge: adds red-team rounds under sanitizers
@@ -188,7 +189,8 @@ Run these from the repository root (`~/Work/lexell`).
 | [lexell/docs/lang/tour.md](lexell/docs/lang/tour.md) | writing Lexell for the first time: the language by example, beside Rust |
 | [lexell/docs/lang/idioms.md](lexell/docs/lang/idioms.md) | writing or reviewing code: the preferred patterns, each as do / don't / why |
 | [lexell/docs/lang/errors.md](lexell/docs/lang/errors.md) | a compile error you don't understand: message, cause, fix |
-| [lexell/lib/README.md](lexell/lib/README.md) | looking for a library module; then read the module's `pub` functions |
+| `python3 lexell/tools/libapi.py [MODULE [NAME...]] [-s]` | looking for a library function: no arguments lists the modules and their most-called functions; a module prints its `pub` API (signatures, comments, `file:line`); names filter it |
+| [lexell/lib/README.md](lexell/lib/README.md) | what each library module covers, and the library tests |
 | [lexell/SPEC.md](lexell/SPEC.md) | a precise rule: ownership (9), borrows (10), C interop (12), tasks (16) |
 | [lexell/tests/README.md](lexell/tests/README.md) | adding tests, or a gate step failed |
 | [lexell/compiler/README.md](lexell/compiler/README.md) | changing the compiler: its files and passes |
