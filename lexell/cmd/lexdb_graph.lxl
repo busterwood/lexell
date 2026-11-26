@@ -2297,6 +2297,94 @@ fn closeOf(r: &Rdr, i: int, hi: int): int {
     return hi
 }
 
+fn edgeLocalCmp(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, i: int, where: int, group: int, copy: int): Option[str] {
+    if where == 0 || i + 6 >= hi { return None }
+    let r = &gt.r
+    if i > lo && r.toks[i - 1].kind == T_OP && r.toks[i - 1].text == "." { return None }
+    if i + 7 < hi && r.toks[i + 7].kind == T_OP && (r.toks[i + 7].text == "." || r.toks[i + 7].text == "(") { return None }
+    let t0 = &r.toks[i]
+    let t1 = &r.toks[i + 1]
+    let t2 = &r.toks[i + 2]
+    let op = &r.toks[i + 3]
+    let t4 = &r.toks[i + 4]
+    let t5 = &r.toks[i + 5]
+    let t6 = &r.toks[i + 6]
+    if !isName(t0) || t1.kind != T_OP || t1.text != "." || !isName(t2) { return None }
+    if op.kind != T_OP || !(op.text == "<" || op.text == "<=" || op.text == ">" || op.text == ">=" || op.text == "=" || op.text == "<>" || op.text == "!=") { return None }
+    if !isName(t4) || t5.kind != T_OP || t5.text != "." || !isName(t6) { return None }
+    let v1 = canonIn(t0, gt.md)
+    let v2 = canonIn(t4, gt.md)
+    if v1 == v2 { return None }
+    let p1 = canonIn(t2, gt.md)
+    let p2 = canonIn(t6, gt.md)
+    var d1 = -1
+    var d2 = -1
+    for k in 0..len(gt.decls) {
+        if gt.decls[k].name == v1 { d1 = k }
+        if gt.decls[k].name == v2 { d2 = k }
+    }
+    if d1 < 0 || d2 < 0 || !gt.decls[d1].vertex || !gt.decls[d2].vertex { return None }
+    var vi1 = -1
+    var vi2 = -1
+    match varFor(gt, x, &v1, where, group, copy) { Ok(v) { vi1 = v } Err(_) { return None } }
+    match varFor(gt, x, &v2, where, group, copy) { Ok(v) { vi2 = v } Err(_) { return None } }
+    if vi1 == vi2 || vi1 >= len(b.elim) || vi2 >= len(b.elim) { return None }
+    if b.elim[vi1].edgeVar < 0 || b.elim[vi2].edgeVar < 0 { return None }
+    // Resolve p1 and p2 to bare column names on vi1 and vi2
+    var c1 = ""
+    let el1 = &gt.g.elems[b.el[vi1]]
+    let ls1 = labelsOf(gt, d1)
+    for l in el1.labels {
+        if !lexdb_base.hasStr(&ls1, &l.name) { continue }
+        for pr in l.props { if pr.name == p1 && len(pr.col) > 0 { c1 = pr.col.clone() } }
+    }
+    var c2 = ""
+    let el2 = &gt.g.elems[b.el[vi2]]
+    let ls2 = labelsOf(gt, d2)
+    for l in el2.labels {
+        if !lexdb_base.hasStr(&ls2, &l.name) { continue }
+        for pr in l.props { if pr.name == p2 && len(pr.col) > 0 { c2 = pr.col.clone() } }
+    }
+    if len(c1) == 0 || len(c2) == 0 { return None }
+    // Check if an edge occurrence directly connects vi1 and vi2 on columns c1 and c2
+    for k in 0..len(x.occs) {
+        let oc = &x.occs[k]
+        let ei = repOf(x, oc.e)
+        let l = repOf(x, oc.x)
+        let rr = repOf(x, oc.y)
+        let srcV = if b.fwd[k] { l } else { rr }
+        let dstV = if b.fwd[k] { rr } else { l }
+        let eel = &gt.g.elems[b.el[ei]]
+        let te = &gt.tabs[b.el[ei]]
+        if srcV == vi1 && dstV == vi2 {
+            var ec1 = ""
+            var ec2 = ""
+            for j in 0..len(eel.src.refs) { if eel.src.refs[j] == c1 { ec1 = eel.src.cols[j].clone() } }
+            for j in 0..len(eel.dst.refs) { if eel.dst.refs[j] == c2 { ec2 = eel.dst.cols[j].clone() } }
+            var ns1: []bool = []
+            var ns2: []bool = []
+            if len(ec1) > 0 && len(ec2) > 0 &&
+               sameEndTypes(te, &[ec1.clone()], &gt.tabs[b.el[vi1]], &[c1.clone()], mut &ns1) &&
+               sameEndTypes(te, &[ec2.clone()], &gt.tabs[b.el[vi2]], &[c2.clone()], mut &ns2) {
+                return Some("((" + alias(ei) + "." + qIn(&ec1, gt.md) + ") " + op.text + " (" + alias(ei) + "." + qIn(&ec2, gt.md) + ")) ")
+            }
+        } else if srcV == vi2 && dstV == vi1 {
+            var ec1 = ""
+            var ec2 = ""
+            for j in 0..len(eel.dst.refs) { if eel.dst.refs[j] == c1 { ec1 = eel.dst.cols[j].clone() } }
+            for j in 0..len(eel.src.refs) { if eel.src.refs[j] == c2 { ec2 = eel.src.cols[j].clone() } }
+            var ns1: []bool = []
+            var ns2: []bool = []
+            if len(ec1) > 0 && len(ec2) > 0 &&
+               sameEndTypes(te, &[ec1.clone()], &gt.tabs[b.el[vi1]], &[c1.clone()], mut &ns1) &&
+               sameEndTypes(te, &[ec2.clone()], &gt.tabs[b.el[vi2]], &[c2.clone()], mut &ns2) {
+                return Some("((" + alias(ei) + "." + qIn(&ec1, gt.md) + ") " + op.text + " (" + alias(ei) + "." + qIn(&ec2, gt.md) + ")) ")
+            }
+        }
+    }
+    return None
+}
+
 // The SQL of tokens [lo, hi) of an expression in a binding: v.p its property's definition, VERTEX_ID and EDGE_ID their JSON's
 // text, IS LABELED and IS SOURCE OF / IS DESTINATION OF conditions, a quantified part's aggregate an expression over its copies.
 fn exprSql(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, where: int, group: int, copy: int, keep: mut &[]bool): Result[str, DbErr] {
@@ -2304,6 +2392,14 @@ fn exprSql(gt: &GT, x: &Exp, b: &Bind, lo: int, hi: int, where: int, group: int,
     var out = ""
     var i = lo
     while i < hi {
+        match edgeLocalCmp(gt, x, b, lo, hi, i, where, group, copy) {
+            Some(s) {
+                out += s
+                i += 7
+                continue
+            }
+            None {}
+        }
         let t = &r.toks[i]
         let nx = &r.toks[i + 1]
         let piece = &r.src[t.at..r.toks[i + 1].at]

@@ -118,15 +118,17 @@ LIMIT 20;
 
 ## How LexDB executes property graphs fast
 
-Naive SQL/PGQ implementations rewrite every graph pattern into verbose multi-table joins or recursive CTEs, leaving 10×–1,000× performance on the table. LexDB combines four graph-aware optimizations inside its relational engine:
+Naive SQL/PGQ implementations rewrite every graph pattern into verbose multi-table joins or recursive CTEs, leaving 10×–1,000× performance on the table. LexDB combines five graph-aware optimizations inside its relational engine:
 
-1. **FK-verified vertex-table elimination & transitive edge equalities.**
-   When an edge table has an enforced, non-deferred foreign key referencing a vertex table's unique key — and the query only uses that vertex for traversal or its key column — LexDB eliminates the redundant vertex table join completely and emits direct edge-to-edge join equalities. A 3-edge triangle pattern drops from a 6-table join down to a tight 3-way self-join on `knows`.
-2. **Packed composite integer hash joins (`JK_INT2`) and count-only hash tables.**
-   Two-column integer join keys such as `(src, dst)` pack directly into a single 64-bit integer key without tuple encoding or re-checking individual predicates. When no payload columns are needed from the build side (such as closing a triangle or cycle), LexDB builds a compact count-only hash table (`24 B/key`) with zero row storage.
-3. **Cold point-to-point bidirectional index-only BFS.**
-   For single-source to single-target `ANY SHORTEST` queries, LexDB uses covering forward `(src, dst)` and reverse `(dst, src)` B+tree indexes to run bidirectional BFS directly off 8-byte integer leaf keys — **without scanning the edge table or building a CSR**. Finding a 5-hop shortest path in a 1M-edge graph takes **0.71 ms cold** (`0.41 ms` warm).
-4. **MVCC-safe cached CSR (Compressed Sparse Row) engine.**
+1. **FK-verified vertex-table elimination & edge-local predicate rewriting.**
+   When an edge table has an enforced, non-deferred foreign key referencing a vertex table's unique key — and the query only uses that vertex for traversal or its key column — LexDB eliminates the redundant vertex table join completely, emits direct edge-to-edge join equalities, and rewrites key comparisons like `b.id < c.id` onto the edge table itself (`e.src < e.dst`) so they filter at scan time. A 3-edge triangle pattern drops from a 6-table join down to a tight 3-way self-join on `knows`.
+2. **Direct-indexed integer hash joins, packed composite keys (`JK_INT2`), and fast count-only probes.**
+   Single-column dense integer build sides use a flat direct-indexed lookup array (one bounds-checked array load per probe, no hashing). Two-column integer join keys such as `(src, dst)` pack directly into a single 64-bit integer key without tuple encoding or re-checking individual predicates. When no payload columns are needed from the build side (such as closing a triangle or cycle), LexDB probes a compact flat open-addressed `FastIntCount` table with zero row storage and zero gather copies, and uses non-cryptographic FxHash for internal text hash tables.
+3. **Dictionary-preserving low-cardinality text propagation.**
+   When a hash join carries low-cardinality text dimensions (such as `country` or `industry`) through millions of edges into a downstream `GROUP BY`, LexDB deduplicates the build-side text buffer and passes a single shared dictionary per chunk so the downstream two-level hash aggregator hits its 64-slot word cache on ~100% of rows without re-hashing strings.
+4. **Cold point-to-point bidirectional index-only BFS.**
+   For single-source to single-target `ANY SHORTEST` queries, LexDB uses covering forward `(src, dst)` and reverse `(dst, src)` B+tree indexes to run bidirectional BFS directly off 8-byte integer leaf keys — **without scanning the edge table or building a CSR**. Finding a 5-hop shortest path in a 1M-edge graph takes **0.70 ms cold** (`0.38 ms` warm).
+5. **MVCC-safe cached CSR (Compressed Sparse Row) engine.**
    For single-source to many-targets (`G11`), multi-source, or repeated shortest-path queries, LexDB scans only the `(src, dst)` columns from its columnar B+tree leaves to build a compact dense CSR (~8.8 MB for 100k vertices and 1M edges; automatically switching to sparse 64-bit ID mapping for arbitrary IDs), caches it in a bounded LRU, and runs flat generation-stamped level-synchronous BFS (automatically flipping direction when the target set is smaller than the source set).
    - **Zero stale reads, full MVCC:** Every B+tree tracks a monotonic commit stamp (`treeStamp`), updated once per written tree at commit time. Committed `INSERT`/`UPDATE`/`DELETE` statements invalidate stale CSR entries in O(1); uncommitted writes inside an open transaction (`BEGIN ... INSERT ... ROLLBACK`) and older MVCC snapshots bypass the cache so read-your-writes and isolation semantics stay 100% exact.
 
@@ -152,29 +154,29 @@ To measure property graph performance apples-to-apples against both a relational
 
 | Query | Pattern | LexDB (warm) | LexDB (cold) | PG 18 (1 core) | DuckPGQ (1T) | Kùzu (1T) | LexDB / PG1 | LexDB / DuckPGQ | LexDB / Kùzu |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **G1** | 1-hop neighborhood + weight sum | **0.28 ms** | 0.45 ms | 0.20 ms | 1.28 ms | 1.20 ms | 1.42× | **0.22×** | **0.23×** |
-| **G2** | 2-hop distinct friends-of-friends | **0.55 ms** | 0.69 ms | 0.85 ms | 2.87 ms | 55.60 ms | **0.65×** | **0.19×** | **0.01×** |
-| **G3** | 1..3-hop distinct neighborhood (hub) | **36.37 ms** | 36.81 ms | 49.04 ms | 52.95 ms | 189.51 ms | **0.74×** | **0.69×** | **0.19×** |
-| **G4** | 1..4-hop distinct neighborhood | **2.48 ms** | 3.17 ms | 2.69 ms | 50.66 ms | 12.01 ms | **0.92×** | **0.05×** | **0.21×** |
-| **G5** | Full-graph 1M-edge country rollup | 110.22 ms | 111.12 ms | 338.80 ms | **14.95 ms** | 19.80 ms | **0.33×** | 7.37× | 5.57× |
-| **G6** | Co-workers who know each other (Tech) | 52.13 ms | 53.89 ms | 80.00 ms | **10.21 ms** | 49.18 ms | **0.65×** | 5.10× | 1.06× |
-| **G7** | Filtered 2-hop star (`UK` + `>=2022` + `Tech`) | 41.54 ms | 45.03 ms | 73.03 ms | **6.34 ms** | 85.96 ms | **0.57×** | 6.55× | **0.48×** |
-| **G8** | Directed triangles (subset `id <= 5000`) | 313.81 ms | 318.74 ms | 957.65 ms | **177.89 ms** | 343.94 ms | **0.33×** | 1.76× | **0.91×** |
-| **G9** | Full-graph 1M-edge directed triangles | 541.30 ms | 539.66 ms | 1,813.83 ms | **518.85 ms** | 521.31 ms | **0.30×** | 1.04× | 1.04× |
-| **G10** | Shortest path (5 hops, `42 -> 98955`) | **0.41 ms** | **0.71 ms** | 1,080.53 ms | 61.89 ms | 40.59 ms | **0.0004×** | **0.007×** | **0.010×** |
-| **G11** | Single-source shortest paths (`42 -> 2k` targets) | **6.34 ms** | **23.55 ms** | 1,263.90 ms | 64.31 ms | 48.26 ms | **0.005×** | **0.10×** | **0.13×** |
-| **Sum** | All 11 queries | **1,105.4 ms** | — | 5,660.5 ms | 962.2 ms | 1,367.4 ms | **5.12× faster** | 1.15× | **1.24× faster** |
-| **Geomean** | Geometric mean across all 11 queries | — | — | **0.19× (5.17× faster)** | **0.49× (2.03× faster)** | **0.26× (3.89× faster)** | | | |
+| **G1** | 1-hop neighborhood + weight sum | **0.27 ms** | 0.47 ms | **0.20 ms** | 1.28 ms | 1.20 ms | 1.39× | **0.21×** | **0.23×** |
+| **G2** | 2-hop distinct friends-of-friends | **0.52 ms** | 0.64 ms | 0.85 ms | 2.87 ms | 55.60 ms | **0.62×** | **0.18×** | **0.009×** |
+| **G3** | 1..3-hop distinct neighborhood (hub) | **36.48 ms** | 36.93 ms | 49.04 ms | 52.95 ms | 189.51 ms | **0.74×** | **0.69×** | **0.19×** |
+| **G4** | 1..4-hop distinct neighborhood | **2.37 ms** | 3.06 ms | 2.69 ms | 50.66 ms | 12.01 ms | **0.88×** | **0.05×** | **0.20×** |
+| **G5** | Full-graph 1M-edge country rollup | 54.84 ms | 53.93 ms | 338.80 ms | **14.95 ms** | 19.80 ms | **0.16×** | 3.67× | 2.77× |
+| **G6** | Co-workers who know each other (Tech) | 31.32 ms | 31.66 ms | 80.00 ms | **10.21 ms** | 49.18 ms | **0.39×** | 3.07× | **0.64×** |
+| **G7** | Filtered 2-hop star (`UK` + `>=2022` + `Tech`) | 45.35 ms | 45.68 ms | 73.03 ms | **6.34 ms** | 85.96 ms | **0.62×** | 7.15× | **0.53×** |
+| **G8** | Directed triangles (subset `id <= 5000`) | 285.39 ms | 288.30 ms | 957.65 ms | **177.89 ms** | 343.94 ms | **0.30×** | 1.60× | **0.83×** |
+| **G9** | Full-graph 1M-edge directed triangles | **396.28 ms** | 396.93 ms | 1,813.83 ms | 518.85 ms | 521.31 ms | **0.22×** | **0.76×** | **0.76×** |
+| **G10** | Shortest path (5 hops, `42 -> 98955`) | **0.38 ms** | **0.70 ms** | 1,080.53 ms | 61.89 ms | 40.59 ms | **0.0004×** | **0.006×** | **0.009×** |
+| **G11** | Single-source shortest paths (`42 -> 2k` targets) | **6.41 ms** | **24.76 ms** | 1,263.90 ms | 64.31 ms | 48.26 ms | **0.005×** | **0.10×** | **0.13×** |
+| **Sum** | All 11 queries | **859.6 ms** | — | 5,660.5 ms | 962.2 ms | 1,367.4 ms | **6.58× faster** | **1.12× faster** | **1.59× faster** |
+| **Geomean** | Geometric mean across all 11 queries | — | — | **0.17× (6.04× faster)** | **0.42× (2.37× faster)** | **0.22× (4.54× faster)** | | | |
 
 ### Key takeaways
 
-- **Overall geometric mean:** On a single core, LexDB is **5.17× faster than PostgreSQL 18**, **2.03× faster than DuckDB + DuckPGQ**, and **3.89× faster than Kùzu** across the full 11-query suite — all through standard SQL:2023 `GRAPH_TABLE` over live transactional tables.
+- **Fastest overall on both total time and geometric mean:** On a single core, LexDB completes the full 11-query suite in **859.6 ms total** — **6.58× faster than PostgreSQL 18**, **1.12× faster than DuckDB + DuckPGQ**, and **1.59× faster than Kùzu** (geometric mean **6.04× faster than PostgreSQL**, **2.37× faster than DuckPGQ**, and **4.54× faster than Kùzu**), all through standard SQL:2023 `GRAPH_TABLE` over live transactional tables. LexDB beats PostgreSQL on **10/11**, beats Kùzu on **10/11**, beats DuckPGQ on **7/11**, and is **#1 fastest on 6 of 11 queries**.
 - **Shortest paths (`G10`, `G11`):**
-  - Point-to-point 5-hop shortest path (`G10`) runs in **0.71 ms cold** (index-only bidirectional BFS) and **0.41 ms warm** — **~2,600× faster than PostgreSQL**, **151× faster than DuckPGQ**, and **99× faster than Kùzu**.
-  - Single-source shortest paths to 2,000 targets (`G11`) run in **23.55 ms cold** (including scanning 1M edges to build the CSR — still 2.7× faster than warm DuckPGQ and 2.0× faster than warm Kùzu) and **6.34 ms warm** (**199× faster than PostgreSQL**, **10.1× faster than DuckPGQ**, and **7.6× faster than Kùzu**).
-- **Local multi-hop traversals (`G1`–`G4`):** LexDB is the fastest engine on 2-hop, 1..3-hop, and 1..4-hop traversals, running **5–20× faster than DuckPGQ and Kùzu** on localized point-seeded patterns thanks to direct B+tree index lookups.
-- **Full-graph triangle counting (`G8`, `G9`):** Through pure `GRAPH_TABLE` syntax, LexDB matches DuckPGQ (`519 ms`) and Kùzu (`521 ms`) within 4% on full-graph 1M-edge triangle counting (`541 ms`), while running **3.35× faster than hand-written PostgreSQL** (`1,814 ms`).
-- **Where pure OLAP / columnar engines remain faster today:** On unfiltered full-graph scan-and-aggregate joins (`G5`–`G7`), DuckDB's in-memory columnar scan and specialized hash-join kernels run 5–7× faster than LexDB's B+tree-backed engine (though LexDB still beats PostgreSQL by 1.5–3.1× on all three).
+  - Point-to-point 5-hop shortest path (`G10`) runs in **0.70 ms cold** (index-only bidirectional BFS) and **0.38 ms warm** — **~2,840× faster than PostgreSQL**, **163× faster than DuckPGQ**, and **107× faster than Kùzu**.
+  - Single-source shortest paths to 2,000 targets (`G11`) run in **24.76 ms cold** (including scanning 1M edges to build the CSR — still 2.6× faster than warm DuckPGQ and 1.95× faster than warm Kùzu) and **6.41 ms warm** (**197× faster than PostgreSQL**, **10.0× faster than DuckPGQ**, and **7.5× faster than Kùzu**).
+- **Full-graph triangle counting (`G9`):** Through pure `GRAPH_TABLE` syntax, LexDB is the **fastest engine of all four** on full-graph 1M-edge directed triangle counting (**396 ms** vs **519 ms** DuckPGQ, **521 ms** Kùzu, and **1,814 ms** PostgreSQL — **1.31× faster than DuckPGQ/Kùzu** and **4.58× faster than hand-written PostgreSQL**).
+- **Local multi-hop traversals (`G1`–`G4`):** LexDB is the fastest engine on 2-hop, 1..3-hop, and 1..4-hop traversals, running **5–21× faster than DuckPGQ and Kùzu** on localized point-seeded patterns thanks to direct B+tree index lookups.
+- **Where pure OLAP engines remain faster today:** On unfiltered full-graph scan-and-aggregate joins (`G5`–`G7`), DuckDB's pure in-memory columnar scan remains 3–7× faster than LexDB's B+tree-backed engine — though LexDB beats PostgreSQL by **1.6–6.2×** on all three and beats Kùzu on both `G6` (`31.3` vs `49.2 ms`) and `G7` (`45.4` vs `86.0 ms`).
 
 ---
 

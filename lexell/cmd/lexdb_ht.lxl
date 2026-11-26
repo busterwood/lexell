@@ -45,9 +45,84 @@ pub fn hashTwoInt(k0: int, k1: int, nu: byte): u64 {
 }
 
 pub fn hashStr(s: &str): u64 {
-    let h = s.hash()
-    let z = h ^ (h >> 30)
-    return z ^ (z << 13) ^ (z >> 17)
+    return collections.fxHashStr(s)
+}
+
+// ============================================================================
+// 0. FastIntCount: Flat power-of-2 open-addressed int -> count hash table
+//    for count-only JK_INT / JK_INT2 hash joins (zero SipHash, zero order array).
+// ============================================================================
+
+pub type FastIntCount = record {
+    pub ks: []int       // slot -> key
+    pub vs: []int       // slot -> count (0 = empty)
+    mask: int
+    len: int
+}
+
+pub fn newFastIntCount(): FastIntCount {
+    return FastIntCount{ks: [], vs: [], mask: 0, len: 0}
+}
+
+pub fn (t: &FastIntCount) size(): int { return t.len }
+
+fn (t: mut &FastIntCount) grow() {
+    let cap = if len(t.vs) == 0 { 1024 } else { len(t.vs) * 2 }
+    let mask = cap - 1
+    var nks: []int = array(cap, 0)
+    var nvs: []int = array(cap, 0)
+    for i in 0..len(t.vs) {
+        let v = t.vs[i]
+        if v == 0 { continue }
+        let k = t.ks[i]
+        let h = k.hash()
+        var sl = int((h ^ (h >> 32)) & u64(mask))
+        while nvs[sl] != 0 { sl = (sl + 1) & mask }
+        nks[sl] = k
+        nvs[sl] = v
+    }
+    t.ks = nks
+    t.vs = nvs
+    t.mask = mask
+}
+
+// Increments count for key k; returns true if k was newly inserted.
+pub fn (t: mut &FastIntCount) inc(k: int): bool {
+    if len(t.vs) == 0 || (t.len + 1) * 10 >= len(t.vs) * 6 {
+        t.grow()
+    }
+    let mask = t.mask
+    let h = k.hash()
+    var sl = int((h ^ (h >> 32)) & u64(mask))
+    while true {
+        let v = t.vs[sl]
+        if v == 0 {
+            t.ks[sl] = k
+            t.vs[sl] = 1
+            t.len += 1
+            return true
+        }
+        if t.ks[sl] == k {
+            t.vs[sl] = v + 1
+            return false
+        }
+        sl = (sl + 1) & mask
+    }
+    return false
+}
+
+pub fn (t: &FastIntCount) get(k: int): int {
+    if t.len == 0 { return 0 }
+    let mask = t.mask
+    let h = k.hash()
+    var sl = int((h ^ (h >> 32)) & u64(mask))
+    while true {
+        let v = t.vs[sl]
+        if v == 0 { return 0 }
+        if t.ks[sl] == k { return v }
+        sl = (sl + 1) & mask
+    }
+    return 0
 }
 
 // ============================================================================

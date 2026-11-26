@@ -2282,7 +2282,7 @@ fn (q: &Query) nBest(init: &[]int, nl: int, cands: &[][]WayCand, owns: &[][]Expr
                 let next = mask | (1 << k)
                 var o = false
                 let rnext = q.setRows(next, nl, base, cmask, cdist, memo)
-                let total = pc[p] + q.joinStep(k, &cands[k], &owns[k], &base[k], mask, rin, rnext, lookups, cap, mut &o)
+                let total = pc[p] + q.joinStep(k, &cands[k], &owns[k], &base[k], mask, cmask, rin, rnext, lookups, cap, mut &o)
                 let j = at.getOr(&next, -1)
                 if j >= 0 {
                     if nc[j] <= total { continue }
@@ -2336,11 +2336,20 @@ fn (q: &Query) nBest(init: &[]int, nl: int, cands: &[][]WayCand, owns: &[][]Expr
 // Where a lookup is possible, it is taken when lookups is set, or when the
 // hash would hold more than cap bytes (statement memory, optimizer 26
 // review).
-fn (q: &Query) joinStep(k: int, cands: &[]WayCand, own: &[]Expr, base: &Way, mask: int, rin: float, rnext: float, lookups: bool,
+fn (q: &Query) joinStep(k: int, cands: &[]WayCand, own: &[]Expr, base: &Way, mask: int, cmask: &[]int, rin: float, rnext: float, lookups: bool,
                         cap: float, hashed: mut &bool): float {
     let out = rnext * ROW_COST
     let w = q.wayInto(k, cands, mask, true, own)
-    var add = if w.rows >= 0.0f && w.nEqs >= 2 {
+    var nJoinEqs = w.nEqs
+    if nJoinEqs < 2 && base.rows >= 10000.0f {
+        let bit = 1 << k
+        var eqc = 0
+        for cm in cmask {
+            if (cm & bit) != 0 && (cm & mask) != 0 { eqc += 1 }
+        }
+        if eqc > nJoinEqs { nJoinEqs = eqc }
+    }
+    var add = if w.rows >= 0.0f && nJoinEqs >= 2 {
         base.cost + base.rows * 6.0f + rin * HASH_PROBE + out
     } else {
         base.inner + base.rows * HASH_BUILD + rin * HASH_PROBE + out
@@ -2629,7 +2638,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
                 let next = mask | (1 << k)
                 var o = false
                 let rnext = q.setRows(next, nl, &base, &cmask, &cdist, mut &memo)
-                let total = cost[mask] + q.joinStep(k, &cands[k], &owns[k], &base[k], mask, rin, rnext, lookups, cap, mut &o)
+                let total = cost[mask] + q.joinStep(k, &cands[k], &owns[k], &base[k], mask, &cmask, rin, rnext, lookups, cap, mut &o)
                 if cost[next] < 0.0f || total < cost[next] {
                     cost[next] = total
                     last[next] = k
@@ -2731,7 +2740,7 @@ fn (q: &Query) grpPass(order: &[]int, flags: mut &[]bool, grps: mut &[]int, gs: 
         var o = false
         let rin = q.setRows(mask, nl, base, cmask, cdist, memo)
         let rnext = q.setRows(mask | (1 << k), nl, base, cmask, cdist, memo)
-        steps[i] = q.joinStep(k, &cands[k], &owns[k], &base[k], mask, rin, rnext, false, cap, mut &o)
+        steps[i] = q.joinStep(k, &cands[k], &owns[k], &base[k], mask, cmask, rin, rnext, false, cap, mut &o)
         total += steps[i]
         mask = mask | (1 << k)
     }
