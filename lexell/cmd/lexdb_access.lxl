@@ -377,6 +377,8 @@ pub fn (sc: &Scan) lowKey(): str { return sc.lo.clone() }
 // No row: a bound is NULL, or one its column cannot hold.
 pub fn noScan(): Scan { return Scan{empty: true, point: false, lo: "", hi: "", whole: false} }
 
+pub fn keyRangeScan(lo: str, hi: str): Scan { return Scan{empty: false, point: false, lo: lo, hi: hi, whole: false} }
+
 // The whole table in primary key order, whatever the path's index.
 pub fn wholeScan(): Scan { return Scan{empty: false, point: false, lo: "", hi: "", whole: true} }
 
@@ -1013,8 +1015,8 @@ fn idxWant(rd: &IxRead, cur: mut &Cursor): int {
 
 // A row read whole by the row path (a value stored apart) into row r of b;
 // false: a value of a kind its column's batch does not hold.
-fn bRowOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, key: &str, v: &str, r: int, b: mut &Batch,
-          bp: &BPlan): Result[bool, DbErr] {
+pub fn bRowOf(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, key: &str, v: &str, r: int, b: mut &Batch,
+              bp: &BPlan): Result[bool, DbErr] {
     let row = try rowOf(st, txn, t, key, v, bp.width, &bp.needP, &bp.missing)
     for i in 0..len(bp.kinds) {
         if bp.needCol[i] && !lexdb_rows.put(b, i, r, row[i].clone(), bp.kinds[i]) { return Ok(false) }
@@ -2320,30 +2322,42 @@ fn fillBackBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc:
     return Ok(Some(b))
 }
 
-// A pure, refcount-shared column leaf handle for par.map parallel OLAP workers:
-// cols is an O(1) refcount-bumped clone of the typed T_CLEAF column bytes (no rc handles).
-pub type ParLeaf = record {
-    pub cols: str
+// Compact 48-byte value record (zero heap pointers, zero destructors) for par.map workers.
+// All columnar leaf bytes are packed contiguously into ParChunk.slab[off..off+slen].
+pub const PL_COL = 0        // T_CLEAF (layoutOk, projected to needed places only)
+pub const PL_ANY = 1        // T_CLEAF (C_ANY)
+
+pub type ParLeaf = value record {
+    pub off: int
+    pub slen: int
     pub n: int
     pub from: int
     pub to: int
+    pub kind: int
 }
 
 pub type ParChunk = record {
+    pub slab: str
     pub leaves: []ParLeaf
+    pub fleafBatches: []Batch
+    pub apartKeys: []str
+    pub apartVals: []str
     pub done: bool
     pub fallback: bool
+    pub bail: bool
 }
 
-// Collects up to maxLeaves consecutive pure, layoutOk typed T_CLEAF column leaves
-// from scan sc starting at cur, preserving hierarchical lexdb_skip pruning,
-// bp.ranges min/max skipping, and read-ahead. Stops cleanly before any non-T_CLEAF,
-// C_ANY, or mismatched-layout leaf so the caller seamlessly falls back to serial fillPickIn.
+// Collects up to maxLeaves consecutive leaves from scan sc starting at cur,
+// preserving hierarchical lexdb_skip pruning, bp.ranges min/max skipping, and read-ahead.
+// Projects T_CLEAF leaves to only needPl[0..=maxPl] into a single contiguous slab.
+// When allowDefer is true, T_FLEAF (row-oriented) leaves are decoded in place into compact
+// projected fleafBatches (avoiding copying 100-column raw leaf.body bytes into slab), and
+// BIG-stub rows are captured directly into apartKeys/apartVals (zero B+tree re-scans!).
 pub fn collectParLeaves(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Scan, cur: mut &Cursor,
-                        bp: &BPlan, lz: &Lazy, maxLeaves: int): Result[ParChunk, DbErr] {
+                        bp: &BPlan, lz: &Lazy, needPl: &[]bool, maxPl: int, maxLeaves: int, allowDefer: bool): Result[ParChunk, DbErr] {
     if sc.empty || sc.point {
         cur.done = true
-        return Ok(ParChunk{leaves: [], done: true, fallback: false})
+        return Ok(ParChunk{slab: "", leaves: [], fleafBatches: [], apartKeys: [], apartVals: [], done: true, fallback: false, bail: false})
     }
     let rw = rowsFor(t)
     let bar = noBar()
@@ -2357,14 +2371,32 @@ pub fn collectParLeaves(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &R
     let prevStarted = cur.started
     let from = if cur.started { cur.at.clone() } else { sc.lo.clone() }
     cur.started = true
-    var leaves: []ParLeaf = []
+    var packPlan = lexdb_rows.newColPackPlan(needPl, maxPl)
+    var slab = ""
+    var leaves: []ParLeaf = withCapacity(4096)
+    var fleafBatches: []Batch = []
+    var fb = lexdb_rows.noRows()
+    var hasFb = false
+    var apartKeys: []str = []
+    var apartVals: []str = []
     var autoSkipped = 0
     var stopped = false
     var stopKey = ""
     var hitNonCol = false
+    var hitBail = false
+    var badErr: []DbErr = []
     try scanLeavesWithSkip(st, txn, t, &rw, &from, sc.hi.clone(), &lz.skipQ, &bar, -1, cur, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
         if j <= i { return true }
-        if !leaf.isCols || lexdb_rows.isAnyLeaf(leaf) || !lexdb_rows.layoutOk(leaf, &rw) {
+        var isCol = false
+        var isAny = false
+        if leaf.isCols {
+            if lexdb_rows.isAnyLeaf(leaf) {
+                isAny = true
+            } else if lexdb_rows.layoutOk(leaf, &rw) {
+                isCol = true
+            }
+        }
+        if !isCol && !isAny && !allowDefer {
             if len(leaves) == 0 {
                 hitNonCol = true
                 return false
@@ -2373,33 +2405,107 @@ pub fn collectParLeaves(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &R
             stopKey = lexdb_rows.leafKey(leaf, i)
             return false
         }
-        if len(bp.ranges) > 0 && lexdb_rows.excluded(leaf, bp, &rw) {
-            autoSkipped += 1
-            return true
-        }
-        if hasExtraAuto && lexdb_skip.colLeafExcludesExtra(leaf, &lz.skipQ, false, -1, 0, false, false) {
-            autoSkipped += 1
-            return true
+        if isCol {
+            if len(bp.ranges) > 0 && lexdb_rows.excluded(leaf, bp, &rw) {
+                autoSkipped += 1
+                return true
+            }
+            if hasExtraAuto && lexdb_skip.colLeafExcludesExtra(leaf, &lz.skipQ, false, -1, 0, false, false) {
+                autoSkipped += 1
+                return true
+            }
         }
         if len(leaves) >= maxLeaves {
             stopped = true
             stopKey = lexdb_rows.leafKey(leaf, i)
             return false
         }
-        append(mut &leaves, ParLeaf{cols: leaf.cols.clone(), n: leaf.n, from: i, to: j})
+        if isCol {
+            let off = len(slab)
+            let slen = lexdb_rows.packNeededColsFast(mut &slab, leaf, mut &packPlan)
+            append(mut &leaves, ParLeaf{off: off, slen: slen, n: leaf.n, from: i, to: j, kind: PL_COL})
+        } else if isAny && !allowDefer {
+            let off = len(slab)
+            slab += leaf.cols
+            append(mut &leaves, ParLeaf{off: off, slen: len(slab) - off, n: leaf.n, from: i, to: j, kind: PL_ANY})
+        } else {
+            // Row-oriented T_FLEAF, C_ANY, or mismatched-layout T_CLEAF: decode ONLY needed columns
+            // in place into compact fleafBatches (avoids copying 36+ MB of 105-column raw rows into slab!).
+            if !hasFb {
+                fb = lexdb_rows.newBatch(bp, lexdb_rows.BROWS)
+                hasFb = true
+            }
+            for r in i..j {
+                if fb.n == lexdb_rows.BROWS {
+                    append(mut &fleafBatches, replace(mut &fb, lexdb_rows.newBatch(bp, lexdb_rows.BROWS)))
+                }
+                if isAny {
+                    let v = lexdb_rows.anyLeafValAt(leaf, r)
+                    match lexdb_rows.decodeRow(v, fb.n, mut &fb, bp, &rw) {
+                        Ok(code) {
+                            if code == 0 { fb.n += 1 }
+                            else if code == 2 {
+                                append(mut &apartKeys, lexdb_rows.leafKey(leaf, r))
+                                append(mut &apartVals, v.clone())
+                            } else {
+                                hitBail = true
+                                return false
+                            }
+                        }
+                        Err(x) { append(mut &badErr, x); return false }
+                    }
+                } else if leaf.isCols {
+                    let v = lexdb_rows.leafVal(leaf, r)
+                    match lexdb_rows.decodeRow(&v, fb.n, mut &fb, bp, &rw) {
+                        Ok(code) {
+                            if code == 0 { fb.n += 1 }
+                            else if code == 2 {
+                                append(mut &apartKeys, lexdb_rows.leafKey(leaf, r))
+                                append(mut &apartVals, v)
+                            } else {
+                                hitBail = true
+                                return false
+                            }
+                        }
+                        Err(x) { append(mut &badErr, x); return false }
+                    }
+                } else {
+                    let v = lexdb_rows.leafValAt(leaf, r)
+                    match lexdb_rows.decodeRow(v, fb.n, mut &fb, bp, &rw) {
+                        Ok(code) {
+                            if code == 0 { fb.n += 1 }
+                            else if code == 2 {
+                                append(mut &apartKeys, lexdb_rows.leafKey(leaf, r))
+                                append(mut &apartVals, v.clone())
+                            } else {
+                                hitBail = true
+                                return false
+                            }
+                        }
+                        Err(x) { append(mut &badErr, x); return false }
+                    }
+                }
+            }
+        }
         return true
     })
+    if len(badErr) > 0 { return Err(replace(mut &badErr[0], lexdb_base.err("XX000", ""))) }
     if autoSkipped > 0 { lexdb_skip.addLeavesSkipped(autoSkipped) }
+    if hitBail {
+        cur.started = prevStarted
+        return Ok(ParChunk{slab: "", leaves: [], fleafBatches: [], apartKeys: [], apartVals: [], done: false, fallback: false, bail: true})
+    }
     if hitNonCol {
         cur.started = prevStarted
-        return Ok(ParChunk{leaves: [], done: false, fallback: true})
+        return Ok(ParChunk{slab: "", leaves: [], fleafBatches: [], apartKeys: [], apartVals: [], done: false, fallback: true, bail: false})
     }
+    if hasFb && fb.n > 0 { append(mut &fleafBatches, fb) }
     if stopped {
         cur.at = stopKey
-        return Ok(ParChunk{leaves: leaves, done: false, fallback: false})
+        return Ok(ParChunk{slab: slab, leaves: leaves, fleafBatches: fleafBatches, apartKeys: apartKeys, apartVals: apartVals, done: false, fallback: false, bail: false})
     }
     cur.done = true
-    return Ok(ParChunk{leaves: leaves, done: true, fallback: false})
+    return Ok(ParChunk{slab: slab, leaves: leaves, fleafBatches: fleafBatches, apartKeys: apartKeys, apartVals: apartVals, done: true, fallback: false, bail: false})
 }
 
 // The next batch of a level, decoded in two steps when lz is on and the

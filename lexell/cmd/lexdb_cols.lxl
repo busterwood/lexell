@@ -1383,6 +1383,137 @@ pub fn places(dir: &[]int): int { return dir[1] }
 // The kind of place p.
 pub fn kindOf(s: &str, p: int): byte { return s[4 + p] }
 
+// End byte offset of place p in column region s (-1 for C_NONE).
+fn colEnd(s: &str, dir: &[]int, p: int): int {
+    let n = dir[2]
+    let x = DIR_HDR + D * p
+    let c = dir[x + F_CODEC]
+    if c == C_FOR || c == C_UNITS || c == C_DICT { return dir[x + F_DATA] + (n * dir[x + F_W] + 7) / 8 }
+    if c == C_RAW { return dir[x + F_DATA] + n * dir[x + F_W] }
+    if c == C_BOOL { return dir[x + F_DATA] + (n + 7) / 8 }
+    if c == C_TEXT || c == C_BIN || c == C_ANY { return dir[x + F_X] + u16At(s, dir[x + F_DATA] + 2 * n - 2) }
+    return -1
+}
+
+// Start byte offset of place p in column region s (O(1) via preceding place's end).
+fn colStart(s: &str, dir: &[]int, p: int): int {
+    var q = p - 1
+    var nones = 0
+    while q >= 0 && dir[DIR_HDR + D * q + F_CODEC] == C_NONE {
+        nones += 1
+        q -= 1
+    }
+    let base = if q < 0 { 4 + dir[1] } else { colEnd(s, dir, q) }
+    return base + nones
+}
+
+// Precomputed projection plan for packNeededFast: avoids per-place addByte loops across 100k+ leaves.
+pub type PackPlan = record {
+    pub outNp: int
+    pub needList: []int
+    pub gaps: []int
+    pub cnonePad: str
+    pub hdrLay: int
+    pub hdrCache: str
+}
+
+pub fn newPackPlan(needPl: &[]bool, maxPl: int): PackPlan {
+    let outNp = if maxPl < 0 { 0 } else { maxPl + 1 }
+    var nl: []int = []
+    var gaps: []int = []
+    var prev = -1
+    var maxGap = 0
+    for p in 0..outNp {
+        if p < len(needPl) && needPl[p] {
+            let g = p - prev - 1
+            append(mut &nl, p)
+            append(mut &gaps, g)
+            if g > maxGap { maxGap = g }
+            prev = p
+        }
+    }
+    var pad = ""
+    for _ in 0..maxGap { pad.addByte(byte(C_NONE)) }
+    return PackPlan{outNp: outNp, needList: nl, gaps: gaps, cnonePad: pad, hdrLay: -1, hdrCache: ""}
+}
+
+// Fast column projection into contiguous buffer `slab`: copies ONLY the needed places
+// using precomputed header & C_NONE gap slices (a handful of memcpys instead of outNp*2 addByte calls).
+pub fn packNeededFast(slab: mut &str, s: &str, dir: &[]int, plan: mut &PackPlan): int {
+    let np = dir[1]
+    let outNp = if plan.outNp < np { plan.outNp } else { np }
+    let off0 = len(slab)
+    let lay = dir[0]
+    if outNp == plan.outNp && lay == plan.hdrLay && len(plan.hdrCache) == 4 + outNp {
+        slab += &plan.hdrCache
+    } else {
+        var hdr = ""
+        hdr.addByte(s[0])
+        hdr.addByte(s[1])
+        hdr.addByte(s[2])
+        hdr.addByte(byte(outNp))
+        var ni = 0
+        for p in 0..outNp {
+            if ni < len(plan.needList) && plan.needList[ni] == p {
+                hdr.addByte(s[4 + p])
+                ni += 1
+            } else {
+                hdr.addByte(K_NONE)
+            }
+        }
+        slab += &hdr
+        if outNp == plan.outNp {
+            plan.hdrLay = lay
+            plan.hdrCache = hdr
+        }
+    }
+    var lastP = -1
+    for i in 0..len(plan.needList) {
+        let p = plan.needList[i]
+        if p >= outNp { break }
+        let g = plan.gaps[i]
+        if g > 0 { slab += &plan.cnonePad[0..g] }
+        if dir[DIR_HDR + D * p + F_CODEC] != C_NONE {
+            let st = colStart(s, dir, p)
+            let en = colEnd(s, dir, p)
+            slab += &s[st..en]
+        } else {
+            slab.addByte(byte(C_NONE))
+        }
+        lastP = p
+    }
+    let tailGap = outNp - 1 - lastP
+    if tailGap > 0 { slab += &plan.cnonePad[0..tailGap] }
+    return len(slab) - off0
+}
+
+// Packs ONLY the needed places (needPl[p], p <= maxPl) of a T_CLEAF column region s
+// into contiguous buffer `slab` as a valid v1 column region (unneeded places become
+// 1-byte C_NONE). Eliminates copying unneeded columns across wide tables in par.map.
+pub fn packNeededInto(slab: mut &str, s: &str, dir: &[]int, needPl: &[]bool, maxPl: int): int {
+    let np = dir[1]
+    let outNp = if maxPl < 0 { 0 } else if maxPl + 1 < np { maxPl + 1 } else { np }
+    let nNeed = len(needPl)
+    let off0 = len(slab)
+    slab.addByte(s[0])
+    slab.addByte(s[1])
+    slab.addByte(s[2])
+    slab.addByte(byte(outNp))
+    for p in 0..outNp {
+        if p < nNeed && needPl[p] { slab.addByte(s[4 + p]) } else { slab.addByte(K_NONE) }
+    }
+    for p in 0..outNp {
+        if p < nNeed && needPl[p] && dir[DIR_HDR + D * p + F_CODEC] != C_NONE {
+            let st = colStart(s, dir, p)
+            let en = colEnd(s, dir, p)
+            slab += &s[st..en]
+        } else {
+            slab.addByte(byte(C_NONE))
+        }
+    }
+    return len(slab) - off0
+}
+
 // Whether the leaf's layout has these kinds (the executor's, for the
 // layout number: a leaf is read by its columns only when they agree).
 pub fn kindsAre(s: &str, dir: &[]int, kinds: &[]byte): bool {
