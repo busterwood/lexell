@@ -1,0 +1,160 @@
+import "collections"
+
+type Addr = value record {
+    city: str
+    zip: str
+}
+
+type Status = value closed { Open; Closed; Pending }
+
+type Shape = closed {
+    Empty
+    Circle(float)
+    Pair(int, str)
+    Rect { w: float; h: float }
+}
+
+type Boxed = record { label: str }
+type MaybeBox = value closed { Nothing; Has(Boxed) }
+
+type Tree = record {
+    val: int
+    kids: []Tree
+}
+
+type Order = record {
+    id: int
+    customer: str
+    total: Decimal
+    paid: bool
+    status: Status
+    note: Option[str]
+    tags: []str
+    addr: Addr
+    shape: Shape
+    extra: MaybeBox
+}
+
+// Custom override: encodes as uppercase string
+type Tag = value record { raw: str }
+pub fn (t: &Tag) toData(): Data { return Data.Str(t.raw.clone()) }
+pub fn (Tag) fromData(d: &Data): Result[Tag, DataError] {
+    match d {
+        Data.Str(s) { return Ok(Tag{raw: "custom:" + s}) }
+        else { return Err(DataError{path: "", msg: "expected tag string"}) }
+    }
+}
+
+type WithCustom = record { tag: Tag; n: int }
+
+fn fromAny[T: Deserialize](d: &Data): Result[T, DataError] { return T.fromData(d) }
+
+fn roundtrip[T: Serialize + Deserialize + Eq](v: &T): bool {
+    let d = v.toData()
+    let back = T.fromData(&d).unwrap()
+    return back == v
+}
+
+fn main() {
+    let o = Order{
+        id: 42,
+        customer: "Ada",
+        total: 123.45m,
+        paid: true,
+        status: Status.Pending,
+        note: Some("rush"),
+        tags: ["vip", "eu"],
+        addr: Addr{city: "London", zip: "EC1A"},
+        shape: Shape.Rect{w: 3.5f, h: 2.0f},
+        extra: MaybeBox.Has(Boxed{label: "ok"})
+    }
+    let od = o.toData()
+    let ob = Order.fromData(&od).unwrap()
+    println(ob.id == 42 && ob.customer == "Ada" && ob.total == 123.45m && ob.paid &&
+            ob.status == Status.Pending && ob.note.is("rush") && len(ob.tags) == 2 &&
+            ob.tags[0] == "vip" && ob.tags[1] == "eu" && ob.addr == o.addr &&
+            ob.shape == o.shape && ob.extra == o.extra)
+
+    // Other closed variants and niche Nothing
+    println(roundtrip(&Shape.Empty))
+    println(roundtrip(&Shape.Circle(2.5f)))
+    println(roundtrip(&Shape.Pair(7, "seven")))
+    println(roundtrip(&MaybeBox.Nothing))
+
+    // Recursive tree
+    let tree = Tree{val: 1, kids: [Tree{val: 2, kids: []}, Tree{val: 3, kids: [Tree{val: 4, kids: []}]}]}
+    let td = tree.toData()
+    let tb = Tree.fromData(&td).unwrap()
+    println(tb.val == 1 && len(tb.kids) == 2 && tb.kids[0].val == 2 && tb.kids[1].kids[0].val == 4)
+
+    // Arrays, rc, Map, Set
+    let nums: []int = [1, 2, 3]
+    let nd = nums.toData()
+    let nb = fromAny[[]int](&nd).unwrap()
+    println(len(nb) == 3 && nb[0] == 1 && nb[2] == 3)
+    let r = rc(Addr{city: "Paris", zip: "75001"})
+    println(roundtrip(&r))
+    var m: Map[str, int] = newMap()
+    m.put("a", 10)
+    m.put("b", 20)
+    let md = m.toData()
+    let m2 = Map[str, int].fromData(&md).unwrap()
+    println($"{m2.get("a").unwrap()},{m2.get("b").unwrap()}")
+    let s = collections.setOf(&["x", "y"])
+    let sd = s.toData()
+    let s2 = collections.Set[str].fromData(&sd).unwrap()
+    println(s2.has("x") && s2.has("y") && s2.size() == 2)
+
+    // Missing Option field defaults to None
+    let partial = Data.Obj([
+        DataField{key: "id", val: Data.Int(1)},
+        DataField{key: "customer", val: Data.Str("Bob")},
+        DataField{key: "total", val: Data.Dec(10.00m)},
+        DataField{key: "paid", val: Data.Bool(false)},
+        DataField{key: "status", val: Data.Str("Open")},
+        DataField{key: "tags", val: Data.Arr([])},
+        DataField{key: "addr", val: Data.Obj([
+            DataField{key: "city", val: Data.Str("NYC")},
+            DataField{key: "zip", val: Data.Str("10001")}
+        ])},
+        DataField{key: "shape", val: Data.Str("Empty")},
+        DataField{key: "extra", val: Data.Str("Nothing")}
+    ])
+    let o2 = Order.fromData(&partial).unwrap()
+    println(o2.note.isNone())
+
+    // Custom override wins over derived
+    let wc = WithCustom{tag: Tag{raw: "abc"}, n: 5}
+    let wcd = wc.toData()
+    let wc2 = WithCustom.fromData(&wcd).unwrap()
+    println($"{wc2.tag.raw}:{wc2.n}")
+
+    // Error paths (also verifies partial-decode cleanup has zero leaks under LXL_CHECK=1)
+    let badField = Data.Obj([
+        DataField{key: "id", val: Data.Int(1)},
+        DataField{key: "customer", val: Data.Str("allocated-string")},
+        DataField{key: "total", val: Data.Bool(true)}
+    ])
+    println(Order.fromData(&badField).unwrapErr())
+
+    let badArr = Data.Arr([Data.Str("ok1"), Data.Str("ok2"), Data.Int(99)])
+    println(fromAny[[]str](&badArr).unwrapErr())
+
+    let badVar = Data.Str("Nope")
+    println(Status.fromData(&badVar).unwrapErr())
+}
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: 10,20
+// expect: true
+// expect: true
+// expect: custom:abc:5
+// expect: total: expected decimal, got bool
+// expect: [2]: expected string, got int
+// expect: unknown variant 'Nope' for Status

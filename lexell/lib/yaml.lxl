@@ -5291,3 +5291,132 @@ fn sortEntryIndices(order: mut &[]int, entries: &[]Entry) {
         }
     }
 }
+
+// ---------------------------------------------------------------- struct serde
+
+fn dataToNode(d: &Data): Node {
+    match d {
+        Data.Null { return null() }
+        Data.Bool(b) { return boolean(b) }
+        Data.Int(n) { return integer(n) }
+        Data.Uint(u) {
+            if u <= u64(9223372036854775807) { return integer(int(u)) }
+            let t = u64ToStr(u)
+            return makeNode(Value.Num(Number{isFloat: false, i: 0, hasInt: false, f: float(u), text: t}), Style.Any)
+        }
+        Data.Float(x) { return number(x) }
+        Data.Dec(x) { return decimal(x) }
+        Data.Str(s) { return string(s) }
+        Data.Arr(xs) {
+            var out: []Node = withCapacity(len(xs))
+            for i in 0..len(xs) { append(mut &out, dataToNode(&xs[i])) }
+            return seqOf(out)
+        }
+        Data.Obj(fs) {
+            var out = mapping()
+            for i in 0..len(fs) { out.set(&fs[i].key, dataToNode(&fs[i].val)) }
+            return out
+        }
+    }
+}
+
+fn parseU64Yaml(s: &str): Option[u64] {
+    if len(s) == 0 { return None }
+    var acc: u64 = u64(0)
+    let limDiv: u64 = u64(1844674407370955161)
+    let limRem: u64 = u64(5)
+    for i in 0..len(s) {
+        let c = strByte(s, i)
+        if c < '0' || c > '9' { return None }
+        let d = u64(int(c - '0'))
+        if acc > limDiv || (acc == limDiv && d > limRem) { return None }
+        acc = acc * u64(10) + d
+    }
+    return Some(acc)
+}
+
+fn nodeToData(n: &Node): Result[Data, DataError] {
+    match &n.value {
+        Value.Null { return Ok(Data.Null) }
+        Value.Bool(b) { return Ok(Data.Bool(b)) }
+        Value.Num(num) {
+            if !num.isFloat && num.hasInt { return Ok(Data.Int(num.i)) }
+            if len(num.text) > 0 {
+                if !num.isFloat {
+                    match parseU64Yaml(&num.text) {
+                        Some(u) { return Ok(Data.Uint(u)) }
+                        None {}
+                    }
+                }
+                match Decimal.parse(&num.text) {
+                    Ok(d) { return Ok(Data.Dec(d)) }
+                    Err(_) {}
+                }
+            }
+            return Ok(Data.Float(num.f))
+        }
+        Value.Str(s) { return Ok(Data.Str(s.clone())) }
+        Value.Seq(b) {
+            var out: []Data = withCapacity(len(b.items))
+            for i in 0..len(b.items) {
+                let item = match nodeToData(&b.items[i]) {
+                    Ok(v) { v }
+                    Err(e) { return Err(e.atIndex(i)) }
+                }
+                append(mut &out, item)
+            }
+            return Ok(Data.Arr(out))
+        }
+        Value.Map(b) {
+            var out: []DataField = withCapacity(len(b.entries))
+            for i in 0..len(b.entries) {
+                let k = match &b.entries[i].key.value {
+                    Value.Str(s) { s.clone() }
+                    else { keyDisplay(&b.entries[i].key) }
+                }
+                let v = match nodeToData(&b.entries[i].value) {
+                    Ok(val) { val }
+                    Err(e) { return Err(e.atField(&k)) }
+                }
+                append(mut &out, DataField{key: k, val: v})
+            }
+            return Ok(Data.Obj(out))
+        }
+    }
+}
+
+pub fn (n: &Node) toData(): Data {
+    match nodeToData(n) {
+        Ok(d) { return d }
+        Err(_) { return Data.Null }
+    }
+}
+
+pub fn (Node) fromData(d: &Data): Result[Node, DataError] { return Ok(dataToNode(d)) }
+
+// Serializes any Serialize value to a YAML 1.2 Node tree.
+pub fn toNode[T: Serialize](v: &T): Node {
+    let d = v.toData()
+    return dataToNode(&d)
+}
+
+// Serializes any Serialize value directly to YAML 1.2 text.
+pub fn encode[T: Serialize](v: &T): str {
+    let n = toNode(v)
+    return write(&n, &writeDefaults())
+}
+
+// Deserializes a YAML Node into any Deserialize type T.
+pub fn fromNode[T: Deserialize](n: &Node): Result[T, DataError] {
+    let d = try nodeToData(n)
+    return T.fromData(&d)
+}
+
+// Parses YAML 1.2 text and deserializes it into any Deserialize type T.
+pub fn decode[T: Deserialize](text: &str): Result[T, DataError] {
+    let n = match parse(text) {
+        Ok(v) { v }
+        Err(e) { return Err(DataError{path: "", msg: e.toStr()}) }
+    }
+    return fromNode[T](&n)
+}

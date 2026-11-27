@@ -33,6 +33,7 @@ for leaks.
 | `os.lxl` | 263 | arguments, environment, pid, working directory, quit, ids, user database, tempDir |
 | `time.lxl` | 1,298 | wall and monotonic clocks, sleep, UTC dates, ISO 8601, Tm/strftime/strptime, HTTP date; Duration (exact: seconds and nanoseconds), Period (years, months, days) and Interval (SQL's: months, days and a Duration), with ISO 8601 text; date arithmetic (addDays, addMonths clamped, until), Time and LocalDateTime plus a duration, period or interval (design/time-types.md); tested against Python by `tests/gen_time_arith.py` |
 | `format.lxl` | 665 | pure format-spec engine (`Spec`, `parseSpec`, `formatInt`/`Uint`/`I128`/`U128`/`Float`/`Decimal`/`Str`, `apply`) shared by `$"..."` and `fmt` |
+| `serde.lxl` | 375 | format-agnostic `Data`, `DataField`, `DataError` and decode helpers backing `Serialize`/`Deserialize` (`json.encode`/`decode`, `yaml.encode`/`decode`) |
 | `fmt.lxl` | 145 | re-exports `format` (`intFmt`/`uintFmt`/`floatFmt`/`decimalFmt`/`strFmt`/`apply`/`Spec`), number padding (`digits`, `appendPadded`, `writePadded`), and eza's `modeString` |
 | `paths.lxl` | 135 | lexical Rust Path components: join, lastComponent, parentOf, ext |
 | `cli.lxl` | 451 | the eza/obo option grammar: Spec, Command, parse, structured Error |

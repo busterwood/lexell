@@ -29,9 +29,14 @@ const G_CLONE = 5
 const G_EQ = 6          // derived methods (design/consistency.md, finding 4)
 const G_HASH = 7
 const G_SHOW = 8
-const GLUE_NAMES: []str = ["drop", "act", "rest", "dup", "tramp", "clone", "eq", "hash", "toStr"]
+const G_TODATA = 9
+const G_FROMDATA = 10
+const GLUE_NAMES: []str = ["drop", "act", "rest", "dup", "tramp", "clone", "eq", "hash", "toStr", "toData", "fromData"]
 
-fn deriveKind(name: &str): int { return if name == "eq" { G_EQ } else if name == "hash" { G_HASH } else { G_SHOW } }
+fn deriveKind(name: &str): int {
+    return if name == "eq" { G_EQ } else if name == "hash" { G_HASH } else if name == "toStr" { G_SHOW }
+        else if name == "toData" { G_TODATA } else { G_FROMDATA }
+}
 
 type Inst = value record {
     f: int
@@ -635,6 +640,408 @@ fn (e: &Emitter) fieldNames(d: int, v: int): []str {
     return out
 }
 
+// ---- derived serialization & deserialization (toData / fromData)
+
+fn (e: mut &Emitter) serdeCall(name: &str, args: []int): int {
+    let sm = e.c.pg.serdeMod()
+    let sym = e.c.pg.mods[sm].scope.getOr(name, sema.Sym{k: -1, i: -1})
+    let fnName = e.instance(sym.i, e.c.pg.mkFn(&[], sema.T_VOID))
+    return e.call(&fnName, args)
+}
+
+fn (e: mut &Emitter) fromDataC(ft: int, dp: int): int {
+    let f = e.c.pg.methodOf(ft, "fromData")
+    if f < 0 {
+        let g = e.glueFn(G_FROMDATA, ft)
+        return e.call(&g, [dp])
+    }
+    var bind: []int = []
+    e.c.pg.unify(e.c.pg.fns[f].recvType, ft, mut &bind, &e.c.pg.fns[f].tps)
+    var ta: []int = []
+    for tp in e.c.pg.fns[f].tps { append(mut &ta, envGet(&bind, tp)) }
+    let fname = e.instance(f, e.c.pg.mkFn(&ta, sema.T_VOID))
+    return e.call(&fname, [dp])
+}
+
+fn (e: mut &Emitter) resOkC(resCt: &str, v: int): int {
+    let tag = e.c.x.desig(".tag", e.c.x.lit(0))
+    let u = e.c.x.desig(".u.V_Ok", e.c.x.init([e.c.x.desig(".f_0", v)]))
+    return e.c.x.par(e.c.x.clit(e.ct(resCt), e.c.x.init([tag, u])))
+}
+
+fn (e: mut &Emitter) resErrC(resCt: &str, err: int): int {
+    let tag = e.c.x.desig(".tag", e.c.x.lit(1))
+    let u = e.c.x.desig(".u.V_Err", e.c.x.init([e.c.x.desig(".f_0", err)]))
+    return e.c.x.par(e.c.x.clit(e.ct(resCt), e.c.x.init([tag, u])))
+}
+
+fn (e: mut &Emitter) buildObjFields(t: int, d: int, v: int, a: int, dfCt: &str, arrVar: &str, body: mut &[]int) {
+    let fnames = e.fieldNames(d, v)
+    let fx = e.derivedFields(t, d, v, a)
+    let fts = e.derivedTypes(t, d, v)
+    let n = len(fts)
+    append(body, e.c.x.decl(e.ct("lxl_arr"), arrVar, e.call("rt_arr_new", [e.c.x.lit(n), e.c.x.szof(e.ct(dfCt))])))
+    let base = e.c.x.pcast(e.c.x.ptr(e.ct(dfCt)), e.c.x.dot(e.nm(arrVar), "data"))
+    for i in 0..n {
+        let kv = e.c.x.clit(e.ct(dfCt), e.c.x.init([
+            e.c.x.desig(".f_key", e.call("rt_str_dup", [e.strlit(&fnames[i], false)])),
+            e.c.x.desig(".f_val", e.methodC(fts[i], "toData", fx[i], -1))
+        ]))
+        append(body, e.c.x.sx(e.c.x.asg(e.c.x.idx(base, e.c.x.lit(i)), kv)))
+    }
+}
+
+fn (e: mut &Emitter) deriveToData(t: int, n: &str) {
+    let dataTy = e.c.pg.stdType("Data")
+    let dfTy = e.c.pg.stdType("DataField")
+    let dataCt = e.ctype(dataTy)
+    let dfCt = e.ctype(dfTy)
+    let pt = e.ctype(e.c.pg.mkRef(t, false))
+    let a = e.nm("a")
+    var body: []int = []
+    if e.tk(t) == sema.TK_ARR {
+        let et = e.c.pg.ta(t)
+        let ec = e.ctype(et)
+        let src = e.c.x.idx(e.c.x.pcast(e.c.x.ptr(e.ct(&ec)), e.c.x.arrow(a, "data")), e.nm("i"))
+        let dst = e.c.x.idx(e.c.x.pcast(e.c.x.ptr(e.ct(&dataCt)), e.c.x.dot(e.nm("xs"), "data")), e.nm("i"))
+        let h = e.loopHead(e.c.x.lit(0), "<", e.c.x.arrow(a, "len"), "++")
+        append(mut &body, e.c.x.decl(e.ct("lxl_arr"), "xs", e.call("rt_arr_new", [e.c.x.arrow(a, "len"), e.c.x.szof(e.ct(&dataCt))])))
+        append(mut &body, e.c.x.for1(h[0], h[1], h[2], e.c.x.sx(e.c.x.asg(dst, e.methodC(et, "toData", src, -1)))))
+        append(mut &body, e.c.x.sret(e.serdeCall("dataArr", [e.nm("xs")])))
+        e.define(n, &dataCt, [pt], ["a"], body, -1)
+        return
+    }
+    let d = e.c.pg.ta(t)
+    let boxed = !e.c.pg.types[d].value
+    if e.c.pg.types[d].form == sx.F_RECORD {
+        e.buildObjFields(t, d, -1, a, &dfCt, "fs", mut &body)
+        append(mut &body, e.c.x.sret(e.serdeCall("dataObj", [e.nm("fs")])))
+        e.define(n, &dataCt, [pt], ["a"], body, -1)
+        return
+    }
+    // closed / value closed
+    append(mut &body, e.c.x.sswitch(e.tagC(t, boxed, a)))
+    let vs = copyInts(&e.c.pg.types[d].variants)
+    for v in vs {
+        append(mut &body, e.c.x.scase(e.c.x.lit(e.c.pg.variants[v].index)))
+        let vname = e.c.pg.variants[v].name.clone()
+        let fnames = e.fieldNames(d, v)
+        let fx = e.derivedFields(t, d, v, a)
+        let fts = e.derivedTypes(t, d, v)
+        let nf = len(fts)
+        let positional = nf > 0 && strByte(fnames[0], 0) >= '0' && strByte(fnames[0], 0) <= '9'
+        if nf == 0 {
+            append(mut &body, e.c.x.sret(e.serdeCall("dataStr", [e.call("rt_str_dup", [e.strlit(&vname, false)])])))
+        } else if positional && nf == 1 {
+            let pv = e.methodC(fts[0], "toData", fx[0], -1)
+            append(mut &body, e.c.x.sret(e.serdeCall("wrapVariant", [e.strlit(&vname, false), pv])))
+        } else if positional {
+            let av = "xs" + intToStr(v)
+            append(mut &body, e.c.x.decl(e.ct("lxl_arr"), &av, e.call("rt_arr_new", [e.c.x.lit(nf), e.c.x.szof(e.ct(&dataCt))])))
+            let base = e.c.x.pcast(e.c.x.ptr(e.ct(&dataCt)), e.c.x.dot(e.nm(&av), "data"))
+            for i in 0..nf {
+                append(mut &body, e.c.x.sx(e.c.x.asg(e.c.x.idx(base, e.c.x.lit(i)), e.methodC(fts[i], "toData", fx[i], -1))))
+            }
+            let arrD = e.serdeCall("dataArr", [e.nm(&av)])
+            append(mut &body, e.c.x.sret(e.serdeCall("wrapVariant", [e.strlit(&vname, false), arrD])))
+        } else {
+            let fv = "fs" + intToStr(v)
+            e.buildObjFields(t, d, v, a, &dfCt, &fv, mut &body)
+            let objD = e.serdeCall("dataObj", [e.nm(&fv)])
+            append(mut &body, e.c.x.sret(e.serdeCall("wrapVariant", [e.strlit(&vname, false), objD])))
+        }
+    }
+    append(mut &body, e.c.x.send())
+    append(mut &body, e.c.x.sret(e.serdeCall("dataNull", [])))
+    e.define(n, &dataCt, [pt], ["a"], body, -1)
+}
+
+fn (e: mut &Emitter) dropDecoded(fts: &[]int, prefix: &str, count: int, body: mut &[]int) {
+    var j = count - 1
+    while j >= 0 {
+        if !e.pod(fts[j]) {
+            append(body, e.c.x.sx(e.dropC(fts[j], e.nm(&(prefix + intToStr(j))))))
+        }
+        j -= 1
+    }
+}
+
+fn (e: mut &Emitter) buildDecodedValue(t: int, d: int, vr: int, fnames: &[]str, prefix: &str, body: mut &[]int): int {
+    let ct = e.ctype(t)
+    let m = len(fnames)
+    if e.c.pg.types[d].value {
+        var its: []int = []
+        for i in 0..m { append(mut &its, e.c.x.desig(&(".f_" + fnames[i]), e.nm(&(prefix + intToStr(i))))) }
+        if vr >= 0 {
+            let nv = e.c.pg.niche(t)
+            if nv >= 0 {
+                let u = "V_" + e.c.pg.variants[nv].name
+                if vr == nv {
+                    return e.c.x.par(e.c.x.clit(e.ct(&ct), e.c.x.init([e.c.x.desig(&(".u." + u), e.c.x.init(&its))])))
+                }
+                let fd = e.c.pg.variants[nv].fields[0].clone()
+                let fenv = e.c.pg.declEnv(t)
+                let ft = e.c.pg.subst(fd.ty, &fenv)
+                let fct = e.ctype(ft)
+                let z = e.c.x.desig(&(".f_" + fd.name), e.c.x.cast(e.ct(&fct), e.c.x.lit(0)))
+                return e.c.x.par(e.c.x.clit(e.ct(&ct), e.c.x.init([e.c.x.desig(&(".u." + u), e.c.x.init(&[z]))])))
+            }
+            let tag = e.c.x.desig(".tag", e.c.x.lit(e.c.pg.variants[vr].index))
+            if m == 0 { return e.c.x.par(e.c.x.clit(e.ct(&ct), e.c.x.init([tag]))) }
+            let u = e.c.x.desig(&(".u.V_" + e.c.pg.variants[vr].name), e.c.x.init(&its))
+            return e.c.x.par(e.c.x.clit(e.ct(&ct), e.c.x.init([tag, u])))
+        }
+        let inner = if m == 0 { [e.c.x.lit(0)] } else { its }
+        return e.c.x.par(e.c.x.clit(e.ct(&ct), e.c.x.init(&inner)))
+    }
+    let ov = if vr >= 0 { "ov" + intToStr(vr) } else { "out" }
+    let nn = e.nm(&ov)
+    append(body, e.c.x.decl(e.ct(&ct), &ov, e.call("rt_alloc", [e.c.x.szof(e.c.x.pre("*", nn))])))
+    if vr >= 0 { append(body, e.c.x.sx(e.c.x.asg(e.c.x.arrow(nn, "tag"), e.c.x.lit(e.c.pg.variants[vr].index)))) }
+    for i in 0..m {
+        let dst = if vr >= 0 {
+            e.c.x.dot(e.c.x.dot(e.c.x.arrow(nn, "u"), &("V_" + e.c.pg.variants[vr].name)), &("f_" + fnames[i]))
+        } else {
+            e.c.x.arrow(nn, &("f_" + fnames[i]))
+        }
+        append(body, e.c.x.sx(e.c.x.asg(dst, e.nm(&(prefix + intToStr(i))))))
+    }
+    return nn
+}
+
+fn (e: mut &Emitter) decodeObjectFields(srcPtr: int, fnames: &[]str, fts: &[]int, resCt: &str, wrapField: &str,
+                                        prefix: &str, body: mut &[]int) {
+    let dataTy = e.c.pg.stdType("Data")
+    let errTy = e.c.pg.stdType("DataError")
+    let optDecl = e.c.pg.stdDecl("Option")
+    let resDecl = e.c.pg.stdDecl("Result")
+    let unitTy = e.c.pg.stdType("Unit")
+    let chkResTy = e.c.pg.mkInst(resDecl, &[unitTy, errTy])
+    let chkResCt = e.ctype(chkResTy)
+    let optRefTy = e.c.pg.mkInst(optDecl, &[e.c.pg.mkRef(dataTy, false)])
+    let optRefCt = e.ctype(optRefTy)
+    let dataCt = e.ctype(dataTy)
+    let chkVar = prefix + "chk"
+    append(body, e.c.x.decl(e.ct(&chkResCt), &chkVar, e.serdeCall("objCheck", [srcPtr])))
+    append(body, e.c.x.sif(e.c.x.bin("==", e.c.x.dot(e.nm(&chkVar), "tag"), e.c.x.lit(1))))
+    var chkErr = e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm(&chkVar), "u"), "V_Err"), "f_0")
+    if len(wrapField) > 0 { chkErr = e.serdeCall("errAtField", [chkErr, e.strlit(wrapField, false)]) }
+    append(body, e.c.x.sret(e.resErrC(resCt, chkErr)))
+    append(body, e.c.x.send())
+    for i in 0..len(fts) {
+        let ft = fts[i]
+        let fCt = e.ctype(ft)
+        let fResTy = e.c.pg.mkInst(resDecl, &[ft, errTy])
+        let fResCt = e.ctype(fResTy)
+        let optVar = prefix + "o" + intToStr(i)
+        let ptrVar = prefix + "p" + intToStr(i)
+        let resVar = prefix + "r" + intToStr(i)
+        let valVar = prefix + intToStr(i)
+        append(body, e.c.x.decl(e.ct(&optRefCt), &optVar, e.serdeCall("objLookup", [srcPtr, e.strlit(&fnames[i], false)])))
+        if e.c.pg.isOption(ft) {
+            let nulVar = prefix + "n" + intToStr(i)
+            append(body, e.c.x.decl(e.ct(&dataCt), &nulVar, e.serdeCall("dataNull", [])))
+            let pExpr = e.c.x.cond(
+                e.c.x.bin("==", e.c.x.dot(e.nm(&optVar), "tag"), e.c.x.lit(0)),
+                e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm(&optVar), "u"), "V_Some"), "f_0"),
+                e.c.x.pre("&", e.nm(&nulVar))
+            )
+            append(body, e.c.x.decl(e.c.x.ptr(e.ct(&dataCt)), &ptrVar, pExpr))
+        } else {
+            append(body, e.c.x.sif(e.c.x.bin("!=", e.c.x.dot(e.nm(&optVar), "tag"), e.c.x.lit(0))))
+            e.dropDecoded(fts, prefix, i, body)
+            var mErr = e.serdeCall("errMissing", [e.strlit(&fnames[i], false)])
+            if len(wrapField) > 0 { mErr = e.serdeCall("errAtField", [mErr, e.strlit(wrapField, false)]) }
+            append(body, e.c.x.sret(e.resErrC(resCt, mErr)))
+            append(body, e.c.x.send())
+            append(body, e.c.x.decl(e.c.x.ptr(e.ct(&dataCt)), &ptrVar,
+                e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm(&optVar), "u"), "V_Some"), "f_0")))
+        }
+        append(body, e.c.x.decl(e.ct(&fResCt), &resVar, e.fromDataC(ft, e.nm(&ptrVar))))
+        append(body, e.c.x.sif(e.c.x.bin("==", e.c.x.dot(e.nm(&resVar), "tag"), e.c.x.lit(1))))
+        e.dropDecoded(fts, prefix, i, body)
+        var fErr = e.serdeCall("errAtField", [
+            e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm(&resVar), "u"), "V_Err"), "f_0"),
+            e.strlit(&fnames[i], false)
+        ])
+        if len(wrapField) > 0 { fErr = e.serdeCall("errAtField", [fErr, e.strlit(wrapField, false)]) }
+        append(body, e.c.x.sret(e.resErrC(resCt, fErr)))
+        append(body, e.c.x.send())
+        append(body, e.c.x.decl(e.ct(&fCt), &valVar, e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm(&resVar), "u"), "V_Ok"), "f_0")))
+    }
+}
+
+fn (e: mut &Emitter) deriveFromData(t: int, n: &str) {
+    let dataTy = e.c.pg.stdType("Data")
+    let errTy = e.c.pg.stdType("DataError")
+    let resDecl = e.c.pg.stdDecl("Result")
+    let optDecl = e.c.pg.stdDecl("Option")
+    let resTy = e.c.pg.mkInst(resDecl, &[t, errTy])
+    let resCt = e.ctype(resTy)
+    let dataCt = e.ctype(dataTy)
+    let dpCt = e.ctype(e.c.pg.mkRef(dataTy, false))
+    let dp = e.nm("d")
+    var body: []int = []
+    if e.tk(t) == sema.TK_ARR {
+        let et = e.c.pg.ta(t)
+        let ec = e.ctype(et)
+        let arrDataTy = e.c.pg.mkArr(dataTy)
+        let itemsResTy = e.c.pg.mkInst(resDecl, &[e.c.pg.mkRef(arrDataTy, false), errTy])
+        let itemsResCt = e.ctype(itemsResTy)
+        let elemResTy = e.c.pg.mkInst(resDecl, &[et, errTy])
+        let elemResCt = e.ctype(elemResTy)
+        append(mut &body, e.c.x.decl(e.ct(&itemsResCt), "ar", e.serdeCall("arrItems", [dp])))
+        append(mut &body, e.c.x.sif(e.c.x.bin("==", e.c.x.dot(e.nm("ar"), "tag"), e.c.x.lit(1))))
+        append(mut &body, e.c.x.sret(e.resErrC(&resCt, e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm("ar"), "u"), "V_Err"), "f_0"))))
+        append(mut &body, e.c.x.send())
+        append(mut &body, e.c.x.decl(e.c.x.ptr(e.ct("lxl_arr")), "xs",
+            e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm("ar"), "u"), "V_Ok"), "f_0")))
+        append(mut &body, e.c.x.decl(e.ct("lxl_arr"), "out",
+            e.call("rt_arr_cap", [e.c.x.arrow(e.nm("xs"), "len"), e.c.x.szof(e.ct(&ec)), e.c.x.str("serde")])))
+        let h = e.loopHead(e.c.x.lit(0), "<", e.c.x.arrow(e.nm("xs"), "len"), "++")
+        append(mut &body, e.c.x.sfor(h[0], h[1], h[2]))
+        let itemPtr = e.c.x.pre("&", e.c.x.idx(e.c.x.pcast(e.c.x.ptr(e.ct(&dataCt)), e.c.x.arrow(e.nm("xs"), "data")), e.nm("i")))
+        append(mut &body, e.c.x.decl(e.ct(&elemResCt), "er", e.fromDataC(et, itemPtr)))
+        append(mut &body, e.c.x.sif(e.c.x.bin("==", e.c.x.dot(e.nm("er"), "tag"), e.c.x.lit(1))))
+        append(mut &body, e.c.x.sx(e.dropC(t, e.nm("out"))))
+        let idxErr = e.serdeCall("errAtIndex", [
+            e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm("er"), "u"), "V_Err"), "f_0"),
+            e.nm("i")
+        ])
+        append(mut &body, e.c.x.sret(e.resErrC(&resCt, idxErr)))
+        append(mut &body, e.c.x.send())
+        let slot = e.c.x.pre("*", e.c.x.pcast(e.c.x.ptr(e.ct(&ec)),
+            e.call("rt_arr_push", [e.c.x.pre("&", e.nm("out")), e.c.x.szof(e.ct(&ec))])))
+        append(mut &body, e.c.x.sx(e.c.x.asg(slot, e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm("er"), "u"), "V_Ok"), "f_0"))))
+        append(mut &body, e.c.x.send())
+        append(mut &body, e.c.x.sret(e.resOkC(&resCt, e.nm("out"))))
+        e.define(n, &resCt, [dpCt], ["d"], body, -1)
+        return
+    }
+    let d = e.c.pg.ta(t)
+    if e.c.pg.types[d].form == sx.F_RECORD {
+        let fnames = e.fieldNames(d, -1)
+        let fts = e.derivedTypes(t, d, -1)
+        e.decodeObjectFields(dp, &fnames, &fts, &resCt, "", "f", mut &body)
+        let built = e.buildDecodedValue(t, d, -1, &fnames, "f", mut &body)
+        append(mut &body, e.c.x.sret(e.resOkC(&resCt, built)))
+        e.define(n, &resCt, [dpCt], ["d"], body, -1)
+        return
+    }
+    // closed / value closed
+    let tagResTy = e.c.pg.mkInst(resDecl, &[e.c.pg.mkRef(sema.T_STR, false), errTy])
+    let tagResCt = e.ctype(tagResTy)
+    let optRefTy = e.c.pg.mkInst(optDecl, &[e.c.pg.mkRef(dataTy, false)])
+    let payResTy = e.c.pg.mkInst(resDecl, &[optRefTy, errTy])
+    let payResCt = e.ctype(payResTy)
+    let arrDataTy = e.c.pg.mkArr(dataTy)
+    let itemsResTy = e.c.pg.mkInst(resDecl, &[e.c.pg.mkRef(arrDataTy, false), errTy])
+    let itemsResCt = e.ctype(itemsResTy)
+    append(mut &body, e.c.x.decl(e.ct(&tagResCt), "tr", e.serdeCall("asTagName", [dp])))
+    append(mut &body, e.c.x.sif(e.c.x.bin("==", e.c.x.dot(e.nm("tr"), "tag"), e.c.x.lit(1))))
+    append(mut &body, e.c.x.sret(e.resErrC(&resCt, e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm("tr"), "u"), "V_Err"), "f_0"))))
+    append(mut &body, e.c.x.send())
+    append(mut &body, e.c.x.decl(e.ct("lxl_str"), "tn", e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm("tr"), "u"), "V_Ok"), "f_0")))
+    append(mut &body, e.c.x.decl(e.ct(&payResCt), "pr", e.serdeCall("asTagPayload", [dp])))
+    append(mut &body, e.c.x.sif(e.c.x.bin("==", e.c.x.dot(e.nm("pr"), "tag"), e.c.x.lit(1))))
+    append(mut &body, e.c.x.sret(e.resErrC(&resCt, e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm("pr"), "u"), "V_Err"), "f_0"))))
+    append(mut &body, e.c.x.send())
+    let optRefCt = e.ctype(optRefTy)
+    append(mut &body, e.c.x.decl(e.ct(&optRefCt), "po", e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm("pr"), "u"), "V_Ok"), "f_0")))
+
+    let vs = copyInts(&e.c.pg.types[d].variants)
+    for v in vs {
+        let vname = e.c.pg.variants[v].name.clone()
+        let fnames = e.fieldNames(d, v)
+        let fts = e.derivedTypes(t, d, v)
+        let nf = len(fts)
+        let positional = nf > 0 && strByte(fnames[0], 0) >= '0' && strByte(fnames[0], 0) <= '9'
+        let vp = "v" + intToStr(v) + "_"
+        append(mut &body, e.c.x.sif(e.call("rt_str_eq", [e.nm("tn"), e.strlit(&vname, false)])))
+        if nf == 0 {
+            append(mut &body, e.c.x.sif(e.c.x.bin("==", e.c.x.dot(e.nm("po"), "tag"), e.c.x.lit(0))))
+            append(mut &body, e.c.x.sret(e.resErrC(&resCt, e.serdeCall("errVariantNoPayload", [e.strlit(&vname, false)]))))
+            append(mut &body, e.c.x.send())
+            let built = e.buildDecodedValue(t, d, v, &fnames, &vp, mut &body)
+            append(mut &body, e.c.x.sret(e.resOkC(&resCt, built)))
+        } else {
+            append(mut &body, e.c.x.sif(e.c.x.bin("!=", e.c.x.dot(e.nm("po"), "tag"), e.c.x.lit(0))))
+            append(mut &body, e.c.x.sret(e.resErrC(&resCt, e.serdeCall("errVariantNeedsPayload", [e.strlit(&vname, false)]))))
+            append(mut &body, e.c.x.send())
+            let payVar = vp + "pay"
+            append(mut &body, e.c.x.decl(e.c.x.ptr(e.ct(&dataCt)), &payVar,
+                e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm("po"), "u"), "V_Some"), "f_0")))
+            if positional && nf == 1 {
+                let ft = fts[0]
+                let fCt = e.ctype(ft)
+                let fResTy = e.c.pg.mkInst(resDecl, &[ft, errTy])
+                let fResCt = e.ctype(fResTy)
+                let rVar = vp + "r0"
+                append(mut &body, e.c.x.decl(e.ct(&fResCt), &rVar, e.fromDataC(ft, e.nm(&payVar))))
+                append(mut &body, e.c.x.sif(e.c.x.bin("==", e.c.x.dot(e.nm(&rVar), "tag"), e.c.x.lit(1))))
+                let vErr = e.serdeCall("errAtField", [
+                    e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm(&rVar), "u"), "V_Err"), "f_0"),
+                    e.strlit(&vname, false)
+                ])
+                append(mut &body, e.c.x.sret(e.resErrC(&resCt, vErr)))
+                append(mut &body, e.c.x.send())
+                append(mut &body, e.c.x.decl(e.ct(&fCt), &(vp + "0"),
+                    e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm(&rVar), "u"), "V_Ok"), "f_0")))
+                let built = e.buildDecodedValue(t, d, v, &fnames, &vp, mut &body)
+                append(mut &body, e.c.x.sret(e.resOkC(&resCt, built)))
+            } else if positional {
+                let arVar = vp + "ar"
+                let xsVar = vp + "xs"
+                append(mut &body, e.c.x.decl(e.ct(&itemsResCt), &arVar, e.serdeCall("arrItems", [e.nm(&payVar)])))
+                append(mut &body, e.c.x.sif(e.c.x.bin("==", e.c.x.dot(e.nm(&arVar), "tag"), e.c.x.lit(1))))
+                let aErr = e.serdeCall("errAtField", [
+                    e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm(&arVar), "u"), "V_Err"), "f_0"),
+                    e.strlit(&vname, false)
+                ])
+                append(mut &body, e.c.x.sret(e.resErrC(&resCt, aErr)))
+                append(mut &body, e.c.x.send())
+                append(mut &body, e.c.x.decl(e.c.x.ptr(e.ct("lxl_arr")), &xsVar,
+                    e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm(&arVar), "u"), "V_Ok"), "f_0")))
+                append(mut &body, e.c.x.sif(e.c.x.bin("!=", e.c.x.arrow(e.nm(&xsVar), "len"), e.c.x.lit(nf))))
+                append(mut &body, e.c.x.sret(e.resErrC(&resCt, e.serdeCall("errVariantArity", [
+                    e.strlit(&vname, false), e.c.x.lit(nf), e.c.x.arrow(e.nm(&xsVar), "len")
+                ]))))
+                append(mut &body, e.c.x.send())
+                for i in 0..nf {
+                    let ft = fts[i]
+                    let fCt = e.ctype(ft)
+                    let fResTy = e.c.pg.mkInst(resDecl, &[ft, errTy])
+                    let fResCt = e.ctype(fResTy)
+                    let rVar = vp + "r" + intToStr(i)
+                    let elPtr = e.c.x.pre("&", e.c.x.idx(e.c.x.pcast(e.c.x.ptr(e.ct(&dataCt)), e.c.x.arrow(e.nm(&xsVar), "data")), e.c.x.lit(i)))
+                    append(mut &body, e.c.x.decl(e.ct(&fResCt), &rVar, e.fromDataC(ft, elPtr)))
+                    append(mut &body, e.c.x.sif(e.c.x.bin("==", e.c.x.dot(e.nm(&rVar), "tag"), e.c.x.lit(1))))
+                    e.dropDecoded(&fts, &vp, i, mut &body)
+                    let idxErr = e.serdeCall("errAtIndex", [
+                        e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm(&rVar), "u"), "V_Err"), "f_0"),
+                        e.c.x.lit(i)
+                    ])
+                    let vErr = e.serdeCall("errAtField", [idxErr, e.strlit(&vname, false)])
+                    append(mut &body, e.c.x.sret(e.resErrC(&resCt, vErr)))
+                    append(mut &body, e.c.x.send())
+                    append(mut &body, e.c.x.decl(e.ct(&fCt), &(vp + intToStr(i)),
+                        e.c.x.dot(e.c.x.dot(e.c.x.dot(e.nm(&rVar), "u"), "V_Ok"), "f_0")))
+                }
+                let built = e.buildDecodedValue(t, d, v, &fnames, &vp, mut &body)
+                append(mut &body, e.c.x.sret(e.resOkC(&resCt, built)))
+            } else {
+                e.decodeObjectFields(e.nm(&payVar), &fnames, &fts, &resCt, &vname, &vp, mut &body)
+                let built = e.buildDecodedValue(t, d, v, &fnames, &vp, mut &body)
+                append(mut &body, e.c.x.sret(e.resOkC(&resCt, built)))
+            }
+        }
+        append(mut &body, e.c.x.send())
+    }
+    let tname = e.c.pg.types[d].name.clone()
+    append(mut &body, e.c.x.sret(e.resErrC(&resCt, e.serdeCall("errUnknownVariant", [e.strlit(&tname, false), e.nm("tn")]))))
+    e.define(n, &resCt, [dpCt], ["d"], body, -1)
+}
+
 fn (e: mut &Emitter) dupC(t: int, cc: int): int {
     if e.pod(t) { return cc }
     if t == sema.T_STR { return e.call("rt_str_dup", [cc]) }
@@ -1053,11 +1460,20 @@ fn (e: mut &Emitter) makeGlue(kind: int, t: int) {
     let key = t * 16 + kind
     let n = e.glue.getOr(&key, "")
     let gk: []str = ["the drop of", "a drop action of", "the drop of the rest of", "the copy of", "the closure made of",
-        "the clone of", "the derived eq of", "the derived hash of", "the derived toStr of"]
+        "the clone of", "the derived eq of", "the derived hash of", "the derived toStr of",
+        "the derived toData of", "the derived fromData of"]
     e.fsrc.put(n.clone(), gk[kind] + " " + e.c.pg.tstr(t))
     let ct = e.ctype(t)
     if kind == G_EQ || kind == G_HASH || kind == G_SHOW {
         e.deriveGlue(kind, t, &n)
+        return
+    }
+    if kind == G_TODATA {
+        e.deriveToData(t, &n)
+        return
+    }
+    if kind == G_FROMDATA {
+        e.deriveFromData(t, &n)
         return
     }
     if kind == G_TRAMP {        // a plain function seen as a closure: the environment is the function
@@ -1343,7 +1759,7 @@ fn (e: mut &Emitter) hole(i: int, holes: &[]ck.Hole, env: &[]int, name: &str, re
         if h.f == sema.RM_VAL { return h.r }
         return e.cloneC(t, if e.c.pg.isRefByVal(t) { e.c.x.par(h.r) } else { e.c.x.par(e.c.x.pre("*", h.r)) })
     }
-    if k == ck.H_IMETH && (h.s == "eq" || h.s == "hash" || h.s == "toStr") && e.c.pg.methodOf(t, h.s) < 0 &&
+    if k == ck.H_IMETH && (h.s == "eq" || h.s == "hash" || h.s == "toStr" || h.s == "toData") && e.c.pg.methodOf(t, h.s) < 0 &&
             e.c.pg.derivable(t, h.s) {
         // a derived method (design/consistency.md, finding 4): its glue, given pointers (&Self)
         e.fill(h.r, holes, env, name, res)
@@ -1352,6 +1768,10 @@ fn (e: mut &Emitter) hole(i: int, holes: &[]ck.Hole, env: &[]int, name: &str, re
         var gargs: []int = [h.r]
         for a in h.args { append(mut &gargs, a) }
         return e.c.x.call(&g, gargs)
+    }
+    if k == ck.H_IASSOC && h.s == "fromData" && e.c.pg.methodOf(t, h.s) < 0 && e.c.pg.derivable(t, h.s) {
+        let g = e.glueFn(G_FROMDATA, t)
+        return e.nm(&g)
     }
     let f = e.c.pg.methodOf(t, h.s)
     var bind: []int = []

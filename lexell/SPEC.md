@@ -755,16 +755,24 @@ compare the variants, when it declares no `eq` method; when it declares one,
 compares the variants (so `eq` may be written `return a == b` without calling
 itself). Both operands have that type (or are borrows of it).
 
-**Derived methods.** A record or closed type that declares no `eq`, `hash`
-or `toStr` method has one derived, as it has `clone` (section 4.7), when it
-has no `drop` method, holds no borrows, and each of its fields has that
-method, declared or derived (a type that contains itself has it when the rest
-does; a type parameter has it when its constraints give it):
+**Derived methods.** A record or closed type that declares no `eq`, `hash`,
+`toStr`, `toData` or `fromData` method has one derived, as it has `clone`
+(section 4.7), when it has no `drop` method, holds no borrows, and each of its
+fields has that method, declared or derived (a type that contains itself has it
+when the rest does; a type parameter has it when its constraints give it;
+arrays `[]T` also derive `toData` and `fromData` when `T` does):
 - `eq` compares the variants, then the fields in declaration order;
 - `hash` combines the variant and the fields' hashes;
 - `toStr` gives `P{x: 1, name: "a"}` for a record, `E.V` for a variant
   without fields, `E.V(1, 2)` for positional fields and `E.V{w: 2}` for named
-  ones; strings are quoted.
+  ones; strings are quoted;
+- `toData` and `fromData` convert between the type and `std`'s format-agnostic
+  `Data` (`Serialize` / `Deserialize`, used by `json.encode`/`decode` and
+  `yaml.encode`/`decode`): records map to objects of their fields in
+  declaration order (missing keys for `Option[T]` fields decode as `None`),
+  unit variants to their name string, single-field positional variants to
+  `{"V": payload}`, multi-field positional variants to `{"V": [...]}` and
+  named-field variants to `{"V": {...}}`. A declared method always wins.
 
 So such a type satisfies `Eq`, `Hash` and `Show`, can be a `Map` key and can
 be printed. A shared borrow `&U` satisfies the interfaces `U` satisfies,
