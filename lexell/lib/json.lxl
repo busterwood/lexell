@@ -2056,3 +2056,125 @@ pub fn canonicalLiteral(t: &str): str {
     }
     return b
 }
+
+// ---------------------------------------------------------------- struct serde
+
+fn dataToJson(d: &Data): Json {
+    match d {
+        Data.Null { return null() }
+        Data.Bool(b) { return boolean(b) }
+        Data.Int(n) { return integer(n) }
+        Data.Uint(u) {
+            if u <= u64(9223372036854775807) { return integer(int(u)) }
+            let t = u64ToStr(u)
+            match numberLiteral(&t) {
+                Some(j) { return j }
+                None { return string(&t) }
+            }
+        }
+        Data.Float(x) { return number(x) }
+        Data.Dec(x) { return decimal(x) }
+        Data.Str(s) { return string(s) }
+        Data.Arr(xs) {
+            var out: []Json = withCapacity(len(xs))
+            for i in 0..len(xs) { append(mut &out, dataToJson(&xs[i])) }
+            return arrayOf(out)
+        }
+        Data.Obj(fs) {
+            var out = object()
+            for i in 0..len(fs) { out.set(&fs[i].key, dataToJson(&fs[i].val)) }
+            return out
+        }
+    }
+}
+
+fn parseU64Text(s: &str): Option[u64] {
+    if len(s) == 0 { return None }
+    var acc: u64 = u64(0)
+    let limDiv: u64 = u64(1844674407370955161)
+    let limRem: u64 = u64(5)
+    for i in 0..len(s) {
+        let c = strByte(s, i)
+        if c < '0' || c > '9' { return None }
+        let d = u64(int(c - '0'))
+        if acc > limDiv || (acc == limDiv && d > limRem) { return None }
+        acc = acc * u64(10) + d
+    }
+    return Some(acc)
+}
+
+fn jsonToData(j: &Json): Data {
+    match j {
+        Json.Null { return Data.Null }
+        Json.Bool(b) { return Data.Bool(b) }
+        Json.Num(n) {
+            if isFastInt(n) { return Data.Int(int(n.f)) }
+            if len(n.text) > 0 {
+                match strings.parseInt(&n.text) {
+                    Ok(v) { return Data.Int(v) }
+                    Err(_) {}
+                }
+                match parseU64Text(&n.text) {
+                    Some(u) { return Data.Uint(u) }
+                    None {}
+                }
+                match Decimal.parse(&n.text) {
+                    Ok(d) { return Data.Dec(d) }
+                    Err(_) {}
+                }
+            } else if n.f == n.f.trunc() && n.f >= -9007199254740992.0f && n.f <= 9007199254740992.0f && !isNegZero(n.f) {
+                return Data.Int(int(n.f))
+            }
+            return Data.Float(n.f)
+        }
+        Json.Str(s) { return Data.Str(s.clone()) }
+        Json.Arr(b) {
+            var out: []Data = withCapacity(len(b.items))
+            for i in 0..len(b.items) { append(mut &out, jsonToData(&b.items[i])) }
+            return Data.Arr(out)
+        }
+        Json.Obj(b) {
+            var out: []DataField = withCapacity(len(b.keys))
+            for i in 0..len(b.keys) {
+                append(mut &out, DataField{key: b.keys[i].clone(), val: jsonToData(&b.vals[i])})
+            }
+            return Data.Obj(out)
+        }
+    }
+}
+
+pub fn (j: &Json) toData(): Data { return jsonToData(j) }
+pub fn (Json) fromData(d: &Data): Result[Json, DataError] { return Ok(dataToJson(d)) }
+
+// Serializes any Serialize value (primitives, arrays, maps, records, closed types) to a Json tree.
+pub fn toJson[T: Serialize](v: &T): Json {
+    let d = v.toData()
+    return dataToJson(&d)
+}
+
+// Serializes any Serialize value directly to compact JSON text.
+pub fn encode[T: Serialize](v: &T): str {
+    let j = toJson(v)
+    return write(&j, &compact())
+}
+
+// Serializes any Serialize value directly to pretty-printed JSON text.
+pub fn encodePretty[T: Serialize](v: &T): str {
+    let j = toJson(v)
+    return write(&j, &pretty())
+}
+
+// Deserializes a Json value into any Deserialize type T.
+pub fn fromJson[T: Deserialize](j: &Json): Result[T, DataError] {
+    let d = jsonToData(j)
+    return T.fromData(&d)
+}
+
+// Parses JSON text and deserializes it into any Deserialize type T.
+pub fn decode[T: Deserialize](text: &str): Result[T, DataError] {
+    let j = match parse(text) {
+        Ok(v) { v }
+        Err(e) { return Err(DataError{path: "", msg: e.toStr()}) }
+    }
+    return fromJson[T](&j)
+}

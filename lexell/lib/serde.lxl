@@ -1,0 +1,377 @@
+// serde: format-agnostic data model and error types for struct serialization
+// and deserialization, shared by json, yaml and compiler-derived codecs.
+//
+// std re-exports Data, DataField, DataError, Serialize, Deserialize, ToKey and
+// FromKey. Any record, value record, closed type, value closed type (without a
+// drop method and holding no borrows) or array []T automatically derives
+// toData(&Self): Data and fromData(&Data): Result[Self, DataError] when all of
+// its fields do. A declared method on a type always overrides the derived one.
+
+import "decimal"
+import "strings"
+
+pub type DataError = value record {
+    pub path: str
+    pub msg: str
+}
+
+pub fn dataError(msg: &str): DataError {
+    return DataError{path: "", msg: msg.clone()}
+}
+
+pub fn (e: &DataError) atField(name: &str): DataError {
+    let p = if len(e.path) == 0 {
+        name.clone()
+    } else if strByte(e.path, 0) == '[' {
+        name + e.path
+    } else {
+        name + "." + e.path
+    }
+    return DataError{path: p, msg: e.msg.clone()}
+}
+
+pub fn (e: &DataError) atIndex(i: int): DataError {
+    let p = if len(e.path) == 0 {
+        "[" + intToStr(i) + "]"
+    } else if strByte(e.path, 0) == '[' {
+        "[" + intToStr(i) + "]" + e.path
+    } else {
+        "[" + intToStr(i) + "]." + e.path
+    }
+    return DataError{path: p, msg: e.msg.clone()}
+}
+
+pub fn (e: &DataError) toStr(): str {
+    if len(e.path) == 0 { return e.msg.clone() }
+    return e.path + ": " + e.msg
+}
+
+pub type DataField = value record {
+    pub key: str
+    pub val: Data
+}
+
+pub type Data = value closed {
+    Null
+    Bool(bool)
+    Int(int)
+    Uint(u64)
+    Float(float)
+    Dec(decimal.Decimal)
+    Str(str)
+    Arr([]Data)
+    Obj([]DataField)
+}
+
+pub fn dataNull(): Data { return Data.Null }
+pub fn dataBool(b: bool): Data { return Data.Bool(b) }
+pub fn dataInt(n: int): Data { return Data.Int(n) }
+pub fn dataUint(n: u64): Data { return Data.Uint(n) }
+pub fn dataFloat(x: float): Data { return Data.Float(x) }
+pub fn dataDec(d: decimal.Decimal): Data { return Data.Dec(d) }
+pub fn dataStr(s: str): Data { return Data.Str(s) }
+pub fn dataArr(xs: []Data): Data { return Data.Arr(xs) }
+pub fn dataObj(fs: []DataField): Data { return Data.Obj(fs) }
+
+pub fn wrapVariant(name: &str, payload: Data): Data {
+    return Data.Obj([DataField{key: name.clone(), val: payload}])
+}
+
+pub fn (d: &Data) kindName(): str {
+    return match d {
+        Data.Null { "null" }
+        Data.Bool(_) { "bool" }
+        Data.Int(_) { "int" }
+        Data.Uint(_) { "uint" }
+        Data.Float(_) { "float" }
+        Data.Dec(_) { "decimal" }
+        Data.Str(_) { "string" }
+        Data.Arr(_) { "array" }
+        Data.Obj(_) { "object" }
+    }
+}
+
+// ---- helpers used by compiler-derived codecs and custom implementations
+
+pub fn objCheck(d: &Data): Result[Unit, DataError] {
+    match d {
+        Data.Obj(_) { return Ok(Unit{}) }
+        else { return Err(dataError(&("expected object, got " + d.kindName()))) }
+    }
+}
+
+pub fn objLookup(d: &Data, key: &str): Option[&Data] {
+    match d {
+        Data.Obj(fs) {
+            var i = len(fs) - 1
+            while i >= 0 {
+                if fs[i].key == key { return Some(&fs[i].val) }
+                i -= 1
+            }
+            return None
+        }
+        else { return None }
+    }
+}
+
+pub fn arrItems(d: &Data): Result[&[]Data, DataError] {
+    match d {
+        Data.Arr(xs) { return Ok(xs) }
+        else { return Err(dataError(&("expected array, got " + d.kindName()))) }
+    }
+}
+
+pub fn asTagName(d: &Data): Result[&str, DataError] {
+    match d {
+        Data.Str(s) { return Ok(s) }
+        Data.Obj(fs) {
+            if len(fs) != 1 {
+                return Err(dataError(&("expected single-key object for variant, got " + intToStr(len(fs)) + " keys")))
+            }
+            return Ok(&fs[0].key)
+        }
+        else { return Err(dataError(&("expected variant string or object, got " + d.kindName()))) }
+    }
+}
+
+pub fn asTagPayload(d: &Data): Result[Option[&Data], DataError] {
+    match d {
+        Data.Str(_) { return Ok(None) }
+        Data.Obj(fs) {
+            if len(fs) != 1 {
+                return Err(dataError(&("expected single-key object for variant, got " + intToStr(len(fs)) + " keys")))
+            }
+            return Ok(Some(&fs[0].val))
+        }
+        else { return Err(dataError(&("expected variant string or object, got " + d.kindName()))) }
+    }
+}
+
+pub fn errMissing(field: &str): DataError {
+    return DataError{path: field.clone(), msg: "missing required field"}
+}
+
+pub fn errUnknownVariant(typeName: &str, name: &str): DataError {
+    return dataError(&("unknown variant '" + name + "' for " + typeName))
+}
+
+pub fn errVariantArity(variant: &str, want: int, got: int): DataError {
+    return DataError{path: variant.clone(), msg: "expected " + intToStr(want) + " elements, got " + intToStr(got)}
+}
+
+pub fn errVariantNoPayload(variant: &str): DataError {
+    return DataError{path: variant.clone(), msg: "variant takes no payload"}
+}
+
+pub fn errVariantNeedsPayload(variant: &str): DataError {
+    return DataError{path: variant.clone(), msg: "variant requires a payload"}
+}
+
+pub fn errAtField(e: DataError, field: &str): DataError { return e.atField(field) }
+pub fn errAtIndex(e: DataError, i: int): DataError { return e.atIndex(i) }
+
+// ---- primitive decode helpers (range-checked, never trap)
+
+const I32_MIN: int = -2147483648
+const I32_MAX: int = 2147483647
+const U32_MAX: int = 4294967295
+const INT_MAX_U64: u64 = 9223372036854775807
+
+pub fn decodeBool(d: &Data): Result[bool, DataError] {
+    match d {
+        Data.Bool(b) { return Ok(b) }
+        else { return Err(dataError(&("expected bool, got " + d.kindName()))) }
+    }
+}
+
+pub fn decodeStr(d: &Data): Result[str, DataError] {
+    match d {
+        Data.Str(s) { return Ok(s.clone()) }
+        else { return Err(dataError(&("expected string, got " + d.kindName()))) }
+    }
+}
+
+pub fn decodeInt(d: &Data): Result[int, DataError] {
+    match d {
+        Data.Int(n) { return Ok(n) }
+        Data.Uint(u) {
+            if u > INT_MAX_U64 { return Err(dataError("integer out of range for int")) }
+            return Ok(int(u))
+        }
+        else { return Err(dataError(&("expected int, got " + d.kindName()))) }
+    }
+}
+
+pub fn decodeI32(d: &Data): Result[i32, DataError] {
+    let n = try decodeInt(d)
+    if n < I32_MIN || n > I32_MAX { return Err(dataError("integer out of range for i32")) }
+    return Ok(i32(n))
+}
+
+pub fn decodeU32(d: &Data): Result[u32, DataError] {
+    let n = try decodeInt(d)
+    if n < 0 || n > U32_MAX { return Err(dataError("integer out of range for u32")) }
+    return Ok(u32(n))
+}
+
+pub fn decodeByte(d: &Data): Result[byte, DataError] {
+    let n = try decodeInt(d)
+    if n < 0 || n > 255 { return Err(dataError("integer out of range for byte")) }
+    return Ok(byte(n))
+}
+
+pub fn decodeU64(d: &Data): Result[u64, DataError] {
+    match d {
+        Data.Uint(u) { return Ok(u) }
+        Data.Int(n) {
+            if n < 0 { return Err(dataError("negative integer out of range for u64")) }
+            return Ok(u64(n))
+        }
+        else { return Err(dataError(&("expected u64, got " + d.kindName()))) }
+    }
+}
+
+pub fn decodeI128(d: &Data): Result[i128, DataError] {
+    match d {
+        Data.Int(n) { return Ok(i128(n)) }
+        Data.Uint(u) { return Ok(i128(u)) }
+        Data.Dec(x) {
+            match x.toInt(decimal.Rounding.UNNECESSARY) {
+                Ok(v) { return Ok(i128(v)) }
+                Err(_) { return parseI128Str(&(x.canonical())) }
+            }
+        }
+        Data.Str(s) { return parseI128Str(s) }
+        else { return Err(dataError(&("expected i128, got " + d.kindName()))) }
+    }
+}
+
+pub fn decodeU128(d: &Data): Result[u128, DataError] {
+    match d {
+        Data.Int(n) {
+            if n < 0 { return Err(dataError("negative integer out of range for u128")) }
+            return Ok(u128(n))
+        }
+        Data.Uint(u) { return Ok(u128(u)) }
+        Data.Dec(x) {
+            if x.isNeg() { return Err(dataError("negative value out of range for u128")) }
+            return parseU128Str(&(x.canonical()))
+        }
+        Data.Str(s) { return parseU128Str(s) }
+        else { return Err(dataError(&("expected u128, got " + d.kindName()))) }
+    }
+}
+
+const U128_MAX_DIV10: u128 = 34028236692093846346337460743176821145
+const U128_MAX_REM10: u128 = 5
+const I128_MAX_U: u128 = 170141183460469231731687303715884105727
+const I128_MIN_MAG: u128 = 170141183460469231731687303715884105728
+const I128_MIN_VAL: i128 = -170141183460469231731687303715884105727 - 1
+const U64_MAX_U128: u128 = 18446744073709551615
+const I64_MIN_I128: i128 = -9223372036854775808
+const I64_MAX_I128: i128 = 9223372036854775807
+
+fn parseU128Str(s: &str): Result[u128, DataError] {
+    if len(s) == 0 { return Err(dataError("empty u128")) }
+    var acc: u128 = u128(0)
+    for i in 0..len(s) {
+        let c = strByte(s, i)
+        if c < '0' || c > '9' { return Err(dataError(&("invalid u128 '" + s + "'"))) }
+        let d = u128(int(c - '0'))
+        if acc > U128_MAX_DIV10 || (acc == U128_MAX_DIV10 && d > U128_MAX_REM10) {
+            return Err(dataError("integer out of range for u128"))
+        }
+        acc = acc * u128(10) + d
+    }
+    return Ok(acc)
+}
+
+fn parseI128Str(s: &str): Result[i128, DataError] {
+    if len(s) == 0 { return Err(dataError("empty i128")) }
+    let neg = strByte(s, 0) == '-'
+    let body: &str = if neg { s[1..] } else { s }
+    let mag = try parseU128Str(body)
+    if neg {
+        if mag > I128_MIN_MAG { return Err(dataError("integer out of range for i128")) }
+        if mag == I128_MIN_MAG { return Ok(I128_MIN_VAL) }
+        return Ok(-i128(mag))
+    }
+    if mag > I128_MAX_U { return Err(dataError("integer out of range for i128")) }
+    return Ok(i128(mag))
+}
+
+pub fn decodeFloat(d: &Data): Result[float, DataError] {
+    match d {
+        Data.Float(x) { return Ok(x) }
+        Data.Int(n) { return Ok(float(n)) }
+        Data.Uint(u) { return Ok(float(u)) }
+        Data.Dec(x) { return Ok(x.toFloat()) }
+        else { return Err(dataError(&("expected float, got " + d.kindName()))) }
+    }
+}
+
+pub fn decodeDecimal(d: &Data): Result[decimal.Decimal, DataError] {
+    match d {
+        Data.Dec(x) { return Ok(x) }
+        Data.Int(n) { return Ok(decimal.Decimal.fromInt(n)) }
+        Data.Uint(u) {
+            match decimal.Decimal.parse(&(u64ToStr(u))) {
+                Ok(v) { return Ok(v) }
+                Err(e) { return Err(dataError(&(e.toStr()))) }
+            }
+        }
+        Data.Float(f) {
+            if !f.isFinite() { return Err(dataError("non-finite float cannot decode as Decimal")) }
+            match decimal.Decimal.parse(&(f.toStr())) {
+                Ok(v) { return Ok(v) }
+                Err(e) { return Err(dataError(&(e.toStr()))) }
+            }
+        }
+        Data.Str(s) {
+            match decimal.Decimal.parse(s) {
+                Ok(v) { return Ok(v) }
+                Err(e) { return Err(dataError(&("invalid decimal '" + s + "': " + e.toStr()))) }
+            }
+        }
+        else { return Err(dataError(&("expected decimal, got " + d.kindName()))) }
+    }
+}
+
+pub fn decodeUnit(d: &Data): Result[Unit, DataError] {
+    match d {
+        Data.Null { return Ok(Unit{}) }
+        Data.Obj(fs) {
+            if len(fs) == 0 { return Ok(Unit{}) }
+            return Err(dataError("expected null or empty object for Unit"))
+        }
+        else { return Err(dataError(&("expected null for Unit, got " + d.kindName()))) }
+    }
+}
+
+// Helper for i128/u128 toData: uses Data.Int/Data.Uint when in 64-bit range, else Data.Dec or Data.Str.
+pub fn encodeI128(n: i128): Data {
+    if n >= I64_MIN_I128 && n <= I64_MAX_I128 {
+        return Data.Int(int(n))
+    }
+    match decimal.Decimal.parse(&(i128ToStr(n))) {
+        Ok(d) { return Data.Dec(d) }
+        Err(_) { return Data.Str(i128ToStr(n)) }
+    }
+}
+
+pub fn encodeU128(n: u128): Data {
+    if n <= U64_MAX_U128 {
+        return Data.Uint(u64(n))
+    }
+    match decimal.Decimal.parse(&(u128ToStr(n))) {
+        Ok(d) { return Data.Dec(d) }
+        Err(_) { return Data.Str(u128ToStr(n)) }
+    }
+}
+
+pub fn keyToInt(s: &str): Result[int, DataError] {
+    match strings.parseInt(s) {
+        Ok(n) { return Ok(n) }
+        Err(_) { return Err(dataError(&("invalid int map key '" + s + "'"))) }
+    }
+}

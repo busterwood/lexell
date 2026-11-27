@@ -13,6 +13,8 @@ import "strings"
 import "hash"
 import "decimal"
 import "collections"
+import "format"
+import "serde"
 
 // ---------------------------------------------------------------- core sums
 
@@ -85,6 +87,20 @@ pub fn (o: &Option[T: Show]) toStr(): str {
     match o {
         Some(x) { return "Some(" + x.toStr() + ")" }
         None { return "None" }
+    }
+}
+
+pub fn (o: &Option[T: Serialize]) toData(): Data {
+    match o {
+        Some(x) { return x.toData() }
+        None { return Data.Null }
+    }
+}
+
+pub fn (Option[T: Deserialize]) fromData(d: &Data): Result[Option[T], DataError] {
+    match d {
+        Data.Null { return Ok(None) }
+        else { return Ok(Some(try T.fromData(d))) }
     }
 }
 
@@ -178,6 +194,8 @@ pub fn (r: &Result[T: Show, E: Show]) toStr(): str {
 pub fn (u: Unit) eq(other: &Unit): bool { return true }
 pub fn (u: Unit) hash(): u64 { return 0 }
 pub fn (u: Unit) toStr(): str { return "()" }
+pub fn (u: Unit) toData(): Data { return Data.Null }
+pub fn (Unit) fromData(d: &Data): Result[Unit, DataError] { return serde.decodeUnit(d) }
 
 // ---------------------------------------------------------------- rc
 // rc T (design/owned-str.md, SPEC 4.9) is a counted handle to a value that does not change while
@@ -193,6 +211,8 @@ pub fn (a: &Rc[T: Eq]) eq(b: &Rc[T]): bool { return a.v == b.v }
 pub fn (a: &Rc[T: Ord]) cmp(b: &Rc[T]): int { return a.v.cmp(&b.v) }
 pub fn (a: &Rc[T: Hash]) hash(): u64 { return a.v.hash() }
 pub fn (a: &Rc[T: Show]) toStr(): str { return a.v.toStr() }
+pub fn (a: &Rc[T: Serialize]) toData(): Data { return a.v.toData() }
+pub fn (Rc[T: Deserialize]) fromData(d: &Data): Result[Rc[T], DataError] { return Ok(rc(try T.fromData(d))) }
 
 // ---------------------------------------------------------------- constraints
 
@@ -203,6 +223,14 @@ pub type Show = interface { fn (&Self) toStr(): str }
 // A second owner made by copying (design/owned-str.md). For str it takes a count while str is
 // counted, and copies the bytes once str is owned.
 pub type Clone = interface { fn (&Self) clone(): Self }
+
+pub type Data = serde.Data
+pub type DataField = serde.DataField
+pub type DataError = serde.DataError
+pub type Serialize = interface { fn (&Self) toData(): Data }
+pub type Deserialize = interface { fn fromData(d: &Data): Result[Self, DataError] }
+pub type ToKey = interface { fn (&Self) toKey(): str }
+pub type FromKey = interface { fn fromKey(s: &str): Result[Self, DataError] }
 
 fn b2i(b: bool): int {
     if b { return 1 }
@@ -518,6 +546,40 @@ pub fn (s: mut &str) clear() { strClear(s) }
 pub fn (s: &str) bytes(): &[byte] { return strBytes(s) }
 pub fn (s: &str) hash(): u64 { return hash.sipStr(&s) }
 
+pub fn (a: int) toData(): Data { return Data.Int(a) }
+pub fn (int) fromData(d: &Data): Result[int, DataError] { return serde.decodeInt(d) }
+pub fn (a: int) toKey(): str { return intToStr(a) }
+pub fn (int) fromKey(s: &str): Result[int, DataError] { return serde.keyToInt(s) }
+
+pub fn (a: i32) toData(): Data { return Data.Int(int(a)) }
+pub fn (i32) fromData(d: &Data): Result[i32, DataError] { return serde.decodeI32(d) }
+
+pub fn (a: u32) toData(): Data { return Data.Int(int(a)) }
+pub fn (u32) fromData(d: &Data): Result[u32, DataError] { return serde.decodeU32(d) }
+
+pub fn (a: u64) toData(): Data { return Data.Uint(a) }
+pub fn (u64) fromData(d: &Data): Result[u64, DataError] { return serde.decodeU64(d) }
+
+pub fn (a: byte) toData(): Data { return Data.Int(int(a)) }
+pub fn (byte) fromData(d: &Data): Result[byte, DataError] { return serde.decodeByte(d) }
+
+pub fn (a: i128) toData(): Data { return serde.encodeI128(a) }
+pub fn (i128) fromData(d: &Data): Result[i128, DataError] { return serde.decodeI128(d) }
+
+pub fn (a: u128) toData(): Data { return serde.encodeU128(a) }
+pub fn (u128) fromData(d: &Data): Result[u128, DataError] { return serde.decodeU128(d) }
+
+pub fn (a: float) toData(): Data { return Data.Float(a) }
+pub fn (float) fromData(d: &Data): Result[float, DataError] { return serde.decodeFloat(d) }
+
+pub fn (a: bool) toData(): Data { return Data.Bool(a) }
+pub fn (bool) fromData(d: &Data): Result[bool, DataError] { return serde.decodeBool(d) }
+
+pub fn (s: &str) toData(): Data { return Data.Str(s.clone()) }
+pub fn (str) fromData(d: &Data): Result[str, DataError] { return serde.decodeStr(d) }
+pub fn (s: &str) toKey(): str { return s.clone() }
+pub fn (str) fromKey(s: &str): Result[str, DataError] { return Ok(s.clone()) }
+
 pub fn min[T: borrow + Ord](a: T, b: T): T {
     if b < a { return b }
     return a
@@ -577,3 +639,40 @@ pub fn fxHashInt(x: int): u64 { return collections.fxHashInt(x) }
 pub fn sort[T: borrow + Ord](xs: mut &[T]) { collections.sort(xs) }
 
 pub fn sipHash13(k0: u64, k1: u64, s: &str): u64 { return hash.sipHash13(k0, k1, s) }
+
+// Compiler-internal formatting helpers for interpolated strings ($"...").
+// Kept non-pub so they do not pollute the unqualified prelude namespace.
+fn __fmtInt(n: int, fill: int, align: int, sign: int, alt: bool, zero: bool, group: bool, width: int, prec: int, kind: int): str {
+    let sp = format.makeSpec(fill, align, sign, alt, zero, group, width, prec, kind)
+    return format.formatInt(n, &sp)
+}
+
+fn __fmtUint(n: u64, fill: int, align: int, sign: int, alt: bool, zero: bool, group: bool, width: int, prec: int, kind: int): str {
+    let sp = format.makeSpec(fill, align, sign, alt, zero, group, width, prec, kind)
+    return format.formatUint(n, &sp)
+}
+
+fn __fmtI128(n: i128, fill: int, align: int, sign: int, alt: bool, zero: bool, group: bool, width: int, prec: int, kind: int): str {
+    let sp = format.makeSpec(fill, align, sign, alt, zero, group, width, prec, kind)
+    return format.formatI128(n, &sp)
+}
+
+fn __fmtU128(n: u128, fill: int, align: int, sign: int, alt: bool, zero: bool, group: bool, width: int, prec: int, kind: int): str {
+    let sp = format.makeSpec(fill, align, sign, alt, zero, group, width, prec, kind)
+    return format.formatU128(n, &sp)
+}
+
+fn __fmtFloat(x: float, fill: int, align: int, sign: int, alt: bool, zero: bool, group: bool, width: int, prec: int, kind: int): str {
+    let sp = format.makeSpec(fill, align, sign, alt, zero, group, width, prec, kind)
+    return format.formatFloat(x, &sp)
+}
+
+fn __fmtDec(d: Decimal, fill: int, align: int, sign: int, alt: bool, zero: bool, group: bool, width: int, prec: int, kind: int): str {
+    let sp = format.makeSpec(fill, align, sign, alt, zero, group, width, prec, kind)
+    return format.formatDecimal(d, &sp)
+}
+
+fn __fmtStr(s: &str, fill: int, align: int, sign: int, alt: bool, zero: bool, group: bool, width: int, prec: int, kind: int): str {
+    let sp = format.makeSpec(fill, align, sign, alt, zero, group, width, prec, kind)
+    return format.formatStr(s, &sp)
+}

@@ -706,28 +706,82 @@ pub fn (pg: mut &Program) builtinClone(t: int, iface: int): bool {
 pub fn (pg: &Program) derivedMember(iface: int): str {
     if pg.types[iface].mod != pg.std { return "" }
     let n = &pg.types[iface].name
-    return if n == "Eq" { "eq" } else if n == "Hash" { "hash" } else if n == "Show" { "toStr" } else { "" }
+    return if n == "Eq" { "eq" } else if n == "Hash" { "hash" } else if n == "Show" { "toStr" }
+        else if n == "Serialize" { "toData" } else if n == "Deserialize" { "fromData" } else { "" }
 }
 
-// Whether t satisfies iface (Eq, Hash or Show) through a derived method.
+// TypeDecl index of a type or alias in std (following aliases), or -1.
+pub fn (pg: mut &Program) stdType(name: &str): int {
+    let s = pg.mods[pg.std].scope.getOr(name, NOSYM)
+    if s.k != D_TYPE { return -1 }
+    let d = s.i
+    if pg.types[d].form == sx.F_ALIAS { return pg.aliasTarget(d) }
+    return pg.mkInst(d, &[])
+}
+
+pub fn (pg: &Program) stdDecl(name: &str): int {
+    let s = pg.mods[pg.std].scope.getOr(name, NOSYM)
+    if s.k != D_TYPE { return -1 }
+    return s.i
+}
+
+pub fn (pg: &Program) serdeMod(): int {
+    for i in 0..len(pg.mods) {
+        if pg.mods[i].isLib && pg.mods[i].name == "serde" { return i }
+    }
+    return -1
+}
+
+pub fn (pg: &Program) isOption(t: int): bool {
+    let od = pg.stdDecl("Option")
+    return od >= 0 && pg.tk(t) == TK_INST && pg.ta(t) == od
+}
+
+// Whether t satisfies iface (Eq, Hash, Show, Serialize or Deserialize) through a derived method.
 pub fn (pg: mut &Program) builtinDerived(t: int, iface: int): bool {
     let m = pg.derivedMember(iface)
     if m == "" || pg.tk(t) == TK_TP || pg.methodOf(t, &m) >= 0 { return false }
     return pg.derivable(t, &m)
 }
 
-// Whether t has the method name (eq, hash or toStr), declared or derived: a type with the method;
-// a type parameter whose constraints give it; a record or closed type with no drop method, holding
-// no borrows, every part of which has it (a type containing itself has it when the rest does).
+// Whether t has the method name (eq, hash, toStr, toData or fromData), declared or derived.
 pub fn (pg: mut &Program) derivable(t: int, name: &str): bool {
     var seen: []int = []
     return pg.derivableAt(t, name, mut &seen)
 }
 
+fn (pg: mut &Program) methodConsOk(t: int, fd: int, seen: mut &[]int): bool {
+    let tps = copyInts(&pg.fns[fd].tps)
+    if len(tps) == 0 { return true }
+    var bind: []int = []
+    if !pg.unify(pg.fns[fd].recvType, t, mut &bind, &tps) || len(bind) != 2 * len(tps) { return false }
+    for tp in tps {
+        let bt = envGet(&bind, tp)
+        if pg.tparams[tp].copy && !pg.isCopy(bt) && !pg.soft(bt) { return false }
+        let cons = copyInts(&pg.tparams[tp].cons)
+        for c0 in cons {
+            let con = pg.subst(c0, &bind)
+            let dm = pg.derivedMember(pg.ta(con))
+            if dm == "toData" || dm == "fromData" {
+                if !pg.derivableAt(bt, &dm, seen) { return false }
+            } else if len(pg.satisfies(bt, con, pg.fns[fd].mod)) > 0 {
+                return false
+            }
+        }
+    }
+    return true
+}
+
 fn (pg: mut &Program) derivableAt(t: int, name: &str, seen: mut &[]int): bool {
+    let isSerde = name == "toData" || name == "fromData"
     let k = pg.tk(t)
     if k == TK_TP { return len(pg.ifaceMembers(t, name)) > 0 }
-    if pg.methodOf(t, name) >= 0 { return true }
+    let fd = pg.methodOf(t, name)
+    if fd >= 0 {
+        if !isSerde { return true }
+        return pg.methodConsOk(t, fd, seen)
+    }
+    if k == TK_ARR && isSerde { return pg.derivableAt(pg.ta(t), name, seen) }
     if k != TK_INST { return false }
     let d = pg.ta(t)
     if d == pg.shared || d == pg.rc { return false }
@@ -2409,6 +2463,9 @@ pub fn (pg: mut &Program) satisfies(t: int, con: int, m: int): str {
     // a shared borrow &U satisfies an interface U satisfies when no method needs mut &Self: its
     // methods are U's, on the borrowed value (design/consistency-designs.md, finding 2: &str is Ord)
     if pg.tk(t) == TK_REF && !pg.tm(t) && pg.tk(pg.ta(t)) != TK_TP && !pg.builtinClone(t, iface) {
+        if pg.derivedMember(iface) == "fromData" {
+            return pg.tstr(t) + " is a borrow and cannot be deserialized"
+        }
         for mb in pg.types[iface].members {
             if mb.mode == sx.M_MUT { return pg.tstr(t) + " is a shared borrow, and " + mb.name + " needs mut &Self" }
         }

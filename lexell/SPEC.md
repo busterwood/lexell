@@ -58,6 +58,17 @@ separate decision from the user; they are the ones to revisit first.
   the source uses (LF, CRLF or a lone CR), so a raw string never contains a CR.
   It is a `str` like any string literal, and a newline after its closing
   backtick ends a statement.
+- Interpolated strings `$"..."` (and raw multiline `` $`...` ``) embed
+  expressions in `{expr}` or `{expr:spec}`: `{{` and `}}` produce literal
+  braces, and an unmatched `}` or empty `{}` is a compile error. Without a
+  `:spec`, a `str`/`&str`/`rc str` is appended directly and any other value
+  calls its `toStr()` method (`Show`, declared or derived). With `:spec`, the
+  specifier `[[fill]align][sign][#][0][width][,][.precision][type]` is parsed
+  and type-checked at compile time (`d x X b o` for integers, `f e E g G` for
+  `float`, `f c` for `Decimal`, `s q` for text/Show; `,` adds thousands
+  grouping). Parts are evaluated left to right into an owned `str` (a literal
+  with no `{...}` interpolations behaves as an ordinary string literal). A
+  newline after the closing quote or backtick ends a statement.
 
 Keywords:
 
@@ -744,16 +755,24 @@ compare the variants, when it declares no `eq` method; when it declares one,
 compares the variants (so `eq` may be written `return a == b` without calling
 itself). Both operands have that type (or are borrows of it).
 
-**Derived methods.** A record or closed type that declares no `eq`, `hash`
-or `toStr` method has one derived, as it has `clone` (section 4.7), when it
-has no `drop` method, holds no borrows, and each of its fields has that
-method, declared or derived (a type that contains itself has it when the rest
-does; a type parameter has it when its constraints give it):
+**Derived methods.** A record or closed type that declares no `eq`, `hash`,
+`toStr`, `toData` or `fromData` method has one derived, as it has `clone`
+(section 4.7), when it has no `drop` method, holds no borrows, and each of its
+fields has that method, declared or derived (a type that contains itself has it
+when the rest does; a type parameter has it when its constraints give it;
+arrays `[]T` also derive `toData` and `fromData` when `T` does):
 - `eq` compares the variants, then the fields in declaration order;
 - `hash` combines the variant and the fields' hashes;
 - `toStr` gives `P{x: 1, name: "a"}` for a record, `E.V` for a variant
   without fields, `E.V(1, 2)` for positional fields and `E.V{w: 2}` for named
-  ones; strings are quoted.
+  ones; strings are quoted;
+- `toData` and `fromData` convert between the type and `std`'s format-agnostic
+  `Data` (`Serialize` / `Deserialize`, used by `json.encode`/`decode` and
+  `yaml.encode`/`decode`): records map to objects of their fields in
+  declaration order (missing keys for `Option[T]` fields decode as `None`),
+  unit variants to their name string, single-field positional variants to
+  `{"V": payload}`, multi-field positional variants to `{"V": [...]}` and
+  named-field variants to `{"V": {...}}`. A declared method always wins.
 
 So such a type satisfies `Eq`, `Hash` and `Show`, can be a `Map` key and can
 be printed. A shared borrow `&U` satisfies the interfaces `U` satisfies,

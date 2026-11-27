@@ -1,0 +1,366 @@
+// zstd: Zstandard compression and decompression over libzstd.
+//
+// One-shot helpers:
+//   compress / compressLevel / decompress / decompressMax
+//   minLevel / maxLevel / defaultLevel / versionNumber
+//
+// Streaming types (RAII: drop() frees the underlying ZSTD_CCtx / ZSTD_DCtx):
+//   Compressor (newCompressor(level)): setChecksum, write, flush, finish
+//   Decompressor (newDecompressor()): setMaxOut, write, finish
+//
+// All decompression entry points enforce an output size limit (default 64 MiB,
+// DEFAULT_MAX_OUT) to guard against decompression bombs. Pass a custom maxOut
+// (or -1 for unlimited) via decompressMax or Decompressor.setMaxOut.
+
+import "ffi"
+
+extern "zstd" fn ZSTD_versionNumber(): u32
+extern "zstd" fn ZSTD_isError(code: u64): u32
+extern "zstd" fn ZSTD_getErrorName(code: u64): str
+extern "zstd" fn ZSTD_compressBound(srcSize: int): u64
+extern "zstd" fn ZSTD_minCLevel(): i32
+extern "zstd" fn ZSTD_maxCLevel(): i32
+extern "zstd" fn ZSTD_defaultCLevel(): i32
+extern "zstd" fn ZSTD_createCCtx(): ptr
+extern "zstd" fn ZSTD_freeCCtx(cctx: ptr): u64
+extern "zstd" fn ZSTD_compressCCtx(cctx: ptr, dst: mut &[byte], dstCap: int, src: &[byte], srcSize: int, level: i32): u64
+extern "zstd" fn ZSTD_CCtx_setParameter(cctx: ptr, param: i32, value: i32): u64
+extern "zstd" fn ZSTD_compressStream2(cctx: ptr, output: ptr, input: ptr, endOp: i32): u64
+extern "zstd" fn ZSTD_createDCtx(): ptr
+extern "zstd" fn ZSTD_freeDCtx(dctx: ptr): u64
+extern "zstd" fn ZSTD_decompressStream(dctx: ptr, output: ptr, input: ptr): u64
+extern "zstd" fn ZSTD_CStreamOutSize(): u64
+extern "zstd" fn ZSTD_DStreamOutSize(): u64
+
+// ZSTD_inBuffer / ZSTD_outBuffer layout on Linux x86-64:
+//   offset 0:  void* / const void* (8 bytes, ptr index 0)
+//   offset 8:  size_t size         (8 bytes)
+//   offset 16: size_t pos          (8 bytes)
+const ZBUF_SIZE: int = 24
+const ZBUF_PTR_IDX: int = 0
+const ZBUF_SIZE_OFF: int = 8
+const ZBUF_POS_OFF: int = 16
+
+const ZSTD_C_COMPRESSION_LEVEL: i32 = 100
+const ZSTD_C_CHECKSUM_FLAG: i32 = 201
+
+const ZSTD_E_CONTINUE: i32 = 0
+const ZSTD_E_FLUSH: i32 = 1
+const ZSTD_E_END: i32 = 2
+
+const CHUNK_SIZE: int = 65536
+
+// Default maximum decompressed output size (64 MiB).
+pub const DEFAULT_MAX_OUT: int = 67108864
+
+pub type Error = record {
+    msg: str
+}
+
+pub fn (e: &Error) toStr(): str { return e.msg.clone() }
+
+fn zerr(op: &str, code: u64): Error {
+    return Error{msg: "zstd: " + op + ": " + ZSTD_getErrorName(code)}
+}
+
+fn getU64(m: &ffi.Mem, off: int): u64 {
+    let b0 = u64(m.get(off))
+    let b1 = u64(m.get(off + 1)) << 8
+    let b2 = u64(m.get(off + 2)) << 16
+    let b3 = u64(m.get(off + 3)) << 24
+    let b4 = u64(m.get(off + 4)) << 32
+    let b5 = u64(m.get(off + 5)) << 40
+    let b6 = u64(m.get(off + 6)) << 48
+    let b7 = u64(m.get(off + 7)) << 56
+    return b0 | b1 | b2 | b3 | b4 | b5 | b6 | b7
+}
+
+fn setU64(m: mut &ffi.Mem, off: int, v: u64) {
+    m.set(off, byte(v & 255))
+    m.set(off + 1, byte((v >> 8) & 255))
+    m.set(off + 2, byte((v >> 16) & 255))
+    m.set(off + 3, byte((v >> 24) & 255))
+    m.set(off + 4, byte((v >> 32) & 255))
+    m.set(off + 5, byte((v >> 40) & 255))
+    m.set(off + 6, byte((v >> 48) & 255))
+    m.set(off + 7, byte((v >> 56) & 255))
+}
+
+// Library version encoded as major*10000 + minor*100 + release.
+pub fn versionNumber(): int { return int(ZSTD_versionNumber()) }
+pub fn minLevel(): int { return int(ZSTD_minCLevel()) }
+pub fn maxLevel(): int { return int(ZSTD_maxCLevel()) }
+pub fn defaultLevel(): int { return int(ZSTD_defaultCLevel()) }
+
+// ---- owned contexts
+
+type CCtxGuard = record {
+    p: ptr
+}
+
+fn (g: mut &CCtxGuard) drop() {
+    if !isNull(g.p) {
+        let _ = ZSTD_freeCCtx(g.p)
+        g.p = nullPtr()
+    }
+}
+
+// ---- one-shot compression
+
+// Compress data at the default Zstandard level (3).
+pub fn compress(data: &str): Result[str, Error] {
+    return compressLevel(data, defaultLevel())
+}
+
+// Compress data at an explicit Zstandard level (minLevel()..maxLevel()).
+pub fn compressLevel(data: &str, level: int): Result[str, Error] {
+    let mn = minLevel()
+    let mx = maxLevel()
+    if level < mn || level > mx {
+        return Err(Error{msg: "zstd: invalid compression level " + intToStr(level) + " (expected " + intToStr(mn) + ".." + intToStr(mx) + ")"})
+    }
+    let boundU = ZSTD_compressBound(len(data))
+    if ZSTD_isError(boundU) != 0 { return Err(zerr("compressBound", boundU)) }
+    let bound = int(boundU)
+    var dst = array(bound, byte(0))
+    let src = strToBytes(data)
+    let ctx = CCtxGuard{p: ZSTD_createCCtx()}
+    if isNull(ctx.p) { return Err(Error{msg: "zstd: ZSTD_createCCtx failed"}) }
+    let rc = ZSTD_compressCCtx(ctx.p, mut &dst, bound, &src, len(src), i32(level))
+    if ZSTD_isError(rc) != 0 { return Err(zerr("compress", rc)) }
+    let n = int(rc)
+    return Ok(strFromBytes(dst[0..n]))
+}
+
+// ---- streaming compressor
+
+pub type Compressor = record {
+    ctx: ptr
+    inDesc: ffi.Mem
+    outDesc: ffi.Mem
+    outBuf: ffi.Mem
+    outCap: int
+    finished: bool
+}
+
+pub fn (c: mut &Compressor) drop() {
+    if !isNull(c.ctx) {
+        let _ = ZSTD_freeCCtx(c.ctx)
+        c.ctx = nullPtr()
+    }
+}
+
+pub fn newCompressor(level: int): Result[Compressor, Error] {
+    let mn = minLevel()
+    let mx = maxLevel()
+    if level < mn || level > mx {
+        return Err(Error{msg: "zstd: invalid compression level " + intToStr(level) + " (expected " + intToStr(mn) + ".." + intToStr(mx) + ")"})
+    }
+    let ctx = ZSTD_createCCtx()
+    if isNull(ctx) { return Err(Error{msg: "zstd: ZSTD_createCCtx failed"}) }
+    let rc = ZSTD_CCtx_setParameter(ctx, ZSTD_C_COMPRESSION_LEVEL, i32(level))
+    if ZSTD_isError(rc) != 0 {
+        let _ = ZSTD_freeCCtx(ctx)
+        return Err(zerr("setParameter(compressionLevel)", rc))
+    }
+    let recCap = int(ZSTD_CStreamOutSize())
+    let cap = if recCap > 0 { recCap } else { CHUNK_SIZE }
+    return Ok(Compressor{
+        ctx: ctx,
+        inDesc: ffi.alloc(ZBUF_SIZE),
+        outDesc: ffi.alloc(ZBUF_SIZE),
+        outBuf: ffi.alloc(cap),
+        outCap: cap,
+        finished: false
+    })
+}
+
+// Enable or disable the 32-bit frame content checksum (call before writing).
+pub fn (c: mut &Compressor) setChecksum(enabled: bool): Result[Unit, Error] {
+    if isNull(c.ctx) || c.finished { return Err(Error{msg: "zstd: Compressor already finished"}) }
+    let rc = ZSTD_CCtx_setParameter(c.ctx, ZSTD_C_CHECKSUM_FLAG, if enabled { i32(1) } else { i32(0) })
+    if ZSTD_isError(rc) != 0 { return Err(zerr("setParameter(checksumFlag)", rc)) }
+    return Ok(Unit{})
+}
+
+fn (c: mut &Compressor) step(chunk: &str, endOp: i32): Result[str, Error] {
+    if isNull(c.ctx) || c.finished { return Err(Error{msg: "zstd: Compressor already finished"}) }
+    var out = ""
+    var off = 0
+    var first = true
+    while first || off < len(chunk) {
+        first = false
+        let end = if off + CHUNK_SIZE < len(chunk) { off + CHUNK_SIZE } else { len(chunk) }
+        let isLast = end == len(chunk)
+        let inMem = ffi.copyBytes(chunk[off..end])
+        let nIn = end - off
+        c.inDesc.setPtr(ZBUF_PTR_IDX, inMem.ptr())
+        setU64(mut &c.inDesc, ZBUF_SIZE_OFF, u64(nIn))
+        setU64(mut &c.inDesc, ZBUF_POS_OFF, 0)
+        let op = if isLast { endOp } else { ZSTD_E_CONTINUE }
+        var done = false
+        while !done {
+            c.outDesc.setPtr(ZBUF_PTR_IDX, c.outBuf.ptr())
+            setU64(mut &c.outDesc, ZBUF_SIZE_OFF, u64(c.outCap))
+            setU64(mut &c.outDesc, ZBUF_POS_OFF, 0)
+            let rem = ZSTD_compressStream2(c.ctx, c.outDesc.ptr(), c.inDesc.ptr(), op)
+            if ZSTD_isError(rem) != 0 { return Err(zerr("compressStream2", rem)) }
+            let produced = int(getU64(&c.outDesc, ZBUF_POS_OFF))
+            if produced > 0 {
+                out += ffi.bytes(c.outBuf.ptr(), produced)
+            }
+            if op == ZSTD_E_CONTINUE {
+                if getU64(&c.inDesc, ZBUF_POS_OFF) >= u64(nIn) { done = true }
+            } else {
+                if rem == 0 { done = true }
+            }
+        }
+        off = end
+    }
+    if endOp == ZSTD_E_END {
+        c.finished = true
+    }
+    return Ok(out)
+}
+
+// Feed uncompressed bytes and return compressed bytes produced so far.
+pub fn (c: mut &Compressor) write(chunk: &str): Result[str, Error] {
+    if len(chunk) == 0 {
+        if isNull(c.ctx) || c.finished { return Err(Error{msg: "zstd: Compressor already finished"}) }
+        return Ok("")
+    }
+    return c.step(chunk, ZSTD_E_CONTINUE)
+}
+
+// Flush buffered data so a receiver can decode everything written so far.
+pub fn (c: mut &Compressor) flush(): Result[str, Error] {
+    return c.step("", ZSTD_E_FLUSH)
+}
+
+// Close the Zstandard frame and return the remaining compressed bytes.
+pub fn (c: mut &Compressor) finish(): Result[str, Error] {
+    return c.step("", ZSTD_E_END)
+}
+
+// ---- streaming decompressor
+
+pub type Decompressor = record {
+    ctx: ptr
+    inDesc: ffi.Mem
+    outDesc: ffi.Mem
+    outBuf: ffi.Mem
+    outCap: int
+    totalOut: int
+    maxOut: int
+    seenAny: bool
+    frameDone: bool
+}
+
+pub fn (d: mut &Decompressor) drop() {
+    if !isNull(d.ctx) {
+        let _ = ZSTD_freeDCtx(d.ctx)
+        d.ctx = nullPtr()
+    }
+}
+
+pub fn newDecompressor(): Result[Decompressor, Error] {
+    let ctx = ZSTD_createDCtx()
+    if isNull(ctx) { return Err(Error{msg: "zstd: ZSTD_createDCtx failed"}) }
+    let recCap = int(ZSTD_DStreamOutSize())
+    let cap = if recCap > 0 { recCap } else { CHUNK_SIZE }
+    return Ok(Decompressor{
+        ctx: ctx,
+        inDesc: ffi.alloc(ZBUF_SIZE),
+        outDesc: ffi.alloc(ZBUF_SIZE),
+        outBuf: ffi.alloc(cap),
+        outCap: cap,
+        totalOut: 0,
+        maxOut: DEFAULT_MAX_OUT,
+        seenAny: false,
+        frameDone: false
+    })
+}
+
+// Set the maximum total decompressed byte count (-1 for unlimited).
+pub fn (d: mut &Decompressor) setMaxOut(maxOut: int) {
+    d.maxOut = maxOut
+}
+
+// True when at least one complete frame has been decoded and no frame is mid-stream.
+pub fn (d: &Decompressor) isDone(): bool { return d.seenAny && d.frameDone }
+
+// Feed compressed bytes (supporting multi-frame streams) and return decompressed output.
+pub fn (d: mut &Decompressor) write(chunk: &str): Result[str, Error] {
+    if isNull(d.ctx) { return Err(Error{msg: "zstd: Decompressor closed"}) }
+    if len(chunk) == 0 { return Ok("") }
+    d.seenAny = true
+    var out = ""
+    var off = 0
+    while off < len(chunk) {
+        let end = if off + CHUNK_SIZE < len(chunk) { off + CHUNK_SIZE } else { len(chunk) }
+        let inMem = ffi.copyBytes(chunk[off..end])
+        let nIn = end - off
+        d.inDesc.setPtr(ZBUF_PTR_IDX, inMem.ptr())
+        setU64(mut &d.inDesc, ZBUF_SIZE_OFF, u64(nIn))
+        setU64(mut &d.inDesc, ZBUF_POS_OFF, 0)
+        var keepGoing = true
+        while keepGoing {
+            var req = d.outCap
+            if d.maxOut >= 0 {
+                let left = d.maxOut - d.totalOut
+                if left < 0 {
+                    return Err(Error{msg: "zstd: decompressed output exceeds limit of " + intToStr(d.maxOut) + " bytes"})
+                }
+                if left + 1 < req { req = left + 1 }
+            }
+            let posBefore = getU64(&d.inDesc, ZBUF_POS_OFF)
+            d.outDesc.setPtr(ZBUF_PTR_IDX, d.outBuf.ptr())
+            setU64(mut &d.outDesc, ZBUF_SIZE_OFF, u64(req))
+            setU64(mut &d.outDesc, ZBUF_POS_OFF, 0)
+            let rc = ZSTD_decompressStream(d.ctx, d.outDesc.ptr(), d.inDesc.ptr())
+            if ZSTD_isError(rc) != 0 { return Err(zerr("decompressStream", rc)) }
+            let produced = int(getU64(&d.outDesc, ZBUF_POS_OFF))
+            if produced > 0 {
+                d.totalOut += produced
+                if d.maxOut >= 0 && d.totalOut > d.maxOut {
+                    return Err(Error{msg: "zstd: decompressed output exceeds limit of " + intToStr(d.maxOut) + " bytes"})
+                }
+                out += ffi.bytes(d.outBuf.ptr(), produced)
+            }
+            d.frameDone = rc == 0
+            let posAfter = getU64(&d.inDesc, ZBUF_POS_OFF)
+            if posAfter < u64(nIn) {
+                keepGoing = !(posAfter == posBefore && produced == 0 && rc != 0)
+            } else {
+                // Input chunk consumed, but drain any remaining buffered output when outBuf filled.
+                keepGoing = produced == req
+            }
+        }
+        off = end
+    }
+    return Ok(out)
+}
+
+// Verify all fed frames completed cleanly (no truncation).
+pub fn (d: mut &Decompressor) finish(): Result[Unit, Error] {
+    if !d.seenAny { return Err(Error{msg: "zstd: empty input"}) }
+    if !d.frameDone { return Err(Error{msg: "zstd: truncated frame"}) }
+    return Ok(Unit{})
+}
+
+// ---- one-shot decompression
+
+// Decompress a Zstandard stream (single or concatenated frames) with DEFAULT_MAX_OUT limit.
+pub fn decompress(data: &str): Result[str, Error] {
+    return decompressMax(data, DEFAULT_MAX_OUT)
+}
+
+// Decompress a Zstandard stream with an explicit output limit (-1 for unlimited).
+pub fn decompressMax(data: &str, maxOut: int): Result[str, Error] {
+    if len(data) == 0 { return Err(Error{msg: "zstd: empty input"}) }
+    var d = try newDecompressor()
+    d.setMaxOut(maxOut)
+    let out = try d.write(data)
+    try d.finish()
+    return Ok(out)
+}

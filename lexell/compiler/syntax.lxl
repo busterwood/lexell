@@ -114,9 +114,13 @@ pub const T_STR = 4
 pub const T_CHAR = 5
 pub const T_SYM = 6
 pub const T_EOF = 7
+pub const T_ISTR_START = 8
+pub const T_ISTR_MID = 9
+pub const T_ISTR_END = 10
+pub const T_FMTSPEC = 11
 
 // Python's token kind names, used in messages ("expected str, found 'eof'").
-const TOKEN_KINDS: []str = ["id", "kw", "int", "frac", "str", "char", "sym", "eof"]
+const TOKEN_KINDS: []str = ["id", "kw", "int", "frac", "str", "char", "sym", "eof", "istr", "istr", "istr", "fmtspec"]
 
 // Symbols, in ref's SYMS order; the code of a symbol is its index.
 pub const SYMS: []str = ["+=", "-=", "*=", "/=", "%=", "|=", "&=", "^=", "+%", "-%", "*%", "<<", ">>", "..",
@@ -353,11 +357,19 @@ fn codePointName(s: &str, i: int): str {
 
 // ---------------------------------------------------------------- lexer
 
+type InterpState = value record {
+    raw: bool
+    brace: int
+    nest: int
+    line: int
+}
+
 pub type Lexer = record {
     src: str
     fname: str
     toks: []Tok
     nest: []byte
+    interp: []InterpState
     line: int
 }
 
@@ -370,11 +382,12 @@ fn (lx: mut &Lexer) push(k: int, op: int, s: &str, v: int, line: int) {
 fn (lx: &Lexer) endsStmt(): bool {
     let nt = len(lx.toks)
     if nt == 0 { return false }
+    if len(lx.interp) > 0 && lx.interp[len(lx.interp) - 1].brace == 0 { return false }
     let nn = len(lx.nest)
     if nn > 0 && lx.nest[nn - 1] != '{' { return false }
     let op = lx.toks[nt - 1].op
     return match lx.toks[nt - 1].k {
-        T_ID, T_INT, T_FRAC, T_STR, T_CHAR { true }
+        T_ID, T_INT, T_FRAC, T_STR, T_ISTR_END, T_CHAR { true }
         T_KW { op == K_RETURN || op == K_BREAK || op == K_CONTINUE || op == K_TRUE || op == K_FALSE || op == K_NEVER }
         T_SYM { op == S_RPAREN || op == S_RBRACKET || op == S_RBRACE }
         else { false }
@@ -458,8 +471,11 @@ fn toDecimal(t: &str, base: int): str {
 }
 
 pub fn lex(src: &str, fname: &str): []Tok {
-    var lx = Lexer{src: src.clone(), fname: fname.clone(), toks: [], nest: [], line: 1}
+    var lx = Lexer{src: src.clone(), fname: fname.clone(), toks: [], nest: [], interp: [], line: 1}
     lx.run()
+    if len(lx.interp) > 0 {
+        lx.fail(lx.interp[len(lx.interp) - 1].line, "unterminated interpolation '{' in interpolated string")
+    }
     let line = lx.line
     lx.push(T_SYM, S_SEMI, ";", 0, line)
     lx.push(T_EOF, -1, "", 0, line)
@@ -491,6 +507,8 @@ fn (lx: mut &Lexer) run() {
             let kw = keyword(&word)
             lx.push(if kw >= 0 { T_KW } else { T_ID }, kw, &word, 0, line)
             i = j
+        } else if c == '$' && i + 1 < n && (strByte(src, i + 1) == '"' || strByte(src, i + 1) == '`') {
+            i = lx.istr(&src, i + 2, strByte(src, i + 1) == '`', true)
         } else if c == '"' {
             i = lx.string(&src, i)
         } else if c == '`' {
@@ -521,11 +539,36 @@ fn (lx: mut &Lexer) run() {
         } else if c == '.' && i + 1 < n && isDig(strByte(src, i + 1)) && !lx.afterOperand() {
             lx.fail(line, "a fractional literal needs digits before the point")
         } else {
+            if len(lx.interp) > 0 {
+                let top = len(lx.interp) - 1
+                if c == '}' && lx.interp[top].brace == 0 && len(lx.nest) == lx.interp[top].nest {
+                    let st = pop(mut &lx.interp)
+                    i = lx.istr(&src, i + 1, st.raw, false)
+                    continue
+                }
+                if c == ':' && lx.interp[top].brace == 0 && len(lx.nest) == lx.interp[top].nest {
+                    var j = i + 1
+                    while j < n && strByte(src, j) != '}' {
+                        if strByte(src, j) == '\n' { lx.fail(line, "unterminated format specifier in interpolated string") }
+                        j += 1
+                    }
+                    if j >= n { lx.fail(line, "unterminated format specifier in interpolated string") }
+                    lx.push(T_FMTSPEC, -1, src[i + 1..j], 0, line)
+                    let st = pop(mut &lx.interp)
+                    i = lx.istr(&src, j + 1, st.raw, false)
+                    continue
+                }
+            }
             var op = if i + 1 < n { sym2(c, strByte(src, i + 1)) } else { -1 }
             if op < 0 { op = sym1(c) }
             if op < 0 {
                 if c >= 128 { lx.fail(line, "unexpected character " + codePointName(&src, i)) }
                 lx.fail(line, "unexpected character " + pyRepr(src[i..i + 1]))
+            }
+            if op == S_LBRACE && len(lx.interp) > 0 {
+                lx.interp[len(lx.interp) - 1].brace += 1
+            } else if op == S_RBRACE && len(lx.interp) > 0 && lx.interp[len(lx.interp) - 1].brace > 0 {
+                lx.interp[len(lx.interp) - 1].brace -= 1
             }
             if op == S_LPAREN || op == S_LBRACKET || op == S_LBRACE {
                 append(mut &lx.nest, c)
@@ -640,6 +683,53 @@ fn (lx: mut &Lexer) string(src: &str, i: int): int {
     return j + 1
 }
 
+// An interpolated string literal segment ($"..." or $`...`) starting at src[start].
+fn (lx: mut &Lexer) istr(src: &str, start: int, raw: bool, first: bool): int {
+    let n = len(src)
+    let line = lx.line
+    let delim: byte = if raw { '`' } else { '"' }
+    var b = ""
+    var j = start
+    while true {
+        if j >= n || (!raw && strByte(src, j) == '\n') {
+            lx.fail(line, if raw { "unterminated raw interpolated string literal" } else { "unterminated interpolated string literal" })
+        }
+        let c = strByte(src, j)
+        if c == delim {
+            lx.push(if first { T_STR } else { T_ISTR_END }, -1, &b, 0, line)
+            return j + 1
+        }
+        if c == '{' {
+            if j + 1 < n && strByte(src, j + 1) == '{' {
+                b.addByte('{')
+                j += 2
+                continue
+            }
+            lx.push(if first { T_ISTR_START } else { T_ISTR_MID }, -1, &b, 0, line)
+            append(mut &lx.interp, InterpState{raw: raw, brace: 0, nest: len(lx.nest), line: lx.line})
+            return j + 1
+        }
+        if c == '}' {
+            if j + 1 < n && strByte(src, j + 1) == '}' {
+                b.addByte('}')
+                j += 2
+                continue
+            }
+            lx.fail(lx.line, "unmatched '}' in interpolated string (write '}}' for a literal '}')")
+        }
+        if !raw && c == '\\' {
+            var v = 0
+            j = lx.escape(j, lx.line, mut &v)
+            b.addByte(byte(v))
+        } else {
+            if c == '\n' { lx.line += 1 }
+            b.addByte(c)
+            j += 1
+        }
+    }
+    return j
+}
+
 // ---------------------------------------------------------------- AST
 
 // Node kinds. Each kind's use of the Node fields is listed; a child or list
@@ -704,6 +794,8 @@ pub const N_IFX = 56         // a cond, b then, c els (an expression, or an N_IF
 pub const N_MATCHX = 57      // a e, b arms (each arm's body an expression)
 pub const N_LNAME = 58       // arm item: a vpath (a constant or a variant); no line
 pub const N_TRC = 59         // a t: rc T, the counted handle std.Rc[T] (design/owned-str.md); no line
+pub const N_ISTR = 60        // a parts (N_STR and N_FMT)
+pub const N_FMT = 61         // a e, s format spec ("" none)
 
 // ref's kind names.
 pub const KIND_NAMES: []str = ["import", "type", "fn", "const", "global", "tparam", "field", "variant",
@@ -711,7 +803,7 @@ pub const KIND_NAMES: []str = ["import", "type", "fn", "const", "global", "tpara
     "let", "destructure", "fieldpat", "if", "while", "for", "return", "break", "continue", "match", "arm",
     "assign", "expr", "int", "char", "str", "int", "char", "frac", "str", "bool", "name", "arrlit",
     "closure", "cparam", "bin", "un", "borrow", "try", "field", "sub", "index", "call", "lit", "init", "targ",
-    "ifx", "matchx", "name"]
+    "ifx", "matchx", "name", "rc", "istr", "fmt"]
 
 // Flags.
 pub const PUB = 1
@@ -841,6 +933,8 @@ fn (p: &Parser) err(msg: str): never { p.fail(p.line(), msg) }
 fn (p: &Parser) foundRepr(t: int): str {
     return match p.toks[t].k {
         T_INT { p.toks[t].s.clone() } T_CHAR { intToStr(p.toks[t].v) } T_STR { "'a string'" } T_EOF { "'eof'" }
+        T_ISTR_START, T_ISTR_MID, T_ISTR_END { "'an interpolated string'" }
+        T_FMTSPEC { "'a format specifier'" }
         T_SYM { if p.toks[t].op == S_SEMI { "'end of line'" } else { pyRepr(&p.toks[t].s) } }
         else { pyRepr(&p.toks[t].s) }
     }
@@ -1819,6 +1913,37 @@ fn (p: mut &Parser) primary(): int {
     if k == T_CHAR { return p.node(N_CHAR, w, "", p.toks[t].v, -1, -1) }
     if k == T_FRAC { return p.node(N_FRAC, w, &text, p.toks[t].v, -1, -1) }
     if k == T_STR { return p.node(N_STR, w, &text, -1, -1, -1) }
+    if k == T_ISTR_START {
+        var parts: []int = []
+        if len(text) > 0 { append(mut &parts, p.node(N_STR, w, &text, -1, -1, -1)) }
+        while true {
+            let ew = p.line()
+            let nt0 = p.at(0)
+            let nk0 = p.toks[nt0].k
+            if nk0 == T_ISTR_MID || nk0 == T_ISTR_END || nk0 == T_FMTSPEC {
+                p.fail(ew, "empty interpolation '{}' in interpolated string")
+            }
+            let save = p.nolit
+            p.nolit = 0
+            let ex = p.expr()
+            p.nolit = save
+            var spec = ""
+            if p.toks[p.at(0)].k == T_FMTSPEC {
+                let ft = p.next()
+                spec = p.toks[ft].s.clone()
+            }
+            append(mut &parts, p.node(N_FMT, ew, &spec, ex, -1, -1))
+            let nt = p.next()
+            let nk = p.toks[nt].k
+            if nk != T_ISTR_MID && nk != T_ISTR_END {
+                p.fail(p.toks[nt].line, "expected '}' to close interpolation, found " + p.foundRepr(nt))
+            }
+            let seg = p.toks[nt].s.clone()
+            if len(seg) > 0 { append(mut &parts, p.node(N_STR, p.toks[nt].line, &seg, -1, -1, -1)) }
+            if nk == T_ISTR_END { break }
+        }
+        return p.node(N_ISTR, w, "", p.list(&parts), -1, -1)
+    }
     if k == T_ID { return p.node(N_NAME, w, &text, -1, -1, -1) }
     let op = p.toks[t].op
     if k == T_KW && (op == K_TRUE || op == K_FALSE) {
