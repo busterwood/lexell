@@ -1,0 +1,690 @@
+// format: string and number formatting with a compact format specifier grammar,
+// shared by interpolated strings ($"...") and the fmt library module.
+//
+// Specifier grammar: [[fill]align][sign][#][0][width][,][.precision][type]
+//   fill:      any printable ASCII byte (0x20..0x7E) before align (default ' ')
+//   align:     '<' left, '>' right, '^' center (default: '>' numbers, '<' text)
+//   sign:      '+' always, ' ' space for non-negative, '-' negative only
+//   #:         alternate prefix (0x, 0X, 0b, 0o for hex/bin/oct)
+//   0:         zero-pad numeric output after sign and prefix (ignored with align)
+//   width:     minimum width in bytes (0..10000)
+//   ,:         thousands grouping with ',' for base-10 integers, floats and decimals
+//   .prec:     decimal places (float/Decimal) or max bytes (str/Show) (0..10000)
+//   type:      d x X b o (integers), f e E g G (float), f c (Decimal), s q (text)
+
+import "strings"
+import "decimal"
+
+pub const MAX_WIDTH = 10000
+
+pub type Spec = value record {
+    pub fill: byte
+    pub align: byte    // 0 default, '<', '>', '^'
+    pub sign: byte     // 0 default, '+', ' ', '-'
+    pub alt: bool
+    pub zero: bool
+    pub group: bool
+    pub width: int
+    pub prec: int      // -1 when omitted
+    pub kind: byte     // 0 default, or 'd' 'x' 'X' 'b' 'o' 'f' 'e' 'E' 'g' 'G' 'c' 's' 'q'
+}
+
+pub fn defaultSpec(): Spec {
+    return Spec{fill: ' ', align: byte(0), sign: byte(0), alt: false, zero: false, group: false,
+                width: 0, prec: -1, kind: byte(0)}
+}
+
+pub fn makeSpec(fill: int, align: int, sign: int, alt: bool, zero: bool, group: bool,
+                width: int, prec: int, kind: int): Spec {
+    return Spec{fill: byte(fill), align: byte(align), sign: byte(sign), alt: alt, zero: zero,
+                group: group, width: width, prec: prec, kind: byte(kind)}
+}
+
+fn isAlign(c: byte): bool { return c == '<' || c == '>' || c == '^' }
+
+fn isKind(c: byte): bool {
+    return c == 'd' || c == 'x' || c == 'X' || c == 'b' || c == 'o' ||
+           c == 'f' || c == 'e' || c == 'E' || c == 'g' || c == 'G' ||
+           c == 'c' || c == 's' || c == 'q'
+}
+
+// Parses a format specifier string.
+pub fn parseSpec(s: &str): Result[Spec, str] {
+    var sp = defaultSpec()
+    let n = len(s)
+    var i = 0
+    if i + 1 < n && isAlign(strByte(s, i + 1)) {
+        let fc = strByte(s, i)
+        if fc < ' ' || fc > '~' { return Err("format fill character must be printable ASCII") }
+        sp.fill = fc
+        sp.align = strByte(s, i + 1)
+        i += 2
+    } else if i < n && isAlign(strByte(s, i)) {
+        sp.align = strByte(s, i)
+        i += 1
+    }
+    if i < n && (strByte(s, i) == '+' || strByte(s, i) == '-' || strByte(s, i) == ' ') {
+        sp.sign = strByte(s, i)
+        i += 1
+    }
+    if i < n && strByte(s, i) == '#' {
+        sp.alt = true
+        i += 1
+    }
+    if i < n && strByte(s, i) == '0' {
+        sp.zero = true
+        i += 1
+    }
+    if i < n && strings.isDigit(strByte(s, i)) {
+        var w = 0
+        while i < n && strings.isDigit(strByte(s, i)) {
+            w = w * 10 + int(strByte(s, i) - '0')
+            if w > MAX_WIDTH { return Err("format width exceeds " + intToStr(MAX_WIDTH)) }
+            i += 1
+        }
+        sp.width = w
+    }
+    if i < n && strByte(s, i) == ',' {
+        sp.group = true
+        i += 1
+    }
+    if i < n && strByte(s, i) == '.' {
+        i += 1
+        if i >= n || !strings.isDigit(strByte(s, i)) {
+            return Err("format precision needs digits after '.'")
+        }
+        var p = 0
+        while i < n && strings.isDigit(strByte(s, i)) {
+            p = p * 10 + int(strByte(s, i) - '0')
+            if p > MAX_WIDTH { return Err("format precision exceeds " + intToStr(MAX_WIDTH)) }
+            i += 1
+        }
+        sp.prec = p
+    }
+    if i < n {
+        let k = strByte(s, i)
+        if !isKind(k) { return Err("unknown format specifier '" + s[i..i + 1] + "'") }
+        sp.kind = k
+        i += 1
+    }
+    if i < n { return Err("unexpected '" + s[i..] + "' in format specifier") }
+    return Ok(sp)
+}
+
+// ---------------------------------------------------------------- helpers
+
+fn padBytes(out: mut &str, ch: byte, count: int) {
+    for i in 0..count { out.addByte(ch) }
+}
+
+fn alignText(text: &str, spec: &Spec, defaultAlign: byte): str {
+    let n = len(text)
+    if spec.width <= n { return text.clone() }
+    let pad = spec.width - n
+    let al = if spec.align != byte(0) { spec.align } else { defaultAlign }
+    var out = ""
+    if al == '<' {
+        out += text
+        padBytes(mut &out, spec.fill, pad)
+    } else if al == '>' {
+        padBytes(mut &out, spec.fill, pad)
+        out += text
+    } else {
+        let left = pad / 2
+        padBytes(mut &out, spec.fill, left)
+        out += text
+        padBytes(mut &out, spec.fill, pad - left)
+    }
+    return out
+}
+
+// Inserts ',' every three digits from the right into an ASCII digit string.
+fn groupIntDigits(digits: &str): str {
+    let n = len(digits)
+    if n <= 3 { return digits.clone() }
+    var out = ""
+    var rem = n % 3
+    if rem == 0 { rem = 3 }
+    out += digits[0..rem]
+    var i = rem
+    while i < n {
+        out.addByte(',')
+        out += digits[i..i + 3]
+        i += 3
+    }
+    return out
+}
+
+// Formats a number split into sign prefix, radix prefix ("0x" etc.), and body.
+fn finishNumber(signStr: &str, prefix: &str, body: &str, spec: &Spec, allowZeroPad: bool): str {
+    let total = len(signStr) + len(prefix) + len(body)
+    if allowZeroPad && spec.zero && spec.align == byte(0) && spec.width > total {
+        var out = ""
+        out += signStr
+        out += prefix
+        if spec.group && len(prefix) == 0 {
+            // Zero-pad with grouping: count digits needed including commas is tricky,
+            // so pad raw leading zeros to reach spec.width cleanly.
+            padBytes(mut &out, '0', spec.width - total)
+        } else {
+            padBytes(mut &out, '0', spec.width - total)
+        }
+        out += body
+        return out
+    }
+    var full = ""
+    full += signStr
+    full += prefix
+    full += body
+    return alignText(&full, spec, '>')
+}
+
+fn signOf(neg: bool, spec: &Spec): str {
+    if neg { return "-" }
+    if spec.sign == '+' { return "+" }
+    if spec.sign == ' ' { return " " }
+    return ""
+}
+
+fn radixPrefix(kind: byte, alt: bool): str {
+    if !alt { return "" }
+    if kind == 'x' { return "0x" }
+    if kind == 'X' { return "0X" }
+    if kind == 'b' { return "0b" }
+    if kind == 'o' { return "0o" }
+    return ""
+}
+
+fn u64Base(v0: u64, base: u64, upper: bool): str {
+    if v0 == u64(0) { return "0" }
+    let digits = if upper { "0123456789ABCDEF" } else { "0123456789abcdef" }
+    var buf: []byte = []
+    var v = v0
+    while v > u64(0) {
+        let d = int(v % base)
+        append(mut &buf, strByte(digits, d))
+        v = v / base
+    }
+    var out = ""
+    var i = len(buf) - 1
+    while i >= 0 {
+        out.addByte(buf[i])
+        i -= 1
+    }
+    return out
+}
+
+fn u128Base(v0: u128, base: u128, upper: bool): str {
+    if v0 == u128(0) { return "0" }
+    let digits = if upper { "0123456789ABCDEF" } else { "0123456789abcdef" }
+    var buf: []byte = []
+    var v = v0
+    while v > u128(0) {
+        let d = int(v % base)
+        append(mut &buf, strByte(digits, d))
+        v = v / base
+    }
+    var out = ""
+    var i = len(buf) - 1
+    while i >= 0 {
+        out.addByte(buf[i])
+        i -= 1
+    }
+    return out
+}
+
+fn formatMagU64(mag: u64, neg: bool, spec: &Spec): str {
+    let k = spec.kind
+    var body = ""
+    if k == 'x' {
+        body = u64Base(mag, u64(16), false)
+    } else if k == 'X' {
+        body = u64Base(mag, u64(16), true)
+    } else if k == 'b' {
+        body = u64Base(mag, u64(2), false)
+    } else if k == 'o' {
+        body = u64Base(mag, u64(8), false)
+    } else {
+        body = u64ToStr(mag)
+        if spec.group { body = groupIntDigits(&body) }
+    }
+    return finishNumber(&(signOf(neg, spec)), &(radixPrefix(k, spec.alt)), &body, spec, true)
+}
+
+fn formatMagU128(mag: u128, neg: bool, spec: &Spec): str {
+    let k = spec.kind
+    var body = ""
+    if k == 'x' {
+        body = u128Base(mag, u128(16), false)
+    } else if k == 'X' {
+        body = u128Base(mag, u128(16), true)
+    } else if k == 'b' {
+        body = u128Base(mag, u128(2), false)
+    } else if k == 'o' {
+        body = u128Base(mag, u128(8), false)
+    } else {
+        body = u128ToStr(mag)
+        if spec.group { body = groupIntDigits(&body) }
+    }
+    return finishNumber(&(signOf(neg, spec)), &(radixPrefix(k, spec.alt)), &body, spec, true)
+}
+
+// ---------------------------------------------------------------- integers
+
+const INT_MIN_MAG: u64 = 9223372036854775808
+
+pub fn formatInt(n: int, spec: &Spec): str {
+    let neg = n < 0
+    var mag: u64 = u64(0)
+    if neg {
+        if n == -9223372036854775807 - 1 {
+            mag = INT_MIN_MAG
+        } else {
+            mag = u64(-n)
+        }
+    } else {
+        mag = u64(n)
+    }
+    return formatMagU64(mag, neg, spec)
+}
+
+pub fn formatUint(n: u64, spec: &Spec): str {
+    return formatMagU64(n, false, spec)
+}
+
+const M64_I128: i128 = 0xffffffffffffffff
+
+pub fn formatI128(n: i128, spec: &Spec): str {
+    let neg = n < i128(0)
+    var mag: u128 = u128(0)
+    if neg {
+        // Compute -n in u128 without signed overflow on i128::MIN.
+        let lo = u64(0) -% u64(n & M64_I128)
+        let borrow = if lo != u64(0) { u64(1) } else { u64(0) }
+        let hi = u64(0) -% u64((n >> 64) & M64_I128) -% borrow
+        mag = (u128(hi) << 64) | u128(lo)
+    } else {
+        mag = u128(n)
+    }
+    return formatMagU128(mag, neg, spec)
+}
+
+pub fn formatU128(n: u128, spec: &Spec): str {
+    return formatMagU128(n, false, spec)
+}
+
+// ---------------------------------------------------------------- floats
+
+// Round decimal digit string d by dropping its last n digits, half to even.
+fn roundDigits(d: &str, n: int): str {
+    if n <= 0 { return d.clone() }
+    if n > len(d) { return "0" }
+    let keep = len(d) - n
+    var bytes = strToBytes(strSlice(d, 0, keep))
+    let first = strByte(d, keep)
+    var rest = false
+    for j in keep + 1..len(d) {
+        if strByte(d, j) != '0' { rest = true }
+    }
+    var lastOdd = false
+    if keep > 0 { lastOdd = int(strByte(d, keep - 1) - '0') % 2 == 1 }
+    if first > '5' || (first == '5' && (rest || lastOdd)) {
+        var k = keep - 1
+        var carry = true
+        while carry && k >= 0 {
+            if bytes[k] == '9' {
+                bytes[k] = '0'
+                k -= 1
+            } else {
+                bytes[k] += 1
+                carry = false
+            }
+        }
+        if carry { return "1" + strFromBytes(&bytes) }
+    }
+    if keep == 0 { return "0" }
+    return strFromBytes(&bytes)
+}
+
+fn allZeroDigits(s: &str): bool {
+    for i in 0..len(s) {
+        if strByte(s, i) != '0' { return false }
+    }
+    return true
+}
+
+type DecParts = value record {
+    digits: str
+    pow: int
+}
+
+// Splits the shortest text of a non-negative finite float into digits * 10^pow.
+fn splitFloatText(s: &str): DecParts {
+    var digits = ""
+    var pow = 0
+    var afterPoint = false
+    var i = 0
+    while i < len(s) {
+        let c = strByte(s, i)
+        if c == 'e' || c == 'E' {
+            pow += strings.parseIntOpt(&(s[i + 1..])).unwrap()
+            break
+        }
+        if c == '.' {
+            afterPoint = true
+        } else {
+            digits.addByte(c)
+            if afterPoint { pow -= 1 }
+        }
+        i += 1
+    }
+    // Strip leading zeros while keeping at least one digit.
+    var z = 0
+    while z + 1 < len(digits) && strByte(digits, z) == '0' { z += 1 }
+    if z > 0 { digits = digits[z..].clone() }
+    return DecParts{digits: digits, pow: pow}
+}
+
+fn floatFixedMag(x: float, prec: int, group: bool): str {
+    let DecParts{digits: d0, pow} = splitFloatText(&(x.abs().toStr()))
+    var r = d0
+    let shift = pow + prec
+    if shift >= 0 {
+        r += strings.repeat("0", shift)
+    } else {
+        r = roundDigits(&r, -shift)
+    }
+    while len(r) <= prec { r = "0" + r }
+    var intPart = r[0..len(r) - prec].clone()
+    if group { intPart = groupIntDigits(&intPart) }
+    if prec > 0 { return intPart + "." + r[len(r) - prec..] }
+    return intPart
+}
+
+fn floatSciMag(x: float, prec: int, upper: bool): str {
+    let DecParts{digits: d0, pow} = splitFloatText(&(x.abs().toStr()))
+    var d = d0
+    var exp = pow + len(d) - 1
+    if allZeroDigits(&d) {
+        d = "0"
+        exp = 0
+    }
+    let want = prec + 1
+    if len(d) < want {
+        d += strings.repeat("0", want - len(d))
+    } else if len(d) > want {
+        let oldLen = len(d)
+        let dropN = oldLen - want
+        d = roundDigits(&d, dropN)
+        if len(d) > want {
+            exp += 1
+            d = d[0..want].clone()
+        }
+    }
+    var out = d[0..1].clone()
+    if prec > 0 {
+        out.addByte('.')
+        out += d[1..want]
+    }
+    out.addByte(if upper { 'E' } else { 'e' })
+    if exp < 0 {
+        out.addByte('-')
+        let ae = -exp
+        if ae < 10 { out.addByte('0') }
+        out.addInt(ae)
+    } else {
+        out.addByte('+')
+        if exp < 10 { out.addByte('0') }
+        out.addInt(exp)
+    }
+    return out
+}
+
+pub fn formatFloat(x: float, spec: &Spec): str {
+    if !x.isFinite() {
+        if x.isNaN() {
+            return alignText("NaN", spec, '>')
+        }
+        let negInf = x < 0.0f
+        return finishNumber(&(signOf(negInf, spec)), "", "inf", spec, false)
+    }
+    let neg = x < 0.0f || (x == 0.0f && (1.0f).copySign(x) < 0.0f)
+    let k = spec.kind
+    var body = ""
+    if k == 'f' {
+        let p = if spec.prec >= 0 { spec.prec } else { 6 }
+        body = floatFixedMag(x, p, spec.group)
+    } else if k == 'e' || k == 'E' {
+        let p = if spec.prec >= 0 { spec.prec } else { 6 }
+        body = floatSciMag(x, p, k == 'E')
+    } else if spec.prec >= 0 {
+        if k == 'g' || k == 'G' {
+            let sig = if spec.prec == 0 { 1 } else { spec.prec }
+            let parts = splitFloatText(&(x.abs().toStr()))
+            let exp = if allZeroDigits(&parts.digits) { 0 } else { parts.pow + len(parts.digits) - 1 }
+            if exp < -4 || exp >= sig {
+                body = floatSciMag(x, sig - 1, k == 'G')
+            } else {
+                let p = if sig - 1 - exp > 0 { sig - 1 - exp } else { 0 }
+                body = floatFixedMag(x, p, spec.group)
+            }
+        } else {
+            body = floatFixedMag(x, spec.prec, spec.group)
+        }
+    } else {
+        body = x.abs().toStr()
+        if k == 'G' { body = strings.toUpperAscii(&body) }
+        if spec.group {
+            let dot = strings.indexOfByte(&body, '.', 0)
+            let exp = strings.indexOfByte(&body, 'e', 0)
+            if exp < 0 {
+                if dot < 0 {
+                    body = groupIntDigits(&body)
+                } else {
+                    body = groupIntDigits(body[0..dot]) + body[dot..]
+                }
+            }
+        }
+    }
+    return finishNumber(&(signOf(neg, spec)), "", &body, spec, true)
+}
+
+// ---------------------------------------------------------------- Decimal
+
+pub fn formatDecimal(d: decimal.Decimal, spec: &Spec): str {
+    let neg = d.isNeg()
+    var mag = d.abs()
+    var text = ""
+    if spec.kind == 'c' {
+        if spec.prec >= 0 {
+            match mag.round(spec.prec) {
+                Ok(r) { text = r.canonical() }
+                Err(_) { text = mag.canonical() }
+            }
+        } else {
+            text = mag.canonical()
+        }
+    } else if spec.prec >= 0 {
+        match mag.round(spec.prec) {
+            Ok(r) { text = r.toStr() }
+            Err(_) { text = mag.toStr() }
+        }
+    } else {
+        text = mag.toStr()
+    }
+    if spec.group {
+        let dot = strings.indexOfByte(&text, '.', 0)
+        if dot < 0 {
+            text = groupIntDigits(&text)
+        } else {
+            text = groupIntDigits(text[0..dot]) + text[dot..]
+        }
+    }
+    // Avoid "-0.00" when a negative decimal rounds to zero? Keep sign only if non-zero after rounding.
+    var isNeg = neg
+    if isNeg {
+        var nonZero = false
+        for i in 0..len(text) {
+            let c = strByte(text, i)
+            if c >= '1' && c <= '9' { nonZero = true }
+        }
+        if !nonZero { isNeg = false }
+    }
+    return finishNumber(&(signOf(isNeg, spec)), "", &text, spec, true)
+}
+
+// ---------------------------------------------------------------- strings
+
+fn quoteStr(s: &str): str {
+    let hex = "0123456789abcdef"
+    var out = "\""
+    for i in 0..len(s) {
+        let c = strByte(s, i)
+        if c == '"' {
+            out += "\\\""
+        } else if c == '\\' {
+            out += "\\\\"
+        } else if c == '\n' {
+            out += "\\n"
+        } else if c == '\t' {
+            out += "\\t"
+        } else if c == '\r' {
+            out += "\\r"
+        } else if c == '\0' {
+            out += "\\0"
+        } else if c < ' ' || c == 127 {
+            out += "\\x"
+            out.addByte(strByte(hex, int(c >> 4)))
+            out.addByte(strByte(hex, int(c & 15)))
+        } else {
+            out.addByte(c)
+        }
+    }
+    out.addByte('"')
+    return out
+}
+
+pub fn formatStr(s: &str, spec: &Spec): str {
+    var body = if spec.kind == 'q' { quoteStr(s) } else { s.clone() }
+    if spec.prec >= 0 && len(body) > spec.prec {
+        body = body[0..spec.prec].clone()
+    }
+    return alignText(&body, spec, '<')
+}
+
+// ---------------------------------------------------------------- string-spec convenience wrappers
+
+pub fn intStr(n: int, spec: &str): Result[str, str] {
+    let sp = try parseSpec(spec)
+    if sp.prec >= 0 { return Err("format precision is not allowed for integers") }
+    if sp.kind != byte(0) && sp.kind != 'd' && sp.kind != 'x' && sp.kind != 'X' && sp.kind != 'b' && sp.kind != 'o' {
+        return Err("format specifier '" + strFromBytes(&[sp.kind]) + "' is not valid for integers")
+    }
+    return Ok(formatInt(n, &sp))
+}
+
+pub fn uintStr(n: u64, spec: &str): Result[str, str] {
+    let sp = try parseSpec(spec)
+    if sp.prec >= 0 { return Err("format precision is not allowed for integers") }
+    if sp.kind != byte(0) && sp.kind != 'd' && sp.kind != 'x' && sp.kind != 'X' && sp.kind != 'b' && sp.kind != 'o' {
+        return Err("format specifier '" + strFromBytes(&[sp.kind]) + "' is not valid for integers")
+    }
+    return Ok(formatUint(n, &sp))
+}
+
+pub fn floatStr(x: float, spec: &str): Result[str, str] {
+    let sp = try parseSpec(spec)
+    if sp.alt { return Err("format '#' is not allowed for float") }
+    if sp.kind != byte(0) && sp.kind != 'f' && sp.kind != 'e' && sp.kind != 'E' && sp.kind != 'g' && sp.kind != 'G' {
+        return Err("format specifier '" + strFromBytes(&[sp.kind]) + "' is not valid for float")
+    }
+    return Ok(formatFloat(x, &sp))
+}
+
+pub fn decimalStr(d: decimal.Decimal, spec: &str): Result[str, str] {
+    let sp = try parseSpec(spec)
+    if sp.alt { return Err("format '#' is not allowed for Decimal") }
+    if sp.kind != byte(0) && sp.kind != 'f' && sp.kind != 'c' {
+        return Err("format specifier '" + strFromBytes(&[sp.kind]) + "' is not valid for Decimal")
+    }
+    return Ok(formatDecimal(d, &sp))
+}
+
+pub fn textStr(s: &str, spec: &str): Result[str, str] {
+    let sp = try parseSpec(spec)
+    if sp.sign != byte(0) || sp.alt || sp.zero || sp.group {
+        return Err("numeric format flags are not allowed for text")
+    }
+    if sp.kind != byte(0) && sp.kind != 's' && sp.kind != 'q' {
+        return Err("format specifier '" + strFromBytes(&[sp.kind]) + "' is not valid for text")
+    }
+    return Ok(formatStr(s, &sp))
+}
+
+// ---------------------------------------------------------------- runtime template formatting
+
+// Fills a runtime format template with string arguments.
+// Placeholders: {}, {:spec}, {0}, {1:>10}, {{ -> '{', }} -> '}'.
+pub fn apply(tmpl: &str, args: &[&str]): Result[str, str] {
+    var out = ""
+    let n = len(tmpl)
+    var i = 0
+    var autoIdx = 0
+    var usedAuto = false
+    var usedManual = false
+    while i < n {
+        let c = strByte(tmpl, i)
+        if c == '{' {
+            if i + 1 < n && strByte(tmpl, i + 1) == '{' {
+                out.addByte('{')
+                i += 2
+                continue
+            }
+            var j = i + 1
+            while j < n && strByte(tmpl, j) != '}' && strByte(tmpl, j) != '{' { j += 1 }
+            if j >= n || strByte(tmpl, j) != '}' { return Err("unclosed '{' in format template") }
+            let inner = tmpl[i + 1..j]
+            let colon = strings.indexOfByte(inner, ':', 0)
+            let idxText: &str = if colon < 0 { inner } else { inner[0..colon] }
+            let specText: &str = if colon < 0 { "" } else { inner[colon + 1..] }
+            var idx = 0
+            if len(idxText) == 0 {
+                if usedManual { return Err("cannot mix automatic and numbered placeholders") }
+                usedAuto = true
+                idx = autoIdx
+                autoIdx += 1
+            } else {
+                if usedAuto { return Err("cannot mix automatic and numbered placeholders") }
+                usedManual = true
+                match strings.parseInt(idxText) {
+                    Ok(v) {
+                        if v < 0 { return Err("negative placeholder index") }
+                        idx = v
+                    }
+                    Err(_) { return Err("invalid placeholder index '" + idxText + "'") }
+                }
+            }
+            if idx >= len(args) {
+                return Err("placeholder index " + intToStr(idx) + " out of range (have " + intToStr(len(args)) + ")")
+            }
+            if len(specText) == 0 {
+                out += args[idx]
+            } else {
+                let piece = try textStr(args[idx], specText)
+                out += piece
+            }
+            i = j + 1
+        } else if c == '}' {
+            if i + 1 < n && strByte(tmpl, i + 1) == '}' {
+                out.addByte('}')
+                i += 2
+                continue
+            }
+            return Err("unmatched '}' in format template")
+        } else {
+            out.addByte(c)
+            i += 1
+        }
+    }
+    return Ok(out)
+}

@@ -32,7 +32,8 @@ for leaks.
 | `fs.lxl` | 485 | stat/lstat, list, mkdirAll, remove/removeAll, rename, symlink, chmod, paths, walk, realpath, temp/atomic write |
 | `os.lxl` | 263 | arguments, environment, pid, working directory, quit, ids, user database, tempDir |
 | `time.lxl` | 1,298 | wall and monotonic clocks, sleep, UTC dates, ISO 8601, Tm/strftime/strptime, HTTP date; Duration (exact: seconds and nanoseconds), Period (years, months, days) and Interval (SQL's: months, days and a Duration), with ISO 8601 text; date arithmetic (addDays, addMonths clamped, until), Time and LocalDateTime plus a duration, period or interval (design/time-types.md); tested against Python by `tests/gen_time_arith.py` |
-| `fmt.lxl` | 115 | number padding and eza's permission string |
+| `format.lxl` | 665 | pure format-spec engine (`Spec`, `parseSpec`, `formatInt`/`Uint`/`I128`/`U128`/`Float`/`Decimal`/`Str`, `apply`) shared by `$"..."` and `fmt` |
+| `fmt.lxl` | 145 | re-exports `format` (`intFmt`/`uintFmt`/`floatFmt`/`decimalFmt`/`strFmt`/`apply`/`Spec`), number padding (`digits`, `appendPadded`, `writePadded`), and eza's `modeString` |
 | `paths.lxl` | 135 | lexical Rust Path components: join, lastComponent, parentOf, ext |
 | `cli.lxl` | 451 | the eza/obo option grammar: Spec, Command, parse, structured Error |
 | `unicode.lxl` | 84 | Unicode 15.0.0 classification, simple lower/upper/fold, White_Space; no regex or Markdown data |
@@ -286,14 +287,20 @@ Slots come from the hash mixed with a per-process seed, as Map's do.
 **Heap[T: Ord]** (min-heap): `newHeap`, `push`, `pop(): Option[T]`, `peek`,
 `size`, `isEmpty`.
 
-### fmt
+### format and fmt
 
-`digits(n)` (decimal width, `digits(0) == 1`), `appendPadded(mut buf, n,
-width)`, `writePadded(w, n, width)` (through an `io.Writer`, no `Result`: the
-Writer keeps the first write error for `flush`/`close`), and
-`modeString(mode)` (eza's ten-character permission form: type, rwx triples,
-`s/S` and `t/T`; no xattr `@`). `strings.padLeft` remains the string
-primitive.
+`format` implements the format-specifier grammar
+`[[fill]align][sign][#][0][width][,][.precision][type]` used by interpolated
+strings (`$"..."`, `` $`...` ``) and re-exported by `fmt`: `Spec`, `parseSpec`,
+`formatInt`, `formatUint`, `formatI128`, `formatU128`, `formatFloat`,
+`formatDecimal`, `formatStr`; string-spec wrappers `intFmt`, `uintFmt`,
+`floatFmt`, `decimalFmt`, `strFmt`; and `apply(tmpl, &args)` for runtime
+`{}` / `{0:>10}` template formatting. `fmt` also provides `digits(n)` (decimal
+width, `digits(0) == 1`), `appendPadded(mut buf, n, width)`, `writePadded(w, n,
+width)` (through an `io.Writer`, no `Result`: the Writer keeps the first write
+error for `flush`/`close`), and `modeString(mode)` (eza's ten-character
+permission form: type, rwx triples, `s/S` and `t/T`; no xattr `@`).
+`strings.padLeft` remains the string primitive.
 
 ### paths
 

@@ -58,6 +58,17 @@ separate decision from the user; they are the ones to revisit first.
   the source uses (LF, CRLF or a lone CR), so a raw string never contains a CR.
   It is a `str` like any string literal, and a newline after its closing
   backtick ends a statement.
+- Interpolated strings `$"..."` (and raw multiline `` $`...` ``) embed
+  expressions in `{expr}` or `{expr:spec}`: `{{` and `}}` produce literal
+  braces, and an unmatched `}` or empty `{}` is a compile error. Without a
+  `:spec`, a `str`/`&str`/`rc str` is appended directly and any other value
+  calls its `toStr()` method (`Show`, declared or derived). With `:spec`, the
+  specifier `[[fill]align][sign][#][0][width][,][.precision][type]` is parsed
+  and type-checked at compile time (`d x X b o` for integers, `f e E g G` for
+  `float`, `f c` for `Decimal`, `s q` for text/Show; `,` adds thousands
+  grouping). Parts are evaluated left to right into an owned `str` (a literal
+  with no `{...}` interpolations behaves as an ordinary string literal). A
+  newline after the closing quote or backtick ends a statement.
 
 Keywords:
 

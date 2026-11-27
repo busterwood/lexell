@@ -1808,12 +1808,12 @@ fn (c: mut &Checker) effects(e: int, traps: bool): bool {
             if k == sx.N_FOR { return c.effects(n.a, traps) || c.effects(n.b, traps) || c.effects(n.c, traps) }
             return c.effects(n.a, traps) || c.effects(n.b, traps) || c.effects(n.c, traps)
         }
-        sx.N_UN, sx.N_BORROW, sx.N_TRY, sx.N_FIELDX, sx.N_RETURN, sx.N_EXPR { return c.effects(n.a, traps) }
+        sx.N_UN, sx.N_BORROW, sx.N_TRY, sx.N_FIELDX, sx.N_RETURN, sx.N_EXPR, sx.N_FMT { return c.effects(n.a, traps) }
         sx.N_LET { return c.effects(n.b, traps) }
         sx.N_ASSIGN { return c.effects(n.a, traps) || c.effects(n.b, traps) }
         sx.N_DESTRUCTURE { return c.effects(n.c, traps) }
         sx.N_INDEX, sx.N_CALL { return c.effects(n.a, traps) || c.effectsList(n.b, traps) }
-        sx.N_ARRLIT, sx.N_BLOCK { return c.effectsList(n.a, traps) }
+        sx.N_ARRLIT, sx.N_BLOCK, sx.N_ISTR { return c.effectsList(n.a, traps) }
         sx.N_LIT {
             for i in 0..c.count(n.b) {
                 if c.effects(c.nd(c.item(n.b, i)).a, traps) { return true }
@@ -2826,7 +2826,7 @@ fn (c: &Checker) hasEarlyExit(x: int, inLoop: bool): bool {
     }
     if k == sx.N_WHILE { return c.hasEarlyExit(n.a, inLoop) || c.hasEarlyExit(n.b, true) }
     if k == sx.N_FOR { return c.hasEarlyExit(n.a, inLoop) || c.hasEarlyExit(n.b, inLoop) || c.hasEarlyExit(n.c, true) }
-    if k == sx.N_BLOCK || k == sx.N_ARRLIT { return c.hasEarlyExitList(n.a, inLoop) }
+    if k == sx.N_BLOCK || k == sx.N_ARRLIT || k == sx.N_ISTR { return c.hasEarlyExitList(n.a, inLoop) }
     if k == sx.N_LET { return c.hasEarlyExit(n.b, inLoop) }
     if k == sx.N_DESTRUCTURE { return c.hasEarlyExit(n.c, inLoop) }
     if k == sx.N_IF || k == sx.N_IFX || k == sx.N_SUB {
@@ -2840,7 +2840,7 @@ fn (c: &Checker) hasEarlyExit(x: int, inLoop: bool): bool {
         return false
     }
     if k == sx.N_ASSIGN || k == sx.N_BIN { return c.hasEarlyExit(n.a, inLoop) || c.hasEarlyExit(n.b, inLoop) }
-    if k == sx.N_EXPR || k == sx.N_UN || k == sx.N_BORROW || k == sx.N_FIELDX || k == sx.N_INIT {
+    if k == sx.N_EXPR || k == sx.N_UN || k == sx.N_BORROW || k == sx.N_FIELDX || k == sx.N_INIT || k == sx.N_FMT {
         return c.hasEarlyExit(n.a, inLoop)
     }
     if k == sx.N_INDEX || k == sx.N_CALL || k == sx.N_LIT {
@@ -3427,6 +3427,7 @@ fn (c: mut &Checker) expr(e: int, exp: int): Val {
     return match k {
         sx.N_CHAR { rv(c.x.pcast(c.ct("uint8_t"), c.lit(c.nd(e).a)), sema.T_BYTE) }
         sx.N_STR { c.strLit(&(c.node(e).s), exp) }
+        sx.N_ISTR { c.xIstr(e, exp) }
         sx.N_BOOL { rv(c.nm(if c.flag(e, sx.TRUE) { "true" } else { "false" }), sema.T_BOOL) }
         sx.N_TARG { c.err(c.line(e), "a type is not a value") }
         sx.N_FRAC { c.xFrac(&(c.node(e).s), c.line(e), exp, c.node(e).a) }
@@ -3878,6 +3879,223 @@ fn (c: mut &Checker) strLit(s: &str, exp: int): Val {
         return rvAt(h, exp, R_FREE, "")
     }
     return rv(h, sema.T_STR)
+}
+
+type ParsedFmt = value record {
+    fill: int
+    align: int
+    sign: int
+    alt: bool
+    zero: bool
+    group: bool
+    width: int
+    prec: int
+    kind: int
+}
+
+fn isFmtAlign(ch: byte): bool { return ch == '<' || ch == '>' || ch == '^' }
+
+fn isFmtKind(ch: byte): bool {
+    return ch == 'd' || ch == 'x' || ch == 'X' || ch == 'b' || ch == 'o' ||
+           ch == 'f' || ch == 'e' || ch == 'E' || ch == 'g' || ch == 'G' ||
+           ch == 'c' || ch == 's' || ch == 'q'
+}
+
+fn (c: &Checker) parseFmtSpec(s: &str, line: int): ParsedFmt {
+    if len(s) == 0 { c.err(line, "empty format specifier after ':' in interpolated string") }
+    var sp = ParsedFmt{fill: int(' '), align: 0, sign: 0, alt: false, zero: false, group: false,
+                       width: 0, prec: -1, kind: 0}
+    let n = len(s)
+    var i = 0
+    if i + 1 < n && isFmtAlign(strByte(s, i + 1)) {
+        let fc = strByte(s, i)
+        if fc < ' ' || fc > '~' { c.err(line, "format fill character must be printable ASCII") }
+        sp.fill = int(fc)
+        sp.align = int(strByte(s, i + 1))
+        i += 2
+    } else if i < n && isFmtAlign(strByte(s, i)) {
+        sp.align = int(strByte(s, i))
+        i += 1
+    }
+    if i < n && (strByte(s, i) == '+' || strByte(s, i) == '-' || strByte(s, i) == ' ') {
+        sp.sign = int(strByte(s, i))
+        i += 1
+    }
+    if i < n && strByte(s, i) == '#' {
+        sp.alt = true
+        i += 1
+    }
+    if i < n && strByte(s, i) == '0' {
+        sp.zero = true
+        i += 1
+    }
+    if i < n && strByte(s, i) >= '0' && strByte(s, i) <= '9' {
+        var w = 0
+        while i < n && strByte(s, i) >= '0' && strByte(s, i) <= '9' {
+            w = w * 10 + int(strByte(s, i) - '0')
+            if w > 10000 { c.err(line, "format width exceeds 10000") }
+            i += 1
+        }
+        sp.width = w
+    }
+    if i < n && strByte(s, i) == ',' {
+        sp.group = true
+        i += 1
+    }
+    if i < n && strByte(s, i) == '.' {
+        i += 1
+        if i >= n || strByte(s, i) < '0' || strByte(s, i) > '9' {
+            c.err(line, "format precision needs digits after '.'")
+        }
+        var p = 0
+        while i < n && strByte(s, i) >= '0' && strByte(s, i) <= '9' {
+            p = p * 10 + int(strByte(s, i) - '0')
+            if p > 10000 { c.err(line, "format precision exceeds 10000") }
+            i += 1
+        }
+        sp.prec = p
+    }
+    if i < n {
+        let k = strByte(s, i)
+        if !isFmtKind(k) { c.err(line, "unknown format specifier '" + s[i..i + 1] + "'") }
+        sp.kind = int(k)
+        i += 1
+    }
+    if i < n { c.err(line, "unexpected '" + s[i..] + "' in format specifier") }
+    return sp
+}
+
+fn (c: &Checker) isDecimalType(t: int): bool {
+    if c.pg.tk(t) != sema.TK_INST { return false }
+    let d = c.pg.ta(t)
+    return c.pg.types[d].name == "Decimal" && c.pg.mods[c.pg.types[d].mod].isLib &&
+           c.pg.mods[c.pg.types[d].mod].name == "decimal"
+}
+
+fn (c: mut &Checker) callStdFmt(helper: &str, arg: Val, sp: &ParsedFmt, line: int): Val {
+    let sym = c.pg.mods[c.pg.std].scope.getOr(helper, sema.Sym{k: -1, i: -1})
+    if sym.k != sema.D_FN { c.err(line, "internal error: missing std." + helper) }
+    let sig = c.fnSig(sym.i, [])
+    let args: []Arg = [
+        Arg{isVal: true, n: -1, v: arg},
+        Arg{isVal: true, n: -1, v: rv(c.lit(sp.fill), sema.T_INT)},
+        Arg{isVal: true, n: -1, v: rv(c.lit(sp.align), sema.T_INT)},
+        Arg{isVal: true, n: -1, v: rv(c.lit(sp.sign), sema.T_INT)},
+        Arg{isVal: true, n: -1, v: rv(c.nm(if sp.alt { "true" } else { "false" }), sema.T_BOOL)},
+        Arg{isVal: true, n: -1, v: rv(c.nm(if sp.zero { "true" } else { "false" }), sema.T_BOOL)},
+        Arg{isVal: true, n: -1, v: rv(c.nm(if sp.group { "true" } else { "false" }), sema.T_BOOL)},
+        Arg{isVal: true, n: -1, v: rv(c.lit(sp.width), sema.T_INT)},
+        Arg{isVal: true, n: -1, v: rv(c.lit(sp.prec), sema.T_INT)},
+        Arg{isVal: true, n: -1, v: rv(c.lit(sp.kind), sema.T_INT)}
+    ]
+    return c.call(&sig, false, voidVal(false), &args, line, -1, &noOpts())
+}
+
+// Formats one interpolation part {expr} or {expr:spec} into a str or &str Val.
+fn (c: mut &Checker) fmtPart(n: int): Val {
+    let nd = c.node(n)
+    let line = nd.line
+    let spec = &nd.s
+    var v = c.expr(nd.a, -1)
+    if v.t == sema.T_VOID || v.t == sema.T_NEVER {
+        c.err(line, "interpolated expression has no value")
+    }
+    var base = if c.pg.tk(v.t) == sema.TK_REF { c.pg.ta(v.t) } else { v.t }
+    while c.pg.isRc(base) {
+        v = c.rcValue(v)
+        base = v.t
+    }
+    if len(spec) == 0 {
+        if base == sema.T_STR {
+            if c.pg.tk(v.t) == sema.TK_REF && c.pg.tm(v.t) {
+                return rv(c.x.par(c.x.pre("*", v.c)), sema.T_STR)
+            }
+            return v
+        }
+        let sig = c.methodSig(base, "toStr", line, true)
+        if sig.kind < 0 || len(sig.params) != 1 || sig.ret != sema.T_STR {
+            c.err(line, "cannot format " + c.tstr(base) + " in interpolated string: it has no method 'toStr(): str'")
+        }
+        return c.call(&sig, true, v, &[], line, -1, &noOpts())
+    }
+    let sp = c.parseFmtSpec(spec, line)
+    let k = sp.kind
+    if base == sema.T_INT || base == sema.T_I32 || base == sema.T_U64 || base == sema.T_U32 ||
+       base == sema.T_BYTE || base == sema.T_I128 || base == sema.T_U128 {
+        if sp.prec >= 0 { c.err(line, "format precision is not allowed for " + c.tstr(base)) }
+        if k != 0 && k != int('d') && k != int('x') && k != int('X') && k != int('b') && k != int('o') {
+            c.err(line, "format specifier '" + strFromBytes(&[byte(k)]) + "' is not valid for " + c.tstr(base))
+        }
+        let r = c.rd(v)
+        if base == sema.T_INT { return c.callStdFmt("__fmtInt", r, &sp, line) }
+        if base == sema.T_I32 { return c.callStdFmt("__fmtInt", rv(c.x.pcast(c.ct("int64_t"), r.c), sema.T_INT), &sp, line) }
+        if base == sema.T_U64 { return c.callStdFmt("__fmtUint", r, &sp, line) }
+        if base == sema.T_U32 || base == sema.T_BYTE {
+            return c.callStdFmt("__fmtUint", rv(c.x.pcast(c.ct("uint64_t"), r.c), sema.T_U64), &sp, line)
+        }
+        if base == sema.T_I128 { return c.callStdFmt("__fmtI128", r, &sp, line) }
+        return c.callStdFmt("__fmtU128", r, &sp, line)
+    }
+    if base == sema.T_FLOAT {
+        if sp.alt { c.err(line, "format '#' is not allowed for float") }
+        if k != 0 && k != int('f') && k != int('e') && k != int('E') && k != int('g') && k != int('G') {
+            c.err(line, "format specifier '" + strFromBytes(&[byte(k)]) + "' is not valid for float")
+        }
+        return c.callStdFmt("__fmtFloat", c.rd(v), &sp, line)
+    }
+    if c.isDecimalType(base) {
+        if sp.alt { c.err(line, "format '#' is not allowed for Decimal") }
+        if k != 0 && k != int('f') && k != int('c') {
+            c.err(line, "format specifier '" + strFromBytes(&[byte(k)]) + "' is not valid for Decimal")
+        }
+        return c.callStdFmt("__fmtDec", c.rd(v), &sp, line)
+    }
+    // str, bool, or any Show type
+    if sp.sign != 0 || sp.alt || sp.zero || sp.group {
+        c.err(line, "numeric format flags are not allowed for " + c.tstr(base))
+    }
+    if k != 0 && k != int('s') && k != int('q') {
+        c.err(line, "format specifier '" + strFromBytes(&[byte(k)]) + "' is not valid for " + c.tstr(base))
+    }
+    var sv = v
+    if base != sema.T_STR {
+        let sig = c.methodSig(base, "toStr", line, true)
+        if sig.kind < 0 || len(sig.params) != 1 || sig.ret != sema.T_STR {
+            c.err(line, "cannot format " + c.tstr(base) + " in interpolated string: it has no method 'toStr(): str'")
+        }
+        sv = c.call(&sig, true, sv, &[], line, -1, &noOpts())
+    }
+    return c.callStdFmt("__fmtStr", sv, &sp, line)
+}
+
+// Interpolated string ($"..." or $`...`): evaluates parts left to right, appending each into
+// an owned temporary buffer so earlier parts are copied before later expressions can mutate
+// anything, and early exits (try/return) drop the buffer cleanly.
+fn (c: mut &Checker) xIstr(e: int, exp: int): Val {
+    let parts = c.nd(e).a
+    let n = c.count(parts)
+    if n == 0 { return c.strLit("", exp) }
+    if n == 1 {
+        let p0 = c.item(parts, 0)
+        if c.kind(p0) == sx.N_STR { return c.strLit(&(c.node(p0).s), exp) }
+        let v = c.fmtPart(p0)
+        if v.t == sema.T_STR && v.cat == CAT_TMP { return v }
+        let acc = c.holdtmp(c.strLit("", -1).c, sema.T_STR)
+        c.emitx(c.x.call("rt_str_append_to", [c.x.pre("&", acc.c), v.c]))
+        return acc
+    }
+    let acc = c.holdtmp(c.strLit("", -1).c, sema.T_STR)
+    for i in 0..n {
+        let p = c.item(parts, i)
+        if c.kind(p) == sx.N_STR {
+            let lit = c.strLit(&(c.node(p).s), -1)
+            c.emitx(c.x.call("rt_str_append_to", [c.x.pre("&", acc.c), lit.c]))
+        } else {
+            let v = c.fmtPart(p)
+            c.emitx(c.x.call("rt_str_append_to", [c.x.pre("&", acc.c), v.c]))
+        }
+    }
+    return acc
 }
 
 fn (c: mut &Checker) xField(e: int, exp: int): Val {
@@ -6038,9 +6256,9 @@ fn (c: mut &Checker) namesOwned(e: int): bool {
     }
     return match k {
         sx.N_BIN, sx.N_SUB, sx.N_IFX { c.namesOwned(n.a) || c.namesOwned(n.b) || c.namesOwned(n.c) }
-        sx.N_UN, sx.N_BORROW, sx.N_TRY, sx.N_FIELDX, sx.N_RETURN { c.namesOwned(n.a) }
+        sx.N_UN, sx.N_BORROW, sx.N_TRY, sx.N_FIELDX, sx.N_RETURN, sx.N_FMT { c.namesOwned(n.a) }
         sx.N_INDEX, sx.N_CALL { c.namesOwned(n.a) || c.namesOwnedList(n.b) }
-        sx.N_ARRLIT { c.namesOwnedList(n.a) }
+        sx.N_ARRLIT, sx.N_ISTR { c.namesOwnedList(n.a) }
         sx.N_LIT { c.namesOwnedInits(n.b) }
         sx.N_MATCHX { c.namesOwned(n.a) || c.namesOwnedArms(n.b) }
         else { false }
