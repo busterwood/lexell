@@ -37,6 +37,8 @@
 
 import "strings"
 
+type VB = vector[byte]
+
 pub type Json = value closed {
     Null
     Bool(bool)
@@ -968,19 +970,30 @@ pub type Position = value record {
 }
 
 pub fn positionOf(s: &str, offset: int): Position {
+    var lim = if offset < len(s) { offset } else { len(s) }
+    if lim < 0 { lim = 0 }
     var line = 1
-    var col = 1
+    var lastNl = -1
     var i = 0
-    while i < offset && i < len(s) {
+    if lim >= VB.lanes {
+        let vNl = VB.splat('\n')
+        let prefix = s[..lim]
+        for v in VB.chunks(&prefix, mut &i) {
+            let m = (v == vNl).bitmask()
+            if m != u64(0) {
+                line += m.countOnes()
+                lastNl = i + (63 - m.leadingZeros())
+            }
+        }
+    }
+    while i < lim {
         if s[i] == '\n' {
             line += 1
-            col = 1
-        } else {
-            col += 1
+            lastNl = i
         }
         i += 1
     }
-    return Position{line: line, column: col}
+    return Position{line: line, column: lim - lastNl}
 }
 
 fn (d: &Decoder) fail(k: ErrorKind, msg: &str, at: int): Error {
@@ -990,8 +1003,27 @@ fn (d: &Decoder) fail(k: ErrorKind, msg: &str, at: int): Error {
 
 fn (d: mut &Decoder) skipSpace() {
     let s = &d.s
+    let n = len(s)
     var i = d.pos
-    while i < len(s) {
+    if i >= n { return }
+    let c0 = s[i]
+    if c0 != ' ' && c0 != '\n' && c0 != '\r' && c0 != '\t' { return }
+    i += 1
+    if n - i >= VB.lanes {
+        let vSp = VB.splat(' ')
+        let vNl = VB.splat('\n')
+        let vCr = VB.splat('\r')
+        let vTb = VB.splat('\t')
+        for v in VB.chunks(s, mut &i) {
+            let ws = (v == vSp) | (v == vNl) | (v == vCr) | (v == vTb)
+            let m = (~ws).bitmask()
+            if m != u64(0) {
+                d.pos = i + m.trailingZeros()
+                return
+            }
+        }
+    }
+    while i < n {
         let c = s[i]
         if c != ' ' && c != '\n' && c != '\r' && c != '\t' { break }
         i += 1
@@ -1448,6 +1480,23 @@ fn (d: mut &Decoder) string(): Result[str, Error] {
     let n = len(d.s)
     // fast path: no escapes, valid UTF-8; the result shares s
     while i < n {
+        if n - i >= VB.lanes {
+            let vQuote = VB.splat('"')
+            let vSlash = VB.splat('\\')
+            let vCtrl  = VB.splat(byte(0x20))
+            let vHigh  = VB.splat(byte(0x80))
+            let s = &d.s
+            var hit = 0
+            for v in VB.chunks(s, mut &i) {
+                let m = ((v == vQuote) | (v == vSlash) | (v < vCtrl) | (v >= vHigh)).bitmask()
+                if m != u64(0) {
+                    hit = m.trailingZeros()
+                    break
+                }
+            }
+            i += hit
+            if i >= n { break }
+        }
         let c = d.s[i]
         if c == '"' {
             d.pos = i + 1
@@ -1579,6 +1628,19 @@ pub fn validUtf8(s: &str): str {
     var i = 0
     let n = len(s)
     while i < n {
+        if n - i >= VB.lanes {
+            let vHigh = VB.splat(byte(0x80))
+            var hit = 0
+            for v in VB.chunks(s, mut &i) {
+                let m = (v >= vHigh).bitmask()
+                if m != u64(0) {
+                    hit = m.trailingZeros()
+                    break
+                }
+            }
+            i += hit
+            if i >= n { break }
+        }
         if s[i] < 0x80 {
             i += 1
         } else {
@@ -1817,6 +1879,22 @@ pub fn writeString[W: Sink](w: mut &W, s: &str, ascii: bool) {
     var run = 0     // start of the bytes not yet written
     var i = 0
     while i < n {
+        if n - i >= VB.lanes {
+            let vCtrl  = VB.splat(byte(0x20))
+            let vDel   = VB.splat(byte(0x7f))
+            let vQuote = VB.splat('"')
+            let vSlash = VB.splat('\\')
+            var hit = 0
+            for v in VB.chunks(s, mut &i) {
+                let m = ((v < vCtrl) | (v >= vDel) | (v == vQuote) | (v == vSlash)).bitmask()
+                if m != u64(0) {
+                    hit = m.trailingZeros()
+                    break
+                }
+            }
+            i += hit
+            if i >= n { break }
+        }
         let c = s[i]
         if c >= 0x20 && c < 0x7f && c != '"' && c != '\\' {
             i += 1
