@@ -16538,13 +16538,8 @@ fn makeParSpans(nLeaves: int, nParts: int): []ParSpan {
 
 // ---- Engine A: Parallel Table Scan (parReadTable)
 
-type ParBatch = record {
-    b: Batch
-    idx: []int
-}
-
 type ParReadRes = record {
-    batches: []ParBatch
+    batches: []Batch
     read: int
     kept: int
     pushed: int
@@ -16555,12 +16550,51 @@ type ParReadRes = record {
     err: Option[DbErr]
 }
 
+// Column-major copy of cnt surviving rows ch[from..from+cnt] from scratch batch src into dense batch dst.
+fn copyBatchRows(dst: mut &Batch, src: &Batch, ch: &[]int, from: int, cnt: int, bp: &BPlan): bool {
+    let d0 = dst.n
+    for i in 0..len(bp.kinds) {
+        if !bp.needCol[i] { continue }
+        let k = bp.kinds[i]
+        if k == BK_TEXT {
+            for j in 0..cnt {
+                let sr = ch[from + j]
+                if src.cols[i].nul[sr] {
+                    dst.cols[i].nul[d0 + j] = true
+                } else {
+                    dst.cols[i].nul[d0 + j] = false
+                    if !lexdb_rows.putText(dst, i, d0 + j, lexdb_rows.textAt(src, i, sr)) { return false }
+                }
+            }
+        } else if k == BK_VAL {
+            for j in 0..cnt {
+                let sr = ch[from + j]
+                if src.cols[i].nul[sr] {
+                    dst.cols[i].nul[d0 + j] = true
+                } else {
+                    dst.cols[i].nul[d0 + j] = false
+                    dst.vals[i][d0 + j] = src.vals[i][sr].clone()
+                }
+            }
+        } else {
+            for j in 0..cnt {
+                let sr = ch[from + j]
+                dst.cols[i].nul[d0 + j] = src.cols[i].nul[sr]
+                dst.cols[i].v[d0 + j] = src.cols[i].v[sr]
+            }
+        }
+    }
+    dst.n += cnt
+    return true
+}
+
 fn parReadWorker(leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int, bp: &BPlan, lz: &Lazy,
                  conds: &[]BNode, pushCol: int, ph: &PushH, hasCut: bool,
                  needPl: &[]bool, maxPl: int): ParReadRes {
     var out = ParReadRes{batches: [], read: 0, kept: 0, pushed: 0, cut: 0, batchesN: 0, kernRuns: 0, bail: false, err: None}
     var b = lexdb_rows.newBatch(bp, lexdb_rows.BROWS)
-    var idx: []int = []
+    var dst = lexdb_rows.noRows()
+    var hasDst = false
     for li in lo..hi {
         let pl = &leaves[li]
         let s = &pl.cols
@@ -16570,18 +16604,17 @@ fn parReadWorker(leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int, bp: &BPlan, 
         let np = lexdb_rows.colPlaces(&dir)
         var k = pl.from
         while k < pl.to {
-            if b.n == lexdb_rows.BROWS {
-                out.batchesN += 1
-                if len(idx) > 0 {
-                    append(mut &out.batches, ParBatch{b: replace(mut &b, lexdb_rows.newBatch(bp, lexdb_rows.BROWS)), idx: replace(mut &idx, [])})
-                } else {
-                    b = lexdb_rows.reuse(mut &b, bp)
-                }
+            let take = min(pl.to - k, lexdb_rows.BROWS)
+            // Reset scratch batch b in place (zero per-leaf heap allocations).
+            for i in 0..len(bp.kinds) {
+                if !bp.needCol[i] { continue }
+                for q in 0..take { b.cols[i].nul[q] = false }
+                if bp.kinds[i] == BK_TEXT { b.txt[i].clear() }
             }
-            let take = min(pl.to - k, lexdb_rows.BROWS - b.n)
-            let r0 = b.n
+            b.n = take
+            let r0 = 0
             var rs: []int = withCapacity(take)
-            for q in 0..take { append(mut &rs, r0 + q) }
+            for q in 0..take { append(mut &rs, q) }
             // 1. Leaf kernels
             var kerned = false
             if len(lz.kern) == 1 {
@@ -16635,7 +16668,7 @@ fn parReadWorker(leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int, bp: &BPlan, 
             if len(firstPs) > 0 && len(rs) > 0 {
                 let wide0 = didKern && 2 * len(rs) >= take
                 var qs0: []int = withCapacity(if wide0 { take } else { len(rs) })
-                if wide0 { for q in 0..take { append(mut &qs0, q) } } else { for r in rs { append(mut &qs0, r - r0) } }
+                if wide0 { for q in 0..take { append(mut &qs0, q) } } else { for r in rs { append(mut &qs0, r) } }
                 match lexdb_rows.colsIntoPure(s, &dir, k, &qs0, len(qs0) == take, r0, firstPs, mut &b, bp) {
                     Ok(ok) { if !ok { out.bail = true; return out } }
                     Err(x) { out.err = Some(x); return out }
@@ -16736,23 +16769,36 @@ fn parReadWorker(leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int, bp: &BPlan, 
             if len(restPs) > 0 && len(ch) > 0 {
                 let wide = (didKern || len(lz.rtKern) > 0 || len(lz.raw) > 0) && 2 * len(ch) >= take
                 var qs: []int = withCapacity(if wide { take } else { len(ch) })
-                if wide { for q in 0..take { append(mut &qs, q) } } else { for r in ch { append(mut &qs, r - r0) } }
+                if wide { for q in 0..take { append(mut &qs, q) } } else { for r in ch { append(mut &qs, r) } }
                 match lexdb_rows.colsIntoPure(s, &dir, k, &qs, len(qs) == take, r0, restPs, mut &b, bp) {
                     Ok(ok) { if !ok { out.bail = true; return out } }
                     Err(x) { out.err = Some(x); return out }
                 }
             }
-            for r in ch { append(mut &idx, r) }
-            b.n += take
+            // 9. Compact surviving rows into dense BROWS output batches (keeps working set tiny).
+            let nc = len(ch)
+            if nc > 0 {
+                if !hasDst {
+                    dst = lexdb_rows.newBatch(bp, lexdb_rows.BROWS)
+                    hasDst = true
+                }
+                var pos = 0
+                while pos < nc {
+                    let room = lexdb_rows.BROWS - dst.n
+                    let copyN = min(nc - pos, room)
+                    if !copyBatchRows(mut &dst, &b, &ch, pos, copyN, bp) { out.bail = true; return out }
+                    pos += copyN
+                    if dst.n == lexdb_rows.BROWS {
+                        append(mut &out.batches, replace(mut &dst, lexdb_rows.newBatch(bp, lexdb_rows.BROWS)))
+                    }
+                }
+            }
             out.read += take
             k += take
         }
     }
-    if b.n > 0 {
-        out.batchesN += 1
-        if len(idx) > 0 {
-            append(mut &out.batches, ParBatch{b: b, idx: idx})
-        }
+    if hasDst && dst.n > 0 {
+        append(mut &out.batches, dst)
     }
     return out
 }
@@ -16812,8 +16858,9 @@ fn parReadTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_a
             if mutRes[ri].kernRuns > 0 { lexdb_leafk.noteRun() }
             var bs = replace(mut &mutRes[ri].batches, [])
             for bi in 0..len(bs) {
-                var b = replace(mut &bs[bi].b, lexdb_rows.noRows())
-                let idx = replace(mut &bs[bi].idx, [])
+                var b = replace(mut &bs[bi], lexdb_rows.noRows())
+                var idx: []int = withCapacity(b.n)
+                for j in 0..b.n { append(mut &idx, j) }
                 if !(try each(txn, mut &b, idx, false)) {
                     if chunkRead > 0 { rc.batches += (chunkRead + lexdb_rows.BROWS - 1) / lexdb_rows.BROWS }
                     return Ok(true)

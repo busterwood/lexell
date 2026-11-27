@@ -265,6 +265,7 @@ typedef struct rt_hp {
     int npool;
     size_t pool_bytes;
     uint64_t tag;                   /* the owner tag written into each block's header */
+    void* remote_free;              /* lock-free stack of blocks freed on another thread */
 } rt_hp;
 struct rt_chunk {
     rt_chunk* qnext;                /* the retire queue */
@@ -364,6 +365,22 @@ __attribute__((noinline)) static void* sys_mmap_thp(size_t n) {
     return p;
 }
 static void class_link(rt_hp* h, rt_chunk* ch, int c);
+static inline void class_unlink(rt_hp* h, rt_chunk* ch, int c);
+static void heap_drain_remote(rt_hp* h);
+/* Take one wholly free chunk from h's retire queue and unlink its class lists for reuse or unmap. */
+static rt_chunk* heap_take_queued(rt_hp* h) {
+    while (h->queue) {
+        rt_chunk* ch = h->queue;
+        h->queue = ch->qnext;
+        h->queued--;
+        ch->qnext = 0;
+        if (ch->live != 0 || ch == h->cur) { ch->queued = 0; continue; }
+        for (int c = 0; c < NCLASS; c++)
+            if (ch->free_list[c]) class_unlink(h, ch, c);
+        return ch;
+    }
+    return 0;
+}
 /* The current chunk's free blocks sit in the heap (one load on the fast path); when it is
    full, they move into its header and onto the class lists, and a new chunk is carved. */
 __attribute__((noinline)) static void cur_flush(rt_hp* h) {
@@ -387,8 +404,12 @@ static inline void chunk_queue(rt_hp* h, rt_chunk* ch) {
 }
 /* A fresh (or pooled) chunk for the small classes, out of line. */
 __attribute__((noinline)) static bool heap_chunk(rt_hp* h) {
+    if (__atomic_load_n(&h->remote_free, __ATOMIC_RELAXED)) heap_drain_remote(h);
     char* p;
-    if (h == &rt_mheap && hp_freelist) {
+    rt_chunk* qch = heap_take_queued(h);
+    if (qch) {
+        p = (char*)qch;
+    } else if (h == &rt_mheap && hp_freelist) {
         p = (char*)hp_freelist;
         hp_freelist = hp_freelist->qnext;
     } else
@@ -586,9 +607,12 @@ static inline __attribute__((always_inline)) void free_h(rt_hp* hp, void* p) {
         hp->cur_live--;
         return;
     }
-    if (__builtin_expect(ch->owner != hp, 0)) {         /* a block whose chunk another heap owns */
-        *(void**)p = hp->legacy[c];
-        hp->legacy[c] = p;
+    if (__builtin_expect(ch->owner != hp, 0)) {         /* a block whose chunk another heap owns: return it lock-free */
+        rt_hp* ow = ch->owner;
+        void* old = __atomic_load_n(&ow->remote_free, __ATOMIC_RELAXED);
+        do {
+            *(void**)p = old;
+        } while (!__atomic_compare_exchange_n(&ow->remote_free, &old, p, true, __ATOMIC_RELEASE, __ATOMIC_RELAXED));
         return;
     }
     bool was_empty = ch->free_list[c] == 0;
@@ -597,6 +621,14 @@ static inline __attribute__((always_inline)) void free_h(rt_hp* hp, void* p) {
     if (was_empty) class_link(hp, ch, c);
     ch->live--;
     if (ch->live == 0) chunk_queue(hp, ch);
+}
+__attribute__((noinline)) static void heap_drain_remote(rt_hp* h) {
+    void* list = __atomic_exchange_n(&h->remote_free, 0, __ATOMIC_ACQUIRE);
+    while (list) {
+        void* nx = *(void**)list;
+        free_h(h, list);
+        list = nx;
+    }
 }
 /* free's one test, as before there were workers: a header word at or above NCLASS is a large
    block, or a block with a worker's tag (a worker's own, or one that came to the main thread with
@@ -4669,11 +4701,17 @@ static void rt_par_worker(rt_wctx* w) {
         rt_pjob* j = rt_pq;
         j->users++;
         rt_pool_unlock();
+        if (__atomic_load_n(&w->heap.remote_free, __ATOMIC_RELAXED)) heap_drain_remote(&w->heap);
         w->heap.tag = __atomic_add_fetch(&rt_par_tags, 1, __ATOMIC_RELAXED);
         w->log = 0;
         w->live = 0;
         w->job = j;
         rt_par_items(j);
+        while (w->heap.queued > 4) {
+            rt_chunk* qch = heap_take_queued(&w->heap);
+            if (!qch) break;
+            SYS(S_MUNMAP, qch, CHUNK, 0);
+        }
         rt_pool_lock();
         if (w->log) { w->log->next = j->logs; j->logs = w->log; }
         j->live += w->live;
