@@ -147,6 +147,7 @@ pub fn optimize(p: ir.Ir): ir.Ir {
     o.dropDead()
     o.elideStaticStrs()
     o.fwdReceivers()
+    o.packRecur()
     return replace(mut &o.u, ir.newIr())
 }
 
@@ -2409,4 +2410,297 @@ fn (o: mut &Opt) clList(l: int): int {
         if y >= 0 { append(mut &xs, y) }
     }
     return o.u.list(&xs)
+}
+
+// ---------------------------------------------------------------- recursive invariant param packing
+//
+// A self-recursive function with >= 2 self-calls that forwards invariant read-only scalar/slice
+// parameters unchanged (>= 24 bytes total) is split into a tiny wrapper that packs those parameters
+// into a stack Ctx struct and a worker taking a single Ctx* pointer alongside the varying params.
+
+fn (o: &Opt) prFindParam(params: &[]int, l: int): int {
+    for j in 0..len(params) {
+        if params[j] == l { return j }
+    }
+    return -1
+}
+
+fn (o: &Opt) prLocalRoot(x: int): int {
+    var r = x
+    while o.u.nk(r) == ir.E_MEMBER { r = o.u.nodes[r].a }
+    if o.u.nk(r) == ir.E_LOCAL { return o.u.nodes[r].a }
+    return -1
+}
+
+fn (o: &Opt) prScan(x: int, f: int, params: &[]int, bad: mut &[]bool, selfCalls: mut &int) {
+    if x < 0 { return }
+    let n = o.u.nodes[x]
+    let k = n.k
+    if k == ir.E_ASSIGN || k == ir.E_POSTINC {
+        let rl = o.prLocalRoot(n.a)
+        if rl >= 0 {
+            let j = o.prFindParam(params, rl)
+            if j >= 0 { bad[j] = true }
+        }
+    } else if k == ir.E_ADDR || k == ir.E_DECAY {
+        let rl = o.prLocalRoot(n.a)
+        if rl >= 0 {
+            let j = o.prFindParam(params, rl)
+            if j >= 0 { bad[j] = true }
+        }
+    } else if k == ir.E_CALL {
+        var isSelf = false
+        if o.u.nk(n.a) == ir.E_DECAY && o.u.nk(o.u.nodes[n.a].a) == ir.E_FUNC &&
+            o.u.nodes[o.u.nodes[n.a].a].a == f {
+            isSelf = true
+            selfCalls += 1
+            if o.u.listLen(n.b) != len(params) {
+                for j in 0..len(params) { bad[j] = true }
+            } else {
+                for j in 0..len(params) {
+                    let aj = o.u.listAt(n.b, j)
+                    if o.u.nk(aj) != ir.E_LOCAL || o.u.nodes[aj].a != params[j] { bad[j] = true }
+                }
+            }
+        }
+        o.prScan(n.a, f, params, bad, selfCalls)
+        if n.b >= 0 {
+            for j in 0..o.u.listLen(n.b) { o.prScan(o.u.listAt(n.b, j), f, params, bad, selfCalls) }
+        }
+        return
+    }
+    let kc = ir.KIDS[k]
+    if kc <= ir.K_NONE { return }
+    if kc == ir.K_A {
+        o.prScan(n.a, f, params, bad, selfCalls)
+    } else if kc == ir.K_AB {
+        o.prScan(n.a, f, params, bad, selfCalls)
+        o.prScan(n.b, f, params, bad, selfCalls)
+    } else if kc == ir.K_ABC {
+        o.prScan(n.a, f, params, bad, selfCalls)
+        o.prScan(n.b, f, params, bad, selfCalls)
+        o.prScan(n.c, f, params, bad, selfCalls)
+    } else if kc == ir.K_CLIT {
+        if n.b >= 0 { for j in 0..o.u.listLen(n.b) { o.prScan(o.u.listAt(n.b, j), f, params, bad, selfCalls) } }
+    } else if kc == ir.K_BLOCK {
+        if n.a >= 0 { for j in 0..o.u.listLen(n.a) { o.prScan(o.u.listAt(n.a, j), f, params, bad, selfCalls) } }
+    } else if kc == ir.K_DECL {
+        o.prScan(n.b, f, params, bad, selfCalls)
+        if n.c >= 0 { for j in 0..o.u.listLen(n.c) { o.prScan(o.u.listAt(n.c, j), f, params, bad, selfCalls) } }
+    } else if kc == ir.K_FOR {
+        o.prScan(n.a, f, params, bad, selfCalls)
+        o.prScan(n.b, f, params, bad, selfCalls)
+        o.prScan(n.c, f, params, bad, selfCalls)
+        o.prScan(n.d, f, params, bad, selfCalls)
+    }
+}
+
+fn (o: mut &Opt) prMk(k: int, ty: int, line: int, a: int, b: int, c: int, v: int): int {
+    append(mut &o.u.nodes, ir.Node{k: k, ty: ty, line: line, a: a, b: b, c: c, d: -1, v: v})
+    return len(o.u.nodes) - 1
+}
+
+fn (o: mut &Opt) prRewrite(x: int, f: int, wf: int, wfTy: int, wfPtrTy: int, ctxP: int, ctxTy: int, ctxPtrTy: int,
+    invLoc: &[]int, invOff: &[]int, varyIdx: &[]int) {
+    if x < 0 { return }
+    let n = o.u.nodes[x]
+    let k = n.k
+    if k == ir.E_LOCAL {
+        for i in 0..len(invLoc) {
+            if invLoc[i] == n.a {
+                let lp = o.prMk(ir.E_LOCAL, ctxPtrTy, n.line, ctxP, -1, -1, 0)
+                let dr = o.prMk(ir.E_DEREF, ctxTy, n.line, lp, -1, -1, 0)
+                o.u.nodes[x].k = ir.E_MEMBER
+                o.u.nodes[x].a = dr
+                o.u.nodes[x].v = invOff[i]
+                return
+            }
+        }
+        return
+    }
+    if k == ir.E_CALL {
+        if o.u.nk(n.a) == ir.E_DECAY && o.u.nk(o.u.nodes[n.a].a) == ir.E_FUNC &&
+            o.u.nodes[o.u.nodes[n.a].a].a == f {
+            let fnN = o.u.nodes[n.a].a
+            o.u.nodes[fnN].a = wf
+            o.u.nodes[fnN].ty = wfTy
+            o.u.nodes[n.a].ty = wfPtrTy
+            o.u.nodes[x].c = wfTy
+            var newArgs: []int = []
+            for j in varyIdx {
+                let aj = o.u.listAt(n.b, j)
+                o.prRewrite(aj, f, wf, wfTy, wfPtrTy, ctxP, ctxTy, ctxPtrTy, invLoc, invOff, varyIdx)
+                append(mut &newArgs, aj)
+            }
+            append(mut &newArgs, o.prMk(ir.E_LOCAL, ctxPtrTy, n.line, ctxP, -1, -1, 0))
+            o.u.nodes[x].b = o.u.list(&newArgs)
+            return
+        }
+        o.prRewrite(n.a, f, wf, wfTy, wfPtrTy, ctxP, ctxTy, ctxPtrTy, invLoc, invOff, varyIdx)
+        if n.b >= 0 {
+            for j in 0..o.u.listLen(n.b) {
+                o.prRewrite(o.u.listAt(n.b, j), f, wf, wfTy, wfPtrTy, ctxP, ctxTy, ctxPtrTy, invLoc, invOff, varyIdx)
+            }
+        }
+        return
+    }
+    let kc = ir.KIDS[k]
+    if kc <= ir.K_NONE { return }
+    if kc == ir.K_A {
+        o.prRewrite(n.a, f, wf, wfTy, wfPtrTy, ctxP, ctxTy, ctxPtrTy, invLoc, invOff, varyIdx)
+    } else if kc == ir.K_AB {
+        o.prRewrite(n.a, f, wf, wfTy, wfPtrTy, ctxP, ctxTy, ctxPtrTy, invLoc, invOff, varyIdx)
+        o.prRewrite(n.b, f, wf, wfTy, wfPtrTy, ctxP, ctxTy, ctxPtrTy, invLoc, invOff, varyIdx)
+    } else if kc == ir.K_ABC {
+        o.prRewrite(n.a, f, wf, wfTy, wfPtrTy, ctxP, ctxTy, ctxPtrTy, invLoc, invOff, varyIdx)
+        o.prRewrite(n.b, f, wf, wfTy, wfPtrTy, ctxP, ctxTy, ctxPtrTy, invLoc, invOff, varyIdx)
+        o.prRewrite(n.c, f, wf, wfTy, wfPtrTy, ctxP, ctxTy, ctxPtrTy, invLoc, invOff, varyIdx)
+    } else if kc == ir.K_CLIT {
+        if n.b >= 0 {
+            for j in 0..o.u.listLen(n.b) {
+                o.prRewrite(o.u.listAt(n.b, j), f, wf, wfTy, wfPtrTy, ctxP, ctxTy, ctxPtrTy, invLoc, invOff, varyIdx)
+            }
+        }
+    } else if kc == ir.K_BLOCK {
+        if n.a >= 0 {
+            for j in 0..o.u.listLen(n.a) {
+                o.prRewrite(o.u.listAt(n.a, j), f, wf, wfTy, wfPtrTy, ctxP, ctxTy, ctxPtrTy, invLoc, invOff, varyIdx)
+            }
+        }
+    } else if kc == ir.K_DECL {
+        o.prRewrite(n.b, f, wf, wfTy, wfPtrTy, ctxP, ctxTy, ctxPtrTy, invLoc, invOff, varyIdx)
+        if n.c >= 0 {
+            for j in 0..o.u.listLen(n.c) {
+                o.prRewrite(o.u.listAt(n.c, j), f, wf, wfTy, wfPtrTy, ctxP, ctxTy, ctxPtrTy, invLoc, invOff, varyIdx)
+            }
+        }
+    } else if kc == ir.K_FOR {
+        o.prRewrite(n.a, f, wf, wfTy, wfPtrTy, ctxP, ctxTy, ctxPtrTy, invLoc, invOff, varyIdx)
+        o.prRewrite(n.b, f, wf, wfTy, wfPtrTy, ctxP, ctxTy, ctxPtrTy, invLoc, invOff, varyIdx)
+        o.prRewrite(n.c, f, wf, wfTy, wfPtrTy, ctxP, ctxTy, ctxPtrTy, invLoc, invOff, varyIdx)
+        o.prRewrite(n.d, f, wf, wfTy, wfPtrTy, ctxP, ctxTy, ctxPtrTy, invLoc, invOff, varyIdx)
+    }
+}
+
+fn (o: mut &Opt) packRecur() {
+    var sliceSid = -1
+    for s in 0..o.u.nRtStructs {
+        if o.u.structs[s].name == "lxl_slice" { sliceSid = s }
+    }
+    let nFuncs = len(o.u.funcs)
+    for f in o.u.nRtFuncs..nFuncs {
+        let body = o.u.funcs[f].body
+        if body < 0 || o.u.funcs[f].isExtern || o.u.isVarFn(o.u.funcs[f].ty) { continue }
+        let np = len(o.u.funcs[f].params)
+        if np < 3 { continue }
+        var params: []int = []
+        for j in 0..np { append(mut &params, o.u.funcs[f].params[j]) }
+        var bad = array(np, false)
+        for j in 0..np {
+            let t = o.u.locals[params[j]].ty
+            let ok = o.u.isScalar(t) || (o.u.tk(t) == ir.TY_STRUCT && o.u.tys[t].sid == sliceSid)
+            if !ok { bad[j] = true }
+        }
+        var selfCalls = 0
+        o.prScan(body, f, &params, mut &bad, mut &selfCalls)
+        if selfCalls < 2 { continue }
+        var invIdx: []int = []
+        var varyIdx: []int = []
+        var invBytes = 0
+        for j in 0..np {
+            if !bad[j] {
+                append(mut &invIdx, j)
+                invBytes += o.u.sizeOf(o.u.locals[params[j]].ty)
+            } else {
+                append(mut &varyIdx, j)
+            }
+        }
+        if len(invIdx) < 2 || invBytes < 24 || len(varyIdx) == 0 { continue }
+
+        // Build Ctx struct for the invariant parameters.
+        var fields: []ir.Field = []
+        var invLoc: []int = []
+        var invOff: []int = []
+        var off = 0
+        var maxAl = 1
+        for k in 0..len(invIdx) {
+            let pl = params[invIdx[k]]
+            let pt = o.u.locals[pl].ty
+            let al = o.u.alignOf(pt)
+            if al > maxAl { maxAl = al }
+            off = ir.alignUp(off, al)
+            append(mut &fields, ir.Field{name: "f" + intToStr(k), ty: pt, off: off})
+            append(mut &invLoc, pl)
+            append(mut &invOff, off)
+            off += o.u.sizeOf(pt)
+        }
+        let sz = ir.alignUp(off, maxAl)
+        let sid = len(o.u.structs)
+        let ctxTy = len(o.u.tys)
+        append(mut &o.u.tys, ir.Ty{k: ir.TY_STRUCT, size: sz, align: maxAl, base: -1, n: 0, sid: sid})
+        append(mut &o.u.structs, ir.Struct{name: "Ctx_" + o.u.funcs[f].name, isUnion: false, fields: fields,
+            size: sz, align: maxAl, complete: true, ty: ctxTy})
+        let ctxPtrTy = o.u.ptrTo(ctxTy)
+
+        // Create worker function taking varying params + ctxP.
+        let ctxP = len(o.u.locals)
+        append(mut &o.u.locals, ir.Local{name: "p_ctx", ty: ctxPtrTy})
+        var wfParams: []int = []
+        var wfParamTys: []int = []
+        for j in varyIdx {
+            append(mut &wfParams, params[j])
+            append(mut &wfParamTys, o.u.locals[params[j]].ty)
+        }
+        append(mut &wfParams, ctxP)
+        append(mut &wfParamTys, ctxPtrTy)
+        let retTy = o.u.tys[o.u.funcs[f].ty].base
+        let wfTy = o.u.fnType(retTy, &wfParamTys)
+        let wfPtrTy = o.u.ptrTo(wfTy)
+        let wf = len(o.u.funcs)
+        let wname = o.u.funcs[f].name + "_w"
+        let ln = o.u.funcs[f].line
+        append(mut &o.u.funcs, ir.Func{name: wname.clone(), ty: wfTy, params: wfParams, body: body,
+            asmName: wname, isExtern: false, line: ln, kernel: o.u.funcs[f].kernel})
+
+        // Rewrite worker body: invariant params -> p_ctx->fk, self-calls -> wf(vary..., p_ctx).
+        o.prRewrite(body, f, wf, wfTy, wfPtrTy, ctxP, ctxTy, ctxPtrTy, &invLoc, &invOff, &varyIdx)
+
+        // Replace f's params with fresh locals and build thin wrapper body.
+        var wrapParams: []int = []
+        for j in 0..np {
+            let nl = len(o.u.locals)
+            append(mut &o.u.locals, ir.Local{name: o.u.locals[params[j]].name.clone(), ty: o.u.locals[params[j]].ty})
+            append(mut &wrapParams, nl)
+        }
+        o.u.funcs[f].params = wrapParams
+        let ctxL = len(o.u.locals)
+        append(mut &o.u.locals, ir.Local{name: "ctx", ty: ctxTy})
+        var stmts: []int = []
+        append(mut &stmts, o.prMk(ir.S_DECL, ir.TY_VOID, ln, ctxL, -1, -1, 0))
+        for k in 0..len(invIdx) {
+            let pl = o.u.funcs[f].params[invIdx[k]]
+            let pt = o.u.locals[pl].ty
+            let cl = o.prMk(ir.E_LOCAL, ctxTy, ln, ctxL, -1, -1, 0)
+            let mem = o.prMk(ir.E_MEMBER, pt, ln, cl, -1, -1, invOff[k])
+            let val = o.prMk(ir.E_LOCAL, pt, ln, pl, -1, -1, 0)
+            let asg = o.prMk(ir.E_ASSIGN, pt, ln, mem, val, -1, 0)
+            append(mut &stmts, o.prMk(ir.S_EXPR, ir.TY_VOID, ln, asg, -1, -1, 0))
+        }
+        var callArgs: []int = []
+        for j in varyIdx {
+            let pl = o.u.funcs[f].params[j]
+            append(mut &callArgs, o.prMk(ir.E_LOCAL, o.u.locals[pl].ty, ln, pl, -1, -1, 0))
+        }
+        let ctxRef = o.prMk(ir.E_ADDR, ctxPtrTy, ln, o.prMk(ir.E_LOCAL, ctxTy, ln, ctxL, -1, -1, 0), -1, -1, 0)
+        append(mut &callArgs, ctxRef)
+        let fnN = o.prMk(ir.E_FUNC, wfTy, ln, wf, -1, -1, 0)
+        let decN = o.prMk(ir.E_DECAY, wfPtrTy, ln, fnN, -1, -1, 0)
+        let callN = o.prMk(ir.E_CALL, retTy, ln, decN, o.u.list(&callArgs), wfTy, 0)
+        if retTy == ir.TY_VOID {
+            append(mut &stmts, o.prMk(ir.S_EXPR, ir.TY_VOID, ln, callN, -1, -1, 0))
+        } else {
+            append(mut &stmts, o.prMk(ir.S_RETURN, ir.TY_VOID, ln, callN, -1, -1, 0))
+        }
+        o.u.funcs[f].body = o.prMk(ir.S_BLOCK, ir.TY_VOID, ln, o.u.list(&stmts), -1, -1, 0)
+    }
 }

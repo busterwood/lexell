@@ -176,7 +176,8 @@ type Gen = record {
     scanExpr: int               // > 0: the scan is in the body of a call generated in place (one position)
     loud: []bool                // per position: its code may change rsi, rdi, r8 or r9 (calls, ...)
     loud89: []bool              // ... may change r8 or r9 but not rsi and rdi (128-bit arithmetic)
-    loud1011: []bool            // ... may change r10 or r11 (clobbers1011), besides loud and loud89 ones
+    loud10: []bool              // ... may change r10 (copyMem, fillEntries), besides loud and loud89 ones
+    loud1011: []bool            // ... may change r11 (clobbers1011), besides loud and loud89 ones
     any89: bool                 // ... some position is
     fpLoud: []bool              // ... may change xmm8-xmm14 (calls but of native/math.c, ...)
     fpKeep: Map[str, bool]      // the runtime functions that leave xmm8-xmm15 alone (rtx.FP_KEEP)
@@ -295,7 +296,7 @@ fn newGen(u: ir.Ir): Gen {
         strs: [], flts: [], fltSym: newMap(), funcPos: [], pend: [], pendLo: 0, pendN: 0, order: [], gLive: [], gQueue: [], relocSeen: 0, slots: [], frame: 0, maxFrame: 0, outArgs: 0, declMark: 0, breakL: [], contL: [],
         caseL: newMap(), retPtr: 0, wideAt: -1, initVia: 0, viaLoaded: false, retTy: 0, epiL: -1, epiJmps: [], loopTops: [], funcAlign: padFromEnv("LXL_FALIGN", FUNC_ALIGN), padBefore: padFromEnv("LXL_PADB", 0), shortJ: padFromEnv("LXL_SHORTJ", 1) != 0, loopLines: padFromEnv("LXL_LOOPLINES", LOOP_LINES), loopEnds: [], entrySym: -1, dyn: false, libs: [], imports: [], importSym: newMapWith[str, int](fxHashStr), stubs: [], grows: [],
         stubOf: newMapWith[str, int](fxHashStr), codeEnd: 0, reg: [], freg: [], preg: [], preg2: [], fpLoud: [], fpKeep: newMapWith[str, bool](fxHashStr), uses: [], weight: [], rawW: [], bad: [], touched: [], first: [], last: [],
-        noInit: [], inner: [], pts: [], defAt: [], coal: [], coalBy: [], declLoop: [], declDepth: [], tmpRegs: [], tmpUsed: 0, unused: false, prevDecl: -1, tailEnd: [], pos: 0, scanExpr: 0, loud: [], loud89: [], loud1011: [], any89: false, regions: [], openLoops: [],
+        noInit: [], inner: [], pts: [], defAt: [], coal: [], coalBy: [], declLoop: [], declDepth: [], tmpRegs: [], tmpUsed: 0, unused: false, prevDecl: -1, tailEnd: [], pos: 0, scanExpr: 0, loud: [], loud89: [], loud10: [], loud1011: [], any89: false, regions: [], openLoops: [],
         saved: [], seen: [], stamp: 1, counting: false, scanStack: [], inlStack: [], inlEnd: [], inl: [], curFunc: -1,
         loops: 0, aTaken: [], emptyS: -1, callDest: NO_MEM, callFresh: false, simpF: -1, destUsed: false, byteDest: 0, posOf: [], posSeen: [],
         inlPos: -1, held: [], nLocalRegs: 0, bareRet: false, rm: newMap(), noCopy: -1, sites: [],
@@ -1049,7 +1050,8 @@ fn (g: mut &Gen) allocRegs(f: int) {
     g.pos = 0
     g.loud = [true]                     // position 0: the entry, where the arguments arrive
     g.loud89 = [false]
-    g.loud1011 = [true]                 // (the entry: no argument arrives in r10 or r11)
+    g.loud10 = [true]                   // (the entry: no argument arrives in r10 or r11)
+    g.loud1011 = [true]
     g.any89 = false
     g.fpLoud = [false]                  // ... in xmm0-xmm7 (the prologue moves doubles from there)
     g.sites = []
@@ -1110,8 +1112,9 @@ fn (g: mut &Gen) allocRegs(f: int) {
             append(mut &l89Before, l89Before[i] + (if g.loud[i] || g.loud89[i] { 1 } else { 0 }))
         }
     }
-    // ... and of the positions that may change r10 and r11 (loud89's do too: 128-bit code), made
-    // when a local first asks for one
+    // ... and of the positions that may change r10 (loud10: copyMem/fillEntries) or r11
+    // (loud1011), besides loud and loud89 (128-bit code); made when a local first asks for one
+    var l10Before: []int = []
     var l1011Before: []int = []
     // the data pointer and the length of a str that loops hoisted (they save two loads and one a
     // use): half the weight, and a sixteenth of the raw weight: a register of their own to save
@@ -1197,20 +1200,27 @@ fn (g: mut &Gen) allocRegs(f: int) {
         for i in 0..nSaved {
             if r < 0 && g.regFree(&given, LOCAL_REGS[i], l) { r = LOCAL_REGS[i] }
         }
-        // r10 or r11 where no position of the range changes them (clobbers1011): nothing to save;
-        // helps hot leaf functions as well as loops (capped list length keeps regFree fast).
+        // r10 where no position changes r10 (clobbers10: aggregates only), else r11 where no
+        // position changes r11 (clobbers1011): nothing to save; helps hot leaf functions and loops.
         if r < 0 && !g.inner[l] && g.rawW[l] >= 16 {
-            var q = -1
-            for x in SCRATCH_REGS {
-                if q < 0 && len(given[x]) < 64 && g.regFree(&given, x, l) { q = x }
-            }
-            if q >= 0 && len(l1011Before) == 0 {
-                append(mut &l1011Before, 0)
-                for i in 0..len(g.loud) {
-                    append(mut &l1011Before, l1011Before[i] + (if g.loud[i] || g.loud89[i] || g.loud1011[i] { 1 } else { 0 }))
+            if len(given[R10]) < 64 && g.regFree(&given, R10, l) {
+                if len(l10Before) == 0 {
+                    append(mut &l10Before, 0)
+                    for i in 0..len(g.loud) {
+                        append(mut &l10Before, l10Before[i] + (if g.loud[i] || g.loud89[i] || g.loud10[i] { 1 } else { 0 }))
+                    }
                 }
+                if g.quietLive(l, &l10Before) { r = R10 }
             }
-            if q >= 0 && g.quietLive(l, &l1011Before) { r = q }
+            if r < 0 && len(given[R11]) < 64 && g.regFree(&given, R11, l) {
+                if len(l1011Before) == 0 {
+                    append(mut &l1011Before, 0)
+                    for i in 0..len(g.loud) {
+                        append(mut &l1011Before, l1011Before[i] + (if g.loud[i] || g.loud89[i] || g.loud1011[i] { 1 } else { 0 }))
+                    }
+                }
+                if g.quietLive(l, &l1011Before) { r = R11 }
+            }
         }
         // a new one: for a value kept across a call even when named only twice (a slot's
         // store before the call and load after it cost more than the save and restore)
@@ -2138,6 +2148,7 @@ fn (g: mut &Gen) step() {
     g.pos += 1
     append(mut &g.loud, false)
     append(mut &g.loud89, false)
+    append(mut &g.loud10, false)
     append(mut &g.loud1011, false)
     append(mut &g.fpLoud, false)
     append(mut &g.tailEnd, -1)
@@ -2224,8 +2235,22 @@ fn (g: &Gen) loudNode(x: int): bool {
     return false
 }
 
-// Whether the code of x (a node at its position, not its operands) may change r10 or r11, which the
-// code generator uses as scratch registers: an aggregate copied or built (copyMem, initAt,
+// Whether the code of x (a node at its position, not its operands) may change r10: only aggregate
+// copies and literal fills (copyMem, fillEntries). Calls and 128-bit code are loud/loud89 already.
+fn (g: &Gen) clobbers10(x: int): bool {
+    let n = g.u.nodes[x]
+    let k = n.k
+    if k == ir.S_RETURN { return n.a >= 0 && g.isAggr(g.u.nodes[n.a].ty) }
+    if k == ir.S_DECL { return n.c >= 0 || (n.b >= 0 && g.isAggr(g.u.locals[n.a].ty)) }
+    if k >= ir.S_DECL { return false }
+    if k == ir.E_CLIT { return true }
+    if k == ir.E_CALL { return g.isAggr(n.ty) }
+    if k == ir.E_ASSIGN { return g.isAggr(n.ty) }
+    return false
+}
+
+// Whether the code of x (a node at its position, not its operands) may change r11, which the
+// code generator uses as a scratch register: an aggregate copied or built (copyMem, initAt,
 // fillEntries), a store through an address it computes or to a global (genAssign holds the address
 // in r11), a post-increment of a place in memory, a selection between constants (genConstSel), an
 // array filled by rep stos (rdi kept in r11), a return (an aggregate's copy). Calls and 128-bit
@@ -2497,9 +2522,9 @@ fn (g: mut &Gen) scan(x: int, depth: int) {
             g.posOf[x] = -1
         }
     }
-    if !g.counting && (k == ir.E_ASSIGN || k == ir.E_CLIT || k == ir.E_COND || k == ir.E_CALL || k == ir.E_POSTINC) &&
-        g.clobbers1011(x) {
-        g.loud1011[g.pos] = true
+    if !g.counting && (k == ir.E_ASSIGN || k == ir.E_CLIT || k == ir.E_COND || k == ir.E_CALL || k == ir.E_POSTINC) {
+        if g.clobbers10(x) { g.loud10[g.pos] = true }
+        if g.clobbers1011(x) { g.loud1011[g.pos] = true }
     }
     if !g.counting && x != g.noCopy && g.loudNode(x) {
         if g.loud89Node(x) {
@@ -2595,6 +2620,7 @@ fn (g: mut &Gen) scan(x: int, depth: int) {
         }
     } else if k == ir.S_EXPR || k == ir.S_RETURN {
         g.step()
+        if !g.counting && g.clobbers10(x) { g.loud10[g.pos] = true }
         if !g.counting && g.clobbers1011(x) { g.loud1011[g.pos] = true }
         g.scan(n.a, depth)
     } else if k == ir.S_SWITCH {
@@ -2667,6 +2693,7 @@ fn (g: mut &Gen) scan(x: int, depth: int) {
         }
     } else if k == ir.S_DECL {
         g.step()
+        if !g.counting && g.clobbers10(x) { g.loud10[g.pos] = true }
         if !g.counting && g.clobbers1011(x) { g.loud1011[g.pos] = true }
         let l = n.a
         g.occur(l)
@@ -2852,7 +2879,30 @@ fn (g: &Gen) sameMem(a: int, b: int): bool {
     if g.u.nodes[a].ty != g.u.nodes[b].ty { return false }
     let ma = g.staticMem(a)
     let mb = g.staticMem(b)
-    return ma.base != -9 && ma.base == mb.base && ma.index == mb.index && ma.disp == mb.disp
+    return ma.base != -9 && ma.base == mb.base && ma.index == mb.index && ma.scale == mb.scale && ma.disp == mb.disp
+}
+
+// Whether pure IR expressions a and b have identical structure (depth-bounded).
+fn (g: &Gen) sameIr(a: int, b: int, d: int): bool {
+    if a == b { return true }
+    if d >= 8 || a < 0 || b < 0 { return false }
+    let na = g.u.nodes[a]
+    let nb = g.u.nodes[b]
+    if na.k != nb.k || na.ty != nb.ty { return false }
+    let k = na.k
+    if k == ir.E_LOCAL || k == ir.E_GLOBAL { return na.a == nb.a }
+    if k == ir.E_INT { return na.v == nb.v }
+    if k == ir.E_MEMBER { return na.v == nb.v && g.sameIr(na.a, nb.a, d + 1) }
+    if k == ir.E_DEREF || k == ir.E_CAST { return g.sameIr(na.a, nb.a, d + 1) }
+    if k == ir.E_PADD { return na.v == nb.v && g.sameIr(na.a, nb.a, d + 1) && g.sameIr(na.b, nb.b, d + 1) }
+    if k == ir.E_CALL {
+        let ra = g.rtName(a)
+        if ra != "rt_idx" && ra != "rt_sidx" { return false }
+        if ra != g.rtName(b) || g.u.listLen(na.b) != 3 || g.u.listLen(nb.b) != 3 { return false }
+        return g.sameIr(g.u.listAt(na.b, 0), g.u.listAt(nb.b, 0), d + 1) &&
+            g.sameIr(g.u.listAt(na.b, 1), g.u.listAt(nb.b, 1), d + 1)
+    }
+    return false
 }
 
 // The xmm register of e if it is a double local in one, else -1.
@@ -4373,7 +4423,15 @@ fn (g: &Gen) staticMem(e: int): x64.Mem {
             if p.base != -9 { return at(p, n.v) }
         }
     }
-    if n.k == ir.E_DEREF && g.viaRegOk(n.ty) && g.regOf(n.a) >= 0 { return x64.mem(g.regOf(n.a), 0) }
+    if n.k == ir.E_DEREF && g.viaRegOk(n.ty) {
+        if g.regOf(n.a) >= 0 { return x64.mem(g.regOf(n.a), 0) }
+        if g.u.nk(n.a) == ir.E_PADD {
+            let pa = g.u.nodes[n.a]
+            if scaleOk(pa.v) && g.regOf(pa.a) >= 0 && g.regOf(pa.b) >= 0 {
+                return x64.memx(g.regOf(pa.a), g.regOf(pa.b), pa.v, 0)
+            }
+        }
+    }
     return x64.mem(-9, 0)
 }
 
@@ -4397,7 +4455,15 @@ fn (g: &Gen) viaReg128(x: int): x64.Mem {
 // of that: [r + disp]; else base -9.
 fn (g: &Gen) viaReg(x: int): x64.Mem {
     let n = g.u.nodes[x]
-    if n.k == ir.E_DEREF && g.regOf(n.a) >= 0 { return x64.mem(g.regOf(n.a), 0) }
+    if n.k == ir.E_DEREF {
+        if g.regOf(n.a) >= 0 { return x64.mem(g.regOf(n.a), 0) }
+        if g.u.nk(n.a) == ir.E_PADD {
+            let pa = g.u.nodes[n.a]
+            if scaleOk(pa.v) && g.regOf(pa.a) >= 0 && g.regOf(pa.b) >= 0 {
+                return x64.memx(g.regOf(pa.a), g.regOf(pa.b), pa.v, 0)
+            }
+        }
+    }
     if n.k == ir.E_MEMBER {
         let p = g.viaReg(n.a)
         if p.base != -9 { return at(p, n.v) }
@@ -5088,6 +5154,63 @@ fn (g: &Gen) flagCond(c: int): bool {
     return n.k == ir.E_BIN && isCmp(n.v) && !g.isF(n.c)
 }
 
+fn intCC(op: int, sgn: bool): int {
+    if op == ir.OP_EQ { return x64.CC_E }
+    if op == ir.OP_NE { return x64.CC_NE }
+    if op == ir.OP_LT { return if sgn { x64.CC_L } else { x64.CC_B } }
+    if op == ir.OP_LE { return if sgn { x64.CC_LE } else { x64.CC_BE } }
+    if op == ir.OP_GT { return if sgn { x64.CC_G } else { x64.CC_A } }
+    return if sgn { x64.CC_GE } else { x64.CC_AE }
+}
+
+fn swapCmp(op: int): int {
+    if op == ir.OP_LT { return ir.OP_GT }
+    if op == ir.OP_GT { return ir.OP_LT }
+    if op == ir.OP_LE { return ir.OP_GE }
+    if op == ir.OP_GE { return ir.OP_LE }
+    return op
+}
+
+// Whether e is a safe non-faulting value (constant or local) that genCmovSel can load eagerly.
+fn (g: &Gen) safeArm(e: int): bool {
+    let n = g.u.nodes[e]
+    if n.k == ir.E_INT || n.k == ir.E_LOCAL { return true }
+    if g.noopCast(e) { return g.safeArm(n.a) }
+    return false
+}
+
+// Whether e is `cmp ? a : b` where cmp is a pure integer compare and both arms are safe non-faulting
+// scalars of e's type: min/max without a branch.
+fn (g: &Gen) cmovSel(e: int): bool {
+    let n = g.u.nodes[e]
+    let t = n.ty
+    if n.k != ir.E_COND || g.isAggr(t) || g.isF(t) || g.is128(t) { return false }
+    if g.u.nodes[n.b].ty != t || g.u.nodes[n.c].ty != t { return false }
+    var cond = n.a
+    while g.u.nk(cond) == ir.E_CAST { cond = g.u.nodes[cond].a }
+    let cn = g.u.nodes[cond]
+    if cn.k != ir.E_BIN || !isCmp(cn.v) || g.isF(cn.c) || g.is128(cn.c) { return false }
+    if !g.pure(cn.a) || !g.pure(cn.b) { return false }
+    return g.safeArm(n.b) && g.safeArm(n.c)
+}
+
+fn (g: mut &Gen) genCmovSel(e: int) {
+    let n = g.u.nodes[e]
+    var cond = n.a
+    while g.u.nk(cond) == ir.E_CAST { cond = g.u.nodes[cond].a }
+    let cn = g.u.nodes[cond]
+    g.cmpPair(cn.a, cn.b)
+    let cc = intCC(cn.v, g.u.isSigned(cn.c))
+    g.genInto(n.c, RAX)
+    let rb = g.regOf(n.b)
+    if rb >= 0 {
+        g.a.cmov(cc, RAX, rb)
+    } else {
+        g.genInto(n.b, RCX)
+        g.a.cmov(cc, RAX, RCX)
+    }
+}
+
 // Generates e (constSel) into rax: the conditions as 0 or 1, then a mask or a cmov.
 fn (g: mut &Gen) genConstSel(e: int) {
     let n = g.u.nodes[e]
@@ -5117,6 +5240,42 @@ fn (g: mut &Gen) genConstSel(e: int) {
             }
         }
         return
+    }
+    // 3-way compare on the same operands (int.cmp: a < b ? -1 : a > b ? 1 : 0): one cmp, no stack.
+    let n2 = g.u.nodes[n.c]
+    if n2.k == ir.E_COND && g.u.nk(n2.c) == ir.E_INT {
+        var a1 = n.a
+        while g.u.nk(a1) == ir.E_CAST { a1 = g.u.nodes[a1].a }
+        var a2 = n2.a
+        while g.u.nk(a2) == ir.E_CAST { a2 = g.u.nodes[a2].a }
+        let c1 = g.u.nodes[a1]
+        let c2 = g.u.nodes[a2]
+        if c1.k == ir.E_BIN && c2.k == ir.E_BIN && isCmp(c1.v) && isCmp(c2.v) &&
+            !g.isF(c1.c) && !g.is128(c1.c) && c1.c == c2.c {
+            let same = g.sameIr(c1.a, c2.a, 0) && g.sameIr(c1.b, c2.b, 0)
+            let swap = !same && g.sameIr(c1.a, c2.b, 0) && g.sameIr(c1.b, c2.a, 0)
+            if same || swap {
+                let sgn = g.u.isSigned(c1.c)
+                let cc1 = intCC(c1.v, sgn)
+                let cc2 = intCC(if swap { swapCmp(c2.v) } else { c2.v }, sgn)
+                let k2 = g.intConst(n2.b, n.ty).v
+                let k3 = g.intConst(n2.c, n.ty).v
+                g.cmpPair(c1.a, c1.b)
+                if k3 == 0 && k2 == 1 {
+                    g.a.setcc(cc2, RAX)
+                    g.a.zx(1, RAX, RAX)
+                    g.a.movRI(RCX, k1)
+                    g.a.cmov(cc1, RAX, RCX)
+                } else {
+                    g.a.movRI(RAX, k3)
+                    g.a.movRI(RCX, k2)
+                    g.a.cmov(cc2, RAX, RCX)
+                    g.a.movRI(RCX, k1)
+                    g.a.cmov(cc1, RAX, RCX)
+                }
+                return
+            }
+        }
     }
     g.genConstSel(n.c)
     let t = g.temp(8, 8)
@@ -5857,6 +6016,8 @@ fn (g: mut &Gen) gen(e: int) {
         g.a.bind(end)
     } else if k == ir.E_COND && g.constSel(e, 0) {
         g.genConstSel(e)
+    } else if k == ir.E_COND && g.cmovSel(e) {
+        g.genCmovSel(e)
     } else if k == ir.E_COND {
         let elseL = g.a.newLabel()
         let end = g.a.newLabel()
@@ -6119,7 +6280,10 @@ fn (g: mut &Gen) genAssign(e: int) {
     }
     var m = g.staticMem(lhs)
     // through a pointer local in a register the value might assign (it is generated first)
-    if m.base != -9 && m.base != RBP && g.writesReg(n.b, m.base) { m = x64.mem(-9, 0) }
+    if m.base != -9 && ((m.base != RBP && g.writesReg(n.b, m.base)) || (m.index >= 0 && g.writesReg(n.b, m.index))) {
+        m = x64.mem(-9, 0)
+    }
+    if unused && g.memInPlace(lhs, n.b, t, m) { return }
     if m.base != -9 && g.isAggr(t) && g.u.nk(lhs) == ir.E_LOCAL && g.u.nk(n.b) == ir.E_CALL && g.u.nodes[n.b].ty == t {
         // a result in registers stored in the local after the call (whole words: its slot is
         // rounded up to them); one in memory written there by the callee when the local's
@@ -6140,12 +6304,24 @@ fn (g: mut &Gen) genAssign(e: int) {
         }
     }
     if m.base != -9 && g.tk(t) == ir.TY_F64 && g.u.nodes[n.b].ty == t {
+        let fr = g.fregOf(n.b)
+        if fr >= 0 {
+            g.a.movsdStore(m, fr)
+            if !unused { g.a.sse66(MOVAPD, 0, fr) }
+            return
+        }
         let r = g.fIntoTemp(n.b, pd)
         if r >= 0 {
             g.a.movsdStore(m, r)
             if !unused { g.a.sse66(MOVAPD, 0, r) }
             return
         }
+    }
+    if m.base != -9 && !g.isAggr(t) && !g.isF(t) && !g.is128(t) && g.regOf(n.b) >= 0 && g.u.nodes[n.b].ty == t {
+        let r = g.regOf(n.b)
+        g.a.store(g.size(t), m, r)
+        if !unused { g.a.movRR(8, RAX, r) }
+        return
     }
     if m.base != -9 {
         g.gen(n.b)
@@ -6256,6 +6432,81 @@ fn (g: mut &Gen) genAssign(e: int) {
     }
     g.storeT(t, x64.mem(R11, 0))
     if g.isAggr(t) { g.a.movRR(8, RAX, R11) }
+}
+
+// `place = place op rhs` (checked or wrapping i64 +/-, or 8-byte int +/-/&/|/^) with value unused:
+// computes the place address once and updates memory in place (no duplicate address or hold spill).
+fn (g: mut &Gen) memInPlace(lhs: int, rhs: int, t: int, m: x64.Mem): bool {
+    if g.size(t) != 8 || g.isF(t) || g.isAggr(t) || g.is128(t) || g.u.nodes[rhs].ty != t { return false }
+    let lk = g.u.nk(lhs)
+    if m.base == -9 && lk != ir.E_DEREF && lk != ir.E_MEMBER { return false }
+    if !g.pure(lhs) { return false }
+    var xop = -1
+    var wrap = true
+    var whereNode = -1
+    var other = -1
+    let rn = g.u.nodes[rhs]
+    if rn.k == ir.E_CALL {
+        let ar = arOp(&(g.rtName(rhs)))
+        if ar.k != ir.TY_I64 || (ar.op != ir.OP_ADD && ar.op != ir.OP_SUB) || g.tk(t) != ir.TY_I64 { return false }
+        let nargs = g.u.listLen(rn.b)
+        if nargs < 2 || (!ar.wrap && (nargs != 3 || !g.isWhere(g.u.listAt(rn.b, 2)))) { return false }
+        let a0 = g.u.listAt(rn.b, 0)
+        let a1 = g.u.listAt(rn.b, 1)
+        if g.sameIr(lhs, a0, 0) {
+            other = a1
+        } else if ar.op == ir.OP_ADD && g.safeArm(a0) && g.sameIr(lhs, a1, 0) {
+            other = a0
+        } else {
+            return false
+        }
+        xop = if ar.op == ir.OP_ADD { x64.ADD } else { x64.SUB }
+        wrap = ar.wrap
+        if !wrap { whereNode = g.u.listAt(rn.b, 2) }
+    } else if rn.k == ir.E_BIN && rn.c == t {
+        let op = rn.v
+        if op == ir.OP_ADD {
+            xop = x64.ADD
+        } else if op == ir.OP_SUB {
+            xop = x64.SUB
+        } else if op == ir.OP_AND {
+            xop = x64.AND
+        } else if op == ir.OP_OR {
+            xop = x64.OR
+        } else if op == ir.OP_XOR {
+            xop = x64.XOR
+        } else {
+            return false
+        }
+        if g.sameIr(lhs, rn.a, 0) {
+            other = rn.b
+        } else if op != ir.OP_SUB && g.safeArm(rn.a) && g.sameIr(lhs, rn.b, 0) {
+            other = rn.a
+        } else {
+            return false
+        }
+    } else {
+        return false
+    }
+    if !g.simple(other) {
+        if m.base == -9 || !g.pure(other) { return false }
+        g.gen(other)
+        g.a.aluMR(xop, 8, m, RAX)
+        if !wrap { g.a.jcc(x64.CC_O, g.stub(10, "integer overflow", whereNode)) }
+        return true
+    }
+    let pm = if m.base != -9 { m } else { g.place(lhs) }
+    let cv = g.intConst(other, t)
+    if cv.c == 0 && x64.fits32(cv.v) {
+        g.a.aluMI(xop, 8, pm, cv.v)
+    } else if g.regOf(other) >= 0 {
+        g.a.aluMR(xop, 8, pm, g.regOf(other))
+    } else {
+        g.genInto(other, RDX)
+        g.a.aluMR(xop, 8, pm, RDX)
+    }
+    if !wrap { g.a.jcc(x64.CC_O, g.stub(10, "integer overflow", whereNode)) }
+    return true
 }
 
 fn (g: mut &Gen) callRt(name: &str) { g.a.callSym(g.symRt(name)) }
