@@ -141,12 +141,12 @@ On durable transactional writes, LexDB's lock-free `io_uring` event loop with gr
 
 ### 2. OLAP analytics and bulk loads
 
-With **no materialized views and no explicit skipping indexes**, LexDB's vectorized columnar engine — using pure `par.map` worker threads across the 4-core budget for large dense scans and aggregations while keeping small tables and wide low-density scans zero-overhead single-threaded — beats single-core and 4-process PostgreSQL across every analytical suite and bulk load:
+With **no materialized views and no explicit skipping indexes**, LexDB's vectorized columnar engine — using pure `par.map` worker threads across the 4-core budget for large scans, hash-join probes, and aggregations while keeping small tables and low-compute scans zero-overhead single-threaded — beats single-core and 4-process PostgreSQL across every analytical suite and bulk load:
 
 | OLAP & load workload | LexDB | PostgreSQL 18 | Takeaway |
 |---|---:|---:|---|
-| **TPC-H SF1** (22 queries, up to 4 cores via `par.map`) | **4.18 s** | 14.67 s (1 core) / 8.84 s (4 proc) | **3.51× faster** than 1-core PG (faster on all 22/22); **2.11× faster** than 4-process PG overall (`0.57×` geomean, 15/22 faster; `q1` **273 ms** — **3.20×** PG4) |
-| **ClickBench 1M** (43 queries, 105 cols, 1 core) | **6.75 s** | 22.08 s (1 core) / 11.40 s (4 proc) | **3.27× faster** than 1-core PG (**43/43** level or ahead; 0.31× geomean wall / 0.29× CPU); **1.69× faster than 4-process PG on 1 core** (no MVs) |
+| **TPC-H SF1** (22 queries, up to 4 cores via `par.map`) | **4.19 s** | 14.67 s (1 core) / 8.84 s (4 proc) | **3.50× faster** than 1-core PG (faster on all 22/22); **2.11× faster** than 4-process PG overall (`0.58×` geomean, 16/22 faster; `q1` **282 ms** — **3.10×** PG4, `q18` **105 ms** — **27.9×** PG4) |
+| **ClickBench 1M** (43 queries, 105 cols, up to 4 cores via `par.map`) | **5.12 s** | 22.08 s (1 core) / 11.40 s (4 proc) | **4.31× faster** than 1-core PG (**43/43** faster; `0.25×` geomean wall / `0.31×` CPU); **2.23× faster** than 4-process PG (**41/43** faster, `0.54×` geomean, no MVs) |
 | **35 Analytic Queries** (1M rows, 1 core) | **0.39× CPU / 0.78× wall** | 1 core / 4 proc | **2.59× less CPU** than 1-core PG (**35/35** ahead on wall & CPU); **1.28× faster** wall time than 4-process PG |
 | **Selective star-schema joins** (1M fact rows, 6 patterns, 1 core) | **0.54–22.5 ms** | 0.21–77.0 ms (1 core) / 0.24–50.7 ms (4 proc) | **1.24–71.7× faster** via hash-join runtime filters; **7.68×** vs PG1 / **4.46×** vs PG4 (geomean) |
 | **Bulk `\copy` loads** (5 cases, 1M–10M rows) | **0.26–2.61 s** | 0.61–5.93 s | **1.25–2.6× faster** on every workload (`224–2,103 MB` peak RSS) |
@@ -182,7 +182,7 @@ It also supports **cascading multi-level rollup DAGs** and **composable HyperLog
 
 | Benchmark (1M rows, single core) | Without MVs | With MVs (unmodified queries) | Live write cost |
 |---|---:|---:|---|
-| **ClickBench 1M** (43 queries, +8 general MVs) | 6.75 s | 21 of 43 queries transparently rewritten to **0.47–54.9 ms** (geomean `0.10×` PG1 / `0.21×` PG4 at `59797d55`) | 1 / 100 new rows updating all 8 MVs live: **6.51 / 10.34 ms** |
+| **ClickBench 1M** (43 queries, +8 general MVs) | 5.12 s | 21 of 43 queries transparently rewritten to **0.47–54.9 ms** (geomean `0.10×` PG1 / `0.21×` PG4 at `59797d55`) | 1 / 100 new rows updating all 8 MVs live: **6.51 / 10.34 ms** |
 | **35 Analytic Queries** (+4 general MVs) | geomean `0.48×` PG1 / `0.78×` PG4 | 9 aggregate & join queries drop from 8–74 ms to **3–4 ms** (geomean **`0.31×` PG1 / `0.49×` PG4**) | 1 / 100 / 1,000 new rows updating all 4 MVs live: **4.40 / 7.09 / 25.90 ms** vs PG `REFRESH` **758 / 264 ms** |
 | **Grouped / Sketch / 3-level DAG** | 23.7 ms grouped / 234.4 ms sketch | **0.18 ms** (132×) / **0.56 ms** (419×) / **0.07 ms** | 1-row `FAST` update: **0.43–0.66 ms** vs PG `REFRESH` **60–369 ms** (**90–780× faster**) |
 
