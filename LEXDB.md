@@ -134,9 +134,9 @@ On durable transactional writes, LexDB's lock-free `io_uring` event loop with gr
 | OLTP workload (1M rows) | LexDB | PostgreSQL 18 | Takeaway |
 |---|---:|---:|---|
 | **Durable updates** (`pgbench`, 1–32 clients) | **3.9k / 17.8k / 63.3k/s** | 1.6k / 6.7k / 25.7k/s | **2.41–2.67× faster**; commit latency **0.42 ms** median / **0.86–0.89 ms** p99 |
-| **Durable updates** (`sysbench`, non-indexed / indexed, 32t) | **56.1k/s** / **27.1k/s** | 23.0k/s / 21.0k/s | **2.44–3.10× faster** non-indexed; **1.29–2.52× faster** indexed |
-| **Point selects** (1 client, `pgbench` / `sysbench`) | **90.4k/s** / **70.7k/s** | 74.5k/s / 65.1k/s | **1.21×** (`pgbench`) / **1.09×** (`sysbench`) faster |
-| **Point selects — 3 read replicas** (32 clients, 4 cores) | **470–490k/s** (`pgbench`) / **374.4k/s** (`sysbench`) | 397k/s / 334.1k/s (4 cores) | **1.18–1.23×** (`pgbench`); **1.12×** (`sysbench`, 33% less CPU; `oltp_read_only` **1.07×** PG) |
+| **Durable updates** (`sysbench`, non-indexed / indexed, 32t) | **58.4k/s** / **34.2k/s** | 23.0k/s / 21.0k/s | **2.54–3.12× faster** non-indexed; **1.63–2.85× faster** indexed |
+| **Point selects** (1 client, `pgbench` / `sysbench`) | **90.4k/s** / **76.2k/s** | 74.5k/s / 65.1k/s | **1.21×** (`pgbench`) / **1.17×** (`sysbench`) faster (`0.01 ms` p95) |
+| **Point selects — 3 read replicas** (32 clients, 4 cores) | **470–490k/s** (`pgbench`) / **427.1k/s** (`sysbench`) | 397k/s / 334.1k/s (4 cores) | **1.18–1.23×** (`pgbench`); **1.28×** (`sysbench`, 42% less CPU; `oltp_read_only` **1.12×** PG) |
 | **Mixed load** (replica selects + master writes, 4 cores) | **368–403k/s** reads + **15.5–16.1k/s** writes | — | Replica lag stays at **0.22–0.23 ms** median, **0.41–0.44 ms** p99 |
 
 ### 2. OLAP analytics and bulk loads
@@ -145,8 +145,8 @@ With **no materialized views and no explicit skipping indexes**, LexDB's single-
 
 | OLAP & load workload | LexDB (1 core) | PostgreSQL 18 | Takeaway |
 |---|---:|---:|---|
-| **TPC-H SF1** (22 queries) | **6.09 s** | 14.67 s (1 core) / 8.84 s (4 proc) | **2.41× faster** than 1-core PG (faster on all 22/22); **1.45× faster** than 4-process PG overall |
-| **ClickBench 1M** (43 queries, 105 cols) | **8.14 s** | 22.36 s (1 core) / 11.33 s (4 proc) | **2.75× faster** than 1-core PG (**43/43** level or ahead; 0.38× CPU); **1.39× faster than 4-process PG on 1 core** (no MVs) |
+| **TPC-H SF1** (22 queries) | **5.90 s** | 14.67 s (1 core) / 8.84 s (4 proc) | **2.49× faster** than 1-core PG (faster on 21/22, `q1` **811 ms** beating 4-proc PG); **1.50× faster** than 4-process PG overall |
+| **ClickBench 1M** (43 queries, 105 cols) | **6.99 s** | 22.08 s (1 core) / 11.40 s (4 proc) | **3.16× faster** than 1-core PG (**43/43** level or ahead; 0.33× geomean wall & CPU); **1.63× faster than 4-process PG on 1 core** (no MVs) |
 | **35 Analytic Queries** (1M rows) | **0.39× CPU / 0.78× wall** | 1 core / 4 proc | **2.59× less CPU** than 1-core PG (**35/35** ahead on wall & CPU); **1.28× faster** wall time than 4-process PG |
 | **Selective star-schema joins** (1M fact rows, 6 patterns) | **0.54–22.5 ms** | 0.21–77.0 ms (1 core) / 0.24–50.7 ms (4 proc) | **1.24–71.7× faster** via hash-join runtime filters; **7.68×** vs PG1 / **4.46×** vs PG4 (geomean) |
 | **Bulk `\copy` loads** (5 cases, 1M–10M rows) | **0.24–2.44 s** | 0.61–5.93 s | **1.1–2.7× faster** on every workload (including wide tables + secondary indexes) |
@@ -157,11 +157,11 @@ Measured single-core / single-thread with 100% exact result parity across relati
 
 | Graph benchmark (1 core / 1 thread) | LexDB | PostgreSQL 18 | DuckDB 2.0 + DuckPGQ | Kùzu 0.11 | Neo4j 5.26 CE |
 |---|---:|---:|---:|---:|---:|
-| **Social-graph suite** (11 queries, 100k vertices / 1.1M edges, incl. `ANY SHORTEST`) | **0.51 s** | 5.66 s | 0.96 s | 1.37 s | — |
-| **LDBC LSQB SF0.1** (9 queries, 432k vertices / 2.1M edges) | **0.49 s** | 3.93 s *(8/9, Q9 timeout)* | **0.24 s** *(+PK/FK)* | 3.95 s | 7.60 s |
-| **LDBC LSQB SF1** (9 queries, 4.0M vertices / 22.2M edges) | **8.14 s** | 98.1 s *(8/9, Q9 timeout)* | **4.56 s** *(+PK/FK)* | 105.0 s | 156.0 s |
+| **Social-graph suite** (11 queries, 100k vertices / 1.1M edges, incl. `ANY SHORTEST`) | **0.50 s** | 5.66 s | 0.96 s | 1.37 s | — |
+| **LDBC LSQB SF0.1** (9 queries, 432k vertices / 2.1M edges) | **0.45 s** | 3.93 s *(8/9, Q9 timeout)* | **0.24 s** *(+PK/FK)* | 3.95 s | 7.60 s |
+| **LDBC LSQB SF1** (9 queries, 4.0M vertices / 22.2M edges) | **7.30 s** | 98.1 s *(8/9, Q9 timeout)* | **4.56 s** *(+PK/FK)* | 105.0 s | 156.0 s |
 
-On the **11-query social-graph suite** (local traversals, triangles, and shortest paths), LexDB is the **fastest of all four engines** (`0.51 s` total — **1.90× faster than DuckPGQ**, **2.71× faster than Kùzu**, **11.2× faster than PG1**; `0.45 ms` warm / `0.71 ms` cold 5-hop shortest path, `227 ms` 1M-edge triangles; geomean **7.74×** vs PG1, **3.03×** vs DuckPGQ, **5.81×** vs Kùzu). On **LDBC LSQB** (pure full-graph analytical pattern counting), in-memory DuckDB 2.0 + DuckPGQ (with matching `PRIMARY KEY` / `FOREIGN KEY` constraints) leads overall, while LexDB is **#2 overall and #1 among disk-backed transactional & graph databases** (`8.14 s` at SF1 — within **1.67×** geomean of in-memory DuckPGQ), beating PostgreSQL 18 (**9.02×** geomean on completed queries), Kùzu (**4.17×** geomean, **12.9×** total), and Neo4j Community (**16.5×** geomean, **19.2×** total), and beating DuckPGQ by **5.51×** on 1.67B-match SF1 `Q6` (`103.2 ms` vs `568.6 ms`). See **[Property graphs in LexDB](lexell/docs/lexdb/property-graphs.md)** for full query-by-query tables and methodology.
+On the **11-query social-graph suite** (local traversals, triangles, and shortest paths), LexDB is the **fastest of all four engines** (`0.50 s` total — **1.92× faster than DuckPGQ**, **2.73× faster than Kùzu**, **11.3× faster than PG1**; `0.45 ms` warm / `0.71 ms` cold 5-hop shortest path, `227 ms` 1M-edge triangles; geomean **7.82×** vs PG1, **3.06×** vs DuckPGQ, **5.86×** vs Kùzu). On **LDBC LSQB** (pure full-graph analytical pattern counting), in-memory DuckDB 2.0 + DuckPGQ (with matching `PRIMARY KEY` / `FOREIGN KEY` constraints) leads overall, while LexDB is **#2 overall and #1 among disk-backed transactional & graph databases** (`7.30 s` at SF1 — within **1.58×** geomean of in-memory DuckPGQ), beating PostgreSQL 18 (**9.03×** geomean on completed queries), Kùzu (**4.40×** geomean, **14.4×** total), and Neo4j Community (**17.4×** geomean, **21.4×** total), and ranking **#1 fastest of all five engines** on both billion-match queries at SF1 (`Q6` `97.8 ms` — **5.81× faster than DuckPGQ**; `Q9` `1,396.9 ms` vs DuckPGQ's `1,408.5 ms`) as well as SF0.1 `Q6` (`10.1 ms` — **1.95× faster than DuckPGQ**). See **[Property graphs in LexDB](lexell/docs/lexdb/property-graphs.md)** for full query-by-query tables and methodology.
 
 **Where PostgreSQL is ahead today:** Multi-threaded reads against a single LexDB process (before adding replicas), multi-statement read-write transaction blocks under high concurrency, and individual heavy queries that benefit from PostgreSQL's 4-worker parallel query execution (LexDB runs each single statement on one core).
 
@@ -182,7 +182,7 @@ It also supports **cascading multi-level rollup DAGs** and **composable HyperLog
 
 | Benchmark (1M rows, single core) | Without MVs | With MVs (unmodified queries) | Live write cost |
 |---|---:|---:|---|
-| **ClickBench 1M** (43 queries, +8 general MVs) | 8.14 s | 21 of 43 queries transparently rewritten to **0.47–54.9 ms** (geomean `0.10×` PG1 / `0.21×` PG4 at `59797d55`) | 1 / 100 new rows updating all 8 MVs live: **6.51 / 10.34 ms** |
+| **ClickBench 1M** (43 queries, +8 general MVs) | 6.99 s | 21 of 43 queries transparently rewritten to **0.47–54.9 ms** (geomean `0.10×` PG1 / `0.21×` PG4 at `59797d55`) | 1 / 100 new rows updating all 8 MVs live: **6.51 / 10.34 ms** |
 | **35 Analytic Queries** (+4 general MVs) | geomean `0.48×` PG1 / `0.78×` PG4 | 9 aggregate & join queries drop from 8–74 ms to **3–4 ms** (geomean **`0.31×` PG1 / `0.49×` PG4**) | 1 / 100 / 1,000 new rows updating all 4 MVs live: **4.40 / 7.09 / 25.90 ms** vs PG `REFRESH` **758 / 264 ms** |
 | **Grouped / Sketch / 3-level DAG** | 23.7 ms grouped / 234.4 ms sketch | **0.18 ms** (132×) / **0.56 ms** (419×) / **0.07 ms** | 1-row `FAST` update: **0.43–0.66 ms** vs PG `REFRESH` **60–369 ms** (**90–780× faster**) |
 
