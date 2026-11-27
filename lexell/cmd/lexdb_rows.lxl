@@ -1142,12 +1142,19 @@ pub fn reuse(spare: mut &Batch, bp: &Projection): Batch {
         for i in 0..len(bp.kinds) {
             let want = if bp.needCol[i] && bp.kinds[i] == BK_VAL { BROWS } else { 0 }
             if len(b.vals[i]) != want { fits = false }
+            let wantC = if bp.needCol[i] { BROWS } else { 0 }
+            if len(b.cols[i].v) != wantC || len(b.cols[i].nul) != wantC { fits = false }
         }
     }
     if !fits { return newBatch(bp, BROWS) }
+    let oldN = b.n
+    let clearN = min(BROWS, oldN + 1)
     b.n = 0
     for i in 0..len(bp.kinds) {
-        if bp.needCol[i] { b.cols[i] = bvec(BROWS) }
+        if bp.needCol[i] {
+            let col = mut &b.cols[i]
+            for q in 0..clearN { col.nul[q] = false }
+        }
         b.txt[i].clear()                // (its buffer kept)
     }
     return b
@@ -2166,6 +2173,9 @@ pub fn parseLeafCols(s: &str, n: int, needPl: &[]bool, maxPl: int): Option[[]int
 }
 pub fn colPlaces(dir: &[]int): int { return lexdb_cols.places(dir) }
 pub fn colKindOf(s: &str, p: int): byte { return lexdb_cols.kindOf(s, p) }
+pub fn colIntsInto(s: &str, dir: &[]int, pl: int, from: int, n: int, dst: mut &[]int, at: int) { lexdb_cols.intsInto(s, dir, pl, from, n, dst, at) }
+pub fn colHasNulls(dir: &[]int, pl: int): bool { return lexdb_cols.hasNulls(dir, pl) }
+pub fn colIsNull(s: &str, dir: &[]int, pl: int, i: int): bool { return lexdb_cols.isNull(s, dir, pl, i) }
 
 pub fn colsIntoPure(s: &str, dir: &[]int, from: int, qs: &[]int, all: bool, r0: int, ps: &[]int, b: mut &Batch, bp: &Projection): Result[bool, DbErr] {
     return colsPickPure(s, dir, from, qs, qs, all, r0, ps, b, bp)
@@ -2344,19 +2354,64 @@ pub fn colsPickPure(s: &str, dir: &[]int, from: int, qs: &[]int, rs: &[]int, all
 // a simple LIKE (or NOT LIKE when neg) of pieces ps holds for; a dictionary's
 // entries matched once. NULLs are never kept (SQL 3VL: NOT (NULL LIKE p) is NULL).
 pub fn likeInLeafCols(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, pl: int, ps: &[]str, neg: bool): []int {
+    let nr = len(rs)
+    if nr == 0 { return [] }
+    // Longest non-empty literal piece (likeSimple guarantees no '_' wildcards):
+    // a single SIMD strFind (memmem) over the leaf's contiguous text bytes skips ~99.9% of non-matching leaves.
+    var bestIdx = -1
+    var bestLen = 0
+    for pi in 0..len(ps) {
+        if len(ps[pi]) > bestLen {
+            bestLen = len(ps[pi])
+            bestIdx = pi
+        }
+    }
+    let pureSub = len(ps) == 3 && len(ps[0]) == 0 && len(ps[2]) == 0 && bestLen > 0
     var out: []int = []
     if lexdb_cols.codecOf(dir, pl) == lexdb_cols.C_DICT {
         let nd = lexdb_cols.dictSize(dir, pl)
+        let nulls = lexdb_cols.hasNulls(dir, pl)
+        if nd > 0 && bestIdx >= 0 {
+            let sp0 = lexdb_cols.entryAt(s, dir, pl, 0)
+            let spLast = lexdb_cols.entryAt(s, dir, pl, nd - 1)
+            let bufStart = lexdb_cols.spanStart(sp0)
+            let bufEnd = lexdb_cols.spanEnd(spLast)
+            let hitPos = if bufEnd - bufStart >= bestLen { strFind(&s[bufStart..bufEnd], 0, &ps[bestIdx]) } else { -1 }
+            if hitPos < 0 {
+                if !neg { return out }
+                if !nulls {
+                    out = withCapacity(nr)
+                    for r in rs { append(mut &out, r) }
+                    return out
+                }
+                for r in rs {
+                    let i = from + r - r0
+                    if !lexdb_cols.isNull(s, dir, pl, i) { append(mut &out, r) }
+                }
+                return out
+            }
+        }
         var hit: []bool = array(nd, false)
-        for j in 0..nd {
-            let sp = lexdb_cols.entryAt(s, dir, pl, j)
-            let a = lexdb_cols.spanStart(sp)
-            let e = lexdb_cols.spanEnd(sp)
-            hit[j] = lexdb_like.likeRange(&s[a..e], 0, e - a, ps) != neg
+        if pureSub {
+            let needle = &ps[1]
+            for j in 0..nd {
+                let sp = lexdb_cols.entryAt(s, dir, pl, j)
+                let a = lexdb_cols.spanStart(sp)
+                let e = lexdb_cols.spanEnd(sp)
+                let f = if e - a >= bestLen { strFind(&s[a..e], 0, needle) } else { -1 }
+                hit[j] = (f >= 0) != neg
+            }
+        } else {
+            for j in 0..nd {
+                let sp = lexdb_cols.entryAt(s, dir, pl, j)
+                let a = lexdb_cols.spanStart(sp)
+                let e = lexdb_cols.spanEnd(sp)
+                hit[j] = lexdb_like.likeRange(&s[a..e], 0, e - a, ps) != neg
+            }
         }
         for r in rs {
             let i = from + r - r0
-            if lexdb_cols.isNull(s, dir, pl, i) { continue }
+            if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
             if hit[lexdb_cols.codeAt(s, dir, pl, i)] { append(mut &out, r) }
         }
         return out
@@ -2364,6 +2419,52 @@ pub fn likeInLeafCols(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, pl: 
     let nulls = lexdb_cols.hasNulls(dir, pl)
     let ends = lexdb_cols.endsAt(dir, pl)
     let data = lexdb_cols.bytesAt(dir, pl)
+    var firstHit = -1
+    var sliceEnd = 0
+    if bestIdx >= 0 {
+        let i0 = from + rs[0] - r0
+        let i1 = from + rs[nr - 1] - r0
+        if i0 <= i1 {
+            let loOff = if i0 == 0 { data } else { data + (int(s[ends + 2 * i0 - 2]) | (int(s[ends + 2 * i0 - 1]) << 8)) }
+            let hiOff = data + (int(s[ends + 2 * i1]) | (int(s[ends + 2 * i1 + 1]) << 8))
+            let hitRel = if hiOff - loOff >= bestLen { strFind(&s[loOff..hiOff], 0, &ps[bestIdx]) } else { -1 }
+            if hitRel < 0 {
+                if !neg { return out }
+                if !nulls {
+                    out = withCapacity(nr)
+                    for r in rs { append(mut &out, r) }
+                    return out
+                }
+                for r in rs {
+                    let i = from + r - r0
+                    if !lexdb_cols.isNull(s, dir, pl, i) { append(mut &out, r) }
+                }
+                return out
+            }
+            firstHit = loOff + hitRel
+            sliceEnd = hiOff
+        }
+    }
+    if pureSub && firstHit >= 0 {
+        let needle = &ps[1]
+        var curHit = firstHit
+        for r in rs {
+            let i = from + r - r0
+            if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
+            let a = if i == 0 { data } else { data + (int(s[ends + 2 * i - 2]) | (int(s[ends + 2 * i - 1]) << 8)) }
+            let e = data + (int(s[ends + 2 * i]) | (int(s[ends + 2 * i + 1]) << 8))
+            var matched = false
+            if e - a >= bestLen {
+                if curHit >= 0 && curHit < a {
+                    let rel = if sliceEnd - a >= bestLen { strFind(&s[a..sliceEnd], 0, needle) } else { -1 }
+                    curHit = if rel >= 0 { a + rel } else { -1 }
+                }
+                if curHit >= a && curHit + bestLen <= e { matched = true }
+            }
+            if matched != neg { append(mut &out, r) }
+        }
+        return out
+    }
     for r in rs {
         let i = from + r - r0
         if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
@@ -2376,6 +2477,33 @@ pub fn likeInLeafCols(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, pl: 
 
 pub fn likeInLeaf(leaf: &LeafView, from: int, rs: &[]int, r0: int, pl: int, ps: &[]str, neg: bool): []int {
     return likeInLeafCols(leaf.cols, leaf.dir, from, rs, r0, pl, ps, neg)
+}
+
+// Zero-allocation whole-leaf positive-LIKE rejection check for cRunLazy.
+// Returns true if NO row in [from..to) can possibly match positive LIKE pieces ps.
+pub fn likeLeafEmpty(leaf: &LeafView, from: int, to: int, pl: int, ps: &[]str): bool {
+    if to <= from { return true }
+    let s = leaf.cols
+    let dir = leaf.dir
+    var bestIdx = -1
+    var bestLen = 0
+    for pi in 0..len(ps) {
+        if len(ps[pi]) > bestLen { bestLen = len(ps[pi]); bestIdx = pi }
+    }
+    if bestIdx < 0 { return false }
+    if lexdb_cols.codecOf(dir, pl) == lexdb_cols.C_DICT {
+        let nd = lexdb_cols.dictSize(dir, pl)
+        if nd <= 0 { return true }
+        let bufStart = lexdb_cols.spanStart(lexdb_cols.entryAt(s, dir, pl, 0))
+        let bufEnd = lexdb_cols.spanEnd(lexdb_cols.entryAt(s, dir, pl, nd - 1))
+        return bufEnd - bufStart < bestLen || strFind(&s[bufStart..bufEnd], 0, &ps[bestIdx]) < 0
+    }
+    let ends = lexdb_cols.endsAt(dir, pl)
+    let data = lexdb_cols.bytesAt(dir, pl)
+    let i1 = to - 1
+    let loOff = if from == 0 { data } else { data + (int(s[ends + 2 * from - 2]) | (int(s[ends + 2 * from - 1]) << 8)) }
+    let hiOff = data + (int(s[ends + 2 * i1]) | (int(s[ends + 2 * i1 + 1]) << 8))
+    return hiOff - loOff < bestLen || strFind(&s[loOff..hiOff], 0, &ps[bestIdx]) < 0
 }
 
 // Column leaves batch scans skipped (excluded), for the tests.

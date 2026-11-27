@@ -11949,6 +11949,200 @@ fn groupKeys(s: &lexdb_sql.Stmt, q: &Query, outs: &[]OutCol, exprs: &[]Expr, sc:
     return Ok(Unit{})
 }
 
+// Flattens a simple single-FROM derived table under an aggregating outer SELECT
+// (e.g. TPC-H q8 / q9: SELECT ... FROM (SELECT ... FROM t1, t2 ... WHERE ...) AS sub GROUP BY ...).
+// Eliminates materializing hundreds of thousands of boxed [][]Val rows and enables
+// fixed-point decimal aggregation and parallel join-agg directly over the base tables.
+fn flatSafeExpr(x: &Expr): bool {
+    match x {
+        Expr.Call(n, args, _) {
+            if lexdb_sql.isSubCall(&n) || lexdb_bind.isAgg(&n) || n == "#win" || n == "#udf" || n == "#plf" ||
+               !lexdb_bind.immutableName(&n) || n == "generate_series" || n == "unnest" { return false }
+            for a in args { if !flatSafeExpr(&a) { return false } }
+            return true
+        }
+        Expr.Unary(_, a) { return flatSafeExpr(&a) }
+        Expr.Bin(_, a, b) { return flatSafeExpr(&a) && flatSafeExpr(&b) }
+        Expr.IsNull(a, _) { return flatSafeExpr(&a) }
+        Expr.Cast(a, _) { return flatSafeExpr(&a) }
+        else { return true }
+    }
+}
+
+fn flatItemName(it: &lexdb_sql.SelItem, colOverride: &str): str {
+    if len(colOverride) > 0 { return colOverride.toStr() }
+    if len(it.alias) > 0 { return it.alias.clone() }
+    match &it.expr {
+        Some(e) {
+            match e {
+                Expr.Col(nm, _) {
+                    let dot = strFind(nm, 0, ".")
+                    return if dot >= 0 { nm[dot + 1..len(nm)].toStr() } else { nm.clone() }
+                }
+                else { return "" }
+            }
+        }
+        None { return "" }
+    }
+}
+
+fn flatSubExpr(x: &Expr, aliasLo: &str, colMap: &Map[str, Expr], outerAliases: &Map[str, int],
+               allowOuterAlias: bool, ok: mut &bool): Expr {
+    match x {
+        Expr.Col(nm, _) {
+            var key = strings.toLowerAscii(nm)
+            let dot = strFind(&key, 0, ".")
+            if dot >= 0 {
+                let q = &key[0..dot]
+                if q != aliasLo {
+                    ok = false
+                    return lexdb_sql.cloneExpr(x)
+                }
+                key = key[dot + 1..len(key)].toStr()
+            }
+            match colMap.get(&key) {
+                Some(rep) { return lexdb_sql.cloneExpr(&rep) }
+                None {
+                    if allowOuterAlias && dot < 0 && outerAliases.has(&key) {
+                        return lexdb_sql.cloneExpr(x)
+                    }
+                    ok = false
+                    return lexdb_sql.cloneExpr(x)
+                }
+            }
+        }
+        Expr.Unary(op, a) { return Expr.Unary(op.clone(), flatSubExpr(&a, aliasLo, colMap, outerAliases, allowOuterAlias, ok)) }
+        Expr.Bin(op, a, b) {
+            return Expr.Bin(op.clone(),
+                            flatSubExpr(&a, aliasLo, colMap, outerAliases, allowOuterAlias, ok),
+                            flatSubExpr(&b, aliasLo, colMap, outerAliases, allowOuterAlias, ok))
+        }
+        Expr.IsNull(a, n) { return Expr.IsNull(flatSubExpr(&a, aliasLo, colMap, outerAliases, allowOuterAlias, ok), n) }
+        Expr.Cast(a, t) { return Expr.Cast(flatSubExpr(&a, aliasLo, colMap, outerAliases, allowOuterAlias, ok), t) }
+        Expr.Call(n, args, star) {
+            var na: []Expr = withCapacity(len(args))
+            for a in args { append(mut &na, flatSubExpr(&a, aliasLo, colMap, outerAliases, allowOuterAlias, ok)) }
+            return Expr.Call(n.clone(), na, star)
+        }
+        else { return lexdb_sql.cloneExpr(x) }
+    }
+}
+
+fn tryFlattenFromSub(s: &lexdb_sql.Stmt, sc: &Scope): Option[lexdb_sql.Stmt] {
+    if len(sc.names.frames) > 0 { return None }
+    if s.kind != lexdb_sql.S_SELECT || s.setop != 0 || len(s.from) != 1 || len(s.subs) != 1 { return None }
+    if s.lockMode != 0 || len(s.mr) > 0 || s.rec || len(s.assign) > 0 || len(s.wins) > 0 ||
+       len(s.distinctOn) > 0 || len(s.gsets) > 0 || s.waitFor || s.udf || len(s.runAs) > 0 { return None }
+    let f = &s.from[0]
+    if f.sub != 0 || f.lateral || f.work >= 0 || len(f.using) > 0 || f.natural { return None }
+    let sub = &s.subs[0]
+    if sub.kind != lexdb_sql.S_SELECT || sub.setop != 0 || sub.rec || sub.cte >= 0 || len(sub.srf) > 0 ||
+       len(sub.from) == 0 || len(sub.subs) > 0 || sub.distinct || len(sub.distinctOn) > 0 ||
+       len(sub.group) > 0 || len(sub.gsets) > 0 || sub.having.isSome() || len(sub.wins) > 0 ||
+       len(sub.order) > 0 || sub.limit.isSome() || sub.offset.isSome() || sub.lockMode != 0 ||
+       len(sub.mr) > 0 || len(sub.seqNames) > 0 || sub.withTies || sub.udf || len(sub.runAs) > 0 ||
+       len(sub.assign) > 0 || sub.topMode != 0 { return None }
+    // Require outer grouping or aggregation (keeps non-agg derived table EXPLAIN plans untouched)
+    var hasOuterAgg = len(s.group) > 0
+    for it in s.items {
+        if it.star { return None }
+        match &it.expr {
+            Some(ex) { if !hasOuterAgg && lexdb_bind.hasAgg(ex) { hasOuterAgg = true } }
+            None { return None }
+        }
+    }
+    if !hasOuterAgg { return None }
+    // Keep outer WHERE empty so no derived-expression error reordering can occur
+    if s.where.isSome() { return None }
+    for sf in sub.from {
+        if sf.sub >= 0 || sf.work >= 0 || sf.lateral || len(sf.using) > 0 || sf.natural { return None }
+        if sf.join != lexdb_sql.J_FIRST && sf.join != lexdb_sql.J_INNER && sf.join != lexdb_sql.J_CROSS { return None }
+    }
+    var colMap: Map[str, Expr] = newMap()
+    for i in 0..len(sub.items) {
+        let it = &sub.items[i]
+        if it.star { return None }
+        let nm = flatItemName(it, if i < len(f.cols) { &f.cols[i] } else { "" })
+        if len(nm) == 0 { return None }
+        let lo = strings.toLowerAscii(&nm)
+        if colMap.has(&lo) { return None }
+        match &it.expr {
+            Some(ex) {
+                if !flatSafeExpr(ex) { return None }
+                colMap.put(lo, lexdb_sql.cloneExpr(ex))
+            }
+            None { return None }
+        }
+    }
+    var outerAliases: Map[str, int] = newMap()
+    for it in s.items {
+        if len(it.alias) > 0 {
+            let alo = strings.toLowerAscii(&it.alias)
+            if colMap.has(&alo) {
+                // Allow identity alias (e.g. SELECT x AS x); bail on shadowing alias
+                var ident = false
+                match &it.expr {
+                    Some(e) {
+                        match e {
+                            Expr.Col(nm, _) {
+                                let dot = strFind(nm, 0, ".")
+                                let bare = if dot >= 0 { &nm[dot + 1..len(nm)] } else { nm }
+                                if strings.toLowerAscii(bare) == alo { ident = true }
+                            }
+                            else {}
+                        }
+                    }
+                    None {}
+                }
+                if !ident { return None }
+            }
+            outerAliases.put(alo, 1)
+        }
+    }
+    let aliasLo = strings.toLowerAscii(&f.alias)
+    var ok = true
+    var flat = s.clone()
+    for i in 0..len(flat.items) {
+        let it = mut &flat.items[i]
+        if len(it.alias) == 0 {
+            let nm = flatItemName(it, "")
+            if len(nm) > 0 { it.alias = nm }
+        }
+        let neOpt = match &it.expr {
+            Some(ex) { Some(flatSubExpr(ex, &aliasLo, &colMap, &outerAliases, false, mut &ok)) }
+            None { None }
+        }
+        if !ok || neOpt.isNone() { return None }
+        it.expr = neOpt
+    }
+    var ng: []Expr = withCapacity(len(flat.group))
+    for g in flat.group {
+        append(mut &ng, flatSubExpr(&g, &aliasLo, &colMap, &outerAliases, true, mut &ok))
+        if !ok { return None }
+    }
+    flat.group = ng
+    match &flat.having {
+        Some(h) {
+            let nh = flatSubExpr(h, &aliasLo, &colMap, &outerAliases, false, mut &ok)
+            if !ok { return None }
+            flat.having = Some(nh)
+        }
+        None {}
+    }
+    for i in 0..len(flat.order) {
+        let ne = flatSubExpr(&flat.order[i].expr, &aliasLo, &colMap, &outerAliases, true, mut &ok)
+        if !ok { return None }
+        flat.order[i].expr = ne
+    }
+    flat.from = sub.from.clone()
+    flat.where = match &sub.where {
+        Some(w) { Some(lexdb_sql.cloneExpr(w)) }
+        None { None }
+    }
+    flat.subs = []
+    return Some(flat)
+}
+
 fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val,
               sc: mut &Scope): Result[Sel, DbErr] {
     if txn.visCap < 0 && s.kind == lexdb_sql.S_SELECT && s.setop == 0 && len(s.from) > 0 && s.lockMode == 0 {
@@ -11964,6 +12158,10 @@ fn planSelect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             }
             None {}
         }
+    }
+    match tryFlattenFromSub(s, sc) {
+        Some(flat) { return planSelect(st, txn, &flat, params, sc) }
+        None {}
     }
     if s.rec && s.setop != lexdb_sql.SET_UNION {
         return Err(e("42P19", "recursive query does not have the form non-recursive-term UNION [ALL] recursive-term"))

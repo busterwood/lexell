@@ -2012,6 +2012,21 @@ fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
     let n = to - from
     let r0 = b.n
     let rw = rowsFor(t)
+    if lexdb_rows.layoutOk(leaf, &rw) {
+        // Zero-allocation whole-leaf rejection for positive LIKE filters (ClickBench q20-q23!)
+        if len(lz.raw) > 0 {
+            let np0 = lexdb_rows.leafPlaces(leaf)
+            for x in 0..len(lz.raw) {
+                if !lz.rawNeg[x] {
+                    let pl = lz.rawPl[x]
+                    if pl < np0 && lexdb_rows.leafPlaceKind(leaf, pl) == PK_TEXT &&
+                       lexdb_rows.likeLeafEmpty(leaf, from, to, pl, &lz.pieces[x]) {
+                        return Ok(n)
+                    }
+                }
+            }
+        }
+    }
     var rs: []int = withCapacity(n)
     for q in 0..n { append(mut &rs, r0 + q) }
     if !lexdb_rows.layoutOk(leaf, &rw) {
@@ -3091,7 +3106,7 @@ pub fn rangeManyIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, i
     // 1 the range is done (one), 2 stop (bail, over, bad); lo[x]: where its
     // rows start (-1 none yet)
     lo = array(len(ks), -1)
-    {
+    if noted {
         let take = fn(x: int, leaf: &lexdb_rows.LeafView, i0: int, j0: int): int {
             if lo[x] < 0 { lo[x] = if index && !only { len(pks) } else { rows.n } }
             var e = i0
@@ -3121,7 +3136,6 @@ pub fn rangeManyIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, i
                 match lexdb_rows.decodeRun(leaf, e, e + want, mut &rows, bp, &rw) {
                     Ok(got) {
                         if got == lexdb_rows.APART {
-                            // (a column leaf's row with a value stored apart: read after, as decodeRow's 2)
                             append(mut &apart, lexdb_rows.leafKey(leaf, e))
                             append(mut &apartAt, rows.n)
                             rows.n += 1
@@ -3167,21 +3181,148 @@ pub fn rangeManyIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, i
             }
             return 0
         }
-        if noted {
-            // range by range, in the keys' order (the reads noted as made)
-            for x in 0..len(ks) {
-                if len(rhis[x]) > 0 && rlos[x] >= rhis[x] { continue }
-                var code = 0
-                try st.scanLeaves(txn, tree, &rlos[x], rhis[x].clone(), fn(leaf: &lexdb_rows.LeafView, i0: int, j0: int): bool {
-                    code = take(x, leaf, i0, j0)
-                    return code == 0
-                })
-                if code == 2 { break }      // (bail, over or bad: take's)
-            }
-        } else {
-            // the ranges in key order, those in one leaf by one descent
-            try st.scanRanges(txn, tree, &rlos, &rhis, take)
+        // range by range, in the keys' order (the reads noted as made)
+        for x in 0..len(ks) {
+            if len(rhis[x]) > 0 && rlos[x] >= rhis[x] { continue }
+            var code = 0
+            try st.scanLeaves(txn, tree, &rlos[x], rhis[x].clone(), fn(leaf: &lexdb_rows.LeafView, i0: int, j0: int): bool {
+                code = take(x, leaf, i0, j0)
+                return code == 0
+            })
+            if code == 2 { break }      // (bail, over or bad: take's)
         }
+    } else {
+        // the ranges in key order, those in one leaf batched into ONE colsPick per leaf!
+        let takeBatch = fn(leaf: &lexdb_rows.LeafView, bxs: &[]int, bis: &[]int, bjs: &[]int): int {
+            let nb = len(bxs)
+            if nb == 0 { return 0 }
+            if !index && leaf.isCols && lexdb_rows.layoutOk(leaf, &rw) {
+                var tot = 0
+                for bi in 0..nb {
+                    let w = if one { 1 } else { bjs[bi] - bis[bi] }
+                    tot += w
+                }
+                if room0 < 0 || (rows.n + tot) * perRow <= room0 {
+                    bRoom(mut &rows, bp, mut &room, rows.n + tot)
+                    if len(bp.usedP) == 0 {
+                        for bi in 0..nb {
+                            let x = bxs[bi]
+                            if lo[x] < 0 { lo[x] = rows.n }
+                            rows.n += if one { 1 } else { bjs[bi] - bis[bi] }
+                        }
+                        return if one && nb == 1 { 1 } else { 0 }
+                    }
+                    var qs: []int = withCapacity(tot)
+                    var rs: []int = withCapacity(tot)
+                    var off = 0
+                    for bi in 0..nb {
+                        let x = bxs[bi]
+                        if lo[x] < 0 { lo[x] = rows.n + off }
+                        let e0 = bis[bi]
+                        let e1 = if one { e0 + 1 } else { bjs[bi] }
+                        for e in e0..e1 {
+                            append(mut &qs, e)
+                            append(mut &rs, off)
+                            off += 1
+                        }
+                    }
+                    match lexdb_rows.colsPick(leaf, 0, &qs, &rs, false, rows.n, &bp.usedP, mut &rows, bp) {
+                        Ok(ok) {
+                            if !ok {
+                                bail = true
+                                return 2
+                            }
+                        }
+                        Err(er) {
+                            append(mut &bad, er)
+                            return 2
+                        }
+                    }
+                    rows.n += tot
+                    return if one && nb == 1 { 1 } else { 0 }
+                }
+            }
+            var lastC = 0
+            for bi in 0..nb {
+                let x = bxs[bi]
+                let i0 = bis[bi]
+                let j0 = bjs[bi]
+                if lo[x] < 0 { lo[x] = if index && !only { len(pks) } else { rows.n } }
+                var e = i0
+                lastC = 0
+                while e < j0 {
+                    if room0 >= 0 && (rows.n + len(pks)) * perRow > room0 {
+                        over = true
+                        return 2
+                    }
+                    if index && !only {
+                        append(mut &pks, lexdb_rows.leafVal(leaf, e))
+                        e += 1
+                        if one { lastC = 1; break }
+                        continue
+                    }
+                    let want = if one { 1 } else { j0 - e }
+                    bRoom(mut &rows, bp, mut &room, rows.n + want)
+                    if index {
+                        if !bIdxInto(&lexdb_rows.leafKey(leaf, e), rows.n, mut &rows, bp, &dec) {
+                            bail = true
+                            return 2
+                        }
+                        rows.n += 1
+                        e += 1
+                        if one { lastC = 1; break }
+                        continue
+                    }
+                    match lexdb_rows.decodeRun(leaf, e, e + want, mut &rows, bp, &rw) {
+                        Ok(got) {
+                            if got == lexdb_rows.APART {
+                                append(mut &apart, lexdb_rows.leafKey(leaf, e))
+                                append(mut &apartAt, rows.n)
+                                rows.n += 1
+                                e += 1
+                                if one { lastC = 1; break }
+                                continue
+                            }
+                            if got < 0 {
+                                bail = true
+                                return 2
+                            }
+                            if got > 0 {
+                                rows.n += got
+                                e += got
+                                if one { lastC = 1; break }
+                                continue
+                            }
+                        }
+                        Err(er) {
+                            append(mut &bad, er)
+                            return 2
+                        }
+                    }
+                    match lexdb_rows.decodeRow(lexdb_rows.leafValAt(leaf, e), rows.n, mut &rows, bp, &rw) {
+                        Ok(code) {
+                            if code == 1 {
+                                bail = true
+                                return 2
+                            }
+                            if code == 2 {
+                                append(mut &apart, lexdb_rows.leafKey(leaf, e))
+                                append(mut &apartAt, rows.n)
+                            }
+                        }
+                        Err(er) {
+                            append(mut &bad, er)
+                            return 2
+                        }
+                    }
+                    rows.n += 1
+                    e += 1
+                    if one { lastC = 1; break }
+                }
+            }
+            return if nb == 1 { lastC } else { 0 }
+        }
+        try st.scanRangesBatched(txn, tree, &rlos, &rhis, takeBatch)
     }
     // where each range's rows end: where the next range with rows starts
     // (ranges are read in order), the last at the end
