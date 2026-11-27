@@ -7,6 +7,7 @@ Lexell is a memory-safe language that compiles in milliseconds and produces smal
 - **No data races, and scaling by sharing nothing.** A server handles thousands of connections as cooperative tasks on one thread, written as plain sequential code, with no threads, locks or `async`. One thread per process is a performance choice as well as a safety one: to use more cores you run more processes that share nothing, as nginx does, so adding cores adds no locks and no contention (see [concurrency](#concurrency-without-threads-or-locks)).
 - **A quick feedback loop.** Hello world compiles in 14 ms, against 59 ms for Rust, and the nine benchmark programs in 140 ms, against 3.58 s.
 - **Small, fast executables.** The compiler writes Linux executables directly. Hello world is 22 KB, against Rust's 330 KB, and the generated code is faster than Rust's on 12 of the 19 [benchmarks](#performance) they share, and level on two more.
+- **Built for modern Linux, without legacy baggage.** Rather than targeting decades-old baselines, the native backend assumes Linux `x86-64-v3` (AVX2, BMI2, CRC32C) out of the box, and the event loop uses `io_uring` natively for sockets and files with an automatic `epoll` fallback on older kernels or restricted containers.
 
 These guarantees come from the language's rules and the compiler's checks. They have not been formally proved, and the compiler is young, so treat it as you would any new toolchain.
 
@@ -14,7 +15,7 @@ Lexell is aimed at command-line tools and database-backed services. It has a bui
 
 I wanted the quick edit–compile–run loop I remember from Turbo Pascal, with runtime performance competitive with established native toolchains. The [benchmarks](#performance) compare compile time and generated code with Rust, and the regex, JSON, jq, Markdown, decimal and command-line programs with their usual external tools.
 
-**In active development.** The language and library APIs may change. The native target is Linux x86-64-v3, which includes AVX2. You can try it today from a source checkout.
+**In active development.** The language and library APIs may change. You can try it today from a source checkout.
 
 [Performance](#performance) · [Concurrency](#concurrency-without-threads-or-locks) · [Quick start](#quick-start) · [LexDB](#lexdb) · [Why I built Lexell](#why-i-built-lexell) · [Documentation](#documentation)
 
