@@ -4806,6 +4806,14 @@ void* lxllib_par_run(int64_t n, void* (*item)(void*, void*, int64_t), void* f, v
 }
 void* lxllib_par_get(void* r, int64_t i) { return ((void**)r)[i]; }
 void lxllib_par_free(void* r) { rt_free(r); }
+int64_t lxllib_par_threads(void) {
+    if (rt_npar > 0) return (int64_t)rt_npar + 1;
+    if (rt_npar < 0) return 1;
+    const char* e = getenv("LXL_PAR");
+    int n = e && *e ? atoi(e) : rt_ncpu() - 1;
+    if (n > 64) n = 64;
+    return n > 0 ? (int64_t)n + 1 : 1;
+}
 
 /* ------------------------------------------------------------ rcstat (exp/borrow: compiler/rcstat.lxl)
    rt_str_dup and rt_str_drop counted by kind (0 other, 1 a dup for a borrowed parameter, 2 the drop

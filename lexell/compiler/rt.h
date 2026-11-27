@@ -2885,3 +2885,4 @@ void* lxllib_par_run(int64_t n, void* (*item)(void*, void*, int64_t), void* f, v
 }
 void* lxllib_par_get(void* r, int64_t i) { return ((void**)r)[i]; }
 void lxllib_par_free(void* r) { rt_free(r); }
+int64_t lxllib_par_threads(void) { return 1; }
