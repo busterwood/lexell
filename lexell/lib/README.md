@@ -44,6 +44,8 @@ for leaks.
 | `binary.lxl` | 286 | endian reads/writes over bytes and str |
 | `glob.lxl` | 408 | Unix path globbing: `*`, `?`, sets, ASCII POSIX classes, dotfiles, optional `**`, options, `escape`, and `expand` under a root |
 | `base64.lxl` | 107 | standard base64, strict and jq-lenient decoders |
+| `zlib.lxl` | 401 | gzip, zlib, and raw deflate compression over libz (one-shot and streaming `Deflater`/`Inflater`, multi-member gzip, `maxOut` limits, CRC-32 and Adler-32) |
+| `zstd.lxl` | 366 | Zstandard compression over libzstd (one-shot and streaming `Compressor`/`Decompressor`, multi-frame streams, frame checksums, `maxOut` limits) |
 | `uuid.lxl` | 260 | RFC 9562 UUIDs: parse/format, v4/v5/v7, bytes, version/variant |
 | `tz.lxl` | 447 | time zones from TZif files (version 2+, 64-bit transitions) and their POSIX footer rules, as glibc applies them: utc, local (TZ or /etc/localtime), fromSpec, load, at, localTime; instantOf (local time to an instant: the earlier of an overlap, the offset before a gap, as PostgreSQL), offsetDateTime; tested against zoneinfo by `tests/gen_tz.py` and `tests/gen_tz_local.py` |
 | `sqldialect.lxl` | 260 | Value, DbError and its codes, SQL fragments with placeholders per dialect, exact decimal text and (p, s) checks |
@@ -1970,6 +1972,14 @@ broken when that fails, or when the request could not be sent whole
   DSN as the ODBC oracle's live tests do:
 
       python3 lib/run_tests.py tds_ sqlserver_
+
+### zlib, zstd
+
+Compression over `libz` (`zlib`) and `libzstd` (`zstd`), kept as separate modules so programs only link the shared library they import. All decompression entry points enforce a default 64 MiB output cap (`DEFAULT_MAX_OUT`) to guard against decompression bombs, with explicit `*Max` / `setMaxOut` overrides (`-1` for unlimited).
+
+- **`zlib`**: one-shot `gzip`/`gzipLevel`/`gunzip`/`gunzipMax`, `zlibCompress`/`zlibCompressLevel`/`zlibDecompress`/`zlibDecompressMax`, raw `deflate`/`deflateLevel`/`inflate`/`inflateMax`, and auto-detecting `decompress`/`decompressMax` (gzip or zlib, including multi-member gzip streams); streaming `Deflater` (`newGzip`, `newZlib`, `newDeflate`, `write`, `flush`, `finish`) and `Inflater` (`newGunzip`, `newZlibDecompressor`, `newInflate`, `newAutoDecompressor`, `setMaxOut`, `write`, `isDone`, `finish`); IEEE `crc32`/`crc32More` and `adler32`/`adler32More`.
+- **`zstd`**: one-shot `compress`/`compressLevel`/`decompress`/`decompressMax` (supporting single and concatenated multi-frame streams), `minLevel`/`maxLevel`/`defaultLevel`/`versionNumber`; streaming `Compressor` (`newCompressor`, `setChecksum`, `write`, `flush`, `finish`) and `Decompressor` (`newDecompressor`, `setMaxOut`, `write`, `isDone`, `finish`).
+- Tests: `zlib_basic`, `zstd_basic`.
 
 ### crypto
 

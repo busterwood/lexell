@@ -1,0 +1,401 @@
+// zlib: gzip, zlib, and raw deflate compression over libz, plus CRC-32 and Adler-32.
+//
+// One-shot helpers:
+//   gzip / gzipLevel / gunzip / gunzipMax
+//   zlibCompress / zlibCompressLevel / zlibDecompress / zlibDecompressMax
+//   deflate / deflateLevel / inflate / inflateMax
+//   decompress / decompressMax   (auto-detects gzip or zlib header)
+//   crc32 / crc32More / adler32 / adler32More
+//
+// Streaming types (RAII: drop() frees the underlying z_stream):
+//   Deflater (newGzip, newZlib, newDeflate): write, flush, finish
+//   Inflater (newGunzip, newZlibDecompressor, newInflate, newAutoDecompressor): write, isDone, finish
+//
+// All decompression entry points enforce an output size limit (default 64 MiB,
+// DEFAULT_MAX_OUT) to guard against decompression bombs. Pass a custom maxOut
+// (or -1 for unlimited) via the *Max functions or setMaxOut on Inflater.
+
+import "ffi"
+
+extern "z" fn zlibVersion(): str
+extern "z" fn deflateInit2_(strm: ptr, level: i32, method: i32, windowBits: i32, memLevel: i32, strategy: i32, version: &str, streamSize: i32): i32
+extern "z" fn deflateRaw(strm: ptr, flush: i32): i32 as "deflate"
+extern "z" fn deflateEnd(strm: ptr): i32
+extern "z" fn inflateInit2_(strm: ptr, windowBits: i32, version: &str, streamSize: i32): i32
+extern "z" fn inflateRaw(strm: ptr, flush: i32): i32 as "inflate"
+extern "z" fn inflateReset(strm: ptr): i32
+extern "z" fn inflateEnd(strm: ptr): i32
+extern "z" fn zCrc32(crc: u64, buf: &[byte], n: u32): u64 as "crc32"
+extern "z" fn zAdler32(adler: u64, buf: &[byte], n: u32): u64 as "adler32"
+
+// sizeof(z_stream) and field offsets on Linux x86-64 (verified against zlib.h).
+const ZSTREAM_SIZE: int = 112
+const OFF_NEXT_IN_PTR: int = 0    // byte 0  -> ptr index 0
+const OFF_AVAIL_IN_I32: int = 2   // byte 8  -> i32 index 2
+const OFF_NEXT_OUT_PTR: int = 3   // byte 24 -> ptr index 3
+const OFF_AVAIL_OUT_I32: int = 8  // byte 32 -> i32 index 8
+
+const Z_OK: i32 = 0
+const Z_STREAM_END: i32 = 1
+const Z_NEED_DICT: i32 = 2
+const Z_STREAM_ERROR: i32 = -2
+const Z_DATA_ERROR: i32 = -3
+const Z_MEM_ERROR: i32 = -4
+const Z_BUF_ERROR: i32 = -5
+const Z_VERSION_ERROR: i32 = -6
+
+const Z_NO_FLUSH: i32 = 0
+const Z_SYNC_FLUSH: i32 = 2
+const Z_FINISH: i32 = 4
+const Z_DEFLATED: i32 = 8
+const Z_DEFAULT_STRATEGY: i32 = 0
+const DEFAULT_MEM_LEVEL: i32 = 8
+
+const WBITS_RAW: i32 = -15
+const WBITS_ZLIB: i32 = 15
+const WBITS_GZIP: i32 = 31     // 15 + 16
+const WBITS_AUTO: i32 = 47     // 15 + 32 (zlib or gzip)
+
+const CHUNK_SIZE: int = 65536
+
+pub const LEVEL_DEFAULT: int = -1
+pub const LEVEL_NONE: int = 0
+pub const LEVEL_FAST: int = 1
+pub const LEVEL_BEST: int = 9
+
+// Default maximum decompressed output size (64 MiB).
+pub const DEFAULT_MAX_OUT: int = 67108864
+
+pub type Error = record {
+    msg: str
+}
+
+pub fn (e: &Error) toStr(): str { return e.msg.clone() }
+
+fn zerr(op: &str, rc: i32): Error {
+    let reason = if rc == Z_DATA_ERROR { "corrupt or invalid compressed data" }
+        else if rc == Z_BUF_ERROR { "unexpected end of stream" }
+        else if rc == Z_MEM_ERROR { "out of memory" }
+        else if rc == Z_STREAM_ERROR { "invalid compression parameter or stream state" }
+        else if rc == Z_VERSION_ERROR { "incompatible libz version" }
+        else if rc == Z_NEED_DICT { "preset dictionary required" }
+        else { "error code " + intToStr(int(rc)) }
+    return Error{msg: "zlib: " + op + ": " + reason}
+}
+
+fn checkLevel(level: int): Result[Unit, Error] {
+    if level < -1 || level > 9 {
+        return Err(Error{msg: "zlib: invalid compression level " + intToStr(level) + " (expected -1..9)"})
+    }
+    return Ok(Unit{})
+}
+
+// ---- checksums
+
+// Standard IEEE 802.3 CRC-32 checksum.
+pub fn crc32(data: &str): u32 {
+    return crc32More(0, data)
+}
+
+// Continue a CRC-32 checksum with more data.
+pub fn crc32More(seed: u32, data: &str): u32 {
+    if len(data) == 0 { return seed }
+    var crc = u64(seed)
+    var off = 0
+    while off < len(data) {
+        let end = if off + CHUNK_SIZE < len(data) { off + CHUNK_SIZE } else { len(data) }
+        let b = strToBytes(data[off..end])
+        crc = zCrc32(crc, &b, u32(len(b)))
+        off = end
+    }
+    return u32(crc & 0xffffffff)
+}
+
+// Adler-32 checksum (used by the zlib wrapper).
+pub fn adler32(data: &str): u32 {
+    return adler32More(1, data)
+}
+
+// Continue an Adler-32 checksum with more data.
+pub fn adler32More(seed: u32, data: &str): u32 {
+    if len(data) == 0 { return seed }
+    var sum = u64(seed)
+    var off = 0
+    while off < len(data) {
+        let end = if off + CHUNK_SIZE < len(data) { off + CHUNK_SIZE } else { len(data) }
+        let b = strToBytes(data[off..end])
+        sum = zAdler32(sum, &b, u32(len(b)))
+        off = end
+    }
+    return u32(sum & 0xffffffff)
+}
+
+// ---- streaming compressor
+
+pub type Deflater = record {
+    strm: ffi.Mem
+    outBuf: ffi.Mem
+    active: bool
+    finished: bool
+}
+
+pub fn (d: mut &Deflater) drop() {
+    if d.active {
+        let _ = deflateEnd(d.strm.ptr())
+        d.active = false
+    }
+}
+
+fn newDeflater(wbits: i32, level: int): Result[Deflater, Error] {
+    try checkLevel(level)
+    var strm = ffi.alloc(ZSTREAM_SIZE)
+    let ver = zlibVersion()
+    let rc = deflateInit2_(strm.ptr(), i32(level), Z_DEFLATED, wbits, DEFAULT_MEM_LEVEL, Z_DEFAULT_STRATEGY, &ver, i32(ZSTREAM_SIZE))
+    if rc != Z_OK { return Err(zerr("deflateInit2", rc)) }
+    return Ok(Deflater{strm: strm, outBuf: ffi.alloc(CHUNK_SIZE), active: true, finished: false})
+}
+
+pub fn newGzip(level: int): Result[Deflater, Error] { return newDeflater(WBITS_GZIP, level) }
+pub fn newZlib(level: int): Result[Deflater, Error] { return newDeflater(WBITS_ZLIB, level) }
+pub fn newDeflate(level: int): Result[Deflater, Error] { return newDeflater(WBITS_RAW, level) }
+
+fn (d: mut &Deflater) runDeflate(chunk: &str, flush: i32): Result[str, Error] {
+    if !d.active || d.finished {
+        return Err(Error{msg: "zlib: Deflater already finished"})
+    }
+    var out = ""
+    var off = 0
+    var first = true
+    while first || off < len(chunk) {
+        first = false
+        let end = if off + CHUNK_SIZE < len(chunk) { off + CHUNK_SIZE } else { len(chunk) }
+        let isLast = end == len(chunk)
+        let inMem = ffi.copyBytes(chunk[off..end])
+        d.strm.setPtr(OFF_NEXT_IN_PTR, inMem.ptr())
+        d.strm.setI32(OFF_AVAIL_IN_I32, i32(end - off))
+        let mode = if isLast { flush } else { Z_NO_FLUSH }
+        var done = false
+        while !done {
+            d.strm.setPtr(OFF_NEXT_OUT_PTR, d.outBuf.ptr())
+            d.strm.setI32(OFF_AVAIL_OUT_I32, i32(CHUNK_SIZE))
+            let rc = deflateRaw(d.strm.ptr(), mode)
+            if rc != Z_OK && rc != Z_STREAM_END && rc != Z_BUF_ERROR {
+                return Err(zerr("deflate", rc))
+            }
+            let rem = int(d.strm.getI32(OFF_AVAIL_OUT_I32))
+            let have = CHUNK_SIZE - rem
+            if have > 0 {
+                out += ffi.bytes(d.outBuf.ptr(), have)
+            }
+            if mode == Z_FINISH {
+                if rc == Z_STREAM_END {
+                    done = true
+                } else if rc == Z_BUF_ERROR && have == 0 {
+                    return Err(zerr("deflate", rc))
+                }
+            } else {
+                // Keep draining while the output buffer was completely filled.
+                if rem > 0 && d.strm.getI32(OFF_AVAIL_IN_I32) == 0 {
+                    done = true
+                }
+            }
+        }
+        off = end
+    }
+    if flush == Z_FINISH {
+        let _ = deflateEnd(d.strm.ptr())
+        d.active = false
+        d.finished = true
+    }
+    return Ok(out)
+}
+
+// Feed a chunk of uncompressed bytes and return any compressed bytes produced so far.
+pub fn (d: mut &Deflater) write(chunk: &str): Result[str, Error] {
+    if len(chunk) == 0 {
+        if !d.active || d.finished { return Err(Error{msg: "zlib: Deflater already finished"}) }
+        return Ok("")
+    }
+    return d.runDeflate(chunk, Z_NO_FLUSH)
+}
+
+// Flush buffered data at a byte boundary (Z_SYNC_FLUSH) without closing the stream.
+pub fn (d: mut &Deflater) flush(): Result[str, Error] {
+    return d.runDeflate("", Z_SYNC_FLUSH)
+}
+
+// Finalize the stream, write any trailer (gzip/zlib checksum), and release the z_stream.
+pub fn (d: mut &Deflater) finish(): Result[str, Error] {
+    return d.runDeflate("", Z_FINISH)
+}
+
+// ---- streaming decompressor
+
+pub type Inflater = record {
+    strm: ffi.Mem
+    outBuf: ffi.Mem
+    active: bool
+    done: bool
+    multiMember: bool
+    totalOut: int
+    maxOut: int
+}
+
+pub fn (inf: mut &Inflater) drop() {
+    if inf.active {
+        let _ = inflateEnd(inf.strm.ptr())
+        inf.active = false
+    }
+}
+
+fn newInflater(wbits: i32, multiMember: bool, maxOut: int): Result[Inflater, Error] {
+    var strm = ffi.alloc(ZSTREAM_SIZE)
+    let ver = zlibVersion()
+    let rc = inflateInit2_(strm.ptr(), wbits, &ver, i32(ZSTREAM_SIZE))
+    if rc != Z_OK { return Err(zerr("inflateInit2", rc)) }
+    return Ok(Inflater{
+        strm: strm,
+        outBuf: ffi.alloc(CHUNK_SIZE),
+        active: true,
+        done: false,
+        multiMember: multiMember,
+        totalOut: 0,
+        maxOut: maxOut
+    })
+}
+
+pub fn newGunzip(): Result[Inflater, Error] { return newInflater(WBITS_GZIP, true, DEFAULT_MAX_OUT) }
+pub fn newZlibDecompressor(): Result[Inflater, Error] { return newInflater(WBITS_ZLIB, false, DEFAULT_MAX_OUT) }
+pub fn newInflate(): Result[Inflater, Error] { return newInflater(WBITS_RAW, false, DEFAULT_MAX_OUT) }
+pub fn newAutoDecompressor(): Result[Inflater, Error] { return newInflater(WBITS_AUTO, true, DEFAULT_MAX_OUT) }
+
+// Set the maximum total decompressed byte count (-1 for unlimited).
+pub fn (inf: mut &Inflater) setMaxOut(maxOut: int) {
+    inf.maxOut = maxOut
+}
+
+// True once a complete compressed stream has been decoded.
+pub fn (inf: &Inflater) isDone(): bool { return inf.done }
+
+// Feed compressed bytes and return the decompressed bytes produced.
+pub fn (inf: mut &Inflater) write(chunk: &str): Result[str, Error] {
+    if !inf.active { return Err(Error{msg: "zlib: Inflater already closed"}) }
+    if len(chunk) == 0 { return Ok("") }
+    var out = ""
+    var off = 0
+    while off < len(chunk) {
+        let end = if off + CHUNK_SIZE < len(chunk) { off + CHUNK_SIZE } else { len(chunk) }
+        let inMem = ffi.copyBytes(chunk[off..end])
+        inf.strm.setPtr(OFF_NEXT_IN_PTR, inMem.ptr())
+        inf.strm.setI32(OFF_AVAIL_IN_I32, i32(end - off))
+        var keepGoing = true
+        while keepGoing {
+            if inf.done {
+                if inf.strm.getI32(OFF_AVAIL_IN_I32) == 0 { break }
+                if inf.multiMember {
+                    let rrc = inflateReset(inf.strm.ptr())
+                    if rrc != Z_OK { return Err(zerr("inflateReset", rrc)) }
+                    inf.done = false
+                } else {
+                    return Err(Error{msg: "zlib: trailing bytes after end of stream"})
+                }
+            }
+            var req = CHUNK_SIZE
+            if inf.maxOut >= 0 {
+                let left = inf.maxOut - inf.totalOut
+                if left < 0 {
+                    return Err(Error{msg: "zlib: decompressed output exceeds limit of " + intToStr(inf.maxOut) + " bytes"})
+                }
+                // Ask for at most left + 1 bytes so we detect overflow without buffering unbounded output.
+                if left + 1 < req { req = left + 1 }
+            }
+            inf.strm.setPtr(OFF_NEXT_OUT_PTR, inf.outBuf.ptr())
+            inf.strm.setI32(OFF_AVAIL_OUT_I32, i32(req))
+            let rc = inflateRaw(inf.strm.ptr(), Z_NO_FLUSH)
+            if rc != Z_OK && rc != Z_STREAM_END && rc != Z_BUF_ERROR {
+                return Err(zerr("inflate", rc))
+            }
+            let rem = int(inf.strm.getI32(OFF_AVAIL_OUT_I32))
+            let have = req - rem
+            if have > 0 {
+                inf.totalOut += have
+                if inf.maxOut >= 0 && inf.totalOut > inf.maxOut {
+                    return Err(Error{msg: "zlib: decompressed output exceeds limit of " + intToStr(inf.maxOut) + " bytes"})
+                }
+                out += ffi.bytes(inf.outBuf.ptr(), have)
+            }
+            if rc == Z_STREAM_END {
+                inf.done = true
+                keepGoing = inf.strm.getI32(OFF_AVAIL_IN_I32) > 0
+            } else if rc == Z_BUF_ERROR && have == 0 {
+                keepGoing = false
+            } else {
+                // Keep draining if input remains or the output buffer was completely filled.
+                keepGoing = inf.strm.getI32(OFF_AVAIL_IN_I32) > 0 || rem == 0
+            }
+        }
+        off = end
+    }
+    return Ok(out)
+}
+
+// Verify the stream reached its end cleanly and release the z_stream.
+pub fn (inf: mut &Inflater) finish(): Result[Unit, Error] {
+    if !inf.active { return Err(Error{msg: "zlib: Inflater already closed"}) }
+    let ok = inf.done
+    let _ = inflateEnd(inf.strm.ptr())
+    inf.active = false
+    if !ok {
+        return Err(Error{msg: "zlib: unexpected end of stream"})
+    }
+    return Ok(Unit{})
+}
+
+// ---- one-shot helpers
+
+fn compressOneShot(wbits: i32, data: &str, level: int): Result[str, Error] {
+    var d = try newDeflater(wbits, level)
+    let a = try d.write(data)
+    let b = try d.finish()
+    if len(a) == 0 { return Ok(b) }
+    if len(b) == 0 { return Ok(a) }
+    return Ok(a + b)
+}
+
+fn decompressOneShot(wbits: i32, multiMember: bool, data: &str, maxOut: int): Result[str, Error] {
+    if len(data) == 0 {
+        return Err(Error{msg: "zlib: empty input"})
+    }
+    var inf = try newInflater(wbits, multiMember, maxOut)
+    let out = try inf.write(data)
+    try inf.finish()
+    return Ok(out)
+}
+
+// Compress with gzip header and trailer (RFC 1952) at the default level.
+pub fn gzip(data: &str): Result[str, Error] { return compressOneShot(WBITS_GZIP, data, LEVEL_DEFAULT) }
+pub fn gzipLevel(data: &str, level: int): Result[str, Error] { return compressOneShot(WBITS_GZIP, data, level) }
+
+// Decompress a gzip stream (including concatenated multi-member gzip streams).
+pub fn gunzip(data: &str): Result[str, Error] { return decompressOneShot(WBITS_GZIP, true, data, DEFAULT_MAX_OUT) }
+pub fn gunzipMax(data: &str, maxOut: int): Result[str, Error] { return decompressOneShot(WBITS_GZIP, true, data, maxOut) }
+
+// Compress with zlib header and Adler-32 trailer (RFC 1950).
+pub fn zlibCompress(data: &str): Result[str, Error] { return compressOneShot(WBITS_ZLIB, data, LEVEL_DEFAULT) }
+pub fn zlibCompressLevel(data: &str, level: int): Result[str, Error] { return compressOneShot(WBITS_ZLIB, data, level) }
+
+// Decompress a zlib stream.
+pub fn zlibDecompress(data: &str): Result[str, Error] { return decompressOneShot(WBITS_ZLIB, false, data, DEFAULT_MAX_OUT) }
+pub fn zlibDecompressMax(data: &str, maxOut: int): Result[str, Error] { return decompressOneShot(WBITS_ZLIB, false, data, maxOut) }
+
+// Compress to raw deflate (RFC 1951, no header or trailer).
+pub fn deflate(data: &str): Result[str, Error] { return compressOneShot(WBITS_RAW, data, LEVEL_DEFAULT) }
+pub fn deflateLevel(data: &str, level: int): Result[str, Error] { return compressOneShot(WBITS_RAW, data, level) }
+
+// Decompress raw deflate (RFC 1951).
+pub fn inflate(data: &str): Result[str, Error] { return decompressOneShot(WBITS_RAW, false, data, DEFAULT_MAX_OUT) }
+pub fn inflateMax(data: &str, maxOut: int): Result[str, Error] { return decompressOneShot(WBITS_RAW, false, data, maxOut) }
+
+// Decompress either a gzip or a zlib stream (auto-detected from the header).
+pub fn decompress(data: &str): Result[str, Error] { return decompressOneShot(WBITS_AUTO, true, data, DEFAULT_MAX_OUT) }
+pub fn decompressMax(data: &str, maxOut: int): Result[str, Error] { return decompressOneShot(WBITS_AUTO, true, data, maxOut) }

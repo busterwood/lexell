@@ -1,0 +1,155 @@
+// zlib module: gzip, zlib, raw deflate, auto-detect, multi-member gzip,
+// streaming Deflater/Inflater, decompression bomb limits, CRC-32 and Adler-32.
+// needs: z
+// expect: crc32 true
+// expect: crc32 split true
+// expect: adler32 true
+// expect: adler32 split true
+// expect: py gzip true
+// expect: py zlib true
+// expect: py raw true
+// expect: empty roundtrip true true true
+// expect: gzip levels true
+// expect: zlib levels true
+// expect: raw levels true
+// expect: auto detect true true
+// expect: large 200k true true true
+// expect: multimember gzip true
+// expect: stream deflate+inflate true
+// expect: stream sync flush true
+// expect: maxOut exact true
+// expect: maxOut overflow true
+// expect: maxOut 65536 boundary true true
+// expect: errors true true true true true
+
+import "zlib"
+import "strings"
+
+fn fromHex(h: &str): str {
+    var out = ""
+    var i = 0
+    while i + 1 < len(h) {
+        let hi = hexVal(h[i])
+        let lo = hexVal(h[i + 1])
+        out.addByte(byte(hi * 16 + lo))
+        i += 2
+    }
+    return out
+}
+
+fn hexVal(b: byte): int {
+    let c = int(b)
+    if c >= 48 && c <= 57 { return c - 48 }
+    if c >= 97 && c <= 102 { return c - 87 }
+    return c - 55
+}
+
+fn main() {
+    // 1. Standard IEEE CRC-32 and Adler-32 ("123456789" check values)
+    println($"crc32 {zlib.crc32("123456789") == u32(0xcbf43926)}")
+    let c1 = zlib.crc32("1234")
+    println($"crc32 split {zlib.crc32More(c1, "56789") == u32(0xcbf43926)}")
+    println($"adler32 {zlib.adler32("123456789") == u32(0x091e01de)}")
+    let a1 = zlib.adler32("1234")
+    println($"adler32 split {zlib.adler32More(a1, "56789") == u32(0x091e01de)}")
+
+    // 2. Interop with Python-generated gzip, zlib, and raw deflate payloads
+    let expected = "Hello, Lexell compression!"
+    let pyGz = fromHex("1f8b08000000000002fff348cdc9c9d751f049ad00321492f3730b8a528b8b33f3f3140149a493a81a000000")
+    let pyZl = fromHex("789cf348cdc9c9d751f049ad00321492f3730b8a528b8b33f3f314017e70099a")
+    let pyRaw = fromHex("f348cdc9c9d751f049ad00321492f3730b8a528b8b33f3f31401")
+    println($"py gzip {zlib.gunzip(&pyGz).unwrap() == expected}")
+    println($"py zlib {zlib.zlibDecompress(&pyZl).unwrap() == expected}")
+    println($"py raw {zlib.inflate(&pyRaw).unwrap() == expected}")
+
+    // 3. Empty payload round-trips
+    let eGz = zlib.gzip("").unwrap()
+    let eZl = zlib.zlibCompress("").unwrap()
+    let eRaw = zlib.deflate("").unwrap()
+    println($"empty roundtrip {zlib.gunzip(&eGz).unwrap() == ""} {zlib.zlibDecompress(&eZl).unwrap() == ""} {zlib.inflate(&eRaw).unwrap() == ""}")
+
+    // 4. All compression levels (-1..9) across gzip, zlib, and raw deflate
+    let sample = strings.repeat("The quick brown fox jumps over the lazy dog.\n", 40)
+    var gzOk = true
+    var zlOk = true
+    var rawOk = true
+    for lvl in -1..10 {
+        let g = zlib.gzipLevel(&sample, lvl).unwrap()
+        if zlib.gunzip(&g).unwrap() != sample { gzOk = false }
+        let z = zlib.zlibCompressLevel(&sample, lvl).unwrap()
+        if zlib.zlibDecompress(&z).unwrap() != sample { zlOk = false }
+        let r = zlib.deflateLevel(&sample, lvl).unwrap()
+        if zlib.inflate(&r).unwrap() != sample { rawOk = false }
+    }
+    println($"gzip levels {gzOk}")
+    println($"zlib levels {zlOk}")
+    println($"raw levels {rawOk}")
+
+    // 5. Auto-detect gzip and zlib headers
+    println($"auto detect {zlib.decompress(&pyGz).unwrap() == expected} {zlib.decompress(&pyZl).unwrap() == expected}")
+
+    // 6. Large (> 64 KiB CHUNK_SIZE) binary + repetitive payload
+    var big = ""
+    for i in 0..200000 {
+        big.addByte(byte((i * 31 + (i / 257)) & 255))
+    }
+    let bigGz = zlib.gzip(&big).unwrap()
+    let bigZl = zlib.zlibCompress(&big).unwrap()
+    let bigRaw = zlib.deflate(&big).unwrap()
+    println($"large 200k {len(bigGz) < len(big) && zlib.gunzip(&bigGz).unwrap() == big} {len(bigZl) < len(big) && zlib.zlibDecompress(&bigZl).unwrap() == big} {len(bigRaw) < len(big) && zlib.inflate(&bigRaw).unwrap() == big}")
+
+    // 7. Concatenated multi-member gzip (RFC 1952)
+    let m1 = zlib.gzip("first member; ").unwrap()
+    let m2 = zlib.gzip("second member; ").unwrap()
+    let m3 = zlib.gzip("third member!").unwrap()
+    let multi = m1 + m2 + m3
+    println($"multimember gzip {zlib.gunzip(&multi).unwrap() == "first member; second member; third member!"}")
+
+    // 8. Streaming Deflater + Inflater across small chunks
+    var def = zlib.newGzip(zlib.LEVEL_DEFAULT).unwrap()
+    var streamComp = ""
+    var pos = 0
+    while pos < len(big) {
+        let end = if pos + 7919 < len(big) { pos + 7919 } else { len(big) }
+        streamComp += def.write(big[pos..end]).unwrap()
+        pos = end
+    }
+    streamComp += def.finish().unwrap()
+    var inf = zlib.newGunzip().unwrap()
+    var streamOut = ""
+    pos = 0
+    while pos < len(streamComp) {
+        let end = if pos + 137 < len(streamComp) { pos + 137 } else { len(streamComp) }
+        streamOut += inf.write(streamComp[pos..end]).unwrap()
+        pos = end
+    }
+    inf.finish().unwrap()
+    println($"stream deflate+inflate {streamOut == big && inf.isDone()}")
+
+    // 9. Streaming Z_SYNC_FLUSH
+    var sd = zlib.newZlib(zlib.LEVEL_FAST).unwrap()
+    var si = zlib.newZlibDecompressor().unwrap()
+    let p1 = sd.write("hello ").unwrap() + sd.flush().unwrap()
+    let d1 = si.write(&p1).unwrap()
+    let p2 = sd.write("world").unwrap() + sd.finish().unwrap()
+    let d2 = si.write(&p2).unwrap()
+    si.finish().unwrap()
+    println($"stream sync flush {d1 == "hello " && d2 == "world"}")
+
+    // 10. Decompression bomb / maxOut limit checks (including 65536 chunk boundary)
+    let hundred = strings.repeat("A", 100)
+    let hundredGz = zlib.gzip(&hundred).unwrap()
+    println($"maxOut exact {zlib.gunzipMax(&hundredGz, 100).unwrap() == hundred}")
+    println($"maxOut overflow {zlib.gunzipMax(&hundredGz, 99).isErr()}")
+    let exactChunk = strings.repeat("B", 65536)
+    let exactChunkGz = zlib.gzip(&exactChunk).unwrap()
+    println($"maxOut 65536 boundary {zlib.gunzipMax(&exactChunkGz, 65536).unwrap() == exactChunk} {zlib.gunzipMax(&exactChunkGz, 65535).isErr()}")
+
+    // 11. Error paths: empty, corrupt, truncated, bad level, double finish
+    let errEmpty = zlib.gunzip("").isErr()
+    let errCorrupt = zlib.gunzip("not a gzip stream at all").isErr()
+    let errTrunc = zlib.gunzip(pyGz[0..len(pyGz) - 5]).isErr()
+    let errLevel = zlib.gzipLevel("abc", 10).isErr()
+    let errAgain = def.finish().isErr()
+    println($"errors {errEmpty} {errCorrupt} {errTrunc} {errLevel} {errAgain}")
+}
