@@ -23,6 +23,20 @@ import "./tmpl" as tm
 pub const CTYPES: []str = ["int64_t", "int32_t", "uint32_t", "uint64_t", "uint8_t", "__int128",
     "unsigned __int128", "double", "bool", "lxl_str", "void*", "void", "void"]
 
+pub fn vecCType(elem: int): str {
+    if elem == sema.T_FLOAT { return "lxl_vf64" }
+    if elem == sema.T_INT { return "lxl_vi64" }
+    if elem == sema.T_I32 { return "lxl_vi32" }
+    return "lxl_vu8"
+}
+
+fn vecSuf(elem: int): str {
+    if elem == sema.T_FLOAT { return "f64" }
+    if elem == sema.T_INT { return "i64" }
+    if elem == sema.T_I32 { return "i32" }
+    return "u8"
+}
+
 // ref's checks(c): whether the C makes a run-time check (each passes its location, a C
 // string); what holes stand for is not looked into.
 fn (c: &Checker) checks(n: int): bool {
@@ -496,6 +510,7 @@ fn mkHoleX(k: int, t: int, x: int): Hole { return Hole{k: k, t: t, f: -1, s: "",
 fn (c: mut &Checker) T(t: int): int {
     let k = c.pg.tk(t)
     if k == sema.TK_PRIM { return c.x.ct(&CTYPES[t]) }
+    if k == sema.TK_VEC { return c.x.ct(&(vecCType(c.pg.ta(t)))) }
     if k == sema.TK_SLICE { return c.x.ct("lxl_slice") }
     if k == sema.TK_CLO { return c.x.ct("lxl_clo") }
     return c.hole(mkHole(H_T, t, ""))
@@ -540,7 +555,7 @@ pub fn isPod(pg: mut &sema.Program, memo: mut &[]int, t: int): bool {
     var r = false
     if k == sema.TK_PRIM {
         r = t != sema.T_STR
-    } else if k == sema.TK_FN || k == sema.TK_REF || k == sema.TK_SLICE || k == sema.TK_CLO {
+    } else if k == sema.TK_FN || k == sema.TK_REF || k == sema.TK_SLICE || k == sema.TK_CLO || k == sema.TK_VEC {
         r = true
     } else if k == sema.TK_BOX {
         r = false
@@ -2873,6 +2888,19 @@ fn (c: mut &Checker) sFor(s: int) {
         c.emit(c.x.send())
         return
     }
+    if n.b < 0 && c.kind(n.a) == sx.N_CALL {
+        let cn = c.node(n.a)
+        if c.kind(cn.a) == sx.N_FIELDX && c.nd(cn.a).s == "chunks" {
+            let st = c.staticNs(c.nd(cn.a).a)
+            if st.k != ST_NONE && st.k != ST_MODULE {
+                let vt = c.staticType(st, c.nd(cn.a).line)
+                if vt >= 0 && c.pg.tk(vt) == sema.TK_VEC {
+                    c.forVecChunks(s, vt, cn.b, n.line)
+                    return
+                }
+            }
+        }
+    }
     var v = c.expr(c.forMoves(n.a), -1)
     if c.pg.tk(v.t) == sema.TK_REF { v = c.deref(v) }
     while c.pg.isRc(v.t) { v = c.rcValue(v) }       // SPEC 4.9: for x in r walks the value
@@ -3758,6 +3786,15 @@ fn (c: mut &Checker) static(e: int): St {
         return NOST
     }
     if n.kind == sx.N_INDEX {
+        if c.kind(n.a) == sx.N_NAME && c.nd(n.a).s == "vector" && c.lookupVar(&"vector", true) < 0 &&
+            c.pg.lookup(mod, &"vector").k < 0 {
+            if c.count(n.b) != 1 { c.err(n.line, "vector takes 1 type argument (float, int, i32, or byte)") }
+            let el = c.resolve(c.texpr(c.item(n.b, 0)), sema.P_INNER, n.line)
+            if sema.vecLanesFor(el) == 0 {
+                c.err(n.line, "vector element type must be float, int, i32, or byte, not " + c.tstr(el))
+            }
+            return stType(c.pg.mkVec(el))
+        }
         let b = c.static(n.a)
         if b.k == ST_DECL && (b.dk == sema.D_TYPE || b.dk == sema.D_FN || b.dk == D_VARIANT) {
             var r = stDecl(b.dk, b.di)
@@ -4254,6 +4291,12 @@ fn (c: mut &Checker) xField(e: int, exp: int): Val {
     if st.k != ST_NONE {
         let vst = c.static(e)
         if vst.k != ST_NONE { return c.staticValue(vst, e, exp) }
+        let vt = c.staticType(st, n.line)
+        if vt >= 0 && c.pg.tk(vt) == sema.TK_VEC && n.s == "lanes" {
+            let lanes = c.pg.vecLanes(vt)
+            let rt = if exp >= 0 && exp < sema.NINTS { exp } else { sema.T_INT }
+            return rv(c.cint(num.bigOf(lanes), rt), rt)
+        }
         if st.k == ST_DECL && st.dk == sema.D_TYPE && c.pg.types[st.di].form == sx.F_CLOSED {
             c.err(n.line, c.pg.types[st.di].name + " has no variant " + n.s)
         }
@@ -4549,8 +4592,16 @@ fn (c: mut &Checker) xUn(e: int, exp: int): Val {
         return rv(c.x.par(c.x.pre("!", v.c)), sema.T_BOOL)
     }
     if n.s == "~" {
+        if c.pg.tk(t) == sema.TK_VEC {
+            if c.pg.vecElem(t) == sema.T_FLOAT { c.err(n.line, "~ is not defined for " + c.tstr(t)) }
+            return rv(c.x.par(c.x.pre("~", v.c)), t)
+        }
         if t >= sema.NINTS { c.err(n.line, "~ needs an integer, not " + c.tstr(t)) }
         return rv(c.x.pcast(c.ct(&CTYPES[t]), c.x.pre("~", v.c)), t)
+    }
+    if c.pg.tk(t) == sema.TK_VEC {
+        if c.pg.vecElem(t) == sema.T_FLOAT { return rv(c.x.par(c.x.pre("-", v.c)), t) }
+        c.err(n.line, "unary - is not defined for " + c.tstr(t) + " (use " + c.tstr(t) + ".zero() -% v)")
     }
     if c.pg.tk(t) == sema.TK_PRIM {
         if t < sema.NINTS { return rv(c.x.call(&("rt_neg_" + sema.PRIM_NAMES[t]), [v.c, c.W(n.line)]), t) }
@@ -4926,6 +4977,43 @@ fn (c: mut &Checker) binop(op: &str, lv0: Val, r: &Arg, line: int, exp: int, has
     let rt = rv1.t
     let W = c.W(line)
     let cmp = isCmpOp(&op)
+    if c.pg.tk(lt) == sema.TK_VEC {
+        let el = c.pg.vecElem(lt)
+        let suf = vecSuf(el)
+        if op == "<<" || op == ">>" {
+            if el != sema.T_INT && el != sema.T_I32 {
+                c.err(line, op + " is supported on vector[int] and vector[i32], not " + c.tstr(lt))
+            }
+            if rt != sema.T_INT {
+                c.err(line, op + " needs an int shift count, not " + c.tstr(rt))
+            }
+            let fn0 = if op == "<<" { "__vec_shl_" } else { "__vec_shr_" }
+            return rv(c.x.call(&(fn0 + suf), [lv.c, rv1.c]), lt)
+        }
+        if lt != rt {
+            c.err(line, "operator " + op + " needs operands of the same type, not " + c.tstr(lt) + " and " + c.tstr(rt))
+        }
+        if cmp { return rv(c.x.par(c.x.bin(&op, lv.c, rv1.c)), c.pg.vecMask(lt)) }
+        if el == sema.T_FLOAT {
+            if op == "+" || op == "-" || op == "*" || op == "/" {
+                return rv(c.x.par(c.x.bin(&op, lv.c, rv1.c)), lt)
+            }
+        } else {
+            if op == "+" || op == "-" || op == "*" {
+                c.err(line, "vector integer arithmetic wraps: use " + op + "% instead of " + op + " on " + c.tstr(lt))
+            }
+            if op == "+%" { return rv(c.x.par(c.x.bin("+", lv.c, rv1.c)), lt) }
+            if op == "-%" { return rv(c.x.par(c.x.bin("-", lv.c, rv1.c)), lt) }
+            if op == "*%" {
+                if el != sema.T_I32 { c.err(line, "*% is supported on vector[i32], not " + c.tstr(lt)) }
+                return rv(c.x.par(c.x.bin("*", lv.c, rv1.c)), lt)
+            }
+            if op == "&" || op == "|" || op == "^" {
+                return rv(c.x.par(c.x.bin(&op, lv.c, rv1.c)), lt)
+            }
+        }
+        c.err(line, "operator " + op + " is not defined for " + c.tstr(lt))
+    }
     if c.pg.tk(lt) == sema.TK_PRIM && c.pg.tk(rt) == sema.TK_PRIM {
         let nm = &sema.PRIM_NAMES[lt]
         if op == "<<" || op == ">>" {
@@ -6733,6 +6821,7 @@ fn (c: mut &Checker) xCall(e: int, exp: int): Val {
                 let nm = if st.k == ST_TYPE { "?" } else { c.declName(st) }
                 c.err(fn1.line, nm + " has no associated function " + fn1.s)
             }
+            if c.pg.tk(t) == sema.TK_VEC { return c.vecStaticCall(t, &fn1.s, &args, n.line) }
             let sig = c.assocSig(t, fn1.s.clone(), n.line, false)
             c.implicitWhere(&sig, false, mut &args, n.line)
             let o = noOpts()
@@ -6741,6 +6830,14 @@ fn (c: mut &Checker) xCall(e: int, exp: int): Val {
         if st.k == ST_NONE {
             let recv = c.expr(fn1.a, -1)
             let base = if c.pg.tk(recv.t) == sema.TK_REF { c.pg.ta(recv.t) } else { recv.t }
+            if c.pg.tk(base) == sema.TK_VEC { return c.vecMethodCall(recv, base, &fn1.s, &args, n.line) }
+            if len(args) == 0 && (base == sema.T_INT || base == sema.T_U64 || base == sema.T_I32 || base == sema.T_U32) &&
+                (fn1.s == "trailingZeros" || fn1.s == "leadingZeros" || fn1.s == "countOnes") {
+                let v = c.rd(recv)
+                let w = if base == sema.T_INT || base == sema.T_U64 { "64" } else { "32" }
+                let op = if fn1.s == "trailingZeros" { "__bit_ctz" } else if fn1.s == "leadingZeros" { "__bit_clz" } else { "__bit_popcnt" }
+                return rv(c.x.call(&(op + w), [v.c]), sema.T_INT)
+            }
             if fn1.s == "unshare" && len(args) == 0 && c.pg.isRc(base) { return c.rcUnshare(recv, base, n.line) }
             let rcShare = fn1.s == "share" && len(args) == 0 &&
                 (c.pg.isRc(base) || (c.pg.tk(base) == sema.TK_INST && c.pg.ta(base) == c.pg.shared))
@@ -7461,4 +7558,365 @@ fn (c: mut &Checker) constInit(e: int, t: int): int {
         }
     }
     c.err(line, "not a constant")
+}
+
+// ---------------------------------------------------------------- explicit SIMD vectors
+
+fn (c: mut &Checker) vecTarget(pNode: int, wantMut: bool, line: int): Val {
+    if c.kind(pNode) == sx.N_BORROW {
+        let inner = c.nd(pNode).a
+        let ik = c.kind(inner)
+        if ik == sx.N_NAME || ik == sx.N_FIELDX || ik == sx.N_INDEX {
+            let isMut = (c.nd(pNode).flags & sx.MUT) != 0
+            if wantMut && !isMut {
+                c.err(line, "store needs a mutable borrow (mut &...)")
+            }
+            let v = c.rcRead(c.expr(inner, -1))
+            if wantMut && v.cat == CAT_PLACE && !v.mutable && c.pg.tk(v.t) != sema.TK_SLICE {
+                c.err(line, "cannot borrow an immutable value as mutable")
+            }
+            return v
+        }
+    }
+    return c.rcRead(c.expr(pNode, -1))
+}
+
+fn (c: mut &Checker) vecAddr(pNode: int, iNode: int, el: int, lanes: int, forStore: bool, line: int): int {
+    var pv = c.vecTarget(pNode, forStore, line)
+    let pk = c.pg.tk(pv.t)
+    if forStore {
+        let ok = (pk == sema.TK_ARR || pk == sema.TK_SLICE) && c.pg.ta(pv.t) == el
+        if !ok { c.err(line, "store needs a mutable array or slice of " + c.tstr(el) + ", not " + c.tstr(pv.t)) }
+        let isMut = if pk == sema.TK_SLICE { c.pg.tm(pv.t) } else { pv.mutable }
+        if !isMut { c.err(line, "store needs a mutable array or slice of " + c.tstr(el)) }
+    } else {
+        let ok = (el == sema.T_BYTE && pv.t == sema.T_STR) ||
+            ((pk == sema.TK_ARR || pk == sema.TK_SLICE) && c.pg.ta(pv.t) == el)
+        if !ok {
+            let extra = if el == sema.T_BYTE { ", or str" } else { "" }
+            c.err(line, "load needs an array or slice of " + c.tstr(el) + extra + ", not " + c.tstr(pv.t))
+        }
+    }
+    if pv.cat == CAT_RV { pv = c.holdtmpSrc(pv.c, pv.t, true, pv) }
+    if c.acts(iNode) { pv = c.seq(pv) }
+    let mark = len(c.cx.pending)
+    if pv.cat == CAT_PLACE { c.hold(pv, HM_SHARED, c.newCid(), line) }
+    let iv = c.intIndex(iNode)
+    c.cutPending(mark)
+    if forStore && pv.cat == CAT_PLACE && pv.root >= 0 {
+        c.frozenAt(pv.root, &pv.path, FR_MUT, line)
+        c.checkPending(pv.root, &pv.path, line, false)
+    }
+    let pex = c.x.par(pv.c)
+    let data = if pv.t == sema.T_STR {
+        c.x.pcast(c.x.ptr(c.ct("uint8_t")), c.x.dot(pex, "p"))
+    } else {
+        c.x.pcast(c.x.ptr(c.T(el)), c.x.dot(pex, "data"))
+    }
+    let length = if pv.t == sema.T_STR {
+        c.x.pcast(c.ct("int64_t"), c.x.dot(pex, "len"))
+    } else {
+        c.x.dot(pex, "len")
+    }
+    let vn = c.fresh("vn")
+    let vi = c.fresh("vi")
+    c.emit(c.x.decl(c.ct("int64_t"), &vn, length))
+    c.emit(c.x.decl(c.ct("int64_t"), &vi, iv))
+    let vne = c.nm(&vn)
+    let vie = c.nm(&vi)
+    let limit = c.x.cond(c.x.bin(">=", vne, c.ll(lanes)), c.x.bin("-", vne, c.ll(lanes - 1)), c.ll(0))
+    let idx = c.x.call("rt_idx", [vie, limit, c.W(line)])
+    return c.x.bin("+", data, idx)
+}
+
+type VecPartAddr = value record {
+    ptr: int
+    cnt: int
+}
+
+fn (c: mut &Checker) vecPartialAddr(pNode: int, iNode: int, el: int, lanes: int, forStore: bool, line: int): VecPartAddr {
+    var pv = c.vecTarget(pNode, forStore, line)
+    let pk = c.pg.tk(pv.t)
+    if forStore {
+        let ok = (pk == sema.TK_ARR || pk == sema.TK_SLICE) && c.pg.ta(pv.t) == el
+        if !ok { c.err(line, "storePartial needs a mutable array or slice of " + c.tstr(el) + ", not " + c.tstr(pv.t)) }
+        let isMut = if pk == sema.TK_SLICE { c.pg.tm(pv.t) } else { pv.mutable }
+        if !isMut { c.err(line, "storePartial needs a mutable array or slice of " + c.tstr(el)) }
+    } else {
+        let ok = (el == sema.T_BYTE && pv.t == sema.T_STR) ||
+            ((pk == sema.TK_ARR || pk == sema.TK_SLICE) && c.pg.ta(pv.t) == el)
+        if !ok {
+            let extra = if el == sema.T_BYTE { ", or str" } else { "" }
+            c.err(line, "loadPartial needs an array or slice of " + c.tstr(el) + extra + ", not " + c.tstr(pv.t))
+        }
+    }
+    if pv.cat == CAT_RV { pv = c.holdtmpSrc(pv.c, pv.t, true, pv) }
+    if c.acts(iNode) { pv = c.seq(pv) }
+    let mark = len(c.cx.pending)
+    if pv.cat == CAT_PLACE { c.hold(pv, HM_SHARED, c.newCid(), line) }
+    let iv = c.intIndex(iNode)
+    c.cutPending(mark)
+    if forStore && pv.cat == CAT_PLACE && pv.root >= 0 {
+        c.frozenAt(pv.root, &pv.path, FR_MUT, line)
+        c.checkPending(pv.root, &pv.path, line, false)
+    }
+    let pex = c.x.par(pv.c)
+    let data = if pv.t == sema.T_STR {
+        c.x.pcast(c.x.ptr(c.ct("uint8_t")), c.x.dot(pex, "p"))
+    } else {
+        c.x.pcast(c.x.ptr(c.T(el)), c.x.dot(pex, "data"))
+    }
+    let length = if pv.t == sema.T_STR {
+        c.x.pcast(c.ct("int64_t"), c.x.dot(pex, "len"))
+    } else {
+        c.x.dot(pex, "len")
+    }
+    let vn = c.fresh("vn")
+    let vi = c.fresh("vi")
+    let vr = c.fresh("vr")
+    let i64 = c.ct("int64_t")
+    c.emit(c.x.decl(i64, &vn, length))
+    let vne = c.nm(&vn)
+    c.emit(c.x.decl(i64, &vi, c.x.call("rt_idx", [iv, c.x.bin("+", vne, c.ll(1)), c.W(line)])))
+    let vie = c.nm(&vi)
+    c.emit(c.x.decl(i64, &vr, c.x.bin("-", vne, vie)))
+    let vre = c.nm(&vr)
+    let cnt = c.x.cond(c.x.bin(">", vre, c.ll(lanes)), c.ll(lanes), vre)
+    return VecPartAddr{ptr: c.x.bin("+", data, vie), cnt: cnt}
+}
+
+fn (c: mut &Checker) vecStaticCall(t: int, name: &str, args: &[]Arg, line: int): Val {
+    let el = c.pg.vecElem(t)
+    let lanes = c.pg.vecLanes(t)
+    let suf = vecSuf(el)
+    if name == "zero" {
+        if len(args) != 0 { c.err(line, c.tstr(t) + ".zero() takes no arguments") }
+        return rv(c.x.call(&("__vec_zero_" + suf), []), t)
+    }
+    if name == "splat" {
+        if len(args) != 1 { c.err(line, c.tstr(t) + ".splat(x) takes 1 argument") }
+        let xv = c.rd(c.expr(args[0].n, el))
+        if xv.t != el { c.err(line, c.tstr(t) + ".splat expects " + c.tstr(el) + ", not " + c.tstr(xv.t)) }
+        return rv(c.x.call(&("__vec_splat_" + suf), [xv.c]), t)
+    }
+    if name == "load" {
+        if len(args) != 2 { c.err(line, c.tstr(t) + ".load(p, i) takes 2 arguments") }
+        let ptr = c.vecAddr(args[0].n, args[1].n, el, lanes, false, line)
+        return rv(c.x.call(&("__vec_load_" + suf), [ptr]), t)
+    }
+    if name == "loadPartial" {
+        if len(args) != 3 { c.err(line, c.tstr(t) + ".loadPartial(p, i, fill) takes 3 arguments") }
+        let pa = c.vecPartialAddr(args[0].n, args[1].n, el, lanes, false, line)
+        let fv = c.rd(c.expr(args[2].n, el))
+        if fv.t != el { c.err(line, c.tstr(t) + ".loadPartial fill expects " + c.tstr(el) + ", not " + c.tstr(fv.t)) }
+        return rv(c.x.call(&("__vec_loadp_" + suf), [pa.ptr, pa.cnt, fv.c]), t)
+    }
+    if name == "tailMask" {
+        if len(args) != 1 { c.err(line, c.tstr(t) + ".tailMask(n) takes 1 argument") }
+        let nv = c.intIndex(args[0].n)
+        let vt = c.fresh("vm")
+        c.emit(c.x.decl(c.ct("int64_t"), &vt, nv))
+        let vtn = c.nm(&vt)
+        let fullMask = if lanes == 32 { "4294967295ULL" } else if lanes == 8 { "255ULL" } else { "15ULL" }
+        let sh = c.x.bin("-", c.x.bin("<<", c.x.num("1ULL"), vtn), c.x.num("1ULL"))
+        let res = c.x.cond(c.x.bin("<=", vtn, c.ll(0)), c.x.num("0ULL"),
+            c.x.cond(c.x.bin(">=", vtn, c.ll(lanes)), c.x.num(fullMask), sh))
+        return rv(c.x.par(res), sema.T_U64)
+    }
+    if name == "chunks" {
+        c.err(line, c.tstr(t) + ".chunks(...) can only be used in a for loop: for v in " + c.tstr(t) + ".chunks(xs)")
+    }
+    c.err(line, c.tstr(t) + " has no associated function '" + name + "'")
+}
+
+fn (c: mut &Checker) vecMethodCall(recv: Val, base: int, name: &str, args: &[]Arg, line: int): Val {
+    let el = c.pg.vecElem(base)
+    let lanes = c.pg.vecLanes(base)
+    let suf = vecSuf(el)
+    var v = c.rd(recv)
+    if name == "store" {
+        if len(args) != 2 { c.err(line, "store(p, i) takes 2 arguments") }
+        if c.acts(args[0].n) || c.acts(args[1].n) { v = c.seq(v) }
+        let ptr = c.vecAddr(args[0].n, args[1].n, el, lanes, true, line)
+        c.emitx(c.x.call(&("__vec_store_" + suf), [ptr, v.c]))
+        return voidVal(false)
+    }
+    if name == "storePartial" {
+        if len(args) != 2 { c.err(line, "storePartial(p, i) takes 2 arguments") }
+        if c.acts(args[0].n) || c.acts(args[1].n) { v = c.seq(v) }
+        let pa = c.vecPartialAddr(args[0].n, args[1].n, el, lanes, true, line)
+        c.emitx(c.x.call(&("__vec_storep_" + suf), [pa.ptr, pa.cnt, v.c]))
+        return voidVal(false)
+    }
+    if name == "sum" {
+        if len(args) != 0 { c.err(line, "sum() takes no arguments") }
+        return rv(c.x.call(&("__vec_sum_" + suf), [v.c]), el)
+    }
+    if name == "reduceMin" {
+        if len(args) != 0 { c.err(line, "reduceMin() takes no arguments") }
+        return rv(c.x.call(&("__vec_rmin_" + suf), [v.c]), el)
+    }
+    if name == "reduceMax" {
+        if len(args) != 0 { c.err(line, "reduceMax() takes no arguments") }
+        return rv(c.x.call(&("__vec_rmax_" + suf), [v.c]), el)
+    }
+    if name == "min" || name == "max" {
+        if len(args) != 1 { c.err(line, name + "(other) takes 1 argument") }
+        v = c.before1(v, args[0].n)
+        let b = c.rd(c.expr(args[0].n, base))
+        if b.t != base { c.err(line, name + " expects " + c.tstr(base) + ", not " + c.tstr(b.t)) }
+        let fn0 = if name == "min" { "__vec_min_" } else { "__vec_max_" }
+        return rv(c.x.call(&(fn0 + suf), [v.c, b.c]), base)
+    }
+    if name == "fma" {
+        if el != sema.T_FLOAT { c.err(line, "fma is only defined for vector[float]") }
+        if len(args) != 2 { c.err(line, "fma(b, c) takes 2 arguments") }
+        if c.acts(args[0].n) || c.acts(args[1].n) { v = c.seq(v) }
+        var b = c.rd(c.expr(args[0].n, base))
+        if b.t != base { c.err(line, "fma expects " + c.tstr(base) + ", not " + c.tstr(b.t)) }
+        b = c.before1(b, args[1].n)
+        let cc = c.rd(c.expr(args[1].n, base))
+        if cc.t != base { c.err(line, "fma expects " + c.tstr(base) + ", not " + c.tstr(cc.t)) }
+        return rv(c.x.call("__vec_fma_f64", [v.c, b.c, cc.c]), base)
+    }
+    if name == "sqrt" || name == "abs" {
+        if el != sema.T_FLOAT { c.err(line, name + " is only defined for vector[float]") }
+        if len(args) != 0 { c.err(line, name + "() takes no arguments") }
+        let fn0 = if name == "sqrt" { "__vec_sqrt_f64" } else { "__vec_abs_f64" }
+        return rv(c.x.call(fn0, [v.c]), base)
+    }
+    if name == "select" {
+        if el == sema.T_FLOAT { c.err(line, "select must be called on an integer/byte mask vector, not vector[float]") }
+        if len(args) != 2 { c.err(line, "select(whenTrue, whenFalse) takes 2 arguments") }
+        if c.acts(args[0].n) || c.acts(args[1].n) { v = c.seq(v) }
+        var a = c.rd(c.expr(args[0].n, -1))
+        if c.pg.tk(a.t) != sema.TK_VEC || c.pg.vecMask(a.t) != base {
+            c.err(line, "select expects vectors matching mask " + c.tstr(base) + ", not " + c.tstr(a.t))
+        }
+        a = c.before1(a, args[1].n)
+        let b = c.rd(c.expr(args[1].n, a.t))
+        if b.t != a.t { c.err(line, "select operands must have the same type, not " + c.tstr(a.t) + " and " + c.tstr(b.t)) }
+        return rv(c.x.call(&("__vec_select_" + vecSuf(c.pg.vecElem(a.t))), [v.c, a.c, b.c]), a.t)
+    }
+    if name == "bitmask" {
+        if len(args) != 0 { c.err(line, "bitmask() takes no arguments") }
+        return rv(c.x.call(&("__vec_bitmask_" + suf), [v.c]), sema.T_U64)
+    }
+    if name == "any" {
+        if len(args) != 0 { c.err(line, "any() takes no arguments") }
+        return rv(c.x.par(c.x.bin("!=", c.x.call(&("__vec_bitmask_" + suf), [v.c]), c.x.num("0ULL"))), sema.T_BOOL)
+    }
+    if name == "all" {
+        if len(args) != 0 { c.err(line, "all() takes no arguments") }
+        let allBits = if lanes == 32 { "4294967295ULL" } else if lanes == 8 { "255ULL" } else { "15ULL" }
+        return rv(c.x.par(c.x.bin("==", c.x.call(&("__vec_bitmask_" + suf), [v.c]), c.x.num(allBits))), sema.T_BOOL)
+    }
+    if name == "shuffle" {
+        if el != sema.T_BYTE { c.err(line, "shuffle is only defined for vector[byte]") }
+        if len(args) != 1 { c.err(line, "shuffle(idx) takes 1 argument") }
+        v = c.before1(v, args[0].n)
+        let idx = c.rd(c.expr(args[0].n, base))
+        if idx.t != base { c.err(line, "shuffle expects vector[byte], not " + c.tstr(idx.t)) }
+        return rv(c.x.call("__vec_shuffle_u8", [v.c, idx.c]), base)
+    }
+    if name == "lane" {
+        if len(args) != 1 { c.err(line, "lane(k) takes 1 argument") }
+        v = c.before1(v, args[0].n)
+        let kv = c.intIndex(args[0].n)
+        let idx = c.x.call("rt_idx", [kv, c.ll(lanes), c.W(line)])
+        return rv(c.x.call(&("__vec_lane_" + suf), [v.c, idx]), el)
+    }
+    c.err(line, c.tstr(base) + " has no method '" + name + "'")
+}
+
+fn (c: mut &Checker) forVecChunks(s: int, vt: int, argsList: int, line: int) {
+    let n = c.node(s)
+    let name = &n.s
+    let el = c.pg.vecElem(vt)
+    let lanes = c.pg.vecLanes(vt)
+    let suf = vecSuf(el)
+    let argc = c.count(argsList)
+    if argc != 1 && argc != 2 {
+        c.err(line, c.tstr(vt) + ".chunks takes 1 or 2 arguments: chunks(xs) or chunks(xs, mut &i)")
+    }
+    let arg0 = c.item(argsList, 0)
+    var pv = c.vecTarget(arg0, false, line)
+    let pk = c.pg.tk(pv.t)
+    let ok = (el == sema.T_BYTE && pv.t == sema.T_STR) ||
+        ((pk == sema.TK_ARR || pk == sema.TK_SLICE) && c.pg.ta(pv.t) == el)
+    if !ok {
+        let extra = if el == sema.T_BYTE { ", or str" } else { "" }
+        c.err(line, "chunks needs an array or slice of " + c.tstr(el) + extra + ", not " + c.tstr(pv.t))
+    }
+    if pv.cat == CAT_RV { pv = c.holdtmpSrc(pv.c, pv.t, true, pv) }
+    if pv.cat == CAT_PLACE && pv.gk >= 0 { c.err(line, "cannot iterate over a global") }
+
+    let pex = c.x.par(pv.c)
+    let ptrTy = if pv.t == sema.T_STR { c.x.ptr(c.ct("uint8_t")) } else { c.x.ptr(c.T(el)) }
+    let dataExpr = if pv.t == sema.T_STR {
+        c.x.pcast(ptrTy, c.x.dot(pex, "p"))
+    } else {
+        c.x.pcast(ptrTy, c.x.dot(pex, "data"))
+    }
+    let lenExpr = if pv.t == sema.T_STR {
+        c.x.pcast(c.ct("int64_t"), c.x.dot(pex, "len"))
+    } else {
+        c.x.dot(pex, "len")
+    }
+    let vp = c.fresh("vp")
+    let vend = c.fresh("vend")
+    let i64 = c.ct("int64_t")
+    c.emit(c.x.decl(ptrTy, &vp, dataExpr))
+    c.emit(c.x.decl(i64, &vend, c.x.bin("-", lenExpr, c.ll(lanes - 1))))
+    let vpn = c.nm(&vp)
+    let vendn = c.nm(&vend)
+
+    var ixExpr = -1
+    var ivRoot = -1
+    var ivPath: str = ""
+    if argc == 1 {
+        let vi = c.fresh("vi")
+        ixExpr = c.nm(&vi)
+        c.emit(c.x.sfor(c.x.decl(i64, &vi, c.ll(0)), c.x.bin("<", ixExpr, vendn), c.x.asg(ixExpr, c.x.bin("+", ixExpr, c.ll(lanes)))))
+    } else {
+        let arg1 = c.item(argsList, 1)
+        let mark = len(c.cx.pending)
+        if pv.cat == CAT_PLACE { c.hold(pv, HM_SHARED, c.newCid(), line) }
+        if c.kind(arg1) == sx.N_BORROW && (c.nd(arg1).flags & sx.MUT) != 0 {
+            let iv = c.expr(c.nd(arg1).a, -1)
+            if iv.t != sema.T_INT || iv.cat != CAT_PLACE || !iv.mutable {
+                c.err(line, "chunks cursor must be a mutable int variable")
+            }
+            if iv.root >= 0 {
+                c.frozenAt(iv.root, &iv.path, FR_MUT, line)
+                c.checkPending(iv.root, &iv.path, line, false)
+                ivRoot = iv.root
+                ivPath = iv.path.clone()
+            }
+            ixExpr = iv.c
+        } else {
+            let refv = c.expr(arg1, -1)
+            if c.pg.tk(refv.t) != sema.TK_REF || !c.pg.tm(refv.t) || c.pg.ta(refv.t) != sema.T_INT {
+                c.err(line, "chunks second argument must be mut &int (e.g. mut &i), not " + c.tstr(refv.t))
+            }
+            let dv = c.deref(refv)
+            ixExpr = dv.c
+        }
+        c.cutPending(mark)
+        c.emit(c.x.if1(c.x.bin("<", ixExpr, c.ll(0)), c.x.sx(c.x.call("rt_idx", [ixExpr, c.ll(0), c.W(line)]))))
+        c.emit(c.x.sfor(-1, c.x.bin("<", ixExpr, vendn), c.x.asg(ixExpr, c.x.bin("+", ixExpr, c.ll(lanes)))))
+    }
+
+    c.cx.ind += 1
+    let xn = c.fresh(&("v_" + name + "_"))
+    c.loopStart(c.snapshot(), false)
+    if pv.root >= 0 { c.freezeAt(pv.root, &pv.path, false, "the chunks loop", -1) }
+    if ivRoot >= 0 { c.freezeAt(ivRoot, &ivPath, false, "the chunks loop", -1) }
+    let loadE = c.x.call(&("__vec_load_" + suf), [c.x.bin("+", vpn, ixExpr)])
+    c.emit(c.x.decl(c.T(vt), &xn, loadE))
+    let x = c.newVar(&name, &xn, vt, false, VK_LOCAL, line)
+    c.declare(x)
+    c.loopEnd(n.c, line)
+    c.cx.ind -= 1
+    c.emit(c.x.send())
 }

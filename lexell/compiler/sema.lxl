@@ -53,6 +53,7 @@ pub const TK_INST = 6
 pub const TK_TP = 7
 pub const TK_SELF = 8
 pub const TK_BOX = 9         // box I (interface value) or box fn(...) (escaping closure): a = inner
+pub const TK_VEC = 10        // vector[E]: a = element prim (T_FLOAT/T_INT/T_I32/T_BYTE), b = lanes
 
 pub type Ty = value record {
     pub k: int
@@ -467,6 +468,21 @@ pub fn (pg: mut &Program) mkClo(ps: &[]int, r: int): int { return pg.intern(TK_C
 pub fn (pg: mut &Program) mkInst(d: int, args: &[]int): int { return pg.intern(TK_INST, d, 0, false, args) }
 pub fn (pg: mut &Program) mkTp(tp: int): int { return pg.intern(TK_TP, tp, 0, false, &[]) }
 pub fn (pg: mut &Program) mkBox(inner: int): int { return pg.intern(TK_BOX, inner, 0, false, &[]) }
+pub fn vecLanesFor(elem: int): int {
+    if elem == T_FLOAT { return 4 }
+    if elem == T_INT { return 4 }
+    if elem == T_I32 { return 8 }
+    if elem == T_BYTE { return 32 }
+    return 0
+}
+pub fn (pg: mut &Program) mkVec(elem: int): int { return pg.intern(TK_VEC, elem, vecLanesFor(elem), false, &[]) }
+pub fn (pg: &Program) isVec(t: int): bool { return pg.tys[t].k == TK_VEC }
+pub fn (pg: &Program) vecElem(t: int): int { return pg.tys[t].a }
+pub fn (pg: &Program) vecLanes(t: int): int { return pg.tys[t].b }
+pub fn (pg: mut &Program) vecMask(t: int): int {
+    let e = pg.tys[t].a
+    return pg.mkVec(if e == T_FLOAT { T_INT } else { e })
+}
 // ref's ('inst', d, None): a generic type named without its arguments (check's static_type).
 pub fn (pg: mut &Program) mkBare(d: int): int { return pg.intern(TK_INST, d, 0, true, &[]) }
 pub fn (pg: &Program) isBare(t: int): bool { return pg.tys[t].k == TK_INST && pg.tys[t].m }
@@ -515,6 +531,7 @@ pub fn (pg: &Program) tstr(t: int): str {
         TK_REF { return (if pg.tm(t) { "mut &" } else { "&" }) + pg.tstr(pg.ta(t)) }
         TK_SLICE { return (if pg.tm(t) { "mut &[" } else { "&[" }) + pg.tstr(pg.ta(t)) + "]" }
         TK_BOX { return "box " + pg.tstr(pg.ta(t)) }
+        TK_VEC { return "vector[" + PRIM_NAMES[pg.ta(t)] + "]" }
         TK_FN, TK_CLO {
             var b = ""
             if k == TK_CLO { b.addByte('&') }
@@ -574,7 +591,7 @@ pub fn (pg: mut &Program) subst(t: int, env: &[]int): int {
             let r = envGet(env, -1)
             return if r >= 0 { r } else { t }
         }
-        TK_PRIM { return t }
+        TK_PRIM, TK_VEC { return t }
         TK_ARR { return pg.mkArr(pg.subst(pg.ta(t), env)) }
         TK_BOX { return pg.mkBox(pg.subst(pg.ta(t), env)) }
         TK_REF, TK_SLICE { return pg.intern(k, pg.subst(pg.ta(t), env), 0, pg.tm(t), &[]) }
@@ -591,7 +608,7 @@ pub fn (pg: &Program) hasTp(t: int, tps: &[]int): bool {
     let k = pg.tk(t)
     match k {
         TK_TP { return len(tps) == 0 || contains(tps, pg.ta(t)) }
-        TK_PRIM, TK_SELF { return false }
+        TK_PRIM, TK_SELF, TK_VEC { return false }
         TK_ARR, TK_REF, TK_SLICE, TK_BOX { return pg.hasTp(pg.ta(t), tps) }
         else {}
     }
@@ -605,7 +622,7 @@ pub fn (pg: &Program) hasSelf(t: int): bool {
     let k = pg.tk(t)
     match k {
         TK_SELF { return true }
-        TK_PRIM, TK_TP { return false }
+        TK_PRIM, TK_TP, TK_VEC { return false }
         TK_ARR, TK_REF, TK_SLICE, TK_BOX { return pg.hasSelf(pg.ta(t)) }
         else {}
     }
@@ -651,7 +668,7 @@ pub fn (pg: &Program) unify(p: int, t: int, bind: mut &[]int, tps: &[]int): bool
     }
     if k != pg.tk(t) { return false }
     match k {
-        TK_PRIM, TK_TP, TK_SELF { return p == t }
+        TK_PRIM, TK_TP, TK_SELF, TK_VEC { return p == t }
         TK_ARR, TK_BOX { return pg.unify(pg.ta(p), pg.ta(t), bind, tps) }
         TK_REF, TK_SLICE { return pg.tm(p) == pg.tm(t) && pg.unify(pg.ta(p), pg.ta(t), bind, tps) }
         TK_FN, TK_CLO {
@@ -1007,7 +1024,7 @@ fn (pg: mut &Program) isCopyAt(t: int, depth: int): bool {
     if depth > 5000 { pg.tooDeep() }
     match pg.tk(t) {
         TK_PRIM { return pg.ta(t) != T_STR || pg.legacy }       // str is owned (design/owned-str.md)
-        TK_FN, TK_REF, TK_SLICE, TK_CLO { return true }
+        TK_FN, TK_REF, TK_SLICE, TK_CLO, TK_VEC { return true }
         TK_ARR, TK_SELF, TK_BOX { return false }
         TK_TP { return pg.tparams[pg.ta(t)].copy }
         else {}
@@ -1645,6 +1662,17 @@ pub fn (pg: mut &Program) resolveType(a: int, m: int, env: &[]int, pos: int, whe
             return p
         }
         s = pg.lookup(m, &name)
+        if name == "vector" && s.k < 0 {
+            if pg.count(m, n.b) != 1 { pg.err(m, w, "vector takes 1 type argument (float, int, i32, or byte)") }
+            let el = pg.resolveType(pg.item(m, n.b, 0), m, env, P_INNER, w)
+            if vecLanesFor(el) == 0 {
+                pg.err(m, w, "vector element type must be float, int, i32, or byte, not " + pg.tstr(el))
+            }
+            if pos == P_FIELD || pos == P_ELEM || pos == P_GLOBAL || pos == P_REF_INNER || pos == P_BOX || pos == P_INNER {
+                pg.err(m, w, "vector[" + pg.tstr(el) + "] cannot be used in a field, array, slice, global, or borrow")
+            }
+            return pg.mkVec(el)
+        }
     } else {
         let first = pg.nd(m, pg.item(m, n.a, 0)).s.clone()
         let target = pg.importOf(m, &first)
@@ -1685,7 +1713,11 @@ pub fn (pg: mut &Program) resolveType(a: int, m: int, env: &[]int, pos: int, whe
             append(mut &env2, pg.types[d].tparams[i])
             append(mut &env2, targs[i])
         }
-        return pg.subst(target, &env2)
+        let r = pg.subst(target, &env2)
+        if pg.tk(r) == TK_VEC && (pos == P_FIELD || pos == P_ELEM || pos == P_GLOBAL || pos == P_REF_INNER || pos == P_BOX || pos == P_INNER) {
+            pg.err(m, w, pg.tstr(r) + " cannot be used in a field, array, slice, global, or borrow")
+        }
+        return r
     }
     let t = pg.mkInst(d, &targs)
     if pg.resolved {
@@ -1731,6 +1763,9 @@ pub fn (pg: mut &Program) checkTargs(targs: &[]int, tparams: &[]int, m: int, lin
             let what = if t == T_NEVER { "never" } else { "inferred as no result (nothing)" }
             pg.err(m, line, "type parameter " + pn + " cannot be " + what + ": never and no result are not " +
                 "types, so they cannot be type arguments")
+        }
+        if pg.tk(t) == TK_VEC {
+            pg.err(m, line, pg.tstr(t) + " cannot be a generic type argument yet (type parameter " + pn + ")")
         }
         pg.checkBorrowTarg(t, p, m, line)
         if pg.tparams[p].copy && !pg.isCopy(t) && pg.soft(t) {

@@ -26,6 +26,8 @@ import "decimal"
 import "math"
 import "serde"
 
+type VB = vector[byte]
+
 // ---------------------------------------------------------------- types & options
 
 pub type Format = value closed {
@@ -483,10 +485,20 @@ fn hexVal(b: byte): int {
 
 fn decodePgTextField(raw: &[byte]): str {
     var hasSlash = false
-    for i in 0..len(raw) {
-        if raw[i] == '\\' {
-            hasSlash = true
-            break
+    var k = 0
+    if len(raw) >= VB.lanes {
+        let vSlash = VB.splat('\\')
+        for v in VB.chunks(raw, mut &k) {
+            if (v == vSlash).any() { hasSlash = true; break }
+        }
+    }
+    if !hasSlash {
+        while k < len(raw) {
+            if raw[k] == '\\' {
+                hasSlash = true
+                break
+            }
+            k += 1
         }
     }
     if !hasSlash { return strFromBytes(raw) }
@@ -814,46 +826,80 @@ fn (r: mut &Reader) nextCsvRow(): Result[Option[Row], Error] {
                 append(mut &cells, Cell{value: strFromBytes(&fieldBuf), isNull: false, quoted: true})
                 if endRow { break }
             } else {
-                // Unquoted field
+                // Unquoted field: scan buffered bytes in 32-byte vector chunks
                 fieldBuf = []
+                var val = ""
+                var hasDirect = false
                 var endRow = false
+                let stopQ = if !noQ && !lazyQ { quote } else { delim }
                 while true {
-                    match try r.peekByte() {
-                        None { endRow = true; break }
-                        Some(b) {
-                            if b == delim {
-                                r.pos += 1
-                                col += 1
-                                break
-                            }
-                            if b == '\n' || b == '\r' {
-                                let _nl = try r.consumeNewline()
-                                endRow = true
-                                break
-                            }
-                            if !noQ && !lazyQ && b == quote {
-                                return Err(errAt(r.line, col, "bare quote in unquoted field"))
-                            }
+                    if r.pos >= r.end {
+                        let avail = try r.ensure(1)
+                        if avail == 0 { endRow = true; break }
+                    }
+                    let start = r.pos
+                    let end = r.end
+                    var p = start
+                    if end - p >= VB.lanes {
+                        let vDelim = VB.splat(delim)
+                        let vNl    = VB.splat('\n')
+                        let vCr    = VB.splat('\r')
+                        let vQuote = VB.splat(stopQ)
+                        var hit = 0
+                        let view = r.buf[0..end]
+                        for v in VB.chunks(&view, mut &p) {
+                            let m = ((v == vDelim) | (v == vNl) | (v == vCr) | (v == vQuote)).bitmask()
+                            if m != u64(0) { hit = m.trailingZeros(); break }
+                        }
+                        p += hit
+                    }
+                    while p < end {
+                        let b = r.buf[p]
+                        if b == delim || b == '\n' || b == '\r' || b == stopQ { break }
+                        p += 1
+                    }
+                    let segLen = p - start
+                    if maxField > 0 && len(fieldBuf) + segLen > maxField {
+                        let overCol = col + (maxField - len(fieldBuf))
+                        return Err(errAt(r.line, overCol, "field exceeds maxFieldBytes limit"))
+                    }
+                    r.pos = p
+                    col += segLen
+                    if p < end {
+                        let b = r.buf[p]
+                        if !noQ && !lazyQ && b == quote {
+                            return Err(errAt(r.line, col, "bare quote in unquoted field"))
+                        }
+                        if len(fieldBuf) == 0 && !trimSp {
+                            val = strFromBytes(&r.buf[start..p])
+                            hasDirect = true
+                        } else {
+                            for k in start..p { append(mut &fieldBuf, r.buf[k]) }
+                        }
+                        if b == delim {
                             r.pos += 1
                             col += 1
-                            if maxField > 0 && len(fieldBuf) >= maxField {
-                                return Err(errAt(r.line, col, "field exceeds maxFieldBytes limit"))
-                            }
-                            append(mut &fieldBuf, b)
-                        }
-                    }
-                }
-                if trimSp {
-                    while len(fieldBuf) > 0 {
-                        let last = fieldBuf[len(fieldBuf) - 1]
-                        if last == ' ' || (last == '\t' && delim != '\t') {
-                            let _p = pop(mut &fieldBuf)
                         } else {
-                            break
+                            let _nl = try r.consumeNewline()
+                            endRow = true
+                        }
+                        break
+                    }
+                    for k in start..p { append(mut &fieldBuf, r.buf[k]) }
+                }
+                if !hasDirect {
+                    if trimSp {
+                        while len(fieldBuf) > 0 {
+                            let last = fieldBuf[len(fieldBuf) - 1]
+                            if last == ' ' || (last == '\t' && delim != '\t') {
+                                let _p = pop(mut &fieldBuf)
+                            } else {
+                                break
+                            }
                         }
                     }
+                    val = strFromBytes(&fieldBuf)
                 }
-                let val = strFromBytes(&fieldBuf)
                 let isN = r.opts.hasNull && val == r.opts.nullStr
                 append(mut &cells, Cell{value: if isN { "" } else { val }, isNull: isN, quoted: false})
                 if endRow { break }
@@ -1126,7 +1172,7 @@ pub type Writer = record {
     started: bool
     wroteHeader: bool
     memOnly: bool
-    outBuf: []byte
+    outBuf: str
 }
 
 pub fn writer(dst: box io.Write): Writer {
@@ -1134,27 +1180,26 @@ pub fn writer(dst: box io.Write): Writer {
 }
 
 pub fn writerWith(dst: box io.Write, opts: Options): Writer {
-    return Writer{dst: dst, opts: opts, started: false, wroteHeader: false, memOnly: false, outBuf: []}
+    return Writer{dst: dst, opts: opts, started: false, wroteHeader: false, memOnly: false, outBuf: ""}
 }
 
 fn memWriter(opts: Options): Writer {
-    return Writer{dst: io.bytesWriter(), opts: opts, started: false, wroteHeader: false, memOnly: true, outBuf: []}
+    return Writer{dst: io.bytesWriter(), opts: opts, started: false, wroteHeader: false, memOnly: true, outBuf: ""}
 }
 
 fn (w: mut &Writer) putByte(b: byte) {
-    append(mut &w.outBuf, b)
+    w.outBuf.addByte(b)
 }
 
 fn (w: mut &Writer) putStr(s: &str) {
-    for i in 0..len(s) { append(mut &w.outBuf, s[i]) }
+    w.outBuf += s
 }
 
 fn (w: mut &Writer) putEol() {
     if w.opts.crlf {
-        w.putByte('\r')
-        w.putByte('\n')
+        w.outBuf += "\r\n"
     } else {
-        w.putByte('\n')
+        w.outBuf.addByte('\n')
     }
 }
 
@@ -1165,7 +1210,8 @@ fn (w: mut &Writer) flushBufIfLarge(): Result[Unit, Error] {
 
 fn (w: mut &Writer) flushBuf(): Result[Unit, Error] {
     if len(w.outBuf) == 0 { return Ok(Unit{}) }
-    let data = replace(mut &w.outBuf, [])
+    let s = replace(mut &w.outBuf, "")
+    let data = strToBytes(&s)
     match io.writeAll(mut &w.dst, &data) {
         Ok(_) { return Ok(Unit{}) }
         Err(e) { return Err(ioToErr(0, &e)) }
@@ -1232,11 +1278,28 @@ fn (w: mut &Writer) writeCsvCell(c: &Cell) {
             needQ = true
         }
         if !needQ {
-            for i in 0..len(val) {
-                let b = val[i]
-                if b == delim || b == quote || b == '\r' || b == '\n' || (esc != quote && b == esc) {
-                    needQ = true
-                    break
+            var i = 0
+            if len(val) >= VB.lanes {
+                let vDelim = VB.splat(delim)
+                let vQuote = VB.splat(quote)
+                let vCr    = VB.splat('\r')
+                let vNl    = VB.splat('\n')
+                let vEsc   = VB.splat(esc)
+                for v in VB.chunks(&val, mut &i) {
+                    if ((v == vDelim) | (v == vQuote) | (v == vCr) | (v == vNl) | (v == vEsc)).any() {
+                        needQ = true
+                        break
+                    }
+                }
+            }
+            if !needQ {
+                while i < len(val) {
+                    let b = val[i]
+                    if b == delim || b == quote || b == '\r' || b == '\n' || (esc != quote && b == esc) {
+                        needQ = true
+                        break
+                    }
+                    i += 1
                 }
             }
         }
@@ -1398,7 +1461,7 @@ pub fn stringifyWith(rows: &[][]str, opts: Options): Result[str, Error] {
     for i in 0..len(rows) {
         try w.writeRow(&rows[i])
     }
-    return Ok(strFromBytes(&w.outBuf))
+    return Ok(replace(mut &w.outBuf, ""))
 }
 
 pub fn stringify(rows: &[][]str): Result[str, Error] {
@@ -1411,7 +1474,7 @@ pub fn stringifyCellsWith(rows: &[][]Cell, opts: Options): Result[str, Error] {
     for i in 0..len(rows) {
         try w.writeCells(&rows[i])
     }
-    return Ok(strFromBytes(&w.outBuf))
+    return Ok(replace(mut &w.outBuf, ""))
 }
 
 pub fn stringifyCells(rows: &[][]Cell): Result[str, Error] {
@@ -1440,7 +1503,7 @@ pub fn encodeWith[T: Serialize](rows: &[]T, opts: Options): Result[str, Error] {
     for i in 0..len(rows) {
         try w.writeRecord(&rows[i])
     }
-    return Ok(strFromBytes(&w.outBuf))
+    return Ok(replace(mut &w.outBuf, ""))
 }
 
 pub fn encode[T: Serialize](rows: &[]T): Result[str, Error] {

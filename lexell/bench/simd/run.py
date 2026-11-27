@@ -78,6 +78,8 @@ def build(tmp):
             '-o', os.path.join(tmp, name + '_lxl')], env=env)
     sh([LXLC, os.path.join(HERE, 'dot.lxl'), '--native', '-O',
         '-o', os.path.join(tmp, 'dot_lxl')], env=env)
+    sh([LXLC, os.path.join(HERE, 'dot_vec.lxl'), '--native', '-O',
+        '-o', os.path.join(tmp, 'dot_vec_lxl')], env=env)
     return tmp
 
 
@@ -93,7 +95,8 @@ WORK = {
     'strings': [('scalar C', 'strings_scalar', []), ('auto-vec C (AVX2)', 'strings_auto', []),
                 ('native lxl -O', 'strings_lxl', [])],
     'dot': [('scalar C', 'dot_scalar', []), ('auto-vec C (AVX2+FMA)', 'dot_auto', []),
-            ('hand AVX2+FMA', 'dot_hand', []), ('native lxl -O', 'dot_lxl', [])],
+            ('hand AVX2+FMA', 'dot_hand', []), ('native lxl -O (scalar)', 'dot_lxl', []),
+            ('native lxl -O (vector[float])', 'dot_vec_lxl', [])],
     'dot_proto': [('scalar C', 'dot_scalar', []), ('hand AVX2+FMA', 'dot_hand', []),
                   ('x64gen sequence, 1 check', 'dot_lxlstyle', ['1']),
                   ('x64gen sequence, 4 checks', 'dot_lxlstyle', ['4']),

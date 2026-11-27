@@ -1,6 +1,8 @@
 // LexDB-shaped benchmark: columnar bit-packed integer decoding + filter + multiply-sum
 // (mirrors lexdb_cols / lexdb_vec scanning compressed lineitem columns in TPC-H Q1/Q6).
 
+type VI32 = vector[i32]
+
 fn packCol(vals: &[int], bits: int): []byte {
     let n = len(vals)
     let totalBits = n * bits
@@ -25,7 +27,7 @@ fn packCol(vals: &[int], bits: int): []byte {
     return out
 }
 
-fn unpackBatch(buf: &[byte], startIdx: int, count: int, bits: int, baseVal: int, dst: mut &[int]) {
+fn unpackBatch(buf: &[byte], startIdx: int, count: int, bits: int, baseVal: int, dst: mut &[i32]) {
     let mask = (1 << bits) - 1
     var bitPos = startIdx * bits
     for i in 0..count {
@@ -36,7 +38,7 @@ fn unpackBatch(buf: &[byte], startIdx: int, count: int, bits: int, baseVal: int,
             (int(buf[byteIdx + 1]) << 8) |
             (int(buf[byteIdx + 2]) << 16) |
             (int(buf[byteIdx + 3]) << 24)
-        dst[i] = baseVal + ((w >> bitOff) & mask)
+        dst[i] = i32(baseVal + ((w >> bitOff) & mask))
         bitPos += bits
     }
 }
@@ -58,36 +60,44 @@ fn main() {
     let pDisc = packCol(&rawDisc, 4)
     let pPrice = packCol(&rawPrice, 17)
 
-    var qty = array(batch, 0)
-    var disc = array(batch, 0)
-    var price = array(batch, 0)
-    var sel = array(batch, 0)
+    var qty = array(batch, i32(0))
+    var disc = array(batch, i32(0))
+    var price = array(batch, i32(0))
 
     var total = 0
     for round in 0..60 {
-        let loDisc = 4 + (round & 3)
-        let hiDisc = loDisc + 4
-        let maxQty = 30 + (round & 7)
+        let loDisc = i32(4 + (round & 3))
+        let hiDisc = i32(int(loDisc) + 4)
+        let maxQty = i32(30 + (round & 7))
+        let vLo = VI32.splat(loDisc)
+        let vHi = VI32.splat(hiDisc)
+        let vMaxQ = VI32.splat(maxQty)
+        let vZero = VI32.zero()
         var pos = 0
         while pos < n {
             let cnt = if n - pos < batch { n - pos } else { batch }
             unpackBatch(&pQty, pos, cnt, 6, 1, mut &qty)
             unpackBatch(&pDisc, pos, cnt, 4, 0, mut &disc)
             unpackBatch(&pPrice, pos, cnt, 17, 90000, mut &price)
-            var nsel = 0
-            for i in 0..cnt {
-                let d = disc[i]
-                if d >= loDisc && d <= hiDisc && qty[i] < maxQty {
-                    sel[nsel] = i
-                    nsel += 1
-                }
+            var vAcc = VI32.zero()
+            var i = 0
+            let ds = disc[0..cnt]
+            for vd in VI32.chunks(&ds, mut &i) {
+                let vq = VI32.load(&qty, i)
+                let vp = VI32.load(&price, i)
+                let m = (vd >= vLo) & (vd <= vHi) & (vq < vMaxQ)
+                vAcc = vAcc +% m.select(vp *% vd, vZero)
             }
-            var acc = 0
-            for j in 0..nsel {
-                let idx = sel[j]
-                acc += price[idx] * disc[idx]
+            if i < cnt {
+                let vd = VI32.loadPartial(&ds, i, i32(0))
+                let vq = VI32.loadPartial(&(qty[0..cnt]), i, maxQty)
+                let vp = VI32.loadPartial(&(price[0..cnt]), i, i32(0))
+                let m = (vd >= vLo) & (vd <= vHi) & (vq < vMaxQ)
+                vAcc = vAcc +% m.select(vp *% vd, vZero)
             }
-            total += acc
+            for lane in 0..VI32.lanes {
+                total += int(vAcc.lane(lane))
+            }
             pos += cnt
         }
     }

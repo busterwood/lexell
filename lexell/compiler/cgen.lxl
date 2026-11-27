@@ -76,6 +76,7 @@ fn (g: mut &Gen) line(s: &str) {
 }
 
 fn (g: mut &Gen) program() {
+    if g.u.hasAnyVec() { g.vecPrelude() }
     for s in 0..len(g.u.structs) {
         let name = &g.u.structs[s].name
         let kw = if g.u.structs[s].isUnion { "union " } else { "struct " }
@@ -129,8 +130,8 @@ const SCALAR_NAMES: []str = ["void", "bool", "char", "uint8_t", "int16_t", "uint
 fn (g: &Gen) decl(t: int, inner: &str): str {
     let ty = &g.u.tys[t]
     let k = ty.k
-    if k <= ir.TY_F64 || k == ir.TY_STRUCT {
-        let n = if k == ir.TY_STRUCT { g.sname[ty.sid].clone() } else { SCALAR_NAMES[k].clone() }
+    if k <= ir.TY_F64 || k == ir.TY_STRUCT || k == ir.TY_VEC {
+        let n = if k == ir.TY_STRUCT { g.sname[ty.sid].clone() } else if k == ir.TY_VEC { g.u.typeName(t) } else { SCALAR_NAMES[k].clone() }
         return if inner == "" { n } else if strByte(inner, 0) == '*' { n + inner } else { n + " " + inner }
     }
     if k == ir.TY_PTR {
@@ -516,6 +517,10 @@ fn (g: &Gen) put(x: int, need: int, b: mut &str) {
         }
         b += &f
         close(P_POST, need, b)
+    } else if k == ir.E_BNOT && g.u.isVec(n.ty) {
+        b += &("lxl_" + vecSufC(&g.u, n.ty) + "_bnot(")
+        g.put(n.a, P_ASSIGN, b)
+        b.addByte(')')
     } else if k == ir.E_DEREF || k == ir.E_BNOT || k == ir.E_LNOT || (k == ir.E_ADDR && g.u.nk(n.a) != ir.E_DEREF) {
         open(P_UNARY, need, b)
         b += if k == ir.E_DEREF { "*" } else if k == ir.E_BNOT { "~" } else if k == ir.E_LNOT { "!" } else { "&" }
@@ -530,9 +535,15 @@ fn (g: &Gen) put(x: int, need: int, b: mut &str) {
         b += &("(" + g.tn[n.ty] + ")")
         g.put(n.a, P_UNARY, b)
         close(P_UNARY, need, b)
+    } else if k == ir.E_BIN && g.u.isVec(n.c) {
+        g.putVecBin(x, b)
     } else if k == ir.E_BIN {
         let p = OP_PREC[n.v]
         g.infix(n.a, &(" " + OP_TEXT[n.v] + " "), n.b, p, p, p + 1, need, b)
+    } else if k == ir.E_NEG && g.u.isVec(n.ty) {
+        b += "lxl_vf64_neg("
+        g.put(n.a, P_ASSIGN, b)
+        b.addByte(')')
     } else if k == ir.E_NEG {
         let s = g.expr(n.a, P_UNARY)
         b += &(paren(&("-" + (if strByte(s, 0) == '-' { "(" + s + ")" } else { s })), P_UNARY, need))
@@ -571,6 +582,8 @@ fn (g: &Gen) put(x: int, need: int, b: mut &str) {
             b += &(" * " + intToStr(n.v) + ")")
             close(P_UNARY, need, b)
         }
+    } else if k == ir.E_VECOP {
+        g.putVecOp(x, b)
     } else {
         ir.failAt("IR node", n.line, "cgen: expression kind " + intToStr(k))
     }
@@ -644,4 +657,224 @@ fn strLit(s: &str): str {
     }
     b.addByte('"')
     return b
+}
+
+// ---------------------------------------------------------------- SIMD vector C helpers
+
+fn vecSufC(u: &ir.Ir, t: int): str {
+    let b = u.tys[t].base
+    if b == ir.TY_F64 { return "vf64" }
+    if b == ir.TY_I64 { return "vi64" }
+    if b == ir.TY_I32 { return "vi32" }
+    return "vu8"
+}
+
+fn (g: &Gen) putVecBin(x: int, b: mut &str) {
+    let n = &g.u.nodes[x]
+    let suf = vecSufC(&g.u, n.c)
+    let op = match n.v {
+        ir.OP_ADD { "add" }
+        ir.OP_SUB { "sub" }
+        ir.OP_MUL { "mul" }
+        ir.OP_DIV { "div" }
+        ir.OP_AND { "and" }
+        ir.OP_OR { "or" }
+        ir.OP_XOR { "xor" }
+        ir.OP_EQ { "eq" }
+        ir.OP_NE { "ne" }
+        ir.OP_LT { "lt" }
+        ir.OP_LE { "le" }
+        ir.OP_GT { "gt" }
+        ir.OP_GE { "ge" }
+        else { "" }
+    }
+    b += &("lxl_" + suf + "_" + op + "(")
+    g.put(n.a, P_ASSIGN, b)
+    b += ", "
+    g.put(n.b, P_ASSIGN, b)
+    b.addByte(')')
+}
+
+fn (g: &Gen) putVecOp(x: int, b: mut &str) {
+    let n = &g.u.nodes[x]
+    let v = n.v
+    if v == ir.V_CTZ || v == ir.V_CLZ || v == ir.V_POPCNT {
+        let is64 = g.u.tk(g.u.nty(n.a)) == ir.TY_U64
+        let nm = if v == ir.V_CTZ { "lxl_bit_ctz" } else if v == ir.V_CLZ { "lxl_bit_clz" } else { "lxl_bit_popcnt" }
+        b += &(nm + (if is64 { "64(" } else { "32(" }))
+        g.put(n.a, P_ASSIGN, b)
+        b.addByte(')')
+        return
+    }
+    let vt = if v == ir.V_STORE { g.u.nty(n.b) }
+        else if v == ir.V_STORE_PARTIAL { g.u.nty(n.c) }
+        else if v == ir.V_BITMASK || v == ir.V_SUM || v == ir.V_RMIN || v == ir.V_RMAX || v == ir.V_LANE { g.u.nty(n.a) }
+        else { n.ty }
+    let suf = vecSufC(&g.u, vt)
+    let op = match v {
+        ir.V_ZERO { "zero" }
+        ir.V_SPLAT { "splat" }
+        ir.V_LOAD { "load" }
+        ir.V_STORE { "store" }
+        ir.V_LOAD_PARTIAL { "loadp" }
+        ir.V_STORE_PARTIAL { "storep" }
+        ir.V_FMADD { "fma" }
+        ir.V_SQRT { "sqrt" }
+        ir.V_ABS { "abs" }
+        ir.V_MIN { "min" }
+        ir.V_MAX { "max" }
+        ir.V_SELECT { "select" }
+        ir.V_BITMASK { "bitmask" }
+        ir.V_SUM { "sum" }
+        ir.V_RMIN { "rmin" }
+        ir.V_RMAX { "rmax" }
+        ir.V_SHUFFLE { "shuffle" }
+        ir.V_LANE { "lane" }
+        ir.V_SHL { "shl" }
+        ir.V_SHR { "shr" }
+        else { "" }
+    }
+    b += &("lxl_" + suf + "_" + op + "(")
+    if n.a >= 0 { g.put(n.a, P_ASSIGN, b) }
+    if n.b >= 0 {
+        b += ", "
+        g.put(n.b, P_ASSIGN, b)
+    }
+    if n.c >= 0 {
+        b += ", "
+        g.put(n.c, P_ASSIGN, b)
+    }
+    b.addByte(')')
+}
+
+fn (g: mut &Gen) vecPrelude() {
+    g.line("#include <immintrin.h>")
+    g.line("typedef __m256d lxl_vf64;")
+    g.line("typedef __m256i lxl_vi64;")
+    g.line("typedef __m256i lxl_vi32;")
+    g.line("typedef __m256i lxl_vu8;")
+    g.line("static inline int64_t lxl_bit_ctz64(uint64_t x) { return x ? (int64_t)__builtin_ctzll(x) : 64LL; }")
+    g.line("static inline int64_t lxl_bit_clz64(uint64_t x) { return x ? (int64_t)__builtin_clzll(x) : 64LL; }")
+    g.line("static inline int64_t lxl_bit_popcnt64(uint64_t x) { return (int64_t)__builtin_popcountll(x); }")
+    g.line("static inline int64_t lxl_bit_ctz32(uint32_t x) { return x ? (int64_t)__builtin_ctz(x) : 32LL; }")
+    g.line("static inline int64_t lxl_bit_clz32(uint32_t x) { return x ? (int64_t)__builtin_clz(x) : 32LL; }")
+    g.line("static inline int64_t lxl_bit_popcnt32(uint32_t x) { return (int64_t)__builtin_popcount(x); }")
+    g.line("static inline __m256i lxl_v_ones(void) { __m256i z = _mm256_setzero_si256(); return _mm256_cmpeq_epi32(z, z); }")
+    // f64x4
+    g.line("static inline lxl_vf64 lxl_vf64_zero(void) { return _mm256_setzero_pd(); }")
+    g.line("static inline lxl_vf64 lxl_vf64_splat(double x) { return _mm256_set1_pd(x); }")
+    g.line("static inline lxl_vf64 lxl_vf64_load(const double* p) { return _mm256_loadu_pd(p); }")
+    g.line("static inline void lxl_vf64_store(double* p, lxl_vf64 v) { _mm256_storeu_pd(p, v); }")
+    g.line("static inline lxl_vf64 lxl_vf64_add(lxl_vf64 a, lxl_vf64 b) { return _mm256_add_pd(a, b); }")
+    g.line("static inline lxl_vf64 lxl_vf64_sub(lxl_vf64 a, lxl_vf64 b) { return _mm256_sub_pd(a, b); }")
+    g.line("static inline lxl_vf64 lxl_vf64_mul(lxl_vf64 a, lxl_vf64 b) { return _mm256_mul_pd(a, b); }")
+    g.line("static inline lxl_vf64 lxl_vf64_div(lxl_vf64 a, lxl_vf64 b) { return _mm256_div_pd(a, b); }")
+    g.line("static inline lxl_vf64 lxl_vf64_neg(lxl_vf64 a) { return _mm256_xor_pd(a, _mm256_set1_pd(-0.0)); }")
+    g.line("static inline lxl_vf64 lxl_vf64_abs(lxl_vf64 a) { return _mm256_andnot_pd(_mm256_set1_pd(-0.0), a); }")
+    g.line("static inline lxl_vf64 lxl_vf64_sqrt(lxl_vf64 a) { return _mm256_sqrt_pd(a); }")
+    g.line("static inline lxl_vf64 lxl_vf64_fma(lxl_vf64 a, lxl_vf64 b, lxl_vf64 c) { return _mm256_fmadd_pd(a, b, c); }")
+    g.line("static inline lxl_vf64 lxl_vf64_min(lxl_vf64 a, lxl_vf64 b) { return _mm256_min_pd(a, b); }")
+    g.line("static inline lxl_vf64 lxl_vf64_max(lxl_vf64 a, lxl_vf64 b) { return _mm256_max_pd(a, b); }")
+    g.line("static inline lxl_vi64 lxl_vf64_eq(lxl_vf64 a, lxl_vf64 b) { return _mm256_castpd_si256(_mm256_cmp_pd(a, b, 0)); }")
+    g.line("static inline lxl_vi64 lxl_vf64_ne(lxl_vf64 a, lxl_vf64 b) { return _mm256_castpd_si256(_mm256_cmp_pd(a, b, 4)); }")
+    g.line("static inline lxl_vi64 lxl_vf64_lt(lxl_vf64 a, lxl_vf64 b) { return _mm256_castpd_si256(_mm256_cmp_pd(a, b, 1)); }")
+    g.line("static inline lxl_vi64 lxl_vf64_le(lxl_vf64 a, lxl_vf64 b) { return _mm256_castpd_si256(_mm256_cmp_pd(a, b, 2)); }")
+    g.line("static inline lxl_vi64 lxl_vf64_gt(lxl_vf64 a, lxl_vf64 b) { return _mm256_castpd_si256(_mm256_cmp_pd(b, a, 1)); }")
+    g.line("static inline lxl_vi64 lxl_vf64_ge(lxl_vf64 a, lxl_vf64 b) { return _mm256_castpd_si256(_mm256_cmp_pd(b, a, 2)); }")
+    g.line("static inline lxl_vf64 lxl_vf64_select(lxl_vi64 m, lxl_vf64 a, lxl_vf64 b) { return _mm256_blendv_pd(b, a, _mm256_castsi256_pd(m)); }")
+    g.line("static inline uint64_t lxl_vf64_bitmask(lxl_vf64 v) { return (uint64_t)(unsigned)_mm256_movemask_pd(v); }")
+    g.line("static inline double lxl_vf64_sum(lxl_vf64 v) { __m128d s = _mm_add_pd(_mm256_castpd256_pd128(v), _mm256_extractf128_pd(v, 1)); return _mm_cvtsd_f64(_mm_add_sd(s, _mm_unpackhi_pd(s, s))); }")
+    g.line("static inline double lxl_vf64_rmin(lxl_vf64 v) { __m128d s = _mm_min_pd(_mm256_castpd256_pd128(v), _mm256_extractf128_pd(v, 1)); return _mm_cvtsd_f64(_mm_min_sd(s, _mm_unpackhi_pd(s, s))); }")
+    g.line("static inline double lxl_vf64_rmax(lxl_vf64 v) { __m128d s = _mm_max_pd(_mm256_castpd256_pd128(v), _mm256_extractf128_pd(v, 1)); return _mm_cvtsd_f64(_mm_max_sd(s, _mm_unpackhi_pd(s, s))); }")
+    g.line("static inline double lxl_vf64_lane(lxl_vf64 v, int64_t k) { double a[4]; _mm256_storeu_pd(a, v); return a[k]; }")
+    // i64x4
+    g.line("static inline lxl_vi64 lxl_vi64_zero(void) { return _mm256_setzero_si256(); }")
+    g.line("static inline lxl_vi64 lxl_vi64_splat(int64_t x) { return _mm256_set1_epi64x(x); }")
+    g.line("static inline lxl_vi64 lxl_vi64_load(const int64_t* p) { return _mm256_loadu_si256((const __m256i*)p); }")
+    g.line("static inline void lxl_vi64_store(int64_t* p, lxl_vi64 v) { _mm256_storeu_si256((__m256i*)p, v); }")
+    g.line("static inline lxl_vi64 lxl_vi64_add(lxl_vi64 a, lxl_vi64 b) { return _mm256_add_epi64(a, b); }")
+    g.line("static inline lxl_vi64 lxl_vi64_sub(lxl_vi64 a, lxl_vi64 b) { return _mm256_sub_epi64(a, b); }")
+    g.line("static inline lxl_vi64 lxl_vi64_and(lxl_vi64 a, lxl_vi64 b) { return _mm256_and_si256(a, b); }")
+    g.line("static inline lxl_vi64 lxl_vi64_or(lxl_vi64 a, lxl_vi64 b) { return _mm256_or_si256(a, b); }")
+    g.line("static inline lxl_vi64 lxl_vi64_xor(lxl_vi64 a, lxl_vi64 b) { return _mm256_xor_si256(a, b); }")
+    g.line("static inline lxl_vi64 lxl_vi64_bnot(lxl_vi64 a) { return _mm256_xor_si256(a, lxl_v_ones()); }")
+    g.line("static inline lxl_vi64 lxl_vi64_shl(lxl_vi64 a, int64_t k) { return _mm256_sll_epi64(a, _mm_cvtsi64_si128(k)); }")
+    g.line("static inline lxl_vi64 lxl_vi64_shr(lxl_vi64 a, int64_t k) { __m256i s = _mm256_cmpgt_epi64(_mm256_setzero_si256(), a); return _mm256_xor_si256(_mm256_srl_epi64(_mm256_xor_si256(a, s), _mm_cvtsi64_si128(k)), s); }")
+    g.line("static inline lxl_vi64 lxl_vi64_eq(lxl_vi64 a, lxl_vi64 b) { return _mm256_cmpeq_epi64(a, b); }")
+    g.line("static inline lxl_vi64 lxl_vi64_ne(lxl_vi64 a, lxl_vi64 b) { return _mm256_xor_si256(_mm256_cmpeq_epi64(a, b), lxl_v_ones()); }")
+    g.line("static inline lxl_vi64 lxl_vi64_gt(lxl_vi64 a, lxl_vi64 b) { return _mm256_cmpgt_epi64(a, b); }")
+    g.line("static inline lxl_vi64 lxl_vi64_lt(lxl_vi64 a, lxl_vi64 b) { return _mm256_cmpgt_epi64(b, a); }")
+    g.line("static inline lxl_vi64 lxl_vi64_le(lxl_vi64 a, lxl_vi64 b) { return _mm256_xor_si256(_mm256_cmpgt_epi64(a, b), lxl_v_ones()); }")
+    g.line("static inline lxl_vi64 lxl_vi64_ge(lxl_vi64 a, lxl_vi64 b) { return _mm256_xor_si256(_mm256_cmpgt_epi64(b, a), lxl_v_ones()); }")
+    g.line("static inline lxl_vi64 lxl_vi64_select(lxl_vi64 m, lxl_vi64 a, lxl_vi64 b) { return _mm256_castpd_si256(_mm256_blendv_pd(_mm256_castsi256_pd(b), _mm256_castsi256_pd(a), _mm256_castsi256_pd(m))); }")
+    g.line("static inline lxl_vi64 lxl_vi64_min(lxl_vi64 a, lxl_vi64 b) { return lxl_vi64_select(_mm256_cmpgt_epi64(a, b), b, a); }")
+    g.line("static inline lxl_vi64 lxl_vi64_max(lxl_vi64 a, lxl_vi64 b) { return lxl_vi64_select(_mm256_cmpgt_epi64(a, b), a, b); }")
+    g.line("static inline uint64_t lxl_vi64_bitmask(lxl_vi64 v) { return (uint64_t)(unsigned)_mm256_movemask_pd(_mm256_castsi256_pd(v)); }")
+    g.line("static inline int64_t lxl_vi64_sum(lxl_vi64 v) { __m128i s = _mm_add_epi64(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1)); return _mm_cvtsi128_si64(_mm_add_epi64(s, _mm_shuffle_epi32(s, 0x4E))); }")
+    g.line("static inline int64_t lxl_vi64_rmin(lxl_vi64 v) { int64_t a[4]; _mm256_storeu_si256((__m256i*)a, v); int64_t m = a[0]; for (int i = 1; i < 4; i++) if (a[i] < m) m = a[i]; return m; }")
+    g.line("static inline int64_t lxl_vi64_rmax(lxl_vi64 v) { int64_t a[4]; _mm256_storeu_si256((__m256i*)a, v); int64_t m = a[0]; for (int i = 1; i < 4; i++) if (a[i] > m) m = a[i]; return m; }")
+    g.line("static inline int64_t lxl_vi64_lane(lxl_vi64 v, int64_t k) { int64_t a[4]; _mm256_storeu_si256((__m256i*)a, v); return a[k]; }")
+    // i32x8
+    g.line("static inline lxl_vi32 lxl_vi32_zero(void) { return _mm256_setzero_si256(); }")
+    g.line("static inline lxl_vi32 lxl_vi32_splat(int32_t x) { return _mm256_set1_epi32(x); }")
+    g.line("static inline lxl_vi32 lxl_vi32_load(const int32_t* p) { return _mm256_loadu_si256((const __m256i*)p); }")
+    g.line("static inline void lxl_vi32_store(int32_t* p, lxl_vi32 v) { _mm256_storeu_si256((__m256i*)p, v); }")
+    g.line("static inline lxl_vi32 lxl_vi32_add(lxl_vi32 a, lxl_vi32 b) { return _mm256_add_epi32(a, b); }")
+    g.line("static inline lxl_vi32 lxl_vi32_sub(lxl_vi32 a, lxl_vi32 b) { return _mm256_sub_epi32(a, b); }")
+    g.line("static inline lxl_vi32 lxl_vi32_mul(lxl_vi32 a, lxl_vi32 b) { return _mm256_mullo_epi32(a, b); }")
+    g.line("static inline lxl_vi32 lxl_vi32_and(lxl_vi32 a, lxl_vi32 b) { return _mm256_and_si256(a, b); }")
+    g.line("static inline lxl_vi32 lxl_vi32_or(lxl_vi32 a, lxl_vi32 b) { return _mm256_or_si256(a, b); }")
+    g.line("static inline lxl_vi32 lxl_vi32_xor(lxl_vi32 a, lxl_vi32 b) { return _mm256_xor_si256(a, b); }")
+    g.line("static inline lxl_vi32 lxl_vi32_bnot(lxl_vi32 a) { return _mm256_xor_si256(a, lxl_v_ones()); }")
+    g.line("static inline lxl_vi32 lxl_vi32_shl(lxl_vi32 a, int64_t k) { return _mm256_sll_epi32(a, _mm_cvtsi64_si128(k)); }")
+    g.line("static inline lxl_vi32 lxl_vi32_shr(lxl_vi32 a, int64_t k) { return _mm256_sra_epi32(a, _mm_cvtsi64_si128(k)); }")
+    g.line("static inline lxl_vi32 lxl_vi32_eq(lxl_vi32 a, lxl_vi32 b) { return _mm256_cmpeq_epi32(a, b); }")
+    g.line("static inline lxl_vi32 lxl_vi32_ne(lxl_vi32 a, lxl_vi32 b) { return _mm256_xor_si256(_mm256_cmpeq_epi32(a, b), lxl_v_ones()); }")
+    g.line("static inline lxl_vi32 lxl_vi32_gt(lxl_vi32 a, lxl_vi32 b) { return _mm256_cmpgt_epi32(a, b); }")
+    g.line("static inline lxl_vi32 lxl_vi32_lt(lxl_vi32 a, lxl_vi32 b) { return _mm256_cmpgt_epi32(b, a); }")
+    g.line("static inline lxl_vi32 lxl_vi32_le(lxl_vi32 a, lxl_vi32 b) { return _mm256_xor_si256(_mm256_cmpgt_epi32(a, b), lxl_v_ones()); }")
+    g.line("static inline lxl_vi32 lxl_vi32_ge(lxl_vi32 a, lxl_vi32 b) { return _mm256_xor_si256(_mm256_cmpgt_epi32(b, a), lxl_v_ones()); }")
+    g.line("static inline lxl_vi32 lxl_vi32_select(lxl_vi32 m, lxl_vi32 a, lxl_vi32 b) { return _mm256_castps_si256(_mm256_blendv_ps(_mm256_castsi256_ps(b), _mm256_castsi256_ps(a), _mm256_castsi256_ps(m))); }")
+    g.line("static inline lxl_vi32 lxl_vi32_min(lxl_vi32 a, lxl_vi32 b) { return _mm256_min_epi32(a, b); }")
+    g.line("static inline lxl_vi32 lxl_vi32_max(lxl_vi32 a, lxl_vi32 b) { return _mm256_max_epi32(a, b); }")
+    g.line("static inline uint64_t lxl_vi32_bitmask(lxl_vi32 v) { return (uint64_t)(unsigned)_mm256_movemask_ps(_mm256_castsi256_ps(v)); }")
+    g.line("static inline int32_t lxl_vi32_sum(lxl_vi32 v) { __m128i s = _mm_add_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1)); s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0x4E)); s = _mm_add_epi32(s, _mm_shuffle_epi32(s, 0xB1)); return _mm_cvtsi128_si32(s); }")
+    g.line("static inline int32_t lxl_vi32_rmin(lxl_vi32 v) { __m128i s = _mm_min_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1)); s = _mm_min_epi32(s, _mm_shuffle_epi32(s, 0x4E)); s = _mm_min_epi32(s, _mm_shuffle_epi32(s, 0xB1)); return _mm_cvtsi128_si32(s); }")
+    g.line("static inline int32_t lxl_vi32_rmax(lxl_vi32 v) { __m128i s = _mm_max_epi32(_mm256_castsi256_si128(v), _mm256_extracti128_si256(v, 1)); s = _mm_max_epi32(s, _mm_shuffle_epi32(s, 0x4E)); s = _mm_max_epi32(s, _mm_shuffle_epi32(s, 0xB1)); return _mm_cvtsi128_si32(s); }")
+    g.line("static inline int32_t lxl_vi32_lane(lxl_vi32 v, int64_t k) { int32_t a[8]; _mm256_storeu_si256((__m256i*)a, v); return a[k]; }")
+    // u8x32
+    g.line("static inline lxl_vu8 lxl_vu8_zero(void) { return _mm256_setzero_si256(); }")
+    g.line("static inline lxl_vu8 lxl_vu8_splat(uint8_t x) { return _mm256_set1_epi8((char)x); }")
+    g.line("static inline lxl_vu8 lxl_vu8_load(const uint8_t* p) { return _mm256_loadu_si256((const __m256i*)p); }")
+    g.line("static inline void lxl_vu8_store(uint8_t* p, lxl_vu8 v) { _mm256_storeu_si256((__m256i*)p, v); }")
+    g.line("static inline lxl_vu8 lxl_vu8_add(lxl_vu8 a, lxl_vu8 b) { return _mm256_add_epi8(a, b); }")
+    g.line("static inline lxl_vu8 lxl_vu8_sub(lxl_vu8 a, lxl_vu8 b) { return _mm256_sub_epi8(a, b); }")
+    g.line("static inline lxl_vu8 lxl_vu8_and(lxl_vu8 a, lxl_vu8 b) { return _mm256_and_si256(a, b); }")
+    g.line("static inline lxl_vu8 lxl_vu8_or(lxl_vu8 a, lxl_vu8 b) { return _mm256_or_si256(a, b); }")
+    g.line("static inline lxl_vu8 lxl_vu8_xor(lxl_vu8 a, lxl_vu8 b) { return _mm256_xor_si256(a, b); }")
+    g.line("static inline lxl_vu8 lxl_vu8_bnot(lxl_vu8 a) { return _mm256_xor_si256(a, lxl_v_ones()); }")
+    g.line("static inline lxl_vu8 lxl_vu8_eq(lxl_vu8 a, lxl_vu8 b) { return _mm256_cmpeq_epi8(a, b); }")
+    g.line("static inline lxl_vu8 lxl_vu8_ne(lxl_vu8 a, lxl_vu8 b) { return _mm256_xor_si256(_mm256_cmpeq_epi8(a, b), lxl_v_ones()); }")
+    g.line("static inline lxl_vu8 lxl_vu8_le(lxl_vu8 a, lxl_vu8 b) { return _mm256_cmpeq_epi8(_mm256_min_epu8(a, b), a); }")
+    g.line("static inline lxl_vu8 lxl_vu8_ge(lxl_vu8 a, lxl_vu8 b) { return _mm256_cmpeq_epi8(_mm256_max_epu8(a, b), a); }")
+    g.line("static inline lxl_vu8 lxl_vu8_lt(lxl_vu8 a, lxl_vu8 b) { return _mm256_xor_si256(lxl_vu8_ge(a, b), lxl_v_ones()); }")
+    g.line("static inline lxl_vu8 lxl_vu8_gt(lxl_vu8 a, lxl_vu8 b) { return _mm256_xor_si256(lxl_vu8_le(a, b), lxl_v_ones()); }")
+    g.line("static inline lxl_vu8 lxl_vu8_select(lxl_vu8 m, lxl_vu8 a, lxl_vu8 b) { return _mm256_blendv_epi8(b, a, m); }")
+    g.line("static inline lxl_vu8 lxl_vu8_min(lxl_vu8 a, lxl_vu8 b) { return _mm256_min_epu8(a, b); }")
+    g.line("static inline lxl_vu8 lxl_vu8_max(lxl_vu8 a, lxl_vu8 b) { return _mm256_max_epu8(a, b); }")
+    g.line("static inline lxl_vu8 lxl_vu8_shuffle(lxl_vu8 a, lxl_vu8 b) { return _mm256_shuffle_epi8(a, b); }")
+    g.line("static inline uint64_t lxl_vu8_bitmask(lxl_vu8 v) { return (uint64_t)(unsigned)_mm256_movemask_epi8(v); }")
+    g.line("static inline uint8_t lxl_vu8_sum(lxl_vu8 v) { uint8_t a[32]; _mm256_storeu_si256((__m256i*)a, v); uint8_t s = 0; for (int i = 0; i < 32; i++) s = (uint8_t)(s + a[i]); return s; }")
+    g.line("static inline uint8_t lxl_vu8_rmin(lxl_vu8 v) { uint8_t a[32]; _mm256_storeu_si256((__m256i*)a, v); uint8_t m = a[0]; for (int i = 1; i < 32; i++) if (a[i] < m) m = a[i]; return m; }")
+    g.line("static inline uint8_t lxl_vu8_rmax(lxl_vu8 v) { uint8_t a[32]; _mm256_storeu_si256((__m256i*)a, v); uint8_t m = a[0]; for (int i = 1; i < 32; i++) if (a[i] > m) m = a[i]; return m; }")
+    g.line("static inline uint8_t lxl_vu8_lane(lxl_vu8 v, int64_t k) { uint8_t a[32]; _mm256_storeu_si256((__m256i*)a, v); return a[k]; }")
+    // partial load/store (safe at buffer edges)
+    g.line("static inline lxl_vf64 lxl_vf64_loadp(const double* p, int64_t n, double f) { if (n >= 4) return _mm256_loadu_pd(p); double a[4] = {f, f, f, f}; for (int64_t i = 0; i < n; i++) a[i] = p[i]; return _mm256_loadu_pd(a); }")
+    g.line("static inline void lxl_vf64_storep(double* p, int64_t n, lxl_vf64 v) { if (n >= 4) { _mm256_storeu_pd(p, v); return; } double a[4]; _mm256_storeu_pd(a, v); for (int64_t i = 0; i < n; i++) p[i] = a[i]; }")
+    g.line("static inline lxl_vi64 lxl_vi64_loadp(const int64_t* p, int64_t n, int64_t f) { if (n >= 4) return _mm256_loadu_si256((const __m256i*)p); int64_t a[4] = {f, f, f, f}; for (int64_t i = 0; i < n; i++) a[i] = p[i]; return _mm256_loadu_si256((const __m256i*)a); }")
+    g.line("static inline void lxl_vi64_storep(int64_t* p, int64_t n, lxl_vi64 v) { if (n >= 4) { _mm256_storeu_si256((__m256i*)p, v); return; } int64_t a[4]; _mm256_storeu_si256((__m256i*)a, v); for (int64_t i = 0; i < n; i++) p[i] = a[i]; }")
+    g.line("static inline lxl_vi32 lxl_vi32_loadp(const int32_t* p, int64_t n, int32_t f) { if (n >= 8) return _mm256_loadu_si256((const __m256i*)p); int32_t a[8] = {f, f, f, f, f, f, f, f}; for (int64_t i = 0; i < n; i++) a[i] = p[i]; return _mm256_loadu_si256((const __m256i*)a); }")
+    g.line("static inline void lxl_vi32_storep(int32_t* p, int64_t n, lxl_vi32 v) { if (n >= 8) { _mm256_storeu_si256((__m256i*)p, v); return; } int32_t a[8]; _mm256_storeu_si256((__m256i*)a, v); for (int64_t i = 0; i < n; i++) p[i] = a[i]; }")
+    g.line("static inline lxl_vu8 lxl_vu8_loadp(const uint8_t* p, int64_t n, uint8_t f) { if (n >= 32) return _mm256_loadu_si256((const __m256i*)p); uint8_t a[32]; _mm256_storeu_si256((__m256i*)a, _mm256_set1_epi8((char)f)); for (int64_t i = 0; i < n; i++) a[i] = p[i]; return _mm256_loadu_si256((const __m256i*)a); }")
+    g.line("static inline void lxl_vu8_storep(uint8_t* p, int64_t n, lxl_vu8 v) { if (n >= 32) { _mm256_storeu_si256((__m256i*)p, v); return; } uint8_t a[32]; _mm256_storeu_si256((__m256i*)a, v); for (int64_t i = 0; i < n; i++) p[i] = a[i]; }")
 }
