@@ -480,7 +480,13 @@ closed when dropped. `isTerminal(fd)`, `terminalWidth(fd): Option[int]`.
 (`newChunkReader`, `newChunkReaderSize(src, size)`) owns one buffer and
 exposes `fill(): int` plus `buf[0..n]`/`pos`; `copy(dst, src)`, `count(src)` and
 `readAll(src)` are the streaming helpers (one chunk-sized conversion per
-chunk).
+chunk). Composable stream interfaces: `Read` (`fn (mut &Self) read(dst: mut &[byte]): Result[int, IoError]`)
+and `Write` (`writeBytes`, `flush`), satisfied by `Reader`, `Writer`,
+`BytesReader` (`bytesReader`, `strReader`), `BytesWriter` (`bytesWriter`),
+`LimitReader` (`limitReader(box Read, limit)`), `TeeReader` (`teeReader(box Read, box Write)`),
+`MultiWriter` (`multiWriter([]box Write)`), and `zlib`/`zstd` stream adapters,
+with polymorphic `copyStream`, `countStream`, `readAllBytes`, `readAllStream`,
+and `writeAll`.
 - **fs**: `stat`/`lstat(path): Result[Stat, IoError]` (`size mode mtime
   mtimeNs nlink uid gid ino dev blocks`, `kind() isDir() isFile() isLink()
   perm()`), `Kind` (`File Dir Link Fifo Socket CharDev BlockDev Other`,
@@ -1083,7 +1089,12 @@ let r = try c.send(&rq)
   `contentLength`, `parseRequest` (`RequestHead {method, target, minor,
   headers}`, `keepAlive()`, `bodyLength()`), `equalFold`, `isToken`,
   `isFieldValue`, `Headers` (`get`, `has`, `values`, `add`, `set`,
-  `remove`, `hasToken`, ...).
+  `remove`, `hasToken`, ...), and the shared `ContentCodec` interface
+  (`name`, `encode`, `decode`) with `Options.addCodec(box ContentCodec)`,
+  `Options.acceptEncoding()`, `Response.contentEncoding()`,
+  `negotiateEncoding`, and `decodeContent` for automatic `Accept-Encoding`
+  negotiation and bounded transparent `Content-Encoding` decompression (gzip,
+  deflate, zstd, or custom codecs) over HTTP/1.1 and HTTP/2.
 
 Tests: `tests/run/url_*.lxl`, `http_*.lxl` (including `http_h2_basic.lxl`,
 `http_h2_tls.lxl`, `http_h2_protocol.lxl`, `http_h2_hardening.lxl` and
@@ -1138,9 +1149,12 @@ let st = try http.serve(net.listen(":8080").expect("listen"), app, r, http.defau
   far as the hard limit allows) or `vm.max_map_count` is too low for
   `maxConns`. In a worker it marks the worker ready (`task.workerReady`);
   `workerPolicy()` is task's with a 35 s drain.
-- `Handler[A] = fn(&A, mut &Request, mut &Response): Result[Unit, Error]`.
-  `router[A]()`; `r.handle(pattern, h)`; `r.handleWith(pattern, h,
-  RouteOpts{deadlineMs, maxBody})` (`routeOpts()` gives -1 for both: the
+- `Handler[A] = fn(&A, mut &Request, mut &Response): Result[Unit, Error]`,
+  `HandlerFn[A] = box fn(&A, mut &Request, mut &Response): Result[Unit, Error]`,
+  and `HttpHandler` (`fn (&Self) serveHttp(rq: mut &Request, w: mut &Response): Result[Unit, Error]`).
+  `router[A]()`; `r.handle(pattern, h)`, `r.handleFn(pattern, boxFn)`,
+  `r.handleObj(pattern, boxHttpHandler)` (and `*With` variants taking
+  `RouteOpts{deadlineMs, maxBody}`, where `routeOpts()` gives -1 for both: the
   Config's; `deadlineMs` 0 is none, for server-sent events).
 - Patterns are Go 1.22's: `"[METHOD ][HOST]/[PATH]"`, `{name}` one
   segment, `{name...}` the rest, `{$}` the end of a path ending in `/`, a
@@ -1149,24 +1163,27 @@ let st = try http.serve(net.listen(":8080").expect("listen"), app, r, http.defau
   another method gets 405 with `Allow`; `/dir` is redirected (301) to
   `/dir/` when only the subtree pattern matches; otherwise 404.
 - Middleware: `Middleware[A] = fn(&A, mut &Request, mut &Response,
-  Next[A]): Result[Unit, Error]`; `next.run(app, rq, w)` runs the rest.
-  `r.use(m)` for every request (404s and 405s too), `r.useUnder(prefix,
-  m)` for paths under prefix; the first added runs outermost. In the
+  Next[A]): Result[Unit, Error]` and stateful `MiddlewareFn[A] = box fn(...)`;
+  `next.run(app, rq, w)` runs the rest. `r.use(m)` / `r.useFn(m)` for every
+  request (404s and 405s too), `r.useUnder(prefix, m)` / `r.useFnUnder(prefix, m)`
+  for paths under prefix; the first added runs outermost. In the
   library: `requestId` (16 random bytes in hex, or a trusted proxy's
   `X-Request-Id` of 1 to 64 token characters; sent back as
-  `X-Request-Id`), `accessLog` (below) and `securityHeaders`
+  `X-Request-Id`), `accessLog` (below), `securityHeaders`
   (`Content-Security-Policy: default-src 'self'; frame-ancestors 'none'`,
   `Referrer-Policy: no-referrer`, `Cross-Origin-Opener-Policy:
-  same-origin`).
+  same-origin`), and `compress[A](codecs: []box http.ContentCodec, opts: CompressOpts)`
+  (RFC 9110 `Accept-Encoding` negotiation, `Content-Encoding` + `Vary: Accept-Encoding`,
+  buffered bodies at or above `minBytes`).
 - `Request`: `method`, `path` (decoded once), `host` (validated,
   lowercase), `proto`, `headers` (`http.Headers`), `peer`, `id`, `pattern`;
   `param(name)`, `paramInt(name)`, `query(name)` (decoded), `header(name)`,
   `rawTarget()`, `rawQuery()`, `client()` (the peer, or for a trusted proxy
   the rightmost untrusted `X-Forwarded-For` address), `note(key, value)`
   (a field for the access log), `serverStats()`, `stopServer()`. The body:
-  `read(mut &buf)` (streams; 0 at the end), `bytes(limit)` and
-  `text(limit)` (413 past the limit or the route's `maxBody`; 400 when the
-  text is not UTF-8), `bodyRead()`, `trailers()`. With `Expect:
+  `read(mut &buf)` (streams; 0 at the end), `bytes(limit)`, `text(limit)`, and
+  `decodeBody(limit, &codecs)` (bounded `Content-Encoding` request decompression,
+  413 past limit, 415 unsupported encoding, 400 corrupt payload), `bodyRead()`, `trailers()`. With `Expect:
   100-continue` the 100 is sent at the first read; a body nobody read is
   read and dropped up to `maxDrain`, else the connection closes.
 - `Response`: `status(code)`, `header(name, value)` (replaces),
@@ -1985,9 +2002,9 @@ broken when that fails, or when the request could not be sent whole
 
 Compression over `libz` (`zlib`) and `libzstd` (`zstd`), kept as separate modules so programs only link the shared library they import. All decompression entry points enforce a default 64 MiB output cap (`DEFAULT_MAX_OUT`) to guard against decompression bombs, with explicit `*Max` / `setMaxOut` overrides (`-1` for unlimited).
 
-- **`zlib`**: one-shot `gzip`/`gzipLevel`/`gunzip`/`gunzipMax`, `zlibCompress`/`zlibCompressLevel`/`zlibDecompress`/`zlibDecompressMax`, raw `deflate`/`deflateLevel`/`inflate`/`inflateMax`, and auto-detecting `decompress`/`decompressMax` (gzip or zlib, including multi-member gzip streams); streaming `Deflater` (`newGzip`, `newZlib`, `newDeflate`, `write`, `flush`, `finish`) and `Inflater` (`newGunzip`, `newZlibDecompressor`, `newInflate`, `newAutoDecompressor`, `setMaxOut`, `write`, `isDone`, `finish`); IEEE `crc32`/`crc32More` and `adler32`/`adler32More`.
-- **`zstd`**: one-shot `compress`/`compressLevel`/`decompress`/`decompressMax` (supporting single and concatenated multi-frame streams), `minLevel`/`maxLevel`/`defaultLevel`/`versionNumber`; streaming `Compressor` (`newCompressor`, `setChecksum`, `write`, `flush`, `finish`) and `Decompressor` (`newDecompressor`, `setMaxOut`, `write`, `isDone`, `finish`).
-- Tests: `zlib_basic`, `zstd_basic`.
+- **`zlib`**: one-shot `gzip`/`gzipLevel`/`gunzip`/`gunzipMax`, `zlibCompress`/`zlibCompressLevel`/`zlibDecompress`/`zlibDecompressMax`, raw `deflate`/`deflateLevel`/`inflate`/`inflateMax`, and auto-detecting `decompress`/`decompressMax` (gzip or zlib, including multi-member gzip streams); streaming `Deflater` (`newGzip`, `newZlib`, `newDeflate`, `write`, `flush`, `finish`) and `Inflater` (`newGunzip`, `newZlibDecompressor`, `newInflate`, `newAutoDecompressor`, `setMaxOut`, `write`, `isDone`, `finish`); composable `io.Read`/`io.Write` adapters `GzipReader` (`gzipReader`) and `GzipWriter` (`gzipWriter`); HTTP codecs `GzipCodec` (`gzipCodec`/`gzipCodecLevel`) and `DeflateCodec` (`deflateCodec`/`deflateCodecLevel`); IEEE `crc32`/`crc32More` and `adler32`/`adler32More`.
+- **`zstd`**: one-shot `compress`/`compressLevel`/`decompress`/`decompressMax` (supporting single and concatenated multi-frame streams), `minLevel`/`maxLevel`/`defaultLevel`/`versionNumber`; streaming `Compressor` (`newCompressor`, `setChecksum`, `write`, `flush`, `finish`) and `Decompressor` (`newDecompressor`, `setMaxOut`, `write`, `isDone`, `finish`); composable `io.Read`/`io.Write` adapters `Reader` (`reader`) and `Writer` (`writer`); HTTP codec `Codec` (`codec`/`codecLevel`).
+- Tests: `zlib_basic`, `zstd_basic`, `io_streams`, `http_compress_handlers`.
 
 ### crypto
 

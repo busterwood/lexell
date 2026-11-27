@@ -1,0 +1,127 @@
+// io.Read / io.Write interfaces, adapters (BytesReader, BytesWriter, LimitReader,
+// TeeReader, MultiWriter), and streaming zlib.GzipReader/GzipWriter + zstd.Reader/Writer.
+// needs: z
+// needs: zstd
+// expect: mem copy 13 hello, world!
+// expect: limit 5 hello
+// expect: multi 10 true true
+// expect: tee 9 abcdefghi abcdefghi
+// expect: gzip file true
+// expect: zstd file true
+// expect: gzip limit 8 01234567
+// expect: gzip bomb err true
+// expect: zstd bomb err true
+// expect: gzip trunc err true
+// expect: hetero count 18
+
+import "io"
+import "fs"
+import "os"
+import "zlib"
+import "zstd"
+import "strings"
+
+fn main() {
+    let tmpDir = os.tempDir()
+    let pid = os.pid()
+    let p1 = $"{tmpDir}/lxl_io_streams_{pid}_1.bin"
+    let p2 = $"{tmpDir}/lxl_io_streams_{pid}_2.bin"
+    let p3 = $"{tmpDir}/lxl_io_streams_{pid}_3.gz"
+    let p4 = $"{tmpDir}/lxl_io_streams_{pid}_4.zst"
+
+    // 1. In-memory BytesReader -> BytesWriter via copyStream (auto-coercing to mut &Read / mut &Write)
+    var sr = io.strReader("hello, world!")
+    var bw = io.bytesWriter()
+    let n1 = io.copyStream(mut &bw, mut &sr).unwrap()
+    println($"mem copy {n1} {bw.toStr()}")
+
+    // 2. LimitReader over box Read
+    var lr = io.limitReader(io.strReader("hello, world!"), 5)
+    let lim = io.readAllStream(mut &lr).unwrap()
+    println($"limit {len(lim)} {lim}")
+
+    // 3. MultiWriter fanning to two heterogeneous box Write targets (file + file)
+    let f1 = io.create(&p1).unwrap()
+    let f2 = io.create(&p2).unwrap()
+    var mw = io.multiWriter([f1, f2])
+    let mBytes = strToBytes("0123456789")
+    let n2 = mw.writeBytes(&mBytes).unwrap()
+    mw.flush().unwrap()
+    // Drop mw so file descriptors close cleanly before reading back
+    mw = io.multiWriter([])
+    let r1 = io.read(&p1).unwrap()
+    let r2 = io.read(&p2).unwrap()
+    println($"multi {n2} {r1 == "0123456789"} {r2 == "0123456789"}")
+
+    // 4. TeeReader mirroring bytes read from BytesReader into a file Writer
+    let fTee = io.create(&p1).unwrap()
+    var tr = io.teeReader(io.strReader("abcdefghi"), fTee)
+    let teeOut = io.readAllStream(mut &tr).unwrap()
+    tr.flushDst().unwrap()
+    let teeMirrored = io.read(&p1).unwrap()
+    println($"tee {len(teeOut)} {teeOut} {teeMirrored}")
+
+    // 5. Streaming zlib.GzipWriter -> file -> zlib.GzipReader
+    var payload = ""
+    for i in 0..200 { payload += $"line-{i}: the quick brown fox jumps over the lazy dog\n" }
+    {
+        let gzFile = io.create(&p3).unwrap()
+        var gw = zlib.gzipWriter(gzFile, zlib.LEVEL_DEFAULT).unwrap()
+        var src = io.strReader(&payload)
+        let _ = io.copyStream(mut &gw, mut &src).unwrap()
+        gw.finish().unwrap()
+    }
+    var gzRead = zlib.gzipReader(io.open(&p3).unwrap(), 1048576).unwrap()
+    let gotGz = io.readAllStream(mut &gzRead).unwrap()
+    println($"gzip file {gotGz == payload}")
+
+    // 6. Streaming zstd.Writer -> file -> zstd.Reader
+    {
+        let zFile = io.create(&p4).unwrap()
+        var zw = zstd.writer(zFile, zstd.defaultLevel()).unwrap()
+        var src = io.strReader(&payload)
+        let _ = io.copyStream(mut &zw, mut &src).unwrap()
+        zw.finish().unwrap()
+    }
+    var zRead = zstd.reader(io.open(&p4).unwrap(), 1048576).unwrap()
+    let gotZ = io.readAllStream(mut &zRead).unwrap()
+    println($"zstd file {gotZ == payload}")
+
+    // 7. Nested composition: LimitReader(GzipReader(BytesReader))
+    let gzSmall = zlib.gzip("0123456789abcdef").unwrap()
+    var nested = io.limitReader(zlib.gzipReader(io.strReader(&gzSmall), 1024).unwrap(), 8)
+    let gotLim = io.readAllStream(mut &nested).unwrap()
+    println($"gzip limit {len(gotLim)} {gotLim}")
+
+    // 8. Decompression bomb limits enforced inside GzipReader and zstd.Reader
+    var bombGz = zlib.gzipReader(io.open(&p3).unwrap(), 100).unwrap()
+    let bombGzRes = io.readAllStream(mut &bombGz)
+    println($"gzip bomb err {bombGzRes.isErr()}")
+
+    var bombZ = zstd.reader(io.open(&p4).unwrap(), 100).unwrap()
+    let bombZRes = io.readAllStream(mut &bombZ)
+    println($"zstd bomb err {bombZRes.isErr()}")
+
+    // 9. Truncated gzip stream caught cleanly on EOF
+    let truncGz = strSlice(&gzSmall, 0, len(gzSmall) - 4)
+    var trGz = zlib.gzipReader(io.strReader(&truncGz), 1024).unwrap()
+    let trGzRes = io.readAllStream(mut &trGz)
+    println($"gzip trunc err {trGzRes.isErr()}")
+
+    // 10. Heterogeneous []box io.Read array
+    var readers: []box io.Read = [
+        io.strReader("1234"),
+        io.limitReader(io.strReader("abcdefghij"), 5),
+        io.open(&p1).unwrap()
+    ]
+    var total = 0
+    for i in 0..len(readers) {
+        total += io.countStream(mut &readers[i]).unwrap()
+    }
+    println($"hetero count {total}")
+
+    let _d1 = fs.remove(&p1)
+    let _d2 = fs.remove(&p2)
+    let _d3 = fs.remove(&p3)
+    let _d4 = fs.remove(&p4)
+}

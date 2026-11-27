@@ -1,0 +1,298 @@
+// http + httpserver: escaping-closure routes (handleFn), box HttpHandler routes
+// (handleObj), stateful middleware (useFn / useFnUnder), transparent compression
+// (zstd, gzip, deflate) over HTTP/1.1 and HTTP/2 (h2c), q-value negotiation,
+// decompression bomb protection, and compressed request bodies (rq.decodeBody).
+// needs: z
+// needs: zstd
+// expect: closure route 200 hits=1 tag=alpha hdr=yes
+// expect: closure route2 200 hits=2 tag=alpha hdr=yes
+// expect: obj greeting 200 hello, lexell!
+// expect: obj admin 401
+// expect: obj admin auth 200 secret:ok
+// expect: h1 zstd 200 enc=zstd vary=true match=true
+// expect: h1 gzip 200 enc=gzip vary=true match=true
+// expect: h1 deflate 200 enc=deflate vary=true match=true
+// expect: h1 qpref 200 enc=deflate match=true
+// expect: h1 qzero 200 enc=gzip match=true
+// expect: h1 raw manual 200 smaller=true match=true
+// expect: h1 small 200 noenc=true body=tiny
+// expect: h1 bomb 0 toobig=true
+// expect: h1 post gz 200 echo=true
+// expect: h1 post zst 200 echo=true
+// expect: h1 post badenc 415
+// expect: h1 post bomb 413
+// expect: h2 zstd 200 proto=HTTP/2.0 enc=zstd match=true
+
+import "http"
+import "httpserver" as hs
+import "net"
+import "task"
+import "zlib"
+import "zstd"
+import "strings"
+
+type App = value record {
+    name: str
+}
+
+type GreetHandler = record {
+    prefix: str
+}
+
+pub fn (g: &GreetHandler) serveHttp(rq: mut &hs.Request, w: mut &hs.Response): Result[Unit, hs.Error] {
+    let who = rq.param("who")
+    return w.text($"{g.prefix}, {who}!")
+}
+
+type SecretHandler = record {
+    payload: str
+}
+
+pub fn (s: &SecretHandler) serveHttp(rq: mut &hs.Request, w: mut &hs.Response): Result[Unit, hs.Error] {
+    return w.text(&s.payload)
+}
+
+fn makeLargePayload(): str {
+    var out = ""
+    for i in 0..80 {
+        out += $"record {i}: the quick brown fox jumps over the lazy dog 0123456789\n"
+    }
+    return out
+}
+
+fn buildRouter(large: str, hits: task.Shared[int]): hs.Router[App] {
+    var r = hs.router[App]()
+
+    // 1. Stateful escaping-closure middleware adding a header from captured config
+    let mwHdr = "yes"
+    r.useFn(box fn(app: &App, rq: mut &hs.Request, w: mut &hs.Response, next: hs.Next[App]): Result[Unit, hs.Error] {
+        w.header("X-Mw", &mwHdr)
+        return next.run(app, rq, w)
+    })
+
+    // 2. Prefix-scoped stateful auth middleware (captures expected bearer token)
+    let expectedToken = "Bearer s3cr3t"
+    r.useFnUnder("/admin/", box fn(app: &App, rq: mut &hs.Request, w: mut &hs.Response, next: hs.Next[App]): Result[Unit, hs.Error] {
+        match rq.header("Authorization") {
+            Some(tok) {
+                if tok == expectedToken { return next.run(app, rq, w) }
+            }
+            None {}
+        }
+        return w.fail(401)
+    })
+
+    // 3. Built-in compression middleware (prefers zstd > gzip > deflate)
+    r.useFn(hs.compress[App]([zstd.codec(), zlib.gzipCodec(), zlib.deflateCodec()], hs.compressOpts()))
+
+    // 4. Escaping-closure route capturing a Shared counter and an owned tag string
+    let tag = "alpha"
+    r.handleFn("GET /count", box fn(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Unit, hs.Error] {
+        var n = 0
+        hits.with(fn(c: mut &int) { c += 1; n = c })
+        return w.text($"hits={n} tag={tag}")
+    })
+
+    // 5. Boxed HttpHandler object routes (two concrete types behind box HttpHandler)
+    r.handleObj("GET /greet/{who}", GreetHandler{prefix: "hello"})
+    r.handleObj("GET /admin/secret", SecretHandler{payload: "secret:ok"})
+
+    // 6. Large compressible body and small incompressible body
+    r.handleFn("GET /large", box fn(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Unit, hs.Error] {
+        return w.text(&large)
+    })
+    r.handleFn("GET /small", box fn(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Unit, hs.Error] {
+        return w.text("tiny")
+    })
+
+    // 7. POST endpoint decoding compressed request bodies (limit = 2048 bytes)
+    let reqCodecs: []box http.ContentCodec = [zlib.gzipCodec(), zstd.codec()]
+    r.handleFn("POST /echo", box fn(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Unit, hs.Error] {
+        let plain = try rq.decodeBody(2048, &reqCodecs)
+        return w.text(&plain)
+    })
+
+    // 8. Stop endpoint for clean shutdown
+    r.handleFn("POST /stop", box fn(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Unit, hs.Error] {
+        rq.stopServer()
+        return w.text("bye")
+    })
+
+    return r
+}
+
+type ServerJob = record {
+    ln: net.Listener
+    large: str
+    hits: task.Shared[int]
+}
+
+fn serverTask(j: ServerJob): int {
+    let ServerJob{ln: ln, large: large, hits: hits} = move(j)
+    var cfg = hs.defaults()
+    cfg.signals = false
+    cfg.h2c = true
+    cfg.maxConns = 64
+    let r = buildRouter(large, hits)
+    let _s = hs.serve(ln, App{name: "demo"}, r, cfg)
+    return 0
+}
+
+fn main() {
+    let large = makeLargePayload()
+    let hits = task.shared(0)
+
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").expect("listen")
+        let addr = ln.localAddr()
+        let base = $"http://{addr}"
+        let srv = s.start(serverTask, ServerJob{ln: ln, large: large.clone(), hits: hits.share()})
+
+        // 1. Escaping-closure route + stateful middleware
+        let cPlain = http.newClient(http.defaults())
+        let r1 = cPlain.get($"{base}/count").unwrap()
+        let mw1 = r1.header("X-Mw").unwrap().clone()
+        let b1 = r1.text().unwrap()
+        println($"closure route 200 {b1} hdr={mw1}")
+
+        let r2 = cPlain.get($"{base}/count").unwrap()
+        let mw2 = r2.header("X-Mw").unwrap().clone()
+        let b2 = r2.text().unwrap()
+        println($"closure route2 200 {b2} hdr={mw2}")
+
+        // 2. box HttpHandler routes + scoped auth middleware
+        let rg = cPlain.get($"{base}/greet/lexell").unwrap()
+        println($"obj greeting {rg.status} {rg.text().unwrap()}")
+
+        let ra1 = cPlain.get($"{base}/admin/secret").unwrap()
+        println($"obj admin {ra1.status}")
+        let _a1 = ra1.text()
+
+        var rqAuth = http.request("GET", $"{base}/admin/secret")
+        rqAuth.header("Authorization", "Bearer s3cr3t")
+        let ra2 = cPlain.send(&rqAuth).unwrap()
+        println($"obj admin auth {ra2.status} {ra2.text().unwrap()}")
+
+        // 3. Transparent zstd (client advertises zstd, gzip, deflate -> server picks zstd)
+        var oAll = http.defaults()
+        oAll.addCodec(zstd.codec())
+        oAll.addCodec(zlib.gzipCodec())
+        oAll.addCodec(zlib.deflateCodec())
+        let cAll = http.newClient(oAll)
+        let rz = cAll.get($"{base}/large").unwrap()
+        let rzEnc = rz.contentEncoding().unwrap().clone()
+        let rzVary = rz.headers.hasToken("Vary", "Accept-Encoding")
+        let rzBody = rz.text().unwrap()
+        println($"h1 zstd 200 enc={rzEnc} vary={rzVary} match={rzBody == large}")
+
+        // 4. Transparent gzip
+        var oGz = http.defaults()
+        oGz.addCodec(zlib.gzipCodec())
+        let cGz = http.newClient(oGz)
+        let rgz = cGz.get($"{base}/large").unwrap()
+        let rgzEnc = rgz.contentEncoding().unwrap().clone()
+        let rgzVary = rgz.headers.hasToken("Vary", "Accept-Encoding")
+        let rgzBody = rgz.text().unwrap()
+        println($"h1 gzip 200 enc={rgzEnc} vary={rgzVary} match={rgzBody == large}")
+
+        // 5. Transparent deflate
+        var oDef = http.defaults()
+        oDef.addCodec(zlib.deflateCodec())
+        let cDef = http.newClient(oDef)
+        let rd = cDef.get($"{base}/large").unwrap()
+        let rdEnc = rd.contentEncoding().unwrap().clone()
+        let rdVary = rd.headers.hasToken("Vary", "Accept-Encoding")
+        let rdBody = rd.text().unwrap()
+        println($"h1 deflate 200 enc={rdEnc} vary={rdVary} match={rdBody == large}")
+
+        // 6. RFC 9110 q-values: prefer deflate (0.9) over gzip (0.5)
+        var rqQ1 = http.request("GET", $"{base}/large")
+        rqQ1.header("Accept-Encoding", "gzip;q=0.5, deflate;q=0.9")
+        let rq1Res = cPlain.send(&rqQ1).unwrap()
+        let q1Enc = rq1Res.contentEncoding().unwrap().clone()
+        let q1Raw = rq1Res.text().unwrap()
+        let q1Plain = zlib.zlibDecompress(&q1Raw).unwrap()
+        println($"h1 qpref 200 enc={q1Enc} match={q1Plain == large}")
+
+        // 7. RFC 9110 q=0 exclusion: zstd;q=0, gzip;q=1 -> picks gzip
+        var rqQ2 = http.request("GET", $"{base}/large")
+        rqQ2.header("Accept-Encoding", "zstd;q=0, gzip;q=1")
+        let rq2Res = cPlain.send(&rqQ2).unwrap()
+        let q2Enc = rq2Res.contentEncoding().unwrap().clone()
+        let q2Raw = rq2Res.text().unwrap()
+        let q2Plain = zlib.gunzip(&q2Raw).unwrap()
+        println($"h1 qzero 200 enc={q2Enc} match={q2Plain == large}")
+
+        // 8. Manual Accept-Encoding on a codec-enabled client returns raw compressed bytes
+        var rqMan = http.request("GET", $"{base}/large")
+        rqMan.header("Accept-Encoding", "gzip")
+        let rMan = cAll.send(&rqMan).unwrap()
+        let rawGz = rMan.text().unwrap()
+        let unGz = zlib.gunzip(&rawGz).unwrap()
+        println($"h1 raw manual 200 smaller={len(rawGz) < len(large)} match={unGz == large}")
+
+        // 9. Small response below minBytes is not compressed
+        let rSmall = cAll.get($"{base}/small").unwrap()
+        let noEnc = rSmall.contentEncoding().isNone()
+        let smallBody = rSmall.text().unwrap()
+        println($"h1 small 200 noenc={noEnc} body={smallBody}")
+
+        // 10. Decompression bomb protection (maxBody < decompressed size -> Kind.TooLarge)
+        var oSmallMax = http.defaults()
+        oSmallMax.maxBody = 512
+        oSmallMax.addCodec(zlib.gzipCodec())
+        let cBomb = http.newClient(oSmallMax)
+        let rBomb = cBomb.get($"{base}/large").unwrap()
+        let bombRes = rBomb.text()
+        let isTooBig = match &bombRes {
+            Err(e) { e.kind == http.Kind.TooLarge }
+            Ok(_) { false }
+        }
+        println($"h1 bomb 0 toobig={isTooBig}")
+
+        // 11. Compressed POST request bodies (gzip, zstd, unsupported 415, bomb 413)
+        let postText = "compressed request payload " + strings.repeat("abcde", 50)
+        var rqPg = http.request("POST", $"{base}/echo")
+        rqPg.header("Content-Encoding", "gzip")
+        rqPg.body = zlib.gzip(&postText).unwrap()
+        let rPg = cPlain.send(&rqPg).unwrap()
+        println($"h1 post gz {rPg.status} echo={rPg.text().unwrap() == postText}")
+
+        var rqPz = http.request("POST", $"{base}/echo")
+        rqPz.header("Content-Encoding", "zstd")
+        rqPz.body = zstd.compress(&postText).unwrap()
+        let rPz = cPlain.send(&rqPz).unwrap()
+        println($"h1 post zst {rPz.status} echo={rPz.text().unwrap() == postText}")
+
+        var rqBad = http.request("POST", $"{base}/echo")
+        rqBad.header("Content-Encoding", "br")
+        rqBad.body = "fake"
+        let rBad = cPlain.send(&rqBad).unwrap()
+        println($"h1 post badenc {rBad.status}")
+        let _b1 = rBad.text()
+
+        var rqPostBomb = http.request("POST", $"{base}/echo")
+        rqPostBomb.header("Content-Encoding", "gzip")
+        rqPostBomb.body = zlib.gzip(&large).unwrap()
+        let rPb = cPlain.send(&rqPostBomb).unwrap()
+        println($"h1 post bomb {rPb.status}")
+        let _b2 = rPb.text()
+
+        // 12. HTTP/2 (h2c) transparent zstd round-trip
+        var oH2 = http.defaults()
+        oH2.h2c = true
+        oH2.addCodec(zstd.codec())
+        oH2.addCodec(zlib.gzipCodec())
+        let cH2 = http.newClient(oH2)
+        let rH2 = cH2.get($"{base}/large").unwrap()
+        let h2Proto = rH2.proto.clone()
+        let h2Enc = rH2.contentEncoding().unwrap().clone()
+        let h2Body = rH2.text().unwrap()
+        println($"h2 zstd 200 proto={h2Proto} enc={h2Enc} match={h2Body == large}")
+
+        // Clean server stop
+        let rStop = cPlain.post($"{base}/stop", "text/plain", "").unwrap()
+        let _st = rStop.text()
+        let _w = srv.wait()
+    })
+}

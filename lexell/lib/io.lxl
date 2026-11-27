@@ -180,6 +180,15 @@ pub fn (w: mut &Writer) writeByte(c: byte) {
     if len(w.buf) >= LIMIT { w.spill() }
 }
 
+// Writes raw bytes to the writer (satisfies io.Write).
+pub fn (w: mut &Writer) writeBytes(src: &[byte]): Result[int, IoError] {
+    if len(src) == 0 { return Ok(0) }
+    let s = strFromBytes(src)
+    w.buf += &s
+    if len(w.buf) >= LIMIT { try w.flushBuf() }
+    return Ok(len(src))
+}
+
 // Writes out the buffer (for stdout, also the runtime's buffer behind
 // print). An error of an earlier implicit flush is reported here, once.
 pub fn (w: mut &Writer) flush(): Result[Unit, IoError] {
@@ -443,6 +452,195 @@ pub fn count(src: mut &Reader): Result[int, IoError] {
 
 // Everything src has left as one string. A read error stops at once.
 pub fn readAll(src: mut &Reader): Result[str, IoError] {
+    var out = ""
+    var buf: []byte = array(CHUNK, 0)
+    while true {
+        let k = try src.read(mut &buf)
+        if k == 0 { return Ok(out) }
+        out += &(strFromBytes(&buf[0..k]))
+    }
+    return Ok("")
+}
+
+// ------------------------------------------------------ Read / Write interfaces
+
+// Any byte stream that can be read into a caller-supplied buffer.
+// Satisfied by Reader, BytesReader, LimitReader, TeeReader, zlib.GzipReader, zstd.Reader, etc.
+pub type Read = interface {
+    fn (mut &Self) read(dst: mut &[byte]): Result[int, IoError]
+}
+
+// Any byte sink that accepts raw bytes and can be flushed.
+// Satisfied by Writer, BytesWriter, MultiWriter, zlib.GzipWriter, zstd.Writer, etc.
+pub type Write = interface {
+    fn (mut &Self) writeBytes(src: &[byte]): Result[int, IoError]
+    fn (mut &Self) flush(): Result[Unit, IoError]
+}
+
+// An in-memory io.Read over owned bytes.
+pub type BytesReader = record {
+    data: []byte
+    pos: int
+}
+
+pub fn bytesReader(data: &[byte]): BytesReader {
+    var copy: []byte = array(len(data), byte(0))
+    for i in 0..len(data) { copy[i] = data[i] }
+    return BytesReader{data: copy, pos: 0}
+}
+
+pub fn strReader(s: &str): BytesReader {
+    return BytesReader{data: strToBytes(s), pos: 0}
+}
+
+pub fn (r: &BytesReader) remaining(): int { return len(r.data) - r.pos }
+
+pub fn (r: mut &BytesReader) read(dst: mut &[byte]): Result[int, IoError] {
+    let n = len(dst)
+    if n == 0 || r.pos >= len(r.data) { return Ok(0) }
+    var k = len(r.data) - r.pos
+    if k > n { k = n }
+    for i in 0..k { dst[i] = r.data[r.pos + i] }
+    r.pos += k
+    return Ok(k)
+}
+
+// An in-memory io.Write that accumulates bytes.
+pub type BytesWriter = record {
+    buf: []byte
+}
+
+pub fn bytesWriter(): BytesWriter { return BytesWriter{buf: []} }
+
+pub fn (w: mut &BytesWriter) writeBytes(src: &[byte]): Result[int, IoError] {
+    for i in 0..len(src) { append(mut &w.buf, src[i]) }
+    return Ok(len(src))
+}
+
+pub fn (w: mut &BytesWriter) flush(): Result[Unit, IoError] { return Ok(Unit{}) }
+
+pub fn (w: &BytesWriter) size(): int { return len(w.buf) }
+
+pub fn (w: &BytesWriter) bytes(): &[byte] { return &w.buf }
+
+pub fn (w: &BytesWriter) toStr(): str { return strFromBytes(&w.buf) }
+
+pub fn (w: mut &BytesWriter) takeBytes(): []byte { return replace(mut &w.buf, []) }
+
+pub fn (w: mut &BytesWriter) clear() { let _ = replace(mut &w.buf, []) }
+
+// An io.Read wrapper that reads at most limit bytes from an inner box Read.
+pub type LimitReader = record {
+    inner: box Read
+    left: int
+}
+
+pub fn limitReader(src: box Read, limit: int): LimitReader {
+    return LimitReader{inner: src, left: if limit < 0 { 0 } else { limit }}
+}
+
+pub fn (r: &LimitReader) remaining(): int { return r.left }
+
+pub fn (r: mut &LimitReader) read(dst: mut &[byte]): Result[int, IoError] {
+    if r.left <= 0 || len(dst) == 0 { return Ok(0) }
+    let cap = if len(dst) > r.left { r.left } else { len(dst) }
+    let k = try r.inner.read(mut &dst[0..cap])
+    r.left -= k
+    return Ok(k)
+}
+
+// An io.Read wrapper that mirrors every byte read from src into dst.
+pub type TeeReader = record {
+    src: box Read
+    dst: box Write
+}
+
+pub fn teeReader(src: box Read, dst: box Write): TeeReader {
+    return TeeReader{src: src, dst: dst}
+}
+
+pub fn (r: mut &TeeReader) read(dst: mut &[byte]): Result[int, IoError] {
+    let k = try r.src.read(dst)
+    if k > 0 { try writeAll(mut &r.dst, &dst[0..k]) }
+    return Ok(k)
+}
+
+pub fn (r: mut &TeeReader) flushDst(): Result[Unit, IoError] { return r.dst.flush() }
+
+// An io.Write that duplicates every write and flush to all underlying sinks.
+pub type MultiWriter = record {
+    dsts: []box Write
+}
+
+pub fn multiWriter(dsts: []box Write): MultiWriter {
+    return MultiWriter{dsts: dsts}
+}
+
+pub fn (w: mut &MultiWriter) writeBytes(src: &[byte]): Result[int, IoError] {
+    for i in 0..len(w.dsts) {
+        try writeAll(mut &w.dsts[i], src)
+    }
+    return Ok(len(src))
+}
+
+pub fn (w: mut &MultiWriter) flush(): Result[Unit, IoError] {
+    for i in 0..len(w.dsts) {
+        try w.dsts[i].flush()
+    }
+    return Ok(Unit{})
+}
+
+// Writes all bytes of data to dst, handling short writes.
+pub fn writeAll(dst: mut &Write, data: &[byte]): Result[Unit, IoError] {
+    var off = 0
+    while off < len(data) {
+        let k = try dst.writeBytes(&data[off..len(data)])
+        if k <= 0 { return Err(ioError(5, "write", "<stream>")) }
+        off += k
+    }
+    return Ok(Unit{})
+}
+
+// Copies all bytes from any io.Read to any io.Write, flushing dst at the end.
+pub fn copyStream(dst: mut &Write, src: mut &Read): Result[int, IoError] {
+    var buf: []byte = array(CHUNK, 0)
+    var total = 0
+    while true {
+        let k = try src.read(mut &buf)
+        if k == 0 { break }
+        try writeAll(dst, &buf[0..k])
+        total += k
+    }
+    try dst.flush()
+    return Ok(total)
+}
+
+// Counts all remaining bytes from any io.Read.
+pub fn countStream(src: mut &Read): Result[int, IoError] {
+    var buf: []byte = array(CHUNK, 0)
+    var total = 0
+    while true {
+        let k = try src.read(mut &buf)
+        if k == 0 { return Ok(total) }
+        total += k
+    }
+    return Ok(total)
+}
+
+// Reads all remaining bytes from any io.Read into an owned byte array.
+pub fn readAllBytes(src: mut &Read): Result[[]byte, IoError] {
+    var out: []byte = []
+    var buf: []byte = array(CHUNK, 0)
+    while true {
+        let k = try src.read(mut &buf)
+        if k == 0 { return Ok(out) }
+        for i in 0..k { append(mut &out, buf[i]) }
+    }
+    return Ok(out)
+}
+
+// Reads all remaining bytes from any io.Read into a string.
+pub fn readAllStream(src: mut &Read): Result[str, IoError] {
     var out = ""
     var buf: []byte = array(CHUNK, 0)
     while true {

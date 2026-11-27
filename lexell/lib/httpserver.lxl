@@ -361,18 +361,38 @@ pub fn routeOpts(): RouteOpts { return RouteOpts{deadlineMs: -1, maxBody: -1} }
 pub type Handler[A] = fn(&A, mut &Request, mut &Response): Result[Unit, Error]
 pub type Middleware[A] = fn(&A, mut &Request, mut &Response, Next[A]): Result[Unit, Error]
 
+// Escaping-closure handler and middleware types (can capture state by value or Shared handles).
+pub type HandlerFn[A] = box fn(&A, mut &Request, mut &Response): Result[Unit, Error]
+pub type MiddlewareFn[A] = box fn(&A, mut &Request, mut &Response, Next[A]): Result[Unit, Error]
+
+// Go-style object-safe HTTP handler interface, registerable via handleObj / handleObjWith.
+pub type HttpHandler = interface {
+    fn (&Self) serveHttp(rq: mut &Request, w: mut &Response): Result[Unit, Error]
+}
+
+type RouteHandler[A] = value closed {
+    Plain(Handler[A])
+    Closure(HandlerFn[A])
+    Obj(box HttpHandler)
+}
+
+type MwKind[A] = value closed {
+    Plain(Middleware[A])
+    Closure(MiddlewareFn[A])
+}
+
 type Route[A] = record {
     pattern: str
     method: str
     host: str
     segs: []Seg
-    h: Handler[A]
+    h: RouteHandler[A]
     opts: RouteOpts
 }
 
 type Mw[A] = value record {
     prefix: str
-    f: Middleware[A]
+    kind: MwKind[A]
 }
 
 // The routes and the middleware of a server.
@@ -385,11 +405,7 @@ pub type Router[A] = record {
 
 pub fn router[A](): Router[A] { return Router[A]{routes: [], order: [], mws: [], errs: []} }
 
-// Routes requests that match pattern to h.
-pub fn (r: mut &Router[A]) handle(pattern: &str, h: Handler[A]) { r.handleWith(pattern, h, routeOpts()) }
-
-// handle with a deadline or a body limit of the route's own.
-pub fn (r: mut &Router[A]) handleWith(pattern: &str, h: Handler[A], o: RouteOpts) {
+fn (r: mut &Router[A]) addRoute(pattern: &str, h: RouteHandler[A], o: RouteOpts) {
     match parsePattern(pattern) {
         Ok(p) {
             let Parsed{method: m, host: hs, segs: sg} = move(p)
@@ -399,12 +415,42 @@ pub fn (r: mut &Router[A]) handleWith(pattern: &str, h: Handler[A], o: RouteOpts
     }
 }
 
+// Routes requests that match pattern to plain function h.
+pub fn (r: mut &Router[A]) handle(pattern: &str, h: Handler[A]) { r.handleWith(pattern, h, routeOpts()) }
+
+// handle with a deadline or a body limit of the route's own.
+pub fn (r: mut &Router[A]) handleWith(pattern: &str, h: Handler[A], o: RouteOpts) {
+    r.addRoute(pattern, RouteHandler.Plain(h), o)
+}
+
+// Routes requests that match pattern to escaping closure h (captures state).
+pub fn (r: mut &Router[A]) handleFn(pattern: &str, h: HandlerFn[A]) { r.handleFnWith(pattern, h, routeOpts()) }
+
+// handleFn with a deadline or a body limit of the route's own.
+pub fn (r: mut &Router[A]) handleFnWith(pattern: &str, h: HandlerFn[A], o: RouteOpts) {
+    r.addRoute(pattern, RouteHandler.Closure(h), o)
+}
+
+// Routes requests that match pattern to any HttpHandler value (boxed as box HttpHandler).
+pub fn (r: mut &Router[A]) handleObj(pattern: &str, h: box HttpHandler) { r.handleObjWith(pattern, h, routeOpts()) }
+
+// handleObj with a deadline or a body limit of the route's own.
+pub fn (r: mut &Router[A]) handleObjWith(pattern: &str, h: box HttpHandler, o: RouteOpts) {
+    r.addRoute(pattern, RouteHandler.Obj(h), o)
+}
+
 // Middleware for every request (also the 404s and 405s), in the order
 // added: the first added runs first, around the rest.
-pub fn (r: mut &Router[A]) use(m: Middleware[A]) { append(mut &r.mws, Mw[A]{prefix: "", f: m}) }
+pub fn (r: mut &Router[A]) use(m: Middleware[A]) { append(mut &r.mws, Mw[A]{prefix: "", kind: MwKind.Plain(m)}) }
 
 // Middleware for the requests whose path starts with prefix.
-pub fn (r: mut &Router[A]) useUnder(prefix: &str, m: Middleware[A]) { append(mut &r.mws, Mw[A]{prefix: prefix.clone(), f: m}) }
+pub fn (r: mut &Router[A]) useUnder(prefix: &str, m: Middleware[A]) { append(mut &r.mws, Mw[A]{prefix: prefix.clone(), kind: MwKind.Plain(m)}) }
+
+// Stateful escaping-closure middleware for every request.
+pub fn (r: mut &Router[A]) useFn(m: MiddlewareFn[A]) { append(mut &r.mws, Mw[A]{prefix: "", kind: MwKind.Closure(m)}) }
+
+// Stateful escaping-closure middleware for requests whose path starts with prefix.
+pub fn (r: mut &Router[A]) useFnUnder(prefix: &str, m: MiddlewareFn[A]) { append(mut &r.mws, Mw[A]{prefix: prefix.clone(), kind: MwKind.Closure(m)}) }
 
 type Parsed = record {
     method: str
@@ -721,19 +767,30 @@ fn slashMatch[A](r: &Router[A], i: int, method: &str, host: &str, path: &str): b
 // The rest of the chain, for a middleware to call (once: run consumes it).
 pub type Next[A] = value record {
     site: rc Router[A]
-    h: Handler[A]
+    routeIdx: int
+    fallback: Handler[A]
     pos: int
 }
 
 // Runs the rest of the chain: the next middleware, or the handler.
 pub fn (n: Next[A]) run(app: &A, rq: mut &Request, w: mut &Response): Result[Unit, Error] {
     if n.pos >= len(rq.chain) {
-        let h = n.h
+        if n.routeIdx >= 0 {
+            match &n.site.routes[n.routeIdx].h {
+                RouteHandler.Plain(h) { return h(app, rq, w) }
+                RouteHandler.Closure(h) { return h(app, rq, w) }
+                RouteHandler.Obj(obj) { return obj.serveHttp(rq, w) }
+            }
+        }
+        let h = n.fallback
         return h(app, rq, w)
     }
     let idx = rq.chain[n.pos]
-    let f = n.site.mws[idx].f
-    return f(app, rq, w, Next[A]{site: n.site.share(), h: n.h, pos: n.pos + 1})
+    let next = Next[A]{site: n.site.share(), routeIdx: n.routeIdx, fallback: n.fallback, pos: n.pos + 1}
+    match &n.site.mws[idx].kind {
+        MwKind.Plain(f) { return f(app, rq, w, next) }
+        MwKind.Closure(f) { return f(app, rq, w, next) }
+    }
 }
 
 fn notFound[A](app: &A, rq: mut &Request, w: mut &Response): Result[Unit, Error] { return w.fail(404) }
@@ -1234,6 +1291,30 @@ pub fn (rq: mut &Request) text(limit: int, at: Where): Result[str, Error] {
     let s = strFromBytes(&b)
     if !strings.isValidUtf8(&s) { return Err(error(400, "the body is not UTF-8")) }
     return Ok(s)
+}
+
+// Read the request body and decompress it according to Content-Encoding using
+// the provided codecs, enforcing limit on both compressed and decompressed bytes.
+// Returns 413 if the decompressed output exceeds limit, 415 if the encoding is
+// not in codecs, or 400 if the compressed payload is corrupt.
+pub fn (rq: mut &Request) decodeBody(limit: int, codecs: &[]box http.ContentCodec, at: Where): Result[str, Error] {
+    let rawBytes = try rq.bytes(limit, at)
+    let raw = strFromBytes(&rawBytes)
+    let encVals = rq.headers.values("Content-Encoding")
+    if len(encVals) == 0 || len(raw) == 0 { return Ok(raw) }
+    let ce = strings.join(&encVals, ", ")
+    match http.decodeContent(codecs, &ce, &raw, limit) {
+        Ok(s) { return Ok(s) }
+        Err(msg) {
+            if strings.contains(&msg, "exceeds limit") {
+                return Err(errOf(413, ErrorKind.Limit, &("decompressed body exceeds limit: " + msg)))
+            }
+            if strings.startsWith(&msg, "unsupported content-encoding:") {
+                return Err(errOf(415, ErrorKind.Client, &msg))
+            }
+            return Err(errOf(400, ErrorKind.Client, &("invalid compressed request body: " + msg)))
+        }
+    }
 }
 
 // ---------------------------------------------------------------- forms
@@ -3669,6 +3750,7 @@ fn h2StreamTask[A](j: H2StreamJob[A]): int {
         pre = 200
     }
     var h: Option[Handler[A]] = None
+    var routeIdx = -1
     var opts = routeOpts()
     if pre == 0 {
         let s: &Router[A] = &site
@@ -3677,7 +3759,8 @@ fn h2StreamTask[A](j: H2StreamJob[A]): int {
             truncate(mut &rq.params, 0)
             h = Some(toSlash[A])
         } else if i >= 0 {
-            h = Some(s.routes[i].h)
+            routeIdx = i
+            h = Some(notFound[A])
             opts = s.routes[i].opts
             rq.pattern = s.routes[i].pattern.clone()
         } else {
@@ -3711,7 +3794,7 @@ fn h2StreamTask[A](j: H2StreamJob[A]): int {
                 let deadline = if opts.deadlineMs >= 0 { opts.deadlineMs } else { rq.lim.deadlineMs }
                 var old = 0
                 if deadline > 0 { old = rtWithin(deadline) }
-                let n = Next[A]{site: site.share(), h: f, pos: 0}
+                let n = Next[A]{site: site.share(), routeIdx: routeIdx, fallback: f, pos: 0}
                 res = n.run(&app, mut &rq, mut &w)
                 if deadline > 0 { rtRestore(old) }
             }
@@ -4016,6 +4099,7 @@ fn serveOne[A](app: &A, site: &rc Router[A], rq: mut &Request, w: mut &Response,
         pre = 200
     }
     var h: Option[Handler[A]] = None
+    var routeIdx = -1
     var opts = routeOpts()
     if pre == 0 {
         let s: &Router[A] = site
@@ -4026,7 +4110,8 @@ fn serveOne[A](app: &A, site: &rc Router[A], rq: mut &Request, w: mut &Response,
                 truncate(mut &rq.params, 0)
                 h = Some(toSlash[A])
             } else if i >= 0 {
-                h = Some(s.routes[i].h)
+                routeIdx = i
+                h = Some(notFound[A])
                 opts = s.routes[i].opts
                 rq.pattern = s.routes[i].pattern.clone()
             } else {
@@ -4062,7 +4147,7 @@ fn serveOne[A](app: &A, site: &rc Router[A], rq: mut &Request, w: mut &Response,
                 let g = rq.conn.cancelOnHangup(rq.lim.cancelOnHalfClose)
                 var old = 0
                 if deadline > 0 { old = rtWithin(deadline) }
-                let n = Next[A]{site: site.share(), h: f, pos: 0}
+                let n = Next[A]{site: site.share(), routeIdx: routeIdx, fallback: f, pos: 0}
                 res = n.run(app, rq, w)
                 if deadline > 0 { rtRestore(old) }
             }
@@ -4158,6 +4243,74 @@ pub fn securityHeaders[A](app: &A, rq: mut &Request, w: mut &Response, next: Nex
     w.header("Referrer-Policy", "no-referrer")
     w.header("Cross-Origin-Opener-Policy", "same-origin")
     return next.run(app, rq, w)
+}
+
+// Options for the response compression middleware.
+pub type CompressOpts = value record {
+    pub minBytes: int    // minimum buffered response size to compress (default 256)
+}
+
+pub fn compressOpts(): CompressOpts { return CompressOpts{minBytes: 256} }
+
+fn (w: mut &Response) addVary(token: &str) {
+    if w.headSent { return }
+    match w.headers.get("Vary") {
+        Some(cur) {
+            if cur == "*" || http.equalFold(&cur, token) || w.headers.hasToken("Vary", token) { return }
+            let merged = cur + ", " + token
+            w.headers.set("Vary", &merged)
+        }
+        None { w.headers.add("Vary", token) }
+    }
+}
+
+fn (w: mut &Response) tryCompress(codec: &http.ContentCodec, minBytes: int) {
+    if w.headSent || w.head || w.failed || len(w.bad) > 0 { return }
+    if noBody(w.statusCode()) || w.headers.has("Content-Encoding") { return }
+    let pending = if w.useStr { len(w.strBody) } else { w.body.n }
+    if pending < minBytes { return }
+    let raw = if w.useStr { w.strBody.clone() } else { strFromBytes(&w.body.b[0..w.body.n]) }
+    match codec.encode(&raw) {
+        Ok(enc) {
+            if len(enc) < len(raw) {
+                w.body.n = 0
+                w.strBody = enc
+                w.useStr = true
+                w.declared = -1
+                let cname = codec.name()
+                w.headers.set("Content-Encoding", &cname)
+                w.addVary("Accept-Encoding")
+            }
+        }
+        Err(_) {}
+    }
+}
+
+// Stateful response compression middleware powered by escaping closures (`box fn`)
+// and pluggable codecs (`[]box http.ContentCodec`, e.g. zstd.codec(), zlib.gzipCodec(),
+// zlib.deflateCodec()). Negotiates Accept-Encoding per RFC 9110, compresses buffered
+// responses at or above opts.minBytes when smaller, sets Content-Encoding and Vary,
+// and leaves streamed responses (such as SSE) untouched.
+pub fn compress[A](codecs: []box http.ContentCodec, opts: CompressOpts): MiddlewareFn[A] {
+    let minB = if opts.minBytes < 0 { 0 } else { opts.minBytes }
+    return box fn(app: &A, rq: mut &Request, w: mut &Response, next: Next[A]): Result[Unit, Error] {
+        let ae = match rq.header("Accept-Encoding") {
+            Some(v) { v.clone() }
+            None { "" }
+        }
+        let chosen = http.negotiateEncoding(&ae, &codecs)
+        try next.run(app, rq, w)
+        if !w.headSent && !w.head && !w.failed && !noBody(w.statusCode()) && !w.headers.has("Content-Encoding") {
+            let pending = if w.useStr { len(w.strBody) } else { w.body.n }
+            if pending >= minB {
+                w.addVary("Accept-Encoding")
+                if chosen >= 0 {
+                    w.tryCompress(&codecs[chosen], minB)
+                }
+            }
+        }
+        return Ok(Unit{})
+    }
 }
 
 // One logfmt line per request, written by the server (never by the
