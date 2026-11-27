@@ -129,6 +129,32 @@ fn (ps: mut &Ps) dropPortal(name: &str) {
 
 // ---- reading
 
+type VB = vector[byte]
+
+fn shiftLeftSimd(b: mut &[]byte, src: int, have: int) {
+    var i = 0
+    while i + 32 <= have {
+        VB.load(b, src + i).store(b, i)
+        i += 32
+    }
+    while i < have {
+        b[i] = b[src + i]
+        i += 1
+    }
+}
+
+fn copySliceSimd(dst: mut &[]byte, src: &[byte], off: int, have: int) {
+    var i = 0
+    while i + 32 <= have {
+        VB.load(src, off + i).store(dst, i)
+        i += 32
+    }
+    while i < have {
+        dst[i] = src[off + i]
+        i += 1
+    }
+}
+
 fn (w: mut &Wire) fill(n: int): Result[bool, io.IoError] {
     while w.inEnd - w.inPos < n {
         // room for n from inPos: move what is left to the front, or grow
@@ -136,10 +162,12 @@ fn (w: mut &Wire) fill(n: int): Result[bool, io.IoError] {
             let have = w.inEnd - w.inPos
             if n > len(w.inBuf) {
                 var nb = array(if n > 2 * len(w.inBuf) { n } else { 2 * len(w.inBuf) }, byte(0))
-                for i in 0..have { nb[i] = w.inBuf[w.inPos + i] }
+                if have >= 32 { copySliceSimd(mut &nb, &w.inBuf, w.inPos, have) }
+                else { for i in 0..have { nb[i] = w.inBuf[w.inPos + i] } }
                 w.inBuf = nb
             } else {
-                for i in 0..have { w.inBuf[i] = w.inBuf[w.inPos + i] }
+                if have >= 32 { shiftLeftSimd(mut &w.inBuf, w.inPos, have) }
+                else { for i in 0..have { w.inBuf[i] = w.inBuf[w.inPos + i] } }
             }
             w.inPos = 0
             w.inEnd = have
@@ -273,9 +301,8 @@ fn (r: mut &Rd) i32(s: &str): int {
 }
 
 fn (r: mut &Rd) cstr(s: &str): str {
-    var i = r.at
-    while i < len(s) && s[i] != 0 { i += 1 }
-    if i >= len(s) {
+    let i = strFindByte(s, r.at, byte(0))
+    if i < 0 {
         r.bad = true
         return ""
     }
@@ -286,9 +313,8 @@ fn (r: mut &Rd) cstr(s: &str): str {
 }
 
 fn (r: mut &Rd) cstrEnd(s: &str): int {
-    var i = r.at
-    while i < len(s) && s[i] != 0 { i += 1 }
-    if i >= len(s) {
+    let i = strFindByte(s, r.at, byte(0))
+    if i < 0 {
         r.bad = true
         return -1
     }

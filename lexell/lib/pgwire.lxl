@@ -32,6 +32,7 @@ import "strings"
 import "task"
 
 pub type Error = sqldialect.DbError
+type VB = vector[byte]
 pub const PROTOCOL = 196608
 pub const CONNECTION_BAD = 1          // connect failures
 pub const FATAL_ERROR = 7             // server errors (PGRES_FATAL_ERROR)
@@ -218,12 +219,13 @@ fn hexVal(c: byte): int {
 
 // A URI part with %XX decoded.
 fn pctDecode(s: &str): Result[str, Error] {
-    var b = ""
+    if strFindByte(s, 0, '%') < 0 { return Ok(s.clone()) }
+    var b: []byte = withCapacity(len(s))
     var i = 0
     while i < len(s) {
         let c = s[i]
         if c != '%' {
-            b.addByte(c)
+            append(mut &b, c)
             i += 1
             continue
         }
@@ -234,10 +236,10 @@ fn pctDecode(s: &str): Result[str, Error] {
             return Err(input(&("invalid percent-encoded token: \"" + s[i..e] + "\"")))
         }
         if hi == 0 && lo == 0 { return Err(input(&("forbidden value %00 in percent-encoded value: \"" + s[i..i + 3] + "\""))) }
-        b.addByte(byte(hi * 16 + lo))
+        append(mut &b, byte((hi << 4) | lo))
         i += 3
     }
-    return Ok(b)
+    return Ok(strFromBytes(&b))
 }
 
 fn isUriSep(c: byte): bool { return c == ':' || c == '/' || c == '?' || c == ',' }
@@ -788,25 +790,62 @@ pub fn (o: &Out) bytes(): &[byte] { return &o.buf[0..o.n] }
 
 pub fn (o: &Out) str(): str { return strFromBytes(&o.buf[0..o.n]) }
 
+fn (o: mut &Out) ensure(need: int) {
+    let want = o.n + need
+    if want <= len(o.buf) { return }
+    var cap = if len(o.buf) == 0 { 256 } else { len(o.buf) * 2 }
+    while cap < want { cap = cap * 2 }
+    let _g = bytesGrow(mut &o.buf, cap - len(o.buf))
+}
+
 fn (o: mut &Out) put8(v: int) {
-    if o.n < len(o.buf) { o.buf[o.n] = byte(v & 0xff) } else { append(mut &o.buf, byte(v & 0xff)) }
+    o.ensure(1)
+    o.buf[o.n] = byte(v & 0xff)
     o.n += 1
 }
 
 fn (o: mut &Out) put16(v: int) {
-    o.put8(v >> 8)
-    o.put8(v)
+    o.ensure(2)
+    let at = o.n
+    o.buf[at] = byte((v >> 8) & 0xff)
+    o.buf[at + 1] = byte(v & 0xff)
+    o.n = at + 2
 }
 
 fn (o: mut &Out) put32(v: int) {
-    o.put8(v >> 24)
-    o.put8(v >> 16)
-    o.put8(v >> 8)
-    o.put8(v)
+    o.ensure(4)
+    let at = o.n
+    o.buf[at] = byte((v >> 24) & 0xff)
+    o.buf[at + 1] = byte((v >> 16) & 0xff)
+    o.buf[at + 2] = byte((v >> 8) & 0xff)
+    o.buf[at + 3] = byte(v & 0xff)
+    o.n = at + 4
+}
+
+fn copyStrSimd(dst: mut &[]byte, at: int, s: &str) {
+    let m = len(s)
+    var i = 0
+    while i + 32 <= m {
+        VB.load(s, i).store(dst, at + i)
+        i += 32
+    }
+    while i < m {
+        dst[at + i] = s[i]
+        i += 1
+    }
 }
 
 fn (o: mut &Out) putRaw(s: &str) {
-    for i in 0..len(s) { o.put8(int(s[i])) }
+    let m = len(s)
+    if m == 0 { return }
+    o.ensure(m)
+    let at = o.n
+    if m >= 32 {
+        copyStrSimd(mut &o.buf, at, s)
+    } else {
+        for i in 0..m { o.buf[at + i] = s[i] }
+    }
+    o.n = at + m
 }
 
 fn (o: mut &Out) putC(s: &str) {
@@ -1000,9 +1039,8 @@ fn (r: mut &Rd) take(n: int, what: &str): Result[str, Error] {
 
 // A NUL-terminated string inside the message.
 fn (r: mut &Rd) cstr(what: &str): Result[str, Error] {
-    var i = r.pos
-    while i < r.end && r.s[i] != 0 { i += 1 }
-    if i >= r.end { return Err(proto(&(what + ": a string without its end"))) }
+    let i = strFindByte(&r.s, r.pos, byte(0))
+    if i < 0 || i >= r.end { return Err(proto(&(what + ": a string without its end"))) }
     let v = r.s[r.pos..i]
     r.pos = i + 1
     return Ok(v.clone())
@@ -1140,6 +1178,59 @@ pub fn scanRow(d: &str, at: int, ncols: int, starts: mut &[]int, lens: mut &[]in
     return Ok(p)
 }
 
+// Fast direct DataRow scan into RawRows's []i32 arrays (no temporary copy).
+fn scanRowIntoI32(d: &str, at: int, end: int, ncols: int, starts: mut &[]i32, lens: mut &[]i32): Result[int, Error] {
+    if at < 0 || at + 2 > end { return Err(proto("a DataRow without its column count")) }
+    let count = (int(d[at]) << 8) | int(d[at + 1])
+    if count != ncols {
+        return Err(proto(&("a DataRow of " + count.toStr() + " columns for a RowDescription of " + ncols.toStr())))
+    }
+    var p = at + 2
+    for _ in 0..ncols {
+        if p + 4 > end { return Err(proto("a DataRow cut short")) }
+        var l = (int(d[p]) << 24) | (int(d[p + 1]) << 16) | (int(d[p + 2]) << 8) | int(d[p + 3])
+        if l >= 2147483648 { l -= 4294967296 }
+        p += 4
+        if l == -1 {
+            append(starts, i32(p))
+            append(lens, i32(-1))
+        } else if l < 0 {
+            return Err(proto(&("a DataRow value of length " + l.toStr())))
+        } else {
+            if p + l > end { return Err(proto("a DataRow value runs past its message")) }
+            append(starts, i32(p))
+            append(lens, i32(l))
+            p += l
+        }
+    }
+    return Ok(p)
+}
+
+// Fast zero-write DataRow validator for streaming batches (avoids unused starts/lens stores).
+fn validateRow(d: &str, at: int, end: int, ncols: int): Result[int, Error] {
+    if at < 0 || at + 2 > end { return Err(proto("a DataRow without its column count")) }
+    let count = (int(d[at]) << 8) | int(d[at + 1])
+    if count != ncols {
+        return Err(proto(&("a DataRow of " + count.toStr() + " columns for a RowDescription of " + ncols.toStr())))
+    }
+    var p = at + 2
+    for _ in 0..ncols {
+        if p + 4 > end { return Err(proto("a DataRow cut short")) }
+        var l = (int(d[p]) << 24) | (int(d[p + 1]) << 16) | (int(d[p + 2]) << 8) | int(d[p + 3])
+        if l >= 2147483648 { l -= 4294967296 }
+        p += 4
+        if l == -1 {
+            continue
+        } else if l < 0 {
+            return Err(proto(&("a DataRow value of length " + l.toStr())))
+        } else {
+            if p + l > end { return Err(proto("a DataRow value runs past its message")) }
+            p += l
+        }
+    }
+    return Ok(p)
+}
+
 // ------------------------------------------------------------- parameters
 
 type Value = sqldialect.Value
@@ -1178,9 +1269,27 @@ fn hmac(key: &str, data: &str): Result[str, Error] {
 }
 
 fn xor(a: &str, b: &str): str {
-    var out = array(len(a), byte(0))
-    for i in 0..len(a) { out[i] = a[i] ^ b[i] }
+    let n = len(a)
+    var out = array(n, byte(0))
+    if n >= 32 {
+        xorSimd(a, b, mut &out)
+        return strFromBytes(&out)
+    }
+    for i in 0..n { out[i] = a[i] ^ b[i] }
     return strFromBytes(&out)
+}
+
+fn xorSimd(a: &str, b: &str, out: mut &[]byte) {
+    let n = len(a)
+    var i = 0
+    while i + 32 <= n {
+        (VB.load(a, i) ^ VB.load(b, i)).store(out, i)
+        i += 32
+    }
+    while i < n {
+        out[i] = a[i] ^ b[i]
+        i += 1
+    }
 }
 
 // "md5" + hex(md5(hex(md5(password + user)) + salt)): the PasswordMessage of AuthenticationMD5Password.
@@ -1330,16 +1439,31 @@ fn fastDecimal(t: &str): Option[Decimal] {
         neg = true
         i = 1
     }
+    // Fast 64-bit integer accumulation for <= 18 significant digits (avoids i128 mul per digit)
+    var u64v = 0
     var units: i128 = 0
+    var wide = false
     var sig = 0                       // significant digits: after the first non-zero one
     var intDigits = 0
-    while i < n && strings.isDigit(t[i]) {
-        let d = int(t[i] - '0')
-        if units != 0 || d != 0 {
+    while i < n {
+        let c = t[i]
+        if c < '0' || c > '9' { break }
+        let d = int(c - '0')
+        if !wide {
+            if u64v != 0 || d != 0 {
+                sig += 1
+                if sig > 18 {
+                    units = i128(u64v) * 10 + i128(d)
+                    wide = true
+                } else {
+                    u64v = u64v * 10 + d
+                }
+            }
+        } else {
             sig += 1
             if sig > FAST_DIGITS { return None }
+            units = units * 10 + i128(d)
         }
-        units = units * 10 + i128(d)
         intDigits += 1
         i += 1
     }
@@ -1347,20 +1471,33 @@ fn fastDecimal(t: &str): Option[Decimal] {
     var scale = 0
     if i < n && t[i] == '.' {
         i += 1
-        while i < n && strings.isDigit(t[i]) {
-            let d = int(t[i] - '0')
-            if units != 0 || d != 0 {
+        while i < n {
+            let c = t[i]
+            if c < '0' || c > '9' { break }
+            let d = int(c - '0')
+            if !wide {
+                if u64v != 0 || d != 0 {
+                    sig += 1
+                    if sig > 18 {
+                        units = i128(u64v) * 10 + i128(d)
+                        wide = true
+                    } else {
+                        u64v = u64v * 10 + d
+                    }
+                }
+            } else {
                 sig += 1
                 if sig > FAST_DIGITS { return None }
+                units = units * 10 + i128(d)
             }
-            units = units * 10 + i128(d)
             scale += 1
             i += 1
         }
         if scale == 0 || scale > FAST_SCALE { return None }
     }
     if i != n { return None }
-    return Some(fromFraction(if neg { -units } else { units }, scale))
+    let fin = if wide { units } else { i128(u64v) }
+    return Some(fromFraction(if neg { -fin } else { fin }, scale))
 }
 
 fn pInt(b: &str, col: &sqlrows.Column): Result[int, Error] {
@@ -1569,6 +1706,30 @@ fn be32s(d: &str, at: int): int {
     return (int(d[at]) << 24) | (int(d[at + 1]) << 16) | (int(d[at + 2]) << 8) | int(d[at + 3])
 }
 
+fn shiftLeftSimd(b: mut &[]byte, src: int, k: int) {
+    var i = 0
+    while i + 32 <= k {
+        VB.load(b, src + i).store(b, i)
+        i += 32
+    }
+    while i < k {
+        b[i] = b[src + i]
+        i += 1
+    }
+}
+
+fn copyBytesSimd(dst: mut &[]byte, src: &[byte], k: int) {
+    var i = 0
+    while i + 32 <= k {
+        VB.load(src, i).store(dst, i)
+        i += 32
+    }
+    while i < k {
+        dst[i] = src[i]
+        i += 1
+    }
+}
+
 // Reads from the socket into the inbox until it holds at least one whole
 // message after pos, growing the buffer by doubling when it is full (never to
 // a declared length before the bytes come). The whole messages are then
@@ -1594,10 +1755,12 @@ fn fillInbox(st: mut &Stream, ib: mut &Inbox, ms: int, w: Where): Result[str, Er
         if ib.end == len(ib.buf) {
             let k = ib.end - ib.pos
             if ib.pos > 0 {
-                for i in 0..k { ib.buf[i] = ib.buf[ib.pos + i] }
+                if k >= 32 { shiftLeftSimd(mut &ib.buf, ib.pos, k) }
+                else { for i in 0..k { ib.buf[i] = ib.buf[ib.pos + i] } }
             } else {
                 var nb = array(2 * len(ib.buf), byte(0))
-                for i in 0..k { nb[i] = ib.buf[i] }
+                if k >= 32 { copyBytesSimd(mut &nb, &ib.buf, k) }
+                else { for i in 0..k { nb[i] = ib.buf[i] } }
                 ib.buf = nb
             }
             ib.pos = 0
@@ -1789,7 +1952,7 @@ fn (s: mut &Session) next(ms: int, w: Where): Result[Msg, Error] {
         let end = at + 1 + l
         s.cpos = end
         let t = int(s.chunk[at])
-        var r = Rd{s: s.chunk.clone(), pos: at + 5, end: end}
+        if t == 68 { return Ok(Msg{t: 68, at: at + 5, end: end}) } // fast path: DataRow (no Rd/chunk clone!)
         if t == 78 {                        // N
             match parseServerError(s.chunk[at + 5..end]) {
                 Ok(e) { s.addNotice(e) }
@@ -1798,12 +1961,14 @@ fn (s: mut &Session) next(ms: int, w: Where): Result[Msg, Error] {
             continue
         }
         if t == 83 {                        // S
+            var r = Rd{s: s.chunk.clone(), pos: at + 5, end: end}
             let name = match r.cstr("ParameterStatus") { Ok(x) { x } Err(e) { return Err(s.wire(e)) } }
             let value = match r.cstr("ParameterStatus") { Ok(x) { x } Err(e) { return Err(s.wire(e)) } }
             s.setParam(&name, &value)
             continue
         }
         if t == 65 {                        // A
+            var r = Rd{s: s.chunk.clone(), pos: at + 5, end: end}
             let pid = match r.i32("NotificationResponse") { Ok(x) { x } Err(e) { return Err(s.wire(e)) } }
             let ch = match r.cstr("NotificationResponse") { Ok(x) { x } Err(e) { return Err(s.wire(e)) } }
             let pl = match r.cstr("NotificationResponse") { Ok(x) { x } Err(e) { return Err(s.wire(e)) } }
@@ -2451,19 +2616,31 @@ fn (s: mut &Session) collect(w: Where): Result[Reply, Error] {
             }
             68 {                                        // D DataRow
                 if !c.hasT { return Err(s.wire(proto("a DataRow before a RowDescription"))) }
-                let end = match scanRow(&s.chunk[..m.end], m.at, len(c.cols), mut &c.sS, mut &c.sL) {
-                    Ok(x) { x }
-                    Err(e) { return Err(s.wire(e)) }
-                }
-                if end != m.end { return Err(s.wire(proto(&("a DataRow with " + (m.end - end).toStr() + " bytes after its values")))) }
+                let ncols = len(c.cols)
                 if c.lastSeq != s.seq {
                     append(mut &c.rows.chunks, s.chunk.clone())
                     c.lastSeq = s.seq
                 }
-                append(mut &c.rows.rowChunk, i32(len(c.rows.chunks) - 1))
-                for i in 0..len(c.cols) {
-                    append(mut &c.rows.starts, i32(c.sS[i]))
-                    append(mut &c.rows.lens, i32(c.sL[i]))
+                let ci = i32(len(c.rows.chunks) - 1)
+                let end = match scanRowIntoI32(&s.chunk, m.at, m.end, ncols, mut &c.rows.starts, mut &c.rows.lens) {
+                    Ok(x) { x }
+                    Err(e) { return Err(s.wire(e)) }
+                }
+                if end != m.end { return Err(s.wire(proto(&("a DataRow with " + (m.end - end).toStr() + " bytes after its values")))) }
+                append(mut &c.rows.rowChunk, ci)
+                // Tight loop over any consecutive DataRows already in s.chunk
+                let clen = len(s.chunk)
+                while s.cpos < clen && int(s.chunk[s.cpos]) == 68 {
+                    let at2 = s.cpos
+                    let l2 = be32s(&s.chunk, at2 + 1)
+                    let end2 = at2 + 1 + l2
+                    s.cpos = end2
+                    let gotEnd = match scanRowIntoI32(&s.chunk, at2 + 5, end2, ncols, mut &c.rows.starts, mut &c.rows.lens) {
+                        Ok(x) { x }
+                        Err(e) { return Err(s.wire(e)) }
+                    }
+                    if gotEnd != end2 { return Err(s.wire(proto(&("a DataRow with " + (end2 - gotEnd).toStr() + " bytes after its values")))) }
+                    append(mut &c.rows.rowChunk, ci)
                 }
             }
             67 {                                        // C CommandComplete
@@ -2800,7 +2977,7 @@ pub fn (s: mut &Session) receiveBatch(rowsWanted: int, w: Where): Result[Batch, 
         let m = got.unwrap()
         match m.t {
             68 {
-                let end = match scanRow(&s.chunk[..m.end], m.at, n, mut &sS, mut &sL) {
+                let end = match validateRow(&s.chunk, m.at, m.end, n) {
                     Ok(x) { x }
                     Err(e) { return Err(s.wire(e)) }
                 }
@@ -2809,9 +2986,26 @@ pub fn (s: mut &Session) receiveBatch(rowsWanted: int, w: Where): Result[Batch, 
                     append(mut &b.chunks, s.chunk.clone())
                     lastSeq = s.seq
                 }
-                append(mut &b.rowChunk, i32(len(b.chunks) - 1))
+                let ci = i32(len(b.chunks) - 1)
+                append(mut &b.rowChunk, ci)
                 append(mut &b.rowAt, i32(m.at))
                 bytes += m.end - m.at
+                // Tight loop over consecutive DataRows already in s.chunk
+                let clen = len(s.chunk)
+                while len(b.rowAt) < want && bytes < BATCH_BYTES && s.cpos < clen && int(s.chunk[s.cpos]) == 68 {
+                    let at2 = s.cpos
+                    let l2 = be32s(&s.chunk, at2 + 1)
+                    let end2 = at2 + 1 + l2
+                    s.cpos = end2
+                    let gotEnd = match validateRow(&s.chunk, at2 + 5, end2, n) {
+                        Ok(x) { x }
+                        Err(e) { return Err(s.wire(e)) }
+                    }
+                    if gotEnd != end2 { return Err(s.wire(proto(&("a DataRow with " + (end2 - gotEnd).toStr() + " bytes after its values")))) }
+                    append(mut &b.rowChunk, ci)
+                    append(mut &b.rowAt, i32(at2 + 5))
+                    bytes += end2 - (at2 + 5)
+                }
             }
             67, 73 {                                    // C, I: the reply ran to its end
                 b.more = false

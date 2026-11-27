@@ -43,13 +43,20 @@ pub fn (v: &Value) toStr(): str {
     }
 }
 
+type VB = vector[byte]
+
 fn replaceQuotes(s: &str): str {
+    var pos = strFindByte(s, 0, '\'')
+    if pos < 0 { return s.clone() }
     var b = ""
-    for i in 0..len(s) {
-        let c = s[i]
-        if c == '\'' { b.addByte(c) }
-        b.addByte(c)
+    var start = 0
+    while pos >= 0 {
+        b += &s[start..pos + 1]
+        b.addByte('\'')
+        start = pos + 1
+        pos = strFindByte(s, start, '\'')
     }
+    if start < len(s) { b += &s[start..] }
     return b
 }
 
@@ -57,11 +64,46 @@ const HEX = "0123456789abcdef"
 
 // The bytes of b as lowercase hexadecimal, two digits a byte.
 pub fn hex(b: &str): str {
-    var out = array(2 * len(b), byte(0))
-    for i in 0..len(b) {
+    let n = len(b)
+    if n == 0 { return "" }
+    var out = array(2 * n, byte(0))
+    var i = 0
+    var o = 0
+    while i + 8 <= n {
+        let w = strWord(b, i)
+        let b0 = int(w & u64(255))
+        let b1 = int((w >> 8) & u64(255))
+        let b2 = int((w >> 16) & u64(255))
+        let b3 = int((w >> 24) & u64(255))
+        let b4 = int((w >> 32) & u64(255))
+        let b5 = int((w >> 40) & u64(255))
+        let b6 = int((w >> 48) & u64(255))
+        let b7 = int(w >> 56)
+        out[o] = HEX[b0 >> 4]
+        out[o + 1] = HEX[b0 & 15]
+        out[o + 2] = HEX[b1 >> 4]
+        out[o + 3] = HEX[b1 & 15]
+        out[o + 4] = HEX[b2 >> 4]
+        out[o + 5] = HEX[b2 & 15]
+        out[o + 6] = HEX[b3 >> 4]
+        out[o + 7] = HEX[b3 & 15]
+        out[o + 8] = HEX[b4 >> 4]
+        out[o + 9] = HEX[b4 & 15]
+        out[o + 10] = HEX[b5 >> 4]
+        out[o + 11] = HEX[b5 & 15]
+        out[o + 12] = HEX[b6 >> 4]
+        out[o + 13] = HEX[b6 & 15]
+        out[o + 14] = HEX[b7 >> 4]
+        out[o + 15] = HEX[b7 & 15]
+        i += 8
+        o += 16
+    }
+    while i < n {
         let c = int(b[i])
-        out[2 * i] = HEX[c >> 4]
-        out[2 * i + 1] = HEX[c & 15]
+        out[o] = HEX[c >> 4]
+        out[o + 1] = HEX[c & 15]
+        i += 1
+        o += 2
     }
     return strFromBytes(&out)
 }
@@ -69,13 +111,84 @@ pub fn hex(b: &str): str {
 // The bytes written as hexadecimal digits (either case); None when s has an
 // odd length or a character that is not a hex digit.
 pub fn unhex(s: &str): Option[str] {
-    if len(s) % 2 != 0 { return None }
-    var out = array(len(s) / 2, byte(0))
+    let n = len(s)
+    if (n & 1) != 0 { return None }
+    if n == 0 { return Some("") }
+    if n >= 32 { return unhexSimd(s) }
+    var out = array(n >> 1, byte(0))
     for i in 0..len(out) {
-        let hi = hexDigit(s[2 * i])
-        let lo = hexDigit(s[2 * i + 1])
+        let hi = hexDigit(s[i << 1])
+        let lo = hexDigit(s[(i << 1) + 1])
         if hi < 0 || lo < 0 { return None }
-        out[i] = byte(hi * 16 + lo)
+        out[i] = byte((hi << 4) | lo)
+    }
+    return Some(strFromBytes(&out))
+}
+
+fn unhexSimd(s: &str): Option[str] {
+    let n = len(s)
+    var out = array(n >> 1, byte(0))
+    var buf = array(32, byte(0))
+    let hiIdxArr: []byte = [
+        0, 2, 4, 6, 8, 10, 12, 14, 128, 128, 128, 128, 128, 128, 128, 128,
+        0, 2, 4, 6, 8, 10, 12, 14, 128, 128, 128, 128, 128, 128, 128, 128
+    ]
+    let loIdxArr: []byte = [
+        1, 3, 5, 7, 9, 11, 13, 15, 128, 128, 128, 128, 128, 128, 128, 128,
+        1, 3, 5, 7, 9, 11, 13, 15, 128, 128, 128, 128, 128, 128, 128, 128
+    ]
+    let hiShiftArr: []byte = [
+        0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0, 0xf0,
+        0x00, 0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80, 0x90, 0xa0, 0xb0, 0xc0, 0xd0, 0xe0, 0xf0
+    ]
+    let vHiIdx = VB.load(&hiIdxArr, 0)
+    let vLoIdx = VB.load(&loIdxArr, 0)
+    let vHiShift = VB.load(&hiShiftArr, 0)
+    let v0 = VB.splat('0')
+    let v9 = VB.splat('9')
+    let va = VB.splat('a')
+    let vf = VB.splat('f')
+    let vA = VB.splat('A')
+    let vF = VB.splat('F')
+    let vaSub = VB.splat(byte(int('a') - 10))
+    let vASub = VB.splat(byte(int('A') - 10))
+    var i = 0
+    var o = 0
+    while i + 32 <= n {
+        let v = VB.load(s, i)
+        let isDig = (v >= v0) & (v <= v9)
+        let isLo = (v >= va) & (v <= vf)
+        let isHi = (v >= vA) & (v <= vF)
+        if !(isDig | isLo | isHi).all() { return None }
+        let d = isDig.select(v -% v0, isLo.select(v -% vaSub, v -% vASub))
+        let packed = vHiShift.shuffle(d.shuffle(vHiIdx)) | d.shuffle(vLoIdx)
+        packed.store(mut &buf, 0)
+        out[o] = buf[0]
+        out[o + 1] = buf[1]
+        out[o + 2] = buf[2]
+        out[o + 3] = buf[3]
+        out[o + 4] = buf[4]
+        out[o + 5] = buf[5]
+        out[o + 6] = buf[6]
+        out[o + 7] = buf[7]
+        out[o + 8] = buf[16]
+        out[o + 9] = buf[17]
+        out[o + 10] = buf[18]
+        out[o + 11] = buf[19]
+        out[o + 12] = buf[20]
+        out[o + 13] = buf[21]
+        out[o + 14] = buf[22]
+        out[o + 15] = buf[23]
+        i += 32
+        o += 16
+    }
+    while i < n {
+        let hi = hexDigit(s[i])
+        let lo = hexDigit(s[i + 1])
+        if hi < 0 || lo < 0 { return None }
+        out[o] = byte((hi << 4) | lo)
+        i += 2
+        o += 1
     }
     return Some(strFromBytes(&out))
 }
@@ -133,10 +246,29 @@ pub fn inputError(msg: &str): DbError { return dbError(E_INPUT, msg) }
 // Err(E_INPUT) when s contains a NUL byte: C sees text up to its first NUL,
 // and the runtime stops a program that passes one to C.
 pub fn noNul(s: &str, what: &str): Result[Unit, DbError] {
+    if len(s) >= 32 {
+        if hasNulSimd(s) { return Err(inputError(&(what + " contains a NUL byte"))) }
+        return Ok(Unit{})
+    }
     for i in 0..len(s) {
         if s[i] == 0 { return Err(inputError(&(what + " contains a NUL byte"))) }
     }
     return Ok(Unit{})
+}
+
+fn hasNulSimd(s: &str): bool {
+    let n = len(s)
+    let v0 = VB.splat(byte(0))
+    var i = 0
+    while i + 32 <= n {
+        if (VB.load(s, i) == v0).any() { return true }
+        i += 32
+    }
+    while i < n {
+        if s[i] == 0 { return true }
+        i += 1
+    }
+    return false
 }
 
 // ----------------------------------------------------------- exact decimals
