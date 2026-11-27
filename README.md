@@ -31,7 +31,7 @@ Measured on an AMD Ryzen 7 8745HS running Linux 7.2 (27 November 2026). Full tab
 | HTTP/1.1 & HTTP/2 server | Up to 235k req/s (`h2c`) and 181k req/s (TLS 1.3) on 1 core — 1.5–5.4× Go and up to 2.4× Node.js at 7–13 MB RSS | [PERFORMANCE.md](PERFORMANCE.md) |
 | CLI tools & parsers | Faster than Go's `regexp`, `jq`, `eza`, `grep` and Python JSON | [PERFORMANCE.md](PERFORMANCE.md) |
 | 38-digit `Decimal` | Faster than .NET `Decimal` on every operation and Java `BigDecimal` on 9 of 10 | [PERFORMANCE.md](PERFORMANCE.md) |
-| LexDB vs. PostgreSQL 18 | 2.1–4.3× faster on TPC-H and ClickBench analytics, 1.3–3.1× durable updates, 1.2–1.3× 4-core OLTP reads via replicas | [LexDB performance](lexell/docs/lexdb/performance.md) |
+| LexDB vs. PostgreSQL 18 | 2.4–4.6× faster on TPC-H and ClickBench analytics (faster than 4-core PG on 43/43 ClickBench queries), 1.3–3.1× durable updates, 1.2–1.3× 4-core OLTP reads via replicas | [LexDB performance](lexell/docs/lexdb/performance.md) |
 
 Where others are ahead: Rust leads on floating-point (`nbody`), sorting with closures, bit-packed decode and hash aggregation; Java leads on allocation-heavy microbenchmarks and vectorised matrix multiplication; PostgreSQL leads on single-process multi-threaded reads and high-concurrency multi-statement read-write transactions. See the linked reports for the full breakdown.
 
