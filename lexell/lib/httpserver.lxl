@@ -123,6 +123,7 @@ pub type Config = record {
     pub drainMs: int             // after a stop: how long requests in flight may take
     pub maxConns: int            // connections at once; past it the accept loop waits
     pub maxConnsPerIp: int       // per client address, in this worker; 0: no limit
+    pub maxHandshakes: int       // concurrent TLS handshakes per worker; 0: no limit
     pub maxRequestsPerConn: int  // then Connection: close
     pub maxHeadBytes: int        // the request head: 431
     pub maxHeaders: int          // header lines: 431
@@ -160,7 +161,7 @@ pub fn defaults(): Config {
     return Config{
         headerTimeoutMs: 10000, idleTimeoutMs: 60000, idlePressureMs: 5000,
         bodyGraceMs: 10000, bodyMinRate: 1024, writeStallMs: 30000, deadlineMs: 30000, drainMs: 30000,
-        maxConns: 10000, maxConnsPerIp: 0, maxRequestsPerConn: 1000,
+        maxConns: 10000, maxConnsPerIp: 0, maxHandshakes: 256, maxRequestsPerConn: 1000,
         maxHeadBytes: 16384, maxHeaders: 100, maxLineBytes: 8192, maxTargetBytes: 8192,
         maxBody: 1048576, maxDrain: 262144, maxParams: 1000, maxParts: 1000, maxPartHeaders: 64,
         maxPartHeadBytes: 16384, maxTrailerBytes: 8192, maxTrailers: 32,
@@ -191,6 +192,7 @@ type Limits = value record {
     bodyMinRate: int
     writeStallMs: int
     deadlineMs: int
+    maxHandshakes: int
     maxRequestsPerConn: int
     maxHeadBytes: int
     maxHeaders: int
@@ -217,7 +219,7 @@ type Limits = value record {
 fn limitsOf(c: &Config): Limits {
     return Limits{headerTimeoutMs: c.headerTimeoutMs, idleTimeoutMs: c.idleTimeoutMs, idlePressureMs: c.idlePressureMs, bodyGraceMs: c.bodyGraceMs,
         bodyMinRate: c.bodyMinRate, writeStallMs: c.writeStallMs, deadlineMs: c.deadlineMs,
-        maxRequestsPerConn: c.maxRequestsPerConn, maxHeadBytes: c.maxHeadBytes, maxHeaders: c.maxHeaders,
+        maxHandshakes: c.maxHandshakes, maxRequestsPerConn: c.maxRequestsPerConn, maxHeadBytes: c.maxHeadBytes, maxHeaders: c.maxHeaders,
         maxLineBytes: c.maxLineBytes, maxTargetBytes: c.maxTargetBytes, maxBody: c.maxBody, maxDrain: c.maxDrain,
         maxParams: c.maxParams, maxParts: c.maxParts, maxPartHeaders: c.maxPartHeaders,
         maxPartHeadBytes: c.maxPartHeadBytes, maxTrailerBytes: c.maxTrailerBytes, maxTrailers: c.maxTrailers,
@@ -832,10 +834,10 @@ fn (c: &ReadConn) read(buf: mut &[byte], at: Where): Result[int, ConnError] {
     }
 }
 
-fn (c: &ReadConn) writeInterim(data: &[byte], at: Where): Result[Unit, ConnError] {
+fn (c: &ReadConn) writeInterim(data: &[byte], stallMs: int, at: Where): Result[Unit, ConnError] {
     match c {
         ReadConn.Plain(h) { return ioUnit(h.writeInterim(data, at)) }
-        ReadConn.Tls(b, _) { return withTls(&b, fn(t: mut &tls.Conn): Result[Unit, tls.Error] { return t.writeStalled(data, 0, at) }) }
+        ReadConn.Tls(b, _) { return withTls(&b, fn(t: mut &tls.Conn): Result[Unit, tls.Error] { return t.writeStalled(data, stallMs, at) }) }
         ReadConn.H2(st) {
             return match st.send100() {
                 Ok(_) { Ok(Unit{}) }
@@ -925,6 +927,7 @@ pub type Request = record {
     rnd: []byte
     rndAt: int
     started: int           // ns (monotonic), when the head was complete (0 on a router without middleware)
+    accountedMem: int      // bytes currently charged to State.mem for this connection's H1 buffers
 }
 
 // The value of the pattern's wildcard name ("" when there is none).
@@ -1072,7 +1075,7 @@ pub fn (rq: mut &Request) read(buf: mut &[byte], at: Where): Result[int, Error] 
         rq.expect = false
         if rq.r == rq.n {
             let hundred = strToBytes("HTTP/1.1 100 Continue\r\n\r\n")
-            match rq.conn.writeInterim(&hundred, at) {
+            match rq.conn.writeInterim(&hundred, rq.lim.writeStallMs, at) {
                 Ok(_) {}
                 Err(e) {
                     rq.broken = true
@@ -1255,10 +1258,10 @@ pub type Form = record {
 }
 
 // The first value of name, if the form has one.
-pub fn (f: &Form) get(name: str): Option[str] { return f.pairs.get(&name) }
+pub fn (f: &Form) get(name: &str): Option[str] { return f.pairs.get(name) }
 
 // Every value of name, in order.
-pub fn (f: &Form) values(name: str): []str { return f.pairs.all(&name) }
+pub fn (f: &Form) values(name: &str): []str { return f.pairs.all(name) }
 
 pub fn (f: &Form) size(): int { return f.pairs.size() }
 
@@ -1419,9 +1422,16 @@ fn extendedName(v: &str): Result[str, str] {
 fn parseMultipart(body: &str, boundary: &str, lim: Limits): Result[Form, Error] {
     let delim = "--" + boundary
     let inner = "\r\n--" + boundary
-    var at = strings.indexOf(body, &delim, 0)
+    // RFC 2046 section 5.1.1: the first delimiter is either at byte 0 or
+    // preceded by CRLF after a preamble (never mid-line).
+    var at = -1
+    if strings.startsWith(body, &delim) {
+        at = len(delim)
+    } else {
+        let idx = strings.indexOf(body, &inner, 0)
+        if idx >= 0 { at = idx + len(inner) }
+    }
     if at < 0 { return Err(error(400, "a multipart body without its boundary")) }
-    at += len(delim)
     var pairs = url.newQuery()
     var files: []File = []
     var parts = 0
@@ -1500,10 +1510,22 @@ fn (rq: mut &Request) fill(at: Where): Result[Unit, Error] {
         rq.r = 0
         rq.n = 0
     } else if rq.n == len(rq.buf) {
-        let k = rq.n - rq.r
-        for i in 0..k { rq.buf[i] = rq.buf[rq.r + i] }
-        rq.r = 0
-        rq.n = k
+        if rq.r > 0 {
+            let k = rq.n - rq.r
+            for i in 0..k { rq.buf[i] = rq.buf[rq.r + i] }
+            rq.r = 0
+            rq.n = k
+        } else {
+            let capLimit = max(max(BUF, rq.lim.maxTrailerBytes + 8), 8192)
+            if len(rq.buf) >= capLimit {
+                return Err(rq.badBody(400, "a chunk line or trailer over the limit"))
+            }
+            var c = len(rq.buf) * 2
+            if c > capLimit { c = capLimit }
+            var nb = array(c, byte(0))
+            for i in 0..rq.n { nb[i] = rq.buf[i] }
+            rq.buf = nb
+        }
     }
     let now = nowMs()
     if !rq.bodyStarted {
@@ -1670,6 +1692,12 @@ fn (rq: mut &Request) readTrailers(at: Where): Result[Unit, Error] {
             match http.parseFields(&text, 0, mut &h, rq.lim.maxTrailers) {
                 Ok(_) {}
                 Err(m) { return Err(rq.badBody(400, &("trailers: " + m))) }
+            }
+            for i in 0..h.size() {
+                let nm = lowerAscii(&h.line(i).name)
+                if h2.isForbiddenTrailer(&nm) {
+                    return Err(rq.badBody(400, &("forbidden trailer header: " + h.line(i).name)))
+                }
             }
             rq.trailers = h
             rq.r = e + 4
@@ -1856,11 +1884,14 @@ fn validHost(h: &str): bool {
     if h[i] != ':' { return false }
     i += 1
     let p0 = i
+    var port = 0
     while i < len(h) {
         if h[i] < '0' || h[i] > '9' { return false }
+        port = port * 10 + int(h[i] - '0')
+        if port > 65535 { return false }
         i += 1
     }
-    return i > p0 && i - p0 <= 5
+    return i > p0 && i - p0 <= 5 && port >= 1 && port <= 65535
 }
 
 fn hasUpperAscii(s: &str): bool {
@@ -2196,7 +2227,8 @@ fn (w: mut &Response) special(name: &str, value: &str): bool {
 // Declares a trailer (before the head is written) and sets its value (at
 // any time before the end). Trailers make the body chunked.
 pub fn (w: mut &Response) trailer(name: &str, value: &str) {
-    if !http.isToken(name) || !http.isFieldValue(value) {
+    let low = lowerAscii(name)
+    if !http.isToken(name) || !http.isFieldValue(value) || h2.isForbiddenTrailer(&low) {
         if !w.headSent { w.bad = "trailer " + logValue(name) }
         return
     }
@@ -2301,8 +2333,11 @@ pub fn (w: mut &Response) redirect(code: int, location: &str, at: Where): Result
             let s0 = if https { 8 } else { 7 }
             var e = s0
             while e < len(location) && location[e] != '/' && location[e] != '?' && location[e] != '#' { e += 1 }
-            let h = lowerAscii(&(hostName(location[s0..e])))
-            w.st.with(fn(s: mut &State) { ok = contains2(&s.redirectHosts, &h) })
+            let auth = location[s0..e]
+            if len(auth) > 0 && strings.indexOf(&auth, "@", 0) < 0 && validHost(&auth) {
+                let h = lowerAscii(&(hostName(&auth)))
+                w.st.with(fn(s: mut &State) { ok = contains2(&s.redirectHosts, &h) })
+            }
         }
     }
     if !ok { return Err(error(500, &("redirect to " + logValue(location) + ", not a relative path or an allowed host"))) }
@@ -2928,6 +2963,8 @@ type State = record {
     perIp: Map[str, int]
     maxPerIp: int
     maxConns: int
+    handshakes: int
+    hsWaiters: []task.Promise[int]
     pid: int
     logFd: int
 }
@@ -3027,7 +3064,7 @@ fn serveWith[A](ln: net.Listener, app: A, r: Router[A], cfg: Config, tctx: Optio
     let st = task.shared(State{stats: noStats(), open: 0, slots: [], done: [], stopping: false, log: newBuf(0), mem: 0,
         memBudget: cfg.memBudget, hosts: lowerList(&cfg.hosts), redirectHosts: lowerList(&cfg.redirectHosts),
         proxies: copyList(&cfg.trustedProxies), perIp: newMap[str, int](), maxPerIp: cfg.maxConnsPerIp,
-        maxConns: cfg.maxConns, pid: int(getpid()), logFd: cfg.logFd})
+        maxConns: cfg.maxConns, handshakes: 0, hsWaiters: [], pid: int(getpid()), logFd: cfg.logFd})
     let sh = rc(site)
     let shared = rc(app)        // one app for every connection: a handle each, lending &A
     let ready = task.workerReady()
@@ -3230,13 +3267,69 @@ type StartConn = closed {
     H2(net.ReadHalf, net.WriteHalf, Option[tls.Engine], str, []byte, bool)
 }
 
-fn startConn(c: net.Conn, tctx: Option[tls.Context], lim: Limits, at: Where): Result[StartConn, ConnError] {
+fn acquireHandshake(st: &task.Shared[State], maxHs: int, timeoutMs: int, at: Where): Result[bool, ConnError] {
+    if maxHs <= 0 { return Ok(false) }
+    let deadline = if timeoutMs > 0 { nowMs() + timeoutMs } else { -1 }
+    while true {
+        var got = false
+        var shed = false
+        var fut: Option[task.Future[int]] = None
+        st.with(fn(x: mut &State) {
+            if x.handshakes < maxHs {
+                x.handshakes += 1
+                got = true
+            } else if len(x.hsWaiters) >= maxHs * 4 {
+                x.stats.shed += 1
+                shed = true
+            } else {
+                let task.Handoff{promise: pr, future: f} = task.promise[int]()
+                append(mut &x.hsWaiters, pr)
+                fut = Some(f)
+            }
+        })
+        if got { return Ok(true) }
+        if shed { return Err(ConnError{timeout: false, msg: "too many concurrent TLS handshakes"}) }
+        let f = replace(mut &fut, None).unwrap()
+        var waitRes: Result[int, task.Cancelled] = Ok(0)
+        if deadline >= 0 {
+            let ms = deadline - nowMs()
+            if ms <= 0 { return Err(ConnError{timeout: true, msg: "TLS handshake queue timeout"}) }
+            waitRes = f.waitFor(ms, at)
+        } else {
+            waitRes = f.wait(at)
+        }
+        match waitRes {
+            Ok(_) {}
+            Err(c) { return Err(ConnError{timeout: c == task.Cancelled.Timeout, msg: "TLS handshake queue cancelled"}) }
+        }
+    }
+    return Ok(false)
+}
+
+fn releaseHandshake(st: &task.Shared[State]) {
+    var next: Option[task.Promise[int]] = None
+    st.with(fn(x: mut &State) {
+        if x.handshakes > 0 { x.handshakes -= 1 }
+        if len(x.hsWaiters) > 0 {
+            for j in 0..len(x.hsWaiters) - 1 { swap(mut &x.hsWaiters, j, j + 1) }
+            next = Some(pop(mut &x.hsWaiters))
+        }
+    })
+    match move(next) {
+        Some(pr) { pr.complete(0) }
+        None {}
+    }
+}
+
+fn startConn(c: net.Conn, tctx: Option[tls.Context], st: &task.Shared[State], lim: Limits, at: Where): Result[StartConn, ConnError] {
     match move(tctx) {
         Some(ctx) {
+            let held = try acquireHandshake(st, lim.maxHandshakes, lim.headerTimeoutMs, at)
             let timed = lim.headerTimeoutMs > 0
             let old = if timed { rtWithin(lim.headerTimeoutMs) } else { 0 }
             let hr = ctx.accept(c, at)
             if timed { rtRestore(old) }
+            if held { releaseHandshake(st) }
             match move(hr) {
                 Ok(tc) {
                     let peer = tc.peerAddr()
@@ -3307,7 +3400,7 @@ fn startConn(c: net.Conn, tctx: Option[tls.Context], lim: Limits, at: Where): Re
 
 fn connTask[A](j: ConnJob[A]): int {
     let ConnJob{conn: c, tlsCtx: tctx, app: app, site: site, st: st, slot: slot, lim: lim} = move(j)
-    let sr = startConn(c, tctx, lim)
+    let sr = startConn(c, tctx, &st, lim)
     if sr.isErr() {
         // The handshake (or the split) failed: the socket is closed and the
         // connection is gone without an HTTP reply.
@@ -3344,7 +3437,7 @@ fn connTask[A](j: ConnJob[A]): int {
                 target: "", rawPath: "", query: "", hostName: "", minor: 1, params: [], chain: [], notes: [], trailers: http.newHeaders(),
                 allow: "", conn: rh, buf: buf, r: 0, n: len(preBytes), framing: F_NONE, left: 0, cstate: C_DONE, got: 0, maxBody: lim.maxBody,
                 extBytes: 0, expect: false, keep: true, broken: false, bodyStarted: false, bodyDeadline: -1, sinceYield: 0, lim: lim, st: st.share(),
-                trusted: trusted, rnd: [], rndAt: 0, started: 0}
+                trusted: trusted, rnd: [], rndAt: 0, started: 0, accountedMem: BUF + OUT}
             var w = Response{conn: wh, code: 0, final: 0, headers: http.newHeaders(), trailerNames: [], trailerVals: http.newHeaders(),
                 out: newBuf(OUT), body: newBuf(0), strBody: "", useStr: false, headSent: false, mode: M_NONE, declared: -1, sent: 0,
                 head: false, minor: 1, close: false, bad: "", id: "", stallMs: lim.writeStallMs, failed: false, ctSet: false, ccSet: false,
@@ -3362,10 +3455,10 @@ fn connTask[A](j: ConnJob[A]): int {
                 }
             }
             if w.close && w.headSent && !task.cancelled() { linger(mut &rq, &w) }
-            let used = len(rq.buf) + len(w.out.b) + len(w.body.b)
+            let releaseMem = rq.accountedMem
             st.with(fn(x: mut &State) {
                 x.open -= 1
-                x.mem -= used
+                x.mem -= releaseMem
                 x.slots[slot].state = SLOT_DONE
                 append(mut &x.done, slot)
                 if counted {
@@ -3539,7 +3632,7 @@ fn h2StreamTask[A](j: H2StreamJob[A]): int {
         left: if cl >= 0 { cl } else { 0 }, cstate: if endStream { C_DONE } else { C_SIZE },
         got: 0, maxBody: lim.maxBody, extBytes: 0, expect: expectCont, keep: true, broken: false,
         bodyStarted: false, bodyDeadline: -1, sinceYield: 0, lim: lim, st: st.share(), trusted: trusted,
-        rnd: [], rndAt: 0, started: if len(site.mws) > 0 { time.monotonicNs() } else { 0 }}
+        rnd: [], rndAt: 0, started: if len(site.mws) > 0 { time.monotonicNs() } else { 0 }, accountedMem: 0}
     var w = Response{conn: WriteConn.H2(stream.share()), code: 0, final: 0, headers: http.newHeaders(),
         trailerNames: [], trailerVals: http.newHeaders(), out: newBuf(0), body: newBuf(0), strBody: "", useStr: false,
         headSent: false, mode: M_NONE, declared: -1, sent: 0, head: rq.method == "HEAD", minor: 0, close: false,
@@ -3796,6 +3889,7 @@ fn (rq: mut &Request) readHead(idleMs: int, at: Where): int {
         while skipped < 2 && rq.n - rq.r >= 2 && rq.buf[rq.r] == '\r' && rq.buf[rq.r + 1] == '\n' {
             rq.r += 2
             skipped += 1
+            if deadline < 0 { deadline = nowMs() + rq.lim.headerTimeoutMs }
             from = rq.r
             lf = rq.r
         }
@@ -3888,7 +3982,11 @@ fn serveOne[A](app: &A, site: &rc Router[A], rq: mut &Request, w: mut &Response,
     var overMem = false
     var misdirected = false
     let hn = &rq.hostName
+    let curMem0 = len(rq.buf) + len(w.out.b) + len(w.body.b)
+    let deltaMem0 = curMem0 - rq.accountedMem
+    rq.accountedMem = curMem0
     st.with(fn(x: mut &State) {
+        x.mem += deltaMem0
         x.stats.requests += 1
         if bad != 0 {
             x.stats.rejected += 1
@@ -4007,8 +4105,12 @@ fn serveOne[A](app: &A, site: &rc Router[A], rq: mut &Request, w: mut &Response,
     if idleNow && len(rq.buf) > BUF { rq.buf = array(BUF, byte(0)) }
     if len(w.out.b) > 4 * FLUSH_AT { w.out = newBuf(OUT) }
     if len(w.body.b) > 4 * FLUSH_AT { w.body = newBuf(0) }
+    let curMem = len(rq.buf) + len(w.out.b) + len(w.body.b)
+    let deltaMem = curMem - rq.accountedMem
+    rq.accountedMem = curMem
     let now = nowMs()
     st.with(fn(x: mut &State) {
+        x.mem += deltaMem
         if status >= 500 {
             x.stats.c5xx += 1
             x.stats.errors += 1

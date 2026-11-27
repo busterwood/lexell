@@ -58,12 +58,14 @@ import "time"
 import "url"
 import "tls"
 import "hpack"
+import "h2"
 import "h2client"
 
 pub const MAX_HEAD = 65536         // bytes of a reply head (status line and headers), or of trailers
 pub const MAX_HEADERS = 100        // header lines of a head, or trailer lines
 const MAX_INTERIM = 8              // 1xx replies skipped before the real one
 const MAX_LINE = 4096              // a chunk-size line
+const MAX_CHUNK_EXT = 16384        // cumulative chunk-extension bytes per response
 const BUF = 4096                   // a connection's read buffer (grows for a long head)
 const SMALL_BODY = 16384           // a request body up to this is sent with the head, in one write
 const CHECK_IDLE_NS = 100000000    // a connection idle longer than 100 ms is checked before reuse
@@ -1126,6 +1128,7 @@ pub type Response = record {
     length: int                   // Content-Length, or -1
     left: int                     // F_LENGTH: bytes to come; chunked: of the current chunk
     chunk: int                    // chunked: C_SIZE, C_DATA or C_CRLF
+    extBytes: int                 // cumulative chunk-extension bytes read
     done: bool                    // the body has been read to the end
     keep: bool                    // the server keeps the connection open after the body
     keepMs: int                   // Keep-Alive: timeout=N, in ms (-1: none)
@@ -1246,7 +1249,7 @@ fn (r: mut &Response) readBody(buf: mut &[byte], w: Where): Result[int, Error] {
         while true {
             if r.chunk == C_SIZE {
                 let line = try r.conn.readLine(&u, w)
-                let size = try chunkSize(&line, &u)
+                let size = try chunkSize(&line, mut &r.extBytes, &u)
                 if size == 0 {
                     try r.trailers(&u, w)
                     r.done = true
@@ -1284,9 +1287,10 @@ fn (r: mut &Response) readBody(buf: mut &[byte], w: Where): Result[int, Error] {
     return Ok(0)
 }
 
-// The size of a chunk-size line: hex digits, then optional extensions
-// (";name=value", ignored).
-fn chunkSize(line: &str, u: &str): Result[int, Error] {
+// The size of a chunk-size line: hex digits, then optional RFC 9112 section 7.1.1
+// extensions (BWS ";" BWS token [BWS "=" BWS (token / quoted-string)]), capped
+// cumulatively at MAX_CHUNK_EXT bytes per response.
+fn chunkSize(line: &str, extBytes: mut &int, u: &str): Result[int, Error] {
     var i = 0
     var n = 0
     while i < len(line) && hexDigit(line[i]) >= 0 {
@@ -1295,10 +1299,50 @@ fn chunkSize(line: &str, u: &str): Result[int, Error] {
         i += 1
     }
     if i == 0 { return Err(err(Kind.Protocol, "a bad chunk size line", u)) }
-    var j = i
-    while j < len(line) && (line[j] == ' ' || line[j] == '\t') { j += 1 }
-    if j < len(line) && (line[j] != ';' || !isFieldValue(line[j..])) {
-        return Err(err(Kind.Protocol, "a bad chunk size line", u))
+    let extStart = i
+    while i < len(line) && (line[i] == ' ' || line[i] == '\t') { i += 1 }
+    while i < len(line) {
+        if line[i] != ';' { return Err(err(Kind.Protocol, "a bad chunk size line", u)) }
+        i += 1
+        while i < len(line) && (line[i] == ' ' || line[i] == '\t') { i += 1 }
+        let n0 = i
+        while i < len(line) && isTchar(line[i]) { i += 1 }
+        if i == n0 { return Err(err(Kind.Protocol, "a bad chunk size line", u)) }
+        while i < len(line) && (line[i] == ' ' || line[i] == '\t') { i += 1 }
+        if i < len(line) && line[i] == '=' {
+            i += 1
+            while i < len(line) && (line[i] == ' ' || line[i] == '\t') { i += 1 }
+            if i < len(line) && line[i] == '"' {
+                i += 1
+                var shut = false
+                while i < len(line) {
+                    let c = line[i]
+                    if c == '"' {
+                        shut = true
+                        i += 1
+                        break
+                    }
+                    if c == '\\' {
+                        i += 1
+                        if i >= len(line) { return Err(err(Kind.Protocol, "a bad chunk size line", u)) }
+                    }
+                    if (line[i] < byte(0x20) && line[i] != '\t') || line[i] == byte(0x7f) {
+                        return Err(err(Kind.Protocol, "a bad chunk size line", u))
+                    }
+                    i += 1
+                }
+                if !shut { return Err(err(Kind.Protocol, "a bad chunk size line", u)) }
+            } else {
+                let v0 = i
+                while i < len(line) && isTchar(line[i]) { i += 1 }
+                if i == v0 { return Err(err(Kind.Protocol, "a bad chunk size line", u)) }
+            }
+            while i < len(line) && (line[i] == ' ' || line[i] == '\t') { i += 1 }
+        }
+    }
+    if len(line) > extStart {
+        extBytes += len(line) - extStart
+        if extBytes > MAX_CHUNK_EXT { return Err(err(Kind.Protocol, "chunk extensions over 16 KiB", u)) }
     }
     return Ok(n)
 }
@@ -1328,6 +1372,9 @@ fn (r: mut &Response) trailers(u: &str, w: Where): Result[Unit, Error] {
             match parseFields(&(strFromBytes(&r.conn.buf[r.conn.r..end])), 0, mut &h, MAX_HEADERS) {
                 Ok(_) {}
                 Err(m) { return Err(err(Kind.Protocol, &(m + " in the trailers"), u)) }
+            }
+            if h.has("Transfer-Encoding") || h.has("Content-Length") {
+                return Err(err(Kind.Protocol, "a framing header in the trailers", u))
             }
             r.conn.r = end + 4
             return Ok(Unit{})
@@ -1624,7 +1671,7 @@ fn h2Exchange(c: &Client, hc: &h2client.Conn, opts: &Options, u: &url.Url, us: &
         status: status, reason: "", major: 2, minor: 0, proto: "HTTP/2.0", headers: hs,
         url: u.clone(), us: us.clone(), conn: gone(), h2: Some(stream), sh: c.sh.share(),
         key: key.clone(), framing: if done { F_EMPTY } else if cl >= 0 { F_LENGTH } else { F_CHUNKED },
-        length: cl, left: if cl >= 0 { cl } else { 0 }, chunk: C_SIZE, done: done,
+        length: cl, left: if cl >= 0 { cl } else { 0 }, chunk: C_SIZE, extBytes: 0, done: done,
         keep: true, keepMs: -1, maxBody: opts.maxBody, idleMs: opts.idleTimeoutMs, deadline: deadline,
     })
 }
@@ -1849,7 +1896,7 @@ fn exchange(c: &Client, opts: &Options, u: &url.Url, us: &str, key: &str, method
     return Ok(Response{status: status, reason: reason, major: 1, minor: minor, proto: proto, headers: headers,
                        url: u.clone(), us: us.clone(), conn: conn, h2: None, sh: c.sh.share(),
                        key: key.clone(), framing: fr.framing, length: fr.length, left: if fr.framing == F_LENGTH { fr.length } else { 0 },
-                       chunk: C_SIZE, done: done, keep: fr.keep, keepMs: fr.keepMs, maxBody: opts.maxBody,
+                       chunk: C_SIZE, extBytes: 0, done: done, keep: fr.keep, keepMs: fr.keepMs, maxBody: opts.maxBody,
                        idleMs: opts.idleTimeoutMs, deadline: deadline})
 }
 
@@ -1864,12 +1911,22 @@ fn wireOf(method: &str, u: &url.Url, us: &str, auth: &str, h: &Headers, body: &s
     for x in h.list {
         if !isToken(&x.name) { return Err(err(Kind.Invalid, &("an invalid header name '" + x.name + "'"), us)) }
         if !isFieldValue(&x.value) { return Err(err(Kind.Invalid, &("a control character in the header " + x.name), us)) }
-        if equalFold(&x.name, "Host") { hasHost = true }
+        if equalFold(&x.name, "Host") {
+            if hasHost { return Err(err(Kind.Invalid, "duplicate Host header", us)) }
+            if len(x.value) == 0 { return Err(err(Kind.Invalid, "empty Host header", us)) }
+            for k in 0..len(x.value) {
+                if x.value[k] <= byte(0x20) || x.value[k] >= byte(0x7f) || x.value[k] == '@' {
+                    return Err(err(Kind.Invalid, "invalid Host header value", us))
+                }
+            }
+            hasHost = true
+        }
         if equalFold(&x.name, "User-Agent") { hasUa = true }
         if equalFold(&x.name, "Transfer-Encoding") {
             return Err(err(Kind.Invalid, "Transfer-Encoding is set (request bodies are sent with a Content-Length)", us))
         }
         if equalFold(&x.name, "Content-Length") {
+            if hasLen { return Err(err(Kind.Invalid, "duplicate Content-Length header", us)) }
             if x.value != intToStr(len(body)) { return Err(err(Kind.Invalid, "a Content-Length that is not the body's length", us)) }
             hasLen = true
         }
