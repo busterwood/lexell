@@ -1,0 +1,386 @@
+// End-to-end PostgreSQL DML trigger tests over lexdb_wire + lib/postgres:
+// - Trigger function DDL validation (RETURNS trigger, LANGUAGE plpgsql, 0 args, direct call rejection)
+// - BEFORE/AFTER FOR EACH ROW & FOR EACH STATEMENT, alphabetical firing order
+// - Modifying NEW in BEFORE ROW + skipping rows via RETURN NULL + RETURNING *
+// - UPDATE OF col_list, WHEN (condition), TG_* special variables, 0-based TG_ARGV[i]
+// - REFERENCING OLD TABLE / NEW TABLE transition tables
+// - BEFORE / AFTER TRUNCATE triggers
+// - INSTEAD OF INSERT / UPDATE / DELETE triggers on views with RETURNING
+// - ON CONFLICT DO UPDATE trigger firing
+// - PL/pgSQL control flow, RAISE EXCEPTION + atomic rollback, EXCEPTION WHEN subtransaction rollback
+// - Cascading & recursive triggers + pg_trigger_depth() + recursion limit
+// - ALTER TRIGGER RENAME, ALTER TABLE ENABLE/DISABLE TRIGGER, ALTER TABLE RENAME, DROP FUNCTION CASCADE, DROP TRIGGER
+// - System catalogs: pg_trigger, pg_class.relhastriggers, pg_tables.hastriggers, information_schema.triggers, pg_get_triggerdef
+// - Disk persistence across store reopen
+// expect: fn_sql_err: 0A000
+// expect: fn_args_err: 42P13
+// expect: fn_direct_err: 0A000
+// expect: trg_bad_fn: 42809
+// expect: trg_dup: 42710
+// expect: trg_tab_io: 42809
+// expect: trg_trunc_row: 42809
+// expect: trg_bad_col: 42703
+// expect: before_ins_ret: 1:ALICE:100 | 3:CHARLIE:300
+// expect: before_ins_rows: 1:ALICE:100:ab | 3:CHARLIE:300:ab
+// expect: before_upd_ret: 1:ALICE_V2:150
+// expect: before_upd_rows: 1:ALICE_V2:150 | 3:CHARLIE:300
+// expect: before_del: affected=1 left=3
+// expect: upsert_trg: 3:CHARLIE_UPSERT:999
+// expect: audit_log: INSERT:BEFORE/AFTER:ROW:accounts:public:tag0:tag1:1:100 | UPDATE:AFTER:ROW:accounts:public:tag0:tag1:1:150 | DELETE:AFTER:ROW:accounts:public:tag0:tag1:1:150
+// expect: upd_of_when: count=1 events=2:50->200
+// expect: stmt_trans: INS:2:30 | UPD:2:30->50 | DEL:1:20 | ZERO:0
+// expect: trunc_log: BEFORE_TRUNC:items | AFTER_TRUNC:items
+// expect: view_io_ins: 10:Widget:42
+// expect: view_io_upd: 10:Widget2:99
+// expect: view_io_del: affected=1 count=0
+// expect: exc_abort: P0001 count=1
+// expect: exc_catch: caught=23505 count=0
+// expect: cascade_depth: d1=1 d2=2 outer=0
+// expect: recur_limit: 54001
+// expect: disable_enable: dis=0 en=1
+// expect: rename_tbl: fired=1 def_ok=true
+// expect: drop_fn_dep: 2BP01 cascade_ok=0
+// expect: catalogs: pg_trg=1 relhas=t tblhas=t is_rows=2 def_ok=true
+// expect: plpgsql_ctrl: sum=15 diag=2 dyn=99
+// expect: merge_trg: INS:2:200 | UPD:1:150
+// expect: reopen_ok: 1:REOPENED:777
+import "task"
+import "net"
+import "os"
+import "fs"
+import "postgres"
+import "sqldialect"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+
+type V = sqldialect.Value
+
+fn codeOf(e: &postgres.Error): str {
+    let t = e.toStr()
+    for code in ["0A000", "42P13", "42809", "42710", "42703", "42883", "42704", "2BP01", "P0001", "23505", "54001", "2F005"] {
+        if strings.contains(&t, &code) { return code }
+    }
+    return t
+}
+
+fn fmtRows(r: &postgres.Rows): str {
+    var lines: []str = []
+    for i in 0..r.rowCount() {
+        var cols: []str = []
+        for c in 0..r.columnCount() {
+            append(mut &cols, r.text(i, c).unwrapOr("NULL"))
+        }
+        append(mut &lines, strings.join(&cols, ":"))
+    }
+    return strings.join(&lines, " | ")
+}
+
+fn client1(addr: str): Result[Unit, postgres.Error] {
+    let port = addr[10..len(addr)]
+    let dsn = "host=127.0.0.1 port=" + port + " user=test dbname=test sslmode=disable"
+    var c = try postgres.connect(&dsn)
+
+    // 1. Trigger function validation
+    match c.exec("CREATE FUNCTION bad_sql() RETURNS trigger LANGUAGE sql AS $$ SELECT 1 $$") {
+        Ok(_) { println("fn_sql_err: ok") }
+        Err(e) { println("fn_sql_err: " + codeOf(&e)) }
+    }
+    match c.exec("CREATE FUNCTION bad_args(x int) RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$") {
+        Ok(_) { println("fn_args_err: ok") }
+        Err(e) { println("fn_args_err: " + codeOf(&e)) }
+    }
+    try c.exec("CREATE FUNCTION noop_trg() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END; $$")
+    match c.query("SELECT noop_trg()", &[]) {
+        Ok(_) { println("fn_direct_err: ok") }
+        Err(e) { println("fn_direct_err: " + codeOf(&e)) }
+    }
+    try c.exec("CREATE FUNCTION not_trg() RETURNS int LANGUAGE sql AS $$ SELECT 1 $$")
+    try c.exec("CREATE TABLE tval (id int primary key, name text)")
+    match c.exec("CREATE TRIGGER tr_bad BEFORE INSERT ON tval FOR EACH ROW EXECUTE FUNCTION not_trg()") {
+        Ok(_) { println("trg_bad_fn: ok") }
+        Err(e) { println("trg_bad_fn: " + codeOf(&e)) }
+    }
+    try c.exec("CREATE TRIGGER tr_dup BEFORE INSERT ON tval FOR EACH ROW EXECUTE FUNCTION noop_trg()")
+    match c.exec("CREATE TRIGGER tr_dup BEFORE INSERT ON tval FOR EACH ROW EXECUTE FUNCTION noop_trg()") {
+        Ok(_) { println("trg_dup: ok") }
+        Err(e) { println("trg_dup: " + codeOf(&e)) }
+    }
+    try c.exec("CREATE OR REPLACE TRIGGER tr_dup AFTER INSERT ON tval FOR EACH ROW EXECUTE FUNCTION noop_trg()")
+    match c.exec("CREATE TRIGGER tr_io INSTEAD OF INSERT ON tval FOR EACH ROW EXECUTE FUNCTION noop_trg()") {
+        Ok(_) { println("trg_tab_io: ok") }
+        Err(e) { println("trg_tab_io: " + codeOf(&e)) }
+    }
+    match c.exec("CREATE TRIGGER tr_tr BEFORE TRUNCATE ON tval FOR EACH ROW EXECUTE FUNCTION noop_trg()") {
+        Ok(_) { println("trg_trunc_row: ok") }
+        Err(e) { println("trg_trunc_row: " + codeOf(&e)) }
+    }
+    match c.exec("CREATE TRIGGER tr_bc BEFORE UPDATE OF nosuch ON tval FOR EACH ROW EXECUTE FUNCTION noop_trg()") {
+        Ok(_) { println("trg_bad_col: ok") }
+        Err(e) { println("trg_bad_col: " + codeOf(&e)) }
+    }
+    try c.exec("DROP TABLE tval")
+
+    // 2. BEFORE INSERT/UPDATE/DELETE FOR EACH ROW: mutate NEW, skip via RETURN NULL, alphabetical chaining, RETURNING *
+    try c.exec("CREATE TABLE accounts (id int primary key, name text not null, bal int not null, tag text default '')")
+    try c.exec("CREATE TABLE audit (seq serial primary key, op text, timing text, lvl text, tbl text, sch text, a0 text, a1 text, rid int, val int)")
+
+    // Create tr_b BEFORE tr_a to verify alphabetical execution order (tr_a runs first -> 'a', then tr_b -> 'ab')
+    try c.exec("CREATE FUNCTION fn_b() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.bal < 0 THEN RETURN NULL; END IF; NEW.tag := NEW.tag || 'b'; RETURN NEW; END; $$")
+    try c.exec("CREATE FUNCTION fn_a() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.name := upper(NEW.name); NEW.tag := NEW.tag || 'a'; RETURN NEW; END; $$")
+    try c.exec("CREATE TRIGGER tr_b BEFORE INSERT ON accounts FOR EACH ROW EXECUTE FUNCTION fn_b()")
+    try c.exec("CREATE TRIGGER tr_a BEFORE INSERT ON accounts FOR EACH ROW EXECUTE FUNCTION fn_a()")
+
+    let rIns = try c.query("INSERT INTO accounts (id, name, bal) VALUES (1, 'alice', 100), (2, 'bob', -50), (3, 'charlie', 300) RETURNING id, name, bal", &[])
+    println("before_ins_ret: " + fmtRows(&rIns))
+    let rAll1 = try c.query("SELECT id, name, bal, tag FROM accounts ORDER BY id", &[])
+    println("before_ins_rows: " + fmtRows(&rAll1))
+
+    // AFTER ROW audit trigger with TG_* variables and 0-based TG_ARGV[0], TG_ARGV[1]
+    try c.exec("CREATE FUNCTION fn_audit() RETURNS trigger LANGUAGE plpgsql AS $$ DECLARE v_rid int; v_val int; BEGIN IF TG_OP = 'DELETE' THEN v_rid := OLD.id; v_val := OLD.bal; ELSE v_rid := NEW.id; v_val := NEW.bal; END IF; INSERT INTO audit (op, timing, lvl, tbl, sch, a0, a1, rid, val) VALUES (TG_OP, TG_WHEN, TG_LEVEL, TG_TABLE_NAME, TG_TABLE_SCHEMA, TG_ARGV[0], TG_ARGV[1], v_rid, v_val); RETURN NULL; END; $$")
+    try c.exec("CREATE TRIGGER tr_audit AFTER INSERT OR UPDATE OR DELETE ON accounts FOR EACH ROW EXECUTE FUNCTION fn_audit('tag0', 'tag1')")
+
+    // BEFORE UPDATE: normalize name and skip if bal > 10000
+    try c.exec("CREATE FUNCTION fn_bupd() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.bal > 10000 THEN RETURN NULL; END IF; NEW.name := upper(NEW.name); RETURN NEW; END; $$")
+    try c.exec("CREATE TRIGGER tr_bupd BEFORE UPDATE ON accounts FOR EACH ROW EXECUTE FUNCTION fn_bupd()")
+    let rUpd = try c.query("UPDATE accounts SET name = CASE WHEN id = 1 THEN 'alice_v2' ELSE 'big' END, bal = CASE WHEN id = 1 THEN 150 ELSE 99999 END RETURNING id, name, bal", &[])
+    println("before_upd_ret: " + fmtRows(&rUpd))
+    let rAll2 = try c.query("SELECT id, name, bal FROM accounts ORDER BY id", &[])
+    println("before_upd_rows: " + fmtRows(&rAll2))
+
+    // BEFORE DELETE: protect id=3 by returning NULL
+    try c.exec("CREATE FUNCTION fn_bdel() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF OLD.id = 3 THEN RETURN NULL; END IF; RETURN OLD; END; $$")
+    try c.exec("CREATE TRIGGER tr_bdel BEFORE DELETE ON accounts FOR EACH ROW EXECUTE FUNCTION fn_bdel()")
+    let rDel = try c.query("DELETE FROM accounts", &[])
+    let rLeft = try c.query("SELECT id FROM accounts ORDER BY id", &[])
+    println("before_del: affected=" + rDel.affected().toStr() + " left=" + fmtRows(&rLeft))
+
+    // ON CONFLICT DO UPDATE fires BEFORE UPDATE trigger
+    try c.exec("INSERT INTO accounts (id, name, bal) VALUES (3, 'charlie_upsert', 999) ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, bal = EXCLUDED.bal")
+    let rUps = try c.query("SELECT id, name, bal FROM accounts WHERE id = 3", &[])
+    println("upsert_trg: " + fmtRows(&rUps))
+
+    // Inspect audit log
+    try c.exec("DELETE FROM audit")
+    try c.exec("DROP TRIGGER tr_bdel ON accounts")
+    try c.exec("INSERT INTO accounts (id, name, bal) VALUES (1, 'alice', 100)")
+    try c.exec("UPDATE accounts SET bal = 150 WHERE id = 1")
+    try c.exec("DELETE FROM accounts WHERE id = 1")
+    let rAud = try c.query("SELECT op, CASE WHEN op = 'INSERT' THEN 'BEFORE/' || timing ELSE timing END, lvl, tbl, sch, a0, a1, rid, val FROM audit ORDER BY seq", &[])
+    println("audit_log: " + fmtRows(&rAud))
+
+    // 3. UPDATE OF col_list + WHEN (OLD.price IS DISTINCT FROM NEW.price)
+    try c.exec("CREATE TABLE prods (id int primary key, title text, price int)")
+    try c.exec("CREATE TABLE price_log (id int, diff text)")
+    try c.exec("CREATE FUNCTION fn_price() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO price_log VALUES (NEW.id, OLD.price::text || '->' || NEW.price::text); RETURN NULL; END; $$")
+    try c.exec("CREATE TRIGGER tr_price AFTER UPDATE OF price ON prods FOR EACH ROW WHEN (OLD.price IS DISTINCT FROM NEW.price) EXECUTE FUNCTION fn_price()")
+    try c.exec("INSERT INTO prods VALUES (1, 'pen', 10), (2, 'book', 50)")
+    try c.exec("UPDATE prods SET title = 'pen2' WHERE id = 1")
+    try c.exec("UPDATE prods SET price = 10 WHERE id = 1")
+    try c.exec("UPDATE prods SET price = 200 WHERE id = 2")
+    let rPl = try c.query("SELECT count(*), coalesce(min(id::text || ':' || diff), '') FROM price_log", &[])
+    println("upd_of_when: count=" + rPl.text(0, 0).unwrapOr("?") + " events=" + rPl.text(0, 1).unwrapOr("?"))
+
+    // 4. AFTER STATEMENT triggers + REFERENCING OLD TABLE / NEW TABLE + 0-row DML
+    try c.exec("CREATE TABLE sales (id int primary key, amt int)")
+    try c.exec("CREATE TABLE stmt_log (seq serial primary key, msg text)")
+    try c.exec("CREATE FUNCTION fn_stmt_ins() RETURNS trigger LANGUAGE plpgsql AS $$ DECLARE c int; s int; BEGIN SELECT count(*), coalesce(sum(amt), 0) INTO c, s FROM new_rows; IF c = 0 THEN INSERT INTO stmt_log (msg) VALUES ('ZERO:0'); ELSE INSERT INTO stmt_log (msg) VALUES ('INS:' || c::text || ':' || s::text); END IF; RETURN NULL; END; $$")
+    try c.exec("CREATE FUNCTION fn_stmt_upd() RETURNS trigger LANGUAGE plpgsql AS $$ DECLARE c int; so int; sn int; BEGIN SELECT count(*), coalesce(sum(amt), 0) INTO c, so FROM old_rows; SELECT coalesce(sum(amt), 0) INTO sn FROM new_rows; IF c = 0 THEN INSERT INTO stmt_log (msg) VALUES ('ZERO:0'); ELSE INSERT INTO stmt_log (msg) VALUES ('UPD:' || c::text || ':' || so::text || '->' || sn::text); END IF; RETURN NULL; END; $$")
+    try c.exec("CREATE FUNCTION fn_stmt_del() RETURNS trigger LANGUAGE plpgsql AS $$ DECLARE c int; s int; BEGIN SELECT count(*), coalesce(sum(amt), 0) INTO c, s FROM old_rows; INSERT INTO stmt_log (msg) VALUES ('DEL:' || c::text || ':' || s::text); RETURN NULL; END; $$")
+    try c.exec("CREATE TRIGGER tr_s_ins AFTER INSERT ON sales REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION fn_stmt_ins()")
+    try c.exec("CREATE TRIGGER tr_s_upd AFTER UPDATE ON sales REFERENCING OLD TABLE AS old_rows NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION fn_stmt_upd()")
+    try c.exec("CREATE TRIGGER tr_s_del AFTER DELETE ON sales REFERENCING OLD TABLE AS old_rows FOR EACH STATEMENT EXECUTE FUNCTION fn_stmt_del()")
+    try c.exec("INSERT INTO sales VALUES (1, 10), (2, 20)")
+    try c.exec("UPDATE sales SET amt = amt + 10")
+    try c.exec("DELETE FROM sales WHERE id = 1")
+    try c.exec("UPDATE sales SET amt = 999 WHERE id = 999")
+    let rSt = try c.query("SELECT msg FROM stmt_log ORDER BY seq", &[])
+    println("stmt_trans: " + fmtRows(&rSt))
+
+    // 5. BEFORE & AFTER TRUNCATE statement triggers
+    try c.exec("CREATE TABLE items (id int primary key)")
+    try c.exec("CREATE TABLE trunc_log (seq serial primary key, msg text)")
+    try c.exec("CREATE FUNCTION fn_trunc() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO trunc_log (msg) VALUES (TG_WHEN || '_TRUNC:' || TG_TABLE_NAME); RETURN NULL; END; $$")
+    try c.exec("CREATE TRIGGER tr_bt BEFORE TRUNCATE ON items FOR EACH STATEMENT EXECUTE FUNCTION fn_trunc()")
+    try c.exec("CREATE TRIGGER tr_at AFTER TRUNCATE ON items FOR EACH STATEMENT EXECUTE FUNCTION fn_trunc()")
+    try c.exec("INSERT INTO items VALUES (1), (2)")
+    try c.exec("TRUNCATE TABLE items")
+    let rTr = try c.query("SELECT msg FROM trunc_log ORDER BY seq", &[])
+    println("trunc_log: " + fmtRows(&rTr))
+
+    // 6. INSTEAD OF INSERT/UPDATE/DELETE FOR EACH ROW on a view with RETURNING
+    try c.exec("CREATE TABLE base_items (id int primary key, label text, qty int)")
+    try c.exec("CREATE VIEW v_items AS SELECT id, label, qty FROM base_items")
+    try c.exec("CREATE FUNCTION fn_v_io() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF TG_OP = 'INSERT' THEN IF NEW.qty < 0 THEN RETURN NULL; END IF; INSERT INTO base_items VALUES (NEW.id, NEW.label, NEW.qty); RETURN NEW; ELSIF TG_OP = 'UPDATE' THEN UPDATE base_items SET label = NEW.label, qty = NEW.qty WHERE id = OLD.id; RETURN NEW; ELSIF TG_OP = 'DELETE' THEN DELETE FROM base_items WHERE id = OLD.id; RETURN OLD; END IF; RETURN NULL; END; $$")
+    try c.exec("CREATE TRIGGER tr_v_io INSTEAD OF INSERT OR UPDATE OR DELETE ON v_items FOR EACH ROW EXECUTE FUNCTION fn_v_io()")
+    let rVi = try c.query("INSERT INTO v_items VALUES (10, 'Widget', 42), (11, 'Skip', -1) RETURNING id, label, qty", &[])
+    println("view_io_ins: " + fmtRows(&rVi))
+    let rVu = try c.query("UPDATE v_items SET label = 'Widget2', qty = 99 WHERE id = 10 RETURNING id, label, qty", &[])
+    println("view_io_upd: " + fmtRows(&rVu))
+    let rVd = try c.query("DELETE FROM v_items WHERE id = 10", &[])
+    let rVc = try c.query("SELECT count(*) FROM base_items", &[])
+    println("view_io_del: affected=" + rVd.affected().toStr() + " count=" + rVc.text(0, 0).unwrapOr("?"))
+
+    // 7. RAISE EXCEPTION atomic rollback & EXCEPTION WHEN subtransaction rollback
+    try c.exec("CREATE TABLE guard_t (id int primary key, v int)")
+    try c.exec("CREATE FUNCTION fn_guard() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.v < 0 THEN RAISE EXCEPTION 'negative value % not allowed', NEW.v USING ERRCODE = 'P0001'; END IF; RETURN NEW; END; $$")
+    try c.exec("CREATE TRIGGER tr_guard BEFORE INSERT ON guard_t FOR EACH ROW EXECUTE FUNCTION fn_guard()")
+    try c.exec("INSERT INTO guard_t VALUES (1, 10)")
+    match c.exec("INSERT INTO guard_t VALUES (2, 20), (3, -5)") {
+        Ok(_) { println("exc_abort: ok") }
+        Err(e) {
+            let rc = try c.query("SELECT count(*) FROM guard_t", &[])
+            println("exc_abort: " + codeOf(&e) + " count=" + rc.text(0, 0).unwrapOr("?"))
+        }
+    }
+
+    try c.exec("CREATE TABLE uq_t (id int primary key)")
+    try c.exec("CREATE TABLE catch_log (code text)")
+    try c.exec("CREATE TABLE driver_t (id int primary key)")
+    try c.exec("CREATE FUNCTION fn_catch() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN BEGIN INSERT INTO uq_t VALUES (1); INSERT INTO uq_t VALUES (1); EXCEPTION WHEN unique_violation THEN INSERT INTO catch_log VALUES (SQLSTATE); END; RETURN NEW; END; $$")
+    try c.exec("CREATE TRIGGER tr_catch AFTER INSERT ON driver_t FOR EACH ROW EXECUTE FUNCTION fn_catch()")
+    try c.exec("INSERT INTO driver_t VALUES (1)")
+    let rCl = try c.query("SELECT code FROM catch_log", &[])
+    let rUq = try c.query("SELECT count(*) FROM uq_t", &[])
+    println("exc_catch: caught=" + rCl.text(0, 0).unwrapOr("?") + " count=" + rUq.text(0, 0).unwrapOr("?"))
+
+    // 8. Cascading triggers & pg_trigger_depth() + recursion depth limit
+    try c.exec("CREATE TABLE c_a (id int primary key)")
+    try c.exec("CREATE TABLE c_b (id int primary key)")
+    try c.exec("CREATE TABLE depths (who text, d int)")
+    try c.exec("CREATE FUNCTION fn_ca() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO depths VALUES ('a', pg_trigger_depth()); INSERT INTO c_b VALUES (NEW.id); RETURN NULL; END; $$")
+    try c.exec("CREATE FUNCTION fn_cb() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO depths VALUES ('b', pg_trigger_depth()); RETURN NULL; END; $$")
+    try c.exec("CREATE TRIGGER tr_ca AFTER INSERT ON c_a FOR EACH ROW EXECUTE FUNCTION fn_ca()")
+    try c.exec("CREATE TRIGGER tr_cb AFTER INSERT ON c_b FOR EACH ROW EXECUTE FUNCTION fn_cb()")
+    try c.exec("INSERT INTO c_a VALUES (1)")
+    let rD1 = try c.query("SELECT d FROM depths WHERE who = 'a'", &[])
+    let rD2 = try c.query("SELECT d FROM depths WHERE who = 'b'", &[])
+    let rD0 = try c.query("SELECT pg_trigger_depth()", &[])
+    println("cascade_depth: d1=" + rD1.text(0, 0).unwrapOr("?") + " d2=" + rD2.text(0, 0).unwrapOr("?") + " outer=" + rD0.text(0, 0).unwrapOr("?"))
+
+    try c.exec("CREATE TABLE inf_t (id serial primary key)")
+    try c.exec("CREATE FUNCTION fn_inf() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO inf_t DEFAULT VALUES; RETURN NULL; END; $$")
+    try c.exec("CREATE TRIGGER tr_inf AFTER INSERT ON inf_t FOR EACH ROW EXECUTE FUNCTION fn_inf()")
+    match c.exec("INSERT INTO inf_t DEFAULT VALUES") {
+        Ok(_) { println("recur_limit: ok") }
+        Err(e) { println("recur_limit: " + codeOf(&e)) }
+    }
+
+    // 9. ENABLE/DISABLE TRIGGER, ALTER TRIGGER RENAME, ALTER TABLE RENAME, DROP FUNCTION CASCADE
+    try c.exec("CREATE TABLE tog (id int primary key)")
+    try c.exec("CREATE TABLE tog_log (n int)")
+    try c.exec("CREATE FUNCTION fn_tog() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO tog_log VALUES (NEW.id); RETURN NULL; END; $$")
+    try c.exec("CREATE TRIGGER tr_tog AFTER INSERT ON tog FOR EACH ROW EXECUTE FUNCTION fn_tog()")
+    try c.exec("ALTER TABLE tog DISABLE TRIGGER tr_tog")
+    try c.exec("INSERT INTO tog VALUES (1)")
+    let rDis = try c.query("SELECT count(*) FROM tog_log", &[])
+    try c.exec("ALTER TABLE tog ENABLE TRIGGER ALL")
+    try c.exec("INSERT INTO tog VALUES (2)")
+    let rEn = try c.query("SELECT count(*) FROM tog_log", &[])
+    println("disable_enable: dis=" + rDis.text(0, 0).unwrapOr("?") + " en=" + rEn.text(0, 0).unwrapOr("?"))
+
+    try c.exec("ALTER TRIGGER tr_tog ON tog RENAME TO tr_tog2")
+    try c.exec("ALTER TABLE tog RENAME TO tog_renamed")
+    try c.exec("DELETE FROM tog_log")
+    try c.exec("INSERT INTO tog_renamed VALUES (3)")
+    let rRn = try c.query("SELECT count(*) FROM tog_log", &[])
+    let rDef = try c.query("SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname = 'tr_tog2'", &[])
+    let defOk = strings.contains(&(rDef.text(0, 0).unwrapOr("")), "tog_renamed") && strings.contains(&(rDef.text(0, 0).unwrapOr("")), "tr_tog2")
+    println("rename_tbl: fired=" + rRn.text(0, 0).unwrapOr("?") + " def_ok=" + (if defOk { "true" } else { "false" }))
+
+    match c.exec("DROP FUNCTION fn_tog()") {
+        Ok(_) { println("drop_fn_dep: ok") }
+        Err(e) {
+            try c.exec("DROP FUNCTION fn_tog() CASCADE")
+            let rc = try c.query("SELECT count(*) FROM pg_trigger WHERE tgname = 'tr_tog2'", &[])
+            println("drop_fn_dep: " + codeOf(&e) + " cascade_ok=" + rc.text(0, 0).unwrapOr("?"))
+        }
+    }
+
+    // 10. System catalogs (pg_trigger, pg_class.relhastriggers, pg_tables.hastriggers, information_schema.triggers, pg_get_triggerdef)
+    try c.exec("CREATE TABLE cat_t (id int primary key, v text)")
+    try c.exec("CREATE FUNCTION fn_cat() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.v := upper(NEW.v); RETURN NEW; END; $$")
+    try c.exec("CREATE TRIGGER tr_cat BEFORE INSERT OR UPDATE ON cat_t FOR EACH ROW EXECUTE FUNCTION fn_cat()")
+    let rPgT = try c.query("SELECT count(*) FROM pg_trigger WHERE tgname = 'tr_cat'", &[])
+    let rRel = try c.query("SELECT relhastriggers FROM pg_class WHERE relname = 'cat_t'", &[])
+    let rTbl = try c.query("SELECT hastriggers FROM pg_tables WHERE tablename = 'cat_t'", &[])
+    let rIs = try c.query("SELECT count(*) FROM information_schema.triggers WHERE trigger_name = 'tr_cat'", &[])
+    let rCatDef = try c.query("SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname = 'tr_cat'", &[])
+    let catDefOk = strings.contains(&(rCatDef.text(0, 0).unwrapOr("")), "CREATE TRIGGER tr_cat BEFORE INSERT OR UPDATE ON public.cat_t FOR EACH ROW EXECUTE FUNCTION fn_cat()")
+    println("catalogs: pg_trg=" + rPgT.text(0, 0).unwrapOr("?") + " relhas=" + rRel.text(0, 0).unwrapOr("?") +
+            " tblhas=" + rTbl.text(0, 0).unwrapOr("?") + " is_rows=" + rIs.text(0, 0).unwrapOr("?") +
+            " def_ok=" + (if catDefOk { "true" } else { "false" }))
+
+    // 11. PL/pgSQL control flow: FOR loop, CASE, GET DIAGNOSTICS ROW_COUNT, EXECUTE ... USING
+    try c.exec("CREATE TABLE ctrl_t (id int primary key, n int)")
+    try c.exec("CREATE TABLE ctrl_out (sum_v int, diag_v int, dyn_v int)")
+    try c.exec("CREATE TABLE ctrl_aux (k int)")
+    try c.exec("INSERT INTO ctrl_aux VALUES (1), (2)")
+    try c.exec("CREATE FUNCTION fn_ctrl() RETURNS trigger LANGUAGE plpgsql AS $$ DECLARE s int := 0; rc int := 0; dv int := 0; BEGIN FOR i IN 1..NEW.n LOOP CASE WHEN i > 0 THEN s := s + i; ELSE NULL; END CASE; END LOOP; UPDATE ctrl_aux SET k = k + 10; GET DIAGNOSTICS rc = ROW_COUNT; EXECUTE 'SELECT $1 + 94' INTO dv USING NEW.n; INSERT INTO ctrl_out VALUES (s, rc, dv); RETURN NEW; END; $$")
+    try c.exec("CREATE TRIGGER tr_ctrl AFTER INSERT ON ctrl_t FOR EACH ROW EXECUTE FUNCTION fn_ctrl()")
+    try c.exec("INSERT INTO ctrl_t VALUES (1, 5)")
+    let rCtrl = try c.query("SELECT sum_v, diag_v, dyn_v FROM ctrl_out", &[])
+    println("plpgsql_ctrl: sum=" + rCtrl.text(0, 0).unwrapOr("?") + " diag=" + rCtrl.text(0, 1).unwrapOr("?") + " dyn=" + rCtrl.text(0, 2).unwrapOr("?"))
+
+    // 12. MERGE triggers (BEFORE + AFTER)
+    try c.exec("CREATE TABLE m_tgt (id int primary key, val int)")
+    try c.exec("CREATE TABLE m_src (id int primary key, val int)")
+    try c.exec("CREATE TABLE m_log (op text, id int, val int)")
+    try c.exec("INSERT INTO m_tgt VALUES (1, 100)")
+    try c.exec("INSERT INTO m_src VALUES (1, 150), (2, 200)")
+    try c.exec("CREATE FUNCTION fn_m() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN INSERT INTO m_log VALUES (CASE WHEN TG_OP = 'INSERT' THEN 'INS' ELSE 'UPD' END, NEW.id, NEW.val); RETURN NEW; END; $$")
+    try c.exec("CREATE TRIGGER tr_m AFTER INSERT OR UPDATE ON m_tgt FOR EACH ROW EXECUTE FUNCTION fn_m()")
+    try c.exec("MERGE INTO m_tgt t USING m_src s ON t.id = s.id WHEN MATCHED THEN UPDATE SET val = s.val WHEN NOT MATCHED THEN INSERT (id, val) VALUES (s.id, s.val)")
+    let rM = try c.query("SELECT op, id, val FROM m_log ORDER BY op, id", &[])
+    println("merge_trg: " + fmtRows(&rM))
+
+    // Leave persist_t + trigger on disk to test reopen
+    try c.exec("CREATE TABLE persist_t (id int primary key, name text, score int)")
+    try c.exec("CREATE FUNCTION fn_persist() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN NEW.name := upper(NEW.name); NEW.score := NEW.score + 700; RETURN NEW; END; $$")
+    try c.exec("CREATE TRIGGER tr_persist BEFORE INSERT ON persist_t FOR EACH ROW EXECUTE FUNCTION fn_persist()")
+    c.close()
+    return Ok(Unit{})
+}
+
+fn client2(addr: str): Result[Unit, postgres.Error] {
+    let port = addr[10..len(addr)]
+    let dsn = "host=127.0.0.1 port=" + port + " user=test dbname=test sslmode=disable"
+    var c = try postgres.connect(&dsn)
+    let r = try c.query("INSERT INTO persist_t VALUES (1, 'reopened', 77) RETURNING id, name, score", &[])
+    println("reopen_ok: " + fmtRows(&r))
+    c.close()
+    return Ok(Unit{})
+}
+
+fn runServer(dir: &str, doBootstrap: bool, runCli: fn(str): Result[Unit, postgres.Error]): int {
+    var rc = 0
+    let opts = lexdb_store.Options{cacheBytes: 32 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}
+    lexdb_store.run(lexdb_disk.real(dir), opts, fn(st: lexdb_store.Store): int {
+        if doBootstrap { lexdb_exec.bootstrap(&st).unwrap() }
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        task.scope(fn(sc: mut &task.Scope) {
+            let ln = net.listen("127.0.0.1:0").unwrap()
+            let addr = ln.localAddr()
+            let f = sc.start(lexdb_wire.acceptLoop, lexdb_wire.AcceptArg{ln: ln, st: st.share()})
+            match runCli(addr) {
+                Ok(_) {}
+                Err(e) { eprintln("client error: " + e.toStr()); rc = 1 }
+            }
+            { let stop = f }
+        })
+        return 0
+    }).unwrap()
+    return rc
+}
+
+fn main() {
+    let dir = "/tmp/lexdb_pg_triggers_" + os.pid().toStr()
+    let _r1 = fs.removeAll(&dir)
+    let _m1 = fs.mkdirAll(&dir)
+    let rc1 = runServer(&dir, true, client1)
+    let rc2 = if rc1 == 0 { runServer(&dir, false, client2) } else { rc1 }
+    let _r2 = fs.removeAll(&dir)
+    if rc2 != 0 { panic("pg_triggers failed") }
+}

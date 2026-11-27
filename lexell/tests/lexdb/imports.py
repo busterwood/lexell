@@ -53,7 +53,7 @@ CORE = {
 }
 
 PG_DATA = {"lexdb_pgdata"}
-PG_BEHAVIOR = {"lexdb_pg", "lexdb_pgcat"}
+PG_BEHAVIOR = {"lexdb_pg", "lexdb_pgcat", "lexdb_plpgsql"}
 SYS_DATA = {"lexdb_sysdata"}
 SYS_BEHAVIOR = {"lexdb_syscat", "lexdb_tsqlfn", "lexdb_tsqltz", "lexdb_tsqlfmt", "lexdb_tsqldef", "lexdb_tsql", "lexdb_tsqlparse", "lexdb_tsqlfunc", "lexdb_tsqlerr"}
 ORA_DATA = {"lexdb_oradata"}

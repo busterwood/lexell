@@ -1,0 +1,1936 @@
+// lexdb_plpgsql: PL/pgSQL interpreter for PostgreSQL trigger functions (RETURNS trigger).
+// Parses a PL/pgSQL block (DECLARE ... BEGIN ... EXCEPTION ... END) into an AST and executes it
+// directly inside the triggering transaction via lexdb_exec.execNested.
+import "strings"
+import "collections"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_store"
+import "./lexdb_catalog"
+import "./lexdb_parse"
+import "./lexdb_exec"
+import "./lexdb_ops"
+import "./lexdb_trigger"
+import "./lexdb_routine"
+import "./lexdb_pgcat"
+
+type DbErr = lexdb_base.DbErr
+type Val = lexdb_sql.Val
+type TypeName = lexdb_sql.TypeName
+type ColDef = lexdb_sql.ColDef
+type Trigger = lexdb_trigger.Trigger
+type RowFireReq = lexdb_trigger.RowFireReq
+type RowFireRes = lexdb_trigger.RowFireRes
+
+fn pgErr(state: &str, msg: &str): DbErr { return lexdb_base.err(state, msg) }
+
+pub fn register() {
+    lexdb_exec.setRowTriggerRunner(lexdb_trigger.TD_PG, runRowTrigger)
+    lexdb_exec.setPlpgsqlValidator(validateBody)
+}
+
+pub fn validateBody(body: &str): Result[Unit, DbErr] {
+    let _ = try parseFunction(body)
+    return Ok(Unit{})
+}
+
+// ---- lexer
+
+const TK_EOF = 0
+const TK_ID = 1     // identifier or keyword; low is lowercase
+const TK_QID = 2    // "quoted identifier"; text is unquoted, low is lowercase
+const TK_STR = 3    // 'string' or $$string$$; text is raw SQL literal, val is unquoted text
+const TK_NUM = 4    // numeric literal
+const TK_OP = 5     // operator / punctuation
+
+type Tok = value record {
+    kind: int
+    text: str
+    low: str
+    val: str
+    s: int
+    e: int
+}
+
+fn isAlpha(c: byte): bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c >= 0x80
+}
+
+fn isAlnum(c: byte): bool {
+    return isAlpha(c) || (c >= '0' && c <= '9') || c == '$'
+}
+
+fn isDigit(c: byte): bool { return c >= '0' && c <= '9' }
+
+fn lex(src: &str): Result[[]Tok, DbErr] {
+    var out: []Tok = []
+    let n = len(src)
+    var i = 0
+    while i < n {
+        let c = src[i]
+        if c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\x0c' {
+            i += 1
+            continue
+        }
+        // -- line comment
+        if c == '-' && i + 1 < n && src[i + 1] == '-' {
+            while i < n && src[i] != '\n' { i += 1 }
+            continue
+        }
+        // /* nested block comment */
+        if c == '/' && i + 1 < n && src[i + 1] == '*' {
+            i += 2
+            var depth = 1
+            while i + 1 < n && depth > 0 {
+                if src[i] == '/' && src[i + 1] == '*' { depth += 1; i += 2 }
+                else if src[i] == '*' && src[i + 1] == '/' { depth -= 1; i += 2 }
+                else { i += 1 }
+            }
+            if depth > 0 { return Err(pgErr("42601", "unterminated /* comment")) }
+            continue
+        }
+        let start = i
+        // E'...' escape string
+        if (c == 'e' || c == 'E') && i + 1 < n && src[i + 1] == '\'' {
+            i += 2
+            var v = ""
+            var done = false
+            while i < n {
+                if src[i] == '\\' && i + 1 < n {
+                    let nx = src[i + 1]
+                    if nx == 'n' { v.addByte('\n') }
+                    else if nx == 't' { v.addByte('\t') }
+                    else if nx == 'r' { v.addByte('\r') }
+                    else { v.addByte(nx) }
+                    i += 2
+                } else if src[i] == '\'' {
+                    if i + 1 < n && src[i + 1] == '\'' { v.addByte('\''); i += 2 }
+                    else { i += 1; done = true; break }
+                } else {
+                    v.addByte(src[i])
+                    i += 1
+                }
+            }
+            if !done { return Err(pgErr("42601", "unterminated quoted string")) }
+            append(mut &out, Tok{kind: TK_STR, text: src[start..i].toStr(), low: "", val: v, s: start, e: i})
+            continue
+        }
+        // '...' string literal
+        if c == '\'' {
+            i += 1
+            var v = ""
+            var done = false
+            while i < n {
+                if src[i] == '\'' {
+                    if i + 1 < n && src[i + 1] == '\'' { v.addByte('\''); i += 2 }
+                    else { i += 1; done = true; break }
+                } else {
+                    v.addByte(src[i])
+                    i += 1
+                }
+            }
+            if !done { return Err(pgErr("42601", "unterminated quoted string")) }
+            append(mut &out, Tok{kind: TK_STR, text: src[start..i].toStr(), low: "", val: v, s: start, e: i})
+            continue
+        }
+        // $tag$...$tag$ dollar-quoted string
+        if c == '$' {
+            var j = i + 1
+            if j < n && isAlpha(src[j]) {
+                while j < n && (isAlpha(src[j]) || isDigit(src[j])) { j += 1 }
+            }
+            if j < n && src[j] == '$' {
+                let tag = src[i..j + 1].toStr()
+                let bodyStart = j + 1
+                let closeAt = strings.indexOf(src, &tag, bodyStart)
+                if closeAt < 0 { return Err(pgErr("42601", "unterminated dollar-quoted string")) }
+                let v = src[bodyStart..closeAt].toStr()
+                i = closeAt + len(tag)
+                append(mut &out, Tok{kind: TK_STR, text: src[start..i].toStr(), low: "", val: v, s: start, e: i})
+                continue
+            }
+            // $1 positional parameter
+            if i + 1 < n && isDigit(src[i + 1]) {
+                var k = i + 1
+                while k < n && isDigit(src[k]) { k += 1 }
+                let w = src[i..k].toStr()
+                append(mut &out, Tok{kind: TK_ID, text: w.clone(), low: w, val: "", s: start, e: k})
+                i = k
+                continue
+            }
+        }
+        // "quoted identifier"
+        if c == '"' {
+            i += 1
+            var v = ""
+            var done = false
+            while i < n {
+                if src[i] == '"' {
+                    if i + 1 < n && src[i + 1] == '"' { v.addByte('"'); i += 2 }
+                    else { i += 1; done = true; break }
+                } else {
+                    v.addByte(src[i])
+                    i += 1
+                }
+            }
+            if !done { return Err(pgErr("42601", "unterminated quoted identifier")) }
+            append(mut &out, Tok{kind: TK_QID, text: v.clone(), low: strings.toLowerAscii(&v), val: v, s: start, e: i})
+            continue
+        }
+        // identifier / keyword
+        if isAlpha(c) {
+            var j = i + 1
+            while j < n && isAlnum(src[j]) { j += 1 }
+            let w = src[i..j].toStr()
+            append(mut &out, Tok{kind: TK_ID, text: w.clone(), low: strings.toLowerAscii(&w), val: "", s: start, e: j})
+            i = j
+            continue
+        }
+        // number
+        if isDigit(c) || (c == '.' && i + 1 < n && isDigit(src[i + 1])) {
+            var j = i
+            while j < n && isDigit(src[j]) { j += 1 }
+            if j < n && src[j] == '.' && !(j + 1 < n && src[j + 1] == '.') {
+                j += 1
+                while j < n && isDigit(src[j]) { j += 1 }
+            }
+            if j < n && (src[j] == 'e' || src[j] == 'E') {
+                var k = j + 1
+                if k < n && (src[k] == '+' || src[k] == '-') { k += 1 }
+                if k < n && isDigit(src[k]) {
+                    while k < n && isDigit(src[k]) { k += 1 }
+                    j = k
+                }
+            }
+            let w = src[i..j].toStr()
+            append(mut &out, Tok{kind: TK_NUM, text: w.clone(), low: w, val: "", s: start, e: j})
+            i = j
+            continue
+        }
+        // 3-char / 2-char operators
+        if i + 2 < n && src[i..i + 3] == "->>" {
+            append(mut &out, Tok{kind: TK_OP, text: "->>", low: "->>", val: "", s: start, e: i + 3})
+            i += 3
+            continue
+        }
+        if i + 1 < n {
+            let two = src[i..i + 2].toStr()
+            if two == ":=" || two == "<>" || two == "!=" || two == "<=" || two == ">=" ||
+               two == "||" || two == "::" || two == ".." || two == "<<" || two == ">>" ||
+               two == "=>" || two == "->" {
+                append(mut &out, Tok{kind: TK_OP, text: two.clone(), low: two, val: "", s: start, e: i + 2})
+                i += 2
+                continue
+            }
+        }
+        let one = src[i..i + 1].toStr()
+        append(mut &out, Tok{kind: TK_OP, text: one.clone(), low: one, val: "", s: start, e: i + 1})
+        i += 1
+    }
+    append(mut &out, Tok{kind: TK_EOF, text: "", low: "", val: "", s: n, e: n})
+    return Ok(out)
+}
+
+// ---- AST
+
+const ST_BLOCK = 1
+const ST_ASSIGN = 2
+const ST_IF = 3
+const ST_CASE = 4
+const ST_LOOP = 5
+const ST_WHILE = 6
+const ST_FOR_INT = 7
+const ST_FOR_QUERY = 8
+const ST_EXIT = 9
+const ST_RETURN = 10
+const ST_RAISE = 11
+const ST_PERFORM = 12
+const ST_DIAG = 13
+const ST_EXEC = 14
+const ST_SQL = 15
+const ST_NULL = 16
+
+type Decl = record {
+    name: str
+    typName: str        // raw type spec (e.g. "integer", "record", "tbl%rowtype", "tbl.col%type")
+    isConst: bool
+    notNull: bool
+    hasInit: bool
+    initExpr: str
+}
+
+type ExcHandler = record {
+    conds: []str        // condition names or "sqlstate:XXXXX"
+    body: []PStmt
+}
+
+type PStmt = record {
+    kind: int
+    label: str
+    // ST_BLOCK
+    decls: []Decl
+    body: []PStmt
+    handlers: []ExcHandler
+    // ST_ASSIGN / ST_DIAG / ST_FOR_*
+    target: str         // variable or rec.field
+    expr: str           // RHS / query / return expr / raise format / execute sql
+    // ST_IF / ST_CASE
+    conds: []str        // IF/ELSIF conditions or CASE scrutinee in expr + WHEN expr lists joined by \x00
+    branches: [][]PStmt
+    elseBody: []PStmt
+    // ST_FOR_INT
+    reverse: bool
+    loExpr: str
+    hiExpr: str
+    stepExpr: str
+    // ST_EXIT
+    isCont: bool
+    // ST_RAISE
+    level: str          // "exception", "notice", "warning", "info", "log", "debug"
+    args: []str
+    usingKeys: []str
+    usingVals: []str
+    // ST_SQL / ST_EXEC
+    intoTargets: []str
+    strict: bool
+    isSelect: bool
+    usingExprs: []str
+}
+
+fn emptyStmt(kind: int): PStmt {
+    return PStmt{
+        kind: kind, label: "", decls: [], body: [], handlers: [], target: "", expr: "",
+        conds: [], branches: [], elseBody: [], reverse: false, loExpr: "", hiExpr: "", stepExpr: "",
+        isCont: false, level: "", args: [], usingKeys: [], usingVals: [],
+        intoTargets: [], strict: false, isSelect: false, usingExprs: [],
+    }
+}
+
+// ---- parser
+
+type Parser = record {
+    src: str
+    toks: []Tok
+    pos: int
+}
+
+fn (p: &Parser) peek(): Tok {
+    if p.pos >= len(p.toks) { return p.toks[len(p.toks) - 1].clone() }
+    return p.toks[p.pos].clone()
+}
+
+fn (p: &Parser) peekAt(off: int): Tok {
+    let i = p.pos + off
+    if i < 0 || i >= len(p.toks) { return p.toks[len(p.toks) - 1].clone() }
+    return p.toks[i].clone()
+}
+
+fn (p: mut &Parser) next(): Tok {
+    let t = p.peek()
+    if p.pos < len(p.toks) - 1 { p.pos += 1 }
+    return t
+}
+
+fn (p: &Parser) isKw(w: &str): bool {
+    let t = p.peek()
+    return t.kind == TK_ID && t.low == w
+}
+
+fn (p: &Parser) isOp(w: &str): bool {
+    let t = p.peek()
+    return t.kind == TK_OP && t.text == w
+}
+
+fn (p: mut &Parser) acceptKw(w: &str): bool {
+    if p.isKw(w) { p.pos += 1; return true }
+    return false
+}
+
+fn (p: mut &Parser) acceptOp(w: &str): bool {
+    if p.isOp(w) { p.pos += 1; return true }
+    return false
+}
+
+fn (p: mut &Parser) expectKw(w: &str): Result[Unit, DbErr] {
+    if p.acceptKw(w) { return Ok(Unit{}) }
+    let t = p.peek()
+    let near = if t.kind == TK_EOF { "end of input" } else { t.text.clone() }
+    return Err(pgErr("42601", &("syntax error at or near \"" + near + "\" (expected " + w + ")")))
+}
+
+fn (p: mut &Parser) expectOp(w: &str): Result[Unit, DbErr] {
+    if p.acceptOp(w) { return Ok(Unit{}) }
+    let t = p.peek()
+    let near = if t.kind == TK_EOF { "end of input" } else { t.text.clone() }
+    return Err(pgErr("42601", &("syntax error at or near \"" + near + "\" (expected " + w + ")")))
+}
+
+fn (p: &Parser) sliceSrc(fromIdx: int, toIdx: int): str {
+    if fromIdx >= toIdx || fromIdx >= len(p.toks) { return "" }
+    let s = p.toks[fromIdx].s
+    let e = p.toks[toIdx - 1].e
+    if s >= e || e > len(p.src) { return "" }
+    return strings.trim(&p.src[s..e]).toStr()
+}
+
+fn parseFunction(src: &str): Result[PStmt, DbErr] {
+    let toks = try lex(src)
+    var p = Parser{src: src.toStr(), toks: toks, pos: 0}
+    let blk = try p.parseBlock("")
+    let _ = p.acceptOp(";")
+    if p.peek().kind != TK_EOF {
+        return Err(pgErr("42601", &("syntax error at or near \"" + p.peek().text + "\"")))
+    }
+    return Ok(blk)
+}
+
+fn (p: mut &Parser) parseOptLabel(): Result[str, DbErr] {
+    if !p.acceptOp("<<") { return Ok("") }
+    let t = p.next()
+    if t.kind != TK_ID && t.kind != TK_QID { return Err(pgErr("42601", &("invalid label \"" + t.text + "\""))) }
+    try p.expectOp(">>")
+    return Ok(t.low)
+}
+
+fn (p: mut &Parser) parseBlock(labelIn: &str): Result[PStmt, DbErr] {
+    var st = emptyStmt(ST_BLOCK)
+    var lbl = labelIn.toStr()
+    if len(lbl) == 0 && p.isOp("<<") { lbl = try p.parseOptLabel() }
+    st.label = lbl
+    if p.acceptKw("declare") {
+        while !p.isKw("begin") && p.peek().kind != TK_EOF {
+            if p.acceptKw("declare") { continue }
+            let d = try p.parseDecl()
+            append(mut &st.decls, d)
+        }
+    }
+    try p.expectKw("begin")
+    st.body = try p.parseStmts(&["exception", "end"])
+    if p.acceptKw("exception") {
+        while p.acceptKw("when") {
+            var h = ExcHandler{conds: [], body: []}
+            while true {
+                if p.acceptKw("sqlstate") {
+                    let s = p.next()
+                    if s.kind != TK_STR { return Err(pgErr("42601", "expected SQLSTATE string literal")) }
+                    append(mut &h.conds, "sqlstate:" + strings.toUpperAscii(&s.val))
+                } else {
+                    let c = p.next()
+                    if c.kind != TK_ID { return Err(pgErr("42601", &("invalid exception condition \"" + c.text + "\""))) }
+                    append(mut &h.conds, c.low)
+                }
+                if !p.acceptKw("or") { break }
+            }
+            try p.expectKw("then")
+            h.body = try p.parseStmts(&["when", "end"])
+            append(mut &st.handlers, h)
+        }
+    }
+    try p.expectKw("end")
+    // optional trailing label before ; or EOF
+    if (p.peek().kind == TK_ID || p.peek().kind == TK_QID) && !p.isKw("if") && !p.isKw("loop") && !p.isKw("case") {
+        let _ = p.next()
+    }
+    return Ok(st)
+}
+
+fn (p: mut &Parser) parseDecl(): Result[Decl, DbErr] {
+    let nt = p.next()
+    if nt.kind != TK_ID && nt.kind != TK_QID {
+        return Err(pgErr("42601", &("syntax error in DECLARE at \"" + nt.text + "\"")))
+    }
+    var d = Decl{name: nt.low.clone(), typName: "", isConst: false, notNull: false, hasInit: false, initExpr: ""}
+    if p.acceptKw("constant") { d.isConst = true }
+    let typeStart = p.pos
+    var depth = 0
+    while p.peek().kind != TK_EOF {
+        let t = p.peek()
+        if depth == 0 {
+            if t.kind == TK_OP && (t.text == ";" || t.text == ":=" || t.text == "=") { break }
+            if t.kind == TK_ID && (t.low == "default" || (t.low == "not" && p.peekAt(1).low == "null")) { break }
+        }
+        if t.kind == TK_OP && (t.text == "(" || t.text == "[") { depth += 1 }
+        else if t.kind == TK_OP && (t.text == ")" || t.text == "]") { if depth > 0 { depth -= 1 } }
+        p.pos += 1
+    }
+    d.typName = p.sliceSrc(typeStart, p.pos)
+    if len(d.typName) == 0 {
+        return Err(pgErr("42601", &("missing type for variable \"" + d.name + "\"")))
+    }
+    if p.isKw("not") && p.peekAt(1).low == "null" {
+        p.pos += 2
+        d.notNull = true
+    }
+    if p.acceptOp(":=") || p.acceptOp("=") || p.acceptKw("default") {
+        let eStart = p.pos
+        try p.skipToSemi()
+        d.hasInit = true
+        d.initExpr = p.sliceSrc(eStart, p.pos)
+    }
+    try p.expectOp(";")
+    return Ok(d)
+}
+
+fn (p: mut &Parser) skipToSemi(): Result[Unit, DbErr] {
+    var depth = 0
+    while p.peek().kind != TK_EOF {
+        let t = p.peek()
+        if depth == 0 && t.kind == TK_OP && t.text == ";" { return Ok(Unit{}) }
+        if t.kind == TK_OP && (t.text == "(" || t.text == "[") { depth += 1 }
+        else if t.kind == TK_OP && (t.text == ")" || t.text == "]") { if depth > 0 { depth -= 1 } }
+        p.pos += 1
+    }
+    return Err(pgErr("42601", "syntax error: missing semicolon"))
+}
+
+fn (p: mut &Parser) readUntilKw(stops: &[]str): Result[str, DbErr] {
+    let start = p.pos
+    var depth = 0
+    while p.peek().kind != TK_EOF {
+        let t = p.peek()
+        if depth == 0 && t.kind == TK_ID {
+            for sw in stops { if t.low == sw { return Ok(p.sliceSrc(start, p.pos)) } }
+        }
+        if depth == 0 && t.kind == TK_OP && t.text == ";" {
+            return Ok(p.sliceSrc(start, p.pos))
+        }
+        if t.kind == TK_OP && (t.text == "(" || t.text == "[") { depth += 1 }
+        else if t.kind == TK_OP && (t.text == ")" || t.text == "]") { if depth > 0 { depth -= 1 } }
+        p.pos += 1
+    }
+    return Err(pgErr("42601", "unexpected end of input in PL/pgSQL expression"))
+}
+
+fn (p: mut &Parser) parseStmts(stops: &[]str): Result[[]PStmt, DbErr] {
+    var out: []PStmt = []
+    while p.peek().kind != TK_EOF {
+        while p.acceptOp(";") {}
+        let t = p.peek()
+        if t.kind == TK_EOF { break }
+        if t.kind == TK_ID {
+            var stop = false
+            for sw in stops { if t.low == sw { stop = true; break } }
+            if stop { break }
+        }
+        let st = try p.parseStmt()
+        append(mut &out, st)
+    }
+    return Ok(out)
+}
+
+fn (p: mut &Parser) parseStmt(): Result[PStmt, DbErr] {
+    var lbl = ""
+    if p.isOp("<<") { lbl = try p.parseOptLabel() }
+    let t = p.peek()
+    if t.kind == TK_ID {
+        match t.low {
+            "declare", "begin" {
+                let blk = try p.parseBlock(&lbl)
+                try p.expectOp(";")
+                return Ok(blk)
+            }
+            "if" { return p.parseIf() }
+            "case" { return p.parseCase() }
+            "loop" {
+                p.pos += 1
+                var st = emptyStmt(ST_LOOP)
+                st.label = lbl
+                st.body = try p.parseStmts(&["end"])
+                try p.expectKw("end")
+                try p.expectKw("loop")
+                if p.peek().kind == TK_ID || p.peek().kind == TK_QID { let _ = p.next() }
+                try p.expectOp(";")
+                return Ok(st)
+            }
+            "while" {
+                p.pos += 1
+                var st = emptyStmt(ST_WHILE)
+                st.label = lbl
+                st.expr = try p.readUntilKw(&["loop"])
+                try p.expectKw("loop")
+                st.body = try p.parseStmts(&["end"])
+                try p.expectKw("end")
+                try p.expectKw("loop")
+                if p.peek().kind == TK_ID || p.peek().kind == TK_QID { let _ = p.next() }
+                try p.expectOp(";")
+                return Ok(st)
+            }
+            "for" { return p.parseFor(&lbl) }
+            "exit", "continue" {
+                let isCont = t.low == "continue"
+                p.pos += 1
+                var st = emptyStmt(ST_EXIT)
+                st.isCont = isCont
+                if (p.peek().kind == TK_ID || p.peek().kind == TK_QID) && !p.isKw("when") {
+                    st.label = p.next().low
+                }
+                if p.acceptKw("when") {
+                    let es = p.pos
+                    try p.skipToSemi()
+                    st.expr = p.sliceSrc(es, p.pos)
+                }
+                try p.expectOp(";")
+                return Ok(st)
+            }
+            "return" {
+                p.pos += 1
+                var st = emptyStmt(ST_RETURN)
+                if !p.isOp(";") {
+                    let es = p.pos
+                    try p.skipToSemi()
+                    st.expr = p.sliceSrc(es, p.pos)
+                }
+                try p.expectOp(";")
+                return Ok(st)
+            }
+            "raise" { return p.parseRaise() }
+            "perform" {
+                p.pos += 1
+                var st = emptyStmt(ST_PERFORM)
+                let es = p.pos
+                try p.skipToSemi()
+                st.expr = p.sliceSrc(es, p.pos)
+                try p.expectOp(";")
+                return Ok(st)
+            }
+            "get" {
+                p.pos += 1
+                let _ = p.acceptKw("current")
+                try p.expectKw("diagnostics")
+                let tgt = p.next()
+                if tgt.kind != TK_ID && tgt.kind != TK_QID { return Err(pgErr("42601", "invalid target in GET DIAGNOSTICS")) }
+                if !p.acceptOp(":=") { try p.expectOp("=") }
+                let item = p.next()
+                try p.expectOp(";")
+                var st = emptyStmt(ST_DIAG)
+                st.target = tgt.low.clone()
+                st.expr = item.low.clone()
+                return Ok(st)
+            }
+            "execute" { return p.parseExecute() }
+            "null" {
+                p.pos += 1
+                try p.expectOp(";")
+                return Ok(emptyStmt(ST_NULL))
+            }
+            "select", "insert", "update", "delete", "with", "truncate", "values" {
+                return p.parseEmbeddedSql()
+            }
+            "commit", "rollback" {
+                return Err(pgErr("0A000", "invalid transaction termination in trigger function"))
+            }
+            else {}
+        }
+    }
+    // Assignment: var [ . field ] ( := | = ) expr ;
+    if t.kind == TK_ID || t.kind == TK_QID {
+        let save = p.pos
+        var tgt = p.next().low
+        if p.acceptOp(".") {
+            let f = p.next()
+            if f.kind != TK_ID && f.kind != TK_QID {
+                p.pos = save
+                return Err(pgErr("42601", &("syntax error at or near \"" + f.text + "\"")))
+            }
+            tgt = tgt + "." + f.low
+        }
+        if p.acceptOp(":=") || p.acceptOp("=") {
+            let es = p.pos
+            try p.skipToSemi()
+            var st = emptyStmt(ST_ASSIGN)
+            st.target = tgt
+            st.expr = p.sliceSrc(es, p.pos)
+            try p.expectOp(";")
+            return Ok(st)
+        }
+        p.pos = save
+    }
+    return Err(pgErr("42601", &("syntax error at or near \"" + t.text + "\"")))
+}
+
+fn (p: mut &Parser) parseIf(): Result[PStmt, DbErr] {
+    try p.expectKw("if")
+    var st = emptyStmt(ST_IF)
+    let c0 = try p.readUntilKw(&["then"])
+    try p.expectKw("then")
+    let b0 = try p.parseStmts(&["elsif", "elseif", "else", "end"])
+    append(mut &st.conds, c0)
+    append(mut &st.branches, b0)
+    while p.acceptKw("elsif") || p.acceptKw("elseif") {
+        let ci = try p.readUntilKw(&["then"])
+        try p.expectKw("then")
+        let bi = try p.parseStmts(&["elsif", "elseif", "else", "end"])
+        append(mut &st.conds, ci)
+        append(mut &st.branches, bi)
+    }
+    if p.acceptKw("else") {
+        st.elseBody = try p.parseStmts(&["end"])
+    }
+    try p.expectKw("end")
+    try p.expectKw("if")
+    try p.expectOp(";")
+    return Ok(st)
+}
+
+fn (p: mut &Parser) parseCase(): Result[PStmt, DbErr] {
+    try p.expectKw("case")
+    var st = emptyStmt(ST_CASE)
+    if !p.isKw("when") {
+        st.expr = try p.readUntilKw(&["when"])
+    }
+    while p.acceptKw("when") {
+        // comma-separated list of expressions before THEN
+        var whens: []str = []
+        while true {
+            let start = p.pos
+            var depth = 0
+            while p.peek().kind != TK_EOF {
+                let t = p.peek()
+                if depth == 0 && ((t.kind == TK_OP && t.text == ",") || (t.kind == TK_ID && t.low == "then")) { break }
+                if t.kind == TK_OP && (t.text == "(" || t.text == "[") { depth += 1 }
+                else if t.kind == TK_OP && (t.text == ")" || t.text == "]") { if depth > 0 { depth -= 1 } }
+                p.pos += 1
+            }
+            append(mut &whens, p.sliceSrc(start, p.pos))
+            if !p.acceptOp(",") { break }
+        }
+        try p.expectKw("then")
+        let b = try p.parseStmts(&["when", "else", "end"])
+        append(mut &st.conds, strings.join(&whens, "\x00"))
+        append(mut &st.branches, b)
+    }
+    if p.acceptKw("else") {
+        st.elseBody = try p.parseStmts(&["end"])
+    }
+    try p.expectKw("end")
+    try p.expectKw("case")
+    try p.expectOp(";")
+    return Ok(st)
+}
+
+fn (p: mut &Parser) parseFor(lbl: &str): Result[PStmt, DbErr] {
+    try p.expectKw("for")
+    let vt = p.next()
+    if vt.kind != TK_ID && vt.kind != TK_QID { return Err(pgErr("42601", "expected loop variable after FOR")) }
+    try p.expectKw("in")
+    let rev = p.acceptKw("reverse")
+    let headStart = p.pos
+    // Scan until LOOP at depth 0 to distinguish integer range (`..`) vs query (`SELECT` / `WITH` / `VALUES`)
+    var depth = 0
+    var dotsAt = -1
+    while p.peek().kind != TK_EOF {
+        let t = p.peek()
+        if depth == 0 && t.kind == TK_ID && t.low == "loop" { break }
+        if depth == 0 && t.kind == TK_OP && t.text == ".." && dotsAt < 0 { dotsAt = p.pos }
+        if t.kind == TK_OP && (t.text == "(" || t.text == "[") { depth += 1 }
+        else if t.kind == TK_OP && (t.text == ")" || t.text == "]") { if depth > 0 { depth -= 1 } }
+        p.pos += 1
+    }
+    let headEnd = p.pos
+    try p.expectKw("loop")
+    let body = try p.parseStmts(&["end"])
+    try p.expectKw("end")
+    try p.expectKw("loop")
+    if p.peek().kind == TK_ID || p.peek().kind == TK_QID { let _ = p.next() }
+    try p.expectOp(";")
+    if dotsAt >= 0 {
+        var st = emptyStmt(ST_FOR_INT)
+        st.label = lbl.toStr()
+        st.target = vt.low.clone()
+        st.reverse = rev
+        st.loExpr = p.sliceSrc(headStart, dotsAt)
+        // Check for optional BY step
+        var byAt = -1
+        var d2 = 0
+        for k in (dotsAt + 1)..headEnd {
+            let tk = &p.toks[k]
+            if d2 == 0 && tk.kind == TK_ID && tk.low == "by" { byAt = k; break }
+            if tk.kind == TK_OP && (tk.text == "(" || tk.text == "[") { d2 += 1 }
+            else if tk.kind == TK_OP && (tk.text == ")" || tk.text == "]") { if d2 > 0 { d2 -= 1 } }
+        }
+        if byAt >= 0 {
+            st.hiExpr = p.sliceSrc(dotsAt + 1, byAt)
+            st.stepExpr = p.sliceSrc(byAt + 1, headEnd)
+        } else {
+            st.hiExpr = p.sliceSrc(dotsAt + 1, headEnd)
+        }
+        st.body = body
+        return Ok(st)
+    }
+    var st = emptyStmt(ST_FOR_QUERY)
+    st.label = lbl.toStr()
+    st.target = vt.low.clone()
+    st.expr = p.sliceSrc(headStart, headEnd)
+    st.body = body
+    return Ok(st)
+}
+
+fn (p: mut &Parser) parseRaise(): Result[PStmt, DbErr] {
+    try p.expectKw("raise")
+    var st = emptyStmt(ST_RAISE)
+    st.level = "exception"
+    if p.acceptOp(";") {
+        // bare RAISE; (re-raise inside EXCEPTION handler)
+        st.target = "reraise"
+        return Ok(st)
+    }
+    if p.isKw("debug") || p.isKw("log") || p.isKw("info") || p.isKw("notice") || p.isKw("warning") || p.isKw("exception") {
+        st.level = p.next().low
+    }
+    if p.peek().kind == TK_STR {
+        st.expr = p.next().val
+        while p.acceptOp(",") {
+            let es = p.pos
+            var depth = 0
+            while p.peek().kind != TK_EOF {
+                let t = p.peek()
+                if depth == 0 && ((t.kind == TK_OP && (t.text == "," || t.text == ";")) || (t.kind == TK_ID && t.low == "using")) { break }
+                if t.kind == TK_OP && (t.text == "(" || t.text == "[") { depth += 1 }
+                else if t.kind == TK_OP && (t.text == ")" || t.text == "]") { if depth > 0 { depth -= 1 } }
+                p.pos += 1
+            }
+            append(mut &st.args, p.sliceSrc(es, p.pos))
+        }
+    } else if p.peek().kind == TK_ID && !p.isKw("using") {
+        // RAISE condition_name [USING ...] or RAISE SQLSTATE 'xxxxx' [USING ...]
+        if p.acceptKw("sqlstate") {
+            let s = p.next()
+            if s.kind != TK_STR { return Err(pgErr("42601", "expected SQLSTATE string")) }
+            append(mut &st.usingKeys, "errcode")
+            append(mut &st.usingVals, "'" + s.val + "'")
+        } else {
+            let cname = p.next().low
+            append(mut &st.usingKeys, "errcode")
+            append(mut &st.usingVals, "'" + conditionToState(&cname) + "'")
+        }
+    }
+    if p.acceptKw("using") {
+        while true {
+            let opt = p.next()
+            if opt.kind != TK_ID { return Err(pgErr("42601", "expected option name after USING")) }
+            if !p.acceptOp("=") { try p.expectOp(":=") }
+            let vs = p.pos
+            var depth = 0
+            while p.peek().kind != TK_EOF {
+                let t = p.peek()
+                if depth == 0 && t.kind == TK_OP && (t.text == "," || t.text == ";") { break }
+                if t.kind == TK_OP && (t.text == "(" || t.text == "[") { depth += 1 }
+                else if t.kind == TK_OP && (t.text == ")" || t.text == "]") { if depth > 0 { depth -= 1 } }
+                p.pos += 1
+            }
+            append(mut &st.usingKeys, opt.low.clone())
+            append(mut &st.usingVals, p.sliceSrc(vs, p.pos))
+            if !p.acceptOp(",") { break }
+        }
+    }
+    try p.expectOp(";")
+    return Ok(st)
+}
+
+fn (p: mut &Parser) parseExecute(): Result[PStmt, DbErr] {
+    try p.expectKw("execute")
+    var st = emptyStmt(ST_EXEC)
+    let es = p.pos
+    var depth = 0
+    while p.peek().kind != TK_EOF {
+        let t = p.peek()
+        if depth == 0 {
+            if t.kind == TK_OP && t.text == ";" { break }
+            if t.kind == TK_ID && (t.low == "into" || t.low == "using") { break }
+        }
+        if t.kind == TK_OP && (t.text == "(" || t.text == "[") { depth += 1 }
+        else if t.kind == TK_OP && (t.text == ")" || t.text == "]") { if depth > 0 { depth -= 1 } }
+        p.pos += 1
+    }
+    st.expr = p.sliceSrc(es, p.pos)
+    if p.acceptKw("into") {
+        st.strict = p.acceptKw("strict")
+        while true {
+            var nm = p.next().low
+            if p.acceptOp(".") { nm = nm + "." + p.next().low }
+            append(mut &st.intoTargets, nm)
+            if !p.acceptOp(",") { break }
+        }
+    }
+    if p.acceptKw("using") {
+        while true {
+            let us = p.pos
+            var d = 0
+            while p.peek().kind != TK_EOF {
+                let t = p.peek()
+                if d == 0 && t.kind == TK_OP && (t.text == "," || t.text == ";") { break }
+                if t.kind == TK_OP && (t.text == "(" || t.text == "[") { d += 1 }
+                else if t.kind == TK_OP && (t.text == ")" || t.text == "]") { if d > 0 { d -= 1 } }
+                p.pos += 1
+            }
+            append(mut &st.usingExprs, p.sliceSrc(us, p.pos))
+            if !p.acceptOp(",") { break }
+        }
+    }
+    try p.expectOp(";")
+    return Ok(st)
+}
+
+// Parse embedded SQL statement, extracting PL/pgSQL `INTO [STRICT] target, ...` for SELECT or RETURNING ... INTO.
+fn (p: mut &Parser) parseEmbeddedSql(): Result[PStmt, DbErr] {
+    var st = emptyStmt(ST_SQL)
+    let firstKw = p.peek().low
+    st.isSelect = firstKw == "select" || firstKw == "values"
+    let start = p.pos
+    var depth = 0
+    var intoStart = -1
+    var intoEnd = -1
+    var seenReturning = false
+    while p.peek().kind != TK_EOF {
+        let t = p.peek()
+        if depth == 0 && t.kind == TK_OP && t.text == ";" { break }
+        if depth == 0 && t.kind == TK_ID {
+            if t.low == "returning" { seenReturning = true }
+            if t.low == "into" && (firstKw == "select" || seenReturning) && intoStart < 0 {
+                intoStart = p.pos
+                p.pos += 1
+                st.strict = p.acceptKw("strict")
+                while true {
+                    let nt = p.next()
+                    if nt.kind != TK_ID && nt.kind != TK_QID { return Err(pgErr("42601", "invalid INTO target")) }
+                    var nm = nt.low.clone()
+                    if p.acceptOp(".") { nm = nm + "." + p.next().low }
+                    append(mut &st.intoTargets, nm)
+                    if !p.acceptOp(",") { break }
+                }
+                intoEnd = p.pos
+                continue
+            }
+        }
+        if t.kind == TK_OP && (t.text == "(" || t.text == "[") { depth += 1 }
+        else if t.kind == TK_OP && (t.text == ")" || t.text == "]") { if depth > 0 { depth -= 1 } }
+        p.pos += 1
+    }
+    let endPos = p.pos
+    try p.expectOp(";")
+    if intoStart >= 0 {
+        let before = p.sliceSrc(start, intoStart)
+        let after = p.sliceSrc(intoEnd, endPos)
+        st.expr = strings.trim(&(before + " " + after)).toStr()
+    } else {
+        st.expr = p.sliceSrc(start, endPos)
+    }
+    return Ok(st)
+}
+
+// ---- condition name <-> SQLSTATE mapping
+
+fn conditionToState(cond: &str): str {
+    let c = strings.toLowerAscii(cond)
+    match c {
+        "raise_exception" { return "P0001" }
+        "no_data_found" { return "P0002" }
+        "too_many_rows" { return "P0003" }
+        "assert_failure" { return "P0004" }
+        "unique_violation" { return "23505" }
+        "foreign_key_violation" { return "23503" }
+        "not_null_violation" { return "23502" }
+        "check_violation" { return "23514" }
+        "restrict_violation" { return "23001" }
+        "integrity_constraint_violation" { return "23000" }
+        "division_by_zero" { return "22012" }
+        "invalid_text_representation" { return "22P02" }
+        "numeric_value_out_of_range" { return "22003" }
+        "string_data_right_truncation" { return "22001" }
+        "data_exception" { return "22000" }
+        "undefined_table" { return "42P01" }
+        "undefined_column" { return "42703" }
+        "undefined_function" { return "42883" }
+        "duplicate_table" { return "42P07" }
+        "duplicate_object" { return "42710" }
+        "insufficient_privilege" { return "42501" }
+        "feature_not_supported" { return "0A000" }
+        "object_not_in_prerequisite_state" { return "55000" }
+        else { return "P0001" }
+    }
+}
+
+fn matchesExcCond(cond: &str, errState: &str): bool {
+    if cond == "others" { return true }
+    if strings.startsWith(cond, "sqlstate:") {
+        return strings.toUpperAscii(&cond[9..len(cond)]) == strings.toUpperAscii(errState)
+    }
+    let want = conditionToState(cond)
+    if want == strings.toUpperAscii(errState) { return true }
+    // Category match: e.g. data_exception (22000) matches any 22xxx, integrity_constraint_violation (23000) matches any 23xxx
+    if len(want) == 5 && strings.endsWith(&want, "000") && len(errState) == 5 && want[0..2] == strings.toUpperAscii(&errState[0..2]) {
+        return true
+    }
+    return false
+}
+
+// ---- runtime environment
+
+type VarSlot = record {
+    name: str
+    val: Val
+    typ: TypeName
+    hasType: bool
+    isConst: bool
+    notNull: bool
+}
+
+type RecSlot = record {
+    name: str
+    cols: []str
+    types: []TypeName
+    vals: []Val
+    isNull: bool
+}
+
+const FL_NONE = 0
+const FL_RETURN = 1
+const FL_EXIT = 2
+const FL_CONTINUE = 3
+
+const RET_NULL = 0
+const RET_NEW = 1
+const RET_OLD = 2
+const RET_REC = 3
+
+type Flow = record {
+    kind: int
+    label: str
+    retKind: int
+    retVals: []Val
+}
+
+fn noFlow(): Flow { return Flow{kind: FL_NONE, label: "", retKind: RET_NULL, retVals: []} }
+
+type RunEnv = record {
+    vars: []VarSlot
+    recs: []RecSlot
+    argv: []str
+    lastRowCount: int
+    curErrState: str
+    curErrMsg: str
+    newModified: bool
+    hasNew: bool
+    hasOld: bool
+}
+
+fn (e: &RunEnv) findVar(name: &str): int {
+    var i = len(e.vars) - 1
+    while i >= 0 {
+        if e.vars[i].name == name { return i }
+        i -= 1
+    }
+    return -1
+}
+
+fn (e: &RunEnv) findRec(name: &str): int {
+    var i = len(e.recs) - 1
+    while i >= 0 {
+        if e.recs[i].name == name { return i }
+        i -= 1
+    }
+    return -1
+}
+
+fn (e: mut &RunEnv) setVarVal(name: &str, v: Val) {
+    let i = e.findVar(name)
+    if i >= 0 {
+        e.vars[i].val = v
+    } else {
+        append(mut &e.vars, VarSlot{name: name.toStr(), val: v, typ: lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0}, hasType: false, isConst: false, notNull: false})
+    }
+}
+
+fn (e: &RunEnv) getVarVal(name: &str): Option[Val] {
+    let i = e.findVar(name)
+    if i < 0 { return None }
+    return Some(e.vars[i].val.clone())
+}
+
+type ParsedType = record {
+    isRec: bool
+    typ: TypeName
+    hasType: bool
+}
+
+fn parseTypeSpec(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, spec: &str): ParsedType {
+    let low = strings.toLowerAscii(&(strings.trim(spec)))
+    if low == "record" || strings.endsWith(&low, "%rowtype") {
+        return ParsedType{isRec: true, typ: lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0}, hasType: false}
+    }
+    if strings.endsWith(&low, "%type") {
+        return ParsedType{isRec: false, typ: lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0}, hasType: false}
+    }
+    let oid = lexdb_pgcat.typeByName(&low)
+    if oid > 0 {
+        return ParsedType{isRec: false, typ: lexdb_sql.oidType(oid), hasType: true}
+    }
+    if strings.startsWith(&low, "varchar") || strings.startsWith(&low, "character varying") {
+        return ParsedType{isRec: false, typ: lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_VARCHAR, prec: 0, scale: 0, len: 0}, hasType: true}
+    }
+    if strings.startsWith(&low, "numeric") || strings.startsWith(&low, "decimal") {
+        return ParsedType{isRec: false, typ: lexdb_sql.TypeName{kind: lexdb_sql.K_NUM, oid: lexdb_sql.OID_NUMERIC, prec: 0, scale: 0, len: 0}, hasType: true}
+    }
+    if strings.startsWith(&low, "int") || low == "bigint" || low == "smallint" {
+        let o = if low == "bigint" || low == "int8" { lexdb_sql.OID_INT8 } else if low == "smallint" || low == "int2" { lexdb_sql.OID_INT2 } else { lexdb_sql.OID_INT4 }
+        return ParsedType{isRec: false, typ: lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: o, prec: 0, scale: 0, len: 0}, hasType: true}
+    }
+    if low == "bool" || low == "boolean" {
+        return ParsedType{isRec: false, typ: lexdb_sql.TypeName{kind: lexdb_sql.K_BOOL, oid: lexdb_sql.OID_BOOL, prec: 0, scale: 0, len: 0}, hasType: true}
+    }
+    if low == "text" {
+        return ParsedType{isRec: false, typ: lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0}, hasType: true}
+    }
+    if strings.startsWith(&low, "timestamp") {
+        let tz = strings.contains(&low, "with time zone") || low == "timestamptz"
+        return ParsedType{isRec: false, typ: lexdb_sql.TypeName{kind: if tz { lexdb_sql.K_TSTZ } else { lexdb_sql.K_TS }, oid: if tz { lexdb_sql.OID_TSTZ } else { lexdb_sql.OID_TS }, prec: 0, scale: 0, len: 0}, hasType: true}
+    }
+    if low == "date" {
+        return ParsedType{isRec: false, typ: lexdb_sql.TypeName{kind: lexdb_sql.K_DATE, oid: lexdb_sql.OID_DATE, prec: 0, scale: 0, len: 0}, hasType: true}
+    }
+    return ParsedType{isRec: false, typ: lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0}, hasType: false}
+}
+
+fn oidOfVal(v: &Val): int {
+    match v {
+        Val.Null { return lexdb_sql.OID_TEXT }
+        Val.Bool(_) { return lexdb_sql.OID_BOOL }
+        Val.Int(_) { return lexdb_sql.OID_INT8 }
+        Val.Float(_) { return lexdb_sql.OID_FLOAT8 }
+        Val.Real(_) { return lexdb_sql.OID_FLOAT4 }
+        Val.Num(_) { return lexdb_sql.OID_NUMERIC }
+        Val.Text(_) { return lexdb_sql.OID_TEXT }
+        Val.Bytes(_) { return lexdb_sql.OID_BYTEA }
+        Val.Date(_) { return lexdb_sql.OID_DATE }
+        Val.Time(_) { return lexdb_sql.OID_TIME }
+        Val.Ts(_) { return lexdb_sql.OID_TS }
+        Val.Tstz(_) { return lexdb_sql.OID_TSTZ }
+        Val.Tsz(_, _) { return lexdb_sql.OID_TSTZ }
+        Val.Ival(_) { return 1186 }
+        Val.Uuid(_) { return lexdb_sql.OID_UUID }
+        Val.Reg(o, _) { return o }
+    }
+}
+
+fn recFieldIdx(r: &RecSlot, col: &str): int {
+    for i in 0..len(r.cols) {
+        if r.cols[i] == col { return i }
+    }
+    return -1
+}
+
+fn recsEqual(a: &RecSlot, b: &RecSlot, distinct: bool): bool {
+    // distinct=true: SQL IS DISTINCT FROM (NULL equals NULL -> false; different -> true)
+    // distinct=false: SQL = (standard comparison)
+    if a.isNull || b.isNull {
+        if distinct { return a.isNull != b.isNull }
+        return false
+    }
+    let n = min(len(a.vals), len(b.vals))
+    for i in 0..n {
+        let an = lexdb_ops.isNull(&a.vals[i])
+        let bn = lexdb_ops.isNull(&b.vals[i])
+        if an && bn { continue }
+        if an != bn { return distinct }
+        if lexdb_sql.text(&a.vals[i]) != lexdb_sql.text(&b.vals[i]) { return distinct }
+    }
+    return !distinct
+}
+
+type SubstRes = record {
+    sql: str
+    params: []Val
+    ptypes: []int
+}
+
+// Substitute PL/pgSQL variable, record field, and TG_ARGV[i] references into SQL text,
+// returning rewritten SQL with positional $1..$n parameters and their values/OIDs.
+fn substSql(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, env: &RunEnv, sql: &str, isExpr: bool): Result[SubstRes, DbErr] {
+    let toks = try lex(sql)
+    var params: []Val = []
+    var ptypes: []int = []
+    var out = ""
+    var i = 0
+    let n = len(toks) - 1 // exclude TK_EOF
+    var inSetLhs = false
+    var inInsertCols = false
+    var insParenDepth = 0
+    while i < n {
+        let t = &toks[i]
+        let prev = if i > 0 { toks[i - 1].clone() } else { Tok{kind: TK_EOF, text: "", low: "", val: "", s: 0, e: 0} }
+        let next = if i + 1 < n { toks[i + 1].clone() } else { Tok{kind: TK_EOF, text: "", low: "", val: "", s: 0, e: 0} }
+
+        // Track SQL context to avoid substituting target column names
+        if !isExpr && t.kind == TK_ID {
+            if t.low == "set" { inSetLhs = true }
+            else if t.low == "where" || t.low == "from" || t.low == "returning" { inSetLhs = false }
+            else if t.low == "into" && prev.low == "insert" {
+                // INSERT INTO [schema.]tbl (col1, col2)
+                inInsertCols = true
+                insParenDepth = 0
+            } else if t.low == "values" || t.low == "select" || t.low == "default" {
+                inInsertCols = false
+            }
+        }
+        if !isExpr && inSetLhs && t.kind == TK_OP {
+            if t.text == "=" { inSetLhs = false }
+            else if t.text == "," { inSetLhs = true }
+        }
+        if !isExpr && inInsertCols && t.kind == TK_OP {
+            if t.text == "(" { insParenDepth += 1 }
+            else if t.text == ")" {
+                insParenDepth -= 1
+                if insParenDepth <= 0 { inInsertCols = false }
+            }
+        }
+
+        // Handle TG_ARGV[expr] (0-based indexing as in PostgreSQL!)
+        if t.kind == TK_ID && t.low == "tg_argv" && next.kind == TK_OP && next.text == "[" {
+            var j = i + 2
+            var depth = 1
+            while j < n && depth > 0 {
+                if toks[j].kind == TK_OP && toks[j].text == "[" { depth += 1 }
+                else if toks[j].kind == TK_OP && toks[j].text == "]" { depth -= 1; if depth == 0 { break } }
+                j += 1
+            }
+            if depth != 0 { return Err(pgErr("42601", "unterminated TG_ARGV subscript")) }
+            let idxSrc = if i + 2 < j { strings.trim(&sql[toks[i + 2].s..toks[j - 1].e]).toStr() } else { "0" }
+            let idxVal = try evalExpr(st, txn, env, &idxSrc)
+            var v = Val.Null
+            match idxVal {
+                Val.Int(idx) {
+                    if idx >= 0 && idx < len(env.argv) { v = Val.Text(env.argv[idx].clone()) }
+                }
+                else {
+                    match strings.parseIntOpt(&lexdb_sql.text(&idxVal)) {
+                        Some(idx) { if idx >= 0 && idx < len(env.argv) { v = Val.Text(env.argv[idx].clone()) } }
+                        None {}
+                    }
+                }
+            }
+            append(mut &params, v)
+            append(mut &ptypes, lexdb_sql.OID_TEXT)
+            out = out + " $" + len(params).toStr() + " "
+            i = j + 1
+            continue
+        }
+
+        // Handle record.field (NEW.col, OLD.col, rec.field)
+        if (t.kind == TK_ID || t.kind == TK_QID) && prev.text != "." && next.kind == TK_OP && next.text == "." && i + 2 < n {
+            let ri = env.findRec(&t.low)
+            if ri >= 0 {
+                let ft = &toks[i + 2]
+                if ft.kind == TK_ID || ft.kind == TK_QID {
+                    let rec = &env.recs[ri]
+                    if rec.isNull {
+                        return Err(pgErr("55000", &("record \"" + t.low + "\" is not assigned yet")))
+                    }
+                    let fi = recFieldIdx(rec, &ft.low)
+                    if fi < 0 {
+                        return Err(pgErr("42703", &("record \"" + t.low + "\" has no field \"" + ft.low + "\"")))
+                    }
+                    let v = rec.vals[fi].clone()
+                    let o = if fi < len(rec.types) && rec.types[fi].oid > 0 { rec.types[fi].oid } else { oidOfVal(&v) }
+                    append(mut &params, v)
+                    append(mut &ptypes, o)
+                    out = out + " $" + len(params).toStr() + " "
+                    i += 3
+                    continue
+                }
+            }
+        }
+
+        // Handle whole-record comparisons: NEW IS [NOT] DISTINCT FROM OLD, NEW = OLD, NEW <> OLD, NEW IS [NOT] NULL
+        if (t.kind == TK_ID || t.kind == TK_QID) && prev.text != "." && next.text != "." {
+            let ri = env.findRec(&t.low)
+            if ri >= 0 {
+                // rec IS [NOT] NULL
+                if next.kind == TK_ID && next.low == "is" {
+                    if i + 2 < n && toks[i + 2].low == "null" {
+                        append(mut &params, Val.Bool(env.recs[ri].isNull))
+                        append(mut &ptypes, lexdb_sql.OID_BOOL)
+                        out = out + " $" + len(params).toStr() + " "
+                        i += 3
+                        continue
+                    }
+                    if i + 3 < n && toks[i + 2].low == "not" && toks[i + 3].low == "null" {
+                        append(mut &params, Val.Bool(!env.recs[ri].isNull))
+                        append(mut &ptypes, lexdb_sql.OID_BOOL)
+                        out = out + " $" + len(params).toStr() + " "
+                        i += 4
+                        continue
+                    }
+                    // rec1 IS [NOT] DISTINCT FROM rec2
+                    if i + 4 < n && toks[i + 2].low == "distinct" && toks[i + 3].low == "from" {
+                        let r2 = env.findRec(&toks[i + 4].low)
+                        if r2 >= 0 {
+                            append(mut &params, Val.Bool(recsEqual(&env.recs[ri], &env.recs[r2], true)))
+                            append(mut &ptypes, lexdb_sql.OID_BOOL)
+                            out = out + " $" + len(params).toStr() + " "
+                            i += 5
+                            continue
+                        }
+                    }
+                    if i + 5 < n && toks[i + 2].low == "not" && toks[i + 3].low == "distinct" && toks[i + 4].low == "from" {
+                        let r2 = env.findRec(&toks[i + 5].low)
+                        if r2 >= 0 {
+                            append(mut &params, Val.Bool(!recsEqual(&env.recs[ri], &env.recs[r2], true)))
+                            append(mut &ptypes, lexdb_sql.OID_BOOL)
+                            out = out + " $" + len(params).toStr() + " "
+                            i += 6
+                            continue
+                        }
+                    }
+                }
+                if (next.text == "=" || next.text == "<>" || next.text == "!=") && i + 2 < n {
+                    let r2 = env.findRec(&toks[i + 2].low)
+                    if r2 >= 0 {
+                        let eq = recsEqual(&env.recs[ri], &env.recs[r2], false)
+                        append(mut &params, Val.Bool(if next.text == "=" { eq } else { !eq }))
+                        append(mut &ptypes, lexdb_sql.OID_BOOL)
+                        out = out + " $" + len(params).toStr() + " "
+                        i += 3
+                        continue
+                    }
+                }
+            }
+        }
+
+        // Handle scalar variable reference
+        if (t.kind == TK_ID || t.kind == TK_QID) && prev.text != "." && prev.text != "::" && next.text != "(" && next.text != "." && !inSetLhs && !inInsertCols {
+            let skipPrev = prev.kind == TK_ID && (prev.low == "as" || prev.low == "from" || prev.low == "join" || prev.low == "into" || prev.low == "update" || prev.low == "table" || prev.low == "schema")
+            if !skipPrev {
+                let vi = env.findVar(&t.low)
+                if vi >= 0 {
+                    let v = env.vars[vi].val.clone()
+                    let o = if env.vars[vi].hasType && env.vars[vi].typ.oid > 0 { env.vars[vi].typ.oid } else { oidOfVal(&v) }
+                    append(mut &params, v)
+                    append(mut &ptypes, o)
+                    out = out + " $" + len(params).toStr() + " "
+                    i += 1
+                    continue
+                }
+            }
+        }
+
+        // Emit raw token verbatim
+        if t.kind == TK_QID {
+            out = out + " \"" + strings.replaceAll(&t.text, "\"", "\"\"") + "\" "
+        } else {
+            out = out + " " + t.text + " "
+        }
+        i += 1
+    }
+    return Ok(SubstRes{sql: strings.trim(&out).toStr(), params: params, ptypes: ptypes})
+}
+
+fn evalExpr(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, env: &RunEnv, exprSrc: &str): Result[Val, DbErr] {
+    let sub = try substSql(st, txn, env, exprSrc, true)
+    let stmts = try lexdb_parse.parse(&("SELECT " + sub.sql))
+    if len(stmts) == 0 { return Ok(Val.Null) }
+    let res = try lexdb_exec.execNested(st, txn, &stmts[0], &sub.params, &sub.ptypes)
+    if len(res.rows) == 0 || len(res.rows[0]) == 0 { return Ok(Val.Null) }
+    return Ok(res.rows[0][0].clone())
+}
+
+fn evalBool(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, env: &RunEnv, exprSrc: &str): Result[bool, DbErr] {
+    let v = try evalExpr(st, txn, env, exprSrc)
+    return Ok(lexdb_ops.truth(&v) == Some(true))
+}
+
+fn evalInt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, env: &RunEnv, exprSrc: &str): Result[int, DbErr] {
+    let v = try evalExpr(st, txn, env, exprSrc)
+    match v {
+        Val.Int(n) { return Ok(n) }
+        else {
+            match strings.parseIntOpt(&lexdb_sql.text(&v)) {
+                Some(n) { return Ok(n) }
+                None { return Err(pgErr("22P02", &("invalid input syntax for type integer: \"" + lexdb_sql.text(&v) + "\""))) }
+            }
+        }
+    }
+}
+
+fn tagRowCount(tag: &str): int {
+    // Parse "INSERT 0 N", "UPDATE N", "DELETE N", "SELECT N"
+    let sp = strings.lastIndexOf(tag, " ")
+    if sp >= 0 && sp + 1 < len(tag) {
+        return strings.parseIntOpt(&tag[sp + 1..len(tag)]).unwrapOr(0)
+    }
+    return 0
+}
+
+fn formatRaiseMsg(fmt: &str, vals: &[]Val): str {
+    var out = ""
+    var ai = 0
+    var i = 0
+    let n = len(fmt)
+    while i < n {
+        if fmt[i] == '%' {
+            if i + 1 < n && fmt[i + 1] == '%' {
+                out.addByte('%')
+                i += 2
+                continue
+            }
+            if ai < len(vals) {
+                if lexdb_ops.isNull(&vals[ai]) { out = out + "<NULL>" }
+                else { out = out + lexdb_sql.text(&vals[ai]) }
+                ai += 1
+            } else {
+                out.addByte('%')
+            }
+            i += 1
+            continue
+        }
+        out.addByte(fmt[i])
+        i += 1
+    }
+    return out
+}
+
+fn assignTarget(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, env: mut &RunEnv, target: &str, v0: Val): Result[Unit, DbErr] {
+    let dot = strings.indexOf(target, ".", 0)
+    if dot > 0 {
+        let rname = target[0..dot].toStr()
+        let fname = target[dot + 1..len(target)].toStr()
+        let ri = env.findRec(&rname)
+        if ri < 0 { return Err(pgErr("42703", &("record \"" + rname + "\" does not exist"))) }
+        if env.recs[ri].isNull {
+            return Err(pgErr("55000", &("record \"" + rname + "\" is not assigned yet")))
+        }
+        let fi = recFieldIdx(&env.recs[ri], &fname)
+        if fi < 0 {
+            return Err(pgErr("42703", &("record \"" + rname + "\" has no field \"" + fname + "\"")))
+        }
+        var v = v0
+        if fi < len(env.recs[ri].types) && env.recs[ri].types[fi].oid > 0 {
+            v = try lexdb_ops.coerceZ(v, &env.recs[ri].types[fi], &txn.sql.zone)
+        }
+        env.recs[ri].vals[fi] = v
+        if rname == "new" { env.newModified = true }
+        return Ok(Unit{})
+    }
+    let vi = env.findVar(target)
+    if vi < 0 { return Err(pgErr("42703", &("\"" + target + "\" is not a known variable"))) }
+    if env.vars[vi].isConst {
+        return Err(pgErr("42601", &("variable \"" + target + "\" is declared CONSTANT")))
+    }
+    var v = v0
+    if env.vars[vi].hasType {
+        v = try lexdb_ops.coerceZ(v, &env.vars[vi].typ, &txn.sql.zone)
+    }
+    if env.vars[vi].notNull && lexdb_ops.isNull(&v) {
+        return Err(pgErr("22004", &("null value cannot be assigned to variable \"" + target + "\" declared NOT NULL")))
+    }
+    env.vars[vi].val = v
+    return Ok(Unit{})
+}
+
+fn assignInto(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, env: mut &RunEnv, targets: &[]str, strict: bool, res: &lexdb_exec.Res): Result[Unit, DbErr] {
+    let nr = len(res.rows)
+    if strict {
+        if nr == 0 { return Err(pgErr("P0002", "query returned no rows")) }
+        if nr > 1 { return Err(pgErr("P0003", "query returned more than one row")) }
+    }
+    if len(targets) == 1 {
+        let ri = env.findRec(&targets[0])
+        if ri >= 0 {
+            if nr == 0 {
+                env.recs[ri].isNull = true
+                env.recs[ri].vals = []
+                return Ok(Unit{})
+            }
+            var cs: []str = []
+            var ts: []TypeName = []
+            for oc in res.cols {
+                append(mut &cs, strings.toLowerAscii(&oc.name))
+                append(mut &ts, lexdb_sql.oidType(oc.oid))
+            }
+            env.recs[ri].cols = cs
+            env.recs[ri].types = ts
+            env.recs[ri].vals = collections.copyOf(&res.rows[0])
+            env.recs[ri].isNull = false
+            return Ok(Unit{})
+        }
+    }
+    for k in 0..len(targets) {
+        let v = if nr > 0 && k < len(res.rows[0]) { res.rows[0][k].clone() } else { Val.Null }
+        try assignTarget(st, txn, env, &targets[k], v)
+    }
+    return Ok(Unit{})
+}
+
+// ---- executor
+
+fn execBlock(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, env: mut &RunEnv, blk: &PStmt): Result[Flow, DbErr] {
+    let savedVars = len(env.vars)
+    let savedRecs = len(env.recs)
+    let hasExc = len(blk.handlers) > 0
+    let mk = if hasExc { txn.mark() } else { 0 }
+
+    // Declarations
+    var declErr: Option[DbErr] = None
+    for d in blk.decls {
+        let pt = parseTypeSpec(st, txn, &d.typName)
+        if pt.isRec {
+            append(mut &env.recs, RecSlot{name: d.name.clone(), cols: [], types: [], vals: [], isNull: true})
+        } else {
+            var initVal = Val.Null
+            if d.hasInit {
+                match evalExpr(st, txn, env, &d.initExpr) {
+                    Ok(v0) {
+                        if pt.hasType {
+                            match lexdb_ops.coerceZ(v0, &pt.typ, &txn.sql.zone) {
+                                Ok(vc) { initVal = vc }
+                                Err(x) { declErr = Some(x); break }
+                            }
+                        } else {
+                            initVal = v0
+                        }
+                    }
+                    Err(x) { declErr = Some(x); break }
+                }
+            }
+            if d.notNull && lexdb_ops.isNull(&initVal) {
+                declErr = Some(pgErr("22004", &("null value cannot be assigned to variable \"" + d.name + "\" declared NOT NULL")))
+                break
+            }
+            append(mut &env.vars, VarSlot{name: d.name.clone(), val: initVal, typ: pt.typ, hasType: pt.hasType, isConst: d.isConst, notNull: d.notNull})
+        }
+    }
+
+    var ran: Result[Flow, DbErr] = match declErr {
+        Some(x) { Err(x) }
+        None { execStmts(st, txn, env, &blk.body) }
+    }
+
+    if hasExc {
+        match move(ran) {
+            Ok(fl) { ran = Ok(fl) }
+            Err(errObj) {
+                var matchedIdx = -1
+                for hi in 0..len(blk.handlers) {
+                    for c in blk.handlers[hi].conds {
+                        if matchesExcCond(&c, &errObj.state) { matchedIdx = hi; break }
+                    }
+                    if matchedIdx >= 0 { break }
+                }
+                if matchedIdx >= 0 {
+                    txn.undoTo(mk)
+                    lexdb_trigger.undoTo(txn.sql.sess, mk)
+                    let prevSt = env.curErrState.clone()
+                    let prevMsg = env.curErrMsg.clone()
+                    env.curErrState = errObj.state.clone()
+                    env.curErrMsg = errObj.msg.clone()
+                    env.setVarVal(&"sqlstate", Val.Text(errObj.state.clone()))
+                    env.setVarVal(&"sqlerrm", Val.Text(errObj.msg.clone()))
+                    ran = execStmts(st, txn, env, &blk.handlers[matchedIdx].body)
+                    env.curErrState = prevSt
+                    env.curErrMsg = prevMsg
+                    env.setVarVal(&"sqlstate", Val.Text(env.curErrState.clone()))
+                    env.setVarVal(&"sqlerrm", Val.Text(env.curErrMsg.clone()))
+                } else {
+                    ran = Err(errObj)
+                }
+            }
+        }
+    }
+
+    // Pop block-local declarations
+    while len(env.vars) > savedVars { let _ = pop(mut &env.vars) }
+    while len(env.recs) > savedRecs { let _ = pop(mut &env.recs) }
+
+    match move(ran) {
+        Ok(fl) {
+            if fl.kind == FL_EXIT && len(fl.label) > 0 && fl.label == blk.label {
+                return Ok(noFlow())
+            }
+            return Ok(fl)
+        }
+        Err(x) { return Err(x) }
+    }
+}
+
+fn execStmts(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, env: mut &RunEnv, stmts: &[]PStmt): Result[Flow, DbErr] {
+    for s in stmts {
+        let fl = try execStmt(st, txn, env, &s)
+        if fl.kind != FL_NONE { return Ok(fl) }
+    }
+    return Ok(noFlow())
+}
+
+fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, env: mut &RunEnv, s: &PStmt): Result[Flow, DbErr] {
+    match s.kind {
+        ST_NULL { return Ok(noFlow()) }
+        ST_BLOCK { return execBlock(st, txn, env, s) }
+        ST_ASSIGN {
+            let v = try evalExpr(st, txn, env, &s.expr)
+            try assignTarget(st, txn, env, &s.target, v)
+            return Ok(noFlow())
+        }
+        ST_IF {
+            for i in 0..len(s.conds) {
+                if try evalBool(st, txn, env, &s.conds[i]) {
+                    return execStmts(st, txn, env, &s.branches[i])
+                }
+            }
+            if len(s.elseBody) > 0 { return execStmts(st, txn, env, &s.elseBody) }
+            return Ok(noFlow())
+        }
+        ST_CASE {
+            if len(s.expr) > 0 {
+                // Simple CASE expr WHEN v1, v2 THEN ...
+                let sv = try evalExpr(st, txn, env, &s.expr)
+                for i in 0..len(s.conds) {
+                    for w in strings.split(&s.conds[i], "\x00") {
+                        let wv = try evalExpr(st, txn, env, &w)
+                        if !lexdb_ops.isNull(&sv) && !lexdb_ops.isNull(&wv) && lexdb_sql.text(&sv) == lexdb_sql.text(&wv) {
+                            return execStmts(st, txn, env, &s.branches[i])
+                        }
+                    }
+                }
+            } else {
+                // Searched CASE WHEN cond THEN ...
+                for i in 0..len(s.conds) {
+                    if try evalBool(st, txn, env, &s.conds[i]) {
+                        return execStmts(st, txn, env, &s.branches[i])
+                    }
+                }
+            }
+            if len(s.elseBody) > 0 { return execStmts(st, txn, env, &s.elseBody) }
+            return Ok(noFlow())
+        }
+        ST_LOOP {
+            var iters = 0
+            while true {
+                iters += 1
+                if iters > 100000 { return Err(pgErr("54000", "PL/pgSQL loop iteration limit exceeded")) }
+                let fl = try execStmts(st, txn, env, &s.body)
+                if fl.kind == FL_RETURN { return Ok(fl) }
+                if fl.kind == FL_EXIT {
+                    if len(fl.label) == 0 || fl.label == s.label { return Ok(noFlow()) }
+                    return Ok(fl)
+                }
+                if fl.kind == FL_CONTINUE {
+                    if len(fl.label) == 0 || fl.label == s.label { continue }
+                    return Ok(fl)
+                }
+            }
+            return Ok(noFlow())
+        }
+        ST_WHILE {
+            var iters = 0
+            while try evalBool(st, txn, env, &s.expr) {
+                iters += 1
+                if iters > 100000 { return Err(pgErr("54000", "PL/pgSQL loop iteration limit exceeded")) }
+                let fl = try execStmts(st, txn, env, &s.body)
+                if fl.kind == FL_RETURN { return Ok(fl) }
+                if fl.kind == FL_EXIT {
+                    if len(fl.label) == 0 || fl.label == s.label { return Ok(noFlow()) }
+                    return Ok(fl)
+                }
+                if fl.kind == FL_CONTINUE {
+                    if len(fl.label) == 0 || fl.label == s.label { continue }
+                    return Ok(fl)
+                }
+            }
+            return Ok(noFlow())
+        }
+        ST_FOR_INT {
+            let lo = try evalInt(st, txn, env, &s.loExpr)
+            let hi = try evalInt(st, txn, env, &s.hiExpr)
+            let step = if len(s.stepExpr) > 0 { try evalInt(st, txn, env, &s.stepExpr) } else { 1 }
+            if step <= 0 { return Err(pgErr("22023", "BY value of FOR loop must be greater than zero")) }
+            let saved = len(env.vars)
+            append(mut &env.vars, VarSlot{name: s.target.clone(), val: Val.Int(lo), typ: lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT4, prec: 0, scale: 0, len: 0}, hasType: true, isConst: false, notNull: false})
+            var cur = if s.reverse { hi } else { lo }
+            var iters = 0
+            var retFl = noFlow()
+            while (if s.reverse { cur >= lo } else { cur <= hi }) {
+                iters += 1
+                if iters > 100000 {
+                    while len(env.vars) > saved { let _ = pop(mut &env.vars) }
+                    return Err(pgErr("54000", "PL/pgSQL loop iteration limit exceeded"))
+                }
+                env.vars[saved].val = Val.Int(cur)
+                let flRes = execStmts(st, txn, env, &s.body)
+                match move(flRes) {
+                    Ok(fl) {
+                        if fl.kind == FL_RETURN { retFl = fl; break }
+                        if fl.kind == FL_EXIT {
+                            if len(fl.label) == 0 || fl.label == s.label { break }
+                            retFl = fl; break
+                        }
+                        if fl.kind == FL_CONTINUE {
+                            if len(fl.label) > 0 && fl.label != s.label { retFl = fl; break }
+                        }
+                    }
+                    Err(x) {
+                        while len(env.vars) > saved { let _ = pop(mut &env.vars) }
+                        return Err(x)
+                    }
+                }
+                if s.reverse { cur -= step } else { cur += step }
+            }
+            while len(env.vars) > saved { let _ = pop(mut &env.vars) }
+            return Ok(retFl)
+        }
+        ST_FOR_QUERY {
+            let sub = try substSql(st, txn, env, &s.expr, false)
+            let stmts = try lexdb_parse.parse(&sub.sql)
+            if len(stmts) == 0 { return Ok(noFlow()) }
+            let res = try lexdb_exec.execNested(st, txn, &stmts[0], &sub.params, &sub.ptypes)
+            var cs: []str = []
+            var ts: []TypeName = []
+            for oc in res.cols {
+                append(mut &cs, strings.toLowerAscii(&oc.name))
+                append(mut &ts, lexdb_sql.oidType(oc.oid))
+            }
+            let ri = env.findRec(&s.target)
+            var pushedRec = false
+            var slot = ri
+            if slot < 0 {
+                append(mut &env.recs, RecSlot{name: s.target.clone(), cols: cs.clone(), types: ts.clone(), vals: [], isNull: true})
+                slot = len(env.recs) - 1
+                pushedRec = true
+            }
+            var retFl = noFlow()
+            var anyRow = false
+            for row in res.rows {
+                anyRow = true
+                env.recs[slot].cols = cs.clone()
+                env.recs[slot].types = ts.clone()
+                env.recs[slot].vals = collections.copyOf(&row)
+                env.recs[slot].isNull = false
+                let flRes = execStmts(st, txn, env, &s.body)
+                match move(flRes) {
+                    Ok(fl) {
+                        if fl.kind == FL_RETURN { retFl = fl; break }
+                        if fl.kind == FL_EXIT {
+                            if len(fl.label) == 0 || fl.label == s.label { break }
+                            retFl = fl; break
+                        }
+                        if fl.kind == FL_CONTINUE {
+                            if len(fl.label) > 0 && fl.label != s.label { retFl = fl; break }
+                        }
+                    }
+                    Err(x) {
+                        if pushedRec { let _ = pop(mut &env.recs) }
+                        return Err(x)
+                    }
+                }
+            }
+            env.setVarVal(&"found", Val.Bool(anyRow))
+            if pushedRec { let _ = pop(mut &env.recs) }
+            return Ok(retFl)
+        }
+        ST_EXIT {
+            var fire = true
+            if len(s.expr) > 0 { fire = try evalBool(st, txn, env, &s.expr) }
+            if !fire { return Ok(noFlow()) }
+            return Ok(Flow{kind: if s.isCont { FL_CONTINUE } else { FL_EXIT }, label: s.label.clone(), retKind: RET_NULL, retVals: []})
+        }
+        ST_RETURN {
+            let ex = strings.toLowerAscii(&(strings.trim(&s.expr)))
+            if len(ex) == 0 || ex == "null" {
+                return Ok(Flow{kind: FL_RETURN, label: "", retKind: RET_NULL, retVals: []})
+            }
+            if ex == "new" {
+                let ri = env.findRec(&"new")
+                if ri < 0 || env.recs[ri].isNull {
+                    return Err(pgErr("55000", "record \"new\" is not assigned yet"))
+                }
+                return Ok(Flow{kind: FL_RETURN, label: "", retKind: RET_NEW, retVals: collections.copyOf(&env.recs[ri].vals)})
+            }
+            if ex == "old" {
+                let ri = env.findRec(&"old")
+                if ri < 0 || env.recs[ri].isNull {
+                    return Err(pgErr("55000", "record \"old\" is not assigned yet"))
+                }
+                return Ok(Flow{kind: FL_RETURN, label: "", retKind: RET_OLD, retVals: collections.copyOf(&env.recs[ri].vals)})
+            }
+            let ri = env.findRec(&ex)
+            if ri >= 0 {
+                if env.recs[ri].isNull {
+                    return Ok(Flow{kind: FL_RETURN, label: "", retKind: RET_NULL, retVals: []})
+                }
+                return Ok(Flow{kind: FL_RETURN, label: "", retKind: RET_REC, retVals: collections.copyOf(&env.recs[ri].vals)})
+            }
+            // Allow RETURN expr where expr evaluates to NULL
+            let v = try evalExpr(st, txn, env, &s.expr)
+            if lexdb_ops.isNull(&v) {
+                return Ok(Flow{kind: FL_RETURN, label: "", retKind: RET_NULL, retVals: []})
+            }
+            return Err(pgErr("42804", "RETURN cannot have a parameter in function returning trigger other than NEW, OLD, or NULL"))
+        }
+        ST_RAISE {
+            if s.target == "reraise" {
+                if len(env.curErrState) == 0 || env.curErrState == "00000" {
+                    return Err(pgErr("0Z002", "RAISE without parameters cannot be used outside an exception handler"))
+                }
+                return Err(pgErr(&env.curErrState, &env.curErrMsg))
+            }
+            var vals: []Val = []
+            for a in s.args { append(mut &vals, try evalExpr(st, txn, env, &a)) }
+            var msg = if len(s.expr) > 0 { formatRaiseMsg(&s.expr, &vals) } else { "" }
+            var state = "P0001"
+            var detail = ""
+            var hint = ""
+            for i in 0..len(s.usingKeys) {
+                let k = &s.usingKeys[i]
+                let uv = try evalExpr(st, txn, env, &s.usingVals[i])
+                let ustr = lexdb_sql.text(&uv)
+                if k == "errcode" {
+                    if len(ustr) == 5 { state = strings.toUpperAscii(&ustr) }
+                    else { state = conditionToState(&ustr) }
+                } else if k == "message" { msg = ustr }
+                else if k == "detail" { detail = ustr }
+                else if k == "hint" { hint = ustr }
+            }
+            if s.level == "exception" {
+                if len(msg) == 0 { msg = state.clone() }
+                return Err(lexdb_base.errDetail(&state, &msg, &detail, &hint))
+            }
+            if s.level == "notice" || s.level == "warning" || s.level == "info" || s.level == "log" {
+                let nstate = if s.level == "warning" { "01000" } else { "00000" }
+                lexdb_exec.emitNotice(st, txn, &nstate, &msg, &detail)
+            }
+            return Ok(noFlow())
+        }
+        ST_PERFORM {
+            let sub = try substSql(st, txn, env, &("SELECT " + s.expr), false)
+            let stmts = try lexdb_parse.parse(&sub.sql)
+            if len(stmts) > 0 {
+                let res = try lexdb_exec.execNested(st, txn, &stmts[0], &sub.params, &sub.ptypes)
+                env.lastRowCount = len(res.rows)
+                env.setVarVal(&"found", Val.Bool(len(res.rows) > 0))
+            }
+            return Ok(noFlow())
+        }
+        ST_DIAG {
+            if s.expr == "row_count" {
+                try assignTarget(st, txn, env, &s.target, Val.Int(env.lastRowCount))
+            }
+            return Ok(noFlow())
+        }
+        ST_EXEC {
+            let sqlVal = try evalExpr(st, txn, env, &s.expr)
+            if lexdb_ops.isNull(&sqlVal) { return Err(pgErr("22004", "query string argument of EXECUTE is null")) }
+            let sqlStr = lexdb_sql.text(&sqlVal)
+            var params: []Val = []
+            var ptypes: []int = []
+            for ue in s.usingExprs {
+                let v = try evalExpr(st, txn, env, &ue)
+                let o = oidOfVal(&v)
+                append(mut &params, v)
+                append(mut &ptypes, o)
+            }
+            let stmts = try lexdb_parse.parse(&sqlStr)
+            if len(stmts) == 0 { return Ok(noFlow()) }
+            let res = try lexdb_exec.execNested(st, txn, &stmts[0], &params, &ptypes)
+            let n = if res.hasRows { len(res.rows) } else { tagRowCount(&res.tag) }
+            env.lastRowCount = n
+            env.setVarVal(&"found", Val.Bool(n > 0))
+            if len(s.intoTargets) > 0 {
+                try assignInto(st, txn, env, &s.intoTargets, s.strict, &res)
+            }
+            return Ok(noFlow())
+        }
+        ST_SQL {
+            let sub = try substSql(st, txn, env, &s.expr, false)
+            let stmts = try lexdb_parse.parse(&sub.sql)
+            if len(stmts) == 0 { return Ok(noFlow()) }
+            let res = try lexdb_exec.execNested(st, txn, &stmts[0], &sub.params, &sub.ptypes)
+            let n = if res.hasRows { len(res.rows) } else { tagRowCount(&res.tag) }
+            env.lastRowCount = n
+            env.setVarVal(&"found", Val.Bool(n > 0))
+            if len(s.intoTargets) > 0 {
+                try assignInto(st, txn, env, &s.intoTargets, s.strict, &res)
+            }
+            return Ok(noFlow())
+        }
+        else { return Ok(noFlow()) }
+    }
+}
+
+// ---- entry point called by lexdb_exec for PostgreSQL triggers
+
+pub fn runRowTrigger(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, req: &RowFireReq): Result[RowFireRes, DbErr] {
+    // Build NEW and OLD record slots
+    var colNames: []str = []
+    var colTypes: []TypeName = []
+    for c in req.cols {
+        append(mut &colNames, c.name.clone())
+        append(mut &colTypes, c.typ)
+    }
+    var newRec = RecSlot{name: "new", cols: colNames.clone(), types: colTypes.clone(), vals: collections.copyOf(&req.newRow), isNull: !req.hasNew}
+    var oldRec = RecSlot{name: "old", cols: colNames.clone(), types: colTypes.clone(), vals: collections.copyOf(&req.oldRow), isNull: !req.hasOld}
+
+    let whenStr = if req.trig.timing == lexdb_trigger.TT_BEFORE { "BEFORE" }
+                  else if req.trig.timing == lexdb_trigger.TT_AFTER { "AFTER" }
+                  else { "INSTEAD OF" }
+    let levelStr = if req.trig.level == lexdb_trigger.TL_ROW { "ROW" } else { "STATEMENT" }
+    let opStr = if req.event == lexdb_trigger.TE_INSERT { "INSERT" }
+                else if req.event == lexdb_trigger.TE_UPDATE { "UPDATE" }
+                else if req.event == lexdb_trigger.TE_DELETE { "DELETE" }
+                else { "TRUNCATE" }
+
+    var env = RunEnv{
+        vars: [
+            VarSlot{name: "tg_name", val: Val.Text(req.trig.name.clone()), typ: lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0}, hasType: true, isConst: true, notNull: false},
+            VarSlot{name: "tg_when", val: Val.Text(whenStr), typ: lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0}, hasType: true, isConst: true, notNull: false},
+            VarSlot{name: "tg_level", val: Val.Text(levelStr), typ: lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0}, hasType: true, isConst: true, notNull: false},
+            VarSlot{name: "tg_op", val: Val.Text(opStr), typ: lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0}, hasType: true, isConst: true, notNull: false},
+            VarSlot{name: "tg_relid", val: Val.Int(req.targetOid), typ: lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_OID, prec: 0, scale: 0, len: 0}, hasType: true, isConst: true, notNull: false},
+            VarSlot{name: "tg_table_name", val: Val.Text(req.targetName.clone()), typ: lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0}, hasType: true, isConst: true, notNull: false},
+            VarSlot{name: "tg_table_schema", val: Val.Text(req.targetSchema.clone()), typ: lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0}, hasType: true, isConst: true, notNull: false},
+            VarSlot{name: "tg_nargs", val: Val.Int(len(req.trig.funcArgs)), typ: lexdb_sql.TypeName{kind: lexdb_sql.K_INT, oid: lexdb_sql.OID_INT4, prec: 0, scale: 0, len: 0}, hasType: true, isConst: true, notNull: false},
+            VarSlot{name: "found", val: Val.Bool(false), typ: lexdb_sql.TypeName{kind: lexdb_sql.K_BOOL, oid: lexdb_sql.OID_BOOL, prec: 0, scale: 0, len: 0}, hasType: true, isConst: false, notNull: false},
+            VarSlot{name: "sqlstate", val: Val.Text("00000"), typ: lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0}, hasType: true, isConst: false, notNull: false},
+            VarSlot{name: "sqlerrm", val: Val.Text("successful completion"), typ: lexdb_sql.TypeName{kind: lexdb_sql.K_TEXT, oid: lexdb_sql.OID_TEXT, prec: 0, scale: 0, len: 0}, hasType: true, isConst: false, notNull: false},
+        ],
+        recs: [newRec, oldRec],
+        argv: collections.copyOf(&req.trig.funcArgs),
+        lastRowCount: 0,
+        curErrState: "00000",
+        curErrMsg: "successful completion",
+        newModified: false,
+        hasNew: req.hasNew,
+        hasOld: req.hasOld,
+    }
+
+    // Evaluate WHEN (condition) before invoking the trigger function
+    if len(req.trig.whenExpr) > 0 {
+        let ok = try evalBool(st, txn, &env, &req.trig.whenExpr)
+        if !ok {
+            return Ok(RowFireRes{skip: false, modified: false, newRow: collections.copyOf(&req.newRow)})
+        }
+    }
+
+    // Look up the trigger function
+    let cands = try lexdb_routine.find(st, txn, lexdb_sql.RD_PG, &req.trig.body)
+    var fnOpt: Option[lexdb_sql.Routine] = None
+    for r in cands {
+        if r.kind == lexdb_sql.RK_FUNC && lexdb_routine.sigOf(&r) == "" {
+            fnOpt = Some(r)
+            break
+        }
+    }
+    let fnDef = match fnOpt {
+        Some(r) { r }
+        None { return Err(pgErr("42883", &("function " + lexdb_sql.shown(&req.trig.body) + "() does not exist"))) }
+    }
+    let blk = try parseFunction(&fnDef.body)
+    let fl = try execBlock(st, txn, mut &env, &blk)
+    if fl.kind != FL_RETURN {
+        return Err(pgErr("2F005", "control reached end of trigger procedure without RETURN"))
+    }
+    if fl.retKind == RET_NULL {
+        return Ok(RowFireRes{skip: true, modified: false, newRow: []})
+    }
+    if fl.retKind == RET_OLD {
+        return Ok(RowFireRes{skip: false, modified: req.hasNew, newRow: collections.copyOf(&fl.retVals)})
+    }
+    // RET_NEW or RET_REC
+    return Ok(RowFireRes{skip: false, modified: env.newModified || fl.retKind == RET_REC, newRow: collections.copyOf(&fl.retVals)})
+}

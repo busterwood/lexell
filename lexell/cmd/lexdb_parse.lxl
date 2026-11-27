@@ -4302,6 +4302,30 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
         }
         return Ok(ts)
     }
+    if !p.tsql && !p.ora && (p.isKw("enable") || p.isKw("disable")) {
+        let back = p.pos
+        let verb = p.next().text
+        var mode = verb.clone()
+        if verb == "enable" && (p.isKw("replica") || p.isKw("always")) {
+            let _ = p.next()
+        }
+        if p.acceptKw("trigger") {
+            var ts = lexdb_sql.newStmt(lexdb_sql.S_ALTER_TRIGGER)
+            ts.mdialect = MD_PG
+            ts.alias = mode
+            ts.table = s.table.clone()
+            ts.ifFlag = s.ifFlag
+            if p.acceptKw("all") || p.acceptKw("user") {
+                append(mut &ts.names, "*")
+            } else {
+                let nm = try p.name()
+                append(mut &ts.names, nm)
+                append(mut &ts.spells, p.spelled.clone())
+            }
+            return Ok(ts)
+        }
+        p.pos = back
+    }
     if p.acceptKw("rename") {
         // the new name's spelling in col.spell (L6)
         var sp = lexdb_sql.noCol()
@@ -8784,6 +8808,22 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             if p.tsql && p.isKw("trigger") {
                 return Err(lexdb_base.err("TS111", "'CREATE/ALTER TRIGGER' must be the first statement in a query batch."))
             }
+            if !p.tsql && !p.ora && p.acceptKw("trigger") {
+                var ts = lexdb_sql.newStmt(lexdb_sql.S_ALTER_TRIGGER)
+                ts.mdialect = MD_PG
+                ts.alias = "rename"
+                let oldNm = try p.name()
+                let oldSp = p.spelled.clone()
+                try p.expectKw("on")
+                ts.table = try p.rname()
+                try p.expectKw("rename")
+                try p.expectKw("to")
+                let newNm = try p.name()
+                let newSp = p.spelled.clone()
+                ts.names = [oldNm, newNm]
+                ts.spells = [oldSp, newSp]
+                return Ok(ts)
+            }
             if p.tsql && p.isKw("view") {
                 // ALTER VIEW name [(columns)] AS query: the view there is given a new definition
                 p.pos += 1
@@ -8928,7 +8968,7 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                         return Err(lexdb_base.err("0A000", "lexdb: CREATE OR REPLACE FORCE VIEW (a view with errors) is not supported"))
                     }
                     if p.ora && p.isKw("noforce") { p.pos += 1 }
-                    if !p.isKw("view") && !p.isKw("temp") && !p.isKw("temporary") && !p.isKw("function") && !p.isKw("procedure") && !p.graphNext() {
+                    if !p.isKw("view") && !p.isKw("temp") && !p.isKw("temporary") && !p.isKw("function") && !p.isKw("procedure") && !(!p.tsql && !p.ora && (p.isKw("trigger") || p.isKw("constraint"))) && !p.graphNext() {
                         // the kinds the dialect's server has OR ALTER | OR REPLACE for, lexdb not yet; for any other kind
                         // the server's syntax error (Oracle's: ORA-00922, missing or invalid option)
                         let kind = p.peek().text.clone()
@@ -8954,6 +8994,11 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
             }
             if p.tsql && p.isKw("trigger") {
                 return Err(lexdb_base.err("TS111", "'CREATE/ALTER TRIGGER' must be the first statement in a query batch."))
+            }
+            if !p.tsql && !p.ora && (p.isKw("trigger") || (p.isKw("constraint") && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "trigger")) {
+                let isCon = p.acceptKw("constraint")
+                try p.expectKw("trigger")
+                return p.createPgTrigger(orReplace, isCon)
             }
             if p.graphNext() { return p.createGraph(orReplace) }
             if p.isKw("assertion") { return p.assertStmt("create") }
@@ -9144,6 +9189,23 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 if p.acceptKw("on") {
                     return Err(lexdb_base.err("0A000", "lexdb: DDL/server triggers (DROP TRIGGER ... ON DATABASE / ALL SERVER) are not supported"))
                 }
+                return Ok(ts)
+            }
+            if !p.tsql && !p.ora && p.acceptKw("trigger") {
+                var ts = lexdb_sql.newStmt(lexdb_sql.S_DROP_TRIGGER)
+                ts.mdialect = MD_PG
+                if p.acceptKw("if") {
+                    try p.expectKw("exists")
+                    ts.ifFlag = true
+                }
+                let nm = try p.name()
+                let sp = p.spelled.clone()
+                try p.expectKw("on")
+                ts.table = try p.rname()
+                if p.acceptKw("cascade") { ts.cascade = true }
+                else { let _ = p.acceptKw("restrict") }
+                ts.names = [nm]
+                ts.spells = [sp]
                 return Ok(ts)
             }
             if p.isKw("function") || p.isKw("procedure") || (!p.tsql && p.isKw("routine")) || (p.tsql && p.isKw("proc")) {
@@ -10969,6 +11031,7 @@ fn (p: mut &P) createRoutine(orReplace: bool, proc: bool): Result[Stmt, lexdb_ba
                         r.attrs = r.attrs + " table"
                         r.ret = if cols == 1 { r.params[len(r.params) - 1].typ } else { TypeName{kind: K_TEXT, oid: 2249, prec: 0, scale: 0, len: 0} }
                     } else if p.acceptKw("void") { r.ret = TypeName{kind: K_TEXT, oid: 2278, prec: 0, scale: 0, len: 0} }
+                    else if p.acceptKw("trigger") { r.ret = TypeName{kind: K_TEXT, oid: 2279, prec: 0, scale: 0, len: 0} }
                     else if p.acceptKw("record") { r.ret = TypeName{kind: K_TEXT, oid: 2249, prec: 0, scale: 0, len: 0} }
                     else { r.ret = plainType(try p.typeName()) }
                 }
@@ -13291,4 +13354,137 @@ fn (p: mut &P) forJsonClause(s: mut &Stmt): Result[Unit, lexdb_base.DbErr] {
     s.forJson = (if pathMode { "path" } else { "auto" }) + "\x1f" + rootName + "\x1f" +
                 (if incNulls { "1" } else { "0" }) + "\x1f" + (if noWrap { "1" } else { "0" })
     return Ok(Unit{})
+}
+
+// PostgreSQL CREATE [OR REPLACE] [CONSTRAINT] TRIGGER name { BEFORE | AFTER | INSTEAD OF }
+// { INSERT | UPDATE [OF col, ...] | DELETE | TRUNCATE } [OR ...] ON table
+// [FROM ref_table] [[NOT] DEFERRABLE] [INITIALLY IMMEDIATE|DEFERRED]
+// [REFERENCING { OLD | NEW } TABLE [AS] alias ...] [FOR [EACH] { ROW | STATEMENT }]
+// [WHEN (condition)] EXECUTE { FUNCTION | PROCEDURE } func( [args] )
+fn (p: mut &P) createPgTrigger(orReplace: bool, isCon: bool): Result[Stmt, lexdb_base.DbErr] {
+    var s = lexdb_sql.newStmt(lexdb_sql.S_CREATE_TRIGGER)
+    s.mdialect = MD_PG
+    s.ifFlag = orReplace
+    s.index = try p.name()
+    s.spell = p.spelled.clone()
+    // timing: 1=BEFORE, 2=AFTER, 3=INSTEAD OF
+    var timing = 0
+    if p.acceptKw("before") { timing = 1 }
+    else if p.acceptKw("after") { timing = 2 }
+    else if p.acceptKw("instead") {
+        try p.expectKw("of")
+        timing = 3
+    } else {
+        return Err(near(&p.peek()))
+    }
+    // events: 1=INSERT, 2=UPDATE, 4=DELETE, 8=TRUNCATE
+    var events = 0
+    var updCols: []str = []
+    while true {
+        if p.acceptKw("insert") {
+            if (events & 1) != 0 { return Err(lexdb_base.err("42601", "duplicate INSERT trigger event")) }
+            events = events | 1
+        } else if p.acceptKw("update") {
+            if (events & 2) != 0 { return Err(lexdb_base.err("42601", "duplicate UPDATE trigger event")) }
+            events = events | 2
+            if p.acceptKw("of") {
+                while true {
+                    let cn = try p.name()
+                    append(mut &updCols, cn)
+                    if !p.acceptKw(",") { break }
+                }
+            }
+        } else if p.acceptKw("delete") {
+            if (events & 4) != 0 { return Err(lexdb_base.err("42601", "duplicate DELETE trigger event")) }
+            events = events | 4
+        } else if p.acceptKw("truncate") {
+            if (events & 8) != 0 { return Err(lexdb_base.err("42601", "duplicate TRUNCATE trigger event")) }
+            events = events | 8
+        } else {
+            return Err(near(&p.peek()))
+        }
+        if !p.acceptKw("or") { break }
+    }
+    try p.expectKw("on")
+    s.table = try p.rname()
+    // optional constraint trigger clauses
+    if p.acceptKw("from") { let _ = try p.rname() }
+    if p.acceptKw("not") { try p.expectKw("deferrable") }
+    else { let _ = p.acceptKw("deferrable") }
+    if p.acceptKw("initially") {
+        if !p.acceptKw("immediate") { try p.expectKw("deferred") }
+    }
+    // optional REFERENCING { OLD | NEW } TABLE [AS] alias ...
+    var refOld = ""
+    var refNew = ""
+    if p.acceptKw("referencing") {
+        while p.isKw("old") || p.isKw("new") {
+            let isNew = p.next().text == "new"
+            try p.expectKw("table")
+            let _ = p.acceptKw("as")
+            let alias = try p.name()
+            if isNew {
+                if len(refNew) > 0 { return Err(lexdb_base.err("42601", "NEW TABLE specified more than once")) }
+                refNew = alias
+            } else {
+                if len(refOld) > 0 { return Err(lexdb_base.err("42601", "OLD TABLE specified more than once")) }
+                refOld = alias
+            }
+        }
+    }
+    // optional FOR [EACH] { ROW | STATEMENT } (default STATEMENT = 0, ROW = 1)
+    var level = 0
+    if p.acceptKw("for") {
+        let _ = p.acceptKw("each")
+        if p.acceptKw("row") { level = 1 }
+        else if p.acceptKw("statement") { level = 0 }
+        else { return Err(near(&p.peek())) }
+    }
+    // optional WHEN ( condition )
+    var whenExpr = ""
+    if p.acceptKw("when") {
+        try p.expectKw("(")
+        let startAt = p.peek().at
+        var depth = 1
+        while depth > 0 {
+            let tk = p.peek()
+            if tk.kind == T_EOF { return Err(near(&tk)) }
+            if tk.kind == T_OP && tk.text == "(" { depth += 1 }
+            else if tk.kind == T_OP && tk.text == ")" {
+                depth -= 1
+                if depth == 0 { break }
+            }
+            p.pos += 1
+        }
+        let endAt = p.peek().at
+        try p.expectKw(")")
+        whenExpr = strings.trim(&p.src[startAt..min(endAt, len(p.src))]).toStr()
+    }
+    // EXECUTE { FUNCTION | PROCEDURE } func_name ( [ args ] )
+    try p.expectKw("execute")
+    if !p.acceptKw("function") { try p.expectKw("procedure") }
+    s.alias = try p.rname()
+    try p.expectKw("(")
+    var fargs: []str = []
+    if !p.acceptKw(")") {
+        while true {
+            let tk = p.next()
+            if tk.kind == T_STR || tk.kind == T_NUM || tk.kind == T_IDENT || tk.kind == T_QIDENT {
+                append(mut &fargs, tk.text.clone())
+            } else if tk.kind == T_OP && (tk.text == "-" || tk.text == "+") {
+                let ntk = p.next()
+                if ntk.kind != T_NUM { return Err(near(&ntk)) }
+                append(mut &fargs, tk.text + ntk.text)
+            } else {
+                return Err(near(&tk))
+            }
+            if !p.acceptKw(",") { break }
+        }
+        try p.expectKw(")")
+    }
+    s.names = updCols
+    s.spells = fargs
+    s.mvOpts = "pg\x00" + timing.toStr() + "\x00" + events.toStr() + "\x00" + level.toStr() + "\x00" +
+               (if isCon { "1" } else { "0" }) + "\x00" + refOld + "\x00" + refNew + "\x00" + whenExpr
+    return Ok(s)
 }

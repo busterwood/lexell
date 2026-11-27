@@ -10,6 +10,7 @@ import "./lexdb_routine"
 import "./lexdb_assert"
 import "./lexdb_mview"
 import "./lexdb_viewdep"
+import "./lexdb_trigger"
 
 type Routine = lexdb_sql.Routine
 
@@ -449,6 +450,74 @@ pub fn idxDefOn(ct: &CatTab, ix: &CatIdx, on: &str, pretty: bool): str {
     return d
 }
 
+pub fn triggerDef(snap: &CatSnap, tr: &lexdb_trigger.Trigger): str {
+    var d = "CREATE TRIGGER " + quoteIfNeeded(&tr.name) + " "
+    if tr.timing == lexdb_trigger.TT_BEFORE { d = d + "BEFORE " }
+    else if tr.timing == lexdb_trigger.TT_AFTER { d = d + "AFTER " }
+    else { d = d + "INSTEAD OF " }
+    var evs: []str = []
+    if (tr.events & lexdb_trigger.TE_INSERT) != 0 { append(mut &evs, "INSERT") }
+    if (tr.events & lexdb_trigger.TE_DELETE) != 0 { append(mut &evs, "DELETE") }
+    if (tr.events & lexdb_trigger.TE_UPDATE) != 0 {
+        if len(tr.cols) > 0 {
+            var cs: []str = []
+            for c in tr.cols { append(mut &cs, quoteIfNeeded(&c)) }
+            append(mut &evs, "UPDATE OF " + strings.join(&cs, ", "))
+        } else {
+            append(mut &evs, "UPDATE")
+        }
+    }
+    if (tr.events & lexdb_trigger.TE_TRUNCATE) != 0 { append(mut &evs, "TRUNCATE") }
+    d = d + strings.join(&evs, " OR ") + " ON "
+    let tsc = lexdb_sql.schemaOf(&tr.target)
+    let tnm = lexdb_sql.baseName(&tr.target)
+    d = d + quoteIfNeeded(&tsc) + "." + quoteIfNeeded(&tnm)
+    if len(tr.refOld) > 0 || len(tr.refNew) > 0 {
+        d = d + " REFERENCING"
+        if len(tr.refOld) > 0 { d = d + " OLD TABLE AS " + quoteIfNeeded(&tr.refOld) }
+        if len(tr.refNew) > 0 { d = d + " NEW TABLE AS " + quoteIfNeeded(&tr.refNew) }
+    }
+    d = d + (if tr.level == lexdb_trigger.TL_ROW { " FOR EACH ROW " } else { " FOR EACH STATEMENT " })
+    if len(tr.whenExpr) > 0 { d = d + "WHEN (" + tr.whenExpr + ") " }
+    let fsc = lexdb_sql.schemaOf(&tr.body)
+    let fnm = lexdb_sql.baseName(&tr.body)
+    var args: []str = []
+    for a in tr.funcArgs { append(mut &args, "'" + strings.replaceAll(&a, "'", "''") + "'") }
+    d = d + "EXECUTE FUNCTION " + (if fsc != "public" { quoteIfNeeded(&fsc) + "." } else { "" }) + quoteIfNeeded(&fnm) + "(" + strings.join(&args, ", ") + ")"
+    return d
+}
+
+fn pgTrigType(tr: &lexdb_trigger.Trigger): int {
+    var m = 0
+    if tr.level == lexdb_trigger.TL_ROW { m = m | 1 }
+    if tr.timing == lexdb_trigger.TT_BEFORE { m = m | 2 }
+    if (tr.events & lexdb_trigger.TE_INSERT) != 0 { m = m | 4 }
+    if (tr.events & lexdb_trigger.TE_DELETE) != 0 { m = m | 8 }
+    if (tr.events & lexdb_trigger.TE_UPDATE) != 0 { m = m | 16 }
+    if (tr.events & lexdb_trigger.TE_TRUNCATE) != 0 { m = m | 32 }
+    if tr.timing == lexdb_trigger.TT_INSTEAD_OF { m = m | 64 }
+    return m
+}
+
+fn pgTargetOid(snap: &CatSnap, targetKey: &str): int {
+    for ct in snap.tabs { if ct.key == targetKey { return ct.oid } }
+    for v in snap.views { if v.key == targetKey { return v.oid } }
+    return 0
+}
+
+fn pgTargetCols(snap: &CatSnap, targetKey: &str): []lexdb_sql.ColDef {
+    for ct in snap.tabs { if ct.key == targetKey { return ct.t.cols.clone() } }
+    for v in snap.views { if v.key == targetKey { return v.t.cols.clone() } }
+    return []
+}
+
+fn viewHasTriggers(snap: &CatSnap, viewKey: &str): bool {
+    for tr in lexdb_trigger.allFromSnap(&snap.triggers) {
+        if tr.target == viewKey { return true }
+    }
+    return false
+}
+
 // The rows of PostgreSQL's catalog relation rel (pg_catalog or
 // information_schema), from catView; stats is filled for
 // pg_stat_user_tables only (the executor keeps the analysis state).
@@ -470,7 +539,7 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
         "pg_class" {
             for ct in snap.tabs {
                 let hasIdx = len(ct.idxs) > 0
-                let trig = len(ct.t.fks) > 0 || len(lexdb_assert.refs(&ct.t.refBy)) > 0 || lexdb_assert.hasAsserts(&ct.t.refBy)
+                let trig = len(ct.t.fks) > 0 || len(lexdb_assert.refs(&ct.t.refBy)) > 0 || lexdb_assert.hasAsserts(&ct.t.refBy) || lexdb_trigger.hasMarks(&ct.t.refBy)
                 let ta = aclOf(&snap, &lexdb_catalog.relObj(&ct.key))
                 let mvOpt = lexdb_mview.findInSnap(&snap.mviews, &ct.key)
                 let rk = if mvOpt.isSome() { "m" } else { "r" }
@@ -490,9 +559,10 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
             }
             for v in snap.views {
                 let va = aclOf(&snap, &lexdb_catalog.relObj(&v.key))
+                let vtrig = viewHasTriggers(&snap, &v.key)
                 append(mut &rows, [iv(v.oid), tv(if len(v.t.spell) > 0 { &v.t.spell } else { &v.name }), iv(nspOid(&v.schema)), iv(0), iv(0), iv(roleOid(&ownerName(&snap, &va), roles)), iv(0), iv(0), iv(0),
                                    iv(0), Val.Real(-1.0f), iv(0), iv(0), bv(false), bv(false), tv(&persistOf(&v.schema)), tv(&"v"), iv(len(v.t.cols)),
-                                   iv(0), bv(true), bv(false), bv(false), bv(false), bv(false), bv(true), tv(&"n"),
+                                   iv(0), bv(true), bv(vtrig), bv(false), bv(false), bv(false), bv(true), tv(&"n"),
                                    bv(false), iv(0), iv(0), iv(0), aclText(&snap, &va, &"arwdDxt"), Val.Null, Val.Null])
             }
             for d in snap.seqs {
@@ -667,8 +737,9 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
                 let proc = r.kind == lexdb_sql.RK_PROC
                 let ret = if proc { (if anyOut { 2249 } else { 2278 }) } else { r.ret.oid }
                 let vol = if strings.contains(&r.attrs, "immutable") { "i" } else if strings.contains(&r.attrs, "stable") { "s" } else { "v" }
+                let langOid = if r.lang == "plpgsql" { 13500 } else { 14 }
                 append(mut &rows, [iv(catOid(&"F", &(r.key + "\x00" + lexdb_routine.sigOf(&r)))), tv(&lexdb_sql.baseName(&r.key)), iv(nspOid(&lexdb_sql.schemaOf(&r.key))),
-                                   iv(roleOid(&r.owner, roles)), iv(14), Val.Real(100.0f), Val.Real(0.0f), iv(0), tv(&"-"), tv(&(if proc { "p" } else { "f" })), bv(false), bv(false),
+                                   iv(roleOid(&r.owner, roles)), iv(langOid), Val.Real(100.0f), Val.Real(0.0f), iv(0), tv(&"-"), tv(&(if proc { "p" } else { "f" })), bv(false), bv(false),
                                    bv(strings.contains(&r.attrs, "strict")), bv(r.retSet), tv(&vol), tv(&"u"), iv(len(ins)), iv(ndef), iv(ret), vecOf(&ins),
                                    if anyOut { Val.Text("{" + strings.join(&all, ",") + "}") } else { Val.Null },
                                    if anyOut { Val.Text("{" + strings.join(&modes, ",") + "}") } else { Val.Null },
@@ -709,10 +780,10 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
                 append(mut &row, if proc { Val.Null } else { tv(&(if isArr { "_" + tn } else { tn })) })
                 for k in 0..4 { append(mut &row, Val.Null) }                      // scope_*, maximum_cardinality
                 append(mut &row, if proc { Val.Null } else { tv(&"0") })          // dtd_identifier
-                append(mut &row, tv(&"SQL"))                                      // routine_body
+                append(mut &row, tv(&(if r.lang == "sql" { "SQL" } else { "EXTERNAL" })))  // routine_body
                 append(mut &row, if r.atomic { Val.Null } else { tv(&r.body) })   // routine_definition
                 append(mut &row, Val.Null)                                        // external_name
-                append(mut &row, tv(&"SQL"))
+                append(mut &row, tv(&strings.toUpperAscii(&r.lang)))
                 append(mut &row, tv(&"GENERAL"))
                 append(mut &row, tv(&(if strings.contains(&r.attrs, "immutable") { "YES" } else { "NO" })))
                 append(mut &row, tv(&"MODIFIES"))
@@ -781,10 +852,77 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
             }
         }
         "pg_language" {
-            // the languages PostgreSQL has before CREATE EXTENSION (lexdb runs none of them)
             append(mut &rows, [iv(12), tv(&"internal"), iv(OID_OWNER), bv(false), bv(false), iv(0), iv(0), tv(&"fmgr_internal_validator"), Val.Null])
             append(mut &rows, [iv(13), tv(&"c"), iv(OID_OWNER), bv(false), bv(false), iv(0), iv(0), tv(&"fmgr_c_validator"), Val.Null])
             append(mut &rows, [iv(14), tv(&"sql"), iv(OID_OWNER), bv(false), bv(true), iv(0), iv(0), tv(&"fmgr_sql_validator"), Val.Null])
+            append(mut &rows, [iv(13500), tv(&"plpgsql"), iv(OID_OWNER), bv(true), bv(true), iv(0), iv(0), tv(&"plpgsql_validator"), Val.Null])
+        }
+        "pg_trigger" {
+            for tr in lexdb_trigger.allFromSnap(&snap.triggers) {
+                if tr.dialect != lexdb_trigger.TD_PG { continue }
+                let relOid = pgTargetOid(&snap, &tr.target)
+                let fnOid = catOid(&"F", &(tr.body + "\x00"))
+                let tcols = pgTargetCols(&snap, &tr.target)
+                var attNums: []int = []
+                for cn in tr.cols {
+                    var vis = 0
+                    for c in tcols {
+                        if lexdb_catalog.hiddenName(&c.name) { continue }
+                        vis += 1
+                        if c.name == cn { append(mut &attNums, vis); break }
+                    }
+                }
+                var argBytes = ""
+                for a in tr.funcArgs {
+                    argBytes = argBytes + a
+                    argBytes.addByte(byte(0))
+                }
+                append(mut &rows, [
+                    iv(tr.oid), iv(relOid), iv(0), tv(&tr.name), iv(fnOid),
+                    iv(pgTrigType(&tr)), tv(&(if tr.enabled { "O" } else { "D" })), bv(false),
+                    iv(0), iv(0), iv(0), bv(false), bv(false), iv(len(tr.funcArgs)),
+                    vecOf(&attNums), Val.Bytes(argBytes),
+                    if len(tr.whenExpr) > 0 { tv(&tr.whenExpr) } else { Val.Null },
+                    if len(tr.refOld) > 0 { tv(&tr.refOld) } else { Val.Null },
+                    if len(tr.refNew) > 0 { tv(&tr.refNew) } else { Val.Null },
+                ])
+            }
+        }
+        "information_schema.triggers" {
+            let allTr = lexdb_trigger.allFromSnap(&snap.triggers)
+            for tr in allTr {
+                if tr.dialect != lexdb_trigger.TD_PG { continue }
+                let tsc = lexdb_sql.schemaOf(&tr.target)
+                let tnm = lexdb_sql.baseName(&tr.target)
+                let timingStr = if tr.timing == lexdb_trigger.TT_BEFORE { "BEFORE" } else if tr.timing == lexdb_trigger.TT_AFTER { "AFTER" } else { "INSTEAD OF" }
+                let orientStr = if tr.level == lexdb_trigger.TL_ROW { "ROW" } else { "STATEMENT" }
+                let fsc = lexdb_sql.schemaOf(&tr.body)
+                let fnm = lexdb_sql.baseName(&tr.body)
+                var args: []str = []
+                for a in tr.funcArgs { append(mut &args, "'" + strings.replaceAll(&a, "'", "''") + "'") }
+                let actStmt = "EXECUTE FUNCTION " + (if fsc != "public" { quoteIfNeeded(&fsc) + "." } else { "" }) + quoteIfNeeded(&fnm) + "(" + strings.join(&args, ", ") + ")"
+                let evList: []int = [lexdb_trigger.TE_INSERT, lexdb_trigger.TE_UPDATE, lexdb_trigger.TE_DELETE, lexdb_trigger.TE_TRUNCATE]
+                let evNames: []str = ["INSERT", "UPDATE", "DELETE", "TRUNCATE"]
+                for ei in 0..len(evList) {
+                    if (tr.events & evList[ei]) == 0 { continue }
+                    // action_order: 1-based rank alphabetically among triggers on same table/timing/event
+                    var ord = 1
+                    for o in allTr {
+                        if o.dialect == lexdb_trigger.TD_PG && o.target == tr.target && o.timing == tr.timing && (o.events & evList[ei]) != 0 && o.name < tr.name {
+                            ord += 1
+                        }
+                    }
+                    append(mut &rows, [
+                        tv(&db), tv(&tsc), tv(&tr.name), tv(&evNames[ei]),
+                        tv(&db), tv(&tsc), tv(&tnm), iv(ord),
+                        if len(tr.whenExpr) > 0 { tv(&tr.whenExpr) } else { Val.Null },
+                        tv(&actStmt), tv(&orientStr), tv(&timingStr),
+                        if len(tr.refOld) > 0 { tv(&tr.refOld) } else { Val.Null },
+                        if len(tr.refNew) > 0 { tv(&tr.refNew) } else { Val.Null },
+                        Val.Null, Val.Null, Val.Null,
+                    ])
+                }
+            }
         }
         "pg_tablespace" {
             append(mut &rows, [iv(1663), tv(&"pg_default"), iv(OID_OWNER), Val.Null, Val.Null])
@@ -824,7 +962,7 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, stats: &Map[int, lexdb_catalog.TabSt
             for ct in snap.tabs {
                 if lexdb_mview.findInSnap(&snap.mviews, &ct.key).isSome() { continue }
                 append(mut &rows, [tv(&ct.schema), tv(if len(ct.t.spell) > 0 { &ct.t.spell } else { &ct.name }), tv(&ownerName(&snap, &aclOf(&snap, &lexdb_catalog.relObj(&ct.key)))), Val.Null, bv(len(ct.idxs) > 0), bv(false),
-                                   bv(len(ct.t.fks) > 0 || len(lexdb_assert.refs(&ct.t.refBy)) > 0 || lexdb_assert.hasAsserts(&ct.t.refBy)), bv(false)])
+                                   bv(len(ct.t.fks) > 0 || len(lexdb_assert.refs(&ct.t.refBy)) > 0 || lexdb_assert.hasAsserts(&ct.t.refBy) || lexdb_trigger.hasMarks(&ct.t.refBy)), bv(false)])
             }
         }
         "pg_matviews" {

@@ -305,15 +305,41 @@ pub fn dropForTarget(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Tabl
 }
 
 pub fn renameTarget(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, oldKey: &str, newKey: &str): Result[Unit, DbErr] {
+    var empty: []str = []
+    return renameTargetRef(st, txn, oldKey, newKey, mut &empty)
+}
+
+pub fn renameTargetRef(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, oldKey: &str, newKey: &str, refBy: mut &[]str): Result[Unit, DbErr] {
     if !storeHasAny(st) { return Ok(Unit{}) }
     for tr0 in try all(st, txn) {
         if tr0.target == oldKey {
             var tr = tr0.clone()
+            let oldMark = trgKey(&tr.key)
             tr.target = newKey.toStr()
+            if tr.dialect == TD_PG {
+                del(txn, &tr.key)
+                tr.schema = lexdb_sql.schemaOf(newKey)
+                tr.key = makeKey(TD_PG, &(newKey + "\x00" + tr.name))
+                tr.oid = makeOid(&tr.key)
+                let newMark = trgKey(&tr.key)
+                for i in 0..len(refBy) {
+                    if refBy[i] == oldMark { refBy[i] = newMark.clone() }
+                }
+            }
             try put(st, txn, &tr)
         }
     }
     return Ok(Unit{})
+}
+
+// Triggers referencing a specific function key (PostgreSQL DROP FUNCTION dependency check).
+pub fn usingFunction(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, dialect: int, fnKey: &str): Result[[]Trigger, DbErr] {
+    var out: []Trigger = []
+    if !storeHasAny(st) { return Ok(out) }
+    for tr in try all(st, txn) {
+        if tr.dialect == dialect && tr.body == fnKey { append(mut &out, tr) }
+    }
+    return Ok(out)
 }
 
 pub fn orderForEvent(tr: &Trigger, event: int): int {
@@ -323,42 +349,73 @@ pub fn orderForEvent(tr: &Trigger, event: int): int {
     return TO_NONE
 }
 
-// Enabled triggers on target matching timing and event, ordered by FIRST -> creation seq -> LAST.
-pub fn onTargetFor(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, timing: int, event: int): Result[[]Trigger, DbErr] {
+fn sortPgAlpha(xs: mut &[]Trigger) {
+    for i in 1..len(xs) {
+        let cur = xs[i].clone()
+        var j = i - 1
+        while j >= 0 && xs[j].name > cur.name {
+            xs[j + 1] = xs[j].clone()
+            j -= 1
+        }
+        xs[j + 1] = cur
+    }
+}
+
+fn sortBySeq(xs: mut &[]Trigger) {
+    for i in 1..len(xs) {
+        let cur = xs[i].clone()
+        var j = i - 1
+        while j >= 0 && xs[j].createdSeq > cur.createdSeq {
+            xs[j + 1] = xs[j].clone()
+            j -= 1
+        }
+        xs[j + 1] = cur
+    }
+}
+
+// Enabled triggers on target matching timing and event (and level if levelFilter >= 0).
+// Ordering: PostgreSQL fires alphabetically by trigger name; SQL Server fires FIRST -> createdSeq -> LAST.
+pub fn onTargetForLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, timing: int, event: int, levelFilter: int): Result[[]Trigger, DbErr] {
     let allT = try onTarget(st, txn, t)
     var first: []Trigger = []
-    var mid: []Trigger = []
+    var pgMid: []Trigger = []
+    var otherMid: []Trigger = []
     var last: []Trigger = []
     for tr in allT {
         if !tr.enabled { continue }
         if tr.timing != timing { continue }
         if (tr.events & event) == 0 { continue }
-        let ord = orderForEvent(&tr, event)
-        if ord == TO_FIRST { append(mut &first, tr) }
-        else if ord == TO_LAST { append(mut &last, tr) }
-        else { append(mut &mid, tr) }
-    }
-    // insertion sort mid by createdSeq
-    for i in 1..len(mid) {
-        let cur = mid[i].clone()
-        var j = i - 1
-        while j >= 0 && mid[j].createdSeq > cur.createdSeq {
-            mid[j + 1] = mid[j].clone()
-            j -= 1
+        if levelFilter >= 0 && tr.level != levelFilter { continue }
+        if tr.dialect == TD_PG {
+            append(mut &pgMid, tr)
+        } else {
+            let ord = orderForEvent(&tr, event)
+            if ord == TO_FIRST { append(mut &first, tr) }
+            else if ord == TO_LAST { append(mut &last, tr) }
+            else { append(mut &otherMid, tr) }
         }
-        mid[j + 1] = cur
     }
+    sortPgAlpha(mut &pgMid)
+    sortBySeq(mut &otherMid)
     var out: []Trigger = []
     for tr in first { append(mut &out, tr) }
-    for tr in mid { append(mut &out, tr) }
+    for tr in pgMid { append(mut &out, tr) }
+    for tr in otherMid { append(mut &out, tr) }
     for tr in last { append(mut &out, tr) }
     return Ok(out)
 }
 
-pub fn hasEnabledFor(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, timing: int, event: int): Result[bool, DbErr] {
+// Enabled triggers on target matching timing and event.
+pub fn onTargetFor(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, timing: int, event: int): Result[[]Trigger, DbErr] {
+    return onTargetForLevel(st, txn, t, timing, event, -1)
+}
+
+pub fn hasEnabledForLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, timing: int, event: int, levelFilter: int): Result[bool, DbErr] {
     if len(t.view) > 0 {
         for tr in try onTargetKey(st, txn, &t.name) {
-            if tr.enabled && tr.timing == timing && (tr.events & event) != 0 { return Ok(true) }
+            if tr.enabled && tr.timing == timing && (tr.events & event) != 0 && (levelFilter < 0 || tr.level == levelFilter) {
+                return Ok(true)
+            }
         }
         return Ok(false)
     }
@@ -366,12 +423,31 @@ pub fn hasEnabledFor(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Tabl
     for k in marksOf(&t.refBy) {
         match try get(st, txn, &k) {
             Some(tr) {
-                if tr.enabled && tr.timing == timing && (tr.events & event) != 0 { return Ok(true) }
+                if tr.enabled && tr.timing == timing && (tr.events & event) != 0 && (levelFilter < 0 || tr.level == levelFilter) {
+                    return Ok(true)
+                }
             }
             None {}
         }
     }
     return Ok(false)
+}
+
+pub fn hasEnabledFor(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, timing: int, event: int): Result[bool, DbErr] {
+    return hasEnabledForLevel(st, txn, t, timing, event, -1)
+}
+
+// Whether an UPDATE OF col1, col2 trigger matches the statement's updated columns bitmap.
+pub fn matchesUpdateCols(tr: &Trigger, event: int, cols: &[]ColDef, updatedCols: &[]bool): bool {
+    if event != TE_UPDATE || len(tr.cols) == 0 { return true }
+    for cn in tr.cols {
+        for k in 0..len(cols) {
+            if cols[k].name == cn && k < len(updatedCols) && updatedCols[k] {
+                return true
+            }
+        }
+    }
+    return false
 }
 
 // Find a schema-scoped trigger (SQL Server / Oracle) by dialect and catalog key (e.g. "tr_name" or "sales.tr_name").
@@ -457,6 +533,27 @@ pub type TrigFrame = record {
 pub type FireReq = record {
     pub trig: Trigger
     pub delta: TableDelta
+}
+
+// Row / statement trigger invocation request for PostgreSQL and Oracle runners (executes directly on Store + Txn).
+pub type RowFireReq = record {
+    pub trig: Trigger
+    pub targetOid: int
+    pub targetSchema: str
+    pub targetName: str
+    pub event: int
+    pub cols: []ColDef
+    pub updatedCols: []bool
+    pub hasOld: bool
+    pub oldRow: []Val
+    pub hasNew: bool
+    pub newRow: []Val
+}
+
+pub type RowFireRes = record {
+    pub skip: bool
+    pub modified: bool
+    pub newRow: []Val
 }
 
 type SessState = record {
@@ -705,14 +802,26 @@ pub fn recordInsteadOf(sess: int, t: &Table, event: int, inserted0: [][]Val, del
 pub fn pushFrame(sess: int, trig: &Trigger, delta: &TableDelta) {
     store().with(fn(st: mut &SessStore) {
         let i = ensureSlot(st, sess)
-        let refOld = if len(trig.refOld) > 0 { strings.toLowerAscii(&trig.refOld) } else { "deleted" }
-        let refNew = if len(trig.refNew) > 0 { strings.toLowerAscii(&trig.refNew) } else { "inserted" }
+        let refOld = if len(trig.refOld) > 0 { strings.toLowerAscii(&trig.refOld) } else if trig.dialect == TD_TSQL { "deleted" } else { "" }
+        let refNew = if len(trig.refNew) > 0 { strings.toLowerAscii(&trig.refNew) } else if trig.dialect == TD_TSQL { "inserted" } else { "" }
         let depth = len(st.vals[i].frames) + 1
         append(mut &st.vals[i].frames, TrigFrame{
             trig: trig.clone(), event: delta.event, cols: delta.cols.clone(),
             updatedCols: delta.updatedCols.clone(), inserted: delta.inserted.clone(),
             deleted: delta.deleted.clone(), rowCount: delta.rowCount,
             refOld: refOld, refNew: refNew, depth: depth,
+        })
+    })
+}
+
+pub fn pushRowFrame(sess: int, trig: &Trigger, event: int) {
+    store().with(fn(st: mut &SessStore) {
+        let i = ensureSlot(st, sess)
+        let depth = len(st.vals[i].frames) + 1
+        append(mut &st.vals[i].frames, TrigFrame{
+            trig: trig.clone(), event: event, cols: [],
+            updatedCols: [], inserted: [], deleted: [], rowCount: 0,
+            refOld: "", refNew: "", depth: depth,
         })
     })
 }
@@ -853,8 +962,8 @@ pub fn virtualRel(sess: int, relName: &str): Option[Table] {
         if i >= 0 && len(st.vals[i].frames) > 0 {
             let fr = &st.vals[i].frames[len(st.vals[i].frames) - 1]
             var which = ""
-            if low == fr.refNew { which = "new" }
-            else if low == fr.refOld { which = "old" }
+            if len(fr.refNew) > 0 && low == fr.refNew { which = "new" }
+            else if len(fr.refOld) > 0 && low == fr.refOld { which = "old" }
             if len(which) > 0 {
                 var vt = lexdb_catalog.emptyTable(&low)
                 vt.tree = -1
@@ -879,7 +988,7 @@ pub fn isVirtualWriteTarget(sess: int, relName: &str): bool {
         let i = findSlot(st, sess)
         if i >= 0 && len(st.vals[i].frames) > 0 {
             let fr = &st.vals[i].frames[len(st.vals[i].frames) - 1]
-            hit = low == fr.refNew || low == fr.refOld
+            hit = (len(fr.refNew) > 0 && low == fr.refNew) || (len(fr.refOld) > 0 && low == fr.refOld)
         }
     })
     return hit
