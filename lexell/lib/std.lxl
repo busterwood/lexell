@@ -63,7 +63,23 @@ pub fn (o: Option[T]) map[U](f: &fn(T): U): Option[U] {
     }
 }
 
-pub fn (a: &Option[T: Eq]) eq(b: &Option[T]): bool {
+// Convert Option[T] to Result[T, E], returning Err(err) when None.
+pub fn (o: Option[T]) okOr[E](err: E): Result[T, E] {
+    match move(o) {
+        Some(x) { return Ok(x) }
+        None { return Err(err) }
+    }
+}
+
+// Convert Option[T] to Result[T, E], computing the error lazily when None.
+pub fn (o: Option[T]) okOrElse[E](f: &fn(): E): Result[T, E] {
+    match move(o) {
+        Some(x) { return Ok(x) }
+        None { return Err(f()) }
+    }
+}
+
+pub fn (a: &Option[T: borrow + Eq]) eq(b: &Option[T]): bool {
     match a {
         Some(x) {
             match b {
@@ -76,21 +92,21 @@ pub fn (a: &Option[T: Eq]) eq(b: &Option[T]): bool {
 }
 
 // Whether o holds a value equal to x, compared without copying either (design/owned-str.md, issue 11).
-pub fn (o: &Option[T: Eq]) is(x: &T): bool {
+pub fn (o: &Option[T: borrow + Eq]) is(x: &T): bool {
     match o {
         Some(v) { return v == x }
         None { return false }
     }
 }
 
-pub fn (o: &Option[T: Show]) toStr(): str {
+pub fn (o: &Option[T: borrow + Show]) toStr(): str {
     match o {
         Some(x) { return "Some(" + x.toStr() + ")" }
         None { return "None" }
     }
 }
 
-pub fn (o: &Option[T: Serialize]) toData(): Data {
+pub fn (o: &Option[T: borrow + Serialize]) toData(): Data {
     match o {
         Some(x) { return x.toData() }
         None { return Data.Null }
@@ -184,10 +200,26 @@ pub fn (r: Result[T, E]) err(): Option[E] {
     }
 }
 
-pub fn (r: &Result[T: Show, E: Show]) toStr(): str {
+pub fn (r: &Result[T: borrow + Show, E: borrow + Show]) toStr(): str {
     match r {
         Ok(x) { return "Ok(" + x.toStr() + ")" }
         Err(e) { return "Err(" + e.toStr() + ")" }
+    }
+}
+
+// Wrap a Result's error with context text and call-site location into Result[T, box Error].
+pub fn (r: Result[T, E: Error]) context(msg: &str, w: Where): Result[T, box Error] {
+    match move(r) {
+        Ok(x) { return Ok(x) }
+        Err(e) { return Err(WrappedError{msg: msg.clone(), at: w, cause: Some(e)}) }
+    }
+}
+
+// Wrap a Result's error with lazily computed context text into Result[T, box Error].
+pub fn (r: Result[T, E: Error]) withContext(f: &fn(): str, w: Where): Result[T, box Error] {
+    match move(r) {
+        Ok(x) { return Ok(x) }
+        Err(e) { return Err(WrappedError{msg: f(), at: w, cause: Some(e)}) }
     }
 }
 
@@ -220,6 +252,30 @@ pub type Eq = interface { fn (&Self) eq(other: &Self): bool }
 pub type Ord = interface { fn (&Self) cmp(other: &Self): int }
 pub type Hash = interface { fn (&Self) hash(): u64 }
 pub type Show = interface { fn (&Self) toStr(): str }
+// Any error value: structurally satisfied by every stdlib and user error type with toStr().
+// Combined with `box Error`, `try` automatically boxes concrete errors into `Result[T, box Error]`.
+pub type Error = interface { fn (&Self) toStr(): str }
+
+// An error with a context message, call-site Where, and optional boxed cause.
+pub type WrappedError = record {
+    pub msg: str
+    pub at: Where
+    pub cause: Option[box Error]
+}
+
+pub fn (e: &WrappedError) toStr(): str {
+    match &e.cause {
+        Some(c) { return e.msg + ": " + c.toStr() }
+        None { return e.msg.clone() }
+    }
+}
+
+pub fn (e: &WrappedError) toStrWithWhere(): str {
+    match &e.cause {
+        Some(c) { return e.msg + " (" + e.at.toStr() + "): " + c.toStr() }
+        None { return e.msg + " (" + e.at.toStr() + ")" }
+    }
+}
 // A second owner made by copying (design/owned-str.md). For str it takes a count while str is
 // counted, and copies the bytes once str is owned.
 pub type Clone = interface { fn (&Self) clone(): Self }

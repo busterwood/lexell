@@ -21,7 +21,7 @@ for leaks.
 
 | Module | Lines | Contents |
 |---|---:|---|
-| `std.lxl` | 537 | the prelude facade: Option, Result, Unit, Where; Eq/Ord/Hash/Show for the primitives; checked arithmetic and float methods; print/println/eprint/eprintln; min/max; prelude aliases/wrappers for Decimal, Map and sort; in-place string building (addByte, addInt, addLine, clear, bytes) |
+| `std.lxl` | 734 | the prelude facade: Option, Result, Unit, Where; Eq/Ord/Hash/Show/Error/WrappedError; checked arithmetic and float methods; print/println/eprint/eprintln; min/max; prelude aliases/wrappers for Decimal, Map and sort; in-place string building (addByte, addInt, addLine, clear, bytes) |
 | `hash.lxl` | 224 | SipHash-1-3 and the per-process hash key (AT_RANDOM); `sipHash13`, `sipStr`, `sipWords`, `hashSeed`; CRC32C with the CPU's crc32 instruction, `crc32c`, `crc32cMore` |
 | `decimal.lxl` | 1,041 | Decimal, Rounding, DecError, exact arithmetic, parse/format, POW10, sumDecimals (the `m` literal's implementation) |
 | `money.lxl` | 196 | Currency, USD/EUR/GBP/JPY/CHF, Money[C] |
@@ -40,7 +40,7 @@ for leaks.
 | `unicode.lxl` | 84 | Unicode 15.0.0 classification, simple lower/upper/fold, White_Space; no regex or Markdown data |
 | `unicode_data.lxl` | 2,170 | generated (`gen_unicode_data.py`): Unicode 15.0.0 categories, simple lower/upper, simple fold and White_Space |
 | `unicode_width.lxl` | 287 | generated from unicode-width 0.1.14: `displayWidth`, `runeWidth`, East Asian width ranges |
-| `errors.lxl` | 73 | Rust-style debugPath and osError |
+| `errors.lxl` | 104 | `Error`/`WrappedError` constructors & wrapping (`new`, `boxNew`, `wrap`, `boxWrap`, `context`), plus Rust-style `debugPath` and `osError` |
 | `binary.lxl` | 286 | endian reads/writes over bytes and str |
 | `glob.lxl` | 408 | Unix path globbing: `*`, `?`, sets, ASCII POSIX classes, dotfiles, optional `**`, options, `escape`, and `expand` under a root |
 | `base64.lxl` | 107 | standard base64, strict and jq-lenient decoders |
@@ -100,13 +100,21 @@ in `strings` only and are imported explicitly; `split` there is
 methods of the primitive types there.
 
 - **Option[T]** `Some(T)`/`None`: `isSome`, `isNone`, `unwrap`, `expect(msg)`,
-  `unwrapOr(d)`, `map(&f)`, `eq` (T: Eq), `toStr` (T: Show). **Result[T, E]**
+  `unwrapOr(d)`, `map(&f)`, `okOr(err)`, `okOrElse(&f)`, `eq` (T: borrow + Eq),
+  `toStr` (T: borrow + Show). **Result[T, E]**
   `Ok`/`Err` (the `try` lang item): `isOk`, `isErr`, `unwrap`, `expect`,
   `unwrapOr`, `unwrapErr`, `expectErr(msg)`, `map(&f)` (the Ok value),
   `mapErr(&f)` (the Err value: `try r.mapErr(toError)`), `ok()`, `err()`,
-  `toStr`. **Unit**. Both take `borrow` type parameters (SPEC 6.1), so
-  `Option[&str]` and `Result[Token, &str]` hold views; such a value follows
-  the rules for values that hold borrows (SPEC 10).
+  `toStr`, `context(msg)` and `withContext(&f)` (for owned `E: Error`, wrapping
+  into `Result[T, box Error]` with call-site `Where`). **Unit**. Both take
+  `borrow` type parameters (SPEC 6.1), so `Option[&str]` and
+  `Result[Token, &str]` hold views; such a value follows the rules for values
+  that hold borrows (SPEC 10).
+- **Error & WrappedError**: `Error` is `interface { fn (&Self) toStr(): str }`,
+  structurally satisfied by every stdlib and user error type; `try`
+  automatically boxes concrete errors into `Result[T, box Error]` (or any
+  `box I` error interface). `WrappedError` carries `msg: str`, `at: Where`, and
+  `cause: Option[box Error]` (`toStr()`, `toStrWithWhere()`).
 - **Where** (a lang item, SPEC 15): a call site, the text `"file:line"` in
   the program's static data (`toStr`, `cstr()` for C). A call of a library
   function whose last parameter is a `Where` may leave it out: the compiler
@@ -344,7 +352,7 @@ not pay for the width table.
 
 ### errors
 
-`debugPath(p)` (Rust `Path`/`OsStr` Debug quoting: quotes, `\" \' \\ \0 \t
+Error wrapping (`Wrapped`, `new`, `boxNew`, `wrap`, `boxWrap`, `context`) over the prelude `Error` interface and `WrappedError` (each taking an implicit `Where` call site, complementing `Result.context`, `Result.withContext`, `Option.okOr`, and `Option.okOrElse` in `std`). Also `debugPath(p)` (Rust `Path`/`OsStr` Debug quoting: quotes, `\" \' \\ \0 \t
 \r \n`, `\u{h}` for other controls and DEL, bytes >= 0x80 copied) and
 `osError(errno)` (`io.errorText(errno)` plus `" (os error N)"`). There is one
 errno table (`io.errorText`); `errors.text` is a thin alias.
