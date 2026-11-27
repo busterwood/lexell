@@ -142,6 +142,7 @@ pub fn newHeaders(): Headers { return Headers{list: []} }
 // ASCII case-insensitive equality (header names, tokens).
 pub fn equalFold(a: &str, b: &str): bool {
     if len(a) != len(b) { return false }
+    if len(a) >= 32 { return strings.equalFoldAscii(a, b) }
     for i in 0..len(a) {
         var x = a[i]
         var y = b[i]
@@ -244,6 +245,8 @@ fn hasTokenIn(v: &str, token: &str): bool {
 
 // ---------------------------------------------------------------- parsing heads (shared)
 
+type VB = vector[byte]
+
 fn isTchar(c: byte): bool {
     if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') { return true }
     return c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' || c == '*' || c == '+' ||
@@ -262,9 +265,29 @@ pub fn isToken(s: &str): bool {
 // Whether s may be a header value: visible ASCII, space, tab and bytes
 // from 0x80 (no CR, LF, NUL or other control character).
 pub fn isFieldValue(s: &str): bool {
+    if len(s) >= 32 { return isFieldValueSimd(s) }
     for i in 0..len(s) {
         let c = s[i]
         if (c < byte(0x20) && c != '\t') || c == byte(0x7f) { return false }
+    }
+    return true
+}
+
+fn isFieldValueSimd(s: &str): bool {
+    let n = len(s)
+    let v20 = VB.splat(byte(0x20))
+    let vTab = VB.splat('\t')
+    let v7f = VB.splat(byte(0x7f))
+    var i = 0
+    while i + 32 <= n {
+        let v = VB.load(s, i)
+        if (((v < v20) & (v != vTab)) | (v == v7f)).any() { return false }
+        i += 32
+    }
+    while i < n {
+        let c = s[i]
+        if (c < byte(0x20) && c != '\t') || c == byte(0x7f) { return false }
+        i += 1
     }
     return true
 }
@@ -282,6 +305,30 @@ fn trimOws(s: &str): str {
 // when a line ends with LF alone.
 pub fn headEnd(b: &[byte], start: int, from: int, n: int): int {
     var i = if from > start { from } else { start }
+    if n - i >= 32 { return headEndSimd(b, start, i, n) }
+    while i < n {
+        if b[i] == '\n' {
+            if i == start || b[i - 1] != '\r' { return -2 }
+            if i >= start + 3 && b[i - 2] == '\n' && b[i - 3] == '\r' { return i - 3 }
+        }
+        i += 1
+    }
+    return -1
+}
+
+fn headEndSimd(b: &[byte], start: int, from: int, n: int): int {
+    let vNL = VB.splat('\n')
+    var i = from
+    while i + 32 <= n {
+        var m = (VB.load(b, i) == vNL).bitmask()
+        while m != u64(0) {
+            let p = i + int(m.trailingZeros())
+            if p == start || b[p - 1] != '\r' { return -2 }
+            if p >= start + 3 && b[p - 2] == '\n' && b[p - 3] == '\r' { return p - 3 }
+            m = m & (m - u64(1))
+        }
+        i += 32
+    }
     while i < n {
         if b[i] == '\n' {
             if i == start || b[i - 1] != '\r' { return -2 }
@@ -320,10 +367,7 @@ pub fn parseFields(head: &str, at: int, h: mut &Headers, max: int): Result[Unit,
         var b = j
         while a < b && (head[a] == ' ' || head[a] == '\t') { a += 1 }
         while b > a && (head[b - 1] == ' ' || head[b - 1] == '\t') { b -= 1 }
-        for k in a..b {
-            let c = head[k]
-            if (c < byte(0x20) && c != '\t') || c == byte(0x7f) { return Err("a control character in a header value") }
-        }
+        if !isFieldValue(&head[a..b]) { return Err("a control character in a header value") }
         if len(h.list) >= max { return Err("more than " + intToStr(max) + " header lines") }
         append(mut &h.list, Header{name: head[i..colon].clone(), value: head[a..b].clone()})
         i = j + 2
