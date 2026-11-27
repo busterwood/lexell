@@ -1,6 +1,6 @@
 # Lexell performance
 
-Measured on 27 November 2026 on `feat/simd-vector` at `ab29758c`.
+Measured on 27 November 2026 on `main` at `20b4f54f` (non-HTTP sections unchanged from `ab29758c`).
 Every number compares Lexell only with external tools.
 Lexell's own C backend and earlier builds are not compared.
 For LexDB database benchmarks against PostgreSQL 18, see [LEXDB.md](LEXDB.md) and the dedicated [LexDB performance report](lexell/docs/lexdb/performance.md).
@@ -25,8 +25,8 @@ Method: wall times are best of N; instruction counts are user-mode
 | JSON | Python, jq | 3.3 times faster than Python to parse and 1.6–1.7 times faster to write, slower to query; 2.0 to 3.5 times faster than jq 1.7.1 on every filter |
 | Markdown | cmark | Faster on the spec examples, level on repository Markdown, slightly slower on the spec text |
 | Decimal | Java, .NET | Faster than .NET on every operation (1.3 to 5.8 times); faster than Java on nine of ten (only slower on 19-digit cmp) |
-| HTTP/1.1 server | Go net/http, Node.js | Faster at 1, 10 and 100 clients: 1.5 to 1.6 times Go's requests a second, 1.3 to 1.4 times Node's (up to 193k req/s on one core, 5× lower p99 than Go at 100 clients) |
-| HTTP/2 server | Go net/http, Node.js | Faster than both Go and Node.js on every `h2c` and TLS case: 1.6 to 5.1 times Go and 1.1 to 2.5 times Node.js (up to 275k req/s `h2c` and 228k req/s TLS 1.3 on one core at 7–12 MB RSS) |
+| HTTP/1.1 server | Go net/http, Node.js | Faster at 1, 10 and 100 clients: 1.6 times Go's requests a second, 1.4 to 1.5 times Node's (up to 203k req/s on one core, 5.4× lower p99 than Go at 100 clients) |
+| HTTP/2 server | Go net/http, Node.js | Faster than both Go and Node.js on every `h2c` and TLS case: 1.6 to 6.7 times Go and 1.1 to 3.5 times Node.js (up to 368k req/s `h2c` and 317k req/s TLS 1.3 on one core at 7–13 MB RSS) |
 | LexDB | PostgreSQL 18 | Moved to its own pages: see [LEXDB.md](LEXDB.md) for the high-level summary and [lexell/docs/lexdb/performance.md](lexell/docs/lexdb/performance.md) for full TPC-H, ClickBench, analytic, OLTP, materialized view, property graph, and bulk load tables |
 | Command-line tools | GNU grep, sort, tail, rg, eza | 1.9 times faster than GNU grep (and ahead of ripgrep with half the instructions) on `grep -c`, 1.4 times faster on `grep -o -w`, 1.6–3.5 times faster on `eza`, level on `tail`, slower on multi-threaded GNU `sort` |
 
@@ -271,15 +271,15 @@ CPU 0 and the load client on CPU 1, the gate's pinning, not the CPU ranges above
 
 | clients | Lexell, req/s | Go, req/s | Node.js, req/s | Lexell / Go | Lexell / Node.js |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 121,107 | 76,944 | 85,607 | 1.57 | 1.41 |
-| 10 | 193,074 | 126,774 | 143,969 | 1.52 | 1.34 |
-| 100 | 187,823 | 125,342 | 143,265 | 1.50 | 1.31 |
+| 1 | 124,461 | 77,027 | 85,703 | 1.62 | 1.45 |
+| 10 | 203,301 | 127,669 | 141,557 | 1.59 | 1.44 |
+| 100 | 198,103 | 125,970 | 141,802 | 1.57 | 1.40 |
 
 | at 100 clients | Lexell | Go | Node.js |
 |---|---:|---:|---:|
-| latency p50 | 509 µs | 750 µs | 678 µs |
-| latency p99 | 562 µs | 2,779 µs | 864 µs |
-| memory per idle connection | 19.6 KB | 20.6 KB | 13.7 KB |
+| latency p50 | 489 µs | 747 µs | 687 µs |
+| latency p99 | 510 µs | 2,738 µs | 847 µs |
+| memory per idle connection | 19.6 KB | 20.4 KB | 13.8 KB |
 | server RSS before the idle connections | 7 MB | 10 MB | 52 MB |
 | server RSS after the load | 202 MB | 345 MB | 222 MB |
 
@@ -297,27 +297,27 @@ Cleartext HTTP/2 prior knowledge (`h2c`):
 
 | conns × streams | Lexell, req/s | Go, req/s | Node.js, req/s | Lexell / Go | Lexell / Node.js |
 |---|---:|---:|---:|---:|---:|
-| 1 × 1 | 43,035 | 27,448 | 30,572 | 1.57 | 1.41 |
-| 1 × 10 | 118,372 | 55,062 | 94,354 | 2.15 | 1.25 |
-| 1 × 100 | 129,034 | 55,034 | 115,138 | 2.34 | 1.12 |
-| 10 × 10 | 274,573 | 53,771 | 112,728 | 5.11 | 2.44 |
+| 1 × 1 | 43,873 | 27,512 | 30,887 | 1.59 | 1.42 |
+| 1 × 10 | 115,338 | 56,159 | 94,534 | 2.05 | 1.22 |
+| 1 × 100 | 123,251 | 55,668 | 114,887 | 2.21 | 1.07 |
+| 10 × 10 | 367,998 | 55,292 | 111,746 | 6.66 | 3.29 |
 
 HTTPS HTTP/2 (TLS 1.3 ALPN `h2`):
 
 | conns × streams | Lexell, req/s | Go, req/s | Node.js, req/s | Lexell / Go | Lexell / Node.js |
 |---|---:|---:|---:|---:|---:|
-| 1 × 1 | 41,743 | 26,438 | 27,561 | 1.58 | 1.51 |
-| 1 × 10 | 130,491 | 52,356 | 79,315 | 2.49 | 1.65 |
-| 1 × 100 | 138,797 | 52,210 | 106,097 | 2.66 | 1.31 |
-| 10 × 10 | 228,470 | 51,964 | 92,054 | 4.40 | 2.48 |
+| 1 × 1 | 42,712 | 26,566 | 27,739 | 1.61 | 1.54 |
+| 1 × 10 | 124,851 | 52,792 | 77,991 | 2.36 | 1.60 |
+| 1 × 100 | 128,775 | 52,483 | 105,812 | 2.45 | 1.22 |
+| 10 × 10 | 317,074 | 52,278 | 89,478 | 6.07 | 3.54 |
 
 Latency and server RSS at 10 × 10 (100 concurrent streams):
 
 | at 10 × 10 | Lexell | Go | Node.js |
 |---|---:|---:|---:|
-| `h2c` latency p50 / p99 | 344 µs / 816 µs | 1,857 µs / 2,993 µs | 656 µs / 6,445 µs |
-| `tls` latency p50 / p99 | 418 µs / 846 µs | 1,896 µs / 3,035 µs | 889 µs / 6,185 µs |
-| `h2c` / `tls` server RSS | 6.8 MB / 12.4 MB | 16.4 MB / 17.1 MB | 158 MB / 162 MB |
+| `h2c` latency p50 / p99 | 254 µs / 701 µs | 1,808 µs / 2,880 µs | 679 µs / 6,497 µs |
+| `tls` latency p50 / p99 | 302 µs / 688 µs | 1,885 µs / 2,979 µs | 920 µs / 6,329 µs |
+| `h2c` / `tls` server RSS | 6.9 MB / 12.6 MB | 16.3 MB / 17.1 MB | 161 MB / 160 MB |
 
 ## Commands
 
