@@ -1,0 +1,230 @@
+// bench_waiters: measures N concurrent HTTP/2 (h2c) SSE waiters against tradetape + LexDB.
+// Usage: bench_waiters BASE_URL N_WAITERS N_TRADES MODE
+//   MODE = "all"     (all N waiters listen on /api/stream; every trade wakes all N)
+//   MODE = "sharded" (N waiters split across 20 symbols SYM00..SYM19; trades target SYM00)
+
+import "http"
+import "io"
+import "task"
+import "time"
+import "os"
+import "strings"
+import "collections"
+
+type SseReader = record {
+    resp: http.Response
+    buf: str
+}
+
+fn (sr: mut &SseReader) nextEvent(): Result[str, str] {
+    var chunk = array(4096, byte(0))
+    while true {
+        let sep = strings.indexOf(&sr.buf, "\n\n", 0)
+        if sep >= 0 {
+            let block = strSlice(&sr.buf, 0, sep)
+            sr.buf = strSlice(&sr.buf, sep + 2, len(sr.buf))
+            var name = "message"
+            var data = ""
+            for line in strings.splitByte(&block, '\n') {
+                let t = strings.trimRight(&line)
+                if len(t) == 0 || strings.startsWith(&t, ":") { continue }
+                if strings.startsWith(&t, "event: ") { name = strSlice(&t, 7, len(t)) }
+                else if strings.startsWith(&t, "data: ") { data = strSlice(&t, 6, len(t)) }
+            }
+            if len(data) > 0 || name != "message" {
+                return Ok(name + "|" + data)
+            }
+            continue
+        }
+        let n = match sr.resp.read(mut &chunk) {
+            Ok(k) { k }
+            Err(e) { return Err(e.toStr()) }
+        }
+        if n == 0 { return Err("eof") }
+        sr.buf += strFromBytes(&chunk[0..n])
+    }
+    return Err("unreachable")
+}
+
+type WaiterJob = record {
+    client: http.Client
+    url: str
+    want: int
+    readyCount: task.Shared[int]
+    sendTimes: task.Shared[[]int]
+}
+
+type WaiterOut = record {
+    latUs: []int
+    err: str
+}
+
+fn waiterTask(j: WaiterJob): WaiterOut {
+    let WaiterJob{client: c, url: url, want: want, readyCount: rc, sendTimes: st} = move(j)
+    match c.get(&url) {
+        Err(e) {
+            rc.with(fn(n: mut &int) { n += 1 })
+            return WaiterOut{latUs: [], err: "connect: " + e.toStr()}
+        }
+        Ok(resp) {
+            var sr = SseReader{resp: resp, buf: ""}
+            match sr.nextEvent() {
+                Ok(ev) {
+                    if !strings.startsWith(&ev, "ready|") {
+                        rc.with(fn(n: mut &int) { n += 1 })
+                        return WaiterOut{latUs: [], err: "bad ready: " + ev}
+                    }
+                }
+                Err(e) {
+                    rc.with(fn(n: mut &int) { n += 1 })
+                    return WaiterOut{latUs: [], err: "ready: " + e}
+                }
+            }
+            rc.with(fn(n: mut &int) { n += 1 })
+
+            var lats: []int = []
+            if want == 0 {
+                while !task.cancelled() {
+                    match sr.nextEvent() {
+                        Ok(_) {}
+                        Err(_) { break }
+                    }
+                }
+                return WaiterOut{latUs: lats, err: ""}
+            }
+
+            var idx = 0
+            while idx < want {
+                match sr.nextEvent() {
+                    Ok(ev) {
+                        if strings.startsWith(&ev, "trade|") {
+                            let now = time.monotonicNs()
+                            var tSend = 0
+                            st.with(fn(ts: mut &[]int) {
+                                if idx < len(ts) { tSend = ts[idx] }
+                            })
+                            if tSend > 0 {
+                                append(mut &lats, (now - tSend) / 1000)
+                            }
+                            idx += 1
+                        }
+                    }
+                    Err(e) {
+                        return WaiterOut{latUs: lats, err: "trade: " + e}
+                    }
+                }
+            }
+            return WaiterOut{latUs: lats, err: ""}
+        }
+    }
+}
+
+fn pct(sorted: &[]int, p: int): int {
+    if len(sorted) == 0 { return 0 }
+    var i = (len(sorted) * p) / 100
+    if i >= len(sorted) { i = len(sorted) - 1 }
+    return sorted[i]
+}
+
+fn main() {
+    let args = os.arguments()
+    if len(args) < 4 {
+        eprintln("usage: bench_waiters BASE N_WAITERS N_TRADES MODE")
+        os.quit(2)
+    }
+    let base = args[0].clone()
+    let nWaiters = strings.parseIntOpt(&args[1]).unwrapOr(100)
+    let nTrades = strings.parseIntOpt(&args[2]).unwrapOr(5)
+    let mode = args[3].clone()
+
+    let nClients = (nWaiters + 49) / 50
+    var clients: []http.Client = []
+    for ci in 0..nClients {
+        var o = http.defaults()
+        o.h2c = true
+        o.timeoutMs = 30000
+        o.maxPerHost = 4
+        append(mut &clients, http.newClient(o))
+    }
+
+    var oPost = http.defaults()
+    oPost.h2c = true
+    oPost.timeoutMs = 15000
+    let cPost = http.newClient(oPost)
+
+    let readyCount = task.shared(0)
+    let initTs: []int = []
+    let sendTimes = task.shared(initTs)
+
+    task.scope(fn(s: mut &task.Scope) {
+        var activeFuts: []task.Future[WaiterOut] = []
+        var bgFuts: []task.Future[WaiterOut] = []
+        let tConn0 = time.monotonicNs()
+
+        for i in 0..nWaiters {
+            let cli = clients[i % nClients].share()
+            if mode == "sharded" {
+                let shard = i % 20
+                let sym = if shard < 10 { $"SYM0{shard}" } else { $"SYM{shard}" }
+                let u = $"{base}/api/stream?symbol={sym}"
+                let want = if shard == 0 { nTrades } else { 0 }
+                let f = s.start(waiterTask, WaiterJob{
+                    client: cli, url: u, want: want,
+                    readyCount: readyCount.share(), sendTimes: sendTimes.share()
+                })
+                if shard == 0 { append(mut &activeFuts, f) } else { append(mut &bgFuts, f) }
+            } else {
+                let u = $"{base}/api/stream"
+                let f = s.start(waiterTask, WaiterJob{
+                    client: cli, url: u, want: nTrades,
+                    readyCount: readyCount.share(), sendTimes: sendTimes.share()
+                })
+                append(mut &activeFuts, f)
+            }
+            if i % 50 == 49 { let _y = task.yield() }
+        }
+
+        while true {
+            var cur = 0
+            readyCount.with(fn(n: mut &int) { cur = n })
+            if cur >= nWaiters { break }
+            let _sl = task.sleep(10)
+        }
+        let connMs = (time.monotonicNs() - tConn0) / 1000000
+        println($"READY n={nWaiters} mode={mode} connectMs={connMs}")
+        let _fl1 = io.flushStdout()
+
+        let _idle = task.sleep(1000)
+        println("IDLE_DONE")
+        let _fl2 = io.flushStdout()
+
+        var postLatsUs: []int = []
+        let tBurst0 = time.monotonicNs()
+        for k in 0..nTrades {
+            let tSend = time.monotonicNs()
+            sendTimes.with(fn(ts: mut &[]int) { append(ts, tSend) })
+            let body = $"{{\"symbol\":\"SYM00\",\"side\":\"BUY\",\"price\":\"1.0845\",\"qty\":1000,\"note\":\"w{k}\"}}"
+            let r = cPost.post($"{base}/api/trades", "application/json", &body).unwrap()
+            let _txt = r.text().unwrap()
+            let tDone = time.monotonicNs()
+            append(mut &postLatsUs, (tDone - tSend) / 1000)
+            let _gap = task.sleep(150)
+        }
+
+        var allLats: []int = []
+        var errs = 0
+        while len(activeFuts) > 0 {
+            let out = pop(mut &activeFuts).wait().unwrap()
+            if len(out.err) > 0 { errs += 1 }
+            for x in out.latUs { append(mut &allLats, x) }
+        }
+        let burstMs = (time.monotonicNs() - tBurst0) / 1000000
+
+        collections.sort(mut &allLats)
+        collections.sort(mut &postLatsUs)
+        println($"RESULT n={nWaiters} mode={mode} trades={nTrades} deliveries={len(allLats)} errs={errs} burstMs={burstMs} post_p50_us={pct(&postLatsUs, 50)} post_max_us={pct(&postLatsUs, 100)} wake_p50_us={pct(&allLats, 50)} wake_p95_us={pct(&allLats, 95)} wake_p99_us={pct(&allLats, 99)} wake_max_us={pct(&allLats, 100)}")
+        let _fl3 = io.flushStdout()
+
+        while len(bgFuts) > 0 { let _drop = pop(mut &bgFuts) }
+    })
+}
