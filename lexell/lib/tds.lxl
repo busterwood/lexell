@@ -1335,15 +1335,45 @@ pub type BulkOptions = value record {
     pub keepNulls: bool             // KEEP_NULLS: else a NULL goes in as the column's DEFAULT, if it has one
 }
 
-// The checked name of a table: one to three regular identifiers (a
-// #temporary table's name too).
+// The checked name of a table: one to three identifiers separated by '.',
+// each either a regular identifier (including a #temporary table) or a
+// bracket-delimited identifier ([...], with ]] for a literal ]).
 pub fn validTableName(t: &str): bool {
-    let parts = strings.split(t, ".")
-    if len(parts) > 3 { return false }
-    for p in parts {
-        if !validIdentifier(&p) { return false }
+    let n = len(t)
+    if n == 0 { return false }
+    var i = 0
+    var parts = 0
+    while true {
+        if parts >= 3 || i >= n { return false }
+        parts += 1
+        if t[i] == '[' {
+            i += 1
+            var inner = ""
+            var ended = false
+            while i < n {
+                if t[i] == ']' {
+                    if i + 1 < n && t[i + 1] == ']' {
+                        inner.addByte(']')
+                        i += 2
+                        continue
+                    }
+                    i += 1
+                    ended = true
+                    break
+                }
+                inner.addByte(t[i])
+                i += 1
+            }
+            if !ended || len(inner) == 0 || utf16Units(&inner) > 128 || toUtf16(&inner).isErr() { return false }
+        } else {
+            let start = i
+            while i < n && t[i] != '.' { i += 1 }
+            if !validIdentifier(&(t[start..i].toStr())) { return false }
+        }
+        if i == n { return true }
+        if t[i] != '.' { return false }
+        i += 1
     }
-    return true
 }
 
 // The query whose COLMETADATA describes a bulk load's destination columns
@@ -1438,7 +1468,8 @@ pub fn bulkWriter(table: &str, dest: &[Column], first: &[[]sqldialect.Value], op
     decl += &("INSERT BULK " + table + " (")
     for i in 0..n {
         let t = dest[i].tdsType
-        cols[i].long = dest[i].size < 0 || t == T_XML
+        cols[i].long = dest[i].size < 0 || t == T_XML || t == T_TEXT || t == T_NTEXT || t == T_IMAGE ||
+            ((t == T_BIGVARCHR || t == T_BIGCHAR) && dest[i].size > 4000)
         if cols[i].kind == ColKind.Unknown {
             cols[i].kind = if intType(t) { ColKind.Int } else if t == T_BITN || t == T_BIT { ColKind.Bool }
                 else if t == T_FLTN || t == T_FLT4 || t == T_FLT8 { ColKind.Float }

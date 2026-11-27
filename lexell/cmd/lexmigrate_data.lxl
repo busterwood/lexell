@@ -1,0 +1,539 @@
+// lexmigrate_data: streaming TDS table reader, compact binary LXRD row dump
+// codec (with optional streaming zstd compression), TDS bulk loader, and
+// row-count verification.
+//
+// Memory usage is O(batchSize) regardless of table size for both direct
+// streaming migration (source TDS -> target LexDB TDS) and dump/restore.
+
+import "sqlserver"
+import "sqlrows"
+import "sqldialect"
+import "strings"
+import "io"
+import "binary"
+import "math"
+import "zstd"
+import "./lexmigrate_mssql"
+
+type V = sqlserver.Value
+
+const LXRD_MAGIC: str = "LXRD"
+const LXRD_VERSION: int = 1
+
+const TAG_NULL: byte = 0
+const TAG_INT: byte = 1
+const TAG_FLOAT: byte = 2
+const TAG_BOOL: byte = 3
+const TAG_TEXT: byte = 4
+const TAG_BYTES: byte = 5
+const TAG_DEC: byte = 6
+
+const FRAME_EOF: byte = 0
+const FRAME_ROW: byte = 1
+
+// ---------------------------------------------------------------- column binding for streaming
+
+type StreamBind = record {
+    kinds: []sqlrows.Kind
+}
+
+fn hasKind(bits: int, k: sqlrows.Kind): bool {
+    return (bits & k.bit()) != 0
+}
+
+fn pickKind(c: &sqlrows.Column): Result[sqlrows.Kind, sqlrows.Error] {
+    let bits = c.kinds
+    if hasKind(bits, sqlrows.Kind.Bool) { return Ok(sqlrows.Kind.Bool) }
+    if hasKind(bits, sqlrows.Kind.Int) { return Ok(sqlrows.Kind.Int) }
+    if hasKind(bits, sqlrows.Kind.Decimal) { return Ok(sqlrows.Kind.Decimal) }
+    if hasKind(bits, sqlrows.Kind.Float) { return Ok(sqlrows.Kind.Float) }
+    if hasKind(bits, sqlrows.Kind.Bytes) { return Ok(sqlrows.Kind.Bytes) }
+    if hasKind(bits, sqlrows.Kind.Date) { return Ok(sqlrows.Kind.Date) }
+    if hasKind(bits, sqlrows.Kind.Time) { return Ok(sqlrows.Kind.Time) }
+    if hasKind(bits, sqlrows.Kind.DateTime) { return Ok(sqlrows.Kind.DateTime) }
+    if hasKind(bits, sqlrows.Kind.OffsetDateTime) { return Ok(sqlrows.Kind.OffsetDateTime) }
+    if hasKind(bits, sqlrows.Kind.Text) { return Ok(sqlrows.Kind.Text) }
+    return Err(sqldialect.dbError(sqldialect.E_TYPE, &("column " + c.name + " (" + c.typeName + ") cannot be streamed")))
+}
+
+fn bindRowCols(cols: &sqlrows.Columns): Result[StreamBind, sqlrows.Error] {
+    var kinds: []sqlrows.Kind = []
+    for i in 0..cols.count() {
+        let col = try cols.get(i)
+        append(mut &kinds, try pickKind(&col))
+    }
+    return Ok(StreamBind{kinds: kinds})
+}
+
+fn readRowVals(b: &StreamBind, rv: &sqlrows.RowView): Result[[]V, sqlrows.Error] {
+    var row: []V = []
+    for i in 0..len(b.kinds) {
+        if try rv.isNull(i) {
+            append(mut &row, V.Null)
+            continue
+        }
+        match b.kinds[i] {
+            sqlrows.Kind.Bool { append(mut &row, V.Bool(try rv.bool(i))) }
+            sqlrows.Kind.Int { append(mut &row, V.Int(try rv.int(i))) }
+            sqlrows.Kind.Decimal { append(mut &row, V.Dec(try rv.decimal(i))) }
+            sqlrows.Kind.Float { append(mut &row, V.Float(try rv.float(i))) }
+            sqlrows.Kind.Bytes { append(mut &row, V.Bytes(try rv.bytes(i))) }
+            sqlrows.Kind.Date { append(mut &row, V.Text((try rv.date(i)).toStr())) }
+            sqlrows.Kind.Time { append(mut &row, V.Text((try rv.timeOfDay(i)).toStr())) }
+            sqlrows.Kind.DateTime { append(mut &row, V.Text((try rv.localDateTime(i)).toStr())) }
+            sqlrows.Kind.OffsetDateTime { append(mut &row, V.Text((try rv.offsetDateTime(i)).toStr())) }
+            sqlrows.Kind.Text { append(mut &row, V.Text(try rv.text(i))) }
+        }
+    }
+    return Ok(row)
+}
+
+// Non-computed, supported columns to copy for a table.
+pub fn copyableCols(t: &lexmigrate_mssql.TableInfo): []str {
+    var cols: []str = []
+    for i in 0..len(t.cols) {
+        if t.cols[i].isComputed || t.cols[i].unsupported { continue }
+        append(mut &cols, t.cols[i].name.clone())
+    }
+    return cols
+}
+
+fn buildSelectSql(t: &lexmigrate_mssql.TableInfo, cols: &[]str): str {
+    var parts: []str = []
+    for c in cols { append(mut &parts, lexmigrate_mssql.quoteIdent(&c)) }
+    return "SELECT " + strings.join(&parts, ", ") + " FROM " + lexmigrate_mssql.qualName(&t.schemaName, &t.name)
+}
+
+fn bulkOpts(): sqlserver.BulkOptions {
+    var opts = sqlserver.bulkOptions()
+    opts.keepNulls = true
+    return opts
+}
+
+// ---------------------------------------------------------------- direct live streaming
+
+// Streams rows directly from src into dst using TDS bulk copy (INSERT BULK),
+// holding at most batchSize rows in memory at once.
+pub fn streamTableDirect(src: mut &sqlserver.Conn, dst: mut &sqlserver.Conn,
+                         t: &lexmigrate_mssql.TableInfo, batchSize: int): Result[int, str] {
+    let cols = copyableCols(t)
+    if len(cols) == 0 { return Ok(0) }
+    let qual = lexmigrate_mssql.qualName(&t.schemaName, &t.name)
+    let selSql = buildSelectSql(t, &cols)
+    let bsz = max(batchSize, 1)
+
+    var stream = match src.stream(&selSql, [], bindRowCols, readRowVals) {
+        Ok(s) { s }
+        Err(e) { return Err("select " + qual + ": " + e.toStr()) }
+    }
+
+    var buf: [][]V = []
+    for _ in 0..bsz { append(mut &buf, []) }
+
+    let opts = bulkOpts()
+    let loaded = dst.bulkStream(&qual, &cols, &opts, fn(): Result[[][]V, sqlserver.Error] {
+        let n = try stream.fill(mut &buf)
+        if n == 0 { return Ok([]) }
+        var out: [][]V = []
+        for i in 0..n { append(mut &out, replace(mut &buf[i], [])) }
+        return Ok(out)
+    })
+
+    let closeRes = stream.close()
+    match loaded {
+        Ok(n) {
+            match closeRes {
+                Ok(_) { return Ok(n) }
+                Err(e) { return Err("close stream " + qual + ": " + e.toStr()) }
+            }
+        }
+        Err(e) { return Err("bulk load " + qual + ": " + e.toStr()) }
+    }
+}
+
+// ---------------------------------------------------------------- binary LXRD dump format
+
+fn encodeHeader(cols: &[]str): []byte {
+    var b: []byte = []
+    appendStr(mut &b, &LXRD_MAGIC)
+    binary.appendU16LE(mut &b, LXRD_VERSION)
+    binary.appendU16LE(mut &b, len(cols))
+    for c in cols {
+        binary.appendU16LE(mut &b, len(c))
+        appendStr(mut &b, &c)
+    }
+    return b
+}
+
+fn encodeRow(b: mut &[]byte, row: &[]V) {
+    append(b, FRAME_ROW)
+    for v in row {
+        match v {
+            V.Null { append(b, TAG_NULL) }
+            V.Int(n) {
+                append(b, TAG_INT)
+                binary.appendU64LE(b, n)
+            }
+            V.Float(f) {
+                append(b, TAG_FLOAT)
+                binary.appendU64LE(b, math.bitsOf(f))
+            }
+            V.Bool(x) {
+                append(b, TAG_BOOL)
+                append(b, if x { byte(1) } else { byte(0) })
+            }
+            V.Text(s) {
+                append(b, TAG_TEXT)
+                binary.appendU32LE(b, len(s))
+                appendStr(b, &s)
+            }
+            V.Bytes(x) {
+                append(b, TAG_BYTES)
+                binary.appendU32LE(b, len(x))
+                appendStr(b, &x)
+            }
+            V.Dec(d) {
+                append(b, TAG_DEC)
+                let ds = d.toStr()
+                binary.appendU16LE(b, len(ds))
+                appendStr(b, &ds)
+            }
+        }
+    }
+}
+
+fn writeChunk(w: mut &io.Writer, comp: mut &[]zstd.Compressor, data: &[byte]): Result[Unit, str] {
+    if len(data) == 0 { return Ok(Unit{}) }
+    if len(comp) > 0 {
+        let s = strFromBytes(data)
+        let enc = match comp[0].write(&s) {
+            Ok(x) { x }
+            Err(e) { return Err("zstd write: " + e.toStr()) }
+        }
+        if len(enc) > 0 { w.write(&enc) }
+    } else {
+        match w.writeBytes(data) {
+            Ok(_) {}
+            Err(e) { return Err("write: " + e.toStr()) }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// Streams table rows from src into an LXRD (optionally zstd-compressed) file.
+pub fn dumpTableToFile(src: mut &sqlserver.Conn, t: &lexmigrate_mssql.TableInfo,
+                       path: &str, compress: bool, batchSize: int): Result[int, str] {
+    let cols = copyableCols(t)
+    let qual = lexmigrate_mssql.qualName(&t.schemaName, &t.name)
+    let bsz = max(batchSize, 1)
+
+    var w = match io.create(path) {
+        Ok(x) { x }
+        Err(e) { return Err("create " + path + ": " + e.toStr()) }
+    }
+    var comp: []zstd.Compressor = []
+    if compress {
+        var c = match zstd.newCompressor(3) {
+            Ok(x) { x }
+            Err(e) { return Err("zstd init: " + e.toStr()) }
+        }
+        let _ = c.setChecksum(true)
+        append(mut &comp, c)
+    }
+
+    let hdr = encodeHeader(&cols)
+    try writeChunk(mut &w, mut &comp, &hdr)
+
+    var total = 0
+    if len(cols) > 0 {
+        let selSql = buildSelectSql(t, &cols)
+        var stream = match src.stream(&selSql, [], bindRowCols, readRowVals) {
+            Ok(s) { s }
+            Err(e) { return Err("select " + qual + ": " + e.toStr()) }
+        }
+        var buf: [][]V = []
+        for _ in 0..bsz { append(mut &buf, []) }
+        while true {
+            var n = 0
+            match stream.fill(mut &buf) {
+                Ok(k) { n = k }
+                Err(e) {
+                    let _ = stream.close()
+                    return Err("read " + qual + ": " + e.toStr())
+                }
+            }
+            if n == 0 { break }
+            var chunk: []byte = []
+            for i in 0..n {
+                encodeRow(mut &chunk, &buf[i])
+                buf[i] = []
+            }
+            try writeChunk(mut &w, mut &comp, &chunk)
+            total += n
+        }
+        match stream.close() {
+            Ok(_) {}
+            Err(e) { return Err("close stream " + qual + ": " + e.toStr()) }
+        }
+    }
+
+    let eofMarker: []byte = [FRAME_EOF]
+    try writeChunk(mut &w, mut &comp, &eofMarker)
+
+    if len(comp) > 0 {
+        let tail = match comp[0].finish() {
+            Ok(x) { x }
+            Err(e) { return Err("zstd finish: " + e.toStr()) }
+        }
+        if len(tail) > 0 { w.write(&tail) }
+    }
+    match w.close() {
+        Ok(_) { return Ok(total) }
+        Err(e) { return Err("close " + path + ": " + e.toStr()) }
+    }
+}
+
+// ---------------------------------------------------------------- streaming LXRD reader -> TDS bulkStream
+
+type BinReader = record {
+    rd: io.Reader
+    dec: []zstd.Decompressor
+    inBuf: []byte
+    buf: []byte
+    pos: int
+    eof: bool
+}
+
+fn openBinReader(path: &str, compressed: bool): Result[BinReader, str] {
+    let rd = match io.open(path) {
+        Ok(x) { x }
+        Err(e) { return Err("open " + path + ": " + e.toStr()) }
+    }
+    var dec: []zstd.Decompressor = []
+    if compressed {
+        var d = match zstd.newDecompressor() {
+            Ok(x) { x }
+            Err(e) { return Err("zstd init: " + e.toStr()) }
+        }
+        d.setMaxOut(-1)
+        append(mut &dec, d)
+    }
+    return Ok(BinReader{rd: rd, dec: dec, inBuf: array(65536, byte(0)), buf: [], pos: 0, eof: false})
+}
+
+fn (br: mut &BinReader) compact() {
+    if br.pos == 0 { return }
+    let rem = len(br.buf) - br.pos
+    if rem == 0 {
+        br.buf = []
+        br.pos = 0
+        return
+    }
+    if br.pos >= 32768 {
+        var nb = array(rem, byte(0))
+        for i in 0..rem { nb[i] = br.buf[br.pos + i] }
+        br.buf = nb
+        br.pos = 0
+    }
+}
+
+fn (br: mut &BinReader) ensure(want: int): Result[bool, str] {
+    while len(br.buf) - br.pos < want {
+        if br.eof { return Ok(false) }
+        br.compact()
+        let k = match br.rd.read(mut &br.inBuf) {
+            Ok(n) { n }
+            Err(e) { return Err("read data file: " + e.toStr()) }
+        }
+        if k == 0 {
+            br.eof = true
+            if len(br.dec) > 0 {
+                match br.dec[0].finish() {
+                    Ok(_) {}
+                    Err(e) { return Err("zstd finish: " + e.toStr()) }
+                }
+            }
+            return Ok(len(br.buf) - br.pos >= want)
+        }
+        if len(br.dec) > 0 {
+            let raw = strFromBytes(&br.inBuf[0..k])
+            let out = match br.dec[0].write(&raw) {
+                Ok(s) { s }
+                Err(e) { return Err("zstd decompress: " + e.toStr()) }
+            }
+            if len(out) > 0 { appendStr(mut &br.buf, &out) }
+        } else {
+            for i in 0..k { append(mut &br.buf, br.inBuf[i]) }
+        }
+    }
+    return Ok(true)
+}
+
+fn (br: mut &BinReader) readByte(): Result[byte, str] {
+    if !(try br.ensure(1)) { return Err("unexpected EOF in LXRD file") }
+    let b = br.buf[br.pos]
+    br.pos += 1
+    return Ok(b)
+}
+
+fn (br: mut &BinReader) readU16(): Result[int, str] {
+    if !(try br.ensure(2)) { return Err("unexpected EOF reading u16") }
+    let v = binary.readU16LE(&br.buf, br.pos)
+    br.pos += 2
+    return Ok(v)
+}
+
+fn (br: mut &BinReader) readU32(): Result[int, str] {
+    if !(try br.ensure(4)) { return Err("unexpected EOF reading u32") }
+    let v = binary.readU32LE(&br.buf, br.pos)
+    br.pos += 4
+    return Ok(v)
+}
+
+fn (br: mut &BinReader) readI64(): Result[int, str] {
+    if !(try br.ensure(8)) { return Err("unexpected EOF reading i64") }
+    let v = binary.readI64LE(&br.buf, br.pos)
+    br.pos += 8
+    return Ok(v)
+}
+
+fn (br: mut &BinReader) readStr(n: int): Result[str, str] {
+    if n == 0 { return Ok("") }
+    if n < 0 { return Err("negative length in LXRD file") }
+    if !(try br.ensure(n)) { return Err("unexpected EOF reading " + n.toStr() + " bytes") }
+    let s = strFromBytes(&br.buf[br.pos..br.pos + n])
+    br.pos += n
+    return Ok(s)
+}
+
+fn readLxrdHeader(br: mut &BinReader): Result[[]str, str] {
+    let magic = try br.readStr(4)
+    if magic != LXRD_MAGIC { return Err("invalid LXRD magic") }
+    let ver = try br.readU16()
+    if ver != LXRD_VERSION { return Err("unsupported LXRD version " + ver.toStr()) }
+    let ncols = try br.readU16()
+    var cols: []str = []
+    for _ in 0..ncols {
+        let nlen = try br.readU16()
+        append(mut &cols, try br.readStr(nlen))
+    }
+    return Ok(cols)
+}
+
+fn readLxrdRow(br: mut &BinReader, ncols: int): Result[Option[[]V], str] {
+    let ft = try br.readByte()
+    if ft == FRAME_EOF { return Ok(None) }
+    if ft != FRAME_ROW { return Err("corrupt LXRD frame tag " + int(ft).toStr()) }
+    var row: []V = []
+    for _ in 0..ncols {
+        let tag = try br.readByte()
+        if tag == TAG_NULL {
+            append(mut &row, V.Null)
+        } else if tag == TAG_INT {
+            append(mut &row, V.Int(try br.readI64()))
+        } else if tag == TAG_FLOAT {
+            append(mut &row, V.Float(math.fromBits(try br.readI64())))
+        } else if tag == TAG_BOOL {
+            let bv = try br.readByte()
+            append(mut &row, V.Bool(bv != 0))
+        } else if tag == TAG_TEXT {
+            let n = try br.readU32()
+            append(mut &row, V.Text(try br.readStr(n)))
+        } else if tag == TAG_BYTES {
+            let n = try br.readU32()
+            append(mut &row, V.Bytes(try br.readStr(n)))
+        } else if tag == TAG_DEC {
+            let n = try br.readU16()
+            let s = try br.readStr(n)
+            let d = match Decimal.parse(&s) {
+                Ok(x) { x }
+                Err(_) { return Err("invalid decimal in LXRD: " + s) }
+            }
+            append(mut &row, V.Dec(d))
+        } else {
+            return Err("unknown LXRD value tag " + int(tag).toStr())
+        }
+    }
+    return Ok(Some(row))
+}
+
+// Restores an LXRD[.zst] file into dst using streaming TDS bulk copy.
+pub fn restoreTableFromFile(dst: mut &sqlserver.Conn, qualTable: &str, path: &str,
+                            compressed: bool, batchSize: int): Result[int, str] {
+    var br = try openBinReader(path, compressed)
+    let cols = try readLxrdHeader(mut &br)
+    if len(cols) == 0 {
+        let _ = br.rd.close()
+        return Ok(0)
+    }
+    let bsz = max(batchSize, 1)
+    var done = false
+    let opts = bulkOpts()
+    let loaded = dst.bulkStream(qualTable, &cols, &opts, fn(): Result[[][]V, sqlserver.Error] {
+        if done { return Ok([]) }
+        var batch: [][]V = []
+        for _ in 0..bsz {
+            match readLxrdRow(mut &br, len(cols)) {
+                Ok(opt) {
+                    match opt {
+                        Some(row) { append(mut &batch, row) }
+                        None {
+                            done = true
+                            break
+                        }
+                    }
+                }
+                Err(msg) { return Err(sqldialect.inputError(&msg)) }
+            }
+        }
+        return Ok(batch)
+    })
+    let _ = br.rd.close()
+    match loaded {
+        Ok(n) { return Ok(n) }
+        Err(e) { return Err("restore " + qualTable + ": " + e.toStr()) }
+    }
+}
+
+// ---------------------------------------------------------------- verification
+
+pub type VerifyResult = value record {
+    pub table: str
+    pub expected: int
+    pub actual: int
+    pub ok: bool
+}
+
+fn countTable(c: mut &sqlserver.Conn, qualTable: &str): Result[int, str] {
+    let r = match c.query(&("SELECT COUNT(*) FROM " + qualTable), &[]) {
+        Ok(x) { x }
+        Err(e) { return Err("count " + qualTable + ": " + e.toStr()) }
+    }
+    if r.rowCount() == 0 { return Ok(0) }
+    match r.int(0, 0) {
+        Ok(n) { return Ok(n) }
+        Err(e) { return Err("count " + qualTable + ": " + e.toStr()) }
+    }
+}
+
+pub fn verifyDirect(src: mut &sqlserver.Conn, dst: mut &sqlserver.Conn,
+                    tables: &[]lexmigrate_mssql.TableInfo): Result[[]VerifyResult, str] {
+    var out: []VerifyResult = []
+    for i in 0..len(tables) {
+        let q = lexmigrate_mssql.qualName(&tables[i].schemaName, &tables[i].name)
+        let exp = try countTable(src, &q)
+        let act = try countTable(dst, &q)
+        append(mut &out, VerifyResult{table: q, expected: exp, actual: act, ok: exp == act})
+    }
+    return Ok(out)
+}
+
+pub fn verifyEntries(dst: mut &sqlserver.Conn, entries: &[]lexmigrate_mssql.TableDumpEntry): Result[[]VerifyResult, str] {
+    var out: []VerifyResult = []
+    for e in entries {
+        let q = lexmigrate_mssql.qualName(&e.schemaName, &e.tableName)
+        let act = try countTable(dst, &q)
+        append(mut &out, VerifyResult{table: q, expected: e.rows, actual: act, ok: e.rows == act})
+    }
+    return Ok(out)
+}

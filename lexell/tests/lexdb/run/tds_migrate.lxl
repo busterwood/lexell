@@ -1,0 +1,320 @@
+// lexmigrate end-to-end test over LexDB's TDS door: exercises schema
+// extraction, T-SQL DDL emission, direct streaming migration (stream ->
+// bulkStream), zstd-compressed and uncompressed LXRD dump + restore,
+// manifest JSON round-trip, filtering, and row-count verification across
+// SQL Server types, collations, IDENTITY, defaults + KEEP_NULLS, computed
+// columns, bracketed names with spaces, filtered/INCLUDE indexes, disabled
+// CHECK constraints, self-referencing/cascading FKs, sequences, table types,
+// nested views, indexed views, and T-SQL functions/procedures.
+// timeout: 60
+// expect: direct ok: rows 1510 verify 6/6
+// expect: direct checks ok
+// expect: dump+restore zstd ok: rows 1510 verify 6/6
+// expect: restore zstd checks ok
+// expect: dump+restore raw ok: rows 1510 verify 6/6
+// expect: restore raw checks ok
+// expect: filter table ok: tables 1 schemas 0 seqs 0
+import "os"
+import "fs"
+import "io"
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+import "../../../cmd/lexmigrate_mssql"
+import "../../../cmd/lexmigrate_data"
+
+fn mustExec(c: mut &sqlserver.Conn, sql: &str) {
+    c.exec(sql).unwrap()
+}
+
+fn q1(c: mut &sqlserver.Conn, sql: &str): str {
+    let r = c.query(sql, &[]).unwrap()
+    var lines: []str = []
+    for row in 0..r.rowCount() {
+        var cols: []str = []
+        for col in 0..r.columnCount() {
+            if r.isNull(row, col).unwrap() {
+                append(mut &cols, "NULL")
+            } else {
+                match r.text(row, col) {
+                    Ok(t) { append(mut &cols, t) }
+                    Err(_) { append(mut &cols, hexOf(&(r.bytes(row, col).unwrap()))) }
+                }
+            }
+        }
+        append(mut &lines, strings.join(&cols, "|"))
+    }
+    return strings.join(&lines, "\n")
+}
+
+fn hexOf(s: &str): str {
+    let hx = "0123456789abcdef"
+    var out = ""
+    for i in 0..len(s) {
+        let b = int(s[i])
+        out.addByte(hx[(b >> 4) & 0xf])
+        out.addByte(hx[b & 0xf])
+    }
+    return out
+}
+
+fn assertEq(name: &str, got: &str, want: &str) {
+    if got != want {
+        println("FAIL " + name + ": got=[" + got + "] want=[" + want + "]")
+        exit(1)
+    }
+}
+
+fn populate(c: mut &sqlserver.Conn) {
+    mustExec(c, "CREATE SCHEMA sales;")
+    mustExec(c, "CREATE SEQUENCE sales.inv_seq AS bigint START WITH 1000 INCREMENT BY 10 MINVALUE 1000 MAXVALUE 999999 NO CYCLE CACHE 5;")
+    let _s1 = q1(c, "SELECT NEXT VALUE FOR sales.inv_seq")
+    let _s2 = q1(c, "SELECT NEXT VALUE FOR sales.inv_seq")
+    mustExec(c, "CREATE TYPE dbo.IdList AS TABLE (id int NOT NULL, tag nvarchar(40) NULL);")
+
+    mustExec(c,
+        "CREATE TABLE dbo.dept (" +
+        "  id int IDENTITY(100, 5) NOT NULL," +
+        "  code char(6) COLLATE Latin1_General_CS_AS NOT NULL," +
+        "  name nvarchar(50) NOT NULL," +
+        "  budget decimal(18, 4) NOT NULL CONSTRAINT DF_dept_budget DEFAULT ((0))," +
+        "  note nvarchar(100) NULL DEFAULT (N'def')," +
+        "  CONSTRAINT PK_dept PRIMARY KEY CLUSTERED (id ASC)" +
+        ");")
+    mustExec(c, "ALTER TABLE dbo.dept ADD CONSTRAINT UQ_dept_code UNIQUE NONCLUSTERED (code ASC);")
+    mustExec(c,
+        "SET IDENTITY_INSERT dbo.dept ON; " +
+        "INSERT INTO dbo.dept (id, code, name, budget, note) VALUES " +
+        "  (100, 'ENG001', N'Engineering', 1250.5000, NULL), " +
+        "  (105, 'SLS001', N'Sales', 850.2500, N''), " +
+        "  (120, 'eng001', N'EngLower', 50.0000, N'café 日本語 🚀'); " +
+        "SET IDENTITY_INSERT dbo.dept OFF;")
+
+    mustExec(c,
+        "CREATE TABLE dbo.emp (" +
+        "  id int NOT NULL PRIMARY KEY," +
+        "  dept_id int NOT NULL," +
+        "  mgr_id int NULL," +
+        "  full_name nvarchar(80) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL," +
+        "  salary money NOT NULL," +
+        "  qty int NOT NULL DEFAULT ((1))," +
+        "  unit_price decimal(10, 2) NOT NULL DEFAULT ((10.00))," +
+        "  line_total AS (qty * unit_price) PERSISTED," +
+        "  double_qty AS (qty * 2)," +
+        "  CONSTRAINT FK_emp_dept FOREIGN KEY (dept_id) REFERENCES dbo.dept (id) ON DELETE CASCADE," +
+        "  CONSTRAINT FK_emp_mgr FOREIGN KEY (mgr_id) REFERENCES dbo.emp (id)" +
+        ");")
+    mustExec(c, "ALTER TABLE dbo.emp ADD CONSTRAINT CK_emp_salary CHECK (salary >= 0);")
+    mustExec(c, "ALTER TABLE dbo.emp WITH NOCHECK ADD CONSTRAINT CK_emp_qty CHECK (qty > 0);")
+    mustExec(c, "ALTER TABLE dbo.emp NOCHECK CONSTRAINT CK_emp_qty;")
+    mustExec(c, "CREATE NONCLUSTERED INDEX IX_emp_dept ON dbo.emp (dept_id ASC, salary DESC) INCLUDE (full_name) WHERE (mgr_id IS NOT NULL);")
+    mustExec(c,
+        "INSERT INTO dbo.emp (id, dept_id, mgr_id, full_name, salary, qty, unit_price) VALUES " +
+        "  (1, 100, NULL, N'Alice', 180000.00, 3, 25.50), " +
+        "  (2, 100, 1,    N'Bob',   140000.00, 0, 12.00), " +
+        "  (3, 105, 1,    N'Carol', 120000.75, 4, 50.00);")
+
+    mustExec(c,
+        "CREATE TABLE dbo.all_types (" +
+        "  id int NOT NULL PRIMARY KEY," +
+        "  c_tiny tinyint NULL, c_small smallint NULL, c_big bigint NULL, c_bit bit NULL," +
+        "  c_real real NULL, c_flt float NULL, c_dec numeric(38, 6) NULL," +
+        "  c_vcmax varchar(max) NULL, c_bin binary(4) NULL, c_vbin varbinary(max) NULL," +
+        "  c_date date NULL, c_time time(4) NULL, c_dt2 datetime2(6) NULL, c_dto datetimeoffset(6) NULL," +
+        "  c_guid uniqueidentifier NULL, c_xml xml NULL" +
+        ");")
+    let bigTxt = strings.padLeft("", 5000, 'Z')
+    mustExec(c,
+        "INSERT INTO dbo.all_types VALUES (" +
+        "  1, 255, -32000, 9000000000000, 1, 1.5, 3.141592653589793, 123456789012345678901234567890.123456, " +
+        "  '" + bigTxt + "', 0x01020304, 0xDEADBEEF00, '2026-11-27', '13:45:07.1250', " +
+        "  '2026-11-27T13:45:07.123456', '2026-11-27T13:45:07.123456+02:00', " +
+        "  '12345678-1234-5678-9abc-def012345678', N'<root>ok</root>');")
+    mustExec(c, "INSERT INTO dbo.all_types (id) VALUES (2);")
+
+    mustExec(c, "CREATE TABLE [dbo].[Order Details] ([Order ID] int NOT NULL, [Product Name] nvarchar(40) NOT NULL, [Qty] int NOT NULL, CONSTRAINT [PK_Order Details] PRIMARY KEY ([Order ID], [Product Name]));")
+    mustExec(c, "INSERT INTO [dbo].[Order Details] VALUES (10, N'Widget', 5), (10, N'Gadget', 2);")
+
+    mustExec(c, "CREATE TABLE sales.empty_tbl (id int NOT NULL PRIMARY KEY, label nvarchar(20) NULL);")
+
+    mustExec(c, "CREATE TABLE sales.events (id int NOT NULL PRIMARY KEY, grp int NOT NULL, payload nvarchar(30) NOT NULL);")
+    var rows: [][]sqlserver.Value = []
+    for i in 1..1501 {
+        append(mut &rows, [sqlserver.Value.Int(i), sqlserver.Value.Int(i % 10), sqlserver.Value.Text("e-" + i.toStr())])
+    }
+    let opts = sqlserver.bulkOptions()
+    let n = c.bulkInsert("sales.events", &["id", "grp", "payload"], &rows, &opts).unwrap()
+    if n != 1500 { exit(1) }
+
+    mustExec(c, "CREATE VIEW dbo.v_z_base AS SELECT id, dept_id, full_name, salary FROM dbo.emp WHERE salary > 100000;")
+    mustExec(c, "CREATE VIEW dbo.v_a_top AS SELECT id, full_name FROM dbo.v_z_base WHERE salary >= 150000;")
+    mustExec(c, "CREATE VIEW sales.v_dept_sum WITH SCHEMABINDING AS SELECT dept_id, COUNT_BIG(*) AS cnt, SUM(salary) AS tot FROM dbo.emp GROUP BY dept_id;")
+    mustExec(c, "CREATE UNIQUE CLUSTERED INDEX IX_v_dept_sum ON sales.v_dept_sum (dept_id);")
+    mustExec(c, "CREATE FUNCTION dbo.fn_dbl(@x int) RETURNS int AS BEGIN RETURN @x * 2; END;")
+    mustExec(c, "CREATE PROCEDURE dbo.sp_dept_cnt @did int, @cnt int OUTPUT AS BEGIN SET NOCOUNT ON; SELECT @cnt = COUNT(*) FROM dbo.emp WHERE dept_id = @did; RETURN 9; END;")
+}
+
+fn verifyTarget(c: mut &sqlserver.Conn, tag: &str) {
+    assertEq("cs ENG001", &q1(c, "SELECT id FROM dbo.dept WHERE code = 'ENG001'"), "100")
+    assertEq("cs eng001", &q1(c, "SELECT id FROM dbo.dept WHERE code = 'eng001'"), "120")
+    assertEq("ci ALICE", &q1(c, "SELECT id FROM dbo.emp WHERE full_name = N'ALICE'"), "1")
+    assertEq("notes", &q1(c, "SELECT id, CASE WHEN note IS NULL THEN '<NULL>' WHEN note = N'' THEN '<EMPTY>' ELSE note END FROM dbo.dept ORDER BY id"),
+        "100|<NULL>\n105|<EMPTY>\n120|café 日本語 🚀")
+    mustExec(c, "INSERT INTO dbo.dept (code, name) VALUES ('NEW001', N'New');")
+    assertEq("ident+def", &q1(c, "SELECT id, budget, note FROM dbo.dept WHERE code = 'NEW001'"), "125|0.0000|def")
+    mustExec(c, "DELETE FROM dbo.dept WHERE code = 'NEW001';")
+    assertEq("computed", &q1(c, "SELECT id, line_total, double_qty FROM dbo.emp ORDER BY id"), "1|76.50|6\n2|0.00|0\n3|200.00|8")
+    assertEq("all_types", &q1(c, "SELECT c_tiny, c_small, c_big, c_bit, LEN(c_vcmax), c_dec, c_bin, c_vbin, c_date, c_guid FROM dbo.all_types WHERE id = 1"),
+        "255|-32000|9000000000000|1|5000|123456789012345678901234567890.123456|01020304|deadbeef00|2026-11-27|12345678-1234-5678-9ABC-DEF012345678")
+    assertEq("all_types null", &q1(c, "SELECT c_tiny, c_dec, c_vbin FROM dbo.all_types WHERE id = 2"), "NULL|NULL|NULL")
+    assertEq("order details", &q1(c, "SELECT [Order ID], [Product Name], [Qty] FROM [dbo].[Order Details] ORDER BY [Product Name]"), "10|Gadget|2\n10|Widget|5")
+    assertEq("events", &q1(c, "SELECT COUNT(*), SUM(CAST(id AS bigint)) FROM sales.events"), "1500|1125750")
+    assertEq("disabled chk", &q1(c, "SELECT is_disabled, is_not_trusted FROM sys.check_constraints WHERE LOWER(name) = 'ck_emp_qty'"), "1|1")
+    assertEq("seq next", &q1(c, "SELECT NEXT VALUE FOR sales.inv_seq"), "1020")
+    assertEq("nested view", &q1(c, "SELECT id, full_name FROM dbo.v_a_top"), "1|Alice")
+    assertEq("indexed view", &q1(c, "SELECT dept_id, cnt FROM sales.v_dept_sum ORDER BY dept_id"), "100|2\n105|1")
+    assertEq("fn_dbl", &q1(c, "SELECT dbo.fn_dbl(21)"), "42")
+    let pr = c.callProc("dbo.sp_dept_cnt", &[sqlserver.arg("@did", sqlserver.Value.Int(100)), sqlserver.outArg("@cnt", "int")], &[]).unwrap()
+    assertEq("proc out", &(pr.outputs.int(0, 0).unwrap().toStr()), "2")
+    assertEq("proc ret", &(pr.returnStatus.unwrapOr(-1).toStr()), "9")
+    println(tag + " checks ok")
+}
+
+fn dsnOf(addr: &str): str {
+    return "Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"
+}
+
+fn runDumpRestore(srcDsn: &str, compress: bool, label: &str) {
+    let tmpDir = os.envOr("TMPDIR", "/tmp") + "/lxl_tds_mig_" + label
+    let _rm0 = fs.removeAll(&tmpDir)
+    let dataDir = fs.join(&tmpDir, "data")
+    fs.mkdirAll(&dataDir).unwrap()
+
+    var src = sqlserver.connect(srcDsn).unwrap()
+    let sc = lexmigrate_mssql.extractSchema(mut &src, &(lexmigrate_mssql.emptyFilter())).unwrap()
+    io.write(&(fs.join(&tmpDir, "01_pre.sql")), &(lexmigrate_mssql.emitPreSql(&sc))).unwrap()
+    io.write(&(fs.join(&tmpDir, "02_post.sql")), &(lexmigrate_mssql.emitPostSql(&sc))).unwrap()
+
+    var entries: []lexmigrate_mssql.TableDumpEntry = []
+    let ext = if compress { ".lxrd.zst" } else { ".lxrd" }
+    for i in 0..len(sc.tables) {
+        let t = &sc.tables[i]
+        let fname = (i + 1).toStr() + "_" + lexmigrate_mssql.safeFilePart(&t.schemaName) + "_" + lexmigrate_mssql.safeFilePart(&t.name) + ext
+        let n = lexmigrate_data.dumpTableToFile(mut &src, t, &(fs.join(&dataDir, &fname)), compress, 300).unwrap()
+        append(mut &entries, lexmigrate_mssql.TableDumpEntry{
+            schemaName: t.schemaName.clone(), tableName: t.name.clone(), fileName: "data/" + fname, rows: n
+        })
+    }
+    src.close()
+    io.write(&(fs.join(&tmpDir, "manifest.json")), &(lexmigrate_mssql.manifestToJson(&sc, &entries, compress))).unwrap()
+
+    // Restore into a brand-new simulated LexDB store
+    lexdb_store.run(lexdb_disk.sim(if compress { 42 } else { 43 }),
+                    lexdb_store.Options{cacheBytes: 32 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000},
+                    fn(dstSt: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&dstSt).unwrap()
+        task.scope(fn(sc2: mut &task.Scope) {
+            let ln = net.listen("127.0.0.1:0").unwrap()
+            let addr = ln.localAddr()
+            lexdb_wire.configure(&dstSt, &lexdb_wire.noAuth()).unwrap()
+            let f = sc2.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: dstSt.share()})
+            let dstDsn = dsnOf(&addr)
+            var dst = sqlserver.connect(&dstDsn).unwrap()
+            let m = lexmigrate_mssql.parseManifest(&(io.read(&(fs.join(&tmpDir, "manifest.json"))).unwrap())).unwrap()
+            var errs: []str = []
+            let pre = lexmigrate_mssql.splitBatches(&(io.read(&(fs.join(&tmpDir, &m.preSql))).unwrap()))
+            let _nPre = lexmigrate_mssql.runBatches(mut &dst, &pre, "pre", false, false, false, mut &errs).unwrap()
+            var total = 0
+            for e in m.tables {
+                let q = lexmigrate_mssql.qualName(&e.schemaName, &e.tableName)
+                total += lexmigrate_data.restoreTableFromFile(mut &dst, &q, &(fs.join(&tmpDir, &e.fileName)), m.compressed, 300).unwrap()
+            }
+            let post = lexmigrate_mssql.splitBatches(&(io.read(&(fs.join(&tmpDir, &m.postSql))).unwrap()))
+            let _nPost = lexmigrate_mssql.runBatches(mut &dst, &post, "post", true, false, false, mut &errs).unwrap()
+            let vr = lexmigrate_data.verifyEntries(mut &dst, &m.tables).unwrap()
+            var ok = 0
+            for v in vr { if v.ok { ok += 1 } }
+            println("dump+restore " + label + " ok: rows " + total.toStr() + " verify " + ok.toStr() + "/" + len(vr).toStr())
+            verifyTarget(mut &dst, &("restore " + label))
+            dst.close()
+            { let stop = f }
+        })
+        return 0
+    }).unwrap()
+    let _rm1 = fs.removeAll(&tmpDir)
+}
+
+fn body(srcSt: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&srcSt).unwrap()
+    task.scope(fn(sc: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&srcSt, &lexdb_wire.noAuth()).unwrap()
+        let f = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: srcSt.share()})
+        let srcDsn = dsnOf(&addr)
+
+        var srcSetup = sqlserver.connect(&srcDsn).unwrap()
+        populate(mut &srcSetup)
+        srcSetup.close()
+
+        // 1. Direct live migration into a second simulated LexDB
+        lexdb_store.run(lexdb_disk.sim(41),
+                        lexdb_store.Options{cacheBytes: 32 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000},
+                        fn(dstSt: lexdb_store.Store): int {
+            lexdb_exec.bootstrap(&dstSt).unwrap()
+            task.scope(fn(sc2: mut &task.Scope) {
+                let ln2 = net.listen("127.0.0.1:0").unwrap()
+                let addr2 = ln2.localAddr()
+                lexdb_wire.configure(&dstSt, &lexdb_wire.noAuth()).unwrap()
+                let f2 = sc2.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln2, st: dstSt.share()})
+                let dstDsn = dsnOf(&addr2)
+
+                var s = sqlserver.connect(&srcDsn).unwrap()
+                var d = sqlserver.connect(&dstDsn).unwrap()
+                let schema = lexmigrate_mssql.extractSchema(mut &s, &(lexmigrate_mssql.emptyFilter())).unwrap()
+                var errs: []str = []
+                let _p = lexmigrate_mssql.applyPreSchema(mut &d, &schema, false, false, mut &errs).unwrap()
+                var total = 0
+                for i in 0..len(schema.tables) {
+                    total += lexmigrate_data.streamTableDirect(mut &s, mut &d, &schema.tables[i], 300).unwrap()
+                }
+                let _q = lexmigrate_mssql.applyPostSchema(mut &d, &schema, false, false, mut &errs).unwrap()
+                let vr = lexmigrate_data.verifyDirect(mut &s, mut &d, &schema.tables).unwrap()
+                var ok = 0
+                for v in vr { if v.ok { ok += 1 } }
+                println("direct ok: rows " + total.toStr() + " verify " + ok.toStr() + "/" + len(vr).toStr())
+                verifyTarget(mut &d, "direct")
+                s.close()
+                d.close()
+                { let stop2 = f2 }
+            })
+            return 0
+        }).unwrap()
+
+        // 2. Compressed (zstd) and uncompressed dump + restore
+        runDumpRestore(&srcDsn, true, "zstd")
+        runDumpRestore(&srcDsn, false, "raw")
+
+        // 3. Single-table filter narrows schemas/sequences/views cleanly
+        var s3 = sqlserver.connect(&srcDsn).unwrap()
+        var flt = lexmigrate_mssql.emptyFilter()
+        append(mut &flt.tables, "dbo.dept")
+        let sub = lexmigrate_mssql.extractSchema(mut &s3, &flt).unwrap()
+        println("filter table ok: tables " + len(sub.tables).toStr() + " schemas " + len(sub.schemas).toStr() + " seqs " + len(sub.sequences).toStr())
+        s3.close()
+
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(40), lexdb_store.Options{cacheBytes: 32 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                             snapNodes: 50000}, body).unwrap()
+}

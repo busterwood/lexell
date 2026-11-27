@@ -1,0 +1,480 @@
+// lexmigrate: native migration, dump, and restore CLI for LexDB.
+//
+// Connects directly to Microsoft SQL Server (2019/2022/2025) or LexDB's own
+// TDS endpoint using Lexell's native TDS 7.4 client — zero external drivers.
+//
+// Subcommands:
+//   lexmigrate [mssql] inspect --from DSN [options]
+//   lexmigrate [mssql] migrate --from DSN --to DSN [options]
+//   lexmigrate [mssql] dump    --from DSN --out DIR [options]
+//   lexmigrate [mssql] restore --in DIR   --to DSN [options]
+
+import "os"
+import "fs"
+import "io"
+import "time"
+import "strings"
+import "sqlserver"
+import "./lexmigrate_mssql"
+import "./lexmigrate_data"
+
+type Config = record {
+    cmd: str                // "inspect", "migrate", "dump", "restore"
+    fromDsn: str
+    toDsn: str
+    outDir: str
+    inDir: str
+    filter: lexmigrate_mssql.Filter
+    schemaOnly: bool
+    dataOnly: bool
+    batchSize: int
+    compress: bool
+    verify: bool
+    continueOnErr: bool
+    verbose: bool
+}
+
+fn usage(code: int) {
+    eprintln("lexmigrate - native SQL Server / LexDB TDS migration, dump, and restore tool")
+    eprintln("")
+    eprintln("Usage:")
+    eprintln("  lexmigrate [mssql] inspect --from DSN [filters]")
+    eprintln("  lexmigrate [mssql] migrate --from DSN --to DSN [options]")
+    eprintln("  lexmigrate [mssql] dump    --from DSN --out DIR [options]")
+    eprintln("  lexmigrate [mssql] restore --in DIR   --to DSN [options]")
+    eprintln("")
+    eprintln("Connection options (env fallbacks: LEXMIGRATE_FROM, LEXMIGRATE_TO):")
+    eprintln("  --from DSN            Source SQL Server or LexDB TDS connection string")
+    eprintln("  --to DSN              Target LexDB TDS connection string")
+    eprintln("  --out DIR             Output directory for dump bundle")
+    eprintln("  --in DIR              Input dump bundle directory for restore")
+    eprintln("")
+    eprintln("Filter & mode options:")
+    eprintln("  --schema NAME         Include only this schema (repeatable)")
+    eprintln("  --table [S.]NAME      Include only this table (repeatable)")
+    eprintln("  --exclude-table NAME  Exclude this table (repeatable)")
+    eprintln("  --schema-only         Migrate/dump/restore DDL only (skip table data)")
+    eprintln("  --data-only           Migrate/restore table data only (skip DDL)")
+    eprintln("  --batch-size N        Rows per streaming bulk batch (default: 2000)")
+    eprintln("  --no-compress         Store uncompressed .lxrd data files on dump")
+    eprintln("  --no-verify           Skip post-load row-count verification")
+    eprintln("  --skip-unsupported    Skip unsupported columns instead of aborting")
+    eprintln("  --continue-on-error   Collect DDL/module errors instead of stopping at first")
+    eprintln("  -v, --verbose         Print each executed DDL statement")
+    eprintln("  -h, --help            Show this help")
+    exit(code)
+}
+
+fn parseArgs(): Config {
+    let args = os.arguments()
+    if len(args) == 0 { usage(2) }
+    var i = 0
+    if args[0] == "-h" || args[0] == "--help" { usage(0) }
+    if args[0] == "mssql" { i = 1 }
+    if i >= len(args) { usage(2) }
+    let cmd = args[i].clone()
+    if cmd == "-h" || cmd == "--help" { usage(0) }
+    if cmd != "inspect" && cmd != "migrate" && cmd != "dump" && cmd != "restore" {
+        eprintln("lexmigrate: unknown command '" + cmd + "'")
+        usage(2)
+    }
+    i += 1
+
+    var cfg = Config{
+        cmd: cmd,
+        fromDsn: os.envOr("LEXMIGRATE_FROM", ""),
+        toDsn: os.envOr("LEXMIGRATE_TO", ""),
+        outDir: "",
+        inDir: "",
+        filter: lexmigrate_mssql.emptyFilter(),
+        schemaOnly: false,
+        dataOnly: false,
+        batchSize: 2000,
+        compress: true,
+        verify: true,
+        continueOnErr: false,
+        verbose: false
+    }
+
+    while i < len(args) {
+        let a = args[i].clone()
+        if a == "-h" || a == "--help" {
+            usage(0)
+        } else if a == "--from" {
+            if i + 1 >= len(args) { eprintln("lexmigrate: --from requires a value"); exit(2) }
+            cfg.fromDsn = args[i + 1].clone()
+            i += 1
+        } else if a == "--to" {
+            if i + 1 >= len(args) { eprintln("lexmigrate: --to requires a value"); exit(2) }
+            cfg.toDsn = args[i + 1].clone()
+            i += 1
+        } else if a == "--out" {
+            if i + 1 >= len(args) { eprintln("lexmigrate: --out requires a value"); exit(2) }
+            cfg.outDir = args[i + 1].clone()
+            i += 1
+        } else if a == "--in" {
+            if i + 1 >= len(args) { eprintln("lexmigrate: --in requires a value"); exit(2) }
+            cfg.inDir = args[i + 1].clone()
+            i += 1
+        } else if a == "--schema" {
+            if i + 1 >= len(args) { eprintln("lexmigrate: --schema requires a value"); exit(2) }
+            append(mut &cfg.filter.schemas, args[i + 1].clone())
+            i += 1
+        } else if a == "--table" {
+            if i + 1 >= len(args) { eprintln("lexmigrate: --table requires a value"); exit(2) }
+            append(mut &cfg.filter.tables, args[i + 1].clone())
+            i += 1
+        } else if a == "--exclude-table" {
+            if i + 1 >= len(args) { eprintln("lexmigrate: --exclude-table requires a value"); exit(2) }
+            append(mut &cfg.filter.excludeTables, args[i + 1].clone())
+            i += 1
+        } else if a == "--batch-size" {
+            if i + 1 >= len(args) { eprintln("lexmigrate: --batch-size requires a value"); exit(2) }
+            let n = strings.parseIntOpt(&args[i + 1]).unwrapOr(-1)
+            if n < 1 || n > 1000000 { eprintln("lexmigrate: --batch-size must be 1..1000000"); exit(2) }
+            cfg.batchSize = n
+            i += 1
+        } else if a == "--schema-only" {
+            cfg.schemaOnly = true
+        } else if a == "--data-only" {
+            cfg.dataOnly = true
+        } else if a == "--no-compress" {
+            cfg.compress = false
+        } else if a == "--no-verify" {
+            cfg.verify = false
+        } else if a == "--skip-unsupported" {
+            cfg.filter.skipUnsupported = true
+        } else if a == "--continue-on-error" {
+            cfg.continueOnErr = true
+        } else if a == "-v" || a == "--verbose" {
+            cfg.verbose = true
+        } else {
+            eprintln("lexmigrate: unknown option '" + a + "'")
+            usage(2)
+        }
+        i += 1
+    }
+
+    if cfg.schemaOnly && cfg.dataOnly {
+        eprintln("lexmigrate: --schema-only and --data-only cannot both be set")
+        exit(2)
+    }
+    return cfg
+}
+
+fn connectTds(role: &str, dsn: &str): Result[sqlserver.Conn, str] {
+    if len(dsn) == 0 { return Err("missing " + role + " connection string") }
+    match sqlserver.connect(dsn) {
+        Ok(c) { return Ok(c) }
+        Err(e) { return Err("connect " + role + " (" + sqlserver.masked(dsn) + "): " + e.toStr()) }
+    }
+}
+
+fn fmtMs(t0: time.Time): str {
+    let ms = t0.millisUntil(time.now())
+    if ms < 1000 { return ms.toStr() + " ms" }
+    let secs = ms / 1000
+    let rem = (ms % 1000) / 10
+    let pad = if rem < 10 { "0" + rem.toStr() } else { rem.toStr() }
+    return secs.toStr() + "." + pad + " s"
+}
+
+fn runInspect(cfg: &Config): Result[Unit, str] {
+    var src = try connectTds("source (--from)", &cfg.fromDsn)
+    let sc = try lexmigrate_mssql.extractSchema(mut &src, &cfg.filter)
+    src.close()
+    print(lexmigrate_mssql.formatReport(&sc))
+    if len(sc.tables) > 0 {
+        println("\nTables (" + len(sc.tables).toStr() + "):")
+        for i in 0..len(sc.tables) {
+            let t = &sc.tables[i]
+            let q = lexmigrate_mssql.qualName(&t.schemaName, &t.name)
+            let pkFlag = if t.pk.isSome() { "PK" } else { "heap" }
+            println("  " + q + " (" + len(t.cols).toStr() + " cols, " + pkFlag + ")")
+        }
+    }
+    return Ok(Unit{})
+}
+
+fn runMigrate(cfg: &Config): Result[Unit, str] {
+    let t0 = time.now()
+    var src = try connectTds("source (--from)", &cfg.fromDsn)
+    var dst = try connectTds("target (--to)", &cfg.toDsn)
+
+    println("Extracting schema from " + src.database() + " (" + src.serverVersion() + ")...")
+    let sc = try lexmigrate_mssql.extractSchema(mut &src, &cfg.filter)
+    if lexmigrate_mssql.hasFatalWarnings(&sc) && !cfg.filter.skipUnsupported {
+        print(lexmigrate_mssql.formatReport(&sc))
+        src.close()
+        dst.close()
+        return Err("source schema contains unsupported column types (re-run with --skip-unsupported to omit them)")
+    }
+
+    var errs: []str = []
+
+    if !cfg.dataOnly {
+        let tPre = time.now()
+        let nPre = try lexmigrate_mssql.applyPreSchema(mut &dst, &sc, cfg.continueOnErr, cfg.verbose, mut &errs)
+        println("Pre-data DDL: " + nPre.toStr() + " statements applied (" + fmtMs(tPre) + ")")
+    }
+
+    var totalRows = 0
+    if !cfg.schemaOnly {
+        let tData = time.now()
+        for i in 0..len(sc.tables) {
+            let q = lexmigrate_mssql.qualName(&sc.tables[i].schemaName, &sc.tables[i].name)
+            let tTab = time.now()
+            let n = try lexmigrate_data.streamTableDirect(mut &src, mut &dst, &sc.tables[i], cfg.batchSize)
+            totalRows += n
+            println("  " + q + ": " + n.toStr() + " rows (" + fmtMs(tTab) + ")")
+        }
+        println("Data transfer: " + totalRows.toStr() + " rows across " + len(sc.tables).toStr() + " tables (" + fmtMs(tData) + ")")
+    }
+
+    if !cfg.dataOnly {
+        let tPost = time.now()
+        let nPost = try lexmigrate_mssql.applyPostSchema(mut &dst, &sc, cfg.continueOnErr, cfg.verbose, mut &errs)
+        println("Post-data DDL: " + nPost.toStr() + " statements applied (" + fmtMs(tPost) + ")")
+    }
+
+    var verifyMismatches = 0
+    if cfg.verify && !cfg.schemaOnly && len(sc.tables) > 0 {
+        let tVer = time.now()
+        let vr = try lexmigrate_data.verifyDirect(mut &src, mut &dst, &sc.tables)
+        for v in vr {
+            if !v.ok {
+                verifyMismatches += 1
+                eprintln("VERIFY MISMATCH: " + v.table + " expected " + v.expected.toStr() + ", got " + v.actual.toStr())
+            }
+        }
+        if verifyMismatches == 0 {
+            println("Verification: " + len(vr).toStr() + "/" + len(vr).toStr() + " tables match exact row counts (" + fmtMs(tVer) + ")")
+        }
+    }
+
+    src.close()
+    dst.close()
+
+    if len(sc.warnings) > 0 {
+        println("\nWarnings (" + len(sc.warnings).toStr() + "):")
+        for w in sc.warnings {
+            println("  [" + strings.toUpperAscii(&w.severity) + "] " + w.object + ": " + w.message)
+        }
+    }
+    if len(errs) > 0 {
+        eprintln("\nErrors collected (" + len(errs).toStr() + "):")
+        for e in errs { eprintln("  " + e) }
+    }
+    println("\nMigration complete in " + fmtMs(t0) + ".")
+    if verifyMismatches > 0 { return Err(verifyMismatches.toStr() + " table(s) failed row-count verification") }
+    if len(errs) > 0 { return Err(len(errs).toStr() + " DDL error(s) occurred") }
+    return Ok(Unit{})
+}
+
+fn runDump(cfg: &Config): Result[Unit, str] {
+    if len(cfg.outDir) == 0 { return Err("dump requires --out DIR") }
+    let t0 = time.now()
+    var src = try connectTds("source (--from)", &cfg.fromDsn)
+
+    println("Extracting schema from " + src.database() + " (" + src.serverVersion() + ")...")
+    let sc = try lexmigrate_mssql.extractSchema(mut &src, &cfg.filter)
+    if lexmigrate_mssql.hasFatalWarnings(&sc) && !cfg.filter.skipUnsupported {
+        print(lexmigrate_mssql.formatReport(&sc))
+        src.close()
+        return Err("source schema contains unsupported column types (re-run with --skip-unsupported to omit them)")
+    }
+
+    let dataDir = fs.join(&cfg.outDir, "data")
+    match fs.mkdirAll(&dataDir) {
+        Ok(_) {}
+        Err(e) { return Err("mkdir " + dataDir + ": " + e.toStr()) }
+    }
+
+    let prePath = fs.join(&cfg.outDir, "01_pre.sql")
+    let postPath = fs.join(&cfg.outDir, "02_post.sql")
+    let reportPath = fs.join(&cfg.outDir, "report.txt")
+    match io.write(&prePath, &(lexmigrate_mssql.emitPreSql(&sc))) {
+        Ok(_) {}
+        Err(e) { return Err("write " + prePath + ": " + e.toStr()) }
+    }
+    match io.write(&postPath, &(lexmigrate_mssql.emitPostSql(&sc))) {
+        Ok(_) {}
+        Err(e) { return Err("write " + postPath + ": " + e.toStr()) }
+    }
+    match io.write(&reportPath, &(lexmigrate_mssql.formatReport(&sc))) {
+        Ok(_) {}
+        Err(e) { return Err("write " + reportPath + ": " + e.toStr()) }
+    }
+
+    var entries: []lexmigrate_mssql.TableDumpEntry = []
+    var totalRows = 0
+    let ext = if cfg.compress { ".lxrd.zst" } else { ".lxrd" }
+    if !cfg.schemaOnly {
+        for i in 0..len(sc.tables) {
+            let t = &sc.tables[i]
+            let fname = (i + 1).toStr() + "_" + lexmigrate_mssql.safeFilePart(&t.schemaName) +
+                        "_" + lexmigrate_mssql.safeFilePart(&t.name) + ext
+            let fpath = fs.join(&dataDir, &fname)
+            let q = lexmigrate_mssql.qualName(&t.schemaName, &t.name)
+            let tTab = time.now()
+            let n = try lexmigrate_data.dumpTableToFile(mut &src, t, &fpath, cfg.compress, cfg.batchSize)
+            totalRows += n
+            append(mut &entries, lexmigrate_mssql.TableDumpEntry{
+                schemaName: t.schemaName.clone(),
+                tableName: t.name.clone(),
+                fileName: "data/" + fname,
+                rows: n
+            })
+            println("  " + q + ": " + n.toStr() + " rows -> data/" + fname + " (" + fmtMs(tTab) + ")")
+        }
+    }
+
+    src.close()
+
+    let manifestPath = fs.join(&cfg.outDir, "manifest.json")
+    let manifestJson = lexmigrate_mssql.manifestToJson(&sc, &entries, cfg.compress)
+    match io.write(&manifestPath, &manifestJson) {
+        Ok(_) {}
+        Err(e) { return Err("write " + manifestPath + ": " + e.toStr()) }
+    }
+
+    if len(sc.warnings) > 0 {
+        println("\nWarnings (" + len(sc.warnings).toStr() + "):")
+        for w in sc.warnings {
+            println("  [" + strings.toUpperAscii(&w.severity) + "] " + w.object + ": " + w.message)
+        }
+    }
+    println("\nDump written to " + cfg.outDir + " (" + len(sc.tables).toStr() + " tables, " +
+            totalRows.toStr() + " rows) in " + fmtMs(t0) + ".")
+    return Ok(Unit{})
+}
+
+fn runRestore(cfg: &Config): Result[Unit, str] {
+    if len(cfg.inDir) == 0 { return Err("restore requires --in DIR") }
+    let t0 = time.now()
+    let manifestPath = fs.join(&cfg.inDir, "manifest.json")
+    let manifestText = match io.read(&manifestPath) {
+        Ok(s) { s }
+        Err(e) { return Err("read " + manifestPath + ": " + e.toStr()) }
+    }
+    let m = try lexmigrate_mssql.parseManifest(&manifestText)
+
+    var dst = try connectTds("target (--to)", &cfg.toDsn)
+    var errs: []str = []
+
+    println("Restoring dump of " + m.sourceDatabase + " (TDS " + m.sourceVersion + ") from " + cfg.inDir + "...")
+
+    if !cfg.dataOnly {
+        let prePath = fs.join(&cfg.inDir, &m.preSql)
+        let preSql = match io.read(&prePath) {
+            Ok(s) { s }
+            Err(e) { return Err("read " + prePath + ": " + e.toStr()) }
+        }
+        let preBatches = lexmigrate_mssql.splitBatches(&preSql)
+        // Skip CREATE SCHEMA for schemas that already exist on target
+        var existingSchemas: Map[str, bool] = newMap()
+        match dst.query("SELECT name FROM sys.schemas", &[]) {
+            Ok(r) {
+                for i in 0..r.rowCount() {
+                    if !r.isNull(i, 0).unwrapOr(true) {
+                        existingSchemas.put(strings.toLowerAscii(&(r.text(i, 0).unwrapOr(""))), true)
+                    }
+                }
+            }
+            Err(_) {}
+        }
+        var filteredPre: []str = []
+        for b in preBatches {
+            if !isExistingCreateSchema(&b, &existingSchemas) {
+                append(mut &filteredPre, b)
+            }
+        }
+        let tPre = time.now()
+        let nPre = try lexmigrate_mssql.runBatches(mut &dst, &filteredPre, "pre-ddl", false, cfg.continueOnErr, cfg.verbose, mut &errs)
+        println("Pre-data DDL: " + nPre.toStr() + " statements applied (" + fmtMs(tPre) + ")")
+    }
+
+    var totalRows = 0
+    if !cfg.schemaOnly {
+        let tData = time.now()
+        for e in m.tables {
+            let fpath = fs.join(&cfg.inDir, &e.fileName)
+            let q = lexmigrate_mssql.qualName(&e.schemaName, &e.tableName)
+            let tTab = time.now()
+            let n = try lexmigrate_data.restoreTableFromFile(mut &dst, &q, &fpath, m.compressed, cfg.batchSize)
+            totalRows += n
+            println("  " + q + ": " + n.toStr() + " rows (" + fmtMs(tTab) + ")")
+        }
+        println("Data restore: " + totalRows.toStr() + " rows across " + len(m.tables).toStr() + " tables (" + fmtMs(tData) + ")")
+    }
+
+    if !cfg.dataOnly {
+        let postPath = fs.join(&cfg.inDir, &m.postSql)
+        let postSql = match io.read(&postPath) {
+            Ok(s) { s }
+            Err(e) { return Err("read " + postPath + ": " + e.toStr()) }
+        }
+        let postBatches = lexmigrate_mssql.splitBatches(&postSql)
+        let tPost = time.now()
+        let nPost = try lexmigrate_mssql.runBatches(mut &dst, &postBatches, "post-ddl", true, cfg.continueOnErr, cfg.verbose, mut &errs)
+        println("Post-data DDL: " + nPost.toStr() + " statements applied (" + fmtMs(tPost) + ")")
+    }
+
+    var verifyMismatches = 0
+    if cfg.verify && !cfg.schemaOnly && len(m.tables) > 0 {
+        let tVer = time.now()
+        let vr = try lexmigrate_data.verifyEntries(mut &dst, &m.tables)
+        for v in vr {
+            if !v.ok {
+                verifyMismatches += 1
+                eprintln("VERIFY MISMATCH: " + v.table + " expected " + v.expected.toStr() + ", got " + v.actual.toStr())
+            }
+        }
+        if verifyMismatches == 0 {
+            println("Verification: " + len(vr).toStr() + "/" + len(vr).toStr() + " tables match exact row counts (" + fmtMs(tVer) + ")")
+        }
+    }
+
+    dst.close()
+
+    if len(errs) > 0 {
+        eprintln("\nErrors collected (" + len(errs).toStr() + "):")
+        for e in errs { eprintln("  " + e) }
+    }
+    println("\nRestore complete in " + fmtMs(t0) + ".")
+    if verifyMismatches > 0 { return Err(verifyMismatches.toStr() + " table(s) failed row-count verification") }
+    if len(errs) > 0 { return Err(len(errs).toStr() + " DDL error(s) occurred") }
+    return Ok(Unit{})
+}
+
+fn isExistingCreateSchema(batch: &str, existing: &Map[str, bool]): bool {
+    let t = strings.trim(batch)
+    let up = strings.toUpperAscii(&t)
+    if !strings.startsWith(&up, "CREATE SCHEMA ") { return false }
+    var rest = strings.trim(&(t[14..len(t)].toStr()))
+    if strings.endsWith(&rest, ";") { rest = strings.trim(&(rest[0..len(rest) - 1].toStr())) }
+    if len(rest) >= 2 && rest[0] == '[' && rest[len(rest) - 1] == ']' {
+        rest = strings.replaceAll(&(rest[1..len(rest) - 1].toStr()), "]]", "]")
+    }
+    return existing.has(&(strings.toLowerAscii(&rest)))
+}
+
+fn main() {
+    let cfg = parseArgs()
+    let res = if cfg.cmd == "inspect" {
+        runInspect(&cfg)
+    } else if cfg.cmd == "migrate" {
+        runMigrate(&cfg)
+    } else if cfg.cmd == "dump" {
+        runDump(&cfg)
+    } else {
+        runRestore(&cfg)
+    }
+    match res {
+        Ok(_) {}
+        Err(msg) {
+            eprintln("lexmigrate: error: " + msg)
+            exit(1)
+        }
+    }
+}

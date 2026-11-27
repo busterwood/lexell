@@ -1,0 +1,1493 @@
+// lexmigrate_mssql: SQL Server / LexDB TDS catalog extraction, T-SQL DDL
+// generation, migration compatibility reporting, and dump manifest codec.
+//
+// Queries only standard sys.* catalog views that exist on both Microsoft SQL
+// Server (2019/2022/2025) and LexDB's TDS door, preserving SQL Server types,
+// collations, IDENTITY columns, defaults, computed columns, constraints,
+// indexes (including INCLUDE and filtered indexes), sequences, table types,
+// views (including indexed views), and T-SQL functions/procedures.
+
+import "sqlserver"
+import "sqldialect"
+import "strings"
+import "json"
+
+pub type Filter = record {
+    pub schemas: []str
+    pub tables: []str
+    pub excludeTables: []str
+    pub skipUnsupported: bool
+}
+
+pub fn emptyFilter(): Filter {
+    return Filter{schemas: [], tables: [], excludeTables: [], skipUnsupported: false}
+}
+
+pub type Warning = value record {
+    pub severity: str       // "info", "warn", "error"
+    pub object: str
+    pub message: str
+}
+
+pub type ColInfo = record {
+    pub colId: int
+    pub name: str
+    pub baseType: str       // resolved SQL Server system type name (lower case)
+    pub userType: str       // original type name (differs for alias types / sysname)
+    pub isUserDefined: bool
+    pub maxLen: int         // bytes (-1 for max)
+    pub prec: int
+    pub scale: int
+    pub collation: str
+    pub nullable: bool
+    pub isIdentity: bool
+    pub identSeed: int
+    pub identInc: int
+    pub hasIdentLast: bool
+    pub identLast: int
+    pub isComputed: bool
+    pub compDef: str
+    pub isPersisted: bool
+    pub hasDefault: bool
+    pub defName: str
+    pub defExpr: str
+    pub defSysNamed: bool
+    pub unsupported: bool
+    pub unsupportedReason: str
+}
+
+pub type IdxCol = value record {
+    pub name: str
+    pub desc: bool
+    pub included: bool
+}
+
+pub type IdxInfo = record {
+    pub indexId: int
+    pub name: str
+    pub objId: int
+    pub objType: str        // "U" or "V"
+    pub schemaName: str
+    pub tableName: str
+    pub idxType: int        // 1 clustered, 2 nonclustered, >2 unsupported
+    pub typeDesc: str
+    pub isUnique: bool
+    pub isPk: bool
+    pub isUqCon: bool
+    pub hasFilter: bool
+    pub filterDef: str
+    pub cols: []IdxCol
+}
+
+pub type FkCol = value record {
+    pub parentCol: str
+    pub refCol: str
+}
+
+pub type FkInfo = record {
+    pub objId: int
+    pub name: str
+    pub parentSchema: str
+    pub parentTable: str
+    pub refSchema: str
+    pub refTable: str
+    pub isDisabled: bool
+    pub isNotTrusted: bool
+    pub deleteAction: str
+    pub updateAction: str
+    pub cols: []FkCol
+}
+
+pub type CheckInfo = value record {
+    pub name: str
+    pub schemaName: str
+    pub tableName: str
+    pub definition: str
+    pub isDisabled: bool
+    pub isNotTrusted: bool
+}
+
+pub type SeqInfo = value record {
+    pub schemaName: str
+    pub name: str
+    pub typeName: str
+    pub startVal: int
+    pub incVal: int
+    pub minVal: int
+    pub maxVal: int
+    pub isCycling: bool
+    pub cacheSize: int      // 0 = NO CACHE / default
+    pub hasLastVal: bool
+    pub lastVal: int
+}
+
+pub type TabTypeInfo = record {
+    pub schemaName: str
+    pub name: str
+    pub typeTableObjId: int
+    pub cols: []ColInfo
+}
+
+pub type ModuleInfo = value record {
+    pub objId: int
+    pub schemaName: str
+    pub name: str
+    pub objType: str        // "V", "FN", "IF", "TF", "P"
+    pub definition: str
+    pub isSchemaBound: bool
+}
+
+pub type TableInfo = record {
+    pub objId: int
+    pub schemaName: str
+    pub name: str
+    pub cols: []ColInfo
+    pub pk: Option[IdxInfo]
+    pub hasUnsupportedCols: bool
+}
+
+pub type Schema = record {
+    pub sourceDatabase: str
+    pub sourceVersion: str
+    pub dbCollation: str
+    pub schemas: []str
+    pub tableTypes: []TabTypeInfo
+    pub sequences: []SeqInfo
+    pub tables: []TableInfo
+    pub uniqueCons: []IdxInfo
+    pub tableIndexes: []IdxInfo
+    pub viewIndexes: []IdxInfo
+    pub checks: []CheckInfo
+    pub fks: []FkInfo
+    pub views: []ModuleInfo
+    pub routines: []ModuleInfo
+    pub warnings: []Warning
+}
+
+pub type TableDumpEntry = value record {
+    pub schemaName: str
+    pub tableName: str
+    pub fileName: str
+    pub rows: int
+}
+
+pub type Manifest = record {
+    pub formatVersion: int
+    pub sourceDatabase: str
+    pub sourceVersion: str
+    pub dbCollation: str
+    pub compressed: bool
+    pub preSql: str
+    pub postSql: str
+    pub tables: []TableDumpEntry
+    pub warnings: []Warning
+}
+
+// ---------------------------------------------------------------- identifiers
+
+pub fn quoteIdent(name: &str): str {
+    var out = "["
+    for i in 0..len(name) {
+        let c = name[i]
+        if c == ']' {
+            out += "]]"
+        } else {
+            out.addByte(c)
+        }
+    }
+    out += "]"
+    return out
+}
+
+pub fn qualName(schema: &str, name: &str): str {
+    return quoteIdent(schema) + "." + quoteIdent(name)
+}
+
+pub fn safeFilePart(s: &str): str {
+    var out = ""
+    for i in 0..len(s) {
+        let c = s[i]
+        let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-'
+        if ok {
+            out.addByte(c)
+        } else {
+            out += "_"
+            let hi = (int(c) >> 4) & 0xf
+            let lo = int(c) & 0xf
+            let hex = "0123456789abcdef"
+            out.addByte(hex[hi])
+            out.addByte(hex[lo])
+        }
+    }
+    if len(out) == 0 { return "_" }
+    return out
+}
+
+// ---------------------------------------------------------------- filtering
+
+fn normTableSpec(spec: &str): str {
+    let t = strings.trim(spec)
+    let dot = strings.indexOf(&t, ".", 0)
+    if dot < 0 { return "dbo." + strings.toLowerAscii(&t) }
+    let s = stripBrackets(&(t[0..dot].toStr()))
+    let n = stripBrackets(&(t[dot + 1..len(t)].toStr()))
+    return strings.toLowerAscii(&s) + "." + strings.toLowerAscii(&n)
+}
+
+fn stripBrackets(s: &str): str {
+    let t = strings.trim(s)
+    if len(t) >= 2 && t[0] == '[' && t[len(t) - 1] == ']' {
+        return strings.replaceAll(&(t[1..len(t) - 1].toStr()), "]]", "]")
+    }
+    return t
+}
+
+fn schemaAllowed(filter: &Filter, schema: &str): bool {
+    if len(filter.schemas) == 0 { return true }
+    let ls = strings.toLowerAscii(schema)
+    for want in filter.schemas {
+        if strings.toLowerAscii(&want) == ls { return true }
+    }
+    return false
+}
+
+fn tableAllowed(filter: &Filter, schema: &str, table: &str): bool {
+    if !schemaAllowed(filter, schema) { return false }
+    let full = strings.toLowerAscii(schema) + "." + strings.toLowerAscii(table)
+    if len(filter.tables) > 0 {
+        var matched = false
+        for want in filter.tables {
+            if normTableSpec(&want) == full {
+                matched = true
+                break
+            }
+        }
+        if !matched { return false }
+    }
+    for ex in filter.excludeTables {
+        if normTableSpec(&ex) == full { return false }
+    }
+    return true
+}
+
+// ---------------------------------------------------------------- row helpers
+
+fn qStr(r: &sqlserver.Rows, row: int, col: int): str {
+    if r.isNull(row, col).unwrapOr(true) { return "" }
+    return r.text(row, col).unwrapOr("")
+}
+
+fn qInt(r: &sqlserver.Rows, row: int, col: int): int {
+    if r.isNull(row, col).unwrapOr(true) { return 0 }
+    return r.int(row, col).unwrapOr(0)
+}
+
+fn qBool(r: &sqlserver.Rows, row: int, col: int): bool {
+    if r.isNull(row, col).unwrapOr(true) { return false }
+    return r.bool(row, col).unwrapOr(false)
+}
+
+fn qParsedInt(r: &sqlserver.Rows, row: int, col: int): Option[int] {
+    if r.isNull(row, col).unwrapOr(true) { return None }
+    let s = strings.trim(&(r.text(row, col).unwrapOr("")))
+    if len(s) == 0 { return None }
+    return strings.parseIntOpt(&s)
+}
+
+fn runQuery(c: mut &sqlserver.Conn, label: &str, sql: &str): Result[sqlserver.Rows, str] {
+    match c.query(sql, &[]) {
+        Ok(r) { return Ok(r) }
+        Err(e) { return Err("catalog query (" + label + "): " + e.toStr()) }
+    }
+}
+
+// ---------------------------------------------------------------- types
+
+fn isSupportedSystemType(t: &str): bool {
+    match t.toStr() {
+        "tinyint", "smallint", "int", "bigint", "bit",
+        "decimal", "numeric", "money", "smallmoney",
+        "float", "real",
+        "char", "varchar", "nchar", "nvarchar", "text", "ntext", "sysname",
+        "binary", "varbinary", "image", "timestamp", "rowversion",
+        "date", "time", "datetime", "smalldatetime", "datetime2", "datetimeoffset",
+        "uniqueidentifier", "xml" { return true }
+        else { return false }
+    }
+}
+
+fn isCharType(t: &str): bool {
+    match t.toStr() {
+        "char", "varchar", "nchar", "nvarchar", "text", "ntext" { return true }
+        else { return false }
+    }
+}
+
+pub fn formatColType(c: &ColInfo): str {
+    let t = strings.toLowerAscii(&c.baseType)
+    match t {
+        "char", "varchar", "binary", "varbinary" {
+            if c.maxLen < 0 { return t + "(max)" }
+            let n = if c.maxLen > 0 { c.maxLen } else { 1 }
+            return t + "(" + n.toStr() + ")"
+        }
+        "nchar", "nvarchar" {
+            if c.maxLen < 0 { return t + "(max)" }
+            let n = if c.maxLen > 0 { c.maxLen / 2 } else { 1 }
+            return t + "(" + max(n, 1).toStr() + ")"
+        }
+        "decimal", "numeric" {
+            let p = if c.prec > 0 { c.prec } else { 18 }
+            return t + "(" + p.toStr() + ", " + c.scale.toStr() + ")"
+        }
+        "time", "datetime2", "datetimeoffset" {
+            return t + "(" + c.scale.toStr() + ")"
+        }
+        "timestamp", "rowversion" {
+            return "varbinary(8)"
+        }
+        else { return t }
+    }
+}
+
+// ---------------------------------------------------------------- extraction
+
+pub fn extractSchema(c: mut &sqlserver.Conn, filter: &Filter): Result[Schema, str] {
+    var sc = Schema{
+        sourceDatabase: c.database(),
+        sourceVersion: c.serverVersion(),
+        dbCollation: "SQL_Latin1_General_CP1_CI_AS",
+        schemas: [],
+        tableTypes: [],
+        sequences: [],
+        tables: [],
+        uniqueCons: [],
+        tableIndexes: [],
+        viewIndexes: [],
+        checks: [],
+        fks: [],
+        views: [],
+        routines: [],
+        warnings: []
+    }
+
+    // 1. Database collation
+    match c.query("SELECT TOP 1 collation_name FROM sys.databases WHERE database_id = DB_ID()", &[]) {
+        Ok(r) {
+            if r.rowCount() > 0 {
+                let col = qStr(&r, 0, 0)
+                if len(col) > 0 { sc.dbCollation = col }
+            }
+        }
+        Err(_) {}
+    }
+
+    // 2. User schemas (excluding SQL Server built-ins)
+    let rSchemas = try runQuery(c, "schemas",
+        "SELECT s.name FROM sys.schemas s " +
+        "WHERE s.name NOT IN ('dbo','guest','INFORMATION_SCHEMA','sys'," +
+        "'db_owner','db_accessadmin','db_securityadmin','db_ddladmin'," +
+        "'db_backupoperator','db_datareader','db_datawriter'," +
+        "'db_denydatareader','db_denydatawriter') " +
+        "ORDER BY s.name")
+    for i in 0..rSchemas.rowCount() {
+        let sname = qStr(&rSchemas, i, 0)
+        if schemaAllowed(filter, &sname) {
+            append(mut &sc.schemas, sname)
+        }
+    }
+
+    // 3. User tables
+    let rTables = try runQuery(c, "tables",
+        "SELECT t.object_id, s.name, t.name " +
+        "FROM sys.tables t " +
+        "JOIN sys.schemas s ON s.schema_id = t.schema_id " +
+        "WHERE t.is_ms_shipped = 0 " +
+        "ORDER BY s.name, t.name")
+    var tabIdxByOid: Map[int, int] = newMap()
+    for i in 0..rTables.rowCount() {
+        let oid = qInt(&rTables, i, 0)
+        let sname = qStr(&rTables, i, 1)
+        let tname = qStr(&rTables, i, 2)
+        if !tableAllowed(filter, &sname, &tname) { continue }
+        let idx = len(sc.tables)
+        tabIdxByOid.put(oid, idx)
+        append(mut &sc.tables, TableInfo{
+            objId: oid, schemaName: sname, name: tname,
+            cols: [], pk: None, hasUnsupportedCols: false
+        })
+    }
+
+    // 4. Table columns (LEFT JOIN base system type so CLR UDTs don't vanish)
+    let rCols = try runQuery(c, "columns",
+        "SELECT c.object_id, c.column_id, c.name, " +
+        "       st.name, ut.name, ut.is_user_defined, " +
+        "       c.max_length, c.precision, c.scale, " +
+        "       c.collation_name, c.is_nullable, c.is_identity, c.is_computed " +
+        "FROM sys.columns c " +
+        "JOIN sys.tables t ON t.object_id = c.object_id " +
+        "LEFT JOIN sys.types st ON st.user_type_id = c.system_type_id " +
+        "JOIN sys.types ut ON ut.user_type_id = c.user_type_id " +
+        "WHERE t.is_ms_shipped = 0 " +
+        "ORDER BY c.object_id, c.column_id")
+    for i in 0..rCols.rowCount() {
+        let oid = qInt(&rCols, i, 0)
+        let tiOpt = tabIdxByOid.get(oid)
+        if tiOpt.isNone() { continue }
+        let ti = tiOpt.unwrap()
+        let colId = qInt(&rCols, i, 1)
+        let cname = qStr(&rCols, i, 2)
+        let stName = strings.toLowerAscii(&(qStr(&rCols, i, 3)))
+        let utName = qStr(&rCols, i, 4)
+        let isUdt = qBool(&rCols, i, 5)
+        let maxLen = qInt(&rCols, i, 6)
+        let prec = qInt(&rCols, i, 7)
+        let scale = qInt(&rCols, i, 8)
+        let coll = qStr(&rCols, i, 9)
+        let nullable = qBool(&rCols, i, 10)
+        let isIdent = qBool(&rCols, i, 11)
+        let isComp = qBool(&rCols, i, 12)
+
+        let base = if len(stName) > 0 { stName } else { strings.toLowerAscii(&utName) }
+        var unsup = false
+        var unsupReason = ""
+        if !isSupportedSystemType(&base) {
+            unsup = true
+            unsupReason = "unsupported SQL Server column type '" + utName + "'"
+            sc.tables[ti].hasUnsupportedCols = true
+            append(mut &sc.warnings, Warning{
+                severity: if filter.skipUnsupported { "warn" } else { "error" },
+                object: qualName(&sc.tables[ti].schemaName, &sc.tables[ti].name) + "." + quoteIdent(&cname),
+                message: unsupReason + (if filter.skipUnsupported { " (column skipped)" } else { "" })
+            })
+        } else if isUdt && strings.toLowerAscii(&utName) != "sysname" {
+            var tmpCol = ColInfo{
+                colId: colId, name: cname.clone(), baseType: base.clone(), userType: utName.clone(),
+                isUserDefined: true, maxLen: maxLen, prec: prec, scale: scale, collation: coll.clone(),
+                nullable: nullable, isIdentity: isIdent, identSeed: 1, identInc: 1,
+                hasIdentLast: false, identLast: 0, isComputed: isComp, compDef: "", isPersisted: false,
+                hasDefault: false, defName: "", defExpr: "", defSysNamed: true,
+                unsupported: false, unsupportedReason: ""
+            }
+            append(mut &sc.warnings, Warning{
+                severity: "info",
+                object: qualName(&sc.tables[ti].schemaName, &sc.tables[ti].name) + "." + quoteIdent(&cname),
+                message: "user-defined alias type '" + utName + "' unfolded to " + formatColType(&tmpCol)
+            })
+        } else if base == "timestamp" || base == "rowversion" {
+            append(mut &sc.warnings, Warning{
+                severity: "info",
+                object: qualName(&sc.tables[ti].schemaName, &sc.tables[ti].name) + "." + quoteIdent(&cname),
+                message: "rowversion/timestamp column mapped to varbinary(8) preserving raw 8-byte values"
+            })
+        }
+
+        append(mut &sc.tables[ti].cols, ColInfo{
+            colId: colId, name: cname, baseType: base, userType: utName,
+            isUserDefined: isUdt, maxLen: maxLen, prec: prec, scale: scale,
+            collation: coll, nullable: nullable, isIdentity: isIdent,
+            identSeed: 1, identInc: 1, hasIdentLast: false, identLast: 0,
+            isComputed: isComp, compDef: "", isPersisted: false,
+            hasDefault: false, defName: "", defExpr: "", defSysNamed: true,
+            unsupported: unsup, unsupportedReason: unsupReason
+        })
+    }
+
+    // 5. Identity metadata (CAST sql_variant -> nvarchar(64) for cross-server compatibility)
+    let rIdent = try runQuery(c, "identity_columns",
+        "SELECT ic.object_id, ic.column_id, " +
+        "       CAST(ic.seed_value AS nvarchar(64)), " +
+        "       CAST(ic.increment_value AS nvarchar(64)), " +
+        "       CAST(ic.last_value AS nvarchar(64)) " +
+        "FROM sys.identity_columns ic " +
+        "JOIN sys.tables t ON t.object_id = ic.object_id " +
+        "WHERE t.is_ms_shipped = 0")
+    for i in 0..rIdent.rowCount() {
+        let oid = qInt(&rIdent, i, 0)
+        let tiOpt = tabIdxByOid.get(oid)
+        if tiOpt.isNone() { continue }
+        let ti = tiOpt.unwrap()
+        let colId = qInt(&rIdent, i, 1)
+        let seed = qParsedInt(&rIdent, i, 2).unwrapOr(1)
+        let inc = qParsedInt(&rIdent, i, 3).unwrapOr(1)
+        let lastOpt = qParsedInt(&rIdent, i, 4)
+        for k in 0..len(sc.tables[ti].cols) {
+            if sc.tables[ti].cols[k].colId == colId {
+                sc.tables[ti].cols[k].identSeed = seed
+                sc.tables[ti].cols[k].identInc = inc
+                match lastOpt {
+                    Some(lv) {
+                        sc.tables[ti].cols[k].hasIdentLast = true
+                        sc.tables[ti].cols[k].identLast = lv
+                    }
+                    None {}
+                }
+                break
+            }
+        }
+    }
+
+    // 6. Computed columns
+    let rComp = try runQuery(c, "computed_columns",
+        "SELECT cc.object_id, cc.column_id, cc.definition, cc.is_persisted " +
+        "FROM sys.computed_columns cc " +
+        "JOIN sys.tables t ON t.object_id = cc.object_id " +
+        "WHERE t.is_ms_shipped = 0")
+    for i in 0..rComp.rowCount() {
+        let oid = qInt(&rComp, i, 0)
+        let tiOpt = tabIdxByOid.get(oid)
+        if tiOpt.isNone() { continue }
+        let ti = tiOpt.unwrap()
+        let colId = qInt(&rComp, i, 1)
+        let defn = qStr(&rComp, i, 2)
+        let pers = qBool(&rComp, i, 3)
+        for k in 0..len(sc.tables[ti].cols) {
+            if sc.tables[ti].cols[k].colId == colId {
+                sc.tables[ti].cols[k].isComputed = true
+                sc.tables[ti].cols[k].compDef = defn.clone()
+                sc.tables[ti].cols[k].isPersisted = pers
+                break
+            }
+        }
+    }
+
+    // 7. Default constraints
+    let rDef = try runQuery(c, "default_constraints",
+        "SELECT dc.parent_object_id, dc.parent_column_id, dc.name, dc.definition, dc.is_system_named " +
+        "FROM sys.default_constraints dc " +
+        "JOIN sys.tables t ON t.object_id = dc.parent_object_id " +
+        "WHERE t.is_ms_shipped = 0")
+    for i in 0..rDef.rowCount() {
+        let oid = qInt(&rDef, i, 0)
+        let tiOpt = tabIdxByOid.get(oid)
+        if tiOpt.isNone() { continue }
+        let ti = tiOpt.unwrap()
+        let colId = qInt(&rDef, i, 1)
+        let dname = qStr(&rDef, i, 2)
+        let dexpr = qStr(&rDef, i, 3)
+        let sysNamed = qBool(&rDef, i, 4)
+        for k in 0..len(sc.tables[ti].cols) {
+            if sc.tables[ti].cols[k].colId == colId {
+                sc.tables[ti].cols[k].hasDefault = true
+                sc.tables[ti].cols[k].defName = dname.clone()
+                sc.tables[ti].cols[k].defExpr = dexpr.clone()
+                sc.tables[ti].cols[k].defSysNamed = sysNamed
+                break
+            }
+        }
+    }
+
+    // 8. Sequences (omitted when --table scopes migration to specific tables)
+    if len(filter.tables) == 0 {
+        let rSeq = try runQuery(c, "sequences",
+            "SELECT s.name, sq.name, st.name, " +
+            "       CAST(sq.start_value AS nvarchar(64)), " +
+            "       CAST(sq.increment AS nvarchar(64)), " +
+            "       CAST(sq.minimum_value AS nvarchar(64)), " +
+            "       CAST(sq.maximum_value AS nvarchar(64)), " +
+            "       sq.is_cycling, sq.cache_size, " +
+            "       CAST(sq.last_used_value AS nvarchar(64)) " +
+            "FROM sys.sequences sq " +
+            "JOIN sys.schemas s ON s.schema_id = sq.schema_id " +
+            "JOIN sys.types st ON st.user_type_id = sq.system_type_id " +
+            "WHERE sq.is_ms_shipped = 0 " +
+            "ORDER BY s.name, sq.name")
+        for i in 0..rSeq.rowCount() {
+            let sname = qStr(&rSeq, i, 0)
+            if !schemaAllowed(filter, &sname) { continue }
+            let lastOpt = qParsedInt(&rSeq, i, 9)
+            append(mut &sc.sequences, SeqInfo{
+                schemaName: sname,
+                name: qStr(&rSeq, i, 1),
+                typeName: strings.toLowerAscii(&(qStr(&rSeq, i, 2))),
+                startVal: qParsedInt(&rSeq, i, 3).unwrapOr(1),
+                incVal: qParsedInt(&rSeq, i, 4).unwrapOr(1),
+                minVal: qParsedInt(&rSeq, i, 5).unwrapOr(-9223372036854775808),
+                maxVal: qParsedInt(&rSeq, i, 6).unwrapOr(9223372036854775807),
+                isCycling: qBool(&rSeq, i, 7),
+                cacheSize: qInt(&rSeq, i, 8),
+                hasLastVal: lastOpt.isSome(),
+                lastVal: lastOpt.unwrapOr(0)
+            })
+        }
+    }
+
+    // 9. User-defined table types (CREATE TYPE ... AS TABLE)
+    if len(filter.tables) == 0 {
+        let rTT = try runQuery(c, "table_types",
+            "SELECT s.name, tt.name, tt.type_table_object_id " +
+            "FROM sys.table_types tt " +
+            "JOIN sys.schemas s ON s.schema_id = tt.schema_id " +
+            "ORDER BY s.name, tt.name")
+        var ttIdxByOid: Map[int, int] = newMap()
+        for i in 0..rTT.rowCount() {
+            let sname = qStr(&rTT, i, 0)
+            if !schemaAllowed(filter, &sname) { continue }
+            let tname = qStr(&rTT, i, 1)
+            let ttoid = qInt(&rTT, i, 2)
+            ttIdxByOid.put(ttoid, len(sc.tableTypes))
+            append(mut &sc.tableTypes, TabTypeInfo{
+                schemaName: sname, name: tname, typeTableObjId: ttoid, cols: []
+            })
+        }
+        if len(sc.tableTypes) > 0 {
+            let rTTCols = try runQuery(c, "table_type_columns",
+                "SELECT c.object_id, c.column_id, c.name, st.name, ut.name, " +
+                "       c.max_length, c.precision, c.scale, c.collation_name, c.is_nullable " +
+                "FROM sys.columns c " +
+                "JOIN sys.table_types tt ON tt.type_table_object_id = c.object_id " +
+                "LEFT JOIN sys.types st ON st.user_type_id = c.system_type_id " +
+                "JOIN sys.types ut ON ut.user_type_id = c.user_type_id " +
+                "ORDER BY c.object_id, c.column_id")
+            for i in 0..rTTCols.rowCount() {
+                let oid = qInt(&rTTCols, i, 0)
+                let idxOpt = ttIdxByOid.get(oid)
+                if idxOpt.isNone() { continue }
+                let k = idxOpt.unwrap()
+                let stn = strings.toLowerAscii(&(qStr(&rTTCols, i, 3)))
+                let utn = qStr(&rTTCols, i, 4)
+                let base = if len(stn) > 0 { stn } else { strings.toLowerAscii(&utn) }
+                append(mut &sc.tableTypes[k].cols, ColInfo{
+                    colId: qInt(&rTTCols, i, 1), name: qStr(&rTTCols, i, 2),
+                    baseType: base, userType: utn, isUserDefined: false,
+                    maxLen: qInt(&rTTCols, i, 5), prec: qInt(&rTTCols, i, 6), scale: qInt(&rTTCols, i, 7),
+                    collation: qStr(&rTTCols, i, 8), nullable: qBool(&rTTCols, i, 9),
+                    isIdentity: false, identSeed: 1, identInc: 1, hasIdentLast: false, identLast: 0,
+                    isComputed: false, compDef: "", isPersisted: false,
+                    hasDefault: false, defName: "", defExpr: "", defSysNamed: true,
+                    unsupported: false, unsupportedReason: ""
+                })
+            }
+        }
+    }
+
+    // 10. Views, functions, stored procedures (sys.sql_modules)
+    let rMods = try runQuery(c, "sql_modules",
+        "SELECT o.object_id, s.name, o.name, RTRIM(o.type), m.definition, m.is_schema_bound " +
+        "FROM sys.objects o " +
+        "JOIN sys.schemas s ON s.schema_id = o.schema_id " +
+        "JOIN sys.sql_modules m ON m.object_id = o.object_id " +
+        "WHERE o.is_ms_shipped = 0 AND RTRIM(o.type) IN ('V', 'FN', 'IF', 'TF', 'P') " +
+        "ORDER BY s.name, o.name")
+    var viewOids: Map[int, int] = newMap()
+    for i in 0..rMods.rowCount() {
+        let oid = qInt(&rMods, i, 0)
+        let sname = qStr(&rMods, i, 1)
+        let mname = qStr(&rMods, i, 2)
+        let mtype = strings.trim(&(qStr(&rMods, i, 3)))
+        let defn = qStr(&rMods, i, 4)
+        let bound = qBool(&rMods, i, 5)
+        if !schemaAllowed(filter, &sname) { continue }
+        if len(filter.tables) > 0 { continue }       // table-scoped migration skips views/procs
+        if len(strings.trim(&defn)) == 0 {
+            append(mut &sc.warnings, Warning{
+                severity: "warn",
+                object: qualName(&sname, &mname),
+                message: "module definition is NULL/encrypted; skipped"
+            })
+            continue
+        }
+        let m = ModuleInfo{
+            objId: oid, schemaName: sname, name: mname,
+            objType: mtype, definition: defn, isSchemaBound: bound
+        }
+        if m.objType == "V" {
+            viewOids.put(oid, len(sc.views))
+            append(mut &sc.views, m)
+        } else {
+            append(mut &sc.routines, m)
+        }
+    }
+
+    // 11. Indexes and key constraints (on both tables and views)
+    let rIdx = try runQuery(c, "indexes",
+        "SELECT i.object_id, i.index_id, i.name, i.type, i.type_desc, " +
+        "       i.is_unique, i.is_primary_key, i.is_unique_constraint, " +
+        "       i.has_filter, i.filter_definition, RTRIM(o.type), s.name, o.name " +
+        "FROM sys.indexes i " +
+        "JOIN sys.objects o ON o.object_id = i.object_id " +
+        "JOIN sys.schemas s ON s.schema_id = o.schema_id " +
+        "WHERE o.is_ms_shipped = 0 AND i.index_id > 0 AND RTRIM(o.type) IN ('U', 'V') " +
+        "ORDER BY i.object_id, i.index_id")
+    var allIdxs: []IdxInfo = []
+    var idxPos: Map[str, int] = newMap()
+    for i in 0..rIdx.rowCount() {
+        let oid = qInt(&rIdx, i, 0)
+        let idxId = qInt(&rIdx, i, 1)
+        let iname = qStr(&rIdx, i, 2)
+        let itype = qInt(&rIdx, i, 3)
+        let tdesc = qStr(&rIdx, i, 4)
+        let isUniq = qBool(&rIdx, i, 5)
+        let isPk = qBool(&rIdx, i, 6)
+        let isUqCon = qBool(&rIdx, i, 7)
+        let hasFilt = qBool(&rIdx, i, 8)
+        let filtDef = qStr(&rIdx, i, 9)
+        let otype = strings.trim(&(qStr(&rIdx, i, 10)))
+        let sname = qStr(&rIdx, i, 11)
+        let oname = qStr(&rIdx, i, 12)
+        if otype == "U" && !tabIdxByOid.has(oid) { continue }
+        if otype == "V" && !viewOids.has(oid) { continue }
+        if itype != 1 && itype != 2 {
+            append(mut &sc.warnings, Warning{
+                severity: "warn",
+                object: qualName(&sname, &oname) + "." + quoteIdent(&iname),
+                message: "unsupported index type " + tdesc + " (skipped)"
+            })
+            continue
+        }
+        let key = oid.toStr() + ":" + idxId.toStr()
+        idxPos.put(key, len(allIdxs))
+        append(mut &allIdxs, IdxInfo{
+            indexId: idxId, name: iname, objId: oid, objType: otype,
+            schemaName: sname, tableName: oname, idxType: itype, typeDesc: tdesc,
+            isUnique: isUniq, isPk: isPk, isUqCon: isUqCon,
+            hasFilter: hasFilt, filterDef: filtDef, cols: []
+        })
+    }
+
+    if len(allIdxs) > 0 {
+        let rIdxCols = try runQuery(c, "index_columns",
+            "SELECT ic.object_id, ic.index_id, ic.is_descending_key, ic.is_included_column, c.name " +
+            "FROM sys.index_columns ic " +
+            "JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id " +
+            "JOIN sys.objects o ON o.object_id = ic.object_id " +
+            "WHERE o.is_ms_shipped = 0 AND RTRIM(o.type) IN ('U', 'V') " +
+            "ORDER BY ic.object_id, ic.index_id, ic.is_included_column, ic.key_ordinal, ic.index_column_id")
+        for i in 0..rIdxCols.rowCount() {
+            let key = qInt(&rIdxCols, i, 0).toStr() + ":" + qInt(&rIdxCols, i, 1).toStr()
+            let posOpt = idxPos.get(&key)
+            if posOpt.isNone() { continue }
+            let p = posOpt.unwrap()
+            append(mut &allIdxs[p].cols, IdxCol{
+                name: qStr(&rIdxCols, i, 4),
+                desc: qBool(&rIdxCols, i, 2),
+                included: qBool(&rIdxCols, i, 3)
+            })
+        }
+    }
+
+    for i in 0..len(allIdxs) {
+        let ix = replace(mut &allIdxs[i], IdxInfo{
+            indexId: 0, name: "", objId: 0, objType: "", schemaName: "", tableName: "",
+            idxType: 0, typeDesc: "", isUnique: false, isPk: false, isUqCon: false,
+            hasFilter: false, filterDef: "", cols: []
+        })
+        if len(ix.cols) == 0 { continue }
+        if ix.objType == "V" {
+            append(mut &sc.viewIndexes, ix)
+        } else if ix.isPk {
+            let tiOpt = tabIdxByOid.get(ix.objId)
+            if tiOpt.isSome() { sc.tables[tiOpt.unwrap()].pk = Some(ix) }
+        } else if ix.isUqCon {
+            append(mut &sc.uniqueCons, ix)
+        } else {
+            append(mut &sc.tableIndexes, ix)
+        }
+    }
+
+    // 12. Check constraints
+    let rChk = try runQuery(c, "check_constraints",
+        "SELECT cc.parent_object_id, cc.name, s.name, t.name, cc.definition, cc.is_disabled, cc.is_not_trusted " +
+        "FROM sys.check_constraints cc " +
+        "JOIN sys.tables t ON t.object_id = cc.parent_object_id " +
+        "JOIN sys.schemas s ON s.schema_id = t.schema_id " +
+        "WHERE t.is_ms_shipped = 0 " +
+        "ORDER BY s.name, t.name, cc.name")
+    for i in 0..rChk.rowCount() {
+        let oid = qInt(&rChk, i, 0)
+        if !tabIdxByOid.has(oid) { continue }
+        append(mut &sc.checks, CheckInfo{
+            name: qStr(&rChk, i, 1),
+            schemaName: qStr(&rChk, i, 2),
+            tableName: qStr(&rChk, i, 3),
+            definition: qStr(&rChk, i, 4),
+            isDisabled: qBool(&rChk, i, 5),
+            isNotTrusted: qBool(&rChk, i, 6)
+        })
+    }
+
+    // 13. Foreign keys
+    let rFk = try runQuery(c, "foreign_keys",
+        "SELECT fk.object_id, fk.name, fk.parent_object_id, fk.referenced_object_id, " +
+        "       ps.name, pt.name, rs.name, rt.name, " +
+        "       fk.is_disabled, fk.is_not_trusted, " +
+        "       fk.delete_referential_action_desc, fk.update_referential_action_desc " +
+        "FROM sys.foreign_keys fk " +
+        "JOIN sys.tables pt ON pt.object_id = fk.parent_object_id " +
+        "JOIN sys.schemas ps ON ps.schema_id = pt.schema_id " +
+        "JOIN sys.tables rt ON rt.object_id = fk.referenced_object_id " +
+        "JOIN sys.schemas rs ON rs.schema_id = rt.schema_id " +
+        "WHERE pt.is_ms_shipped = 0 " +
+        "ORDER BY ps.name, pt.name, fk.name")
+    var fkPosByOid: Map[int, int] = newMap()
+    for i in 0..rFk.rowCount() {
+        let foid = qInt(&rFk, i, 0)
+        let poid = qInt(&rFk, i, 2)
+        let roid = qInt(&rFk, i, 3)
+        if !tabIdxByOid.has(poid) { continue }
+        let fname = qStr(&rFk, i, 1)
+        let ps = qStr(&rFk, i, 4)
+        let pt = qStr(&rFk, i, 5)
+        let rs = qStr(&rFk, i, 6)
+        let rt = qStr(&rFk, i, 7)
+        if !tabIdxByOid.has(roid) {
+            append(mut &sc.warnings, Warning{
+                severity: "warn",
+                object: qualName(&ps, &pt) + "." + quoteIdent(&fname),
+                message: "foreign key references excluded table " + qualName(&rs, &rt) + " (skipped)"
+            })
+            continue
+        }
+        fkPosByOid.put(foid, len(sc.fks))
+        append(mut &sc.fks, FkInfo{
+            objId: foid, name: fname,
+            parentSchema: ps, parentTable: pt,
+            refSchema: rs, refTable: rt,
+            isDisabled: qBool(&rFk, i, 8),
+            isNotTrusted: qBool(&rFk, i, 9),
+            deleteAction: qStr(&rFk, i, 10),
+            updateAction: qStr(&rFk, i, 11),
+            cols: []
+        })
+    }
+
+    if len(sc.fks) > 0 {
+        let rFkCols = try runQuery(c, "foreign_key_columns",
+            "SELECT fkc.constraint_object_id, pc.name, rc.name " +
+            "FROM sys.foreign_key_columns fkc " +
+            "JOIN sys.columns pc ON pc.object_id = fkc.parent_object_id AND pc.column_id = fkc.parent_column_id " +
+            "JOIN sys.columns rc ON rc.object_id = fkc.referenced_object_id AND rc.column_id = fkc.referenced_column_id " +
+            "ORDER BY fkc.constraint_object_id, fkc.constraint_column_id")
+        for i in 0..rFkCols.rowCount() {
+            let foid = qInt(&rFkCols, i, 0)
+            let pOpt = fkPosByOid.get(foid)
+            if pOpt.isNone() { continue }
+            append(mut &sc.fks[pOpt.unwrap()].cols, FkCol{
+                parentCol: qStr(&rFkCols, i, 1),
+                refCol: qStr(&rFkCols, i, 2)
+            })
+        }
+    }
+
+    // Narrow schemas when --table selects specific tables
+    if len(filter.tables) > 0 {
+        var usedSchemas: Map[str, bool] = newMap()
+        for i in 0..len(sc.tables) {
+            usedSchemas.put(strings.toLowerAscii(&sc.tables[i].schemaName), true)
+        }
+        var kept: []str = []
+        for s in sc.schemas {
+            if usedSchemas.has(&(strings.toLowerAscii(&s))) { append(mut &kept, s.clone()) }
+        }
+        sc.schemas = kept
+    }
+
+    // 14. Discovery of unsupported objects for the migration report (best-effort)
+    match c.query(
+        "SELECT tr.parent_id, s.name, o.name, tr.name " +
+        "FROM sys.triggers tr " +
+        "JOIN sys.objects o ON o.object_id = tr.parent_id " +
+        "JOIN sys.schemas s ON s.schema_id = o.schema_id " +
+        "WHERE tr.is_ms_shipped = 0", &[]) {
+        Ok(rTrig) {
+            for i in 0..rTrig.rowCount() {
+                let poid = qInt(&rTrig, i, 0)
+                let sname = qStr(&rTrig, i, 1)
+                if !schemaAllowed(filter, &sname) { continue }
+                if len(filter.tables) > 0 && !tabIdxByOid.has(poid) { continue }
+                append(mut &sc.warnings, Warning{
+                    severity: "warn",
+                    object: qualName(&sname, &(qStr(&rTrig, i, 2))) + "." + quoteIdent(&(qStr(&rTrig, i, 3))),
+                    message: "trigger is not supported by LexDB (skipped)"
+                })
+            }
+        }
+        Err(_) {}
+    }
+
+    if len(filter.tables) == 0 {
+        match c.query(
+            "SELECT s.name, o.name, RTRIM(o.type), o.type_desc " +
+            "FROM sys.objects o " +
+            "JOIN sys.schemas s ON s.schema_id = o.schema_id " +
+            "WHERE o.is_ms_shipped = 0 AND RTRIM(o.type) IN ('PC', 'FS', 'FT', 'AF', 'TA', 'SN')", &[]) {
+            Ok(rOther) {
+                for i in 0..rOther.rowCount() {
+                    let sname = qStr(&rOther, i, 0)
+                    if !schemaAllowed(filter, &sname) { continue }
+                    append(mut &sc.warnings, Warning{
+                        severity: "warn",
+                        object: qualName(&sname, &(qStr(&rOther, i, 1))),
+                        message: "unsupported object type " + qStr(&rOther, i, 3) + " (" + qStr(&rOther, i, 2) + ") skipped"
+                    })
+                }
+            }
+            Err(_) {}
+        }
+    }
+
+    return Ok(sc)
+}
+
+// ---------------------------------------------------------------- DDL emission
+
+fn formatIdxCols(cols: &[]IdxCol, included: bool): str {
+    var parts: []str = []
+    for c in cols {
+        if c.included != included { continue }
+        if included {
+            append(mut &parts, quoteIdent(&c.name))
+        } else {
+            append(mut &parts, quoteIdent(&c.name) + (if c.desc { " DESC" } else { " ASC" }))
+        }
+    }
+    return strings.join(&parts, ", ")
+}
+
+fn fkActionSql(desc: &str): str {
+    match strings.toUpperAscii(desc) {
+        "CASCADE" { return "CASCADE" }
+        "SET_NULL" { return "SET NULL" }
+        "SET_DEFAULT" { return "SET DEFAULT" }
+        else { return "" }
+    }
+}
+
+fn emitColDef(c: &ColInfo, dbCollation: &str): str {
+    var s = quoteIdent(&c.name) + " "
+    if c.isComputed {
+        s += "AS " + c.compDef
+        if c.isPersisted {
+            s += " PERSISTED"
+            if !c.nullable { s += " NOT NULL" }
+        }
+        return s
+    }
+    s += formatColType(c)
+    if isCharType(&c.baseType) && len(c.collation) > 0 && c.collation != dbCollation {
+        s += " COLLATE " + c.collation
+    }
+    if c.isIdentity {
+        s += " IDENTITY(" + c.identSeed.toStr() + ", " + c.identInc.toStr() + ")"
+    }
+    s += if c.nullable { " NULL" } else { " NOT NULL" }
+    if c.hasDefault && len(c.defExpr) > 0 {
+        if !c.defSysNamed && len(c.defName) > 0 {
+            s += " CONSTRAINT " + quoteIdent(&c.defName)
+        }
+        s += " DEFAULT " + c.defExpr
+    }
+    return s
+}
+
+pub fn emitCreateTable(t: &TableInfo, dbCollation: &str): str {
+    var lines: []str = []
+    for i in 0..len(t.cols) {
+        if t.cols[i].unsupported { continue }
+        append(mut &lines, "    " + emitColDef(&t.cols[i], dbCollation))
+    }
+    match &t.pk {
+        Some(pk) {
+            let cl = if pk.idxType == 1 { "CLUSTERED" } else { "NONCLUSTERED" }
+            let colsSql = formatIdxCols(&pk.cols, false)
+            append(mut &lines, "    CONSTRAINT " + quoteIdent(&pk.name) + " PRIMARY KEY " + cl + " (" + colsSql + ")")
+        }
+        None {}
+    }
+    return "CREATE TABLE " + qualName(&t.schemaName, &t.name) + " (\n" + strings.join(&lines, ",\n") + "\n);"
+}
+
+pub fn emitCreateSequence(sq: &SeqInfo): str {
+    var s = "CREATE SEQUENCE " + qualName(&sq.schemaName, &sq.name)
+    if len(sq.typeName) > 0 { s += " AS " + sq.typeName }
+    s += " START WITH " + sq.startVal.toStr()
+    s += " INCREMENT BY " + sq.incVal.toStr()
+    s += " MINVALUE " + sq.minVal.toStr()
+    s += " MAXVALUE " + sq.maxVal.toStr()
+    if sq.isCycling { s += " CYCLE" } else { s += " NO CYCLE" }
+    if sq.cacheSize > 0 {
+        s += " CACHE " + sq.cacheSize.toStr()
+    } else {
+        s += " NO CACHE"
+    }
+    s += ";"
+    return s
+}
+
+pub fn emitRestartSequence(sq: &SeqInfo): Option[str] {
+    if !sq.hasLastVal { return None }
+    let nextVal = sq.lastVal + sq.incVal
+    return Some("ALTER SEQUENCE " + qualName(&sq.schemaName, &sq.name) + " RESTART WITH " + nextVal.toStr() + ";")
+}
+
+pub fn emitCreateTableType(tt: &TabTypeInfo, dbCollation: &str): str {
+    var lines: []str = []
+    for i in 0..len(tt.cols) {
+        append(mut &lines, "    " + emitColDef(&tt.cols[i], dbCollation))
+    }
+    return "CREATE TYPE " + qualName(&tt.schemaName, &tt.name) + " AS TABLE (\n" + strings.join(&lines, ",\n") + "\n);"
+}
+
+pub fn emitUniqueCon(ix: &IdxInfo): str {
+    let cl = if ix.idxType == 1 { "CLUSTERED" } else { "NONCLUSTERED" }
+    let colsSql = formatIdxCols(&ix.cols, false)
+    return "ALTER TABLE " + qualName(&ix.schemaName, &ix.tableName) +
+           " ADD CONSTRAINT " + quoteIdent(&ix.name) +
+           " UNIQUE " + cl + " (" + colsSql + ");"
+}
+
+pub fn emitCreateIndex(ix: &IdxInfo): str {
+    var s = "CREATE "
+    if ix.isUnique { s += "UNIQUE " }
+    s += if ix.idxType == 1 { "CLUSTERED " } else { "NONCLUSTERED " }
+    s += "INDEX " + quoteIdent(&ix.name) + " ON " + qualName(&ix.schemaName, &ix.tableName)
+    s += " (" + formatIdxCols(&ix.cols, false) + ")"
+    let inc = formatIdxCols(&ix.cols, true)
+    if len(inc) > 0 { s += " INCLUDE (" + inc + ")" }
+    if ix.hasFilter && len(ix.filterDef) > 0 { s += " WHERE " + ix.filterDef }
+    s += ";"
+    return s
+}
+
+pub fn emitCheckCon(ck: &CheckInfo): []str {
+    let qt = qualName(&ck.schemaName, &ck.tableName)
+    let mode = if ck.isDisabled || ck.isNotTrusted { "WITH NOCHECK " } else { "WITH CHECK " }
+    let defn = strings.trim(&ck.definition)
+    let expr = if strings.startsWith(&defn, "(") { defn } else { "(" + defn + ")" }
+    var stmts: []str = [
+        "ALTER TABLE " + qt + " " + mode + "ADD CONSTRAINT " + quoteIdent(&ck.name) + " CHECK " + expr + ";"
+    ]
+    if ck.isDisabled {
+        append(mut &stmts, "ALTER TABLE " + qt + " NOCHECK CONSTRAINT " + quoteIdent(&ck.name) + ";")
+    }
+    return stmts
+}
+
+pub fn emitFkCon(fk: &FkInfo): []str {
+    let pt = qualName(&fk.parentSchema, &fk.parentTable)
+    let rt = qualName(&fk.refSchema, &fk.refTable)
+    var pcols: []str = []
+    var rcols: []str = []
+    for c in fk.cols {
+        append(mut &pcols, quoteIdent(&c.parentCol))
+        append(mut &rcols, quoteIdent(&c.refCol))
+    }
+    let mode = if fk.isDisabled || fk.isNotTrusted { "WITH NOCHECK " } else { "WITH CHECK " }
+    var s = "ALTER TABLE " + pt + " " + mode + "ADD CONSTRAINT " + quoteIdent(&fk.name) +
+            " FOREIGN KEY (" + strings.join(&pcols, ", ") + ") REFERENCES " + rt +
+            " (" + strings.join(&rcols, ", ") + ")"
+    let del = fkActionSql(&fk.deleteAction)
+    if len(del) > 0 { s += " ON DELETE " + del }
+    let upd = fkActionSql(&fk.updateAction)
+    if len(upd) > 0 { s += " ON UPDATE " + upd }
+    s += ";"
+    var stmts: []str = [s]
+    if fk.isDisabled {
+        append(mut &stmts, "ALTER TABLE " + pt + " NOCHECK CONSTRAINT " + quoteIdent(&fk.name) + ";")
+    }
+    return stmts
+}
+
+pub fn emitPreSql(sc: &Schema): str {
+    var out = "-- LexDB T-SQL migration pre-data DDL\n"
+    out += "-- Source: " + sc.sourceDatabase + " (TDS " + sc.sourceVersion + ", collation " + sc.dbCollation + ")\n\n"
+    if len(sc.schemas) > 0 {
+        out += "-- Schemas\n"
+        for s in sc.schemas {
+            out += "CREATE SCHEMA " + quoteIdent(&s) + ";\nGO\n"
+        }
+        out += "\n"
+    }
+    if len(sc.tableTypes) > 0 {
+        out += "-- User-defined table types\n"
+        for i in 0..len(sc.tableTypes) {
+            out += emitCreateTableType(&sc.tableTypes[i], &sc.dbCollation) + "\nGO\n"
+        }
+        out += "\n"
+    }
+    if len(sc.sequences) > 0 {
+        out += "-- Sequences\n"
+        for i in 0..len(sc.sequences) {
+            out += emitCreateSequence(&sc.sequences[i]) + "\nGO\n"
+        }
+        out += "\n"
+    }
+    if len(sc.tables) > 0 {
+        out += "-- Tables\n"
+        for i in 0..len(sc.tables) {
+            out += emitCreateTable(&sc.tables[i], &sc.dbCollation) + "\nGO\n\n"
+        }
+    }
+    return out
+}
+
+pub fn emitPostSql(sc: &Schema): str {
+    var out = "-- LexDB T-SQL migration post-data DDL\n\n"
+    if len(sc.uniqueCons) > 0 {
+        out += "-- Unique constraints\n"
+        for i in 0..len(sc.uniqueCons) {
+            out += emitUniqueCon(&sc.uniqueCons[i]) + "\nGO\n"
+        }
+        out += "\n"
+    }
+    if len(sc.tableIndexes) > 0 {
+        out += "-- Indexes\n"
+        for i in 0..len(sc.tableIndexes) {
+            out += emitCreateIndex(&sc.tableIndexes[i]) + "\nGO\n"
+        }
+        out += "\n"
+    }
+    if len(sc.checks) > 0 {
+        out += "-- Check constraints\n"
+        for i in 0..len(sc.checks) {
+            for st in emitCheckCon(&sc.checks[i]) { out += st + "\nGO\n" }
+        }
+        out += "\n"
+    }
+    if len(sc.fks) > 0 {
+        out += "-- Foreign keys\n"
+        for i in 0..len(sc.fks) {
+            for st in emitFkCon(&sc.fks[i]) { out += st + "\nGO\n" }
+        }
+        out += "\n"
+    }
+    if len(sc.views) > 0 {
+        out += "-- Views\n"
+        for i in 0..len(sc.views) {
+            out += strings.trim(&sc.views[i].definition) + "\nGO\n\n"
+        }
+    }
+    if len(sc.viewIndexes) > 0 {
+        out += "-- Indexed view indexes\n"
+        // Clustered (index_id 1 / type 1) first so the view materializes before nonclustered indexes
+        for pass in 0..2 {
+            for i in 0..len(sc.viewIndexes) {
+                let isCl = sc.viewIndexes[i].idxType == 1
+                if (pass == 0) != isCl { continue }
+                out += emitCreateIndex(&sc.viewIndexes[i]) + "\nGO\n"
+            }
+        }
+        out += "\n"
+    }
+    if len(sc.routines) > 0 {
+        out += "-- Functions and stored procedures\n"
+        for i in 0..len(sc.routines) {
+            out += strings.trim(&sc.routines[i].definition) + "\nGO\n\n"
+        }
+    }
+    var hasSeqRestart = false
+    for i in 0..len(sc.sequences) {
+        if sc.sequences[i].hasLastVal { hasSeqRestart = true }
+    }
+    if hasSeqRestart {
+        out += "-- Sequence positions\n"
+        for i in 0..len(sc.sequences) {
+            match emitRestartSequence(&sc.sequences[i]) {
+                Some(st) { out += st + "\nGO\n" }
+                None {}
+            }
+        }
+        out += "\n"
+    }
+    return out
+}
+
+// ---------------------------------------------------------------- batch splitting & execution
+
+// Splits a T-SQL script into batches on standalone GO lines (case-insensitive).
+pub fn splitBatches(script: &str): []str {
+    var batches: []str = []
+    var cur: []str = []
+    let lines = strings.split(script, "\n")
+    for rawLine in lines {
+        let line = if len(rawLine) > 0 && rawLine[len(rawLine) - 1] == '\r' { rawLine[0..len(rawLine) - 1].toStr() } else { rawLine.clone() }
+        let trimmed = strings.trim(&line)
+        if strings.toUpperAscii(&trimmed) == "GO" {
+            let body = strings.trim(&(strings.join(&cur, "\n")))
+            if hasExecutableSql(&body) { append(mut &batches, body) }
+            cur = []
+        } else {
+            append(mut &cur, line)
+        }
+    }
+    let tail = strings.trim(&(strings.join(&cur, "\n")))
+    if hasExecutableSql(&tail) { append(mut &batches, tail) }
+    return batches
+}
+
+fn hasExecutableSql(batch: &str): bool {
+    let lines = strings.split(batch, "\n")
+    for l in lines {
+        let t = strings.trim(&l)
+        if len(t) > 0 && !strings.startsWith(&t, "--") { return true }
+    }
+    return false
+}
+
+fn previewBatch(sql: &str): str {
+    let lines = strings.split(sql, "\n")
+    for l in lines {
+        let t = strings.trim(&l)
+        if len(t) > 0 && !strings.startsWith(&t, "--") {
+            return if len(t) > 96 { t[0..96].toStr() + "..." } else { t }
+        }
+    }
+    return ""
+}
+
+fn execOneBatch(dst: mut &sqlserver.Conn, sql: &str): Result[Unit, str] {
+    match dst.exec(sql) {
+        Ok(_) { return Ok(Unit{}) }
+        Err(e) { return Err(e.toStr()) }
+    }
+}
+
+// Runs a list of batches with optional multi-pass dependency retry (useful when
+// view B references view A, or proc/func order isn't topological).
+pub fn runBatches(dst: mut &sqlserver.Conn, batches: &[]str, label: &str, retryDeps: bool,
+                  continueOnErr: bool, verbose: bool, errs: mut &[]str): Result[int, str] {
+    var pending: []int = []
+    for i in 0..len(batches) { append(mut &pending, i) }
+    var okCount = 0
+    var pass = 0
+    let maxPasses = if retryDeps { 8 } else { 1 }
+    while len(pending) > 0 && pass < maxPasses {
+        pass += 1
+        var nextPending: []int = []
+        var progressed = 0
+        for idx in pending {
+            let sql = &batches[idx]
+            match execOneBatch(dst, sql) {
+                Ok(_) {
+                    okCount += 1
+                    progressed += 1
+                    if verbose { println("  ok [" + label + "]: " + previewBatch(sql)) }
+                }
+                Err(msg) {
+                    if retryDeps && pass < maxPasses {
+                        append(mut &nextPending, idx)
+                    } else {
+                        let emsg = label + " failed (" + previewBatch(sql) + "): " + msg
+                        if continueOnErr {
+                            append(errs, emsg)
+                        } else {
+                            return Err(emsg)
+                        }
+                    }
+                }
+            }
+        }
+        if len(nextPending) == 0 { break }
+        if progressed == 0 {
+            // No more progress possible: report final errors for remaining batches
+            for idx in nextPending {
+                let sql = &batches[idx]
+                match execOneBatch(dst, sql) {
+                    Ok(_) { okCount += 1 }
+                    Err(msg) {
+                        let emsg = label + " failed (" + previewBatch(sql) + "): " + msg
+                        if continueOnErr {
+                            append(errs, emsg)
+                        } else {
+                            return Err(emsg)
+                        }
+                    }
+                }
+            }
+            break
+        }
+        pending = nextPending
+    }
+    return Ok(okCount)
+}
+
+// Applies pre-DDL from a live Schema (skipping schemas that already exist on target).
+pub fn applyPreSchema(dst: mut &sqlserver.Conn, sc: &Schema, continueOnErr: bool,
+                      verbose: bool, errs: mut &[]str): Result[int, str] {
+    var existingSchemas: Map[str, bool] = newMap()
+    match dst.query("SELECT name FROM sys.schemas", &[]) {
+        Ok(r) {
+            for i in 0..r.rowCount() {
+                existingSchemas.put(strings.toLowerAscii(&(qStr(&r, i, 0))), true)
+            }
+        }
+        Err(_) {}
+    }
+    var batches: []str = []
+    for s in sc.schemas {
+        if !existingSchemas.has(&(strings.toLowerAscii(&s))) {
+            append(mut &batches, "CREATE SCHEMA " + quoteIdent(&s) + ";")
+        }
+    }
+    for i in 0..len(sc.tableTypes) {
+        append(mut &batches, emitCreateTableType(&sc.tableTypes[i], &sc.dbCollation))
+    }
+    for i in 0..len(sc.sequences) {
+        append(mut &batches, emitCreateSequence(&sc.sequences[i]))
+    }
+    for i in 0..len(sc.tables) {
+        append(mut &batches, emitCreateTable(&sc.tables[i], &sc.dbCollation))
+    }
+    return runBatches(dst, &batches, "pre-ddl", false, continueOnErr, verbose, errs)
+}
+
+// Applies post-DDL from a live Schema in dependency-safe phases.
+pub fn applyPostSchema(dst: mut &sqlserver.Conn, sc: &Schema, continueOnErr: bool,
+                       verbose: bool, errs: mut &[]str): Result[int, str] {
+    var total = 0
+    var structBatches: []str = []
+    for i in 0..len(sc.uniqueCons) { append(mut &structBatches, emitUniqueCon(&sc.uniqueCons[i])) }
+    for i in 0..len(sc.tableIndexes) { append(mut &structBatches, emitCreateIndex(&sc.tableIndexes[i])) }
+    for i in 0..len(sc.checks) {
+        for st in emitCheckCon(&sc.checks[i]) { append(mut &structBatches, st) }
+    }
+    for i in 0..len(sc.fks) {
+        for st in emitFkCon(&sc.fks[i]) { append(mut &structBatches, st) }
+    }
+    total += try runBatches(dst, &structBatches, "constraints/indexes", false, continueOnErr, verbose, errs)
+
+    var viewBatches: []str = []
+    for i in 0..len(sc.views) { append(mut &viewBatches, strings.trim(&sc.views[i].definition)) }
+    total += try runBatches(dst, &viewBatches, "views", true, continueOnErr, verbose, errs)
+
+    var vidxBatches: []str = []
+    for pass in 0..2 {
+        for i in 0..len(sc.viewIndexes) {
+            let isCl = sc.viewIndexes[i].idxType == 1
+            if (pass == 0) != isCl { continue }
+            append(mut &vidxBatches, emitCreateIndex(&sc.viewIndexes[i]))
+        }
+    }
+    total += try runBatches(dst, &vidxBatches, "view-indexes", false, continueOnErr, verbose, errs)
+
+    var routBatches: []str = []
+    for i in 0..len(sc.routines) { append(mut &routBatches, strings.trim(&sc.routines[i].definition)) }
+    total += try runBatches(dst, &routBatches, "routines", true, continueOnErr, verbose, errs)
+
+    var seqBatches: []str = []
+    for i in 0..len(sc.sequences) {
+        match emitRestartSequence(&sc.sequences[i]) {
+            Some(st) { append(mut &seqBatches, st) }
+            None {}
+        }
+    }
+    total += try runBatches(dst, &seqBatches, "sequences", false, continueOnErr, verbose, errs)
+    return Ok(total)
+}
+
+// ---------------------------------------------------------------- reporting
+
+pub fn hasFatalWarnings(sc: &Schema): bool {
+    for w in sc.warnings {
+        if w.severity == "error" { return true }
+    }
+    return false
+}
+
+pub fn formatReport(sc: &Schema): str {
+    var out = "Source database : " + sc.sourceDatabase + "\n"
+    out += "Server version  : " + sc.sourceVersion + "\n"
+    out += "Collation       : " + sc.dbCollation + "\n"
+    out += "Objects found   :\n"
+    out += "  Schemas            : " + len(sc.schemas).toStr() + " (+ dbo)\n"
+    out += "  Table types        : " + len(sc.tableTypes).toStr() + "\n"
+    out += "  Sequences          : " + len(sc.sequences).toStr() + "\n"
+    out += "  Tables             : " + len(sc.tables).toStr() + "\n"
+    out += "  Unique constraints : " + len(sc.uniqueCons).toStr() + "\n"
+    out += "  Table indexes      : " + len(sc.tableIndexes).toStr() + "\n"
+    out += "  Check constraints  : " + len(sc.checks).toStr() + "\n"
+    out += "  Foreign keys       : " + len(sc.fks).toStr() + "\n"
+    out += "  Views              : " + len(sc.views).toStr() + " (" + len(sc.viewIndexes).toStr() + " view indexes)\n"
+    out += "  Routines           : " + len(sc.routines).toStr() + "\n"
+    if len(sc.warnings) > 0 {
+        out += "\nCompatibility notes & warnings (" + len(sc.warnings).toStr() + "):\n"
+        for w in sc.warnings {
+            out += "  [" + strings.toUpperAscii(&w.severity) + "] " + w.object + ": " + w.message + "\n"
+        }
+    } else {
+        out += "\nNo compatibility warnings.\n"
+    }
+    return out
+}
+
+// ---------------------------------------------------------------- manifest JSON
+
+pub fn manifestToJson(sc: &Schema, entries: &[]TableDumpEntry, compressed: bool): str {
+    var root = json.object()
+    root.set("format_version", json.integer(1))
+    root.set("dialect", json.string("mssql"))
+    root.set("source_database", json.string(&sc.sourceDatabase))
+    root.set("source_version", json.string(&sc.sourceVersion))
+    root.set("db_collation", json.string(&sc.dbCollation))
+    root.set("compressed", json.boolean(compressed))
+    root.set("pre_sql", json.string("01_pre.sql"))
+    root.set("post_sql", json.string("02_post.sql"))
+
+    var tabs = json.emptyArray()
+    for e in entries {
+        var o = json.object()
+        o.set("schema", json.string(&e.schemaName))
+        o.set("table", json.string(&e.tableName))
+        o.set("file", json.string(&e.fileName))
+        o.set("rows", json.integer(e.rows))
+        tabs.push(o)
+    }
+    root.set("tables", tabs)
+
+    var warns = json.emptyArray()
+    for w in sc.warnings {
+        var o = json.object()
+        o.set("severity", json.string(&w.severity))
+        o.set("object", json.string(&w.object))
+        o.set("message", json.string(&w.message))
+        warns.push(o)
+    }
+    root.set("warnings", warns)
+    return root.pretty() + "\n"
+}
+
+pub fn parseManifest(text: &str): Result[Manifest, str] {
+    let root = match json.parse(text) {
+        Ok(j) { j }
+        Err(e) { return Err("manifest.json: " + e.toStr()) }
+    }
+    if !root.isObject() { return Err("manifest.json: expected JSON object") }
+    let ver = root.field("format_version").asInt().unwrapOr(0)
+    if ver != 1 { return Err("manifest.json: unsupported format_version " + ver.toStr()) }
+
+    var m = Manifest{
+        formatVersion: ver,
+        sourceDatabase: root.field("source_database").asStr().unwrapOr(""),
+        sourceVersion: root.field("source_version").asStr().unwrapOr(""),
+        dbCollation: root.field("db_collation").asStr().unwrapOr(""),
+        compressed: root.field("compressed").asBool().unwrapOr(false),
+        preSql: root.field("pre_sql").asStr().unwrapOr("01_pre.sql"),
+        postSql: root.field("post_sql").asStr().unwrapOr("02_post.sql"),
+        tables: [],
+        warnings: []
+    }
+    let tabs = root.field("tables")
+    if tabs.isArray() {
+        for i in 0..tabs.size() {
+            let item = tabs.item(i)
+            append(mut &m.tables, TableDumpEntry{
+                schemaName: item.field("schema").asStr().unwrapOr("dbo"),
+                tableName: item.field("table").asStr().unwrapOr(""),
+                fileName: item.field("file").asStr().unwrapOr(""),
+                rows: item.field("rows").asInt().unwrapOr(0)
+            })
+        }
+    }
+    let warns = root.field("warnings")
+    if warns.isArray() {
+        for i in 0..warns.size() {
+            let item = warns.item(i)
+            append(mut &m.warnings, Warning{
+                severity: item.field("severity").asStr().unwrapOr("warn"),
+                object: item.field("object").asStr().unwrapOr(""),
+                message: item.field("message").asStr().unwrapOr("")
+            })
+        }
+    }
+    return Ok(m)
+}

@@ -238,6 +238,6 @@ psql -h 127.0.0.1 -p 5433 -U postgres lexdb
 | [Read replicas](lexell/docs/lexdb/replicas.md) | Scaling reads across cores, per-door read-only routing, and `WAIT FOR LSN`. |
 | [Assertions](lexell/docs/lexdb/assertions.md) | SQL-standard `CREATE ASSERTION` enforced across PostgreSQL, SQL Server, and Oracle doors. |
 | [SELECT ... WAIT](lexell/docs/lexdb/sql/postgresql/select-wait.md) & [MATCH_RECOGNIZE](lexell/docs/lexdb/sql/postgresql/match-recognize.md) | Transactional event streams (`WAIT n SECONDS`) and SQL:2016 row pattern recognition. |
-| [Bulk loading](lexell/docs/lexdb/bulk-load.md) & [PostgreSQL `pg_dump`/`pg_restore`](lexell/docs/lexdb/pg-restore.md) | Fast `COPY`/bcp/array DML loading and restoring real PostgreSQL backups (`-Fp`, `-Fc`, `-Ft`, `-Fd`) directly into LexDB. |
+| [Bulk loading](lexell/docs/lexdb/bulk-load.md), [PostgreSQL `pg_dump`/`pg_restore`](lexell/docs/lexdb/pg-restore.md) & [SQL Server migration (`lexmigrate`)](lexell/docs/lexdb/migrate-mssql.md) | Fast `COPY`/bcp/array DML loading, restoring PostgreSQL backups (`-Fp`, `-Fc`, `-Ft`, `-Fd`), and native TDS live migration & zstd dump/restore from SQL Server. |
 | [Full LexDB documentation](lexell/docs/lexdb/README.md) | Architecture, transactions, security, bulk loading, property graphs, and complete SQL references for all three doors. |
 | [Internals & benchmark history](lexell/design/lexdb.md) | Storage engine internals ([lexdb.md](lexell/design/lexdb.md)) and the full historical benchmark log ([lexdb-benchmarks.md](lexell/design/lexdb-benchmarks.md)). |
