@@ -1,0 +1,334 @@
+// httpserver: raw HTTP/2 frame conformance and DoS hardening tests —
+// PING ACK, CONTINUATION assembly, padded DATA, request trailers,
+// Expect: 100-continue, RST_STREAM handler cancellation, invalid headers,
+// bad preface, CONTINUATION flood, and Rapid Reset (CVE-2023-44487).
+// expect: ping: ok
+// expect: continuation: 200
+// expect: padded_and_trailers: 200 body=hello tr=sig42
+// expect: expect_100: 100 then 200
+// expect: bad_header_rst: PROTOCOL_ERROR then 200
+// expect: rst_cancel: cancelled=true
+// expect: bad_preface: PROTOCOL_ERROR
+// expect: cont_flood: ENHANCE_YOUR_CALM
+// expect: rapid_reset: ENHANCE_YOUR_CALM
+import "task"
+import "net"
+import "h2"
+import "hpack"
+import "httpserver"
+
+type State = record { cancelled: bool }
+type App = value record { st: task.Shared[State] }
+
+fn okRoute(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    return w.text("ok")
+}
+
+fn echoWithTrailers(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    let body = try rq.text(1000)
+    let tr = rq.trailers().get("x-sig").unwrapOr("")
+    return w.text(&("body=" + body + " tr=" + tr))
+}
+
+fn waitCancel(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    match task.sleep(5000) {
+        Ok(_) { return w.text("slept") }
+        Err(_) {
+            app.st.with(fn(s: mut &State) { s.cancelled = true })
+            return Err(httpserver.error(499, "cancelled"))
+        }
+    }
+}
+
+fn routes(): httpserver.Router[App] {
+    var r = httpserver.router[App]()
+    r.handle("GET /ok", okRoute)
+    r.handle("POST /tr", echoWithTrailers)
+    r.handle("GET /wait", waitCancel)
+    return r
+}
+
+type SrvJob = record { ln: net.Listener; app: App }
+
+fn runServer(j: SrvJob): int {
+    let SrvJob{ln: ln, app: app} = move(j)
+    var cfg = httpserver.defaults()
+    cfg.signals = false
+    cfg.logFd = -1
+    cfg.h2c = true
+    let _r = httpserver.serve(ln, app, routes(), cfg)
+    return 0
+}
+
+type Frame = record { hdr: h2.FrameHeader; body: []byte }
+
+fn readExact(c: &net.Conn, n: int): Option[[]byte] {
+    var out = array(n, byte(0))
+    var got = 0
+    while got < n {
+        match c.read(mut &out[got..n]) {
+            Ok(k) { if k == 0 { return None }; got += k }
+            Err(_) { return None }
+        }
+    }
+    return Some(out)
+}
+
+fn readFrame(c: &net.Conn): Option[Frame] {
+    let hb = match readExact(c, 9) {
+        Some(b) { b }
+        None { return None }
+    }
+    let fh = h2.parseFrameHeader(&hb)
+    if fh.length == 0 { return Some(Frame{hdr: fh, body: []}) }
+    let body = match readExact(c, fh.length) {
+        Some(b) { b }
+        None { return None }
+    }
+    return Some(Frame{hdr: fh, body: body})
+}
+
+fn openH2(addr: &str): net.Conn {
+    let c = net.connect(addr).unwrap()
+    var out: []byte = []
+    let pfx = strToBytes(h2.PREFACE)
+    for i in 0..len(pfx) { append(mut &out, pfx[i]) }
+    h2.putSettings(mut &out, &[])
+    c.write(&out).unwrap()
+    // Read server SETTINGS (+ optional WINDOW_UPDATE) and SETTINGS ACK
+    var gotSet = false
+    var gotAck = false
+    while !gotSet || !gotAck {
+        let f = readFrame(&c).unwrap()
+        if f.hdr.ftype == h2.F_SETTINGS {
+            if (f.hdr.flags & h2.FL_ACK) != 0 {
+                gotAck = true
+            } else {
+                gotSet = true
+                var ack: []byte = []
+                h2.putSettingsAck(mut &ack)
+                c.write(&ack).unwrap()
+            }
+        }
+    }
+    return c
+}
+
+fn waitGoaway(c: &net.Conn): int {
+    for i in 0..500 {
+        match readFrame(c) {
+            Some(f) {
+                if f.hdr.ftype == h2.F_GOAWAY {
+                    return h2.parseGoaway(&f.body).unwrap().code
+                }
+            }
+            None { return -1 }
+        }
+    }
+    return -2
+}
+
+fn readResponse(c: &net.Conn, dec: mut &hpack.Decoder, sid: int): str {
+    var status = ""
+    var body = ""
+    while true {
+        let f = readFrame(c).unwrap()
+        if f.hdr.streamId != sid { continue }
+        if f.hdr.ftype == h2.F_HEADERS {
+            let fs = dec.decode(&f.body, 65536, 100).unwrap()
+            for x in fs { if x.name == ":status" { status = x.value.clone() } }
+            if (f.hdr.flags & h2.FL_END_STREAM) != 0 { break }
+        } else if f.hdr.ftype == h2.F_DATA {
+            body += strFromBytes(&f.body)
+            if (f.hdr.flags & h2.FL_END_STREAM) != 0 { break }
+        }
+    }
+    return status + " " + body
+}
+
+fn main() {
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        let appState = task.shared(State{cancelled: false})
+        let srv = s.start(runServer, SrvJob{ln: ln, app: App{st: appState.share()}})
+
+        // 1. PING ACK + CONTINUATION + PADDED DATA + trailers + 100-continue + invalid header RST
+        {
+            let c = openH2(&addr)
+            var enc = hpack.newEncoder(4096)
+            var dec = hpack.newDecoder(4096)
+
+            // PING
+            var p: []byte = []
+            let pdata = [byte(1), byte(2), byte(3), byte(4), byte(5), byte(6), byte(7), byte(8)]
+            h2.putPing(mut &p, false, &pdata)
+            c.write(&p).unwrap()
+            let pf = readFrame(&c).unwrap()
+            if pf.hdr.ftype != h2.F_PING || (pf.hdr.flags & h2.FL_ACK) == 0 || pf.body[7] != byte(8) {
+                panic("bad ping ack")
+            }
+            println("ping: ok")
+
+            // HEADERS + CONTINUATION split across 2 frames (stream 1)
+            var blk1: []byte = []
+            enc.encode(&[
+                hpack.Field{name: ":method", value: "GET"},
+                hpack.Field{name: ":scheme", value: "http"},
+                hpack.Field{name: ":authority", value: "localhost"},
+                hpack.Field{name: ":path", value: "/ok"},
+            ], mut &blk1)
+            let mid = len(blk1) / 2
+            var out1: []byte = []
+            h2.putFrameHeader(mut &out1, mid, h2.F_HEADERS, h2.FL_END_STREAM, 1)
+            for i in 0..mid { append(mut &out1, blk1[i]) }
+            h2.putFrameHeader(mut &out1, len(blk1) - mid, h2.F_CONTINUATION, h2.FL_END_HEADERS, 1)
+            for i in mid..len(blk1) { append(mut &out1, blk1[i]) }
+            c.write(&out1).unwrap()
+            let r1 = readResponse(&c, mut &dec, 1)
+            println("continuation: " + r1[0..3])
+
+            // Padded DATA + request trailers (stream 3)
+            var blk3: []byte = []
+            enc.encode(&[
+                hpack.Field{name: ":method", value: "POST"},
+                hpack.Field{name: ":scheme", value: "http"},
+                hpack.Field{name: ":authority", value: "localhost"},
+                hpack.Field{name: ":path", value: "/tr"},
+            ], mut &blk3)
+            var out3: []byte = []
+            h2.putHeaderBlock(mut &out3, 3, &blk3, false, 16384)
+            // Padded DATA: padLen=3, "hello", 3 zero pad bytes
+            h2.putFrameHeader(mut &out3, 1 + 5 + 3, h2.F_DATA, h2.FL_PADDED, 3)
+            append(mut &out3, byte(3))
+            let hb = strToBytes("hello")
+            for i in 0..len(hb) { append(mut &out3, hb[i]) }
+            append(mut &out3, byte(0)); append(mut &out3, byte(0)); append(mut &out3, byte(0))
+            // Trailing HEADERS with END_STREAM
+            var trBlk: []byte = []
+            enc.encode(&[hpack.Field{name: "x-sig", value: "sig42"}], mut &trBlk)
+            h2.putHeaderBlock(mut &out3, 3, &trBlk, true, 16384)
+            c.write(&out3).unwrap()
+            println("padded_and_trailers: " + readResponse(&c, mut &dec, 3))
+
+            // Expect: 100-continue (stream 5)
+            var blk5: []byte = []
+            enc.encode(&[
+                hpack.Field{name: ":method", value: "POST"},
+                hpack.Field{name: ":scheme", value: "http"},
+                hpack.Field{name: ":authority", value: "localhost"},
+                hpack.Field{name: ":path", value: "/tr"},
+                hpack.Field{name: "expect", value: "100-continue"},
+            ], mut &blk5)
+            var out5: []byte = []
+            h2.putHeaderBlock(mut &out5, 5, &blk5, false, 16384)
+            c.write(&out5).unwrap()
+            let f100 = readFrame(&c).unwrap()
+            let fs100 = dec.decode(&f100.body, 65536, 100).unwrap()
+            var st100 = ""
+            for x in fs100 { if x.name == ":status" { st100 = x.value.clone() } }
+            var d5: []byte = []
+            h2.putData(mut &d5, 5, &strToBytes("hi"), true, 16384)
+            c.write(&d5).unwrap()
+            let r5 = readResponse(&c, mut &dec, 5)
+            println("expect_100: " + st100 + " then " + r5[0..3])
+
+            // Uppercase header name -> RST_STREAM(PROTOCOL_ERROR), connection stays alive for stream 9
+            var blk7: []byte = []
+            enc.encode(&[
+                hpack.Field{name: ":method", value: "GET"},
+                hpack.Field{name: ":scheme", value: "http"},
+                hpack.Field{name: ":authority", value: "localhost"},
+                hpack.Field{name: ":path", value: "/ok"},
+                hpack.Field{name: "X-Upper", value: "bad"},
+            ], mut &blk7)
+            var out7: []byte = []
+            h2.putHeaderBlock(mut &out7, 7, &blk7, true, 16384)
+            c.write(&out7).unwrap()
+            let rst7 = readFrame(&c).unwrap()
+            let rstCode = h2.parseRstStream(&rst7.body).unwrap()
+            var blk9: []byte = []
+            enc.encode(&[
+                hpack.Field{name: ":method", value: "GET"},
+                hpack.Field{name: ":scheme", value: "http"},
+                hpack.Field{name: ":authority", value: "localhost"},
+                hpack.Field{name: ":path", value: "/ok"},
+            ], mut &blk9)
+            var out9: []byte = []
+            h2.putHeaderBlock(mut &out9, 9, &blk9, true, 16384)
+            c.write(&out9).unwrap()
+            let r9 = readResponse(&c, mut &dec, 9)
+            println("bad_header_rst: " + h2.errorName(rstCode) + " then " + r9[0..3])
+
+            // RST_STREAM cancels running handler task
+            var blk11: []byte = []
+            enc.encode(&[
+                hpack.Field{name: ":method", value: "GET"},
+                hpack.Field{name: ":scheme", value: "http"},
+                hpack.Field{name: ":authority", value: "localhost"},
+                hpack.Field{name: ":path", value: "/wait"},
+            ], mut &blk11)
+            var out11: []byte = []
+            h2.putHeaderBlock(mut &out11, 11, &blk11, true, 16384)
+            c.write(&out11).unwrap()
+            let _sl = task.sleep(30)
+            var cancel11: []byte = []
+            h2.putRstStream(mut &cancel11, 11, h2.ERR_CANCEL)
+            c.write(&cancel11).unwrap()
+            let _sl2 = task.sleep(50)
+            var wasCancelled = false
+            appState.with(fn(st: mut &State) { wasCancelled = st.cancelled })
+            println("rst_cancel: cancelled=" + (if wasCancelled { "true" } else { "false" }))
+        }
+
+        // 2. Bad first frame after preface -> GOAWAY(PROTOCOL_ERROR)
+        {
+            let c = net.connect(&addr).unwrap()
+            var out: []byte = []
+            let pfx = strToBytes(h2.PREFACE)
+            for i in 0..len(pfx) { append(mut &out, pfx[i]) }
+            let pd = array(8, byte(0))
+            h2.putPing(mut &out, false, &pd)
+            c.write(&out).unwrap()
+            println("bad_preface: " + h2.errorName(waitGoaway(&c)))
+        }
+
+        // 3. CONTINUATION flood (> 8 CONTINUATION frames) -> GOAWAY(ENHANCE_YOUR_CALM)
+        {
+            let c = openH2(&addr)
+            var out: []byte = []
+            h2.putFrameHeader(mut &out, 1, h2.F_HEADERS, h2.FL_END_STREAM, 1)
+            append(mut &out, byte(0x82))
+            for i in 0..10 {
+                h2.putFrameHeader(mut &out, 1, h2.F_CONTINUATION, 0, 1)
+                append(mut &out, byte(0x86))
+            }
+            c.write(&out).unwrap()
+            println("cont_flood: " + h2.errorName(waitGoaway(&c)))
+        }
+
+        // 4. Rapid Reset (CVE-2023-44487) -> GOAWAY(ENHANCE_YOUR_CALM)
+        {
+            let c = openH2(&addr)
+            var enc = hpack.newEncoder(4096)
+            var blk: []byte = []
+            enc.encode(&[
+                hpack.Field{name: ":method", value: "GET"},
+                hpack.Field{name: ":scheme", value: "http"},
+                hpack.Field{name: ":authority", value: "localhost"},
+                hpack.Field{name: ":path", value: "/ok"},
+            ], mut &blk)
+            var sid = 1
+            for i in 0..220 {
+                var burst: []byte = []
+                h2.putHeaderBlock(mut &burst, sid, &blk, true, 16384)
+                h2.putRstStream(mut &burst, sid, h2.ERR_CANCEL)
+                if c.write(&burst).isErr() { break }
+                sid += 2
+            }
+            println("rapid_reset: " + h2.errorName(waitGoaway(&c)))
+        }
+
+        // Dropping srv cancels the server cleanly
+    })
+}

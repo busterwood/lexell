@@ -57,6 +57,8 @@ import "os"
 import "time"
 import "url"
 import "tls"
+import "hpack"
+import "h2client"
 
 pub const MAX_HEAD = 65536         // bytes of a reply head (status line and headers), or of trailers
 pub const MAX_HEADERS = 100        // header lines of a head, or trailer lines
@@ -480,17 +482,19 @@ pub type Options = value record {
     pub idleTimeoutMs: int         // how long an idle connection is kept
     pub userAgent: str             // the User-Agent header, unless a request sets one ("": none)
     pub tls: tls.Options           // for https: tls.defaults() (verification against the system's
-                                   // store) with ALPN http/1.1; caFile, insecureSkipVerify, pins, ...
+                                   // store) with ALPN h2,http/1.1; caFile, insecureSkipVerify, pins, ...
+    pub http2: bool                // negotiate HTTP/2 over TLS (ALPN "h2"); true by default
+    pub h2c: bool                  // use prior-knowledge cleartext HTTP/2 for http:// URLs; false by default
 }
 
 // maxPerHost 16, timeoutMs 30,000, maxBody 16 MiB, redirects on, at most
 // 10, not from https to http, idle connections kept 90 s, User-Agent lxl,
-// TLS as tls.defaults() offering http/1.1.
+// TLS as tls.defaults() offering h2,http/1.1.
 pub fn defaults(): Options {
     var t = tls.defaults()
-    t.alpn = "http/1.1"
+    t.alpn = "h2,http/1.1"
     return Options{maxPerHost: 16, timeoutMs: 30000, maxBody: 16777216, redirects: true, maxRedirects: 10,
-                   allowHttpsToHttp: false, idleTimeoutMs: 90000, userAgent: "lxl", tls: t}
+                   allowHttpsToHttp: false, idleTimeoutMs: 90000, userAgent: "lxl", tls: t, http2: true, h2c: false}
 }
 
 // A client: its options and a pool of kept-alive connections per server. A
@@ -527,9 +531,10 @@ type PoolState = record {
 }
 
 type Host = record {
-    open: int              // connections open or being opened, in use or idle
-    idle: []Conn           // most recently used last
+    open: int              // H1 connections open or being opened, in use or idle
+    idle: []Conn           // H1 idle connections, most recently used last
     waiters: []Waiter      // first come first served
+    h2: []h2client.Conn    // multiplexed HTTP/2 connections
 }
 
 // A request parked for a connection: its promise brings an idle one, or
@@ -558,6 +563,7 @@ pub fn (c: &Client) options(): Options {
 
 pub fn (c: &Client) stats(): Stats {
     var s = Stats{open: 0, idle: 0, waiting: 0, dials: 0, reuses: 0, retries: 0}
+    var h2List: []h2client.Conn = []
     c.sh.with(fn(st: mut &PoolState) {
         s.dials = st.dials
         s.reuses = st.reuses
@@ -567,21 +573,78 @@ pub fn (c: &Client) stats(): Stats {
             s.open += h.open
             s.idle += len(h.idle)
             s.waiting += len(h.waiters)
+            for hc in h.h2 { append(mut &h2List, hc.share()) }
         }
     })
+    for hc in h2List {
+        if !hc.isDead() {
+            s.open += 1
+            if hc.isIdle() { s.idle += 1 }
+        }
+    }
     return s
 }
 
 // Closes the idle connections now (dropping the last copy of the client
 // does too).
 pub fn (c: &Client) closeIdle() {
+    var h2List: []h2client.Conn = []
     c.sh.with(fn(st: mut &PoolState) {
         for i in 0..st.hosts.size() {
             let h = st.hosts.valAtMut(i)
             h.open -= len(h.idle)
             h.idle = []
+            for hc in h.h2 { append(mut &h2List, hc.share()) }
         }
     })
+    for hc in h2List {
+        if hc.isIdle() { hc.close() }
+    }
+    pruneDeadH2(&c.sh)
+}
+
+fn pruneDeadH2(sh: &task.Shared[PoolState]) {
+    var keys: []str = []
+    var conns: []h2client.Conn = []
+    sh.with(fn(st: mut &PoolState) {
+        for i in 0..st.hosts.size() {
+            let k = st.hosts.keyAt(i)
+            let h = st.hosts.valAt(i)
+            if len(h.h2) > 0 {
+                append(mut &keys, k.clone())
+                for hc in h.h2 { append(mut &conns, hc.share()) }
+            }
+        }
+    })
+    if len(conns) == 0 { return }
+    var anyDead = false
+    for hc in conns {
+        if hc.isDead() { anyDead = true; break }
+    }
+    if !anyDead { return }
+    // Snapshot per-host lists and rebuild without dead entries outside nested with
+    for k in keys {
+        var cur: []h2client.Conn = []
+        sh.with(fn(st: mut &PoolState) {
+            if st.hosts.has(&k) {
+                let h = st.hosts.at(k.clone())
+                for hc in h.h2 { append(mut &cur, hc.share()) }
+            }
+        })
+        var keep: []h2client.Conn = []
+        for hc in cur {
+            if !hc.isDead() { append(mut &keep, hc.share()) }
+        }
+        sh.with(fn(st: mut &PoolState) {
+            if st.hosts.has(&k) {
+                let h = st.hosts.atMut(k.clone())
+                h.h2 = replace(mut &keep, [])
+                if h.open == 0 && len(h.waiters) == 0 && len(h.h2) == 0 {
+                    let gone = st.hosts.remove(&k)
+                }
+            }
+        })
+    }
 }
 
 // The client's TLS context, made from its options at the first https
@@ -589,7 +652,9 @@ pub fn (c: &Client) closeIdle() {
 fn tlsContext(sh: &task.Shared[PoolState], us: &str): Result[tls.Context, Error] {
     var got: Option[tls.Context] = None
     var o = tls.defaults()
+    var allowH2 = true
     sh.with(fn(st: mut &PoolState) {
+        allowH2 = st.opts.http2
         match st.tlsCtx {
             Some(x) { got = Some(x.share()) }
             None { o = st.opts.tls.clone() }
@@ -599,6 +664,7 @@ fn tlsContext(sh: &task.Shared[PoolState], us: &str): Result[tls.Context, Error]
         Some(x) { return Ok(x) }
         None {}
     }
+    if !allowH2 && o.alpn == "h2,http/1.1" { o.alpn = "http/1.1" }
     let ctx = match tls.client(o) {
         Ok(x) { x }
         Err(e) { return Err(err(Kind.Tls, &(e.kind.toStr() + ": " + e.msg), us)) }
@@ -761,9 +827,15 @@ fn (c: &Conn) isGone(): bool {
     }
 }
 
+type Dialed = closed {
+    H1(Conn)
+    H2(h2client.Conn)
+}
+
 // A new connection to u's server; for https, with its TLS handshake done
-// (the server's certificate verified for u.host).
-fn dialConn(sh: &task.Shared[PoolState], u: &url.Url, us: &str, w: Where): Result[Conn, Error] {
+// (the server's certificate verified for u.host). Negotiates HTTP/2 when
+// ALPN chooses "h2" (or when opts.h2c is set on plain http://).
+fn dialConn(sh: &task.Shared[PoolState], opts: &Options, u: &url.Url, us: &str, w: Where): Result[Dialed, Error] {
     var ctx: Option[tls.Context] = None             // first: bad TLS options fail before connecting
     if u.scheme == "https" { ctx = Some(try tlsContext(sh, us)) }
     let nc = match net.dial(&(u.hostPort()), w) {
@@ -774,15 +846,26 @@ fn dialConn(sh: &task.Shared[PoolState], u: &url.Url, us: &str, w: Where): Resul
         Ok(_) {}
         Err(e) { return Err(ioErr(sockErr(e), true, us)) }
     }
-    let tc = match move(ctx) {
-        Some(x) { x }
-        None { return Ok(Conn{s: Stream.Tcp(nc), buf: array(BUF, byte(0)), r: 0, w: 0, idleSince: 0, idleUntil: 0, check: false}) }
+    var tcOpt: Option[tls.Context] = None
+    match move(ctx) {
+        Some(x) { tcOpt = Some(x) }
+        None {
+            if opts.h2c {
+                return Ok(Dialed.H2(h2client.newConn(nc, None, opts.idleTimeoutMs)))
+            }
+            return Ok(Dialed.H1(Conn{s: Stream.Tcp(nc), buf: array(BUF, byte(0)), r: 0, w: 0, idleSince: 0, idleUntil: 0, check: false}))
+        }
     }
+    let tc = replace(mut &tcOpt, None).unwrap()
     let t = match tc.connect(nc, &u.host, w) {
         Ok(x) { x }
         Err(e) { return Err(ioErr(tlsErr(e), true, us)) }
     }
-    return Ok(Conn{s: Stream.Tls(t), buf: array(BUF, byte(0)), r: 0, w: 0, idleSince: 0, idleUntil: 0, check: false})
+    if opts.http2 && t.alpn() == "h2" {
+        let tls.Parts{engine: eng, sock: sock} = t.intoParts()
+        return Ok(Dialed.H2(h2client.newConn(sock, Some(eng), opts.idleTimeoutMs)))
+    }
+    return Ok(Dialed.H1(Conn{s: Stream.Tls(t), buf: array(BUF, byte(0)), r: 0, w: 0, idleSince: 0, idleUntil: 0, check: false}))
 }
 
 // Makes room after buf[w] for more input: moves the unread bytes to the
@@ -902,7 +985,7 @@ fn acquire(sh: &task.Shared[PoolState], key: str, u: &str, w: Where): Result[Opt
         let max = st.opts.maxPerHost
         id = st.nextId
         st.nextId += 1
-        if !st.hosts.has(&key) { st.hosts.put(key.clone(), Host{open: 0, idle: [], waiters: []}) }
+        if !st.hosts.has(&key) { st.hosts.put(key.clone(), Host{open: 0, idle: [], waiters: [], h2: []}) }
         var reused = false
         {
             let h = st.hosts.atMut(key.clone())
@@ -988,7 +1071,7 @@ fn release(sh: &task.Shared[PoolState], key: &str, var c: Option[Conn]) {
                     None { h.open -= 1 }
                 }
             }
-            empty = h.open == 0 && len(h.waiters) == 0
+            empty = h.open == 0 && len(h.waiters) == 0 && len(h.h2) == 0
         }
         if empty { let gone = st.hosts.remove(key) }
     })
@@ -1021,11 +1104,14 @@ const C_CRLF = 2        // the CRLF after a chunk's data next
 pub type Response = record {
     pub status: int
     pub reason: str
-    pub minor: int                // 1 for HTTP/1.1, 0 for HTTP/1.0
+    pub major: int                // 1 for HTTP/1.x, 2 for HTTP/2.0
+    pub minor: int                // 1 for HTTP/1.1, 0 for HTTP/1.0 and HTTP/2.0
+    pub proto: str                // "HTTP/1.1", "HTTP/1.0", or "HTTP/2.0"
     pub headers: Headers
     pub url: url.Url              // the URL that answered (after redirects)
     us: str                       // url as text, for errors
     conn: Conn
+    h2: Option[h2client.Stream]
     sh: task.Shared[PoolState]
     key: str                      // the pool's key for the connection's server
     framing: int
@@ -1051,6 +1137,14 @@ pub fn (r: &Response) header(name: &str): Option[&str] { return r.headers.get(na
 pub fn (r: &Response) contentLength(): int { return r.length }
 
 fn (r: mut &Response) drop() {
+    match replace(mut &r.h2, None) {
+        Some(st) {
+            var s = st
+            s.finish()
+            return
+        }
+        None {}
+    }
     if !r.done && r.framing == F_LENGTH && r.conn.w - r.conn.r >= r.left {
         r.conn.r += r.left              // the rest of the body is here already: it counts as read
         r.left = 0
@@ -1095,9 +1189,33 @@ pub fn (r: mut &Response) read(buf: mut &[byte], w: Where): Result[int, Error] {
     return task.within(ms, fn(): Result[int, Error] { return r.readBody(buf, w) })
 }
 
+fn h2Err(e: &h2client.ClientError, u: &str): Error {
+    let k = match e.kind {
+        h2client.ErrKind.Tls { Kind.Tls }
+        h2client.ErrKind.Timeout { Kind.Timeout }
+        h2client.ErrKind.Cancelled { Kind.Cancelled }
+        h2client.ErrKind.Protocol { Kind.Protocol }
+        h2client.ErrKind.TooLarge { Kind.TooLarge }
+        else { Kind.Io }
+    }
+    return err(k, &e.msg, u)
+}
+
 fn (r: mut &Response) readBody(buf: mut &[byte], w: Where): Result[int, Error] {
     let u = r.us.clone()
-    if r.framing == F_LENGTH {
+    if r.h2.isSome() {
+        var st = replace(mut &r.h2, None).unwrap()
+        let res = st.read(buf, w)
+        r.h2 = Some(st)
+        match res {
+            Ok(n) {
+                if n == 0 { r.done = true }
+                return Ok(n)
+            }
+            Err(e) { return Err(h2Err(&e, &u)) }
+        }
+    }
+    if r.framing == F_LENGTH && r.h2.isNone() {
         let want = min(len(buf), r.left)
         let n = match r.conn.take(mut &buf[0..want], w) {
             Ok(k) { k }
@@ -1250,7 +1368,7 @@ pub fn (var r: Response) discard(limit: int, w: Where): Result[Unit, Error] {
 fn (r: mut &Response) readAll(w: Where): Result[str, Error] {
     let u = r.us.clone()
     if r.done { return Ok("") }
-    if r.framing == F_LENGTH {
+    if r.framing == F_LENGTH && r.h2.isNone() {
         if r.left > r.maxBody { return Err(err(Kind.TooLarge, &("a body of " + intToStr(r.left) + " bytes, over maxBody"), &u)) }
         if r.conn.w - r.conn.r >= r.left {       // all here already
             let s = strFromBytes(&r.conn.buf[r.conn.r..r.conn.r + r.left])
@@ -1397,10 +1515,80 @@ fn keepAliveMs(v: &str): int {
     return -1
 }
 
+fn pickH2(sh: &task.Shared[PoolState], key: &str): Option[h2client.Conn] {
+    var cands: []h2client.Conn = []
+    sh.with(fn(st: mut &PoolState) {
+        if st.hosts.has(key) {
+            let h = st.hosts.at(key.clone())
+            for hc in h.h2 { append(mut &cands, hc.share()) }
+        }
+    })
+    if len(cands) == 0 { return None }
+    let now = time.monotonicNs()
+    for hc in cands {
+        if hc.canTakeStream(now) {
+            sh.with(fn(st: mut &PoolState) { st.reuses += 1 })
+            return Some(hc.share())
+        }
+    }
+    pruneDeadH2(sh)
+    return None
+}
+
+fn registerH2(sh: &task.Shared[PoolState], key: &str, hc: &h2client.Conn) {
+    sh.with(fn(st: mut &PoolState) {
+        if !st.hosts.has(key) { st.hosts.put(key.clone(), Host{open: 0, idle: [], waiters: [], h2: []}) }
+        let h = st.hosts.atMut(key.clone())
+        append(mut &h.h2, hc.share())
+    })
+}
+
+fn h2ReqFields(method: &str, h: &Headers, body: &str, ua: &str): []hpack.Field {
+    var hasUa = false
+    var hasLen = false
+    var out: []hpack.Field = []
+    for x in h.list {
+        if equalFold(&x.name, "User-Agent") { hasUa = true }
+        if equalFold(&x.name, "Content-Length") { hasLen = true }
+        if equalFold(&x.name, "Host") { continue }
+        append(mut &out, hpack.Field{name: strings.toLowerAscii(&x.name), value: x.value.clone()})
+    }
+    if !hasUa && len(ua) > 0 { append(mut &out, hpack.Field{name: "user-agent", value: ua.clone()}) }
+    if !hasLen && (len(body) > 0 || bodyMethod(method)) {
+        append(mut &out, hpack.Field{name: "content-length", value: intToStr(len(body))})
+    }
+    return out
+}
+
+fn h2PathOf(u: &url.Url): str {
+    let p: &str = if len(u.path) == 0 { "/" } else { &u.path }
+    if u.hasQuery { return p + "?" + u.query }
+    return p.clone()
+}
+
+fn h2Exchange(c: &Client, hc: &h2client.Conn, opts: &Options, u: &url.Url, us: &str, key: &str,
+              method: &str, auth: &str, reqHdrs: &Headers, body: &str, deadline: int, w: Where): Result[Response, h2client.ClientError] {
+    let fields = h2ReqFields(method, reqHdrs, body, &opts.userAgent)
+    let path = h2PathOf(u)
+    let sr = try hc.roundTrip(method, &u.scheme, auth, &path, &fields, body, opts.idleTimeoutMs, w)
+    let h2client.StartRes{stream: stream, head: head} = move(sr)
+    let h2client.RespHead{status: status, headers: rfields, contentLength: cl, endStream: es} = move(head)
+    var hs = newHeaders()
+    for f in move(rfields) { hs.add(&f.name, &f.value) }
+    let done = es || method == "HEAD" || status == 204 || status == 304
+    return Ok(Response{
+        status: status, reason: "", major: 2, minor: 0, proto: "HTTP/2.0", headers: hs,
+        url: u.clone(), us: us.clone(), conn: gone(), h2: Some(stream), sh: c.sh.share(),
+        key: key.clone(), framing: if done { F_EMPTY } else if cl >= 0 { F_LENGTH } else { F_CHUNKED },
+        length: cl, left: if cl >= 0 { cl } else { 0 }, chunk: C_SIZE, done: done,
+        keep: true, keepMs: -1, maxBody: opts.maxBody, idleMs: opts.idleTimeoutMs, deadline: deadline,
+    })
+}
+
 // A new connection for a place held in the pool; on an error the place is
 // given back.
-fn dialHeld(c: &Client, key: &str, u: &url.Url, us: &str, w: Where): Result[Conn, Error] {
-    match dialConn(&c.sh, u, us, w) {
+fn dialHeld(c: &Client, opts: &Options, key: &str, u: &url.Url, us: &str, w: Where): Result[Dialed, Error] {
+    match dialConn(&c.sh, opts, u, us, w) {
         Ok(x) { return Ok(x) }
         Err(e) {
             release(&c.sh, key, None)
@@ -1413,19 +1601,64 @@ fn dialHeld(c: &Client, key: &str, u: &url.Url, us: &str, w: Where): Result[Conn
 // connection when a kept-alive one turns out closed before any of the reply
 // came, if the method is idempotent. The place in the pool that acquire
 // gives is the Response's; on an error it is given back here.
-fn exchange(c: &Client, opts: &Options, u: &url.Url, us: &str, key: &str, wire: &Wire, deadline: int, w: Where): Result[Response, Error] {
+fn exchange(c: &Client, opts: &Options, u: &url.Url, us: &str, key: &str, method: &str, auth: &str,
+            reqHdrs: &Headers, body: &str, wire: &Wire, deadline: int, w: Where): Result[Response, Error] {
+    // 1. Reuse an existing multiplexed HTTP/2 connection if available
+    if (u.scheme == "https" && opts.http2) || (u.scheme == "http" && opts.h2c) {
+        match pickH2(&c.sh, key) {
+            Some(hc) {
+                match h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, deadline, w) {
+                    Ok(resp) { return Ok(resp) }
+                    Err(e) {
+                        let retryable = e.kind == h2client.ErrKind.Refused || e.kind == h2client.ErrKind.Unavailable ||
+                                        (e.kind == h2client.ErrKind.Io && idempotent(method))
+                        if !retryable { return Err(h2Err(&e, us)) }
+                        count(&c.sh, false)
+                        pruneDeadH2(&c.sh)
+                    }
+                }
+            }
+            None {}
+        }
+    }
+
+    // 2. Acquire an idle HTTP/1.1 connection or a slot to dial a new one
     let got = try acquire(&c.sh, key.clone(), us, w)
     var reused = got.isSome()
-    var conn = match move(got) {
-        Some(x) { x }
-        None { try dialHeld(c, key, u, us, w) }
+    var conn = gone()
+    match move(got) {
+        Some(x) { conn = x }
+        None {
+            let d = try dialHeld(c, opts, key, u, us, w)
+            count(&c.sh, true)
+            match d {
+                Dialed.H2(hc) {
+                    registerH2(&c.sh, key, &hc)
+                    release(&c.sh, key, None)   // H2 connections live in Host.h2, not the H1 slot
+                    return match h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, deadline, w) {
+                        Ok(resp) { Ok(resp) }
+                        Err(e) { Err(h2Err(&e, us)) }
+                    }
+                }
+                Dialed.H1(h1c) { conn = h1c }
+            }
+        }
     }
-    if !reused {
-        count(&c.sh, true)
-    } else if conn.check && !conn.s.quiet() {
+    if reused && conn.check && !conn.s.quiet() {
         reused = false                   // closed by the server meanwhile (or it sent something): a new one
-        conn = try dialHeld(c, key, u, us, w)
+        let d = try dialHeld(c, opts, key, u, us, w)
         count(&c.sh, true)
+        match d {
+            Dialed.H2(hc) {
+                registerH2(&c.sh, key, &hc)
+                release(&c.sh, key, None)
+                return match h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, deadline, w) {
+                    Ok(resp) { Ok(resp) }
+                    Err(e) { Err(h2Err(&e, us)) }
+                }
+            }
+            Dialed.H1(h1c) { conn = h1c }
+        }
     }
     var first = conn.roundTrip(wire, reused, us, w)
     if first.isErr() {
@@ -1434,9 +1667,20 @@ fn exchange(c: &Client, opts: &Options, u: &url.Url, us: &str, key: &str, wire: 
             release(&c.sh, key, None)
             return Err(f.e.clone())
         }
-        conn = try dialHeld(c, key, u, us, w)
+        let d = try dialHeld(c, opts, key, u, us, w)
         count(&c.sh, true)
         count(&c.sh, false)
+        match d {
+            Dialed.H2(hc) {
+                registerH2(&c.sh, key, &hc)
+                release(&c.sh, key, None)
+                return match h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, deadline, w) {
+                    Ok(resp) { Ok(resp) }
+                    Err(e) { Err(h2Err(&e, us)) }
+                }
+            }
+            Dialed.H1(h1c) { conn = h1c }
+        }
         first = conn.roundTrip(wire, false, us, w)
         if first.isErr() {
             release(&c.sh, key, None)
@@ -1452,7 +1696,9 @@ fn exchange(c: &Client, opts: &Options, u: &url.Url, us: &str, key: &str, wire: 
     let fr = framed.unwrap()
     let done = fr.framing == F_EMPTY || (fr.framing == F_LENGTH && fr.length == 0)
     let Head{status: status, reason: reason, minor: minor, headers: headers} = move(head)
-    return Ok(Response{status: status, reason: reason, minor: minor, headers: headers, url: u.clone(), us: us.clone(), conn: conn, sh: c.sh.share(),
+    let proto = if minor == 0 { "HTTP/1.0" } else { "HTTP/1.1" }
+    return Ok(Response{status: status, reason: reason, major: 1, minor: minor, proto: proto, headers: headers,
+                       url: u.clone(), us: us.clone(), conn: conn, h2: None, sh: c.sh.share(),
                        key: key.clone(), framing: fr.framing, length: fr.length, left: if fr.framing == F_LENGTH { fr.length } else { 0 },
                        chunk: C_SIZE, done: done, keep: fr.keep, keepMs: fr.keepMs, maxBody: opts.maxBody,
                        idleMs: opts.idleTimeoutMs, deadline: deadline})
@@ -1590,10 +1836,9 @@ fn (c: &Client) follow(opts: &Options, rq: &Request, first: url.Url, deadline: i
     var hops = 0
     while true {
         let auth = u.authority()
-        let wire = if hops == 0 { try wireOf(&method, &u, &us, &auth, &rq.headers, &body, &opts.userAgent) } else {
-            try wireOf(&method, &u, &us, &auth, &h, &body, &opts.userAgent)
-        }
-        let r = try exchange(c, opts, &u, &us, &(u.scheme + "://" + auth), &wire, deadline, w)
+        let curHdrs: &Headers = if hops == 0 { &rq.headers } else { &h }
+        let wire = try wireOf(&method, &u, &us, &auth, curHdrs, &body, &opts.userAgent)
+        let r = try exchange(c, opts, &u, &us, &(u.scheme + "://" + auth), &method, &auth, curHdrs, &body, &wire, deadline, w)
         if !opts.redirects || !isRedirect(r.status) { return Ok(r) }
         let loc = match r.headers.get("Location") {
             Some(l) { l.clone() }

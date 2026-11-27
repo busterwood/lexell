@@ -1,0 +1,216 @@
+// hpack and h2: RFC 7541 HPACK codec (including Appendix C examples, Huffman
+// edge cases, dynamic table eviction, HPACK bomb limits) and RFC 9113 frame
+// encoding/decoding/validation.
+// expect: c2_1: ok
+// expect: c2_2: ok
+// expect: c2_3: ok
+// expect: c2_4: ok
+// expect: c4_seq: ok
+// expect: roundtrip: ok
+// expect: size_update: ok
+// expect: errors: ok
+// expect: h2_frames: ok
+// expect: h2_validate: ok
+import "hpack"
+import "h2"
+
+fn hexBytes(hex: &str): []byte {
+    var out: []byte = []
+    var i = 0
+    while i + 1 < len(hex) {
+        if hex[i] == ' ' { i += 1; continue }
+        let a = hexVal(hex[i])
+        let b = hexVal(hex[i + 1])
+        append(mut &out, byte((a << 4) | b))
+        i += 2
+    }
+    return out
+}
+
+fn hexVal(c: byte): int {
+    if c >= '0' && c <= '9' { return int(c - '0') }
+    if c >= 'a' && c <= 'f' { return int(c - 'a') + 10 }
+    if c >= 'A' && c <= 'F' { return int(c - 'A') + 10 }
+    panic("bad hex")
+}
+
+fn expectFields(got: &[]hpack.Field, want: &[]hpack.Field, label: &str) {
+    if len(got) != len(want) {
+        panic(label + ": len mismatch: got " + intToStr(len(got)) + " want " + intToStr(len(want)))
+    }
+    for i in 0..len(got) {
+        if got[i].name != want[i].name || got[i].value != want[i].value {
+            panic(label + ": field " + intToStr(i) + " got " + got[i].name + "=" + got[i].value +
+                  " want " + want[i].name + "=" + want[i].value)
+        }
+    }
+}
+
+fn main() {
+    // RFC 7541 C.2.1: Literal Header Field with Indexing
+    var d1 = hpack.newDecoder(4096)
+    let b21 = hexBytes("400a637573746f6d2d6b65790d637573746f6d2d686561646572")
+    let f21 = d1.decode(&b21, 16384, 100).unwrap()
+    expectFields(&f21, &[hpack.Field{name: "custom-key", value: "custom-header"}], "c2_1")
+    if d1.dynamicSize() != 55 { panic("c2_1 dyn size") }
+    println("c2_1: ok")
+
+    // RFC 7541 C.2.2: Literal Header Field without Indexing
+    var d2 = hpack.newDecoder(4096)
+    let b22 = hexBytes("040c2f73616d706c652f70617468")
+    let f22 = d2.decode(&b22, 16384, 100).unwrap()
+    expectFields(&f22, &[hpack.Field{name: ":path", value: "/sample/path"}], "c2_2")
+    if d2.dynamicSize() != 0 { panic("c2_2 dyn size") }
+    println("c2_2: ok")
+
+    // RFC 7541 C.2.3: Literal Header Field Never Indexed
+    var d3 = hpack.newDecoder(4096)
+    let b23 = hexBytes("100870617373776f726406736563726574")
+    let f23 = d3.decode(&b23, 16384, 100).unwrap()
+    expectFields(&f23, &[hpack.Field{name: "password", value: "secret"}], "c2_3")
+    if d3.dynamicSize() != 0 { panic("c2_3 dyn size") }
+    println("c2_3: ok")
+
+    // RFC 7541 C.2.4: Indexed Header Field
+    var d4 = hpack.newDecoder(4096)
+    let b24 = hexBytes("82")
+    let f24 = d4.decode(&b24, 16384, 100).unwrap()
+    expectFields(&f24, &[hpack.Field{name: ":method", value: "GET"}], "c2_4")
+    println("c2_4: ok")
+
+    // RFC 7541 C.4.1 -> C.4.3: Three Huffman-coded requests sharing dynamic table
+    var dh = hpack.newDecoder(4096)
+    let r1 = hexBytes("828684418cf1e3c2e5f23a6ba0ab90f4ff")
+    let fr1 = dh.decode(&r1, 16384, 100).unwrap()
+    expectFields(&fr1, &[
+        hpack.Field{name: ":method", value: "GET"},
+        hpack.Field{name: ":scheme", value: "http"},
+        hpack.Field{name: ":path", value: "/"},
+        hpack.Field{name: ":authority", value: "www.example.com"},
+    ], "c4_1")
+    let r2 = hexBytes("828684be5886a8eb10649cbf")
+    let fr2 = dh.decode(&r2, 16384, 100).unwrap()
+    expectFields(&fr2, &[
+        hpack.Field{name: ":method", value: "GET"},
+        hpack.Field{name: ":scheme", value: "http"},
+        hpack.Field{name: ":path", value: "/"},
+        hpack.Field{name: ":authority", value: "www.example.com"},
+        hpack.Field{name: "cache-control", value: "no-cache"},
+    ], "c4_2")
+    let r3 = hexBytes("828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf")
+    let fr3 = dh.decode(&r3, 16384, 100).unwrap()
+    expectFields(&fr3, &[
+        hpack.Field{name: ":method", value: "GET"},
+        hpack.Field{name: ":scheme", value: "https"},
+        hpack.Field{name: ":path", value: "/index.html"},
+        hpack.Field{name: ":authority", value: "www.example.com"},
+        hpack.Field{name: "custom-key", value: "custom-value"},
+    ], "c4_3")
+    println("c4_seq: ok")
+
+    // Encoder -> Decoder multi-block roundtrip with sensitive headers, eviction & all 256 byte values
+    var enc = hpack.newEncoder(256)
+    var dec = hpack.newDecoder(256)
+    var allBytes = ""
+    for i in 0..256 { allBytes.addByte(byte(i)) }
+    let hdrs1 = [
+        hpack.Field{name: ":status", value: "200"},
+        hpack.Field{name: "content-type", value: "application/json; charset=utf-8"},
+        hpack.Field{name: "authorization", value: "Bearer secret-token-123"},
+        hpack.Field{name: "x-custom-alpha", value: "value-one"},
+        hpack.Field{name: "x-all-bytes", value: allBytes},
+    ]
+    var wire: []byte = []
+    enc.encode(&hdrs1, mut &wire)
+    let got1 = dec.decode(&wire, 16384, 100).unwrap()
+    expectFields(&got1, &hdrs1, "rt1")
+    // Second encode should hit dynamic table
+    wire = []
+    enc.encode(&hdrs1, mut &wire)
+    let got2 = dec.decode(&wire, 16384, 100).unwrap()
+    expectFields(&got2, &hdrs1, "rt2")
+    println("roundtrip: ok")
+
+    // Dynamic table size update (min then target per RFC 7541 4.2)
+    enc.setMaxTableSize(0)
+    enc.setMaxTableSize(128)
+    wire = []
+    let hdrs2 = [hpack.Field{name: ":method", value: "POST"}, hpack.Field{name: "x-a", value: "1"}]
+    enc.encode(&hdrs2, mut &wire)
+    let got3 = dec.decode(&wire, 16384, 100).unwrap()
+    expectFields(&got3, &hdrs2, "size_update")
+    println("size_update: ok")
+
+    // Error cases
+    var de = hpack.newDecoder(4096)
+    // Index 0
+    if de.decode(&[byte(0x80)], 16384, 100).isOk() { panic("idx 0 accepted") }
+    // Out-of-range index
+    if de.decode(&[byte(0xff), byte(0x40)], 16384, 100).isOk() { panic("bad idx accepted") }
+    // Size update after header
+    if de.decode(&[byte(0x82), byte(0x20)], 16384, 100).isOk() { panic("late size update accepted") }
+    // Size update above hardMax
+    let bigUp = hexBytes("3fe13f") // 4096 + something > 4096
+    if de.decode(&bigUp, 16384, 100).isOk() { panic("over-max size update accepted") }
+    // Huffman EOS (4 bytes of 0xff = 32 ones -> hits 30-bit EOS)
+    if hpack.decodeHuffman(&[byte(0xff), byte(0xff), byte(0xff), byte(0xff)], 1024).isOk() { panic("EOS accepted") }
+    // Huffman >= 8 bits of 1-padding: '0' is 5 bits (00000), padded with 3 ones (0x07), then extra 0xff
+    if hpack.decodeHuffman(&[byte(0x07), byte(0xff)], 1024).isOk() { panic("over-pad accepted") }
+    // Huffman non-1 padding: '0' is 00000 + 000 -> 0x00
+    if hpack.decodeHuffman(&[byte(0x00)], 1024).isOk() { panic("zero-pad accepted") }
+    // HPACK bomb: repeated indexed entry exceeding maxListBytes
+    var bomb: []byte = []
+    for i in 0..50 { append(mut &bomb, byte(0x90)) } // static 16: accept-encoding: gzip, deflate (size 60 each -> 3000 bytes)
+    if de.decode(&bomb, 500, 100).isOk() { panic("bomb accepted") }
+    if de.decode(&bomb, 16384, 10).isOk() { panic("too many accepted") }
+    println("errors: ok")
+
+    // h2 frame codec checks
+    var fbuf: []byte = []
+    h2.putSettings(mut &fbuf, &[
+        h2.Setting{id: h2.SET_MAX_CONCURRENT_STREAMS, val: 100},
+        h2.Setting{id: h2.SET_INITIAL_WINDOW_SIZE, val: 262144},
+    ])
+    let fh = h2.parseFrameHeader(&fbuf[0..9])
+    if fh.ftype != h2.F_SETTINGS || fh.length != 12 || fh.streamId != 0 { panic("settings hdr") }
+    let sets = h2.parseSettings(&fbuf[9..21], 32).unwrap()
+    if len(sets) != 2 || sets[0].val != 100 || sets[1].val != 262144 { panic("settings vals") }
+
+    // HEADERS + CONTINUATION splitting
+    var bigBlock = array(20000, byte(0x82))
+    var hbuf: []byte = []
+    h2.putHeaderBlock(mut &hbuf, 7, &bigBlock, true, 16384)
+    let h1 = h2.parseFrameHeader(&hbuf[0..9])
+    if h1.ftype != h2.F_HEADERS || h1.length != 16384 || (h1.flags & h2.FL_END_HEADERS) != 0 || (h1.flags & h2.FL_END_STREAM) == 0 || h1.streamId != 7 {
+        panic("hdr split 1")
+    }
+    let off2 = 9 + 16384
+    let h2f = h2.parseFrameHeader(&hbuf[off2..off2 + 9])
+    if h2f.ftype != h2.F_CONTINUATION || h2f.length != 20000 - 16384 || (h2f.flags & h2.FL_END_HEADERS) == 0 || h2f.streamId != 7 {
+        panic("hdr split 2")
+    }
+
+    // GOAWAY & WINDOW_UPDATE
+    var gbuf: []byte = []
+    h2.putGoaway(mut &gbuf, 15, h2.ERR_ENHANCE_YOUR_CALM, "calm")
+    let gh = h2.parseFrameHeader(&gbuf[0..9])
+    let ga = h2.parseGoaway(&gbuf[9..9 + gh.length]).unwrap()
+    if ga.lastStreamId != 15 || ga.code != h2.ERR_ENHANCE_YOUR_CALM || ga.debug != "calm" { panic("goaway") }
+    if h2.parseWindowUpdate(&[byte(0), byte(0), byte(0), byte(0)]).isOk() { panic("wu 0 accepted") }
+    println("h2_frames: ok")
+
+    // Header & TLS cipher validation
+    if !h2.isValidHeaderName("content-type") || h2.isValidHeaderName("Content-Type") || h2.isValidHeaderName("") {
+        panic("header name check")
+    }
+    if !h2.isValidHeaderValue("text/plain") || h2.isValidHeaderValue(" lead") || h2.isValidHeaderValue("trail ") || h2.isValidHeaderValue("a\rb") {
+        panic("header value check")
+    }
+    if !h2.isForbiddenHeader("connection") || !h2.isForbiddenHeader("transfer-encoding") || h2.isForbiddenHeader("content-length") {
+        panic("forbidden header check")
+    }
+    if !h2.isGoodTlsCipher("TLSv1.3", "TLS_AES_128_GCM_SHA256") || !h2.isGoodTlsCipher("TLSv1.2", "ECDHE-ECDSA-AES128-GCM-SHA256") || h2.isGoodTlsCipher("TLSv1.2", "AES128-SHA") {
+        panic("cipher check")
+    }
+    println("h2_validate: ok")
+}

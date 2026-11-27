@@ -1,0 +1,355 @@
+// h2: shared RFC 9113 HTTP/2 constants, frame codec and validation used by
+// lib/httpserver.lxl (server) and lib/http.lxl (client).
+import "hpack"
+import "strings"
+
+// Client connection preface (RFC 9113 section 3.4), 24 octets.
+pub const PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+pub const PREFACE_LEN = 24
+pub const FRAME_HDR_LEN = 9
+
+// Frame types (RFC 9113 section 6).
+pub const F_DATA = 0
+pub const F_HEADERS = 1
+pub const F_PRIORITY = 2
+pub const F_RST_STREAM = 3
+pub const F_SETTINGS = 4
+pub const F_PUSH_PROMISE = 5
+pub const F_PING = 6
+pub const F_GOAWAY = 7
+pub const F_WINDOW_UPDATE = 8
+pub const F_CONTINUATION = 9
+
+// Frame flags.
+pub const FL_END_STREAM = 0x01
+pub const FL_ACK = 0x01
+pub const FL_END_HEADERS = 0x04
+pub const FL_PADDED = 0x08
+pub const FL_PRIORITY = 0x20
+
+// Settings identifiers (RFC 9113 section 6.5.2).
+pub const SET_HEADER_TABLE_SIZE = 1
+pub const SET_ENABLE_PUSH = 2
+pub const SET_MAX_CONCURRENT_STREAMS = 3
+pub const SET_INITIAL_WINDOW_SIZE = 4
+pub const SET_MAX_FRAME_SIZE = 5
+pub const SET_MAX_HEADER_LIST_SIZE = 6
+
+// Error codes (RFC 9113 section 7).
+pub const ERR_NO_ERROR = 0
+pub const ERR_PROTOCOL_ERROR = 1
+pub const ERR_INTERNAL_ERROR = 2
+pub const ERR_FLOW_CONTROL_ERROR = 3
+pub const ERR_SETTINGS_TIMEOUT = 4
+pub const ERR_STREAM_CLOSED = 5
+pub const ERR_FRAME_SIZE_ERROR = 6
+pub const ERR_REFUSED_STREAM = 7
+pub const ERR_CANCEL = 8
+pub const ERR_COMPRESSION_ERROR = 9
+pub const ERR_CONNECT_ERROR = 10
+pub const ERR_ENHANCE_YOUR_CALM = 11
+pub const ERR_INADEQUATE_SECURITY = 12
+pub const ERR_HTTP_1_1_REQUIRED = 13
+
+// Protocol defaults & bounds.
+pub const DEFAULT_HEADER_TABLE_SIZE = 4096
+pub const DEFAULT_INITIAL_WINDOW = 65535
+pub const DEFAULT_MAX_FRAME_SIZE = 16384
+pub const MAX_FRAME_SIZE_LIMIT = 16777215
+pub const MAX_WINDOW = 2147483647
+pub const MAX_STREAM_ID = 2147483647
+
+pub fn errorName(code: int): str {
+    if code == ERR_NO_ERROR { return "NO_ERROR" }
+    if code == ERR_PROTOCOL_ERROR { return "PROTOCOL_ERROR" }
+    if code == ERR_INTERNAL_ERROR { return "INTERNAL_ERROR" }
+    if code == ERR_FLOW_CONTROL_ERROR { return "FLOW_CONTROL_ERROR" }
+    if code == ERR_SETTINGS_TIMEOUT { return "SETTINGS_TIMEOUT" }
+    if code == ERR_STREAM_CLOSED { return "STREAM_CLOSED" }
+    if code == ERR_FRAME_SIZE_ERROR { return "FRAME_SIZE_ERROR" }
+    if code == ERR_REFUSED_STREAM { return "REFUSED_STREAM" }
+    if code == ERR_CANCEL { return "CANCEL" }
+    if code == ERR_COMPRESSION_ERROR { return "COMPRESSION_ERROR" }
+    if code == ERR_CONNECT_ERROR { return "CONNECT_ERROR" }
+    if code == ERR_ENHANCE_YOUR_CALM { return "ENHANCE_YOUR_CALM" }
+    if code == ERR_INADEQUATE_SECURITY { return "INADEQUATE_SECURITY" }
+    if code == ERR_HTTP_1_1_REQUIRED { return "HTTP_1_1_REQUIRED" }
+    return "ERR_" + intToStr(code)
+}
+
+// ---------------------------------------------------------------- frame structures
+
+pub type FrameHeader = value record {
+    pub length: int
+    pub ftype: int
+    pub flags: int
+    pub streamId: int
+}
+
+pub type Setting = value record {
+    pub id: int
+    pub val: int
+}
+
+pub type Goaway = value record {
+    pub lastStreamId: int
+    pub code: int
+    pub debug: str
+}
+
+pub type Span = value record {
+    pub start: int
+    pub end: int
+}
+
+// ---------------------------------------------------------------- frame encoding
+
+pub fn putU16(out: mut &[]byte, v: int) {
+    append(out, byte((v >> 8) & 0xff))
+    append(out, byte(v & 0xff))
+}
+
+pub fn putU24(out: mut &[]byte, v: int) {
+    append(out, byte((v >> 16) & 0xff))
+    append(out, byte((v >> 8) & 0xff))
+    append(out, byte(v & 0xff))
+}
+
+pub fn putU32(out: mut &[]byte, v: int) {
+    append(out, byte((v >> 24) & 0xff))
+    append(out, byte((v >> 16) & 0xff))
+    append(out, byte((v >> 8) & 0xff))
+    append(out, byte(v & 0xff))
+}
+
+pub fn readU16(b: &[byte], off: int): int {
+    return (int(b[off]) << 8) | int(b[off + 1])
+}
+
+pub fn readU24(b: &[byte], off: int): int {
+    return (int(b[off]) << 16) | (int(b[off + 1]) << 8) | int(b[off + 2])
+}
+
+pub fn readU32(b: &[byte], off: int): int {
+    return (int(b[off]) << 24) | (int(b[off + 1]) << 16) | (int(b[off + 2]) << 8) | int(b[off + 3])
+}
+
+pub fn parseFrameHeader(b: &[byte]): FrameHeader {
+    return FrameHeader{
+        length: readU24(b, 0),
+        ftype: int(b[3]),
+        flags: int(b[4]),
+        streamId: readU32(b, 5) & 0x7fffffff,
+    }
+}
+
+pub fn putFrameHeader(out: mut &[]byte, length: int, ftype: int, flags: int, streamId: int) {
+    putU24(out, length)
+    append(out, byte(ftype & 0xff))
+    append(out, byte(flags & 0xff))
+    putU32(out, streamId & 0x7fffffff)
+}
+
+pub fn putSettings(out: mut &[]byte, entries: &[]Setting) {
+    putFrameHeader(out, len(entries) * 6, F_SETTINGS, 0, 0)
+    for s in entries {
+        putU16(out, s.id)
+        putU32(out, s.val)
+    }
+}
+
+pub fn putSettingsAck(out: mut &[]byte) {
+    putFrameHeader(out, 0, F_SETTINGS, FL_ACK, 0)
+}
+
+pub fn putPing(out: mut &[]byte, ack: bool, data: &[byte]) {
+    putFrameHeader(out, 8, F_PING, if ack { FL_ACK } else { 0 }, 0)
+    for i in 0..8 {
+        append(out, if i < len(data) { data[i] } else { byte(0) })
+    }
+}
+
+pub fn putWindowUpdate(out: mut &[]byte, streamId: int, incr: int) {
+    putFrameHeader(out, 4, F_WINDOW_UPDATE, 0, streamId)
+    putU32(out, incr & 0x7fffffff)
+}
+
+pub fn putRstStream(out: mut &[]byte, streamId: int, code: int) {
+    putFrameHeader(out, 4, F_RST_STREAM, 0, streamId)
+    putU32(out, code)
+}
+
+pub fn putGoaway(out: mut &[]byte, lastStreamId: int, code: int, debug: &str) {
+    putFrameHeader(out, 8 + len(debug), F_GOAWAY, 0, 0)
+    putU32(out, lastStreamId & 0x7fffffff)
+    putU32(out, code)
+    for i in 0..len(debug) { append(out, debug[i]) }
+}
+
+// Emits a complete HPACK block as a HEADERS frame followed by zero or more
+// CONTINUATION frames, each bounded by maxFrameSize.
+pub fn putHeaderBlock(out: mut &[]byte, streamId: int, block: &[byte], endStream: bool, maxFrameSize: int) {
+    let mfs = if maxFrameSize < DEFAULT_MAX_FRAME_SIZE { DEFAULT_MAX_FRAME_SIZE } else { maxFrameSize }
+    if len(block) <= mfs {
+        let fl = FL_END_HEADERS | (if endStream { FL_END_STREAM } else { 0 })
+        putFrameHeader(out, len(block), F_HEADERS, fl, streamId)
+        for i in 0..len(block) { append(out, block[i]) }
+        return
+    }
+    // First chunk in HEADERS
+    let fl0 = if endStream { FL_END_STREAM } else { 0 }
+    putFrameHeader(out, mfs, F_HEADERS, fl0, streamId)
+    for i in 0..mfs { append(out, block[i]) }
+    var off = mfs
+    while off < len(block) {
+        let rem = len(block) - off
+        let n = if rem > mfs { mfs } else { rem }
+        let fl = if off + n == len(block) { FL_END_HEADERS } else { 0 }
+        putFrameHeader(out, n, F_CONTINUATION, fl, streamId)
+        for i in 0..n { append(out, block[off + i]) }
+        off += n
+    }
+}
+
+// Emits data as one or more DATA frames bounded by maxFrameSize. If data is
+// empty and endStream is true, emits a zero-length DATA frame with END_STREAM.
+pub fn putData(out: mut &[]byte, streamId: int, data: &[byte], endStream: bool, maxFrameSize: int) {
+    let mfs = if maxFrameSize < DEFAULT_MAX_FRAME_SIZE { DEFAULT_MAX_FRAME_SIZE } else { maxFrameSize }
+    if len(data) == 0 {
+        if endStream { putFrameHeader(out, 0, F_DATA, FL_END_STREAM, streamId) }
+        return
+    }
+    var off = 0
+    while off < len(data) {
+        let rem = len(data) - off
+        let n = if rem > mfs { mfs } else { rem }
+        let fl = if endStream && off + n == len(data) { FL_END_STREAM } else { 0 }
+        putFrameHeader(out, n, F_DATA, fl, streamId)
+        for i in 0..n { append(out, data[off + i]) }
+        off += n
+    }
+}
+
+// ---------------------------------------------------------------- frame payload validation
+
+// Removes optional PADDED framing from DATA or HEADERS payloads.
+// Returns the unpadded [start..end) span or ERR_PROTOCOL_ERROR / ERR_FRAME_SIZE_ERROR.
+pub fn unpad(payload: &[byte], flags: int): Result[Span, int] {
+    if (flags & FL_PADDED) == 0 { return Ok(Span{start: 0, end: len(payload)}) }
+    if len(payload) < 1 { return Err(ERR_FRAME_SIZE_ERROR) }
+    let padLen = int(payload[0])
+    if padLen >= len(payload) { return Err(ERR_PROTOCOL_ERROR) }
+    return Ok(Span{start: 1, end: len(payload) - padLen})
+}
+
+// Strips optional PADDED and PRIORITY fields from a HEADERS frame payload.
+// Also validates RFC 9113 section 5.3.1 (a stream cannot depend on itself).
+pub fn headersFragment(payload: &[byte], flags: int, streamId: int): Result[Span, int] {
+    var sp = try unpad(payload, flags)
+    if (flags & FL_PRIORITY) != 0 {
+        if sp.end - sp.start < 5 { return Err(ERR_FRAME_SIZE_ERROR) }
+        let dep = readU32(payload, sp.start) & 0x7fffffff
+        if dep == streamId { return Err(ERR_PROTOCOL_ERROR) }
+        sp.start += 5
+    }
+    return Ok(sp)
+}
+
+// Parses a non-ACK SETTINGS payload (RFC 9113 section 6.5).
+pub fn parseSettings(payload: &[byte], maxEntries: int): Result[[]Setting, int] {
+    if len(payload) % 6 != 0 { return Err(ERR_FRAME_SIZE_ERROR) }
+    let count = len(payload) / 6
+    if maxEntries > 0 && count > maxEntries { return Err(ERR_ENHANCE_YOUR_CALM) }
+    var out: []Setting = withCapacity(count)
+    for i in 0..count {
+        let id = readU16(payload, i * 6)
+        let val = readU32(payload, i * 6 + 2)
+        if id == SET_ENABLE_PUSH && val != 0 && val != 1 { return Err(ERR_PROTOCOL_ERROR) }
+        if id == SET_INITIAL_WINDOW_SIZE && (val < 0 || val > MAX_WINDOW) { return Err(ERR_FLOW_CONTROL_ERROR) }
+        if id == SET_MAX_FRAME_SIZE && (val < DEFAULT_MAX_FRAME_SIZE || val > MAX_FRAME_SIZE_LIMIT) { return Err(ERR_PROTOCOL_ERROR) }
+        append(mut &out, Setting{id: id, val: val})
+    }
+    return Ok(out)
+}
+
+pub fn parseRstStream(payload: &[byte]): Result[int, int] {
+    if len(payload) != 4 { return Err(ERR_FRAME_SIZE_ERROR) }
+    return Ok(readU32(payload, 0))
+}
+
+pub fn parseWindowUpdate(payload: &[byte]): Result[int, int] {
+    if len(payload) != 4 { return Err(ERR_FRAME_SIZE_ERROR) }
+    let incr = readU32(payload, 0) & 0x7fffffff
+    if incr == 0 { return Err(ERR_PROTOCOL_ERROR) }
+    return Ok(incr)
+}
+
+pub fn parseGoaway(payload: &[byte]): Result[Goaway, int] {
+    if len(payload) < 8 { return Err(ERR_FRAME_SIZE_ERROR) }
+    let lastId = readU32(payload, 0) & 0x7fffffff
+    let code = readU32(payload, 4)
+    let dbg = if len(payload) > 8 { strFromBytes(&payload[8..len(payload)]) } else { "" }
+    return Ok(Goaway{lastStreamId: lastId, code: code, debug: dbg})
+}
+
+// ---------------------------------------------------------------- header validation (RFC 9113 section 8.2)
+
+fn isLowerTchar(c: byte): bool {
+    if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') { return true }
+    return c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' || c == '*' || c == '+' ||
+           c == '-' || c == '.' || c == '^' || c == '_' || c == '`' || c == '|' || c == '~'
+}
+
+// RFC 9113 section 8.2.1: regular header field names must be lowercase tokens.
+pub fn isValidHeaderName(name: &str): bool {
+    if len(name) == 0 { return false }
+    for i in 0..len(name) {
+        if !isLowerTchar(name[i]) { return false }
+    }
+    return true
+}
+
+// RFC 9113 section 8.2.1: no NUL, CR, LF, other controls (except HTAB),
+// and no leading or trailing SP / HTAB.
+pub fn isValidHeaderValue(val: &str): bool {
+    let n = len(val)
+    if n > 0 && (val[0] == ' ' || val[0] == '\t' || val[n - 1] == ' ' || val[n - 1] == '\t') { return false }
+    for i in 0..n {
+        let c = val[i]
+        if (c < byte(0x20) && c != '\t') || c == byte(0x7f) { return false }
+    }
+    return true
+}
+
+// RFC 9113 section 8.2.2: connection-specific header fields forbidden in HTTP/2.
+pub fn isForbiddenHeader(name: &str): bool {
+    let n = len(name)
+    if n == 10 && name == "connection" { return true }
+    if n == 10 && name == "keep-alive" { return true }
+    if n == 16 && name == "proxy-connection" { return true }
+    if n == 17 && name == "transfer-encoding" { return true }
+    if n == 7 && name == "upgrade" { return true }
+    return false
+}
+
+// Checks a decoded trailer block (RFC 9113 section 8.1 / 8.2):
+// no pseudo-headers, valid lowercase names, valid values, no connection-specific headers.
+pub fn validateTrailers(fields: &[]hpack.Field): bool {
+    for f in fields {
+        if len(f.name) == 0 || f.name[0] == ':' { return false }
+        if !isValidHeaderName(&f.name) || !isValidHeaderValue(&f.value) { return false }
+        if isForbiddenHeader(&f.name) { return false }
+        if f.name == "te" && f.value != "trailers" { return false }
+    }
+    return true
+}
+
+// RFC 9113 section 9.2.2: checks whether a negotiated TLS version & OpenSSL
+// cipher suite name satisfy HTTP/2's AEAD + forward-secrecy requirements.
+pub fn isGoodTlsCipher(version: &str, cipher: &str): bool {
+    if version == "TLSv1.3" { return true }
+    if version != "TLSv1.2" { return false }
+    let pfs = strings.startsWith(cipher, "ECDHE-") || strings.startsWith(cipher, "DHE-")
+    if !pfs { return false }
+    return strings.contains(cipher, "-GCM-") || strings.contains(cipher, "CHACHA20-POLY1305") || strings.contains(cipher, "-CCM")
+}

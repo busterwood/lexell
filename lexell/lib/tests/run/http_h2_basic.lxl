@@ -1,0 +1,265 @@
+// http + httpserver: HTTP/2 cleartext (h2c) end-to-end with the same API as
+// HTTP/1.1 — routing, params, query, headers, large bodies (flow control),
+// streaming + trailers, SSE, concurrent multiplexing on one connection,
+// redirects, mid-stream reset recovery, unread response drop, H1/H2 coexistence,
+// and graceful GOAWAY drain.
+// expect: h1_coexist: 200 HTTP/1.1
+// expect: h2_get: 200 HTTP/2.0 root
+// expect: h2_param: 200 hello alice q=42 hdr=yes
+// expect: h2_head: 200 len=4 body=''
+// expect: h2_post_small: 200 POST /echo 11 hello world
+// expect: h2_post_big: 200 POST /echo 200000 ok=true
+// expect: h2_big_resp: 200 len=300000 ok=true
+// expect: h2_stream: 200 one,two,three
+// expect: h2_sse: 200 event: tick
+// expect: h2_redirect: 200 hello redir q= hdr=
+// expect: h2_err_before: 422
+// expect: h2_err_mid: err=true, next=200
+// expect: h2_drop_unread: next=200
+// expect: h2_mux: ok=20 dials=1
+// expect: stop: 200 bye
+import "task"
+import "net"
+import "strings"
+import "http"
+import "httpserver"
+
+type App = value record { tag: str }
+
+fn root(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    return w.text("root")
+}
+
+fn proto(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    return w.text(&rq.proto)
+}
+
+fn hello(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    let name = rq.param("name")
+    let q = rq.query("q").unwrapOr("")
+    let hdr = rq.header("X-Test").unwrapOr("")
+    w.header("X-Reply", "ok")
+    return w.text(&("hello " + name + " q=" + q + " hdr=" + hdr))
+}
+
+fn echo(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    let b = try rq.bytes(500000)
+    if len(b) <= 64 {
+        return w.text(&(rq.method + " " + rq.path + " " + intToStr(len(b)) + " " + strFromBytes(&b)))
+    }
+    var ok = true
+    for i in 0..len(b) {
+        if b[i] != byte(65 + (i % 26)) { ok = false; break }
+    }
+    return w.text(&(rq.method + " " + rq.path + " " + intToStr(len(b)) + " ok=" + (if ok { "true" } else { "false" })))
+}
+
+fn bigResp(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    var chunk = array(30000, byte('z'))
+    for i in 0..10 {
+        try w.write(&chunk)
+    }
+    return Ok(Unit{})
+}
+
+fn streamResp(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    w.trailer("X-Sum", "")
+    try w.writeStr("one,")
+    try w.flush()
+    try w.writeStr("two,")
+    try w.flush()
+    try w.writeStr("three")
+    w.trailer("X-Sum", "3")
+    return Ok(Unit{})
+}
+
+fn events(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    try w.startEvents()
+    try w.event("tick", "1")
+    try w.event("tick", "2")
+    return Ok(Unit{})
+}
+
+fn redir(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    return w.redirect(303, "/hello/redir")
+}
+
+fn errBefore(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    return Err(httpserver.error(422, "bad input"))
+}
+
+fn errMid(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    try w.writeStr("partial")
+    try w.flush()
+    return Err(httpserver.error(500, "boom mid-stream"))
+}
+
+fn slow(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    let id = rq.param("id")
+    let r = task.sleep(30)
+    return w.text(&("slow-" + id))
+}
+
+fn stop(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    rq.stopServer()
+    return w.text("bye")
+}
+
+fn routes(): httpserver.Router[App] {
+    var r = httpserver.router[App]()
+    r.handle("GET /{$}", root)
+    r.handle("GET /proto", proto)
+    r.handle("GET /hello/{name}", hello)
+    r.handleWith("POST /echo", echo, httpserver.RouteOpts{deadlineMs: -1, maxBody: 500000})
+    r.handle("GET /big", bigResp)
+    r.handle("GET /stream", streamResp)
+    r.handle("GET /events", events)
+    r.handle("GET /redirect", redir)
+    r.handle("GET /err-before", errBefore)
+    r.handle("GET /err-mid", errMid)
+    r.handle("GET /slow/{id}", slow)
+    r.handle("GET /stop", stop)
+    return r
+}
+
+type SrvJob = record { ln: net.Listener; cfg: httpserver.Config }
+
+fn runServer(j: SrvJob): str {
+    let SrvJob{ln: ln, cfg: cfg} = move(j)
+    match httpserver.serve(ln, App{tag: "h2"}, routes(), cfg) {
+        Ok(st) { return st.toStr() }
+        Err(e) { return "err: " + e.toStr() }
+    }
+}
+
+type MuxJob = record { c: http.Client; url: str; id: int }
+
+fn runMux(j: MuxJob): bool {
+    let MuxJob{c: c, url: u, id: id} = move(j)
+    match c.get(&u) {
+        Ok(r) {
+            if r.status != 200 || r.major != 2 { return false }
+            match r.text() {
+                Ok(t) { return t == "slow-" + intToStr(id) }
+                Err(_) { return false }
+            }
+        }
+        Err(_) { return false }
+    }
+}
+
+fn main() {
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        var cfg = httpserver.defaults()
+        cfg.signals = false
+        cfg.logFd = -1
+        cfg.h2c = true
+        let srv = s.start(runServer, SrvJob{ln: ln, cfg: cfg})
+        let base = "http://" + addr
+
+        // 1. Plain HTTP/1.1 client still works on the same h2c-enabled server
+        let c1 = http.newClient(http.defaults())
+        let r1 = c1.get(&(base + "/proto")).unwrap()
+        println("h1_coexist: " + intToStr(r1.status) + " " + r1.text().unwrap())
+
+        // 2. HTTP/2 h2c client using the exact same API
+        var o2 = http.defaults()
+        o2.h2c = true
+        let c2 = http.newClient(o2)
+
+        let rRoot = c2.get(&(base + "/")).unwrap()
+        println("h2_get: " + intToStr(rRoot.status) + " " + rRoot.proto + " " + rRoot.text().unwrap())
+
+        var rq = http.request("GET", &(base + "/hello/alice?q=42"))
+        rq.header("X-Test", "yes")
+        let rParam = c2.send(&rq).unwrap()
+        if rParam.header("X-Reply").unwrapOr("") != "ok" { panic("missing X-Reply") }
+        println("h2_param: " + intToStr(rParam.status) + " " + rParam.text().unwrap())
+
+        let rHead = c2.head(&(base + "/")).unwrap()
+        let hst = rHead.status
+        let hcl = rHead.contentLength()
+        let hb = rHead.text().unwrap()
+        println("h2_head: " + intToStr(hst) + " len=" + intToStr(hcl) + " body='" + hb + "'")
+
+        let rSmall = c2.post(&(base + "/echo"), "text/plain", "hello world").unwrap()
+        println("h2_post_small: " + intToStr(rSmall.status) + " " + rSmall.text().unwrap())
+
+        // Large 200 KiB POST body (exceeds 64 KiB initial flow-control window)
+        var bigBody = ""
+        for i in 0..200000 { bigBody.addByte(byte(65 + (i % 26))) }
+        let rBigPost = c2.post(&(base + "/echo"), "application/octet-stream", &bigBody).unwrap()
+        println("h2_post_big: " + intToStr(rBigPost.status) + " " + rBigPost.text().unwrap())
+
+        // Large 300 KiB streamed response (exercises client WINDOW_UPDATE)
+        let rBig = c2.get(&(base + "/big")).unwrap()
+        let bigSt = rBig.status
+        let bigGot = rBig.text().unwrap()
+        var bigOk = len(bigGot) == 300000
+        for i in 0..len(bigGot) {
+            if bigGot[i] != 'z' { bigOk = false; break }
+        }
+        println("h2_big_resp: " + intToStr(bigSt) + " len=" + intToStr(len(bigGot)) + " ok=" + (if bigOk { "true" } else { "false" }))
+
+        // Streaming + trailers
+        let rStream = c2.get(&(base + "/stream")).unwrap()
+        let stSt = rStream.status
+        println("h2_stream: " + intToStr(stSt) + " " + rStream.text().unwrap())
+
+        // SSE
+        let rSse = c2.get(&(base + "/events")).unwrap()
+        let sseSt = rSse.status
+        let sseText = rSse.text().unwrap()
+        let firstLine = strings.cut(&sseText, "\n").unwrap().before.clone()
+        println("h2_sse: " + intToStr(sseSt) + " " + firstLine)
+
+        // Redirect
+        let rRedir = c2.get(&(base + "/redirect")).unwrap()
+        println("h2_redirect: " + intToStr(rRedir.status) + " " + rRedir.text().unwrap())
+
+        // Handler error before head
+        let rErr1 = c2.get(&(base + "/err-before")).unwrap()
+        let stErr1 = rErr1.status
+        let _d1 = rErr1.text().unwrap()
+        println("h2_err_before: " + intToStr(stErr1))
+
+        // Mid-stream handler error resets stream without killing connection
+        let rErr2 = c2.get(&(base + "/err-mid")).unwrap()
+        let midRes = rErr2.text()
+        let rAfter = c2.get(&(base + "/")).unwrap()
+        let afterSt = rAfter.status
+        let _d2 = rAfter.text().unwrap()
+        println("h2_err_mid: err=" + (if midRes.isErr() { "true" } else { "false" }) + ", next=" + intToStr(afterSt))
+
+        // Dropping an unread large response cancels its stream cleanly and keeps connection alive
+        {
+            let rDrop = c2.get(&(base + "/big")).unwrap()
+            if rDrop.status != 200 { panic("drop status") }
+        }
+        let rAfterDrop = c2.get(&(base + "/")).unwrap()
+        let dropNext = rAfterDrop.status
+        let _d3 = rAfterDrop.text().unwrap()
+        println("h2_drop_unread: next=" + intToStr(dropNext))
+
+        // 20 concurrent multiplexed requests over ONE HTTP/2 connection!
+        let muxOk = task.scoped(fn(ms: mut &task.Scope): int {
+            var futs: []task.Future[bool] = []
+            for i in 0..20 {
+                append(mut &futs, ms.start(runMux, MuxJob{c: c2.share(), url: base + "/slow/" + intToStr(i), id: i}))
+            }
+            let res = task.all(futs).unwrap()
+            var n = 0
+            for ok in res { if ok { n += 1 } }
+            return n
+        })
+        let stats = c2.stats()
+        println("h2_mux: ok=" + intToStr(muxOk) + " dials=" + intToStr(stats.dials))
+
+        // Graceful stop
+        let rStop = c2.get(&(base + "/stop")).unwrap()
+        println("stop: " + intToStr(rStop.status) + " " + rStop.text().unwrap())
+        let _srvOut = srv.wait().unwrap()
+    })
+}

@@ -1,0 +1,478 @@
+// hpack: RFC 7541 HPACK header compression for HTTP/2.
+//
+// Strict decoder with bounded header-list size (defends against HPACK bombs),
+// 4-bit nibble Huffman DFA with exact RFC 7541 section 5.2 EOS/padding checks,
+// and an encoder with static/dynamic table lookup, Huffman encoding and
+// never-indexed protection for sensitive headers.
+import "hpack_data" as hd
+
+pub type Field = value record {
+    pub name: str
+    pub value: str
+}
+
+pub type Error = value closed {
+    Truncated
+    BadIndex
+    BadInt
+    BadHuffman
+    TableSize
+    TooLarge
+    TooMany
+}
+
+pub fn (e: Error) toStr(): str {
+    match e {
+        Error.Truncated { return "truncated HPACK block" }
+        Error.BadIndex { return "invalid HPACK index" }
+        Error.BadInt { return "invalid HPACK integer" }
+        Error.BadHuffman { return "invalid HPACK Huffman string" }
+        Error.TableSize { return "invalid HPACK dynamic table size update" }
+        Error.TooLarge { return "header list too large" }
+        Error.TooMany { return "too many header fields" }
+    }
+}
+
+// ---------------------------------------------------------------- dynamic table
+
+// Dynamic table: entries stored oldest-first in ents[head..len(ents)].
+// Index 0 in HPACK dynamic numbering (index 62 overall) is ents[len(ents) - 1].
+type DynTable = record {
+    ents: []Field
+    head: int
+    size: int          // sum of (len(name) + len(value) + 32)
+    maxSize: int
+}
+
+fn newDynTable(maxSize: int): DynTable {
+    return DynTable{ents: [], head: 0, size: 0, maxSize: maxSize}
+}
+
+fn (t: &DynTable) count(): int { return len(t.ents) - t.head }
+
+fn (t: mut &DynTable) evictTo(limit: int) {
+    while t.size > limit && t.head < len(t.ents) {
+        let e = &t.ents[t.head]
+        t.size -= len(e.name) + len(e.value) + 32
+        t.ents[t.head] = Field{name: "", value: ""}
+        t.head += 1
+    }
+    if t.head == len(t.ents) {
+        t.ents = []
+        t.head = 0
+        t.size = 0
+    } else if t.head >= 64 && t.head * 2 >= len(t.ents) {
+        let keep = len(t.ents) - t.head
+        var next: []Field = withCapacity(keep)
+        for i in t.head..len(t.ents) {
+            append(mut &next, replace(mut &t.ents[i], Field{name: "", value: ""}))
+        }
+        t.ents = next
+        t.head = 0
+    }
+}
+
+fn (t: mut &DynTable) setMaxSize(n: int) {
+    t.maxSize = n
+    t.evictTo(n)
+}
+
+fn (t: mut &DynTable) add(name: &str, value: &str) {
+    let esize = len(name) + len(value) + 32
+    if esize > t.maxSize {
+        t.evictTo(0)
+        return
+    }
+    t.evictTo(t.maxSize - esize)
+    append(mut &t.ents, Field{name: name.clone(), value: value.clone()})
+    t.size += esize
+}
+
+// ---------------------------------------------------------------- integer & Huffman codec
+
+const MAX_INT = 2147483647
+
+type IntRes = value record {
+    val: int
+    next: int
+}
+
+// Decodes an RFC 7541 section 5.1 integer with an N-bit prefix starting at data[pos].
+fn decodeInt(data: &[byte], pos: int, prefixBits: int): Result[IntRes, Error] {
+    if pos >= len(data) { return Err(Error.Truncated) }
+    let mask = (1 << prefixBits) - 1
+    var val = int(data[pos]) & mask
+    var i = pos + 1
+    if val < mask { return Ok(IntRes{val: val, next: i}) }
+    var shift = 0
+    var steps = 0
+    while true {
+        if i >= len(data) { return Err(Error.Truncated) }
+        if steps >= 5 { return Err(Error.BadInt) }
+        let b = int(data[i])
+        i += 1
+        let chunk = b & 0x7f
+        if shift >= 28 && chunk > 7 { return Err(Error.BadInt) }
+        let add = chunk << shift
+        if val > MAX_INT - add { return Err(Error.BadInt) }
+        val += add
+        if (b & 0x80) == 0 { return Ok(IntRes{val: val, next: i}) }
+        shift += 7
+        steps += 1
+    }
+    return Err(Error.BadInt)
+}
+
+fn encodeInt(out: mut &[]byte, prefixByte: int, prefixBits: int, val: int) {
+    let mask = (1 << prefixBits) - 1
+    if val < mask {
+        append(out, byte(prefixByte | val))
+        return
+    }
+    append(out, byte(prefixByte | mask))
+    var v = val - mask
+    while v >= 128 {
+        append(out, byte((v & 0x7f) | 0x80))
+        v = v >> 7
+    }
+    append(out, byte(v))
+}
+
+// Decodes an RFC 7541 section 5.2 Huffman-encoded byte slice, bounded by maxOut bytes.
+pub fn decodeHuffman(src: &[byte], maxOut: int): Result[str, Error] {
+    if len(src) == 0 { return Ok("") }
+    var out: []byte = withCapacity(min(len(src) * 2, maxOut))
+    var state = 0
+    for i in 0..len(src) {
+        let b = int(src[i])
+        // high nibble
+        let t1 = int(hd.HUFF_DFA[state * 16 + (b >> 4)])
+        if (t1 & hd.HUFF_FAIL) != 0 { return Err(Error.BadHuffman) }
+        if (t1 & hd.HUFF_EMIT) != 0 {
+            if len(out) >= maxOut { return Err(Error.TooLarge) }
+            append(mut &out, byte((t1 >> 8) & 0xff))
+        }
+        state = t1 & 0xff
+        // low nibble
+        let t2 = int(hd.HUFF_DFA[state * 16 + (b & 0x0f)])
+        if (t2 & hd.HUFF_FAIL) != 0 { return Err(Error.BadHuffman) }
+        if (t2 & hd.HUFF_EMIT) != 0 {
+            if len(out) >= maxOut { return Err(Error.TooLarge) }
+            append(mut &out, byte((t2 >> 8) & 0xff))
+        }
+        state = t2 & 0xff
+    }
+    if hd.HUFF_ACCEPT[state] == byte(0) { return Err(Error.BadHuffman) }
+    return Ok(strFromBytes(&out))
+}
+
+// Exact encoded byte length of s under RFC 7541 Huffman coding.
+pub fn huffmanLen(s: &str): int {
+    var bits = 0
+    for i in 0..len(s) {
+        bits += int(hd.HUFF_LEN[int(s[i])])
+    }
+    return (bits + 7) / 8
+}
+
+// Appends the Huffman encoding of s (with trailing 1-bit EOS padding) to out.
+pub fn encodeHuffman(out: mut &[]byte, s: &str) {
+    var acc: u64 = 0
+    var nbits = 0
+    for i in 0..len(s) {
+        let idx = int(s[i])
+        let code = u64(hd.HUFF_CODE[idx])
+        let clen = int(hd.HUFF_LEN[idx])
+        acc = (acc << clen) | code
+        nbits += clen
+        while nbits >= 8 {
+            nbits -= 8
+            append(out, byte((acc >> nbits) & 0xff))
+        }
+    }
+    if nbits > 0 {
+        let pad = 8 - nbits
+        let last = ((acc << pad) | ((u64(1) << pad) - 1)) & 0xff
+        append(out, byte(last))
+    }
+}
+
+type StrRes = value record {
+    s: str
+    next: int
+}
+
+fn decodeString(data: &[byte], pos: int, maxOut: int): Result[StrRes, Error] {
+    if pos >= len(data) { return Err(Error.Truncated) }
+    let huff = (int(data[pos]) & 0x80) != 0
+    let lr = try decodeInt(data, pos, 7)
+    let slen = lr.val
+    let start = lr.next
+    if slen < 0 || slen > len(data) - start { return Err(Error.Truncated) }
+    if huff {
+        let s = try decodeHuffman(&data[start..start + slen], maxOut)
+        return Ok(StrRes{s: s, next: start + slen})
+    }
+    if slen > maxOut { return Err(Error.TooLarge) }
+    return Ok(StrRes{s: strFromBytes(&data[start..start + slen]), next: start + slen})
+}
+
+fn encodeString(out: mut &[]byte, s: &str) {
+    let hlen = huffmanLen(s)
+    if hlen < len(s) {
+        encodeInt(out, 0x80, 7, hlen)
+        encodeHuffman(out, s)
+    } else {
+        encodeInt(out, 0x00, 7, len(s))
+        for i in 0..len(s) { append(out, s[i]) }
+    }
+}
+
+// ---------------------------------------------------------------- decoder
+
+pub type Decoder = record {
+    dyn: DynTable
+    hardMax: int       // maximum allowed dynamic table size (SETTINGS_HEADER_TABLE_SIZE)
+}
+
+pub fn newDecoder(maxTableSize: int): Decoder {
+    let m = if maxTableSize < 0 { 0 } else { maxTableSize }
+    return Decoder{dyn: newDynTable(m), hardMax: m}
+}
+
+// Updates the maximum allowed dynamic table size (after SETTINGS_HEADER_TABLE_SIZE).
+pub fn (d: mut &Decoder) setMaxTableSize(n: int) {
+    let m = if n < 0 { 0 } else { n }
+    d.hardMax = m
+    if d.dyn.maxSize > m { d.dyn.setMaxSize(m) }
+}
+
+pub fn (d: &Decoder) dynamicSize(): int { return d.dyn.size }
+
+fn (d: &Decoder) lookup(idx: int): Result[Field, Error] {
+    if idx <= 0 { return Err(Error.BadIndex) }
+    if idx <= hd.STATIC_COUNT {
+        return Ok(Field{name: hd.STATIC_NAME[idx].clone(), value: hd.STATIC_VAL[idx].clone()})
+    }
+    let di = idx - hd.STATIC_COUNT - 1
+    let cnt = d.dyn.count()
+    if di >= cnt { return Err(Error.BadIndex) }
+    let e = &d.dyn.ents[len(d.dyn.ents) - 1 - di]
+    return Ok(Field{name: e.name.clone(), value: e.value.clone()})
+}
+
+fn (d: &Decoder) lookupName(idx: int): Result[str, Error] {
+    if idx <= 0 { return Err(Error.BadIndex) }
+    if idx <= hd.STATIC_COUNT { return Ok(hd.STATIC_NAME[idx].clone()) }
+    let di = idx - hd.STATIC_COUNT - 1
+    let cnt = d.dyn.count()
+    if di >= cnt { return Err(Error.BadIndex) }
+    return Ok(d.dyn.ents[len(d.dyn.ents) - 1 - di].name.clone())
+}
+
+// Decodes a complete HPACK header block. Enforces RFC 7541 section 4.1 list
+// size (sum of len(name) + len(value) + 32) <= maxListBytes and field count
+// <= maxFields while decoding, stopping immediately on HPACK bombs.
+pub fn (d: mut &Decoder) decode(data: &[byte], maxListBytes: int, maxFields: int): Result[[]Field, Error] {
+    var out: []Field = []
+    var pos = 0
+    var listBytes = 0
+    var allowSizeUpdate = true
+    while pos < len(data) {
+        let b = int(data[pos])
+        if (b & 0x80) != 0 {
+            // 6.1 Indexed Header Field
+            allowSizeUpdate = false
+            let r = try decodeInt(data, pos, 7)
+            pos = r.next
+            if len(out) >= maxFields { return Err(Error.TooMany) }
+            let f = try d.lookup(r.val)
+            let cost = len(f.name) + len(f.value) + 32
+            if listBytes + cost > maxListBytes { return Err(Error.TooLarge) }
+            listBytes += cost
+            append(mut &out, f)
+        } else if (b & 0xc0) == 0x40 {
+            // 6.2.1 Literal Header Field with Incremental Indexing
+            allowSizeUpdate = false
+            let r = try decodeInt(data, pos, 6)
+            pos = r.next
+            if len(out) >= maxFields { return Err(Error.TooMany) }
+            let rem = maxListBytes - listBytes - 32
+            if rem < 0 { return Err(Error.TooLarge) }
+            var name = ""
+            if r.val == 0 {
+                let StrRes{s: ns, next: nnext} = try decodeString(data, pos, rem)
+                name = ns
+                pos = nnext
+            } else {
+                name = try d.lookupName(r.val)
+                if len(name) > rem { return Err(Error.TooLarge) }
+            }
+            let StrRes{s: vs, next: vnext} = try decodeString(data, pos, rem - len(name))
+            pos = vnext
+            let cost = len(name) + len(vs) + 32
+            if listBytes + cost > maxListBytes { return Err(Error.TooLarge) }
+            listBytes += cost
+            d.dyn.add(&name, &vs)
+            append(mut &out, Field{name: name, value: vs})
+        } else if (b & 0xe0) == 0x20 {
+            // 6.3 Dynamic Table Size Update (only at the start of a header block)
+            if !allowSizeUpdate { return Err(Error.TableSize) }
+            let r = try decodeInt(data, pos, 5)
+            pos = r.next
+            if r.val > d.hardMax { return Err(Error.TableSize) }
+            d.dyn.setMaxSize(r.val)
+        } else {
+            // 6.2.2 Literal without Indexing (0x00) / 6.2.3 Never Indexed (0x10)
+            allowSizeUpdate = false
+            let r = try decodeInt(data, pos, 4)
+            pos = r.next
+            if len(out) >= maxFields { return Err(Error.TooMany) }
+            let rem = maxListBytes - listBytes - 32
+            if rem < 0 { return Err(Error.TooLarge) }
+            var name = ""
+            if r.val == 0 {
+                let StrRes{s: ns, next: nnext} = try decodeString(data, pos, rem)
+                name = ns
+                pos = nnext
+            } else {
+                name = try d.lookupName(r.val)
+                if len(name) > rem { return Err(Error.TooLarge) }
+            }
+            let StrRes{s: vs, next: vnext} = try decodeString(data, pos, rem - len(name))
+            pos = vnext
+            let cost = len(name) + len(vs) + 32
+            if listBytes + cost > maxListBytes { return Err(Error.TooLarge) }
+            listBytes += cost
+            append(mut &out, Field{name: name, value: vs})
+        }
+    }
+    return Ok(out)
+}
+
+// ---------------------------------------------------------------- encoder
+
+pub type Encoder = record {
+    dyn: DynTable
+    hardMax: int        // our own dynamic table cap (default 4096)
+    sizeDirty: bool     // peer changed SETTINGS_HEADER_TABLE_SIZE; emit update(s) next block
+    minPending: int     // lowest size seen since last block (RFC 7541 4.2)
+    targetSize: int     // final target size to emit
+}
+
+pub fn newEncoder(maxTableSize: int): Encoder {
+    let m = if maxTableSize < 0 { 0 } else { maxTableSize }
+    return Encoder{dyn: newDynTable(m), hardMax: m, sizeDirty: false, minPending: m, targetSize: m}
+}
+
+// Applies the peer's SETTINGS_HEADER_TABLE_SIZE (capped at our hardMax).
+pub fn (e: mut &Encoder) setMaxTableSize(n: int) {
+    var m = if n < 0 { 0 } else { n }
+    if m > e.hardMax { m = e.hardMax }
+    if !e.sizeDirty {
+        if m == e.dyn.maxSize { return }
+        e.sizeDirty = true
+        e.minPending = m
+        e.targetSize = m
+    } else {
+        if m < e.minPending { e.minPending = m }
+        e.targetSize = m
+    }
+    e.dyn.setMaxSize(m)
+}
+
+fn isSensitive(name: &str): bool {
+    let n = len(name)
+    if n == 6 && name == "cookie" { return true }
+    if n == 10 && name == "set-cookie" { return true }
+    if n == 13 && name == "authorization" { return true }
+    if n == 19 && name == "proxy-authorization" { return true }
+    return false
+}
+
+// Whether a header is worth indexing into the encoder's dynamic table.
+fn shouldIndex(name: &str, value: &str): bool {
+    let n = len(name)
+    // Skip high-cardinality per-request headers that churn the table
+    if n == 5 && name == ":path" && len(value) > 64 { return false }
+    if n == 14 && name == "content-length" { return false }
+    if n == 12 && name == "x-request-id" { return false }
+    if len(name) + len(value) + 32 > 1024 { return false }
+    return true
+}
+
+type SearchRes = value record {
+    idx: int
+    exact: bool
+}
+
+fn searchStatic(name: &str, value: &str): SearchRes {
+    var nameIdx = 0
+    for i in 1..hd.STATIC_COUNT + 1 {
+        if hd.STATIC_NAME[i] == name {
+            if hd.STATIC_VAL[i] == value {
+                return SearchRes{idx: i, exact: true}
+            }
+            if nameIdx == 0 { nameIdx = i }
+        }
+    }
+    return SearchRes{idx: nameIdx, exact: false}
+}
+
+fn (e: &Encoder) searchDynamic(name: &str, value: &str, sensitive: bool): SearchRes {
+    var nameIdx = 0
+    let n = len(e.dyn.ents)
+    var i = n - 1
+    while i >= e.dyn.head {
+        let ent = &e.dyn.ents[i]
+        if ent.name == name {
+            let idx = hd.STATIC_COUNT + (n - i)
+            if !sensitive && ent.value == value {
+                return SearchRes{idx: idx, exact: true}
+            }
+            if nameIdx == 0 { nameIdx = idx }
+        }
+        i -= 1
+    }
+    return SearchRes{idx: nameIdx, exact: false}
+}
+
+// Encodes fields into an HPACK header block appended to out.
+pub fn (e: mut &Encoder) encode(fields: &[]Field, out: mut &[]byte) {
+    if e.sizeDirty {
+        if e.minPending < e.targetSize {
+            encodeInt(out, 0x20, 5, e.minPending)
+        }
+        encodeInt(out, 0x20, 5, e.targetSize)
+        e.sizeDirty = false
+    }
+    for f in fields {
+        let sens = isSensitive(&f.name)
+        let sr = searchStatic(&f.name, &f.value)
+        if sr.exact && !sens {
+            encodeInt(out, 0x80, 7, sr.idx)
+            continue
+        }
+        var bestIdx = sr.idx
+        let dr = e.searchDynamic(&f.name, &f.value, sens)
+        if dr.exact && !sens {
+            encodeInt(out, 0x80, 7, dr.idx)
+            continue
+        }
+        if bestIdx == 0 { bestIdx = dr.idx }
+        let esize = len(f.name) + len(f.value) + 32
+        if !sens && esize <= e.dyn.maxSize && shouldIndex(&f.name, &f.value) {
+            // Literal with Incremental Indexing (0x40, 6-bit prefix)
+            encodeInt(out, 0x40, 6, bestIdx)
+            if bestIdx == 0 { encodeString(out, &f.name) }
+            encodeString(out, &f.value)
+            e.dyn.add(&f.name, &f.value)
+        } else {
+            // Never Indexed (0x10) for sensitive headers, else Without Indexing (0x00)
+            let pfx = if sens { 0x10 } else { 0x00 }
+            encodeInt(out, pfx, 4, bestIdx)
+            if bestIdx == 0 { encodeString(out, &f.name) }
+            encodeString(out, &f.value)
+        }
+    }
+}

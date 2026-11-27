@@ -1,0 +1,151 @@
+// http + httpserver: HTTPS with ALPN "h2,http/1.1" — default client negotiates
+// HTTP/2 over TLS (full-duplex memory-BIO Engine + net.Halves), concurrent
+// multiplexed HTTPS requests share one TLS connection, large bodies flow
+// cleanly, HTTP/1.1-only clients fall back to HTTP/1.1 on the same server,
+// and unknown ALPN protocols are refused.
+// needs: ssl
+// expect: h2_tls_get: 200 HTTP/2.0 server=HTTP/2.0
+// expect: h2_tls_post: 200 len=150000 ok=true
+// expect: h2_tls_mux: ok=12 dials=1
+// expect: h1_fallback: 200 HTTP/1.1 server=HTTP/1.1
+// expect: bad_alpn: config
+// expect: stop: 200 bye
+import "task"
+import "net"
+import "strings"
+import "http"
+import "tls"
+import "httpserver"
+import "../support/tlstest" as tt
+
+type App = value record { name: str }
+
+fn proto(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    return w.text(&("server=" + rq.proto))
+}
+
+fn echoBig(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    let b = try rq.bytes(300000)
+    var ok = true
+    for i in 0..len(b) {
+        if b[i] != byte(97 + (i % 26)) { ok = false; break }
+    }
+    return w.text(&("len=" + intToStr(len(b)) + " ok=" + (if ok { "true" } else { "false" })))
+}
+
+fn slow(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    let id = rq.param("id")
+    let r = task.sleep(20)
+    return w.text(&("tls-" + id))
+}
+
+fn stop(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    rq.stopServer()
+    return w.text("bye")
+}
+
+fn routes(): httpserver.Router[App] {
+    var r = httpserver.router[App]()
+    r.handle("GET /proto", proto)
+    r.handleWith("POST /echo", echoBig, httpserver.RouteOpts{deadlineMs: -1, maxBody: 300000})
+    r.handle("GET /slow/{id}", slow)
+    r.handle("GET /stop", stop)
+    return r
+}
+
+type Job = record { ln: net.Listener; ctx: tls.Context; cfg: httpserver.Config }
+
+fn serveJob(j: Job): str {
+    let Job{ln: ln, ctx: ctx, cfg: cfg} = move(j)
+    match httpserver.serveTls(ln, ctx, App{name: "tls-h2"}, routes(), cfg) {
+        Ok(s) { return s.toStr() }
+        Err(e) { return e.kind.toStr() }
+    }
+}
+
+fn serverCtx(alpn: &str): tls.Context {
+    var o = tls.defaults()
+    o.certFile = tt.path("srv.pem")
+    o.keyFile = tt.path("srv.key")
+    o.alpn = alpn.clone()
+    return tls.server(o).unwrap()
+}
+
+type MuxJob = record { c: http.Client; url: str; id: int }
+
+fn runMux(j: MuxJob): bool {
+    let MuxJob{c: c, url: u, id: id} = move(j)
+    match c.get(&u) {
+        Ok(r) {
+            if r.status != 200 || r.major != 2 { return false }
+            return match r.text() {
+                Ok(t) { t == "tls-" + intToStr(id) }
+                Err(_) { false }
+            }
+        }
+        Err(_) { return false }
+    }
+}
+
+fn main() {
+    tt.pki()
+    task.scope(fn(s: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let port = strings.cut(&(ln.localAddr()), ":").unwrap().after.clone()
+        var cfg = httpserver.defaults()
+        cfg.signals = false
+        cfg.logFd = -1
+        let srv = s.start(serveJob, Job{ln: ln, ctx: serverCtx("h2,http/1.1"), cfg: cfg})
+        let base = "https://localhost:" + port
+
+        // 1. Default client with ALPN "h2,http/1.1" negotiates HTTP/2 over TLS
+        var o2 = http.defaults()
+        var to2 = tt.clientOptions()
+        to2.alpn = "h2,http/1.1"
+        o2.tls = to2
+        let c2 = http.newClient(o2)
+
+        let r1 = c2.get(&(base + "/proto")).unwrap()
+        println("h2_tls_get: " + intToStr(r1.status) + " " + r1.proto + " " + r1.text().unwrap())
+
+        // 2. Large 150 KiB POST over TLS HTTP/2
+        var big = ""
+        for i in 0..150000 { big.addByte(byte(97 + (i % 26))) }
+        let r2 = c2.post(&(base + "/echo"), "application/octet-stream", &big).unwrap()
+        println("h2_tls_post: " + intToStr(r2.status) + " " + r2.text().unwrap())
+
+        // 3. 12 concurrent multiplexed HTTPS requests over 1 TLS connection
+        let okN = task.scoped(fn(ms: mut &task.Scope): int {
+            var futs: []task.Future[bool] = []
+            for i in 0..12 {
+                append(mut &futs, ms.start(runMux, MuxJob{c: c2.share(), url: base + "/slow/" + intToStr(i), id: i}))
+            }
+            var n = 0
+            for ok in task.all(futs).unwrap() { if ok { n += 1 } }
+            return n
+        })
+        println("h2_tls_mux: ok=" + intToStr(okN) + " dials=" + intToStr(c2.stats().dials))
+
+        // 4. HTTP/1.1-only client falls back cleanly to HTTP/1.1 on the same server
+        var o1 = http.defaults()
+        o1.http2 = false
+        var to1 = tt.clientOptions()
+        to1.alpn = "http/1.1"
+        o1.tls = to1
+        let c1 = http.newClient(o1)
+        let r3 = c1.get(&(base + "/proto")).unwrap()
+        println("h1_fallback: " + intToStr(r3.status) + " " + r3.proto + " " + r3.text().unwrap())
+
+        // 5. Unknown ALPN rejected as Config error
+        let badLn = net.listen("127.0.0.1:0").unwrap()
+        var badCfg = httpserver.defaults()
+        badCfg.signals = false
+        badCfg.logFd = -1
+        println("bad_alpn: " + serveJob(Job{ln: badLn, ctx: serverCtx("spdy/3"), cfg: badCfg}))
+
+        // 6. Stop
+        let rStop = c2.get(&(base + "/stop")).unwrap()
+        println("stop: " + intToStr(rStop.status) + " " + rStop.text().unwrap())
+        let _done = srv.wait().unwrap()
+    })
+}
