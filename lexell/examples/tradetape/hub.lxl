@@ -1,0 +1,208 @@
+// hub: single-connection LexDB `SELECT ... WAIT` relay feeding in-process
+// `sse.Feed` broadcast hubs (one all-symbols feed + per-symbol feeds).
+//
+// Instead of holding N dedicated database connections for N SSE clients,
+// one background task per worker process holds ONE LexDB connection running:
+//
+//     SELECT seq, symbol, side, price, qty, note, at_ms
+//     FROM trades WHERE seq > $1 ORDER BY seq LIMIT 64 WAIT <N> SECONDS
+//
+// Each committed trade wakes that single relay task immediately and fans out
+// in memory via `sse.Feed`—0% idle CPU, O(1) database load regardless of how
+// many thousands of SSE subscribers are connected, and per-symbol subscribers
+// never wake on non-matching symbols.
+
+import "sse"
+import "postgres"
+import "task"
+import "json"
+import "decimal"
+
+pub type Trade = record {
+    pub seq: int
+    pub symbol: str
+    pub side: str
+    pub price: Decimal
+    pub qty: int
+    pub notional: Decimal
+    pub note: str
+    pub atMs: int
+}
+
+pub fn tradeFromRow(rows: &postgres.Rows, r: int): Result[Trade, postgres.Error] {
+    let seq = try rows.int(r, 0)
+    let symbol = try rows.text(r, 1)
+    let side = try rows.text(r, 2)
+    let price = try rows.decimal(r, 3)
+    let qty = try rows.int(r, 4)
+    let note = try rows.text(r, 5)
+    let atMs = try rows.int(r, 6)
+    let notional = price * decimal.Decimal.fromInt(qty)
+    return Ok(Trade{
+        seq: seq, symbol: symbol, side: side, price: price,
+        qty: qty, notional: notional, note: note, atMs: atMs
+    })
+}
+
+type HubState = record {
+    allFeed: sse.Feed
+    bySymbol: Map[str, sse.Feed]
+    lastSeq: int
+}
+
+pub type Hub = value record {
+    sh: task.Shared[HubState]
+}
+
+pub fn newHub(): Hub {
+    return Hub{sh: task.shared(HubState{
+        allFeed: sse.newFeed(),
+        bySymbol: newMap(),
+        lastSeq: 0
+    })}
+}
+
+pub fn (h: &Hub) share(): Hub { return Hub{sh: h.sh.share()} }
+
+pub type Subscription = record {
+    pub cursor: sse.Cursor
+    pub hubSeq: int
+}
+
+// Subscribe to either the all-symbols feed (sym == "") or a single symbol's feed.
+// Returns an sse.Cursor positioned for live/ring-buffer delivery plus the hub's
+// current highest sequence number so callers can run a one-shot DB catch-up if
+// they requested history older than the in-memory ring buffer.
+pub fn (h: &Hub) subscribe(sym: &str, afterSeq: int): Subscription {
+    var out: Option[Subscription] = None
+    h.sh.with(fn(st: mut &HubState) {
+        var feed = st.allFeed.share()
+        if len(sym) > 0 {
+            if !st.bySymbol.has(sym) {
+                st.bySymbol.put(sym.clone(), sse.newFeed())
+            }
+            feed = st.bySymbol.at(sym.clone()).share()
+        }
+        let cur = if afterSeq > 0 {
+            feed.subscribeAfter(afterSeq.toStr())
+        } else {
+            feed.subscribe()
+        }
+        out = Some(Subscription{cursor: cur, hubSeq: st.lastSeq})
+    })
+    return out.unwrap()
+}
+
+fn (h: &Hub) publishTrade(t: &Trade) {
+    let ev = sse.Event{id: t.seq.toStr(), name: "trade", data: json.encode(t)}
+    var allF: Option[sse.Feed] = None
+    var symF: Option[sse.Feed] = None
+    h.sh.with(fn(st: mut &HubState) {
+        if t.seq > st.lastSeq { st.lastSeq = t.seq }
+        allF = Some(st.allFeed.share())
+        if st.bySymbol.has(&t.symbol) {
+            symF = Some(st.bySymbol.at(t.symbol.clone()).share())
+        }
+    })
+    match allF {
+        Some(f) { f.publish(ev.clone()) }
+        None {}
+    }
+    match symF {
+        Some(f) { f.publish(ev) }
+        None {}
+    }
+}
+
+pub type RelayJob = record {
+    pub hub: Hub
+    pub dsn: str
+    pub waitSec: int
+    pub ready: task.Promise[str]
+}
+
+fn signalOnce(opt: mut &Option[task.Promise[str]], val: str): bool {
+    match replace(opt, None) {
+        Some(p) { p.complete(val); return true }
+        None { return false }
+    }
+}
+
+// Background task: holds ONE dedicated LexDB connection running SELECT ... WAIT
+// and publishes every committed trade to the Hub's sse.Feeds. Exits immediately
+// when cancelled (conn.setCloseOnCancel(true)).
+pub fn runRelay(j: RelayJob): int {
+    let RelayJob{hub: h, dsn: dsn, waitSec: waitSec, ready: readyPr} = move(j)
+    var readyOpt: Option[task.Promise[str]] = Some(readyPr)
+    var cursor = 0
+
+    // Seed starting cursor from current max seq so we start tailing cleanly.
+    match postgres.connect(&dsn) {
+        Ok(c0) {
+            var conn0 = c0
+            conn0.setCloseOnCancel(true)
+            match conn0.query("SELECT seq FROM trades ORDER BY seq DESC LIMIT 1", &[]) {
+                Ok(rs) {
+                    if rs.rowCount() > 0 {
+                        cursor = rs.int(0, 0).unwrapOr(0)
+                    }
+                }
+                Err(_) {}
+            }
+        }
+        Err(e) {
+            let _s = signalOnce(mut &readyOpt, "err:" + e.toStr())
+            return 1
+        }
+    }
+    h.sh.with(fn(st: mut &HubState) {
+        if cursor > st.lastSeq { st.lastSeq = cursor }
+    })
+
+    let waitSql = $"SELECT seq, symbol, side, price, qty, note, at_ms FROM trades WHERE seq > $1 ORDER BY seq LIMIT 64 WAIT {waitSec} SECONDS"
+
+    while !task.cancelled() {
+        match postgres.connect(&dsn) {
+            Err(e) {
+                if signalOnce(mut &readyOpt, "err:" + e.toStr()) { return 1 }
+                if task.cancelled() { break }
+                let _sl = task.sleep(250)
+                continue
+            }
+            Ok(c) {
+                var conn = c
+                conn.setCloseOnCancel(true)
+                match conn.prepare(&waitSql) {
+                    Err(e) {
+                        if signalOnce(mut &readyOpt, "err:" + e.toStr()) { return 1 }
+                        if task.cancelled() { break }
+                        let _sl = task.sleep(250)
+                        continue
+                    }
+                    Ok(stmt) {
+                        let _ok = signalOnce(mut &readyOpt, "ok")
+                        while !task.cancelled() {
+                            match conn.queryPrepared(&stmt, &[postgres.Value.Int(cursor)]) {
+                                Ok(rows) {
+                                    for i in 0..rows.rowCount() {
+                                        match tradeFromRow(&rows, i) {
+                                            Ok(t) {
+                                                cursor = t.seq
+                                                h.publishTrade(&t)
+                                            }
+                                            Err(_) {}
+                                        }
+                                    }
+                                }
+                                Err(_) {
+                                    break
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return 0
+}
