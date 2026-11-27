@@ -7607,6 +7607,62 @@ fn (c: mut &Checker) vecAddr(pNode: int, iNode: int, el: int, lanes: int, forSto
     return c.x.bin("+", data, idx)
 }
 
+type VecPartAddr = value record {
+    ptr: int
+    cnt: int
+}
+
+fn (c: mut &Checker) vecPartialAddr(pNode: int, iNode: int, el: int, lanes: int, forStore: bool, line: int): VecPartAddr {
+    var pv = c.rcRead(c.expr(pNode, -1))
+    let pk = c.pg.tk(pv.t)
+    if forStore {
+        let ok = (pk == sema.TK_ARR || pk == sema.TK_SLICE) && c.pg.ta(pv.t) == el
+        if !ok { c.err(line, "storePartial needs a mutable array or slice of " + c.tstr(el) + ", not " + c.tstr(pv.t)) }
+        let isMut = if pk == sema.TK_SLICE { c.pg.tm(pv.t) } else { pv.mutable }
+        if !isMut { c.err(line, "storePartial needs a mutable array or slice of " + c.tstr(el)) }
+    } else {
+        let ok = (el == sema.T_BYTE && pv.t == sema.T_STR) ||
+            ((pk == sema.TK_ARR || pk == sema.TK_SLICE) && c.pg.ta(pv.t) == el)
+        if !ok {
+            let extra = if el == sema.T_BYTE { ", or str" } else { "" }
+            c.err(line, "loadPartial needs an array or slice of " + c.tstr(el) + extra + ", not " + c.tstr(pv.t))
+        }
+    }
+    if pv.cat == CAT_RV { pv = c.holdtmpSrc(pv.c, pv.t, true, pv) }
+    if c.acts(iNode) { pv = c.seq(pv) }
+    let mark = len(c.cx.pending)
+    if pv.cat == CAT_PLACE { c.hold(pv, HM_SHARED, c.newCid(), line) }
+    let iv = c.intIndex(iNode)
+    c.cutPending(mark)
+    if forStore && pv.cat == CAT_PLACE && pv.root >= 0 {
+        c.frozenAt(pv.root, &pv.path, FR_MUT, line)
+        c.checkPending(pv.root, &pv.path, line, false)
+    }
+    let pex = c.x.par(pv.c)
+    let data = if pv.t == sema.T_STR {
+        c.x.pcast(c.x.ptr(c.ct("uint8_t")), c.x.dot(pex, "p"))
+    } else {
+        c.x.pcast(c.x.ptr(c.T(el)), c.x.dot(pex, "data"))
+    }
+    let length = if pv.t == sema.T_STR {
+        c.x.pcast(c.ct("int64_t"), c.x.dot(pex, "len"))
+    } else {
+        c.x.dot(pex, "len")
+    }
+    let vn = c.fresh("vn")
+    let vi = c.fresh("vi")
+    let vr = c.fresh("vr")
+    let i64 = c.ct("int64_t")
+    c.emit(c.x.decl(i64, &vn, length))
+    let vne = c.nm(&vn)
+    c.emit(c.x.decl(i64, &vi, c.x.call("rt_idx", [iv, c.x.bin("+", vne, c.ll(1)), c.W(line)])))
+    let vie = c.nm(&vi)
+    c.emit(c.x.decl(i64, &vr, c.x.bin("-", vne, vie)))
+    let vre = c.nm(&vr)
+    let cnt = c.x.cond(c.x.bin(">", vre, c.ll(lanes)), c.ll(lanes), vre)
+    return VecPartAddr{ptr: c.x.bin("+", data, vie), cnt: cnt}
+}
+
 fn (c: mut &Checker) vecStaticCall(t: int, name: &str, args: &[]Arg, line: int): Val {
     let el = c.pg.vecElem(t)
     let lanes = c.pg.vecLanes(t)
@@ -7626,6 +7682,25 @@ fn (c: mut &Checker) vecStaticCall(t: int, name: &str, args: &[]Arg, line: int):
         let ptr = c.vecAddr(args[0].n, args[1].n, el, lanes, false, line)
         return rv(c.x.call(&("__vec_load_" + suf), [ptr]), t)
     }
+    if name == "loadPartial" {
+        if len(args) != 3 { c.err(line, c.tstr(t) + ".loadPartial(p, i, fill) takes 3 arguments") }
+        let pa = c.vecPartialAddr(args[0].n, args[1].n, el, lanes, false, line)
+        let fv = c.rd(c.expr(args[2].n, el))
+        if fv.t != el { c.err(line, c.tstr(t) + ".loadPartial fill expects " + c.tstr(el) + ", not " + c.tstr(fv.t)) }
+        return rv(c.x.call(&("__vec_loadp_" + suf), [pa.ptr, pa.cnt, fv.c]), t)
+    }
+    if name == "tailMask" {
+        if len(args) != 1 { c.err(line, c.tstr(t) + ".tailMask(n) takes 1 argument") }
+        let nv = c.intIndex(args[0].n)
+        let vt = c.fresh("vm")
+        c.emit(c.x.decl(c.ct("int64_t"), &vt, nv))
+        let vtn = c.nm(&vt)
+        let fullMask = if lanes == 32 { "4294967295ULL" } else if lanes == 8 { "255ULL" } else { "15ULL" }
+        let sh = c.x.bin("-", c.x.bin("<<", c.x.num("1ULL"), vtn), c.x.num("1ULL"))
+        let res = c.x.cond(c.x.bin("<=", vtn, c.ll(0)), c.x.num("0ULL"),
+            c.x.cond(c.x.bin(">=", vtn, c.ll(lanes)), c.x.num(fullMask), sh))
+        return rv(c.x.par(res), sema.T_U64)
+    }
     if name == "chunks" {
         c.err(line, c.tstr(t) + ".chunks(...) can only be used in a for loop: for v in " + c.tstr(t) + ".chunks(xs)")
     }
@@ -7642,6 +7717,13 @@ fn (c: mut &Checker) vecMethodCall(recv: Val, base: int, name: &str, args: &[]Ar
         if c.acts(args[0].n) || c.acts(args[1].n) { v = c.seq(v) }
         let ptr = c.vecAddr(args[0].n, args[1].n, el, lanes, true, line)
         c.emitx(c.x.call(&("__vec_store_" + suf), [ptr, v.c]))
+        return voidVal(false)
+    }
+    if name == "storePartial" {
+        if len(args) != 2 { c.err(line, "storePartial(p, i) takes 2 arguments") }
+        if c.acts(args[0].n) || c.acts(args[1].n) { v = c.seq(v) }
+        let pa = c.vecPartialAddr(args[0].n, args[1].n, el, lanes, true, line)
+        c.emitx(c.x.call(&("__vec_storep_" + suf), [pa.ptr, pa.cnt, v.c]))
         return voidVal(false)
     }
     if name == "sum" {
