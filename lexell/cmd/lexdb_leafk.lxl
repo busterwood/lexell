@@ -19,6 +19,7 @@ import "./lexdb_rows"
 import "collections"
 import "strings"
 import "./lexdb_cols"
+import "./lexdb_like"
 
 type LeafView = lexdb_rows.LeafView
 type VB = vector[byte]
@@ -41,6 +42,8 @@ pub type LeafK = closed {
     // removed first when trim (a char(n)'s): substring(x from 1 for m) IN
     // (...) (pl, m, trim, ks; q22's)
     Prefix(int, int, bool, []str)
+    // simple LIKE / ILIKE (no _ or escape) on text place pl (pl, fold, neg, pieces)
+    Like(int, bool, bool, []str)
     // runtime hash-join Bloom + range filter on integer place pl (pl, pk, bf)
     IntBloom(int, byte, lexdb_cols.IntBloom)
     // every one holds; one at least holds
@@ -269,6 +272,44 @@ fn textRowsPrefix(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int
     return Some(out)
 }
 
+fn textRowsLike(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int, pl: int, fold: bool, neg: bool, ps: &[]str): Option[[]int] {
+    let n = len(rs)
+    if pl >= lexdb_cols.places(dir) || lexdb_cols.kindOf(s, pl) != lexdb_rows.PK_TEXT { return None }
+    let codec = lexdb_cols.codecOf(dir, pl)
+    let nulls = lexdb_cols.hasNulls(dir, pl)
+    var out: []int = []
+    if codec == lexdb_cols.C_DICT {
+        let nd = lexdb_cols.dictSize(dir, pl)
+        var hit: []bool = array(nd, false)
+        for j in 0..nd {
+            let sp = lexdb_cols.entryAt(s, dir, pl, j)
+            let lo = lexdb_cols.spanStart(sp)
+            let hi = lexdb_cols.spanEnd(sp)
+            let ok = if fold { lexdb_like.likeRangeFold(s, lo, hi, ps) } else { lexdb_like.likeRange(s, lo, hi, ps) }
+            hit[j] = ok != neg
+        }
+        let codes = codesOfCols(s, dir, from, rs, r0, cnt, pl)
+        for x in 0..n {
+            if hit[codes[x]] {
+                if nulls && lexdb_cols.isNull(s, dir, pl, from + rs[x] - r0) { continue }
+                append(mut &out, rs[x])
+            }
+        }
+        return Some(out)
+    }
+    if codec != lexdb_cols.C_TEXT { return None }
+    for x in 0..n {
+        let i = from + rs[x] - r0
+        if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
+        let sp = lexdb_cols.varAt(s, dir, pl, i)
+        let lo = lexdb_cols.spanStart(sp)
+        let hi = lexdb_cols.spanEnd(sp)
+        let ok = if fold { lexdb_like.likeRangeFold(s, lo, hi, ps) } else { lexdb_like.likeRange(s, lo, hi, ps) }
+        if ok != neg { append(mut &out, rs[x]) }
+    }
+    return Some(out)
+}
+
 // The rows of rs (batch rows of a run of cnt rows, leaf row from at batch
 // row r0) k holds for, in order. None: a place of the leaf is not of the
 // kind k reads. Pure (no LeafView / indirect calls) for par.map workers.
@@ -421,6 +462,7 @@ pub fn rowsOfCols(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int
         }
         LeafK.Texts(op, pl, ks) { return textRowsOp(s, dir, from, rs, r0, cnt, pl, op, &ks) }
         LeafK.Prefix(pl, m, trim, ks) { return textRowsPrefix(s, dir, from, rs, r0, cnt, pl, m, trim, &ks) }
+        LeafK.Like(pl, fold, neg, ps) { return textRowsLike(s, dir, from, rs, r0, cnt, pl, fold, neg, &ps) }
         LeafK.IntBloom(pl, pk, bf) {
             if !wordsOkCols(s, dir, pl, pk, -1) { return None }
             let nulls = lexdb_cols.hasNulls(dir, pl)

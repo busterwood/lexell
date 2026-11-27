@@ -1014,6 +1014,44 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
             return Ok(out)
         }
         BNode.Arith(op, x, y) {
+            if op == 0 || op == 1 {
+                match &x {
+                    BNode.Const(kv, nul) {
+                        if !nul {
+                            match &y {
+                                BNode.Col(cy) {
+                                    var out = lexdb_rows.bvec(m)
+                                    let src = &b.cols[cy]
+                                    if !lexdb_vec.addSubConstCol(op, true, kv, &src.v, &src.nul, idx, mut &out.v, mut &out.nul) {
+                                        return Err(e("22003", "bigint out of range"))
+                                    }
+                                    return Ok(out)
+                                }
+                                else {}
+                            }
+                        }
+                    }
+                    else {}
+                }
+                match &y {
+                    BNode.Const(kv, nul) {
+                        if !nul {
+                            match &x {
+                                BNode.Col(cx) {
+                                    var out = lexdb_rows.bvec(m)
+                                    let src = &b.cols[cx]
+                                    if !lexdb_vec.addSubConstCol(op, false, kv, &src.v, &src.nul, idx, mut &out.v, mut &out.nul) {
+                                        return Err(e("22003", "bigint out of range"))
+                                    }
+                                    return Ok(out)
+                                }
+                                else {}
+                            }
+                        }
+                    }
+                    else {}
+                }
+            }
             var a = try bEval(&x, b, idx)
             let c = try bEval(&y, b, idx)
             for j in 0..m { if c.nul[j] { a.nul[j] = true } }
@@ -1326,23 +1364,23 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
                                 BNode.Col(cy) {
                                     var out = lexdb_rows.bvec(m)
                                     let src = &b.cols[cy]
+                                    if m == len(src.v) {
+                                        if !lexdb_vec.addSubConstCol(op, true, kv, &src.v, &src.nul, idx, mut &out.v, mut &out.nul) {
+                                            return Err(decSpill())
+                                        }
+                                        return Ok(out)
+                                    }
                                     if op == 0 {
                                         for j in 0..m {
                                             let r = idx[j]
                                             if src.nul[r] { out.nul[j] = true; continue }
-                                            match kv.checkedAdd(src.v[r]) {
-                                                Some(w) { out.v[j] = w }
-                                                None { return Err(decSpill()) }
-                                            }
+                                            match kv.checkedAdd(src.v[r]) { Some(w) { out.v[j] = w } None { return Err(decSpill()) } }
                                         }
                                     } else {
                                         for j in 0..m {
                                             let r = idx[j]
                                             if src.nul[r] { out.nul[j] = true; continue }
-                                            match kv.checkedSub(src.v[r]) {
-                                                Some(w) { out.v[j] = w }
-                                                None { return Err(decSpill()) }
-                                            }
+                                            match kv.checkedSub(src.v[r]) { Some(w) { out.v[j] = w } None { return Err(decSpill()) } }
                                         }
                                     }
                                     return Ok(out)
@@ -1360,23 +1398,23 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
                                 BNode.Col(cx) {
                                     var out = lexdb_rows.bvec(m)
                                     let src = &b.cols[cx]
+                                    if m == len(src.v) {
+                                        if !lexdb_vec.addSubConstCol(op, false, kv, &src.v, &src.nul, idx, mut &out.v, mut &out.nul) {
+                                            return Err(decSpill())
+                                        }
+                                        return Ok(out)
+                                    }
                                     if op == 0 {
                                         for j in 0..m {
                                             let r = idx[j]
                                             if src.nul[r] { out.nul[j] = true; continue }
-                                            match src.v[r].checkedAdd(kv) {
-                                                Some(w) { out.v[j] = w }
-                                                None { return Err(decSpill()) }
-                                            }
+                                            match src.v[r].checkedAdd(kv) { Some(w) { out.v[j] = w } None { return Err(decSpill()) } }
                                         }
                                     } else {
                                         for j in 0..m {
                                             let r = idx[j]
                                             if src.nul[r] { out.nul[j] = true; continue }
-                                            match src.v[r].checkedSub(kv) {
-                                                Some(w) { out.v[j] = w }
-                                                None { return Err(decSpill()) }
-                                            }
+                                            match src.v[r].checkedSub(kv) { Some(w) { out.v[j] = w } None { return Err(decSpill()) } }
                                         }
                                     }
                                     return Ok(out)
@@ -1752,9 +1790,7 @@ pub fn cmpConst(op: int, a: mut &BVec, k: int) {
 // The positions j of idx whose row n holds for (true, not NULL).
 pub fn bTrue(n: &BNode, b: &Batch, idx: &[]int): Result[[]int, DbErr] {
     let t = try bEval(n, b, idx)
-    var out: []int = []
-    for j in 0..len(idx) { if t.v[j] == 1 && !t.nul[j] { append(mut &out, j) } }
-    return Ok(out)
+    return Ok(lexdb_vec.trueIndices(&t.v, &t.nul))
 }
 
 // The two steps for a batch plan with these conditions: a simple LIKE on
@@ -2116,6 +2152,27 @@ fn leafKOf(n: &BNode, bp: &BPlan, t: &lexdb_catalog.Table): Option[lexdb_leafk.L
             if pk != lexdb_rows.placeKind(&t.cols[b]) { return None }
             if pk != lexdb_rows.PK_DATE && pk != lexdb_rows.PK_TIME && pk != lexdb_rows.PK_TS && pk != lexdb_rows.PK_TSTZ { return None }
             return Some(lexdb_leafk.LeafK.Cols(op, plOf(a), plOf(b), pk))
+        }
+        BNode.Like(c, lp) {
+            if (lp.simple || lp.foldSimple) && lexdb_rows.placeKind(&t.cols[c]) == lexdb_rows.PK_TEXT {
+                var ps: []str = []
+                for p in lp.pieces { append(mut &ps, p.clone()) }
+                return Some(lexdb_leafk.LeafK.Like(plOf(c), lp.fold, false, ps))
+            }
+            return None
+        }
+        BNode.Not(inner) {
+            match inner {
+                BNode.Like(c, lp) {
+                    if (lp.simple || lp.foldSimple) && lexdb_rows.placeKind(&t.cols[c]) == lexdb_rows.PK_TEXT {
+                        var ps: []str = []
+                        for p in lp.pieces { append(mut &ps, p.clone()) }
+                        return Some(lexdb_leafk.LeafK.Like(plOf(c), lp.fold, true, ps))
+                    }
+                }
+                else {}
+            }
+            return None
         }
         BNode.And(x, y) {
             let a = leafKOf(&x, bp, t)
@@ -16618,6 +16675,44 @@ fn bEvalPure(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
             return Ok(out)
         }
         BNode.Arith(op, x, y) {
+            if op == 0 || op == 1 {
+                match &x {
+                    BNode.Const(kv, nul) {
+                        if !nul {
+                            match &y {
+                                BNode.Col(cy) {
+                                    var out = lexdb_rows.bvec(m)
+                                    let src = &b.cols[cy]
+                                    if !lexdb_vec.addSubConstCol(op, true, kv, &src.v, &src.nul, idx, mut &out.v, mut &out.nul) {
+                                        return Err(e("22003", "bigint out of range"))
+                                    }
+                                    return Ok(out)
+                                }
+                                else {}
+                            }
+                        }
+                    }
+                    else {}
+                }
+                match &y {
+                    BNode.Const(kv, nul) {
+                        if !nul {
+                            match &x {
+                                BNode.Col(cx) {
+                                    var out = lexdb_rows.bvec(m)
+                                    let src = &b.cols[cx]
+                                    if !lexdb_vec.addSubConstCol(op, false, kv, &src.v, &src.nul, idx, mut &out.v, mut &out.nul) {
+                                        return Err(e("22003", "bigint out of range"))
+                                    }
+                                    return Ok(out)
+                                }
+                                else {}
+                            }
+                        }
+                    }
+                    else {}
+                }
+            }
             var a = try bEvalPure(&x, b, idx)
             let c = try bEvalPure(&y, b, idx)
             for j in 0..m { if c.nul[j] { a.nul[j] = true } }
@@ -16860,6 +16955,12 @@ fn bEvalPure(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
                                 BNode.Col(cy) {
                                     var out = lexdb_rows.bvec(m)
                                     let src = &b.cols[cy]
+                                    if m == len(src.v) {
+                                        if !lexdb_vec.addSubConstCol(op, true, kv, &src.v, &src.nul, idx, mut &out.v, mut &out.nul) {
+                                            return Err(decSpill())
+                                        }
+                                        return Ok(out)
+                                    }
                                     if op == 0 {
                                         for j in 0..m {
                                             let r = idx[j]
@@ -16888,6 +16989,12 @@ fn bEvalPure(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
                                 BNode.Col(cx) {
                                     var out = lexdb_rows.bvec(m)
                                     let src = &b.cols[cx]
+                                    if m == len(src.v) {
+                                        if !lexdb_vec.addSubConstCol(op, false, kv, &src.v, &src.nul, idx, mut &out.v, mut &out.nul) {
+                                            return Err(decSpill())
+                                        }
+                                        return Ok(out)
+                                    }
                                     if op == 0 {
                                         for j in 0..m {
                                             let r = idx[j]
@@ -17078,9 +17185,7 @@ fn bEvalPure(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
 
 fn bTruePure(n: &BNode, b: &Batch, idx: &[]int): Result[[]int, DbErr] {
     let t = try bEvalPure(n, b, idx)
-    var out: []int = []
-    for j in 0..len(idx) { if t.v[j] == 1 && !t.nul[j] { append(mut &out, j) } }
-    return Ok(out)
+    return Ok(lexdb_vec.trueIndices(&t.v, &t.nul))
 }
 
 fn markPlace(pl: int, needPl: mut &[]bool, maxPl: mut &int) {
@@ -17097,6 +17202,7 @@ fn markLeafKPlaces(k: &lexdb_leafk.LeafK, needPl: mut &[]bool, maxPl: mut &int) 
         lexdb_leafk.LeafK.Cols(_, pa, pb, _) { markPlace(pa, needPl, maxPl); markPlace(pb, needPl, maxPl) }
         lexdb_leafk.LeafK.Texts(_, pl, _) { markPlace(pl, needPl, maxPl) }
         lexdb_leafk.LeafK.Prefix(pl, _, _, _) { markPlace(pl, needPl, maxPl) }
+        lexdb_leafk.LeafK.Like(pl, _, _, _) { markPlace(pl, needPl, maxPl) }
         lexdb_leafk.LeafK.IntBloom(pl, _, _) { markPlace(pl, needPl, maxPl) }
         lexdb_leafk.LeafK.All(ks) { for k2 in ks { markLeafKPlaces(&k2, needPl, maxPl) } }
         lexdb_leafk.LeafK.Any(ks) { for k2 in ks { markLeafKPlaces(&k2, needPl, maxPl) } }

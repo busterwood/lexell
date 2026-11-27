@@ -460,6 +460,104 @@ pub fn minMaxI64Col(cv: &[]int, cnul: &[]bool, rows: &[]int, mx: bool, cn: mut &
     cn[0] = c
 }
 
+// Fused checked add/sub between a constant kv and column srcv[idx[j]] into outv/outn.
+// op == 0: kv + x (or x + kv); op == 1 && constLeft: kv - x; op == 1 && !constLeft: x - kv.
+// Returns false on signed 64-bit overflow.
+pub fn addSubConstCol(op: int, constLeft: bool, kv: int, srcv: &[]int, srcn: &[]bool, idx: &[]int, outv: mut &[]int, outn: mut &[]bool): bool {
+    let m = len(idx)
+    if isFullSeq(idx, len(srcv)) && !hasAnyNull(srcn) {
+        let vK = VI.splat(kv)
+        let vZero = VI.zero()
+        var j = 0
+        if op == 0 {
+            while j + VI.lanes <= len(srcv) && j + VI.lanes <= len(outv) {
+                let v = VI.load(srcv, j)
+                let r = v +% vK
+                if (((r ^ v) & (r ^ vK)) < vZero).any() { return false }
+                r.store(outv, j)
+                j += VI.lanes
+            }
+            while j < m {
+                match srcv[j].checkedAdd(kv) { Some(w) { outv[j] = w } None { return false } }
+                j += 1
+            }
+            return true
+        }
+        if constLeft {
+            while j + VI.lanes <= len(srcv) && j + VI.lanes <= len(outv) {
+                let v = VI.load(srcv, j)
+                let r = vK -% v
+                if (((vK ^ v) & (vK ^ r)) < vZero).any() { return false }
+                r.store(outv, j)
+                j += VI.lanes
+            }
+            while j < m {
+                match kv.checkedSub(srcv[j]) { Some(w) { outv[j] = w } None { return false } }
+                j += 1
+            }
+            return true
+        }
+        while j + VI.lanes <= len(srcv) && j + VI.lanes <= len(outv) {
+            let v = VI.load(srcv, j)
+            let r = v -% vK
+            if (((v ^ vK) & (v ^ r)) < vZero).any() { return false }
+            r.store(outv, j)
+            j += VI.lanes
+        }
+        while j < m {
+            match srcv[j].checkedSub(kv) { Some(w) { outv[j] = w } None { return false } }
+            j += 1
+        }
+        return true
+    }
+    if op == 0 {
+        for j in 0..m {
+            let r = idx[j]
+            if srcn[r] { outn[j] = true; continue }
+            match srcv[r].checkedAdd(kv) { Some(w) { outv[j] = w } None { return false } }
+        }
+    } else if constLeft {
+        for j in 0..m {
+            let r = idx[j]
+            if srcn[r] { outn[j] = true; continue }
+            match kv.checkedSub(srcv[r]) { Some(w) { outv[j] = w } None { return false } }
+        }
+    } else {
+        for j in 0..m {
+            let r = idx[j]
+            if srcn[r] { outn[j] = true; continue }
+            match srcv[r].checkedSub(kv) { Some(w) { outv[j] = w } None { return false } }
+        }
+    }
+    return true
+}
+
+// Positions j in 0..len(v) where v[j] == 1 && !nul[j].
+pub fn trueIndices(v: &[]int, nul: &[]bool): []int {
+    let m = len(v)
+    var out: []int = []
+    if !hasAnyNull(nul) {
+        let vOne = VI.splat(1)
+        var j = 0
+        for vec in VI.chunks(v, mut &j) {
+            var bm = (vec == vOne).bitmask()
+            while bm != u64(0) {
+                append(mut &out, j + int(bm.trailingZeros()))
+                bm = bm & (bm - u64(1))
+            }
+        }
+        while j < m {
+            if v[j] == 1 { append(mut &out, j) }
+            j += 1
+        }
+        return out
+    }
+    for j in 0..m {
+        if v[j] == 1 && !nul[j] { append(mut &out, j) }
+    }
+    return out
+}
+
 // 10^38: a numeric sum at or past it in magnitude is out of range, as
 // Decimal's exact sum is (38 digits).
 const TEN38: i128 = 100000000000000000000000000000000000000

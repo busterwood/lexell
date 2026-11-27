@@ -47,15 +47,17 @@ pub fn likePieces(s: &str, ps: &[]str): bool { return likeRange(s, 0, len(s), ps
 // ILIKE's likePieces: s matched with its ASCII letters folded to lower case,
 // as likeMatch folds both sides (strings.toLowerAscii); the pieces are
 // already folded. Not copied: a skipping index's SET values are tested so.
-pub fn likePiecesFold(s: &str, ps: &[]str): bool {
+pub fn likePiecesFold(s: &str, ps: &[]str): bool { return likeRangeFold(s, 0, len(s), ps) }
+
+// likePiecesFold of s[lo..hi], zero-copy, using 2-byte branchless SIMD filtering.
+pub fn likeRangeFold(s: &str, lo: int, hi: int, ps: &[]str): bool {
     let n = len(ps)
-    let hi = len(s)
-    if n == 1 { return hi == len(ps[0]) && bytesAtFold(s, 0, &ps[0]) }
+    if n == 1 { return hi - lo == len(ps[0]) && bytesAtFold(s, lo, &ps[0]) }
     let first = &ps[0]
     let last = &ps[n - 1]
-    if hi < len(first) + len(last) { return false }
-    if !bytesAtFold(s, 0, first) || !bytesAtFold(s, hi - len(last), last) { return false }
-    var at = len(first)
+    if hi - lo < len(first) + len(last) { return false }
+    if !bytesAtFold(s, lo, first) || !bytesAtFold(s, hi - len(last), last) { return false }
+    var at = lo + len(first)
     let end = hi - len(last)
     for k in 1..n - 1 {
         let p = &ps[k]
@@ -64,30 +66,46 @@ pub fn likePiecesFold(s: &str, ps: &[]str): bool {
         let lim = end - plen + 1
         if at >= lim { return false }
         let b0 = p[0]
-        let isLetter = b0 >= 'a' && b0 <= 'z'
-        let vLo = VB.splat(b0)
-        let vHi = if isLetter { VB.splat(b0 - byte(32)) } else { vLo }
+        let v0Lo = VB.splat(b0)
+        let vM0 = if b0 >= 'a' && b0 <= 'z' { VB.splat(byte(0x20)) } else { VB.zero() }
         var found = -1
         var i = at
-        while i + VB.lanes <= lim {
-            let v = VB.load(s, i)
-            var m = if isLetter { ((v == vLo) | (v == vHi)).bitmask() } else { (v == vLo).bitmask() }
-            while m != u64(0) {
-                let pos = i + int(m.trailingZeros())
-                if plen == 1 || bytesAtFold(s, pos, p) { found = pos; break }
-                m = m & (m - u64(1))
+        if plen == 1 {
+            while i + VB.lanes <= lim {
+                var m = ((VB.load(s, i) | vM0) == v0Lo).bitmask()
+                if m != u64(0) { found = i + int(m.trailingZeros()); break }
+                i += VB.lanes
             }
-            if found >= 0 { break }
-            i += VB.lanes
-        }
-        if found < 0 && i < lim {
-            let v = VB.loadPartial(s, i, byte(0))
-            let hit = if isLetter { (v == vLo) | (v == vHi) } else { v == vLo }
-            var m = hit.bitmask() & VB.tailMask(lim - i)
-            while m != u64(0) {
-                let pos = i + int(m.trailingZeros())
-                if plen == 1 || bytesAtFold(s, pos, p) { found = pos; break }
-                m = m & (m - u64(1))
+            if found < 0 && i < lim {
+                let m = ((VB.loadPartial(s, i, byte(0)) | vM0) == v0Lo).bitmask() & VB.tailMask(lim - i)
+                if m != u64(0) { found = i + int(m.trailingZeros()) }
+            }
+        } else {
+            let off1 = plen - 1
+            let b1 = p[off1]
+            let v1Lo = VB.splat(b1)
+            let vM1 = if b1 >= 'a' && b1 <= 'z' { VB.splat(byte(0x20)) } else { VB.zero() }
+            while i + VB.lanes <= lim {
+                let ma = (VB.load(s, i) | vM0) == v0Lo
+                let mb = (VB.load(s, i + off1) | vM1) == v1Lo
+                var m = (ma & mb).bitmask()
+                while m != u64(0) {
+                    let pos = i + int(m.trailingZeros())
+                    if plen == 2 || bytesAtFoldMid(s, pos, p) { found = pos; break }
+                    m = m & (m - u64(1))
+                }
+                if found >= 0 { break }
+                i += VB.lanes
+            }
+            if found < 0 && i < lim {
+                let ma = (VB.loadPartial(s, i, byte(0)) | vM0) == v0Lo
+                let mb = (VB.loadPartial(s, i + off1, byte(0)) | vM1) == v1Lo
+                var m = (ma & mb).bitmask() & VB.tailMask(lim - i)
+                while m != u64(0) {
+                    let pos = i + int(m.trailingZeros())
+                    if plen == 2 || bytesAtFoldMid(s, pos, p) { found = pos; break }
+                    m = m & (m - u64(1))
+                }
             }
         }
         if found < 0 { return false }
@@ -102,6 +120,12 @@ fn foldByte(c: byte): byte { return if c >= 'A' && c <= 'Z' { c + 32 } else { c 
 fn bytesAtFold(s: &str, at: int, p: &str): bool {
     if at < 0 || at + len(p) > len(s) { return false }
     for i in 0..len(p) { if foldByte(s[at + i]) != p[i] { return false } }
+    return true
+}
+
+// Like bytesAtFold when p[0] and p[len(p)-1] have already been matched in SIMD.
+fn bytesAtFoldMid(s: &str, at: int, p: &str): bool {
+    for i in 1..len(p) - 1 { if foldByte(s[at + i]) != p[i] { return false } }
     return true
 }
 

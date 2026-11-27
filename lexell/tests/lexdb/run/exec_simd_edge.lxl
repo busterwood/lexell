@@ -37,6 +37,14 @@
 // expect: ilike utf8: same
 // expect: ilike underscore fallback: same
 // expect: ilike escape fallback: same
+// expect: w4 between: same
+// expect: w4 empty: same
+// expect: w4 all: same
+// expect: w4 single: same
+// expect: leafk not ilike: same
+// expect: leafk dict ilike: same
+// expect: leafk dict not ilike null: same
+// expect: const sub col overflow: same ERROR 22003
 import "strings"
 import "../../../cmd/lexdb_store"
 import "../../../cmd/lexdb_disk"
@@ -89,14 +97,16 @@ fn main() {
         lexdb_exec.bootstrap(&st).unwrap()
         var s = lexdb_exec.newSession(st.share())
 
-        // 137 rows (not a multiple of 4 or 32) for w==8 rangeFilter, LeafK, min/max, UTF-8, ILIKE
-        run(mut &s, &"CREATE TABLE t (id INT PRIMARY KEY, b INT, c INT, n INT, d NUMERIC(18,2), txt TEXT)")
+        // 137 rows (not a multiple of 4, 32, or 64) for w==4/w==8 rangeFilter, LeafK, min/max, UTF-8, ILIKE
+        run(mut &s, &"CREATE TABLE t (id INT PRIMARY KEY, w4 INT, b INT, c INT, n INT, d NUMERIC(18,2), tag TEXT, txt TEXT)")
         var vals: []str = []
         for i in 0..137 {
+            let w4 = (i * 3) % 15
             let b = (i * 7) % 200
             let c = (i * 11) % 200
             let n = if i % 5 == 0 { "NULL" } else { (i * 3 - 200).toStr() }
             let d = (i * 1000000000000).toStr() + ".25"
+            let tag = if i % 9 == 0 { "NULL" } else if i % 3 == 0 { "'Alpha-Tag'" } else if i % 3 == 1 { "'Beta-Tag'" } else { "'Gamma-Item'" }
             var txt = "short-FOO-" + i.toStr()
             if i % 7 == 0 {
                 txt = "prefix_012345678901234567890123456789_MiXeD_BaR_end_" + i.toStr()
@@ -109,7 +119,7 @@ fn main() {
             } else if i % 7 == 4 {
                 txt = "pre_100%_val_suf"
             }
-            append(mut &vals, "(" + i.toStr() + "," + b.toStr() + "," + c.toStr() + "," + n + "," + d + ",'" + txt + "')")
+            append(mut &vals, "(" + i.toStr() + "," + w4.toStr() + "," + b.toStr() + "," + c.toStr() + "," + n + "," + d + "," + tag + ",'" + txt + "')")
         }
         run(mut &s, &("INSERT INTO t VALUES " + strings.join(&vals, ",")))
 
@@ -168,6 +178,16 @@ fn main() {
         check(mut &s, &"ilike utf8", &"SELECT count(*), sum(id) FROM t WHERE txt ILIKE '%🚀%foo%BAZ'")
         check(mut &s, &"ilike underscore fallback", &"SELECT count(*), sum(id) FROM t WHERE txt ILIKE 'h_llo'")
         check(mut &s, &"ilike escape fallback", &"SELECT count(*), sum(id) FROM t WHERE txt ILIKE '%100!%%' ESCAPE '!'")
+
+        // w == 4 64-way SIMD rangeFilter & LeafK.Like (C_DICT + NOT ILIKE + NULLs) & Const - Col
+        check(mut &s, &"w4 between", &"SELECT count(*), sum(id) FROM t WHERE w4 BETWEEN 3 AND 10")
+        check(mut &s, &"w4 empty", &"SELECT count(*) FROM t WHERE w4 BETWEEN 20 AND 30")
+        check(mut &s, &"w4 all", &"SELECT count(*), sum(w4) FROM t WHERE w4 BETWEEN -5 AND 20")
+        check(mut &s, &"w4 single", &"SELECT count(*), sum(id) FROM t WHERE w4 = 7")
+        check(mut &s, &"leafk not ilike", &"SELECT count(*), sum(id) FROM t WHERE txt NOT ILIKE '%foo%'")
+        check(mut &s, &"leafk dict ilike", &"SELECT count(*), sum(id) FROM t WHERE tag ILIKE '%tag'")
+        check(mut &s, &"leafk dict not ilike null", &"SELECT count(*), sum(id) FROM t WHERE tag NOT ILIKE '%alpha%'")
+        check(mut &s, &"const sub col overflow", &"SELECT sum(1 - x) FROM big WHERE id IN (3, 4, 5, 6, 8)")
 
         return 0
     })
