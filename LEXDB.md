@@ -145,7 +145,7 @@ With **no materialized views and no explicit skipping indexes**, LexDB's single-
 
 | OLAP & load workload | LexDB (1 core) | PostgreSQL 18 | Takeaway |
 |---|---:|---:|---|
-| **TPC-H SF1** (22 queries) | **5.90 s** | 14.67 s (1 core) / 8.84 s (4 proc) | **2.49× faster** than 1-core PG (faster on 21/22, `q1` **811 ms** beating 4-proc PG); **1.50× faster** than 4-process PG overall |
+| **TPC-H SF1** (22 queries) | **5.59 s** | 14.67 s (1 core) / 8.84 s (4 proc) | **2.62× faster** than 1-core PG (faster on all 22/22, `q1` **809 ms** beating 4-proc PG); **1.58× faster** than 4-process PG overall |
 | **ClickBench 1M** (43 queries, 105 cols) | **6.99 s** | 22.08 s (1 core) / 11.40 s (4 proc) | **3.16× faster** than 1-core PG (**43/43** level or ahead; 0.33× geomean wall & CPU); **1.63× faster than 4-process PG on 1 core** (no MVs) |
 | **35 Analytic Queries** (1M rows) | **0.39× CPU / 0.78× wall** | 1 core / 4 proc | **2.59× less CPU** than 1-core PG (**35/35** ahead on wall & CPU); **1.28× faster** wall time than 4-process PG |
 | **Selective star-schema joins** (1M fact rows, 6 patterns) | **0.54–22.5 ms** | 0.21–77.0 ms (1 core) / 0.24–50.7 ms (4 proc) | **1.24–71.7× faster** via hash-join runtime filters; **7.68×** vs PG1 / **4.46×** vs PG4 (geomean) |
