@@ -36,6 +36,10 @@ pub fn newLower(): Lower {
         ir.TY_I64, ir.TY_I64, ir.TY_U64, ir.TY_BOOL, ir.TY_BOOL, ir.TY_I8, ir.TY_I16, ir.TY_I32, ir.TY_I64, ir.TY_I128,
         ir.TY_F64, ir.TY_VOID]
     for j in 0..len(names) { u.types.put(names[j].clone(), ids[j]) }
+    u.types.put("lxl_vf64", u.ir.vecOf(ir.TY_F64, 4))
+    u.types.put("lxl_vi64", u.ir.vecOf(ir.TY_I64, 4))
+    u.types.put("lxl_vi32", u.ir.vecOf(ir.TY_I32, 8))
+    u.types.put("lxl_vu8", u.ir.vecOf(ir.TY_U8, 32))
     u.header(&(strings.join(&rtx.HEADER, "\n")))
     u.ir.nRtStructs = len(u.ir.structs)
     u.ir.nRtFuncs = len(u.ir.funcs)
@@ -677,7 +681,15 @@ pub fn (u: mut &Lower) expr(n: int): int {
         let si = u.ir.addStr(&nd.s)
         return u.mk(ir.E_STR, u.ir.arrOf(ir.TY_I8, len(nd.s) + 1), -1, -1, -1, si)
     }
-    if k == tm.X_CALL { return u.call(u.expr(nd.a), nd.l) }
+    if k == tm.X_CALL {
+        if u.x.k(nd.a) == tm.X_NAME {
+            let nm = u.x.nodes[nd.a].s.clone()
+            if strings.startsWith(&nm, "__vec_") || strings.startsWith(&nm, "__bit_") {
+                return u.vecCall(&nm, nd.l)
+            }
+        }
+        return u.call(u.expr(nd.a), nd.l)
+    }
     if k == tm.X_DOT {
         let e = u.expr(nd.a)
         let f = u.fieldOf(u.ir.nty(e), &nd.s)
@@ -769,10 +781,16 @@ fn (u: mut &Lower) negate(e: int): int {
 }
 
 fn (u: mut &Lower) unary(p: &str, n: int): int {
-    if p == "-" { return u.negate(u.expr(n)) }
+    if p == "-" {
+        let e = u.rv(u.expr(n))
+        if u.ir.isVec(u.ir.nty(e)) { return u.mk(ir.E_NEG, u.ir.nty(e), e, -1, -1, 0) }
+        return u.negate(e)
+    }
     if p == "+" { return u.promote(u.scalar(u.expr(n))) }
     if p == "~" {
-        let a = u.promote(u.scalar(u.expr(n)))
+        let e = u.rv(u.expr(n))
+        if u.ir.isVec(u.ir.nty(e)) { return u.mk(ir.E_BNOT, u.ir.nty(e), e, -1, -1, 0) }
+        let a = u.promote(u.scalar(e))
         let at = u.ir.nty(a)
         if !u.ir.isInt(at) { fail("~ on " + u.ir.typeName(at)) }
         if u.ir.nk(a) == ir.E_INT && u.ir.sizeOf(at) <= 8 {
@@ -835,6 +853,10 @@ fn (u: mut &Lower) binary(p: &str, l0: int, r0: int): int {
     let op = opCode(p)
     let lt = u.ir.nty(l)
     let rt = u.ir.nty(r)
+    if u.ir.isVec(lt) && lt == rt {
+        if op >= ir.OP_EQ { return u.mk(ir.E_BIN, u.ir.vecMask(lt), l, r, lt, op) }
+        return u.mk(ir.E_BIN, lt, l, r, lt, op)
+    }
     let lp = u.ir.tk(lt) == ir.TY_PTR
     let rp = u.ir.tk(rt) == ir.TY_PTR
     if (op == ir.OP_ADD || op == ir.OP_SUB) && lp && u.ir.isInt(rt) {
@@ -941,4 +963,50 @@ fn (u: mut &Lower) call(callee0: int, l: int): int {
         return u.mk(ir.E_CALL, u.ir.tys[ft].base, callee, u.ir.list(&args), cft, 0)
     }
     return u.mk(ir.E_CALL, u.ir.tys[ft].base, callee, u.ir.list(&args), ft, 0)
+}
+
+fn (u: mut &Lower) vecTypeBySuf(suf: &str): int {
+    if suf == "f64" { return u.ir.vecOf(ir.TY_F64, 4) }
+    if suf == "i64" { return u.ir.vecOf(ir.TY_I64, 4) }
+    if suf == "i32" { return u.ir.vecOf(ir.TY_I32, 8) }
+    if suf == "u8" { return u.ir.vecOf(ir.TY_U8, 32) }
+    fail("unknown vector suffix " + suf)
+}
+
+fn (u: mut &Lower) vecCall(name: &str, l: int): int {
+    let n = u.x.items[l]
+    var args: []int = []
+    for j in 0..n { append(mut &args, u.rv(u.expr(u.x.items[l + 1 + j]))) }
+    if strings.startsWith(name, "__bit_") {
+        let is64 = strings.endsWith(name, "64")
+        let a = u.convert(args[0], if is64 { ir.TY_U64 } else { ir.TY_U32 })
+        let op = if strings.startsWith(name, "__bit_ctz") { ir.V_CTZ }
+            else if strings.startsWith(name, "__bit_clz") { ir.V_CLZ }
+            else { ir.V_POPCNT }
+        return u.mk(ir.E_VECOP, ir.TY_I64, a, -1, -1, op)
+    }
+    let us = strings.lastIndexOf(name, "_")
+    let opName = name[6..us]
+    let suf = name[us + 1..len(name)]
+    let vt = u.vecTypeBySuf(&suf)
+    let el = u.ir.tys[vt].base
+    if opName == "zero" { return u.mk(ir.E_VECOP, vt, -1, -1, -1, ir.V_ZERO) }
+    if opName == "splat" { return u.mk(ir.E_VECOP, vt, u.convert(args[0], el), -1, -1, ir.V_SPLAT) }
+    if opName == "load" { return u.mk(ir.E_VECOP, vt, args[0], -1, -1, ir.V_LOAD) }
+    if opName == "store" { return u.mk(ir.E_VECOP, ir.TY_VOID, args[0], args[1], -1, ir.V_STORE) }
+    if opName == "fma" { return u.mk(ir.E_VECOP, vt, args[0], args[1], args[2], ir.V_FMADD) }
+    if opName == "sqrt" { return u.mk(ir.E_VECOP, vt, args[0], -1, -1, ir.V_SQRT) }
+    if opName == "abs" { return u.mk(ir.E_VECOP, vt, args[0], -1, -1, ir.V_ABS) }
+    if opName == "min" { return u.mk(ir.E_VECOP, vt, args[0], args[1], -1, ir.V_MIN) }
+    if opName == "max" { return u.mk(ir.E_VECOP, vt, args[0], args[1], -1, ir.V_MAX) }
+    if opName == "select" { return u.mk(ir.E_VECOP, vt, args[0], args[1], args[2], ir.V_SELECT) }
+    if opName == "bitmask" { return u.mk(ir.E_VECOP, ir.TY_U64, args[0], -1, -1, ir.V_BITMASK) }
+    if opName == "sum" { return u.mk(ir.E_VECOP, el, args[0], -1, -1, ir.V_SUM) }
+    if opName == "rmin" { return u.mk(ir.E_VECOP, el, args[0], -1, -1, ir.V_RMIN) }
+    if opName == "rmax" { return u.mk(ir.E_VECOP, el, args[0], -1, -1, ir.V_RMAX) }
+    if opName == "shuffle" { return u.mk(ir.E_VECOP, vt, args[0], args[1], -1, ir.V_SHUFFLE) }
+    if opName == "lane" { return u.mk(ir.E_VECOP, el, args[0], u.convert(args[1], ir.TY_I64), -1, ir.V_LANE) }
+    if opName == "shl" { return u.mk(ir.E_VECOP, vt, args[0], u.convert(args[1], ir.TY_I64), -1, ir.V_SHL) }
+    if opName == "shr" { return u.mk(ir.E_VECOP, vt, args[0], u.convert(args[1], ir.TY_I64), -1, ir.V_SHR) }
+    fail("unknown vector op " + name)
 }

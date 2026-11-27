@@ -1,0 +1,280 @@
+// expect: ok
+import "par"
+
+type VF = vector[float]
+type VI = vector[int]
+type VI32 = vector[i32]
+type VB = vector[byte]
+
+fn addVecs(a: vector[float], b: vector[float]): vector[float] {
+    return a + b
+}
+
+fn passMany(
+    v0: vector[int], v1: vector[int], v2: vector[int], v3: vector[int],
+    v4: vector[int], v5: vector[int], v6: vector[int], v7: vector[int],
+    v8: vector[int], s: int
+): int {
+    let t = (v0 +% v1) +% (v2 +% v3) +% (v4 +% v5) +% (v6 +% v7) +% v8
+    return t.sum() +% s
+}
+
+fn dot(a: &[float], b: &[float]): float {
+    var acc = VF.zero()
+    var i = 0
+    while i + VF.lanes <= len(a) {
+        acc = VF.load(a, i).fma(VF.load(b, i), acc)
+        i += VF.lanes
+    }
+    var r = acc.sum()
+    while i < len(a) {
+        r = r + a[i] * b[i]
+        i += 1
+    }
+    return r
+}
+
+fn filterRange(xs: &[int], lo: int, hi: int): []int {
+    let vlo = VI.splat(lo)
+    let vhi = VI.splat(hi)
+    var out: []int = []
+    var i = 0
+    while i + VI.lanes <= len(xs) {
+        let v = VI.load(xs, i)
+        var m = ((v >= vlo) & (v <= vhi)).bitmask()
+        while m != u64(0) {
+            append(mut &out, i + m.trailingZeros())
+            m = m & (m - u64(1))
+        }
+        i += VI.lanes
+    }
+    while i < len(xs) {
+        if xs[i] >= lo && xs[i] <= hi { append(mut &out, i) }
+        i += 1
+    }
+    return out
+}
+
+fn nextJsonSpecial(s: &str, from: int): int {
+    let vQuote = VB.splat('"')
+    let vSlash = VB.splat('\\')
+    let vCtrl = VB.splat(byte(0x20))
+    var i = from
+    while i + VB.lanes <= len(s) {
+        let v = VB.load(s, i)
+        let m = ((v == vQuote) | (v == vSlash) | (v < vCtrl)).bitmask()
+        if m != u64(0) { return i + m.trailingZeros() }
+        i += VB.lanes
+    }
+    while i < len(s) {
+        let c = s[i]
+        if c == '"' || c == '\\' || c < byte(0x20) { return i }
+        i += 1
+    }
+    return -1
+}
+
+fn mixedScalarAndVec(xs: &[float], scale: float): float {
+    var s1 = scale * 2.0f
+    var v = VF.load(xs, 0)
+    var s2 = s1 + 1.5f
+    v = v * VF.splat(s2)
+    return v.sum() + s1 + s2
+}
+
+fn testF64() {
+    assert(VF.lanes == 4 && vector[float].lanes == 4)
+    let a: []float = [1.0f, -2.0f, 3.5f, 4.0f, 5.0f, -6.0f]
+    let b: []float = [2.0f, 3.0f, -1.0f, 0.5f, 1.0f, 2.0f]
+    let va = VF.load(&a, 0)
+    let vb = VF.load(&b, 0)
+    let vc = addVecs(va, vb)
+    assert(vc.lane(0) == 3.0f && vc.lane(1) == 1.0f && vc.lane(2) == 2.5f && vc.lane(3) == 4.5f)
+    assert((va - vb).lane(1) == -5.0f)
+    assert((va * vb).lane(2) == -3.5f)
+    assert((va / vb).lane(3) == 8.0f)
+    assert((-va).lane(1) == 2.0f)
+    assert(va.abs().lane(1) == 2.0f)
+    let sq = VF.load(&[4.0f, 9.0f, 16.0f, 25.0f], 0).sqrt()
+    assert(sq.lane(0) == 2.0f && sq.lane(1) == 3.0f && sq.lane(2) == 4.0f && sq.lane(3) == 5.0f)
+    assert(va.min(vb).lane(0) == 1.0f && va.min(vb).lane(1) == -2.0f && va.min(vb).lane(2) == -1.0f && va.min(vb).lane(3) == 0.5f)
+    assert(va.max(vb).lane(0) == 2.0f && va.max(vb).lane(1) == 3.0f && va.max(vb).lane(2) == 3.5f && va.max(vb).lane(3) == 4.0f)
+    assert(va.sum() == 6.5f)
+    assert(va.reduceMin() == -2.0f)
+    assert(va.reduceMax() == 4.0f)
+
+    // comparisons, masks, select, bitmask, any, all
+    let mlt = va < vb
+    assert(mlt.bitmask() == u64(3))       // lanes 0 (1<2) and 1 (-2<3)
+    assert(mlt.any() && !mlt.all())
+    assert((va == va).all())
+    assert(!(va != va).any())
+    let sel = mlt.select(VF.splat(10.0f), VF.splat(-10.0f))
+    assert(sel.lane(0) == 10.0f && sel.lane(1) == 10.0f && sel.lane(2) == -10.0f && sel.lane(3) == -10.0f)
+
+    // NaN comparisons
+    let z = 0.0f
+    let nan = z / z
+    let vnan = VF.load(&[nan, 1.0f, nan, 2.0f], 0)
+    assert((vnan == vnan).bitmask() == u64(10))   // lanes 1, 3
+    assert((vnan != vnan).bitmask() == u64(5))    // lanes 0, 2
+
+    // store
+    var out: []float = array(6, 0.0f)
+    vc.store(mut &out, 1)
+    assert(out[0] == 0.0f && out[1] == 3.0f && out[2] == 1.0f && out[3] == 2.5f && out[4] == 4.5f && out[5] == 0.0f)
+
+    // dot product with tail
+    let d = dot(&a, &b)
+    // 1*2 + (-2)*3 + 3.5*(-1) + 4*0.5 + 5*1 + (-6)*2 = 2 - 6 - 3.5 + 2 + 5 - 12 = -12.5
+    assert(d == -12.5f)
+
+    // mixed scalar + vector locals
+    assert(mixedScalarAndVec(&a, 2.0f) == 6.5f * 5.5f + 4.0f + 5.5f)
+}
+
+fn testI64() {
+    assert(VI.lanes == 4 && vector[int].lanes == 4)
+    let a: []int = [10, -20, 9223372036854775807, -1]
+    let b: []int = [5, -30, 1, -1]
+    let va = VI.load(&a, 0)
+    let vb = VI.load(&b, 0)
+    let sum = va +% vb
+    assert(sum.lane(0) == 15 && sum.lane(1) == -50 && sum.lane(2) == -9223372036854775807 - 1 && sum.lane(3) == -2)
+    let diff = va -% vb
+    assert(diff.lane(0) == 5 && diff.lane(1) == 10 && diff.lane(3) == 0)
+    assert((va & vb).lane(0) == 0 && (va | vb).lane(0) == 15 && (va ^ vb).lane(0) == 15)
+    assert((~VI.zero()).lane(0) == -1 && (~VI.zero()).lane(3) == -1)
+
+    // shifts (including 64-bit arithmetic right shift on negatives and k=0, k=64)
+    let shl = VI.load(&[1, -2, 3, 4], 0) << 3
+    assert(shl.lane(0) == 8 && shl.lane(1) == -16 && shl.lane(2) == 24 && shl.lane(3) == 32)
+    let shr = VI.load(&[16, -16, -1, 7], 0) >> 2
+    assert(shr.lane(0) == 4 && shr.lane(1) == -4 && shr.lane(2) == -1 && shr.lane(3) == 1)
+    let shr0 = VI.load(&[16, -16, -1, 7], 0) >> 0
+    assert(shr0.lane(0) == 16 && shr0.lane(1) == -16 && shr0.lane(2) == -1 && shr0.lane(3) == 7)
+    let shr64 = VI.load(&[16, -16, -1, 0], 0) >> 64
+    assert(shr64.lane(0) == 0 && shr64.lane(1) == -1 && shr64.lane(2) == -1 && shr64.lane(3) == 0)
+
+    // comparisons, min/max, reductions
+    assert((va == vb).bitmask() == u64(8))
+    assert((va != vb).bitmask() == u64(7))
+    assert((va > vb).bitmask() == u64(7))
+    assert((va < vb).bitmask() == u64(0))
+    assert((va >= vb).bitmask() == u64(15))
+    assert((va <= vb).bitmask() == u64(8))
+    assert(va.min(vb).lane(1) == -30 && va.max(vb).lane(1) == -20)
+    assert(VI.load(&[10, -5, 30, 2], 0).sum() == 37)
+    assert(VI.load(&[10, -5, 30, 2], 0).reduceMin() == -5)
+    assert(VI.load(&[10, -5, 30, 2], 0).reduceMax() == 30)
+
+    // stack-passed 9th vector argument
+    let v1 = VI.splat(1)
+    assert(passMany(v1, v1, v1, v1, v1, v1, v1, v1, v1, 100) == 136)
+
+    // filterRange
+    let data: []int = [1, 5, 10, 15, 20, 25, 3, 12, 18, 30]
+    let hits = filterRange(&data, 10, 20)
+    assert(len(hits) == 5 && hits[0] == 2 && hits[1] == 3 && hits[2] == 4 && hits[3] == 7 && hits[4] == 8)
+}
+
+fn testI32() {
+    assert(VI32.lanes == 8 && vector[i32].lanes == 8)
+    let a: []i32 = [i32(1), i32(-2), i32(3), i32(4), i32(-5), i32(6), i32(7), i32(8)]
+    let b: []i32 = [i32(2), i32(3), i32(-4), i32(4), i32(5), i32(-6), i32(1), i32(10)]
+    let va = VI32.load(&a, 0)
+    let vb = VI32.load(&b, 0)
+    let prod = va *% vb
+    assert(prod.lane(0) == i32(2) && prod.lane(1) == i32(-6) && prod.lane(2) == i32(-12) && prod.lane(7) == i32(80))
+    assert((va +% vb).sum() == i32(37))
+    assert(va.reduceMin() == i32(-5) && va.reduceMax() == i32(8))
+    assert((va < vb).bitmask() == u64(0x93)) // lanes 0,1,4,7 -> 1+2+16+128 = 147 = 0x93
+    let sr = VI32.load(&[i32(-8), i32(16), i32(-1), i32(0), i32(32), i32(-32), i32(7), i32(-7)], 0) >> 2
+    assert(sr.lane(0) == i32(-2) && sr.lane(1) == i32(4) && sr.lane(2) == i32(-1) && sr.lane(7) == i32(-2))
+    let sel = (va < vb).select(va, vb)
+    assert(sel.lane(0) == i32(1) && sel.lane(2) == i32(-4) && sel.lane(5) == i32(-6))
+}
+
+fn testU8() {
+    assert(VB.lanes == 32 && vector[byte].lanes == 32)
+    // unsigned comparison check: bytes >= 0x80 MUST be > 0x20 (UTF-8 safety!)
+    var buf: []byte = array(32, byte(0x80))
+    buf[0] = byte(0x00)
+    buf[5] = byte(0x1f)
+    buf[10] = byte(0x20)
+    buf[20] = byte(0xff)
+    let v = VB.load(&buf, 0)
+    let lt20 = (v < VB.splat(byte(0x20))).bitmask()
+    assert(lt20 == (u64(1) | (u64(1) << 5)))      // ONLY lanes 0 and 5; NOT 0x80 or 0xff!
+    let gt80 = (v > VB.splat(byte(0x80))).bitmask()
+    assert(gt80 == (u64(1) << 20))                 // ONLY lane 20 (0xff)
+    assert(v.reduceMin() == byte(0x00))
+    assert(v.reduceMax() == byte(0xff))
+
+    // shuffle (vpshufb: 16-byte in-lane LUT, bit 7 zeroes lane)
+    var lut: []byte = array(32, byte(0))
+    for i in 0..16 {
+        lut[i] = byte(100 + i)
+        lut[16 + i] = byte(200 + i)
+    }
+    var idx: []byte = array(32, byte(0x80))
+    idx[0] = byte(3)
+    idx[1] = byte(15)
+    idx[16] = byte(2)
+    idx[31] = byte(7)
+    let sh = VB.load(&lut, 0).shuffle(VB.load(&idx, 0))
+    assert(sh.lane(0) == byte(103) && sh.lane(1) == byte(115) && sh.lane(2) == byte(0))
+    assert(sh.lane(16) == byte(202) && sh.lane(31) == byte(207))
+
+    // nextJsonSpecial over &str with UTF-8 multibyte chars before the quote
+    let s = "0123456789abcdef0123456789\xc3\xa9bcdefhello\"world"
+    assert(nextJsonSpecial(&s, 0) == 38)
+    assert(nextJsonSpecial(&s, 39) == -1)
+    let s2 = "0123456789abcdef0123456789abcdef\trest"
+    assert(nextJsonSpecial(&s2, 0) == 32)
+}
+
+fn testBitScans() {
+    assert(u64(0).trailingZeros() == 64)
+    assert(u64(0).leadingZeros() == 64)
+    assert(u64(0).countOnes() == 0)
+    assert(u64(0x80).trailingZeros() == 7)
+    assert(u64(0x80).leadingZeros() == 56)
+    assert(u64(0x55).countOnes() == 4)
+    assert(u32(0).trailingZeros() == 32)
+    assert(u32(0).leadingZeros() == 32)
+    assert(u32(0x10).trailingZeros() == 4)
+    assert(u32(0x10).leadingZeros() == 27)
+    assert(u32(0xff).countOnes() == 8)
+    assert((1 << 12).trailingZeros() == 12)
+}
+
+fn testParMapSimd() {
+    var chunks: [][]float = []
+    for k in 0..8 {
+        var row: []float = array(64, float(k + 1))
+        append(mut &chunks, row)
+    }
+    let sums = par.map(&chunks, fn(row: &[]float): float {
+        var acc = VF.zero()
+        var i = 0
+        while i + VF.lanes <= len(row) {
+            acc = acc + VF.load(row, i)
+            i += VF.lanes
+        }
+        return acc.sum()
+    })
+    for k in 0..8 {
+        assert(sums[k] == float((k + 1) * 64))
+    }
+}
+
+fn main() {
+    testF64()
+    testI64()
+    testI32()
+    testU8()
+    testBitScans()
+    testParMapSimd()
+    println("ok")
+}
