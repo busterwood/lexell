@@ -629,11 +629,41 @@ static int64_t rt_find_pair(const char* s, int64_t from, int64_t n, int64_t i1, 
 #if defined(__SSE2__)
     if (k1 <= 4 && k2 <= 4) {
 #if defined(__AVX2__)
-        if (p + 31 <= last) {
+        if (k1 <= 2 && k2 <= 2) {
+            rt_v32 a0 = rt_v32_of((uint8_t)s1[0]), a1 = rt_v32_of((uint8_t)s1[k1 > 1 ? 1 : 0]);
+            rt_v32 b0 = rt_v32_of((uint8_t)s2[0]), b1 = rt_v32_of((uint8_t)s2[k2 > 1 ? 1 : 0]);
+            for (; p + 63 <= last; p += 64) {
+                rt_v32 x0 = rt_v32_at(p + i1), y0 = rt_v32_at(p + i2);
+                rt_v32 x1 = rt_v32_at(p + 32 + i1), y1 = rt_v32_at(p + 32 + i2);
+                rt_v32 r0 = ((x0 == a0) | (x0 == a1)) & ((y0 == b0) | (y0 == b1));
+                rt_v32 r1 = ((x1 == a0) | (x1 == a1)) & ((y1 == b0) | (y1 == b1));
+                if (__builtin_expect(rt_v32_mask(r0 | r1) != 0, 0)) {
+                    unsigned m = rt_v32_mask(r0);
+                    if (m) return p - s + __builtin_ctz(m);
+                    return p + 32 - s + __builtin_ctz(rt_v32_mask(r1));
+                }
+            }
+            for (; p + 31 <= last; p += 32) {
+                rt_v32 x = rt_v32_at(p + i1), y = rt_v32_at(p + i2);
+                unsigned m = rt_v32_mask(((x == a0) | (x == a1)) & ((y == b0) | (y == b1)));
+                if (m) return p - s + __builtin_ctz(m);
+            }
+        } else if (p + 31 <= last) {
             rt_v32 a0 = rt_v32_of((uint8_t)s1[0]), a1 = rt_v32_of((uint8_t)s1[k1 > 1 ? 1 : 0]);
             rt_v32 a2 = rt_v32_of((uint8_t)s1[k1 > 2 ? 2 : 0]), a3 = rt_v32_of((uint8_t)s1[k1 > 3 ? 3 : 0]);
             rt_v32 b0 = rt_v32_of((uint8_t)s2[0]), b1 = rt_v32_of((uint8_t)s2[k2 > 1 ? 1 : 0]);
             rt_v32 b2 = rt_v32_of((uint8_t)s2[k2 > 2 ? 2 : 0]), b3 = rt_v32_of((uint8_t)s2[k2 > 3 ? 3 : 0]);
+            for (; p + 63 <= last; p += 64) {
+                rt_v32 x0 = rt_v32_at(p + i1), y0 = rt_v32_at(p + i2);
+                rt_v32 x1 = rt_v32_at(p + 32 + i1), y1 = rt_v32_at(p + 32 + i2);
+                rt_v32 r0 = ((x0 == a0) | (x0 == a1) | (x0 == a2) | (x0 == a3)) & ((y0 == b0) | (y0 == b1) | (y0 == b2) | (y0 == b3));
+                rt_v32 r1 = ((x1 == a0) | (x1 == a1) | (x1 == a2) | (x1 == a3)) & ((y1 == b0) | (y1 == b1) | (y1 == b2) | (y1 == b3));
+                if (__builtin_expect(rt_v32_mask(r0 | r1) != 0, 0)) {
+                    unsigned m = rt_v32_mask(r0);
+                    if (m) return p - s + __builtin_ctz(m);
+                    return p + 32 - s + __builtin_ctz(rt_v32_mask(r1));
+                }
+            }
             for (; p + 31 <= last; p += 32) {
                 rt_v32 x = rt_v32_at(p + i1), y = rt_v32_at(p + i2);
                 unsigned m = rt_v32_mask(((x == a0) | (x == a1) | (x == a2) | (x == a3)) & ((y == b0) | (y == b1) | (y == b2) | (y == b3)));
@@ -677,6 +707,20 @@ static int64_t rt_find_str(const char* s, int64_t from, int64_t n, const char* t
 #if defined(__AVX2__)
     if (p + hi + 32 <= e) {
         rt_v32 w1 = rt_v32_of((uint8_t)t[i1]), w2 = rt_v32_of((uint8_t)t[i2]);
+        for (; p + hi + 128 <= e; p += 128) {
+            rt_v32 r0 = (rt_v32_at(p + i1) == w1) & (rt_v32_at(p + i2) == w2);
+            rt_v32 r1 = (rt_v32_at(p + 32 + i1) == w1) & (rt_v32_at(p + 32 + i2) == w2);
+            rt_v32 r2 = (rt_v32_at(p + 64 + i1) == w1) & (rt_v32_at(p + 64 + i2) == w2);
+            rt_v32 r3 = (rt_v32_at(p + 96 + i1) == w1) & (rt_v32_at(p + 96 + i2) == w2);
+            if (__builtin_expect(rt_v32_mask((r0 | r1) | (r2 | r3)) != 0, 0)) {
+                unsigned m;
+                const char* q;
+                if ((m = rt_v32_mask(r0))) { q = p; while (m) { const char* c = q + __builtin_ctz(m); if (c <= last && (k == 2 || memcmp(c, t, (size_t)k) == 0)) return c - s; m &= m - 1; } }
+                if ((m = rt_v32_mask(r1))) { q = p + 32; while (m) { const char* c = q + __builtin_ctz(m); if (c <= last && (k == 2 || memcmp(c, t, (size_t)k) == 0)) return c - s; m &= m - 1; } }
+                if ((m = rt_v32_mask(r2))) { q = p + 64; while (m) { const char* c = q + __builtin_ctz(m); if (c <= last && (k == 2 || memcmp(c, t, (size_t)k) == 0)) return c - s; m &= m - 1; } }
+                if ((m = rt_v32_mask(r3))) { q = p + 96; while (m) { const char* c = q + __builtin_ctz(m); if (c <= last && (k == 2 || memcmp(c, t, (size_t)k) == 0)) return c - s; m &= m - 1; } }
+            }
+        }
         for (; p + hi + 32 <= e; p += 32) {
             unsigned m = rt_v32_mask((rt_v32_at(p + i1) == w1) & (rt_v32_at(p + i2) == w2));
             while (m) {

@@ -61,10 +61,16 @@ type ArrBox = record {
 }
 
 type ObjBox = record {
-    keys: []str
+    keys: rc []str
     vals: []Json
     index: []int    // empty, or slots of -1 / an entry, a power of two, at most half full
 }
+
+// Static sentinel marking an exact integer (|v| <= 2^53-1) stored in Number.f with no heap text.
+const INT_TAG = "\x00"
+const MAX_FAST_INT = 9007199254740991
+
+fn isFastInt(n: &Number): bool { return len(n.text) == 1 && n.text[0] == 0 }
 
 // What kind of value a Json is. toStr gives jq's names for them.
 pub type Kind = value closed { Null; Bool; Number; String; Array; Object }
@@ -85,7 +91,7 @@ const SMALL = 16    // objects up to this many keys have no index
 fn newArr(items: []Json): Json { return Json.Arr(rc(ArrBox{items: items})) }
 
 fn newObj(keys: []str, vals: []Json): Json {
-    var b = ObjBox{keys: keys, vals: vals, index: []}
+    var b = ObjBox{keys: rc(keys), vals: vals, index: []}
     if len(b.keys) > SMALL { reindex(mut &b) }
     return Json.Obj(rc(b))
 }
@@ -97,7 +103,10 @@ pub fn boolean(b: bool): Json { return Json.Bool(b) }
 pub fn string(s: &str): Json { return Json.Str(s.clone()) }
 
 // An integer, exact however large (its text is kept).
-pub fn integer(n: int): Json { return Json.Num(Number{f: float(n), text: intToStr(n)}) }
+pub fn integer(n: int): Json {
+    if n >= -MAX_FAST_INT && n <= MAX_FAST_INT { return Json.Num(Number{f: float(n), text: INT_TAG}) }
+    return Json.Num(Number{f: float(n), text: intToStr(n)})
+}
 
 // A double; it has no text and writes as its shortest form (NaN and the
 // infinities write as null).
@@ -210,9 +219,13 @@ pub fn (j: &Json) asDecimal(): Option[Decimal] {
 pub fn (n: &Number) toFloat(): float { return n.f }
 
 // The text the number was written with, "" when it was made from a float.
-pub fn (n: &Number) literal(): str { return n.text.clone() }
+pub fn (n: &Number) literal(): str {
+    if isFastInt(n) { return intToStr(int(n.f)) }
+    return n.text.clone()
+}
 
 pub fn (n: &Number) toInt(): Option[int] {
+    if isFastInt(n) { return Some(int(n.f)) }
     if len(n.text) == 0 {
         if n.f != n.f || n.f.trunc() != n.f || n.f < -9223372036854775808.0f || n.f >= 9223372036854775808.0f { return None }
         return Some(int(n.f))
@@ -246,6 +259,7 @@ pub fn (n: &Number) toInt(): Option[int] {
 }
 
 pub fn (n: &Number) toDecimal(): Option[Decimal] {
+    if isFastInt(n) { return Some(Decimal.fromInt(int(n.f))) }
     var t = n.text.clone()
     if len(t) == 0 {
         if !n.f.isFinite() { return None }
@@ -537,11 +551,12 @@ pub fn (j: mut &Json) remove(k: &str): Option[Json] {
             let b = o.unshare()
             let e = findKey(b, k)
             let n = len(b.keys)
-            for i in e..n - 1 {
-                swap(mut &b.keys, i, i + 1)
-                swap(mut &b.vals, i, i + 1)
+            {
+                let ks = b.keys.unshare()
+                for i in e..n - 1 { swap(ks, i, i + 1) }
+                pop(ks)
             }
-            pop(mut &b.keys)
+            for i in e..n - 1 { swap(mut &b.vals, i, i + 1) }
             let v = pop(mut &b.vals)
             if len(b.index) > 0 { reindex(b) }
             r = Some(v)
@@ -568,13 +583,15 @@ pub fn (j: Json) and(v: Json): Json {
 }
 
 fn findKey(b: &ObjBox, k: &str): int {
+    let ks: &[]str = &b.keys
     if len(b.index) == 0 {
         // lengths and first bytes first: most keys differ there, and a string
         // compare is a call
-        for i in 0..len(b.keys) {
-            let key = &b.keys[i]
-            if len(key) != len(k) { continue }
-            if len(k) > 0 && key[0] != k[0] { continue }
+        let kn = len(k)
+        for i in 0..len(ks) {
+            let key = &ks[i]
+            if len(key) != kn { continue }
+            if kn > 0 && key[0] != k[0] { continue }
             if key == k { return i }
         }
         return -1
@@ -584,7 +601,7 @@ fn findKey(b: &ObjBox, k: &str): int {
     while true {
         let e = b.index[s]
         if e < 0 { return -1 }
-        if b.keys[e] == k { return e }
+        if ks[e] == k { return e }
         s = (s + 1) & mask
     }
 }
@@ -595,15 +612,45 @@ fn putKey(b: mut &ObjBox, k: &str, v: Json) {
         replace(mut &b.vals[e], v)
         return
     }
-    append(mut &b.keys, k.clone())
+    var n = 0
+    {
+        let ks = b.keys.unshare()
+        append(ks, k.clone())
+        n = len(ks)
+    }
     append(mut &b.vals, v)
-    let n = len(b.keys)
     if n > SMALL {
         if 2 * n > len(b.index) {
             reindex(b)
         } else {
             let mask = len(b.index) - 1
             var s = int(k.hash() & u64(mask))
+            while b.index[s] >= 0 { s = (s + 1) & mask }
+            b.index[s] = n - 1
+        }
+    }
+}
+
+fn putKeyOwned(b: mut &ObjBox, k: str, v: Json) {
+    let e = findKey(b, &k)
+    if e >= 0 {
+        replace(mut &b.vals[e], v)
+        return
+    }
+    let h = if len(b.keys) >= SMALL { k.hash() } else { u64(0) }
+    var n = 0
+    {
+        let ks = b.keys.unshare()
+        append(ks, k)
+        n = len(ks)
+    }
+    append(mut &b.vals, v)
+    if n > SMALL {
+        if 2 * n > len(b.index) {
+            reindex(b)
+        } else {
+            let mask = len(b.index) - 1
+            var s = int(h & u64(mask))
             while b.index[s] >= 0 { s = (s + 1) & mask }
             b.index[s] = n - 1
         }
@@ -679,7 +726,13 @@ pub fn cmpNumbers(x: &Number, y: &Number): int {
     }
     if x.f < y.f { return -1 }
     if x.f > y.f { return 1 }
-    if len(x.text) == 0 || len(y.text) == 0 || x.text == y.text { return 0 }
+    let xfi = isFastInt(x)
+    let yfi = isFastInt(y)
+    if xfi && yfi { return 0 }
+    if len(x.text) == 0 || len(y.text) == 0 { return 0 }
+    if !xfi && !yfi && x.text == y.text { return 0 }
+    if xfi { return cmpDecimalText(&(intToStr(int(x.f))), &y.text) }
+    if yfi { return cmpDecimalText(&x.text, &(intToStr(int(y.f)))) }
     return cmpDecimalText(&x.text, &y.text)
 }
 
@@ -884,11 +937,14 @@ pub type Decoder = record {
     pos: int
     depth: int
     opts: ParseOptions
+    shapes: []rc []str
 }
 
 pub fn decoder(s: &str): Decoder { return decoderWith(s, parseOptions()) }
 
-pub fn decoderWith(s: &str, o: ParseOptions): Decoder { return Decoder{s: s.clone(), pos: 0, depth: 0, opts: o} }
+pub fn decoderWith(s: &str, o: ParseOptions): Decoder {
+    return Decoder{s: s.clone(), pos: 0, depth: 0, opts: o, shapes: []}
+}
 
 // The next value, None at the end of the strings.
 pub fn (d: mut &Decoder) next(): Result[Option[Json], Error] {
@@ -1001,8 +1057,39 @@ fn (d: mut &Decoder) word(w: &str, v: Json): Result[Json, Error] {
 fn (d: mut &Decoder) numberValue(): Result[Json, Error] {
     let s = &d.s
     let i = d.pos
+    let n = len(s)
+    // Fast path: canonical JSON integer up to 15 digits (not -0): exact in f64, zero heap alloc.
+    var p = i
+    var neg = false
+    if p < n && s[p] == '-' {
+        neg = true
+        p += 1
+    }
+    if p < n {
+        let c0 = s[p]
+        if c0 == '0' && !neg && (p + 1 >= n || !wordByte(s[p + 1])) {
+            d.pos = p + 1
+            return Ok(Json.Num(Number{f: 0.0f, text: INT_TAG}))
+        }
+        if c0 >= '1' && c0 <= '9' {
+            var v = int(c0 - '0')
+            var q = p + 1
+            let lim = if p + 15 < n { p + 15 } else { n }
+            while q < lim {
+                let c = s[q]
+                if c < '0' || c > '9' { break }
+                v = v * 10 + int(c - '0')
+                q += 1
+            }
+            if q >= n || !wordByte(s[q]) {
+                d.pos = q
+                if neg { v = -v }
+                return Ok(Json.Num(Number{f: float(v), text: INT_TAG}))
+            }
+        }
+    }
     var j = i
-    while j < len(s) && wordByte(s[j]) { j += 1 }
+    while j < n && wordByte(s[j]) { j += 1 }
     let t = s[i..j]
     let ok = if d.opts.lenient { isLenientNumber(&t) } else { isNumberText(&t) }
     if !ok { return Err(d.fail(ErrorKind.Number, &("invalid number " + quoteShort(&t)), i)) }
@@ -1227,25 +1314,69 @@ fn (d: mut &Decoder) objectValue(): Result[Json, Error] {
     d.depth += 1
     if d.depth > d.opts.maxDepth { return Err(d.fail(ErrorKind.Depth, "nested too deep", start)) }
     d.pos += 1
-    var b = ObjBox{keys: [], vals: [], index: []}
     d.skipSpace()
     if d.pos < len(d.s) && d.s[d.pos] == '}' {
         d.pos += 1
         d.depth -= 1
-        return Ok(Json.Obj(rc(b)))
+        return Ok(Json.Obj(rc(ObjBox{keys: rc([]), vals: [], index: []})))
     }
+    let slot = d.depth
+    var matching = slot < len(d.shapes) && len(d.shapes[slot]) > 0
+    var cand: rc []str = if matching { d.shapes[slot].share() } else { rc([]) }
+    let candLen = len(cand)
+    var vals: []Json = if matching { withCapacity(candLen) } else { [] }
+    var b = ObjBox{keys: rc([]), vals: [], index: []}
+    var idx = 0
     while true {
         d.skipSpace()
         if d.pos >= len(d.s) { return Err(d.fail(ErrorKind.Eof, "unfinished object", d.pos)) }
         if d.s[d.pos] != '"' { return Err(d.fail(ErrorKind.Syntax, &("expected a string key, found " + describe(d.s[d.pos])), d.pos)) }
-        let k = try d.string()
+        var matchedKey = false
+        var ownedKey = ""
+        if matching && idx < candLen {
+            let kstart = d.pos + 1
+            var ki = kstart
+            let n = len(d.s)
+            while ki < n {
+                let kc = d.s[ki]
+                if kc == '"' {
+                    let want = &cand[idx]
+                    if ki - kstart == len(want) && d.s[kstart..ki] == want {
+                        d.pos = ki + 1
+                        matchedKey = true
+                    }
+                    break
+                }
+                if kc == '\\' || kc < 0x20 || kc >= 0x80 { break }
+                ki += 1
+            }
+        }
+        if !matchedKey {
+            ownedKey = try d.string()
+            if matching {
+                if idx < candLen && ownedKey == cand[idx] {
+                    matchedKey = true
+                } else {
+                    var ks: []str = withCapacity(idx + 1)
+                    for m in 0..idx { append(mut &ks, cand[m].clone()) }
+                    b = ObjBox{keys: rc(ks), vals: replace(mut &vals, []), index: []}
+                    if idx > SMALL { reindex(mut &b) }
+                    matching = false
+                }
+            }
+        }
         d.skipSpace()
         if d.pos >= len(d.s) { return Err(d.fail(ErrorKind.Eof, "unfinished object", d.pos)) }
         if d.s[d.pos] != ':' { return Err(d.fail(ErrorKind.Syntax, &("expected ':', found " + describe(d.s[d.pos])), d.pos)) }
         d.pos += 1
         d.skipSpace()
         let v = try d.value()
-        putKey(mut &b, &k, v)
+        if matching {
+            append(mut &vals, v)
+            idx += 1
+        } else {
+            putKeyOwned(mut &b, ownedKey, v)
+        }
         d.skipSpace()
         if d.pos >= len(d.s) { return Err(d.fail(ErrorKind.Eof, "unfinished object", d.pos)) }
         let c = d.s[d.pos]
@@ -1259,6 +1390,21 @@ fn (d: mut &Decoder) objectValue(): Result[Json, Error] {
         }
     }
     d.depth -= 1
+    if matching {
+        if idx == candLen {
+            var ob = ObjBox{keys: cand, vals: vals, index: []}
+            if candLen > SMALL { reindex(mut &ob) }
+            return Ok(Json.Obj(rc(ob)))
+        }
+        var ks: []str = withCapacity(idx)
+        for m in 0..idx { append(mut &ks, cand[m].clone()) }
+        b = ObjBox{keys: rc(ks), vals: vals, index: []}
+        if idx > SMALL { reindex(mut &b) }
+    }
+    if slot < 32 {
+        while len(d.shapes) <= slot { append(mut &d.shapes, rc([])) }
+        d.shapes[slot] = b.keys.share()
+    }
     return Ok(Json.Obj(rc(b)))
 }
 
@@ -1471,16 +1617,14 @@ pub type Sink = interface {
 }
 
 // A byte buffer that is a Sink.
-pub type Buf = record { bytes: []byte }
+pub type Buf = record { s: str }
 
-pub fn newBuf(): Buf { return Buf{bytes: []} }
-pub fn (b: mut &Buf) write(s: &str) {
-    for i in 0..len(s) { append(mut &b.bytes, s[i]) }
-}
-pub fn (b: mut &Buf) writeByte(c: byte) { append(mut &b.bytes, c) }
-pub fn (b: &Buf) toStr(): str { return strFromBytes(&b.bytes) }
-pub fn (b: &Buf) size(): int { return len(b.bytes) }
-pub fn (b: mut &Buf) clear() { replace(mut &b.bytes, []) }
+pub fn newBuf(): Buf { return Buf{s: ""} }
+pub fn (b: mut &Buf) write(s: &str) { b.s += s }
+pub fn (b: mut &Buf) writeByte(c: byte) { b.s.addByte(c) }
+pub fn (b: &Buf) toStr(): str { return b.s.clone() }
+pub fn (b: &Buf) size(): int { return len(b.s) }
+pub fn (b: mut &Buf) clear() { replace(mut &b.s, "") }
 
 pub type WriteOptions = value record {
     pub indent: int        // spaces per level; 0 writes compactly, no spaces at all
@@ -1508,21 +1652,21 @@ pub fn write(j: &Json, o: &WriteOptions): str {
     var b = newBuf()
     writeTo(mut &b, j, o)
     if o.indent > 0 || o.tab { b.writeByte('\n') }
-    return b.toStr()
+    return replace(mut &b.s, "")
 }
 
 // The compact text of j.
 pub fn (j: &Json) toStr(): str {
     var b = newBuf()
     writeTo(mut &b, j, &compact())
-    return b.toStr()
+    return replace(mut &b.s, "")
 }
 
 // The text with two spaces per level (no newline at the end).
 pub fn (j: &Json) pretty(): str {
     var b = newBuf()
     writeTo(mut &b, j, &pretty())
-    return b.toStr()
+    return replace(mut &b.s, "")
 }
 
 // Writes the text of j to w, with no newline at the end.
@@ -1581,10 +1725,22 @@ fn writeValue[W: Sink](w: mut &W, j: &Json, o: &WriteOptions, level: int) {
         Json.Obj(ob) {
             if len(ob.keys) == 0 {
                 w.write("{}")
+            } else if !o.sortKeys {
+                w.writeByte('{')
+                for i in 0..len(ob.keys) {
+                    if i > 0 { w.writeByte(',') }
+                    if pretty { newline(w, o, level + 1) }
+                    writeString(w, ob.keys[i], o.ascii)
+                    w.writeByte(':')
+                    if pretty { w.writeByte(' ') }
+                    writeValue(w, ob.vals[i], o, level + 1)
+                }
+                if pretty { newline(w, o, level) }
+                w.writeByte('}')
             } else {
-                var order: []int = []
-                for i in 0..len(ob.keys) { append(mut &order, i) }
-                if o.sortKeys { sortByKeys(mut &order, ob.keys) }
+                var order = array(len(ob.keys), 0)
+                for i in 0..len(ob.keys) { order[i] = i }
+                sortByKeys(mut &order, ob.keys)
                 w.writeByte('{')
                 for x in 0..len(order) {
                     let i = order[x]
@@ -1720,6 +1876,7 @@ pub fn writeString[W: Sink](w: mut &W, s: &str, ascii: bool) {
 // 1.7.1 prints: a literal in decNumber's scientific form, a double with its
 // shortest digits laid out as jq's dtoa does.
 pub fn formatNumber(n: &Number, jq: bool): str {
+    if isFastInt(n) { return intToStr(int(n.f)) }
     if len(n.text) > 0 {
         if !jq { return n.text.clone() }
         let c = canonicalLiteral(&n.text)

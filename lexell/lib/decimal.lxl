@@ -187,7 +187,7 @@ fn makeDec(neg: bool, c: U256, exp: int, dscale: int): Result[Decimal, DecError]
         e += 1
     }
     var x = v.lo
-    if x % 10 == 0 {
+    if (x & 1) == 0 {
         while true {   // strip trailing zeros (x != 0), see INV5
             let q = (x >> 1) *% INV5
             if (q | (x << 127)) > DIV5_MAX { break }
@@ -217,7 +217,7 @@ fn makeDecCore(neg: bool, c: U256, exp: int, dscale: int, err: mut &int): Decima
         e += 1
     }
     var x = v.lo
-    if x % 10 == 0 {
+    if (x & 1) == 0 {
         while true {   // strip trailing zeros (x != 0), see INV5
             let q = (x >> 1) *% INV5
             if (q | (x << 127)) > DIV5_MAX { break }
@@ -374,8 +374,13 @@ pub fn (a: Decimal) add(b: Decimal): Decimal {
             m = mag(t)
             neg = t < 0
         }
+        var e = a.exp
+        if (m & 1) == 0 { m = stripTens(m, mut &e) }
+        if m <= COEF_MAX && e >= EXP_MIN && (e <= EXP_MAX || e + digits(m) <= EXP_MAX + 38) {
+            return Decimal{v: signed(m, neg), exp: e, dscale: ds}
+        }
         var err = 0
-        let d = makeDecCore(neg, u256(m), a.exp, ds, mut &err)
+        let d = makeDecCore(neg, u256(m), e, ds, mut &err)
         if err != 0 { decStop(decErrOf(err)) }
         return d
     }
@@ -556,38 +561,49 @@ pub fn (a: Decimal) div(b: Decimal, scale: int, mode: Rounding): Result[Decimal,
     let bc = mag(b.v)
     // q = ac * 10^t / bc, t = a.exp - b.exp + scale
     let t = a.exp - b.exp + scale
+    if t >= 0 && t <= 19 && ac <= M64 && bc <= M64 {
+        let scaled = ac *% pow10(t)
+        if scaled <= M64 {
+            // the scaled numerator and the divisor fit in 64 bits (ac * 10^t < 2^128 cannot wrap):
+            // one 64-bit divide, rounded and built here. The quotient has at most 20 digits and the
+            // exponent is -scale or above (at most 20 more), within range: makeDec's checks hold.
+            let nn = u64(scaled)
+            let dd = u64(bc)
+            var qq = nn / dd
+            let rr = nn - qq *% dd
+            if rr != 0 {
+                // 2 * rr against dd, as rr against dd - rr (2 * rr can pass 2^64)
+                let hf = decB2i(rr > dd - rr) - decB2i(rr < dd - rr)
+                var inc = 0
+                match mode {
+                    Rounding.HALF_EVEN { inc = decB2i(hf > 0 || hf == 0 && qq % 2 == 1) }
+                    Rounding.HALF_AWAY { inc = decB2i(hf >= 0) }
+                    else {
+                        inc = roundIncrement(mode, neg, hf, true, qq % 2 == 1)
+                        if inc < 0 { return Err(DecError.Inexact) }
+                    }
+                }
+                qq += u64(inc)      // qq < nn here (dd > 1): no overflow
+            }
+            if qq == 0 { return Ok(zeroDec(scale)) }
+            var e = 0 - scale
+            if (qq & 1) == 0 {
+                while true {
+                    let q1 = (qq >> 1) *% 0xcccccccccccccccd
+                    if (q1 | (qq << 63)) > 0x3333333333333333 { break }
+                    qq = q1
+                    e += 1
+                }
+            }
+            return Ok(Decimal{v: signed(u128(qq), neg), exp: e, dscale: scale})
+        }
+    }
     var n = u256(ac)
     var d = u256(bc)
     var q = u256(0)
     var r = n
     var half = -1
-    if t >= 0 && t <= 19 && ac <= M64 && bc <= M64 && ac *% pow10(t) <= M64 {
-        // the scaled numerator and the divisor fit in 64 bits (ac * 10^t < 2^128 cannot wrap):
-        // one 64-bit divide, rounded and built here. The quotient has at most 20 digits and the
-        // exponent is -scale or above (at most 20 more), within range: makeDec's checks hold.
-        let nn = u64(ac *% pow10(t))
-        let dd = u64(bc)
-        var qq = nn / dd
-        let rr = nn - qq *% dd
-        if rr != 0 {
-            // 2 * rr against dd, as rr against dd - rr (2 * rr can pass 2^64)
-            let hf = decB2i(rr > dd - rr) - decB2i(rr < dd - rr)
-            var inc = 0
-            match mode {
-                Rounding.HALF_EVEN { inc = decB2i(hf > 0 || hf == 0 && qq % 2 == 1) }
-                Rounding.HALF_AWAY { inc = decB2i(hf >= 0) }
-                else {
-                    inc = roundIncrement(mode, neg, hf, true, qq % 2 == 1)
-                    if inc < 0 { return Err(DecError.Inexact) }
-                }
-            }
-            qq += u64(inc)      // qq < nn here (dd > 1): no overflow
-        }
-        if qq == 0 { return Ok(zeroDec(scale)) }
-        var e = 0 - scale
-        let m = stripTens(u128(qq), mut &e)
-        return Ok(Decimal{v: signed(m, neg), exp: e, dscale: scale})
-    } else if t >= 0 {
+    if t >= 0 {
         n = try mulPow10(n, t, DecError.Overflow)
         let qr = divModU(n, d)
         q = qr.q
@@ -689,13 +705,14 @@ fn roundIncrement(mode: Rounding, neg: bool, half: int, dropped: bool, odd: bool
 
 // ---- comparison
 
-pub fn (a: Decimal) cmp(b: &Decimal): int {
+pub fn (a: &Decimal) cmp(b: &Decimal): int {
     // the same exponent: the signed coefficients order the values. Kept this small so that the
     // inliner takes it into the caller (no call, no copy of a).
-    if a.exp != b.exp { return cmpApart(&a, b) }
+    if a.exp != b.exp { return cmpApart(a, b) }
     let x = a.v
     let y = b.v
-    return decB2i(x > y) - decB2i(x < y)
+    if x == y { return 0 }
+    return if x < y { -1 } else { 1 }
 }
 
 // cmp of values with different exponents.
