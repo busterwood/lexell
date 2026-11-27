@@ -129,9 +129,15 @@ fn bytesAtFoldMid(s: &str, at: int, p: &str): bool {
     return true
 }
 
+// Like bytesAt when p[0] and p[len(p)-1] have already been matched in SIMD.
+fn bytesAtMid(s: &str, at: int, p: &str): bool {
+    for i in 1..len(p) - 1 { if s[at + i] != p[i] { return false } }
+    return true
+}
+
 // likePieces of s[lo..hi] (9.108: a text in a row's bytes, not copied out).
-// A piece between is found by the runtime's search from where the last
-// ended: its first place in s, which is in s[lo..hi] if any is.
+// Bounded 2-byte SIMD scan stays strictly within s[at..end] instead of scanning
+// past hi into the rest of a multi-row columnar leaf buffer.
 pub fn likeRange(s: &str, lo: int, hi: int, ps: &[]str): bool {
     let n = len(ps)
     if n == 1 { return hi - lo == len(ps[0]) && bytesAt(s, lo, &ps[0]) }
@@ -143,11 +149,49 @@ pub fn likeRange(s: &str, lo: int, hi: int, ps: &[]str): bool {
     let end = hi - len(last)
     for k in 1..n - 1 {
         let p = &ps[k]
-        if len(p) == 0 { continue }
-        if at + len(p) > end { return false }
-        let found = strFind(s, at, p)
-        if found < 0 || found + len(p) > end { return false }
-        at = found + len(p)
+        let plen = len(p)
+        if plen == 0 { continue }
+        let lim = end - plen + 1
+        if at >= lim { return false }
+        let v0 = VB.splat(p[0])
+        var found = -1
+        var i = at
+        if plen == 1 {
+            while i + VB.lanes <= lim {
+                let m = (VB.load(s, i) == v0).bitmask()
+                if m != u64(0) { found = i + int(m.trailingZeros()); break }
+                i += VB.lanes
+            }
+            if found < 0 && i < lim {
+                let m = (VB.loadPartial(s, i, byte(0)) == v0).bitmask() & VB.tailMask(lim - i)
+                if m != u64(0) { found = i + int(m.trailingZeros()) }
+            }
+        } else {
+            let off1 = plen - 1
+            let v1 = VB.splat(p[off1])
+            while i + VB.lanes <= lim {
+                var m = ((VB.load(s, i) == v0) & (VB.load(s, i + off1) == v1)).bitmask()
+                while m != u64(0) {
+                    let pos = i + int(m.trailingZeros())
+                    if plen == 2 || bytesAtMid(s, pos, p) { found = pos; break }
+                    m = m & (m - u64(1))
+                }
+                if found >= 0 { break }
+                i += VB.lanes
+            }
+            if found < 0 && i < lim {
+                let ma = VB.loadPartial(s, i, byte(0)) == v0
+                let mb = VB.loadPartial(s, i + off1, byte(0)) == v1
+                var m = (ma & mb).bitmask() & VB.tailMask(lim - i)
+                while m != u64(0) {
+                    let pos = i + int(m.trailingZeros())
+                    if plen == 2 || bytesAtMid(s, pos, p) { found = pos; break }
+                    m = m & (m - u64(1))
+                }
+            }
+        }
+        if found < 0 { return false }
+        at = found + plen
     }
     return true
 }
