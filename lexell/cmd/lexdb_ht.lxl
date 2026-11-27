@@ -455,6 +455,27 @@ pub fn newFastIntMap(): FastIntMap {
 
 pub fn (t: &FastIntMap) size(): int { return t.len }
 
+// Zero-rehash O(cap) conversion of FastIntMap (key -> bucket+1) into FastIntCount (key -> bucketW[bucket])
+// when every bucket has weight > 0. Moves slots and Bloom filter directly (0 allocs, 0 hashes).
+pub fn (t: mut &FastIntMap) intoWeightedCount(bucketW: &[]int): FastIntCount {
+    var slots = replace(mut &t.slots, [])
+    var bf = replace(mut &t.bf, [])
+    let mask = t.mask
+    let n = t.len
+    let bfMask = t.bfMask
+    t.mask = 0
+    t.len = 0
+    t.bfMask = -1
+    var i = 0
+    let sl = len(slots)
+    while i < sl {
+        let v = slots[i + 1]
+        if v != 0 { slots[i + 1] = bucketW[v - 1] }
+        i += 2
+    }
+    return FastIntCount{slots: slots, mask: mask, len: n, bf: bf, bfMask: bfMask}
+}
+
 fn (t: mut &FastIntMap) grow() {
     let cap = if len(t.slots) == 0 { 1024 } else { len(t.slots) } // len(slots) == oldCap * 2
     let mask = cap - 1
@@ -776,7 +797,7 @@ pub fn (t: &FastInt2Set) has(k0: int, k1: int): bool {
 // Vectorized batch terminal anti-join probe for JK_INT2_64 using compact 16B/slot FastInt2Set.
 pub fn (t: &FastInt2Set) sumLastAntiW(at0: &[]int, at1: &[]int, kv0: &[]int, nul0: &[]bool,
                                       kv1: &[]int, nul1: &[]bool, ws: &[]int, n: int,
-                                      acc: mut &int, matched: mut &int) {
+                                      antiNull: bool, acc: mut &int, matched: mut &int, nulls: mut &int) {
     let tLen = t.len
     let mask = t.mask
     let bfMask = t.bfMask
@@ -821,6 +842,7 @@ pub fn (t: &FastInt2Set) sumLastAntiW(at0: &[]int, at1: &[]int, kv0: &[]int, nul
     }
     acc += a
     matched += mat
+    if antiNull { nulls += a }
 }
 
 pub fn newFastInt2Count(): FastInt2Count {
@@ -1897,6 +1919,17 @@ pub fn (t: &TwoLevelArena) probeBufBatch(buf: &str, off: &[]int, slen: &[]int, n
             let h = hashStr(sl)
             outHash[j] = h
             outGid[j] = t.l1.find(sl, h)
+        }
+        return
+    }
+    if (t.trackKeys && len(t.gidLoc) < 32768) || nc < 256 {
+        for j in 0..nc {
+            let a = off[j]
+            let sl = &buf[a..a + slen[j]]
+            let h = hashStr(sl)
+            outHash[j] = h
+            let bk = &t.bkts[bucketOf(h)]
+            outGid[j] = if len(bk.ht) == 0 { -1 } else { bk.find(sl, h) }
         }
         return
     }

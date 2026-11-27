@@ -9003,7 +9003,7 @@ fn grpSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, j: &lexdb_plan.PJ
     initTDict(mut &bd, &bp)
     let mode = jl.mode
     if mode == JK_INT && len(j.hcols) == 1 { jl.hcol0 = j.hcols[0] }
-    let useSet2 = countOnly && mode == JK_INT2_64 && jl.mark == lexdb_plan.MK_ANTI && !jl.antiNull
+    let useSet2 = countOnly && mode == JK_INT2_64 && jl.mark == lexdb_plan.MK_ANTI
     jl.isSet2 = useSet2
     let h0 = bud.held
     let room = bud.room()
@@ -9195,7 +9195,7 @@ fn foldCountJoin(jr: mut &JRun, room: int) {
         if jr.jls[k].folded || !(kh == lexdb_plan.JH_HASH || kh == lexdb_plan.JH_ROWS || kh == lexdb_plan.JH_JOIN) ||
            jr.jls[k].countOnly || jr.jls[k].mode != JK_INT || jr.jls[k].mark != lexdb_plan.MK_JOIN ||
            jr.jls[k].left || jr.jls[k].right || jr.jls[k].na != 0 || jr.jls[k].resCol >= 0 ||
-           len(jr.jls[k].conds) > 0 || len(jr.jls[k].post) > 0 || jr.jls[k].neqOut >= 0 || jr.jls[k].hcol0 < 0 { continue }
+           len(jr.jls[k].conds) > 0 || len(jr.jls[k].post) > 0 || jr.jls[k].hcol0 < 0 { continue }
         // Exactness: no intermediate level between k and j may have residual conditions that could error.
         var midOk = true
         for m in (k + 1)..j {
@@ -9265,42 +9265,79 @@ fn foldCountJoin(jr: mut &JRun, room: int) {
                 if kUsed { break }
             }
         }
-        if !kUsed && jr.jls[k].hcol0 < len(jr.jls[k].rows.cols) {
+        if !kUsed && jr.jls[k].neqOut < 0 && jr.jls[k].hcol0 < len(jr.jls[k].rows.cols) {
             // Collapse level k completely into a weighted countOnly FastIntCount/dense table!
-            let hc0 = jr.jls[k].hcol0
-            var fc = lexdb_ht.newFastIntCount()
-            var hasR = false
-            var lo = 0
-            var hi = 0
+            let nb = len(jr.jls[k].head)
+            var bw: []int = array(nb, 0)
+            var anyZeroBk = false
             {
-                let hcol = &jr.jls[k].rows.cols[hc0]
                 let rw2 = &jr.jls[k].rowW
-                for r in 0..nRows {
-                    let w = rw2[r]
-                    if w <= 0 || hcol.nul[r] { continue }
-                    let kv = hcol.v[r]
-                    if !hasR { lo = kv; hi = kv; hasR = true } else {
-                        if kv < lo { lo = kv }
-                        if kv > hi { hi = kv }
+                let hd = &jr.jls[k].head
+                let nx = &jr.jls[k].next
+                for b in 0..nb {
+                    var r = hd[b]
+                    var s = 0
+                    while r >= 0 {
+                        s += rw2[r]
+                        r = nx[r]
                     }
-                    let added = fc.addW(kv, w)
+                    bw[b] = s
+                    if s <= 0 { anyZeroBk = true }
                 }
             }
-            jr.jls[k].countOnly = true
-            jr.jls[k].fastCnt = fc
-            jr.jls[k].dense = []
-            jr.jls[k].nLive = jr.jls[k].fastCnt.size()
-            jr.jls[k].hasRange0 = hasR
-            jr.jls[k].minK0 = lo
-            jr.jls[k].maxK0 = hi
-            jr.jls[k].rows = lexdb_rows.noRows()
-            jr.jls[k].head = []
-            jr.jls[k].next = []
-            jr.jls[k].rowW = []
-            jr.jls[k].ints = lexdb_ht.newFastIntMap()
-            jr.jls[k].cutB = []
-            jr.jls[k].cutTo = -1
-            buildDense(mut &jr.jls[k], hasR, lo, hi, room)
+            if !anyZeroBk && jr.jls[k].ints.size() > 0 {
+                // Zero-rehash O(cap) in-place slot & dense conversion (0 hashes, 0 allocs!)
+                jr.jls[k].fastCnt = jr.jls[k].ints.intoWeightedCount(&bw)
+                if len(jr.jls[k].dense) > 0 {
+                    for d in 0..len(jr.jls[k].dense) {
+                        let bk = jr.jls[k].dense[d]
+                        jr.jls[k].dense[d] = if bk >= 0 { bw[bk] } else { 0 }
+                    }
+                }
+                jr.jls[k].countOnly = true
+                jr.jls[k].nLive = jr.jls[k].fastCnt.size()
+                jr.jls[k].rows = lexdb_rows.noRows()
+                jr.jls[k].head = []
+                jr.jls[k].next = []
+                jr.jls[k].rowW = []
+                jr.jls[k].cutB = []
+                jr.jls[k].cutTo = -1
+            } else {
+                let hc0 = jr.jls[k].hcol0
+                var fc = lexdb_ht.newFastIntCount()
+                var hasR = false
+                var lo = 0
+                var hi = 0
+                {
+                    let hcol = &jr.jls[k].rows.cols[hc0]
+                    let rw2 = &jr.jls[k].rowW
+                    for r in 0..nRows {
+                        let w = rw2[r]
+                        if w <= 0 || hcol.nul[r] { continue }
+                        let kv = hcol.v[r]
+                        if !hasR { lo = kv; hi = kv; hasR = true } else {
+                            if kv < lo { lo = kv }
+                            if kv > hi { hi = kv }
+                        }
+                        let added = fc.addW(kv, w)
+                    }
+                }
+                jr.jls[k].countOnly = true
+                jr.jls[k].fastCnt = fc
+                jr.jls[k].dense = []
+                jr.jls[k].nLive = jr.jls[k].fastCnt.size()
+                jr.jls[k].hasRange0 = hasR
+                jr.jls[k].minK0 = lo
+                jr.jls[k].maxK0 = hi
+                jr.jls[k].rows = lexdb_rows.noRows()
+                jr.jls[k].head = []
+                jr.jls[k].next = []
+                jr.jls[k].rowW = []
+                jr.jls[k].ints = lexdb_ht.newFastIntMap()
+                jr.jls[k].cutB = []
+                jr.jls[k].cutTo = -1
+                buildDense(mut &jr.jls[k], hasR, lo, hi, room)
+            }
         } else if anyDead {
             let cut = cutRows(mut &jr.jls[k], &live, j)
         }
@@ -9841,7 +9878,7 @@ fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalo
     initTDict(mut &bd, &bp)
     let mode = jl.mode
     if mode == JK_INT && len(j.hcols) == 1 { jl.hcol0 = j.hcols[0] }
-    let useSet2 = jl.countOnly && mode == JK_INT2_64 && jl.mark == lexdb_plan.MK_ANTI && !jl.antiNull
+    let useSet2 = jl.countOnly && mode == JK_INT2_64 && jl.mark == lexdb_plan.MK_ANTI
     jl.isSet2 = useSet2
     let raw = j.how == lexdb_plan.JH_ROWS
     let keepAll = jl.right
@@ -11900,7 +11937,7 @@ fn joinFromW(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: m
                     var nulls = 0
                     let isAnti = jl.mark == lexdb_plan.MK_ANTI
                     if jl.isSet2 {
-                        jl.fastSet2.sumLastAntiW(at0, at1, &kc0.v, &kc0.nul, &kc1.v, &kc1.nul, ws, n, mut &acc, mut &matched)
+                        jl.fastSet2.sumLastAntiW(at0, at1, &kc0.v, &kc0.nul, &kc1.v, &kc1.nul, ws, n, jl.antiNull, mut &acc, mut &matched, mut &nulls)
                     } else if is64 {
                         jl.fastCnt2.sumLastW(at0, at1, &kc0.v, &kc0.nul, &kc1.v, &kc1.nul, ws, n, jl.left, isAnti, jl.antiNull, mut &acc, mut &matched, mut &nulls)
                     } else {
@@ -12079,7 +12116,7 @@ fn joinFromW(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: m
     // Fast path for neqCountOnly JK_INT levels (outer_col <> inner_col with no cols read above)
     if hashed(jl) && jl.resCol < 0 && jl.mode == JK_INT && jl.kCol0 >= 0 && jl.neqOut >= 0 &&
        (isLast || jl.neqCountOnly) && len(jl.conds) == 0 && len(jl.post) == 0 &&
-       jl.mark == lexdb_plan.MK_JOIN && !jl.left && !jl.right && len(jl.neqMeta) > 0 {
+       jl.mark == lexdb_plan.MK_JOIN && !jl.left && !jl.right && len(jl.neqMeta) > 0 && len(jl.rowW) == 0 {
         let o0 = jr.owner[jl.kCol0]
         let on = jr.owner[jl.neqOut]
         if o0 >= 0 && o0 < len(at) && on >= 0 && on < len(at) {
@@ -12213,6 +12250,7 @@ fn joinFromW(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: m
                 let inCol = &jl.rows.cols[jl.neqIn]
                 if isLast && sumCol0 < 0 && len(jl.conds) == 0 && len(jl.post) == 0 && jl.mark == lexdb_plan.MK_JOIN && !jl.left && !jl.right {
                     try bud.tickN(n)
+                    let hasRW = len(jl.rowW) > 0
                     var acc = 0
                     var totRead = 0
                     var sumW = 0
@@ -12237,7 +12275,7 @@ fn joinFromW(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, jr: &JRun, js: m
                             var x = jl.head[bk]
                             while x >= 0 {
                                 seen += 1
-                                if !inCol.nul[x] && inCol.v[x] != ov { hits += 1 }
+                                if !inCol.nul[x] && inCol.v[x] != ov { hits += if hasRW { jl.rowW[x] } else { 1 } }
                                 x = jl.next[x]
                             }
                             totRead += wr * seen
