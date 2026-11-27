@@ -134,9 +134,9 @@ On durable transactional writes, LexDB's lock-free `io_uring` event loop with gr
 | OLTP workload (1M rows) | LexDB | PostgreSQL 18 | Takeaway |
 |---|---:|---:|---|
 | **Durable updates** (`pgbench`, 1–32 clients) | **3.9k / 17.8k / 63.3k/s** | 1.6k / 6.7k / 25.7k/s | **2.41–2.67× faster**; commit latency **0.42 ms** median / **0.86–0.89 ms** p99 |
-| **Durable updates** (`sysbench`, non-indexed / indexed, 32t) | **58.4k/s** / **34.2k/s** | 23.0k/s / 21.0k/s | **2.54–3.12× faster** non-indexed; **1.63–2.85× faster** indexed |
-| **Point selects** (1 client, `pgbench` / `sysbench`) | **90.4k/s** / **76.2k/s** | 74.5k/s / 65.1k/s | **1.21×** (`pgbench`) / **1.17×** (`sysbench`) faster (`0.01 ms` p95) |
-| **Point selects — 3 read replicas** (32 clients, 4 cores) | **470–490k/s** (`pgbench`) / **427.1k/s** (`sysbench`) | 397k/s / 334.1k/s (4 cores) | **1.18–1.23×** (`pgbench`); **1.28×** (`sysbench`, 42% less CPU; `oltp_read_only` **1.12×** PG) |
+| **Durable updates** (`sysbench`, non-indexed / indexed, 32t) | **58.9k/s** / **28.1k/s** | 23.0k/s / 21.0k/s | **2.56–3.14× faster** non-indexed; **1.34–2.90× faster** indexed |
+| **Point selects** (1 client, `pgbench` / `sysbench`) | **90.4k/s** / **76.9k/s** | 74.5k/s / 65.1k/s | **1.21×** (`pgbench`) / **1.18×** (`sysbench`) faster (`0.01 ms` p95) |
+| **Point selects — 3 read replicas** (32 clients, 4 cores) | **470–490k/s** (`pgbench`) / **430.9k/s** (`sysbench`) | 397k/s / 334.1k/s (4 cores) | **1.18–1.23×** (`pgbench`); **1.29×** (`sysbench`, 42% less CPU) |
 | **Mixed load** (replica selects + master writes, 4 cores) | **368–403k/s** reads + **15.5–16.1k/s** writes | — | Replica lag stays at **0.22–0.23 ms** median, **0.41–0.44 ms** p99 |
 
 ### 2. OLAP analytics and bulk loads
@@ -149,7 +149,7 @@ With **no materialized views and no explicit skipping indexes**, LexDB's vectori
 | **ClickBench 1M** (43 queries, 105 cols, 1 core) | **6.75 s** | 22.08 s (1 core) / 11.40 s (4 proc) | **3.27× faster** than 1-core PG (**43/43** level or ahead; 0.31× geomean wall / 0.29× CPU); **1.69× faster than 4-process PG on 1 core** (no MVs) |
 | **35 Analytic Queries** (1M rows, 1 core) | **0.39× CPU / 0.78× wall** | 1 core / 4 proc | **2.59× less CPU** than 1-core PG (**35/35** ahead on wall & CPU); **1.28× faster** wall time than 4-process PG |
 | **Selective star-schema joins** (1M fact rows, 6 patterns, 1 core) | **0.54–22.5 ms** | 0.21–77.0 ms (1 core) / 0.24–50.7 ms (4 proc) | **1.24–71.7× faster** via hash-join runtime filters; **7.68×** vs PG1 / **4.46×** vs PG4 (geomean) |
-| **Bulk `\copy` loads** (5 cases, 1M–10M rows) | **0.24–2.44 s** | 0.61–5.93 s | **1.1–2.7× faster** on every workload (including wide tables + secondary indexes) |
+| **Bulk `\copy` loads** (5 cases, 1M–10M rows) | **0.26–2.61 s** | 0.61–5.93 s | **1.25–2.6× faster** on every workload (`224–2,103 MB` peak RSS) |
 
 ### 3. Property graphs (SQL/PGQ)
 
