@@ -146,8 +146,11 @@ pub type Db = record {
     freeSlots: []int
     loadedCount: int
     cacheUsed: int              // the loaded nodes' costs
-    wlog: []WEntry              // the writes of recent commits, in commit order (validate)
-    wlogFloor: int              // reads before this commit can no longer be checked
+    wlogIdx: Map[int, int]      // tree id -> index in wlogs
+    wlogs: []WLogRing           // per-tree ring-buffer write logs in commit order (validate / SSI)
+    ssi: []SsiCommit            // committed txn metadata for Cahill-style SSI dangerous-structure checks
+    ssiHead: int                // logical start index in ssi (compacted lazily)
+    ssiFloor: int               // highest commit seq evicted from ssi before oldest active snapshot
     hand: int
     trees: Map[int, int]        // tree id -> root slot
     // The last descent to a leaf (descend), and the keys that lead there:
@@ -343,19 +346,50 @@ fn (st: &Store) viewOf(t: &Txn): View {
 // a range read sees an insert into it (no phantoms).
 type Mark = value record { tree: int; lo: str; hi: str; seq: int }
 
-// A committed write, kept for the commit checks (Db.wlog): all, a dropped
-// tree (every key).
-// A key range [key, hi] (hi "": the key alone): a commit of many writes to
-// a tree logs their range, not each (a large COPY's commit would otherwise
-// add an entry per row). open: a range delete's [key, hi), hi "" being no
-// end (not the key alone).
-type WEntry = value record { seq: int; tree: int; key: str; hi: str; all: bool; open: bool }
+// A committed write, kept per tree in a fixed-cap ring buffer (Db.wlogs):
+// all = a dropped tree (every key), open = a range delete [key, hi) (hi "" no end),
+// otherwise [key, hi] (hi "" single key).
+type WEntry = value record { seq: int; key: str; hi: str; all: bool; open: bool }
+
+// Per-tree circular write log: O(1) append/evict (no 65k-entry array clones)
+// and tree-scoped binary search during commit validation.
+type WLogRing = record {
+    buf: []WEntry
+    head: int
+    count: int
+    floor: int                  // highest seq evicted from this tree's ring
+}
+
+// Committed transaction summary kept for Cahill-style SSI dangerous-structure
+// detection (T1 -rw-> T2 -rw-> T3). Pruned automatically once seq <= oldest
+// live snapshot (keeping at least SSI_MIN_KEEP recent commits for lazy/live txns).
+type SsiCommit = record {
+    seq: int                    // commit seq (for RO blocks, db.seq at commit time)
+    startSeq: int               // snapshot seq (or min read seq for autocommit)
+    readOnly: bool
+    treeMask: u64               // 64-bit bloom mask of trees in reads
+    reads: []Mark
+    inConflict: bool            // some concurrent T_other has T_other -rw-> this
+    outConflict: bool           // this has this -rw-> some concurrent committed T_other
+    outMinSeq: int              // min commit seq among T_other where this -rw-> T_other (0 if none)
+}
+
+// Deferred SSI flag updates planned during validateAndPlanSSI (applied only on commit).
+type SsiPlan = record {
+    inConflict: bool
+    outConflict: bool
+    outMinSeq: int
+    markIn: []int
+    markOut: []int
+}
+
+const SSI_MAX = 4096
+const SSI_MIN_KEEP = 128
 
 // Past this many writes to one tree, a commit logs their range.
 const WLOG_RANGE = 1024
 
-// The writes kept: past this many, the older half goes, and a transaction
-// whose read is older than what is kept fails its check (a conflict).
+// Max entries retained per tree ring before oldest entries overwrite in O(1).
 var WLOG_MAX: int = 131072
 
 // For the tests: keeps fewer writes.
@@ -5220,36 +5254,211 @@ pub fn (st: &Store) createTree(t: mut &Txn): int {
     return id
 }
 
-// Whether nothing the transaction read was written by a commit after the
-// read: per key range, against the recent commits' writes.
-fn (db: &Db) validate(t: &Txn): bool {
-    for m in t.reads {
-        if m.seq < db.wlogFloor { return false }
-        // the first write after the read (wlog is in commit order)
-        var lo = 0
-        var hi = len(db.wlog)
-        while lo < hi {
-            let mid = (lo + hi) / 2
-            if db.wlog[mid].seq <= m.seq { lo = mid + 1 } else { hi = mid }
+fn treeBit(tree: int): u64 { return u64(1) << (tree & 63) }
+
+fn wEntryOverlapsMark(e: &WEntry, m: &Mark): bool {
+    if e.all { return true }
+    if e.open {
+        return (len(e.hi) == 0 || e.hi > m.lo) && (len(m.hi) == 0 || e.key < m.hi)
+    }
+    let top = if len(e.hi) > 0 { &e.hi } else { &e.key }
+    return top >= m.lo && (len(m.hi) == 0 || e.key < m.hi)
+}
+
+fn wEntryOverlapsKey(e: &WEntry, key: &str): bool {
+    if e.all { return true }
+    if e.open {
+        return key >= e.key && (len(e.hi) == 0 || key < e.hi)
+    }
+    let top = if len(e.hi) > 0 { &e.hi } else { &e.key }
+    return key >= e.key && key <= top
+}
+
+fn wEntryOverlapsRange(e: &WEntry, lo: &str, hi: &str): bool {
+    if e.all { return true }
+    if e.open {
+        return (len(e.hi) == 0 || e.hi > lo) && (len(hi) == 0 || e.key < hi)
+    }
+    let top = if len(e.hi) > 0 { &e.hi } else { &e.key }
+    return top >= lo && (len(hi) == 0 || e.key < hi)
+}
+
+fn writeOverlapsMark(w: &TxWrite, m: &Mark): bool {
+    if w.tree != m.tree { return false }
+    if w.op == OP_DROP { return true }
+    if w.op == OP_DELRANGE {
+        return (len(w.val) == 0 || w.val > m.lo) && (len(m.hi) == 0 || w.key < m.hi)
+    }
+    if w.op == OP_PUT || w.op == OP_DEL {
+        return w.key >= m.lo && (len(m.hi) == 0 || w.key < m.hi)
+    }
+    return false
+}
+
+fn (r: &WLogRing) at(j: int): &WEntry {
+    let cap = len(r.buf)
+    var idx = r.head + j
+    if idx >= cap { idx -= cap }
+    return &r.buf[idx]
+}
+
+// First logical index j in [0, r.count) with seq > afterSeq.
+fn (r: &WLogRing) firstAfter(afterSeq: int): int {
+    var lo = 0
+    var hi = r.count
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if r.at(mid).seq <= afterSeq { lo = mid + 1 } else { hi = mid }
+    }
+    return lo
+}
+
+fn (r: mut &WLogRing) push(e: WEntry, maxCap: int) {
+    let cap = if maxCap > 0 { maxCap } else { 1 }
+    if len(r.buf) > cap {
+        // WLOG_MAX was lowered (test hook): trim oldest entries into floor.
+        var keep: []WEntry = withCapacity(cap)
+        let dropN = if r.count >= cap { r.count - (cap - 1) } else { 0 }
+        for j in 0..dropN {
+            let s = r.at(j).seq
+            if s > r.floor { r.floor = s }
         }
-        var i = lo
-        while i < len(db.wlog) {
-            let e = &db.wlog[i]
-            if e.tree == m.tree {
-                if e.all { return false }
-                // a range delete: [key, hi), hi "" no end
-                if e.open {
-                    if (len(e.hi) == 0 || e.hi > m.lo) && (len(m.hi) == 0 || e.key < m.hi) { return false }
-                    i += 1
-                    continue
-                }
-                let top = if len(e.hi) > 0 { &e.hi } else { &e.key }
-                if top >= m.lo && (len(m.hi) == 0 || e.key < m.hi) { return false }
-            }
-            i += 1
+        for j in dropN..r.count { append(mut &keep, r.at(j).clone()) }
+        append(mut &keep, e)
+        r.buf = keep
+        r.head = 0
+        r.count = len(r.buf)
+        return
+    }
+    if r.count < len(r.buf) {
+        var idx = r.head + r.count
+        if idx >= len(r.buf) { idx -= len(r.buf) }
+        r.buf[idx] = e
+        r.count += 1
+        return
+    }
+    if len(r.buf) < cap {
+        if r.head == 0 {
+            append(mut &r.buf, e)
+            r.count += 1
+            return
+        }
+        var grown: []WEntry = withCapacity(min(cap, len(r.buf) * 2))
+        for j in 0..r.count { append(mut &grown, r.at(j).clone()) }
+        append(mut &grown, e)
+        r.buf = grown
+        r.head = 0
+        r.count = len(r.buf)
+        return
+    }
+    // Ring full: O(1) overwrite of oldest slot.
+    let oldSeq = r.buf[r.head].seq
+    if oldSeq > r.floor { r.floor = oldSeq }
+    r.buf[r.head] = e
+    r.head += 1
+    if r.head == len(r.buf) { r.head = 0 }
+}
+
+fn (db: mut &Db) pushWLog(tree: int, e: WEntry) {
+    match db.wlogIdx.get(&tree) {
+        Some(idx) { db.wlogs[idx].push(e, WLOG_MAX) }
+        None {
+            let idx = len(db.wlogs)
+            var r = WLogRing{buf: [], head: 0, count: 0, floor: 0}
+            r.push(e, WLOG_MAX)
+            append(mut &db.wlogs, r)
+            db.wlogIdx.put(tree, idx)
         }
     }
-    var last = -1                       // a tree just checked (a large write's rows are of one or a few)
+}
+
+// Strict 1-edge OCC check: whether any read mark in t.reads was modified by a commit
+// after the read, or any written tree was dropped (used for liveStale and non-block autocommits).
+fn (db: &Db) anyReadChanged(t: &Txn): bool {
+    for m in t.reads {
+        match db.wlogIdx.get(&m.tree) {
+            None {}
+            Some(ri) {
+                let r = &db.wlogs[ri]
+                if m.seq < r.floor { return true }
+                var j = r.firstAfter(m.seq)
+                while j < r.count {
+                    if wEntryOverlapsMark(r.at(j), &m) { return true }
+                    j += 1
+                }
+            }
+        }
+    }
+    var last = -1
+    for w in t.writes {
+        if w.op == OP_CREATE || w.tree == last { continue }
+        last = w.tree
+        if !db.trees.has(&w.tree) {
+            var mine = false
+            for c in t.created { if c == w.tree { mine = true } }
+            if !mine { return true }
+        }
+    }
+    return false
+}
+
+// Finds the RW SsiCommit entry for commit sequence `seq` in db.ssi[ssiHead..], or -1.
+fn (db: &Db) findSsiCommit(seq: int): int {
+    var lo = db.ssiHead
+    var hi = len(db.ssi)
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if db.ssi[mid].seq < seq { lo = mid + 1 } else { hi = mid }
+    }
+    var i = lo
+    while i < len(db.ssi) && db.ssi[i].seq == seq {
+        if !db.ssi[i].readOnly { return i }
+        i += 1
+    }
+    return -1
+}
+
+// First index in db.ssi[ssiHead..] with seq > afterSeq.
+fn (db: &Db) firstSsiAfter(afterSeq: int): int {
+    var lo = db.ssiHead
+    var hi = len(db.ssi)
+    while lo < hi {
+        let mid = (lo + hi) / 2
+        if db.ssi[mid].seq <= afterSeq { lo = mid + 1 } else { hi = mid }
+    }
+    return lo
+}
+
+fn appendUniqueInt(xs: mut &[]int, v: int) {
+    for x in xs { if x == v { return } }
+    append(xs, v)
+}
+
+// Effective start sequence of t for SSI concurrency checks.
+// For a snapshot block (snap >= 0), its snapshot seq.
+// For a non-snapshot live/row-locked txn (snap < 0), the minimum seq of its
+// non-catalog data reads (ignoring catalog planning reads on tree 1 so a task
+// that planned before waiting on a row lock is not misclassified as concurrent
+// with the holder that committed before this task read data).
+fn (db: &Db) txnStartSeq(t: &Txn): int {
+    if t.snap >= 0 { return t.snapSeq }
+    var lo = -1
+    for m in t.reads {
+        if m.tree == 1 { continue }
+        if lo < 0 || m.seq < lo { lo = m.seq }
+    }
+    return if lo >= 0 { lo } else { db.seq }
+}
+
+// Cahill-style SSI validation for SERIALIZABLE blocks (t.track == true),
+// falling back to strict 1-edge validation for non-block autocommit transactions
+// (!t.track) and catalog DDL writes (tree == 1).
+// Guarantees 100% true serializability (aborts write skew, 3-txn cycles,
+// read-only anomalies, First-Committer-Wins ww conflicts, and dropped trees)
+// while allowing non-cyclic single rw-antidependency edges to commit cleanly.
+fn (db: &Db) validateAndPlanSSI(t: &Txn, plan: mut &SsiPlan): bool {
+    // 1. Check written trees still exist.
+    var last = -1
     for w in t.writes {
         if w.op == OP_CREATE || w.tree == last { continue }
         last = w.tree
@@ -5259,10 +5468,276 @@ fn (db: &Db) validate(t: &Txn): bool {
             if !mine { return false }
         }
     }
+    // Non-block live/autocommit transactions (t.track == false): strict 1-edge read check
+    // (preserves single-statement retry semantics and store_rowconflict expectations),
+    // while still checking incoming edges from concurrent SSI blocks below.
+    if !t.track {
+        for m in t.reads {
+            match db.wlogIdx.get(&m.tree) {
+                None {}
+                Some(ri) {
+                    let r = &db.wlogs[ri]
+                    if m.seq < r.floor { return false }
+                    var j = r.firstAfter(m.seq)
+                    while j < r.count {
+                        if wEntryOverlapsMark(r.at(j), &m) { return false }
+                        j += 1
+                    }
+                }
+            }
+        }
+    }
+    let startSeq = db.txnStartSeq(t)
+    // 2. First-Committer-Wins (ww check) for snapshot blocks: if a concurrent commit
+    // wrote a key (or range) that this snapshot block also writes (and this block did not
+    // lock-read it live after that commit), abort with 40001.
+    if t.track && t.snap >= 0 && len(t.writes) > 0 {
+        for w in t.writes {
+            if w.op == OP_CREATE || w.tree == 1 { continue }
+            match db.wlogIdx.get(&w.tree) {
+                None {}
+                Some(ri) {
+                    let r = &db.wlogs[ri]
+                    var j = r.firstAfter(t.snapSeq)
+                    while j < r.count {
+                        let e = r.at(j)
+                        var hit = false
+                        if w.op == OP_DROP { hit = true }
+                        else if w.op == OP_DELRANGE { hit = wEntryOverlapsRange(e, &w.key, &w.val) }
+                        else if w.op == OP_PUT || w.op == OP_DEL { hit = wEntryOverlapsKey(e, &w.key) }
+                        if hit {
+                            // If t updated/deleted via live row lock after e.seq, its read mark on w.key
+                            // has seq >= e.seq; otherwise this is a true SI First-Committer-Wins conflict.
+                            var seenLive = false
+                            if w.op == OP_PUT || w.op == OP_DEL {
+                                for m in t.reads {
+                                    if m.tree == w.tree && m.seq >= e.seq && w.key >= m.lo && (len(m.hi) == 0 || w.key < m.hi) {
+                                        seenLive = true
+                                        break
+                                    }
+                                }
+                            }
+                            if !seenLive { return false }
+                        }
+                        j += 1
+                    }
+                }
+            }
+        }
+    }
+    // 3. Outgoing rw-antidependencies (T -rw-> C) for tracked SERIALIZABLE blocks.
+    if t.track {
+        for m in t.reads {
+            match db.wlogIdx.get(&m.tree) {
+                None {}
+                Some(ri) {
+                    let r = &db.wlogs[ri]
+                    if m.seq < r.floor { return false }
+                    var j = r.firstAfter(m.seq)
+                    while j < r.count {
+                        let e = r.at(j)
+                        if wEntryOverlapsMark(e, &m) {
+                            // Dropped tree or catalog DDL write: always conflict.
+                            if e.all || m.tree == 1 { return false }
+                            plan.outConflict = true
+                            if plan.outMinSeq == 0 || e.seq < plan.outMinSeq { plan.outMinSeq = e.seq }
+                            if e.seq <= db.ssiFloor { return false }
+                            let ci = db.findSsiCommit(e.seq)
+                            if ci < 0 { return false }
+                            // Dangerous structure T -rw-> C -rw-> X: abort T.
+                            if db.ssi[ci].outConflict { return false }
+                            appendUniqueInt(mut &plan.markIn, ci)
+                        }
+                        j += 1
+                    }
+                }
+            }
+        }
+    }
+    // 4. Incoming rw-antidependencies (C -rw-> T) from concurrent already-committed txns C.
+    if len(t.writes) > 0 && db.ssiHead < len(db.ssi) {
+        let firstC = db.firstSsiAfter(startSeq)
+        if firstC < len(db.ssi) {
+            var wMask = u64(0)
+            for w in t.writes {
+                if w.op != OP_CREATE { wMask = wMask | treeBit(w.tree) }
+            }
+            // Summarize large write sets (> 64 writes) per tree as [minKey, maxKey] to stay O(trees) not O(writes).
+            let summarize = len(t.writes) > 64
+            var sumTrees: []int = []
+            var sumLo: []int = []
+            var sumHi: []int = []
+            var sumAll: []bool = []
+            if summarize {
+                for wi in 0..len(t.writes) {
+                    let w = &t.writes[wi]
+                    if w.op == OP_CREATE { continue }
+                    var k = 0
+                    while k < len(sumTrees) && sumTrees[k] != w.tree { k += 1 }
+                    if k == len(sumTrees) {
+                        append(mut &sumTrees, w.tree)
+                        append(mut &sumLo, wi)
+                        append(mut &sumHi, wi)
+                        append(mut &sumAll, w.op == OP_DROP || w.op == OP_DELRANGE)
+                    } else if w.op == OP_DROP || w.op == OP_DELRANGE {
+                        sumAll[k] = true
+                    } else if !sumAll[k] {
+                        if t.isSortedTree(w.tree) {
+                            sumHi[k] = wi
+                        } else {
+                            if w.key < t.writes[sumLo[k]].key { sumLo[k] = wi }
+                            if w.key > t.writes[sumHi[k]].key { sumHi[k] = wi }
+                        }
+                    }
+                }
+            }
+            var ci = firstC
+            while ci < len(db.ssi) {
+                let c = &db.ssi[ci]
+                if (c.treeMask & wMask) != u64(0) {
+                    var hit = false
+                    if summarize {
+                        for cm in c.reads {
+                            for k in 0..len(sumTrees) {
+                                if sumTrees[k] != cm.tree { continue }
+                                if sumAll[k] { hit = true; break }
+                                if t.writes[sumHi[k]].key >= cm.lo && (len(cm.hi) == 0 || t.writes[sumLo[k]].key < cm.hi) {
+                                    hit = true
+                                    break
+                                }
+                            }
+                            if hit { break }
+                        }
+                    } else {
+                        for cm in c.reads {
+                            for w in t.writes {
+                                if writeOverlapsMark(&w, &cm) { hit = true; break }
+                            }
+                            if hit { break }
+                        }
+                    }
+                    if hit {
+                        plan.inConflict = true
+                        // Dangerous structure X -rw-> C -rw-> T: abort T.
+                        if c.inConflict { return false }
+                        // Pivot check on T itself (C1 -rw-> T -rw-> C2, incl. 2-txn write skew): abort T.
+                        if plan.outConflict { return false }
+                        appendUniqueInt(mut &plan.markOut, ci)
+                    }
+                }
+                ci += 1
+            }
+        }
+    }
+    // 5. Final pivot check on T.
+    if plan.inConflict && plan.outConflict { return false }
     return true
 }
 
-// Keeps a commit's writes for the checks of transactions still running.
+// Read-only SERIALIZABLE block check (catches Fekete/Cahill read-only anomaly
+// when T1 is read-only and T1 -rw-> T2 -rw-> T3 with T3 committed <= T1.snapSeq).
+fn (db: mut &Db) validateAndRecordReadOnlySSI(t: &Txn): bool {
+    var outConflict = false
+    var outMinSeq = 0
+    var markIn: []int = []
+    for m in t.reads {
+        if m.tree == 1 { continue }
+        match db.wlogIdx.get(&m.tree) {
+            None {}
+            Some(ri) {
+                let r = &db.wlogs[ri]
+                if m.seq < r.floor { return false }
+                var j = r.firstAfter(m.seq)
+                while j < r.count {
+                    let e = r.at(j)
+                    if wEntryOverlapsMark(e, &m) {
+                        if e.seq <= db.ssiFloor { return false }
+                        let ci = db.findSsiCommit(e.seq)
+                        if ci < 0 { return false }
+                        if db.ssi[ci].outConflict && db.ssi[ci].outMinSeq > 0 && db.ssi[ci].outMinSeq <= t.snapSeq {
+                            return false
+                        }
+                        outConflict = true
+                        if outMinSeq == 0 || e.seq < outMinSeq { outMinSeq = e.seq }
+                        appendUniqueInt(mut &markIn, ci)
+                    }
+                    j += 1
+                }
+            }
+        }
+    }
+    for ci in markIn { db.ssi[ci].inConflict = true }
+    // Only record this read-only block in db.ssi if another active snapshot exists that
+    // could later commit a write forming T_ro -rw-> T_writer -rw-> T_earlier.
+    if len(db.snaps) > 1 {
+        var rMask = u64(0)
+        for m in t.reads { rMask = rMask | treeBit(m.tree) }
+        var rs: []Mark = withCapacity(len(t.reads))
+        for m in t.reads { append(mut &rs, m.clone()) }
+        append(mut &db.ssi, SsiCommit{
+            seq: db.seq, startSeq: t.snapSeq, readOnly: true, treeMask: rMask, reads: rs,
+            inConflict: false, outConflict: outConflict, outMinSeq: outMinSeq
+        })
+        db.pruneSsi()
+    }
+    return true
+}
+
+// Applies planned SSI conflict flags and records the newly committed RW transaction.
+fn (db: mut &Db) recordSsiCommit(t: mut &Txn, plan: &SsiPlan, startSeq: int) {
+    for ci in plan.markIn { db.ssi[ci].inConflict = true }
+    for ci in plan.markOut {
+        db.ssi[ci].outConflict = true
+        if db.ssi[ci].outMinSeq == 0 || db.seq < db.ssi[ci].outMinSeq {
+            db.ssi[ci].outMinSeq = db.seq
+        }
+    }
+    var rMask = u64(0)
+    for m in t.reads { rMask = rMask | treeBit(m.tree) }
+    let movedReads = replace(mut &t.reads, [])
+    append(mut &db.ssi, SsiCommit{
+        seq: db.seq, startSeq: startSeq, readOnly: false, treeMask: rMask, reads: movedReads,
+        inConflict: plan.inConflict, outConflict: plan.outConflict, outMinSeq: plan.outMinSeq
+    })
+    db.pruneSsi()
+}
+
+// Drops SsiCommit entries older than the oldest active snapshot (keeping at least
+// SSI_MIN_KEEP entries for in-flight lazy/autocommit transactions, capped at SSI_MAX).
+fn (db: mut &Db) pruneSsi() {
+    var live = len(db.ssi) - db.ssiHead
+    if live <= SSI_MIN_KEEP { return }
+    var minSnap = db.seq
+    for s in db.snaps {
+        if !s.cancelled && s.seq < minSnap { minSnap = s.seq }
+    }
+    // Evict entries that are strictly older than minSnap AND outside the recent SSI_MIN_KEEP tail.
+    let stopBefore = len(db.ssi) - SSI_MIN_KEEP
+    while db.ssiHead < stopBefore && db.ssi[db.ssiHead].seq <= minSnap {
+        db.ssiHead += 1
+    }
+    // Hard cap at SSI_MAX (advancing ssiFloor conservatively if forced).
+    live = len(db.ssi) - db.ssiHead
+    if live > SSI_MAX {
+        let dropTo = len(db.ssi) - SSI_MAX
+        while db.ssiHead < dropTo {
+            let s = db.ssi[db.ssiHead].seq
+            if s > db.ssiFloor { db.ssiFloor = s }
+            db.ssiHead += 1
+        }
+    }
+    // Compact backing slice lazily once dead prefix reaches >= 512 and >= half the slice.
+    if db.ssiHead >= 512 && db.ssiHead * 2 >= len(db.ssi) {
+        var keep: []SsiCommit = withCapacity(len(db.ssi) - db.ssiHead)
+        for i in db.ssiHead..len(db.ssi) {
+            append(mut &keep, replace(mut &db.ssi[i], SsiCommit{seq: 0, startSeq: 0, readOnly: false, treeMask: u64(0), reads: [], inConflict: false, outConflict: false, outMinSeq: 0}))
+        }
+        db.ssi = keep
+        db.ssiHead = 0
+    }
+}
+
+// Keeps a commit's writes per tree for the checks of transactions still running.
 fn (db: mut &Db) logWrites(t: &Txn) {
     // per tree: its writes' count and range (tracked by index into t.writes so
     // an ascending bulk load never clones every key).
@@ -5296,7 +5771,7 @@ fn (db: mut &Db) logWrites(t: &Txn) {
     var anySmall = false
     for k in 0..len(trees) {
         if counts[k] > WLOG_RANGE {
-            append(mut &db.wlog, WEntry{seq: db.seq, tree: trees[k], key: t.writes[loIdx[k]].key.clone(), hi: t.writes[hiIdx[k]].key.clone(), all: false, open: false})
+            db.pushWLog(trees[k], WEntry{seq: db.seq, key: t.writes[loIdx[k]].key.clone(), hi: t.writes[hiIdx[k]].key.clone(), all: false, open: false})
         } else {
             anySmall = true
         }
@@ -5306,18 +5781,11 @@ fn (db: mut &Db) logWrites(t: &Txn) {
             if w.op == OP_PUT || w.op == OP_DEL {
                 var k = 0
                 while trees[k] != w.tree { k += 1 }
-                if counts[k] <= WLOG_RANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: w.key.clone(), hi: "", all: false, open: false}) }
+                if counts[k] <= WLOG_RANGE { db.pushWLog(w.tree, WEntry{seq: db.seq, key: w.key.clone(), hi: "", all: false, open: false}) }
             }
-            else if w.op == OP_DROP { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: "", hi: "", all: true, open: false}) }
-            else if w.op == OP_DELRANGE { append(mut &db.wlog, WEntry{seq: db.seq, tree: w.tree, key: w.key.clone(), hi: w.val.clone(), all: false, open: true}) }
+            else if w.op == OP_DROP { db.pushWLog(w.tree, WEntry{seq: db.seq, key: "", hi: "", all: true, open: false}) }
+            else if w.op == OP_DELRANGE { db.pushWLog(w.tree, WEntry{seq: db.seq, key: w.key.clone(), hi: w.val.clone(), all: false, open: true}) }
         }
-    }
-    if len(db.wlog) > WLOG_MAX {
-        let half = len(db.wlog) / 2
-        db.wlogFloor = db.wlog[half - 1].seq
-        var keep: []WEntry = []
-        for k in half..len(db.wlog) { append(mut &keep, db.wlog[k].clone()) }
-        db.wlog = keep
     }
 }
 
@@ -5328,13 +5796,12 @@ fn (db: mut &Db) logWrites(t: &Txn) {
 pub fn (st: &Store) liveStale(t: &Txn): bool {
     if st.viewOf(t) != View.Live { return false }
     var stale = false
-    st.sh.with(fn(db: mut &Db) { stale = !db.validate(t) })
+    st.sh.with(fn(db: mut &Db) { stale = db.anyReadChanged(t) })
     return stale
 }
 
-// Commits: checks that nothing the transaction read has changed, applies its
-// writes and waits until the log holds them. A transaction that only read
-// is checked too, and waits until what it saw is durable (4.4).
+// Commits: checks serializability (Cahill SSI for SERIALIZABLE blocks),
+// applies its writes and waits until the log holds them.
 pub fn (st: &Store) commit(t0: Txn): Result[Unit, lexdb_base.DbErr] {
     if st.fo.isSome() { return st.repEnd(&t0) }
     var t = t0
@@ -5342,8 +5809,16 @@ pub fn (st: &Store) commit(t0: Txn): Result[Unit, lexdb_base.DbErr] {
     let lid = t.lockId
     let held = replace(mut &t.held, [])
     if id >= 0 && len(t.writes) == 0 {
+        var ok = true
+        if t.track && len(t.reads) > 0 {
+            st.sh.with(fn(db: mut &Db) {
+                ok = db.validateAndRecordReadOnlySSI(&t)
+                if !ok { db.conflicts += 1 }
+            })
+        }
         st.endSnap(id)
         st.locks.release(lid, &held)
+        if !ok { return Err(lexdb_base.conflict()) }
         return Ok(Unit{})
     }
     let r = st.commitLive(mut &t, true)
@@ -5488,11 +5963,15 @@ fn sortWritesRadix(ws: &[]TxWrite, mine: mut &[]int) {
     }
 }
 
+fn ordIdx(order: &[]int, i: int): int { return if len(order) == 0 { i } else { order[i] } }
+
+// Returns [] (empty identity sentinel) when t.writes is already in key order
+// (avoids an 80 MB []int allocation on 10M-row sorted COPY loads).
 fn commitOrder(t: &Txn): []int {
     let ws = &t.writes
-    var ix: []int = withCapacity(len(ws))
-    for i in 0..len(ws) { append(mut &ix, i) }
-    if len(ws) < ORDER_MIN { return ix }
+    if len(ws) < ORDER_MIN { return [] }
+    // Fast check: scan runs first without allocating ix; only allocate if reordering is needed.
+    var allInOrder = true
     var a = 0
     while a < len(ws) {
         if ws[a].op != OP_PUT && ws[a].op != OP_DEL {
@@ -5501,7 +5980,33 @@ fn commitOrder(t: &Txn): []int {
         }
         var b = a
         while b < len(ws) && (ws[b].op == OP_PUT || ws[b].op == OP_DEL) { b += 1 }
-        // already in order, tree by tree and key by key: left as it is
+        var u = a + 1
+        var fastTree = if t.isSortedTree(ws[a].tree) { ws[a].tree } else { -1 }
+        while allInOrder && u < b {
+            let x = &ws[u]
+            let y = &ws[u - 1]
+            if x.tree == fastTree && y.tree == fastTree {
+                u += 1
+                continue
+            }
+            if x.tree < y.tree || (x.tree == y.tree && x.key < y.key) { allInOrder = false }
+            else if x.tree != y.tree { fastTree = if t.isSortedTree(x.tree) { x.tree } else { -1 } }
+            u += 1
+        }
+        if !allInOrder { break }
+        a = b
+    }
+    if allInOrder { return [] }
+    var ix: []int = withCapacity(len(ws))
+    for i in 0..len(ws) { append(mut &ix, i) }
+    a = 0
+    while a < len(ws) {
+        if ws[a].op != OP_PUT && ws[a].op != OP_DEL {
+            a += 1
+            continue
+        }
+        var b = a
+        while b < len(ws) && (ws[b].op == OP_PUT || ws[b].op == OP_DEL) { b += 1 }
         var inOrder = true
         var u = a + 1
         var fastTree = if t.isSortedTree(ws[a].tree) { ws[a].tree } else { -1 }
@@ -5561,13 +6066,19 @@ fn commitOrder(t: &Txn): []int {
 }
 
 // Bottom-up B-tree builder for a contiguous strictly ascending run of OP_PUT
-// writes into an empty tree (CREATE INDEX or fresh COPY): fills leaves to room
-// without per-row descend, lower, prev-key clone, delta tracking, or recost.
+// writes into an empty tree (CREATE INDEX or fresh COPY): builds compressed
+// T_CLEAF (or lazy packed T_FLEAF) leaves directly without per-entry rc str
+// boxes, streams each leaf's WAL records into db.batch, and frees writes[idx]
+// per leaf as it goes so peak RSS stays bounded.
 // Returns the number of writes consumed from `from` (0 if preconditions fail).
 const BULK_LOAD_MIN = 64
+// Emit direct compressed T_CLEAF / lazy packed leaves during applyBulkLoad for
+// large bulk loads (100k+ rows, e.g. COPY 1M-10M), keeping smaller INSERT...SELECT
+// loads on the standard leaf-room / checkpoint-refit path.
+const DIRECT_COL_MIN = 100000
 
 fn (db: mut &Db) applyBulkLoad(tree: int, writes: mut &[]TxWrite, order: &[]int, from: int, knownSorted: bool): int {
-    let total = len(order)
+    let total = len(writes)
     if total - from < BULK_LOAD_MIN { return 0 }
     if tree == 1 || tree == db.watched || isOvf(tree) || db.trees.has(&(tree + OVF)) { return 0 }
     let oldRoot = match db.trees.get(&tree) { Some(r) { r } None { -1 } }
@@ -5576,13 +6087,14 @@ fn (db: mut &Db) applyBulkLoad(tree: int, writes: mut &[]TxWrite, order: &[]int,
     if !db.pool[rf].leaf || db.pool[rf].count() != 0 { return 0 }
     var end = from
     while end < total {
-        let w = &writes[order[end]]
+        let w = &writes[ordIdx(order, end)]
         if w.op != OP_PUT || w.tree != tree { break }
         if marked(&w.val) || lexdb_page.leafEntry(&w.key, &w.val) > lexdb_page.MAX_ENTRY { break }
-        if !knownSorted && end > from && !(w.key > writes[order[end - 1]].key) { break }
+        if !knownSorted && end > from && !(w.key > writes[ordIdx(order, end - 1)].key) { break }
         end += 1
     }
     if end - from < BULK_LOAD_MIN { return 0 }
+    let directPack = (end - from) >= DIRECT_COL_MIN
     let specIdx = if db.colsOn() {
         match db.colSpecs.get(&tree) { Some(i) { i } None { -1 } }
     } else { -1 }
@@ -5590,38 +6102,116 @@ fn (db: mut &Db) applyBulkLoad(tree: int, writes: mut &[]TxWrite, order: &[]int,
     var seps: []str = []
     var k = from
     while k < end {
-        var leaf = lexdb_page.newNode(true)
+        let k0 = k
         var sz = 0
         var cnt = 0
+        var fitRowCnt = 0
+        var fitRowSz = 0
         var room = if specIdx >= 0 && db.specRatio[specIdx] > 0 { roomOf(db.specRatio[specIdx]) } else { lexdb_page.NODE_ROOM }
         while k < end {
-            let idx = order[k]
+            let idx = ordIdx(order, k)
             let e = if cnt == 0 {
                 lexdb_page.frontEntry(&"", &writes[idx].key, &writes[idx].val)
             } else {
-                lexdb_page.frontEntry(leaf.keyView(cnt - 1), &writes[idx].key, &writes[idx].val)
+                lexdb_page.frontEntry(&writes[ordIdx(order, k - 1)].key, &writes[idx].key, &writes[idx].val)
             }
             if cnt > 0 && sz + e > room {
                 if specIdx >= 0 && (db.specRatio[specIdx] == 0 || (db.specSplits[specIdx] >= 64 && sz + e > roomOf(db.specRatio[specIdx]))) {
                     db.specSplits[specIdx] = 0
-                    leaf.size = sz
-                    let ce = lexdb_page.colSize(&leaf, 0, cnt, &db.specs[specIdx])
+                    var sKeys: []&str = withCapacity(cnt)
+                    var sVals: []&str = withCapacity(cnt)
+                    for q in k0..k {
+                        let qi = ordIdx(order, q)
+                        append(mut &sKeys, &writes[qi].key)
+                        append(mut &sVals, &writes[qi].val)
+                    }
+                    let ce = lexdb_rows.colSize(&sKeys, &sVals, 0, cnt, &db.specs[specIdx])
                     db.noteRatio(specIdx, ce, sz)
                     room = roomOf(db.specRatio[specIdx])
                     if ce >= 0 && ce <= lexdb_page.PAGE && sz + e <= CAP_LEAF && sz + e > room { room = sz + e }
                 }
                 if sz + e > room { break }
             }
-            let mk = replace(mut &writes[idx].key, "")
-            let mv = replace(mut &writes[idx].val, "")
-            append(leaf.keys.unshare(), rc(mk))
-            append(mut &leaf.vals, rc(mv))
             sz += e
             cnt += 1
+            if sz <= lexdb_page.NODE_ROOM {
+                fitRowCnt = cnt
+                fitRowSz = sz
+            }
             k += 1
         }
-        let firstKey = leaf.keys[0].toStr()
-        leaf.size = sz
+        var leaf = lexdb_page.newNode(true)
+        if directPack {
+            // Large bulk load: build compressed T_CLEAF directly (or packed lazy T_FLEAF),
+            // eliminating 20M rc str allocations and fitting every leaf in 4 KiB.
+            var madeCol = false
+            if specIdx >= 0 {
+                var tryCnt = cnt
+                while tryCnt > 0 {
+                    var keys: []&str = withCapacity(tryCnt)
+                    var vals: []&str = withCapacity(tryCnt)
+                    for q in k0..k0 + tryCnt {
+                        let qi = ordIdx(order, q)
+                        append(mut &keys, &writes[qi].key)
+                        append(mut &vals, &writes[qi].val)
+                    }
+                    match lexdb_rows.colBodyRange(&keys, &vals, 0, tryCnt, &db.specs[specIdx]) {
+                        Some(b) {
+                            let pb = lexdb_page.colPageBytes(&b, tryCnt)
+                            if pb <= lexdb_page.PAGE {
+                                leaf = lexdb_page.packedLeaf(&b, tryCnt)
+                                leaf.size = pb
+                                db.colLeaves += 1
+                                madeCol = true
+                                cnt = tryCnt
+                                k = k0 + cnt
+                                break
+                            }
+                        }
+                        None {}
+                    }
+                    if tryCnt <= fitRowCnt || tryCnt <= 1 { break }
+                    let nextTry = (tryCnt + fitRowCnt) / 2
+                    tryCnt = if nextTry < tryCnt { nextTry } else { fitRowCnt }
+                }
+            }
+            if !madeCol {
+                if sz > lexdb_page.NODE_ROOM && fitRowCnt > 0 {
+                    cnt = fitRowCnt
+                    sz = fitRowSz
+                    k = k0 + cnt
+                }
+                var keys: []&str = withCapacity(cnt)
+                var vals: []&str = withCapacity(cnt)
+                for q in k0..k {
+                    let qi = ordIdx(order, q)
+                    append(mut &keys, &writes[qi].key)
+                    append(mut &vals, &writes[qi].val)
+                }
+                leaf = lexdb_page.packEntries(&keys, &vals, sz)
+                if specIdx >= 0 { db.rowLeaves += 1 }
+            }
+            // Stream WAL records for this leaf and immediately release writes[qi].key/val strings.
+            for q in k0..k {
+                let qi = ordIdx(order, q)
+                addRecord(mut &db.batch, &writes[qi])
+                db.batchCount += 1
+                let _dk = replace(mut &writes[qi].key, "")
+                let _dv = replace(mut &writes[qi].val, "")
+            }
+        } else {
+            for q in k0..k {
+                let qi = ordIdx(order, q)
+                addRecord(mut &db.batch, &writes[qi])
+                db.batchCount += 1
+                let mk = replace(mut &writes[qi].key, "")
+                let mv = replace(mut &writes[qi].val, "")
+                append(leaf.keys.unshare(), rc(mk))
+                append(mut &leaf.vals, rc(mv))
+            }
+            leaf.size = sz
+        }
+        let firstKey = leaf.key(0)
         if specIdx >= 0 && room > lexdb_page.NODE_ROOM { db.specSplits[specIdx] += 1 }
         let s = db.newNode(leaf)
         append(mut &level, s)
@@ -5711,7 +6301,9 @@ fn (st: &Store) commitLive(t: mut &Txn, durable: bool): Result[Unit, lexdb_base.
             // loadMany's sweep keeps them.
             var seen: []Map[int, int] = []
             var skipTree = -1
-            for i in order {
+            let nWrites = len(t.writes)
+            for oi0 in 0..nWrites {
+                let i = ordIdx(&order, oi0)
                 let w = &t.writes[i]
                 if (w.op == OP_PUT || w.op == OP_DEL) && w.tree == skipTree { continue }
                 let n = db.writeNeeds(w)
@@ -5751,13 +6343,14 @@ fn (st: &Store) commitLive(t: mut &Txn, durable: bool): Result[Unit, lexdb_base.
                 }
             }
             if len(needs) > 0 { return }
-            if !db.validate(&t) {
+            var ssiPlan = SsiPlan{inConflict: false, outConflict: false, outMinSeq: 0, markIn: [], markOut: []}
+            if !db.validateAndPlanSSI(&t, mut &ssiPlan) {
                 db.conflicts += 1
                 append(mut &bad, lexdb_base.conflict())
                 return
             }
             var b = db.appliedBatch
-            if len(t.writes) > 0 {
+            if nWrites > 0 {
                 // A frame's length is 32 bits: a commit that would not fit
                 // one fails, before anything is written (9.127); one that
                 // would not fit the batch waits for the writer to take it.
@@ -5772,19 +6365,20 @@ fn (st: &Store) commitLive(t: mut &Txn, durable: bool): Result[Unit, lexdb_base.
                     append(mut &held, f)
                     return
                 }
+                let startSeq = db.txnStartSeq(&t)
                 db.seq += 1
                 for tr in t.idxTrees { db.treeSeq.put(tr, db.seq) }
                 for c in t.cuts { db.treeSeq.put(c.tree, db.seq) }
-                db.logWrites(t)
-                db.reserveBatch(t)
-                for w in t.writes {
-                    addRecord(mut &db.batch, &w)
-                    db.batchCount += 1
+                if durable {
+                    db.logWrites(t)
+                    db.recordSsiCommit(t, &ssiPlan, startSeq)
                 }
+                db.reserveBatch(t)
                 var oi = 0
-                while oi < len(order) {
-                    let wop = t.writes[order[oi]].op
-                    let wtree = t.writes[order[oi]].tree
+                while oi < nWrites {
+                    let wi = ordIdx(&order, oi)
+                    let wop = t.writes[wi].op
+                    let wtree = t.writes[wi].tree
                     if wop == OP_PUT {
                         let done = db.applyBulkLoad(wtree, mut &t.writes, &order, oi, t.isSortedTree(wtree))
                         if done > 0 {
@@ -5792,9 +6386,14 @@ fn (st: &Store) commitLive(t: mut &Txn, durable: bool): Result[Unit, lexdb_base.
                             continue
                         }
                     }
-                    db.applyWrite(&t.writes[order[oi]])
+                    addRecord(mut &db.batch, &t.writes[wi])
+                    db.batchCount += 1
+                    db.applyWrite(&t.writes[wi])
+                    let _dk = replace(mut &t.writes[wi].key, "")
+                    let _dv = replace(mut &t.writes[wi].val, "")
                     oi += 1
                 }
+                t.writes = []
                 b = db.batchNo
                 db.appliedBatch = b
                 db.commits += 1
@@ -7747,7 +8346,7 @@ fn checkLog(fs: &lexdb_disk.Fs, logFs: &lexdb_disk.Fs, split: bool, create: bool
 // ---- open, recovery, close
 
 fn newDb(fs: lexdb_disk.Fs, logFs: lexdb_disk.Fs, data: lexdb_disk.File, opts: Options, m: &lexdb_page.Meta): Db {
-    return Db{opts: opts, fs: fs, logFs: logFs, data: data, watched: -1, watchedWrites: 0, pool: [], owner: [], meta: [], freeSlots: [], ovfLens: newMap(), loadedCount: 0, cacheUsed: 0, wlog: [], wlogFloor: 0, hand: 0,
+    return Db{opts: opts, fs: fs, logFs: logFs, data: data, watched: -1, watchedWrites: 0, pool: [], owner: [], meta: [], freeSlots: [], ovfLens: newMap(), loadedCount: 0, cacheUsed: 0, wlogIdx: newMap(), wlogs: [], ssi: [], ssiHead: 0, ssiFloor: 0, hand: 0,
               trees: newMap(), lastLeaf: LastLeaf{tree: -1, shape: -1, path: [], lo: [], hasLo: [], hi: [], hasHi: []}, shape: 0, nextTree: m.nextTree, npages: m.npages, fileEnd: 0, reserving: true, free: [], freeAfterNext: [],
               pendingFree: [], dropped: [], frameMax: FRAME_MAX, dropReads: DROP_READS, countHook: [], countMode: 0, countArg: "", countCalls: 0, listPages: [], ckpt: m.ckpt, durableCkpt: m.ckpt, ckptRunning: false,
               batch: [], batchCount: 0, batchNo: m.replayBatch, appliedBatch: m.replayBatch - 1,
