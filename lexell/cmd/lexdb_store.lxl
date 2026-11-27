@@ -360,27 +360,22 @@ type WLogRing = record {
     floor: int                  // highest seq evicted from this tree's ring
 }
 
-// Committed transaction summary kept for Cahill-style SSI dangerous-structure
-// detection (T1 -rw-> T2 -rw-> T3). Pruned automatically once seq <= oldest
-// live snapshot (keeping at least SSI_MIN_KEEP recent commits for lazy/live txns).
+// Committed transaction summary kept for Cahill/Ports-Grittner SSI dangerous-structure
+// detection (T1 -rw-> T2 -rw-> T3 where T3 commits before T2). Immutable once appended;
+// pruned automatically once seq <= oldest live snapshot.
 type SsiCommit = record {
     seq: int                    // commit seq (for RO blocks, db.seq at commit time)
-    startSeq: int               // snapshot seq (or min read seq for autocommit)
+    startSeq: int               // snapshot seq (or min non-catalog read seq for autocommit)
     readOnly: bool
     treeMask: u64               // 64-bit bloom mask of trees in reads
     reads: []Mark
-    inConflict: bool            // some concurrent T_other has T_other -rw-> this
-    outConflict: bool           // this has this -rw-> some concurrent committed T_other
-    outMinSeq: int              // min commit seq among T_other where this -rw-> T_other (0 if none)
+    outConflict: bool           // true iff this txn had this -rw-> T3 for an earlier committed T3
+    outMinSeq: int              // min commit seq of such T3 (0 if none)
 }
 
-// Deferred SSI flag updates planned during validateAndPlanSSI (applied only on commit).
-type SsiPlan = record {
-    inConflict: bool
+type SsiPlan = value record {
     outConflict: bool
     outMinSeq: int
-    markIn: []int
-    markOut: []int
 }
 
 const SSI_MAX = 4096
@@ -5544,9 +5539,8 @@ fn (db: &Db) validateAndPlanSSI(t: &Txn, plan: mut &SsiPlan): bool {
                             if e.seq <= db.ssiFloor { return false }
                             let ci = db.findSsiCommit(e.seq)
                             if ci < 0 { return false }
-                            // Dangerous structure T -rw-> C -rw-> X: abort T.
+                            // Ports & Grittner Theorem 2.1 (Check A): T -rw-> C -rw-> X where X committed before C.
                             if db.ssi[ci].outConflict { return false }
-                            appendUniqueInt(mut &plan.markIn, ci)
                         }
                         j += 1
                     }
@@ -5554,8 +5548,10 @@ fn (db: &Db) validateAndPlanSSI(t: &Txn, plan: mut &SsiPlan): bool {
             }
         }
     }
-    // 4. Incoming rw-antidependencies (C -rw-> T) from concurrent already-committed txns C.
-    if len(t.writes) > 0 && db.ssiHead < len(db.ssi) {
+    // 4. Pivot check (Check C: C -rw-> T -rw-> X where X committed before T).
+    // Only needed when T already has an outgoing rw-edge (plan.outConflict == true):
+    // transactions with no outgoing rw-edge skip the db.ssi scan completely in O(1).
+    if plan.outConflict && len(t.writes) > 0 && db.ssiHead < len(db.ssi) {
         let firstC = db.firstSsiAfter(startSeq)
         if firstC < len(db.ssi) {
             var wMask = u64(0)
@@ -5595,42 +5591,28 @@ fn (db: &Db) validateAndPlanSSI(t: &Txn, plan: mut &SsiPlan): bool {
             while ci < len(db.ssi) {
                 let c = &db.ssi[ci]
                 if (c.treeMask & wMask) != u64(0) {
-                    var hit = false
                     if summarize {
                         for cm in c.reads {
                             for k in 0..len(sumTrees) {
                                 if sumTrees[k] != cm.tree { continue }
-                                if sumAll[k] { hit = true; break }
+                                if sumAll[k] { return false }
                                 if t.writes[sumHi[k]].key >= cm.lo && (len(cm.hi) == 0 || t.writes[sumLo[k]].key < cm.hi) {
-                                    hit = true
-                                    break
+                                    return false
                                 }
                             }
-                            if hit { break }
                         }
                     } else {
                         for cm in c.reads {
                             for w in t.writes {
-                                if writeOverlapsMark(&w, &cm) { hit = true; break }
+                                if writeOverlapsMark(&w, &cm) { return false }
                             }
-                            if hit { break }
                         }
-                    }
-                    if hit {
-                        plan.inConflict = true
-                        // Dangerous structure X -rw-> C -rw-> T: abort T.
-                        if c.inConflict { return false }
-                        // Pivot check on T itself (C1 -rw-> T -rw-> C2, incl. 2-txn write skew): abort T.
-                        if plan.outConflict { return false }
-                        appendUniqueInt(mut &plan.markOut, ci)
                     }
                 }
                 ci += 1
             }
         }
     }
-    // 5. Final pivot check on T.
-    if plan.inConflict && plan.outConflict { return false }
     return true
 }
 
@@ -5639,7 +5621,6 @@ fn (db: &Db) validateAndPlanSSI(t: &Txn, plan: mut &SsiPlan): bool {
 fn (db: mut &Db) validateAndRecordReadOnlySSI(t: &Txn): bool {
     var outConflict = false
     var outMinSeq = 0
-    var markIn: []int = []
     for m in t.reads {
         if m.tree == 1 { continue }
         match db.wlogIdx.get(&m.tree) {
@@ -5659,14 +5640,12 @@ fn (db: mut &Db) validateAndRecordReadOnlySSI(t: &Txn): bool {
                         }
                         outConflict = true
                         if outMinSeq == 0 || e.seq < outMinSeq { outMinSeq = e.seq }
-                        appendUniqueInt(mut &markIn, ci)
                     }
                     j += 1
                 }
             }
         }
     }
-    for ci in markIn { db.ssi[ci].inConflict = true }
     // Only record this read-only block in db.ssi if another active snapshot exists that
     // could later commit a write forming T_ro -rw-> T_writer -rw-> T_earlier.
     if len(db.snaps) > 1 {
@@ -5676,28 +5655,21 @@ fn (db: mut &Db) validateAndRecordReadOnlySSI(t: &Txn): bool {
         for m in t.reads { append(mut &rs, m.clone()) }
         append(mut &db.ssi, SsiCommit{
             seq: db.seq, startSeq: t.snapSeq, readOnly: true, treeMask: rMask, reads: rs,
-            inConflict: false, outConflict: outConflict, outMinSeq: outMinSeq
+            outConflict: outConflict, outMinSeq: outMinSeq
         })
         db.pruneSsi()
     }
     return true
 }
 
-// Applies planned SSI conflict flags and records the newly committed RW transaction.
+// Records the newly committed RW transaction in db.ssi (immutable once appended).
 fn (db: mut &Db) recordSsiCommit(t: mut &Txn, plan: &SsiPlan, startSeq: int) {
-    for ci in plan.markIn { db.ssi[ci].inConflict = true }
-    for ci in plan.markOut {
-        db.ssi[ci].outConflict = true
-        if db.ssi[ci].outMinSeq == 0 || db.seq < db.ssi[ci].outMinSeq {
-            db.ssi[ci].outMinSeq = db.seq
-        }
-    }
     var rMask = u64(0)
     for m in t.reads { rMask = rMask | treeBit(m.tree) }
     let movedReads = replace(mut &t.reads, [])
     append(mut &db.ssi, SsiCommit{
         seq: db.seq, startSeq: startSeq, readOnly: false, treeMask: rMask, reads: movedReads,
-        inConflict: plan.inConflict, outConflict: plan.outConflict, outMinSeq: plan.outMinSeq
+        outConflict: plan.outConflict, outMinSeq: plan.outMinSeq
     })
     db.pruneSsi()
 }
@@ -5730,7 +5702,7 @@ fn (db: mut &Db) pruneSsi() {
     if db.ssiHead >= 512 && db.ssiHead * 2 >= len(db.ssi) {
         var keep: []SsiCommit = withCapacity(len(db.ssi) - db.ssiHead)
         for i in db.ssiHead..len(db.ssi) {
-            append(mut &keep, replace(mut &db.ssi[i], SsiCommit{seq: 0, startSeq: 0, readOnly: false, treeMask: u64(0), reads: [], inConflict: false, outConflict: false, outMinSeq: 0}))
+            append(mut &keep, replace(mut &db.ssi[i], SsiCommit{seq: 0, startSeq: 0, readOnly: false, treeMask: u64(0), reads: [], outConflict: false, outMinSeq: 0}))
         }
         db.ssi = keep
         db.ssiHead = 0
@@ -6107,7 +6079,7 @@ fn (db: mut &Db) applyBulkLoad(tree: int, writes: mut &[]TxWrite, order: &[]int,
         var cnt = 0
         var fitRowCnt = 0
         var fitRowSz = 0
-        var room = if specIdx >= 0 && db.specRatio[specIdx] > 0 { roomOf(db.specRatio[specIdx]) } else { lexdb_page.NODE_ROOM }
+        var room = if !directPack && specIdx >= 0 && db.specRatio[specIdx] > 0 { roomOf(db.specRatio[specIdx]) } else { lexdb_page.NODE_ROOM }
         while k < end {
             let idx = ordIdx(order, k)
             let e = if cnt == 0 {
@@ -6116,7 +6088,7 @@ fn (db: mut &Db) applyBulkLoad(tree: int, writes: mut &[]TxWrite, order: &[]int,
                 lexdb_page.frontEntry(&writes[ordIdx(order, k - 1)].key, &writes[idx].key, &writes[idx].val)
             }
             if cnt > 0 && sz + e > room {
-                if specIdx >= 0 && (db.specRatio[specIdx] == 0 || (db.specSplits[specIdx] >= 64 && sz + e > roomOf(db.specRatio[specIdx]))) {
+                if !directPack && specIdx >= 0 && (db.specRatio[specIdx] == 0 || (db.specSplits[specIdx] >= 64 && sz + e > roomOf(db.specRatio[specIdx]))) {
                     db.specSplits[specIdx] = 0
                     var sKeys: []&str = withCapacity(cnt)
                     var sVals: []&str = withCapacity(cnt)
@@ -6142,56 +6114,17 @@ fn (db: mut &Db) applyBulkLoad(tree: int, writes: mut &[]TxWrite, order: &[]int,
         }
         var leaf = lexdb_page.newNode(true)
         if directPack {
-            // Large bulk load: build compressed T_CLEAF directly (or packed lazy T_FLEAF),
-            // eliminating 20M rc str allocations and fitting every leaf in 4 KiB.
-            var madeCol = false
-            if specIdx >= 0 {
-                var tryCnt = cnt
-                while tryCnt > 0 {
-                    var keys: []&str = withCapacity(tryCnt)
-                    var vals: []&str = withCapacity(tryCnt)
-                    for q in k0..k0 + tryCnt {
-                        let qi = ordIdx(order, q)
-                        append(mut &keys, &writes[qi].key)
-                        append(mut &vals, &writes[qi].val)
-                    }
-                    match lexdb_rows.colBodyRange(&keys, &vals, 0, tryCnt, &db.specs[specIdx]) {
-                        Some(b) {
-                            let pb = lexdb_page.colPageBytes(&b, tryCnt)
-                            if pb <= lexdb_page.PAGE {
-                                leaf = lexdb_page.packedLeaf(&b, tryCnt)
-                                leaf.size = pb
-                                db.colLeaves += 1
-                                madeCol = true
-                                cnt = tryCnt
-                                k = k0 + cnt
-                                break
-                            }
-                        }
-                        None {}
-                    }
-                    if tryCnt <= fitRowCnt || tryCnt <= 1 { break }
-                    let nextTry = (tryCnt + fitRowCnt) / 2
-                    tryCnt = if nextTry < tryCnt { nextTry } else { fitRowCnt }
-                }
+            // Large bulk load: pack directly into a flat lazy T_FLEAF Node (zero rc str boxes,
+            // zero synchronous colBodyRange commit latency; checkpointer upgrades to T_CLEAF
+            // asynchronously) and release writes[qi].key/val per leaf right after WAL append.
+            var keys: []&str = withCapacity(cnt)
+            var vals: []&str = withCapacity(cnt)
+            for q in k0..k {
+                let qi = ordIdx(order, q)
+                append(mut &keys, &writes[qi].key)
+                append(mut &vals, &writes[qi].val)
             }
-            if !madeCol {
-                if sz > lexdb_page.NODE_ROOM && fitRowCnt > 0 {
-                    cnt = fitRowCnt
-                    sz = fitRowSz
-                    k = k0 + cnt
-                }
-                var keys: []&str = withCapacity(cnt)
-                var vals: []&str = withCapacity(cnt)
-                for q in k0..k {
-                    let qi = ordIdx(order, q)
-                    append(mut &keys, &writes[qi].key)
-                    append(mut &vals, &writes[qi].val)
-                }
-                leaf = lexdb_page.packEntries(&keys, &vals, sz)
-                if specIdx >= 0 { db.rowLeaves += 1 }
-            }
-            // Stream WAL records for this leaf and immediately release writes[qi].key/val strings.
+            leaf = lexdb_page.packEntries(&keys, &vals, sz)
             for q in k0..k {
                 let qi = ordIdx(order, q)
                 addRecord(mut &db.batch, &writes[qi])
@@ -6343,7 +6276,7 @@ fn (st: &Store) commitLive(t: mut &Txn, durable: bool): Result[Unit, lexdb_base.
                 }
             }
             if len(needs) > 0 { return }
-            var ssiPlan = SsiPlan{inConflict: false, outConflict: false, outMinSeq: 0, markIn: [], markOut: []}
+            var ssiPlan = SsiPlan{outConflict: false, outMinSeq: 0}
             if !db.validateAndPlanSSI(&t, mut &ssiPlan) {
                 db.conflicts += 1
                 append(mut &bad, lexdb_base.conflict())
