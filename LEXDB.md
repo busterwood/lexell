@@ -20,7 +20,7 @@ LexDB follows the exact same **shared-nothing** architecture as the [Lexell lang
 - **Copy-on-write columnar B+trees.** Tables are stored as B+trees whose leaves pack rows column by column. Pages referenced by the last checkpoint are never overwritten in place, so power loss cannot corrupt a page and there is no doublewrite buffer, no full-page logging, and no undo pass on crash recovery. Commits arriving in the same event-loop turn automatically share one durable flush (`group commit`).
 - **One store for OLTP and analytics.** Point lookups traverse the B+tree straight to a row, while scans, filters, joins, and aggregations read only the columns a query needs and process them in vectorized batches through a cost-based optimizer and adaptive two-level hash aggregation.
 - **Strong consistency without blocking.** Read-write transactions run at `SERIALIZABLE` isolation by default (with opt-in `READ COMMITTED` in the PostgreSQL door). Read-only queries run against clean snapshots: readers never block writers, and writers never block readers.
-- **Scale reads across cores with read replicas.** Just as Lexell services scale across cores with separate worker processes, LexDB scales reads with shared-nothing read-replica processes (`lexdb ./data --replicas 3`). Replicas follow the master's write-ahead log in real time — staying within **0.22 ms median / 0.44 ms p99** under heavy mixed load — and route read-only clients using each protocol's native mechanism (`target_session_attrs`, `ApplicationIntent=ReadOnly`, Oracle read-only service).
+- **Scale reads across cores with read replicas.** Just as Lexell services scale across cores with separate worker processes, LexDB scales reads with shared-nothing read-replica processes (`lexdb ./data --replicas 3`). Replicas follow the master's write-ahead log in real time — staying within **0.14–0.15 ms median / 0.27–0.33 ms p99** under heavy mixed load — and route read-only clients using each protocol's native mechanism (`target_session_attrs`, `ApplicationIntent=ReadOnly`, Oracle read-only service).
 
 ---
 
@@ -133,23 +133,23 @@ On durable transactional writes, LexDB's lock-free `io_uring` event loop with gr
 
 | OLTP workload (1M rows) | LexDB | PostgreSQL 18 | Takeaway |
 |---|---:|---:|---|
-| **Durable updates** (`pgbench`, 1–32 clients) | **3.9k / 17.8k / 63.3k/s** | 1.6k / 6.7k / 25.7k/s | **2.41–2.67× faster**; commit latency **0.42 ms** median / **0.86–0.89 ms** p99 |
-| **Durable updates** (`sysbench`, non-indexed / indexed, 32t) | **58.9k/s** / **28.1k/s** | 23.0k/s / 21.0k/s | **2.56–3.14× faster** non-indexed; **1.34–2.90× faster** indexed |
-| **Point selects** (1 client, `pgbench` / `sysbench`) | **90.4k/s** / **76.9k/s** | 74.5k/s / 65.1k/s | **1.21×** (`pgbench`) / **1.18×** (`sysbench`) faster (`0.01 ms` p95) |
-| **Point selects — 3 read replicas** (32 clients, 4 cores) | **470–490k/s** (`pgbench`) / **430.9k/s** (`sysbench`) | 397k/s / 334.1k/s (4 cores) | **1.18–1.23×** (`pgbench`); **1.29×** (`sysbench`, 42% less CPU) |
-| **Mixed load** (replica selects + master writes, 4 cores) | **368–403k/s** reads + **15.5–16.1k/s** writes | — | Replica lag stays at **0.22–0.23 ms** median, **0.41–0.44 ms** p99 |
+| **Durable updates** (`pgbench`, 1–32 clients) | **4.1k / 18.5k / 68.3k/s** | 1.6k / 6.7k / 25.9k/s | **2.53–2.77× faster**; commit latency **0.41 ms** median / **0.84–0.87 ms** p99 |
+| **Durable updates** (`sysbench`, non-indexed / indexed, 32t) | **57.7k/s** / **28.6k/s** | 23.0k/s / 21.0k/s | **2.51–3.16× faster** non-indexed; **1.36–2.84× faster** indexed |
+| **Point selects** (1 client, `pgbench` / `sysbench`) | **105.6k/s** / **75.1k/s** | 80.9k/s / 65.1k/s | **1.31×** (`pgbench`) / **1.15×** (`sysbench`) faster (`0.01 ms` p95) |
+| **Point selects — 3 read replicas** (32 clients, 4 cores) | **567–588k/s** (`pgbench`) / **431.6k/s** (`sysbench`) | 404k/s / 334.1k/s (4 cores) | **1.40–1.46×** (`pgbench`, half the CPU/op); **1.29×** (`sysbench`, 42% less CPU) |
+| **Mixed load** (replica selects + master writes, 4 cores) | **443–479k/s** reads + **15.1–16.5k/s** writes | — | Replica lag stays at **0.14–0.15 ms** median, **0.27–0.33 ms** p99 |
 
 ### 2. OLAP analytics and bulk loads
 
-With **no materialized views and no explicit skipping indexes**, LexDB's vectorized columnar engine — using pure `par.map` worker threads across the same 4-core budget as PostgreSQL for large scans, hash-join probes, and aggregations while keeping small tables and low-compute scans single-threaded — beats 4-process PostgreSQL across every analytical suite and bulk load:
+With **no materialized views and no explicit skipping indexes**, LexDB's AVX2-vectorized columnar engine — using pure `par.map` worker threads across the same 4-core budget as PostgreSQL for large scans, hash-join probes, and aggregations while keeping small tables and low-compute scans single-threaded — beats 4-process PostgreSQL across every analytical suite and bulk load:
 
 | OLAP & load workload | LexDB | PostgreSQL 18 | Takeaway |
 |---|---:|---:|---|
-| **TPC-H SF1** (22 queries, 4 cores via `par.map`) | **3.25 s** *(4.78 s CPU)* | 8.84 s (4 proc) *(15.03 s 1c CPU)* | **2.72× faster** than 4-process PG overall (`0.51×` geomean, 17/22 faster; `q1` **261 ms** — **3.35×**, `q9` **323 ms** — **2.32×**, `q18` **103 ms** — **28.5×**); **3.14× less total CPU** |
-| **ClickBench 1M** (43 queries, 105 cols, 4 cores via `par.map`) | **4.78 s** *(7.12 s CPU)* | 11.40 s (4 proc) *(23.12 s 1c CPU)* | **2.39× faster** than 4-process PG (**43/43** faster, `0.51×` geomean, no MVs); **3.25× less total CPU** (`0.29×` geomean) |
-| **35 Analytic Queries** (1M rows, 1 core) | **0.39× CPU / 0.78× wall** | 1 core / 4 proc | **2.59× less CPU** than 1-core PG (**35/35** ahead on wall & CPU); **1.28× faster** wall time than 4-process PG |
+| **TPC-H SF1** (22 queries, 4 cores via `par.map`) | **3.33 s** *(4.83 s CPU)* | 8.84 s (4 proc) *(15.03 s 1c CPU)* | **2.66× faster** than 4-process PG overall (`0.52×` geomean, 17/22 faster; `q1` **276 ms** — **3.17×**, `q9` **329 ms** — **2.28×**, `q13` **238 ms** — **3.47×**, `q18` **105 ms** — **27.9×**); **3.11× less total CPU** |
+| **ClickBench 1M** (43 queries, 105 cols, 4 cores via `par.map`) | **4.71 s** *(6.91 s CPU)* | 11.40 s (4 proc) *(23.12 s 1c CPU)* | **2.42× faster** than 4-process PG (**43/43** faster, `0.51×` geomean, no MVs); **3.34× less total CPU** (`0.29×` geomean) |
+| **35 Analytic Queries** (1M rows, 4 cores via `par.map`) | **0.36× CPU / 0.61× wall** | 1 core / 4 proc | **2.80× less total CPU** than 1-core PG (**35/35** ahead of PG1 on wall); **1.64× faster** geomean wall time than 4-process PG (**31/35** level or ahead) |
 | **Selective star-schema joins** (1M fact rows, 6 patterns, 1 core) | **0.54–22.5 ms** | 0.21–77.0 ms (1 core) / 0.24–50.7 ms (4 proc) | **1.24–71.7× faster** via hash-join runtime filters; **7.68×** vs PG1 / **4.46×** vs PG4 (geomean) |
-| **Bulk `\copy` loads** (5 cases, 1M–10M rows) | **0.26–2.61 s** | 0.61–5.93 s | **1.25–2.6× faster** on every workload (`224–2,103 MB` peak RSS) |
+| **Bulk `\copy` loads** (5 cases, 1M–10M rows) | **0.24–2.64 s** | 0.61–5.93 s | **1.29–2.63× faster** on every workload (`224–2,103 MB` peak RSS) |
 
 ### 3. Property graphs (SQL/PGQ)
 
@@ -157,11 +157,11 @@ Measured single-core / single-thread with 100% exact result parity across relati
 
 | Graph benchmark (1 core / 1 thread) | LexDB | PostgreSQL 18 | DuckDB 2.0 + DuckPGQ | Kùzu 0.11 | Neo4j 5.26 CE |
 |---|---:|---:|---:|---:|---:|
-| **Social-graph suite** (11 queries, 100k vertices / 1.1M edges, incl. `ANY SHORTEST`) | **0.50 s** | 5.66 s | 0.96 s | 1.37 s | — |
-| **LDBC LSQB SF0.1** (9 queries, 432k vertices / 2.1M edges) | **0.45 s** | 3.93 s *(8/9, Q9 timeout)* | **0.24 s** *(+PK/FK)* | 3.95 s | 7.60 s |
-| **LDBC LSQB SF1** (9 queries, 4.0M vertices / 22.2M edges) | **7.30 s** | 98.1 s *(8/9, Q9 timeout)* | **4.56 s** *(+PK/FK)* | 105.0 s | 156.0 s |
+| **Social-graph suite** (11 queries, 100k vertices / 1.1M edges, incl. `ANY SHORTEST`) | **0.52 s** | 5.66 s | 0.96 s | 1.37 s | — |
+| **LDBC LSQB SF0.1** (9 queries, 432k vertices / 2.1M edges) | **0.58 s** | 3.93 s *(8/9, Q9 timeout)* | **0.24 s** *(+PK/FK)* | 3.95 s | 7.60 s |
+| **LDBC LSQB SF1** (9 queries, 4.0M vertices / 22.2M edges) | **8.63 s** | 98.1 s *(8/9, Q9 timeout)* | **4.56 s** *(+PK/FK)* | 105.0 s | 156.0 s |
 
-On the **11-query social-graph suite** (local traversals, triangles, and shortest paths), LexDB is the **fastest of all four engines** (`0.50 s` total — **1.92× faster than DuckPGQ**, **2.73× faster than Kùzu**, **11.3× faster than PG1**; `0.45 ms` warm / `0.71 ms` cold 5-hop shortest path, `227 ms` 1M-edge triangles; geomean **7.82×** vs PG1, **3.06×** vs DuckPGQ, **5.86×** vs Kùzu). On **LDBC LSQB** (pure full-graph analytical pattern counting), in-memory DuckDB 2.0 + DuckPGQ (with matching `PRIMARY KEY` / `FOREIGN KEY` constraints) leads overall, while LexDB is **#2 overall and #1 among disk-backed transactional & graph databases** (`7.30 s` at SF1 — within **1.58×** geomean of in-memory DuckPGQ), beating PostgreSQL 18 (**9.03×** geomean on completed queries), Kùzu (**4.40×** geomean, **14.4×** total), and Neo4j Community (**17.4×** geomean, **21.4×** total), and ranking **#1 fastest of all five engines** on both billion-match queries at SF1 (`Q6` `97.8 ms` — **5.81× faster than DuckPGQ**; `Q9` `1,396.9 ms` vs DuckPGQ's `1,408.5 ms`) as well as SF0.1 `Q6` (`10.1 ms` — **1.95× faster than DuckPGQ**). See **[Property graphs in LexDB](lexell/docs/lexdb/property-graphs.md)** for full query-by-query tables and methodology.
+On the **11-query social-graph suite** (local traversals, triangles, and shortest paths), LexDB is the **fastest of all four engines** (`0.52 s` total — **1.87× faster than DuckPGQ**, **2.65× faster than Kùzu**, **11.0× faster than PG1**; `0.46 ms` warm / `0.71 ms` cold 5-hop shortest path, `222 ms` 1M-edge triangles; geomean **7.08×** vs PG1, **2.78×** vs DuckPGQ, **5.32×** vs Kùzu). On **LDBC LSQB** (pure full-graph analytical pattern counting), in-memory DuckDB 2.0 + DuckPGQ (with matching `PRIMARY KEY` / `FOREIGN KEY` constraints) leads overall, while LexDB is **#2 overall and #1 among disk-backed transactional & graph databases** (`8.63 s` at SF1), beating PostgreSQL 18 (**7.41×** geomean on completed queries), Kùzu (**3.66×** geomean, **12.2×** total), and Neo4j Community (**14.5×** geomean, **18.1×** total), and ranking **#1 fastest of all five engines** on `Q6` at both SF1 (`123.1 ms` — **4.62× faster than DuckPGQ+FK**) and SF0.1 (`14.0 ms` — **1.41× faster than DuckPGQ+FK**). See **[Property graphs in LexDB](lexell/docs/lexdb/property-graphs.md)** for full query-by-query tables and methodology.
 
 **Where PostgreSQL is ahead today:** Multi-threaded reads against a single LexDB process (before adding replicas) and multi-statement read-write transaction blocks under high concurrency.
 
@@ -180,10 +180,10 @@ In most databases, materialized views are static snapshots that require expensiv
 
 It also supports **cascading multi-level rollup DAGs** and **composable HyperLogLog++ / t-digest sketches** for incremental approximate distinct counts and percentiles.
 
-| Benchmark (1M rows, single core) | Without MVs | With MVs (unmodified queries) | Live write cost |
+| Benchmark (1M rows, single core / 4 cores) | Without MVs | With MVs (unmodified queries) | Live write cost |
 |---|---:|---:|---|
-| **ClickBench 1M** (43 queries, +8 general MVs) | 4.78 s | 21 of 43 queries transparently rewritten to **0.47–54.9 ms** (geomean `0.10×` PG1 / `0.21×` PG4 at `59797d55`) | 1 / 100 new rows updating all 8 MVs live: **6.51 / 10.34 ms** |
-| **35 Analytic Queries** (+4 general MVs) | geomean `0.48×` PG1 / `0.78×` PG4 | 9 aggregate & join queries drop from 8–74 ms to **3–4 ms** (geomean **`0.31×` PG1 / `0.49×` PG4**) | 1 / 100 / 1,000 new rows updating all 4 MVs live: **4.40 / 7.09 / 25.90 ms** vs PG `REFRESH` **758 / 264 ms** |
+| **ClickBench 1M** (43 queries, +8 general MVs) | 4.71 s | 21 of 43 queries transparently rewritten to **0.47–54.9 ms** (geomean `0.10×` PG1 / `0.21×` PG4 at `59797d55`) | 1 / 100 new rows updating all 8 MVs live: **6.51 / 10.34 ms** |
+| **35 Analytic Queries** (+4 general MVs) | geomean `0.38×` PG1 / `0.61×` PG4 | 9 aggregate & join queries drop to **3–4 ms** (geomean **`0.31×` PG1 / `0.49×` PG4** at `59797d55`) | 1 / 100 / 1,000 new rows updating all 4 MVs live: **4.40 / 7.09 / 25.90 ms** vs PG `REFRESH` **758 / 264 ms** |
 | **Grouped / Sketch / 3-level DAG** | 23.7 ms grouped / 234.4 ms sketch | **0.18 ms** (132×) / **0.56 ms** (419×) / **0.07 ms** | 1-row `FAST` update: **0.43–0.66 ms** vs PG `REFRESH` **60–369 ms** (**90–780× faster**) |
 
 Read the user guide: **[Materialized views and transparent query rewrite](lexell/docs/lexdb/materialized-views.md)**.

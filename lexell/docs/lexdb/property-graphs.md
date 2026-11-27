@@ -154,29 +154,29 @@ To measure property graph performance apples-to-apples against both a relational
 
 | Query | Pattern | LexDB (warm) | LexDB (cold) | PG 18 (1 core) | DuckPGQ (1T) | Kùzu (1T) | LexDB / PG1 | LexDB / DuckPGQ | LexDB / Kùzu |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| **G1** | 1-hop neighborhood + weight sum | **0.27 ms** | 0.98 ms | **0.20 ms** | 1.28 ms | 1.20 ms | 1.35× | **0.21×** | **0.23×** |
-| **G2** | 2-hop distinct friends-of-friends | **0.50 ms** | 1.78 ms | 0.85 ms | 2.87 ms | 55.60 ms | **0.59×** | **0.17×** | **0.009×** |
-| **G3** | 1..3-hop distinct neighborhood (hub) | **34.24 ms** | 55.26 ms | 49.04 ms | 52.95 ms | 189.51 ms | **0.70×** | **0.65×** | **0.18×** |
-| **G4** | 1..4-hop distinct neighborhood | **2.05 ms** | 6.73 ms | 2.69 ms | 50.66 ms | 12.01 ms | **0.76×** | **0.040×** | **0.17×** |
-| **G5** | Full-graph 1M-edge country rollup | 44.11 ms | 92.46 ms | 338.80 ms | **14.95 ms** | 19.80 ms | **0.13×** | 2.95× | 2.23× |
-| **G6** | Co-workers who know each other (Tech) | 26.60 ms | 61.33 ms | 80.00 ms | **10.21 ms** | 49.18 ms | **0.33×** | 2.61× | **0.54×** |
-| **G7** | Filtered 2-hop star (`UK` + `>=2022` + `Tech`) | 16.68 ms | 20.85 ms | 73.03 ms | **6.34 ms** | 85.96 ms | **0.23×** | 2.63× | **0.19×** |
-| **G8** | Directed triangles (subset `id <= 5000`) | **143.65 ms** | 147.89 ms | 957.65 ms | 177.89 ms | 343.94 ms | **0.15×** | **0.81×** | **0.42×** |
-| **G9** | Full-graph 1M-edge directed triangles | **226.55 ms** | 229.61 ms | 1,813.83 ms | 518.85 ms | 521.31 ms | **0.12×** | **0.44×** | **0.43×** |
-| **G10** | Shortest path (5 hops, `42 -> 98955`) | **0.45 ms** | **0.71 ms** | 1,080.53 ms | 61.89 ms | 40.59 ms | **0.0004×** | **0.007×** | **0.011×** |
-| **G11** | Single-source shortest paths (`42 -> 2k` targets) | **5.83 ms** | **24.86 ms** | 1,263.90 ms | 64.31 ms | 48.26 ms | **0.005×** | **0.09×** | **0.12×** |
-| **Sum** | All 11 queries | **500.9 ms** | — | 5,660.5 ms | 962.2 ms | 1,367.4 ms | **11.30× faster** | **1.92× faster** | **2.73× faster** |
-| **Geomean** | Geometric mean across all 11 queries | — | — | **0.13× (7.82× faster)** | **0.33× (3.06× faster)** | **0.17× (5.86× faster)** | | | |
+| **G1** | 1-hop neighborhood + weight sum | **0.27 ms** | 0.98 ms | **0.20 ms** | 1.28 ms | 1.20 ms | 1.38× | **0.21×** | **0.23×** |
+| **G2** | 2-hop distinct friends-of-friends | **0.61 ms** | 1.78 ms | 0.85 ms | 2.87 ms | 55.60 ms | **0.72×** | **0.21×** | **0.011×** |
+| **G3** | 1..3-hop distinct neighborhood (hub) | **37.34 ms** | 55.26 ms | 49.04 ms | 52.95 ms | 189.51 ms | **0.76×** | **0.71×** | **0.20×** |
+| **G4** | 1..4-hop distinct neighborhood | **2.44 ms** | 6.73 ms | 2.69 ms | 50.66 ms | 12.01 ms | **0.91×** | **0.048×** | **0.20×** |
+| **G5** | Full-graph 1M-edge country rollup | 54.20 ms | 92.46 ms | 338.80 ms | **14.95 ms** | 19.80 ms | **0.16×** | 3.62× | 2.74× |
+| **G6** | Co-workers who know each other (Tech) | 26.37 ms | 61.33 ms | 80.00 ms | **10.21 ms** | 49.18 ms | **0.33×** | 2.58× | **0.54×** |
+| **G7** | Filtered 2-hop star (`UK` + `>=2022` + `Tech`) | 24.78 ms | 20.85 ms | 73.03 ms | **6.34 ms** | 85.96 ms | **0.34×** | 3.91× | **0.29×** |
+| **G8** | Directed triangles (subset `id <= 5000`) | **140.86 ms** | 147.89 ms | 957.65 ms | 177.89 ms | 343.94 ms | **0.15×** | **0.79×** | **0.41×** |
+| **G9** | Full-graph 1M-edge directed triangles | **221.77 ms** | 229.61 ms | 1,813.83 ms | 518.85 ms | 521.31 ms | **0.12×** | **0.43×** | **0.43×** |
+| **G10** | Shortest path (5 hops, `42 -> 98955`) | **0.46 ms** | **0.71 ms** | 1,080.53 ms | 61.89 ms | 40.59 ms | **0.0004×** | **0.007×** | **0.011×** |
+| **G11** | Single-source shortest paths (`42 -> 2k` targets) | **5.95 ms** | **24.86 ms** | 1,263.90 ms | 64.31 ms | 48.26 ms | **0.005×** | **0.09×** | **0.12×** |
+| **Sum** | All 11 queries | **515.1 ms** | — | 5,660.5 ms | 962.2 ms | 1,367.4 ms | **10.99× faster** | **1.87× faster** | **2.65× faster** |
+| **Geomean** | Geometric mean across all 11 queries | — | — | **0.14× (7.08× faster)** | **0.36× (2.78× faster)** | **0.19× (5.32× faster)** | | | |
 
 ### Key takeaways
 
-- **Fastest overall on both total time and geometric mean:** On a single core, LexDB completes the full 11-query suite in **500.9 ms total** — **11.30× faster than PostgreSQL 18**, **1.92× faster than DuckDB + DuckPGQ**, and **2.73× faster than Kùzu** (geometric mean **7.82× faster than PostgreSQL**, **3.06× faster than DuckPGQ**, and **5.86× faster than Kùzu**), all through standard SQL:2023 `GRAPH_TABLE` over live transactional tables. LexDB beats PostgreSQL on **10/11**, beats Kùzu on **10/11**, beats DuckPGQ on **8/11**, and is **#1 fastest on 7 of 11 queries**.
+- **Fastest overall on both total time and geometric mean:** On a single core, LexDB completes the full 11-query suite in **515.1 ms total** — **10.99× faster than PostgreSQL 18**, **1.87× faster than DuckDB + DuckPGQ**, and **2.65× faster than Kùzu** (geometric mean **7.08× faster than PostgreSQL**, **2.78× faster than DuckPGQ**, and **5.32× faster than Kùzu**), all through standard SQL:2023 `GRAPH_TABLE` over live transactional tables. LexDB beats PostgreSQL on **10/11**, beats Kùzu on **10/11**, beats DuckPGQ on **8/11**, and is **#1 fastest on 7 of 11 queries**.
 - **Shortest paths (`G10`, `G11`):**
-  - Point-to-point 5-hop shortest path (`G10`) runs in **0.71 ms cold** (index-only bidirectional BFS) and **0.45 ms warm** — **~2,400× faster than PostgreSQL**, **138× faster than DuckPGQ**, and **90× faster than Kùzu**.
-  - Single-source shortest paths to 2,000 targets (`G11`) run in **24.86 ms cold** (including scanning 1M edges to build the CSR — still 2.6× faster than warm DuckPGQ and 1.9× faster than warm Kùzu) and **5.83 ms warm** (**217× faster than PostgreSQL**, **11.0× faster than DuckPGQ**, and **8.3× faster than Kùzu**).
-- **Triangle counting (`G8`, `G9`):** Through pure `GRAPH_TABLE` syntax with L3-resident Bloom pre-filters and cache-line-packed open-addressed hash tables, LexDB is the **fastest engine of all four** on both subset triangles (`G8`: **143.7 ms** vs 177.9 ms DuckPGQ, 343.9 ms Kùzu, 957.7 ms PG) and full-graph 1M-edge directed triangle counting (`G9`: **226.6 ms** vs **518.9 ms** DuckPGQ, **521.3 ms** Kùzu, and **1,813.8 ms** PostgreSQL — **2.29× faster than DuckPGQ/Kùzu** and **8.01× faster than hand-written PostgreSQL**).
-- **Local multi-hop traversals (`G1`–`G4`):** LexDB is the fastest engine on 2-hop, 1..3-hop, and 1..4-hop traversals, running **5–25× faster than DuckPGQ and Kùzu** on localized point-seeded patterns thanks to direct B+tree index lookups.
-- **Where pure OLAP engines remain faster today:** On unfiltered full-graph scan-and-aggregate joins (`G5`–`G7`), DuckDB's pure in-memory columnar scan remains ~2.6–3.0× faster than LexDB's B+tree-backed engine — though LexDB beats PostgreSQL by **3.0–7.7×** on all three and beats Kùzu on both `G6` (`26.6` vs `49.2 ms`) and `G7` (`16.7` vs `86.0 ms`, **5.15× faster**).
+  - Point-to-point 5-hop shortest path (`G10`) runs in **0.71 ms cold** (index-only bidirectional BFS) and **0.46 ms warm** — **~2,350× faster than PostgreSQL**, **135× faster than DuckPGQ**, and **88× faster than Kùzu**.
+  - Single-source shortest paths to 2,000 targets (`G11`) run in **24.86 ms cold** (including scanning 1M edges to build the CSR — still 2.6× faster than warm DuckPGQ and 1.9× faster than warm Kùzu) and **5.95 ms warm** (**212× faster than PostgreSQL**, **10.8× faster than DuckPGQ**, and **8.1× faster than Kùzu**).
+- **Triangle counting (`G8`, `G9`):** Through pure `GRAPH_TABLE` syntax with L3-resident Bloom pre-filters and cache-line-packed open-addressed hash tables, LexDB is the **fastest engine of all four** on both subset triangles (`G8`: **140.9 ms** vs 177.9 ms DuckPGQ, 343.9 ms Kùzu, 957.7 ms PG) and full-graph 1M-edge directed triangle counting (`G9`: **221.8 ms** vs **518.9 ms** DuckPGQ, **521.3 ms** Kùzu, and **1,813.8 ms** PostgreSQL — **2.34× faster than DuckPGQ/Kùzu** and **8.18× faster than hand-written PostgreSQL**).
+- **Local multi-hop traversals (`G1`–`G4`):** LexDB is the fastest engine on 2-hop, 1..3-hop, and 1..4-hop traversals, running **5–21× faster than DuckPGQ and Kùzu** on localized point-seeded patterns thanks to direct B+tree index lookups.
+- **Where pure OLAP engines remain faster today:** On unfiltered full-graph scan-and-aggregate joins (`G5`–`G7`), DuckDB's pure in-memory columnar scan remains ~2.6–3.9× faster than LexDB's B+tree-backed engine — though LexDB beats PostgreSQL by **2.9–6.3×** on all three and beats Kùzu on both `G6` (`26.4` vs `49.2 ms`) and `G7` (`24.8` vs `86.0 ms`, **3.47× faster**).
 
 ---
 
@@ -203,39 +203,39 @@ To test multi-way subgraph pattern matching on an open-source industry benchmark
 
 | Query | Pattern | Matches | LexDB | DuckPGQ 2.0 (+FK) | PG 18 (1c) | Kùzu 0.11.3 | Neo4j 5.26 CE |
 |---|---|---:|---:|---:|---:|---:|---:|
-| **Q1** | 8-hop path (`Country ← City ← Person ← Forum → Post ← Comment → Tag → TagClass`) | 221,636,419 | 866.1 ms | **180.6 ms** | 20,399.4 ms | 32,104.0 ms | 6,710.8 ms |
-| **Q2** | 4-cycle (`Person ↔ Person`, `Comment → Post` creators) | 1,085,627 | 708.0 ms | **201.3 ms** | 900.7 ms | 977.7 ms | 2,175.1 ms |
-| **Q3** | Triangle of friends in the same country (9 tables) | 753,570 | 565.6 ms | **351.4 ms** | 3,218.6 ms | 2,734.2 ms | 15,319.8 ms |
-| **Q4** | Star around `Message` (`Tag`, `Creator`, `Liker`, `Comment`) | 14,836,038 | 539.9 ms | **371.1 ms** | 2,964.7 ms | 442.2 ms | 7,362.0 ms |
-| **Q5** | 3-hop `Tag1 ← Message ← Comment → Tag2` (`Tag1 ≠ Tag2`) | 13,824,510 | 970.1 ms | **351.5 ms** | 3,032.5 ms | 695.7 ms | 7,574.4 ms |
-| **Q6** | 3-hop `Person ↔ Person ↔ Person → Tag` (`p1 ≠ p3`) | 1,668,134,320 | **97.8 ms** | 568.6 ms | 57,191.3 ms | 2,827.2 ms | 40,627.8 ms |
-| **Q7** | Star with two `OPTIONAL MATCH` / `LEFT JOIN` edges | 26,190,133 | 740.0 ms | **478.7 ms** | 5,062.2 ms | 1,189.2 ms | 10,190.1 ms |
-| **Q8** | Q5 + negated edge (`Comment` does not have `Tag1`) | 6,907,213 | 1,410.6 ms | **652.0 ms** | 5,325.7 ms | 2,951.6 ms | 14,308.4 ms |
-| **Q9** | Q6 + negated edge (`p1` does not know `p3`) | 1,596,153,418 | **1,396.9 ms** | 1,408.5 ms | TIMEOUT (>120s) | 61,042.4 ms | 51,776.5 ms |
-| **Total** | All 9 queries | — | 7,295.0 ms | **4,563.7 ms** | 98,095.0 ms *(8/9)* | 104,964.2 ms | 156,044.9 ms |
-| **Geomean** | Relative to LexDB (`<1` faster, `>1` slower than LexDB) | — | **1.00×** | **0.63×** *(1.58× faster)* | **9.03× slower** *(8/9)* | **4.40× slower** | **17.42× slower** |
+| **Q1** | 8-hop path (`Country ← City ← Person ← Forum → Post ← Comment → Tag → TagClass`) | 221,636,419 | 847.1 ms | **180.6 ms** | 20,399.4 ms | 32,104.0 ms | 6,710.8 ms |
+| **Q2** | 4-cycle (`Person ↔ Person`, `Comment → Post` creators) | 1,085,627 | 781.5 ms | **201.3 ms** | 900.7 ms | 977.7 ms | 2,175.1 ms |
+| **Q3** | Triangle of friends in the same country (9 tables) | 753,570 | 624.6 ms | **351.4 ms** | 3,218.6 ms | 2,734.2 ms | 15,319.8 ms |
+| **Q4** | Star around `Message` (`Tag`, `Creator`, `Liker`, `Comment`) | 14,836,038 | 832.0 ms | **371.1 ms** | 2,964.7 ms | 442.2 ms | 7,362.0 ms |
+| **Q5** | 3-hop `Tag1 ← Message ← Comment → Tag2` (`Tag1 ≠ Tag2`) | 13,824,510 | 1,145.9 ms | **351.5 ms** | 3,032.5 ms | 695.7 ms | 7,574.4 ms |
+| **Q6** | 3-hop `Person ↔ Person ↔ Person → Tag` (`p1 ≠ p3`) | 1,668,134,320 | **123.1 ms** | 568.6 ms | 57,191.3 ms | 2,827.2 ms | 40,627.8 ms |
+| **Q7** | Star with two `OPTIONAL MATCH` / `LEFT JOIN` edges | 26,190,133 | 1,181.9 ms | **478.7 ms** | 5,062.2 ms | 1,189.2 ms | 10,190.1 ms |
+| **Q8** | Q5 + negated edge (`Comment` does not have `Tag1`) | 6,907,213 | 1,624.3 ms | **652.0 ms** | 5,325.7 ms | 2,951.6 ms | 14,308.4 ms |
+| **Q9** | Q6 + negated edge (`p1` does not know `p3`) | 1,596,153,418 | 1,470.0 ms | **1,408.5 ms** | TIMEOUT (>120s) | 61,042.4 ms | 51,776.5 ms |
+| **Total** | All 9 queries | — | 8,630.4 ms | **4,563.7 ms** | 98,095.0 ms *(8/9)* | 104,964.2 ms | 156,044.9 ms |
+| **Geomean** | Relative to LexDB (`<1` faster, `>1` slower than LexDB) | — | **1.00×** | **0.52×** *(1.93× faster)* | **7.41× slower** *(8/9)* | **3.66× slower** | **14.50× slower** |
 
 ### Results — SF0.1 (432k vertices / 2.1M edges, median ms, 1 core / 1 thread)
 
 | Query | Matches | LexDB | DuckPGQ 2.0 (+FK) | PG 18 (1c) | Kùzu 0.11.3 | Neo4j 5.26 CE |
 |---|---:|---:|---:|---:|---:|---:|
-| **Q1** | 8,773,828 | 70.9 ms | **16.0 ms** | 1,055.6 ms | 1,301.2 ms | 608.8 ms |
-| **Q2** | 82,990 | 55.5 ms | **13.4 ms** | 62.6 ms | 56.0 ms | 192.5 ms |
-| **Q3** | 30,456 | 17.7 ms | **12.6 ms** | 54.2 ms | 93.6 ms | 235.4 ms |
-| **Q4** | 784,511 | 53.9 ms | 39.7 ms | 263.7 ms | **36.9 ms** | 678.3 ms |
-| **Q5** | 1,079,722 | 62.6 ms | **22.0 ms** | 245.1 ms | 48.6 ms | 614.5 ms |
-| **Q6** | 55,607,896 | **10.1 ms** | 19.7 ms | 1,589.7 ms | 121.3 ms | 1,464.9 ms |
-| **Q7** | 1,628,132 | 52.3 ms | **33.7 ms** | 343.6 ms | 72.6 ms | 926.9 ms |
-| **Q8** | 537,142 | 89.0 ms | **47.8 ms** | 319.5 ms | 198.8 ms | 1,246.7 ms |
-| **Q9** | 51,009,398 | 42.2 ms | **38.0 ms** | TIMEOUT (>60s) | 2,015.9 ms | 1,632.8 ms |
-| **Total** | All 9 queries | 454.2 ms | **242.9 ms** | 3,934.0 ms *(8/9)* | 3,945.0 ms | 7,600.9 ms |
-| **Geomean** | Relative to LexDB | **1.00×** | **0.57×** *(1.76× faster)* | **6.61× slower** *(8/9)* | **3.56× slower** | **15.99× slower** |
+| **Q1** | 8,773,828 | 68.9 ms | **16.0 ms** | 1,055.6 ms | 1,301.2 ms | 608.8 ms |
+| **Q2** | 82,990 | 51.8 ms | **13.4 ms** | 62.6 ms | 56.0 ms | 192.5 ms |
+| **Q3** | 30,456 | 23.8 ms | **12.6 ms** | 54.2 ms | 93.6 ms | 235.4 ms |
+| **Q4** | 784,511 | 83.7 ms | 39.7 ms | 263.7 ms | **36.9 ms** | 678.3 ms |
+| **Q5** | 1,079,722 | 88.4 ms | **22.0 ms** | 245.1 ms | 48.6 ms | 614.5 ms |
+| **Q6** | 55,607,896 | **14.0 ms** | 19.7 ms | 1,589.7 ms | 121.3 ms | 1,464.9 ms |
+| **Q7** | 1,628,132 | 84.2 ms | **33.7 ms** | 343.6 ms | 72.6 ms | 926.9 ms |
+| **Q8** | 537,142 | 112.6 ms | **47.8 ms** | 319.5 ms | 198.8 ms | 1,246.7 ms |
+| **Q9** | 51,009,398 | 48.7 ms | **38.0 ms** | TIMEOUT (>60s) | 2,015.9 ms | 1,632.8 ms |
+| **Total** | All 9 queries | 576.0 ms | **242.9 ms** | 3,934.0 ms *(8/9)* | 3,945.0 ms | 7,600.9 ms |
+| **Geomean** | Relative to LexDB | **1.00×** | **0.45×** *(2.24× faster)* | **5.13× slower** *(8/9)* | **2.80× slower** | **12.50× slower** |
 
 ### Key takeaways (LDBC LSQB)
 
-- **Fastest disk-backed transactional / graph database at both SF0.1 and SF1 (#2 overall behind in-memory DuckDB + DuckPGQ):** At SF1 (22.2M edges), LexDB finishes all 9 queries in **7.30 s** — beating **PostgreSQL 18** (`98.10 s` on 8 queries plus Q9 timeout, **9.03×** geomean), **Kùzu 0.11.3** (`104.96 s`, **14.4×** total / **4.40×** geomean), and **Neo4j 5.26 Community** (`156.04 s`, **21.4×** total / **17.4×** geomean) while serving live durable transactional B+trees.
-- **Billion-match queries without row materialization (`Q6`, `Q9`):** LexDB is **#1 fastest of all five engines on both billion-match queries at SF1**. On SF1 `Q6` (1.67 billion 3-hop paths), flat `FastIntMap` + non-expanding weighted `neqCountOnly` joins count all 1.67B matches in **97.8 ms** (**5.81× faster than DuckPGQ+FK's `568.6 ms`**, **28.9× faster than Kùzu**, **415× faster than Neo4j**, and **585× faster than PostgreSQL 18**; at SF0.1, build-side weight pushdown runs `Q6` in **10.1 ms** — **1.95× faster than DuckPGQ+FK**). On SF1 `Q9` (1.60 billion matches with a negated edge), build-side count-weight pushdown onto the `neqOut` join + compact 16B/slot `FastInt2Set` with L3-resident Bloom pre-filter completes in **1.40 s** (beating in-memory DuckPGQ+FK's `1.41 s`, **43.7× faster than Kùzu**, and **37.1× faster than Neo4j**, while PostgreSQL times out past 120 s).
-- **Where pure OLAP / factorized engines lead:** With matching `PRIMARY KEY` and `FOREIGN KEY` constraints, in-memory **DuckDB 2.0 + DuckPGQ** (`4.56 s` SF1 / `243 ms` SF0.1) is ~1.58–1.76× faster than LexDB in geometric mean thanks to pure columnar in-memory storage and general factorized group joins across multi-way chains (`Q1`–`Q5`, `Q7`–`Q8`). **Kùzu** also remains slightly ahead on pure star `Q4` and `Q5` at SF1, while LexDB leads Kùzu on **7 of 9** SF1 queries including `Q7` (`740 ms` vs `1,189 ms`), long paths (`Q1`: `0.87 s` vs `32.1 s`), cycles (`Q2`, `Q3`), and billion-match anti-joins (`Q9`: `1.40 s` vs `61.0 s`).
+- **Fastest disk-backed transactional / graph database at both SF0.1 and SF1 (#2 overall behind in-memory DuckDB + DuckPGQ):** At SF1 (22.2M edges), LexDB finishes all 9 queries in **8.63 s** — beating **PostgreSQL 18** (`98.10 s` on 8 queries plus Q9 timeout, **7.41×** geomean), **Kùzu 0.11.3** (`104.96 s`, **12.2×** total / **3.66×** geomean), and **Neo4j 5.26 Community** (`156.04 s`, **18.1×** total / **14.5×** geomean) while serving live durable transactional B+trees.
+- **Billion-match queries without row materialization (`Q6`, `Q9`):** LexDB is **#1 fastest of all five engines on `Q6` at both SF1 and SF0.1**. On SF1 `Q6` (1.67 billion 3-hop paths), flat `FastIntMap` + non-expanding weighted `neqCountOnly` joins count all 1.67B matches in **123.1 ms** (**4.62× faster than DuckPGQ+FK's `568.6 ms`**, **23.0× faster than Kùzu**, **330× faster than Neo4j**, and **465× faster than PostgreSQL 18**; at SF0.1, `Q6` runs in **14.0 ms** — **1.41× faster than DuckPGQ+FK**). On SF1 `Q9` (1.60 billion matches with a negated edge), build-side count-weight pushdown onto the `neqOut` join + compact 16B/slot `FastInt2Set` with L3-resident Bloom pre-filter completes in **1.47 s** (within 4% of in-memory DuckPGQ+FK's `1.41 s`, **41.5× faster than Kùzu**, and **35.2× faster than Neo4j**, while PostgreSQL times out past 120 s).
+- **Where pure OLAP / factorized engines lead:** With matching `PRIMARY KEY` and `FOREIGN KEY` constraints, in-memory **DuckDB 2.0 + DuckPGQ** (`4.56 s` SF1 / `243 ms` SF0.1) leads overall thanks to pure columnar in-memory storage and general factorized group joins across multi-way chains (`Q1`–`Q5`, `Q7`–`Q8`). **Kùzu** also remains ahead on pure star `Q4` and `Q5` at SF1, while LexDB leads Kùzu on **7 of 9** SF1 queries including `Q7` (`1,182 ms` vs `1,189 ms`), long paths (`Q1`: `0.85 s` vs `32.1 s`), cycles (`Q2`, `Q3`), and billion-match anti-joins (`Q9`: `1.47 s` vs `61.0 s`).
 
 ---
 

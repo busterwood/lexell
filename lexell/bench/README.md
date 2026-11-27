@@ -170,21 +170,17 @@ repeated to 10 MB, the `tests/markdown.py --perf` input) and `decimal`
 table is also available as JSON (`--json`, `--json-out`) and TSV (`--tsv`) for
 regression tracking.
 
-One baseline, `-n 3`, core 4, hash seed 42, 59 s end to end:
+One baseline, `-n 3`, core 4, hash seed 42, 47.3 s end to end (`feat/simd-vector` at `ab29758c`):
 
 | application | native -O | C | native/C | native Minstr | C Minstr | instr native/C | native Mcyc | C Mcyc | cyc native/C |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| regex | 87 ms | 64 ms | 1.36 | 1215.9 | 961.1 | 1.27 | 319.9 | 217.0 | 1.47 |
-| json | 629 ms | 643 ms | 0.98 | 4418.6 | 3858.5 | 1.15 | 2183.8 | 2205.6 | 0.99 |
-| jq | 461 ms | 493 ms | 0.93 | 4288.6 | 3783.9 | 1.13 | 1620.3 | 1760.1 | 0.92 |
-| cmark | 214 ms | 187 ms | 1.14 | 1489.6 | 1169.4 | 1.27 | 645.7 | 559.2 | 1.15 |
-| decimal | 3158 ms | 2830 ms | 1.12 | 56393.8 | 44082.3 | 1.28 | 13287.9 | 11773.7 | 1.13 |
+| regex | 49 ms | 48 ms | 1.01 | 522.6 | 494.2 | 1.06 | 128.9 | 118.5 | 1.09 |
+| json | 213 ms | 275 ms | 0.78 | 2757.9 | 2771.1 | 1.00 | 878.0 | 998.9 | 0.88 |
+| jq | 161 ms | 213 ms | 0.76 | 2423.3 | 2319.4 | 1.04 | 624.2 | 715.0 | 0.87 |
+| cmark | 101 ms | 102 ms | 0.98 | 1092.5 | 928.3 | 1.18 | 341.6 | 333.2 | 1.03 |
+| decimal | 2464 ms | 2503 ms | 0.98 | 41135.4 | 31569.5 | 1.30 | 8334.2 | 8551.4 | 0.97 |
 
-`regex` still pays for the native backend's per-match work; `json` and `jq`
-are level on wall time, `cmark` within 1.14, all with more instructions
-natively (the C build's libc does more per call); `decimal` is about 1.1 times
-C. The suite also sets `LXL_HASH_SEED` (42 by default, `--random-hash` to opt
-out), so map-using programs hash identically in both builds.
+Native `-O` is level with or ahead of the C backend on all five applications: `json` (0.78×) and `jq` (0.76×) lead by 22–24% on wall time, `cmark` and `decimal` edge ahead at 0.98×, and `regex` is level at 1.01×. The suite also sets `LXL_HASH_SEED` (42 by default, `--random-hash` to opt out), so map-using programs hash identically in both builds.
 
 `regex/` is the regex library's benchmark (design/regex.md section 4):
 `python3 lexell/bench/regex/bench.py` times eight patterns over a generated

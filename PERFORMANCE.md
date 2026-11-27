@@ -1,6 +1,6 @@
 # Lexell performance
 
-Measured on 27 November 2026 on `main` at `4565eaaf`.
+Measured on 27 November 2026 on `feat/simd-vector` at `ab29758c`.
 Every number compares Lexell only with external tools.
 Lexell's own C backend and earlier builds are not compared.
 For LexDB database benchmarks against PostgreSQL 18, see [LEXDB.md](LEXDB.md) and the dedicated [LexDB performance report](lexell/docs/lexdb/performance.md).
@@ -8,7 +8,7 @@ For LexDB database benchmarks against PostgreSQL 18, see [LEXDB.md](LEXDB.md) an
 Host: AMD Ryzen 7 8745HS (8 cores, 16 threads), 46 GB RAM, Linux 7.2 (Arch).
 Versions: rustc and cargo 1.99.1, Go 1.27.3, Node.js 26.13.1, Java 21.0.13, .NET SDK 10.0.113, Python 3.14.8,
 cmark 0.31.2, jq 1.7.1 (built from its tarball with `-O2`) and jq 1.8.2 from the system,
-GNU grep, sort and tail, and eza 0.23.5 from the system.
+GNU grep, sort and tail, ripgrep, and eza 0.23.5 from the system.
 
 Method: wall times are best of N; instruction counts are user-mode
 `perf stat` instructions, the stable figure. Benchmark processes are pinned
@@ -19,16 +19,16 @@ Method: wall times are best of N; instruction counts are user-mode
 
 | Area | Against | Result |
 |---|---|---|
-| Compile time | Rust | Much faster: about 4.1 times for hello world, about 26 times for nine programs |
-| Microbenchmarks | Rust, Java, Go | Faster than Rust on twelve of nineteen, level on two; faster than warmed-up Java on eleven of twenty, level on one; task switching about 1.8 times Go's speed; 2–31 MB on nineteen of twenty against the JVM's 50 MB–2.14 GB |
-| Regex | Go, Rust | Faster than Go on all; slower than Rust on six of seven, 3.8 times faster on `(?m)^ERROR .*timeout$` |
-| JSON | Python, jq | 2.9 times faster than Python to parse and 1.5 times faster to write, slower to query; 1.8 to 3.1 times faster than jq 1.7.1 on every filter |
-| Markdown | cmark | Faster on repository Markdown and the spec examples, slightly slower on the spec text |
+| Compile time | Rust | Much faster: about 3.0 times for hello world, about 18 times for nine programs |
+| Microbenchmarks | Rust, Java, Go | Faster than Rust on fourteen of nineteen, level on one (`array` 3.8×, `matmul` 2.5×, `maps` 2.3×, `bitpack` 2.0× via explicit `vector[T]` SIMD); faster than warmed-up Java on ten of twenty, level on one; task switching about 1.8 times Go's speed; 2–31 MB on nineteen of twenty against the JVM's 51 MB–2.37 GB |
+| Regex | Go, Rust | Faster than Go on all; slower than Rust on six of seven, 4.1 times faster on `(?m)^ERROR .*timeout$` |
+| JSON | Python, jq | 3.3 times faster than Python to parse and 1.6–1.7 times faster to write, slower to query; 2.0 to 3.5 times faster than jq 1.7.1 on every filter |
+| Markdown | cmark | Faster on the spec examples, level on repository Markdown, slightly slower on the spec text |
 | Decimal | Java, .NET | Faster than .NET on every operation (1.3 to 5.8 times); faster than Java on nine of ten (only slower on 19-digit cmp) |
-| HTTP/1.1 server | Go net/http, Node.js | Faster at 1, 10 and 100 clients: 1.7 to 2.1 times Go's requests a second, 1.2 to 1.3 times Node's |
-| HTTP/2 server | Go net/http, Node.js | Faster than Go on all `h2c` and TLS cases (1.5 to 5.4 times); faster than Node.js on all `h2c` cases (1.2 to 2.4 times) and multi-connection TLS (2.2 times, 181k req/s on one core), slightly behind Node.js on single-connection TLS at 100 streams (0.90 times, with 2.4 times lower p99) |
-| LexDB | PostgreSQL 18 | Moved to its own pages: see [LEXDB.md](LEXDB.md) for the high-level summary and [lexell/docs/lexdb/performance.md](lexell/docs/lexdb/performance.md) for full TPC-H, ClickBench, analytic, OLTP, materialized view, and bulk load tables |
-| Command-line tools | GNU grep, sort, tail, eza | 2.6 times faster on `grep -c`, faster on `grep -o -w` and eza, slower on sort, level on tail |
+| HTTP/1.1 server | Go net/http, Node.js | Faster at 1, 10 and 100 clients: 1.5 to 1.6 times Go's requests a second, 1.3 to 1.4 times Node's (up to 193k req/s on one core, 5× lower p99 than Go at 100 clients) |
+| HTTP/2 server | Go net/http, Node.js | Faster than both Go and Node.js on every `h2c` and TLS case: 1.6 to 5.1 times Go and 1.1 to 2.5 times Node.js (up to 275k req/s `h2c` and 228k req/s TLS 1.3 on one core at 7–12 MB RSS) |
+| LexDB | PostgreSQL 18 | Moved to its own pages: see [LEXDB.md](LEXDB.md) for the high-level summary and [lexell/docs/lexdb/performance.md](lexell/docs/lexdb/performance.md) for full TPC-H, ClickBench, analytic, OLTP, materialized view, property graph, and bulk load tables |
+| Command-line tools | GNU grep, sort, tail, rg, eza | 1.9 times faster than GNU grep (and ahead of ripgrep with half the instructions) on `grep -c`, 1.4 times faster on `grep -o -w`, 1.6–3.5 times faster on `eza`, level on `tail`, slower on multi-threaded GNU `sort` |
 
 ## Compile time
 
@@ -39,12 +39,12 @@ step fails on a broken system symlink.
 
 | case | Lexell | Rust |
 |---|---:|---:|
-| hello world, compile | 14.4 ms | 58.9 ms |
+| hello world, compile | 19.0 ms | 57.6 ms |
 | hello world, binary | 22 KB | 330 KB |
-| nine benchmark programs, clean compile | 139.5 ms | 3,580 ms |
+| nine benchmark programs, clean compile | 187.1 ms | 3,360 ms |
 | nine benchmark programs, binaries | 219 KB | 517 KB |
 
-The compiler's own self-build takes 585 ms (no external reference).
+The compiler's own self-build takes 682 ms (no external reference; compiler binary 3.55 MB).
 
 ## Microbenchmarks
 
@@ -64,39 +64,40 @@ over arrays of rows), `pingpong` (two tasks handing a counter back and forth 2,0
 order-32 B-tree inserts, splits, lookups and range scans), `hashagg` (open-addressing columnar
 hash aggregation with COUNT/SUM/MIN/MAX), `varint_csv` (delimited text parsing and LEB128 varint
 encoding) and `enum_eval` (boxed closed-type SQL expression AST evaluation over columnar batches).
-`pingpong` has no Rust port (Rust's lightweight tasks are an async runtime crate, and the ports
-use none); its Go port uses goroutines and channels, its Java port virtual threads and a
-`SynchronousQueue`. The `maps` ports use std `HashMap` (Rust, with its default SipHash) and
-`java.util.HashMap`, whose layouts differ from Lexell's `Map` (insertion-ordered, with u32 index
-slots), so for `maps` the comparison is of the same operations and keys, not the same data
-structure. Every port prints the same checksum.
+`array`, `matmul`, `bitpack`, and `collections.Map` (used by `maps`) use Lexell's built-in explicit
+`vector[T]` AVX2 SIMD operations. `pingpong` has no Rust port (Rust's lightweight tasks are an async
+runtime crate, and the ports use none); its Go port uses goroutines and channels, its Java port
+virtual threads and a `SynchronousQueue`. The `maps` ports use std `HashMap` (Rust, with its default
+SipHash) and `java.util.HashMap`, whose layouts differ from Lexell's `Map` (insertion-ordered, with
+u32 index slots and 8-wide SIMD probing), so for `maps` the comparison is of the same operations and
+keys, not the same data structure. Every port prints the same checksum.
 
 | program | Lexell | Rust | Lexell / Rust | Java (warm) | Lexell / Java |
 |---|---:|---:|---:|---:|---:|
-| fib | 584 ms | 960 ms | 0.61 | 652 ms | 0.90 |
-| loop | 430 ms | 431 ms | 1.00 | 486 ms | 0.89 |
-| array | 265 ms | 356 ms | 0.74 | 287 ms | 0.92 |
-| sieve | 308 ms | 466 ms | 0.66 | 543 ms | 0.57 |
-| alloc | 35 ms | 376 ms | 0.09 | 29 ms | 1.19 |
-| strings | 78 ms | 281 ms | 0.28 | 46 ms | 1.69 |
-| lists | 88 ms | 513 ms | 0.17 | 60 ms | 1.47 |
-| trees | 63 ms | 343 ms | 0.18 | 43 ms | 1.46 |
-| tokens | 105 ms | 96 ms | 1.09 | 176 ms | 0.60 |
-| maps | 329 ms | 664 ms | 0.50 | 266 ms | 1.24 |
-| nbody | 255 ms | 168 ms | 1.52 | 256 ms | 1.00 |
-| interp | 163 ms | 223 ms | 0.73 | 345 ms | 0.47 |
-| closures | 109 ms | 64 ms | 1.72 | 171 ms | 0.64 |
-| matmul | 92 ms | 146 ms | 0.63 | 31 ms | 2.96 |
-| pingpong | 203 ms | - | - | 1,574 ms | 0.13 |
-| bitpack | 413 ms | 353 ms | 1.17 | 642 ms | 0.64 |
-| btree | 106 ms | 107 ms | 0.99 | 102 ms | 1.04 |
-| hashagg | 158 ms | 134 ms | 1.18 | 128 ms | 1.24 |
-| varint_csv | 78 ms | 81 ms | 0.96 | 108 ms | 0.72 |
-| enum_eval | 121 ms | 137 ms | 0.88 | 125 ms | 0.97 |
+| fib | 546 ms | 899 ms | 0.61 | 618 ms | 0.88 |
+| loop | 407 ms | 407 ms | 1.00 | 516 ms | 0.79 |
+| array | 90 ms | 340 ms | 0.27 | 273 ms | 0.33 |
+| sieve | 252 ms | 439 ms | 0.57 | 510 ms | 0.49 |
+| alloc | 33 ms | 350 ms | 0.09 | 27 ms | 1.22 |
+| strings | 74 ms | 268 ms | 0.28 | 45 ms | 1.65 |
+| lists | 83 ms | 484 ms | 0.17 | 58 ms | 1.43 |
+| trees | 60 ms | 326 ms | 0.18 | 40 ms | 1.50 |
+| tokens | 109 ms | 101 ms | 1.09 | 186 ms | 0.59 |
+| maps | 281 ms | 640 ms | 0.44 | 265 ms | 1.06 |
+| nbody | 241 ms | 160 ms | 1.51 | 241 ms | 1.00 |
+| interp | 148 ms | 213 ms | 0.69 | 331 ms | 0.45 |
+| closures | 106 ms | 63 ms | 1.69 | 164 ms | 0.65 |
+| matmul | 55 ms | 140 ms | 0.39 | 31 ms | 1.77 |
+| pingpong | 194 ms | - | - | 2,564 ms | 0.08 |
+| bitpack | 163 ms | 334 ms | 0.49 | 568 ms | 0.29 |
+| btree | 100 ms | 102 ms | 0.98 | 96 ms | 1.04 |
+| hashagg | 147 ms | 125 ms | 1.18 | 122 ms | 1.21 |
+| varint_csv | 75 ms | 78 ms | 0.96 | 103 ms | 0.73 |
+| enum_eval | 120 ms | 130 ms | 0.92 | 108 ms | 1.11 |
 
-Go runs `pingpong` in 367 ms (Lexell / Go 0.55), with its default threads or with one.
+Go runs `pingpong` in 349 ms (Lexell / Go 0.56), with its default threads or with one.
 
-`alloc` runs about 35 ms: its records never escape, so neither Lexell nor the JVM
+`alloc` runs about 33 ms: its records never escape, so neither Lexell nor the JVM
 allocates them (`lexell/design/opt-experiments.md`, section 18), while Rust's `Box` does.
 
 Peak resident memory of the same runs (the Java figure is the JVM's over its warm-up and timed
@@ -104,26 +105,26 @@ runs, with its default heap, which may grow to a quarter of RAM):
 
 | program | Lexell | Rust | Java |
 |---|---:|---:|---:|
-| fib | 2.0 MB | 2.3 MB | 51 MB |
-| loop | 2.0 MB | 2.3 MB | 51 MB |
-| array | 9.7 MB | 10.1 MB | 206 MB |
-| sieve | 12.0 MB | 11.9 MB | 327 MB |
-| alloc | 2.0 MB | 2.1 MB | 67 MB |
-| strings | 2.0 MB | 2.8 MB | 648 MB |
-| lists | 2.2 MB | 2.7 MB | 537 MB |
-| trees | 6.0 MB | 7.2 MB | 1,404 MB |
-| tokens | 3.8 MB | 3.4 MB | 549 MB |
-| maps | 180 MB | 208 MB | 2,135 MB |
-| nbody | 2.0 MB | 2.2 MB | 50 MB |
-| interp | 2.0 MB | 2.3 MB | 54 MB |
-| closures | 13.0 MB | 22.3 MB | 155 MB |
-| matmul | 4.0 MB | 5.7 MB | 92 MB |
-| pingpong | 2.0 MB | - | 542 MB |
-| bitpack | 31.2 MB | 28.3 MB | 245 MB |
-| btree | 4.0 MB | 5.1 MB | 91 MB |
-| hashagg | 27.8 MB | 26.2 MB | 233 MB |
-| varint_csv | 5.2 MB | 5.2 MB | 399 MB |
-| enum_eval | 18.0 MB | 17.5 MB | 134 MB |
+| fib | 2.0 MB | 2.3 MB | 51.1 MB |
+| loop | 2.0 MB | 2.3 MB | 50.6 MB |
+| array | 9.6 MB | 9.9 MB | 205.5 MB |
+| sieve | 12.0 MB | 11.8 MB | 325.0 MB |
+| alloc | 2.0 MB | 2.3 MB | 68.9 MB |
+| strings | 2.0 MB | 2.7 MB | 661.2 MB |
+| lists | 2.2 MB | 2.5 MB | 747.1 MB |
+| trees | 6.0 MB | 7.2 MB | 1,363.4 MB |
+| tokens | 3.8 MB | 3.5 MB | 547.5 MB |
+| maps | 162.8 MB | 207.8 MB | 2,368.0 MB |
+| nbody | 2.0 MB | 2.3 MB | 52.5 MB |
+| interp | 2.0 MB | 2.4 MB | 53.9 MB |
+| closures | 12.9 MB | 21.5 MB | 161.3 MB |
+| matmul | 4.0 MB | 5.6 MB | 92.5 MB |
+| pingpong | 2.0 MB | - | 547.8 MB |
+| bitpack | 31.2 MB | 28.3 MB | 245.8 MB |
+| btree | 4.0 MB | 5.2 MB | 90.1 MB |
+| hashagg | 27.8 MB | 26.2 MB | 232.4 MB |
+| varint_csv | 5.0 MB | 5.2 MB | 376.4 MB |
+| enum_eval | 18.0 MB | 17.4 MB | 134.3 MB |
 
 Java's speed here does not depend on that memory. With its heap capped at 64 MB (`-Xmx64m`),
 `lists`, `strings` and `trees` run in 60, 46 and 42 ms at a peak of 86 to 105 MB; at 16 MB they
@@ -134,19 +135,23 @@ nothing to free, whereas Lexell frees each node when its owner is dropped. Lexel
 larger: an `Option` of a box is a pointer, so its `lists` and `trees` nodes are 16 and 24 bytes
 with their headers, against Java's 24.
 
-On `matmul` (92 ms), Lexell is 1.59× faster than Rust (146 ms), while Java's C2 JIT auto-vectorises
-the inner loop (31 ms). On `nbody` (255 ms), Lexell matches Java (256 ms) and is behind Rust
-(168 ms), where LLVM unrolls and vectorises the pairwise force loop. Rust's `sort_by` leads on
-`closures` (64 vs 109 ms), while Lexell is 1.57× faster than Java's `List.sort` (171 ms). `interp` (163 ms)
-is 27% ahead of Rust (223 ms) and more than twice Java's speed (345 ms). In `pingpong`, a round
-trip of two task hand-overs takes 102 ns in Lexell, against 184 ns over Go channels and 787 ns for
-Java virtual threads. `tokens` uses `&str` views of the source in all three languages (105 ms vs
-Rust's 96 ms and Java's 176 ms).
+With explicit `vector[T]` AVX2 kernels, `array` runs in 90 ms (3.8× faster than Rust's 340 ms and
+3.0× faster than Java's 273 ms), `matmul` runs in 55 ms (2.5× faster than Rust's 140 ms, while
+Java's C2 JIT reaches 31 ms), and `bitpack` runs in 163 ms (2.0× faster than Rust's 334 ms and
+3.5× faster than Java's 568 ms). Vectorized `collections.Map` probing brings `maps` to 281 ms (2.3×
+faster than Rust's 640 ms and within 6% of Java's 265 ms at 163 MB vs 2.37 GB RSS). On `nbody`
+(241 ms), Lexell matches Java (241 ms) and is behind Rust (160 ms), where LLVM unrolls and
+vectorises the pairwise force loop. Rust's `sort_by` leads on `closures` (63 vs 106 ms), while
+Lexell is 1.55× faster than Java's `List.sort` (164 ms). `interp` (148 ms) is 1.44× faster than Rust
+(213 ms) and 2.24× faster than Java (331 ms). In `pingpong`, a round trip of two task hand-overs
+takes 97 ns in Lexell, against 175 ns over Go channels and 1,282 ns for Java virtual threads.
+`tokens` uses `&str` views of the source in all three languages (109 ms vs Rust's 101 ms and Java's
+186 ms).
 
-On the five database-kernel benchmarks, Lexell leads both Rust and Java on `varint_csv` (78 vs 81
-and 108 ms) and `enum_eval` (121 vs 137 and 125 ms), leads Java on `bitpack` (413 vs 642 ms),
-matches Rust on `btree` (106 vs 107 ms; Java 102 ms), and trails Rust and Java on `hashagg` (158 vs
-134 and 128 ms).
+On the five database-kernel benchmarks, Lexell leads both Rust and Java on `bitpack` (163 vs 334
+and 568 ms) and `varint_csv` (75 vs 78 and 103 ms), leads Rust on `btree` (100 vs 102 ms; Java
+96 ms) and `enum_eval` (120 vs 130 ms; Java 108 ms), and trails Rust and Java on `hashagg` (147 vs
+125 and 122 ms).
 
 ## Applications
 
@@ -171,17 +176,17 @@ with the same target flags as the other Rust ports (`opt-level = 3`,
 
 | pattern | Lexell | Go regexp | Rust regex | Lexell / Go | Lexell / Rust |
 |---|---:|---:|---:|---:|---:|
-| literal `Sherlock Holmes` | 0.09 ms | 0.43 ms | 0.08 ms | 0.21 | 1.13 |
-| alternation `Sherlock\|Holmes\|Watson\|Irene` | 0.58 ms | 140.2 ms | 0.43 ms | 0.004 | 1.35 |
-| `\w+` | 20.3 ms | 132.3 ms | 17.2 ms | 0.15 | 1.18 |
-| `(?i)sherlock` | 0.56 ms | 74.2 ms | 0.45 ms | 0.008 | 1.24 |
-| email | 0.10 ms | 81.1 ms | 0.09 ms | 0.001 | 1.11 |
-| `(?m)^ERROR .*timeout$` | 0.16 ms | 32.5 ms | 0.60 ms | 0.005 | 0.27 |
-| dates `(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})` | 2.23 ms | 74.9 ms | 1.27 ms | 0.030 | 1.76 |
-| `(a*)*b` on 100 KB | below timer resolution | 3.32 ms | below timer resolution | | |
+| literal `Sherlock Holmes` | 0.09 ms | 0.41 ms | 0.07 ms | 0.22 | 1.29 |
+| alternation `Sherlock\|Holmes\|Watson\|Irene` | 0.55 ms | 132.1 ms | 0.40 ms | 0.004 | 1.38 |
+| `\w+` | 18.8 ms | 118.5 ms | 15.7 ms | 0.16 | 1.20 |
+| `(?i)sherlock` | 0.52 ms | 69.6 ms | 0.43 ms | 0.007 | 1.21 |
+| email | 0.09 ms | 75.2 ms | 0.08 ms | 0.001 | 1.13 |
+| `(?m)^ERROR .*timeout$` | 0.14 ms | 30.3 ms | 0.57 ms | 0.005 | 0.25 |
+| dates `(?P<y>\d{4})-(?P<m>\d{2})-(?P<d>\d{2})` | 2.17 ms | 67.6 ms | 1.22 ms | 0.032 | 1.78 |
+| `(a*)*b` on 100 KB | below timer resolution | 3.18 ms | below timer resolution | | |
 
-Against Rust, `literal` (0.09 vs 0.08 ms) and `email` (0.10 vs 0.09 ms) are within 0.01 ms
-(the script's resolution), Lexell is 3.75× faster on `errors` (0.16 vs 0.60 ms), and Rust's
+Against Rust, `email` (0.09 vs 0.08 ms) and `literal` (0.09 vs 0.07 ms) are within 0.02 ms
+(the script's resolution), Lexell is 4.07× faster on `errors` (0.14 vs 0.57 ms), and Rust's
 `regex` crate leads on the remaining four patterns; `(a*)*b` is below timer resolution for both.
 
 Against Rust, the remaining gap on alternation, `(?i)sherlock` and `dates` is on
@@ -198,20 +203,20 @@ driver's output is identical (sha256 checked).
 
 | step | Lexell | Reference | Lexell / reference |
 |---|---:|---:|---:|
-| parse | 330 ms | Python json 946 ms | 0.35 |
-| compact output | 428 ms | Python json 640 ms | 0.67 |
-| pretty output | 465 ms | Python json 677 ms | 0.69 |
-| query (sum of qty) | 141 ms | Python json 52 ms | 2.7 |
-| visit (eachItem) | 146 ms | Python json 52 ms | 2.8 |
-| jq `.` | 810 ms | jq 1.7.1 2,520 ms | 0.32 |
-| jq `-c .` | 750 ms | jq 1.7.1 2,210 ms | 0.34 |
-| jq `length` | 450 ms | jq 1.7.1 1,130 ms | 0.40 |
-| jq `[.[].items[].qty] \| add` | 620 ms | jq 1.7.1 1,430 ms | 0.43 |
-| jq `map(select(...))` | 650 ms | jq 1.7.1 1,410 ms | 0.46 |
-| jq `group_by(.address.city)` | 970 ms | jq 1.7.1 1,700 ms | 0.57 |
+| parse | 252 ms | Python json 819 ms | 0.31 |
+| compact output | 337 ms | Python json 579 ms | 0.58 |
+| pretty output | 373 ms | Python json 615 ms | 0.61 |
+| query (sum of qty) | 123 ms | Python json 42 ms | 2.93 |
+| visit (eachItem) | 124 ms | Python json 42 ms | 2.94 |
+| jq `.` | 660 ms | jq 1.7.1 2,290 ms | 0.29 |
+| jq `-c .` | 600 ms | jq 1.7.1 2,010 ms | 0.30 |
+| jq `length` | 370 ms | jq 1.7.1 1,040 ms | 0.36 |
+| jq `[.[].items[].qty] \| add` | 490 ms | jq 1.7.1 1,290 ms | 0.38 |
+| jq `map(select(...))` | 510 ms | jq 1.7.1 1,290 ms | 0.40 |
+| jq `group_by(.address.city)` | 770 ms | jq 1.7.1 1,520 ms | 0.51 |
 
-The jq times are rounded to 10 ms by the script. Lexell's jq takes 0.32 to 0.57
-times jq 1.7.1's time (1.8 to 3.1× faster), with identical output on every filter. The query and
+The jq times are rounded to 10 ms by the script. Lexell's jq takes 0.29 to 0.51
+times jq 1.7.1's time (2.0 to 3.5× faster), with identical output on every filter. The query and
 visit steps read values through `get()` and `eachItem`, which borrow, so they copy nothing.
 
 ### Markdown
@@ -223,9 +228,9 @@ The perf mode checks no output.
 
 | input | Lexell | cmark | Lexell / cmark |
 |---|---:|---:|---:|
-| spec text, 49 times (10.0 MB) | 124 ms | 108 ms | 1.15 |
-| repository Markdown, 2 times (15.4 MB) | 183 ms | 191 ms | 0.96 |
-| spec examples, 643 times (10.0 MB) | 355 ms | 391 ms | 0.91 |
+| spec text, 49 times (10.0 MB) | 106 ms | 98 ms | 1.08 |
+| repository Markdown, 2 times (15.4 MB) | 168 ms | 166 ms | 1.01 |
+| spec examples, 643 times (10.0 MB) | 318 ms | 338 ms | 0.94 |
 
 ### Decimal
 
@@ -238,16 +243,16 @@ The .NET harness has no 37- and 38-digit cases.
 
 | operation | Lexell | .NET System.Decimal | Java BigDecimal | Lexell / .NET | Lexell / Java |
 |---|---:|---:|---:|---:|---:|
-| add, 19 digits | 8.0 ns | 11.5 ns | 14.8 ns | 0.69 | 0.54 |
-| mul, 6 by 6 digits | 9.0 ns | 11.9 ns | 10.8 ns | 0.76 | 0.83 |
-| div, 12 by 6, scale 2 | 11.8 ns | 68.4 ns | 13.3 ns | 0.17 | 0.89 |
-| parse, 20 digits | 34.8 ns | 95.0 ns | 114.5 ns | 0.37 | 0.30 |
-| format, 19 digits | 46.0 ns | 84.9 ns | 48.3 ns | 0.54 | 0.95 |
-| cmp, 19 digits | 2.3 ns | 3.8 ns | 1.7 ns | 0.60 | 1.37 |
-| add, 37 digits | 8.8 ns | not in harness | 17.9 ns | | 0.49 |
-| mul, 19 digits | 14.3 ns | not in harness | 22.5 ns | | 0.64 |
-| parse, 38 digits | 49.3 ns | not in harness | 223.0 ns | | 0.22 |
-| format, 38 digits | 74.6 ns | not in harness | 269.8 ns | | 0.28 |
+| add, 19 digits | 7.5 ns | 10.9 ns | 13.3 ns | 0.69 | 0.57 |
+| mul, 6 by 6 digits | 8.4 ns | 11.1 ns | 9.7 ns | 0.76 | 0.87 |
+| div, 12 by 6, scale 2 | 10.9 ns | 63.2 ns | 11.4 ns | 0.17 | 0.95 |
+| parse, 20 digits | 32.5 ns | 88.6 ns | 116.0 ns | 0.37 | 0.28 |
+| format, 19 digits | 41.5 ns | 80.0 ns | 46.0 ns | 0.52 | 0.90 |
+| cmp, 19 digits | 2.1 ns | 3.6 ns | 1.6 ns | 0.59 | 1.34 |
+| add, 37 digits | 8.1 ns | not in harness | 15.3 ns | | 0.53 |
+| mul, 19 digits | 13.1 ns | not in harness | 19.8 ns | | 0.66 |
+| parse, 38 digits | 45.5 ns | not in harness | 212.2 ns | | 0.21 |
+| format, 38 digits | 69.4 ns | not in harness | 245.9 ns | | 0.28 |
 
 The outputs are not verified against each other. The harnesses print different
 checksums for most cases, so those cases cannot be compared. The format cases print
@@ -266,17 +271,17 @@ CPU 0 and the load client on CPU 1, the gate's pinning, not the CPU ranges above
 
 | clients | Lexell, req/s | Go, req/s | Node.js, req/s | Lexell / Go | Lexell / Node.js |
 |---:|---:|---:|---:|---:|---:|
-| 1 | 108,862 | 56,471 | 83,952 | 1.93 | 1.30 |
-| 10 | 182,352 | 89,036 | 142,298 | 2.05 | 1.28 |
-| 100 | 167,432 | 99,813 | 139,947 | 1.68 | 1.20 |
+| 1 | 121,107 | 76,944 | 85,607 | 1.57 | 1.41 |
+| 10 | 193,074 | 126,774 | 143,969 | 1.52 | 1.34 |
+| 100 | 187,823 | 125,342 | 143,265 | 1.50 | 1.31 |
 
 | at 100 clients | Lexell | Go | Node.js |
 |---|---:|---:|---:|
-| latency p50 | 549 µs | 909 µs | 680 µs |
-| latency p99 | 1,242 µs | 3,866 µs | 1,028 µs |
-| memory per idle connection | 19.6 KB | 20.4 KB | 14.0 KB |
-| server RSS before the idle connections | 7 MB | 8 MB | 52 MB |
-| server RSS after the load | 199 MB | 343 MB | 224 MB |
+| latency p50 | 509 µs | 750 µs | 678 µs |
+| latency p99 | 562 µs | 2,779 µs | 864 µs |
+| memory per idle connection | 19.6 KB | 20.6 KB | 13.7 KB |
+| server RSS before the idle connections | 7 MB | 10 MB | 52 MB |
+| server RSS after the load | 202 MB | 345 MB | 222 MB |
 
 ### HTTP/2 server
 
@@ -292,59 +297,57 @@ Cleartext HTTP/2 prior knowledge (`h2c`):
 
 | conns × streams | Lexell, req/s | Go, req/s | Node.js, req/s | Lexell / Go | Lexell / Node.js |
 |---|---:|---:|---:|---:|---:|
-| 1 × 1 | 40,474 | 22,638 | 22,130 | 1.79 | 1.83 |
-| 1 × 10 | 87,356 | 42,704 | 70,990 | 2.05 | 1.23 |
-| 1 × 100 | 97,055 | 43,295 | 81,306 | 2.24 | 1.19 |
-| 10 × 10 | 235,055 | 43,828 | 99,827 | 5.36 | 2.35 |
+| 1 × 1 | 43,035 | 27,448 | 30,572 | 1.57 | 1.41 |
+| 1 × 10 | 118,372 | 55,062 | 94,354 | 2.15 | 1.25 |
+| 1 × 100 | 129,034 | 55,034 | 115,138 | 2.34 | 1.12 |
+| 10 × 10 | 274,573 | 53,771 | 112,728 | 5.11 | 2.44 |
 
 HTTPS HTTP/2 (TLS 1.3 ALPN `h2`):
 
 | conns × streams | Lexell, req/s | Go, req/s | Node.js, req/s | Lexell / Go | Lexell / Node.js |
 |---|---:|---:|---:|---:|---:|
-| 1 × 1 | 29,839 | 19,405 | 21,340 | 1.54 | 1.40 |
-| 1 × 10 | 64,723 | 43,715 | 65,378 | 1.48 | 0.99 |
-| 1 × 100 | 77,634 | 46,178 | 86,141 | 1.68 | 0.90 |
-| 10 × 10 | 180,662 | 44,560 | 82,215 | 4.05 | 2.20 |
+| 1 × 1 | 41,743 | 26,438 | 27,561 | 1.58 | 1.51 |
+| 1 × 10 | 130,491 | 52,356 | 79,315 | 2.49 | 1.65 |
+| 1 × 100 | 138,797 | 52,210 | 106,097 | 2.66 | 1.31 |
+| 10 × 10 | 228,470 | 51,964 | 92,054 | 4.40 | 2.48 |
 
 Latency and server RSS at 10 × 10 (100 concurrent streams):
 
 | at 10 × 10 | Lexell | Go | Node.js |
 |---|---:|---:|---:|
-| `h2c` latency p50 / p99 | 404 µs / 952 µs | 2,218 µs / 4,294 µs | 721 µs / 7,306 µs |
-| `tls` latency p50 / p99 | 496 µs / 1,725 µs | 2,211 µs / 4,040 µs | 938 µs / 6,834 µs |
-| `h2c` / `tls` server RSS | 6.9 MB / 12.5 MB | 16.5 MB / 17.1 MB | 155 MB / 159 MB |
+| `h2c` latency p50 / p99 | 344 µs / 816 µs | 1,857 µs / 2,993 µs | 656 µs / 6,445 µs |
+| `tls` latency p50 / p99 | 418 µs / 846 µs | 1,896 µs / 3,035 µs | 889 µs / 6,185 µs |
+| `h2c` / `tls` server RSS | 6.8 MB / 12.4 MB | 16.4 MB / 17.1 MB | 158 MB / 162 MB |
 
 ## Commands
 
-GNU grep, sort and tail, and eza are the common tools for the same jobs.
+GNU grep, sort and tail, ripgrep (`rg`), and eza are the common tools for the same jobs.
 
-The programs in `lexell/cmd`, built with the native backend (without `-O`), against the
-system tools. Wall time is measured around each process, best of 5 rounds,
-interleaved, with `LC_ALL=C` and the benchmark CPUs (4-7 and 12-15), stdout written to a
-temporary file. Instruction counts are user-mode. GNU sort runs several threads. The driver
-does not compare outputs; they were compared separately. Every output is identical to the system
-tool's except `eza -l`, which differs on one of 4,140 lines: eza 0.23.5 marks a file with
-extended attributes with `@`, and Lexell's eza does not.
+The programs in `lexell/cmd`, built with `--native -O`, against the system tools. Wall time is
+measured around each process (including `perf stat` wrapper), best of 5 interleaved rounds, with
+`LC_ALL=C TZ=UTC` pinned to CPUs 4–7 and 12–15, stdout written to a temporary file. Instruction
+counts are user-mode. GNU sort runs several threads. Every output is byte-identical to the system
+tool's except `eza -l /usr/lib`, which differs on a single file with extended attributes where
+eza 0.23.5 prints `@` and Lexell's eza does not.
 
 | case | Lexell | Reference | Lexell / reference |
 |---|---:|---:|---:|
-| grep `-c omega`, 100 MB, wall | 31 ms | GNU grep 81 ms | 0.38 |
-| grep `-c omega`, instructions | 204 M | GNU grep 364 M | 0.56 |
-| grep `-o -w eta`, 100 MB, wall | 219 ms | GNU grep 312 ms | 0.70 |
-| grep `-o -w eta`, instructions | 3,104 M | GNU grep 3,483 M | 0.89 |
-| sort, 100 MB, wall | 213 ms | GNU sort 166 ms | 1.28 |
-| sort, instructions | 3,929 M | GNU sort 2,136 M | 1.84 |
-| tail `-n 5`, 100 MB file, wall | 1 ms | GNU tail 1 ms | level (1 ms resolution) |
-| eza `-T /usr/share`, wall | 313 ms | eza 0.23.5 1,127 ms | 0.28 |
-| eza `-T /usr/share`, instructions | 1,058 M | eza 0.23.5 3,185 M | 0.33 |
-| eza `-l /usr/lib`, wall | 17 ms | eza 0.23.5 37 ms | 0.46 |
-| eza `-l /usr/lib`, instructions | 109 M | eza 0.23.5 188 M | 0.58 |
+| grep `-c omega`, 100 MB, wall | 50.9 ms | GNU grep 98.5 ms (rg 52.3 ms) | 0.52 (0.97 vs rg) |
+| grep `-c omega`, instructions | 220 M | GNU grep 375 M (rg 434 M) | 0.59 (0.51 vs rg) |
+| grep `-o -w eta`, 100 MB, wall | 254 ms | GNU grep 363 ms | 0.70 |
+| grep `-o -w eta`, instructions | 3,351 M | GNU grep 4,063 M | 0.82 |
+| sort, 100 MB, wall | 514 ms | GNU sort 336 ms | 1.53 |
+| sort, instructions | 4,453 M | GNU sort 2,683 M | 1.66 |
+| tail `-n 5`, 100 MB file, wall | 18.1 ms | GNU tail 18.3 ms | 0.99 (level) |
+| eza `-T /usr/share`, wall | 335 ms | eza 0.23.5 1,178 ms | 0.28 |
+| eza `-T /usr/share`, instructions | 874 M | eza 0.23.5 3,180 M | 0.27 |
+| eza `-l /usr/lib`, wall | 34.7 ms | eza 0.23.5 55.6 ms | 0.62 |
+| eza `-l /usr/lib`, instructions | 90.4 M | eza 0.23.5 188.1 M | 0.48 |
 
 ## Not measured
 
 - **Rust toolchain sizes** in the compile table: the sizing step fails on a
   broken system symlink.
 - **Plain C references** for the microbenchmarks are in the run's log but not in the table above.
-- **ripgrep** in the command programs: not included.
 - **HTTP client, tasks and database streaming.** Each needs its own
   references and runs.
