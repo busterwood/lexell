@@ -373,12 +373,63 @@ fn sortBySeq(xs: mut &[]Trigger) {
     }
 }
 
+// Topological sort for Oracle triggers honoring FOLLOWS and PRECEDES, breaking ties by createdSeq.
+// "B FOLLOWS A" => A before B; "A PRECEDES B" => A before B.
+fn sortOraFollows(xs: mut &[]Trigger) {
+    let n = len(xs)
+    if n <= 1 { return }
+    sortBySeq(xs)
+    // Build adjacency: edge u -> v means xs[u] must run before xs[v]
+    var indeg: []int = array(n, 0)
+    var adj: [][]int = []
+    for _ in 0..n { append(mut &adj, []) }
+    for i in 0..n {
+        for f in xs[i].follows {
+            let base = lexdb_sql.baseName(&f)
+            var u = -1
+            for k in 0..n { if xs[k].name == base { u = k; break } }
+            if u >= 0 && u != i {
+                append(mut &adj[u], i)
+                indeg[i] += 1
+            }
+        }
+        for p in xs[i].precedes {
+            let base = lexdb_sql.baseName(&p)
+            var v = -1
+            for k in 0..n { if xs[k].name == base { v = k; break } }
+            if v >= 0 && v != i {
+                append(mut &adj[i], v)
+                indeg[v] += 1
+            }
+        }
+    }
+    var used: []bool = array(n, false)
+    var out: []Trigger = []
+    for _ in 0..n {
+        var pick = -1
+        for i in 0..n {
+            if !used[i] && indeg[i] == 0 { pick = i; break }
+        }
+        if pick < 0 {
+            // cycle fallback: pick lowest unused
+            for i in 0..n { if !used[i] { pick = i; break } }
+        }
+        if pick < 0 { break }
+        used[pick] = true
+        append(mut &out, xs[pick].clone())
+        for v in adj[pick] { indeg[v] -= 1 }
+    }
+    for i in 0..n { xs[i] = out[i].clone() }
+}
+
 // Enabled triggers on target matching timing and event (and level if levelFilter >= 0).
-// Ordering: PostgreSQL fires alphabetically by trigger name; SQL Server fires FIRST -> createdSeq -> LAST.
+// Ordering: PostgreSQL fires alphabetically by trigger name; Oracle honors FOLLOWS/PRECEDES -> createdSeq;
+// SQL Server fires FIRST -> createdSeq -> LAST.
 pub fn onTargetForLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, timing: int, event: int, levelFilter: int): Result[[]Trigger, DbErr] {
     let allT = try onTarget(st, txn, t)
     var first: []Trigger = []
     var pgMid: []Trigger = []
+    var oraMid: []Trigger = []
     var otherMid: []Trigger = []
     var last: []Trigger = []
     for tr in allT {
@@ -388,6 +439,8 @@ pub fn onTargetForLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &T
         if levelFilter >= 0 && tr.level != levelFilter { continue }
         if tr.dialect == TD_PG {
             append(mut &pgMid, tr)
+        } else if tr.dialect == TD_ORA {
+            append(mut &oraMid, tr)
         } else {
             let ord = orderForEvent(&tr, event)
             if ord == TO_FIRST { append(mut &first, tr) }
@@ -396,10 +449,12 @@ pub fn onTargetForLevel(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &T
         }
     }
     sortPgAlpha(mut &pgMid)
+    sortOraFollows(mut &oraMid)
     sortBySeq(mut &otherMid)
     var out: []Trigger = []
     for tr in first { append(mut &out, tr) }
     for tr in pgMid { append(mut &out, tr) }
+    for tr in oraMid { append(mut &out, tr) }
     for tr in otherMid { append(mut &out, tr) }
     for tr in last { append(mut &out, tr) }
     return Ok(out)

@@ -28,6 +28,7 @@ import "./lexdb_graph"
 import "./lexdb_assert"
 import "./lexdb_mview"
 import "./lexdb_parse"
+import "./lexdb_trigger"
 import "./lexdb_routine"
 import "./lexdb_oratext"
 
@@ -185,7 +186,7 @@ pub fn isBuilt(base: &str): bool {
         "TABLES", "TAB_COLUMNS", "TAB_COLS", "INDEXES", "IND_COLUMNS", "IND_EXPRESSIONS", "CONSTRAINTS", "CONS_COLUMNS", "OBJECTS", "SEQUENCES",
         "VIEWS", "TAB_COMMENTS", "COL_COMMENTS", "TAB_IDENTITY_COLS", "CATALOG", "SOURCE", "PROCEDURES", "ERRORS", "ANNOTATIONS_USAGE", "ANNOTATIONS",
         "ANNOTATION_VALUES", "PROPERTY_GRAPHS", "PG_ELEMENTS", "PG_LABELS", "PG_ELEMENT_LABELS", "PG_LABEL_PROPERTIES", "PG_PROP_DEFINITIONS",
-        "PG_KEYS", "PG_EDGE_RELATIONSHIPS", "PG_COMMENTS", "ASSERTIONS", "ASSERTION_DEPENDENCIES", "MVIEWS", "MVIEW_LOGS", "JSON_COLUMNS" { return true }
+        "PG_KEYS", "PG_EDGE_RELATIONSHIPS", "PG_COMMENTS", "ASSERTIONS", "ASSERTION_DEPENDENCIES", "MVIEWS", "MVIEW_LOGS", "JSON_COLUMNS", "TRIGGERS" { return true }
         else { return false }
     }
 }
@@ -990,6 +991,64 @@ fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role, verrs: &Map[str, DbErr])
             p.i("NAMESPACE", 1)
             append(mut &out, p)
         }
+        for tr in lexdb_trigger.allFromSnap(&snap.triggers) {
+            if tr.dialect != lexdb_trigger.TD_ORA { continue }
+            let owner = oraOwner(&tr.schema, &user)
+            var p = oraPend(&owner, &"TRIGGER")
+            oraObject(mut &p, &(strings.toUpperAscii(&tr.name)), tr.oid, &"TRIGGER", false)
+            p.null("DATA_OBJECT_ID")
+            p.s("STATUS", "VALID")
+            p.s("TEMPORARY", "N")
+            p.s("SECONDARY", "N")
+            p.i("NAMESPACE", 3)
+            append(mut &out, p)
+        }
+        return out
+    }
+    if base == "TRIGGERS" {
+        for tr in lexdb_trigger.allFromSnap(&snap.triggers) {
+            if tr.dialect != lexdb_trigger.TD_ORA { continue }
+            let owner = oraOwner(&tr.schema, &user)
+            let tblOwner = oraOwner(&lexdb_sql.schemaOf(&tr.target), &user)
+            let tblName = oraUp(&lexdb_sql.baseName(&tr.target))
+            let trgName = strings.toUpperAscii(&tr.name)
+            let ttype = if tr.timing == lexdb_trigger.TT_INSTEAD_OF { "INSTEAD OF" }
+                        else if tr.timing == lexdb_trigger.TT_BEFORE { (if tr.level == lexdb_trigger.TL_ROW { "BEFORE EACH ROW" } else { "BEFORE STATEMENT" }) }
+                        else { (if tr.level == lexdb_trigger.TL_ROW { "AFTER EACH ROW" } else { "AFTER STATEMENT" }) }
+            var evs: []str = []
+            if (tr.events & lexdb_trigger.TE_INSERT) != 0 { append(mut &evs, "INSERT") }
+            if (tr.events & lexdb_trigger.TE_UPDATE) != 0 { append(mut &evs, "UPDATE") }
+            if (tr.events & lexdb_trigger.TE_DELETE) != 0 { append(mut &evs, "DELETE") }
+            let evStr = strings.join(&evs, " OR ")
+            let refNew = if len(tr.refNew) > 0 { strings.toUpperAscii(&tr.refNew) } else { "NEW" }
+            let refOld = if len(tr.refOld) > 0 { strings.toUpperAscii(&tr.refOld) } else { "OLD" }
+            let refStr = "REFERENCING NEW AS " + refNew + " OLD AS " + refOld
+            let baseType = if tr.isView { "VIEW" } else { "TABLE" }
+            var p = oraPend(&owner, &"TRIGGER")
+            p.s("OWNER", &owner)
+            p.s("TRIGGER_NAME", &trgName)
+            p.s("TRIGGER_TYPE", &ttype)
+            p.s("TRIGGERING_EVENT", &evStr)
+            p.s("TABLE_OWNER", &tblOwner)
+            p.s("BASE_OBJECT_TYPE", &baseType)
+            p.s("TABLE_NAME", &tblName)
+            p.null("COLUMN_NAME")
+            p.s("REFERENCING_NAMES", &refStr)
+            if len(tr.whenExpr) > 0 { p.s("WHEN_CLAUSE", &tr.whenExpr) } else { p.null("WHEN_CLAUSE") }
+            p.s("STATUS", if tr.enabled { "ENABLED" } else { "DISABLED" })
+            p.s("DESCRIPTION", &(trgName + " " + ttype + " " + evStr + " ON " + tblName))
+            p.s("ACTION_TYPE", "PL/SQL")
+            p.s("TRIGGER_BODY", &tr.body)
+            p.s("CROSSEDITION", "NO")
+            p.s("BEFORE_STATEMENT", if tr.timing == lexdb_trigger.TT_BEFORE && tr.level == lexdb_trigger.TL_STATEMENT { "YES" } else { "NO" })
+            p.s("BEFORE_ROW", if tr.timing == lexdb_trigger.TT_BEFORE && tr.level == lexdb_trigger.TL_ROW { "YES" } else { "NO" })
+            p.s("AFTER_ROW", if tr.timing == lexdb_trigger.TT_AFTER && tr.level == lexdb_trigger.TL_ROW { "YES" } else { "NO" })
+            p.s("AFTER_STATEMENT", if tr.timing == lexdb_trigger.TT_AFTER && tr.level == lexdb_trigger.TL_STATEMENT { "YES" } else { "NO" })
+            p.s("INSTEAD_OF_ROW", if tr.timing == lexdb_trigger.TT_INSTEAD_OF { "YES" } else { "NO" })
+            p.s("FIRE_ONCE", "YES")
+            p.s("APPLY_SERVER_ONLY", "NO")
+            append(mut &out, p)
+        }
         return out
     }
     if base == "PROCEDURES" {
@@ -1124,6 +1183,24 @@ fn oraBuilt(snap: &CatSnap, base: &str, roles: &[]Role, verrs: &Map[str, DbErr])
                 var p = oraPend(&pr.owner, &pr.kind)
                 p.s("NAME", &pr.name)
                 p.s("TYPE", &pr.kind)
+                p.i("LINE", k + 1)
+                p.s("TEXT", &(lines[k] + (if k + 1 < len(lines) { "\n" } else { "" })))
+                p.i("ORIGIN_CON_ID", 3)
+                append(mut &out, p)
+            }
+        }
+        for tr in lexdb_trigger.allFromSnap(&snap.triggers) {
+            if tr.dialect != lexdb_trigger.TD_ORA { continue }
+            let owner = oraOwner(&tr.schema, &user)
+            let trgName = strings.toUpperAscii(&tr.name)
+            let up = strings.toUpperAscii(&tr.def)
+            var at = strings.indexOf(&up, "TRIGGER", 0)
+            if at < 0 { at = 0 }
+            let lines = strings.split(&tr.def[at..len(tr.def)], "\n")
+            for k in 0..len(lines) {
+                var p = oraPend(&owner, &"TRIGGER")
+                p.s("NAME", &trgName)
+                p.s("TYPE", "TRIGGER")
                 p.i("LINE", k + 1)
                 p.s("TEXT", &(lines[k] + (if k + 1 < len(lines) { "\n" } else { "" })))
                 p.i("ORIGIN_CON_ID", 3)

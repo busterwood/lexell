@@ -56,6 +56,7 @@ import "./lexdb_oraadm"
 import "./lexdb_oratext"
 import "./lexdb_plsql"
 import "./lexdb_plcall"
+import "./lexdb_oratrig"
 import "./lexdb_parse"
 import "./lexdb_standby"
 import "./lexdb_repl"
@@ -2219,6 +2220,10 @@ fn (c: mut &Conn) execute(rq: &Req) {
         return
     }
     if kind == tns.S_DDL {
+        if lexdb_oratrig.isTriggerDdl(&sql) {
+            c.createOraTriggerDdl(&sql, id)
+            return
+        }
         let ud = lexdb_plsql.unitDdl(&sql)
         if ud != 0 {
             c.unitDdl(ud, &sql, id)
@@ -2640,6 +2645,30 @@ fn (c: mut &Conn) unitDdl(ud: int, sql: &str, id: int) {
             let fe = lexdb_plsql.finalError(&e)
             c.endCall(fe.num, &(oraText(fe.num, &fe.text)), id, 0)
         }
+    }
+}
+
+fn (c: mut &Conn) createOraTriggerDdl(sql: &str, id: int) {
+    if c.sess.status() != 'I' {
+        match c.simple("COMMIT") {
+            Ok(_) {}
+            Err(e) { c.fail(&e, id); return }
+        }
+    }
+    if c.nls.redo { c.reapply() }
+    match lexdb_oratrig.parseCreateTrigger(sql) {
+        Ok(stmt) {
+            let none: []Val = []
+            let nt: []int = []
+            match c.sess.run(&stmt, &none, &nt) {
+                Ok(_) {
+                    lexdb_plsql.noteDdl(mut &c.pl)
+                    c.endCall(0, "", id, 0)
+                }
+                Err(e) { c.fail(&e, id) }
+            }
+        }
+        Err(e) { c.fail(&e, id) }
     }
 }
 
@@ -3680,6 +3709,7 @@ pub fn serve(a: ConnArg): int {
     let nd = sock.setNoDelay(true)
     let sess = lexdb_exec.newSession(st.share())
     lexdb_plcall.install()
+    lexdb_oratrig.register()
     sess.setDoor(&"tns")
     let local = sock.localAddr()
     var c = Conn{connId: id, local: local, odp: false, w: newWire(sock), sess: sess, st: st, o: newOut(), secret: secret, fv: FV_SERVER, seq: 0, user: "",

@@ -25266,6 +25266,7 @@ var TRG_RUN_ORA: once []TriggerRunner
 var ROW_TRG_PG: once []RowTriggerRunner
 var ROW_TRG_ORA: once []RowTriggerRunner
 var PLPGSQL_VAL: once []PlpgsqlValidator
+var ORATRIG_VAL: once []PlpgsqlValidator
 
 pub fn setTriggerRunner(dialect: int, f: TriggerRunner) {
     if dialect == lexdb_trigger.TD_PG { if !TRG_RUN_PG.isSet() { TRG_RUN_PG.set([f]) } }
@@ -25282,8 +25283,17 @@ pub fn setPlpgsqlValidator(f: PlpgsqlValidator) {
     if !PLPGSQL_VAL.isSet() { PLPGSQL_VAL.set([f]) }
 }
 
+pub fn setOraTrigValidator(f: PlpgsqlValidator) {
+    if !ORATRIG_VAL.isSet() { ORATRIG_VAL.set([f]) }
+}
+
 fn validatePlpgsqlBody(body: &str): Result[Unit, DbErr] {
     if PLPGSQL_VAL.isSet() { return PLPGSQL_VAL.get()[0](body) }
+    return Ok(Unit{})
+}
+
+fn validateOraTrigBody(body: &str): Result[Unit, DbErr] {
+    if ORATRIG_VAL.isSet() { return ORATRIG_VAL.get()[0](body) }
     return Ok(Unit{})
 }
 
@@ -25674,6 +25684,9 @@ fn createTrigger(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sq
     if s.mdialect == lexdb_sql.MD_PG {
         return createPgTrigger(st, txn, s)
     }
+    if s.mdialect == lexdb_sql.MD_ORA {
+        return createOraTrigger(st, txn, s)
+    }
     var tr = lexdb_trigger.decode(&s.mvOpts)
     var t = match try findTable(st, txn, &tr.target) {
         Some(tb) { tb }
@@ -25755,6 +25768,92 @@ fn createTrigger(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sq
         return Ok(tagOnly("CREATE TRIGGER"))
     }
     return Err(e("0A000", "lexdb: triggers are not supported in this dialect yet"))
+}
+
+fn createOraTrigger(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    var tr = lexdb_trigger.decode(&s.mvOpts)
+    var t = match try findTable(st, txn, &tr.target) {
+        Some(tb) { tb }
+        None { return Err(e("ORA00942", "table or view does not exist")) }
+    }
+    if lexdb_mview.isMvTable(&t) {
+        return Err(e("ORA25001", "cannot create this trigger type on views"))
+    }
+    tr.isView = len(t.view) > 0
+    if !tr.isView && tr.timing == lexdb_trigger.TT_INSTEAD_OF {
+        return Err(e("ORA25002", "cannot create INSTEAD OF triggers on tables"))
+    }
+    if tr.isView && tr.timing != lexdb_trigger.TT_INSTEAD_OF {
+        return Err(e("ORA25001", "cannot create this trigger type on views"))
+    }
+    if tr.timing == lexdb_trigger.TT_INSTEAD_OF {
+        tr.level = lexdb_trigger.TL_ROW
+    }
+    if len(tr.whenExpr) > 0 && tr.level != lexdb_trigger.TL_ROW {
+        return Err(e("ORA04077", "WHEN clause cannot be used with table level triggers"))
+    }
+    for cn in tr.cols {
+        if lexdb_bind.colIndex(&t.cols, &cn) < 0 {
+            return Err(e("ORA00904", &("\"" + strings.toUpperAscii(&cn) + "\": invalid identifier")))
+        }
+    }
+    let tgtSchema = lexdb_sql.schemaOf(&t.name)
+    if len(tr.schema) == 0 { tr.schema = tgtSchema.clone() }
+    let scopeKey = lexdb_sql.qual(&tr.schema, &tr.name)
+    tr.key = lexdb_trigger.makeKey(lexdb_trigger.TD_ORA, &scopeKey)
+    tr.oid = lexdb_trigger.makeOid(&tr.key)
+    tr.target = t.name.clone()
+    tr.owner = lexdb_priv.currentRole(st, txn.sql.sess)
+
+    let existing = try lexdb_trigger.get(st, txn, &tr.key)
+    if existing.isSome() && !s.ifFlag {
+        return Err(e("ORA04081", &("trigger '" + strings.toUpperAscii(&tr.name) + "' already exists")))
+    }
+    match existing {
+        Some(old) {
+            if old.target != t.name {
+                match try byKeyOpt(st, txn, &old.target) {
+                    Some(ot0) {
+                        if len(ot0.view) == 0 {
+                            var ot = ot0
+                            dropKey(mut &ot.refBy, &lexdb_trigger.trgKey(&old.key))
+                            try putTable(txn, &ot)
+                        }
+                    }
+                    None {}
+                }
+            }
+            tr.createdSeq = old.createdSeq
+        }
+        None {
+            tr.createdSeq = try lexdb_trigger.nextSeq(st, txn)
+        }
+    }
+    try lexdb_trigger.put(st, txn, &tr)
+    if !tr.isView {
+        addKey(mut &t.refBy, &lexdb_trigger.trgKey(&tr.key))
+        try putTable(txn, &t)
+    }
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("CREATE TRIGGER"))
+}
+
+fn findOraTrigger(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rawName: &str): Result[Option[lexdb_trigger.Trigger], DbErr] {
+    match try lexdb_trigger.findByKey(st, txn, lexdb_trigger.TD_ORA, rawName) {
+        Some(tr) { return Ok(Some(tr)) }
+        None {}
+    }
+    if !lexdb_sql.isQual(rawName) {
+        let p = collections.copyOf(&txn.sql.path)
+        for sc in p {
+            let k = lexdb_sql.qual(&sc, rawName)
+            match try lexdb_trigger.findByKey(st, txn, lexdb_trigger.TD_ORA, &k) {
+                Some(tr) { return Ok(Some(tr)) }
+                None {}
+            }
+        }
+    }
+    return Ok(None)
 }
 
 fn createPgTrigger(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
@@ -25959,10 +26058,95 @@ fn dropTrigger(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.
         try bumpCatalog(st, txn)
         return Ok(tagOnly("DROP TRIGGER"))
     }
+    if s.mdialect == lexdb_sql.MD_ORA {
+        let nm = if len(s.names) > 0 { &s.names[0] } else { "" }
+        match try findOraTrigger(st, txn, nm) {
+            Some(tr) {
+                lexdb_trigger.del(txn, &tr.key)
+                match try byKeyOpt(st, txn, &tr.target) {
+                    Some(t0) {
+                        if len(t0.view) == 0 {
+                            var tb = t0
+                            dropKey(mut &tb.refBy, &lexdb_trigger.trgKey(&tr.key))
+                            try putTable(txn, &tb)
+                        }
+                    }
+                    None {}
+                }
+            }
+            None {
+                if !s.ifFlag {
+                    return Err(e("ORA04080", &("trigger '" + strings.toUpperAscii(&lexdb_sql.baseName(nm)) + "' does not exist")))
+                }
+            }
+        }
+        try bumpCatalog(st, txn)
+        return Ok(tagOnly("DROP TRIGGER"))
+    }
     return Err(e("0A000", "lexdb: DROP TRIGGER is not supported in this dialect yet"))
 }
 
 fn alterTrigger(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    if s.mdialect == lexdb_sql.MD_ORA {
+        if s.alias == "enable_all" || s.alias == "disable_all" {
+            let enable = s.alias == "enable_all"
+            let t = match try findTable(st, txn, &s.table) {
+                Some(tb) { tb }
+                None { return Err(e("ORA00942", "table or view does not exist")) }
+            }
+            for tr0 in try lexdb_trigger.onTarget(st, txn, &t) {
+                if tr0.dialect != lexdb_trigger.TD_ORA { continue }
+                var tr = tr0.clone()
+                tr.enabled = enable
+                try lexdb_trigger.put(st, txn, &tr)
+            }
+            try bumpCatalog(st, txn)
+            return Ok(tagOnly("ALTER TABLE"))
+        }
+        var tr = match try findOraTrigger(st, txn, &s.table) {
+            Some(x) { x }
+            None { return Err(e("ORA04080", &("trigger '" + strings.toUpperAscii(&lexdb_sql.baseName(&s.table)) + "' does not exist"))) }
+        }
+        if s.alias == "enable" || s.alias == "disable" {
+            tr.enabled = s.alias == "enable"
+            try lexdb_trigger.put(st, txn, &tr)
+            try bumpCatalog(st, txn)
+            return Ok(tagOnly("ALTER TRIGGER"))
+        }
+        if s.alias == "compile" {
+            try validateOraTrigBody(&tr.body)
+            return Ok(tagOnly("ALTER TRIGGER"))
+        }
+        if s.alias == "rename" && len(s.names) > 0 {
+            let newNm = &s.names[0]
+            let newScope = lexdb_sql.qual(&tr.schema, newNm)
+            let newKey = lexdb_trigger.makeKey(lexdb_trigger.TD_ORA, &newScope)
+            if newKey != tr.key && (try lexdb_trigger.get(st, txn, &newKey)).isSome() {
+                return Err(e("ORA04081", &("trigger '" + strings.toUpperAscii(newNm) + "' already exists")))
+            }
+            let oldKey = tr.key.clone()
+            lexdb_trigger.del(txn, &oldKey)
+            tr.name = newNm.clone()
+            tr.spell = strings.toUpperAscii(newNm)
+            tr.key = newKey.clone()
+            tr.oid = lexdb_trigger.makeOid(&newKey)
+            try lexdb_trigger.put(st, txn, &tr)
+            match try byKeyOpt(st, txn, &tr.target) {
+                Some(t0) {
+                    if len(t0.view) == 0 {
+                        var tb = t0
+                        dropKey(mut &tb.refBy, &lexdb_trigger.trgKey(&oldKey))
+                        addKey(mut &tb.refBy, &lexdb_trigger.trgKey(&newKey))
+                        try putTable(txn, &tb)
+                    }
+                }
+                None {}
+            }
+            try bumpCatalog(st, txn)
+            return Ok(tagOnly("ALTER TRIGGER"))
+        }
+        return Err(e("ORA00922", "missing or invalid option"))
+    }
     if s.mdialect == lexdb_sql.MD_PG && s.alias == "rename" {
         var t = match try findTable(st, txn, &s.table) {
             Some(tb) { tb }

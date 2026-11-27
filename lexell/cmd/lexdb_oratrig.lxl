@@ -1,0 +1,1875 @@
+// lexdb_oratrig: Oracle DML trigger parser and PL/SQL trigger runtime.
+// Supports CREATE [OR REPLACE] [EDITIONABLE | NONEDITIONABLE] TRIGGER ... ON table_or_view
+// with BEFORE / AFTER / INSTEAD OF, INSERT / UPDATE [OF cols] / DELETE,
+// REFERENCING OLD/NEW/PARENT AS ..., FOR EACH ROW, FOLLOWS / PRECEDES, ENABLE / DISABLE,
+// WHEN (cond), :OLD.col / :NEW.col, INSERTING / UPDATING / DELETING / UPDATING('COL'),
+// RAISE_APPLICATION_ERROR, EXCEPTION WHEN ... THEN ..., and embedded Oracle SQL via lexdb_exec.execNested.
+import "strings"
+import "collections"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_store"
+import "./lexdb_catalog"
+import "./lexdb_parse"
+import "./lexdb_exec"
+import "./lexdb_ops"
+import "./lexdb_trigger"
+import "./lexdb_oratext"
+
+type DbErr = lexdb_base.DbErr
+type Val = lexdb_sql.Val
+type TypeName = lexdb_sql.TypeName
+type Trigger = lexdb_trigger.Trigger
+type RowFireReq = lexdb_trigger.RowFireReq
+type RowFireRes = lexdb_trigger.RowFireRes
+
+fn oraErr(num: int, msg: &str): DbErr {
+    var s = num.toStr()
+    while len(s) < 5 { s = "0" + s }
+    return lexdb_base.err(&("ORA" + s), msg)
+}
+
+pub fn register() {
+    lexdb_exec.setRowTriggerRunner(lexdb_trigger.TD_ORA, runRowTrigger)
+    lexdb_exec.setOraTrigValidator(validateBody)
+}
+
+pub fn validateBody(body: &str): Result[Unit, DbErr] {
+    let _ = try parseBlockSrc(body)
+    return Ok(Unit{})
+}
+
+// ---- lexer (Oracle SQL / PL/SQL)
+
+const TK_EOF = 0
+const TK_ID = 1     // unquoted identifier or keyword; low is lowercase, up is uppercase
+const TK_QID = 2    // "quoted identifier"
+const TK_STR = 3    // 'string' or q'[string]'
+const TK_NUM = 4    // number
+const TK_OP = 5     // operator / punctuation
+
+type Tok = value record {
+    kind: int
+    text: str
+    low: str
+    val: str
+    s: int
+    e: int
+}
+
+fn isAlpha(c: byte): bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c >= 0x80
+}
+
+fn isAlnum(c: byte): bool {
+    return isAlpha(c) || (c >= '0' && c <= '9') || c == '$' || c == '#'
+}
+
+fn isDigit(c: byte): bool { return c >= '0' && c <= '9' }
+
+fn qCloser(c: byte): byte {
+    if c == '[' { return ']' }
+    if c == '(' { return ')' }
+    if c == '{' { return '}' }
+    if c == '<' { return '>' }
+    return c
+}
+
+fn lex(src: &str): Result[[]Tok, DbErr] {
+    var out: []Tok = []
+    let n = len(src)
+    var i = 0
+    while i < n {
+        let c = src[i]
+        if c == ' ' || c == '\t' || c == '\r' || c == '\n' || c == '\x0c' {
+            i += 1
+            continue
+        }
+        // -- line comment
+        if c == '-' && i + 1 < n && src[i + 1] == '-' {
+            while i < n && src[i] != '\n' { i += 1 }
+            continue
+        }
+        // /* block comment */
+        if c == '/' && i + 1 < n && src[i + 1] == '*' {
+            i += 2
+            var done = false
+            while i + 1 < n {
+                if src[i] == '*' && src[i + 1] == '/' { i += 2; done = true; break }
+                i += 1
+            }
+            if !done { return Err(oraErr(1756, "unterminated /* comment")) }
+            continue
+        }
+        let start = i
+        // q'[...]' / nq'[...]'
+        if (c == 'q' || c == 'Q' || ((c == 'n' || c == 'N') && i + 1 < n && (src[i + 1] == 'q' || src[i + 1] == 'Q'))) {
+            var j = i + 1
+            if c == 'n' || c == 'N' { j += 1 }
+            if j + 1 < n && src[j] == '\'' {
+                let cl = qCloser(src[j + 1])
+                var k = j + 2
+                var done = false
+                while k + 1 < n {
+                    if src[k] == cl && src[k + 1] == '\'' { done = true; break }
+                    k += 1
+                }
+                if !done { return Err(oraErr(1756, "quoted string not properly terminated")) }
+                let v = src[j + 2..k].toStr()
+                i = k + 2
+                append(mut &out, Tok{kind: TK_STR, text: src[start..i].toStr(), low: "", val: v, s: start, e: i})
+                continue
+            }
+        }
+        // N'...' / '...'
+        if (c == 'n' || c == 'N') && i + 1 < n && src[i + 1] == '\'' {
+            i += 2
+            var v = ""
+            var done = false
+            while i < n {
+                if src[i] == '\'' {
+                    if i + 1 < n && src[i + 1] == '\'' { v.addByte('\''); i += 2 }
+                    else { i += 1; done = true; break }
+                } else { v.addByte(src[i]); i += 1 }
+            }
+            if !done { return Err(oraErr(1756, "quoted string not properly terminated")) }
+            append(mut &out, Tok{kind: TK_STR, text: src[start..i].toStr(), low: "", val: v, s: start, e: i})
+            continue
+        }
+        if c == '\'' {
+            i += 1
+            var v = ""
+            var done = false
+            while i < n {
+                if src[i] == '\'' {
+                    if i + 1 < n && src[i + 1] == '\'' { v.addByte('\''); i += 2 }
+                    else { i += 1; done = true; break }
+                } else { v.addByte(src[i]); i += 1 }
+            }
+            if !done { return Err(oraErr(1756, "quoted string not properly terminated")) }
+            append(mut &out, Tok{kind: TK_STR, text: src[start..i].toStr(), low: "", val: v, s: start, e: i})
+            continue
+        }
+        // "quoted identifier"
+        if c == '"' {
+            i += 1
+            var v = ""
+            var done = false
+            while i < n {
+                if src[i] == '"' {
+                    if i + 1 < n && src[i + 1] == '"' { v.addByte('"'); i += 2 }
+                    else { i += 1; done = true; break }
+                } else { v.addByte(src[i]); i += 1 }
+            }
+            if !done { return Err(oraErr(1740, "missing double quote in identifier")) }
+            append(mut &out, Tok{kind: TK_QID, text: v.clone(), low: strings.toLowerAscii(&v), val: v, s: start, e: i})
+            continue
+        }
+        if isAlpha(c) {
+            var j = i + 1
+            while j < n && isAlnum(src[j]) { j += 1 }
+            let w = src[i..j].toStr()
+            append(mut &out, Tok{kind: TK_ID, text: w.clone(), low: strings.toLowerAscii(&w), val: "", s: start, e: j})
+            i = j
+            continue
+        }
+        if isDigit(c) || (c == '.' && i + 1 < n && isDigit(src[i + 1])) {
+            var j = i
+            while j < n && isDigit(src[j]) { j += 1 }
+            if j < n && src[j] == '.' && !(j + 1 < n && src[j + 1] == '.') {
+                j += 1
+                while j < n && isDigit(src[j]) { j += 1 }
+            }
+            if j < n && (src[j] == 'e' || src[j] == 'E') {
+                var k = j + 1
+                if k < n && (src[k] == '+' || src[k] == '-') { k += 1 }
+                if k < n && isDigit(src[k]) {
+                    while k < n && isDigit(src[k]) { k += 1 }
+                    j = k
+                }
+            }
+            let w = src[i..j].toStr()
+            append(mut &out, Tok{kind: TK_NUM, text: w.clone(), low: w, val: "", s: start, e: j})
+            i = j
+            continue
+        }
+        if i + 1 < n {
+            let two = src[i..i + 2].toStr()
+            if two == ":=" || two == "<>" || two == "!=" || two == "^=" || two == "<=" || two == ">=" ||
+               two == "||" || two == ".." || two == "<<" || two == ">>" || two == "=>" || two == "**" {
+                append(mut &out, Tok{kind: TK_OP, text: two.clone(), low: two, val: "", s: start, e: i + 2})
+                i += 2
+                continue
+            }
+        }
+        let one = src[i..i + 1].toStr()
+        append(mut &out, Tok{kind: TK_OP, text: one.clone(), low: one, val: "", s: start, e: i + 1})
+        i += 1
+    }
+    append(mut &out, Tok{kind: TK_EOF, text: "", low: "", val: "", s: n, e: n})
+    return Ok(out)
+}
+
+// ---- DDL detection & parsing: CREATE [OR REPLACE] [EDITIONABLE|NONEDITIONABLE] TRIGGER
+
+pub fn isTriggerDdl(sql: &str): bool {
+    match lex(sql) {
+        Ok(toks) {
+            if len(toks) < 3 { return false }
+            if toks[0].kind != TK_ID || toks[0].low != "create" { return false }
+            var i = 1
+            if i + 1 < len(toks) && toks[i].low == "or" && toks[i + 1].low == "replace" { i += 2 }
+            if i < len(toks) && (toks[i].low == "editionable" || toks[i].low == "noneditionable") { i += 1 }
+            return i < len(toks) && toks[i].kind == TK_ID && toks[i].low == "trigger"
+        }
+        Err(_) { return false }
+    }
+}
+
+fn stripTrailingSlash(sql: &str): str {
+    var s = strings.trim(sql).toStr()
+    while len(s) > 0 && s[len(s) - 1] == '/' {
+        s = strings.trim(&s[0..len(s) - 1]).toStr()
+    }
+    return s
+}
+
+pub fn parseCreateTrigger(sql0: &str): Result[lexdb_sql.Stmt, DbErr] {
+    let sql = stripTrailingSlash(sql0)
+    let toks = try lex(&sql)
+    var p = Parser{src: sql.clone(), toks: toks, pos: 0}
+    try p.expectKw("create")
+    var orReplace = false
+    if p.acceptKw("or") {
+        try p.expectKw("replace")
+        orReplace = true
+    }
+    if p.isKw("editionable") || p.isKw("noneditionable") { p.pos += 1 }
+    try p.expectKw("trigger")
+
+    // [schema.]trigger_name
+    let n1 = p.next()
+    if n1.kind != TK_ID && n1.kind != TK_QID { return Err(oraErr(4070, "invalid trigger name")) }
+    var trSchema = ""
+    var trName = n1.low.clone()
+    var trSpell = strings.toUpperAscii(&n1.text)
+    if p.acceptOp(".") {
+        let n2 = p.next()
+        if n2.kind != TK_ID && n2.kind != TK_QID { return Err(oraErr(4070, "invalid trigger name")) }
+        trSchema = n1.low.clone()
+        trName = n2.low.clone()
+        trSpell = strings.toUpperAscii(&n2.text)
+    }
+
+    // timing: BEFORE | AFTER | INSTEAD OF
+    var timing = 0
+    if p.acceptKw("before") { timing = lexdb_trigger.TT_BEFORE }
+    else if p.acceptKw("after") { timing = lexdb_trigger.TT_AFTER }
+    else if p.acceptKw("instead") {
+        try p.expectKw("of")
+        timing = lexdb_trigger.TT_INSTEAD_OF
+    } else {
+        return Err(oraErr(4071, "missing BEFORE, AFTER or INSTEAD OF keyword"))
+    }
+
+    // events: INSERT | UPDATE [OF col, ...] | DELETE joined by OR
+    var events = 0
+    var updCols: []str = []
+    while true {
+        if p.acceptKw("insert") {
+            events = events | lexdb_trigger.TE_INSERT
+        } else if p.acceptKw("update") {
+            events = events | lexdb_trigger.TE_UPDATE
+            if p.acceptKw("of") {
+                while true {
+                    let cn = p.next()
+                    if cn.kind != TK_ID && cn.kind != TK_QID { return Err(oraErr(904, "invalid identifier in UPDATE OF clause")) }
+                    append(mut &updCols, cn.low.clone())
+                    if !p.acceptOp(",") { break }
+                }
+            }
+        } else if p.acceptKw("delete") {
+            events = events | lexdb_trigger.TE_DELETE
+        } else {
+            return Err(oraErr(4072, "invalid trigger type"))
+        }
+        if !p.acceptKw("or") { break }
+    }
+
+    try p.expectKw("on")
+    let t1 = p.next()
+    if t1.kind != TK_ID && t1.kind != TK_QID { return Err(oraErr(903, "invalid table name")) }
+    var target = t1.low.clone()
+    if p.acceptOp(".") {
+        let t2 = p.next()
+        if t2.kind != TK_ID && t2.kind != TK_QID { return Err(oraErr(903, "invalid table name")) }
+        target = lexdb_sql.qual(&t1.low, &t2.low)
+    }
+
+    // Optional clauses in flexible order: REFERENCING, FOR EACH ROW, FOLLOWS/PRECEDES, ENABLE/DISABLE, WHEN (...)
+    var refOld = ""
+    var refNew = ""
+    var refParent = ""
+    var level = if timing == lexdb_trigger.TT_INSTEAD_OF { lexdb_trigger.TL_ROW } else { lexdb_trigger.TL_STATEMENT }
+    var follows: []str = []
+    var precedes: []str = []
+    var enabled = true
+    var whenExpr = ""
+
+    while p.peek().kind != TK_EOF {
+        if p.acceptKw("referencing") {
+            while p.isKw("old") || p.isKw("new") || p.isKw("parent") {
+                let which = p.next().low
+                let _ = p.acceptKw("as")
+                let al = p.next()
+                if al.kind != TK_ID && al.kind != TK_QID { return Err(oraErr(4074, "invalid REFERENCING name")) }
+                if which == "old" { refOld = al.low.clone() }
+                else if which == "new" { refNew = al.low.clone() }
+                else { refParent = al.low.clone() }
+            }
+        } else if p.acceptKw("for") {
+            try p.expectKw("each")
+            try p.expectKw("row")
+            level = lexdb_trigger.TL_ROW
+        } else if p.acceptKw("follows") {
+            while true {
+                let f1 = p.next()
+                var fnm = f1.low.clone()
+                if p.acceptOp(".") { fnm = p.next().low.clone() }
+                append(mut &follows, fnm)
+                if !p.acceptOp(",") { break }
+            }
+        } else if p.acceptKw("precedes") {
+            while true {
+                let p1 = p.next()
+                var pnm = p1.low.clone()
+                if p.acceptOp(".") { pnm = p.next().low.clone() }
+                append(mut &precedes, pnm)
+                if !p.acceptOp(",") { break }
+            }
+        } else if p.acceptKw("enable") {
+            enabled = true
+        } else if p.acceptKw("disable") {
+            enabled = false
+        } else if p.acceptKw("when") {
+            try p.expectOp("(")
+            let startAt = p.peek().s
+            var depth = 1
+            while depth > 0 {
+                let tk = p.peek()
+                if tk.kind == TK_EOF { return Err(oraErr(907, "missing right parenthesis in WHEN clause")) }
+                if tk.kind == TK_OP && tk.text == "(" { depth += 1 }
+                else if tk.kind == TK_OP && tk.text == ")" {
+                    depth -= 1
+                    if depth == 0 { break }
+                }
+                p.pos += 1
+            }
+            let endAt = p.peek().s
+            try p.expectOp(")")
+            whenExpr = strings.trim(&sql[startAt..min(endAt, len(sql))]).toStr()
+        } else {
+            break
+        }
+    }
+
+    if p.peek().kind == TK_EOF {
+        return Err(oraErr(4079, "missing trigger body"))
+    }
+    let bodyStart = p.peek().s
+    let body = strings.trim(&sql[bodyStart..len(sql)]).toStr()
+    // Validate PL/SQL trigger block syntax immediately
+    try validateBody(&body)
+
+    var tr = lexdb_trigger.emptyTrigger()
+    tr.dialect = lexdb_trigger.TD_ORA
+    tr.name = trName
+    tr.spell = trSpell
+    tr.schema = trSchema
+    tr.target = target.clone()
+    tr.timing = timing
+    tr.events = events
+    tr.level = level
+    tr.cols = updCols
+    tr.whenExpr = whenExpr
+    tr.body = body
+    tr.def = sql
+    tr.refOld = refOld
+    tr.refNew = refNew
+    tr.refParent = refParent
+    tr.enabled = enabled
+    tr.follows = follows
+    tr.precedes = precedes
+
+    var s = lexdb_sql.newStmt(lexdb_sql.S_CREATE_TRIGGER)
+    s.mdialect = lexdb_sql.MD_ORA
+    s.ifFlag = orReplace
+    s.table = target
+    s.mvOpts = lexdb_trigger.encode(&tr)
+    return Ok(s)
+}
+
+// ---- PL/SQL AST
+
+const ST_BLOCK = 1
+const ST_ASSIGN = 2
+const ST_IF = 3
+const ST_CASE = 4
+const ST_LOOP = 5
+const ST_WHILE = 6
+const ST_FOR_INT = 7
+const ST_FOR_QUERY = 8
+const ST_EXIT = 9
+const ST_RETURN = 10
+const ST_RAISE = 11
+const ST_RAISE_APP = 12
+const ST_EXEC_IMM = 13
+const ST_SQL = 14
+const ST_NULL = 15
+
+type Decl = record {
+    name: str
+    typName: str
+    isExc: bool
+    isPragma: bool
+    pragmaCode: int
+    isConst: bool
+    notNull: bool
+    hasInit: bool
+    initExpr: str
+}
+
+type ExcHandler = record {
+    conds: []str
+    body: []OStmt
+}
+
+type OStmt = record {
+    kind: int
+    label: str
+    decls: []Decl
+    body: []OStmt
+    handlers: []ExcHandler
+    target: str
+    expr: str
+    expr2: str
+    conds: []str
+    branches: [][]OStmt
+    elseBody: []OStmt
+    reverse: bool
+    loExpr: str
+    hiExpr: str
+    isCont: bool
+    intoTargets: []str
+    usingExprs: []str
+}
+
+fn emptyOStmt(kind: int): OStmt {
+    return OStmt{
+        kind: kind, label: "", decls: [], body: [], handlers: [], target: "", expr: "", expr2: "",
+        conds: [], branches: [], elseBody: [], reverse: false, loExpr: "", hiExpr: "",
+        isCont: false, intoTargets: [], usingExprs: [],
+    }
+}
+
+// ---- parser
+
+type Parser = record {
+    src: str
+    toks: []Tok
+    pos: int
+}
+
+fn (p: &Parser) peek(): Tok {
+    if p.pos >= len(p.toks) { return p.toks[len(p.toks) - 1].clone() }
+    return p.toks[p.pos].clone()
+}
+
+fn (p: &Parser) peekAt(off: int): Tok {
+    let i = p.pos + off
+    if i < 0 || i >= len(p.toks) { return p.toks[len(p.toks) - 1].clone() }
+    return p.toks[i].clone()
+}
+
+fn (p: mut &Parser) next(): Tok {
+    let t = p.peek()
+    if p.pos < len(p.toks) - 1 { p.pos += 1 }
+    return t
+}
+
+fn (p: &Parser) isKw(w: &str): bool {
+    let t = p.peek()
+    return t.kind == TK_ID && t.low == w
+}
+
+fn (p: &Parser) isOp(w: &str): bool {
+    let t = p.peek()
+    return t.kind == TK_OP && t.text == w
+}
+
+fn (p: mut &Parser) acceptKw(w: &str): bool {
+    if p.isKw(w) { p.pos += 1; return true }
+    return false
+}
+
+fn (p: mut &Parser) acceptOp(w: &str): bool {
+    if p.isOp(w) { p.pos += 1; return true }
+    return false
+}
+
+fn (p: mut &Parser) expectKw(w: &str): Result[Unit, DbErr] {
+    if p.acceptKw(w) { return Ok(Unit{}) }
+    let t = p.peek()
+    let near = if t.kind == TK_EOF { "end of input" } else { t.text.clone() }
+    return Err(oraErr(6550, &("PLS-00103: Encountered the symbol \"" + near + "\" when expecting " + w)))
+}
+
+fn (p: mut &Parser) expectOp(w: &str): Result[Unit, DbErr] {
+    if p.acceptOp(w) { return Ok(Unit{}) }
+    let t = p.peek()
+    let near = if t.kind == TK_EOF { "end of input" } else { t.text.clone() }
+    return Err(oraErr(6550, &("PLS-00103: Encountered the symbol \"" + near + "\" when expecting " + w)))
+}
+
+fn (p: &Parser) sliceSrc(fromIdx: int, toIdx: int): str {
+    if fromIdx >= toIdx || fromIdx >= len(p.toks) { return "" }
+    let s = p.toks[fromIdx].s
+    let e = p.toks[toIdx - 1].e
+    if s >= e || e > len(p.src) { return "" }
+    return strings.trim(&p.src[s..e]).toStr()
+}
+
+fn parseBlockSrc(src: &str): Result[OStmt, DbErr] {
+    let toks = try lex(src)
+    var p = Parser{src: src.toStr(), toks: toks, pos: 0}
+    let blk = try p.parseBlock("")
+    let _ = p.acceptOp(";")
+    if p.peek().kind != TK_EOF {
+        return Err(oraErr(6550, &("PLS-00103: Encountered the symbol \"" + p.peek().text + "\"")))
+    }
+    return Ok(blk)
+}
+
+fn (p: mut &Parser) parseOptLabel(): Result[str, DbErr] {
+    if !p.acceptOp("<<") { return Ok("") }
+    let t = p.next()
+    try p.expectOp(">>")
+    return Ok(t.low.clone())
+}
+
+fn (p: mut &Parser) parseBlock(labelIn: &str): Result[OStmt, DbErr] {
+    var st = emptyOStmt(ST_BLOCK)
+    var lbl = labelIn.toStr()
+    if len(lbl) == 0 && p.isOp("<<") { lbl = try p.parseOptLabel() }
+    st.label = lbl
+    if p.acceptKw("declare") {
+        while !p.isKw("begin") && p.peek().kind != TK_EOF {
+            let d = try p.parseDecl()
+            append(mut &st.decls, d)
+        }
+    }
+    try p.expectKw("begin")
+    st.body = try p.parseStmts(&["exception", "end"])
+    if p.acceptKw("exception") {
+        while p.acceptKw("when") {
+            var h = ExcHandler{conds: [], body: []}
+            while true {
+                let c = p.next()
+                if c.kind != TK_ID { return Err(oraErr(6550, "invalid exception name")) }
+                append(mut &h.conds, c.low.clone())
+                if !p.acceptKw("or") { break }
+            }
+            try p.expectKw("then")
+            h.body = try p.parseStmts(&["when", "end"])
+            append(mut &st.handlers, h)
+        }
+    }
+    try p.expectKw("end")
+    if (p.peek().kind == TK_ID || p.peek().kind == TK_QID) && !p.isKw("if") && !p.isKw("loop") && !p.isKw("case") {
+        let _ = p.next()
+    }
+    return Ok(st)
+}
+
+fn (p: mut &Parser) parseDecl(): Result[Decl, DbErr] {
+    if p.acceptKw("pragma") {
+        let pn = p.next().low
+        var d = Decl{name: "", typName: "", isExc: false, isPragma: true, pragmaCode: 0, isConst: false, notNull: false, hasInit: false, initExpr: ""}
+        if pn == "exception_init" {
+            try p.expectOp("(")
+            d.name = p.next().low.clone()
+            try p.expectOp(",")
+            var sign = 1
+            if p.acceptOp("-") { sign = -1 }
+            else { let _ = p.acceptOp("+") }
+            let numTok = p.next()
+            d.pragmaCode = sign * strings.parseIntOpt(&numTok.text).unwrapOr(0)
+            try p.expectOp(")")
+        } else {
+            try p.skipToSemi()
+        }
+        try p.expectOp(";")
+        return Ok(d)
+    }
+    let nt = p.next()
+    if nt.kind != TK_ID && nt.kind != TK_QID { return Err(oraErr(6550, &("invalid declaration near \"" + nt.text + "\""))) }
+    var d = Decl{name: nt.low.clone(), typName: "", isExc: false, isPragma: false, pragmaCode: 0, isConst: false, notNull: false, hasInit: false, initExpr: ""}
+    if p.acceptKw("exception") {
+        d.isExc = true
+        try p.expectOp(";")
+        return Ok(d)
+    }
+    if p.acceptKw("constant") { d.isConst = true }
+    let ts = p.pos
+    var depth = 0
+    while p.peek().kind != TK_EOF {
+        let t = p.peek()
+        if depth == 0 {
+            if t.kind == TK_OP && (t.text == ";" || t.text == ":=") { break }
+            if t.kind == TK_ID && (t.low == "default" || (t.low == "not" && p.peekAt(1).low == "null")) { break }
+        }
+        if t.kind == TK_OP && t.text == "(" { depth += 1 }
+        else if t.kind == TK_OP && t.text == ")" { if depth > 0 { depth -= 1 } }
+        p.pos += 1
+    }
+    d.typName = p.sliceSrc(ts, p.pos)
+    if p.isKw("not") && p.peekAt(1).low == "null" {
+        p.pos += 2
+        d.notNull = true
+    }
+    if p.acceptOp(":=") || p.acceptKw("default") {
+        let es = p.pos
+        try p.skipToSemi()
+        d.hasInit = true
+        d.initExpr = p.sliceSrc(es, p.pos)
+    }
+    try p.expectOp(";")
+    return Ok(d)
+}
+
+fn (p: mut &Parser) skipToSemi(): Result[Unit, DbErr] {
+    var depth = 0
+    while p.peek().kind != TK_EOF {
+        let t = p.peek()
+        if depth == 0 && t.kind == TK_OP && t.text == ";" { return Ok(Unit{}) }
+        if t.kind == TK_OP && t.text == "(" { depth += 1 }
+        else if t.kind == TK_OP && t.text == ")" { if depth > 0 { depth -= 1 } }
+        p.pos += 1
+    }
+    return Err(oraErr(6550, "PLS-00103: missing semicolon"))
+}
+
+fn (p: mut &Parser) readUntilKw(stops: &[]str): Result[str, DbErr] {
+    let start = p.pos
+    var depth = 0
+    while p.peek().kind != TK_EOF {
+        let t = p.peek()
+        if depth == 0 && t.kind == TK_ID {
+            for sw in stops { if t.low == sw { return Ok(p.sliceSrc(start, p.pos)) } }
+        }
+        if depth == 0 && t.kind == TK_OP && t.text == ";" { return Ok(p.sliceSrc(start, p.pos)) }
+        if t.kind == TK_OP && t.text == "(" { depth += 1 }
+        else if t.kind == TK_OP && t.text == ")" { if depth > 0 { depth -= 1 } }
+        p.pos += 1
+    }
+    return Err(oraErr(6550, "unexpected end of PL/SQL block"))
+}
+
+fn (p: mut &Parser) parseStmts(stops: &[]str): Result[[]OStmt, DbErr] {
+    var out: []OStmt = []
+    while p.peek().kind != TK_EOF {
+        while p.acceptOp(";") {}
+        let t = p.peek()
+        if t.kind == TK_EOF { break }
+        if t.kind == TK_ID {
+            var stop = false
+            for sw in stops { if t.low == sw { stop = true; break } }
+            if stop { break }
+        }
+        append(mut &out, try p.parseStmt())
+    }
+    return Ok(out)
+}
+
+fn (p: mut &Parser) parseStmt(): Result[OStmt, DbErr] {
+    var lbl = ""
+    if p.isOp("<<") { lbl = try p.parseOptLabel() }
+    let t = p.peek()
+    if t.kind == TK_ID {
+        match t.low {
+            "declare", "begin" {
+                let blk = try p.parseBlock(&lbl)
+                try p.expectOp(";")
+                return Ok(blk)
+            }
+            "if" { return p.parseIf() }
+            "case" { return p.parseCase() }
+            "loop" {
+                p.pos += 1
+                var st = emptyOStmt(ST_LOOP)
+                st.label = lbl
+                st.body = try p.parseStmts(&["end"])
+                try p.expectKw("end")
+                try p.expectKw("loop")
+                if p.peek().kind == TK_ID || p.peek().kind == TK_QID { let _ = p.next() }
+                try p.expectOp(";")
+                return Ok(st)
+            }
+            "while" {
+                p.pos += 1
+                var st = emptyOStmt(ST_WHILE)
+                st.label = lbl
+                st.expr = try p.readUntilKw(&["loop"])
+                try p.expectKw("loop")
+                st.body = try p.parseStmts(&["end"])
+                try p.expectKw("end")
+                try p.expectKw("loop")
+                if p.peek().kind == TK_ID || p.peek().kind == TK_QID { let _ = p.next() }
+                try p.expectOp(";")
+                return Ok(st)
+            }
+            "for" { return p.parseFor(&lbl) }
+            "exit", "continue" {
+                let isCont = t.low == "continue"
+                p.pos += 1
+                var st = emptyOStmt(ST_EXIT)
+                st.isCont = isCont
+                if (p.peek().kind == TK_ID || p.peek().kind == TK_QID) && !p.isKw("when") {
+                    st.label = p.next().low.clone()
+                }
+                if p.acceptKw("when") {
+                    let es = p.pos
+                    try p.skipToSemi()
+                    st.expr = p.sliceSrc(es, p.pos)
+                }
+                try p.expectOp(";")
+                return Ok(st)
+            }
+            "return" {
+                p.pos += 1
+                try p.expectOp(";")
+                return Ok(emptyOStmt(ST_RETURN))
+            }
+            "raise" {
+                p.pos += 1
+                var st = emptyOStmt(ST_RAISE)
+                if !p.isOp(";") {
+                    st.target = p.next().low.clone()
+                }
+                try p.expectOp(";")
+                return Ok(st)
+            }
+            "raise_application_error" {
+                p.pos += 1
+                try p.expectOp("(")
+                var args: []str = []
+                while true {
+                    let as0 = p.pos
+                    var d = 0
+                    while p.peek().kind != TK_EOF {
+                        let tk = p.peek()
+                        if d == 0 && tk.kind == TK_OP && (tk.text == "," || tk.text == ")") { break }
+                        if tk.kind == TK_OP && tk.text == "(" { d += 1 }
+                        else if tk.kind == TK_OP && tk.text == ")" { if d > 0 { d -= 1 } }
+                        p.pos += 1
+                    }
+                    append(mut &args, p.sliceSrc(as0, p.pos))
+                    if !p.acceptOp(",") { break }
+                }
+                try p.expectOp(")")
+                try p.expectOp(";")
+                if len(args) < 2 { return Err(oraErr(6550, "RAISE_APPLICATION_ERROR requires code and message")) }
+                var st = emptyOStmt(ST_RAISE_APP)
+                st.expr = args[0].clone()
+                st.expr2 = args[1].clone()
+                return Ok(st)
+            }
+            "execute" { return p.parseExecImm() }
+            "null" {
+                p.pos += 1
+                try p.expectOp(";")
+                return Ok(emptyOStmt(ST_NULL))
+            }
+            "select", "insert", "update", "delete", "merge", "with" {
+                return p.parseEmbeddedSql()
+            }
+            "commit", "rollback" {
+                return Err(oraErr(4092, "cannot COMMIT or ROLLBACK in a trigger"))
+            }
+            else {}
+        }
+    }
+    // Assignment: :NEW.col := expr; or :OLD.col := expr; or var[.field] := expr;
+    let save = p.pos
+    var tgt = ""
+    if p.acceptOp(":") {
+        let r = p.next()
+        if (r.kind == TK_ID || r.kind == TK_QID) && p.acceptOp(".") {
+            let f = p.next()
+            if f.kind == TK_ID || f.kind == TK_QID {
+                tgt = ":" + r.low + "." + f.low
+            }
+        }
+    } else if t.kind == TK_ID || t.kind == TK_QID {
+        tgt = p.next().low.clone()
+        if p.acceptOp(".") {
+            let f = p.next()
+            if f.kind == TK_ID || f.kind == TK_QID { tgt = tgt + "." + f.low }
+        }
+    }
+    if len(tgt) > 0 && p.acceptOp(":=") {
+        let es = p.pos
+        try p.skipToSemi()
+        var st = emptyOStmt(ST_ASSIGN)
+        st.target = tgt
+        st.expr = p.sliceSrc(es, p.pos)
+        try p.expectOp(";")
+        return Ok(st)
+    }
+    p.pos = save
+    return Err(oraErr(6550, &("PLS-00103: Encountered the symbol \"" + t.text + "\"")))
+}
+
+fn (p: mut &Parser) parseIf(): Result[OStmt, DbErr] {
+    try p.expectKw("if")
+    var st = emptyOStmt(ST_IF)
+    let c0 = try p.readUntilKw(&["then"])
+    try p.expectKw("then")
+    let b0 = try p.parseStmts(&["elsif", "else", "end"])
+    append(mut &st.conds, c0)
+    append(mut &st.branches, b0)
+    while p.acceptKw("elsif") {
+        let ci = try p.readUntilKw(&["then"])
+        try p.expectKw("then")
+        let bi = try p.parseStmts(&["elsif", "else", "end"])
+        append(mut &st.conds, ci)
+        append(mut &st.branches, bi)
+    }
+    if p.acceptKw("else") { st.elseBody = try p.parseStmts(&["end"]) }
+    try p.expectKw("end")
+    try p.expectKw("if")
+    try p.expectOp(";")
+    return Ok(st)
+}
+
+fn (p: mut &Parser) parseCase(): Result[OStmt, DbErr] {
+    try p.expectKw("case")
+    var st = emptyOStmt(ST_CASE)
+    if !p.isKw("when") { st.expr = try p.readUntilKw(&["when"]) }
+    while p.acceptKw("when") {
+        let w = try p.readUntilKw(&["then"])
+        try p.expectKw("then")
+        let b = try p.parseStmts(&["when", "else", "end"])
+        append(mut &st.conds, w)
+        append(mut &st.branches, b)
+    }
+    if p.acceptKw("else") { st.elseBody = try p.parseStmts(&["end"]) }
+    try p.expectKw("end")
+    let _ = p.acceptKw("case")
+    try p.expectOp(";")
+    return Ok(st)
+}
+
+fn (p: mut &Parser) parseFor(lbl: &str): Result[OStmt, DbErr] {
+    try p.expectKw("for")
+    let vt = p.next()
+    try p.expectKw("in")
+    let rev = p.acceptKw("reverse")
+    let headStart = p.pos
+    var depth = 0
+    var dotsAt = -1
+    while p.peek().kind != TK_EOF {
+        let t = p.peek()
+        if depth == 0 && t.kind == TK_ID && t.low == "loop" { break }
+        if depth == 0 && t.kind == TK_OP && t.text == ".." && dotsAt < 0 { dotsAt = p.pos }
+        if t.kind == TK_OP && t.text == "(" { depth += 1 }
+        else if t.kind == TK_OP && t.text == ")" { if depth > 0 { depth -= 1 } }
+        p.pos += 1
+    }
+    let headEnd = p.pos
+    try p.expectKw("loop")
+    let body = try p.parseStmts(&["end"])
+    try p.expectKw("end")
+    try p.expectKw("loop")
+    if p.peek().kind == TK_ID || p.peek().kind == TK_QID { let _ = p.next() }
+    try p.expectOp(";")
+    if dotsAt >= 0 {
+        var st = emptyOStmt(ST_FOR_INT)
+        st.label = lbl.toStr()
+        st.target = vt.low.clone()
+        st.reverse = rev
+        st.loExpr = p.sliceSrc(headStart, dotsAt)
+        st.hiExpr = p.sliceSrc(dotsAt + 1, headEnd)
+        st.body = body
+        return Ok(st)
+    }
+    var qsrc = p.sliceSrc(headStart, headEnd)
+    if len(qsrc) >= 2 && qsrc[0] == '(' && qsrc[len(qsrc) - 1] == ')' {
+        qsrc = strings.trim(&qsrc[1..len(qsrc) - 1]).toStr()
+    }
+    var st = emptyOStmt(ST_FOR_QUERY)
+    st.label = lbl.toStr()
+    st.target = vt.low.clone()
+    st.expr = qsrc
+    st.body = body
+    return Ok(st)
+}
+
+fn (p: mut &Parser) parseExecImm(): Result[OStmt, DbErr] {
+    try p.expectKw("execute")
+    try p.expectKw("immediate")
+    var st = emptyOStmt(ST_EXEC_IMM)
+    let es = p.pos
+    var depth = 0
+    while p.peek().kind != TK_EOF {
+        let t = p.peek()
+        if depth == 0 {
+            if t.kind == TK_OP && t.text == ";" { break }
+            if t.kind == TK_ID && (t.low == "into" || t.low == "using") { break }
+        }
+        if t.kind == TK_OP && t.text == "(" { depth += 1 }
+        else if t.kind == TK_OP && t.text == ")" { if depth > 0 { depth -= 1 } }
+        p.pos += 1
+    }
+    st.expr = p.sliceSrc(es, p.pos)
+    if p.acceptKw("into") {
+        while true {
+            var nm = p.next().low.clone()
+            if p.acceptOp(".") { nm = nm + "." + p.next().low }
+            append(mut &st.intoTargets, nm)
+            if !p.acceptOp(",") { break }
+        }
+    }
+    if p.acceptKw("using") {
+        while true {
+            let us = p.pos
+            var d = 0
+            while p.peek().kind != TK_EOF {
+                let t = p.peek()
+                if d == 0 && t.kind == TK_OP && (t.text == "," || t.text == ";") { break }
+                if t.kind == TK_OP && t.text == "(" { d += 1 }
+                else if t.kind == TK_OP && t.text == ")" { if d > 0 { d -= 1 } }
+                p.pos += 1
+            }
+            append(mut &st.usingExprs, p.sliceSrc(us, p.pos))
+            if !p.acceptOp(",") { break }
+        }
+    }
+    try p.expectOp(";")
+    return Ok(st)
+}
+
+fn (p: mut &Parser) parseEmbeddedSql(): Result[OStmt, DbErr] {
+    var st = emptyOStmt(ST_SQL)
+    let firstKw = p.peek().low
+    let start = p.pos
+    var depth = 0
+    var intoStart = -1
+    var intoEnd = -1
+    var seenReturning = false
+    while p.peek().kind != TK_EOF {
+        let t = p.peek()
+        if depth == 0 && t.kind == TK_OP && t.text == ";" { break }
+        if depth == 0 && t.kind == TK_ID {
+            if t.low == "returning" { seenReturning = true }
+            if t.low == "into" && (firstKw == "select" || seenReturning) && intoStart < 0 {
+                intoStart = p.pos
+                p.pos += 1
+                while true {
+                    var nm = ""
+                    if p.acceptOp(":") {
+                        let r = p.next()
+                        try p.expectOp(".")
+                        let f = p.next()
+                        nm = ":" + r.low + "." + f.low
+                    } else {
+                        let nt = p.next()
+                        nm = nt.low.clone()
+                        if p.acceptOp(".") { nm = nm + "." + p.next().low }
+                    }
+                    append(mut &st.intoTargets, nm)
+                    if !p.acceptOp(",") { break }
+                }
+                intoEnd = p.pos
+                continue
+            }
+        }
+        if t.kind == TK_OP && t.text == "(" { depth += 1 }
+        else if t.kind == TK_OP && t.text == ")" { if depth > 0 { depth -= 1 } }
+        p.pos += 1
+    }
+    let endPos = p.pos
+    try p.expectOp(";")
+    if intoStart >= 0 {
+        let before = p.sliceSrc(start, intoStart)
+        let after = p.sliceSrc(intoEnd, endPos)
+        st.expr = strings.trim(&(before + " " + after)).toStr()
+    } else {
+        st.expr = p.sliceSrc(start, endPos)
+    }
+    return Ok(st)
+}
+
+// ---- runtime environment
+
+type VarSlot = record {
+    name: str
+    val: Val
+    typ: TypeName
+    hasType: bool
+    isConst: bool
+    notNull: bool
+}
+
+type RecSlot = record {
+    name: str
+    cols: []str
+    types: []TypeName
+    vals: []Val
+    isNull: bool
+}
+
+type UserExc = record {
+    name: str
+    code: int       // negative Oracle error code if PRAGMA EXCEPTION_INIT, else positive synthetic
+}
+
+const FL_NONE = 0
+const FL_RETURN = 1
+const FL_EXIT = 2
+const FL_CONTINUE = 3
+
+type Flow = record {
+    kind: int
+    label: str
+}
+
+fn noFlow(): Flow { return Flow{kind: FL_NONE, label: ""} }
+
+type RunEnv = record {
+    vars: []VarSlot
+    recs: []RecSlot
+    excs: []UserExc
+    timing: int
+    event: int
+    cols: []lexdb_sql.ColDef
+    updatedCols: []bool
+    oldAlias: str
+    newAlias: str
+    sqlRowCount: int
+    sqlFound: bool
+    curErrCode: int
+    curErrState: str
+    curErrMsg: str
+    newModified: bool
+    hasNew: bool
+    hasOld: bool
+}
+
+fn (e: &RunEnv) findVar(name: &str): int {
+    var i = len(e.vars) - 1
+    while i >= 0 {
+        if e.vars[i].name == name { return i }
+        i -= 1
+    }
+    return -1
+}
+
+fn (e: &RunEnv) findRec(name: &str): int {
+    var i = len(e.recs) - 1
+    while i >= 0 {
+        if e.recs[i].name == name { return i }
+        i -= 1
+    }
+    return -1
+}
+
+fn (e: &RunEnv) findExc(name: &str): int {
+    var i = len(e.excs) - 1
+    while i >= 0 {
+        if e.excs[i].name == name { return i }
+        i -= 1
+    }
+    return -1
+}
+
+type ParsedOraType = record {
+    isRec: bool
+    typ: TypeName
+    hasType: bool
+}
+
+fn parseOraTypeSpec(spec: &str): ParsedOraType {
+    let low = strings.toLowerAscii(&(strings.trim(spec)))
+    if strings.endsWith(&low, "%rowtype") {
+        return ParsedOraType{isRec: true, typ: lexdb_sql.oidType(lexdb_sql.OID_TEXT), hasType: false}
+    }
+    if strings.endsWith(&low, "%type") {
+        return ParsedOraType{isRec: false, typ: lexdb_sql.oidType(lexdb_sql.OID_TEXT), hasType: false}
+    }
+    if strings.startsWith(&low, "varchar") || strings.startsWith(&low, "nvarchar") || strings.startsWith(&low, "char") || low == "clob" || low == "nclob" {
+        return ParsedOraType{isRec: false, typ: lexdb_sql.oidType(lexdb_sql.OID_TEXT), hasType: true}
+    }
+    if low == "integer" || low == "int" || low == "pls_integer" || low == "binary_integer" || low == "simple_integer" || low == "natural" || low == "positive" {
+        return ParsedOraType{isRec: false, typ: lexdb_sql.oidType(lexdb_sql.OID_INT8), hasType: true}
+    }
+    if strings.startsWith(&low, "number") || strings.startsWith(&low, "numeric") || strings.startsWith(&low, "decimal") {
+        return ParsedOraType{isRec: false, typ: lexdb_sql.oidType(lexdb_sql.OID_NUMERIC), hasType: true}
+    }
+    if low == "boolean" || low == "bool" {
+        return ParsedOraType{isRec: false, typ: lexdb_sql.oidType(lexdb_sql.OID_BOOL), hasType: true}
+    }
+    if low == "date" || strings.startsWith(&low, "timestamp") {
+        return ParsedOraType{isRec: false, typ: lexdb_sql.oidType(lexdb_sql.OID_TS), hasType: true}
+    }
+    return ParsedOraType{isRec: false, typ: lexdb_sql.oidType(lexdb_sql.OID_TEXT), hasType: false}
+}
+
+fn oidOfVal(v: &Val): int {
+    match v {
+        Val.Null { return lexdb_sql.OID_TEXT }
+        Val.Bool(_) { return lexdb_sql.OID_BOOL }
+        Val.Int(_) { return lexdb_sql.OID_INT8 }
+        Val.Float(_) { return lexdb_sql.OID_FLOAT8 }
+        Val.Real(_) { return lexdb_sql.OID_FLOAT4 }
+        Val.Num(_) { return lexdb_sql.OID_NUMERIC }
+        Val.Text(_) { return lexdb_sql.OID_TEXT }
+        Val.Bytes(_) { return lexdb_sql.OID_BYTEA }
+        Val.Date(_) { return lexdb_sql.OID_DATE }
+        Val.Time(_) { return lexdb_sql.OID_TIME }
+        Val.Ts(_) { return lexdb_sql.OID_TS }
+        Val.Tstz(_) { return lexdb_sql.OID_TSTZ }
+        Val.Tsz(_, _) { return lexdb_sql.OID_TSTZ }
+        Val.Ival(_) { return 1186 }
+        Val.Uuid(_) { return lexdb_sql.OID_UUID }
+        Val.Reg(o, _) { return o }
+    }
+}
+
+fn recFieldIdx(r: &RecSlot, col: &str): int {
+    for i in 0..len(r.cols) {
+        if r.cols[i] == col { return i }
+    }
+    return -1
+}
+
+fn colWasUpdated(env: &RunEnv, colName: &str): bool {
+    if env.event != lexdb_trigger.TE_UPDATE { return false }
+    let low = strings.toLowerAscii(colName)
+    for i in 0..len(env.cols) {
+        if env.cols[i].name == low {
+            return i < len(env.updatedCols) && env.updatedCols[i]
+        }
+    }
+    return false
+}
+
+type SubstRes = record {
+    sql: str
+    params: []Val
+    ptypes: []int
+}
+
+// Substitute :NEW.col, :OLD.col (or custom REFERENCING aliases), uncolonized NEW.col/OLD.col in WHEN,
+// INSERTING/UPDATING/DELETING/UPDATING('COL'), SQL%ROWCOUNT/SQL%FOUND/SQL%NOTFOUND, SQLCODE/SQLERRM,
+// and local PL/SQL variables into Oracle SQL with $1..$n positional parameters.
+fn substOraSql(env: &RunEnv, sql: &str, isWhen: bool, isExpr: bool): Result[SubstRes, DbErr] {
+    let toks = try lex(sql)
+    var params: []Val = []
+    var ptypes: []int = []
+    var out = ""
+    var i = 0
+    let n = len(toks) - 1
+    var inSetLhs = false
+    var inInsertCols = false
+    var insParenDepth = 0
+    while i < n {
+        let t = &toks[i]
+        let prev = if i > 0 { toks[i - 1].clone() } else { Tok{kind: TK_EOF, text: "", low: "", val: "", s: 0, e: 0} }
+        let next = if i + 1 < n { toks[i + 1].clone() } else { Tok{kind: TK_EOF, text: "", low: "", val: "", s: 0, e: 0} }
+
+        if !isExpr && !isWhen && t.kind == TK_ID {
+            if t.low == "set" { inSetLhs = true }
+            else if t.low == "where" || t.low == "from" || t.low == "returning" { inSetLhs = false }
+            else if t.low == "into" && prev.low == "insert" { inInsertCols = true; insParenDepth = 0 }
+            else if t.low == "values" || t.low == "select" || t.low == "default" { inInsertCols = false }
+        }
+        if !isExpr && !isWhen && inSetLhs && t.kind == TK_OP {
+            if t.text == "=" { inSetLhs = false }
+            else if t.text == "," { inSetLhs = true }
+        }
+        if !isExpr && !isWhen && inInsertCols && t.kind == TK_OP {
+            if t.text == "(" { insParenDepth += 1 }
+            else if t.text == ")" { insParenDepth -= 1; if insParenDepth <= 0 { inInsertCols = false } }
+        }
+
+        // :NEW.col / :OLD.col (or custom REFERENCING aliases)
+        if t.kind == TK_OP && t.text == ":" && i + 3 < n && toks[i + 2].kind == TK_OP && toks[i + 2].text == "." {
+            let rtok = &toks[i + 1]
+            let ftok = &toks[i + 3]
+            if (rtok.kind == TK_ID || rtok.kind == TK_QID) && (ftok.kind == TK_ID || ftok.kind == TK_QID) {
+                var rname = ""
+                if rtok.low == env.newAlias { rname = "new" }
+                else if rtok.low == env.oldAlias { rname = "old" }
+                if len(rname) > 0 {
+                    let ri = env.findRec(&rname)
+                    if ri >= 0 {
+                        let rec = &env.recs[ri]
+                        let fi = recFieldIdx(rec, &ftok.low)
+                        if fi < 0 { return Err(oraErr(49, &("bad bind variable '" + rtok.text + "." + ftok.text + "'"))) }
+                        let v = if rec.isNull { Val.Null } else { rec.vals[fi].clone() }
+                        let o = if fi < len(rec.types) && rec.types[fi].oid > 0 { rec.types[fi].oid } else { oidOfVal(&v) }
+                        append(mut &params, v)
+                        append(mut &ptypes, o)
+                        out = out + " $" + len(params).toStr() + " "
+                        i += 4
+                        continue
+                    }
+                }
+            }
+        }
+
+        // In WHEN (...) clause: uncolonized NEW.col / OLD.col (or custom REFERENCING aliases)
+        if isWhen && (t.kind == TK_ID || t.kind == TK_QID) && prev.text != "." && next.kind == TK_OP && next.text == "." && i + 2 < n {
+            var rname = ""
+            if t.low == env.newAlias { rname = "new" }
+            else if t.low == env.oldAlias { rname = "old" }
+            if len(rname) > 0 {
+                let ri = env.findRec(&rname)
+                let ftok = &toks[i + 2]
+                if ri >= 0 && (ftok.kind == TK_ID || ftok.kind == TK_QID) {
+                    let rec = &env.recs[ri]
+                    let fi = recFieldIdx(rec, &ftok.low)
+                    if fi < 0 { return Err(oraErr(904, &("\"" + strings.toUpperAscii(&ftok.text) + "\": invalid identifier"))) }
+                    let v = if rec.isNull { Val.Null } else { rec.vals[fi].clone() }
+                    let o = if fi < len(rec.types) && rec.types[fi].oid > 0 { rec.types[fi].oid } else { oidOfVal(&v) }
+                    append(mut &params, v)
+                    append(mut &ptypes, o)
+                    out = out + " $" + len(params).toStr() + " "
+                    i += 3
+                    continue
+                }
+            }
+        }
+
+        // Oracle trigger predicates: INSERTING, UPDATING, UPDATING('COL'), DELETING
+        if t.kind == TK_ID && prev.text != "." && next.text != "." {
+            if t.low == "inserting" && next.text != "(" {
+                append(mut &params, Val.Bool(env.event == lexdb_trigger.TE_INSERT))
+                append(mut &ptypes, lexdb_sql.OID_BOOL)
+                out = out + " $" + len(params).toStr() + " "
+                i += 1
+                continue
+            }
+            if t.low == "deleting" && next.text != "(" {
+                append(mut &params, Val.Bool(env.event == lexdb_trigger.TE_DELETE))
+                append(mut &ptypes, lexdb_sql.OID_BOOL)
+                out = out + " $" + len(params).toStr() + " "
+                i += 1
+                continue
+            }
+            if t.low == "updating" {
+                if next.kind == TK_OP && next.text == "(" && i + 3 < n && toks[i + 2].kind == TK_STR && toks[i + 3].text == ")" {
+                    let hit = colWasUpdated(env, &toks[i + 2].val)
+                    append(mut &params, Val.Bool(hit))
+                    append(mut &ptypes, lexdb_sql.OID_BOOL)
+                    out = out + " $" + len(params).toStr() + " "
+                    i += 4
+                    continue
+                }
+                if next.text != "(" {
+                    append(mut &params, Val.Bool(env.event == lexdb_trigger.TE_UPDATE))
+                    append(mut &ptypes, lexdb_sql.OID_BOOL)
+                    out = out + " $" + len(params).toStr() + " "
+                    i += 1
+                    continue
+                }
+            }
+            // SQL%ROWCOUNT / SQL%FOUND / SQL%NOTFOUND
+            if t.low == "sql" && next.kind == TK_OP && next.text == "%" && i + 2 < n && toks[i + 2].kind == TK_ID {
+                let attr = &toks[i + 2].low
+                if attr == "rowcount" {
+                    append(mut &params, Val.Int(env.sqlRowCount))
+                    append(mut &ptypes, lexdb_sql.OID_INT8)
+                    out = out + " $" + len(params).toStr() + " "
+                    i += 3
+                    continue
+                }
+                if attr == "found" || attr == "notfound" {
+                    append(mut &params, Val.Bool(if attr == "found" { env.sqlFound } else { !env.sqlFound }))
+                    append(mut &ptypes, lexdb_sql.OID_BOOL)
+                    out = out + " $" + len(params).toStr() + " "
+                    i += 3
+                    continue
+                }
+            }
+            if t.low == "sqlcode" && next.text != "(" {
+                append(mut &params, Val.Int(env.curErrCode))
+                append(mut &ptypes, lexdb_sql.OID_INT8)
+                out = out + " $" + len(params).toStr() + " "
+                i += 1
+                continue
+            }
+            if t.low == "sqlerrm" && next.text != "(" {
+                append(mut &params, Val.Text(env.curErrMsg.clone()))
+                append(mut &ptypes, lexdb_sql.OID_TEXT)
+                out = out + " $" + len(params).toStr() + " "
+                i += 1
+                continue
+            }
+        }
+
+        // Loop / declared record.field
+        if (t.kind == TK_ID || t.kind == TK_QID) && prev.text != "." && prev.text != ":" && next.kind == TK_OP && next.text == "." && i + 2 < n {
+            let ri = env.findRec(&t.low)
+            if ri >= 0 && t.low != "new" && t.low != "old" {
+                let ftok = &toks[i + 2]
+                if ftok.kind == TK_ID || ftok.kind == TK_QID {
+                    let rec = &env.recs[ri]
+                    let fi = recFieldIdx(rec, &ftok.low)
+                    if fi >= 0 {
+                        let v = if rec.isNull { Val.Null } else { rec.vals[fi].clone() }
+                        let o = if fi < len(rec.types) && rec.types[fi].oid > 0 { rec.types[fi].oid } else { oidOfVal(&v) }
+                        append(mut &params, v)
+                        append(mut &ptypes, o)
+                        out = out + " $" + len(params).toStr() + " "
+                        i += 3
+                        continue
+                    }
+                }
+            }
+        }
+
+        // Local scalar variable
+        if !isWhen && (t.kind == TK_ID || t.kind == TK_QID) && prev.text != "." && prev.text != ":" && next.text != "(" && next.text != "." && !inSetLhs && !inInsertCols {
+            let skipPrev = prev.kind == TK_ID && (prev.low == "as" || prev.low == "from" || prev.low == "join" || prev.low == "into" || prev.low == "update" || prev.low == "table")
+            if !skipPrev {
+                let vi = env.findVar(&t.low)
+                if vi >= 0 {
+                    let v = env.vars[vi].val.clone()
+                    let o = if env.vars[vi].hasType && env.vars[vi].typ.oid > 0 { env.vars[vi].typ.oid } else { oidOfVal(&v) }
+                    append(mut &params, v)
+                    append(mut &ptypes, o)
+                    out = out + " $" + len(params).toStr() + " "
+                    i += 1
+                    continue
+                }
+            }
+        }
+
+        if t.kind == TK_QID {
+            out = out + " \"" + strings.replaceAll(&t.text, "\"", "\"\"") + "\" "
+        } else {
+            out = out + " " + t.text + " "
+        }
+        i += 1
+    }
+    return Ok(SubstRes{sql: strings.trim(&out).toStr(), params: params, ptypes: ptypes})
+}
+
+fn runOraSql(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sql: &str, params: &[]Val, ptypes: &[]int): Result[lexdb_exec.Res, DbErr] {
+    let rewritten = lexdb_oratext.oracleSql(sql)
+    let stmts = try lexdb_parse.parseFor(&rewritten, lexdb_sql.MD_ORA)
+    if len(stmts) == 0 { return Err(oraErr(900, "invalid SQL statement")) }
+    return lexdb_exec.execNested(st, txn, &stmts[0], params, ptypes)
+}
+
+fn evalExpr(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, env: &RunEnv, exprSrc: &str, isWhen: bool): Result[Val, DbErr] {
+    let sub = try substOraSql(env, exprSrc, isWhen, true)
+    let res = try runOraSql(st, txn, &("SELECT " + sub.sql + " FROM DUAL"), &sub.params, &sub.ptypes)
+    if len(res.rows) == 0 || len(res.rows[0]) == 0 { return Ok(Val.Null) }
+    return Ok(res.rows[0][0].clone())
+}
+
+fn evalBool(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, env: &RunEnv, exprSrc: &str, isWhen: bool): Result[bool, DbErr] {
+    let v = try evalExpr(st, txn, env, exprSrc, isWhen)
+    return Ok(lexdb_ops.truth(&v) == Some(true))
+}
+
+fn evalInt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, env: &RunEnv, exprSrc: &str): Result[int, DbErr] {
+    let v = try evalExpr(st, txn, env, exprSrc, false)
+    match v {
+        Val.Int(n) { return Ok(n) }
+        else {
+            match strings.parseIntOpt(&lexdb_sql.text(&v)) {
+                Some(n) { return Ok(n) }
+                None { return Err(oraErr(6502, &("PL/SQL: numeric or value error: " + lexdb_sql.text(&v)))) }
+            }
+        }
+    }
+}
+
+fn tagRowCount(tag: &str): int {
+    let sp = strings.lastIndexOf(tag, " ")
+    if sp >= 0 && sp + 1 < len(tag) {
+        return strings.parseIntOpt(&tag[sp + 1..len(tag)]).unwrapOr(0)
+    }
+    return 0
+}
+
+fn assignTarget(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, env: mut &RunEnv, target: &str, v0: Val): Result[Unit, DbErr] {
+    if strings.startsWith(target, ":") {
+        let rest = &target[1..len(target)]
+        let dot = strings.indexOf(rest, ".", 0)
+        if dot <= 0 { return Err(oraErr(49, &("bad bind variable '" + rest + "'"))) }
+        let ralias = rest[0..dot].toStr()
+        let fname = rest[dot + 1..len(rest)].toStr()
+        if ralias == env.oldAlias {
+            return Err(oraErr(4085, "cannot change the value of OLD reference variables"))
+        }
+        if ralias != env.newAlias {
+            return Err(oraErr(49, &("bad bind variable '" + rest + "'")))
+        }
+        if env.timing == lexdb_trigger.TT_AFTER {
+            return Err(oraErr(4084, "cannot change NEW values for this trigger type"))
+        }
+        let ri = env.findRec(&"new")
+        if ri < 0 || env.recs[ri].isNull {
+            return Err(oraErr(4084, "cannot change NEW values for this trigger type"))
+        }
+        let fi = recFieldIdx(&env.recs[ri], &fname)
+        if fi < 0 { return Err(oraErr(49, &("bad bind variable '" + rest + "'"))) }
+        var v = v0
+        if fi < len(env.recs[ri].types) && env.recs[ri].types[fi].oid > 0 {
+            v = try lexdb_ops.coerceZ(v, &env.recs[ri].types[fi], &txn.sql.zone)
+        }
+        env.recs[ri].vals[fi] = v
+        env.newModified = true
+        return Ok(Unit{})
+    }
+    let dot = strings.indexOf(target, ".", 0)
+    if dot > 0 {
+        let rname = target[0..dot].toStr()
+        let fname = target[dot + 1..len(target)].toStr()
+        let ri = env.findRec(&rname)
+        if ri < 0 { return Err(oraErr(6550, &("identifier '" + target + "' must be declared"))) }
+        let fi = recFieldIdx(&env.recs[ri], &fname)
+        if fi < 0 { return Err(oraErr(6550, &("component '" + fname + "' must be declared"))) }
+        env.recs[ri].vals[fi] = v0
+        return Ok(Unit{})
+    }
+    let vi = env.findVar(target)
+    if vi < 0 { return Err(oraErr(6550, &("identifier '" + target + "' must be declared"))) }
+    if env.vars[vi].isConst { return Err(oraErr(6550, &("expression '" + target + "' cannot be used as an assignment target"))) }
+    var v = v0
+    if env.vars[vi].hasType {
+        v = try lexdb_ops.coerceZ(v, &env.vars[vi].typ, &txn.sql.zone)
+    }
+    if env.vars[vi].notNull && lexdb_ops.isNull(&v) {
+        return Err(oraErr(6502, "PL/SQL: numeric or value error: NULL value assigned to NOT NULL variable"))
+    }
+    env.vars[vi].val = v
+    return Ok(Unit{})
+}
+
+fn oraCodeOfErr(err: &DbErr): int {
+    if strings.startsWith(&err.state, "ORA") {
+        let n = strings.parseIntOpt(&err.state[3..len(err.state)]).unwrapOr(0)
+        if n > 0 { return -n }
+    }
+    if err.state == "23505" { return -1 }
+    if err.state == "22012" { return -1476 }
+    if err.state == "P0002" { return 100 }
+    if err.state == "P0003" { return -1422 }
+    return -1
+}
+
+fn matchesOraExc(env: &RunEnv, cond: &str, err: &DbErr): bool {
+    if cond == "others" { return true }
+    let code = oraCodeOfErr(err)
+    if cond == "dup_val_on_index" { return err.state == "23505" || err.state == "ORA00001" }
+    if cond == "no_data_found" { return err.state == "ORA01403" || err.state == "P0002" }
+    if cond == "too_many_rows" { return err.state == "ORA01422" || err.state == "P0003" }
+    if cond == "zero_divide" { return err.state == "22012" || err.state == "ORA01476" }
+    if cond == "value_error" { return err.state == "ORA06502" || err.state == "22P02" || err.state == "22003" }
+    let ei = env.findExc(cond)
+    if ei >= 0 {
+        let ex = &env.excs[ei]
+        if ex.code < 0 && code == ex.code { return true }
+        if err.state == "ORAX" + ex.name { return true }
+    }
+    return false
+}
+
+// ---- executor
+
+fn execBlock(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, env: mut &RunEnv, blk: &OStmt): Result[Flow, DbErr] {
+    let savedVars = len(env.vars)
+    let savedRecs = len(env.recs)
+    let savedExcs = len(env.excs)
+    let hasExc = len(blk.handlers) > 0
+    let mk = if hasExc { txn.mark() } else { 0 }
+
+    var declErr: Option[DbErr] = None
+    for d in blk.decls {
+        if d.isPragma {
+            let ei = env.findExc(&d.name)
+            if ei >= 0 { env.excs[ei].code = d.pragmaCode }
+            continue
+        }
+        if d.isExc {
+            append(mut &env.excs, UserExc{name: d.name.clone(), code: 1})
+            continue
+        }
+        let pt = parseOraTypeSpec(&d.typName)
+        if pt.isRec {
+            append(mut &env.recs, RecSlot{name: d.name.clone(), cols: [], types: [], vals: [], isNull: true})
+        } else {
+            var initVal = Val.Null
+            if d.hasInit {
+                match evalExpr(st, txn, env, &d.initExpr, false) {
+                    Ok(v0) {
+                        if pt.hasType {
+                            match lexdb_ops.coerceZ(v0, &pt.typ, &txn.sql.zone) {
+                                Ok(vc) { initVal = vc }
+                                Err(x) { declErr = Some(x); break }
+                            }
+                        } else { initVal = v0 }
+                    }
+                    Err(x) { declErr = Some(x); break }
+                }
+            }
+            if d.notNull && lexdb_ops.isNull(&initVal) {
+                declErr = Some(oraErr(6502, "PL/SQL: numeric or value error"))
+                break
+            }
+            append(mut &env.vars, VarSlot{name: d.name.clone(), val: initVal, typ: pt.typ, hasType: pt.hasType, isConst: d.isConst, notNull: d.notNull})
+        }
+    }
+
+    var ran: Result[Flow, DbErr] = match declErr {
+        Some(x) { Err(x) }
+        None { execStmts(st, txn, env, &blk.body) }
+    }
+
+    if hasExc {
+        match move(ran) {
+            Ok(fl) { ran = Ok(fl) }
+            Err(errObj) {
+                var matched = -1
+                for hi in 0..len(blk.handlers) {
+                    for c in blk.handlers[hi].conds {
+                        if matchesOraExc(env, &c, &errObj) { matched = hi; break }
+                    }
+                    if matched >= 0 { break }
+                }
+                if matched >= 0 {
+                    txn.undoTo(mk)
+                    lexdb_trigger.undoTo(txn.sql.sess, mk)
+                    let prevCode = env.curErrCode
+                    let prevSt = env.curErrState.clone()
+                    let prevMsg = env.curErrMsg.clone()
+                    env.curErrCode = oraCodeOfErr(&errObj)
+                    env.curErrState = errObj.state.clone()
+                    env.curErrMsg = errObj.msg.clone()
+                    ran = execStmts(st, txn, env, &blk.handlers[matched].body)
+                    env.curErrCode = prevCode
+                    env.curErrState = prevSt
+                    env.curErrMsg = prevMsg
+                } else {
+                    ran = Err(errObj)
+                }
+            }
+        }
+    }
+
+    while len(env.vars) > savedVars { let _ = pop(mut &env.vars) }
+    while len(env.recs) > savedRecs { let _ = pop(mut &env.recs) }
+    while len(env.excs) > savedExcs { let _ = pop(mut &env.excs) }
+
+    match move(ran) {
+        Ok(fl) {
+            if fl.kind == FL_EXIT && len(fl.label) > 0 && fl.label == blk.label { return Ok(noFlow()) }
+            return Ok(fl)
+        }
+        Err(x) { return Err(x) }
+    }
+}
+
+fn execStmts(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, env: mut &RunEnv, stmts: &[]OStmt): Result[Flow, DbErr] {
+    for s in stmts {
+        let fl = try execStmt(st, txn, env, &s)
+        if fl.kind != FL_NONE { return Ok(fl) }
+    }
+    return Ok(noFlow())
+}
+
+fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, env: mut &RunEnv, s: &OStmt): Result[Flow, DbErr] {
+    match s.kind {
+        ST_NULL { return Ok(noFlow()) }
+        ST_BLOCK { return execBlock(st, txn, env, s) }
+        ST_ASSIGN {
+            let v = try evalExpr(st, txn, env, &s.expr, false)
+            try assignTarget(st, txn, env, &s.target, v)
+            return Ok(noFlow())
+        }
+        ST_IF {
+            for i in 0..len(s.conds) {
+                if try evalBool(st, txn, env, &s.conds[i], false) {
+                    return execStmts(st, txn, env, &s.branches[i])
+                }
+            }
+            if len(s.elseBody) > 0 { return execStmts(st, txn, env, &s.elseBody) }
+            return Ok(noFlow())
+        }
+        ST_CASE {
+            if len(s.expr) > 0 {
+                let sv = try evalExpr(st, txn, env, &s.expr, false)
+                for i in 0..len(s.conds) {
+                    let wv = try evalExpr(st, txn, env, &s.conds[i], false)
+                    if !lexdb_ops.isNull(&sv) && !lexdb_ops.isNull(&wv) && lexdb_sql.text(&sv) == lexdb_sql.text(&wv) {
+                        return execStmts(st, txn, env, &s.branches[i])
+                    }
+                }
+            } else {
+                for i in 0..len(s.conds) {
+                    if try evalBool(st, txn, env, &s.conds[i], false) {
+                        return execStmts(st, txn, env, &s.branches[i])
+                    }
+                }
+            }
+            if len(s.elseBody) > 0 { return execStmts(st, txn, env, &s.elseBody) }
+            return Ok(noFlow())
+        }
+        ST_LOOP {
+            var iters = 0
+            while true {
+                iters += 1
+                if iters > 100000 { return Err(oraErr(6500, "PL/SQL loop iteration limit exceeded")) }
+                let fl = try execStmts(st, txn, env, &s.body)
+                if fl.kind == FL_RETURN { return Ok(fl) }
+                if fl.kind == FL_EXIT {
+                    if len(fl.label) == 0 || fl.label == s.label { return Ok(noFlow()) }
+                    return Ok(fl)
+                }
+                if fl.kind == FL_CONTINUE {
+                    if len(fl.label) == 0 || fl.label == s.label { continue }
+                    return Ok(fl)
+                }
+            }
+            return Ok(noFlow())
+        }
+        ST_WHILE {
+            var iters = 0
+            while try evalBool(st, txn, env, &s.expr, false) {
+                iters += 1
+                if iters > 100000 { return Err(oraErr(6500, "PL/SQL loop iteration limit exceeded")) }
+                let fl = try execStmts(st, txn, env, &s.body)
+                if fl.kind == FL_RETURN { return Ok(fl) }
+                if fl.kind == FL_EXIT {
+                    if len(fl.label) == 0 || fl.label == s.label { return Ok(noFlow()) }
+                    return Ok(fl)
+                }
+                if fl.kind == FL_CONTINUE {
+                    if len(fl.label) == 0 || fl.label == s.label { continue }
+                    return Ok(fl)
+                }
+            }
+            return Ok(noFlow())
+        }
+        ST_FOR_INT {
+            let lo = try evalInt(st, txn, env, &s.loExpr)
+            let hi = try evalInt(st, txn, env, &s.hiExpr)
+            let saved = len(env.vars)
+            append(mut &env.vars, VarSlot{name: s.target.clone(), val: Val.Int(lo), typ: lexdb_sql.oidType(lexdb_sql.OID_INT8), hasType: true, isConst: true, notNull: false})
+            var cur = if s.reverse { hi } else { lo }
+            var iters = 0
+            var retFl = noFlow()
+            while (if s.reverse { cur >= lo } else { cur <= hi }) {
+                iters += 1
+                if iters > 100000 {
+                    while len(env.vars) > saved { let _ = pop(mut &env.vars) }
+                    return Err(oraErr(6500, "PL/SQL loop iteration limit exceeded"))
+                }
+                env.vars[saved].val = Val.Int(cur)
+                match execStmts(st, txn, env, &s.body) {
+                    Ok(fl) {
+                        if fl.kind == FL_RETURN { retFl = fl; break }
+                        if fl.kind == FL_EXIT {
+                            if len(fl.label) == 0 || fl.label == s.label { break }
+                            retFl = fl; break
+                        }
+                        if fl.kind == FL_CONTINUE {
+                            if len(fl.label) > 0 && fl.label != s.label { retFl = fl; break }
+                        }
+                    }
+                    Err(x) {
+                        while len(env.vars) > saved { let _ = pop(mut &env.vars) }
+                        return Err(x)
+                    }
+                }
+                if s.reverse { cur -= 1 } else { cur += 1 }
+            }
+            while len(env.vars) > saved { let _ = pop(mut &env.vars) }
+            return Ok(retFl)
+        }
+        ST_FOR_QUERY {
+            let sub = try substOraSql(env, &s.expr, false, false)
+            let res = try runOraSql(st, txn, &sub.sql, &sub.params, &sub.ptypes)
+            var cs: []str = []
+            var ts: []TypeName = []
+            for oc in res.cols {
+                append(mut &cs, strings.toLowerAscii(&oc.name))
+                append(mut &ts, lexdb_sql.oidType(oc.oid))
+            }
+            let saved = len(env.recs)
+            append(mut &env.recs, RecSlot{name: s.target.clone(), cols: cs.clone(), types: ts.clone(), vals: [], isNull: true})
+            var retFl = noFlow()
+            for row in res.rows {
+                env.recs[saved].vals = collections.copyOf(&row)
+                env.recs[saved].isNull = false
+                match execStmts(st, txn, env, &s.body) {
+                    Ok(fl) {
+                        if fl.kind == FL_RETURN { retFl = fl; break }
+                        if fl.kind == FL_EXIT {
+                            if len(fl.label) == 0 || fl.label == s.label { break }
+                            retFl = fl; break
+                        }
+                        if fl.kind == FL_CONTINUE {
+                            if len(fl.label) > 0 && fl.label != s.label { retFl = fl; break }
+                        }
+                    }
+                    Err(x) {
+                        while len(env.recs) > saved { let _ = pop(mut &env.recs) }
+                        return Err(x)
+                    }
+                }
+            }
+            while len(env.recs) > saved { let _ = pop(mut &env.recs) }
+            return Ok(retFl)
+        }
+        ST_EXIT {
+            var fire = true
+            if len(s.expr) > 0 { fire = try evalBool(st, txn, env, &s.expr, false) }
+            if !fire { return Ok(noFlow()) }
+            return Ok(Flow{kind: if s.isCont { FL_CONTINUE } else { FL_EXIT }, label: s.label.clone()})
+        }
+        ST_RETURN {
+            return Ok(Flow{kind: FL_RETURN, label: ""})
+        }
+        ST_RAISE {
+            if len(s.target) == 0 {
+                if len(env.curErrState) == 0 || env.curErrState == "00000" {
+                    return Err(oraErr(6550, "RAISE without exception name outside exception handler"))
+                }
+                return Err(lexdb_base.err(&env.curErrState, &env.curErrMsg))
+            }
+            if s.target == "no_data_found" { return Err(oraErr(1403, "no data found")) }
+            if s.target == "too_many_rows" { return Err(oraErr(1422, "exact fetch returns more than requested number of rows")) }
+            if s.target == "dup_val_on_index" { return Err(oraErr(1, "unique constraint violated")) }
+            if s.target == "zero_divide" { return Err(oraErr(1476, "divisor is equal to zero")) }
+            if s.target == "value_error" { return Err(oraErr(6502, "PL/SQL: numeric or value error")) }
+            let ei = env.findExc(&s.target)
+            if ei >= 0 {
+                let ex = &env.excs[ei]
+                if ex.code < 0 { return Err(oraErr(-ex.code, &("user-defined exception " + strings.toUpperAscii(&ex.name)))) }
+                return Err(lexdb_base.err(&("ORAX" + ex.name), "User-Defined Exception"))
+            }
+            return Err(oraErr(6510, &("PL/SQL: unhandled user-defined exception: " + s.target)))
+        }
+        ST_RAISE_APP {
+            let code = try evalInt(st, txn, env, &s.expr)
+            let msgVal = try evalExpr(st, txn, env, &s.expr2, false)
+            let msg = if lexdb_ops.isNull(&msgVal) { "" } else { lexdb_sql.text(&msgVal) }
+            if code > -20000 || code < -20999 {
+                return Err(oraErr(21000, &("error number argument to raise_application_error of " + code.toStr() + " is out of range")))
+            }
+            return Err(oraErr(-code, &msg))
+        }
+        ST_EXEC_IMM {
+            let sqlVal = try evalExpr(st, txn, env, &s.expr, false)
+            if lexdb_ops.isNull(&sqlVal) { return Err(oraErr(6535, "statement string in EXECUTE IMMEDIATE is NULL")) }
+            let sqlStr = lexdb_sql.text(&sqlVal)
+            var params: []Val = []
+            var ptypes: []int = []
+            for ue in s.usingExprs {
+                let v = try evalExpr(st, txn, env, &ue, false)
+                let o = oidOfVal(&v)
+                append(mut &params, v)
+                append(mut &ptypes, o)
+            }
+            let res = try runOraSql(st, txn, &sqlStr, &params, &ptypes)
+            let n = if res.hasRows { len(res.rows) } else { tagRowCount(&res.tag) }
+            env.sqlRowCount = n
+            env.sqlFound = n > 0
+            if len(s.intoTargets) > 0 {
+                if len(res.rows) == 0 { return Err(oraErr(1403, "no data found")) }
+                if len(res.rows) > 1 { return Err(oraErr(1422, "exact fetch returns more than requested number of rows")) }
+                for k in 0..len(s.intoTargets) {
+                    let v = if k < len(res.rows[0]) { res.rows[0][k].clone() } else { Val.Null }
+                    try assignTarget(st, txn, env, &s.intoTargets[k], v)
+                }
+            }
+            return Ok(noFlow())
+        }
+        ST_SQL {
+            let sub = try substOraSql(env, &s.expr, false, false)
+            let res = try runOraSql(st, txn, &sub.sql, &sub.params, &sub.ptypes)
+            let n = if res.hasRows { len(res.rows) } else { tagRowCount(&res.tag) }
+            env.sqlRowCount = n
+            env.sqlFound = n > 0
+            if len(s.intoTargets) > 0 {
+                if len(res.rows) == 0 { return Err(oraErr(1403, "no data found")) }
+                if len(res.rows) > 1 { return Err(oraErr(1422, "exact fetch returns more than requested number of rows")) }
+                for k in 0..len(s.intoTargets) {
+                    let v = if k < len(res.rows[0]) { res.rows[0][k].clone() } else { Val.Null }
+                    try assignTarget(st, txn, env, &s.intoTargets[k], v)
+                }
+            }
+            return Ok(noFlow())
+        }
+        else { return Ok(noFlow()) }
+    }
+}
+
+// ---- entry point called by lexdb_exec for Oracle triggers
+
+pub fn runRowTrigger(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, req: &RowFireReq): Result[RowFireRes, DbErr] {
+    var colNames: []str = []
+    var colTypes: []TypeName = []
+    for c in req.cols {
+        append(mut &colNames, c.name.clone())
+        append(mut &colTypes, c.typ)
+    }
+    let newRec = RecSlot{name: "new", cols: colNames.clone(), types: colTypes.clone(), vals: collections.copyOf(&req.newRow), isNull: !req.hasNew}
+    let oldRec = RecSlot{name: "old", cols: colNames.clone(), types: colTypes.clone(), vals: collections.copyOf(&req.oldRow), isNull: !req.hasOld}
+    let oldAlias = if len(req.trig.refOld) > 0 { strings.toLowerAscii(&req.trig.refOld) } else { "old" }
+    let newAlias = if len(req.trig.refNew) > 0 { strings.toLowerAscii(&req.trig.refNew) } else { "new" }
+
+    var env = RunEnv{
+        vars: [],
+        recs: [newRec, oldRec],
+        excs: [],
+        timing: req.trig.timing,
+        event: req.event,
+        cols: req.cols.clone(),
+        updatedCols: collections.copyOf(&req.updatedCols),
+        oldAlias: oldAlias,
+        newAlias: newAlias,
+        sqlRowCount: 0,
+        sqlFound: false,
+        curErrCode: 0,
+        curErrState: "00000",
+        curErrMsg: "ORA-0000: normal, successful completion",
+        newModified: false,
+        hasNew: req.hasNew,
+        hasOld: req.hasOld,
+    }
+
+    // Evaluate WHEN (condition) with uncolonized OLD/NEW (or custom REFERENCING aliases)
+    if len(req.trig.whenExpr) > 0 {
+        let ok = try evalBool(st, txn, &env, &req.trig.whenExpr, true)
+        if !ok {
+            return Ok(RowFireRes{skip: false, modified: false, newRow: collections.copyOf(&req.newRow)})
+        }
+    }
+
+    let blk = try parseBlockSrc(&req.trig.body)
+    let _ = try execBlock(st, txn, mut &env, &blk)
+
+    // Oracle triggers never skip rows; if BEFORE/INSTEAD OF modified :NEW, return updated newRow
+    if req.hasNew && env.newModified {
+        return Ok(RowFireRes{skip: false, modified: true, newRow: collections.copyOf(&env.recs[0].vals)})
+    }
+    return Ok(RowFireRes{skip: false, modified: false, newRow: collections.copyOf(&req.newRow)})
+}

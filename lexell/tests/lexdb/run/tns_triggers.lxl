@@ -1,0 +1,324 @@
+// End-to-end Oracle DML trigger tests over lexdb_tns + lib/oracle:
+// - DDL validation & Oracle error codes (ORA-00942, ORA-04081, ORA-25002, ORA-25001, ORA-04077, ORA-00904, ORA-04084, ORA-04085, ORA-04080)
+// - BEFORE INSERT/UPDATE/DELETE FOR EACH ROW: seq.NEXTVAL INTO :NEW.id FROM DUAL, mutating :NEW.col, REFERENCING OLD AS o NEW AS n, WHEN (...)
+// - AFTER INSERT OR UPDATE OR DELETE FOR EACH ROW: INSERTING, UPDATING, DELETING, UPDATING('COL'), UPDATE OF col
+// - FOLLOWS / PRECEDES topological firing order
+// - BEFORE / AFTER STATEMENT triggers (including 0-row DML)
+// - INSTEAD OF INSERT / UPDATE / DELETE on views
+// - RAISE_APPLICATION_ERROR(-20xxx, msg) + atomic rollback + ORA-21000 out-of-range
+// - EXCEPTION WHEN DUP_VAL_ON_INDEX + PRAGMA EXCEPTION_INIT subtransaction rollback
+// - PL/SQL control flow: DECLARE, IF/ELSIF/ELSE, CASE, FOR i IN 1..n, FOR r IN (SELECT ...), SQL%ROWCOUNT, EXECUTE IMMEDIATE
+// - MERGE firing Oracle triggers
+// - CREATE TRIGGER ... DISABLE, ALTER TRIGGER ENABLE/DISABLE/COMPILE/RENAME TO, ALTER TABLE ENABLE/DISABLE ALL TRIGGERS, DROP TRIGGER [IF EXISTS]
+// - Oracle Data Dictionary: USER_TRIGGERS, ALL_TRIGGERS, DBA_TRIGGERS, USER_OBJECTS, USER_SOURCE
+// - Disk persistence across store reopen
+// expect: err_notbl: error 942
+// expect: err_dup: error 4081
+// expect: err_tab_io: error 25002
+// expect: err_view_bf: error 25001
+// expect: err_when_stmt: error 4077
+// expect: err_bad_col: error 904
+// expect: before_ins: 1 'ALICE' 100 | 2 'BOB' 200
+// expect: ref_when: 1 150 | 2 200
+// expect: err_after_new: error 4084
+// expect: err_old_assign: error 4085
+// expect: preds_log: 'INS:1:100' | 'UPD_SAL:1:100->250' | 'UPD_OTHER:1' | 'DEL:1:250'
+// expect: upd_of_sal: 1
+// expect: follows_order: '1:2:3:4'
+// expect: stmt_log: 'B_INS' | 'A_INS' | 'B_UPD' | 'A_UPD' | 'B_DEL' | 'A_DEL'
+// expect: view_io: ins=10 'Widget' 42 upd=10 'Widget2' 99 del=0
+// expect: raise_app: err=error 20042 range=error 21000 count=1
+// expect: exc_catch: caught=-1 uq_cnt=0 pragma=error 20055
+// expect: ctrl_flow: 15 2 99
+// expect: merge_log: 'INS:2:200' | 'UPD:1:150'
+// expect: lifecycle: init_dis=0 after_en=1 after_tbl_dis=0 after_tbl_en=2 after_ren=3 drop_miss=error 4080
+// expect: dict_views: ut=1 at=1 dt=1 obj=1 src_ok=true meta='TR_CAT|BEFORE EACH ROW|INSERT OR UPDATE|CAT_T|TABLE|ENABLED|YES|NO'
+// expect: reopen_ok: 1 'REOPENED' 777
+import "task"
+import "net"
+import "os"
+import "fs"
+import "strings"
+import "oracle"
+import "sqldialect"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_tns"
+
+fn connect(port: &str): oracle.Conn {
+    match oracle.connect(&("User Id=sa;Password=sa;Data Source=127.0.0.1:" + port + "/lexdb")) {
+        Ok(c) { return c }
+        Err(e) {
+            eprintln("connect: error " + e.code.toStr() + " " + e.msg)
+            panic("connect failed")
+        }
+    }
+}
+
+fn text(r: &oracle.Rows, row: int, col: int): str {
+    match r.isNull(row, col) {
+        Ok(n) { if n { return "NULL" } }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+    match r.value(row, col) {
+        Ok(v) { return v.toStr() }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn rowStr(r: &oracle.Rows, row: int): str {
+    var out: []str = []
+    for i in 0..r.columnCount() { append(mut &out, text(r, row, i)) }
+    return strings.join(&out, " ")
+}
+
+fn rowsStr(r: &oracle.Rows): str {
+    var out: []str = []
+    for i in 0..r.rowCount() { append(mut &out, rowStr(r, i)) }
+    return strings.join(&out, " | ")
+}
+
+fn execOk(c: mut &oracle.Conn, sql: &str) {
+    let none: []sqldialect.Value = []
+    match c.call(sql, &none, &[]) {
+        Ok(_) {}
+        Err(e) {
+            eprintln("exec failed (" + e.code.toStr() + "): " + e.msg + " for SQL: " + sql)
+            panic("exec failed")
+        }
+    }
+}
+
+fn execErr(c: mut &oracle.Conn, sql: &str): str {
+    let none: []sqldialect.Value = []
+    match c.call(sql, &none, &[]) {
+        Ok(_) { return "ok" }
+        Err(e) { return "error " + e.code.toStr() }
+    }
+}
+
+fn qStr(c: mut &oracle.Conn, sql: &str): str {
+    let none: []sqldialect.Value = []
+    match c.query(sql, &none) {
+        Ok(r) { return rowsStr(&r) }
+        Err(e) {
+            eprintln("query failed (" + e.code.toStr() + "): " + e.msg + " for SQL: " + sql)
+            panic("query failed")
+        }
+    }
+}
+
+fn client1(port: &str) {
+    var c = connect(port)
+
+    // 1. Validation & Oracle error codes
+    println("err_notbl: " + execErr(mut &c, "CREATE TRIGGER tr_no BEFORE INSERT ON no_such_tbl BEGIN NULL; END;"))
+    execOk(mut &c, "CREATE TABLE tv (id NUMBER PRIMARY KEY, v NUMBER)")
+    execOk(mut &c, "CREATE VIEW vv AS SELECT id, v FROM tv")
+    execOk(mut &c, "CREATE TRIGGER tr_dup BEFORE INSERT ON tv BEGIN NULL; END;")
+    println("err_dup: " + execErr(mut &c, "CREATE TRIGGER tr_dup BEFORE INSERT ON tv BEGIN NULL; END;"))
+    println("err_tab_io: " + execErr(mut &c, "CREATE TRIGGER tr_io INSTEAD OF INSERT ON tv BEGIN NULL; END;"))
+    println("err_view_bf: " + execErr(mut &c, "CREATE TRIGGER tr_vbf BEFORE INSERT ON vv BEGIN NULL; END;"))
+    println("err_when_stmt: " + execErr(mut &c, "CREATE TRIGGER tr_ws BEFORE INSERT ON tv WHEN (NEW.v > 0) BEGIN NULL; END;"))
+    println("err_bad_col: " + execErr(mut &c, "CREATE TRIGGER tr_bc BEFORE UPDATE OF nosuch ON tv FOR EACH ROW BEGIN NULL; END;"))
+    execOk(mut &c, "DROP VIEW vv")
+    execOk(mut &c, "DROP TABLE tv")
+
+    // 2. BEFORE INSERT FOR EACH ROW: seq.NEXTVAL INTO :NEW.id FROM DUAL + :NEW.name := UPPER(:NEW.name)
+    execOk(mut &c, "CREATE SEQUENCE emp_seq START WITH 1 INCREMENT BY 1")
+    execOk(mut &c, "CREATE TABLE emps (id NUMBER PRIMARY KEY, name VARCHAR2(50), sal NUMBER)")
+    execOk(mut &c, "CREATE OR REPLACE TRIGGER tr_emp_bi BEFORE INSERT ON emps FOR EACH ROW BEGIN IF :NEW.id IS NULL THEN SELECT emp_seq.NEXTVAL INTO :NEW.id FROM DUAL; END IF; :NEW.name := UPPER(:NEW.name); END; /")
+    execOk(mut &c, "INSERT INTO emps (name, sal) VALUES ('alice', 100)")
+    execOk(mut &c, "INSERT INTO emps (name, sal) VALUES ('bob', 200)")
+    execOk(mut &c, "COMMIT")
+    println("before_ins: " + qStr(mut &c, "SELECT id, name, sal FROM emps ORDER BY id"))
+
+    // REFERENCING OLD AS o NEW AS n + WHEN (n.sal < 150)
+    execOk(mut &c, "CREATE OR REPLACE TRIGGER tr_emp_ref BEFORE UPDATE ON emps REFERENCING OLD AS o NEW AS n FOR EACH ROW WHEN (n.sal < 150) BEGIN :n.sal := 150; END;")
+    execOk(mut &c, "UPDATE emps SET sal = 120 WHERE id = 1")
+    execOk(mut &c, "UPDATE emps SET sal = 200 WHERE id = 2")
+    execOk(mut &c, "COMMIT")
+    println("ref_when: " + qStr(mut &c, "SELECT id, sal FROM emps ORDER BY id"))
+
+    // ORA-04084 (:NEW assignment in AFTER) and ORA-04085 (:OLD assignment)
+    execOk(mut &c, "CREATE TABLE bad_t (id NUMBER PRIMARY KEY, v NUMBER)")
+    execOk(mut &c, "CREATE TRIGGER tr_bad_new AFTER INSERT ON bad_t FOR EACH ROW BEGIN :NEW.v := 1; END;")
+    println("err_after_new: " + execErr(mut &c, "INSERT INTO bad_t VALUES (1, 10)"))
+    execOk(mut &c, "DROP TRIGGER tr_bad_new")
+    execOk(mut &c, "CREATE TRIGGER tr_bad_old BEFORE UPDATE ON bad_t FOR EACH ROW BEGIN :OLD.v := 1; END;")
+    execOk(mut &c, "INSERT INTO bad_t VALUES (1, 10)")
+    println("err_old_assign: " + execErr(mut &c, "UPDATE bad_t SET v = 20 WHERE id = 1"))
+    execOk(mut &c, "DROP TABLE bad_t")
+
+    // 3. INSERTING / UPDATING / DELETING / UPDATING('SAL') + UPDATE OF sal
+    execOk(mut &c, "CREATE TABLE pay (id NUMBER PRIMARY KEY, name VARCHAR2(50), sal NUMBER)")
+    execOk(mut &c, "CREATE TABLE pay_log (seq NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, msg VARCHAR2(100))")
+    execOk(mut &c, "CREATE TABLE sal_cnt (n NUMBER)")
+    execOk(mut &c, "CREATE TRIGGER tr_pay_aud AFTER INSERT OR UPDATE OR DELETE ON pay FOR EACH ROW BEGIN IF INSERTING THEN INSERT INTO pay_log (msg) VALUES ('INS:' || :NEW.id || ':' || :NEW.sal); ELSIF UPDATING('SAL') THEN INSERT INTO pay_log (msg) VALUES ('UPD_SAL:' || :NEW.id || ':' || :OLD.sal || '->' || :NEW.sal); ELSIF UPDATING THEN INSERT INTO pay_log (msg) VALUES ('UPD_OTHER:' || :NEW.id); ELSIF DELETING THEN INSERT INTO pay_log (msg) VALUES ('DEL:' || :OLD.id || ':' || :OLD.sal); END IF; END;")
+    execOk(mut &c, "CREATE TRIGGER tr_pay_sal AFTER UPDATE OF sal ON pay FOR EACH ROW WHEN (OLD.sal <> NEW.sal) BEGIN INSERT INTO sal_cnt VALUES (1); END;")
+    execOk(mut &c, "INSERT INTO pay VALUES (1, 'Ann', 100)")
+    execOk(mut &c, "UPDATE pay SET sal = 250 WHERE id = 1")
+    execOk(mut &c, "UPDATE pay SET name = 'Anna' WHERE id = 1")
+    execOk(mut &c, "DELETE FROM pay WHERE id = 1")
+    execOk(mut &c, "COMMIT")
+    println("preds_log: " + qStr(mut &c, "SELECT msg FROM pay_log ORDER BY seq"))
+    println("upd_of_sal: " + qStr(mut &c, "SELECT COUNT(*) FROM sal_cnt"))
+
+    // 4. FOLLOWS / PRECEDES ordering
+    execOk(mut &c, "CREATE TABLE ord_t (id NUMBER PRIMARY KEY, trail VARCHAR2(50))")
+    execOk(mut &c, "CREATE TRIGGER tr_o3 BEFORE INSERT ON ord_t FOR EACH ROW BEGIN :NEW.trail := :NEW.trail || ':3'; END;")
+    execOk(mut &c, "CREATE TRIGGER tr_o2 BEFORE INSERT ON ord_t FOR EACH ROW PRECEDES tr_o3 BEGIN :NEW.trail := :NEW.trail || ':2'; END;")
+    execOk(mut &c, "CREATE TRIGGER tr_o1 BEFORE INSERT ON ord_t FOR EACH ROW PRECEDES tr_o2 BEGIN :NEW.trail := '1'; END;")
+    execOk(mut &c, "CREATE TRIGGER tr_o4 BEFORE INSERT ON ord_t FOR EACH ROW FOLLOWS tr_o3 BEGIN :NEW.trail := :NEW.trail || ':4'; END;")
+    execOk(mut &c, "INSERT INTO ord_t (id, trail) VALUES (1, '')")
+    execOk(mut &c, "COMMIT")
+    println("follows_order: " + qStr(mut &c, "SELECT trail FROM ord_t WHERE id = 1"))
+
+    // 5. BEFORE / AFTER STATEMENT triggers (including 0-row UPDATE)
+    execOk(mut &c, "CREATE TABLE st_t (id NUMBER PRIMARY KEY)")
+    execOk(mut &c, "CREATE TABLE st_log (seq NUMBER GENERATED ALWAYS AS IDENTITY PRIMARY KEY, msg VARCHAR2(50))")
+    execOk(mut &c, "CREATE TRIGGER tr_sb BEFORE INSERT OR UPDATE OR DELETE ON st_t BEGIN IF INSERTING THEN INSERT INTO st_log (msg) VALUES ('B_INS'); ELSIF UPDATING THEN INSERT INTO st_log (msg) VALUES ('B_UPD'); ELSIF DELETING THEN INSERT INTO st_log (msg) VALUES ('B_DEL'); END IF; END;")
+    execOk(mut &c, "CREATE TRIGGER tr_sa AFTER INSERT OR UPDATE OR DELETE ON st_t BEGIN IF INSERTING THEN INSERT INTO st_log (msg) VALUES ('A_INS'); ELSIF UPDATING THEN INSERT INTO st_log (msg) VALUES ('A_UPD'); ELSIF DELETING THEN INSERT INTO st_log (msg) VALUES ('A_DEL'); END IF; END;")
+    execOk(mut &c, "INSERT INTO st_t VALUES (1)")
+    execOk(mut &c, "UPDATE st_t SET id = 1 WHERE id = 999")
+    execOk(mut &c, "DELETE FROM st_t WHERE id = 1")
+    execOk(mut &c, "COMMIT")
+    println("stmt_log: " + qStr(mut &c, "SELECT msg FROM st_log ORDER BY seq"))
+
+    // 6. INSTEAD OF INSERT / UPDATE / DELETE on a view
+    execOk(mut &c, "CREATE TABLE base_v (id NUMBER PRIMARY KEY, label VARCHAR2(50), qty NUMBER)")
+    execOk(mut &c, "CREATE VIEW v_base AS SELECT id, label, qty FROM base_v")
+    execOk(mut &c, "CREATE TRIGGER tr_v_io INSTEAD OF INSERT OR UPDATE OR DELETE ON v_base FOR EACH ROW BEGIN IF INSERTING THEN INSERT INTO base_v VALUES (:NEW.id, :NEW.label, :NEW.qty); ELSIF UPDATING THEN UPDATE base_v SET label = :NEW.label, qty = :NEW.qty WHERE id = :OLD.id; ELSIF DELETING THEN DELETE FROM base_v WHERE id = :OLD.id; END IF; END;")
+    execOk(mut &c, "INSERT INTO v_base VALUES (10, 'Widget', 42)")
+    let vIns = qStr(mut &c, "SELECT id, label, qty FROM base_v WHERE id = 10")
+    execOk(mut &c, "UPDATE v_base SET label = 'Widget2', qty = 99 WHERE id = 10")
+    let vUpd = qStr(mut &c, "SELECT id, label, qty FROM base_v WHERE id = 10")
+    execOk(mut &c, "DELETE FROM v_base WHERE id = 10")
+    let vDel = qStr(mut &c, "SELECT COUNT(*) FROM base_v")
+    execOk(mut &c, "COMMIT")
+    println("view_io: ins=" + vIns + " upd=" + vUpd + " del=" + vDel)
+
+    // 7. RAISE_APPLICATION_ERROR + atomic rollback + ORA-21000
+    execOk(mut &c, "CREATE TABLE guard_o (id NUMBER PRIMARY KEY, v NUMBER)")
+    execOk(mut &c, "CREATE TRIGGER tr_go BEFORE INSERT ON guard_o FOR EACH ROW BEGIN IF :NEW.v = -999 THEN RAISE_APPLICATION_ERROR(-19999, 'bad range'); ELSIF :NEW.v < 0 THEN RAISE_APPLICATION_ERROR(-20042, 'negative not allowed'); END IF; END;")
+    execOk(mut &c, "INSERT INTO guard_o VALUES (1, 10)")
+    let eApp = execErr(mut &c, "INSERT INTO guard_o VALUES (2, -5)")
+    let eRng = execErr(mut &c, "INSERT INTO guard_o VALUES (3, -999)")
+    let gCnt = qStr(mut &c, "SELECT COUNT(*) FROM guard_o")
+    execOk(mut &c, "COMMIT")
+    println("raise_app: err=" + eApp + " range=" + eRng + " count=" + gCnt)
+
+    // 8. EXCEPTION WHEN DUP_VAL_ON_INDEX + PRAGMA EXCEPTION_INIT
+    execOk(mut &c, "CREATE TABLE uq_o (id NUMBER PRIMARY KEY)")
+    execOk(mut &c, "CREATE TABLE catch_o (code NUMBER)")
+    execOk(mut &c, "CREATE TABLE drv_o (id NUMBER PRIMARY KEY)")
+    execOk(mut &c, "CREATE TRIGGER tr_catch_o AFTER INSERT ON drv_o FOR EACH ROW BEGIN BEGIN INSERT INTO uq_o VALUES (1); INSERT INTO uq_o VALUES (1); EXCEPTION WHEN DUP_VAL_ON_INDEX THEN INSERT INTO catch_o VALUES (SQLCODE); END; END;")
+    execOk(mut &c, "INSERT INTO drv_o VALUES (1)")
+    let cCode = qStr(mut &c, "SELECT code FROM catch_o")
+    let uqCnt = qStr(mut &c, "SELECT COUNT(*) FROM uq_o")
+    execOk(mut &c, "CREATE TABLE prag_o (id NUMBER PRIMARY KEY)")
+    execOk(mut &c, "CREATE TRIGGER tr_prag BEFORE INSERT ON prag_o FOR EACH ROW DECLARE e_neg EXCEPTION; PRAGMA EXCEPTION_INIT(e_neg, -20055); BEGIN IF :NEW.id < 0 THEN RAISE e_neg; END IF; END;")
+    let pErr = execErr(mut &c, "INSERT INTO prag_o VALUES (-1)")
+    execOk(mut &c, "COMMIT")
+    println("exc_catch: caught=" + cCode + " uq_cnt=" + uqCnt + " pragma=" + pErr)
+
+    // 9. PL/SQL control flow: FOR loop, CASE, SQL%ROWCOUNT, EXECUTE IMMEDIATE ... INTO ... USING
+    execOk(mut &c, "CREATE TABLE ctrl_o (id NUMBER PRIMARY KEY, n NUMBER)")
+    execOk(mut &c, "CREATE TABLE ctrl_aux_o (k NUMBER)")
+    execOk(mut &c, "CREATE TABLE ctrl_out_o (s NUMBER, rc NUMBER, dv NUMBER)")
+    execOk(mut &c, "INSERT INTO ctrl_aux_o VALUES (1)")
+    execOk(mut &c, "INSERT INTO ctrl_aux_o VALUES (2)")
+    execOk(mut &c, "CREATE TRIGGER tr_ctrl_o AFTER INSERT ON ctrl_o FOR EACH ROW DECLARE v_sum NUMBER := 0; v_rc NUMBER := 0; v_dv NUMBER := 0; BEGIN FOR i IN 1..:NEW.n LOOP CASE WHEN i > 0 THEN v_sum := v_sum + i; ELSE NULL; END CASE; END LOOP; UPDATE ctrl_aux_o SET k = k + 10; v_rc := SQL%ROWCOUNT; EXECUTE IMMEDIATE 'SELECT $1 + 94 FROM DUAL' INTO v_dv USING :NEW.n; INSERT INTO ctrl_out_o VALUES (v_sum, v_rc, v_dv); END;")
+    execOk(mut &c, "INSERT INTO ctrl_o VALUES (1, 5)")
+    execOk(mut &c, "COMMIT")
+    println("ctrl_flow: " + qStr(mut &c, "SELECT s, rc, dv FROM ctrl_out_o"))
+
+    // 10. MERGE triggers
+    execOk(mut &c, "CREATE TABLE mo_tgt (id NUMBER PRIMARY KEY, v NUMBER)")
+    execOk(mut &c, "CREATE TABLE mo_src (id NUMBER PRIMARY KEY, v NUMBER)")
+    execOk(mut &c, "CREATE TABLE mo_log (msg VARCHAR2(50))")
+    execOk(mut &c, "INSERT INTO mo_tgt VALUES (1, 100)")
+    execOk(mut &c, "INSERT INTO mo_src VALUES (1, 150)")
+    execOk(mut &c, "INSERT INTO mo_src VALUES (2, 200)")
+    execOk(mut &c, "CREATE TRIGGER tr_mo AFTER INSERT OR UPDATE ON mo_tgt FOR EACH ROW BEGIN IF INSERTING THEN INSERT INTO mo_log VALUES ('INS:' || :NEW.id || ':' || :NEW.v); ELSE INSERT INTO mo_log VALUES ('UPD:' || :NEW.id || ':' || :NEW.v); END IF; END;")
+    execOk(mut &c, "MERGE INTO mo_tgt t USING mo_src s ON (t.id = s.id) WHEN MATCHED THEN UPDATE SET t.v = s.v WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)")
+    execOk(mut &c, "COMMIT")
+    println("merge_log: " + qStr(mut &c, "SELECT msg FROM mo_log ORDER BY msg"))
+
+    // 11. Lifecycle DDL: CREATE ... DISABLE, ALTER TRIGGER ENABLE/DISABLE/COMPILE/RENAME, ALTER TABLE ... ALL TRIGGERS, DROP TRIGGER
+    execOk(mut &c, "CREATE TABLE lc_t (id NUMBER PRIMARY KEY)")
+    execOk(mut &c, "CREATE TABLE lc_log (n NUMBER)")
+    execOk(mut &c, "CREATE TRIGGER tr_lc AFTER INSERT ON lc_t FOR EACH ROW DISABLE BEGIN INSERT INTO lc_log VALUES (:NEW.id); END;")
+    execOk(mut &c, "INSERT INTO lc_t VALUES (1)")
+    let c0 = qStr(mut &c, "SELECT COUNT(*) FROM lc_log")
+    execOk(mut &c, "ALTER TRIGGER tr_lc ENABLE")
+    execOk(mut &c, "ALTER TRIGGER tr_lc COMPILE")
+    execOk(mut &c, "INSERT INTO lc_t VALUES (2)")
+    let c1 = qStr(mut &c, "SELECT COUNT(*) FROM lc_log")
+    execOk(mut &c, "ALTER TABLE lc_t DISABLE ALL TRIGGERS")
+    execOk(mut &c, "INSERT INTO lc_t VALUES (3)")
+    execOk(mut &c, "DELETE FROM lc_log")
+    execOk(mut &c, "INSERT INTO lc_t VALUES (4)")
+    let c2 = qStr(mut &c, "SELECT COUNT(*) FROM lc_log")
+    execOk(mut &c, "ALTER TABLE lc_t ENABLE ALL TRIGGERS")
+    execOk(mut &c, "INSERT INTO lc_t VALUES (5)")
+    execOk(mut &c, "INSERT INTO lc_t VALUES (6)")
+    let c3 = qStr(mut &c, "SELECT COUNT(*) FROM lc_log")
+    execOk(mut &c, "ALTER TRIGGER tr_lc RENAME TO tr_lc2")
+    execOk(mut &c, "INSERT INTO lc_t VALUES (7)")
+    let c4 = qStr(mut &c, "SELECT COUNT(*) FROM lc_log")
+    execOk(mut &c, "DROP TRIGGER tr_lc2")
+    let dropMiss = execErr(mut &c, "DROP TRIGGER tr_lc2")
+    execOk(mut &c, "DROP TRIGGER IF EXISTS tr_lc2")
+    println("lifecycle: init_dis=" + c0 + " after_en=" + c1 + " after_tbl_dis=" + c2 + " after_tbl_en=" + c3 + " after_ren=" + c4 + " drop_miss=" + dropMiss)
+
+    // 12. Data Dictionary Views: USER_TRIGGERS, ALL_TRIGGERS, DBA_TRIGGERS, USER_OBJECTS, USER_SOURCE
+    execOk(mut &c, "CREATE TABLE cat_t (id NUMBER PRIMARY KEY, v VARCHAR2(50))")
+    execOk(mut &c, "CREATE TRIGGER tr_cat BEFORE INSERT OR UPDATE ON cat_t FOR EACH ROW BEGIN :NEW.v := UPPER(:NEW.v); END;")
+    let ut = qStr(mut &c, "SELECT COUNT(*) FROM USER_TRIGGERS WHERE TRIGGER_NAME = 'TR_CAT'")
+    let at = qStr(mut &c, "SELECT COUNT(*) FROM ALL_TRIGGERS WHERE TRIGGER_NAME = 'TR_CAT'")
+    let dt = qStr(mut &c, "SELECT COUNT(*) FROM DBA_TRIGGERS WHERE TRIGGER_NAME = 'TR_CAT'")
+    let obj = qStr(mut &c, "SELECT COUNT(*) FROM USER_OBJECTS WHERE OBJECT_NAME = 'TR_CAT' AND OBJECT_TYPE = 'TRIGGER' AND STATUS = 'VALID'")
+    let src = qStr(mut &c, "SELECT TEXT FROM USER_SOURCE WHERE NAME = 'TR_CAT' AND TYPE = 'TRIGGER' AND LINE = 1")
+    let srcOk = strings.contains(&src, "tr_cat") || strings.contains(&src, "TR_CAT")
+    let meta = qStr(mut &c, "SELECT TRIGGER_NAME || '|' || TRIGGER_TYPE || '|' || TRIGGERING_EVENT || '|' || TABLE_NAME || '|' || BASE_OBJECT_TYPE || '|' || STATUS || '|' || BEFORE_ROW || '|' || AFTER_ROW FROM USER_TRIGGERS WHERE TRIGGER_NAME = 'TR_CAT'")
+    println("dict_views: ut=" + ut + " at=" + at + " dt=" + dt + " obj=" + obj + " src_ok=" + (if srcOk { "true" } else { "false" }) + " meta=" + meta)
+
+    // 13. Persist table + trigger for disk reopen test
+    execOk(mut &c, "CREATE TABLE persist_o (id NUMBER PRIMARY KEY, name VARCHAR2(50), score NUMBER)")
+    execOk(mut &c, "CREATE TRIGGER tr_persist_o BEFORE INSERT ON persist_o FOR EACH ROW BEGIN :NEW.name := UPPER(:NEW.name); :NEW.score := :NEW.score + 700; END;")
+    c.logoff()
+}
+
+fn client2(port: &str) {
+    var c = connect(port)
+    execOk(mut &c, "INSERT INTO persist_o VALUES (1, 'reopened', 77)")
+    execOk(mut &c, "COMMIT")
+    println("reopen_ok: " + qStr(mut &c, "SELECT id, name, score FROM persist_o WHERE id = 1"))
+    c.logoff()
+}
+
+fn runServer(dir: &str, doBootstrap: bool, runCli: fn(&str)) {
+    let opts = lexdb_store.Options{cacheBytes: 32 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}
+    lexdb_store.run(lexdb_disk.real(dir), opts, fn(st: lexdb_store.Store): int {
+        if doBootstrap { lexdb_exec.bootstrap(&st).unwrap() }
+        task.scope(fn(sc: mut &task.Scope) {
+            let ln = net.listen("127.0.0.1:0").unwrap()
+            let addr = ln.localAddr()
+            let f = sc.start(lexdb_tns.acceptLoop, lexdb_tns.AcceptArg{ln: ln, st: st.share()})
+            runCli(&addr[10..len(addr)])
+            { let stop = f }
+        })
+        return 0
+    }).unwrap()
+}
+
+fn main() {
+    let dir = "/tmp/lexdb_ora_triggers_" + os.pid().toStr()
+    let _r1 = fs.removeAll(&dir)
+    let _m1 = fs.mkdirAll(&dir)
+    runServer(&dir, true, client1)
+    runServer(&dir, false, client2)
+    let _r2 = fs.removeAll(&dir)
+}

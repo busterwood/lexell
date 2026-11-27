@@ -57,7 +57,7 @@ PG_BEHAVIOR = {"lexdb_pg", "lexdb_pgcat", "lexdb_plpgsql"}
 SYS_DATA = {"lexdb_sysdata"}
 SYS_BEHAVIOR = {"lexdb_syscat", "lexdb_tsqlfn", "lexdb_tsqltz", "lexdb_tsqlfmt", "lexdb_tsqldef", "lexdb_tsql", "lexdb_tsqlparse", "lexdb_tsqlfunc", "lexdb_tsqlerr"}
 ORA_DATA = {"lexdb_oradata"}
-ORA_BEHAVIOR = {"lexdb_oracat", "lexdb_orafn", "lexdb_oraadm", "lexdb_oratext", "lexdb_oratz", "lexdb_plsql", "lexdb_plcall"}
+ORA_BEHAVIOR = {"lexdb_oracat", "lexdb_orafn", "lexdb_oraadm", "lexdb_oratext", "lexdb_oratz", "lexdb_plsql", "lexdb_plcall", "lexdb_oratrig"}
 PROTO = {"lexdb_wire", "lexdb_pgbin", "lexdb_tds", "lexdb_tns", "lexdb_auth"}
 
 DATA = PG_DATA | SYS_DATA | ORA_DATA
