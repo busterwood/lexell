@@ -1572,6 +1572,12 @@ pub fn least(dir: &[]int, p: int): int { return dir[DIR_HDR + D * p + F_BASE] }
 pub fn greatest(dir: &[]int, p: int): int { return dir[DIR_HDR + D * p + F_MAX] }
 pub fn scaleOf(dir: &[]int, p: int): int { return dir[DIR_HDR + D * p + F_X] }
 
+fn i64AtStr(s: &str, o: int): int {
+    let u = strWord(s, o)
+    let lo = int(u & u64(0x7fffffffffffffff))
+    return if (u >> 63) != u64(0) { lo - 9223372036854775807 - 1 } else { lo }
+}
+
 // Rows from..from+cnt of an integer place (or a units place's units) into
 // out[r0..] (a NULL row: the least value).
 pub fn intsInto(s: &str, dir: &[]int, p: int, from: int, cnt: int, out: mut &[]int, r0: int) {
@@ -1585,13 +1591,22 @@ pub fn intsInto(s: &str, dir: &[]int, p: int, from: int, cnt: int, out: mut &[]i
     var o = dir[x + F_DATA] + wb * from
     if wb == 8 {
         for q in 0..cnt {
-            out[r0 + q] = binary.readI64LEStr(s, o)
+            out[r0 + q] = i64AtStr(s, o)
             o += 8
         }
     } else if wb == 4 {
-        for q in 0..cnt {
+        var q = 0
+        while q + 2 <= cnt {
+            let w = strWord(s, o)
+            let u0 = int(w & u64(0xffffffff))
+            let u1 = int(w >> 32)
+            out[r0 + q] = if u0 >= 0x80000000 { u0 - 0x100000000 } else { u0 }
+            out[r0 + q + 1] = if u1 >= 0x80000000 { u1 - 0x100000000 } else { u1 }
+            o += 8
+            q += 2
+        }
+        if q < cnt {
             out[r0 + q] = binary.readI32LEStr(s, o)
-            o += 4
         }
     } else {
         for q in 0..cnt {
@@ -1917,20 +1932,209 @@ pub fn rangeFilter(s: &str, dir: &[]int, p: int, from: int, cnt: int, r0: int, l
     var o = dir[x + F_DATA] + wb * from
     if wb == 8 {
         for q in 0..cnt {
-            let v = binary.readI64LEStr(s, o)
+            let v = i64AtStr(s, o)
             if v >= lo && v <= hi { append(mut &out, r0 + q) }
             o += 8
         }
     } else if wb == 4 {
-        for q in 0..cnt {
+        var q = 0
+        while q + 2 <= cnt {
+            let w = strWord(s, o)
+            let u0 = int(w & u64(0xffffffff))
+            let v0 = if u0 >= 0x80000000 { u0 - 0x100000000 } else { u0 }
+            if v0 >= lo && v0 <= hi { append(mut &out, r0 + q) }
+            let u1 = int(w >> 32)
+            let v1 = if u1 >= 0x80000000 { u1 - 0x100000000 } else { u1 }
+            if v1 >= lo && v1 <= hi { append(mut &out, r0 + q + 1) }
+            o += 8
+            q += 2
+        }
+        if q < cnt {
             let v = binary.readI32LEStr(s, o)
             if v >= lo && v <= hi { append(mut &out, r0 + q) }
-            o += 4
         }
     } else {
         for q in 0..cnt {
             let v = binary.readI16LEStr(s, o)
             if v >= lo && v <= hi { append(mut &out, r0 + q) }
+            o += 2
+        }
+    }
+    return out
+}
+
+// Fused full-run inequality filter (col <> kv) on a non-NULL integer/units place.
+pub fn neFilter(s: &str, dir: &[]int, p: int, from: int, cnt: int, r0: int, kv: int): []int {
+    var out: []int = withCapacity(cnt)
+    if cnt <= 0 { return out }
+    let x = DIR_HDR + D * p
+    let c = dir[x + F_CODEC]
+    if c == C_FOR || c == C_UNITS {
+        let w = dir[x + F_W]
+        let base = dir[x + F_BASE]
+        if w == 0 {
+            if base != kv {
+                for q in 0..cnt { append(mut &out, r0 + q) }
+            }
+            return out
+        }
+        let data = dir[x + F_DATA]
+        if w == 8 && base <= 9223372036854775552 {
+            if kv < base || kv > base + 255 {
+                for q in 0..cnt { append(mut &out, r0 + q) }
+                return out
+            }
+            let dk = kv - base
+            let vK = VB.splat(byte(dk))
+            let sl = &s[data + from..data + from + cnt]
+            var q = 0
+            for v in VB.chunks(sl, mut &q) {
+                var m = (v != vK).bitmask()
+                while m != u64(0) {
+                    let tz = int(m.trailingZeros())
+                    append(mut &out, r0 + q + tz)
+                    m = m & (m - u64(1))
+                }
+            }
+            if q < cnt {
+                let v = VB.loadPartial(sl, q, byte(dk))
+                var m = (v != vK).bitmask() & VB.tailMask(cnt - q)
+                while m != u64(0) {
+                    let tz = int(m.trailingZeros())
+                    append(mut &out, r0 + q + tz)
+                    m = m & (m - u64(1))
+                }
+            }
+            return out
+        }
+        if w == 16 && base <= 9223372036854775807 - 65535 {
+            if kv < base || kv > base + 65535 {
+                for q in 0..cnt { append(mut &out, r0 + q) }
+                return out
+            }
+            let dk = kv - base
+            let vHi = VB.splat(byte(dk >> 8))
+            let vLo = VB.splat(byte(dk & 255))
+            let even = u64(0x55555555)
+            let odd = u64(0xaaaaaaaa)
+            var o = data + 2 * from
+            var q = 0
+            while q + 16 <= cnt {
+                let v = VB.load(s, o)
+                let eqH = ((v == vHi).bitmask() & odd) >> 1
+                let eqL = (v == vLo).bitmask() & even
+                var m = even ^ (eqH & eqL)
+                while m != u64(0) {
+                    let tz = int(m.trailingZeros())
+                    append(mut &out, r0 + q + (tz >> 1))
+                    m = m & (m - u64(1))
+                }
+                o += 32
+                q += 16
+            }
+            while q < cnt {
+                if u16At(s, o) != dk { append(mut &out, r0 + q) }
+                o += 2
+                q += 1
+            }
+            return out
+        }
+        if w == 4 && base <= 9223372036854775807 - 15 {
+            if kv < base || kv > base + 15 {
+                for q in 0..cnt { append(mut &out, r0 + q) }
+                return out
+            }
+            let dk = kv - base
+            let slen = len(s)
+            var q = 0
+            if (from & 1) != 0 && q < cnt {
+                if (int(s[data + (from >> 1)]) >> 4) != dk { append(mut &out, r0 + q) }
+                q += 1
+            }
+            var pos = data + ((from + q) >> 1)
+            let vM0 = VB.splat(byte(0x0f))
+            let vM1 = VB.splat(byte(0xf0))
+            let vK0 = VB.splat(byte(dk))
+            let vK1 = VB.splat(byte(dk << 4))
+            while q + 64 <= cnt && pos + VB.lanes <= slen {
+                let v = VB.load(s, pos)
+                var mE = ((v & vM0) != vK0).bitmask()
+                var mO = ((v & vM1) != vK1).bitmask()
+                if (mE | mO) != u64(0) {
+                    let baseRow = r0 + q
+                    while (mE | mO) != u64(0) {
+                        let tE = if mE != u64(0) { int(mE.trailingZeros()) } else { 64 }
+                        let tO = if mO != u64(0) { int(mO.trailingZeros()) } else { 64 }
+                        if tE <= tO {
+                            append(mut &out, baseRow + (tE << 1))
+                            mE = mE & (mE - u64(1))
+                        } else {
+                            append(mut &out, baseRow + (tO << 1) + 1)
+                            mO = mO & (mO - u64(1))
+                        }
+                    }
+                }
+                pos += VB.lanes
+                q += 64
+            }
+            while q + 2 <= cnt && pos < slen {
+                let b = int(s[pos])
+                if (b & 15) != dk { append(mut &out, r0 + q) }
+                if (b >> 4) != dk { append(mut &out, r0 + q + 1) }
+                pos += 1
+                q += 2
+            }
+            if q < cnt {
+                if (int(s[pos]) & 15) != dk { append(mut &out, r0 + q) }
+            }
+            return out
+        }
+        let mask = (1 << w) - 1
+        let bp = from * w
+        var pos = data + (bp >> 3)
+        let sk = bp & 7
+        var acc = int(s[pos]) >> sk
+        var have = 8 - sk
+        pos += 1
+        for q in 0..cnt {
+            while have < w {
+                acc = acc | (int(s[pos]) << have)
+                pos += 1
+                have += 8
+            }
+            let v = base +% (acc & mask)
+            if v != kv { append(mut &out, r0 + q) }
+            acc = acc >> w
+            have -= w
+        }
+        return out
+    }
+    let wb = dir[x + F_W]
+    var o = dir[x + F_DATA] + wb * from
+    if wb == 8 {
+        for q in 0..cnt {
+            if i64AtStr(s, o) != kv { append(mut &out, r0 + q) }
+            o += 8
+        }
+    } else if wb == 4 {
+        var q = 0
+        while q + 2 <= cnt {
+            let w = strWord(s, o)
+            let u0 = int(w & u64(0xffffffff))
+            let v0 = if u0 >= 0x80000000 { u0 - 0x100000000 } else { u0 }
+            if v0 != kv { append(mut &out, r0 + q) }
+            let u1 = int(w >> 32)
+            let v1 = if u1 >= 0x80000000 { u1 - 0x100000000 } else { u1 }
+            if v1 != kv { append(mut &out, r0 + q + 1) }
+            o += 8
+            q += 2
+        }
+        if q < cnt {
+            if binary.readI32LEStr(s, o) != kv { append(mut &out, r0 + q) }
+        }
+    } else {
+        for q in 0..cnt {
+            if binary.readI16LEStr(s, o) != kv { append(mut &out, r0 + q) }
             o += 2
         }
     }
@@ -2110,15 +2314,26 @@ pub fn rangeCount(s: &str, dir: &[]int, p: int, from: int, cnt: int, lo: int, hi
     var tot = 0
     if wb == 8 {
         for q in 0..cnt {
-            let v = binary.readI64LEStr(s, o)
+            let v = i64AtStr(s, o)
             if v >= lo && v <= hi { tot += 1 }
             o += 8
         }
     } else if wb == 4 {
-        for q in 0..cnt {
+        var q = 0
+        while q + 2 <= cnt {
+            let w = strWord(s, o)
+            let u0 = int(w & u64(0xffffffff))
+            let v0 = if u0 >= 0x80000000 { u0 - 0x100000000 } else { u0 }
+            if v0 >= lo && v0 <= hi { tot += 1 }
+            let u1 = int(w >> 32)
+            let v1 = if u1 >= 0x80000000 { u1 - 0x100000000 } else { u1 }
+            if v1 >= lo && v1 <= hi { tot += 1 }
+            o += 8
+            q += 2
+        }
+        if q < cnt {
             let v = binary.readI32LEStr(s, o)
             if v >= lo && v <= hi { tot += 1 }
-            o += 4
         }
     } else {
         for q in 0..cnt {
@@ -2128,6 +2343,354 @@ pub fn rangeCount(s: &str, dir: &[]int, p: int, from: int, cnt: int, lo: int, hi
         }
     }
     return tot
+}
+
+// Count rows in from..from+cnt of a non-NULL C_DICT place whose code equals target.
+pub fn codeCount(s: &str, dir: &[]int, p: int, from: int, cnt: int, target: int): int {
+    if cnt <= 0 || target < 0 { return 0 }
+    let x = DIR_HDR + D * p
+    let w = dir[x + F_W]
+    if w == 0 { return if target == 0 { cnt } else { 0 } }
+    let data = dir[x + F_DATA]
+    if w == 8 {
+        if target > 255 { return 0 }
+        let vK = VB.splat(byte(target))
+        let sl = &s[data + from..data + from + cnt]
+        var tot = 0
+        var q = 0
+        for v in VB.chunks(sl, mut &q) {
+            tot += int((v == vK).bitmask().countOnes())
+        }
+        if q < cnt {
+            let v = VB.loadPartial(sl, q, byte(target ^ 1))
+            tot += int(((v == vK).bitmask() & VB.tailMask(cnt - q)).countOnes())
+        }
+        return tot
+    }
+    if w == 4 {
+        if target > 15 { return 0 }
+        let slen = len(s)
+        var tot = 0
+        var q = 0
+        if (from & 1) != 0 && q < cnt {
+            if (int(s[data + (from >> 1)]) >> 4) == target { tot += 1 }
+            q += 1
+        }
+        var pos = data + ((from + q) >> 1)
+        let vM0 = VB.splat(byte(0x0f))
+        let vM1 = VB.splat(byte(0xf0))
+        let vK0 = VB.splat(byte(target))
+        let vK1 = VB.splat(byte(target << 4))
+        while q + 64 <= cnt && pos + VB.lanes <= slen {
+            let v = VB.load(s, pos)
+            tot += int(((v & vM0) == vK0).bitmask().countOnes())
+            tot += int(((v & vM1) == vK1).bitmask().countOnes())
+            pos += VB.lanes
+            q += 64
+        }
+        while q + 2 <= cnt && pos < slen {
+            let b = int(s[pos])
+            if (b & 15) == target { tot += 1 }
+            if (b >> 4) == target { tot += 1 }
+            pos += 1
+            q += 2
+        }
+        if q < cnt {
+            if (int(s[pos]) & 15) == target { tot += 1 }
+        }
+        return tot
+    }
+    let mask = (1 << w) - 1
+    if target > mask { return 0 }
+    let bp = from * w
+    var pos = data + (bp >> 3)
+    let sk = bp & 7
+    var acc = int(s[pos]) >> sk
+    var have = 8 - sk
+    pos += 1
+    var tot = 0
+    for q in 0..cnt {
+        while have < w {
+            acc = acc | (int(s[pos]) << have)
+            pos += 1
+            have += 8
+        }
+        if (acc & mask) == target { tot += 1 }
+        acc = acc >> w
+        have -= w
+    }
+    return tot
+}
+
+// 16-way SIMD empty / non-empty filter on a non-NULL C_TEXT place (compares
+// adjacent u16 end offsets directly with zero string slicing or cmp).
+pub fn textEmptyFilter(s: &str, dir: &[]int, p: int, from: int, cnt: int, r0: int, wantEmpty: bool): []int {
+    var out: []int = withCapacity(cnt)
+    if cnt <= 0 { return out }
+    let offs = dir[DIR_HDR + D * p + F_DATA]
+    var q = 0
+    if from == 0 {
+        let empty0 = u16At(s, offs) == 0
+        if empty0 == wantEmpty { append(mut &out, r0) }
+        q = 1
+    }
+    let even = u64(0x55555555)
+    var o = offs + 2 * (from + q)
+    while q + 16 <= cnt {
+        let vPrev = VB.load(s, o - 2)
+        let vCur = VB.load(s, o)
+        let eq = (vPrev == vCur).bitmask()
+        let emptyM = (eq & (eq >> 1)) & even
+        var m = if wantEmpty { emptyM } else { even ^ emptyM }
+        while m != u64(0) {
+            let tz = int(m.trailingZeros())
+            append(mut &out, r0 + q + (tz >> 1))
+            m = m & (m - u64(1))
+        }
+        o += 32
+        q += 16
+    }
+    if q < cnt {
+        var prev = u16At(s, o - 2)
+        while q < cnt {
+            let cur = u16At(s, o)
+            if (cur == prev) == wantEmpty { append(mut &out, r0 + q) }
+            prev = cur
+            o += 2
+            q += 1
+        }
+    }
+    return out
+}
+
+// Zero-allocation 16-way SIMD empty / non-empty count on a non-NULL C_TEXT place.
+pub fn textEmptyCount(s: &str, dir: &[]int, p: int, from: int, cnt: int, wantEmpty: bool): int {
+    if cnt <= 0 { return 0 }
+    let offs = dir[DIR_HDR + D * p + F_DATA]
+    var tot = 0
+    var q = 0
+    if from == 0 {
+        let empty0 = u16At(s, offs) == 0
+        if empty0 == wantEmpty { tot += 1 }
+        q = 1
+    }
+    let even = u64(0x55555555)
+    var o = offs + 2 * (from + q)
+    while q + 16 <= cnt {
+        let vPrev = VB.load(s, o - 2)
+        let vCur = VB.load(s, o)
+        let eq = (vPrev == vCur).bitmask()
+        let emptyM = (eq & (eq >> 1)) & even
+        let m = if wantEmpty { emptyM } else { even ^ emptyM }
+        tot += int(m.countOnes())
+        o += 32
+        q += 16
+    }
+    if q < cnt {
+        var prev = u16At(s, o - 2)
+        while q < cnt {
+            let cur = u16At(s, o)
+            if (cur == prev) == wantEmpty { tot += 1 }
+            prev = cur
+            o += 2
+            q += 1
+        }
+    }
+    return tot
+}
+
+// Direct leaf-level SUM/MIN/MAX over rows from..from+cnt of a non-NULL integer or
+// units place p using SWAR 64-bit word accumulation (no Batch unpack/allocation).
+// When needSum is false and fullLeaf is true with hasRange, returns O(1) header min/max.
+pub fn sumIntCols(s: &str, dir: &[]int, p: int, from: int, cnt: int, leafN: int, wantScale: int,
+                  needSum: bool, needExactMinMax: bool, outCnt: mut &int, outMin: mut &int, outMax: mut &int): Option[i128] {
+    if cnt <= 0 { return Some(i128(0)) }
+    if p < 0 || p >= places(dir) { return None }
+    let x = DIR_HDR + D * p
+    if dir[x + F_NULLS] >= 0 { return None }
+    let k = kindOf(s, p)
+    let c = dir[x + F_CODEC]
+    if wantScale >= 0 {
+        if k != K_NUM || c != C_UNITS || dir[x + F_X] != wantScale { return None }
+    } else {
+        if !(k == K_INT || k == K_INT4 || k == K_INT2) { return None }
+        if c != C_FOR && c != C_RAW { return None }
+    }
+    let fullLeaf = from == 0 && cnt == leafN
+    let hr = dir[x + F_Y] == 1
+    if !hr { return None }
+    if needExactMinMax && !fullLeaf { return None }
+    let mn = dir[x + F_BASE]
+    let mx = dir[x + F_MAX]
+    outMin = mn
+    outMax = mx
+    outCnt = cnt
+    if !needSum { return Some(i128(0)) }
+    if c == C_FOR || c == C_UNITS {
+        let w = dir[x + F_W]
+        let base = dir[x + F_BASE]
+        if w == 0 {
+            return Some(i128(cnt) * i128(base))
+        }
+        let data = dir[x + F_DATA]
+        if w == 8 {
+            // SWAR 8 bytes per step in 16-bit lanes; fold every 255 steps (2040 rows) to prevent u16 overflow
+            var deltaSum = i128(0)
+            var o = data + from
+            var q = 0
+            let mask16 = u64(0x00ff00ff00ff00ff)
+            while q + 8 <= cnt {
+                var accLo = u64(0)
+                var accHi = u64(0)
+                var steps = 0
+                while steps < 255 && q + 8 <= cnt {
+                    let word = strWord(s, o)
+                    accLo = accLo +% (word & mask16)
+                    accHi = accHi +% ((word >> 8) & mask16)
+                    o += 8
+                    q += 8
+                    steps += 1
+                }
+                let s0 = (accLo & u64(0xffff)) +% ((accLo >> 16) & u64(0xffff)) +% ((accLo >> 32) & u64(0xffff)) +% (accLo >> 48)
+                let s1 = (accHi & u64(0xffff)) +% ((accHi >> 16) & u64(0xffff)) +% ((accHi >> 32) & u64(0xffff)) +% (accHi >> 48)
+                deltaSum += i128(int(s0 +% s1))
+            }
+            var tail = 0
+            while q < cnt {
+                tail += int(s[o])
+                o += 1
+                q += 1
+            }
+            deltaSum += i128(tail)
+            return Some(i128(cnt) * i128(base) + deltaSum)
+        }
+        if w == 16 {
+            // SWAR 4 u16 values per step in 32-bit lanes (no overflow up to 65535 steps = 262k rows)
+            var deltaSum = i128(0)
+            var o = data + 2 * from
+            var q = 0
+            let mask32 = u64(0x0000ffff0000ffff)
+            var accLo = u64(0)
+            var accHi = u64(0)
+            var steps = 0
+            while q + 4 <= cnt {
+                let word = strWord(s, o)
+                accLo = accLo +% (word & mask32)
+                accHi = accHi +% ((word >> 16) & mask32)
+                o += 8
+                q += 4
+                steps += 1
+                if steps == 65535 {
+                    deltaSum += i128(int(accLo & u64(0xffffffff))) + i128(int(accLo >> 32)) +
+                                i128(int(accHi & u64(0xffffffff))) + i128(int(accHi >> 32))
+                    accLo = u64(0)
+                    accHi = u64(0)
+                    steps = 0
+                }
+            }
+            if steps > 0 {
+                deltaSum += i128(int(accLo & u64(0xffffffff))) + i128(int(accLo >> 32)) +
+                            i128(int(accHi & u64(0xffffffff))) + i128(int(accHi >> 32))
+            }
+            var tail = 0
+            while q < cnt {
+                tail += u16At(s, o)
+                o += 2
+                q += 1
+            }
+            deltaSum += i128(tail)
+            return Some(i128(cnt) * i128(base) + deltaSum)
+        }
+        if w == 4 {
+            let slen = len(s)
+            var deltaSum = i128(0)
+            var q = 0
+            if (from & 1) != 0 && q < cnt {
+                deltaSum += i128(int(s[data + (from >> 1)]) >> 4)
+                q += 1
+            }
+            var pos = data + ((from + q) >> 1)
+            let maskNib = u64(0x0f0f0f0f0f0f0f0f)
+            let mask16 = u64(0x00ff00ff00ff00ff)
+            while q + 16 <= cnt && pos + 8 <= slen {
+                var accLo = u64(0)
+                var accHi = u64(0)
+                var steps = 0
+                while steps < 255 && q + 16 <= cnt && pos + 8 <= slen {
+                    let word = strWord(s, pos)
+                    // Each byte's sum of low+high nibble is in 0..30; 8 bytes -> 4x u16 lanes
+                    let bsum = (word & maskNib) +% ((word >> 4) & maskNib)
+                    accLo = accLo +% (bsum & mask16)
+                    accHi = accHi +% ((bsum >> 8) & mask16)
+                    pos += 8
+                    q += 16
+                    steps += 1
+                }
+                let s0 = (accLo & u64(0xffff)) +% ((accLo >> 16) & u64(0xffff)) +% ((accLo >> 32) & u64(0xffff)) +% (accLo >> 48)
+                let s1 = (accHi & u64(0xffff)) +% ((accHi >> 16) & u64(0xffff)) +% ((accHi >> 32) & u64(0xffff)) +% (accHi >> 48)
+                deltaSum += i128(int(s0 +% s1))
+            }
+            var tail = 0
+            while q + 2 <= cnt && pos < slen {
+                let b = int(s[pos])
+                tail += (b & 15) + (b >> 4)
+                pos += 1
+                q += 2
+            }
+            if q < cnt {
+                tail += int(s[pos]) & 15
+            }
+            deltaSum += i128(tail)
+            return Some(i128(cnt) * i128(base) + deltaSum)
+        }
+        let mask = (1 << w) - 1
+        let bp = from * w
+        var pos = data + (bp >> 3)
+        let sk = bp & 7
+        var acc = int(s[pos]) >> sk
+        var have = 8 - sk
+        pos += 1
+        var deltaSum = i128(0)
+        for q in 0..cnt {
+            while have < w {
+                acc = acc | (int(s[pos]) << have)
+                pos += 1
+                have += 8
+            }
+            deltaSum += i128(acc & mask)
+            acc = acc >> w
+            have -= w
+        }
+        return Some(i128(cnt) * i128(base) + deltaSum)
+    }
+    let wb = dir[x + F_W]
+    var o = dir[x + F_DATA] + wb * from
+    var tot = i128(0)
+    if wb == 8 {
+        for q in 0..cnt {
+            tot += i128(i64AtStr(s, o))
+            o += 8
+        }
+    } else if wb == 4 {
+        var q = 0
+        while q + 2 <= cnt {
+            let word = strWord(s, o)
+            let u0 = int(word & u64(0xffffffff))
+            let u1 = int(word >> 32)
+            let v0 = if u0 >= 0x80000000 { u0 - 0x100000000 } else { u0 }
+            let v1 = if u1 >= 0x80000000 { u1 - 0x100000000 } else { u1 }
+            tot += i128(v0 + v1)
+            o += 8
+            q += 2
+        }
+        if q < cnt { tot += i128(binary.readI32LEStr(s, o)) }
+    } else {
+        for q in 0..cnt {
+            tot += i128(binary.readI16LEStr(s, o))
+            o += 2
+        }
+    }
+    return Some(tot)
 }
 
 fn utf8LenSpan(s: &str, lo: int, hi: int): int {
@@ -2279,6 +2842,80 @@ pub fn bloomFilter(s: &str, dir: &[]int, p: int, from: int, cnt: int, r0: int, b
         }
         let data = dir[x + F_DATA]
         if w == 8 {
+            if base <= 9223372036854775552 && lo <= hi {
+                if hi < base || lo > base + 255 { return out }
+                let dlo = if lo <= base { 0 } else { lo - base }
+                let dhi = if hi >= base + 255 { 255 } else { hi - base }
+                let span = dhi - dlo + 1
+                if cnt >= 64 && span <= cnt {
+                    var b0 = u64(0)
+                    var b1 = u64(0)
+                    var b2 = u64(0)
+                    var b3 = u64(0)
+                    for d in dlo..dhi + 1 {
+                        let h = rtBloomHash(base + d)
+                        let bm = rtBloomMask(h)
+                        if (words[int((h >> 18) & bmask)] & bm) == bm {
+                            let bit = u64(1) << (d & 63)
+                            let wi = d >> 6
+                            if wi == 0 { b0 = b0 | bit }
+                            else if wi == 1 { b1 = b1 | bit }
+                            else if wi == 2 { b2 = b2 | bit }
+                            else { b3 = b3 | bit }
+                        }
+                    }
+                    if (b0 | b1 | b2 | b3) == u64(0) { return out }
+                    let vLo = VB.splat(byte(dlo))
+                    let vHi = VB.splat(byte(dhi))
+                    let sl = &s[data + from..data + from + cnt]
+                    var q = 0
+                    for v in VB.chunks(sl, mut &q) {
+                        var m = ((v >= vLo) & (v <= vHi)).bitmask()
+                        while m != u64(0) {
+                            let tz = int(m.trailingZeros())
+                            let d = int(sl[q + tz])
+                            let wi = d >> 6
+                            let bw = if wi == 0 { b0 } else if wi == 1 { b1 } else if wi == 2 { b2 } else { b3 }
+                            if ((bw >> (d & 63)) & u64(1)) != u64(0) { append(mut &out, r0 + q + tz) }
+                            m = m & (m - u64(1))
+                        }
+                    }
+                    while q < cnt {
+                        let d = int(sl[q])
+                        if d >= dlo && d <= dhi {
+                            let wi = d >> 6
+                            let bw = if wi == 0 { b0 } else if wi == 1 { b1 } else if wi == 2 { b2 } else { b3 }
+                            if ((bw >> (d & 63)) & u64(1)) != u64(0) { append(mut &out, r0 + q) }
+                        }
+                        q += 1
+                    }
+                    return out
+                }
+                let vLo = VB.splat(byte(dlo))
+                let vHi = VB.splat(byte(dhi))
+                let sl = &s[data + from..data + from + cnt]
+                var q = 0
+                for v in VB.chunks(sl, mut &q) {
+                    var m = ((v >= vLo) & (v <= vHi)).bitmask()
+                    while m != u64(0) {
+                        let tz = int(m.trailingZeros())
+                        let h = rtBloomHash(base + int(sl[q + tz]))
+                        let bm = rtBloomMask(h)
+                        if (words[int((h >> 18) & bmask)] & bm) == bm { append(mut &out, r0 + q + tz) }
+                        m = m & (m - u64(1))
+                    }
+                }
+                while q < cnt {
+                    let d = int(sl[q])
+                    if d >= dlo && d <= dhi {
+                        let h = rtBloomHash(base + d)
+                        let bm = rtBloomMask(h)
+                        if (words[int((h >> 18) & bmask)] & bm) == bm { append(mut &out, r0 + q) }
+                    }
+                    q += 1
+                }
+                return out
+            }
             var o = data + from
             for q in 0..cnt {
                 let v = base +% int(s[o])
@@ -2292,6 +2929,77 @@ pub fn bloomFilter(s: &str, dir: &[]int, p: int, from: int, cnt: int, r0: int, b
             return out
         }
         if w == 16 {
+            if base <= 9223372036854775807 - 65535 && lo <= hi {
+                if hi < base || lo > base + 65535 { return out }
+                let dlo = if lo <= base { 0 } else { lo - base }
+                let dhi = if hi >= base + 65535 { 65535 } else { hi - base }
+                if dlo > 0 || dhi < 65535 {
+                    let loH = dlo >> 8
+                    let loL = dlo & 255
+                    let hiH = dhi >> 8
+                    let hiL = dhi & 255
+                    let vLoH = VB.splat(byte(loH))
+                    let vLoL = VB.splat(byte(loL))
+                    let vHiL = VB.splat(byte(hiL))
+                    let even = u64(0x55555555)
+                    let odd = u64(0xaaaaaaaa)
+                    var o = data + 2 * from
+                    var q = 0
+                    if loH == hiH {
+                        while q + 16 <= cnt {
+                            let v = VB.load(s, o)
+                            let mH = ((v == vLoH).bitmask() & odd) >> 1
+                            let mL = ((v >= vLoL) & (v <= vHiL)).bitmask() & even
+                            var m = mH & mL
+                            while m != u64(0) {
+                                let tz = int(m.trailingZeros())
+                                let lane = tz >> 1
+                                let h = rtBloomHash(base + u16At(s, o + tz))
+                                let bm = rtBloomMask(h)
+                                if (words[int((h >> 18) & bmask)] & bm) == bm { append(mut &out, r0 + q + lane) }
+                                m = m & (m - u64(1))
+                            }
+                            o += 32
+                            q += 16
+                        }
+                    } else {
+                        let vHiH = VB.splat(byte(hiH))
+                        while q + 16 <= cnt {
+                            let v = VB.load(s, o)
+                            let mGtLoH = ((v > vLoH).bitmask() & odd) >> 1
+                            let mEqLoH = ((v == vLoH).bitmask() & odd) >> 1
+                            let mGeLoL = (v >= vLoL).bitmask() & even
+                            let geLo = mGtLoH | (mEqLoH & mGeLoL)
+                            let mLtHiH = ((v < vHiH).bitmask() & odd) >> 1
+                            let mEqHiH = ((v == vHiH).bitmask() & odd) >> 1
+                            let mLeHiL = (v <= vHiL).bitmask() & even
+                            let leHi = mLtHiH | (mEqHiH & mLeHiL)
+                            var m = geLo & leHi
+                            while m != u64(0) {
+                                let tz = int(m.trailingZeros())
+                                let lane = tz >> 1
+                                let h = rtBloomHash(base + u16At(s, o + tz))
+                                let bm = rtBloomMask(h)
+                                if (words[int((h >> 18) & bmask)] & bm) == bm { append(mut &out, r0 + q + lane) }
+                                m = m & (m - u64(1))
+                            }
+                            o += 32
+                            q += 16
+                        }
+                    }
+                    while q < cnt {
+                        let u = u16At(s, o)
+                        if u >= dlo && u <= dhi {
+                            let h = rtBloomHash(base + u)
+                            let bm = rtBloomMask(h)
+                            if (words[int((h >> 18) & bmask)] & bm) == bm { append(mut &out, r0 + q) }
+                        }
+                        o += 2
+                        q += 1
+                    }
+                    return out
+                }
+            }
             var o = data + 2 * from
             for q in 0..cnt {
                 let v = base +% u16At(s, o)
@@ -2332,7 +3040,7 @@ pub fn bloomFilter(s: &str, dir: &[]int, p: int, from: int, cnt: int, r0: int, b
     var o = dir[x + F_DATA] + wb * from
     if wb == 8 {
         for q in 0..cnt {
-            let v = binary.readI64LEStr(s, o)
+            let v = i64AtStr(s, o)
             if v >= lo && v <= hi {
                 let h = rtBloomHash(v)
                 let m = rtBloomMask(h)
@@ -2341,14 +3049,33 @@ pub fn bloomFilter(s: &str, dir: &[]int, p: int, from: int, cnt: int, r0: int, b
             o += 8
         }
     } else if wb == 4 {
-        for q in 0..cnt {
+        var q = 0
+        while q + 2 <= cnt {
+            let word = strWord(s, o)
+            let u0 = int(word & u64(0xffffffff))
+            let v0 = if u0 >= 0x80000000 { u0 - 0x100000000 } else { u0 }
+            if v0 >= lo && v0 <= hi {
+                let h = rtBloomHash(v0)
+                let m = rtBloomMask(h)
+                if (words[int((h >> 18) & bmask)] & m) == m { append(mut &out, r0 + q) }
+            }
+            let u1 = int(word >> 32)
+            let v1 = if u1 >= 0x80000000 { u1 - 0x100000000 } else { u1 }
+            if v1 >= lo && v1 <= hi {
+                let h = rtBloomHash(v1)
+                let m = rtBloomMask(h)
+                if (words[int((h >> 18) & bmask)] & m) == m { append(mut &out, r0 + q + 1) }
+            }
+            o += 8
+            q += 2
+        }
+        if q < cnt {
             let v = binary.readI32LEStr(s, o)
             if v >= lo && v <= hi {
                 let h = rtBloomHash(v)
                 let m = rtBloomMask(h)
                 if (words[int((h >> 18) & bmask)] & m) == m { append(mut &out, r0 + q) }
             }
-            o += 4
         }
     } else {
         for q in 0..cnt {

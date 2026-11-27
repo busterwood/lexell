@@ -234,6 +234,9 @@ fn textRowsOp(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int, pl
         return Some(out)
     }
     if codec != lexdb_cols.C_TEXT { return None }
+    if n == cnt && !nulls && (op == 0 || op == 1) && len(ks) == 1 && len(ks[0]) == 0 {
+        return Some(lexdb_cols.textEmptyFilter(s, dir, pl, from, cnt, r0, op == 0))
+    }
     for x in 0..n {
         let i = from + rs[x] - r0
         if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
@@ -403,6 +406,9 @@ pub fn rowsOfCols(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int
                 let mx = lexdb_cols.greatest(dir, pl)
                 if mn == kv && mx == kv { return Some([]) }
                 if !nulls && (kv < mn || kv > mx) { return Some(collections.copyOf(rs)) }
+            }
+            if n == cnt && !nulls {
+                return Some(lexdb_cols.neFilter(s, dir, pl, from, cnt, r0, kv))
             }
             let w = wordsOfCols(s, dir, from, rs, r0, cnt, pl)
             var out: []int = withCapacity(n)
@@ -593,21 +599,12 @@ pub fn countOfCols(s: &str, dir: &[]int, from: int, cnt: int, k: &LeafK): Option
                 if mn == kv && mx == kv { return Some(0) }
                 if !nulls && (kv < mn || kv > mx) { return Some(cnt) }
             }
+            if !nulls {
+                return Some(cnt - lexdb_cols.rangeCount(s, dir, pl, from, cnt, kv, kv))
+            }
             var w: []int = array(cnt, 0)
             lexdb_cols.intsInto(s, dir, pl, from, cnt, mut &w, 0)
             var tot = 0
-            if !nulls {
-                let vK = VI.splat(kv)
-                var x = 0
-                for v in VI.chunks(&w, mut &x) {
-                    tot += int((v != vK).bitmask().countOnes())
-                }
-                while x < cnt {
-                    if w[x] != kv { tot += 1 }
-                    x += 1
-                }
-                return Some(tot)
-            }
             for q in 0..cnt {
                 if w[q] != kv && !lexdb_cols.isNull(s, dir, pl, from + q) { tot += 1 }
             }
@@ -669,6 +666,49 @@ pub fn countOfCols(s: &str, dir: &[]int, from: int, cnt: int, k: &LeafK): Option
                     let i = from + q
                     if !lexdb_cols.isNull(s, dir, pa, i) && !lexdb_cols.isNull(s, dir, pb, i) { tot += 1 }
                 }
+            }
+            return Some(tot)
+        }
+        LeafK.Texts(op, pl, ks) {
+            if pl >= lexdb_cols.places(dir) || lexdb_cols.kindOf(s, pl) != lexdb_rows.PK_TEXT { return None }
+            let codec = lexdb_cols.codecOf(dir, pl)
+            let nulls = lexdb_cols.hasNulls(dir, pl)
+            if codec == lexdb_cols.C_DICT {
+                let nd = lexdb_cols.dictSize(dir, pl)
+                var hit: []bool = array(nd, false)
+                var nHit = 0
+                var oneHit = -1
+                var oneMiss = -1
+                for j in 0..nd {
+                    let sp = lexdb_cols.entryAt(s, dir, pl, j)
+                    let ok = textHolds(op, &s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)], &ks)
+                    hit[j] = ok
+                    if ok { nHit += 1; oneHit = j } else { oneMiss = j }
+                }
+                if !nulls {
+                    if nHit == 0 { return Some(0) }
+                    if nHit == nd { return Some(cnt) }
+                    if nHit == 1 { return Some(lexdb_cols.codeCount(s, dir, pl, from, cnt, oneHit)) }
+                    if nHit == nd - 1 { return Some(cnt - lexdb_cols.codeCount(s, dir, pl, from, cnt, oneMiss)) }
+                }
+                var codes: []int = array(cnt, 0)
+                lexdb_cols.codesInto(s, dir, pl, from, cnt, mut &codes, 0)
+                var tot = 0
+                for q in 0..cnt {
+                    if hit[codes[q]] && (!nulls || !lexdb_cols.isNull(s, dir, pl, from + q)) { tot += 1 }
+                }
+                return Some(tot)
+            }
+            if codec != lexdb_cols.C_TEXT { return None }
+            if !nulls && (op == 0 || op == 1) && len(ks) == 1 && len(ks[0]) == 0 {
+                return Some(lexdb_cols.textEmptyCount(s, dir, pl, from, cnt, op == 0))
+            }
+            var tot = 0
+            for q in 0..cnt {
+                let i = from + q
+                if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
+                let sp = lexdb_cols.varAt(s, dir, pl, i)
+                if textHolds(op, &s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)], &ks) { tot += 1 }
             }
             return Some(tot)
         }

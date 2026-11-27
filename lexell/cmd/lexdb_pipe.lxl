@@ -18825,6 +18825,79 @@ fn tryDirectCountLeaf(st: mut &ParAggState, meta: &ParAggMeta, specs: &[]BSpec, 
     }
 }
 
+fn tryDirectIntAggLeaf(st: mut &ParAggState, meta: &ParAggMeta, specs: &[]BSpec, shareOf: &[]int,
+                       intPl: &[]int, intDelta: &[]int, intFit: &[]int, intScale: &[]int,
+                       uniqPl: &[]int, uniqScale: &[]int, uniqNeedSum: &[]bool, uniqNeedMM: &[]bool, specUniq: &[]int,
+                       s: &str, dir: &[]int, from: int, leafCnt: int, leafN: int): Result[bool, DbErr] {
+    let nu = len(uniqPl)
+    var uSum: []i128 = array(nu, i128(0))
+    var uCnt: []int = array(nu, 0)
+    var uMin: []int = array(nu, 0)
+    var uMax: []int = array(nu, 0)
+    for ui in 0..nu {
+        var nc = 0
+        var mn = 0
+        var mx = 0
+        match lexdb_rows.colSumInt(s, dir, uniqPl[ui], from, leafCnt, leafN, uniqScale[ui],
+                                   uniqNeedSum[ui], uniqNeedMM[ui], mut &nc, mut &mn, mut &mx) {
+            Some(tot) { uSum[ui] = tot; uCnt[ui] = nc; uMin[ui] = mn; uMax[ui] = mx }
+            None { return Ok(false) }
+        }
+    }
+    // Verify any SUM(col + delta) fits without integer overflow before mutating state
+    for si in 0..len(specs) {
+        if shareOf[si] >= 0 { continue }
+        let delta = intDelta[si]
+        if delta == 0 { continue }
+        let ui = specUniq[si]
+        if ui < 0 || uCnt[ui] == 0 { continue }
+        let fitBits = intFit[si]
+        let mn = uMin[ui]
+        let mx = uMax[ui]
+        if fitBits == 16 {
+            match mn.checkedAdd(delta) { Some(lo) { if lo < -32768 { return Ok(false) } } None { return Ok(false) } }
+            match mx.checkedAdd(delta) { Some(hi) { if hi > 32767 { return Ok(false) } } None { return Ok(false) } }
+        } else if fitBits == 32 {
+            match mn.checkedAdd(delta) { Some(lo) { if lo < -2147483648 { return Ok(false) } } None { return Ok(false) } }
+            match mx.checkedAdd(delta) { Some(hi) { if hi > 2147483647 { return Ok(false) } } None { return Ok(false) } }
+        } else {
+            if mn.checkedAdd(delta).isNone() || mx.checkedAdd(delta).isNone() { return Ok(false) }
+        }
+    }
+    st.nRead += leafCnt
+    st.nJoined += leafCnt
+    if st.ngroups == 0 {
+        st.ngroups += 1
+        st.added += 32 + 64 * (meta.ns + 1)
+        if meta.room >= 0 && st.added > meta.room { return Err(memErr(meta.maxHeld)) }
+        parNewGroup(st, specs)
+    }
+    for si in 0..len(specs) {
+        if shareOf[si] >= 0 { continue }
+        let sp = &specs[si]
+        if sp.kind == BA_STAR {
+            st.an[si][0] += leafCnt
+            continue
+        }
+        let ui = specUniq[si]
+        let nc = uCnt[ui]
+        if nc == 0 { continue }
+        if sp.kind == BA_COUNT {
+            st.an[si][0] += nc
+        } else if sp.kind == BA_SUM || sp.kind == BA_AVG {
+            st.adec[si][0] += uSum[ui] + i128(intDelta[si]) * i128(nc)
+            st.an[si][0] += nc
+        } else if sp.kind == BA_MIN || sp.kind == BA_MAX {
+            let val = if sp.kind == BA_MAX { uMax[ui] } else { uMin[ui] }
+            if st.an[si][0] == 0 || (if sp.kind == BA_MAX { val > st.amm[si][0] } else { val < st.amm[si][0] }) {
+                st.amm[si][0] = val
+            }
+            st.an[si][0] += nc
+        }
+    }
+    return Ok(true)
+}
+
 fn tryDirectStrLenLeaf(st: mut &ParAggState, meta: &ParAggMeta, specs: &[]BSpec, shareOf: &[]int,
                        strLenPl: &[]int, s: &str, dir: &[]int, from: int, leafCnt: int): Result[bool, DbErr] {
     var sums: []i128 = array(len(specs), i128(0))
@@ -18947,6 +19020,101 @@ fn parAggWorker(slab: &str, leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int,
         }
         if !anyStrLen { directStrLen = false }
     }
+    var directIntAgg = !directStrLen && meta.nkeys == 0 && len(fcols) == 0 && !meta.havOn && len(bconds) == 0 && len(lz.raw) == 0
+    var intPl: []int = array(len(specs), -1)
+    var intDelta: []int = array(len(specs), 0)
+    var intFit: []int = array(len(specs), 64)
+    var intScale: []int = array(len(specs), -1)
+    var uniqPl: []int = []
+    var uniqScale: []int = []
+    var uniqNeedSum: []bool = []
+    var uniqNeedMM: []bool = []
+    var specUniq: []int = array(len(specs), -1)
+    if directIntAgg {
+        var anyInt = false
+        for si in 0..len(specs) {
+            if shareOf[si] >= 0 { continue }
+            let sp = &specs[si]
+            if sp.filter.isSome() || sp.vcol >= 0 { directIntAgg = false; break }
+            if sp.kind == BA_STAR { continue }
+            var col = -1
+            var delta = 0
+            var fitBits = 64
+            var wantScale = -1
+            var needSum = false
+            var needMM = false
+            if (sp.kind == BA_SUM || sp.kind == BA_AVG) && sp.dsc < 0 {
+                match &sp.arg {
+                    Some(ax) {
+                        let sco = sumColOffset(ax, kinds)
+                        col = sco.col
+                        delta = sco.delta
+                        fitBits = sco.fitBits
+                        needSum = true
+                    }
+                    None {}
+                }
+            } else if (sp.kind == BA_SUM || sp.kind == BA_AVG) && sp.dsc >= 0 {
+                match &sp.arg {
+                    Some(ax) {
+                        match ax {
+                            BNode.Col(c) {
+                                if c >= 0 && c < len(bp.kinds) && bp.kinds[c] == lexdb_rows.BK_DEC {
+                                    col = c
+                                    wantScale = sp.dsc
+                                    needSum = true
+                                }
+                            }
+                            else {}
+                        }
+                    }
+                    None {}
+                }
+            } else if sp.kind == BA_MIN || sp.kind == BA_MAX || sp.kind == BA_COUNT {
+                match &sp.arg {
+                    Some(ax) {
+                        match ax {
+                            BNode.Col(c) {
+                                if c >= 0 && c < len(bp.kinds) && bp.kinds[c] == BK_INT {
+                                    col = c
+                                    needMM = sp.kind == BA_MIN || sp.kind == BA_MAX
+                                }
+                            }
+                            else {}
+                        }
+                    }
+                    None {}
+                }
+            }
+            if col < 0 { directIntAgg = false; break }
+            var foundPl = -1
+            for p in bp.usedP {
+                if p < len(bp.placeCol) && bp.placeCol[p] == col { foundPl = p; break }
+            }
+            if foundPl < 0 { directIntAgg = false; break }
+            intPl[si] = foundPl
+            intDelta[si] = delta
+            intFit[si] = fitBits
+            intScale[si] = wantScale
+            var ui = -1
+            for j in 0..len(uniqPl) {
+                if uniqPl[j] == foundPl && uniqScale[j] == wantScale { ui = j; break }
+            }
+            if ui < 0 {
+                ui = len(uniqPl)
+                append(mut &uniqPl, foundPl)
+                append(mut &uniqScale, wantScale)
+                append(mut &uniqNeedSum, needSum)
+                append(mut &uniqNeedMM, needMM)
+            } else {
+                if needSum { uniqNeedSum[ui] = true }
+                if needMM { uniqNeedMM[ui] = true }
+            }
+            specUniq[si] = ui
+            anyInt = true
+        }
+        if !anyInt { directIntAgg = false }
+    }
     for li in lo..hi {
         let pl = &leaves[li]
         let s = &slab[pl.off..pl.off + pl.slen]
@@ -19029,6 +19197,14 @@ fn parAggWorker(slab: &str, leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int,
         }
         if directStrLen && leafCnt > 0 {
             match tryDirectStrLenLeaf(mut &st, meta, specs, shareOf, &strLenPl, s, &dir, pl.from, leafCnt) {
+                Ok(done) { if done { continue } }
+                Err(x) { st.err = Some(x); return st }
+            }
+        }
+        if directIntAgg && leafCnt > 0 {
+            match tryDirectIntAggLeaf(mut &st, meta, specs, shareOf, &intPl, &intDelta, &intFit, &intScale,
+                                      &uniqPl, &uniqScale, &uniqNeedSum, &uniqNeedMM, &specUniq,
+                                      s, &dir, pl.from, leafCnt, pl.n) {
                 Ok(done) { if done { continue } }
                 Err(x) { st.err = Some(x); return st }
             }
