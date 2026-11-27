@@ -199,10 +199,10 @@ The current Lexell grew out of an Oberon dialect and an ownership fork called `o
 
 | Area | What you’ll find |
 |---|---|
-| Language | Modules with explicit imports, records with methods, generics, structural interfaces, slices, closures, `Option`, `Result`, `try`, `match` and destructors. |
+| Language | Modules with explicit imports, records with methods, generics, structural interfaces (including `box I` / `&I` interface values), slices, borrowed and escaping (`box fn`) closures, string interpolation (`$"..."`), derived `Serialize`/`Deserialize`, `Option`, `Result`, `Error`, `try` (with auto-boxing), `match` and destructors. |
 | Ownership | Single ownership and checked borrows, for strings too: a `str` is owned and moves, `&str` borrows it, and `clone()` copies it. Reference counting is opt-in: `rc T` is a counted, immutable handle for values you want to share. |
-| Compiler | A self-hosted compiler that writes x86-64 ELF directly. The C backend shares the same intermediate representation and is used for bootstrapping and differential testing. |
-| Standard library | Collections, text and file I/O, time zones, regex, JSON, CommonMark, HTTP and HTTPS servers and clients, TLS, Redis and tasks. |
+| Compiler | A self-hosted compiler that writes x86-64 ELF directly (with devirtualization for interface values and escaping closures). The C backend shares the same intermediate representation and is used for bootstrapping and differential testing. |
+| Standard library | Collections, composable `io.Read`/`io.Write` streams and file I/O, time zones, regex, JSON, YAML 1.2, CSV/TSV (RFC 4180, Excel, PostgreSQL `COPY`), CommonMark, `zlib` and `zstd` compression, modern crypto (AEAD, HKDF, PBKDF2, Ed25519, X25519, ECDSA), HTTP/1.1 & HTTP/2 servers and clients (with pluggable compression and stateful closure/interface handlers), TLS, Redis and tasks. |
 | Data stores | Clients for SQLite, PostgreSQL, SQL Server, Oracle and Redis. PostgreSQL, SQL Server and Oracle use their native wire protocols; Redis speaks RESP2 and RESP3. The SQL clients can decode rows into your own record types in bounded batches. |
 | Programs | A jq port, a CommonMark renderer, an HTTP/1.1 & HTTP/2 (and HTTPS) server and load client, a Redis client and `redis-cli`, and ports of everyday tools including `grep`, `eza` and `zoxide`. |
 
@@ -223,7 +223,7 @@ See the [database streaming design](lexell/design/db-streaming.md) for an exampl
 
 ## Status and feedback
 
-The specification is a draft. Record the commit you build from if you want to reproduce an example later. The compiler finds the standard library in the source tree. Some library features use system libraries, including OpenSSL for TLS and libsqlite3 for SQLite.
+The specification is a draft. Record the commit you build from if you want to reproduce an example later. The compiler finds the standard library in the source tree. Some library features use system libraries, including OpenSSL for TLS and crypto, `libz` and `libzstd` for compression, and `libsqlite3` for SQLite.
 
 If you try Lexell, I’d like to know what you built and where you got stuck. For a bug, include the commit, your platform, a small reproducer and the output you expected. For a library or documentation gap, an example of what you were trying to do is a good place to start.
 
