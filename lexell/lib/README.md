@@ -86,6 +86,7 @@ for leaks.
 | `regex_unicode.lxl` | 2,019 | generated (`gen_regex_unicode.py`): Unicode 15.0.0 categories, scripts and simple case folding |
 | `json.lxl` | 1,944 | JSON values (shared, copy on write; objects in insertion order), parsing with positioned errors, a decoder for sequences, compact and indented writing with jq's options |
 | `yaml.lxl` | 5,293 | YAML 1.2 (Core Schema): comment- and style-preserving `Node` tree (shared, copy on write; insertion-ordered arbitrary keys), borrow-class `MapDecoder` with unknown-key rejection, pull `EventParser`, multi-document streams, anchors/aliases, merge keys (`<<`), round-trip writing and `json` bridge |
+| `csv.lxl` | 1,448 | RFC 4180 CSV, Excel CSV (UTF-8 BOM, `sep=` directive, semicolon, CRLF, Mac CR, formula guard), TSV (quoted & raw), PostgreSQL `COPY` (`FORMAT csv` with NULL vs `""` and custom `ESCAPE`, `FORMAT text` with backslash escapes, `\N`, `\.`), streaming `Reader`/`Writer` over `io.Read`/`io.Write`, and typed `Serialize`/`Deserialize` struct codecs |
 
 ### std (prelude)
 
@@ -2006,6 +2007,16 @@ Compression over `libz` (`zlib`) and `libzstd` (`zstd`), kept as separate module
 - **`zstd`**: one-shot `compress`/`compressLevel`/`decompress`/`decompressMax` (supporting single and concatenated multi-frame streams), `minLevel`/`maxLevel`/`defaultLevel`/`versionNumber`; streaming `Compressor` (`newCompressor`, `setChecksum`, `write`, `flush`, `finish`) and `Decompressor` (`newDecompressor`, `setMaxOut`, `write`, `isDone`, `finish`); composable `io.Read`/`io.Write` adapters `Reader` (`reader`) and `Writer` (`writer`); HTTP codec `Codec` (`codec`/`codecLevel`).
 - Tests: `zlib_basic`, `zstd_basic`, `io_streams`, `http_compress_handlers`.
 
+### csv
+
+Streaming and one-shot CSV/TSV parser, writer, and typed struct codec covering four dialects:
+
+- **Presets**: `rfc4180()` / `defaults()` (strict RFC 4180, `,`, `"`, doubled `""`, CRLF), `excel()` & `excelSemicolon()` (UTF-8 BOM read/write, leading `sep=<c>` delimiter directive, CRLF & legacy Mac CR, opt-in `guardFormulas` OWASP formula-injection protection), `tsv()` & `tsvRaw()` (tab-delimited, quoted or raw unquoted, LF), `postgresCsv()` (PostgreSQL `COPY FORMAT csv`: unquoted `""` = SQL NULL, quoted `""` = empty string, custom `ESCAPE`, `FORCE_QUOTE`, `t`/`f` booleans), and `postgresText()` (PostgreSQL `COPY FORMAT text`: tab-delimited, backslash escapes `\b`/`\f`/`\n`/`\r`/`\t`/`\v`/`\\`/`\xHH`/`\NNN`, `\N` NULL vs `\\N` literal, `\.` end-of-data marker).
+- **Streaming over `io.Read`/`io.Write`**: `reader`/`readerWith`/`fromStr`/`fromStrWith` (`nextRow`, `next`, `readHeader`, `readAll`, `readTable`, `nextRecord[T]`, `delimiter`) and `writer`/`writerWith` (`writeRow`, `writeCells`, `writeRecord[T]`, `writeEndMarker`, `flush`) — composes directly with `io.open`, `io.create`, `zlib.GzipReader`/`GzipWriter`, `zstd.Reader`/`Writer`, etc.
+- **One-shot & typed codecs**: `parse`/`parseWith`, `parseTable`/`parseTableWith`, `stringify`/`stringifyWith`, `stringifyCells`/`stringifyCellsWith`, `decode[T]`/`decodeWith[T]`, `encode[T]`/`encodeWith[T]` (working with compiler-derived `Serialize`/`Deserialize` records, `Decimal`, `Option[T]` NULLs, Excel `TRUE`/`FALSE`, Postgres `t`/`f`, and leading-zero strings).
+- **Cells & Rows**: `Cell { value, isNull, quoted }`, `Row` typed getters (`intAt`, `floatAt`, `decimalAt`, `boolAt`, `optStrAt`, `optIntAt`, `optDecimalAt`, `optBoolAt`), `Table` (`col`, `get`, `isNull`), positioned `Error { line, col, msg }` satisfying prelude `Error`, and `maxFieldBytes`/`maxFields` DoS limits.
+- Tests: `csv_basic`, `csv_edge_cases`.
+
 ### crypto
 
 OpenSSL `libcrypto` wrappers for digests, MACs, key derivation, symmetric encryption (including AEAD), asymmetric signatures/key-exchange, and secure randomness.
@@ -2241,8 +2252,8 @@ them and a NUL-terminated temporary copy otherwise (freed after the call).
   matching, and the caller formats the messages.
 - `glob` is Unix/bash-shaped; zoxide's Rust-crate matcher is local to `cmd/`,
   and grep's GNU byte matcher stays in grep.
-- No general `html`/`csv`/`sh` module: jq and cmark keep their call-site
-  escaping, and `base64` is the only shared encoding module.
+- No general `html`/`sh` module: jq and cmark keep their call-site
+  escaping.
 - `regex`: no Unicode blocks, full case folding, `RegexSet` or
   byte-oriented matching (R3).
 - No `Deque`, no `BTreeMap`/ordered map; `Set` iterates in insertion order

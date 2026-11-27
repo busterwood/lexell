@@ -1,0 +1,137 @@
+// csv edge cases: 1-byte chunked io.Read across BOM / sep= / CRLF / quotes / pg text,
+// streaming Writer -> file -> Reader (writeRecord, writeEndMarker, flush), lazyQuotes,
+// trimSpace, skipEmptyLines, Postgres FORCE_QUOTE & custom delimiter/null, multi-line
+// error line tracking, maxFieldBytes / maxFields limits, empty inputs, and box Error try.
+// expect: onebyte excel delim=; val=a;b|c"d|line1\nline2
+// expect: onebyte pgtext rows=2 null=true val=x|y
+// expect: file stream 3 ok=true
+// expect: lazy+trim+skip 2 [a][b"c] [d][e]
+// expect: forcequote raw="1",,"" null=true empty=false
+// expect: multiline err line=6
+// expect: limits field=true cols=true
+// expect: empty parse=0 table=0 decode=0
+// expect: box error try true
+
+import "csv"
+import "io"
+import "fs"
+import "os"
+import "strings"
+
+// Adversarial io.Read that returns at most 1 byte per read() call.
+type OneByteReader = record {
+    data: []byte
+    pos: int
+}
+
+pub fn (r: mut &OneByteReader) read(dst: mut &[byte]): Result[int, io.IoError] {
+    if r.pos >= len(r.data) || len(dst) == 0 { return Ok(0) }
+    dst[0] = r.data[r.pos]
+    r.pos += 1
+    return Ok(1)
+}
+
+type Item = record {
+    code: int
+    name: str
+    tag: Option[str]
+}
+
+fn loadFirstCell(s: &str): Result[str, box Error] {
+    let rows = try csv.parse(s)
+    return Ok(rows[0][0].clone())
+}
+
+fn main() {
+    // 1. 1-byte chunked io.Read over Excel UTF-8 BOM + sep=; + CRLF + embedded newline + doubled quotes
+    let bom = strFromBytes(&[byte(0xEF), byte(0xBB), byte(0xBF)])
+    let ex1 = bom + "sep=;\r\n\"a;b\";\"c\"\"d\";\"line1\r\nline2\"\r\n"
+    var ob1 = OneByteReader{data: strToBytes(ex1), pos: 0}
+    var r1 = csv.readerWith(ob1, csv.excel())
+    let row1 = r1.nextRow().unwrap().unwrap()
+    let d1 = strFromBytes(&[r1.delimiter()])
+    let v2 = strings.replaceAll(row1.get(2), "\r\n", "\\n")
+    println($"onebyte excel delim={d1} val={row1.get(0)}|{row1.get(1)}|{v2}")
+
+    // 2. 1-byte chunked io.Read over Postgres COPY TEXT with custom delimiter '|' and custom NULL 'NULL'
+    var pgCustom = csv.postgresText()
+    pgCustom.delimiter = '|'
+    pgCustom.nullStr = "NULL"
+    let pgTxt = "1|NULL|x\\|y\n2|ok|z\n\\.\n3|after|end\n"
+    var ob2 = OneByteReader{data: strToBytes(pgTxt), pos: 0}
+    var r2 = csv.readerWith(ob2, pgCustom)
+    let rows2 = r2.readAll().unwrap()
+    println($"onebyte pgtext rows={len(rows2)} null={rows2[0].isNull(1)} val={rows2[0].get(2)}")
+
+    // 3. Streaming csv.Writer -> file -> csv.Reader with writeRecord & writeEndMarker
+    let tmp = $"{os.tempDir()}/lxl_csv_edge_{os.pid()}.tsv"
+    {
+        var w = csv.writerWith(io.create(&tmp).unwrap(), csv.postgresText())
+        let items: []Item = [
+            Item{code: 1, name: "alpha\t1", tag: Some("t1")},
+            Item{code: 2, name: "beta\n2", tag: None},
+            Item{code: 3, name: "gamma\\3", tag: Some("")}
+        ]
+        for i in 0..len(items) { w.writeRecord(&items[i]).unwrap() }
+        w.writeEndMarker().unwrap()
+        w.flush().unwrap()
+    }
+    var rf = csv.readerWith(io.open(&tmp).unwrap(), csv.postgresText())
+    var got: []Item = []
+    while true {
+        match rf.nextRecord[Item]().unwrap() {
+            Some(it) { append(mut &got, it) }
+            None { break }
+        }
+    }
+    let fOk = len(got) == 3 && got[0].name == "alpha\t1" && got[1].name == "beta\n2" && got[1].tag.isNone() &&
+        got[2].name == "gamma\\3" && got[2].tag.is(&"")
+    println($"file stream {len(got)} ok={fOk}")
+    let _rm = fs.remove(&tmp)
+
+    // 4. lazyQuotes + trimSpace + skipEmptyLines
+    var messyOpts = csv.rfc4180()
+    messyOpts.lazyQuotes = true
+    messyOpts.trimSpace = true
+    messyOpts.skipEmptyLines = true
+    let messy = "\n  \"a\" , b\"c\n\n  d , \"e\"  \n"
+    let mRows = csv.parseWith(&messy, messyOpts).unwrap()
+    println($"lazy+trim+skip {len(mRows)} [{mRows[0][0]}][{mRows[0][1]}] [{mRows[1][0]}][{mRows[1][1]}]")
+
+    // 5. Postgres CSV FORCE_QUOTE * (quotes non-NULL fields, keeps NULL unquoted)
+    var fqOpts = csv.postgresCsv()
+    fqOpts.forceQuote = true
+    let fqCells: [][]csv.Cell = [[csv.cell("1"), csv.nullCell(), csv.cell("")]]
+    let fqOut = strings.trimRight(&(csv.stringifyCellsWith(&fqCells, fqOpts).unwrap()))
+    var fqBack = csv.fromStrWith(&fqOut, csv.postgresCsv())
+    let fqRow = fqBack.nextRow().unwrap().unwrap()
+    println($"forcequote raw={fqOut} null={fqRow.isNull(1)} empty={fqRow.isNull(2)}")
+
+    // 6. Accurate error line number after a multi-line quoted field
+    let ml = "a,b\n\"line2\nline3\nline4\",ok\nx,y\n1,bad\"quote\n"
+    let mlErr = csv.parse(&ml).unwrapErr()
+    println($"multiline err line={mlErr.line}")
+
+    // 7. DoS limits: maxFieldBytes and maxFields
+    var limField = csv.rfc4180()
+    limField.maxFieldBytes = 5
+    let eField = csv.parseWith("ok,toolongfield\n", limField).isErr()
+    var limCols = csv.rfc4180()
+    limCols.maxFields = 3
+    let eCols = csv.parseWith("1,2,3,4\n", limCols).isErr()
+    println($"limits field={eField} cols={eCols}")
+
+    // 8. Empty input handling
+    let emptyParse = csv.parse("").unwrap()
+    let emptyTbl = csv.parseTable("").unwrap()
+    let emptyDec = csv.decode[Item]("").unwrap()
+    println($"empty parse={len(emptyParse)} table={len(emptyTbl.rows)} decode={len(emptyDec)}")
+
+    // 9. csv.Error satisfies prelude Error and auto-boxes via `try`
+    let boxRes = loadFirstCell("a,\"unterminated")
+    let boxOk = match &boxRes {
+        Err(e) { strings.contains(&(e.toStr()), "unterminated quoted field") }
+        Ok(_) { false }
+    }
+    println($"box error try {boxOk}")
+}

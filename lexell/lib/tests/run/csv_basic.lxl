@@ -1,0 +1,184 @@
+// csv: RFC 4180, Excel (UTF-8 BOM, sep= directive, semicolon, CRLF, Mac CR, formula guard),
+// TSV (quoted and raw), PostgreSQL COPY (FORMAT csv with NULL vs "" and custom ESCAPE,
+// FORMAT text with \ escapes, \N NULL, \. end marker), streaming over io.Read/io.Write
+// (including gzip), and typed Serialize/Deserialize struct round-trips.
+// needs: z
+// expect: rfc4180 basic 3 a,b|c"d|e\nf
+// expect: rfc4180 trailing empty 3 [x][y][]
+// expect: rfc4180 crlf roundtrip true
+// expect: rfc4180 errors bare=true unterm=true after=true ragged=true
+// expect: excel bom+sep delim=; rows=2 cafe=café price=12.50
+// expect: excel write bom=true crlf=true formula=true negnum=true
+// expect: excel mac cr 2 a|b c|d
+// expect: tsv quoted 2 a	b|c"d
+// expect: tsv raw 2 say "hi"|plain
+// expect: pg csv null vs empty null=true empty_null=false empty_val=[] quote_null=false
+// expect: pg csv roundtrip null=true empty=false val=[]
+// expect: pg csv custom escape ok=true val=he said "hi" \ bye
+// expect: pg text escapes ok=true null=true litNull=\N tab=true nl=true hex=A oct=B
+// expect: pg text endmarker rows=2
+// expect: pg text roundtrip ok=true
+// expect: typed rfc+pg 2 101:02134:19.95:true:vip 102:90210:0.50:false:none
+// expect: typed excel 2 101:02134:19.95:true:vip 102:90210:0.50:false:none
+// expect: typed pgtext 2 101:02134:19.95:true:vip 102:90210:0.50:false:none
+// expect: gzip stream 500 ok=true
+// expect: large stringify ok=true
+
+import "csv"
+import "io"
+import "zlib"
+import "strings"
+import "decimal"
+
+type Order = record {
+    id: int
+    zip: str
+    amount: Decimal
+    paid: bool
+    note: Option[str]
+}
+
+fn fmtOrder(o: &Order): str {
+    let n = match &o.note {
+        Some(s) { s.clone() }
+        None { "none" }
+    }
+    return $"{o.id}:{o.zip}:{o.amount}:{o.paid}:{n}"
+}
+
+fn main() {
+    // 1. RFC 4180: quotes, doubled quotes, embedded CRLF/LF, trailing empty field
+    let rfcIn = "col1,col2,col3\r\n\"a,b\",\"c\"\"d\",\"e\nf\"\r\nx,y,\r\n"
+    let rfcRows = csv.parse(&rfcIn).unwrap()
+    let f2 = strings.replaceAll(&rfcRows[1][2], "\n", "\\n")
+    println($"rfc4180 basic {len(rfcRows)} {rfcRows[1][0]}|{rfcRows[1][1]}|{f2}")
+    println($"rfc4180 trailing empty {len(rfcRows[2])} [{rfcRows[2][0]}][{rfcRows[2][1]}][{rfcRows[2][2]}]")
+
+    let rfcOut = csv.stringify(&rfcRows).unwrap()
+    let hasCrlf = strings.contains(&rfcOut, "\r\n")
+    let rfcBack = csv.parse(&rfcOut).unwrap()
+    println($"rfc4180 crlf roundtrip {hasCrlf && len(rfcBack) == 3 && rfcBack[1][1] == "c\"d" && rfcBack[1][2] == "e\nf"}")
+
+    // RFC 4180 strict error checks
+    let eBare = csv.parse("a,b\"c,d").isErr()
+    let eUnterm = csv.parse("a,\"unterminated").isErr()
+    let eAfter = csv.parse("a,\"hi\"extra,c").isErr()
+    let eRagged = csv.parse("a,b\n1,2,3\n").isErr()
+    println($"rfc4180 errors bare={eBare} unterm={eUnterm} after={eAfter} ragged={eRagged}")
+
+    // 2. Excel: UTF-8 BOM + `sep=;` directive + non-ASCII + formula guard + legacy Mac CR
+    let bom = strFromBytes(&[byte(0xEF), byte(0xBB), byte(0xBF)])
+    let excelIn = bom + "sep=;\r\nitem;price\r\ncafé;12.50\r\n"
+    var exReader = csv.fromStrWith(&excelIn, csv.excel())
+    let exTbl = exReader.readTable().unwrap()
+    let exDelim = strFromBytes(&[exReader.delimiter()])
+    let cafe = exTbl.get(0, "item").unwrap()
+    let price = exTbl.get(0, "price").unwrap()
+    println($"excel bom+sep delim={exDelim} rows={len(exTbl.rows) + 1} cafe={cafe} price={price}")
+
+    var exOutOpts = csv.excel()
+    exOutOpts.guardFormulas = true
+    let exOut = csv.stringifyWith(&[["formula", "neg"], ["=SUM(A1:A2)", "-42.50"]], exOutOpts).unwrap()
+    let hasBom = len(exOut) >= 3 && exOut[0] == byte(0xEF) && exOut[1] == byte(0xBB) && exOut[2] == byte(0xBF)
+    let exCrlf = strings.contains(&exOut, "\r\n")
+    let exReparsed = csv.parseWith(&exOut, csv.excel()).unwrap()
+    println($"excel write bom={hasBom} crlf={exCrlf} formula={exReparsed[1][0] == "'=SUM(A1:A2)"} negnum={exReparsed[1][1] == "-42.50"}")
+
+    let macIn = "a,b\rc,d\r"
+    let macRows = csv.parseWith(&macIn, csv.excel()).unwrap()
+    println($"excel mac cr {len(macRows)} {macRows[0][0]}|{macRows[0][1]} {macRows[1][0]}|{macRows[1][1]}")
+
+    // 3. TSV (quoted and raw)
+    let tsvIn = "\"a\tb\"\t\"c\"\"d\"\n1\t2\n"
+    let tsvRows = csv.parseWith(&tsvIn, csv.tsv()).unwrap()
+    println($"tsv quoted {len(tsvRows)} {tsvRows[0][0]}|{tsvRows[0][1]}")
+
+    let tsvRawIn = "say \"hi\"\tplain\nx\ty\n"
+    let tsvRawRows = csv.parseWith(&tsvRawIn, csv.tsvRaw()).unwrap()
+    println($"tsv raw {len(tsvRawRows)} {tsvRawRows[0][0]}|{tsvRawRows[0][1]}")
+
+    // 4. PostgreSQL COPY FORMAT csv: unquoted empty = NULL vs quoted "" = empty string
+    let pgCsvIn = "id,opt,empty,qnull\n1,,\"\",\"\"\n"
+    let pgTbl = csv.parseTableWith(&pgCsvIn, csv.postgresCsv()).unwrap()
+    let r0 = &pgTbl.rows[0]
+    println($"pg csv null vs empty null={r0.isNull(1)} empty_null={r0.isNull(2)} empty_val=[{r0.get(2)}] quote_null={r0.isNull(3)}")
+
+    // Postgres CSV writer quotes non-null "" so round-trip preserves NULL vs ""
+    let pgCells: [][]csv.Cell = [[csv.cell("1"), csv.nullCell(), csv.cell("")]]
+    let pgStr = csv.stringifyCellsWith(&pgCells, csv.postgresCsv()).unwrap()
+    var pgBackR = csv.fromStrWith(&pgStr, csv.postgresCsv())
+    let pgBackRow = pgBackR.nextRow().unwrap().unwrap()
+    println($"pg csv roundtrip null={pgBackRow.isNull(1)} empty={pgBackRow.isNull(2)} val=[{pgBackRow.get(2)}]")
+
+    // Postgres CSV with custom ESCAPE '\'
+    var pgEscOpts = csv.postgresCsv()
+    pgEscOpts.escape = '\\'
+    let pgEscIn = "1,\"he said \\\"hi\\\" \\\\ bye\"\n"
+    let pgEscRows = csv.parseWith(&pgEscIn, pgEscOpts).unwrap()
+    println($"pg csv custom escape ok={len(pgEscRows) == 1} val={pgEscRows[0][1]}")
+
+    // 5. PostgreSQL COPY FORMAT text: backslash escapes, \N NULL vs \\N literal, \. end marker
+    let pgTextIn = "1\t\\N\t\\\\N\ta\\tb\tc\\nd\t\\x41\t\\102\n2\tok\tval\t1\t2\t3\t4\n\\.\n3\tignored\n"
+    var pgTR = csv.fromStrWith(&pgTextIn, csv.postgresText())
+    let tRows = pgTR.readAll().unwrap()
+    let tr0 = &tRows[0]
+    println($"pg text escapes ok={tr0.len() == 7} null={tr0.isNull(1)} litNull={tr0.get(2)} tab={tr0.get(3) == "a\tb"} nl={tr0.get(4) == "c\nd"} hex={tr0.get(5)} oct={tr0.get(6)}")
+    println($"pg text endmarker rows={len(tRows)}")
+
+    // Postgres COPY text write + read round-trip (streaming Writer -> gzip -> Reader)
+    let specialRow: []csv.Cell = [csv.cell("k1"), csv.nullCell(), csv.cell("a\tb\nc\\d\re")]
+    let pgTStr = csv.stringifyCellsWith(&[specialRow], csv.postgresText()).unwrap() + "\\.\n"
+    var pgTR2 = csv.fromStrWith(&pgTStr, csv.postgresText())
+    let tBack = pgTR2.readAll().unwrap()
+    println($"pg text roundtrip ok={len(tBack) == 1 && tBack[0].isNull(1) && tBack[0].get(2) == "a\tb\nc\\d\re"}")
+
+    // 6. Typed Serialize / Deserialize across RFC 4180, Postgres CSV, Excel, and Postgres TEXT
+    let orders: []Order = [
+        Order{id: 101, zip: "02134", amount: 19.95m, paid: true, note: Some("vip")},
+        Order{id: 102, zip: "90210", amount: 0.50m, paid: false, note: None}
+    ]
+    let pgEncoded = csv.encodeWith(&orders, csv.postgresCsv()).unwrap()
+    let pgDecoded = csv.decodeWith[Order](&pgEncoded, csv.postgresCsv()).unwrap()
+    println($"typed rfc+pg {len(pgDecoded)} {fmtOrder(&pgDecoded[0])} {fmtOrder(&pgDecoded[1])}")
+
+    // Excel export with TRUE/FALSE, quoted int, leading-zero zip, empty optional
+    let exTyped = bom + "id,zip,amount,paid,note\r\n\"101\",02134,\"19.95\",TRUE,vip\r\n102,90210,0.50,FALSE,\r\n"
+    var exDecOpts = csv.excel()
+    exDecOpts.hasNull = true
+    exDecOpts.nullStr = ""
+    let exDecoded = csv.decodeWith[Order](&exTyped, exDecOpts).unwrap()
+    println($"typed excel {len(exDecoded)} {fmtOrder(&exDecoded[0])} {fmtOrder(&exDecoded[1])}")
+
+    // Postgres COPY FORMAT text typed round-trip
+    let pgTxtEnc = csv.encodeWith(&orders, csv.postgresText()).unwrap()
+    let pgTxtDec = csv.decodeWith[Order](&pgTxtEnc, csv.postgresText()).unwrap()
+    println($"typed pgtext {len(pgTxtDec)} {fmtOrder(&pgTxtDec[0])} {fmtOrder(&pgTxtDec[1])}")
+
+    // 7. Streaming CSV directly from zlib.GzipReader (box io.Read composition)
+    var bigCsv = "id,label\n"
+    for i in 0..500 { bigCsv += $"{i},\"item,{i}\"\n" }
+    let gzCsv = zlib.gzip(&bigCsv).unwrap()
+    var gzCsvReader = csv.reader(zlib.gzipReader(io.strReader(&gzCsv), 1048576).unwrap())
+    let _hdr = gzCsvReader.readHeader().unwrap()
+    var count = 0
+    var lastOk = false
+    while true {
+        match gzCsvReader.nextRow().unwrap() {
+            Some(row) {
+                count += 1
+                if count == 500 { lastOk = row.intAt(0).unwrap() == 499 && row.get(1) == "item,499" }
+            }
+            None { break }
+        }
+    }
+    println($"gzip stream {count} ok={lastOk}")
+
+    // 8. Large stringify (> 64 KiB IO_BUF_SIZE) verifies memOnly writer doesn't drop chunks
+    var bigRows: [][]str = []
+    for i in 0..1500 {
+        append(mut &bigRows, [intToStr(i), "the quick brown fox jumps over the lazy dog 0123456789"])
+    }
+    let bigOut = csv.stringify(&bigRows).unwrap()
+    let bigBack = csv.parse(&bigOut).unwrap()
+    println($"large stringify ok={len(bigOut) > 80000 && len(bigBack) == 1500 && bigBack[1499][0] == "1499"}")
+}
