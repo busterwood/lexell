@@ -2888,6 +2888,19 @@ fn (c: mut &Checker) sFor(s: int) {
         c.emit(c.x.send())
         return
     }
+    if n.b < 0 && c.kind(n.a) == sx.N_CALL {
+        let cn = c.node(n.a)
+        if c.kind(cn.a) == sx.N_FIELDX && c.nd(cn.a).s == "chunks" {
+            let st = c.staticNs(c.nd(cn.a).a)
+            if st.k != ST_NONE && st.k != ST_MODULE {
+                let vt = c.staticType(st, c.nd(cn.a).line)
+                if vt >= 0 && c.pg.tk(vt) == sema.TK_VEC {
+                    c.forVecChunks(s, vt, cn.b, n.line)
+                    return
+                }
+            }
+        }
+    }
     var v = c.expr(c.forMoves(n.a), -1)
     if c.pg.tk(v.t) == sema.TK_REF { v = c.deref(v) }
     while c.pg.isRc(v.t) { v = c.rcValue(v) }       // SPEC 4.9: for x in r walks the value
@@ -7613,6 +7626,9 @@ fn (c: mut &Checker) vecStaticCall(t: int, name: &str, args: &[]Arg, line: int):
         let ptr = c.vecAddr(args[0].n, args[1].n, el, lanes, false, line)
         return rv(c.x.call(&("__vec_load_" + suf), [ptr]), t)
     }
+    if name == "chunks" {
+        c.err(line, c.tstr(t) + ".chunks(...) can only be used in a for loop: for v in " + c.tstr(t) + ".chunks(xs)")
+    }
     c.err(line, c.tstr(t) + " has no associated function '" + name + "'")
 }
 
@@ -7707,4 +7723,96 @@ fn (c: mut &Checker) vecMethodCall(recv: Val, base: int, name: &str, args: &[]Ar
         return rv(c.x.call(&("__vec_lane_" + suf), [v.c, idx]), el)
     }
     c.err(line, c.tstr(base) + " has no method '" + name + "'")
+}
+
+fn (c: mut &Checker) forVecChunks(s: int, vt: int, argsList: int, line: int) {
+    let n = c.node(s)
+    let name = &n.s
+    let el = c.pg.vecElem(vt)
+    let lanes = c.pg.vecLanes(vt)
+    let suf = vecSuf(el)
+    let argc = c.count(argsList)
+    if argc != 1 && argc != 2 {
+        c.err(line, c.tstr(vt) + ".chunks takes 1 or 2 arguments: chunks(xs) or chunks(xs, mut &i)")
+    }
+    let arg0 = c.item(argsList, 0)
+    var pv = c.rcRead(c.expr(arg0, -1))
+    let pk = c.pg.tk(pv.t)
+    let ok = (el == sema.T_BYTE && pv.t == sema.T_STR) ||
+        ((pk == sema.TK_ARR || pk == sema.TK_SLICE) && c.pg.ta(pv.t) == el)
+    if !ok {
+        let extra = if el == sema.T_BYTE { ", or str" } else { "" }
+        c.err(line, "chunks needs an array or slice of " + c.tstr(el) + extra + ", not " + c.tstr(pv.t))
+    }
+    if pv.cat == CAT_RV { pv = c.holdtmpSrc(pv.c, pv.t, true, pv) }
+    if pv.cat == CAT_PLACE && pv.gk >= 0 { c.err(line, "cannot iterate over a global") }
+
+    let pex = c.x.par(pv.c)
+    let ptrTy = if pv.t == sema.T_STR { c.x.ptr(c.ct("uint8_t")) } else { c.x.ptr(c.T(el)) }
+    let dataExpr = if pv.t == sema.T_STR {
+        c.x.pcast(ptrTy, c.x.dot(pex, "p"))
+    } else {
+        c.x.pcast(ptrTy, c.x.dot(pex, "data"))
+    }
+    let lenExpr = if pv.t == sema.T_STR {
+        c.x.pcast(c.ct("int64_t"), c.x.dot(pex, "len"))
+    } else {
+        c.x.dot(pex, "len")
+    }
+    let vp = c.fresh("vp")
+    let vend = c.fresh("vend")
+    let i64 = c.ct("int64_t")
+    c.emit(c.x.decl(ptrTy, &vp, dataExpr))
+    c.emit(c.x.decl(i64, &vend, c.x.bin("-", lenExpr, c.ll(lanes - 1))))
+    let vpn = c.nm(&vp)
+    let vendn = c.nm(&vend)
+
+    var ixExpr = -1
+    var ivRoot = -1
+    var ivPath: str = ""
+    if argc == 1 {
+        let vi = c.fresh("vi")
+        ixExpr = c.nm(&vi)
+        c.emit(c.x.sfor(c.x.decl(i64, &vi, c.ll(0)), c.x.bin("<", ixExpr, vendn), c.x.asg(ixExpr, c.x.bin("+", ixExpr, c.ll(lanes)))))
+    } else {
+        let arg1 = c.item(argsList, 1)
+        let mark = len(c.cx.pending)
+        if pv.cat == CAT_PLACE { c.hold(pv, HM_SHARED, c.newCid(), line) }
+        if c.kind(arg1) == sx.N_BORROW && (c.nd(arg1).flags & sx.MUT) != 0 {
+            let iv = c.expr(c.nd(arg1).a, -1)
+            if iv.t != sema.T_INT || iv.cat != CAT_PLACE || !iv.mutable {
+                c.err(line, "chunks cursor must be a mutable int variable")
+            }
+            if iv.root >= 0 {
+                c.frozenAt(iv.root, &iv.path, FR_MUT, line)
+                c.checkPending(iv.root, &iv.path, line, false)
+                ivRoot = iv.root
+                ivPath = iv.path.clone()
+            }
+            ixExpr = iv.c
+        } else {
+            let refv = c.expr(arg1, -1)
+            if c.pg.tk(refv.t) != sema.TK_REF || !c.pg.tm(refv.t) || c.pg.ta(refv.t) != sema.T_INT {
+                c.err(line, "chunks second argument must be mut &int (e.g. mut &i), not " + c.tstr(refv.t))
+            }
+            let dv = c.deref(refv)
+            ixExpr = dv.c
+        }
+        c.cutPending(mark)
+        c.emit(c.x.if1(c.x.bin("<", ixExpr, c.ll(0)), c.x.sx(c.x.call("rt_idx", [ixExpr, c.ll(0), c.W(line)]))))
+        c.emit(c.x.sfor(-1, c.x.bin("<", ixExpr, vendn), c.x.asg(ixExpr, c.x.bin("+", ixExpr, c.ll(lanes)))))
+    }
+
+    c.cx.ind += 1
+    let xn = c.fresh(&("v_" + name + "_"))
+    c.loopStart(c.snapshot(), false)
+    if pv.root >= 0 { c.freezeAt(pv.root, &pv.path, false, "the chunks loop", -1) }
+    if ivRoot >= 0 { c.freezeAt(ivRoot, &ivPath, false, "the chunks loop", -1) }
+    let loadE = c.x.call(&("__vec_load_" + suf), [c.x.bin("+", vpn, ixExpr)])
+    c.emit(c.x.decl(c.T(vt), &xn, loadE))
+    let x = c.newVar(&name, &xn, vt, false, VK_LOCAL, line)
+    c.declare(x)
+    c.loopEnd(n.c, line)
+    c.cx.ind -= 1
+    c.emit(c.x.send())
 }
