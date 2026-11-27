@@ -45,19 +45,10 @@ def compile_lxl(src: Path, out: Path) -> None:
     subprocess.run([str(LXLC), str(src), "-o", str(out)], env=env, check=True)
 
 
-def main() -> int:
-    with tempfile.TemporaryDirectory(prefix="lexell_tradetape_") as tmp:
+def run_mode(lexdb_bin: Path, server_bin: Path, client_bin: Path, mode: str) -> int:
+    with tempfile.TemporaryDirectory(prefix=f"lexell_tradetape_{mode}_") as tmp:
         tmp_path = Path(tmp)
-        lexdb_bin = tmp_path / "lexdb"
-        server_bin = tmp_path / "tradetape"
-        client_bin = tmp_path / "client_test"
         data_dir = tmp_path / "data"
-
-        print("Compiling lexdb, tradetape, and client_test...")
-        compile_lxl(ROOT / "lexell/cmd/lexdb.lxl", lexdb_bin)
-        compile_lxl(DEMO / "main.lxl", server_bin)
-        compile_lxl(DEMO / "client_test.lxl", client_bin)
-
         pg_port = free_port()
         http_port = free_port()
 
@@ -77,17 +68,17 @@ def main() -> int:
             dsn = f"host=127.0.0.1 port={pg_port} dbname=lexdb user=postgres"
 
             server_proc = subprocess.Popen(
-                [str(server_bin), f"127.0.0.1:{http_port}", "--dsn", dsn, "--wait-sec", "5"],
+                [str(server_bin), f"127.0.0.1:{http_port}", "--dsn", dsn, "--mode", mode, "--wait-sec", "5"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
                 env=env,
             )
-            # Wait for listening line
             line = server_proc.stdout.readline()
             if not line or "listening on" not in line:
                 err = server_proc.stderr.read() if server_proc.stderr else ""
-                raise RuntimeError(f"tradetape failed to start: stdout={line!r} stderr={err!r}")
+                raise RuntimeError(f"tradetape ({mode}) failed to start: stdout={line!r} stderr={err!r}")
+            print(f"\n=== E2E mode={mode} ===")
             print(f"Server: {line.strip()}")
             wait_tcp("127.0.0.1", http_port, timeout=5.0)
 
@@ -110,10 +101,10 @@ def main() -> int:
             if srv_err:
                 print(f"Server stderr: {srv_err}", file=sys.stderr)
             if server_proc.returncode != 0:
-                print(f"tradetape exited with {server_proc.returncode}", file=sys.stderr)
+                print(f"tradetape ({mode}) exited with {server_proc.returncode}", file=sys.stderr)
                 return 1
             if "leak" in srv_err.lower() or "leak" in res.stderr.lower():
-                print("Memory leak detected under LXL_CHECK=1!", file=sys.stderr)
+                print(f"Memory leak detected in mode={mode} under LXL_CHECK=1!", file=sys.stderr)
                 return 1
             return 0
         finally:
@@ -129,6 +120,25 @@ def main() -> int:
                     lexdb_proc.wait(timeout=5)
                 except subprocess.TimeoutExpired:
                     lexdb_proc.kill()
+
+
+def main() -> int:
+    with tempfile.TemporaryDirectory(prefix="lexell_tradetape_bins_") as tmp:
+        tmp_path = Path(tmp)
+        lexdb_bin = tmp_path / "lexdb"
+        server_bin = tmp_path / "tradetape"
+        client_bin = tmp_path / "client_test"
+
+        print("Compiling lexdb, tradetape, and client_test...")
+        compile_lxl(ROOT / "lexell/cmd/lexdb.lxl", lexdb_bin)
+        compile_lxl(DEMO / "main.lxl", server_bin)
+        compile_lxl(DEMO / "client_test.lxl", client_bin)
+
+        for mode in ["hub", "direct"]:
+            rc = run_mode(lexdb_bin, server_bin, client_bin, mode)
+            if rc != 0:
+                return rc
+        return 0
 
 
 if __name__ == "__main__":

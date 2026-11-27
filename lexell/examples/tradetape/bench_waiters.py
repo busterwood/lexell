@@ -63,8 +63,8 @@ def compile_opt(src: Path, out: Path) -> None:
     subprocess.run([str(LXLC), "-O", str(src), "-o", str(out)], env=env, check=True)
 
 
-def run_case(lexdb_bin: Path, srv_bin: Path, bench_bin: Path, n: int, trades: int, mode: str) -> None:
-    with tempfile.TemporaryDirectory(prefix=f"lexbench_{n}_") as tmp:
+def run_case(lexdb_bin: Path, srv_bin: Path, bench_bin: Path, srv_mode: str, n: int, trades: int, mode: str) -> None:
+    with tempfile.TemporaryDirectory(prefix=f"lexbench_{srv_mode}_{n}_") as tmp:
         pg_port = free_port()
         http_port = free_port()
         data_dir = Path(tmp) / "data"
@@ -83,7 +83,7 @@ def run_case(lexdb_bin: Path, srv_bin: Path, bench_bin: Path, n: int, trades: in
             wait_tcp("127.0.0.1", pg_port)
             dsn = f"host=127.0.0.1 port={pg_port} dbname=lexdb user=postgres"
             srv_proc = subprocess.Popen(
-                [str(srv_bin), f"127.0.0.1:{http_port}", "--dsn", dsn, "--wait-sec", "15"],
+                [str(srv_bin), f"127.0.0.1:{http_port}", "--dsn", dsn, "--mode", srv_mode, "--wait-sec", "15"],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
@@ -130,7 +130,7 @@ def run_case(lexdb_bin: Path, srv_bin: Path, bench_bin: Path, n: int, trades: in
             db_burst_pct = 100.0 * db_burst_ms / max(1.0, burst_wall_ms)
             srv_burst_pct = 100.0 * srv_burst_ms / max(1.0, burst_wall_ms)
 
-            print(f"\n=== N={n} mode={mode} ({ready_line}) ===")
+            print(f"\n=== srv={srv_mode} N={n} mode={mode} ({ready_line}) ===")
             print(f"  {res_line}")
             print(
                 f"  IDLE (1s parked):   lexdb={db_idle_pct:5.2f}% CPU ({db_cpu_idle1-db_cpu_idle0:.1f}ms) | "
@@ -171,9 +171,13 @@ def main() -> int:
         compile_opt(DEMO / "bench_waiters.lxl", bench_bin)
 
         for n in [10, 100, 500, 1000]:
-            run_case(lexdb_bin, srv_bin, bench_bin, n, 5, "all")
+            run_case(lexdb_bin, srv_bin, bench_bin, "direct", n, 5, "all")
         for n in [100, 1000]:
-            run_case(lexdb_bin, srv_bin, bench_bin, n, 5, "sharded")
+            run_case(lexdb_bin, srv_bin, bench_bin, "direct", n, 5, "sharded")
+        for n in [100, 500, 1000, 2000]:
+            run_case(lexdb_bin, srv_bin, bench_bin, "hub", n, 5, "all")
+        for n in [100, 1000, 2000]:
+            run_case(lexdb_bin, srv_bin, bench_bin, "hub", n, 5, "sharded")
     return 0
 
 

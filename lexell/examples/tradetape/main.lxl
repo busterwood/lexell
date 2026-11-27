@@ -2,13 +2,15 @@
 // to LexDB over the PostgreSQL wire protocol, streaming Server-Sent Events directly
 // from LexDB's `SELECT ... WAIT` clause—no polling, no connection pool, no broker.
 //
-// Usage:
-//   tradetape [ADDR] [--dsn DSN] [--wait-sec N] [--tls-cert FILE --tls-key FILE]
+// Two streaming architectures selectable via --mode:
+//   --mode hub (default): ONE background LexDB `SELECT ... WAIT` connection feeds
+//     in-process `sse.Feed` broadcast hubs (all-symbols + per-symbol), scaling to
+//     thousands of concurrent SSE subscribers with O(1) database load.
+//   --mode direct: Each SSE subscriber opens its own dedicated LexDB `SELECT ... WAIT`
+//     connection (minimal 1-to-1 pattern, ideal up to ~100-200 subscribers).
 //
-// Defaults:
-//   ADDR       127.0.0.1:8080 (HTTP/1.1 + HTTP/2 h2c on the same port)
-//   --dsn      $LEXDB_DSN or "host=127.0.0.1 port=5433 dbname=lexdb user=postgres"
-//   --wait-sec 10 (LexDB SELECT ... WAIT timeout per round before sending SSE keep-alive)
+// Usage:
+//   tradetape [ADDR] [--dsn DSN] [--mode hub|direct] [--wait-sec N] [--tls-cert FILE --tls-key FILE]
 
 import "http"
 import "httpserver" as hs
@@ -26,6 +28,7 @@ import "zlib"
 import "zstd"
 import "decimal"
 import "./ui"
+import "./hub"
 
 // ---------------------------------------------------------------- domain types (derived Serialize/Deserialize)
 
@@ -37,24 +40,17 @@ type CreateTrade = record {
     note: Option[str]
 }
 
-type Trade = record {
-    seq: int
-    symbol: str
-    side: str
-    price: Decimal
-    qty: int
-    notional: Decimal
-    note: str
-    atMs: int
-}
+type Trade = hub.Trade
 
 type ReadyEvent = value record {
     after: int
     symbol: str
     proto: str
+    mode: str
 }
 
 type StatsReply = value record {
+    mode: str
     activeStreams: int
     openConns: int
     accepted: int
@@ -65,7 +61,16 @@ type StatsReply = value record {
 type App = value record {
     dsn: str
     waitSec: int
+    hubMode: bool
+    hub: hub.Hub
     activeStreams: task.Shared[int]
+}
+
+fn (a: &App) share(): App {
+    return App{
+        dsn: a.dsn.clone(), waitSec: a.waitSec, hubMode: a.hubMode,
+        hub: a.hub.share(), activeStreams: a.activeStreams.share()
+    }
 }
 
 // RAII guard that tracks active SSE subscriber count and decrements on any exit path.
@@ -103,21 +108,6 @@ fn initSchema(dsn: &str): Result[Unit, box Error] {
     return Ok(Unit{})
 }
 
-fn tradeFromRow(rows: &postgres.Rows, r: int): Result[Trade, postgres.Error] {
-    let seq = try rows.int(r, 0)
-    let symbol = try rows.text(r, 1)
-    let side = try rows.text(r, 2)
-    let price = try rows.decimal(r, 3)
-    let qty = try rows.int(r, 4)
-    let note = try rows.text(r, 5)
-    let atMs = try rows.int(r, 6)
-    let notional = price * decimal.Decimal.fromInt(qty)
-    return Ok(Trade{
-        seq: seq, symbol: symbol, side: side, price: price,
-        qty: qty, notional: notional, note: note, atMs: atMs
-    })
-}
-
 fn normalizeSymbol(raw: &str): Result[str, hs.Error] {
     let s = strings.toUpperAscii(&(strings.trim(raw)))
     if len(s) == 0 || len(s) > 16 {
@@ -132,7 +122,6 @@ fn normalizeSymbol(raw: &str): Result[str, hs.Error] {
 }
 
 fn insertTrade(dsn: &str, sym: &str, side: &str, price: Decimal, qty: int, note: &str): Result[Trade, postgres.Error] {
-    // Dedicated short-lived connection (no pool); retry on SSI 40001 conflict if concurrent POSTs race on seq_counter.
     var conn = try postgres.connect(dsn)
     let pParam = try postgres.decimalParam(price, 14, 4)
     let now = time.now()
@@ -187,7 +176,27 @@ fn fetchTrades(dsn: &str, sym: &str, limit: int): Result[[]Trade, postgres.Error
     }
     var out: []Trade = []
     for i in 0..rows.rowCount() {
-        append(mut &out, try tradeFromRow(&rows, i))
+        append(mut &out, try hub.tradeFromRow(&rows, i))
+    }
+    return Ok(out)
+}
+
+fn fetchCatchup(dsn: &str, sym: &str, afterSeq: int, upToSeq: int): Result[[]Trade, postgres.Error] {
+    var conn = try postgres.connect(dsn)
+    let rows = if len(sym) == 0 {
+        try conn.query(
+            "SELECT seq, symbol, side, price, qty, note, at_ms FROM trades WHERE seq > $1 AND seq <= $2 ORDER BY seq LIMIT 500",
+            &[postgres.Value.Int(afterSeq), postgres.Value.Int(upToSeq)]
+        )
+    } else {
+        try conn.query(
+            "SELECT seq, symbol, side, price, qty, note, at_ms FROM trades WHERE symbol = $1 AND seq > $2 AND seq <= $3 ORDER BY seq LIMIT 500",
+            &[postgres.Value.Text(sym.clone()), postgres.Value.Int(afterSeq), postgres.Value.Int(upToSeq)]
+        )
+    }
+    var out: []Trade = []
+    for i in 0..rows.rowCount() {
+        append(mut &out, try hub.tradeFromRow(&rows, i))
     }
     return Ok(out)
 }
@@ -266,10 +275,13 @@ fn handleExportCsv(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[
     return w.writeStr(&body)
 }
 
-// Live SSE stream backed by ONE dedicated LexDB connection running a prepared
-// `SELECT ... WAIT` query—kept open until the HTTP/1.1 or HTTP/2 client closes
-// the stream, at which point RAII drop closes the LexDB connection cleanly.
-fn handleStream(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Unit, hs.Error] {
+type StreamParams = record {
+    sym: str
+    cursor: int
+    hasExplicitAfter: bool
+}
+
+fn parseStreamParams(rq: &hs.Request): Result[StreamParams, hs.Error] {
     var sym = ""
     match rq.query("symbol") {
         Some(raw) {
@@ -278,10 +290,11 @@ fn handleStream(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Uni
         None {}
     }
     var cursor = 0
+    var explicit = false
     match rq.header("Last-Event-ID") {
         Some(v) {
             match strings.parseIntOpt(&(strings.trim(&v))) {
-                Some(n) { if n >= 0 { cursor = n } }
+                Some(n) { if n >= 0 { cursor = n; explicit = true } }
                 None {}
             }
         }
@@ -289,7 +302,7 @@ fn handleStream(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Uni
             match rq.query("after") {
                 Some(v) {
                     match strings.parseIntOpt(&(strings.trim(&v))) {
-                        Some(n) { if n >= 0 { cursor = n } }
+                        Some(n) { if n >= 0 { cursor = n; explicit = true } }
                         None { return Err(hs.error(400, "after must be a non-negative integer")) }
                     }
                 }
@@ -297,12 +310,71 @@ fn handleStream(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Uni
             }
         }
     }
+    return Ok(StreamParams{sym: sym, cursor: cursor, hasExplicitAfter: explicit})
+}
 
-    // Open a dedicated LexDB connection for this subscriber (no connection pool).
-    // Close it immediately when the HTTP/1.1 or HTTP/2 client disconnects.
+// Mode 1 (--mode hub, default): subscribes to the in-process sse.Feed fed by a
+// single background LexDB `SELECT ... WAIT` relay task. Scales to thousands of
+// concurrent SSE subscribers with O(1) database load and 0 DB connections per client.
+fn handleStreamHub(app: &App, rq: mut &hs.Request, w: mut &hs.Response, p: &StreamParams): Result[Unit, hs.Error] {
+    let hub.Subscription{cursor: cur0, hubSeq: hubSeq} = app.hub.subscribe(&p.sym, p.cursor)
+    var cur = cur0
+    var lastSent = p.cursor
+
+    app.activeStreams.with(fn(n: mut &int) { n += 1 })
+    let _guard = StreamGuard{counter: app.activeStreams.share()}
+
+    try w.startEvents()
+    let ready = ReadyEvent{after: p.cursor, symbol: p.sym.clone(), proto: rq.proto.clone(), mode: "hub"}
+    try w.event("ready", &(json.encode(&ready)))
+
+    // If historical trades already exist in LexDB prior to the live feed cursor
+    // (e.g. cold reconnect older than sse.KEEP or initial load after server restart),
+    // catch up once from LexDB and deduplicate against the live sse.Feed cursor.
+    if hubSeq > p.cursor && (!p.hasExplicitAfter || p.cursor == 0 || hubSeq - p.cursor > 60) {
+        let hist = try hs.check(fetchCatchup(&app.dsn, &p.sym, p.cursor, hubSeq), 503)
+        for i in 0..len(hist) {
+            let t = &hist[i]
+            if t.seq > lastSent {
+                lastSent = t.seq
+                let seqStr = t.seq.toStr()
+                let payload = json.encode(t)
+                try w.eventWith(&seqStr, "trade", &payload)
+            }
+        }
+    }
+
+    let keepAliveMs = app.waitSec * 1000
+    while !task.cancelled() {
+        match cur.wait(keepAliveMs) {
+            Ok(optEv) {
+                match optEv {
+                    Some(ev) {
+                        let evSeq = strings.parseIntOpt(&ev.id).unwrapOr(0)
+                        if evSeq == 0 || evSeq > lastSent {
+                            if evSeq > lastSent { lastSent = evSeq }
+                            try w.eventWith(&ev.id, &ev.name, &ev.data)
+                        }
+                    }
+                    None {
+                        if task.cancelled() { return Ok(Unit{}) }
+                        try w.keepAlive()
+                    }
+                }
+            }
+            Err(_) { return Ok(Unit{}) }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// Mode 2 (--mode direct): each SSE subscriber holds ONE dedicated LexDB connection
+// running a prepared `SELECT ... WAIT` query until the client closes the stream.
+fn handleStreamDirect(app: &App, rq: mut &hs.Request, w: mut &hs.Response, p: &StreamParams): Result[Unit, hs.Error] {
+    var cursor = p.cursor
     var conn = try hs.check(postgres.connect(&app.dsn), 503)
     conn.setCloseOnCancel(true)
-    let waitSql = if len(sym) == 0 {
+    let waitSql = if len(p.sym) == 0 {
         $"SELECT seq, symbol, side, price, qty, note, at_ms FROM trades WHERE seq > $1 ORDER BY seq LIMIT 64 WAIT {app.waitSec} SECONDS"
     } else {
         $"SELECT seq, symbol, side, price, qty, note, at_ms FROM trades WHERE symbol = $2 AND seq > $1 ORDER BY seq LIMIT 64 WAIT {app.waitSec} SECONDS"
@@ -313,14 +385,14 @@ fn handleStream(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Uni
     let _guard = StreamGuard{counter: app.activeStreams.share()}
 
     try w.startEvents()
-    let ready = ReadyEvent{after: cursor, symbol: sym.clone(), proto: rq.proto.clone()}
+    let ready = ReadyEvent{after: cursor, symbol: p.sym.clone(), proto: rq.proto.clone(), mode: "direct"}
     try w.event("ready", &(json.encode(&ready)))
 
     while !task.cancelled() {
-        let rowsRes = if len(sym) == 0 {
+        let rowsRes = if len(p.sym) == 0 {
             conn.queryPrepared(&stmt, &[postgres.Value.Int(cursor)])
         } else {
-            conn.queryPrepared(&stmt, &[postgres.Value.Int(cursor), postgres.Value.Text(sym.clone())])
+            conn.queryPrepared(&stmt, &[postgres.Value.Int(cursor), postgres.Value.Text(p.sym.clone())])
         }
         match move(rowsRes) {
             Ok(rows) {
@@ -330,7 +402,7 @@ fn handleStream(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Uni
                     continue
                 }
                 for i in 0..rows.rowCount() {
-                    let trade = try hs.check(tradeFromRow(&rows, i), 500)
+                    let trade = try hs.check(hub.tradeFromRow(&rows, i), 500)
                     cursor = trade.seq
                     let seqStr = trade.seq.toStr()
                     let payload = json.encode(&trade)
@@ -338,7 +410,6 @@ fn handleStream(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Uni
                 }
             }
             Err(e) {
-                // Client closed HTTP/2 stream or TCP socket -> task cancelled -> exit cleanly and drop conn.
                 if task.cancelled() || e.code == 10 { return Ok(Unit{}) }
                 return Err(hs.error(503, &("lexdb wait failed: " + e.toStr())))
             }
@@ -347,11 +418,20 @@ fn handleStream(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Uni
     return Ok(Unit{})
 }
 
+fn handleStream(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Unit, hs.Error] {
+    let p = try parseStreamParams(rq)
+    if app.hubMode {
+        return handleStreamHub(app, rq, w, &p)
+    }
+    return handleStreamDirect(app, rq, w, &p)
+}
+
 fn handleStats(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Unit, hs.Error] {
     var active = 0
     app.activeStreams.with(fn(n: mut &int) { active = n })
     let s = rq.serverStats()
     let reply = StatsReply{
+        mode: if app.hubMode { "hub" } else { "direct" },
         activeStreams: active, openConns: s.open, accepted: s.accepted, requests: s.requests
     }
     return w.json(&(json.encode(&reply)))
@@ -362,6 +442,7 @@ fn handleStats(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Unit
 type CliConfig = record {
     addr: str
     dsn: str
+    hubMode: bool
     waitSec: int
     tlsCert: str
     tlsKey: str
@@ -371,6 +452,7 @@ fn parseCli(): Result[CliConfig, str] {
     var cfg = CliConfig{
         addr: "127.0.0.1:8080",
         dsn: os.envOr("LEXDB_DSN", "host=127.0.0.1 port=5433 dbname=lexdb user=postgres"),
+        hubMode: true,
         waitSec: 10,
         tlsCert: "",
         tlsKey: ""
@@ -381,6 +463,12 @@ fn parseCli(): Result[CliConfig, str] {
         let a = &args[i]
         if a == "--dsn" && i + 1 < len(args) {
             cfg.dsn = args[i + 1].clone()
+            i += 2
+        } else if a == "--mode" && i + 1 < len(args) {
+            let m = &args[i + 1]
+            if m == "hub" { cfg.hubMode = true }
+            else if m == "direct" { cfg.hubMode = false }
+            else { return Err("--mode must be 'hub' or 'direct'") }
             i += 2
         } else if a == "--wait-sec" && i + 1 < len(args) {
             match strings.parseIntOpt(&args[i + 1]) {
@@ -398,7 +486,7 @@ fn parseCli(): Result[CliConfig, str] {
             cfg.tlsKey = args[i + 1].clone()
             i += 2
         } else if a == "-h" || a == "--help" {
-            println("Usage: tradetape [ADDR] [--dsn DSN] [--wait-sec N] [--tls-cert FILE --tls-key FILE]")
+            println("Usage: tradetape [ADDR] [--dsn DSN] [--mode hub|direct] [--wait-sec N] [--tls-cert FILE --tls-key FILE]")
             os.quit(0)
         } else if !strings.startsWith(a, "-") {
             cfg.addr = a.clone()
@@ -436,6 +524,35 @@ fn die(msg: &str, code: int): never {
     os.quit(code)
 }
 
+fn runServer(ln: net.Listener, cli: &CliConfig, app: App, router: hs.Router[App], cfg: hs.Config) {
+    let bound = ln.localAddr()
+    let modeName = if cli.hubMode { "hub" } else { "direct" }
+    if len(cli.tlsCert) > 0 {
+        let keyPath = if len(cli.tlsKey) > 0 { cli.tlsKey.clone() } else { cli.tlsCert.clone() }
+        var topts = tls.defaults()
+        topts.alpn = "h2,http/1.1"
+        topts.certFile = cli.tlsCert.clone()
+        topts.keyFile = keyPath
+        let ctx = match tls.server(topts) {
+            Ok(c) { c }
+            Err(e) { die(&($"tradetape: tls: {e}"), 1) }
+        }
+        println($"listening on https://{bound} (HTTP/2 + HTTP/1.1, mode={modeName}, wait={cli.waitSec}s)")
+        let _fl = io.flushStdout()
+        match hs.serveTls(ln, ctx, app, router, cfg) {
+            Ok(st) { println($"stopped: accepted={st.accepted} requests={st.requests}") }
+            Err(e) { die(&($"tradetape: serveTls: {e}"), 1) }
+        }
+    } else {
+        println($"listening on http://{bound} (HTTP/2 h2c + HTTP/1.1, mode={modeName}, wait={cli.waitSec}s)")
+        let _fl = io.flushStdout()
+        match hs.serve(ln, app, router, cfg) {
+            Ok(st) { println($"stopped: accepted={st.accepted} requests={st.requests}") }
+            Err(e) { die(&($"tradetape: serve: {e}"), 1) }
+        }
+    }
+}
+
 fn main() {
     let cli = match parseCli() {
         Ok(c) { c }
@@ -447,40 +564,39 @@ fn main() {
         Err(e) { die(&($"tradetape: failed to initialize LexDB: {e}"), 1) }
     }
 
-    let ln = match net.listen(&cli.addr) {
-        Ok(l) { l }
-        Err(e) { die(&($"tradetape: listen {cli.addr}: {e}"), 1) }
-    }
-    let bound = ln.localAddr()
-    let app = App{dsn: cli.dsn.clone(), waitSec: cli.waitSec, activeStreams: task.shared(0)}
+    let h = hub.newHub()
+    let app = App{dsn: cli.dsn.clone(), waitSec: cli.waitSec, hubMode: cli.hubMode, hub: h.share(), activeStreams: task.shared(0)}
     let router = buildRouter()
 
     var cfg = hs.defaults()
     cfg.h2c = true
     cfg.drainMs = 2000
 
-    if len(cli.tlsCert) > 0 {
-        let keyPath = if len(cli.tlsKey) > 0 { cli.tlsKey.clone() } else { cli.tlsCert.clone() }
-        var topts = tls.defaults()
-        topts.alpn = "h2,http/1.1"
-        topts.certFile = cli.tlsCert.clone()
-        topts.keyFile = keyPath
-        let ctx = match tls.server(topts) {
-            Ok(c) { c }
-            Err(e) { die(&($"tradetape: tls: {e}"), 1) }
-        }
-        println($"listening on https://{bound} (HTTP/2 + HTTP/1.1, wait={cli.waitSec}s)")
-        let _fl = io.flushStdout()
-        match hs.serveTls(ln, ctx, app, router, cfg) {
-            Ok(st) { println($"stopped: accepted={st.accepted} requests={st.requests}") }
-            Err(e) { die(&($"tradetape: serveTls: {e}"), 1) }
-        }
+    if cli.hubMode {
+        // Structured concurrency: run the single LexDB SELECT ... WAIT relay task
+        // alongside httpserver.serve. When serve stops, relayFut drops -> cancels
+        // the relay task -> closes its dedicated LexDB socket immediately.
+        task.scope(fn(s: mut &task.Scope) {
+            let task.Handoff{promise: readyPr, future: readyFut} = task.promise[str]()
+            let relayFut = s.start(hub.runRelay, hub.RelayJob{
+                hub: h.share(), dsn: cli.dsn.clone(), waitSec: cli.waitSec, ready: readyPr
+            })
+            let status = readyFut.wait().unwrap()
+            if status != "ok" {
+                die(&($"tradetape: relay failed: {status}"), 1)
+            }
+            let ln = match net.listen(&cli.addr) {
+                Ok(l) { l }
+                Err(e) { die(&($"tradetape: listen {cli.addr}: {e}"), 1) }
+            }
+            runServer(ln, &cli, app.share(), buildRouter(), cfg.clone())
+            let _dropRelay = relayFut
+        })
     } else {
-        println($"listening on http://{bound} (HTTP/2 h2c + HTTP/1.1, wait={cli.waitSec}s)")
-        let _fl = io.flushStdout()
-        match hs.serve(ln, app, router, cfg) {
-            Ok(st) { println($"stopped: accepted={st.accepted} requests={st.requests}") }
-            Err(e) { die(&($"tradetape: serve: {e}"), 1) }
+        let ln = match net.listen(&cli.addr) {
+            Ok(l) { l }
+            Err(e) { die(&($"tradetape: listen {cli.addr}: {e}"), 1) }
         }
+        runServer(ln, &cli, app, router, cfg)
     }
 }
