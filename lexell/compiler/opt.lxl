@@ -95,20 +95,23 @@ type Opt = record {
     wf: int             // the function whose body the W_CALLEES walk is in
     recur: []bool       // per function: it calls itself (the W_CALLEES walk)
     allocs: []bool      // per function: it calls rt_alloc, or a body inlined in it does
-    // devirtualization (Tier 1 local fat-pointer prop + Tier 2 whole-program monomorphic CHA)
+    // devirtualization (Tier 1 local, Tier 2 monomorphic CHA, Tier 3 guarded polymorphic)
     devirt: int         // 0 off (LXL_DEVIRT=0), 1 on (default), 2 verbose (LXL_DEVIRT=v)
+    dvPoly: bool        // Tier 3 guarded bimorphic/trimorphic devirtualization (LXL_DEVIRT=2 turns off)
     drunF: int          // rt_drun
     dpushF: int         // rt_dpush
     noopDropF: int      // rt_box_noop
     cloSid: int         // lxl_clo struct id
     vtMap: Map[int, int]    // (globalIdx << 12) | byteOff -> fnId
     monoMap: Map[int, int]  // (structSid << 12) | byteOff -> fnId
+    polyVts: Map[int, []int] // closed vtable structSid -> [g0, g1(, g2)] for Tier 3
     vtGlobSet: Map[int, bool]
     simpleDrop: []bool  // per function: safe to replace rt_drun(f, p) with direct f(p)
     dvMonoN: int
     dvLocalN: int
     dvCloN: int
     dvDropN: int
+    dvPolyN: int
 }
 
 // What unbox knows of a local of the function at hand.
@@ -127,12 +130,14 @@ pub fn optimize(p: ir.Ir): ir.Ir {
     var o = Opt{u: p, state: [], form: [], size: [], rets: [], ro: [], refs: [], aTaken: [], mk: [], mv: [], bound: [], budget: 0, cur: -1,
         grown: 0, limit: 0, dest: D_NONE, dl: -1, lv: -1, aty: -1, single: false, nrvo: -1,
         dupF: -1, dropF: -1, stamp: 0, sStamp: [], sCand: [], cands: [], prevFresh: -1, adj: -1, selfOnce: false, fpOf: [], fpList: [], ren: newMap(), allocF: -1, freeF: -1, ub: [], ubSeen: [], wf: -1, recur: [], allocs: [],
-        devirt: 1, drunF: -1, dpushF: -1, noopDropF: -1, cloSid: -1, vtMap: newMap(), monoMap: newMap(), vtGlobSet: newMap(), simpleDrop: [], dvMonoN: 0, dvLocalN: 0, dvCloN: 0, dvDropN: 0}
+        devirt: 1, dvPoly: true, drunF: -1, dpushF: -1, noopDropF: -1, cloSid: -1, vtMap: newMap(), monoMap: newMap(), polyVts: newMap(), vtGlobSet: newMap(), simpleDrop: [], dvMonoN: 0, dvLocalN: 0, dvCloN: 0, dvDropN: 0, dvPolyN: 0}
     o.limit = INLINE_LIMIT
     let ev = os.envOr("LXL_INLINE", "")
     if ev != "" { o.limit = strings.parseIntOpt(&ev).unwrapOr(INLINE_LIMIT) }
     let dv = os.envOr("LXL_DEVIRT", "")
-    if dv == "0" { o.devirt = 0 } else if dv == "v" { o.devirt = 2 }
+    if dv == "0" { o.devirt = 0; o.dvPoly = false }
+    else if dv == "2" { o.dvPoly = false }
+    else if dv == "v" { o.devirt = 2 }
     for f in 0..len(o.u.funcs) {
         append(mut &o.state, 0)
         append(mut &o.form, -1)
@@ -173,7 +178,7 @@ pub fn optimize(p: ir.Ir): ir.Ir {
     o.fwdReceivers()
     o.packRecur()
     if o.devirt == 2 {
-        eprintln($"devirt: mono={o.dvMonoN} local={o.dvLocalN} clo={o.dvCloN} drop={o.dvDropN}")
+        eprintln($"devirt: mono={o.dvMonoN} local={o.dvLocalN} clo={o.dvCloN} drop={o.dvDropN} poly={o.dvPolyN}")
     }
     return replace(mut &o.u, ir.newIr())
 }
@@ -937,6 +942,22 @@ fn (o: mut &Opt) visit(f: int) {
             o.grown = sg
             o.wf = sw
             o.stmtIn(o.u.funcs[f].body)
+        }
+        if o.dvPoly && o.polyVts.size() > 0 {
+            let pnews = o.devirtPoly(f)
+            if len(pnews) > 0 {
+                let sc = o.cur
+                let sg = o.grown
+                let sw = o.wf
+                for nf in pnews {
+                    if nf >= 0 && o.u.funcs[nf].body >= 0 && o.state[nf] == 0 { o.visit(nf) }
+                    if nf >= 0 && (nf == o.allocF || o.allocs[nf]) { o.allocs[f] = true }
+                }
+                o.cur = sc
+                o.grown = sg
+                o.wf = sw
+                o.stmtIn(o.u.funcs[f].body)
+            }
         }
     }
     o.unbox(f)
@@ -2875,11 +2896,14 @@ fn (o: mut &Opt) initDevirt() {
             }
         }
     }
-    // Build Tier 2 monomorphic slot table for each clean vtable struct sid.
+    // Build Tier 2 monomorphic slot table and Tier 3 closed bimorphic/trimorphic vtable list.
     for sid in o.u.nRtStructs..len(o.u.structs) {
         if badSid.has(&sid) || !bySid.has(&sid) { continue }
         let gs = bySid.getOr(&sid, [])
         if len(gs) == 0 { continue }
+        if len(gs) >= 2 && len(gs) <= 3 {
+            o.polyVts.put(sid, gs.clone())
+        }
         let fields = o.u.structs[sid].fields.clone()
         for fld in fields {
             let f0 = o.vtMap.getOr(&((gs[0] << 12) | fld.off), -1)
@@ -3278,6 +3302,31 @@ fn (o: mut &Opt) dvLocalWalk(x: int, st: &DvInfo, found: mut &[]int) {
     if x < 0 { return }
     let n = o.u.nodes[x]
     let k = n.k
+    if k == ir.S_IF && o.u.nk(n.a) == ir.E_BIN && o.u.nodes[n.a].v == ir.OP_EQ {
+        let lhs = o.u.nodes[n.a].a
+        let rhs = o.u.nodes[n.a].b
+        let gR = o.constGlobAddr(rhs)
+        if gR >= 0 && o.vtGlobSet.has(&gR) {
+            let gL = o.resolveVtExpr(lhs, st)
+            if gL >= 0 {
+                if gL == gR {
+                    o.unrefAll(n.c)
+                    o.u.nodes[x] = o.u.nodes[n.b]
+                } else {
+                    o.unrefAll(n.b)
+                    if n.c >= 0 {
+                        o.u.nodes[x] = o.u.nodes[n.c]
+                    } else {
+                        o.u.nodes[x].k = ir.S_EMPTY
+                        o.u.nodes[x].a = -1
+                    }
+                }
+                o.dvLocalN += 1
+                o.dvLocalWalk(x, st, found)
+                return
+            }
+        }
+    }
     // Check `rt_drun(dv.vt->drop, dv.data);` statement.
     if k == ir.S_EXPR && o.drunF >= 0 && o.u.nk(n.a) == ir.E_CALL && o.callee(n.a) == o.drunF &&
             o.u.listLen(o.u.nodes[n.a].b) == 2 {
@@ -3381,4 +3430,235 @@ fn (o: mut &Opt) dvLocalWalk(x: int, st: &DvInfo, found: mut &[]int) {
 fn (o: mut &Opt) dvLocalList(l: int, st: &DvInfo, found: mut &[]int) {
     if l < 0 { return }
     for j in 0..o.u.items[l] { o.dvLocalWalk(o.u.items[l + 1 + j], st, found) }
+}
+
+// ---------------------------------------------------------------- Tier 3: guarded polymorphic devirt
+//
+// For closed bimorphic/trimorphic vtable struct types (2..3 const vtable globals in the whole
+// program), rewrites statement-level indirect calls `dv.vt->m_k(args...)` into an exhaustive
+// pointer-comparison dispatch:
+//   V* dvt = dv.vt;
+//   T0 dva0 = arg0; ...
+//   if ((uint64_t)dvt == (uint64_t)&vt0) { res = fn0(dva0, ...); }
+//   else { res = fn1(dva0, ...); }
+// Because the vtable set is closed whole-program, no fallback indirect call is needed, the
+// vtable memory load is eliminated, and opt's inliner immediately inlines the concrete targets.
+
+fn (o: mut &Opt) devirtPoly(f: int): []int {
+    let body = o.u.funcs[f].body
+    if body < 0 { return [] }
+    var found: []int = []
+    o.dvPolyStmt(body, false, mut &found)
+    return found
+}
+
+fn (o: mut &Opt) dvPolyStmt(s: int, inLoop: bool, found: mut &[]int) {
+    if s < 0 { return }
+    let k = o.u.nk(s)
+    if k == ir.S_BLOCK {
+        o.dvPolyBlock(s, inLoop, found)
+    } else if k == ir.S_IF {
+        o.u.nodes[s].b = o.dvPolyBody(o.u.nodes[s].b, inLoop, found)
+        if o.u.nodes[s].c >= 0 { o.u.nodes[s].c = o.dvPolyBody(o.u.nodes[s].c, inLoop, found) }
+    } else if k == ir.S_WHILE {
+        o.u.nodes[s].b = o.dvPolyBody(o.u.nodes[s].b, true, found)
+    } else if k == ir.S_FOR {
+        o.u.nodes[s].d = o.dvPolyBody(o.u.nodes[s].d, true, found)
+    } else if k == ir.S_SWITCH {
+        o.u.nodes[s].b = o.dvPolyBody(o.u.nodes[s].b, inLoop, found)
+    }
+}
+
+fn (o: mut &Opt) dvPolyBody(s: int, inLoop: bool, found: mut &[]int): int {
+    if o.u.nk(s) == ir.S_BLOCK {
+        o.dvPolyBlock(s, inLoop, found)
+        return s
+    }
+    o.dvPolyStmt(s, inLoop, found)
+    var out: []int = []
+    o.dvPolySite(s, inLoop, mut &out, found)
+    if len(out) == 1 && out[0] == s { return s }
+    return o.block(&out)
+}
+
+fn (o: mut &Opt) dvPolyBlock(b: int, inLoop: bool, found: mut &[]int) {
+    let l = o.u.nodes[b].a
+    var out: []int = []
+    var changed = false
+    for j in 0..o.u.listLen(l) {
+        let x = o.u.listAt(l, j)
+        o.dvPolyStmt(x, inLoop, found)
+        let n = len(out)
+        o.dvPolySite(x, inLoop, mut &out, found)
+        if len(out) != n + 1 || out[n] != x { changed = true }
+    }
+    if changed { o.u.nodes[b].a = o.u.list(&out) }
+}
+
+fn (o: mut &Opt) dvPolySite(x: int, inLoop: bool, out: mut &[]int, found: mut &[]int) {
+    if o.grown >= GROWTH {
+        append(out, x)
+        return
+    }
+    let k = o.u.nk(x)
+    var c = -1
+    var dest = D_NONE
+    if k == ir.S_EXPR {
+        let e = o.u.nodes[x].a
+        if o.u.nk(e) == ir.E_CALL {
+            c = e
+        } else if o.u.nk(e) == ir.E_ASSIGN && o.u.nk(o.u.nodes[e].b) == ir.E_CALL && o.root(o.u.nodes[e].a) >= 0 &&
+                o.u.nodes[o.u.nodes[e].b].ty == o.u.nodes[e].ty {
+            c = o.u.nodes[e].b
+            dest = D_ASSIGN
+        }
+    } else if k == ir.S_DECL && o.u.nodes[x].c < 0 && o.u.nodes[x].b >= 0 && o.u.nk(o.u.nodes[x].b) == ir.E_CALL &&
+            o.u.nodes[o.u.nodes[x].b].ty == o.u.locals[o.u.nodes[x].a].ty {
+        c = o.u.nodes[x].b
+        dest = D_DECL
+    } else if k == ir.S_RETURN && o.u.nodes[x].a >= 0 && o.u.nk(o.u.nodes[x].a) == ir.E_CALL &&
+            o.u.nodes[o.u.nodes[x].a].ty == o.u.tys[o.u.funcs[o.cur].ty].base {
+        c = o.u.nodes[x].a
+        dest = D_RETURN
+    }
+    if c < 0 || o.callee(c) >= 0 {
+        append(out, x)
+        return
+    }
+    var off = 0
+    let vtExpr = o.vtSlotLoad(o.u.nodes[c].a, mut &off)
+    if vtExpr < 0 {
+        append(out, x)
+        return
+    }
+    let vty = o.u.nodes[vtExpr].ty
+    if o.u.tk(vty) != ir.TY_PTR || o.u.tk(o.u.tys[vty].base) != ir.TY_STRUCT {
+        append(out, x)
+        return
+    }
+    let sid = o.u.tys[o.u.tys[vty].base].sid
+    if !o.polyVts.has(&sid) {
+        append(out, x)
+        return
+    }
+    let gs = o.polyVts.getOr(&sid, [])
+    if len(gs) < 2 || len(gs) > 3 {
+        append(out, x)
+        return
+    }
+    // Resolve target function per vtable global and ensure every signature matches.
+    var fns: []int = []
+    var anyInlineable = false
+    for g in gs {
+        let fnId = o.vtMap.getOr(&((g << 12) | off), -1)
+        if fnId < 0 || !o.sigMatches(c, fnId) {
+            append(out, x)
+            return
+        }
+        append(mut &fns, fnId)
+        if o.state[fnId] != 2 || (o.form[fnId] >= 0 && o.size[fnId] <= o.limit + COPY_SLACK) {
+            anyInlineable = true
+        }
+    }
+    // Outside loops, only guard-specialize if at least one branch can inline (avoids cold code bloat).
+    if !inLoop && !anyInlineable {
+        append(out, x)
+        return
+    }
+    // Compact duplicate targets when 3 globals map to only 2 distinct functions: put the unique one first.
+    var bGlobs: []int = []
+    var bFns: []int = []
+    if len(gs) == 3 && fns[0] == fns[1] && fns[0] != fns[2] {
+        bGlobs = [gs[2], gs[0]]
+        bFns = [fns[2], fns[0]]
+    } else if len(gs) == 3 && fns[0] == fns[2] && fns[0] != fns[1] {
+        bGlobs = [gs[1], gs[0]]
+        bFns = [fns[1], fns[0]]
+    } else if len(gs) == 3 && fns[1] == fns[2] && fns[0] != fns[1] {
+        bGlobs = [gs[0], gs[1]]
+        bFns = [fns[0], fns[1]]
+    } else {
+        bGlobs = gs.clone()
+        bFns = fns
+    }
+
+    let ln = o.u.nodes[c].line
+    // 1. Evaluate vtExpr once into local dvt.
+    let vtL = o.local("dvt", vty, false)
+    append(out, o.prMk(ir.S_DECL, ir.TY_VOID, ln, vtL, vtExpr, -1, 0))
+    // 2. Evaluate call arguments once in left-to-right order into fresh locals.
+    let argList = o.u.nodes[c].b
+    let nArgs = o.u.listLen(argList)
+    var argLocs: []int = []
+    var argConst: []int = []
+    for i in 0..nArgs {
+        let a = o.u.listAt(argList, i)
+        let ak = o.u.nk(a)
+        if ak == ir.E_INT || ak == ir.E_FLT {
+            append(mut &argLocs, -1)
+            append(mut &argConst, a)
+        } else {
+            let al = o.local("dva", o.u.nodes[a].ty, false)
+            append(out, o.prMk(ir.S_DECL, ir.TY_VOID, ln, al, a, -1, 0))
+            append(mut &argLocs, al)
+            append(mut &argConst, -1)
+        }
+    }
+    // 3. For D_DECL, declare the destination local before the if/else chain.
+    let dl = if dest == D_DECL { o.u.nodes[x].a } else { -1 }
+    if dest == D_DECL {
+        append(out, o.prMk(ir.S_DECL, ir.TY_VOID, ln, dl, -1, -1, 0))
+    }
+    let lhsOrig = if dest == D_ASSIGN { o.u.nodes[o.u.nodes[x].a].a } else { -1 }
+    let retTy = o.u.nodes[c].ty
+
+    // 4. Build exhaustive if / else-if / else chain from last branch back to first.
+    var curStmt = -1
+    var bi = len(bFns) - 1
+    while bi >= 0 {
+        let fnId = bFns[bi]
+        var callArgs: []int = []
+        for i in 0..nArgs {
+            if argLocs[i] >= 0 {
+                let al = argLocs[i]
+                append(mut &callArgs, o.prMk(ir.E_LOCAL, o.u.locals[al].ty, ln, al, -1, -1, 0))
+            } else {
+                append(mut &callArgs, o.copyTree(argConst[i]))
+            }
+        }
+        let callN = o.prMk(ir.E_CALL, retTy, ln, o.mkDecayFn(fnId, ln), o.u.list(&callArgs), o.u.funcs[fnId].ty, 0)
+        o.refs[fnId] += 1
+        append(found, fnId)
+        var brStmt = -1
+        if dest == D_NONE {
+            brStmt = o.prMk(ir.S_EXPR, ir.TY_VOID, ln, callN, -1, -1, 0)
+        } else if dest == D_DECL {
+            let dstL = o.prMk(ir.E_LOCAL, o.u.locals[dl].ty, ln, dl, -1, -1, 0)
+            let asg = o.prMk(ir.E_ASSIGN, o.u.locals[dl].ty, ln, dstL, callN, -1, 0)
+            brStmt = o.prMk(ir.S_EXPR, ir.TY_VOID, ln, asg, -1, -1, 0)
+        } else if dest == D_ASSIGN {
+            let dst = o.copyTree(lhsOrig)
+            let asg = o.prMk(ir.E_ASSIGN, o.u.nodes[dst].ty, ln, dst, callN, -1, 0)
+            brStmt = o.prMk(ir.S_EXPR, ir.TY_VOID, ln, asg, -1, -1, 0)
+        } else {
+            brStmt = o.prMk(ir.S_RETURN, ir.TY_VOID, ln, callN, -1, -1, 0)
+        }
+        let brBlk = o.block(&[brStmt])
+        if curStmt < 0 {
+            curStmt = brBlk
+        } else {
+            let gIdx = bGlobs[bi]
+            let gTy = o.u.globals[gIdx].ty
+            let gNode = o.prMk(ir.E_GLOBAL, gTy, ln, gIdx, -1, -1, 0)
+            let gAddr = o.prMk(ir.E_ADDR, o.u.ptrTo(gTy), ln, gNode, -1, -1, 0)
+            let vtUse = o.prMk(ir.E_LOCAL, vty, ln, vtL, -1, -1, 0)
+            let cL = o.prMk(ir.E_CAST, ir.TY_U64, ln, vtUse, -1, -1, 0)
+            let cR = o.prMk(ir.E_CAST, ir.TY_U64, ln, gAddr, -1, -1, 0)
+            let cond = o.prMk(ir.E_BIN, ir.TY_I32, ln, cL, cR, ir.TY_U64, ir.OP_EQ)
+            curStmt = o.prMk(ir.S_IF, ir.TY_VOID, ln, cond, brBlk, curStmt, 0)
+        }
+        bi -= 1
+    }
+    append(out, curStmt)
+    o.dvPolyN += 1
 }
