@@ -16,6 +16,7 @@
 // (or -1 for unlimited) via the *Max functions or setMaxOut on Inflater.
 
 import "ffi"
+import "io"
 
 extern "z" fn zlibVersion(): str
 extern "z" fn deflateInit2_(strm: ptr, level: i32, method: i32, windowBits: i32, memLevel: i32, strategy: i32, version: &str, streamSize: i32): i32
@@ -399,3 +400,168 @@ pub fn inflateMax(data: &str, maxOut: int): Result[str, Error] { return decompre
 // Decompress either a gzip or a zlib stream (auto-detected from the header).
 pub fn decompress(data: &str): Result[str, Error] { return decompressOneShot(WBITS_AUTO, true, data, DEFAULT_MAX_OUT) }
 pub fn decompressMax(data: &str, maxOut: int): Result[str, Error] { return decompressOneShot(WBITS_AUTO, true, data, maxOut) }
+
+// ---- io.Read / io.Write streaming adapters
+
+// An io.Read that transparently gunzips bytes read from an inner box io.Read.
+pub type GzipReader = record {
+    src: box io.Read
+    inf: Inflater
+    inBuf: []byte
+    outBuf: []byte
+    outPos: int
+    eof: bool
+}
+
+// Wrap any box io.Read with gzip decompression bounded by maxOut (-1 for unlimited).
+pub fn gzipReader(src: box io.Read, maxOut: int): Result[GzipReader, Error] {
+    var inf = try newGunzip()
+    inf.setMaxOut(maxOut)
+    return Ok(GzipReader{src: src, inf: inf, inBuf: array(16384, byte(0)), outBuf: [], outPos: 0, eof: false})
+}
+
+pub fn (r: mut &GzipReader) read(dst: mut &[byte]): Result[int, io.IoError] {
+    let n = len(dst)
+    if n == 0 { return Ok(0) }
+    while r.outPos >= len(r.outBuf) {
+        if r.eof { return Ok(0) }
+        let k = try r.src.read(mut &r.inBuf)
+        if k == 0 {
+            r.eof = true
+            match r.inf.finish() {
+                Ok(_) { return Ok(0) }
+                Err(e) { return Err(io.ioError(22, "gunzip", &e.msg)) }
+            }
+        }
+        let chunk = strFromBytes(&r.inBuf[0..k])
+        let dec = match r.inf.write(&chunk) {
+            Ok(s) { s }
+            Err(e) { return Err(io.ioError(22, "gunzip", &e.msg)) }
+        }
+        if len(dec) > 0 {
+            r.outBuf = strToBytes(dec)
+            r.outPos = 0
+        }
+    }
+    var take = len(r.outBuf) - r.outPos
+    if take > n { take = n }
+    for i in 0..take { dst[i] = r.outBuf[r.outPos + i] }
+    r.outPos += take
+    return Ok(take)
+}
+
+// An io.Write that gzip-compresses bytes written to it and forwards them to dst.
+// Call finish() to emit the gzip trailer and flush dst.
+pub type GzipWriter = record {
+    dst: box io.Write
+    def: Deflater
+    finished: bool
+}
+
+pub fn gzipWriter(dst: box io.Write, level: int): Result[GzipWriter, Error] {
+    let def = try newGzip(level)
+    return Ok(GzipWriter{dst: dst, def: def, finished: false})
+}
+
+pub fn (w: mut &GzipWriter) writeBytes(src: &[byte]): Result[int, io.IoError] {
+    if w.finished { return Err(io.ioError(22, "gzip", "writer already finished")) }
+    if len(src) == 0 { return Ok(0) }
+    let s = strFromBytes(src)
+    let out = match w.def.write(&s) {
+        Ok(b) { b }
+        Err(e) { return Err(io.ioError(22, "gzip", &e.msg)) }
+    }
+    if len(out) > 0 {
+        let bs = strToBytes(out)
+        try io.writeAll(mut &w.dst, &bs)
+    }
+    return Ok(len(src))
+}
+
+pub fn (w: mut &GzipWriter) flush(): Result[Unit, io.IoError] {
+    if w.finished { return w.dst.flush() }
+    let out = match w.def.flush() {
+        Ok(b) { b }
+        Err(e) { return Err(io.ioError(22, "gzip", &e.msg)) }
+    }
+    if len(out) > 0 {
+        let bs = strToBytes(out)
+        try io.writeAll(mut &w.dst, &bs)
+    }
+    return w.dst.flush()
+}
+
+pub fn (w: mut &GzipWriter) finish(): Result[Unit, io.IoError] {
+    if w.finished { return Ok(Unit{}) }
+    w.finished = true
+    let out = match w.def.finish() {
+        Ok(b) { b }
+        Err(e) { return Err(io.ioError(22, "gzip", &e.msg)) }
+    }
+    if len(out) > 0 {
+        let bs = strToBytes(out)
+        try io.writeAll(mut &w.dst, &bs)
+    }
+    return w.dst.flush()
+}
+
+fn (w: mut &GzipWriter) drop() {
+    if !w.finished {
+        let _ = w.finish()
+    }
+}
+
+// ---- HTTP ContentCodec implementations (structurally satisfy http.ContentCodec)
+
+pub type GzipCodec = value record {
+    pub level: int
+}
+
+pub fn gzipCodec(): GzipCodec { return GzipCodec{level: LEVEL_DEFAULT} }
+pub fn gzipCodecLevel(level: int): GzipCodec { return GzipCodec{level: level} }
+
+pub fn (c: &GzipCodec) name(): str { return "gzip" }
+
+pub fn (c: &GzipCodec) encode(data: &str): Result[str, str] {
+    match gzipLevel(data, c.level) {
+        Ok(s) { return Ok(s) }
+        Err(e) { return Err(e.toStr()) }
+    }
+}
+
+pub fn (c: &GzipCodec) decode(data: &str, maxOut: int): Result[str, str] {
+    match gunzipMax(data, maxOut) {
+        Ok(s) { return Ok(s) }
+        Err(e) { return Err(e.toStr()) }
+    }
+}
+
+pub type DeflateCodec = value record {
+    pub level: int
+}
+
+pub fn deflateCodec(): DeflateCodec { return DeflateCodec{level: LEVEL_DEFAULT} }
+pub fn deflateCodecLevel(level: int): DeflateCodec { return DeflateCodec{level: level} }
+
+pub fn (c: &DeflateCodec) name(): str { return "deflate" }
+
+pub fn (c: &DeflateCodec) encode(data: &str): Result[str, str] {
+    match zlibCompressLevel(data, c.level) {
+        Ok(s) { return Ok(s) }
+        Err(e) { return Err(e.toStr()) }
+    }
+}
+
+pub fn (c: &DeflateCodec) decode(data: &str, maxOut: int): Result[str, str] {
+    // RFC 9110: HTTP "deflate" is zlib-wrapped deflate, but some peers send raw deflate.
+    match zlibDecompressMax(data, maxOut) {
+        Ok(s) { return Ok(s) }
+        Err(e1) {
+            if len(data) == 0 { return Err(e1.toStr()) }
+            match inflateMax(data, maxOut) {
+                Ok(s2) { return Ok(s2) }
+                Err(_) { return Err(e1.toStr()) }
+            }
+        }
+    }
+}

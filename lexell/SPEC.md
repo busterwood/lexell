@@ -649,8 +649,10 @@ and do not mention `Self` in their parameter or return types):
   subset of `I`'s (respecting `&Self` vs `mut &Self`), so `box Show` and
   `&Show` can be passed to generic `T: Show` functions and used in `$"..."`.
 
-`std` defines `Eq` (`eq`), `Ord` (`cmp`), `Hash` (`hash`) and `Show`
-(`toStr`) and implements them for the primitive types.
+`std` defines `Eq` (`eq`), `Ord` (`cmp`), `Hash` (`hash`), `Show` (`toStr`),
+`Error` (`toStr`), and `WrappedError` (a context message, call-site `Where`,
+and optional `Option[box Error]` cause), and implements the comparison, hashing
+and display interfaces for the primitive types.
 
 ## 6. Generics
 
@@ -670,7 +672,10 @@ the rules of section 10 and cannot have a `drop` method. `std`'s `Option` and
 and `task.Scope.start` do not. A `borrow` parameter may also be constrained
 by an interface (`I: borrow + Iter[X]`), so adapters over iterators can be
 written; a type argument named only in another parameter's constraint is not
-inferred.
+inferred. A method on a generic type inherits `borrow` for any bare receiver
+type parameter (`fn (r: &Result[T, E])`), and narrows it to owned when the
+method writes constraints without `borrow` (`fn (r: Result[T, E: Error])`);
+methods that want both a constraint and `borrow` write `T: borrow + Eq`.
 
 A type argument is a type: `never` and "no result" are not, so neither can be
 a type argument, written or inferred (`call(fn(): never { exit(3) })` with
@@ -865,9 +870,12 @@ move). Rule 3 of section 10 applies between the borrows as taken.
 
 `try e` requires `e` to have a closed type with variants `Ok(T)` and `Err(E)`
 (the second lang item). It yields the `Ok` value, or returns `Err(e)` from the
-enclosing function, whose result type must be a closed type with an `Err(E)`
-variant of the same `E`. `try` may appear anywhere in an expression; owned
-values already built for the statement are dropped before the return.
+enclosing function, whose result type must be a closed type with an `Err(F)`
+variant where either `E` is the same type as `F`, or `F` is a boxed interface
+`box I` and `E` is an owned (non-borrow-class) type satisfying `I` (in which
+case `e` is automatically boxed as `box I`, e.g. `Result[U, box Error]`).
+`try` may appear anywhere in an expression; owned values already built for the
+statement are dropped before the return.
 
 ### 7.7 Temporaries
 

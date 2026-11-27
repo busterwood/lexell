@@ -470,6 +470,142 @@ fn idempotent(m: &str): bool {
 
 fn bodyMethod(m: &str): bool { return m == "POST" || m == "PUT" || m == "PATCH" }
 
+// ---------------------------------------------------------------- content codecs
+
+// A content-encoding codec (e.g. zlib.gzipCodec(), zlib.deflateCodec(), zstd.codec())
+// shared by http (client transparent decompression) and httpserver (response/request compression).
+pub type ContentCodec = interface {
+    fn (&Self) name(): str
+    fn (&Self) encode(data: &str): Result[str, str]
+    fn (&Self) decode(data: &str, maxOut: int): Result[str, str]
+}
+
+type CodecList = record {
+    items: []box ContentCodec
+}
+
+fn cloneCodecs(c: &Option[task.Shared[CodecList]]): Option[task.Shared[CodecList]] {
+    match c {
+        Some(sh) { return Some(sh.share()) }
+        None { return None }
+    }
+}
+
+fn codecsAcceptHeader(c: &Option[task.Shared[CodecList]]): str {
+    match c {
+        Some(sh) {
+            var out = ""
+            sh.with(fn(cl: mut &CodecList) {
+                for i in 0..len(cl.items) {
+                    if i > 0 { out += ", " }
+                    out += cl.items[i].name()
+                }
+            })
+            return out
+        }
+        None { return "" }
+    }
+}
+
+// Parse a decimal q-value (0..1) into milli-units 0..1000, or -1 if invalid.
+fn parseQValue(s: &str): int {
+    let t = trimOws(s)
+    if len(t) == 0 { return -1 }
+    if t == "1" || t == "1.0" || t == "1.00" || t == "1.000" { return 1000 }
+    if t == "0" || t == "0.0" || t == "0.00" || t == "0.000" { return 0 }
+    if len(t) >= 3 && t[0] == '0' && t[1] == '.' && len(t) <= 5 {
+        var v = 0
+        var mult = 100
+        for i in 2..len(t) {
+            let b = t[i]
+            if b < '0' || b > '9' { return -1 }
+            v += int(b - '0') * mult
+            mult = mult / 10
+        }
+        return v
+    }
+    return -1
+}
+
+// Negotiate the best codec from `codecs` for an HTTP Accept-Encoding header value.
+// Returns the index into `codecs`, or -1 if no codec is acceptable.
+pub fn negotiateEncoding(acceptHeader: &str, codecs: &[]box ContentCodec): int {
+    if len(acceptHeader) == 0 || len(codecs) == 0 { return -1 }
+    var bestIdx = -1
+    var bestQ = 0
+    var starQ = -1
+    // Track explicit q-values per codec (-1 = not explicitly named).
+    var qs: []int = array(len(codecs), -1)
+    for part in strings.splitByte(acceptHeader, ',') {
+        let seg = trimOws(&part)
+        if len(seg) == 0 { continue }
+        var name = seg.clone()
+        var q = 1000
+        let semi = strings.indexOf(&seg, ";", 0)
+        if semi >= 0 {
+            name = trimOws(seg[0..semi]).clone()
+            let params = seg[semi + 1..]
+            for p in strings.splitByte(params, ';') {
+                let pt = trimOws(&p)
+                if len(pt) >= 2 && (pt[0] == 'q' || pt[0] == 'Q') && pt[1] == '=' {
+                    let parsed = parseQValue(pt[2..])
+                    if parsed >= 0 { q = parsed }
+                }
+            }
+        }
+        if name == "*" {
+            starQ = q
+        } else {
+            for i in 0..len(codecs) {
+                let cn = codecs[i].name()
+                if equalFold(&name, &cn) {
+                    if q > qs[i] { qs[i] = q }
+                }
+            }
+        }
+    }
+    for i in 0..len(codecs) {
+        let eff = if qs[i] >= 0 { qs[i] } else if starQ >= 0 { starQ } else { 0 }
+        if eff > bestQ {
+            bestQ = eff
+            bestIdx = i
+        }
+    }
+    return bestIdx
+}
+
+// Decode a body encoded with an HTTP Content-Encoding header value (single or
+// comma-separated coding stack, applied in reverse order per RFC 9110 §8.4),
+// enforcing maxOut on every layer.
+pub fn decodeContent(codecs: &[]box ContentCodec, encoding: &str, data: &str, maxOut: int): Result[str, str] {
+    var tokens: []str = []
+    for part in strings.splitByte(encoding, ',') {
+        let t = trimOws(&part)
+        if len(t) == 0 || equalFold(&t, "identity") { continue }
+        append(mut &tokens, t.clone())
+    }
+    if len(tokens) == 0 { return Ok(data.clone()) }
+    var cur = data.clone()
+    var k = len(tokens) - 1
+    while k >= 0 {
+        let tok = &tokens[k]
+        var found = -1
+        for i in 0..len(codecs) {
+            let cn = codecs[i].name()
+            if equalFold(tok, &cn) {
+                found = i
+                break
+            }
+        }
+        if found < 0 {
+            return Err("unsupported content-encoding: " + tok)
+        }
+        cur = try codecs[found].decode(&cur, maxOut)
+        k -= 1
+    }
+    return Ok(cur)
+}
+
 // ---------------------------------------------------------------- options and clients
 
 // What a Client does. defaults() gives the usual values; change fields of
@@ -487,6 +623,7 @@ pub type Options = value record {
                                    // store) with ALPN h2,http/1.1; caFile, insecureSkipVerify, pins, ...
     pub http2: bool                // negotiate HTTP/2 over TLS (ALPN "h2"); true by default
     pub h2c: bool                  // use prior-knowledge cleartext HTTP/2 for http:// URLs; false by default
+    codecs: Option[task.Shared[CodecList]]
 }
 
 // maxPerHost 16, timeoutMs 30,000, maxBody 16 MiB, redirects on, at most
@@ -496,7 +633,45 @@ pub fn defaults(): Options {
     var t = tls.defaults()
     t.alpn = "h2,http/1.1"
     return Options{maxPerHost: 16, timeoutMs: 30000, maxBody: 16777216, redirects: true, maxRedirects: 10,
-                   allowHttpsToHttp: false, idleTimeoutMs: 90000, userAgent: "lxl", tls: t, http2: true, h2c: false}
+                   allowHttpsToHttp: false, idleTimeoutMs: 90000, userAgent: "lxl", tls: t, http2: true, h2c: false,
+                   codecs: None}
+}
+
+// Register a ContentCodec (e.g. zstd.codec(), zlib.gzipCodec(), zlib.deflateCodec())
+// for automatic Accept-Encoding negotiation and transparent response decompression.
+pub fn (o: mut &Options) addCodec(c: box ContentCodec) {
+    var pending: Option[box ContentCodec] = Some(c)
+    match &o.codecs {
+        Some(sh) {
+            sh.with(fn(cl: mut &CodecList) {
+                match replace(mut &pending, None) {
+                    Some(x) { append(mut &cl.items, x) }
+                    None {}
+                }
+            })
+        }
+        None {
+            match replace(mut &pending, None) {
+                Some(x) { o.codecs = Some(task.shared(CodecList{items: [x]})) }
+                None {}
+            }
+        }
+    }
+}
+
+// The Accept-Encoding header value advertised by registered codecs, or "" if none.
+pub fn (o: &Options) acceptEncoding(): str {
+    return codecsAcceptHeader(&o.codecs)
+}
+
+pub fn (o: &Options) clone(): Options {
+    return Options{
+        maxPerHost: o.maxPerHost, timeoutMs: o.timeoutMs, maxBody: o.maxBody,
+        redirects: o.redirects, maxRedirects: o.maxRedirects,
+        allowHttpsToHttp: o.allowHttpsToHttp, idleTimeoutMs: o.idleTimeoutMs,
+        userAgent: o.userAgent.clone(), tls: o.tls.clone(), http2: o.http2, h2c: o.h2c,
+        codecs: cloneCodecs(&o.codecs)
+    }
 }
 
 // A client: its options and a pool of kept-alive connections per server. A
@@ -1135,6 +1310,8 @@ pub type Response = record {
     maxBody: int
     idleMs: int
     deadline: int                 // monotonic ns, or 0: none
+    codecs: Option[task.Shared[CodecList]]
+    autoDecompress: bool          // true when the client added Accept-Encoding itself
 }
 
 // Whether the status is 2xx.
@@ -1142,6 +1319,9 @@ pub fn (r: &Response) ok(): bool { return r.status >= 200 && r.status < 300 }
 
 // The first value of the header name.
 pub fn (r: &Response) header(name: &str): Option[&str] { return r.headers.get(name) }
+
+// The Content-Encoding header value, if present.
+pub fn (r: &Response) contentEncoding(): Option[&str] { return r.headers.get("Content-Encoding") }
 
 // The length the server announced (Content-Length), or -1: chunked, until
 // the connection closes, or no body.
@@ -1421,6 +1601,30 @@ pub fn (var r: Response) discard(limit: int, w: Where): Result[Unit, Error] {
 }
 
 fn (r: mut &Response) readAll(w: Where): Result[str, Error] {
+    let raw = try r.readAllRaw(w)
+    if !r.autoDecompress || len(raw) == 0 { return Ok(raw) }
+    let encVals = r.headers.values("Content-Encoding")
+    if len(encVals) == 0 { return Ok(raw) }
+    let ce = strings.join(&encVals, ", ")
+    match &r.codecs {
+        Some(sh) {
+            var res: Result[str, str] = Ok("")
+            sh.with(fn(cl: mut &CodecList) {
+                res = decodeContent(&cl.items, &ce, &raw, r.maxBody)
+            })
+            match move(res) {
+                Ok(s) { return Ok(s) }
+                Err(msg) {
+                    let k = if strings.contains(&msg, "exceeds limit") { Kind.TooLarge } else { Kind.Protocol }
+                    return Err(err(k, &("content-encoding decode failed: " + msg), &r.us))
+                }
+            }
+        }
+        None { return Ok(raw) }
+    }
+}
+
+fn (r: mut &Response) readAllRaw(w: Where): Result[str, Error] {
     let u = r.us.clone()
     if r.done { return Ok("") }
     if r.framing == F_LENGTH && r.h2.isNone() {
@@ -1634,17 +1838,24 @@ fn finishH2Dial(sh: &task.Shared[PoolState], key: &str, h2Known: int, takeH1Slot
     }
 }
 
-fn h2ReqFields(method: &str, h: &Headers, body: &str, ua: &str): []hpack.Field {
+fn h2ReqFields(method: &str, h: &Headers, body: &str, ua: &str, acceptEnc: &str): []hpack.Field {
     var hasUa = false
     var hasLen = false
+    var hasAe = false
+    var hasRange = false
     var out: []hpack.Field = []
     for x in h.list {
         if equalFold(&x.name, "User-Agent") { hasUa = true }
         if equalFold(&x.name, "Content-Length") { hasLen = true }
+        if equalFold(&x.name, "Accept-Encoding") { hasAe = true }
+        if equalFold(&x.name, "Range") { hasRange = true }
         if equalFold(&x.name, "Host") { continue }
         append(mut &out, hpack.Field{name: strings.toLowerAscii(&x.name), value: x.value.clone()})
     }
     if !hasUa && len(ua) > 0 { append(mut &out, hpack.Field{name: "user-agent", value: ua.clone()}) }
+    if !hasAe && !hasRange && len(acceptEnc) > 0 && method != "HEAD" {
+        append(mut &out, hpack.Field{name: "accept-encoding", value: acceptEnc.clone()})
+    }
     if !hasLen && (len(body) > 0 || bodyMethod(method)) {
         append(mut &out, hpack.Field{name: "content-length", value: intToStr(len(body))})
     }
@@ -1658,8 +1869,9 @@ fn h2PathOf(u: &url.Url): str {
 }
 
 fn h2Exchange(c: &Client, hc: &h2client.Conn, opts: &Options, u: &url.Url, us: &str, key: &str,
-              method: &str, auth: &str, reqHdrs: &Headers, body: &str, deadline: int, w: Where): Result[Response, h2client.ClientError] {
-    let fields = h2ReqFields(method, reqHdrs, body, &opts.userAgent)
+              method: &str, auth: &str, reqHdrs: &Headers, body: &str, acceptEnc: &str, autoDecomp: bool,
+              deadline: int, w: Where): Result[Response, h2client.ClientError] {
+    let fields = h2ReqFields(method, reqHdrs, body, &opts.userAgent, acceptEnc)
     let path = h2PathOf(u)
     let sr = try hc.roundTrip(method, &u.scheme, auth, &path, &fields, body, opts.idleTimeoutMs, w)
     let h2client.StartRes{stream: stream, head: head} = move(sr)
@@ -1673,6 +1885,7 @@ fn h2Exchange(c: &Client, hc: &h2client.Conn, opts: &Options, u: &url.Url, us: &
         key: key.clone(), framing: if done { F_EMPTY } else if cl >= 0 { F_LENGTH } else { F_CHUNKED },
         length: cl, left: if cl >= 0 { cl } else { 0 }, chunk: C_SIZE, extBytes: 0, done: done,
         keep: true, keepMs: -1, maxBody: opts.maxBody, idleMs: opts.idleTimeoutMs, deadline: deadline,
+        codecs: cloneCodecs(&opts.codecs), autoDecompress: autoDecomp,
     })
 }
 
@@ -1693,7 +1906,7 @@ fn dialHeld(c: &Client, opts: &Options, key: &str, u: &url.Url, us: &str, w: Whe
 // came, if the method is idempotent. The place in the pool that acquire
 // gives is the Response's; on an error it is given back here.
 fn exchange(c: &Client, opts: &Options, u: &url.Url, us: &str, key: &str, method: &str, auth: &str,
-            reqHdrs: &Headers, body: &str, wire: &Wire, deadline: int, w: Where): Result[Response, Error] {
+            reqHdrs: &Headers, body: &str, wire: &Wire, acceptEnc: &str, autoDecomp: bool, deadline: int, w: Where): Result[Response, Error] {
     var conn = gone()
     var reused = false
     var haveH1Conn = false
@@ -1707,7 +1920,7 @@ fn exchange(c: &Client, opts: &Options, u: &url.Url, us: &str, key: &str, method
         while true {
             match pickH2(&c.sh, key) {
                 Some(hc) {
-                    let res = h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, deadline, w)
+                    let res = h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, acceptEnc, autoDecomp, deadline, w)
                     updateH2MaxStreams(&c.sh, key, &hc)
                     match res {
                         Ok(resp) { return Ok(resp) }
@@ -1784,7 +1997,7 @@ fn exchange(c: &Client, opts: &Options, u: &url.Url, us: &str, key: &str, method
                             Dialed.H2(hc) {
                                 registerH2(&c.sh, key, &hc)
                                 finishH2Dial(&c.sh, key, 1, false)
-                                let res = h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, deadline, w)
+                                let res = h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, acceptEnc, autoDecomp, deadline, w)
                                 updateH2MaxStreams(&c.sh, key, &hc)
                                 match res {
                                     Ok(resp) { return Ok(resp) }
@@ -1830,7 +2043,7 @@ fn exchange(c: &Client, opts: &Options, u: &url.Url, us: &str, key: &str, method
                     Dialed.H2(hc) {
                         registerH2(&c.sh, key, &hc)
                         release(&c.sh, key, None)   // H2 connections live in Host.h2, not the H1 slot
-                        return match h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, deadline, w) {
+                        return match h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, acceptEnc, autoDecomp, deadline, w) {
                             Ok(resp) { Ok(resp) }
                             Err(e) { Err(h2Err(&e, us)) }
                         }
@@ -1848,7 +2061,7 @@ fn exchange(c: &Client, opts: &Options, u: &url.Url, us: &str, key: &str, method
             Dialed.H2(hc) {
                 registerH2(&c.sh, key, &hc)
                 release(&c.sh, key, None)
-                return match h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, deadline, w) {
+                return match h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, acceptEnc, autoDecomp, deadline, w) {
                     Ok(resp) { Ok(resp) }
                     Err(e) { Err(h2Err(&e, us)) }
                 }
@@ -1870,7 +2083,7 @@ fn exchange(c: &Client, opts: &Options, u: &url.Url, us: &str, key: &str, method
             Dialed.H2(hc) {
                 registerH2(&c.sh, key, &hc)
                 release(&c.sh, key, None)
-                return match h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, deadline, w) {
+                return match h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, acceptEnc, autoDecomp, deadline, w) {
                     Ok(resp) { Ok(resp) }
                     Err(e) { Err(h2Err(&e, us)) }
                 }
@@ -1897,17 +2110,20 @@ fn exchange(c: &Client, opts: &Options, u: &url.Url, us: &str, key: &str, method
                        url: u.clone(), us: us.clone(), conn: conn, h2: None, sh: c.sh.share(),
                        key: key.clone(), framing: fr.framing, length: fr.length, left: if fr.framing == F_LENGTH { fr.length } else { 0 },
                        chunk: C_SIZE, extBytes: 0, done: done, keep: fr.keep, keepMs: fr.keepMs, maxBody: opts.maxBody,
-                       idleMs: opts.idleTimeoutMs, deadline: deadline})
+                       idleMs: opts.idleTimeoutMs, deadline: deadline,
+                       codecs: cloneCodecs(&opts.codecs), autoDecompress: autoDecomp})
 }
 
 // The wire form of a request to u: its head (request line, Host,
 // User-Agent, the request's headers, Content-Length), and its body, in the
 // same bytes when it is small. auth: u.authority().
-fn wireOf(method: &str, u: &url.Url, us: &str, auth: &str, h: &Headers, body: &str, ua: &str): Result[Wire, Error] {
+fn wireOf(method: &str, u: &url.Url, us: &str, auth: &str, h: &Headers, body: &str, ua: &str, acceptEnc: &str): Result[Wire, Error] {
     if !isToken(method) { return Err(err(Kind.Invalid, &("an invalid method '" + method + "'"), us)) }
     var hasHost = false
     var hasUa = false
     var hasLen = false
+    var hasAe = false
+    var hasRange = false
     for x in h.list {
         if !isToken(&x.name) { return Err(err(Kind.Invalid, &("an invalid header name '" + x.name + "'"), us)) }
         if !isFieldValue(&x.value) { return Err(err(Kind.Invalid, &("a control character in the header " + x.name), us)) }
@@ -1922,6 +2138,8 @@ fn wireOf(method: &str, u: &url.Url, us: &str, auth: &str, h: &Headers, body: &s
             hasHost = true
         }
         if equalFold(&x.name, "User-Agent") { hasUa = true }
+        if equalFold(&x.name, "Accept-Encoding") { hasAe = true }
+        if equalFold(&x.name, "Range") { hasRange = true }
         if equalFold(&x.name, "Transfer-Encoding") {
             return Err(err(Kind.Invalid, "Transfer-Encoding is set (request bodies are sent with a Content-Length)", us))
         }
@@ -1933,12 +2151,14 @@ fn wireOf(method: &str, u: &url.Url, us: &str, auth: &str, h: &Headers, body: &s
     }
     let path: &str = if len(u.path) == 0 { "/" } else { &u.path }
     let withUa = !hasUa && len(ua) > 0
+    let withAe = !hasAe && !hasRange && len(acceptEnc) > 0 && method != "HEAD"
     let clen = if !hasLen && (len(body) > 0 || bodyMethod(method)) { intToStr(len(body)) } else { "" }
     let inline = len(body) <= SMALL_BODY
     var n = len(method) + 1 + len(path) + 11
     if u.hasQuery { n += 1 + len(u.query) }
     if !hasHost { n += 8 + len(auth) }
     if withUa { n += 14 + len(ua) }
+    if withAe { n += 19 + len(acceptEnc) }
     for x in h.list { n += len(x.name) + len(x.value) + 4 }
     if len(clen) > 0 { n += 18 + len(clen) }
     n += 2
@@ -1961,6 +2181,11 @@ fn wireOf(method: &str, u: &url.Url, us: &str, auth: &str, h: &Headers, body: &s
     if withUa {
         at = putStr(mut &b, at, "User-Agent: ")
         at = putStr(mut &b, at, ua)
+        at = putStr(mut &b, at, "\r\n")
+    }
+    if withAe {
+        at = putStr(mut &b, at, "Accept-Encoding: ")
+        at = putStr(mut &b, at, acceptEnc)
         at = putStr(mut &b, at, "\r\n")
     }
     for x in h.list {
@@ -2040,11 +2265,13 @@ fn (c: &Client) follow(opts: &Options, rq: &Request, first: url.Url, deadline: i
     var u = first
     var us = rq.url.clone()
     var hops = 0
+    let acceptEnc = opts.acceptEncoding()
     while true {
         let auth = u.authority()
         let curHdrs: &Headers = if hops == 0 { &rq.headers } else { &h }
-        let wire = try wireOf(&method, &u, &us, &auth, curHdrs, &body, &opts.userAgent)
-        let r = try exchange(c, opts, &u, &us, &(u.scheme + "://" + auth), &method, &auth, curHdrs, &body, &wire, deadline, w)
+        let autoDecomp = len(acceptEnc) > 0 && !curHdrs.has("Accept-Encoding") && !curHdrs.has("Range") && method != "HEAD"
+        let wire = try wireOf(&method, &u, &us, &auth, curHdrs, &body, &opts.userAgent, &acceptEnc)
+        let r = try exchange(c, opts, &u, &us, &(u.scheme + "://" + auth), &method, &auth, curHdrs, &body, &wire, &acceptEnc, autoDecomp, deadline, w)
         if !opts.redirects || !isRedirect(r.status) { return Ok(r) }
         let loc = match r.headers.get("Location") {
             Some(l) { l.clone() }

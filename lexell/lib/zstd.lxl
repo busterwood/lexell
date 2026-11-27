@@ -13,6 +13,7 @@
 // (or -1 for unlimited) via decompressMax or Decompressor.setMaxOut.
 
 import "ffi"
+import "io"
 
 extern "zstd" fn ZSTD_versionNumber(): u32
 extern "zstd" fn ZSTD_isError(code: u64): u32
@@ -363,4 +364,139 @@ pub fn decompressMax(data: &str, maxOut: int): Result[str, Error] {
     let out = try d.write(data)
     try d.finish()
     return Ok(out)
+}
+
+// ---- io.Read / io.Write streaming adapters
+
+// An io.Read that transparently decompresses a Zstandard stream from an inner box io.Read.
+pub type Reader = record {
+    src: box io.Read
+    dec: Decompressor
+    inBuf: []byte
+    outBuf: []byte
+    outPos: int
+    eof: bool
+}
+
+// Wrap any box io.Read with Zstandard decompression bounded by maxOut (-1 for unlimited).
+pub fn reader(src: box io.Read, maxOut: int): Result[Reader, Error] {
+    var dec = try newDecompressor()
+    dec.setMaxOut(maxOut)
+    return Ok(Reader{src: src, dec: dec, inBuf: array(16384, byte(0)), outBuf: [], outPos: 0, eof: false})
+}
+
+pub fn (r: mut &Reader) read(dst: mut &[byte]): Result[int, io.IoError] {
+    let n = len(dst)
+    if n == 0 { return Ok(0) }
+    while r.outPos >= len(r.outBuf) {
+        if r.eof { return Ok(0) }
+        let k = try r.src.read(mut &r.inBuf)
+        if k == 0 {
+            r.eof = true
+            match r.dec.finish() {
+                Ok(_) { return Ok(0) }
+                Err(e) { return Err(io.ioError(22, "zstd", &e.msg)) }
+            }
+        }
+        let chunk = strFromBytes(&r.inBuf[0..k])
+        let dec = match r.dec.write(&chunk) {
+            Ok(s) { s }
+            Err(e) { return Err(io.ioError(22, "zstd", &e.msg)) }
+        }
+        if len(dec) > 0 {
+            r.outBuf = strToBytes(dec)
+            r.outPos = 0
+        }
+    }
+    var take = len(r.outBuf) - r.outPos
+    if take > n { take = n }
+    for i in 0..take { dst[i] = r.outBuf[r.outPos + i] }
+    r.outPos += take
+    return Ok(take)
+}
+
+// An io.Write that Zstandard-compresses bytes written to it and forwards them to dst.
+// Call finish() to close the Zstandard frame and flush dst.
+pub type Writer = record {
+    dst: box io.Write
+    cmp: Compressor
+    finished: bool
+}
+
+pub fn writer(dst: box io.Write, level: int): Result[Writer, Error] {
+    let cmp = try newCompressor(level)
+    return Ok(Writer{dst: dst, cmp: cmp, finished: false})
+}
+
+pub fn (w: mut &Writer) writeBytes(src: &[byte]): Result[int, io.IoError] {
+    if w.finished { return Err(io.ioError(22, "zstd", "writer already finished")) }
+    if len(src) == 0 { return Ok(0) }
+    let s = strFromBytes(src)
+    let out = match w.cmp.write(&s) {
+        Ok(b) { b }
+        Err(e) { return Err(io.ioError(22, "zstd", &e.msg)) }
+    }
+    if len(out) > 0 {
+        let bs = strToBytes(out)
+        try io.writeAll(mut &w.dst, &bs)
+    }
+    return Ok(len(src))
+}
+
+pub fn (w: mut &Writer) flush(): Result[Unit, io.IoError] {
+    if w.finished { return w.dst.flush() }
+    let out = match w.cmp.flush() {
+        Ok(b) { b }
+        Err(e) { return Err(io.ioError(22, "zstd", &e.msg)) }
+    }
+    if len(out) > 0 {
+        let bs = strToBytes(out)
+        try io.writeAll(mut &w.dst, &bs)
+    }
+    return w.dst.flush()
+}
+
+pub fn (w: mut &Writer) finish(): Result[Unit, io.IoError] {
+    if w.finished { return Ok(Unit{}) }
+    w.finished = true
+    let out = match w.cmp.finish() {
+        Ok(b) { b }
+        Err(e) { return Err(io.ioError(22, "zstd", &e.msg)) }
+    }
+    if len(out) > 0 {
+        let bs = strToBytes(out)
+        try io.writeAll(mut &w.dst, &bs)
+    }
+    return w.dst.flush()
+}
+
+fn (w: mut &Writer) drop() {
+    if !w.finished {
+        let _ = w.finish()
+    }
+}
+
+// ---- HTTP ContentCodec implementation (structurally satisfies http.ContentCodec)
+
+pub type Codec = value record {
+    pub level: int
+}
+
+pub fn codec(): Codec { return Codec{level: defaultLevel()} }
+pub fn codecLevel(level: int): Codec { return Codec{level: level} }
+
+pub fn (c: &Codec) name(): str { return "zstd" }
+
+pub fn (c: &Codec) encode(data: &str): Result[str, str] {
+    match compressLevel(data, c.level) {
+        Ok(s) { return Ok(s) }
+        Err(e) { return Err(e.toStr()) }
+    }
+}
+
+pub fn (c: &Codec) decode(data: &str, maxOut: int): Result[str, str] {
+    match decompressMax(data, maxOut) {
+        Ok(s) { return Ok(s) }
+        Err(e) { return Err(e.toStr()) }
+    }
 }

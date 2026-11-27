@@ -1,0 +1,103 @@
+// try auto-boxing into Result[T, box Error] and custom box Error interfaces,
+// Result.context / Result.withContext, Option.okOr / okOrElse, errors.new / wrap.
+// expect: ok pipeline 42
+// expect: err io true
+// expect: err parse ParseErr(bad int)
+// expect: err custom custom: ParseErr(oops)
+// expect: err ctx outer: inner: ParseErr(x)
+// expect: err lazy lazy-99: ParseErr(z)
+// expect: okOr Some 7
+// expect: okOr None missing key
+// expect: generic box ParseErr(gen)
+// expect: custom iface 500: boom
+
+import "errors"
+
+type ParseErr = value record {
+    detail: str
+}
+fn (e: &ParseErr) toStr(): str { return $"ParseErr({e.detail})" }
+
+type NetErr = record {
+    code: int
+    msg: str
+}
+fn (e: &NetErr) toStr(): str { return $"NetErr({e.code}: {e.msg})" }
+
+type HttpErr = interface {
+    fn (&Self) status(): int
+    fn (&Self) toStr(): str
+}
+
+type ServerErr = record {
+    s: int
+    m: str
+}
+fn (e: &ServerErr) status(): int { return e.s }
+fn (e: &ServerErr) toStr(): str { return e.m.clone() }
+
+fn parseNum(ok: bool, tag: &str): Result[int, ParseErr] {
+    if ok { return Ok(42) }
+    return Err(ParseErr{detail: tag.clone()})
+}
+
+fn fetchNet(ok: bool): Result[int, NetErr] {
+    if ok { return Ok(10) }
+    return Err(NetErr{code: 503, msg: "unavailable"})
+}
+
+fn pipeline(netOk: bool, parseOk: bool): Result[int, box Error] {
+    let _ = try fetchNet(netOk)
+    let n = try parseNum(parseOk, "bad int")
+    return Ok(n)
+}
+
+fn withWrapped(): Result[int, box Error] {
+    let r = parseNum(false, "oops")
+    match move(r) {
+        Ok(v) { return Ok(v) }
+        Err(e) { return Err(errors.wrap(e, "custom")) }
+    }
+}
+
+fn nestedContext(): Result[int, box Error] {
+    let a: Result[int, box Error] = parseNum(false, "x").context("inner")
+    let _ = try a.context("outer")
+    return Ok(0)
+}
+
+fn lazyContext(id: int): Result[int, box Error] {
+    let _ = try parseNum(false, "z").withContext(fn(): str { return $"lazy-{id}" })
+    return Ok(0)
+}
+
+fn lookupKey(found: bool): Result[int, box Error] {
+    let o: Option[int] = if found { Some(7) } else { None }
+    let v = try o.okOr(errors.new("missing key"))
+    return Ok(v)
+}
+
+fn genericTry[E: Error](r: Result[int, E]): Result[int, box Error] {
+    return Ok(try r)
+}
+
+fn customIfaceTry(): Result[int, box HttpErr] {
+    let r: Result[int, ServerErr] = Err(ServerErr{s: 500, m: "boom"})
+    return Ok(try r)
+}
+
+fn main() {
+    println($"ok pipeline {pipeline(true, true).unwrap()}")
+    let eNet = pipeline(false, true).unwrapErr()
+    println($"err io {eNet.toStr() == "NetErr(503: unavailable)"}")
+    let eParse = pipeline(true, false).unwrapErr()
+    println($"err parse {eParse}")
+    println($"err custom {withWrapped().unwrapErr()}")
+    println($"err ctx {nestedContext().unwrapErr()}")
+    println($"err lazy {lazyContext(99).unwrapErr()}")
+    println($"okOr Some {lookupKey(true).unwrap()}")
+    println($"okOr None {lookupKey(false).unwrapErr()}")
+    println($"generic box {genericTry(parseNum(false, "gen")).unwrapErr()}")
+    let ce = customIfaceTry().unwrapErr()
+    println($"custom iface {ce.status()}: {ce.toStr()}")
+}

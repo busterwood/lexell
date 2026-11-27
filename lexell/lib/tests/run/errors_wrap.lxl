@@ -1,0 +1,57 @@
+// Real stdlib composition with `Result[T, box Error]`, `try`, `.context()`,
+// `errors.wrap`, `Option.okOr`, across io + zlib + json + serde.
+// needs: z
+// expect: ok host=db.internal port=5432
+// expect: err missing true
+// expect: err corrupt true
+// expect: err json true
+// expect: with where true
+
+import "io"
+import "zlib"
+import "json"
+import "errors"
+import "strings"
+
+type Config = record {
+    host: str
+    port: int
+}
+
+fn decodeCompressedConfig(gz: &str): Result[Config, box Error] {
+    let plain = try zlib.gunzip(gz).context("decompressing config")
+    let cfg = try json.decode[Config](&plain).context("parsing config JSON")
+    return Ok(cfg)
+}
+
+fn loadConfigFile(path: &str): Result[Config, box Error] {
+    let raw = try io.read(path).context($"reading {path}")
+    return decodeCompressedConfig(&raw)
+}
+
+fn main() {
+    // 1. Happy path: encode Config -> JSON -> gzip -> decode via Result[Config, box Error]
+    let orig = Config{host: "db.internal", port: 5432}
+    let j = json.encode(&orig)
+    let gz = zlib.gzip(&j).unwrap()
+    let got = decodeCompressedConfig(&gz).unwrap()
+    println($"ok host={got.host} port={got.port}")
+
+    // 2. Missing file -> io.IoError auto-wrapped with context
+    let e1 = loadConfigFile("/nonexistent_lexell_cfg_999.gz").unwrapErr().toStr()
+    println($"err missing {strings.startsWith(&e1, "reading /nonexistent_lexell_cfg_999.gz:")}")
+
+    // 3. Corrupt gzip -> zlib.Error auto-wrapped with context
+    let e2 = decodeCompressedConfig("not gzip bytes").unwrapErr().toStr()
+    println($"err corrupt {strings.startsWith(&e2, "decompressing config: zlib:")}")
+
+    // 4. Valid gzip containing invalid JSON -> json.Error auto-wrapped with context
+    let badGz = zlib.gzip("{bad json").unwrap()
+    let e3 = decodeCompressedConfig(&badGz).unwrapErr().toStr()
+    println($"err json {strings.startsWith(&e3, "parsing config JSON:")}")
+
+    // 5. Where location preserved on WrappedError
+    let w = errors.new("boom")
+    let s = w.toStrWithWhere()
+    println($"with where {strings.contains(&s, "errors_wrap.lxl:") && strings.startsWith(&s, "boom (")}")
+}
