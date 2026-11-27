@@ -558,6 +558,90 @@ pub fn trueIndices(v: &[]int, nul: &[]bool): []int {
     return out
 }
 
+// Copies full-batch srcv[idx[j]] / srcn[idx[j]] into outv/outn (m == len(srcv)).
+// Uses 4-wide vector[int] copy when idx is sequential and skips null copy when no NULLs.
+pub fn copyColFull(srcv: &[]int, srcn: &[]bool, idx: &[]int, outv: mut &[]int, outn: mut &[]bool) {
+    let m = len(idx)
+    if isFullSeq(idx, m) {
+        var j = 0
+        while j + VI.lanes <= len(srcv) && j + VI.lanes <= len(outv) {
+            VI.load(srcv, j).store(outv, j)
+            j += VI.lanes
+        }
+        while j < m { outv[j] = srcv[j]; j += 1 }
+        if hasAnyNull(srcn) {
+            for i in 0..m { outn[i] = srcn[i] }
+        }
+        return
+    }
+    for j in 0..m {
+        let r = idx[j]
+        outv[j] = srcv[r]
+        outn[j] = srcn[r]
+    }
+}
+
+// Single-pass 4-wide SIMD (min, max, sum_i128, count) over cv[idx[j]].
+pub fn sumMinMaxI128Col(cv: &[]int, cnul: &[]bool, idx: &[]int, outMin: mut &int, outMax: mut &int, outCnt: mut &int): i128 {
+    let k = len(idx)
+    if k == 0 {
+        outMin = 9223372036854775807
+        outMax = -9223372036854775807 - 1
+        outCnt = 0
+        return i128(0)
+    }
+    if isFullSeq(idx, len(cv)) && !hasAnyNull(cnul) {
+        let vZero = VI.zero()
+        var vAcc = VI.zero()
+        var vMin = VI.splat(cv[0])
+        var vMax = VI.splat(cv[0])
+        var s = i128(0)
+        var j = 0
+        for v in VI.chunks(cv, mut &j) {
+            vMin = vMin.min(v)
+            vMax = vMax.max(v)
+            let next = vAcc +% v
+            if (((next ^ vAcc) & (next ^ v)) < vZero).any() {
+                s += flushI128(vAcc)
+                vAcc = v
+            } else {
+                vAcc = next
+            }
+        }
+        s += flushI128(vAcc)
+        var mn = vMin.reduceMin()
+        var mx = vMax.reduceMax()
+        while j < k {
+            let v = cv[j]
+            if v < mn { mn = v }
+            if v > mx { mx = v }
+            s += i128(v)
+            j += 1
+        }
+        outMin = mn
+        outMax = mx
+        outCnt = k
+        return s
+    }
+    var mn = 9223372036854775807
+    var mx = -9223372036854775807 - 1
+    var s = i128(0)
+    var c = 0
+    for j in 0..k {
+        let r = idx[j]
+        if cnul[r] { continue }
+        let v = cv[r]
+        if v < mn { mn = v }
+        if v > mx { mx = v }
+        s += i128(v)
+        c += 1
+    }
+    outMin = mn
+    outMax = mx
+    outCnt = c
+    return s
+}
+
 // 10^38: a numeric sum at or past it in magnitude is out of range, as
 // Decimal's exact sum is (38 digits).
 const TEN38: i128 = 100000000000000000000000000000000000000

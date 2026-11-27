@@ -1256,10 +1256,23 @@ pub fn parseNeeded(s: &str, n: int, needPl: &[]bool, maxPl: int): Option[[]int] 
     let np = int(s[3])
     if len(s) < 4 + np { return None }
     var dir: []int = array(DIR_HDR + D * np, 0)
+    if !parseNeededInto(s, n, needPl, maxPl, mut &dir) { return None }
+    return Some(dir)
+}
+
+// Zero-allocation partial directory parse into caller-owned dir buffer.
+pub fn parseNeededInto(s: &str, n: int, needPl: &[]bool, maxPl: int, dir: mut &[]int): bool {
+    if len(s) < 4 || int(s[0]) != VERSION { return false }
+    let np = int(s[3])
+    if len(s) < 4 + np { return false }
+    let wantLen = DIR_HDR + D * np
+    if len(dir) < wantLen {
+        while len(dir) < wantLen { append(dir, 0) }
+    }
     dir[0] = u16At(s, 1)
     dir[1] = np
     dir[2] = n
-    if maxPl < 0 { return Some(dir) }
+    if maxPl < 0 { return true }
     let limit = if maxPl + 1 < np { maxPl + 1 } else { np }
     let nNeed = len(needPl)
     var at = 4 + np
@@ -1267,7 +1280,7 @@ pub fn parseNeeded(s: &str, n: int, needPl: &[]bool, maxPl: int): Option[[]int] 
     for p in 0..limit {
         let k = s[4 + p]
         let x = DIR_HDR + D * p
-        if at >= len(s) { return None }
+        if at >= len(s) { return false }
         let cb = int(s[at])
         at += 1
         let c = cb & 0x7f
@@ -1277,7 +1290,7 @@ pub fn parseNeeded(s: &str, n: int, needPl: &[]bool, maxPl: int): Option[[]int] 
             dir[x + F_NULLS] = -1
             var nnul = 0
             if cb & C_NULLS != 0 {
-                if at + nb > len(s) { return None }
+                if at + nb > len(s) { return false }
                 dir[x + F_NULLS] = at
                 for i in 0..n { if bitAt(s, at, i) { nnul += 1 } }
                 at += nb
@@ -1285,25 +1298,25 @@ pub fn parseNeeded(s: &str, n: int, needPl: &[]bool, maxPl: int): Option[[]int] 
             dir[x + F_Y] = if nnul < n { 1 } else { 0 }
         } else {
             if cb & C_NULLS != 0 {
-                if at + nb > len(s) { return None }
+                if at + nb > len(s) { return false }
                 at += nb
             }
         }
         if c == C_NONE {
-            if k != K_NONE { return None }
+            if k != K_NONE { return false }
         } else if c == C_FOR || c == C_UNITS {
-            if c == C_FOR && !isInt(k) { return None }
+            if c == C_FOR && !isInt(k) { return false }
             if c == C_UNITS {
-                if k != K_NUM || at >= len(s) { return None }
+                if k != K_NUM || at >= len(s) { return false }
                 if want { dir[x + F_X] = int(s[at]) }
                 at += 1
             }
-            if at + 2 > len(s) { return None }
+            if at + 2 > len(s) { return false }
             let base = unzz(getUVar(s, mut &at))
-            if at >= len(s) { return None }
+            if at >= len(s) { return false }
             let w = int(s[at])
             at += 1
-            if w > MAX_W || at >= len(s) { return None }
+            if w > MAX_W || at >= len(s) { return false }
             let range = getUVar(s, mut &at)
             if want {
                 dir[x + F_BASE] = base
@@ -1313,9 +1326,9 @@ pub fn parseNeeded(s: &str, n: int, needPl: &[]bool, maxPl: int): Option[[]int] 
             }
             at += (n * w + 7) / 8
         } else if c == C_RAW {
-            if !isInt(k) || at + 2 > len(s) { return None }
+            if !isInt(k) || at + 2 > len(s) { return false }
             let base = unzz(getUVar(s, mut &at))
-            if at >= len(s) { return None }
+            if at >= len(s) { return false }
             let mx = unzz(getUVar(s, mut &at))
             if want {
                 dir[x + F_BASE] = base
@@ -1325,12 +1338,12 @@ pub fn parseNeeded(s: &str, n: int, needPl: &[]bool, maxPl: int): Option[[]int] 
             }
             at += n * fixedSize(k)
         } else if c == C_BOOL {
-            if k != K_BOOL { return None }
+            if k != K_BOOL { return false }
             if want { dir[x + F_DATA] = at }
             at += nb
         } else if c == C_TEXT || c == C_BIN {
-            if (c == C_TEXT && (k == K_NUM || !isVar(k))) || (c == C_BIN && k != K_NUM) { return None }
-            if at + 2 * n > len(s) || n == 0 { return None }
+            if (c == C_TEXT && (k == K_NUM || !isVar(k))) || (c == C_BIN && k != K_NUM) { return false }
+            if at + 2 * n > len(s) || n == 0 { return false }
             let total = u16At(s, at + 2 * n - 2)
             if want {
                 dir[x + F_DATA] = at
@@ -1338,7 +1351,7 @@ pub fn parseNeeded(s: &str, n: int, needPl: &[]bool, maxPl: int): Option[[]int] 
             }
             at += 2 * n + total
         } else if c == C_ANY {
-            if k != K_ANY || n == 0 || at + 2 * n > len(s) { return None }
+            if k != K_ANY || n == 0 || at + 2 * n > len(s) { return false }
             let total = u16At(s, at + 2 * n - 2)
             if want {
                 dir[x + F_DATA] = at
@@ -1346,31 +1359,31 @@ pub fn parseNeeded(s: &str, n: int, needPl: &[]bool, maxPl: int): Option[[]int] 
             }
             at += 2 * n + total
         } else if c == C_DICT {
-            if k != K_TEXT || at >= len(s) { return None }
+            if k != K_TEXT || at >= len(s) { return false }
             let nd = int(s[at]) + 1
             at += 1
-            if at + 2 * nd > len(s) { return None }
+            if at + 2 * nd > len(s) { return false }
             let dbytes = u16At(s, at + 2 * nd - 2)
             if want {
                 dir[x + F_X] = nd
                 dir[x + F_Y] = at
             }
             at += 2 * nd + dbytes
-            if at >= len(s) { return None }
+            if at >= len(s) { return false }
             let w = int(s[at])
             at += 1
-            if w > 8 { return None }
+            if w > 8 { return false }
             if want {
                 dir[x + F_W] = w
                 dir[x + F_DATA] = at
             }
             at += (n * w + 7) / 8
         } else {
-            return None
+            return false
         }
-        if at > len(s) { return None }
+        if at > len(s) { return false }
     }
-    return Some(dir)
+    return true
 }
 
 // Whether the leaf is a whole-row column leaf (C_ANY): every row's bytes
@@ -1859,6 +1872,224 @@ pub fn rangeFilter(s: &str, dir: &[]int, p: int, from: int, cnt: int, r0: int, l
         }
     }
     return out
+}
+
+// Fused full-run range count on a non-NULL integer/units place: returns the
+// number of rows q in 0..cnt whose value is in [lo, hi], with zero output allocation.
+pub fn rangeCount(s: &str, dir: &[]int, p: int, from: int, cnt: int, lo: int, hi: int): int {
+    if cnt <= 0 || lo > hi { return 0 }
+    let x = DIR_HDR + D * p
+    let c = dir[x + F_CODEC]
+    if c == C_FOR || c == C_UNITS {
+        let w = dir[x + F_W]
+        let base = dir[x + F_BASE]
+        if w == 0 {
+            return if base >= lo && base <= hi { cnt } else { 0 }
+        }
+        let data = dir[x + F_DATA]
+        if w == 8 {
+            if base <= 9223372036854775552 {
+                if hi < base || lo > base + 255 { return 0 }
+                let dlo = if lo <= base { 0 } else { lo - base }
+                let dhi = if hi >= base + 255 { 255 } else { hi - base }
+                if dlo == 0 && dhi == 255 { return cnt }
+                let vLo = VB.splat(byte(dlo))
+                let vHi = VB.splat(byte(dhi))
+                let sl = &s[data + from..data + from + cnt]
+                var tot = 0
+                var q = 0
+                for v in VB.chunks(sl, mut &q) {
+                    tot += int(((v >= vLo) & (v <= vHi)).bitmask().countOnes())
+                }
+                if q < cnt {
+                    let v = VB.loadPartial(sl, q, byte(0))
+                    tot += int((((v >= vLo) & (v <= vHi)).bitmask() & VB.tailMask(cnt - q)).countOnes())
+                }
+                return tot
+            }
+            var tot = 0
+            var o = data + from
+            for q in 0..cnt {
+                let v = base +% int(s[o])
+                if v >= lo && v <= hi { tot += 1 }
+                o += 1
+            }
+            return tot
+        }
+        if w == 4 && base <= 9223372036854775807 - 15 {
+            if hi < base || lo > base + 15 { return 0 }
+            let dlo = if lo <= base { 0 } else { lo - base }
+            let dhi = if hi >= base + 15 { 15 } else { hi - base }
+            if dlo == 0 && dhi == 15 { return cnt }
+            let slen = len(s)
+            var tot = 0
+            var q = 0
+            if (from & 1) != 0 && q < cnt {
+                let u = int(s[data + (from >> 1)]) >> 4
+                if u >= dlo && u <= dhi { tot += 1 }
+                q += 1
+            }
+            var pos = data + ((from + q) >> 1)
+            let vM0 = VB.splat(byte(0x0f))
+            let vM1 = VB.splat(byte(0xf0))
+            let vLo0 = VB.splat(byte(dlo))
+            let vHi0 = VB.splat(byte(dhi))
+            let vLo1 = VB.splat(byte(dlo << 4))
+            let vHi1 = VB.splat(byte(dhi << 4))
+            while q + 64 <= cnt && pos + VB.lanes <= slen {
+                let v = VB.load(s, pos)
+                let lo4 = v & vM0
+                let hi4 = v & vM1
+                tot += int(((lo4 >= vLo0) & (lo4 <= vHi0)).bitmask().countOnes())
+                tot += int(((hi4 >= vLo1) & (hi4 <= vHi1)).bitmask().countOnes())
+                pos += VB.lanes
+                q += 64
+            }
+            while q + 2 <= cnt && pos < slen {
+                let b = int(s[pos])
+                let u0 = b & 15
+                let u1 = b >> 4
+                if u0 >= dlo && u0 <= dhi { tot += 1 }
+                if u1 >= dlo && u1 <= dhi { tot += 1 }
+                pos += 1
+                q += 2
+            }
+            if q < cnt {
+                let u = int(s[pos]) & 15
+                if u >= dlo && u <= dhi { tot += 1 }
+            }
+            return tot
+        }
+        if w == 16 {
+            var tot = 0
+            var o = data + 2 * from
+            for q in 0..cnt {
+                let v = base +% u16At(s, o)
+                if v >= lo && v <= hi { tot += 1 }
+                o += 2
+            }
+            return tot
+        }
+        let mask = (1 << w) - 1
+        let bp = from * w
+        var pos = data + (bp >> 3)
+        let sk = bp & 7
+        var acc = int(s[pos]) >> sk
+        var have = 8 - sk
+        pos += 1
+        var tot = 0
+        for q in 0..cnt {
+            while have < w {
+                acc = acc | (int(s[pos]) << have)
+                pos += 1
+                have += 8
+            }
+            let v = base +% (acc & mask)
+            if v >= lo && v <= hi { tot += 1 }
+            acc = acc >> w
+            have -= w
+        }
+        return tot
+    }
+    let wb = dir[x + F_W]
+    var o = dir[x + F_DATA] + wb * from
+    var tot = 0
+    if wb == 8 {
+        for q in 0..cnt {
+            let v = binary.readI64LEStr(s, o)
+            if v >= lo && v <= hi { tot += 1 }
+            o += 8
+        }
+    } else if wb == 4 {
+        for q in 0..cnt {
+            let v = binary.readI32LEStr(s, o)
+            if v >= lo && v <= hi { tot += 1 }
+            o += 4
+        }
+    } else {
+        for q in 0..cnt {
+            let v = binary.readI16LEStr(s, o)
+            if v >= lo && v <= hi { tot += 1 }
+            o += 2
+        }
+    }
+    return tot
+}
+
+fn utf8LenSpan(s: &str, lo: int, hi: int): int {
+    if lo >= hi { return 0 }
+    let sl = &s[lo..hi]
+    let n = len(sl)
+    var c = 0
+    var i = 0
+    let vMask = VB.splat(byte(0xc0))
+    let vCont = VB.splat(byte(0x80))
+    for v in VB.chunks(sl, mut &i) {
+        c += int(((v & vMask) != vCont).bitmask().countOnes())
+    }
+    if i < n {
+        let v = VB.loadPartial(sl, i, byte(0x80))
+        c += int(((v & vMask) != vCont).bitmask().countOnes())
+    }
+    return c
+}
+
+// Direct leaf-level SUM(length(col)) over rows from..from+cnt of text place p.
+// Returns None if p is not a text place (or unsupported codec); otherwise adds
+// non-NULL row count into outCnt and returns the exact UTF-8 character-length sum.
+pub fn sumStrLenCols(s: &str, dir: &[]int, p: int, from: int, cnt: int, outCnt: mut &int): Option[i128] {
+    if cnt <= 0 { return Some(i128(0)) }
+    if p < 0 || p >= places(dir) || kindOf(s, p) != K_TEXT { return None }
+    let x = DIR_HDR + D * p
+    let c = dir[x + F_CODEC]
+    let nulls = dir[x + F_NULLS] >= 0
+    if c == C_TEXT {
+        let offs = dir[x + F_DATA]
+        let bytes = dir[x + F_X]
+        if !nulls {
+            let bs = bytes + (if from == 0 { 0 } else { u16At(s, offs + 2 * (from - 1)) })
+            let be = bytes + u16At(s, offs + 2 * (from + cnt - 1))
+            outCnt += cnt
+            return Some(i128(utf8LenSpan(s, bs, be)))
+        }
+        var tot = i128(0)
+        var nc = 0
+        for q in 0..cnt {
+            let i = from + q
+            if isNull(s, dir, p, i) { continue }
+            let bs = bytes + (if i == 0 { 0 } else { u16At(s, offs + 2 * (i - 1)) })
+            let be = bytes + u16At(s, offs + 2 * i)
+            tot += i128(utf8LenSpan(s, bs, be))
+            nc += 1
+        }
+        outCnt += nc
+        return Some(tot)
+    }
+    if c == C_DICT {
+        let nd = dir[x + F_X]
+        var dlen: []int = array(nd, 0)
+        for j in 0..nd {
+            let sp = entryAt(s, dir, p, j)
+            dlen[j] = utf8LenSpan(s, spanStart(sp), spanEnd(sp))
+        }
+        var codes: []int = array(cnt, 0)
+        codesInto(s, dir, p, from, cnt, mut &codes, 0)
+        var tot = i128(0)
+        var nc = 0
+        if !nulls {
+            for q in 0..cnt { tot += i128(dlen[codes[q]]) }
+            outCnt += cnt
+            return Some(tot)
+        }
+        for q in 0..cnt {
+            if isNull(s, dir, p, from + q) { continue }
+            tot += i128(dlen[codes[q]])
+            nc += 1
+        }
+        outCnt += nc
+        return Some(tot)
+    }
+    return None
 }
 
 // ---- Runtime integer Bloom filter (register-blocked 64-bit words, 3 bits per key)

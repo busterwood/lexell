@@ -414,6 +414,7 @@ pub type BNode = closed {
     // constant on the left
     ValCmp(int, int, Val, bool, bool)
     Like(int, LikePat)      // a column of values LIKE (ILIKE) a constant pattern
+    Token(int, str, bool, bool) // has_token / has_token_ci (col, word, fold, txt)
     // a column IN a constant list too long for the OR chain: its values
     // sorted, and whether the list had a NULL (a no-match row is NULL)
     InVals(int, []Val, bool, bool)    // ... the last true: a BK_TEXT column
@@ -858,6 +859,21 @@ pub fn bCompileD(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, bas
                     else {}
                 }
             }
+            if (fr.name == "has_token" || fr.name == "hastoken" || fr.name == "has_token_ci" || fr.name == "hastokencaseinsensitive") && len(args) == 2 {
+                let c = bValCol(&args[0], kinds, base)
+                if c < 0 || !bxConst(&args[1]) { return None }
+                let none: []Val = []
+                let wv = match bxEval(&args[1], &none, &none, ce) {
+                    Ok(v) { v }
+                    Err(_) { return None }
+                }
+                if lexdb_ops.isNull(&wv) { return Some(BComp{n: BNode.Const(0, true), typ: BT_NULL}) }
+                let w0 = lexdb_sql.text(&wv)
+                if !lexdb_token.validToken(&w0) { return None }
+                let fold = fr.name == "has_token_ci" || fr.name == "hastokencaseinsensitive"
+                let w = if fold { strings.toLowerAscii(&w0) } else { w0 }
+                return Some(BComp{n: BNode.Token(c, w, fold, kinds[c + base] == BK_TEXT), typ: BT_BOOL})
+            }
             if (fr.name != "like" && fr.name != "ilike") || len(args) < 2 || len(args) > 3 { return None }
             let c = bValCol(&args[0], kinds, base)
             if c < 0 { return None }
@@ -1006,6 +1022,10 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
         BNode.Col(c) {
             var out = lexdb_rows.bvec(m)
             let src = &b.cols[c]
+            if m == len(src.v) {
+                lexdb_vec.copyColFull(&src.v, &src.nul, idx, mut &out.v, mut &out.nul)
+                return Ok(out)
+            }
             for j in 0..m {
                 let r = idx[j]
                 out.v[j] = src.v[r]
@@ -1237,6 +1257,26 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
                     }
                 } else {
                     try lexdb_lib.likeMatch(&(lexdb_sql.text(&b.vals[c][r])), &lp.pat, &lp.esc, lp.fold)
+                }
+                out.v[j] = if hit { 1 } else { 0 }
+            }
+            return Ok(out)
+        }
+        BNode.Token(c, w, fold, txt) {
+            var out = lexdb_rows.bvec(m)
+            for j in 0..m {
+                let r = idx[j]
+                if b.cols[c].nul[r] {
+                    out.nul[j] = true
+                    continue
+                }
+                let hit = if txt {
+                    lexdb_token.hasToken(lexdb_rows.textAt(b, c, r), &w, fold)
+                } else {
+                    match &b.vals[c][r] {
+                        Val.Text(x) { lexdb_token.hasToken(x, &w, fold) }
+                        else { lexdb_token.hasToken(&lexdb_sql.text(&b.vals[c][r]), &w, fold) }
+                    }
                 }
                 out.v[j] = if hit { 1 } else { 0 }
             }
@@ -1919,6 +1959,7 @@ fn bNoErr(n: &BNode, t: &lexdb_catalog.Table): bool {
         BNode.Cmp(_, a, b) { return bNoErr(&a, t) && bNoErr(&b, t) }
         BNode.DCmp(_, a, _, b, _) { return bNoErr(&a, t) && bNoErr(&b, t) }
         BNode.Like(_, _) { return true }
+        BNode.Token(_, _, _, _) { return true }
         BNode.InInts(_, _, _) { return true }
         BNode.ValCmp(_, c, k, _, _) { return lexdb_ops.isNull(&k) || t.cols[c].typ.kind == lexdb_ops.kindOf(&k) }
         BNode.VCmp(_, a, b, _, _) { return t.cols[a].typ.kind == t.cols[b].typ.kind }
@@ -2161,6 +2202,12 @@ fn leafKOf(n: &BNode, bp: &BPlan, t: &lexdb_catalog.Table): Option[lexdb_leafk.L
             }
             return None
         }
+        BNode.Token(c, w, fold, _) {
+            if lexdb_rows.placeKind(&t.cols[c]) == lexdb_rows.PK_TEXT {
+                return Some(lexdb_leafk.LeafK.Token(plOf(c), fold, false, w.clone()))
+            }
+            return None
+        }
         BNode.Not(inner) {
             match inner {
                 BNode.Like(c, lp) {
@@ -2168,6 +2215,11 @@ fn leafKOf(n: &BNode, bp: &BPlan, t: &lexdb_catalog.Table): Option[lexdb_leafk.L
                         var ps: []str = []
                         for p in lp.pieces { append(mut &ps, p.clone()) }
                         return Some(lexdb_leafk.LeafK.Like(plOf(c), lp.fold, true, ps))
+                    }
+                }
+                BNode.Token(c, w, fold, _) {
+                    if lexdb_rows.placeKind(&t.cols[c]) == lexdb_rows.PK_TEXT {
+                        return Some(lexdb_leafk.LeafK.Token(plOf(c), fold, true, w.clone()))
                     }
                 }
                 else {}
@@ -2461,6 +2513,15 @@ fn cSkipOf(n: &BNode, kinds: &[]int, t: &lexdb_catalog.Table, q: mut &lexdb_skip
                 append(mut &q.likePl, placeOfCol(t, c))
                 append(mut &q.likePieces, ps)
                 append(mut &q.likeFold, lp.fold)
+            }
+        }
+        BNode.Token(c, w, fold, _) {
+            if c >= 0 && c < len(t.cols) && t.cols[c].typ.kind == lexdb_sql.K_TEXT {
+                let ck = lexdb_sql.collKind(&t.cols[c].coll)
+                if ck != lexdb_sql.COLL_EXACT && ck != lexdb_sql.COLL_CI { return }
+                append(mut &q.tokPl, placeOfCol(t, c))
+                append(mut &q.tokRuns, w.clone())
+                append(mut &q.tokFlags, lexdb_skip.TF_START | lexdb_skip.TF_END | (if fold { lexdb_skip.TF_ASCII } else { 0 }))
             }
         }
         BNode.Gen(g) { cSkipBX(&g.cx, &g, t, q) }
@@ -2915,6 +2976,7 @@ pub fn bColsOf(n: &BNode, used: mut &[]bool) {
         BNode.IsNull(a, _) { bColsOf(&a, used) }
         BNode.ValCmp(_, c, _, _, _) { used[c] = true }
         BNode.Like(c, _) { used[c] = true }
+        BNode.Token(c, _, _, _) { used[c] = true }
         BNode.InVals(c, _, _, _) { used[c] = true }
         BNode.InInts(c, _, _) { used[c] = true }
         BNode.VCmp(_, a, b, _, _) {
@@ -16591,6 +16653,7 @@ fn canParBNode(n: &BNode): bool {
         BNode.IsNull(x, _) { return canParBNode(&x) }
         BNode.ValCmp(_, _, _, _, _) { return true }
         BNode.Like(_, _) { return true }
+        BNode.Token(_, _, _, _) { return true }
         BNode.InVals(_, _, _, _) { return true }
         BNode.InInts(_, _, _) { return true }
         BNode.VCmp(_, _, _, _, _) { return true }
@@ -16667,6 +16730,10 @@ fn bEvalPure(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
         BNode.Col(c) {
             var out = lexdb_rows.bvec(m)
             let src = &b.cols[c]
+            if m == len(src.v) {
+                lexdb_vec.copyColFull(&src.v, &src.nul, idx, mut &out.v, mut &out.nul)
+                return Ok(out)
+            }
             for j in 0..m {
                 let r = idx[j]
                 out.v[j] = src.v[r]
@@ -16881,6 +16948,26 @@ fn bEvalPure(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
                     }
                 } else {
                     try lexdb_lib.likeMatch(&(lexdb_sql.text(&b.vals[c][r])), &lp.pat, &lp.esc, lp.fold)
+                }
+                out.v[j] = if hit { 1 } else { 0 }
+            }
+            return Ok(out)
+        }
+        BNode.Token(c, w, fold, txt) {
+            var out = lexdb_rows.bvec(m)
+            for j in 0..m {
+                let r = idx[j]
+                if b.cols[c].nul[r] {
+                    out.nul[j] = true
+                    continue
+                }
+                let hit = if txt {
+                    lexdb_token.hasToken(lexdb_rows.textAt(b, c, r), &w, fold)
+                } else {
+                    match &b.vals[c][r] {
+                        Val.Text(x) { lexdb_token.hasToken(x, &w, fold) }
+                        else { lexdb_token.hasToken(&lexdb_sql.text(&b.vals[c][r]), &w, fold) }
+                    }
                 }
                 out.v[j] = if hit { 1 } else { 0 }
             }
@@ -17203,6 +17290,7 @@ fn markLeafKPlaces(k: &lexdb_leafk.LeafK, needPl: mut &[]bool, maxPl: mut &int) 
         lexdb_leafk.LeafK.Texts(_, pl, _) { markPlace(pl, needPl, maxPl) }
         lexdb_leafk.LeafK.Prefix(pl, _, _, _) { markPlace(pl, needPl, maxPl) }
         lexdb_leafk.LeafK.Like(pl, _, _, _) { markPlace(pl, needPl, maxPl) }
+        lexdb_leafk.LeafK.Token(pl, _, _, _) { markPlace(pl, needPl, maxPl) }
         lexdb_leafk.LeafK.IntBloom(pl, _, _) { markPlace(pl, needPl, maxPl) }
         lexdb_leafk.LeafK.All(ks) { for k2 in ks { markLeafKPlaces(&k2, needPl, maxPl) } }
         lexdb_leafk.LeafK.Any(ks) { for k2 in ks { markLeafKPlaces(&k2, needPl, maxPl) } }
@@ -18261,22 +18349,8 @@ fn parAggAccum(st: mut &ParAggState, specs: &[]BSpec, shareOf: &[]int, kinds: &[
                     if col >= 0 {
                         if col != sumCol {
                             sumCol = col
-                            sumColS = i128(0)
-                            sumColC = 0
-                            sumColMin = 9223372036854775807
-                            sumColMax = -9223372036854775807 - 1
                             sumColOk = true
-                            let cv = &b.cols[col].v
-                            let cn = &b.cols[col].nul
-                            for j in 0..len(idx) {
-                                let r = idx[j]
-                                if cn[r] { continue }
-                                let v = cv[r]
-                                if v < sumColMin { sumColMin = v }
-                                if v > sumColMax { sumColMax = v }
-                                sumColS += i128(v)
-                                sumColC += 1
-                            }
+                            sumColS = lexdb_vec.sumMinMaxI128Col(&b.cols[col].v, &b.cols[col].nul, idx, mut &sumColMin, mut &sumColMax, mut &sumColC)
                         }
                         if sumColOk {
                             if sumColC == 0 { continue }
@@ -18298,6 +18372,28 @@ fn parAggAccum(st: mut &ParAggState, specs: &[]BSpec, shareOf: &[]int, kinds: &[
                                 continue
                             }
                         }
+                    }
+                }
+                None {}
+            }
+        }
+        if one && (sp.kind == BA_MIN || sp.kind == BA_MAX) && sp.filter.isNone() && sp.vcol < 0 && sumColOk && sumCol >= 0 {
+            match &sp.arg {
+                Some(ax) {
+                    match ax {
+                        BNode.Col(c) {
+                            if c == sumCol {
+                                if sumColC > 0 {
+                                    let val = if sp.kind == BA_MAX { sumColMax } else { sumColMin }
+                                    if st.an[si][0] == 0 || (if sp.kind == BA_MAX { val > st.amm[si][0] } else { val < st.amm[si][0] }) {
+                                        st.amm[si][0] = val
+                                    }
+                                    st.an[si][0] += sumColC
+                                }
+                                continue
+                            }
+                        }
+                        else {}
                     }
                 }
                 None {}
@@ -18704,6 +18800,65 @@ fn parAggEat(st: mut &ParAggState, meta: &ParAggMeta, keys: &[]BComp, specs: &[]
     return Ok(true)
 }
 
+fn tryDirectCountLeaf(st: mut &ParAggState, meta: &ParAggMeta, specs: &[]BSpec, shareOf: &[]int,
+                      s: &str, dir: &[]int, from: int, leafCnt: int, k: &lexdb_leafk.LeafK): Result[bool, DbErr] {
+    match lexdb_leafk.countOfCols(s, dir, from, leafCnt, k) {
+        Some(hits) {
+            st.nRead += leafCnt
+            st.kernRuns += 1
+            if hits > 0 {
+                st.nJoined += hits
+                if st.ngroups == 0 {
+                    st.ngroups += 1
+                    st.added += 32 + 64 * (meta.ns + 1)
+                    if meta.room >= 0 && st.added > meta.room { return Err(memErr(meta.maxHeld)) }
+                    parNewGroup(st, specs)
+                }
+                for si in 0..len(specs) {
+                    if shareOf[si] >= 0 { continue }
+                    st.an[si][0] += hits
+                }
+            }
+            return Ok(true)
+        }
+        None { return Ok(false) }
+    }
+}
+
+fn tryDirectStrLenLeaf(st: mut &ParAggState, meta: &ParAggMeta, specs: &[]BSpec, shareOf: &[]int,
+                       strLenPl: &[]int, s: &str, dir: &[]int, from: int, leafCnt: int): Result[bool, DbErr] {
+    var sums: []i128 = array(len(specs), i128(0))
+    var cnts: []int = array(len(specs), 0)
+    for si in 0..len(specs) {
+        if shareOf[si] >= 0 { continue }
+        let p = strLenPl[si]
+        if p < 0 { continue }
+        var nc = 0
+        match lexdb_rows.colSumStrLen(s, dir, p, from, leafCnt, mut &nc) {
+            Some(tot) { sums[si] = tot; cnts[si] = nc }
+            None { return Ok(false) }
+        }
+    }
+    st.nRead += leafCnt
+    st.nJoined += leafCnt
+    if st.ngroups == 0 {
+        st.ngroups += 1
+        st.added += 32 + 64 * (meta.ns + 1)
+        if meta.room >= 0 && st.added > meta.room { return Err(memErr(meta.maxHeld)) }
+        parNewGroup(st, specs)
+    }
+    for si in 0..len(specs) {
+        if shareOf[si] >= 0 { continue }
+        if strLenPl[si] >= 0 {
+            st.adec[si][0] += sums[si]
+            st.an[si][0] += cnts[si]
+        } else {
+            st.an[si][0] += leafCnt
+        }
+    }
+    return Ok(true)
+}
+
 fn parAggWorker(slab: &str, leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int,
                 fleafBatches: &[]Batch, flo: int, fhi: int, bp: &BPlan, lz: &Lazy, rw: &lexdb_rows.Rows,
                 bconds: &[]BNode, meta: &ParAggMeta, keys: &[]BComp, specs: &[]BSpec,
@@ -18739,13 +18894,66 @@ fn parAggWorker(slab: &str, leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int,
             }
         }
     }
+    var dir: []int = []
+    var directCountOnly = meta.nkeys == 0 && len(fcols) == 0 && !meta.havOn && len(lz.raw) == 0 && len(lz.kern) == 1
+    if directCountOnly {
+        for ci in 0..len(bconds) {
+            if ci >= len(lz.skipK) || !lz.skipK[ci] { directCountOnly = false; break }
+        }
+    }
+    if directCountOnly {
+        for si in 0..len(specs) {
+            if shareOf[si] >= 0 { continue }
+            if specs[si].kind != BA_STAR || specs[si].filter.isSome() { directCountOnly = false; break }
+        }
+    }
+    var directStrLen = meta.nkeys == 0 && len(fcols) == 0 && !meta.havOn && len(bconds) == 0 && len(lz.raw) == 0
+    var strLenPl: []int = array(len(specs), -1)
+    if directStrLen {
+        var anyStrLen = false
+        for si in 0..len(specs) {
+            if shareOf[si] >= 0 { continue }
+            let sp = &specs[si]
+            if sp.filter.isSome() { directStrLen = false; break }
+            if sp.kind == BA_STAR { continue }
+            if (sp.kind == BA_SUM || sp.kind == BA_AVG) && sp.vcol < 0 && sp.dsc < 0 {
+                match &sp.arg {
+                    Some(ax) {
+                        match ax {
+                            BNode.StrLen(col) {
+                                if col >= 0 && col < len(bp.kinds) && bp.kinds[col] == BK_TEXT {
+                                    var foundPl = -1
+                                    for p in bp.usedP {
+                                        if p < len(bp.placeCol) && bp.placeCol[p] == col { foundPl = p; break }
+                                    }
+                                    if foundPl >= 0 {
+                                        strLenPl[si] = foundPl
+                                        anyStrLen = true
+                                        continue
+                                    }
+                                }
+                                directStrLen = false
+                                break
+                            }
+                            else { directStrLen = false; break }
+                        }
+                    }
+                    None { directStrLen = false; break }
+                }
+            } else {
+                directStrLen = false
+                break
+            }
+        }
+        if !anyStrLen { directStrLen = false }
+    }
     for li in lo..hi {
         let pl = &leaves[li]
         let s = &slab[pl.off..pl.off + pl.slen]
         if pl.kind == lexdb_access.PL_ANY {
             let dirOpt = lexdb_rows.parseAnyCols(s, pl.n)
             if dirOpt.isNone() { st.bail = true; return st }
-            let dir = dirOpt.unwrap()
+            let anyDir = dirOpt.unwrap()
             let useLazy = lz.on && len(lz.br.usedP) > 0
             let bp0 = if useLazy { &lz.bf } else { bp }
             var k = pl.from
@@ -18768,7 +18976,7 @@ fn parAggWorker(slab: &str, leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int,
                 var rowAt: []int = withCapacity(take)
                 var nIn = 0
                 for q in 0..take {
-                    let rowS = lexdb_rows.anyRowBytes(s, &dir, k + q)
+                    let rowS = lexdb_rows.anyRowBytes(s, &anyDir, k + q)
                     if allowSkipApart && lexdb_rows.rowNeedsStore(rowS, bp) { continue }
                     let dstR = r0 + nIn
                     match lexdb_rows.decodeRow(rowS, dstR, mut &b, bp0, rw) {
@@ -18796,7 +19004,7 @@ fn parAggWorker(slab: &str, leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int,
                     if useLazy && len(ch) > 0 {
                         for r in ch {
                             let origRow = rowAt[r - r0]
-                            match lexdb_rows.decodeRow(lexdb_rows.anyRowBytes(s, &dir, origRow), r, mut &b, &lz.br, rw) {
+                            match lexdb_rows.decodeRow(lexdb_rows.anyRowBytes(s, &anyDir, origRow), r, mut &b, &lz.br, rw) {
                                 Ok(code) { if code != 0 { st.bail = true; return st } }
                                 Err(x) { st.err = Some(x); return st }
                             }
@@ -18810,10 +19018,21 @@ fn parAggWorker(slab: &str, leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int,
             }
             continue
         }
-        let dirOpt = lexdb_rows.parseLeafCols(s, pl.n, needPl, maxPl)
-        if dirOpt.isNone() { st.bail = true; return st }
-        let dir = dirOpt.unwrap()
+        if !lexdb_rows.parseLeafColsInto(s, pl.n, needPl, maxPl, mut &dir) { st.bail = true; return st }
         let np = lexdb_rows.colPlaces(&dir)
+        let leafCnt = pl.to - pl.from
+        if directCountOnly && leafCnt > 0 {
+            match tryDirectCountLeaf(mut &st, meta, specs, shareOf, s, &dir, pl.from, leafCnt, &lz.kern[0]) {
+                Ok(done) { if done { continue } }
+                Err(x) { st.err = Some(x); return st }
+            }
+        }
+        if directStrLen && leafCnt > 0 {
+            match tryDirectStrLenLeaf(mut &st, meta, specs, shareOf, &strLenPl, s, &dir, pl.from, leafCnt) {
+                Ok(done) { if done { continue } }
+                Err(x) { st.err = Some(x); return st }
+            }
+        }
         var k = pl.from
         while k < pl.to {
             if b.n == lexdb_rows.BROWS {
