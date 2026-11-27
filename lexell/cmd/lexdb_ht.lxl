@@ -105,6 +105,11 @@ fn (t: mut &FastIntCount) grow() {
 
 // Increments count for key k; returns true if k was newly inserted.
 pub fn (t: mut &FastIntCount) inc(k: int): bool {
+    return t.addW(k, 1)
+}
+
+pub fn (t: mut &FastIntCount) addW(k: int, w: int): bool {
+    if w == 0 { return false }
     let cap = len(t.slots) / 2
     if cap == 0 || (t.len + 1) * 10 >= cap * 6 {
         t.grow()
@@ -118,12 +123,12 @@ pub fn (t: mut &FastIntCount) inc(k: int): bool {
         let v = t.slots[base + 1]
         if v == 0 {
             t.slots[base] = k
-            t.slots[base + 1] = 1
+            t.slots[base + 1] = w
             t.len += 1
             return true
         }
         if t.slots[base] == k {
-            t.slots[base + 1] = v + 1
+            t.slots[base + 1] = v + w
             return false
         }
         sl = (sl + 1) & mask
@@ -630,6 +635,192 @@ pub type FastInt2Count = record {
     len: int
     bf: []u64
     bfMask: int
+}
+
+// 16-byte/slot [k0, k1] set for MK_ANTI JK_INT2_64 joins (33% smaller than FastInt2Count; fits closer to L3!).
+const SET2_EMPTY = -9223372036854775807 - 1
+
+pub type FastInt2Set = record {
+    slots: []int        // interleaved [k0, k1] per slot (k0 == SET2_EMPTY means empty)
+    mask: int
+    len: int
+    minK1: []int        // overflow for rare k0 == SET2_EMPTY keys
+    bf: []u64
+    bfMask: int
+}
+
+pub fn newFastInt2Set(): FastInt2Set {
+    return FastInt2Set{slots: [], mask: 0, len: 0, minK1: [], bf: [], bfMask: -1}
+}
+
+pub fn (t: &FastInt2Set) size(): int { return t.len }
+
+fn (t: mut &FastInt2Set) grow() {
+    let cap = if len(t.slots) == 0 { 1024 } else { len(t.slots) }
+    let mask = cap - 1
+    var ns: []int = array(cap * 2, SET2_EMPTY)
+    var i = 0
+    let nOld = len(t.slots)
+    while i < nOld {
+        let k0 = t.slots[i]
+        if k0 != SET2_EMPTY {
+            let k1 = t.slots[i + 1]
+            var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
+            h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
+            h = h ^ (h >> 31)
+            var sl = h & mask
+            while ns[sl * 2] != SET2_EMPTY { sl = (sl + 1) & mask }
+            let base = sl * 2
+            ns[base] = k0
+            ns[base + 1] = k1
+        }
+        i += 2
+    }
+    t.slots = ns
+    t.mask = mask
+}
+
+pub fn (t: mut &FastInt2Set) add(k0: int, k1: int): bool {
+    if k0 == SET2_EMPTY {
+        for x in t.minK1 { if x == k1 { return false } }
+        append(mut &t.minK1, k1)
+        t.len += 1
+        return true
+    }
+    let cap = len(t.slots) / 2
+    if cap == 0 || (t.len + 1) * 10 >= cap * 6 {
+        t.grow()
+    }
+    let mask = t.mask
+    var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
+    h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
+    h = h ^ (h >> 31)
+    var sl = h & mask
+    while true {
+        let base = sl * 2
+        let s0 = t.slots[base]
+        if s0 == SET2_EMPTY {
+            t.slots[base] = k0
+            t.slots[base + 1] = k1
+            t.len += 1
+            return true
+        }
+        if s0 == k0 && t.slots[base + 1] == k1 { return false }
+        sl = (sl + 1) & mask
+    }
+    return false
+}
+
+pub fn (t: mut &FastInt2Set) buildFilter(room: int) {
+    let words = bloomWords(t.len, room)
+    if words == 0 { return }
+    let bm = words - 1
+    var bf: []u64 = array(words, u64(0))
+    var i = 0
+    let n = len(t.slots)
+    while i < n {
+        let k0 = t.slots[i]
+        if k0 != SET2_EMPTY {
+            var h = (k0 *% 0x517cc1b727220a95) ^ (t.slots[i + 1] *% 0x2545f4914f6cdd1d)
+            h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
+            h = h ^ (h >> 31)
+            let wi = h & bm
+            let b = (u64(1) << ((h >> 24) & 63)) |
+                    (u64(1) << ((h >> 30) & 63)) |
+                    (u64(1) << ((h >> 36) & 63))
+            bf[wi] = bf[wi] | b
+        }
+        i += 2
+    }
+    for k1 in t.minK1 {
+        var h = (SET2_EMPTY *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
+        h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
+        h = h ^ (h >> 31)
+        let wi = h & bm
+        let b = (u64(1) << ((h >> 24) & 63)) |
+                (u64(1) << ((h >> 30) & 63)) |
+                (u64(1) << ((h >> 36) & 63))
+        bf[wi] = bf[wi] | b
+    }
+    t.bf = bf
+    t.bfMask = bm
+}
+
+pub fn (t: &FastInt2Set) has(k0: int, k1: int): bool {
+    if t.len == 0 { return false }
+    if k0 == SET2_EMPTY {
+        for x in t.minK1 { if x == k1 { return true } }
+        return false
+    }
+    var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
+    h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
+    h = h ^ (h >> 31)
+    if t.bfMask >= 0 {
+        let b = (u64(1) << ((h >> 24) & 63)) |
+                (u64(1) << ((h >> 30) & 63)) |
+                (u64(1) << ((h >> 36) & 63))
+        if (t.bf[h & t.bfMask] & b) != b { return false }
+    }
+    let mask = t.mask
+    var sl = h & mask
+    while true {
+        let base = sl * 2
+        let s0 = t.slots[base]
+        if s0 == SET2_EMPTY { return false }
+        if s0 == k0 && t.slots[base + 1] == k1 { return true }
+        sl = (sl + 1) & mask
+    }
+    return false
+}
+
+// Vectorized batch terminal anti-join probe for JK_INT2_64 using compact 16B/slot FastInt2Set.
+pub fn (t: &FastInt2Set) sumLastAntiW(at0: &[]int, at1: &[]int, kv0: &[]int, nul0: &[]bool,
+                                      kv1: &[]int, nul1: &[]bool, ws: &[]int, n: int,
+                                      acc: mut &int, matched: mut &int) {
+    let tLen = t.len
+    let mask = t.mask
+    let bfMask = t.bfMask
+    let hasBf = bfMask >= 0
+    var a = 0
+    var mat = 0
+    for r in 0..n {
+        let wr = ws[r]
+        if wr == 0 { continue }
+        let sr0 = at0[r]
+        let sr1 = at1[r]
+        var hit = false
+        if tLen > 0 && sr0 >= 0 && sr1 >= 0 && !nul0[sr0] && !nul1[sr1] {
+            let k0 = kv0[sr0]
+            let k1 = kv1[sr1]
+            if k0 == SET2_EMPTY {
+                for x in t.minK1 { if x == k1 { hit = true; break } }
+            } else {
+                var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
+                h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
+                h = h ^ (h >> 31)
+                var ok = true
+                if hasBf {
+                    let b = (u64(1) << ((h >> 24) & 63)) |
+                            (u64(1) << ((h >> 30) & 63)) |
+                            (u64(1) << ((h >> 36) & 63))
+                    if (t.bf[h & bfMask] & b) != b { ok = false }
+                }
+                if ok {
+                    var sl = h & mask
+                    while true {
+                        let base = sl * 2
+                        let s0 = t.slots[base]
+                        if s0 == SET2_EMPTY { break }
+                        if s0 == k0 && t.slots[base + 1] == k1 { hit = true; break }
+                        sl = (sl + 1) & mask
+                    }
+                }
+            }
+        }
+        if !hit { a += wr } else { mat += wr }
+    }
+    acc += a
+    matched += mat
 }
 
 pub fn newFastInt2Count(): FastInt2Count {
@@ -1691,6 +1882,55 @@ pub fn (t: &TwoLevelArena) probeTextBatch(buf: &str, words: &[]int, nul: &[]bool
                 outGid[j] = outGid[dj]
                 outHash[j] = outHash[dj]
             }
+        }
+    }
+}
+
+// Batch-grouped cache-friendly probe for encoded composite keys packed in a single flat buffer `buf`
+// (entry j is buf[off[j] .. off[j] + slen[j]]). Radix-scatters across 256 L2 buckets when two-level.
+pub fn (t: &TwoLevelArena) probeBufBatch(buf: &str, off: &[]int, slen: &[]int, nc: int,
+                                         outHash: mut &[]u64, outGid: mut &[]int) {
+    if !t.twoLevel {
+        for j in 0..nc {
+            let a = off[j]
+            let sl = &buf[a..a + slen[j]]
+            let h = hashStr(sl)
+            outHash[j] = h
+            outGid[j] = t.l1.find(sl, h)
+        }
+        return
+    }
+    var cnt: []int = array(NBUCKETS, 0)
+    for j in 0..nc {
+        let a = off[j]
+        let h = hashStr(&buf[a..a + slen[j]])
+        outHash[j] = h
+        cnt[bucketOf(h)] += 1
+    }
+    var boff: []int = array(NBUCKETS, 0)
+    var total = 0
+    for b in 0..NBUCKETS { boff[b] = total; total += cnt[b] }
+    var pos = collections.copyOf(&boff)
+    var ord: []int = array(total, 0)
+    for j in 0..nc {
+        let b = bucketOf(outHash[j])
+        ord[pos[b]] = j
+        pos[b] += 1
+    }
+    for b in 0..NBUCKETS {
+        let n = cnt[b]
+        if n == 0 { continue }
+        let st = boff[b]
+        let bk = &t.bkts[b]
+        let cap = len(bk.ht)
+        if cap == 0 {
+            for p in st..(st + n) { outGid[ord[p]] = -1 }
+            continue
+        }
+        for p in st..(st + n) {
+            let j = ord[p]
+            let a = off[j]
+            outGid[j] = bk.find(&buf[a..a + slen[j]], outHash[j])
         }
     }
 }

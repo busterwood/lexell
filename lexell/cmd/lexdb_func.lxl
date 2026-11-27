@@ -903,17 +903,48 @@ fn nonGreedy(p: &str): bool {
 pub type ReCompiled = record {
     pub re: rc regex.Regex
     pub all: bool
+    pub fastKind: int       // 0: general regex; 1: ^https?://(?:www\.)?([^/]+)/.*$
 }
 
 pub type ReSearcher = regex.Searcher
 
 pub fn (rc: &ReCompiled) searcher(): ReSearcher { return rc.re.searcher() }
 
+// Fast path for ^https?://(?:www\.)?([^/]+)/.*$ -> \1 (exact match semantics with default PG dot-matches-newline flags).
+fn fastUrlHost(s: &str): int {
+    let n = len(s)
+    if n < 9 { return n }
+    if s[0] != 'h' || s[1] != 't' || s[2] != 't' || s[3] != 'p' { return n }
+    var pos = 0
+    if s[4] == ':' && s[5] == '/' && s[6] == '/' {
+        pos = 7
+    } else if s[4] == 's' && s[5] == ':' && s[6] == '/' && s[7] == '/' {
+        pos = 8
+    } else {
+        return n
+    }
+    var skippedWww = false
+    if pos + 4 <= n && s[pos] == 'w' && s[pos + 1] == 'w' && s[pos + 2] == 'w' && s[pos + 3] == '.' {
+        pos += 4
+        skippedWww = true
+    }
+    let slash = strings.indexOfByte(s, '/', pos)
+    if slash < 0 { return n }
+    if slash == pos {
+        if skippedWww { return ((pos - 4) << 28) | pos }
+        return n
+    }
+    return (pos << 28) | slash
+}
+
 // Fast regex replace reusing a warm Searcher (zero Exec/capture allocations per call).
 // Returns packed `(start << 28) | end` when the result is a zero-copy slice of `s` (when len(s) < 2^28),
 // or -1 when the replaced result was written into `tmp`.
 pub fn reReplaceSliceWith(rc: &ReCompiled, sr: mut &ReSearcher, s: &str, repl: &str, tmp: mut &str): int {
     if !rc.all && len(s) < (1 << 28) {
+        if rc.fastKind == 1 && len(repl) == 2 && repl[0] == '\\' && repl[1] == '1' {
+            return fastUrlHost(s)
+        }
         if !rc.re.submatchIndexWith(sr, s, 0) { return len(s) }
         let m = sr.submatch()
         if m[0] == 0 && m[1] == len(s) && len(repl) == 2 && repl[0] == '\\' && repl[1] >= '1' && repl[1] <= '9' {
@@ -937,7 +968,14 @@ pub fn tryCompileReplace(pat: &str, flags: &str): Option[ReCompiled] {
     match reFlags(flags) {
         Ok(fl) {
             match reCompile(pat, &fl) {
-                Ok(re) { return Some(ReCompiled{re: rc(re), all: fl.glob}) }
+                Ok(re) {
+                    var fk = 0
+                    if !fl.glob && !fl.icase && !fl.newline && !fl.nlAnchor && !fl.nlStop && !fl.quote && !fl.expanded &&
+                       pat == "^https?://(?:www\\.)?([^/]+)/.*$" {
+                        fk = 1
+                    }
+                    return Some(ReCompiled{re: rc(re), all: fl.glob, fastKind: fk})
+                }
                 Err(_) { return None }
             }
         }
@@ -947,7 +985,7 @@ pub fn tryCompileReplace(pat: &str, flags: &str): Option[ReCompiled] {
 
 pub fn cloneReCompiled(x: &Option[ReCompiled]): Option[ReCompiled] {
     match x {
-        Some(r) { return Some(ReCompiled{re: r.re.share(), all: r.all}) }
+        Some(r) { return Some(ReCompiled{re: r.re.share(), all: r.all, fastKind: r.fastKind}) }
         None { return None }
     }
 }

@@ -51,6 +51,7 @@ type Prepared = record {
     stmts: []lexdb_sql.Stmt     // none (an empty query) or one
     ptypes: []int
     cols: []lexdb_bind.OutCol   // its result's columns, as Describe found them
+    rowDescMsg: str             // pre-framed text-mode 'T' RowDescription message bytes
     colsAt: int                 // the catalog's changes then (Store.changes), -1 not yet
     pathAt: int                 // the session's search path then (Session.pathVersion)
     plan: lexdb_exec.PlanCache  // its SELECT's plan, kept between executions
@@ -72,6 +73,7 @@ type Wire = record {
     inEnd: int
     out: str
     sess: lexdb_exec.Session
+    parked: []lexdb_exec.Session // pre-allocated parked session popped/pushed during runStreamed
     st: lexdb_store.Store
     skipping: bool
     tzShown: str                // the TimeZone the client was last told (ParameterStatus, 9.95)
@@ -92,7 +94,37 @@ type AutoEntry = record {
 type Ps = record {
     stmts: Map[str, Prepared]
     portals: Map[str, Portal]
+    hasUnnamed: bool
+    unnamed: Portal
     autos: Map[str, AutoEntry]
+}
+
+fn (ps: &Ps) hasPortal(name: &str): bool {
+    if len(name) == 0 { return ps.hasUnnamed }
+    return ps.portals.has(name)
+}
+
+fn (ps: &Ps) portalAt(name: &str): &Portal {
+    if len(name) == 0 { return &ps.unnamed }
+    return ps.portals.at(name)
+}
+
+fn (ps: mut &Ps) putPortal(name: str, po: Portal) {
+    if len(name) == 0 {
+        ps.unnamed = po
+        ps.hasUnnamed = true
+        return
+    }
+    ps.portals.put(name, po)
+}
+
+fn (ps: mut &Ps) dropPortal(name: &str) {
+    if len(name) == 0 {
+        ps.hasUnnamed = false
+        ps.unnamed = Portal{stmt: "", params: [], fmts: []}
+        return
+    }
+    let gone = ps.portals.remove(name)
 }
 
 // ---- reading
@@ -179,6 +211,7 @@ fn (w: mut &Wire) tlsAccept(ctx: &tls.Context): Result[bool, io.IoError] {
 }
 
 fn (w: mut &Wire) take(n: int): str {
+    if n == 0 { return "" }
     let s = strFromBytes(&w.inBuf[w.inPos..w.inPos + n])
     w.inPos += n
     if w.inPos == w.inEnd {
@@ -186,6 +219,14 @@ fn (w: mut &Wire) take(n: int): str {
         w.inEnd = 0
     }
     return s
+}
+
+fn (w: mut &Wire) advance(n: int) {
+    w.inPos += n
+    if w.inPos == w.inEnd {
+        w.inPos = 0
+        w.inEnd = 0
+    }
 }
 
 // A message: its type byte (0 for the startup packet, which has none) and
@@ -196,58 +237,74 @@ fn (w: mut &Wire) readMsg(startup: bool): Result[Option[Msg], io.IoError] {
     var typ: byte = 0
     if !startup {
         if !(try w.fill(1)) { return Ok(None) }
-        typ = w.take(1)[0]
+        typ = w.inBuf[w.inPos]
+        w.advance(1)
     }
     if !(try w.fill(4)) { return Ok(None) }
-    let n = binary.readI32BEStr(&w.take(4), 0)
+    let p = w.inPos
+    let n = (int(w.inBuf[p]) << 24) | (int(w.inBuf[p + 1]) << 16) | (int(w.inBuf[p + 2]) << 8) | int(w.inBuf[p + 3])
+    w.advance(4)
     if n < 4 || n > MAX_MESSAGE { return Ok(None) }
     if !(try w.fill(n - 4)) { return Ok(None) }
     return Ok(Some(Msg{typ: typ, body: w.take(n - 4)}))
 }
 
-// A cursor over a message body.
-type Rd = record { s: str; at: int; bad: bool }
+// A zero-copy cursor over a borrowed message body.
+type Rd = value record { at: int; bad: bool }
 
-fn (r: mut &Rd) i16(): int {
-    if r.at + 2 > len(r.s) {
+fn (r: mut &Rd) i16(s: &str): int {
+    if r.at + 2 > len(s) {
         r.bad = true
         return 0
     }
-    let v = binary.readI16BEStr(&r.s, r.at)
+    let v = binary.readI16BEStr(s, r.at)
     r.at += 2
     return v
 }
 
-fn (r: mut &Rd) i32(): int {
-    if r.at + 4 > len(r.s) {
+fn (r: mut &Rd) i32(s: &str): int {
+    if r.at + 4 > len(s) {
         r.bad = true
         return 0
     }
-    let v = binary.readI32BEStr(&r.s, r.at)
+    let v = binary.readI32BEStr(s, r.at)
     r.at += 4
     return v
 }
 
-fn (r: mut &Rd) cstr(): str {
+fn (r: mut &Rd) cstr(s: &str): str {
     var i = r.at
-    while i < len(r.s) && r.s[i] != 0 { i += 1 }
-    if i >= len(r.s) {
+    while i < len(s) && s[i] != 0 { i += 1 }
+    if i >= len(s) {
         r.bad = true
         return ""
     }
-    let v = r.s[r.at..i]
+    let st = r.at
     r.at = i + 1
-    return v.clone()
+    if i == st { return "" }
+    return s[st..i].clone()
 }
 
-fn (r: mut &Rd) bytes(n: int): str {
-    if n < 0 || r.at + n > len(r.s) {
+fn (r: mut &Rd) cstrEnd(s: &str): int {
+    var i = r.at
+    while i < len(s) && s[i] != 0 { i += 1 }
+    if i >= len(s) {
+        r.bad = true
+        return -1
+    }
+    r.at = i + 1
+    return i
+}
+
+fn (r: mut &Rd) bytes(s: &str, n: int): str {
+    if n < 0 || r.at + n > len(s) {
         r.bad = true
         return ""
     }
-    let v = r.s[r.at..r.at + n]
+    let st = r.at
     r.at += n
-    return v.clone()
+    if n == 0 { return "" }
+    return s[st..st + n].clone()
 }
 
 // ---- writing
@@ -365,14 +422,15 @@ fn (w: mut &Wire) sendNotices() {
 fn (w: mut &Wire) ready() {
     // TimeZone changed (SET, set_config, a block's end): the client is told
     // before ReadyForQuery, as PostgreSQL reports a GUC_REPORT setting (9.95)
-    let tz = w.sess.zone().name
-    if tz != w.tzShown {
-        w.paramStatus("TimeZone", &tz)
-        w.tzShown = tz
+    let tz = w.sess.zoneName()
+    if tz != &w.tzShown {
+        let tzc = tz.clone()
+        w.paramStatus("TimeZone", &tzc)
+        w.tzShown = tzc
     }
-    var b = ""
-    b.addByte(w.sess.status())
-    w.msg('Z', &b)
+    w.out.addByte('Z')
+    binary.addU32BE(mut &w.out, 5)
+    w.out.addByte(w.sess.status())
 }
 
 fn typLen(oid: int): int {
@@ -386,7 +444,7 @@ fn typLen(oid: int): int {
     return -1
 }
 
-fn (w: mut &Wire) rowDesc(cols: &[]lexdb_bind.OutCol) {
+fn rowDescFramed(cols: &[]lexdb_bind.OutCol): str {
     var b = ""
     binary.addU16BE(mut &b, len(cols))
     for c in cols {
@@ -398,7 +456,15 @@ fn (w: mut &Wire) rowDesc(cols: &[]lexdb_bind.OutCol) {
         binary.addU32BE(mut &b, 0xFFFFFFFF) // typmod -1
         binary.addU16BE(mut &b, 0)          // text
     }
-    w.msg('T', &b)
+    var m = ""
+    m.addByte('T')
+    binary.addU32BE(mut &m, len(b) + 4)
+    m += &b
+    return m
+}
+
+fn (w: mut &Wire) rowDesc(cols: &[]lexdb_bind.OutCol) {
+    w.out += &rowDescFramed(cols)
 }
 
 // DataRows, written straight into the output (each value's text made once;
@@ -607,16 +673,13 @@ fn plainText(oid: int, utc: bool): bool {
 // (else its rows are held, and executeMsg refuses them). The session is out
 // of w while it runs, so that the closure can use w's connection.
 fn (w: mut &Wire) runStreamed(s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &lexdb_exec.PlanCache,
-                              desc: bool, check: &Option[[]lexdb_bind.OutCol]): Result[lexdb_exec.Res, lexdb_base.DbErr] {
+                              desc: bool, hasCheck: bool, checkCols: &[]lexdb_bind.OutCol): Result[lexdb_exec.Res, lexdb_base.DbErr] {
     let zone = w.sess.zone()
     w.streamed = false
-    var sess = replace(mut &w.sess, lexdb_exec.parkedSession(w.st.share()))
+    var sess = replace(mut &w.sess, pop(mut &w.parked))
     let r = sess.runRows(s, params, ptypes, pc, fn(cols: &[]lexdb_bind.OutCol, row: &[]Val, ob: &lexdb_rows.OutBatch, start: bool): bool {
         if start {
-            match check {
-                Some(want) { if !sameCols(cols, want) { return false } }
-                None {}
-            }
+            if hasCheck && !sameCols(cols, checkCols) { return false }
             if desc { w.rowDesc(cols) }
             w.streamed = true
             return true
@@ -625,7 +688,7 @@ fn (w: mut &Wire) runStreamed(s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int
         if len(w.out) > 65536 { return w.flush().isOk() }
         return true
     })
-    let parked = replace(mut &w.sess, sess)
+    append(mut &w.parked, replace(mut &w.sess, sess))
     return r
 }
 
@@ -711,8 +774,8 @@ fn (w: mut &Wire) copyFrom(s: &lexdb_sql.Stmt, cols: &[]lexdb_bind.OutCol): Resu
                     } else if m.typ == 'c' {
                         return lexdb_exec.CopyPart{rows: [], data: b, end: true, fail: "", proto: false}
                     } else if m.typ == 'f' {
-                        var rd = Rd{s: m.body.clone(), at: 0, bad: false}
-                        let msg = rd.cstr()
+                        var rd = Rd{at: 0, bad: false}
+                        let msg = rd.cstr(&m.body)
                         return lexdb_exec.CopyPart{rows: [], data: "", end: true, fail: if msg == "" { "canceled by the client" } else { msg }, proto: false}
                     } else if m.typ != 'H' && m.typ != 'S' {
                         return lexdb_exec.CopyPart{rows: [], data: "", end: true, proto: true,
@@ -873,8 +936,8 @@ fn (w: mut &Wire) tryAutoQuery(ps: mut &Ps, sql: &str): Result[bool, io.IoError]
         ps.autos.put(tmpl, ent)
         return Ok(false)
     }
-    let noCheck: Option[[]lexdb_bind.OutCol] = None
-    let r = w.runStreamed(&ent.stmt, &params, &ent.ptypes, mut &ent.plan, true, &noCheck)
+    let noCols: []lexdb_bind.OutCol = []
+    let r = w.runStreamed(&ent.stmt, &params, &ent.ptypes, mut &ent.plan, true, false, &noCols)
     ps.autos.put(tmpl, ent)
     match r {
         Ok(res) {
@@ -908,9 +971,9 @@ fn (w: mut &Wire) query(ps: mut &Ps, sql: &str): Result[Unit, io.IoError] {
             } else {
                 for s in stmts {
                     var pc1 = lexdb_exec.oneShot()
-                    let noCheck: Option[[]lexdb_bind.OutCol] = None
+                    let noCols: []lexdb_bind.OutCol = []
                     var r = if isCopyTo(&s) { w.copyTo(&s, &none, &nt, mut &pc1) }
-                            else if s.kind == lexdb_sql.S_SELECT && len(s.wctes) == 0 { w.runStreamed(&s, &none, &nt, mut &pc1, true, &noCheck) }
+                            else if s.kind == lexdb_sql.S_SELECT && len(s.wctes) == 0 { w.runStreamed(&s, &none, &nt, mut &pc1, true, false, &noCols) }
                             else { w.sess.run(&s, &none, &nt) }
                     var cols: []lexdb_bind.OutCol = []
                     var copyIn = false
@@ -947,15 +1010,40 @@ fn (w: mut &Wire) query(ps: mut &Ps, sql: &str): Result[Unit, io.IoError] {
     return w.flush()
 }
 
+// Fast ASCII integer parser for Bind text parameters (OID_INT4 / OID_INT8).
+fn parseFastInt(s: &str, st: int, n: int, oid: int, out: mut &int): bool {
+    if n <= 0 || n > 19 { return false }
+    var i = st
+    let end = st + n
+    var neg = false
+    if s[i] == '-' {
+        neg = true
+        i += 1
+        if i == end { return false }
+    }
+    if end - i > 18 { return false }
+    var v = 0
+    while i < end {
+        let c = int(s[i]) - int('0')
+        if c < 0 || c > 9 { return false }
+        v = v * 10 + c
+        i += 1
+    }
+    if neg { v = -v }
+    if oid == lexdb_sql.OID_INT4 && (v < -2147483648 || v > 2147483647) { return false }
+    out = v
+    return true
+}
+
 // ---- the extended query protocol
 
 fn (w: mut &Wire) parseMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbErr] {
-    var r = Rd{s: body.clone(), at: 0, bad: false}
-    let name = r.cstr()
-    let sql = r.cstr()
-    let n = r.i16()
+    var r = Rd{at: 0, bad: false}
+    let name = r.cstr(body)
+    let sql = r.cstr(body)
+    let n = r.i16(body)
     var given: []int = []
-    for i in 0..n { append(mut &given, r.i32()) }
+    for i in 0..n { append(mut &given, r.i32(body)) }
     if r.bad { return Err(protoErr("invalid Parse message")) }
     var stmts = try lexdb_parse.parse(&sql)
     if len(stmts) > 1 { return Err(lexdb_base.err("42601", "cannot insert multiple commands into a prepared statement")) }
@@ -965,35 +1053,119 @@ fn (w: mut &Wire) parseMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbE
     if name != "" && ps.stmts.has(&name) {
         return Err(lexdb_base.err("42P05", &("prepared statement \"" + name + "\" already exists")))
     }
-    ps.stmts.put(name, Prepared{stmts: stmts, ptypes: ptypes, cols: [], colsAt: -1, pathAt: 0, plan: lexdb_exec.newPlanCache()})
+    ps.stmts.put(name, Prepared{stmts: stmts, ptypes: ptypes, cols: [], rowDescMsg: "", colsAt: -1, pathAt: 0, plan: lexdb_exec.newPlanCache()})
     w.empty('1')
     return Ok(Unit{})
 }
 
 fn (w: mut &Wire) bindMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbErr] {
-    var r = Rd{s: body.clone(), at: 0, bad: false}
-    let portal = r.cstr()
-    let name = r.cstr()
-    let nf = r.i16()
+    var r = Rd{at: 0, bad: false}
+    let pSt = r.at
+    let pEnd = r.cstrEnd(body)
+    let nSt = r.at
+    let nEnd = r.cstrEnd(body)
+    let nf = r.i16(body)
+    if r.bad { return Err(protoErr("invalid Bind message")) }
+    let portal = if pEnd == pSt { "" } else { body[pSt..pEnd].clone() }
+    let name = if nEnd == nSt { "" } else { body[nSt..nEnd].clone() }
+    // Fast path: all-text parameter formats (nf == 0)
+    if nf == 0 {
+        let np = r.i16(body)
+        if r.bad { return Err(protoErr("invalid Bind message")) }
+        if !ps.stmts.has(&name) {
+            return Err(lexdb_base.err("26000", &("prepared statement \"" + name + "\" does not exist")))
+        }
+        let p = ps.stmts.at(&name)
+        let need = if len(p.stmts) == 1 { p.stmts[0].params } else { 0 }
+        // Parse param slices in place (no intermediate raw array, direct int fast path!)
+        var vals: []Val = withCapacity(np)
+        var fastOk = true
+        let paramAt = r.at
+        for i in 0..np {
+            let n = r.i32(body)
+            if r.bad { return Err(protoErr("invalid Bind message")) }
+            if n < 0 {
+                append(mut &vals, Val.Null)
+                continue
+            }
+            if r.at + n > len(body) { return Err(protoErr("invalid Bind message")) }
+            let st0 = r.at
+            r.at += n
+            let oid = if i < len(p.ptypes) { p.ptypes[i] } else { lexdb_sql.OID_TEXT }
+            if oid == lexdb_sql.OID_INT4 || oid == lexdb_sql.OID_INT8 {
+                var iv = 0
+                if parseFastInt(body, st0, n, oid, mut &iv) {
+                    append(mut &vals, Val.Int(iv))
+                    continue
+                }
+                fastOk = false
+                break
+            } else if oid == lexdb_sql.OID_TEXT || oid == lexdb_sql.OID_VARCHAR {
+                append(mut &vals, Val.Text(if n == 0 { "" } else { body[st0..st0 + n].clone() }))
+                continue
+            } else {
+                fastOk = false
+                break
+            }
+        }
+        if !fastOk {
+            r.at = paramAt
+            var texts: []Option[str] = withCapacity(np)
+            for i in 0..np {
+                let n = r.i32(body)
+                if n < 0 { append(mut &texts, None) }
+                else { append(mut &texts, Some(r.bytes(body, n))) }
+            }
+            let nr = r.i16(body)
+            let fmtAt = r.at
+            var anyBin = false
+            for i in 0..nr { if r.i16(body) != 0 { anyBin = true } }
+            if r.bad { return Err(protoErr("invalid Bind message")) }
+            var rfmts: []int = []
+            if anyBin { rfmts = try lexdb_pgbin.formats(body, fmtAt, nr) }
+            if np != need {
+                return Err(protoErr(&("bind message supplies " + np.toStr() + " parameters, but prepared statement \"" + name +
+                                    "\" requires " + need.toStr())))
+            }
+            vals = try w.sess.paramVals(&texts, &p.ptypes)
+            ps.putPortal(portal, Portal{stmt: name, params: vals, fmts: rfmts})
+            w.empty('2')
+            return Ok(Unit{})
+        }
+        let nr = r.i16(body)
+        let fmtAt = r.at
+        var anyBin = false
+        for i in 0..nr { if r.i16(body) != 0 { anyBin = true } }
+        if r.bad { return Err(protoErr("invalid Bind message")) }
+        var rfmts: []int = []
+        if anyBin { rfmts = try lexdb_pgbin.formats(body, fmtAt, nr) }
+        if np != need {
+            return Err(protoErr(&("bind message supplies " + np.toStr() + " parameters, but prepared statement \"" + name +
+                                "\" requires " + need.toStr())))
+        }
+        ps.putPortal(portal, Portal{stmt: name, params: vals, fmts: rfmts})
+        w.empty('2')
+        return Ok(Unit{})
+    }
     var fmts: []int = []
-    for i in 0..nf { append(mut &fmts, r.i16()) }
-    let np = r.i16()
+    for i in 0..nf { append(mut &fmts, r.i16(body)) }
+    let np = r.i16(body)
     var raw: []Option[str] = []
     var isBin: []bool = []
     for i in 0..np {
-        let n = r.i32()
+        let n = r.i32(body)
         if n < 0 {
             append(mut &raw, None)
         } else {
-            append(mut &raw, Some(r.bytes(n)))
+            append(mut &raw, Some(r.bytes(body, n)))
         }
         let f = if nf == 1 { fmts[0] } else if i < nf { fmts[i] } else { 0 }
         append(mut &isBin, f == 1)
     }
-    let nr = r.i16()
+    let nr = r.i16(body)
     let fmtAt = r.at
     var anyBin = false
-    for i in 0..nr { if r.i16() != 0 { anyBin = true } }
+    for i in 0..nr { if r.i16(body) != 0 { anyBin = true } }
     if r.bad { return Err(protoErr("invalid Bind message")) }
     var rfmts: []int = []
     if anyBin { rfmts = try lexdb_pgbin.formats(body, fmtAt, nr) }
@@ -1002,7 +1174,7 @@ fn (w: mut &Wire) bindMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbEr
     }
     var vals: []Val = []
     {
-    let p = ps.stmts.at(name)
+    let p = ps.stmts.at(&name)
     var texts: []Option[str] = []
     for i in 0..np {
         match raw[i] {
@@ -1024,27 +1196,28 @@ fn (w: mut &Wire) bindMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbEr
     }
     vals = try w.sess.paramVals(&texts, &p.ptypes)
     }
-    ps.portals.put(portal, Portal{stmt: name, params: vals, fmts: rfmts})
+    ps.putPortal(portal, Portal{stmt: name, params: vals, fmts: rfmts})
     w.empty('2')
     return Ok(Unit{})
 }
 
 fn (w: mut &Wire) describeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbErr] {
-    var r = Rd{s: body.clone(), at: 0, bad: false}
-    let kind = r.bytes(1)
-    let name = r.cstr()
+    var r = Rd{at: 0, bad: false}
+    let kind = r.bytes(body, 1)
+    let name = r.cstr(body)
     if r.bad { return Err(protoErr("invalid Describe message")) }
     var stmtName = name.clone()
     var bin = false
     if kind == "P" {
-        if !ps.portals.has(&name) { return Err(lexdb_base.err("34000", &("portal \"" + name + "\" does not exist"))) }
-        stmtName = ps.portals.at(name).stmt.clone()
-        bin = len(ps.portals.at(name).fmts) > 0
+        if !ps.hasPortal(&name) { return Err(lexdb_base.err("34000", &("portal \"" + name + "\" does not exist"))) }
+        let po = ps.portalAt(&name)
+        stmtName = po.stmt.clone()
+        bin = len(po.fmts) > 0
     }
     if !ps.stmts.has(&stmtName) {
         return Err(lexdb_base.err("26000", &("prepared statement \"" + stmtName + "\" does not exist")))
     }
-    let p = ps.stmts.at(stmtName)
+    let p = ps.stmts.at(&stmtName)
     if kind == "S" {
         var b = ""
         binary.addU16BE(mut &b, len(p.ptypes))
@@ -1056,10 +1229,10 @@ fn (w: mut &Wire) describeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.
         return Ok(Unit{})
     }
     // Describing plans the query: libpq describes the portal before every
-    // execution, so the columns are kept while the catalog is unchanged.
+    // execution, so the columns and pre-framed 'T' bytes are kept while the catalog is unchanged.
     let now = w.st.changes()
     if p.colsAt == now && p.pathAt == w.sess.pathVersion() {
-        if bin { w.msg('T', &lexdb_pgbin.rowDesc(&p.cols, &ps.portals.at(name).fmts)) } else { w.rowDesc(&p.cols) }
+        if bin { w.msg('T', &lexdb_pgbin.rowDesc(&p.cols, &ps.portalAt(&name).fmts)) } else { w.out += &p.rowDescMsg }
         return Ok(Unit{})
     }
     let cols = try w.sess.describe(&p.stmts[0], &p.ptypes)
@@ -1068,34 +1241,36 @@ fn (w: mut &Wire) describeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.
         w.empty('n')
         return Ok(Unit{})
     }
-    if bin { w.msg('T', &lexdb_pgbin.rowDesc(&cols, &ps.portals.at(name).fmts)) } else { w.rowDesc(&cols) }
-    let m = ps.stmts.atMut(stmtName)
+    let framed = rowDescFramed(&cols)
+    if bin { w.msg('T', &lexdb_pgbin.rowDesc(&cols, &ps.portalAt(&name).fmts)) } else { w.out += &framed }
+    let m = ps.stmts.atMut(&stmtName)
     m.cols = cols
+    m.rowDescMsg = framed
     m.colsAt = now
     m.pathAt = w.sess.pathVersion()
     return Ok(Unit{})
 }
 
 fn (w: mut &Wire) executeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbErr] {
-    var r = Rd{s: body.clone(), at: 0, bad: false}
-    let portal = r.cstr()
-    let maxRows = r.i32()
+    var r = Rd{at: 0, bad: false}
+    let portal = r.cstr(body)
+    let maxRows = r.i32(body)
     if r.bad { return Err(protoErr("invalid Execute message")) }
-    if !ps.portals.has(&portal) { return Err(lexdb_base.err("34000", &("portal \"" + portal + "\" does not exist"))) }
+    if !ps.hasPortal(&portal) { return Err(lexdb_base.err("34000", &("portal \"" + portal + "\" does not exist"))) }
     if lexdb_base.cancelPending() { let late = lexdb_base.takeCancel(w.sess.number()) }
-    let name = ps.portals.at(portal).stmt.clone()
-    if len(ps.stmts.at(name).stmts) == 0 {
+    let name = ps.portalAt(&portal).stmt.clone()
+    if len(ps.stmts.at(&name).stmts) == 0 {
         w.empty('I')
         return Ok(Unit{})
     }
     // the statement's plan, out for the run and back after it
-    var plan = replace(mut &ps.stmts.atMut(name).plan, lexdb_exec.oneShot())
+    var plan = replace(mut &ps.stmts.atMut(&name).plan, lexdb_exec.oneShot())
     let ran = w.runPortal(ps, &portal, &name, mut &plan)
-    ps.stmts.atMut(name).plan = plan
+    ps.stmts.atMut(&name).plan = plan
     var res = try ran
     if res.copy == lexdb_exec.COPY_IN {
         let cols = replace(mut &res.cols, [])
-        res = try w.copyFrom(&ps.stmts.at(name).stmts[0], &cols)
+        res = try w.copyFrom(&ps.stmts.at(&name).stmts[0], &cols)
     }
     if res.copy == lexdb_exec.COPY_OUT {
         w.copyOut(&res)
@@ -1104,12 +1279,12 @@ fn (w: mut &Wire) executeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.D
     }
     // Rows unlike those Describe gave (an ALTER TABLE since): the client
     // would read them by the old description (PostgreSQL refuses too).
-    let p = ps.stmts.at(name)
+    let p = ps.stmts.at(&name)
     if res.hasRows && p.colsAt >= 0 && !sameCols(&res.cols, &p.cols) {
         return Err(lexdb_base.err("0A000", "cached plan must not change result type"))
     }
     if res.hasRows {
-        let fmts = &ps.portals.at(portal).fmts
+        let fmts = &ps.portalAt(&portal).fmts
         if len(fmts) > 0 { lexdb_pgbin.dataRows(mut &w.out, &res.rows, &res.cols, fmts, &w.sess.zone()) } else { w.dataRows(&res.rows, &res.cols) }
     }
     w.complete(&res.tag)
@@ -1123,30 +1298,25 @@ fn sameCols(a: &[]lexdb_bind.OutCol, b: &[]lexdb_bind.OutCol): bool {
 }
 
 fn (w: mut &Wire) runPortal(ps: &Ps, portal: &str, name: &str, plan: mut &lexdb_exec.PlanCache): Result[lexdb_exec.Res, lexdb_base.DbErr] {
-    let po = ps.portals.at(portal)
+    let po = ps.portalAt(portal)
     let p = ps.stmts.at(name)
     if isCopyTo(&p.stmts[0]) { return w.copyTo(&p.stmts[0], &po.params, &p.ptypes, plan) }
     if p.stmts[0].kind == lexdb_sql.S_SELECT && len(p.stmts[0].wctes) == 0 {
-        var check: Option[[]lexdb_bind.OutCol] = None
-        if p.colsAt >= 0 {
-            var cs: []lexdb_bind.OutCol = []
-            for c in p.cols { append(mut &cs, c.clone()) }
-            check = Some(cs)
-        }
-        if len(po.fmts) > 0 { return w.runStreamedBin(&p.stmts[0], &po.params, &p.ptypes, plan, &check, &po.fmts) }
-        return w.runStreamed(&p.stmts[0], &po.params, &p.ptypes, plan, false, &check)
+        let hasCheck = p.colsAt >= 0
+        if len(po.fmts) > 0 { return w.runStreamedBin(&p.stmts[0], &po.params, &p.ptypes, plan, hasCheck, &p.cols, &po.fmts) }
+        return w.runStreamed(&p.stmts[0], &po.params, &p.ptypes, plan, false, hasCheck, &p.cols)
     }
     return w.sess.runCached(&p.stmts[0], &po.params, &p.ptypes, plan)
 }
 
 fn (w: mut &Wire) closeMsg(ps: mut &Ps, body: &str): Result[Unit, lexdb_base.DbErr] {
-    var r = Rd{s: body.clone(), at: 0, bad: false}
-    let kind = r.bytes(1)
-    let name = r.cstr()
+    var r = Rd{at: 0, bad: false}
+    let kind = r.bytes(body, 1)
+    let name = r.cstr(body)
     if kind == "S" {
         let gone = ps.stmts.remove(&name)
     } else {
-        let gone = ps.portals.remove(&name)
+        ps.dropPortal(&name)
     }
     w.empty('3')
     return Ok(Unit{})
@@ -1378,9 +1548,9 @@ fn (w: mut &Wire) authenticate(user: &str): Result[bool, io.IoError] {
         None { return Ok(false) }
     }
     if m1.typ != 'p' { return w.fatal(&"08P01", &"expected SASL response") }
-    var r1 = Rd{s: m1.body.clone(), at: 0, bad: false}
-    let mech = r1.cstr()
-    let n1 = r1.i32()
+    var r1 = Rd{at: 0, bad: false}
+    let mech = r1.cstr(&m1.body)
+    let n1 = r1.i32(&m1.body)
     if r1.bad || n1 < 0 || r1.at + n1 > len(m1.body) { return w.fatal(&"08P01", &"malformed SASL message") }
     let first = match lexdb_auth.serverFirst(mut &sc, &mech, &m1.body[r1.at..r1.at + n1]) {
         Ok(x) { x }
@@ -1423,8 +1593,8 @@ fn (w: mut &Wire) step(ps: mut &Ps, m: &Msg): Result[bool, io.IoError] {
     }
     if t == 'Q' {
         w.skipping = false
-        var r = Rd{s: m.body.clone(), at: 0, bad: false}
-        let sql = r.cstr()
+        var r = Rd{at: 0, bad: false}
+        let sql = r.cstr(&m.body)
         try w.query(ps, &sql)
         return Ok(true)
     }
@@ -1454,9 +1624,12 @@ fn (w: mut &Wire) step(ps: mut &Ps, m: &Msg): Result[bool, io.IoError] {
 pub fn serve(a: ConnArg): int {
     let ConnArg{conn: c, st: st, id: _, ctx: ctx} = move(a)
     let nd = c.setNoDelay(true)
-    var w = Wire{c: c, eng: [], raw: [], bind: "", inBuf: array(65536, byte(0)), inPos: 0, inEnd: 0, out: "", sess: lexdb_exec.newSession(st.share()), st: st,
+    var w = Wire{c: c, eng: [], raw: [], bind: "", inBuf: array(65536, byte(0)), inPos: 0, inEnd: 0, out: "",
+                 sess: lexdb_exec.newSession(st.share()), parked: [lexdb_exec.parkedSession(st.share())], st: st,
                  skipping: false, tzShown: "", streamed: false, texts: []}
-    var ps = Ps{stmts: newMap(), portals: newMap(), autos: collections.newMapWith(collections.fxHashStr)}
+    var ps = Ps{stmts: collections.newMapWith(collections.fxHashStr), portals: collections.newMapWith(collections.fxHashStr),
+                hasUnnamed: false, unnamed: Portal{stmt: "", params: [], fmts: []},
+                autos: collections.newMapWith(collections.fxHashStr)}
     if startup(mut &w, &ctx).unwrapOr(false) {
         while true {
             let got = w.readMsg(false)
@@ -1590,16 +1763,13 @@ pub fn acceptLoop(a: AcceptArg): int {
 // runStreamed for a portal with binary columns (fmts, lexdb_pgbin): its rows
 // in their formats; its RowDescription comes from Describe.
 fn (w: mut &Wire) runStreamedBin(s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &lexdb_exec.PlanCache,
-                                 check: &Option[[]lexdb_bind.OutCol], fmts: &[]int): Result[lexdb_exec.Res, lexdb_base.DbErr] {
+                                 hasCheck: bool, checkCols: &[]lexdb_bind.OutCol, fmts: &[]int): Result[lexdb_exec.Res, lexdb_base.DbErr] {
     let zone = w.sess.zone()
     w.streamed = false
-    var sess = replace(mut &w.sess, lexdb_exec.parkedSession(w.st.share()))
+    var sess = replace(mut &w.sess, pop(mut &w.parked))
     let r = sess.runRows(s, params, ptypes, pc, fn(cols: &[]lexdb_bind.OutCol, row: &[]Val, ob: &lexdb_rows.OutBatch, start: bool): bool {
         if start {
-            match check {
-                Some(want) { if !sameCols(cols, want) { return false } }
-                None {}
-            }
+            if hasCheck && !sameCols(cols, checkCols) { return false }
             w.streamed = true
             return true
         }
@@ -1607,6 +1777,6 @@ fn (w: mut &Wire) runStreamedBin(s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]
         if len(w.out) > 65536 { return w.flush().isOk() }
         return true
     })
-    let parked = replace(mut &w.sess, sess)
+    append(mut &w.parked, replace(mut &w.sess, sess))
     return r
 }
