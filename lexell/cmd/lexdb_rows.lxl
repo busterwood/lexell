@@ -2144,12 +2144,191 @@ pub fn colsPick(leaf: &LeafView, from: int, qs: &[]int, rs: &[]int, all: bool, r
     return Ok(true)
 }
 
+// Pure parallel-safe version of colsInto / colsPick operating directly on (s, dir)
+// without touching LeafView (rc str) or the DICTS global Shared pool.
+pub fn parseLeafCols(s: &str, n: int, needPl: &[]bool, maxPl: int): Option[[]int] {
+    return lexdb_cols.parseNeeded(s, n, needPl, maxPl)
+}
+pub fn colPlaces(dir: &[]int): int { return lexdb_cols.places(dir) }
+pub fn colKindOf(s: &str, p: int): byte { return lexdb_cols.kindOf(s, p) }
+
+pub fn colsIntoPure(s: &str, dir: &[]int, from: int, qs: &[]int, all: bool, r0: int, ps: &[]int, b: mut &Batch, bp: &Projection): Result[bool, DbErr] {
+    return colsPickPure(s, dir, from, qs, qs, all, r0, ps, b, bp)
+}
+
+pub fn colsPickPure(s: &str, dir: &[]int, from: int, qs: &[]int, rs: &[]int, all: bool, r0: int, ps: &[]int, b: mut &Batch, bp: &Projection): Result[bool, DbErr] {
+    let np = lexdb_cols.places(dir)
+    let n = len(qs)
+    if n == 0 { return Ok(true) }
+    for pl in ps {
+        let c = bp.placeCol[pl]
+        let k = bp.kinds[c]
+        if pl >= np {
+            let mv = if pl < len(bp.missing) { bp.missing[pl].clone() } else { Val.Null }
+            for x in 0..n { if !put(b, c, r0 + rs[x], mv.clone(), k) { return Ok(false) } }
+            continue
+        }
+        let pk = lexdb_cols.kindOf(s, pl)
+        if pk == PK_NONE {
+            for x in 0..n { setNull(b, c, r0 + rs[x]) }
+            continue
+        }
+        let nulls = lexdb_cols.hasNulls(dir, pl)
+        if nulls {
+            if all { lexdb_cols.nullsInto(s, dir, pl, from, n, mut &b.cols[c].nul, r0) } else {
+                for x in 0..n { if lexdb_cols.isNull(s, dir, pl, from + qs[x]) { b.cols[c].nul[r0 + rs[x]] = true } }
+            }
+        }
+        if k == BK_INT && isIntKind(pk) {
+            var col = replace(mut &b.cols[c], bvec(0))
+            if all { lexdb_cols.intsInto(s, dir, pl, from, n, mut &col.v, r0) } else {
+                lexdb_cols.intsPick(s, dir, pl, from, qs, rs, mut &col.v, r0)
+            }
+            b.cols[c] = col
+        } else if k == BK_BOOL && pk == PK_BOOL {
+            var col = replace(mut &b.cols[c], bvec(0))
+            if all { lexdb_cols.boolsInto(s, dir, pl, from, n, mut &col.v, r0) } else {
+                for x in 0..n { col.v[r0 + rs[x]] = if lexdb_cols.boolAt(s, dir, pl, from + qs[x]) { 1 } else { 0 } }
+            }
+            b.cols[c] = col
+        } else if isDecKind(k) {
+            if pk != PK_NUM { return Ok(false) }
+            let ds = decScale(k)
+            if lexdb_cols.codecOf(dir, pl) == lexdb_cols.C_UNITS {
+                if lexdb_cols.scaleOf(dir, pl) != ds { return Ok(false) }
+                var col = replace(mut &b.cols[c], bvec(0))
+                if all { lexdb_cols.intsInto(s, dir, pl, from, n, mut &col.v, r0) } else {
+                    lexdb_cols.intsPick(s, dir, pl, from, qs, rs, mut &col.v, r0)
+                }
+                b.cols[c] = col
+            } else {
+                var sp: []int = array(n, 0)
+                if all { lexdb_cols.varsInto(s, dir, pl, from, n, mut &sp, 0) } else {
+                    for x in 0..n { sp[x] = lexdb_cols.varAt(s, dir, pl, from + qs[x]) }
+                }
+                for x in 0..n {
+                    let r = r0 + rs[x]
+                    if b.cols[c].nul[r] { continue }
+                    let v = try varVal(pk, s, lexdb_cols.spanStart(sp[x]), lexdb_cols.spanEnd(sp[x]))
+                    if !put(b, c, r, v, k) { return Ok(false) }
+                }
+            }
+        } else if k == BK_TEXT {
+            if pk != PK_TEXT { return Ok(false) }
+            let codec = lexdb_cols.codecOf(dir, pl)
+            if codec == lexdb_cols.C_DICT && !all && 4 * n < lexdb_cols.dictSize(dir, pl) {
+                for x in 0..n {
+                    let r = r0 + rs[x]
+                    if b.cols[c].nul[r] { continue }
+                    let sp = lexdb_cols.entryAt(s, dir, pl, lexdb_cols.codeAt(s, dir, pl, from + qs[x]))
+                    if !putText(b, c, r, &s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)]) { return Ok(false) }
+                }
+            } else if codec == lexdb_cols.C_DICT {
+                var codes: []int = array(n, 0)
+                if all { lexdb_cols.codesInto(s, dir, pl, from, n, mut &codes, 0) } else {
+                    for x in 0..n { codes[x] = lexdb_cols.codeAt(s, dir, pl, from + qs[x]) }
+                }
+                var placed: []int = array(lexdb_cols.dictSize(dir, pl), -1)
+                for x in 0..n {
+                    let r = r0 + rs[x]
+                    if b.cols[c].nul[r] { continue }
+                    let code = codes[x]
+                    if placed[code] < 0 {
+                        let sp = lexdb_cols.entryAt(s, dir, pl, code)
+                        if !putText(b, c, r, &s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)]) { return Ok(false) }
+                        placed[code] = b.cols[c].v[r]
+                    } else {
+                        b.cols[c].v[r] = placed[code]
+                    }
+                }
+            } else {
+                var sp: []int = array(n, 0)
+                if all { lexdb_cols.varsInto(s, dir, pl, from, n, mut &sp, 0) } else {
+                    for x in 0..n { sp[x] = lexdb_cols.varAt(s, dir, pl, from + qs[x]) }
+                }
+                for x in 0..n {
+                    let r = r0 + rs[x]
+                    if b.cols[c].nul[r] { continue }
+                    if !putText(b, c, r, &s[lexdb_cols.spanStart(sp[x])..lexdb_cols.spanEnd(sp[x])]) { return Ok(false) }
+                }
+            }
+        } else if k == BK_VAL {
+            var vals = replace(mut &b.vals[c], [])
+            if nulls { for x in 0..n { if b.cols[c].nul[r0 + rs[x]] { vals[r0 + rs[x]] = Val.Null } } }
+            let codec = lexdb_cols.codecOf(dir, pl)
+            if isWordKind(pk) {
+                for x in 0..n {
+                    let r = r0 + rs[x]
+                    if !b.cols[c].nul[r] { vals[r] = wordVal(pk, lexdb_cols.intAt(s, dir, pl, from + qs[x])) }
+                }
+            } else if pk == PK_BOOL {
+                for x in 0..n {
+                    let r = r0 + rs[x]
+                    if !b.cols[c].nul[r] { vals[r] = Val.Bool(lexdb_cols.boolAt(s, dir, pl, from + qs[x])) }
+                }
+            } else if codec == lexdb_cols.C_DICT && !all && n < lexdb_cols.dictSize(dir, pl) {
+                for x in 0..n {
+                    let r = r0 + rs[x]
+                    if b.cols[c].nul[r] { continue }
+                    let sp = lexdb_cols.entryAt(s, dir, pl, lexdb_cols.codeAt(s, dir, pl, from + qs[x]))
+                    vals[r] = Val.Text(s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)].clone())
+                }
+            } else if codec == lexdb_cols.C_DICT {
+                let nd = lexdb_cols.dictSize(dir, pl)
+                var dv: []Val = withCapacity(nd)
+                for j in 0..nd {
+                    let sp = lexdb_cols.entryAt(s, dir, pl, j)
+                    append(mut &dv, Val.Text(s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)].clone()))
+                }
+                var codes: []int = array(n, 0)
+                if all { lexdb_cols.codesInto(s, dir, pl, from, n, mut &codes, 0) } else {
+                    for x in 0..n { codes[x] = lexdb_cols.codeAt(s, dir, pl, from + qs[x]) }
+                }
+                for x in 0..n {
+                    let r = r0 + rs[x]
+                    if !b.cols[c].nul[r] { vals[r] = dv[codes[x]].clone() }
+                }
+            } else if codec == lexdb_cols.C_UNITS {
+                let ds = lexdb_cols.scaleOf(dir, pl)
+                for x in 0..n {
+                    let r = r0 + rs[x]
+                    if !b.cols[c].nul[r] { vals[r] = Val.Num(Decimal.fromUnits(lexdb_cols.intAt(s, dir, pl, from + qs[x]), ds)) }
+                }
+            } else {
+                var sp: []int = array(n, 0)
+                if all { lexdb_cols.varsInto(s, dir, pl, from, n, mut &sp, 0) } else {
+                    for x in 0..n { sp[x] = lexdb_cols.varAt(s, dir, pl, from + qs[x]) }
+                }
+                for x in 0..n {
+                    let r = r0 + rs[x]
+                    if b.cols[c].nul[r] { continue }
+                    let a = lexdb_cols.spanStart(sp[x])
+                    let e = lexdb_cols.spanEnd(sp[x])
+                    if pk == PK_TEXT {
+                        vals[r] = Val.Text(s[a..e].clone())
+                    } else {
+                        match varVal(pk, s, a, e) {
+                            Ok(v) { vals[r] = v }
+                            Err(bad) {
+                                b.vals[c] = vals
+                                return Err(bad)
+                            }
+                        }
+                    }
+                }
+            }
+            b.vals[c] = vals
+        } else {
+            return Ok(false)
+        }
+    }
+    return Ok(true)
+}
+
 // Rows rs (batch rows, from row r0 = leaf row from) whose text at place pl
 // a simple LIKE (or NOT LIKE when neg) of pieces ps holds for; a dictionary's
 // entries matched once. NULLs are never kept (SQL 3VL: NOT (NULL LIKE p) is NULL).
-pub fn likeInLeaf(leaf: &LeafView, from: int, rs: &[]int, r0: int, pl: int, ps: &[]str, neg: bool): []int {
-    let s = leaf.cols
-    let dir = leaf.dir
+pub fn likeInLeafCols(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, pl: int, ps: &[]str, neg: bool): []int {
     var out: []int = []
     if lexdb_cols.codecOf(dir, pl) == lexdb_cols.C_DICT {
         let nd = lexdb_cols.dictSize(dir, pl)
@@ -2167,8 +2346,6 @@ pub fn likeInLeaf(leaf: &LeafView, from: int, rs: &[]int, r0: int, pl: int, ps: 
         }
         return out
     }
-    // (each text a view of its own bytes: a piece searched for is not
-    // looked for past its end, in the texts after it)
     let nulls = lexdb_cols.hasNulls(dir, pl)
     let ends = lexdb_cols.endsAt(dir, pl)
     let data = lexdb_cols.bytesAt(dir, pl)
@@ -2180,6 +2357,10 @@ pub fn likeInLeaf(leaf: &LeafView, from: int, rs: &[]int, r0: int, pl: int, ps: 
         if lexdb_like.likeRange(&s[a..e], 0, e - a, ps) != neg { append(mut &out, r) }
     }
     return out
+}
+
+pub fn likeInLeaf(leaf: &LeafView, from: int, rs: &[]int, r0: int, pl: int, ps: &[]str, neg: bool): []int {
+    return likeInLeafCols(leaf.cols, leaf.dir, from, rs, r0, pl, ps, neg)
 }
 
 // Column leaves batch scans skipped (excluded), for the tests.

@@ -1147,6 +1147,72 @@ pub fn compare(a: &Val, b: &Val): Result[int, DbErr] {
     return Err(e("42883", &("operator does not exist: " + lexdb_sql.text(a) + " compared with " + lexdb_sql.text(b))))
 }
 
+// Pure parallel-safe mirror of compare (never touches lexdb_time.utc() / Zone / rc).
+// Returns XXBAT if timezone-dependent coercion is required (caller falls back serially).
+pub fn comparePure(a: &Val, b: &Val): Result[int, DbErr] {
+    let ka = kindOf(a)
+    let kb = kindOf(b)
+    if lexdb_sql.isTimeKind(ka) || lexdb_sql.isTimeKind(kb) {
+        match timeCmpLocal(a, b) {
+            Some(c) { return Ok(c) }
+            None { return Err(e("XXBAT", "timezone comparison requires serial path")) }
+        }
+    }
+    if ka == lexdb_sql.K_UUID || kb == lexdb_sql.K_UUID || ka == lexdb_sql.K_BYTEA || kb == lexdb_sql.K_BYTEA {
+        if ka != kb { return Err(e("XXBAT", "uuid/bytea coercion requires serial path")) }
+        return Ok(lexdb_sql.text(a).cmp(&lexdb_sql.text(b)))
+    }
+    if ka == lexdb_sql.K_REG || kb == lexdb_sql.K_REG {
+        match oidArg(a) {
+            Some(x) { match oidArg(b) { Some(y) { return Ok(x.cmp(&y)) } None {} } }
+            None {}
+        }
+    }
+    if ka == lexdb_sql.K_FLOAT || kb == lexdb_sql.K_FLOAT {
+        match asFloat(a) {
+            Some(x) { match asFloat(b) { Some(y) { return Ok(floatCmp(x, y)) } None {} } }
+            None {}
+        }
+    }
+    match a {
+        Val.Int(x) {
+            match b {
+                Val.Int(y) { return Ok(x.cmp(&y)) }
+                Val.Text(s) { match strings.parseIntOpt(&(strings.trim(&s))) { Some(y) { return Ok(x.cmp(&y)) } None {} } }
+                else {}
+            }
+        }
+        Val.Text(x) {
+            match b {
+                Val.Text(y) { return Ok(x.cmp(&y)) }
+                Val.Int(_) { let r = try comparePure(b, a); return Ok(-r) }
+                Val.Bool(_) { let r = try comparePure(b, a); return Ok(-r) }
+                Val.Num(_) { let r = try comparePure(b, a); return Ok(-r) }
+                else {}
+            }
+        }
+        Val.Bool(x) {
+            let y = match b {
+                Val.Bool(v) { Some(v) }
+                Val.Text(s) { parseBool(&s) }
+                else { None }
+            }
+            match y {
+                Some(v) { return Ok(if x == v { 0 } else if !x { -1 } else { 1 }) }
+                None {}
+            }
+        }
+        else {}
+    }
+    if ka == lexdb_sql.K_NUM || kb == lexdb_sql.K_NUM {
+        match asNum(a) {
+            Some(x) { match asNum(b) { Some(y) { return Ok(x.cmp(&y)) } None {} } }
+            None {}
+        }
+    }
+    return Err(e("42883", &("operator does not exist: " + lexdb_sql.text(a) + " compared with " + lexdb_sql.text(b))))
+}
+
 pub fn decErr(): DbErr { return e("22003", "numeric value out of range") }
 
 // The decimal digits of d's coefficient (1 for zero).
@@ -1209,6 +1275,14 @@ pub fn arith(op: int, a: &Val, b: &Val): Result[Val, DbErr] {
     if isNull(a) || isNull(b) { return Ok(Val.Null) }
     if op == OP_POW { return powOp(a, b) }
     if lexdb_sql.isTimeKind(kindOf(a)) || lexdb_sql.isTimeKind(kindOf(b)) { return arithTime(op, a, b, lexdb_time.utc()) }
+    return arithNonTime(op, a, b)
+}
+
+// Pure parallel-safe arithmetic for non-time types (never reaches lexdb_time.utc() / Zone).
+pub fn arithNonTime(op: int, a: &Val, b: &Val): Result[Val, DbErr] {
+    if isNull(a) || isNull(b) { return Ok(Val.Null) }
+    if op == OP_POW { return powOp(a, b) }
+    if lexdb_sql.isTimeKind(kindOf(a)) || lexdb_sql.isTimeKind(kindOf(b)) { return Err(e("XXBAT", "time arithmetic requires serial path")) }
     if isFloat(a) || isFloat(b) { return arithFloat(op, a, b) }
     var x = 0
     var y = 0

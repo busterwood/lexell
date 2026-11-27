@@ -52,16 +52,19 @@ pub fn intBloom(pl: int, pk: byte, bf: lexdb_cols.IntBloom): LeafK {
 
 // Fast zero-allocation check: true when k is guaranteed to pass every row in leaf
 // (e.g. a non-NULL Range whose leaf [mn, mx] is completely inside [lo, hi]).
-pub fn allPass(leaf: &LeafView, k: &LeafK): bool {
+pub fn allPassCols(s: &str, dir: &[]int, k: &LeafK): bool {
     match k {
         LeafK.Range(pl, pk, sc, lo, hi) {
-            if !wordsOk(leaf, pl, pk, sc) { return false }
-            let dir = leaf.dir
+            if !wordsOkCols(s, dir, pl, pk, sc) { return false }
             if lexdb_cols.hasNulls(dir, pl) || !lexdb_cols.hasRange(dir, pl) { return false }
             return lexdb_cols.least(dir, pl) >= lo && lexdb_cols.greatest(dir, pl) <= hi
         }
         else { return false }
     }
+}
+
+pub fn allPass(leaf: &LeafView, k: &LeafK): bool {
+    return allPassCols(leaf.cols, leaf.dir, k)
 }
 
 pub const MIN_W: int = -9223372036854775807 - 1
@@ -107,11 +110,11 @@ pub fn merged(ks: []LeafK): []LeafK {
 
 // Whether place pl of the leaf holds words of kind pk (PK_INT: any
 // integer kind) at scale sc (-1: not a units place) as intAt reads them.
-fn wordsOk(leaf: &LeafView, pl: int, pk: byte, sc: int): bool {
-    if pl >= lexdb_cols.places(leaf.dir) { return false }
-    let k = lexdb_cols.kindOf(leaf.cols, pl)
-    let c = lexdb_cols.codecOf(leaf.dir, pl)
-    if sc >= 0 { return k == lexdb_rows.PK_NUM && c == lexdb_cols.C_UNITS && lexdb_cols.scaleOf(leaf.dir, pl) == sc }
+fn wordsOkCols(s: &str, dir: &[]int, pl: int, pk: byte, sc: int): bool {
+    if pl >= lexdb_cols.places(dir) { return false }
+    let k = lexdb_cols.kindOf(s, pl)
+    let c = lexdb_cols.codecOf(dir, pl)
+    if sc >= 0 { return k == lexdb_rows.PK_NUM && c == lexdb_cols.C_UNITS && lexdb_cols.scaleOf(dir, pl) == sc }
     if pk == lexdb_rows.PK_INT { if !lexdb_rows.isIntKind(k) { return false } } else if k != pk { return false }
     return c == lexdb_cols.C_FOR || c == lexdb_cols.C_RAW
 }
@@ -120,29 +123,29 @@ fn wordsOk(leaf: &LeafView, pl: int, pk: byte, sc: int): bool {
 // Place pl's words of rows rs (leaf row from + r - r0), in rs's order, of a
 // run of cnt rows: unpacked together when rs holds half the run or more,
 // else row by row.
-fn wordsOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, pl: int): []int {
+fn wordsOfCols(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int, pl: int): []int {
     let n = len(rs)
     var w: []int = array(n, 0)
-    if n == cnt { lexdb_cols.intsInto(leaf.cols, leaf.dir, pl, from, n, mut &w, 0) } else if 2 * n >= cnt {
+    if n == cnt { lexdb_cols.intsInto(s, dir, pl, from, n, mut &w, 0) } else if 2 * n >= cnt {
         var all: []int = array(cnt, 0)
-        lexdb_cols.intsInto(leaf.cols, leaf.dir, pl, from, cnt, mut &all, 0)
+        lexdb_cols.intsInto(s, dir, pl, from, cnt, mut &all, 0)
         for x in 0..n { w[x] = all[rs[x] - r0] }
     } else {
-        lexdb_cols.intsPickDense(leaf.cols, leaf.dir, pl, from, rs, r0, mut &w)
+        lexdb_cols.intsPickDense(s, dir, pl, from, rs, r0, mut &w)
     }
     return w
 }
 
-// A dictionary place's codes of rows rs, as wordsOf.
-fn codesOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, pl: int): []int {
+// A dictionary place's codes of rows rs, as wordsOfCols.
+fn codesOfCols(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int, pl: int): []int {
     let n = len(rs)
     var w: []int = array(n, 0)
-    if n == cnt { lexdb_cols.codesInto(leaf.cols, leaf.dir, pl, from, n, mut &w, 0) } else if 2 * n >= cnt {
+    if n == cnt { lexdb_cols.codesInto(s, dir, pl, from, n, mut &w, 0) } else if 2 * n >= cnt {
         var all: []int = array(cnt, 0)
-        lexdb_cols.codesInto(leaf.cols, leaf.dir, pl, from, cnt, mut &all, 0)
+        lexdb_cols.codesInto(s, dir, pl, from, cnt, mut &all, 0)
         for x in 0..n { w[x] = all[rs[x] - r0] }
     } else {
-        for x in 0..n { w[x] = lexdb_cols.codeAt(leaf.cols, leaf.dir, pl, from + rs[x] - r0) }
+        for x in 0..n { w[x] = lexdb_cols.codeAt(s, dir, pl, from + rs[x] - r0) }
     }
     return w
 }
@@ -185,11 +188,8 @@ fn prefixIn(t: &str, m: int, trim: bool, ks: &[]str): bool {
     return false
 }
 
-// The rows of rs (as rowsOf) whose text at place pl test holds for (a
-// dictionary's entries tested once); None: pl is not a text place.
-fn textRows(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, pl: int, test: &fn(&str): bool): Option[[]int] {
-    let s = leaf.cols
-    let dir = leaf.dir
+// Direct (non-closure) text kernel helpers so rowsOfCols is 100% pure for par.map kernels.
+fn textRowsOp(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int, pl: int, op: int, ks: &[]str): Option[[]int] {
     let n = len(rs)
     if pl >= lexdb_cols.places(dir) || lexdb_cols.kindOf(s, pl) != lexdb_rows.PK_TEXT { return None }
     let codec = lexdb_cols.codecOf(dir, pl)
@@ -200,9 +200,9 @@ fn textRows(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, pl: int, 
         var hit: []bool = array(nd, false)
         for j in 0..nd {
             let sp = lexdb_cols.entryAt(s, dir, pl, j)
-            hit[j] = test(&s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)])
+            hit[j] = textHolds(op, &s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)], ks)
         }
-        let codes = codesOf(leaf, from, rs, r0, cnt, pl)
+        let codes = codesOfCols(s, dir, from, rs, r0, cnt, pl)
         for x in 0..n {
             if hit[codes[x]] {
                 if nulls && lexdb_cols.isNull(s, dir, pl, from + rs[x] - r0) { continue }
@@ -216,21 +216,51 @@ fn textRows(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, pl: int, 
         let i = from + rs[x] - r0
         if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
         let sp = lexdb_cols.varAt(s, dir, pl, i)
-        if test(&s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)]) { append(mut &out, rs[x]) }
+        if textHolds(op, &s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)], ks) { append(mut &out, rs[x]) }
+    }
+    return Some(out)
+}
+
+fn textRowsPrefix(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int, pl: int, m: int, trim: bool, ks: &[]str): Option[[]int] {
+    let n = len(rs)
+    if pl >= lexdb_cols.places(dir) || lexdb_cols.kindOf(s, pl) != lexdb_rows.PK_TEXT { return None }
+    let codec = lexdb_cols.codecOf(dir, pl)
+    let nulls = lexdb_cols.hasNulls(dir, pl)
+    var out: []int = []
+    if codec == lexdb_cols.C_DICT {
+        let nd = lexdb_cols.dictSize(dir, pl)
+        var hit: []bool = array(nd, false)
+        for j in 0..nd {
+            let sp = lexdb_cols.entryAt(s, dir, pl, j)
+            hit[j] = prefixIn(&s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)], m, trim, ks)
+        }
+        let codes = codesOfCols(s, dir, from, rs, r0, cnt, pl)
+        for x in 0..n {
+            if hit[codes[x]] {
+                if nulls && lexdb_cols.isNull(s, dir, pl, from + rs[x] - r0) { continue }
+                append(mut &out, rs[x])
+            }
+        }
+        return Some(out)
+    }
+    if codec != lexdb_cols.C_TEXT { return None }
+    for x in 0..n {
+        let i = from + rs[x] - r0
+        if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
+        let sp = lexdb_cols.varAt(s, dir, pl, i)
+        if prefixIn(&s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)], m, trim, ks) { append(mut &out, rs[x]) }
     }
     return Some(out)
 }
 
 // The rows of rs (batch rows of a run of cnt rows, leaf row from at batch
 // row r0) k holds for, in order. None: a place of the leaf is not of the
-// kind k reads.
-pub fn rowsOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, k: &LeafK): Option[[]int] {
-    let s = leaf.cols
-    let dir = leaf.dir
+// kind k reads. Pure (no LeafView / indirect calls) for par.map workers.
+pub fn rowsOfCols(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int, k: &LeafK): Option[[]int] {
     let n = len(rs)
     match k {
         LeafK.Range(pl, pk, sc, lo, hi) {
-            if !wordsOk(leaf, pl, pk, sc) { return None }
+            if !wordsOkCols(s, dir, pl, pk, sc) { return None }
             let nulls = lexdb_cols.hasNulls(dir, pl)
             if lexdb_cols.hasRange(dir, pl) {
                 let mn = lexdb_cols.least(dir, pl)
@@ -241,7 +271,7 @@ pub fn rowsOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, k: &Lea
             if n == cnt && !nulls {
                 return Some(lexdb_cols.rangeFilter(s, dir, pl, from, cnt, r0, lo, hi))
             }
-            let w = wordsOf(leaf, from, rs, r0, cnt, pl)
+            let w = wordsOfCols(s, dir, from, rs, r0, cnt, pl)
             var out: []int = withCapacity(n)
             for x in 0..n {
                 let v = w[x]
@@ -253,7 +283,7 @@ pub fn rowsOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, k: &Lea
             return Some(out)
         }
         LeafK.Ne(pl, pk, sc, kv) {
-            if !wordsOk(leaf, pl, pk, sc) { return None }
+            if !wordsOkCols(s, dir, pl, pk, sc) { return None }
             let nulls = lexdb_cols.hasNulls(dir, pl)
             if lexdb_cols.hasRange(dir, pl) {
                 let mn = lexdb_cols.least(dir, pl)
@@ -261,7 +291,7 @@ pub fn rowsOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, k: &Lea
                 if mn == kv && mx == kv { return Some([]) }
                 if !nulls && (kv < mn || kv > mx) { return Some(collections.copyOf(rs)) }
             }
-            let w = wordsOf(leaf, from, rs, r0, cnt, pl)
+            let w = wordsOfCols(s, dir, from, rs, r0, cnt, pl)
             var out: []int = withCapacity(n)
             for x in 0..n {
                 if w[x] != kv {
@@ -272,9 +302,9 @@ pub fn rowsOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, k: &Lea
             return Some(out)
         }
         LeafK.Cols(op, pa, pb, pk) {
-            if !wordsOk(leaf, pa, pk, -1) || !wordsOk(leaf, pb, pk, -1) { return None }
-            let wa = wordsOf(leaf, from, rs, r0, cnt, pa)
-            let wb = wordsOf(leaf, from, rs, r0, cnt, pb)
+            if !wordsOkCols(s, dir, pa, pk, -1) || !wordsOkCols(s, dir, pb, pk, -1) { return None }
+            let wa = wordsOfCols(s, dir, from, rs, r0, cnt, pa)
+            let wb = wordsOfCols(s, dir, from, rs, r0, cnt, pb)
             var out: []int = withCapacity(n)
             let nulls = lexdb_cols.hasNulls(dir, pa) || lexdb_cols.hasNulls(dir, pb)
             for x in 0..n {
@@ -290,10 +320,10 @@ pub fn rowsOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, k: &Lea
             }
             return Some(out)
         }
-        LeafK.Texts(op, pl, ks) { return textRows(leaf, from, rs, r0, cnt, pl, fn(t: &str): bool { return textHolds(op, t, &ks) }) }
-        LeafK.Prefix(pl, m, trim, ks) { return textRows(leaf, from, rs, r0, cnt, pl, fn(t: &str): bool { return prefixIn(t, m, trim, &ks) }) }
+        LeafK.Texts(op, pl, ks) { return textRowsOp(s, dir, from, rs, r0, cnt, pl, op, &ks) }
+        LeafK.Prefix(pl, m, trim, ks) { return textRowsPrefix(s, dir, from, rs, r0, cnt, pl, m, trim, &ks) }
         LeafK.IntBloom(pl, pk, bf) {
-            if !wordsOk(leaf, pl, pk, -1) { return None }
+            if !wordsOkCols(s, dir, pl, pk, -1) { return None }
             let nulls = lexdb_cols.hasNulls(dir, pl)
             if lexdb_cols.hasRange(dir, pl) {
                 let mn = lexdb_cols.least(dir, pl)
@@ -303,7 +333,7 @@ pub fn rowsOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, k: &Lea
             if n == cnt && !nulls {
                 return Some(lexdb_cols.bloomFilter(s, dir, pl, from, cnt, r0, &bf))
             }
-            let w = wordsOf(leaf, from, rs, r0, cnt, pl)
+            let w = wordsOfCols(s, dir, from, rs, r0, cnt, pl)
             var out: []int = withCapacity(n)
             for x in 0..n {
                 if bf.has(w[x]) {
@@ -317,7 +347,7 @@ pub fn rowsOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, k: &Lea
             var cur = collections.copyOf(rs)
             for k2 in ks {
                 if len(cur) == 0 { break }
-                match rowsOf(leaf, from, &cur, r0, cnt, &k2) {
+                match rowsOfCols(s, dir, from, &cur, r0, cnt, &k2) {
                     Some(x) { cur = x }
                     None { return None }
                 }
@@ -327,9 +357,8 @@ pub fn rowsOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, k: &Lea
         LeafK.Any(ks) {
             var hit: []bool = array(n, false)
             for k2 in ks {
-                match rowsOf(leaf, from, rs, r0, cnt, &k2) {
+                match rowsOfCols(s, dir, from, rs, r0, cnt, &k2) {
                     Some(x) {
-                        // (x is rs's rows in order)
                         var j = 0
                         for r in x {
                             while rs[j] != r { j += 1 }
@@ -344,6 +373,10 @@ pub fn rowsOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, k: &Lea
             return Some(out)
         }
     }
+}
+
+pub fn rowsOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, k: &LeafK): Option[[]int] {
+    return rowsOfCols(leaf.cols, leaf.dir, from, rs, r0, cnt, k)
 }
 
 // Runs of column leaf rows the kernels chose (cRunLazy), for the tests.
