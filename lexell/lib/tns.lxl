@@ -184,24 +184,87 @@ fn typeErr(msg: &str): Error { return sqldialect.dbError(sqldialect.E_TYPE, msg)
 
 // ---------------------------------------------------------------- writing
 
+type VB = vector[byte]
+
+fn appendBytesSimd(dst: mut &[]byte, src: &[byte]) {
+    let n = len(src)
+    if n == 0 { return }
+    let at = bytesGrow(dst, n)
+    var i = 0
+    while i + 32 <= n {
+        VB.load(src, i).store(dst, at + i)
+        i += 32
+    }
+    while i < n {
+        dst[at + i] = src[i]
+        i += 1
+    }
+}
+
+fn appendBytes(dst: mut &[]byte, src: &[byte]) {
+    let n = len(src)
+    if n == 0 { return }
+    if n >= 32 { appendBytesSimd(dst, src); return }
+    let at = bytesGrow(dst, n)
+    for i in 0..n { dst[at + i] = src[i] }
+}
+
+fn shiftLeftSimd(b: mut &[]byte, src: int, n: int) {
+    var i = 0
+    while i + 32 <= n {
+        VB.load(b, src + i).store(b, i)
+        i += 32
+    }
+    while i < n {
+        b[i] = b[src + i]
+        i += 1
+    }
+}
+
+fn copySliceSimd(dst: mut &[]byte, src: &[byte], off: int, n: int) {
+    var i = 0
+    while i + 32 <= n {
+        VB.load(src, off + i).store(dst, i)
+        i += 32
+    }
+    while i < n {
+        dst[i] = src[off + i]
+        i += 1
+    }
+}
+
 fn put8(b: mut &[]byte, v: int) { append(b, byte(v & 0xff)) }
 
 fn put16be(b: mut &[]byte, v: int) {
-    append(b, byte((v >> 8) & 0xff))
-    append(b, byte(v & 0xff))
+    let at = bytesGrow(b, 2)
+    b[at] = byte((v >> 8) & 0xff)
+    b[at + 1] = byte(v & 0xff)
 }
 
 fn put16le(b: mut &[]byte, v: int) {
-    append(b, byte(v & 0xff))
-    append(b, byte((v >> 8) & 0xff))
+    let at = bytesGrow(b, 2)
+    b[at] = byte(v & 0xff)
+    b[at + 1] = byte((v >> 8) & 0xff)
 }
 
 fn put32be(b: mut &[]byte, v: int) {
-    for k in 0..4 { append(b, byte((v >> (24 - 8 * k)) & 0xff)) }
+    let at = bytesGrow(b, 4)
+    b[at] = byte((v >> 24) & 0xff)
+    b[at + 1] = byte((v >> 16) & 0xff)
+    b[at + 2] = byte((v >> 8) & 0xff)
+    b[at + 3] = byte(v & 0xff)
 }
 
 fn put64be(b: mut &[]byte, v: int) {
-    for k in 0..8 { append(b, byte((v >> (56 - 8 * k)) & 0xff)) }
+    let at = bytesGrow(b, 8)
+    b[at] = byte((v >> 56) & 0xff)
+    b[at + 1] = byte((v >> 48) & 0xff)
+    b[at + 2] = byte((v >> 40) & 0xff)
+    b[at + 3] = byte((v >> 32) & 0xff)
+    b[at + 4] = byte((v >> 24) & 0xff)
+    b[at + 5] = byte((v >> 16) & 0xff)
+    b[at + 6] = byte((v >> 8) & 0xff)
+    b[at + 7] = byte(v & 0xff)
 }
 
 fn putStr(b: mut &[]byte, s: &str) { appendStr(b, s) }
@@ -402,13 +465,16 @@ fn utf8(b: &str, what: &str): Result[str, Error] {
 
 // UTF-8 text as UTF-16BE (NCHAR binds).
 pub fn toUtf16be(s: &str): Result[str, Error] {
-    var out: []byte = []
+    let n = len(s)
+    if n >= 40 { return toUtf16beSimd(s) }
+    var out: []byte = withCapacity(2 * n)
     var i = 0
-    while i < len(s) {
+    while i < n {
         let c = s[i]
         if c < 0x80 {
-            append(mut &out, byte(0))
-            append(mut &out, c)
+            let at = bytesGrow(mut &out, 2)
+            out[at] = byte(0)
+            out[at + 1] = c
             i += 1
             continue
         }
@@ -425,15 +491,142 @@ pub fn toUtf16be(s: &str): Result[str, Error] {
     return Ok(strFromBytes(&out))
 }
 
+fn toUtf16beSimd(s: &str): Result[str, Error] {
+    let n = len(s)
+    var out = array(2 * n, byte(0))
+    var i = 0
+    var o = 0
+    while i < 8 && i < n {
+        let c = s[i]
+        if c >= byte(0x80) { break }
+        out[o + 1] = c
+        i += 1
+        o += 2
+    }
+    if i == 8 {
+        let l0Arr: []byte = [
+            128, 0, 128, 1, 128, 2, 128, 3, 128, 4, 128, 5, 128, 6, 128, 7,
+            128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128
+        ]
+        let l1Arr: []byte = [
+            128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128, 128,
+            128, 0, 128, 1, 128, 2, 128, 3, 128, 4, 128, 5, 128, 6, 128, 7
+        ]
+        let vL0 = VB.load(&l0Arr, 0)
+        let vL1 = VB.load(&l1Arr, 0)
+        let vHi = VB.splat(byte(0x80))
+        while i + 32 <= n {
+            let vA = VB.load(s, i)
+            if ((vA >= vHi).bitmask() & u64(0xffff)) != u64(0) { break }
+            let vB = VB.load(s, i - 8)
+            (vA.shuffle(vL0) | vB.shuffle(vL1)).store(mut &out, o)
+            i += 16
+            o += 32
+        }
+    }
+    while i < n && s[i] < byte(0x80) {
+        out[o + 1] = s[i]
+        i += 1
+        o += 2
+    }
+    if i == n { return Ok(strFromBytes(&out)) }
+    var res: []byte = withCapacity(o + 2 * (n - i))
+    appendBytesSimd(mut &res, &out[0..o])
+    while i < n {
+        let c = s[i]
+        if c < byte(0x80) {
+            let at = bytesGrow(mut &res, 2)
+            res[at] = byte(0)
+            res[at + 1] = c
+            i += 1
+            continue
+        }
+        let d = strings.decodeAt(&s, i)
+        if !d.ok { return Err(sqldialect.inputError(&("invalid UTF-8 at byte " + i.toStr()))) }
+        if d.rune >= 0x10000 {
+            put16be(mut &res, 0xd800 + ((d.rune - 0x10000) >> 10))
+            put16be(mut &res, 0xdc00 + ((d.rune - 0x10000) & 0x3ff))
+        } else {
+            put16be(mut &res, d.rune)
+        }
+        i += d.size
+    }
+    return Ok(strFromBytes(&res))
+}
+
 // UTF-16BE bytes as UTF-8; Err for an odd length or a lone surrogate.
 pub fn fromUtf16be(b: &str): Result[str, Error] {
-    if len(b) % 2 != 0 { return Err(proto("UTF-16 text with an odd number of bytes")) }
+    let n = len(b)
+    if (n & 1) != 0 { return Err(proto("UTF-16 text with an odd number of bytes")) }
+    if n >= 64 { return fromUtf16beSimd(b) }
+    var ascii = true
+    var k = 0
+    while k < n {
+        if b[k] != byte(0) || b[k + 1] >= byte(0x80) { ascii = false; break }
+        k += 2
+    }
+    if ascii {
+        var a = array(n >> 1, byte(0))
+        for j in 0..len(a) { a[j] = b[(j << 1) + 1] }
+        return Ok(strFromBytes(&a))
+    }
     var out = ""
     var i = 0
-    while i < len(b) {
+    while i < n {
         var u = (int(b[i]) << 8) | int(b[i + 1])
         if u >= 0xd800 && u <= 0xdfff {
-            let lo = if i + 3 < len(b) { (int(b[i + 2]) << 8) | int(b[i + 3]) } else { 0 }
+            let lo = if i + 3 < n { (int(b[i + 2]) << 8) | int(b[i + 3]) } else { 0 }
+            if u >= 0xdc00 || lo < 0xdc00 || lo > 0xdfff {
+                return Err(proto(&("invalid UTF-16: a lone surrogate at unit " + (i / 2).toStr())))
+            }
+            u = 0x10000 + ((u - 0xd800) << 10) + (lo - 0xdc00)
+            i += 2
+        }
+        strings.addRune(mut &out, u)
+        i += 2
+    }
+    return Ok(out)
+}
+
+fn fromUtf16beSimd(b: &str): Result[str, Error] {
+    let n = len(b)
+    var a = array(n >> 1, byte(0))
+    var buf = array(32, byte(0))
+    let maskArr: []byte = [
+        0xff, 0x80, 0xff, 0x80, 0xff, 0x80, 0xff, 0x80, 0xff, 0x80, 0xff, 0x80, 0xff, 0x80, 0xff, 0x80,
+        0xff, 0x80, 0xff, 0x80, 0xff, 0x80, 0xff, 0x80, 0xff, 0x80, 0xff, 0x80, 0xff, 0x80, 0xff, 0x80
+    ]
+    let oddArr: []byte = [
+        1, 3, 5, 7, 9, 11, 13, 15, 128, 128, 128, 128, 128, 128, 128, 128,
+        1, 3, 5, 7, 9, 11, 13, 15, 128, 128, 128, 128, 128, 128, 128, 128
+    ]
+    let vMask = VB.load(&maskArr, 0)
+    let vOdd = VB.load(&oddArr, 0)
+    let vZero = VB.splat(byte(0))
+    var i = 0
+    var o = 0
+    while i + 32 <= n {
+        let v = VB.load(b, i)
+        if ((v & vMask) != vZero).any() { break }
+        v.shuffle(vOdd).store(mut &buf, 0)
+        a[o] = buf[0]; a[o + 1] = buf[1]; a[o + 2] = buf[2]; a[o + 3] = buf[3]
+        a[o + 4] = buf[4]; a[o + 5] = buf[5]; a[o + 6] = buf[6]; a[o + 7] = buf[7]
+        a[o + 8] = buf[16]; a[o + 9] = buf[17]; a[o + 10] = buf[18]; a[o + 11] = buf[19]
+        a[o + 12] = buf[20]; a[o + 13] = buf[21]; a[o + 14] = buf[22]; a[o + 15] = buf[23]
+        i += 32
+        o += 16
+    }
+    while i < n && b[i] == byte(0) && b[i + 1] < byte(0x80) {
+        a[o] = b[i + 1]
+        i += 2
+        o += 1
+    }
+    if i == n { return Ok(strFromBytes(&a)) }
+    var out = strFromBytes(&a[0..o])
+    while i < n {
+        var u = (int(b[i]) << 8) | int(b[i + 1])
+        if u >= 0xd800 && u <= 0xdfff {
+            let lo = if i + 3 < n { (int(b[i + 2]) << 8) | int(b[i + 3]) } else { 0 }
             if u >= 0xdc00 || lo < 0xdc00 || lo > 0xdfff {
                 return Err(proto(&("invalid UTF-16: a lone surrogate at unit " + (i / 2).toStr())))
             }
@@ -476,19 +669,40 @@ pub fn (n: &Num) toStr(): str {
 
 // The Decimal; Err(DecError.Precision) for 39 and 40 digits.
 pub fn (n: &Num) decimal(): Result[Decimal, DecError] {
-    if n.digits == "" { return Ok(Decimal.zero()) }
-    if len(n.digits) > 38 { return Err(DecError.Precision) }
+    let nd = len(n.digits)
+    if nd == 0 { return Ok(Decimal.zero()) }
+    if nd > 38 { return Err(DecError.Precision) }
+    if nd <= 18 && n.exp <= 0 && -n.exp <= 1000 {
+        var u = 0
+        for i in 0..nd { u = u * 10 + int(n.digits[i] - '0') }
+        let v = if n.neg { -i128(u) } else { i128(u) }
+        return Ok(fromFraction(v, -n.exp))
+    }
+    if n.exp > 0 && nd + n.exp <= 18 {
+        var u = 0
+        for i in 0..nd { u = u * 10 + int(n.digits[i] - '0') }
+        for _ in 0..n.exp { u = u * 10 }
+        let v = if n.neg { -i128(u) } else { i128(u) }
+        return Ok(fromFraction(v, 0))
+    }
     let sign = if n.neg { "-" } else { "" }
     return Decimal.parse(&(sign + n.digits + "e" + n.exp.toStr()))
 }
 
 // The int, if the number is an integer within int's range.
 pub fn (n: &Num) int(): Option[int] {
-    if n.digits == "" { return Some(0) }
-    if n.exp < 0 || len(n.digits) + n.exp > 19 { return None }
+    let nd = len(n.digits)
+    if nd == 0 { return Some(0) }
+    if n.exp < 0 || nd + n.exp > 19 { return None }
+    if nd + n.exp <= 18 {
+        var u = 0
+        for i in 0..nd { u = u * 10 + int(n.digits[i] - '0') }
+        for _ in 0..n.exp { u = u * 10 }
+        return Some(if n.neg { -u } else { u })
+    }
     var v: i128 = 0
-    for i in 0..len(n.digits) { v = v * 10 + i128(n.digits[i] - '0') }
-    for i in 0..n.exp { v = v * 10 }
+    for i in 0..nd { v = v * 10 + i128(n.digits[i] - '0') }
+    for _ in 0..n.exp { v = v * 10 }
     if n.neg { v = -v }
     if v > i128(9223372036854775807) || v < -i128(9223372036854775807) - 1 { return None }
     return Some(int(v))
@@ -522,6 +736,8 @@ pub fn encodeNumber(n: &Num): Result[str, Error] {
     return Ok(strFromBytes(&b))
 }
 
+const DIGIT_PAIRS: str = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899"
+
 // The number in NUMBER bytes. Err for a malformed one and for -1e126
 // (Oracle's "negative infinity", a single byte 0).
 pub fn decodeNumber(b: &str): Result[Num, Error] {
@@ -536,21 +752,24 @@ pub fn decodeNumber(b: &str): Result[Num, Error] {
     let e = (if pos { b0 } else { (~b0) & 0xff }) - 193
     var last = n
     if !pos && int(b[n - 1]) == 102 { last = n - 1 }
-    var ds = ""
+    let nd = (last - 1) * 2
+    var buf = array(nd, byte(0))
+    var o = 0
     for i in 1..last {
         let v = if pos { int(b[i]) - 1 } else { 101 - int(b[i]) }
         if v < 0 || v > 99 { return Err(proto(&("a NUMBER mantissa byte " + int(b[i]).toStr()))) }
-        ds.addByte(byte(48 + v / 10))
-        ds.addByte(byte(48 + v % 10))
+        let p = v * 2
+        buf[o] = DIGIT_PAIRS[p]
+        buf[o + 1] = DIGIT_PAIRS[p + 1]
+        o += 2
     }
-    let all = ds
     // value = 0.all * 10^(2e + 2)
     var lo = 0
-    while lo < len(all) && all[lo] == '0' { lo += 1 }
-    var hi = len(all)
-    while hi > lo && all[hi - 1] == '0' { hi -= 1 }
+    while lo < nd && buf[lo] == '0' { lo += 1 }
+    var hi = nd
+    while hi > lo && buf[hi - 1] == '0' { hi -= 1 }
     if lo == hi { return Ok(Num{neg: false, digits: "", exp: 0}) }
-    return Ok(Num{neg: !pos, digits: all[lo..hi].clone(), exp: 2 * e + 2 - hi})
+    return Ok(Num{neg: !pos, digits: strFromBytes(&buf[lo..hi]), exp: 2 * e + 2 - hi})
 }
 
 // ---------------------------------------------------------------- floats
@@ -1360,7 +1579,10 @@ fn scanRaw(d: &rc str, at: int, r: mut &Reply): Result[int, Error] {
             let k = r.rawLens[q]
             append(mut &r.rawStarts, len(r.rawData))
             append(mut &r.rawLens, k)
-            if k > 0 { appendStr(mut &r.rawData, strFromBytes(&r.rawData[from..from + k])) }
+            if k > 0 {
+                let dst = bytesGrow(mut &r.rawData, k)
+                for j in 0..k { r.rawData[dst + j] = r.rawData[from + j] }
+            }
             continue
         }
         if plainRaw(&r.columns[i]) && p < n {
@@ -1479,7 +1701,7 @@ pub fn seedRaw(r: mut &Reply, prev: &Reply) {
         append(mut &r.rawStarts, len(r.rawData))
         append(mut &r.rawLens, n)
         let from = prev.rawStarts[first + i]
-        for k in 0..n { append(mut &r.rawData, prev.rawData[from + k]) }
+        if n > 0 { appendBytes(mut &r.rawData, &prev.rawData[from..from + n]) }
     }
     r.rawFirst = nc
 }
@@ -2123,10 +2345,12 @@ fn fillTo(s: mut &Stream, ib: mut &Inbox, n: int, w: Where): Result[Unit, Error]
             let k = ib.end - ib.pos
             if n > len(ib.buf) {
                 var nb = array(max(n, 2 * len(ib.buf)), byte(0))
-                for i in 0..k { nb[i] = ib.buf[ib.pos + i] }
+                if k >= 32 { copySliceSimd(mut &nb, &ib.buf, ib.pos, k) }
+                else { for i in 0..k { nb[i] = ib.buf[ib.pos + i] } }
                 ib.buf = nb
             } else {
-                for i in 0..k { ib.buf[i] = ib.buf[ib.pos + i] }
+                if k >= 32 { shiftLeftSimd(mut &ib.buf, ib.pos, k) }
+                else { for i in 0..k { ib.buf[i] = ib.buf[ib.pos + i] } }
             }
             ib.pos = 0
             ib.end = k
@@ -2182,12 +2406,13 @@ fn (t: mut &Transport) sendPacket(ptype: int, flags: int, payload: &str, w: Wher
 fn (t: mut &Transport) sendData(msg: &[]byte, w: Where): Result[Unit, Error] {
     let room = t.sdu - HEADER - 2
     var off = 0
-    var out: []byte = []
+    let npkts = if len(msg) == 0 { 1 } else { (len(msg) + room - 1) / room }
+    var out: []byte = withCapacity(len(msg) + npkts * (HEADER + 2))
     while true {
         let k = min(room, len(msg) - off)
         putHeader(mut &out, HEADER + 2 + k, PT_DATA, 0, t.large)
         put16be(mut &out, 0)
-        for i in 0..k { append(mut &out, msg[off + i]) }
+        appendBytes(mut &out, &msg[off..off + k])
         off += k
         if off >= len(msg) { break }
     }

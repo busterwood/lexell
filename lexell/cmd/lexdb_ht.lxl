@@ -18,9 +18,45 @@
 //    keyAt(gid) reconstructs key text on demand only for groups that survive Top-N pruning.
 import "collections"
 
+type VI32 = vector[i32]
+type VB = vector[byte]
+
 pub const TWO_LEVEL_THRESH = 16384
 pub const NBUCKETS = 256
 const BKT_MASK = 255
+
+fn htTag(h: u64, mask: int): i32 {
+    return i32((int((h >> 25) & u64(0x3fffffff)) & ~mask) | 0x40000000)
+}
+
+fn ctrlTag(h: int): byte {
+    return byte(((h >> 56) & 0x7f) | 0x80)
+}
+
+fn ctrlSet(ctrl: mut &[]byte, cap: int, sl: int, tag: byte) {
+    ctrl[sl] = tag
+    if sl < 32 { ctrl[cap + sl] = tag }
+}
+
+fn htSet(ht: mut &[]i32, cap: int, sl: int, val: i32) {
+    ht[sl] = val
+    if sl < 8 { ht[cap + sl] = val }
+}
+
+fn htInsertEmpty(ht: mut &[]i32, cap: int, h: u64, loc: int) {
+    let mask = cap - 1
+    let val = htTag(h, mask) | i32(loc + 1)
+    let vZero = VI32.zero()
+    var i = int(h & u64(mask))
+    while true {
+        let em = (VI32.load(ht, i) == vZero).bitmask()
+        if em != u64(0) {
+            htSet(ht, cap, (i + int(em.trailingZeros())) & mask, val)
+            return
+        }
+        i = (i + 8) & mask
+    }
+}
 
 fn bucketOf(h: u64): int {
     return int((h >> 56) & u64(BKT_MASK))
@@ -70,6 +106,7 @@ fn bloomWords(nKeys: int, room: int): int {
 
 pub type FastIntCount = record {
     pub slots: []int    // interleaved [k, v] per slot (v == 0 means empty)
+    ctrl: []byte        // cap + 32 mirrored SwissTable control bytes (0 = empty, 0x80|h2 = full)
     mask: int
     len: int
     bf: []u64           // optional register-blocked Bloom filter
@@ -77,7 +114,7 @@ pub type FastIntCount = record {
 }
 
 pub fn newFastIntCount(): FastIntCount {
-    return FastIntCount{slots: [], mask: 0, len: 0, bf: [], bfMask: -1}
+    return FastIntCount{slots: [], ctrl: [], mask: 0, len: 0, bf: [], bfMask: -1}
 }
 
 pub fn (t: &FastIntCount) size(): int { return t.len }
@@ -86,6 +123,8 @@ fn (t: mut &FastIntCount) grow() {
     let cap = if len(t.slots) == 0 { 1024 } else { len(t.slots) } // len(slots) == oldCap * 2
     let mask = cap - 1
     var ns: []int = array(cap * 2, 0)
+    var nc: []byte = array(cap + 32, byte(0))
+    let vZero = VB.zero()
     var i = 0
     let nOld = len(t.slots)
     while i < nOld {
@@ -94,14 +133,24 @@ fn (t: mut &FastIntCount) grow() {
             let k = t.slots[i]
             var h = (k ^ (k >> 30)) *% 0x2545f4914f6cdd1d
             h = h ^ (h >> 27)
+            let tag = ctrlTag(h)
             var sl = h & mask
-            while ns[sl * 2 + 1] != 0 { sl = (sl + 1) & mask }
-            ns[sl * 2] = k
-            ns[sl * 2 + 1] = v
+            while true {
+                let em = (VB.load(&nc, sl) == vZero).bitmask()
+                if em != u64(0) {
+                    let at = (sl + int(em.trailingZeros())) & mask
+                    ctrlSet(mut &nc, cap, at, tag)
+                    ns[at * 2] = k
+                    ns[at * 2 + 1] = v
+                    break
+                }
+                sl = (sl + 32) & mask
+            }
         }
         i += 2
     }
     t.slots = ns
+    t.ctrl = nc
     t.mask = mask
 }
 
@@ -113,27 +162,40 @@ pub fn (t: mut &FastIntCount) inc(k: int): bool {
 pub fn (t: mut &FastIntCount) addW(k: int, w: int): bool {
     if w == 0 { return false }
     let cap = len(t.slots) / 2
-    if cap == 0 || (t.len + 1) * 10 >= cap * 6 {
+    if cap == 0 || (t.len + 1) * 8 > cap * 7 {
         t.grow()
     }
+    let capNow = t.mask + 1
     let mask = t.mask
     var h = (k ^ (k >> 30)) *% 0x2545f4914f6cdd1d
     h = h ^ (h >> 27)
+    let tag = ctrlTag(h)
+    let vTag = VB.splat(tag)
+    let vZero = VB.zero()
     var sl = h & mask
     while true {
-        let base = sl * 2
-        let v = t.slots[base + 1]
-        if v == 0 {
+        let cv = VB.load(&t.ctrl, sl)
+        var hits = (cv == vTag).bitmask()
+        while hits != u64(0) {
+            let at = (sl + int(hits.trailingZeros())) & mask
+            let base = at * 2
+            if t.slots[base] == k {
+                t.slots[base + 1] = t.slots[base + 1] + w
+                return false
+            }
+            hits = hits & (hits - u64(1))
+        }
+        let em = (cv == vZero).bitmask()
+        if em != u64(0) {
+            let at = (sl + int(em.trailingZeros())) & mask
+            ctrlSet(mut &t.ctrl, capNow, at, tag)
+            let base = at * 2
             t.slots[base] = k
             t.slots[base + 1] = w
             t.len += 1
             return true
         }
-        if t.slots[base] == k {
-            t.slots[base + 1] = v + w
-            return false
-        }
-        sl = (sl + 1) & mask
+        sl = (sl + 32) & mask
     }
     return false
 }
@@ -173,13 +235,20 @@ pub fn (t: &FastIntCount) get(k: int): int {
         if (t.bf[h & t.bfMask] & b) != b { return 0 }
     }
     let mask = t.mask
+    let vTag = VB.splat(ctrlTag(h))
+    let vZero = VB.zero()
     var sl = h & mask
     while true {
-        let base = sl * 2
-        let v = t.slots[base + 1]
-        if v == 0 { return 0 }
-        if t.slots[base] == k { return v }
-        sl = (sl + 1) & mask
+        let cv = VB.load(&t.ctrl, sl)
+        var hits = (cv == vTag).bitmask()
+        while hits != u64(0) {
+            let at = (sl + int(hits.trailingZeros())) & mask
+            let base = at * 2
+            if t.slots[base] == k { return t.slots[base + 1] }
+            hits = hits & (hits - u64(1))
+        }
+        if (cv == vZero).bitmask() != u64(0) { return 0 }
+        sl = (sl + 32) & mask
     }
     return 0
 }
@@ -193,6 +262,7 @@ pub fn (t: &FastIntCount) mulWeights(at0: &[]int, kv: &[]int, knul: &[]bool, ws:
     let mask = t.mask
     let bfMask = t.bfMask
     let hasBf = bfMask >= 0
+    let vZero = VB.zero()
     var kept = 0
     var mat = 0
     var nul = 0
@@ -212,19 +282,26 @@ pub fn (t: &FastIntCount) mulWeights(at0: &[]int, kv: &[]int, knul: &[]bool, ws:
                         (u64(1) << ((h >> 36) & 63))
                 if (t.bf[h & bfMask] & b) != b { continue }
             }
+            let vTag = VB.splat(ctrlTag(h))
             var sl = h & mask
+            var found = 0
             while true {
-                let base = sl * 2
-                let v = t.slots[base + 1]
-                if v == 0 { break }
-                if t.slots[base] == k {
-                    let nw = wr * v
-                    w2[r] = nw
-                    mat += nw
-                    kept += 1
-                    break
+                let cv = VB.load(&t.ctrl, sl)
+                var hits = (cv == vTag).bitmask()
+                while hits != u64(0) {
+                    let at = (sl + int(hits.trailingZeros())) & mask
+                    let base = at * 2
+                    if t.slots[base] == k { found = t.slots[base + 1]; break }
+                    hits = hits & (hits - u64(1))
                 }
-                sl = (sl + 1) & mask
+                if found != 0 || (cv == vZero).bitmask() != u64(0) { break }
+                sl = (sl + 32) & mask
+            }
+            if found != 0 {
+                let nw = wr * found
+                w2[r] = nw
+                mat += nw
+                kept += 1
             }
         }
         matched += mat
@@ -247,13 +324,19 @@ pub fn (t: &FastIntCount) mulWeights(at0: &[]int, kv: &[]int, knul: &[]bool, ws:
                 if (t.bf[h & bfMask] & b) != b { ok = false }
             }
             if ok {
+                let vTag = VB.splat(ctrlTag(h))
                 var sl = h & mask
                 while true {
-                    let base = sl * 2
-                    let v = t.slots[base + 1]
-                    if v == 0 { break }
-                    if t.slots[base] == k { m = v; break }
-                    sl = (sl + 1) & mask
+                    let cv = VB.load(&t.ctrl, sl)
+                    var hits = (cv == vTag).bitmask()
+                    while hits != u64(0) {
+                        let at = (sl + int(hits.trailingZeros())) & mask
+                        let base = at * 2
+                        if t.slots[base] == k { m = t.slots[base + 1]; break }
+                        hits = hits & (hits - u64(1))
+                    }
+                    if m != 0 || (cv == vZero).bitmask() != u64(0) { break }
+                    sl = (sl + 32) & mask
                 }
             }
         }
@@ -278,6 +361,7 @@ pub fn (t: &FastIntCount) sumLast1W(at0: &[]int, kv: &[]int, knul: &[]bool, ws: 
     let mask = t.mask
     let bfMask = t.bfMask
     let hasBf = bfMask >= 0
+    let vZero = VB.zero()
     var a = 0
     var mat = 0
     var nul = 0
@@ -297,14 +381,22 @@ pub fn (t: &FastIntCount) sumLast1W(at0: &[]int, kv: &[]int, knul: &[]bool, ws: 
                         (u64(1) << ((h >> 36) & 63))
                 if (t.bf[h & bfMask] & b) != b { continue }
             }
+            let vTag = VB.splat(ctrlTag(h))
             var sl = h & mask
+            var found = 0
             while true {
-                let base = sl * 2
-                let v = t.slots[base + 1]
-                if v == 0 { break }
-                if t.slots[base] == k { a += wr * v; break }
-                sl = (sl + 1) & mask
+                let cv = VB.load(&t.ctrl, sl)
+                var hits = (cv == vTag).bitmask()
+                while hits != u64(0) {
+                    let at = (sl + int(hits.trailingZeros())) & mask
+                    let base = at * 2
+                    if t.slots[base] == k { found = t.slots[base + 1]; break }
+                    hits = hits & (hits - u64(1))
+                }
+                if found != 0 || (cv == vZero).bitmask() != u64(0) { break }
+                sl = (sl + 32) & mask
             }
+            if found != 0 { a += wr * found }
         }
         acc += a
         matched += a
@@ -327,13 +419,19 @@ pub fn (t: &FastIntCount) sumLast1W(at0: &[]int, kv: &[]int, knul: &[]bool, ws: 
                 if (t.bf[h & bfMask] & b) != b { ok = false }
             }
             if ok {
+                let vTag = VB.splat(ctrlTag(h))
                 var sl = h & mask
                 while true {
-                    let base = sl * 2
-                    let v = t.slots[base + 1]
-                    if v == 0 { break }
-                    if t.slots[base] == k { m = v; break }
-                    sl = (sl + 1) & mask
+                    let cv = VB.load(&t.ctrl, sl)
+                    var hits = (cv == vTag).bitmask()
+                    while hits != u64(0) {
+                        let at = (sl + int(hits.trailingZeros())) & mask
+                        let base = at * 2
+                        if t.slots[base] == k { m = t.slots[base + 1]; break }
+                        hits = hits & (hits - u64(1))
+                    }
+                    if m != 0 || (cv == vZero).bitmask() != u64(0) { break }
+                    sl = (sl + 32) & mask
                 }
             }
         }
@@ -358,6 +456,7 @@ pub fn (t: &FastIntCount) sumLast2W(at0: &[]int, at1: &[]int, kv0: &[]int, nul0:
     let mask = t.mask
     let bfMask = t.bfMask
     let hasBf = bfMask >= 0
+    let vZero = VB.zero()
     var a = 0
     var mat = 0
     var nul = 0
@@ -381,14 +480,22 @@ pub fn (t: &FastIntCount) sumLast2W(at0: &[]int, at1: &[]int, kv0: &[]int, nul0:
                         (u64(1) << ((h >> 36) & 63))
                 if (t.bf[h & bfMask] & b) != b { continue }
             }
+            let vTag = VB.splat(ctrlTag(h))
             var sl = h & mask
+            var found = 0
             while true {
-                let base = sl * 2
-                let v = t.slots[base + 1]
-                if v == 0 { break }
-                if t.slots[base] == k { a += wr * v; break }
-                sl = (sl + 1) & mask
+                let cv = VB.load(&t.ctrl, sl)
+                var hits = (cv == vTag).bitmask()
+                while hits != u64(0) {
+                    let at = (sl + int(hits.trailingZeros())) & mask
+                    let base = at * 2
+                    if t.slots[base] == k { found = t.slots[base + 1]; break }
+                    hits = hits & (hits - u64(1))
+                }
+                if found != 0 || (cv == vZero).bitmask() != u64(0) { break }
+                sl = (sl + 32) & mask
             }
+            if found != 0 { a += wr * found }
         }
         acc += a
         matched += a
@@ -415,13 +522,19 @@ pub fn (t: &FastIntCount) sumLast2W(at0: &[]int, at1: &[]int, kv0: &[]int, nul0:
                     if (t.bf[h & bfMask] & b) != b { ok = false }
                 }
                 if ok {
+                    let vTag = VB.splat(ctrlTag(h))
                     var sl = h & mask
                     while true {
-                        let base = sl * 2
-                        let v = t.slots[base + 1]
-                        if v == 0 { break }
-                        if t.slots[base] == k { m = v; break }
-                        sl = (sl + 1) & mask
+                        let cv = VB.load(&t.ctrl, sl)
+                        var hits = (cv == vTag).bitmask()
+                        while hits != u64(0) {
+                            let at = (sl + int(hits.trailingZeros())) & mask
+                            let base = at * 2
+                            if t.slots[base] == k { m = t.slots[base + 1]; break }
+                            hits = hits & (hits - u64(1))
+                        }
+                        if m != 0 || (cv == vZero).bitmask() != u64(0) { break }
+                        sl = (sl + 32) & mask
                     }
                 }
             }
@@ -439,12 +552,13 @@ pub fn (t: &FastIntCount) sumLast2W(at0: &[]int, at1: &[]int, kv0: &[]int, nul0:
 }
 
 // ============================================================================
-// 0a. FastIntMap: Flat power-of-2 open-addressed int -> bucket hash table
+// 0a. FastIntMap: Flat power-of-2 SwissTable int -> bucket hash table
 //     with cache-line-packed [k, bucket + 1] slots and L3 Bloom pre-filter.
 // ============================================================================
 
 pub type FastIntMap = record {
     pub slots: []int    // interleaved [k, bucket + 1] per slot (0 = empty)
+    ctrl: []byte        // cap + 32 mirrored SwissTable control bytes
     mask: int
     len: int
     bf: []u64
@@ -452,15 +566,16 @@ pub type FastIntMap = record {
 }
 
 pub fn newFastIntMap(): FastIntMap {
-    return FastIntMap{slots: [], mask: 0, len: 0, bf: [], bfMask: -1}
+    return FastIntMap{slots: [], ctrl: [], mask: 0, len: 0, bf: [], bfMask: -1}
 }
 
 pub fn (t: &FastIntMap) size(): int { return t.len }
 
 // Zero-rehash O(cap) conversion of FastIntMap (key -> bucket+1) into FastIntCount (key -> bucketW[bucket])
-// when every bucket has weight > 0. Moves slots and Bloom filter directly (0 allocs, 0 hashes).
+// when every bucket has weight > 0. Moves slots, ctrl and Bloom filter directly (0 allocs, 0 hashes).
 pub fn (t: mut &FastIntMap) intoWeightedCount(bucketW: &[]int): FastIntCount {
     var slots = replace(mut &t.slots, [])
+    var ctrl = replace(mut &t.ctrl, [])
     var bf = replace(mut &t.bf, [])
     let mask = t.mask
     let n = t.len
@@ -475,13 +590,15 @@ pub fn (t: mut &FastIntMap) intoWeightedCount(bucketW: &[]int): FastIntCount {
         if v != 0 { slots[i + 1] = bucketW[v - 1] }
         i += 2
     }
-    return FastIntCount{slots: slots, mask: mask, len: n, bf: bf, bfMask: bfMask}
+    return FastIntCount{slots: slots, ctrl: ctrl, mask: mask, len: n, bf: bf, bfMask: bfMask}
 }
 
 fn (t: mut &FastIntMap) grow() {
     let cap = if len(t.slots) == 0 { 1024 } else { len(t.slots) } // len(slots) == oldCap * 2
     let mask = cap - 1
     var ns: []int = array(cap * 2, 0)
+    var nc: []byte = array(cap + 32, byte(0))
+    let vZero = VB.zero()
     var i = 0
     let nOld = len(t.slots)
     while i < nOld {
@@ -490,40 +607,61 @@ fn (t: mut &FastIntMap) grow() {
             let k = t.slots[i]
             var h = (k ^ (k >> 30)) *% 0x2545f4914f6cdd1d
             h = h ^ (h >> 27)
+            let tag = ctrlTag(h)
             var sl = h & mask
-            while ns[sl * 2 + 1] != 0 { sl = (sl + 1) & mask }
-            ns[sl * 2] = k
-            ns[sl * 2 + 1] = v
+            while true {
+                let em = (VB.load(&nc, sl) == vZero).bitmask()
+                if em != u64(0) {
+                    let at = (sl + int(em.trailingZeros())) & mask
+                    ctrlSet(mut &nc, cap, at, tag)
+                    ns[at * 2] = k
+                    ns[at * 2 + 1] = v
+                    break
+                }
+                sl = (sl + 32) & mask
+            }
         }
         i += 2
     }
     t.slots = ns
+    t.ctrl = nc
     t.mask = mask
 }
 
 // Returns existing bucket (>= 0) or inserts nextBk and returns nextBk.
 pub fn (t: mut &FastIntMap) getOrPut(k: int, nextBk: int): int {
     let cap = len(t.slots) / 2
-    if cap == 0 || (t.len + 1) * 10 >= cap * 6 {
+    if cap == 0 || (t.len + 1) * 8 > cap * 7 {
         t.grow()
     }
+    let capNow = t.mask + 1
     let mask = t.mask
     var h = (k ^ (k >> 30)) *% 0x2545f4914f6cdd1d
     h = h ^ (h >> 27)
+    let tag = ctrlTag(h)
+    let vTag = VB.splat(tag)
+    let vZero = VB.zero()
     var sl = h & mask
     while true {
-        let base = sl * 2
-        let v = t.slots[base + 1]
-        if v == 0 {
+        let cv = VB.load(&t.ctrl, sl)
+        var hits = (cv == vTag).bitmask()
+        while hits != u64(0) {
+            let at = (sl + int(hits.trailingZeros())) & mask
+            let base = at * 2
+            if t.slots[base] == k { return t.slots[base + 1] - 1 }
+            hits = hits & (hits - u64(1))
+        }
+        let em = (cv == vZero).bitmask()
+        if em != u64(0) {
+            let at = (sl + int(em.trailingZeros())) & mask
+            ctrlSet(mut &t.ctrl, capNow, at, tag)
+            let base = at * 2
             t.slots[base] = k
             t.slots[base + 1] = nextBk + 1
             t.len += 1
             return nextBk
         }
-        if t.slots[base] == k {
-            return v - 1
-        }
-        sl = (sl + 1) & mask
+        sl = (sl + 32) & mask
     }
     return nextBk
 }
@@ -563,13 +701,20 @@ pub fn (t: &FastIntMap) get(k: int): int {
         if (t.bf[h & t.bfMask] & b) != b { return -1 }
     }
     let mask = t.mask
+    let vTag = VB.splat(ctrlTag(h))
+    let vZero = VB.zero()
     var sl = h & mask
     while true {
-        let base = sl * 2
-        let v = t.slots[base + 1]
-        if v == 0 { return -1 }
-        if t.slots[base] == k { return v - 1 }
-        sl = (sl + 1) & mask
+        let cv = VB.load(&t.ctrl, sl)
+        var hits = (cv == vTag).bitmask()
+        while hits != u64(0) {
+            let at = (sl + int(hits.trailingZeros())) & mask
+            let base = at * 2
+            if t.slots[base] == k { return t.slots[base + 1] - 1 }
+            hits = hits & (hits - u64(1))
+        }
+        if (cv == vZero).bitmask() != u64(0) { return -1 }
+        sl = (sl + 32) & mask
     }
     return -1
 }
@@ -586,6 +731,7 @@ pub fn (t: &FastIntMap) neqCountW(at0: &[]int, kv: &[]int, knul: &[]bool,
     let mask = t.mask
     let bfMask = t.bfMask
     let hasBf = bfMask >= 0
+    let vZero = VB.zero()
     var a = 0
     var tr = 0
     var sw = 0
@@ -607,14 +753,20 @@ pub fn (t: &FastIntMap) neqCountW(at0: &[]int, kv: &[]int, knul: &[]bool,
                     (u64(1) << ((h >> 36) & 63))
             if (t.bf[h & bfMask] & b) != b { continue }
         }
+        let vTag = VB.splat(ctrlTag(h))
         var sl = h & mask
         var bk = -1
         while true {
-            let base = sl * 2
-            let v = t.slots[base + 1]
-            if v == 0 { break }
-            if t.slots[base] == k { bk = v - 1; break }
-            sl = (sl + 1) & mask
+            let cv = VB.load(&t.ctrl, sl)
+            var hits = (cv == vTag).bitmask()
+            while hits != u64(0) {
+                let at = (sl + int(hits.trailingZeros())) & mask
+                let base = at * 2
+                if t.slots[base] == k { bk = t.slots[base + 1] - 1; break }
+                hits = hits & (hits - u64(1))
+            }
+            if bk >= 0 || (cv == vZero).bitmask() != u64(0) { break }
+            sl = (sl + 32) & mask
         }
         if bk >= 0 {
             let mb = bk * 3
@@ -648,32 +800,31 @@ pub fn (t: &FastIntMap) neqCountW(at0: &[]int, kv: &[]int, knul: &[]bool,
 }
 
 // ============================================================================
-// 0b. FastInt2Count & FastInt2Map: Flat open-addressed (int64, int64) tables
-//     with cache-line-packed [k0, k1, v] slots and L3 Bloom pre-filters.
+// 0b. FastInt2Set, FastInt2Count & FastInt2Map: Flat 32-byte SwissTable
+//     (int64, int64) tables with inline slots and L3 Bloom pre-filters.
 // ============================================================================
 
 pub type FastInt2Count = record {
     slots: []int        // interleaved [k0, k1, v] per slot (v == 0 means empty)
+    ctrl: []byte        // cap + 32 mirrored SwissTable control bytes (0 = empty, 0x80|h2 = full)
     mask: int
     len: int
     bf: []u64
     bfMask: int
 }
 
-// 16-byte/slot [k0, k1] set for MK_ANTI JK_INT2_64 joins (33% smaller than FastInt2Count; fits closer to L3!).
-const SET2_EMPTY = -9223372036854775807 - 1
-
+// 16-byte/slot [k0, k1] SwissTable set for MK_ANTI JK_INT2_64 joins (ctrl == 0 marks empty, no sentinel needed).
 pub type FastInt2Set = record {
-    slots: []int        // interleaved [k0, k1] per slot (k0 == SET2_EMPTY means empty)
+    slots: []int        // interleaved [k0, k1] per slot
+    ctrl: []byte        // cap + 32 mirrored SwissTable control bytes
     mask: int
     len: int
-    minK1: []int        // overflow for rare k0 == SET2_EMPTY keys
     bf: []u64
     bfMask: int
 }
 
 pub fn newFastInt2Set(): FastInt2Set {
-    return FastInt2Set{slots: [], mask: 0, len: 0, minK1: [], bf: [], bfMask: -1}
+    return FastInt2Set{slots: [], ctrl: [], mask: 0, len: 0, bf: [], bfMask: -1}
 }
 
 pub fn (t: &FastInt2Set) size(): int { return t.len }
@@ -681,55 +832,71 @@ pub fn (t: &FastInt2Set) size(): int { return t.len }
 fn (t: mut &FastInt2Set) grow() {
     let cap = if len(t.slots) == 0 { 1024 } else { len(t.slots) }
     let mask = cap - 1
-    var ns: []int = array(cap * 2, SET2_EMPTY)
-    var i = 0
-    let nOld = len(t.slots)
-    while i < nOld {
-        let k0 = t.slots[i]
-        if k0 != SET2_EMPTY {
-            let k1 = t.slots[i + 1]
+    var ns: []int = array(cap * 2, 0)
+    var nc: []byte = array(cap + 32, byte(0))
+    let vZero = VB.zero()
+    let oldCap = len(t.slots) / 2
+    for i in 0..oldCap {
+        if t.ctrl[i] != byte(0) {
+            let k0 = t.slots[i * 2]
+            let k1 = t.slots[i * 2 + 1]
             var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
             h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
             h = h ^ (h >> 31)
+            let tag = ctrlTag(h)
             var sl = h & mask
-            while ns[sl * 2] != SET2_EMPTY { sl = (sl + 1) & mask }
-            let base = sl * 2
-            ns[base] = k0
-            ns[base + 1] = k1
+            while true {
+                let em = (VB.load(&nc, sl) == vZero).bitmask()
+                if em != u64(0) {
+                    let at = (sl + int(em.trailingZeros())) & mask
+                    ctrlSet(mut &nc, cap, at, tag)
+                    ns[at * 2] = k0
+                    ns[at * 2 + 1] = k1
+                    break
+                }
+                sl = (sl + 32) & mask
+            }
         }
-        i += 2
     }
     t.slots = ns
+    t.ctrl = nc
     t.mask = mask
 }
 
 pub fn (t: mut &FastInt2Set) add(k0: int, k1: int): bool {
-    if k0 == SET2_EMPTY {
-        for x in t.minK1 { if x == k1 { return false } }
-        append(mut &t.minK1, k1)
-        t.len += 1
-        return true
-    }
     let cap = len(t.slots) / 2
-    if cap == 0 || (t.len + 1) * 10 >= cap * 6 {
+    if cap == 0 || (t.len + 1) * 8 > cap * 7 {
         t.grow()
     }
+    let capNow = t.mask + 1
     let mask = t.mask
     var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
     h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
     h = h ^ (h >> 31)
+    let tag = ctrlTag(h)
+    let vTag = VB.splat(tag)
+    let vZero = VB.zero()
     var sl = h & mask
     while true {
-        let base = sl * 2
-        let s0 = t.slots[base]
-        if s0 == SET2_EMPTY {
+        let cv = VB.load(&t.ctrl, sl)
+        var hits = (cv == vTag).bitmask()
+        while hits != u64(0) {
+            let at = (sl + int(hits.trailingZeros())) & mask
+            let base = at * 2
+            if t.slots[base] == k0 && t.slots[base + 1] == k1 { return false }
+            hits = hits & (hits - u64(1))
+        }
+        let em = (cv == vZero).bitmask()
+        if em != u64(0) {
+            let at = (sl + int(em.trailingZeros())) & mask
+            ctrlSet(mut &t.ctrl, capNow, at, tag)
+            let base = at * 2
             t.slots[base] = k0
             t.slots[base + 1] = k1
             t.len += 1
             return true
         }
-        if s0 == k0 && t.slots[base + 1] == k1 { return false }
-        sl = (sl + 1) & mask
+        sl = (sl + 32) & mask
     }
     return false
 }
@@ -739,12 +906,10 @@ pub fn (t: mut &FastInt2Set) buildFilter(room: int) {
     if words == 0 { return }
     let bm = words - 1
     var bf: []u64 = array(words, u64(0))
-    var i = 0
-    let n = len(t.slots)
-    while i < n {
-        let k0 = t.slots[i]
-        if k0 != SET2_EMPTY {
-            var h = (k0 *% 0x517cc1b727220a95) ^ (t.slots[i + 1] *% 0x2545f4914f6cdd1d)
+    let cap = len(t.slots) / 2
+    for i in 0..cap {
+        if t.ctrl[i] != byte(0) {
+            var h = (t.slots[i * 2] *% 0x517cc1b727220a95) ^ (t.slots[i * 2 + 1] *% 0x2545f4914f6cdd1d)
             h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
             h = h ^ (h >> 31)
             let wi = h & bm
@@ -753,17 +918,6 @@ pub fn (t: mut &FastInt2Set) buildFilter(room: int) {
                     (u64(1) << ((h >> 36) & 63))
             bf[wi] = bf[wi] | b
         }
-        i += 2
-    }
-    for k1 in t.minK1 {
-        var h = (SET2_EMPTY *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
-        h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
-        h = h ^ (h >> 31)
-        let wi = h & bm
-        let b = (u64(1) << ((h >> 24) & 63)) |
-                (u64(1) << ((h >> 30) & 63)) |
-                (u64(1) << ((h >> 36) & 63))
-        bf[wi] = bf[wi] | b
     }
     t.bf = bf
     t.bfMask = bm
@@ -771,10 +925,6 @@ pub fn (t: mut &FastInt2Set) buildFilter(room: int) {
 
 pub fn (t: &FastInt2Set) has(k0: int, k1: int): bool {
     if t.len == 0 { return false }
-    if k0 == SET2_EMPTY {
-        for x in t.minK1 { if x == k1 { return true } }
-        return false
-    }
     var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
     h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
     h = h ^ (h >> 31)
@@ -785,13 +935,20 @@ pub fn (t: &FastInt2Set) has(k0: int, k1: int): bool {
         if (t.bf[h & t.bfMask] & b) != b { return false }
     }
     let mask = t.mask
+    let vTag = VB.splat(ctrlTag(h))
+    let vZero = VB.zero()
     var sl = h & mask
     while true {
-        let base = sl * 2
-        let s0 = t.slots[base]
-        if s0 == SET2_EMPTY { return false }
-        if s0 == k0 && t.slots[base + 1] == k1 { return true }
-        sl = (sl + 1) & mask
+        let cv = VB.load(&t.ctrl, sl)
+        var hits = (cv == vTag).bitmask()
+        while hits != u64(0) {
+            let at = (sl + int(hits.trailingZeros())) & mask
+            let base = at * 2
+            if t.slots[base] == k0 && t.slots[base + 1] == k1 { return true }
+            hits = hits & (hits - u64(1))
+        }
+        if (cv == vZero).bitmask() != u64(0) { return false }
+        sl = (sl + 32) & mask
     }
     return false
 }
@@ -804,6 +961,7 @@ pub fn (t: &FastInt2Set) sumLastAntiW(at0: &[]int, at1: &[]int, kv0: &[]int, nul
     let mask = t.mask
     let bfMask = t.bfMask
     let hasBf = bfMask >= 0
+    let vZero = VB.zero()
     var a = 0
     var mat = 0
     for r in 0..n {
@@ -815,28 +973,30 @@ pub fn (t: &FastInt2Set) sumLastAntiW(at0: &[]int, at1: &[]int, kv0: &[]int, nul
         if tLen > 0 && sr0 >= 0 && sr1 >= 0 && !nul0[sr0] && !nul1[sr1] {
             let k0 = kv0[sr0]
             let k1 = kv1[sr1]
-            if k0 == SET2_EMPTY {
-                for x in t.minK1 { if x == k1 { hit = true; break } }
-            } else {
-                var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
-                h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
-                h = h ^ (h >> 31)
-                var ok = true
-                if hasBf {
-                    let b = (u64(1) << ((h >> 24) & 63)) |
-                            (u64(1) << ((h >> 30) & 63)) |
-                            (u64(1) << ((h >> 36) & 63))
-                    if (t.bf[h & bfMask] & b) != b { ok = false }
-                }
-                if ok {
-                    var sl = h & mask
-                    while true {
-                        let base = sl * 2
-                        let s0 = t.slots[base]
-                        if s0 == SET2_EMPTY { break }
-                        if s0 == k0 && t.slots[base + 1] == k1 { hit = true; break }
-                        sl = (sl + 1) & mask
+            var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
+            h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
+            h = h ^ (h >> 31)
+            var ok = true
+            if hasBf {
+                let b = (u64(1) << ((h >> 24) & 63)) |
+                        (u64(1) << ((h >> 30) & 63)) |
+                        (u64(1) << ((h >> 36) & 63))
+                if (t.bf[h & bfMask] & b) != b { ok = false }
+            }
+            if ok {
+                let vTag = VB.splat(ctrlTag(h))
+                var sl = h & mask
+                while true {
+                    let cv = VB.load(&t.ctrl, sl)
+                    var hits = (cv == vTag).bitmask()
+                    while hits != u64(0) {
+                        let at = (sl + int(hits.trailingZeros())) & mask
+                        let base = at * 2
+                        if t.slots[base] == k0 && t.slots[base + 1] == k1 { hit = true; break }
+                        hits = hits & (hits - u64(1))
                     }
+                    if hit || (cv == vZero).bitmask() != u64(0) { break }
+                    sl = (sl + 32) & mask
                 }
             }
         }
@@ -848,7 +1008,7 @@ pub fn (t: &FastInt2Set) sumLastAntiW(at0: &[]int, at1: &[]int, kv0: &[]int, nul
 }
 
 pub fn newFastInt2Count(): FastInt2Count {
-    return FastInt2Count{slots: [], mask: 0, len: 0, bf: [], bfMask: -1}
+    return FastInt2Count{slots: [], ctrl: [], mask: 0, len: 0, bf: [], bfMask: -1}
 }
 
 pub fn (t: &FastInt2Count) size(): int { return t.len }
@@ -857,6 +1017,8 @@ fn (t: mut &FastInt2Count) grow() {
     let cap = if len(t.slots) == 0 { 1024 } else { (len(t.slots) / 3) * 2 }
     let mask = cap - 1
     var ns: []int = array(cap * 3, 0)
+    var nc: []byte = array(cap + 32, byte(0))
+    let vZero = VB.zero()
     var i = 0
     let nOld = len(t.slots)
     while i < nOld {
@@ -867,44 +1029,67 @@ fn (t: mut &FastInt2Count) grow() {
             var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
             h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
             h = h ^ (h >> 31)
+            let tag = ctrlTag(h)
             var sl = h & mask
-            while ns[sl * 3 + 2] != 0 { sl = (sl + 1) & mask }
-            let base = sl * 3
-            ns[base] = k0
-            ns[base + 1] = k1
-            ns[base + 2] = v
+            while true {
+                let em = (VB.load(&nc, sl) == vZero).bitmask()
+                if em != u64(0) {
+                    let at = (sl + int(em.trailingZeros())) & mask
+                    ctrlSet(mut &nc, cap, at, tag)
+                    let base = at * 3
+                    ns[base] = k0
+                    ns[base + 1] = k1
+                    ns[base + 2] = v
+                    break
+                }
+                sl = (sl + 32) & mask
+            }
         }
         i += 3
     }
     t.slots = ns
+    t.ctrl = nc
     t.mask = mask
 }
 
 pub fn (t: mut &FastInt2Count) inc(k0: int, k1: int): bool {
     let cap = len(t.slots) / 3
-    if cap == 0 || (t.len + 1) * 10 >= cap * 6 {
+    if cap == 0 || (t.len + 1) * 8 > cap * 7 {
         t.grow()
     }
+    let capNow = t.mask + 1
     let mask = t.mask
     var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
     h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
     h = h ^ (h >> 31)
+    let tag = ctrlTag(h)
+    let vTag = VB.splat(tag)
+    let vZero = VB.zero()
     var sl = h & mask
     while true {
-        let base = sl * 3
-        let v = t.slots[base + 2]
-        if v == 0 {
+        let cv = VB.load(&t.ctrl, sl)
+        var hits = (cv == vTag).bitmask()
+        while hits != u64(0) {
+            let at = (sl + int(hits.trailingZeros())) & mask
+            let base = at * 3
+            if t.slots[base] == k0 && t.slots[base + 1] == k1 {
+                t.slots[base + 2] = t.slots[base + 2] + 1
+                return false
+            }
+            hits = hits & (hits - u64(1))
+        }
+        let em = (cv == vZero).bitmask()
+        if em != u64(0) {
+            let at = (sl + int(em.trailingZeros())) & mask
+            ctrlSet(mut &t.ctrl, capNow, at, tag)
+            let base = at * 3
             t.slots[base] = k0
             t.slots[base + 1] = k1
             t.slots[base + 2] = 1
             t.len += 1
             return true
         }
-        if t.slots[base] == k0 && t.slots[base + 1] == k1 {
-            t.slots[base + 2] = v + 1
-            return false
-        }
-        sl = (sl + 1) & mask
+        sl = (sl + 32) & mask
     }
     return false
 }
@@ -945,13 +1130,20 @@ pub fn (t: &FastInt2Count) get(k0: int, k1: int): int {
         if (t.bf[h & t.bfMask] & b) != b { return 0 }
     }
     let mask = t.mask
+    let vTag = VB.splat(ctrlTag(h))
+    let vZero = VB.zero()
     var sl = h & mask
     while true {
-        let base = sl * 3
-        let v = t.slots[base + 2]
-        if v == 0 { return 0 }
-        if t.slots[base] == k0 && t.slots[base + 1] == k1 { return v }
-        sl = (sl + 1) & mask
+        let cv = VB.load(&t.ctrl, sl)
+        var hits = (cv == vTag).bitmask()
+        while hits != u64(0) {
+            let at = (sl + int(hits.trailingZeros())) & mask
+            let base = at * 3
+            if t.slots[base] == k0 && t.slots[base + 1] == k1 { return t.slots[base + 2] }
+            hits = hits & (hits - u64(1))
+        }
+        if (cv == vZero).bitmask() != u64(0) { return 0 }
+        sl = (sl + 32) & mask
     }
     return 0
 }
@@ -965,6 +1157,7 @@ pub fn (t: &FastInt2Count) sumLastW(at0: &[]int, at1: &[]int, kv0: &[]int, nul0:
     let mask = t.mask
     let bfMask = t.bfMask
     let hasBf = bfMask >= 0
+    let vZero = VB.zero()
     var a = 0
     var mat = 0
     var nul = 0
@@ -989,13 +1182,19 @@ pub fn (t: &FastInt2Count) sumLastW(at0: &[]int, at1: &[]int, kv0: &[]int, nul0:
                     if (t.bf[h & bfMask] & b) != b { ok = false }
                 }
                 if ok {
+                    let vTag = VB.splat(ctrlTag(h))
                     var sl = h & mask
                     while true {
-                        let base = sl * 3
-                        let v = t.slots[base + 2]
-                        if v == 0 { break }
-                        if t.slots[base] == k0 && t.slots[base + 1] == k1 { m = v; break }
-                        sl = (sl + 1) & mask
+                        let cv = VB.load(&t.ctrl, sl)
+                        var hits = (cv == vTag).bitmask()
+                        while hits != u64(0) {
+                            let at = (sl + int(hits.trailingZeros())) & mask
+                            let base = at * 3
+                            if t.slots[base] == k0 && t.slots[base + 1] == k1 { m = t.slots[base + 2]; break }
+                            hits = hits & (hits - u64(1))
+                        }
+                        if m != 0 || (cv == vZero).bitmask() != u64(0) { break }
+                        sl = (sl + 32) & mask
                     }
                 }
             }
@@ -1026,14 +1225,22 @@ pub fn (t: &FastInt2Count) sumLastW(at0: &[]int, at1: &[]int, kv0: &[]int, nul0:
                         (u64(1) << ((h >> 36) & 63))
                 if (t.bf[h & bfMask] & b) != b { continue }
             }
+            let vTag = VB.splat(ctrlTag(h))
             var sl = h & mask
+            var found = 0
             while true {
-                let base = sl * 3
-                let v = t.slots[base + 2]
-                if v == 0 { break }
-                if t.slots[base] == k0 && t.slots[base + 1] == k1 { a += wr * v; break }
-                sl = (sl + 1) & mask
+                let cv = VB.load(&t.ctrl, sl)
+                var hits = (cv == vTag).bitmask()
+                while hits != u64(0) {
+                    let at = (sl + int(hits.trailingZeros())) & mask
+                    let base = at * 3
+                    if t.slots[base] == k0 && t.slots[base + 1] == k1 { found = t.slots[base + 2]; break }
+                    hits = hits & (hits - u64(1))
+                }
+                if found != 0 || (cv == vZero).bitmask() != u64(0) { break }
+                sl = (sl + 32) & mask
             }
+            if found != 0 { a += wr * found }
         }
         acc += a
         matched += a
@@ -1059,13 +1266,19 @@ pub fn (t: &FastInt2Count) sumLastW(at0: &[]int, at1: &[]int, kv0: &[]int, nul0:
                 if (t.bf[h & bfMask] & b) != b { ok = false }
             }
             if ok {
+                let vTag = VB.splat(ctrlTag(h))
                 var sl = h & mask
                 while true {
-                    let base = sl * 3
-                    let v = t.slots[base + 2]
-                    if v == 0 { break }
-                    if t.slots[base] == k0 && t.slots[base + 1] == k1 { m = v; break }
-                    sl = (sl + 1) & mask
+                    let cv = VB.load(&t.ctrl, sl)
+                    var hits = (cv == vTag).bitmask()
+                    while hits != u64(0) {
+                        let at = (sl + int(hits.trailingZeros())) & mask
+                        let base = at * 3
+                        if t.slots[base] == k0 && t.slots[base + 1] == k1 { m = t.slots[base + 2]; break }
+                        hits = hits & (hits - u64(1))
+                    }
+                    if m != 0 || (cv == vZero).bitmask() != u64(0) { break }
+                    sl = (sl + 32) & mask
                 }
             }
         }
@@ -1078,6 +1291,7 @@ pub fn (t: &FastInt2Count) sumLastW(at0: &[]int, at1: &[]int, kv0: &[]int, nul0:
 
 pub type FastInt2Map = record {
     slots: []int        // interleaved [k0, k1, bucket + 1] per slot (0 = empty)
+    ctrl: []byte        // cap + 32 mirrored SwissTable control bytes
     mask: int
     len: int
     bf: []u64
@@ -1085,7 +1299,7 @@ pub type FastInt2Map = record {
 }
 
 pub fn newFastInt2Map(): FastInt2Map {
-    return FastInt2Map{slots: [], mask: 0, len: 0, bf: [], bfMask: -1}
+    return FastInt2Map{slots: [], ctrl: [], mask: 0, len: 0, bf: [], bfMask: -1}
 }
 
 pub fn (t: &FastInt2Map) size(): int { return t.len }
@@ -1094,6 +1308,8 @@ fn (t: mut &FastInt2Map) grow() {
     let cap = if len(t.slots) == 0 { 1024 } else { (len(t.slots) / 3) * 2 }
     let mask = cap - 1
     var ns: []int = array(cap * 3, 0)
+    var nc: []byte = array(cap + 32, byte(0))
+    let vZero = VB.zero()
     var i = 0
     let nOld = len(t.slots)
     while i < nOld {
@@ -1104,44 +1320,65 @@ fn (t: mut &FastInt2Map) grow() {
             var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
             h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
             h = h ^ (h >> 31)
+            let tag = ctrlTag(h)
             var sl = h & mask
-            while ns[sl * 3 + 2] != 0 { sl = (sl + 1) & mask }
-            let base = sl * 3
-            ns[base] = k0
-            ns[base + 1] = k1
-            ns[base + 2] = v
+            while true {
+                let em = (VB.load(&nc, sl) == vZero).bitmask()
+                if em != u64(0) {
+                    let at = (sl + int(em.trailingZeros())) & mask
+                    ctrlSet(mut &nc, cap, at, tag)
+                    let base = at * 3
+                    ns[base] = k0
+                    ns[base + 1] = k1
+                    ns[base + 2] = v
+                    break
+                }
+                sl = (sl + 32) & mask
+            }
         }
         i += 3
     }
     t.slots = ns
+    t.ctrl = nc
     t.mask = mask
 }
 
 // Returns existing bucket (>= 0) or inserts nextBk and returns nextBk.
 pub fn (t: mut &FastInt2Map) getOrPut(k0: int, k1: int, nextBk: int): int {
     let cap = len(t.slots) / 3
-    if cap == 0 || (t.len + 1) * 10 >= cap * 6 {
+    if cap == 0 || (t.len + 1) * 8 > cap * 7 {
         t.grow()
     }
+    let capNow = t.mask + 1
     let mask = t.mask
     var h = (k0 *% 0x517cc1b727220a95) ^ (k1 *% 0x2545f4914f6cdd1d)
     h = (h ^ (h >> 30)) *% 0x3c79ac492ba7b653
     h = h ^ (h >> 31)
+    let tag = ctrlTag(h)
+    let vTag = VB.splat(tag)
+    let vZero = VB.zero()
     var sl = h & mask
     while true {
-        let base = sl * 3
-        let v = t.slots[base + 2]
-        if v == 0 {
+        let cv = VB.load(&t.ctrl, sl)
+        var hits = (cv == vTag).bitmask()
+        while hits != u64(0) {
+            let at = (sl + int(hits.trailingZeros())) & mask
+            let base = at * 3
+            if t.slots[base] == k0 && t.slots[base + 1] == k1 { return t.slots[base + 2] - 1 }
+            hits = hits & (hits - u64(1))
+        }
+        let em = (cv == vZero).bitmask()
+        if em != u64(0) {
+            let at = (sl + int(em.trailingZeros())) & mask
+            ctrlSet(mut &t.ctrl, capNow, at, tag)
+            let base = at * 3
             t.slots[base] = k0
             t.slots[base + 1] = k1
             t.slots[base + 2] = nextBk + 1
             t.len += 1
             return nextBk
         }
-        if t.slots[base] == k0 && t.slots[base + 1] == k1 {
-            return v - 1
-        }
-        sl = (sl + 1) & mask
+        sl = (sl + 32) & mask
     }
     return nextBk
 }
@@ -1182,13 +1419,20 @@ pub fn (t: &FastInt2Map) get(k0: int, k1: int): int {
         if (t.bf[h & t.bfMask] & b) != b { return -1 }
     }
     let mask = t.mask
+    let vTag = VB.splat(ctrlTag(h))
+    let vZero = VB.zero()
     var sl = h & mask
     while true {
-        let base = sl * 3
-        let v = t.slots[base + 2]
-        if v == 0 { return -1 }
-        if t.slots[base] == k0 && t.slots[base + 1] == k1 { return v - 1 }
-        sl = (sl + 1) & mask
+        let cv = VB.load(&t.ctrl, sl)
+        var hits = (cv == vTag).bitmask()
+        while hits != u64(0) {
+            let at = (sl + int(hits.trailingZeros())) & mask
+            let base = at * 3
+            if t.slots[base] == k0 && t.slots[base + 1] == k1 { return t.slots[base + 2] - 1 }
+            hits = hits & (hits - u64(1))
+        }
+        if (cv == vZero).bitmask() != u64(0) { return -1 }
+        sl = (sl + 32) & mask
     }
     return -1
 }
@@ -1198,36 +1442,43 @@ pub fn (t: &FastInt2Map) get(k0: int, k1: int): int {
 // ============================================================================
 
 type IntBucket = record {
-    ht: []int           // slot -> local index + 1 (0 = empty)
+    ht: []i32           // cap + 8 mirrored 32-bit tagged slots (0 = empty, else tag | (loc + 1))
+    cap: int
     ks: []int           // local index -> key
     gids: []int         // local index -> global group id
 }
 
-fn newIntBucket(): IntBucket { return IntBucket{ht: [], ks: [], gids: []} }
+fn newIntBucket(): IntBucket { return IntBucket{ht: [], cap: 0, ks: [], gids: []} }
 
 fn (bk: mut &IntBucket) grow() {
-    let cap = if len(bk.ht) == 0 { 128 } else { len(bk.ht) * 2 }
-    let mask = cap - 1
-    var nht: []int = array(cap, 0)
+    let cap = if bk.cap == 0 { 128 } else { bk.cap * 2 }
+    var nht: []i32 = array(cap + 8, i32(0))
     for i in 0..len(bk.ks) {
-        var sl = slotMask(hashInt(bk.ks[i]), mask)
-        while nht[sl] != 0 { sl = (sl + 1) & mask }
-        nht[sl] = i + 1
+        htInsertEmpty(mut &nht, cap, hashInt(bk.ks[i]), i)
     }
     bk.ht = nht
+    bk.cap = cap
 }
 
 fn (bk: &IntBucket) find(k: int, h: u64): int {
-    let cap = len(bk.ht)
+    let cap = bk.cap
     if cap == 0 { return -1 }
     let mask = cap - 1
-    var sl = slotMask(h, mask)
+    let low = i32(mask)
+    let vTagMask = VI32.splat(~low)
+    let vTag = VI32.splat(htTag(h, mask))
+    let vZero = VI32.zero()
+    var sl = int(h & u64(mask))
     while true {
-        let e = bk.ht[sl]
-        if e == 0 { return -1 }
-        let loc = e - 1
-        if bk.ks[loc] == k { return bk.gids[loc] }
-        sl = (sl + 1) & mask
+        let v = VI32.load(&bk.ht, sl)
+        var hits = ((v & vTagMask) == vTag).bitmask()
+        while hits != u64(0) {
+            let loc = int(bk.ht[sl + int(hits.trailingZeros())] & low) - 1
+            if bk.ks[loc] == k { return bk.gids[loc] }
+            hits = hits & (hits - u64(1))
+        }
+        if (v == vZero).bitmask() != u64(0) { return -1 }
+        sl = (sl + 8) & mask
     }
     return -1
 }
@@ -1236,19 +1487,17 @@ fn (bk: mut &IntBucket) insert(k: int, h: u64, gid: int) {
     let loc = len(bk.ks)
     append(mut &bk.ks, k)
     append(mut &bk.gids, gid)
-    if len(bk.ht) == 0 || (loc + 1) * 10 >= len(bk.ht) * 7 {
+    if bk.cap == 0 || (loc + 1) * 6 > bk.cap * 5 {
         bk.grow()
     } else {
-        let mask = len(bk.ht) - 1
-        var sl = slotMask(h, mask)
-        while bk.ht[sl] != 0 { sl = (sl + 1) & mask }
-        bk.ht[sl] = loc + 1
+        htInsertEmpty(mut &bk.ht, bk.cap, h, loc)
     }
 }
 
 pub type TwoLevelInt = record {
     pub twoLevel: bool
-    ht: []int               // Level 1: slot -> local idx + 1
+    ht: []i32               // Level 1: cap + 8 mirrored 32-bit tagged slots
+    cap: int
     ks: []int               // Level 1: local idx -> key
     gids: []int             // Level 1: local idx -> gid
     bkts: []IntBucket       // Level 2: 256 buckets
@@ -1257,19 +1506,17 @@ pub type TwoLevelInt = record {
 }
 
 pub fn newTwoLevelInt(trackKeys: bool): TwoLevelInt {
-    return TwoLevelInt{twoLevel: false, ht: [], ks: [], gids: [], bkts: [], keyByGid: [], trackKeys: trackKeys}
+    return TwoLevelInt{twoLevel: false, ht: [], cap: 0, ks: [], gids: [], bkts: [], keyByGid: [], trackKeys: trackKeys}
 }
 
 fn (t: mut &TwoLevelInt) growL1() {
-    let cap = if len(t.ht) == 0 { 1024 } else { len(t.ht) * 2 }
-    let mask = cap - 1
-    var nht: []int = array(cap, 0)
+    let cap = if t.cap == 0 { 1024 } else { t.cap * 2 }
+    var nht: []i32 = array(cap + 8, i32(0))
     for i in 0..len(t.ks) {
-        var sl = slotMask(hashInt(t.ks[i]), mask)
-        while nht[sl] != 0 { sl = (sl + 1) & mask }
-        nht[sl] = i + 1
+        htInsertEmpty(mut &nht, cap, hashInt(t.ks[i]), i)
     }
     t.ht = nht
+    t.cap = cap
 }
 
 fn (t: mut &TwoLevelInt) promote() {
@@ -1283,26 +1530,39 @@ fn (t: mut &TwoLevelInt) promote() {
     }
     t.bkts = bkts
     t.ht = []
+    t.cap = 0
     t.ks = []
     t.gids = []
     t.twoLevel = true
 }
 
+fn (t: &TwoLevelInt) findL1(k: int, h: u64): int {
+    let cap = t.cap
+    if cap == 0 { return -1 }
+    let mask = cap - 1
+    let low = i32(mask)
+    let vTagMask = VI32.splat(~low)
+    let vTag = VI32.splat(htTag(h, mask))
+    let vZero = VI32.zero()
+    var sl = int(h & u64(mask))
+    while true {
+        let v = VI32.load(&t.ht, sl)
+        var hits = ((v & vTagMask) == vTag).bitmask()
+        while hits != u64(0) {
+            let loc = int(t.ht[sl + int(hits.trailingZeros())] & low) - 1
+            if t.ks[loc] == k { return t.gids[loc] }
+            hits = hits & (hits - u64(1))
+        }
+        if (v == vZero).bitmask() != u64(0) { return -1 }
+        sl = (sl + 8) & mask
+    }
+    return -1
+}
+
 pub fn (t: &TwoLevelInt) get(k: int): int {
     let h = hashInt(k)
     if t.twoLevel { return t.bkts[bucketOf(h)].find(k, h) }
-    let cap = len(t.ht)
-    if cap == 0 { return -1 }
-    let mask = cap - 1
-    var sl = slotMask(h, mask)
-    while true {
-        let e = t.ht[sl]
-        if e == 0 { return -1 }
-        let loc = e - 1
-        if t.ks[loc] == k { return t.gids[loc] }
-        sl = (sl + 1) & mask
-    }
-    return -1
+    return t.findL1(k, h)
 }
 
 pub fn (t: mut &TwoLevelInt) put(k: int, gid: int) {
@@ -1319,13 +1579,10 @@ pub fn (t: mut &TwoLevelInt) put(k: int, gid: int) {
     let loc = len(t.ks)
     append(mut &t.ks, k)
     append(mut &t.gids, gid)
-    if len(t.ht) == 0 || (loc + 1) * 10 >= len(t.ht) * 7 {
+    if t.cap == 0 || (loc + 1) * 6 > t.cap * 5 {
         t.growL1()
     } else {
-        let mask = len(t.ht) - 1
-        var sl = slotMask(h, mask)
-        while t.ht[sl] != 0 { sl = (sl + 1) & mask }
-        t.ht[sl] = loc + 1
+        htInsertEmpty(mut &t.ht, t.cap, h, loc)
     }
 }
 
@@ -1356,18 +1613,8 @@ pub fn (t: mut &TwoLevelInt) getOrPut(k: int, nextGid: int): int {
         }
         return nextGid
     }
-    let cap = len(t.ht)
-    if cap > 0 {
-        let mask = cap - 1
-        var sl = slotMask(h, mask)
-        while true {
-            let e = t.ht[sl]
-            if e == 0 { break }
-            let loc = e - 1
-            if t.ks[loc] == k { return t.gids[loc] }
-            sl = (sl + 1) & mask
-        }
-    }
+    let got = t.findL1(k, h)
+    if got >= 0 { return got }
     t.put(k, nextGid)
     return nextGid
 }
@@ -1375,23 +1622,32 @@ pub fn (t: mut &TwoLevelInt) getOrPut(k: int, nextGid: int): int {
 // Batch-grouped cache-friendly probe for Level 2: fills outGid[j] with existing gid or -1.
 pub fn (t: &TwoLevelInt) probeBatch(ks: &[]int, nul: &[]bool, nc: int, outGid: mut &[]int) {
     if !t.twoLevel {
-        let cap = len(t.ht)
+        let cap = t.cap
         if cap == 0 {
             for j in 0..nc { outGid[j] = -1 }
             return
         }
         let mask = cap - 1
+        let low = i32(mask)
+        let vTagMask = VI32.splat(~low)
+        let vZero = VI32.zero()
         for j in 0..nc {
             if nul[j] { outGid[j] = -1; continue }
             let k = ks[j]
-            var sl = slotMask(hashInt(k), mask)
+            let h = hashInt(k)
+            let vTag = VI32.splat(htTag(h, mask))
+            var sl = int(h & u64(mask))
             var found = -1
             while true {
-                let e = t.ht[sl]
-                if e == 0 { break }
-                let loc = e - 1
-                if t.ks[loc] == k { found = t.gids[loc]; break }
-                sl = (sl + 1) & mask
+                let v = VI32.load(&t.ht, sl)
+                var hits = ((v & vTagMask) == vTag).bitmask()
+                while hits != u64(0) {
+                    let loc = int(t.ht[sl + int(hits.trailingZeros())] & low) - 1
+                    if t.ks[loc] == k { found = t.gids[loc]; break }
+                    hits = hits & (hits - u64(1))
+                }
+                if found >= 0 || (v == vZero).bitmask() != u64(0) { break }
+                sl = (sl + 8) & mask
             }
             outGid[j] = found
         }
@@ -1418,28 +1674,37 @@ pub fn (t: &TwoLevelInt) probeBatch(ks: &[]int, nul: &[]bool, nc: int, outGid: m
         ord[pos[b]] = j
         pos[b] += 1
     }
+    let vZero = VI32.zero()
     for b in 0..NBUCKETS {
         let n = cnt[b]
         if n == 0 { continue }
         let st = off[b]
         let bk = &t.bkts[b]
-        let cap = len(bk.ht)
+        let cap = bk.cap
         if cap == 0 {
             for p in st..(st + n) { outGid[ord[p]] = -1 }
             continue
         }
         let mask = cap - 1
+        let low = i32(mask)
+        let vTagMask = VI32.splat(~low)
         for p in st..(st + n) {
             let j = ord[p]
             let k = ks[j]
-            var sl = slotMask(hs[j], mask)
+            let h = hs[j]
+            let vTag = VI32.splat(htTag(h, mask))
+            var sl = int(h & u64(mask))
             var found = -1
             while true {
-                let e = bk.ht[sl]
-                if e == 0 { break }
-                let loc = e - 1
-                if bk.ks[loc] == k { found = bk.gids[loc]; break }
-                sl = (sl + 1) & mask
+                let v = VI32.load(&bk.ht, sl)
+                var hits = ((v & vTagMask) == vTag).bitmask()
+                while hits != u64(0) {
+                    let loc = int(bk.ht[sl + int(hits.trailingZeros())] & low) - 1
+                    if bk.ks[loc] == k { found = bk.gids[loc]; break }
+                    hits = hits & (hits - u64(1))
+                }
+                if found >= 0 || (v == vZero).bitmask() != u64(0) { break }
+                sl = (sl + 8) & mask
             }
             outGid[j] = found
         }
@@ -1451,38 +1716,45 @@ pub fn (t: &TwoLevelInt) probeBatch(ks: &[]int, nul: &[]bool, nc: int, outGid: m
 // ============================================================================
 
 type TwoIntBucket = record {
-    ht: []int
+    ht: []i32
+    cap: int
     k0: []int
     k1: []int
     nu: []byte
     gids: []int
 }
 
-fn newTwoIntBucket(): TwoIntBucket { return TwoIntBucket{ht: [], k0: [], k1: [], nu: [], gids: []} }
+fn newTwoIntBucket(): TwoIntBucket { return TwoIntBucket{ht: [], cap: 0, k0: [], k1: [], nu: [], gids: []} }
 
 fn (bk: mut &TwoIntBucket) grow() {
-    let cap = if len(bk.ht) == 0 { 128 } else { len(bk.ht) * 2 }
-    let mask = cap - 1
-    var nht: []int = array(cap, 0)
+    let cap = if bk.cap == 0 { 128 } else { bk.cap * 2 }
+    var nht: []i32 = array(cap + 8, i32(0))
     for i in 0..len(bk.k0) {
-        var sl = slotMask(hashTwoInt(bk.k0[i], bk.k1[i], bk.nu[i]), mask)
-        while nht[sl] != 0 { sl = (sl + 1) & mask }
-        nht[sl] = i + 1
+        htInsertEmpty(mut &nht, cap, hashTwoInt(bk.k0[i], bk.k1[i], bk.nu[i]), i)
     }
     bk.ht = nht
+    bk.cap = cap
 }
 
 fn (bk: &TwoIntBucket) find(a: int, b: int, nu: byte, h: u64): int {
-    let cap = len(bk.ht)
+    let cap = bk.cap
     if cap == 0 { return -1 }
     let mask = cap - 1
-    var sl = slotMask(h, mask)
+    let low = i32(mask)
+    let vTagMask = VI32.splat(~low)
+    let vTag = VI32.splat(htTag(h, mask))
+    let vZero = VI32.zero()
+    var sl = int(h & u64(mask))
     while true {
-        let e = bk.ht[sl]
-        if e == 0 { return -1 }
-        let loc = e - 1
-        if bk.k0[loc] == a && bk.k1[loc] == b && bk.nu[loc] == nu { return bk.gids[loc] }
-        sl = (sl + 1) & mask
+        let v = VI32.load(&bk.ht, sl)
+        var hits = ((v & vTagMask) == vTag).bitmask()
+        while hits != u64(0) {
+            let loc = int(bk.ht[sl + int(hits.trailingZeros())] & low) - 1
+            if bk.k0[loc] == a && bk.k1[loc] == b && bk.nu[loc] == nu { return bk.gids[loc] }
+            hits = hits & (hits - u64(1))
+        }
+        if (v == vZero).bitmask() != u64(0) { return -1 }
+        sl = (sl + 8) & mask
     }
     return -1
 }
@@ -1493,20 +1765,18 @@ fn (bk: mut &TwoIntBucket) insert(a: int, b: int, nu: byte, h: u64, gid: int): i
     append(mut &bk.k1, b)
     append(mut &bk.nu, nu)
     append(mut &bk.gids, gid)
-    if len(bk.ht) == 0 || (loc + 1) * 10 >= len(bk.ht) * 7 {
+    if bk.cap == 0 || (loc + 1) * 6 > bk.cap * 5 {
         bk.grow()
     } else {
-        let mask = len(bk.ht) - 1
-        var sl = slotMask(h, mask)
-        while bk.ht[sl] != 0 { sl = (sl + 1) & mask }
-        bk.ht[sl] = loc + 1
+        htInsertEmpty(mut &bk.ht, bk.cap, h, loc)
     }
     return loc
 }
 
 pub type TwoLevelTwoInt = record {
     pub twoLevel: bool
-    ht: []int
+    ht: []i32
+    cap: int
     k0: []int
     k1: []int
     nu: []byte
@@ -1517,19 +1787,17 @@ pub type TwoLevelTwoInt = record {
 }
 
 pub fn newTwoLevelTwoInt(): TwoLevelTwoInt {
-    return TwoLevelTwoInt{twoLevel: false, ht: [], k0: [], k1: [], nu: [], bkts: [], gidBkt: [], gidLoc: []}
+    return TwoLevelTwoInt{twoLevel: false, ht: [], cap: 0, k0: [], k1: [], nu: [], bkts: [], gidBkt: [], gidLoc: []}
 }
 
 fn (t: mut &TwoLevelTwoInt) growL1() {
-    let cap = if len(t.ht) == 0 { 1024 } else { len(t.ht) * 2 }
-    let mask = cap - 1
-    var nht: []int = array(cap, 0)
+    let cap = if t.cap == 0 { 1024 } else { t.cap * 2 }
+    var nht: []i32 = array(cap + 8, i32(0))
     for g in 0..len(t.k0) {
-        var sl = slotMask(hashTwoInt(t.k0[g], t.k1[g], t.nu[g]), mask)
-        while nht[sl] != 0 { sl = (sl + 1) & mask }
-        nht[sl] = g + 1
+        htInsertEmpty(mut &nht, cap, hashTwoInt(t.k0[g], t.k1[g], t.nu[g]), g)
     }
     t.ht = nht
+    t.cap = cap
 }
 
 fn (t: mut &TwoLevelTwoInt) promote() {
@@ -1549,27 +1817,40 @@ fn (t: mut &TwoLevelTwoInt) promote() {
     t.gidBkt = gb
     t.gidLoc = gl
     t.ht = []
+    t.cap = 0
     t.k0 = []
     t.k1 = []
     t.nu = []
     t.twoLevel = true
 }
 
+fn (t: &TwoLevelTwoInt) findL1(a: int, b: int, nu: byte, h: u64): int {
+    let cap = t.cap
+    if cap == 0 { return -1 }
+    let mask = cap - 1
+    let low = i32(mask)
+    let vTagMask = VI32.splat(~low)
+    let vTag = VI32.splat(htTag(h, mask))
+    let vZero = VI32.zero()
+    var sl = int(h & u64(mask))
+    while true {
+        let v = VI32.load(&t.ht, sl)
+        var hits = ((v & vTagMask) == vTag).bitmask()
+        while hits != u64(0) {
+            let g = int(t.ht[sl + int(hits.trailingZeros())] & low) - 1
+            if t.k0[g] == a && t.k1[g] == b && t.nu[g] == nu { return g }
+            hits = hits & (hits - u64(1))
+        }
+        if (v == vZero).bitmask() != u64(0) { return -1 }
+        sl = (sl + 8) & mask
+    }
+    return -1
+}
+
 pub fn (t: &TwoLevelTwoInt) get(a: int, b: int, nu: byte): int {
     let h = hashTwoInt(a, b, nu)
     if t.twoLevel { return t.bkts[bucketOf(h)].find(a, b, nu, h) }
-    let cap = len(t.ht)
-    if cap == 0 { return -1 }
-    let mask = cap - 1
-    var sl = slotMask(h, mask)
-    while true {
-        let e = t.ht[sl]
-        if e == 0 { return -1 }
-        let g = e - 1
-        if t.k0[g] == a && t.k1[g] == b && t.nu[g] == nu { return g }
-        sl = (sl + 1) & mask
-    }
-    return -1
+    return t.findL1(a, b, nu, h)
 }
 
 pub fn (t: mut &TwoLevelTwoInt) put(a: int, b: int, nu: byte, gid: int) {
@@ -1585,13 +1866,10 @@ pub fn (t: mut &TwoLevelTwoInt) put(a: int, b: int, nu: byte, gid: int) {
     append(mut &t.k0, a)
     append(mut &t.k1, b)
     append(mut &t.nu, nu)
-    if len(t.ht) == 0 || len(t.k0) * 10 >= len(t.ht) * 7 {
+    if t.cap == 0 || len(t.k0) * 6 > t.cap * 5 {
         t.growL1()
     } else {
-        let mask = len(t.ht) - 1
-        var sl = slotMask(h, mask)
-        while t.ht[sl] != 0 { sl = (sl + 1) & mask }
-        t.ht[sl] = gid + 1
+        htInsertEmpty(mut &t.ht, t.cap, h, gid)
     }
 }
 
@@ -1640,18 +1918,8 @@ pub fn (t: mut &TwoLevelTwoInt) getOrPut(a: int, b: int, nu: byte, nextGid: int)
         append(mut &t.gidLoc, loc)
         return nextGid
     }
-    let cap = len(t.ht)
-    if cap > 0 {
-        let mask = cap - 1
-        var sl = slotMask(h, mask)
-        while true {
-            let e = t.ht[sl]
-            if e == 0 { break }
-            let g = e - 1
-            if t.k0[g] == a && t.k1[g] == b && t.nu[g] == nu { return g }
-            sl = (sl + 1) & mask
-        }
-    }
+    let got = t.findL1(a, b, nu, h)
+    if got >= 0 { return got }
     t.put(a, b, nu, nextGid)
     return nextGid
 }
@@ -1659,26 +1927,35 @@ pub fn (t: mut &TwoLevelTwoInt) getOrPut(a: int, b: int, nu: byte, nextGid: int)
 // Batch-grouped cache-friendly probe for TwoLevelTwoInt.
 pub fn (t: &TwoLevelTwoInt) probeBatch(v0: &[]int, nul0: &[]bool, v1: &[]int, nul1: &[]bool, nc: int, outGid: mut &[]int) {
     if !t.twoLevel {
-        let cap = len(t.ht)
+        let cap = t.cap
         if cap == 0 {
             for j in 0..nc { outGid[j] = -1 }
             return
         }
         let mask = cap - 1
+        let low = i32(mask)
+        let vTagMask = VI32.splat(~low)
+        let vZero = VI32.zero()
         for j in 0..nc {
             let n0 = nul0[j]
             let n1 = nul1[j]
             let a = if n0 { 0 } else { v0[j] }
             let b = if n1 { 0 } else { v1[j] }
             let nu = byte((if n0 { 1 } else { 0 }) | (if n1 { 2 } else { 0 }))
-            var sl = slotMask(hashTwoInt(a, b, nu), mask)
+            let h = hashTwoInt(a, b, nu)
+            let vTag = VI32.splat(htTag(h, mask))
+            var sl = int(h & u64(mask))
             var found = -1
             while true {
-                let e = t.ht[sl]
-                if e == 0 { break }
-                let g = e - 1
-                if t.k0[g] == a && t.k1[g] == b && t.nu[g] == nu { found = g; break }
-                sl = (sl + 1) & mask
+                let v = VI32.load(&t.ht, sl)
+                var hits = ((v & vTagMask) == vTag).bitmask()
+                while hits != u64(0) {
+                    let g = int(t.ht[sl + int(hits.trailingZeros())] & low) - 1
+                    if t.k0[g] == a && t.k1[g] == b && t.nu[g] == nu { found = g; break }
+                    hits = hits & (hits - u64(1))
+                }
+                if found >= 0 || (v == vZero).bitmask() != u64(0) { break }
+                sl = (sl + 8) & mask
             }
             outGid[j] = found
         }
@@ -1706,17 +1983,20 @@ pub fn (t: &TwoLevelTwoInt) probeBatch(v0: &[]int, nul0: &[]bool, v1: &[]int, nu
         ord[pos[b]] = j
         pos[b] += 1
     }
+    let vZero = VI32.zero()
     for b in 0..NBUCKETS {
         let n = cnt[b]
         if n == 0 { continue }
         let st = off[b]
         let bk = &t.bkts[b]
-        let cap = len(bk.ht)
+        let cap = bk.cap
         if cap == 0 {
             for p in st..(st + n) { outGid[ord[p]] = -1 }
             continue
         }
         let mask = cap - 1
+        let low = i32(mask)
+        let vTagMask = VI32.splat(~low)
         for p in st..(st + n) {
             let j = ord[p]
             let n0 = nul0[j]
@@ -1724,14 +2004,20 @@ pub fn (t: &TwoLevelTwoInt) probeBatch(v0: &[]int, nul0: &[]bool, v1: &[]int, nu
             let a = if n0 { 0 } else { v0[j] }
             let bb = if n1 { 0 } else { v1[j] }
             let nu = byte((if n0 { 1 } else { 0 }) | (if n1 { 2 } else { 0 }))
-            var sl = slotMask(hs[j], mask)
+            let h = hs[j]
+            let vTag = VI32.splat(htTag(h, mask))
+            var sl = int(h & u64(mask))
             var found = -1
             while true {
-                let e = bk.ht[sl]
-                if e == 0 { break }
-                let loc = e - 1
-                if bk.k0[loc] == a && bk.k1[loc] == bb && bk.nu[loc] == nu { found = bk.gids[loc]; break }
-                sl = (sl + 1) & mask
+                let v = VI32.load(&bk.ht, sl)
+                var hits = ((v & vTagMask) == vTag).bitmask()
+                while hits != u64(0) {
+                    let loc = int(bk.ht[sl + int(hits.trailingZeros())] & low) - 1
+                    if bk.k0[loc] == a && bk.k1[loc] == bb && bk.nu[loc] == nu { found = bk.gids[loc]; break }
+                    hits = hits & (hits - u64(1))
+                }
+                if found >= 0 || (v == vZero).bitmask() != u64(0) { break }
+                sl = (sl + 8) & mask
             }
             outGid[j] = found
         }
@@ -1740,7 +2026,7 @@ pub fn (t: &TwoLevelTwoInt) probeBatch(v0: &[]int, nul0: &[]bool, v1: &[]int, nu
 
 // ============================================================================
 // 3. TwoLevelArena: Adaptive Two-Level Bump-Arena String / Bytes Hash Table
-//    (zero per-key malloc; 32-bit hash tag in ht + packed 24B ArenaEnt -> 2 cache lines!)
+//    (zero per-key malloc; 8-wide vector[i32] tagged ht + packed 24B ArenaEnt!)
 // ============================================================================
 
 type ArenaEnt = value record {
@@ -1752,39 +2038,66 @@ type ArenaEnt = value record {
 
 type ArenaBucket = record {
     arena: str          // contiguous bump-allocated bytes of all distinct keys in this bucket
-    ht: []u64           // 0 = empty; else ((h & 0xffffffff00000000) | u64(loc + 1))
+    ht: []i32           // cap + 8 mirrored 32-bit tagged slots (0 = empty, else tag | (loc + 1))
+    cap: int
     ents: []ArenaEnt    // packed metadata in one contiguous cache-friendly array
 }
 
 fn newArenaBucket(): ArenaBucket {
-    return ArenaBucket{arena: "", ht: [], ents: []}
+    return ArenaBucket{arena: "", ht: [], cap: 0, ents: []}
 }
 
 fn (bk: mut &ArenaBucket) grow() {
-    let cap = if len(bk.ht) == 0 { 128 } else { len(bk.ht) * 2 }
-    let mask = cap - 1
-    var nht: []u64 = array(cap, u64(0))
+    let cap = if bk.cap == 0 { 128 } else { bk.cap * 2 }
+    var nht: []i32 = array(cap + 8, i32(0))
     for i in 0..len(bk.ents) {
-        let h = bk.ents[i].hash
-        var sl = slotMask(h, mask)
-        while nht[sl] != u64(0) { sl = (sl + 1) & mask }
-        nht[sl] = ((h >> 32) << 32) | u64(i + 1)
+        htInsertEmpty(mut &nht, cap, bk.ents[i].hash, i)
     }
     bk.ht = nht
+    bk.cap = cap
+}
+
+fn (bk: &ArenaBucket) findSimd(s: &str, h: u64): int {
+    let cap = bk.cap
+    let mask = cap - 1
+    let low = i32(mask)
+    let slen = len(s)
+    let vTagMask = VI32.splat(~low)
+    let vTag = VI32.splat(htTag(h, mask))
+    let vZero = VI32.zero()
+    var sl = int(h & u64(mask))
+    while true {
+        let v = VI32.load(&bk.ht, sl)
+        var hits = ((v & vTagMask) == vTag).bitmask()
+        while hits != u64(0) {
+            let loc = int(bk.ht[sl + int(hits.trailingZeros())] & low) - 1
+            let ent = bk.ents[loc]
+            if ent.len == slen && ent.hash == h && &bk.arena[ent.off..ent.off + slen] == s {
+                return ent.gid
+            }
+            hits = hits & (hits - u64(1))
+        }
+        if (v == vZero).bitmask() != u64(0) { return -1 }
+        sl = (sl + 8) & mask
+    }
+    return -1
 }
 
 fn (bk: &ArenaBucket) find(s: &str, h: u64): int {
-    let cap = len(bk.ht)
+    let cap = bk.cap
     if cap == 0 { return -1 }
+    if cap > 512 { return bk.findSimd(s, h) }
     let mask = cap - 1
+    let low = i32(mask)
+    let tagMask = ~low
+    let tag = htTag(h, mask)
     let slen = len(s)
-    let tag = h >> 32
-    var sl = slotMask(h, mask)
+    var sl = int(h & u64(mask))
     while true {
-        let e = bk.ht[sl]
-        if e == u64(0) { return -1 }
-        if (e >> 32) == tag {
-            let loc = int(e & u64(0xffffffff)) - 1
+        let slot = bk.ht[sl]
+        if slot == i32(0) { return -1 }
+        if (slot & tagMask) == tag {
+            let loc = int(slot & low) - 1
             let ent = bk.ents[loc]
             if ent.len == slen && ent.hash == h && &bk.arena[ent.off..ent.off + slen] == s {
                 return ent.gid
@@ -1800,13 +2113,10 @@ fn (bk: mut &ArenaBucket) insert(s: &str, h: u64, gid: int): int {
     let o = len(bk.arena)
     bk.arena += s
     append(mut &bk.ents, ArenaEnt{off: o, len: len(s), gid: gid, hash: h})
-    if len(bk.ht) == 0 || (loc + 1) * 10 >= len(bk.ht) * 7 {
+    if bk.cap == 0 || (loc + 1) * 6 > bk.cap * 5 {
         bk.grow()
     } else {
-        let mask = len(bk.ht) - 1
-        var sl = slotMask(h, mask)
-        while bk.ht[sl] != u64(0) { sl = (sl + 1) & mask }
-        bk.ht[sl] = ((h >> 32) << 32) | u64(loc + 1)
+        htInsertEmpty(mut &bk.ht, bk.cap, h, loc)
     }
     return loc
 }
@@ -1968,22 +2278,47 @@ pub fn (t: &TwoLevelArena) probeTextBatch(buf: &str, words: &[]int, nul: &[]bool
         ord[pos[b]] = j
         pos[b] += 1
     }
+    let vZero = VI32.zero()
     for b in 0..NBUCKETS {
         let n = cnt[b]
         if n == 0 { continue }
         let st = off[b]
         let bk = &t.bkts[b]
-        let cap = len(bk.ht)
+        let cap = bk.cap
         if cap == 0 {
             for p in st..(st + n) { outGid[ord[p]] = -1 }
             continue
         }
+        let mask = cap - 1
+        let low = i32(mask)
+        let vTagMask = VI32.splat(~low)
         for p in st..(st + n) {
             let j = ord[p]
             let r = idx[j]
             let w = words[r]
             let a = w >> 24
-            outGid[j] = bk.find(&buf[a..a + (w & 0xffffff)], outHash[j])
+            let slen = w & 0xffffff
+            let s = &buf[a..a + slen]
+            let h = outHash[j]
+            let vTag = VI32.splat(htTag(h, mask))
+            var sl = int(h & u64(mask))
+            var found = -1
+            while true {
+                let v = VI32.load(&bk.ht, sl)
+                var hits = ((v & vTagMask) == vTag).bitmask()
+                while hits != u64(0) {
+                    let loc = int(bk.ht[sl + int(hits.trailingZeros())] & low) - 1
+                    let ent = bk.ents[loc]
+                    if ent.len == slen && ent.hash == h && &bk.arena[ent.off..ent.off + slen] == s {
+                        found = ent.gid
+                        break
+                    }
+                    hits = hits & (hits - u64(1))
+                }
+                if found >= 0 || (v == vZero).bitmask() != u64(0) { break }
+                sl = (sl + 8) & mask
+            }
+            outGid[j] = found
         }
     }
     if nUnique < nc {
@@ -2039,20 +2374,45 @@ pub fn (t: &TwoLevelArena) probeBufBatch(buf: &str, off: &[]int, slen: &[]int, n
         ord[pos[b]] = j
         pos[b] += 1
     }
+    let vZero = VI32.zero()
     for b in 0..NBUCKETS {
         let n = cnt[b]
         if n == 0 { continue }
         let st = boff[b]
         let bk = &t.bkts[b]
-        let cap = len(bk.ht)
+        let cap = bk.cap
         if cap == 0 {
             for p in st..(st + n) { outGid[ord[p]] = -1 }
             continue
         }
+        let mask = cap - 1
+        let low = i32(mask)
+        let vTagMask = VI32.splat(~low)
         for p in st..(st + n) {
             let j = ord[p]
             let a = off[j]
-            outGid[j] = bk.find(&buf[a..a + slen[j]], outHash[j])
+            let nlen = slen[j]
+            let s = &buf[a..a + nlen]
+            let h = outHash[j]
+            let vTag = VI32.splat(htTag(h, mask))
+            var sl = int(h & u64(mask))
+            var found = -1
+            while true {
+                let v = VI32.load(&bk.ht, sl)
+                var hits = ((v & vTagMask) == vTag).bitmask()
+                while hits != u64(0) {
+                    let loc = int(bk.ht[sl + int(hits.trailingZeros())] & low) - 1
+                    let ent = bk.ents[loc]
+                    if ent.len == nlen && ent.hash == h && &bk.arena[ent.off..ent.off + nlen] == s {
+                        found = ent.gid
+                        break
+                    }
+                    hits = hits & (hits - u64(1))
+                }
+                if found >= 0 || (v == vZero).bitmask() != u64(0) { break }
+                sl = (sl + 8) & mask
+            }
+            outGid[j] = found
         }
     }
 }

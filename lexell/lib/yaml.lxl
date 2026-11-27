@@ -24,6 +24,8 @@ import "json"
 import "time"
 import "base64"
 
+type VB = vector[byte]
+
 // ---------------------------------------------------------------- core types
 
 // Source location in the input text. Lines and columns count from 1 (column
@@ -2167,6 +2169,32 @@ fn (sc: mut &Scanner) advanceN(n: int) {
     for _i in 0..n { sc.advance() }
 }
 
+// Advances sc.pos and sc.col to the next '\n' or '\r' (or EOF) using 32-byte SIMD.
+fn (sc: mut &Scanner) skipToBreak() {
+    let s = &sc.src
+    let n = len(s)
+    let start = sc.pos
+    var i = start
+    if n - i >= VB.lanes {
+        let vNl = VB.splat('\n')
+        let vCr = VB.splat('\r')
+        while i + VB.lanes <= n {
+            let v = VB.load(s, i)
+            let m = ((v == vNl) | (v == vCr)).bitmask()
+            if m != u64(0) {
+                i += int(m.trailingZeros())
+                sc.pos = i
+                sc.col += i - start
+                return
+            }
+            i += VB.lanes
+        }
+    }
+    while i < n && !isBreakByte(s[i]) { i += 1 }
+    sc.pos = i
+    sc.col += i - start
+}
+
 fn (sc: &Scanner) nextTokNum(): int {
     return sc.tokensParsed + (len(sc.tokens) - sc.tokHead)
 }
@@ -2341,9 +2369,7 @@ fn (sc: mut &Scanner) scanToNextToken(): Result[Unit, Error] {
             }
             let sp = sc.span()
             let start = sc.pos
-            while !sc.eof() && !isBreakByte(sc.peekAt(0)) {
-                sc.advance()
-            }
+            sc.skipToBreak()
             var end = sc.pos
             while end > start && (sc.src[end - 1] == ' ' || sc.src[end - 1] == '\t') {
                 end -= 1
@@ -2912,9 +2938,7 @@ fn (sc: mut &Scanner) fetchBlockScalar(folded: bool): Result[Unit, Error] {
             breaks.clear()
 
             let ls = sc.pos
-            while !sc.eof() && !isBreakByte(sc.peekAt(0)) {
-                sc.advance()
-            }
+            sc.skipToBreak()
             out += sc.src[ls..sc.pos]
             endLine = sc.line
             if !sc.eof() && isBreakByte(sc.peekAt(0)) {
@@ -3105,8 +3129,54 @@ fn (sc: mut &Scanner) fetchFlowScalar(single: bool): Result[Unit, Error] {
                 out += sc.src[bs..sc.pos]
             }
         } else {
-            out.addByte(c)
-            sc.advance()
+            // Bulk-scan ordinary characters (no quote, escape, blank, or break) with 32-byte SIMD.
+            let s = &sc.src
+            let n = len(s)
+            let start = sc.pos
+            var i = start + 1
+            if single {
+                if n - i >= VB.lanes {
+                    let vQ = VB.splat('\'')
+                    let vNl = VB.splat('\n')
+                    let vCr = VB.splat('\r')
+                    let vSp = VB.splat(' ')
+                    let vTb = VB.splat('\t')
+                    while i + VB.lanes <= n {
+                        let v = VB.load(s, i)
+                        let m = ((v == vQ) | (v == vNl) | (v == vCr) | (v == vSp) | (v == vTb)).bitmask()
+                        if m != u64(0) { i += int(m.trailingZeros()); break }
+                        i += VB.lanes
+                    }
+                }
+                while i < n {
+                    let b = s[i]
+                    if b == '\'' || b == '\n' || b == '\r' || b == ' ' || b == '\t' { break }
+                    i += 1
+                }
+            } else {
+                if n - i >= VB.lanes {
+                    let vQ = VB.splat('"')
+                    let vSl = VB.splat('\\')
+                    let vNl = VB.splat('\n')
+                    let vCr = VB.splat('\r')
+                    let vSp = VB.splat(' ')
+                    let vTb = VB.splat('\t')
+                    while i + VB.lanes <= n {
+                        let v = VB.load(s, i)
+                        let m = ((v == vQ) | (v == vSl) | (v == vNl) | (v == vCr) | (v == vSp) | (v == vTb)).bitmask()
+                        if m != u64(0) { i += int(m.trailingZeros()); break }
+                        i += VB.lanes
+                    }
+                }
+                while i < n {
+                    let b = s[i]
+                    if b == '"' || b == '\\' || b == '\n' || b == '\r' || b == ' ' || b == '\t' { break }
+                    i += 1
+                }
+            }
+            out += s[start..i]
+            sc.col += i - start
+            sc.pos = i
         }
     }
     return Err(makeError(ErrorKind.Eof, "unterminated quoted string", sp))
@@ -3197,9 +3267,63 @@ fn (sc: mut &Scanner) fetchPlainScalar(): Result[Unit, Error] {
                 out += &spaces
                 spaces.clear()
             }
-            out.addByte(c)
+            // Bulk-scan ordinary plain-scalar bytes with 32-byte SIMD.
+            let s = &sc.src
+            let n = len(s)
+            let start = sc.pos
+            var i = start + 1
+            if sc.flowLevel == 0 {
+                if n - i >= VB.lanes {
+                    let vSp = VB.splat(' ')
+                    let vTb = VB.splat('\t')
+                    let vNl = VB.splat('\n')
+                    let vCr = VB.splat('\r')
+                    let vCol = VB.splat(':')
+                    let vZ = VB.zero()
+                    while i + VB.lanes <= n {
+                        let v = VB.load(s, i)
+                        let m = ((v == vSp) | (v == vTb) | (v == vNl) | (v == vCr) | (v == vCol) | (v == vZ)).bitmask()
+                        if m != u64(0) { i += int(m.trailingZeros()); break }
+                        i += VB.lanes
+                    }
+                }
+                while i < n {
+                    let b = s[i]
+                    if b == ' ' || b == '\t' || b == '\n' || b == '\r' || b == ':' || b == 0 { break }
+                    i += 1
+                }
+            } else {
+                if n - i >= VB.lanes {
+                    let vSp = VB.splat(' ')
+                    let vTb = VB.splat('\t')
+                    let vNl = VB.splat('\n')
+                    let vCr = VB.splat('\r')
+                    let vCol = VB.splat(':')
+                    let vCom = VB.splat(',')
+                    let vLb = VB.splat('[')
+                    let vRb = VB.splat(']')
+                    let vLc = VB.splat('{')
+                    let vRc = VB.splat('}')
+                    let vZ = VB.zero()
+                    while i + VB.lanes <= n {
+                        let v = VB.load(s, i)
+                        let m1 = (v == vSp) | (v == vTb) | (v == vNl) | (v == vCr) | (v == vCol) | (v == vZ)
+                        let m2 = (v == vCom) | (v == vLb) | (v == vRb) | (v == vLc) | (v == vRc)
+                        let m = (m1 | m2).bitmask()
+                        if m != u64(0) { i += int(m.trailingZeros()); break }
+                        i += VB.lanes
+                    }
+                }
+                while i < n {
+                    let b = s[i]
+                    if isBlankOrBreak(b) || b == ':' || isFlowIndic(b) { break }
+                    i += 1
+                }
+            }
+            out += s[start..i]
             endLine = sc.line
-            sc.advance()
+            sc.col += i - start
+            sc.pos = i
         }
 
         // Check for whitespace / line breaks that might continue the plain scalar
@@ -5197,23 +5321,53 @@ fn writeBlockLiteral[W: Sink](w: mut &W, s: &str, contentIndent: int) {
 }
 
 fn canSingleQuote(s: &str): bool {
-    for i in 0..len(s) {
+    let n = len(s)
+    var i = 0
+    if n >= VB.lanes {
+        let v20 = VB.splat(byte(0x20))
+        let v7f = VB.splat(byte(0x7F))
+        for v in VB.chunks(s, mut &i) {
+            if ((v < v20) | (v == v7f)).any() { return false }
+        }
+    }
+    while i < n {
         let c = s[i]
         if c < 0x20 || c == 0x7F { return false }
+        i += 1
     }
     return true
 }
 
 fn writeSingleQuoted[W: Sink](w: mut &W, s: &str) {
     w.writeByte('\'')
-    for i in 0..len(s) {
-        let c = s[i]
-        if c == '\'' {
-            w.write("''")
-        } else {
-            w.writeByte(c)
+    let n = len(s)
+    var seg = 0
+    var i = 0
+    if n >= VB.lanes {
+        let vQ = VB.splat('\'')
+        while i + VB.lanes <= n {
+            var m = (VB.load(s, i) == vQ).bitmask()
+            if m != u64(0) {
+                while m != u64(0) {
+                    let pos = i + int(m.trailingZeros())
+                    if pos > seg { w.write(s[seg..pos]) }
+                    w.write("''")
+                    seg = pos + 1
+                    m = m & (m - u64(1))
+                }
+            }
+            i += VB.lanes
         }
     }
+    while i < n {
+        if s[i] == '\'' {
+            if i > seg { w.write(s[seg..i]) }
+            w.write("''")
+            seg = i + 1
+        }
+        i += 1
+    }
+    if seg < n { w.write(s[seg..n]) }
     w.writeByte('\'')
 }
 
@@ -5221,27 +5375,76 @@ const HEX_CHARS = "0123456789abcdef"
 
 fn writeDoubleQuoted[W: Sink](w: mut &W, s: &str) {
     w.writeByte('"')
-    for i in 0..len(s) {
-        let c = s[i]
-        if c == '"' { w.write("\\\"") }
-        else if c == '\\' { w.write("\\\\") }
-        else if c == '\n' { w.write("\\n") }
-        else if c == '\r' { w.write("\\r") }
-        else if c == '\t' { w.write("\\t") }
-        else if c == 0 { w.write("\\0") }
-        else if c == 7 { w.write("\\a") }
-        else if c == 8 { w.write("\\b") }
-        else if c == 11 { w.write("\\v") }
-        else if c == 12 { w.write("\\f") }
-        else if c == 27 { w.write("\\e") }
-        else if c < 0x20 || c == 0x7F {
-            w.write("\\x")
-            w.writeByte(HEX_CHARS[(int(c) >> 4) & 15])
-            w.writeByte(HEX_CHARS[int(c) & 15])
-        } else {
-            w.writeByte(c)
+    let n = len(s)
+    var seg = 0
+    var i = 0
+    if n >= VB.lanes {
+        let v20 = VB.splat(byte(0x20))
+        let v7f = VB.splat(byte(0x7F))
+        let vQ = VB.splat('"')
+        let vSl = VB.splat('\\')
+        while i < n {
+            while i + VB.lanes <= n {
+                let v = VB.load(s, i)
+                let m = ((v < v20) | (v == v7f) | (v == vQ) | (v == vSl)).bitmask()
+                if m != u64(0) { i += int(m.trailingZeros()); break }
+                i += VB.lanes
+            }
+            if i >= n { break }
+            let c = s[i]
+            if c >= 0x20 && c != 0x7F && c != '"' && c != '\\' {
+                i += 1
+                continue
+            }
+            if i > seg { w.write(s[seg..i]) }
+            if c == '"' { w.write("\\\"") }
+            else if c == '\\' { w.write("\\\\") }
+            else if c == '\n' { w.write("\\n") }
+            else if c == '\r' { w.write("\\r") }
+            else if c == '\t' { w.write("\\t") }
+            else if c == 0 { w.write("\\0") }
+            else if c == 7 { w.write("\\a") }
+            else if c == 8 { w.write("\\b") }
+            else if c == 11 { w.write("\\v") }
+            else if c == 12 { w.write("\\f") }
+            else if c == 27 { w.write("\\e") }
+            else {
+                w.write("\\x")
+                w.writeByte(HEX_CHARS[(int(c) >> 4) & 15])
+                w.writeByte(HEX_CHARS[int(c) & 15])
+            }
+            i += 1
+            seg = i
+        }
+    } else {
+        while i < n {
+            let c = s[i]
+            if c >= 0x20 && c != 0x7F && c != '"' && c != '\\' {
+                i += 1
+                continue
+            }
+            if i > seg { w.write(s[seg..i]) }
+            if c == '"' { w.write("\\\"") }
+            else if c == '\\' { w.write("\\\\") }
+            else if c == '\n' { w.write("\\n") }
+            else if c == '\r' { w.write("\\r") }
+            else if c == '\t' { w.write("\\t") }
+            else if c == 0 { w.write("\\0") }
+            else if c == 7 { w.write("\\a") }
+            else if c == 8 { w.write("\\b") }
+            else if c == 11 { w.write("\\v") }
+            else if c == 12 { w.write("\\f") }
+            else if c == 27 { w.write("\\e") }
+            else {
+                w.write("\\x")
+                w.writeByte(HEX_CHARS[(int(c) >> 4) & 15])
+                w.writeByte(HEX_CHARS[int(c) & 15])
+            }
+            i += 1
+            seg = i
         }
     }
+    if seg < n { w.write(s[seg..n]) }
     w.writeByte('"')
 }
 
@@ -5265,7 +5468,29 @@ fn isSafePlainScalar(s: &str, flow: bool): bool {
     if parseCoreInt(s).isSome() { return false }
     if parseCoreFloat(s).isSome() { return false }
 
-    for i in 0..n {
+    var i = 0
+    if n >= VB.lanes {
+        let v20 = VB.splat(byte(0x20))
+        let v7f = VB.splat(byte(0x7F))
+        let vCol = VB.splat(':')
+        let vHash = VB.splat('#')
+        if !flow {
+            while i + VB.lanes <= n {
+                let v = VB.load(s, i)
+                var m = ((v < v20) | (v == v7f) | (v == vCol) | (v == vHash)).bitmask()
+                while m != u64(0) {
+                    let pos = i + int(m.trailingZeros())
+                    let c = s[pos]
+                    if c < 0x20 || c == 0x7F { return false }
+                    if c == ':' && (pos + 1 >= n || isBlankOrBreak(s[pos + 1])) { return false }
+                    if c == '#' && pos > 0 && isBlankByte(s[pos - 1]) { return false }
+                    m = m & (m - u64(1))
+                }
+                i += VB.lanes
+            }
+        }
+    }
+    while i < n {
         let c = s[i]
         if c < 0x20 || c == 0x7F { return false }
         if flow && isFlowIndic(c) { return false }
@@ -5277,6 +5502,7 @@ fn isSafePlainScalar(s: &str, flow: bool): bool {
         if c == '#' && i > 0 && isBlankByte(s[i - 1]) {
             return false
         }
+        i += 1
     }
     return true
 }

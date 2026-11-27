@@ -20,6 +20,8 @@
 
 // ------------------------------------------------------------ searching
 
+type VB = vector[byte]
+
 // The last index of sub in s, or -1.
 pub fn lastIndexOf(s: &str, sub: &str): int {
     var i = len(s) - len(sub)
@@ -45,13 +47,30 @@ pub fn indexOfAny(s: &str, set: &str, from: int): int {
     return strFindAny(s, start, set)
 }
 
-// The last index of byte c in s, or -1. No runtime reverse scan exists, so
-// this walks backwards a byte at a time.
+// The last index of byte c in s, or -1.
 pub fn lastIndexOfByte(s: &str, c: byte): int {
-    var i = len(s) - 1
+    let n = len(s)
+    if n >= 32 { return lastIndexOfByteSimd(s, c) }
+    var i = n - 1
     while i >= 0 {
         if strByte(s, i) == c { return i }
         i -= 1
+    }
+    return -1
+}
+
+fn lastIndexOfByteSimd(s: &str, c: byte): int {
+    let vc = VB.splat(c)
+    var i = len(s) - 32
+    while i >= 0 {
+        let m = (VB.load(s, i) == vc).bitmask()
+        if m != u64(0) { return i + 63 - int(m.leadingZeros()) }
+        i -= 32
+    }
+    var rem = i + 31
+    while rem >= 0 {
+        if strByte(s, rem) == c { return rem }
+        rem -= 1
     }
     return -1
 }
@@ -78,9 +97,32 @@ fn matches(s: &str, at: int, sub: &str): bool {
 
 // Whether a and b are equal ignoring ASCII case.
 pub fn equalFoldAscii(a: &str, b: &str): bool {
-    if len(a) != len(b) { return false }
-    for i in 0..len(a) {
+    let n = len(a)
+    if n != len(b) { return false }
+    if n >= 32 { return equalFoldAsciiSimd(a, b) }
+    for i in 0..n {
         if lowerByte(strByte(a, i)) != lowerByte(strByte(b, i)) { return false }
+    }
+    return true
+}
+
+fn equalFoldAsciiSimd(a: &str, b: &str): bool {
+    let n = len(a)
+    let vA = VB.splat('A')
+    let vZ = VB.splat('Z')
+    let v32 = VB.splat(byte(32))
+    var i = 0
+    while i + 32 <= n {
+        let va = VB.load(a, i)
+        let vb = VB.load(b, i)
+        let la = ((va >= vA) & (va <= vZ)).select(va +% v32, va)
+        let lb = ((vb >= vA) & (vb <= vZ)).select(vb +% v32, vb)
+        if (la != lb).any() { return false }
+        i += 32
+    }
+    while i < n {
+        if lowerByte(strByte(a, i)) != lowerByte(strByte(b, i)) { return false }
+        i += 1
     }
     return true
 }
@@ -246,6 +288,7 @@ pub fn trimSuffix(s: &str, suffix: &str): str {
 // ------------------------------------------------------------ case
 
 pub fn toUpperAscii(s: &str): str {
+    if len(s) >= 32 { return toUpperAsciiSimd(s) }
     var bs = strToBytes(s)
     for i in 0..len(bs) {
         if bs[i] >= 'a' && bs[i] <= 'z' { bs[i] -= 32 }
@@ -253,9 +296,50 @@ pub fn toUpperAscii(s: &str): str {
     return strFromBytes(&bs)
 }
 
+fn toUpperAsciiSimd(s: &str): str {
+    let n = len(s)
+    var bs = strToBytes(s)
+    let va = VB.splat('a')
+    let vz = VB.splat('z')
+    let v32 = VB.splat(byte(32))
+    var i = 0
+    while i + 32 <= n {
+        let v = VB.load(&bs, i)
+        let m = (v >= va) & (v <= vz)
+        m.select(v -% v32, v).store(mut &bs, i)
+        i += 32
+    }
+    while i < n {
+        if bs[i] >= 'a' && bs[i] <= 'z' { bs[i] -= 32 }
+        i += 1
+    }
+    return strFromBytes(&bs)
+}
+
 pub fn toLowerAscii(s: &str): str {
+    if len(s) >= 32 { return toLowerAsciiSimd(s) }
     var bs = strToBytes(s)
     for i in 0..len(bs) { bs[i] = lowerByte(bs[i]) }
+    return strFromBytes(&bs)
+}
+
+fn toLowerAsciiSimd(s: &str): str {
+    let n = len(s)
+    var bs = strToBytes(s)
+    let vA = VB.splat('A')
+    let vZ = VB.splat('Z')
+    let v32 = VB.splat(byte(32))
+    var i = 0
+    while i + 32 <= n {
+        let v = VB.load(&bs, i)
+        let m = (v >= vA) & (v <= vZ)
+        m.select(v +% v32, v).store(mut &bs, i)
+        i += 32
+    }
+    while i < n {
+        bs[i] = lowerByte(bs[i])
+        i += 1
+    }
     return strFromBytes(&bs)
 }
 
@@ -564,6 +648,7 @@ pub fn runes(s: &str): []int {
 // The number of code points in s (each invalid byte counts as one).
 pub fn runeCount(s: &str): int {
     let m = len(s)
+    if m >= 32 { return runeCountSimd(s) }
     var i = 0
     while i < m && strByte(s, i) < byte(0x80) { i += 1 }
     if i == m { return m }
@@ -579,11 +664,67 @@ pub fn runeCount(s: &str): int {
     return n
 }
 
+fn runeCountSimd(s: &str): int {
+    let m = len(s)
+    let vHi = VB.splat(byte(0x80))
+    var i = 0
+    var n = 0
+    while i < m {
+        while i + 32 <= m {
+            let mask = (VB.load(s, i) >= vHi).bitmask()
+            if mask == u64(0) {
+                i += 32
+                n += 32
+                continue
+            }
+            let tz = int(mask.trailingZeros())
+            i += tz
+            n += tz
+            break
+        }
+        if i >= m { break }
+        if strByte(s, i) < byte(0x80) {
+            i += 1
+        } else {
+            i += decodeAt(s, i).size
+        }
+        n += 1
+    }
+    return n
+}
+
 // Whether s is valid UTF-8.
 pub fn isValidUtf8(s: &str): bool {
+    if len(s) >= 32 { return isValidUtf8Simd(s) }
     var i = 0
     while i < len(s) {
         if strByte(s, i) < 0x80 {
+            i += 1
+        } else {
+            let d = decodeAt(s, i)
+            if !d.ok { return false }
+            i += d.size
+        }
+    }
+    return true
+}
+
+fn isValidUtf8Simd(s: &str): bool {
+    let m = len(s)
+    let vHi = VB.splat(byte(0x80))
+    var i = 0
+    while i < m {
+        while i + 32 <= m {
+            let mask = (VB.load(s, i) >= vHi).bitmask()
+            if mask == u64(0) {
+                i += 32
+                continue
+            }
+            i += int(mask.trailingZeros())
+            break
+        }
+        if i >= m { return true }
+        if strByte(s, i) < byte(0x80) {
             i += 1
         } else {
             let d = decodeAt(s, i)
@@ -602,6 +743,7 @@ pub fn isValidUtf8(s: &str): bool {
 // sequence at the end of s is "incomplete", anything followed by more bytes is
 // an "invalid ... sequence".
 pub fn utf8Error(s: &str): Option[str] {
+    if len(s) >= 32 { return utf8ErrorSimd(s) }
     var i = 0
     while i < len(s) {
         if strByte(s, i) < 0x80 {
@@ -615,6 +757,39 @@ pub fn utf8Error(s: &str): Option[str] {
         }
         let c = int(strByte(s, i))
         if c < 0xC2 || c > 0xF4 || i + d.size < len(s) {
+            return Some("invalid utf-8 sequence of " + intToStr(d.size) + " bytes from index " + intToStr(i))
+        }
+        return Some("incomplete utf-8 byte sequence from index " + intToStr(i))
+    }
+    return None
+}
+
+fn utf8ErrorSimd(s: &str): Option[str] {
+    let m = len(s)
+    let vHi = VB.splat(byte(0x80))
+    var i = 0
+    while i < m {
+        while i + 32 <= m {
+            let mask = (VB.load(s, i) >= vHi).bitmask()
+            if mask == u64(0) {
+                i += 32
+                continue
+            }
+            i += int(mask.trailingZeros())
+            break
+        }
+        if i >= m { return None }
+        if strByte(s, i) < byte(0x80) {
+            i += 1
+            continue
+        }
+        let d = decodeAt(s, i)
+        if d.ok {
+            i += d.size
+            continue
+        }
+        let c = int(strByte(s, i))
+        if c < 0xC2 || c > 0xF4 || i + d.size < m {
             return Some("invalid utf-8 sequence of " + intToStr(d.size) + " bytes from index " + intToStr(i))
         }
         return Some("incomplete utf-8 byte sequence from index " + intToStr(i))

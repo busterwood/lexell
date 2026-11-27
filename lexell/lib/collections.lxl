@@ -10,6 +10,8 @@
 
 import "hash"
 
+type VI32 = vector[i32]
+
 // ------------------------------------------------------------ sorting
 
 // Sorts xs stably by cmp (negative: a before b, zero: keep their order,
@@ -833,12 +835,21 @@ fn defaultHash[K: Hash](k: &K): u64 { return k.hash() }
 // slot almost always sees a different tag and moves on without loading
 // anything else; a lookup loads the slot, then the key it names.
 
+// Map uses an 8-wide `vector[i32]` SIMD-probed tagged index over an
+// insertion-ordered dense entry store (keys, vals, hashes). Each slot holds 0
+// (empty) or `(tag | (entry + 1))` (with bit 30 set in `tag` so no occupied
+// slot ever has tag 0), plus 8 mirror slots at index[cap..cap+8] for wrap-free
+// 32-byte AVX2 loads at up to 83.3% load factor (2 cache misses per hit, zero
+// tombstones via backward-shift removal). Probes check the home slot in scalar
+// first so L1-resident small maps and direct hits pay zero AVX2 setup cost.
+
 pub type Map[K: Eq + Hash, V] = record {
     keys: []K
     vals: []V
     hashes: []u64
-    index: []u32   // 0 or a tag and an entry number + 1; the length is a power of two, at most 2^32
-    shift: int     // 64 - log2(len(index))
+    index: []i32   // length cap + 8: 0 or (tag | (entry + 1)); cap is a power of two >= 8
+    cap: int       // power of 2 >= 8
+    shift: int     // 64 - log2(cap)
     seed: u64      // the process's hash.hashSeed(): where a hash's slots are is not predictable
     fast: bool     // true when hashFn is a supplied hasher, not the default K.hash()
     hashFn: fn(&K): u64  // the hasher: consulted when fast; newMapWith supplies it
@@ -847,43 +858,119 @@ pub type Map[K: Eq + Hash, V] = record {
 type Probe = value record { slot: int; entry: int }
 
 pub fn newMap[K: Eq + Hash, V](): Map[K, V] {
-    return Map{keys: [], vals: [], hashes: [], index: array(8, u32(0)), shift: 61, seed: hash.hashSeed(),
+    return Map{keys: [], vals: [], hashes: [], index: array(16, i32(0)), cap: 8, shift: 61, seed: hash.hashSeed(),
         fast: false, hashFn: defaultHash[K]}
 }
 
 // A Map that hashes keys with hashFn instead of K.hash(). Use it for trusted
 // input only: fxHashStr and fxHashInt are fast but not collision resistant.
 pub fn newMapWith[K: Eq + Hash, V](hashFn: fn(&K): u64): Map[K, V] {
-    return Map{keys: [], vals: [], hashes: [], index: array(8, u32(0)), shift: 61, seed: hash.hashSeed(),
+    return Map{keys: [], vals: [], hashes: [], index: array(16, i32(0)), cap: 8, shift: 61, seed: hash.hashSeed(),
         fast: true, hashFn: hashFn}
 }
 
-// The hash of a key at a call site: the supplied hasher, or K.hash() on the
-// default path (direct, so a default Map pays one predictable branch). Written
-// out at each site: a helper function would add a call around every hash.
-
 // The mixed hash: (h ^ seed) * SLOT_MIX (Fibonacci hashing). Its top bits are the first slot.
-// With the seed, keys whose hashes are known (the integers') still land in unknown slots.
 fn (m: &Map[K, V]) mix(h: u64): u64 { return (h ^ m.seed) *% SLOT_MIX }
 
 fn (m: &Map[K, V]) home(h: u64): int { return int(m.mix(h) >> m.shift) }
 
-// The tag of mixed hash x: its bits below the home bits, in the slot bits above the entry.
-fn (m: &Map[K, V]) tagOf(x: u64): u32 { return u32((x << (64 - m.shift)) >> 32) & ~u32(len(m.index) - 1) }
+// Non-zero 31-bit tag with bit 30 set so no occupied slot ever matches empty (0).
+fn (m: &Map[K, V]) tagOf(x: u64): i32 {
+    return i32((int((x >> 12) & u64(0x3fffffff)) & ~(m.cap - 1)) | 0x40000000)
+}
 
-// The slot holding k, or the empty slot where it would go (entry -1).
-fn (m: &Map[K, V]) probe(k: &K, h: u64): Probe {
-    let mask = len(m.index) - 1
-    let low = u32(mask)
-    let x = m.mix(h)
-    let tag = m.tagOf(x)
+fn (m: mut &Map[K, V]) setSlot(slot: int, v: i32) {
+    m.index[slot] = v
+    if slot < 8 { m.index[m.cap + slot] = v }
+}
+
+// Threshold above which Map switches from scalar L1-resident probing at 50%
+// load (zero AVX2/vzeroupper overhead) to 8-wide AVX2 SIMD probing at 83.3%
+// load (cap > 2048).
+const MAP_SIMD_CAP = 2048
+
+// 8-wide AVX2 SIMD read-only lookup for large tables (cap > MAP_SIMD_CAP).
+fn (m: &Map[K, V]) probeFindSimd(k: &K, h: u64): int {
+    let mask = m.cap - 1
+    let low = i32(mask)
+    let x = (h ^ m.seed) *% SLOT_MIX
+    let tag = i32((int((x >> 12) & u64(0x3fffffff)) & ~mask) | 0x40000000)
+    let vTag = VI32.splat(tag)
+    let vTagMask = VI32.splat(~low)
+    let vZero = VI32.zero()
+    var i = int(x >> m.shift)
+    while true {
+        let v = VI32.load(&m.index, i)
+        var hits = ((v & vTagMask) == vTag).bitmask()
+        while hits != u64(0) {
+            let e = int(m.index[i + int(hits.trailingZeros())] & low) - 1
+            if m.keys[e] == k { return e }
+            hits = hits & (hits - u64(1))
+        }
+        if (v == vZero).bitmask() != u64(0) { return -1 }
+        i = (i + 8) & mask
+    }
+}
+
+// Scalar read-only lookup for L1-resident tables (zero AVX2 setup/vzeroupper).
+fn (m: &Map[K, V]) probeFind(k: &K, h: u64): int {
+    let mask = m.cap - 1
+    let low = i32(mask)
+    let tagMask = ~low
+    let x = (h ^ m.seed) *% SLOT_MIX
+    let tag = i32((int((x >> 12) & u64(0x3fffffff)) & ~mask) | 0x40000000)
     var i = int(x >> m.shift)
     while true {
         let s = m.index[i]
-        if s == 0 { return Probe{slot: i, entry: -1} }
-        let d = s ^ tag   // the entry number + 1 when the tags match
-        if d <= low {
-            let e = int(d) - 1
+        if s == i32(0) { return -1 }
+        if (s & tagMask) == tag {
+            let e = int(s & low) - 1
+            if m.keys[e] == k { return e }
+        }
+        i = (i + 1) & mask
+    }
+}
+
+// 8-wide AVX2 SIMD probe for large tables (cap > MAP_SIMD_CAP).
+fn (m: &Map[K, V]) probeSimd(k: &K, h: u64): Probe {
+    let mask = m.cap - 1
+    let low = i32(mask)
+    let x = (h ^ m.seed) *% SLOT_MIX
+    let tag = i32((int((x >> 12) & u64(0x3fffffff)) & ~mask) | 0x40000000)
+    let vTag = VI32.splat(tag)
+    let vTagMask = VI32.splat(~low)
+    let vZero = VI32.zero()
+    var i = int(x >> m.shift)
+    while true {
+        let v = VI32.load(&m.index, i)
+        var hits = ((v & vTagMask) == vTag).bitmask()
+        while hits != u64(0) {
+            let tz = int(hits.trailingZeros())
+            let e = int(m.index[i + tz] & low) - 1
+            if m.keys[e] == k { return Probe{slot: (i + tz) & mask, entry: e} }
+            hits = hits & (hits - u64(1))
+        }
+        let em = (v == vZero).bitmask()
+        if em != u64(0) {
+            return Probe{slot: (i + int(em.trailingZeros())) & mask, entry: -1}
+        }
+        i = (i + 8) & mask
+    }
+}
+
+// Scalar probe for L1-resident tables: slot holding k, or empty slot (entry -1).
+fn (m: &Map[K, V]) probe(k: &K, h: u64): Probe {
+    let mask = m.cap - 1
+    let low = i32(mask)
+    let tagMask = ~low
+    let x = (h ^ m.seed) *% SLOT_MIX
+    let tag = i32((int((x >> 12) & u64(0x3fffffff)) & ~mask) | 0x40000000)
+    var i = int(x >> m.shift)
+    while true {
+        let s = m.index[i]
+        if s == i32(0) { return Probe{slot: i, entry: -1} }
+        if (s & tagMask) == tag {
+            let e = int(s & low) - 1
             if m.keys[e] == k { return Probe{slot: i, entry: e} }
         }
         i = (i + 1) & mask
@@ -894,21 +981,21 @@ pub fn (m: &Map[K, V]) size(): int { return len(m.keys) }
 
 pub fn (m: &Map[K, V]) has(k: &K): bool {
     let h = if m.fast { m.hashFn(k) } else { k.hash() }
-    return m.probe(k, h).entry >= 0
+    return (if m.cap > MAP_SIMD_CAP { m.probeFindSimd(k, h) } else { m.probeFind(k, h) }) >= 0
 }
 
 pub fn (m: &Map[K, V: Clone]) get(k: &K): Option[V] {
     let h = if m.fast { m.hashFn(k) } else { k.hash() }
-    let p = m.probe(k, h)
-    if p.entry < 0 { return None }
-    return Some(m.vals[p.entry].clone())
+    let e = if m.cap > MAP_SIMD_CAP { m.probeFindSimd(k, h) } else { m.probeFind(k, h) }
+    if e < 0 { return None }
+    return Some(m.vals[e].clone())
 }
 
 pub fn (m: &Map[K, V: Clone]) getOr(k: &K, d: V): V {
     let h = if m.fast { m.hashFn(k) } else { k.hash() }
-    let p = m.probe(k, h)
-    if p.entry < 0 { return d }
-    return m.vals[p.entry].clone()
+    let e = if m.cap > MAP_SIMD_CAP { m.probeFindSimd(k, h) } else { m.probeFind(k, h) }
+    if e < 0 { return d }
+    return m.vals[e].clone()
 }
 
 // The value stored under k, borrowed from the map, or None: a lookup that neither copies the value
@@ -916,38 +1003,38 @@ pub fn (m: &Map[K, V: Clone]) getOr(k: &K, d: V): V {
 // k, so a key that is a temporary is good for the statement (match m.find(&(a + b)) { ... }).
 pub fn (m: &Map[K, V]) find(k: &K): Option[&V] {
     let h = if m.fast { m.hashFn(k) } else { k.hash() }
-    let p = m.probe(k, h)
-    if p.entry < 0 { return None }
-    return Some(&m.vals[p.entry])
+    let e = if m.cap > MAP_SIMD_CAP { m.probeFindSimd(k, h) } else { m.probeFind(k, h) }
+    if e < 0 { return None }
+    return Some(&m.vals[e])
 }
 
 // The value stored under k, borrowed from the map; stops the program if absent.
 pub fn (m: &Map[K, V]) at(k: &K): &V {
     let h = if m.fast { m.hashFn(k) } else { k.hash() }
-    let p = m.probe(k, h)
-    if p.entry < 0 { panic("Map.at: no such key") }
-    return &m.vals[p.entry]
+    let e = if m.cap > MAP_SIMD_CAP { m.probeFindSimd(k, h) } else { m.probeFind(k, h) }
+    if e < 0 { panic("Map.at: no such key") }
+    return &m.vals[e]
 }
 
 // The value stored under k, mutably borrowed; stops the program if absent.
 pub fn (m: mut &Map[K, V]) atMut(k: &K): mut &V {
     let h = if m.fast { m.hashFn(k) } else { k.hash() }
-    let p = m.probe(k, h)
-    if p.entry < 0 { panic("Map.atMut: no such key") }
-    return mut &m.vals[p.entry]
+    let e = if m.cap > MAP_SIMD_CAP { m.probeFindSimd(k, h) } else { m.probeFind(k, h) }
+    if e < 0 { panic("Map.atMut: no such key") }
+    return mut &m.vals[e]
 }
 
 // The value under k, mutably borrowed, after storing d there if k was
 // absent: `let n = counts.atOrPut(word, 0); n += 1`.
 pub fn (m: mut &Map[K, V]) atOrPut(k: K, d: V): mut &V {
     let h = if m.fast { m.hashFn(&k) } else { k.hash() }
-    let p = m.probe(&k, h)
+    let p = if m.cap > MAP_SIMD_CAP { m.probeSimd(&k, h) } else { m.probe(&k, h) }
     if p.entry >= 0 { return mut &m.vals[p.entry] }
-    m.index[p.slot] = m.tagOf(m.mix(h)) | u32(len(m.keys) + 1)
+    m.setSlot(p.slot, m.tagOf(m.mix(h)) | i32(len(m.keys) + 1))
     append(mut &m.keys, k)
     append(mut &m.vals, d)
     append(mut &m.hashes, h)
-    if 2 * len(m.keys) > len(m.index) { m.grow() }
+    if (if m.cap <= MAP_SIMD_CAP { 2 * len(m.keys) > m.cap } else { 6 * len(m.keys) > 5 * m.cap }) { m.grow() }
     return mut &m.vals[len(m.vals) - 1]
 }
 
@@ -1004,16 +1091,16 @@ pub fn (m: &Map[K, V: Clone]) values(): []V {
 // Stores v under k, replacing (and dropping) an older value.
 pub fn (m: mut &Map[K, V]) put(k: K, v: V) {
     let h = if m.fast { m.hashFn(&k) } else { k.hash() }
-    let p = m.probe(&k, h)
+    let p = if m.cap > MAP_SIMD_CAP { m.probeSimd(&k, h) } else { m.probe(&k, h) }
     if p.entry >= 0 {
         replace(mut &m.vals[p.entry], v)
         return
     }
-    m.index[p.slot] = m.tagOf(m.mix(h)) | u32(len(m.keys) + 1)
+    m.setSlot(p.slot, m.tagOf(m.mix(h)) | i32(len(m.keys) + 1))
     append(mut &m.keys, k)
     append(mut &m.vals, v)
     append(mut &m.hashes, h)
-    if 2 * len(m.keys) > len(m.index) { m.grow() }
+    if (if m.cap <= MAP_SIMD_CAP { 2 * len(m.keys) > m.cap } else { 6 * len(m.keys) > 5 * m.cap }) { m.grow() }
 }
 
 // Removes k and returns its value, if it was there, in O(1): the last entry
@@ -1021,14 +1108,14 @@ pub fn (m: mut &Map[K, V]) put(k: K, v: V) {
 // changes. removeStable keeps that order at O(size).
 pub fn (m: mut &Map[K, V]) remove(k: &K): Option[V] {
     let h = if m.fast { m.hashFn(k) } else { k.hash() }
-    let p = m.probe(k, h)
+    let p = if m.cap > MAP_SIMD_CAP { m.probeSimd(k, h) } else { m.probe(k, h) }
     if p.entry < 0 { return None }
     m.unlink(p.slot)
     let last = len(m.keys) - 1
     if p.entry != last {
         // the last entry moves into the hole: repoint its slot
         let s = m.slotOf(last)
-        m.index[s] = m.index[s] & ~u32(len(m.index) - 1) | u32(p.entry + 1)
+        m.setSlot(s, (m.index[s] & ~i32(m.cap - 1)) | i32(p.entry + 1))
         swap(mut &m.keys, p.entry, last)
         swap(mut &m.vals, p.entry, last)
         swap(mut &m.hashes, p.entry, last)
@@ -1043,7 +1130,7 @@ pub fn (m: mut &Map[K, V]) remove(k: &K): Option[V] {
 // remove when the order does not matter.
 pub fn (m: mut &Map[K, V]) removeStable(k: &K): Option[V] {
     let h = if m.fast { m.hashFn(k) } else { k.hash() }
-    let p = m.probe(k, h)
+    let p = if m.cap > MAP_SIMD_CAP { m.probeSimd(k, h) } else { m.probe(k, h) }
     if p.entry < 0 { return None }
     m.unlink(p.slot)
     let last = len(m.keys) - 1
@@ -1057,24 +1144,21 @@ pub fn (m: mut &Map[K, V]) removeStable(k: &K): Option[V] {
     pop(mut &m.keys)
     pop(mut &m.hashes)
     let v = pop(mut &m.vals)
-    // Removing the last entry shifts nothing, so no slot changed its entry
-    // number; a middle removal decrements the numbers of the entries that
-    // shifted. That is one pass over the index with no rehash.
     if p.entry != last { m.shiftEntries(p.entry) }
     return Some(v)
 }
 
 // Entry e was removed and the tail shifted down by one: every index slot that
 // named an entry after e now names one less. The tags stay; only the low
-// entry+1 field changes. O(len(index)), no hashing.
+// entry+1 field changes. O(cap), no hashing.
 fn (m: mut &Map[K, V]) shiftEntries(e: int) {
-    let low = u32(len(m.index) - 1)
-    let cut = u32(e + 1)
-    for i in 0..len(m.index) {
+    let low = i32(m.cap - 1)
+    let cut = i32(e + 1)
+    for i in 0..m.cap {
         let s = m.index[i]
-        if s == 0 { continue }
+        if s == i32(0) { continue }
         let num = s & low
-        if num > cut { m.index[i] = (s & ~low) | (num - 1) }
+        if num > cut { m.setSlot(i, (s & ~low) | (num - i32(1))) }
     }
 }
 
@@ -1082,48 +1166,72 @@ pub fn (m: mut &Map[K, V]) clear() {
     replace(mut &m.keys, [])
     replace(mut &m.vals, [])
     replace(mut &m.hashes, [])
-    replace(mut &m.index, array(8, u32(0)))
+    replace(mut &m.index, array(16, i32(0)))
+    m.cap = 8
     m.shift = 61
 }
 
 // The slot that points at entry e.
 fn (m: &Map[K, V]) slotOf(e: int): int {
-    let mask = len(m.index) - 1
-    let low = u32(mask)
-    let s = u32(e + 1)
+    let mask = m.cap - 1
+    let low = i32(mask)
+    let s = i32(e + 1)
     var i = m.home(m.hashes[e])
-    while m.index[i] & low != s { i = (i + 1) & mask }
+    while (m.index[i] & low) != s { i = (i + 1) & mask }
     return i
 }
 
 // Empties slot s, shifting later entries of its probe run back (no tombstones).
 fn (m: mut &Map[K, V]) unlink(s: int) {
-    let mask = len(m.index) - 1
-    let low = u32(mask)
+    let mask = m.cap - 1
+    let low = i32(mask)
     var hole = s
     var j = (s + 1) & mask
-    while m.index[j] != 0 {
+    while m.index[j] != i32(0) {
         let h = m.home(m.hashes[int(m.index[j] & low) - 1])
-        if (j - h) & mask >= (j - hole) & mask {
-            m.index[hole] = m.index[j]
+        if ((j - h) & mask) >= ((j - hole) & mask) {
+            m.setSlot(hole, m.index[j])
             hole = j
         }
         j = (j + 1) & mask
     }
-    m.index[hole] = 0
+    m.setSlot(hole, i32(0))
+}
+
+fn (m: mut &Map[K, V]) growSimd() {
+    let mask = m.cap - 1
+    let vZero = VI32.zero()
+    for e in 0..len(m.keys) {
+        let x = m.mix(m.hashes[e])
+        var i = int(x >> m.shift)
+        while true {
+            let em = (VI32.load(&m.index, i) == vZero).bitmask()
+            if em != u64(0) {
+                let sl = (i + int(em.trailingZeros())) & mask
+                m.setSlot(sl, m.tagOf(x) | i32(e + 1))
+                break
+            }
+            i = (i + 8) & mask
+        }
+    }
 }
 
 fn (m: mut &Map[K, V]) grow() {
-    let n = len(m.index) * 2
-    if n > 4294967296 { panic("Map: more than 2^31 entries") }
-    replace(mut &m.index, array(n, u32(0)))
+    let n = m.cap * 2
+    if n > 1073741824 { panic("Map: more than 2^30 entries") }
+    replace(mut &m.index, array(n + 8, i32(0)))
+    m.cap = n
     m.shift -= 1
+    if n > MAP_SIMD_CAP {
+        m.growSimd()
+        return
+    }
     let mask = n - 1
     for e in 0..len(m.keys) {
         let x = m.mix(m.hashes[e])
         var i = int(x >> m.shift)
-        while m.index[i] != 0 { i = (i + 1) & mask }
-        m.index[i] = m.tagOf(x) | u32(e + 1)
+        while m.index[i] != i32(0) { i = (i + 1) & mask }
+        m.setSlot(i, m.tagOf(x) | i32(e + 1))
     }
 }
 

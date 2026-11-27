@@ -19,8 +19,12 @@ import "./lexdb_rows"
 import "collections"
 import "strings"
 import "./lexdb_cols"
+import "./lexdb_like"
+import "./lexdb_token"
 
 type LeafView = lexdb_rows.LeafView
+type VB = vector[byte]
+type VI = vector[int]
 
 // One condition on a leaf's bytes.
 pub type LeafK = closed {
@@ -39,6 +43,10 @@ pub type LeafK = closed {
     // removed first when trim (a char(n)'s): substring(x from 1 for m) IN
     // (...) (pl, m, trim, ks; q22's)
     Prefix(int, int, bool, []str)
+    // simple LIKE / ILIKE (no _ or escape) on text place pl (pl, fold, neg, pieces)
+    Like(int, bool, bool, []str)
+    // has_token / has_token_ci on text place pl (pl, fold, neg, word)
+    Token(int, bool, bool, str)
     // runtime hash-join Bloom + range filter on integer place pl (pl, pk, bf)
     IntBloom(int, byte, lexdb_cols.IntBloom)
     // every one holds; one at least holds
@@ -169,10 +177,24 @@ fn prefixIn(t: &str, m: int, trim: bool, ks: &[]str): bool {
     var e = len(t)
     if trim { while e > 0 && t[e - 1] == ' ' { e -= 1 } }
     var ascii = true
-    for i in 0..e {
-        if t[i] >= 128 {
-            ascii = false
-            break
+    var bi = 0
+    if e >= VB.lanes {
+        let vHi = VB.splat(byte(128))
+        let sl = &t[0..e]
+        for v in VB.chunks(sl, mut &bi) {
+            if (v >= vHi).any() {
+                ascii = false
+                break
+            }
+        }
+    }
+    if ascii {
+        while bi < e {
+            if t[bi] >= 128 {
+                ascii = false
+                break
+            }
+            bi += 1
         }
     }
     if ascii {
@@ -212,6 +234,9 @@ fn textRowsOp(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int, pl
         return Some(out)
     }
     if codec != lexdb_cols.C_TEXT { return None }
+    if n == cnt && !nulls && (op == 0 || op == 1) && len(ks) == 1 && len(ks[0]) == 0 {
+        return Some(lexdb_cols.textEmptyFilter(s, dir, pl, from, cnt, r0, op == 0))
+    }
     for x in 0..n {
         let i = from + rs[x] - r0
         if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
@@ -253,6 +278,78 @@ fn textRowsPrefix(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int
     return Some(out)
 }
 
+fn textRowsLike(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int, pl: int, fold: bool, neg: bool, ps: &[]str): Option[[]int] {
+    let n = len(rs)
+    if pl >= lexdb_cols.places(dir) || lexdb_cols.kindOf(s, pl) != lexdb_rows.PK_TEXT { return None }
+    let codec = lexdb_cols.codecOf(dir, pl)
+    let nulls = lexdb_cols.hasNulls(dir, pl)
+    var out: []int = []
+    if codec == lexdb_cols.C_DICT {
+        let nd = lexdb_cols.dictSize(dir, pl)
+        var hit: []bool = array(nd, false)
+        for j in 0..nd {
+            let sp = lexdb_cols.entryAt(s, dir, pl, j)
+            let lo = lexdb_cols.spanStart(sp)
+            let hi = lexdb_cols.spanEnd(sp)
+            let ok = if fold { lexdb_like.likeRangeFold(s, lo, hi, ps) } else { lexdb_like.likeRange(s, lo, hi, ps) }
+            hit[j] = ok != neg
+        }
+        let codes = codesOfCols(s, dir, from, rs, r0, cnt, pl)
+        for x in 0..n {
+            if hit[codes[x]] {
+                if nulls && lexdb_cols.isNull(s, dir, pl, from + rs[x] - r0) { continue }
+                append(mut &out, rs[x])
+            }
+        }
+        return Some(out)
+    }
+    if codec != lexdb_cols.C_TEXT { return None }
+    for x in 0..n {
+        let i = from + rs[x] - r0
+        if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
+        let sp = lexdb_cols.varAt(s, dir, pl, i)
+        let lo = lexdb_cols.spanStart(sp)
+        let hi = lexdb_cols.spanEnd(sp)
+        let ok = if fold { lexdb_like.likeRangeFold(s, lo, hi, ps) } else { lexdb_like.likeRange(s, lo, hi, ps) }
+        if ok != neg { append(mut &out, rs[x]) }
+    }
+    return Some(out)
+}
+
+fn textRowsToken(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int, pl: int, fold: bool, neg: bool, w: &str): Option[[]int] {
+    let n = len(rs)
+    if pl >= lexdb_cols.places(dir) || lexdb_cols.kindOf(s, pl) != lexdb_rows.PK_TEXT { return None }
+    let codec = lexdb_cols.codecOf(dir, pl)
+    let nulls = lexdb_cols.hasNulls(dir, pl)
+    var out: []int = []
+    if codec == lexdb_cols.C_DICT {
+        let nd = lexdb_cols.dictSize(dir, pl)
+        var hit: []bool = array(nd, false)
+        for j in 0..nd {
+            let sp = lexdb_cols.entryAt(s, dir, pl, j)
+            let ok = lexdb_token.hasTokenRange(s, lexdb_cols.spanStart(sp), lexdb_cols.spanEnd(sp), w, fold)
+            hit[j] = ok != neg
+        }
+        let codes = codesOfCols(s, dir, from, rs, r0, cnt, pl)
+        for x in 0..n {
+            if hit[codes[x]] {
+                if nulls && lexdb_cols.isNull(s, dir, pl, from + rs[x] - r0) { continue }
+                append(mut &out, rs[x])
+            }
+        }
+        return Some(out)
+    }
+    if codec != lexdb_cols.C_TEXT { return None }
+    for x in 0..n {
+        let i = from + rs[x] - r0
+        if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
+        let sp = lexdb_cols.varAt(s, dir, pl, i)
+        let ok = lexdb_token.hasTokenRange(s, lexdb_cols.spanStart(sp), lexdb_cols.spanEnd(sp), w, fold)
+        if ok != neg { append(mut &out, rs[x]) }
+    }
+    return Some(out)
+}
+
 // The rows of rs (batch rows of a run of cnt rows, leaf row from at batch
 // row r0) k holds for, in order. None: a place of the leaf is not of the
 // kind k reads. Pure (no LeafView / indirect calls) for par.map workers.
@@ -273,10 +370,29 @@ pub fn rowsOfCols(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int
             }
             let w = wordsOfCols(s, dir, from, rs, r0, cnt, pl)
             var out: []int = withCapacity(n)
+            if !nulls {
+                let vLo = VI.splat(lo)
+                let vHi = VI.splat(hi)
+                var x = 0
+                for v in VI.chunks(&w, mut &x) {
+                    var m = ((v >= vLo) & (v <= vHi)).bitmask()
+                    while m != u64(0) {
+                        let tz = int(m.trailingZeros())
+                        append(mut &out, rs[x + tz])
+                        m = m & (m - u64(1))
+                    }
+                }
+                while x < n {
+                    let v = w[x]
+                    if v >= lo && v <= hi { append(mut &out, rs[x]) }
+                    x += 1
+                }
+                return Some(out)
+            }
             for x in 0..n {
                 let v = w[x]
                 if v >= lo && v <= hi {
-                    if nulls && lexdb_cols.isNull(s, dir, pl, from + rs[x] - r0) { continue }
+                    if lexdb_cols.isNull(s, dir, pl, from + rs[x] - r0) { continue }
                     append(mut &out, rs[x])
                 }
             }
@@ -291,11 +407,31 @@ pub fn rowsOfCols(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int
                 if mn == kv && mx == kv { return Some([]) }
                 if !nulls && (kv < mn || kv > mx) { return Some(collections.copyOf(rs)) }
             }
+            if n == cnt && !nulls {
+                return Some(lexdb_cols.neFilter(s, dir, pl, from, cnt, r0, kv))
+            }
             let w = wordsOfCols(s, dir, from, rs, r0, cnt, pl)
             var out: []int = withCapacity(n)
+            if !nulls {
+                let vK = VI.splat(kv)
+                var x = 0
+                for v in VI.chunks(&w, mut &x) {
+                    var m = (v != vK).bitmask()
+                    while m != u64(0) {
+                        let tz = int(m.trailingZeros())
+                        append(mut &out, rs[x + tz])
+                        m = m & (m - u64(1))
+                    }
+                }
+                while x < n {
+                    if w[x] != kv { append(mut &out, rs[x]) }
+                    x += 1
+                }
+                return Some(out)
+            }
             for x in 0..n {
                 if w[x] != kv {
-                    if nulls && lexdb_cols.isNull(s, dir, pl, from + rs[x] - r0) { continue }
+                    if lexdb_cols.isNull(s, dir, pl, from + rs[x] - r0) { continue }
                     append(mut &out, rs[x])
                 }
             }
@@ -307,14 +443,61 @@ pub fn rowsOfCols(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int
             let wb = wordsOfCols(s, dir, from, rs, r0, cnt, pb)
             var out: []int = withCapacity(n)
             let nulls = lexdb_cols.hasNulls(dir, pa) || lexdb_cols.hasNulls(dir, pb)
+            if !nulls {
+                var x = 0
+                if op == 0 {
+                    while x + VI.lanes <= len(wa) && x + VI.lanes <= len(wb) {
+                        var m = (VI.load(&wa, x) == VI.load(&wb, x)).bitmask()
+                        while m != u64(0) { append(mut &out, rs[x + int(m.trailingZeros())]); m = m & (m - u64(1)) }
+                        x += VI.lanes
+                    }
+                } else if op == 1 {
+                    while x + VI.lanes <= len(wa) && x + VI.lanes <= len(wb) {
+                        var m = (VI.load(&wa, x) != VI.load(&wb, x)).bitmask()
+                        while m != u64(0) { append(mut &out, rs[x + int(m.trailingZeros())]); m = m & (m - u64(1)) }
+                        x += VI.lanes
+                    }
+                } else if op == 2 {
+                    while x + VI.lanes <= len(wa) && x + VI.lanes <= len(wb) {
+                        var m = (VI.load(&wa, x) < VI.load(&wb, x)).bitmask()
+                        while m != u64(0) { append(mut &out, rs[x + int(m.trailingZeros())]); m = m & (m - u64(1)) }
+                        x += VI.lanes
+                    }
+                } else if op == 3 {
+                    while x + VI.lanes <= len(wa) && x + VI.lanes <= len(wb) {
+                        var m = (VI.load(&wa, x) <= VI.load(&wb, x)).bitmask()
+                        while m != u64(0) { append(mut &out, rs[x + int(m.trailingZeros())]); m = m & (m - u64(1)) }
+                        x += VI.lanes
+                    }
+                } else if op == 4 {
+                    while x + VI.lanes <= len(wa) && x + VI.lanes <= len(wb) {
+                        var m = (VI.load(&wa, x) > VI.load(&wb, x)).bitmask()
+                        while m != u64(0) { append(mut &out, rs[x + int(m.trailingZeros())]); m = m & (m - u64(1)) }
+                        x += VI.lanes
+                    }
+                } else {
+                    while x + VI.lanes <= len(wa) && x + VI.lanes <= len(wb) {
+                        var m = (VI.load(&wa, x) >= VI.load(&wb, x)).bitmask()
+                        while m != u64(0) { append(mut &out, rs[x + int(m.trailingZeros())]); m = m & (m - u64(1)) }
+                        x += VI.lanes
+                    }
+                }
+                while x < n {
+                    let a = wa[x]
+                    let b = wb[x]
+                    if holds(op, if a < b { -1 } else if a > b { 1 } else { 0 }) {
+                        append(mut &out, rs[x])
+                    }
+                    x += 1
+                }
+                return Some(out)
+            }
             for x in 0..n {
                 let a = wa[x]
                 let b = wb[x]
                 if holds(op, if a < b { -1 } else if a > b { 1 } else { 0 }) {
-                    if nulls {
-                        let i = from + rs[x] - r0
-                        if lexdb_cols.isNull(s, dir, pa, i) || lexdb_cols.isNull(s, dir, pb, i) { continue }
-                    }
+                    let i = from + rs[x] - r0
+                    if lexdb_cols.isNull(s, dir, pa, i) || lexdb_cols.isNull(s, dir, pb, i) { continue }
                     append(mut &out, rs[x])
                 }
             }
@@ -322,6 +505,8 @@ pub fn rowsOfCols(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int
         }
         LeafK.Texts(op, pl, ks) { return textRowsOp(s, dir, from, rs, r0, cnt, pl, op, &ks) }
         LeafK.Prefix(pl, m, trim, ks) { return textRowsPrefix(s, dir, from, rs, r0, cnt, pl, m, trim, &ks) }
+        LeafK.Like(pl, fold, neg, ps) { return textRowsLike(s, dir, from, rs, r0, cnt, pl, fold, neg, &ps) }
+        LeafK.Token(pl, fold, neg, w) { return textRowsToken(s, dir, from, rs, r0, cnt, pl, fold, neg, &w) }
         LeafK.IntBloom(pl, pk, bf) {
             if !wordsOkCols(s, dir, pl, pk, -1) { return None }
             let nulls = lexdb_cols.hasNulls(dir, pl)
@@ -377,6 +562,225 @@ pub fn rowsOfCols(s: &str, dir: &[]int, from: int, rs: &[]int, r0: int, cnt: int
 
 pub fn rowsOf(leaf: &LeafView, from: int, rs: &[]int, r0: int, cnt: int, k: &LeafK): Option[[]int] {
     return rowsOfCols(leaf.cols, leaf.dir, from, rs, r0, cnt, k)
+}
+
+// Zero-allocation leaf-direct count of rows in from..from+cnt where k holds.
+// Uses SIMD bitmask().countOnes() (popcnt) and skips building row-index arrays.
+pub fn countOfCols(s: &str, dir: &[]int, from: int, cnt: int, k: &LeafK): Option[int] {
+    if cnt <= 0 { return Some(0) }
+    match k {
+        LeafK.Range(pl, pk, sc, lo, hi) {
+            if !wordsOkCols(s, dir, pl, pk, sc) { return None }
+            let nulls = lexdb_cols.hasNulls(dir, pl)
+            if lexdb_cols.hasRange(dir, pl) {
+                let mn = lexdb_cols.least(dir, pl)
+                let mx = lexdb_cols.greatest(dir, pl)
+                if lo > hi || mx < lo || mn > hi { return Some(0) }
+                if !nulls && mn >= lo && mx <= hi { return Some(cnt) }
+            }
+            if !nulls {
+                return Some(lexdb_cols.rangeCount(s, dir, pl, from, cnt, lo, hi))
+            }
+            var w: []int = array(cnt, 0)
+            lexdb_cols.intsInto(s, dir, pl, from, cnt, mut &w, 0)
+            var tot = 0
+            for q in 0..cnt {
+                let v = w[q]
+                if v >= lo && v <= hi && !lexdb_cols.isNull(s, dir, pl, from + q) { tot += 1 }
+            }
+            return Some(tot)
+        }
+        LeafK.Ne(pl, pk, sc, kv) {
+            if !wordsOkCols(s, dir, pl, pk, sc) { return None }
+            let nulls = lexdb_cols.hasNulls(dir, pl)
+            if lexdb_cols.hasRange(dir, pl) {
+                let mn = lexdb_cols.least(dir, pl)
+                let mx = lexdb_cols.greatest(dir, pl)
+                if mn == kv && mx == kv { return Some(0) }
+                if !nulls && (kv < mn || kv > mx) { return Some(cnt) }
+            }
+            if !nulls {
+                return Some(cnt - lexdb_cols.rangeCount(s, dir, pl, from, cnt, kv, kv))
+            }
+            var w: []int = array(cnt, 0)
+            lexdb_cols.intsInto(s, dir, pl, from, cnt, mut &w, 0)
+            var tot = 0
+            for q in 0..cnt {
+                if w[q] != kv && !lexdb_cols.isNull(s, dir, pl, from + q) { tot += 1 }
+            }
+            return Some(tot)
+        }
+        LeafK.Cols(op, pa, pb, pk) {
+            if !wordsOkCols(s, dir, pa, pk, -1) || !wordsOkCols(s, dir, pb, pk, -1) { return None }
+            var wa: []int = array(cnt, 0)
+            var wb: []int = array(cnt, 0)
+            lexdb_cols.intsInto(s, dir, pa, from, cnt, mut &wa, 0)
+            lexdb_cols.intsInto(s, dir, pb, from, cnt, mut &wb, 0)
+            let nulls = lexdb_cols.hasNulls(dir, pa) || lexdb_cols.hasNulls(dir, pb)
+            var tot = 0
+            if !nulls {
+                var x = 0
+                if op == 0 {
+                    while x + VI.lanes <= len(wa) && x + VI.lanes <= len(wb) {
+                        tot += int((VI.load(&wa, x) == VI.load(&wb, x)).bitmask().countOnes())
+                        x += VI.lanes
+                    }
+                } else if op == 1 {
+                    while x + VI.lanes <= len(wa) && x + VI.lanes <= len(wb) {
+                        tot += int((VI.load(&wa, x) != VI.load(&wb, x)).bitmask().countOnes())
+                        x += VI.lanes
+                    }
+                } else if op == 2 {
+                    while x + VI.lanes <= len(wa) && x + VI.lanes <= len(wb) {
+                        tot += int((VI.load(&wa, x) < VI.load(&wb, x)).bitmask().countOnes())
+                        x += VI.lanes
+                    }
+                } else if op == 3 {
+                    while x + VI.lanes <= len(wa) && x + VI.lanes <= len(wb) {
+                        tot += int((VI.load(&wa, x) <= VI.load(&wb, x)).bitmask().countOnes())
+                        x += VI.lanes
+                    }
+                } else if op == 4 {
+                    while x + VI.lanes <= len(wa) && x + VI.lanes <= len(wb) {
+                        tot += int((VI.load(&wa, x) > VI.load(&wb, x)).bitmask().countOnes())
+                        x += VI.lanes
+                    }
+                } else {
+                    while x + VI.lanes <= len(wa) && x + VI.lanes <= len(wb) {
+                        tot += int((VI.load(&wa, x) >= VI.load(&wb, x)).bitmask().countOnes())
+                        x += VI.lanes
+                    }
+                }
+                while x < cnt {
+                    let a = wa[x]
+                    let b = wb[x]
+                    if holds(op, if a < b { -1 } else if a > b { 1 } else { 0 }) { tot += 1 }
+                    x += 1
+                }
+                return Some(tot)
+            }
+            for q in 0..cnt {
+                let a = wa[q]
+                let b = wb[q]
+                if holds(op, if a < b { -1 } else if a > b { 1 } else { 0 }) {
+                    let i = from + q
+                    if !lexdb_cols.isNull(s, dir, pa, i) && !lexdb_cols.isNull(s, dir, pb, i) { tot += 1 }
+                }
+            }
+            return Some(tot)
+        }
+        LeafK.Texts(op, pl, ks) {
+            if pl >= lexdb_cols.places(dir) || lexdb_cols.kindOf(s, pl) != lexdb_rows.PK_TEXT { return None }
+            let codec = lexdb_cols.codecOf(dir, pl)
+            let nulls = lexdb_cols.hasNulls(dir, pl)
+            if codec == lexdb_cols.C_DICT {
+                let nd = lexdb_cols.dictSize(dir, pl)
+                var hit: []bool = array(nd, false)
+                var nHit = 0
+                var oneHit = -1
+                var oneMiss = -1
+                for j in 0..nd {
+                    let sp = lexdb_cols.entryAt(s, dir, pl, j)
+                    let ok = textHolds(op, &s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)], &ks)
+                    hit[j] = ok
+                    if ok { nHit += 1; oneHit = j } else { oneMiss = j }
+                }
+                if !nulls {
+                    if nHit == 0 { return Some(0) }
+                    if nHit == nd { return Some(cnt) }
+                    if nHit == 1 { return Some(lexdb_cols.codeCount(s, dir, pl, from, cnt, oneHit)) }
+                    if nHit == nd - 1 { return Some(cnt - lexdb_cols.codeCount(s, dir, pl, from, cnt, oneMiss)) }
+                }
+                var codes: []int = array(cnt, 0)
+                lexdb_cols.codesInto(s, dir, pl, from, cnt, mut &codes, 0)
+                var tot = 0
+                for q in 0..cnt {
+                    if hit[codes[q]] && (!nulls || !lexdb_cols.isNull(s, dir, pl, from + q)) { tot += 1 }
+                }
+                return Some(tot)
+            }
+            if codec != lexdb_cols.C_TEXT { return None }
+            if !nulls && (op == 0 || op == 1) && len(ks) == 1 && len(ks[0]) == 0 {
+                return Some(lexdb_cols.textEmptyCount(s, dir, pl, from, cnt, op == 0))
+            }
+            var tot = 0
+            for q in 0..cnt {
+                let i = from + q
+                if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
+                let sp = lexdb_cols.varAt(s, dir, pl, i)
+                if textHolds(op, &s[lexdb_cols.spanStart(sp)..lexdb_cols.spanEnd(sp)], &ks) { tot += 1 }
+            }
+            return Some(tot)
+        }
+        LeafK.Like(pl, fold, neg, ps) {
+            if pl >= lexdb_cols.places(dir) || lexdb_cols.kindOf(s, pl) != lexdb_rows.PK_TEXT { return None }
+            let codec = lexdb_cols.codecOf(dir, pl)
+            let nulls = lexdb_cols.hasNulls(dir, pl)
+            var tot = 0
+            if codec == lexdb_cols.C_DICT {
+                let nd = lexdb_cols.dictSize(dir, pl)
+                var hit: []bool = array(nd, false)
+                for j in 0..nd {
+                    let sp = lexdb_cols.entryAt(s, dir, pl, j)
+                    let ok = if fold { lexdb_like.likeRangeFold(s, lexdb_cols.spanStart(sp), lexdb_cols.spanEnd(sp), &ps) }
+                             else { lexdb_like.likeRange(s, lexdb_cols.spanStart(sp), lexdb_cols.spanEnd(sp), &ps) }
+                    hit[j] = ok != neg
+                }
+                var codes: []int = array(cnt, 0)
+                lexdb_cols.codesInto(s, dir, pl, from, cnt, mut &codes, 0)
+                for q in 0..cnt {
+                    if hit[codes[q]] && (!nulls || !lexdb_cols.isNull(s, dir, pl, from + q)) { tot += 1 }
+                }
+                return Some(tot)
+            }
+            if codec != lexdb_cols.C_TEXT { return None }
+            for q in 0..cnt {
+                let i = from + q
+                if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
+                let sp = lexdb_cols.varAt(s, dir, pl, i)
+                let ok = if fold { lexdb_like.likeRangeFold(s, lexdb_cols.spanStart(sp), lexdb_cols.spanEnd(sp), &ps) }
+                         else { lexdb_like.likeRange(s, lexdb_cols.spanStart(sp), lexdb_cols.spanEnd(sp), &ps) }
+                if ok != neg { tot += 1 }
+            }
+            return Some(tot)
+        }
+        LeafK.Token(pl, fold, neg, w) {
+            if pl >= lexdb_cols.places(dir) || lexdb_cols.kindOf(s, pl) != lexdb_rows.PK_TEXT { return None }
+            let codec = lexdb_cols.codecOf(dir, pl)
+            let nulls = lexdb_cols.hasNulls(dir, pl)
+            var tot = 0
+            if codec == lexdb_cols.C_DICT {
+                let nd = lexdb_cols.dictSize(dir, pl)
+                var hit: []bool = array(nd, false)
+                for j in 0..nd {
+                    let sp = lexdb_cols.entryAt(s, dir, pl, j)
+                    hit[j] = lexdb_token.hasTokenRange(s, lexdb_cols.spanStart(sp), lexdb_cols.spanEnd(sp), &w, fold) != neg
+                }
+                var codes: []int = array(cnt, 0)
+                lexdb_cols.codesInto(s, dir, pl, from, cnt, mut &codes, 0)
+                for q in 0..cnt {
+                    if hit[codes[q]] && (!nulls || !lexdb_cols.isNull(s, dir, pl, from + q)) { tot += 1 }
+                }
+                return Some(tot)
+            }
+            if codec != lexdb_cols.C_TEXT { return None }
+            for q in 0..cnt {
+                let i = from + q
+                if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
+                let sp = lexdb_cols.varAt(s, dir, pl, i)
+                if lexdb_token.hasTokenRange(s, lexdb_cols.spanStart(sp), lexdb_cols.spanEnd(sp), &w, fold) != neg { tot += 1 }
+            }
+            return Some(tot)
+        }
+        else {
+            var rs: []int = withCapacity(cnt)
+            for q in 0..cnt { append(mut &rs, q) }
+            match rowsOfCols(s, dir, from, &rs, 0, cnt, k) {
+                Some(out) { return Some(len(out)) }
+                None { return None }
+            }
+        }
+    }
 }
 
 // Runs of column leaf rows the kernels chose (cRunLazy), for the tests.

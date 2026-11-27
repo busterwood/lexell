@@ -6,7 +6,32 @@ run, newest first. Each run's detail (plans, profiles, what changed) stays
 in the design note it came from, linked from its row. When a suite is run
 again, add its row to section 4 and update section 1.
 
-## 1. Now (2026-11-27)
+## 1. Now (2026-11-27, `feat/simd-vector` `ab29758c`)
+
+**Full refresh on `feat/simd-vector` at `ab29758c` (explicit `vector[T]` AVX2 columnar filters, `ILIKE`/`LIKE`, `has_token`, `bloomFilter`, direct leaf aggregations, 32-byte SwissTable / 8-wide `vector[i32]` hash tables, vectorized `pgwire`/TDS/TNS codecs, and single-pass `DataRow` / `COPY TO` sending). Pinned (section 2); boost off for TPC-H, ClickBench, Star-Schema, Social Graph, LSQB, sysbench, and dedicated MV suites. Selective star-schema joins and MV suites unchanged from `4c1fb4cc` / `59797d55`.**
+
+| | 2026-11-27 (`513bc194` / `a751fe1d`) | 2026-11-27 (`feat/simd-vector` `ab29758c`) | PostgreSQL 18 |
+|---|---:|---:|---:|
+| point selects, 1 / 8 / 32 clients (`pgbench`, 1 proc) | 90,358 / 168,897 / 162,732/s | **105,578 / 214,006 / 208,393/s** (+17–28%; 4.66–4.79 µs/op) | 80,880 / 443,445 / 403,874/s |
+| point selects, 3 replicas, 1 / 8 / 32 clients (`pgbench`) | 95,628–97,255 / 323,686–345,622 / 470,054–490,451/s | **99,836–105,408 / 378,239–388,951 / 567,116–587,781/s** (**1.40–1.46×** PG, half CPU/op) | (4 cores: above) |
+| sysbench 1 proc: point_select 1/8/32t, read_only 1/8/32t | 76.9k / 149.5k / 146.7k/s; 2.8k / 3.9k / 3.7k/s | **75.1k / 143.3k / 141.7k/s** (`1.15×` 1t); 2.8k / 3.9k / 3.6k/s | 65.1k / 369.5k / 334.1k/s; 2.4k / 11.5k / 10.2k/s |
+| sysbench 1 proc: read_write (`SERIALIZABLE` / `READ COMMITTED`) 1/8/32t | 1,192 / 1,654 / 1,055 (`SER`); 1,127 / 1,682 / 1,806 (`RC`) | 1,104 / 1,563 / 992 (`SER`); **1,197 / 1,885 / 1,982 (`RC`, 0 err, -27% CPU at 32t)** | 829 / 4,082 / 5,553 (`RC`, 66 err) |
+| sysbench 3 replicas: point_select 1/8/32t, read_only 8/32t | 77.2k / 391.8k / 430.9k/s; 10.9k / 10.0k/s | **77.8k / 346.4k / 431.6k/s** (`1.29×` PG, -42% CPU); **10.9k / 11.1k/s** (`1.08×` PG at 32t) | 65.1k / 369.5k / 334.1k/s; 11.5k / 10.2k/s |
+| sysbench 1 proc: non-index / index updates (32t), write_only 32t | 58.9k / 28.1k/s; 7.4k/s | **57.7k** (`2.51×` PG) / **28.6k/s** (`1.36×`); 6.4k/s (0 err) | 23.0k / 21.0k/s; 18.5k/s (318 err) |
+| updates, 1 / 8 / 32 clients (`pgbench`) | 3,943 / 17,811 / 63,304/s | **4,124 / 18,528 / 68,261/s** (**2.53–2.77×** PG) | 1,629 / 6,697 / 25,869/s |
+| mixed: replica selects / master updates | 368,138–402,845 / 15,479–16,088/s | **443,389–478,560 / 15,061–16,459/s** | |
+| commit latency p50 / p99 / p99.9 / max (8 clients) | 0.42 / 0.86–0.89 / 3.86–3.92 / 8.24–10.25 ms | **0.41 / 0.84–0.87 / 3.70–3.81 / 8.03–9.09 ms** | |
+| replica lag under the mixed load, p50 / p99 | 0.22–0.23 / 0.41–0.44 ms | **0.14–0.15 / 0.27–0.33 ms** | |
+| 35 analytic queries, lexdb CPU / PG 1c, wall / PG 4p | 0.39 / 0.78 (wall vs PG1 0.48, 35/35) | **0.36 / 0.61** (wall vs PG1 **0.38**, **35/35** vs PG1, **31/35** vs PG4; summed 2,663 vs 3,832 ms) | |
+| TPC-H SF1, summed (4c vs 4p, boost off) | 3,253.6 ms (geomean 0.51, CPU 4,781 ms) | **3,327.3 ms** (**2.66×** PG4, geomean **0.52**, **17/22** vs PG4; total CPU **4,830 ms** = **3.11× less** than PG1 CPU [geomean **0.37**]; `q13` **238.2 ms** [-12.3% CPU]) | 8,839 ms (4 proc) / 15,034 ms (1c CPU) |
+| ClickBench 1M, summed (4c vs 4p, boost off) | 4,775.5 ms (geomean 0.51, CPU 7,118 ms) | **4,713.3 ms** (**2.42×** PG4, geomean **0.51**, **43/43** vs PG4; total CPU **6,912 ms** = **3.34× less** than PG1 CPU [geomean **0.29**]) | 11,401 ms (4 proc) / 23,119 ms (1c CPU) |
+| Selective star-schema joins (1M rows, 6 patterns, boost off) | **40.0 ms sum** (`0.54–22.5 ms`; **7.68×** vs PG1 / **4.46×** vs PG4) | *(unchanged)* | 308.3 ms (1c) / 161.2 ms (4p) |
+| Property graphs: Social 11q / LSQB SF0.1 / SF1 (1 core, boost off) | 500.9 ms / 454.2 ms / 7.30 s | **515.1 ms** / **576.0 ms** (`Q6` **14.0 ms**) / **8.63 s** (`Q6` **123.1 ms**, `Q9` **1.47 s**) | 5,661 ms / 3.93 s / 98.1 s (8/9) |
+| COPY narrow / wide / wide + 2 indexes / no key / 10M narrow | 0.26 / 1.07 / 1.89 / 1.13 / 2.61 s | **0.24 / 1.03 / 1.86 / 1.09 / 2.64 s** (`0.38–0.77×` PG) | 0.61 / 2.00 / 4.90 / 1.41 / 5.93 s |
+| COPY peak RSS, narrow / wide / wide + 2 indexes / 10M narrow | 224 / 619 / 1,029 / 2,103 MB | **224 / 618 / 1,029 / 2,103 MB** | |
+| MV `FAST` update (1M rows, 1 row: grp / sketch / 3-level DAG) | **0.66 / 0.47 / 0.43 ms** (sketch build **220** vs PG 379 ms) | *(unchanged)* | 144.4 / 368.6 / 136.2 ms (1c); 59.7 / 363.2 / 136.1 ms (4p) |
+
+### 1.0b Previous snapshot (`a751fe1d` / `513bc194`, 2026-11-27)
 
 **TPC-H SF1 and ClickBench 1M refreshed at `a751fe1d` (main: OLAP v3 — whole-leaf `memmem` `LIKE` pre-scan & zero-alloc `reuse`, derived-table flattening under aggregation, PK-lookup hash build groups with parallel `JK_INT2` Bloom runtime filter, `TopAgg` for `SUM`, parallel `COUNT(DISTINCT text)`, `CondText` `elideComp`, `COLL_PAD` / `#bptrim` vectorization, batched same-leaf range scans, and pre-kernel dense pushdown); `sysbench` OLTP and bulk `\copy` from `513bc194`; Social Graph 11q and LDBC LSQB SF0.1/SF1 from `48b393c0`; 35 Analytic and star-schema joins from `4c1fb4cc`; `pgbench` and MV suites from `59797d55`. Pinned (section 2), boost off for TPC-H, ClickBench, Star-Schema, Social Graph, LSQB, sysbench, and dedicated MV suites.**
 

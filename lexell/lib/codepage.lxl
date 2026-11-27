@@ -6,11 +6,34 @@
 import "strings"
 import "codepage_data" as data
 
+type VB = vector[byte]
+
 pub const WINDOWS_1252 = 1252
 pub const ISO_8859_1 = 28591
 
 // Whether decode and encode know this code page.
 pub fn supported(cp: int): bool { return cp == WINDOWS_1252 || cp == ISO_8859_1 }
+
+fn firstNonAscii(s: &str, from: int): int {
+    let n = len(s)
+    if n - from >= 32 { return firstNonAsciiSimd(s, from) }
+    var i = from
+    while i < n && strByte(s, i) < byte(0x80) { i += 1 }
+    return i
+}
+
+fn firstNonAsciiSimd(s: &str, from: int): int {
+    let n = len(s)
+    let vHi = VB.splat(byte(0x80))
+    var i = from
+    while i + 32 <= n {
+        let m = (VB.load(s, i) >= vHi).bitmask()
+        if m != u64(0) { return i + int(m.trailingZeros()) }
+        i += 32
+    }
+    while i < n && strByte(s, i) < byte(0x80) { i += 1 }
+    return i
+}
 
 // The UTF-8 text of bytes b in code page cp. ASCII bytes pass through
 // (all-ASCII input is returned as it is); a byte the code page leaves
@@ -18,16 +41,21 @@ pub fn supported(cp: int): bool { return cp == WINDOWS_1252 || cp == ISO_8859_1 
 // the same value.
 pub fn decode(cp: int, b: &str): Result[str, str] {
     if !supported(cp) { return Err("code page " + cp.toStr() + " is not supported") }
-    var i = 0
-    while i < len(b) && strByte(b, i) < 0x80 { i += 1 }
+    var i = firstNonAscii(b, 0)
     if i == len(b) { return Ok(b.clone()) }
     let w = cp == WINDOWS_1252
     var out = ""
     out += b[0..i]
     while i < len(b) {
         let c = int(strByte(b, i))
-        if c < 0x80 { out.addByte(byte(c)) } else { strings.addRune(mut &out, if w { data.DECODE_1252[c] } else { data.DECODE_28591[c] }) }
-        i += 1
+        if c < 0x80 {
+            let start = i
+            i = firstNonAscii(b, i + 1)
+            out += b[start..i]
+        } else {
+            strings.addRune(mut &out, if w { data.DECODE_1252[c] } else { data.DECODE_28591[c] })
+            i += 1
+        }
     }
     return Ok(out)
 }
@@ -36,31 +64,32 @@ pub fn decode(cp: int, b: &str): Result[str, str] {
 // character the code page cannot represent (or the invalid UTF-8).
 pub fn encode(cp: int, s: &str): Result[str, str] {
     if !supported(cp) { return Err("code page " + cp.toStr() + " is not supported") }
-    var i = 0
-    while i < len(s) && strByte(s, i) < 0x80 { i += 1 }
+    var i = firstNonAscii(s, 0)
     if i == len(s) { return Ok(s.clone()) }
 
     let w = cp == WINDOWS_1252
     var out = ""
     out += s[0..i]
     while i < len(s) {
+        if strByte(s, i) < byte(0x80) {
+            let start = i
+            i = firstNonAscii(s, i + 1)
+            out += s[start..i]
+            continue
+        }
         let d = strings.decodeAt(s, i)
         if !d.ok { return Err("invalid UTF-8 at byte " + i.toStr()) }
-        if d.rune < 0x80 {
-            out.addByte(byte(d.rune))
-        } else {
-            var lo = 0
-            var hi = 128
-            while lo < hi {
-                let mid = (lo + hi) / 2
-                if (if w { data.ENC_RUNE_1252[mid] } else { data.ENC_RUNE_28591[mid] }) < d.rune { lo = mid + 1 } else { hi = mid }
-            }
-            if lo == 128 || (if w { data.ENC_RUNE_1252[lo] } else { data.ENC_RUNE_28591[lo] }) != d.rune {
-                return Err("U+" + strings.toUpperAscii(&(strings.padLeft(&(strings.hex(d.rune)), 4, '0'))) + " (" + s[i..i + d.size] +
-                           ") cannot be represented in code page " + cp.toStr())
-            }
-            out.addByte(byte(if w { data.ENC_BYTE_1252[lo] } else { data.ENC_BYTE_28591[lo] }))
+        var lo = 0
+        var hi = 128
+        while lo < hi {
+            let mid = (lo + hi) / 2
+            if (if w { data.ENC_RUNE_1252[mid] } else { data.ENC_RUNE_28591[mid] }) < d.rune { lo = mid + 1 } else { hi = mid }
         }
+        if lo == 128 || (if w { data.ENC_RUNE_1252[lo] } else { data.ENC_RUNE_28591[lo] }) != d.rune {
+            return Err("U+" + strings.toUpperAscii(&(strings.padLeft(&(strings.hex(d.rune)), 4, '0'))) + " (" + s[i..i + d.size] +
+                       ") cannot be represented in code page " + cp.toStr())
+        }
+        out.addByte(byte(if w { data.ENC_BYTE_1252[lo] } else { data.ENC_BYTE_28591[lo] }))
         i += d.size
     }
     return Ok(out)

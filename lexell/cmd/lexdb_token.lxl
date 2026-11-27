@@ -11,6 +11,8 @@
 //   (url ~ '\ycheckout\y') and an ngrambf one that has none of its n-grams.
 import "strings"
 
+type VB = vector[byte]
+
 // Whether c is a byte of a token.
 pub fn isTokenByte(c: byte): bool {
     return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')
@@ -25,23 +27,82 @@ pub fn validToken(w: &str): bool {
 
 fn foldByte(c: byte): byte { return if c >= 'A' && c <= 'Z' { c + 32 } else { c } }
 
+fn tokenMidEq(s: &str, pos: int, w: &str, fold: bool): bool {
+    if fold {
+        for k in 1..len(w) - 1 {
+            if foldByte(s[pos + k]) != w[k] { return false }
+        }
+        return true
+    }
+    for k in 1..len(w) - 1 {
+        if s[pos + k] != w[k] { return false }
+    }
+    return true
+}
+
 // Whether w (a token; folded to lower case when fold) is one of s's tokens,
-// s's ASCII letters folded when fold.
+// s's ASCII letters folded when fold. Uses 2-byte branchless vector[byte] SIMD.
 pub fn hasToken(s: &str, w: &str, fold: bool): bool {
-    let n = len(s)
+    return hasTokenRange(s, 0, len(s), w, fold)
+}
+
+// Zero-copy hasToken on s[lo..hi].
+pub fn hasTokenRange(s: &str, lo: int, hi: int, w: &str, fold: bool): bool {
+    let n = hi - lo
     let m = len(w)
-    var i = 0
-    while i < n {
-        while i < n && !isTokenByte(s[i]) { i += 1 }
-        let st = i
-        while i < n && isTokenByte(s[i]) { i += 1 }
-        if i - st == m {
-            var same = true
-            for k in 0..m {
-                let c = if fold { foldByte(s[st + k]) } else { s[st + k] }
-                if c != w[k] { same = false; break }
+    if m == 0 || m > n { return false }
+    let lim = hi - m + 1
+    let b0 = w[0]
+    let v0Lo = VB.splat(b0)
+    let vM0 = if fold && b0 >= 'a' && b0 <= 'z' { VB.splat(byte(0x20)) } else { VB.zero() }
+    var i = lo
+    if m == 1 {
+        while i + VB.lanes <= lim {
+            var bm = ((VB.load(s, i) | vM0) == v0Lo).bitmask()
+            while bm != u64(0) {
+                let pos = i + int(bm.trailingZeros())
+                if (pos == lo || !isTokenByte(s[pos - 1])) && (pos + 1 == hi || !isTokenByte(s[pos + 1])) { return true }
+                bm = bm & (bm - u64(1))
             }
-            if same { return true }
+            i += VB.lanes
+        }
+        if i < lim {
+            var bm = ((VB.loadPartial(s, i, byte(0)) | vM0) == v0Lo).bitmask() & VB.tailMask(lim - i)
+            while bm != u64(0) {
+                let pos = i + int(bm.trailingZeros())
+                if (pos == lo || !isTokenByte(s[pos - 1])) && (pos + 1 == hi || !isTokenByte(s[pos + 1])) { return true }
+                bm = bm & (bm - u64(1))
+            }
+        }
+        return false
+    }
+    let off1 = m - 1
+    let b1 = w[off1]
+    let v1Lo = VB.splat(b1)
+    let vM1 = if fold && b1 >= 'a' && b1 <= 'z' { VB.splat(byte(0x20)) } else { VB.zero() }
+    while i + VB.lanes <= lim {
+        let ma = (VB.load(s, i) | vM0) == v0Lo
+        let mb = (VB.load(s, i + off1) | vM1) == v1Lo
+        var bm = (ma & mb).bitmask()
+        while bm != u64(0) {
+            let pos = i + int(bm.trailingZeros())
+            if (pos == lo || !isTokenByte(s[pos - 1])) && (pos + m == hi || !isTokenByte(s[pos + m])) && (m == 2 || tokenMidEq(s, pos, w, fold)) {
+                return true
+            }
+            bm = bm & (bm - u64(1))
+        }
+        i += VB.lanes
+    }
+    if i < lim {
+        let ma = (VB.loadPartial(s, i, byte(0)) | vM0) == v0Lo
+        let mb = (VB.loadPartial(s, i + off1, byte(0)) | vM1) == v1Lo
+        var bm = (ma & mb).bitmask() & VB.tailMask(lim - i)
+        while bm != u64(0) {
+            let pos = i + int(bm.trailingZeros())
+            if (pos == lo || !isTokenByte(s[pos - 1])) && (pos + m == hi || !isTokenByte(s[pos + m])) && (m == 2 || tokenMidEq(s, pos, w, fold)) {
+                return true
+            }
+            bm = bm & (bm - u64(1))
         }
     }
     return false

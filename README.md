@@ -5,9 +5,9 @@ Lexell is a memory-safe language that compiles in milliseconds and produces smal
 - **Memory safe, without a garbage collector.** Every value has one owner, and the compiler checks that a borrow never outlives what it borrows, so there is no use after free and no double free. Memory is released as soon as its owner goes away: no collector, no pauses, and a small footprint (2–31 MB peak in the benchmarks, where the JVM takes 51 MB–1.4 GB). Reference counting is there when you ask for it (`rc T`).
 - **No nulls, no unchecked memory access.** A value that may be missing is an `Option`, and the compiler makes you handle the missing case. Indexes are bounds-checked, and integer overflow stops the program instead of wrapping silently. There is no pointer arithmetic and no `unsafe` block; the only unchecked code is a call into a C library declared `extern`, which the standard library wraps.
 - **No data races, and scaling by sharing nothing.** A server handles thousands of connections as cooperative tasks on one thread, written as plain sequential code, with no threads, locks or `async`. One thread per process is a performance choice as well as a safety one: to use more cores you run more processes that share nothing, as nginx does, so adding cores adds no locks and no contention (see [concurrency](#concurrency-without-threads-or-locks)).
-- **A quick feedback loop.** Hello world compiles in 14 ms, against 59 ms for Rust, and the nine benchmark programs in 140 ms, against 3.58 s.
-- **Small, fast executables.** The compiler writes Linux executables directly. Hello world is 22 KB, against Rust's 330 KB, and the generated code is faster than Rust's on 12 of the 19 [benchmarks](#performance) they share, and level on two more.
-- **Built for modern Linux, without legacy baggage.** Rather than targeting decades-old baselines, the native backend assumes Linux `x86-64-v3` (AVX2, BMI2, CRC32C) out of the box, and the event loop uses `io_uring` natively for sockets and files with an automatic `epoll` fallback on older kernels or restricted containers.
+- **A quick feedback loop.** Hello world compiles in 19 ms, against 58 ms for Rust, and the nine benchmark programs in 187 ms, against 3.36 s.
+- **Small, fast executables.** The compiler writes Linux executables directly. Hello world is 22 KB, against Rust's 330 KB, and the generated code is faster than Rust's on 14 of the 19 [benchmarks](#performance) they share, and level on one more.
+- **Built for modern Linux, without legacy baggage.** Rather than targeting decades-old baselines, the native backend assumes Linux `x86-64-v3` (AVX2, BMI2, CRC32C) out of the box with built-in explicit `vector[T]` SIMD types, and the event loop uses `io_uring` natively for sockets and files with an automatic `epoll` fallback on older kernels or restricted containers.
 
 These guarantees come from the language's rules and the compiler's checks. They have not been formally proved, and the compiler is young, so treat it as you would any new toolchain.
 
@@ -25,15 +25,15 @@ Measured on an AMD Ryzen 7 8745HS running Linux 7.2 (27 November 2026). Full tab
 
 | Area | Headline result | Details |
 |---|---|---|
-| Compile time | Hello world in 14 ms (4.1× faster than Rust); 9-program suite in 140 ms (26× faster) | [PERFORMANCE.md](PERFORMANCE.md) |
-| Generated code (`-O`) | Ahead of Rust on 12 of 19 shared benchmarks (level on 2); ahead of warmed-up Java on most CPU benchmarks | [PERFORMANCE.md](PERFORMANCE.md) |
-| Peak memory | 2–31 MB across the benchmark suite (vs. 50 MB–1.4 GB on the JVM) | [PERFORMANCE.md](PERFORMANCE.md) |
-| HTTP/1.1 & HTTP/2 server | Up to 235k req/s (`h2c`) and 181k req/s (TLS 1.3) on 1 core — 1.5–5.4× Go and up to 2.4× Node.js at 7–13 MB RSS | [PERFORMANCE.md](PERFORMANCE.md) |
-| CLI tools & parsers | Faster than Go's `regexp`, `jq`, `eza`, `grep` and Python JSON | [PERFORMANCE.md](PERFORMANCE.md) |
+| Compile time | Hello world in 19 ms (3.0× faster than Rust); 9-program suite in 187 ms (18× faster) | [PERFORMANCE.md](PERFORMANCE.md) |
+| Generated code (`-O`) | Ahead of Rust on 14 of 19 shared benchmarks (level on 1); ahead of warmed-up Java on 10 of 20 (level on 1) | [PERFORMANCE.md](PERFORMANCE.md) |
+| Peak memory | 2–31 MB across 19 of 20 benchmarks (vs. 51 MB–2.37 GB on the JVM) | [PERFORMANCE.md](PERFORMANCE.md) |
+| HTTP/1.1 & HTTP/2 server | Up to 193k req/s HTTP/1.1, 275k req/s (`h2c`) and 228k req/s (TLS 1.3) on 1 core — 1.5–5.1× Go and 1.1–2.5× Node.js at 7–12 MB RSS | [PERFORMANCE.md](PERFORMANCE.md) |
+| CLI tools & parsers | Faster than Go's `regexp`, `jq`, `eza`, GNU `grep` (ahead of `rg` on `grep -c`), and Python JSON | [PERFORMANCE.md](PERFORMANCE.md) |
 | 38-digit `Decimal` | Faster than .NET `Decimal` on every operation and Java `BigDecimal` on 9 of 10 | [PERFORMANCE.md](PERFORMANCE.md) |
-| LexDB vs. PostgreSQL 18 | 2.4–2.7× faster than 4-core PostgreSQL on TPC-H and ClickBench analytics (43/43 ClickBench queries faster, 3.1–3.2× less total CPU), 1.3–3.1× durable updates, 1.2–1.3× 4-core OLTP reads via replicas | [LexDB performance](lexell/docs/lexdb/performance.md) |
+| LexDB vs. PostgreSQL 18 | 2.4–2.7× faster than 4-core PostgreSQL on TPC-H and ClickBench analytics (43/43 ClickBench queries faster, 3.1–3.3× less total CPU), 1.4–3.2× durable updates, 1.3–1.46× 4-core OLTP reads via replicas | [LexDB performance](lexell/docs/lexdb/performance.md) |
 
-Where others are ahead: Rust leads on floating-point (`nbody`), sorting with closures, bit-packed decode and hash aggregation; Java leads on allocation-heavy microbenchmarks and vectorised matrix multiplication; PostgreSQL leads on single-process multi-threaded reads and high-concurrency multi-statement read-write transactions. See the linked reports for the full breakdown.
+Where others are ahead: Rust leads on floating-point (`nbody`), sorting with closures, byte tokenizing, and hash aggregation; Java leads on allocation-heavy microbenchmarks and matrix multiplication; PostgreSQL leads on single-process multi-threaded reads and high-concurrency multi-statement read-write transactions. See the linked reports for the full breakdown.
 
 ## Concurrency without threads or locks
 
