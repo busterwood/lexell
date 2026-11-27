@@ -437,11 +437,12 @@ pub type BNode = closed {
     // - CASE WHEN cond THEN textCol ELSE lit END (ClickBench q39)
     // - length(textCol) / char_length(textCol) (ClickBench q28)
     // - regexp_replace(textCol, const_pat, const_repl [, const_flags]) (ClickBench q28)
-    TsPart(int, int)            // col, part (0 = minute, 1 = hour)
+    TsPart(int, int)            // col, part (0 = minute, 1 = hour, 2 = date year)
     TsTrunc(int, int)           // col, unitUs (1, 1000, SEC_US, 60*SEC_US, 3600*SEC_US, DAY_US)
     CondText(BNode, int, str)   // cond, textCol, elseLit
     StrLen(int)                 // textCol -> UTF-8 character length (with C_DICT word dedup)
     ReReplace(int, lexdb_lib.ReCompiled, str) // textCol, compiled regex, replacement string
+    CaseNum(BNode, BNode, int, BNode, int)    // cond, then, thenScale (-1=int), else, elseScale (-1=int)
 }
 
 // A compiled expression over a batch (9.108): per row, the columns it
@@ -854,6 +855,34 @@ pub fn bCompileD(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, bas
             let pieces = if simple { lexdb_like.likeSplit(&pat) } else { [] }
             return Some(BComp{n: BNode.Like(c, LikePat{pat: pat, esc: esc, fold: fold, simple: simple, pieces: pieces,
                                                        txt: kinds[c + base] == BK_TEXT}), typ: BT_BOOL})
+        }
+        BX.Case(cs, hasElse) {
+            if hasElse && len(cs) == 3 {
+                let c0 = bCompileD(&cs[0], cols, kinds, ce, base, dec)
+                if c0.isNone() { return None }
+                let cc0 = c0.unwrap()
+                if !boolLike(cc0.typ) { return None }
+                let c1 = bCompileD(&cs[1], cols, kinds, ce, base, dec)
+                if c1.isNone() { return None }
+                let c2 = bCompileD(&cs[2], cols, kinds, ce, base, dec)
+                if c2.isNone() { return None }
+                let cc1 = c1.unwrap()
+                let cc2 = c2.unwrap()
+                let t1 = cc1.typ
+                let t2 = cc2.typ
+                if intLike(t1) && intLike(t2) {
+                    return Some(BComp{n: BNode.CaseNum(takeN(cc0), takeN(cc1), -1, takeN(cc2), -1), typ: BT_INT})
+                }
+                if (isDecT(t1) || isDecT(t2)) && (isDecT(t1) || intLike(t1)) && (isDecT(t2) || intLike(t2)) {
+                    let s1 = decSc(t1)
+                    let s2 = decSc(t2)
+                    let sc = max(s1, s2)
+                    if sc <= lexdb_vec.MAX_SCALE {
+                        return Some(BComp{n: BNode.CaseNum(takeN(cc0), takeN(cc1), s1, takeN(cc2), s2), typ: BT_DEC + sc})
+                    }
+                }
+            }
+            return None
         }
         else { return None }
     }
@@ -1350,6 +1379,26 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
         }
         BNode.TsPart(col, part) {
             var out = lexdb_rows.bvec(m)
+            if part == 2 {
+                for j in 0..m {
+                    let r = idx[j]
+                    if b.cols[col].nul[r] {
+                        out.nul[j] = true
+                        continue
+                    }
+                    match &b.vals[col][r] {
+                        Val.Date(d) {
+                            if d == lexdb_time.INF || d == lexdb_time.NINF {
+                                return Err(lexdb_base.err("22008", "extract of an infinite date"))
+                            }
+                            let yr = lexdb_time.dateOf(d).year
+                            out.v[j] = if yr <= 0 { yr - 1 } else { yr }
+                        }
+                        else { return Err(batErr()) }
+                    }
+                }
+                return Ok(out)
+            }
             for j in 0..m {
                 let r = idx[j]
                 if b.cols[col].nul[r] {
@@ -1431,6 +1480,51 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
         }
         BNode.ReReplace(_, _, _) {
             return Ok(lexdb_rows.bvec(0))
+        }
+        BNode.CaseNum(cond, th, st, el, se) {
+            let cv = try bEval(&cond, b, idx)
+            var tPos: []int = []
+            var tIdx: []int = []
+            var ePos: []int = []
+            var eIdx: []int = []
+            for j in 0..m {
+                if !cv.nul[j] && cv.v[j] != 0 {
+                    append(mut &tPos, j)
+                    append(mut &tIdx, idx[j])
+                } else {
+                    append(mut &ePos, j)
+                    append(mut &eIdx, idx[j])
+                }
+            }
+            var out = lexdb_rows.bvec(m)
+            let sc = max(st, se)
+            if len(tIdx) > 0 {
+                let tv = try bEval(&th, b, &tIdx)
+                let mul = if st >= 0 && st < sc { lexdb_rows.pow10i(sc - st) } else { 1 }
+                for k in 0..len(tPos) {
+                    let j = tPos[k]
+                    if tv.nul[k] { out.nul[j] = true; continue }
+                    if mul != 1 {
+                        match tv.v[k].checkedMul(mul) { Some(w) { out.v[j] = w } None { return Err(decSpill()) } }
+                    } else {
+                        out.v[j] = tv.v[k]
+                    }
+                }
+            }
+            if len(eIdx) > 0 {
+                let ev = try bEval(&el, b, &eIdx)
+                let mul = if se >= 0 && se < sc { lexdb_rows.pow10i(sc - se) } else { 1 }
+                for k in 0..len(ePos) {
+                    let j = ePos[k]
+                    if ev.nul[k] { out.nul[j] = true; continue }
+                    if mul != 1 {
+                        match ev.v[k].checkedMul(mul) { Some(w) { out.v[j] = w } None { return Err(decSpill()) } }
+                    } else {
+                        out.v[j] = ev.v[k]
+                    }
+                }
+            }
+            return Ok(out)
         }
     }
 }
@@ -2700,6 +2794,11 @@ pub fn bColsOf(n: &BNode, used: mut &[]bool) {
         }
         BNode.StrLen(col) { used[col] = true }
         BNode.ReReplace(col, _, _) { used[col] = true }
+        BNode.CaseNum(cond, th, _, el, _) {
+            bColsOf(&cond, used)
+            bColsOf(&th, used)
+            bColsOf(&el, used)
+        }
     }
 }
 
@@ -4759,16 +4858,21 @@ fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan
     let afterA = aggAfter(&ag, len(bp.kinds))
     let lazy = lazyOfAfter(&bp, t, &bconds, -1, &afterA)
     var parDone = false
+    var parEmitted = false
     if !held && par.threads() > 1 && src.index < 0 && src.rd.ix < 0 && !src.desc && !src.rd.small &&
        len(src.scans) == 1 && !src.scans[0].empty && !src.scans[0].point &&
-       !ag.set && len(ag.ags) == 1 && top.groupCap < 0 && canParAgg(&bconds, &ag.ags[0]) {
+       !ag.set && len(ag.ags) == 1 && top.groupCap < 0 && canParAgg(&bconds, &ag.ags[0]) &&
+       parAggWorthIt(t, &lazy, &bconds, &ag.ags[0]) {
         var parCur = lexdb_access.newCursor()
-        let pr = try parAggBatches(st, txn, &rel, &src.scans[0], mut &parCur, &bp, &lazy, &bconds,
+        let pr = try parAggBatches(st, txn, &rel, &src.scans[0], sc.part, mut &parCur, &bp, &lazy, &bconds,
                                    mut &ag.ags[0], mut &ag.rows, top, streamOn, &streamHb, streamRowLen,
                                    give, mut &streamFirst, mut &streamAccs, bud,
                                    mut &nRead, mut &nJoined, mut &nBatches, mut &streamed, mut &peakAdded)
         if pr == 2 { return Ok(None) }
-        if pr == 1 {
+        if pr == 4 {
+            parDone = true
+            parEmitted = true
+        } else if pr == 1 {
             parDone = true
         } else if pr == 3 {
             // Hybrid tail: parallel chunks already merged into ag.ags[0]; finish remaining dirty/non-col leaves serially from parCur!
@@ -4907,8 +5011,8 @@ fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan
     cnt[0].read += nRead
     cnt[0].joined += nJoined
     cnt[0].batches += nBatches
-    cnt[len(cnt) - 1].joined += streamed + ag.ngroups()
-    try ag.finishTop(len(cols), top, give)
+    cnt[len(cnt) - 1].joined += streamed + (if parEmitted { 0 } else { ag.ngroups() })
+    if !parEmitted { try ag.finishTop(len(cols), top, give) }
     let finalAdd = ag.added()
     return Ok(Some(if peakAdded > finalAdd { peakAdded } else { finalAdd }))
 }
@@ -5258,6 +5362,7 @@ fn aggKeyCompile(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, cx: &Ctx, dec
                                     let lo = strings.toLowerAscii(&f)
                                     if lo == "minute" || lo == "minutes" { part = 0 }
                                     else if lo == "hour" || lo == "hours" { part = 1 }
+                                    else if lo == "year" || lo == "years" { part = 2 }
                                 }
                                 else {}
                             }
@@ -5268,8 +5373,13 @@ fn aggKeyCompile(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, cx: &Ctx, dec
                 if part >= 0 {
                     match &args[1] {
                         BX.Col(c) {
-                            if c >= 0 && c < len(cols) && c < len(kinds) && kinds[c] == BK_VAL && cols[c].typ.oid == lexdb_sql.OID_TS {
-                                return Some(BComp{n: BNode.TsPart(c, part), typ: BT_INT})
+                            if c >= 0 && c < len(cols) && c < len(kinds) && kinds[c] == BK_VAL {
+                                if part == 2 && cols[c].typ.oid == lexdb_sql.OID_DATE {
+                                    return Some(BComp{n: BNode.TsPart(c, 2), typ: BT_INT})
+                                }
+                                if part < 2 && cols[c].typ.oid == lexdb_sql.OID_TS {
+                                    return Some(BComp{n: BNode.TsPart(c, part), typ: BT_INT})
+                                }
                             }
                         }
                         else {}
@@ -11072,6 +11182,19 @@ fn joinTail(jr: &JRun, js: mut &JState, j: int, at: &[][]int, n: int, pj: &[]int
 fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef,
             tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, dec: bool, kinds: []int, owner: []int, want: []bool, exact: bool,
             bud: mut &Budget, cnt: mut &[]Counts, ap: &Apply, out: &fn(mut &lexdb_store.Txn, mut &Batch): Result[bool, DbErr]): Result[Unit, DbErr] {
+    var noParAg: []AggSt = []
+    var noParRows = 0
+    var noParGave = false
+    var noParParts: []ParAggState = []
+    return joinRowsWithAgg(st, txn, top, cols, tabs, srcs, vrows, cx, dec, kinds, owner, want, exact, bud, cnt, ap,
+                           mut &noParAg, mut &noParRows, mut &noParGave, mut &noParParts, out)
+}
+
+fn joinRowsWithAgg(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.PPlan, cols: &[]lexdb_sql.ColDef,
+                   tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, dec: bool, kinds: []int, owner: []int, want: []bool, exact: bool,
+                   bud: mut &Budget, cnt: mut &[]Counts, ap: &Apply,
+                   parAg: mut &[]AggSt, parRows: mut &int, parGaveWay: mut &bool, parParts: mut &[]ParAggState,
+                   out: &fn(mut &lexdb_store.Txn, mut &Batch): Result[bool, DbErr]): Result[Unit, DbErr] {
     let nq = len(cols)
     var wl: []int = []
     for c in 0..len(want) { if want[c] { append(mut &wl, c) } }
@@ -11162,23 +11285,55 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
     }
     if len(rt.bpRanges) > 0 { for r in rt.bpRanges { append(mut &bp.ranges, r) } }
     let after0 = join0After(&jr, sc, len(bp.kinds), pushCol)
-    let stopped = try readRows(st, txn, t, sc, &srcs[sc.level], &vrows[sc.level], &bp, &cn, pushCol, &ph, &rt, &after0, exact, mut &rc,
-                               fn(tx: mut &lexdb_store.Txn, b: mut &Batch, idx: []int, raw: bool): Result[bool, DbErr] {
-        joinChunks += 1
-        try bud.tickN(b.n)
-        js.cur[0] = replace(b, lexdb_rows.noRows())
-        let got = if jr.grow && !raw { joinGrow(st, tx, &jr, mut &js, tabs, &cn, idx, exact, cx, bud, cnt, mut &rawKept, mut &width, mut &unreached, out) }
-                  else { joinChunk(st, tx, &jr, mut &js, tabs, &cn, idx, raw, exact, cx, bud, cnt, mut &rawKept, out) }
-        // (the batch back to the scan, used again)
-        b = replace(mut &js.cur[0], lexdb_rows.noRows())
-        return got
-    })
+    var parJoinDone = false
+    if len(parAg) == 1 && !exact && par.threads() > 1 && canParJoinAgg(&jr, &srcs[sc.level], &cn, &parAg[0]) {
+        var lazy0 = lazyOfAfter(&bp, t, &cn, pushCol, &after0)
+        if rt.active { mergeRtIntoLazy(mut &lazy0, &rt) }
+        let rel0 = lexdb_catalog.relOf(t)
+        let hasCut0 = len(ph.cutB) > 0
+        parJoinDone = try parAggJoin(st, txn, &rel0, &srcs[sc.level].scans[0], &jr, &bp, &lazy0, &cn, pushCol, &ph, hasCut0,
+                                     mut &parAg[0], parRows, parParts, bud, cnt, mut &rc)
+    }
+    let stopped = if parJoinDone { false } else if len(parAg) == 1 {
+        try readRows(st, txn, t, sc, &srcs[sc.level], &vrows[sc.level], &bp, &cn, pushCol, &ph, &rt, &after0, exact, mut &rc,
+                     fn(tx: mut &lexdb_store.Txn, b: mut &Batch, idx: []int, raw: bool): Result[bool, DbErr] {
+            joinChunks += 1
+            try bud.tickN(b.n)
+            js.cur[0] = replace(b, lexdb_rows.noRows())
+            let agOut = fn(tx2: mut &lexdb_store.Txn, f: mut &Batch): Result[bool, DbErr] {
+                var all: []int = withCapacity(f.n)
+                for x in 0..f.n { append(mut &all, x) }
+                if !(try parAg[0].eat(f, &all)) {
+                    parGaveWay = true
+                    return Ok(false)
+                }
+                parRows += f.n
+                return Ok(true)
+            }
+            let got = if jr.grow && !raw { joinGrow(st, tx, &jr, mut &js, tabs, &cn, idx, exact, cx, bud, cnt, mut &rawKept, mut &width, mut &unreached, agOut) }
+                      else { joinChunk(st, tx, &jr, mut &js, tabs, &cn, idx, raw, exact, cx, bud, cnt, mut &rawKept, agOut) }
+            b = replace(mut &js.cur[0], lexdb_rows.noRows())
+            return got
+        })
+    } else {
+        try readRows(st, txn, t, sc, &srcs[sc.level], &vrows[sc.level], &bp, &cn, pushCol, &ph, &rt, &after0, exact, mut &rc,
+                     fn(tx: mut &lexdb_store.Txn, b: mut &Batch, idx: []int, raw: bool): Result[bool, DbErr] {
+            joinChunks += 1
+            try bud.tickN(b.n)
+            js.cur[0] = replace(b, lexdb_rows.noRows())
+            let got = if jr.grow && !raw { joinGrow(st, tx, &jr, mut &js, tabs, &cn, idx, exact, cx, bud, cnt, mut &rawKept, mut &width, mut &unreached, out) }
+                      else { joinChunk(st, tx, &jr, mut &js, tabs, &cn, idx, raw, exact, cx, bud, cnt, mut &rawKept, out) }
+            // (the batch back to the scan, used again)
+            b = replace(mut &js.cur[0], lexdb_rows.noRows())
+            return got
+        })
+    }
     cnt[sc.level].joined += rawKept
     // each RIGHT or FULL JOIN's rows that joined nothing, a level at a
     // time as runRows gives them (what an earlier level's tail joined to a
     // later one is noted before its own), with NULLs for the tables before
     // it, its WHERE conjuncts after it, then joined with the tables after it
-    var more = !stopped
+    var more = !stopped && !parJoinDone
     for rightAt in rights {
         if !more { break }
         let jl = &jr.jls[rightAt]
@@ -11206,7 +11361,22 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
             }
             let m = len(at[0])
             js.sk.skip = 0
-            if !(try joinFrom(st, txn, &jr, mut &js, tabs, rightAt + 1, at, m, cx, bud, cnt, false, out)) {
+            let okRight = if len(parAg) == 1 {
+                try joinFrom(st, txn, &jr, mut &js, tabs, rightAt + 1, at, m, cx, bud, cnt, false,
+                             fn(tx2: mut &lexdb_store.Txn, f: mut &Batch): Result[bool, DbErr] {
+                    var all2: []int = withCapacity(f.n)
+                    for r2 in 0..f.n { append(mut &all2, r2) }
+                    if !(try parAg[0].eat(f, &all2)) {
+                        parGaveWay = true
+                        return Ok(false)
+                    }
+                    parRows += f.n
+                    return Ok(true)
+                })
+            } else {
+                try joinFrom(st, txn, &jr, mut &js, tabs, rightAt + 1, at, m, cx, bud, cnt, false, out)
+            }
+            if !okRight {
                 more = false
                 break
             }
@@ -12808,20 +12978,33 @@ fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top0: &lexdb_plan.
         if dec && !usedDec { continue }
         var gaveWay = false
         let ks0 = collections.copyOf(&kinds)
-        let r = joinRows(st, txn, top, cols, tabs, srcs, vrows, cx, dec, kinds, owner, want, false, bud, cnt, &ap,
+        var parParts: []ParAggState = []
+        let tryParJoin = !ag.set && len(ag.ags) == 1 && ap.level < 0 && par.threads() > 1 && canPlanParJoin(top) && canParAgg(&[], &ag.ags[0])
+        var r: Result[Unit, DbErr] = Ok(Unit{})
+        if tryParJoin {
+            var parAgs = replace(mut &ag.ags, [])
+            var parRows = ag.rows
+            r = joinRowsWithAgg(st, txn, top, cols, tabs, srcs, vrows, cx, dec, kinds, owner, want, false, bud, cnt, &ap,
+                                mut &parAgs, mut &parRows, mut &gaveWay, mut &parParts,
+                                fn(tx: mut &lexdb_store.Txn, f: mut &Batch): Result[bool, DbErr] { return Ok(true) })
+            ag.ags = parAgs
+            ag.rows = parRows
+        } else {
+            r = joinRows(st, txn, top, cols, tabs, srcs, vrows, cx, dec, kinds, owner, want, false, bud, cnt, &ap,
                          fn(tx: mut &lexdb_store.Txn, f: mut &Batch): Result[bool, DbErr] {
-            if askOf(f, nq) {
-                try askRows(tx, f, nq, &ks0, &ap.reads, ask)
+                if askOf(f, nq) {
+                    try askRows(tx, f, nq, &ks0, &ap.reads, ask)
+                    return Ok(true)
+                }
+                var all: []int = withCapacity(f.n)
+                for x in 0..f.n { append(mut &all, x) }
+                if !(try ag.eat(f, &all)) {
+                    gaveWay = true
+                    return Ok(false)
+                }
                 return Ok(true)
-            }
-            var all: []int = withCapacity(f.n)
-            for x in 0..f.n { append(mut &all, x) }
-            if !(try ag.eat(f, &all)) {
-                gaveWay = true
-                return Ok(false)
-            }
-            return Ok(true)
-        })
+            })
+        }
         var again = gaveWay
         match r {
             Ok(_) {}
@@ -12836,6 +13019,22 @@ fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top0: &lexdb_plan.
         if !again {
             if usedDec { decRuns += 1 }
             groupRuns += 1
+            if len(parParts) > 0 {
+                var totalDistinct = 0
+                var totalAdded = 0
+                for p in 0..len(parParts) {
+                    totalDistinct += parParts[p].ngroups
+                    totalAdded += parParts[p].added
+                }
+                cnt[last].joined += totalDistinct
+                let noTop = noTopAgg()
+                let noHb = noHavBound()
+                let emitRowLen = aggRowLenOf(&ag.ags[0])
+                for p in 0..len(parParts) {
+                    try emitParPartition(mut &ag.ags[0], mut &parParts[p], &noTop, &noHb, emitRowLen, give)
+                }
+                return Ok(totalAdded)
+            }
             cnt[last].joined += ag.ngroups()
             try ag.finish(nq, give)
             return Ok(ag.added())
@@ -15894,9 +16093,10 @@ pub fn deadlineNs(w: int): int {
 
 const PAR_MIN_LEAVES = 64
 const PAR_MIN_ROWS = 32768
-const PAR_MIN_DENSITY = 24
-const PAR_READ_MEGA = 4096
-const PAR_AGG_MEGA = 65536
+const PAR_READ_MIN_LEAVES = 512
+const PAR_READ_MIN_ROWS = 262144
+const PAR_READ_MEGA = 8192
+const PAR_AGG_MEGA = 131072
 
 type ParSpan = value record { lo: int; hi: int }
 
@@ -16058,6 +16258,7 @@ fn canParBNode(n: &BNode): bool {
         BNode.TsTrunc(_, _) { return true }
         BNode.CondText(cond, _, _) { return canParBNode(&cond) }
         BNode.StrLen(_) { return true }
+        BNode.CaseNum(cond, th, _, el, _) { return canParBNode(&cond) && canParBNode(&th) && canParBNode(&el) }
         else { return false }
     }
 }
@@ -16067,10 +16268,45 @@ fn allCanPar(conds: &[]BNode): bool {
     return true
 }
 
+fn isFastUrlAgg(ag: &AggSt): bool {
+    if ag.reCol < 0 || len(ag.reRepl) != 2 || ag.reRepl[0] != '\\' || ag.reRepl[1] != '1' { return false }
+    match &ag.reComp {
+        Some(rc) { return rc.fastKind == 1 && !rc.all }
+        None { return false }
+    }
+}
+
+fn parAggWorthIt(t: &lexdb_catalog.Table, lz: &Lazy, bconds: &[]BNode, ag: &AggSt): bool {
+    // Dense tables (e.g. TPC-H lineitem/orders) have >30 rows/leaf and low collect overhead -> always parallelize.
+    if len(t.cols) < 32 { return true }
+    // Wide low-density tables (e.g. ClickBench 105-col hits at ~8.5 rows/leaf): avoid copying huge
+    // text slabs for raw LIKE filters or trivial low-compute scans where in-place serial wins.
+    if len(lz.raw) > 0 { return false }
+    if len(ag.keys) >= 2 || ag.textCol >= 0 || isFastUrlAgg(ag) { return true }
+    var hasStrLen = false
+    var hasMinMax = false
+    var hasCntD = false
+    for sp in ag.specs {
+        if sp.kind == BA_CNTD { hasCntD = true }
+        if sp.kind == BA_MIN || sp.kind == BA_MAX { hasMinMax = true }
+        match &sp.arg {
+            Some(ax) { match ax { BNode.StrLen(_) { hasStrLen = true } else {} } }
+            None {}
+        }
+    }
+    if hasStrLen || hasCntD { return true }
+    if len(ag.keys) == 0 && len(bconds) == 0 && hasMinMax { return true }
+    return false
+}
+
 fn canParAgg(bconds: &[]BNode, ag: &AggSt): bool {
-    if ag.track || ag.reCol >= 0 || ag.groupCap >= 0 { return false }
+    if ag.track || ag.groupCap >= 0 { return false }
+    let fastUrl = isFastUrlAgg(ag)
+    if ag.reCol >= 0 && !fastUrl { return false }
     if !allCanPar(bconds) { return false }
-    for k in ag.keys { if !canParBNode(&k.n) { return false } }
+    if !fastUrl {
+        for k in ag.keys { if !canParBNode(&k.n) { return false } }
+    }
     for si in 0..len(ag.specs) {
         let sp = &ag.specs[si]
         if sp.kind == BA_GEN || ag.gens[si].isSome() { return false }
@@ -16421,6 +16657,23 @@ fn bEvalPure(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
         }
         BNode.TsPart(col, part) {
             var out = lexdb_rows.bvec(m)
+            if part == 2 {
+                for j in 0..m {
+                    let r = idx[j]
+                    if b.cols[col].nul[r] { out.nul[j] = true; continue }
+                    match &b.vals[col][r] {
+                        Val.Date(d) {
+                            if d == lexdb_time.INF || d == lexdb_time.NINF {
+                                return Err(lexdb_base.err("22008", "extract of an infinite date"))
+                            }
+                            let yr = lexdb_time.dateOf(d).year
+                            out.v[j] = if yr <= 0 { yr - 1 } else { yr }
+                        }
+                        else { return Err(batErrPure()) }
+                    }
+                }
+                return Ok(out)
+            }
             for j in 0..m {
                 let r = idx[j]
                 if b.cols[col].nul[r] { out.nul[j] = true; continue }
@@ -16476,6 +16729,51 @@ fn bEvalPure(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
                 match &b.vals[col][r] {
                     Val.Text(s) { out.v[j] = utf8CharLen(s) }
                     else { return Err(batErrPure()) }
+                }
+            }
+            return Ok(out)
+        }
+        BNode.CaseNum(cond, th, st, el, se) {
+            let cv = try bEvalPure(&cond, b, idx)
+            var tPos: []int = []
+            var tIdx: []int = []
+            var ePos: []int = []
+            var eIdx: []int = []
+            for j in 0..m {
+                if !cv.nul[j] && cv.v[j] != 0 {
+                    append(mut &tPos, j)
+                    append(mut &tIdx, idx[j])
+                } else {
+                    append(mut &ePos, j)
+                    append(mut &eIdx, idx[j])
+                }
+            }
+            var out = lexdb_rows.bvec(m)
+            let sc = max(st, se)
+            if len(tIdx) > 0 {
+                let tv = try bEvalPure(&th, b, &tIdx)
+                let mul = if st >= 0 && st < sc { lexdb_rows.pow10i(sc - st) } else { 1 }
+                for k in 0..len(tPos) {
+                    let j = tPos[k]
+                    if tv.nul[k] { out.nul[j] = true; continue }
+                    if mul != 1 {
+                        match tv.v[k].checkedMul(mul) { Some(w) { out.v[j] = w } None { return Err(decSpill()) } }
+                    } else {
+                        out.v[j] = tv.v[k]
+                    }
+                }
+            }
+            if len(eIdx) > 0 {
+                let ev = try bEvalPure(&el, b, &eIdx)
+                let mul = if se >= 0 && se < sc { lexdb_rows.pow10i(sc - se) } else { 1 }
+                for k in 0..len(ePos) {
+                    let j = ePos[k]
+                    if ev.nul[k] { out.nul[j] = true; continue }
+                    if mul != 1 {
+                        match ev.v[k].checkedMul(mul) { Some(w) { out.v[j] = w } None { return Err(decSpill()) } }
+                    } else {
+                        out.v[j] = ev.v[k]
+                    }
                 }
             }
             return Ok(out)
@@ -16588,7 +16886,19 @@ fn copyBatchRows(dst: mut &Batch, src: &Batch, ch: &[]int, from: int, cnt: int, 
     return true
 }
 
-fn parReadWorker(leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int, bp: &BPlan, lz: &Lazy,
+fn resetBatchInPlace(b: mut &Batch, bp: &BPlan) {
+    let n = b.n
+    if n == 0 { return }
+    for i in 0..len(bp.kinds) {
+        if !bp.needCol[i] { continue }
+        let col = mut &b.cols[i]
+        for q in 0..n { col.nul[q] = false }
+        if bp.kinds[i] == BK_TEXT { b.txt[i].clear() }
+    }
+    b.n = 0
+}
+
+fn parReadWorker(slab: &str, leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int, bp: &BPlan, lz: &Lazy, rw: &lexdb_rows.Rows,
                  conds: &[]BNode, pushCol: int, ph: &PushH, hasCut: bool,
                  needPl: &[]bool, maxPl: int): ParReadRes {
     var out = ParReadRes{batches: [], read: 0, kept: 0, pushed: 0, cut: 0, batchesN: 0, kernRuns: 0, bail: false, err: None}
@@ -16597,7 +16907,129 @@ fn parReadWorker(leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int, bp: &BPlan, 
     var hasDst = false
     for li in lo..hi {
         let pl = &leaves[li]
-        let s = &pl.cols
+        let s = &slab[pl.off..pl.off + pl.slen]
+        if pl.kind == lexdb_access.PL_ANY {
+            let dirOpt = lexdb_rows.parseAnyCols(s, pl.n)
+            if dirOpt.isNone() { out.bail = true; return out }
+            let dir = dirOpt.unwrap()
+            var k = pl.from
+            while k < pl.to {
+                let take = min(pl.to - k, lexdb_rows.BROWS)
+                for i in 0..len(bp.kinds) {
+                    if !bp.needCol[i] { continue }
+                    for q in 0..take { b.cols[i].nul[q] = false }
+                    if bp.kinds[i] == BK_TEXT { b.txt[i].clear() }
+                }
+                b.n = take
+                let useLazy = lz.on && len(lz.br.usedP) > 0
+                let bp0 = if useLazy { &lz.bf } else { bp }
+                for q in 0..take {
+                    match lexdb_rows.decodeRow(lexdb_rows.anyRowBytes(s, &dir, k + q), q, mut &b, bp0, rw) {
+                        Ok(code) { if code != 0 { out.bail = true; return out } }
+                        Err(x) { out.err = Some(x); return out }
+                    }
+                }
+                var ch: []int = withCapacity(take)
+                for q in 0..take { append(mut &ch, q) }
+                for ci in 0..len(conds) {
+                    if len(ch) == 0 { break }
+                    match bTruePure(&conds[ci], &b, &ch) {
+                        Ok(pos) {
+                            var nx: []int = withCapacity(len(pos))
+                            for j in pos { append(mut &nx, ch[j]) }
+                            ch = nx
+                        }
+                        Err(x) { out.err = Some(x); return out }
+                    }
+                }
+                out.kept += len(ch)
+                if pushCol >= 0 && len(ch) > 0 {
+                    var fin: []int = withCapacity(len(ch))
+                    let kc = &b.cols[pushCol]
+                    let dLen = len(ph.dense)
+                    if dLen > 0 {
+                        let dMin = ph.denseMin
+                        if ph.countOnly {
+                            for r in ch {
+                                if kc.nul[r] { out.pushed += 1; continue }
+                                let d = kc.v[r] - dMin
+                                if d >= 0 && d < dLen && ph.dense[d] > 0 { append(mut &fin, r) } else { out.pushed += 1 }
+                            }
+                        } else {
+                            for r in ch {
+                                if kc.nul[r] { out.pushed += 1; continue }
+                                let d = kc.v[r] - dMin
+                                if d >= 0 && d < dLen {
+                                    let bk = ph.dense[d]
+                                    if bk >= 0 {
+                                        if ph.head[bk] >= 0 { append(mut &fin, r) } else {
+                                            out.pushed += 1
+                                            if hasCut { out.cut += ph.cutB[bk] }
+                                        }
+                                        continue
+                                    }
+                                }
+                                out.pushed += 1
+                            }
+                        }
+                    } else if ph.countOnly {
+                        for r in ch {
+                            if kc.nul[r] { out.pushed += 1; continue }
+                            if ph.fastCnt.get(kc.v[r]) > 0 { append(mut &fin, r) } else { out.pushed += 1 }
+                        }
+                    } else if ph.useFast {
+                        for r in ch {
+                            if kc.nul[r] { out.pushed += 1; continue }
+                            let bk = ph.fastMap.get(kc.v[r])
+                            if bk >= 0 {
+                                if ph.head[bk] >= 0 { append(mut &fin, r) } else {
+                                    out.pushed += 1
+                                    if hasCut { out.cut += ph.cutB[bk] }
+                                }
+                            } else { out.pushed += 1 }
+                        }
+                    } else {
+                        for r in ch {
+                            if kc.nul[r] { out.pushed += 1; continue }
+                            match ph.keys.get(&kc.v[r]) {
+                                Some(bk) {
+                                    if ph.head[bk] >= 0 { append(mut &fin, r) } else {
+                                        out.pushed += 1
+                                        if hasCut { out.cut += ph.cutB[bk] }
+                                    }
+                                }
+                                None { out.pushed += 1 }
+                            }
+                        }
+                    }
+                    ch = fin
+                }
+                if useLazy && len(ch) > 0 {
+                    for r in ch {
+                        match lexdb_rows.decodeRow(lexdb_rows.anyRowBytes(s, &dir, k + r), r, mut &b, &lz.br, rw) {
+                            Ok(code) { if code != 0 { out.bail = true; return out } }
+                            Err(x) { out.err = Some(x); return out }
+                        }
+                    }
+                }
+                if len(ch) > 0 {
+                    if !hasDst { dst = lexdb_rows.newBatch(bp, lexdb_rows.BROWS); hasDst = true }
+                    var pos = 0
+                    while pos < len(ch) {
+                        let space = lexdb_rows.BROWS - dst.n
+                        let copyN = min(space, len(ch) - pos)
+                        if !copyBatchRows(mut &dst, &b, &ch, pos, copyN, bp) { out.bail = true; return out }
+                        pos += copyN
+                        if dst.n == lexdb_rows.BROWS {
+                            append(mut &out.batches, replace(mut &dst, lexdb_rows.newBatch(bp, lexdb_rows.BROWS)))
+                        }
+                    }
+                }
+                out.read += take
+                k += take
+            }
+            continue
+        }
         let dirOpt = lexdb_rows.parseLeafCols(s, pl.n, needPl, maxPl)
         if dirOpt.isNone() { out.bail = true; return out }
         let dir = dirOpt.unwrap()
@@ -16810,6 +17242,7 @@ fn parReadTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_a
                 sc: &lexdb_access.Scan, cur: mut &lexdb_access.Cursor, bp: &BPlan, lz: &Lazy,
                 conds: &[]BNode, pushCol: int, ph: &PushH, hasCut: bool, rawOnErr: bool, rc: mut &RC,
                 each: &fn(mut &lexdb_store.Txn, mut &Batch, []int, bool): Result[bool, DbErr]): Result[bool, DbErr] {
+    if len(conds) == 0 && pushCol < 0 { return Ok(false) }
     var needPl: []bool = []
     var maxPl = -1
     buildNeedPlaces(bp, lz, mut &needPl, mut &maxPl)
@@ -16818,25 +17251,27 @@ fn parReadTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_a
     var didPar = false
     while !cur.done {
         let saved = cur.copy()
-        let chunk = try lexdb_access.collectParLeaves(st, txn, rel, sc, cur, bp, lz, PAR_READ_MEGA)
+        let chunk = try lexdb_access.collectParLeaves(st, txn, rel, sc, cur, bp, lz, &needPl, maxPl, PAR_READ_MEGA, false)
         if chunk.fallback { return Ok(false) }
         let nl = len(chunk.leaves)
         if nl == 0 { continue }
         if !didPar {
             var estRows = 0
             for lv in chunk.leaves { estRows += lv.to - lv.from }
-            if (chunk.done && (nl < PAR_MIN_LEAVES || estRows < PAR_MIN_ROWS)) || estRows < nl * PAR_MIN_DENSITY {
-                // Small or ultra-wide low-density table: keep serial (no par.map pool start).
+            if chunk.done && (nl < PAR_READ_MIN_LEAVES || estRows < PAR_READ_MIN_ROWS) {
+                // Small table: keep serial (no par.map pool start).
                 cur = saved
                 return Ok(false)
             }
         }
         didPar = true
-        let leaves = chunk.leaves
+        let slabRef = &chunk.slab
+        let leavesRef = &chunk.leaves
+        let rw = lexdb_access.rowsFor(rel)
         let nParts = min(max(1, nl / 8), wantParts)
         let spans = makeParSpans(nl, nParts)
         let results = par.map(&spans, fn(sp: &ParSpan): ParReadRes {
-            return parReadWorker(&leaves, sp.lo, sp.hi, bp, lz, conds, pushCol, ph, hasCut, &needPl, maxPl)
+            return parReadWorker(slabRef, leavesRef, sp.lo, sp.hi, bp, lz, &rw, conds, pushCol, ph, hasCut, &needPl, maxPl)
         })
         for ri in 0..len(results) {
             if results[ri].bail || (results[ri].err.isSome() && rawOnErr) {
@@ -16882,6 +17317,7 @@ type ParAggMeta = value record {
     twoInt: bool
     sorted: bool
     textCol: int
+    fastUrlCol: int
     twoText: bool
     twoTextC0: int
     twoTextC1: int
@@ -16893,6 +17329,13 @@ type ParAggMeta = value record {
     havOn: bool
     havAgg: int
     havOp: int
+}
+
+type ParJoinCounts = value record {
+    starts: int
+    read: int
+    joined: int
+    nulls: int
 }
 
 // Pure worker-local aggregation state (zero BNode/BGen/GCall/ReCompiled/rc/Shared).
@@ -16915,6 +17358,12 @@ type ParAggState = record {
     lastKey: int
     lastG: int
     sortedKeys: []int
+    topKeep: []int
+    apartLeaves: []int
+    seen: [][]bool
+    jcnt: []ParJoinCounts
+    pushed: int
+    cut: int
     nRead: int
     nJoined: int
     nBatches: int
@@ -16931,7 +17380,7 @@ fn newParAggState(ns: int): ParAggState {
         twoHt: lexdb_ht.newTwoLevelTwoInt(),
         textHt: lexdb_ht.newTwoLevelArena(true),
         keyHt: lexdb_ht.newTwoLevelArena(true),
-        nullGroup: -1, lastKey: 0, lastG: -1, sortedKeys: [],
+        nullGroup: -1, lastKey: 0, lastG: -1, sortedKeys: [], topKeep: [], apartLeaves: [], seen: [], jcnt: [], pushed: 0, cut: 0,
         nRead: 0, nJoined: 0, nBatches: 0, kernRuns: 0, added: 0, bail: false, err: None
     }
     for _ in 0..ns {
@@ -17536,6 +17985,79 @@ fn parAggEat(st: mut &ParAggState, meta: &ParAggMeta, keys: &[]BComp, specs: &[]
                 gid[j] = g
             }
         }
+    } else if meta.fastUrlCol >= 0 {
+        let tc = meta.fastUrlCol
+        let tcol = lexdb_rows.isTextCol(b, tc)
+        var wcW: []int = array(64, -1)
+        var wcG: []int = array(64, -1)
+        var prevW = -1
+        var prevG = -1
+        for j in 0..nc {
+            let r = idx[j]
+            if b.cols[tc].nul[r] {
+                var g = st.nullGroup
+                if g < 0 {
+                    g = st.ngroups
+                    st.ngroups += 1
+                    let fcost = if hasFcols { bFirstVals(b, r, kinds, fcols, mut &st.fv) } else { 32 }
+                    st.added += fcost + 64 * (ns + 1) + 1
+                    if meta.room >= 0 && st.added > meta.room { return Err(memErr(meta.maxHeld)) }
+                    parNewGroup(st, specs)
+                    st.nullGroup = g
+                }
+                gid[j] = g
+                continue
+            }
+            if tcol {
+                let w = b.cols[tc].v[r]
+                if w == prevW && prevG >= 0 { gid[j] = prevG; continue }
+                let wi = ((w >> 24) ^ w) & 63
+                if wcW[wi] == w && wcG[wi] >= 0 {
+                    let g = wcG[wi]
+                    gid[j] = g; prevW = w; prevG = g
+                    continue
+                }
+                let x = lexdb_rows.textAt(b, tc, r)
+                let span = lexdb_lib.fastUrlHost(x)
+                let out = &x[(span >> 28)..(span & 0xfffffff)]
+                let oh = lexdb_ht.hashStr(out)
+                var g = st.textHt.getHash(out, oh)
+                if g < 0 {
+                    g = st.ngroups
+                    st.ngroups += 1
+                    let klen = len(out)
+                    let fcost = if hasFcols { bFirstVals(b, r, kinds, fcols, mut &st.fv) } else { 32 }
+                    st.added += fcost + 64 * (ns + 1) + klen
+                    if meta.room >= 0 && st.added > meta.room { return Err(memErr(meta.maxHeld)) }
+                    parNewGroup(st, specs)
+                    st.textHt.putHash(out, oh, g)
+                }
+                gid[j] = g
+                wcW[wi] = w; wcG[wi] = g
+                prevW = w; prevG = g
+            } else {
+                match &b.vals[tc][r] {
+                    Val.Text(x) {
+                        let span = lexdb_lib.fastUrlHost(x)
+                        let out = &x[(span >> 28)..(span & 0xfffffff)]
+                        let oh = lexdb_ht.hashStr(out)
+                        var g = st.textHt.getHash(out, oh)
+                        if g < 0 {
+                            g = st.ngroups
+                            st.ngroups += 1
+                            let klen = len(out)
+                            let fcost = if hasFcols { bFirstVals(b, r, kinds, fcols, mut &st.fv) } else { 32 }
+                            st.added += fcost + 64 * (ns + 1) + klen
+                            if meta.room >= 0 && st.added > meta.room { return Err(memErr(meta.maxHeld)) }
+                            parNewGroup(st, specs)
+                            st.textHt.putHash(out, oh, g)
+                        }
+                        gid[j] = g
+                    }
+                    else { return Ok(false) }
+                }
+            }
+        }
     } else if meta.twoText && lexdb_rows.isTextCol(b, meta.twoTextC0) && lexdb_rows.isTextCol(b, meta.twoTextC1) {
         let c0 = meta.twoTextC0
         let c1 = meta.twoTextC1
@@ -17654,16 +18176,112 @@ fn parAggEat(st: mut &ParAggState, meta: &ParAggMeta, keys: &[]BComp, specs: &[]
     return Ok(true)
 }
 
-fn parAggWorker(leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int, bp: &BPlan, lz: &Lazy,
+fn parAggWorker(slab: &str, leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int,
+                fleafBatches: &[]Batch, flo: int, fhi: int, bp: &BPlan, lz: &Lazy, rw: &lexdb_rows.Rows,
                 bconds: &[]BNode, meta: &ParAggMeta, keys: &[]BComp, specs: &[]BSpec,
                 shareOf: &[]int, kinds: &[]int, fcols: &[]int, hb: &HavBound,
-                needPl: &[]bool, maxPl: int): ParAggState {
+                needPl: &[]bool, maxPl: int, allowSkipApart: bool): ParAggState {
     var st = newParAggState(meta.ns)
     var b = lexdb_rows.newBatch(bp, lexdb_rows.BROWS)
     var idx: []int = []
+    for fi in flo..fhi {
+        let fb = &fleafBatches[fi]
+        let nr = fb.n
+        if nr == 0 { continue }
+        var ch: []int = withCapacity(nr)
+        for q in 0..nr { append(mut &ch, q) }
+        for ci in 0..len(bconds) {
+            if len(ch) == 0 { break }
+            match bTruePure(&bconds[ci], fb, &ch) {
+                Ok(pos) {
+                    var nx: []int = withCapacity(len(pos))
+                    for j in pos { append(mut &nx, ch[j]) }
+                    ch = nx
+                }
+                Err(x) { st.err = Some(x); return st }
+            }
+        }
+        st.nRead += nr
+        st.nBatches += 1
+        if len(ch) > 0 {
+            st.nJoined += len(ch)
+            match parAggEat(mut &st, meta, keys, specs, shareOf, kinds, fcols, hb, fb, &ch) {
+                Ok(ok) { if !ok { st.bail = true; return st } }
+                Err(x) { st.err = Some(x); return st }
+            }
+        }
+    }
     for li in lo..hi {
         let pl = &leaves[li]
-        let s = &pl.cols
+        let s = &slab[pl.off..pl.off + pl.slen]
+        if pl.kind == lexdb_access.PL_ANY {
+            let dirOpt = lexdb_rows.parseAnyCols(s, pl.n)
+            if dirOpt.isNone() { st.bail = true; return st }
+            let dir = dirOpt.unwrap()
+            let useLazy = lz.on && len(lz.br.usedP) > 0
+            let bp0 = if useLazy { &lz.bf } else { bp }
+            var k = pl.from
+            while k < pl.to {
+                if b.n == lexdb_rows.BROWS {
+                    st.nBatches += 1
+                    if len(idx) > 0 {
+                        st.nJoined += len(idx)
+                        match parAggEat(mut &st, meta, keys, specs, shareOf, kinds, fcols, hb, &b, &idx) {
+                            Ok(ok) { if !ok { st.bail = true; return st } }
+                            Err(x) { st.err = Some(x); return st }
+                        }
+                        idx = []
+                    }
+                    resetBatchInPlace(mut &b, bp)
+                }
+                let take = min(pl.to - k, lexdb_rows.BROWS - b.n)
+                let r0 = b.n
+                var ch: []int = withCapacity(take)
+                var rowAt: []int = withCapacity(take)
+                var nIn = 0
+                for q in 0..take {
+                    let rowS = lexdb_rows.anyRowBytes(s, &dir, k + q)
+                    if allowSkipApart && lexdb_rows.rowNeedsStore(rowS, bp) { continue }
+                    let dstR = r0 + nIn
+                    match lexdb_rows.decodeRow(rowS, dstR, mut &b, bp0, rw) {
+                        Ok(code) {
+                            if code != 0 { st.bail = true; return st }
+                        }
+                        Err(x) { st.err = Some(x); return st }
+                    }
+                    append(mut &ch, dstR)
+                    append(mut &rowAt, k + q)
+                    nIn += 1
+                }
+                if nIn > 0 {
+                    for ci in 0..len(bconds) {
+                        if len(ch) == 0 { break }
+                        match bTruePure(&bconds[ci], &b, &ch) {
+                            Ok(pos) {
+                                var nx: []int = withCapacity(len(pos))
+                                for j in pos { append(mut &nx, ch[j]) }
+                                ch = nx
+                            }
+                            Err(x) { st.err = Some(x); return st }
+                        }
+                    }
+                    if useLazy && len(ch) > 0 {
+                        for r in ch {
+                            let origRow = rowAt[r - r0]
+                            match lexdb_rows.decodeRow(lexdb_rows.anyRowBytes(s, &dir, origRow), r, mut &b, &lz.br, rw) {
+                                Ok(code) { if code != 0 { st.bail = true; return st } }
+                                Err(x) { st.err = Some(x); return st }
+                            }
+                        }
+                    }
+                    for r in ch { append(mut &idx, r) }
+                    b.n += nIn
+                    st.nRead += nIn
+                }
+                k += take
+            }
+            continue
+        }
         let dirOpt = lexdb_rows.parseLeafCols(s, pl.n, needPl, maxPl)
         if dirOpt.isNone() { st.bail = true; return st }
         let dir = dirOpt.unwrap()
@@ -17680,7 +18298,7 @@ fn parAggWorker(leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int, bp: &BPlan, l
                     }
                     idx = []
                 }
-                b = lexdb_rows.reuse(mut &b, bp)
+                resetBatchInPlace(mut &b, bp)
             }
             let take = min(pl.to - k, lexdb_rows.BROWS - b.n)
             let r0 = b.n
@@ -17966,7 +18584,7 @@ fn mergeParAgg(dst: mut &AggSt, src: mut &ParAggState, top: &TopAgg, streamOn: b
         if dst.added > peakAdded { peakAdded = dst.added }
         return Ok(Unit{})
     }
-    if dst.textCol >= 0 {
+    if dst.textCol >= 0 || dst.reCol >= 0 {
         for sg in 0..src.ngroups {
             var dg = -1
             var isNew = false
@@ -18031,9 +18649,389 @@ fn mergeParAgg(dst: mut &AggSt, src: mut &ParAggState, top: &TopAgg, streamOn: b
     return Ok(Unit{})
 }
 
-// Returns: 1 = fully completed in parallel; 0 = fallback to serial (cur points at resume position); 2 = bail to aggRows.
+fn parMergeGroupAccsPure(dst: mut &ParAggState, dg: int, src: &ParAggState, sg: int,
+                          specs: &[]BSpec, shareOf: &[]int): Result[Unit, DbErr] {
+    let ns = len(specs)
+    for si in 0..ns {
+        if shareOf[si] >= 0 { continue }
+        let sp = &specs[si]
+        let kd = sp.kind
+        if kd == BA_CNTD {
+            for k in src.asets[si][sg].keys() { dst.asets[si][dg].put(k, 1) }
+            continue
+        }
+        let sn = src.an[si][sg]
+        if sn == 0 { continue }
+        let dn = dst.an[si][dg]
+        if kd == BA_STAR || kd == BA_COUNT {
+            dst.an[si][dg] = dn + sn
+        } else if kd == BA_VAR {
+            if dn == 0 {
+                dst.afs[si][dg] = src.afs[si][sg]
+                dst.afq[si][dg] = src.afq[si][sg]
+            } else {
+                dst.afs[si][dg] = try fAddPure(dst.afs[si][dg], src.afs[si][sg])
+                dst.afq[si][dg] = try fAddPure(dst.afq[si][dg], src.afq[si][sg])
+            }
+            dst.an[si][dg] = dn + sn
+        } else if kd == BA_AND {
+            if dn == 0 || src.amm[si][sg] < dst.amm[si][dg] { dst.amm[si][dg] = src.amm[si][sg] }
+            dst.an[si][dg] = dn + sn
+        } else if kd == BA_OR {
+            if dn == 0 || src.amm[si][sg] > dst.amm[si][dg] { dst.amm[si][dg] = src.amm[si][sg] }
+            dst.an[si][dg] = dn + sn
+        } else if sp.vcol >= 0 {
+            if dn == 0 || lexdb_ops.isNull(&dst.aval[si][dg]) {
+                dst.aval[si][dg] = src.aval[si][sg].clone()
+            } else if kd == BA_SUM || kd == BA_AVG {
+                dst.aval[si][dg] = try sumAddPure(&dst.aval[si][dg], &src.aval[si][sg])
+            } else {
+                let mx = kd == BA_MAX
+                let x = try lexdb_ops.comparePure(&src.aval[si][sg], &dst.aval[si][dg])
+                if lexdb_agg.takes(x, if mx { 1 } else { -1 }, &src.aval[si][sg]) {
+                    dst.aval[si][dg] = src.aval[si][sg].clone()
+                }
+            }
+            dst.an[si][dg] = dn + sn
+        } else if kd == BA_SUM || kd == BA_AVG {
+            dst.adec[si][dg] += src.adec[si][sg]
+            dst.an[si][dg] = dn + sn
+        } else if kd == BA_MIN || kd == BA_MAX {
+            let mx = kd == BA_MAX
+            if dn == 0 || (if mx { src.amm[si][sg] > dst.amm[si][dg] } else { src.amm[si][sg] < dst.amm[si][dg] }) {
+                dst.amm[si][dg] = src.amm[si][sg]
+            }
+            dst.an[si][dg] = dn + sn
+        }
+    }
+    return Ok(Unit{})
+}
+
+fn copyGroupFcolsPure(dst: mut &ParAggState, src: &ParAggState, sg: int, nf: int): int {
+    if nf == 0 { return 32 }
+    var cost = 32
+    for fi in 0..nf {
+        let v = src.fv[sg * nf + fi].clone()
+        cost += 24 + valExtra(&v)
+        append(mut &dst.fv, v)
+    }
+    return cost
+}
+
+// Parallel disjoint hash-partitioned merge worker: merges ONLY groups whose hash
+// maps to partition `partIdx` (mod `nParts`, power of 2) across all `results[0..len]`.
+// Directly scans only the 256/nParts matching TwoLevel buckets (4x less scan, zero
+// indirect gidBkt/gidLoc misses, zero re-hashing, single-probe getOrPut).
+fn parMergePart(results: &[]ParAggState, partIdx: int, nParts: int, meta: &ParAggMeta,
+                specs: &[]BSpec, shareOf: &[]int, nf: int, estPerPart: int,
+                topOn: bool, topAggIdx: int, topN: int, topDesc: bool, topOneOrd: bool): ParAggState {
+    var out = newParAggState(meta.ns)
+    let ns = meta.ns
+    let pMask = u64(nParts - 1)
+    let isText = meta.textCol >= 0 || meta.fastUrlCol >= 0
+    if estPerPart > 1024 {
+        for si in 0..ns {
+            let kd = specs[si].kind
+            if kd != BA_CNTD {
+                out.an[si] = withCapacity(estPerPart)
+                if kd == BA_SUM || kd == BA_AVG { if specs[si].vcol < 0 { out.adec[si] = withCapacity(estPerPart) } }
+                else if kd == BA_MIN || kd == BA_MAX || kd == BA_AND || kd == BA_OR { if specs[si].vcol < 0 { out.amm[si] = withCapacity(estPerPart) } }
+            }
+        }
+        if estPerPart >= lexdb_ht.TWO_LEVEL_THRESH {
+            if meta.oneKey { out.intHt.prePromote() }
+            else if meta.twoInt { out.twoHt.prePromote(estPerPart) }
+            else if isText { out.textHt.prePromote(estPerPart) }
+            else { out.keyHt.prePromote(estPerPart) }
+        }
+    }
+    for ri in 0..len(results) {
+        let src = &results[ri]
+        let ng = src.ngroups
+        if ng == 0 { continue }
+        if meta.oneKey {
+            if src.nullGroup >= 0 && partIdx == 0 {
+                let sg = src.nullGroup
+                var dg = out.nullGroup
+                if dg < 0 {
+                    dg = out.ngroups
+                    out.ngroups += 1
+                    let fcost = copyGroupFcolsPure(mut &out, src, sg, nf)
+                    out.added += fcost + 64 * (ns + 1) + 9
+                    parNewGroup(mut &out, specs)
+                    out.nullGroup = dg
+                }
+                match parMergeGroupAccsPure(mut &out, dg, src, sg, specs, shareOf) {
+                    Ok(_) {}
+                    Err(x) { out.err = Some(x); return out }
+                }
+            }
+            if src.intHt.twoLevel {
+                var b = partIdx
+                while b < lexdb_ht.NBUCKETS {
+                    let bl = src.intHt.bktLen(b)
+                    for i in 0..bl {
+                        let k = src.intHt.bktKey(b, i)
+                        let sg = src.intHt.bktGid(b, i)
+                        let nextG = out.ngroups
+                        let dg = out.intHt.getOrPut(k, nextG)
+                        if dg == nextG {
+                            out.ngroups += 1
+                            let fcost = copyGroupFcolsPure(mut &out, src, sg, nf)
+                            out.added += fcost + 64 * (ns + 1) + 9
+                            parNewGroup(mut &out, specs)
+                        }
+                        match parMergeGroupAccsPure(mut &out, dg, src, sg, specs, shareOf) {
+                            Ok(_) {}
+                            Err(x) { out.err = Some(x); return out }
+                        }
+                    }
+                    b += nParts
+                }
+            } else {
+                for sg in 0..ng {
+                    if sg == src.nullGroup { continue }
+                    let k = src.intHt.keyAt(sg)
+                    if int((lexdb_ht.hashInt(k) >> 56) & pMask) != partIdx { continue }
+                    let nextG = out.ngroups
+                    let dg = out.intHt.getOrPut(k, nextG)
+                    if dg == nextG {
+                        out.ngroups += 1
+                        let fcost = copyGroupFcolsPure(mut &out, src, sg, nf)
+                        out.added += fcost + 64 * (ns + 1) + 9
+                        parNewGroup(mut &out, specs)
+                    }
+                    match parMergeGroupAccsPure(mut &out, dg, src, sg, specs, shareOf) {
+                        Ok(_) {}
+                        Err(x) { out.err = Some(x); return out }
+                    }
+                }
+            }
+        } else if meta.twoInt {
+            if src.twoHt.twoLevel {
+                var b = partIdx
+                while b < lexdb_ht.NBUCKETS {
+                    let bl = src.twoHt.bktLen(b)
+                    for i in 0..bl {
+                        let k0 = src.twoHt.bktK0(b, i)
+                        let k1 = src.twoHt.bktK1(b, i)
+                        let nu = src.twoHt.bktNu(b, i)
+                        let sg = src.twoHt.bktGid(b, i)
+                        let nextG = out.ngroups
+                        let dg = out.twoHt.getOrPut(k0, k1, nu, nextG)
+                        if dg == nextG {
+                            out.ngroups += 1
+                            let fcost = copyGroupFcolsPure(mut &out, src, sg, nf)
+                            out.added += fcost + 64 * (ns + 1) + 18
+                            parNewGroup(mut &out, specs)
+                        }
+                        match parMergeGroupAccsPure(mut &out, dg, src, sg, specs, shareOf) {
+                            Ok(_) {}
+                            Err(x) { out.err = Some(x); return out }
+                        }
+                    }
+                    b += nParts
+                }
+            } else {
+                for sg in 0..ng {
+                    let k0 = src.twoHt.key0At(sg)
+                    let k1 = src.twoHt.key1At(sg)
+                    let nu = src.twoHt.nuAt(sg)
+                    if int((lexdb_ht.hashTwoInt(k0, k1, nu) >> 56) & pMask) != partIdx { continue }
+                    let nextG = out.ngroups
+                    let dg = out.twoHt.getOrPut(k0, k1, nu, nextG)
+                    if dg == nextG {
+                        out.ngroups += 1
+                        let fcost = copyGroupFcolsPure(mut &out, src, sg, nf)
+                        out.added += fcost + 64 * (ns + 1) + 18
+                        parNewGroup(mut &out, specs)
+                    }
+                    match parMergeGroupAccsPure(mut &out, dg, src, sg, specs, shareOf) {
+                        Ok(_) {}
+                        Err(x) { out.err = Some(x); return out }
+                    }
+                }
+            }
+        } else if isText {
+            if src.nullGroup >= 0 && partIdx == 0 {
+                let sg = src.nullGroup
+                var dg = out.nullGroup
+                if dg < 0 {
+                    dg = out.ngroups
+                    out.ngroups += 1
+                    let fcost = copyGroupFcolsPure(mut &out, src, sg, nf)
+                    out.added += fcost + 64 * (ns + 1) + 9
+                    parNewGroup(mut &out, specs)
+                    out.nullGroup = dg
+                }
+                match parMergeGroupAccsPure(mut &out, dg, src, sg, specs, shareOf) {
+                    Ok(_) {}
+                    Err(x) { out.err = Some(x); return out }
+                }
+            }
+            if src.textHt.twoLevel {
+                var b = partIdx
+                while b < lexdb_ht.NBUCKETS {
+                    let bl = src.textHt.bktLen(b)
+                    for i in 0..bl {
+                        let kh = src.textHt.bktHash(b, i)
+                        let ks = src.textHt.bktSlice(b, i)
+                        let sg = src.textHt.bktGid(b, i)
+                        let nextG = out.ngroups
+                        let dg = out.textHt.getOrPutHash(ks, kh, nextG)
+                        if dg == nextG {
+                            out.ngroups += 1
+                            let fcost = copyGroupFcolsPure(mut &out, src, sg, nf)
+                            out.added += fcost + 64 * (ns + 1) + len(ks)
+                            parNewGroup(mut &out, specs)
+                        }
+                        match parMergeGroupAccsPure(mut &out, dg, src, sg, specs, shareOf) {
+                            Ok(_) {}
+                            Err(x) { out.err = Some(x); return out }
+                        }
+                    }
+                    b += nParts
+                }
+            } else {
+                for sg in 0..ng {
+                    if sg == src.nullGroup { continue }
+                    let kh = src.textHt.hashAt(sg)
+                    if int((kh >> 56) & pMask) != partIdx { continue }
+                    let ks = src.textHt.keySliceAt(sg)
+                    let nextG = out.ngroups
+                    let dg = out.textHt.getOrPutHash(ks, kh, nextG)
+                    if dg == nextG {
+                        out.ngroups += 1
+                        let fcost = copyGroupFcolsPure(mut &out, src, sg, nf)
+                        out.added += fcost + 64 * (ns + 1) + len(ks)
+                        parNewGroup(mut &out, specs)
+                    }
+                    match parMergeGroupAccsPure(mut &out, dg, src, sg, specs, shareOf) {
+                        Ok(_) {}
+                        Err(x) { out.err = Some(x); return out }
+                    }
+                }
+            }
+        } else {
+            if src.keyHt.twoLevel {
+                var b = partIdx
+                while b < lexdb_ht.NBUCKETS {
+                    let bl = src.keyHt.bktLen(b)
+                    for i in 0..bl {
+                        let kh = src.keyHt.bktHash(b, i)
+                        let ks = src.keyHt.bktSlice(b, i)
+                        let sg = src.keyHt.bktGid(b, i)
+                        let nextG = out.ngroups
+                        let dg = out.keyHt.getOrPutHash(ks, kh, nextG)
+                        if dg == nextG {
+                            out.ngroups += 1
+                            let fcost = copyGroupFcolsPure(mut &out, src, sg, nf)
+                            out.added += fcost + 64 * (ns + 1) + len(ks)
+                            parNewGroup(mut &out, specs)
+                        }
+                        match parMergeGroupAccsPure(mut &out, dg, src, sg, specs, shareOf) {
+                            Ok(_) {}
+                            Err(x) { out.err = Some(x); return out }
+                        }
+                    }
+                    b += nParts
+                }
+            } else {
+                for sg in 0..ng {
+                    let kh = src.keyHt.hashAt(sg)
+                    if int((kh >> 56) & pMask) != partIdx { continue }
+                    let ks = src.keyHt.keySliceAt(sg)
+                    let nextG = out.ngroups
+                    let dg = out.keyHt.getOrPutHash(ks, kh, nextG)
+                    if dg == nextG {
+                        out.ngroups += 1
+                        let fcost = copyGroupFcolsPure(mut &out, src, sg, nf)
+                        out.added += fcost + 64 * (ns + 1) + len(ks)
+                        parNewGroup(mut &out, specs)
+                    }
+                    match parMergeGroupAccsPure(mut &out, dg, src, sg, specs, shareOf) {
+                        Ok(_) {}
+                        Err(x) { out.err = Some(x); return out }
+                    }
+                }
+            }
+        }
+    }
+    if topOn && out.ngroups > 2048 {
+        out.topKeep = lexdb_ht.selectTopIntGroups(&out.an[topAggIdx], out.ngroups, topN, topDesc, topOneOrd)
+    }
+    return out
+}
+
+// Moves a disjoint ParAggState into ag in O(1) and emits its groups via ag.groupAt + give.
+fn emitParPartition(ag: mut &AggSt, part: mut &ParAggState, top: &TopAgg, hb: &HavBound,
+                    rowLen: int, give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[Unit, DbErr] {
+    if part.ngroups == 0 { return Ok(Unit{}) }
+    let ns = len(ag.specs)
+    ag.ngroups = part.ngroups
+    ag.fv = replace(mut &part.fv, [])
+    ag.an = replace(mut &part.an, [])
+    ag.asum = replace(mut &part.asum, [])
+    ag.amm = replace(mut &part.amm, [])
+    ag.aval = replace(mut &part.aval, [])
+    ag.adec = replace(mut &part.adec, [])
+    ag.afs = replace(mut &part.afs, [])
+    ag.afq = replace(mut &part.afq, [])
+    ag.asets = replace(mut &part.asets, [])
+    ag.intHt = replace(mut &part.intHt, lexdb_ht.newTwoLevelInt(false))
+    ag.twoHt = replace(mut &part.twoHt, lexdb_ht.newTwoLevelTwoInt())
+    ag.textHt = replace(mut &part.textHt, lexdb_ht.newTwoLevelArena(false))
+    ag.keyHt = replace(mut &part.keyHt, lexdb_ht.newTwoLevelArena(false))
+    ag.nullGroup = part.nullGroup
+    var first: []Val = array(rowLen, Val.Null)
+    var accs = lexdb_agg.newAccs(ns)
+    if len(part.topKeep) > 0 {
+        for g in part.topKeep {
+            try ag.groupAt(g, mut &first, mut &accs)
+            try give(mut &first, -1, mut &accs)
+            if len(first) != rowLen { first = array(rowLen, Val.Null) }
+            if len(accs) != ns { accs = lexdb_agg.newAccs(ns) }
+        }
+    } else {
+        for g in 0..ag.ngroups {
+            if !havPass(ag, g, top, hb) { continue }
+            try ag.groupAt(g, mut &first, mut &accs)
+            try give(mut &first, -1, mut &accs)
+            if len(first) != rowLen { first = array(rowLen, Val.Null) }
+            if len(accs) != ns { accs = lexdb_agg.newAccs(ns) }
+        }
+    }
+    ag.ngroups = 0
+    return Ok(Unit{})
+}
+
+fn aggRowLenOf(ag: &AggSt): int {
+    var rowLen = 0
+    for c in ag.fcols { if c + 1 > rowLen { rowLen = c + 1 } }
+    if ag.elideText && ag.textCol + 1 > rowLen { rowLen = ag.textCol + 1 }
+    if ag.keyCol0 >= 0 && ag.keyCol0 + 1 > rowLen { rowLen = ag.keyCol0 + 1 }
+    if ag.keyCol1 >= 0 && ag.keyCol1 + 1 > rowLen { rowLen = ag.keyCol1 + 1 }
+    if ag.elideComp { for c in ag.compCols { if c + 1 > rowLen { rowLen = c + 1 } } }
+    return rowLen
+}
+
+// Parallel disjoint merge + direct emission for ungrouped COUNT(DISTINCT) over large sets (ClickBench q4).
+fn parCountDistPart(results: &[]ParAggState, partIdx: int, nParts: int, si: int): int {
+    let mask = u64(nParts - 1)
+    var s: Map[int, int] = newMap()
+    for ri in 0..len(results) {
+        if results[ri].ngroups == 0 { continue }
+        for k in results[ri].asets[si][0].keys() {
+            if int(k.hash() & mask) == partIdx { s.put(k, 1) }
+        }
+    }
+    return s.size()
+}
+
+// Returns: 1 = completed in parallel (caller runs finishTop); 4 = completed & already emitted via give;
+//          3 = hybrid tail; 0 = fallback to serial; 2 = bail to aggRows.
 fn parAggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_access.Rel,
-                 sc: &lexdb_access.Scan, cur: mut &lexdb_access.Cursor, bp: &BPlan, lz: &Lazy,
+                 sc: &lexdb_access.Scan, scPart: bool, cur: mut &lexdb_access.Cursor, bp: &BPlan, lz: &Lazy,
                  bconds: &[]BNode, ag: mut &AggSt, totRows: mut &int, top: &TopAgg, streamOn: bool,
                  streamHb: &HavBound, streamRowLen: int,
                  give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr],
@@ -18043,53 +19041,291 @@ fn parAggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_
     var needPl: []bool = []
     var maxPl = -1
     buildNeedPlaces(bp, lz, mut &needPl, mut &maxPl)
+    let fastUrl = isFastUrlAgg(ag)
     let meta = ParAggMeta{
         ns: len(ag.specs), nkeys: len(ag.keys), oneKey: ag.oneKey, twoInt: ag.twoInt, sorted: ag.sorted,
-        textCol: ag.textCol, twoText: ag.twoText, twoTextC0: ag.twoTextC0, twoTextC1: ag.twoTextC1,
+        textCol: ag.textCol, fastUrlCol: if fastUrl { ag.reCol } else { -1 },
+        twoText: ag.twoText, twoTextC0: ag.twoTextC0, twoTextC1: ag.twoTextC1,
         key0Typ: if len(ag.keys) > 0 { ag.keys[0].typ } else { 0 },
         key1Typ: if len(ag.keys) > 1 { ag.keys[1].typ } else { 0 },
         room: ag.room, maxHeld: ag.maxHeld, streamOn: streamOn,
         havOn: top.havOn, havAgg: top.havAgg, havOp: top.havOp
     }
     let workers = max(1, par.threads())
-    // Ungrouped and sorted streaming have O(1) merge cost -> fine chunks for load balancing.
-    // Hash GROUP BY merges partial tables -> use W chunks (only W-1 merges, minimal RAM!).
-    let wantParts = if meta.nkeys == 0 || meta.sorted { workers * 4 } else { workers }
+    var hasCntD = false
+    for sp in ag.specs { if sp.kind == BA_CNTD { hasCntD = true; break } }
+    // Ungrouped (without COUNT DISTINCT) and sorted streaming have O(1) merge cost -> fine chunks for load balancing.
+    // Hash GROUP BY and COUNT(DISTINCT) merge hash tables -> use W chunks (only W partial tables!).
+    let wantParts = if (meta.nkeys == 0 && !hasCntD) || meta.sorted { workers * 4 } else { workers }
     var didPar = false
+    var didPriorMerge = false
     while !cur.done {
         let saved = cur.copy()
-        let chunk = try lexdb_access.collectParLeaves(st, txn, rel, sc, cur, bp, lz, PAR_AGG_MEGA)
+        let allowDefer = !meta.sorted
+        let chunk = try lexdb_access.collectParLeaves(st, txn, rel, sc, cur, bp, lz, &needPl, maxPl, PAR_AGG_MEGA, allowDefer)
+        if chunk.bail { return Ok(2) }
         if chunk.fallback { return Ok(if didPar { 3 } else { 0 }) }
         let nl = len(chunk.leaves)
-        if nl == 0 { continue }
+        let nFb = len(chunk.fleafBatches)
+        let nApart = len(chunk.apartKeys)
+        if nl == 0 && nFb == 0 && nApart == 0 { continue }
         if !didPar {
-            var estRows = 0
+            var estRows = nApart
             for lv in chunk.leaves { estRows += lv.to - lv.from }
-            if (chunk.done && (nl < PAR_MIN_LEAVES || estRows < PAR_MIN_ROWS)) || estRows < nl * PAR_MIN_DENSITY {
+            for fb in chunk.fleafBatches { estRows += fb.n }
+            if chunk.done && (nl < PAR_MIN_LEAVES || estRows < PAR_MIN_ROWS) {
                 cur = saved
                 return Ok(0)
             }
         }
         didPar = true
-        let leaves = chunk.leaves
-        let nParts = min(max(1, nl / 8), wantParts)
-        let spans = makeParSpans(nl, nParts)
-        let keysRef = &ag.keys
+        let slabRef = &chunk.slab
+        let leaves = &chunk.leaves
+        let fbRef = &chunk.fleafBatches
+        let rw = lexdb_access.rowsFor(rel)
+        let noKeys: []BComp = []
+        let keysRef = if fastUrl { &noKeys } else { &ag.keys }
         let specsRef = &ag.specs
         let shareRef = &ag.shareOf
         let kindsRef = &ag.kinds
         let fcolsRef = &ag.fcols
-        let results = par.map(&spans, fn(sp: &ParSpan): ParAggState {
-            return parAggWorker(&leaves, sp.lo, sp.hi, bp, lz, bconds, &meta, keysRef, specsRef,
-                                shareRef, kindsRef, fcolsRef, streamHb, &needPl, maxPl)
-        })
+        var results: []ParAggState = []
+        if nl > 0 || nFb > 0 {
+            let nParts = min(max(1, max(nl / 8, nFb)), wantParts)
+            let spans = makeParSpans(nl, nParts)
+            let fspans = if nFb > 0 { makeParSpans(nFb, len(spans)) } else { [] }
+            var idxList: []int = withCapacity(len(spans))
+            for pi in 0..len(spans) { append(mut &idxList, pi) }
+            results = par.map(&idxList, fn(pi: &int): ParAggState {
+                let sp = spans[pi]
+                let flo = if pi < len(fspans) { fspans[pi].lo } else { 0 }
+                let fhi = if pi < len(fspans) { fspans[pi].hi } else { 0 }
+                return parAggWorker(slabRef, leaves, sp.lo, sp.hi, fbRef, flo, fhi, bp, lz, &rw, bconds, &meta, keysRef, specsRef,
+                                    shareRef, kindsRef, fcolsRef, streamHb, &needPl, maxPl, allowDefer)
+            })
+        }
         var chunkRead = 0
+        var totalGroups = 0
         for ri in 0..len(results) {
             if results[ri].err.isSome() { return Err(results[ri].err.clone().unwrap()) }
             if results[ri].bail { return Ok(2) }
             chunkRead += results[ri].nRead
+            totalGroups += results[ri].ngroups
+        }
+        // Finish any BIG-stub / non-lazy rows directly in memory without B+tree re-scans (zero I/O in workers).
+        if nApart > 0 {
+            var apartSt = newParAggState(meta.ns)
+            var b2 = lexdb_rows.newBatch(bp, lexdb_rows.BROWS)
+            let useLazy = lz.on && len(lz.br.usedP) > 0
+            var pos = 0
+            while pos < nApart {
+                let take = min(nApart - pos, lexdb_rows.BROWS)
+                b2.n = take
+                var needFull: []int = []
+                var ch: []int = withCapacity(take)
+                for q in 0..take {
+                    let ak = &chunk.apartKeys[pos + q]
+                    let av = &chunk.apartVals[pos + q]
+                    if useLazy {
+                        let code = try lexdb_rows.decodeRow(av, q, mut &b2, &lz.bf, &rw)
+                        if code == 1 { return Ok(2) }
+                        if code == 2 {
+                            if !(try lexdb_access.bRowOf(st, txn, rel, ak, av, q, mut &b2, bp)) { return Ok(2) }
+                            append(mut &ch, q)
+                        } else {
+                            append(mut &ch, q)
+                            append(mut &needFull, q)
+                        }
+                    } else {
+                        let code = try lexdb_rows.decodeRow(av, q, mut &b2, bp, &rw)
+                        if code == 1 { return Ok(2) }
+                        if code == 2 && !(try lexdb_access.bRowOf(st, txn, rel, ak, av, q, mut &b2, bp)) { return Ok(2) }
+                        append(mut &ch, q)
+                    }
+                }
+                for ci in 0..len(bconds) {
+                    if len(ch) == 0 { break }
+                    let keep = try bTrue(&bconds[ci], &b2, &ch)
+                    var nx: []int = withCapacity(len(keep))
+                    for j in keep { append(mut &nx, ch[j]) }
+                    ch = nx
+                }
+                if useLazy && len(ch) > 0 && len(needFull) > 0 {
+                    var nfAt = 0
+                    for r in ch {
+                        while nfAt < len(needFull) && needFull[nfAt] < r { nfAt += 1 }
+                        if nfAt < len(needFull) && needFull[nfAt] == r {
+                            let ak = &chunk.apartKeys[pos + r]
+                            let av = &chunk.apartVals[pos + r]
+                            let code = try lexdb_rows.decodeRow(av, r, mut &b2, &lz.br, &rw)
+                            if code == 1 { return Ok(2) }
+                            if code == 2 && !(try lexdb_access.bRowOf(st, txn, rel, ak, av, r, mut &b2, bp)) { return Ok(2) }
+                        }
+                    }
+                }
+                apartSt.nRead += take
+                apartSt.nBatches += 1
+                chunkRead += take
+                if len(ch) > 0 {
+                    apartSt.nJoined += len(ch)
+                    if !(try parAggEat(mut &apartSt, &meta, keysRef, specsRef, shareRef, kindsRef, fcolsRef, streamHb, &b2, &ch)) {
+                        return Ok(2)
+                    }
+                }
+                resetBatchInPlace(mut &b2, bp)
+                pos += take
+            }
+            totalGroups += apartSt.ngroups
+            append(mut &results, apartSt)
         }
         try bud.tickN(chunkRead)
+        if chunkRead > 0 { nBatches += (chunkRead + lexdb_rows.BROWS - 1) / lexdb_rows.BROWS }
+        // Fast path A: single-wave high-cardinality GROUP BY -> parallel disjoint partitioned merge + direct emission!
+        var mp = 1
+        while mp * 2 <= workers { mp = mp * 2 }
+        if cur.done && !didPriorMerge && mp >= 2 && len(results) > 1 && !meta.sorted && meta.nkeys > 0 && totalGroups > 4096 {
+            for ri in 0..len(results) {
+                nRead += results[ri].nRead
+                nJoined += results[ri].nJoined
+                totRows += results[ri].nJoined
+                if results[ri].kernRuns > 0 { lexdb_leafk.noteRun() }
+            }
+            var partIds: []int = withCapacity(mp)
+            for p in 0..mp { append(mut &partIds, p) }
+            let nf = len(ag.fcols)
+            let topOn = !streamHb.ok && top.on && top.aggIdx >= 0 && top.aggIdx < len(ag.specs) &&
+                        (ag.specs[top.aggIdx].kind == BA_STAR || ag.specs[top.aggIdx].kind == BA_COUNT)
+            let topAggIdx = top.aggIdx
+            let topN = top.topN
+            let topDesc = top.desc
+            let topOneOrd = top.oneOrd
+            let estPerPart = totalGroups / mp
+            var parts = par.map(&partIds, fn(pid: &int): ParAggState {
+                return parMergePart(&results, pid, mp, &meta, specsRef, shareRef, nf, estPerPart, topOn, topAggIdx, topN, topDesc, topOneOrd)
+            })
+            var totalAdded = 0
+            var totalDistinct = 0
+            for p in 0..len(parts) {
+                if parts[p].err.isSome() { return Err(parts[p].err.clone().unwrap()) }
+                totalAdded += parts[p].added
+                totalDistinct += parts[p].ngroups
+            }
+            if totalAdded > peakAdded { peakAdded = totalAdded }
+            if ag.room >= 0 && totalAdded > ag.room { return Err(memErr(ag.maxHeld)) }
+            let emitRowLen = aggRowLenOf(ag)
+            for p in 0..len(parts) {
+                try emitParPartition(ag, mut &parts[p], top, streamHb, emitRowLen, give)
+            }
+            streamed += totalDistinct
+            return Ok(4)
+        }
+        // Fast path B: single-wave ungrouped COUNT(DISTINCT) -> parallel 4-way radix set count!
+        if cur.done && !didPriorMerge && mp >= 2 && len(results) > 1 && meta.nkeys == 0 && hasCntD {
+            var bigSet = false
+            for si in 0..len(ag.specs) {
+                if ag.specs[si].kind == BA_CNTD {
+                    var totS = 0
+                    for ri in 0..len(results) {
+                        if results[ri].ngroups > 0 { totS += results[ri].asets[si][0].size() }
+                    }
+                    if totS > 4096 { bigSet = true; break }
+                }
+            }
+            if bigSet {
+                var anyRow = false
+                for ri in 0..len(results) {
+                    nRead += results[ri].nRead
+                    nJoined += results[ri].nJoined
+                    totRows += results[ri].nJoined
+                    if results[ri].ngroups > 0 { anyRow = true }
+                    if results[ri].kernRuns > 0 { lexdb_leafk.noteRun() }
+                }
+                if !anyRow { return Ok(4) }
+                var partIds: []int = withCapacity(mp)
+                for p in 0..mp { append(mut &partIds, p) }
+                var distCounts: []int = array(len(ag.specs), 0)
+                for si in 0..len(ag.specs) {
+                    if ag.specs[si].kind != BA_CNTD { continue }
+                    let sIdx = si
+                    let cs = par.map(&partIds, fn(pid: &int): int {
+                        return parCountDistPart(&results, pid, mp, sIdx)
+                    })
+                    var tot = 0
+                    for c in cs { tot += c }
+                    distCounts[si] = tot
+                }
+                // Merge non-BA_CNTD specs in O(W) and emit the single ungrouped row!
+                let emitRowLen = aggRowLenOf(ag)
+                var first: []Val = array(emitRowLen, Val.Null)
+                let nf = len(ag.fcols)
+                var gotFirst = false
+                ag.ngroups = 1
+                ag.newGroup(0)
+                var mutRes = results
+                for ri in 0..len(mutRes) {
+                    if mutRes[ri].ngroups == 0 { continue }
+                    if !gotFirst {
+                        for fi in 0..nf { first[ag.fcols[fi]] = replace(mut &mutRes[ri].fv[fi], Val.Null) }
+                        gotFirst = true
+                    }
+                    for si in 0..len(ag.specs) {
+                        if ag.specs[si].kind == BA_CNTD || ag.shareOf[si] >= 0 { continue }
+                        let sn = mutRes[ri].an[si][0]
+                        if sn == 0 { continue }
+                        let dn = ag.an[si][0]
+                        let kd = ag.specs[si].kind
+                        if kd == BA_STAR || kd == BA_COUNT { ag.an[si][0] = dn + sn }
+                        else if kd == BA_VAR {
+                            if dn == 0 { ag.afs[si][0] = mutRes[ri].afs[si][0]; ag.afq[si][0] = mutRes[ri].afq[si][0] }
+                            else {
+                                ag.afs[si][0] = try fAdd(ag.afs[si][0], mutRes[ri].afs[si][0])
+                                ag.afq[si][0] = try fAdd(ag.afq[si][0], mutRes[ri].afq[si][0])
+                            }
+                            ag.an[si][0] = dn + sn
+                        } else if kd == BA_AND {
+                            if dn == 0 || mutRes[ri].amm[si][0] < ag.amm[si][0] { ag.amm[si][0] = mutRes[ri].amm[si][0] }
+                            ag.an[si][0] = dn + sn
+                        } else if kd == BA_OR {
+                            if dn == 0 || mutRes[ri].amm[si][0] > ag.amm[si][0] { ag.amm[si][0] = mutRes[ri].amm[si][0] }
+                            ag.an[si][0] = dn + sn
+                        } else if ag.specs[si].vcol >= 0 {
+                            if dn == 0 || lexdb_ops.isNull(&ag.aval[si][0]) {
+                                ag.aval[si][0] = replace(mut &mutRes[ri].aval[si][0], Val.Null)
+                            } else if kd == BA_SUM || kd == BA_AVG {
+                                ag.aval[si][0] = try lexdb_agg.sumAdd(&ag.aval[si][0], &mutRes[ri].aval[si][0])
+                            } else {
+                                let mx = kd == BA_MAX
+                                let x = try lexdb_ops.compare(&mutRes[ri].aval[si][0], &ag.aval[si][0])
+                                if lexdb_agg.takes(x, if mx { 1 } else { -1 }, &mutRes[ri].aval[si][0]) {
+                                    ag.aval[si][0] = replace(mut &mutRes[ri].aval[si][0], Val.Null)
+                                }
+                            }
+                            ag.an[si][0] = dn + sn
+                        } else if kd == BA_SUM || kd == BA_AVG {
+                            ag.adec[si][0] += mutRes[ri].adec[si][0]
+                            ag.an[si][0] = dn + sn
+                        } else if kd == BA_MIN || kd == BA_MAX {
+                            let mx = kd == BA_MAX
+                            if dn == 0 || (if mx { mutRes[ri].amm[si][0] > ag.amm[si][0] } else { mutRes[ri].amm[si][0] < ag.amm[si][0] }) {
+                                ag.amm[si][0] = mutRes[ri].amm[si][0]
+                            }
+                            ag.an[si][0] = dn + sn
+                        }
+                    }
+                }
+                var accs = lexdb_agg.newAccs(len(ag.specs))
+                // Populate non-BA_CNTD accs via groupAt, then fill in exact BA_CNTD counts!
+                for fi in 0..nf { append(mut &ag.fv, first[ag.fcols[fi]].clone()) }
+                try ag.groupAt(0, mut &first, mut &accs)
+                for si in 0..len(ag.specs) {
+                    if ag.specs[si].kind == BA_CNTD { accs[si].n = distCounts[si] }
+                }
+                ag.ngroups = 0
+                try give(mut &first, -1, mut &accs)
+                streamed += 1
+                return Ok(4)
+            }
+        }
         var mutRes = results
         for ri in 0..len(mutRes) {
             nRead += mutRes[ri].nRead
@@ -18098,7 +19334,952 @@ fn parAggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_
             if mutRes[ri].kernRuns > 0 { lexdb_leafk.noteRun() }
             try mergeParAgg(ag, mut &mutRes[ri], top, streamOn, streamHb, streamRowLen, give, streamFirst, streamAccs, streamed, peakAdded)
         }
-        if chunkRead > 0 { nBatches += (chunkRead + lexdb_rows.BROWS - 1) / lexdb_rows.BROWS }
+        didPriorMerge = true
     }
     return Ok(1)
+}
+
+// ============================================================================
+// Engine C: End-to-End Parallel Hash-Join Probe + Post-Join Aggregation
+// (scan -> leaf filters -> multi-way immutable hash probe -> gather -> agg)
+// ============================================================================
+
+fn canPlanParJoin(p: &lexdb_plan.PPlan): bool {
+    match p {
+        lexdb_plan.PPlan.Join(i, j) {
+            if j.how != lexdb_plan.JH_HASH && j.how != lexdb_plan.JH_JOIN && j.how != lexdb_plan.JH_ROWS { return false }
+            if j.kind == lexdb_sql.J_FULL || len(j.keys) == 0 { return false }
+            return canPlanParJoin(&i)
+        }
+        lexdb_plan.PPlan.Filter(i, _) { return canPlanParJoin(&i) }
+        lexdb_plan.PPlan.Scan(_, _) { return true }
+        else { return false }
+    }
+}
+
+fn canParJoinAgg(jr: &JRun, src: &Src, cn: &[]BNode, ag: &AggSt): bool {
+    if jr.apAt >= 0 || jr.grow || jr.one || jr.weighted || len(jr.jls) < 2 { return false }
+    if src.held || src.index >= 0 || src.rd.ix >= 0 || src.desc || src.rd.small { return false }
+    if len(src.scans) != 1 || src.scans[0].empty || src.scans[0].point { return false }
+    if !allCanPar(cn) || !canParAgg(&[], ag) { return false }
+    for j in 1..len(jr.jls) {
+        let jl = &jr.jls[j]
+        if !hashed(jl) || jl.cross || jl.na != 0 || jl.folded { return false }
+        if !(jl.mode == JK_INT || jl.mode == JK_INT2 || jl.mode == JK_INT2_64 || jl.mode == JK_TEXT) { return false }
+        if !allCanPar(&jl.key) || !allCanPar(&jl.conds) || !allCanPar(&jl.post) { return false }
+        if jl.resCol >= 0 && !canParBNode(&jl.res) { return false }
+    }
+    return true
+}
+
+fn gatherAtPure(jr: &JRun, b0: &Batch, at: &[][]int, n: int, reads: &[]int): Batch {
+    var w = bJoined(jr.nq, n)
+    for c in reads {
+        let o = jr.owner[c]
+        if o < 0 || o >= len(at) { continue }
+        let jl = &jr.jls[o]
+        let src = if o == 0 { b0 } else { &jl.rows }
+        if c - jl.first >= len(src.cols) {
+            var col = lexdb_rows.bvec(n)
+            for p in 0..n { col.nul[p] = true }
+            w.cols[c] = col
+            if jr.kinds[c] == BK_VAL { w.vals[c] = array(n, Val.Null) }
+            continue
+        }
+        bGather(src, c - jl.first, jr.kinds[c], &at[o], mut &w, c)
+    }
+    return w
+}
+
+fn pickPure(conds: &[]BNode, b: &Batch, idx0: []int): Result[[]int, DbErr] {
+    var idx = idx0
+    for c in conds {
+        if len(idx) == 0 { break }
+        let pos = try bTruePure(&c, b, &idx)
+        var nx: []int = withCapacity(len(pos))
+        for j in pos { append(mut &nx, idx[j]) }
+        idx = nx
+    }
+    return Ok(idx)
+}
+
+fn keyVecsPure(jl: &JL, w: &Batch): Result[[]BVec, DbErr] {
+    var all: []int = withCapacity(w.n)
+    for r in 0..w.n { append(mut &all, r) }
+    var out: []BVec = []
+    for i in 0..len(jl.key) {
+        if jl.keyTyp[i] == BT_OTHER {
+            append(mut &out, lexdb_rows.bvec(0))
+        } else {
+            append(mut &out, try bEvalPure(&jl.key[i], w, &all))
+        }
+    }
+    return Ok(out)
+}
+
+fn parJoinTail(jr: &JRun, b0: &Batch, j: int, at: &[][]int, n: int, pj: &[]int, pi: []int,
+               jcnt: mut &[]ParJoinCounts, seen: mut &[][]bool): Result[[][]int, DbErr] {
+    let jl = &jr.jls[j]
+    let nc = len(pj)
+    if len(jl.conds) == 0 && len(jl.post) == 0 && jl.mark == lexdb_plan.MK_JOIN && !jl.left && !jl.right {
+        jcnt[j].read += nc
+        jcnt[j].joined += nc
+        var ident = nc == n
+        if ident {
+            for r in 0..nc {
+                if pj[r] != r { ident = false; break }
+            }
+        }
+        var outAt = if ident { at.clone() } else { compose(at, pj) }
+        append(mut &outAt, pi)
+        return Ok(outAt)
+    }
+    var cat = compose(at, pj)
+    append(mut &cat, pi)
+    var keep: []int = withCapacity(nc)
+    for x in 0..nc { append(mut &keep, x) }
+    if len(jl.conds) > 0 {
+        let w = gatherAtPure(jr, b0, &cat, nc, &jl.creads)
+        keep = try pickPure(&jl.conds, &w, keep)
+    }
+    if jl.mark == lexdb_plan.MK_JOIN {
+        jcnt[j].read += nc
+    } else if jl.mark == lexdb_plan.MK_ANTI && jl.antiNull {
+        jcnt[j].read += nc
+        jcnt[j].joined += nc
+    } else {
+        var ki = 0
+        var doneRow = -1
+        for x in 0..nc {
+            if pj[x] == doneRow { continue }
+            jcnt[j].read += 1
+            while ki < len(keep) && keep[ki] < x { ki += 1 }
+            if ki < len(keep) && keep[ki] == x { doneRow = pj[x] }
+        }
+    }
+    if jl.right { for x in keep { if cat[j][x] >= 0 { seen[j][cat[j][x]] = true } } }
+    var outAt: [][]int = []
+    if jl.mark == lexdb_plan.MK_ANTI {
+        var have: []bool = array(n, false)
+        for x in keep {
+            if !jl.antiNull && !have[pj[x]] { jcnt[j].joined += 1 }
+            have[pj[x]] = true
+        }
+        var aj: []int = []
+        for r in 0..n { if !have[r] { append(mut &aj, r) } }
+        if jl.antiNull { jcnt[j].nulls += len(aj) }
+        outAt = compose(at, &aj)
+        append(mut &outAt, array(len(aj), -1))
+    } else if jl.mark == lexdb_plan.MK_SEMI {
+        var fst: []int = []
+        var prev = -1
+        for x in keep {
+            if pj[x] != prev {
+                append(mut &fst, x)
+                prev = pj[x]
+            }
+        }
+        jcnt[j].joined += len(fst)
+        outAt = compose(&cat, &fst)
+    } else if jl.left {
+        jcnt[j].joined += len(keep)
+        var outJ: []int = withCapacity(n)
+        var outI: []int = withCapacity(n)
+        var k = 0
+        for r in 0..n {
+            var any = false
+            while k < len(keep) && pj[keep[k]] == r {
+                append(mut &outJ, r)
+                append(mut &outI, cat[j][keep[k]])
+                any = true
+                k += 1
+            }
+            if !any {
+                append(mut &outJ, r)
+                append(mut &outI, -1)
+                jcnt[j].nulls += 1
+            }
+        }
+        outAt = compose(at, &outJ)
+        append(mut &outAt, outI)
+    } else if len(keep) == nc {
+        jcnt[j].joined += len(keep)
+        outAt = cat
+    } else {
+        jcnt[j].joined += len(keep)
+        outAt = compose(&cat, &keep)
+    }
+    if len(jl.post) > 0 {
+        let m = len(outAt[0])
+        let w = gatherAtPure(jr, b0, &outAt, m, &jl.preads)
+        var all: []int = withCapacity(m)
+        for x in 0..m { append(mut &all, x) }
+        let k2 = try pickPure(&jl.post, &w, all)
+        if len(k2) < m { outAt = compose(&outAt, &k2) }
+    }
+    return Ok(outAt)
+}
+
+fn parJoinFrom(jr: &JRun, b0: &Batch, j: int, at: &[][]int, n: int,
+               meta: &ParAggMeta, keys: &[]BComp, specs: &[]BSpec, shareOf: &[]int,
+               kinds: &[]int, fcols: &[]int, st: mut &ParAggState): Result[bool, DbErr] {
+    if n == 0 { return Ok(true) }
+    if j == len(jr.jls) {
+        let f = gatherAtPure(jr, b0, at, n, &jr.wantList)
+        var all: []int = withCapacity(n)
+        for r in 0..n { append(mut &all, r) }
+        st.nJoined += n
+        return parAggEat(st, meta, keys, specs, shareOf, kinds, fcols, &noHavBound(), &f, &all)
+    }
+    let jl = &jr.jls[j]
+    var pj: []int = withCapacity(n)
+    var pi: []int = withCapacity(n)
+    if jl.resCol < 0 && jl.mode == JK_INT && jl.kCol0 >= 0 {
+        let first = (jl.mark == lexdb_plan.MK_SEMI || (jl.mark == lexdb_plan.MK_ANTI && !jl.antiNull)) && len(jl.conds) == 0
+        let o0 = jr.owner[jl.kCol0]
+        let sJl = &jr.jls[o0]
+        let src = if o0 == 0 { b0 } else { &sJl.rows }
+        let cOff = jl.kCol0 - sJl.first
+        if o0 >= 0 && o0 < len(at) && cOff >= 0 && cOff < len(src.cols) {
+            let kc = &src.cols[cOff]
+            let at0 = &at[o0]
+            let useDense = len(jl.dense) > 0
+            let dMin = jl.denseMin
+            let dLen = len(jl.dense)
+            if jl.countOnly {
+                if useDense {
+                    for r in 0..n {
+                        let sr = at0[r]
+                        if sr < 0 || kc.nul[sr] { continue }
+                        let d = kc.v[sr] - dMin
+                        if d >= 0 && d < dLen {
+                            let m = jl.dense[d]
+                            if m > 0 {
+                                let rep = if first { 1 } else { m }
+                                for _ in 0..rep { append(mut &pj, r); append(mut &pi, -1) }
+                            }
+                        }
+                    }
+                } else {
+                    for r in 0..n {
+                        let sr = at0[r]
+                        if sr < 0 || kc.nul[sr] { continue }
+                        let m = jl.fastCnt.get(kc.v[sr])
+                        if m > 0 {
+                            let rep = if first { 1 } else { m }
+                            for _ in 0..rep { append(mut &pj, r); append(mut &pi, -1) }
+                        }
+                    }
+                }
+            } else if jl.neqOut >= 0 {
+                let on = jr.owner[jl.neqOut]
+                let nJl = &jr.jls[on]
+                let nSrc = if on == 0 { b0 } else { &nJl.rows }
+                let ncOff = jl.neqOut - nJl.first
+                let nkc = &nSrc.cols[ncOff]
+                let nat = &at[on]
+                let inCol = &jl.rows.cols[jl.neqIn]
+                for r in 0..n {
+                    let sr = at0[r]
+                    let nsr = nat[r]
+                    if sr < 0 || nsr < 0 || kc.nul[sr] || nkc.nul[nsr] { continue }
+                    var bk = -1
+                    if useDense {
+                        let d = kc.v[sr] - dMin
+                        if d >= 0 && d < dLen { bk = jl.dense[d] }
+                    } else {
+                        bk = jl.ints.get(kc.v[sr])
+                    }
+                    if bk >= 0 {
+                        let ov = nkc.v[nsr]
+                        var x = jl.head[bk]
+                        while x >= 0 {
+                            if !inCol.nul[x] && inCol.v[x] != ov {
+                                append(mut &pj, r)
+                                append(mut &pi, x)
+                            }
+                            x = jl.next[x]
+                        }
+                    }
+                }
+            } else {
+                let cutTo = jl.cutTo
+                for r in 0..n {
+                    let sr = at0[r]
+                    if sr < 0 || kc.nul[sr] { continue }
+                    var bk = -1
+                    if useDense {
+                        let d = kc.v[sr] - dMin
+                        if d >= 0 && d < dLen { bk = jl.dense[d] }
+                    } else {
+                        bk = jl.ints.get(kc.v[sr])
+                    }
+                    if bk >= 0 {
+                        if cutTo >= 0 {
+                            let m = jl.cutB[bk]
+                            st.jcnt[j].read += m
+                            st.jcnt[j].joined += m
+                            st.jcnt[cutTo].starts += m
+                        }
+                        var x = jl.head[bk]
+                        while x >= 0 {
+                            append(mut &pj, r)
+                            append(mut &pi, x)
+                            x = if first { -1 } else { jl.next[x] }
+                        }
+                    }
+                }
+            }
+        }
+        st.jcnt[j].starts += n
+    } else if jl.resCol < 0 && (jl.mode == JK_INT2 || jl.mode == JK_INT2_64) && jl.kCol0 >= 0 && jl.kCol1 >= 0 {
+        let first = (jl.mark == lexdb_plan.MK_SEMI || (jl.mark == lexdb_plan.MK_ANTI && !jl.antiNull)) && len(jl.conds) == 0
+        let o0 = jr.owner[jl.kCol0]
+        let sJl0 = &jr.jls[o0]
+        let src0 = if o0 == 0 { b0 } else { &sJl0.rows }
+        let o1 = jr.owner[jl.kCol1]
+        let sJl1 = &jr.jls[o1]
+        let src1 = if o1 == 0 { b0 } else { &sJl1.rows }
+        let cOff0 = jl.kCol0 - sJl0.first
+        let cOff1 = jl.kCol1 - sJl1.first
+        if o0 >= 0 && o0 < len(at) && o1 >= 0 && o1 < len(at) && cOff0 >= 0 && cOff0 < len(src0.cols) && cOff1 >= 0 && cOff1 < len(src1.cols) {
+            let kc0 = &src0.cols[cOff0]
+            let at0 = &at[o0]
+            let kc1 = &src1.cols[cOff1]
+            let at1 = &at[o1]
+            if jl.mode == JK_INT2_64 {
+                if jl.countOnly {
+                    for r in 0..n {
+                        let sr0 = at0[r]; let sr1 = at1[r]
+                        if sr0 < 0 || sr1 < 0 || kc0.nul[sr0] || kc1.nul[sr1] { continue }
+                        let m = jl.fastCnt2.get(kc0.v[sr0], kc1.v[sr1])
+                        if m > 0 {
+                            let rep = if first { 1 } else { m }
+                            for _ in 0..rep { append(mut &pj, r); append(mut &pi, -1) }
+                        }
+                    }
+                } else {
+                    for r in 0..n {
+                        let sr0 = at0[r]; let sr1 = at1[r]
+                        if sr0 < 0 || sr1 < 0 || kc0.nul[sr0] || kc1.nul[sr1] { continue }
+                        let bk = jl.ints2.get(kc0.v[sr0], kc1.v[sr1])
+                        if bk >= 0 {
+                            var x = jl.head[bk]
+                            while x >= 0 {
+                                append(mut &pj, r); append(mut &pi, x)
+                                x = if first { -1 } else { jl.next[x] }
+                            }
+                        }
+                    }
+                }
+            } else if jl.countOnly {
+                for r in 0..n {
+                    let sr0 = at0[r]; let sr1 = at1[r]
+                    if sr0 < 0 || sr1 < 0 || kc0.nul[sr0] || kc1.nul[sr1] { continue }
+                    let v0 = kc0.v[sr0]; let v1 = kc1.v[sr1]
+                    if !inInt32(v0) || !inInt32(v1) { continue }
+                    let m = jl.fastCnt.get(packInt2(v0, v1))
+                    if m > 0 {
+                        let rep = if first { 1 } else { m }
+                        for _ in 0..rep { append(mut &pj, r); append(mut &pi, -1) }
+                    }
+                }
+            } else {
+                for r in 0..n {
+                    let sr0 = at0[r]; let sr1 = at1[r]
+                    if sr0 < 0 || sr1 < 0 || kc0.nul[sr0] || kc1.nul[sr1] { continue }
+                    let v0 = kc0.v[sr0]; let v1 = kc1.v[sr1]
+                    if !inInt32(v0) || !inInt32(v1) { continue }
+                    let bk = jl.ints.get(packInt2(v0, v1))
+                    if bk >= 0 {
+                        var x = jl.head[bk]
+                        while x >= 0 {
+                            append(mut &pj, r); append(mut &pi, x)
+                            x = if first { -1 } else { jl.next[x] }
+                        }
+                    }
+                }
+            }
+        }
+        st.jcnt[j].starts += n
+    } else {
+        let w = gatherAtPure(jr, b0, at, n, &jl.kreads)
+        let kv = try keyVecsPure(jl, &w)
+        var rv = lexdb_rows.bvec(0)
+        if jl.resCol >= 0 {
+            var all: []int = withCapacity(n)
+            for r in 0..n { append(mut &all, r) }
+            rv = try bEvalPure(&jl.res, &w, &all)
+        }
+        let first = (jl.mark == lexdb_plan.MK_SEMI || (jl.mark == lexdb_plan.MK_ANTI && !jl.antiNull)) && len(jl.conds) == 0
+        let wtxt = jl.mode == JK_TEXT && lexdb_rows.isTextCol(&w, jl.keyCol[0])
+        if jl.countOnly {
+            if jl.mode == JK_INT {
+                let useDense = len(jl.dense) > 0
+                let dMin = jl.denseMin
+                let dLen = len(jl.dense)
+                for r in 0..n {
+                    if kv[0].nul[r] { continue }
+                    var m = 0
+                    if useDense {
+                        let d = kv[0].v[r] - dMin
+                        if d >= 0 && d < dLen { m = jl.dense[d] }
+                    } else { m = jl.fastCnt.get(kv[0].v[r]) }
+                    if m > 0 {
+                        let rep = if first { 1 } else { m }
+                        for _ in 0..rep { append(mut &pj, r); append(mut &pi, -1) }
+                    }
+                }
+            } else if jl.mode == JK_INT2_64 {
+                for r in 0..n {
+                    if kv[0].nul[r] || kv[1].nul[r] { continue }
+                    let m = jl.fastCnt2.get(kv[0].v[r], kv[1].v[r])
+                    if m > 0 {
+                        let rep = if first { 1 } else { m }
+                        for _ in 0..rep { append(mut &pj, r); append(mut &pi, -1) }
+                    }
+                }
+            } else {
+                for r in 0..n {
+                    if kv[0].nul[r] || kv[1].nul[r] { continue }
+                    let v0 = kv[0].v[r]; let v1 = kv[1].v[r]
+                    if !inInt32(v0) || !inInt32(v1) { continue }
+                    let m = jl.fastCnt.get(packInt2(v0, v1))
+                    if m > 0 {
+                        let rep = if first { 1 } else { m }
+                        for _ in 0..rep { append(mut &pj, r); append(mut &pi, -1) }
+                    }
+                }
+            }
+            st.jcnt[j].starts += n
+        } else {
+            for r in 0..n {
+                var bk = -1
+                if jl.mode == JK_INT {
+                    if !kv[0].nul[r] {
+                        bk = jl.ints.get(kv[0].v[r])
+                        if bk >= 0 && jl.cutTo >= 0 {
+                            let m = jl.cutB[bk]
+                            st.jcnt[j].read += m
+                            st.jcnt[j].joined += m
+                            st.jcnt[jl.cutTo].starts += m
+                        }
+                    }
+                } else if jl.mode == JK_INT2 {
+                    if !kv[0].nul[r] && !kv[1].nul[r] {
+                        let v0 = kv[0].v[r]; let v1 = kv[1].v[r]
+                        if inInt32(v0) && inInt32(v1) { bk = jl.ints.get(packInt2(v0, v1)) }
+                    }
+                } else if jl.mode == JK_INT2_64 {
+                    if !kv[0].nul[r] && !kv[1].nul[r] { bk = jl.ints2.get(kv[0].v[r], kv[1].v[r]) }
+                } else if jl.mode == JK_TEXT {
+                    let c = jl.keyCol[0]
+                    if !w.cols[c].nul[r] && wtxt {
+                        match jl.txts.get(lexdb_rows.textAt(&w, c, r)) { Some(y) { bk = y } None {} }
+                    } else if !w.cols[c].nul[r] {
+                        match w.vals[c][r] {
+                            Val.Text(x) { match jl.txts.get(&x) { Some(y) { bk = y } None {} } }
+                            else { return Err(batErrPure()) }
+                        }
+                    }
+                }
+                if jl.resCol >= 0 {
+                    if bk >= 0 && !rv.nul[r] {
+                        var hit = jl.mixed[bk]
+                        if !hit {
+                            let sm = &jl.single[bk]
+                            if !lexdb_ops.isNull(sm) {
+                                let ov = if jl.resTyp == BT_BOOL { Val.Bool(rv.v[r] != 0) } else { Val.Int(rv.v[r]) }
+                                if (try lexdb_ops.comparePure(sm, &ov)) != 0 { hit = true }
+                            }
+                        }
+                        if hit { append(mut &pj, r); append(mut &pi, -1) }
+                    }
+                    if !(bk >= 0 && !rv.nul[r] && len(pj) > 0 && pj[len(pj) - 1] == r) { st.jcnt[j].read += 1 }
+                    continue
+                }
+                if bk >= 0 {
+                    var x = jl.head[bk]
+                    while x >= 0 {
+                        append(mut &pj, r); append(mut &pi, x)
+                        x = if first { -1 } else { jl.next[x] }
+                    }
+                }
+            }
+            st.jcnt[j].starts += n
+        }
+    }
+    let outAt = try parJoinTail(jr, b0, j, at, n, &pj, pi, mut &st.jcnt, mut &st.seen)
+    let n2 = len(outAt[0])
+    return parJoinFrom(jr, b0, j + 1, &outAt, n2, meta, keys, specs, shareOf, kinds, fcols, st)
+}
+
+fn parAggJoinWorker(slab: &str, leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int, jr: &JRun,
+                    bp: &BPlan, lz: &Lazy, rw: &lexdb_rows.Rows, conds: &[]BNode, pushCol: int, ph: &PushH, hasCut: bool,
+                    meta: &ParAggMeta, keys: &[]BComp, specs: &[]BSpec, shareOf: &[]int,
+                    kinds: &[]int, fcols: &[]int, needPl: &[]bool, maxPl: int): ParAggState {
+    var st = newParAggState(meta.ns)
+    st.jcnt = array(len(jr.jls), ParJoinCounts{starts: 0, read: 0, joined: 0, nulls: 0})
+    for ji in 0..len(jr.jls) {
+        append(mut &st.seen, if jr.jls[ji].right { array(jr.jls[ji].rows.n, false) } else { [] })
+    }
+    var b = lexdb_rows.newBatch(bp, lexdb_rows.BROWS)
+    var idx: []int = []
+    for li in lo..hi {
+        let pl = &leaves[li]
+        let s = &slab[pl.off..pl.off + pl.slen]
+        if pl.kind == lexdb_access.PL_ANY {
+            if b.n > 0 {
+                st.nBatches += 1
+                if len(idx) > 0 {
+                    var at0: [][]int = []
+                    append(mut &at0, idx)
+                    match parJoinFrom(jr, &b, 1, &at0, len(at0[0]), meta, keys, specs, shareOf, kinds, fcols, mut &st) {
+                        Ok(ok) { if !ok { st.bail = true; return st } }
+                        Err(x) { st.err = Some(x); return st }
+                    }
+                    idx = []
+                }
+                resetBatchInPlace(mut &b, bp)
+            }
+            let nr = pl.to - pl.from
+            if nr > lexdb_rows.BROWS { st.bail = true; return st }
+            let dirOpt = lexdb_rows.parseAnyCols(s, pl.n)
+            if dirOpt.isNone() { st.bail = true; return st }
+            let dir = dirOpt.unwrap()
+            let useLazy = lz.on && len(lz.br.usedP) > 0
+            let bp0 = if useLazy { &lz.bf } else { bp }
+            for q in 0..nr {
+                match lexdb_rows.decodeRow(lexdb_rows.anyRowBytes(s, &dir, pl.from + q), q, mut &b, bp0, rw) {
+                    Ok(code) { if code != 0 { st.bail = true; return st } }
+                    Err(x) { st.err = Some(x); return st }
+                }
+            }
+            var ch: []int = withCapacity(nr)
+            for q in 0..nr { append(mut &ch, q) }
+            for ci in 0..len(conds) {
+                if len(ch) == 0 { break }
+                match bTruePure(&conds[ci], &b, &ch) {
+                    Ok(pos) {
+                        var nx: []int = withCapacity(len(pos))
+                        for j in pos { append(mut &nx, ch[j]) }
+                        ch = nx
+                    }
+                    Err(x) { st.err = Some(x); return st }
+                }
+            }
+            st.jcnt[0].joined += len(ch)
+            if pushCol >= 0 && len(ch) > 0 {
+                var fin: []int = withCapacity(len(ch))
+                let kc = &b.cols[pushCol]
+                let dLen = len(ph.dense)
+                if dLen > 0 {
+                    let dMin = ph.denseMin
+                    if ph.countOnly {
+                        for r in ch {
+                            if kc.nul[r] { st.pushed += 1; continue }
+                            let d = kc.v[r] - dMin
+                            if d >= 0 && d < dLen && ph.dense[d] > 0 { append(mut &fin, r) } else { st.pushed += 1 }
+                        }
+                    } else {
+                        for r in ch {
+                            if kc.nul[r] { st.pushed += 1; continue }
+                            let d = kc.v[r] - dMin
+                            if d >= 0 && d < dLen {
+                                let bk = ph.dense[d]
+                                if bk >= 0 {
+                                    if ph.head[bk] >= 0 { append(mut &fin, r) } else {
+                                        st.pushed += 1
+                                        if hasCut { st.cut += ph.cutB[bk] }
+                                    }
+                                    continue
+                                }
+                            }
+                            st.pushed += 1
+                        }
+                    }
+                } else if ph.countOnly {
+                    for r in ch {
+                        if kc.nul[r] { st.pushed += 1; continue }
+                        if ph.fastCnt.get(kc.v[r]) > 0 { append(mut &fin, r) } else { st.pushed += 1 }
+                    }
+                } else if ph.useFast {
+                    for r in ch {
+                        if kc.nul[r] { st.pushed += 1; continue }
+                        let bk = ph.fastMap.get(kc.v[r])
+                        if bk >= 0 {
+                            if ph.head[bk] >= 0 { append(mut &fin, r) } else {
+                                st.pushed += 1
+                                if hasCut { st.cut += ph.cutB[bk] }
+                            }
+                        } else { st.pushed += 1 }
+                    }
+                } else {
+                    for r in ch {
+                        if kc.nul[r] { st.pushed += 1; continue }
+                        match ph.keys.get(&kc.v[r]) {
+                            Some(bk) {
+                                if ph.head[bk] >= 0 { append(mut &fin, r) } else {
+                                    st.pushed += 1
+                                    if hasCut { st.cut += ph.cutB[bk] }
+                                }
+                            }
+                            None { st.pushed += 1 }
+                        }
+                    }
+                }
+                ch = fin
+            }
+            if useLazy && len(ch) > 0 {
+                for r in ch {
+                    match lexdb_rows.decodeRow(lexdb_rows.anyRowBytes(s, &dir, pl.from + r), r, mut &b, &lz.br, rw) {
+                        Ok(code) { if code != 0 { st.bail = true; return st } }
+                        Err(x) { st.err = Some(x); return st }
+                    }
+                }
+            }
+            b.n = nr
+            st.nRead += nr
+            st.nBatches += 1
+            if len(ch) > 0 {
+                var at0: [][]int = []
+                append(mut &at0, ch)
+                match parJoinFrom(jr, &b, 1, &at0, len(at0[0]), meta, keys, specs, shareOf, kinds, fcols, mut &st) {
+                    Ok(ok) { if !ok { st.bail = true; return st } }
+                    Err(x) { st.err = Some(x); return st }
+                }
+            }
+            resetBatchInPlace(mut &b, bp)
+            continue
+        }
+        let dirOpt = lexdb_rows.parseLeafCols(s, pl.n, needPl, maxPl)
+        if dirOpt.isNone() { st.bail = true; return st }
+        let dir = dirOpt.unwrap()
+        let np = lexdb_rows.colPlaces(&dir)
+        var k = pl.from
+        while k < pl.to {
+            if b.n == lexdb_rows.BROWS {
+                st.nBatches += 1
+                if len(idx) > 0 {
+                    var at0: [][]int = []
+                    append(mut &at0, idx)
+                    match parJoinFrom(jr, &b, 1, &at0, len(at0[0]), meta, keys, specs, shareOf, kinds, fcols, mut &st) {
+                        Ok(ok) { if !ok { st.bail = true; return st } }
+                        Err(x) { st.err = Some(x); return st }
+                    }
+                    idx = []
+                }
+                resetBatchInPlace(mut &b, bp)
+            }
+            let take = min(pl.to - k, lexdb_rows.BROWS - b.n)
+            let r0 = b.n
+            var rs: []int = withCapacity(take)
+            for q in 0..take { append(mut &rs, r0 + q) }
+            var kerned = false
+            if len(lz.kern) == 1 {
+                match lexdb_leafk.rowsOfCols(s, &dir, k, &rs, r0, take, &lz.kern[0]) {
+                    Some(x) { rs = x; kerned = true; st.kernRuns += 1 }
+                    None {}
+                }
+            } else if len(lz.kern) > 1 {
+                var cur = collections.copyOf(&rs)
+                kerned = true
+                for lk in lz.kern {
+                    if len(cur) == 0 { break }
+                    match lexdb_leafk.rowsOfCols(s, &dir, k, &cur, r0, take, &lk) {
+                        Some(x) { cur = x }
+                        None { kerned = false; break }
+                    }
+                }
+                if kerned { rs = cur; st.kernRuns += 1 }
+            }
+            for x in 0..len(lz.raw) {
+                if len(rs) == 0 { break }
+                let rp = lz.rawPl[x]
+                if rp >= np || lexdb_rows.colKindOf(s, rp) != lexdb_rows.PK_TEXT {
+                    st.bail = true
+                    return st
+                }
+                rs = lexdb_rows.likeInLeafCols(s, &dir, k, &rs, r0, rp, &lz.pieces[x], lz.rawNeg[x])
+            }
+            let skArr = if kerned { &lz.skipK } else { &lz.skip }
+            let firstPs = if kerned { &lz.firstK } else { &lz.first }
+            if len(firstPs) > 0 && len(rs) > 0 {
+                let wide0 = kerned && 2 * len(rs) >= take
+                var qs0: []int = withCapacity(if wide0 { take } else { len(rs) })
+                if wide0 { for q in 0..take { append(mut &qs0, q) } } else { for r in rs { append(mut &qs0, r - r0) } }
+                match lexdb_rows.colsIntoPure(s, &dir, k, &qs0, len(qs0) == take, r0, firstPs, mut &b, bp) {
+                    Ok(ok) { if !ok { st.bail = true; return st } }
+                    Err(x) { st.err = Some(x); return st }
+                }
+            }
+            var ch = rs
+            for ci in 0..len(conds) {
+                if len(ch) == 0 { break }
+                if ci < len(skArr) && skArr[ci] { continue }
+                match bTruePure(&conds[ci], &b, &ch) {
+                    Ok(pos) {
+                        var nx: []int = withCapacity(len(pos))
+                        for j in pos { append(mut &nx, ch[j]) }
+                        ch = nx
+                    }
+                    Err(x) { st.err = Some(x); return st }
+                }
+            }
+            st.jcnt[0].joined += len(ch)
+            if pushCol >= 0 && len(ch) > 0 {
+                var fin: []int = withCapacity(len(ch))
+                let kc = &b.cols[pushCol]
+                let dLen = len(ph.dense)
+                if dLen > 0 {
+                    let dMin = ph.denseMin
+                    if ph.countOnly {
+                        for r in ch {
+                            if kc.nul[r] { st.pushed += 1; continue }
+                            let d = kc.v[r] - dMin
+                            if d >= 0 && d < dLen && ph.dense[d] > 0 { append(mut &fin, r) } else { st.pushed += 1 }
+                        }
+                    } else {
+                        for r in ch {
+                            if kc.nul[r] { st.pushed += 1; continue }
+                            let d = kc.v[r] - dMin
+                            if d >= 0 && d < dLen {
+                                let bk = ph.dense[d]
+                                if bk >= 0 {
+                                    if ph.head[bk] >= 0 { append(mut &fin, r) } else {
+                                        st.pushed += 1
+                                        if hasCut { st.cut += ph.cutB[bk] }
+                                    }
+                                    continue
+                                }
+                            }
+                            st.pushed += 1
+                        }
+                    }
+                } else if ph.countOnly {
+                    for r in ch {
+                        if kc.nul[r] { st.pushed += 1; continue }
+                        if ph.fastCnt.get(kc.v[r]) > 0 { append(mut &fin, r) } else { st.pushed += 1 }
+                    }
+                } else if ph.useFast {
+                    for r in ch {
+                        if kc.nul[r] { st.pushed += 1; continue }
+                        let bk = ph.fastMap.get(kc.v[r])
+                        if bk >= 0 {
+                            if ph.head[bk] >= 0 { append(mut &fin, r) } else {
+                                st.pushed += 1
+                                if hasCut { st.cut += ph.cutB[bk] }
+                            }
+                        } else { st.pushed += 1 }
+                    }
+                } else {
+                    for r in ch {
+                        if kc.nul[r] { st.pushed += 1; continue }
+                        match ph.keys.get(&kc.v[r]) {
+                            Some(bk) {
+                                if ph.head[bk] >= 0 { append(mut &fin, r) } else {
+                                    st.pushed += 1
+                                    if hasCut { st.cut += ph.cutB[bk] }
+                                }
+                            }
+                            None { st.pushed += 1 }
+                        }
+                    }
+                }
+                ch = fin
+            }
+            let restPs = if kerned { &lz.restK } else { &lz.rest }
+            if len(restPs) > 0 && len(ch) > 0 {
+                let wide = (kerned || len(lz.raw) > 0) && 2 * len(ch) >= take
+                var qs: []int = withCapacity(if wide { take } else { len(ch) })
+                if wide { for q in 0..take { append(mut &qs, q) } } else { for r in ch { append(mut &qs, r - r0) } }
+                match lexdb_rows.colsIntoPure(s, &dir, k, &qs, len(qs) == take, r0, restPs, mut &b, bp) {
+                    Ok(ok) { if !ok { st.bail = true; return st } }
+                    Err(x) { st.err = Some(x); return st }
+                }
+            }
+            for r in ch { append(mut &idx, r) }
+            b.n += take
+            st.nRead += take
+            k += take
+        }
+    }
+    if b.n > 0 {
+        st.nBatches += 1
+        if len(idx) > 0 {
+            var at0: [][]int = []
+            append(mut &at0, idx)
+            match parJoinFrom(jr, &b, 1, &at0, len(at0[0]), meta, keys, specs, shareOf, kinds, fcols, mut &st) {
+                Ok(ok) { if !ok { st.bail = true; return st } }
+                Err(x) { st.err = Some(x); return st }
+            }
+        }
+    }
+    return st
+}
+
+// End-to-end parallel join-probe + aggregation driver for joinRowsWithAgg.
+// Returns true if the entire scan+join+agg completed in parallel; false if
+// it fell back cleanly before mutating any state (caller runs serial readRows).
+fn parAggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_access.Rel,
+              sc: &lexdb_access.Scan, jr: &JRun, bp: &BPlan, lz: &Lazy, conds: &[]BNode,
+              pushCol: int, ph: &PushH, hasCut: bool, ag: mut &AggSt, totRows: mut &int,
+              parParts: mut &[]ParAggState, bud: mut &Budget, cnt: mut &[]Counts,
+              rc: mut &RC): Result[bool, DbErr] {
+    var needPl: []bool = []
+    var maxPl = -1
+    buildNeedPlaces(bp, lz, mut &needPl, mut &maxPl)
+    var cur = lexdb_access.newCursor()
+    let chunk = try lexdb_access.collectParLeaves(st, txn, rel, sc, mut &cur, bp, lz, &needPl, maxPl, PAR_AGG_MEGA, false)
+    if chunk.fallback || !chunk.done { return Ok(false) }
+    let nl = len(chunk.leaves)
+    if nl < PAR_MIN_LEAVES { return Ok(false) }
+    var estRows = 0
+    for lv in chunk.leaves { estRows += lv.to - lv.from }
+    if estRows < PAR_MIN_ROWS { return Ok(false) }
+    let fastUrl = isFastUrlAgg(ag)
+    let meta = ParAggMeta{
+        ns: len(ag.specs), nkeys: len(ag.keys), oneKey: ag.oneKey, twoInt: ag.twoInt, sorted: false,
+        textCol: ag.textCol, fastUrlCol: if fastUrl { ag.reCol } else { -1 },
+        twoText: ag.twoText, twoTextC0: ag.twoTextC0, twoTextC1: ag.twoTextC1,
+        key0Typ: if len(ag.keys) > 0 { ag.keys[0].typ } else { 0 },
+        key1Typ: if len(ag.keys) > 1 { ag.keys[1].typ } else { 0 },
+        room: ag.room, maxHeld: ag.maxHeld, streamOn: false,
+        havOn: false, havAgg: -1, havOp: 0
+    }
+    let workers = max(1, par.threads())
+    var hasCntD = false
+    for sp in ag.specs { if sp.kind == BA_CNTD { hasCntD = true; break } }
+    let wantParts = if meta.nkeys == 0 && !hasCntD { workers * 4 } else { workers }
+    let nParts = min(max(1, nl / 8), wantParts)
+    let spans = makeParSpans(nl, nParts)
+    let slabRef = &chunk.slab
+    let leavesRef = &chunk.leaves
+    let rw = lexdb_access.rowsFor(rel)
+    let noKeys: []BComp = []
+    let keysRef = if fastUrl { &noKeys } else { &ag.keys }
+    let specsRef = &ag.specs
+    let shareRef = &ag.shareOf
+    let kindsRef = &ag.kinds
+    let fcolsRef = &ag.fcols
+    var results = par.map(&spans, fn(sp: &ParSpan): ParAggState {
+        return parAggJoinWorker(slabRef, leavesRef, sp.lo, sp.hi, jr, bp, lz, &rw, conds, pushCol, ph, hasCut,
+                                &meta, keysRef, specsRef, shareRef, kindsRef, fcolsRef, &needPl, maxPl)
+    })
+    var chunkRead = 0
+    var totalGroups = 0
+    for ri in 0..len(results) {
+        if results[ri].err.isSome() { return Err(results[ri].err.clone().unwrap()) }
+        if results[ri].bail { return Err(batErr()) }
+        chunkRead += results[ri].nRead
+        totalGroups += results[ri].ngroups
+    }
+    try bud.tickN(chunkRead)
+    for ri in 0..len(results) {
+        rc.read += results[ri].nRead
+        rc.kept += results[ri].jcnt[0].joined
+        rc.pushed += results[ri].pushed
+        rc.cut += results[ri].cut
+        rc.batches += results[ri].nBatches
+        totRows += results[ri].nJoined
+        if results[ri].kernRuns > 0 { lexdb_leafk.noteRun() }
+        for j in 1..len(jr.jls) {
+            let lv = jr.jls[j].level
+            cnt[lv].starts += results[ri].jcnt[j].starts
+            cnt[lv].read += results[ri].jcnt[j].read
+            cnt[lv].joined += results[ri].jcnt[j].joined
+            cnt[lv].nulls += results[ri].jcnt[j].nulls
+        }
+    }
+    // Emit unmatched RIGHT JOIN rows (e.g. TPC-H q13 orders RIGHT JOIN customer) by ORing per-worker seen[] bitmaps.
+    var anyRight = false
+    for j in 1..len(jr.jls) { if jr.jls[j].right { anyRight = true; break } }
+    if anyRight {
+        var rightSt = newParAggState(meta.ns)
+        rightSt.jcnt = array(len(jr.jls), ParJoinCounts{starts: 0, read: 0, joined: 0, nulls: 0})
+        for ji in 0..len(jr.jls) {
+            append(mut &rightSt.seen, if jr.jls[ji].right { array(jr.jls[ji].rows.n, false) } else { [] })
+        }
+        let dummyB0 = lexdb_rows.noRows()
+        for rightAt in 1..len(jr.jls) {
+            let jl = &jr.jls[rightAt]
+            if !jl.right { continue }
+            let total = jl.rows.n
+            var allSeen: []bool = array(total, false)
+            for ri in 0..len(results) {
+                let sArr = &results[ri].seen[rightAt]
+                for x in 0..total { if sArr[x] { allSeen[x] = true } }
+            }
+            for x in 0..total { if rightSt.seen[rightAt][x] { allSeen[x] = true } }
+            var x = 0
+            while x < total {
+                var ridx: []int = []
+                while x < total && len(ridx) < lexdb_rows.BROWS {
+                    if !allSeen[x] { append(mut &ridx, x) }
+                    x += 1
+                }
+                let n = len(ridx)
+                if n == 0 { continue }
+                cnt[jl.level].unmatched += n
+                try bud.tickN(n)
+                var at: [][]int = []
+                for _ in 0..rightAt { append(mut &at, array(n, -1)) }
+                append(mut &at, ridx)
+                if len(jl.post) > 0 {
+                    let w = gatherAtPure(jr, &dummyB0, &at, n, &jl.preads)
+                    var all: []int = withCapacity(n)
+                    for r in 0..n { append(mut &all, r) }
+                    let k2 = try pickPure(&jl.post, &w, all)
+                    if len(k2) < n { at = compose(&at, &k2) }
+                }
+                let m = len(at[0])
+                if !(try parJoinFrom(jr, &dummyB0, rightAt + 1, &at, m, &meta, keysRef, specsRef, shareRef, kindsRef, fcolsRef, mut &rightSt)) {
+                    return Err(batErr())
+                }
+            }
+        }
+        totRows += rightSt.nJoined
+        for j in 1..len(jr.jls) {
+            let lv = jr.jls[j].level
+            cnt[lv].starts += rightSt.jcnt[j].starts
+            cnt[lv].read += rightSt.jcnt[j].read
+            cnt[lv].joined += rightSt.jcnt[j].joined
+            cnt[lv].nulls += rightSt.jcnt[j].nulls
+        }
+        totalGroups += rightSt.ngroups
+        append(mut &results, rightSt)
+    }
+    // Parallel disjoint merge for high-cardinality join-aggs (e.g. TPC-H q13 150k groups, q3, q10)
+    var mp = 1
+    while mp * 2 <= workers { mp = mp * 2 }
+    if mp >= 2 && len(results) > 1 && meta.nkeys > 0 && totalGroups > 4096 {
+        var partIds: []int = withCapacity(mp)
+        for p in 0..mp { append(mut &partIds, p) }
+        let nf = len(ag.fcols)
+        let estPerPart = totalGroups / mp
+        let parts = par.map(&partIds, fn(pid: &int): ParAggState {
+            return parMergePart(&results, pid, mp, &meta, specsRef, shareRef, nf, estPerPart, false, -1, 0, false, false)
+        })
+        var totalAdded = 0
+        for p in 0..len(parts) {
+            if parts[p].err.isSome() { return Err(parts[p].err.clone().unwrap()) }
+            totalAdded += parts[p].added
+        }
+        if ag.room >= 0 && totalAdded > ag.room { return Err(memErr(ag.maxHeld)) }
+        parParts = parts
+        return Ok(true)
+    }
+    let noTop = noTopAgg()
+    let noHb = noHavBound()
+    var dummyFirst: []Val = []
+    var dummyAccs: []Acc = []
+    var dummyStreamed = 0
+    var dummyPeak = 0
+    var mutRes = results
+    for ri in 0..len(mutRes) {
+        try mergeParAgg(ag, mut &mutRes[ri], &noTop, false, &noHb, 0,
+                        fn(f: mut &[]Val, s: int, a: mut &[]Acc): Result[Unit, DbErr] { return Ok(Unit{}) },
+                        mut &dummyFirst, mut &dummyAccs, mut &dummyStreamed, mut &dummyPeak)
+    }
+    return Ok(true)
 }

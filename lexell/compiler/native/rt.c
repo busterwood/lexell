@@ -4785,8 +4785,6 @@ static void rt_par_start(void) {
     }
     rt_par_base = base;
     __atomic_store_n(&rt_par_span, (size_t)n * PAR_SLOT, __ATOMIC_RELEASE);
-    rt_heap_slow = true;
-    rt_mheap.inline_ok = 0;
     unsigned long all = ~0UL, old = 0;
     SYS4(S_RT_SIGPROCMASK, 2, &all, &old, 8);                    /* SIG_SETMASK: workers start with all blocked */
     int k = 0;
@@ -4815,6 +4813,11 @@ void* lxllib_par_run(int64_t n, void* (*item)(void*, void*, int64_t), void* f, v
     memset(&j, 0, sizeof j);
     j.done.t = rt_cur;
     j.item = item; j.f = f; j.xs = xs; j.res = r; j.n = n; j.chunk = chunk;
+    if (rt_njobs == 0) {
+        rt_heap_slow = true;
+        rt_mheap.inline_ok = 0;
+    }
+    rt_njobs++;
     rt_pool_lock();
     if (rt_pq_tail) rt_pq_tail->qnext = &j; else rt_pq = &j;
     rt_pq_tail = &j;
@@ -4832,9 +4835,12 @@ void* lxllib_par_run(int64_t n, void* (*item)(void*, void*, int64_t), void* f, v
         if (rt_par_last(&j)) j.done.done = true;
         rt_pool_unlock();
     }
-    rt_njobs++;
     while (!__atomic_load_n(&j.done.done, __ATOMIC_ACQUIRE)) rt_park(false, w);
     rt_njobs--;
+    if (rt_njobs == 0) {
+        rt_heap_slow = false;
+        rt_mheap.inline_ok = !rt_check;
+    }
     if (j.fail) {                                           /* a worker stopped: stop the program */
         rt_flush();
         write_all(2, j.msg, j.msgn);

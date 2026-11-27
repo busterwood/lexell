@@ -45,7 +45,9 @@ pub fn hashTwoInt(k0: int, k1: int, nu: byte): u64 {
 }
 
 pub fn hashStr(s: &str): u64 {
-    return collections.fxHashStr(s)
+    var h = collections.fxHashStr(s)
+    h = (h ^ (h >> 33)) *% u64(0x5851f42d4c957f2d)
+    return h ^ (h >> 33)
 }
 
 // ============================================================================
@@ -1329,6 +1331,47 @@ pub fn (t: mut &TwoLevelInt) put(k: int, gid: int) {
 
 pub fn (t: &TwoLevelInt) keyAt(gid: int): int { return t.keyByGid[gid] }
 
+pub fn (t: &TwoLevelInt) bktLen(b: int): int { return len(t.bkts[b].ks) }
+pub fn (t: &TwoLevelInt) bktKey(b: int, i: int): int { return t.bkts[b].ks[i] }
+pub fn (t: &TwoLevelInt) bktGid(b: int, i: int): int { return t.bkts[b].gids[i] }
+
+pub fn (t: mut &TwoLevelInt) prePromote() {
+    if t.twoLevel { return }
+    var bkts: []IntBucket = withCapacity(NBUCKETS)
+    for _ in 0..NBUCKETS { append(mut &bkts, newIntBucket()) }
+    t.bkts = bkts
+    t.twoLevel = true
+}
+
+pub fn (t: mut &TwoLevelInt) getOrPut(k: int, nextGid: int): int {
+    let h = hashInt(k)
+    if t.twoLevel {
+        let bk = mut &t.bkts[bucketOf(h)]
+        let got = bk.find(k, h)
+        if got >= 0 { return got }
+        bk.insert(k, h, nextGid)
+        if t.trackKeys {
+            while len(t.keyByGid) <= nextGid { append(mut &t.keyByGid, 0) }
+            t.keyByGid[nextGid] = k
+        }
+        return nextGid
+    }
+    let cap = len(t.ht)
+    if cap > 0 {
+        let mask = cap - 1
+        var sl = slotMask(h, mask)
+        while true {
+            let e = t.ht[sl]
+            if e == 0 { break }
+            let loc = e - 1
+            if t.ks[loc] == k { return t.gids[loc] }
+            sl = (sl + 1) & mask
+        }
+    }
+    t.put(k, nextGid)
+    return nextGid
+}
+
 // Batch-grouped cache-friendly probe for Level 2: fills outGid[j] with existing gid or -1.
 pub fn (t: &TwoLevelInt) probeBatch(ks: &[]int, nul: &[]bool, nc: int, outGid: mut &[]int) {
     if !t.twoLevel {
@@ -1565,6 +1608,52 @@ pub fn (t: &TwoLevelTwoInt) key1At(gid: int): int {
 pub fn (t: &TwoLevelTwoInt) nuAt(gid: int): byte {
     if !t.twoLevel { return t.nu[gid] }
     return t.bkts[int(t.gidBkt[gid])].nu[t.gidLoc[gid]]
+}
+
+pub fn (t: &TwoLevelTwoInt) bktLen(b: int): int { return len(t.bkts[b].k0) }
+pub fn (t: &TwoLevelTwoInt) bktK0(b: int, i: int): int { return t.bkts[b].k0[i] }
+pub fn (t: &TwoLevelTwoInt) bktK1(b: int, i: int): int { return t.bkts[b].k1[i] }
+pub fn (t: &TwoLevelTwoInt) bktNu(b: int, i: int): byte { return t.bkts[b].nu[i] }
+pub fn (t: &TwoLevelTwoInt) bktGid(b: int, i: int): int { return t.bkts[b].gids[i] }
+
+pub fn (t: mut &TwoLevelTwoInt) prePromote(estCap: int) {
+    if t.twoLevel { return }
+    var bkts: []TwoIntBucket = withCapacity(NBUCKETS)
+    for _ in 0..NBUCKETS { append(mut &bkts, newTwoIntBucket()) }
+    t.bkts = bkts
+    if estCap > 0 {
+        t.gidBkt = withCapacity(estCap)
+        t.gidLoc = withCapacity(estCap)
+    }
+    t.twoLevel = true
+}
+
+pub fn (t: mut &TwoLevelTwoInt) getOrPut(a: int, b: int, nu: byte, nextGid: int): int {
+    let h = hashTwoInt(a, b, nu)
+    if t.twoLevel {
+        let bi = bucketOf(h)
+        let bk = mut &t.bkts[bi]
+        let got = bk.find(a, b, nu, h)
+        if got >= 0 { return got }
+        let loc = bk.insert(a, b, nu, h, nextGid)
+        append(mut &t.gidBkt, byte(bi))
+        append(mut &t.gidLoc, loc)
+        return nextGid
+    }
+    let cap = len(t.ht)
+    if cap > 0 {
+        let mask = cap - 1
+        var sl = slotMask(h, mask)
+        while true {
+            let e = t.ht[sl]
+            if e == 0 { break }
+            let g = e - 1
+            if t.k0[g] == a && t.k1[g] == b && t.nu[g] == nu { return g }
+            sl = (sl + 1) & mask
+        }
+    }
+    t.put(a, b, nu, nextGid)
+    return nextGid
 }
 
 // Batch-grouped cache-friendly probe for TwoLevelTwoInt.
@@ -2055,6 +2144,47 @@ pub fn (t: &TwoLevelArena) hashAt(gid: int): u64 {
     if loc < 0 { return u64(0) }
     if !t.twoLevel { return t.l1.ents[loc].hash }
     return t.bkts[int(t.gidBkt[gid])].ents[loc].hash
+}
+
+pub fn (t: &TwoLevelArena) bktLen(b: int): int { return len(t.bkts[b].ents) }
+pub fn (t: &TwoLevelArena) bktSlice(b: int, i: int): &str {
+    let bk = &t.bkts[b]
+    let ent = bk.ents[i]
+    return &bk.arena[ent.off..ent.off + ent.len]
+}
+pub fn (t: &TwoLevelArena) bktHash(b: int, i: int): u64 { return t.bkts[b].ents[i].hash }
+pub fn (t: &TwoLevelArena) bktGid(b: int, i: int): int { return t.bkts[b].ents[i].gid }
+
+pub fn (t: mut &TwoLevelArena) prePromote(estCap: int) {
+    if t.twoLevel { return }
+    var bkts: []ArenaBucket = withCapacity(NBUCKETS)
+    for _ in 0..NBUCKETS { append(mut &bkts, newArenaBucket()) }
+    t.bkts = bkts
+    if t.trackKeys && estCap > 0 {
+        t.gidBkt = withCapacity(estCap)
+        t.gidLoc = withCapacity(estCap)
+    }
+    t.twoLevel = true
+}
+
+pub fn (t: mut &TwoLevelArena) getOrPutHash(s: &str, h: u64, nextGid: int): int {
+    if t.twoLevel {
+        let b = bucketOf(h)
+        let bk = mut &t.bkts[b]
+        let got = bk.find(s, h)
+        if got >= 0 { return got }
+        let loc = bk.insert(s, h, nextGid)
+        if t.trackKeys {
+            while len(t.gidBkt) <= nextGid { append(mut &t.gidBkt, byte(0)); append(mut &t.gidLoc, -1) }
+            t.gidBkt[nextGid] = byte(b)
+            t.gidLoc[nextGid] = loc
+        }
+        return nextGid
+    }
+    let got = t.l1.find(s, h)
+    if got >= 0 { return got }
+    t.putHash(s, h, nextGid)
+    return nextGid
 }
 
 // ============================================================================
