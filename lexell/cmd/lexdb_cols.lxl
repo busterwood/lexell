@@ -1247,6 +1247,130 @@ pub fn parse(s: &str, n: int): Option[[]int] {
     return Some(dir)
 }
 
+// Fast partial directory parse for parallel OLAP workers: parses ONLY places 0..=maxPl
+// and skips null-bitmap counting / metadata fills for unneeded places (!needPl[p]).
+pub fn parseNeeded(s: &str, n: int, needPl: &[]bool, maxPl: int): Option[[]int] {
+    if len(s) < 4 || int(s[0]) != VERSION { return None }
+    let np = int(s[3])
+    if len(s) < 4 + np { return None }
+    var dir: []int = array(DIR_HDR + D * np, 0)
+    dir[0] = u16At(s, 1)
+    dir[1] = np
+    dir[2] = n
+    if maxPl < 0 { return Some(dir) }
+    let limit = if maxPl + 1 < np { maxPl + 1 } else { np }
+    let nNeed = len(needPl)
+    var at = 4 + np
+    let nb = (n + 7) / 8
+    for p in 0..limit {
+        let k = s[4 + p]
+        let x = DIR_HDR + D * p
+        if at >= len(s) { return None }
+        let cb = int(s[at])
+        at += 1
+        let c = cb & 0x7f
+        let want = p < nNeed && needPl[p]
+        if want {
+            dir[x + F_CODEC] = c
+            dir[x + F_NULLS] = -1
+            var nnul = 0
+            if cb & C_NULLS != 0 {
+                if at + nb > len(s) { return None }
+                dir[x + F_NULLS] = at
+                for i in 0..n { if bitAt(s, at, i) { nnul += 1 } }
+                at += nb
+            }
+            dir[x + F_Y] = if nnul < n { 1 } else { 0 }
+        } else {
+            if cb & C_NULLS != 0 {
+                if at + nb > len(s) { return None }
+                at += nb
+            }
+        }
+        if c == C_NONE {
+            if k != K_NONE { return None }
+        } else if c == C_FOR || c == C_UNITS {
+            if c == C_FOR && !isInt(k) { return None }
+            if c == C_UNITS {
+                if k != K_NUM || at >= len(s) { return None }
+                if want { dir[x + F_X] = int(s[at]) }
+                at += 1
+            }
+            if at + 2 > len(s) { return None }
+            let base = unzz(getUVar(s, mut &at))
+            if at >= len(s) { return None }
+            let w = int(s[at])
+            at += 1
+            if w > MAX_W || at >= len(s) { return None }
+            let range = getUVar(s, mut &at)
+            if want {
+                dir[x + F_BASE] = base
+                dir[x + F_W] = w
+                dir[x + F_MAX] = base +% range
+                dir[x + F_DATA] = at
+            }
+            at += (n * w + 7) / 8
+        } else if c == C_RAW {
+            if !isInt(k) || at + 2 > len(s) { return None }
+            let base = unzz(getUVar(s, mut &at))
+            if at >= len(s) { return None }
+            let mx = unzz(getUVar(s, mut &at))
+            if want {
+                dir[x + F_BASE] = base
+                dir[x + F_MAX] = mx
+                dir[x + F_W] = fixedSize(k)
+                dir[x + F_DATA] = at
+            }
+            at += n * fixedSize(k)
+        } else if c == C_BOOL {
+            if k != K_BOOL { return None }
+            if want { dir[x + F_DATA] = at }
+            at += nb
+        } else if c == C_TEXT || c == C_BIN {
+            if (c == C_TEXT && (k == K_NUM || !isVar(k))) || (c == C_BIN && k != K_NUM) { return None }
+            if at + 2 * n > len(s) || n == 0 { return None }
+            let total = u16At(s, at + 2 * n - 2)
+            if want {
+                dir[x + F_DATA] = at
+                dir[x + F_X] = at + 2 * n
+            }
+            at += 2 * n + total
+        } else if c == C_ANY {
+            if k != K_ANY || n == 0 || at + 2 * n > len(s) { return None }
+            let total = u16At(s, at + 2 * n - 2)
+            if want {
+                dir[x + F_DATA] = at
+                dir[x + F_X] = at + 2 * n
+            }
+            at += 2 * n + total
+        } else if c == C_DICT {
+            if k != K_TEXT || at >= len(s) { return None }
+            let nd = int(s[at]) + 1
+            at += 1
+            if at + 2 * nd > len(s) { return None }
+            let dbytes = u16At(s, at + 2 * nd - 2)
+            if want {
+                dir[x + F_X] = nd
+                dir[x + F_Y] = at
+            }
+            at += 2 * nd + dbytes
+            if at >= len(s) { return None }
+            let w = int(s[at])
+            at += 1
+            if w > 8 { return None }
+            if want {
+                dir[x + F_W] = w
+                dir[x + F_DATA] = at
+            }
+            at += (n * w + 7) / 8
+        } else {
+            return None
+        }
+        if at > len(s) { return None }
+    }
+    return Some(dir)
+}
+
 // Whether the leaf is a whole-row column leaf (C_ANY): every row's bytes
 // as they were, whatever its layout or kind.
 pub fn isAny(s: &str, dir: &[]int): bool {

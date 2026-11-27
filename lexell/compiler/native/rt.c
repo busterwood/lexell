@@ -4721,7 +4721,7 @@ static int rt_ncpu(void) {
 static void rt_par_start(void) {
     const char* e = getenv("LXL_PAR");
     int ncpu = rt_ncpu();
-    int n = e && *e ? atoi(e) : ncpu - 1;
+    int n = e && *e ? atoi(e) : (ncpu > 1 ? ncpu : 0);
     if (n > 64) n = 64;
     rt_npar = -1;
     if (n <= 0) return;
@@ -4784,7 +4784,8 @@ void* lxllib_par_run(int64_t n, void* (*item)(void*, void*, int64_t), void* f, v
     __atomic_add_fetch(&rt_par_seq, 1, __ATOMIC_RELEASE);
     rt_pool_unlock();
     int64_t ranges = (n + chunk - 1) / chunk;
-    SYS4(S_FUTEX, &rt_par_seq, K_FUTEX_WAKE_PRIVATE, ranges < rt_npar ? ranges : rt_npar, 0);
+    int maxw = (alone && rt_npar > 1) ? rt_npar - 1 : rt_npar;
+    SYS4(S_FUTEX, &rt_par_seq, K_FUTEX_WAKE_PRIVATE, ranges < maxw ? ranges : maxw, 0);
     if (alone) {                                            /* nothing else to run: work too */
         rt_par_items(&j);
         rt_pool_lock();
@@ -4806,6 +4807,15 @@ void* lxllib_par_run(int64_t n, void* (*item)(void*, void*, int64_t), void* f, v
 }
 void* lxllib_par_get(void* r, int64_t i) { return ((void**)r)[i]; }
 void lxllib_par_free(void* r) { rt_free(r); }
+int64_t lxllib_par_threads(void) {
+    if (rt_npar > 0) return (int64_t)rt_npar;
+    if (rt_npar < 0) return 1;
+    const char* e = getenv("LXL_PAR");
+    int ncpu = rt_ncpu();
+    int n = e && *e ? atoi(e) : (ncpu > 1 ? ncpu : 0);
+    if (n > 64) n = 64;
+    return n > 0 ? (int64_t)n : 1;
+}
 
 /* ------------------------------------------------------------ rcstat (exp/borrow: compiler/rcstat.lxl)
    rt_str_dup and rt_str_drop counted by kind (0 other, 1 a dup for a borrowed parameter, 2 the drop

@@ -2320,6 +2320,88 @@ fn fillBackBatch(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc:
     return Ok(Some(b))
 }
 
+// A pure, refcount-shared column leaf handle for par.map parallel OLAP workers:
+// cols is an O(1) refcount-bumped clone of the typed T_CLEAF column bytes (no rc handles).
+pub type ParLeaf = record {
+    pub cols: str
+    pub n: int
+    pub from: int
+    pub to: int
+}
+
+pub type ParChunk = record {
+    pub leaves: []ParLeaf
+    pub done: bool
+    pub fallback: bool
+}
+
+// Collects up to maxLeaves consecutive pure, layoutOk typed T_CLEAF column leaves
+// from scan sc starting at cur, preserving hierarchical lexdb_skip pruning,
+// bp.ranges min/max skipping, and read-ahead. Stops cleanly before any non-T_CLEAF,
+// C_ANY, or mismatched-layout leaf so the caller seamlessly falls back to serial fillPickIn.
+pub fn collectParLeaves(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Rel, sc: &Scan, cur: mut &Cursor,
+                        bp: &BPlan, lz: &Lazy, maxLeaves: int): Result[ParChunk, DbErr] {
+    if sc.empty || sc.point {
+        cur.done = true
+        return Ok(ParChunk{leaves: [], done: true, fallback: false})
+    }
+    let rw = rowsFor(t)
+    let bar = noBar()
+    if lz.skipQ.active && !cur.skipReady {
+        let info = try lexdb_skip.ensureTreeInfo(st, txn, t.tree, t.name)
+        cur.skipReady = true
+        cur.skipHasMetas = info.hasMetas
+        cur.skipEpoch = info.epoch
+    }
+    let hasExtraAuto = !cur.skipHasMetas && lz.skipQ.hasExtraAutoFilters()
+    let prevStarted = cur.started
+    let from = if cur.started { cur.at.clone() } else { sc.lo.clone() }
+    cur.started = true
+    var leaves: []ParLeaf = []
+    var autoSkipped = 0
+    var stopped = false
+    var stopKey = ""
+    var hitNonCol = false
+    try scanLeavesWithSkip(st, txn, t, &rw, &from, sc.hi.clone(), &lz.skipQ, &bar, -1, cur, fn(leaf: &lexdb_rows.LeafView, i: int, j: int): bool {
+        if j <= i { return true }
+        if !leaf.isCols || lexdb_rows.isAnyLeaf(leaf) || !lexdb_rows.layoutOk(leaf, &rw) {
+            if len(leaves) == 0 {
+                hitNonCol = true
+                return false
+            }
+            stopped = true
+            stopKey = lexdb_rows.leafKey(leaf, i)
+            return false
+        }
+        if len(bp.ranges) > 0 && lexdb_rows.excluded(leaf, bp, &rw) {
+            autoSkipped += 1
+            return true
+        }
+        if hasExtraAuto && lexdb_skip.colLeafExcludesExtra(leaf, &lz.skipQ, false, -1, 0, false, false) {
+            autoSkipped += 1
+            return true
+        }
+        if len(leaves) >= maxLeaves {
+            stopped = true
+            stopKey = lexdb_rows.leafKey(leaf, i)
+            return false
+        }
+        append(mut &leaves, ParLeaf{cols: leaf.cols.clone(), n: leaf.n, from: i, to: j})
+        return true
+    })
+    if autoSkipped > 0 { lexdb_skip.addLeavesSkipped(autoSkipped) }
+    if hitNonCol {
+        cur.started = prevStarted
+        return Ok(ParChunk{leaves: [], done: false, fallback: true})
+    }
+    if stopped {
+        cur.at = stopKey
+        return Ok(ParChunk{leaves: leaves, done: false, fallback: false})
+    }
+    cur.done = true
+    return Ok(ParChunk{leaves: leaves, done: true, fallback: false})
+}
+
 // The next batch of a level, decoded in two steps when lz is on and the
 // level is a scan of its table (else as fillLevel reads it, whole), its
 // rows chosen by the level's conditions (narrow: idx narrowed to the rows
