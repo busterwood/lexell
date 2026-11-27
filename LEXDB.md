@@ -134,19 +134,19 @@ On durable transactional writes, LexDB's lock-free `io_uring` event loop with gr
 | OLTP workload (1M rows) | LexDB | PostgreSQL 18 | Takeaway |
 |---|---:|---:|---|
 | **Durable updates** (`pgbench`, 1–32 clients) | **3.9k / 17.8k / 63.3k/s** | 1.6k / 6.7k / 25.7k/s | **2.41–2.67× faster**; commit latency **0.42 ms** median / **0.86–0.89 ms** p99 |
-| **Durable updates** (`sysbench`, non-indexed / indexed, 32t) | **54.2k/s** / **27.7k/s** | 23.0k/s / 21.0k/s | **2.36–3.13× faster** non-indexed; **1.32–2.54× faster** indexed |
-| **Point selects** (1 client, `pgbench` / `sysbench`) | **90.4k/s** / **71.0k/s** | 74.5k/s / 65.1k/s | **1.21×** (`pgbench`) / **1.09×** (`sysbench`) faster |
-| **Point selects — 3 read replicas** (32 clients, 4 cores) | **470–490k/s** (`pgbench`) / **350.5k/s** (`sysbench`) | 397k/s / 334.1k/s (4 cores) | **1.18–1.23×** (`pgbench`); **1.05×** (`sysbench`, 29% less CPU, p95 `0.14 ms`) |
+| **Durable updates** (`sysbench`, non-indexed / indexed, 32t) | **56.1k/s** / **27.1k/s** | 23.0k/s / 21.0k/s | **2.44–3.10× faster** non-indexed; **1.29–2.52× faster** indexed |
+| **Point selects** (1 client, `pgbench` / `sysbench`) | **90.4k/s** / **70.7k/s** | 74.5k/s / 65.1k/s | **1.21×** (`pgbench`) / **1.09×** (`sysbench`) faster |
+| **Point selects — 3 read replicas** (32 clients, 4 cores) | **470–490k/s** (`pgbench`) / **374.4k/s** (`sysbench`) | 397k/s / 334.1k/s (4 cores) | **1.18–1.23×** (`pgbench`); **1.12×** (`sysbench`, 33% less CPU; `oltp_read_only` **1.07×** PG) |
 | **Mixed load** (replica selects + master writes, 4 cores) | **368–403k/s** reads + **15.5–16.1k/s** writes | — | Replica lag stays at **0.22–0.23 ms** median, **0.41–0.44 ms** p99 |
 
 ### 2. OLAP analytics and bulk loads
 
-With **no materialized views and no explicit skipping indexes**, LexDB's single-core vectorized columnar engine beats single-core PostgreSQL across analytical suites and bulk loads — and beats 4-process PostgreSQL on TPC-H SF1 and the 35-query analytic suite on a single core:
+With **no materialized views and no explicit skipping indexes**, LexDB's single-core vectorized columnar engine beats single-core PostgreSQL across every analytical suite and bulk load — and beats **4-process PostgreSQL on a single core** across TPC-H SF1, ClickBench 1M, and the 35-query analytic suite:
 
 | OLAP & load workload | LexDB (1 core) | PostgreSQL 18 | Takeaway |
 |---|---:|---:|---|
-| **TPC-H SF1** (22 queries) | **6.29 s** | 14.67 s (1 core) / 8.84 s (4 proc) | **2.33× faster** than 1-core PG (faster on all 22/22); **1.41× faster** than 4-process PG overall |
-| **ClickBench 1M** (43 queries, 105 cols) | **12.16 s** | 22.36 s (1 core) / 11.33 s (4 proc) | **1.84× faster** than 1-core PG (**42/43** level or ahead; 0.55× CPU); within 7% of 4-core PG on 1 core |
+| **TPC-H SF1** (22 queries) | **6.09 s** | 14.67 s (1 core) / 8.84 s (4 proc) | **2.41× faster** than 1-core PG (faster on all 22/22); **1.45× faster** than 4-process PG overall |
+| **ClickBench 1M** (43 queries, 105 cols) | **8.14 s** | 22.36 s (1 core) / 11.33 s (4 proc) | **2.75× faster** than 1-core PG (**43/43** level or ahead; 0.38× CPU); **1.39× faster than 4-process PG on 1 core** (no MVs) |
 | **35 Analytic Queries** (1M rows) | **0.39× CPU / 0.78× wall** | 1 core / 4 proc | **2.59× less CPU** than 1-core PG (**35/35** ahead on wall & CPU); **1.28× faster** wall time than 4-process PG |
 | **Selective star-schema joins** (1M fact rows, 6 patterns) | **0.54–22.5 ms** | 0.21–77.0 ms (1 core) / 0.24–50.7 ms (4 proc) | **1.24–71.7× faster** via hash-join runtime filters; **7.68×** vs PG1 / **4.46×** vs PG4 (geomean) |
 | **Bulk `\copy` loads** (5 cases, 1M–10M rows) | **0.24–2.44 s** | 0.61–5.93 s | **1.1–2.7× faster** on every workload (including wide tables + secondary indexes) |
@@ -182,7 +182,7 @@ It also supports **cascading multi-level rollup DAGs** and **composable HyperLog
 
 | Benchmark (1M rows, single core) | Without MVs | With MVs (unmodified queries) | Live write cost |
 |---|---:|---:|---|
-| **ClickBench 1M** (43 queries, +8 general MVs) | 12.16 s | **9.07 s total** — **1.25× faster than 4-core PG (`11.33 s`) on one core** (21 queries rewritten; geomean `0.10×` PG1 / `0.21×` PG4) | 1 / 100 new rows updating all 8 MVs live: **6.51 / 10.34 ms** |
+| **ClickBench 1M** (43 queries, +8 general MVs) | 8.14 s | 21 of 43 queries transparently rewritten to **0.47–54.9 ms** (geomean `0.10×` PG1 / `0.21×` PG4 at `59797d55`) | 1 / 100 new rows updating all 8 MVs live: **6.51 / 10.34 ms** |
 | **35 Analytic Queries** (+4 general MVs) | geomean `0.48×` PG1 / `0.78×` PG4 | 9 aggregate & join queries drop from 8–74 ms to **3–4 ms** (geomean **`0.31×` PG1 / `0.49×` PG4**) | 1 / 100 / 1,000 new rows updating all 4 MVs live: **4.40 / 7.09 / 25.90 ms** vs PG `REFRESH` **758 / 264 ms** |
 | **Grouped / Sketch / 3-level DAG** | 23.7 ms grouped / 234.4 ms sketch | **0.18 ms** (132×) / **0.56 ms** (419×) / **0.07 ms** | 1-row `FAST` update: **0.43–0.66 ms** vs PG `REFRESH` **60–369 ms** (**90–780× faster**) |
 
