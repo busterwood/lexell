@@ -1,0 +1,113 @@
+// needs: crypto
+import "crypto"
+
+fn main() {
+    // Constant-time compare
+    println(crypto.constantTimeEq("secret", "secret"))
+    println(crypto.constantTimeEq("secret", "secreT"))
+    println(crypto.constantTimeEq("secret", "short"))
+    println(crypto.constantTimeEq("", ""))
+
+    // SHA-384 and HMAC-SHA-384 / HMAC-SHA-512
+    println(crypto.hex(&(crypto.sha384("abc").unwrap())))
+    println(len(crypto.hmacSha384("key", "msg").unwrap()))
+    println(len(crypto.hmacSha512("key", "msg").unwrap()))
+
+    // Streaming Hasher matches one-shot SHA-256 and SHA-512
+    var h = crypto.newHasher(crypto.HashAlg.Sha256).unwrap()
+    h.update("hello ").unwrap()
+    h.update("world").unwrap()
+    let streamed = h.finish().unwrap()
+    println(streamed == crypto.sha256("hello world").unwrap())
+
+    // RFC 5869 Test Case 1 for HKDF-SHA-256
+    let ikm = crypto.unhex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b").unwrap()
+    let salt = crypto.unhex("000102030405060708090a0b0c").unwrap()
+    let info = crypto.unhex("f0f1f2f3f4f5f6f7f8f9").unwrap()
+    let okm = crypto.hkdfSha256(&salt, &ikm, &info, 42).unwrap()
+    println(crypto.hex(&okm) == "3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")
+
+    // AES-256-GCM encrypt, decrypt, and tamper rejection (AAD, tag, ciphertext)
+    let key32 = crypto.randomBytes(32).unwrap()
+    let nonce = crypto.randomBytes(12).unwrap()
+    let aad = "order:42"
+    let pt = "transfer 100.00 USD"
+    let sealed = crypto.aesGcmEncrypt(&key32, &nonce, aad, pt).unwrap()
+    println(len(sealed) == len(pt) + 16)
+    println(crypto.aesGcmDecrypt(&key32, &nonce, aad, &sealed).unwrap() == pt)
+    println(crypto.aesGcmDecrypt(&key32, &nonce, "wrong-aad", &sealed).isErr())
+    var tampered = strToBytes(&sealed)
+    tampered[0] = tampered[0] ^ byte(1)
+    println(crypto.aesGcmDecrypt(&key32, &nonce, aad, &(strFromBytes(&tampered))).isErr())
+
+    // AES-128-GCM empty plaintext (tag only)
+    let key16 = crypto.randomBytes(16).unwrap()
+    let emptySealed = crypto.aesGcmEncrypt(&key16, &nonce, "meta", "").unwrap()
+    println(len(emptySealed) == 16 && crypto.aesGcmDecrypt(&key16, &nonce, "meta", &emptySealed).unwrap() == "")
+
+    // ChaCha20-Poly1305 RFC 8439 §2.8.2 test vector
+    let ccKey = crypto.unhex("808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f").unwrap()
+    let ccNonce = crypto.unhex("070000004041424344454647").unwrap()
+    let ccAad = crypto.unhex("50515253c0c1c2c3c4c5c6c7").unwrap()
+    let ccPt = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
+    let ccSealed = crypto.chacha20Poly1305Encrypt(&ccKey, &ccNonce, &ccAad, ccPt).unwrap()
+    let wantTag = "1ae10b594f09e26a7e902ecbd0600691"
+    println(crypto.hex(ccSealed[len(ccSealed) - 16..]) == wantTag)
+    println(crypto.chacha20Poly1305Decrypt(&ccKey, &ccNonce, &ccAad, &ccSealed).unwrap() == ccPt)
+    println(crypto.chacha20Poly1305Decrypt(&ccKey, &ccNonce, "bad", &ccSealed).isErr())
+
+    // Ed25519 RFC 8032 §7.1 Test 1 (empty message)
+    let edSeed = crypto.unhex("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60").unwrap()
+    let edPub = crypto.ed25519PublicKey(&edSeed).unwrap()
+    println(crypto.hex(&edPub) == "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a")
+    let edSig = crypto.ed25519Sign(&edSeed, "").unwrap()
+    println(crypto.hex(&edSig) == "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25bf5f0595bbe24655141438e7a100b")
+    println(crypto.ed25519Verify(&edPub, "", &edSig).unwrap())
+    println(!crypto.ed25519Verify(&edPub, "x", &edSig).unwrap())
+
+    // Ed25519 keygen + sign/verify
+    let kp = crypto.ed25519Keygen().unwrap()
+    let sig = crypto.ed25519Sign(&kp.priv, "lexell").unwrap()
+    println(crypto.ed25519Verify(&kp.pubKey, "lexell", &sig).unwrap())
+
+    // X25519 RFC 7748 §6.1 test vector + keygen exchange
+    let alicePriv = crypto.unhex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a").unwrap()
+    let bobPub = crypto.unhex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f").unwrap()
+    let shared = crypto.x25519SharedSecret(&alicePriv, &bobPub).unwrap()
+    println(crypto.hex(&shared) == "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742")
+    let xa = crypto.x25519Keygen().unwrap()
+    let xb = crypto.x25519Keygen().unwrap()
+    println(crypto.x25519SharedSecret(&xa.priv, &xb.pubKey).unwrap() == crypto.x25519SharedSecret(&xb.priv, &xa.pubKey).unwrap())
+
+    // ECDSA P-256 keygen + sign + verify + tamper
+    let ec = crypto.ecdsaP256Keygen().unwrap()
+    let ecSig = crypto.ecdsaP256Sign(&ec.priv, "signed payload").unwrap()
+    println(crypto.ecdsaP256Verify(&ec.pubKey, "signed payload", &ecSig).unwrap())
+    println(!crypto.ecdsaP256Verify(&ec.pubKey, "altered payload", &ecSig).unwrap())
+}
+// expect: true
+// expect: false
+// expect: false
+// expect: true
+// expect: cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7
+// expect: 48
+// expect: 64
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
+// expect: true
