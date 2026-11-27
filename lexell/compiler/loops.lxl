@@ -63,6 +63,7 @@ const F_HI = 4          // local a <= v
 const F_ST = 5          // the element of type c at pointer local a + index local b * v holds local d
 const F_LE = 6          // local a <= local b, both of the integer kind c
 const F_ADD = 7         // local a holds local b + v exactly (no overflow), both of the integer kind c
+const F_PLE = 8         // local a + v <= local b (v >= 1, no overflow), both of the integer kind c
 
 const MAX_FACTS = 256
 const DEPTH = 2         // how many facts between locals a bound or an order goes through
@@ -245,7 +246,7 @@ pub fn optimize(p: ir.Ir): ir.Ir {
         if o.u.funcs[f].body >= 0 { o.go(o.u.funcs[f].body, W_AT, 0) }
     }
     for f in o.u.nRtFuncs..len(o.u.funcs) {
-        if o.u.funcs[f].body >= 0 && !o.u.funcHasVec(f) { o.function(f) }
+        if o.u.funcs[f].body >= 0 { o.function(f) }
     }
     if ev == "v" {
         eprintln("loops: " + intToStr(o.nHoist) + " headers hoisted, " + intToStr(o.nLoad) + " loads hoisted, " +
@@ -700,6 +701,7 @@ fn (o: mut &Loops) killsW(x: int): int {
         if r < 0 || r % 2 == 1 || o.taken[r / 2] { o.kmem = true }
     }
     if k == ir.E_CALL && !o.pureCall(x) { o.kmem = true }
+    if k == ir.E_VECOP && (o.u.nodes[x].v == ir.V_STORE || o.u.nodes[x].v == ir.V_STORE_PARTIAL) { o.kmem = true }
     return o.down(x, W_KILLS, 0)
 }
 
@@ -1215,6 +1217,7 @@ fn (o: mut &Loops) effW(x: int): int {
     if k == ir.E_ASSIGN || k == ir.E_POSTINC { o.effStore(a) }
     if k == ir.S_DECL && o.eFn && o.taken[a] { o.addTy(o.u.locals[a].ty) }
     if k == ir.E_CALL { o.effCall(x) }
+    if k == ir.E_VECOP && (o.u.nodes[x].v == ir.V_STORE || o.u.nodes[x].v == ir.V_STORE_PARTIAL) { o.eAll = true }
     return o.down(x, W_EFF, 0)
 }
 
@@ -1776,11 +1779,31 @@ fn (o: mut &Loops) cond(e: int, t: bool) {
     if k != ir.E_BIN || o.u.nodes[e].v < ir.OP_EQ { return }
     let ck = o.u.tk(o.u.nodes[a].ty)
     if !ranged(ck) || ck == ir.TY_BOOL { return }
-    let x = o.symOf(a)
-    let y = o.symOf(o.u.nodes[e].b)
-    if x.l == -2 || y.l == -2 || !inKind(x, ck) || !inKind(y, ck) { return }
     var op = o.u.nodes[e].v
     if !t { op = negOp(op) }
+    let x = o.symOf(a)
+    let y = o.symOf(o.u.nodes[e].b)
+    if x.l == -2 && y.l != -2 && inKind(y, ck) && (op == ir.OP_LE || op == ir.OP_LT) {
+        let f = o.rtFn(a)
+        let isCAdd = f >= 0 && o.rtc[f] == RC_ADD && o.nargs(a) == 3
+        let isWAdd = f >= 0 && o.nargs(a) == 2 && o.wfn[ir.OP_ADD * 4 + 0] == f
+        if (isCAdd || isWAdd) && ck == ir.TY_I64 {
+            let ax = o.symOf(o.arg(a, 0))
+            let ac = o.symOf(o.arg(a, 1))
+            let aclo = if ac.l != -2 { o.lo(ac, ck) } else { 0 }
+            let achi = if ac.l != -2 { o.hi(ac, ck) } else { -1 }
+            if ax.l >= 0 && aclo == achi && aclo >= 1 && aclo <= 1024 && (isCAdd || o.lo(ax, ck) >= 0) {
+                let eff = if op == ir.OP_LT { aclo + 1 } else { aclo }
+                if y.l == -1 {
+                    if y.c - eff >= kmin(ck) { o.less(ax, Sym{l: -1, c: y.c - eff}, ck, 0) }
+                } else {
+                    o.add(Fact{k: F_PLE, a: ax.l, b: y.l, c: ck, d: -1, v: eff})
+                }
+            }
+        }
+        return
+    }
+    if x.l == -2 || y.l == -2 || !inKind(x, ck) || !inKind(y, ck) { return }
     if op == ir.OP_LT { o.less(x, y, ck, 1) }
     if op == ir.OP_GT { o.less(y, x, ck, 1) }
     if op == ir.OP_LE { o.less(x, y, ck, 0) }
@@ -1866,6 +1889,12 @@ fn (o: mut &Loops) define(l: int, v: int) {
             o.defineBand(l, v, k)
         } else if o.u.nk(v) == ir.E_BIN && o.u.nodes[v].v == ir.OP_SHR {
             o.defineShr(l, o.u.nodes[v].a, o.u.nodes[v].b, k)
+        } else if o.u.nk(v) == ir.E_BIN && o.u.nodes[v].v == ir.OP_SUB && k == ir.TY_I64 {
+            let sa = o.symOf(o.u.nodes[v].a)
+            let sb = o.symOf(o.u.nodes[v].b)
+            if sa.l >= 0 && sa.l != l && !o.killed(sa.l) && sb.l == -1 && sb.c >= 1 && sb.c <= 1024 && o.lo(sa, k) >= 0 {
+                o.add(Fact{k: F_ADD, a: l, b: sa.l, c: k, d: -1, v: -sb.c})
+            }
         } else {
             o.defineArith(l, v, k)
         }
@@ -2019,17 +2048,17 @@ fn (o: mut &Loops) defineArith(l: int, v: int, k: int) {
     var m = -1
     var c = 0
     var cst = false
-    if a.l >= 0 && b.l == -1 {
+    if a.l >= 0 && (b.l == -1 || blo == bhi) {
         m = a.l
-        c = b.c
+        c = if b.l == -1 { b.c } else { blo }
         cst = true
         if op == ir.OP_SUB {
             if c == kmin(k) { return }
             c = 0 - c
         }
-    } else if a.l == -1 && b.l >= 0 && op == ir.OP_ADD {
+    } else if (a.l == -1 || alo == ahi) && b.l >= 0 && op == ir.OP_ADD {
         m = b.l
-        c = a.c
+        c = if a.l == -1 { a.c } else { alo }
         cst = true
     } else if a.l >= 0 && b.l >= 0 && op == ir.OP_ADD {
         if blo >= 1 {
@@ -2608,6 +2637,13 @@ fn (o: mut &Loops) rw(x: int, lv: bool) {
         o.call(x)
         return
     }
+    if k == ir.E_VECOP {
+        o.rw(a, false)
+        o.rw(b, false)
+        o.rw(o.u.nodes[x].c, false)
+        if o.u.nodes[x].v == ir.V_STORE || o.u.nodes[x].v == ir.V_STORE_PARTIAL { o.killStores() }
+        return
+    }
     let kc = ir.KIDS[k]
     if kc == ir.K_CLIT {
         for j in 0..o.u.listLen(b) { o.rw(o.u.listAt(b, j), false) }
@@ -2618,10 +2654,67 @@ fn (o: mut &Loops) rw(x: int, lv: bool) {
     if kc == ir.K_ABC { o.rw(o.u.nodes[x].c, false) }
 }
 
+// Whether i + k <= m is known from the facts (caller ensures i >= 0 and k >= 1).
+fn (o: &Loops) plusLe(i: Sym, k: int, m: Sym, depth: int): bool {
+    if i.l == -2 || m.l == -2 { return false }
+    let ihi = o.hi(i, ir.TY_I64)
+    let mlo = o.lo(m, ir.TY_I64)
+    if ihi <= kmax(ir.TY_I64) - k && ihi + k <= mlo { return true }
+    if m.l < 0 || i.l < 0 { return false }
+    let ic = o.canon(i.l)
+    let mc = o.canon(m.l)
+    for f in o.facts {
+        if f.k == F_PLE && f.c == ir.TY_I64 && f.v >= k && o.canon(f.a) == ic {
+            let fb = o.canon(f.b)
+            if fb == mc || o.below(fb, mc, ir.TY_I64, false, DEPTH) { return true }
+        }
+        if f.k == F_ADD && f.c == ir.TY_I64 && o.canon(f.b) == ic {
+            if f.v >= k && o.below(f.a, mc, ir.TY_I64, false, DEPTH) { return true }
+            if f.v >= k - 1 && o.below(f.a, mc, ir.TY_I64, true, DEPTH) { return true }
+        }
+        if f.k == F_ADD && f.c == ir.TY_I64 && o.canon(f.b) == mc {
+            if f.v <= -(k - 1) && o.below(ic, f.a, ir.TY_I64, true, DEPTH) { return true }
+            if f.v <= -k && o.below(ic, f.a, ir.TY_I64, false, DEPTH) { return true }
+        }
+    }
+    if depth > 0 {
+        for f in o.facts {
+            if f.k == F_ADD && f.c == ir.TY_I64 && o.canon(f.a) == ic && f.v >= 0 && f.v <= kmax(ir.TY_I64) - k {
+                let base = Sym{l: f.b, c: 0}
+                if o.lo(base, ir.TY_I64) >= 0 && o.plusLe(base, k + f.v, m, depth - 1) { return true }
+            }
+        }
+    }
+    return false
+}
+
+// Whether cond is vecAddr's `(vn >= K ? vn - (K - 1) : 0)` and i + K <= vn is proved.
+fn (o: &Loops) vecLimitProved(i: Sym, cond: int): bool {
+    let cn = &o.u.nodes[cond]
+    if cn.k != ir.E_COND { return false }
+    let t = &o.u.nodes[cn.a]
+    let tb = &o.u.nodes[cn.b]
+    let fc = &o.u.nodes[cn.c]
+    if t.k != ir.E_BIN || t.v != ir.OP_GE { return false }
+    if tb.k != ir.E_BIN || tb.v != ir.OP_SUB { return false }
+    if fc.k != ir.E_INT || fc.v != 0 { return false }
+    let kv = o.symOf(t.b)
+    let kv2 = o.symOf(tb.b)
+    if kv.l != -1 || kv2.l != -1 || kv.c < 1 || kv2.c != kv.c - 1 { return false }
+    let m1 = o.symOf(t.a)
+    let m2 = o.symOf(tb.a)
+    if m1.l == -2 || m1.l != m2.l || m1.c != m2.c { return false }
+    return o.plusLe(i, kv.c, m1, 2)
+}
+
 // The bounds check x (rt_idx(i, n, w)) cannot fail: 0 <= i < n is known.
 fn (o: &Loops) idxProved(x: int): bool {
     let i = o.symOf(o.arg(x, 0))
-    let m = o.symOf(o.arg(x, 1))
+    let arg1 = o.arg(x, 1)
+    if i.l != -2 && o.lo(i, ir.TY_I64) >= 0 && o.u.nk(arg1) == ir.E_COND {
+        if o.vecLimitProved(i, arg1) { return true }
+    }
+    let m = o.symOf(arg1)
     if i.l == -2 || m.l == -2 || o.lo(i, ir.TY_I64) < 0 { return false }
     if m.l == -1 { return o.hi(i, ir.TY_I64) < m.c }
     if i.l == -1 { return o.lo(m, ir.TY_I64) > i.c }

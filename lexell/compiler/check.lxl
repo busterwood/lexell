@@ -7562,8 +7562,27 @@ fn (c: mut &Checker) constInit(e: int, t: int): int {
 
 // ---------------------------------------------------------------- explicit SIMD vectors
 
+fn (c: mut &Checker) vecTarget(pNode: int, wantMut: bool, line: int): Val {
+    if c.kind(pNode) == sx.N_BORROW {
+        let inner = c.nd(pNode).a
+        let ik = c.kind(inner)
+        if ik == sx.N_NAME || ik == sx.N_FIELDX || ik == sx.N_INDEX {
+            let isMut = (c.nd(pNode).flags & sx.MUT) != 0
+            if wantMut && !isMut {
+                c.err(line, "store needs a mutable borrow (mut &...)")
+            }
+            let v = c.rcRead(c.expr(inner, -1))
+            if wantMut && v.cat == CAT_PLACE && !v.mutable && c.pg.tk(v.t) != sema.TK_SLICE {
+                c.err(line, "cannot borrow an immutable value as mutable")
+            }
+            return v
+        }
+    }
+    return c.rcRead(c.expr(pNode, -1))
+}
+
 fn (c: mut &Checker) vecAddr(pNode: int, iNode: int, el: int, lanes: int, forStore: bool, line: int): int {
-    var pv = c.rcRead(c.expr(pNode, -1))
+    var pv = c.vecTarget(pNode, forStore, line)
     let pk = c.pg.tk(pv.t)
     if forStore {
         let ok = (pk == sema.TK_ARR || pk == sema.TK_SLICE) && c.pg.ta(pv.t) == el
@@ -7600,10 +7619,13 @@ fn (c: mut &Checker) vecAddr(pNode: int, iNode: int, el: int, lanes: int, forSto
         c.x.dot(pex, "len")
     }
     let vn = c.fresh("vn")
+    let vi = c.fresh("vi")
     c.emit(c.x.decl(c.ct("int64_t"), &vn, length))
+    c.emit(c.x.decl(c.ct("int64_t"), &vi, iv))
     let vne = c.nm(&vn)
+    let vie = c.nm(&vi)
     let limit = c.x.cond(c.x.bin(">=", vne, c.ll(lanes)), c.x.bin("-", vne, c.ll(lanes - 1)), c.ll(0))
-    let idx = c.x.call("rt_idx", [iv, limit, c.W(line)])
+    let idx = c.x.call("rt_idx", [vie, limit, c.W(line)])
     return c.x.bin("+", data, idx)
 }
 
@@ -7613,7 +7635,7 @@ type VecPartAddr = value record {
 }
 
 fn (c: mut &Checker) vecPartialAddr(pNode: int, iNode: int, el: int, lanes: int, forStore: bool, line: int): VecPartAddr {
-    var pv = c.rcRead(c.expr(pNode, -1))
+    var pv = c.vecTarget(pNode, forStore, line)
     let pk = c.pg.tk(pv.t)
     if forStore {
         let ok = (pk == sema.TK_ARR || pk == sema.TK_SLICE) && c.pg.ta(pv.t) == el
@@ -7818,7 +7840,7 @@ fn (c: mut &Checker) forVecChunks(s: int, vt: int, argsList: int, line: int) {
         c.err(line, c.tstr(vt) + ".chunks takes 1 or 2 arguments: chunks(xs) or chunks(xs, mut &i)")
     }
     let arg0 = c.item(argsList, 0)
-    var pv = c.rcRead(c.expr(arg0, -1))
+    var pv = c.vecTarget(arg0, false, line)
     let pk = c.pg.tk(pv.t)
     let ok = (el == sema.T_BYTE && pv.t == sema.T_STR) ||
         ((pk == sema.TK_ARR || pk == sema.TK_SLICE) && c.pg.ta(pv.t) == el)
