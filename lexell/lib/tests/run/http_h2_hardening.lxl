@@ -1,0 +1,550 @@
+// expect: thundering_herd: ok=20 dials=1 reuses=19
+// expect: drop_cancel_immediate: ok=true
+// expect: ows_and_expect: ows=trimmed expect=417
+// expect: goaway_retry: status=200 body=retried dials=2 retries=1
+// expect: stress_mix: ok=60 dials<=2
+// expect: rfc_conformance: wu_len=FRAME_SIZE_ERROR even_id=PROTOCOL_ERROR lower_id=PROTOCOL_ERROR closed_id=STREAM_CLOSED tab0_pipe=ok tab0_no_upd=COMPRESSION_ERROR
+// Hardening tests for HTTP/2: cold-start single-flight thundering herd, immediate
+// non-blocking RST_STREAM flush on unread Response drop, GOAWAY transparent retry,
+// high-concurrency mixed GET/POST/stream stress under maxPerHost & maxConcurrentStreams,
+// OWS trimming, Expect 417, and strict RFC 9113 / 7541 wire checks.
+import "http"
+import "httpserver"
+import "h2"
+import "hpack"
+import "net"
+import "task"
+import "strings"
+
+type AppState = record {
+    streamCancelled: int
+    cancelWait: Option[task.Promise[int]]
+}
+
+type App = value record {
+    sh: task.Shared[AppState]
+}
+
+fn (a: &App) share(): App { return App{sh: a.sh.share()} }
+
+fn okHandler(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    w.header("X-Ows", "  trimmed  ")
+    return w.text("ok")
+}
+
+fn slowIdHandler(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    let id = rq.param("id")
+    if task.sleep(15).isErr() { return Err(httpserver.error(499, "gone")) }
+    return w.text(&("id=" + id))
+}
+
+fn echoHandler(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    let b = try rq.text(262144)
+    return w.text(&("len=" + intToStr(len(b))))
+}
+
+fn bigHandler(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    var chunk = ""
+    for i in 0..8192 { chunk.addByte('m') }
+    for i in 0..16 {
+        try w.writeStr(&chunk)
+        try w.flush()
+    }
+    return Ok(Unit{})
+}
+
+fn endlessStreamHandler(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    try w.writeStr("first-chunk\n")
+    try w.flush()
+    var chunk = ""
+    for i in 0..4096 { chunk.addByte('a') }
+    for i in 0..500 {
+        if task.sleep(20).isErr() || w.writeStr(&chunk).isErr() || w.flush().isErr() {
+            var pr: Option[task.Promise[int]] = None
+            app.sh.with(fn(st: mut &AppState) {
+                st.streamCancelled += 1
+                pr = replace(mut &st.cancelWait, None)
+            })
+            match move(pr) {
+                Some(p) { p.complete(1) }
+                None {}
+            }
+            return Err(httpserver.error(499, "cancelled"))
+        }
+    }
+    return Ok(Unit{})
+}
+
+fn stopHandler(app: &App, rq: mut &httpserver.Request, w: mut &httpserver.Response): Result[Unit, httpserver.Error] {
+    rq.stopServer()
+    return w.text("bye")
+}
+
+type SrvJob = record {
+    ln: net.Listener
+    cfg: httpserver.Config
+    app: App
+}
+
+fn runServer(j: SrvJob): int {
+    let SrvJob{ln: ln, cfg: cfg, app: app} = move(j)
+    var r = httpserver.router[App]()
+    r.handle("GET /ok", okHandler)
+    r.handle("GET /slow/{id}", slowIdHandler)
+    r.handle("POST /echo", echoHandler)
+    r.handle("GET /big", bigHandler)
+    r.handle("GET /endless", endlessStreamHandler)
+    r.handle("GET /stop", stopHandler)
+    let _s = httpserver.serve(ln, app, r, cfg).unwrap()
+    return 0
+}
+
+type GetJob = record { c: http.Client; url: str; want: str }
+
+fn doGet(j: GetJob): bool {
+    let GetJob{c: c, url: u, want: want} = move(j)
+    match c.get(&u) {
+        Ok(r) {
+            if r.status != 200 || r.major != 2 { return false }
+            match r.text() {
+                Ok(t) { return t == want }
+                Err(_) { return false }
+            }
+        }
+        Err(_) { return false }
+    }
+}
+
+type MixJob = record { c: http.Client; base: str; idx: int }
+
+fn doMix(j: MixJob): bool {
+    let MixJob{c: c, base: base, idx: idx} = move(j)
+    let kind = idx % 3
+    if kind == 0 {
+        match c.get(&(base + "/slow/" + intToStr(idx))) {
+            Ok(r) {
+                if r.status != 200 || r.major != 2 { return false }
+                match r.text() {
+                    Ok(t) { return t == "id=" + intToStr(idx) }
+                    Err(_) { return false }
+                }
+            }
+            Err(_) { return false }
+        }
+    } else if kind == 1 {
+        var body = ""
+        let sz = 70000 + (idx % 5) * 1000
+        for i in 0..sz { body.addByte(byte(65 + (i % 26))) }
+        match c.post(&(base + "/echo"), "application/octet-stream", &body) {
+            Ok(r) {
+                if r.status != 200 || r.major != 2 { return false }
+                match r.text() {
+                    Ok(t) { return t == "len=" + intToStr(sz) }
+                    Err(_) { return false }
+                }
+            }
+            Err(_) { return false }
+        }
+    } else {
+        match c.get(&(base + "/big")) {
+            Ok(r) {
+                if r.status != 200 || r.major != 2 { return false }
+                match r.text() {
+                    Ok(t) { return len(t) == 131072 }
+                    Err(_) { return false }
+                }
+            }
+            Err(_) { return false }
+        }
+    }
+}
+
+// Raw mock H2 server that accepts conn #1 stream 1, then rejects stream 3 with GOAWAY(last=1, NO_ERROR),
+// and accepts conn #2 stream 1 with "retried".
+fn readExact(c: &net.Conn, n: int): Result[[]byte, int] {
+    var out = array(n, byte(0))
+    var got = 0
+    while got < n {
+        match c.read(mut &out[got..n]) {
+            Ok(k) {
+                if k == 0 { return Err(1) }
+                got += k
+            }
+            Err(_) { return Err(2) }
+        }
+    }
+    return Ok(out)
+}
+
+type Frame = record {
+    hdr: h2.FrameHeader
+    pay: []byte
+}
+
+fn readFrame(c: &net.Conn): Result[Frame, int] {
+    let hb = try readExact(c, 9)
+    let fh = h2.parseFrameHeader(&hb)
+    var pay: []byte = []
+    if fh.length > 0 { pay = try readExact(c, fh.length) }
+    return Ok(Frame{hdr: fh, pay: pay})
+}
+
+fn runGoawayMock(ln: net.Listener): int {
+    // Connection 1: answer stream 1 ("first"), then send GOAWAY(last=1) when stream 3 arrives
+    {
+        let c = ln.accept().unwrap()
+        let _pfx = readExact(&c, 24).unwrap()
+        var init: []byte = []
+        let emptySets: []h2.Setting = []
+        h2.putSettings(mut &init, &emptySets)
+        let _w = c.write(&init)
+        var enc = hpack.newEncoder(4096)
+        var done = false
+        while !done {
+            match readFrame(&c) {
+                Ok(fr) {
+                    if fr.hdr.ftype == h2.F_SETTINGS && (fr.hdr.flags & h2.FL_ACK) == 0 {
+                        var ack: []byte = []
+                        h2.putSettingsAck(mut &ack)
+                        let _wa = c.write(&ack)
+                    } else if fr.hdr.ftype == h2.F_HEADERS && fr.hdr.streamId == 1 {
+                        var out: []byte = []
+                        var blk: []byte = []
+                        let fs = [hpack.Field{name: ":status", value: "200"}, hpack.Field{name: "content-length", value: "5"}]
+                        enc.encode(&fs, mut &blk)
+                        h2.putHeaderBlock(mut &out, 1, &blk, false, 16384)
+                        let db = strToBytes("first")
+                        h2.putData(mut &out, 1, &db, true, 16384)
+                        let _wr = c.write(&out)
+                    } else if fr.hdr.ftype == h2.F_HEADERS && fr.hdr.streamId == 3 {
+                        var ga: []byte = []
+                        h2.putGoaway(mut &ga, 1, h2.ERR_NO_ERROR, "draining")
+                        let _wg = c.write(&ga)
+                        done = true
+                    }
+                }
+                Err(_) { break }
+            }
+        }
+    }
+    // Connection 2: answer stream 1 ("retried")
+    {
+        let c = ln.accept().unwrap()
+        let _pfx = readExact(&c, 24).unwrap()
+        var init: []byte = []
+        let emptySets: []h2.Setting = []
+        h2.putSettings(mut &init, &emptySets)
+        let _w = c.write(&init)
+        var enc = hpack.newEncoder(4096)
+        while true {
+            match readFrame(&c) {
+                Ok(fr) {
+                    if fr.hdr.ftype == h2.F_SETTINGS && (fr.hdr.flags & h2.FL_ACK) == 0 {
+                        var ack: []byte = []
+                        h2.putSettingsAck(mut &ack)
+                        let _wa = c.write(&ack)
+                    } else if fr.hdr.ftype == h2.F_HEADERS && fr.hdr.streamId == 1 {
+                        var out: []byte = []
+                        var blk: []byte = []
+                        let fs = [hpack.Field{name: ":status", value: "200"}, hpack.Field{name: "content-length", value: "7"}]
+                        enc.encode(&fs, mut &blk)
+                        h2.putHeaderBlock(mut &out, 1, &blk, false, 16384)
+                        let db = strToBytes("retried")
+                        h2.putData(mut &out, 1, &db, true, 16384)
+                        let _wr = c.write(&out)
+                        break
+                    }
+                }
+                Err(_) { break }
+            }
+        }
+    }
+    return 0
+}
+
+// Raw H2 client helpers for RFC conformance checks
+fn rawHandshake(c: &net.Conn, ackServer: bool) {
+    var out = strToBytes(h2.PREFACE)
+    let emptySets: []h2.Setting = []
+    h2.putSettings(mut &out, &emptySets)
+    let _w = c.write(&out).unwrap()
+    var gotSrv = false
+    var gotAck = false
+    for _ in 0..10 {
+        let fr = readFrame(c).unwrap()
+        if fr.hdr.ftype == h2.F_SETTINGS && (fr.hdr.flags & h2.FL_ACK) == 0 {
+            gotSrv = true
+            if ackServer {
+                var a: []byte = []
+                h2.putSettingsAck(mut &a)
+                let _wa = c.write(&a).unwrap()
+            }
+        } else if fr.hdr.ftype == h2.F_SETTINGS && (fr.hdr.flags & h2.FL_ACK) != 0 {
+            gotAck = true
+        }
+        if gotSrv && gotAck { return }
+    }
+}
+
+fn expectGoawayCode(c: &net.Conn): str {
+    for _ in 0..20 {
+        match readFrame(c) {
+            Ok(fr) {
+                if fr.hdr.ftype == h2.F_GOAWAY {
+                    let ga = h2.parseGoaway(&fr.pay).unwrap()
+                    return h2.errorName(ga.code)
+                }
+            }
+            Err(_) { return "EOF" }
+        }
+    }
+    return "NONE"
+}
+
+fn rawGetBytes(enc: mut &hpack.Encoder, path: &str): []byte {
+    let fs = [
+        hpack.Field{name: ":method", value: "GET"},
+        hpack.Field{name: ":scheme", value: "http"},
+        hpack.Field{name: ":authority", value: "127.0.0.1"},
+        hpack.Field{name: ":path", value: path.clone()},
+    ]
+    var blk: []byte = []
+    enc.encode(&fs, mut &blk)
+    return blk
+}
+
+fn waitStreamEnd(c: &net.Conn, sid: int) {
+    for _ in 0..30 {
+        let fr = readFrame(c).unwrap()
+        if fr.hdr.streamId == sid && (fr.hdr.flags & h2.FL_END_STREAM) != 0 { return }
+    }
+}
+
+fn main() {
+    task.scope(fn(s: mut &task.Scope) {
+        let appSh = task.shared(AppState{streamCancelled: 0, cancelWait: None})
+        let app = App{sh: appSh.share()}
+
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        var cfg = httpserver.defaults()
+        cfg.signals = false
+        cfg.logFd = -1
+        cfg.h2c = true
+        cfg.maxConcurrentStreams = 20
+        let srv = s.start(runServer, SrvJob{ln: ln, cfg: cfg, app: app.share()})
+        let base = "http://" + addr
+
+        // 1. Cold-start 20-way thundering herd (NO warmup request!) -> must single-flight to dials=1!
+        var o1 = http.defaults()
+        o1.h2c = true
+        let cHerd = http.newClient(o1)
+        var herdOk = 0
+        task.scope(fn(ms: mut &task.Scope) {
+            var futs: []task.Future[bool] = []
+            for i in 0..20 {
+                append(mut &futs, ms.start(doGet, GetJob{c: cHerd.share(), url: base + "/ok", want: "ok"}))
+            }
+            for f in futs {
+                if f.wait().unwrapOr(false) { herdOk += 1 }
+            }
+        })
+        let stHerd = cHerd.stats()
+        println("thundering_herd: ok=" + intToStr(herdOk) + " dials=" + intToStr(stHerd.dials) + " reuses=" + intToStr(stHerd.reuses))
+
+        // 2. Immediate non-blocking RST_STREAM flush when unread Response is dropped (no follow-up request!)
+        var cancelFutOpt: Option[task.Future[int]] = None
+        appSh.with(fn(st: mut &AppState) {
+            let task.Handoff{promise: pr, future: f} = task.promise[int]()
+            st.cancelWait = Some(pr)
+            cancelFutOpt = Some(f)
+        })
+        let cancelFut = replace(mut &cancelFutOpt, None).unwrap()
+        {
+            var rEnd = cHerd.get(&(base + "/endless")).unwrap()
+            var buf = array(64, byte(0))
+            let _n = rEnd.read(mut &buf).unwrap()
+            // Drop rEnd right here without sending any other request on cHerd!
+        }
+        let cancelledPromptly = cancelFut.waitFor(1000).isOk()
+        println("drop_cancel_immediate: ok=" + (if cancelledPromptly { "true" } else { "false" }))
+
+        // 3. Response OWS trimming + Expect != 100-continue -> 417
+        let rOws = cHerd.get(&(base + "/ok")).unwrap()
+        let owsVal = rOws.header("X-Ows").unwrapOr("").clone()
+        let _bOws = rOws.text().unwrap()
+        var rqExp = http.request("GET", &(base + "/ok"))
+        rqExp.header("Expect", "something-unsupported")
+        let rExp = cHerd.send(&rqExp).unwrap()
+        let expSt = rExp.status
+        let _bExp = rExp.text().unwrap()
+        println("ows_and_expect: ows=" + owsVal + " expect=" + intToStr(expSt))
+
+        // 4. Transparent retry on server GOAWAY(lastStreamId < streamId)
+        let lnGa = net.listen("127.0.0.1:0").unwrap()
+        let gaAddr = lnGa.localAddr()
+        let gaSrv = s.start(runGoawayMock, lnGa)
+        var oGa = http.defaults()
+        oGa.h2c = true
+        let cGa = http.newClient(oGa)
+        let rGa1 = cGa.get(&("http://" + gaAddr + "/1")).unwrap()
+        if rGa1.text().unwrap() != "first" { panic("ga1") }
+        let rGa2 = cGa.get(&("http://" + gaAddr + "/2")).unwrap()
+        let ga2St = rGa2.status
+        let ga2Body = rGa2.text().unwrap()
+        let gaStats = cGa.stats()
+        let _gdone = gaSrv.wait()
+        println("goaway_retry: status=" + intToStr(ga2St) + " body=" + ga2Body + " dials=" + intToStr(gaStats.dials) + " retries=" + intToStr(gaStats.retries))
+
+        // 5. High-concurrency mixed workload (60 concurrent GET/POST/128KiB-stream with maxConcurrentStreams=20, maxPerHost=2)
+        var oMix = http.defaults()
+        oMix.h2c = true
+        oMix.maxPerHost = 2
+        let cMix = http.newClient(oMix)
+        var mixOk = 0
+        task.scope(fn(ms: mut &task.Scope) {
+            var futs: []task.Future[bool] = []
+            for i in 0..60 {
+                append(mut &futs, ms.start(doMix, MixJob{c: cMix.share(), base: base.clone(), idx: i}))
+            }
+            for f in futs {
+                if f.wait().unwrapOr(false) { mixOk += 1 }
+            }
+        })
+        let stMix = cMix.stats()
+        println("stress_mix: ok=" + intToStr(mixOk) + " dials<=2" + (if stMix.dials <= 2 { "" } else { " FAIL(" + intToStr(stMix.dials) + ")" }))
+
+        // 6. Strict RFC 9113 / 7541 wire conformance checks
+        // 6a: WINDOW_UPDATE length != 4 on stream 1 -> connection FRAME_SIZE_ERROR
+        var wuLenCode = ""
+        {
+            let c = net.dial(&addr).unwrap()
+            rawHandshake(&c, true)
+            var enc = hpack.newEncoder(4096)
+            var out: []byte = []
+            let blk = rawGetBytes(mut &enc, "/ok")
+            h2.putHeaderBlock(mut &out, 1, &blk, false, 16384)
+            h2.putFrameHeader(mut &out, 2, h2.F_WINDOW_UPDATE, 0, 1)
+            append(mut &out, byte(0))
+            append(mut &out, byte(1))
+            let _w = c.write(&out).unwrap()
+            wuLenCode = expectGoawayCode(&c)
+        }
+        // 6b: DATA on even stream id 2 (after stream 5) -> PROTOCOL_ERROR
+        var evenCode = ""
+        {
+            let c = net.dial(&addr).unwrap()
+            rawHandshake(&c, true)
+            var enc = hpack.newEncoder(4096)
+            var out: []byte = []
+            let blk = rawGetBytes(mut &enc, "/ok")
+            h2.putHeaderBlock(mut &out, 5, &blk, true, 16384)
+            let _w1 = c.write(&out).unwrap()
+            waitStreamEnd(&c, 5)
+            var bad: []byte = []
+            let db = strToBytes("x")
+            h2.putData(mut &bad, 2, &db, true, 16384)
+            let _w2 = c.write(&bad).unwrap()
+            evenCode = expectGoawayCode(&c)
+        }
+        // 6c: HEADERS on lower never-opened stream 3 (after stream 5) -> PROTOCOL_ERROR
+        var lowerCode = ""
+        {
+            let c = net.dial(&addr).unwrap()
+            rawHandshake(&c, true)
+            var enc = hpack.newEncoder(4096)
+            var out: []byte = []
+            let blk = rawGetBytes(mut &enc, "/ok")
+            h2.putHeaderBlock(mut &out, 5, &blk, true, 16384)
+            let _w1 = c.write(&out).unwrap()
+            waitStreamEnd(&c, 5)
+            var bad: []byte = []
+            let blk2 = rawGetBytes(mut &enc, "/ok")
+            h2.putHeaderBlock(mut &bad, 3, &blk2, true, 16384)
+            let _w2 = c.write(&bad).unwrap()
+            lowerCode = expectGoawayCode(&c)
+        }
+        // 6d: HEADERS on already-closed stream 1 -> STREAM_CLOSED
+        var closedCode = ""
+        {
+            let c = net.dial(&addr).unwrap()
+            rawHandshake(&c, true)
+            var enc = hpack.newEncoder(4096)
+            var out: []byte = []
+            let blk = rawGetBytes(mut &enc, "/ok")
+            h2.putHeaderBlock(mut &out, 1, &blk, true, 16384)
+            let _w1 = c.write(&out).unwrap()
+            waitStreamEnd(&c, 1)
+            var bad: []byte = []
+            let blk2 = rawGetBytes(mut &enc, "/ok")
+            h2.putHeaderBlock(mut &bad, 1, &blk2, true, 16384)
+            let _w2 = c.write(&bad).unwrap()
+            closedCode = expectGoawayCode(&c)
+        }
+
+        // 6e-f: Server with maxHeaderTableSize=0 -> pipelined request before SETTINGS ACK succeeds,
+        //       then request without dynamic table size update after SETTINGS ACK gets COMPRESSION_ERROR
+        let ln0 = net.listen("127.0.0.1:0").unwrap()
+        let addr0 = ln0.localAddr()
+        var cfg0 = httpserver.defaults()
+        cfg0.signals = false
+        cfg0.logFd = -1
+        cfg0.h2c = true
+        cfg0.maxHeaderTableSize = 0
+        let srv0 = s.start(runServer, SrvJob{ln: ln0, cfg: cfg0, app: app.share()})
+
+        var tab0Pipe = ""
+        {
+            let c = net.dial(&addr0).unwrap()
+            var out = strToBytes(h2.PREFACE)
+            let emptySets: []h2.Setting = []
+            h2.putSettings(mut &out, &emptySets)
+            var enc = hpack.newEncoder(4096)
+            let fs = [
+                hpack.Field{name: ":method", value: "GET"},
+                hpack.Field{name: ":scheme", value: "http"},
+                hpack.Field{name: ":authority", value: "127.0.0.1"},
+                hpack.Field{name: ":path", value: "/ok"},
+                hpack.Field{name: "x-pipe", value: "indexed-before-ack"},
+            ]
+            var blk: []byte = []
+            enc.encode(&fs, mut &blk)
+            h2.putHeaderBlock(mut &out, 1, &blk, true, 16384)
+            let _w = c.write(&out).unwrap()
+            var gotBody = ""
+            for _ in 0..20 {
+                let fr = readFrame(&c).unwrap()
+                if fr.hdr.ftype == h2.F_SETTINGS && (fr.hdr.flags & h2.FL_ACK) == 0 {
+                    var ack: []byte = []
+                    h2.putSettingsAck(mut &ack)
+                    let _wa = c.write(&ack).unwrap()
+                } else if fr.hdr.ftype == h2.F_DATA && fr.hdr.streamId == 1 {
+                    gotBody += strFromBytes(&fr.pay)
+                    if (fr.hdr.flags & h2.FL_END_STREAM) != 0 { break }
+                }
+            }
+            tab0Pipe = gotBody
+        }
+
+        var tab0NoUpd = ""
+        {
+            let c = net.dial(&addr0).unwrap()
+            rawHandshake(&c, true)
+            var enc = hpack.newEncoder(0)
+            let blk = rawGetBytes(mut &enc, "/ok")
+            var out: []byte = []
+            h2.putHeaderBlock(mut &out, 1, &blk, true, 16384)
+            let _w = c.write(&out).unwrap()
+            tab0NoUpd = expectGoawayCode(&c)
+        }
+
+        println("rfc_conformance: wu_len=" + wuLenCode + " even_id=" + evenCode + " lower_id=" + lowerCode +
+                " closed_id=" + closedCode + " tab0_pipe=" + tab0Pipe + " tab0_no_upd=" + tab0NoUpd)
+
+        // Stop both servers cleanly
+        let _r0 = cHerd.get(&("http://" + addr0 + "/stop")).unwrap().text().unwrap()
+        let _r1 = cHerd.get(&(base + "/stop")).unwrap().text().unwrap()
+        let _s0 = srv0.wait()
+        let _s1 = srv.wait()
+    })
+}

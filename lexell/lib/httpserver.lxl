@@ -186,6 +186,7 @@ pub fn workerPolicy(): task.WorkerPolicy {
 type Limits = value record {
     headerTimeoutMs: int
     idleTimeoutMs: int
+    idlePressureMs: int
     bodyGraceMs: int
     bodyMinRate: int
     writeStallMs: int
@@ -214,7 +215,7 @@ type Limits = value record {
 }
 
 fn limitsOf(c: &Config): Limits {
-    return Limits{headerTimeoutMs: c.headerTimeoutMs, idleTimeoutMs: c.idleTimeoutMs, bodyGraceMs: c.bodyGraceMs,
+    return Limits{headerTimeoutMs: c.headerTimeoutMs, idleTimeoutMs: c.idleTimeoutMs, idlePressureMs: c.idlePressureMs, bodyGraceMs: c.bodyGraceMs,
         bodyMinRate: c.bodyMinRate, writeStallMs: c.writeStallMs, deadlineMs: c.deadlineMs,
         maxRequestsPerConn: c.maxRequestsPerConn, maxHeadBytes: c.maxHeadBytes, maxHeaders: c.maxHeaders,
         maxLineBytes: c.maxLineBytes, maxTargetBytes: c.maxTargetBytes, maxBody: c.maxBody, maxDrain: c.maxDrain,
@@ -2501,8 +2502,8 @@ fn (w: &Response) h2HeadFields(code: int, length: int): []hpack.Field {
     for i in 0..w.headers.size() {
         let x = w.headers.line(i)
         let nm = lowerAscii(&x.name)
-        if !h2.isForbiddenHeader(&nm) {
-            append(mut &fs, hpack.Field{name: nm, value: x.value.clone()})
+        if !h2.isForbiddenHeader(&nm) && nm != "te" {
+            append(mut &fs, hpack.Field{name: nm, value: h2.trimOws(&x.value)})
         }
     }
     if !w.ctSet && !noBody(code) && length != 0 {
@@ -2926,6 +2927,7 @@ type State = record {
     proxies: []str
     perIp: Map[str, int]
     maxPerIp: int
+    maxConns: int
     pid: int
     logFd: int
 }
@@ -3025,7 +3027,7 @@ fn serveWith[A](ln: net.Listener, app: A, r: Router[A], cfg: Config, tctx: Optio
     let st = task.shared(State{stats: noStats(), open: 0, slots: [], done: [], stopping: false, log: newBuf(0), mem: 0,
         memBudget: cfg.memBudget, hosts: lowerList(&cfg.hosts), redirectHosts: lowerList(&cfg.redirectHosts),
         proxies: copyList(&cfg.trustedProxies), perIp: newMap[str, int](), maxPerIp: cfg.maxConnsPerIp,
-        pid: int(getpid()), logFd: cfg.logFd})
+        maxConns: cfg.maxConns, pid: int(getpid()), logFd: cfg.logFd})
     let sh = rc(site)
     let shared = rc(app)        // one app for every connection: a handle each, lending &A
     let ready = task.workerReady()
@@ -3413,6 +3415,7 @@ fn serveH2Conn[A](rh: net.ReadHalf, wh: net.WriteHalf, tlsEng: Option[tls.Engine
         }
     })
     let h2conn = h2server.newConn(h2LimitsOf(lim), tlsEng)
+    var accountedMem = BUF + OUT
     if refuse {
         h2conn.closeConn(h2.ERR_ENHANCE_YOUR_CALM, "too many connections from IP")
     } else {
@@ -3453,11 +3456,18 @@ fn serveH2Conn[A](rh: net.ReadHalf, wh: net.WriteHalf, tlsEng: Option[tls.Engine
                     h2conn.closeConn(h2.ERR_NO_ERROR, "")
                     break
                 }
+                if h2conn.checkSettingsTimeout() { break }
                 var stopping = false
+                var pressure = false
                 let idleNow = len(active) == 0 && h2conn.activeHandlers() == 0
+                let curMem = h2conn.bufferedBytes()
+                let deltaMem = curMem - accountedMem
+                accountedMem = curMem
                 let now = nowMs()
                 st.with(fn(x: mut &State) {
+                    x.mem += deltaMem
                     stopping = x.stopping
+                    pressure = x.maxConns > 0 && x.open * 5 >= x.maxConns * 4
                     if idleNow && x.slots[slot].state == SLOT_BUSY {
                         x.slots[slot] = Slot{state: SLOT_IDLE, since: now}
                     }
@@ -3473,7 +3483,12 @@ fn serveH2Conn[A](rh: net.ReadHalf, wh: net.WriteHalf, tlsEng: Option[tls.Engine
                         break
                     }
                 }
-                if idleNow && lim.idleTimeoutMs > 0 && h2conn.idleMs() >= lim.idleTimeoutMs {
+                let effIdle = if pressure && lim.idlePressureMs > 0 && (lim.idleTimeoutMs <= 0 || lim.idlePressureMs < lim.idleTimeoutMs) {
+                    lim.idlePressureMs
+                } else {
+                    lim.idleTimeoutMs
+                }
+                if idleNow && effIdle > 0 && h2conn.idleMs() >= effIdle {
                     h2conn.closeConn(h2.ERR_NO_ERROR, "")
                     break
                 }
@@ -3483,9 +3498,10 @@ fn serveH2Conn[A](rh: net.ReadHalf, wh: net.WriteHalf, tlsEng: Option[tls.Engine
             // Dropping active, rd inside task.scope cancels and joins them cleanly.
         })
     }
+    let releaseMem = accountedMem
     st.with(fn(x: mut &State) {
         x.open -= 1
-        x.mem -= BUF + OUT
+        x.mem -= releaseMem
         x.slots[slot].state = SLOT_DONE
         append(mut &x.done, slot)
         if counted {
@@ -3513,7 +3529,7 @@ fn removeActive(active: mut &[]ActiveStream, sid: int) {
 fn h2StreamTask[A](j: H2StreamJob[A]): int {
     let H2StreamJob{req: req, stream: stream, app: app, site: site, st: st, peer: peer, trusted: trusted, lim: lim} = move(j)
     let h2server.StreamReq{id: _, method: method, scheme: _, authority: auth, path: target, headers: rawHdrs,
-                           contentLength: cl, expectContinue: expectCont, endStream: endStream} = move(req)
+                           contentLength: cl, expectContinue: expectCont, badExpect: badExpect, endStream: endStream} = move(req)
     var headers = http.newHeaders()
     for f in move(rawHdrs) { headers.add(&f.name, &f.value) }
     var rq = Request{method: method, path: "", host: "", proto: "HTTP/2.0", headers: headers, peer: peer, id: "", pattern: "",
@@ -3530,7 +3546,7 @@ fn h2StreamTask[A](j: H2StreamJob[A]): int {
         bad: "", id: "", stallMs: lim.writeStallMs, failed: false, ctSet: false, ccSet: false, h2EndSent: false,
         st: st.share()}
 
-    let bad = validateH2Request(mut &rq, &auth, &target)
+    let bad = if badExpect { 417 } else { validateH2Request(mut &rq, &auth, &target) }
     var overMem = false
     var misdirected = false
     let hn = &rq.hostName

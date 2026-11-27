@@ -64,6 +64,7 @@ type StreamState = record {
     sendWin: int
     err: Option[ClientError]
     waiter: Option[task.Promise[int]]
+    inReadQueue: bool
     localEnd: bool
     resetSent: bool
 }
@@ -86,6 +87,7 @@ fn newClientStream(id: int, sendWin: int, endStream: bool): StreamState {
         sendWin: sendWin,
         err: None,
         waiter: None,
+        inReadQueue: false,
         localEnd: endStream,
         resetSent: false,
     }
@@ -126,9 +128,11 @@ type ConnState = record {
     readerActive: bool
     writerActive: bool
     readWaiters: []int
+    readWaitHead: int
     writeWaiters: []task.Promise[int]
     connWinWaiters: []task.Promise[int]
     // Lifecycle
+    gotServerSettings: bool
     goaway: bool
     goawayLastId: int
     shut: bool
@@ -215,8 +219,10 @@ pub fn newConn(sock: net.Conn, tlsEng: Option[tls.Engine], idleMs: int): Conn {
         readerActive: false,
         writerActive: false,
         readWaiters: [],
+        readWaitHead: 0,
         writeWaiters: [],
         connWinWaiters: [],
+        gotServerSettings: false,
         goaway: false,
         goawayLastId: h2.MAX_STREAM_ID,
         shut: false,
@@ -241,6 +247,21 @@ pub fn (c: &Conn) isIdle(): bool {
         idle = !st.shut && st.activeCount == 0
     })
     return idle
+}
+
+pub fn (c: &Conn) knownMaxStreams(): int {
+    var m = 0
+    c.sh.with(fn(st: mut &ConnState) {
+        if st.gotServerSettings { m = st.peerMaxConcurrent }
+    })
+    return m
+}
+
+pub fn (c: &Conn) setInitialMaxStreams(m: int) {
+    if m <= 0 { return }
+    c.sh.with(fn(st: mut &ConnState) {
+        if !st.gotServerSettings { st.peerMaxConcurrent = m }
+    })
 }
 
 pub fn (c: &Conn) canTakeStream(nowNs: int): bool {
@@ -397,7 +418,7 @@ pub fn (c: &Conn) roundTrip(method: &str, scheme: &str, authority: &str, path: &
         for f in headers {
             let nm = strings.toLowerAscii(&f.name)
             if nm == "host" || h2.isForbiddenHeader(&nm) { continue }
-            append(mut &fs, hpack.Field{name: nm, value: f.value.clone()})
+            append(mut &fs, hpack.Field{name: nm, value: h2.trimOws(&f.value)})
         }
         var blk: []byte = []
         st.enc.encode(&fs, mut &blk)
@@ -521,7 +542,7 @@ fn (c: &Conn) waitHead(sid: int, w: Where): Result[RespHead, ClientError] {
                     status: ss.status,
                     headers: hs,
                     contentLength: ss.contentLength,
-                    endStream: ss.inDone && len(ss.inBuf) == ss.inOff,
+                    endStream: ss.inDone && len(ss.inBuf) == ss.inOff && ss.err.isNone(),
                 })
             } else if ss.err.isSome() {
                 err = ss.err.clone()
@@ -624,11 +645,13 @@ pub fn (s: mut &Stream) read(buf: mut &[byte], w: Where): Result[int, ClientErro
 
 // Releases the stream slot (safe to call from drop — never parks).
 // If the server had not finished sending the response, queues RST_STREAM(CANCEL)
-// and credits unread bytes back to the connection receive window.
+// and credits unread bytes back to the connection receive window, then attempts
+// an immediate non-blocking flush so the server sees the cancel promptly.
 pub fn (s: mut &Stream) finish() {
     if s.finished { return }
     s.finished = true
     let sid = s.id
+    var needFlush = false
     s.sh.with(fn(st: mut &ConnState) {
         if !st.streams.has(&sid) { return }
         var credit = 0
@@ -649,16 +672,111 @@ pub fn (s: mut &Stream) finish() {
         let old = st.streams.remove(&sid)
         if st.activeCount > 0 { st.activeCount -= 1 }
         st.lastUsedNs = time.monotonicNs()
-        if sendCancel { h2.putRstStream(mut &st.ctrlOut, sid, h2.ERR_CANCEL) }
+        if sendCancel {
+            h2.putRstStream(mut &st.ctrlOut, sid, h2.ERR_CANCEL)
+            needFlush = true
+        }
         if credit > 0 {
             st.connRecvConsumed += credit
             if !st.shut && st.connRecvConsumed >= CLIENT_CONN_WIN / 2 {
                 h2.putWindowUpdate(mut &st.ctrlOut, 0, st.connRecvConsumed)
                 st.connRecvWin += st.connRecvConsumed
                 st.connRecvConsumed = 0
+                needFlush = true
             }
         }
     })
+    if needFlush {
+        let conn = Conn{sh: s.sh.share()}
+        conn.tryFlushNow()
+    }
+}
+
+// Non-blocking best-effort flush of queued outbound frames (never parks).
+// Safe to call from drop (Stream.finish) or after a caller's deadline expired.
+fn (c: &Conn) tryFlushNow() {
+    var whOpt: Option[net.WriteHalf] = None
+    var chunk: []byte = []
+    var chunkOff = 0
+    var tlsErrStr = ""
+    c.sh.with(fn(st: mut &ConnState) {
+        if st.shut || st.writerActive || st.wh.isNone() { return }
+        if len(st.ctrlOut) == 0 && len(st.dataOut) == 0 && st.outOff >= len(st.outBuf) { return }
+        if len(st.ctrlOut) > 0 || len(st.dataOut) > 0 {
+            let ctrl = replace(mut &st.ctrlOut, [])
+            let data = replace(mut &st.dataOut, [])
+            match replace(mut &st.tls, None) {
+                Some(e) {
+                    var eng = e
+                    if len(ctrl) > 0 {
+                        match eng.write(&ctrl) {
+                            Ok(_) {}
+                            Err(te) { tlsErrStr = te.toStr() }
+                        }
+                    }
+                    if len(tlsErrStr) == 0 && len(data) > 0 {
+                        match eng.write(&data) {
+                            Ok(_) {}
+                            Err(te) { tlsErrStr = te.toStr() }
+                        }
+                    }
+                    if len(tlsErrStr) == 0 {
+                        let enc = eng.takeOutput()
+                        if len(enc) > 0 { appendSlice(mut &st.outBuf, &enc) }
+                    }
+                    st.tls = Some(eng)
+                }
+                None {
+                    if len(ctrl) > 0 { appendSlice(mut &st.outBuf, &ctrl) }
+                    if len(data) > 0 { appendSlice(mut &st.outBuf, &data) }
+                }
+            }
+        }
+        if len(tlsErrStr) > 0 { return }
+        if st.outOff < len(st.outBuf) {
+            st.writerActive = true
+            whOpt = replace(mut &st.wh, None)
+            chunk = replace(mut &st.outBuf, [])
+            chunkOff = st.outOff
+            st.outOff = 0
+        }
+    })
+    if len(tlsErrStr) > 0 {
+        c.failAll(ErrKind.Tls, &tlsErrStr)
+        return
+    }
+    if whOpt.isNone() { return }
+    let wh = replace(mut &whOpt, None).unwrap()
+    var fatalMsg = ""
+    while chunkOff < len(chunk) {
+        match wh.writeNow(&chunk[chunkOff..]) {
+            Ok(n) {
+                if n > 0 { chunkOff += n } else { break }
+            }
+            Err(e) {
+                fatalMsg = e.toStr()
+                break
+            }
+        }
+    }
+    var whBack: Option[net.WriteHalf] = Some(wh)
+    var ww: []task.Promise[int] = []
+    var rem = replace(mut &chunk, [])
+    let offKeep = chunkOff
+    c.sh.with(fn(st: mut &ConnState) {
+        if offKeep < len(rem) && len(fatalMsg) == 0 {
+            var merged: []byte = withCapacity(len(rem) - offKeep + len(st.outBuf) - st.outOff)
+            for i in offKeep..len(rem) { append(mut &merged, rem[i]) }
+            for i in st.outOff..len(st.outBuf) { append(mut &merged, st.outBuf[i]) }
+            st.outBuf = merged
+            st.outOff = 0
+        }
+        st.wh = replace(mut &whBack, None)
+        st.writerActive = false
+        ww = replace(mut &st.writeWaiters, [])
+    })
+    wakeAll(mut &ww)
+    if len(fatalMsg) > 0 { c.failAll(ErrKind.Io, &fatalMsg) }
 }
 
 // ---------------------------------------------------------------- turn-taking writer
@@ -710,9 +828,11 @@ fn (c: &Conn) flushWrites(w: Where): Result[Unit, ClientError] {
         let wh = replace(mut &whOpt, None).unwrap()
         var writeErr: Option[ClientError] = None
         var fatal = false
+        var fatalKind = ErrKind.Io
         while true {
             var chunk: []byte = []
             var chunkOff = 0
+            var tlsErrStr = ""
             c.sh.with(fn(st: mut &ConnState) {
                 // Move pending plaintext frames into outBuf (encrypting through TLS if active)
                 if len(st.ctrlOut) > 0 || len(st.dataOut) > 0 {
@@ -721,10 +841,22 @@ fn (c: &Conn) flushWrites(w: Where): Result[Unit, ClientError] {
                     match replace(mut &st.tls, None) {
                         Some(e) {
                             var eng = e
-                            if len(ctrl) > 0 { let r = eng.write(&ctrl) }
-                            if len(data) > 0 { let r = eng.write(&data) }
-                            let enc = eng.takeOutput()
-                            if len(enc) > 0 { appendSlice(mut &st.outBuf, &enc) }
+                            if len(ctrl) > 0 {
+                                match eng.write(&ctrl) {
+                                    Ok(_) {}
+                                    Err(te) { tlsErrStr = te.toStr() }
+                                }
+                            }
+                            if len(tlsErrStr) == 0 && len(data) > 0 {
+                                match eng.write(&data) {
+                                    Ok(_) {}
+                                    Err(te) { tlsErrStr = te.toStr() }
+                                }
+                            }
+                            if len(tlsErrStr) == 0 {
+                                let enc = eng.takeOutput()
+                                if len(enc) > 0 { appendSlice(mut &st.outBuf, &enc) }
+                            }
                             st.tls = Some(eng)
                         }
                         None {
@@ -733,12 +865,19 @@ fn (c: &Conn) flushWrites(w: Where): Result[Unit, ClientError] {
                         }
                     }
                 }
+                if len(tlsErrStr) > 0 { return }
                 if st.outOff < len(st.outBuf) {
                     chunk = replace(mut &st.outBuf, [])
                     chunkOff = st.outOff
                     st.outOff = 0
                 }
             })
+            if len(tlsErrStr) > 0 {
+                fatal = true
+                fatalKind = ErrKind.Tls
+                writeErr = Some(cErr(ErrKind.Tls, &tlsErrStr))
+                break
+            }
             if len(chunk) == 0 { break }
             while chunkOff < len(chunk) {
                 match wh.writeNow(&chunk[chunkOff..]) {
@@ -795,7 +934,7 @@ fn (c: &Conn) flushWrites(w: Where): Result[Unit, ClientError] {
                 Some(e) { e.msg.clone() }
                 None { "write failed" }
             }
-            c.failAll(ErrKind.Io, &em)
+            c.failAll(fatalKind, &em)
         }
         match move(writeErr) {
             Some(e) { return Err(e) }
@@ -817,8 +956,16 @@ fn (c: &Conn) driveRead(mySid: int, w: Where): Result[Unit, ClientError] {
             rhOpt = replace(mut &st.rh, None)
         } else if st.streams.has(&mySid) {
             let task.Handoff{promise: pr, future: f} = task.promise[int]()
-            st.streams.atMut(mySid).waiter = Some(pr)
-            append(mut &st.readWaiters, mySid)
+            var needPush = false
+            {
+                let ss = st.streams.atMut(mySid)
+                ss.waiter = Some(pr)
+                if !ss.inReadQueue {
+                    ss.inReadQueue = true
+                    needPush = true
+                }
+            }
+            if needPush { append(mut &st.readWaiters, mySid) }
             fut = Some(f)
         }
     })
@@ -962,21 +1109,35 @@ fn (c: &Conn) driveRead(mySid: int, w: Where): Result[Unit, ClientError] {
         })
     }
 
-    // Release reader leadership and pass leadership to one waiting follower (if any)
+    // Release reader leadership and pass leadership FIFO to one waiting follower (if any)
     var rhBack: Option[net.ReadHalf] = Some(rh)
     var nextLeader: Option[task.Promise[int]] = None
     c.sh.with(fn(st: mut &ConnState) {
         st.rh = replace(mut &rhBack, None)
         st.readerActive = false
-        while len(st.readWaiters) > 0 {
-            let sid = pop(mut &st.readWaiters)
-            if sid != mySid && st.streams.has(&sid) {
-                let p = replace(mut &st.streams.atMut(sid).waiter, None)
-                if p.isSome() {
-                    nextLeader = p
-                    break
+        while st.readWaitHead < len(st.readWaiters) {
+            let sid = st.readWaiters[st.readWaitHead]
+            st.readWaitHead += 1
+            if st.streams.has(&sid) {
+                let ss = st.streams.atMut(sid)
+                ss.inReadQueue = false
+                if sid != mySid {
+                    let p = replace(mut &ss.waiter, None)
+                    if p.isSome() {
+                        nextLeader = p
+                        break
+                    }
                 }
             }
+        }
+        if st.readWaitHead == len(st.readWaiters) {
+            st.readWaiters = []
+            st.readWaitHead = 0
+        } else if st.readWaitHead >= 64 && st.readWaitHead * 2 >= len(st.readWaiters) {
+            var next: []int = withCapacity(len(st.readWaiters) - st.readWaitHead)
+            for i in st.readWaitHead..len(st.readWaiters) { append(mut &next, st.readWaiters[i]) }
+            st.readWaiters = next
+            st.readWaitHead = 0
         }
     })
     wakeOpt(mut &nextLeader)
@@ -994,7 +1155,11 @@ fn (c: &Conn) driveRead(mySid: int, w: Where): Result[Unit, ClientError] {
         return Err(cErr(ek, &em))
     }
     if needFlush {
-        let fr = c.flushWrites(w)
+        if readErr.isSome() {
+            c.tryFlushNow()
+        } else {
+            let fr = c.flushWrites(w)
+        }
     }
     match move(readErr) {
         Some(e) { return Err(e) }
@@ -1109,6 +1274,15 @@ fn (c: &Conn) dispatchFrame(fh: h2.FrameHeader, payload: &[byte]): bool {
             return
         }
 
+        // Server's first frame MUST be a non-ACK SETTINGS frame (RFC 9113 section 3.4)
+        if !st.gotServerSettings {
+            if fh.ftype != h2.F_SETTINGS || (fh.flags & h2.FL_ACK) != 0 || fh.streamId != 0 {
+                protoErr = "server first frame must be SETTINGS"
+                return
+            }
+            st.gotServerSettings = true
+        }
+
         if fh.ftype == h2.F_CONTINUATION {
             protoErr = "unexpected CONTINUATION frame"
             return
@@ -1124,7 +1298,7 @@ fn (c: &Conn) dispatchFrame(fh: h2.FrameHeader, payload: &[byte]): bool {
                         if s.id == h2.SET_HEADER_TABLE_SIZE {
                             st.enc.setMaxTableSize(s.val)
                         } else if s.id == h2.SET_MAX_CONCURRENT_STREAMS {
-                            st.peerMaxConcurrent = if s.val > 0 { s.val } else { 1 }
+                            st.peerMaxConcurrent = if s.val >= 0 { s.val } else { 0 }
                         } else if s.id == h2.SET_INITIAL_WINDOW_SIZE {
                             let delta = s.val - st.peerInitWin
                             st.peerInitWin = s.val
@@ -1150,12 +1324,18 @@ fn (c: &Conn) dispatchFrame(fh: h2.FrameHeader, payload: &[byte]): bool {
                 }
                 Err(_) { protoErr = "malformed server SETTINGS" }
             }
+        } else if fh.ftype == h2.F_PRIORITY {
+            if fh.streamId == 0 { protoErr = "PRIORITY on stream 0"; return }
+            if fh.length != 5 { protoErr = "bad PRIORITY length"; return }
+            let dep = h2.readU32(payload, 0) & 0x7fffffff
+            if dep == fh.streamId { protoErr = "PRIORITY self-dependency"; return }
         } else if fh.ftype == h2.F_PING {
             if fh.streamId != 0 || fh.length != 8 { protoErr = "bad PING frame"; return }
             if (fh.flags & h2.FL_ACK) == 0 {
                 h2.putPing(mut &st.ctrlOut, true, payload)
             }
         } else if fh.ftype == h2.F_WINDOW_UPDATE {
+            if fh.length != 4 { protoErr = "WINDOW_UPDATE length != 4"; return }
             match h2.parseWindowUpdate(payload) {
                 Ok(incr) {
                     if fh.streamId == 0 {
@@ -1170,25 +1350,46 @@ fn (c: &Conn) dispatchFrame(fh: h2.FrameHeader, payload: &[byte]): bool {
                             }
                         }
                     } else if st.streams.has(&fh.streamId) {
-                        let ss = st.streams.atMut(fh.streamId)
-                        if ss.sendWin > h2.MAX_WINDOW - incr {
-                            ss.err = Some(cErr(ErrKind.Protocol, "stream window overflow"))
-                            match replace(mut &ss.waiter, None) {
-                                Some(pr) { append(mut &waiters, pr) }
-                                None {}
+                        var overflow = false
+                        {
+                            let ss = st.streams.atMut(fh.streamId)
+                            if ss.sendWin > h2.MAX_WINDOW - incr {
+                                overflow = true
+                                ss.err = Some(cErr(ErrKind.Protocol, "stream window overflow"))
+                                ss.resetSent = true
+                                match replace(mut &ss.waiter, None) {
+                                    Some(pr) { append(mut &waiters, pr) }
+                                    None {}
+                                }
+                            } else {
+                                ss.sendWin += incr
+                                if ss.sendWin > 0 {
+                                    match replace(mut &ss.waiter, None) {
+                                        Some(pr) { append(mut &waiters, pr) }
+                                        None {}
+                                    }
+                                }
                             }
-                            return
                         }
-                        ss.sendWin += incr
-                        if ss.sendWin > 0 {
-                            match replace(mut &ss.waiter, None) {
-                                Some(pr) { append(mut &waiters, pr) }
-                                None {}
-                            }
-                        }
+                        if overflow { h2.putRstStream(mut &st.ctrlOut, fh.streamId, h2.ERR_FLOW_CONTROL_ERROR) }
                     }
                 }
-                Err(_) { protoErr = "bad WINDOW_UPDATE" }
+                Err(_) {
+                    if fh.streamId == 0 {
+                        protoErr = "zero connection WINDOW_UPDATE"
+                    } else {
+                        if st.streams.has(&fh.streamId) {
+                            let ss = st.streams.atMut(fh.streamId)
+                            ss.err = Some(cErr(ErrKind.Protocol, "zero stream WINDOW_UPDATE"))
+                            ss.resetSent = true
+                            match replace(mut &ss.waiter, None) {
+                                Some(pr) { append(mut &waiters, pr) }
+                                None {}
+                            }
+                        }
+                        h2.putRstStream(mut &st.ctrlOut, fh.streamId, h2.ERR_PROTOCOL_ERROR)
+                    }
+                }
             }
         } else if fh.ftype == h2.F_GOAWAY {
             if fh.streamId != 0 { protoErr = "GOAWAY on non-zero stream"; return }
@@ -1267,20 +1468,31 @@ fn (c: &Conn) dispatchFrame(fh: h2.FrameHeader, payload: &[byte]): bool {
                         }
                         return
                     }
-                    let padCredit = frameLen - dataLen
+                    var padCredit = frameLen - dataLen
                     var streamWu = 0
+                    var sendRstCode = 0
                     {
                         let ss = st.streams.atMut(fh.streamId)
                         if !ss.gotHead {
+                            padCredit = frameLen
                             ss.err = Some(cErr(ErrKind.Protocol, "DATA received before response HEADERS"))
+                            sendRstCode = h2.ERR_PROTOCOL_ERROR
+                        } else if ss.inDone {
+                            padCredit = frameLen
+                            ss.err = Some(cErr(ErrKind.Protocol, "DATA received after END_STREAM"))
+                            sendRstCode = h2.ERR_STREAM_CLOSED
                         } else if frameLen > ss.recvWin {
+                            padCredit = frameLen
                             ss.err = Some(cErr(ErrKind.Protocol, "stream receive window exceeded"))
+                            sendRstCode = h2.ERR_FLOW_CONTROL_ERROR
                         } else {
                             ss.recvWin -= frameLen
                             if padCredit > 0 { ss.recvConsumed += padCredit }
                             ss.recvBytes += dataLen
                             if ss.contentLength >= 0 && (ss.recvBytes > ss.contentLength || (es && ss.recvBytes != ss.contentLength)) {
+                                padCredit = frameLen
                                 ss.err = Some(cErr(ErrKind.Protocol, "response body length differs from Content-Length"))
+                                sendRstCode = h2.ERR_PROTOCOL_ERROR
                             } else {
                                 if dataLen > 0 { appendSlice(mut &ss.inBuf, &payload[sp.start..sp.end]) }
                                 if es {
@@ -1296,6 +1508,9 @@ fn (c: &Conn) dispatchFrame(fh: h2.FrameHeader, payload: &[byte]): bool {
                             Some(pr) { append(mut &waiters, pr) }
                             None {}
                         }
+                    }
+                    if sendRstCode != 0 {
+                        h2.putRstStream(mut &st.ctrlOut, fh.streamId, sendRstCode)
                     }
                     if padCredit > 0 {
                         st.connRecvConsumed += padCredit
@@ -1346,6 +1561,7 @@ fn (c: &Conn) applyResponseHeaders(sid: int, block: &[byte], endStream: bool): b
     c.sh.with(fn(st: mut &ConnState) {
         if !st.streams.has(&sid) { return }
         let ss = st.streams.atMut(sid)
+        if ss.err.isSome() { return }
         if ss.gotHead {
             // Trailing HEADERS: must have END_STREAM and valid trailer fields
             if !endStream || !h2.validateTrailers(&fields) {

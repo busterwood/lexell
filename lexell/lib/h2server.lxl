@@ -66,6 +66,7 @@ pub type StreamReq = record {
     pub headers: []hpack.Field
     pub contentLength: int          // >= 0 if Content-Length was present, else -1
     pub expectContinue: bool
+    pub badExpect: bool             // Expect header other than 100-continue -> 417
     pub endStream: bool
 }
 
@@ -146,9 +147,13 @@ type ConnState = record {
     connWinWaiters: []task.Promise[int]
     wireWaiters: []task.Promise[int]
     events: []ConnEvent
-    eventWake: Option[task.Promise[int]]
+    eventsHead: int
+    closedIds: Map[int, bool]       // recently opened & closed stream ids (capped at 256)
+    closedOrder: []int
+    resetByUs: Map[int, int]        // streams reset by server -> timestampMs (grace window for in-flight DATA)
+    resetOrder: []int
     activeHandlers: int             // live handler tasks (counts until task exits!)
-    openStreams: int                 // RFC open/half-closed streams
+    openStreams: int                // RFC open/half-closed streams
     totalStreams: int
     shut: bool
     draining: bool
@@ -157,12 +162,15 @@ type ConnState = record {
     drainStartMs: int
     goawaySent: bool
     gotSettings: bool
+    settingsSentMs: int
+    settingsAcked: bool
     // DoS budgets
     winStartMs: int
     resetsInWin: int
     cheapInWin: int
     queuedCtrl: int
     lastActivityMs: int
+    eventWake: Option[task.Promise[int]]
 }
 
 // A counted handle to the connection's shared state.
@@ -223,7 +231,7 @@ pub fn newConn(lim: Limits, tlsEng: Option[tls.Engine]): Conn {
     let st = ConnState{
         lim: lim,
         tls: tlsEng,
-        dec: hpack.newDecoder(lim.maxHeaderTableSize),
+        dec: hpack.newDecoderWithDefault(lim.maxHeaderTableSize),
         enc: hpack.newEncoder(h2.DEFAULT_HEADER_TABLE_SIZE),
         streams: newMap[int, StreamState](),
         maxStreamId: 0,
@@ -239,7 +247,11 @@ pub fn newConn(lim: Limits, tlsEng: Option[tls.Engine]): Conn {
         connWinWaiters: [],
         wireWaiters: [],
         events: [],
-        eventWake: None,
+        eventsHead: 0,
+        closedIds: newMap[int, bool](),
+        closedOrder: [],
+        resetByUs: newMap[int, int](),
+        resetOrder: [],
         activeHandlers: 0,
         openStreams: 0,
         totalStreams: 0,
@@ -250,13 +262,47 @@ pub fn newConn(lim: Limits, tlsEng: Option[tls.Engine]): Conn {
         drainStartMs: 0,
         goawaySent: false,
         gotSettings: false,
+        settingsSentMs: now,
+        settingsAcked: false,
         winStartMs: now,
         resetsInWin: 0,
         cheapInWin: 0,
         queuedCtrl: 0,
         lastActivityMs: now,
+        eventWake: None,
     }
     return Conn{sh: task.shared(st)}
+}
+
+fn noteClosed(st: mut &ConnState, id: int) {
+    if st.closedIds.has(&id) { return }
+    if len(st.closedOrder) >= 256 {
+        let evict = st.closedOrder[0]
+        let old = st.closedIds.remove(&evict)
+        var next: []int = withCapacity(256)
+        for i in 1..len(st.closedOrder) { append(mut &next, st.closedOrder[i]) }
+        st.closedOrder = next
+    }
+    st.closedIds.put(id, true)
+    append(mut &st.closedOrder, id)
+}
+
+fn noteResetByUs(st: mut &ConnState, id: int, now: int) {
+    noteClosed(st, id)
+    if len(st.resetOrder) >= 256 {
+        let evict = st.resetOrder[0]
+        let old = st.resetByUs.remove(&evict)
+        var next: []int = withCapacity(256)
+        for i in 1..len(st.resetOrder) { append(mut &next, st.resetOrder[i]) }
+        st.resetOrder = next
+    }
+    st.resetByUs.put(id, now)
+    append(mut &st.resetOrder, id)
+}
+
+fn isRecentServerReset(st: &ConnState, id: int, now: int): bool {
+    if !st.resetByUs.has(&id) { return false }
+    return now - st.resetByUs.at(id) <= 2000
 }
 
 // ---------------------------------------------------------------- dispatcher API
@@ -265,8 +311,8 @@ pub fn (c: &Conn) nextEvent(waitMs: int, at: Where): Option[ConnEvent] {
     var ev: Option[ConnEvent] = None
     var fut: Option[task.Future[int]] = None
     c.sh.with(fn(st: mut &ConnState) {
-        if len(st.events) > 0 {
-            ev = Some(popFrontEvent(mut &st.events))
+        if st.eventsHead < len(st.events) {
+            ev = Some(popFrontEvent(st))
         } else if st.shut {
             ev = Some(ConnEvent.Closed)
         } else {
@@ -285,8 +331,8 @@ pub fn (c: &Conn) nextEvent(waitMs: int, at: Where): Option[ConnEvent] {
             var out: Option[ConnEvent] = None
             c.sh.with(fn(st: mut &ConnState) {
                 st.eventWake = None
-                if len(st.events) > 0 {
-                    out = Some(popFrontEvent(mut &st.events))
+                if st.eventsHead < len(st.events) {
+                    out = Some(popFrontEvent(st))
                 } else if st.shut {
                     out = Some(ConnEvent.Closed)
                 }
@@ -297,10 +343,50 @@ pub fn (c: &Conn) nextEvent(waitMs: int, at: Where): Option[ConnEvent] {
     }
 }
 
-fn popFrontEvent(xs: mut &[]ConnEvent): ConnEvent {
-    let n = len(xs)
-    for i in 0..n - 1 { swap(xs, i, i + 1) }
-    return pop(xs)
+fn popFrontEvent(st: mut &ConnState): ConnEvent {
+    let ev = replace(mut &st.events[st.eventsHead], ConnEvent.Closed)
+    st.eventsHead += 1
+    if st.eventsHead == len(st.events) {
+        st.events = []
+        st.eventsHead = 0
+    } else if st.eventsHead >= 64 && st.eventsHead * 2 >= len(st.events) {
+        let keep = len(st.events) - st.eventsHead
+        var next: []ConnEvent = withCapacity(keep)
+        for i in st.eventsHead..len(st.events) {
+            append(mut &next, replace(mut &st.events[i], ConnEvent.Closed))
+        }
+        st.events = next
+        st.eventsHead = 0
+    }
+    return ev
+}
+
+// Approximate bytes currently buffered inside this HTTP/2 connection (for memBudget).
+pub fn (c: &Conn) bufferedBytes(): int {
+    var total = 16384
+    c.sh.with(fn(st: mut &ConnState) {
+        total += len(st.ctrlOut) + len(st.dataOut) + len(st.wireOut)
+        for i in 0..st.streams.size() {
+            let ss = st.streams.valAt(i)
+            total += len(ss.inBuf) - ss.inOff
+        }
+    })
+    return total
+}
+
+// Checks whether the peer failed to acknowledge our initial SETTINGS in time.
+pub fn (c: &Conn) checkSettingsTimeout(): bool {
+    var timedOut = false
+    let now = nowMs()
+    c.sh.with(fn(st: mut &ConnState) {
+        if !st.shut && !st.settingsAcked && st.lim.headerTimeoutMs > 0 && now - st.settingsSentMs > st.lim.headerTimeoutMs {
+            timedOut = true
+        }
+    })
+    if timedOut {
+        c.closeConn(h2.ERR_SETTINGS_TIMEOUT, "SETTINGS ACK timeout")
+    }
+    return timedOut
 }
 
 pub fn (c: &Conn) activeHandlers(): int {
@@ -441,7 +527,8 @@ pub fn (s: &Stream) handlerFinished() {
             }
             if decOpen { st.openStreams -= 1 }
             if sendRst {
-                h2.putRstStream(mut &st.ctrlOut, id, h2.ERR_NO_ERROR)
+                noteResetByUs(st, id, nowMs())
+                h2.putRstStream(mut &st.dataOut, id, h2.ERR_NO_ERROR)
                 w = replace(mut &st.writerWake, None)
             }
             if credit > 0 {
@@ -453,7 +540,10 @@ pub fn (s: &Stream) handlerFinished() {
                     w = replace(mut &st.writerWake, None)
                 }
             }
-            if removeIt { let old = st.streams.remove(&id) }
+            if removeIt {
+                noteClosed(st, id)
+                let old = st.streams.remove(&id)
+            }
         }
         append(mut &st.events, ConnEvent.StreamDone(id))
         ew = replace(mut &st.eventWake, None)
@@ -787,7 +877,8 @@ pub fn (s: &Stream) reset(code: int) {
             if already { return }
             if decOpen { st.openStreams -= 1 }
         }
-        h2.putRstStream(mut &st.ctrlOut, id, code)
+        noteResetByUs(st, id, nowMs())
+        h2.putRstStream(mut &st.dataOut, id, code)
         w = replace(mut &st.writerWake, None)
     })
     wakeOpt(mut &w)
@@ -811,6 +902,7 @@ pub fn writerTask(j: WriterJob): int {
     while true {
         var batch: []byte = []
         var stop = false
+        var tlsFail = false
         var fut: Option[task.Future[int]] = None
         var ww: []task.Promise[int] = []
         c.sh.with(fn(st: mut &ConnState) {
@@ -823,10 +915,16 @@ pub fn writerTask(j: WriterJob): int {
                 match replace(mut &st.tls, None) {
                     Some(e) {
                         var eng = e
-                        if len(ctrl) > 0 { let r = eng.write(&ctrl) }
-                        if len(data) > 0 { let r = eng.write(&data) }
-                        let enc = eng.takeOutput()
-                        if len(enc) > 0 { appendSlice(mut &st.wireOut, &enc) }
+                        if len(ctrl) > 0 {
+                            if eng.write(&ctrl).isErr() { tlsFail = true }
+                        }
+                        if !tlsFail && len(data) > 0 {
+                            if eng.write(&data).isErr() { tlsFail = true }
+                        }
+                        if !tlsFail {
+                            let enc = eng.takeOutput()
+                            if len(enc) > 0 { appendSlice(mut &st.wireOut, &enc) }
+                        }
                         st.tls = Some(eng)
                     }
                     None {
@@ -835,6 +933,7 @@ pub fn writerTask(j: WriterJob): int {
                     }
                 }
             }
+            if tlsFail { return }
             if len(st.wireOut) > 0 {
                 batch = replace(mut &st.wireOut, [])
                 ww = replace(mut &st.wireWaiters, [])
@@ -847,6 +946,10 @@ pub fn writerTask(j: WriterJob): int {
             }
         })
         wakeAll(mut &ww)
+        if tlsFail {
+            c.closeConn(-1, "")
+            return 0
+        }
         if len(batch) > 0 {
             match wh.writeStalled(&batch, stallMs) {
                 Ok(_) {}
@@ -1055,6 +1158,7 @@ fn buildRequest(id: int, fields: []hpack.Field, endStream: bool, maxLineBytes: i
     var headers: []hpack.Field = []
     var cl = -1
     var expectCont = false
+    var badExpect = false
     var cookies = ""
     var cookieCount = 0
     var hostVal = ""
@@ -1103,7 +1207,11 @@ fn buildRequest(id: int, fields: []hpack.Field, endStream: bool, maxLineBytes: i
                 if cl >= 0 && cl != v { return Err(h2.ERR_PROTOCOL_ERROR) }
                 cl = v
             } else if f.name == "expect" {
-                if strings.toLowerAscii(&f.value) == "100-continue" { expectCont = true }
+                if strings.toLowerAscii(&f.value) == "100-continue" {
+                    expectCont = true
+                } else {
+                    badExpect = true
+                }
             } else if f.name == "host" {
                 hostCount += 1
                 if hostCount > 1 { return Err(h2.ERR_PROTOCOL_ERROR) }
@@ -1120,6 +1228,10 @@ fn buildRequest(id: int, fields: []hpack.Field, endStream: bool, maxLineBytes: i
     if !hasMethod { return Err(h2.ERR_PROTOCOL_ERROR) }
     if method == "CONNECT" { return Err(h2.ERR_PROTOCOL_ERROR) }
     if !hasScheme || !hasPath { return Err(h2.ERR_PROTOCOL_ERROR) }
+    if !h2.isValidScheme(&scheme) { return Err(h2.ERR_PROTOCOL_ERROR) }
+    if path != "*" && path[0] != '/' { return Err(h2.ERR_PROTOCOL_ERROR) }
+    if path == "*" && method != "OPTIONS" { return Err(h2.ERR_PROTOCOL_ERROR) }
+    if hasAuth && strings.indexOf(&authority, "@", 0) >= 0 { return Err(h2.ERR_PROTOCOL_ERROR) }
     if hasAuth && hostCount > 0 && strings.toLowerAscii(&authority) != strings.toLowerAscii(&hostVal) {
         return Err(h2.ERR_PROTOCOL_ERROR)
     }
@@ -1135,7 +1247,8 @@ fn buildRequest(id: int, fields: []hpack.Field, endStream: bool, maxLineBytes: i
         path: path,
         headers: headers,
         contentLength: cl,
-        expectContinue: expectCont && !endStream,
+        expectContinue: expectCont && !endStream && !badExpect,
+        badExpect: badExpect,
         endStream: endStream,
     })
 }
@@ -1183,13 +1296,24 @@ pub fn readerTask(j: ReaderJob): int {
     var contCount = 0
     var contEndStream = false
     var contIsTrailer = false
+    var contDeadlineMs = 0
     var hdrBlock: []byte = []
     let maxBlockCompressed = max(32768, lim.maxHeadBytes * 2 + 8192)
     var framesSinceYield = 0
 
     while true {
         if c.isClosed() { return 0 }
-        let readTimeout = if firstFrame || contStream > 0 { lim.headerTimeoutMs } else { 0 }
+        var readTimeout = 0
+        if firstFrame {
+            readTimeout = lim.headerTimeoutMs
+        } else if contStream > 0 && lim.headerTimeoutMs > 0 {
+            let rem = contDeadlineMs - nowMs()
+            if rem <= 0 {
+                c.closeConn(h2.ERR_PROTOCOL_ERROR, "CONTINUATION timeout")
+                return 0
+            }
+            readTimeout = rem
+        }
         var hbytes: []byte = []
         match pr.readExact(h2.FRAME_HDR_LEN, readTimeout) {
             Ok(b) { hbytes = b }
@@ -1209,7 +1333,12 @@ pub fn readerTask(j: ReaderJob): int {
         }
         var payload: []byte = []
         if fh.length > 0 {
-            match pr.readExact(fh.length, lim.headerTimeoutMs) {
+            let payTimeout = if contStream > 0 && lim.headerTimeoutMs > 0 {
+                max(1, contDeadlineMs - nowMs())
+            } else {
+                lim.headerTimeoutMs
+            }
+            match pr.readExact(fh.length, payTimeout) {
                 Ok(p) { payload = p }
                 Err(_) {
                     c.closeConn(-1, "")
@@ -1278,8 +1407,8 @@ pub fn readerTask(j: ReaderJob): int {
                 return 0
             }
             if fh.length != 5 {
-                c.closeConn(h2.ERR_FRAME_SIZE_ERROR, "bad PRIORITY length")
-                return 0
+                if !resetStreamWithBudget(&c, fh.streamId, h2.ERR_FRAME_SIZE_ERROR, true) { return 0 }
+                continue
             }
             let dep = h2.readU32(&payload, 0) & 0x7fffffff
             if dep == fh.streamId {
@@ -1311,18 +1440,26 @@ pub fn readerTask(j: ReaderJob): int {
                 st.lastActivityMs = nowMs()
                 if st.streams.has(&fh.streamId) {
                     let ss = st.streams.at(fh.streamId)
-                    if ss.state == SS_OPEN && es {
-                        isTrailer = true
+                    if ss.state == SS_OPEN {
+                        if es {
+                            isTrailer = true
+                        } else {
+                            // Second HEADERS on open stream without END_STREAM (RFC 9113 8.1)
+                            connErr = h2.ERR_PROTOCOL_ERROR
+                        }
                     } else {
                         connErr = h2.ERR_STREAM_CLOSED
                     }
                 } else if fh.streamId <= st.maxStreamId {
-                    connErr = h2.ERR_STREAM_CLOSED
+                    // RFC 9113 5.1 / 5.1.1: STREAM_CLOSED if previously opened & closed, else PROTOCOL_ERROR
+                    if st.closedIds.has(&fh.streamId) {
+                        connErr = h2.ERR_STREAM_CLOSED
+                    } else {
+                        connErr = h2.ERR_PROTOCOL_ERROR
+                    }
                 }
             })
             if connErr != 0 {
-                // RFC 9113: HEADERS on closed/lower stream id is connection-level STREAM_CLOSED
-                // (or PROTOCOL_ERROR for <= maxStreamId).
                 c.closeConn(connErr, "HEADERS on closed or non-increasing stream")
                 return 0
             }
@@ -1338,6 +1475,7 @@ pub fn readerTask(j: ReaderJob): int {
                 contCount = 0
                 contEndStream = es
                 contIsTrailer = isTrailer
+                contDeadlineMs = nowMs() + lim.headerTimeoutMs
                 hdrBlock = withCapacity(fragLen)
                 appendSlice(mut &hdrBlock, &payload[sp.start..sp.end])
             }
@@ -1370,6 +1508,12 @@ fn handleSettings(c: &Conn, fh: h2.FrameHeader, payload: &[byte]): bool {
             c.closeConn(h2.ERR_FRAME_SIZE_ERROR, "SETTINGS ACK with payload")
             return false
         }
+        c.sh.with(fn(st: mut &ConnState) {
+            if !st.settingsAcked {
+                st.settingsAcked = true
+                st.dec.setMaxTableSize(st.lim.maxHeaderTableSize)
+            }
+        })
         return true
     }
     var entries: []h2.Setting = []
@@ -1469,17 +1613,16 @@ fn handlePing(c: &Conn, fh: h2.FrameHeader, payload: &[byte]): bool {
 }
 
 fn handleWindowUpdate(c: &Conn, fh: h2.FrameHeader, payload: &[byte]): bool {
+    // RFC 9113 section 6.9: length != 4 is ALWAYS a connection-level FRAME_SIZE_ERROR.
+    if fh.length != 4 {
+        c.closeConn(h2.ERR_FRAME_SIZE_ERROR, "WINDOW_UPDATE length != 4")
+        return false
+    }
     var incr = 0
+    var zeroIncr = false
     match h2.parseWindowUpdate(payload) {
         Ok(v) { incr = v }
-        Err(code) {
-            if fh.streamId == 0 {
-                c.closeConn(code, "bad connection WINDOW_UPDATE")
-                return false
-            }
-            // Stream-level zero WINDOW_UPDATE: MadeYouReset counts this too!
-            return resetStreamWithBudget(c, fh.streamId, code, true)
-        }
+        Err(_) { zeroIncr = true }
     }
     var connErr = 0
     var streamErr = 0
@@ -1488,6 +1631,10 @@ fn handleWindowUpdate(c: &Conn, fh: h2.FrameHeader, payload: &[byte]): bool {
     let now = nowMs()
     c.sh.with(fn(st: mut &ConnState) {
         if fh.streamId == 0 {
+            if zeroIncr {
+                connErr = h2.ERR_PROTOCOL_ERROR
+                return
+            }
             if st.connSendWin > h2.MAX_WINDOW - incr {
                 connErr = h2.ERR_FLOW_CONTROL_ERROR
                 return
@@ -1496,8 +1643,13 @@ fn handleWindowUpdate(c: &Conn, fh: h2.FrameHeader, payload: &[byte]): bool {
             if st.connSendWin > 0 { cw = replace(mut &st.connWinWaiters, []) }
             return
         }
-        if fh.streamId > st.maxStreamId {
+        // RFC 9113 section 5.1: WINDOW_UPDATE on an idle stream (even or > maxStreamId) is connection PROTOCOL_ERROR.
+        if (fh.streamId & 1) == 0 || fh.streamId > st.maxStreamId {
             connErr = h2.ERR_PROTOCOL_ERROR
+            return
+        }
+        if zeroIncr {
+            streamErr = h2.ERR_PROTOCOL_ERROR
             return
         }
         if !st.streams.has(&fh.streamId) {
@@ -1541,7 +1693,7 @@ fn handleRstStream(c: &Conn, fh: h2.FrameHeader, payload: &[byte]): bool {
     var w: Option[task.Promise[int]] = None
     let now = nowMs()
     c.sh.with(fn(st: mut &ConnState) {
-        if fh.streamId > st.maxStreamId {
+        if (fh.streamId & 1) == 0 || fh.streamId > st.maxStreamId {
             connErr = h2.ERR_PROTOCOL_ERROR
             return
         }
@@ -1634,6 +1786,7 @@ fn resetStreamWithBudget(c: &Conn, id: int, code: int, notifyHandler: bool): boo
                 st.connRecvConsumed = 0
             }
         }
+        noteResetByUs(st, id, now)
         h2.putRstStream(mut &st.ctrlOut, id, code)
         w = replace(mut &st.writerWake, None)
         if notifyHandler {
@@ -1707,12 +1860,16 @@ fn finishHeaderBlock(c: &Conn, id: int, block: &[byte], endStream: bool, isTrail
     var maxStreams = 100
     c.sh.with(fn(st: mut &ConnState) {
         maxStreams = st.lim.maxConcurrentStreams
-        if st.drainFinalSent && id > st.drainCutoff {
-            refused = true
-            return
-        }
         if id <= st.maxStreamId {
             connErr = h2.ERR_PROTOCOL_ERROR
+            return
+        }
+        // RFC 9113 section 5.1.1: receiving HEADERS opens (and implicitly closes lower) stream IDs
+        // even if we immediately refuse the stream with REFUSED_STREAM, so in-flight DATA frames
+        // for a refused POST stream are recognized as recently-reset rather than idle PROTOCOL_ERROR.
+        st.maxStreamId = id
+        if st.drainFinalSent && id > st.drainCutoff {
+            refused = true
             return
         }
         // Rapid Reset defense: count activeHandlers (until task exits), not just openStreams
@@ -1720,7 +1877,6 @@ fn finishHeaderBlock(c: &Conn, id: int, block: &[byte], endStream: bool, isTrail
             refused = true
             return
         }
-        st.maxStreamId = id
         st.totalStreams += 1
     })
     if connErr != 0 {
@@ -1786,7 +1942,7 @@ fn handleData(c: &Conn, fh: h2.FrameHeader, payload: &[byte]): bool {
             return
         }
         st.connRecvWin -= frameLen
-        if fh.streamId > st.maxStreamId {
+        if (fh.streamId & 1) == 0 || fh.streamId > st.maxStreamId {
             connErr = h2.ERR_PROTOCOL_ERROR
             return
         }
@@ -1795,7 +1951,9 @@ fn handleData(c: &Conn, fh: h2.FrameHeader, payload: &[byte]): bool {
             return
         }
         if !st.streams.has(&fh.streamId) {
-            // Stream already closed: credit connection window back and send STREAM_CLOSED
+            // Stream already closed: credit connection window back.
+            // Ignore in-flight DATA arriving shortly after server-sent RST_STREAM (RFC 9113 5.1),
+            // otherwise treat as connection-level STREAM_CLOSED.
             st.connRecvConsumed += frameLen
             if st.connRecvConsumed >= st.lim.connRecvWindow / 2 {
                 h2.putWindowUpdate(mut &st.ctrlOut, 0, st.connRecvConsumed)
@@ -1803,7 +1961,9 @@ fn handleData(c: &Conn, fh: h2.FrameHeader, payload: &[byte]): bool {
                 st.connRecvConsumed = 0
                 w = replace(mut &st.writerWake, None)
             }
-            streamErr = h2.ERR_STREAM_CLOSED
+            if !isRecentServerReset(st, fh.streamId, now) {
+                connErr = h2.ERR_STREAM_CLOSED
+            }
             return
         }
         var padCredit = frameLen - dataLen

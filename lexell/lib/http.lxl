@@ -535,6 +535,14 @@ type Host = record {
     idle: []Conn           // H1 idle connections, most recently used last
     waiters: []Waiter      // first come first served
     h2: []h2client.Conn    // multiplexed HTTP/2 connections
+    h2Dialing: bool        // single-flight guard while dialing an H2-candidate connection
+    h2Known: int           // 0 unknown, 1 negotiated H2, -1 server spoke H1
+    h2MaxStreams: int      // cached peer SETTINGS_MAX_CONCURRENT_STREAMS (0 = unknown)
+    h2DialWaiters: []task.Promise[int]
+}
+
+fn newHost(): Host {
+    return Host{open: 0, idle: [], waiters: [], h2: [], h2Dialing: false, h2Known: 0, h2MaxStreams: 0, h2DialWaiters: []}
 }
 
 // A request parked for a connection: its promise brings an idle one, or
@@ -639,7 +647,7 @@ fn pruneDeadH2(sh: &task.Shared[PoolState]) {
             if st.hosts.has(&k) {
                 let h = st.hosts.atMut(k.clone())
                 h.h2 = replace(mut &keep, [])
-                if h.open == 0 && len(h.waiters) == 0 && len(h.h2) == 0 {
+                if h.open == 0 && len(h.waiters) == 0 && len(h.h2) == 0 && !h.h2Dialing && len(h.h2DialWaiters) == 0 {
                     let gone = st.hosts.remove(&k)
                 }
             }
@@ -985,7 +993,7 @@ fn acquire(sh: &task.Shared[PoolState], key: str, u: &str, w: Where): Result[Opt
         let max = st.opts.maxPerHost
         id = st.nextId
         st.nextId += 1
-        if !st.hosts.has(&key) { st.hosts.put(key.clone(), Host{open: 0, idle: [], waiters: [], h2: []}) }
+        if !st.hosts.has(&key) { st.hosts.put(key.clone(), newHost()) }
         var reused = false
         {
             let h = st.hosts.atMut(key.clone())
@@ -1071,7 +1079,7 @@ fn release(sh: &task.Shared[PoolState], key: &str, var c: Option[Conn]) {
                     None { h.open -= 1 }
                 }
             }
-            empty = h.open == 0 && len(h.waiters) == 0 && len(h.h2) == 0
+            empty = h.open == 0 && len(h.waiters) == 0 && len(h.h2) == 0 && !h.h2Dialing && len(h.h2DialWaiters) == 0
         }
         if empty { let gone = st.hosts.remove(key) }
     })
@@ -1536,11 +1544,47 @@ fn pickH2(sh: &task.Shared[PoolState], key: &str): Option[h2client.Conn] {
 }
 
 fn registerH2(sh: &task.Shared[PoolState], key: &str, hc: &h2client.Conn) {
+    var knownMax = 0
     sh.with(fn(st: mut &PoolState) {
-        if !st.hosts.has(key) { st.hosts.put(key.clone(), Host{open: 0, idle: [], waiters: [], h2: []}) }
+        if !st.hosts.has(key) { st.hosts.put(key.clone(), newHost()) }
         let h = st.hosts.atMut(key.clone())
+        h.h2Known = 1
+        knownMax = h.h2MaxStreams
         append(mut &h.h2, hc.share())
     })
+    if knownMax > 0 { hc.setInitialMaxStreams(knownMax) }
+}
+
+fn updateH2MaxStreams(sh: &task.Shared[PoolState], key: &str, hc: &h2client.Conn) {
+    let m = hc.knownMaxStreams()
+    if m <= 0 { return }
+    sh.with(fn(st: mut &PoolState) {
+        if st.hosts.has(key) {
+            let h = st.hosts.atMut(key.clone())
+            h.h2MaxStreams = m
+        }
+    })
+}
+
+fn finishH2Dial(sh: &task.Shared[PoolState], key: &str, h2Known: int, takeH1Slot: bool) {
+    var wake: []task.Promise[int] = []
+    sh.with(fn(st: mut &PoolState) {
+        if !st.hosts.has(key) { return }
+        var empty = false
+        {
+            let h = st.hosts.atMut(key.clone())
+            h.h2Dialing = false
+            if h2Known != 0 { h.h2Known = h2Known }
+            if takeH1Slot { h.open += 1 }
+            wake = replace(mut &h.h2DialWaiters, [])
+            empty = h.open == 0 && len(h.waiters) == 0 && len(h.h2) == 0 && !h.h2Dialing
+        }
+        if empty { let gone = st.hosts.remove(key) }
+    })
+    while len(wake) > 0 {
+        let pr = pop(mut &wake)
+        pr.complete(0)
+    }
 }
 
 fn h2ReqFields(method: &str, h: &Headers, body: &str, ua: &str): []hpack.Field {
@@ -1603,44 +1647,149 @@ fn dialHeld(c: &Client, opts: &Options, key: &str, u: &url.Url, us: &str, w: Whe
 // gives is the Response's; on an error it is given back here.
 fn exchange(c: &Client, opts: &Options, u: &url.Url, us: &str, key: &str, method: &str, auth: &str,
             reqHdrs: &Headers, body: &str, wire: &Wire, deadline: int, w: Where): Result[Response, Error] {
-    // 1. Reuse an existing multiplexed HTTP/2 connection if available
-    if (u.scheme == "https" && opts.http2) || (u.scheme == "http" && opts.h2c) {
-        match pickH2(&c.sh, key) {
-            Some(hc) {
-                match h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, deadline, w) {
-                    Ok(resp) { return Ok(resp) }
+    var conn = gone()
+    var reused = false
+    var haveH1Conn = false
+
+    // 1. Single-flight HTTP/2 pool lookup & dial (prevents cold-start thundering herd
+    //    and caps live H2 connections per host at opts.maxPerHost).
+    let tryH2 = (u.scheme == "https" && opts.http2) || (u.scheme == "http" && opts.h2c)
+    if tryH2 {
+        var ioRetries = 0
+        var refusedRetries = 0
+        while true {
+            match pickH2(&c.sh, key) {
+                Some(hc) {
+                    let res = h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, deadline, w)
+                    updateH2MaxStreams(&c.sh, key, &hc)
+                    match res {
+                        Ok(resp) { return Ok(resp) }
+                        Err(e) {
+                            if e.kind == h2client.ErrKind.Refused || e.kind == h2client.ErrKind.Unavailable {
+                                if refusedRetries >= 8 { return Err(h2Err(&e, us)) }
+                                refusedRetries += 1
+                                count(&c.sh, false)
+                                pruneDeadH2(&c.sh)
+                                let _y = task.yield(w)
+                                continue
+                            }
+                            if e.kind == h2client.ErrKind.Io && idempotent(method) && ioRetries < 1 {
+                                ioRetries += 1
+                                count(&c.sh, false)
+                                pruneDeadH2(&c.sh)
+                                continue
+                            }
+                            return Err(h2Err(&e, us))
+                        }
+                    }
+                }
+                None {}
+            }
+
+            // Decide: wait for in-flight H2 dial, wait for H2 capacity, fall back to H1, or become the single dialer.
+            var action = 0      // 0 = fall through to H1, 1 = wait on h2DialWaiters, 2 = dial now, 3 = wait for H2 slot
+            var waitFut: Option[task.Future[int]] = None
+            c.sh.with(fn(st: mut &PoolState) {
+                let maxH = st.opts.maxPerHost
+                if !st.hosts.has(key) { st.hosts.put(key.clone(), newHost()) }
+                let h = st.hosts.atMut(key.clone())
+                if h.h2Known < 0 || len(h.idle) > 0 {
+                    action = 0
+                } else if h.h2Dialing {
+                    let task.Handoff{promise: pr, future: f} = task.promise[int]()
+                    append(mut &h.h2DialWaiters, pr)
+                    waitFut = Some(f)
+                    action = 1
+                } else if len(h.h2) >= maxH {
+                    action = 3
+                } else {
+                    h.h2Dialing = true
+                    action = 2
+                }
+            })
+
+            if action == 0 {
+                break
+            } else if action == 1 {
+                let f = replace(mut &waitFut, None).unwrap()
+                match f.wait(w) {
+                    Ok(_) { continue }
+                    Err(k) {
+                        let ek = if k == task.Cancelled.Timeout { Kind.Timeout } else { Kind.Cancelled }
+                        return Err(err(ek, &(k.toStr() + " while waiting for HTTP/2 connection"), us))
+                    }
+                }
+            } else if action == 3 {
+                pruneDeadH2(&c.sh)
+                match task.sleep(10, w) {
+                    Ok(_) { continue }
+                    Err(k) {
+                        let ek = if k == task.Cancelled.Timeout { Kind.Timeout } else { Kind.Cancelled }
+                        return Err(err(ek, &(k.toStr() + " while waiting for HTTP/2 stream slot"), us))
+                    }
+                }
+            } else {
+                // Single-flight dial
+                match dialConn(&c.sh, opts, u, us, w) {
+                    Ok(d) {
+                        count(&c.sh, true)
+                        match d {
+                            Dialed.H2(hc) {
+                                registerH2(&c.sh, key, &hc)
+                                finishH2Dial(&c.sh, key, 1, false)
+                                let res = h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, deadline, w)
+                                updateH2MaxStreams(&c.sh, key, &hc)
+                                match res {
+                                    Ok(resp) { return Ok(resp) }
+                                    Err(e) {
+                                        if (e.kind == h2client.ErrKind.Refused || e.kind == h2client.ErrKind.Unavailable) && refusedRetries < 8 {
+                                            refusedRetries += 1
+                                            count(&c.sh, false)
+                                            pruneDeadH2(&c.sh)
+                                            continue
+                                        }
+                                        return Err(h2Err(&e, us))
+                                    }
+                                }
+                            }
+                            Dialed.H1(h1c) {
+                                finishH2Dial(&c.sh, key, -1, true)
+                                conn = h1c
+                                reused = false
+                                haveH1Conn = true
+                                break
+                            }
+                        }
+                    }
                     Err(e) {
-                        let retryable = e.kind == h2client.ErrKind.Refused || e.kind == h2client.ErrKind.Unavailable ||
-                                        (e.kind == h2client.ErrKind.Io && idempotent(method))
-                        if !retryable { return Err(h2Err(&e, us)) }
-                        count(&c.sh, false)
-                        pruneDeadH2(&c.sh)
+                        finishH2Dial(&c.sh, key, 0, false)
+                        return Err(e)
                     }
                 }
             }
-            None {}
         }
     }
 
-    // 2. Acquire an idle HTTP/1.1 connection or a slot to dial a new one
-    let got = try acquire(&c.sh, key.clone(), us, w)
-    var reused = got.isSome()
-    var conn = gone()
-    match move(got) {
-        Some(x) { conn = x }
-        None {
-            let d = try dialHeld(c, opts, key, u, us, w)
-            count(&c.sh, true)
-            match d {
-                Dialed.H2(hc) {
-                    registerH2(&c.sh, key, &hc)
-                    release(&c.sh, key, None)   // H2 connections live in Host.h2, not the H1 slot
-                    return match h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, deadline, w) {
-                        Ok(resp) { Ok(resp) }
-                        Err(e) { Err(h2Err(&e, us)) }
+    // 2. Acquire an idle HTTP/1.1 connection or a slot to dial a new one (unless single-flight already dialed H1)
+    if !haveH1Conn {
+        let got = try acquire(&c.sh, key.clone(), us, w)
+        reused = got.isSome()
+        match move(got) {
+            Some(x) { conn = x }
+            None {
+                let d = try dialHeld(c, opts, key, u, us, w)
+                count(&c.sh, true)
+                match d {
+                    Dialed.H2(hc) {
+                        registerH2(&c.sh, key, &hc)
+                        release(&c.sh, key, None)   // H2 connections live in Host.h2, not the H1 slot
+                        return match h2Exchange(c, &hc, opts, u, us, key, method, auth, reqHdrs, body, deadline, w) {
+                            Ok(resp) { Ok(resp) }
+                            Err(e) { Err(h2Err(&e, us)) }
+                        }
                     }
+                    Dialed.H1(h1c) { conn = h1c }
                 }
-                Dialed.H1(h1c) { conn = h1c }
             }
         }
     }

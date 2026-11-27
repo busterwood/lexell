@@ -232,17 +232,29 @@ fn encodeString(out: mut &[]byte, s: &str) {
 
 pub type Decoder = record {
     dyn: DynTable
-    hardMax: int       // maximum allowed dynamic table size (SETTINGS_HEADER_TABLE_SIZE)
+    hardMax: int        // maximum allowed dynamic table size (SETTINGS_HEADER_TABLE_SIZE)
+    needSizeUpdate: bool // peer ACKed a lower SETTINGS_HEADER_TABLE_SIZE (RFC 7541 4.2)
 }
 
 pub fn newDecoder(maxTableSize: int): Decoder {
     let m = if maxTableSize < 0 { 0 } else { maxTableSize }
-    return Decoder{dyn: newDynTable(m), hardMax: m}
+    return Decoder{dyn: newDynTable(m), hardMax: m, needSizeUpdate: false}
 }
 
-// Updates the maximum allowed dynamic table size (after SETTINGS_HEADER_TABLE_SIZE).
+// Starts a decoder that accepts the RFC default 4096 table until SETTINGS ACK,
+// while also allowing an advertised size > 4096 as soon as the peer reacts.
+pub fn newDecoderWithDefault(advertisedMax: int): Decoder {
+    let adv = if advertisedMax < 0 { 0 } else { advertisedMax }
+    let hm = if adv > 4096 { adv } else { 4096 }
+    return Decoder{dyn: newDynTable(4096), hardMax: hm, needSizeUpdate: false}
+}
+
+// Updates the maximum allowed dynamic table size (after peer ACKs our SETTINGS).
 pub fn (d: mut &Decoder) setMaxTableSize(n: int) {
     let m = if n < 0 { 0 } else { n }
+    if m < d.dyn.maxSize {
+        d.needSizeUpdate = true
+    }
     d.hardMax = m
     if d.dyn.maxSize > m { d.dyn.setMaxSize(m) }
 }
@@ -278,8 +290,12 @@ pub fn (d: mut &Decoder) decode(data: &[byte], maxListBytes: int, maxFields: int
     var pos = 0
     var listBytes = 0
     var allowSizeUpdate = true
+    var sawSizeUpdate = false
     while pos < len(data) {
         let b = int(data[pos])
+        if (b & 0xe0) != 0x20 && d.needSizeUpdate && !sawSizeUpdate {
+            return Err(Error.TableSize)
+        }
         if (b & 0x80) != 0 {
             // 6.1 Indexed Header Field
             allowSizeUpdate = false
@@ -322,6 +338,8 @@ pub fn (d: mut &Decoder) decode(data: &[byte], maxListBytes: int, maxFields: int
             pos = r.next
             if r.val > d.hardMax { return Err(Error.TableSize) }
             d.dyn.setMaxSize(r.val)
+            sawSizeUpdate = true
+            d.needSizeUpdate = false
         } else {
             // 6.2.2 Literal without Indexing (0x00) / 6.2.3 Never Indexed (0x10)
             allowSizeUpdate = false

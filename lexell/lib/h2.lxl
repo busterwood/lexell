@@ -243,16 +243,27 @@ pub fn unpad(payload: &[byte], flags: int): Result[Span, int] {
 }
 
 // Strips optional PADDED and PRIORITY fields from a HEADERS frame payload.
-// Also validates RFC 9113 section 5.3.1 (a stream cannot depend on itself).
+// Also validates RFC 9113 section 5.3.1 (a stream cannot depend on itself)
+// and section 6.2 (pad length vs remaining payload).
 pub fn headersFragment(payload: &[byte], flags: int, streamId: int): Result[Span, int] {
-    var sp = try unpad(payload, flags)
-    if (flags & FL_PRIORITY) != 0 {
-        if sp.end - sp.start < 5 { return Err(ERR_FRAME_SIZE_ERROR) }
-        let dep = readU32(payload, sp.start) & 0x7fffffff
-        if dep == streamId { return Err(ERR_PROTOCOL_ERROR) }
-        sp.start += 5
+    let padded = (flags & FL_PADDED) != 0
+    let prio = (flags & FL_PRIORITY) != 0
+    let fixedLen = (if padded { 1 } else { 0 }) + (if prio { 5 } else { 0 })
+    if len(payload) < fixedLen { return Err(ERR_FRAME_SIZE_ERROR) }
+    var start = 0
+    var end = len(payload)
+    if padded {
+        let padLen = int(payload[0])
+        if padLen > len(payload) - fixedLen { return Err(ERR_PROTOCOL_ERROR) }
+        start = 1
+        end = len(payload) - padLen
     }
-    return Ok(sp)
+    if prio {
+        let dep = readU32(payload, start) & 0x7fffffff
+        if dep == streamId { return Err(ERR_PROTOCOL_ERROR) }
+        start += 5
+    }
+    return Ok(Span{start: start, end: end})
 }
 
 // Parses a non-ACK SETTINGS payload (RFC 9113 section 6.5).
@@ -342,6 +353,30 @@ pub fn validateTrailers(fields: &[]hpack.Field): bool {
         if f.name == "te" && f.value != "trailers" { return false }
     }
     return true
+}
+
+// RFC 3986 section 3.1: ALPHA *( ALPHA / DIGIT / "+" / "-" / "." ).
+pub fn isValidScheme(s: &str): bool {
+    if len(s) == 0 { return false }
+    let c0 = s[0]
+    if !((c0 >= 'a' && c0 <= 'z') || (c0 >= 'A' && c0 <= 'Z')) { return false }
+    for i in 1..len(s) {
+        let c = s[i]
+        let ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+                 c == '+' || c == '-' || c == '.'
+        if !ok { return false }
+    }
+    return true
+}
+
+// Trims leading and trailing HTTP optional whitespace (SP / HTAB).
+pub fn trimOws(s: &str): str {
+    var a = 0
+    var b = len(s)
+    while a < b && (s[a] == ' ' || s[a] == '\t') { a += 1 }
+    while b > a && (s[b - 1] == ' ' || s[b - 1] == '\t') { b -= 1 }
+    if a == 0 && b == len(s) { return s.clone() }
+    return s[a..b].clone()
 }
 
 // RFC 9113 section 9.2.2: checks whether a negotiated TLS version & OpenSSL
