@@ -1,0 +1,1448 @@
+// csv: RFC 4180, Excel (UTF-8 BOM, sep= directive, semicolon, CRLF, formula guard),
+// TSV (quoted and raw), and PostgreSQL COPY (FORMAT csv and FORMAT text) streaming
+// reader, writer, and typed Serialize/Deserialize struct codecs.
+//
+// Presets:
+//   csv.rfc4180() / csv.defaults()  -- RFC 4180 CSV (comma, `"`, doubled `""`, CRLF)
+//   csv.excel()                     -- Excel UTF-8 CSV (BOM on read/write, sep= directive, CRLF)
+//   csv.excelSemicolon()            -- European Excel CSV (`;`, BOM, sep= directive, CRLF)
+//   csv.tsv()                       -- Tab-delimited with optional RFC 4180 quoting, LF
+//   csv.tsvRaw()                    -- Tab-delimited with no quoting (quotes are literal), LF
+//   csv.postgresCsv()               -- PostgreSQL COPY FORMAT csv (unquoted "" = NULL, `""` = empty str, LF)
+//   csv.postgresText()              -- PostgreSQL COPY FORMAT text (tab, \ escapes, \N = NULL, \. end marker, LF)
+//
+// Streaming:
+//   var r = csv.reader(io.open(path)?) / csv.readerWith(src, csv.postgresCsv())
+//   while true { match try r.nextRow() { Some(row) { ... } None { break } } }
+//   var w = csv.writer(io.create(path)?) / csv.writerWith(dst, csv.excel())
+//
+// Typed structs (via derived Serialize / Deserialize):
+//   let rows: []Order = try csv.decodeWith(&text, csv.postgresCsv())
+//   let out = try csv.encodeWith(&rows, csv.excel())
+
+import "io"
+import "strings"
+import "decimal"
+import "math"
+import "serde"
+
+// ---------------------------------------------------------------- types & options
+
+pub type Format = value closed {
+    Csv
+    PgText
+}
+
+pub type Options = value record {
+    pub format: Format
+    pub delimiter: byte
+    pub quote: byte
+    pub escape: byte
+    pub noQuotes: bool
+    pub lazyQuotes: bool
+    pub trimSpace: bool
+    pub crlf: bool
+    pub strictFields: bool
+    pub skipEmptyLines: bool
+    pub stripBom: bool
+    pub writeBom: bool
+    pub excelSepDirective: bool
+    pub writeSepDirective: bool
+    pub guardFormulas: bool
+    pub hasNull: bool
+    pub nullStr: str
+    pub forceQuote: bool
+    pub pgEndMarker: bool
+    pub pgBooleans: bool
+    pub writeHeader: bool
+    pub maxFieldBytes: int
+    pub maxFields: int
+}
+
+const DEFAULT_MAX_FIELD_BYTES: int = 16777216
+const DEFAULT_MAX_FIELDS: int = 65536
+const IO_BUF_SIZE: int = 65536
+
+// Strict RFC 4180 CSV (comma-separated, double-quote, doubled-quote escape, CRLF).
+pub fn rfc4180(): Options {
+    return Options{
+        format: Format.Csv,
+        delimiter: ',',
+        quote: '"',
+        escape: '"',
+        noQuotes: false,
+        lazyQuotes: false,
+        trimSpace: false,
+        crlf: true,
+        strictFields: true,
+        skipEmptyLines: false,
+        stripBom: true,
+        writeBom: false,
+        excelSepDirective: false,
+        writeSepDirective: false,
+        guardFormulas: false,
+        hasNull: false,
+        nullStr: "",
+        forceQuote: false,
+        pgEndMarker: false,
+        pgBooleans: false,
+        writeHeader: true,
+        maxFieldBytes: DEFAULT_MAX_FIELD_BYTES,
+        maxFields: DEFAULT_MAX_FIELDS
+    }
+}
+
+pub fn defaults(): Options { return rfc4180() }
+
+// Microsoft Excel UTF-8 CSV: strips BOM & honours leading `sep=<c>` on read,
+// emits UTF-8 BOM + CRLF on write, tolerates ragged rows.
+pub fn excel(): Options {
+    var o = rfc4180()
+    o.strictFields = false
+    o.stripBom = true
+    o.writeBom = true
+    o.excelSepDirective = true
+    return o
+}
+
+// European Excel UTF-8 CSV (`;` delimiter, BOM, `sep=` directive, CRLF).
+pub fn excelSemicolon(): Options {
+    var o = excel()
+    o.delimiter = ';'
+    return o
+}
+
+// Tab-separated values with RFC 4180 quoting when needed and LF endings.
+pub fn tsv(): Options {
+    var o = rfc4180()
+    o.delimiter = '\t'
+    o.crlf = false
+    o.strictFields = false
+    return o
+}
+
+// Raw unquoted TSV (quotes are ordinary data bytes; fields never span lines).
+pub fn tsvRaw(): Options {
+    var o = tsv()
+    o.noQuotes = true
+    return o
+}
+
+// PostgreSQL COPY ... WITH (FORMAT csv): comma delimiter, LF endings,
+// unquoted empty field = SQL NULL, quoted `""` = empty string, t/f booleans.
+pub fn postgresCsv(): Options {
+    var o = rfc4180()
+    o.crlf = false
+    o.hasNull = true
+    o.nullStr = ""
+    o.pgBooleans = true
+    return o
+}
+
+// PostgreSQL COPY ... WITH (FORMAT text): tab delimiter, backslash escapes,
+// `\N` = SQL NULL, `\.` end-of-data marker, t/f booleans, LF endings.
+pub fn postgresText(): Options {
+    var o = postgresCsv()
+    o.format = Format.PgText
+    o.delimiter = '\t'
+    o.noQuotes = true
+    o.nullStr = "\\N"
+    o.pgEndMarker = true
+    return o
+}
+
+// ---------------------------------------------------------------- errors
+
+pub type Error = value record {
+    pub line: int
+    pub col: int
+    pub msg: str
+}
+
+pub fn (e: &Error) toStr(): str {
+    if e.line > 0 && e.col > 0 {
+        return "csv: line " + intToStr(e.line) + ", col " + intToStr(e.col) + ": " + e.msg
+    }
+    if e.line > 0 {
+        return "csv: line " + intToStr(e.line) + ": " + e.msg
+    }
+    return "csv: " + e.msg
+}
+
+fn errAt(line: int, col: int, msg: &str): Error {
+    return Error{line: line, col: col, msg: msg.clone()}
+}
+
+fn ioToErr(line: int, e: &io.IoError): Error {
+    return Error{line: line, col: 0, msg: e.toStr()}
+}
+
+// ---------------------------------------------------------------- cells, rows, tables
+
+// One parsed or outgoing field. `isNull` distinguishes SQL NULL from `""`
+// (e.g. unquoted empty vs quoted `""` in PostgreSQL CSV, or `\N` vs empty in TEXT).
+pub type Cell = value record {
+    pub value: str
+    pub isNull: bool
+    pub quoted: bool
+}
+
+pub fn cell(s: &str): Cell {
+    return Cell{value: s.clone(), isNull: false, quoted: false}
+}
+
+pub fn nullCell(): Cell {
+    return Cell{value: "", isNull: true, quoted: false}
+}
+
+pub type Row = record {
+    pub cells: []Cell
+    pub line: int
+}
+
+pub fn (r: &Row) len(): int { return len(r.cells) }
+
+pub fn (r: &Row) get(i: int): &str {
+    if i < 0 || i >= len(r.cells) { return "" }
+    return &r.cells[i].value
+}
+
+pub fn (r: &Row) cellAt(i: int): Option[&Cell] {
+    if i < 0 || i >= len(r.cells) { return None }
+    return Some(&r.cells[i])
+}
+
+pub fn (r: &Row) isNull(i: int): bool {
+    if i < 0 || i >= len(r.cells) { return true }
+    return r.cells[i].isNull
+}
+
+pub fn (r: &Row) values(): []str {
+    var out: []str = []
+    for i in 0..len(r.cells) {
+        append(mut &out, r.cells[i].value.clone())
+    }
+    return out
+}
+
+fn parseBoolText(s: &str, pgBools: bool): Option[bool] {
+    let t = strings.trim(s)
+    if t == "true" || t == "TRUE" || t == "True" || t == "1" { return Some(true) }
+    if t == "false" || t == "FALSE" || t == "False" || t == "0" { return Some(false) }
+    if pgBools {
+        if t == "t" || t == "T" || t == "yes" || t == "YES" || t == "y" || t == "on" { return Some(true) }
+        if t == "f" || t == "F" || t == "no" || t == "NO" || t == "n" || t == "off" { return Some(false) }
+    }
+    return None
+}
+
+pub fn (r: &Row) intAt(i: int): Result[int, Error] {
+    if i < 0 || i >= len(r.cells) { return Err(errAt(r.line, 0, "column index out of range")) }
+    if r.cells[i].isNull { return Err(errAt(r.line, 0, "column " + intToStr(i) + " is NULL")) }
+    let s = strings.trim(&r.cells[i].value)
+    match strings.parseInt(&s) {
+        Ok(n) { return Ok(n) }
+        Err(_) { return Err(errAt(r.line, 0, "invalid int in column " + intToStr(i) + ": '" + s + "'")) }
+    }
+}
+
+pub fn (r: &Row) floatAt(i: int): Result[float, Error] {
+    if i < 0 || i >= len(r.cells) { return Err(errAt(r.line, 0, "column index out of range")) }
+    if r.cells[i].isNull { return Err(errAt(r.line, 0, "column " + intToStr(i) + " is NULL")) }
+    let s = strings.trim(&r.cells[i].value)
+    match math.parse(&s) {
+        Some(x) { return Ok(x) }
+        None { return Err(errAt(r.line, 0, "invalid float in column " + intToStr(i) + ": '" + s + "'")) }
+    }
+}
+
+pub fn (r: &Row) decimalAt(i: int): Result[decimal.Decimal, Error] {
+    if i < 0 || i >= len(r.cells) { return Err(errAt(r.line, 0, "column index out of range")) }
+    if r.cells[i].isNull { return Err(errAt(r.line, 0, "column " + intToStr(i) + " is NULL")) }
+    let s = strings.trim(&r.cells[i].value)
+    match decimal.Decimal.parse(&s) {
+        Ok(d) { return Ok(d) }
+        Err(e) { return Err(errAt(r.line, 0, "invalid decimal in column " + intToStr(i) + ": " + e.toStr())) }
+    }
+}
+
+pub fn (r: &Row) boolAt(i: int): Result[bool, Error] {
+    if i < 0 || i >= len(r.cells) { return Err(errAt(r.line, 0, "column index out of range")) }
+    if r.cells[i].isNull { return Err(errAt(r.line, 0, "column " + intToStr(i) + " is NULL")) }
+    match parseBoolText(&r.cells[i].value, true) {
+        Some(b) { return Ok(b) }
+        None { return Err(errAt(r.line, 0, "invalid bool in column " + intToStr(i) + ": '" + r.cells[i].value + "'")) }
+    }
+}
+
+pub fn (r: &Row) optStrAt(i: int): Option[&str] {
+    if i < 0 || i >= len(r.cells) || r.cells[i].isNull { return None }
+    return Some(&r.cells[i].value)
+}
+
+pub fn (r: &Row) optIntAt(i: int): Result[Option[int], Error] {
+    if i < 0 || i >= len(r.cells) || r.cells[i].isNull { return Ok(None) }
+    if !r.cells[i].quoted && len(strings.trim(&r.cells[i].value)) == 0 { return Ok(None) }
+    return Ok(Some(try r.intAt(i)))
+}
+
+pub fn (r: &Row) optDecimalAt(i: int): Result[Option[decimal.Decimal], Error] {
+    if i < 0 || i >= len(r.cells) || r.cells[i].isNull { return Ok(None) }
+    if !r.cells[i].quoted && len(strings.trim(&r.cells[i].value)) == 0 { return Ok(None) }
+    return Ok(Some(try r.decimalAt(i)))
+}
+
+pub fn (r: &Row) optBoolAt(i: int): Result[Option[bool], Error] {
+    if i < 0 || i >= len(r.cells) || r.cells[i].isNull { return Ok(None) }
+    if !r.cells[i].quoted && len(strings.trim(&r.cells[i].value)) == 0 { return Ok(None) }
+    return Ok(Some(try r.boolAt(i)))
+}
+
+pub type Table = record {
+    pub headers: []str
+    pub rows: []Row
+    index: Map[str, int]
+}
+
+pub fn (t: &Table) col(name: &str): Option[int] {
+    return t.index.get(name)
+}
+
+pub fn (t: &Table) get(row: int, colName: &str): Option[&str] {
+    if row < 0 || row >= len(t.rows) { return None }
+    match t.index.get(colName) {
+        Some(ci) { return t.rows[row].optStrAt(ci) }
+        None { return None }
+    }
+}
+
+pub fn (t: &Table) isNull(row: int, colName: &str): bool {
+    if row < 0 || row >= len(t.rows) { return true }
+    match t.index.get(colName) {
+        Some(ci) { return t.rows[row].isNull(ci) }
+        None { return true }
+    }
+}
+
+// ---------------------------------------------------------------- streaming Reader
+
+pub type Reader = record {
+    src: box io.Read
+    opts: Options
+    buf: []byte
+    pos: int
+    end: int
+    eof: bool
+    started: bool
+    done: bool
+    line: int
+    expectedFields: int
+    hdrs: []str
+    hasHdrs: bool
+}
+
+pub fn reader(src: box io.Read): Reader {
+    return readerWith(src, rfc4180())
+}
+
+pub fn readerWith(src: box io.Read, opts: Options): Reader {
+    return Reader{
+        src: src,
+        opts: opts,
+        buf: array(IO_BUF_SIZE, byte(0)),
+        pos: 0,
+        end: 0,
+        eof: false,
+        started: false,
+        done: false,
+        line: 1,
+        expectedFields: -1,
+        hdrs: [],
+        hasHdrs: false
+    }
+}
+
+pub fn fromStr(s: &str): Reader {
+    return reader(io.strReader(s))
+}
+
+pub fn fromStrWith(s: &str, opts: Options): Reader {
+    return readerWith(io.strReader(s), opts)
+}
+
+// The active delimiter (useful after Excel `sep=<c>` auto-detection).
+pub fn (r: &Reader) delimiter(): byte { return r.opts.delimiter }
+
+pub fn (r: &Reader) headers(): &[]str { return &r.hdrs }
+
+fn (r: mut &Reader) ensure(want: int): Result[int, Error] {
+    let avail = r.end - r.pos
+    if avail >= want || r.eof { return Ok(avail) }
+    if r.pos > 0 {
+        let rem = r.end - r.pos
+        for i in 0..rem { r.buf[i] = r.buf[r.pos + i] }
+        r.pos = 0
+        r.end = rem
+    }
+    while r.end - r.pos < want && !r.eof && r.end < len(r.buf) {
+        let k = match r.src.read(mut &r.buf[r.end..len(r.buf)]) {
+            Ok(n) { n }
+            Err(e) { return Err(ioToErr(r.line, &e)) }
+        }
+        if k == 0 {
+            r.eof = true
+            break
+        }
+        r.end += k
+    }
+    return Ok(r.end - r.pos)
+}
+
+fn (r: mut &Reader) peekByte(): Result[Option[byte], Error] {
+    if r.pos < r.end { return Ok(Some(r.buf[r.pos])) }
+    let n = try r.ensure(1)
+    if n == 0 { return Ok(None) }
+    return Ok(Some(r.buf[r.pos]))
+}
+
+fn (r: mut &Reader) takeByte(): Result[Option[byte], Error] {
+    if r.pos < r.end {
+        let b = r.buf[r.pos]
+        r.pos += 1
+        return Ok(Some(b))
+    }
+    let n = try r.ensure(1)
+    if n == 0 { return Ok(None) }
+    let b = r.buf[r.pos]
+    r.pos += 1
+    return Ok(Some(b))
+}
+
+// Consumes \r\n, \n, or bare \r; returns true if a line break was consumed.
+fn (r: mut &Reader) consumeNewline(): Result[bool, Error] {
+    match try r.peekByte() {
+        Some(b) {
+            if b == '\n' {
+                r.pos += 1
+                r.line += 1
+                return Ok(true)
+            }
+            if b == '\r' {
+                r.pos += 1
+                match try r.peekByte() {
+                    Some(b2) { if b2 == '\n' { r.pos += 1 } }
+                    None {}
+                }
+                r.line += 1
+                return Ok(true)
+            }
+            return Ok(false)
+        }
+        None { return Ok(false) }
+    }
+}
+
+fn (r: mut &Reader) startIfNeeded(): Result[Unit, Error] {
+    if r.started { return Ok(Unit{}) }
+    r.started = true
+    if r.opts.stripBom {
+        let n = try r.ensure(3)
+        if n >= 3 && r.buf[r.pos] == byte(0xEF) && r.buf[r.pos + 1] == byte(0xBB) && r.buf[r.pos + 2] == byte(0xBF) {
+            r.pos += 3
+        }
+    }
+    if r.opts.excelSepDirective {
+        let n = try r.ensure(7)
+        if n >= 5 {
+            let b0 = r.buf[r.pos]
+            let b1 = r.buf[r.pos + 1]
+            let b2 = r.buf[r.pos + 2]
+            let b3 = r.buf[r.pos + 3]
+            let isSep = (b0 == 's' || b0 == 'S') && (b1 == 'e' || b1 == 'E') && (b2 == 'p' || b2 == 'P') && b3 == '='
+            if isSep {
+                let d = r.buf[r.pos + 4]
+                let validDelim = d != '\r' && d != '\n'
+                let atEnd = n == 5 || r.buf[r.pos + 5] == '\n' || r.buf[r.pos + 5] == '\r'
+                if validDelim && atEnd {
+                    r.opts.delimiter = d
+                    r.pos += 5
+                    let _nl = try r.consumeNewline()
+                }
+            }
+        }
+    }
+    return Ok(Unit{})
+}
+
+fn hexVal(b: byte): int {
+    if b >= '0' && b <= '9' { return int(b - '0') }
+    if b >= 'a' && b <= 'f' { return 10 + int(b - 'a') }
+    if b >= 'A' && b <= 'F' { return 10 + int(b - 'A') }
+    return -1
+}
+
+fn decodePgTextField(raw: &[byte]): str {
+    var hasSlash = false
+    for i in 0..len(raw) {
+        if raw[i] == '\\' {
+            hasSlash = true
+            break
+        }
+    }
+    if !hasSlash { return strFromBytes(raw) }
+    var out: []byte = []
+    var i = 0
+    let n = len(raw)
+    while i < n {
+        let b = raw[i]
+        if b != '\\' || i + 1 >= n {
+            append(mut &out, b)
+            i += 1
+            continue
+        }
+        i += 1
+        let c = raw[i]
+        if c == 'b' { append(mut &out, byte(0x08)); i += 1 }
+        else if c == 'f' { append(mut &out, byte(0x0C)); i += 1 }
+        else if c == 'n' { append(mut &out, '\n'); i += 1 }
+        else if c == 'r' { append(mut &out, '\r'); i += 1 }
+        else if c == 't' { append(mut &out, '\t'); i += 1 }
+        else if c == 'v' { append(mut &out, byte(0x0B)); i += 1 }
+        else if c == '\\' { append(mut &out, '\\'); i += 1 }
+        else if c == 'x' {
+            i += 1
+            if i < n && hexVal(raw[i]) >= 0 {
+                var v = hexVal(raw[i])
+                i += 1
+                if i < n && hexVal(raw[i]) >= 0 {
+                    v = v * 16 + hexVal(raw[i])
+                    i += 1
+                }
+                append(mut &out, byte(v))
+            } else {
+                append(mut &out, 'x')
+            }
+        } else if c >= '0' && c <= '7' {
+            var v = int(c - '0')
+            i += 1
+            var digits = 1
+            while digits < 3 && i < n && raw[i] >= '0' && raw[i] <= '7' {
+                v = v * 8 + int(raw[i] - '0')
+                i += 1
+                digits += 1
+            }
+            append(mut &out, byte(v & 255))
+        } else {
+            append(mut &out, c)
+            i += 1
+        }
+    }
+    return strFromBytes(&out)
+}
+
+fn (r: mut &Reader) nextPgTextRow(): Result[Option[Row], Error] {
+    let delim = r.opts.delimiter
+    let maxField = r.opts.maxFieldBytes
+    let maxCols = r.opts.maxFields
+    while true {
+        match try r.peekByte() {
+            None { r.done = true; return Ok(None) }
+            Some(_) {}
+        }
+        let rowLine = r.line
+        var rawLine: []byte = []
+        while true {
+            match try r.takeByte() {
+                None { break }
+                Some(b) {
+                    if b == '\n' {
+                        r.line += 1
+                        break
+                    }
+                    if b == '\r' {
+                        match try r.peekByte() {
+                            Some(b2) { if b2 == '\n' { r.pos += 1 } }
+                            None {}
+                        }
+                        r.line += 1
+                        break
+                    }
+                    if maxField > 0 && len(rawLine) >= maxField * 4 {
+                        return Err(errAt(rowLine, len(rawLine) + 1, "line exceeds maximum length"))
+                    }
+                    append(mut &rawLine, b)
+                }
+            }
+        }
+        if r.opts.pgEndMarker && len(rawLine) == 2 && rawLine[0] == '\\' && rawLine[1] == '.' {
+            r.done = true
+            return Ok(None)
+        }
+        if len(rawLine) == 0 && r.opts.skipEmptyLines { continue }
+        var cells: []Cell = []
+        var start = 0
+        var i = 0
+        let n = len(rawLine)
+        while i <= n {
+            if i == n || rawLine[i] == delim {
+                if maxCols > 0 && len(cells) >= maxCols {
+                    return Err(errAt(rowLine, i + 1, "row exceeds maxFields limit"))
+                }
+                let slice = &rawLine[start..i]
+                if maxField > 0 && len(slice) > maxField {
+                    return Err(errAt(rowLine, start + 1, "field exceeds maxFieldBytes limit"))
+                }
+                let rawStr = strFromBytes(slice)
+                if r.opts.hasNull && rawStr == r.opts.nullStr {
+                    append(mut &cells, nullCell())
+                } else {
+                    append(mut &cells, Cell{value: decodePgTextField(slice), isNull: false, quoted: false})
+                }
+                start = i + 1
+                i += 1
+            } else if rawLine[i] == '\\' && i + 1 < n {
+                // Skip escaped byte so a backslash-escaped custom delimiter does not split.
+                i += 2
+            } else {
+                i += 1
+            }
+        }
+        if r.opts.strictFields {
+            if r.expectedFields < 0 {
+                r.expectedFields = len(cells)
+            } else if len(cells) != r.expectedFields {
+                return Err(errAt(rowLine, 1, "wrong number of fields: expected " + intToStr(r.expectedFields) +
+                    ", got " + intToStr(len(cells))))
+            }
+        }
+        return Ok(Some(Row{cells: cells, line: rowLine}))
+    }
+    return Ok(None)
+}
+
+fn (r: mut &Reader) nextCsvRow(): Result[Option[Row], Error] {
+    let delim = r.opts.delimiter
+    let quote = r.opts.quote
+    let esc = r.opts.escape
+    let noQ = r.opts.noQuotes
+    let lazyQ = r.opts.lazyQuotes
+    let trimSp = r.opts.trimSpace
+    let maxField = r.opts.maxFieldBytes
+    let maxCols = r.opts.maxFields
+
+    while true {
+        let first = try r.peekByte()
+        match first {
+            None { r.done = true; return Ok(None) }
+            Some(b) {
+                if b == '\n' || b == '\r' {
+                    let rowLine = r.line
+                    let _nl = try r.consumeNewline()
+                    if r.opts.skipEmptyLines { continue }
+                    let isN = r.opts.hasNull && len(r.opts.nullStr) == 0
+                    let c0 = Cell{value: "", isNull: isN, quoted: false}
+                    if r.opts.strictFields {
+                        if r.expectedFields < 0 {
+                            r.expectedFields = 1
+                        } else if r.expectedFields != 1 {
+                            return Err(errAt(rowLine, 1, "wrong number of fields: expected " +
+                                intToStr(r.expectedFields) + ", got 1"))
+                        }
+                    }
+                    return Ok(Some(Row{cells: [c0], line: rowLine}))
+                }
+            }
+        }
+
+        let rowLine = r.line
+        var col = 1
+        var cells: []Cell = []
+        var fieldBuf: []byte = []
+
+        while true {
+            if maxCols > 0 && len(cells) >= maxCols {
+                return Err(errAt(rowLine, col, "row exceeds maxFields limit"))
+            }
+            if trimSp {
+                while true {
+                    match try r.peekByte() {
+                        Some(sp) {
+                            if sp == ' ' || (sp == '\t' && delim != '\t') {
+                                r.pos += 1
+                                col += 1
+                            } else {
+                                break
+                            }
+                        }
+                        None { break }
+                    }
+                }
+            }
+
+            let isQuoted = match try r.peekByte() {
+                Some(b) { !noQ && b == quote }
+                None { false }
+            }
+
+            if isQuoted {
+                let quoteCol = col
+                r.pos += 1
+                col += 1
+                fieldBuf = []
+                while true {
+                    let mb = try r.takeByte()
+                    let b = match mb {
+                        Some(x) { x }
+                        None { return Err(errAt(rowLine, quoteCol, "unterminated quoted field")) }
+                    }
+                    col += 1
+                    if esc == quote {
+                        if b == quote {
+                            match try r.peekByte() {
+                                Some(nb) {
+                                    if nb == quote {
+                                        r.pos += 1
+                                        col += 1
+                                        if maxField > 0 && len(fieldBuf) >= maxField {
+                                            return Err(errAt(r.line, col, "field exceeds maxFieldBytes limit"))
+                                        }
+                                        append(mut &fieldBuf, quote)
+                                    } else {
+                                        break
+                                    }
+                                }
+                                None { break }
+                            }
+                        } else {
+                            if b == '\n' {
+                                r.line += 1
+                                col = 1
+                            } else if b == '\r' {
+                                match try r.peekByte() {
+                                    Some(nb) { if nb != '\n' { r.line += 1; col = 1 } }
+                                    None { r.line += 1; col = 1 }
+                                }
+                            }
+                            if maxField > 0 && len(fieldBuf) >= maxField {
+                                return Err(errAt(r.line, col, "field exceeds maxFieldBytes limit"))
+                            }
+                            append(mut &fieldBuf, b)
+                        }
+                    } else {
+                        if b == esc {
+                            let mb2 = try r.takeByte()
+                            let b2 = match mb2 {
+                                Some(x) { x }
+                                None { return Err(errAt(rowLine, quoteCol, "unterminated quoted field")) }
+                            }
+                            col += 1
+                            if b2 == '\n' { r.line += 1; col = 1 }
+                            if maxField > 0 && len(fieldBuf) >= maxField {
+                                return Err(errAt(r.line, col, "field exceeds maxFieldBytes limit"))
+                            }
+                            append(mut &fieldBuf, b2)
+                        } else if b == quote {
+                            break
+                        } else {
+                            if b == '\n' {
+                                r.line += 1
+                                col = 1
+                            } else if b == '\r' {
+                                match try r.peekByte() {
+                                    Some(nb) { if nb != '\n' { r.line += 1; col = 1 } }
+                                    None { r.line += 1; col = 1 }
+                                }
+                            }
+                            if maxField > 0 && len(fieldBuf) >= maxField {
+                                return Err(errAt(r.line, col, "field exceeds maxFieldBytes limit"))
+                            }
+                            append(mut &fieldBuf, b)
+                        }
+                    }
+                }
+                if trimSp {
+                    while true {
+                        match try r.peekByte() {
+                            Some(sp) {
+                                if sp == ' ' || (sp == '\t' && delim != '\t') {
+                                    r.pos += 1
+                                    col += 1
+                                } else {
+                                    break
+                                }
+                            }
+                            None { break }
+                        }
+                    }
+                }
+                // After closing quote: must see delimiter, newline, or EOF (unless lazyQuotes).
+                var endRow = false
+                match try r.peekByte() {
+                    None { endRow = true }
+                    Some(nb) {
+                        if nb == delim {
+                            r.pos += 1
+                            col += 1
+                        } else if nb == '\n' || nb == '\r' {
+                            let _nl = try r.consumeNewline()
+                            endRow = true
+                        } else if lazyQ {
+                            while true {
+                                match try r.peekByte() {
+                                    None { endRow = true; break }
+                                    Some(lb) {
+                                        if lb == delim { r.pos += 1; col += 1; break }
+                                        if lb == '\n' || lb == '\r' {
+                                            let _nl = try r.consumeNewline()
+                                            endRow = true
+                                            break
+                                        }
+                                        r.pos += 1
+                                        col += 1
+                                        if maxField > 0 && len(fieldBuf) >= maxField {
+                                            return Err(errAt(r.line, col, "field exceeds maxFieldBytes limit"))
+                                        }
+                                        append(mut &fieldBuf, lb)
+                                    }
+                                }
+                            }
+                        } else {
+                            return Err(errAt(r.line, col, "unexpected character after closing quote"))
+                        }
+                    }
+                }
+                append(mut &cells, Cell{value: strFromBytes(&fieldBuf), isNull: false, quoted: true})
+                if endRow { break }
+            } else {
+                // Unquoted field
+                fieldBuf = []
+                var endRow = false
+                while true {
+                    match try r.peekByte() {
+                        None { endRow = true; break }
+                        Some(b) {
+                            if b == delim {
+                                r.pos += 1
+                                col += 1
+                                break
+                            }
+                            if b == '\n' || b == '\r' {
+                                let _nl = try r.consumeNewline()
+                                endRow = true
+                                break
+                            }
+                            if !noQ && !lazyQ && b == quote {
+                                return Err(errAt(r.line, col, "bare quote in unquoted field"))
+                            }
+                            r.pos += 1
+                            col += 1
+                            if maxField > 0 && len(fieldBuf) >= maxField {
+                                return Err(errAt(r.line, col, "field exceeds maxFieldBytes limit"))
+                            }
+                            append(mut &fieldBuf, b)
+                        }
+                    }
+                }
+                if trimSp {
+                    while len(fieldBuf) > 0 {
+                        let last = fieldBuf[len(fieldBuf) - 1]
+                        if last == ' ' || (last == '\t' && delim != '\t') {
+                            let _p = pop(mut &fieldBuf)
+                        } else {
+                            break
+                        }
+                    }
+                }
+                let val = strFromBytes(&fieldBuf)
+                let isN = r.opts.hasNull && val == r.opts.nullStr
+                append(mut &cells, Cell{value: if isN { "" } else { val }, isNull: isN, quoted: false})
+                if endRow { break }
+            }
+        }
+
+        if r.opts.strictFields {
+            if r.expectedFields < 0 {
+                r.expectedFields = len(cells)
+            } else if len(cells) != r.expectedFields {
+                return Err(errAt(rowLine, 1, "wrong number of fields: expected " + intToStr(r.expectedFields) +
+                    ", got " + intToStr(len(cells))))
+            }
+        }
+        return Ok(Some(Row{cells: cells, line: rowLine}))
+    }
+    return Ok(None)
+}
+
+// Read the next row with full Cell metadata (value, isNull, quoted), or None at EOF.
+pub fn (r: mut &Reader) nextRow(): Result[Option[Row], Error] {
+    if r.done { return Ok(None) }
+    try r.startIfNeeded()
+    match r.opts.format {
+        Format.Csv { return r.nextCsvRow() }
+        Format.PgText { return r.nextPgTextRow() }
+    }
+}
+
+// Read the next row as plain strings, or None at EOF.
+pub fn (r: mut &Reader) next(): Result[Option[[]str], Error] {
+    match try r.nextRow() {
+        Some(row) { return Ok(Some(row.values())) }
+        None { return Ok(None) }
+    }
+}
+
+// Read the header row and record its column names on the reader.
+pub fn (r: mut &Reader) readHeader(): Result[Option[[]str], Error] {
+    match try r.nextRow() {
+        Some(row) {
+            r.hdrs = row.values()
+            r.hasHdrs = true
+            var copy: []str = []
+            for h in r.hdrs { append(mut &copy, h.clone()) }
+            return Ok(Some(copy))
+        }
+        None {
+            r.hdrs = []
+            r.hasHdrs = true
+            return Ok(None)
+        }
+    }
+}
+
+// Read all remaining rows.
+pub fn (r: mut &Reader) readAll(): Result[[]Row, Error] {
+    var out: []Row = []
+    while true {
+        match try r.nextRow() {
+            Some(row) { append(mut &out, row) }
+            None { return Ok(out) }
+        }
+    }
+    return Ok(out)
+}
+
+// Read a header row (if not already read) and all remaining rows into a Table.
+pub fn (r: mut &Reader) readTable(): Result[Table, Error] {
+    if !r.hasHdrs {
+        let _h = try r.readHeader()
+    }
+    var hdrCopy: []str = []
+    var idx: Map[str, int] = newMap()
+    for i in 0..len(r.hdrs) {
+        let name = r.hdrs[i].clone()
+        if !idx.has(&name) { idx.put(name.clone(), i) }
+        append(mut &hdrCopy, name)
+    }
+    let rows = try r.readAll()
+    return Ok(Table{headers: hdrCopy, rows: rows, index: idx})
+}
+
+// ---------------------------------------------------------------- typed struct decoding
+
+fn isIntText(s: &str): bool {
+    if len(s) == 0 { return false }
+    var i = 0
+    if s[0] == '-' {
+        if len(s) == 1 { return false }
+        i = 1
+    }
+    // Preserve leading-zero strings like "02134" as strings unless literally "0" or "-0".
+    if len(s) - i > 1 && s[i] == '0' { return false }
+    while i < len(s) {
+        if s[i] < '0' || s[i] > '9' { return false }
+        i += 1
+    }
+    return true
+}
+
+fn isNumberText(s: &str): bool {
+    if len(s) == 0 { return false }
+    var i = 0
+    if s[0] == '-' || s[0] == '+' {
+        if len(s) == 1 { return false }
+        i = 1
+    }
+    var hasDot = false
+    var hasExp = false
+    var digits = 0
+    while i < len(s) {
+        let b = s[i]
+        if b >= '0' && b <= '9' {
+            digits += 1
+        } else if b == '.' && !hasDot && !hasExp {
+            hasDot = true
+        } else if (b == 'e' || b == 'E') && !hasExp && digits > 0 {
+            hasExp = true
+            if i + 1 < len(s) && (s[i + 1] == '+' || s[i + 1] == '-') { i += 1 }
+            digits = 0
+        } else {
+            return false
+        }
+        i += 1
+    }
+    return digits > 0 && (hasDot || hasExp)
+}
+
+fn cellToInitialData(c: &Cell, pgBools: bool): Data {
+    if c.isNull { return Data.Null }
+    if c.quoted { return Data.Str(c.value.clone()) }
+    let s = &c.value
+    if len(s) == 0 { return Data.Str("") }
+    match parseBoolText(s, pgBools) {
+        Some(b) {
+            // Keep bare "0" / "1" as Int initially so int columns decode directly.
+            if s != "0" && s != "1" { return Data.Bool(b) }
+        }
+        None {}
+    }
+    if isIntText(s) {
+        match strings.parseInt(s) {
+            Ok(n) { return Data.Int(n) }
+            Err(_) {
+                match decimal.Decimal.parse(s) {
+                    Ok(d) { return Data.Dec(d) }
+                    Err(_) { return Data.Str(s.clone()) }
+                }
+            }
+        }
+    }
+    if isNumberText(s) {
+        match decimal.Decimal.parse(s) {
+            Ok(d) { return Data.Dec(d) }
+            Err(_) {
+                match math.parse(s) {
+                    Some(f) { return Data.Float(f) }
+                    None { return Data.Str(s.clone()) }
+                }
+            }
+        }
+    }
+    return Data.Str(s.clone())
+}
+
+fn coerceCellForError(c: &Cell, msg: &str, pgBools: bool): Option[Data] {
+    let raw = &c.value
+    if strings.startsWith(msg, "expected string") {
+        if c.isNull { return None }
+        return Some(Data.Str(raw.clone()))
+    }
+    if strings.startsWith(msg, "expected bool") {
+        if !c.quoted && len(strings.trim(raw)) == 0 { return Some(Data.Null) }
+        match parseBoolText(raw, pgBools || true) {
+            Some(b) { return Some(Data.Bool(b)) }
+            None { return None }
+        }
+    }
+    if strings.startsWith(msg, "expected int") || strings.startsWith(msg, "expected u64") {
+        let t = strings.trim(raw)
+        if !c.quoted && len(t) == 0 { return Some(Data.Null) }
+        match strings.parseInt(&t) {
+            Ok(n) { return Some(Data.Int(n)) }
+            Err(_) { return None }
+        }
+    }
+    if strings.startsWith(msg, "expected float") {
+        let t = strings.trim(raw)
+        if !c.quoted && len(t) == 0 { return Some(Data.Null) }
+        match math.parse(&t) {
+            Some(x) { return Some(Data.Float(x)) }
+            None { return None }
+        }
+    }
+    if strings.startsWith(msg, "expected decimal") {
+        let t = strings.trim(raw)
+        if !c.quoted && len(t) == 0 { return Some(Data.Null) }
+        match decimal.Decimal.parse(&t) {
+            Ok(d) { return Some(Data.Dec(d)) }
+            Err(_) { return None }
+        }
+    }
+    return None
+}
+
+fn decodeRowAs[T: Deserialize](hdrs: &[]str, row: &Row, pgBools: bool): Result[T, Error] {
+    var fields: []DataField = []
+    var cellIndices: []int = []
+    let n = if len(hdrs) < len(row.cells) { len(hdrs) } else { len(row.cells) }
+    for i in 0..n {
+        append(mut &fields, DataField{key: hdrs[i].clone(), val: cellToInitialData(&row.cells[i], pgBools)})
+        append(mut &cellIndices, i)
+    }
+    var attempts = 0
+    let maxAttempts = n + 1
+    while attempts <= maxAttempts {
+        let obj = Data.Obj(fields.clone())
+        match T.fromData(&obj) {
+            Ok(v) { return Ok(v) }
+            Err(e) {
+                var retried = false
+                if len(e.path) > 0 && attempts < maxAttempts {
+                    for k in 0..len(fields) {
+                        if fields[k].key == e.path {
+                            let ci = cellIndices[k]
+                            match coerceCellForError(&row.cells[ci], &e.msg, pgBools) {
+                                Some(nd) {
+                                    fields[k].val = nd
+                                    retried = true
+                                }
+                                None {}
+                            }
+                            break
+                        }
+                    }
+                }
+                if !retried {
+                    return Err(errAt(row.line, 0, &(e.toStr())))
+                }
+            }
+        }
+        attempts += 1
+    }
+    return Err(errAt(row.line, 0, "failed to decode row"))
+}
+
+// Stream the next row decoded into a Deserialize struct T (reads header automatically on first call).
+pub fn (r: mut &Reader) nextRecord[T: Deserialize](): Result[Option[T], Error] {
+    if !r.hasHdrs {
+        match try r.readHeader() {
+            Some(_) {}
+            None { return Ok(None) }
+        }
+    }
+    match try r.nextRow() {
+        Some(row) {
+            let v = try decodeRowAs[T](&r.hdrs, &row, r.opts.pgBooleans)
+            return Ok(Some(v))
+        }
+        None { return Ok(None) }
+    }
+}
+
+// ---------------------------------------------------------------- streaming Writer
+
+pub type Writer = record {
+    dst: box io.Write
+    opts: Options
+    started: bool
+    wroteHeader: bool
+    memOnly: bool
+    outBuf: []byte
+}
+
+pub fn writer(dst: box io.Write): Writer {
+    return writerWith(dst, rfc4180())
+}
+
+pub fn writerWith(dst: box io.Write, opts: Options): Writer {
+    return Writer{dst: dst, opts: opts, started: false, wroteHeader: false, memOnly: false, outBuf: []}
+}
+
+fn memWriter(opts: Options): Writer {
+    return Writer{dst: io.bytesWriter(), opts: opts, started: false, wroteHeader: false, memOnly: true, outBuf: []}
+}
+
+fn (w: mut &Writer) putByte(b: byte) {
+    append(mut &w.outBuf, b)
+}
+
+fn (w: mut &Writer) putStr(s: &str) {
+    for i in 0..len(s) { append(mut &w.outBuf, s[i]) }
+}
+
+fn (w: mut &Writer) putEol() {
+    if w.opts.crlf {
+        w.putByte('\r')
+        w.putByte('\n')
+    } else {
+        w.putByte('\n')
+    }
+}
+
+fn (w: mut &Writer) flushBufIfLarge(): Result[Unit, Error] {
+    if w.memOnly || len(w.outBuf) < IO_BUF_SIZE { return Ok(Unit{}) }
+    return w.flushBuf()
+}
+
+fn (w: mut &Writer) flushBuf(): Result[Unit, Error] {
+    if len(w.outBuf) == 0 { return Ok(Unit{}) }
+    let data = replace(mut &w.outBuf, [])
+    match io.writeAll(mut &w.dst, &data) {
+        Ok(_) { return Ok(Unit{}) }
+        Err(e) { return Err(ioToErr(0, &e)) }
+    }
+}
+
+fn (w: mut &Writer) writePrologueIfNeeded() {
+    if w.started { return }
+    w.started = true
+    if w.opts.writeBom {
+        w.putByte(byte(0xEF))
+        w.putByte(byte(0xBB))
+        w.putByte(byte(0xBF))
+    }
+    if w.opts.writeSepDirective {
+        w.putStr("sep=")
+        w.putByte(w.opts.delimiter)
+        w.putEol()
+    }
+}
+
+fn isPureSignedNumber(s: &str): bool {
+    if len(s) < 2 || s[0] != '-' { return false }
+    var dot = false
+    var digits = 0
+    for i in 1..len(s) {
+        let b = s[i]
+        if b >= '0' && b <= '9' {
+            digits += 1
+        } else if b == '.' && !dot {
+            dot = true
+        } else {
+            return false
+        }
+    }
+    return digits > 0
+}
+
+fn needsFormulaGuard(s: &str): bool {
+    if len(s) == 0 { return false }
+    let b = s[0]
+    if b == '=' || b == '+' || b == '@' || b == '\t' || b == '\r' { return true }
+    if b == '-' { return !isPureSignedNumber(s) }
+    return false
+}
+
+fn (w: mut &Writer) writeCsvCell(c: &Cell) {
+    if c.isNull {
+        let ns = w.opts.nullStr.clone()
+        w.putStr(&ns)
+        return
+    }
+    let val = if w.opts.guardFormulas && needsFormulaGuard(&c.value) {
+        "'" + c.value
+    } else {
+        c.value.clone()
+    }
+    let delim = w.opts.delimiter
+    let quote = w.opts.quote
+    let esc = w.opts.escape
+    var needQ = w.opts.forceQuote || (w.opts.hasNull && val == w.opts.nullStr)
+    if !needQ && !w.opts.noQuotes {
+        if w.opts.trimSpace && len(val) > 0 && (val[0] == ' ' || val[len(val) - 1] == ' ') {
+            needQ = true
+        }
+        if !needQ {
+            for i in 0..len(val) {
+                let b = val[i]
+                if b == delim || b == quote || b == '\r' || b == '\n' || (esc != quote && b == esc) {
+                    needQ = true
+                    break
+                }
+            }
+        }
+    }
+    if !w.opts.noQuotes && needQ {
+        w.putByte(quote)
+        for i in 0..len(val) {
+            let b = val[i]
+            if b == quote {
+                w.putByte(esc)
+                w.putByte(quote)
+            } else if esc != quote && b == esc {
+                w.putByte(esc)
+                w.putByte(esc)
+            } else {
+                w.putByte(b)
+            }
+        }
+        w.putByte(quote)
+    } else {
+        w.putStr(&val)
+    }
+}
+
+fn (w: mut &Writer) writePgTextCell(c: &Cell) {
+    if c.isNull {
+        let ns = w.opts.nullStr.clone()
+        w.putStr(&ns)
+        return
+    }
+    let delim = w.opts.delimiter
+    let s = &c.value
+    for i in 0..len(s) {
+        let b = s[i]
+        if b == '\\' { w.putByte('\\'); w.putByte('\\') }
+        else if b == '\n' { w.putByte('\\'); w.putByte('n') }
+        else if b == '\r' { w.putByte('\\'); w.putByte('r') }
+        else if b == '\t' { w.putByte('\\'); w.putByte('t') }
+        else if b == byte(0x08) { w.putByte('\\'); w.putByte('b') }
+        else if b == byte(0x0C) { w.putByte('\\'); w.putByte('f') }
+        else if b == byte(0x0B) { w.putByte('\\'); w.putByte('v') }
+        else if b == delim { w.putByte('\\'); w.putByte(b) }
+        else { w.putByte(b) }
+    }
+}
+
+// Write one row of Cells (preserving NULL vs empty-string distinction).
+pub fn (w: mut &Writer) writeCells(cells: &[Cell]): Result[Unit, Error] {
+    w.writePrologueIfNeeded()
+    let delim = w.opts.delimiter
+    for i in 0..len(cells) {
+        if i > 0 { w.putByte(delim) }
+        match w.opts.format {
+            Format.Csv { w.writeCsvCell(&cells[i]) }
+            Format.PgText { w.writePgTextCell(&cells[i]) }
+        }
+    }
+    w.putEol()
+    return w.flushBufIfLarge()
+}
+
+// Write one row of string fields.
+pub fn (w: mut &Writer) writeRow(fields: &[str]): Result[Unit, Error] {
+    var cells: []Cell = []
+    for i in 0..len(fields) {
+        append(mut &cells, cell(&fields[i]))
+    }
+    return w.writeCells(&cells)
+}
+
+fn dataToCell(d: &Data, opts: &Options): Result[Cell, Error] {
+    match d {
+        Data.Null {
+            if opts.hasNull { return Ok(nullCell()) }
+            return Ok(cell(""))
+        }
+        Data.Bool(b) {
+            if opts.pgBooleans {
+                return Ok(cell(if b { "t" } else { "f" }))
+            }
+            return Ok(cell(if b { "true" } else { "false" }))
+        }
+        Data.Int(n) { return Ok(cell(&(intToStr(n)))) }
+        Data.Uint(u) { return Ok(cell(&(u64ToStr(u)))) }
+        Data.Float(x) { return Ok(cell(&(x.toStr()))) }
+        Data.Dec(x) { return Ok(cell(&(x.toStr()))) }
+        Data.Str(s) { return Ok(cell(s)) }
+        else { return Err(errAt(0, 0, "cannot encode nested " + d.kindName() + " as a flat CSV cell")) }
+    }
+}
+
+// Write a Serialize struct as a row (writes header automatically on the first call if opts.writeHeader is true).
+pub fn (w: mut &Writer) writeRecord[T: Serialize](rec: &T): Result[Unit, Error] {
+    let d = rec.toData()
+    match &d {
+        Data.Obj(fs) {
+            if w.opts.writeHeader && !w.wroteHeader {
+                var hdrs: []str = []
+                for i in 0..len(fs) { append(mut &hdrs, fs[i].key.clone()) }
+                try w.writeRow(&hdrs)
+                w.wroteHeader = true
+            }
+            var cells: []Cell = []
+            for i in 0..len(fs) {
+                append(mut &cells, try dataToCell(&fs[i].val, &w.opts))
+            }
+            return w.writeCells(&cells)
+        }
+        else { return Err(errAt(0, 0, "writeRecord expects a record (object), got " + d.kindName())) }
+    }
+}
+
+// Write the PostgreSQL COPY end-of-data marker `\.` followed by a newline.
+pub fn (w: mut &Writer) writeEndMarker(): Result[Unit, Error] {
+    w.writePrologueIfNeeded()
+    w.putStr("\\.")
+    w.putEol()
+    return w.flushBufIfLarge()
+}
+
+// Flush buffered output to the underlying io.Write.
+pub fn (w: mut &Writer) flush(): Result[Unit, Error] {
+    try w.flushBuf()
+    match w.dst.flush() {
+        Ok(_) { return Ok(Unit{}) }
+        Err(e) { return Err(ioToErr(0, &e)) }
+    }
+}
+
+// ---------------------------------------------------------------- one-shot helpers
+
+pub fn parseWith(s: &str, opts: Options): Result[[][]str, Error] {
+    var r = fromStrWith(s, opts)
+    var out: [][]str = []
+    while true {
+        match try r.next() {
+            Some(row) { append(mut &out, row) }
+            None { return Ok(out) }
+        }
+    }
+    return Ok(out)
+}
+
+pub fn parse(s: &str): Result[[][]str, Error] {
+    return parseWith(s, rfc4180())
+}
+
+pub fn parseTableWith(s: &str, opts: Options): Result[Table, Error] {
+    var r = fromStrWith(s, opts)
+    return r.readTable()
+}
+
+pub fn parseTable(s: &str): Result[Table, Error] {
+    return parseTableWith(s, rfc4180())
+}
+
+pub fn stringifyWith(rows: &[][]str, opts: Options): Result[str, Error] {
+    var w = memWriter(opts)
+    for i in 0..len(rows) {
+        try w.writeRow(&rows[i])
+    }
+    return Ok(strFromBytes(&w.outBuf))
+}
+
+pub fn stringify(rows: &[][]str): Result[str, Error] {
+    return stringifyWith(rows, rfc4180())
+}
+
+// Serialize rows of Cells (preserving NULL vs empty-string distinction) to a string.
+pub fn stringifyCellsWith(rows: &[][]Cell, opts: Options): Result[str, Error] {
+    var w = memWriter(opts)
+    for i in 0..len(rows) {
+        try w.writeCells(&rows[i])
+    }
+    return Ok(strFromBytes(&w.outBuf))
+}
+
+pub fn stringifyCells(rows: &[][]Cell): Result[str, Error] {
+    return stringifyCellsWith(rows, rfc4180())
+}
+
+pub fn decodeWith[T: Deserialize](s: &str, opts: Options): Result[[]T, Error] {
+    var r = fromStrWith(s, opts)
+    var out: []T = []
+    while true {
+        match try r.nextRecord[T]() {
+            Some(rec) { append(mut &out, rec) }
+            None { return Ok(out) }
+        }
+    }
+    return Ok(out)
+}
+
+pub fn decode[T: Deserialize](s: &str): Result[[]T, Error] {
+    return decodeWith[T](s, rfc4180())
+}
+
+pub fn encodeWith[T: Serialize](rows: &[]T, opts: Options): Result[str, Error] {
+    if len(rows) == 0 { return Ok("") }
+    var w = memWriter(opts)
+    for i in 0..len(rows) {
+        try w.writeRecord(&rows[i])
+    }
+    return Ok(strFromBytes(&w.outBuf))
+}
+
+pub fn encode[T: Serialize](rows: &[]T): Result[str, Error] {
+    return encodeWith[T](rows, rfc4180())
+}
