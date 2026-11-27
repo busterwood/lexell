@@ -4154,6 +4154,8 @@ fn (st: &Store) scanLeavesMerged(t: mut &Txn, tree: int, from: &str, to: &str,
 // stored. A replica's base and delta, or the transaction's own writes and
 // cuts, come as synthetic leaves (scanLeavesMerged). Each leaf's whole
 // range is noted as read, even when f stops in it (a wider read is safe).
+const LEAF_BATCH = 64
+
 pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
                                f: &fn(&lexdb_rows.LeafView, int, int): bool): Result[Unit, lexdb_base.DbErr] {
     let view = st.viewOf(t)
@@ -4170,7 +4172,11 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
     var cursor: str = from.clone()
     var more = true
     let noting = t.noting()
+    let hasTo = len(to) > 0
     var ahead = if t.raTree == tree { t.ra } else { AHEAD_MIN }
+    var pslot: []int = withCapacity(8)
+    var pver: []int = withCapacity(8)
+    var pidx: []int = withCapacity(8)
     while more {
         var rseq = 0
         var need = -1
@@ -4187,63 +4193,184 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
                 return
             }
             rseq = if snap { t.snapSeq } else { db.seq }
+            while len(pslot) > 0 { let d0 = pop(mut &pslot) }
+            while len(pver) > 0 { let d1 = pop(mut &pver) }
+            while len(pidx) > 0 { let d2 = pop(mut &pidx) }
+            var root = -1
             if snap {
                 if db.snapGone(t.snap) {
                     append(mut &bad, snapCancelled())
                     return
                 }
-                let root = db.snapRoot(t, tree)
-                if root < 0 {
-                    empty = true
-                    return
-                }
-                let d = db.snapDescend(root, t.snapSeq, &cursor, false)
-                if d.need >= 0 {
-                    need = d.need
-                    if d.par >= 0 { run = db.runAt(&db.snapNode(d.par, d.pver).kids, d.at, ahead) }
-                    return
-                }
-                if d.missing {
-                    append(mut &bad, lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: a node version is missing"))
-                    return
-                }
-                if d.ver == -1 { db.noteLeaf(tree, d.leaf) }
-                let n = db.snapNode(d.leaf, d.ver)
-                let i = n.lower(&cursor)
-                var j = n.count()
-                if len(to) > 0 { j = n.lower(&to) }
-                if j > i {
-                    if noting { seen = n.key(j - 1) }      // (read only to note the read)
-                    let lv = lexdb_page.leafView(&n)
-                    go = f(&lv, i, j)
-                }
-                hasUpper = d.hasFence
-                upper = d.fence                     // (moved: d is not used again)
-                return
+                root = db.snapRoot(t, tree)
+            } else {
+                root = match db.trees.get(&tree) { Some(r) { r } None { -1 } }
             }
-            let d = db.descend(tree, &cursor)
-            if d.need >= 0 {
-                need = d.need
-                if len(d.path) > 0 { run = db.runFor(d.path[len(d.path) - 1], &cursor, need, ahead) }
-                return
-            }
-            if len(d.path) == 0 {
+            if root < 0 {
                 empty = true
                 return
             }
-            let leaf = d.path[len(d.path) - 1]
-            db.noteLeaf(tree, leaf)
-            let n = &db.pool[db.meta[leaf].frame]
-            let i = n.lower(&cursor)
-            var j = n.count()
-            if len(to) > 0 { j = n.lower(&to) }
-            if j > i {
-                if noting { seen = n.key(j - 1) }
-                let lv = lexdb_page.leafView(n)
-                go = f(&lv, i, j)
+            // Initial descent from root to the leaf holding cursor, recording the ancestor stack.
+            var s = root
+            var leafS = -1
+            var leafV = -1
+            var fb = NO_BOUND
+            var par = -1
+            var pvr = -1
+            var pat = -1
+            let w0 = lexdb_page.keyWord(&cursor)
+            while true {
+                var v = -1
+                if snap {
+                    v = db.verOf(s, t.snapSeq)
+                    if v == -2 {
+                        need = s
+                        if par >= 0 { run = db.runAt(&db.snapNode(par, pvr).kids, pat, ahead) }
+                        return
+                    }
+                    if v == -3 {
+                        append(mut &bad, lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: a node version is missing"))
+                        return
+                    }
+                } else {
+                    if !db.meta[s].loaded {
+                        need = s
+                        if par >= 0 { run = db.runAt(&db.pool[db.meta[par].frame].kids, pat, ahead) }
+                        return
+                    }
+                }
+                db.meta[s].ref = true
+                let n = if snap { db.snapNode(s, v) } else { &db.pool[db.meta[s].frame] }
+                if n.leaf {
+                    leafS = s
+                    leafV = v
+                    break
+                }
+                let ci = n.childW(&cursor, w0)
+                if ci < n.count() { fb = Bound{s: s, v: v, i: ci} }
+                append(mut &pslot, s)
+                append(mut &pver, v)
+                append(mut &pidx, ci)
+                par = s
+                pvr = v
+                pat = ci
+                s = n.kids[ci]
             }
-            hasUpper = d.hasUpper
-            upper = d.upper
+            // Walk up to LEAF_BATCH sibling leaves inside this single lock turn.
+            var visited = 0
+            var lastSeenS = -1
+            var lastSeenV = -1
+            var lastSeenJ = 0
+            while true {
+                if leafV == -1 { db.noteLeaf(tree, leafS) }
+                let n = if snap { db.snapNode(leafS, leafV) } else { &db.pool[db.meta[leafS].frame] }
+                let i = if visited == 0 { n.lower(&cursor) } else { 0 }
+                var j = n.count()
+                var reachedTo = false
+                if hasTo {
+                    if fb.s >= 0 {
+                        let sep = db.boundKey(fb)
+                        if sep > to {
+                            j = n.lower(&to)
+                            reachedTo = true
+                        } else if sep == to {
+                            reachedTo = true
+                        }
+                    } else {
+                        j = n.lower(&to)
+                        reachedTo = true
+                    }
+                }
+                if j > i {
+                    if noting {
+                        lastSeenS = leafS
+                        lastSeenV = leafV
+                        lastSeenJ = j
+                    }
+                    let lv = lexdb_page.leafView(n)
+                    go = f(&lv, i, j)
+                }
+                visited += 1
+                if !go || reachedTo || fb.s < 0 || visited >= LEAF_BATCH {
+                    if fb.s >= 0 {
+                        hasUpper = true
+                        upper = db.boundKey(fb).clone()
+                    }
+                    break
+                }
+                // Advance to next sibling leaf via ancestor stack.
+                let prevFb = fb
+                while len(pslot) > 0 {
+                    let top = len(pslot) - 1
+                    let pn = if snap { db.snapNode(pslot[top], pver[top]) } else { &db.pool[db.meta[pslot[top]].frame] }
+                    if pidx[top] + 1 < len(pn.kids) {
+                        pidx[top] += 1
+                        break
+                    }
+                    let d3 = pop(mut &pslot)
+                    let d4 = pop(mut &pver)
+                    let d5 = pop(mut &pidx)
+                }
+                if len(pslot) == 0 {
+                    hasUpper = false
+                    break
+                }
+                // Descend leftmost from the new sibling branch.
+                let top0 = len(pslot) - 1
+                var curS = (if snap { db.snapNode(pslot[top0], pver[top0]) } else { &db.pool[db.meta[pslot[top0]].frame] }).kids[pidx[top0]]
+                var hitUnloaded = false
+                while true {
+                    var cv = -1
+                    if snap {
+                        cv = db.verOf(curS, t.snapSeq)
+                        if cv == -2 {
+                            hitUnloaded = true
+                            break
+                        }
+                        if cv == -3 {
+                            append(mut &bad, lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: a node version is missing"))
+                            return
+                        }
+                    } else {
+                        if !db.meta[curS].loaded {
+                            hitUnloaded = true
+                            break
+                        }
+                    }
+                    db.meta[curS].ref = true
+                    let cn = if snap { db.snapNode(curS, cv) } else { &db.pool[db.meta[curS].frame] }
+                    if cn.leaf {
+                        leafS = curS
+                        leafV = cv
+                        break
+                    }
+                    append(mut &pslot, curS)
+                    append(mut &pver, cv)
+                    append(mut &pidx, 0)
+                    curS = cn.kids[0]
+                }
+                if hitUnloaded {
+                    // Stop batch cleanly at prevFb so outer loop records read and loads next leaf.
+                    hasUpper = true
+                    upper = db.boundKey(prevFb).clone()
+                    break
+                }
+                // Recompute upper fence for the new leaf from the shallow-depth ancestor stack.
+                fb = NO_BOUND
+                var ai = len(pslot) - 1
+                while ai >= 0 {
+                    let pn = if snap { db.snapNode(pslot[ai], pver[ai]) } else { &db.pool[db.meta[pslot[ai]].frame] }
+                    if pidx[ai] < pn.count() {
+                        fb = Bound{s: pslot[ai], v: pver[ai], i: pidx[ai]}
+                        break
+                    }
+                    ai -= 1
+                }
+            }
+            if noting && lastSeenS >= 0 {
+                let ln = if snap { db.snapNode(lastSeenS, lastSeenV) } else { &db.pool[db.meta[lastSeenS].frame] }
+                seen = ln.key(lastSeenJ - 1)
+            }
         })
         if len(bad) > 0 { return Err(bad[0].clone()) }
         if need >= 0 {
@@ -4256,7 +4383,7 @@ pub fn (st: &Store) scanLeaves(t: mut &Txn, tree: int, from: &str, to: str,
             continue
         }
         if empty { return Ok(Unit{}) }
-        let last = !hasUpper || (len(to) > 0 && upper >= to)
+        let last = !hasUpper || (hasTo && upper >= to)
         if noting && last && t.openEnd {
             if len(seen) > 0 { t.noteRead(tree, &cursor, &(seen + "\x00"), rseq) }     // an open end (Txn.openEnd)
         } else if noting {

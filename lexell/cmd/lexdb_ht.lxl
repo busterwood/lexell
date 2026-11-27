@@ -1695,6 +1695,55 @@ pub fn (t: &TwoLevelArena) probeTextBatch(buf: &str, words: &[]int, nul: &[]bool
     }
 }
 
+// Batch-grouped cache-friendly probe for encoded composite keys packed in a single flat buffer `buf`
+// (entry j is buf[off[j] .. off[j] + slen[j]]). Radix-scatters across 256 L2 buckets when two-level.
+pub fn (t: &TwoLevelArena) probeBufBatch(buf: &str, off: &[]int, slen: &[]int, nc: int,
+                                         outHash: mut &[]u64, outGid: mut &[]int) {
+    if !t.twoLevel {
+        for j in 0..nc {
+            let a = off[j]
+            let sl = &buf[a..a + slen[j]]
+            let h = hashStr(sl)
+            outHash[j] = h
+            outGid[j] = t.l1.find(sl, h)
+        }
+        return
+    }
+    var cnt: []int = array(NBUCKETS, 0)
+    for j in 0..nc {
+        let a = off[j]
+        let h = hashStr(&buf[a..a + slen[j]])
+        outHash[j] = h
+        cnt[bucketOf(h)] += 1
+    }
+    var boff: []int = array(NBUCKETS, 0)
+    var total = 0
+    for b in 0..NBUCKETS { boff[b] = total; total += cnt[b] }
+    var pos = collections.copyOf(&boff)
+    var ord: []int = array(total, 0)
+    for j in 0..nc {
+        let b = bucketOf(outHash[j])
+        ord[pos[b]] = j
+        pos[b] += 1
+    }
+    for b in 0..NBUCKETS {
+        let n = cnt[b]
+        if n == 0 { continue }
+        let st = boff[b]
+        let bk = &t.bkts[b]
+        let cap = len(bk.ht)
+        if cap == 0 {
+            for p in st..(st + n) { outGid[ord[p]] = -1 }
+            continue
+        }
+        for p in st..(st + n) {
+            let j = ord[p]
+            let a = off[j]
+            outGid[j] = bk.find(&buf[a..a + slen[j]], outHash[j])
+        }
+    }
+}
+
 // ============================================================================
 // 3b. StrGidMemo: Direct-Mapped Input-String -> GroupID Memoization Cache
 //     (speeds up expensive pure unary text transforms like REGEXP_REPLACE in GROUP BY!)

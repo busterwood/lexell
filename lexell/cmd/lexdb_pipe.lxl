@@ -667,10 +667,40 @@ pub fn bCompileD(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, bas
                 // numeric of scale 0, as arith reads it): by value; + and
                 // - at the larger scale, * at the sum of the two (Decimal's
                 // display scales)
-                let sa = decSc(lt)
-                let sb = decSc(rt)
+                var sa = decSc(lt)
+                var sb = decSc(rt)
                 if cc >= 0 { return Some(BComp{n: BNode.DCmp(cc, l, sa, r, sb), typ: BT_BOOL}) }
-                if ac == 0 || ac == 1 { return Some(BComp{n: BNode.DArith(ac, l, sa, r, sb), typ: BT_DEC + max(sa, sb)}) }
+                if ac == 0 || ac == 1 {
+                    var ln = l
+                    var rn = r
+                    // Pre-scale decimal constants at compile time (e.g. 1 - l_discount -> 100 - l_discount at scale 2)
+                    if sa < sb {
+                        match ln {
+                            BNode.Const(kv, nul) {
+                                if !nul {
+                                    match kv.checkedMul(lexdb_rows.pow10i(sb - sa)) {
+                                        Some(skv) { ln = BNode.Const(skv, false); sa = sb }
+                                        None {}
+                                    }
+                                }
+                            }
+                            else {}
+                        }
+                    } else if sb < sa {
+                        match rn {
+                            BNode.Const(kv, nul) {
+                                if !nul {
+                                    match kv.checkedMul(lexdb_rows.pow10i(sa - sb)) {
+                                        Some(skv) { rn = BNode.Const(skv, false); sb = sa }
+                                        None {}
+                                    }
+                                }
+                            }
+                            else {}
+                        }
+                    }
+                    return Some(BComp{n: BNode.DArith(ac, ln, sa, rn, sb), typ: BT_DEC + max(sa, sb)})
+                }
                 if ac == 2 && sa + sb <= lexdb_vec.MAX_SCALE { return Some(BComp{n: BNode.DArith(2, l, sa, r, sb), typ: BT_DEC + sa + sb}) }
                 return None
             }
@@ -1200,6 +1230,112 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
             return Ok(out)
         }
         BNode.DArith(op, x, sa, y, sb) {
+            // Const +/- Col at matching scale (e.g. TPC-H q1: 1 - l_discount, 1 + l_tax): single pass, zero constant BVec alloc
+            if (op == 0 || op == 1) && sa == sb {
+                match &x {
+                    BNode.Const(kv, nul) {
+                        if !nul {
+                            match &y {
+                                BNode.Col(cy) {
+                                    var out = lexdb_rows.bvec(m)
+                                    let src = &b.cols[cy]
+                                    if op == 0 {
+                                        for j in 0..m {
+                                            let r = idx[j]
+                                            if src.nul[r] { out.nul[j] = true; continue }
+                                            match kv.checkedAdd(src.v[r]) {
+                                                Some(w) { out.v[j] = w }
+                                                None { return Err(decSpill()) }
+                                            }
+                                        }
+                                    } else {
+                                        for j in 0..m {
+                                            let r = idx[j]
+                                            if src.nul[r] { out.nul[j] = true; continue }
+                                            match kv.checkedSub(src.v[r]) {
+                                                Some(w) { out.v[j] = w }
+                                                None { return Err(decSpill()) }
+                                            }
+                                        }
+                                    }
+                                    return Ok(out)
+                                }
+                                else {}
+                            }
+                        }
+                    }
+                    else {}
+                }
+                match &y {
+                    BNode.Const(kv, nul) {
+                        if !nul {
+                            match &x {
+                                BNode.Col(cx) {
+                                    var out = lexdb_rows.bvec(m)
+                                    let src = &b.cols[cx]
+                                    if op == 0 {
+                                        for j in 0..m {
+                                            let r = idx[j]
+                                            if src.nul[r] { out.nul[j] = true; continue }
+                                            match src.v[r].checkedAdd(kv) {
+                                                Some(w) { out.v[j] = w }
+                                                None { return Err(decSpill()) }
+                                            }
+                                        }
+                                    } else {
+                                        for j in 0..m {
+                                            let r = idx[j]
+                                            if src.nul[r] { out.nul[j] = true; continue }
+                                            match src.v[r].checkedSub(kv) {
+                                                Some(w) { out.v[j] = w }
+                                                None { return Err(decSpill()) }
+                                            }
+                                        }
+                                    }
+                                    return Ok(out)
+                                }
+                                else {}
+                            }
+                        }
+                    }
+                    else {}
+                }
+            }
+            // Col * Expr: multiply directly into Expr's BVec without allocating a separate BVec for Col
+            if op == 2 {
+                match &x {
+                    BNode.Col(cx) {
+                        var c = try bEval(&y, b, idx)
+                        let src = &b.cols[cx]
+                        for j in 0..m {
+                            let r = idx[j]
+                            if src.nul[r] || c.nul[j] { c.nul[j] = true; continue }
+                            match src.v[r].checkedMul(c.v[j]) {
+                                Some(w) { c.v[j] = w }
+                                None { return Err(decSpill()) }
+                            }
+                        }
+                        return Ok(c)
+                    }
+                    else {}
+                }
+                match &y {
+                    BNode.Col(cy) {
+                        var a = try bEval(&x, b, idx)
+                        let src = &b.cols[cy]
+                        for j in 0..m {
+                            let r = idx[j]
+                            if a.nul[j] || src.nul[r] { a.nul[j] = true; continue }
+                            match a.v[j].checkedMul(src.v[r]) {
+                                Some(w) { a.v[j] = w }
+                                None { return Err(decSpill()) }
+                            }
+                        }
+                        return Ok(a)
+                    }
+                    else {}
+                }
+            }
             var a = try bEval(&x, b, idx)
             let c = try bEval(&y, b, idx)
             if !lexdb_vec.arith(op, mut &a, sa, &c, sb) { return Err(decSpill()) }
@@ -2651,11 +2787,43 @@ pub fn bAccVal(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, cn: mut &[]int
 // Adds the rows (gids: their groups) of a batch to a numeric aggregate's
 // counts and sums as units (sp.dsc), in 128 bits.
 pub fn bAccDec(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, cn: mut &[]int, su: mut &[]i128): Result[Unit, DbErr] {
-    let a = match sp.arg {
-        Some(x) { try bEval(&x, b, rows) }
-        None { lexdb_rows.bvec(0) }
+    match &sp.arg {
+        Some(x) {
+            match x {
+                BNode.Col(col) {
+                    // Direct column sum without allocating or copying a BVec
+                    let cv = &b.cols[col].v
+                    let cnul = &b.cols[col].nul
+                    let k = len(rows)
+                    if one {
+                        var s = su[0]
+                        var c = cn[0]
+                        for j in 0..k {
+                            let r = rows[j]
+                            if cnul[r] { continue }
+                            s += i128(cv[r])
+                            c += 1
+                        }
+                        su[0] = s
+                        cn[0] = c
+                    } else {
+                        for j in 0..k {
+                            let r = rows[j]
+                            if cnul[r] { continue }
+                            let g = gids[j]
+                            su[g] += i128(cv[r])
+                            cn[g] += 1
+                        }
+                    }
+                    return Ok(Unit{})
+                }
+                else {}
+            }
+            let a = try bEval(x, b, rows)
+            lexdb_vec.sum(&a, gids, one, cn, su)
+        }
+        None {}
     }
-    lexdb_vec.sum(&a, gids, one, cn, su)
     return Ok(Unit{})
 }
 
@@ -4740,7 +4908,7 @@ fn havPrep(ag: &AggSt, top: &TopAgg): HavBound {
 
 fn havPass(ag: &AggSt, g: int, top: &TopAgg, hb: &HavBound): bool {
     if !hb.ok { return true }
-    let ai = top.havAgg
+    let ai = if ag.shareOf[top.havAgg] >= 0 { ag.shareOf[top.havAgg] } else { top.havAgg }
     var v = i128(0)
     if hb.isSum {
         if ag.an[ai][g] == 0 { return false }
@@ -4792,12 +4960,19 @@ type AggSt = record {
     reSr: Option[lexdb_lib.ReSearcher]
     reRepl: str
     reMemo: lexdb_ht.StrGidMemo
-    // Zero-copy key column elision: key columns reconstructed directly from intHt/twoHt/textHt at finish()
+    // Zero-copy key column elision: key columns reconstructed directly from intHt/twoHt/textHt/keyHt at finish()
     elideText: bool
     keyCol0: int
     keyCol1: int
     keyCol0Bool: bool
     keyCol1Bool: bool
+    twoText: bool           // two plain text columns: 64-slot (w0, w1) C_DICT word cache (TPC-H q1)
+    twoTextC0: int
+    twoTextC1: int
+    elideComp: bool         // composite plain-column keys reconstructed from keyHt.keyAt(g) (ClickBench q18/q39)
+    compCols: []int
+    compTypes: []int        // 0: int, 1: bool, 2: text
+    shareOf: []int          // per spec: >= 0 shares (an, adec) with earlier identical BA_SUM/BA_AVG spec
     added: int
     room: int
     maxHeld: int
@@ -5225,6 +5400,8 @@ fn aggState(a: &lexdb_plan.PAgg, ks: &[]int, cols: &[]lexdb_sql.ColDef, kinds: &
                    oneKey: false, sorted: false, lastKey: 0, lastG: -1, textCol: -1,
                    reCol: -1, reComp: None, reSr: None, reRepl: "", reMemo: lexdb_ht.newStrGidMemo(),
                    elideText: false, keyCol0: -1, keyCol1: -1, keyCol0Bool: false, keyCol1Bool: false,
+                   twoText: false, twoTextC0: -1, twoTextC1: -1,
+                   elideComp: false, compCols: [], compTypes: [], shareOf: array(ns, -1),
                    added: 0, room: room, maxHeld: maxHeld,
                    track: false, base: 0, born: [], groupCap: -1}
     for i in 0..ns {
@@ -5236,6 +5413,20 @@ fn aggState(a: &lexdb_plan.PAgg, ks: &[]int, cols: &[]lexdb_sql.ColDef, kinds: &
         append(mut &ag.afs, [])
         append(mut &ag.afq, [])
         append(mut &ag.asets, [])
+    }
+    // Share (an, adec) between identical BA_SUM / BA_AVG specs (e.g. TPC-H q1 sum(x) + avg(x))
+    for i in 1..ns {
+        let spi = &ag.specs[i]
+        if (spi.kind == BA_SUM || spi.kind == BA_AVG) && spi.vcol < 0 && spi.filter.isNone() && ag.gens[i].isNone() {
+            for j in 0..i {
+                let spj = &ag.specs[j]
+                if (spj.kind == BA_SUM || spj.kind == BA_AVG) && spj.vcol < 0 && spj.filter.isNone() && ag.gens[j].isNone() &&
+                   spj.dsc == spi.dsc && bNodeOptEq(&spj.arg, &spi.arg) {
+                    ag.shareOf[i] = j
+                    break
+                }
+            }
+        }
     }
     ag.oneKey = len(ag.keys) == 1 && ag.keys[0].typ != BT_OTHER
     ag.twoInt = len(ag.keys) == 2 &&
@@ -5254,7 +5445,7 @@ fn aggState(a: &lexdb_plan.PAgg, ks: &[]int, cols: &[]lexdb_sql.ColDef, kinds: &
             }
             BNode.ReReplace(c, rc, repl) {
                 gotReC = c
-                gotReComp = lexdb_lib.cloneReCompiled(&Some(lexdb_lib.ReCompiled{re: rc.re.share(), all: rc.all}))
+                gotReComp = lexdb_lib.cloneReCompiled(&Some(lexdb_lib.ReCompiled{re: rc.re.share(), all: rc.all, fastKind: rc.fastKind}))
                 gotReSr = Some(lexdb_lib.reSearcher(rc))
                 gotReRepl = repl.clone()
             }
@@ -5268,8 +5459,32 @@ fn aggState(a: &lexdb_plan.PAgg, ks: &[]int, cols: &[]lexdb_sql.ColDef, kinds: &
             ag.reRepl = gotReRepl
         }
     }
+    // Two plain text columns (e.g. TPC-H q1 l_returnflag, l_linestatus): 64-slot (w0, w1) C_DICT word cache
+    if len(ag.keys) == 2 && ag.keys[0].typ == BT_OTHER && ag.keys[1].typ == BT_OTHER {
+        var c0 = -1
+        var c1 = -1
+        match &ag.keys[0].n {
+            BNode.Col(c) {
+                let o = cols[c].typ.oid
+                if o == lexdb_sql.OID_TEXT || o == lexdb_sql.OID_VARCHAR { c0 = c }
+            }
+            else {}
+        }
+        match &ag.keys[1].n {
+            BNode.Col(c) {
+                let o = cols[c].typ.oid
+                if o == lexdb_sql.OID_TEXT || o == lexdb_sql.OID_VARCHAR { c1 = c }
+            }
+            else {}
+        }
+        if c0 >= 0 && c1 >= 0 {
+            ag.twoText = true
+            ag.twoTextC0 = c0
+            ag.twoTextC1 = c1
+        }
+    }
     // Zero-copy fv elision: avoid duplicating key columns into ag.fv when they are already
-    // stored in textHt (bump-arena) or twoHt (flat key arrays)!
+    // stored in textHt (bump-arena), twoHt (flat key arrays), or keyHt (encoded composite keys)!
     if ag.textCol >= 0 && hasIntIn(&ag.fcols, ag.textCol) {
         var nf: []int = []
         for fc in ag.fcols { if fc != ag.textCol { append(mut &nf, fc) } }
@@ -5302,8 +5517,112 @@ fn aggState(a: &lexdb_plan.PAgg, ks: &[]int, cols: &[]lexdb_sql.ColDef, kinds: &
             for fc in ag.fcols { if fc != ag.keyCol0 && fc != ag.keyCol1 { append(mut &nf, fc) } }
             ag.fcols = nf
         }
+    } else if len(ag.keys) >= 2 && ag.reCol < 0 {
+        // Composite plain-column keys: check if every key is a plain Col of int/bool/text so bKeyEncFast is lossless
+        var allPlain = true
+        var cCols: []int = []
+        var cTyps: []int = []
+        var anyInFcols = false
+        for ki in 0..len(ag.keys) {
+            let k = &ag.keys[ki]
+            var ci = -1
+            match &k.n {
+                BNode.Col(c) { ci = c }
+                else {}
+            }
+            if ci < 0 || ci >= len(kinds) { allPlain = false; break }
+            let kd = kinds[ci]
+            if k.typ == BT_INT && !lexdb_rows.isDecKind(kd) && kd == BK_INT {
+                append(mut &cCols, ci); append(mut &cTyps, 0)
+            } else if k.typ == BT_BOOL && kd == BK_BOOL {
+                append(mut &cCols, ci); append(mut &cTyps, 1)
+            } else if k.typ == BT_OTHER && kd == BK_TEXT {
+                append(mut &cCols, ci); append(mut &cTyps, 2)
+            } else {
+                allPlain = false; break
+            }
+            if hasIntIn(&ag.fcols, ci) { anyInFcols = true }
+        }
+        if allPlain && anyInFcols {
+            var nf: []int = []
+            for fc in ag.fcols { if !hasIntIn(&cCols, fc) { append(mut &nf, fc) } }
+            ag.fcols = nf
+            ag.elideComp = true
+            ag.compCols = cCols
+            ag.compTypes = cTyps
+            ag.keyHt.trackKeys = true
+        }
     }
     return Some(ag)
+}
+
+fn bNodeEq(a: &BNode, b: &BNode): bool {
+    match a {
+        BNode.Const(va, na) {
+            match b { BNode.Const(vb, nb) { return va == vb && na == nb } else { return false } }
+        }
+        BNode.Col(ca) {
+            match b { BNode.Col(cb) { return ca == cb } else { return false } }
+        }
+        BNode.Arith(oa, xa, ya) {
+            match b { BNode.Arith(ob, xb, yb) { return oa == ob && bNodeEq(&xa, &xb) && bNodeEq(&ya, &yb) } else { return false } }
+        }
+        BNode.Neg(xa) {
+            match b { BNode.Neg(xb) { return bNodeEq(&xa, &xb) } else { return false } }
+        }
+        BNode.Fit(xa, ba) {
+            match b { BNode.Fit(xb, bb) { return ba == bb && bNodeEq(&xa, &xb) } else { return false } }
+        }
+        BNode.DArith(oa, xa, saa, ya, sba) {
+            match b { BNode.DArith(ob, xb, sab, yb, sbb) { return oa == ob && saa == sab && sba == sbb && bNodeEq(&xa, &xb) && bNodeEq(&ya, &yb) } else { return false } }
+        }
+        BNode.StrLen(ca) {
+            match b { BNode.StrLen(cb) { return ca == cb } else { return false } }
+        }
+        else { return false }
+    }
+}
+
+fn bNodeOptEq(a: &Option[BNode], b: &Option[BNode]): bool {
+    match a {
+        Some(xa) { match b { Some(xb) { return bNodeEq(xa, xb) } None { return false } } }
+        None { return b.isNone() }
+    }
+}
+
+// Decodes composite keys encoded by bKeyEncFast back into first[compCols[i]].
+fn decodeCompKey(raw: &str, compCols: &[]int, compTypes: &[]int, first: mut &[]Val) {
+    var pos = 0
+    let n = len(raw)
+    for ki in 0..len(compCols) {
+        if pos >= n { return }
+        let tag = int(raw[pos])
+        pos += 1
+        let ci = compCols[ki]
+        if tag == 0 {
+            first[ci] = Val.Null
+            continue
+        }
+        if tag == 1 {
+            var v = 0
+            for b in 0..8 { v = v | (int(raw[pos + b]) << (b * 8)) }
+            pos += 8
+            first[ci] = Val.Int(v)
+        } else if tag == 2 {
+            first[ci] = Val.Bool(raw[pos] != 0)
+            pos += 1
+        } else if tag == 4 {
+            let sl = int(raw[pos]) | (int(raw[pos + 1]) << 8)
+            pos += 2
+            first[ci] = Val.Text(raw[pos..pos + sl].clone())
+            pos += sl
+        } else if tag == 7 {
+            let sl = int(raw[pos]) | (int(raw[pos + 1]) << 8) | (int(raw[pos + 2]) << 16) | (int(raw[pos + 3]) << 24)
+            pos += 4
+            first[ci] = Val.Text(raw[pos..pos + sl].clone())
+            pos += sl
+        }
+    }
 }
 
 fn hasIntIn(xs: &[]int, x: int): bool {
@@ -5371,12 +5690,13 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
         // Adaptive two-level single-integer GROUP BY (batch-grouped probe + row-order miss insert)
         let kv0 = try bEval(&ag.keys[0].n, b, idx)
         ag.intHt.probeBatch(&kv0.v, &kv0.nul, nc, mut &gid)
+        var anyNew = false
         for j in 0..nc {
             if gid[j] >= 0 { continue }
             var g = -1
             if kv0.nul[j] {
                 g = ag.nullGroup
-            } else {
+            } else if anyNew {
                 g = ag.intHt.get(kv0.v[j])
             }
             if g < 0 {
@@ -5392,7 +5712,7 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
                 ag.added += cost
                 if ag.room >= 0 && ag.added > ag.room { return Err(memErr(ag.maxHeld)) }
                 ag.newGroup(ag.base + j)
-                if kv0.nul[j] { ag.nullGroup = g } else { ag.intHt.put(kv0.v[j], g) }
+                if kv0.nul[j] { ag.nullGroup = g } else { ag.intHt.put(kv0.v[j], g); anyNew = true }
             }
             gid[j] = g
         }
@@ -5401,6 +5721,7 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
         let kv0 = try bEval(&ag.keys[0].n, b, idx)
         let kv1 = try bEval(&ag.keys[1].n, b, idx)
         ag.twoHt.probeBatch(&kv0.v, &kv0.nul, &kv1.v, &kv1.nul, nc, mut &gid)
+        var anyNew = false
         for j in 0..nc {
             if gid[j] >= 0 { continue }
             let n0 = kv0.nul[j]
@@ -5408,7 +5729,7 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
             let k0 = if n0 { 0 } else { kv0.v[j] }
             let k1 = if n1 { 0 } else { kv1.v[j] }
             let nu = byte((if n0 { 1 } else { 0 }) | (if n1 { 2 } else { 0 }))
-            var g = ag.twoHt.get(k0, k1, nu)
+            var g = if anyNew { ag.twoHt.get(k0, k1, nu) } else { -1 }
             if g < 0 {
                 if gCap >= 0 && ag.ngroups >= gCap {
                     gid[j] = -1
@@ -5425,6 +5746,7 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
                 if ag.room >= 0 && ag.added > ag.room { return Err(memErr(ag.maxHeld)) }
                 ag.newGroup(ag.base + j)
                 ag.twoHt.put(k0, k1, nu, g)
+                anyNew = true
             }
             gid[j] = g
         }
@@ -5435,6 +5757,7 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
         if tcol {
             var hs: []u64 = array(nc, u64(0))
             ag.textHt.probeTextBatch(&b.txt[tc], &b.cols[tc].v, &b.cols[tc].nul, idx, nc, mut &hs, mut &gid)
+            var anyNew = false
             for j in 0..nc {
                 if gid[j] >= 0 { continue }
                 let r = idx[j]
@@ -5446,7 +5769,7 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
                 } else {
                     let x = lexdb_rows.textAt(b, tc, r)
                     klen = len(x)
-                    g = ag.textHt.getHash(x, hs[j])
+                    if anyNew { g = ag.textHt.getHash(x, hs[j]) }
                 }
                 if g < 0 {
                     if gCap >= 0 && ag.ngroups >= gCap {
@@ -5465,6 +5788,7 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
                         ag.nullGroup = g
                     } else {
                         ag.textHt.putHash(lexdb_rows.textAt(b, tc, r), hs[j], g)
+                        anyNew = true
                     }
                 }
                 gid[j] = g
@@ -5526,6 +5850,7 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
         var srOpt = replace(mut &ag.reSr, None)
         let rc = rcOpt.unwrap()
         var sr = srOpt.unwrap()
+        let fastUrl = rc.fastKind == 1 && len(ag.reRepl) == 2 && ag.reRepl[0] == '\\' && ag.reRepl[1] == '1'
         var errOut: Option[DbErr] = None
         var bailOut = false
         for j in 0..nc {
@@ -5564,9 +5889,8 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
                     continue
                 }
                 let x = lexdb_rows.textAt(b, tc, r)
-                let xh = lexdb_ht.hashStr(x)
-                var g = ag.reMemo.get(x, xh)
-                if g < 0 {
+                var g = -1
+                if fastUrl {
                     let span = lexdb_lib.reReplaceSliceWith(&rc, mut &sr, x, &ag.reRepl, mut &tmp)
                     let out: &str = if span >= 0 { &x[(span >> 28)..(span & 0xfffffff)] } else { &tmp }
                     let oh = lexdb_ht.hashStr(out)
@@ -5586,7 +5910,31 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
                         ag.newGroup(ag.base + j)
                         ag.textHt.putHash(out, oh, g)
                     }
-                    ag.reMemo.put(x, xh, g)
+                } else {
+                    let xh = lexdb_ht.hashStr(x)
+                    g = ag.reMemo.get(x, xh)
+                    if g < 0 {
+                        let span = lexdb_lib.reReplaceSliceWith(&rc, mut &sr, x, &ag.reRepl, mut &tmp)
+                        let out: &str = if span >= 0 { &x[(span >> 28)..(span & 0xfffffff)] } else { &tmp }
+                        let oh = lexdb_ht.hashStr(out)
+                        g = ag.textHt.getHash(out, oh)
+                        if g < 0 {
+                            if gCap >= 0 && ag.ngroups >= gCap {
+                                gid[j] = -1
+                                anyDrop = true
+                                continue
+                            }
+                            g = ag.ngroups
+                            ag.ngroups += 1
+                            let klen = len(out)
+                            let fcost = if hasFcols { bFirstVals(b, r, &ag.kinds, &ag.fcols, mut &ag.fv) } else { 32 }
+                            ag.added += fcost + 64 * (ns + 1) + klen
+                            if ag.room >= 0 && ag.added > ag.room { errOut = Some(memErr(ag.maxHeld)); break }
+                            ag.newGroup(ag.base + j)
+                            ag.textHt.putHash(out, oh, g)
+                        }
+                        ag.reMemo.put(x, xh, g)
+                    }
                 }
                 gid[j] = g
                 wcW[wi] = w; wcG[wi] = g
@@ -5628,29 +5976,70 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
         ag.reSr = Some(sr)
         if errOut.isSome() { return Err(errOut.unwrap()) }
         if bailOut { return Ok(false) }
-    } else {
-        // Sorted single-key OR composite keys in adaptive two-level bump-arena (ClickBench q18/q39!)
-        let ktxt = keyTexts(&ag.keys, b)
-        var kvs: []BVec = []
-        for k in ag.keys { append(mut &kvs, try bEval(&k.n, b, idx)) }
+    } else if ag.twoText && lexdb_rows.isTextCol(b, ag.twoTextC0) && lexdb_rows.isTextCol(b, ag.twoTextC1) {
+        // Two BK_TEXT columns (e.g. TPC-H q1 l_returnflag, l_linestatus): 64-slot (w0, w1) C_DICT word cache!
+        let c0 = ag.twoTextC0
+        let c1 = ag.twoTextC1
+        let v0 = &b.cols[c0].v
+        let n0 = &b.cols[c0].nul
+        let v1 = &b.cols[c1].v
+        let n1 = &b.cols[c1].nul
+        var wc0: []int = array(64, -1)
+        var wc1: []int = array(64, -1)
+        var wcG: []int = array(64, -1)
+        var prev0 = -1
+        var prev1 = -1
+        var prevG = -1
         var kb = ""
         for j in 0..nc {
-            var g = -1
-            var klen = 9
-            var h = u64(0)
-            if ag.oneKey {
-                // ag.sorted == true
-                if kvs[0].nul[j] {
-                    g = ag.nullGroup
-                } else if ag.lastG >= 0 && kvs[0].v[j] == ag.lastKey {
-                    g = ag.lastG
+            let r = idx[j]
+            let w0 = if n0[r] { -2 } else { v0[r] }
+            let w1 = if n1[r] { -2 } else { v1[r] }
+            if w0 == prev0 && w1 == prev1 && prevG >= 0 {
+                gid[j] = prevG
+                continue
+            }
+            let wi = (((w0 >> 24) ^ w0) *% 31 +% ((w1 >> 24) ^ w1)) & 63
+            if wc0[wi] == w0 && wc1[wi] == w1 && wcG[wi] >= 0 {
+                let g = wcG[wi]
+                gid[j] = g
+                prev0 = w0; prev1 = w1; prevG = g
+                continue
+            }
+            kb.clear()
+            if n0[r] { kb.addByte(0) } else { addHashText(mut &kb, lexdb_rows.textAt(b, c0, r)) }
+            if n1[r] { kb.addByte(0) } else { addHashText(mut &kb, lexdb_rows.textAt(b, c1, r)) }
+            let klen = len(kb)
+            let h = lexdb_ht.hashStr(&kb)
+            var g = ag.keyHt.getHash(&kb, h)
+            if g < 0 {
+                if gCap >= 0 && ag.ngroups >= gCap {
+                    gid[j] = -1
+                    anyDrop = true
+                    continue
                 }
-            } else {
-                kb.clear()
-                for ki in 0..len(ag.keys) { bKeyEncFast(mut &kb, &ag.keys[ki], &kvs[ki], j, b, idx[j], ktxt[ki]) }
-                klen = len(kb)
-                h = lexdb_ht.hashStr(&kb)
-                g = ag.keyHt.getHash(&kb, h)
+                g = ag.ngroups
+                ag.ngroups += 1
+                let fcost = if hasFcols { bFirstVals(b, r, &ag.kinds, &ag.fcols, mut &ag.fv) } else { 32 }
+                let cost = fcost + 64 * (ns + 1) + klen
+                ag.added += cost
+                if ag.room >= 0 && ag.added > ag.room { return Err(memErr(ag.maxHeld)) }
+                ag.newGroup(ag.base + j)
+                ag.keyHt.putHash(&kb, h, g)
+            }
+            gid[j] = g
+            wc0[wi] = w0; wc1[wi] = w1; wcG[wi] = g
+            prev0 = w0; prev1 = w1; prevG = g
+        }
+    } else if ag.oneKey {
+        // Sorted single-key (ag.sorted == true)
+        let kv0 = try bEval(&ag.keys[0].n, b, idx)
+        for j in 0..nc {
+            var g = -1
+            if kv0.nul[j] {
+                g = ag.nullGroup
+            } else if ag.lastG >= 0 && kv0.v[j] == ag.lastKey {
+                g = ag.lastG
             }
             if g < 0 {
                 if gCap >= 0 && ag.ngroups >= gCap {
@@ -5661,16 +6050,53 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
                 g = ag.ngroups
                 ag.ngroups += 1
                 let fcost = if hasFcols { bFirstVals(b, idx[j], &ag.kinds, &ag.fcols, mut &ag.fv) } else { 32 }
-                let cost = fcost + 64 * (ns + 1) + klen
+                let cost = fcost + 64 * (ns + 1) + 9
                 ag.added += cost
                 if ag.room >= 0 && ag.added > ag.room { return Err(memErr(ag.maxHeld)) }
                 ag.newGroup(ag.base + j)
-                if ag.oneKey {
-                    if kvs[0].nul[j] { ag.nullGroup = g }
-                    else { ag.lastKey = kvs[0].v[j]; ag.lastG = g }
-                } else {
-                    ag.keyHt.putHash(&kb, h, g)
+                if kv0.nul[j] { ag.nullGroup = g }
+                else { ag.lastKey = kv0.v[j]; ag.lastG = g }
+            }
+            gid[j] = g
+        }
+    } else {
+        // Composite keys in adaptive two-level bump-arena with batch-grouped 256-bucket L2 probe (ClickBench q18/q39!)
+        let ktxt = keyTexts(&ag.keys, b)
+        var kvs: []BVec = []
+        for k in ag.keys { append(mut &kvs, try bEval(&k.n, b, idx)) }
+        var kbuf = ""
+        var koff: []int = array(nc, 0)
+        var klenA: []int = array(nc, 0)
+        for j in 0..nc {
+            let st0 = len(kbuf)
+            koff[j] = st0
+            for ki in 0..len(ag.keys) { bKeyEncFast(mut &kbuf, &ag.keys[ki], &kvs[ki], j, b, idx[j], ktxt[ki]) }
+            klenA[j] = len(kbuf) - st0
+        }
+        var khs: []u64 = array(nc, u64(0))
+        ag.keyHt.probeBufBatch(&kbuf, &koff, &klenA, nc, mut &khs, mut &gid)
+        var anyNew = false
+        for j in 0..nc {
+            if gid[j] >= 0 { continue }
+            let st0 = koff[j]
+            let kl = klenA[j]
+            let sl = &kbuf[st0..st0 + kl]
+            var g = if anyNew { ag.keyHt.getHash(sl, khs[j]) } else { -1 }
+            if g < 0 {
+                if gCap >= 0 && ag.ngroups >= gCap {
+                    gid[j] = -1
+                    anyDrop = true
+                    continue
                 }
+                g = ag.ngroups
+                ag.ngroups += 1
+                let fcost = if hasFcols { bFirstVals(b, idx[j], &ag.kinds, &ag.fcols, mut &ag.fv) } else { 32 }
+                let cost = fcost + 64 * (ns + 1) + kl
+                ag.added += cost
+                if ag.room >= 0 && ag.added > ag.room { return Err(memErr(ag.maxHeld)) }
+                ag.newGroup(ag.base + j)
+                ag.keyHt.putHash(sl, khs[j], g)
+                anyNew = true
             }
             gid[j] = g
         }
@@ -5810,8 +6236,100 @@ fn (ag: mut &AggSt) accum(specs: &[]BSpec, b: &Batch, idx: &[]int, gid: &[]int, 
     var sumColMin = 0
     var sumColMax = 0
     var sumColOk = false
+    // Per-batch CSE cache for decimal arithmetic aggregates (e.g. TPC-H q1 disc_price reused in charge)
+    var cseIdx: []int = []
+    var cseVec: []BVec = []
     for si in 0..len(specs) {
+        if ag.shareOf[si] >= 0 { continue }
         let sp = &specs[si]
+        if (sp.kind == BA_SUM || sp.kind == BA_AVG) && sp.filter.isNone() && sp.vcol < 0 && sp.dsc >= 0 {
+            match &sp.arg {
+                Some(ax) {
+                    match ax {
+                        BNode.DArith(op, lhs, _, rhs, _) {
+                            if op == 2 && len(cseIdx) > 0 {
+                                var hit = -1
+                                for ci in 0..len(cseIdx) {
+                                    match &specs[cseIdx[ci]].arg {
+                                        Some(prevAx) { if bNodeEq(lhs, prevAx) { hit = ci; break } }
+                                        None {}
+                                    }
+                                }
+                                if hit >= 0 {
+                                    // Reuse cached lhs BVec! Specialize rhs = Const +/- Col at matching scale for zero extra BVec alloc.
+                                    let lv = &cseVec[hit]
+                                    let k = len(idx)
+                                    var fused = false
+                                    match rhs {
+                                        BNode.DArith(yop, yx, ysa, yy, ysb) {
+                                            if (yop == 0 || yop == 1) && ysa == ysb {
+                                                match &yx {
+                                                    BNode.Const(kv, nul) {
+                                                        if !nul {
+                                                            match &yy {
+                                                                BNode.Col(cy) {
+                                                                    let cv = &b.cols[cy].v
+                                                                    let cnul = &b.cols[cy].nul
+                                                                    if yop == 0 {
+                                                                        for j in 0..k {
+                                                                            let r = idx[j]
+                                                                            if lv.nul[j] || cnul[r] { continue }
+                                                                            let yval = match kv.checkedAdd(cv[r]) { Some(w) { w } None { return Err(decSpill()) } }
+                                                                            let prod = match lv.v[j].checkedMul(yval) { Some(w) { w } None { return Err(decSpill()) } }
+                                                                            let g = if one { 0 } else { gid[j] }
+                                                                            ag.adec[si][g] += i128(prod)
+                                                                            ag.an[si][g] += 1
+                                                                        }
+                                                                    } else {
+                                                                        for j in 0..k {
+                                                                            let r = idx[j]
+                                                                            if lv.nul[j] || cnul[r] { continue }
+                                                                            let yval = match kv.checkedSub(cv[r]) { Some(w) { w } None { return Err(decSpill()) } }
+                                                                            let prod = match lv.v[j].checkedMul(yval) { Some(w) { w } None { return Err(decSpill()) } }
+                                                                            let g = if one { 0 } else { gid[j] }
+                                                                            ag.adec[si][g] += i128(prod)
+                                                                            ag.an[si][g] += 1
+                                                                        }
+                                                                    }
+                                                                    fused = true
+                                                                }
+                                                                else {}
+                                                            }
+                                                        }
+                                                    }
+                                                    else {}
+                                                }
+                                            }
+                                        }
+                                        else {}
+                                    }
+                                    if !fused {
+                                        let rv = try bEval(rhs, b, idx)
+                                        for j in 0..k {
+                                            if lv.nul[j] || rv.nul[j] { continue }
+                                            let prod = match lv.v[j].checkedMul(rv.v[j]) { Some(w) { w } None { return Err(decSpill()) } }
+                                            let g = if one { 0 } else { gid[j] }
+                                            ag.adec[si][g] += i128(prod)
+                                            ag.an[si][g] += 1
+                                        }
+                                    }
+                                    continue
+                                }
+                            }
+                            if si + 1 < len(specs) {
+                                let av = try bEval(ax, b, idx)
+                                lexdb_vec.sum(&av, gid, one, mut &ag.an[si], mut &ag.adec[si])
+                                append(mut &cseIdx, si)
+                                append(mut &cseVec, av)
+                                continue
+                            }
+                        }
+                        else {}
+                    }
+                }
+                None {}
+            }
+        }
         if one && (sp.kind == BA_SUM || sp.kind == BA_AVG) && sp.filter.isNone() && sp.vcol < 0 && sp.dsc < 0 {
             match &sp.arg {
                 Some(ax) {
@@ -5957,6 +6475,8 @@ fn (ag: mut &AggSt) groupAt(g: int, first: mut &[]Val, accs: mut &[]Acc): Result
                                 else if ag.keyCol1Bool { Val.Bool(ag.twoHt.key1At(g) != 0) }
                                 else { Val.Int(ag.twoHt.key1At(g)) }
         }
+    } else if ag.elideComp {
+        decodeCompKey(&ag.keyHt.keyAt(g), &ag.compCols, &ag.compTypes, first)
     }
     for si in 0..ns {
         let kd = ag.specs[si].kind
@@ -5972,8 +6492,9 @@ fn (ag: mut &AggSt) groupAt(g: int, first: mut &[]Val, accs: mut &[]Acc): Result
             acc.val = Val.Null
             continue
         }
+        let src = if ag.shareOf[si] >= 0 { ag.shareOf[si] } else { si }
         let acc = mut &accs[si]
-        acc.n = ag.an[si][g]
+        acc.n = ag.an[src][g]
         acc.sum = Val.Null
         acc.sumsq = Val.Null
         acc.val = Val.Null
@@ -5984,22 +6505,22 @@ fn (ag: mut &AggSt) groupAt(g: int, first: mut &[]Val, accs: mut &[]Acc): Result
             }
         } else if kd == BA_AND || kd == BA_OR {
             if acc.n > 0 { acc.val = Val.Bool(ag.amm[si][g] != 0) }
-        } else if ag.an[si][g] > 0 && ag.specs[si].vcol >= 0 {
+        } else if acc.n > 0 && ag.specs[si].vcol >= 0 {
             if kd == BA_SUM || kd == BA_AVG { acc.sum = ag.aval[si][g].clone() }
             if kd == BA_MIN || kd == BA_MAX { acc.val = ag.aval[si][g].clone() }
-        } else if ag.an[si][g] > 0 && ag.specs[si].dsc >= 0 {
+        } else if acc.n > 0 && ag.specs[si].dsc >= 0 {
             // as the row engine's Decimal sum of the same values (display scale dsc)
             let ds = ag.specs[si].dsc
             if kd == BA_SUM || kd == BA_AVG {
-                match lexdb_vec.sumVal(ag.adec[si][g], ds) {
+                match lexdb_vec.sumVal(ag.adec[src][g], ds) {
                     Some(v) { acc.sum = v }
                     None { return Err(lexdb_ops.decErr()) }
                 }
             }
             if kd == BA_MIN || kd == BA_MAX { acc.val = lexdb_rows.decVal(ag.amm[si][g], ds) }
-        } else if ag.an[si][g] > 0 {
+        } else if acc.n > 0 {
             if kd == BA_SUM || kd == BA_AVG {
-                let u = ag.adec[si][g]
+                let u = ag.adec[src][g]
                 if u >= i128(-9223372036854775807 - 1) && u <= i128(9223372036854775807) {
                     acc.sum = Val.Int(int(u))
                 } else {
@@ -6163,6 +6684,7 @@ fn (ag: mut &AggSets) finishTop(nq: int, top: &TopAgg, give: &fn(mut &[]Val, int
         if x.elideText && x.textCol + 1 > rowLen { rowLen = x.textCol + 1 }
         if x.keyCol0 >= 0 && x.keyCol0 + 1 > rowLen { rowLen = x.keyCol0 + 1 }
         if x.keyCol1 >= 0 && x.keyCol1 + 1 > rowLen { rowLen = x.keyCol1 + 1 }
+        if x.elideComp { for c in x.compCols { if c + 1 > rowLen { rowLen = c + 1 } } }
     }
     // Direct Top-N pruning BEFORE allocating Val/Acc arrays for rejected groups!
     if !ag.set && top.on && ag.ags[0].ngroups > 8192 && top.aggIdx >= 0 && top.aggIdx < ns {
