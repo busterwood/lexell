@@ -1,0 +1,252 @@
+// lexdb_exec: Cahill-style Serializable Snapshot Isolation (SSI):
+// - Classic 2-txn write skew aborts with 40001;
+// - Non-cyclic single rw-antidependency commits cleanly (no false OCC abort);
+// - 3-txn dangerous cycle (T1 -rw-> T2 -rw-> T3 -rw-> T1) aborts in every commit order;
+// - Read-only anomaly (Fekete et al.: T1 RO sees T3's write and misses T2's write)
+//   aborts in both commit orders (T3,T2,T1 and T3,T1,T2);
+// - Phantom read write skew aborts with 40001;
+// - Concurrent range-read + disjoint-write workload commits with zero false aborts.
+// expect: write skew: COMMIT / 40001
+// expect: single rw-edge: COMMIT / COMMIT
+// expect: 3-txn cycle (T3,T2,T1): COMMIT / COMMIT / 40001
+// expect: 3-txn cycle (T1,T2,T3): COMMIT / COMMIT / 40001
+// expect: 3-txn cycle (T2,T1,T3): COMMIT / COMMIT / 40001
+// expect: ro anomaly (T3,T2,T1): COMMIT / COMMIT / 40001
+// expect: ro anomaly (T3,T1,T2): COMMIT / COMMIT / 40001
+// expect: phantom cycle: COMMIT / 40001
+// expect: concurrent disjoint rw: committed 64, conflicts 0, sum 64
+import "task"
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+fn one(s: mut &lexdb_exec.Session, sql: str): str {
+    match s.exec(&sql) {
+        Ok(rs) {
+            let r = &rs[len(rs) - 1]
+            if r.hasRows && len(r.rows) > 0 {
+                var out = ""
+                for v in r.rows[0] { out = out + (if out == "" { "" } else { " " }) + lexdb_sql.text(&v) }
+                return out
+            }
+            return r.tag.clone()
+        }
+        Err(e) { return e.state.clone() }
+    }
+}
+
+type WorkerArg = record { st: lexdb_store.Store; wid: int; n: int }
+type WorkerRes = value record { ok: int; conf: int }
+
+fn rwWorker(a: WorkerArg): WorkerRes {
+    var s = lexdb_exec.newSession(a.st.share())
+    var ok = 0
+    var conf = 0
+    for i in 0..a.n {
+        let b = one(mut &s, "begin")
+        // Read a range of shared table `pool` (overlapping other workers' writes -> single rw-edges),
+        // then update this worker's own disjoint row in `own`. Because no worker reads `own`,
+        // there is no rw-cycle and SSI must allow every commit without false 40001 aborts.
+        let r1 = one(mut &s, "select sum(v) from pool where id between 1 and 200")
+        let y = task.yield()
+        let u1 = one(mut &s, "update pool set v = v + 1 where id = " + (10 + a.wid * 20 + i).toStr())
+        let u2 = one(mut &s, "update own set v = v + 1 where id = " + (a.wid + 1).toStr())
+        // Wait: workers write into `pool` which OTHER workers read, forming T1 -rw-> T2 -rw-> T3
+        // if multiple workers read and write `pool`! Use separate `shared_r` written by one side
+        // and `own` written by workers to test strictly non-cyclic single rw-edges concurrently.
+        let c = one(mut &s, "commit")
+        if c == "COMMIT" { ok += 1 } else if c == "40001" { conf += 1 }
+    }
+    s.close()
+    return WorkerRes{ok: ok, conf: conf}
+}
+
+fn disjointWorker(a: WorkerArg): WorkerRes {
+    var s = lexdb_exec.newSession(a.st.share())
+    var ok = 0
+    var conf = 0
+    for i in 0..a.n {
+        let b = one(mut &s, "begin")
+        // Reads `shared_ro` (concurrently updated by writer task -> single rw-edge worker -rw-> writer),
+        // writes disjoint `own` row (never read by writer -> acyclic!).
+        let r1 = one(mut &s, "select sum(v) from shared_ro where id between 1 and 50")
+        let y = task.yield()
+        let u1 = one(mut &s, "update own set v = v + 1 where id = " + (a.wid + 1).toStr())
+        let c = one(mut &s, "commit")
+        if c == "COMMIT" { ok += 1 } else if c == "40001" { conf += 1 }
+    }
+    s.close()
+    return WorkerRes{ok: ok, conf: conf}
+}
+
+fn writerLoop(a: WorkerArg): int {
+    var s = lexdb_exec.newSession(a.st.share())
+    for i in 0..a.n {
+        let u = one(mut &s, "update shared_ro set v = v + 1 where id = " + ((i % 50) + 1).toStr())
+        let y = task.yield()
+    }
+    s.close()
+    return 0
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    var a = lexdb_exec.newSession(st.share())
+    var b = lexdb_exec.newSession(st.share())
+    var c = lexdb_exec.newSession(st.share())
+
+    let _t1 = one(mut &a, "create table t (id int primary key, v int)")
+    let _t2 = one(mut &a, "insert into t values (1, 10), (2, 10), (3, 10)")
+
+    // 1. Classic 2-txn write skew: both read (1, 2), A writes 1, B writes 2 -> 40001.
+    let _1 = one(mut &a, "begin")
+    let _2 = one(mut &b, "begin")
+    let _3 = one(mut &a, "select sum(v) from t where id in (1, 2)")
+    let _4 = one(mut &b, "select sum(v) from t where id in (1, 2)")
+    let _5 = one(mut &a, "update t set v = 0 where id = 1")
+    let _6 = one(mut &b, "update t set v = 0 where id = 2")
+    println("write skew: " + one(mut &a, "commit") + " / " + one(mut &b, "commit"))
+    let _rb1 = one(mut &b, "rollback")
+
+    // 2. Non-cyclic single rw-edge: A reads 1 and writes 2; B writes 1 (never reads 2) and commits first.
+    // Equivalent serial order: A < B -> BOTH must commit under Cahill SSI!
+    let _t3 = one(mut &a, "create table u (id int primary key, v int)")
+    let _t4 = one(mut &a, "insert into u values (1, 100), (2, 200)")
+    let _s1 = one(mut &a, "begin")
+    let _s2 = one(mut &a, "select v from u where id = 1")
+    let _s3 = one(mut &b, "begin")
+    let _s4 = one(mut &b, "update u set v = 101 where id = 1")
+    let cs_b = one(mut &b, "commit")
+    let _s5 = one(mut &a, "update u set v = 201 where id = 2")
+    let cs_a = one(mut &a, "commit")
+    println("single rw-edge: " + cs_b + " / " + cs_a)
+
+    // 3. 3-txn cycle T1 -rw-> T2 -rw-> T3 -rw-> T1 in three commit orders:
+    // T1 reads 1 writes 3; T2 reads 2 writes 1; T3 reads 3 writes 2.
+    let _c1 = one(mut &a, "create table cyc (id int primary key, v int)")
+    let _c2 = one(mut &a, "insert into cyc values (1, 1), (2, 2), (3, 3)")
+    // Order (T3, T2, T1)
+    let _o1 = one(mut &a, "begin"); let _o2 = one(mut &b, "begin"); let _o3 = one(mut &c, "begin")
+    let _o4 = one(mut &a, "select v from cyc where id = 1")
+    let _o5 = one(mut &b, "select v from cyc where id = 2")
+    let _o6 = one(mut &c, "select v from cyc where id = 3")
+    let _o7 = one(mut &a, "update cyc set v = 13 where id = 3")
+    let _o8 = one(mut &b, "update cyc set v = 11 where id = 1")
+    let _o9 = one(mut &c, "update cyc set v = 12 where id = 2")
+    let r3a = one(mut &c, "commit")
+    let r2a = one(mut &b, "commit")
+    let r1a = one(mut &a, "commit")
+    let _rba = one(mut &a, "rollback")
+    println("3-txn cycle (T3,T2,T1): " + r3a + " / " + r2a + " / " + r1a)
+
+    // Order (T1, T2, T3)
+    let _p1 = one(mut &a, "begin"); let _p2 = one(mut &b, "begin"); let _p3 = one(mut &c, "begin")
+    let _p4 = one(mut &a, "select v from cyc where id = 1")
+    let _p5 = one(mut &b, "select v from cyc where id = 2")
+    let _p6 = one(mut &c, "select v from cyc where id = 3")
+    let _p7 = one(mut &a, "update cyc set v = 23 where id = 3")
+    let _p8 = one(mut &b, "update cyc set v = 21 where id = 1")
+    let _p9 = one(mut &c, "update cyc set v = 22 where id = 2")
+    let r1b = one(mut &a, "commit")
+    let r2b = one(mut &b, "commit")
+    let r3b = one(mut &c, "commit")
+    let _rbb = one(mut &c, "rollback")
+    println("3-txn cycle (T1,T2,T3): " + r1b + " / " + r2b + " / " + r3b)
+
+    // Order (T2, T1, T3)
+    let _q1 = one(mut &a, "begin"); let _q2 = one(mut &b, "begin"); let _q3 = one(mut &c, "begin")
+    let _q4 = one(mut &a, "select v from cyc where id = 1")
+    let _q5 = one(mut &b, "select v from cyc where id = 2")
+    let _q6 = one(mut &c, "select v from cyc where id = 3")
+    let _q7 = one(mut &a, "update cyc set v = 33 where id = 3")
+    let _q8 = one(mut &b, "update cyc set v = 31 where id = 1")
+    let _q9 = one(mut &c, "update cyc set v = 32 where id = 2")
+    let r2c = one(mut &b, "commit")
+    let r1c = one(mut &a, "commit")
+    let r3c = one(mut &c, "commit")
+    let _rbc = one(mut &c, "rollback")
+    println("3-txn cycle (T2,T1,T3): " + r2c + " / " + r1c + " / " + r3c)
+
+    // 4. Read-only anomaly (Fekete et al.):
+    // T3 updates Y (id=2) and commits;
+    // T2 (started before T3) reads Y (old -> T2 -rw-> T3) and updates X (id=1);
+    // T1 (read-only! started after T3, before T2) reads X (old -> T1 -rw-> T2) and Y (new).
+    // Order (T3, T2, T1): T1 aborts at commit.
+    let _ro0 = one(mut &a, "create table ro (id int primary key, v int)")
+    let _ro1 = one(mut &a, "insert into ro values (1, 0), (2, 0)")
+    let _ro2 = one(mut &b, "begin")
+    let _ro3 = one(mut &b, "select v from ro where id = 2")    // T2 pins snapshot before T3, reads old Y
+    let _ro4 = one(mut &c, "begin")
+    let _ro5 = one(mut &c, "update ro set v = 10 where id = 2")
+    let ro_c1 = one(mut &c, "commit")                          // T3 commits first
+    let _ro6 = one(mut &a, "begin")
+    let _ro7 = one(mut &a, "select v from ro where id = 1")    // T1 (RO) starts after T3, reads old X
+    let _ro8 = one(mut &a, "select v from ro where id = 2")    // T1 sees new Y
+    let _ro9 = one(mut &b, "update ro set v = 20 where id = 1")
+    let ro_b1 = one(mut &b, "commit")                          // T2 commits second (outConflict=true, outMinSeq=T3.seq)
+    let ro_a1 = one(mut &a, "commit")                          // T1 commits third -> MUST abort 40001!
+    let _rorb1 = one(mut &a, "rollback")
+    println("ro anomaly (T3,T2,T1): " + ro_c1 + " / " + ro_b1 + " / " + ro_a1)
+
+    // Order (T3, T1, T2): T1 commits second, T2 commits third -> T2 aborts!
+    let _rb20 = one(mut &b, "begin")
+    let _rb21 = one(mut &b, "select v from ro where id = 2")   // T2 pins snapshot before T3
+    let _rb22 = one(mut &c, "begin")
+    let _rb23 = one(mut &c, "update ro set v = 30 where id = 2")
+    let ro_c2 = one(mut &c, "commit")                          // T3 commits first
+    let _rb24 = one(mut &a, "begin")
+    let _rb25 = one(mut &a, "select v from ro where id = 1")   // T1 (RO) starts after T3, reads old X
+    let _rb26 = one(mut &a, "select v from ro where id = 2")
+    let ro_a2 = one(mut &a, "commit")                          // T1 commits second
+    let _rb27 = one(mut &b, "update ro set v = 40 where id = 1")
+    let ro_b2 = one(mut &b, "commit")                          // T2 commits third -> MUST abort 40001!
+    let _rorb2 = one(mut &b, "rollback")
+    println("ro anomaly (T3,T1,T2): " + ro_c2 + " / " + ro_a2 + " / " + ro_b2)
+
+    // 5. Phantom read cycle: T1 range-scans A writes B; T2 range-scans B inserts into A's range.
+    let _ph0 = one(mut &a, "create table pa (id int primary key, k int)")
+    let _ph1 = one(mut &a, "create table pb (id int primary key, k int)")
+    let _ph2 = one(mut &a, "begin")
+    let _ph3 = one(mut &b, "begin")
+    let _ph4 = one(mut &a, "select count(*) from pa where id between 10 and 20")
+    let _ph5 = one(mut &b, "select count(*) from pb where id between 10 and 20")
+    let _ph6 = one(mut &a, "insert into pb values (15, 1)")
+    let _ph7 = one(mut &b, "insert into pa values (15, 1)")
+    let ph_a = one(mut &a, "commit")
+    let ph_b = one(mut &b, "commit")
+    let _phrb = one(mut &b, "rollback")
+    println("phantom cycle: " + ph_a + " / " + ph_b)
+
+    // 6. Concurrent single-rw-edge workload (zero false 40001 aborts).
+    let _cw0 = one(mut &a, "create table shared_ro (id int primary key, v int)")
+    let _cw1 = one(mut &a, "insert into shared_ro select g, 0 from generate_series(1, 50) g")
+    let _cw2 = one(mut &a, "create table own (id int primary key, v int)")
+    let _cw3 = one(mut &a, "insert into own select g, 0 from generate_series(1, 8) g")
+    var totOk = 0
+    var totConf = 0
+    task.scope(fn(sc: mut &task.Scope) {
+        let fw = sc.start(writerLoop, WorkerArg{st: st.share(), wid: 0, n: 40})
+        var ws: []task.Future[WorkerRes] = []
+        for w in 0..8 {
+            append(mut &ws, sc.start(disjointWorker, WorkerArg{st: st.share(), wid: w, n: 8}))
+        }
+        while len(ws) > 0 {
+            let r = pop(mut &ws).wait().unwrap()
+            totOk += r.ok
+            totConf += r.conf
+        }
+        let _w = fw.wait().unwrap()
+    })
+    println("concurrent disjoint rw: committed " + totOk.toStr() + ", conflicts " + totConf.toStr() + ", sum " + one(mut &a, "select sum(v) from own"))
+
+    a.close()
+    b.close()
+    c.close()
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(42), lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 50000}, body).unwrap()
+}
