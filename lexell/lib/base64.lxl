@@ -7,33 +7,78 @@
 
 const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 
+type VB = vector[byte]
+
 // Base64 of data: the standard alphabet, padded with "=".
 pub fn encode(data: &str): str {
-    var b = ""
+    let n = len(data)
+    if n == 0 { return "" }
+    let outLen = ((n + 2) / 3) * 4
+    var out: []byte = array(outLen, byte(0))
     var i = 0
-    while i + 3 <= len(data) {
-        let v = (int(data[i]) << 16) | (int(data[i + 1]) << 8) | int(data[i + 2])
-        b.addByte(ALPHABET[(v >> 18) & 63])
-        b.addByte(ALPHABET[(v >> 12) & 63])
-        b.addByte(ALPHABET[(v >> 6) & 63])
-        b.addByte(ALPHABET[v & 63])
-        i += 3
+    var o = 0
+    if n >= 24 {
+        let v26 = VB.splat(byte(26))
+        let v52 = VB.splat(byte(52))
+        let v62 = VB.splat(byte(62))
+        let v63 = VB.splat(byte(63))
+        let v65 = VB.splat(byte(65))
+        let v71 = VB.splat(byte(71))
+        let v252 = VB.splat(byte(252))
+        let vPlus = VB.splat('+')
+        let vSlash = VB.splat('/')
+        while i + 24 <= n {
+            var k = 0
+            while k < 24 {
+                let b0 = int(data[i + k])
+                let b1 = int(data[i + k + 1])
+                let b2 = int(data[i + k + 2])
+                out[o] = byte(b0 >> 2)
+                out[o + 1] = byte(((b0 & 3) << 4) | (b1 >> 4))
+                out[o + 2] = byte(((b1 & 15) << 2) | (b2 >> 6))
+                out[o + 3] = byte(b2 & 63)
+                o += 4
+                k += 3
+            }
+            let base = o - 32
+            let v = VB.load(&out, base)
+            let mLo = v >= v26
+            let mDg = v >= v52
+            let m62 = v == v62
+            let m63 = v == v63
+            var d = mLo.select(v71, v65)
+            d = mDg.select(v252, d)
+            var res = v +% d
+            res = m62.select(vPlus, res)
+            res = m63.select(vSlash, res)
+            res.store(mut &out, base)
+            i += 24
+        }
     }
-    let rest = len(data) - i
+    while i + 3 <= n {
+        let v = (int(data[i]) << 16) | (int(data[i + 1]) << 8) | int(data[i + 2])
+        out[o] = ALPHABET[(v >> 18) & 63]
+        out[o + 1] = ALPHABET[(v >> 12) & 63]
+        out[o + 2] = ALPHABET[(v >> 6) & 63]
+        out[o + 3] = ALPHABET[v & 63]
+        i += 3
+        o += 4
+    }
+    let rest = n - i
     if rest == 1 {
         let v = int(data[i]) << 16
-        b.addByte(ALPHABET[(v >> 18) & 63])
-        b.addByte(ALPHABET[(v >> 12) & 63])
-        b.addByte('=')
-        b.addByte('=')
+        out[o] = ALPHABET[(v >> 18) & 63]
+        out[o + 1] = ALPHABET[(v >> 12) & 63]
+        out[o + 2] = '='
+        out[o + 3] = '='
     } else if rest == 2 {
         let v = (int(data[i]) << 16) | (int(data[i + 1]) << 8)
-        b.addByte(ALPHABET[(v >> 18) & 63])
-        b.addByte(ALPHABET[(v >> 12) & 63])
-        b.addByte(ALPHABET[(v >> 6) & 63])
-        b.addByte('=')
+        out[o] = ALPHABET[(v >> 18) & 63]
+        out[o + 1] = ALPHABET[(v >> 12) & 63]
+        out[o + 2] = ALPHABET[(v >> 6) & 63]
+        out[o + 3] = '='
     }
-    return b
+    return strFromBytes(&out)
 }
 
 fn value(c: byte): int {
@@ -51,9 +96,56 @@ fn value(c: byte): int {
 // are not checked (as libpq's decoder).
 pub fn decodeStrict(text: &str): Option[str] {
     let n = len(text)
+    if n == 0 { return Some("") }
     if n % 4 != 0 { return None }
-    var out: []byte = []
+    let padEnd = if text[n - 1] == '=' { if text[n - 2] == '=' { 2 } else { 1 } } else { 0 }
+    var out: []byte = array((n / 4) * 3 - padEnd, byte(0))
     var i = 0
+    var o = 0
+    let simdLim = n - 4
+    if simdLim >= 32 {
+        let vA = VB.splat('A')
+        let vZ = VB.splat('Z')
+        let va = VB.splat('a')
+        let vz = VB.splat('z')
+        let v0 = VB.splat('0')
+        let v9 = VB.splat('9')
+        let vPlus = VB.splat('+')
+        let vSlash = VB.splat('/')
+        let vOffUp = VB.splat(byte(191))
+        let vOffLo = VB.splat(byte(185))
+        let vOffDg = VB.splat(byte(4))
+        let vOffPl = VB.splat(byte(19))
+        let vOffSl = VB.splat(byte(16))
+        var tmp: []byte = array(32, byte(0))
+        while i + 32 <= simdLim {
+            let v = VB.load(text, i)
+            let isUp = (v >= vA) & (v <= vZ)
+            let isLo = (v >= va) & (v <= vz)
+            let isDg = (v >= v0) & (v <= v9)
+            let isPl = v == vPlus
+            let isSl = v == vSlash
+            if !(isUp | isLo | isDg | isPl | isSl).all() { return None }
+            var delta = isUp.select(vOffUp, vOffLo)
+            delta = isDg.select(vOffDg, delta)
+            delta = isPl.select(vOffPl, delta)
+            delta = isSl.select(vOffSl, delta)
+            (v +% delta).store(mut &tmp, 0)
+            var k = 0
+            while k < 32 {
+                let d0 = int(tmp[k])
+                let d1 = int(tmp[k + 1])
+                let d2 = int(tmp[k + 2])
+                let d3 = int(tmp[k + 3])
+                out[o] = byte((d0 << 2) | (d1 >> 4))
+                out[o + 1] = byte(((d1 & 15) << 4) | (d2 >> 2))
+                out[o + 2] = byte(((d2 & 3) << 6) | d3)
+                o += 3
+                k += 4
+            }
+            i += 32
+        }
+    }
     while i < n {
         let last = i + 4 == n
         var pad = 0
@@ -71,9 +163,10 @@ pub fn decodeStrict(text: &str): Option[str] {
                 v = (v << 6) | d
             }
         }
-        append(mut &out, byte((v >> 16) & 255))
-        if pad < 2 { append(mut &out, byte((v >> 8) & 255)) }
-        if pad < 1 { append(mut &out, byte(v & 255)) }
+        out[o] = byte((v >> 16) & 255)
+        o += 1
+        if pad < 2 { out[o] = byte((v >> 8) & 255); o += 1 }
+        if pad < 1 { out[o] = byte(v & 255); o += 1 }
         i += 4
     }
     return Some(strFromBytes(&out))
@@ -85,23 +178,72 @@ pub fn decodeStrict(text: &str): Option[str] {
 // value it qualifies. Output bytes are not checked for UTF-8; a caller that
 // needs text validates them (jq's `json.validUtf8`).
 pub fn decodeLenient(s: &str): Result[str, str] {
-    var out: []byte = []
+    let n = len(s)
+    if n == 0 { return Ok("") }
+    var out: []byte = array((n / 4) * 3 + 3, byte(0))
+    var i = 0
+    var o = 0
+    if n >= 32 {
+        let vA = VB.splat('A')
+        let vZ = VB.splat('Z')
+        let va = VB.splat('a')
+        let vz = VB.splat('z')
+        let v0 = VB.splat('0')
+        let v9 = VB.splat('9')
+        let vPlus = VB.splat('+')
+        let vSlash = VB.splat('/')
+        let vOffUp = VB.splat(byte(191))
+        let vOffLo = VB.splat(byte(185))
+        let vOffDg = VB.splat(byte(4))
+        let vOffPl = VB.splat(byte(19))
+        let vOffSl = VB.splat(byte(16))
+        var tmp: []byte = array(32, byte(0))
+        while i + 32 <= n {
+            let v = VB.load(s, i)
+            let isUp = (v >= vA) & (v <= vZ)
+            let isLo = (v >= va) & (v <= vz)
+            let isDg = (v >= v0) & (v <= v9)
+            let isPl = v == vPlus
+            let isSl = v == vSlash
+            if !(isUp | isLo | isDg | isPl | isSl).all() { break }
+            var delta = isUp.select(vOffUp, vOffLo)
+            delta = isDg.select(vOffDg, delta)
+            delta = isPl.select(vOffPl, delta)
+            delta = isSl.select(vOffSl, delta)
+            (v +% delta).store(mut &tmp, 0)
+            var k = 0
+            while k < 32 {
+                let d0 = int(tmp[k])
+                let d1 = int(tmp[k + 1])
+                let d2 = int(tmp[k + 2])
+                let d3 = int(tmp[k + 3])
+                out[o] = byte((d0 << 2) | (d1 >> 4))
+                out[o + 1] = byte(((d1 & 15) << 4) | (d2 >> 2))
+                out[o + 2] = byte(((d2 & 3) << 6) | d3)
+                o += 3
+                k += 4
+            }
+            i += 32
+        }
+    }
     var acc = 0
     var bits = 0
-    var n = 0
-    for i in 0..len(s) {
+    var seen = i
+    while i < n {
         let c = s[i]
         if c == '=' { break }
         let v = value(c)
         if v < 0 { return Err("is not valid base64 data") }
         acc = ((acc << 6) | v) & 0xFFFF
         bits += 6
-        n += 1
+        seen += 1
         if bits >= 8 {
             bits -= 8
-            append(mut &out, byte((acc >> bits) & 255))
+            out[o] = byte((acc >> bits) & 255)
+            o += 1
         }
+        i += 1
     }
-    if n % 4 == 1 { return Err("trailing base64 byte found") }
-    return Ok(strFromBytes(&out))
+    if seen % 4 == 1 { return Err("trailing base64 byte found") }
+    return Ok(strFromBytes(&out[0..o]))
 }
