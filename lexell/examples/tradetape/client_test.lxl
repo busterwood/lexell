@@ -1,0 +1,282 @@
+// client_test: end-to-end HTTP/2 (h2c) + SSE + LexDB SELECT ... WAIT verification client.
+// Run via test_e2e.py against a live lexdb + tradetape pair.
+
+import "http"
+import "task"
+import "time"
+import "os"
+import "strings"
+import "json"
+import "csv"
+import "zlib"
+import "zstd"
+
+type Trade = record {
+    seq: int
+    symbol: str
+    side: str
+    price: Decimal
+    qty: int
+    notional: Decimal
+    note: str
+    atMs: int
+}
+
+type ReadyEvent = value record {
+    after: int
+    symbol: str
+    proto: str
+}
+
+type StatsReply = value record {
+    activeStreams: int
+    openConns: int
+    accepted: int
+    requests: int
+}
+
+type SseEvent = record {
+    id: str
+    name: str
+    data: str
+}
+
+type SseReader = record {
+    resp: http.Response
+    buf: str
+}
+
+fn (sr: mut &SseReader) nextEvent(): Result[SseEvent, str] {
+    var chunk = array(4096, byte(0))
+    while true {
+        let sep = strings.indexOf(&sr.buf, "\n\n", 0)
+        if sep >= 0 {
+            let block = strSlice(&sr.buf, 0, sep)
+            sr.buf = strSlice(&sr.buf, sep + 2, len(sr.buf))
+            var id = ""
+            var name = "message"
+            var data = ""
+            for line in strings.splitByte(&block, '\n') {
+                let t = strings.trimRight(&line)
+                if len(t) == 0 || strings.startsWith(&t, ":") { continue }
+                if strings.startsWith(&t, "id: ") { id = strSlice(&t, 4, len(t)) }
+                else if strings.startsWith(&t, "event: ") { name = strSlice(&t, 7, len(t)) }
+                else if strings.startsWith(&t, "data: ") {
+                    let part = strSlice(&t, 6, len(t))
+                    data = if len(data) == 0 { part } else { data + "\n" + part }
+                }
+            }
+            if len(data) > 0 || name != "message" {
+                return Ok(SseEvent{id: id, name: name, data: data})
+            }
+            continue
+        }
+        let n = match sr.resp.read(mut &chunk) {
+            Ok(k) { k }
+            Err(e) { return Err("sse read: " + e.toStr()) }
+        }
+        if n == 0 { return Err("sse stream closed unexpectedly") }
+        sr.buf += strFromBytes(&chunk[0..n])
+    }
+    return Err("unreachable")
+}
+
+fn must(ok: bool, msg: &str) {
+    if !ok {
+        eprintln($"FAIL: {msg}")
+        os.quit(1)
+    }
+}
+
+type StreamJob = record {
+    base: str
+    path: str
+    lastId: str
+    wantTrades: int
+    readyPromise: task.Promise[str]
+}
+
+type StreamResult = record {
+    proto: str
+    trades: []Trade
+    err: str
+}
+
+fn sseSubscriber(j: StreamJob): StreamResult {
+    let StreamJob{base: base, path: path, lastId: lastId, wantTrades: want, readyPromise: rp} = move(j)
+    var o = http.defaults()
+    o.h2c = true
+    o.timeoutMs = 15000
+    let c = http.newClient(o)
+    var rq = http.request("GET", $"{base}{path}")
+    if len(lastId) > 0 { rq.header("Last-Event-ID", &lastId) }
+    match c.send(&rq) {
+        Err(e) {
+            rp.complete("err:" + e.toStr())
+            return StreamResult{proto: "", trades: [], err: e.toStr()}
+        }
+        Ok(resp) {
+            let proto = resp.proto.clone()
+            var sr = SseReader{resp: resp, buf: ""}
+            match sr.nextEvent() {
+                Err(e) {
+                    rp.complete("err:" + e)
+                    return StreamResult{proto: proto, trades: [], err: e}
+                }
+                Ok(ev0) {
+                    if ev0.name != "ready" {
+                        rp.complete("err:expected ready, got " + ev0.name)
+                        return StreamResult{proto: proto, trades: [], err: "expected ready"}
+                    }
+                    rp.complete(proto.clone())
+
+                    var trades: []Trade = []
+                    while len(trades) < want {
+                        let ev = match sr.nextEvent() {
+                            Ok(x) { x }
+                            Err(e) { return StreamResult{proto: proto, trades: trades, err: e} }
+                        }
+                        if ev.name == "trade" {
+                            let t = match json.decode[Trade](&ev.data) {
+                                Ok(x) { x }
+                                Err(e) { return StreamResult{proto: proto, trades: trades, err: e.toStr()} }
+                            }
+                            append(mut &trades, t)
+                        }
+                    }
+                    // Explicitly drop sr (closing the HTTP/2 stream -> cancelling the server's dedicated LexDB WAIT connection).
+                    return StreamResult{proto: proto, trades: trades, err: ""}
+                }
+            }
+        }
+    }
+}
+
+fn postTrade(c: &http.Client, base: &str, sym: &str, side: &str, price: &str, qty: int, note: &str): Trade {
+    let body = $"{{\"symbol\":\"{sym}\",\"side\":\"{side}\",\"price\":\"{price}\",\"qty\":{qty},\"note\":\"{note}\"}}"
+    let r = c.post($"{base}/api/trades", "application/json", &body).unwrap()
+    must(r.status == 201, &($"POST /api/trades status {r.status}"))
+    let txt = r.text().unwrap()
+    return json.decode[Trade](&txt).unwrap()
+}
+
+fn getStats(c: &http.Client, base: &str): StatsReply {
+    let r = c.get($"{base}/api/stats").unwrap()
+    must(r.status == 200, &($"GET /api/stats status {r.status}"))
+    return json.decode[StatsReply](&(r.text().unwrap())).unwrap()
+}
+
+fn main() {
+    let args = os.arguments()
+    if len(args) < 1 {
+        eprintln("usage: client_test http://127.0.0.1:PORT")
+        os.quit(2)
+    }
+    let base = args[0].clone()
+
+    var oH2 = http.defaults()
+    oH2.h2c = true
+    oH2.addCodec(zstd.codec())
+    oH2.addCodec(zlib.gzipCodec())
+    let cH2 = http.newClient(oH2)
+
+    // 1. HTML dashboard
+    let rDash = cH2.get($"{base}/").unwrap()
+    must(rDash.status == 200, "GET / status")
+    let dashProto = rDash.proto.clone()
+    let dashHtml = rDash.text().unwrap()
+    must(strings.contains(&dashHtml, "Lexell + LexDB Live Trade Tape"), "dashboard HTML title")
+    println($"dashboard ok proto={dashProto}")
+
+    // 2. Concurrent HTTP/2 SSE streams (ALL + EURUSD-filtered) woken by POST /api/trades via LexDB SELECT ... WAIT
+    task.scope(fn(s: mut &task.Scope) {
+        let task.Handoff{promise: pAll, future: fReadyAll} = task.promise[str]()
+        let task.Handoff{promise: pEur, future: fReadyEur} = task.promise[str]()
+
+        let futAll = s.start(sseSubscriber, StreamJob{
+            base: base.clone(), path: "/api/stream", lastId: "", wantTrades: 2, readyPromise: pAll
+        })
+        let futEur = s.start(sseSubscriber, StreamJob{
+            base: base.clone(), path: "/api/stream?symbol=EURUSD", lastId: "", wantTrades: 1, readyPromise: pEur
+        })
+
+        let protoAll = fReadyAll.wait().unwrap()
+        let protoEur = fReadyEur.wait().unwrap()
+        must(protoAll == "HTTP/2.0", &($"ALL stream proto {protoAll}"))
+        must(protoEur == "HTTP/2.0", &($"EURUSD stream proto {protoEur}"))
+
+        let stLive = getStats(&cH2, &base)
+        must(stLive.activeStreams == 2, &($"expected 2 activeStreams, got {stLive.activeStreams}"))
+
+        // Post trade #1 (GBPUSD) and trade #2 (EURUSD) and measure instant LexDB WAIT wakeup
+        let t0 = time.monotonicNs()
+        let t1 = postTrade(&cH2, &base, "GBPUSD", "SELL", "1.2650", 5000, "cable-1")
+        let t2 = postTrade(&cH2, &base, "EURUSD", "BUY", "1.0845", 10000, "fiber-2")
+        must(t1.seq == 1 && t1.notional == 6325.0000m, "trade #1 seq & exact decimal notional")
+        must(t2.seq == 2 && t2.notional == 10845.0000m, "trade #2 seq & exact decimal notional")
+
+        let resAll = futAll.wait().unwrap()
+        let resEur = futEur.wait().unwrap()
+        let wakeMs = (time.monotonicNs() - t0) / 1000000
+        must(len(resAll.err) == 0 && len(resAll.trades) == 2, &($"ALL stream err={resAll.err}"))
+        must(len(resEur.err) == 0 && len(resEur.trades) == 1, &($"EURUSD stream err={resEur.err}"))
+        must(resAll.trades[0].seq == 1 && resAll.trades[0].symbol == "GBPUSD", "ALL stream received trade #1")
+        must(resAll.trades[1].seq == 2 && resAll.trades[1].symbol == "EURUSD", "ALL stream received trade #2")
+        must(resEur.trades[0].seq == 2 && resEur.trades[0].symbol == "EURUSD", "EURUSD filter skipped GBPUSD and got #2")
+        must(wakeMs < 1500, &($"expected instant WAIT wakeup (<1500ms), took {wakeMs}ms"))
+        println($"sse h2 wakeup ok wakeMs={wakeMs} all=2 eur=1")
+
+        // 3. Verify closing HTTP/2 SSE streams cancels the dedicated LexDB connections cleanly
+        var closedOk = false
+        for tries in 0..20 {
+            let stAfter = getStats(&cH2, &base)
+            if stAfter.activeStreams == 0 {
+                closedOk = true
+                break
+            }
+            let _sl = task.sleep(50)
+        }
+        must(closedOk, "activeStreams did not return to 0 after HTTP/2 SSE streams closed")
+        println("sse cleanup ok activeStreams=0")
+
+        // 4. Last-Event-ID resume: post trade #3 offline, then reconnect with Last-Event-ID: 1 -> gets #2 and #3
+        let t3 = postTrade(&cH2, &base, "USDJPY", "BUY", "154.2500", 1000, "yen-3")
+        must(t3.seq == 3, "trade #3 seq")
+        let task.Handoff{promise: pRes, future: fReadyRes} = task.promise[str]()
+        let futRes = s.start(sseSubscriber, StreamJob{
+            base: base.clone(), path: "/api/stream", lastId: "1", wantTrades: 2, readyPromise: pRes
+        })
+        let _pr = fReadyRes.wait().unwrap()
+        let resResume = futRes.wait().unwrap()
+        must(len(resResume.err) == 0 && len(resResume.trades) == 2, &($"resume err={resResume.err}"))
+        must(resResume.trades[0].seq == 2 && resResume.trades[1].seq == 3, "Last-Event-ID caught up #2 and #3")
+        println("sse resume ok seqs=2,3")
+    })
+
+    // 5. Compressed GET /api/trades (zstd) + Excel & Postgres CSV exports
+    let rList = cH2.get($"{base}/api/trades?limit=10").unwrap()
+    must(rList.status == 200, "GET /api/trades status")
+    let listTxt = rList.text().unwrap()
+    let listed = json.decode[[]Trade](&listTxt).unwrap()
+    must(len(listed) == 3 && listed[0].seq == 3 && listed[2].seq == 1, "GET /api/trades count & order")
+    println($"list ok count={len(listed)}")
+
+    let rCsv = cH2.get($"{base}/api/trades/export.csv").unwrap()
+    must(rCsv.status == 200, "GET /api/trades/export.csv status")
+    let csvTxt = rCsv.text().unwrap()
+    let csvTrades = csv.decodeWith[Trade](&csvTxt, csv.excel()).unwrap()
+    must(len(csvTrades) == 3 && csvTrades[0].notional == 154250.0000m, "Excel CSV round-trip")
+    println($"csv excel ok count={len(csvTrades)}")
+
+    let rPgCsv = cH2.get($"{base}/api/trades/export.csv?format=pg").unwrap()
+    must(rPgCsv.status == 200, "GET /api/trades/export.csv?format=pg status")
+    let pgCsvTrades = csv.decodeWith[Trade](&(rPgCsv.text().unwrap()), csv.postgresCsv()).unwrap()
+    must(len(pgCsvTrades) == 3, "Postgres CSV round-trip")
+    println($"csv pg ok count={len(pgCsvTrades)}")
+
+    // 6. Clean graceful server shutdown
+    let rStop = cH2.post($"{base}/api/shutdown", "text/plain", "").unwrap()
+    must(rStop.status == 200, "POST /api/shutdown status")
+    let _st = rStop.text()
+    println("ALL E2E CHECKS PASSED")
+}

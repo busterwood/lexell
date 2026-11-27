@@ -1,0 +1,213 @@
+// ui: embedded single-page HTML/JS dashboard for the Live Trade Tape demo.
+// Connects to GET /api/stream via EventSource (SSE) and submits trades via POST /api/trades.
+
+pub const DASHBOARD_HTML = `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Lexell + LexDB Live Trade Tape</title>
+<style>
+  :root {
+    --bg: #0f1419; --panel: #161d26; --border: #263241; --text: #e6edf3;
+    --muted: #8b9bb0; --buy: #3fb950; --sell: #f85149; --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px; }
+  h1 { margin: 0; font-size: 18px; font-weight: 600; }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 2px; }
+  .badge { display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px; background: var(--panel); border: 1px solid var(--border); font-size: 13px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); }
+  .dot.live { background: var(--buy); box-shadow: 0 0 8px var(--buy); }
+  main { max-width: 1100px; margin: 20px auto; padding: 0 20px; display: grid; grid-template-columns: 320px 1fr; gap: 20px; }
+  @media (max-width: 820px) { main { grid-template-columns: 1fr; } }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .card h2 { margin: 0 0 12px; font-size: 15px; font-weight: 600; }
+  label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 4px; }
+  input, select { width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg); color: var(--text); font-size: 14px; }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  button { margin-top: 14px; width: 100%; padding: 10px; border: 0; border-radius: 6px; background: var(--accent); color: #091018; font-weight: 600; font-size: 14px; cursor: pointer; }
+  button:hover { filter: brightness(1.08); }
+  .toolbar { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 12px; flex-wrap: wrap; }
+  .pills { display: flex; gap: 6px; flex-wrap: wrap; }
+  .pill { margin: 0; width: auto; padding: 5px 10px; font-size: 12px; background: var(--bg); color: var(--muted); border: 1px solid var(--border); border-radius: 6px; }
+  .pill.active { background: var(--accent); color: #091018; border-color: var(--accent); }
+  a.export { color: var(--accent); font-size: 13px; text-decoration: none; }
+  table { width: 100%; border-collapse: collapse; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 500; font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; }
+  td.num, th.num { text-align: right; }
+  .BUY { color: var(--buy); font-weight: 600; }
+  .SELL { color: var(--sell); font-weight: 600; }
+  tr.flash { animation: flash 0.7s ease-out; }
+  @keyframes flash { from { background: rgba(88,166,255,0.22); } to { background: transparent; } }
+  #err { color: var(--sell); font-size: 13px; margin-top: 8px; min-height: 18px; }
+  .hint { margin-top: 14px; font-size: 12px; color: var(--muted); line-height: 1.5; }
+  code { background: var(--bg); padding: 2px 5px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Lexell + LexDB Live Trade Tape</h1>
+    <div class="sub">HTTP/1.1 &amp; HTTP/2 (h2c) · Server-Sent Events backed directly by LexDB <code>SELECT ... WAIT</code> (no polling, no pool, no broker)</div>
+  </div>
+  <div class="badge"><span id="dot" class="dot"></span><span id="status">Connecting...</span></div>
+</header>
+<main>
+  <section class="card">
+    <h2>Submit Trade</h2>
+    <form id="tradeForm">
+      <div class="row2">
+        <div>
+          <label for="symbol">Symbol</label>
+          <select id="symbol">
+            <option value="EURUSD">EURUSD</option>
+            <option value="GBPUSD">GBPUSD</option>
+            <option value="USDJPY">USDJPY</option>
+            <option value="BTCUSD">BTCUSD</option>
+          </select>
+        </div>
+        <div>
+          <label for="side">Side</label>
+          <select id="side">
+            <option value="BUY">BUY</option>
+            <option value="SELL">SELL</option>
+          </select>
+        </div>
+      </div>
+      <div class="row2">
+        <div>
+          <label for="price">Price (Decimal)</label>
+          <input id="price" value="1.0845" required>
+        </div>
+        <div>
+          <label for="qty">Quantity</label>
+          <input id="qty" type="number" min="1" value="10000" required>
+        </div>
+      </div>
+      <label for="note">Note</label>
+      <input id="note" placeholder="optional desk note" value="desk-1">
+      <button type="submit">Post Trade (POST /api/trades)</button>
+      <div id="err"></div>
+    </form>
+    <div class="hint">
+      Each SSE subscriber holds one dedicated LexDB connection running a prepared
+      <code>SELECT ... WHERE seq &gt; $1 ORDER BY seq LIMIT 64 WAIT 10 SECONDS</code>
+      until the HTTP stream closes. Posting a trade—or inserting from <code>psql</code>—wakes
+      all waiting streams immediately.
+    </div>
+  </section>
+
+  <section class="card">
+    <div class="toolbar">
+      <div class="pills" id="filters">
+        <button type="button" class="pill active" data-sym="">ALL</button>
+        <button type="button" class="pill" data-sym="EURUSD">EURUSD</button>
+        <button type="button" class="pill" data-sym="GBPUSD">GBPUSD</button>
+        <button type="button" class="pill" data-sym="USDJPY">USDJPY</button>
+        <button type="button" class="pill" data-sym="BTCUSD">BTCUSD</button>
+      </div>
+      <a class="export" id="csvLink" href="/api/trades/export.csv">Download Excel CSV</a>
+    </div>
+    <table>
+      <thead>
+        <tr>
+          <th>Seq</th>
+          <th>Symbol</th>
+          <th>Side</th>
+          <th class="num">Price</th>
+          <th class="num">Qty</th>
+          <th class="num">Notional</th>
+          <th>Note</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+  </section>
+</main>
+<script>
+let currentSym = "";
+let es = null;
+const tbody = document.getElementById("rows");
+const dot = document.getElementById("dot");
+const statusEl = document.getElementById("status");
+const errEl = document.getElementById("err");
+const csvLink = document.getElementById("csvLink");
+
+function escHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function addRow(t, flash) {
+  const tr = document.createElement("tr");
+  if (flash) tr.className = "flash";
+  tr.innerHTML =
+    "<td>#" + t.seq + "</td><td>" + escHtml(t.symbol) + "</td><td class=\"" + escHtml(t.side) + "\">" + escHtml(t.side) + "</td>" +
+    "<td class=\"num\">" + escHtml(t.price) + "</td><td class=\"num\">" + t.qty + "</td>" +
+    "<td class=\"num\">" + escHtml(t.notional) + "</td><td>" + escHtml(t.note || "") + "</td>";
+  tbody.prepend(tr);
+  while (tbody.children.length > 100) tbody.removeChild(tbody.lastChild);
+}
+
+function connectStream(sym) {
+  if (es) es.close();
+  tbody.innerHTML = "";
+  currentSym = sym;
+  csvLink.href = sym ? ("/api/trades/export.csv?symbol=" + encodeURIComponent(sym)) : "/api/trades/export.csv";
+  const q = sym ? ("?symbol=" + encodeURIComponent(sym)) : "";
+  dot.className = "dot";
+  statusEl.textContent = "Connecting...";
+  es = new EventSource("/api/stream" + q);
+  es.addEventListener("ready", function(ev) {
+    const info = JSON.parse(ev.data);
+    dot.className = "dot live";
+    statusEl.textContent = "Live (" + (info.symbol || "ALL") + " · after #" + info.after + ")";
+  });
+  es.addEventListener("trade", function(ev) {
+    addRow(JSON.parse(ev.data), true);
+  });
+  es.onerror = function() {
+    dot.className = "dot";
+    statusEl.textContent = "Reconnecting...";
+  };
+}
+
+document.getElementById("filters").addEventListener("click", function(e) {
+  const btn = e.target.closest("button[data-sym]");
+  if (!btn) return;
+  document.querySelectorAll(".pill").forEach(function(b) { b.classList.remove("active"); });
+  btn.classList.add("active");
+  connectStream(btn.dataset.sym);
+});
+
+document.getElementById("tradeForm").addEventListener("submit", async function(e) {
+  e.preventDefault();
+  errEl.textContent = "";
+  const body = {
+    symbol: document.getElementById("symbol").value,
+    side: document.getElementById("side").value,
+    price: document.getElementById("price").value.trim(),
+    qty: Number(document.getElementById("qty").value),
+    note: document.getElementById("note").value
+  };
+  try {
+    const res = await fetch("/api/trades", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!res.ok) {
+      errEl.textContent = "HTTP " + res.status + ": " + (await res.text());
+    }
+  } catch (ex) {
+    errEl.textContent = String(ex);
+  }
+});
+
+connectStream("");
+</script>
+</body>
+</html>
+`

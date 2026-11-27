@@ -1642,6 +1642,7 @@ pub type Session = record {
     portalCols: []Column
     srvFail: bool               // the failure was a server's ErrorResponse (startup)
     shut: bool
+    closeOnCancel: bool         // close socket immediately on task cancellation instead of CancelRequest+drain
 }
 
 // Whether an idle session's connection is still there: nothing read ahead
@@ -1656,8 +1657,10 @@ fn newSession(st: Stream, unixPath: &str, addr: &str): Session {
     return Session{st: st, ib: Inbox{buf: array(INBOX, byte(0)), pos: 0, end: 0}, chunk: "", cpos: 0, seq: 0, out: newOut(),
                    state: S_BUSY, why: "", tx: TX_IDLE, params: [], pid: 0, key: "", unixPath: unixPath.clone(), addr: addr.clone(),
                    notices: [], notifies: [], dropped: 0, lastErr: None, trips: 0, portalCols: [],
-                   srvFail: false, shut: false}
+                   srvFail: false, shut: false, closeOnCancel: false}
 }
+
+pub fn (s: mut &Session) setCloseOnCancel(on: bool) { s.closeOnCancel = on }
 
 pub fn (s: &Session) broken(): bool { return s.state == S_BROKEN }
 
@@ -2695,6 +2698,11 @@ fn (s: mut &Session) drain(ms: int, w: Where): Result[Unit, Error] {
 // nothing is sent but the cancel. The session is ready again afterwards, or broken.
 fn (s: mut &Session) abort(w: Where) {
     if s.state == S_BROKEN { return }
+    if s.closeOnCancel {
+        s.breakWith("cancelled")
+        s.close()
+        return
+    }
     let c = s.cancelRequest(w)
     let d = s.drain(ABORT_MS, w)
 }
