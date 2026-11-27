@@ -989,6 +989,37 @@ pub fn (h: &WriteHalf) writeStalled(data: &[byte], stallMs: int, w: Where): Resu
     return writeAll(h.fd, &h.addr, data, stallMs, w)
 }
 
+// Writes what the socket takes now, without parking: the count sent,
+// maybe less than len(data), 0 when the socket's buffer is full.
+pub fn (h: &WriteHalf) writeNow(data: &[byte]): Result[int, io.IoError] {
+    while true {
+        let n = rtWrite(h.fd, data, len(data))
+        if n >= 0 { return Ok(n) }
+        if n == -EAGAIN { return Ok(0) }
+        if n != -EINTR { return Err(io.ioError(-n, "write", &h.addr)) }
+    }
+    return Err(io.ioError(EINVAL, "write", &h.addr))
+}
+
+// Parks until the socket is writable, with an optional no-progress limit of
+// stallMs milliseconds (0: no limit). Used alongside writeNow by multiplexed
+// protocols that must know the exact byte offset written before a cancel or
+// timeout.
+pub fn (h: &WriteHalf) waitWrite(stallMs: int, w: Where): Result[Unit, io.IoError] {
+    let k = rtCheck(w.cstr())
+    if k != 0 { return Err(stopped(k, "write", &h.addr)) }
+    var r = 0
+    if stallMs > 0 {
+        let old = rtWithin(stallMs)
+        r = rtWait(h.fd, 1, w.cstr())
+        rtRestore(old)
+    } else {
+        r = rtWait(h.fd, 1, w.cstr())
+    }
+    if r != 0 { return Err(stopped(r, "write", &h.addr)) }
+    return Ok(Unit{})
+}
+
 // The write loop of Conn and WriteHalf: all of data, parking while the
 // socket's buffer is full, with an optional no-progress limit of stallMs.
 fn writeAll(fd: int, addr: &str, data: &[byte], stallMs: int, w: Where): Result[Unit, io.IoError] {

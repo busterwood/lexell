@@ -1,0 +1,1653 @@
+// h2client: RFC 9113 HTTP/2 multiplexed client connection engine for lib/http.
+//
+// Uses a leader/follower (turn-taking) multiplexer so multiple concurrent tasks
+// share one HTTP/2 TCP/TLS connection without needing a detached background
+// task outside a task.Scope. Full-duplex reading and writing run on split
+// net.ReadHalf / net.WriteHalf with tls.Engine driven inside Shared.with.
+import "h2"
+import "hpack"
+import "net"
+import "io"
+import "tls"
+import "task"
+import "time"
+import "strings"
+
+const CLIENT_STREAM_WIN = 262144    // 256 KiB per-stream receive window
+const CLIENT_CONN_WIN = 1048576     // 1 MiB connection receive window
+const CLIENT_MAX_HEAD = 65536
+const CLIENT_MAX_HEADERS = 100
+const CLIENT_MAX_INTERIM = 8
+const CLIENT_CHECK_IDLE_NS = 100000000
+
+pub type ErrKind = value closed {
+    Io
+    Tls
+    Timeout
+    Cancelled
+    Protocol
+    TooLarge
+    Refused         // REFUSED_STREAM or GOAWAY before processing (safe to retry)
+    Unavailable     // connection full/draining/closed; caller should dial a fresh one
+}
+
+pub type ClientError = value record {
+    pub kind: ErrKind
+    pub msg: str
+}
+
+fn cErr(k: ErrKind, msg: &str): ClientError {
+    return ClientError{kind: k, msg: msg.clone()}
+}
+
+pub type RespHead = record {
+    pub status: int
+    pub headers: []hpack.Field
+    pub contentLength: int          // >= 0 if Content-Length present, else -1
+    pub endStream: bool
+}
+
+type StreamState = record {
+    id: int
+    gotHead: bool
+    status: int
+    headers: []hpack.Field
+    trailers: []hpack.Field
+    contentLength: int
+    interimCount: int
+    inBuf: []byte
+    inOff: int
+    inDone: bool
+    recvWin: int
+    recvConsumed: int
+    recvBytes: int
+    sendWin: int
+    err: Option[ClientError]
+    waiter: Option[task.Promise[int]]
+    inReadQueue: bool
+    localEnd: bool
+    resetSent: bool
+}
+
+fn newClientStream(id: int, sendWin: int, endStream: bool): StreamState {
+    return StreamState{
+        id: id,
+        gotHead: false,
+        status: 0,
+        headers: [],
+        trailers: [],
+        contentLength: -1,
+        interimCount: 0,
+        inBuf: [],
+        inOff: 0,
+        inDone: false,
+        recvWin: CLIENT_STREAM_WIN,
+        recvConsumed: 0,
+        recvBytes: 0,
+        sendWin: sendWin,
+        err: None,
+        waiter: None,
+        inReadQueue: false,
+        localEnd: endStream,
+        resetSent: false,
+    }
+}
+
+type ConnState = record {
+    rh: Option[net.ReadHalf]
+    wh: Option[net.WriteHalf]
+    tls: Option[tls.Engine]
+    dec: hpack.Decoder
+    enc: hpack.Encoder
+    // Persisted reader buffers (survive leader handoffs)
+    inBuf: []byte
+    inR: int
+    inW: int
+    inRaw: []byte
+    inEof: bool
+    // Persisted CONTINUATION assembly state
+    contStream: int
+    contBlock: []byte
+    contEndStream: bool
+    // Persisted writer buffer & exact offset (survive mid-write cancel/timeout)
+    ctrlOut: []byte
+    dataOut: []byte
+    outBuf: []byte
+    outOff: int
+    // Streams & flow control
+    streams: Map[int, StreamState]
+    nextStreamId: int
+    activeCount: int
+    peerMaxConcurrent: int
+    peerMaxFrame: int
+    peerInitWin: int
+    connRecvWin: int
+    connRecvConsumed: int
+    connSendWin: int
+    // Leader/follower coordination
+    readerActive: bool
+    writerActive: bool
+    readWaiters: []int
+    readWaitHead: int
+    writeWaiters: []task.Promise[int]
+    connWinWaiters: []task.Promise[int]
+    // Lifecycle
+    gotServerSettings: bool
+    goaway: bool
+    goawayLastId: int
+    shut: bool
+    connErr: str
+    lastUsedNs: int
+    idleUntilNs: int
+}
+
+pub type Conn = value record {
+    sh: task.Shared[ConnState]
+}
+
+pub type Stream = value record {
+    sh: task.Shared[ConnState]
+    pub id: int
+    finished: bool
+}
+
+pub fn (c: &Conn) share(): Conn { return Conn{sh: c.sh.share()} }
+
+fn appendSlice(dst: mut &[]byte, src: &[byte]) {
+    for i in 0..len(src) { append(dst, src[i]) }
+}
+
+fn wakeOpt(p: mut &Option[task.Promise[int]]) {
+    match replace(p, None) {
+        Some(pr) { pr.complete(0) }
+        None {}
+    }
+}
+
+fn wakeAll(ps: mut &[]task.Promise[int]) {
+    var list = replace(ps, [])
+    while len(list) > 0 {
+        let pr = pop(mut &list)
+        pr.complete(0)
+    }
+}
+
+// Wraps an already-connected socket (and optional post-handshake tls.Engine)
+// as a multiplexed HTTP/2 client connection, queuing the client preface,
+// initial SETTINGS and connection WINDOW_UPDATE.
+pub fn newConn(sock: net.Conn, tlsEng: Option[tls.Engine], idleMs: int): Conn {
+    let net.Halves{read: rh, write: wh} = sock.split()
+    var ctrl: []byte = []
+    let pfx = strToBytes(h2.PREFACE)
+    appendSlice(mut &ctrl, &pfx)
+    let sets = [
+        h2.Setting{id: h2.SET_ENABLE_PUSH, val: 0},
+        h2.Setting{id: h2.SET_INITIAL_WINDOW_SIZE, val: CLIENT_STREAM_WIN},
+        h2.Setting{id: h2.SET_MAX_FRAME_SIZE, val: h2.DEFAULT_MAX_FRAME_SIZE},
+        h2.Setting{id: h2.SET_MAX_HEADER_LIST_SIZE, val: CLIENT_MAX_HEAD},
+    ]
+    h2.putSettings(mut &ctrl, &sets)
+    h2.putWindowUpdate(mut &ctrl, 0, CLIENT_CONN_WIN - h2.DEFAULT_INITIAL_WINDOW)
+    let now = time.monotonicNs()
+    let st = ConnState{
+        rh: Some(rh),
+        wh: Some(wh),
+        tls: tlsEng,
+        dec: hpack.newDecoder(h2.DEFAULT_HEADER_TABLE_SIZE),
+        enc: hpack.newEncoder(h2.DEFAULT_HEADER_TABLE_SIZE),
+        inBuf: array(16384, byte(0)),
+        inR: 0,
+        inW: 0,
+        inRaw: array(17408, byte(0)),
+        inEof: false,
+        contStream: 0,
+        contBlock: [],
+        contEndStream: false,
+        ctrlOut: ctrl,
+        dataOut: [],
+        outBuf: [],
+        outOff: 0,
+        streams: newMap[int, StreamState](),
+        nextStreamId: 1,
+        activeCount: 0,
+        peerMaxConcurrent: 100,
+        peerMaxFrame: h2.DEFAULT_MAX_FRAME_SIZE,
+        peerInitWin: h2.DEFAULT_INITIAL_WINDOW,
+        connRecvWin: CLIENT_CONN_WIN,
+        connRecvConsumed: 0,
+        connSendWin: h2.DEFAULT_INITIAL_WINDOW,
+        readerActive: false,
+        writerActive: false,
+        readWaiters: [],
+        readWaitHead: 0,
+        writeWaiters: [],
+        connWinWaiters: [],
+        gotServerSettings: false,
+        goaway: false,
+        goawayLastId: h2.MAX_STREAM_ID,
+        shut: false,
+        connErr: "",
+        lastUsedNs: now,
+        idleUntilNs: now + idleMs * 1000000,
+    }
+    return Conn{sh: task.shared(st)}
+}
+
+pub fn (c: &Conn) isDead(): bool {
+    var dead = false
+    c.sh.with(fn(st: mut &ConnState) {
+        dead = st.shut || (st.goaway && st.activeCount == 0)
+    })
+    return dead
+}
+
+pub fn (c: &Conn) isIdle(): bool {
+    var idle = false
+    c.sh.with(fn(st: mut &ConnState) {
+        idle = !st.shut && st.activeCount == 0
+    })
+    return idle
+}
+
+pub fn (c: &Conn) knownMaxStreams(): int {
+    var m = 0
+    c.sh.with(fn(st: mut &ConnState) {
+        if st.gotServerSettings { m = st.peerMaxConcurrent }
+    })
+    return m
+}
+
+pub fn (c: &Conn) setInitialMaxStreams(m: int) {
+    if m <= 0 { return }
+    c.sh.with(fn(st: mut &ConnState) {
+        if !st.gotServerSettings { st.peerMaxConcurrent = m }
+    })
+}
+
+pub fn (c: &Conn) canTakeStream(nowNs: int): bool {
+    var ok = false
+    var needCheck = false
+    c.sh.with(fn(st: mut &ConnState) {
+        if st.shut || st.goaway { return }
+        if st.nextStreamId >= h2.MAX_STREAM_ID - 2 { return }
+        if st.activeCount == 0 && nowNs >= st.idleUntilNs {
+            st.shut = true
+            return
+        }
+        if st.activeCount >= st.peerMaxConcurrent { return }
+        ok = true
+        if st.activeCount == 0 && !st.readerActive && nowNs - st.lastUsedNs > CLIENT_CHECK_IDLE_NS {
+            needCheck = true
+        }
+    })
+    if ok && needCheck {
+        // Non-blocking drain of any pending server frames (e.g. GOAWAY or EOF) while idle
+        if !c.drainIdle() { return false }
+    }
+    return ok
+}
+
+// Non-blocking check on an idle connection to consume any server SETTINGS/PING/GOAWAY
+// or detect a server close before opening a new stream.
+fn (c: &Conn) drainIdle(): bool {
+    var rhOpt: Option[net.ReadHalf] = None
+    var gotLeader = false
+    c.sh.with(fn(st: mut &ConnState) {
+        if st.shut || st.goaway { return }
+        if st.readerActive || st.rh.isNone() { return }
+        st.readerActive = true
+        rhOpt = replace(mut &st.rh, None)
+        gotLeader = true
+    })
+    if !gotLeader {
+        var ok = false
+        c.sh.with(fn(st: mut &ConnState) { ok = !st.shut && !st.goaway })
+        return ok
+    }
+    let rh = replace(mut &rhOpt, None).unwrap()
+    var alive = true
+    var buf = array(4096, byte(0))
+    while alive {
+        var isTls = false
+        c.sh.with(fn(st: mut &ConnState) { isTls = st.tls.isSome() })
+        if isTls {
+            var wantIn = false
+            var got = 0
+            var fail = false
+            c.sh.with(fn(st: mut &ConnState) {
+                match replace(mut &st.tls, None) {
+                    Some(e) {
+                        var eng = e
+                        match eng.read(mut &buf) {
+                            Ok(n) {
+                                if n == tls.WANT_INPUT { wantIn = true } else { got = n }
+                            }
+                            Err(_) { fail = true }
+                        }
+                        if eng.pending() > 0 {
+                            let enc = eng.takeOutput()
+                            if len(enc) > 0 { appendSlice(mut &st.outBuf, &enc) }
+                        }
+                        st.tls = Some(eng)
+                    }
+                    None { fail = true }
+                }
+            })
+            if fail { alive = false; break }
+            if !wantIn {
+                if got == 0 { alive = false; break }
+                c.feedPlaintext(&buf[0..got])
+                if !c.processFrames() { alive = false; break }
+                continue
+            }
+            var raw = array(4096, byte(0))
+            match rh.readNow(mut &raw) {
+                Ok(n) {
+                    if n == 0 { alive = false; break }
+                    c.sh.with(fn(st: mut &ConnState) {
+                        match replace(mut &st.tls, None) {
+                            Some(e) { var eng = e; eng.feed(&raw[0..n]); st.tls = Some(eng) }
+                            None {}
+                        }
+                    })
+                }
+                Err(e) {
+                    if e.errno != 11 { alive = false }
+                    break
+                }
+            }
+        } else {
+            match rh.readNow(mut &buf) {
+                Ok(n) {
+                    if n == 0 { alive = false; break }
+                    c.feedPlaintext(&buf[0..n])
+                    if !c.processFrames() { alive = false; break }
+                }
+                Err(e) {
+                    if e.errno != 11 { alive = false }
+                    break
+                }
+            }
+        }
+    }
+    var rhBack: Option[net.ReadHalf] = Some(rh)
+    c.sh.with(fn(st: mut &ConnState) {
+        st.rh = replace(mut &rhBack, None)
+        st.readerActive = false
+        if !alive { st.shut = true }
+    })
+    if !alive {
+        c.failAll(ErrKind.Io, "connection closed while idle")
+        return false
+    }
+    var ok = false
+    c.sh.with(fn(st: mut &ConnState) { ok = !st.shut && !st.goaway })
+    return ok
+}
+
+pub fn (c: &Conn) close() {
+    c.failAll(ErrKind.Io, "connection closed")
+}
+
+// ---------------------------------------------------------------- opening & sending a request
+
+pub type StartRes = record {
+    pub stream: Stream
+    pub head: RespHead
+}
+
+// Sends an HTTP/2 request (HEADERS + optional DATA frames) and waits for the
+// final response HEADERS (skipping 1xx interim responses).
+pub fn (c: &Conn) roundTrip(method: &str, scheme: &str, authority: &str, path: &str,
+                            headers: &[]hpack.Field, body: &str, idleMs: int, w: Where): Result[StartRes, ClientError] {
+    var sid = 0
+    var availErr: Option[ClientError] = None
+    let hasBody = len(body) > 0
+    c.sh.with(fn(st: mut &ConnState) {
+        if st.shut || st.goaway || st.activeCount >= st.peerMaxConcurrent || st.nextStreamId >= h2.MAX_STREAM_ID - 2 {
+            availErr = Some(cErr(ErrKind.Unavailable, "H2 connection cannot accept more streams"))
+            return
+        }
+        sid = st.nextStreamId
+        st.nextStreamId += 2
+        var fs: []hpack.Field = []
+        append(mut &fs, hpack.Field{name: ":method", value: method.clone()})
+        append(mut &fs, hpack.Field{name: ":scheme", value: scheme.clone()})
+        append(mut &fs, hpack.Field{name: ":authority", value: authority.clone()})
+        append(mut &fs, hpack.Field{name: ":path", value: path.clone()})
+        for f in headers {
+            let nm = strings.toLowerAscii(&f.name)
+            if nm == "host" || h2.isForbiddenHeader(&nm) { continue }
+            append(mut &fs, hpack.Field{name: nm, value: h2.trimOws(&f.value)})
+        }
+        var blk: []byte = []
+        st.enc.encode(&fs, mut &blk)
+        h2.putHeaderBlock(mut &st.dataOut, sid, &blk, !hasBody, st.peerMaxFrame)
+        st.streams.put(sid, newClientStream(sid, st.peerInitWin, !hasBody))
+        st.activeCount += 1
+        let now = time.monotonicNs()
+        st.lastUsedNs = now
+        st.idleUntilNs = now + idleMs * 1000000
+    })
+    match move(availErr) {
+        Some(e) { return Err(e) }
+        None {}
+    }
+
+    var stHandle = Stream{sh: c.sh.share(), id: sid, finished: false}
+    // Flush preface/SETTINGS/HEADERS
+    match c.flushWrites(w) {
+        Ok(_) {}
+        Err(e) {
+            stHandle.finish()
+            return Err(e)
+        }
+    }
+
+    // Stream request body if present, respecting send windows
+    if hasBody {
+        let bodyBytes = strToBytes(body)
+        match c.sendBody(sid, &bodyBytes, w) {
+            Ok(_) {}
+            Err(e) {
+                stHandle.finish()
+                return Err(e)
+            }
+        }
+    }
+
+    // Wait for final response HEADERS
+    var headOpt: Option[RespHead] = None
+    match c.waitHead(sid, w) {
+        Ok(h) { headOpt = Some(h) }
+        Err(e) {
+            stHandle.finish()
+            return Err(e)
+        }
+    }
+    return Ok(StartRes{stream: stHandle, head: replace(mut &headOpt, None).unwrap()})
+}
+
+fn (c: &Conn) sendBody(sid: int, body: &[byte], w: Where): Result[Unit, ClientError] {
+    var off = 0
+    while off < len(body) {
+        var sent = 0
+        var err: Option[ClientError] = None
+        var needWin = false
+        c.sh.with(fn(st: mut &ConnState) {
+            if st.shut {
+                err = Some(cErr(ErrKind.Io, if len(st.connErr) > 0 { &st.connErr } else { "connection closed" }))
+                return
+            }
+            if !st.streams.has(&sid) {
+                err = Some(cErr(ErrKind.Io, "stream closed"))
+                return
+            }
+            let cWin = st.connSendWin
+            let maxBurst = st.peerMaxFrame * 4
+            var fin = false
+            {
+                let ss = st.streams.atMut(sid)
+                if ss.err.isSome() {
+                    err = ss.err.clone()
+                    return
+                }
+                if ss.sendWin <= 0 || cWin <= 0 {
+                    needWin = true
+                } else {
+                    sent = len(body) - off
+                    if sent > ss.sendWin { sent = ss.sendWin }
+                    if sent > cWin { sent = cWin }
+                    if sent > maxBurst { sent = maxBurst }
+                    ss.sendWin -= sent
+                    fin = (off + sent == len(body))
+                    if fin { ss.localEnd = true }
+                }
+            }
+            if sent > 0 {
+                st.connSendWin -= sent
+                h2.putData(mut &st.dataOut, sid, &body[off..off + sent], fin, st.peerMaxFrame)
+            }
+        })
+        match move(err) {
+            Some(e) { return Err(e) }
+            None {}
+        }
+        if sent > 0 {
+            off += sent
+            try c.flushWrites(w)
+            continue
+        }
+        if needWin {
+            // Drive reading so incoming WINDOW_UPDATE frames unblock us!
+            try c.driveRead(sid, w)
+        }
+    }
+    return Ok(Unit{})
+}
+
+fn (c: &Conn) waitHead(sid: int, w: Where): Result[RespHead, ClientError] {
+    while true {
+        var got: Option[RespHead] = None
+        var err: Option[ClientError] = None
+        c.sh.with(fn(st: mut &ConnState) {
+            if !st.streams.has(&sid) {
+                err = Some(cErr(ErrKind.Io, "stream closed"))
+                return
+            }
+            let ss = st.streams.atMut(sid)
+            if ss.gotHead {
+                let hs = replace(mut &ss.headers, [])
+                got = Some(RespHead{
+                    status: ss.status,
+                    headers: hs,
+                    contentLength: ss.contentLength,
+                    endStream: ss.inDone && len(ss.inBuf) == ss.inOff && ss.err.isNone(),
+                })
+            } else if ss.err.isSome() {
+                err = ss.err.clone()
+            } else if st.shut {
+                err = Some(cErr(ErrKind.Io, if len(st.connErr) > 0 { &st.connErr } else { "connection closed" }))
+            }
+        })
+        match move(got) {
+            Some(h) { return Ok(h) }
+            None {}
+        }
+        match move(err) {
+            Some(e) { return Err(e) }
+            None {}
+        }
+        try c.driveRead(sid, w)
+    }
+    return Err(cErr(ErrKind.Protocol, "unreachable"))
+}
+
+// ---------------------------------------------------------------- Stream read / finish
+
+pub fn (s: mut &Stream) read(buf: mut &[byte], w: Where): Result[int, ClientError] {
+    if s.finished || len(buf) == 0 { return Ok(0) }
+    let sid = s.id
+    let conn = Conn{sh: s.sh.share()}
+    while true {
+        var got = 0
+        var eof = false
+        var err: Option[ClientError] = None
+        var needFlush = false
+        s.sh.with(fn(st: mut &ConnState) {
+            if !st.streams.has(&sid) {
+                if st.shut {
+                    err = Some(cErr(ErrKind.Io, if len(st.connErr) > 0 { &st.connErr } else { "connection closed" }))
+                } else {
+                    eof = true
+                }
+                return
+            }
+            var sendStreamWu = 0
+            let isShut = st.shut
+            {
+                let ss = st.streams.atMut(sid)
+                let avail = len(ss.inBuf) - ss.inOff
+                if avail > 0 {
+                    let k = min(avail, len(buf))
+                    for i in 0..k { buf[i] = ss.inBuf[ss.inOff + i] }
+                    ss.inOff += k
+                    if ss.inOff == len(ss.inBuf) {
+                        ss.inBuf = []
+                        ss.inOff = 0
+                    } else if ss.inOff >= 4096 && ss.inOff * 2 >= len(ss.inBuf) {
+                        let rem = len(ss.inBuf) - ss.inOff
+                        var nb: []byte = withCapacity(rem)
+                        for i in ss.inOff..len(ss.inBuf) { append(mut &nb, ss.inBuf[i]) }
+                        ss.inBuf = nb
+                        ss.inOff = 0
+                    }
+                    got = k
+                    ss.recvConsumed += k
+                    if !isShut && !ss.inDone && ss.recvConsumed >= CLIENT_STREAM_WIN / 2 {
+                        sendStreamWu = ss.recvConsumed
+                        ss.recvWin += sendStreamWu
+                        ss.recvConsumed = 0
+                    }
+                } else if ss.err.isSome() {
+                    err = ss.err.clone()
+                } else if ss.inDone {
+                    eof = true
+                } else if isShut {
+                    err = Some(cErr(ErrKind.Io, if len(st.connErr) > 0 { &st.connErr } else { "connection closed" }))
+                }
+            }
+            if sendStreamWu > 0 {
+                h2.putWindowUpdate(mut &st.ctrlOut, sid, sendStreamWu)
+                needFlush = true
+            }
+            if got > 0 {
+                st.connRecvConsumed += got
+                if !st.shut && st.connRecvConsumed >= CLIENT_CONN_WIN / 2 {
+                    h2.putWindowUpdate(mut &st.ctrlOut, 0, st.connRecvConsumed)
+                    st.connRecvWin += st.connRecvConsumed
+                    st.connRecvConsumed = 0
+                    needFlush = true
+                }
+            }
+        })
+        if needFlush { let r = conn.flushWrites(w) }
+        if got > 0 { return Ok(got) }
+        match move(err) {
+            Some(e) { return Err(e) }
+            None {}
+        }
+        if eof { return Ok(0) }
+        try conn.driveRead(sid, w)
+    }
+    return Ok(0)
+}
+
+// Releases the stream slot (safe to call from drop — never parks).
+// If the server had not finished sending the response, queues RST_STREAM(CANCEL)
+// and credits unread bytes back to the connection receive window, then attempts
+// an immediate non-blocking flush so the server sees the cancel promptly.
+pub fn (s: mut &Stream) finish() {
+    if s.finished { return }
+    s.finished = true
+    let sid = s.id
+    var needFlush = false
+    s.sh.with(fn(st: mut &ConnState) {
+        if !st.streams.has(&sid) { return }
+        var credit = 0
+        var sendCancel = false
+        let isShut = st.shut
+        {
+            let ss = st.streams.atMut(sid)
+            if len(ss.inBuf) > ss.inOff {
+                credit = len(ss.inBuf) - ss.inOff
+                ss.inBuf = []
+                ss.inOff = 0
+            }
+            if !ss.inDone && !ss.resetSent && !isShut {
+                ss.resetSent = true
+                sendCancel = true
+            }
+        }
+        let old = st.streams.remove(&sid)
+        if st.activeCount > 0 { st.activeCount -= 1 }
+        st.lastUsedNs = time.monotonicNs()
+        if sendCancel {
+            h2.putRstStream(mut &st.ctrlOut, sid, h2.ERR_CANCEL)
+            needFlush = true
+        }
+        if credit > 0 {
+            st.connRecvConsumed += credit
+            if !st.shut && st.connRecvConsumed >= CLIENT_CONN_WIN / 2 {
+                h2.putWindowUpdate(mut &st.ctrlOut, 0, st.connRecvConsumed)
+                st.connRecvWin += st.connRecvConsumed
+                st.connRecvConsumed = 0
+                needFlush = true
+            }
+        }
+    })
+    if needFlush {
+        let conn = Conn{sh: s.sh.share()}
+        conn.tryFlushNow()
+    }
+}
+
+// Non-blocking best-effort flush of queued outbound frames (never parks).
+// Safe to call from drop (Stream.finish) or after a caller's deadline expired.
+fn (c: &Conn) tryFlushNow() {
+    var whOpt: Option[net.WriteHalf] = None
+    var chunk: []byte = []
+    var chunkOff = 0
+    var tlsErrStr = ""
+    c.sh.with(fn(st: mut &ConnState) {
+        if st.shut || st.writerActive || st.wh.isNone() { return }
+        if len(st.ctrlOut) == 0 && len(st.dataOut) == 0 && st.outOff >= len(st.outBuf) { return }
+        if len(st.ctrlOut) > 0 || len(st.dataOut) > 0 {
+            let ctrl = replace(mut &st.ctrlOut, [])
+            let data = replace(mut &st.dataOut, [])
+            match replace(mut &st.tls, None) {
+                Some(e) {
+                    var eng = e
+                    if len(ctrl) > 0 {
+                        match eng.write(&ctrl) {
+                            Ok(_) {}
+                            Err(te) { tlsErrStr = te.toStr() }
+                        }
+                    }
+                    if len(tlsErrStr) == 0 && len(data) > 0 {
+                        match eng.write(&data) {
+                            Ok(_) {}
+                            Err(te) { tlsErrStr = te.toStr() }
+                        }
+                    }
+                    if len(tlsErrStr) == 0 {
+                        let enc = eng.takeOutput()
+                        if len(enc) > 0 { appendSlice(mut &st.outBuf, &enc) }
+                    }
+                    st.tls = Some(eng)
+                }
+                None {
+                    if len(ctrl) > 0 { appendSlice(mut &st.outBuf, &ctrl) }
+                    if len(data) > 0 { appendSlice(mut &st.outBuf, &data) }
+                }
+            }
+        }
+        if len(tlsErrStr) > 0 { return }
+        if st.outOff < len(st.outBuf) {
+            st.writerActive = true
+            whOpt = replace(mut &st.wh, None)
+            chunk = replace(mut &st.outBuf, [])
+            chunkOff = st.outOff
+            st.outOff = 0
+        }
+    })
+    if len(tlsErrStr) > 0 {
+        c.failAll(ErrKind.Tls, &tlsErrStr)
+        return
+    }
+    if whOpt.isNone() { return }
+    let wh = replace(mut &whOpt, None).unwrap()
+    var fatalMsg = ""
+    while chunkOff < len(chunk) {
+        match wh.writeNow(&chunk[chunkOff..]) {
+            Ok(n) {
+                if n > 0 { chunkOff += n } else { break }
+            }
+            Err(e) {
+                fatalMsg = e.toStr()
+                break
+            }
+        }
+    }
+    var whBack: Option[net.WriteHalf] = Some(wh)
+    var ww: []task.Promise[int] = []
+    var rem = replace(mut &chunk, [])
+    let offKeep = chunkOff
+    c.sh.with(fn(st: mut &ConnState) {
+        if offKeep < len(rem) && len(fatalMsg) == 0 {
+            var merged: []byte = withCapacity(len(rem) - offKeep + len(st.outBuf) - st.outOff)
+            for i in offKeep..len(rem) { append(mut &merged, rem[i]) }
+            for i in st.outOff..len(st.outBuf) { append(mut &merged, st.outBuf[i]) }
+            st.outBuf = merged
+            st.outOff = 0
+        }
+        st.wh = replace(mut &whBack, None)
+        st.writerActive = false
+        ww = replace(mut &st.writeWaiters, [])
+    })
+    wakeAll(mut &ww)
+    if len(fatalMsg) > 0 { c.failAll(ErrKind.Io, &fatalMsg) }
+}
+
+// ---------------------------------------------------------------- turn-taking writer
+
+fn (c: &Conn) flushWrites(w: Where): Result[Unit, ClientError] {
+    while true {
+        var whOpt: Option[net.WriteHalf] = None
+        var fut: Option[task.Future[int]] = None
+        var done = false
+        var err: Option[ClientError] = None
+        c.sh.with(fn(st: mut &ConnState) {
+            if st.shut {
+                err = Some(cErr(ErrKind.Io, if len(st.connErr) > 0 { &st.connErr } else { "connection closed" }))
+                return
+            }
+            let hasWork = len(st.ctrlOut) > 0 || len(st.dataOut) > 0 || st.outOff < len(st.outBuf)
+            if !hasWork {
+                done = true
+                return
+            }
+            if !st.writerActive && st.wh.isSome() {
+                st.writerActive = true
+                whOpt = replace(mut &st.wh, None)
+            } else {
+                let task.Handoff{promise: pr, future: f} = task.promise[int]()
+                append(mut &st.writeWaiters, pr)
+                fut = Some(f)
+            }
+        })
+        match move(err) {
+            Some(e) { return Err(e) }
+            None {}
+        }
+        if done { return Ok(Unit{}) }
+        match move(fut) {
+            Some(f) {
+                match f.wait(w) {
+                    Ok(_) { continue }
+                    Err(k) {
+                        let ek = if k == task.Cancelled.Timeout { ErrKind.Timeout } else { ErrKind.Cancelled }
+                        return Err(cErr(ek, &(k.toStr() + " while writing HTTP/2 request")))
+                    }
+                }
+            }
+            None {}
+        }
+
+        // We hold writer leadership (wh)
+        let wh = replace(mut &whOpt, None).unwrap()
+        var writeErr: Option[ClientError] = None
+        var fatal = false
+        var fatalKind = ErrKind.Io
+        while true {
+            var chunk: []byte = []
+            var chunkOff = 0
+            var tlsErrStr = ""
+            c.sh.with(fn(st: mut &ConnState) {
+                // Move pending plaintext frames into outBuf (encrypting through TLS if active)
+                if len(st.ctrlOut) > 0 || len(st.dataOut) > 0 {
+                    let ctrl = replace(mut &st.ctrlOut, [])
+                    let data = replace(mut &st.dataOut, [])
+                    match replace(mut &st.tls, None) {
+                        Some(e) {
+                            var eng = e
+                            if len(ctrl) > 0 {
+                                match eng.write(&ctrl) {
+                                    Ok(_) {}
+                                    Err(te) { tlsErrStr = te.toStr() }
+                                }
+                            }
+                            if len(tlsErrStr) == 0 && len(data) > 0 {
+                                match eng.write(&data) {
+                                    Ok(_) {}
+                                    Err(te) { tlsErrStr = te.toStr() }
+                                }
+                            }
+                            if len(tlsErrStr) == 0 {
+                                let enc = eng.takeOutput()
+                                if len(enc) > 0 { appendSlice(mut &st.outBuf, &enc) }
+                            }
+                            st.tls = Some(eng)
+                        }
+                        None {
+                            if len(ctrl) > 0 { appendSlice(mut &st.outBuf, &ctrl) }
+                            if len(data) > 0 { appendSlice(mut &st.outBuf, &data) }
+                        }
+                    }
+                }
+                if len(tlsErrStr) > 0 { return }
+                if st.outOff < len(st.outBuf) {
+                    chunk = replace(mut &st.outBuf, [])
+                    chunkOff = st.outOff
+                    st.outOff = 0
+                }
+            })
+            if len(tlsErrStr) > 0 {
+                fatal = true
+                fatalKind = ErrKind.Tls
+                writeErr = Some(cErr(ErrKind.Tls, &tlsErrStr))
+                break
+            }
+            if len(chunk) == 0 { break }
+            while chunkOff < len(chunk) {
+                match wh.writeNow(&chunk[chunkOff..]) {
+                    Ok(n) {
+                        if n > 0 {
+                            chunkOff += n
+                            continue
+                        }
+                    }
+                    Err(e) {
+                        fatal = true
+                        writeErr = Some(cErr(ErrKind.Io, &e.toStr()))
+                        break
+                    }
+                }
+                match wh.waitWrite(0, w) {
+                    Ok(_) {}
+                    Err(e) {
+                        if e.isTimeout() || e.isCancelled() {
+                            // Preserve exact remaining bytes so another writer task can finish seamlessly!
+                            var rem = replace(mut &chunk, [])
+                            let offKeep = chunkOff
+                            c.sh.with(fn(st: mut &ConnState) {
+                                // Prepend remaining unsent bytes ahead of anything queued meanwhile
+                                var merged: []byte = withCapacity(len(rem) - offKeep + len(st.outBuf) - st.outOff)
+                                for i in offKeep..len(rem) { append(mut &merged, rem[i]) }
+                                for i in st.outOff..len(st.outBuf) { append(mut &merged, st.outBuf[i]) }
+                                st.outBuf = merged
+                                st.outOff = 0
+                            })
+                            let ek = if e.isTimeout() { ErrKind.Timeout } else { ErrKind.Cancelled }
+                            writeErr = Some(cErr(ek, &e.toStr()))
+                            break
+                        }
+                        fatal = true
+                        writeErr = Some(cErr(ErrKind.Io, &e.toStr()))
+                        break
+                    }
+                }
+            }
+            if writeErr.isSome() { break }
+        }
+        // Release writer leadership and wake waiting writers
+        var whBack: Option[net.WriteHalf] = Some(wh)
+        var ww: []task.Promise[int] = []
+        c.sh.with(fn(st: mut &ConnState) {
+            st.wh = replace(mut &whBack, None)
+            st.writerActive = false
+            ww = replace(mut &st.writeWaiters, [])
+        })
+        wakeAll(mut &ww)
+        if fatal {
+            let em = match &writeErr {
+                Some(e) { e.msg.clone() }
+                None { "write failed" }
+            }
+            c.failAll(fatalKind, &em)
+        }
+        match move(writeErr) {
+            Some(e) { return Err(e) }
+            None { return Ok(Unit{}) }
+        }
+    }
+    return Ok(Unit{})
+}
+
+// ---------------------------------------------------------------- leader/follower reader
+
+fn (c: &Conn) driveRead(mySid: int, w: Where): Result[Unit, ClientError] {
+    var rhOpt: Option[net.ReadHalf] = None
+    var fut: Option[task.Future[int]] = None
+    c.sh.with(fn(st: mut &ConnState) {
+        if st.shut { return }
+        if !st.readerActive && st.rh.isSome() {
+            st.readerActive = true
+            rhOpt = replace(mut &st.rh, None)
+        } else if st.streams.has(&mySid) {
+            let task.Handoff{promise: pr, future: f} = task.promise[int]()
+            var needPush = false
+            {
+                let ss = st.streams.atMut(mySid)
+                ss.waiter = Some(pr)
+                if !ss.inReadQueue {
+                    ss.inReadQueue = true
+                    needPush = true
+                }
+            }
+            if needPush { append(mut &st.readWaiters, mySid) }
+            fut = Some(f)
+        }
+    })
+
+    // Follower path: park until leader delivers to our stream or passes leadership
+    match move(fut) {
+        Some(f) {
+            match f.wait(w) {
+                Ok(_) { return Ok(Unit{}) }
+                Err(k) {
+                    c.sh.with(fn(st: mut &ConnState) {
+                        if st.streams.has(&mySid) {
+                            let ss = st.streams.atMut(mySid)
+                            ss.waiter = None
+                        }
+                    })
+                    let ek = if k == task.Cancelled.Timeout { ErrKind.Timeout } else { ErrKind.Cancelled }
+                    return Err(cErr(ek, &(k.toStr() + " while reading HTTP/2 response")))
+                }
+            }
+        }
+        None {}
+    }
+
+    if rhOpt.isNone() { return Ok(Unit{}) }
+    let rh = replace(mut &rhOpt, None).unwrap()
+
+    // Leader path: read one chunk of plaintext (or TLS decrypted bytes), dispatch frames, then release leadership
+    var readErr: Option[ClientError] = None
+    var fatal = false
+    var gotBytes = false
+    var isTls = false
+    c.sh.with(fn(st: mut &ConnState) { isTls = st.tls.isSome() })
+
+    if !isTls {
+        var tmp = array(16384, byte(0))
+        match rh.read(mut &tmp, w) {
+            Ok(n) {
+                if n == 0 {
+                    fatal = true
+                    readErr = Some(cErr(ErrKind.Io, "the server closed the HTTP/2 connection"))
+                } else {
+                    c.feedPlaintext(&tmp[0..n])
+                    gotBytes = true
+                }
+            }
+            Err(e) {
+                if e.isTimeout() || e.isCancelled() {
+                    let ek = if e.isTimeout() { ErrKind.Timeout } else { ErrKind.Cancelled }
+                    readErr = Some(cErr(ek, &e.toStr()))
+                } else {
+                    fatal = true
+                    readErr = Some(cErr(ErrKind.Io, &e.toStr()))
+                }
+            }
+        }
+    } else {
+        var tmp = array(16384, byte(0))
+        var raw = array(17408, byte(0))
+        while true {
+            var got = 0
+            var wantIn = false
+            var tlsErrStr = ""
+            c.sh.with(fn(st: mut &ConnState) {
+                match replace(mut &st.tls, None) {
+                    Some(e) {
+                        var eng = e
+                        match eng.read(mut &tmp) {
+                            Ok(n) {
+                                if n == tls.WANT_INPUT { wantIn = true } else { got = n }
+                            }
+                            Err(te) { tlsErrStr = te.toStr() }
+                        }
+                        if eng.pending() > 0 {
+                            let enc = eng.takeOutput()
+                            if len(enc) > 0 { appendSlice(mut &st.outBuf, &enc) }
+                        }
+                        st.tls = Some(eng)
+                    }
+                    None { tlsErrStr = "missing TLS engine" }
+                }
+            })
+            if len(tlsErrStr) > 0 {
+                fatal = true
+                readErr = Some(cErr(ErrKind.Tls, &tlsErrStr))
+                break
+            }
+            if !wantIn {
+                if got == 0 {
+                    fatal = true
+                    readErr = Some(cErr(ErrKind.Io, "the server closed the HTTP/2 connection"))
+                } else {
+                    c.feedPlaintext(&tmp[0..got])
+                    gotBytes = true
+                }
+                break
+            }
+            match rh.read(mut &raw, w) {
+                Ok(n) {
+                    if n == 0 {
+                        var partial = false
+                        c.sh.with(fn(st: mut &ConnState) {
+                            match &st.tls {
+                                Some(eng) { partial = eng.partial() }
+                                None {}
+                            }
+                        })
+                        fatal = true
+                        readErr = Some(cErr(if partial { ErrKind.Tls } else { ErrKind.Io },
+                                            if partial { "connection closed inside a TLS record" } else { "the server closed the HTTP/2 connection" }))
+                        break
+                    }
+                    c.sh.with(fn(st: mut &ConnState) {
+                        match replace(mut &st.tls, None) {
+                            Some(e) { var eng = e; eng.feed(&raw[0..n]); st.tls = Some(eng) }
+                            None {}
+                        }
+                    })
+                }
+                Err(e) {
+                    if e.isTimeout() || e.isCancelled() {
+                        let ek = if e.isTimeout() { ErrKind.Timeout } else { ErrKind.Cancelled }
+                        readErr = Some(cErr(ek, &e.toStr()))
+                    } else {
+                        fatal = true
+                        readErr = Some(cErr(ErrKind.Io, &e.toStr()))
+                    }
+                    break
+                }
+            }
+        }
+    }
+
+    var needFlush = false
+    if gotBytes {
+        if !c.processFrames() {
+            fatal = true
+        }
+        c.sh.with(fn(st: mut &ConnState) {
+            needFlush = len(st.ctrlOut) > 0 || len(st.outBuf) > st.outOff
+        })
+    }
+
+    // Release reader leadership and pass leadership FIFO to one waiting follower (if any)
+    var rhBack: Option[net.ReadHalf] = Some(rh)
+    var nextLeader: Option[task.Promise[int]] = None
+    c.sh.with(fn(st: mut &ConnState) {
+        st.rh = replace(mut &rhBack, None)
+        st.readerActive = false
+        while st.readWaitHead < len(st.readWaiters) {
+            let sid = st.readWaiters[st.readWaitHead]
+            st.readWaitHead += 1
+            if st.streams.has(&sid) {
+                let ss = st.streams.atMut(sid)
+                ss.inReadQueue = false
+                if sid != mySid {
+                    let p = replace(mut &ss.waiter, None)
+                    if p.isSome() {
+                        nextLeader = p
+                        break
+                    }
+                }
+            }
+        }
+        if st.readWaitHead == len(st.readWaiters) {
+            st.readWaiters = []
+            st.readWaitHead = 0
+        } else if st.readWaitHead >= 64 && st.readWaitHead * 2 >= len(st.readWaiters) {
+            var next: []int = withCapacity(len(st.readWaiters) - st.readWaitHead)
+            for i in st.readWaitHead..len(st.readWaiters) { append(mut &next, st.readWaiters[i]) }
+            st.readWaiters = next
+            st.readWaitHead = 0
+        }
+    })
+    wakeOpt(mut &nextLeader)
+
+    if fatal {
+        let em = match &readErr {
+            Some(e) { e.msg.clone() }
+            None { "HTTP/2 protocol error" }
+        }
+        let ek = match &readErr {
+            Some(e) { e.kind }
+            None { ErrKind.Protocol }
+        }
+        c.failAll(ek, &em)
+        return Err(cErr(ek, &em))
+    }
+    if needFlush {
+        if readErr.isSome() {
+            c.tryFlushNow()
+        } else {
+            let fr = c.flushWrites(w)
+        }
+    }
+    match move(readErr) {
+        Some(e) { return Err(e) }
+        None { return Ok(Unit{}) }
+    }
+}
+
+fn (c: &Conn) feedPlaintext(src: &[byte]) {
+    c.sh.with(fn(st: mut &ConnState) {
+        if st.inR == st.inW {
+            st.inR = 0
+            st.inW = 0
+        } else if st.inW + len(src) > len(st.inBuf) {
+            let rem = st.inW - st.inR
+            let need = rem + len(src)
+            var cap = len(st.inBuf)
+            while cap < need { cap = cap * 2 }
+            var nb = array(cap, byte(0))
+            for i in 0..rem { nb[i] = st.inBuf[st.inR + i] }
+            st.inBuf = nb
+            st.inR = 0
+            st.inW = rem
+        }
+        for i in 0..len(src) { st.inBuf[st.inW + i] = src[i] }
+        st.inW += len(src)
+    })
+}
+
+fn (c: &Conn) failAll(kind: ErrKind, msg: &str) {
+    var waiters: []task.Promise[int] = []
+    var wwaiters: []task.Promise[int] = []
+    var cwaiters: []task.Promise[int] = []
+    c.sh.with(fn(st: mut &ConnState) {
+        st.shut = true
+        if len(st.connErr) == 0 { st.connErr = msg.clone() }
+        for i in 0..st.streams.size() {
+            let ss = st.streams.valAtMut(i)
+            if ss.err.isNone() { ss.err = Some(cErr(kind, msg)) }
+            match replace(mut &ss.waiter, None) {
+                Some(pr) { append(mut &waiters, pr) }
+                None {}
+            }
+        }
+        wwaiters = replace(mut &st.writeWaiters, [])
+        cwaiters = replace(mut &st.connWinWaiters, [])
+    })
+    wakeAll(mut &waiters)
+    wakeAll(mut &wwaiters)
+    wakeAll(mut &cwaiters)
+}
+
+// Processes all complete HTTP/2 frames currently in ConnState.inBuf.
+// Returns false on a connection-level protocol error.
+fn (c: &Conn) processFrames(): bool {
+    while true {
+        var hasFrame = false
+        var fh = h2.FrameHeader{length: 0, ftype: 0, flags: 0, streamId: 0}
+        var payload: []byte = []
+        var frameTooBig = false
+        c.sh.with(fn(st: mut &ConnState) {
+            if st.inW - st.inR < h2.FRAME_HDR_LEN { return }
+            let h = h2.parseFrameHeader(&st.inBuf[st.inR..st.inR + h2.FRAME_HDR_LEN])
+            if h.length > h2.DEFAULT_MAX_FRAME_SIZE {
+                frameTooBig = true
+                return
+            }
+            if st.inW - st.inR < h2.FRAME_HDR_LEN + h.length { return }
+            fh = h
+            let pstart = st.inR + h2.FRAME_HDR_LEN
+            payload = array(h.length, byte(0))
+            for i in 0..h.length { payload[i] = st.inBuf[pstart + i] }
+            st.inR = pstart + h.length
+            if st.inR == st.inW { st.inR = 0; st.inW = 0 }
+            hasFrame = true
+        })
+        if frameTooBig {
+            c.failAll(ErrKind.Protocol, "server frame exceeds MAX_FRAME_SIZE")
+            return false
+        }
+        if !hasFrame { return true }
+        if !c.dispatchFrame(fh, &payload) { return false }
+    }
+    return true
+}
+
+fn (c: &Conn) dispatchFrame(fh: h2.FrameHeader, payload: &[byte]): bool {
+    var waiters: []task.Promise[int] = []
+    var protoErr = ""
+    var contComplete = false
+    var contSid = 0
+    var contEs = false
+    var contBlk: []byte = []
+
+    c.sh.with(fn(st: mut &ConnState) {
+        if st.contStream > 0 {
+            if fh.ftype != h2.F_CONTINUATION || fh.streamId != st.contStream {
+                protoErr = "expected CONTINUATION frame"
+                return
+            }
+            if len(st.contBlock) + len(payload) > CLIENT_MAX_HEAD * 2 {
+                protoErr = "response header block too large"
+                return
+            }
+            appendSlice(mut &st.contBlock, payload)
+            if (fh.flags & h2.FL_END_HEADERS) != 0 {
+                contComplete = true
+                contSid = st.contStream
+                contEs = st.contEndStream
+                contBlk = replace(mut &st.contBlock, [])
+                st.contStream = 0
+            }
+            return
+        }
+
+        // Server's first frame MUST be a non-ACK SETTINGS frame (RFC 9113 section 3.4)
+        if !st.gotServerSettings {
+            if fh.ftype != h2.F_SETTINGS || (fh.flags & h2.FL_ACK) != 0 || fh.streamId != 0 {
+                protoErr = "server first frame must be SETTINGS"
+                return
+            }
+            st.gotServerSettings = true
+        }
+
+        if fh.ftype == h2.F_CONTINUATION {
+            protoErr = "unexpected CONTINUATION frame"
+            return
+        } else if fh.ftype == h2.F_SETTINGS {
+            if fh.streamId != 0 { protoErr = "SETTINGS on non-zero stream"; return }
+            if (fh.flags & h2.FL_ACK) != 0 {
+                if fh.length != 0 { protoErr = "SETTINGS ACK with payload"; return }
+                return
+            }
+            match h2.parseSettings(payload, 64) {
+                Ok(entries) {
+                    for s in entries {
+                        if s.id == h2.SET_HEADER_TABLE_SIZE {
+                            st.enc.setMaxTableSize(s.val)
+                        } else if s.id == h2.SET_MAX_CONCURRENT_STREAMS {
+                            st.peerMaxConcurrent = if s.val >= 0 { s.val } else { 0 }
+                        } else if s.id == h2.SET_INITIAL_WINDOW_SIZE {
+                            let delta = s.val - st.peerInitWin
+                            st.peerInitWin = s.val
+                            for i in 0..st.streams.size() {
+                                let ss = st.streams.valAtMut(i)
+                                if delta > 0 && ss.sendWin > h2.MAX_WINDOW - delta {
+                                    protoErr = "flow control overflow in SETTINGS"
+                                    return
+                                }
+                                ss.sendWin += delta
+                                if delta > 0 && ss.sendWin > 0 {
+                                    match replace(mut &ss.waiter, None) {
+                                        Some(pr) { append(mut &waiters, pr) }
+                                        None {}
+                                    }
+                                }
+                            }
+                        } else if s.id == h2.SET_MAX_FRAME_SIZE {
+                            st.peerMaxFrame = s.val
+                        }
+                    }
+                    h2.putSettingsAck(mut &st.ctrlOut)
+                }
+                Err(_) { protoErr = "malformed server SETTINGS" }
+            }
+        } else if fh.ftype == h2.F_PRIORITY {
+            if fh.streamId == 0 { protoErr = "PRIORITY on stream 0"; return }
+            if fh.length != 5 { protoErr = "bad PRIORITY length"; return }
+            let dep = h2.readU32(payload, 0) & 0x7fffffff
+            if dep == fh.streamId { protoErr = "PRIORITY self-dependency"; return }
+        } else if fh.ftype == h2.F_PING {
+            if fh.streamId != 0 || fh.length != 8 { protoErr = "bad PING frame"; return }
+            if (fh.flags & h2.FL_ACK) == 0 {
+                h2.putPing(mut &st.ctrlOut, true, payload)
+            }
+        } else if fh.ftype == h2.F_WINDOW_UPDATE {
+            if fh.length != 4 { protoErr = "WINDOW_UPDATE length != 4"; return }
+            match h2.parseWindowUpdate(payload) {
+                Ok(incr) {
+                    if fh.streamId == 0 {
+                        if st.connSendWin > h2.MAX_WINDOW - incr { protoErr = "connection window overflow"; return }
+                        st.connSendWin += incr
+                        if st.connSendWin > 0 {
+                            for i in 0..st.streams.size() {
+                                match replace(mut &st.streams.valAtMut(i).waiter, None) {
+                                    Some(pr) { append(mut &waiters, pr) }
+                                    None {}
+                                }
+                            }
+                        }
+                    } else if st.streams.has(&fh.streamId) {
+                        var overflow = false
+                        {
+                            let ss = st.streams.atMut(fh.streamId)
+                            if ss.sendWin > h2.MAX_WINDOW - incr {
+                                overflow = true
+                                ss.err = Some(cErr(ErrKind.Protocol, "stream window overflow"))
+                                ss.resetSent = true
+                                match replace(mut &ss.waiter, None) {
+                                    Some(pr) { append(mut &waiters, pr) }
+                                    None {}
+                                }
+                            } else {
+                                ss.sendWin += incr
+                                if ss.sendWin > 0 {
+                                    match replace(mut &ss.waiter, None) {
+                                        Some(pr) { append(mut &waiters, pr) }
+                                        None {}
+                                    }
+                                }
+                            }
+                        }
+                        if overflow { h2.putRstStream(mut &st.ctrlOut, fh.streamId, h2.ERR_FLOW_CONTROL_ERROR) }
+                    }
+                }
+                Err(_) {
+                    if fh.streamId == 0 {
+                        protoErr = "zero connection WINDOW_UPDATE"
+                    } else {
+                        if st.streams.has(&fh.streamId) {
+                            let ss = st.streams.atMut(fh.streamId)
+                            ss.err = Some(cErr(ErrKind.Protocol, "zero stream WINDOW_UPDATE"))
+                            ss.resetSent = true
+                            match replace(mut &ss.waiter, None) {
+                                Some(pr) { append(mut &waiters, pr) }
+                                None {}
+                            }
+                        }
+                        h2.putRstStream(mut &st.ctrlOut, fh.streamId, h2.ERR_PROTOCOL_ERROR)
+                    }
+                }
+            }
+        } else if fh.ftype == h2.F_GOAWAY {
+            if fh.streamId != 0 { protoErr = "GOAWAY on non-zero stream"; return }
+            match h2.parseGoaway(payload) {
+                Ok(ga) {
+                    st.goaway = true
+                    if ga.lastStreamId < st.goawayLastId { st.goawayLastId = ga.lastStreamId }
+                    for i in 0..st.streams.size() {
+                        let ss = st.streams.valAtMut(i)
+                        if ss.id > ga.lastStreamId && ss.err.isNone() {
+                            ss.err = Some(cErr(ErrKind.Refused, &("server GOAWAY (" + h2.errorName(ga.code) + ")")))
+                            match replace(mut &ss.waiter, None) {
+                                Some(pr) { append(mut &waiters, pr) }
+                                None {}
+                            }
+                        }
+                    }
+                }
+                Err(_) { protoErr = "bad GOAWAY" }
+            }
+        } else if fh.ftype == h2.F_RST_STREAM {
+            if fh.streamId == 0 { protoErr = "RST_STREAM on stream 0"; return }
+            match h2.parseRstStream(payload) {
+                Ok(code) {
+                    if st.streams.has(&fh.streamId) {
+                        let ss = st.streams.atMut(fh.streamId)
+                        let ek = if code == h2.ERR_REFUSED_STREAM && !ss.gotHead { ErrKind.Refused } else { ErrKind.Protocol }
+                        ss.err = Some(cErr(ek, &("server RST_STREAM (" + h2.errorName(code) + ")")))
+                        ss.inDone = true
+                        match replace(mut &ss.waiter, None) {
+                            Some(pr) { append(mut &waiters, pr) }
+                            None {}
+                        }
+                    }
+                }
+                Err(_) { protoErr = "bad RST_STREAM" }
+            }
+        } else if fh.ftype == h2.F_PUSH_PROMISE {
+            protoErr = "server sent PUSH_PROMISE with push disabled"
+            return
+        } else if fh.ftype == h2.F_HEADERS {
+            if fh.streamId == 0 { protoErr = "HEADERS on stream 0"; return }
+            match h2.headersFragment(payload, fh.flags, fh.streamId) {
+                Ok(sp) {
+                    let es = (fh.flags & h2.FL_END_STREAM) != 0
+                    if (fh.flags & h2.FL_END_HEADERS) != 0 {
+                        contComplete = true
+                        contSid = fh.streamId
+                        contEs = es
+                        contBlk = array(sp.end - sp.start, byte(0))
+                        for i in 0..sp.end - sp.start { contBlk[i] = payload[sp.start + i] }
+                    } else {
+                        st.contStream = fh.streamId
+                        st.contEndStream = es
+                        st.contBlock = []
+                        appendSlice(mut &st.contBlock, &payload[sp.start..sp.end])
+                    }
+                }
+                Err(_) { protoErr = "bad HEADERS framing" }
+            }
+        } else if fh.ftype == h2.F_DATA {
+            if fh.streamId == 0 { protoErr = "DATA on stream 0"; return }
+            match h2.unpad(payload, fh.flags) {
+                Ok(sp) {
+                    let es = (fh.flags & h2.FL_END_STREAM) != 0
+                    let dataLen = sp.end - sp.start
+                    let frameLen = fh.length
+                    if frameLen > st.connRecvWin { protoErr = "connection receive window exceeded"; return }
+                    st.connRecvWin -= frameLen
+                    if !st.streams.has(&fh.streamId) {
+                        st.connRecvConsumed += frameLen
+                        if st.connRecvConsumed >= CLIENT_CONN_WIN / 2 {
+                            h2.putWindowUpdate(mut &st.ctrlOut, 0, st.connRecvConsumed)
+                            st.connRecvWin += st.connRecvConsumed
+                            st.connRecvConsumed = 0
+                        }
+                        return
+                    }
+                    var padCredit = frameLen - dataLen
+                    var streamWu = 0
+                    var sendRstCode = 0
+                    {
+                        let ss = st.streams.atMut(fh.streamId)
+                        if !ss.gotHead {
+                            padCredit = frameLen
+                            ss.err = Some(cErr(ErrKind.Protocol, "DATA received before response HEADERS"))
+                            sendRstCode = h2.ERR_PROTOCOL_ERROR
+                        } else if ss.inDone {
+                            padCredit = frameLen
+                            ss.err = Some(cErr(ErrKind.Protocol, "DATA received after END_STREAM"))
+                            sendRstCode = h2.ERR_STREAM_CLOSED
+                        } else if frameLen > ss.recvWin {
+                            padCredit = frameLen
+                            ss.err = Some(cErr(ErrKind.Protocol, "stream receive window exceeded"))
+                            sendRstCode = h2.ERR_FLOW_CONTROL_ERROR
+                        } else {
+                            ss.recvWin -= frameLen
+                            if padCredit > 0 { ss.recvConsumed += padCredit }
+                            ss.recvBytes += dataLen
+                            if ss.contentLength >= 0 && (ss.recvBytes > ss.contentLength || (es && ss.recvBytes != ss.contentLength)) {
+                                padCredit = frameLen
+                                ss.err = Some(cErr(ErrKind.Protocol, "response body length differs from Content-Length"))
+                                sendRstCode = h2.ERR_PROTOCOL_ERROR
+                            } else {
+                                if dataLen > 0 { appendSlice(mut &ss.inBuf, &payload[sp.start..sp.end]) }
+                                if es {
+                                    ss.inDone = true
+                                } else if ss.recvConsumed >= CLIENT_STREAM_WIN / 2 {
+                                    streamWu = ss.recvConsumed
+                                    ss.recvWin += streamWu
+                                    ss.recvConsumed = 0
+                                }
+                            }
+                        }
+                        match replace(mut &ss.waiter, None) {
+                            Some(pr) { append(mut &waiters, pr) }
+                            None {}
+                        }
+                    }
+                    if sendRstCode != 0 {
+                        h2.putRstStream(mut &st.ctrlOut, fh.streamId, sendRstCode)
+                    }
+                    if padCredit > 0 {
+                        st.connRecvConsumed += padCredit
+                        if st.connRecvConsumed >= CLIENT_CONN_WIN / 2 {
+                            h2.putWindowUpdate(mut &st.ctrlOut, 0, st.connRecvConsumed)
+                            st.connRecvWin += st.connRecvConsumed
+                            st.connRecvConsumed = 0
+                        }
+                    }
+                    if streamWu > 0 {
+                        h2.putWindowUpdate(mut &st.ctrlOut, fh.streamId, streamWu)
+                    }
+                }
+                Err(_) { protoErr = "bad DATA padding" }
+            }
+        }
+    })
+    wakeAll(mut &waiters)
+    if len(protoErr) > 0 {
+        c.failAll(ErrKind.Protocol, &protoErr)
+        return false
+    }
+    if contComplete {
+        return c.applyResponseHeaders(contSid, &contBlk, contEs)
+    }
+    return true
+}
+
+fn (c: &Conn) applyResponseHeaders(sid: int, block: &[byte], endStream: bool): bool {
+    var decErr: Option[hpack.Error] = None
+    var fields: []hpack.Field = []
+    c.sh.with(fn(st: mut &ConnState) {
+        match st.dec.decode(block, CLIENT_MAX_HEAD, CLIENT_MAX_HEADERS) {
+            Ok(fs) { fields = fs }
+            Err(e) { decErr = Some(e) }
+        }
+    })
+    match decErr {
+        Some(e) {
+            let ek = if e == hpack.Error.TooLarge || e == hpack.Error.TooMany { ErrKind.TooLarge } else { ErrKind.Protocol }
+            c.failAll(ek, &e.toStr())
+            return false
+        }
+        None {}
+    }
+
+    var w: Option[task.Promise[int]] = None
+    c.sh.with(fn(st: mut &ConnState) {
+        if !st.streams.has(&sid) { return }
+        let ss = st.streams.atMut(sid)
+        if ss.err.isSome() { return }
+        if ss.gotHead {
+            // Trailing HEADERS: must have END_STREAM and valid trailer fields
+            if !endStream || !h2.validateTrailers(&fields) {
+                ss.err = Some(cErr(ErrKind.Protocol, "invalid HTTP/2 response trailers"))
+            } else if ss.contentLength >= 0 && ss.recvBytes != ss.contentLength {
+                ss.err = Some(cErr(ErrKind.Protocol, "response body length differs from Content-Length"))
+            } else {
+                ss.trailers = replace(mut &fields, [])
+                ss.inDone = true
+            }
+            w = replace(mut &ss.waiter, None)
+            return
+        }
+        // Parse :status and regular headers
+        var status = -1
+        var seenRegular = false
+        var cl = -1
+        var bad = ""
+        var outHdrs: []hpack.Field = []
+        for f in replace(mut &fields, []) {
+            if len(f.name) == 0 { bad = "empty response header name"; break }
+            if f.name[0] == ':' {
+                if seenRegular { bad = "pseudo-header after regular header"; break }
+                if f.name != ":status" || status >= 0 || len(f.value) != 3 {
+                    bad = "invalid :status pseudo-header"
+                    break
+                }
+                var code = 0
+                for k in 0..3 {
+                    if f.value[k] < '0' || f.value[k] > '9' { bad = "malformed :status"; break }
+                    code = code * 10 + int(f.value[k] - '0')
+                }
+                if len(bad) > 0 { break }
+                if code < 100 || code > 599 { bad = ":status out of range"; break }
+                status = code
+            } else {
+                seenRegular = true
+                if !h2.isValidHeaderName(&f.name) || !h2.isValidHeaderValue(&f.value) {
+                    bad = "invalid response header"
+                    break
+                }
+                if h2.isForbiddenHeader(&f.name) {
+                    bad = "connection-specific header in HTTP/2 response"
+                    break
+                }
+                if f.name == "content-length" {
+                    if len(f.value) == 0 || len(f.value) > 18 { bad = "invalid Content-Length"; break }
+                    var v = 0
+                    for k in 0..len(f.value) {
+                        if f.value[k] < '0' || f.value[k] > '9' { bad = "invalid Content-Length"; break }
+                        v = v * 10 + int(f.value[k] - '0')
+                    }
+                    if len(bad) > 0 { break }
+                    if cl >= 0 && cl != v { bad = "two different Content-Lengths"; break }
+                    cl = v
+                }
+                append(mut &outHdrs, f)
+            }
+        }
+        if len(bad) == 0 && status < 0 { bad = "missing :status pseudo-header" }
+        if len(bad) > 0 {
+            ss.err = Some(cErr(ErrKind.Protocol, &bad))
+            w = replace(mut &ss.waiter, None)
+            return
+        }
+        // Skip 1xx interim responses (like 100 Continue, 103 Early Hints)
+        if status < 200 {
+            if status == 101 || endStream {
+                ss.err = Some(cErr(ErrKind.Protocol, "invalid 1xx HTTP/2 response"))
+                w = replace(mut &ss.waiter, None)
+                return
+            }
+            ss.interimCount += 1
+            if ss.interimCount > CLIENT_MAX_INTERIM {
+                ss.err = Some(cErr(ErrKind.Protocol, "more than 8 interim (1xx) replies"))
+                w = replace(mut &ss.waiter, None)
+            }
+            return
+        }
+        ss.gotHead = true
+        ss.status = status
+        ss.headers = outHdrs
+        ss.contentLength = cl
+        if endStream { ss.inDone = true }
+        w = replace(mut &ss.waiter, None)
+    })
+    wakeOpt(mut &w)
+    return true
+}

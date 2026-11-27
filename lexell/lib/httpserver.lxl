@@ -32,6 +32,9 @@
 // parsers could read differently is refused with a 4xx and the connection
 // closed; every limit and timeout has a value (defaults()).
 import "http"
+import "h2"
+import "hpack"
+import "h2server"
 import "net"
 import "task"
 import "io"
@@ -143,6 +146,13 @@ pub type Config = record {
     pub redirectHosts: []str     // hosts w.redirect may send clients to (besides relative paths)
     pub trustedProxies: []str    // peers whose X-Forwarded-For and X-Request-Id are believed
     pub logFd: int               // where accessLog writes (1: stdout; -1: nowhere)
+    pub h2: bool                 // allow HTTP/2 over TLS (ALPN "h2"); true by default
+    pub h2c: bool                // allow prior-knowledge cleartext HTTP/2 on serve(); false by default
+    pub maxConcurrentStreams: int // HTTP/2 SETTINGS_MAX_CONCURRENT_STREAMS
+    pub maxFrameSize: int        // HTTP/2 SETTINGS_MAX_FRAME_SIZE (16384..16777215)
+    pub streamRecvWindow: int    // HTTP/2 SETTINGS_INITIAL_WINDOW_SIZE
+    pub connRecvWindow: int      // HTTP/2 connection receive window
+    pub maxHeaderTableSize: int  // HTTP/2 SETTINGS_HEADER_TABLE_SIZE
 }
 
 // The defaults of design/http-server.md section 3.4.
@@ -156,7 +166,9 @@ pub fn defaults(): Config {
         maxPartHeadBytes: 16384, maxTrailerBytes: 8192, maxTrailers: 32,
         memBudget: 536870912, fdMargin: 64, acceptBatch: 16,
         deferAccept: true, cancelOnHalfClose: true, signals: true,
-        hosts: [], redirectHosts: [], trustedProxies: [], logFd: 1}
+        hosts: [], redirectHosts: [], trustedProxies: [], logFd: 1,
+        h2: true, h2c: false, maxConcurrentStreams: 100, maxFrameSize: 16384,
+        streamRecvWindow: 262144, connRecvWindow: 1048576, maxHeaderTableSize: 4096}
 }
 
 // task.workerPolicy with a drain long enough for defaults().drainMs.
@@ -174,6 +186,7 @@ pub fn workerPolicy(): task.WorkerPolicy {
 type Limits = value record {
     headerTimeoutMs: int
     idleTimeoutMs: int
+    idlePressureMs: int
     bodyGraceMs: int
     bodyMinRate: int
     writeStallMs: int
@@ -192,16 +205,44 @@ type Limits = value record {
     maxTrailerBytes: int
     maxTrailers: int
     cancelOnHalfClose: bool
+    h2: bool
+    h2c: bool
+    maxConcurrentStreams: int
+    maxFrameSize: int
+    streamRecvWindow: int
+    connRecvWindow: int
+    maxHeaderTableSize: int
 }
 
 fn limitsOf(c: &Config): Limits {
-    return Limits{headerTimeoutMs: c.headerTimeoutMs, idleTimeoutMs: c.idleTimeoutMs, bodyGraceMs: c.bodyGraceMs,
+    return Limits{headerTimeoutMs: c.headerTimeoutMs, idleTimeoutMs: c.idleTimeoutMs, idlePressureMs: c.idlePressureMs, bodyGraceMs: c.bodyGraceMs,
         bodyMinRate: c.bodyMinRate, writeStallMs: c.writeStallMs, deadlineMs: c.deadlineMs,
         maxRequestsPerConn: c.maxRequestsPerConn, maxHeadBytes: c.maxHeadBytes, maxHeaders: c.maxHeaders,
         maxLineBytes: c.maxLineBytes, maxTargetBytes: c.maxTargetBytes, maxBody: c.maxBody, maxDrain: c.maxDrain,
         maxParams: c.maxParams, maxParts: c.maxParts, maxPartHeaders: c.maxPartHeaders,
         maxPartHeadBytes: c.maxPartHeadBytes, maxTrailerBytes: c.maxTrailerBytes, maxTrailers: c.maxTrailers,
-        cancelOnHalfClose: c.cancelOnHalfClose}
+        cancelOnHalfClose: c.cancelOnHalfClose, h2: c.h2, h2c: c.h2c,
+        maxConcurrentStreams: c.maxConcurrentStreams, maxFrameSize: c.maxFrameSize,
+        streamRecvWindow: c.streamRecvWindow, connRecvWindow: c.connRecvWindow,
+        maxHeaderTableSize: c.maxHeaderTableSize}
+}
+
+fn h2LimitsOf(l: Limits): h2server.Limits {
+    return h2server.Limits{
+        maxConcurrentStreams: if l.maxConcurrentStreams > 0 { l.maxConcurrentStreams } else { 100 },
+        maxFrameSize: if l.maxFrameSize >= h2.DEFAULT_MAX_FRAME_SIZE && l.maxFrameSize <= h2.MAX_FRAME_SIZE_LIMIT { l.maxFrameSize } else { h2.DEFAULT_MAX_FRAME_SIZE },
+        streamRecvWindow: if l.streamRecvWindow > 0 { l.streamRecvWindow } else { 262144 },
+        connRecvWindow: if l.connRecvWindow >= h2.DEFAULT_INITIAL_WINDOW { l.connRecvWindow } else { 1048576 },
+        maxHeaderTableSize: if l.maxHeaderTableSize >= 0 { l.maxHeaderTableSize } else { 4096 },
+        maxHeadBytes: l.maxHeadBytes,
+        maxHeaders: l.maxHeaders,
+        maxLineBytes: l.maxLineBytes,
+        maxTrailerBytes: l.maxTrailerBytes,
+        maxTrailers: l.maxTrailers,
+        headerTimeoutMs: l.headerTimeoutMs,
+        idleTimeoutMs: l.idleTimeoutMs,
+        writeStallMs: l.writeStallMs,
+    }
 }
 
 // ---------------------------------------------------------------- statistics
@@ -746,10 +787,10 @@ fn connErr(e: &ConnError, what: &str): Error {
 type TlsBox = record { c: Option[tls.Conn] }
 
 // The reading side; a TLS one keeps the socket's descriptor for the hangup
-// watch.
-type ReadConn = value closed { Plain(net.ReadHalf); Tls(task.Shared[TlsBox], int) }
+// watch; an H2 one holds its stream handle.
+type ReadConn = value closed { Plain(net.ReadHalf); Tls(task.Shared[TlsBox], int); H2(h2server.Stream) }
 
-type WriteConn = value closed { Plain(net.WriteHalf); Tls(task.Shared[TlsBox]) }
+type WriteConn = value closed { Plain(net.WriteHalf); Tls(task.Shared[TlsBox]); H2(h2server.Stream) }
 
 // Runs f on the boxed TLS connection, taking it out for the call (f may
 // park) and putting it back after.
@@ -787,6 +828,7 @@ fn (c: &ReadConn) read(buf: mut &[byte], at: Where): Result[int, ConnError] {
             }
         }
         ReadConn.Tls(b, _) { return withTls(&b, fn(t: mut &tls.Conn): Result[int, tls.Error] { return t.read(buf, at) }) }
+        ReadConn.H2(_) { return Err(ConnError{timeout: false, msg: "H2 read called via H1 path"}) }
     }
 }
 
@@ -794,13 +836,20 @@ fn (c: &ReadConn) writeInterim(data: &[byte], at: Where): Result[Unit, ConnError
     match c {
         ReadConn.Plain(h) { return ioUnit(h.writeInterim(data, at)) }
         ReadConn.Tls(b, _) { return withTls(&b, fn(t: mut &tls.Conn): Result[Unit, tls.Error] { return t.writeStalled(data, 0, at) }) }
+        ReadConn.H2(st) {
+            return match st.send100() {
+                Ok(_) { Ok(Unit{}) }
+                Err(e) { Err(ConnError{timeout: e.timeout, msg: e.msg.clone()}) }
+            }
+        }
     }
 }
 
-fn (c: &ReadConn) cancelOnHangup(halfClose: bool): net.HangupGuard {
+fn (c: &ReadConn) cancelOnHangup(halfClose: bool): Option[net.HangupGuard] {
     match c {
-        ReadConn.Plain(h) { return h.cancelOnHangup(halfClose) }
-        ReadConn.Tls(_, fd) { return net.hangup(fd, halfClose) }
+        ReadConn.Plain(h) { return Some(h.cancelOnHangup(halfClose)) }
+        ReadConn.Tls(_, fd) { return Some(net.hangup(fd, halfClose)) }
+        ReadConn.H2(_) { return None }
     }
 }
 
@@ -808,6 +857,7 @@ fn (c: &WriteConn) writeStalled(data: &[byte], stallMs: int, at: Where): Result[
     match c {
         WriteConn.Plain(h) { return ioUnit(h.writeStalled(data, stallMs, at)) }
         WriteConn.Tls(b) { return withTls(&b, fn(t: mut &tls.Conn): Result[Unit, tls.Error] { return t.writeStalled(data, stallMs, at) }) }
+        WriteConn.H2(_) { return Err(ConnError{timeout: false, msg: "H2 write called via H1 path"}) }
     }
 }
 
@@ -815,6 +865,21 @@ fn (c: &WriteConn) closeWrite(at: Where): Result[Unit, ConnError] {
     match c {
         WriteConn.Plain(h) { return ioUnit(h.closeWrite()) }
         WriteConn.Tls(b) { return withTls(&b, fn(t: mut &tls.Conn): Result[Unit, tls.Error] { return t.shutdown(at) }) }
+        WriteConn.H2(_) { return Ok(Unit{}) }
+    }
+}
+
+fn (c: &ReadConn) isH2(): bool {
+    match c {
+        ReadConn.H2(_) { return true }
+        else { return false }
+    }
+}
+
+fn (c: &WriteConn) isH2(): bool {
+    match c {
+        WriteConn.H2(_) { return true }
+        else { return false }
     }
 }
 
@@ -1002,6 +1067,7 @@ fn nowMs(): int { return time.monotonicNs() / 1000000 }
 // Expect: 100-continue, the 100 is sent at the first call.
 pub fn (rq: mut &Request) read(buf: mut &[byte], at: Where): Result[int, Error] {
     if len(buf) == 0 { return Ok(0) }
+    if rq.conn.isH2() { return rq.readH2(buf, at) }
     if rq.expect {
         rq.expect = false
         if rq.r == rq.n {
@@ -1057,6 +1123,78 @@ pub fn (rq: mut &Request) read(buf: mut &[byte], at: Where): Result[int, Error] 
         return Ok(k)
     }
     return Ok(0)
+}
+
+fn (rq: mut &Request) readH2(buf: mut &[byte], at: Where): Result[int, Error] {
+    let stream = match &rq.conn {
+        ReadConn.H2(st) { st.share() }
+        else { return Ok(0) }
+    }
+    if rq.expect {
+        rq.expect = false
+        match stream.send100() {
+            Ok(_) {}
+            Err(e) {
+                rq.broken = true
+                return Err(errOf(499, ErrorKind.Gone, &("100 Continue: " + e.msg)))
+            }
+        }
+    }
+    if rq.framing == F_NONE { return Ok(0) }
+    let now = nowMs()
+    if !rq.bodyStarted {
+        rq.bodyStarted = true
+        rq.bodyDeadline = if rq.lim.bodyMinRate > 0 { now + rq.lim.bodyGraceMs } else { -1 }
+    }
+    var old = -1
+    var timed = false
+    if rq.bodyDeadline >= 0 {
+        let ms = rq.bodyDeadline - now
+        if ms <= 0 {
+            rq.broken = true
+            return Err(errOf(408, ErrorKind.Timeout, "the body came too slowly"))
+        }
+        old = rtWithin(ms)
+        timed = true
+    }
+    let r = stream.read(buf, at)
+    if timed { rtRestore(old) }
+    match r {
+        Ok(k) {
+            if k == 0 {
+                let ts = stream.trailers()
+                if len(ts) > 0 {
+                    var h = http.newHeaders()
+                    for f in ts { h.add(&f.name, &f.value) }
+                    rq.trailers = h
+                }
+                rq.framing = F_NONE
+                rq.left = 0
+                rq.cstate = C_DONE
+                return Ok(0)
+            }
+            rq.got += k
+            if rq.framing == F_LENGTH && rq.left >= k { rq.left -= k }
+            if rq.bodyDeadline >= 0 {
+                let t = nowMs()
+                var d = rq.bodyDeadline + k * 1000 / rq.lim.bodyMinRate
+                let cap = if rq.bodyDeadline > t + 5000 { rq.bodyDeadline } else { t + 5000 }
+                if d > cap { d = cap }
+                rq.bodyDeadline = d
+            }
+            try rq.paced(k, at)
+            return Ok(k)
+        }
+        Err(e) {
+            rq.broken = true
+            if e.timeout && rq.bodyDeadline >= 0 && nowMs() >= rq.bodyDeadline - 1 {
+                return Err(errOf(408, ErrorKind.Timeout, "the body came too slowly"))
+            }
+            if e.proto { return Err(errOf(400, ErrorKind.Protocol, &("reading the body: " + e.msg))) }
+            if e.timeout { return Err(errOf(503, ErrorKind.Timeout, &("reading the body: " + e.msg))) }
+            return Err(errOf(499, ErrorKind.Gone, &("reading the body: " + e.msg)))
+        }
+    }
 }
 
 // The whole body (at most limit bytes, and at most the route's maxBody):
@@ -1970,6 +2108,7 @@ pub type Response = record {
     failed: bool           // a write failed: the connection is gone
     ctSet: bool
     ccSet: bool
+    h2EndSent: bool
     st: task.Shared[State]
 }
 
@@ -2273,6 +2412,7 @@ pub fn (w: mut &Response) keepAlive(at: Where): Result[Unit, Error] {
 // body bytes so far.
 pub fn (w: mut &Response) flush(at: Where): Result[Unit, Error] {
     if w.failed { return Err(errOf(499, ErrorKind.Gone, "the connection is gone")) }
+    if w.conn.isH2() { return w.flushH2(at) }
     if !w.headSent {
         if len(w.bad) > 0 { return Err(error(500, &("invalid " + w.bad))) }
         let code = w.statusCode()
@@ -2298,6 +2438,7 @@ fn noBody(code: int): bool { return code == 204 || code == 304 || code < 200 }
 // (with a Content-Length), what is buffered, and the end of a chunked body.
 fn (w: mut &Response) finish(at: Where): Result[Unit, Error] {
     if w.failed { return Err(errOf(499, ErrorKind.Gone, "the connection is gone")) }
+    if w.conn.isH2() { return w.finishH2(at) }
     if !w.headSent {
         if len(w.bad) > 0 { return Err(error(500, &("invalid " + w.bad))) }
         let pending = if w.useStr { len(w.strBody) } else { w.body.n }
@@ -2352,6 +2493,216 @@ fn (w: mut &Response) finish(at: Where): Result[Unit, Error] {
         return Err(error(500, &("Content-Length " + intToStr(w.declared) + " but " + intToStr(w.sent) + " bytes written")))
     }
     return Ok(Unit{})
+}
+
+fn (w: &Response) h2HeadFields(code: int, length: int): []hpack.Field {
+    var fs: []hpack.Field = []
+    append(mut &fs, hpack.Field{name: ":status", value: intToStr(code)})
+    append(mut &fs, hpack.Field{name: "date", value: currentDate()})
+    for i in 0..w.headers.size() {
+        let x = w.headers.line(i)
+        let nm = lowerAscii(&x.name)
+        if !h2.isForbiddenHeader(&nm) && nm != "te" {
+            append(mut &fs, hpack.Field{name: nm, value: h2.trimOws(&x.value)})
+        }
+    }
+    if !w.ctSet && !noBody(code) && length != 0 {
+        append(mut &fs, hpack.Field{name: "content-type", value: "application/octet-stream"})
+    }
+    append(mut &fs, hpack.Field{name: "x-content-type-options", value: "nosniff"})
+    if code >= 400 && !w.ccSet {
+        append(mut &fs, hpack.Field{name: "cache-control", value: "no-store"})
+    }
+    if length >= 0 && !noBody(code) {
+        append(mut &fs, hpack.Field{name: "content-length", value: intToStr(length)})
+    }
+    if len(w.trailerNames) > 0 && !noBody(code) && !w.head {
+        var tn = ""
+        for i in 0..len(w.trailerNames) {
+            if i > 0 { tn += ", " }
+            tn += lowerAscii(&w.trailerNames[i])
+        }
+        append(mut &fs, hpack.Field{name: "trailer", value: tn})
+    }
+    return fs
+}
+
+fn (w: &Response) h2TrailerFields(): []hpack.Field {
+    var fs: []hpack.Field = []
+    for k in 0..len(w.trailerNames) {
+        let t = lowerAscii(&w.trailerNames[k])
+        if !h2.isForbiddenHeader(&t) && h2.isValidHeaderName(&t) {
+            let mv = match w.trailerVals.get(&t) {
+                Some(v) { Some(v.clone()) }
+                None { None }
+            }
+            match mv {
+                Some(v) { append(mut &fs, hpack.Field{name: t, value: v}) }
+                None {}
+            }
+        }
+    }
+    return fs
+}
+
+fn h2WriteErr(e: &h2server.StreamError): Error {
+    if e.timeout { return errOf(503, ErrorKind.Timeout, &("writing the response: " + e.msg)) }
+    return errOf(499, ErrorKind.Gone, &("writing the response: " + e.msg))
+}
+
+fn (w: mut &Response) h2SendHead(length: int, endStream: bool): Result[Unit, Error] {
+    let stream = match &w.conn {
+        WriteConn.H2(st) { st.share() }
+        else { return Err(error(500, "not an H2 stream")) }
+    }
+    let code = w.statusCode()
+    w.final = code
+    let fs = w.h2HeadFields(code, length)
+    match stream.sendHeaders(&fs, endStream) {
+        Ok(_) {
+            w.headSent = true
+            if endStream { w.h2EndSent = true }
+            return Ok(Unit{})
+        }
+        Err(e) {
+            w.failed = true
+            return Err(h2WriteErr(&e))
+        }
+    }
+}
+
+fn (w: mut &Response) h2TakeBodyBytes(): []byte {
+    if w.useStr {
+        w.useStr = false
+        let s = replace(mut &w.strBody, "")
+        return strToBytes(&s)
+    }
+    if w.body.n == 0 { return [] }
+    let n = w.body.n
+    var out = array(n, byte(0))
+    for i in 0..n { out[i] = w.body.b[i] }
+    w.body.n = 0
+    return out
+}
+
+fn (w: mut &Response) flushH2(at: Where): Result[Unit, Error] {
+    let stream = match &w.conn {
+        WriteConn.H2(st) { st.share() }
+        else { return Err(error(500, "not an H2 stream")) }
+    }
+    if !w.headSent {
+        if len(w.bad) > 0 { return Err(error(500, &("invalid " + w.bad))) }
+        let code = w.statusCode()
+        if w.head || noBody(code) {
+            w.mode = M_EMPTY
+            let lenVal = if w.head && w.declared >= 0 { w.declared } else { -1 }
+            try w.h2SendHead(lenVal, true)
+            let drop = w.h2TakeBodyBytes()
+            w.sent += len(drop)
+            return Ok(Unit{})
+        } else if w.declared >= 0 {
+            w.mode = M_LENGTH
+        } else {
+            w.mode = M_CHUNKED
+        }
+        try w.h2SendHead(if w.mode == M_LENGTH { w.declared } else { -1 }, false)
+    }
+    let k = if w.useStr { len(w.strBody) } else { w.body.n }
+    if k == 0 { return Ok(Unit{}) }
+    if w.mode == M_LENGTH && w.sent + k > w.declared {
+        return Err(error(500, "more body than its Content-Length"))
+    }
+    let bytes = w.h2TakeBodyBytes()
+    w.sent += k
+    if w.mode == M_EMPTY { return Ok(Unit{}) }
+    match stream.writeData(&bytes, false, w.stallMs, at) {
+        Ok(_) { return Ok(Unit{}) }
+        Err(e) {
+            w.failed = true
+            return Err(h2WriteErr(&e))
+        }
+    }
+}
+
+fn (w: mut &Response) finishH2(at: Where): Result[Unit, Error] {
+    let stream = match &w.conn {
+        WriteConn.H2(st) { st.share() }
+        else { return Err(error(500, "not an H2 stream")) }
+    }
+    let tr = w.h2TrailerFields()
+    let hasTrailers = len(tr) > 0
+    if !w.headSent {
+        if len(w.bad) > 0 { return Err(error(500, &("invalid " + w.bad))) }
+        let pending = if w.useStr { len(w.strBody) } else { w.body.n }
+        let code = w.statusCode()
+        if noBody(code) {
+            w.mode = M_EMPTY
+            return w.h2SendHead(-1, true)
+        }
+        if w.head {
+            w.mode = M_EMPTY
+            let lenVal = if w.declared >= 0 { w.declared } else { pending }
+            let drop = w.h2TakeBodyBytes()
+            w.sent += len(drop)
+            return w.h2SendHead(lenVal, true)
+        }
+        if w.declared >= 0 && w.declared != pending {
+            return Err(error(500, &("Content-Length " + intToStr(w.declared) + " but " + intToStr(pending) + " bytes written")))
+        }
+        if pending == 0 && !hasTrailers {
+            w.mode = M_LENGTH
+            w.declared = 0
+            return w.h2SendHead(0, true)
+        }
+        if hasTrailers {
+            w.mode = M_CHUNKED
+            try w.h2SendHead(-1, false)
+        } else {
+            w.mode = M_LENGTH
+            w.declared = pending
+            try w.h2SendHead(pending, false)
+        }
+    }
+    if w.h2EndSent { return Ok(Unit{}) }
+    let k = if w.useStr { len(w.strBody) } else { w.body.n }
+    if w.mode == M_LENGTH && w.sent + k > w.declared {
+        return Err(error(500, "more body than its Content-Length"))
+    }
+    let bytes = w.h2TakeBodyBytes()
+    w.sent += k
+    if w.mode == M_LENGTH && w.sent != w.declared {
+        stream.reset(h2.ERR_INTERNAL_ERROR)
+        w.h2EndSent = true
+        return Err(error(500, &("Content-Length " + intToStr(w.declared) + " but " + intToStr(w.sent) + " bytes written")))
+    }
+    if hasTrailers {
+        if len(bytes) > 0 {
+            match stream.writeData(&bytes, false, w.stallMs, at) {
+                Ok(_) {}
+                Err(e) { w.failed = true; return Err(h2WriteErr(&e)) }
+            }
+        }
+        match stream.sendHeaders(&tr, true) {
+            Ok(_) { w.h2EndSent = true; return Ok(Unit{}) }
+            Err(e) { w.failed = true; return Err(h2WriteErr(&e)) }
+        }
+    }
+    match stream.writeData(&bytes, true, w.stallMs, at) {
+        Ok(_) { w.h2EndSent = true; return Ok(Unit{}) }
+        Err(e) { w.failed = true; return Err(h2WriteErr(&e)) }
+    }
+}
+
+fn (w: mut &Response) h2Reset(code: int) {
+    match &w.conn {
+        WriteConn.H2(st) {
+            if !w.h2EndSent {
+                st.reset(code)
+                w.h2EndSent = true
+            }
+        }
+        else {}
+    }
 }
 
 // The head into out; length: a Content-Length to send, or -1.
@@ -2526,6 +2877,16 @@ fn addDate(out: mut &Buf) {
     out.add(&t[..])
 }
 
+fn currentDate(): str {
+    let sec = time.unixSeconds()
+    if sec != DATE_SEC {
+        DATE_TEXT = rc(time.httpDate(sec))
+        DATE_SEC = sec
+    }
+    let t = DATE_TEXT.clone()
+    return t[..].clone()
+}
+
 // Adds the ISO time of the log lines to out (shared per second, as addDate).
 fn addIso(out: mut &Buf) {
     let sec = time.unixSeconds()
@@ -2566,6 +2927,7 @@ type State = record {
     proxies: []str
     perIp: Map[str, int]
     maxPerIp: int
+    maxConns: int
     pid: int
     logFd: int
 }
@@ -2610,15 +2972,21 @@ pub fn serve[A](ln: net.Listener, app: A, r: Router[A], cfg: Config, at: Where):
 }
 
 // Serves HTTPS on ln with the TLS context ctx (tls.server(options) with a
-// certificate and key), one HTTP/1.1 connection per accepted socket. The
-// context's alpn is "" (ALPN not answered) or "http/1.1" (a client that
-// offers ALPN without it is refused); any other protocol is a Config error,
-// as this server speaks only HTTP/1.1.
+// certificate and key), negotiating HTTP/2 or HTTP/1.1 via ALPN. The
+// context's alpn is "" (HTTP/1.1 without ALPN) or any combination of "h2"
+// and "http/1.1" (e.g. "h2,http/1.1"); any other protocol is a Config error.
 pub fn serveTls[A](ln: net.Listener, ctx: tls.Context, app: A, r: Router[A], cfg: Config, at: Where): Result[Stats, Error] {
     if !ctx.isServer() { return Err(configErr("serveTls needs a server context (tls.server)")) }
     let alpn = ctx.alpn()
-    if len(alpn) > 0 && alpn != "http/1.1" {
-        return Err(configErr(&("serveTls speaks only HTTP/1.1, not the context's ALPN \"" + alpn + "\"")))
+    if len(alpn) > 0 {
+        for p in strings.splitByte(&alpn, ',') {
+            if p == "http/1.1" { continue }
+            if p == "h2" && cfg.h2 { continue }
+            if p == "h2" {
+                return Err(configErr("serveTls: context offers h2 but Config.h2 is false"))
+            }
+            return Err(configErr(&("serveTls supports only h2 and http/1.1, not ALPN \"" + alpn + "\"")))
+        }
     }
     return serveWith(ln, app, r, cfg, Some(ctx), at)
 }
@@ -2659,7 +3027,7 @@ fn serveWith[A](ln: net.Listener, app: A, r: Router[A], cfg: Config, tctx: Optio
     let st = task.shared(State{stats: noStats(), open: 0, slots: [], done: [], stopping: false, log: newBuf(0), mem: 0,
         memBudget: cfg.memBudget, hosts: lowerList(&cfg.hosts), redirectHosts: lowerList(&cfg.redirectHosts),
         proxies: copyList(&cfg.trustedProxies), perIp: newMap[str, int](), maxPerIp: cfg.maxConnsPerIp,
-        pid: int(getpid()), logFd: cfg.logFd})
+        maxConns: cfg.maxConns, pid: int(getpid()), logFd: cfg.logFd})
     let sh = rc(site)
     let shared = rc(app)        // one app for every connection: a handle each, lending &A
     let ready = task.workerReady()
@@ -2857,26 +3225,32 @@ fn flushLog(st: task.Shared[State]) {
 
 // ---------------------------------------------------------------- a connection
 
-type Sides = record {
-    read: ReadConn
-    write: WriteConn
-    peer: str
+type StartConn = closed {
+    H1(ReadConn, WriteConn, str, []byte)
+    H2(net.ReadHalf, net.WriteHalf, Option[tls.Engine], str, []byte, bool)
 }
 
-fn startSides(c: net.Conn, tctx: Option[tls.Context], hsMs: int, at: Where): Result[Sides, ConnError] {
+fn startConn(c: net.Conn, tctx: Option[tls.Context], lim: Limits, at: Where): Result[StartConn, ConnError] {
     match move(tctx) {
         Some(ctx) {
-            // within cannot hold the handshake: accept takes c
-            let timed = hsMs > 0
-            let old = if timed { rtWithin(hsMs) } else { 0 }
+            let timed = lim.headerTimeoutMs > 0
+            let old = if timed { rtWithin(lim.headerTimeoutMs) } else { 0 }
             let hr = ctx.accept(c, at)
             if timed { rtRestore(old) }
             match move(hr) {
                 Ok(tc) {
                     let peer = tc.peerAddr()
+                    if lim.h2 && tc.alpn() == "h2" {
+                        if !h2.isGoodTlsCipher(&tc.version(), &tc.cipher()) {
+                            return Err(ConnError{timeout: false, msg: "TLS 1.2 cipher not allowed for HTTP/2"})
+                        }
+                        let tls.Parts{engine: eng, sock: sock} = tc.intoParts()
+                        let net.Halves{read: rh, write: wh} = sock.split()
+                        return Ok(StartConn.H2(rh, wh, Some(eng), peer, [], false))
+                    }
                     let fd = tc.fd()
                     let box = task.shared(TlsBox{c: Some(tc)})
-                    return Ok(Sides{read: ReadConn.Tls(box.share(), fd), write: WriteConn.Tls(box), peer: peer})
+                    return Ok(StartConn.H1(ReadConn.Tls(box.share(), fd), WriteConn.Tls(box), peer, []))
                 }
                 Err(e) { return Err(tlsConn(&e)) }
             }
@@ -2884,14 +3258,56 @@ fn startSides(c: net.Conn, tctx: Option[tls.Context], hsMs: int, at: Where): Res
         None {
             let net.Halves{read: rh, write: wh} = c.split()
             let peer = rh.remote()
-            return Ok(Sides{read: ReadConn.Plain(rh), write: WriteConn.Plain(wh), peer: peer})
+            if !lim.h2c {
+                return Ok(StartConn.H1(ReadConn.Plain(rh), WriteConn.Plain(wh), peer, []))
+            }
+            // Peek up to 24 bytes for the HTTP/2 prior-knowledge preface.
+            // Stop immediately on the first byte mismatch so short HTTP/1.x requests never wait.
+            var pre = array(256, byte(0))
+            var got = 0
+            var matches = true
+            let dl = if lim.headerTimeoutMs > 0 { nowMs() + lim.headerTimeoutMs } else { -1 }
+            while matches && got < h2.PREFACE_LEN {
+                var r: Result[int, io.IoError] = Ok(0)
+                if dl >= 0 {
+                    let ms = dl - nowMs()
+                    if ms <= 0 { return Err(ConnError{timeout: true, msg: "preface timeout"}) }
+                    let old = rtWithin(ms)
+                    r = rh.read(mut &pre[got..], at)
+                    rtRestore(old)
+                } else {
+                    r = rh.read(mut &pre[got..], at)
+                }
+                match r {
+                    Ok(k) {
+                        if k == 0 { return Err(ConnError{timeout: false, msg: "closed before preface"}) }
+                        let checkEnd = min(got + k, h2.PREFACE_LEN)
+                        for i in got..checkEnd {
+                            if pre[i] != h2.PREFACE[i] {
+                                matches = false
+                                break
+                            }
+                        }
+                        got += k
+                    }
+                    Err(e) { return Err(ioConn(&e)) }
+                }
+            }
+            if matches && got >= h2.PREFACE_LEN {
+                var rest: []byte = []
+                for i in h2.PREFACE_LEN..got { append(mut &rest, pre[i]) }
+                return Ok(StartConn.H2(rh, wh, None, peer, rest, true))
+            }
+            var init: []byte = array(got, byte(0))
+            for i in 0..got { init[i] = pre[i] }
+            return Ok(StartConn.H1(ReadConn.Plain(rh), WriteConn.Plain(wh), peer, init))
         }
     }
 }
 
 fn connTask[A](j: ConnJob[A]): int {
     let ConnJob{conn: c, tlsCtx: tctx, app: app, site: site, st: st, slot: slot, lim: lim} = move(j)
-    let sr = startSides(c, tctx, lim.headerTimeoutMs)
+    let sr = startConn(c, tctx, lim)
     if sr.isErr() {
         // The handshake (or the split) failed: the socket is closed and the
         // connection is gone without an HTTP reply.
@@ -2903,8 +3319,88 @@ fn connTask[A](j: ConnJob[A]): int {
         })
         return 0
     }
-    let sides = sr.unwrap()
-    let Sides{read: rh, write: wh, peer: peer} = move(sides)
+    match sr.unwrap() {
+        StartConn.H2(rh, wh, tlsEng, peer, preRead, prefaceDone) {
+            serveH2Conn[A](rh, wh, tlsEng, peer, preRead, prefaceDone, app, site, st, slot, lim)
+            return 0
+        }
+        StartConn.H1(rh, wh, peer, preBytes) {
+            var trusted = false
+            var refuse = false
+            var counted = false
+            let ip = ipOf(&peer)
+            st.with(fn(x: mut &State) {
+                if len(x.proxies) > 0 { trusted = contains2(&x.proxies, &ip) }
+                if x.maxPerIp > 0 {
+                    counted = true
+                    let n = x.perIp.getOr(&ip, 0) + 1
+                    x.perIp.put(ip.clone(), n)
+                    if n > x.maxPerIp { refuse = true }
+                }
+            })
+            var buf = array(max(BUF, len(preBytes)), byte(0))
+            for i in 0..len(preBytes) { buf[i] = preBytes[i] }
+            var rq = Request{method: "", path: "", host: "", proto: "", headers: http.newHeaders(), peer: peer, id: "", pattern: "",
+                target: "", rawPath: "", query: "", hostName: "", minor: 1, params: [], chain: [], notes: [], trailers: http.newHeaders(),
+                allow: "", conn: rh, buf: buf, r: 0, n: len(preBytes), framing: F_NONE, left: 0, cstate: C_DONE, got: 0, maxBody: lim.maxBody,
+                extBytes: 0, expect: false, keep: true, broken: false, bodyStarted: false, bodyDeadline: -1, sinceYield: 0, lim: lim, st: st.share(),
+                trusted: trusted, rnd: [], rndAt: 0, started: 0}
+            var w = Response{conn: wh, code: 0, final: 0, headers: http.newHeaders(), trailerNames: [], trailerVals: http.newHeaders(),
+                out: newBuf(OUT), body: newBuf(0), strBody: "", useStr: false, headSent: false, mode: M_NONE, declared: -1, sent: 0,
+                head: false, minor: 1, close: false, bad: "", id: "", stallMs: lim.writeStallMs, failed: false, ctSet: false, ccSet: false,
+                h2EndSent: false, st: st.share()}
+            if refuse {
+                w.close = true
+                w.sendError(503)
+                let r = w.finish()
+            } else {
+                var served = 0
+                while true {
+                    if !serveOne[A](&app, &site, mut &rq, mut &w, slot, served) { break }
+                    served += 1
+                    if task.yield().isErr() { break }
+                }
+            }
+            if w.close && w.headSent && !task.cancelled() { linger(mut &rq, &w) }
+            let used = len(rq.buf) + len(w.out.b) + len(w.body.b)
+            st.with(fn(x: mut &State) {
+                x.open -= 1
+                x.mem -= used
+                x.slots[slot].state = SLOT_DONE
+                append(mut &x.done, slot)
+                if counted {
+                    let n = x.perIp.getOr(&ip, 0) - 1
+                    if n <= 0 {
+                        let old = x.perIp.remove(&ip)
+                    } else {
+                        x.perIp.put(ip.clone(), n)
+                    }
+                }
+            })
+            return 0
+        }
+    }
+}
+
+type ActiveStream = record {
+    id: int
+    fut: task.Future[int]
+}
+
+type H2StreamJob[A] = record {
+    req: h2server.StreamReq
+    stream: h2server.Stream
+    app: rc A
+    site: rc Router[A]
+    st: task.Shared[State]
+    peer: str
+    trusted: bool
+    lim: Limits
+}
+
+fn serveH2Conn[A](rh: net.ReadHalf, wh: net.WriteHalf, tlsEng: Option[tls.Engine], peer: str,
+                  preRead: []byte, prefaceDone: bool, app: rc A, site: rc Router[A],
+                  st: task.Shared[State], slot: int, lim: Limits) {
     var trusted = false
     var refuse = false
     var counted = false
@@ -2918,31 +3414,94 @@ fn connTask[A](j: ConnJob[A]): int {
             if n > x.maxPerIp { refuse = true }
         }
     })
-    var rq = Request{method: "", path: "", host: "", proto: "", headers: http.newHeaders(), peer: peer, id: "", pattern: "",
-        target: "", rawPath: "", query: "", hostName: "", minor: 1, params: [], chain: [], notes: [], trailers: http.newHeaders(),
-        allow: "", conn: rh, buf: array(BUF, byte(0)), r: 0, n: 0, framing: F_NONE, left: 0, cstate: C_DONE, got: 0, maxBody: lim.maxBody,
-        extBytes: 0, expect: false, keep: true, broken: false, bodyStarted: false, bodyDeadline: -1, sinceYield: 0, lim: lim, st: st.share(),
-        trusted: trusted, rnd: [], rndAt: 0, started: 0}
-    var w = Response{conn: wh, code: 0, final: 0, headers: http.newHeaders(), trailerNames: [], trailerVals: http.newHeaders(),
-        out: newBuf(OUT), body: newBuf(0), strBody: "", useStr: false, headSent: false, mode: M_NONE, declared: -1, sent: 0,
-        head: false, minor: 1, close: false, bad: "", id: "", stallMs: lim.writeStallMs, failed: false, ctSet: false, ccSet: false, st: st.share()}
+    let h2conn = h2server.newConn(h2LimitsOf(lim), tlsEng)
+    var accountedMem = BUF + OUT
     if refuse {
-        w.close = true
-        w.sendError(503)
-        let r = w.finish()
+        h2conn.closeConn(h2.ERR_ENHANCE_YOUR_CALM, "too many connections from IP")
     } else {
-        var served = 0
-        while true {
-            if !serveOne[A](&app, &site, mut &rq, mut &w, slot, served) { break }
-            served += 1
-            if task.yield().isErr() { break }
-        }
+        var wJob: Option[h2server.WriterJob] = Some(h2conn.writerJob(wh))
+        var rJob: Option[h2server.ReaderJob] = Some(h2conn.readerJob(rh, preRead, prefaceDone))
+        task.scope(fn(s: mut &task.Scope) {
+            let wr = s.start(h2server.writerTask, replace(mut &wJob, None).unwrap())
+            let rd = s.start(h2server.readerTask, replace(mut &rJob, None).unwrap())
+            var active: []ActiveStream = []
+            var draining = false
+            while true {
+                match h2conn.nextEvent(TICK) {
+                    Some(ev) {
+                        match ev {
+                            h2server.ConnEvent.NewStream(req) {
+                                let sid = req.id
+                                st.with(fn(x: mut &State) { x.slots[slot].state = SLOT_BUSY })
+                                let f = s.start(h2StreamTask[A], H2StreamJob[A]{
+                                    req: req, stream: h2conn.stream(sid), app: app.share(), site: site.share(), st: st.share(),
+                                    peer: peer.clone(), trusted: trusted, lim: lim,
+                                })
+                                append(mut &active, ActiveStream{id: sid, fut: f})
+                            }
+                            h2server.ConnEvent.CancelStream(sid) {
+                                removeActive(mut &active, sid)
+                            }
+                            h2server.ConnEvent.StreamDone(sid) {
+                                removeActive(mut &active, sid)
+                            }
+                            h2server.ConnEvent.Closed {
+                                break
+                            }
+                        }
+                    }
+                    None {}
+                }
+                if task.cancelled() {
+                    h2conn.closeConn(h2.ERR_NO_ERROR, "")
+                    break
+                }
+                if h2conn.checkSettingsTimeout() { break }
+                var stopping = false
+                var pressure = false
+                let idleNow = len(active) == 0 && h2conn.activeHandlers() == 0
+                let curMem = h2conn.bufferedBytes()
+                let deltaMem = curMem - accountedMem
+                accountedMem = curMem
+                let now = nowMs()
+                st.with(fn(x: mut &State) {
+                    x.mem += deltaMem
+                    stopping = x.stopping
+                    pressure = x.maxConns > 0 && x.open * 5 >= x.maxConns * 4
+                    if idleNow && x.slots[slot].state == SLOT_BUSY {
+                        x.slots[slot] = Slot{state: SLOT_IDLE, since: now}
+                    }
+                })
+                if stopping && !draining {
+                    draining = true
+                    h2conn.beginDrain()
+                }
+                if draining {
+                    h2conn.pollDrain()
+                    if idleNow {
+                        h2conn.closeConn(h2.ERR_NO_ERROR, "")
+                        break
+                    }
+                }
+                let effIdle = if pressure && lim.idlePressureMs > 0 && (lim.idleTimeoutMs <= 0 || lim.idlePressureMs < lim.idleTimeoutMs) {
+                    lim.idlePressureMs
+                } else {
+                    lim.idleTimeoutMs
+                }
+                if idleNow && effIdle > 0 && h2conn.idleMs() >= effIdle {
+                    h2conn.closeConn(h2.ERR_NO_ERROR, "")
+                    break
+                }
+            }
+            // Let writerTask flush any queued GOAWAY before scope teardown cancels tasks.
+            let _wr = wr.waitFor(200)
+            // Dropping active, rd inside task.scope cancels and joins them cleanly.
+        })
     }
-    if w.close && w.headSent && !task.cancelled() { linger(mut &rq, &w) }
-    let used = len(rq.buf) + len(w.out.b) + len(w.body.b)
+    let releaseMem = accountedMem
     st.with(fn(x: mut &State) {
         x.open -= 1
-        x.mem -= used
+        x.mem -= releaseMem
         x.slots[slot].state = SLOT_DONE
         append(mut &x.done, slot)
         if counted {
@@ -2954,6 +3513,201 @@ fn connTask[A](j: ConnJob[A]): int {
             }
         }
     })
+}
+
+fn removeActive(active: mut &[]ActiveStream, sid: int) {
+    for i in 0..len(active) {
+        if active[i].id == sid {
+            let last = len(active) - 1
+            if i != last { swap(active, i, last) }
+            let dropped = pop(active)
+            return
+        }
+    }
+}
+
+fn h2StreamTask[A](j: H2StreamJob[A]): int {
+    let H2StreamJob{req: req, stream: stream, app: app, site: site, st: st, peer: peer, trusted: trusted, lim: lim} = move(j)
+    let h2server.StreamReq{id: _, method: method, scheme: _, authority: auth, path: target, headers: rawHdrs,
+                           contentLength: cl, expectContinue: expectCont, badExpect: badExpect, endStream: endStream} = move(req)
+    var headers = http.newHeaders()
+    for f in move(rawHdrs) { headers.add(&f.name, &f.value) }
+    var rq = Request{method: method, path: "", host: "", proto: "HTTP/2.0", headers: headers, peer: peer, id: "", pattern: "",
+        target: target.clone(), rawPath: "", query: "", hostName: "", minor: 0, params: [], chain: [], notes: [],
+        trailers: http.newHeaders(), allow: "", conn: ReadConn.H2(stream.share()), buf: [], r: 0, n: 0,
+        framing: if endStream { F_NONE } else if cl >= 0 { F_LENGTH } else { F_CHUNKED },
+        left: if cl >= 0 { cl } else { 0 }, cstate: if endStream { C_DONE } else { C_SIZE },
+        got: 0, maxBody: lim.maxBody, extBytes: 0, expect: expectCont, keep: true, broken: false,
+        bodyStarted: false, bodyDeadline: -1, sinceYield: 0, lim: lim, st: st.share(), trusted: trusted,
+        rnd: [], rndAt: 0, started: if len(site.mws) > 0 { time.monotonicNs() } else { 0 }}
+    var w = Response{conn: WriteConn.H2(stream.share()), code: 0, final: 0, headers: http.newHeaders(),
+        trailerNames: [], trailerVals: http.newHeaders(), out: newBuf(0), body: newBuf(0), strBody: "", useStr: false,
+        headSent: false, mode: M_NONE, declared: -1, sent: 0, head: rq.method == "HEAD", minor: 0, close: false,
+        bad: "", id: "", stallMs: lim.writeStallMs, failed: false, ctSet: false, ccSet: false, h2EndSent: false,
+        st: st.share()}
+
+    let bad = if badExpect { 417 } else { validateH2Request(mut &rq, &auth, &target) }
+    var overMem = false
+    var misdirected = false
+    let hn = &rq.hostName
+    st.with(fn(x: mut &State) {
+        x.stats.requests += 1
+        if bad != 0 {
+            x.stats.rejected += 1
+            if bad >= 500 { x.stats.c5xx += 1 } else { x.stats.c4xx += 1 }
+        } else {
+            overMem = x.mem > x.memBudget
+            if len(x.hosts) > 0 && !contains2(&x.hosts, &hn) { misdirected = true }
+        }
+    })
+    if bad != 0 {
+        w.sendError(bad)
+        let r = w.finish()
+        stream.handlerFinished()
+        return 0
+    }
+
+    var pre = 0
+    if misdirected {
+        pre = 421
+    } else if overMem {
+        pre = 503
+    } else if rq.target == "*" {
+        pre = 200
+    }
+    var h: Option[Handler[A]] = None
+    var opts = routeOpts()
+    if pre == 0 {
+        let s: &Router[A] = &site
+        let i = findRoute(s, &rq.method, &rq.hostName, &rq.path, mut &rq.params)
+        if slashMatch(s, i, &rq.method, &rq.hostName, &rq.path) {
+            truncate(mut &rq.params, 0)
+            h = Some(toSlash[A])
+        } else if i >= 0 {
+            h = Some(s.routes[i].h)
+            opts = s.routes[i].opts
+            rq.pattern = s.routes[i].pattern.clone()
+        } else {
+            let allow = allowedMethods(s, &rq.hostName, &rq.path)
+            if len(allow) > 0 {
+                rq.allow = allow
+                h = Some(notAllowed[A])
+            } else {
+                h = Some(notFound[A])
+            }
+        }
+        for k in 0..len(s.mws) {
+            let p = &s.mws[k].prefix
+            if len(p) == 0 || strings.startsWith(&rq.path, &p) { append(mut &rq.chain, k) }
+        }
+        if opts.maxBody >= 0 { rq.maxBody = opts.maxBody }
+        if rq.framing == F_LENGTH && rq.left > rq.maxBody {
+            pre = 413
+            rq.broken = true
+        }
+    }
+
+    var res: Result[Unit, Error] = Ok(Unit{})
+    if pre == 200 {
+        w.code = 200
+    } else if pre != 0 {
+        w.sendError(pre)
+    } else {
+        match h {
+            Some(f) {
+                let deadline = if opts.deadlineMs >= 0 { opts.deadlineMs } else { rq.lim.deadlineMs }
+                var old = 0
+                if deadline > 0 { old = rtWithin(deadline) }
+                let n = Next[A]{site: site.share(), h: f, pos: 0}
+                res = n.run(&app, mut &rq, mut &w)
+                if deadline > 0 { rtRestore(old) }
+            }
+            None {}
+        }
+    }
+
+    let gone = task.cancelled()
+    var abort = false
+    var kind = ""
+    match &res {
+        Ok(_) {}
+        Err(e) {
+            kind = e.kind.toStr()
+            if !w.headSent && !w.failed && !gone {
+                w.sendError(if e.status >= 400 && e.status <= 599 { e.status } else { 500 })
+            } else {
+                abort = true
+            }
+        }
+    }
+    if abort {
+        w.h2Reset(h2.ERR_INTERNAL_ERROR)
+    } else if !gone && !w.failed {
+        var fin = w.finish()
+        if fin.isErr() && !w.headSent && !w.failed {
+            w.sendError(500)
+            fin = w.finish()
+        } else if fin.isErr() && w.headSent {
+            w.h2Reset(h2.ERR_INTERNAL_ERROR)
+        }
+    }
+    let status = if w.headSent { w.final } else { 0 }
+    st.with(fn(x: mut &State) {
+        if status >= 500 {
+            x.stats.c5xx += 1
+            x.stats.errors += 1
+        } else if status >= 400 {
+            x.stats.c4xx += 1
+        } else if status >= 300 {
+            x.stats.c3xx += 1
+        } else if status >= 200 {
+            x.stats.c2xx += 1
+        }
+        if gone { x.stats.gone += 1 }
+        if kind == "timeout" { x.stats.timeouts += 1 }
+    })
+    stream.handlerFinished()
+    return 0
+}
+
+// Validates HTTP/2 method, authority and :path into rq's fields; returns 0 or HTTP error status.
+fn validateH2Request(rq: mut &Request, auth: &str, target: &str): int {
+    if !http.isToken(&rq.method) { return 400 }
+    if rq.method == "CONNECT" { return 405 }
+    if len(target) == 0 { return 400 }
+    if len(target) > rq.lim.maxTargetBytes { return 414 }
+    for i in 0..len(target) {
+        let c = target[i]
+        if c <= byte(0x20) || c >= byte(0x7f) || c == '#' { return 400 }
+    }
+    var host = auth.clone()
+    if len(host) > 0 {
+        if !validHost(&host) { return 400 }
+        host = lowerAscii(&host)
+    }
+    rq.host = host.clone()
+    rq.hostName = hostName(&host)
+    if target == "*" {
+        if rq.method != "OPTIONS" { return 400 }
+        rq.rawPath = "*"
+        rq.path = "*"
+        rq.query = ""
+        return 0
+    }
+    if target[0] != '/' { return 400 }
+    let q = strings.indexOf(target, "?", 0)
+    rq.rawPath = if q >= 0 { target[..q].clone() } else { target.clone() }
+    rq.query = if q >= 0 { target[q + 1..].clone() } else { "" }
+    let p = cleanPath(&rq.rawPath)
+    if len(p) == 0 { return 400 }
+    rq.path = p
+    if len(rq.query) > 0 {
+        var params = 1
+        for k in 0..len(rq.query) {
+            if rq.query[k] == '&' { params += 1 }
+        }
+        if params > rq.lim.maxParams { return 400 }
+    }
     return 0
 }
 
@@ -3022,6 +3776,7 @@ fn reset(rq: mut &Request, w: mut &Response) {
     w.failed = false
     w.ctSet = false
     w.ccSet = false
+    w.h2EndSent = false
 }
 
 // Reads up to the end of a request head: the index of its "\r\n\r\n" in
