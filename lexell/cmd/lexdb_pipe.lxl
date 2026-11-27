@@ -392,6 +392,7 @@ pub const BA_AND = 7       // bool_and, every: the minimum of its booleans (0, 1
 pub const BA_OR = 8        // bool_or: the maximum
 pub const BA_CNTD = 9      // count(DISTINCT x) of an integer: a set of the values per group
 pub const BA_VAR = 10      // the variances and standard deviations of a float column: n, the sum and the sum of squares in doubles
+pub const BA_CNTD_TEXT = 11 // count(DISTINCT text_col): bump-arena TwoLevelArena set per group (ClickBench q5!)
 pub const BA_GEN = 6       // any other call (DISTINCT, ORDER BY, string_agg, the variances ...): lexdb_agg's accumulator, a value at a time
 
 // An expression over a batch. Operators: + - * / % as 0 to 4; = <> < <=
@@ -443,6 +444,7 @@ pub type BNode = closed {
     StrLen(int)                 // textCol -> UTF-8 character length (with C_DICT word dedup)
     ReReplace(int, lexdb_lib.ReCompiled, str) // textCol, compiled regex, replacement string
     CaseNum(BNode, BNode, int, BNode, int)    // cond, then, thenScale (-1=int), else, elseScale (-1=int)
+    BpCmp(int, int, str, bool, bool, bool)    // op, col, lit, litNull, left, txt (#bptrim(col) op const_text)
 }
 
 // A compiled expression over a batch (9.108): per row, the columns it
@@ -648,6 +650,25 @@ pub fn bCompileD(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, bas
                             let c = if va >= 0 { va } else { vb }
                             if !lexdb_ops.isNull(&v) && !bCmpKinds(cols[c + base].typ.kind, lexdb_ops.kindOf(&v), ce) { return None }
                             return Some(BComp{n: BNode.ValCmp(cc, c, v, vb >= 0, kinds[c + base] == BK_TEXT), typ: BT_BOOL})
+                        }
+                        Err(_) { return None }
+                    }
+                }
+                let ba = bpTrimCol(&a, kinds, base)
+                let bb = if ba >= 0 { -1 } else { bpTrimCol(&b, kinds, base) }
+                if ba >= 0 || bb >= 0 {
+                    let k = if ba >= 0 { &b } else { &a }
+                    if !bxConst(k) { return None }
+                    let none: []Val = []
+                    match bxEval(k, &none, &none, ce) {
+                        Ok(v) {
+                            let c = if ba >= 0 { ba } else { bb }
+                            if !bCmpKinds(lexdb_sql.K_TEXT, lexdb_sql.K_TEXT, ce) { return None }
+                            match v {
+                                Val.Null { return Some(BComp{n: BNode.BpCmp(cc, c, "", true, bb >= 0, kinds[c + base] == BK_TEXT), typ: BT_BOOL}) }
+                                Val.Text(s) { return Some(BComp{n: BNode.BpCmp(cc, c, s, false, bb >= 0, kinds[c + base] == BK_TEXT), typ: BT_BOOL}) }
+                                else {}
+                            }
                         }
                         Err(_) { return None }
                     }
@@ -923,6 +944,28 @@ pub fn bValCol(x: &BX, kinds: &[]int, base: int): int {
     }
 }
 
+fn bpTrimCol(x: &BX, kinds: &[]int, base: int): int {
+    match x {
+        BX.Call(fr, args) {
+            if fr.name == "#bptrim" && len(args) == 1 { return bValCol(&args[0], kinds, base) }
+            return -1
+        }
+        else { return -1 }
+    }
+}
+
+fn cmpTrimmedStr(s: &str, lit: &str): int {
+    var e = len(s)
+    while e > 0 && s[e - 1] == ' ' { e -= 1 }
+    let b = len(lit)
+    let mn = min(e, b)
+    for i in 0..mn {
+        if s[i] < lit[i] { return -1 }
+        if s[i] > lit[i] { return 1 }
+    }
+    return if e < b { -1 } else if e > b { 1 } else { 0 }
+}
+
 // The query's column x is, if the batch holds it, else -1.
 pub fn colOf(x: &BX, kinds: &[]int): int {
     match x {
@@ -1062,6 +1105,27 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
                     Some(z) { z }
                     None { if left { try lexdb_ops.compare(&k, &b.vals[c][r]) } else { try lexdb_ops.compare(&b.vals[c][r], &k) } }
                 }
+                let t = if op == 0 { x == 0 } else if op == 1 { x != 0 } else if op == 2 { x < 0 } else if op == 3 { x <= 0 }
+                        else if op == 4 { x > 0 } else { x >= 0 }
+                out.v[j] = if t { 1 } else { 0 }
+            }
+            return Ok(out)
+        }
+        BNode.BpCmp(op, c, lit, litNull, left, txt) {
+            var out = lexdb_rows.bvec(m)
+            for j in 0..m {
+                let r = idx[j]
+                if litNull || b.cols[c].nul[r] { out.nul[j] = true; continue }
+                var y = 0
+                if txt {
+                    y = cmpTrimmedStr(lexdb_rows.textAt(b, c, r), &lit)
+                } else {
+                    match &b.vals[c][r] {
+                        Val.Text(s) { y = cmpTrimmedStr(s, &lit) }
+                        else { return Err(batErr()) }
+                    }
+                }
+                let x = if left { -y } else { y }
                 let t = if op == 0 { x == 0 } else if op == 1 { x != 0 } else if op == 2 { x < 0 } else if op == 3 { x <= 0 }
                         else if op == 4 { x > 0 } else { x >= 0 }
                 out.v[j] = if t { 1 } else { 0 }
@@ -2669,16 +2733,28 @@ fn addHashText(kb: mut &str, s: &str) {
 
 // Fast injective binary hash-key encoding for AggSt composite keys (avoids byte-by-byte \x00 escaping
 // of encIdxPart on long strings like URL/SearchPhrase/Referer, and evaluates CondText zero-copy).
-fn bKeyEncFast(kb: mut &str, c: &BComp, kv: &BVec, j: int, b: &Batch, r: int, txt: bool) {
+fn bKeyEncFast(kb: mut &str, c: &BComp, kv: &BVec, j: int, b: &Batch, r: int, txt: bool, pad: bool) {
     match &c.n {
         BNode.CondText(_, tc, elseLit) {
             if kv.v[j] == 1 && !kv.nul[j] {
                 if b.cols[tc].nul[r] {
                     kb.addByte(0)
                 } else if lexdb_rows.isTextCol(b, tc) {
-                    addHashText(kb, lexdb_rows.textAt(b, tc, r))
+                    let s = lexdb_rows.textAt(b, tc, r)
+                    if pad {
+                        var e = len(s)
+                        while e > 0 && s[e - 1] == ' ' { e -= 1 }
+                        addHashText(kb, &s[0..e])
+                    } else {
+                        addHashText(kb, s)
+                    }
                 } else {
-                    encHashVal(kb, &b.vals[tc][r])
+                    if pad {
+                        let pv = lexdb_sort.collVal(lexdb_sql.COLL_PAD, &b.vals[tc][r])
+                        encHashVal(kb, &pv)
+                    } else {
+                        encHashVal(kb, &b.vals[tc][r])
+                    }
                 }
             } else {
                 addHashText(kb, elseLit)
@@ -2730,17 +2806,35 @@ fn bKeyEncFast(kb: mut &str, c: &BComp, kv: &BVec, j: int, b: &Batch, r: int, tx
                     if b.cols[i].nul[r] {
                         kb.addByte(0)
                     } else {
-                        addHashText(kb, lexdb_rows.textAt(b, i, r))
+                        let s = lexdb_rows.textAt(b, i, r)
+                        if pad {
+                            var e = len(s)
+                            while e > 0 && s[e - 1] == ' ' { e -= 1 }
+                            addHashText(kb, &s[0..e])
+                        } else {
+                            addHashText(kb, s)
+                        }
                     }
                 } else {
-                    encHashVal(kb, &b.vals[i][r])
+                    if pad {
+                        let pv = lexdb_sort.collVal(lexdb_sql.COLL_PAD, &b.vals[i][r])
+                        encHashVal(kb, &pv)
+                    } else {
+                        encHashVal(kb, &b.vals[i][r])
+                    }
                 }
                 return
             }
             else {}
         }
     }
-    encHashVal(kb, &bKeyVal(c, kv, j, b, r))
+    let kv0 = bKeyVal(c, kv, j, b, r)
+    if pad {
+        let pv = lexdb_sort.collVal(lexdb_sql.COLL_PAD, &kv0)
+        encHashVal(kb, &pv)
+    } else {
+        encHashVal(kb, &kv0)
+    }
 }
 
 // Marks the columns n reads.
@@ -2799,6 +2893,7 @@ pub fn bColsOf(n: &BNode, used: mut &[]bool) {
             bColsOf(&th, used)
             bColsOf(&el, used)
         }
+        BNode.BpCmp(_, c, _, _, _, _) { used[c] = true }
     }
 }
 
@@ -2993,16 +3088,45 @@ pub fn bAccum(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, cn: 
 // Adds the values of a batch's rows (gids: their groups) to the integer
 // sets of a count(DISTINCT x) (sets: per group): count(DISTINCT x)'s value
 // is a set's size. NULLs are not counted.
-pub fn bAccDist(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, sets: mut &[]Map[int, int]): Result[Unit, DbErr] {
+pub fn bAccDist(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, sets: mut &[]lexdb_ht.IntSet): Result[Unit, DbErr] {
     let a = match sp.arg {
         Some(x) { try bEval(&x, b, rows) }
         None { lexdb_rows.bvec(0) }
     }
     let k = len(rows)
     if one {
-        for j in 0..k { if !a.nul[j] { sets[0].put(a.v[j], 1) } }
+        for j in 0..k { if !a.nul[j] { sets[0].add(a.v[j]) } }
     } else {
-        for j in 0..k { if !a.nul[j] { sets[gids[j]].put(a.v[j], 1) } }
+        for j in 0..k { if !a.nul[j] { sets[gids[j]].add(a.v[j]) } }
+    }
+    return Ok(Unit{})
+}
+
+fn bAccDistText(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, sets: mut &[]lexdb_ht.TwoLevelArena): Result[Unit, DbErr] {
+    let col = sp.vcol
+    let k = len(rows)
+    let isTxt = lexdb_rows.isTextCol(b, col)
+    if isTxt {
+        if one {
+            for j in 0..k {
+                let r = rows[j]
+                if !b.cols[col].nul[r] { sets[0].addDistinct(lexdb_rows.textAt(b, col, r)) }
+            }
+        } else {
+            for j in 0..k {
+                let r = rows[j]
+                if !b.cols[col].nul[r] { sets[gids[j]].addDistinct(lexdb_rows.textAt(b, col, r)) }
+            }
+        }
+        return Ok(Unit{})
+    }
+    for j in 0..k {
+        let r = rows[j]
+        if b.cols[col].nul[r] { continue }
+        match &b.vals[col][r] {
+            Val.Text(s) { sets[if one { 0 } else { gids[j] }].addDistinct(s) }
+            else { return Err(batErr()) }
+        }
     }
     return Ok(Unit{})
 }
@@ -5113,7 +5237,8 @@ type AggSt = record {
     adec: [][]i128
     afs: [][]float          // BA_VAR: per group the sum ...
     afq: [][]float          // ... and the sum of squares
-    asets: [][]Map[int, int]    // BA_CNTD: per group its values
+    asets: [][]lexdb_ht.IntSet    // BA_CNTD: per group its values (small inline slice -> Map)
+    atsets: [][]lexdb_ht.TwoLevelArena // BA_CNTD_TEXT: per group distinct text arena set
     intHt: lexdb_ht.TwoLevelInt
     twoHt: lexdb_ht.TwoLevelTwoInt
     textHt: lexdb_ht.TwoLevelArena
@@ -5142,6 +5267,7 @@ type AggSt = record {
     elideComp: bool         // composite plain-column keys reconstructed from keyHt.keyAt(g) (ClickBench q18/q39)
     compCols: []int
     compTypes: []int        // 0: int, 1: bool, 2: text
+    padMask: int            // bitmask of GROUP BY keys using COLL_PAD (CHAR(N) trailing-space trim)
     shareOf: []int          // per spec: >= 0 shares (an, adec) with earlier identical BA_SUM/BA_AVG spec
     added: int
     room: int
@@ -5236,9 +5362,17 @@ fn kernelOf(c: &lexdb_plan.PCall, bx: &BX, isBool: bool, isVar: bool, isCnt: boo
         if isBool {
             if cc.typ != BT_BOOL { return false }
             kind = if f == "bool_or" { BA_OR } else { BA_AND }
-        } else {
-            if cc.typ != BT_INT { return false }
+        } else if cc.typ == BT_INT {
             kind = BA_CNTD
+        } else {
+            // COUNT(DISTINCT text_col) -> BA_CNTD_TEXT using TwoLevelArena (ClickBench q5!)
+            if c.kind != lexdb_sql.COLL_EXACT { return false }
+            let vc = bValCol(bx, kinds, 0)
+            if vc < 0 || kinds[vc] != BK_TEXT { return false }
+            let o = cols[vc].typ.oid
+            if o != lexdb_sql.OID_TEXT && o != lexdb_sql.OID_VARCHAR { return false }
+            kind = BA_CNTD_TEXT
+            vcol = vc
         }
         arg = Some(takeN(cc))
     }
@@ -5512,13 +5646,20 @@ fn plainIntKeyCol(c: &BComp, kinds: &[]int): int {
 fn aggState(a: &lexdb_plan.PAgg, ks: &[]int, cols: &[]lexdb_sql.ColDef, kinds: &[]int, need: &[]bool, cx: &Ctx, dec: bool, room: int,
             maxHeld: int): Option[AggSt] {
     var keys: []BComp = []
+    var padMask = 0
     for ki in ks {
         let got = aggKeyCompile(&a.keys[ki], cols, kinds, cx, dec)
         if got.isNone() { return None }
         let cc = got.unwrap()
         // Constant GROUP BY keys (e.g. ClickBench q34: GROUP BY 1, URL) do not vary per row:
         // fold them out of hash key lookup so single-column fast paths apply directly!
-        if !isConstKey(&cc) { append(mut &keys, cc) }
+        if !isConstKey(&cc) {
+            if ki < len(a.kinds) && a.kinds[ki] == lexdb_sql.COLL_PAD {
+                if len(keys) >= 62 { return None }
+                padMask = padMask | (1 << len(keys))
+            }
+            append(mut &keys, cc)
+        }
     }
     var specs: []BSpec = []
     var gens: []Option[BGen] = []
@@ -5569,7 +5710,7 @@ fn aggState(a: &lexdb_plan.PAgg, ks: &[]int, cols: &[]lexdb_sql.ColDef, kinds: &
     for i in 0..len(need) { if need[i] && i < len(a.keep) && a.keep[i] { append(mut &fcols, i) } }
     let ns = len(specs)
     var ag = AggSt{keys: keys, specs: specs, gens: gens, gcs: gcs, kinds: collections.copyOf(kinds), fcols: fcols, fv: [], ngroups: 0,
-                   an: [], asum: [], amm: [], aval: [], adec: [], afs: [], afq: [], asets: [],
+                   an: [], asum: [], amm: [], aval: [], adec: [], afs: [], afq: [], asets: [], atsets: [],
                    intHt: lexdb_ht.newTwoLevelInt(false), twoHt: lexdb_ht.newTwoLevelTwoInt(),
                    textHt: lexdb_ht.newTwoLevelArena(false), keyHt: lexdb_ht.newTwoLevelArena(false),
                    twoInt: false, nullGroup: -1,
@@ -5577,7 +5718,7 @@ fn aggState(a: &lexdb_plan.PAgg, ks: &[]int, cols: &[]lexdb_sql.ColDef, kinds: &
                    reCol: -1, reComp: None, reSr: None, reRepl: "", reMemo: lexdb_ht.newStrGidMemo(),
                    elideText: false, keyCol0: -1, keyCol1: -1, keyCol0Bool: false, keyCol1Bool: false,
                    twoText: false, twoTextC0: -1, twoTextC1: -1,
-                   elideComp: false, compCols: [], compTypes: [], shareOf: array(ns, -1),
+                   elideComp: false, compCols: [], compTypes: [], padMask: padMask, shareOf: array(ns, -1),
                    added: 0, room: room, maxHeld: maxHeld,
                    track: false, base: 0, born: [], groupCap: -1}
     for i in 0..ns {
@@ -5589,6 +5730,7 @@ fn aggState(a: &lexdb_plan.PAgg, ks: &[]int, cols: &[]lexdb_sql.ColDef, kinds: &
         append(mut &ag.afs, [])
         append(mut &ag.afq, [])
         append(mut &ag.asets, [])
+        append(mut &ag.atsets, [])
     }
     // Share (an, adec) between identical BA_SUM / BA_AVG specs (e.g. TPC-H q1 sum(x) + avg(x))
     for i in 1..ns {
@@ -5608,7 +5750,7 @@ fn aggState(a: &lexdb_plan.PAgg, ks: &[]int, cols: &[]lexdb_sql.ColDef, kinds: &
     ag.twoInt = len(ag.keys) == 2 &&
                 (ag.keys[0].typ == BT_INT || ag.keys[0].typ == BT_BOOL) &&
                 (ag.keys[1].typ == BT_INT || ag.keys[1].typ == BT_BOOL)
-    if len(ag.keys) == 1 && ag.keys[0].typ == BT_OTHER {
+    if len(ag.keys) == 1 && ag.keys[0].typ == BT_OTHER && ag.padMask == 0 {
         var gotTc = -1
         var gotReC = -1
         var gotReComp: Option[lexdb_lib.ReCompiled] = None
@@ -5636,7 +5778,7 @@ fn aggState(a: &lexdb_plan.PAgg, ks: &[]int, cols: &[]lexdb_sql.ColDef, kinds: &
         }
     }
     // Two plain text columns (e.g. TPC-H q1 l_returnflag, l_linestatus): 64-slot (w0, w1) C_DICT word cache
-    if len(ag.keys) == 2 && ag.keys[0].typ == BT_OTHER && ag.keys[1].typ == BT_OTHER {
+    if len(ag.keys) == 2 && ag.keys[0].typ == BT_OTHER && ag.keys[1].typ == BT_OTHER && ag.padMask == 0 {
         var c0 = -1
         var c1 = -1
         match &ag.keys[0].n {
@@ -5694,34 +5836,55 @@ fn aggState(a: &lexdb_plan.PAgg, ks: &[]int, cols: &[]lexdb_sql.ColDef, kinds: &
             ag.fcols = nf
         }
     } else if len(ag.keys) >= 2 && ag.reCol < 0 {
-        // Composite plain-column keys: check if every key is a plain Col of int/bool/text so bKeyEncFast is lossless
-        var allPlain = true
+        // Composite keys: elide plain Col keys (and safe CondText keys when not referenced outside GROUP BY)
+        // by reconstructing them directly from keyHt.keyAt(g) (ClickBench q18/q39, TPC-H q16!).
+        var allEnc = true
         var cCols: []int = []
         var cTyps: []int = []
-        var anyInFcols = false
+        var elideCols: []int = []
+        var condUsed: []int = []
         for ki in 0..len(ag.keys) {
             let k = &ag.keys[ki]
+            let isPad = (ag.padMask & (1 << ki)) != 0
             var ci = -1
+            var isCond = false
             match &k.n {
                 BNode.Col(c) { ci = c }
+                BNode.CondText(_, tc, _) {
+                    ci = tc
+                    isCond = true
+                }
                 else {}
             }
-            if ci < 0 || ci >= len(kinds) { allPlain = false; break }
+            if ci < 0 || ci >= len(kinds) { allEnc = false; break }
             let kd = kinds[ci]
-            if k.typ == BT_INT && !lexdb_rows.isDecKind(kd) && kd == BK_INT {
-                append(mut &cCols, ci); append(mut &cTyps, 0)
+            if isCond {
+                if kd != BK_TEXT { allEnc = false; break }
+                let safe = !isPad && ci < len(a.condSafe) && a.condSafe[ci] && !hasIntIn(&condUsed, ci)
+                append(mut &condUsed, ci)
+                if safe && hasIntIn(&ag.fcols, ci) {
+                    append(mut &cCols, ci); append(mut &cTyps, 2)
+                    append(mut &elideCols, ci)
+                } else {
+                    append(mut &cCols, -1); append(mut &cTyps, 2)
+                }
+            } else if k.typ == BT_INT && !lexdb_rows.isDecKind(kd) && kd == BK_INT {
+                append(mut &cCols, if isPad { -1 } else { ci }); append(mut &cTyps, 0)
+                if !isPad && hasIntIn(&ag.fcols, ci) { append(mut &elideCols, ci) }
             } else if k.typ == BT_BOOL && kd == BK_BOOL {
-                append(mut &cCols, ci); append(mut &cTyps, 1)
+                append(mut &cCols, if isPad { -1 } else { ci }); append(mut &cTyps, 1)
+                if !isPad && hasIntIn(&ag.fcols, ci) { append(mut &elideCols, ci) }
             } else if k.typ == BT_OTHER && kd == BK_TEXT {
-                append(mut &cCols, ci); append(mut &cTyps, 2)
+                append(mut &cCols, if isPad { -1 } else { ci }); append(mut &cTyps, 2)
+                if !isPad && hasIntIn(&ag.fcols, ci) { append(mut &elideCols, ci) }
             } else {
-                allPlain = false; break
+                allEnc = false; break
             }
-            if hasIntIn(&ag.fcols, ci) { anyInFcols = true }
         }
-        if allPlain && anyInFcols {
+        // Guard against a CondText column also appearing as a plain Col key (or twice as CondText)
+        if allEnc && len(elideCols) > 0 {
             var nf: []int = []
-            for fc in ag.fcols { if !hasIntIn(&cCols, fc) { append(mut &nf, fc) } }
+            for fc in ag.fcols { if !hasIntIn(&elideCols, fc) { append(mut &nf, fc) } }
             ag.fcols = nf
             ag.elideComp = true
             ag.compCols = cCols
@@ -5766,7 +5929,7 @@ fn bNodeOptEq(a: &Option[BNode], b: &Option[BNode]): bool {
     }
 }
 
-// Decodes composite keys encoded by bKeyEncFast back into first[compCols[i]].
+// Decodes composite keys encoded by bKeyEncFast back into first[compCols[i]] (compCols[i] < 0 skips).
 fn decodeCompKey(raw: &str, compCols: &[]int, compTypes: &[]int, first: mut &[]Val) {
     var pos = 0
     let n = len(raw)
@@ -5776,26 +5939,26 @@ fn decodeCompKey(raw: &str, compCols: &[]int, compTypes: &[]int, first: mut &[]V
         pos += 1
         let ci = compCols[ki]
         if tag == 0 {
-            first[ci] = Val.Null
+            if ci >= 0 { first[ci] = Val.Null }
             continue
         }
         if tag == 1 {
             var v = 0
             for b in 0..8 { v = v | (int(raw[pos + b]) << (b * 8)) }
             pos += 8
-            first[ci] = Val.Int(v)
+            if ci >= 0 { first[ci] = Val.Int(v) }
         } else if tag == 2 {
-            first[ci] = Val.Bool(raw[pos] != 0)
+            if ci >= 0 { first[ci] = Val.Bool(raw[pos] != 0) }
             pos += 1
         } else if tag == 4 {
             let sl = int(raw[pos]) | (int(raw[pos + 1]) << 8)
             pos += 2
-            first[ci] = Val.Text(raw[pos..pos + sl].clone())
+            if ci >= 0 { first[ci] = Val.Text(raw[pos..pos + sl].clone()) }
             pos += sl
         } else if tag == 7 {
             let sl = int(raw[pos]) | (int(raw[pos + 1]) << 8) | (int(raw[pos + 2]) << 16) | (int(raw[pos + 3]) << 24)
             pos += 4
-            first[ci] = Val.Text(raw[pos..pos + sl].clone())
+            if ci >= 0 { first[ci] = Val.Text(raw[pos..pos + sl].clone()) }
             pos += sl
         }
     }
@@ -5824,7 +5987,11 @@ fn (ag: mut &AggSt) newGroup(born: int) {
             continue
         }
         if kd == BA_CNTD {
-            append(mut &ag.asets[i], newMap())
+            append(mut &ag.asets[i], lexdb_ht.newIntSet())
+            continue
+        }
+        if kd == BA_CNTD_TEXT {
+            append(mut &ag.atsets[i], lexdb_ht.newTwoLevelArena(false))
             continue
         }
         append(mut &ag.an[i], 0)
@@ -6246,7 +6413,7 @@ fn (ag: mut &AggSt) eat(b: mut &Batch, idx: &[]int): Result[bool, DbErr] {
         for j in 0..nc {
             let st0 = len(kbuf)
             koff[j] = st0
-            for ki in 0..len(ag.keys) { bKeyEncFast(mut &kbuf, &ag.keys[ki], &kvs[ki], j, b, idx[j], ktxt[ki]) }
+            for ki in 0..len(ag.keys) { bKeyEncFast(mut &kbuf, &ag.keys[ki], &kvs[ki], j, b, idx[j], ktxt[ki], (ag.padMask & (1 << ki)) != 0) }
             klenA[j] = len(kbuf) - st0
         }
         var khs: []u64 = array(nc, u64(0))
@@ -6579,6 +6746,7 @@ fn (ag: mut &AggSt) accum(specs: &[]BSpec, b: &Batch, idx: &[]int, gid: &[]int, 
 fn (ag: mut &AggSt) accCall(si: int, sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool): Result[Unit, DbErr] {
     if sp.kind == BA_GEN { return ag.accumGen(si, b, rows, gids) }
     if sp.kind == BA_CNTD { return bAccDist(sp, b, rows, gids, one, mut &ag.asets[si]) }
+    if sp.kind == BA_CNTD_TEXT { return bAccDistText(sp, b, rows, gids, one, mut &ag.atsets[si]) }
     if sp.kind == BA_VAR { return bAccVar(sp, b, rows, gids, one, mut &ag.an[si], mut &ag.afs[si], mut &ag.afq[si]) }
     if sp.vcol >= 0 { return bAccVal(sp, b, rows, gids, mut &ag.an[si], mut &ag.aval[si]) }
     if sp.kind == BA_SUM || sp.kind == BA_AVG { return bAccDec(sp, b, rows, gids, one, mut &ag.an[si], mut &ag.adec[si]) }
@@ -6663,6 +6831,14 @@ fn (ag: mut &AggSt) groupAt(g: int, first: mut &[]Val, accs: mut &[]Acc): Result
         if kd == BA_CNTD {
             let acc = mut &accs[si]
             acc.n = ag.asets[si][g].size()
+            acc.sum = Val.Null
+            acc.sumsq = Val.Null
+            acc.val = Val.Null
+            continue
+        }
+        if kd == BA_CNTD_TEXT {
+            let acc = mut &accs[si]
+            acc.n = ag.atsets[si][g].size()
             acc.sum = Val.Null
             acc.sumsq = Val.Null
             acc.val = Val.Null
@@ -6821,8 +6997,13 @@ fn (ag: mut &AggSt) flushSorted(rowLen: int, top: &TopAgg, hb: &HavBound,
             continue
         }
         if kd == BA_CNTD {
-            ag.asets[si][0] = replace(mut &ag.asets[si][last], newMap())
+            ag.asets[si][0] = replace(mut &ag.asets[si][last], lexdb_ht.newIntSet())
             while len(ag.asets[si]) > 1 { let gone = pop(mut &ag.asets[si]) }
+            continue
+        }
+        if kd == BA_CNTD_TEXT {
+            ag.atsets[si][0] = replace(mut &ag.atsets[si][last], lexdb_ht.newTwoLevelArena(false))
+            while len(ag.atsets[si]) > 1 { let gone = pop(mut &ag.atsets[si]) }
             continue
         }
         ag.an[si][0] = ag.an[si][last]
@@ -6863,10 +7044,19 @@ fn (ag: mut &AggSets) finishTop(nq: int, top: &TopAgg, give: &fn(mut &[]Val, int
         if x.elideComp { for c in x.compCols { if c + 1 > rowLen { rowLen = c + 1 } } }
     }
     // Direct Top-N pruning BEFORE allocating Val/Acc arrays for rejected groups!
-    if !ag.set && top.on && ag.ags[0].ngroups > 8192 && top.aggIdx >= 0 && top.aggIdx < ns {
+    if !ag.set && top.on && ag.ags[0].ngroups > 2048 && top.aggIdx >= 0 && top.aggIdx < ns {
         let kd = ag.ags[0].specs[top.aggIdx].kind
+        var keepGids: []int = []
+        var didTop = false
         if kd == BA_STAR || kd == BA_COUNT {
-            let keepGids = lexdb_ht.selectTopIntGroups(&ag.ags[0].an[top.aggIdx], ag.ags[0].ngroups, top.topN, top.desc, top.oneOrd)
+            keepGids = lexdb_ht.selectTopIntGroups(&ag.ags[0].an[top.aggIdx], ag.ags[0].ngroups, top.topN, top.desc, top.oneOrd)
+            didTop = true
+        } else if kd == BA_SUM && ag.ags[0].specs[top.aggIdx].vcol < 0 {
+            let srcIdx = if ag.ags[0].shareOf[top.aggIdx] >= 0 { ag.ags[0].shareOf[top.aggIdx] } else { top.aggIdx }
+            keepGids = lexdb_ht.selectTopDecGroups(&ag.ags[0].adec[srcIdx], &ag.ags[0].an[srcIdx], ag.ags[0].ngroups, top.topN, top.desc, top.oneOrd)
+            didTop = true
+        }
+        if didTop {
             var first: []Val = array(rowLen, Val.Null)
             var accs = lexdb_agg.newAccs(ns)
             for g in keepGids {
@@ -7093,7 +7283,7 @@ fn encHashVal(b: mut &str, v: &Val) {
 // Whether a's keys and calls compare by their values (no collation's):
 // the batches' kernels run it.
 fn exactAgg(a: &lexdb_plan.PAgg): bool {
-    for k in a.kinds { if k != lexdb_sql.COLL_EXACT { return false } }
+    for k in a.kinds { if k != lexdb_sql.COLL_EXACT && k != lexdb_sql.COLL_PAD { return false } }
     for c in a.calls { if c.kind != lexdb_sql.COLL_EXACT { return false } }
     return true
 }
@@ -8243,14 +8433,89 @@ fn buildRuntimeFilters(jr: &JRun, sc: &lexdb_plan.PScan, t: &lexdb_catalog.Table
                 let pc0 = jl.kCol0 - sc.first
                 if pc0 >= 0 && pc0 < len(bp.kinds) && bp.kinds[pc0] == BK_INT && pc0 < len(t.cols) &&
                    lexdb_rows.isIntKind(lexdb_rows.placeKind(&t.cols[pc0])) {
-                    addIntRangeRt(mut &rt, placeOfCol(t, pc0), jl.nLive > 0 && jl.hasRange0, jl.minK0, jl.maxK0, addSkip, addKern)
+                    let pl0 = placeOfCol(t, pc0)
+                    addIntRangeRt(mut &rt, pl0, jl.nLive > 0 && jl.hasRange0, jl.minK0, jl.maxK0, addSkip, addKern)
+                    // Build an L1-hot IntBloom on key 0 when distinct k0 keys are sparse (e.g. TPC-H q9 part ⋈ partsupp: 10.6k / 200k!)
+                    if jl.mode == JK_INT2 && jl.nLive > 0 && jl.nLive <= 65536 && jl.hasRange0 && jl.maxK0 - jl.minK0 >= 1024 {
+                        var d0 = lexdb_ht.newFastIntCount()
+                        if jl.countOnly {
+                            var si = 0
+                            let sn = len(jl.fastCnt.slots)
+                            while si < sn {
+                                if jl.fastCnt.slots[si + 1] > 0 { let _ = d0.inc(jl.fastCnt.slots[si] >> 32) }
+                                si += 2
+                            }
+                        } else {
+                            var si = 0
+                            let sn = len(jl.ints.slots)
+                            while si < sn {
+                                let v = jl.ints.slots[si + 1]
+                                if v != 0 && jl.head[v - 1] >= 0 { let _ = d0.inc(jl.ints.slots[si] >> 32) }
+                                si += 2
+                            }
+                        }
+                        let nd0 = d0.size()
+                        if nd0 > 0 && nd0 <= 32768 && isSparse(nd0, jl.minK0, jl.maxK0) {
+                            var bf = lexdb_skip.newIntBloom(nd0, jl.minK0, jl.maxK0)
+                            var si = 0
+                            let sn = len(d0.slots)
+                            while si < sn {
+                                if d0.slots[si + 1] != 0 { bf.add(d0.slots[si]) }
+                                si += 2
+                            }
+                            rtBloomsBuilt += 1
+                            if hasMetas {
+                                append(mut &rt.rtBloomPl, pl0)
+                                append(mut &rt.rtBlooms, lexdb_skip.cloneIntBloom(&bf))
+                            }
+                            append(mut &rt.kern, lexdb_leafk.intBloom(pl0, lexdb_rows.PK_INT, bf))
+                            rt.active = true
+                        }
+                    }
                 }
             }
             if jl.kCol1 >= 0 && jr.owner[jl.kCol1] == 0 {
                 let pc1 = jl.kCol1 - sc.first
                 if pc1 >= 0 && pc1 < len(bp.kinds) && bp.kinds[pc1] == BK_INT && pc1 < len(t.cols) &&
                    lexdb_rows.isIntKind(lexdb_rows.placeKind(&t.cols[pc1])) {
-                    addIntRangeRt(mut &rt, placeOfCol(t, pc1), jl.nLive > 0 && jl.hasRange1, jl.minK1, jl.maxK1, addSkip, addKern)
+                    let pl1 = placeOfCol(t, pc1)
+                    addIntRangeRt(mut &rt, pl1, jl.nLive > 0 && jl.hasRange1, jl.minK1, jl.maxK1, addSkip, addKern)
+                    if jl.mode == JK_INT2 && jl.nLive > 0 && jl.nLive <= 65536 && jl.hasRange1 && jl.maxK1 - jl.minK1 >= 1024 {
+                        var d1 = lexdb_ht.newFastIntCount()
+                        if jl.countOnly {
+                            var si = 0
+                            let sn = len(jl.fastCnt.slots)
+                            while si < sn {
+                                if jl.fastCnt.slots[si + 1] > 0 { let _ = d1.inc((jl.fastCnt.slots[si] << 32) >> 32) }
+                                si += 2
+                            }
+                        } else {
+                            var si = 0
+                            let sn = len(jl.ints.slots)
+                            while si < sn {
+                                let v = jl.ints.slots[si + 1]
+                                if v != 0 && jl.head[v - 1] >= 0 { let _ = d1.inc((jl.ints.slots[si] << 32) >> 32) }
+                                si += 2
+                            }
+                        }
+                        let nd1 = d1.size()
+                        if nd1 > 0 && nd1 <= 32768 && isSparse(nd1, jl.minK1, jl.maxK1) {
+                            var bf = lexdb_skip.newIntBloom(nd1, jl.minK1, jl.maxK1)
+                            var si = 0
+                            let sn = len(d1.slots)
+                            while si < sn {
+                                if d1.slots[si + 1] != 0 { bf.add(d1.slots[si]) }
+                                si += 2
+                            }
+                            rtBloomsBuilt += 1
+                            if hasMetas {
+                                append(mut &rt.rtBloomPl, pl1)
+                                append(mut &rt.rtBlooms, lexdb_skip.cloneIntBloom(&bf))
+                            }
+                            append(mut &rt.kern, lexdb_leafk.intBloom(pl1, lexdb_rows.PK_INT, bf))
+                            rt.active = true
+                        }
+                    }
                 }
             }
         } else if jl.mode == JK_TEXT {
@@ -9838,6 +10103,10 @@ fn (bd: mut &Builder) addCount(b: &Batch, idx: &[]int, hc: &[]int, mode: int, us
 fn (bd: mut &Builder) add(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, mode: int, raw: bool, keepAll: bool, resCol: int,
                           room: int, maxHeld: int, colls: &[]int): Result[Unit, DbErr] {
     let ncol = len(bp.kinds)
+    var rowMem = 32
+    for ci in 0..ncol {
+        if bp.needCol[ci] { rowMem += if bp.kinds[ci] == BK_VAL { 32 } else { 12 } }
+    }
     var kb = ""
     var has0 = bd.hasRange
     var min0 = bd.minK
@@ -9958,8 +10227,10 @@ fn (bd: mut &Builder) add(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, mode: 
         if bk == len(bd.head) {
             append(mut &bd.head, -1)
             append(mut &bd.tail, -1)
-            append(mut &bd.mixed, false)
-            append(mut &bd.single, Val.Null)
+            if resCol >= 0 {
+                append(mut &bd.mixed, false)
+                append(mut &bd.single, Val.Null)
+            }
         }
         bd.kept += 1
         if resCol >= 0 {
@@ -10021,7 +10292,7 @@ fn (bd: mut &Builder) add(b: &Batch, idx: &[]int, bp: &BPlan, hc: &[]int, mode: 
                 }
             }
         }
-        bd.held += 32 + 24 * ncol
+        bd.held += rowMem
         if room >= 0 && bd.held > room { return Err(memErr(maxHeld)) }
         bd.rows.n += 1
         append(mut &bd.next, -1)
@@ -11668,21 +11939,23 @@ fn runAggAnyTop(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, co
                 src: &Src, tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
                 top: &TopAgg, give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr],
                 ask: &fn(mut &lexdb_store.Txn, &[]Val, mut &[][]Val): Result[bool, DbErr]): Result[int, DbErr] {
-    if pg.joins { return runAggJ(st, txn, pg, cols, tabs, srcs, vrows, cx, room, bud, cnt, give, ask) }
+    if pg.joins { return runAggJTop(st, txn, pg, cols, tabs, srcs, vrows, cx, room, bud, cnt, top, give, ask) }
     let none: [][]Val = []
     return runAggTop(st, txn, pg, cols, t, src, if len(vrows) > 0 { &vrows[0] } else { &none }, cx, room, bud, cnt, top, give)
 }
 
-// Runs an aggregate over joins (pg.groups, pg.joins: Agg (joins) under
-// the caller's views), as runAgg: its tables tabs and where each is read
-// srcs, by level; cnt per level, then the groups. Over the joined chunks
-// with numerics as units, then as values, then each joined row grouped by
-// the scalar evaluator; each from the start (the groups are given at the
-// end). A value a batch cannot hold: batErr (nothing given).
 pub fn runAggJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, tabs: &[]&lexdb_catalog.Table,
                srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
                give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr],
                ask: &fn(mut &lexdb_store.Txn, &[]Val, mut &[][]Val): Result[bool, DbErr]): Result[int, DbErr] {
+    let noTop = noTopAgg()
+    return runAggJTop(st, txn, pg, cols, tabs, srcs, vrows, cx, room, bud, cnt, &noTop, give, ask)
+}
+
+fn runAggJTop(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, cols: &[]lexdb_sql.ColDef, tabs: &[]&lexdb_catalog.Table,
+              srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts, top: &TopAgg,
+              give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr],
+              ask: &fn(mut &lexdb_store.Txn, &[]Val, mut &[][]Val): Result[bool, DbErr]): Result[int, DbErr] {
     runs += 1
     joinRuns += 1
     batchRuns += 1
@@ -11690,7 +11963,7 @@ pub fn runAggJ(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, col
     match aggUnder(&pg.plan) {
         lexdb_plan.PPlan.Agg(i, _, pa) {
             match pa {
-                Some(a) { return aggJoin(st, txn, &i, &a, cols, tabs, srcs, vrows, cx, room, bud, cnt, give, ask) }
+                Some(a) { return aggJoin(st, txn, &i, &a, cols, tabs, srcs, vrows, cx, room, bud, cnt, top, give, ask) }
                 None {}
             }
         }
@@ -12900,7 +13173,7 @@ fn joinRowsCount(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_
 
 fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top0: &lexdb_plan.PPlan, a: &lexdb_plan.PAgg, cols: &[]lexdb_sql.ColDef,
            tabs: &[]&lexdb_catalog.Table, srcs: &[]Src, vrows: &[][][]Val, cx: &Ctx, room: int, bud: mut &Budget, cnt: mut &[]Counts,
-           give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr],
+           topAgg: &TopAgg, give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr],
            ask: &fn(mut &lexdb_store.Txn, &[]Val, mut &[][]Val): Result[bool, DbErr]): Result[int, DbErr] {
     let nq = len(cols)
     // (an Apply over the joins: Q8 R6)
@@ -13036,7 +13309,7 @@ fn aggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top0: &lexdb_plan.
                 return Ok(totalAdded)
             }
             cnt[last].joined += ag.ngroups()
-            try ag.finish(nq, give)
+            try ag.finishTop(nq, topAgg, give)
             return Ok(ag.added())
         }
         for k in 0..len(c0) { cnt[k] = c0[k] }
@@ -15336,7 +15609,8 @@ fn topAggOf(pg: &Prog, specs: &[]lexdb_agg.AggSpec, hs: &[]BX, canTop: bool): To
             if sc0 >= 0 && sc0 < len(xs) {
                 match &xs[sc0] {
                     lexdb_bind.BX.Agg(ai) {
-                        if ai >= 0 && ai < len(specs) && !specs[ai].distinct && (specs[ai].star || specs[ai].op == lexdb_agg.OP_COUNT) {
+                        if ai >= 0 && ai < len(specs) && !specs[ai].distinct &&
+                           (specs[ai].star || specs[ai].op == lexdb_agg.OP_COUNT || specs[ai].op == lexdb_agg.OP_SUM) {
                             return TopAgg{on: true, aggIdx: ai, desc: srt.desc[0], oneOrd: len(srt.desc) == 1, topN: topN, groupCap: -1,
                                           havOn: false, havAgg: -1, havOp: 0, havIsNum: false, havInt: 0, havNum: 0m, canStream: false}
                         }
@@ -15701,7 +15975,13 @@ fn groupOut(txn: mut &lexdb_store.Txn, ev: &fn(mut &lexdb_store.Txn, int, int, i
     var out: []Val = withCapacity(nOut)
     for o in 0..nOut {
         let x = &xs[b + o]
-        append(mut &out, if lexdb_bind.isEvalMark(x) { try ev(txn, GV_OUT, si, o, first, aggs, &noVals) } else { try bxEval(x, row, aggs, cx) })
+        match x {
+            BX.Col(ci) { append(mut &out, row[ci].clone()) }
+            BX.Agg(ai) { append(mut &out, aggs[ai].clone()) }
+            else {
+                append(mut &out, if lexdb_bind.isEvalMark(x) { try ev(txn, GV_OUT, si, o, first, aggs, &noVals) } else { try bxEval(x, row, aggs, cx) })
+            }
+        }
     }
     if dist {
         var kb = ""
@@ -16259,6 +16539,7 @@ fn canParBNode(n: &BNode): bool {
         BNode.CondText(cond, _, _) { return canParBNode(&cond) }
         BNode.StrLen(_) { return true }
         BNode.CaseNum(cond, th, _, el, _) { return canParBNode(&cond) && canParBNode(&th) && canParBNode(&el) }
+        BNode.BpCmp(_, _, _, _, _, _) { return true }
         else { return false }
     }
 }
@@ -16279,15 +16560,15 @@ fn isFastUrlAgg(ag: &AggSt): bool {
 fn parAggWorthIt(t: &lexdb_catalog.Table, lz: &Lazy, bconds: &[]BNode, ag: &AggSt): bool {
     // Dense tables (e.g. TPC-H lineitem/orders) have >30 rows/leaf and low collect overhead -> always parallelize.
     if len(t.cols) < 32 { return true }
-    // Wide low-density tables (e.g. ClickBench 105-col hits at ~8.5 rows/leaf): avoid copying huge
-    // text slabs for raw LIKE filters or trivial low-compute scans where in-place serial wins.
+    // Wide low-density tables (e.g. ClickBench 105-col hits at ~8.5 rows/leaf):
+    // Raw LIKE filters with narrow column projections (q20/q21/q22: 1-4 columns) parallelize cleanly!
     if len(lz.raw) > 0 { return false }
     if len(ag.keys) >= 2 || ag.textCol >= 0 || isFastUrlAgg(ag) { return true }
     var hasStrLen = false
     var hasMinMax = false
     var hasCntD = false
     for sp in ag.specs {
-        if sp.kind == BA_CNTD { hasCntD = true }
+        if sp.kind == BA_CNTD || sp.kind == BA_CNTD_TEXT { hasCntD = true }
         if sp.kind == BA_MIN || sp.kind == BA_MAX { hasMinMax = true }
         match &sp.arg {
             Some(ax) { match ax { BNode.StrLen(_) { hasStrLen = true } else {} } }
@@ -16418,6 +16699,27 @@ fn bEvalPure(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
                     Some(z) { z }
                     None { if left { try lexdb_ops.comparePure(&k, &b.vals[c][r]) } else { try lexdb_ops.comparePure(&b.vals[c][r], &k) } }
                 }
+                let t = if op == 0 { x == 0 } else if op == 1 { x != 0 } else if op == 2 { x < 0 } else if op == 3 { x <= 0 }
+                        else if op == 4 { x > 0 } else { x >= 0 }
+                out.v[j] = if t { 1 } else { 0 }
+            }
+            return Ok(out)
+        }
+        BNode.BpCmp(op, c, lit, litNull, left, txt) {
+            var out = lexdb_rows.bvec(m)
+            for j in 0..m {
+                let r = idx[j]
+                if litNull || b.cols[c].nul[r] { out.nul[j] = true; continue }
+                var y = 0
+                if txt {
+                    y = cmpTrimmedStr(lexdb_rows.textAt(b, c, r), &lit)
+                } else {
+                    match &b.vals[c][r] {
+                        Val.Text(s) { y = cmpTrimmedStr(s, &lit) }
+                        else { return Err(batErrPure()) }
+                    }
+                }
+                let x = if left { -y } else { y }
                 let t = if op == 0 { x == 0 } else if op == 1 { x != 0 } else if op == 2 { x < 0 } else if op == 3 { x <= 0 }
                         else if op == 4 { x > 0 } else { x >= 0 }
                 out.v[j] = if t { 1 } else { 0 }
@@ -16905,6 +17207,13 @@ fn parReadWorker(slab: &str, leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int, 
     var b = lexdb_rows.newBatch(bp, lexdb_rows.BROWS)
     var dst = lexdb_rows.noRows()
     var hasDst = false
+    var pushPl = -1
+    if pushCol >= 0 && !hasCut && len(ph.dense) > 0 && len(lz.kern) > 0 && len(lz.raw) == 0 {
+        for p in 0..len(bp.placeCol) {
+            if bp.placeCol[p] == pushCol { pushPl = p; break }
+        }
+    }
+    var pushScratch: []int = if pushPl >= 0 { array(lexdb_rows.BROWS, 0) } else { [] }
     for li in lo..hi {
         let pl = &leaves[li]
         let s = &slab[pl.off..pl.off + pl.slen]
@@ -17046,7 +17355,40 @@ fn parReadWorker(slab: &str, leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int, 
             b.n = take
             let r0 = 0
             var rs: []int = withCapacity(take)
-            for q in 0..take { append(mut &rs, q) }
+            var didDensePush = false
+            // Pre-filter selective dense pushCol (e.g. TPC-H q21 l_suppkey 411/10000!) BEFORE heavy multi-col leaf kernels!
+            if pushPl >= 0 && !hasCut && pushPl < np && lexdb_rows.isIntKind(lexdb_rows.colKindOf(s, pushPl)) {
+                didDensePush = true
+                lexdb_rows.colIntsInto(s, &dir, pushPl, k, take, mut &pushScratch, 0)
+                let pNulls = lexdb_rows.colHasNulls(&dir, pushPl)
+                let dMin = ph.denseMin
+                let dLen = len(ph.dense)
+                if ph.countOnly {
+                    for q in 0..take {
+                        if pNulls && lexdb_rows.colIsNull(s, &dir, pushPl, k + q) { continue }
+                        let d = pushScratch[q] - dMin
+                        if d >= 0 && d < dLen && ph.dense[d] > 0 { append(mut &rs, q) }
+                    }
+                } else {
+                    for q in 0..take {
+                        if pNulls && lexdb_rows.colIsNull(s, &dir, pushPl, k + q) { continue }
+                        let d = pushScratch[q] - dMin
+                        if d >= 0 && d < dLen {
+                            let bk = ph.dense[d]
+                            if bk >= 0 && ph.head[bk] >= 0 { append(mut &rs, q) }
+                        }
+                    }
+                }
+                let pDrop = take - len(rs)
+                out.pushed += pDrop
+                if len(rs) == 0 {
+                    out.read += take
+                    k += take
+                    continue
+                }
+            } else {
+                for q in 0..take { append(mut &rs, q) }
+            }
             // 1. Leaf kernels
             var kerned = false
             if len(lz.kern) == 1 {
@@ -17122,7 +17464,7 @@ fn parReadWorker(slab: &str, leaves: &[]lexdb_access.ParLeaf, lo: int, hi: int, 
             }
             out.kept += len(ch)
             // 6. PushH hash-join pre-filter
-            if pushCol >= 0 && len(ch) > 0 {
+            if pushCol >= 0 && !didDensePush && len(ch) > 0 {
                 var fin: []int = withCapacity(len(ch))
                 let kc = &b.cols[pushCol]
                 let dLen = len(ph.dense)
@@ -17242,7 +17584,7 @@ fn parReadTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_a
                 sc: &lexdb_access.Scan, cur: mut &lexdb_access.Cursor, bp: &BPlan, lz: &Lazy,
                 conds: &[]BNode, pushCol: int, ph: &PushH, hasCut: bool, rawOnErr: bool, rc: mut &RC,
                 each: &fn(mut &lexdb_store.Txn, mut &Batch, []int, bool): Result[bool, DbErr]): Result[bool, DbErr] {
-    if len(conds) == 0 && pushCol < 0 { return Ok(false) }
+    if len(conds) == 0 && pushCol < 0 && len(lz.rtKern) == 0 { return Ok(false) }
     var needPl: []bool = []
     var maxPl = -1
     buildNeedPlaces(bp, lz, mut &needPl, mut &maxPl)
@@ -17329,6 +17671,7 @@ type ParAggMeta = value record {
     havOn: bool
     havAgg: int
     havOp: int
+    padMask: int
 }
 
 type ParJoinCounts = value record {
@@ -17349,7 +17692,8 @@ type ParAggState = record {
     adec: [][]i128
     afs: [][]float
     afq: [][]float
-    asets: [][]Map[int, int]
+    asets: [][]lexdb_ht.IntSet
+    atsets: [][]lexdb_ht.TwoLevelArena
     intHt: lexdb_ht.TwoLevelInt
     twoHt: lexdb_ht.TwoLevelTwoInt
     textHt: lexdb_ht.TwoLevelArena
@@ -17375,7 +17719,7 @@ type ParAggState = record {
 
 fn newParAggState(ns: int): ParAggState {
     var st = ParAggState{
-        ngroups: 0, fv: [], an: [], asum: [], amm: [], aval: [], adec: [], afs: [], afq: [], asets: [],
+        ngroups: 0, fv: [], an: [], asum: [], amm: [], aval: [], adec: [], afs: [], afq: [], asets: [], atsets: [],
         intHt: lexdb_ht.newTwoLevelInt(true),
         twoHt: lexdb_ht.newTwoLevelTwoInt(),
         textHt: lexdb_ht.newTwoLevelArena(true),
@@ -17392,6 +17736,7 @@ fn newParAggState(ns: int): ParAggState {
         append(mut &st.afs, [])
         append(mut &st.afq, [])
         append(mut &st.asets, [])
+        append(mut &st.atsets, [])
     }
     return st
 }
@@ -17400,7 +17745,11 @@ fn parNewGroup(st: mut &ParAggState, specs: &[]BSpec) {
     for i in 0..len(specs) {
         let kd = specs[i].kind
         if kd == BA_CNTD {
-            append(mut &st.asets[i], newMap())
+            append(mut &st.asets[i], lexdb_ht.newIntSet())
+            continue
+        }
+        if kd == BA_CNTD_TEXT {
+            append(mut &st.atsets[i], lexdb_ht.newTwoLevelArena(false))
             continue
         }
         append(mut &st.an[i], 0)
@@ -17423,7 +17772,11 @@ fn parResetGroup(st: mut &ParAggState, g: int, specs: &[]BSpec) {
     for i in 0..len(specs) {
         let kd = specs[i].kind
         if kd == BA_CNTD {
-            st.asets[i][g] = newMap()
+            st.asets[i][g] = lexdb_ht.newIntSet()
+            continue
+        }
+        if kd == BA_CNTD_TEXT {
+            st.atsets[i][g] = lexdb_ht.newTwoLevelArena(false)
             continue
         }
         st.an[i][g] = 0
@@ -17463,13 +17816,28 @@ fn parHavPass(st: &ParAggState, g: int, shareOf: &[]int, meta: &ParAggMeta, hb: 
     return v >= hb.bound
 }
 
-fn bKeyEncPure(kb: mut &str, c: &BComp, kv: &BVec, j: int, b: &Batch, r: int, txt: bool) {
+fn bKeyEncPure(kb: mut &str, c: &BComp, kv: &BVec, j: int, b: &Batch, r: int, txt: bool, pad: bool) {
     match &c.n {
         BNode.CondText(_, tc, elseLit) {
             if kv.v[j] == 1 && !kv.nul[j] {
                 if b.cols[tc].nul[r] { kb.addByte(0) }
-                else if lexdb_rows.isTextCol(b, tc) { addHashText(kb, lexdb_rows.textAt(b, tc, r)) }
-                else { encHashVal(kb, &b.vals[tc][r]) }
+                else if lexdb_rows.isTextCol(b, tc) {
+                    let s = lexdb_rows.textAt(b, tc, r)
+                    if pad {
+                        var e = len(s)
+                        while e > 0 && s[e - 1] == ' ' { e -= 1 }
+                        addHashText(kb, &s[0..e])
+                    } else {
+                        addHashText(kb, s)
+                    }
+                } else {
+                    if pad {
+                        let pv = lexdb_sort.collVal(lexdb_sql.COLL_PAD, &b.vals[tc][r])
+                        encHashVal(kb, &pv)
+                    } else {
+                        encHashVal(kb, &b.vals[tc][r])
+                    }
+                }
             } else {
                 addHashText(kb, elseLit)
             }
@@ -17506,8 +17874,23 @@ fn bKeyEncPure(kb: mut &str, c: &BComp, kv: &BVec, j: int, b: &Batch, r: int, tx
     match &c.n {
         BNode.Col(ci) {
             if b.cols[ci].nul[r] { kb.addByte(0); return }
-            if txt { addHashText(kb, lexdb_rows.textAt(b, ci, r)); return }
-            encHashVal(kb, &b.vals[ci][r])
+            if txt {
+                let s = lexdb_rows.textAt(b, ci, r)
+                if pad {
+                    var e = len(s)
+                    while e > 0 && s[e - 1] == ' ' { e -= 1 }
+                    addHashText(kb, &s[0..e])
+                } else {
+                    addHashText(kb, s)
+                }
+                return
+            }
+            if pad {
+                let pv = lexdb_sort.collVal(lexdb_sql.COLL_PAD, &b.vals[ci][r])
+                encHashVal(kb, &pv)
+            } else {
+                encHashVal(kb, &b.vals[ci][r])
+            }
         }
         else { kb.addByte(0) }
     }
@@ -17605,22 +17988,52 @@ fn bAccumPure(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, cn: 
     return Ok(Unit{})
 }
 
-fn bAccDistPure(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, sets: mut &[]Map[int, int]): Result[Unit, DbErr] {
+fn bAccDistPure(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, sets: mut &[]lexdb_ht.IntSet): Result[Unit, DbErr] {
     let a = match &sp.arg {
         Some(x) { try bEvalPure(x, b, rows) }
         None { lexdb_rows.bvec(0) }
     }
     let k = len(rows)
     if one {
-        for j in 0..k { if !a.nul[j] { sets[0].put(a.v[j], 1) } }
+        for j in 0..k { if !a.nul[j] { sets[0].add(a.v[j]) } }
     } else {
-        for j in 0..k { if !a.nul[j] { sets[gids[j]].put(a.v[j], 1) } }
+        for j in 0..k { if !a.nul[j] { sets[gids[j]].add(a.v[j]) } }
+    }
+    return Ok(Unit{})
+}
+
+fn bAccDistTextPure(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, sets: mut &[]lexdb_ht.TwoLevelArena): Result[Unit, DbErr] {
+    let col = sp.vcol
+    let k = len(rows)
+    let isTxt = lexdb_rows.isTextCol(b, col)
+    if isTxt {
+        if one {
+            for j in 0..k {
+                let r = rows[j]
+                if !b.cols[col].nul[r] { sets[0].addDistinct(lexdb_rows.textAt(b, col, r)) }
+            }
+        } else {
+            for j in 0..k {
+                let r = rows[j]
+                if !b.cols[col].nul[r] { sets[gids[j]].addDistinct(lexdb_rows.textAt(b, col, r)) }
+            }
+        }
+        return Ok(Unit{})
+    }
+    for j in 0..k {
+        let r = rows[j]
+        if b.cols[col].nul[r] { continue }
+        match &b.vals[col][r] {
+            Val.Text(s) { sets[if one { 0 } else { gids[j] }].addDistinct(s) }
+            else { return Err(batErrPure()) }
+        }
     }
     return Ok(Unit{})
 }
 
 fn parAggAccCall(st: mut &ParAggState, si: int, sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool): Result[Unit, DbErr] {
     if sp.kind == BA_CNTD { return bAccDistPure(sp, b, rows, gids, one, mut &st.asets[si]) }
+    if sp.kind == BA_CNTD_TEXT { return bAccDistTextPure(sp, b, rows, gids, one, mut &st.atsets[si]) }
     if sp.kind == BA_VAR { return bAccVarPure(sp, b, rows, gids, one, mut &st.an[si], mut &st.afs[si], mut &st.afq[si]) }
     if sp.vcol >= 0 { return bAccValPure(sp, b, rows, gids, mut &st.an[si], mut &st.aval[si]) }
     if sp.kind == BA_SUM || sp.kind == BA_AVG { return bAccDecPure(sp, b, rows, gids, one, mut &st.an[si], mut &st.adec[si]) }
@@ -17811,7 +18224,8 @@ fn parPruneSorted(st: mut &ParAggState, specs: &[]BSpec, shareOf: &[]int, fcols:
             for fi in 0..nf { st.fv[w * nf + fi] = replace(mut &st.fv[g * nf + fi], Val.Null) }
             for si in 0..ns {
                 let kd = specs[si].kind
-                if kd == BA_CNTD { st.asets[si][w] = replace(mut &st.asets[si][g], newMap()); continue }
+                if kd == BA_CNTD { st.asets[si][w] = replace(mut &st.asets[si][g], lexdb_ht.newIntSet()); continue }
+                if kd == BA_CNTD_TEXT { st.atsets[si][w] = replace(mut &st.atsets[si][g], lexdb_ht.newTwoLevelArena(false)); continue }
                 st.an[si][w] = st.an[si][g]
                 if kd == BA_VAR { st.afs[si][w] = st.afs[si][g]; st.afq[si][w] = st.afq[si][g] }
                 else if kd == BA_AND || kd == BA_OR { st.amm[si][w] = st.amm[si][g] }
@@ -17827,7 +18241,8 @@ fn parPruneSorted(st: mut &ParAggState, specs: &[]BSpec, shareOf: &[]int, fcols:
         for fi in 0..nf { st.fv[w * nf + fi] = replace(mut &st.fv[last * nf + fi], Val.Null) }
         for si in 0..ns {
             let kd = specs[si].kind
-            if kd == BA_CNTD { st.asets[si][w] = replace(mut &st.asets[si][last], newMap()); continue }
+            if kd == BA_CNTD { st.asets[si][w] = replace(mut &st.asets[si][last], lexdb_ht.newIntSet()); continue }
+            if kd == BA_CNTD_TEXT { st.atsets[si][w] = replace(mut &st.atsets[si][last], lexdb_ht.newTwoLevelArena(false)); continue }
             st.an[si][w] = st.an[si][last]
             if kd == BA_VAR { st.afs[si][w] = st.afs[si][last]; st.afq[si][w] = st.afq[si][last] }
             else if kd == BA_AND || kd == BA_OR { st.amm[si][w] = st.amm[si][last] }
@@ -17842,6 +18257,7 @@ fn parPruneSorted(st: mut &ParAggState, specs: &[]BSpec, shareOf: &[]int, fcols:
     for si in 0..ns {
         let kd = specs[si].kind
         if kd == BA_CNTD { while len(st.asets[si]) > keep { let d = pop(mut &st.asets[si]) }; continue }
+        if kd == BA_CNTD_TEXT { while len(st.atsets[si]) > keep { let d = pop(mut &st.atsets[si]) }; continue }
         while len(st.an[si]) > keep { let d = pop(mut &st.an[si]) }
         if kd == BA_VAR {
             while len(st.afs[si]) > keep { let d = pop(mut &st.afs[si]) }
@@ -18137,7 +18553,7 @@ fn parAggEat(st: mut &ParAggState, meta: &ParAggMeta, keys: &[]BComp, specs: &[]
         for j in 0..nc {
             let st0 = len(kbuf)
             koff[j] = st0
-            for ki in 0..len(keys) { bKeyEncPure(mut &kbuf, &keys[ki], &kvs[ki], j, b, idx[j], ktxt[ki]) }
+            for ki in 0..len(keys) { bKeyEncPure(mut &kbuf, &keys[ki], &kvs[ki], j, b, idx[j], ktxt[ki], (meta.padMask & (1 << ki)) != 0) }
             klenA[j] = len(kbuf) - st0
         }
         var khs: []u64 = array(nc, u64(0))
@@ -18391,7 +18807,11 @@ fn mergeGroupAccs(dst: mut &AggSt, dg: int, src: mut &ParAggState, sg: int): Res
         let sp = &dst.specs[si]
         let kd = sp.kind
         if kd == BA_CNTD {
-            for k in src.asets[si][sg].keys() { dst.asets[si][dg].put(k, 1) }
+            dst.asets[si][dg].mergeFrom(&src.asets[si][sg])
+            continue
+        }
+        if kd == BA_CNTD_TEXT {
+            dst.atsets[si][dg].mergeDistinctFrom(&src.atsets[si][sg])
             continue
         }
         let sn = src.an[si][sg]
@@ -18470,6 +18890,7 @@ fn mergeParAgg(dst: mut &AggSt, src: mut &ParAggState, top: &TopAgg, streamOn: b
         dst.afs = replace(mut &src.afs, [])
         dst.afq = replace(mut &src.afq, [])
         dst.asets = replace(mut &src.asets, [])
+        dst.atsets = replace(mut &src.atsets, [])
         dst.intHt = replace(mut &src.intHt, lexdb_ht.newTwoLevelInt(false))
         dst.twoHt = replace(mut &src.twoHt, lexdb_ht.newTwoLevelTwoInt())
         dst.textHt = replace(mut &src.textHt, lexdb_ht.newTwoLevelArena(false))
@@ -18657,7 +19078,11 @@ fn parMergeGroupAccsPure(dst: mut &ParAggState, dg: int, src: &ParAggState, sg: 
         let sp = &specs[si]
         let kd = sp.kind
         if kd == BA_CNTD {
-            for k in src.asets[si][sg].keys() { dst.asets[si][dg].put(k, 1) }
+            dst.asets[si][dg].mergeFrom(&src.asets[si][sg])
+            continue
+        }
+        if kd == BA_CNTD_TEXT {
+            dst.atsets[si][dg].mergeDistinctFrom(&src.atsets[si][sg])
             continue
         }
         let sn = src.an[si][sg]
@@ -18732,7 +19157,7 @@ fn parMergePart(results: &[]ParAggState, partIdx: int, nParts: int, meta: &ParAg
     if estPerPart > 1024 {
         for si in 0..ns {
             let kd = specs[si].kind
-            if kd != BA_CNTD {
+            if kd != BA_CNTD && kd != BA_CNTD_TEXT {
                 out.an[si] = withCapacity(estPerPart)
                 if kd == BA_SUM || kd == BA_AVG { if specs[si].vcol < 0 { out.adec[si] = withCapacity(estPerPart) } }
                 else if kd == BA_MIN || kd == BA_MAX || kd == BA_AND || kd == BA_OR { if specs[si].vcol < 0 { out.amm[si] = withCapacity(estPerPart) } }
@@ -18958,7 +19383,13 @@ fn parMergePart(results: &[]ParAggState, partIdx: int, nParts: int, meta: &ParAg
         }
     }
     if topOn && out.ngroups > 2048 {
-        out.topKeep = lexdb_ht.selectTopIntGroups(&out.an[topAggIdx], out.ngroups, topN, topDesc, topOneOrd)
+        let tkd = specs[topAggIdx].kind
+        if tkd == BA_STAR || tkd == BA_COUNT {
+            out.topKeep = lexdb_ht.selectTopIntGroups(&out.an[topAggIdx], out.ngroups, topN, topDesc, topOneOrd)
+        } else if tkd == BA_SUM && specs[topAggIdx].vcol < 0 {
+            let sIdx = if shareOf[topAggIdx] >= 0 { shareOf[topAggIdx] } else { topAggIdx }
+            out.topKeep = lexdb_ht.selectTopDecGroups(&out.adec[sIdx], &out.an[sIdx], out.ngroups, topN, topDesc, topOneOrd)
+        }
     }
     return out
 }
@@ -18978,6 +19409,7 @@ fn emitParPartition(ag: mut &AggSt, part: mut &ParAggState, top: &TopAgg, hb: &H
     ag.afs = replace(mut &part.afs, [])
     ag.afq = replace(mut &part.afq, [])
     ag.asets = replace(mut &part.asets, [])
+    ag.atsets = replace(mut &part.atsets, [])
     ag.intHt = replace(mut &part.intHt, lexdb_ht.newTwoLevelInt(false))
     ag.twoHt = replace(mut &part.twoHt, lexdb_ht.newTwoLevelTwoInt())
     ag.textHt = replace(mut &part.textHt, lexdb_ht.newTwoLevelArena(false))
@@ -19015,17 +19447,25 @@ fn aggRowLenOf(ag: &AggSt): int {
     return rowLen
 }
 
-// Parallel disjoint merge + direct emission for ungrouped COUNT(DISTINCT) over large sets (ClickBench q4).
+// Parallel disjoint merge + direct emission for ungrouped COUNT(DISTINCT) over large sets (ClickBench q4/q5).
 fn parCountDistPart(results: &[]ParAggState, partIdx: int, nParts: int, si: int): int {
     let mask = u64(nParts - 1)
     var s: Map[int, int] = newMap()
     for ri in 0..len(results) {
         if results[ri].ngroups == 0 { continue }
-        for k in results[ri].asets[si][0].keys() {
-            if int(k.hash() & mask) == partIdx { s.put(k, 1) }
-        }
+        results[ri].asets[si][0].addPartKeys(partIdx, mask, mut &s)
     }
     return s.size()
+}
+
+fn parCountDistTextPart(results: &[]ParAggState, partIdx: int, nParts: int, si: int, estPerPart: int): int {
+    var dst = lexdb_ht.newTwoLevelArena(false)
+    if estPerPart >= lexdb_ht.TWO_LEVEL_THRESH { dst.prePromote(estPerPart) }
+    for ri in 0..len(results) {
+        if results[ri].ngroups == 0 { continue }
+        dst.mergeDistinctPart(&results[ri].atsets[si][0], partIdx, nParts)
+    }
+    return dst.size()
 }
 
 // Returns: 1 = completed in parallel (caller runs finishTop); 4 = completed & already emitted via give;
@@ -19049,11 +19489,11 @@ fn parAggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_
         key0Typ: if len(ag.keys) > 0 { ag.keys[0].typ } else { 0 },
         key1Typ: if len(ag.keys) > 1 { ag.keys[1].typ } else { 0 },
         room: ag.room, maxHeld: ag.maxHeld, streamOn: streamOn,
-        havOn: top.havOn, havAgg: top.havAgg, havOp: top.havOp
+        havOn: top.havOn, havAgg: top.havAgg, havOp: top.havOp, padMask: ag.padMask
     }
     let workers = max(1, par.threads())
     var hasCntD = false
-    for sp in ag.specs { if sp.kind == BA_CNTD { hasCntD = true; break } }
+    for sp in ag.specs { if sp.kind == BA_CNTD || sp.kind == BA_CNTD_TEXT { hasCntD = true; break } }
     // Ungrouped (without COUNT DISTINCT) and sorted streaming have O(1) merge cost -> fine chunks for load balancing.
     // Hash GROUP BY and COUNT(DISTINCT) merge hash tables -> use W chunks (only W partial tables!).
     let wantParts = if (meta.nkeys == 0 && !hasCntD) || meta.sorted { workers * 4 } else { workers }
@@ -19194,7 +19634,8 @@ fn parAggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_
             for p in 0..mp { append(mut &partIds, p) }
             let nf = len(ag.fcols)
             let topOn = !streamHb.ok && top.on && top.aggIdx >= 0 && top.aggIdx < len(ag.specs) &&
-                        (ag.specs[top.aggIdx].kind == BA_STAR || ag.specs[top.aggIdx].kind == BA_COUNT)
+                        (ag.specs[top.aggIdx].kind == BA_STAR || ag.specs[top.aggIdx].kind == BA_COUNT ||
+                         (ag.specs[top.aggIdx].kind == BA_SUM && ag.specs[top.aggIdx].vcol < 0))
             let topAggIdx = top.aggIdx
             let topN = top.topN
             let topDesc = top.desc
@@ -19222,13 +19663,20 @@ fn parAggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_
         // Fast path B: single-wave ungrouped COUNT(DISTINCT) -> parallel 4-way radix set count!
         if cur.done && !didPriorMerge && mp >= 2 && len(results) > 1 && meta.nkeys == 0 && hasCntD {
             var bigSet = false
+            var maxSetTot = 0
             for si in 0..len(ag.specs) {
                 if ag.specs[si].kind == BA_CNTD {
                     var totS = 0
                     for ri in 0..len(results) {
                         if results[ri].ngroups > 0 { totS += results[ri].asets[si][0].size() }
                     }
-                    if totS > 4096 { bigSet = true; break }
+                    if totS > 4096 { bigSet = true; if totS > maxSetTot { maxSetTot = totS } }
+                } else if ag.specs[si].kind == BA_CNTD_TEXT {
+                    var totS = 0
+                    for ri in 0..len(results) {
+                        if results[ri].ngroups > 0 { totS += results[ri].atsets[si][0].size() }
+                    }
+                    if totS > 4096 { bigSet = true; if totS > maxSetTot { maxSetTot = totS } }
                 }
             }
             if bigSet {
@@ -19244,12 +19692,20 @@ fn parAggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_
                 var partIds: []int = withCapacity(mp)
                 for p in 0..mp { append(mut &partIds, p) }
                 var distCounts: []int = array(len(ag.specs), 0)
+                let estTextPer = maxSetTot / mp
                 for si in 0..len(ag.specs) {
-                    if ag.specs[si].kind != BA_CNTD { continue }
+                    let kd = ag.specs[si].kind
+                    if kd != BA_CNTD && kd != BA_CNTD_TEXT { continue }
                     let sIdx = si
-                    let cs = par.map(&partIds, fn(pid: &int): int {
-                        return parCountDistPart(&results, pid, mp, sIdx)
-                    })
+                    let cs = if kd == BA_CNTD {
+                        par.map(&partIds, fn(pid: &int): int {
+                            return parCountDistPart(&results, pid, mp, sIdx)
+                        })
+                    } else {
+                        par.map(&partIds, fn(pid: &int): int {
+                            return parCountDistTextPart(&results, pid, mp, sIdx, estTextPer)
+                        })
+                    }
                     var tot = 0
                     for c in cs { tot += c }
                     distCounts[si] = tot
@@ -19269,7 +19725,7 @@ fn parAggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_
                         gotFirst = true
                     }
                     for si in 0..len(ag.specs) {
-                        if ag.specs[si].kind == BA_CNTD || ag.shareOf[si] >= 0 { continue }
+                        if ag.specs[si].kind == BA_CNTD || ag.specs[si].kind == BA_CNTD_TEXT || ag.shareOf[si] >= 0 { continue }
                         let sn = mutRes[ri].an[si][0]
                         if sn == 0 { continue }
                         let dn = ag.an[si][0]
@@ -19318,7 +19774,7 @@ fn parAggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_
                 for fi in 0..nf { append(mut &ag.fv, first[ag.fcols[fi]].clone()) }
                 try ag.groupAt(0, mut &first, mut &accs)
                 for si in 0..len(ag.specs) {
-                    if ag.specs[si].kind == BA_CNTD { accs[si].n = distCounts[si] }
+                    if ag.specs[si].kind == BA_CNTD || ag.specs[si].kind == BA_CNTD_TEXT { accs[si].n = distCounts[si] }
                 }
                 ag.ngroups = 0
                 try give(mut &first, -1, mut &accs)
@@ -20145,11 +20601,11 @@ fn parAggJoin(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rel: &lexdb_acc
         key0Typ: if len(ag.keys) > 0 { ag.keys[0].typ } else { 0 },
         key1Typ: if len(ag.keys) > 1 { ag.keys[1].typ } else { 0 },
         room: ag.room, maxHeld: ag.maxHeld, streamOn: false,
-        havOn: false, havAgg: -1, havOp: 0
+        havOn: false, havAgg: -1, havOp: 0, padMask: ag.padMask
     }
     let workers = max(1, par.threads())
     var hasCntD = false
-    for sp in ag.specs { if sp.kind == BA_CNTD { hasCntD = true; break } }
+    for sp in ag.specs { if sp.kind == BA_CNTD || sp.kind == BA_CNTD_TEXT { hasCntD = true; break } }
     let wantParts = if meta.nkeys == 0 && !hasCntD { workers * 4 } else { workers }
     let nParts = min(max(1, nl / 8), wantParts)
     let spans = makeParSpans(nl, nParts)

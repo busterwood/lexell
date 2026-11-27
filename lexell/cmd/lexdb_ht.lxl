@@ -2187,6 +2187,57 @@ pub fn (t: mut &TwoLevelArena) getOrPutHash(s: &str, h: u64, nextGid: int): int 
     return nextGid
 }
 
+pub fn (t: &TwoLevelArena) size(): int {
+    if !t.twoLevel { return len(t.l1.ents) }
+    var tot = 0
+    for b in t.bkts { tot += len(b.ents) }
+    return tot
+}
+
+pub fn (t: mut &TwoLevelArena) addDistinct(s: &str) {
+    let _ = t.getOrPutHash(s, hashStr(s), 0)
+}
+
+pub fn (dst: mut &TwoLevelArena) mergeDistinctFrom(src: &TwoLevelArena) {
+    if src.twoLevel {
+        for b in 0..NBUCKETS {
+            let bl = len(src.bkts[b].ents)
+            for i in 0..bl {
+                let ent = src.bkts[b].ents[i]
+                let _ = dst.getOrPutHash(&src.bkts[b].arena[ent.off..ent.off + ent.len], ent.hash, 0)
+            }
+        }
+    } else {
+        let n = len(src.l1.ents)
+        for i in 0..n {
+            let ent = src.l1.ents[i]
+            let _ = dst.getOrPutHash(&src.l1.arena[ent.off..ent.off + ent.len], ent.hash, 0)
+        }
+    }
+}
+
+pub fn (dst: mut &TwoLevelArena) mergeDistinctPart(src: &TwoLevelArena, partIdx: int, nParts: int) {
+    let pMask = u64(nParts - 1)
+    if src.twoLevel {
+        var b = partIdx
+        while b < NBUCKETS {
+            let bl = len(src.bkts[b].ents)
+            for i in 0..bl {
+                let ent = src.bkts[b].ents[i]
+                let _ = dst.getOrPutHash(&src.bkts[b].arena[ent.off..ent.off + ent.len], ent.hash, 0)
+            }
+            b += nParts
+        }
+    } else {
+        let n = len(src.l1.ents)
+        for i in 0..n {
+            let ent = src.l1.ents[i]
+            if int((ent.hash >> 56) & pMask) != partIdx { continue }
+            let _ = dst.getOrPutHash(&src.l1.arena[ent.off..ent.off + ent.len], ent.hash, 0)
+        }
+    }
+}
+
 // ============================================================================
 // 4. Direct Top-N Integer Group Selector (prunes 99.9%+ groups BEFORE Val/Acc alloc!)
 // ============================================================================
@@ -2261,6 +2312,130 @@ fn siftDown(h: mut &[]int, start: int, n: int, minHeap: bool) {
             i = best
         } else {
             break
+        }
+    }
+}
+
+pub fn selectTopDecGroups(vals: &[]i128, cnts: &[]int, n: int, topN: int, desc: bool, oneOrd: bool): []int {
+    if n <= topN || topN <= 0 {
+        var all: []int = withCapacity(n)
+        for g in 0..n { append(mut &all, g) }
+        return all
+    }
+    // Bail to all groups if any group has a NULL sum (cnt == 0) so NULL ordering stays exact.
+    for g in 0..n {
+        if cnts[g] == 0 {
+            var all: []int = withCapacity(n)
+            for k in 0..n { append(mut &all, k) }
+            return all
+        }
+    }
+    var heap: []i128 = withCapacity(topN)
+    for g in 0..topN { append(mut &heap, vals[g]) }
+    var i = topN / 2 - 1
+    while i >= 0 {
+        siftDownDec(mut &heap, i, topN, desc)
+        i -= 1
+    }
+    for g in topN..n {
+        let v = vals[g]
+        if (desc && v > heap[0]) || (!desc && v < heap[0]) {
+            heap[0] = v
+            siftDownDec(mut &heap, 0, topN, desc)
+        }
+    }
+    let bar = heap[0]
+    var out: []int = withCapacity(if oneOrd { topN } else { topN * 2 })
+    if oneOrd {
+        var ties: []int = []
+        for g in 0..n {
+            let v = vals[g]
+            if (desc && v > bar) || (!desc && v < bar) {
+                append(mut &out, g)
+            } else if v == bar && len(ties) < topN {
+                append(mut &ties, g)
+            }
+        }
+        var ti = 0
+        while len(out) < topN && ti < len(ties) {
+            append(mut &out, ties[ti])
+            ti += 1
+        }
+        return out
+    }
+    for g in 0..n {
+        let v = vals[g]
+        if (desc && v >= bar) || (!desc && v <= bar) { append(mut &out, g) }
+    }
+    return out
+}
+
+fn siftDownDec(h: mut &[]i128, start: int, n: int, minHeap: bool) {
+    var i = start
+    while true {
+        let l = i * 2 + 1
+        if l >= n { break }
+        let r = l + 1
+        var best = l
+        if r < n && ((minHeap && h[r] < h[l]) || (!minHeap && h[r] > h[l])) { best = r }
+        if (minHeap && h[best] < h[i]) || (!minHeap && h[best] > h[i]) {
+            let tmp = h[i]
+            h[i] = h[best]
+            h[best] = tmp
+            i = best
+        } else {
+            break
+        }
+    }
+}
+
+// Compact distinct-int set for BA_CNTD: avoids Map allocation for <= 16 distinct values per group (TPC-H q16!).
+pub type IntSet = record {
+    pub small: []int
+    pub useBig: bool
+    pub big: Map[int, int]
+}
+
+pub fn newIntSet(): IntSet {
+    return IntSet{small: [], useBig: false, big: newMap()}
+}
+
+pub fn (s: mut &IntSet) add(v: int) {
+    if s.useBig {
+        s.big.put(v, 1)
+        return
+    }
+    for x in s.small { if x == v { return } }
+    if len(s.small) < 16 {
+        append(mut &s.small, v)
+        return
+    }
+    for x in s.small { s.big.put(x, 1) }
+    s.big.put(v, 1)
+    s.small = []
+    s.useBig = true
+}
+
+pub fn (s: &IntSet) size(): int {
+    return if s.useBig { s.big.size() } else { len(s.small) }
+}
+
+pub fn (dst: mut &IntSet) mergeFrom(src: &IntSet) {
+    if src.useBig {
+        for k in src.big.keys() { dst.add(k) }
+    } else {
+        for x in src.small { dst.add(x) }
+    }
+}
+
+pub fn (src: &IntSet) addPartKeys(partIdx: int, mask: u64, dst: mut &Map[int, int]) {
+    if src.useBig {
+        for k in src.big.keys() {
+            if int(k.hash() & mask) == partIdx { dst.put(k, 1) }
+        }
+    } else {
+        for k in src.small {
+            if int(k.hash() & mask) == partIdx { dst.put(k, 1) }
         }
     }
 }

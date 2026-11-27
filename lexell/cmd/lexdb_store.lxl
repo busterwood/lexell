@@ -5064,6 +5064,128 @@ pub fn (st: &Store) scanRanges(t: mut &Txn, tree: int, los: &[]str, his: &[]str,
     return Ok(Unit{})
 }
 
+// Like scanRanges, but groups consecutive ranges that fall entirely inside the
+// same leaf into one callback fBatch(leaf, xs, is, js) so columnar range lookups
+// (TPC-H q3/q4/q5/q10/q16/q21) do one fingerTo, one leafView, and one colsPick per leaf!
+pub fn (st: &Store) scanRangesBatched(t: mut &Txn, tree: int, los: &[]str, his: &[]str,
+                                      fBatch: &fn(&lexdb_rows.LeafView, &[]int, &[]int, &[]int): int): Result[Unit, lexdb_base.DbErr] {
+    let nr = len(los)
+    let view = st.viewOf(t)
+    let each = view == View.Repl || t.noting()
+    let snap = view == View.Snap
+    var slow: []bool = array(nr, each)
+    if !each { for z in 0..nr { slow[z] = len(t.ownRange(tree, &los[z], &his[z])) > 0 || t.cutsMeet(tree, &los[z], &his[z]) } }
+    var starts: []&str = withCapacity(nr)
+    for z in 0..nr { append(mut &starts, &los[z]) }
+    let fOne = fn(rx: int, lv: &lexdb_rows.LeafView, i0: int, j0: int): int {
+        let xs: []int = [rx]
+        let is: []int = [i0]
+        let js: []int = [j0]
+        return fBatch(lv, &xs, &is, &js)
+    }
+    var x = 0
+    var stop = false
+    while x < nr && !stop {
+        if slow[x] {
+            try st.scanOne(t, tree, x, &los[x], &his[x], fOne, mut &stop)
+            x += 1
+            continue
+        }
+        var need = -1
+        var ahead: []int = []
+        var bad: []lexdb_base.DbErr = []
+        var empty = false
+        var cross = false
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 {
+                append(mut &bad, db.failed[0].clone())
+                return
+            }
+            if snap && db.snapGone(t.snap) {
+                append(mut &bad, snapCancelled())
+                return
+            }
+            let root = if snap { db.snapRoot(t, tree) } else { match db.trees.get(&tree) { Some(r) { r } None { -1 } } }
+            if root < 0 {
+                empty = true
+                return
+            }
+            let q = if snap { t.snapSeq } else { db.seq }
+            var fg = newFinger()
+            while x < nr {
+                if slow[x] { return }
+                let wl = lexdb_page.keyWord(&los[x])
+                let d = db.fingerTo(mut &fg, root, snap, q, &los[x], wl, mut &need)
+                if d == -1 {
+                    ahead = db.lookupAhead(root, snap, q, &starts, x, need)
+                    return
+                }
+                if d == -2 {
+                    append(mut &bad, lexdb_base.err(lexdb_base.S_INTERNAL, "snapshot: a node version is missing"))
+                    return
+                }
+                if fg.vers[d] == -1 { db.noteLeaf(tree, fg.slots[d]) }
+                let hasHi = fg.his[d].s >= 0
+                let wh = if len(his[x]) == 0 { u64(0) } else { lexdb_page.keyWord(&his[x]) }
+                if hasHi && (len(his[x]) == 0 || db.snapNode(fg.his[d].s, fg.his[d].v).keyLt(fg.his[d].i, &his[x], wh)) {
+                    cross = true
+                    return
+                }
+                let n = db.snapNode(fg.slots[d], fg.vers[d])
+                var bxs: []int = withCapacity(16)
+                var bis: []int = withCapacity(16)
+                var bjs: []int = withCapacity(16)
+                var curI = n.lowerW(&los[x], wl)
+                var curJ = if len(his[x]) == 0 { n.count() } else { n.lowerW(&his[x], wh) }
+                if curJ > curI {
+                    append(mut &bxs, x)
+                    append(mut &bis, curI)
+                    append(mut &bjs, curJ)
+                }
+                x += 1
+                // Absorb all subsequent sorted ranges that also lie completely within this same leaf!
+                while x < nr && !slow[x] {
+                    if los[x] < los[x - 1] { break }
+                    let wl2 = lexdb_page.keyWord(&los[x])
+                    let wh2 = if len(his[x]) == 0 { u64(0) } else { lexdb_page.keyWord(&his[x]) }
+                    if hasHi {
+                        let hn = db.snapNode(fg.his[d].s, fg.his[d].v)
+                        // Check los[x] < fence (i.e. !(fence <= los[x])) AND his[x] <= fence (i.e. !(fence < his[x]))
+                        if hn.keyLe(fg.his[d].i, &los[x], wl2) { break }
+                        if len(his[x]) == 0 || hn.keyLt(fg.his[d].i, &his[x], wh2) { break }
+                    }
+                    let i2 = n.lowerW(&los[x], wl2)
+                    let j2 = if len(his[x]) == 0 { n.count() } else { n.lowerW(&his[x], wh2) }
+                    if j2 > i2 {
+                        append(mut &bxs, x)
+                        append(mut &bis, i2)
+                        append(mut &bjs, j2)
+                    }
+                    x += 1
+                }
+                if len(bxs) > 0 {
+                    let lv = lexdb_page.leafView(&n)
+                    if fBatch(&lv, &bxs, &bis, &bjs) == 2 {
+                        stop = true
+                        return
+                    }
+                }
+            }
+        })
+        if len(bad) > 0 { return Err(bad[0].clone()) }
+        if need >= 0 {
+            if len(ahead) > 1 { try st.loadMany(&ahead) } else { try st.load(need) }
+            continue
+        }
+        if empty { return Ok(Unit{}) }
+        if cross {
+            try st.scanOne(t, tree, x, &los[x], &his[x], fOne, mut &stop)
+            x += 1
+        }
+    }
+    return Ok(Unit{})
+}
+
 // scanRanges' range x by scanLeaves; stop set when f says 2.
 fn (st: &Store) scanOne(t: mut &Txn, tree: int, x: int, lo: &str, hi: &str, f: &fn(int, &lexdb_rows.LeafView, int, int): int,
                         stop: mut &bool): Result[Unit, lexdb_base.DbErr] {

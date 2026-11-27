@@ -372,6 +372,7 @@ pub type PAgg = record {
     pub keys: []lexdb_bind.BX
     pub calls: []PCall
     pub keep: []bool        // per column of the query: kept in a group's first row (read after grouping: outputs, HAVING, ORDER BY)
+    pub condSafe: []bool    // per column: only referenced after grouping inside a GROUP BY expression (safe for CondText elideComp)
     pub sets: [][]int       // GROUPING SETS, ROLLUP, CUBE: per set the places of its keys (in keys); a group of each set; [] plain
     pub kinds: []int        // per key its collation's kind (lexdb_sql.COLL_*; Q8 R2: a collated key groups by its collated value)
     // (Q8 R7) the HAVING over its groups (the Filter above) may be checked
@@ -2871,7 +2872,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
     if bushy != BU_OFF && !lookups && !ordered && nl >= 3 {
         var gs = q.grpSearch(&cs, &masks, nl)
         gs.force = bushy == BU_FORCE
-        if gs.on { q.grpPass(&order, mut &flags, mut &grps, &gs, nl, &cands, &owns, &base, &cmask, &cdist, mut &memo, cap) }
+        if gs.on { q.grpPass(mut &order, mut &flags, mut &grps, &gs, nl, &cands, &owns, &base, &cmask, &cdist, mut &memo, cap) }
     }
     var ident = true
     for i in 0..nl {
@@ -2894,7 +2895,7 @@ fn (q: &Query) costOrder(ms: &[][]Expr, lookups: bool, cap: float, ordT: int, or
 // members are linked to the hub or the member before by an equality, the
 // group to the tables before by one, no conjunct that may fail reads one
 // of them with another table (GrpSearch.bad).
-fn (q: &Query) grpPass(order: &[]int, flags: mut &[]bool, grps: mut &[]int, gs: &GrpSearch, nl: int, cands: &[][]WayCand, owns: &[][]Expr,
+fn (q: &Query) grpPass(order: mut &[]int, flags: mut &[]bool, grps: mut &[]int, gs: &GrpSearch, nl: int, cands: &[][]WayCand, owns: &[][]Expr,
                        base: &[]Way, cmask: &[]int, cdist: &[]float, memo: mut &Map[int, float], cap: float) {
     // each place's step (the set before it, the table)
     var steps: []float = array(nl, 0.0f)
@@ -2957,10 +2958,69 @@ fn (q: &Query) grpPass(order: &[]int, flags: mut &[]bool, grps: mut &[]int, gs: 
         append(mut &picked, b)
         gain += gains[b]
     }
-    if len(picked) == 0 || (!gs.force && !(total - gain < GRP_GAIN * total)) { return }
-    for b in picked {
-        grps[at[b]] = ms[b]
-        for p in at[b]..at[b] + ms[b] + 1 { flags[p] = true }
+    if len(picked) > 0 && (gs.force || total - gain < GRP_GAIN * total) {
+        for b in picked {
+            grps[at[b]] = ms[b]
+            for p in at[b]..at[b] + ms[b] + 1 { flags[p] = true }
+        }
+    } else {
+        for p in 0..nl { used[p] = false }
+    }
+    // PK/index-lookup build groups: pair a selective hashed hub h (e.g. TPC-H q9 filtered part, 10k rows)
+    // with a later lookup-probed table x (e.g. partsupp, 319k PK lookups) when x has a PK/index lookup from h
+    // and the joined build (h ⋈_PK x, 42k rows) is small and much cheaper than per-row probes from outer!
+    for i in 1..nl - 1 {
+        if used[i] || !flags[i] { continue }
+        let h = order[i]
+        if (gs.bad & (1 << h)) != 0 || base[h].rows > 250000.0f { continue }
+        let pre = befores[i]
+        if (gs.eqAdj[h] & pre) == 0 { continue }
+        var hn = 0
+        let hNb = float(estNeedBytes(&q.levels[h], mut &hn))
+        var bestK = -1
+        var bestGain = 0.0f
+        for k in i + 1..nl {
+            if used[k] || flags[k] { continue }
+            let x = order[k]
+            if (gs.bad & (1 << x)) != 0 { continue }
+            let w = q.wayInto(x, &cands[x], 1 << h, true, &owns[x])
+            if w.rows < 0.0f { continue }
+            let rHx = fmax(1.0f, base[h].rows * w.rows)
+            var xn = 0
+            let xNb = float(estNeedBytes(&q.levels[x], mut &xn))
+            if rHx * (hNb + xNb) > fmin(cap, HASH_WIDE_MAX_BYTES) { continue }
+            // Ensure rotating x from k to i+1 does not break any existing group spanning i+1..k
+            var blocked = false
+            for p in i + 1..k { if grps[p] > 0 { blocked = true; break } }
+            if blocked { continue }
+            let rinI = q.setRows(pre, nl, base, cmask, cdist, memo)
+            let rNext = q.setRows(pre | (1 << h) | (1 << x), nl, base, cmask, cdist, memo)
+            let c = base[h].cost + base[h].rows * w.cost + rHx * (ROW_COST + HASH_BUILD) + rinI * HASH_PROBE + rNext * ROW_COST
+            let removed = steps[i] + steps[k]
+            if c < removed * GRP_GAIN && removed - c > bestGain {
+                bestGain = removed - c
+                bestK = k
+            }
+        }
+        if bestK > i {
+            let xOrd = order[bestK]
+            var p = bestK
+            while p > i + 1 {
+                order[p] = order[p - 1]
+                flags[p] = flags[p - 1]
+                grps[p] = grps[p - 1]
+                used[p] = used[p - 1]
+                steps[p] = steps[p - 1]
+                p -= 1
+            }
+            order[i + 1] = xOrd
+            flags[i] = true
+            flags[i + 1] = false
+            grps[i] = 1
+            grps[i + 1] = 0
+            used[i] = true
+            used[i + 1] = true
+        }
     }
 }
 
@@ -4283,8 +4343,16 @@ pub fn planFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: mut &Query
         if !q.levels[k].virt() && q.levels[k].est.rows < 0 && !hs.rules && !txn.noting() && hasInSub(&m) {
             q.levels[k].est = try lexdb_stats.loadEst(st, txn, &q.levels[k].t, true, hs.rules)
         }
-        var path = if q.levels[k].virt() { Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false} } else {
-            choosePath(q, k, &m, params, mut &sc.looks)
+        let gk = grpOf(q, k)
+        var path = Path{index: -1, eqs: [], rng: [], desc: false, noNulls: false, ins: [], inSub: -1, inArr: [], stats: false, inMax: 0, sorted: false}
+        if !q.levels[k].virt() {
+            if gk >= 0 && gk < k && !q.levels[k].readOnce {
+                var gm: []Expr = []
+                for c in m { if q.minLevel(&c) >= gk { append(mut &gm, lexdb_sql.cloneExpr(&c)) } }
+                path = choosePath(q, k, &gm, params, mut &sc.looks)
+            } else {
+                path = choosePath(q, k, &m, params, mut &sc.looks)
+            }
         }
         // the cost planner's index range: read in key order where keyOrdered
         // says it may (optimizer 47); a scan of the first table (or of one
@@ -8365,7 +8433,10 @@ fn grpEnd(q: &Query, g: int): int { return g + q.levels[g].grp }
 fn grpPlain(q: &Query, g: int): bool {
     for l in g..grpEnd(q, g) + 1 {
         let lv = &q.levels[l]
-        if !(lv.join == lexdb_sql.J_INNER || lv.join == lexdb_sql.J_CROSS) || lv.lateral || lv.lock != 0 || lv.virt() || lv.perRow { return false }
+        if !(lv.join == lexdb_sql.J_INNER || lv.join == lexdb_sql.J_CROSS) || lv.lateral || lv.lock != 0 || lv.virt() { return false }
+        if lv.perRow {
+            if l == g || !(lookupPath(q, lv) || rangePath(q, lv)) { return false }
+        }
         if len(lv.post) > 0 || lv.semi || lv.anti || lv.semiSub >= 0 || lv.resNot { return false }
     }
     return true
@@ -8403,36 +8474,43 @@ fn grpArm(q: &Query, g: int): Option[PJoin] {
     // the build: the hub's scan (its own conditions), then each member
     var build = filterOver(joinScan(q, g), hb, [])
     var keyAt = -1
+    var keyAt2 = -1
     for l in g..grpEnd(q, g) + 1 {
         let lv = &q.levels[l]
-        var m = PJoin{how: JH_HASH, kind: lexdb_sql.J_INNER, mark: MK_JOIN, resCol: -1, res: [], scan: joinScan(q, l), build: [], hcols: [], keys: [],
+        let isLook = l > g && lv.perRow
+        let look = isLook && lookupPath(q, lv)
+        let range = isLook && !look && rangePath(q, lv)
+        var m = PJoin{how: if !isLook { JH_HASH } else if look { JH_LOOK } else { JH_RANGE }, kind: lexdb_sql.J_INNER, mark: MK_JOIN, resCol: -1, res: [], scan: joinScan(q, l), build: [], hcols: [], keys: [],
                       ktypes: [], exact: true, colls: [], conds: [], keq: -1, keq2: -1, post: [], index: lv.path.index, rng: [], capNulls: false, noNulls: lv.path.noNulls, sub: []}
         var mkey = -1
         for x in lv.cond {
             let lo = q.minLevel(&x)
-            if lo >= l { continue }             // its own: applied as its rows are read (Level.local)
+            if !isLook && lo >= l { continue }             // hash member's own: applied as its rows are read (Level.local)
             let outer = lo < g
-            match q.grpKey(g, l, &x, outer) {
-                Some(gk) {
-                    let typ = boundType(&q.cols[gk.slot].typ)
-                    match planX(&gk.val, q) {
-                        Some(b) {
-                            if outer {
-                                append(mut &j.hcols, gk.slot)
-                                append(mut &j.keys, b)
-                                append(mut &j.ktypes, typ)
-                                keyAt = len(j.conds)
-                            } else {
-                                append(mut &m.hcols, gk.slot - lv.first)
-                                append(mut &m.keys, b)
-                                append(mut &m.ktypes, typ)
-                                mkey = len(m.conds)
+            if outer || !isLook {
+                match q.grpKey(g, l, &x, outer) {
+                    Some(gk) {
+                        let typ = boundType(&q.cols[gk.slot].typ)
+                        match planX(&gk.val, q) {
+                            Some(b) {
+                                if outer {
+                                    if len(j.hcols) == 0 { keyAt = len(j.conds) }
+                                    else if len(j.hcols) == 1 { keyAt2 = len(j.conds) }
+                                    append(mut &j.hcols, gk.slot)
+                                    append(mut &j.keys, b)
+                                    append(mut &j.ktypes, typ)
+                                } else {
+                                    append(mut &m.hcols, gk.slot - lv.first)
+                                    append(mut &m.keys, b)
+                                    append(mut &m.ktypes, typ)
+                                    mkey = len(m.conds)
+                                }
                             }
+                            None { return None }
                         }
-                        None { return None }
                     }
+                    None {}
                 }
-                None {}
             }
             match planX(&x, q) {
                 Some(b) { if outer { append(mut &j.conds, b) } else { append(mut &m.conds, b) } }
@@ -8440,18 +8518,41 @@ fn grpArm(q: &Query, g: int): Option[PJoin] {
             }
         }
         if l == g { continue }
-        for x in lv.local {
-            match planX(&x, q) {
-                Some(b) { append(mut &m.build, b) }
-                None { return None }
+        if isLook {
+            let t = &lv.t
+            let ix = if look { -1 } else { lv.path.index }
+            for i in 0..len(lv.path.eqs) {
+                append(mut &m.ktypes, keyType(t, ix, i))
+                match planX(&lv.path.eqs[i], q) {
+                    Some(b) { append(mut &m.keys, b) }
+                    None { return None }
+                }
             }
+            if range && len(lv.path.rng) > 0 {
+                append(mut &m.ktypes, keyType(t, ix, len(lv.path.eqs)))
+                for b in lv.path.rng {
+                    match planX(&b.val, q) {
+                        Some(v) { append(mut &m.rng, PBound{op: b.op.toStr(), val: v}) }
+                        None { return None }
+                    }
+                }
+            }
+            m.capNulls = range && lv.path.index >= 0 && (len(lv.path.rng) > 0 || lv.path.noNulls)
+        } else {
+            for x in lv.local {
+                match planX(&x, q) {
+                    Some(b) { append(mut &m.build, b) }
+                    None { return None }
+                }
+            }
+            if len(m.hcols) == 1 { m.keq = mkey }
         }
-        if len(m.hcols) == 1 { m.keq = mkey }
         build = PPlan.Join(build, m)
     }
     j.sub = [build]
     if len(j.hcols) == 0 { return None }
     if len(j.hcols) == 1 { j.keq = keyAt }
+    else if len(j.hcols) == 2 { j.keq = keyAt; j.keq2 = keyAt2 }
     return Some(j)
 }
 
@@ -8485,6 +8586,7 @@ pub fn grpLine(q: &Query, k: int): str {
     let name = if lv.alias == tn { tn } else { tn + " " + lv.alias }
     let keys = "(" + strings.join(&cs, ", ") + ")"
     if k == g { return "join " + name + ": hash of a join on " + keys + " over " + pathTextAt(q, k) }
+    if lv.perRow { return "  with " + name + ": " + pathTextAt(q, k) + " per row" }
     return "  with " + name + ": hash on " + keys + " over " + pathTextAt(q, k)
 }
 
@@ -9165,6 +9267,7 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
         ps.part = true
     }
     let keep = firstKeep(sel)
+    let condSafe = condSafeKeep(sel)
     let base = filterOver(ps, cs, subsOf(&sel.q))
     // (over joins: slice P2)
     let joined = if len(sel.q.levels) > 1 { joinsOver(&sel.q, base) } else { Ok(base) }
@@ -9180,7 +9283,7 @@ pub fn pipeAgg(sel: mut &Sel): Option[PPlan] {
     // those called above the groups only the caller's, Q8 R7)
     if sel.q.corr { input = applyOver(&sel.q, replace(mut &input, PPlan.Result([]))) }
     if viewsCorr(&sel.q) { input = applySubs(replace(mut &input, PPlan.Result([]))) }
-    let agg = PPlan.Agg(if sel.first >= 0 { PPlan.MinMax(input) } else { input }, len(sel.gsets) > 0, Some(PAgg{keys: keys, calls: calls, keep: keep, sets: copySets(&sel.gsets), kinds: collections.copyOf(&sel.groupKinds),
+    let agg = PPlan.Agg(if sel.first >= 0 { PPlan.MinMax(input) } else { input }, len(sel.gsets) > 0, Some(PAgg{keys: keys, calls: calls, keep: keep, condSafe: condSafe, sets: copySets(&sel.gsets), kinds: collections.copyOf(&sel.groupKinds),
                                                                                                    fuse: fuseOf(sel)}))
     return Some(grpViews(sel, agg))
 }
@@ -9561,6 +9664,56 @@ pub fn firstKeep(sel: &Sel): []bool {
     var keep: []bool = array(len(sel.q.cols), false)
     for ci in afterCols(sel, &sel.q) { keep[ci] = true }
     return keep
+}
+
+// Per column, true if every reference to that column after grouping is enclosed
+// inside one of sel.group's non-column expressions (safe to reconstruct from CondText keys).
+fn colNamesOutsideGroup(x: &Expr, gtexts: &[]str, out: mut &[]str) {
+    let t = lexdb_sql.exprText(x)
+    for gt in gtexts { if t == gt { return } }
+    match x {
+        Expr.Col(n, _) { append(out, n.clone()) }
+        Expr.Unary(_, a) { colNamesOutsideGroup(&a, gtexts, out) }
+        Expr.Bin(_, a, b) {
+            colNamesOutsideGroup(&a, gtexts, out)
+            colNamesOutsideGroup(&b, gtexts, out)
+        }
+        Expr.IsNull(a, _) { colNamesOutsideGroup(&a, gtexts, out) }
+        Expr.Cast(a, _) { colNamesOutsideGroup(&a, gtexts, out) }
+        Expr.Call(_, args, _) { for a in args { colNamesOutsideGroup(&a, gtexts, out) } }
+        else {}
+    }
+}
+
+fn condSafeKeep(sel: &Sel): []bool {
+    let n = len(sel.q.cols)
+    var safe: []bool = array(n, true)
+    if len(sel.groupBy) == 0 { return array(n, false) }
+    var gtexts: []str = []
+    for g in sel.groupBy {
+        match &g {
+            Expr.Col(_, _) {}
+            else { append(mut &gtexts, lexdb_sql.exprText(&g)) }
+        }
+    }
+    if len(gtexts) == 0 { return array(n, false) }
+    var names: []str = []
+    for x in sel.exprs { colNamesOutsideGroup(&x, &gtexts, mut &names) }
+    match &sel.having {
+        Some(h) { colNamesOutsideGroup(h, &gtexts, mut &names) }
+        None {}
+    }
+    for x in sel.order { colNamesOutsideGroup(&x, &gtexts, mut &names) }
+    for w in sel.wins {
+        for x in w.part { colNamesOutsideGroup(&x, &gtexts, mut &names) }
+        for x in w.order { colNamesOutsideGroup(&x, &gtexts, mut &names) }
+        for x in lexdb_window.argsOf(&w) { colNamesOutsideGroup(&x, &gtexts, mut &names) }
+    }
+    for nm in names {
+        let ci = lexdb_bind.colIndex(&sel.q.cols, &nm)
+        if ci >= 0 && ci < n { safe[ci] = false }
+    }
+    return safe
 }
 
 // The query's columns a grouped select reads after grouping: those its
