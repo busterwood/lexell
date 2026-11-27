@@ -1,0 +1,77 @@
+// Devirtualization (Tier 1 local/inlined + Tier 2 whole-program monomorphic):
+// verifies exact semantics across monomorphic interfaces, polymorphic interfaces
+// with locally known vtables, escaping closures, borrowed closures via Option.map,
+// and mixed polymorphic/monomorphic dispatch.
+// expect: mono sum 499500
+// expect: local poly 10 30
+// expect: clo local 55 42
+// expect: opt map Some(210)
+// expect: poly arr 60
+
+// Monomorphic interface (Tier 2: only one concrete implementor in program)
+type MonoGen = interface {
+    fn (mut &Self) step(): int
+}
+
+type LinGen = value record {
+    cur: int
+}
+
+fn (g: mut &LinGen) step(): int {
+    let v = g.cur
+    g.cur += 1
+    return v
+}
+
+fn sumMono(g: mut &MonoGen, n: int): int {
+    var s = 0
+    for _ in 0..n { s += g.step() }
+    return s
+}
+
+// Polymorphic interface (2 implementors: Tier 1 devirtualizes locally known sites,
+// while heterogeneous array dispatch remains polymorphic)
+type Op = interface {
+    fn (&Self) eval(x: int): int
+}
+
+type AddOp = value record { k: int }
+fn (a: &AddOp) eval(x: int): int { return x + a.k }
+
+type MulOp = value record { k: int }
+fn (m: &MulOp) eval(x: int): int { return x * m.k }
+
+fn runOp(op: &Op, x: int): int {
+    return op.eval(x)
+}
+
+fn makeAdd(k: int): box fn(int): int {
+    return fn(x) { return x + k }
+}
+
+fn main() {
+    // 1. Tier 2 monomorphic devirtualization in a loop
+    var g: box MonoGen = LinGen{cur: 0}
+    println($"mono sum {sumMono(mut &g, 1000)}")
+
+    // 2. Tier 1 local devirtualization of a polymorphic interface via inlined helper
+    let a = AddOp{k: 5}
+    let m = MulOp{k: 3}
+    println($"local poly {runOp(&a, 5)} {runOp(&m, 10)}")
+
+    // 3. Tier 1 escaping closure devirtualization + noop/simple drop
+    let f = makeAdd(5)
+    let f0: box fn(int): int = fn(x) { return x * 2 }
+    println($"clo local {f(50)} {f0(21)}")
+
+    // 4. Tier 1 borrowed closure devirtualization through Option.map
+    let scale = 10
+    let mapped = Some(21).map(fn(x): int { return x * scale })
+    println($"opt map {mapped}")
+
+    // 5. True polymorphic dispatch through heterogeneous array
+    let ops: []box Op = [AddOp{k: 10}, MulOp{k: 3}]
+    var v = 10
+    for i in 0..len(ops) { v = ops[i].eval(v) }
+    println($"poly arr {v}")
+}

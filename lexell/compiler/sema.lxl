@@ -52,6 +52,7 @@ pub const TK_CLO = 5
 pub const TK_INST = 6
 pub const TK_TP = 7
 pub const TK_SELF = 8
+pub const TK_BOX = 9         // box I (interface value) or box fn(...) (escaping closure): a = inner
 
 pub type Ty = value record {
     pub k: int
@@ -103,6 +104,8 @@ pub const P_GLOBAL = 7
 pub const P_INNER = 8
 pub const P_CONSTRAINT = 9
 pub const P_ALIAS = 10
+pub const P_BOX = 11
+pub const P_REF_INNER = 12
 
 pub type TParam = value record {
     pub name: str
@@ -288,6 +291,7 @@ pub type Program = record {
     pub externs: Map[str, int]     // C name -> the first extern FnDecl with it
     pub externNames: []str
     pending: []Pending
+    pendingObj: []Pending
     pub resolved: bool
     wraps: []Wrap
     pub gwrap: str           // check's global initializers: "the initializer of global G must be constant: "
@@ -410,7 +414,7 @@ pub fn newProgram(stdPath: &str, libroots: []str, mainFile: &str): Program {
     var pg = Program{libroots: libroots, mainFile: mainFile.clone(), mods: [], modIndex: newMapWith[str, int](fxHashStr), types: [],
         variants: [], fns: [], consts: [], globals: [], tparams: [], tys: [], tlists: [], tindex: newMapWith[str, int](fxHashStr),
         primMethods: [], primMethodNames: [], prelude: newMapWith[str, int](fxHashStr), preludeNames: [], externs: newMapWith[str, int](fxHashStr),
-        externNames: [], pending: [], resolved: false, wraps: [], gwrap: "", std: -1, shared: -1, where: -1, rc: -1, main: -1, bcMemo: [], bcDecl: [],
+        externNames: [], pending: [], pendingObj: [], resolved: false, wraps: [], gwrap: "", std: -1, shared: -1, where: -1, rc: -1, main: -1, bcMemo: [], bcDecl: [],
         migrate: os.envOr("LXL_OWNED_STR", "") == "1" || os.envOr("LXL_OWNED_SHARED", "") == "1", legacy: false,
         paramReport: os.envOr("LXL_PARAM_REPORT", "") == "1"}
     let none: []int = []
@@ -462,9 +466,14 @@ pub fn (pg: mut &Program) mkFn(ps: &[]int, r: int): int { return pg.intern(TK_FN
 pub fn (pg: mut &Program) mkClo(ps: &[]int, r: int): int { return pg.intern(TK_CLO, 0, r, false, ps) }
 pub fn (pg: mut &Program) mkInst(d: int, args: &[]int): int { return pg.intern(TK_INST, d, 0, false, args) }
 pub fn (pg: mut &Program) mkTp(tp: int): int { return pg.intern(TK_TP, tp, 0, false, &[]) }
+pub fn (pg: mut &Program) mkBox(inner: int): int { return pg.intern(TK_BOX, inner, 0, false, &[]) }
 // ref's ('inst', d, None): a generic type named without its arguments (check's static_type).
 pub fn (pg: mut &Program) mkBare(d: int): int { return pg.intern(TK_INST, d, 0, true, &[]) }
 pub fn (pg: &Program) isBare(t: int): bool { return pg.tys[t].k == TK_INST && pg.tys[t].m }
+pub fn (pg: &Program) isIface(t: int): bool { return pg.tys[t].k == TK_INST && pg.types[pg.tys[t].a].form == sx.F_INTERFACE }
+pub fn (pg: &Program) isBoxIface(t: int): bool { return pg.tys[t].k == TK_BOX && pg.isIface(pg.tys[t].a) }
+pub fn (pg: &Program) isBoxFn(t: int): bool { return pg.tys[t].k == TK_BOX && pg.tys[pg.tys[t].a].k == TK_FN }
+pub fn (pg: &Program) isDynRef(t: int): bool { return pg.tys[t].k == TK_REF && pg.isIface(pg.tys[t].a) }
 
 pub fn (pg: &Program) tk(t: int): int { return pg.tys[t].k }
 pub fn (pg: &Program) ta(t: int): int { return pg.tys[t].a }
@@ -505,6 +514,7 @@ pub fn (pg: &Program) tstr(t: int): str {
         TK_ARR { return "[]" + pg.tstr(pg.ta(t)) }
         TK_REF { return (if pg.tm(t) { "mut &" } else { "&" }) + pg.tstr(pg.ta(t)) }
         TK_SLICE { return (if pg.tm(t) { "mut &[" } else { "&[" }) + pg.tstr(pg.ta(t)) + "]" }
+        TK_BOX { return "box " + pg.tstr(pg.ta(t)) }
         TK_FN, TK_CLO {
             var b = ""
             if k == TK_CLO { b.addByte('&') }
@@ -566,6 +576,7 @@ pub fn (pg: mut &Program) subst(t: int, env: &[]int): int {
         }
         TK_PRIM { return t }
         TK_ARR { return pg.mkArr(pg.subst(pg.ta(t), env)) }
+        TK_BOX { return pg.mkBox(pg.subst(pg.ta(t), env)) }
         TK_REF, TK_SLICE { return pg.intern(k, pg.subst(pg.ta(t), env), 0, pg.tm(t), &[]) }
         else {}
     }
@@ -581,7 +592,7 @@ pub fn (pg: &Program) hasTp(t: int, tps: &[]int): bool {
     match k {
         TK_TP { return len(tps) == 0 || contains(tps, pg.ta(t)) }
         TK_PRIM, TK_SELF { return false }
-        TK_ARR, TK_REF, TK_SLICE { return pg.hasTp(pg.ta(t), tps) }
+        TK_ARR, TK_REF, TK_SLICE, TK_BOX { return pg.hasTp(pg.ta(t), tps) }
         else {}
     }
     for i in 0..pg.tn(t) {
@@ -590,10 +601,24 @@ pub fn (pg: &Program) hasTp(t: int, tps: &[]int): bool {
     return (k == TK_FN || k == TK_CLO) && pg.hasTp(pg.tb(t), tps)
 }
 
+pub fn (pg: &Program) hasSelf(t: int): bool {
+    let k = pg.tk(t)
+    match k {
+        TK_SELF { return true }
+        TK_PRIM, TK_TP { return false }
+        TK_ARR, TK_REF, TK_SLICE, TK_BOX { return pg.hasSelf(pg.ta(t)) }
+        else {}
+    }
+    for i in 0..pg.tn(t) {
+        if pg.hasSelf(pg.ti(t, i)) { return true }
+    }
+    return (k == TK_FN || k == TK_CLO) && pg.hasSelf(pg.tb(t))
+}
+
 pub fn (pg: &Program) depth(t: int): int {
     let k = pg.tk(t)
     match k {
-        TK_ARR, TK_REF, TK_SLICE { return 1 + pg.depth(pg.ta(t)) }
+        TK_ARR, TK_REF, TK_SLICE, TK_BOX { return 1 + pg.depth(pg.ta(t)) }
         TK_FN, TK_CLO, TK_INST {
             var m = if k != TK_INST { pg.depth(pg.tb(t)) } else { 0 }
             for i in 0..pg.tn(t) {
@@ -627,7 +652,7 @@ pub fn (pg: &Program) unify(p: int, t: int, bind: mut &[]int, tps: &[]int): bool
     if k != pg.tk(t) { return false }
     match k {
         TK_PRIM, TK_TP, TK_SELF { return p == t }
-        TK_ARR { return pg.unify(pg.ta(p), pg.ta(t), bind, tps) }
+        TK_ARR, TK_BOX { return pg.unify(pg.ta(p), pg.ta(t), bind, tps) }
         TK_REF, TK_SLICE { return pg.tm(p) == pg.tm(t) && pg.unify(pg.ta(p), pg.ta(t), bind, tps) }
         TK_FN, TK_CLO {
             if pg.tn(p) != pg.tn(t) { return false }
@@ -983,7 +1008,7 @@ fn (pg: mut &Program) isCopyAt(t: int, depth: int): bool {
     match pg.tk(t) {
         TK_PRIM { return pg.ta(t) != T_STR || pg.legacy }       // str is owned (design/owned-str.md)
         TK_FN, TK_REF, TK_SLICE, TK_CLO { return true }
-        TK_ARR, TK_SELF { return false }
+        TK_ARR, TK_SELF, TK_BOX { return false }
         TK_TP { return pg.tparams[pg.ta(t)].copy }
         else {}
     }
@@ -1370,6 +1395,11 @@ pub fn (pg: mut &Program) resolveAll() {
         pg.checkTargs(&args, &tps, p.mod, p.line)
     }
     replace(mut &pg.pending, [])
+    for k in 0..len(pg.pendingObj) {
+        let p = pg.pendingObj[k]
+        pg.checkObjectSafe(p.t, p.mod, p.line)
+    }
+    replace(mut &pg.pendingObj, [])
     for m in 0..nm {
         for k in 0..len(pg.mods[m].scopeNames) {
             let s = pg.scopeGet(m, pg.mods[m].scopeNames[k])
@@ -1532,7 +1562,7 @@ fn posWhat(pos: int): str {
 // or 0 (ref's '').
 fn (pg: &Program) typeWhere(m: int, a: int): int {
     var x = a
-    while pg.kind(m, x) == sx.N_TREF || pg.kind(m, x) == sx.N_TARR || pg.kind(m, x) == sx.N_TSLICE || pg.kind(m, x) == sx.N_TRC {
+    while pg.kind(m, x) == sx.N_TREF || pg.kind(m, x) == sx.N_TARR || pg.kind(m, x) == sx.N_TSLICE || pg.kind(m, x) == sx.N_TRC || pg.kind(m, x) == sx.N_TBOX {
         x = pg.nd(m, x).a
     }
     let k = pg.kind(m, x)
@@ -1567,7 +1597,7 @@ pub fn (pg: mut &Program) resolveType(a: int, m: int, env: &[]int, pos: int, whe
                 pg.err(m, pg.orWhere(where, m, a), "a borrow type cannot be " + posWhat(pos) +
                     ": borrows are second class")
             }
-            if k == sx.N_TREF { return pg.mkRef(pg.resolveType(n.a, m, env, P_INNER, where), isMut) }
+            if k == sx.N_TREF { return pg.mkRef(pg.resolveType(n.a, m, env, P_REF_INNER, where), isMut) }
             return pg.mkSlice(pg.resolveType(n.a, m, env, P_ELEM, where), isMut)
         }
         sx.N_TARR { return pg.mkArr(pg.resolveType(n.a, m, env, P_ELEM, where)) }
@@ -1575,6 +1605,13 @@ pub fn (pg: mut &Program) resolveType(a: int, m: int, env: &[]int, pos: int, whe
             if pg.rc < 0 { pg.err(m, pg.orWhere(where, m, a), "rc T needs std.Rc") }
             let inner = pg.resolveType(n.a, m, env, P_TARG, where)
             return pg.mkInst(pg.rc, &[inner])
+        }
+        sx.N_TBOX {
+            let inner = pg.resolveType(n.a, m, env, P_BOX, where)
+            if !pg.isIface(inner) && pg.tk(inner) != TK_FN {
+                pg.err(m, pg.orWhere(where, m, a), "box " + pg.tstr(inner) + ": box takes an interface or fn(...) type")
+            }
+            return pg.mkBox(inner)
         }
         sx.N_TFN {
             if n.flags & sx.EXTERN != 0 {
@@ -1626,8 +1663,19 @@ pub fn (pg: mut &Program) resolveType(a: int, m: int, env: &[]int, pos: int, whe
     }
     let form = pg.types[d].form
     if form == sx.F_INTERFACE {
-        if pos != P_CONSTRAINT { pg.err(m, w, name + " is an interface: it can only constrain a type parameter") }
-        return pg.mkInst(d, &targs)
+        if pos != P_CONSTRAINT && pos != P_BOX && pos != P_REF_INNER {
+            pg.err(m, w, name + " is an interface: it can only constrain a type parameter, or be written box " +
+                name + ", &" + name + " or mut &" + name)
+        }
+        let it = pg.mkInst(d, &targs)
+        if pos == P_BOX || pos == P_REF_INNER {
+            if pg.resolved {
+                pg.checkObjectSafe(it, m, w)
+            } else {
+                append(mut &pg.pendingObj, Pending{t: it, mod: m, line: w})
+            }
+        }
+        return it
     }
     if pos == P_CONSTRAINT { pg.err(m, w, name + " is not an interface") }
     if form == sx.F_ALIAS {
@@ -2456,10 +2504,80 @@ fn sameInts(a: &[]int, b: &[]int): bool {
     return true
 }
 
+// Whether an interface instance may be used as a dynamic interface value (box I, &I, mut &I).
+// Returns "" if object-safe, otherwise the reason.
+pub fn (pg: &Program) objectSafe(ifaceInst: int): str {
+    let d = pg.ta(ifaceInst)
+    for mb in pg.types[d].members {
+        if mb.mode == sx.M_NONE {
+            return "member '" + mb.name + "' is an associated function (no receiver)"
+        }
+        if mb.mode == sx.M_VAL {
+            return "method '" + mb.name + "' takes Self by value (use &Self or mut &Self)"
+        }
+        for pt in mb.params {
+            if pg.hasSelf(pt) {
+                return "method '" + mb.name + "' mentions Self in a parameter type"
+            }
+        }
+        if pg.hasSelf(mb.ret) {
+            return "method '" + mb.name + "' returns Self"
+        }
+    }
+    return ""
+}
+
+pub fn (pg: &Program) checkObjectSafe(ifaceInst: int, m: int, line: int) {
+    let why = pg.objectSafe(ifaceInst)
+    if len(why) > 0 {
+        pg.err(m, line, pg.tstr(ifaceInst) + " cannot be used as an interface value: " + why)
+    }
+}
+
+// Find member `name` in interface instance `ifaceInst`; returns its index or -1.
+pub fn (pg: &Program) ifaceMemberIdx(ifaceInst: int, name: &str): int {
+    let d = pg.ta(ifaceInst)
+    for i in 0..len(pg.types[d].members) {
+        if pg.types[d].members[i].name == name { return i }
+    }
+    return -1
+}
+
+// Whether interface value of interface `srcIface` (with sharedOnly = true for &I) satisfies `con`.
+fn (pg: mut &Program) ifaceSatisfies(srcIface: int, sharedOnly: bool, con: int): str {
+    let dstD = pg.ta(con)
+    var srcEnv = pg.declEnv(srcIface)
+    var dstEnv = pg.declEnv(con)
+    let srcD = pg.ta(srcIface)
+    for j in 0..len(pg.types[dstD].members) {
+        let dm = pg.types[dstD].members[j].clone()
+        if dm.mode == sx.M_NONE { return "interface value has no associated function '" + dm.name + "'" }
+        if sharedOnly && dm.mode == sx.M_MUT { return "shared interface borrow cannot satisfy mut &Self method '" + dm.name + "'" }
+        let idx = pg.ifaceMemberIdx(srcIface, &dm.name)
+        if idx < 0 { return "it has no method '" + dm.name + "'" }
+        let sm = pg.types[srcD].members[idx].clone()
+        if sm.mode != dm.mode { return "its method '" + dm.name + "' has the wrong receiver mode" }
+        if len(sm.params) != len(dm.params) { return "its method '" + dm.name + "' has the wrong signature" }
+        for k in 0..len(dm.params) {
+            if pg.hasSelf(dm.params[k]) { return "its method '" + dm.name + "' mentions Self" }
+            let sp = pg.subst(sm.params[k], &srcEnv)
+            let dp = pg.subst(dm.params[k], &dstEnv)
+            if sp != dp { return "its method '" + dm.name + "' has the wrong signature" }
+        }
+        if pg.hasSelf(dm.ret) { return "its method '" + dm.name + "' returns Self" }
+        let sr = pg.subst(sm.ret, &srcEnv)
+        let dr = pg.subst(dm.ret, &dstEnv)
+        if sr != dr { return "its method '" + dm.name + "' has the wrong signature" }
+    }
+    return ""
+}
+
 // ref's satisfies(t, con, mod): "" when t satisfies the interface instance
 // con (seen from module m), otherwise the reason.
 pub fn (pg: mut &Program) satisfies(t: int, con: int, m: int): str {
     let iface = pg.ta(con)
+    if pg.isBoxIface(t) { return pg.ifaceSatisfies(pg.ta(t), false, con) }
+    if pg.isDynRef(t) { return pg.ifaceSatisfies(pg.ta(t), !pg.tm(t), con) }
     // a shared borrow &U satisfies an interface U satisfies when no method needs mut &Self: its
     // methods are U's, on the borrowed value (design/consistency-designs.md, finding 2: &str is Ord)
     if pg.tk(t) == TK_REF && !pg.tm(t) && pg.tk(pg.ta(t)) != TK_TP && !pg.builtinClone(t, iface) {

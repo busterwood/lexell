@@ -1,0 +1,210 @@
+// Interface values: box I, &I, mut &I, dynamic dispatch, heterogeneous arrays,
+// generic interfaces (box Iter[int]), mut methods, drop dispatch, structural
+// interface satisfaction (box I / &I as generic T: Show), if/match coercion.
+// expect: show int 42
+// expect: show str hello
+// expect: show dog Dog(Rex)
+// expect: speak Rex says woof
+// expect: speak Whiskers says meow
+// expect: speak Tweety says tweet
+// expect: sounds 3: woof, meow, tweet
+// expect: generic show 42 hello Dog(Rex)
+// expect: iter sum 60
+// expect: mut ref counter 1 2 3 3
+// expect: if/match box woof meow
+// expect: opt box Some(Dog(Bolt)) None
+// expect: drops 3
+// expect: deep chain ok
+
+type Speaker = interface {
+    fn (&Self) name(): str
+    fn (&Self) sound(): str
+}
+
+type Counter = interface {
+    fn (mut &Self) bump(by: int): int
+    fn (&Self) value(): int
+}
+
+type Dog = record {
+    n: str
+}
+
+fn (d: &Dog) name(): str { return d.n.clone() }
+fn (d: &Dog) sound(): str { return "woof" }
+fn (d: &Dog) toStr(): str { return $"Dog({d.n})" }
+
+type Cat = value record {
+    n: str
+}
+
+fn (c: &Cat) name(): str { return c.n.clone() }
+fn (c: &Cat) sound(): str { return "meow" }
+
+type Bird = record {
+    n: str
+}
+
+fn (b: &Bird) name(): str { return b.n.clone() }
+fn (b: &Bird) sound(): str { return "tweet" }
+
+// Generic interface value: box Seq[int]
+type Seq[T] = interface {
+    fn (mut &Self) next(): Option[T]
+}
+
+type Stepper = value record {
+    cur: int
+    end: int
+    step: int
+}
+
+fn (s: mut &Stepper) next(): Option[int] {
+    if s.cur >= s.end { return None }
+    let v = s.cur
+    s.cur += s.step
+    return Some(v)
+}
+
+type Tally = record {
+    v: int
+}
+
+fn (t: mut &Tally) bump(by: int): int {
+    t.v += by
+    return t.v
+}
+
+fn (t: &Tally) value(): int { return t.v }
+
+// Drop tracking through box I
+var dropCount: int = 0
+
+type Tracked = record {
+    label: str
+}
+
+fn (t: &Tracked) toStr(): str { return t.label.clone() }
+fn (t: mut &Tracked) drop() { dropCount += 1 }
+
+// Deep recursive chain of box Node (tests iterative drop stack, no stack overflow!)
+type NodeI = interface {
+    fn (&Self) depth(): int
+}
+
+type Link = record {
+    next: Option[box NodeI]
+}
+
+fn (l: &Link) depth(): int { return 1 }
+
+fn showOne(label: &str, s: &Show) {
+    println($"{label} {s.toStr()}")
+}
+
+fn speakOne(s: &Speaker) {
+    println($"speak {s.name()} says {s.sound()}")
+}
+
+fn showGeneric[T: Show](x: &T): str {
+    return x.toStr()
+}
+
+fn sumIter(it: mut &Seq[int]): int {
+    var total = 0
+    while true {
+        match it.next() {
+            Some(v) { total += v }
+            None { break }
+        }
+    }
+    return total
+}
+
+fn bumpTwice(c: mut &Counter): int {
+    let _ = c.bump(1)
+    return c.bump(1)
+}
+
+fn makeSpeaker(kind: int): box Speaker {
+    return match kind {
+        0 { Dog{n: "A"} }
+        else { Cat{n: "B"} }
+    }
+}
+
+fn main() {
+    // 1. Borrowed &Show on primitive, str, and record
+    let n = 42
+    let hi = "hello"
+    let rex = Dog{n: "Rex"}
+    showOne("show int", &n)
+    showOne("show str", &hi)
+    showOne("show dog", &rex)
+
+    // 2. Heterogeneous []box Speaker + &box Speaker -> &Speaker
+    let animals: []box Speaker = [
+        Dog{n: "Rex"},
+        Cat{n: "Whiskers"},
+        Bird{n: "Tweety"}
+    ]
+    for i in 0..len(animals) {
+        speakOne(&animals[i])
+    }
+    var joined = ""
+    for i in 0..len(animals) {
+        if i > 0 { joined += ", " }
+        joined += &animals[i].sound()
+    }
+    println($"sounds {len(animals)}: {joined}")
+
+    // 3. box Show satisfies generic T: Show (and interpolation!)
+    let b1: box Show = 42
+    let b2: box Show = "hello"
+    let b3: box Show = Dog{n: "Rex"}
+    println($"generic show {showGeneric(&b1)} {showGeneric(&b2)} {showGeneric(&b3)}")
+
+    // 4. Generic interface value: box Seq[int] and mut &Seq[int]
+    var it: box Seq[int] = Stepper{cur: 10, end: 40, step: 10}
+    println($"iter sum {sumIter(mut &it)}")
+
+    // 5. Mutable interface value & mut &Counter -> &Counter
+    var tally = Tally{v: 0}
+    let a = tally.bump(1)
+    let b = bumpTwice(mut &tally)
+    let cRef: &Counter = &tally
+    println($"mut ref counter {a} {a + 1} {b} {cRef.value()}")
+
+    // 6. if/match expressions producing box Speaker
+    let s0: box Speaker = if true { Dog{n: "X"} } else { Cat{n: "Y"} }
+    let s1 = makeSpeaker(1)
+    println($"if/match box {s0.sound()} {s1.sound()}")
+
+    // 7. Option[box Show]
+    let o1: Option[box Show] = Some(Dog{n: "Bolt"})
+    let o2: Option[box Show] = None
+    let t1 = match &o1 { Some(x) { $"Some({x.toStr()})" } None { "None" } }
+    let t2 = match &o2 { Some(x) { $"Some({x.toStr()})" } None { "None" } }
+    println($"opt box {t1} {t2}")
+
+    // 8. Drop dispatch through box Show
+    {
+        let ts: []box Show = [
+            Tracked{label: "one"},
+            Tracked{label: "two"},
+            Tracked{label: "three"}
+        ]
+        assert(len(ts) == 3)
+    }
+    println($"drops {dropCount}")
+
+    // 9. Deep chain of box NodeI (tests iterative drop stack)
+    {
+        var cur: Option[box NodeI] = None
+        for _ in 0..5000 {
+            let link = Link{next: cur}
+            cur = Some(link)
+        }
+    }
+    println("deep chain ok")
+}

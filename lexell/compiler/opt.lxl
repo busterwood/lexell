@@ -95,6 +95,20 @@ type Opt = record {
     wf: int             // the function whose body the W_CALLEES walk is in
     recur: []bool       // per function: it calls itself (the W_CALLEES walk)
     allocs: []bool      // per function: it calls rt_alloc, or a body inlined in it does
+    // devirtualization (Tier 1 local fat-pointer prop + Tier 2 whole-program monomorphic CHA)
+    devirt: int         // 0 off (LXL_DEVIRT=0), 1 on (default), 2 verbose (LXL_DEVIRT=v)
+    drunF: int          // rt_drun
+    dpushF: int         // rt_dpush
+    noopDropF: int      // rt_box_noop
+    cloSid: int         // lxl_clo struct id
+    vtMap: Map[int, int]    // (globalIdx << 12) | byteOff -> fnId
+    monoMap: Map[int, int]  // (structSid << 12) | byteOff -> fnId
+    vtGlobSet: Map[int, bool]
+    simpleDrop: []bool  // per function: safe to replace rt_drun(f, p) with direct f(p)
+    dvMonoN: int
+    dvLocalN: int
+    dvCloN: int
+    dvDropN: int
 }
 
 // What unbox knows of a local of the function at hand.
@@ -112,10 +126,13 @@ type Ub = value record {
 pub fn optimize(p: ir.Ir): ir.Ir {
     var o = Opt{u: p, state: [], form: [], size: [], rets: [], ro: [], refs: [], aTaken: [], mk: [], mv: [], bound: [], budget: 0, cur: -1,
         grown: 0, limit: 0, dest: D_NONE, dl: -1, lv: -1, aty: -1, single: false, nrvo: -1,
-        dupF: -1, dropF: -1, stamp: 0, sStamp: [], sCand: [], cands: [], prevFresh: -1, adj: -1, selfOnce: false, fpOf: [], fpList: [], ren: newMap(), allocF: -1, freeF: -1, ub: [], ubSeen: [], wf: -1, recur: [], allocs: []}
+        dupF: -1, dropF: -1, stamp: 0, sStamp: [], sCand: [], cands: [], prevFresh: -1, adj: -1, selfOnce: false, fpOf: [], fpList: [], ren: newMap(), allocF: -1, freeF: -1, ub: [], ubSeen: [], wf: -1, recur: [], allocs: [],
+        devirt: 1, drunF: -1, dpushF: -1, noopDropF: -1, cloSid: -1, vtMap: newMap(), monoMap: newMap(), vtGlobSet: newMap(), simpleDrop: [], dvMonoN: 0, dvLocalN: 0, dvCloN: 0, dvDropN: 0}
     o.limit = INLINE_LIMIT
     let ev = os.envOr("LXL_INLINE", "")
     if ev != "" { o.limit = strings.parseIntOpt(&ev).unwrapOr(INLINE_LIMIT) }
+    let dv = os.envOr("LXL_DEVIRT", "")
+    if dv == "0" { o.devirt = 0 } else if dv == "v" { o.devirt = 2 }
     for f in 0..len(o.u.funcs) {
         append(mut &o.state, 0)
         append(mut &o.form, -1)
@@ -126,12 +143,15 @@ pub fn optimize(p: ir.Ir): ir.Ir {
         append(mut &o.fpOf, -1)
         append(mut &o.recur, false)
         append(mut &o.allocs, false)
+        append(mut &o.simpleDrop, false)
     }
     for f in 0..o.u.nRtFuncs {
         if o.u.funcs[f].name == "rt_str_dup" { o.dupF = f }
         if o.u.funcs[f].name == "rt_str_drop" { o.dropF = f }
         if o.u.funcs[f].name == "rt_alloc" { o.allocF = f }
         if o.u.funcs[f].name == "rt_free" { o.freeF = f }
+        if o.u.funcs[f].name == "rt_drun" { o.drunF = f }
+        if o.u.funcs[f].name == "rt_dpush" { o.dpushF = f }
     }
     for l in 0..len(o.u.locals) {
         append(mut &o.sStamp, 0)
@@ -139,6 +159,10 @@ pub fn optimize(p: ir.Ir): ir.Ir {
         append(mut &o.aTaken, false)
         append(mut &o.mk, M_NONE)
         append(mut &o.mv, -1)
+    }
+    if o.devirt > 0 {
+        o.initDevirt()
+        o.devirtMono()
     }
     for v in 0..len(o.u.globals) { o.walkList(o.u.globals[v].init, W_CALLEES, -1) }
     for f in 0..len(o.u.funcs) {
@@ -148,6 +172,9 @@ pub fn optimize(p: ir.Ir): ir.Ir {
     o.elideStaticStrs()
     o.fwdReceivers()
     o.packRecur()
+    if o.devirt == 2 {
+        eprintln($"devirt: mono={o.dvMonoN} local={o.dvLocalN} clo={o.dvCloN} drop={o.dvDropN}")
+    }
     return replace(mut &o.u, ir.newIr())
 }
 
@@ -895,6 +922,23 @@ fn (o: mut &Opt) visit(f: int) {
     o.cur = f
     o.grown = 0
     o.stmtIn(o.u.funcs[f].body)
+    if o.devirt > 0 {
+        for _ in 0..3 {
+            let news = o.devirtLocal(f)
+            if len(news) == 0 { break }
+            let sc = o.cur
+            let sg = o.grown
+            let sw = o.wf
+            for nf in news {
+                if nf >= 0 && o.u.funcs[nf].body >= 0 && o.state[nf] == 0 { o.visit(nf) }
+                if nf >= 0 && (nf == o.allocF || o.allocs[nf]) { o.allocs[f] = true }
+            }
+            o.cur = sc
+            o.grown = sg
+            o.wf = sw
+            o.stmtIn(o.u.funcs[f].body)
+        }
+    }
     o.unbox(f)
     o.scalars(f)
     o.form[f] = o.shape(f)
@@ -2703,4 +2747,638 @@ fn (o: mut &Opt) packRecur() {
         }
         o.u.funcs[f].body = o.prMk(ir.S_BLOCK, ir.TY_VOID, ln, o.u.list(&stmts), -1, -1, 0)
     }
+}
+
+// ---------------------------------------------------------------- devirtualization (Tier 1 + Tier 2)
+//
+// Tier 2 (whole-program monomorphic CHA): a vtable struct type (V<n>_* or VF<n>) whose live const
+// globals all agree on a single function pointer in a slot (in particular, any interface or
+// escaping closure type with only one concrete vtable in the program) devirtualizes every call
+// through that slot unconditionally before inlining.
+//
+// Tier 1 (local / inlined fat-pointer and closure propagation): after inlining exposes a fat
+// pointer `{ data, &vt }` or borrowed closure `{ fn, env }`, single-definition local tracking
+// resolves `dv.vt->m_k(...)`, `f.fn(...)`, and `rt_drun(dv.vt->drop, dv.data)` to direct calls
+// (eliding no-op drops and lowering non-recursive drops to direct calls so inlining and unbox
+// can optimize through them).
+
+fn (o: &Opt) constFnOf(e0: int): int {
+    var e = e0
+    while e >= 0 && o.u.nk(e) == ir.E_CAST { e = o.u.nodes[e].a }
+    if e < 0 { return -1 }
+    let k = o.u.nk(e)
+    if k == ir.E_FUNC { return o.u.nodes[e].a }
+    if (k == ir.E_DECAY || k == ir.E_ADDR) && o.u.nk(o.u.nodes[e].a) == ir.E_FUNC {
+        return o.u.nodes[o.u.nodes[e].a].a
+    }
+    return -1
+}
+
+fn (o: &Opt) constGlobAddr(e0: int): int {
+    var e = e0
+    while e >= 0 && o.u.nk(e) == ir.E_CAST { e = o.u.nodes[e].a }
+    if e < 0 { return -1 }
+    if o.u.nk(e) == ir.E_ADDR && o.u.nk(o.u.nodes[e].a) == ir.E_GLOBAL {
+        return o.u.nodes[o.u.nodes[e].a].a
+    }
+    return -1
+}
+
+fn (o: &Opt) isSimpleDropBody(x: int): bool {
+    if x < 0 { return true }
+    let n = o.u.nodes[x]
+    let k = n.k
+    if k == ir.E_CALL {
+        let cf = o.callee(x)
+        if cf < 0 || cf == o.dpushF || cf == o.drunF { return false }
+        // Only treat direct calls to runtime helpers (rt_free, rt_str_drop, etc.) or tiny bodies without pushes as simple.
+        if cf >= o.u.nRtFuncs { return false }
+        return o.isSimpleDropList(n.b)
+    }
+    let kc = ir.KIDS[k]
+    if kc <= 0 { return true }
+    if kc == ir.K_A { return o.isSimpleDropBody(n.a) }
+    if kc == ir.K_AB { return o.isSimpleDropBody(n.a) && o.isSimpleDropBody(n.b) }
+    if kc == ir.K_CALL { return o.isSimpleDropBody(n.a) && o.isSimpleDropList(n.b) }
+    if kc == ir.K_BLOCK { return o.isSimpleDropList(n.a) }
+    if kc == ir.K_ABC { return o.isSimpleDropBody(n.a) && o.isSimpleDropBody(n.b) && o.isSimpleDropBody(n.c) }
+    if kc == ir.K_DECL { return o.isSimpleDropBody(n.b) && o.isSimpleDropList(n.c) }
+    if kc == ir.K_CLIT { return o.isSimpleDropList(n.b) }
+    return o.isSimpleDropBody(n.a) && o.isSimpleDropBody(n.b) && o.isSimpleDropBody(n.c) && o.isSimpleDropBody(n.d)
+}
+
+fn (o: &Opt) isSimpleDropList(l: int): bool {
+    if l < 0 { return true }
+    for j in 0..o.u.items[l] {
+        if !o.isSimpleDropBody(o.u.items[l + 1 + j]) { return false }
+    }
+    return true
+}
+
+fn (o: &Opt) isVtableStruct(sid: int): bool {
+    if sid < o.u.nRtStructs { return false }
+    let st = &o.u.structs[sid]
+    if st.isUnion || len(st.fields) == 0 { return false }
+    if len(st.name) < 2 || strByte(&st.name, 0) != 'V' { return false }
+    for fld in st.fields {
+        if o.u.tk(fld.ty) != ir.TY_PTR || o.u.tk(o.u.tys[fld.ty].base) != ir.TY_FN { return false }
+    }
+    return true
+}
+
+fn (o: mut &Opt) initDevirt() {
+    for s in 0..o.u.nRtStructs {
+        if o.u.structs[s].name == "lxl_clo" { o.cloSid = s }
+    }
+    for f in o.u.nRtFuncs..len(o.u.funcs) {
+        if o.u.funcs[f].name == "rt_box_noop" { o.noopDropF = f }
+        if o.u.funcs[f].body >= 0 {
+            o.simpleDrop[f] = o.isSimpleDropBody(o.u.funcs[f].body)
+        }
+    }
+    // Track structs that have any non-const global, local variable, or compound literal (disqualifies Tier 2 CHA).
+    var badSid: Map[int, bool] = newMap()
+    for l in 0..len(o.u.locals) {
+        let lt = o.u.locals[l].ty
+        if o.u.tk(lt) == ir.TY_STRUCT { badSid.put(o.u.tys[lt].sid, true) }
+    }
+    for i in 0..len(o.u.nodes) {
+        let n = o.u.nodes[i]
+        if n.k == ir.E_CLIT && o.u.tk(n.ty) == ir.TY_STRUCT {
+            badSid.put(o.u.tys[n.ty].sid, true)
+        }
+    }
+    var bySid: Map[int, []int] = newMap()
+    for g in 0..len(o.u.globals) {
+        let gl = &o.u.globals[g]
+        if o.u.tk(gl.ty) != ir.TY_STRUCT { continue }
+        let sid = o.u.tys[gl.ty].sid
+        if !gl.isConst || gl.init < 0 {
+            badSid.put(sid, true)
+            continue
+        }
+        var anyFn = false
+        for j in 0..o.u.listLen(gl.init) {
+            let ei = o.u.listAt(gl.init, j)
+            let fnId = o.constFnOf(o.u.nodes[ei].a)
+            if fnId >= 0 {
+                o.vtMap.put((g << 12) | o.u.nodes[ei].v, fnId)
+                anyFn = true
+            }
+        }
+        if anyFn {
+            o.vtGlobSet.put(g, true)
+            if o.isVtableStruct(sid) {
+                var gs = bySid.getOr(&sid, [])
+                append(mut &gs, g)
+                bySid.put(sid, gs)
+            }
+        }
+    }
+    // Build Tier 2 monomorphic slot table for each clean vtable struct sid.
+    for sid in o.u.nRtStructs..len(o.u.structs) {
+        if badSid.has(&sid) || !bySid.has(&sid) { continue }
+        let gs = bySid.getOr(&sid, [])
+        if len(gs) == 0 { continue }
+        let fields = o.u.structs[sid].fields.clone()
+        for fld in fields {
+            let f0 = o.vtMap.getOr(&((gs[0] << 12) | fld.off), -1)
+            if f0 < 0 { continue }
+            var same = true
+            for k in 1..len(gs) {
+                if o.vtMap.getOr(&((gs[k] << 12) | fld.off), -1) != f0 {
+                    same = false
+                    break
+                }
+            }
+            if same { o.monoMap.put((sid << 12) | fld.off, f0) }
+        }
+    }
+}
+
+fn (o: &Opt) sigMatches(callN: int, fnId: int): bool {
+    if fnId < 0 || fnId >= len(o.u.funcs) { return false }
+    let fty = o.u.funcs[fnId].ty
+    let cty = o.u.nodes[callN].c
+    if fty == cty { return true }
+    let fps = o.u.fnParams(fty)
+    let cps = o.u.fnParams(cty)
+    if len(fps) != len(cps) { return false }
+    if o.u.tys[fty].base != o.u.tys[cty].base {
+        if !(o.u.tk(o.u.tys[fty].base) == ir.TY_PTR && o.u.tk(o.u.tys[cty].base) == ir.TY_PTR) { return false }
+    }
+    for i in 0..len(fps) {
+        if fps[i] != cps[i] {
+            if !(o.u.tk(fps[i]) == ir.TY_PTR && o.u.tk(cps[i]) == ir.TY_PTR) { return false }
+        }
+    }
+    return true
+}
+
+fn (o: mut &Opt) mkDecayFn(fnId: int, line: int): int {
+    let fty = o.u.funcs[fnId].ty
+    let fnN = o.prMk(ir.E_FUNC, fty, line, fnId, -1, -1, 0)
+    return o.prMk(ir.E_DECAY, o.u.ptrTo(fty), line, fnN, -1, -1, 0)
+}
+
+// Extract (vtExpr, byteOff) from `vtExpr->m_k` (E_MEMBER(E_DEREF(vtExpr), off)); returns -1 if not a vtable load.
+fn (o: &Opt) vtSlotLoad(e0: int, off: mut &int): int {
+    var e = e0
+    while e >= 0 && o.u.nk(e) == ir.E_CAST { e = o.u.nodes[e].a }
+    if e < 0 || o.u.nk(e) != ir.E_MEMBER { return -1 }
+    let base = o.u.nodes[e].a
+    if o.u.nk(base) != ir.E_DEREF { return -1 }
+    off = o.u.nodes[e].v
+    return o.u.nodes[base].a
+}
+
+// Tier 2: rewrite monomorphic vtable calls and drops across all functions before inlining.
+fn (o: mut &Opt) devirtMono() {
+    if o.monoMap.size() == 0 { return }
+    for f in o.u.nRtFuncs..len(o.u.funcs) {
+        let b = o.u.funcs[f].body
+        if b >= 0 { o.dvMonoWalk(b) }
+    }
+}
+
+fn (o: mut &Opt) dvMonoWalk(x: int) {
+    if x < 0 { return }
+    let n = o.u.nodes[x]
+    let k = n.k
+    // Check `rt_drun(dv.vt->drop, dv.data);` statement for direct/noop drop lowering.
+    if k == ir.S_EXPR && o.drunF >= 0 && o.u.nk(n.a) == ir.E_CALL && o.callee(n.a) == o.drunF &&
+            o.u.listLen(o.u.nodes[n.a].b) == 2 {
+        let callN = n.a
+        let fnArg = o.u.listAt(o.u.nodes[callN].b, 0)
+        var off = 0
+        let vtExpr = o.vtSlotLoad(fnArg, mut &off)
+        if vtExpr >= 0 && off == 0 {
+            let vty = o.u.nodes[vtExpr].ty
+            if o.u.tk(vty) == ir.TY_PTR && o.u.tk(o.u.tys[vty].base) == ir.TY_STRUCT {
+                let sid = o.u.tys[o.u.tys[vty].base].sid
+                let fnId = o.monoMap.getOr(&((sid << 12) | off), -1)
+                if fnId >= 0 {
+                    if fnId == o.noopDropF {
+                        o.u.nodes[x].k = ir.S_EMPTY
+                        o.u.nodes[x].a = -1
+                        o.dvDropN += 1
+                        return
+                    }
+                    let dataArg = o.u.listAt(o.u.nodes[callN].b, 1)
+                    if o.simpleDrop[fnId] {
+                        o.u.nodes[callN].a = o.mkDecayFn(fnId, o.u.nodes[callN].line)
+                        o.u.nodes[callN].b = o.u.list(&[dataArg])
+                        o.u.nodes[callN].c = o.u.funcs[fnId].ty
+                        o.dvDropN += 1
+                        o.dvMonoWalk(dataArg)
+                        return
+                    }
+                    let nl = o.u.list(&[o.mkDecayFn(fnId, o.u.nodes[fnArg].line), dataArg])
+                    o.u.nodes[callN].b = nl
+                    o.dvMonoN += 1
+                    o.dvMonoWalk(dataArg)
+                    return
+                }
+            }
+        }
+    }
+    if k == ir.E_CALL && o.callee(x) < 0 {
+        var off = 0
+        let vtExpr = o.vtSlotLoad(n.a, mut &off)
+        if vtExpr >= 0 {
+            let vty = o.u.nodes[vtExpr].ty
+            if o.u.tk(vty) == ir.TY_PTR && o.u.tk(o.u.tys[vty].base) == ir.TY_STRUCT {
+                let sid = o.u.tys[o.u.tys[vty].base].sid
+                let fnId = o.monoMap.getOr(&((sid << 12) | off), -1)
+                if fnId >= 0 && o.sigMatches(x, fnId) {
+                    o.u.nodes[x].a = o.mkDecayFn(fnId, n.line)
+                    o.u.nodes[x].c = o.u.funcs[fnId].ty
+                    o.dvMonoN += 1
+                }
+            }
+        }
+    }
+    let kc = ir.KIDS[k]
+    if kc <= 0 { return }
+    if kc == ir.K_A { o.dvMonoWalk(n.a); return }
+    if kc == ir.K_AB { o.dvMonoWalk(n.a); o.dvMonoWalk(n.b); return }
+    if kc == ir.K_CALL { o.dvMonoWalk(n.a); o.dvMonoList(n.b); return }
+    if kc == ir.K_BLOCK { o.dvMonoList(n.a); return }
+    if kc == ir.K_ABC { o.dvMonoWalk(n.a); o.dvMonoWalk(n.b); o.dvMonoWalk(n.c); return }
+    if kc == ir.K_DECL { o.dvMonoWalk(n.b); o.dvMonoList(n.c); return }
+    if kc == ir.K_CLIT { o.dvMonoList(n.b); return }
+    o.dvMonoWalk(n.a); o.dvMonoWalk(n.b); o.dvMonoWalk(n.c); o.dvMonoWalk(n.d)
+}
+
+fn (o: mut &Opt) dvMonoList(l: int) {
+    if l < 0 { return }
+    for j in 0..o.u.items[l] { o.dvMonoWalk(o.u.items[l + 1 + j]) }
+}
+
+// Tier 1: local fat-pointer & closure constant propagation inside function f (after inlining).
+type DvInfo = record {
+    decls: Map[int, int]
+    writes: Map[int, bool]
+    addrBad: Map[int, bool]
+    ptrTo: Map[int, int]
+    ptrBad: Map[int, bool]
+    initB: Map[int, int]
+    initC: Map[int, int]
+    locals: []int
+    vtGlob: Map[int, int]
+    cloFn: Map[int, int]
+    fnLocal: Map[int, int]
+}
+
+fn (o: &Opt) dvScan(x: int, inDeref: bool, st: mut &DvInfo) {
+    if x < 0 { return }
+    let n = o.u.nodes[x]
+    let k = n.k
+    if k == ir.E_LOCAL {
+        if !inDeref && st.ptrTo.has(&n.a) { st.ptrBad.put(n.a, true) }
+        return
+    }
+    if k == ir.S_DECL {
+        let l = n.a
+        let d = st.decls.getOr(&l, 0)
+        if d == 0 { append(mut &st.locals, l) }
+        st.decls.put(l, d + 1)
+        st.initB.put(l, n.b)
+        st.initC.put(l, n.c)
+        if n.b >= 0 && n.c < 0 && o.u.nk(n.b) == ir.E_ADDR && o.u.nk(o.u.nodes[n.b].a) == ir.E_LOCAL {
+            let src = o.u.nodes[o.u.nodes[n.b].a].a
+            if d == 0 { st.ptrTo.put(l, src) } else { st.ptrBad.put(l, true) }
+            return
+        }
+        o.dvScan(n.b, false, st)
+        o.dvScanList(n.c, st)
+        return
+    }
+    if k == ir.E_ASSIGN || k == ir.E_POSTINC {
+        let r = o.root(n.a)
+        if r >= 0 { st.writes.put(r, true) }
+        // Writing through *p invalidates the pointee of p.
+        var lhs = n.a
+        while o.u.nk(lhs) == ir.E_MEMBER { lhs = o.u.nodes[lhs].a }
+        if o.u.nk(lhs) == ir.E_DEREF && o.u.nk(o.u.nodes[lhs].a) == ir.E_LOCAL {
+            st.ptrBad.put(o.u.nodes[lhs].a, true)
+        }
+        o.dvScan(n.a, false, st)
+        if k == ir.E_ASSIGN { o.dvScan(n.b, false, st) }
+        return
+    }
+    if k == ir.E_ADDR || k == ir.E_DECAY {
+        let r = o.root(n.a)
+        if r >= 0 { st.addrBad.put(r, true) }
+        o.dvScan(n.a, false, st)
+        return
+    }
+    if k == ir.E_DEREF {
+        // `*p` read: allow `p` to stay clean; `*&x` also keeps `x` clean.
+        if o.u.nk(n.a) == ir.E_ADDR && o.u.nk(o.u.nodes[n.a].a) == ir.E_LOCAL { return }
+        o.dvScan(n.a, o.u.nk(n.a) == ir.E_LOCAL, st)
+        return
+    }
+    let kc = ir.KIDS[k]
+    if kc <= 0 { return }
+    if kc == ir.K_A { o.dvScan(n.a, false, st); return }
+    if kc == ir.K_AB { o.dvScan(n.a, false, st); o.dvScan(n.b, false, st); return }
+    if kc == ir.K_CALL { o.dvScan(n.a, false, st); o.dvScanList(n.b, st); return }
+    if kc == ir.K_BLOCK { o.dvScanList(n.a, st); return }
+    if kc == ir.K_ABC { o.dvScan(n.a, false, st); o.dvScan(n.b, false, st); o.dvScan(n.c, false, st); return }
+    if kc == ir.K_CLIT { o.dvScanList(n.b, st); return }
+    o.dvScan(n.a, false, st); o.dvScan(n.b, false, st); o.dvScan(n.c, false, st); o.dvScan(n.d, false, st)
+}
+
+fn (o: &Opt) dvScanList(l: int, st: mut &DvInfo) {
+    if l < 0 { return }
+    for j in 0..o.u.items[l] { o.dvScan(o.u.items[l + 1 + j], false, st) }
+}
+
+fn (o: &Opt) clitVtGlob(ents: int): int {
+    if ents < 0 { return -1 }
+    for j in 0..o.u.listLen(ents) {
+        let ei = o.u.listAt(ents, j)
+        if o.u.nodes[ei].v == 8 {
+            let g = o.constGlobAddr(o.u.nodes[ei].a)
+            if g >= 0 && o.vtGlobSet.has(&g) { return g }
+        }
+    }
+    return -1
+}
+
+fn (o: &Opt) clitCloFn(ents: int, st: &DvInfo): int {
+    if ents < 0 { return -1 }
+    for j in 0..o.u.listLen(ents) {
+        let ei = o.u.listAt(ents, j)
+        if o.u.nodes[ei].v == 0 {
+            let a = o.u.nodes[ei].a
+            let fnId = o.constFnOf(a)
+            if fnId >= 0 { return fnId }
+            var off = 0
+            let ve = o.vtSlotLoad(a, mut &off)
+            if ve >= 0 {
+                let vg = o.resolveVtExpr(ve, st)
+                if vg >= 0 {
+                    let vf = o.vtMap.getOr(&((vg << 12) | off), -1)
+                    if vf >= 0 { return vf }
+                }
+                let vty = o.u.nodes[ve].ty
+                if o.u.tk(vty) == ir.TY_PTR && o.u.tk(o.u.tys[vty].base) == ir.TY_STRUCT {
+                    let mf = o.monoMap.getOr(&((o.u.tys[o.u.tys[vty].base].sid << 12) | off), -1)
+                    if mf >= 0 { return mf }
+                }
+            }
+        }
+    }
+    return -1
+}
+
+fn (o: &Opt) resolveVtExpr(e0: int, st: &DvInfo): int {
+    var e = e0
+    while e >= 0 && o.u.nk(e) == ir.E_CAST { e = o.u.nodes[e].a }
+    if e < 0 { return -1 }
+    let g0 = o.constGlobAddr(e)
+    if g0 >= 0 && o.vtGlobSet.has(&g0) { return g0 }
+    if o.u.nk(e) == ir.E_LOCAL { return st.vtGlob.getOr(&o.u.nodes[e].a, -1) }
+    if o.u.nk(e) == ir.E_MEMBER && o.u.nodes[e].v == 8 {
+        let b = o.u.nodes[e].a
+        if o.u.nk(b) == ir.E_LOCAL { return st.vtGlob.getOr(&o.u.nodes[b].a, -1) }
+        if o.u.nk(b) == ir.E_CLIT { return o.clitVtGlob(o.u.nodes[b].b) }
+        if o.u.nk(b) == ir.E_DEREF {
+            let p = o.u.nodes[b].a
+            if o.u.nk(p) == ir.E_LOCAL && !st.ptrBad.has(&o.u.nodes[p].a) {
+                let src = st.ptrTo.getOr(&o.u.nodes[p].a, -1)
+                if src >= 0 { return st.vtGlob.getOr(&src, -1) }
+            }
+            if o.u.nk(p) == ir.E_ADDR && o.u.nk(o.u.nodes[p].a) == ir.E_LOCAL {
+                return st.vtGlob.getOr(&o.u.nodes[o.u.nodes[p].a].a, -1)
+            }
+        }
+    }
+    return -1
+}
+
+fn (o: &Opt) resolveCloFn(e0: int, st: &DvInfo): int {
+    var e = e0
+    while e >= 0 && o.u.nk(e) == ir.E_CAST { e = o.u.nodes[e].a }
+    if e < 0 || o.u.nk(e) != ir.E_MEMBER || o.u.nodes[e].v != 0 { return -1 }
+    let b = o.u.nodes[e].a
+    let bty = o.u.nodes[b].ty
+    if o.cloSid < 0 || o.u.tk(bty) != ir.TY_STRUCT || o.u.tys[bty].sid != o.cloSid { return -1 }
+    if o.u.nk(b) == ir.E_LOCAL { return st.cloFn.getOr(&o.u.nodes[b].a, -1) }
+    if o.u.nk(b) == ir.E_CLIT { return o.clitCloFn(o.u.nodes[b].b, st) }
+    return -1
+}
+
+fn (o: mut &Opt) devirtLocal(f: int): []int {
+    if o.vtMap.size() == 0 && o.cloSid < 0 { return [] }
+    let body = o.u.funcs[f].body
+    if body < 0 { return [] }
+    var st = DvInfo{
+        decls: newMap(), writes: newMap(), addrBad: newMap(), ptrTo: newMap(), ptrBad: newMap(),
+        initB: newMap(), initC: newMap(), locals: [], vtGlob: newMap(), cloFn: newMap(), fnLocal: newMap()
+    }
+    o.dvScan(body, false, mut &st)
+    // Any bad pointer disqualifies its target from being immutable.
+    for l in st.locals {
+        if st.ptrTo.has(&l) {
+            if st.decls.getOr(&l, 0) != 1 || st.writes.has(&l) || st.addrBad.has(&l) {
+                st.ptrBad.put(l, true)
+            }
+            if st.ptrBad.has(&l) {
+                st.addrBad.put(st.ptrTo.getOr(&l, -1), true)
+            }
+        }
+    }
+    // Propagate known vtable globals and closure fn pointers through single-def locals.
+    for _ in 0..4 {
+        var changed = false
+        for l in st.locals {
+            if st.decls.getOr(&l, 0) != 1 || st.writes.has(&l) || st.addrBad.has(&l) { continue }
+            let ib = st.initB.getOr(&l, -1)
+            let ic = st.initC.getOr(&l, -1)
+            let lty = o.u.locals[l].ty
+            if !st.vtGlob.has(&l) {
+                var g = -1
+                if ic >= 0 && o.u.tk(lty) == ir.TY_STRUCT {
+                    g = o.clitVtGlob(ic)
+                } else if ib >= 0 {
+                    if o.u.nk(ib) == ir.E_CLIT {
+                        g = o.clitVtGlob(o.u.nodes[ib].b)
+                    } else if o.u.nk(ib) == ir.E_LOCAL {
+                        g = st.vtGlob.getOr(&o.u.nodes[ib].a, -1)
+                    } else if o.u.nk(ib) == ir.E_DEREF && o.u.nk(o.u.nodes[ib].a) == ir.E_LOCAL && !st.ptrBad.has(&o.u.nodes[o.u.nodes[ib].a].a) {
+                        let src = st.ptrTo.getOr(&o.u.nodes[o.u.nodes[ib].a].a, -1)
+                        if src >= 0 { g = st.vtGlob.getOr(&src, -1) }
+                    } else if o.u.nk(ib) == ir.E_DEREF && o.u.nk(o.u.nodes[ib].a) == ir.E_ADDR && o.u.nk(o.u.nodes[o.u.nodes[ib].a].a) == ir.E_LOCAL {
+                        g = st.vtGlob.getOr(&o.u.nodes[o.u.nodes[o.u.nodes[ib].a].a].a, -1)
+                    } else {
+                        g = o.resolveVtExpr(ib, &st)
+                    }
+                }
+                if g >= 0 {
+                    st.vtGlob.put(l, g)
+                    changed = true
+                }
+            }
+            if !st.cloFn.has(&l) && o.cloSid >= 0 && o.u.tk(lty) == ir.TY_STRUCT && o.u.tys[lty].sid == o.cloSid {
+                var cf = -1
+                if ic >= 0 {
+                    cf = o.clitCloFn(ic, &st)
+                } else if ib >= 0 {
+                    if o.u.nk(ib) == ir.E_CLIT {
+                        cf = o.clitCloFn(o.u.nodes[ib].b, &st)
+                    } else if o.u.nk(ib) == ir.E_LOCAL {
+                        cf = st.cloFn.getOr(&o.u.nodes[ib].a, -1)
+                    }
+                }
+                if cf >= 0 {
+                    st.cloFn.put(l, cf)
+                    changed = true
+                }
+            }
+            if !st.fnLocal.has(&l) && ib >= 0 && ic < 0 && o.u.tk(lty) == ir.TY_PTR {
+                var ff = o.constFnOf(ib)
+                if ff < 0 {
+                    var off = 0
+                    let ve = o.vtSlotLoad(ib, mut &off)
+                    if ve >= 0 {
+                        let vg = o.resolveVtExpr(ve, &st)
+                        if vg >= 0 { ff = o.vtMap.getOr(&((vg << 12) | off), -1) }
+                        if ff < 0 {
+                            let vty = o.u.nodes[ve].ty
+                            if o.u.tk(vty) == ir.TY_PTR && o.u.tk(o.u.tys[vty].base) == ir.TY_STRUCT {
+                                ff = o.monoMap.getOr(&((o.u.tys[o.u.tys[vty].base].sid << 12) | off), -1)
+                            }
+                        }
+                    }
+                }
+                if ff < 0 { ff = o.resolveCloFn(ib, &st) }
+                if ff < 0 {
+                    var sr = ib
+                    while sr >= 0 && o.u.nk(sr) == ir.E_CAST { sr = o.u.nodes[sr].a }
+                    if sr >= 0 && o.u.nk(sr) == ir.E_LOCAL { ff = st.fnLocal.getOr(&o.u.nodes[sr].a, -1) }
+                }
+                if ff >= 0 {
+                    st.fnLocal.put(l, ff)
+                    changed = true
+                }
+            }
+        }
+        if !changed { break }
+    }
+    if st.vtGlob.size() == 0 && st.cloFn.size() == 0 && st.fnLocal.size() == 0 && o.monoMap.size() == 0 { return [] }
+    var found: []int = []
+    o.dvLocalWalk(body, &st, mut &found)
+    return found
+}
+
+fn (o: mut &Opt) dvLocalWalk(x: int, st: &DvInfo, found: mut &[]int) {
+    if x < 0 { return }
+    let n = o.u.nodes[x]
+    let k = n.k
+    // Check `rt_drun(dv.vt->drop, dv.data);` statement.
+    if k == ir.S_EXPR && o.drunF >= 0 && o.u.nk(n.a) == ir.E_CALL && o.callee(n.a) == o.drunF &&
+            o.u.listLen(o.u.nodes[n.a].b) == 2 {
+        let callN = n.a
+        let fnArg = o.u.listAt(o.u.nodes[callN].b, 0)
+        var off = 0
+        let vtExpr = o.vtSlotLoad(fnArg, mut &off)
+        var fnId = -1
+        if vtExpr >= 0 && off == 0 {
+            let g = o.resolveVtExpr(vtExpr, st)
+            if g >= 0 { fnId = o.vtMap.getOr(&((g << 12) | off), -1) }
+            if fnId < 0 {
+                let vty = o.u.nodes[vtExpr].ty
+                if o.u.tk(vty) == ir.TY_PTR && o.u.tk(o.u.tys[vty].base) == ir.TY_STRUCT {
+                    fnId = o.monoMap.getOr(&((o.u.tys[o.u.tys[vty].base].sid << 12) | off), -1)
+                }
+            }
+        } else {
+            fnId = o.constFnOf(fnArg)
+        }
+        if fnId >= 0 {
+            let dataArg = o.u.listAt(o.u.nodes[callN].b, 1)
+            if fnId == o.noopDropF {
+                o.unrefAll(x)
+                o.u.nodes[x].k = ir.S_EMPTY
+                o.u.nodes[x].a = -1
+                o.dvDropN += 1
+                return
+            }
+            if o.simpleDrop[fnId] {
+                o.unrefAll(o.u.nodes[callN].a)
+                o.unrefAll(fnArg)
+                o.u.nodes[callN].a = o.mkDecayFn(fnId, o.u.nodes[callN].line)
+                o.u.nodes[callN].b = o.u.list(&[dataArg])
+                o.u.nodes[callN].c = o.u.funcs[fnId].ty
+                o.refs[fnId] += 1
+                append(found, fnId)
+                o.dvDropN += 1
+                o.dvLocalWalk(dataArg, st, found)
+                return
+            }
+            if vtExpr >= 0 {
+                o.unrefAll(fnArg)
+                o.u.nodes[callN].b = o.u.list(&[o.mkDecayFn(fnId, o.u.nodes[fnArg].line), dataArg])
+                o.refs[fnId] += 1
+                append(found, fnId)
+                o.dvLocalN += 1
+                o.dvLocalWalk(dataArg, st, found)
+                return
+            }
+        }
+    }
+    if k == ir.E_CALL && o.callee(x) < 0 {
+        var off = 0
+        let vtExpr = o.vtSlotLoad(n.a, mut &off)
+        var fnId = -1
+        var isClo = false
+        if vtExpr >= 0 {
+            let g = o.resolveVtExpr(vtExpr, st)
+            if g >= 0 { fnId = o.vtMap.getOr(&((g << 12) | off), -1) }
+            if fnId < 0 {
+                let vty = o.u.nodes[vtExpr].ty
+                if o.u.tk(vty) == ir.TY_PTR && o.u.tk(o.u.tys[vty].base) == ir.TY_STRUCT {
+                    fnId = o.monoMap.getOr(&((o.u.tys[o.u.tys[vty].base].sid << 12) | off), -1)
+                }
+            }
+        } else {
+            fnId = o.resolveCloFn(n.a, st)
+            if fnId >= 0 {
+                isClo = true
+            } else {
+                var ce = n.a
+                while ce >= 0 && o.u.nk(ce) == ir.E_CAST { ce = o.u.nodes[ce].a }
+                if ce >= 0 && o.u.nk(ce) == ir.E_LOCAL {
+                    fnId = st.fnLocal.getOr(&o.u.nodes[ce].a, -1)
+                    if fnId >= 0 { isClo = true }
+                }
+            }
+        }
+        if fnId >= 0 && o.sigMatches(x, fnId) {
+            o.unrefAll(o.u.nodes[x].a)
+            o.u.nodes[x].a = o.mkDecayFn(fnId, n.line)
+            o.u.nodes[x].c = o.u.funcs[fnId].ty
+            o.refs[fnId] += 1
+            append(found, fnId)
+            if isClo { o.dvCloN += 1 } else { o.dvLocalN += 1 }
+        }
+    }
+    let kc = ir.KIDS[k]
+    if kc <= 0 { return }
+    if kc == ir.K_A { o.dvLocalWalk(n.a, st, found); return }
+    if kc == ir.K_AB { o.dvLocalWalk(n.a, st, found); o.dvLocalWalk(n.b, st, found); return }
+    if kc == ir.K_CALL { o.dvLocalWalk(n.a, st, found); o.dvLocalList(n.b, st, found); return }
+    if kc == ir.K_BLOCK { o.dvLocalList(n.a, st, found); return }
+    if kc == ir.K_ABC { o.dvLocalWalk(n.a, st, found); o.dvLocalWalk(n.b, st, found); o.dvLocalWalk(n.c, st, found); return }
+    if kc == ir.K_DECL { o.dvLocalWalk(n.b, st, found); o.dvLocalList(n.c, st, found); return }
+    if kc == ir.K_CLIT { o.dvLocalList(n.b, st, found); return }
+    o.dvLocalWalk(n.a, st, found); o.dvLocalWalk(n.b, st, found); o.dvLocalWalk(n.c, st, found); o.dvLocalWalk(n.d, st, found)
+}
+
+fn (o: mut &Opt) dvLocalList(l: int, st: &DvInfo, found: mut &[]int) {
+    if l < 0 { return }
+    for j in 0..o.u.items[l] { o.dvLocalWalk(o.u.items[l + 1 + j], st, found) }
 }

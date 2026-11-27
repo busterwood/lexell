@@ -90,6 +90,11 @@ type GDef = record {
     res: []int
 }
 
+type EnvStruct = record {
+    name: str
+    fieldTys: []str
+}
+
 // What cases() does with the fields of a record or variant (ref passes a function).
 const CM_PARTS = 0      // push: each part
 const CM_DIRECT = 1     // direct: drop each, last to first
@@ -101,6 +106,17 @@ pub type Emitter = record {
     nnames: int
     structs: []int
     fntypes: []FnType
+    dynIfaceNames: Map[int, str]
+    dynIfaces: []int
+    dynFnNames: Map[int, str]
+    dynFns: []int
+    fnBoxVts: Map[int, str]
+    envStructs: []EnvStruct
+    noopDrop: bool
+    vtables: Map[str, str]
+    boxFns: Map[str, str]
+    nvt: int
+    vtGlobs: []GDef
     insts: Map[str, str]
     ninsts: int
     work: []Inst
@@ -127,7 +143,10 @@ pub type Emitter = record {
 }
 
 pub fn newEmitter(c: ck.Checker): Emitter {
-    return Emitter{c: c, names: newMap(), nnames: 0, structs: [], fntypes: [], insts: newMapWith[str, str](fxHashStr), ninsts: 0, work: [],
+    return Emitter{c: c, names: newMap(), nnames: 0, structs: [], fntypes: [],
+        dynIfaceNames: newMap(), dynIfaces: [], dynFnNames: newMap(), dynFns: [], fnBoxVts: newMap(), envStructs: [], noopDrop: false,
+        vtables: newMapWith[str, str](fxHashStr), boxFns: newMapWith[str, str](fxHashStr), nvt: 0, vtGlobs: [],
+        insts: newMapWith[str, str](fxHashStr), ninsts: 0, work: [],
         glue: newMap(), nglue: 0, gluework: [], reachIdx: newMap(), reachSets: [], strs: newMapWith[str, str](fxHashStr), strKeys: [],
         fns: [], ress: [], podMemo: [], fsrc: newMapWith[str, str](fxHashStr), gsrc: newMapWith[str, str](fxHashStr),
         parMaps: newMapWith[str, bool](fxHashStr), parBounds: newMapWith[str, bool](fxHashStr), kglobals: newMapWith[str, bool](fxHashStr), kexterns: newMapWith[str, bool](fxHashStr),
@@ -151,6 +170,9 @@ fn (e: mut &Emitter) ctype(t: int): str {
     let k = e.tk(t)
     if k == sema.TK_PRIM { return ck.CTYPES[t].clone() }
     if k == sema.TK_ARR { return "lxl_arr" }
+    if e.c.pg.isBoxIface(t) { return "D" + e.dynIface(e.c.pg.ta(t)) }
+    if e.c.pg.isBoxFn(t) { return "DF" + e.dynFn(e.c.pg.ta(t)) }
+    if e.c.pg.isDynRef(t) { return "D" + e.dynIface(e.c.pg.ta(t)) }
     if k == sema.TK_REF {
         if !e.c.pg.tm(t) && e.c.pg.isRefByVal(e.c.pg.ta(t)) { return e.ctype(e.c.pg.ta(t)) }
         return e.ctype(e.c.pg.ta(t)) + "*"
@@ -176,6 +198,197 @@ fn (e: mut &Emitter) ctype(t: int): str {
     }
     let n = e.names.getOr(&t, "")
     return if k == sema.TK_FN || e.c.pg.types[e.c.pg.ta(t)].value { n } else { n + "*" }
+}
+
+// Register the fat-pointer struct D<n>_<I> and vtable struct V<n>_<I> for interface instance `iface`.
+// Returns the suffix "<n>_<cname>".
+fn (e: mut &Emitter) dynIface(iface: int): str {
+    let have = e.dynIfaceNames.getOr(&iface, "")
+    if len(have) > 0 { return have }
+    let s = intToStr(e.nnames) + "_" + e.c.pg.types[e.c.pg.ta(iface)].cname
+    e.nnames += 1
+    e.dynIfaceNames.put(iface, s.clone())
+    append(mut &e.dynIfaces, iface)
+    // Eagerly name all member parameter and return types so they are registered before lower().
+    let d = e.c.pg.ta(iface)
+    let env = e.c.pg.declEnv(iface)
+    let nm = len(e.c.pg.types[d].members)
+    for j in 0..nm {
+        let mb = e.c.pg.types[d].members[j].clone()
+        for p in mb.params { let _ = e.ctype(e.c.pg.subst(p, &env)) }
+        let _ = e.ctype(e.c.pg.subst(mb.ret, &env))
+    }
+    return s
+}
+
+// Emit (or reuse) the vtable global, drop action, and method thunks for concrete type `t` as interface `iface`.
+fn (e: mut &Emitter) vtableFor(t: int, iface: int): str {
+    let key = intToStr(t) + "," + intToStr(iface)
+    let have = e.vtables.getOr(&key, "")
+    if len(have) > 0 { return have }
+    let id = e.nvt
+    e.nvt += 1
+    let vtName = "vt" + intToStr(id)
+    e.vtables.put(key, vtName.clone())
+    let dn = e.dynIface(iface)
+    let ct = e.ctype(t)
+
+    // Drop action: void vtd_<id>(void* p) — drops *(C(T)*)p and frees the heap cell p.
+    let dropName = "vtd_" + intToStr(id)
+    var dbody: []int = []
+    if e.pod(t) {
+        append(mut &dbody, e.callS("rt_free", [e.nm("p")]))
+    } else if t == sema.T_STR {
+        append(mut &dbody, e.callS("rt_str_drop", [e.c.x.at(e.ct(&ct), e.nm("p"))]))
+        append(mut &dbody, e.callS("rt_free", [e.nm("p")]))
+    } else if e.tk(t) == sema.TK_BOX {
+        append(mut &dbody, e.c.x.decl(e.ct(&ct), "v", e.c.x.at(e.ct(&ct), e.nm("p"))))
+        append(mut &dbody, e.callS("rt_free", [e.nm("p")]))
+        append(mut &dbody, e.callS("rt_dpush", [e.c.x.arrow(e.c.x.dot(e.nm("v"), "vt"), "drop"), e.c.x.dot(e.nm("v"), "data")]))
+    } else if e.tk(t) == sema.TK_INST && !e.c.pg.types[e.c.pg.ta(t)].value {
+        // Boxed record or closed type: C(T) is S*, so p points to S*.
+        append(mut &dbody, e.c.x.decl(e.ct(&ct), "v", e.c.x.at(e.ct(&ct), e.nm("p"))))
+        append(mut &dbody, e.callS("rt_free", [e.nm("p")]))
+        if e.listed(t) {
+            let act = e.glueFn(G_ACT, t)
+            append(mut &dbody, e.callS("rt_dpush", [e.nm(&act), e.nm("v")]))
+        } else {
+            append(mut &dbody, e.c.x.sx(e.dropC(t, e.nm("v"))))
+        }
+    } else if e.listed(t) {
+        // Value record/closed/array on iterative drop stack: LIFO — push free first, then drop action.
+        let act = e.glueFn(G_ACT, t)
+        append(mut &dbody, e.callS("rt_dpush", [e.nm("rt_free_act"), e.nm("p")]))
+        append(mut &dbody, e.callS("rt_dpush", [e.nm(&act), e.nm("p")]))
+    } else {
+        append(mut &dbody, e.c.x.sx(e.dropC(t, e.c.x.at(e.ct(&ct), e.nm("p")))))
+        append(mut &dbody, e.callS("rt_free", [e.nm("p")]))
+    }
+    e.define(&dropName, "void", ["void*"], ["p"], dbody, -1)
+
+    // Method thunks: R vtm_<id>_<j>(void* p, P0 a0, ...)
+    var vtEntries: []int = [e.nm(&dropName)]
+    let d = e.c.pg.ta(iface)
+    let ienv = e.c.pg.declEnv(iface)
+    let nm = len(e.c.pg.types[d].members)
+    for j in 0..nm {
+        let mb = e.c.pg.types[d].members[j].clone()
+        let mName = "vtm_" + intToStr(id) + "_" + intToStr(j)
+        var ps: []str = ["void*"]
+        var pns: []str = ["p"]
+        var avs: []int = []
+        for k in 0..len(mb.params) {
+            append(mut &ps, e.ctype(e.c.pg.subst(mb.params[k], &ienv)))
+            let an = "a" + intToStr(k)
+            append(mut &pns, an.clone())
+            append(mut &avs, e.nm(&an))
+        }
+        let retTy = e.c.pg.subst(mb.ret, &ienv)
+        let rc = e.ctype(retTy)
+        var callExpr = -1
+        var body: []int = []
+        if e.c.pg.isBoxIface(t) || e.c.pg.isDynRef(t) {
+            let srcIface = e.c.pg.ta(t)
+            let sidx = e.c.pg.ifaceMemberIdx(srcIface, &mb.name)
+            append(mut &body, e.c.x.decl(e.ct(&ct), "v", e.c.x.at(e.ct(&ct), e.nm("p"))))
+            var all: []int = [e.c.x.dot(e.nm("v"), "data")]
+            for a in avs { append(mut &all, a) }
+            callExpr = e.c.x.callx(e.c.x.arrow(e.c.x.dot(e.nm("v"), "vt"), &("m_" + intToStr(sidx))), all)
+        } else {
+            let f = e.c.pg.methodOf(t, &mb.name)
+            if f < 0 && (mb.name == "eq" || mb.name == "hash" || mb.name == "toStr" || mb.name == "toData") && e.c.pg.derivable(t, &mb.name) {
+                let g = e.glueFn(deriveKind(&mb.name), t)
+                let recv = if e.c.pg.isRefByVal(t) { e.c.x.at(e.ct(&ct), e.nm("p")) } else { e.c.x.pcast(e.c.x.ptr(e.ct(&ct)), e.nm("p")) }
+                var all: []int = [recv]
+                for a in avs { append(mut &all, a) }
+                callExpr = e.call(&g, all)
+            } else {
+                var bind: []int = []
+                if f < 0 || !e.c.pg.unify(e.c.pg.fns[f].recvType, t, mut &bind, &e.c.pg.fns[f].tps) {
+                    sx.failText("internal error: vtable: " + e.c.pg.tstr(t) + " has no method " + mb.name)
+                }
+                var ta: []int = []
+                for tp in e.c.pg.fns[f].tps { append(mut &ta, envGet(&bind, tp)) }
+                let fname = e.instance(f, e.c.pg.mkFn(&ta, sema.T_VOID))
+                let rmode = e.c.pg.fns[f].recvMode
+                let recv = if rmode == sema.RM_VAL {
+                    e.dupC(t, e.c.x.at(e.ct(&ct), e.nm("p")))
+                } else if rmode == sema.RM_REF && e.c.pg.isRefByVal(t) {
+                    e.c.x.at(e.ct(&ct), e.nm("p"))
+                } else {
+                    e.c.x.pcast(e.c.x.ptr(e.ct(&ct)), e.nm("p"))
+                }
+                var all: []int = [recv]
+                for a in avs { append(mut &all, a) }
+                callExpr = e.call(&fname, all)
+            }
+        }
+        append(mut &body, if rc == "void" { e.c.x.sx(callExpr) } else { e.c.x.sret(callExpr) })
+        e.define(&mName, &rc, ps, pns, body, -1)
+        append(mut &vtEntries, e.nm(&mName))
+    }
+    append(mut &e.vtGlobs, GDef{name: vtName.clone(), ty: "V" + dn, n: -1, init: e.c.x.init(vtEntries), isConst: true, res: []})
+    return vtName
+}
+
+// Emit (or reuse) the boxing helper: D<dn> box_<k>(C(T) v) { C(T)* p = rt_alloc(sizeof(*p)); *p = v; return (D){p, &vt}; }
+fn (e: mut &Emitter) boxFnFor(t: int, iface: int): str {
+    let key = intToStr(t) + "," + intToStr(iface)
+    let have = e.boxFns.getOr(&key, "")
+    if len(have) > 0 { return have }
+    let vt = e.vtableFor(t, iface)
+    let dn = e.dynIface(iface)
+    let bid = e.nvt
+    e.nvt += 1
+    let fnName = "box_" + intToStr(bid)
+    e.boxFns.put(key, fnName.clone())
+    let ct = e.ctype(t)
+    let pTy = e.c.x.ptr(e.ct(&ct))
+    let pDecl = e.c.x.decl(pTy, "p", e.call("rt_alloc", [e.c.x.szof(e.c.x.pre("*", e.nm("p")))]))
+    let store = e.c.x.sx(e.c.x.asg(e.c.x.pre("*", e.nm("p")), e.nm("v")))
+    let ret = e.c.x.sret(e.c.x.clit(e.ct(&("D" + dn)), e.c.x.init([
+        e.c.x.cast(e.ct("void*"), e.nm("p")),
+        e.c.x.pcast(e.c.x.ptr(e.ct(&("V" + dn))), e.c.x.pre("&", e.nm(&vt)))
+    ])))
+    e.define(&fnName, &("D" + dn), [ct], ["v"], [pDecl, store, ret], -1)
+    return fnName
+}
+
+// Register the fat-pointer struct DF<n> and vtable struct VF<n> for escaping closure fn type `fnTy`.
+fn (e: mut &Emitter) dynFn(fnTy: int): str {
+    let have = e.dynFnNames.getOr(&fnTy, "")
+    if len(have) > 0 { return have }
+    let s = intToStr(e.nnames)
+    e.nnames += 1
+    e.dynFnNames.put(fnTy, s.clone())
+    append(mut &e.dynFns, fnTy)
+    for i in 0..e.c.pg.tn(fnTy) { let _ = e.ctype(e.c.pg.ti(fnTy, i)) }
+    let _ = e.ctype(e.c.pg.tb(fnTy))
+    return s
+}
+
+fn (e: mut &Emitter) ensureNoopDrop(): str {
+    if !e.noopDrop {
+        e.noopDrop = true
+        e.define("rt_box_noop", "void", ["void*"], ["p"], [e.c.x.sx(e.c.x.cast(e.ct("void"), e.nm("p")))], -1)
+    }
+    return "rt_box_noop"
+}
+
+// Vtable for coercing a plain function pointer fn(A): R to box fn(A): R (zero allocation).
+fn (e: mut &Emitter) fnBoxVtFor(fnTy: int): str {
+    let have = e.fnBoxVts.getOr(&fnTy, "")
+    if len(have) > 0 { return have }
+    let dn = e.dynFn(fnTy)
+    let id = e.nvt
+    e.nvt += 1
+    let vtName = "fvt" + intToStr(id)
+    e.fnBoxVts.put(fnTy, vtName.clone())
+    let noop = e.ensureNoopDrop()
+    let tramp = e.glueFn(G_TRAMP, fnTy)
+    append(mut &e.vtGlobs, GDef{name: vtName.clone(), ty: "VF" + dn, n: -1,
+        init: e.c.x.init([e.nm(&noop), e.nm(&tramp)]), isConst: true, res: []})
+    return vtName
 }
 
 fn (e: &Emitter) tooDeep(t: int): never {
@@ -1105,9 +1318,11 @@ fn (e: mut &Emitter) inReach(t: int, x: int): bool {
     return false
 }
 
-fn (e: mut &Emitter) chain(t: int): bool { return e.inReach(t, t) || e.inReach(t, DEEP) }
+fn (e: mut &Emitter) chain(t: int): bool { return e.tk(t) == sema.TK_BOX || e.inReach(t, t) || e.inReach(t, DEEP) }
 
-fn (e: &Emitter) hasDrop(t: int): bool { return e.tk(t) == sema.TK_INST && e.c.pg.types[e.c.pg.ta(t)].drop >= 0 }
+fn (e: &Emitter) hasDrop(t: int): bool {
+    return e.tk(t) == sema.TK_BOX || (e.tk(t) == sema.TK_INST && e.c.pg.types[e.c.pg.ta(t)].drop >= 0)
+}
 
 // Dropping t runs no drop method and does not nest without bound: it may run at any time.
 fn (e: mut &Emitter) quiet(t: int): bool {
@@ -1246,6 +1461,9 @@ fn (e: mut &Emitter) caseBody(mode: int, fts: &[]int, locs: &[]int, boxed: bool)
 // memory: a boxed value is pushed by pointer, a chain value type without a drop method by its
 // parts.
 fn (e: mut &Emitter) push(t: int, loc: int): Lines {
+    if e.tk(t) == sema.TK_BOX {
+        return Lines{ls: [e.callS("rt_dpush", [e.c.x.arrow(e.c.x.dot(loc, "vt"), "drop"), e.c.x.dot(loc, "data")])], refs: false}
+    }
     let inst = e.tk(t) == sema.TK_INST
     if inst && !e.c.pg.types[e.c.pg.ta(t)].value {
         let g = e.glueFn(G_ACT, t)
@@ -1491,6 +1709,17 @@ fn (e: mut &Emitter) makeGlue(kind: int, t: int) {
         e.define(&n, &rc, ps, pns, [st], -1)
         return
     }
+    if (kind == G_DROP || kind == G_ACT || kind == G_REST) && e.tk(t) == sema.TK_BOX {
+        if kind == G_DROP {
+            let st = e.callS("rt_drun", [e.c.x.arrow(e.c.x.dot(e.nm("v"), "vt"), "drop"), e.c.x.dot(e.nm("v"), "data")])
+            e.define(&n, "void", [ct], ["v"], [st], -1)
+        } else {
+            let vDecl = e.c.x.decl(e.ct(&ct), "v", e.c.x.at(e.ct(&ct), e.nm("p")))
+            let st = e.callS("rt_dpush", [e.c.x.arrow(e.c.x.dot(e.nm("v"), "vt"), "drop"), e.c.x.dot(e.nm("v"), "data")])
+            e.define(&n, "void", ["void*"], ["p"], [vDecl, st], -1)
+        }
+        return
+    }
     if (kind == G_DROP || kind == G_ACT || kind == G_REST) && e.c.pg.isRc(t) {
         // rc T (design/owned-str.md): one handle fewer; the last drops the value and frees the box
         let vt = e.c.pg.targs(t)[0]
@@ -1721,7 +1950,65 @@ fn (e: mut &Emitter) hole(i: int, holes: &[]ck.Hole, env: &[]int, name: &str, re
         let g = e.glueFn(G_TRAMP, e.c.pg.subst(h.t, env))
         return e.nm(&g)
     }
+    if k == ck.H_BOX {
+        let t0 = e.c.pg.subst(h.t, env)
+        let iface = e.c.pg.subst(h.r, env)
+        e.fill(h.x, holes, env, name, res)
+        let bf = e.boxFnFor(t0, iface)
+        return e.call(&bf, [h.x])
+    }
+    if k == ck.H_DYNSPILL {
+        let t0 = e.c.pg.subst(h.t, env)
+        e.fill(h.x, holes, env, name, res)
+        if e.c.pg.isRefByVal(t0) { return h.x }
+        let k0 = e.tk(t0)
+        let isStruct = k0 == sema.TK_ARR || k0 == sema.TK_SLICE || k0 == sema.TK_CLO || k0 == sema.TK_BOX ||
+            e.c.pg.isDynRef(t0) || (k0 == sema.TK_INST && e.c.pg.types[e.c.pg.ta(t0)].value)
+        if isStruct { return e.c.x.init([]) }
+        return e.c.x.lit(0)
+    }
+    if k == ck.H_DYNREF {
+        let t0 = e.c.pg.subst(h.t, env)
+        let iface = e.c.pg.subst(h.r, env)
+        e.fill(h.x, holes, env, name, res)
+        let vt = e.vtableFor(t0, iface)
+        let dn = e.dynIface(iface)
+        let dataPtr = if h.f == 1 && e.c.pg.isRefByVal(t0) { e.c.x.pre("&", e.nm(&h.s)) } else { h.x }
+        return e.c.x.par(e.c.x.clit(e.ct(&("D" + dn)), e.c.x.init([
+            e.c.x.cast(e.ct("void*"), dataPtr),
+            e.c.x.pcast(e.c.x.ptr(e.ct(&("V" + dn))), e.c.x.pre("&", e.nm(&vt)))
+        ])))
+    }
+    if k == ck.H_BOXCLO {
+        var args: []int = []
+        for a in h.args {
+            e.fill(a, holes, env, name, res)
+            append(mut &args, a)
+        }
+        return e.call(&("mkc_" + name + "_c" + intToStr(h.f)), args)
+    }
+    if k == ck.H_BOXFN {
+        let fnTy = e.c.pg.subst(h.t, env)
+        e.fill(h.x, holes, env, name, res)
+        let dn = e.dynFn(fnTy)
+        let vt = e.fnBoxVtFor(fnTy)
+        return e.c.x.par(e.c.x.clit(e.ct(&("DF" + dn)), e.c.x.init([
+            e.c.x.cast(e.ct("void*"), h.x),
+            e.c.x.pcast(e.c.x.ptr(e.ct(&("VF" + dn))), e.c.x.pre("&", e.nm(&vt)))
+        ])))
+    }
     let t = e.c.pg.subst(h.t, env)
+    if k == ck.H_IMETH && (e.c.pg.isBoxIface(t) || e.c.pg.isDynRef(t)) {
+        let iface = e.c.pg.ta(t)
+        let idx = e.c.pg.ifaceMemberIdx(iface, &h.s)
+        e.fill(h.r, holes, env, name, res)
+        var args: []int = [e.c.x.arrow(e.c.x.par(h.r), "data")]
+        for a in h.args {
+            e.fill(a, holes, env, name, res)
+            append(mut &args, a)
+        }
+        return e.c.x.callx(e.c.x.arrow(e.c.x.arrow(e.c.x.par(h.r), "vt"), &("m_" + intToStr(idx))), args)
+    }
     if k == ck.H_IMETH && e.c.pg.tk(t) == sema.TK_REF && !e.c.pg.tm(t) {
         // T is a shared borrow &U (sema.satisfies): U's method on the borrowed value. The receiver
         // and the &Self arguments are pointers to the borrow: one dereference gives the &U.
@@ -1883,17 +2170,101 @@ fn (e: mut &Emitter) makeInstance(f: int, targs: int) {
     for l in tm.lifted {        // its closures
         var cps: []str = ["void*"]
         var cns: []str = ["cv_"]
+        var subPtys: []int = []
         for j in 0..len(l.pnames) {
-            append(mut &cps, e.ctype(e.c.pg.subst(l.ptys[j], &env)))
+            let spt = e.c.pg.subst(l.ptys[j], &env)
+            append(mut &subPtys, spt)
+            append(mut &cps, e.ctype(spt))
             append(mut &cns, l.pnames[j].clone())
         }
-        let lrc = e.ctype(e.c.pg.subst(l.ret, &env))
+        let subRet = e.c.pg.subst(l.ret, &env)
+        let lrc = e.ctype(subRet)
         for x in l.lines { e.fill(x, &tm.holes, &env, &name, mut &res) }
-        // void** ce_ = cv_; (void)ce_;
-        var lines: []int = [e.c.x.decl(e.ct("void**"), "ce_", e.nm("cv_")), e.c.x.sx(e.c.x.cast(e.ct("void"), e.nm("ce_")))]
-        for x in l.lines { append(mut &lines, x) }
-        e.define(&(name + "_c" + intToStr(l.k)), &lrc, cps, cns, lines, ri)
-        e.fsrc.put(name + "_c" + intToStr(l.k), "the closure in " + label + " (" + file + ":" + intToStr(l.line) + ")")
+        let lname = name + "_c" + intToStr(l.k)
+        if l.escaping {
+            let fnTy = e.c.pg.mkFn(&subPtys, subRet)
+            let dn = e.dynFn(fnTy)
+            var subCaps: []int = []
+            var capCts: []str = []
+            for ct0 in l.capTys {
+                let sct = e.c.pg.subst(ct0, &env)
+                append(mut &subCaps, sct)
+                append(mut &capCts, e.ctype(sct))
+            }
+            var lines: []int = []
+            var dropFn = ""
+            let vtName = "cvt_" + lname
+            let mkName = "mkc_" + lname
+            if len(subCaps) == 0 {
+                append(mut &lines, e.c.x.sx(e.c.x.cast(e.ct("void"), e.nm("cv_"))))
+                for x in l.lines { append(mut &lines, x) }
+                dropFn = e.ensureNoopDrop()
+                let ret = e.c.x.sret(e.c.x.clit(e.ct(&("DF" + dn)), e.c.x.init([
+                    e.c.x.cast(e.ct("void*"), e.c.x.lit(0)),
+                    e.c.x.pcast(e.c.x.ptr(e.ct(&("VF" + dn))), e.c.x.pre("&", e.nm(&vtName)))
+                ])))
+                e.define(&mkName, &("DF" + dn), [], [], [ret], -1)
+            } else {
+                let envName = "CE_" + lname
+                append(mut &e.envStructs, EnvStruct{name: envName.clone(), fieldTys: capCts.clone()})
+                let envPtr = e.c.x.ptr(e.ct(&envName))
+                append(mut &lines, e.c.x.decl(envPtr, "ce_", e.nm("cv_")))
+                append(mut &lines, e.c.x.sx(e.c.x.cast(e.ct("void"), e.nm("ce_"))))
+                for x in l.lines { append(mut &lines, x) }
+                // Drop action for the heap environment struct.
+                dropFn = "ced_" + lname
+                var dbody: []int = [e.c.x.decl(e.c.x.ptr(e.ct(&envName)), "ce", e.nm("p"))]
+                var dops: []int = []
+                var anyRefs = false
+                var ci = len(subCaps) - 1
+                while ci >= 0 {
+                    let fty = subCaps[ci]
+                    if !e.pod(fty) {
+                        let loc = e.c.x.arrow(e.nm("ce"), &("c" + intToStr(ci)))
+                        if e.quiet(fty) {
+                            append(mut &dops, e.c.x.sx(e.dropC(fty, loc)))
+                        } else {
+                            let pl = e.push(fty, loc)
+                            if pl.refs { anyRefs = true }
+                            for s in pl.ls { append(mut &dops, s) }
+                        }
+                    }
+                    ci -= 1
+                }
+                if anyRefs {
+                    append(mut &dbody, e.callS("rt_dpush", [e.nm("rt_free_act"), e.nm("p")]))
+                    for s in dops { append(mut &dbody, s) }
+                } else {
+                    for s in dops { append(mut &dbody, s) }
+                    append(mut &dbody, e.callS("rt_free", [e.nm("p")]))
+                }
+                e.define(&dropFn, "void", ["void*"], ["p"], dbody, -1)
+                // Constructor: DF<dn> mkc_<lname>(C(T0) c0, ...)
+                var mkPns: []str = []
+                var mkBody: []int = [e.c.x.decl(e.c.x.ptr(e.ct(&envName)), "ce",
+                    e.call("rt_alloc", [e.c.x.szof(e.c.x.pre("*", e.nm("ce")))]))]
+                for ci2 in 0..len(subCaps) {
+                    let fnm = "c" + intToStr(ci2)
+                    append(mut &mkPns, fnm.clone())
+                    append(mut &mkBody, e.c.x.sx(e.c.x.asg(e.c.x.arrow(e.nm("ce"), &fnm), e.nm(&fnm))))
+                }
+                append(mut &mkBody, e.c.x.sret(e.c.x.clit(e.ct(&("DF" + dn)), e.c.x.init([
+                    e.c.x.cast(e.ct("void*"), e.nm("ce")),
+                    e.c.x.pcast(e.c.x.ptr(e.ct(&("VF" + dn))), e.c.x.pre("&", e.nm(&vtName)))
+                ]))))
+                e.define(&mkName, &("DF" + dn), capCts, mkPns, mkBody, -1)
+            }
+            append(mut &e.vtGlobs, GDef{name: vtName, ty: "VF" + dn, n: -1,
+                init: e.c.x.init([e.nm(&dropFn), e.nm(&lname)]), isConst: true, res: []})
+            e.define(&lname, &lrc, cps, cns, lines, ri)
+            e.fsrc.put(lname, "the closure in " + label + " (" + file + ":" + intToStr(l.line) + ")")
+        } else {
+            // void** ce_ = cv_; (void)ce_;
+            var lines: []int = [e.c.x.decl(e.ct("void**"), "ce_", e.nm("cv_")), e.c.x.sx(e.c.x.cast(e.ct("void"), e.nm("ce_")))]
+            for x in l.lines { append(mut &lines, x) }
+            e.define(&lname, &lrc, cps, cns, lines, ri)
+            e.fsrc.put(lname, "the closure in " + label + " (" + file + ":" + intToStr(l.line) + ")")
+        }
     }
     append(mut &e.ress, res)
     e.c.tmpls[f] = tm
@@ -2041,7 +2412,7 @@ pub fn (e: mut &Emitter) program(main: int, libs: mut &[]str): ir.Ir {
         }
     }
     var i = 0
-    while i < len(e.structs) {          // field types may name more types
+    while i < len(e.structs) {          // field types may name more types (including box I)
         e.nameFields(e.structs[i])
         i += 1
     }
@@ -2064,16 +2435,80 @@ fn (e: mut &Emitter) lower(entry: &str, externs: &[]Extern, globs: &[]GDef, gdro
     u.ir.fpath = replace(mut &e.fpath, newMapWith[str, str](fxHashStr))
     let structs = copyInts(&e.structs)
     for t in structs { u.newStruct(&(e.names.getOr(&t, "")), false) }
+    let dynIfs = copyInts(&e.dynIfaces)
+    for iface in dynIfs {
+        let dn = e.dynIfaceNames.getOr(&iface, "")
+        u.newStruct(&("V" + dn), false)
+        u.newStruct(&("D" + dn), false)
+    }
+    let dynFns = copyInts(&e.dynFns)
+    for fnTy in dynFns {
+        let dn = e.dynFnNames.getOr(&fnTy, "")
+        u.newStruct(&("VF" + dn), false)
+        u.newStruct(&("DF" + dn), false)
+    }
+    for es in e.envStructs {
+        u.newStruct(&es.name, false)
+    }
     for ft in e.fntypes {
         var pts: []int = []
         for p in ft.ptys { append(mut &pts, u.ctName(p.clone())) }
         let r = u.ctName(ft.ret.clone())
         u.typedef(&ft.name, u.ir.ptrTo(u.ir.fnType(r, &pts)))
     }
+    for iface in dynIfs {
+        let dn = e.dynIfaceNames.getOr(&iface, "")
+        let vTy = u.ctName("V" + dn)
+        let dTy = u.ctName("D" + dn)
+        let vp = u.ctName("void*")
+        var vfs: []ir.Field = [ir.Field{name: "drop", ty: u.ir.ptrTo(u.ir.fnType(ir.TY_VOID, &[vp])), off: 0}]
+        let d = e.c.pg.ta(iface)
+        let ienv = e.c.pg.declEnv(iface)
+        for j in 0..len(e.c.pg.types[d].members) {
+            let mb = e.c.pg.types[d].members[j].clone()
+            var mps: []int = [vp]
+            for p in mb.params {
+                let pc = e.ctype(e.c.pg.subst(p, &ienv))
+                append(mut &mps, u.ctName(pc))
+            }
+            let rc = e.ctype(e.c.pg.subst(mb.ret, &ienv))
+            let rIr = u.ctName(rc)
+            append(mut &vfs, ir.Field{name: "m_" + intToStr(j), ty: u.ir.ptrTo(u.ir.fnType(rIr, &mps)), off: 0})
+        }
+        u.layout(vTy, vfs)
+        u.layout(dTy, [ir.Field{name: "data", ty: vp, off: 0}, ir.Field{name: "vt", ty: u.ir.ptrTo(vTy), off: 0}])
+    }
+    for fnTy in dynFns {
+        let dn = e.dynFnNames.getOr(&fnTy, "")
+        let vTy = u.ctName("VF" + dn)
+        let dTy = u.ctName("DF" + dn)
+        let vp = u.ctName("void*")
+        var mps: []int = [vp]
+        for i in 0..e.c.pg.tn(fnTy) {
+            let pc = e.ctype(e.c.pg.ti(fnTy, i))
+            append(mut &mps, u.ctName(pc))
+        }
+        let rc = e.ctype(e.c.pg.tb(fnTy))
+        let rIr = u.ctName(rc)
+        let vfs: []ir.Field = [
+            ir.Field{name: "drop", ty: u.ir.ptrTo(u.ir.fnType(ir.TY_VOID, &[vp])), off: 0},
+            ir.Field{name: "call", ty: u.ir.ptrTo(u.ir.fnType(rIr, &mps)), off: 0}
+        ]
+        u.layout(vTy, vfs)
+        u.layout(dTy, [ir.Field{name: "data", ty: vp, off: 0}, ir.Field{name: "vt", ty: u.ir.ptrTo(vTy), off: 0}])
+    }
     var order: []int = []
     var done: Map[int, bool] = newMap()
     for t in structs { e.visitStruct(t, mut &done, mut &order) }
     for t in order { e.layout(mut &u, t) }
+    for es in e.envStructs {
+        let eTy = u.ctName(es.name.clone())
+        var efs: []ir.Field = []
+        for k in 0..len(es.fieldTys) {
+            append(mut &efs, ir.Field{name: "c" + intToStr(k), ty: u.ctName(es.fieldTys[k].clone()), off: 0})
+        }
+        u.layout(eTy, efs)
+    }
     u.x = replace(mut &e.c.x, tm.newArena())
     for b in e.strKeys {
         let n = e.strs.getOr(&b, "")
@@ -2106,6 +2541,10 @@ fn (e: mut &Emitter) lower(entry: &str, externs: &[]Extern, globs: &[]GDef, gdro
         let ty = u.ir.fnType(r, &pts)
         u.declFunc(f.name.clone(), ty, "", false)
         append(mut &ftys, ty)
+    }
+    for vg in e.vtGlobs {
+        u.res = []
+        u.global(&vg.name, u.ctName(vg.ty.clone()), vg.init, vg.isConst)
     }
     for j in 0..len(e.fns) {
         let ri = e.fns[j].res
