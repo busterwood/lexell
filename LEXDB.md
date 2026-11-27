@@ -141,14 +141,14 @@ On durable transactional writes, LexDB's lock-free `io_uring` event loop with gr
 
 ### 2. OLAP analytics and bulk loads
 
-With **no materialized views and no explicit skipping indexes**, LexDB's single-core vectorized columnar engine beats single-core PostgreSQL across every analytical suite and bulk load — and beats **4-process PostgreSQL on a single core** across TPC-H SF1, ClickBench 1M, and the 35-query analytic suite:
+With **no materialized views and no explicit skipping indexes**, LexDB's vectorized columnar engine — using pure `par.map` worker threads across the 4-core budget for large dense scans and aggregations while keeping small tables and wide low-density scans zero-overhead single-threaded — beats single-core and 4-process PostgreSQL across every analytical suite and bulk load:
 
-| OLAP & load workload | LexDB (1 core) | PostgreSQL 18 | Takeaway |
+| OLAP & load workload | LexDB | PostgreSQL 18 | Takeaway |
 |---|---:|---:|---|
-| **TPC-H SF1** (22 queries) | **5.59 s** | 14.67 s (1 core) / 8.84 s (4 proc) | **2.62× faster** than 1-core PG (faster on all 22/22, `q1` **809 ms** beating 4-proc PG); **1.58× faster** than 4-process PG overall |
-| **ClickBench 1M** (43 queries, 105 cols) | **6.99 s** | 22.08 s (1 core) / 11.40 s (4 proc) | **3.16× faster** than 1-core PG (**43/43** level or ahead; 0.33× geomean wall & CPU); **1.63× faster than 4-process PG on 1 core** (no MVs) |
-| **35 Analytic Queries** (1M rows) | **0.39× CPU / 0.78× wall** | 1 core / 4 proc | **2.59× less CPU** than 1-core PG (**35/35** ahead on wall & CPU); **1.28× faster** wall time than 4-process PG |
-| **Selective star-schema joins** (1M fact rows, 6 patterns) | **0.54–22.5 ms** | 0.21–77.0 ms (1 core) / 0.24–50.7 ms (4 proc) | **1.24–71.7× faster** via hash-join runtime filters; **7.68×** vs PG1 / **4.46×** vs PG4 (geomean) |
+| **TPC-H SF1** (22 queries, up to 4 cores via `par.map`) | **4.18 s** | 14.67 s (1 core) / 8.84 s (4 proc) | **3.51× faster** than 1-core PG (faster on all 22/22); **2.11× faster** than 4-process PG overall (`0.57×` geomean, 15/22 faster; `q1` **273 ms** — **3.20×** PG4) |
+| **ClickBench 1M** (43 queries, 105 cols, 1 core) | **6.75 s** | 22.08 s (1 core) / 11.40 s (4 proc) | **3.27× faster** than 1-core PG (**43/43** level or ahead; 0.31× geomean wall / 0.29× CPU); **1.69× faster than 4-process PG on 1 core** (no MVs) |
+| **35 Analytic Queries** (1M rows, 1 core) | **0.39× CPU / 0.78× wall** | 1 core / 4 proc | **2.59× less CPU** than 1-core PG (**35/35** ahead on wall & CPU); **1.28× faster** wall time than 4-process PG |
+| **Selective star-schema joins** (1M fact rows, 6 patterns, 1 core) | **0.54–22.5 ms** | 0.21–77.0 ms (1 core) / 0.24–50.7 ms (4 proc) | **1.24–71.7× faster** via hash-join runtime filters; **7.68×** vs PG1 / **4.46×** vs PG4 (geomean) |
 | **Bulk `\copy` loads** (5 cases, 1M–10M rows) | **0.24–2.44 s** | 0.61–5.93 s | **1.1–2.7× faster** on every workload (including wide tables + secondary indexes) |
 
 ### 3. Property graphs (SQL/PGQ)
@@ -163,7 +163,7 @@ Measured single-core / single-thread with 100% exact result parity across relati
 
 On the **11-query social-graph suite** (local traversals, triangles, and shortest paths), LexDB is the **fastest of all four engines** (`0.50 s` total — **1.92× faster than DuckPGQ**, **2.73× faster than Kùzu**, **11.3× faster than PG1**; `0.45 ms` warm / `0.71 ms` cold 5-hop shortest path, `227 ms` 1M-edge triangles; geomean **7.82×** vs PG1, **3.06×** vs DuckPGQ, **5.86×** vs Kùzu). On **LDBC LSQB** (pure full-graph analytical pattern counting), in-memory DuckDB 2.0 + DuckPGQ (with matching `PRIMARY KEY` / `FOREIGN KEY` constraints) leads overall, while LexDB is **#2 overall and #1 among disk-backed transactional & graph databases** (`7.30 s` at SF1 — within **1.58×** geomean of in-memory DuckPGQ), beating PostgreSQL 18 (**9.03×** geomean on completed queries), Kùzu (**4.40×** geomean, **14.4×** total), and Neo4j Community (**17.4×** geomean, **21.4×** total), and ranking **#1 fastest of all five engines** on both billion-match queries at SF1 (`Q6` `97.8 ms` — **5.81× faster than DuckPGQ**; `Q9` `1,396.9 ms` vs DuckPGQ's `1,408.5 ms`) as well as SF0.1 `Q6` (`10.1 ms` — **1.95× faster than DuckPGQ**). See **[Property graphs in LexDB](lexell/docs/lexdb/property-graphs.md)** for full query-by-query tables and methodology.
 
-**Where PostgreSQL is ahead today:** Multi-threaded reads against a single LexDB process (before adding replicas), multi-statement read-write transaction blocks under high concurrency, and individual heavy queries that benefit from PostgreSQL's 4-worker parallel query execution (LexDB runs each single statement on one core).
+**Where PostgreSQL is ahead today:** Multi-threaded reads against a single LexDB process (before adding replicas) and multi-statement read-write transaction blocks under high concurrency.
 
 ---
 
@@ -182,7 +182,7 @@ It also supports **cascading multi-level rollup DAGs** and **composable HyperLog
 
 | Benchmark (1M rows, single core) | Without MVs | With MVs (unmodified queries) | Live write cost |
 |---|---:|---:|---|
-| **ClickBench 1M** (43 queries, +8 general MVs) | 6.99 s | 21 of 43 queries transparently rewritten to **0.47–54.9 ms** (geomean `0.10×` PG1 / `0.21×` PG4 at `59797d55`) | 1 / 100 new rows updating all 8 MVs live: **6.51 / 10.34 ms** |
+| **ClickBench 1M** (43 queries, +8 general MVs) | 6.75 s | 21 of 43 queries transparently rewritten to **0.47–54.9 ms** (geomean `0.10×` PG1 / `0.21×` PG4 at `59797d55`) | 1 / 100 new rows updating all 8 MVs live: **6.51 / 10.34 ms** |
 | **35 Analytic Queries** (+4 general MVs) | geomean `0.48×` PG1 / `0.78×` PG4 | 9 aggregate & join queries drop from 8–74 ms to **3–4 ms** (geomean **`0.31×` PG1 / `0.49×` PG4**) | 1 / 100 / 1,000 new rows updating all 4 MVs live: **4.40 / 7.09 / 25.90 ms** vs PG `REFRESH` **758 / 264 ms** |
 | **Grouped / Sketch / 3-level DAG** | 23.7 ms grouped / 234.4 ms sketch | **0.18 ms** (132×) / **0.56 ms** (419×) / **0.07 ms** | 1-row `FAST` update: **0.43–0.66 ms** vs PG `REFRESH` **60–369 ms** (**90–780× faster**) |
 
