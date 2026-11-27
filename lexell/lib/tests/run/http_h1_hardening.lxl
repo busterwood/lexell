@@ -1,0 +1,320 @@
+// expect: redirect_bypass: ok=302 userinfo_port=500 userinfo=500 badport=500
+// expect: mem_budget: after_big_conns=503
+// expect: big_trailer: 200 len=5500
+// expect: leading_crlf_timeout: 408 fast=true
+// expect: forbidden_trailers: req_cl=400 req_te=400 req_host=400 resp_cl=500
+// expect: host_ports: p0=400 p65536=400 p99999=400 p65535=200
+// expect: client_chunk_ext: over_16k=protocol bad_ext=protocol framing_tr=protocol
+// expect: client_wire_val: dup_host=invalid bad_host=invalid dup_cl=invalid
+// expect: multipart_preamble: 200 val=real
+// expect: tls_handshake_cap: shed>=1 ok=200
+// Regression tests for HTTP/1.1 security, framing, memory-accounting, and DoS hardening.
+import "http"
+import "httpserver" as hs
+import "net"
+import "tls"
+import "task"
+import "time"
+import "strings"
+import "../support/tlstest" as pki
+
+type App = value record {}
+
+fn okH(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Unit, hs.Error] {
+    return w.text("ok")
+}
+
+fn bigH(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Unit, hs.Error] {
+    var s = ""
+    for i in 0..65536 { s.addByte('b') }
+    return w.text(&s)
+}
+
+fn redirH(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Unit, hs.Error] {
+    let to = rq.query("to").unwrapOr("")
+    return w.redirect(302, &to)
+}
+
+fn trailerEchoH(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Unit, hs.Error] {
+    let _b = try rq.text(65536)
+    let v = rq.trailers().get("X-Big").unwrapOr("")
+    return w.text(&("len=" + intToStr(len(v))))
+}
+
+fn badRespTrailerH(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Unit, hs.Error] {
+    w.trailer("Content-Length", "5")
+    try w.writeStr("hello")
+    return Ok(Unit{})
+}
+
+fn formH(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Unit, hs.Error] {
+    let f = try rq.form(65536)
+    return w.text(&("val=" + f.get("a").unwrapOr("")))
+}
+
+fn stopH(app: &App, rq: mut &hs.Request, w: mut &hs.Response): Result[Unit, hs.Error] {
+    rq.stopServer()
+    return w.text("bye")
+}
+
+type SrvJob = record {
+    ln: net.Listener
+    cfg: hs.Config
+}
+
+fn runSrv(j: SrvJob): int {
+    let SrvJob{ln: ln, cfg: cfg} = move(j)
+    var r = hs.router[App]()
+    r.handle("GET /ok", okH)
+    r.handle("GET /big", bigH)
+    r.handle("GET /redir", redirH)
+    r.handle("POST /tr", trailerEchoH)
+    r.handle("GET /badtr", badRespTrailerH)
+    r.handle("POST /form", formH)
+    r.handle("GET /stop", stopH)
+    let _s = hs.serve(ln, App{}, r, cfg).unwrap()
+    return 0
+}
+
+type TlsSrvJob = record {
+    ln: net.Listener
+    ctx: tls.Context
+    cfg: hs.Config
+}
+
+fn runTlsSrv(j: TlsSrvJob): hs.Stats {
+    let TlsSrvJob{ln: ln, ctx: ctx, cfg: cfg} = move(j)
+    var r = hs.router[App]()
+    r.handle("GET /ok", okH)
+    r.handle("GET /stop", stopH)
+    return hs.serveTls(ln, ctx, App{}, r, cfg).unwrap()
+}
+
+fn rawReq(addr: &str, payload: &str): str {
+    let c = net.dial(addr).unwrap()
+    let _w = c.writeStr(payload).unwrap()
+    var buf = array(4096, byte(0))
+    var out = ""
+    while true {
+        match c.read(mut &buf) {
+            Ok(k) {
+                if k == 0 { break }
+                out += strFromBytes(&buf[0..k])
+                if strings.contains(&out, "\r\n\r\n") && strings.contains(&out, "Connection: close") {
+                    // read rest of small response
+                }
+            }
+            Err(_) { break }
+        }
+    }
+    return out
+}
+
+fn statusOf(resp: &str): str {
+    if len(resp) < 12 { return "NONE" }
+    return resp[9..12].clone()
+}
+
+fn bodyOf(resp: &str): str {
+    let i = strings.indexOf(resp, "\r\n\r\n", 0)
+    if i < 0 { return "" }
+    return resp[i + 4..].clone()
+}
+
+// Scripted raw server for client chunked-extension / framing-trailer tests
+type ScriptJob = record {
+    ln: net.Listener
+    replies: []str
+}
+
+fn runScript(j: ScriptJob): int {
+    let ScriptJob{ln: ln, replies: replies} = move(j)
+    for rep in replies {
+        let c = ln.accept().unwrap()
+        var buf = array(2048, byte(0))
+        let _r = c.read(mut &buf)
+        let _w = c.writeStr(&rep)
+    }
+    return 0
+}
+
+fn repeatStr(s: &str, n: int): str {
+    var out = ""
+    for _ in 0..n { out += s }
+    return out
+}
+
+fn main() {
+    task.scope(fn(s: mut &task.Scope) {
+        // --- Main HTTP/1.1 test server ---
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        var cfg = hs.defaults()
+        cfg.signals = false
+        cfg.logFd = -1
+        cfg.headerTimeoutMs = 300
+        cfg.idleTimeoutMs = 5000
+        cfg.redirectHosts = ["allowed.example"]
+        let srv = s.start(runSrv, SrvJob{ln: ln, cfg: cfg})
+
+        // 1. Open-redirect bypass tests
+        let rOk = statusOf(&rawReq(&addr, "GET /redir?to=https%3A%2F%2Fallowed.example%2Fok HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+        let rU1 = statusOf(&rawReq(&addr, "GET /redir?to=https%3A%2F%2Fallowed.example%3A443%40evil.com%2Fp HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+        let rU2 = statusOf(&rawReq(&addr, "GET /redir?to=https%3A%2F%2Fallowed.example%40evil.com%2Fp HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+        let rBp = statusOf(&rawReq(&addr, "GET /redir?to=https%3A%2F%2Fallowed.example%3A99999%2Fp HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+        println("redirect_bypass: ok=" + rOk + " userinfo_port=" + rU1 + " userinfo=" + rU2 + " badport=" + rBp)
+
+        // 2. State.mem accounting: 10 big-buffer connections must NOT drift x.mem negative
+        let lnMem = net.listen("127.0.0.1:0").unwrap()
+        let addrMem = lnMem.localAddr()
+        var cfgMem = hs.defaults()
+        cfgMem.signals = false
+        cfgMem.logFd = -1
+        cfgMem.memBudget = 20000    // enough for 1 big-head conn (4.5K) or 2 idle, exceeded when 2 conns hold 25K+
+        let srvMem = s.start(runSrv, SrvJob{ln: lnMem, cfg: cfgMem})
+        let bigHdr = repeatStr("a", 6000)
+        for _ in 0..8 {
+            // Each connection grows rq.buf to 16 KiB and w.out to 64+ KiB, then closes
+            let _resp = rawReq(&addrMem, &("GET /big HTTP/1.1\r\nHost: x\r\nX-Pad: " + bigHdr + "\r\nConnection: close\r\n\r\n"))
+        }
+        // Now open 6 idle connections (6 * 4608 = 27648 > 20000 memBudget); if x.mem had drifted negative
+        // from the 8 closed big connections (-600 KiB!), this request would falsely return 200 instead of 503!
+        var holdConns: []net.Conn = []
+        for _ in 0..6 {
+            let hc = net.dial(&addrMem).unwrap()
+            let _wg = hc.writeStr("G").unwrap()
+            append(mut &holdConns, hc)
+        }
+        let _wSleep = task.sleep(50)
+        let memSt = statusOf(&rawReq(&addrMem, "GET /ok HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+        holdConns = []
+        let _wSleep2 = task.sleep(50)
+        let _stopMem = rawReq(&addrMem, "GET /stop HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        let _sm = srvMem.wait()
+        println("mem_budget: after_big_conns=" + memSt)
+
+        // 3. Chunked trailers > 4 KiB (5,500 bytes, under maxTrailerBytes=8192)
+        let trVal = repeatStr("t", 5500)
+        let bigTrResp = rawReq(&addr, &("POST /tr HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n5\r\nhello\r\n0\r\nX-Big: " + trVal + "\r\n\r\n"))
+        println("big_trailer: " + statusOf(&bigTrResp) + " " + bodyOf(&bigTrResp))
+
+        // 4. Leading CRLF arms headerTimeoutMs (300ms) instead of extending idleTimeoutMs (5000ms)
+        let t0 = time.monotonicNs()
+        var crlfSt = ""
+        {
+            let c = net.dial(&addr).unwrap()
+            let _w = c.writeStr("\r\n").unwrap()
+            var buf = array(1024, byte(0))
+            var out = ""
+            while true {
+                match c.read(mut &buf) {
+                    Ok(k) {
+                        if k == 0 { break }
+                        out += strFromBytes(&buf[0..k])
+                    }
+                    Err(_) { break }
+                }
+            }
+            crlfSt = statusOf(&out)
+        }
+        let crlfMs = (time.monotonicNs() - t0) / 1000000
+        println("leading_crlf_timeout: " + crlfSt + " fast=" + (if crlfMs < 2000 { "true" } else { "false" }))
+
+        // 5. Forbidden headers in request and response trailers
+        let reqCl = statusOf(&rawReq(&addr, "POST /tr HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\nContent-Length: 5\r\n\r\n"))
+        let reqTe = statusOf(&rawReq(&addr, "POST /tr HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\nTransfer-Encoding: chunked\r\n\r\n"))
+        let reqHost = statusOf(&rawReq(&addr, "POST /tr HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n0\r\nHost: evil.com\r\n\r\n"))
+        let respCl = statusOf(&rawReq(&addr, "GET /badtr HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"))
+        println("forbidden_trailers: req_cl=" + reqCl + " req_te=" + reqTe + " req_host=" + reqHost + " resp_cl=" + respCl)
+
+        // 6. Strict Host port range 1..65535
+        let p0 = statusOf(&rawReq(&addr, "GET /ok HTTP/1.1\r\nHost: example.com:0\r\nConnection: close\r\n\r\n"))
+        let p65536 = statusOf(&rawReq(&addr, "GET /ok HTTP/1.1\r\nHost: example.com:65536\r\nConnection: close\r\n\r\n"))
+        let p99999 = statusOf(&rawReq(&addr, "GET /ok HTTP/1.1\r\nHost: example.com:99999\r\nConnection: close\r\n\r\n"))
+        let p65535 = statusOf(&rawReq(&addr, "GET /ok HTTP/1.1\r\nHost: example.com:65535\r\nConnection: close\r\n\r\n"))
+        println("host_ports: p0=" + p0 + " p65536=" + p65536 + " p99999=" + p99999 + " p65535=" + p65535)
+
+        // 7. HTTP/1.1 client chunk-extension 16 KiB cap, strict ext syntax, and framing header in trailers
+        let lnSc = net.listen("127.0.0.1:0").unwrap()
+        let addrSc = lnSc.localAddr()
+        let rep1 = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n" +
+                   repeatStr(&("1;a=" + repeatStr("x", 3000) + "\r\nh\r\n"), 6) + "0\r\n\r\n"
+        let rep2 = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5;=bad\r\nhello\r\n0\r\n\r\n"
+        let rep3 = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nTransfer-Encoding: chunked\r\n\r\n"
+        let scSrv = s.start(runScript, ScriptJob{ln: lnSc, replies: [rep1, rep2, rep3]})
+        let cl = http.newClient(http.defaults())
+        let cUrl = "http://" + addrSc + "/"
+        let e1 = cl.get(&cUrl).unwrap().text().unwrapErr().kind.toStr()
+        let e2 = cl.get(&cUrl).unwrap().text().unwrapErr().kind.toStr()
+        let e3 = cl.get(&cUrl).unwrap().text().unwrapErr().kind.toStr()
+        let _sd = scSrv.wait()
+        println("client_chunk_ext: over_16k=" + e1 + " bad_ext=" + e2 + " framing_tr=" + e3)
+
+        // 8. Client wireOf validation (duplicate Host, bad Host, duplicate Content-Length)
+        var rq1 = http.request("GET", &("http://" + addr + "/ok"))
+        rq1.header("Host", "a.example")
+        rq1.header("Host", "b.example")
+        let w1 = cl.send(&rq1).unwrapErr().kind
+        var rq2 = http.request("GET", &("http://" + addr + "/ok"))
+        rq2.header("Host", "user@evil.example")
+        let w2 = cl.send(&rq2).unwrapErr().kind
+        var rq3 = http.request("POST", &("http://" + addr + "/ok"))
+        rq3.body = "hi"
+        rq3.header("Content-Length", "2")
+        rq3.header("Content-Length", "2")
+        let w3 = cl.send(&rq3).unwrapErr().kind
+        let kName = fn(k: http.Kind): str { return if k == http.Kind.Invalid { "invalid" } else { k.toStr() } }
+        println("client_wire_val: dup_host=" + kName(w1) + " bad_host=" + kName(w2) + " dup_cl=" + kName(w3))
+
+        // 9. Multipart preamble containing mid-line --boundary must NOT falsely start a part
+        let mp = "preamble with inline--XyZ ignored\r\n--XyZ\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nreal\r\n--XyZ--\r\n"
+        let mpResp = rawReq(&addr, &("POST /form HTTP/1.1\r\nHost: x\r\nContent-Type: multipart/form-data; boundary=XyZ\r\nContent-Length: " +
+                                     intToStr(len(mp)) + "\r\nConnection: close\r\n\r\n" + mp))
+        println("multipart_preamble: " + statusOf(&mpResp) + " " + bodyOf(&mpResp))
+
+        // Stop main H1 server
+        let _stop1 = rawReq(&addr, "GET /stop HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        let _s1 = srv.wait()
+
+        // 10. TLS handshake concurrency cap (Config.maxHandshakes = 1)
+        pki.pki()
+        var sOpt = tls.defaults()
+        sOpt.certFile = pki.path("srv.pem")
+        sOpt.keyFile = pki.path("srv.key")
+        sOpt.alpn = "http/1.1"
+        let sCtx = tls.server(sOpt).unwrap()
+        let lnTls = net.listen("127.0.0.1:0").unwrap()
+        let addrTls = lnTls.localAddr()
+        var cfgTls = hs.defaults()
+        cfgTls.signals = false
+        cfgTls.logFd = -1
+        cfgTls.headerTimeoutMs = 500
+        cfgTls.maxHandshakes = 1
+        let tlsSrv = s.start(runTlsSrv, TlsSrvJob{ln: lnTls, ctx: sCtx, cfg: cfgTls})
+
+        // Hold 1 active handshake + 4 queued (maxHandshakes*4) + 3 excess that must be shed immediately
+        var stalled: []net.Conn = []
+        for _ in 0..8 {
+            append(mut &stalled, net.dial(&addrTls).unwrap())
+        }
+        let _ws = task.sleep(80)
+        // Release all stalled handshakes
+        stalled = []
+        let _ws2 = task.sleep(50)
+
+        var cOpt = http.defaults()
+        cOpt.http2 = false
+        var to = pki.clientOptions()
+        to.alpn = "http/1.1"
+        cOpt.tls = to
+        let tlsCl = http.newClient(cOpt)
+        let port = strings.cut(&addrTls, ":").unwrap().after.clone()
+        let okTls = tlsCl.get(&("https://localhost:" + port + "/ok")).unwrap()
+        let okTlsSt = okTls.status
+        let _okBody = okTls.text().unwrap()
+        let _stopTls = tlsCl.get(&("https://localhost:" + port + "/stop")).unwrap().text().unwrap()
+        let tlsStats = tlsSrv.wait().unwrap()
+        println("tls_handshake_cap: shed>=1" + (if tlsStats.shed >= 1 { "" } else { " FAIL(" + intToStr(tlsStats.shed) + ")" }) +
+                " ok=" + intToStr(okTlsSt))
+    })
+}
