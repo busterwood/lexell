@@ -5863,6 +5863,15 @@ pub type PushFrame = record { pub batch: int; pub seg: int; pub off: int; pub da
 const PUSH_KEEP = 16 * 1024 * 1024
 
 fn (db: mut &Db) keepFrame(f: PushFrame) {
+    if len(f.data) > PUSH_KEEP {
+        // Bulk-load frame larger than the push buffer: do not pin it in RAM;
+        // clear older kept frames so replicas fall back to the WAL segment file.
+        for i in db.recentAt..len(db.recent) { db.recent[i].data = [] }
+        db.recent = []
+        db.recentAt = 0
+        db.recentBytes = 0
+        return
+    }
     db.recentBytes += len(f.data)
     append(mut &db.recent, f)
     while db.recentBytes > PUSH_KEEP && db.recentAt < len(db.recent) - 1 {
@@ -8918,7 +8927,7 @@ fn versionAt(d: &Delta, i: int, batch: int, out: mut &[]str): int {
 // above k on the way (the leaf holds no key >= it).
 type Step = record { leaf: int; need: int; upper: str; hasUpper: bool }
 
-fn (f: mut &Fol) descend(root: int, k: &str): Step {
+fn (f: mut &Fol) descend(root: int, k: &str, wantUpper: bool): Step {
     var st = Step{leaf: -1, need: -1, upper: "", hasUpper: false}
     var p = root
     while true {
@@ -8930,7 +8939,7 @@ fn (f: mut &Fol) descend(root: int, k: &str): Step {
                     return st
                 }
                 let c = childIndex(&f.pool[i].keys, k)
-                if c < len(f.pool[i].keys) {
+                if wantUpper && c < len(f.pool[i].keys) {
                     st.upper = f.pool[i].keys[c].toStr()
                     st.hasUpper = true
                 }
@@ -8954,7 +8963,7 @@ fn (fo: &Follower) baseGet(bi: int, tree: int, key: &str): Result[Option[str], l
         fo.sh.with(fn(f: mut &Fol) {
             match f.bases[bi].roots.get(&tree) {
                 Some(root) {
-                    let st = f.descend(root, key)
+                    let st = f.descend(root, key, false)
                     if st.need >= 0 {
                         need = st.need
                         return
@@ -8989,7 +8998,7 @@ fn (fo: &Follower) baseScan(bi: int, tree: int, from: &str, to: &str, f: &fn(&En
         fo.sh.with(fn(fl: mut &Fol) {
             match fl.bases[bi].roots.get(&tree) {
                 Some(root) {
-                    let st = fl.descend(root, &cursor)
+                    let st = fl.descend(root, &cursor, true)
                     if st.need >= 0 {
                         need = st.need
                         return
@@ -9051,20 +9060,51 @@ pub fn (fo: &Follower) get(s: &FSnap, tree: int, key: &str): Result[Option[str],
     var bi = -1
     var live = false
     var kind = 0
+    var need = -1
     var vs: []str = []
     fo.sh.with(fn(f: mut &Fol) {
         bi = f.baseOf(s.ckpt)
         if bi < 0 { return }
         live = f.live(s, tree, bi)
-        if live { kind = f.version(tree, key, s.batch, mut &vs) }
+        if !live { return }
+        kind = f.version(tree, key, s.batch, mut &vs)
+        if kind != 0 { return }
+        match f.bases[bi].roots.get(&tree) {
+            Some(root) {
+                let st = f.descend(root, key, false)
+                if st.need >= 0 {
+                    need = st.need
+                    return
+                }
+                let n = &f.pool[st.leaf]
+                let i = n.lower(key)
+                if i < n.count() && n.keyView(i) == key {
+                    append(mut &vs, n.val(i))
+                    kind = 3
+                }
+            }
+            None {}
+        }
     })
     if bi < 0 { return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "follower: the snapshot has ended")) }
     if !live || kind == 2 { return Ok(None) }
     if kind == 1 { return Ok(Some(pop(mut &vs))) }
-    match try fo.baseGet(bi, tree, key) {
-        Some(v) { return Ok(Some(try fo.unstore(bi, tree, key, &v))) }
-        None { return Ok(None) }
+    if kind == 3 {
+        let v = pop(mut &vs)
+        if !marked(&v) { return Ok(Some(v)) }
+        return Ok(Some(try fo.unstore(bi, tree, key, &v)))
     }
+    if need >= 0 {
+        try fo.load(need)
+        match try fo.baseGet(bi, tree, key) {
+            Some(v) {
+                if !marked(&v) { return Ok(Some(v)) }
+                return Ok(Some(try fo.unstore(bi, tree, key, &v)))
+            }
+            None { return Ok(None) }
+        }
+    }
+    return Ok(None)
 }
 
 // The entries of tree with keys in [from, to) (to "": to the end) as of
@@ -9185,7 +9225,7 @@ pub fn (fo: &Follower) scanLeaves(s: &FSnap, tree: int, from: &str, to: &str,
         fo.sh.with(fn(fl: mut &Fol) {
             match fl.bases[bi].roots.get(&tree) {
                 Some(root) {
-                    let st = fl.descend(root, &cursor)
+                    let st = fl.descend(root, &cursor, true)
                     if st.need >= 0 {
                         need = st.need
                         return

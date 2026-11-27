@@ -679,7 +679,7 @@ fn encodeOne(rows: &[]&str, spec: &Spec): Option[str] {
 // a text where a date is now, an integer too wide) makes the leaf a C_ANY
 // column of its rows (encodeAny), not a leaf of rows.
 
-const LONG = 256        // lexdb_exec LONG: a text this long or longer makes its row tagged
+const FIXED_MAX = 1280  // lexdb_rows.FIXED_MAX: max total bytes for a FIXED row (fits inside MAX_ENTRY=1350)
 
 // The class of a value read for conversion (by place): K_NONE NULL, K_INT
 // any integer, else the kind of place it may go to; its word, or its bytes
@@ -725,16 +725,25 @@ fn readPlace(s: &str, kinds: &[]byte, lay: &Lay, p: int, vs: mut &Vals, q: int, 
     return true
 }
 
-// The values of tagged row s (not long) into vs: how many it has; -1 when
-// one is not convertible (a long text's, an interval, a tag not known) or
-// the row has more than np. asText: a numeric's text left where it is
-// (its span), not made binary.
+// The values of tagged row s (plain tagged or format 6 with tag-5 tail) into vs:
+// how many it has; -1 when one is not convertible (an interval, a tag not known,
+// truncated tail) or the row has more than np. asText: a numeric's text left where
+// it is (its span), not made binary.
 fn readTagged(s: &str, np: int, vs: mut &Vals, asText: bool): int {
+    let n = len(s)
     var at = 0
     var p = 0
-    let n = len(s)
-    while at < n {
-        if p >= np { return -1 }
+    var longCols = -1
+    var tailPs: []int = []
+    var tailLens: []int = []
+    if n > 0 && s[0] == 6 {
+        if n < 5 { return -1 }
+        longCols = binary.readU32LEStr(s, 1)
+        if longCols < 0 || longCols > np { return -1 }
+        at = 5
+    }
+    while if longCols >= 0 { p < longCols } else { at < n } {
+        if at >= n || p >= np { return -1 }
         let tag = int(s[at])
         at += 1
         vs.own[p] = false
@@ -776,6 +785,14 @@ fn readTagged(s: &str, np: int, vs: mut &Vals, asText: bool): int {
                 vs.cls[p] = if tag == 3 { K_NUM } else if tag == 4 { K_TEXT } else { K_BYTEA }
             }
             at += l
+        } else if tag == 5 && longCols >= 0 {
+            if at + 4 > n { return -1 }
+            let l = binary.readU32LEStr(s, at)
+            at += 4
+            if l < 0 { return -1 }
+            append(mut &tailPs, p)
+            append(mut &tailLens, l)
+            vs.cls[p] = K_TEXT
         } else if tag == 12 {
             if at + 16 > n { return -1 }
             vs.sa[p] = at
@@ -783,9 +800,20 @@ fn readTagged(s: &str, np: int, vs: mut &Vals, asText: bool): int {
             at += 16
             vs.cls[p] = K_UUID
         } else {
-            return -1               // 5 a long text's place, 11 an interval, or not a tag
+            return -1               // 11 an interval, 16 tsz, or not a tag
         }
         p += 1
+    }
+    if longCols >= 0 {
+        for ti in 0..len(tailPs) {
+            let l = tailLens[ti]
+            if at + l > n { return -1 }
+            let tp = tailPs[ti]
+            vs.sa[tp] = at
+            vs.sb[tp] = at + l
+            at += l
+        }
+        if at != n { return -1 }
     }
     return p
 }
@@ -814,7 +842,7 @@ pub fn convertRows(rows: &[]&str, spec: &Spec): Option[[]str] {
     var out: []str = withCapacity(len(rows))
     for r in 0..len(rows) {
         let s = rows[r]
-        if len(s) == 0 || s[0] == 6 { return None }
+        if len(s) == 0 || s[0] == 0xFF { return None }
         var got = 0                 // the places the row has
         if s[0] == FIXED {
             if len(s) < 3 { return None }
@@ -870,11 +898,10 @@ fn placeRow(s: &str, tk: &[]byte, tl: &Lay, lid: int, vs: &Vals): Option[str] {
         if isVar(k) {
             if c != k { return None }
             let l = if vs.own[p] { len(vs.made[p]) } else { vs.sb[p] - vs.sa[p] }
-            if l >= LONG { return None }
             total += l
         }
     }
-    if total > 65535 { return None }
+    if total > 65535 || tl.v0 + total > FIXED_MAX { return None }
     var b: []byte = array(tl.v0 + total, byte(0))
     b[0] = FIXED
     b[1] = byte(lid & 255)

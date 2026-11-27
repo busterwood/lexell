@@ -437,6 +437,7 @@ pub type BNode = closed {
     // - length(textCol) / char_length(textCol) (ClickBench q28)
     // - regexp_replace(textCol, const_pat, const_repl [, const_flags]) (ClickBench q28)
     TsPart(int, int)            // col, part (0 = minute, 1 = hour)
+    TsTrunc(int, int)           // col, unitUs (1, 1000, SEC_US, 60*SEC_US, 3600*SEC_US, DAY_US)
     CondText(BNode, int, str)   // cond, textCol, elseLit
     StrLen(int)                 // textCol -> UTF-8 character length (with C_DICT word dedup)
     ReReplace(int, lexdb_lib.ReCompiled, str) // textCol, compiled regex, replacement string
@@ -1231,6 +1232,27 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
             }
             return Ok(out)
         }
+        BNode.TsTrunc(col, unitUs) {
+            var out = lexdb_rows.bvec(m)
+            for j in 0..m {
+                let r = idx[j]
+                if b.cols[col].nul[r] {
+                    out.nul[j] = true
+                    continue
+                }
+                match &b.vals[col][r] {
+                    Val.Ts(us) {
+                        if us == lexdb_time.INF || us == lexdb_time.NINF || unitUs == 1 {
+                            out.v[j] = us
+                        } else {
+                            out.v[j] = us - lexdb_time.floorMod(us, unitUs)
+                        }
+                    }
+                    else { return Err(batErr()) }
+                }
+            }
+            return Ok(out)
+        }
         BNode.CondText(cond, _, _) {
             return bEval(&cond, b, idx)
         }
@@ -1451,18 +1473,40 @@ pub fn bTrue(n: &BNode, b: &Batch, idx: &[]int): Result[[]int, DbErr] {
 // of the columns the others read (and extra's, a bar's: -1 none); then
 // the rest. Off when nothing is read first, or nothing after.
 pub fn lazyOf(bp: &BPlan, t: &lexdb_catalog.Table, conds: &[]BNode, extra: int): Lazy {
+    let empty: []bool = []
+    return lazyOfAfter(bp, t, conds, extra, &empty)
+}
+
+// Like lazyOf, except when after is non-empty (indexed by table column) any place
+// whose column is neither needed by remaining WHERE conditions nor marked in after
+// is omitted from rest/restK (e.g. a LIKE/NOT LIKE column never read after WHERE).
+fn lazyOfAfter(bp: &BPlan, t: &lexdb_catalog.Table, conds: &[]BNode, extra: int, after: &[]bool): Lazy {
     let nc = len(bp.kinds)
+    let hasAfter = len(after) == nc
     var used: []bool = array(nc, false)
     var likeOn: []int = array(len(conds), -1)
+    var likeNeg: []bool = array(len(conds), false)
     for ci in 0..len(conds) {
         match conds[ci] {
             BNode.Like(c, lp) { if lp.simple { likeOn[ci] = c } }
+            BNode.Not(inner) {
+                match inner {
+                    BNode.Like(c, lp) {
+                        if lp.simple {
+                            likeOn[ci] = c
+                            likeNeg[ci] = true
+                        }
+                    }
+                    else {}
+                }
+            }
             else {}
         }
         if likeOn[ci] < 0 { bColsOf(&conds[ci], mut &used) }
     }
     var raw: []int = []
     var rawPl: []int = []
+    var rawNeg: []bool = []
     var pieces: [][]str = []
     var skip: []bool = array(len(conds), false)
     for ci in 0..len(conds) {
@@ -1471,11 +1515,22 @@ pub fn lazyOf(bp: &BPlan, t: &lexdb_catalog.Table, conds: &[]BNode, extra: int):
         if used[c] { continue }
         append(mut &raw, ci)
         append(mut &rawPl, if len(t.slots) == 0 { c } else { t.slots[c] })
+        append(mut &rawNeg, likeNeg[ci])
         match conds[ci] {
             BNode.Like(_, lp) {
                 var ps: []str = []
                 for x in lp.pieces { append(mut &ps, x.clone()) }
                 append(mut &pieces, ps)
+            }
+            BNode.Not(inner) {
+                match inner {
+                    BNode.Like(_, lp) {
+                        var ps: []str = []
+                        for x in lp.pieces { append(mut &ps, x.clone()) }
+                        append(mut &pieces, ps)
+                    }
+                    else { append(mut &pieces, []) }
+                }
             }
             else { append(mut &pieces, []) }
         }
@@ -1488,7 +1543,8 @@ pub fn lazyOf(bp: &BPlan, t: &lexdb_catalog.Table, conds: &[]BNode, extra: int):
     var rest: []int = []
     for pl in bp.usedP {
         let c = bp.placeCol[pl]
-        if used[c] { append(mut &first, pl) } else { append(mut &rest, pl) }
+        if used[c] { append(mut &first, pl) }
+        else if !hasAfter || after[c] { append(mut &rest, pl) }
     }
     var firstAndRaw = collections.copyOf(&first)
     for pl in rawPl { append(mut &firstAndRaw, pl) }
@@ -1516,11 +1572,13 @@ pub fn lazyOf(bp: &BPlan, t: &lexdb_catalog.Table, conds: &[]BNode, extra: int):
     var firstK: []int = []
     var restK: []int = []
     for pl in bp.usedP {
-        if usedK[bp.placeCol[pl]] { append(mut &firstK, pl) } else { append(mut &restK, pl) }
+        let c = bp.placeCol[pl]
+        if usedK[c] { append(mut &firstK, pl) }
+        else if !hasAfter || after[c] { append(mut &restK, pl) }
     }
     let skipQ = cSkipQuery(conds, &bp.kinds, t)
-    return Lazy{on: ((len(first) > 0 || len(raw) > 0) && len(rest) > 0) || len(kern) > 0, first: first, rest: rest, raw: raw, rawPl: rawPl,
-                pieces: pieces, skip: skip, bf: bf, br: br, kern: lexdb_leafk.merged(kern), rtKern: [], firstK: firstK, restK: restK, skipK: skipK, skipQ: skipQ}
+    return Lazy{on: len(raw) > 0 || (len(first) > 0 && len(rest) > 0) || len(kern) > 0, first: first, rest: rest, raw: raw, rawPl: rawPl,
+                rawNeg: rawNeg, pieces: pieces, skip: skip, bf: bf, br: br, kern: lexdb_leafk.merged(kern), rtKern: [], firstK: firstK, restK: restK, skipK: skipK, skipQ: skipQ}
 }
 
 // Whether evaluating n cannot raise a runtime error (safe to run a later
@@ -2498,6 +2556,7 @@ pub fn bColsOf(n: &BNode, used: mut &[]bool) {
             bColsOf(&b, used)
         }
         BNode.TsPart(col, _) { used[col] = true }
+        BNode.TsTrunc(col, _) { used[col] = true }
         BNode.CondText(cond, col, _) {
             bColsOf(&cond, used)
             used[col] = true
@@ -4304,12 +4363,22 @@ fn aggRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PSc
                     Some(n) { return Ok(n) }
                     None {}
                 }
+                if top.canStream {
+                    var ev: []Val = []
+                    var ea: []Acc = []
+                    try give(mut &ev, -2, mut &ea)
+                }
                 cnt[0] = c0
                 // (no numeric read as units: the values' try is the same)
                 values = usedDec
             }
             Err(x) {
                 if !isSpill(&x) { return Err(x) }
+                if top.canStream {
+                    var ev: []Val = []
+                    var ea: []Acc = []
+                    try give(mut &ev, -2, mut &ea)
+                }
                 cnt[0] = c0
                 decSpills += 1
                 values = true
@@ -4319,7 +4388,14 @@ fn aggRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan.PSc
             var none = false
             match try aggBatches(st, txn, sc, conds, a, cols, t, src, hrows, cx, room, bud, cnt, top, give, false, mut &none) {
                 Some(n) { return Ok(n) }
-                None { cnt[0] = c0 }
+                None {
+                    if top.canStream {
+                        var ev: []Val = []
+                        var ea: []Acc = []
+                        try give(mut &ev, -2, mut &ea)
+                    }
+                    cnt[0] = c0
+                }
             }
         }
     }
@@ -4355,6 +4431,32 @@ fn bxVolatile(x: &BX): bool {
         }
         else { return false }
     }
+}
+
+// Columns of the scanned table read by ag after WHERE (keys, aggregate args/filters, first-row cols).
+fn aggAfter(ag: &AggSets, nc: int): []bool {
+    var after: []bool = array(nc, false)
+    for x in ag.ags {
+        for k in x.keys { bColsOf(&k.n, mut &after) }
+        for sp in x.specs {
+            match &sp.arg { Some(an) { bColsOf(an, mut &after) } None {} }
+            match &sp.filter { Some(fn0) { bColsOf(fn0, mut &after) } None {} }
+            if sp.vcol >= 0 && sp.vcol < nc { after[sp.vcol] = true }
+        }
+        for go in x.gens {
+            match go { Some(g) { for c in g.cols { if c >= 0 && c < nc { after[c] = true } } } None {} }
+        }
+        for gc in x.gcs {
+            match &gc.arg { Some(g) { for c in g.cols { if c >= 0 && c < nc { after[c] = true } } } None {} }
+            for g in gc.more { for c in g.cols { if c >= 0 && c < nc { after[c] = true } } }
+        }
+        for c in x.fcols { if c >= 0 && c < nc { after[c] = true } }
+        if x.textCol >= 0 && x.textCol < nc { after[x.textCol] = true }
+        if x.reCol >= 0 && x.reCol < nc { after[x.reCol] = true }
+        if x.keyCol0 >= 0 && x.keyCol0 < nc { after[x.keyCol0] = true }
+        if x.keyCol1 >= 0 && x.keyCol1 < nc { after[x.keyCol1] = true }
+    }
+    return after
 }
 
 // The aggregate over the scan's batches; dec: numeric(p, s) columns as
@@ -4429,6 +4531,17 @@ fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan
     var nRead = 0
     var nJoined = 0
     var nBatches = 0
+    var streamed = 0
+    var peakAdded = 0
+    let streamOn = top.canStream && !ag.set && len(ag.ags) == 1 && ag.ags[0].sorted && !top.on && top.groupCap < 0
+    let streamHb = if !ag.set && len(ag.ags) == 1 { havPrep(&ag.ags[0], top) } else { noHavBound() }
+    var streamRowLen = 0
+    if streamOn {
+        for c in ag.ags[0].fcols { if c + 1 > streamRowLen { streamRowLen = c + 1 } }
+        if ag.ags[0].keyCol0 >= 0 && ag.ags[0].keyCol0 + 1 > streamRowLen { streamRowLen = ag.ags[0].keyCol0 + 1 }
+    }
+    var streamFirst: []Val = if streamOn { array(streamRowLen, Val.Null) } else { [] }
+    var streamAccs: []Acc = if streamOn { lexdb_agg.newAccs(len(ag.ags[0].specs)) } else { [] }
     // (rows the run holds: one pass over them, in place of the scans)
     let held = src.held
     // Direct leaf-count fast path for unconditional COUNT(*) over table scans:
@@ -4474,7 +4587,8 @@ fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan
         return Ok(Some(ag.added()))
     }
     // (a table's scan decoded in two steps: lazyOf)
-    let lazy = lazyOf(&bp, t, &bconds, -1)
+    let afterA = aggAfter(&ag, len(bp.kinds))
+    let lazy = lazyOfAfter(&bp, t, &bconds, -1, &afterA)
     for sj in 0..(if held { 1 } else { len(src.scans) }) {
         var cur = lexdb_access.newCursor()
         var hpos = lexdb_held.newPos()
@@ -4541,6 +4655,11 @@ fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan
                 continue
             }
             if !(try ag.eat(mut &b, &idx)) { return Ok(None) }
+            let curAdd = ag.added()
+            if curAdd > peakAdded { peakAdded = curAdd }
+            if streamOn && ag.ags[0].ngroups > 1 && ag.ags[0].nullGroup < 0 {
+                streamed += try ag.ags[0].flushSorted(streamRowLen, top, &streamHb, give, mut &streamFirst, mut &streamAccs)
+            }
             // (the columns the calls' generic steps added dropped)
             while len(b.cols) > len(bp.kinds) { let gone = pop(mut &b.cols) }
             while len(b.vals) > len(bp.kinds) { let gone2 = pop(mut &b.vals) }
@@ -4554,9 +4673,10 @@ fn aggBatches(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &lexdb_plan
     cnt[0].read += nRead
     cnt[0].joined += nJoined
     cnt[0].batches += nBatches
-    cnt[len(cnt) - 1].joined += ag.ngroups()
+    cnt[len(cnt) - 1].joined += streamed + ag.ngroups()
     try ag.finishTop(len(cols), top, give)
-    return Ok(Some(ag.added()))
+    let finalAdd = ag.added()
+    return Ok(Some(if peakAdded > finalAdd { peakAdded } else { finalAdd }))
 }
 
 // An aggregate's state over batches: its keys and calls compiled, per
@@ -4574,9 +4694,70 @@ type TopAgg = value record {
     oneOrd: bool
     topN: int
     groupCap: int           // unordered GROUP BY ... LIMIT N [OFFSET M]: freeze new groups once ngroups == groupCap (-1 none)
+    havOn: bool             // inline HAVING Agg(havAgg) <havOp> const pre-filter
+    havAgg: int
+    havOp: int              // 0 =, 1 <>, 2 <, 3 <=, 4 >, 5 >=
+    havIsNum: bool
+    havInt: int
+    havNum: Decimal
+    canStream: bool         // caller supports resetting output if aggBatches retries
 }
 
-fn noTopAgg(): TopAgg { return TopAgg{on: false, aggIdx: -1, desc: false, oneOrd: false, topN: -1, groupCap: -1} }
+fn noTopAgg(): TopAgg {
+    return TopAgg{on: false, aggIdx: -1, desc: false, oneOrd: false, topN: -1, groupCap: -1,
+                  havOn: false, havAgg: -1, havOp: 0, havIsNum: false, havInt: 0, havNum: 0m, canStream: false}
+}
+
+type HavBound = value record { ok: bool; bound: i128; isSum: bool }
+
+fn noHavBound(): HavBound { return HavBound{ok: false, bound: i128(0), isSum: false} }
+
+fn havPrep(ag: &AggSt, top: &TopAgg): HavBound {
+    if !top.havOn || top.havAgg < 0 || top.havAgg >= len(ag.specs) { return noHavBound() }
+    let sp = &ag.specs[top.havAgg]
+    var isSum = false
+    var sc = 0
+    if sp.kind == BA_STAR || sp.kind == BA_COUNT {
+        isSum = false
+        sc = 0
+    } else if sp.kind == BA_SUM && sp.vcol < 0 {
+        isSum = true
+        sc = if sp.dsc >= 0 { sp.dsc } else { 0 }
+    } else {
+        return noHavBound()
+    }
+    if !top.havIsNum {
+        if sc < 0 || sc > 18 { return noHavBound() }
+        return HavBound{ok: true, bound: i128(top.havInt) * i128(lexdb_rows.pow10i(sc)), isSum: isSum}
+    }
+    let d = &top.havNum
+    let c = d.coefficient()
+    let sh = d.exponent() + sc
+    if sh < 0 || sh > 18 || c > u128(1000000000000000000) { return noHavBound() }
+    let u = i128(c) * i128(lexdb_rows.pow10i(sh))
+    return HavBound{ok: true, bound: if d.isNeg() { -u } else { u }, isSum: isSum}
+}
+
+fn havPass(ag: &AggSt, g: int, top: &TopAgg, hb: &HavBound): bool {
+    if !hb.ok { return true }
+    let ai = top.havAgg
+    var v = i128(0)
+    if hb.isSum {
+        if ag.an[ai][g] == 0 { return false }
+        v = ag.adec[ai][g]
+        let lim = i128(1000000000000000000) * i128(100000000000000000)
+        if v > lim || v < -lim { return true }
+    } else {
+        v = i128(ag.an[ai][g])
+    }
+    let op = top.havOp
+    if op == 0 { return v == hb.bound }
+    if op == 1 { return v != hb.bound }
+    if op == 2 { return v < hb.bound }
+    if op == 3 { return v <= hb.bound }
+    if op == 4 { return v > hb.bound }
+    return v >= hb.bound
+}
 
 type AggSt = record {
     keys: []BComp
@@ -4848,6 +5029,39 @@ fn aggKeyCompile(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, cx: &Ctx, dec
                         BX.Col(c) {
                             if c >= 0 && c < len(cols) && c < len(kinds) && kinds[c] == BK_VAL && cols[c].typ.oid == lexdb_sql.OID_TS {
                                 return Some(BComp{n: BNode.TsPart(c, part), typ: BT_INT})
+                            }
+                        }
+                        else {}
+                    }
+                }
+            }
+            if fr.name == "date_trunc" && len(args) == 2 {
+                var unitUs = 0
+                if bxConst(&args[0]) {
+                    let none: []Val = []
+                    match bxEval(&args[0], &none, &none, cx) {
+                        Ok(v) {
+                            match v {
+                                Val.Text(f) {
+                                    let lo = strings.toLowerAscii(&f)
+                                    if lo == "microsecond" || lo == "microseconds" { unitUs = 1 }
+                                    else if lo == "millisecond" || lo == "milliseconds" { unitUs = 1000 }
+                                    else if lo == "second" || lo == "seconds" { unitUs = 1000000 }
+                                    else if lo == "minute" || lo == "minutes" { unitUs = 60000000 }
+                                    else if lo == "hour" || lo == "hours" { unitUs = 3600000000 }
+                                    else if lo == "day" || lo == "days" { unitUs = lexdb_time.DAY_US }
+                                }
+                                else {}
+                            }
+                        }
+                        Err(_) {}
+                    }
+                }
+                if unitUs > 0 {
+                    match &args[1] {
+                        BX.Col(c) {
+                            if c >= 0 && c < len(cols) && c < len(kinds) && kinds[c] == BK_VAL && cols[c].typ.oid == lexdb_sql.OID_TS {
+                                return Some(BComp{n: BNode.TsTrunc(c, unitUs), typ: BT_INT})
                             }
                         }
                         else {}
@@ -5880,6 +6094,67 @@ fn (ag: mut &AggSets) finish(nq: int, give: &fn(mut &[]Val, int, mut &[]Acc): Re
     return ag.finishTop(nq, &noTop, give)
 }
 
+// Flushes all completed groups 0..(ngroups - 2) of a sorted single-key AggSt,
+// carrying over the still-active final group (ngroups - 1) into slot 0 so memory
+// stays O(batch) instead of O(total groups). Returns the number of groups flushed.
+fn (ag: mut &AggSt) flushSorted(rowLen: int, top: &TopAgg, hb: &HavBound,
+                                give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr],
+                                first: mut &[]Val, accs: mut &[]Acc): Result[int, DbErr] {
+    let ng = ag.ngroups
+    if ng <= 1 { return Ok(0) }
+    let ns = len(ag.specs)
+    let nf = len(ag.fcols)
+    let last = ng - 1
+    for g in 0..last {
+        if !havPass(ag, g, top, hb) { continue }
+        try ag.groupAt(g, first, accs)
+        try give(first, -1, accs)
+        if len(first) != rowLen { first = array(rowLen, Val.Null) }
+        if len(accs) != ns { accs = lexdb_agg.newAccs(ns) }
+    }
+    if nf > 0 {
+        for fi in 0..nf { ag.fv[fi] = replace(mut &ag.fv[last * nf + fi], Val.Null) }
+        while len(ag.fv) > nf { let gone = pop(mut &ag.fv) }
+    }
+    for si in 0..ns {
+        let kd = ag.specs[si].kind
+        if kd == BA_GEN {
+            ag.gcs[si].accs[0] = replace(mut &ag.gcs[si].accs[last], lexdb_agg.newAcc())
+            while len(ag.gcs[si].accs) > 1 { let gone = pop(mut &ag.gcs[si].accs) }
+            continue
+        }
+        if kd == BA_CNTD {
+            ag.asets[si][0] = replace(mut &ag.asets[si][last], newMap())
+            while len(ag.asets[si]) > 1 { let gone = pop(mut &ag.asets[si]) }
+            continue
+        }
+        ag.an[si][0] = ag.an[si][last]
+        while len(ag.an[si]) > 1 { let gone = pop(mut &ag.an[si]) }
+        if kd == BA_VAR {
+            ag.afs[si][0] = ag.afs[si][last]
+            ag.afq[si][0] = ag.afq[si][last]
+            while len(ag.afs[si]) > 1 { let gone = pop(mut &ag.afs[si]) }
+            while len(ag.afq[si]) > 1 { let gone = pop(mut &ag.afq[si]) }
+        } else if kd == BA_AND || kd == BA_OR {
+            ag.amm[si][0] = ag.amm[si][last]
+            while len(ag.amm[si]) > 1 { let gone = pop(mut &ag.amm[si]) }
+        } else if ag.specs[si].vcol >= 0 || ag.gens[si].isSome() {
+            ag.aval[si][0] = replace(mut &ag.aval[si][last], Val.Null)
+            while len(ag.aval[si]) > 1 { let gone = pop(mut &ag.aval[si]) }
+        } else if kd == BA_SUM || kd == BA_AVG {
+            ag.adec[si][0] = ag.adec[si][last]
+            while len(ag.adec[si]) > 1 { let gone = pop(mut &ag.adec[si]) }
+        } else if kd == BA_MIN || kd == BA_MAX {
+            ag.amm[si][0] = ag.amm[si][last]
+            while len(ag.amm[si]) > 1 { let gone = pop(mut &ag.amm[si]) }
+        }
+    }
+    ag.ngroups = 1
+    ag.lastG = 0
+    ag.added = 64 * (ns + 1) + nf * 32
+    return Ok(last)
+}
+
 fn (ag: mut &AggSets) finishTop(nq: int, top: &TopAgg, give: &fn(mut &[]Val, int, mut &[]Acc): Result[Unit, DbErr]): Result[Unit, DbErr] {
     let ns = len(ag.ags[0].specs)
     var rowLen = 0
@@ -5905,6 +6180,7 @@ fn (ag: mut &AggSets) finishTop(nq: int, top: &TopAgg, give: &fn(mut &[]Val, int
             return Ok(Unit{})
         }
     }
+    let hb = if !ag.set && len(ag.ags) == 1 { havPrep(&ag.ags[0], top) } else { noHavBound() }
     var first: []Val = array(rowLen, Val.Null)
     var accs = lexdb_agg.newAccs(ns)
     var at: []int = array(len(ag.ags), 0)
@@ -5921,6 +6197,7 @@ fn (ag: mut &AggSets) finishTop(nq: int, top: &TopAgg, give: &fn(mut &[]Val, int
         if k < 0 { break }
         let g = at[k]
         at[k] += 1
+        if !ag.set && !havPass(&ag.ags[0], g, top, &hb) { continue }
         try ag.ags[k].groupAt(g, mut &first, mut &accs)
         try give(mut &first, if ag.set { k } else { -1 }, mut &accs)
         if len(first) != rowLen { first = array(rowLen, Val.Null) }
@@ -7066,7 +7343,7 @@ fn jlCollectIntKeys(jl: &JL, cap: int): []int {
         } else {
             for d in 0..len(jl.dense) {
                 let bk = jl.dense[d]
-                if bk >= 0 && jl.head[bk] >= 0 {
+                if bk >= 0 && (if len(jl.neqMeta) > 0 { jl.neqMeta[bk * 3] > 0 } else { jl.head[bk] >= 0 }) {
                     append(mut &out, dMin + d)
                     if len(out) >= cap { break }
                 }
@@ -7090,7 +7367,7 @@ fn jlCollectIntKeys(jl: &JL, cap: int): []int {
     let n = len(jl.ints.slots)
     while i < n {
         let v = jl.ints.slots[i + 1]
-        if v != 0 && jl.head[v - 1] >= 0 {
+        if v != 0 && (if len(jl.neqMeta) > 0 { jl.neqMeta[(v - 1) * 3] > 0 } else { jl.head[v - 1] >= 0 }) {
             append(mut &out, jl.ints.slots[i])
             if len(out) >= cap { break }
         }
@@ -7108,7 +7385,7 @@ fn jlBuildIntBloom(jl: &JL, nLive: int, lo: int, hi: int): lexdb_skip.IntBloom {
         } else {
             for d in 0..len(jl.dense) {
                 let bk = jl.dense[d]
-                if bk >= 0 && jl.head[bk] >= 0 { bf.add(dMin + d) }
+                if bk >= 0 && (if len(jl.neqMeta) > 0 { jl.neqMeta[bk * 3] > 0 } else { jl.head[bk] >= 0 }) { bf.add(dMin + d) }
             }
         }
         return bf
@@ -7126,7 +7403,7 @@ fn jlBuildIntBloom(jl: &JL, nLive: int, lo: int, hi: int): lexdb_skip.IntBloom {
     let n = len(jl.ints.slots)
     while i < n {
         let v = jl.ints.slots[i + 1]
-        if v != 0 && jl.head[v - 1] >= 0 { bf.add(jl.ints.slots[i]) }
+        if v != 0 && (if len(jl.neqMeta) > 0 { jl.neqMeta[(v - 1) * 3] > 0 } else { jl.head[v - 1] >= 0 }) { bf.add(jl.ints.slots[i]) }
         i += 2
     }
     return bf
@@ -7371,8 +7648,32 @@ fn mergeRtIntoLazy(lz: mut &Lazy, rt: &RtFilters) {
 // too, before the batch's other columns are decoded. An error of a
 // condition: raised. A value a batch cannot hold: batErr. Whether each
 // stopped it.
+// Columns of table 0 (sc.first .. sc.first + nc) needed after level 0's WHERE conditions.
+// Empty slice means "keep all" (conservative fallback when APPLY/LATERAL is present).
+fn join0After(jr: &JRun, sc: &lexdb_plan.PScan, nc: int, pushCol: int): []bool {
+    for j in 1..len(jr.jls) {
+        if jr.jls[j].how == lexdb_plan.JH_APPLY { return [] }
+    }
+    var after: []bool = array(nc, false)
+    let base = sc.first
+    let hi = base + nc
+    if pushCol >= 0 && pushCol < nc { after[pushCol] = true }
+    for c in jr.wantList { if c >= base && c < hi { after[c - base] = true } }
+    for c in jr.apReads { if c >= base && c < hi { after[c - base] = true } }
+    for j in 1..len(jr.jls) {
+        let jl = &jr.jls[j]
+        for c in jl.kreads { if c >= base && c < hi { after[c - base] = true } }
+        for c in jl.creads { if c >= base && c < hi { after[c - base] = true } }
+        for c in jl.preads { if c >= base && c < hi { after[c - base] = true } }
+        if jl.kCol0 >= base && jl.kCol0 < hi { after[jl.kCol0 - base] = true }
+        if jl.kCol1 >= base && jl.kCol1 < hi { after[jl.kCol1 - base] = true }
+        if jl.neqOut >= base && jl.neqOut < hi { after[jl.neqOut - base] = true }
+    }
+    return after
+}
+
 fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog.Table, sc: &lexdb_plan.PScan, src: &Src, hrows: &[][]Val, bp: &BPlan,
-            conds: &[]BNode, pushCol: int, ph: &PushH, rt: &RtFilters, rawOnErr: bool, rc: mut &RC,
+            conds: &[]BNode, pushCol: int, ph: &PushH, rt: &RtFilters, after: &[]bool, rawOnErr: bool, rc: mut &RC,
             each: &fn(mut &lexdb_store.Txn, mut &Batch, []int, bool): Result[bool, DbErr]): Result[bool, DbErr] {
     let rel = lexdb_catalog.relOf(t)
     if src.held {
@@ -7453,7 +7754,7 @@ fn readRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalog
         }
         return Ok(false)
     }
-    var lazy = lazyOf(bp, t, conds, pushCol)
+    var lazy = lazyOfAfter(bp, t, conds, pushCol, after)
     if rt.active { mergeRtIntoLazy(mut &lazy, rt) }
     let hasCut = len(ph.cutB) > 0
     try lexdb_access.warmPoints(st, txn, &rel, &src.scans)
@@ -8059,7 +8360,7 @@ fn joinSetup(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, p: &lexdb_plan.P
                    !anyAbove && !jl.right && (!jl.left || jr.weighted) && jl.resCol < 0 && jl.na == 0 && jl.neqOut < 0 &&
                    len(jl.conds) == 0 && len(jl.post) == 0 && len(jr.apReads) == 0 {
                     jl.countOnly = true
-                } else if j.how == lexdb_plan.JH_HASH && jl.mark == lexdb_plan.MK_JOIN && jl.mode == JK_INT &&
+                } else if jr.weighted && j.how == lexdb_plan.JH_HASH && jl.mark == lexdb_plan.MK_JOIN && jl.mode == JK_INT &&
                    !anyAbove && !jl.right && !jl.left && jl.resCol < 0 && jl.na == 0 && jl.neqOut >= 0 &&
                    len(jl.conds) == 0 && len(jl.post) == 0 && len(jr.apReads) == 0 {
                     jl.neqCountOnly = true
@@ -8469,6 +8770,11 @@ fn buildNeqFlat(jl: mut &JL) {
     }
     jl.neqMeta = meta
     jl.neqVals = vals
+    // All bucket values are now packed in neqMeta/neqVals and jr.weighted guarantees
+    // only joinFromW reads this level; free jl.rows, jl.head, jl.next immediately.
+    jl.rows = lexdb_rows.noRows()
+    jl.head = []
+    jl.next = []
 }
 
 fn buildDense(jl: mut &JL, hasRange: bool, minK: int, maxK: int, room: int) {
@@ -8874,7 +9180,8 @@ fn hashBuild(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &lexdb_catalo
         let noHeld: [][]Val = []
         let countOnly = jl.countOnly
         let noRt = noRtFilters()
-        let stop = try readRows(st, txn, t, sc, src, &noHeld, &bp, &conds, -1, &ph, &noRt, false, mut &rc,
+        let noAfter: []bool = []
+        let stop = try readRows(st, txn, t, sc, src, &noHeld, &bp, &conds, -1, &ph, &noRt, &noAfter, false, mut &rc,
                                 fn(tx: mut &lexdb_store.Txn, b: mut &Batch, idx: []int, raw2: bool): Result[bool, DbErr] {
             if countOnly {
                 try bd.addCount(b, &idx, &j.hcols, mode, room, maxHeld)
@@ -10043,7 +10350,8 @@ fn joinRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_plan.
         rt = buildRuntimeFilters(&jr, sc, t, &bp, &cn, useSip, cx.sipCol, &cx.sipKeys, pushCol, skInfo.hasMetas)
     }
     if len(rt.bpRanges) > 0 { for r in rt.bpRanges { append(mut &bp.ranges, r) } }
-    let stopped = try readRows(st, txn, t, sc, &srcs[sc.level], &vrows[sc.level], &bp, &cn, pushCol, &ph, &rt, exact, mut &rc,
+    let after0 = join0After(&jr, sc, len(bp.kinds), pushCol)
+    let stopped = try readRows(st, txn, t, sc, &srcs[sc.level], &vrows[sc.level], &bp, &cn, pushCol, &ph, &rt, &after0, exact, mut &rc,
                                fn(tx: mut &lexdb_store.Txn, b: mut &Batch, idx: []int, raw: bool): Result[bool, DbErr] {
         joinChunks += 1
         try bud.tickN(b.n)
@@ -11357,7 +11665,8 @@ fn joinRowsCount(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, top: &lexdb_
         rt = buildRuntimeFilters(&jr, sc, t, &bp, &cn, false, -1, &noSip, pushCol, skInfo.hasMetas)
     }
     if len(rt.bpRanges) > 0 { for r in rt.bpRanges { append(mut &bp.ranges, r) } }
-    let _ = try readRows(st, txn, t, sc, &srcs[sc.level], &vrows[sc.level], &bp, &cn, pushCol, &ph, &rt, false, mut &rc,
+    let after0 = join0After(&jr, sc, len(bp.kinds), pushCol)
+    let _ = try readRows(st, txn, t, sc, &srcs[sc.level], &vrows[sc.level], &bp, &cn, pushCol, &ph, &rt, &after0, false, mut &rc,
                          fn(tx: mut &lexdb_store.Txn, b: mut &Batch, idx: []int, raw: bool): Result[bool, DbErr] {
         if raw { return Err(batErr()) }
         joinChunks += 1
@@ -13770,7 +14079,8 @@ fn topAggOf(pg: &Prog, specs: &[]lexdb_agg.AggSpec, hs: &[]BX, canTop: bool): To
                     }
                 }
                 if !safeProj { return noTopAgg() }
-                return TopAgg{on: false, aggIdx: -1, desc: false, oneOrd: false, topN: -1, groupCap: topN}
+                return TopAgg{on: false, aggIdx: -1, desc: false, oneOrd: false, topN: -1, groupCap: topN,
+                              havOn: false, havAgg: -1, havOp: 0, havIsNum: false, havInt: 0, havNum: 0m, canStream: false}
             }
             if len(srt.desc) == 0 || len(srt.out) == 0 || len(srt.coll) == 0 || srt.coll[0] != lexdb_sql.COLL_EXACT {
                 return noTopAgg()
@@ -13780,7 +14090,8 @@ fn topAggOf(pg: &Prog, specs: &[]lexdb_agg.AggSpec, hs: &[]BX, canTop: bool): To
                 match &xs[sc0] {
                     lexdb_bind.BX.Agg(ai) {
                         if ai >= 0 && ai < len(specs) && !specs[ai].distinct && (specs[ai].star || specs[ai].op == lexdb_agg.OP_COUNT) {
-                            return TopAgg{on: true, aggIdx: ai, desc: srt.desc[0], oneOrd: len(srt.desc) == 1, topN: topN, groupCap: -1}
+                            return TopAgg{on: true, aggIdx: ai, desc: srt.desc[0], oneOrd: len(srt.desc) == 1, topN: topN, groupCap: -1,
+                                          havOn: false, havAgg: -1, havOp: 0, havIsNum: false, havInt: 0, havNum: 0m, canStream: false}
                         }
                     }
                     else {}
@@ -13829,7 +14140,65 @@ fn groupsCollect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, c
         else {}
     }
     let ns = len(specs)
-    let topAgg = topAggOf(pg, specs, hs, canTop && !hasSets && !plain)
+    var topAgg = topAggOf(pg, specs, hs, canTop && !hasSets && !plain)
+    topAgg.canStream = true
+    if fuse && len(hs) == 1 && !hasSets && !plain {
+        match &hs[0] {
+            lexdb_bind.BX.Op(code, a, b) {
+                let op = cmpOf(code)
+                if op >= 0 {
+                    var ai = -1
+                    var flip = false
+                    var kv = Val.Null
+                    var hasK = false
+                    match &a {
+                        lexdb_bind.BX.Agg(idx) {
+                            ai = idx
+                            hasK = cxLit(&b, cx, mut &kv)
+                        }
+                        else {
+                            match &b {
+                                lexdb_bind.BX.Agg(idx) {
+                                    ai = idx
+                                    flip = true
+                                    hasK = cxLit(&a, cx, mut &kv)
+                                }
+                                else {}
+                            }
+                        }
+                    }
+                    if ai >= 0 && ai < ns && hasK && !specs[ai].distinct &&
+                       (specs[ai].star || specs[ai].op == lexdb_agg.OP_COUNT || specs[ai].op == lexdb_agg.OP_SUM) {
+                        var hop = op
+                        if flip {
+                            if hop == 2 { hop = 4 }
+                            else if hop == 3 { hop = 5 }
+                            else if hop == 4 { hop = 2 }
+                            else if hop == 5 { hop = 3 }
+                        }
+                        match kv {
+                            Val.Int(k) {
+                                topAgg.havOn = true
+                                topAgg.havAgg = ai
+                                topAgg.havOp = hop
+                                topAgg.havIsNum = false
+                                topAgg.havInt = k
+                            }
+                            Val.Num(d) {
+                                topAgg.havOn = true
+                                topAgg.havAgg = ai
+                                topAgg.havOp = hop
+                                topAgg.havIsNum = true
+                                topAgg.havNum = d
+                            }
+                            else {}
+                        }
+                    }
+                }
+            }
+            else {}
+        }
+    }
     var firsts: [][]Val = []
     var accss: [][]Acc = []
     var gsets: []int = []
@@ -13837,6 +14206,13 @@ fn groupsCollect(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pg: &Prog, c
     var fv: []Val = []
     let got = runAggAnyTop(st, txn, pg, cols, t, src, tabs, srcs, vrows, cx, room, bud, cnt, &topAgg,
                         fn(first: mut &[]Val, set: int, ps: mut &[]Acc): Result[Unit, DbErr] {
+        if set == -2 {
+            firsts = []
+            accss = []
+            gsets = []
+            fusing = fuse
+            return Ok(Unit{})
+        }
         if fusing {
             while len(fv) > 0 { let gone = pop(mut &fv) }
             var bad = false

@@ -48,6 +48,7 @@ pub const PK_TSZ: byte = PK_UUID
 // in place, its bytes after the last column (9.31): the columns before
 // them stay at the row's start, which a large row keeps in its leaf.
 pub const LONG: int = 256
+pub const FIXED_MAX: int = 1280 // max total bytes for a FIXED row (fits inside MAX_ENTRY=1350 with key)
 
 // A table's column-leaf schema (lexdb_cols): its layouts and the fill
 // value rows written before a column was added take.
@@ -278,12 +279,12 @@ pub fn encodeFixed(r: &Rows, places: &[]Val): Option[str] {
                 fixed += 1
             }
             Val.Text(x) {
-                if k != PK_TEXT || len(x) >= LONG { return None }
+                if k != PK_TEXT { return None }
                 varLen += len(x)
                 fixed += 2
             }
             Val.Bytes(x) {
-                if k != PK_BYTEA || len(x) >= LONG { return None }
+                if k != PK_BYTEA { return None }
                 varLen += len(x)
                 fixed += 2
             }
@@ -296,7 +297,6 @@ pub fn encodeFixed(r: &Rows, places: &[]Val): Option[str] {
                 } else if isVarKind(k) {
                     match varBytes(&places[p], k) {
                         Some(x) {
-                            if len(x) >= LONG { return None }
                             varLen += len(x)
                             fixed += 2
                             append(mut &conv, x)
@@ -309,7 +309,7 @@ pub fn encodeFixed(r: &Rows, places: &[]Val): Option[str] {
             }
         }
     }
-    if varLen > 65535 { return None }
+    if varLen > 65535 || fixed + varLen > FIXED_MAX { return None }
     var b: []byte = withCapacity(fixed + varLen)
     append(mut &b, FIXED)
     binary.appendU16LE(mut &b, nl - 1)
@@ -2145,8 +2145,9 @@ pub fn colsPick(leaf: &LeafView, from: int, qs: &[]int, rs: &[]int, all: bool, r
 }
 
 // Rows rs (batch rows, from row r0 = leaf row from) whose text at place pl
-// a simple LIKE of pieces ps holds for; a dictionary's entries matched once.
-pub fn likeInLeaf(leaf: &LeafView, from: int, rs: &[]int, r0: int, pl: int, ps: &[]str): []int {
+// a simple LIKE (or NOT LIKE when neg) of pieces ps holds for; a dictionary's
+// entries matched once. NULLs are never kept (SQL 3VL: NOT (NULL LIKE p) is NULL).
+pub fn likeInLeaf(leaf: &LeafView, from: int, rs: &[]int, r0: int, pl: int, ps: &[]str, neg: bool): []int {
     let s = leaf.cols
     let dir = leaf.dir
     var out: []int = []
@@ -2157,7 +2158,7 @@ pub fn likeInLeaf(leaf: &LeafView, from: int, rs: &[]int, r0: int, pl: int, ps: 
             let sp = lexdb_cols.entryAt(s, dir, pl, j)
             let a = lexdb_cols.spanStart(sp)
             let e = lexdb_cols.spanEnd(sp)
-            hit[j] = lexdb_like.likeRange(&s[a..e], 0, e - a, ps)
+            hit[j] = lexdb_like.likeRange(&s[a..e], 0, e - a, ps) != neg
         }
         for r in rs {
             let i = from + r - r0
@@ -2176,7 +2177,7 @@ pub fn likeInLeaf(leaf: &LeafView, from: int, rs: &[]int, r0: int, pl: int, ps: 
         if nulls && lexdb_cols.isNull(s, dir, pl, i) { continue }
         let a = if i == 0 { data } else { data + (int(s[ends + 2 * i - 2]) | (int(s[ends + 2 * i - 1]) << 8)) }
         let e = data + (int(s[ends + 2 * i]) | (int(s[ends + 2 * i + 1]) << 8))
-        if lexdb_like.likeRange(&s[a..e], 0, e - a, ps) { append(mut &out, r) }
+        if lexdb_like.likeRange(&s[a..e], 0, e - a, ps) != neg { append(mut &out, r) }
     }
     return out
 }

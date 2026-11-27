@@ -1814,6 +1814,7 @@ pub type Lazy = record {
     // pattern's pieces (lexdb_like)
     pub raw: []int
     pub rawPl: []int
+    pub rawNeg: []bool
     pub pieces: [][]str
     pub skip: []bool        // per condition: one of raw
     // A tagged row's (9.76: a row with a date or a timestamp mostly is)
@@ -1898,8 +1899,9 @@ fn bTagLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
 }
 
 // Rows rs of a run (their bytes rows[r - r0], of layout lay) a simple LIKE
-// on place pl holds for, read in place: as Like over the decoded text.
-fn likeRaw(rows: &[]&str, rs: &[]int, r0: int, pl: int, lay: &FixedLay, ps: &[]str): Result[[]int, DbErr] {
+// (or NOT LIKE when neg) on place pl holds for, read in place: as Like over
+// the decoded text. NULLs are never kept (NOT (NULL LIKE p) is NULL).
+fn likeRaw(rows: &[]&str, rs: &[]int, r0: int, pl: int, lay: &FixedLay, ps: &[]str, neg: bool): Result[[]int, DbErr] {
     let at = lay.bm + pl / 8
     let bit = pl % 8
     let o = lay.off[pl]
@@ -1912,7 +1914,7 @@ fn likeRaw(rows: &[]&str, rs: &[]int, r0: int, pl: int, lay: &FixedLay, ps: &[]s
         let e = binary.readU16LEStr(s, o)
         let st = if pv < 0 { 0 } else { binary.readU16LEStr(s, pv) }
         if st > e || v0 + e > len(s) { return Err(lexdb_base.corrupt("a row's variable part")) }
-        if lexdb_like.likeRange(&s[v0 + st..v0 + e], 0, e - st, ps) { append(mut &out, r) }
+        if lexdb_like.likeRange(&s[v0 + st..v0 + e], 0, e - st, ps) != neg { append(mut &out, r) }
     }
     return Ok(out)
 }
@@ -1955,7 +1957,7 @@ fn bRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
         let ci = lz.raw[x]
         let pl = lz.rawPl[x]
         if pl < np && lay.kinds[pl] == PK_TEXT {
-            rs = try likeRaw(&rows, &rs, r0, pl, lay, &lz.pieces[x])
+            rs = try likeRaw(&rows, &rs, r0, pl, lay, &lz.pieces[x], lz.rawNeg[x])
             continue
         }
         // (a layout whose place is not a text: decoded, then the condition)
@@ -2082,7 +2084,7 @@ fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
         let ci = lz.raw[x]
         let pl = lz.rawPl[x]
         if pl < np && lexdb_rows.leafPlaceKind(leaf, pl) == PK_TEXT {
-            rs = lexdb_rows.likeInLeaf(leaf, from, &rs, r0, pl, &lz.pieces[x])
+            rs = lexdb_rows.likeInLeaf(leaf, from, &rs, r0, pl, &lz.pieces[x], lz.rawNeg[x])
             continue
         }
         var qs1: []int = withCapacity(len(rs))
@@ -2145,7 +2147,7 @@ fn cRunLazy(leaf: &lexdb_rows.LeafView, from: int, to: int, b: mut &Batch, bp: &
     }
     let restPs = if kerned { &lz.restK } else { &lz.rest }
     if len(restPs) > 0 && len(ch) > 0 {
-        let wide = (didKern || len(lz.rtKern) > 0) && 2 * len(ch) >= n
+        let wide = (didKern || len(lz.rtKern) > 0 || len(lz.raw) > 0) && 2 * len(ch) >= n
         var qs: []int = withCapacity(if wide { n } else { len(ch) })
         if wide { for q in 0..n { append(mut &qs, q) } } else { for r in ch { append(mut &qs, r - r0) } }
         if !(try lexdb_rows.colsInto(leaf, from, &qs, len(qs) == n, r0, restPs, b, bp)) { return Ok(-1) }

@@ -7935,16 +7935,84 @@ fn idDefault(t: &Table, i: int, isDef: bool, ovr: int): Result[bool, DbErr] {
     return Ok(false)
 }
 
+// Whether an INSERT VALUES expression matrix contains only pure literals/params/ops
+// (no function calls, currval/lastval, or subqueries) so SERIAL runs can be safely batched.
+fn exprSafeSeqBatch(x: &Expr): bool {
+    if lexdb_sql.isDefault(x) { return true }
+    match x {
+        Expr.Lit(_) { return true }
+        Expr.Param(_) { return true }
+        Expr.Unary(_, a) { return exprSafeSeqBatch(&a) }
+        Expr.Bin(_, a, b) { return exprSafeSeqBatch(&a) && exprSafeSeqBatch(&b) }
+        Expr.Cast(a, _) { return exprSafeSeqBatch(&a) }
+        Expr.IsNull(a, _) { return exprSafeSeqBatch(&a) }
+        else { return false }
+    }
+}
+
+fn exprsSafeSeqBatch(rows: &[][]Expr): bool {
+    for r in rows {
+        for x in r { if !exprSafeSeqBatch(&x) { return false } }
+    }
+    return true
+}
+
+// Next value for a SERIAL / identity sequence column in a multi-row INSERT,
+// drawing runs of up to min(rowsRem, ROWID_RUN) values at once and deferring
+// currval/lastval memo writes until statement completion (flushSeqCurrval).
+fn nextSeqBatched(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, defs: &Defs, i: int, up: mut &Upsert): Result[int, DbErr] {
+    if len(up.seqLeft) > 0 && up.rowsRem > 0 {
+        if up.seqLeft[i] == 0 {
+            let want = if up.rowsRem < ROWID_RUN { up.rowsRem } else { ROWID_RUN }
+            let r = try nextRun(st, &defs.seqs[i], want)
+            up.seqNext[i] = r.first
+            up.seqLeft[i] = r.count
+        }
+        let v = up.seqNext[i]
+        up.seqLeft[i] -= 1
+        if up.seqLeft[i] > 0 { up.seqNext[i] += defs.seqs[i].inc }
+        up.seqLast[i] = v
+        up.seqHit[i] = true
+        return Ok(v)
+    }
+    return nextFor(st, txn.sql.sess, &defs.seqs[i])
+}
+
+fn flushSeqCurrval(st: &lexdb_store.Store, sess: int, defs: &Defs, up: mut &Upsert) {
+    for i in 0..len(up.seqHit) {
+        if up.seqHit[i] {
+            let s = up.seqLast[i].toStr()
+            st.memo.put(&curKey(sess, &defs.seqs[i]), &s)
+            st.memo.put(&lastKey(sess), &s)
+            up.seqHit[i] = false
+        }
+    }
+}
+
 // The rows of VALUES inserted: their count (each kept, with keep).
 fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targets: &[]int, rows: &[][]Expr,
               env: &Env, ovr: int, keep: bool, kept: mut &[][]Val, up: mut &Upsert, wr: mut &[]WcteRun): Result[int, DbErr] {
     let defs = try defaultsOf(st, txn, t)
     let fw = try fkTables(st, txn, t, true, up.mode == lexdb_sql.CONFLICT_UPDATE)
+    if len(rows) > 1 && exprsSafeSeqBatch(rows) {
+        var anySeq = false
+        for i in 0..len(t.cols) {
+            if len(defs.seqs[i].key) > 0 && t.cols[i].name != lexdb_catalog.ROWID { anySeq = true; break }
+        }
+        if anySeq {
+            let nc = len(t.cols)
+            up.seqLeft = array(nc, 0)
+            up.seqNext = array(nc, 0)
+            up.seqLast = array(nc, 0)
+            up.seqHit = array(nc, false)
+        }
+    }
     var later: []FkLater = []
     var count = 0
     var chunkEnd = 0
     var want = 32
     for ri in 0..len(rows) {
+        up.rowsRem = len(rows) - ri
         let r = &rows[ri]
         if ri == chunkEnd && len(rows) > 1 && len(t.fks) > 0 {
             // a chunk's parents looked up together, from the literals and parameters it gives for the keys
@@ -7952,30 +8020,68 @@ fn insertRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targ
             if len(up.fk.fks) == 0 && up.mode != lexdb_sql.CONFLICT_UPDATE { up.fk = fkProbes(t, &fw, targets) }
             if up.fk.any() {
                 let spec = up.fk.given(rows, ri, to, len(targets), env.params)
-                try fkAhead(st, txn, t, &fw, targets, up, &spec)
+                match fkAhead(st, txn, t, &fw, targets, up, &spec) {
+                    Ok(_) {}
+                    Err(x) { flushSeqCurrval(st, txn.sql.sess, &defs, up); return Err(x) }
+                }
             }
             chunkEnd = to
             want = min(want * 2, lexdb_rows.BROWS)
         }
         var vs: []Val = []
         for k in 0..len(r) {
-            if k >= len(targets) { return Err(e("42601", "INSERT has more expressions than target columns")) }
+            if k >= len(targets) {
+                flushSeqCurrval(st, txn.sql.sess, &defs, up)
+                return Err(e("42601", "INSERT has more expressions than target columns"))
+            }
             let isDef = lexdb_sql.isDefault(&r[k])
-            if len(defs.gens) > 0 { try lexdb_gen.checkWrite(&t.cols, targets[k], isDef, up.md, true) }
-            if isDef || try idDefault(t, targets[k], false, ovr) {
-                append(mut &vs, try defAt(st, txn, &defs, t, targets[k]))
+            if len(defs.gens) > 0 {
+                match lexdb_gen.checkWrite(&t.cols, targets[k], isDef, up.md, true) {
+                    Ok(_) {}
+                    Err(x) { flushSeqCurrval(st, txn.sql.sess, &defs, up); return Err(x) }
+                }
+            }
+            var useDef = isDef
+            if !useDef {
+                match idDefault(t, targets[k], false, ovr) {
+                    Ok(b) { useDef = b }
+                    Err(x) { flushSeqCurrval(st, txn.sql.sess, &defs, up); return Err(x) }
+                }
+            }
+            if useDef {
+                let ci = targets[k]
+                if len(defs.seqs[ci].key) > 0 && t.cols[ci].name != lexdb_catalog.ROWID && len(up.seqLeft) > 0 {
+                    match nextSeqBatched(st, txn, &defs, ci, up) {
+                        Ok(v) { append(mut &vs, Val.Int(v)) }
+                        Err(x) { flushSeqCurrval(st, txn.sql.sess, &defs, up); return Err(x) }
+                    }
+                } else {
+                    match defAt(st, txn, &defs, t, ci) {
+                        Ok(v) { append(mut &vs, v) }
+                        Err(x) { flushSeqCurrval(st, txn.sql.sess, &defs, up); return Err(x) }
+                    }
+                }
             } else {
-                append(mut &vs, try eval(&r[k], env))
+                match eval(&r[k], env) {
+                    Ok(v) { append(mut &vs, v) }
+                    Err(x) { flushSeqCurrval(st, txn.sql.sess, &defs, up); return Err(x) }
+                }
             }
         }
-        match try insertOne(st, txn, t, targets, &vs, &defs, &fw, mut &later, up, env) {
-            Some(row) {
-                if keep { append(kept, row) }
-                count += 1
+        match insertOne(st, txn, t, targets, &vs, &defs, &fw, mut &later, up, env) {
+            Ok(got) {
+                match got {
+                    Some(row) {
+                        if keep { append(kept, row) }
+                        count += 1
+                    }
+                    None {}
+                }
             }
-            None {}
+            Err(x) { flushSeqCurrval(st, txn.sql.sess, &defs, up); return Err(x) }
         }
     }
+    flushSeqCurrval(st, txn.sql.sess, &defs, up)
     if len(wr) > 0 { addWcteFks(wr, &fw, mut &later) } else { try fkFinish(st, txn, &fw, mut &later) }
     return Ok(count)
 }
@@ -8021,6 +8127,10 @@ fn insertOne(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, targe
             row[i] = Val.Int(up.ridNext)
             up.ridNext += defs.seqs[i].inc
             up.ridLeft -= 1
+            continue
+        }
+        if len(defs.seqs[i].key) > 0 && len(up.seqLeft) > 0 && up.rowsRem > 0 {
+            row[i] = Val.Int(try nextSeqBatched(st, txn, defs, i, up))
             continue
         }
         row[i] = try defAt(st, txn, defs, t, i)
@@ -8080,6 +8190,12 @@ type Upsert = record {
     ridNext: int
     ridLeft: int
     ridWant: int
+    // batched sequence runs for SERIAL / identity columns in multi-row INSERT VALUES
+    seqLeft: []int
+    seqNext: []int
+    seqLast: []int
+    seqHit: []bool
+    rowsRem: int
     // the statement's foreign keys' parents probed ahead (lexdb_fkprobe): empty
     // for a single row, under DO UPDATE (it may change a key a row refers to),
     // and until the first chunk
@@ -8091,7 +8207,8 @@ const ROWID_RUN: int = 1024
 
 fn noUpsert(): Upsert {
     return Upsert{mode: lexdb_sql.CONFLICT_NONE, arb: [], targets: [], sets: [], cond: None, cols: [], touched: newMap(), idBump: false,
-                  idCols: [], idMax: [], ridNext: 0, ridLeft: 0, ridWant: 1, fk: lexdb_fkprobe.none(), md: lexdb_sql.MD_PG}
+                  idCols: [], idMax: [], ridNext: 0, ridLeft: 0, ridWant: 1, seqLeft: [], seqNext: [], seqLast: [], seqHit: [], rowsRem: 0,
+                  fk: lexdb_fkprobe.none(), md: lexdb_sql.MD_PG}
 }
 
 fn sameCols(a: &[]int, b: &[]int): bool {
@@ -18512,7 +18629,7 @@ fn fastCopyField(t: &Table, zone: &lexdb_time.Zone, plan: &FastCopyPlan, p: int,
         let spaces = len(s) > 0 && (strings.isSpace(s[0]) || strings.isSpace(s[len(s) - 1]))
         let d = if spaces { try fastCopyNum(t, p, &(strings.trim(s))) } else { try fastCopyNum(t, p, s) }
         let x = d.toBin()
-        if len(x) >= lexdb_rows.LONG {
+        if len(x) >= lexdb_rows.FIXED_MAX {
             append(mut &longs, FastLong{p: p, v: Val.Num(d)})
             binary.setU16LE(mut &b, plan.off[p], len(b) - plan.v0)
             return Ok(0)
@@ -18527,7 +18644,7 @@ fn fastCopyField(t: &Table, zone: &lexdb_time.Zone, plan: &FastCopyPlan, p: int,
         if oid == lexdb_sql.OID_BPCHAR && maxLen > 0 {
             let rc = strings.runeCount(s)
             if rc == maxLen {
-                if len(s) >= lexdb_rows.LONG {
+                if len(s) >= lexdb_rows.FIXED_MAX {
                     append(mut &longs, FastLong{p: p, v: Val.Text(s.clone())})
                     binary.setU16LE(mut &b, plan.off[p], len(b) - plan.v0)
                     return Ok(0)
@@ -18538,7 +18655,7 @@ fn fastCopyField(t: &Table, zone: &lexdb_time.Zone, plan: &FastCopyPlan, p: int,
             }
             if rc < maxLen {
                 let pad = maxLen - rc
-                if len(s) + pad >= lexdb_rows.LONG {
+                if len(s) + pad >= lexdb_rows.FIXED_MAX {
                     var padded = s.clone()
                     for pi in 0..pad { padded.addByte(' ') }
                     append(mut &longs, FastLong{p: p, v: Val.Text(padded)})
@@ -18558,7 +18675,7 @@ fn fastCopyField(t: &Table, zone: &lexdb_time.Zone, plan: &FastCopyPlan, p: int,
                 if s[j] != ' ' { return Err(e("22001", &("value too long for type character(" + maxLen.toStr() + ")"))) }
             }
             let cut = s[0..at]
-            if len(cut) >= lexdb_rows.LONG {
+            if len(cut) >= lexdb_rows.FIXED_MAX {
                 append(mut &longs, FastLong{p: p, v: Val.Text(cut.clone())})
                 binary.setU16LE(mut &b, plan.off[p], len(b) - plan.v0)
                 return Ok(0)
@@ -18571,7 +18688,7 @@ fn fastCopyField(t: &Table, zone: &lexdb_time.Zone, plan: &FastCopyPlan, p: int,
            strings.runeCount(s) > maxLen {
             return Err(e("22001", &("value too long for type character varying(" + maxLen.toStr() + ")")))
         }
-        if len(s) >= lexdb_rows.LONG {
+        if len(s) >= lexdb_rows.FIXED_MAX {
             append(mut &longs, FastLong{p: p, v: Val.Text(s.clone())})
             binary.setU16LE(mut &b, plan.off[p], len(b) - plan.v0)
             return Ok(0)
@@ -18716,7 +18833,7 @@ fn fastCopyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rel
                     }
                 }
             } else if k == lexdb_rows.PK_TEXT && plan.plainText[p] {
-                if flen < lexdb_rows.LONG && (!anyEsc || flen == 0 || strings.indexOfByte(&line[start..end], '\\', 0) < 0) {
+                if flen < lexdb_rows.FIXED_MAX && (!anyEsc || flen == 0 || strings.indexOfByte(&line[start..end], '\\', 0) < 0) {
                     if flen > 0 { appendStr(mut &b, line[start..end]) }
                     let relOff = len(b) - plan.v0
                     let at = plan.off[p]
@@ -18762,9 +18879,10 @@ fn fastCopyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rel
         return Err(e("XX000", "lexdb: COPY fast path: no primary key value"))
     }
     let fixed = strFromBytes(&b)
-    // a value too long for the fixed row: the row's values, stored in the tagged form (encRow's)
+    // a value or row too long for FIXED_MAX: decode values and store in the tagged form (encRow's)
+    let tooBig = len(longs) > 0 || len(fixed) > lexdb_rows.FIXED_MAX
     var vals: []Val = []
-    if len(longs) > 0 {
+    if tooBig {
         for q in 0..plan.n { append(mut &vals, try fastCopyVal(plan, &fixed, q)) }
         for l in longs { vals[l.p] = l.v.clone() }
     }
@@ -18778,8 +18896,8 @@ fn fastCopyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rel
         }
     }
     if len(plan.ixs) > 0 { try fastCopyEntries(t, plan, &fixed, &vals, &key, ents) }
-    let row = if len(longs) > 0 { lexdb_access.encRow(rel, &vals) } else { fixed }
-    let head = if len(longs) > 0 { lexdb_rows.rowHead(&row) } else { 0 }
+    let row = if tooBig { lexdb_access.encRow(rel, &vals) } else { fixed }
+    let head = if tooBig { lexdb_rows.rowHead(&row) } else { 0 }
     let ok = if plan.pk >= 0 {
         try lexdb_access.loadRow(st, txn, rel, id, &row, head, state)
     } else {
@@ -18788,7 +18906,6 @@ fn fastCopyRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, rel
     if !ok {
         return Err(e("23505", "duplicate key value violates unique constraint"))
     }
-    lexdb_stats.noteChg(st, txn.sql.sess, t, 0)
     return Ok(Unit{})
 }
 
@@ -18920,6 +19037,7 @@ fn fastCopyRun(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, s: 
             count += 1
         }
     }
+    if count > 0 { lexdb_stats.noteChgN(st, txn.sql.sess, t, count) }
     try fastCopyIndexes(txn, t, plan, &state, mut &ents)
     return Ok(Res{cols: [], rows: [], tag: "COPY " + count.toStr(), hasRows: false, copy: COPY_NONE})
 }
