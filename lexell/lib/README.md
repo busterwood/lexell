@@ -1754,7 +1754,9 @@ that need one are skipped when it is not installed). Examples:
   `task.within` deadline end a wait: `Err` with `E_CANCELLED` (1020) or
   `E_TIMEOUT` (1021), after a CancelRequest has stopped the query on the
   server and its replies are drained (at most 5 s, not cancellable), so the
-  connection is idle again. `connect_timeout` bounds the whole connect
+  connection is idle again (call `conn.setCloseOnCancel(true)` on a dedicated
+  non-pooled connection, such as a LexDB `SELECT ... WAIT` stream, to close the
+  socket immediately on cancellation instead of draining). `connect_timeout` bounds the whole connect
   (`E_TIMEOUT`). A lost connection is `E_IO` and a malformed reply
   `E_PROTOCOL`; the connection is then broken. Every call that can park
   takes a last `w: Where`. The calls take `mut &Conn` (a Lease's `conn()`), as
