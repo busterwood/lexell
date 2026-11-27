@@ -20,71 +20,19 @@ I wanted the quick edit–compile–run loop I remember from Turbo Pascal, with 
 
 ## Performance
 
-### Compile time
+Measured on an AMD Ryzen 7 8745HS running Linux 7.2 (27 November 2026). Full tables, caveats and reproduction steps are in the [performance report](PERFORMANCE.md) and [LexDB performance](lexell/docs/lexdb/performance.md).
 
-| | Lexell | Rust | Lexell is |
-|---|---:|---:|---:|
-| Hello world (a 22 KB executable) | 14 ms | 59 ms | 4.1× faster |
-| The nine benchmark programs | 140 ms | 3.58 s | 26× faster |
+| Area | Headline result | Details |
+|---|---|---|
+| Compile time | Hello world in 14 ms (4.1× faster than Rust); 9-program suite in 140 ms (26× faster) | [PERFORMANCE.md](PERFORMANCE.md) |
+| Generated code (`-O`) | Ahead of Rust on 12 of 19 shared benchmarks (level on 2); ahead of warmed-up Java on most CPU benchmarks | [PERFORMANCE.md](PERFORMANCE.md) |
+| Peak memory | 2–31 MB across the benchmark suite (vs. 50 MB–1.4 GB on the JVM) | [PERFORMANCE.md](PERFORMANCE.md) |
+| HTTP/1.1 & HTTP/2 server | Up to 235k req/s (`h2c`) and 181k req/s (TLS 1.3) on 1 core — 1.5–5.4× Go and up to 2.4× Node.js at 7–13 MB RSS | [PERFORMANCE.md](PERFORMANCE.md) |
+| CLI tools & parsers | Faster than Go's `regexp`, `jq`, `eza`, `grep` and Python JSON | [PERFORMANCE.md](PERFORMANCE.md) |
+| 38-digit `Decimal` | Faster than .NET `Decimal` on every operation and Java `BigDecimal` on 9 of 10 | [PERFORMANCE.md](PERFORMANCE.md) |
+| LexDB vs. PostgreSQL 18 | 2–3.5× faster on TPC-H and ClickBench analytics, 1.3–3.1× durable updates, 1.2–1.3× 4-core OLTP reads via replicas | [LexDB performance](lexell/docs/lexdb/performance.md) |
 
-### Generated code
-
-Lexell with `-O` against Rust and against Java on a warmed-up JVM (20 benchmarks):
-
-| Benchmark | Faster than Rust | Faster than Java |
-|---|---:|---:|
-| Allocation | 11× | |
-| Lists and trees | 5.4–5.8× | |
-| Strings | 3.6× | |
-| Maps | 2.0× | |
-| Recursive calls (`fib`) | 1.64× | 1.12× |
-| Matrix multiplication | 1.59× | |
-| Sieve | 1.51× | 1.76× |
-| Interpreter loop | 1.37× | 2.1× |
-| Array indexing | 1.34× | 1.08× |
-| Expression AST evaluation (`enum_eval`) | 1.13× | 1.03× |
-| Bit-packed column decode | | 1.55× |
-| Varint CSV parsing | 1.04× | 1.38× |
-| Switching between tasks | | 7.8× (1.8× Go) |
-| Token scanner | | 1.68× |
-| Sorting with closures | | 1.57× |
-| Floating point (`nbody`) | | level |
-| Loops | level | 1.13× |
-| B-tree | level | |
-| Peak memory (19 of 20 programs) | | 2–31 MB against the JVM's 50 MB–1.4 GB |
-
-Rust is ahead on floating point (`nbody`), sorting with closures, bit-packed decode (`bitpack`), hash aggregation (`hashagg`), and slightly on the token scanner (1.09×). Java is ahead on the allocation-heavy programs, maps, B-tree (1.04×), hash aggregation, and vectorised matrix multiplication.
-
-### Real programs
-
-| Program | Compared with | Lexell is |
-|---|---|---:|
-| HTTP/2 server (`h2c` & TLS 1.3, 1 core) | Go's `net/http` | 1.5–5.4× faster (up to 235k req/s) |
-| HTTP/2 server (`h2c` & multi-conn TLS) | Node.js `http2` | 1.2–2.4× faster (2.4–7.7× lower p99) |
-| HTTP/1.1 server (1 core, 10k idle conns) | Go / Node.js | 1.7–2.1× Go, 1.2–1.3× Node.js |
-| Regex, all eight patterns | Go's regexp | 4.8× to several hundred× faster |
-| jq, every filter (identical output) | jq 1.7.1 | 1.8–3.1× faster |
-| Tree listing | eza | 3.6× faster |
-| JSON parsing | Python | 2.9× faster |
-| grep | GNU grep | 1.4–2.6× faster |
-| JSON writing | Python | 1.5× faster |
-
-Lexell is ahead of cmark on repository Markdown and the spec examples (slightly behind on the spec text), slightly behind Node.js `http2` on single-connection TLS at 100 streams (0.90×, with 2.4× lower p99 and 13× lower RSS), behind Python on JSON queries, Rust's regex crate on most patterns (3.8× faster on `(?m)^ERROR .*timeout$`), and GNU sort.
-
-### Decimal
-
-| Operation | Faster than Java `BigDecimal` | Faster than .NET `Decimal` |
-|---|---:|---:|
-| Parse | 3.3–4.5× | 2.7× |
-| Format | 1.05–3.6× | 1.8× |
-| Divide | 1.13× | 5.8× |
-| Add | 1.85–2.0× | 1.44× |
-| Multiply | 1.21–1.57× | 1.32× |
-| Compare | | 1.65× |
-
-Lexell is ahead of .NET on every operation and ahead of Java on nine of ten; Java is ahead on 19-digit comparison.
-
-Measured on one AMD Ryzen 7 8745HS running Linux 7.2, 27 November 2026. The [performance report](PERFORMANCE.md) has every result, what each benchmark does, and how to reproduce them.
+Where others are ahead: Rust leads on floating-point (`nbody`), sorting with closures, bit-packed decode and hash aggregation; Java leads on allocation-heavy microbenchmarks and vectorised matrix multiplication; PostgreSQL leads on single-process multi-threaded reads and high-concurrency multi-statement read-write transactions. See the linked reports for the full breakdown.
 
 ## Concurrency without threads or locks
 
@@ -141,11 +89,11 @@ fn main() {
 
 The same design runs through the library and LexDB:
 
-- **HTTP/1.1, HTTP/2 and HTTPS server.** One task per connection (and per HTTP/2 stream), with keep-alive, multiplexing, graceful shutdown, and worker processes sharing one port. On one core it serves 1.7–2.1× as many HTTP/1.1 requests a second as Go's `net/http` and 1.2–1.3× as many as Node.js; over HTTP/2 it serves 1.5–5.4× Go's rate and up to 2.4× Node.js's (235k req/s over `h2c` and 181k req/s over TLS 1.3 on one core), using 7–13 MB RSS against Node's 155–159 MB.
+- **HTTP/1.1, HTTP/2 and HTTPS server.** One task per connection (and per HTTP/2 stream), with keep-alive, multiplexing, graceful shutdown, and shared-nothing worker processes on one port. It outperforms Go's `net/http` and Node.js across both HTTP/1.1 and HTTP/2 at a fraction of the memory footprint ([benchmarks](PERFORMANCE.md)).
 - **Database clients.** The PostgreSQL, SQL Server, Oracle and Redis clients speak their wire protocols on the event loop, so a query parks only the task that sent it, and their connection pools hand out connections the same way. SQLite has only a blocking C API, so its calls run on a helper thread, which runs only C code, while the task waits.
-- **LexDB.** The database runs every session as a task on one thread. A commit never waits partway through, so no other session can run inside it, and the engine needs no latches on its pages and no locks to keep threads out of each other's way. Commits that arrive in the same turn of the event loop share one flush to disk. Without materialized views, it runs the 22 TPC-H queries (using `par.map` across 4 cores for large columnar scans and aggregations) **3.51×** faster than PostgreSQL 18 on one core and **2.11×** faster than four-process PostgreSQL (`4.18 s` vs `8.84 s`), and runs the 43 wide-table ClickBench 1M queries on one core **3.27×** faster than one-core PostgreSQL (**1.69×** faster than four-process PostgreSQL). It also takes **1.3–3.1×** as many durable updates a second. LexDB adds cores for OLTP reads the same way a web server does: read-only replicas are separate processes that follow the master's log about 0.2 ms behind, and a master with three replicas on four cores serves **1.18–1.29×** as many point selects a second as PostgreSQL on the same four cores (`470–490k/s` `pgbench`, `431k/s` `sysbench`). PostgreSQL is ahead on multi-threaded reads against a single process (before adding replicas) and on multi-statement read-write transactions under high concurrency ([LexDB performance](lexell/docs/lexdb/performance.md)).
+- **LexDB.** Every session runs as a task on one thread. Commits never yield partway through, so the engine needs no page latches or thread locks, and commits arriving in the same event-loop turn share a single flush to disk. Large analytical scans parallelise across cores with `par.map`, while OLTP reads scale out via separate read-only replica processes following the master's log. See [LEXDB.md](LEXDB.md) and [LexDB performance](lexell/docs/lexdb/performance.md) for architecture and PostgreSQL 18 benchmarks.
 
-The event loop uses io_uring for sockets and files by default, where the kernel allows it. On older kernels, and in containers that block io_uring, it falls back to epoll and a pool of helper threads for file I/O, with no change to your code and little loss: in LexDB's measurements the fallback kept about seven-eighths of io_uring's select rate and matched it on updates.
+The event loop uses `io_uring` for sockets and files by default and falls back automatically to `epoll` plus a helper pool where `io_uring` is unavailable, with no code changes.
 
 The [concurrency design](lexell/design/concurrency.md) explains the choices, what they cost and what is given up.
 
@@ -199,10 +147,10 @@ The current Lexell grew out of an Oberon dialect and an ownership fork called `o
 
 | Area | What you’ll find |
 |---|---|
-| Language | Modules with explicit imports, records with methods, generics, structural interfaces (including `box I` / `&I` interface values), slices, borrowed and escaping (`box fn`) closures, string interpolation (`$"..."`), derived `Serialize`/`Deserialize`, `Option`, `Result`, `Error`, `try` (with auto-boxing), `match` and destructors. |
+| Language | Modules, records with methods, generics, structural interfaces (`box I` / `&I`), slices, borrowed and escaping (`box fn`) closures, string interpolation, derived `Serialize`/`Deserialize`, `Option`, `Result`, `Error`, `try`, `match` and destructors. |
 | Ownership | Single ownership and checked borrows, for strings too: a `str` is owned and moves, `&str` borrows it, and `clone()` copies it. Reference counting is opt-in: `rc T` is a counted, immutable handle for values you want to share. |
-| Compiler | A self-hosted compiler that writes x86-64 ELF directly (with devirtualization for interface values and escaping closures). The C backend shares the same intermediate representation and is used for bootstrapping and differential testing. |
-| Standard library | Collections, composable `io.Read`/`io.Write` streams and file I/O, time zones, regex, JSON, YAML 1.2, CSV/TSV (RFC 4180, Excel, PostgreSQL `COPY`), CommonMark, `zlib` and `zstd` compression, modern crypto (AEAD, HKDF, PBKDF2, Ed25519, X25519, ECDSA), HTTP/1.1 & HTTP/2 servers and clients (with pluggable compression and stateful closure/interface handlers), TLS, Redis and tasks. |
+| Compiler | A self-hosted compiler that emits x86-64 ELF directly, with devirtualization for interface values and escaping closures. A C backend shares the same IR for bootstrapping and differential testing. |
+| Standard library | Collections, composable `io.Read`/`io.Write` streams, time zones, regex, JSON, YAML 1.2, CSV/TSV, CommonMark, `zlib`/`zstd` compression, modern crypto, HTTP/1.1 & HTTP/2 servers and clients, TLS, Redis and tasks. |
 | Data stores | Clients for SQLite, PostgreSQL, SQL Server, Oracle and Redis. PostgreSQL, SQL Server and Oracle use their native wire protocols; Redis speaks RESP2 and RESP3. The SQL clients can decode rows into your own record types in bounded batches. |
 | Programs | A jq port, a CommonMark renderer, an HTTP/1.1 & HTTP/2 (and HTTPS) server and load client, a Redis client and `redis-cli`, and ports of everyday tools including `grep`, `eza` and `zoxide`. |
 
