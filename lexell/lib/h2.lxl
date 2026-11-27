@@ -3,6 +3,66 @@
 import "hpack"
 import "strings"
 
+type VB = vector[byte]
+
+// SIMD 32-byte bulk append from &[byte] slice into mut &[]byte.
+pub fn appendBytesSimd(dst: mut &[]byte, src: &[byte], off: int, n: int) {
+    if n <= 0 { return }
+    let at = bytesGrow(dst, n)
+    var i = 0
+    while i + 32 <= n {
+        VB.load(src, off + i).store(dst, at + i)
+        i += 32
+    }
+    while i < n {
+        dst[at + i] = src[off + i]
+        i += 1
+    }
+}
+
+// SIMD 32-byte bulk append from &str slice into mut &[]byte.
+pub fn appendStrSimd(dst: mut &[]byte, src: &str, off: int, n: int) {
+    if n <= 0 { return }
+    let at = bytesGrow(dst, n)
+    var i = 0
+    while i + 32 <= n {
+        VB.load(src, off + i).store(dst, at + i)
+        i += 32
+    }
+    while i < n {
+        dst[at + i] = src[off + i]
+        i += 1
+    }
+}
+
+// SIMD 32-byte copy between non-overlapping byte slices.
+pub fn copyBytesSimd(dst: mut &[byte], dstOff: int, src: &[byte], srcOff: int, n: int) {
+    var i = 0
+    while i + 32 <= n {
+        VB.load(src, srcOff + i).store(dst, dstOff + i)
+        i += 32
+    }
+    while i < n {
+        dst[dstOff + i] = src[srcOff + i]
+        i += 1
+    }
+}
+
+// SIMD 32-byte in-place left shift: moves buf[srcOff..srcOff+n] to buf[0..n] (srcOff >= 0).
+pub fn shiftLeftSimd(buf: mut &[byte], srcOff: int, n: int) {
+    if srcOff <= 0 || n <= 0 { return }
+    var i = 0
+    while i + 32 <= n {
+        let v = VB.load(buf, srcOff + i)
+        v.store(buf, i)
+        i += 32
+    }
+    while i < n {
+        buf[i] = buf[srcOff + i]
+        i += 1
+    }
+}
+
 // Client connection preface (RFC 9113 section 3.4), 24 octets.
 pub const PREFACE = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
 pub const PREFACE_LEN = 24
@@ -143,11 +203,22 @@ pub fn parseFrameHeader(b: &[byte]): FrameHeader {
     }
 }
 
+pub fn putFrameHeaderAt(out: mut &[byte], at: int, length: int, ftype: int, flags: int, streamId: int) {
+    let sid = streamId & 0x7fffffff
+    out[at] = byte((length >> 16) & 0xff)
+    out[at + 1] = byte((length >> 8) & 0xff)
+    out[at + 2] = byte(length & 0xff)
+    out[at + 3] = byte(ftype & 0xff)
+    out[at + 4] = byte(flags & 0xff)
+    out[at + 5] = byte((sid >> 24) & 0xff)
+    out[at + 6] = byte((sid >> 16) & 0xff)
+    out[at + 7] = byte((sid >> 8) & 0xff)
+    out[at + 8] = byte(sid & 0xff)
+}
+
 pub fn putFrameHeader(out: mut &[]byte, length: int, ftype: int, flags: int, streamId: int) {
-    putU24(out, length)
-    append(out, byte(ftype & 0xff))
-    append(out, byte(flags & 0xff))
-    putU32(out, streamId & 0x7fffffff)
+    let at = bytesGrow(out, FRAME_HDR_LEN)
+    putFrameHeaderAt(out, at, length, ftype, flags, streamId)
 }
 
 pub fn putSettings(out: mut &[]byte, entries: &[]Setting) {
@@ -164,26 +235,36 @@ pub fn putSettingsAck(out: mut &[]byte) {
 
 pub fn putPing(out: mut &[]byte, ack: bool, data: &[byte]) {
     putFrameHeader(out, 8, F_PING, if ack { FL_ACK } else { 0 }, 0)
+    let at = bytesGrow(out, 8)
     for i in 0..8 {
-        append(out, if i < len(data) { data[i] } else { byte(0) })
+        out[at + i] = if i < len(data) { data[i] } else { byte(0) }
     }
 }
 
 pub fn putWindowUpdate(out: mut &[]byte, streamId: int, incr: int) {
-    putFrameHeader(out, 4, F_WINDOW_UPDATE, 0, streamId)
-    putU32(out, incr & 0x7fffffff)
+    let at = bytesGrow(out, 13)
+    putFrameHeaderAt(out, at, 4, F_WINDOW_UPDATE, 0, streamId)
+    let v = incr & 0x7fffffff
+    out[at + 9] = byte((v >> 24) & 0xff)
+    out[at + 10] = byte((v >> 16) & 0xff)
+    out[at + 11] = byte((v >> 8) & 0xff)
+    out[at + 12] = byte(v & 0xff)
 }
 
 pub fn putRstStream(out: mut &[]byte, streamId: int, code: int) {
-    putFrameHeader(out, 4, F_RST_STREAM, 0, streamId)
-    putU32(out, code)
+    let at = bytesGrow(out, 13)
+    putFrameHeaderAt(out, at, 4, F_RST_STREAM, 0, streamId)
+    out[at + 9] = byte((code >> 24) & 0xff)
+    out[at + 10] = byte((code >> 16) & 0xff)
+    out[at + 11] = byte((code >> 8) & 0xff)
+    out[at + 12] = byte(code & 0xff)
 }
 
 pub fn putGoaway(out: mut &[]byte, lastStreamId: int, code: int, debug: &str) {
     putFrameHeader(out, 8 + len(debug), F_GOAWAY, 0, 0)
     putU32(out, lastStreamId & 0x7fffffff)
     putU32(out, code)
-    for i in 0..len(debug) { append(out, debug[i]) }
+    appendStrSimd(out, debug, 0, len(debug))
 }
 
 // Emits a complete HPACK block as a HEADERS frame followed by zero or more
@@ -193,22 +274,60 @@ pub fn putHeaderBlock(out: mut &[]byte, streamId: int, block: &[byte], endStream
     if len(block) <= mfs {
         let fl = FL_END_HEADERS | (if endStream { FL_END_STREAM } else { 0 })
         putFrameHeader(out, len(block), F_HEADERS, fl, streamId)
-        for i in 0..len(block) { append(out, block[i]) }
+        appendBytesSimd(out, block, 0, len(block))
         return
     }
     // First chunk in HEADERS
     let fl0 = if endStream { FL_END_STREAM } else { 0 }
     putFrameHeader(out, mfs, F_HEADERS, fl0, streamId)
-    for i in 0..mfs { append(out, block[i]) }
+    appendBytesSimd(out, block, 0, mfs)
     var off = mfs
     while off < len(block) {
         let rem = len(block) - off
         let n = if rem > mfs { mfs } else { rem }
         let fl = if off + n == len(block) { FL_END_HEADERS } else { 0 }
         putFrameHeader(out, n, F_CONTINUATION, fl, streamId)
-        for i in 0..n { append(out, block[off + i]) }
+        appendBytesSimd(out, block, off, n)
         off += n
     }
+}
+
+// Encodes fields directly into out as HEADERS (+ CONTINUATION if > maxFrameSize)
+// with zero intermediate block allocation on the common single-frame path.
+pub fn putHeaderBlockEncoded(enc: mut &hpack.Encoder, out: mut &[]byte, streamId: int, fields: &[]hpack.Field, endStream: bool, maxFrameSize: int) {
+    let mfs = if maxFrameSize < DEFAULT_MAX_FRAME_SIZE { DEFAULT_MAX_FRAME_SIZE } else { maxFrameSize }
+    let hdrAt = bytesGrow(out, FRAME_HDR_LEN)
+    let blkStart = len(out)
+    enc.encode(fields, out)
+    let blkLen = len(out) - blkStart
+    if blkLen <= mfs {
+        let fl = FL_END_HEADERS | (if endStream { FL_END_STREAM } else { 0 })
+        putFrameHeaderAt(out, hdrAt, blkLen, F_HEADERS, fl, streamId)
+        return
+    }
+    // Rare oversized header block: copy out and split into HEADERS + CONTINUATION.
+    var tmp = array(blkLen, byte(0))
+    copyBytesSimd(mut &tmp, 0, out, blkStart, blkLen)
+    // Trim out back to hdrAt by rebuilding? No: patch first chunk in-place and append CONTINUATIONs.
+    let fl0 = if endStream { FL_END_STREAM } else { 0 }
+    putFrameHeaderAt(out, hdrAt, mfs, F_HEADERS, fl0, streamId)
+    // Truncate extra bytes past blkStart + mfs by shrinking via pop? Avoid pop loop: rewrite remaining chunks after mfs.
+    let extra = blkLen - mfs
+    var off = mfs
+    // Overwrite from blkStart + mfs using a fresh tail buffer then copy back.
+    var cont: []byte = withCapacity(extra + ((extra / mfs) + 1) * FRAME_HDR_LEN)
+    while off < blkLen {
+        let rem = blkLen - off
+        let n = if rem > mfs { mfs } else { rem }
+        let fl = if off + n == blkLen { FL_END_HEADERS } else { 0 }
+        putFrameHeader(mut &cont, n, F_CONTINUATION, fl, streamId)
+        appendBytesSimd(mut &cont, &tmp, off, n)
+        off += n
+    }
+    // Grow out by (len(cont) - extra) and copy cont at blkStart + mfs.
+    let needGrow = len(cont) - extra
+    if needGrow > 0 { let _g = bytesGrow(out, needGrow) }
+    copyBytesSimd(out, blkStart + mfs, &cont, 0, len(cont))
 }
 
 // Emits data as one or more DATA frames bounded by maxFrameSize. If data is
@@ -225,7 +344,26 @@ pub fn putData(out: mut &[]byte, streamId: int, data: &[byte], endStream: bool, 
         let n = if rem > mfs { mfs } else { rem }
         let fl = if endStream && off + n == len(data) { FL_END_STREAM } else { 0 }
         putFrameHeader(out, n, F_DATA, fl, streamId)
-        for i in 0..n { append(out, data[off + i]) }
+        appendBytesSimd(out, data, off, n)
+        off += n
+    }
+}
+
+// Emits a str slice data[start..start+total] as one or more DATA frames without
+// allocating an intermediate []byte.
+pub fn putDataStr(out: mut &[]byte, streamId: int, data: &str, start: int, total: int, endStream: bool, maxFrameSize: int) {
+    let mfs = if maxFrameSize < DEFAULT_MAX_FRAME_SIZE { DEFAULT_MAX_FRAME_SIZE } else { maxFrameSize }
+    if total == 0 {
+        if endStream { putFrameHeader(out, 0, F_DATA, FL_END_STREAM, streamId) }
+        return
+    }
+    var off = 0
+    while off < total {
+        let rem = total - off
+        let n = if rem > mfs { mfs } else { rem }
+        let fl = if endStream && off + n == total { FL_END_STREAM } else { 0 }
+        putFrameHeader(out, n, F_DATA, fl, streamId)
+        appendStrSimd(out, data, start + off, n)
         off += n
     }
 }
@@ -305,29 +443,82 @@ pub fn parseGoaway(payload: &[byte]): Result[Goaway, int] {
 
 // ---------------------------------------------------------------- header validation (RFC 9113 section 8.2)
 
+// 256-byte lowercase RFC 9113 tchar lookup table ('1' = valid, '0' = invalid).
+const LOWER_TCHAR_LUT =
+    "00000000000000000000000000000000" + // 0x00..0x1f
+    "01011111001101101111111111000000" + // 0x20..0x3f: ! # $ % & ' * + - . 0-9
+    "00000000000000000000000000000011" + // 0x40..0x5f: ^ _ (uppercase A-Z forbidden!)
+    "11111111111111111111111111101010" + // 0x60..0x7f: ` a-z | ~
+    "00000000000000000000000000000000" +
+    "00000000000000000000000000000000" +
+    "00000000000000000000000000000000" +
+    "00000000000000000000000000000000"
+
 fn isLowerTchar(c: byte): bool {
-    if (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') { return true }
-    return c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' || c == '*' || c == '+' ||
-           c == '-' || c == '.' || c == '^' || c == '_' || c == '`' || c == '|' || c == '~'
+    return LOWER_TCHAR_LUT[int(c)] != '0'
 }
 
 // RFC 9113 section 8.2.1: regular header field names must be lowercase tokens.
 pub fn isValidHeaderName(name: &str): bool {
-    if len(name) == 0 { return false }
-    for i in 0..len(name) {
-        if !isLowerTchar(name[i]) { return false }
+    let n = len(name)
+    if n == 0 { return false }
+    var i = 0
+    if n >= 32 {
+        let va = VB.splat('a')
+        let vz = VB.splat('z')
+        let v0 = VB.splat('0')
+        let v9 = VB.splat('9')
+        let vDash = VB.splat('-')
+        let vUnder = VB.splat('_')
+        while i + 32 <= n {
+            let v = VB.load(name, i)
+            let ok = ((v >= va) & (v <= vz)) | ((v >= v0) & (v <= v9)) | (v == vDash) | (v == vUnder)
+            var bad = ok.bitmask() ^ u64(0xffffffff)
+            while bad != u64(0) {
+                let p = i + int(bad.trailingZeros())
+                if LOWER_TCHAR_LUT[int(name[p])] == '0' { return false }
+                bad = bad & (bad - u64(1))
+            }
+            i += 32
+        }
+    }
+    while i < n {
+        if LOWER_TCHAR_LUT[int(name[i])] == '0' { return false }
+        i += 1
     }
     return true
 }
+
+// 256-byte lookup table for valid HTTP/2 header value bytes (HTAB, 0x20..0x7e, 0x80..0xff).
+const H2_VAL_LUT =
+    "00000000010000000000000000000000" + // 0x00..0x1f: only HTAB (0x09)
+    "11111111111111111111111111111111" + // 0x20..0x3f
+    "11111111111111111111111111111111" + // 0x40..0x5f
+    "11111111111111111111111111111110" + // 0x60..0x7f: 0x7f forbidden
+    "11111111111111111111111111111111" +
+    "11111111111111111111111111111111" +
+    "11111111111111111111111111111111" +
+    "11111111111111111111111111111111"
 
 // RFC 9113 section 8.2.1: no NUL, CR, LF, other controls (except HTAB),
 // and no leading or trailing SP / HTAB.
 pub fn isValidHeaderValue(val: &str): bool {
     let n = len(val)
     if n > 0 && (val[0] == ' ' || val[0] == '\t' || val[n - 1] == ' ' || val[n - 1] == '\t') { return false }
-    for i in 0..n {
-        let c = val[i]
-        if (c < byte(0x20) && c != '\t') || c == byte(0x7f) { return false }
+    var i = 0
+    if n >= 32 {
+        let v20 = VB.splat(byte(0x20))
+        let vTab = VB.splat('\t')
+        let v7f = VB.splat(byte(0x7f))
+        while i + 32 <= n {
+            let v = VB.load(val, i)
+            if (((v < v20) & (v != vTab)) | (v == v7f)).any() { return false }
+            i += 32
+        }
+    }
+    while i < n {
+        if H2_VAL_LUT[int(val[i])] == '0' { return false }
+        i += 1
     }
     return true
 }
@@ -335,11 +526,11 @@ pub fn isValidHeaderValue(val: &str): bool {
 // RFC 9113 section 8.2.2: connection-specific header fields forbidden in HTTP/2.
 pub fn isForbiddenHeader(name: &str): bool {
     let n = len(name)
-    if n == 10 && name == "connection" { return true }
-    if n == 10 && name == "keep-alive" { return true }
-    if n == 16 && name == "proxy-connection" { return true }
-    if n == 17 && name == "transfer-encoding" { return true }
-    if n == 7 && name == "upgrade" { return true }
+    if n < 7 || n > 17 { return false }
+    if n == 10 { return name == "connection" || name == "keep-alive" }
+    if n == 7 { return name == "upgrade" }
+    if n == 16 { return name == "proxy-connection" }
+    if n == 17 { return name == "transfer-encoding" }
     return false
 }
 

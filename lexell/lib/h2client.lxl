@@ -154,7 +154,7 @@ pub type Stream = value record {
 pub fn (c: &Conn) share(): Conn { return Conn{sh: c.sh.share()} }
 
 fn appendSlice(dst: mut &[]byte, src: &[byte]) {
-    for i in 0..len(src) { append(dst, src[i]) }
+    h2.appendBytesSimd(dst, src, 0, len(src))
 }
 
 fn wakeOpt(p: mut &Option[task.Promise[int]]) {
@@ -420,9 +420,7 @@ pub fn (c: &Conn) roundTrip(method: &str, scheme: &str, authority: &str, path: &
             if nm == "host" || h2.isForbiddenHeader(&nm) { continue }
             append(mut &fs, hpack.Field{name: nm, value: h2.trimOws(&f.value)})
         }
-        var blk: []byte = []
-        st.enc.encode(&fs, mut &blk)
-        h2.putHeaderBlock(mut &st.dataOut, sid, &blk, !hasBody, st.peerMaxFrame)
+        h2.putHeaderBlockEncoded(mut &st.enc, mut &st.dataOut, sid, &fs, !hasBody, st.peerMaxFrame)
         st.streams.put(sid, newClientStream(sid, st.peerInitWin, !hasBody))
         st.activeCount += 1
         let now = time.monotonicNs()
@@ -590,15 +588,15 @@ pub fn (s: mut &Stream) read(buf: mut &[byte], w: Where): Result[int, ClientErro
                 let avail = len(ss.inBuf) - ss.inOff
                 if avail > 0 {
                     let k = min(avail, len(buf))
-                    for i in 0..k { buf[i] = ss.inBuf[ss.inOff + i] }
+                    h2.copyBytesSimd(buf, 0, &ss.inBuf, ss.inOff, k)
                     ss.inOff += k
                     if ss.inOff == len(ss.inBuf) {
                         ss.inBuf = []
                         ss.inOff = 0
                     } else if ss.inOff >= 4096 && ss.inOff * 2 >= len(ss.inBuf) {
                         let rem = len(ss.inBuf) - ss.inOff
-                        var nb: []byte = withCapacity(rem)
-                        for i in ss.inOff..len(ss.inBuf) { append(mut &nb, ss.inBuf[i]) }
+                        var nb = array(rem, byte(0))
+                        h2.copyBytesSimd(mut &nb, 0, &ss.inBuf, ss.inOff, rem)
                         ss.inBuf = nb
                         ss.inOff = 0
                     }
@@ -703,18 +701,23 @@ fn (c: &Conn) tryFlushNow() {
         if st.shut || st.writerActive || st.wh.isNone() { return }
         if len(st.ctrlOut) == 0 && len(st.dataOut) == 0 && st.outOff >= len(st.outBuf) { return }
         if len(st.ctrlOut) > 0 || len(st.dataOut) > 0 {
-            let ctrl = replace(mut &st.ctrlOut, [])
+            var ctrl = replace(mut &st.ctrlOut, [])
             let data = replace(mut &st.dataOut, [])
             match replace(mut &st.tls, None) {
                 Some(e) {
                     var eng = e
-                    if len(ctrl) > 0 {
+                    if len(ctrl) > 0 && len(data) > 0 {
+                        h2.appendBytesSimd(mut &ctrl, &data, 0, len(data))
                         match eng.write(&ctrl) {
                             Ok(_) {}
                             Err(te) { tlsErrStr = te.toStr() }
                         }
-                    }
-                    if len(tlsErrStr) == 0 && len(data) > 0 {
+                    } else if len(ctrl) > 0 {
+                        match eng.write(&ctrl) {
+                            Ok(_) {}
+                            Err(te) { tlsErrStr = te.toStr() }
+                        }
+                    } else if len(data) > 0 {
                         match eng.write(&data) {
                             Ok(_) {}
                             Err(te) { tlsErrStr = te.toStr() }
@@ -722,13 +725,34 @@ fn (c: &Conn) tryFlushNow() {
                     }
                     if len(tlsErrStr) == 0 {
                         let enc = eng.takeOutput()
-                        if len(enc) > 0 { appendSlice(mut &st.outBuf, &enc) }
+                        if len(enc) > 0 {
+                            if st.outOff >= len(st.outBuf) {
+                                st.outBuf = enc
+                                st.outOff = 0
+                            } else {
+                                appendSlice(mut &st.outBuf, &enc)
+                            }
+                        }
                     }
                     st.tls = Some(eng)
                 }
                 None {
-                    if len(ctrl) > 0 { appendSlice(mut &st.outBuf, &ctrl) }
-                    if len(data) > 0 { appendSlice(mut &st.outBuf, &data) }
+                    if len(ctrl) > 0 {
+                        if st.outOff >= len(st.outBuf) {
+                            st.outBuf = ctrl
+                            st.outOff = 0
+                        } else {
+                            appendSlice(mut &st.outBuf, &ctrl)
+                        }
+                    }
+                    if len(data) > 0 {
+                        if st.outOff >= len(st.outBuf) {
+                            st.outBuf = data
+                            st.outOff = 0
+                        } else {
+                            appendSlice(mut &st.outBuf, &data)
+                        }
+                    }
                 }
             }
         }
@@ -766,8 +790,8 @@ fn (c: &Conn) tryFlushNow() {
     c.sh.with(fn(st: mut &ConnState) {
         if offKeep < len(rem) && len(fatalMsg) == 0 {
             var merged: []byte = withCapacity(len(rem) - offKeep + len(st.outBuf) - st.outOff)
-            for i in offKeep..len(rem) { append(mut &merged, rem[i]) }
-            for i in st.outOff..len(st.outBuf) { append(mut &merged, st.outBuf[i]) }
+            h2.appendBytesSimd(mut &merged, &rem, offKeep, len(rem) - offKeep)
+            h2.appendBytesSimd(mut &merged, &st.outBuf, st.outOff, len(st.outBuf) - st.outOff)
             st.outBuf = merged
             st.outOff = 0
         }
@@ -836,18 +860,23 @@ fn (c: &Conn) flushWrites(w: Where): Result[Unit, ClientError] {
             c.sh.with(fn(st: mut &ConnState) {
                 // Move pending plaintext frames into outBuf (encrypting through TLS if active)
                 if len(st.ctrlOut) > 0 || len(st.dataOut) > 0 {
-                    let ctrl = replace(mut &st.ctrlOut, [])
+                    var ctrl = replace(mut &st.ctrlOut, [])
                     let data = replace(mut &st.dataOut, [])
                     match replace(mut &st.tls, None) {
                         Some(e) {
                             var eng = e
-                            if len(ctrl) > 0 {
+                            if len(ctrl) > 0 && len(data) > 0 {
+                                h2.appendBytesSimd(mut &ctrl, &data, 0, len(data))
                                 match eng.write(&ctrl) {
                                     Ok(_) {}
                                     Err(te) { tlsErrStr = te.toStr() }
                                 }
-                            }
-                            if len(tlsErrStr) == 0 && len(data) > 0 {
+                            } else if len(ctrl) > 0 {
+                                match eng.write(&ctrl) {
+                                    Ok(_) {}
+                                    Err(te) { tlsErrStr = te.toStr() }
+                                }
+                            } else if len(data) > 0 {
                                 match eng.write(&data) {
                                     Ok(_) {}
                                     Err(te) { tlsErrStr = te.toStr() }
@@ -855,13 +884,34 @@ fn (c: &Conn) flushWrites(w: Where): Result[Unit, ClientError] {
                             }
                             if len(tlsErrStr) == 0 {
                                 let enc = eng.takeOutput()
-                                if len(enc) > 0 { appendSlice(mut &st.outBuf, &enc) }
+                                if len(enc) > 0 {
+                                    if st.outOff >= len(st.outBuf) {
+                                        st.outBuf = enc
+                                        st.outOff = 0
+                                    } else {
+                                        appendSlice(mut &st.outBuf, &enc)
+                                    }
+                                }
                             }
                             st.tls = Some(eng)
                         }
                         None {
-                            if len(ctrl) > 0 { appendSlice(mut &st.outBuf, &ctrl) }
-                            if len(data) > 0 { appendSlice(mut &st.outBuf, &data) }
+                            if len(ctrl) > 0 {
+                                if st.outOff >= len(st.outBuf) {
+                                    st.outBuf = ctrl
+                                    st.outOff = 0
+                                } else {
+                                    appendSlice(mut &st.outBuf, &ctrl)
+                                }
+                            }
+                            if len(data) > 0 {
+                                if st.outOff >= len(st.outBuf) {
+                                    st.outBuf = data
+                                    st.outOff = 0
+                                } else {
+                                    appendSlice(mut &st.outBuf, &data)
+                                }
+                            }
                         }
                     }
                 }
@@ -1172,18 +1222,25 @@ fn (c: &Conn) feedPlaintext(src: &[byte]) {
         if st.inR == st.inW {
             st.inR = 0
             st.inW = 0
-        } else if st.inW + len(src) > len(st.inBuf) {
+        }
+        if st.inW + len(src) > len(st.inBuf) {
             let rem = st.inW - st.inR
             let need = rem + len(src)
-            var cap = len(st.inBuf)
-            while cap < need { cap = cap * 2 }
-            var nb = array(cap, byte(0))
-            for i in 0..rem { nb[i] = st.inBuf[st.inR + i] }
-            st.inBuf = nb
-            st.inR = 0
-            st.inW = rem
+            if st.inR > 0 && need <= len(st.inBuf) {
+                h2.shiftLeftSimd(mut &st.inBuf, st.inR, rem)
+                st.inR = 0
+                st.inW = rem
+            } else {
+                var cap = len(st.inBuf)
+                while cap < need { cap = cap * 2 }
+                var nb = array(cap, byte(0))
+                h2.copyBytesSimd(mut &nb, 0, &st.inBuf, st.inR, rem)
+                st.inBuf = nb
+                st.inR = 0
+                st.inW = rem
+            }
         }
-        for i in 0..len(src) { st.inBuf[st.inW + i] = src[i] }
+        h2.copyBytesSimd(mut &st.inBuf, st.inW, src, 0, len(src))
         st.inW += len(src)
     })
 }
@@ -1230,7 +1287,7 @@ fn (c: &Conn) processFrames(): bool {
             fh = h
             let pstart = st.inR + h2.FRAME_HDR_LEN
             payload = array(h.length, byte(0))
-            for i in 0..h.length { payload[i] = st.inBuf[pstart + i] }
+            h2.copyBytesSimd(mut &payload, 0, &st.inBuf, pstart, h.length)
             st.inR = pstart + h.length
             if st.inR == st.inW { st.inR = 0; st.inW = 0 }
             hasFrame = true
@@ -1440,7 +1497,7 @@ fn (c: &Conn) dispatchFrame(fh: h2.FrameHeader, payload: &[byte]): bool {
                         contSid = fh.streamId
                         contEs = es
                         contBlk = array(sp.end - sp.start, byte(0))
-                        for i in 0..sp.end - sp.start { contBlk[i] = payload[sp.start + i] }
+                        h2.copyBytesSimd(mut &contBlk, 0, payload, sp.start, sp.end - sp.start)
                     } else {
                         st.contStream = fh.streamId
                         st.contEndStream = es

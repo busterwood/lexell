@@ -141,15 +141,15 @@ pub fn newHeaders(): Headers { return Headers{list: []} }
 
 // ASCII case-insensitive equality (header names, tokens).
 pub fn equalFold(a: &str, b: &str): bool {
-    if len(a) != len(b) { return false }
-    if len(a) >= 32 { return strings.equalFoldAscii(a, b) }
-    for i in 0..len(a) {
-        var x = a[i]
-        var y = b[i]
+    let n = len(a)
+    if n != len(b) { return false }
+    if n >= 32 { return strings.equalFoldAscii(a, b) }
+    for i in 0..n {
+        let x = a[i]
+        let y = b[i]
         if x != y {
-            if x >= 'A' && x <= 'Z' { x += byte(32) }
-            if y >= 'A' && y <= 'Z' { y += byte(32) }
-            if x != y { return false }
+            let lx = x | byte(0x20)
+            if lx < 'a' || lx > 'z' || lx != (y | byte(0x20)) { return false }
         }
     }
     return true
@@ -183,6 +183,9 @@ pub fn (h: &Headers) line(i: int): &Header { return &h.list[i] }
 
 // Adds a line at the end.
 pub fn (h: mut &Headers) add(name: &str, value: &str) { append(mut &h.list, Header{name: name.clone(), value: value.clone()}) }
+
+// Adds an already-owned header line at the end without cloning.
+pub fn (h: mut &Headers) addOwned(name: str, value: str) { append(mut &h.list, Header{name: name, value: value}) }
 
 // Removes every line of name.
 pub fn (h: mut &Headers) remove(name: &str) {
@@ -247,17 +250,73 @@ fn hasTokenIn(v: &str, token: &str): bool {
 
 type VB = vector[byte]
 
+// 256-byte RFC 9110 §5.6.2 tchar lookup table ('1' = valid tchar, '0' = invalid).
+const TCHAR_LUT =
+    "00000000000000000000000000000000" + // 0x00..0x1f
+    "01011111001101101111111111000000" + // 0x20..0x3f: ! # $ % & ' * + - . 0-9
+    "01111111111111111111111111100011" + // 0x40..0x5f: A-Z ^ _
+    "11111111111111111111111111101010" + // 0x60..0x7f: ` a-z | ~
+    "00000000000000000000000000000000" +
+    "00000000000000000000000000000000" +
+    "00000000000000000000000000000000" +
+    "00000000000000000000000000000000"
+
 fn isTchar(c: byte): bool {
-    if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') { return true }
-    return c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' || c == '*' || c == '+' ||
-           c == '-' || c == '.' || c == '^' || c == '_' || c == '`' || c == '|' || c == '~'
+    return TCHAR_LUT[int(c)] != '0'
+}
+
+fn isTokenRange(s: &str, start: int, end: int): bool {
+    if end <= start { return false }
+    var i = start
+    if end - i >= 32 {
+        let va = VB.splat('a')
+        let vz = VB.splat('z')
+        let vA = VB.splat('A')
+        let vZ = VB.splat('Z')
+        let v0 = VB.splat('0')
+        let v9 = VB.splat('9')
+        let vDash = VB.splat('-')
+        let vUnder = VB.splat('_')
+        while i + 32 <= end {
+            let v = VB.load(s, i)
+            let ok = ((v >= va) & (v <= vz)) | ((v >= vA) & (v <= vZ)) | ((v >= v0) & (v <= v9)) | (v == vDash) | (v == vUnder)
+            var bad = ok.bitmask() ^ u64(0xffffffff)
+            while bad != u64(0) {
+                let p = i + int(bad.trailingZeros())
+                if TCHAR_LUT[int(s[p])] == '0' { return false }
+                bad = bad & (bad - u64(1))
+            }
+            i += 32
+        }
+    }
+    while i < end {
+        if TCHAR_LUT[int(s[i])] == '0' { return false }
+        i += 1
+    }
+    return true
 }
 
 // Whether s is a token (RFC 9110 5.6.2): a method or a header name.
 pub fn isToken(s: &str): bool {
-    if len(s) == 0 { return false }
-    for i in 0..len(s) {
-        if !isTchar(s[i]) { return false }
+    return isTokenRange(s, 0, len(s))
+}
+
+fn isFieldValueRange(s: &str, start: int, end: int): bool {
+    var i = start
+    if end - i >= 32 {
+        let v20 = VB.splat(byte(0x20))
+        let vTab = VB.splat('\t')
+        let v7f = VB.splat(byte(0x7f))
+        while i + 32 <= end {
+            let v = VB.load(s, i)
+            if (((v < v20) & (v != vTab)) | (v == v7f)).any() { return false }
+            i += 32
+        }
+    }
+    while i < end {
+        let c = s[i]
+        if (c < byte(0x20) && c != '\t') || c == byte(0x7f) { return false }
+        i += 1
     }
     return true
 }
@@ -265,31 +324,7 @@ pub fn isToken(s: &str): bool {
 // Whether s may be a header value: visible ASCII, space, tab and bytes
 // from 0x80 (no CR, LF, NUL or other control character).
 pub fn isFieldValue(s: &str): bool {
-    if len(s) >= 32 { return isFieldValueSimd(s) }
-    for i in 0..len(s) {
-        let c = s[i]
-        if (c < byte(0x20) && c != '\t') || c == byte(0x7f) { return false }
-    }
-    return true
-}
-
-fn isFieldValueSimd(s: &str): bool {
-    let n = len(s)
-    let v20 = VB.splat(byte(0x20))
-    let vTab = VB.splat('\t')
-    let v7f = VB.splat(byte(0x7f))
-    var i = 0
-    while i + 32 <= n {
-        let v = VB.load(s, i)
-        if (((v < v20) & (v != vTab)) | (v == v7f)).any() { return false }
-        i += 32
-    }
-    while i < n {
-        let c = s[i]
-        if (c < byte(0x20) && c != '\t') || c == byte(0x7f) { return false }
-        i += 1
-    }
-    return true
+    return isFieldValueRange(s, 0, len(s))
 }
 
 fn trimOws(s: &str): str {
@@ -339,35 +374,75 @@ fn headEndSimd(b: &[byte], start: int, from: int, n: int): int {
     return -1
 }
 
+// Finds the first CR or LF in s[from..n], or n if none.
+fn findLineEnd(s: &str, from: int, n: int): int {
+    var i = from
+    if n - i >= 32 {
+        let vCR = VB.splat('\r')
+        let vLF = VB.splat('\n')
+        while i + 32 <= n {
+            let v = VB.load(s, i)
+            let m = ((v == vCR) | (v == vLF)).bitmask()
+            if m != u64(0) { return i + int(m.trailingZeros()) }
+            i += 32
+        }
+    }
+    while i < n && s[i] != '\r' && s[i] != '\n' { i += 1 }
+    return i
+}
+
+// Finds the first ':' in s[from..end], or -1 if none.
+fn findColon(s: &str, from: int, end: int): int {
+    var i = from
+    if end - i >= 32 {
+        let vCol = VB.splat(':')
+        while i + 32 <= end {
+            let m = (VB.load(s, i) == vCol).bitmask()
+            if m != u64(0) { return i + int(m.trailingZeros()) }
+            i += 32
+        }
+    }
+    while i < end {
+        if s[i] == ':' { return i }
+        i += 1
+    }
+    return -1
+}
+
 // The header lines of head from byte `at` on (head: without the blank line
 // that ends it; lines end with CRLF) into h, at most max of them. Strict:
 // a line that starts with a space or tab (obsolete folding), a name that
 // is not a token or is followed by a space, a value with a control
 // character, a CR or LF alone, are errors.
 pub fn parseFields(head: &str, at: int, h: mut &Headers, max: int): Result[Unit, str] {
+    return parseFieldsMaxLine(head, at, h, max, 0)
+}
+
+// Same as parseFields, also enforcing a per-line length cap (in bytes, excluding LF)
+// when maxLine > 0 (returns Err("line too long") so httpserver can map it to 431).
+pub fn parseFieldsMaxLine(head: &str, at: int, h: mut &Headers, max: int, maxLine: int): Result[Unit, str] {
+    let n = len(head)
     var i = at
-    while i < len(head) {
-        var j = i
-        var colon = -1
-        while j < len(head) && head[j] != '\r' && head[j] != '\n' {
-            if colon < 0 && head[j] == ':' { colon = j }
-            j += 1
+    while i < n {
+        let j = findLineEnd(head, i, n)
+        if maxLine > 0 {
+            // Match httpserver's line-length check (up to '\n', including '\r' if CRLF).
+            let lineLen = if j < n && head[j] == '\r' && j + 1 < n && head[j + 1] == '\n' { j + 1 - i } else { j - i }
+            if lineLen > maxLine { return Err("line too long") }
         }
-        if j < len(head) && (head[j] == '\n' || j + 1 >= len(head) || head[j + 1] != '\n') {
+        if j < n && (head[j] == '\n' || j + 1 >= n || head[j + 1] != '\n') {
             return Err("a line not ended by CRLF")
         }
         if j == i { return Err("an empty header line") }
         if head[i] == ' ' || head[i] == '\t' { return Err("a header line folded onto the next (obs-fold)") }
+        let colon = findColon(head, i, j)
         if colon < 0 { return Err("a header line without ':'") }
-        if colon == i { return Err("an invalid header name") }
-        for k in i..colon {
-            if !isTchar(head[k]) { return Err("an invalid header name") }
-        }
+        if colon == i || !isTokenRange(head, i, colon) { return Err("an invalid header name") }
         var a = colon + 1
         var b = j
         while a < b && (head[a] == ' ' || head[a] == '\t') { a += 1 }
         while b > a && (head[b - 1] == ' ' || head[b - 1] == '\t') { b -= 1 }
-        if !isFieldValue(&head[a..b]) { return Err("a control character in a header value") }
+        if !isFieldValueRange(head, a, b) { return Err("a control character in a header value") }
         if len(h.list) >= max { return Err("more than " + intToStr(max) + " header lines") }
         append(mut &h.list, Header{name: head[i..colon].clone(), value: head[a..b].clone()})
         i = j + 2
