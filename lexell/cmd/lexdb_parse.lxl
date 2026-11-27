@@ -2301,6 +2301,13 @@ fn (p: mut &P) primary(): Result[Expr, lexdb_base.DbErr] {
         }
     }
     if t.kind == T_IDENT && t.text == "case" { return p.caseExpr() }
+    if p.tsql && t.kind == T_IDENT && t.text == "update" && p.isKw("(") {
+        // T-SQL trigger predicate UPDATE(column_name)
+        p.pos += 1
+        let col = try p.name()
+        try p.expectKw(")")
+        return Ok(Expr.Call("#trg_update", [Expr.Lit(Val.Text(col))], false))
+    }
     if t.kind == T_IDENT && t.text == "substring" && p.isKw("(") && p.sqlForm() {
         // substring(x [FROM a] [FOR b]) (9.92): substring(x, a [, b]), FOR alone
         // from 1; a text a is a pattern (lexdb_exec)
@@ -3049,6 +3056,15 @@ fn (p: mut &P) tsqlCall(name: &str, args: []Expr, star: bool): Result[Expr, lexd
     if name == "scope_identity" && n == 0 {
         // the batch's @@IDENTITY (refreshed before each statement): a value WHERE can read
         return p.variable(&Tok{kind: T_VAR, text: "@@identity", at: 0, spell: ""})
+    }
+    if name == "columns_updated" && n == 0 {
+        return Ok(Expr.Call("#trg_cols_updated", [], false))
+    }
+    if name == "trigger_nestlevel" && n <= 3 {
+        return Ok(Expr.Call("#trg_nestlevel", a, false))
+    }
+    if name == "eventdata" && n == 0 {
+        return Ok(Expr.Lit(Val.Null))
     }
     // SQL Server JSON functions
     if name == "json_modify" && n == 3 { return Ok(Expr.Call("#json_modify", a, false)) }
@@ -4269,6 +4285,23 @@ fn (p: mut &P) alterTable(): Result[Stmt, lexdb_base.DbErr] {
     }
     // SQL Server renames with sp_rename: ALTER TABLE has no RENAME
     if p.tsql && p.isKw("rename") { return Err(near(&p.peek())) }
+    if p.tsql && (p.isKw("enable") || p.isKw("disable")) && p.peekAt(1).kind == T_IDENT && p.peekAt(1).text == "trigger" {
+        let verb = p.next().text
+        p.pos += 1 // trigger
+        var ts = lexdb_sql.newStmt(lexdb_sql.S_ALTER_TRIGGER)
+        ts.mdialect = MD_TSQL
+        ts.alias = verb
+        ts.table = s.table.clone()
+        if p.acceptKw("all") {
+            append(mut &ts.names, "*")
+        } else {
+            while true {
+                append(mut &ts.names, try p.rname())
+                if !p.acceptKw(",") { break }
+            }
+        }
+        return Ok(ts)
+    }
     if p.acceptKw("rename") {
         // the new name's spelling in col.spell (L6)
         var sp = lexdb_sql.noCol()
@@ -8748,6 +8781,9 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 p.pos += 1
                 return p.alterDatabase()
             }
+            if p.tsql && p.isKw("trigger") {
+                return Err(lexdb_base.err("TS111", "'CREATE/ALTER TRIGGER' must be the first statement in a query batch."))
+            }
             if p.tsql && p.isKw("view") {
                 // ALTER VIEW name [(columns)] AS query: the view there is given a new definition
                 p.pos += 1
@@ -8916,6 +8952,9 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
                 let proc = p.next().text == "procedure"
                 return p.createRoutine(orReplace, proc)
             }
+            if p.tsql && p.isKw("trigger") {
+                return Err(lexdb_base.err("TS111", "'CREATE/ALTER TRIGGER' must be the first statement in a query batch."))
+            }
             if p.graphNext() { return p.createGraph(orReplace) }
             if p.isKw("assertion") { return p.assertStmt("create") }
             if !orReplace && p.acceptKw("materialized") { return p.createMview() }
@@ -9064,8 +9103,49 @@ fn (p: mut &P) statement(): Result[Stmt, lexdb_base.DbErr] {
         "refresh" {
             return p.refreshMview()
         }
+        "enable", "disable" {
+            if !p.tsql { return Err(near(&t)) }
+            try p.expectKw("trigger")
+            var ts = lexdb_sql.newStmt(lexdb_sql.S_ALTER_TRIGGER)
+            ts.mdialect = MD_TSQL
+            ts.alias = t.text.clone()
+            if p.acceptKw("all") {
+                append(mut &ts.names, "*")
+            } else {
+                while true {
+                    append(mut &ts.names, try p.rname())
+                    if !p.acceptKw(",") { break }
+                }
+            }
+            try p.expectKw("on")
+            if p.isKw("database") || p.isKw("all") {
+                return Err(lexdb_base.err("0A000", "lexdb: DDL/server triggers (ENABLE/DISABLE TRIGGER ... ON DATABASE / ALL SERVER) are not supported"))
+            }
+            ts.table = try p.rname()
+            return Ok(ts)
+        }
         "drop" {
             if p.tsql && p.isKw("routine") { return Err(lexdb_base.err("TS343", "Unknown object type 'ROUTINE' used in a CREATE, DROP, or ALTER statement.")) }
+            if p.tsql && p.acceptKw("trigger") {
+                var ts = lexdb_sql.newStmt(lexdb_sql.S_DROP_TRIGGER)
+                ts.mdialect = MD_TSQL
+                if p.acceptKw("if") {
+                    try p.expectKw("exists")
+                    ts.ifFlag = true
+                }
+                while true {
+                    let at = p.peek().at
+                    let key = try p.rname()
+                    let spell = strings.trim(&p.src[at..min(p.peek().at, len(p.src))]).toStr()
+                    append(mut &ts.names, key)
+                    append(mut &ts.spells, spell)
+                    if !p.acceptKw(",") { break }
+                }
+                if p.acceptKw("on") {
+                    return Err(lexdb_base.err("0A000", "lexdb: DDL/server triggers (DROP TRIGGER ... ON DATABASE / ALL SERVER) are not supported"))
+                }
+                return Ok(ts)
+            }
             if p.isKw("function") || p.isKw("procedure") || (!p.tsql && p.isKw("routine")) || (p.tsql && p.isKw("proc")) {
                 var kw = p.next().text
                 if kw == "proc" { kw = "procedure" }
@@ -11166,6 +11246,7 @@ pub fn tsqlSelect(sql: &str, vars: &[]str): Result[Stmt, lexdb_base.DbErr] {
 // Where the next token starts, and the source text (a procedure's body, after its AS).
 pub fn (q: &Parser) here(): int { return q.p.peek().at }
 pub fn (q: &Parser) source(): &str { return &q.p.src }
+pub fn (q: &Parser) lastSpelled(): str { return q.p.spelled.clone() }
 
 // A SQL function's body with each use of a named input parameter written as $n (names[i] is $nums[i]): fname.name too. A
 // name after a "." or before a "(" is a column's or a function's and stays.

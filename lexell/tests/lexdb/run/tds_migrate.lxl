@@ -158,6 +158,9 @@ fn populate(c: mut &sqlserver.Conn) {
     mustExec(c, "CREATE UNIQUE CLUSTERED INDEX IX_v_dept_sum ON sales.v_dept_sum (dept_id);")
     mustExec(c, "CREATE FUNCTION dbo.fn_dbl(@x int) RETURNS int AS BEGIN RETURN @x * 2; END;")
     mustExec(c, "CREATE PROCEDURE dbo.sp_dept_cnt @did int, @cnt int OUTPUT AS BEGIN SET NOCOUNT ON; SELECT @cnt = COUNT(*) FROM dbo.emp WHERE dept_id = @did; RETURN 9; END;")
+    mustExec(c, "CREATE TRIGGER dbo.tr_dept_guard ON dbo.dept AFTER INSERT AS BEGIN IF EXISTS (SELECT 1 FROM inserted WHERE budget < 0) THROW 51001, 'neg budget', 1; END")
+    mustExec(c, "CREATE TRIGGER dbo.tr_dept_off ON dbo.dept AFTER DELETE AS BEGIN THROW 51002, 'no delete', 1; END")
+    mustExec(c, "DISABLE TRIGGER dbo.tr_dept_off ON dbo.dept;")
 }
 
 fn verifyTarget(c: mut &sqlserver.Conn, tag: &str) {
@@ -183,6 +186,11 @@ fn verifyTarget(c: mut &sqlserver.Conn, tag: &str) {
     let pr = c.callProc("dbo.sp_dept_cnt", &[sqlserver.arg("@did", sqlserver.Value.Int(100)), sqlserver.outArg("@cnt", "int")], &[]).unwrap()
     assertEq("proc out", &(pr.outputs.int(0, 0).unwrap().toStr()), "2")
     assertEq("proc ret", &(pr.returnStatus.unwrapOr(-1).toStr()), "9")
+    assertEq("triggers migrated", &q1(c, "SELECT name, is_disabled FROM sys.triggers ORDER BY name"), "tr_dept_guard|0\ntr_dept_off|1")
+    match c.exec("INSERT INTO dbo.dept (code, name, budget) VALUES ('BAD001', N'Bad', -1);") {
+        Ok(_) { println("FAIL migrated trigger did not fire"); exit(1) }
+        Err(_) {}
+    }
     println(tag + " checks ok")
 }
 

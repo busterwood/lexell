@@ -1,0 +1,903 @@
+// lexdb_trigger: unified trigger metadata, catalog persistence, and per-session runtime state
+// shared across SQL Server, PostgreSQL, and Oracle doors.
+//
+// - Catalog storage: each trigger is stored in CATALOG under TRG_PRE ("\x02trg\x00") + key.
+// - Zero-cost DML subscription: a table or view with triggers carries TRG_PRE + key in Table.refBy.
+//   Tables without triggers pay zero overhead on DML (dmlTableSimple, delNarrow, rangeDelete,
+//   and parentSide already handle \x02-prefixed refBy marks).
+// - Per-session runtime state:
+//   * DmlScope stack captures inserted/deleted rows (and FK cascade child rows) during a DML statement.
+//   * TrigFrame stack tracks active nested triggers for virtual tables (inserted/deleted, PG transition
+//     tables), UPDATE(col), COLUMNS_UPDATED(), TRIGGER_NESTLEVEL(), and recursion guards.
+import "strings"
+import "binary"
+import "collections"
+import "task"
+import "./lexdb_base"
+import "./lexdb_sql"
+import "./lexdb_store"
+import "./lexdb_catalog"
+
+type DbErr = lexdb_base.DbErr
+type Table = lexdb_catalog.Table
+type ColDef = lexdb_sql.ColDef
+type Val = lexdb_sql.Val
+
+// Trigger dialect (matches RD_* numbering).
+pub const TD_PG = 0
+pub const TD_TSQL = 1
+pub const TD_ORA = 2
+
+// Trigger timing.
+pub const TT_BEFORE = 1
+pub const TT_AFTER = 2
+pub const TT_INSTEAD_OF = 3
+
+// Trigger events (bitmask).
+pub const TE_INSERT = 1
+pub const TE_UPDATE = 2
+pub const TE_DELETE = 4
+pub const TE_TRUNCATE = 8
+
+// Trigger granularity.
+pub const TL_STATEMENT = 0
+pub const TL_ROW = 1
+
+// Trigger firing order (SQL Server sp_settriggerorder).
+pub const TO_NONE = 0
+pub const TO_FIRST = 1
+pub const TO_LAST = 2
+
+// Catalog key prefixes.
+pub const TRG_PRE: str = lexdb_catalog.TRG_PRE
+pub const TRG_END: str = lexdb_catalog.TRG_END
+const TRG_SEQ_KEY: str = "\x02trgseq\x00"
+const TRG_ANY_MEMO: str = "trg.any"
+
+// Virtual relation marker in Table.view for trigger transition tables (inserted/deleted, PG OLD/NEW TABLE).
+pub const TRG_REL: str = "\x00trg:"
+
+pub type Trigger = record {
+    pub key: str            // storage suffix: dialect + "\x00" + scopeKey (TSQL/ORA: schema-qualified key; PG: targetKey + "\x00" + name)
+    pub dialect: int        // TD_PG / TD_TSQL / TD_ORA
+    pub name: str           // folded trigger name (without schema)
+    pub spell: str          // original case trigger name as written
+    pub schema: str         // trigger schema (folded; "public" for dbo)
+    pub target: str         // target table or view catalog key
+    pub isView: bool        // true if target is a view
+    pub timing: int         // TT_BEFORE / TT_AFTER / TT_INSTEAD_OF
+    pub events: int         // bitmask of TE_*
+    pub level: int          // TL_STATEMENT / TL_ROW
+    pub cols: []str         // OF col1, col2 (PG / Oracle UPDATE OF columns)
+    pub whenExpr: str       // WHEN (...) condition text (PG / Oracle)
+    pub body: str           // trigger body (TSQL batch, Oracle PL/SQL block, PG function key)
+    pub funcArgs: []str     // PG EXECUTE FUNCTION args
+    pub def: str            // full CREATE TRIGGER ... definition text
+    pub refOld: str         // REFERENCING OLD [TABLE] AS ...
+    pub refNew: str         // REFERENCING NEW [TABLE] AS ...
+    pub refParent: str      // Oracle REFERENCING PARENT AS ...
+    pub enabled: bool       // enabled state
+    pub orderIns: int       // sp_settriggerorder for INSERT (TO_*)
+    pub orderUpd: int       // sp_settriggerorder for UPDATE (TO_*)
+    pub orderDel: int       // sp_settriggerorder for DELETE (TO_*)
+    pub follows: []str      // Oracle FOLLOWS trigger names
+    pub precedes: []str     // Oracle PRECEDES trigger names
+    pub owner: str          // owner role
+    pub createdSeq: int     // monotonic sequence for deterministic firing order
+    pub oid: int            // deterministic object_id / oid
+}
+
+pub fn emptyTrigger(): Trigger {
+    return Trigger{
+        key: "", dialect: TD_TSQL, name: "", spell: "", schema: "public", target: "", isView: false,
+        timing: TT_AFTER, events: 0, level: TL_STATEMENT, cols: [], whenExpr: "", body: "", funcArgs: [],
+        def: "", refOld: "", refNew: "", refParent: "", enabled: true, orderIns: TO_NONE, orderUpd: TO_NONE,
+        orderDel: TO_NONE, follows: [], precedes: [], owner: "", createdSeq: 0, oid: 0,
+    }
+}
+
+pub fn makeKey(dialect: int, scopeKey: &str): str {
+    return dialect.toStr() + "\x00" + scopeKey
+}
+
+pub fn makeOid(key: &str): int {
+    return lexdb_sql.nameOid("TR", key)
+}
+
+pub fn trgKey(key: &str): str { return TRG_PRE + key }
+pub fn isTrgMark(k: &str): bool { return strings.startsWith(k, TRG_PRE) }
+
+pub fn hasMarks(refBy: &[]str): bool {
+    for x in refBy { if isTrgMark(&x) { return true } }
+    return false
+}
+
+pub fn marksOf(refBy: &[]str): []str {
+    var out: []str = []
+    for x in refBy {
+        if isTrgMark(&x) { append(mut &out, x[len(TRG_PRE)..len(x)].toStr()) }
+    }
+    return out
+}
+
+// ---- binary encoding / decoding (version 1)
+
+pub fn encode(tr: &Trigger): str {
+    var b = ""
+    b.addByte(byte(1)) // version
+    b.addByte(byte(tr.dialect))
+    b.addByte(byte(tr.timing))
+    b.addByte(byte(tr.events))
+    b.addByte(byte(tr.level))
+    b.addByte(if tr.isView { byte(1) } else { byte(0) })
+    b.addByte(if tr.enabled { byte(1) } else { byte(0) })
+    b.addByte(byte(tr.orderIns))
+    b.addByte(byte(tr.orderUpd))
+    b.addByte(byte(tr.orderDel))
+    binary.addU64BE(mut &b, tr.createdSeq)
+    binary.addU64BE(mut &b, tr.oid)
+    lexdb_catalog.addStr(mut &b, &tr.key)
+    lexdb_catalog.addStr(mut &b, &tr.name)
+    lexdb_catalog.addStr(mut &b, &tr.spell)
+    lexdb_catalog.addStr(mut &b, &tr.schema)
+    lexdb_catalog.addStr(mut &b, &tr.target)
+    lexdb_catalog.addStr(mut &b, &tr.whenExpr)
+    lexdb_catalog.addStr(mut &b, &tr.body)
+    lexdb_catalog.addStr(mut &b, &tr.def)
+    lexdb_catalog.addStr(mut &b, &tr.refOld)
+    lexdb_catalog.addStr(mut &b, &tr.refNew)
+    lexdb_catalog.addStr(mut &b, &tr.refParent)
+    lexdb_catalog.addStr(mut &b, &tr.owner)
+    lexdb_catalog.addStrs(mut &b, &tr.cols)
+    lexdb_catalog.addStrs(mut &b, &tr.funcArgs)
+    lexdb_catalog.addStrs(mut &b, &tr.follows)
+    lexdb_catalog.addStrs(mut &b, &tr.precedes)
+    return b
+}
+
+fn readStr(s: &str, at: mut &int): str {
+    let v = lexdb_catalog.strAt(s, at)
+    at += 4 + len(v)
+    return v
+}
+
+fn readStrs(s: &str, at: mut &int): []str {
+    let v = lexdb_catalog.strsAt(s, at)
+    at += lexdb_catalog.strsLen(&v)
+    return v
+}
+
+pub fn decode(s: &str): Trigger {
+    var tr = emptyTrigger()
+    if len(s) < 26 { return tr }
+    tr.dialect = int(s[1])
+    tr.timing = int(s[2])
+    tr.events = int(s[3])
+    tr.level = int(s[4])
+    tr.isView = s[5] != byte(0)
+    tr.enabled = s[6] != byte(0)
+    tr.orderIns = int(s[7])
+    tr.orderUpd = int(s[8])
+    tr.orderDel = int(s[9])
+    tr.createdSeq = binary.readI64BEStr(s, 10)
+    tr.oid = binary.readI64BEStr(s, 18)
+    var at = 26
+    tr.key = readStr(s, mut &at)
+    tr.name = readStr(s, mut &at)
+    tr.spell = readStr(s, mut &at)
+    tr.schema = readStr(s, mut &at)
+    tr.target = readStr(s, mut &at)
+    tr.whenExpr = readStr(s, mut &at)
+    tr.body = readStr(s, mut &at)
+    tr.def = readStr(s, mut &at)
+    tr.refOld = readStr(s, mut &at)
+    tr.refNew = readStr(s, mut &at)
+    tr.refParent = readStr(s, mut &at)
+    tr.owner = readStr(s, mut &at)
+    tr.cols = readStrs(s, mut &at)
+    tr.funcArgs = readStrs(s, mut &at)
+    tr.follows = readStrs(s, mut &at)
+    tr.precedes = readStrs(s, mut &at)
+    return tr
+}
+
+// ---- catalog CRUD
+
+pub fn nextSeq(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[int, DbErr] {
+    var cur = 0
+    match try st.get(txn, lexdb_catalog.CATALOG, TRG_SEQ_KEY) {
+        Some(v) { if len(v) >= 8 { cur = binary.readI64BEStr(&v, 0) } }
+        None {}
+    }
+    cur += 1
+    var buf = ""
+    binary.addU64BE(mut &buf, cur)
+    try txn.put(lexdb_catalog.CATALOG, TRG_SEQ_KEY, &buf)
+    return Ok(cur)
+}
+
+pub fn put(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, tr: &Trigger): Result[Unit, DbErr] {
+    try txn.put(lexdb_catalog.CATALOG, &(trgKey(&tr.key)), &(encode(tr)))
+    st.memo.put(&TRG_ANY_MEMO, &"1")
+    return Ok(Unit{})
+}
+
+pub fn del(txn: mut &lexdb_store.Txn, key: &str) {
+    txn.del(lexdb_catalog.CATALOG, &(trgKey(key)))
+}
+
+pub fn get(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, key: &str): Result[Option[Trigger], DbErr] {
+    match try st.get(txn, lexdb_catalog.CATALOG, &(trgKey(key))) {
+        Some(v) { return Ok(Some(decode(&v))) }
+        None { return Ok(None) }
+    }
+}
+
+pub fn all(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): Result[[]Trigger, DbErr] {
+    var out: []Trigger = []
+    try st.scan(txn, lexdb_catalog.CATALOG, TRG_PRE, TRG_END, fn(en: &lexdb_store.Entry): bool {
+        append(mut &out, decode(&en.val))
+        return true
+    })
+    return Ok(out)
+}
+
+pub fn allFromSnap(raw: &[]str): []Trigger {
+    var out: []Trigger = []
+    for s in raw { append(mut &out, decode(&s)) }
+    return out
+}
+
+// Fast check whether this store has (or has ever had) triggers; initialized lazily on first check.
+pub fn storeHasAny(st: &lexdb_store.Store): bool {
+    match st.memo.get(&TRG_ANY_MEMO) {
+        Some(v) { return v == "1" }
+        None {
+            var found = false
+            var t = lexdb_store.begin()
+            let _ = st.scan(mut &t, lexdb_catalog.CATALOG, TRG_PRE, TRG_END, fn(en: &lexdb_store.Entry): bool {
+                found = true
+                return false
+            })
+            let flag = if found { "1" } else { "0" }
+            st.memo.put(&TRG_ANY_MEMO, &flag)
+            return found
+        }
+    }
+}
+
+pub fn noteAny(st: &lexdb_store.Store) {
+    st.memo.put(&TRG_ANY_MEMO, &"1")
+}
+
+// All triggers attached to target table/view t (reads only keys named in t.refBy for tables,
+// or scans TRG_PRE for views whose catalog row does not persist refBy).
+pub fn onTarget(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result[[]Trigger, DbErr] {
+    if len(t.view) > 0 {
+        return onTargetKey(st, txn, &t.name)
+    }
+    var out: []Trigger = []
+    for k in marksOf(&t.refBy) {
+        match try get(st, txn, &k) {
+            Some(tr) { append(mut &out, tr) }
+            None {}
+        }
+    }
+    return Ok(out)
+}
+
+pub fn onTargetKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, targetKey: &str): Result[[]Trigger, DbErr] {
+    var out: []Trigger = []
+    if !storeHasAny(st) { return Ok(out) }
+    for tr in try all(st, txn) {
+        if tr.target == targetKey { append(mut &out, tr) }
+    }
+    return Ok(out)
+}
+
+pub fn dropForTarget(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table): Result[Unit, DbErr] {
+    if len(t.view) > 0 {
+        for tr in try onTargetKey(st, txn, &t.name) { del(txn, &tr.key) }
+        return Ok(Unit{})
+    }
+    for k in marksOf(&t.refBy) { del(txn, &k) }
+    return Ok(Unit{})
+}
+
+pub fn renameTarget(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, oldKey: &str, newKey: &str): Result[Unit, DbErr] {
+    if !storeHasAny(st) { return Ok(Unit{}) }
+    for tr0 in try all(st, txn) {
+        if tr0.target == oldKey {
+            var tr = tr0.clone()
+            tr.target = newKey.toStr()
+            try put(st, txn, &tr)
+        }
+    }
+    return Ok(Unit{})
+}
+
+pub fn orderForEvent(tr: &Trigger, event: int): int {
+    if event == TE_INSERT { return tr.orderIns }
+    if event == TE_UPDATE { return tr.orderUpd }
+    if event == TE_DELETE { return tr.orderDel }
+    return TO_NONE
+}
+
+// Enabled triggers on target matching timing and event, ordered by FIRST -> creation seq -> LAST.
+pub fn onTargetFor(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, timing: int, event: int): Result[[]Trigger, DbErr] {
+    let allT = try onTarget(st, txn, t)
+    var first: []Trigger = []
+    var mid: []Trigger = []
+    var last: []Trigger = []
+    for tr in allT {
+        if !tr.enabled { continue }
+        if tr.timing != timing { continue }
+        if (tr.events & event) == 0 { continue }
+        let ord = orderForEvent(&tr, event)
+        if ord == TO_FIRST { append(mut &first, tr) }
+        else if ord == TO_LAST { append(mut &last, tr) }
+        else { append(mut &mid, tr) }
+    }
+    // insertion sort mid by createdSeq
+    for i in 1..len(mid) {
+        let cur = mid[i].clone()
+        var j = i - 1
+        while j >= 0 && mid[j].createdSeq > cur.createdSeq {
+            mid[j + 1] = mid[j].clone()
+            j -= 1
+        }
+        mid[j + 1] = cur
+    }
+    var out: []Trigger = []
+    for tr in first { append(mut &out, tr) }
+    for tr in mid { append(mut &out, tr) }
+    for tr in last { append(mut &out, tr) }
+    return Ok(out)
+}
+
+pub fn hasEnabledFor(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, timing: int, event: int): Result[bool, DbErr] {
+    if len(t.view) > 0 {
+        for tr in try onTargetKey(st, txn, &t.name) {
+            if tr.enabled && tr.timing == timing && (tr.events & event) != 0 { return Ok(true) }
+        }
+        return Ok(false)
+    }
+    if !hasMarks(&t.refBy) { return Ok(false) }
+    for k in marksOf(&t.refBy) {
+        match try get(st, txn, &k) {
+            Some(tr) {
+                if tr.enabled && tr.timing == timing && (tr.events & event) != 0 { return Ok(true) }
+            }
+            None {}
+        }
+    }
+    return Ok(false)
+}
+
+// Find a schema-scoped trigger (SQL Server / Oracle) by dialect and catalog key (e.g. "tr_name" or "sales.tr_name").
+pub fn findByKey(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, dialect: int, scopeKey: &str): Result[Option[Trigger], DbErr] {
+    return get(st, txn, &(makeKey(dialect, scopeKey)))
+}
+
+// ---- column helpers (excluding hidden \x00rowid columns)
+
+pub fn visibleCols(t: &Table): []ColDef {
+    var out: []ColDef = []
+    for c in t.cols {
+        if lexdb_catalog.hiddenName(&c.name) { continue }
+        append(mut &out, c.clone())
+    }
+    return out
+}
+
+pub fn stripHidden(t: &Table, row: &[]Val): []Val {
+    if !lexdb_catalog.hiddenKeyed(t) {
+        var fast = true
+        for c in t.cols { if lexdb_catalog.hiddenName(&c.name) { fast = false; break } }
+        if fast { return collections.copyOf(row) }
+    }
+    var out: []Val = []
+    for i in 0..len(t.cols) {
+        if lexdb_catalog.hiddenName(&t.cols[i].name) { continue }
+        if i < len(row) { append(mut &out, row[i].clone()) }
+        else { append(mut &out, Val.Null) }
+    }
+    return out
+}
+
+// Build a visible-column updated bitmap from raw Table column indices.
+pub fn updatedBitmap(t: &Table, targets: &[]int, allTrue: bool): []bool {
+    var visIdx: []int = []
+    for i in 0..len(t.cols) {
+        if !lexdb_catalog.hiddenName(&t.cols[i].name) { append(mut &visIdx, i) }
+    }
+    var bits: []bool = array(len(visIdx), allTrue)
+    if allTrue { return bits }
+    for tg in targets {
+        for v in 0..len(visIdx) {
+            if visIdx[v] == tg { bits[v] = true; break }
+        }
+    }
+    return bits
+}
+
+// ---- per-session DML delta stack & active trigger frame stack
+
+pub type TableDelta = record {
+    pub target: str
+    pub event: int
+    pub insteadOf: bool
+    pub cols: []ColDef
+    pub updatedCols: []bool
+    pub inserted: [][]Val
+    pub deleted: [][]Val
+    pub rowCount: int
+    pub isBulk: bool
+    pub fireBulk: bool
+}
+
+pub type DmlScope = record {
+    pub entries: []TableDelta
+    pub mark: int
+}
+
+pub type TrigFrame = record {
+    pub trig: Trigger
+    pub event: int
+    pub cols: []ColDef
+    pub updatedCols: []bool
+    pub inserted: [][]Val
+    pub deleted: [][]Val
+    pub rowCount: int
+    pub refOld: str
+    pub refNew: str
+    pub depth: int
+}
+
+pub type FireReq = record {
+    pub trig: Trigger
+    pub delta: TableDelta
+}
+
+type SessState = record {
+    scopes: []DmlScope
+    frames: []TrigFrame
+}
+
+type SessStore = record {
+    keys: []int
+    vals: []SessState
+}
+
+var SESS_STATES: once task.Shared[SessStore]
+var SESS_ACTIVE: int = 0
+
+fn store(): task.Shared[SessStore] {
+    if !SESS_STATES.isSet() { SESS_STATES.set(task.shared(SessStore{keys: [], vals: []})) }
+    return SESS_STATES.get().share()
+}
+
+fn findSlot(st: &SessStore, sess: int): int {
+    for i in 0..len(st.keys) { if st.keys[i] == sess { return i } }
+    return -1
+}
+
+fn ensureSlot(st: mut &SessStore, sess: int): int {
+    let i = findSlot(st, sess)
+    if i >= 0 { return i }
+    append(mut &st.keys, sess)
+    append(mut &st.vals, SessState{scopes: [], frames: []})
+    SESS_ACTIVE += 1
+    return len(st.keys) - 1
+}
+
+fn removeSlot(st: mut &SessStore, i: int) {
+    let last = len(st.keys) - 1
+    if i != last {
+        st.keys[i] = st.keys[last]
+        st.vals[i] = replace(mut &st.vals[last], SessState{scopes: [], frames: []})
+    }
+    let _k = pop(mut &st.keys)
+    let _v = pop(mut &st.vals)
+    if SESS_ACTIVE > 0 { SESS_ACTIVE -= 1 }
+}
+
+pub fn pushScope(sess: int, mark: int) {
+    store().with(fn(st: mut &SessStore) {
+        let i = ensureSlot(st, sess)
+        append(mut &st.vals[i].scopes, DmlScope{entries: [], mark: mark})
+    })
+}
+
+pub fn popScope(sess: int): Option[DmlScope] {
+    if SESS_ACTIVE == 0 { return None }
+    var out: Option[DmlScope] = None
+    store().with(fn(st: mut &SessStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 && len(st.vals[i].scopes) > 0 {
+            out = Some(pop(mut &st.vals[i].scopes))
+            if len(st.vals[i].scopes) == 0 && len(st.vals[i].frames) == 0 { removeSlot(st, i) }
+        }
+    })
+    return out
+}
+
+pub fn hasActiveScope(sess: int): bool {
+    if SESS_ACTIVE == 0 { return false }
+    var ok = false
+    store().with(fn(st: mut &SessStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 && len(st.vals[i].scopes) > 0 { ok = true }
+    })
+    return ok
+}
+
+pub fn clearSession(sess: int) {
+    if SESS_ACTIVE == 0 { return }
+    store().with(fn(st: mut &SessStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 { removeSlot(st, i) }
+    })
+}
+
+pub fn clearScopes(sess: int) {
+    if SESS_ACTIVE == 0 { return }
+    store().with(fn(st: mut &SessStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 {
+            st.vals[i].scopes = []
+            if len(st.vals[i].frames) == 0 { removeSlot(st, i) }
+        }
+    })
+}
+
+pub fn undoTo(sess: int, mark: int) {
+    if SESS_ACTIVE == 0 { return }
+    store().with(fn(st: mut &SessStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 {
+            while len(st.vals[i].scopes) > 0 && st.vals[i].scopes[len(st.vals[i].scopes) - 1].mark >= mark {
+                let _ = pop(mut &st.vals[i].scopes)
+            }
+            if len(st.vals[i].scopes) == 0 && len(st.vals[i].frames) == 0 { removeSlot(st, i) }
+        }
+    })
+}
+
+fn findDeltaIdx(entries: &[]TableDelta, target: &str, event: int, insteadOf: bool): int {
+    for i in 0..len(entries) {
+        if entries[i].target == target && entries[i].event == event && entries[i].insteadOf == insteadOf {
+            return i
+        }
+    }
+    return -1
+}
+
+pub fn ensureTarget(sess: int, t: &Table, event: int, insteadOf: bool, updatedCols: &[]bool, isBulk: bool, fireBulk: bool) {
+    if SESS_ACTIVE == 0 || !hasMarks(&t.refBy) { return }
+    store().with(fn(st: mut &SessStore) {
+        let slot = findSlot(st, sess)
+        if slot < 0 || len(st.vals[slot].scopes) == 0 { return }
+        let si = len(st.vals[slot].scopes) - 1
+        let idx = findDeltaIdx(&st.vals[slot].scopes[si].entries, &t.name, event, insteadOf)
+        if idx < 0 {
+            let vc = visibleCols(t)
+            var uc: []bool = []
+            if len(updatedCols) == len(vc) {
+                for b in updatedCols { append(mut &uc, b) }
+            } else {
+                uc = array(len(vc), event == TE_INSERT)
+            }
+            append(mut &st.vals[slot].scopes[si].entries, TableDelta{
+                target: t.name.clone(), event: event, insteadOf: insteadOf, cols: vc,
+                updatedCols: uc, inserted: [], deleted: [], rowCount: 0, isBulk: isBulk, fireBulk: fireBulk,
+            })
+        } else if len(updatedCols) == len(st.vals[slot].scopes[si].entries[idx].updatedCols) {
+            for k in 0..len(updatedCols) {
+                if updatedCols[k] { st.vals[slot].scopes[si].entries[idx].updatedCols[k] = true }
+            }
+        }
+    })
+}
+
+pub fn recordInsert(sess: int, t: &Table, row: &[]Val) {
+    if SESS_ACTIVE == 0 || !hasMarks(&t.refBy) { return }
+    store().with(fn(st: mut &SessStore) {
+        let slot = findSlot(st, sess)
+        if slot < 0 || len(st.vals[slot].scopes) == 0 { return }
+        let si = len(st.vals[slot].scopes) - 1
+        var idx = findDeltaIdx(&st.vals[slot].scopes[si].entries, &t.name, TE_INSERT, false)
+        if idx < 0 {
+            let vc = visibleCols(t)
+            let uc = array(len(vc), true)
+            append(mut &st.vals[slot].scopes[si].entries, TableDelta{
+                target: t.name.clone(), event: TE_INSERT, insteadOf: false, cols: vc,
+                updatedCols: uc, inserted: [], deleted: [], rowCount: 0, isBulk: false, fireBulk: false,
+            })
+            idx = len(st.vals[slot].scopes[si].entries) - 1
+        }
+        append(mut &st.vals[slot].scopes[si].entries[idx].inserted, stripHidden(t, row))
+        st.vals[slot].scopes[si].entries[idx].rowCount += 1
+    })
+}
+
+pub fn recordUpdate(sess: int, t: &Table, old: &[]Val, nw: &[]Val, updatedCols: &[]bool) {
+    if SESS_ACTIVE == 0 || !hasMarks(&t.refBy) { return }
+    store().with(fn(st: mut &SessStore) {
+        let slot = findSlot(st, sess)
+        if slot < 0 || len(st.vals[slot].scopes) == 0 { return }
+        let si = len(st.vals[slot].scopes) - 1
+        var idx = findDeltaIdx(&st.vals[slot].scopes[si].entries, &t.name, TE_UPDATE, false)
+        if idx < 0 {
+            let vc = visibleCols(t)
+            var uc: []bool = []
+            if len(updatedCols) == len(vc) {
+                for b in updatedCols { append(mut &uc, b) }
+            } else {
+                uc = array(len(vc), false)
+                let so = stripHidden(t, old)
+                let sn = stripHidden(t, nw)
+                for k in 0..len(vc) {
+                    if k < len(so) && k < len(sn) && lexdb_sql.text(&so[k]) != lexdb_sql.text(&sn[k]) { uc[k] = true }
+                }
+            }
+            append(mut &st.vals[slot].scopes[si].entries, TableDelta{
+                target: t.name.clone(), event: TE_UPDATE, insteadOf: false, cols: vc,
+                updatedCols: uc, inserted: [], deleted: [], rowCount: 0, isBulk: false, fireBulk: false,
+            })
+            idx = len(st.vals[slot].scopes[si].entries) - 1
+        } else if len(updatedCols) == len(st.vals[slot].scopes[si].entries[idx].updatedCols) {
+            for k in 0..len(updatedCols) {
+                if updatedCols[k] { st.vals[slot].scopes[si].entries[idx].updatedCols[k] = true }
+            }
+        }
+        append(mut &st.vals[slot].scopes[si].entries[idx].deleted, stripHidden(t, old))
+        append(mut &st.vals[slot].scopes[si].entries[idx].inserted, stripHidden(t, nw))
+        st.vals[slot].scopes[si].entries[idx].rowCount += 1
+    })
+}
+
+pub fn recordDelete(sess: int, t: &Table, old: &[]Val) {
+    if SESS_ACTIVE == 0 || !hasMarks(&t.refBy) { return }
+    store().with(fn(st: mut &SessStore) {
+        let slot = findSlot(st, sess)
+        if slot < 0 || len(st.vals[slot].scopes) == 0 { return }
+        let si = len(st.vals[slot].scopes) - 1
+        var idx = findDeltaIdx(&st.vals[slot].scopes[si].entries, &t.name, TE_DELETE, false)
+        if idx < 0 {
+            let vc = visibleCols(t)
+            let uc = array(len(vc), false)
+            append(mut &st.vals[slot].scopes[si].entries, TableDelta{
+                target: t.name.clone(), event: TE_DELETE, insteadOf: false, cols: vc,
+                updatedCols: uc, inserted: [], deleted: [], rowCount: 0, isBulk: false, fireBulk: false,
+            })
+            idx = len(st.vals[slot].scopes[si].entries) - 1
+        }
+        append(mut &st.vals[slot].scopes[si].entries[idx].deleted, stripHidden(t, old))
+        st.vals[slot].scopes[si].entries[idx].rowCount += 1
+    })
+}
+
+pub fn recordInsteadOf(sess: int, t: &Table, event: int, inserted0: [][]Val, deleted0: [][]Val, updatedCols: &[]bool, rowCount: int) {
+    if SESS_ACTIVE == 0 { return }
+    var ins = inserted0
+    var del = deleted0
+    store().with(fn(st: mut &SessStore) {
+        let slot = findSlot(st, sess)
+        if slot < 0 || len(st.vals[slot].scopes) == 0 { return }
+        let si = len(st.vals[slot].scopes) - 1
+        let vc = visibleCols(t)
+        var uc: []bool = []
+        if len(updatedCols) == len(vc) {
+            for b in updatedCols { append(mut &uc, b) }
+        } else {
+            uc = array(len(vc), event == TE_INSERT)
+        }
+        append(mut &st.vals[slot].scopes[si].entries, TableDelta{
+            target: t.name.clone(), event: event, insteadOf: true, cols: vc,
+            updatedCols: uc, inserted: replace(mut &ins, []), deleted: replace(mut &del, []), rowCount: rowCount, isBulk: false, fireBulk: false,
+        })
+    })
+}
+
+// ---- active trigger frame stack
+
+pub fn pushFrame(sess: int, trig: &Trigger, delta: &TableDelta) {
+    store().with(fn(st: mut &SessStore) {
+        let i = ensureSlot(st, sess)
+        let refOld = if len(trig.refOld) > 0 { strings.toLowerAscii(&trig.refOld) } else { "deleted" }
+        let refNew = if len(trig.refNew) > 0 { strings.toLowerAscii(&trig.refNew) } else { "inserted" }
+        let depth = len(st.vals[i].frames) + 1
+        append(mut &st.vals[i].frames, TrigFrame{
+            trig: trig.clone(), event: delta.event, cols: delta.cols.clone(),
+            updatedCols: delta.updatedCols.clone(), inserted: delta.inserted.clone(),
+            deleted: delta.deleted.clone(), rowCount: delta.rowCount,
+            refOld: refOld, refNew: refNew, depth: depth,
+        })
+    })
+}
+
+pub fn popFrame(sess: int) {
+    if SESS_ACTIVE == 0 { return }
+    store().with(fn(st: mut &SessStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 {
+            if len(st.vals[i].frames) > 0 { let _ = pop(mut &st.vals[i].frames) }
+            if len(st.vals[i].scopes) == 0 && len(st.vals[i].frames) == 0 { removeSlot(st, i) }
+        }
+    })
+}
+
+pub fn frameDepth(sess: int): int {
+    if SESS_ACTIVE == 0 { return 0 }
+    var d = 0
+    store().with(fn(st: mut &SessStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 { d = len(st.vals[i].frames) }
+    })
+    return d
+}
+
+pub fn isActiveInsteadOf(sess: int, target: &str, event: int): bool {
+    if SESS_ACTIVE == 0 { return false }
+    var hit = false
+    store().with(fn(st: mut &SessStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 {
+            for fr in st.vals[i].frames {
+                if fr.trig.timing == TT_INSTEAD_OF && fr.trig.target == target && fr.event == event {
+                    hit = true
+                    break
+                }
+            }
+        }
+    })
+    return hit
+}
+
+// True if the immediately enclosing trigger is an AFTER trigger on target (direct recursion).
+pub fn isDirectRecursion(sess: int, target: &str): bool {
+    if SESS_ACTIVE == 0 { return false }
+    var hit = false
+    store().with(fn(st: mut &SessStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 && len(st.vals[i].frames) > 0 {
+            let top = &st.vals[i].frames[len(st.vals[i].frames) - 1]
+            hit = top.trig.timing == TT_AFTER && top.trig.target == target
+        }
+    })
+    return hit
+}
+
+// SQL Server TRIGGER_NESTLEVEL([object_id [, 'AFTER'|'INSTEAD OF' [, 'DML'|'DDL']]]).
+pub fn nestLevel(sess: int, hasObj: bool, objId: int, timingFilter: &str, kindFilter: &str): int {
+    if SESS_ACTIVE == 0 { return 0 }
+    let kf = strings.toUpperAscii(&(strings.trim(kindFilter)))
+    if len(kf) > 0 && kf != "DML" { return 0 }
+    let tf = strings.toUpperAscii(&(strings.trim(timingFilter)))
+    var n = 0
+    store().with(fn(st: mut &SessStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 {
+            for fr in st.vals[i].frames {
+                if hasObj && fr.trig.oid != objId { continue }
+                if len(tf) > 0 {
+                    if tf == "AFTER" && fr.trig.timing != TT_AFTER { continue }
+                    if tf == "INSTEAD OF" && fr.trig.timing != TT_INSTEAD_OF { continue }
+                }
+                n += 1
+            }
+        }
+    })
+    return n
+}
+
+// SQL Server UPDATE(col_name) inside a trigger.
+pub fn isColUpdated(sess: int, colName: &str): bool {
+    if SESS_ACTIVE == 0 { return false }
+    let low = strings.toLowerAscii(colName)
+    var hit = false
+    store().with(fn(st: mut &SessStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 && len(st.vals[i].frames) > 0 {
+            let fr = &st.vals[i].frames[len(st.vals[i].frames) - 1]
+            for k in 0..len(fr.cols) {
+                if fr.cols[k].name == low {
+                    hit = k < len(fr.updatedCols) && fr.updatedCols[k]
+                    break
+                }
+            }
+        }
+    })
+    return hit
+}
+
+// SQL Server COLUMNS_UPDATED() inside a trigger: varbinary bitmask, bit (col_id-1)%8 of byte (col_id-1)/8.
+pub fn columnsUpdated(sess: int): Option[str] {
+    if SESS_ACTIVE == 0 { return None }
+    var res: Option[str] = None
+    store().with(fn(st: mut &SessStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 && len(st.vals[i].frames) > 0 {
+            let fr = &st.vals[i].frames[len(st.vals[i].frames) - 1]
+            let nc = len(fr.cols)
+            if nc == 0 {
+                res = Some("")
+            } else {
+                let nb = (nc + 7) / 8
+                var bytes: []byte = array(nb, byte(0))
+                for k in 0..nc {
+                    if k < len(fr.updatedCols) && fr.updatedCols[k] {
+                        let bi = k / 8
+                        let bit = k % 8
+                        bytes[bi] = byte(int(bytes[bi]) | (1 << bit))
+                    }
+                }
+                var out = ""
+                for b in bytes { out.addByte(b) }
+                res = Some(out)
+            }
+        }
+    })
+    return res
+}
+
+// Resolve a virtual trigger transition table ("inserted" / "deleted" in T-SQL, or PG transition table name).
+// Only intercepts unqualified relation names.
+pub fn virtualRel(sess: int, relName: &str): Option[Table] {
+    if SESS_ACTIVE == 0 || lexdb_sql.isQual(relName) { return None }
+    let low = strings.toLowerAscii(relName)
+    var res: Option[Table] = None
+    store().with(fn(st: mut &SessStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 && len(st.vals[i].frames) > 0 {
+            let fr = &st.vals[i].frames[len(st.vals[i].frames) - 1]
+            var which = ""
+            if low == fr.refNew { which = "new" }
+            else if low == fr.refOld { which = "old" }
+            if len(which) > 0 {
+                var vt = lexdb_catalog.emptyTable(&low)
+                vt.tree = -1
+                var specs: []str = []
+                for c in fr.cols {
+                    append(mut &vt.cols, c.clone())
+                    append(mut &specs, c.name + "\x02" + c.typ.oid.toStr() + "\x02" + c.spell + "\x02" + c.coll)
+                }
+                vt.view = TRG_REL + which + "\x01" + strings.join(&specs, "\x03")
+                res = Some(vt)
+            }
+        }
+    })
+    return res
+}
+
+pub fn isVirtualWriteTarget(sess: int, relName: &str): bool {
+    if SESS_ACTIVE == 0 || lexdb_sql.isQual(relName) { return false }
+    let low = strings.toLowerAscii(relName)
+    var hit = false
+    store().with(fn(st: mut &SessStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 && len(st.vals[i].frames) > 0 {
+            let fr = &st.vals[i].frames[len(st.vals[i].frames) - 1]
+            hit = low == fr.refNew || low == fr.refOld
+        }
+    })
+    return hit
+}
+
+pub fn virtualRows(sess: int, srf: &str): [][]Val {
+    if SESS_ACTIVE == 0 { return [] }
+    let start = 1 + len(TRG_REL)
+    let sep = strings.indexOf(srf, "\x01", start)
+    let which = if sep < 0 { srf[start..len(srf)].toStr() } else { srf[start..sep].toStr() }
+    var out: [][]Val = []
+    store().with(fn(st: mut &SessStore) {
+        let i = findSlot(st, sess)
+        if i >= 0 && len(st.vals[i].frames) > 0 {
+            let fr = &st.vals[i].frames[len(st.vals[i].frames) - 1]
+            if which == "new" { out = fr.inserted.clone() }
+            else if which == "old" { out = fr.deleted.clone() }
+        }
+    })
+    return out
+}

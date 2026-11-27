@@ -27,6 +27,7 @@ import "./lexdb_parse"
 import "./lexdb_dbopt"
 import "./lexdb_tsqldef"
 import "./lexdb_mview"
+import "./lexdb_trigger"
 
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
@@ -736,6 +737,20 @@ fn tsqlRoutines(snap: &CatSnap): []lexdb_sql.Routine {
     return out
 }
 
+fn tsqlTriggers(snap: &CatSnap): []lexdb_trigger.Trigger {
+    var out: []lexdb_trigger.Trigger = []
+    for tr in lexdb_trigger.allFromSnap(&snap.triggers) {
+        if tr.dialect == lexdb_trigger.TD_TSQL { append(mut &out, tr) }
+    }
+    return out
+}
+
+fn trgParentOid(snap: &CatSnap, key: &str): int {
+    for ct in snap.tabs { if ct.key == key { return ct.oid } }
+    for v in snap.views { if v.key == key { return v.oid } }
+    return 0
+}
+
 // A routine's sys.objects type and its description: P, FN (scalar), IF (inline table-valued), TF (multi-statement).
 fn routineType(r: &lexdb_sql.Routine): []str {
     if r.kind == lexdb_sql.RK_PROC { return ["P", "SQL_STORED_PROCEDURE"] }
@@ -790,6 +805,9 @@ fn sysObjects(snap: &CatSnap): [][]Val {
     for r in tsqlRoutines(snap) {
         let rt = routineType(&r)
         append(mut &rows, sysObj(&procName(&r), procOid(&r), sysSchemaId(&lexdb_sql.schemaOf(&r.key)), 0, &rt[0], &rt[1], false))
+    }
+    for tr in tsqlTriggers(snap) {
+        append(mut &rows, sysObj(&tr.spell, tr.oid, sysSchemaId(&tr.schema), trgParentOid(snap, &tr.target), &"TR", &"SQL_TRIGGER", false))
     }
     // a table type's table: TT_name_hex, SQL Server's own
     for t in snap.ttypes {
@@ -1462,6 +1480,12 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] 
                 x.set(&"definition", tv(&r.def))
                 append(mut &rows, x.row())
             }
+            for tr in tsqlTriggers(&snap) {
+                var x = sysTemplate(&"sql_modules")
+                x.set(&"object_id", iv(tr.oid))
+                x.set(&"definition", tv(&tr.def))
+                append(mut &rows, x.row())
+            }
             for v in snap.views {
                 if lexdb_base.isTempSchema(&v.schema) { continue }
                 var r = sysTemplate(&"sql_modules")
@@ -1511,7 +1535,47 @@ pub fn viewRows(cq: &lexdb_catalog.CatView, view: &str): Result[[][]Val, DbErr] 
                 append(mut &rows, r.row())
             }
         }
-        else {}     // the rest have no rows: triggers, extended properties, xml and spatial indexes, ...
+        "triggers" {
+            for tr in tsqlTriggers(&snap) {
+                var r = sysTemplate(&"triggers")
+                r.set(&"name", tv(&tr.spell))
+                r.set(&"object_id", iv(tr.oid))
+                r.set(&"parent_class", iv(1))
+                r.set(&"parent_class_desc", tv(&"OBJECT_OR_COLUMN"))
+                r.set(&"parent_id", iv(trgParentOid(&snap, &tr.target)))
+                r.set(&"type", tv(&"TR"))
+                r.set(&"type_desc", tv(&"SQL_TRIGGER"))
+                r.set(&"create_date", sysTs())
+                r.set(&"modify_date", sysTs())
+                r.set(&"is_ms_shipped", bv(false))
+                r.set(&"is_disabled", bv(!tr.enabled))
+                r.set(&"is_not_for_replication", bv(false))
+                r.set(&"is_instead_of_trigger", bv(tr.timing == lexdb_trigger.TT_INSTEAD_OF))
+                append(mut &rows, r.row())
+            }
+        }
+        "trigger_events" {
+            for tr in tsqlTriggers(&snap) {
+                let evs = [lexdb_trigger.TE_INSERT, lexdb_trigger.TE_UPDATE, lexdb_trigger.TE_DELETE]
+                let codes = [1, 2, 3]
+                let descs = ["INSERT", "UPDATE", "DELETE"]
+                for k in 0..3 {
+                    if (tr.events & evs[k]) == 0 { continue }
+                    let ord = lexdb_trigger.orderForEvent(&tr, evs[k])
+                    var r = sysTemplate(&"trigger_events")
+                    r.set(&"object_id", iv(tr.oid))
+                    r.set(&"type", iv(codes[k]))
+                    r.set(&"type_desc", tv(&descs[k]))
+                    r.set(&"is_first", bv(ord == lexdb_trigger.TO_FIRST))
+                    r.set(&"is_last", bv(ord == lexdb_trigger.TO_LAST))
+                    r.set(&"event_group_type", Val.Null)
+                    r.set(&"event_group_type_desc", Val.Null)
+                    r.set(&"is_trigger_event", bv(true))
+                    append(mut &rows, r.row())
+                }
+            }
+        }
+        else {}     // the rest have no rows: extended properties, xml and spatial indexes, ...
     }
     return Ok(rows)
 }
@@ -1555,6 +1619,7 @@ pub fn bind(snap: &CatSnap, b: mut &str) {
         if len(d) > 0 { b += &("D\t" + v.oid.toStr() + "\t" + escDef(&d) + "\n") }
     }
     for r in tsqlRoutines(snap) { b += &("D\t" + procOid(&r).toStr() + "\t" + escDef(&r.def) + "\n") }
+    for tr in tsqlTriggers(snap) { b += &("D\t" + tr.oid.toStr() + "\t" + escDef(&tr.def) + "\n") }
     // Y table types (user_type_id, schema_id, name)
     for t in snap.ttypes { b += &("Y\t" + lexdb_sql.nameOid("T", &t.key).toStr() + "\t" + sysSchemaId(&lexdb_sql.schemaOf(&t.key)).toStr() + "\t" + lexdb_catalog.clean(&t.spell) + "\n") }
     for r in sysObjects(snap) {

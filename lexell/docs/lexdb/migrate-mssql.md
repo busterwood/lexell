@@ -33,7 +33,7 @@ No ODBC driver, JDBC runtime, or `sqlcmd`/`bcp` installation is required.
   --from "Server=sql.example.com,1433;Database=appdb;UID=sa;PWD=...;Encrypt=yes;TrustServerCertificate=yes"
 ```
 
-Prints an object inventory (schemas, table types, sequences, tables, constraints, indexes, views, routines) and a compatibility report flagging alias-type unfoldings, triggers, CLR objects, or unsupported column types before touching anything.
+Prints an object inventory (schemas, table types, sequences, tables, constraints, indexes, views, routines, triggers) and a compatibility report flagging alias-type unfoldings, CLR objects, or unsupported column types before touching anything.
 
 ### 2. Direct live migration (`SQL Server → LexDB`)
 
@@ -111,7 +111,8 @@ Because `01_pre.sql` and `02_post.sql` are plain `GO`-delimited T-SQL, you can i
 
 - **User-defined alias types (`CREATE TYPE dbo.ShortName FROM nvarchar(50)`):** Automatically unfolded to their underlying SQL Server system type and logged as an `[INFO]` note in the report.
 - **`rowversion` / `timestamp` columns:** Mapped to `varbinary(8)` so the raw 8-byte values are preserved verbatim during migration (logged as `[INFO]`).
-- **Triggers, synonyms, CLR objects, and XML/spatial/columnstore indexes:** Detected from `sys.triggers`, `sys.objects`, and `sys.indexes`, skipped cleanly, and listed in the compatibility report (`[WARN]`).
+- **DML Triggers:** Migrated in post-data DDL (`02_post.sql` / `applyPostSchema`) after data loading and view/routine creation, preserving `AFTER` and `INSTEAD OF` triggers (on tables and views) and disabled state (`DISABLE TRIGGER`).
+- **Synonyms, CLR objects, and XML/spatial/columnstore indexes:** Detected from `sys.objects` and `sys.indexes`, skipped cleanly, and listed in the compatibility report (`[WARN]`).
 - **Unsupported column types (`hierarchyid`, `geography`, `geometry`, `sql_variant`, CLR UDTs):** Flagged as `[ERROR]` and abort before modifying the target unless `--skip-unsupported` is passed, in which case those columns are omitted with a `[WARN]`.
 - **View and routine dependencies:** Post-data DDL runs constraints and table indexes first, then views (with automatic multi-pass dependency resolution), then indexed-view indexes (clustered first), then functions/procedures (multi-pass), and finally `ALTER SEQUENCE ... RESTART WITH` to restore exact sequence positions.
 - **Migrating from PostgreSQL instead?** Use standard `pg_dump` / `pg_restore` directly over LexDB's PostgreSQL door — see [Restoring PostgreSQL backups](pg-restore.md).

@@ -1,0 +1,555 @@
+// SQL Server DML triggers end-to-end test over LexDB's TDS door:
+// AFTER & INSTEAD OF (tables & views), inserted/deleted, 0-row DML,
+// UPDATE(col), COLUMNS_UPDATED(), TRIGGER_NESTLEVEL(), @@NESTLEVEL, @@PROCID,
+// @@ROWCOUNT preservation, ENABLE/DISABLE TRIGGER, ALTER TABLE ENABLE/DISABLE,
+// sp_settriggerorder, nested & recursive triggers (RECURSIVE_TRIGGERS OFF/ON),
+// ROLLBACK TRAN (TS3609), RAISERROR/THROW atomicity & TRY...CATCH, MERGE,
+// FK CASCADE, INSERT BULK (default vs FIRE_TRIGGERS), TRUNCATE, sys.triggers,
+// sys.trigger_events, sys.objects, sys.sql_modules, OBJECT_DEFINITION,
+// OBJECTPROPERTY, non-dbo schema, DROP TABLE/VIEW cascade, sp_rename, DDL errors.
+// timeout: 60
+// expect: after dml ok
+// expect: zero row ok
+// expect: update cols ok
+// expect: instead of table ok
+// expect: instead of view ok
+// expect: enable disable order ok
+// expect: nested recursive ok
+// expect: tx rollback trycatch ok
+// expect: merge fk bulk truncate ok
+// expect: catalog schema ddl errors ok
+// expect: extra edge cases ok
+// expect: persistence reopen ok
+import "os"
+import "fs"
+import "strings"
+import "task"
+import "net"
+import "sqlserver"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_wire"
+import "../../../cmd/lexdb_tds"
+
+fn mustExec(c: mut &sqlserver.Conn, sql: &str) {
+    match c.exec(sql) {
+        Ok(_) {}
+        Err(e) {
+            println("FAIL exec [" + sql + "]: " + e.toStr())
+            exit(1)
+        }
+    }
+}
+
+fn mustFail(c: mut &sqlserver.Conn, label: &str, sql: &str, wantSub: &str) {
+    match c.exec(sql) {
+        Ok(_) {
+            println("FAIL expected error (" + label + ") for [" + sql + "]")
+            exit(1)
+        }
+        Err(e) {
+            let msg = e.toStr()
+            if len(wantSub) > 0 && !strings.contains(&msg, wantSub) {
+                println("FAIL wrong error (" + label + "): got=[" + msg + "] wantSub=[" + wantSub + "]")
+                exit(1)
+            }
+        }
+    }
+}
+
+fn q1(c: mut &sqlserver.Conn, sql: &str): str {
+    let rq = c.query(sql, &[])
+    if rq.isErr() {
+        println("FAIL query [" + sql + "]: " + rq.unwrapErr().toStr())
+        exit(1)
+    }
+    let r = rq.unwrap()
+    var lines: []str = []
+    for row in 0..r.rowCount() {
+        var cols: []str = []
+        for col in 0..r.columnCount() {
+            if r.isNull(row, col).unwrap() {
+                append(mut &cols, "NULL")
+            } else {
+                match r.text(row, col) {
+                    Ok(t) { append(mut &cols, t) }
+                    Err(_) { append(mut &cols, hexOf(&(r.bytes(row, col).unwrap()))) }
+                }
+            }
+        }
+        append(mut &lines, strings.join(&cols, "|"))
+    }
+    return strings.join(&lines, "\n")
+}
+
+fn hexOf(s: &str): str {
+    let hx = "0123456789abcdef"
+    var out = ""
+    for i in 0..len(s) {
+        let b = int(s[i])
+        out.addByte(hx[(b >> 4) & 0xf])
+        out.addByte(hx[b & 0xf])
+    }
+    return out
+}
+
+fn assertEq(name: &str, got: &str, want: &str) {
+    if got != want {
+        println("FAIL " + name + ": got=[" + got + "] want=[" + want + "]")
+        exit(1)
+    }
+}
+
+fn runTests(c: mut &sqlserver.Conn) {
+    // 1. AFTER INSERT, UPDATE, DELETE + multi-event FOR trigger + @@ROWCOUNT preservation
+    mustExec(c, "CREATE TABLE dbo.items (id int PRIMARY KEY, name nvarchar(50) NOT NULL, price int NOT NULL);")
+    mustExec(c, "CREATE TABLE dbo.audit (seq int IDENTITY(1,1) PRIMARY KEY, op varchar(10), id int, old_p int, new_p int, rc int);")
+    mustExec(c,
+        "CREATE TRIGGER dbo.tr_items_ins ON dbo.items AFTER INSERT AS " +
+        "BEGIN " +
+        "  DECLARE @rc int = @@ROWCOUNT; " +
+        "  INSERT INTO dbo.audit (op, id, old_p, new_p, rc) SELECT 'INS', id, NULL, price, @rc FROM inserted; " +
+        "END")
+    mustExec(c,
+        "CREATE TRIGGER dbo.tr_items_upd ON dbo.items FOR UPDATE AS " +
+        "BEGIN " +
+        "  DECLARE @rc int = @@ROWCOUNT; " +
+        "  INSERT INTO dbo.audit (op, id, old_p, new_p, rc) " +
+        "  SELECT 'UPD', i.id, d.price, i.price, @rc FROM inserted i JOIN deleted d ON i.id = d.id; " +
+        "END")
+    mustExec(c,
+        "CREATE TRIGGER dbo.tr_items_del ON dbo.items AFTER DELETE AS " +
+        "BEGIN " +
+        "  DECLARE @rc int = @@ROWCOUNT; " +
+        "  INSERT INTO dbo.audit (op, id, old_p, new_p, rc) SELECT 'DEL', id, price, NULL, @rc FROM deleted; " +
+        "END")
+
+    assertEq("ins rowcount",
+        q1(c, "INSERT INTO dbo.items VALUES (1, N'A', 10), (2, N'B', 20); SELECT @@ROWCOUNT;"),
+        "2")
+    assertEq("upd rowcount",
+        q1(c, "UPDATE dbo.items SET price = price + 5 WHERE id = 1; SELECT @@ROWCOUNT;"),
+        "1")
+    assertEq("del rowcount",
+        q1(c, "DELETE FROM dbo.items WHERE id = 2; SELECT @@ROWCOUNT;"),
+        "1")
+    assertEq("audit after dml",
+        q1(c, "SELECT op, id, old_p, new_p, rc FROM dbo.audit ORDER BY seq"),
+        "INS|1|NULL|10|2\nINS|2|NULL|20|2\nUPD|1|10|15|1\nDEL|2|20|NULL|1")
+    println("after dml ok")
+
+    // 2. 0-row DML still fires AFTER triggers with @@ROWCOUNT = 0 and empty inserted/deleted
+    mustExec(c, "CREATE TABLE dbo.zero_log (tag varchar(20), rc int, icnt int, dcnt int);")
+    mustExec(c,
+        "CREATE TRIGGER dbo.tr_zero ON dbo.items AFTER INSERT, UPDATE, DELETE AS " +
+        "BEGIN " +
+        "  DECLARE @rc int = @@ROWCOUNT; " +
+        "  INSERT INTO dbo.zero_log VALUES ('fired', @rc, (SELECT COUNT(*) FROM inserted), (SELECT COUNT(*) FROM deleted)); " +
+        "END")
+    mustExec(c, "INSERT INTO dbo.items SELECT id, name, price FROM dbo.items WHERE 1 = 0;")
+    mustExec(c, "UPDATE dbo.items SET price = 99 WHERE id = 999;")
+    mustExec(c, "DELETE FROM dbo.items WHERE id = 999;")
+    assertEq("zero row fires",
+        q1(c, "SELECT tag, rc, icnt, dcnt FROM dbo.zero_log"),
+        "fired|0|0|0\nfired|0|0|0\nfired|0|0|0")
+    mustExec(c, "DROP TRIGGER dbo.tr_zero;")
+    println("zero row ok")
+
+    // 3. UPDATE(col) and COLUMNS_UPDATED()
+    mustExec(c, "CREATE TABLE dbo.ucols (c1 int PRIMARY KEY, c2 int, c3 int, c4 int);")
+    mustExec(c, "CREATE TABLE dbo.ucols_log (seq int IDENTITY(1,1) PRIMARY KEY, u1 int, u2 int, u3 int, mask varbinary(8));")
+    mustExec(c,
+        "CREATE TRIGGER dbo.tr_ucols ON dbo.ucols AFTER INSERT, UPDATE, DELETE AS " +
+        "BEGIN " +
+        "  INSERT INTO dbo.ucols_log (u1, u2, u3, mask) VALUES (" +
+        "    CASE WHEN UPDATE(c1) THEN 1 ELSE 0 END, " +
+        "    CASE WHEN UPDATE(c2) THEN 1 ELSE 0 END, " +
+        "    CASE WHEN UPDATE(c3) THEN 1 ELSE 0 END, " +
+        "    COLUMNS_UPDATED()); " +
+        "END")
+    mustExec(c, "INSERT INTO dbo.ucols (c1, c2) VALUES (1, 10);")
+    mustExec(c, "UPDATE dbo.ucols SET c2 = 20 WHERE c1 = 1;")
+    mustExec(c, "UPDATE dbo.ucols SET c3 = 30 WHERE c1 = 999;")
+    mustExec(c, "DELETE FROM dbo.ucols WHERE c1 = 1;")
+    // c1=bit0(1), c2=bit1(2), c3=bit2(4), c4=bit3(8): INS=0x0f, UPD c2=0x02, UPD c3=0x04, DEL=0x00
+    assertEq("ucols log",
+        q1(c, "SELECT u1, u2, u3, mask FROM dbo.ucols_log ORDER BY seq"),
+        "1|1|1|0f\n0|1|0|02\n0|0|1|04\n0|0|0|00")
+    println("update cols ok")
+
+    // 4. INSTEAD OF triggers on a TABLE (plus firing AFTER triggers when INSTEAD OF performs real DML)
+    mustExec(c, "CREATE TABLE dbo.soft (id int PRIMARY KEY, val nvarchar(50), deleted_flag bit DEFAULT 0);")
+    mustExec(c, "CREATE TABLE dbo.soft_after (seq int IDENTITY(1,1) PRIMARY KEY, msg nvarchar(50));")
+    mustExec(c,
+        "CREATE TRIGGER dbo.tr_soft_io_ins ON dbo.soft INSTEAD OF INSERT AS " +
+        "BEGIN " +
+        "  INSERT INTO dbo.soft (id, val, deleted_flag) SELECT id, UPPER(val), 0 FROM inserted; " +
+        "END")
+    mustExec(c,
+        "CREATE TRIGGER dbo.tr_soft_after_ins ON dbo.soft AFTER INSERT AS " +
+        "BEGIN " +
+        "  INSERT INTO dbo.soft_after (msg) SELECT val FROM inserted; " +
+        "END")
+    mustExec(c,
+        "CREATE TRIGGER dbo.tr_soft_io_del ON dbo.soft INSTEAD OF DELETE AS " +
+        "BEGIN " +
+        "  UPDATE s SET deleted_flag = 1 FROM dbo.soft s JOIN deleted d ON s.id = d.id; " +
+        "END")
+    mustExec(c, "INSERT INTO dbo.soft (id, val) VALUES (1, N'hello'), (2, N'world');")
+    mustExec(c, "DELETE FROM dbo.soft WHERE id = 1;")
+    assertEq("soft table",
+        q1(c, "SELECT id, val, deleted_flag FROM dbo.soft ORDER BY id"),
+        "1|HELLO|1\n2|WORLD|0")
+    assertEq("soft after fired",
+        q1(c, "SELECT msg FROM dbo.soft_after ORDER BY seq"),
+        "HELLO\nWORLD")
+    println("instead of table ok")
+
+    // 5. INSTEAD OF triggers on a VIEW (INSERT, UPDATE, DELETE)
+    mustExec(c, "CREATE TABLE dbo.vbase (id int PRIMARY KEY, title nvarchar(40), active bit);")
+    mustExec(c, "CREATE VIEW dbo.v_active AS SELECT id, title FROM dbo.vbase WHERE active = 1;")
+    mustExec(c,
+        "CREATE TRIGGER dbo.tr_v_ins ON dbo.v_active INSTEAD OF INSERT AS " +
+        "BEGIN INSERT INTO dbo.vbase (id, title, active) SELECT id, title, 1 FROM inserted; END")
+    mustExec(c,
+        "CREATE TRIGGER dbo.tr_v_upd ON dbo.v_active INSTEAD OF UPDATE AS " +
+        "BEGIN UPDATE b SET title = i.title FROM dbo.vbase b JOIN inserted i ON b.id = i.id; END")
+    mustExec(c,
+        "CREATE TRIGGER dbo.tr_v_del ON dbo.v_active INSTEAD OF DELETE AS " +
+        "BEGIN UPDATE b SET active = 0 FROM dbo.vbase b JOIN deleted d ON b.id = d.id; END")
+    mustExec(c, "INSERT INTO dbo.v_active (id, title) VALUES (1, N'one'), (2, N'two');")
+    mustExec(c, "UPDATE dbo.v_active SET title = N'ONE!' WHERE id = 1;")
+    mustExec(c, "DELETE FROM dbo.v_active WHERE id = 2;")
+    assertEq("view active", q1(c, "SELECT id, title FROM dbo.v_active ORDER BY id"), "1|ONE!")
+    assertEq("view base", q1(c, "SELECT id, title, active FROM dbo.vbase ORDER BY id"), "1|ONE!|1\n2|two|0")
+    println("instead of view ok")
+
+    // 6. ENABLE/DISABLE TRIGGER, ALTER TABLE ENABLE/DISABLE, sp_settriggerorder, CREATE OR ALTER / ALTER TRIGGER
+    mustExec(c, "CREATE TABLE dbo.ord_t (id int PRIMARY KEY);")
+    mustExec(c, "CREATE TABLE dbo.ord_log (seq int IDENTITY(1,1) PRIMARY KEY, tag varchar(10));")
+    mustExec(c, "CREATE TRIGGER dbo.tr_o1 ON dbo.ord_t AFTER INSERT AS BEGIN INSERT INTO dbo.ord_log (tag) VALUES ('o1'); END")
+    mustExec(c, "CREATE TRIGGER dbo.tr_o2 ON dbo.ord_t AFTER INSERT AS BEGIN INSERT INTO dbo.ord_log (tag) VALUES ('o2'); END")
+    mustExec(c, "CREATE TRIGGER dbo.tr_o3 ON dbo.ord_t AFTER INSERT AS BEGIN INSERT INTO dbo.ord_log (tag) VALUES ('o3'); END")
+    mustExec(c, "EXEC sp_settriggerorder @triggername = 'dbo.tr_o3', @order = 'First', @stmttype = 'INSERT';")
+    mustExec(c, "EXEC sp_settriggerorder @triggername = 'dbo.tr_o1', @order = 'Last', @stmttype = 'INSERT';")
+    mustExec(c, "INSERT INTO dbo.ord_t VALUES (1);")
+    assertEq("order first/mid/last", q1(c, "SELECT tag FROM dbo.ord_log ORDER BY seq"), "o3\no2\no1")
+
+    mustExec(c, "DISABLE TRIGGER dbo.tr_o2 ON dbo.ord_t;")
+    mustExec(c, "DELETE FROM dbo.ord_log;")
+    mustExec(c, "INSERT INTO dbo.ord_t VALUES (2);")
+    assertEq("disabled one", q1(c, "SELECT tag FROM dbo.ord_log ORDER BY seq"), "o3\no1")
+
+    mustExec(c, "ALTER TABLE dbo.ord_t DISABLE TRIGGER ALL;")
+    mustExec(c, "DELETE FROM dbo.ord_log;")
+    mustExec(c, "INSERT INTO dbo.ord_t VALUES (3);")
+    assertEq("disabled all", q1(c, "SELECT COUNT(*) FROM dbo.ord_log"), "0")
+
+    mustExec(c, "ALTER TABLE dbo.ord_t ENABLE TRIGGER ALL;")
+    mustExec(c, "ALTER TRIGGER dbo.tr_o2 ON dbo.ord_t AFTER INSERT AS BEGIN INSERT INTO dbo.ord_log (tag) VALUES ('o2_alt'); END")
+    mustExec(c, "CREATE OR ALTER TRIGGER dbo.tr_o1 ON dbo.ord_t AFTER INSERT AS BEGIN INSERT INTO dbo.ord_log (tag) VALUES ('o1_alt'); END")
+    // ALTER / CREATE OR ALTER resets sp_settriggerorder (tr_o1 is no longer Last, so runs before tr_o2 by creation order)
+    mustExec(c, "INSERT INTO dbo.ord_t VALUES (4);")
+    assertEq("re-enabled + altered", q1(c, "SELECT tag FROM dbo.ord_log ORDER BY seq"), "o3\no1_alt\no2_alt")
+    println("enable disable order ok")
+
+    // 7. Nested triggers, @@NESTLEVEL, TRIGGER_NESTLEVEL(), and RECURSIVE_TRIGGERS OFF vs ON
+    mustExec(c, "CREATE TABLE dbo.n1 (id int PRIMARY KEY, v int);")
+    mustExec(c, "CREATE TABLE dbo.n2 (id int PRIMARY KEY, nl int, tnl int, tnl_self int);")
+    mustExec(c,
+        "CREATE TRIGGER dbo.tr_n1 ON dbo.n1 AFTER INSERT AS " +
+        "BEGIN " +
+        "  INSERT INTO dbo.n2 SELECT id, @@NESTLEVEL, TRIGGER_NESTLEVEL(), TRIGGER_NESTLEVEL(@@PROCID) FROM inserted; " +
+        "END")
+    mustExec(c, "CREATE TABLE dbo.n3 (id int PRIMARY KEY, nl int, tnl int, tnl_after int);")
+    mustExec(c,
+        "CREATE TRIGGER dbo.tr_n2 ON dbo.n2 AFTER INSERT AS " +
+        "BEGIN " +
+        "  INSERT INTO dbo.n3 SELECT id, @@NESTLEVEL, TRIGGER_NESTLEVEL(), TRIGGER_NESTLEVEL(0, 'AFTER', 'DML') FROM inserted; " +
+        "END")
+    mustExec(c, "INSERT INTO dbo.n1 VALUES (10, 1);")
+    assertEq("nest n2", q1(c, "SELECT id, nl, tnl, tnl_self FROM dbo.n2"), "10|1|1|1")
+    assertEq("nest n3", q1(c, "SELECT id, nl, tnl, tnl_after FROM dbo.n3"), "10|2|2|2")
+
+    // Direct recursion: OFF by default -> trigger updating its own table does NOT re-fire itself
+    mustExec(c, "CREATE TABLE dbo.rec_t (id int PRIMARY KEY, cnt int);")
+    mustExec(c,
+        "CREATE TRIGGER dbo.tr_rec ON dbo.rec_t AFTER UPDATE AS " +
+        "BEGIN " +
+        "  IF EXISTS (SELECT 1 FROM inserted WHERE cnt < 5) " +
+        "    UPDATE dbo.rec_t SET cnt = cnt + 1 WHERE id IN (SELECT id FROM inserted); " +
+        "END")
+    mustExec(c, "INSERT INTO dbo.rec_t VALUES (1, 1);")
+    mustExec(c, "UPDATE dbo.rec_t SET cnt = 2 WHERE id = 1;")
+    assertEq("rec off", q1(c, "SELECT cnt FROM dbo.rec_t WHERE id = 1"), "3")
+
+    // Turn RECURSIVE_TRIGGERS ON -> recurses until cnt reaches 5
+    mustExec(c, "ALTER DATABASE CURRENT SET RECURSIVE_TRIGGERS ON;")
+    mustExec(c, "UPDATE dbo.rec_t SET cnt = 1 WHERE id = 1;")
+    assertEq("rec on", q1(c, "SELECT cnt FROM dbo.rec_t WHERE id = 1"), "5")
+    mustExec(c, "ALTER DATABASE CURRENT SET RECURSIVE_TRIGGERS OFF;")
+    println("nested recursive ok")
+
+    // 8. Transaction atomicity, RAISERROR/THROW, TRY...CATCH, ROLLBACK TRAN (TS3609)
+    mustExec(c, "CREATE TABLE dbo.guard_t (id int PRIMARY KEY, amt int);")
+    mustExec(c, "CREATE TABLE dbo.guard_log (id int);")
+    mustExec(c,
+        "CREATE TRIGGER dbo.tr_guard ON dbo.guard_t AFTER INSERT AS " +
+        "BEGIN " +
+        "  INSERT INTO dbo.guard_log SELECT id FROM inserted; " +
+        "  IF EXISTS (SELECT 1 FROM inserted WHERE amt < 0) " +
+        "    THROW 51000, 'negative amount forbidden', 1; " +
+        "  IF EXISTS (SELECT 1 FROM inserted WHERE amt = 0) " +
+        "    ROLLBACK TRANSACTION; " +
+        "END")
+    mustExec(c, "INSERT INTO dbo.guard_t VALUES (1, 100);")
+    mustFail(c, "throw rolls back", "INSERT INTO dbo.guard_t VALUES (2, -5);", "negative amount forbidden")
+    assertEq("throw rolled back both tables",
+        q1(c, "SELECT (SELECT COUNT(*) FROM dbo.guard_t), (SELECT COUNT(*) FROM dbo.guard_log)"),
+        "1|1")
+    mustFail(c, "rollback tran ts3609", "INSERT INTO dbo.guard_t VALUES (3, 0);", "transaction ended in the trigger")
+    assertEq("rollback tran rolled back",
+        q1(c, "SELECT (SELECT COUNT(*) FROM dbo.guard_t), (SELECT COUNT(*) FROM dbo.guard_log)"),
+        "1|1")
+    // Explicit BEGIN TRAN + ROLLBACK in trigger rolls back the outer explicit transaction too!
+    mustFail(c, "explicit tx rollback in trigger",
+        "BEGIN TRAN; INSERT INTO dbo.guard_t VALUES (4, 50); INSERT INTO dbo.guard_t VALUES (5, 0); COMMIT;",
+        "transaction ended in the trigger")
+    assertEq("explicit tx rolled back completely",
+        q1(c, "SELECT COUNT(*) FROM dbo.guard_t"), "1")
+    // TRY...CATCH catching trigger THROW + ERROR_PROCEDURE()
+    assertEq("try catch trigger throw",
+        q1(c,
+            "BEGIN TRY " +
+            "  INSERT INTO dbo.guard_t VALUES (6, -1); " +
+            "  SELECT 'noerr', ''; " +
+            "END TRY " +
+            "BEGIN CATCH " +
+            "  SELECT ERROR_NUMBER(), ERROR_PROCEDURE(); " +
+            "END CATCH"),
+        "51000|tr_guard")
+    assertEq("try catch left table clean", q1(c, "SELECT COUNT(*) FROM dbo.guard_t"), "1")
+    println("tx rollback trycatch ok")
+
+    // 9. MERGE, FK ON DELETE CASCADE, INSERT BULK (default vs FIRE_TRIGGERS), TRUNCATE
+    mustExec(c, "CREATE TABLE dbo.m_tgt (id int PRIMARY KEY, v int);")
+    mustExec(c, "CREATE TABLE dbo.m_src (id int PRIMARY KEY, v int);")
+    mustExec(c, "CREATE TABLE dbo.m_log (seq int IDENTITY(1,1) PRIMARY KEY, ev varchar(10), id int, v int);")
+    mustExec(c, "CREATE TRIGGER dbo.tr_m_i ON dbo.m_tgt AFTER INSERT AS BEGIN INSERT INTO dbo.m_log (ev, id, v) SELECT 'I', id, v FROM inserted; END")
+    mustExec(c, "CREATE TRIGGER dbo.tr_m_u ON dbo.m_tgt AFTER UPDATE AS BEGIN INSERT INTO dbo.m_log (ev, id, v) SELECT 'U', id, v FROM inserted; END")
+    mustExec(c, "CREATE TRIGGER dbo.tr_m_d ON dbo.m_tgt AFTER DELETE AS BEGIN INSERT INTO dbo.m_log (ev, id, v) SELECT 'D', id, v FROM deleted; END")
+    mustExec(c, "INSERT INTO dbo.m_tgt VALUES (1, 10), (2, 20);")
+    mustExec(c, "DELETE FROM dbo.m_log;")
+    mustExec(c, "INSERT INTO dbo.m_src VALUES (2, 200), (3, 300);")
+    mustExec(c,
+        "MERGE INTO dbo.m_tgt AS t USING dbo.m_src AS s ON t.id = s.id " +
+        "WHEN MATCHED THEN UPDATE SET v = s.v " +
+        "WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v) " +
+        "WHEN NOT MATCHED BY SOURCE THEN DELETE;")
+    assertEq("merge triggers",
+        q1(c, "SELECT ev, id, v FROM dbo.m_log ORDER BY ev, id"),
+        "D|1|10\nI|3|300\nU|2|200")
+
+    // FK ON DELETE CASCADE fires child AFTER DELETE trigger
+    mustExec(c, "CREATE TABLE dbo.fk_p (id int PRIMARY KEY);")
+    mustExec(c, "CREATE TABLE dbo.fk_c (id int PRIMARY KEY, pid int REFERENCES dbo.fk_p(id) ON DELETE CASCADE);")
+    mustExec(c, "CREATE TABLE dbo.fk_log (cid int);")
+    mustExec(c, "CREATE TRIGGER dbo.tr_fk_c ON dbo.fk_c AFTER DELETE AS BEGIN INSERT INTO dbo.fk_log SELECT id FROM deleted; END")
+    mustExec(c, "INSERT INTO dbo.fk_p VALUES (1); INSERT INTO dbo.fk_c VALUES (10, 1), (11, 1);")
+    mustExec(c, "DELETE FROM dbo.fk_p WHERE id = 1;")
+    assertEq("fk cascade trigger", q1(c, "SELECT cid FROM dbo.fk_log ORDER BY cid"), "10\n11")
+
+    // TRUNCATE does NOT fire DELETE triggers
+    mustExec(c, "CREATE TABLE dbo.tr_t (id int PRIMARY KEY);")
+    mustExec(c, "CREATE TABLE dbo.tr_log (c int);")
+    mustExec(c, "CREATE TRIGGER dbo.tr_trunc ON dbo.tr_t AFTER DELETE AS BEGIN INSERT INTO dbo.tr_log VALUES (1); END")
+    mustExec(c, "INSERT INTO dbo.tr_t VALUES (1), (2);")
+    mustExec(c, "TRUNCATE TABLE dbo.tr_t;")
+    assertEq("truncate no trigger", q1(c, "SELECT COUNT(*) FROM dbo.tr_log"), "0")
+
+    // INSERT BULK default (no triggers) vs FIRE_TRIGGERS
+    mustExec(c, "CREATE TABLE dbo.bk_t (id int PRIMARY KEY, v int);")
+    mustExec(c, "CREATE TABLE dbo.bk_log (id int);")
+    mustExec(c, "CREATE TRIGGER dbo.tr_bk ON dbo.bk_t AFTER INSERT AS BEGIN INSERT INTO dbo.bk_log SELECT id FROM inserted; END")
+    var bo1 = sqlserver.bulkOptions()
+    let bulk1 = c.bulkInsert("dbo.bk_t", &["id", "v"], &[[sqlserver.Value.Int(1), sqlserver.Value.Int(10)]], &bo1)
+    bulk1.unwrap()
+    assertEq("bulk no fire", q1(c, "SELECT COUNT(*) FROM dbo.bk_log"), "0")
+    var bo2 = sqlserver.bulkOptions()
+    bo2.fireTriggers = true
+    let bulk2 = c.bulkInsert("dbo.bk_t", &["id", "v"], &[[sqlserver.Value.Int(2), sqlserver.Value.Int(20)], [sqlserver.Value.Int(3), sqlserver.Value.Int(30)]], &bo2)
+    bulk2.unwrap()
+    assertEq("bulk fire", q1(c, "SELECT id FROM dbo.bk_log ORDER BY id"), "2\n3")
+    println("merge fk bulk truncate ok")
+
+    // 10. Catalog views, OBJECT_ID/DEFINITION/PROPERTY, non-dbo schema, DROP TABLE/VIEW cascade, sp_rename, DDL errors
+    mustExec(c, "CREATE SCHEMA sales;")
+    mustExec(c, "CREATE TABLE sales.orders (id int PRIMARY KEY, total int);")
+    mustExec(c, "CREATE TABLE sales.olog (id int);")
+    mustExec(c, "CREATE TRIGGER sales.tr_ord ON sales.orders AFTER INSERT AS BEGIN INSERT INTO sales.olog SELECT id FROM inserted; END")
+    mustExec(c, "INSERT INTO sales.orders VALUES (42, 999);")
+    assertEq("sales trigger", q1(c, "SELECT id FROM sales.olog"), "42")
+
+    // Catalog checks
+    assertEq("sys.triggers",
+        q1(c, "SELECT name, type, is_disabled, is_instead_of_trigger FROM sys.triggers WHERE name = 'tr_ord'"),
+        "tr_ord|TR|0|0")
+    assertEq("sys.trigger_events",
+        q1(c, "SELECT te.type_desc, te.is_first, te.is_last FROM sys.trigger_events te JOIN sys.triggers t ON te.object_id = t.object_id WHERE t.name = 'tr_o3'"),
+        "INSERT|1|0")
+    assertEq("objectproperty istrigger",
+        q1(c, "SELECT OBJECTPROPERTY(OBJECT_ID('sales.tr_ord'), 'IsTrigger')"),
+        "1")
+    assertEq("object_definition",
+        if strings.contains(&q1(c, "SELECT OBJECT_DEFINITION(OBJECT_ID('sales.tr_ord'))"), "CREATE TRIGGER sales.tr_ord") { "yes" } else { "no" },
+        "yes")
+    assertEq("sys.sql_modules",
+        if strings.contains(&q1(c, "SELECT m.definition FROM sys.sql_modules m JOIN sys.triggers t ON m.object_id = t.object_id WHERE t.name = 'tr_ord'"), "sales.olog") { "yes" } else { "no" },
+        "yes")
+
+    // sp_rename table keeps trigger working
+    mustExec(c, "EXEC sp_rename 'sales.orders', 'orders2';")
+    mustExec(c, "INSERT INTO sales.orders2 VALUES (43, 888);")
+    assertEq("after sp_rename", q1(c, "SELECT id FROM sales.olog ORDER BY id"), "42\n43")
+
+    // DROP TABLE auto-drops attached triggers
+    mustExec(c, "DROP TABLE sales.orders2;")
+    assertEq("drop table cascades trigger",
+        q1(c, "SELECT COUNT(*) FROM sys.triggers WHERE name = 'tr_ord'"),
+        "0")
+
+    // DROP VIEW auto-drops attached INSTEAD OF triggers
+    mustExec(c, "DROP VIEW dbo.v_active;")
+    assertEq("drop view cascades trigger",
+        q1(c, "SELECT COUNT(*) FROM sys.triggers WHERE name IN ('tr_v_ins', 'tr_v_upd', 'tr_v_del')"),
+        "0")
+
+    // DDL & runtime error checks
+    mustExec(c, "CREATE VIEW dbo.v_err AS SELECT id FROM dbo.items;")
+    mustFail(c, "after on view fails",
+        "CREATE TRIGGER dbo.tr_bad_v ON dbo.v_err AFTER INSERT AS BEGIN SELECT 1; END", "AFTER trigger")
+    mustFail(c, "dup instead of",
+        "CREATE TRIGGER dbo.tr_dup_io ON dbo.soft INSTEAD OF INSERT AS BEGIN SELECT 1; END", "already has an INSTEAD OF trigger")
+    mustFail(c, "schema mismatch",
+        "CREATE TRIGGER sales.tr_mismatch ON dbo.items AFTER INSERT AS BEGIN SELECT 1; END", "schema")
+    mustFail(c, "not first in batch",
+        "SELECT 1; CREATE TRIGGER dbo.tr_second ON dbo.items AFTER INSERT AS BEGIN SELECT 1; END", "first statement")
+    mustFail(c, "return value in trigger",
+        "CREATE TRIGGER dbo.tr_retv ON dbo.items AFTER INSERT AS BEGIN RETURN 1; END", "RETURN statement with a return value")
+    mustExec(c, "CREATE TRIGGER dbo.tr_w_ins ON dbo.items AFTER INSERT AS BEGIN DELETE FROM inserted; END")
+    // Execute the trigger that tries to write to inserted -> TS286!
+    mustFail(c, "write to inserted runtime",
+        "INSERT INTO dbo.items VALUES (99, N'Z', 1);", "INSERTED and DELETED cannot be updated")
+    mustExec(c, "DROP TRIGGER dbo.tr_w_ins;")
+    mustExec(c, "DROP TRIGGER IF EXISTS dbo.nonexistent_trig;")
+    mustFail(c, "drop missing trigger", "DROP TRIGGER dbo.nonexistent_trig;", "Cannot drop the trigger")
+    println("catalog schema ddl errors ok")
+
+    // 11. Extra edge cases: TS217 max nesting 32, TRY...CATCH inside trigger, RAISERROR, trigger inside stored proc
+    mustExec(c, "CREATE TABLE dbo.inf_t (id int PRIMARY KEY, v int);")
+    mustExec(c, "CREATE TRIGGER dbo.tr_inf ON dbo.inf_t AFTER UPDATE AS BEGIN UPDATE dbo.inf_t SET v = v + 1 WHERE id IN (SELECT id FROM inserted); END")
+    mustExec(c, "INSERT INTO dbo.inf_t VALUES (1, 0);")
+    mustExec(c, "ALTER DATABASE CURRENT SET RECURSIVE_TRIGGERS ON;")
+    mustFail(c, "max nest 32 ts217", "UPDATE dbo.inf_t SET v = 1 WHERE id = 1;", "Maximum stored procedure, function, trigger, or view nesting level exceeded")
+    mustExec(c, "ALTER DATABASE CURRENT SET RECURSIVE_TRIGGERS OFF;")
+    assertEq("ts217 rolled back", q1(c, "SELECT v FROM dbo.inf_t WHERE id = 1"), "0")
+
+    // TRY...CATCH inside trigger catches error without aborting outer DML
+    mustExec(c, "CREATE TABLE dbo.tc_t (id int PRIMARY KEY);")
+    mustExec(c, "CREATE TABLE dbo.tc_err (num int);")
+    mustExec(c,
+        "CREATE TRIGGER dbo.tr_tc ON dbo.tc_t AFTER INSERT AS " +
+        "BEGIN " +
+        "  BEGIN TRY " +
+        "    DECLARE @x int = 1 / 0; " +
+        "  END TRY " +
+        "  BEGIN CATCH " +
+        "    INSERT INTO dbo.tc_err VALUES (ERROR_NUMBER()); " +
+        "  END CATCH " +
+        "END")
+    mustExec(c, "INSERT INTO dbo.tc_t VALUES (7);")
+    assertEq("inner try catch succeeded", q1(c, "SELECT (SELECT COUNT(*) FROM dbo.tc_t), (SELECT num FROM dbo.tc_err)"), "1|8134")
+
+    // RAISERROR sev 16 inside trigger rolls back DML
+    mustExec(c, "CREATE TABLE dbo.re_t (id int PRIMARY KEY);")
+    mustExec(c, "CREATE TRIGGER dbo.tr_re ON dbo.re_t AFTER INSERT AS BEGIN RAISERROR('blocked by %s', 16, 1, 'policy'); END")
+    mustFail(c, "raiserror in trigger", "INSERT INTO dbo.re_t VALUES (1);", "blocked by policy")
+    assertEq("raiserror rolled back", q1(c, "SELECT COUNT(*) FROM dbo.re_t"), "0")
+
+    // Trigger firing from inside a stored procedure
+    mustExec(c, "CREATE PROCEDURE dbo.p_add_item @id int, @nm nvarchar(50), @pr int AS BEGIN INSERT INTO dbo.items VALUES (@id, @nm, @pr); END")
+    mustExec(c, "DELETE FROM dbo.audit;")
+    mustExec(c, "EXEC dbo.p_add_item 50, N'ProcItem', 77;")
+    assertEq("proc fires trigger", q1(c, "SELECT op, id, new_p FROM dbo.audit"), "INS|50|77")
+    println("extra edge cases ok")
+}
+
+fn persistCheck(dir: &str) {
+    // Phase A: create table + trigger and commit
+    let d1 = lexdb_disk.real(dir)
+    lexdb_store.run(d1, lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 10000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        task.scope(fn(sc: mut &task.Scope) {
+            let ln = net.listen("127.0.0.1:0").unwrap()
+            let addr = ln.localAddr()
+            lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+            let f = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+            let dsn = "Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"
+            var c = sqlserver.connect(&dsn).unwrap()
+            mustExec(mut &c, "CREATE TABLE dbo.pt (id int PRIMARY KEY);")
+            mustExec(mut &c, "CREATE TABLE dbo.plog (id int);")
+            mustExec(mut &c, "CREATE TRIGGER dbo.tr_pt ON dbo.pt AFTER INSERT AS BEGIN INSERT INTO dbo.plog SELECT id FROM inserted; END")
+            mustExec(mut &c, "INSERT INTO dbo.pt VALUES (1);")
+            c.close()
+            { let stop = f }
+        })
+        return 0
+    }).unwrap()
+
+    // Phase B: reopen store fresh (no trigger DDL in this run!) and verify trigger still fires
+    let d2 = lexdb_disk.real(dir)
+    lexdb_store.run(d2, lexdb_store.Options{cacheBytes: 16 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024, snapNodes: 10000}, fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        task.scope(fn(sc: mut &task.Scope) {
+            let ln = net.listen("127.0.0.1:0").unwrap()
+            let addr = ln.localAddr()
+            lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+            let f = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+            let dsn = "Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"
+            var c = sqlserver.connect(&dsn).unwrap()
+            mustExec(mut &c, "INSERT INTO dbo.pt VALUES (2);")
+            assertEq("reopen trigger fired", q1(mut &c, "SELECT id FROM dbo.plog ORDER BY id"), "1\n2")
+            c.close()
+            { let stop = f }
+        })
+        return 0
+    }).unwrap()
+    println("persistence reopen ok")
+}
+
+fn body(st: lexdb_store.Store): int {
+    lexdb_exec.bootstrap(&st).unwrap()
+    task.scope(fn(sc: mut &task.Scope) {
+        let ln = net.listen("127.0.0.1:0").unwrap()
+        let addr = ln.localAddr()
+        lexdb_wire.configure(&st, &lexdb_wire.noAuth()).unwrap()
+        let f = sc.start(lexdb_tds.acceptLoop, lexdb_tds.AcceptArg{ln: ln, st: st.share()})
+        let dsn = "Server=127.0.0.1," + addr[10..len(addr)] + ";UID=sa;PWD=x;Encrypt=no"
+        var c = sqlserver.connect(&dsn).unwrap()
+        runTests(mut &c)
+        c.close()
+        { let stop = f }
+    })
+    return 0
+}
+
+fn main() {
+    lexdb_store.run(lexdb_disk.sim(40), lexdb_store.Options{cacheBytes: 32 * 1024 * 1024, segBytes: 256 * 1024, ckptBytes: 128 * 1024,
+                                                             snapNodes: 50000}, body).unwrap()
+    let dir = "/tmp/lexdb_trg_persist_" + os.pid().toStr()
+    let _r1 = fs.removeAll(&dir)
+    let _m1 = fs.mkdirAll(&dir)
+    persistCheck(&dir)
+    let _r2 = fs.removeAll(&dir)
+}

@@ -24,6 +24,7 @@
 // over PostgreSQL's protocol (the first error ends a batch); SET
 // LEXDB_DIALECT TSQL goes back.
 import "strings"
+import "task"
 import "./lexdb_base"
 import "./lexdb_sql"
 import "./lexdb_tsqlparse"
@@ -33,6 +34,7 @@ import "./lexdb_catalog"
 import "./lexdb_ops"
 import "./lexdb_syscat"
 import "./lexdb_parse"
+import "./lexdb_trigger"
 import "./lexdb_recur"
 import "./lexdb_recrun"
 import "./lexdb_tsqlerr"
@@ -298,7 +300,7 @@ pub type State = record {
 // columns the rows give, KEEP_NULLS.
 // bad: a column the table has not (SQL Server's DONE then says an error,
 // with no message, and so does the load's).
-pub type BulkReq = record { pub table: str; pub cols: []str; pub keepNulls: bool; pub bad: bool }
+pub type BulkReq = record { pub table: str; pub cols: []str; pub keepNulls: bool; pub fireTriggers: bool; pub bad: bool }
 
 pub fn newState(spid: int): State {
     return State{nocount: false, xactAbort: false, implicitTx: false, quotedIdent: true, postgres: false, trancount: 0,
@@ -524,11 +526,27 @@ fn (st: mut &State) sqlStmtWith(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stm
     let cmd = if bulk { CMD_BULK } else if s.kind == lexdb_sql.S_CREATE && len(s.inner) > 0 && s.inner[0].kind != lexdb_sql.S_CREATE_INDEX { CMD_SELECTINTO } else { cmdOf(s.kind) }
     // as SQL Server: an INSERT, UPDATE or DELETE runs in a transaction of
     // its own, nested, so @@TRANCOUNT inside it is one more
-    if s.kind == lexdb_sql.S_INSERT || s.kind == lexdb_sql.S_UPDATE || s.kind == lexdb_sql.S_DELETE || s.kind == lexdb_sql.S_MERGE || len(s.wctes) > 0 {
+    let isDml = s.kind == lexdb_sql.S_INSERT || s.kind == lexdb_sql.S_UPDATE || s.kind == lexdb_sql.S_DELETE || s.kind == lexdb_sql.S_MERGE || bulk || len(s.wctes) > 0
+    if isDml {
         f.vals[0] = Val.Int(max(st.trancount, if sess.status() == 'I' { 0 } else { 1 }) + 1)
     }
     let oids = f.oids()
+    let sid = sess.sessionId()
+    if isDml {
+        pushTrgBridge(sid, TrgBridge{
+            nocount: st.nocount, xactAbort: st.xactAbort, quotedIdent: st.quotedIdent,
+            nest: st.nest, trancount: max(st.trancount, if sess.status() == 'I' { 0 } else { 1 }),
+            spid: st.spid, tryDepth: st.tryDepth, events: [], errProc: "", errLine: 1,
+        })
+    }
     var r = if bulk { sess.copyInFrom(s, pull) } else { runIn(sess, s, f, &oids) }
+    var br = TrgBridge{nocount: false, xactAbort: false, quotedIdent: true, nest: 0, trancount: 0, spid: 0, tryDepth: 0, events: [], errProc: "", errLine: 1}
+    if isDml {
+        br = popTrgBridge(sid)
+        for i in 0..len(br.events) {
+            append(ev, replace(mut &br.events[i], ev0(EV_DONE)))
+        }
+    }
     if len(s.outInto) > 0 && r.isOk() { r = outputInto(sess, s, r.unwrap()) }
     var before: []lexdb_exec.Res = []
     var past = false
@@ -543,7 +561,7 @@ fn (st: mut &State) sqlStmtWith(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stm
             x.rows = replace(mut &before[0].rows, [])
             append(ev, x)
         }
-        if ownTx {
+        if ownTx && sess.status() != 'I' {
             // (the transaction is not the batch's: its error ends the statement, not it)
             let rb = simple(sess, &"ROLLBACK")
         }
@@ -555,21 +573,32 @@ fn (st: mut &State) sqlStmtWith(sess: mut &lexdb_exec.Session, s: &lexdb_sql.Stm
             doneEv(ev, -1, cmd, true)
         } else {
             st.failErr(ev, &e, cmd)
+            if st.jump && len(br.errProc) > 0 {
+                st.pendingProc = br.errProc.clone()
+                st.pendingLine = br.errLine
+            }
         }
         st.rowcount = 0
         if inTx {
-            if (st.xactAbort || dooms(&e)) && st.tryDepth == 0 {
+            if sess.status() == 'I' {
+                // transaction was rolled back inside a trigger (TS3609)
+                st.trancount = 0
+                st.saves = []
+                st.doomed = false
+                if e.state == "TS3609" && st.tryDepth == 0 { return false }
+            } else if (st.xactAbort || dooms(&e)) && st.tryDepth == 0 {
                 let rb = simple(sess, &"ROLLBACK")
                 return false
+            } else {
+                let back = simple(sess, &("ROLLBACK TO SAVEPOINT " + SAVE))
+                let rel = simple(sess, &("RELEASE SAVEPOINT " + SAVE))
+                // in a TRY block: the transaction left open, to be rolled back (XACT_STATE() -1)
+                if st.xactAbort || dooms(&e) { st.doomed = true }
             }
-            let back = simple(sess, &("ROLLBACK TO SAVEPOINT " + SAVE))
-            let rel = simple(sess, &("RELEASE SAVEPOINT " + SAVE))
-            // in a TRY block: the transaction left open, to be rolled back (XACT_STATE() -1)
-            if st.xactAbort || dooms(&e) { st.doomed = true }
-        } else if st.xactAbort && st.tryDepth == 0 {
+        } else if (st.xactAbort || e.state == "TS3609") && st.tryDepth == 0 {
             return false
         }
-        let ends = (st.tryDepth == 0 || st.uncatchable) && endsBatch(&e)
+        let ends = (st.tryDepth == 0 || st.uncatchable) && (endsBatch(&e) || e.state == "TS3609")
         st.uncatchable = false
         if ends { st.scopeEnd = true }
         return !ends
@@ -744,7 +773,7 @@ fn (st: mut &State) exec(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
                     for j in 0..len(decl) { if strings.toLowerAscii(&decl[j].name) == t.names[i] { k = j } }
                     if k < 0 { bad = true }
                 }
-                st.bulk = [BulkReq{table: t.names[0].clone(), cols: cols, keepNulls: strings.contains(&t.value, "keep_nulls"), bad: bad}]
+                st.bulk = [BulkReq{table: t.names[0].clone(), cols: cols, keepNulls: strings.contains(&t.value, "keep_nulls"), fireTriggers: strings.contains(&t.value, "fire_triggers"), bad: bad}]
                 doneEv(ev, -1, CMD_SETOPT, bad)
                 return true
             }
@@ -844,6 +873,7 @@ fn (st: mut &State) exec(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
         st.trancount = 0
         st.saves = []
         if ok { doneEv(ev, -1, 0, false) }
+        if lexdb_trigger.frameDepth(sess.sessionId()) > 0 { return false }
         return true
     }
     if t.kind == lexdb_tsqlparse.TS_SAVE {
@@ -889,6 +919,7 @@ fn (st: mut &State) after(sess: &lexdb_exec.Session, before: byte, ev: mut &[]Ev
 // Runs a batch: its events onto ev. f: its variables to start with
 // (newFrame's, and an RPC's parameters), and after it the values they have.
 pub fn run(sess: mut &lexdb_exec.Session, st: mut &State, sql: &str, f: mut &Frame, ev: mut &[]Event) {
+    ensureTriggerHook()
     // (nothing of an earlier batch's errors is left: no jump to a CATCH block, no error a TRY block does not catch)
     st.jump = false
     st.uncatchable = false
@@ -1761,6 +1792,26 @@ fn (st: mut &State) call(sess: mut &lexdb_exec.Session, t: &lexdb_tsqlparse.TStm
         if !st.sqlStmt(sess, &rs, f, ev, true) { return F_END }
         return F_NEXT
     }
+    if proc == "sp_settriggerorder" || proc == "dbo.sp_settriggerorder" || proc == "sys.sp_settriggerorder" {
+        let ia = argAt(&vals, &t.names, &"@triggername", 0)
+        let ib = argAt(&vals, &t.names, &"@order", 1)
+        let ic = argAt(&vals, &t.names, &"@stmttype", 2)
+        if ia < 0 || ib < 0 || ic < 0 {
+            let miss = if ia < 0 { "@triggername" } else if ib < 0 { "@order" } else { "@stmttype" }
+            st.fail(ev, Caught{number: 201, message: "Procedure or function 'sp_settriggerorder' expects parameter '" + miss + "', which was not supplied.", severity: 16, state: 4}, 0)
+            return F_NEXT
+        }
+        var rs = lexdb_sql.newStmt(lexdb_sql.S_ALTER_TRIGGER)
+        rs.mdialect = lexdb_sql.MD_TSQL
+        rs.alias = "order"
+        var tn = if lexdb_ops.isNull(&vals[ia]) { "" } else { strings.toLowerAscii(&lexdb_sql.text(&vals[ia])) }
+        if strings.startsWith(&tn, "dbo.") { tn = tn[4..len(tn)].toStr() }
+        rs.table = tn
+        rs.index = if lexdb_ops.isNull(&vals[ib]) { "" } else { lexdb_sql.text(&vals[ib]) }
+        append(mut &rs.names, if lexdb_ops.isNull(&vals[ic]) { "" } else { lexdb_sql.text(&vals[ic]) })
+        if !st.sqlStmt(sess, &rs, f, ev, true) { return F_END }
+        return F_NEXT
+    }
     let cat = catalogProcSql(&proc, &vals, &t.names)
     if len(cat) > 0 {
         var fr = newFrame()
@@ -2504,6 +2555,7 @@ pub fn bulk(sess: mut &lexdb_exec.Session, st: mut &State, pull: &fn(): lexdb_ex
     s.copy.from = true
     s.copy.setBulk(true)
     s.copy.setKeepNulls(req.keepNulls)
+    s.copy.setFireTriggers(req.fireTriggers)
     var f = newFrame()
     st.refresh(sess, mut &f)
     let before = sess.status()
@@ -2629,3 +2681,192 @@ fn tableArg(text: &str): Result[str, DbErr] {
 
 // SQL_Latin1_General_CP1_CI_AS in TDS's 5 bytes (lexdb_tds sends every text column so)
 const TDS_COLLATION = "\x09\x04\xd0\x00\x34"
+
+// ---- T-SQL trigger execution bridge (called from lexdb_exec.firePendingTriggers)
+
+type TrgBridge = record {
+    nocount: bool
+    xactAbort: bool
+    quotedIdent: bool
+    nest: int
+    trancount: int
+    spid: int
+    tryDepth: int
+    events: []Event
+    errProc: str
+    errLine: int
+}
+
+type BridgeStore = record {
+    keys: []int
+    vals: [][]TrgBridge
+}
+
+var TRG_HOOK_SET: bool = false
+var TRG_BRIDGES: once task.Shared[BridgeStore]
+
+fn bridgeStore(): task.Shared[BridgeStore] {
+    if !TRG_BRIDGES.isSet() { TRG_BRIDGES.set(task.shared(BridgeStore{keys: [], vals: []})) }
+    return TRG_BRIDGES.get().share()
+}
+
+fn ensureTriggerHook() {
+    if !TRG_HOOK_SET {
+        TRG_HOOK_SET = true
+        lexdb_exec.setTriggerRunner(lexdb_trigger.TD_TSQL, runTrigger)
+    }
+}
+
+fn pushTrgBridge(sid: int, b0: TrgBridge) {
+    var b = b0
+    let empty = TrgBridge{nocount: false, xactAbort: false, quotedIdent: true, nest: 0, trancount: 0, spid: 0, tryDepth: 0, events: [], errProc: "", errLine: 1}
+    bridgeStore().with(fn(bs: mut &BridgeStore) {
+        var idx = -1
+        for i in 0..len(bs.keys) { if bs.keys[i] == sid { idx = i; break } }
+        if idx < 0 {
+            append(mut &bs.keys, sid)
+            append(mut &bs.vals, [])
+            idx = len(bs.keys) - 1
+        }
+        append(mut &bs.vals[idx], replace(mut &b, empty.clone()))
+    })
+}
+
+fn popTrgBridge(sid: int): TrgBridge {
+    var out = TrgBridge{nocount: false, xactAbort: false, quotedIdent: true, nest: 0, trancount: 0, spid: 0, tryDepth: 0, events: [], errProc: "", errLine: 1}
+    bridgeStore().with(fn(bs: mut &BridgeStore) {
+        for i in 0..len(bs.keys) {
+            if bs.keys[i] == sid {
+                if len(bs.vals[i]) > 0 { out = pop(mut &bs.vals[i]) }
+                if len(bs.vals[i]) == 0 {
+                    let last = len(bs.keys) - 1
+                    if i != last {
+                        bs.keys[i] = bs.keys[last]
+                        bs.vals[i] = replace(mut &bs.vals[last], [])
+                    }
+                    let _k = pop(mut &bs.keys)
+                    let _v = pop(mut &bs.vals)
+                }
+                break
+            }
+        }
+    })
+    return out
+}
+
+fn peekTrgBridge(sid: int): Option[TrgBridge] {
+    var out: Option[TrgBridge] = None
+    bridgeStore().with(fn(bs: mut &BridgeStore) {
+        for i in 0..len(bs.keys) {
+            if bs.keys[i] == sid && len(bs.vals[i]) > 0 {
+                out = Some(bs.vals[i][len(bs.vals[i]) - 1].clone())
+                break
+            }
+        }
+    })
+    return out
+}
+
+fn appendTrgEvents(sid: int, evs: mut &[]Event, errProc: &str, errLine: int) {
+    bridgeStore().with(fn(bs: mut &BridgeStore) {
+        for i in 0..len(bs.keys) {
+            if bs.keys[i] == sid && len(bs.vals[i]) > 0 {
+                let k = len(bs.vals[i]) - 1
+                for j in 0..len(evs) {
+                    if evs[j].kind == EV_INFO || evs[j].kind == EV_ROWS {
+                        append(mut &bs.vals[i][k].events, replace(mut &evs[j], ev0(EV_DONE)))
+                    }
+                }
+                if len(errProc) > 0 && len(bs.vals[i][k].errProc) == 0 {
+                    bs.vals[i][k].errProc = errProc.toStr()
+                    bs.vals[i][k].errLine = errLine
+                }
+                break
+            }
+        }
+    })
+}
+
+pub fn runTrigger(sess: mut &lexdb_exec.Session, req: &lexdb_trigger.FireReq): Result[Unit, DbErr] {
+    let sid = sess.sessionId()
+    let brOpt = peekTrgBridge(sid)
+    var tState = newState(sid)
+    match brOpt {
+        Some(br) {
+            tState.nocount = br.nocount
+            tState.xactAbort = br.xactAbort
+            tState.quotedIdent = br.quotedIdent
+            tState.nest = br.nest
+            tState.trancount = max(br.trancount, 1)
+            tState.spid = br.spid
+        }
+        None {
+            tState.trancount = 1
+        }
+    }
+    if tState.nest >= 32 {
+        return Err(tsErr(217, "Maximum stored procedure, function, trigger, or view nesting level exceeded (limit 32)."))
+    }
+    tState.nest += 1
+    tState.procId = req.trig.oid
+    tState.rowcount = req.delta.rowCount
+    append(mut &tState.procs, req.trig.spell.clone())
+
+    var fr = newFrame()
+    tState.refresh(sess, mut &fr)
+    let text = withTableTypes(sess, &req.trig.body)
+    let parsed = lexdb_tsqlparse.parseBatch(&text, lexdb_parse.Dialect{tsql: true, quotedIdent: tState.quotedIdent}, &fr.names)
+    if parsed.isErr() {
+        return Err(parsed.unwrapErr())
+    }
+    let b = parsed.unwrap()
+    let given0 = len(fr.names)
+    for k in given0..len(b.vars) { let _ = fr.add(&b.vars[k], b.types[k - given0], Val.Null) }
+
+    let tempMark = len(tState.temps)
+    let tvMark = len(tState.tableVars)
+    let callerRole = if len(req.trig.owner) > 0 { sess.actAs(&req.trig.owner) } else { "" }
+    tState.text = text.clone()
+    var tev: []Event = []
+    let r = tState.block(sess, &b.stmts, mut &fr, mut &tev)
+    if len(req.trig.owner) > 0 { sess.backTo(&callerRole) }
+
+    while len(tState.temps) > tempMark {
+        let tn = pop(mut &tState.temps)
+        if sess.status() != 'I' { let _ = simple(sess, &("DROP TABLE IF EXISTS " + quoteName(&tn))) }
+    }
+    while len(tState.tableVars) > tvMark {
+        let tn = pop(mut &tState.tableVars)
+        if sess.status() != 'I' { let _ = simple(sess, &("DROP TABLE IF EXISTS " + quoteName(&tn))) }
+    }
+
+    // Check if the trigger rolled back the transaction
+    if sess.status() == 'I' {
+        appendTrgEvents(sid, mut &tev, &req.trig.spell, tState.line)
+        return Err(tsErr(3609, "The transaction ended in the trigger. The batch has been aborted."))
+    }
+
+    // Check if an uncaught error occurred inside the trigger
+    var errOpt: Option[DbErr] = None
+    var errLine = tState.line
+    for i in 0..len(tev) {
+        if tev[i].kind == EV_ERROR {
+            let num = if tev[i].number > 0 { tev[i].number } else { 50000 }
+            var de = tsErr(num, &tev[i].err.msg)
+            if tev[i].state > 0 { de.detail = "state=" + tev[i].state.toStr() }
+            errOpt = Some(de)
+            if tev[i].line > 0 { errLine = tev[i].line }
+            break
+        }
+    }
+    let ep = if errOpt.isSome() { req.trig.spell.clone() } else { "" }
+    appendTrgEvents(sid, mut &tev, &ep, errLine)
+    match errOpt {
+        Some(de) { return Err(de) }
+        None {}
+    }
+    if r == F_END && tState.error != 0 {
+        return Err(tsErr(tState.error, "Trigger execution failed."))
+    }
+    return Ok(Unit{})
+}

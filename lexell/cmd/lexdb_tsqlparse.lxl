@@ -17,6 +17,7 @@ import "./lexdb_sql"
 import "./lexdb_parse"
 import "./lexdb_udf"
 import "./lexdb_routine"
+import "./lexdb_trigger"
 
 type DbErr = lexdb_base.DbErr
 type TypeName = lexdb_sql.TypeName
@@ -920,6 +921,10 @@ pub fn parseBatch(sql0: &str, d: lexdb_parse.Dialect, vars: &[]str): Result[TBat
         Some(b) { return Ok(b) }
         None {}
     }
+    match try triggerBatch(sql0, d, vars) {
+        Some(b) { return Ok(b) }
+        None {}
+    }
     return parseStmts(sql0, d, vars)
 }
 
@@ -1290,6 +1295,145 @@ fn procBatch(sql: &str, d: lexdb_parse.Dialect, vars: &[]str): Result[Option[TBa
     s.ifFlag = orAt >= 0 || !create
     if !create { s.alias = "alter" }
     append(mut &s.rtn, r)
+    var ts = tstmt(TS_SQL)
+    append(mut &ts.stmt, s)
+    return Ok(Some(TBatch{stmts: [ts], vars: [], types: []}))
+}
+
+fn checkTriggerBody(ts: &[]TStmt): Result[Unit, DbErr] {
+    for t in ts {
+        let k = t.kind
+        if k == TS_BLOCK { try checkTriggerBody(&t.body) }
+        else if k == TS_IF || k == TS_WHILE || k == TS_TRY {
+            try checkTriggerBody(&t.body)
+            try checkTriggerBody(&t.els)
+        } else if k == TS_USE {
+            return Err(tsErr(154, "a USE database statement is not allowed in a procedure, function or trigger."))
+        } else if k == TS_RETURN && len(t.stmt) > 0 {
+            return Err(tsErr(178, "A RETURN statement with a return value cannot be used in this context."))
+        }
+    }
+    return Ok(Unit{})
+}
+
+// CREATE [OR ALTER] TRIGGER [schema.]name ON [schema.]table_or_view
+//   [WITH <dml_trigger_option> [, ...]]
+//   { FOR | AFTER | INSTEAD OF } { INSERT | UPDATE | DELETE } [, ...]
+//   [NOT FOR REPLICATION]
+//   AS body
+// or ALTER TRIGGER ...
+fn triggerBatch(sql: &str, d: lexdb_parse.Dialect, vars: &[]str): Result[Option[TBatch], DbErr] {
+    let low = strings.toLowerAscii(sql)
+    if !strings.contains(&low, "trigger") { return Ok(None) }
+    var q = match lexdb_parse.tsqlParser(sql, d, vars) {
+        Ok(x) { x }
+        Err(_) { return Ok(None) }
+    }
+    let first = q.peek().clone()
+    if first.kind != lexdb_parse.T_IDENT || (first.text != "create" && first.text != "alter") { return Ok(None) }
+    let create = first.text == "create"
+    var k = 1
+    var orAt = -1
+    var alterAt = -1
+    if create && q.peekAt(1).kind == lexdb_parse.T_IDENT && q.peekAt(1).text == "or" &&
+       q.peekAt(2).kind == lexdb_parse.T_IDENT && q.peekAt(2).text == "alter" {
+        orAt = q.peekAt(1).at
+        alterAt = q.peekAt(2).at
+        k = 3
+    }
+    let w = q.peekAt(k).clone()
+    if w.kind != lexdb_parse.T_IDENT || w.text != "trigger" { return Ok(None) }
+    q.skip(k + 1)
+
+    // Trigger name ([schema.]name)
+    let trigRaw = try q.tableName()
+    let trigSpell = q.lastSpelled()
+    try q.expectKw("on")
+    if q.isKw("database") || q.isKw("all") {
+        return Err(lexdb_base.err("0A000", "lexdb: DDL/server triggers (ON DATABASE / ON ALL SERVER) are not supported"))
+    }
+    let targetRaw = try q.tableName()
+
+    // Optional WITH <dml_trigger_option> [, ...] (ENCRYPTION, EXECUTE AS ...)
+    if q.acceptKw("with") {
+        while true {
+            if q.acceptKw("encryption") || q.acceptKw("native_compilation") || q.acceptKw("schemabinding") {
+                // accepted
+            } else if q.acceptKw("execute") {
+                try q.expectKw("as")
+                if q.acceptKw("caller") || q.acceptKw("self") || q.acceptKw("owner") {
+                } else {
+                    let _ = q.next()
+                }
+            } else {
+                return Err(q.unexpected())
+            }
+            if !q.acceptKw(",") { break }
+        }
+    }
+
+    // Timing: FOR | AFTER | INSTEAD OF
+    var timing = lexdb_trigger.TT_AFTER
+    if q.acceptKw("for") || q.acceptKw("after") {
+        timing = lexdb_trigger.TT_AFTER
+    } else if q.acceptKw("instead") {
+        try q.expectKw("of")
+        timing = lexdb_trigger.TT_INSTEAD_OF
+    } else {
+        return Err(q.unexpected())
+    }
+
+    // Events: INSERT, UPDATE, DELETE (comma-separated, at least one)
+    var events = 0
+    while true {
+        if q.acceptKw("insert") { events = events | lexdb_trigger.TE_INSERT }
+        else if q.acceptKw("update") { events = events | lexdb_trigger.TE_UPDATE }
+        else if q.acceptKw("delete") { events = events | lexdb_trigger.TE_DELETE }
+        else { return Err(q.unexpected()) }
+        if !q.acceptKw(",") { break }
+    }
+
+    // Optional WITH APPEND / NOT FOR REPLICATION
+    if q.acceptKw("with") { let _ = q.acceptKw("append") }
+    if q.acceptKw("not") {
+        try q.expectKw("for")
+        try q.expectKw("replication")
+    }
+
+    try q.expectKw("as")
+    let at = q.here()
+    let src = q.source()
+    let body = src[at..len(src)].toStr()
+    let def = if orAt >= 0 { src[first.at..orAt].toStr() + src[orAt + 2..alterAt].toStr() + src[alterAt + 5..len(src)].toStr() }
+              else if !create { "CREATE" + src[first.at + 5..len(src)].toStr() } else { src[first.at..len(src)].toStr() }
+
+    // Validate body syntax (same as procedures, plus trigger restrictions)
+    let b = try parseStmts(&body, d, vars)
+    try checkTriggerBody(&b.stmts)
+
+    var tr = lexdb_trigger.emptyTrigger()
+    tr.dialect = lexdb_trigger.TD_TSQL
+    // Store raw schema/name; executor validates target table/view and aligns schema with target!
+    tr.key = trigRaw.clone()
+    tr.name = lexdb_sql.baseName(&trigRaw)
+    tr.spell = if len(trigSpell) > 0 { trigSpell } else { tr.name.clone() }
+    tr.schema = if lexdb_sql.isQual(&trigRaw) { lexdb_sql.schemaOf(&trigRaw) } else { "" }
+    tr.target = targetRaw.clone()
+    tr.timing = timing
+    tr.events = events
+    tr.level = lexdb_trigger.TL_STATEMENT
+    tr.body = body
+    tr.def = def
+    tr.refOld = "deleted"
+    tr.refNew = "inserted"
+    tr.enabled = true
+
+    var s = lexdb_sql.newStmt(lexdb_sql.S_CREATE_TRIGGER)
+    s.mdialect = lexdb_sql.MD_TSQL
+    s.table = targetRaw
+    s.ifFlag = orAt >= 0 || !create
+    s.alter = !create
+    s.mvOpts = lexdb_trigger.encode(&tr)
     var ts = tstmt(TS_SQL)
     append(mut &ts.stmt, s)
     return Ok(Some(TBatch{stmts: [ts], vars: [], types: []}))

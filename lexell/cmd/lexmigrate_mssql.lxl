@@ -137,6 +137,16 @@ pub type ModuleInfo = value record {
     pub isSchemaBound: bool
 }
 
+pub type TriggerInfo = value record {
+    pub objId: int
+    pub schemaName: str
+    pub parentName: str
+    pub name: str
+    pub definition: str
+    pub isDisabled: bool
+    pub isInsteadOf: bool
+}
+
 pub type TableInfo = record {
     pub objId: int
     pub schemaName: str
@@ -161,6 +171,7 @@ pub type Schema = record {
     pub fks: []FkInfo
     pub views: []ModuleInfo
     pub routines: []ModuleInfo
+    pub triggers: []TriggerInfo
     pub warnings: []Warning
 }
 
@@ -368,6 +379,7 @@ pub fn extractSchema(c: mut &sqlserver.Conn, filter: &Filter): Result[Schema, st
         fks: [],
         views: [],
         routines: [],
+        triggers: [],
         warnings: []
     }
 
@@ -882,23 +894,41 @@ pub fn extractSchema(c: mut &sqlserver.Conn, filter: &Filter): Result[Schema, st
         sc.schemas = kept
     }
 
-    // 14. Discovery of unsupported objects for the migration report (best-effort)
+    // 14. DML triggers (migrated in post-data DDL after data load, views, and routines)
     match c.query(
-        "SELECT tr.parent_id, s.name, o.name, tr.name " +
+        "SELECT tr.object_id, tr.parent_id, s.name, o.name, tr.name, m.definition, tr.is_disabled, tr.is_instead_of_trigger " +
         "FROM sys.triggers tr " +
         "JOIN sys.objects o ON o.object_id = tr.parent_id " +
         "JOIN sys.schemas s ON s.schema_id = o.schema_id " +
-        "WHERE tr.is_ms_shipped = 0", &[]) {
+        "JOIN sys.sql_modules m ON m.object_id = tr.object_id " +
+        "WHERE tr.is_ms_shipped = 0 AND tr.parent_class = 1 " +
+        "ORDER BY tr.object_id", &[]) {
         Ok(rTrig) {
             for i in 0..rTrig.rowCount() {
-                let poid = qInt(&rTrig, i, 0)
-                let sname = qStr(&rTrig, i, 1)
+                let oid = qInt(&rTrig, i, 0)
+                let poid = qInt(&rTrig, i, 1)
+                let sname = qStr(&rTrig, i, 2)
+                let pname = qStr(&rTrig, i, 3)
+                let tname = qStr(&rTrig, i, 4)
+                let defn = qStr(&rTrig, i, 5)
                 if !schemaAllowed(filter, &sname) { continue }
                 if len(filter.tables) > 0 && !tabIdxByOid.has(poid) { continue }
-                append(mut &sc.warnings, Warning{
-                    severity: "warn",
-                    object: qualName(&sname, &(qStr(&rTrig, i, 2))) + "." + quoteIdent(&(qStr(&rTrig, i, 3))),
-                    message: "trigger is not supported by LexDB (skipped)"
+                if len(strings.trim(&defn)) == 0 {
+                    append(mut &sc.warnings, Warning{
+                        severity: "warn",
+                        object: qualName(&sname, &pname) + "." + quoteIdent(&tname),
+                        message: "trigger has empty/encrypted definition (skipped)"
+                    })
+                    continue
+                }
+                append(mut &sc.triggers, TriggerInfo{
+                    objId: oid,
+                    schemaName: sname,
+                    parentName: pname,
+                    name: tname,
+                    definition: defn,
+                    isDisabled: qBool(&rTrig, i, 6),
+                    isInsteadOf: qBool(&rTrig, i, 7)
                 })
             }
         }
@@ -1175,6 +1205,16 @@ pub fn emitPostSql(sc: &Schema): str {
             out += strings.trim(&sc.routines[i].definition) + "\nGO\n\n"
         }
     }
+    if len(sc.triggers) > 0 {
+        out += "-- Triggers\n"
+        for i in 0..len(sc.triggers) {
+            out += strings.trim(&sc.triggers[i].definition) + "\nGO\n"
+            if sc.triggers[i].isDisabled {
+                out += "DISABLE TRIGGER " + qualName(&sc.triggers[i].schemaName, &sc.triggers[i].name) + " ON " + qualName(&sc.triggers[i].schemaName, &sc.triggers[i].parentName) + ";\nGO\n"
+            }
+            out += "\n"
+        }
+    }
     var hasSeqRestart = false
     for i in 0..len(sc.sequences) {
         if sc.sequences[i].hasLastVal { hasSeqRestart = true }
@@ -1364,6 +1404,15 @@ pub fn applyPostSchema(dst: mut &sqlserver.Conn, sc: &Schema, continueOnErr: boo
     for i in 0..len(sc.routines) { append(mut &routBatches, strings.trim(&sc.routines[i].definition)) }
     total += try runBatches(dst, &routBatches, "routines", true, continueOnErr, verbose, errs)
 
+    var trigBatches: []str = []
+    for i in 0..len(sc.triggers) {
+        append(mut &trigBatches, strings.trim(&sc.triggers[i].definition))
+        if sc.triggers[i].isDisabled {
+            append(mut &trigBatches, "DISABLE TRIGGER " + qualName(&sc.triggers[i].schemaName, &sc.triggers[i].name) + " ON " + qualName(&sc.triggers[i].schemaName, &sc.triggers[i].parentName) + ";")
+        }
+    }
+    total += try runBatches(dst, &trigBatches, "triggers", false, continueOnErr, verbose, errs)
+
     var seqBatches: []str = []
     for i in 0..len(sc.sequences) {
         match emitRestartSequence(&sc.sequences[i]) {
@@ -1399,6 +1448,7 @@ pub fn formatReport(sc: &Schema): str {
     out += "  Foreign keys       : " + len(sc.fks).toStr() + "\n"
     out += "  Views              : " + len(sc.views).toStr() + " (" + len(sc.viewIndexes).toStr() + " view indexes)\n"
     out += "  Routines           : " + len(sc.routines).toStr() + "\n"
+    out += "  Triggers           : " + len(sc.triggers).toStr() + "\n"
     if len(sc.warnings) > 0 {
         out += "\nCompatibility notes & warnings (" + len(sc.warnings).toStr() + "):\n"
         for w in sc.warnings {

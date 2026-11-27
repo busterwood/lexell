@@ -43,6 +43,7 @@ import "./lexdb_annot"
 import "./lexdb_csr"
 import "./lexdb_graph"
 import "./lexdb_mview"
+import "./lexdb_trigger"
 import "./lexdb_skip"
 import "./lexdb_sql"
 import "./lexdb_json"
@@ -251,6 +252,9 @@ fn srfCols(name: &str, ordin: bool, args: &[]OutCol): Result[[]OutCol, DbErr] {
     if strings.startsWith(name, &("#" + MV_OQC_REL)) {
         return Ok(mvOqcOutCols(name))
     }
+    if strings.startsWith(name, &("#" + lexdb_trigger.TRG_REL)) {
+        return Ok(trgRelOutCols(name))
+    }
     if strings.startsWith(name, lexdb_graph.PGQ_SHORTEST_PRE) {
         return Ok(pgqShortestOutCols(name))
     }
@@ -408,6 +412,8 @@ fn srfRows(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sel: &Sel, args: [
         let lim = Limits{rounds: MAX_RECURSION, steps: MAX_MATCH_STEPS, mem: txn.sql.memMax, deadline: rs.bud.deadline, batch: rs.batch, rules: txn.sql.rules, auto: false, rdel: true}
         let up = mvUp(st, txn.sql.sess, lim)
         rows = try lexdb_mview.readMergedRows(st, txn, &key, &up)
+    } else if strings.startsWith(&sel.srf, &("#" + lexdb_trigger.TRG_REL)) {
+        rows = lexdb_trigger.virtualRows(txn.sql.sess, &sel.srf)
     } else if strings.startsWith(&sel.srf, lexdb_graph.PGQ_SHORTEST_PRE) {
         rows = try pgqShortestRows(st, txn, &sel.srf, params, rs)
     } else {
@@ -1519,7 +1525,11 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 let rp = strings.split(&r, lexdb_catalog.RN_SEP)
                 if len(rp) == 3 && rp[0] == "t" && rp[1] == f.table { tname = rp[2].toStr() }
             }
-            let found = try findTableRc(st, txn, &tname)
+            var found: Option[rc Table] = None
+            match lexdb_trigger.virtualRel(txn.sql.sess, &tname) {
+                Some(vt) { found = Some(rc(vt)) }
+                None { found = try findTableRc(st, txn, &tname) }
+            }
             if found.isNone() {
                 // a sequence: its one row (9.117), as a view of it
                 match try findSeq(st, txn, &f.table) {
@@ -1529,7 +1539,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
             } else {
                 t = found.unwrap()
             }
-            if t.name != sc.target {
+            if t.name != sc.target && !strings.startsWith(&t.view, lexdb_trigger.TRG_REL) {
                 try scCheck(st, txn, sc, &t.name, &(if len(t.view) > 0 { "view" } else { "table" }))
                 if len(t.view) == 0 && lexdb_mview.isUnpopPgMv(&t) {
                     return Err(lexdb_base.errDetail("55000", &("materialized view \"" + lexdb_sql.baseName(&t.name) + "\" has not been populated"),
@@ -1578,7 +1588,7 @@ fn bindFrom(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, from: &[]lexdb_sq
                 }
                 viewSrc = len(subs) + len(views)
                 sp.view = Some(lexdb_plan.ViewSrc{stmt: vs, owner: vowner, rn: t.rn.clone()})  // for the planner's pushdown (optimizer 48.3)
-                if !strings.startsWith(&t.view, SEQ_REL) && !strings.startsWith(&t.view, MV_OQC_REL) && len(sc.works) == 0 && selPure(&sp.sel) {
+                if !strings.startsWith(&t.view, SEQ_REL) && !strings.startsWith(&t.view, MV_OQC_REL) && !strings.startsWith(&t.view, lexdb_trigger.TRG_REL) && len(sc.works) == 0 && selPure(&sp.sel) {
                     sp.viewKey = t.name.toStr()
                 }
                 append(mut &views, sp)
@@ -4882,6 +4892,7 @@ fn dropTableNamed(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, name: &str,
             try dropOwnedSeqs(st, txn, &d, &"")
             if !lexdb_catalog.tempRel(&d.name) && (try lexdb_mview.readLog(st, txn, &d.name)).isSome() { lexdb_mview.delLog(txn, &d.name) }
             try lexdb_skip.dropAllForTable(st, txn, &d.name, d.tree)
+            try lexdb_trigger.dropForTarget(st, txn, &d)
             dropOne(txn, &d)
             try bumpFor(st, txn, &d.name)
             return Ok(tagOnly("DROP TABLE"))
@@ -4978,7 +4989,8 @@ fn dropTempIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, sc: &str): Resu
                 lexdb_catalog.joinFks(mut &d)
                 try unlinkTable(st, txn, mut &d, true)
                 try dropOwnedSeqs(st, txn, &d, &"")
-                dropOne(txn, &d)
+                try lexdb_trigger.dropForTarget(st, txn, &d)
+            dropOne(txn, &d)
             }
             None {}
         }
@@ -5039,7 +5051,8 @@ fn onCommitDo(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, have: &[]str, l
                     try dropDependentViews(st, txn, &d.name, true, &"table")
                     try unlinkTable(st, txn, mut &d, true)
                     try dropOwnedSeqs(st, txn, &d, &"")
-                    dropOne(txn, &d)
+                    try lexdb_trigger.dropForTarget(st, txn, &d)
+            dropOne(txn, &d)
                     tmpBump(st, txn)
                 } else if t.onCommit == lexdb_sql.ONC_DELETE {
                     append(mut &kept, k.clone())
@@ -6088,6 +6101,7 @@ fn alterTable(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
             t.name = key.clone()
             try lexdb_priv.moveAcl(st, txn, &lexdb_catalog.relObj(&old), &lexdb_catalog.relObj(&key))
             try relink(st, txn, mut &t, &old)
+            try lexdb_trigger.renameTarget(st, txn, &old, &t.name)
             try lexdb_stats.moveStats(st, txn, &old, &t.name)
             try ownerMoved(st, txn, mut &t, &old, &"", &"", &"")
             for ix in t.indexes { try txn.put(lexdb_catalog.CATALOG, &(idxName(&ix.name)), &key) }
@@ -6901,7 +6915,8 @@ fn dropSchema(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.S
                     var d = t
                     try dropDependentViews(st, txn, &d.name, true, &"table")
                     try unlinkTable(st, txn, mut &d, true)
-                    dropOne(txn, &d)
+                    try lexdb_trigger.dropForTarget(st, txn, &d)
+            dropOne(txn, &d)
                 }
             }
             None {}
@@ -7530,6 +7545,20 @@ fn insert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
 fn insertIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, lim: Limits, pc: mut &PlanCache, wr: mut &[]WcteRun): Result[Res, DbErr] {
     let wOn = len(wr) > 0
     if wOn { txn.visCap = wr[0].baseMark }
+    if lexdb_trigger.isVirtualWriteTarget(txn.sql.sess, &s.table) {
+        return Err(e("TS286", "The logical tables INSERTED and DELETED cannot be updated."))
+    }
+    if lexdb_trigger.storeHasAny(st) {
+        match try findTable(st, txn, &s.table) {
+            Some(it) {
+                if !lexdb_trigger.isActiveInsteadOf(txn.sql.sess, &it.name, lexdb_trigger.TE_INSERT) &&
+                   try lexdb_trigger.hasEnabledFor(st, txn, &it, lexdb_trigger.TT_INSTEAD_OF, lexdb_trigger.TE_INSERT) {
+                    return insteadOfInsert(st, txn, s, &it, params, ptypes, lim, wr)
+                }
+            }
+            None {}
+        }
+    }
     try notView(st, txn, &s.table, &"insert into")
     try dmlCheck(st, txn, s, &"a")
     let sqe = seqEnv(st, txn)
@@ -7595,6 +7624,10 @@ fn insertIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     if wOn { wr[0].sh.giveBack(mut &rs) }
     var kept: [][]Val = []
     var count = 0
+    if lexdb_trigger.hasMarks(&t.refBy) {
+        let ucols = lexdb_trigger.updatedBitmap(&t, &targets, true)
+        lexdb_trigger.ensureTarget(txn.sql.sess, &t, lexdb_trigger.TE_INSERT, false, &ucols, false, false)
+    }
     let parents = up.mode == lexdb_sql.CONFLICT_UPDATE        // an update may change a key other rows refer to
     if len(s.inner) > 0 {
         // INSERT ... SELECT: the query's rows inserted as it gives them
@@ -8373,6 +8406,7 @@ fn storeRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: [
         try childSide(st, txn, t, fw, &row, &none, later, pr)
     }
     lexdb_mview.recordInsert(txn, t, &row)
+    lexdb_trigger.recordInsert(txn.sql.sess, t, &row)
     return Ok(row)
 }
 
@@ -8430,6 +8464,20 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let wOn = len(wr) > 0
     let baseMark = if wOn { wr[0].baseMark } else { -1 }
     if wOn { txn.visCap = baseMark }
+    if lexdb_trigger.isVirtualWriteTarget(txn.sql.sess, &s.table) {
+        return Err(e("TS286", "The logical tables INSERTED and DELETED cannot be updated."))
+    }
+    if lexdb_trigger.storeHasAny(st) {
+        match try findTable(st, txn, &s.table) {
+            Some(ut) {
+                if !lexdb_trigger.isActiveInsteadOf(txn.sql.sess, &ut.name, lexdb_trigger.TE_UPDATE) &&
+                   try lexdb_trigger.hasEnabledFor(st, txn, &ut, lexdb_trigger.TT_INSTEAD_OF, lexdb_trigger.TE_UPDATE) {
+                    return insteadOfUpdate(st, txn, s, &ut, params, ptypes, lim, wr)
+                }
+            }
+            None {}
+        }
+    }
     try notView(st, txn, &s.table, &"update")
     try dmlCheck(st, txn, s, &"w")
     let sqe = seqEnv(st, txn)
@@ -8522,6 +8570,10 @@ fn updateB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     }
     let fw = try fkTables(st, txn, t, true, true)
     var later: []FkLater = []
+    if lexdb_trigger.hasMarks(&t.refBy) {
+        let ucols = lexdb_trigger.updatedBitmap(t, &targets, false)
+        lexdb_trigger.ensureTarget(txn.sql.sess, t, lexdb_trigger.TE_UPDATE, false, &ucols, false, false)
+    }
     // a joined row: t's columns, then FROM's, which SET, RETURNING and
     // WHERE may read
     let nt = len(t.cols)
@@ -8666,6 +8718,20 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let wOn = len(wr) > 0
     let baseMark = if wOn { wr[0].baseMark } else { -1 }
     if wOn { txn.visCap = baseMark }
+    if lexdb_trigger.isVirtualWriteTarget(txn.sql.sess, &s.table) {
+        return Err(e("TS286", "The logical tables INSERTED and DELETED cannot be updated."))
+    }
+    if lexdb_trigger.storeHasAny(st) {
+        match try findTable(st, txn, &s.table) {
+            Some(dt) {
+                if !lexdb_trigger.isActiveInsteadOf(txn.sql.sess, &dt.name, lexdb_trigger.TE_DELETE) &&
+                   try lexdb_trigger.hasEnabledFor(st, txn, &dt, lexdb_trigger.TT_INSTEAD_OF, lexdb_trigger.TE_DELETE) {
+                    return insteadOfDelete(st, txn, s, &dt, params, ptypes, lim, wr)
+                }
+            }
+            None {}
+        }
+    }
     try notView(st, txn, &s.table, &"delete from")
     try dmlCheck(st, txn, s, &"d")
     var sc = newScopeIn(st, txn, params, ptypes)
@@ -8731,6 +8797,10 @@ fn deleteB(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     if win.n > 0 { winEnd(win, t, &found, rs.cnt[0].read) }
     let fw = try fkTables(st, txn, t, false, true)
     var later: []FkLater = []
+    if lexdb_trigger.hasMarks(&t.refBy) {
+        let noCols: []bool = []
+        lexdb_trigger.ensureTarget(txn.sql.sess, t, lexdb_trigger.TE_DELETE, false, &noCols, false, false)
+    }
     let nt = len(t.cols)
     if wOn {
         var liveFound: [][]Val = []
@@ -9365,6 +9435,9 @@ fn mergeIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     let wOn = len(wr) > 0
     let baseMark = if wOn { wr[0].baseMark } else { -1 }
     if wOn { txn.visCap = baseMark }
+    if lexdb_trigger.isVirtualWriteTarget(txn.sql.sess, &s.table) {
+        return Err(e("TS286", "The logical tables INSERTED and DELETED cannot be updated."))
+    }
     try notView(st, txn, &s.table, &"merge into")
     try mergeCheck(st, txn, s)
     let sqe = seqEnv(st, txn)
@@ -9518,6 +9591,32 @@ fn mergeIn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt
     }
     let fw = try fkTables(st, txn, &t, true, true)
     var later: []FkLater = []
+    if lexdb_trigger.hasMarks(&t.refBy) {
+        var hasIns = false
+        var hasUpd = false
+        var hasDel = false
+        var updTgs: []int = []
+        for c in cl {
+            if c.act == lexdb_sql.MA_INSERT { hasIns = true }
+            if c.act == lexdb_sql.MA_UPDATE {
+                hasUpd = true
+                for tg in c.targets { append(mut &updTgs, tg) }
+            }
+            if c.act == lexdb_sql.MA_DELETE { hasDel = true }
+        }
+        if hasIns {
+            let ucols = lexdb_trigger.updatedBitmap(&t, &[], true)
+            lexdb_trigger.ensureTarget(txn.sql.sess, &t, lexdb_trigger.TE_INSERT, false, &ucols, false, false)
+        }
+        if hasUpd {
+            let ucols = lexdb_trigger.updatedBitmap(&t, &updTgs, false)
+            lexdb_trigger.ensureTarget(txn.sql.sess, &t, lexdb_trigger.TE_UPDATE, false, &ucols, false, false)
+        }
+        if hasDel {
+            let noCols: []bool = []
+            lexdb_trigger.ensureTarget(txn.sql.sess, &t, lexdb_trigger.TE_DELETE, false, &noCols, false, false)
+        }
+    }
     var up = noUpsert()
     up.md = s.mdialect
     up.idBump = ovr == lexdb_sql.OVR_TSQL
@@ -14913,7 +15012,8 @@ fn isWrite(kind: int): bool {
            kind == lexdb_sql.S_CREATE_TYPE || kind == lexdb_sql.S_DROP_TYPE || kind == lexdb_sql.S_ALTER_TYPE ||
            kind == lexdb_sql.S_TRUNCATE || kind == lexdb_sql.S_ANALYZE || kind == lexdb_sql.S_MERGE || kind == lexdb_sql.S_ALTER_DB || kind == lexdb_sql.S_SP_RENAME ||
            kind == lexdb_sql.S_CREATE_ROUTINE || kind == lexdb_sql.S_DROP_ROUTINE || kind == lexdb_sql.S_CREATE_GRAPH || kind == lexdb_sql.S_DROP_GRAPH || kind == lexdb_sql.S_ASSERT ||
-           kind == lexdb_sql.S_CREATE_MVIEW || kind == lexdb_sql.S_DROP_MVIEW || kind == lexdb_sql.S_REFRESH_MVIEW || kind == lexdb_sql.S_ALTER_MVIEW || kind == lexdb_sql.S_MVIEW_LOG || kind == lexdb_sql.S_COMMENT
+           kind == lexdb_sql.S_CREATE_MVIEW || kind == lexdb_sql.S_DROP_MVIEW || kind == lexdb_sql.S_REFRESH_MVIEW || kind == lexdb_sql.S_ALTER_MVIEW || kind == lexdb_sql.S_MVIEW_LOG || kind == lexdb_sql.S_COMMENT ||
+           kind == lexdb_sql.S_CREATE_TRIGGER || kind == lexdb_sql.S_DROP_TRIGGER || kind == lexdb_sql.S_ALTER_TRIGGER
 }
 
 fn stmtName(kind: int): str {
@@ -14960,6 +15060,9 @@ fn stmtName(kind: int): str {
         lexdb_sql.S_ALTER_MVIEW { "ALTER MATERIALIZED VIEW" }
         lexdb_sql.S_MVIEW_LOG { "CREATE MATERIALIZED VIEW LOG" }
         lexdb_sql.S_COMMENT { "COMMENT" }
+        lexdb_sql.S_CREATE_TRIGGER { "CREATE TRIGGER" }
+        lexdb_sql.S_DROP_TRIGGER { "DROP TRIGGER" }
+        lexdb_sql.S_ALTER_TRIGGER { "ALTER TRIGGER" }
         else { "DELETE" }
     }
 }
@@ -15238,6 +15341,9 @@ fn execStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
         lexdb_sql.S_ALTER_MVIEW { return alterMview(st, txn, s, lim) }
         lexdb_sql.S_MVIEW_LOG { return mviewLogStmt(st, txn, s) }
         lexdb_sql.S_COMMENT { return Ok(tagOnly("COMMENT")) }
+        lexdb_sql.S_CREATE_TRIGGER { return createTrigger(st, txn, s) }
+        lexdb_sql.S_DROP_TRIGGER { return dropTrigger(st, txn, s) }
+        lexdb_sql.S_ALTER_TRIGGER { return alterTrigger(st, txn, s) }
         lexdb_sql.S_COPY { return copyStmt(st, txn, s, params, ptypes, lim, pc, input, out, pull) }
         lexdb_sql.S_EXPLAIN { return explain(st, txn, s, params, lim, ptypes) }
         else { return Err(e("XX000", "not a data statement")) }
@@ -15723,6 +15829,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         }
         lexdb_sql.S_ROLLBACK {
             lexdb_mview.clearTxn(s.id)
+            lexdb_trigger.clearScopes(s.id)
             if len(s.txn) > 0 {
                 let t = pop(mut &s.txn)
                 s.tmpUndo(&t)
@@ -15757,6 +15864,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
             // ROLLBACK TO: its writes since, and the error if any, gone; it stays
             s.txn[0].undoTo(s.saves[i].mark)
             lexdb_mview.undoTo(s.id, s.saves[i].mark)
+            lexdb_trigger.undoTo(s.id, s.saves[i].mark)
             if s.txn[0].tmpDdl { tmpChanged(&s.st, s.id) }          // (temporary objects' DDL may be gone, 9.96)
             while len(s.saves) > i + 1 { let x = pop(mut &s.saves) }
             s.failed = false
@@ -15799,18 +15907,44 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         }
         let reads0 = s.txn[0].readCount()
         s.fresh = false
-        let r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits(), pc, input, out, pull, sink)
+        let trgOn = isDmlTriggerStmt(stmt) && lexdb_trigger.storeHasAny(&s.st)
+        let trgMark = if trgOn { s.txn[0].mark() } else { 0 }
+        if trgOn { lexdb_trigger.pushScope(s.id, trgMark) }
+        var r = execIn(&st, mut &s.txn[0], stmt, params, ptypes, s.limits(), pc, input, out, pull, sink)
         if rcSnap { s.st.releaseSnapshot(mut &s.txn[0]) }
         if r.isOk() && s.txn[0].rc && (stmt.kind == lexdb_sql.S_UPDATE || stmt.kind == lexdb_sql.S_DELETE || stmt.kind == lexdb_sql.S_MERGE ||
                                        wcteW || (stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode > 0)) {
             s.txn[0].forgetReads(reads0)
         }
+        if trgOn {
+            if r.isOk() {
+                match s.firePendingTriggers() {
+                    Ok(_) {}
+                    Err(x) {
+                        if len(s.txn) == 0 {
+                            return Err(x)
+                        }
+                        s.txn[0].undoTo(trgMark)
+                        lexdb_mview.undoTo(s.id, trgMark)
+                        s.txn[0].live = false
+                        s.failed = true
+                        return Err(x)
+                    }
+                }
+            } else {
+                let _ = lexdb_trigger.popScope(s.id)
+            }
+        }
+        if len(s.txn) == 0 { return r }
         if len(s.txn[0].onCommit) > 0 || lexdb_mview.hasStmtDeltas(s.id) { return s.blockEnd(stmt, r) }        // (its assertions, O23; materialized views; a temporary schema it made: TMP_MADE)
         s.txn[0].live = false
         if r.isErr() { s.failed = true }
         return r
     }
     if stmt.waitFor { return s.waitForRun(stmt, params, ptypes, pc) }
+    if isDmlTriggerStmt(stmt) && lexdb_trigger.storeHasAny(&s.st) {
+        return s.runAutoWithTriggers(stmt, params, ptypes, pc, input, out, pull, sink)
+    }
     var tries = 0
     let noticesWere = if NOTICE_ACTIVE > 0 { s.st.memo.get(&noticeKey(s.id)).unwrapOr("") } else { "" }
     let lim = s.limits()                    // retries share the statement's time
@@ -16462,6 +16596,8 @@ fn updRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, old: &[]
     if c == lexdb_access.PK_CONFLICT { return Err(dupKey(t, row)) }
     if c >= 0 { return Err(try uniqueErr(t, &t.indexes[c], row)) }
     lexdb_mview.recordUpdate(txn, t, old, row)
+    let noUc: []bool = []
+    lexdb_trigger.recordUpdate(txn.sql.sess, t, old, row, &noUc)
     if len(t.fks) > 0 {
         var np = lexdb_fkprobe.none()
         try childSide(st, txn, t, fw, row, old, later, mut &np)
@@ -16478,6 +16614,7 @@ fn delRow(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, row: &[]
                                fn(xi: &Index, k: int, r: &[]Val): Result[Val, DbErr] { return idxVal(t, xi, k, r) },
                                fn(tx: &lexdb_store.Txn) { lexdb_stats.noteChg(st, tx.sql.sess, t, 2) })
     lexdb_mview.recordDelete(txn, t, row)
+    lexdb_trigger.recordDelete(txn.sql.sess, t, row)
     if len(t.refBy) > 0 {
         let none: []Val = []
         try parentSide(st, txn, t, fw, row, &none, false, later)
@@ -17781,6 +17918,29 @@ fn seqCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
                     Some(v) { return Ok(Val.Num(Decimal.fromInt(lexdb_base.num(&v)))) }
                     None { return Ok(Val.Null) }
                 }
+            }
+            if name == "#trg_update" {
+                if len(vs) < 1 || lexdb_ops.isNull(&vs[0]) { return Ok(Val.Bool(false)) }
+                return Ok(Val.Bool(lexdb_trigger.isColUpdated(q.sess, &lexdb_sql.text(&vs[0]))))
+            }
+            if name == "#trg_cols_updated" {
+                match lexdb_trigger.columnsUpdated(q.sess) {
+                    Some(b) { return Ok(Val.Bytes(b)) }
+                    None { return Ok(Val.Null) }
+                }
+            }
+            if name == "#trg_nestlevel" {
+                var hasObj = false
+                var objId = 0
+                var timing = ""
+                var kind = ""
+                if len(vs) >= 1 && !lexdb_ops.isNull(&vs[0]) {
+                    objId = sysInt(&vs[0]).unwrapOr(0)
+                    hasObj = objId != 0
+                }
+                if len(vs) >= 2 && !lexdb_ops.isNull(&vs[1]) { timing = lexdb_sql.text(&vs[1]) }
+                if len(vs) >= 3 && !lexdb_ops.isNull(&vs[2]) { kind = lexdb_sql.text(&vs[2]) }
+                return Ok(Val.Int(lexdb_trigger.nestLevel(q.sess, hasObj, objId, &timing, &kind)))
             }
             if name == "lastval" {
                 if len(vs) != 0 { return Err(e("42883", "function lastval takes no arguments")) }
@@ -19401,6 +19561,10 @@ fn bulkStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
     let defs = try defaultsOf(st, txn, &t)
     let fw = try fkTables(st, txn, &t, true, false)
     var later: []FkLater = []
+    if lexdb_trigger.hasMarks(&t.refBy) {
+        let ucols = lexdb_trigger.updatedBitmap(&t, &targets, true)
+        lexdb_trigger.ensureTarget(txn.sql.sess, &t, lexdb_trigger.TE_INSERT, false, &ucols, true, s.copy.fireTriggers())
+    }
     var up = noUpsert()
     up.idBump = true
     // the columns whose NULL takes the default; a bit sent for a column not boolean
@@ -21509,7 +21673,7 @@ fn sysCall(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
                 if len(l) == 0 { return Ok(Some(Val.Null)) }
                 typ = l[3].clone()
             }
-            let isMod = typ == "V"
+            let isMod = typ == "V" || typ == "TR" || typ == "P" || typ == "FN"
             let flag = fn(b: bool): Option[Val] { return Some(Val.Int(if b { 1 } else { 0 })) }
             match p.toStr() {
                 "basetype" { return Ok(Some(Val.Text(typ))) }
@@ -21526,7 +21690,8 @@ fn sysCall(name: &str, vs: &[]Val, se: &SeqEnv): Result[Option[Val], DbErr] {
                 "isscalarfunction" { return Ok(flag(typ == "FN")) }
                 "istablefunction" { return Ok(flag(typ == "IF" || typ == "TF")) }
                 "isinlinefunction" { return Ok(flag(typ == "IF")) }
-                "istrigger", "isextendedproc",
+                "istrigger" { return Ok(flag(typ == "TR")) }
+                "isextendedproc",
                 "isencrypted", "isschemabound", "isreplproc", "isqueue", "isrule", "isdefault" { return Ok(flag(false)) }
                 "ownerid", "schemaid" {
                     if p == "ownerid" { return Ok(Some(Val.Int(1))) }
@@ -21774,7 +21939,7 @@ fn roleStmt(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
 
 // A view's query, parsed to be planned where the view is used.
 fn viewQuery(t: &Table): Result[lexdb_sql.Stmt, DbErr] {
-    if strings.startsWith(&t.view, SEQ_REL) || strings.startsWith(&t.view, MV_OQC_REL) {
+    if strings.startsWith(&t.view, SEQ_REL) || strings.startsWith(&t.view, MV_OQC_REL) || strings.startsWith(&t.view, lexdb_trigger.TRG_REL) {
         // a sequence's row or OQC materialized view's merged rows: made by the executor, as a catalog relation's
         var q = lexdb_sql.newStmt(lexdb_sql.S_SELECT)
         q.srf = "#" + t.view
@@ -21963,6 +22128,7 @@ fn dropView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stm
                 }
                 try lexdb_priv.needRelOwner(st, txn, &t.name, &"view")
                 try dropDependentViews(st, txn, &t.name, s.cascade, &"view")
+                try lexdb_trigger.dropForTarget(st, txn, &t)
                 txn.del(lexdb_catalog.CATALOG, &t.name)
                 lexdb_priv.dropAcl(txn, &lexdb_catalog.relObj(&t.name))
                 append(mut &keys, t.name.clone())
@@ -22781,6 +22947,7 @@ fn renameView(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, t: &Table, name
     txn.del(lexdb_catalog.CATALOG, &t.name)
     try txn.put(lexdb_catalog.CATALOG, &to, &(lexdb_catalog.encViewRn(&v.cols, &v.view, &v.deps, spell, &v.rn, &v.invalid)))
     try lexdb_priv.moveAcl(st, txn, &lexdb_catalog.relObj(&t.name), &lexdb_catalog.relObj(&to))
+    try lexdb_trigger.renameTarget(st, txn, &t.name, &to)
     try followApply(st, txn, &plan, &t.name, &to)
     try bumpFor(st, txn, &to)
     return Ok(tagOnly(tag))
@@ -24892,6 +25059,9 @@ fn latAsk(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, q: &Query, env: &En
 // The table SET IDENTITY_INSERT is on for, "" none.
 pub fn (s: &Session) identityInsert(): str { return s.st.memo.get(&identKey(s.id)).unwrapOr("") }
 
+// This session's unique id (for dialect trigger bridges).
+pub fn (s: &Session) sessionId(): int { return s.id }
+
 // A table by its name along the session's path (the T-SQL door's error texts read its keys, checks and foreign keys).
 pub fn (s: mut &Session) tableInfo(name: &str): Result[Table, DbErr] { return s.tableNamed(name) }
 
@@ -24907,3 +25077,597 @@ fn (s: mut &Session) setTimeout(ms: int) {
 }
 
 fn (s: &Session) timedWord(): int { return lexdb_pipe.deadlineWord((time.monotonicNs() + 999999) / 1000000 + s.timeoutMs, s.id) }
+
+// ---- Triggers (lexdb_trigger): dialect runner hook, virtual transition tables, DDL, INSTEAD OF, and firing
+
+pub type TriggerRunner = fn(mut &Session, &lexdb_trigger.FireReq): Result[Unit, DbErr]
+
+var TRG_RUN_PG: once []TriggerRunner
+var TRG_RUN_TSQL: once []TriggerRunner
+var TRG_RUN_ORA: once []TriggerRunner
+
+pub fn setTriggerRunner(dialect: int, f: TriggerRunner) {
+    if dialect == lexdb_trigger.TD_PG { if !TRG_RUN_PG.isSet() { TRG_RUN_PG.set([f]) } }
+    else if dialect == lexdb_trigger.TD_TSQL { if !TRG_RUN_TSQL.isSet() { TRG_RUN_TSQL.set([f]) } }
+    else if dialect == lexdb_trigger.TD_ORA { if !TRG_RUN_ORA.isSet() { TRG_RUN_ORA.set([f]) } }
+}
+
+fn runTriggerFor(dialect: int, s: mut &Session, req: &lexdb_trigger.FireReq): Result[Unit, DbErr] {
+    if dialect == lexdb_trigger.TD_PG && TRG_RUN_PG.isSet() { return TRG_RUN_PG.get()[0](s, req) }
+    if dialect == lexdb_trigger.TD_TSQL && TRG_RUN_TSQL.isSet() { return TRG_RUN_TSQL.get()[0](s, req) }
+    if dialect == lexdb_trigger.TD_ORA && TRG_RUN_ORA.isSet() { return TRG_RUN_ORA.get()[0](s, req) }
+    return Err(e("0A000", "lexdb: trigger runner not registered for dialect"))
+}
+
+fn isDmlTriggerStmt(s: &lexdb_sql.Stmt): bool {
+    return s.kind == lexdb_sql.S_INSERT || s.kind == lexdb_sql.S_UPDATE || s.kind == lexdb_sql.S_DELETE ||
+           s.kind == lexdb_sql.S_MERGE || (s.kind == lexdb_sql.S_COPY && s.copy.from) || len(s.wctes) > 0
+}
+
+fn trgRelOutCols(srf: &str): []OutCol {
+    var out: []OutCol = []
+    let sep = strings.indexOf(srf, "\x01", 1 + len(lexdb_trigger.TRG_REL))
+    if sep < 0 || sep + 1 >= len(srf) { return out }
+    let rest = &srf[sep + 1..len(srf)]
+    for part in strings.split(rest, "\x03") {
+        let fs = strings.split(&part, "\x02")
+        if len(fs) >= 4 {
+            append(mut &out, OutCol{name: fs[0].clone(), oid: strings.parseIntOpt(&fs[1]).unwrapOr(lexdb_sql.OID_TEXT),
+                                    spell: fs[2].clone(), coll: fs[3].clone(), scale: -1})
+        }
+    }
+    return out
+}
+
+// Whether ALTER DATABASE ... SET RECURSIVE_TRIGGERS ON is set (default OFF).
+fn isRecursiveTriggersOn(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn): bool {
+    match st.get(txn, lexdb_catalog.CATALOG, &lexdb_dbopt.KEY) {
+        Ok(opt) {
+            match opt {
+                Some(cur) {
+                    for l in strings.lines(&cur) {
+                        if strings.startsWith(&l, "recursive_triggers\t") {
+                            return strings.trim(&l[19..len(l)]) == "on"
+                        }
+                    }
+                }
+                None {}
+            }
+        }
+        Err(_) {}
+    }
+    return false
+}
+
+// Fire all triggers accumulated in the top DmlScope of this session, inside the active transaction s.txn[0].
+fn (s: mut &Session) firePendingTriggers(): Result[Unit, DbErr] {
+    let scOpt = lexdb_trigger.popScope(s.id)
+    match scOpt {
+        None { return Ok(Unit{}) }
+        Some(scope) {
+            if len(scope.entries) == 0 { return Ok(Unit{}) }
+            for delta in scope.entries {
+                if delta.isBulk && !delta.fireBulk { continue }
+                if len(s.txn) == 0 { return Err(e("TS3609", "The transaction ended in the trigger. The batch has been aborted.")) }
+                let st = &s.st
+                let tOpt = try byKeyOpt(&st, mut &s.txn[0], &delta.target)
+                if tOpt.isNone() { continue }
+                let t = tOpt.unwrap()
+                let timing = if delta.insteadOf { lexdb_trigger.TT_INSTEAD_OF } else { lexdb_trigger.TT_AFTER }
+                if timing == lexdb_trigger.TT_AFTER && lexdb_trigger.isDirectRecursion(s.id, &delta.target) {
+                    if !isRecursiveTriggersOn(&st, mut &s.txn[0]) { continue }
+                }
+                let trigs = try lexdb_trigger.onTargetFor(&st, mut &s.txn[0], &t, timing, delta.event)
+                for tr in trigs {
+                    if lexdb_trigger.frameDepth(s.id) >= 32 {
+                        return Err(e("TS217", "Maximum stored procedure, function, trigger, or view nesting level exceeded (limit 32)."))
+                    }
+                    lexdb_trigger.pushFrame(s.id, &tr, &delta)
+                    let req = lexdb_trigger.FireReq{trig: tr.clone(), delta: delta.clone()}
+                    let rr = runTriggerFor(tr.dialect, s, &req)
+                    lexdb_trigger.popFrame(s.id)
+                    try rr
+                    if len(s.txn) == 0 {
+                        return Err(e("TS3609", "The transaction ended in the trigger. The batch has been aborted."))
+                    }
+                }
+            }
+            return Ok(Unit{})
+        }
+    }
+}
+
+// Autocommit DML when the store has triggers: runs DML + triggers inside one atomic implicit transaction.
+fn (s: mut &Session) runAutoWithTriggers(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache,
+                                         input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart,
+                                         sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
+    var tries = 0
+    let noticesWere = if NOTICE_ACTIVE > 0 { s.st.memo.get(&noticeKey(s.id)).unwrapOr("") } else { "" }
+    let lim = s.limits()
+    while true {
+        var t = lexdb_store.begin()
+        s.setUp(mut &t)
+        t.live = true
+        append(mut &s.txn, t)
+        lexdb_mview.clearTxn(s.id)
+        lexdb_stats.chgEnd(&s.st, s.id, false)
+        if NOTICE_ACTIVE > 0 {
+            if len(noticesWere) > 0 { s.st.memo.put(&noticeKey(s.id), &noticesWere) } else { s.st.memo.del(&noticeKey(s.id)) }
+        }
+        lexdb_trigger.pushScope(s.id, 0)
+        var sent = false
+        let st = &s.st
+        let ran = execIn(&st, mut &s.txn[0], stmt, params, ptypes, lim, pc, input, out, pull, fn(c: &[]OutCol, r: &[]Val, ob: &OutBatch, start: bool): bool {
+            let ok = sink(c, r, ob, start)
+            if ok { sent = true }
+            return ok
+        })
+        match move(ran) {
+            Ok(r) {
+                match s.firePendingTriggers() {
+                    Ok(_) {}
+                    Err(x) {
+                        lexdb_mview.clearTxn(s.id)
+                        if len(s.txn) > 0 {
+                            let tx = pop(mut &s.txn)
+                            s.adopt(&tx)
+                            s.tmpUndo(&tx)
+                            s.st.abort(tx)
+                        }
+                        s.failed = false
+                        return Err(x)
+                    }
+                }
+                if len(s.txn) == 0 {
+                    return Err(e("TS3609", "The transaction ended in the trigger. The batch has been aborted."))
+                }
+                var kept = collections.copyOf(&s.onCommit)
+                if (len(s.onCommit) > 0 && s.txn[0].hasWrites()) || len(s.txn[0].onCommit) > 0 || lexdb_mview.hasWork(s.id) {
+                    let st2 = &s.st
+                    match onCommitDo(&st2, mut &s.txn[0], &kept, lim, stmt) {
+                        Ok(k) { kept = k }
+                        Err(x) {
+                            lexdb_mview.clearTxn(s.id)
+                            let tx = pop(mut &s.txn)
+                            s.adopt(&tx)
+                            s.tmpUndo(&tx)
+                            s.st.abort(tx)
+                            return Err(x)
+                        }
+                    }
+                }
+                let tx = pop(mut &s.txn)
+                s.adopt(&tx)
+                let ddl = tx.tmpDdl
+                match s.st.commit(tx) {
+                    Ok(_) {
+                        s.onCommit = kept
+                        lexdb_stats.chgEnd(&s.st, s.id, s.auto)
+                        return Ok(r)
+                    }
+                    Err(x) {
+                        if ddl { tmpChanged(&s.st, s.id) }
+                        tries += 1
+                        if x.state != lexdb_base.S_CONFLICT || tries >= 10 || input.pull || stmt.copy.batchRows > 0 { return Err(x) }
+                    }
+                }
+            }
+            Err(x) {
+                let _ = lexdb_trigger.popScope(s.id)
+                lexdb_mview.clearTxn(s.id)
+                if len(s.txn) > 0 {
+                    let tx = pop(mut &s.txn)
+                    s.adopt(&tx)
+                    s.tmpUndo(&tx)
+                    s.st.abort(tx)
+                }
+                s.failed = false
+                tries += 1
+                let again = x.state == lexdb_base.S_CONFLICT && !input.pull && stmt.copy.batchRows == 0
+                if !again || tries >= 10 || input.stream || sent { return Err(x) }
+            }
+        }
+    }
+    return Err(e("XX000", "unreachable"))
+}
+
+// ---- Trigger DDL (SQL Server; designed for PG and Oracle too)
+
+fn createTrigger(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    var tr = lexdb_trigger.decode(&s.mvOpts)
+    var t = match try findTable(st, txn, &tr.target) {
+        Some(tb) { tb }
+        None { return Err(e("TS8197", &("The object '" + lexdb_sql.shown(&tr.target) + "' does not exist or is invalid for this operation."))) }
+    }
+    if lexdb_mview.isMvTable(&t) {
+        return Err(e("42809", &("cannot create trigger on materialized view \"" + lexdb_sql.shown(&t.name) + "\"")))
+    }
+    tr.isView = len(t.view) > 0
+    if tr.dialect == lexdb_trigger.TD_TSQL {
+        if tr.isView && tr.timing != lexdb_trigger.TT_INSTEAD_OF {
+            return Err(e("TS2104", &("Cannot create AFTER trigger '" + tr.spell + "' on view '" + lexdb_sql.shown(&t.name) + "' because it is not a table.")))
+        }
+        let tgtSchema = lexdb_sql.schemaOf(&t.name)
+        if len(tr.schema) == 0 {
+            tr.schema = tgtSchema.clone()
+        } else if tr.schema != tgtSchema {
+            return Err(e("TS2110", &("Cannot create trigger '" + tr.spell + "' because the trigger schema does not match the target object schema.")))
+        }
+        let scopeKey = lexdb_sql.qual(&tr.schema, &tr.name)
+        tr.key = lexdb_trigger.makeKey(tr.dialect, &scopeKey)
+        tr.oid = lexdb_trigger.makeOid(&tr.key)
+        tr.target = t.name.clone()
+        tr.owner = lexdb_priv.currentRole(st, txn.sql.sess)
+
+        let existing = try lexdb_trigger.get(st, txn, &tr.key)
+        let otherObj = (try relExists(st, txn, &scopeKey)) || len(try lexdb_routine.find(st, txn, lexdb_sql.RD_TSQL, &scopeKey)) > 0
+        if s.alter && existing.isNone() {
+            if otherObj {
+                return Err(e("TS2010", &("Cannot perform alter on '" + tr.spell + "' because it is an incompatible object type.")))
+            }
+            return Err(e("TS208", &("Invalid object name '" + tr.spell + "'.")))
+        }
+        if !s.ifFlag && (existing.isSome() || otherObj) {
+            return Err(e("TS2714", &("There is already an object named '" + tr.spell + "' in the database.")))
+        }
+        if s.ifFlag && existing.isNone() && otherObj {
+            return Err(e("TS2010", &("Cannot perform alter on '" + tr.spell + "' because it is an incompatible object type.")))
+        }
+        match existing {
+            Some(old) {
+                if s.alter && old.target != t.name {
+                    return Err(e("TS2105", &("Cannot alter trigger '" + tr.spell + "' on '" + lexdb_sql.shown(&t.name) + "' because it belongs to '" + lexdb_sql.shown(&old.target) + "'.")))
+                }
+                if old.target != t.name {
+                    // Unlink old target table if CREATE OR ALTER moved the trigger
+                    match try byKeyOpt(st, txn, &old.target) {
+                        Some(ot0) {
+                            if len(ot0.view) == 0 {
+                                var ot = ot0
+                                dropKey(mut &ot.refBy, &lexdb_trigger.trgKey(&old.key))
+                                try putTable(txn, &ot)
+                            }
+                        }
+                        None {}
+                    }
+                }
+                tr.createdSeq = old.createdSeq
+                tr.enabled = old.enabled
+            }
+            None {
+                tr.createdSeq = try lexdb_trigger.nextSeq(st, txn)
+            }
+        }
+        // At most one INSTEAD OF trigger per event on a table or view
+        if tr.timing == lexdb_trigger.TT_INSTEAD_OF {
+            for et in try lexdb_trigger.onTarget(st, txn, &t) {
+                if et.key != tr.key && et.timing == lexdb_trigger.TT_INSTEAD_OF && (et.events & tr.events) != 0 {
+                    return Err(e("TS2111", &("Cannot CREATE INSTEAD OF trigger '" + tr.spell + "' on '" + lexdb_sql.shown(&t.name) + "'. This is because the object already has an INSTEAD OF trigger for this action.")))
+                }
+            }
+        }
+        try lexdb_trigger.put(st, txn, &tr)
+        if !tr.isView {
+            addKey(mut &t.refBy, &lexdb_trigger.trgKey(&tr.key))
+            try putTable(txn, &t)
+        }
+        try bumpCatalog(st, txn)
+        return Ok(tagOnly("CREATE TRIGGER"))
+    }
+    return Err(e("0A000", "lexdb: triggers are not supported in this dialect yet"))
+}
+
+fn findTsqlTrigger(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, rawName: &str): Result[Option[lexdb_trigger.Trigger], DbErr] {
+    match try lexdb_trigger.findByKey(st, txn, lexdb_trigger.TD_TSQL, rawName) {
+        Some(tr) { return Ok(Some(tr)) }
+        None {}
+    }
+    if !lexdb_sql.isQual(rawName) {
+        let p = collections.copyOf(&txn.sql.path)
+        for sc in p {
+            let k = lexdb_sql.qual(&sc, rawName)
+            match try lexdb_trigger.findByKey(st, txn, lexdb_trigger.TD_TSQL, &k) {
+                Some(tr) { return Ok(Some(tr)) }
+                None {}
+            }
+        }
+    }
+    return Ok(None)
+}
+
+fn dropTrigger(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    if s.mdialect == lexdb_sql.MD_TSQL {
+        for i in 0..len(s.names) {
+            let nm = &s.names[i]
+            let sp = if i < len(s.spells) { &s.spells[i] } else { nm }
+            match try findTsqlTrigger(st, txn, nm) {
+                Some(tr) {
+                    lexdb_trigger.del(txn, &tr.key)
+                    match try byKeyOpt(st, txn, &tr.target) {
+                        Some(t0) {
+                            if len(t0.view) == 0 {
+                                var t = t0
+                                dropKey(mut &t.refBy, &lexdb_trigger.trgKey(&tr.key))
+                                try putTable(txn, &t)
+                            }
+                        }
+                        None {}
+                    }
+                }
+                None {
+                    if !s.ifFlag {
+                        if (try relExists(st, txn, nm)) || len(try lexdb_routine.find(st, txn, lexdb_sql.RD_TSQL, nm)) > 0 {
+                            return Err(e("TS3705", &("Cannot use DROP TRIGGER with '" + sp + "' because '" + sp + "' is not a trigger.")))
+                        }
+                        return Err(e("TS3701", &("Cannot drop the trigger '" + sp + "', because it does not exist or you do not have permission.")))
+                    }
+                }
+            }
+        }
+        try bumpCatalog(st, txn)
+        return Ok(tagOnly("DROP TRIGGER"))
+    }
+    return Err(e("0A000", "lexdb: DROP TRIGGER is not supported in this dialect yet"))
+}
+
+fn alterTrigger(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt): Result[Res, DbErr] {
+    if s.alias == "order" {
+        // sp_settriggerorder @triggername, @order, @stmttype
+        let tname = &s.table
+        let ordStr = strings.toLowerAscii(&s.index)
+        let stmtType = if len(s.names) > 0 { strings.toLowerAscii(&s.names[0]) } else { "" }
+        let ord = if ordStr == "first" { lexdb_trigger.TO_FIRST } else if ordStr == "last" { lexdb_trigger.TO_LAST } else if ordStr == "none" { lexdb_trigger.TO_NONE } else { -1 }
+        if ord < 0 { return Err(e("TS15229", &("Invalid value '" + s.index + "' for @order. Valid values are 'First', 'Last', or 'None'."))) }
+        let ev = if stmtType == "insert" { lexdb_trigger.TE_INSERT } else if stmtType == "update" { lexdb_trigger.TE_UPDATE } else if stmtType == "delete" { lexdb_trigger.TE_DELETE } else { 0 }
+        if ev == 0 { return Err(e("TS15228", &("Invalid value '" + stmtType + "' for @stmttype. Valid values are 'INSERT', 'UPDATE', or 'DELETE'."))) }
+        var tr = match try findTsqlTrigger(st, txn, tname) {
+            Some(x) { x }
+            None { return Err(e("TS15001", &("Object '" + tname + "' does not exist or is not a valid object for this operation."))) }
+        }
+        if tr.timing != lexdb_trigger.TT_AFTER {
+            return Err(e("TS15226", "Trigger order cannot be specified for INSTEAD OF triggers."))
+        }
+        if (tr.events & ev) == 0 {
+            return Err(e("TS15226", &("Trigger '" + tr.spell + "' is not defined for " + strings.toUpperAscii(&stmtType) + ".")))
+        }
+        // Enforce at most one FIRST and one LAST per table + statement type
+        if ord != lexdb_trigger.TO_NONE {
+            match try byKeyOpt(st, txn, &tr.target) {
+                Some(tb) {
+                    for ot in try lexdb_trigger.onTarget(st, txn, &tb) {
+                        if ot.key != tr.key && lexdb_trigger.orderForEvent(&ot, ev) == ord {
+                            return Err(e("TS15227", &("Object '" + lexdb_sql.shown(&tb.name) + "' already has a " + strings.toUpperAscii(&ordStr) + " trigger for " + strings.toUpperAscii(&stmtType) + ".")))
+                        }
+                    }
+                }
+                None {}
+            }
+        }
+        if ev == lexdb_trigger.TE_INSERT { tr.orderIns = ord }
+        else if ev == lexdb_trigger.TE_UPDATE { tr.orderUpd = ord }
+        else if ev == lexdb_trigger.TE_DELETE { tr.orderDel = ord }
+        try lexdb_trigger.put(st, txn, &tr)
+        try bumpCatalog(st, txn)
+        return Ok(tagOnly("ALTER TRIGGER"))
+    }
+    // ENABLE / DISABLE TRIGGER
+    let enable = s.alias == "enable"
+    let t = match try findTable(st, txn, &s.table) {
+        Some(tb) { tb }
+        None { return Err(e("TS8197", &("The object '" + lexdb_sql.shown(&s.table) + "' does not exist or is invalid for this operation."))) }
+    }
+    let trigs = try lexdb_trigger.onTarget(st, txn, &t)
+    if len(s.names) == 1 && s.names[0] == "*" {
+        for tr0 in trigs {
+            var tr = tr0.clone()
+            tr.enabled = enable
+            try lexdb_trigger.put(st, txn, &tr)
+        }
+        try bumpCatalog(st, txn)
+        return Ok(tagOnly("ALTER TRIGGER"))
+    }
+    for nm in s.names {
+        let base = lexdb_sql.baseName(&nm)
+        let sc = if lexdb_sql.isQual(&nm) { lexdb_sql.schemaOf(&nm) } else { "" }
+        var found = false
+        for tr0 in trigs {
+            if tr0.name == base && (len(sc) == 0 || tr0.schema == sc) {
+                var tr = tr0.clone()
+                tr.enabled = enable
+                try lexdb_trigger.put(st, txn, &tr)
+                found = true
+                break
+            }
+        }
+        if !found {
+            return Err(e("TS15165", &("Cannot find the object '" + lexdb_sql.shown(&nm) + "' because it does not exist or you do not have permissions.")))
+        }
+    }
+    try bumpCatalog(st, txn)
+    return Ok(tagOnly("ALTER TRIGGER"))
+}
+
+// ---- INSTEAD OF trigger interception (tables AND views)
+
+fn insteadOfInsert(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, t: &Table,
+                   params: &[]Val, ptypes: &[]int, lim: Limits, wr: mut &[]WcteRun): Result[Res, DbErr] {
+    let sqe = seqEnv(st, txn)
+    var targets: []int = []
+    if len(s.names) == 0 {
+        let skipGen = s.mdialect == lexdb_sql.MD_TSQL && len(t.view) == 0
+        for i in 0..len(t.cols) {
+            if t.cols[i].name != lexdb_catalog.ROWID && !(skipGen && t.cols[i].genKind != lexdb_sql.GEN_NONE) {
+                append(mut &targets, i)
+            }
+        }
+    } else {
+        for n in s.names {
+            let i = lexdb_bind.colIndex(&t.cols, &n)
+            if i < 0 { return Err(e("42703", &("column \"" + n + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" does not exist"))) }
+            append(mut &targets, i)
+        }
+    }
+    let defs = if len(t.view) == 0 { try defaultsOf(st, txn, t) } else { Defs{vals: [], seqs: [], exprs: [], gens: [], fill: []} }
+    let noCols: []lexdb_sql.ColDef = []
+    let noAggs: []Val = []
+    let noSubs: []SubRes = []
+    var sc = newScopeIn(st, txn, params, ptypes)
+    addWcteWorks(mut &sc, wr)
+    let noFrom: []lexdb_sql.FromItem = []
+    let noWhere: Option[Expr] = None
+    var q = try buildQuery(st, txn, &noFrom, &noWhere, params, &s.subs, &newMap(), true, mut &sc, false)
+    if len(q.subs) > 0 { pipeSubs(mut &q) }
+    endScope(mut &sc, mut &q)
+    var rs = newRun(&q)
+    rs.limit(&lim)
+    let m = try prepare(st, txn, &q, params, mut &rs)
+    let env = Env{cols: &noCols, row: &noAggs, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
+
+    var proposed: [][]Val = []
+    if len(s.inner) > 0 {
+        var ssc = newScopeIn(st, txn, params, ptypes)
+        addWcteWorks(mut &ssc, wr)
+        var sel = try planSelect(st, txn, &s.inner[0], params, mut &ssc)
+        bindSel(mut &sel)
+        pipeSel(mut &sel)
+        let res = try runSel(st, txn, &sel, params, lim)
+        for src in res.rows {
+            var full: []Val = array(len(t.cols), Val.Null)
+            var setFlags: []bool = array(len(t.cols), false)
+            for k in 0..len(targets) {
+                let ci = targets[k]
+                let v = if k < len(src) { src[k].clone() } else { Val.Null }
+                full[ci] = try coerceCol(st, txn, v, &t.cols[ci].typ)
+                setFlags[ci] = true
+            }
+            if len(t.view) == 0 {
+                for ci in 0..len(t.cols) {
+                    if !setFlags[ci] && t.cols[ci].name != lexdb_catalog.ROWID && t.cols[ci].def.isSome() {
+                        full[ci] = try defAt(st, txn, &defs, t, ci)
+                    }
+                }
+                if len(defs.fill) > 0 { try genFill(t, &defs.fill, mut &full, &txn.sql.zone) }
+            }
+            append(mut &proposed, lexdb_trigger.stripHidden(t, &full))
+        }
+    } else {
+        for r in s.rows {
+            var full: []Val = array(len(t.cols), Val.Null)
+            var setFlags: []bool = array(len(t.cols), false)
+            for k in 0..len(targets) {
+                let ci = targets[k]
+                if k < len(r) {
+                    if lexdb_sql.isDefault(&r[k]) {
+                        if len(t.view) == 0 { full[ci] = try defAt(st, txn, &defs, t, ci) }
+                    } else {
+                        let ev = try evalX(st, txn, &q, &r[k], &env, mut &rs)
+                        full[ci] = try coerceCol(st, txn, ev, &t.cols[ci].typ)
+                    }
+                    setFlags[ci] = true
+                }
+            }
+            if len(t.view) == 0 {
+                for ci in 0..len(t.cols) {
+                    if !setFlags[ci] && t.cols[ci].name != lexdb_catalog.ROWID && t.cols[ci].def.isSome() {
+                        full[ci] = try defAt(st, txn, &defs, t, ci)
+                    }
+                }
+                if len(defs.fill) > 0 { try genFill(t, &defs.fill, mut &full, &txn.sql.zone) }
+            }
+            append(mut &proposed, lexdb_trigger.stripHidden(t, &full))
+        }
+    }
+    let n = len(proposed)
+    let ucols = lexdb_trigger.updatedBitmap(t, &targets, true)
+    lexdb_trigger.recordInsteadOf(txn.sql.sess, t, lexdb_trigger.TE_INSERT, proposed, [], &ucols, n)
+    return Ok(tagOnly(&("INSERT 0 " + n.toStr())))
+}
+
+fn insteadOfUpdate(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, t: &Table,
+                   params: &[]Val, ptypes: &[]int, lim: Limits, wr: mut &[]WcteRun): Result[Res, DbErr] {
+    let sqe = seqEnv(st, txn)
+    var sc = newScopeIn(st, txn, params, ptypes)
+    addWcteWorks(mut &sc, wr)
+    sc.target = t.name.clone()
+    var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, &newMap(), true, mut &sc, false)
+    var targets: []int = []
+    var sets: []Expr = []
+    for set in s.sets {
+        let i = lexdb_bind.colIndex(&q.levels[0].t.cols, &set.col)
+        if i < 0 {
+            return Err(e("42703", &("column \"" + set.col + "\" of relation \"" + lexdb_sql.baseName(&t.name) + "\" does not exist")))
+        }
+        append(mut &targets, i)
+        append(mut &sets, try lexdb_bind.resolveAssign(&set.expr, &q.levels[0].t.cols[i].typ, &q.cols, len(q.cols), mut &sc.names))
+    }
+    endScope(mut &sc, mut &q)
+    if len(q.subs) > 0 { pipeSubs(mut &q) }
+    writeProg(mut &q, false)
+    let qt = &q.levels[0].t
+    var found: [][]Val = []
+    var rs = newRun(&q)
+    rs.limit(&lim)
+    let m = try writePrep(st, txn, &q, params, mut &rs)
+    try runQuery(st, txn, &q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
+        append(mut &found, collections.copyOf(r))
+        return Ok(true)
+    }, mut &rs)
+    if len(s.from) > 0 && len(qt.pk) > 0 { found = onceEach(qt, found, true) }
+    if s.limit.isSome() { found = firstN(found, try lexdb_plan.topOf(&s.limit, params, s.topMode, len(found))) }
+    let defs = if len(t.view) == 0 { try defaultsOf(st, txn, t) } else { Defs{vals: [], seqs: [], exprs: [], gens: [], fill: []} }
+    let nt = len(qt.cols)
+    let noAggs: []Val = []
+    var insRows: [][]Val = []
+    var delRows: [][]Val = []
+    for joined in found {
+        let oldRaw = if len(joined) == nt { collections.copyOf(&joined) } else { rowPrefix(&joined, nt) }
+        let env = Env{cols: &q.cols, row: &joined, aggs: &noAggs, params: params, subs: &m.subs, cur: &noAggs, seq: &sqe}
+        var nwRaw = collections.copyOf(&oldRaw)
+        for k in 0..len(sets) {
+            if lexdb_sql.isDefault(&sets[k]) {
+                if len(t.view) == 0 { nwRaw[targets[k]] = try defAt(st, txn, &defs, t, targets[k]) } else { nwRaw[targets[k]] = Val.Null }
+            } else {
+                nwRaw[targets[k]] = try coerceCol(st, txn, try evalX(st, txn, &q, &sets[k], &env, mut &rs), &qt.cols[targets[k]].typ)
+            }
+        }
+        if len(t.view) == 0 && len(defs.fill) > 0 { try genFill(t, &defs.fill, mut &nwRaw, &txn.sql.zone) }
+        append(mut &delRows, lexdb_trigger.stripHidden(qt, &oldRaw))
+        append(mut &insRows, lexdb_trigger.stripHidden(qt, &nwRaw))
+    }
+    let n = len(delRows)
+    let ucols = lexdb_trigger.updatedBitmap(qt, &targets, false)
+    lexdb_trigger.recordInsteadOf(txn.sql.sess, t, lexdb_trigger.TE_UPDATE, insRows, delRows, &ucols, n)
+    return Ok(tagOnly(&("UPDATE " + n.toStr())))
+}
+
+fn insteadOfDelete(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt, t: &Table,
+                   params: &[]Val, ptypes: &[]int, lim: Limits, wr: mut &[]WcteRun): Result[Res, DbErr] {
+    var sc = newScopeIn(st, txn, params, ptypes)
+    addWcteWorks(mut &sc, wr)
+    sc.target = t.name.clone()
+    var q = try buildQuery(st, txn, &(try dmlFrom(s)), &s.where, params, &s.subs, &newMap(), true, mut &sc, false)
+    endScope(mut &sc, mut &q)
+    if len(q.subs) > 0 { pipeSubs(mut &q) }
+    writeProg(mut &q, false)
+    let qt = &q.levels[0].t
+    var found: [][]Val = []
+    var rs = newRun(&q)
+    rs.limit(&lim)
+    let m = try writePrep(st, txn, &q, params, mut &rs)
+    try runQuery(st, txn, &q, &m, params, fn(tx: mut &lexdb_store.Txn, r: &[]Val): Result[bool, DbErr] {
+        append(mut &found, collections.copyOf(r))
+        return Ok(true)
+    }, mut &rs)
+    if len(s.from) > 0 && len(qt.pk) > 0 { found = onceEach(qt, found, true) }
+    if s.limit.isSome() { found = firstN(found, try lexdb_plan.topOf(&s.limit, params, s.topMode, len(found))) }
+    let nt = len(qt.cols)
+    var delRows: [][]Val = []
+    for joined in found {
+        let oldRaw = if len(joined) == nt { collections.copyOf(&joined) } else { rowPrefix(&joined, nt) }
+        append(mut &delRows, lexdb_trigger.stripHidden(qt, &oldRaw))
+    }
+    let n = len(delRows)
+    let noCols: []bool = []
+    lexdb_trigger.recordInsteadOf(txn.sql.sess, t, lexdb_trigger.TE_DELETE, [], delRows, &noCols, n)
+    return Ok(tagOnly(&("DELETE " + n.toStr())))
+}
