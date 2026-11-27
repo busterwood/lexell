@@ -8,6 +8,8 @@
 // Whether LIKE pattern pat is literal text and % only (no _, no escape
 // character): matched as bytes. UTF-8 text matches a literal piece only at
 // a character's start, so bytes give what characters do.
+type VB = vector[byte]
+
 pub fn likeSimple(pat: &str, esc: &str): bool {
     for i in 0..len(pat) { if pat[i] == '_' { return false } }
     if len(esc) == 0 { return true }
@@ -57,15 +59,39 @@ pub fn likePiecesFold(s: &str, ps: &[]str): bool {
     let end = hi - len(last)
     for k in 1..n - 1 {
         let p = &ps[k]
-        if len(p) == 0 { continue }
+        let plen = len(p)
+        if plen == 0 { continue }
+        let lim = end - plen + 1
+        if at >= lim { return false }
+        let b0 = p[0]
+        let isLetter = b0 >= 'a' && b0 <= 'z'
+        let vLo = VB.splat(b0)
+        let vHi = if isLetter { VB.splat(b0 - byte(32)) } else { vLo }
         var found = -1
         var i = at
-        while i + len(p) <= end {
-            if bytesAtFold(s, i, p) { found = i; break }
-            i += 1
+        while i + VB.lanes <= lim {
+            let v = VB.load(s, i)
+            var m = if isLetter { ((v == vLo) | (v == vHi)).bitmask() } else { (v == vLo).bitmask() }
+            while m != u64(0) {
+                let pos = i + int(m.trailingZeros())
+                if plen == 1 || bytesAtFold(s, pos, p) { found = pos; break }
+                m = m & (m - u64(1))
+            }
+            if found >= 0 { break }
+            i += VB.lanes
+        }
+        if found < 0 && i < lim {
+            let v = VB.loadPartial(s, i, byte(0))
+            let hit = if isLetter { (v == vLo) | (v == vHi) } else { v == vLo }
+            var m = hit.bitmask() & VB.tailMask(lim - i)
+            while m != u64(0) {
+                let pos = i + int(m.trailingZeros())
+                if plen == 1 || bytesAtFold(s, pos, p) { found = pos; break }
+                m = m & (m - u64(1))
+            }
         }
         if found < 0 { return false }
-        at = found + len(p)
+        at = found + plen
     }
     return true
 }

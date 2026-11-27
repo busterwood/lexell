@@ -48,6 +48,7 @@ type BVec = lexdb_rows.BVec
 type Acc = lexdb_agg.Acc
 type BPlan = lexdb_rows.Projection     // where a batch reads the columns used
 type Lazy = lexdb_access.Lazy
+type VB = vector[byte]
 
 const BK_INT: int = lexdb_rows.BK_INT    // a column's kind in a batch: an integer ...
 const BK_BOOL: int = lexdb_rows.BK_BOOL  // ... a boolean (0, 1) ...
@@ -461,7 +462,8 @@ pub type LikePat = record {
     pub pat: str
     pub esc: str
     pub fold: bool              // ILIKE
-    pub simple: bool            // literal text and % only (likeSimple): pieces
+    pub simple: bool            // literal text and % only (!fold): pieces
+    pub foldSimple: bool        // literal text and % only (fold / ILIKE): lowercased pieces
     pub pieces: []str
     pub txt: bool               // the column BK_TEXT (its bytes), else values
 }
@@ -872,9 +874,13 @@ pub fn bCompileD(x: &BX, cols: &[]lexdb_sql.ColDef, kinds: &[]int, ce: &Ctx, bas
             let pat = lexdb_sql.text(&cs[0])
             let esc = if len(cs) > 1 { lexdb_sql.text(&cs[1]) } else { "\\" }
             let fold = fr.name == "ilike"
-            let simple = !fold && lexdb_like.likeSimple(&pat, &esc) && len(strings.runes(&esc)) <= 1
-            let pieces = if simple { lexdb_like.likeSplit(&pat) } else { [] }
-            return Some(BComp{n: BNode.Like(c, LikePat{pat: pat, esc: esc, fold: fold, simple: simple, pieces: pieces,
+            let isSim = lexdb_like.likeSimple(&pat, &esc) && len(strings.runes(&esc)) <= 1
+            let simple = !fold && isSim
+            let foldSimple = fold && isSim
+            let pieces = if simple { lexdb_like.likeSplit(&pat) }
+                         else if foldSimple { lexdb_like.likeSplit(&strings.toLowerAscii(&pat)) }
+                         else { [] }
+            return Some(BComp{n: BNode.Like(c, LikePat{pat: pat, esc: esc, fold: fold, simple: simple, foldSimple: foldSimple, pieces: pieces,
                                                        txt: kinds[c + base] == BK_TEXT}), typ: BT_BOOL})
         }
         BX.Case(cs, hasElse) {
@@ -1011,22 +1017,8 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
             var a = try bEval(&x, b, idx)
             let c = try bEval(&y, b, idx)
             for j in 0..m { if c.nul[j] { a.nul[j] = true } }
-            if op == 0 {
-                for j in 0..m {
-                    if a.nul[j] { continue }
-                    match a.v[j].checkedAdd(c.v[j]) {
-                        Some(r) { a.v[j] = r }
-                        None { return Err(e("22003", "bigint out of range")) }
-                    }
-                }
-            } else if op == 1 {
-                for j in 0..m {
-                    if a.nul[j] { continue }
-                    match a.v[j].checkedSub(c.v[j]) {
-                        Some(r) { a.v[j] = r }
-                        None { return Err(e("22003", "bigint out of range")) }
-                    }
-                }
+            if op == 0 || op == 1 {
+                if !lexdb_vec.arithAddSubI64(op, mut &a.v, &a.nul, &c.v) { return Err(e("22003", "bigint out of range")) }
             } else if op == 2 {
                 for j in 0..m {
                     if a.nul[j] { continue }
@@ -1062,8 +1054,8 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
         BNode.Fit(x, bits) {
             let a = try bEval(&x, b, idx)
             let hi = if bits == 16 { 32767 } else { 2147483647 }
-            for j in 0..m {
-                if !a.nul[j] && (a.v[j] > hi || a.v[j] < -hi - 1) { return Err(e("22003", if bits == 16 { "smallint out of range" } else { "integer out of range" })) }
+            if !lexdb_vec.fitI64(&a.v, &a.nul, -hi - 1, hi) {
+                return Err(e("22003", if bits == 16 { "smallint out of range" } else { "integer out of range" }))
             }
             return Ok(a)
         }
@@ -1193,11 +1185,17 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
                 }
                 let hit = if lp.txt {
                     if lp.simple { lexdb_like.likePieces(lexdb_rows.textAt(b, c, r), &lp.pieces) }
+                    else if lp.foldSimple { lexdb_like.likePiecesFold(lexdb_rows.textAt(b, c, r), &lp.pieces) }
                     else { try lexdb_lib.likeMatch(lexdb_rows.textAt(b, c, r), &lp.pat, &lp.esc, lp.fold) }
                 } else if lp.simple {
                     match b.vals[c][r] {
                         Val.Text(x) { lexdb_like.likePieces(&x, &lp.pieces) }
                         else { lexdb_like.likePieces(&lexdb_sql.text(&b.vals[c][r]), &lp.pieces) }
+                    }
+                } else if lp.foldSimple {
+                    match b.vals[c][r] {
+                        Val.Text(x) { lexdb_like.likePiecesFold(&x, &lp.pieces) }
+                        else { lexdb_like.likePiecesFold(&lexdb_sql.text(&b.vals[c][r]), &lp.pieces) }
                     }
                 } else {
                     try lexdb_lib.likeMatch(&(lexdb_sql.text(&b.vals[c][r])), &lp.pat, &lp.esc, lp.fold)
@@ -1222,12 +1220,7 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
             }
             let c = try bEval(&y, b, idx)
             for j in 0..m { if c.nul[j] { a.nul[j] = true } }
-            if op == 0 { for j in 0..m { a.v[j] = if a.v[j] == c.v[j] { 1 } else { 0 } } }
-            else if op == 1 { for j in 0..m { a.v[j] = if a.v[j] != c.v[j] { 1 } else { 0 } } }
-            else if op == 2 { for j in 0..m { a.v[j] = if a.v[j] < c.v[j] { 1 } else { 0 } } }
-            else if op == 3 { for j in 0..m { a.v[j] = if a.v[j] <= c.v[j] { 1 } else { 0 } } }
-            else if op == 4 { for j in 0..m { a.v[j] = if a.v[j] > c.v[j] { 1 } else { 0 } } }
-            else { for j in 0..m { a.v[j] = if a.v[j] >= c.v[j] { 1 } else { 0 } } }
+            lexdb_vec.cmpI64(op, mut &a.v, &c.v)
             return Ok(a)
         }
         BNode.And(x, y) {
@@ -1275,7 +1268,7 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
         }
         BNode.Not(x) {
             var a = try bEval(&x, b, idx)
-            for j in 0..m { a.v[j] = if a.v[j] == 0 { 1 } else { 0 } }      // (a NULL's value is any: 1 - v may overflow)
+            lexdb_vec.notI64(mut &a.v)      // (a NULL's value is any: 1 - v may overflow)
             return Ok(a)
         }
         BNode.IsNull(x, neg) {
@@ -1596,8 +1589,15 @@ pub fn bEval(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
 fn utf8CharLen(s: &str): int {
     let n = len(s)
     var c = 0
-    for i in 0..n {
-        if (int(s[i]) & 0xc0) != 0x80 { c += 1 }
+    var i = 0
+    let vMask = VB.splat(byte(0xc0))
+    let vCont = VB.splat(byte(0x80))
+    for v in VB.chunks(s, mut &i) {
+        c += int(((v & vMask) != vCont).bitmask().countOnes())
+    }
+    if i < n {
+        let v = VB.loadPartial(s, i, byte(0x80))
+        c += int(((v & vMask) != vCont).bitmask().countOnes())
     }
     return c
 }
@@ -1746,13 +1746,7 @@ pub fn bAddVals(b: mut &Batch, idx: &[]int, vals: []Val): int {
 }
 
 pub fn cmpConst(op: int, a: mut &BVec, k: int) {
-    let m = len(a.v)
-    if op == 0 { for j in 0..m { a.v[j] = if a.v[j] == k { 1 } else { 0 } } }
-    else if op == 1 { for j in 0..m { a.v[j] = if a.v[j] != k { 1 } else { 0 } } }
-    else if op == 2 { for j in 0..m { a.v[j] = if a.v[j] < k { 1 } else { 0 } } }
-    else if op == 3 { for j in 0..m { a.v[j] = if a.v[j] <= k { 1 } else { 0 } } }
-    else if op == 4 { for j in 0..m { a.v[j] = if a.v[j] > k { 1 } else { 0 } } }
-    else { for j in 0..m { a.v[j] = if a.v[j] >= k { 1 } else { 0 } } }
+    lexdb_vec.cmpConstI64(op, mut &a.v, k)
 }
 
 // The positions j of idx whose row n holds for (true, not NULL).
@@ -2991,16 +2985,7 @@ pub fn bAccDec(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, cn:
                     let cnul = &b.cols[col].nul
                     let k = len(rows)
                     if one {
-                        var s = su[0]
-                        var c = cn[0]
-                        for j in 0..k {
-                            let r = rows[j]
-                            if cnul[r] { continue }
-                            s += i128(cv[r])
-                            c += 1
-                        }
-                        su[0] = s
-                        cn[0] = c
+                        lexdb_vec.sumI128Col(cv, cnul, rows, cn, su)
                     } else {
                         for j in 0..k {
                             let r = rows[j]
@@ -3033,6 +3018,33 @@ pub fn bAccum(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, cn: 
         if one { cn[0] += k } else { for j in 0..k { cn[gids[j]] += 1 } }
         return Ok(Unit{})
     }
+    if one {
+        match &sp.arg {
+            Some(x) {
+                match x {
+                    BNode.Col(col) {
+                        let cv = &b.cols[col].v
+                        let cnul = &b.cols[col].nul
+                        if sp.kind == BA_COUNT {
+                            var c = cn[0]
+                            for j in 0..k { if !cnul[rows[j]] { c += 1 } }
+                            cn[0] = c
+                            return Ok(Unit{})
+                        }
+                        if sp.kind == BA_SUM || sp.kind == BA_AVG {
+                            if !lexdb_vec.sumI64Col(cv, cnul, rows, cn, su) { return Err(batErr()) }
+                            return Ok(Unit{})
+                        }
+                        let mx = sp.kind == BA_MAX || sp.kind == BA_OR
+                        lexdb_vec.minMaxI64Col(cv, cnul, rows, mx, cn, mm)
+                        return Ok(Unit{})
+                    }
+                    else {}
+                }
+            }
+            None {}
+        }
+    }
     let a = match sp.arg {
         Some(x) { try bEval(&x, b, rows) }
         None { lexdb_rows.bvec(0) }
@@ -3049,18 +3061,7 @@ pub fn bAccum(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, cn: 
     }
     if sp.kind == BA_SUM || sp.kind == BA_AVG {
         if one {
-            var s = su[0]
-            var c = cn[0]
-            for j in 0..k {
-                if a.nul[j] { continue }
-                match s.checkedAdd(a.v[j]) {
-                    Some(w) { s = w }
-                    None { return Err(batErr()) }       // past 2^63: the row path's numeric (eat gives way)
-                }
-                c += 1
-            }
-            su[0] = s
-            cn[0] = c
+            if !lexdb_vec.sumI64One(&a, cn, su) { return Err(batErr()) }
         } else {
             for j in 0..k {
                 if a.nul[j] { continue }
@@ -3075,9 +3076,13 @@ pub fn bAccum(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, cn: 
         return Ok(Unit{})
     }
     let mx = sp.kind == BA_MAX || sp.kind == BA_OR
+    if one {
+        lexdb_vec.minMaxI64One(&a, mx, cn, mm)
+        return Ok(Unit{})
+    }
     for j in 0..k {
         if a.nul[j] { continue }
-        let g = if one { 0 } else { gids[j] }
+        let g = gids[j]
         let v = a.v[j]
         if cn[g] == 0 || (if mx { v > mm[g] } else { v < mm[g] }) { mm[g] = v }
         cn[g] += 1
@@ -16616,22 +16621,8 @@ fn bEvalPure(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
             var a = try bEvalPure(&x, b, idx)
             let c = try bEvalPure(&y, b, idx)
             for j in 0..m { if c.nul[j] { a.nul[j] = true } }
-            if op == 0 {
-                for j in 0..m {
-                    if a.nul[j] { continue }
-                    match a.v[j].checkedAdd(c.v[j]) {
-                        Some(r) { a.v[j] = r }
-                        None { return Err(e("22003", "bigint out of range")) }
-                    }
-                }
-            } else if op == 1 {
-                for j in 0..m {
-                    if a.nul[j] { continue }
-                    match a.v[j].checkedSub(c.v[j]) {
-                        Some(r) { a.v[j] = r }
-                        None { return Err(e("22003", "bigint out of range")) }
-                    }
-                }
+            if op == 0 || op == 1 {
+                if !lexdb_vec.arithAddSubI64(op, mut &a.v, &a.nul, &c.v) { return Err(e("22003", "bigint out of range")) }
             } else if op == 2 {
                 for j in 0..m {
                     if a.nul[j] { continue }
@@ -16667,8 +16658,8 @@ fn bEvalPure(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
         BNode.Fit(x, bits) {
             let a = try bEvalPure(&x, b, idx)
             let hi = if bits == 16 { 32767 } else { 2147483647 }
-            for j in 0..m {
-                if !a.nul[j] && (a.v[j] > hi || a.v[j] < -hi - 1) { return Err(e("22003", if bits == 16 { "smallint out of range" } else { "integer out of range" })) }
+            if !lexdb_vec.fitI64(&a.v, &a.nul, -hi - 1, hi) {
+                return Err(e("22003", if bits == 16 { "smallint out of range" } else { "integer out of range" }))
             }
             return Ok(a)
         }
@@ -16781,11 +16772,17 @@ fn bEvalPure(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
                 if b.cols[c].nul[r] { out.nul[j] = true; continue }
                 let hit = if lp.txt {
                     if lp.simple { lexdb_like.likePieces(lexdb_rows.textAt(b, c, r), &lp.pieces) }
+                    else if lp.foldSimple { lexdb_like.likePiecesFold(lexdb_rows.textAt(b, c, r), &lp.pieces) }
                     else { try lexdb_lib.likeMatch(lexdb_rows.textAt(b, c, r), &lp.pat, &lp.esc, lp.fold) }
                 } else if lp.simple {
                     match b.vals[c][r] {
                         Val.Text(x) { lexdb_like.likePieces(&x, &lp.pieces) }
                         else { lexdb_like.likePieces(&lexdb_sql.text(&b.vals[c][r]), &lp.pieces) }
+                    }
+                } else if lp.foldSimple {
+                    match b.vals[c][r] {
+                        Val.Text(x) { lexdb_like.likePiecesFold(&x, &lp.pieces) }
+                        else { lexdb_like.likePiecesFold(&lexdb_sql.text(&b.vals[c][r]), &lp.pieces) }
                     }
                 } else {
                     try lexdb_lib.likeMatch(&(lexdb_sql.text(&b.vals[c][r])), &lp.pat, &lp.esc, lp.fold)
@@ -16809,12 +16806,7 @@ fn bEvalPure(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
             }
             let c = try bEvalPure(&y, b, idx)
             for j in 0..m { if c.nul[j] { a.nul[j] = true } }
-            if op == 0 { for j in 0..m { a.v[j] = if a.v[j] == c.v[j] { 1 } else { 0 } } }
-            else if op == 1 { for j in 0..m { a.v[j] = if a.v[j] != c.v[j] { 1 } else { 0 } } }
-            else if op == 2 { for j in 0..m { a.v[j] = if a.v[j] < c.v[j] { 1 } else { 0 } } }
-            else if op == 3 { for j in 0..m { a.v[j] = if a.v[j] <= c.v[j] { 1 } else { 0 } } }
-            else if op == 4 { for j in 0..m { a.v[j] = if a.v[j] > c.v[j] { 1 } else { 0 } } }
-            else { for j in 0..m { a.v[j] = if a.v[j] >= c.v[j] { 1 } else { 0 } } }
+            lexdb_vec.cmpI64(op, mut &a.v, &c.v)
             return Ok(a)
         }
         BNode.And(x, y) {
@@ -16851,7 +16843,7 @@ fn bEvalPure(n: &BNode, b: &Batch, idx: &[]int): Result[BVec, DbErr] {
         }
         BNode.Not(x) {
             var a = try bEvalPure(&x, b, idx)
-            for j in 0..m { a.v[j] = if a.v[j] == 0 { 1 } else { 0 } }
+            lexdb_vec.notI64(mut &a.v)
             return Ok(a)
         }
         BNode.IsNull(x, neg) {
@@ -17905,16 +17897,7 @@ fn bAccDecPure(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, cn:
                     let cnul = &b.cols[col].nul
                     let k = len(rows)
                     if one {
-                        var s = su[0]
-                        var c = cn[0]
-                        for j in 0..k {
-                            let r = rows[j]
-                            if cnul[r] { continue }
-                            s += i128(cv[r])
-                            c += 1
-                        }
-                        su[0] = s
-                        cn[0] = c
+                        lexdb_vec.sumI128Col(cv, cnul, rows, cn, su)
                     } else {
                         for j in 0..k {
                             let r = rows[j]
@@ -17942,6 +17925,33 @@ fn bAccumPure(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, cn: 
         if one { cn[0] += k } else { for j in 0..k { cn[gids[j]] += 1 } }
         return Ok(Unit{})
     }
+    if one {
+        match &sp.arg {
+            Some(x) {
+                match x {
+                    BNode.Col(col) {
+                        let cv = &b.cols[col].v
+                        let cnul = &b.cols[col].nul
+                        if sp.kind == BA_COUNT {
+                            var c = cn[0]
+                            for j in 0..k { if !cnul[rows[j]] { c += 1 } }
+                            cn[0] = c
+                            return Ok(Unit{})
+                        }
+                        if sp.kind == BA_SUM || sp.kind == BA_AVG {
+                            if !lexdb_vec.sumI64Col(cv, cnul, rows, cn, su) { return Err(batErrPure()) }
+                            return Ok(Unit{})
+                        }
+                        let mx = sp.kind == BA_MAX || sp.kind == BA_OR
+                        lexdb_vec.minMaxI64Col(cv, cnul, rows, mx, cn, mm)
+                        return Ok(Unit{})
+                    }
+                    else {}
+                }
+            }
+            None {}
+        }
+    }
     let a = match &sp.arg {
         Some(x) { try bEvalPure(x, b, rows) }
         None { lexdb_rows.bvec(0) }
@@ -17958,15 +17968,7 @@ fn bAccumPure(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, cn: 
     }
     if sp.kind == BA_SUM || sp.kind == BA_AVG {
         if one {
-            var s = su[0]
-            var c = cn[0]
-            for j in 0..k {
-                if a.nul[j] { continue }
-                match s.checkedAdd(a.v[j]) { Some(w) { s = w } None { return Err(batErrPure()) } }
-                c += 1
-            }
-            su[0] = s
-            cn[0] = c
+            if !lexdb_vec.sumI64One(&a, cn, su) { return Err(batErrPure()) }
         } else {
             for j in 0..k {
                 if a.nul[j] { continue }
@@ -17978,9 +17980,13 @@ fn bAccumPure(sp: &BSpec, b: &Batch, rows: &[]int, gids: &[]int, one: bool, cn: 
         return Ok(Unit{})
     }
     let mx = sp.kind == BA_MAX || sp.kind == BA_OR
+    if one {
+        lexdb_vec.minMaxI64One(&a, mx, cn, mm)
+        return Ok(Unit{})
+    }
     for j in 0..k {
         if a.nul[j] { continue }
-        let g = if one { 0 } else { gids[j] }
+        let g = gids[j]
         let v = a.v[j]
         if cn[g] == 0 || (if mx { v > mm[g] } else { v < mm[g] }) { mm[g] = v }
         cn[g] += 1

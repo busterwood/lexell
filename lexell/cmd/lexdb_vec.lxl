@@ -13,6 +13,10 @@ import "decimal"
 
 type BVec = lexdb_rows.BVec
 type Val = lexdb_sql.Val
+type VI = vector[int]
+
+const MIN_I64: i128 = -9223372036854775807 - 1
+const MAX_I64: i128 = 9223372036854775807
 
 // The largest scale a units vector has (10^18 fits an integer).
 pub const MAX_SCALE: int = 18
@@ -28,6 +32,194 @@ fn scaleUp(a: mut &BVec, k: int): bool {
             Some(w) { a.v[j] = w }
             None { return false }
         }
+    }
+    return true
+}
+
+// Element-wise checked signed 64-bit add (op == 0) or sub (op == 1) in place
+// into av (caller has merged c.nul into anul). False if any non-NULL lane overflows.
+pub fn arithAddSubI64(op: int, av: mut &[]int, anul: &[]bool, cv: &[]int): bool {
+    let m = len(av)
+    let vZero = VI.zero()
+    var j = 0
+    if op == 0 {
+        while j + VI.lanes <= len(av) && j + VI.lanes <= len(cv) {
+            let x = VI.load(av, j)
+            let y = VI.load(cv, j)
+            let r = x +% y
+            if (((r ^ x) & (r ^ y)) < vZero).any() {
+                for t in j..j + VI.lanes {
+                    if anul[t] { continue }
+                    match av[t].checkedAdd(cv[t]) {
+                        Some(w) { av[t] = w }
+                        None { return false }
+                    }
+                }
+            } else {
+                r.store(av, j)
+            }
+            j += VI.lanes
+        }
+        while j < m {
+            if !anul[j] {
+                match av[j].checkedAdd(cv[j]) {
+                    Some(w) { av[j] = w }
+                    None { return false }
+                }
+            }
+            j += 1
+        }
+        return true
+    }
+    while j + VI.lanes <= len(av) && j + VI.lanes <= len(cv) {
+        let x = VI.load(av, j)
+        let y = VI.load(cv, j)
+        let r = x -% y
+        if (((x ^ y) & (x ^ r)) < vZero).any() {
+            for t in j..j + VI.lanes {
+                if anul[t] { continue }
+                match av[t].checkedSub(cv[t]) {
+                    Some(w) { av[t] = w }
+                    None { return false }
+                }
+            }
+        } else {
+            r.store(av, j)
+        }
+        j += VI.lanes
+    }
+    while j < m {
+        if !anul[j] {
+            match av[j].checkedSub(cv[j]) {
+                Some(w) { av[j] = w }
+                None { return false }
+            }
+        }
+        j += 1
+    }
+    return true
+}
+
+// Element-wise comparison a[j] op c[j] -> 1 or 0 in a (op: 0 =, 1 <>, 2 <, 3 <=, 4 >, 5 >=).
+pub fn cmpI64(op: int, a: mut &[]int, c: &[]int) {
+    let m = len(a)
+    let vOne = VI.splat(1)
+    let vZero = VI.zero()
+    var j = 0
+    if op == 0 {
+        while j + VI.lanes <= len(a) && j + VI.lanes <= len(c) {
+            (VI.load(a, j) == VI.load(c, j)).select(vOne, vZero).store(a, j)
+            j += VI.lanes
+        }
+        while j < m { a[j] = if a[j] == c[j] { 1 } else { 0 }; j += 1 }
+    } else if op == 1 {
+        while j + VI.lanes <= len(a) && j + VI.lanes <= len(c) {
+            (VI.load(a, j) != VI.load(c, j)).select(vOne, vZero).store(a, j)
+            j += VI.lanes
+        }
+        while j < m { a[j] = if a[j] != c[j] { 1 } else { 0 }; j += 1 }
+    } else if op == 2 {
+        while j + VI.lanes <= len(a) && j + VI.lanes <= len(c) {
+            (VI.load(a, j) < VI.load(c, j)).select(vOne, vZero).store(a, j)
+            j += VI.lanes
+        }
+        while j < m { a[j] = if a[j] < c[j] { 1 } else { 0 }; j += 1 }
+    } else if op == 3 {
+        while j + VI.lanes <= len(a) && j + VI.lanes <= len(c) {
+            (VI.load(a, j) <= VI.load(c, j)).select(vOne, vZero).store(a, j)
+            j += VI.lanes
+        }
+        while j < m { a[j] = if a[j] <= c[j] { 1 } else { 0 }; j += 1 }
+    } else if op == 4 {
+        while j + VI.lanes <= len(a) && j + VI.lanes <= len(c) {
+            (VI.load(a, j) > VI.load(c, j)).select(vOne, vZero).store(a, j)
+            j += VI.lanes
+        }
+        while j < m { a[j] = if a[j] > c[j] { 1 } else { 0 }; j += 1 }
+    } else {
+        while j + VI.lanes <= len(a) && j + VI.lanes <= len(c) {
+            (VI.load(a, j) >= VI.load(c, j)).select(vOne, vZero).store(a, j)
+            j += VI.lanes
+        }
+        while j < m { a[j] = if a[j] >= c[j] { 1 } else { 0 }; j += 1 }
+    }
+}
+
+// Element-wise comparison a[j] op k -> 1 or 0 in a.
+pub fn cmpConstI64(op: int, a: mut &[]int, k: int) {
+    let m = len(a)
+    let vK = VI.splat(k)
+    let vOne = VI.splat(1)
+    let vZero = VI.zero()
+    var j = 0
+    if op == 0 {
+        while j + VI.lanes <= len(a) {
+            (VI.load(a, j) == vK).select(vOne, vZero).store(a, j)
+            j += VI.lanes
+        }
+        while j < m { a[j] = if a[j] == k { 1 } else { 0 }; j += 1 }
+    } else if op == 1 {
+        while j + VI.lanes <= len(a) {
+            (VI.load(a, j) != vK).select(vOne, vZero).store(a, j)
+            j += VI.lanes
+        }
+        while j < m { a[j] = if a[j] != k { 1 } else { 0 }; j += 1 }
+    } else if op == 2 {
+        while j + VI.lanes <= len(a) {
+            (VI.load(a, j) < vK).select(vOne, vZero).store(a, j)
+            j += VI.lanes
+        }
+        while j < m { a[j] = if a[j] < k { 1 } else { 0 }; j += 1 }
+    } else if op == 3 {
+        while j + VI.lanes <= len(a) {
+            (VI.load(a, j) <= vK).select(vOne, vZero).store(a, j)
+            j += VI.lanes
+        }
+        while j < m { a[j] = if a[j] <= k { 1 } else { 0 }; j += 1 }
+    } else if op == 4 {
+        while j + VI.lanes <= len(a) {
+            (VI.load(a, j) > vK).select(vOne, vZero).store(a, j)
+            j += VI.lanes
+        }
+        while j < m { a[j] = if a[j] > k { 1 } else { 0 }; j += 1 }
+    } else {
+        while j + VI.lanes <= len(a) {
+            (VI.load(a, j) >= vK).select(vOne, vZero).store(a, j)
+            j += VI.lanes
+        }
+        while j < m { a[j] = if a[j] >= k { 1 } else { 0 }; j += 1 }
+    }
+}
+
+// Element-wise boolean NOT: a[j] = (a[j] == 0 ? 1 : 0).
+pub fn notI64(a: mut &[]int) {
+    let m = len(a)
+    let vZero = VI.zero()
+    let vOne = VI.splat(1)
+    var j = 0
+    while j + VI.lanes <= len(a) {
+        (VI.load(a, j) == vZero).select(vOne, vZero).store(a, j)
+        j += VI.lanes
+    }
+    while j < m { a[j] = if a[j] == 0 { 1 } else { 0 }; j += 1 }
+}
+
+// Range check: returns true iff every non-NULL row of a is in [lo, hi].
+pub fn fitI64(av: &[]int, anul: &[]bool, lo: int, hi: int): bool {
+    let m = len(av)
+    let vLo = VI.splat(lo)
+    let vHi = VI.splat(hi)
+    var j = 0
+    for v in VI.chunks(av, mut &j) {
+        if ((v > vHi) | (v < vLo)).any() {
+            for t in j..j + VI.lanes {
+                if !anul[t] && (av[t] > hi || av[t] < lo) { return false }
+            }
+        }
+    }
+    while j < m {
+        if !anul[j] && (av[j] > hi || av[j] < lo) { return false }
+        j += 1
     }
     return true
 }
@@ -50,6 +242,7 @@ pub fn arith(op: int, a: mut &BVec, sa: int, c: &BVec, sc: int): bool {
         }
         return true
     }
+    if sa == sc { return arithAddSubI64(op, mut &a.v, &a.nul, &c.v) }
     if sa < sc { if !scaleUp(a, sc - sa) { return false } }
     // c's rows brought to a's scale as they are read
     let k = if sc < sa { lexdb_rows.pow10i(sa - sc) } else { 1 }
@@ -87,11 +280,7 @@ pub fn cmp(op: int, a: mut &BVec, sa: int, c: &BVec, sc: int) {
     let m = len(a.v)
     for j in 0..m { if c.nul[j] { a.nul[j] = true } }
     if sa == sc {
-        for j in 0..m {
-            let x = a.v[j]
-            let y = c.v[j]
-            a.v[j] = if holds(op, if x < y { -1 } else if x > y { 1 } else { 0 }) { 1 } else { 0 }
-        }
+        cmpI64(op, mut &a.v, &c.v)
         return
     }
     // at the larger scale, in 128 bits (no overflow)
@@ -104,29 +293,171 @@ pub fn cmp(op: int, a: mut &BVec, sa: int, c: &BVec, sc: int) {
     }
 }
 
+fn flushI128(v: VI): i128 {
+    return i128(v.lane(0)) + i128(v.lane(1)) + i128(v.lane(2)) + i128(v.lane(3))
+}
+
+fn hasAnyNull(nul: &[]bool): bool {
+    for x in nul { if x { return true } }
+    return false
+}
+
+fn isFullSeq(rows: &[]int, n: int): bool {
+    if len(rows) != n || n == 0 { return false }
+    if rows[0] != 0 || rows[n - 1] != n - 1 { return false }
+    for i in 0..n { if rows[i] != i { return false } }
+    return true
+}
+
+fn sumI128NoNull(av: &[]int, s0: i128): i128 {
+    var s = s0
+    let vZero = VI.zero()
+    var vAcc = VI.zero()
+    var j = 0
+    for v in VI.chunks(av, mut &j) {
+        let next = vAcc +% v
+        if (((next ^ vAcc) & (next ^ v)) < vZero).any() {
+            s += flushI128(vAcc)
+            vAcc = v
+        } else {
+            vAcc = next
+        }
+    }
+    s += flushI128(vAcc)
+    while j < len(av) {
+        s += i128(av[j])
+        j += 1
+    }
+    return s
+}
+
+fn sumI128Slice(av: &[]int, anul: &[]bool, s0: i128, cn: mut &[]int): i128 {
+    let k = len(av)
+    if !hasAnyNull(anul) {
+        cn[0] += k
+        return sumI128NoNull(av, s0)
+    }
+    var s = s0
+    var c = cn[0]
+    for j in 0..k {
+        if anul[j] { continue }
+        s += i128(av[j])
+        c += 1
+    }
+    cn[0] = c
+    return s
+}
+
 // Adds the rows of a (units) not NULL to their groups' sums (gids: each
 // row's group; one: all in group 0) and counts, in 128 bits: 2^64 values
 // of 2^63 at most cannot pass it.
 pub fn sum(a: &BVec, gids: &[]int, one: bool, cn: mut &[]int, su: mut &[]i128) {
-    let k = len(a.v)
     if one {
-        var s = su[0]
-        var c = cn[0]
-        for j in 0..k {
-            if a.nul[j] { continue }
-            s += i128(a.v[j])
-            c += 1
-        }
-        su[0] = s
-        cn[0] = c
+        su[0] = sumI128Slice(&a.v, &a.nul, su[0], cn)
         return
     }
+    let k = len(a.v)
     for j in 0..k {
         if a.nul[j] { continue }
         let g = gids[j]
         su[g] += i128(a.v[j])
         cn[g] += 1
     }
+}
+
+fn sumI128ColVal(cv: &[]int, cnul: &[]bool, rows: &[]int, s0: i128, cn: mut &[]int): i128 {
+    let k = len(rows)
+    if isFullSeq(rows, len(cv)) {
+        return sumI128Slice(cv, cnul, s0, cn)
+    }
+    var s = s0
+    var c = cn[0]
+    for j in 0..k {
+        let r = rows[j]
+        if cnul[r] { continue }
+        s += i128(cv[r])
+        c += 1
+    }
+    cn[0] = c
+    return s
+}
+
+// Direct 128-bit sum of cv[rows[j]] (single group) with 4-wide SIMD on full batches.
+pub fn sumI128Col(cv: &[]int, cnul: &[]bool, rows: &[]int, cn: mut &[]int, su: mut &[]i128) {
+    su[0] = sumI128ColVal(cv, cnul, rows, su[0], cn)
+}
+
+// Single-group i64 sum of BVec a into su[0], cn[0]. Returns false if the total overflows i64.
+pub fn sumI64One(a: &BVec, cn: mut &[]int, su: mut &[]int): bool {
+    let tot = sumI128Slice(&a.v, &a.nul, i128(su[0]), cn)
+    if tot < MIN_I64 || tot > MAX_I64 { return false }
+    su[0] = int(tot)
+    return true
+}
+
+// Direct single-group i64 sum of cv[rows[j]] into su[0], cn[0]. Returns false on i64 overflow.
+pub fn sumI64Col(cv: &[]int, cnul: &[]bool, rows: &[]int, cn: mut &[]int, su: mut &[]int): bool {
+    let tot = sumI128ColVal(cv, cnul, rows, i128(su[0]), cn)
+    if tot < MIN_I64 || tot > MAX_I64 { return false }
+    su[0] = int(tot)
+    return true
+}
+
+fn minMaxI64Slice(av: &[]int, anul: &[]bool, mx: bool, cn: mut &[]int, mm: mut &[]int) {
+    let k = len(av)
+    if k == 0 { return }
+    if !hasAnyNull(anul) {
+        var vCur = VI.splat(if cn[0] > 0 { mm[0] } else { av[0] })
+        var j = 0
+        if mx {
+            for v in VI.chunks(av, mut &j) { vCur = vCur.max(v) }
+            var best = vCur.reduceMax()
+            while j < k { if av[j] > best { best = av[j] }; j += 1 }
+            mm[0] = best
+        } else {
+            for v in VI.chunks(av, mut &j) { vCur = vCur.min(v) }
+            var best = vCur.reduceMin()
+            while j < k { if av[j] < best { best = av[j] }; j += 1 }
+            mm[0] = best
+        }
+        cn[0] += k
+        return
+    }
+    var c = cn[0]
+    var best = mm[0]
+    for j in 0..k {
+        if anul[j] { continue }
+        let x = av[j]
+        if c == 0 || (if mx { x > best } else { x < best }) { best = x }
+        c += 1
+    }
+    if c > 0 { mm[0] = best }
+    cn[0] = c
+}
+
+// Single-group min or max of BVec a into mm[0], cn[0].
+pub fn minMaxI64One(a: &BVec, mx: bool, cn: mut &[]int, mm: mut &[]int) {
+    minMaxI64Slice(&a.v, &a.nul, mx, cn, mm)
+}
+
+// Direct single-group min or max of cv[rows[j]] with 4-wide SIMD on full batches.
+pub fn minMaxI64Col(cv: &[]int, cnul: &[]bool, rows: &[]int, mx: bool, cn: mut &[]int, mm: mut &[]int) {
+    if isFullSeq(rows, len(cv)) {
+        minMaxI64Slice(cv, cnul, mx, cn, mm)
+        return
+    }
+    let k = len(rows)
+    var c = cn[0]
+    var best = mm[0]
+    for j in 0..k {
+        let r = rows[j]
+        if cnul[r] { continue }
+        let x = cv[r]
+        if c == 0 || (if mx { x > best } else { x < best }) { best = x }
+        c += 1
+    }
+    if c > 0 { mm[0] = best }
+    cn[0] = c
 }
 
 // 10^38: a numeric sum at or past it in magnitude is out of range, as

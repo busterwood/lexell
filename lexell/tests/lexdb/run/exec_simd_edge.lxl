@@ -1,0 +1,175 @@
+// lexdb_exec: SIMD edge cases (overflows, NULL lanes, w==8 rangeFilter,
+// 128-bit sums, min/max, UTF-8 char length across 32-byte boundaries, and
+// ILIKE folding across short/long/UTF-8/escaped patterns). Every query is
+// checked differentially: lexdb_batch = off (scalar row path) vs on (SIMD
+// batch + columnar leaf kernels).
+// expect: w8 between: same
+// expect: w8 empty hi: same
+// expect: w8 empty lo: same
+// expect: w8 all: same
+// expect: w8 single: same
+// expect: leafk ne: same
+// expect: leafk cols eq: same
+// expect: leafk cols ne: same
+// expect: leafk cols lt: same
+// expect: leafk cols le: same
+// expect: leafk cols gt: same
+// expect: leafk cols ge: same
+// expect: leafk cols null: same
+// expect: arith add overflow: same ERROR 22003
+// expect: arith sub overflow: same ERROR 22003
+// expect: arith null lane safe: same
+// expect: arith cmp not: same
+// expect: fit int2 overflow: same ERROR 22003
+// expect: sum i64 spill to numeric: same
+// expect: sum dec i128: same
+// expect: minmax nonull: same
+// expect: minmax withnull: same
+// expect: minmax allnull: same
+// expect: minmax filtered: same
+// expect: utf8 strlen: same
+// expect: ilike multi: same
+// expect: ilike single char: same
+// expect: ilike nonletter: same
+// expect: ilike exact: same
+// expect: ilike prefix suffix: same
+// expect: ilike empty pieces: same
+// expect: ilike utf8: same
+// expect: ilike underscore fallback: same
+// expect: ilike escape fallback: same
+import "strings"
+import "../../../cmd/lexdb_store"
+import "../../../cmd/lexdb_disk"
+import "../../../cmd/lexdb_exec"
+import "../../../cmd/lexdb_sql"
+
+fn q(s: mut &lexdb_exec.Session, sql: &str): str {
+    match s.exec(sql) {
+        Ok(rs) {
+            var out: []str = []
+            for r in rs {
+                if !r.hasRows { append(mut &out, r.tag.clone()) }
+                for row in r.rows {
+                    var vs: []str = []
+                    for v in row { append(mut &vs, lexdb_sql.text(&v)) }
+                    append(mut &out, strings.join(&vs, "|"))
+                }
+            }
+            return strings.join(&out, " ")
+        }
+        Err(e) { return "ERROR " + e.state }
+    }
+}
+
+fn run(s: mut &lexdb_exec.Session, sql: &str) {
+    let r = q(s, sql)
+    if strings.startsWith(&r, &"ERROR") { println("setup err: " + r + " in " + sql) }
+}
+
+fn check(s: mut &lexdb_exec.Session, label: &str, sql: &str) {
+    run(s, &"set lexdb_batch = off")
+    let off = q(s, sql)
+    run(s, &"set lexdb_batch = on")
+    let on = q(s, sql)
+    var msg = label + ": " + (if off == on { "same" } else { "DIFFERENT" })
+    if strings.startsWith(&off, &"ERROR") { msg = msg + " " + off }
+    println(msg)
+    if off != on {
+        println("  off: " + off)
+        println("  on:  " + on)
+    }
+}
+
+fn opts(): lexdb_store.Options {
+    return lexdb_store.Options{cacheBytes: 1024 * 1024, segBytes: 4 * 1024 * 1024, ckptBytes: 2 * 1024 * 1024, snapNodes: 100000}
+}
+
+fn main() {
+    let res = lexdb_store.run(lexdb_disk.sim(20261127), opts(), fn(st: lexdb_store.Store): int {
+        lexdb_exec.bootstrap(&st).unwrap()
+        var s = lexdb_exec.newSession(st.share())
+
+        // 137 rows (not a multiple of 4 or 32) for w==8 rangeFilter, LeafK, min/max, UTF-8, ILIKE
+        run(mut &s, &"CREATE TABLE t (id INT PRIMARY KEY, b INT, c INT, n INT, d NUMERIC(18,2), txt TEXT)")
+        var vals: []str = []
+        for i in 0..137 {
+            let b = (i * 7) % 200
+            let c = (i * 11) % 200
+            let n = if i % 5 == 0 { "NULL" } else { (i * 3 - 200).toStr() }
+            let d = (i * 1000000000000).toStr() + ".25"
+            var txt = "short-FOO-" + i.toStr()
+            if i % 7 == 0 {
+                txt = "prefix_012345678901234567890123456789_MiXeD_BaR_end_" + i.toStr()
+            } else if i % 7 == 1 {
+                txt = "café-🚀-Zürich-012345678901234567890123456789-€-FOO-baz"
+            } else if i % 7 == 2 {
+                txt = ""
+            } else if i % 7 == 3 {
+                txt = "Hello"
+            } else if i % 7 == 4 {
+                txt = "pre_100%_val_suf"
+            }
+            append(mut &vals, "(" + i.toStr() + "," + b.toStr() + "," + c.toStr() + "," + n + "," + d + ",'" + txt + "')")
+        }
+        run(mut &s, &("INSERT INTO t VALUES " + strings.join(&vals, ",")))
+
+        // Big values table for 64-bit overflow and 128-bit sum spill
+        run(mut &s, &"CREATE TABLE big (id INT PRIMARY KEY, x BIGINT, y BIGINT, z SMALLINT)")
+        run(mut &s, &"INSERT INTO big VALUES (1, 9223372036854775807, 0, 32767), (2, 9223372036854775807, NULL, NULL), (3, -9223372036854775808, 0, -32768), (4, 4000000000000000000, 1, 10), (5, 4000000000000000000, 2, 20), (6, 4000000000000000000, 3, 30), (7, 4000000000000000000, NULL, NULL), (8, 4000000000000000000, 4, 40), (9, 4000000000000000000, 5, 50)")
+
+        // All-NULL table for min/max
+        run(mut &s, &"CREATE TABLE an (id INT PRIMARY KEY, x INT)")
+        run(mut &s, &"INSERT INTO an VALUES (1, NULL), (2, NULL), (3, NULL), (4, NULL), (5, NULL)")
+
+        st.checkpointAll().unwrap()
+
+        // w == 8 rangeFilter
+        check(mut &s, &"w8 between", &"SELECT count(*), sum(id) FROM t WHERE b BETWEEN 40 AND 120")
+        check(mut &s, &"w8 empty hi", &"SELECT count(*) FROM t WHERE b BETWEEN 250 AND 300")
+        check(mut &s, &"w8 empty lo", &"SELECT count(*) FROM t WHERE b BETWEEN -50 AND -1")
+        check(mut &s, &"w8 all", &"SELECT count(*), sum(b) FROM t WHERE b BETWEEN -10 AND 500")
+        check(mut &s, &"w8 single", &"SELECT count(*), sum(id) FROM t WHERE b = 42")
+
+        // LeafK Ne & Cols
+        check(mut &s, &"leafk ne", &"SELECT count(*), sum(id) FROM t WHERE b <> 42")
+        check(mut &s, &"leafk cols eq", &"SELECT count(*), sum(id) FROM t WHERE b = c")
+        check(mut &s, &"leafk cols ne", &"SELECT count(*), sum(id) FROM t WHERE b <> c")
+        check(mut &s, &"leafk cols lt", &"SELECT count(*), sum(id) FROM t WHERE b < c")
+        check(mut &s, &"leafk cols le", &"SELECT count(*), sum(id) FROM t WHERE b <= c")
+        check(mut &s, &"leafk cols gt", &"SELECT count(*), sum(id) FROM t WHERE b > c")
+        check(mut &s, &"leafk cols ge", &"SELECT count(*), sum(id) FROM t WHERE b >= c")
+        check(mut &s, &"leafk cols null", &"SELECT count(*), sum(id) FROM t WHERE n < b")
+
+        // Arithmetic overflow & NULL lanes
+        check(mut &s, &"arith add overflow", &"SELECT sum(x + 1) FROM big WHERE id IN (1, 4, 5, 6, 8)")
+        check(mut &s, &"arith sub overflow", &"SELECT sum(x - 1) FROM big WHERE id IN (3, 4, 5, 6, 8)")
+        check(mut &s, &"arith null lane safe", &"SELECT count(*), sum(x + y) FROM big WHERE id >= 2")
+        check(mut &s, &"arith cmp not", &"SELECT count(*) FROM t WHERE NOT (b + c > 200)")
+        check(mut &s, &"fit int2 overflow", &"SELECT sum(z + 1::smallint) FROM big WHERE id IN (1, 4, 5, 6, 8)")
+
+        // 128-bit sums & min/max
+        check(mut &s, &"sum i64 spill to numeric", &"SELECT sum(x), count(x) FROM big WHERE id >= 4")
+        check(mut &s, &"sum dec i128", &"SELECT sum(d), count(d) FROM t")
+        check(mut &s, &"minmax nonull", &"SELECT min(b), max(b), sum(b), count(b) FROM t")
+        check(mut &s, &"minmax withnull", &"SELECT min(n), max(n), sum(n), count(n) FROM t")
+        check(mut &s, &"minmax allnull", &"SELECT min(x), max(x), sum(x), count(x) FROM an")
+        check(mut &s, &"minmax filtered", &"SELECT min(b), max(b), sum(b) FROM t WHERE id % 3 = 0")
+
+        // UTF-8 strlen
+        check(mut &s, &"utf8 strlen", &"SELECT sum(length(txt)), min(length(txt)), max(length(txt)) FROM t")
+
+        // ILIKE
+        check(mut &s, &"ilike multi", &"SELECT count(*), sum(id) FROM t WHERE txt ILIKE '%mixed%bar%end%'")
+        check(mut &s, &"ilike single char", &"SELECT count(*), sum(id) FROM t WHERE txt ILIKE '%f%'")
+        check(mut &s, &"ilike nonletter", &"SELECT count(*), sum(id) FROM t WHERE txt ILIKE '%-%-%'")
+        check(mut &s, &"ilike exact", &"SELECT count(*), sum(id) FROM t WHERE txt ILIKE 'hello'")
+        check(mut &s, &"ilike prefix suffix", &"SELECT count(*), sum(id) FROM t WHERE txt ILIKE 'pre%suf'")
+        check(mut &s, &"ilike empty pieces", &"SELECT count(*) FROM t WHERE txt ILIKE '%%'")
+        check(mut &s, &"ilike utf8", &"SELECT count(*), sum(id) FROM t WHERE txt ILIKE '%🚀%foo%BAZ'")
+        check(mut &s, &"ilike underscore fallback", &"SELECT count(*), sum(id) FROM t WHERE txt ILIKE 'h_llo'")
+        check(mut &s, &"ilike escape fallback", &"SELECT count(*), sum(id) FROM t WHERE txt ILIKE '%100!%%' ESCAPE '!'")
+
+        return 0
+    })
+    if res.isErr() { println("store err") }
+}
