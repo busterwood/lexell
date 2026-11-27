@@ -9,6 +9,77 @@ import "./lexdb_bind"
 
 type Val = lexdb_sql.Val
 type OutCol = lexdb_bind.OutCol
+type VB = vector[byte]
+
+const PAIRS: str = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899"
+
+fn appendInt(b: mut &[]byte, n: int) {
+    if n == -9223372036854775807 - 1 {
+        appendStr(b, "-9223372036854775808")
+        return
+    }
+    var neg = false
+    var v = n
+    if v < 0 {
+        neg = true
+        v = -v
+    }
+    var nd = 1
+    var p = 10
+    while nd < 19 && v >= p {
+        nd += 1
+        if nd < 19 { p = p * 10 }
+    }
+    let extra = if neg { 1 } else { 0 }
+    let at = bytesGrow(b, extra + nd)
+    if neg { b[at] = '-' }
+    var k = at + extra + nd - 1
+    while v >= 100 {
+        let r = (v % 100) * 2
+        v = v / 100
+        b[k] = PAIRS[r + 1]
+        b[k - 1] = PAIRS[r]
+        k -= 2
+    }
+    if v >= 10 {
+        b[k] = PAIRS[v * 2 + 1]
+        b[k - 1] = PAIRS[v * 2]
+    } else {
+        b[k] = byte(48 + v)
+    }
+}
+
+fn nextJsonEscSimd(t: &str, from: int): int {
+    let n = len(t)
+    let v32 = VB.splat(byte(32))
+    let vQ = VB.splat('"')
+    let vB = VB.splat('\\')
+    var i = from
+    while i + 32 <= n {
+        let v = VB.load(t, i)
+        let m = ((v < v32) | (v == vQ) | (v == vB)).bitmask()
+        if m != u64(0) { return i + int(m.trailingZeros()) }
+        i += 32
+    }
+    while i < n {
+        let c = t[i]
+        if c < byte(32) || c == '"' || c == '\\' { return i }
+        i += 1
+    }
+    return n
+}
+
+fn nextJsonEsc(t: &str, from: int): int {
+    let n = len(t)
+    if n - from >= 32 { return nextJsonEscSimd(t, from) }
+    var i = from
+    while i < n {
+        let c = t[i]
+        if c < byte(32) || c == '"' || c == '\\' { return i }
+        i += 1
+    }
+    return n
+}
 
 // COPY FROM's FORCE_NOT_NULL and FORCE_NULL lists (a and b): the first name that is no column of the table ([] none), which
 // PostgreSQL refuses (42703, "column ... of relation ... does not exist") before it asks the client for the data, as lexdb_exec's
@@ -27,8 +98,19 @@ fn hex2(c: int, b: mut &[]byte) {
 
 // A text as a JSON string.
 pub fn jstr(t: &str, b: mut &[]byte) {
+    let n = len(t)
+    let first = nextJsonEsc(t, 0)
+    if first == n {
+        append(b, '"')
+        if n > 0 { appendStr(b, t) }
+        append(b, '"')
+        return
+    }
     append(b, '"')
-    for k in 0..len(t) {
+    var start = 0
+    var k = first
+    while k < n {
+        if k > start { appendStr(b, &t[start..k]) }
         let c = t[k]
         if c == '"' { appendStr(b, "\\\"") }
         else if c == '\\' { appendStr(b, "\\\\") }
@@ -37,11 +119,14 @@ pub fn jstr(t: &str, b: mut &[]byte) {
         else if c == '\t' { appendStr(b, "\\t") }
         else if c == byte(8) { appendStr(b, "\\b") }
         else if c == byte(12) { appendStr(b, "\\f") }
-        else if c < byte(32) {
+        else {
             appendStr(b, "\\u00")
             hex2(int(c), b)
-        } else { append(b, c) }
+        }
+        start = k + 1
+        k = nextJsonEsc(t, start)
     }
+    if start < n { appendStr(b, &t[start..n]) }
     append(b, '"')
 }
 
@@ -84,22 +169,107 @@ fn jarray(t: &str, elem: int, b: mut &[]byte) {
     }
 }
 
+// Precomputes each column's JSON key prefix: "{\"col\":" for k == 0, ",\"col\":" for k > 0.
+pub fn keyPrefixes(cols: &[]OutCol): []str {
+    var out: []str = withCapacity(len(cols))
+    for k in 0..len(cols) {
+        var b: []byte = withCapacity(32)
+        append(mut &b, if k == 0 { '{' } else { ',' })
+        let nm = cols[k].label()
+        jstr(&nm, mut &b)
+        append(mut &b, ':')
+        append(mut &out, strFromBytes(&b))
+    }
+    return out
+}
+
+// A row as one JSON object using precomputed keyPrefixes (zero per-row key alloc/escape).
+pub fn objectPre(r: &[]Val, cols: &[]OutCol, keys: &[]str, z: &lexdb_time.Zone, b: mut &[]byte) {
+    let utc = z.isUtc()
+    if len(r) == 0 {
+        appendStr(b, "{}")
+        return
+    }
+    for k in 0..len(r) {
+        if k < len(keys) {
+            appendStr(b, &keys[k])
+        } else {
+            append(b, if k == 0 { '{' } else { ',' })
+            appendStr(b, "\"?column?\":")
+        }
+        let oid = if k < len(cols) { cols[k].oid } else { lexdb_sql.OID_TEXT }
+        match r[k] {
+            Val.Null { appendStr(b, "null") }
+            Val.Int(n) {
+                if isNumber(oid) || isFloat(oid) { appendInt(b, n) }
+                else {
+                    let t = lexdb_ops.textOut(&r[k], oid, z)
+                    let el = lexdb_sql.elemOid(oid)
+                    if el > 0 { jarray(&t, el, b) } else { scalar(&t, oid, b) }
+                }
+            }
+            Val.Bool(v) {
+                if oid == lexdb_sql.OID_BOOL { appendStr(b, if v { "true" } else { "false" }) }
+                else { jstr(if v { "t" } else { "f" }, b) }
+            }
+            Val.Text(t) {
+                let el = lexdb_sql.elemOid(oid)
+                if el == 0 && (utc || oid != lexdb_sql.OID_TSTZ) && !isNumber(oid) && !isFloat(oid) && oid != lexdb_sql.OID_BOOL {
+                    jstr(&t, b)
+                } else {
+                    let s = lexdb_ops.textOut(&r[k], oid, z)
+                    if el > 0 { jarray(&s, el, b) } else { scalar(&s, oid, b) }
+                }
+            }
+            else {
+                let t = lexdb_ops.textOut(&r[k], oid, z)
+                let el = lexdb_sql.elemOid(oid)
+                if el > 0 { jarray(&t, el, b) } else { scalar(&t, oid, b) }
+            }
+        }
+    }
+    append(b, '}')
+}
+
 // A row as one JSON object (without its line end): cols' names, the values' types, the session's zone.
 pub fn object(r: &[]Val, cols: &[]OutCol, z: &lexdb_time.Zone, b: mut &[]byte) {
+    let utc = z.isUtc()
     append(b, '{')
     for k in 0..len(r) {
         if k > 0 { append(b, ',') }
         let nm = if k < len(cols) { cols[k].label() } else { "?column?".toStr() }
         jstr(&nm, b)
         append(b, ':')
-        if lexdb_ops.isNull(&r[k]) {
-            appendStr(b, "null")
-            continue
-        }
         let oid = if k < len(cols) { cols[k].oid } else { lexdb_sql.OID_TEXT }
-        let t = lexdb_ops.textOut(&r[k], oid, z)
-        let el = lexdb_sql.elemOid(oid)
-        if el > 0 { jarray(&t, el, b) } else { scalar(&t, oid, b) }
+        match r[k] {
+            Val.Null { appendStr(b, "null") }
+            Val.Int(n) {
+                if isNumber(oid) || isFloat(oid) { appendInt(b, n) }
+                else {
+                    let t = lexdb_ops.textOut(&r[k], oid, z)
+                    let el = lexdb_sql.elemOid(oid)
+                    if el > 0 { jarray(&t, el, b) } else { scalar(&t, oid, b) }
+                }
+            }
+            Val.Bool(v) {
+                if oid == lexdb_sql.OID_BOOL { appendStr(b, if v { "true" } else { "false" }) }
+                else { jstr(if v { "t" } else { "f" }, b) }
+            }
+            Val.Text(t) {
+                let el = lexdb_sql.elemOid(oid)
+                if el == 0 && (utc || oid != lexdb_sql.OID_TSTZ) && !isNumber(oid) && !isFloat(oid) && oid != lexdb_sql.OID_BOOL {
+                    jstr(&t, b)
+                } else {
+                    let s = lexdb_ops.textOut(&r[k], oid, z)
+                    if el > 0 { jarray(&s, el, b) } else { scalar(&s, oid, b) }
+                }
+            }
+            else {
+                let t = lexdb_ops.textOut(&r[k], oid, z)
+                let el = lexdb_sql.elemOid(oid)
+                if el > 0 { jarray(&t, el, b) } else { scalar(&t, oid, b) }
+            }
+        }
     }
     append(b, '}')
 }

@@ -501,67 +501,42 @@ fn (w: mut &Wire) dataRows(rows: &[][]Val, cols: &[]lexdb_bind.OutCol) {
 }
 
 fn (w: mut &Wire) dataRow(r: &[]Val, cols: &[]lexdb_bind.OutCol, zone: &lexdb_time.Zone) {
-    // Written straight into the output (9.99): a text's bytes need no
-    // string of their own; any other value's text is made once (an
-    // integer's by the runtime's conversion: faster than its digits a byte
-    // at a time, 9.100), kept in w.texts (used again for each row) between
-    // the pass that sizes the message and the one that writes it.
     let utc = zone.isUtc()
-    while len(w.texts) > 0 { let x = pop(mut &w.texts) }
-    var size = 4 + 2
-    for k in 0..len(r) {
+    let nc = len(r)
+    var buf: []byte = withCapacity(64 + 16 * nc)
+    let at0 = bytesGrow(mut &buf, 7)
+    buf[at0] = 'D'
+    buf[at0 + 5] = byte((nc >> 8) & 0xff)
+    buf[at0 + 6] = byte(nc & 0xff)
+    for k in 0..nc {
         let oid = if k < len(cols) { cols[k].oid } else { 0 }
         match r[k] {
-            Val.Null { size += 4 }
-            Val.Int(n) {
-                let x = n.toStr()
-                size += 4 + len(x)
-                append(mut &w.texts, x)
-            }
+            Val.Null { putU32(mut &buf, 0xFFFFFFFF) }
+            Val.Int(n) { putInt(mut &buf, n) }
+            Val.Bool(v) { putBool(mut &buf, v) }
             Val.Text(t) {
-                if plainText(oid, utc) { size += 4 + len(t) } else {
+                if plainText(oid, utc) {
+                    putU32(mut &buf, len(t))
+                    appendStr(mut &buf, &t)
+                } else {
                     let x = lexdb_ops.textOut(&r[k], oid, zone)
-                    size += 4 + len(x)
-                    append(mut &w.texts, x)
+                    putU32(mut &buf, len(x))
+                    appendStr(mut &buf, &x)
                 }
             }
             else {
                 let x = lexdb_ops.textOut(&r[k], oid, zone)
-                size += 4 + len(x)
-                append(mut &w.texts, x)
+                putU32(mut &buf, len(x))
+                appendStr(mut &buf, &x)
             }
         }
     }
-    w.out.addByte('D')
-    binary.addU32BE(mut &w.out, size)
-    binary.addU16BE(mut &w.out, len(r))
-    var j = 0
-    for k in 0..len(r) {
-        let oid = if k < len(cols) { cols[k].oid } else { 0 }
-        match r[k] {
-            Val.Null { binary.addU32BE(mut &w.out, 0xFFFFFFFF) }
-            Val.Int(n) {
-                binary.addU32BE(mut &w.out, len(w.texts[j]))
-                w.out += &w.texts[j]
-                j += 1
-            }
-            Val.Text(t) {
-                if plainText(oid, utc) {
-                    binary.addU32BE(mut &w.out, len(t))
-                    w.out += &t
-                } else {
-                    binary.addU32BE(mut &w.out, len(w.texts[j]))
-                    w.out += &w.texts[j]
-                    j += 1
-                }
-            }
-            else {
-                binary.addU32BE(mut &w.out, len(w.texts[j]))
-                w.out += &w.texts[j]
-                j += 1
-            }
-        }
-    }
+    let size = len(buf) - at0 - 1
+    buf[at0 + 1] = byte((size >> 24) & 0xff)
+    buf[at0 + 2] = byte((size >> 16) & 0xff)
+    buf[at0 + 3] = byte((size >> 8) & 0xff)
+    buf[at0 + 4] = byte(size & 0xff)
+    w.out += strView(mut &buf)
 }
 
 // A batch of rows' DataRows (9.101), written from the batch's columns:
@@ -652,24 +627,33 @@ fn putBool(out: mut &[]byte, v: bool) {
 const PAIRS: str = "00010203040506070809101112131415161718192021222324252627282930313233343536373839404142434445464748495051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899"
 
 // An integer's text, its length first: its digits written from the end,
-// two at a time.
+// two at a time (handles both non-negative and negative values without allocating).
 fn putInt(out: mut &[]byte, n: int) {
-    if n < 0 {
-        let x = n.toStr()
-        putU32(out, len(x))
-        appendStr(out, x)
+    if n == -9223372036854775807 - 1 {
+        let at = bytesGrow(out, 24)
+        out[at + 3] = 20
+        let minS = "-9223372036854775808"
+        for i in 0..20 { out[at + 4 + i] = minS[i] }
         return
+    }
+    var neg = false
+    var v = n
+    if v < 0 {
+        neg = true
+        v = -v
     }
     var nd = 1
     var p = 10
-    while nd < 19 && n >= p {
+    while nd < 19 && v >= p {
         nd += 1
         if nd < 19 { p = p * 10 }
     }
-    let at = bytesGrow(out, 4 + nd)
-    out[at + 3] = byte(nd)
-    var v = n
-    var k = at + 4 + nd - 1
+    let extra = if neg { 1 } else { 0 }
+    let tot = extra + nd
+    let at = bytesGrow(out, 4 + tot)
+    out[at + 3] = byte(tot)
+    if neg { out[at + 4] = '-' }
+    var k = at + 4 + tot - 1
     while v >= 100 {
         let r = (v % 100) * 2
         v = v / 100
