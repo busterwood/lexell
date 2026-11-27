@@ -378,6 +378,24 @@ let adults = count(&people, fn(p: &Person): bool { return p.age >= minAge })
 - Types are inferred for a closure argument once the callee's type arguments
   are known from the arguments before it; otherwise write them.
 
+`box fn(A, B): R` is the type of an **escaping closure**: an owned, first-class
+closure with a heap-allocated environment that can be stored in records, arrays,
+maps and options, and returned from functions.
+
+- A closure expression `fn(params) { ... }` becomes an escaping closure when its
+  expected type is `box fn(...)`; writing `box fn(params) { ... }` makes an
+  escaping closure explicitly without an expected type.
+- Escaping closures cannot capture borrows or borrow-class values. Owned
+  captures are moved into the closure's environment and dropped when the
+  `box fn` is dropped. Copy captures that are only read are copied; a mutable
+  `var` capture that the closure mutates is moved into the environment so
+  subsequent uses outside are rejected.
+- Zero-capture escaping closures and plain function pointers coerced to
+  `box fn(...)` do not allocate on the heap.
+- Calling a `box fn(...)` borrows it (it may be called repeatedly) and freezes
+  it for the duration of the call. A `box fn(...)` or `&box fn(...)` coerces to
+  `&fn(...)` so it can be passed to any function expecting a borrowed closure.
+
 ### 4.7 Copy types and owned types
 
 A type is a **copy type** if it has no `drop` method and it is a primitive
@@ -608,12 +626,28 @@ type Currency = interface { fn code(): str; fn scale(): int }
 ```
 
 An interface is a list of method and associated-function signatures over
-`Self`. In draft 1 interfaces are used only as constraints; there are no
-interface values (section 13). A type **satisfies** an interface when it has,
-for each member, a method or associated function of the same name with the
-same parameter and result types (with `Self` replaced by the type) and the same
-receiver mode. A by-value receiver on a copy type also satisfies `&Self`.
-Satisfaction is structural: there is no `impl` declaration.
+`Self`. A type **satisfies** an interface when it has, for each member, a
+method or associated function of the same name with the same parameter and
+result types (with `Self` replaced by the type) and the same receiver mode. A
+by-value receiver on a copy type also satisfies `&Self`. Satisfaction is
+structural: there is no `impl` declaration.
+
+**Interface values** (`box I`, `&I`, `mut &I`) provide dynamic dispatch for any
+object-safe interface `I` (one whose members all take `&Self` or `mut &Self`
+and do not mention `Self` in their parameter or return types):
+
+- `box I` is an owned, move-only heap-boxed value holding a data pointer and a
+  vtable pointer; dropping it dispatches to the concrete type's destructor on
+  the runtime's iterative drop stack. Any non-borrow value satisfying `I`
+  coerces to `box I`.
+- `&I` and `mut &I` are zero-allocation borrowed fat pointers subject to the
+  ordinary borrow rules (section 10). `&T` / `mut &T` (for `T` satisfying `I`)
+  and `&box I` / `mut &box I` coerce to `&I` / `mut &I`; `mut &I` coerces to
+  `&I`. Calling a `mut &Self` method requires a `mut &I`, `mut &box I`, or
+  mutable `var` `box I`.
+- `box I` and `&I` / `mut &I` satisfy any interface `J` whose methods are a
+  subset of `I`'s (respecting `&Self` vs `mut &Self`), so `box Show` and
+  `&Show` can be passed to generic `T: Show` functions and used in `$"..."`.
 
 `std` defines `Eq` (`eq`), `Ord` (`cmp`), `Hash` (`hash`) and `Show`
 (`toStr`) and implements them for the primitive types.
@@ -1351,9 +1385,6 @@ Each of these is planned and is left out of draft 1 to keep the first
 compiler small. None of them needs a change to the rules above.
 
 - **Handles** (`^T`): generation-checked non-owning pointers.
-- **Escaping closures**: closures that can be stored and returned (with an
-  owned environment). They are to be designed together with interface values.
-- **Interface values** (`box I`, `&I`): dynamic dispatch.
 - **Effects**: per-function summaries of what a call may free, which allow
   owned globals and borrows of them.
 - **Templates** (sql, html): to be a desugaring onto a library protocol.

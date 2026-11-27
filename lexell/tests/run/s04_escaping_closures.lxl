@@ -1,0 +1,136 @@
+// Escaping closures (`box fn(...)` and `box fn(...) { ... }`):
+// returning closures, storing in records/arrays/Option/Map, capturing copy +
+// owned + mutable state, zero-capture & plain fn coercion, passing box fn to
+// &fn parameters, generic escaping closures, drop tracking, deep closure chains.
+// expect: adder 15 42
+// expect: greeter Hello, Alice! Hello, Bob!
+// expect: counter 10 11 12
+// expect: plain fn 20 20
+// expect: explicit box fn 107
+// expect: zero cap 99
+// expect: pipeline 27
+// expect: record field 42
+// expect: as borrowed clo 30 30
+// expect: immediate call 55
+// expect: generic make 100 hi!
+// expect: capture drops 2
+// expect: deep closure chain 2000
+
+type Pipeline = record {
+    name: str
+    step: box fn(int): int
+}
+
+fn makeAdder(n: int): box fn(int): int {
+    return fn(x) { return x + n }
+}
+
+fn makeGreeter(prefix: str): box fn(&str): str {
+    return fn(name) { return $"{prefix}, {name}!" }
+}
+
+fn makeCounter(start: int): box fn(): int {
+    var cur = start
+    return fn() {
+        let v = cur
+        cur += 1
+        return v
+    }
+}
+
+fn doubleIt(x: int): int { return x * 2 }
+
+fn applyBorrowed(x: int, f: &fn(int): int): int {
+    return f(x)
+}
+
+fn makeConst[T: Clone](val: T): box fn(): T {
+    return fn() { return val.clone() }
+}
+
+var dropHits: int = 0
+
+type Watch = record {
+    tag: str
+}
+
+fn (w: mut &Watch) drop() { dropHits += 1 }
+
+fn makeWatcher(tag: str): box fn(): str {
+    let w = Watch{tag: tag}
+    return fn() { return w.tag.clone() }
+}
+
+fn main() {
+    // 1. Returning closure capturing copy int
+    let add5 = makeAdder(5)
+    println($"adder {add5(10)} {add5(37)}")
+
+    // 2. Returning closure capturing owned str (moved into heap env, called multiple times)
+    let hi = makeGreeter("Hello")
+    println($"greeter {hi("Alice")} {hi("Bob")}")
+
+    // 3. Stateful counter closure mutating captured var
+    let cnt = makeCounter(10)
+    let c0 = cnt()
+    let c1 = cnt()
+    let c2 = cnt()
+    println($"counter {c0} {c1} {c2}")
+
+    // 4. Plain fn coerced to box fn (zero allocation)
+    let fPlain: box fn(int): int = doubleIt
+    println($"plain fn {fPlain(10)} {doubleIt(10)}")
+
+    // 5. Explicit `box fn(...) { ... }` expression without type annotation
+    let base = 100
+    let explicit = box fn(x: int): int { return base + x }
+    println($"explicit box fn {explicit(7)}")
+
+    // 6. Zero-capture escaping closure (zero allocation)
+    let zc: box fn(): int = fn() { return 99 }
+    println($"zero cap {zc()}")
+
+    // 7. Array of escaping closures (heterogeneous captures + plain fn)
+    let ops: []box fn(int): int = [
+        fn(x) { return x + 3 },
+        doubleIt,
+        makeAdder(7)
+    ]
+    var v = 7
+    for i in 0..len(ops) {
+        v = ops[i](v)
+    }
+    println($"pipeline {v}")
+
+    // 8. Escaping closure stored in a record field
+    let p = Pipeline{name: "inc", step: makeAdder(2)}
+    println($"record field {p.step(40)}")
+
+    // 9. Coercing box fn and &box fn to borrowed &fn parameter
+    let mul3: box fn(int): int = fn(x) { return x * 3 }
+    println($"as borrowed clo {applyBorrowed(10, mul3)} {applyBorrowed(10, &mul3)}")
+
+    // 10. Immediate call on temporary escaping closure (dropped after statement)
+    println($"immediate call {makeAdder(50)(5)}")
+
+    // 11. Generic function returning escaping closure
+    let g1 = makeConst(100)
+    let g2 = makeConst("hi!")
+    println($"generic make {g1()} {g2()}")
+
+    // 12. Drop of owned captures inside escaping closure
+    {
+        let w1 = makeWatcher("a")
+        let w2 = makeWatcher("b")
+        assert(w1() == "a" && w2() == "b")
+    }
+    println($"capture drops {dropHits}")
+
+    // 13. Deep chain of escaping closures capturing prior escaping closures (tests iterative drop stack)
+    var chain: box fn(int): int = fn(x) { return x }
+    for _ in 0..2000 {
+        let prev = chain
+        chain = fn(x) { return prev(x) + 1 }
+    }
+    println($"deep closure chain {chain(0)}")
+}

@@ -90,6 +90,11 @@ pub const H_DERIVE = 15    // a derived method (eq, hash, toStr; design/consiste
 // (a variant id) with the field initializers args.
 pub const H_TAGIS = 16
 pub const H_VINIT = 17
+pub const H_BOX = 18       // box a concrete value x of type t into interface r (returns D<k>_<I>)
+pub const H_DYNREF = 19    // build &I / mut &I from concrete pointer x of type t into interface r (f=1 if shared &TP)
+pub const H_DYNSPILL = 20  // spill slot init for generic shared &T -> &I: x if isRefByVal(t) else (C(t)){0}
+pub const H_BOXCLO = 21    // build escaping closure box fn(...) from lifted closure f and capture args
+pub const H_BOXFN = 22     // coerce plain fn(...) value x of type t to box fn(...) (zero-alloc)
 
 pub type Hole = value record {
     pub k: int
@@ -109,6 +114,8 @@ pub type Lifted = record {
     pub ptys: []int
     pub lines: []int
     pub line: int
+    pub escaping: bool
+    pub capTys: []int
 }
 
 // A checked function: ref's fd.template and fd.lifted.
@@ -275,6 +282,7 @@ type Ctx = record {
     env: []int      // the type parameters in scope
     mod: int
     closure: bool
+    escaping: bool
     bvar: int       // the borrowed parameter's Var, or -1
     lines: []int
     ind: int
@@ -298,7 +306,7 @@ type Ctx = record {
 }
 
 fn newCtx(f: int, label: &str, ret: int, env: []int, mod: int, closure: bool): Ctx {
-    return Ctx{fd: f, label: label.clone(), ret: ret, env: env, mod: mod, closure: closure, bvar: -1, lines: [], ind: 1,
+    return Ctx{fd: f, label: label.clone(), ret: ret, env: env, mod: mod, closure: closure, escaping: false, bvar: -1, lines: [], ind: 1,
         scopes: [], frames: [], loops: [], pending: [], pmarks: [], fscopes: [], dead: false, nomove: [], n: 0, tailOn: false,
         tail: [], capNames: [], capVars: [], wconds: [], rsrc: [], blks: [], rhsAt: -1}
 }
@@ -329,6 +337,8 @@ const SK_IMETH = 4
 const SK_FNVAL = 5
 const SK_CLO = 6
 const SK_INTR = 7
+const SK_DYN = 8
+const SK_BOXFN = 9
 
 type Sig = record {
     label: str
@@ -532,6 +542,8 @@ pub fn isPod(pg: mut &sema.Program, memo: mut &[]int, t: int): bool {
         r = t != sema.T_STR
     } else if k == sema.TK_FN || k == sema.TK_REF || k == sema.TK_SLICE || k == sema.TK_CLO {
         r = true
+    } else if k == sema.TK_BOX {
+        r = false
     } else if k == sema.TK_INST {
         let d = pg.ta(t)
         if pg.types[d].value && pg.types[d].drop < 0 && d != pg.shared {     // Shared: a counted handle
@@ -1172,9 +1184,14 @@ fn (c: mut &Checker) lookupAt(lvl: int, name: &str, capture: bool): int {
     let o = c.lookupAt(lvl - 1, name, capture)
     if o < 0 || !capture { return o }
     let ncaps = if lvl == len(c.outers) { len(c.cx.capNames) } else { len(c.outers[lvl].capNames) }
-    let ct = c.T(c.vars[o].t)
+    let isEsc = if lvl == len(c.outers) { c.cx.escaping } else { c.outers[lvl].escaping }
     var p = c.vars[o].clone()
-    p.c = c.x.par(c.x.at(ct, c.x.idx(c.nm("ce_"), c.lit(ncaps))))
+    if isEsc {
+        p.c = c.x.arrow(c.nm("ce_"), &("c" + intToStr(ncaps)))
+    } else {
+        let ct = c.T(c.vars[o].t)
+        p.c = c.x.par(c.x.at(ct, c.x.idx(c.nm("ce_"), c.lit(ncaps))))
+    }
     p.cap = o
     p.capmut = false
     append(mut &c.vars, p)
@@ -1947,6 +1964,34 @@ fn (c: mut &Checker) coerce(v0: Val, t: int, line: int, what: &str): Val {
         let h = c.hole(mkHole(H_TRAMP, v.t, ""))
         return rv(c.cloVal(h, v.c), t)
     }
+    if k == sema.TK_CLO && c.pg.isBoxFn(v.t) && c.sameSig(c.pg.ta(v.t), t) {
+        if v.cat == CAT_RV { v = c.holdtmp(v.c, v.t) }
+        let dn = c.fresh("cb")
+        c.emit(c.x.decl(c.T(v.t), &dn, v.c))
+        let dnn = c.nm(&dn)
+        var r = rv(c.cloVal(c.x.arrow(c.x.dot(dnn, "vt"), "call"), c.x.dot(dnn, "data")), t)
+        if v.root >= 0 {
+            append(mut &c.capl, [Cap{v: v.root, m: false}])
+            r.caps = len(c.capl) - 1
+        }
+        return r
+    }
+    if k == sema.TK_CLO && vk == sema.TK_REF && c.pg.isBoxFn(c.pg.ta(v.t)) && c.sameSig(c.pg.ta(c.pg.ta(v.t)), t) {
+        let bft = c.pg.ta(v.t)
+        let dn = c.fresh("cb")
+        c.emit(c.x.decl(c.T(bft), &dn, c.x.par(c.x.pre("*", v.c))))
+        let dnn = c.nm(&dn)
+        var r = rv(c.cloVal(c.x.arrow(c.x.dot(dnn, "vt"), "call"), c.x.dot(dnn, "data")), t)
+        if v.root >= 0 {
+            append(mut &c.capl, [Cap{v: v.root, m: false}])
+            r.caps = len(c.capl) - 1
+        }
+        return r
+    }
+    if c.pg.isBoxFn(t) && vk == sema.TK_FN && c.sameSig(v.t, c.pg.ta(t)) {
+        let h = c.hole(Hole{k: H_BOXFN, t: v.t, f: 0, s: "", x: v.c, r: -1, args: []})
+        return c.holdtmp(h, t)
+    }
     if vk == sema.TK_REF && k != sema.TK_REF {
         let d = c.deref(v.clone())
         if d.t == t { return d }
@@ -1959,6 +2004,8 @@ fn (c: mut &Checker) coerce(v0: Val, t: int, line: int, what: &str): Val {
         r.vvar = v.vvar
         return r
     }
+    if c.pg.isDynRef(t) { return c.coerceDynRef(v, t, line, what) }
+    if c.pg.isBoxIface(t) { return c.coerceBox(v, t, line, what) }
     // a shared borrow of an array of str read as one of views (the same headers, SPEC 4.1): the views
     // are rooted where the array is, and nothing can be written through it
     if vk == sema.TK_REF && k == sema.TK_REF && !c.pg.tm(t) && c.pg.tk(c.pg.ta(v.t)) == sema.TK_ARR &&
@@ -1980,6 +2027,109 @@ fn (c: mut &Checker) coerce(v0: Val, t: int, line: int, what: &str): Val {
         }
     }
     c.err(line, what + " is " + c.tstr(v.t) + ", not " + c.tstr(t))
+}
+
+fn (c: &Checker) isTmplLvalue(x0: int): bool {
+    var x = x0
+    while x >= 0 && c.x.k(x) == tm.X_PAREN { x = c.x.nodes[x].a }
+    if x < 0 { return false }
+    let k = c.x.k(x)
+    return k == tm.X_NAME || k == tm.X_DOT || k == tm.X_ARROW || k == tm.X_INDEX || (k == tm.X_PRE && c.x.nodes[x].s == "*")
+}
+
+// Coerce a borrow (&U, mut &U, &box I, mut &box I, mut &I) to &I or mut &I.
+fn (c: mut &Checker) coerceDynRef(v0: Val, t: int, line: int, what: &str): Val {
+    var v = v0
+    let iface = c.pg.ta(t)
+    let tMut = c.pg.tm(t)
+    if c.pg.tk(v.t) != sema.TK_REF {
+        c.err(line, what + " is " + c.tstr(v.t) + ", not " + c.tstr(t) + ": pass a borrow (" +
+            (if tMut { "mut &" } else { "&" }) + "x)")
+    }
+    let vMut = c.pg.tm(v.t)
+    let inner = c.pg.ta(v.t)
+    if tMut && !vMut {
+        c.err(line, what + " needs a mut borrow (" + c.tstr(t) + "), not " + c.tstr(v.t))
+    }
+    // &box I / mut &box I -> &I / mut &I: deref the D* fat pointer directly (zero allocation).
+    if c.pg.isBoxIface(inner) && c.pg.ta(inner) == iface {
+        var r = val(c.x.par(c.x.pre("*", v.c)), t, CAT_RV)
+        r.root = v.root
+        r.path = v.path.clone()
+        r.vvar = v.vvar
+        return r
+    }
+    // Same interface (already handled for mut &I -> &I above, but keep safe).
+    if inner == iface {
+        var r = val(v.c, t, v.cat)
+        r.root = v.root
+        r.path = v.path.clone()
+        r.vvar = v.vvar
+        return r
+    }
+    let satTy = if c.pg.isIface(inner) { v.t } else { inner }
+    let why = c.pg.satisfies(satTy, iface, c.cx.mod)
+    if len(why) > 0 {
+        c.err(line, what + " (" + c.tstr(inner) + ") does not satisfy " + c.tstr(iface) + ": " + why)
+    }
+    var dataC = v.c
+    var spillRoot = v.root
+    var genericShared = 0
+    if !vMut && c.pg.tk(inner) == sema.TK_TP {
+        // Generic T: may or may not be isRefByVal per instantiation.
+        let sp = c.fresh("dr")
+        let ct = c.T(inner)
+        let init = c.hole(Hole{k: H_DYNSPILL, t: inner, f: 0, s: "", x: v.c, r: -1, args: []})
+        c.emit(c.x.decl(ct, &sp, init))
+        // Pass spill name in s, original pointer in x; emit picks &sp when isRefByVal else x.
+        let dc = c.hole(Hole{k: H_DYNREF, t: inner, f: 1, s: sp, x: v.c, r: iface, args: []})
+        var r = val(dc, t, CAT_RV)
+        r.root = spillRoot
+        r.path = v.path.clone()
+        return r
+    }
+    if (!vMut && c.pg.isRefByVal(inner)) || c.pg.isIface(inner) {
+        if c.isTmplLvalue(v.c) {
+            dataC = c.x.par(c.x.pre("&", v.c))
+        } else {
+            let sp = c.fresh("dr")
+            let ct = if c.pg.isIface(inner) { c.T(v.t) } else { c.T(inner) }
+            c.emit(c.x.decl(ct, &sp, v.c))
+            dataC = c.x.par(c.x.pre("&", c.nm(&sp)))
+        }
+        // A shared &str / &BoxedRec / &I1 parameter is passed by value in C, so taking &param points to
+        // this function's stack frame and cannot escape via return.
+        if v.root >= 0 && c.vars[v.root].kind == VK_PARAM && c.pg.tk(c.vars[v.root].t) == sema.TK_REF &&
+                (!c.pg.tm(c.vars[v.root].t) || c.pg.isIface(inner)) {
+            let sv = c.newVar(&("_dynref_" + c.vars[v.root].name), "_dynref", inner, false, VK_LOCAL, line)
+            spillRoot = sv
+        }
+    }
+    let dynSrcTy = if c.pg.isIface(inner) { v.t } else { inner }
+    let dc = c.hole(Hole{k: H_DYNREF, t: dynSrcTy, f: genericShared, s: "", x: dataC, r: iface, args: []})
+    var r = val(dc, t, CAT_RV)
+    r.root = spillRoot
+    r.path = v.path.clone()
+    return r
+}
+
+// Coerce an owned value of concrete type U to box I (allocating a heap cell and attaching its vtable).
+fn (c: mut &Checker) coerceBox(v0: Val, t: int, line: int, what: &str): Val {
+    var v = v0
+    let iface = c.pg.ta(t)
+    if c.pg.tk(v.t) == sema.TK_REF && !c.pg.isIface(c.pg.ta(v.t)) && c.isCopy(c.pg.ta(v.t)) {
+        v = c.deref(v)
+    }
+    if c.pg.isBorrow(v.t) || c.pg.isBorrowClass(v.t) {
+        c.err(line, "cannot box " + c.tstr(v.t) + " as " + c.tstr(t) + ": it holds borrows")
+    }
+    let why = c.pg.satisfies(v.t, iface, c.cx.mod)
+    if len(why) > 0 {
+        c.err(line, what + " (" + c.tstr(v.t) + ") does not satisfy " + c.tstr(iface) + ": " + why)
+    }
+    let cc = c.consume(v.clone(), line)
+    let bc = c.hole(Hole{k: H_BOX, t: v.t, f: 0, s: "", x: cc, r: iface, args: []})
+    return c.holdtmp(bc, t)
 }
 
 // Elements of type a may be read as elements of type b through a shared borrow: str as &str.
@@ -4605,17 +4755,19 @@ fn (c: mut &Checker) peekType(e: int, exp: int): int {
 
 fn (c: &Checker) hasTpIn(t: int, tps: &[]int): bool { return len(tps) > 0 && c.pg.hasTp(t, tps) }
 
-// fn(params) { ... } (SPEC 4.6): a function lifted out of the enclosing one, with an environment
-// of pointers to the variables it uses (in the enclosing frame: no allocation).
+// fn(params) { ... } (SPEC 4.6) and escaping box fn(params) { ... }.
 fn (c: mut &Checker) xClosure(e: int, exp: int): Val {
     let n = c.node(e)
     let mod = c.cx.mod
     let env = copyInts(&c.cx.env)
     let ctps = copyInts(&c.calleeTps)
-    let want = if c.ek(exp) == sema.TK_CLO { exp } else { -1 }
+    let escaping = (n.flags & sx.BOX != 0) || (exp >= 0 && c.pg.isBoxFn(exp))
+    let want = if escaping {
+        if exp >= 0 && c.pg.isBoxFn(exp) { c.pg.ta(exp) } else { -1 }
+    } else if c.ek(exp) == sema.TK_CLO { exp } else { -1 }
     let np = c.count(n.a)
     if want >= 0 && c.pg.tn(want) != np {
-        c.err(n.line, "the closure takes " + intToStr(np) + " parameters, but " + c.tstr(want) + " is expected")
+        c.err(n.line, "the closure takes " + intToStr(np) + " parameters, but " + c.tstr(exp) + " is expected")
     }
     var pnames: []str = []
     var ptys: []int = []
@@ -4647,7 +4799,9 @@ fn (c: mut &Checker) xClosure(e: int, exp: int): Val {
         c.err(n.line, "a closure cannot return " + c.tstr(ret) + ": it holds borrows")
     }
     for pv in pvars { c.paramContents(pv) }
-    let outer = replace(mut &c.cx, newCtx(-1, "the closure", ret, env, mod, true))
+    var cctx = newCtx(-1, "the closure", ret, env, mod, true)
+    cctx.escaping = escaping
+    let outer = replace(mut &c.cx, cctx)
     append(mut &c.outers, outer)
     append(mut &c.cx.scopes, Scope{vars: pvars, freezes: []})
     c.block(n.c, false, false)
@@ -4660,7 +4814,51 @@ fn (c: mut &Checker) xClosure(e: int, exp: int): Val {
     let k = len(c.lifted)
     var cps: []str = []
     for pn in pnames { append(mut &cps, "p_" + pn) }
-    append(mut &c.lifted, Lifted{k: k, ret: ret, pnames: cps, ptys: copyInts(&ptys), lines: replace(mut &cx.lines, []), line: n.line})
+    if escaping {
+        var capTys: []int = []
+        var capArgs: []int = []
+        for pv in cx.capVars {
+            let cap = c.vars[pv].cap
+            let cm = c.vars[pv].capmut
+            let ct = c.vars[cap].t
+            if c.pg.isBorrow(ct) || c.pg.isBorrowClass(ct) {
+                c.err(n.line, "an escaping closure cannot capture '" + c.vars[cap].name + "' of borrow type " + c.tstr(ct))
+            }
+            if c.vars[cap].moved { c.movedErr(cap, n.line) }
+            if !c.isCopy(ct) {
+                var pv0 = val(c.vars[cap].c, ct, CAT_PLACE)
+                pv0.vvar = cap
+                pv0.root = cap
+                pv0.mutable = c.vars[cap].mutable
+                append(mut &capArgs, c.consume(pv0, n.line))
+            } else {
+                if cm {
+                    c.frozen(cap, FR_MUT, n.line)
+                    if c.vars[cap].cap >= 0 {
+                        c.err(n.line, "cannot move captured variable '" + c.vars[cap].name + "' into an escaping closure")
+                    }
+                    if c.vars[cap].loops < len(c.cx.loops) {
+                        c.err(n.line, "cannot move '" + c.vars[cap].name + "' into an escaping closure inside a loop")
+                    }
+                    c.vars[cap].moved = true
+                    c.vars[cap].mline = n.line
+                    c.vars[cap].mctx = "moved into an escaping closure"
+                } else {
+                    c.frozen(cap, FR_READ, n.line)
+                }
+                append(mut &capArgs, c.dup(c.vars[cap].c, ct))
+            }
+            append(mut &capTys, ct)
+        }
+        append(mut &c.lifted, Lifted{k: k, ret: ret, pnames: cps, ptys: copyInts(&ptys), lines: replace(mut &cx.lines, []),
+            line: n.line, escaping: true, capTys: capTys})
+        let fnTy = c.pg.mkFn(&ptys, ret)
+        let boxTy = c.pg.mkBox(fnTy)
+        let h = c.hole(Hole{k: H_BOXCLO, t: fnTy, f: k, s: "", x: -1, r: -1, args: capArgs})
+        return c.holdtmp(h, boxTy)
+    }
+    append(mut &c.lifted, Lifted{k: k, ret: ret, pnames: cps, ptys: copyInts(&ptys), lines: replace(mut &cx.lines, []),
+        line: n.line, escaping: false, capTys: []})
     var caps: []Cap = []
     for pv in cx.capVars {     // check the captures against the enclosing borrows
         let cap = c.vars[pv].cap
@@ -5017,6 +5215,9 @@ fn (c: mut &Checker) ifBranch(x: int, want: int, snap: &[]int, r: int, bm: bool)
             c.err(c.line(x), "an if expression cannot give a borrow, a slice or a closure")
         }
         v = c.rd(v.clone())
+        if !v.noreturn && want >= 0 && c.pg.tk(want) == sema.TK_BOX && v.t != want {
+            v = c.coerce(v, want, c.line(x), "this branch")
+        }
         if !v.noreturn && c.pg.isBorrowClass(v.t) { bcr = c.branchRoot(v.clone(), len(c.cx.scopes), c.line(x), "an if branch") }
     }
     let fr = c.popFrame()
@@ -5151,6 +5352,9 @@ fn (c: mut &Checker) mxBody(x: int) {
             c.err(c.line(x), "a match expression cannot give a borrow, a slice or a closure")
         }
         v = c.rd(v.clone())
+        if !v.noreturn && want >= 0 && c.pg.tk(want) == sema.TK_BOX && v.t != want {
+            v = c.coerce(v, want, c.line(x), "this arm")
+        }
         if !v.noreturn && c.pg.isBorrowClass(v.t) {
             c.mxs[top].cr = c.joinRoots(c.mxs[top].cr, c.branchRoot(v.clone(), c.mxs[top].d, c.line(x), "a match arm"))
         }
@@ -5571,6 +5775,13 @@ fn (c: mut &Checker) xArrlit(e: int, exp: int): Val {
             v = c.borrow(v, false, c.line(it), true)
         }
         if et == -1 { et = c.elemType(v.t, c.line(it)) }
+        if et >= 0 && v.t != et && (c.pg.tk(et) == sema.TK_BOX || c.pg.isDynRef(et)) {
+            if c.pg.isDynRef(et) && !c.pg.tm(et) && c.pg.tk(v.t) != sema.TK_REF {
+                if v.cat == CAT_RV && !c.isCopy(v.t) { v = c.holdtmp(v.c, v.t) }
+                v = c.borrow(v, false, c.line(it), true)
+            }
+            v = c.coerce(v, et, c.line(it), "array element")
+        }
         if v.t != et { c.err(c.line(it), "array element is " + c.tstr(v.t) + ", not " + c.tstr(et)) }
         var later: []int = []
         for j in i + 1..len(items) { append(mut &later, items[j]) }
@@ -5680,6 +5891,27 @@ fn (c: &Checker) visible(f: int, line: int) {
 }
 
 fn (c: mut &Checker) methodSig(t: int, name: &str, line: int, quiet: bool): Sig {
+    if c.pg.isBoxIface(t) || c.pg.isIface(t) {
+        let iface = if c.pg.isBoxIface(t) { c.pg.ta(t) } else { t }
+        let idx = c.pg.ifaceMemberIdx(iface, name)
+        if idx < 0 {
+            if quiet { return noSig() }
+            c.err(line, c.tstr(t) + " has no method '" + name + "'")
+        }
+        let d = c.pg.ta(iface)
+        let mb = c.pg.types[d].members[idx].clone()
+        let env = c.pg.declEnv(iface)
+        let rp = c.pg.mkRef(t, mb.mode == sx.M_MUT)
+        var ps: []int = [rp]
+        for p in mb.params { append(mut &ps, c.pg.subst(p, &env)) }
+        let ret = c.pg.subst(mb.ret, &env)
+        var s = newSig(&(c.tstr(t) + "." + name), SK_DYN, ps, ret)
+        s.recv = mb.mode
+        s.tpt = iface
+        s.fd = idx
+        s.name = name.clone()
+        return s
+    }
     let isTp = c.pg.tk(t) == sema.TK_TP
     if name == "drop" && isTp && len(c.pg.ifaceMembers(t, name)) > 0 { c.err(line, "a drop method cannot be called directly") }
     if isTp {
@@ -5901,7 +6133,7 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
             v = args[if hasRecv { i - 1 } else { i }].v.clone()
         } else if c.kind(an) == sx.N_CLOSURE {
             let save = replace(mut &c.calleeTps, copyInts(&tps))
-            v = c.expr(an, if ptk == sema.TK_CLO { pe } else { -1 })
+            v = c.expr(an, if ptk == sema.TK_CLO || c.pg.isBoxFn(pe) { pe } else { -1 })
             c.calleeTps = save
         } else {
             var e2 = pe
@@ -5955,10 +6187,16 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
                 c.strAsView(c.pg.ta(c.pg.ta(v.t)), c.pg.ta(c.pg.ta(pt))) {
                 v.t = c.pg.mkRef(c.pg.ta(pt), false)
             }
+            var dynSpilled = false
+            let spe = c.pg.subst(pt, &bind)
+            if c.pg.isDynRef(spe) && v.t != spe {
+                v = c.coerceDynRef(v, spe, line, &what)
+                dynSpilled = true
+            }
             if !c.pg.unify(c.pg.ta(pt), c.pg.ta(v.t), mut &bind, &tps) {
                 c.err(line, what + " is " + c.tstr(c.pg.subst(pt, &bind)) + ", not " + c.tstr(v.t))
             }
-            if c.late(if isrecv { o.rast } else { an }) {
+            if !dynSpilled && c.late(if isrecv { o.rast } else { an }) {
                 append(mut &lates, Late{v: v.clone(), m: pm})
                 if c.checks(v.c) { append(mut &rechecks, Recheck{pos: pos, v: v.clone()}) }
             } else {
@@ -5969,6 +6207,14 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
             if c.pg.tk(v.t) == sema.TK_FN {
                 let ps = c.pg.targs(v.t)
                 v = c.coerce(v, c.pg.mkClo(&ps, c.pg.tb(v.t)), line, "value")
+            } else if c.pg.isBoxFn(v.t) {
+                let ft = c.pg.ta(v.t)
+                let ps = c.pg.targs(ft)
+                v = c.coerce(v, c.pg.mkClo(&ps, c.pg.tb(ft)), line, "value")
+            } else if c.pg.tk(v.t) == sema.TK_REF && c.pg.isBoxFn(c.pg.ta(v.t)) {
+                let ft = c.pg.ta(c.pg.ta(v.t))
+                let ps = c.pg.targs(ft)
+                v = c.coerce(v, c.pg.mkClo(&ps, c.pg.tb(ft)), line, "value")
             }
             if c.pg.tk(v.t) != sema.TK_CLO || !c.pg.unify(pt, v.t, mut &bind, &tps) {
                 c.err(line, what + " is " + c.tstr(pe) + ", not " + c.tstr(v.t))
@@ -6003,6 +6249,10 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
                 if c.pg.unify(pt, rv2.t, mut &trial2, &tps) { v = rv2.clone() }
             }
             if v.t == sema.T_VOID { c.err(line, what + " has no value") }
+            let boxTarget = c.pg.subst(pt, &bind)
+            if c.pg.tk(boxTarget) == sema.TK_BOX && !c.hasTpIn(boxTarget, &tps) && v.t != boxTarget {
+                v = c.coerce(v, boxTarget, line, &what)
+            }
             if !c.pg.unify(pt, v.t, mut &bind, &tps) {
                 c.err(line, what + " is " + c.tstr(c.pg.subst(pt, &bind)) + ", not " + c.tstr(v.t))
             }
@@ -6136,6 +6386,24 @@ fn (c: mut &Checker) call(sig: &Sig, hasRecv: bool, recv: Val, args: &[]Arg, lin
         var all: []int = [c.x.dot(c.x.par(sig.c), "env")]
         for x in cs { append(mut &all, x) }
         text = c.x.callx(c.x.pcast(ft, c.x.dot(c.x.par(sig.c), "fn")), all)
+    } else if sig.kind == SK_DYN {
+        let dn = c.fresh("dv")
+        let dty = c.T(c.pg.mkBox(sig.tpt))
+        let dvInit = if c.pg.isBoxIface(c.pg.ta(params[0])) { c.x.par(c.x.pre("*", cs[0])) } else { cs[0] }
+        c.emit(c.x.decl(dty, &dn, dvInit))
+        let dnn = c.nm(&dn)
+        var all: []int = [c.x.dot(dnn, "data")]
+        for k in 1..len(cs) { append(mut &all, cs[k]) }
+        let fnPtr = c.x.arrow(c.x.dot(dnn, "vt"), &("m_" + intToStr(sig.fd)))
+        text = c.x.callx(fnPtr, all)
+    } else if sig.kind == SK_BOXFN {
+        let dn = c.fresh("fv")
+        let dty = c.T(c.pg.mkBox(sig.tpt))
+        c.emit(c.x.decl(dty, &dn, c.x.par(c.x.pre("*", cs[0]))))
+        let dnn = c.nm(&dn)
+        var all: []int = [c.x.dot(dnn, "data")]
+        for k in 1..len(cs) { append(mut &all, cs[k]) }
+        text = c.x.callx(c.x.arrow(c.x.dot(dnn, "vt"), "call"), all)
     } else if sig.kind == SK_INTR {
         if sig.loc { append(mut &cs, c.W(line)) }
         text = c.x.callx(sig.c, cs)
@@ -6489,7 +6757,7 @@ fn (c: mut &Checker) xCall(e: int, exp: int): Val {
                 recv2 = c.rcValue(recv2)
                 base2 = recv2.t
             }
-            let sig = c.methodSig(base2, &fn1.s, n.line, c.pg.tk(base2) == sema.TK_INST)
+            let sig = c.methodSig(base2, &fn1.s, n.line, c.pg.tk(base2) == sema.TK_INST && !c.pg.isIface(base2))
             if sig.kind < 0 {
                 let fv = c.fieldOf(recv2, &fn1.s, n.line)
                 return c.callValue(fv, e, exp)
@@ -6711,6 +6979,19 @@ fn (c: mut &Checker) typeish(x: int): bool {
 }
 
 fn (c: mut &Checker) callValue(fv0: Val, e: int, exp: int): Val {
+    let baseT = if c.pg.tk(fv0.t) == sema.TK_REF { c.pg.ta(fv0.t) } else { fv0.t }
+    if c.pg.isBoxFn(baseT) {
+        let fnTy = c.pg.ta(baseT)
+        var ps: []int = [c.pg.mkRef(baseT, false)]
+        for p in c.pg.targs(fnTy) { append(mut &ps, p) }
+        var sig = newSig("escaping closure", SK_BOXFN, ps, c.pg.tb(fnTy))
+        sig.recv = sema.RM_REF
+        sig.tpt = fnTy
+        let args = c.callArgs(e)
+        var o = noOpts()
+        o.rast = c.nd(e).a
+        return c.call(&sig, true, fv0, &args, c.line(e), exp, &o)
+    }
     var fv = c.rd(fv0)
     let k = c.pg.tk(fv.t)
     if k != sema.TK_FN && k != sema.TK_CLO { c.err(c.line(e), "cannot call a " + c.tstr(fv.t)) }
