@@ -9900,6 +9900,7 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
             if pc.ver != ver {
                 pc.sels = []
                 pc.looks = []
+                pc.fastSel = []
                 pc.ver = ver
             }
             if len(txn.sql.path) == 0 && len(txn.tmp) == 0 && txn.sql.zone.isUtc() {
@@ -9910,6 +9911,21 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
                 pc.fastNoting = txn.noting()
             } else {
                 pc.fastGen = -1
+            }
+        }
+        if fastHit && len(pc.fastSel) > 0 && !txn.live && len(txn.tmp) == 0 {
+            let fs = &pc.fastSel[0]
+            if fs.pkParam >= 0 && fs.pkParam < len(params) {
+                match dmlPkKey(&fs.t, &params[fs.pkParam]) {
+                    Some(key) {
+                        let rel = lexdb_catalog.relOf(&fs.t)
+                        match try lexdb_access.getRow(st, txn, &rel, &fs.rr, &key) {
+                            Some(row) { return emitFastSelRow(fs, row, sink) }
+                            None { return emitFastSelEmpty(fs, sink) }
+                        }
+                    }
+                    None {}
+                }
             }
         }
         for i in 0..len(pc.sels) {
@@ -9929,6 +9945,12 @@ fn select(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, s: &lexdb_sql.Stmt,
     pipeSel(mut &sel)
     let looks = replace(mut &sc.looks, [])
     if !pc.keep || len(pc.sels) >= PLAN_VARIANTS { return runSelTo(st, txn, &sel, params, lim, sink) }
+    if len(pc.sels) == 0 && len(looks) == 0 {
+        match tryBuildFastSel(s, &sel) {
+            Some(fs) { pc.fastSel = [fs] }
+            None {}
+        }
+    }
     append(mut &pc.sels, sel)
     append(mut &pc.looks, looks)
     pc.plans += 1
@@ -11170,10 +11192,19 @@ type DmlPlan = record {
     lmode: int
 }
 
+type FastSelPlan = record {
+    t: rc Table
+    rr: lexdb_access.RowRead
+    pkParam: int
+    outIdx: []int
+    cols: []OutCol
+}
+
 pub type PlanCache = record {
     sels: []Sel
     looks: [][]Look
     dml: []DmlPlan
+    fastSel: []FastSelPlan
     ver: str
     keep: bool
     pub plans: int
@@ -11185,11 +11216,77 @@ pub type PlanCache = record {
 }
 
 pub fn newPlanCache(): PlanCache {
-    return PlanCache{sels: [], looks: [], dml: [], ver: "", keep: true, plans: 0, fastGen: -1, fastRole: -1, fastRules: false, fastMem: 0, fastNoting: false}
+    return PlanCache{sels: [], looks: [], dml: [], fastSel: [], ver: "", keep: true, plans: 0, fastGen: -1, fastRole: -1, fastRules: false, fastMem: 0, fastNoting: false}
 }
 
 pub fn oneShot(): PlanCache {
-    return PlanCache{sels: [], looks: [], dml: [], ver: "", keep: false, plans: 0, fastGen: -1, fastRole: -1, fastRules: false, fastMem: 0, fastNoting: false}
+    return PlanCache{sels: [], looks: [], dml: [], fastSel: [], ver: "", keep: false, plans: 0, fastGen: -1, fastRole: -1, fastRules: false, fastMem: 0, fastNoting: false}
+}
+
+fn tryBuildFastSel(s: &lexdb_sql.Stmt, sel: &Sel): Option[FastSelPlan] {
+    if sel.setop != 0 || sel.distinct || sel.aggQ || len(sel.groupBy) > 0 || len(sel.order) > 0 ||
+       sel.limit >= 0 || sel.offset > 0 || sel.having.isSome() || len(sel.wins) > 0 ||
+       len(sel.locks) > 0 || len(sel.gsets) > 0 || len(sel.srf) > 0 || sel.topMode != 0 ||
+       len(sel.mr) > 0 || len(sel.forJson) > 0 || sel.rec >= 0 || sel.first >= 0 || sel.donKey > 0 {
+        return None
+    }
+    if len(sel.q.levels) != 1 || len(sel.q.subs) > 0 || len(sel.q.refs) > 0 { return None }
+    let lv = &sel.q.levels[0]
+    if lv.src >= 0 || lv.work >= 0 || lv.lateral || lv.gen || lv.lock != 0 ||
+       len(lv.t.view) > 0 || lexdb_catalog.tempRel(&lv.t.name) || lv.t.tree < 0 ||
+       len(lv.cond) > 0 || len(lv.post) > 0 || len(lv.local) > 0 ||
+       lv.path.index >= 0 || len(lv.path.eqs) != 1 || len(lv.path.rng) > 0 ||
+       len(lv.path.ins) > 0 || lv.path.inSub >= 0 || len(lv.path.inArr) > 0 {
+        return None
+    }
+    let pkp = match dmlPkEq(&s.where, &lv.t) {
+        Some(p) { p }
+        None { return None }
+    }
+    if len(sel.outs) == 0 || len(sel.outs) != len(sel.exprs) { return None }
+    var need: []bool = array(len(lv.t.cols), false)
+    var outIdx: []int = withCapacity(len(sel.exprs))
+    for i in 0..len(sel.exprs) {
+        match &sel.exprs[i] {
+            Expr.Col(n, sl) {
+                let ci = lexdb_bind.colSlot(&sel.q.cols, n, sl)
+                if ci < 0 || ci >= len(lv.t.cols) { return None }
+                need[ci] = true
+                append(mut &outIdx, ci)
+            }
+            else { return None }
+        }
+    }
+    let rel = lexdb_catalog.relOf(&lv.t)
+    let rr = lexdb_access.rowRead(&rel, &need)
+    var cols: []OutCol = withCapacity(len(sel.outs))
+    for c in sel.outs { append(mut &cols, c.clone()) }
+    return Some(FastSelPlan{t: lv.t.share(), rr: rr, pkParam: pkp, outIdx: outIdx, cols: cols})
+}
+
+fn emitFastSelRow(fs: &FastSelPlan, rawRow: []Val, sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
+    let noRow: []Val = []
+    let noB = noBatch()
+    var proj: []Val = withCapacity(len(fs.outIdx))
+    for ci in fs.outIdx { append(mut &proj, rawRow[ci].clone()) }
+    if sink(&fs.cols, &noRow, &noB, true) {
+        if !sink(&fs.cols, &proj, &noB, false) { return Err(e("08006", "client disconnected")) }
+        return Ok(Res{cols: [], rows: [], tag: "SELECT 1", hasRows: false, copy: COPY_NONE})
+    }
+    var cols: []OutCol = withCapacity(len(fs.cols))
+    for c in fs.cols { append(mut &cols, c.clone()) }
+    return Ok(Res{cols: cols, rows: [proj], tag: "SELECT 1", hasRows: true, copy: COPY_NONE})
+}
+
+fn emitFastSelEmpty(fs: &FastSelPlan, sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
+    let noRow: []Val = []
+    let noB = noBatch()
+    if sink(&fs.cols, &noRow, &noB, true) {
+        return Ok(Res{cols: [], rows: [], tag: "SELECT 0", hasRows: false, copy: COPY_NONE})
+    }
+    var cols: []OutCol = withCapacity(len(fs.cols))
+    for c in fs.cols { append(mut &cols, c.clone()) }
+    return Ok(Res{cols: cols, rows: [], tag: "SELECT 0", hasRows: true, copy: COPY_NONE})
 }
 
 fn checkDmlCache(st: &lexdb_store.Store, txn: mut &lexdb_store.Txn, pc: mut &PlanCache): Result[Unit, DbErr] {
@@ -13959,6 +14056,8 @@ pub fn (s: mut &Session) startupIsolation(v: &str): Result[Unit, DbErr] {
 // The session's time zone (SET TimeZone, 9.95).
 pub fn (s: &Session) zone(): lexdb_time.Zone { return s.zone.clone() }
 
+pub fn (s: &Session) zoneName(): &str { return &s.zone.name }
+
 // The text a client sees for a value of a column of type oid, in the
 // session's zone (textOut).
 pub fn (s: &Session) text(v: &Val, oid: int): str { return lexdb_ops.textOut(v, oid, &s.zone) }
@@ -14431,6 +14530,8 @@ pub fn (s: mut &Session) close() {
 // them before the statement's end; a statement run again drops its first
 // try's.
 
+var NOTICE_ACTIVE: int = 0
+
 fn noticeKey(sess: int): str { return "nt:" + sess.toStr() }
 
 // A notice for the session running txn: SQLSTATE state (00000, or the
@@ -14438,7 +14539,11 @@ fn noticeKey(sess: int): str { return "nt:" + sess.toStr() }
 // msg, and a DETAIL ("" none).
 fn notice(st: &lexdb_store.Store, txn: &lexdb_store.Txn, state: &str, msg: &str, detail: &str) {
     let k = noticeKey(txn.sql.sess)
-    let was = st.memo.get(&k).unwrapOr("")
+    var was = ""
+    match st.memo.get(&k) {
+        Some(v) { was = v }
+        None { NOTICE_ACTIVE += 1 }
+    }
     st.memo.put(&k, &(was + state + "\x01" + msg + "\x01" + detail + "\x00"))
 }
 
@@ -14446,9 +14551,11 @@ fn notice(st: &lexdb_store.Store, txn: &lexdb_store.Txn, state: &str, msg: &str,
 // message and detail).
 pub fn (s: &Session) takeNotices(): []DbErr {
     var out: []DbErr = []
+    if NOTICE_ACTIVE == 0 { return out }
     match s.st.memo.get(&noticeKey(s.id)) {
         Some(v) {
             s.st.memo.del(&noticeKey(s.id))
+            if NOTICE_ACTIVE > 0 { NOTICE_ACTIVE -= 1 }
             for one in strings.split(&v, "\x00") {
                 let f = strings.split(&one, "\x01")
                 if len(f) == 3 { append(mut &out, lexdb_base.errDetail(&(f[0].toStr()), &(f[1].toStr()), &(f[2].toStr()), "")) }
@@ -15081,6 +15188,34 @@ fn (s: mut &Session) blockEnd(stmt: &lexdb_sql.Stmt, r0: Result[Res, DbErr]): Re
 fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]int, pc: mut &PlanCache,
                              input: &CopyInput, out: &fn(int, &[]byte): bool, pull: &fn(): CopyPart,
                              sink: &fn(&[]OutCol, &[]Val, &OutBatch, bool): bool): Result[Res, DbErr] {
+    // Ultra-fast single-shot autocommit PK SELECT (1 lock turn total; zero snapshot/memo/mview/stats overhead)
+    if len(s.txn) == 0 && len(pc.fastSel) > 0 && stmt.kind == lexdb_sql.S_SELECT && stmt.lockMode == 0 &&
+       len(stmt.wctes) == 0 && !stmt.waitFor && len(stmt.seqNames) == 0 && !stmt.udf &&
+       pc.fastGen > 0 && len(s.path) == 0 && len(s.tmp) == 0 && s.zone.isUtc() &&
+       s.rules == pc.fastRules && s.maxMem == pc.fastMem && s.st.memo.roleGen() == pc.fastRole {
+        let fs = &pc.fastSel[0]
+        if fs.pkParam >= 0 && fs.pkParam < len(params) {
+            match dmlPkKey(&fs.t, &params[fs.pkParam]) {
+                Some(key) {
+                    var catOk = false
+                    var needSlow = false
+                    let got = try s.st.pointRead(fs.t.tree, &key, pc.fastGen, mut &catOk, mut &needSlow)
+                    if catOk && !needSlow {
+                        s.fresh = false
+                        match got {
+                            Some(raw) {
+                                let rel = lexdb_catalog.relOf(&fs.t)
+                                let row = try lexdb_access.decodeRowInline(&rel, &fs.rr, &raw)
+                                return emitFastSelRow(fs, row, sink)
+                            }
+                            None { return emitFastSelEmpty(fs, sink) }
+                        }
+                    }
+                }
+                None {}
+            }
+        }
+    }
     // a block's first statement may be a WAITFOR: any other but a
     // savepoint's (and BEGIN's, which does nothing in a block) ends that
     if !stmt.waitFor && stmt.kind != lexdb_sql.S_SAVEPOINT && stmt.kind != lexdb_sql.S_RELEASE &&
@@ -15479,7 +15614,7 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
     }
     if stmt.waitFor { return s.waitForRun(stmt, params, ptypes, pc) }
     var tries = 0
-    let noticesWere = s.st.memo.get(&noticeKey(s.id)).unwrapOr("")
+    let noticesWere = if NOTICE_ACTIVE > 0 { s.st.memo.get(&noticeKey(s.id)).unwrapOr("") } else { "" }
     let lim = s.limits()                    // retries share the statement's time
     while true {
         // A SELECT runs on a snapshot: it sees one state and never conflicts.
@@ -15499,7 +15634,9 @@ fn (s: mut &Session) runStmt(stmt: &lexdb_sql.Stmt, params: &[]Val, ptypes: &[]i
         lexdb_mview.clearTxn(s.id)
         lexdb_stats.chgEnd(&s.st, s.id, false)          // (a try before that failed: its counts go, optimizer 44)
         // (and its notices: those of the statements before kept)
-        if len(noticesWere) > 0 { s.st.memo.put(&noticeKey(s.id), &noticesWere) } else { s.st.memo.del(&noticeKey(s.id)) }
+        if NOTICE_ACTIVE > 0 {
+            if len(noticesWere) > 0 { s.st.memo.put(&noticeKey(s.id), &noticesWere) } else { s.st.memo.del(&noticeKey(s.id)) }
+        }
         var sent = false
         let ran = execIn(&s.st, mut &t, stmt, params, ptypes, lim, pc, input, out, pull, fn(c: &[]OutCol, r: &[]Val, ob: &OutBatch, start: bool): bool {
             let ok = sink(c, r, ob, start)
@@ -17351,6 +17488,8 @@ fn boundSeq(q: &SeqEnv, name: &str, f: &str): Result[Seq, DbErr] {
 // the store's lock goes with the last. A transaction's are released at its
 // end (Session.advEnd), all of them at the session's.
 
+var ADV_ACTIVE: int = 0
+
 fn advMemo(sess: int): str { return "\x00adv\x00" + sess.toStr() }
 
 fn advCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
@@ -17405,6 +17544,7 @@ fn advCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
             if got == lexdb_locks.LOCK_SKIPPED { return Ok(Val.Bool(false)) }
             append(mut &lines, line)
             q.st.memo.put(&advMemo(q.sess), &strings.join(&lines, "\n"))
+            ADV_ACTIVE += 1
             return Ok(if tryIt { Val.Bool(true) } else { Val.Text("") })
         }
     }
@@ -17412,6 +17552,7 @@ fn advCall(name: &str, vs: &[]Val, env: &Env): Result[Val, DbErr] {
 
 // Releases a session's transaction-level advisory locks (all: every one).
 fn advRelease(st: &lexdb_store.Store, sess: int, all: bool) {
+    if ADV_ACTIVE == 0 { return }
     let m = st.memo.get(&advMemo(sess)).unwrapOr("")
     if len(m) == 0 { return }
     var keep: []str = []

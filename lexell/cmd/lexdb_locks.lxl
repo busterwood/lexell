@@ -15,15 +15,23 @@ pub fn (l: &Locks) share(): Locks { return Locks{sh: l.sh.share()} }
 
 type LockWait = record { key: str; id: int; p: task.Promise[Unit] }
 
+// Typed holder entry: single-owner fast path (zero slice allocs) + rare shared multi-owner overflow.
+type LockEntry = record {
+    id0: int
+    mode0: int
+    extraIds: []int
+    extraModes: []int
+}
+
 type LockState = record {
-    held: Map[str, str]        // lock key -> "id mode;id mode"
-    waits: []LockWait
+    held: Map[str, LockEntry]
+    waitByKey: Map[str, []LockWait]
     waitFor: Map[int, str]     // owner -> the key it waits for
     next: int
 }
 
 pub fn newLocks(): Locks {
-    return Locks{sh: task.shared(LockState{held: newMap(), waits: [], waitFor: newMap(), next: 0})}
+    return Locks{sh: task.shared(LockState{held: collections.newMapWith(collections.fxHashStr), waitByKey: collections.newMapWith(collections.fxHashStr), waitFor: newMap(), next: 0})}
 }
 
 // A new owner id (a transaction's first lock).
@@ -53,25 +61,48 @@ pub fn (l: &Locks) lockAs(me: int, lk: &str, mode: int, wait: int, keep: bool, a
         var bad: []lexdb_base.DbErr = []
         var fut: []task.Future[Unit] = []
         l.sh.with(fn(s: mut &LockState) {
-            let gone = s.waitFor.remove(&me)
-            var ids: []int = []
-            var modes: []int = []
-            holdersOf(&s.held.get(&lk).unwrapOr(""), mut &ids, mut &modes)
+            if s.waitFor.size() > 0 { let gone = s.waitFor.remove(&me) }
+            if !s.held.has(lk) {
+                if keep {
+                    s.held.put(lk.toStr(), LockEntry{id0: me, mode0: mode, extraIds: [], extraModes: []})
+                    added = true
+                }
+                out = if waited { LOCKED_AFTER_WAIT } else { LOCKED }
+                return
+            }
+            let e = s.held.atMut(lk)
+            // Fast path: single holder is already me
+            if len(e.extraIds) == 0 && e.id0 == me {
+                if keep && e.mode0 < mode { e.mode0 = mode }
+                out = if waited { LOCKED_AFTER_WAIT } else { LOCKED }
+                return
+            }
             var others: []int = []
             var mine = -1
-            for i in 0..len(ids) {
-                if ids[i] == me { mine = i } else if lockConflict(mode, modes[i]) { append(mut &others, ids[i]) }
+            if e.id0 == me {
+                mine = 0
+            } else if lockConflict(mode, e.mode0) {
+                append(mut &others, e.id0)
+            }
+            for i in 0..len(e.extraIds) {
+                let hi = e.extraIds[i]
+                if hi == me {
+                    mine = i + 1
+                } else if lockConflict(mode, e.extraModes[i]) {
+                    append(mut &others, hi)
+                }
             }
             if len(others) == 0 {
                 if keep {
                     if mine < 0 {
-                        append(mut &ids, me)
-                        append(mut &modes, mode)
+                        append(mut &e.extraIds, me)
+                        append(mut &e.extraModes, mode)
                         added = true
-                    } else if modes[mine] < mode {
-                        modes[mine] = mode
+                    } else if mine == 0 {
+                        if e.mode0 < mode { e.mode0 = mode }
+                    } else {
+                        if e.extraModes[mine - 1] < mode { e.extraModes[mine - 1] = mode }
                     }
-                    s.held.put(lk.toStr(), holdersText(&ids, &modes))
                 }
                 out = if waited { LOCKED_AFTER_WAIT } else { LOCKED }
                 return
@@ -89,7 +120,12 @@ pub fn (l: &Locks) lockAs(me: int, lk: &str, mode: int, wait: int, keep: bool, a
                 return
             }
             let task.Handoff{promise: p, future: f} = task.promise[Unit]()
-            append(mut &s.waits, LockWait{key: lk.toStr(), id: me, p: p})
+            let lw = LockWait{key: lk.toStr(), id: me, p: p}
+            if s.waitByKey.has(lk) {
+                append(mut &s.waitByKey.atMut(lk), lw)
+            } else {
+                s.waitByKey.put(lk.toStr(), [lw])
+            }
             s.waitFor.put(me, lk.toStr())
             append(mut &fut, f)
         })
@@ -110,33 +146,46 @@ pub fn (l: &Locks) release(id: int, held: &[]str) {
     if id == 0 { return }
     var wake: []task.Promise[Unit] = []
     l.sh.with(fn(s: mut &LockState) {
-        let w = s.waitFor.remove(&id)
+        if s.waitFor.size() > 0 { let w = s.waitFor.remove(&id) }
         for lk in held {
-            var ids: []int = []
-            var modes: []int = []
-            holdersOf(&s.held.get(&lk).unwrapOr(""), mut &ids, mut &modes)
-            var ki: []int = []
-            var km: []int = []
-            for i in 0..len(ids) {
-                if ids[i] != id {
-                    append(mut &ki, ids[i])
-                    append(mut &km, modes[i])
+            if !s.held.has(&lk) { continue }
+            var dropAll = false
+            {
+                let e = s.held.atMut(&lk)
+                if len(e.extraIds) == 0 {
+                    if e.id0 == id { dropAll = true }
+                } else {
+                    var wi = 0
+                    for i in 0..len(e.extraIds) {
+                        if e.extraIds[i] != id {
+                            e.extraIds[wi] = e.extraIds[i]
+                            e.extraModes[wi] = e.extraModes[i]
+                            wi += 1
+                        }
+                    }
+                    while len(e.extraIds) > wi {
+                        let d1 = pop(mut &e.extraIds)
+                        let d2 = pop(mut &e.extraModes)
+                    }
+                    if e.id0 == id {
+                        if len(e.extraIds) == 0 {
+                            dropAll = true
+                        } else {
+                            e.id0 = pop(mut &e.extraIds)
+                            e.mode0 = pop(mut &e.extraModes)
+                        }
+                    }
                 }
             }
-            if len(ki) == 0 { let r = s.held.remove(&lk) } else { s.held.put(lk.toStr(), holdersText(&ki, &km)) }
+            if dropAll { let r = s.held.remove(&lk) }
+            if s.waitByKey.size() > 0 && s.waitByKey.has(&lk) {
+                var ws = s.waitByKey.remove(&lk).unwrap()
+                while len(ws) > 0 {
+                    let LockWait{key: _, id: _, p: p} = pop(mut &ws)
+                    append(mut &wake, p)
+                }
+            }
         }
-        if len(held) == 0 { return }
-        var keep: []LockWait = []
-        while len(s.waits) > 0 {
-            let lw = pop(mut &s.waits)
-            var mine = false
-            for lk in held { if lk == lw.key { mine = true } }
-            if mine {
-                let LockWait{key: _, id: _, p: p} = move(lw)
-                append(mut &wake, p)
-            } else { append(mut &keep, lw) }
-        }
-        s.waits = keep
     })
     while len(wake) > 0 { pop(mut &wake).complete(Unit{}) }
 }
@@ -155,10 +204,9 @@ pub fn (l: &Locks) locksIn(me: int, tree: int, lo: &str, hi: &str): bool {
             if !strings.startsWith(&k, &pre) { continue }
             let key = k[len(pre)..len(k)]
             if key < lo || (len(hi) > 0 && key >= hi) { continue }
-            var ids: []int = []
-            var modes: []int = []
-            holdersOf(&s.held.get(&k).unwrapOr(""), mut &ids, mut &modes)
-            for h in ids { if h != me { any = true } }
+            let e = s.held.at(&k)
+            if e.id0 != me { any = true; return }
+            for h in e.extraIds { if h != me { any = true; return } }
         }
     })
     return any
@@ -179,22 +227,6 @@ fn lockConflict(a: int, b: int): bool {
     return false
 }
 
-// A row's holders: ids and their modes.
-fn holdersOf(x: &str, ids: mut &[]int, modes: mut &[]int) {
-    if len(x) == 0 { return }
-    for h in strings.split(x, ";") {
-        let sp = strings.indexOf(&h, " ", 0)
-        append(ids, strings.parseIntOpt(&(h[0..sp].toStr())).unwrapOr(0))
-        append(modes, strings.parseIntOpt(&(h[sp + 1..len(h)].toStr())).unwrapOr(0))
-    }
-}
-
-fn holdersText(ids: &[]int, modes: &[]int): str {
-    var parts: []str = []
-    for i in 0..len(ids) { append(mut &parts, ids[i].toStr() + " " + modes[i].toStr()) }
-    return strings.join(&parts, ";")
-}
-
 // Whether owner me waiting for holders hs would wait for itself: a holder
 // that is me, or waits (in turn) for a row me holds.
 fn (s: &LockState) cycle(me: int, hs: &[]int): bool {
@@ -210,10 +242,11 @@ fn (s: &LockState) cycle(me: int, hs: &[]int): bool {
         append(mut &seen, h)
         match s.waitFor.get(&h) {
             Some(k) {
-                var ids: []int = []
-                var modes: []int = []
-                holdersOf(&s.held.get(&k).unwrapOr(""), mut &ids, mut &modes)
-                for i in ids { append(mut &todo, i) }
+                if s.held.has(&k) {
+                    let e = s.held.at(&k)
+                    append(mut &todo, e.id0)
+                    for ei in e.extraIds { append(mut &todo, ei) }
+                }
             }
             None {}
         }

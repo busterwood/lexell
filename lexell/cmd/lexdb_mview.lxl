@@ -1198,6 +1198,8 @@ type BufStore = record {
 
 var SESS_BUFS: once task.Shared[BufStore]
 
+var BUF_ACTIVE: int = 0
+
 fn bufs(): task.Shared[BufStore] {
     if !SESS_BUFS.isSet() { SESS_BUFS.set(task.shared(BufStore{keys: [], vals: []})) }
     return SESS_BUFS.get().share()
@@ -1207,6 +1209,7 @@ fn bufSlot(st: mut &BufStore, sess: int): int {
     for i in 0..len(st.keys) { if st.keys[i] == sess { return i } }
     append(mut &st.keys, sess)
     append(mut &st.vals, TxnBuf{deltas: [], pending: []})
+    BUF_ACTIVE += 1
     return len(st.keys) - 1
 }
 
@@ -1223,6 +1226,7 @@ fn removeSlot(st: mut &BufStore, i: int) {
     }
     let _k = pop(mut &st.keys)
     let _v = pop(mut &st.vals)
+    if BUF_ACTIVE > 0 { BUF_ACTIVE -= 1 }
 }
 
 fn pushDelta(sess: int, mark: int, table: &str, sign: int, row: &[]Val, chg: &[]int) {
@@ -1266,6 +1270,7 @@ pub fn recordTruncate(txn: &lexdb_store.Txn, t: &Table) {
 }
 
 pub fn hasWork(sess: int): bool {
+    if BUF_ACTIVE == 0 { return false }
     var any = false
     bufs().with(fn(st: mut &BufStore) {
         let i = findSlot(st, sess)
@@ -1275,6 +1280,7 @@ pub fn hasWork(sess: int): bool {
 }
 
 pub fn hasStmtDeltas(sess: int): bool {
+    if BUF_ACTIVE == 0 { return false }
     var any = false
     bufs().with(fn(st: mut &BufStore) {
         let i = findSlot(st, sess)
@@ -1284,6 +1290,7 @@ pub fn hasStmtDeltas(sess: int): bool {
 }
 
 pub fn undoTo(sess: int, mark: int) {
+    if BUF_ACTIVE == 0 { return }
     bufs().with(fn(st: mut &BufStore) {
         let i = findSlot(st, sess)
         if i < 0 { return }
@@ -1298,6 +1305,7 @@ pub fn undoTo(sess: int, mark: int) {
 }
 
 pub fn clearTxn(sess: int) {
+    if BUF_ACTIVE == 0 { return }
     bufs().with(fn(st: mut &BufStore) {
         let i = findSlot(st, sess)
         if i >= 0 { removeSlot(st, i) }

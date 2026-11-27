@@ -1193,7 +1193,51 @@ fn (db: mut &Db) prune() {
                 db.meta[s].listed = false
                 continue
             }
-            if hasD { db.materializeHist(s) }
+            // In-place delta pruning: never call materializeHist/copyNode during prune() so
+            // hot OLTP leaves never share n.keys (avoiding keys.unshare() churn under concurrent writes).
+            if hasD {
+                let hn = len(db.hist[s])
+                var firstD = hn
+                while firstD > 0 && db.hist[s][firstD - 1].op != H_FULL { firstD -= 1 }
+                // Find the oldest still-needed delta in [firstD..hn). Any deltas BEFORE keepFrom
+                // are strictly older than every live snapshot and can be dropped directly!
+                var keepFrom = hn
+                for j in firstD..hn {
+                    let h = &db.hist[s][j]
+                    if h.since >= 0 && snapNeeds(&live, minL, maxL, h.since, h.until, db.durableSeq) {
+                        keepFrom = j
+                        break
+                    }
+                }
+                var kept: []Hist = []
+                var old = replace(mut &db.hist[s], [])
+                for j in 0..hn {
+                    var h = replace(mut &old[j], Hist{since: -1, until: -1, op: H_FULL, at: 0, oldSize: 0, oldKey: None, oldVal: None, node: []})
+                    if j < firstD {
+                        if h.since >= 0 && snapNeeds(&live, minL, maxL, h.since, h.until, db.durableSeq) {
+                            append(mut &kept, h)
+                        } else {
+                            db.histCount -= 1
+                        }
+                    } else if j < keepFrom {
+                        db.histCount -= 1
+                    } else {
+                        if h.since >= 0 && !snapNeeds(&live, minL, maxL, h.since, h.until, db.durableSeq) {
+                            h.since = -1
+                            h.until = -1
+                        }
+                        append(mut &kept, h)
+                    }
+                }
+                if len(kept) > 0 {
+                    db.hist[s] = kept
+                    db.histSlots[w] = s
+                    w += 1
+                } else {
+                    db.meta[s].listed = false
+                }
+                continue
+            }
             var kept: []Hist = []
             var old = replace(mut &db.hist[s], [])
             while len(old) > 0 {
@@ -3791,7 +3835,7 @@ fn (st: &Store) snapGet(t: mut &Txn, tree: int, key: &str, mode: int): Result[Op
             }
             let root = db.snapRoot(t, tree)
             if root < 0 { return }
-            let d = db.snapDescend(root, t.snapSeq, &key, false)
+            let d = db.snapDescendNoFence(root, t.snapSeq, &key)
             if d.need >= 0 {
                 need = d.need
                 return
@@ -3813,6 +3857,78 @@ fn (st: &Store) snapGet(t: mut &Txn, tree: int, key: &str, mode: int): Result[Op
         match out {
             Some(v) {
                 if marked(&v) && !isOvf(tree) && !(mode == M_PART && isStub(&v)) { return Ok(Some(try st.unstore(t, tree, &key, &v))) }
+            }
+            None {}
+        }
+        return Ok(out)
+    }
+    return Ok(None)
+}
+
+// Single-shot autocommit point read at db.durableSeq (master) or latest replica batch (Follower),
+// verifying catalog generation == wantCatGen inside the SAME single lock turn (eliminates
+// beginSnapshot/snapTrees clone, fastCatMatch lock, endSnapshot lock, and fence clone!).
+// Sets catOk = true if catGen matched; sets needSlow = true if value is out-of-line (marked)
+// or needs the full snapshot path.
+pub fn (st: &Store) pointRead(tree: int, key: &str, wantCatGen: int,
+                              catOk: mut &bool, needSlow: mut &bool): Result[Option[str], lexdb_base.DbErr] {
+    match &st.fo {
+        Some(fo) {
+            return fo.pointRead(tree, key, wantCatGen, catOk, needSlow)
+        }
+        None {}
+    }
+    while true {
+        var need = -1
+        var out: Option[str] = None
+        var bad: []lexdb_base.DbErr = []
+        var cOk = false
+        var slow = false
+        st.sh.with(fn(db: mut &Db) {
+            if len(db.failed) > 0 {
+                append(mut &bad, db.failed[0].clone())
+                return
+            }
+            let q = db.durableSeq
+            if db.catGen != wantCatGen || q < db.catSeq { return }
+            cOk = true
+            var root = match db.trees.get(&tree) { Some(r) { r } None { -1 } }
+            if len(db.rootHist) > 0 {
+                var k = len(db.rootHist) - 1
+                while k >= 0 {
+                    let rc = db.rootHist[k]
+                    if rc.seq > q && rc.tree == tree { root = rc.prev }
+                    k -= 1
+                }
+            }
+            if root < 0 { return }
+            let d = db.snapDescendNoFence(root, q, key)
+            if d.need >= 0 {
+                need = d.need
+                return
+            }
+            if d.missing {
+                slow = true
+                return
+            }
+            let n = db.snapNode(d.leaf, d.ver)
+            let i = n.lower(key)
+            if i < n.count() && n.keyView(i) == key { out = Some(n.val(i)) }
+        })
+        if len(bad) > 0 { return Err(bad[0].clone()) }
+        if !cOk { catOk = false; return Ok(None) }
+        catOk = true
+        if slow { needSlow = true; return Ok(None) }
+        if need >= 0 {
+            try st.load(need)
+            continue
+        }
+        match &out {
+            Some(v) {
+                if marked(v) && !isOvf(tree) {
+                    needSlow = true
+                    return Ok(None)
+                }
             }
             None {}
         }
@@ -5929,6 +6045,27 @@ fn snapCancelled(): lexdb_base.DbErr {
 // par, pver, at: where need was reached (the parent's slot and version,
 // the child's index), for read-ahead; par -1 at the root.
 type SnapLeaf = value record { leaf: int; ver: int; need: int; missing: bool; fence: str; hasFence: bool; par: int; pver: int; at: int }
+
+// Point-lookup snapshot descent: skips fence tracking and string cloning.
+fn (db: mut &Db) snapDescendNoFence(root: int, q: int, cursor: &str): SnapLeaf {
+    var r = SnapLeaf{leaf: -1, ver: -1, need: -1, missing: false, fence: "", hasFence: false, par: -1, pver: -1, at: -1}
+    var s = root
+    let w = lexdb_page.keyWord(cursor)
+    while true {
+        let v = db.verOf(s, q)
+        if v == -2 { r.need = s; return r }
+        if v == -3 { r.missing = true; return r }
+        db.meta[s].ref = true
+        let n = db.snapNode(s, v)
+        if n.leaf {
+            r.leaf = s
+            r.ver = v
+            return r
+        }
+        s = n.kids[n.childW(cursor, w)]
+    }
+    return r
+}
 
 fn (db: mut &Db) snapDescend(root: int, q: int, cursor: &str, back: bool): SnapLeaf {
     var r = SnapLeaf{leaf: -1, ver: -1, need: -1, missing: false, fence: "", hasFence: false, par: -1, pver: -1, at: -1}
@@ -9180,6 +9317,64 @@ fn (fo: &Follower) unstore(bi: int, tree: int, key: &str, v: &str): Result[str, 
         return Err(lexdb_base.err(lexdb_base.S_INTERNAL, "follower: a large value's chunks do not match it"))
     }
     return Ok(b)
+}
+
+// Single-shot point read on a read replica verifying catGen inside ONE fo.sh.with lock turn.
+pub fn (fo: &Follower) pointRead(tree: int, key: &str, wantCatGen: int,
+                                 catOk: mut &bool, needSlow: mut &bool): Result[Option[str], lexdb_base.DbErr] {
+    while true {
+        var cOk = false
+        var slow = false
+        var live = false
+        var kind = 0
+        var need = -1
+        var vs: []str = []
+        fo.sh.with(fn(f: mut &Fol) {
+            if f.catGen != wantCatGen || f.applied < f.catBatch { return }
+            cOk = true
+            if len(f.bases) == 0 { slow = true; return }
+            let bi = len(f.bases) - 1
+            let s = FSnap{id: -1, ckpt: f.bases[bi].ckpt, batch: f.applied}
+            live = f.live(&s, tree, bi)
+            if !live { return }
+            kind = f.version(tree, key, f.applied, mut &vs)
+            if kind != 0 { return }
+            match f.bases[bi].roots.get(&tree) {
+                Some(root) {
+                    let st = f.descend(root, key, false)
+                    if st.need >= 0 {
+                        need = st.need
+                        return
+                    }
+                    let n = &f.pool[st.leaf]
+                    let i = n.lower(key)
+                    if i < n.count() && n.keyView(i) == key {
+                        append(mut &vs, n.val(i))
+                        kind = 3
+                    }
+                }
+                None {}
+            }
+        })
+        if !cOk { catOk = false; return Ok(None) }
+        catOk = true
+        if slow { needSlow = true; return Ok(None) }
+        if !live || kind == 2 { return Ok(None) }
+        if kind == 1 || kind == 3 {
+            let v = pop(mut &vs)
+            if marked(&v) && !isOvf(tree) {
+                needSlow = true
+                return Ok(None)
+            }
+            return Ok(Some(v))
+        }
+        if need >= 0 {
+            try fo.load(need)
+            continue
+        }
+        return Ok(None)
+    }
+    return Ok(None)
 }
 
 // The value of key in tree as of the snapshot.
