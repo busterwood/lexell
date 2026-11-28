@@ -145,8 +145,8 @@ With **no materialized views and no explicit skipping indexes**, LexDB's AVX2-ve
 
 | OLAP & load workload | LexDB | PostgreSQL 18 | Takeaway |
 |---|---:|---:|---|
-| **TPC-H SF1** (22 queries, 4 cores via `par.map`) | **3.33 s** *(4.83 s CPU)* | 8.84 s (4 proc) *(15.03 s 1c CPU)* | **2.66× faster** than 4-process PG overall (`0.52×` geomean, 17/22 faster; `q1` **276 ms** — **3.17×**, `q9` **329 ms** — **2.28×**, `q13` **238 ms** — **3.47×**, `q18` **105 ms** — **27.9×**); **3.11× less total CPU** |
-| **ClickBench 1M** (43 queries, 105 cols, 4 cores via `par.map`) | **4.71 s** *(6.91 s CPU)* | 11.40 s (4 proc) *(23.12 s 1c CPU)* | **2.42× faster** than 4-process PG (**43/43** faster, `0.51×` geomean, no MVs); **3.34× less total CPU** (`0.29×` geomean) |
+| **TPC-H SF1** (22 queries, 4 cores via `par.map`) | **3.20 s** *(4.67 s CPU)* | 8.84 s (4 proc) *(15.03 s 1c CPU)* | **2.76× faster** than 4-process PG overall (`0.50×` geomean, 17/22 faster; `q1` **258 ms** — **3.39×**, `q6` **100 ms** — **2.04×**, `q9` **316 ms** — **2.38×**, `q13` **230 ms** — **3.59×**, `q18` **102 ms** — **28.8×**); **3.22× less total CPU** |
+| **ClickBench 1M** (43 queries, 105 cols, 4 cores via `par.map`) | **4.69 s** *(6.87 s CPU)* | 11.40 s (4 proc) *(23.12 s 1c CPU)* | **2.43× faster** than 4-process PG (**43/43** faster, `0.51×` geomean, no MVs); **3.36× less total CPU** (`0.29×` geomean) |
 | **35 Analytic Queries** (1M rows, 4 cores via `par.map`) | **0.36× CPU / 0.61× wall** | 1 core / 4 proc | **2.80× less total CPU** than 1-core PG (**35/35** ahead of PG1 on wall); **1.64× faster** geomean wall time than 4-process PG (**31/35** level or ahead) |
 | **Selective star-schema joins** (1M fact rows, 6 patterns, 1 core) | **0.54–22.5 ms** | 0.21–77.0 ms (1 core) / 0.24–50.7 ms (4 proc) | **1.24–71.7× faster** via hash-join runtime filters; **7.68×** vs PG1 / **4.46×** vs PG4 (geomean) |
 | **Bulk `\copy` loads** (5 cases, 1M–10M rows) | **0.24–2.64 s** | 0.61–5.93 s | **1.29–2.63× faster** on every workload (`224–2,103 MB` peak RSS) |

@@ -1,6 +1,6 @@
 # Lexell performance
 
-Measured on 27 November 2026 on `main` at `20b4f54f` (non-HTTP sections unchanged from `ab29758c`).
+Measured on 28 November 2026 on `main` at `0907ea85` (Markdown updated at `0907ea85`; HTTP/1.1 & HTTP/2 from `20b4f54f`; other sections from `ab29758c`).
 Every number compares Lexell only with external tools.
 Lexell's own C backend and earlier builds are not compared.
 For LexDB database benchmarks against PostgreSQL 18, see [LEXDB.md](LEXDB.md) and the dedicated [LexDB performance report](lexell/docs/lexdb/performance.md).
@@ -23,7 +23,7 @@ Method: wall times are best of N; instruction counts are user-mode
 | Microbenchmarks | Rust, Java, Go | Faster than Rust on fourteen of nineteen, level on one (`array` 3.8×, `matmul` 2.5×, `maps` 2.3×, `bitpack` 2.0× via explicit `vector[T]` SIMD); faster than warmed-up Java on ten of twenty, level on one; task switching about 1.8 times Go's speed; 2–31 MB on nineteen of twenty against the JVM's 51 MB–2.37 GB |
 | Regex | Go, Rust | Faster than Go on all; slower than Rust on six of seven, 4.1 times faster on `(?m)^ERROR .*timeout$` |
 | JSON | Python, jq | 3.3 times faster than Python to parse and 1.6–1.7 times faster to write, slower to query; 2.0 to 3.5 times faster than jq 1.7.1 on every filter |
-| Markdown | cmark | Faster on the spec examples, level on repository Markdown, slightly slower on the spec text |
+| Markdown | cmark | Faster on repository Markdown (`0.97×`) and the spec examples (`0.93×`), slightly slower on the spec text (`1.08×`) |
 | Decimal | Java, .NET | Faster than .NET on every operation (1.3 to 5.8 times); faster than Java on nine of ten (only slower on 19-digit cmp) |
 | HTTP/1.1 server | Go net/http, Node.js | Faster at 1, 10 and 100 clients: 1.6 times Go's requests a second, 1.4 to 1.5 times Node's (up to 203k req/s on one core, 5.4× lower p99 than Go at 100 clients) |
 | HTTP/2 server | Go net/http, Node.js | Faster than both Go and Node.js on every `h2c` and TLS case: 1.6 to 6.7 times Go and 1.1 to 3.5 times Node.js (up to 368k req/s `h2c` and 317k req/s TLS 1.3 on one core at 7–13 MB RSS) |
@@ -228,9 +228,9 @@ The perf mode checks no output.
 
 | input | Lexell | cmark | Lexell / cmark |
 |---|---:|---:|---:|
-| spec text, 49 times (10.0 MB) | 106 ms | 98 ms | 1.08 |
-| repository Markdown, 2 times (15.4 MB) | 168 ms | 166 ms | 1.01 |
-| spec examples, 643 times (10.0 MB) | 318 ms | 338 ms | 0.94 |
+| spec text, 49 times (10.0 MB) | 110 ms | 102 ms | 1.08 |
+| repository Markdown, 2 times (15.5 MB) | 170 ms | 176 ms | 0.97 |
+| spec examples, 643 times (10.0 MB) | 326 ms | 351 ms | 0.93 |
 
 ### Decimal
 
