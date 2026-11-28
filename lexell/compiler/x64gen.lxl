@@ -58,6 +58,9 @@ const RT_CHUNK_BITS = 21
 // no callee-saved xmm registers, but native/math.c leaves these alone). The generated code uses
 // xmm0-xmm7 for values and arguments and xmm15 for copies.
 const FP_REGS: []int = [8, 9, 10, 11, 12, 13, 14]
+// Extra ymm registers for call-free vector[T] locals (quietLive on loudBefore as well as fpBefore).
+// pairV keeps vTmp in ymm3..4 so ymm5..7 are never touched outside calls.
+const FP_QUIET_REGS: []int = [5, 6, 7]
 
 // The largest frame that needs no stack probe: below a page, so that no access of the frame
 // (nor the return address of a call from it) can skip the guard page.
@@ -1278,6 +1281,14 @@ fn (g: mut &Gen) allocRegs(f: int) {
                 append(mut &given[16 + x], l)
             }
         }
+        if g.freg[l] < 0 && g.isV(g.u.locals[l].ty) && g.quietLive(l, &loudBefore) {
+            for x in FP_QUIET_REGS {
+                if g.freg[l] < 0 && g.regFree(&given, 16 + x, l) {
+                    g.freg[l] = x
+                    append(mut &given[16 + x], l)
+                }
+            }
+        }
     }
 }
 
@@ -1613,6 +1624,7 @@ fn (g: mut &Gen) simpList(l: int) {
             if g.u.listAt(l, j) == x && j + 1 < cnt { g.intoAssign(l, j) }
             if g.u.listAt(l, j) == x && j + 1 < cnt { g.intoReturn(l, j) }
             if g.u.listAt(l, j) == x && j + 1 < cnt { g.forward(l, j) }
+            if g.u.listAt(l, j) == x && j + 1 < cnt { g.forwardIdxOff(l, j) }
             if g.u.listAt(l, j) == x && j + 1 < cnt { g.forwardLit(l, j) }
             if g.u.listAt(l, j) == x && j + 1 < cnt { g.memberCopy(l, j) }
         }
@@ -1852,6 +1864,114 @@ fn (g: mut &Gen) forward(l: int, j: int) {
     g.uses[t] = 0
 }
 
+// Pure index-offset forwarding: `int64_t t = base +% k` (or `-% k`, wrapping/non-trapping) with
+// t named once more, inside an E_PADD index in a later statement of the same block (up to 8
+// statements ahead), with neither base nor t written in between. Lets paddMem fold `k * scale`
+// straight into disp32 with zero `lea` instructions.
+fn (g: &Gen) pureIdxOffBase(v: int): int {
+    let n = g.u.nodes[v]
+    if n.k == ir.E_BIN && (n.v == ir.OP_ADD || n.v == ir.OP_SUB) && g.tk(n.ty) == ir.TY_I64 {
+        if g.u.nk(n.a) == ir.E_LOCAL && g.u.nk(n.b) == ir.E_INT && g.tk(g.u.locals[g.u.nodes[n.a].a].ty) == ir.TY_I64 {
+            let k = g.u.nodes[n.b].v
+            if k > -100000000 && k < 100000000 { return g.u.nodes[n.a].a }
+        }
+        if n.v == ir.OP_ADD && g.u.nk(n.b) == ir.E_LOCAL && g.u.nk(n.a) == ir.E_INT && g.tk(g.u.locals[g.u.nodes[n.b].a].ty) == ir.TY_I64 {
+            let k = g.u.nodes[n.a].v
+            if k > -100000000 && k < 100000000 { return g.u.nodes[n.b].a }
+        }
+        return -1
+    }
+    if n.k == ir.E_CALL && g.u.listLen(n.b) == 2 && g.tk(n.ty) == ir.TY_I64 {
+        let nm = g.rtName(v)
+        if nm == "rt_wadd_int" || nm == "rt_wsub_int" {
+            let a0 = g.u.listAt(n.b, 0)
+            let a1 = g.u.listAt(n.b, 1)
+            if g.u.nk(a0) == ir.E_LOCAL && g.u.nk(a1) == ir.E_INT && g.tk(g.u.locals[g.u.nodes[a0].a].ty) == ir.TY_I64 {
+                let k = g.u.nodes[a1].v
+                if k > -100000000 && k < 100000000 { return g.u.nodes[a0].a }
+            }
+            if nm == "rt_wadd_int" && g.u.nk(a1) == ir.E_LOCAL && g.u.nk(a0) == ir.E_INT && g.tk(g.u.locals[g.u.nodes[a1].a].ty) == ir.TY_I64 {
+                let k = g.u.nodes[a0].v
+                if k > -100000000 && k < 100000000 { return g.u.nodes[a1].a }
+            }
+        }
+    }
+    return -1
+}
+
+// Finds local t used directly as the index (n.b) of a scaleOk E_PADD inside an E_VECOP in x.
+fn (g: &Gen) findPaddIdx(x: int, t: int, inVec: bool): int {
+    if x < 0 { return -1 }
+    let n = g.u.nodes[x]
+    let k = n.k
+    if inVec && k == ir.E_PADD && scaleOk(n.v) && g.u.nk(n.b) == ir.E_LOCAL && g.u.nodes[n.b].a == t {
+        return n.b
+    }
+    let iv = inVec || k == ir.E_VECOP
+    let kc = ir.KIDS[k]
+    if kc <= ir.K_NONE { return -1 }
+    if kc == ir.K_A { return g.findPaddIdx(n.a, t, iv) }
+    if kc == ir.K_AB {
+        let r = g.findPaddIdx(n.a, t, iv)
+        if r >= 0 { return r }
+        return g.findPaddIdx(n.b, t, iv)
+    }
+    if kc == ir.K_ABC {
+        let r = g.findPaddIdx(n.a, t, iv)
+        if r >= 0 { return r }
+        let r2 = g.findPaddIdx(n.b, t, iv)
+        if r2 >= 0 { return r2 }
+        return g.findPaddIdx(n.c, t, iv)
+    }
+    if kc == ir.K_CALL {
+        let r = g.findPaddIdx(n.a, t, iv)
+        if r >= 0 { return r }
+        if n.b >= 0 {
+            for i in 0..g.u.listLen(n.b) {
+                let r2 = g.findPaddIdx(g.u.listAt(n.b, i), t, iv)
+                if r2 >= 0 { return r2 }
+            }
+        }
+        return -1
+    }
+    if kc == ir.K_DECL { return g.findPaddIdx(n.b, t, iv) }
+    return -1
+}
+
+fn (g: mut &Gen) forwardIdxOff(l: int, j: int) {
+    let cnt = g.u.listLen(l)
+    let x = g.u.listAt(l, j)
+    let t = g.u.nodes[x].a
+    if g.uses[t] != 2 || g.aTaken[t] || g.tk(g.u.locals[t].ty) != ir.TY_I64 { return }
+    let v = g.u.nodes[x].b
+    let base = g.pureIdxOffBase(v)
+    if base < 0 || base == t || g.aTaken[base] { return }
+    var m = j + 1
+    while m < cnt && m <= j + 8 {
+        let y = g.u.listAt(l, m)
+        let yk = g.u.nk(y)
+        if yk == ir.S_EMPTY {
+            m += 1
+            continue
+        }
+        if yk == ir.S_CASE || yk == ir.S_DEFAULT { return }
+        if g.walk(y, 1, base, -1) > 0 || g.walk(y, 1, t, -1) > 0 { return }
+        let named = g.walk(y, 0, t, -1)
+        if named == 0 {
+            m += 1
+            continue
+        }
+        if named != 1 { return }
+        if yk != ir.S_EXPR && !(yk == ir.S_DECL && g.u.nodes[y].c < 0) { return }
+        let at = g.findPaddIdx(y, t, false)
+        if at < 0 || g.u.nodes[at].ty != g.u.nodes[v].ty { return }
+        g.u.nodes[at] = g.u.nodes[v]
+        g.u.items[l + 1 + j] = g.emptyS
+        g.uses[t] = 0
+        return
+    }
+}
+
 // (8) `T t = s.f;` (a member chain of a local record s whose address is never taken) with T a
 // 128-bit integer, t's address never taken and every other name of t in the statements after
 // it in the block, none of which (up to the last) assigns t, s or a member of s: t's names read
@@ -2037,6 +2157,10 @@ fn (g: mut &Gen) fwdSite(x: int, t: int, v: int): int {
         append(mut &kids, n.b)
     } else if k == ir.E_NEG || k == ir.E_BNOT || k == ir.E_LNOT || k == ir.E_DEREF {
         append(mut &kids, n.a)
+    } else if k == ir.E_VECOP {
+        if n.a >= 0 { append(mut &kids, n.a) }
+        if n.b >= 0 { append(mut &kids, n.b) }
+        if n.c >= 0 { append(mut &kids, n.c) }
     } else if k == ir.E_ASSIGN {
         // into a local or a member of one, the value naming t
         var r = n.a
@@ -3145,7 +3269,9 @@ fn (g: mut &Gen) stmt1(s: int) {
         let t = g.u.locals[l].ty
         if g.freg[l] >= 0 {
             g.declMark = g.frame
-            if n.b >= 0 && g.isF(t) && g.fIntoLocal(n.b, g.freg[l], l) {
+            if n.b >= 0 && g.isV(t) {
+                g.genVec(n.b, g.freg[l])
+            } else if n.b >= 0 && g.isF(t) && g.fIntoLocal(n.b, g.freg[l], l) {
                 // computed in the local's register
             } else if n.b >= 0 {
                 g.gen(n.b)
@@ -6139,15 +6265,59 @@ fn (g: mut &Gen) place(e: int): x64.Mem {
     return x64.mem(RAX, 0)
 }
 
+type IdxOff = value record {
+    reg: int
+    off: int
+}
+
+// Matches `reg + k`, `k + reg`, `reg - k` (wrapping or plain E_BIN on 64-bit int) where reg is a
+// local in a register and k is an integer constant; returns reg = -1 otherwise.
+fn (g: &Gen) idxAddConst(b: int): IdxOff {
+    let none = IdxOff{reg: -1, off: 0}
+    let n = g.u.nodes[b]
+    if n.k == ir.E_BIN && (n.v == ir.OP_ADD || n.v == ir.OP_SUB) && g.tk(n.ty) == ir.TY_I64 {
+        let ra = g.regOf(n.a)
+        let rb = g.regOf(n.b)
+        if ra >= 0 && g.u.nk(n.b) == ir.E_INT {
+            let k = g.u.nodes[n.b].v
+            return IdxOff{reg: ra, off: if n.v == ir.OP_ADD { k } else { -k }}
+        }
+        if n.v == ir.OP_ADD && rb >= 0 && g.u.nk(n.a) == ir.E_INT {
+            return IdxOff{reg: rb, off: g.u.nodes[n.a].v}
+        }
+        return none
+    }
+    if n.k == ir.E_CALL && g.u.listLen(n.b) == 2 && g.tk(n.ty) == ir.TY_I64 {
+        let nm = g.rtName(b)
+        if nm == "rt_wadd_int" || nm == "rt_wsub_int" {
+            let a0 = g.u.listAt(n.b, 0)
+            let a1 = g.u.listAt(n.b, 1)
+            let r0 = g.regOf(a0)
+            let r1 = g.regOf(a1)
+            if r0 >= 0 && g.u.nk(a1) == ir.E_INT {
+                let k = g.u.nodes[a1].v
+                return IdxOff{reg: r0, off: if nm == "rt_wadd_int" { k } else { -k }}
+            }
+            if nm == "rt_wadd_int" && r1 >= 0 && g.u.nk(a0) == ir.E_INT {
+                return IdxOff{reg: r1, off: g.u.nodes[a0].v}
+            }
+        }
+    }
+    return none
+}
+
 // Whether the pointer e is p + i * size that paddMem folds into an operand: size 1, 2, 4 or 8
 // (or any other, multiplied into rcx first), p needs no code but loads (simple, or loadOnly:
-// generated after i, in rax), and i is a local in a register, an rt_idx of one (the check done
-// first, in place), or pure (generated first, as pair does).
+// generated after i, in rax), and i is a local in a register, `reg +/- k`, an rt_idx of one
+// (the check done first, in place), or pure (generated first, as pair does).
 fn (g: &Gen) paddFold(e: int): bool {
     let n = g.u.nodes[e]
     if n.k != ir.E_PADD || g.u.nk(n.b) == ir.E_INT || !(g.simple(n.a) || g.loadOnly(n.a)) { return false }
     if !x64.fits32(n.v) { return false }
-    return g.regOf(n.b) >= 0 || g.idxReg(n.b) >= 0 || g.pure(n.b)
+    if g.regOf(n.b) >= 0 || g.idxReg(n.b) >= 0 { return true }
+    let io = g.idxAddConst(n.b)
+    if io.reg >= 0 && scaleOk(n.v) && io.off > -100000000 && io.off < 100000000 && x64.fits32(io.off * n.v) { return true }
+    return g.pure(n.b)
 }
 
 fn scaleOk(sc: int): bool { return sc == 1 || sc == 2 || sc == 4 || sc == 8 }
@@ -6171,6 +6341,14 @@ fn (g: mut &Gen) paddMem(e: int): x64.Mem {
     let n = g.u.nodes[e]
     var sc = n.v
     var ri = g.regOf(n.b)
+    var disp = 0
+    if ri < 0 && scaleOk(sc) {
+        let io = g.idxAddConst(n.b)
+        if io.reg >= 0 && io.off > -100000000 && io.off < 100000000 && x64.fits32(io.off * sc) {
+            ri = io.reg
+            disp = io.off * sc
+        }
+    }
     if ri < 0 && g.idxReg(n.b) >= 0 {
         let l = g.u.nodes[n.b].b
         ri = g.idxReg(n.b)
@@ -6189,9 +6367,9 @@ fn (g: mut &Gen) paddMem(e: int): x64.Mem {
             ri = RCX
             sc = 1
         }
-        if g.regOf(n.a) >= 0 { return x64.memx(g.regOf(n.a), ri, sc, 0) }
+        if g.regOf(n.a) >= 0 { return x64.memx(g.regOf(n.a), ri, sc, disp) }
         g.baseInto(n.a)
-        return x64.memx(RAX, ri, sc, 0)
+        return x64.memx(RAX, ri, sc, disp)
     }
     g.gen(n.b)
     if !scaleOk(sc) && g.regOf(n.a) < 0 && !g.simple(n.a) {
@@ -6257,12 +6435,10 @@ fn (g: mut &Gen) genAssign(e: int) {
     if g.fregOf(lhs) >= 0 {
         let r = g.fregOf(lhs)
         if g.isV(t) {
-            let v = g.u.nodes[n.b]
-            if v.k == ir.E_VECOP && v.v == ir.V_FMADD && g.fregOf(v.c) == r &&
-                !g.assignsLocal(v.a, g.u.nodes[lhs].a) && !g.assignsLocal(v.b, g.u.nodes[lhs].a) {
-                let p = g.pairV(v.a, v.b)
-                g.a.vfmadd231pd256(r, p.a, p.b)
-                if !unused { g.a.vmovdquRR(0, r) }
+            let local = g.u.nodes[lhs].a
+            if !g.assignsLocal(n.b, local) {
+                g.genVec(n.b, r)
+                if !unused && r != 0 { g.a.vmovdquRR(0, r) }
                 return
             }
             g.gen(n.b)
@@ -10144,112 +10320,233 @@ fn (g: mut &Gen) genClampSub(e: int): bool {
     return true
 }
 
+fn (g: mut &Gen) vecPtrMem(addr: int): x64.Mem {
+    var a = addr
+    while g.u.nk(a) == ir.E_CAST && g.tk(g.u.nodes[a].ty) == ir.TY_PTR && g.tk(g.u.nodes[g.u.nodes[a].a].ty) == ir.TY_PTR {
+        a = g.u.nodes[a].a
+    }
+    if g.regOf(a) >= 0 { return x64.mem(g.regOf(a), 0) }
+    if g.paddFold(a) { return g.paddMem(a) }
+    g.gen(addr)
+    return x64.mem(RAX, 0)
+}
+
+fn (g: &Gen) isQuietVecLoad(e: int): bool {
+    return g.u.nk(e) == ir.E_VECOP && g.u.nodes[e].v == ir.V_LOAD &&
+        !g.u.nodeHasVec(g.u.nodes[e].a) && g.quietTree(g.u.nodes[e].a)
+}
+
 fn (g: mut &Gen) pairV(a: int, b: int): VecPair {
     let ra = g.fregOf(a)
     let rb = g.fregOf(b)
     if ra >= 0 && rb >= 0 { return VecPair{a: ra, b: rb} }
     if rb >= 0 {
-        g.gen(a)
+        g.genVec(a, 0)
         return VecPair{a: 0, b: rb}
     }
     if ra >= 0 && !g.assignsLocal(b, g.u.nodes[a].a) {
-        g.gen(b)
+        g.genVec(b, 0)
         return VecPair{a: ra, b: 0}
     }
-    if g.u.nk(b) == ir.E_VECOP && g.u.nodes[b].v == ir.V_LOAD && !g.u.nodeHasVec(g.u.nodes[b].a) && g.quietTree(g.u.nodes[b].a) {
-        g.gen(a)
-        g.gen(g.u.nodes[b].a)
+    if g.isQuietVecLoad(b) {
+        g.genVec(a, 0)
+        let m = g.vecPtrMem(g.u.nodes[b].a)
         if g.u.tys[g.u.nty(b)].base == ir.TY_F64 {
-            g.a.vmovupdLoad(1, x64.mem(RAX, 0))
+            g.a.vmovupdLoad(1, m)
         } else {
-            g.a.vmovdquLoad(1, x64.mem(RAX, 0))
+            g.a.vmovdquLoad(1, m)
         }
         return VecPair{a: 0, b: 1}
     }
     if g.u.nk(b) == ir.E_LOCAL && g.staticMem(b).base != -9 {
-        g.gen(a)
+        g.genVec(a, 0)
         g.a.vmovdquLoad(1, g.staticMem(b))
         return VecPair{a: 0, b: 1}
     }
-    g.gen(a)
-    if g.quietTree(b) && g.vTmp < 5 {
+    g.genVec(a, 0)
+    if g.quietTree(b) && g.vTmp < 2 {
         let sv = 3 + g.vTmp
         g.vTmp += 1
         g.a.vmovdquRR(sv, 0)
-        g.gen(b)
+        g.genVec(b, 0)
         g.vTmp -= 1
         return VecPair{a: sv, b: 0}
     }
     let s = g.temp(32, 32)
     g.a.vmovdquStore(rbp(s), 0)
-    g.gen(b)
+    g.genVec(b, 0)
     g.a.vmovdquRR(1, 0)
     g.a.vmovdquLoad(0, rbp(s))
     return VecPair{a: 0, b: 1}
 }
 
-fn (g: mut &Gen) genVecBin(e: int) {
+fn (g: mut &Gen) genVec(e: int, dst: int) {
+    let k = g.u.nk(e)
+    if k == ir.E_LOCAL {
+        let r = g.fregOf(e)
+        if r >= 0 {
+            if r != dst { g.a.vmovdquRR(dst, r) }
+            return
+        }
+        let m = g.staticMem(e)
+        if m.base != -9 {
+            g.a.vmovdquLoad(dst, m)
+            return
+        }
+    }
+    if k == ir.E_BIN && g.isV(g.u.nodes[e].c) {
+        g.genVecBinInto(e, dst)
+        return
+    }
+    if k == ir.E_VECOP {
+        g.genVecOpInto(e, dst)
+        return
+    }
+    g.gen(e)
+    if dst != 0 { g.a.vmovdquRR(dst, 0) }
+}
+
+fn vecBinMemOk(op: int, ek: int): bool {
+    if ek == ir.TY_F64 {
+        return op == ir.OP_ADD || op == ir.OP_SUB || op == ir.OP_MUL || op == ir.OP_DIV
+    }
+    if op == ir.OP_AND || op == ir.OP_OR || op == ir.OP_XOR || op == ir.OP_ADD || op == ir.OP_SUB || op == ir.OP_EQ {
+        return true
+    }
+    if ek == ir.TY_I64 { return op == ir.OP_GT }
+    if ek == ir.TY_I32 { return op == ir.OP_MUL || op == ir.OP_GT }
+    return false
+}
+
+fn vecBinComm(op: int): bool {
+    return op == ir.OP_ADD || op == ir.OP_MUL || op == ir.OP_AND || op == ir.OP_OR || op == ir.OP_XOR || op == ir.OP_EQ
+}
+
+fn (g: mut &Gen) emitVecBinMem(dst: int, ra: int, m: x64.Mem, op: int, ek: int) {
+    if ek == ir.TY_F64 {
+        if op == ir.OP_ADD { g.a.vaddpd256Mem(dst, ra, m) }
+        else if op == ir.OP_SUB { g.a.vsubpd256Mem(dst, ra, m) }
+        else if op == ir.OP_MUL { g.a.vmulpd256Mem(dst, ra, m) }
+        else { g.a.vdivpd256Mem(dst, ra, m) }
+        return
+    }
+    if op == ir.OP_AND { g.a.vpand256Mem(dst, ra, m); return }
+    if op == ir.OP_OR { g.a.vpor256Mem(dst, ra, m); return }
+    if op == ir.OP_XOR { g.a.vpxor256Mem(dst, ra, m); return }
+    if ek == ir.TY_I64 {
+        if op == ir.OP_ADD { g.a.vpaddq256Mem(dst, ra, m) }
+        else if op == ir.OP_SUB { g.a.vpsubq256Mem(dst, ra, m) }
+        else if op == ir.OP_EQ { g.a.vpcmpeqq256Mem(dst, ra, m) }
+        else { g.a.vpcmpgtq256Mem(dst, ra, m) }
+        return
+    }
+    if ek == ir.TY_I32 {
+        if op == ir.OP_ADD { g.a.vpaddd256Mem(dst, ra, m) }
+        else if op == ir.OP_SUB { g.a.vpsubd256Mem(dst, ra, m) }
+        else if op == ir.OP_MUL { g.a.vpmulld256Mem(dst, ra, m) }
+        else if op == ir.OP_EQ { g.a.vpcmpeqd256Mem(dst, ra, m) }
+        else { g.a.vpcmpgtd256Mem(dst, ra, m) }
+        return
+    }
+    if op == ir.OP_ADD { g.a.vpaddb256Mem(dst, ra, m) }
+    else if op == ir.OP_SUB { g.a.vpsubb256Mem(dst, ra, m) }
+    else { g.a.vpcmpeqb256Mem(dst, ra, m) }
+}
+
+fn (g: mut &Gen) genVecBin(e: int) { g.genVecBinInto(e, 0) }
+
+fn (g: mut &Gen) genVecBinInto(e: int, dst: int) {
     let n = g.u.nodes[e]
     let op = n.v
     let ek = g.u.tys[n.c].base
+    if vecBinMemOk(op, ek) {
+        if g.isQuietVecLoad(n.b) && g.u.tys[g.u.nty(n.b)].base == ek {
+            let ra = g.fregOf(n.a)
+            if ra >= 0 {
+                let m = g.vecPtrMem(g.u.nodes[n.b].a)
+                g.emitVecBinMem(dst, ra, m, op, ek)
+                return
+            }
+            if g.quietTree(n.a) {
+                g.genVec(n.a, 0)
+                let m = g.vecPtrMem(g.u.nodes[n.b].a)
+                g.emitVecBinMem(dst, 0, m, op, ek)
+                return
+            }
+        }
+        if vecBinComm(op) && g.isQuietVecLoad(n.a) && g.u.tys[g.u.nty(n.a)].base == ek && g.fregOf(n.b) >= 0 {
+            let rb = g.fregOf(n.b)
+            let m = g.vecPtrMem(g.u.nodes[n.a].a)
+            g.emitVecBinMem(dst, rb, m, op, ek)
+            return
+        }
+    }
     let p = g.pairV(n.a, n.b)
     let ra = p.a
     let rb = p.b
     if ek == ir.TY_F64 {
-        if op == ir.OP_ADD { g.a.vaddpd256(0, ra, rb) }
-        else if op == ir.OP_SUB { g.a.vsubpd256(0, ra, rb) }
-        else if op == ir.OP_MUL { g.a.vmulpd256(0, ra, rb) }
-        else if op == ir.OP_DIV { g.a.vdivpd256(0, ra, rb) }
-        else if op == ir.OP_EQ { g.a.vcmppd256(0, ra, rb, 0) }
-        else if op == ir.OP_NE { g.a.vcmppd256(0, ra, rb, 4) }
-        else if op == ir.OP_LT { g.a.vcmppd256(0, ra, rb, 1) }
-        else if op == ir.OP_LE { g.a.vcmppd256(0, ra, rb, 2) }
-        else if op == ir.OP_GT { g.a.vcmppd256(0, rb, ra, 1) }
-        else if op == ir.OP_GE { g.a.vcmppd256(0, rb, ra, 2) }
+        if op == ir.OP_ADD { g.a.vaddpd256(dst, ra, rb) }
+        else if op == ir.OP_SUB { g.a.vsubpd256(dst, ra, rb) }
+        else if op == ir.OP_MUL { g.a.vmulpd256(dst, ra, rb) }
+        else if op == ir.OP_DIV { g.a.vdivpd256(dst, ra, rb) }
+        else if op == ir.OP_EQ { g.a.vcmppd256(dst, ra, rb, 0) }
+        else if op == ir.OP_NE { g.a.vcmppd256(dst, ra, rb, 4) }
+        else if op == ir.OP_LT { g.a.vcmppd256(dst, ra, rb, 1) }
+        else if op == ir.OP_LE { g.a.vcmppd256(dst, ra, rb, 2) }
+        else if op == ir.OP_GT { g.a.vcmppd256(dst, rb, ra, 1) }
+        else if op == ir.OP_GE { g.a.vcmppd256(dst, rb, ra, 2) }
         else { g.fail(e, "vector f64 op") }
         return
     }
-    if op == ir.OP_AND { g.a.vpand256(0, ra, rb); return }
-    if op == ir.OP_OR { g.a.vpor256(0, ra, rb); return }
-    if op == ir.OP_XOR { g.a.vpxor256(0, ra, rb); return }
+    if op == ir.OP_AND { g.a.vpand256(dst, ra, rb); return }
+    if op == ir.OP_OR { g.a.vpor256(dst, ra, rb); return }
+    if op == ir.OP_XOR { g.a.vpxor256(dst, ra, rb); return }
     if ek == ir.TY_I64 {
-        if op == ir.OP_ADD { g.a.vpaddq256(0, ra, rb) }
-        else if op == ir.OP_SUB { g.a.vpsubq256(0, ra, rb) }
-        else if op == ir.OP_EQ { g.a.vpcmpeqq256(0, ra, rb) }
-        else if op == ir.OP_NE { g.a.vpcmpeqq256(0, ra, rb); g.a.vpcmpeqd256(2, 2, 2); g.a.vpxor256(0, 0, 2) }
-        else if op == ir.OP_GT { g.a.vpcmpgtq256(0, ra, rb) }
-        else if op == ir.OP_LT { g.a.vpcmpgtq256(0, rb, ra) }
-        else if op == ir.OP_LE { g.a.vpcmpgtq256(0, ra, rb); g.a.vpcmpeqd256(2, 2, 2); g.a.vpxor256(0, 0, 2) }
-        else if op == ir.OP_GE { g.a.vpcmpgtq256(0, rb, ra); g.a.vpcmpeqd256(2, 2, 2); g.a.vpxor256(0, 0, 2) }
+        if op == ir.OP_ADD { g.a.vpaddq256(dst, ra, rb) }
+        else if op == ir.OP_SUB { g.a.vpsubq256(dst, ra, rb) }
+        else if op == ir.OP_EQ { g.a.vpcmpeqq256(dst, ra, rb) }
+        else if op == ir.OP_NE { g.a.vpcmpeqq256(dst, ra, rb); g.a.vpcmpeqd256(2, 2, 2); g.a.vpxor256(dst, dst, 2) }
+        else if op == ir.OP_GT { g.a.vpcmpgtq256(dst, ra, rb) }
+        else if op == ir.OP_LT { g.a.vpcmpgtq256(dst, rb, ra) }
+        else if op == ir.OP_LE { g.a.vpcmpgtq256(dst, ra, rb); g.a.vpcmpeqd256(2, 2, 2); g.a.vpxor256(dst, dst, 2) }
+        else if op == ir.OP_GE { g.a.vpcmpgtq256(dst, rb, ra); g.a.vpcmpeqd256(2, 2, 2); g.a.vpxor256(dst, dst, 2) }
         else { g.fail(e, "vector i64 op") }
         return
     }
     if ek == ir.TY_I32 {
-        if op == ir.OP_ADD { g.a.vpaddd256(0, ra, rb) }
-        else if op == ir.OP_SUB { g.a.vpsubd256(0, ra, rb) }
-        else if op == ir.OP_MUL { g.a.vpmulld256(0, ra, rb) }
-        else if op == ir.OP_EQ { g.a.vpcmpeqd256(0, ra, rb) }
-        else if op == ir.OP_NE { g.a.vpcmpeqd256(0, ra, rb); g.a.vpcmpeqd256(2, 2, 2); g.a.vpxor256(0, 0, 2) }
-        else if op == ir.OP_GT { g.a.vpcmpgtd256(0, ra, rb) }
-        else if op == ir.OP_LT { g.a.vpcmpgtd256(0, rb, ra) }
-        else if op == ir.OP_LE { g.a.vpcmpgtd256(0, ra, rb); g.a.vpcmpeqd256(2, 2, 2); g.a.vpxor256(0, 0, 2) }
-        else if op == ir.OP_GE { g.a.vpcmpgtd256(0, rb, ra); g.a.vpcmpeqd256(2, 2, 2); g.a.vpxor256(0, 0, 2) }
+        if op == ir.OP_ADD { g.a.vpaddd256(dst, ra, rb) }
+        else if op == ir.OP_SUB { g.a.vpsubd256(dst, ra, rb) }
+        else if op == ir.OP_MUL { g.a.vpmulld256(dst, ra, rb) }
+        else if op == ir.OP_EQ { g.a.vpcmpeqd256(dst, ra, rb) }
+        else if op == ir.OP_NE { g.a.vpcmpeqd256(dst, ra, rb); g.a.vpcmpeqd256(2, 2, 2); g.a.vpxor256(dst, dst, 2) }
+        else if op == ir.OP_GT { g.a.vpcmpgtd256(dst, ra, rb) }
+        else if op == ir.OP_LT { g.a.vpcmpgtd256(dst, rb, ra) }
+        else if op == ir.OP_LE { g.a.vpcmpgtd256(dst, ra, rb); g.a.vpcmpeqd256(2, 2, 2); g.a.vpxor256(dst, dst, 2) }
+        else if op == ir.OP_GE { g.a.vpcmpgtd256(dst, rb, ra); g.a.vpcmpeqd256(2, 2, 2); g.a.vpxor256(dst, dst, 2) }
         else { g.fail(e, "vector i32 op") }
         return
     }
     // TY_U8 (unsigned comparisons)
-    if op == ir.OP_ADD { g.a.vpaddb256(0, ra, rb) }
-    else if op == ir.OP_SUB { g.a.vpsubb256(0, ra, rb) }
-    else if op == ir.OP_EQ { g.a.vpcmpeqb256(0, ra, rb) }
-    else if op == ir.OP_NE { g.a.vpcmpeqb256(0, ra, rb); g.a.vpcmpeqd256(2, 2, 2); g.a.vpxor256(0, 0, 2) }
-    else if op == ir.OP_LE { g.a.vpminub256(2, ra, rb); g.a.vpcmpeqb256(0, 2, ra) }
-    else if op == ir.OP_GE { g.a.vpmaxub256(2, ra, rb); g.a.vpcmpeqb256(0, 2, ra) }
-    else if op == ir.OP_LT { g.a.vpmaxub256(2, ra, rb); g.a.vpcmpeqb256(0, 2, ra); g.a.vpcmpeqd256(2, 2, 2); g.a.vpxor256(0, 0, 2) }
-    else if op == ir.OP_GT { g.a.vpminub256(2, ra, rb); g.a.vpcmpeqb256(0, 2, ra); g.a.vpcmpeqd256(2, 2, 2); g.a.vpxor256(0, 0, 2) }
+    if op == ir.OP_ADD { g.a.vpaddb256(dst, ra, rb) }
+    else if op == ir.OP_SUB { g.a.vpsubb256(dst, ra, rb) }
+    else if op == ir.OP_EQ { g.a.vpcmpeqb256(dst, ra, rb) }
+    else if op == ir.OP_NE { g.a.vpcmpeqb256(dst, ra, rb); g.a.vpcmpeqd256(2, 2, 2); g.a.vpxor256(dst, dst, 2) }
+    else if op == ir.OP_LE { g.a.vpminub256(2, ra, rb); g.a.vpcmpeqb256(dst, 2, ra) }
+    else if op == ir.OP_GE { g.a.vpmaxub256(2, ra, rb); g.a.vpcmpeqb256(dst, 2, ra) }
+    else if op == ir.OP_LT { g.a.vpmaxub256(2, ra, rb); g.a.vpcmpeqb256(dst, 2, ra); g.a.vpcmpeqd256(2, 2, 2); g.a.vpxor256(dst, dst, 2) }
+    else if op == ir.OP_GT { g.a.vpminub256(2, ra, rb); g.a.vpcmpeqb256(dst, 2, ra); g.a.vpcmpeqd256(2, 2, 2); g.a.vpxor256(dst, dst, 2) }
     else { g.fail(e, "vector u8 op") }
 }
 
-fn (g: mut &Gen) genVecOp(e: int) {
+fn (g: mut &Gen) emitBlendV(dst: int, rf: int, rt: int, rm: int, ek: int) {
+    if ek == ir.TY_F64 || ek == ir.TY_I64 { g.a.vblendvpd256(dst, rf, rt, rm) }
+    else if ek == ir.TY_I32 { g.a.vblendvps256(dst, rf, rt, rm) }
+    else { g.a.vpblendvb256(dst, rf, rt, rm) }
+}
+
+fn (g: mut &Gen) genVecOp(e: int) { g.genVecOpInto(e, 0) }
+
+fn (g: mut &Gen) genVecOpInto(e: int, dst: int) {
     let n = g.u.nodes[e]
     let op = n.v
     if op == ir.V_CTZ || op == ir.V_CLZ || op == ir.V_POPCNT {
@@ -10261,47 +10558,57 @@ fn (g: mut &Gen) genVecOp(e: int) {
         return
     }
     if op == ir.V_ZERO {
-        g.a.vpxor256(0, 0, 0)
+        g.a.vpxor256(dst, dst, dst)
         return
     }
     if op == ir.V_SPLAT {
         let ek = g.u.tys[n.ty].base
-        g.gen(n.a)
         if ek == ir.TY_F64 {
-            g.a.vbroadcastsd(0, 0)
+            let rf = g.fregOf(n.a)
+            if rf >= 0 {
+                g.a.vbroadcastsd(dst, rf)
+            } else {
+                g.gen(n.a)
+                g.a.vbroadcastsd(dst, 0)
+            }
         } else if ek == ir.TY_I64 {
-            g.a.vmovqXR(0, RAX)
-            g.a.vpbroadcastq(0, 0)
+            let ra = g.regOf(n.a)
+            if ra >= 0 { g.a.vmovqXR(dst, ra) }
+            else { g.gen(n.a); g.a.vmovqXR(dst, RAX) }
+            g.a.vpbroadcastq(dst, dst)
         } else if ek == ir.TY_I32 {
-            g.a.vmovdXR(0, RAX)
-            g.a.vpbroadcastd(0, 0)
+            let ra = g.regOf(n.a)
+            if ra >= 0 { g.a.vmovdXR(dst, ra) }
+            else { g.gen(n.a); g.a.vmovdXR(dst, RAX) }
+            g.a.vpbroadcastd(dst, dst)
         } else {
-            g.a.vmovdXR(0, RAX)
-            g.a.vpbroadcastb(0, 0)
+            let ra = g.regOf(n.a)
+            if ra >= 0 { g.a.vmovdXR(dst, ra) }
+            else { g.gen(n.a); g.a.vmovdXR(dst, RAX) }
+            g.a.vpbroadcastb(dst, dst)
         }
         return
     }
     if op == ir.V_LOAD {
         let ek = g.u.tys[n.ty].base
-        g.gen(n.a)
-        if ek == ir.TY_F64 { g.a.vmovupdLoad(0, x64.mem(RAX, 0)) }
-        else { g.a.vmovdquLoad(0, x64.mem(RAX, 0)) }
+        let m = g.vecPtrMem(n.a)
+        if ek == ir.TY_F64 { g.a.vmovupdLoad(dst, m) }
+        else { g.a.vmovdquLoad(dst, m) }
         return
     }
     if op == ir.V_LOAD_U8 || op == ir.V_LOAD_U16 || op == ir.V_LOAD_I16 || op == ir.V_LOAD_U32 || op == ir.V_LOAD_I32 {
         let ek = g.u.tys[n.ty].base
-        g.gen(n.a)
-        let m = x64.mem(RAX, 0)
+        let m = g.vecPtrMem(n.a)
         if ek == ir.TY_I64 {
-            if op == ir.V_LOAD_U8 { g.a.vpmovzxbqLoad(0, m) }
-            else if op == ir.V_LOAD_U16 { g.a.vpmovzxwqLoad(0, m) }
-            else if op == ir.V_LOAD_I16 { g.a.vpmovsxwqLoad(0, m) }
-            else if op == ir.V_LOAD_U32 { g.a.vpmovzxdqLoad(0, m) }
-            else { g.a.vpmovsxdqLoad(0, m) }
+            if op == ir.V_LOAD_U8 { g.a.vpmovzxbqLoad(dst, m) }
+            else if op == ir.V_LOAD_U16 { g.a.vpmovzxwqLoad(dst, m) }
+            else if op == ir.V_LOAD_I16 { g.a.vpmovsxwqLoad(dst, m) }
+            else if op == ir.V_LOAD_U32 { g.a.vpmovzxdqLoad(dst, m) }
+            else { g.a.vpmovsxdqLoad(dst, m) }
         } else {
-            if op == ir.V_LOAD_U8 { g.a.vpmovzxbdLoad(0, m) }
-            else if op == ir.V_LOAD_U16 { g.a.vpmovzxwdLoad(0, m) }
-            else { g.a.vpmovsxwdLoad(0, m) }
+            if op == ir.V_LOAD_U8 { g.a.vpmovzxbdLoad(dst, m) }
+            else if op == ir.V_LOAD_U16 { g.a.vpmovzxwdLoad(dst, m) }
+            else { g.a.vpmovsxwdLoad(dst, m) }
         }
         return
     }
@@ -10309,15 +10616,22 @@ fn (g: mut &Gen) genVecOp(e: int) {
         let ek = g.u.tys[g.u.nty(n.b)].base
         let rv = g.fregOf(n.b)
         if rv >= 0 {
-            g.gen(n.a)
-            if ek == ir.TY_F64 { g.a.vmovupdStore(x64.mem(RAX, 0), rv) }
-            else { g.a.vmovdquStore(x64.mem(RAX, 0), rv) }
+            let m = g.vecPtrMem(n.a)
+            if ek == ir.TY_F64 { g.a.vmovupdStore(m, rv) }
+            else { g.a.vmovdquStore(m, rv) }
+            return
+        }
+        if !g.u.nodeHasVec(n.a) && g.quietTree(n.a) {
+            g.genVec(n.b, 0)
+            let m = g.vecPtrMem(n.a)
+            if ek == ir.TY_F64 { g.a.vmovupdStore(m, 0) }
+            else { g.a.vmovdquStore(m, 0) }
             return
         }
         g.gen(n.a)
         let sp = g.temp(8, 8)
         g.a.store(8, rbp(sp), RAX)
-        g.gen(n.b)
+        g.genVec(n.b, 0)
         g.a.load(8, RAX, rbp(sp))
         if ek == ir.TY_F64 { g.a.vmovupdStore(x64.mem(RAX, 0), 0) }
         else { g.a.vmovdquStore(x64.mem(RAX, 0), 0) }
@@ -10372,6 +10686,7 @@ fn (g: mut &Gen) genVecOp(e: int) {
         g.a.bind(reloadL)
         g.a.vmovdquLoad(0, rbp(buf))
         g.a.bind(doneL)
+        if dst != 0 { g.a.vmovdquRR(dst, 0) }
         return
     }
     if op == ir.V_STORE_PARTIAL {
@@ -10412,74 +10727,126 @@ fn (g: mut &Gen) genVecOp(e: int) {
         return
     }
     if op == ir.V_SQRT {
-        g.gen(n.a)
-        g.a.vsqrtpd256(0, 0)
+        g.genVec(n.a, dst)
+        g.a.vsqrtpd256(dst, dst)
         return
     }
     if op == ir.V_ABS {
-        g.gen(n.a)
+        g.genVec(n.a, dst)
         g.a.movRI(RCX, -9223372036854775807 - 1)
         g.a.vmovqXR(1, RCX)
         g.a.vbroadcastsd(1, 1)
-        g.a.vandnpd256(0, 1, 0)
+        g.a.vandnpd256(dst, 1, dst)
         return
     }
     if op == ir.V_FMADD {
         let ra = g.fregOf(n.a)
         let rb = g.fregOf(n.b)
-        if ra >= 0 && rb >= 0 && !g.assignsLocal(n.c, g.u.nodes[n.a].a) && !g.assignsLocal(n.c, g.u.nodes[n.b].a) {
-            g.gen(n.c)
-            g.a.vfmadd231pd256(0, ra, rb)
+        let rc = g.fregOf(n.c)
+        if rc >= 0 && rc == dst {
+            let cl = g.u.nodes[n.c].a
+            if !g.assignsLocal(n.a, cl) && !g.assignsLocal(n.b, cl) {
+                if g.isQuietVecLoad(n.b) && g.quietTree(n.a) {
+                    if ra >= 0 {
+                        g.a.vfmadd231pd256Mem(dst, ra, g.vecPtrMem(g.u.nodes[n.b].a))
+                        return
+                    }
+                    g.genVec(n.a, 0)
+                    g.a.vfmadd231pd256Mem(dst, 0, g.vecPtrMem(g.u.nodes[n.b].a))
+                    return
+                }
+                if g.isQuietVecLoad(n.a) && rb >= 0 {
+                    g.a.vfmadd231pd256Mem(dst, rb, g.vecPtrMem(g.u.nodes[n.a].a))
+                    return
+                }
+                let p = g.pairV(n.a, n.b)
+                g.a.vfmadd231pd256(dst, p.a, p.b)
+                return
+            }
+        }
+        if ra >= 0 && rb >= 0 && ra != dst && rb != dst && !g.assignsLocal(n.c, g.u.nodes[n.a].a) && !g.assignsLocal(n.c, g.u.nodes[n.b].a) {
+            g.genVec(n.c, dst)
+            g.a.vfmadd231pd256(dst, ra, rb)
             return
         }
-        g.gen(n.a)
+        if ra >= 0 && ra != dst && g.isQuietVecLoad(n.b) && g.quietTree(n.c) && !g.assignsLocal(n.c, g.u.nodes[n.a].a) {
+            g.genVec(n.c, dst)
+            g.a.vfmadd231pd256Mem(dst, ra, g.vecPtrMem(g.u.nodes[n.b].a))
+            return
+        }
+        if rb >= 0 && rb != dst && g.isQuietVecLoad(n.a) && g.quietTree(n.c) && !g.assignsLocal(n.c, g.u.nodes[n.b].a) {
+            g.genVec(n.c, dst)
+            g.a.vfmadd231pd256Mem(dst, rb, g.vecPtrMem(g.u.nodes[n.a].a))
+            return
+        }
+        g.genVec(n.a, 0)
         let sa = g.temp(32, 32)
         g.a.vmovdquStore(rbp(sa), 0)
-        g.gen(n.b)
+        g.genVec(n.b, 0)
         let sb = g.temp(32, 32)
         g.a.vmovdquStore(rbp(sb), 0)
-        g.gen(n.c)
+        g.genVec(n.c, dst)
         g.a.vmovdquLoad(1, rbp(sa))
         g.a.vmovdquLoad(2, rbp(sb))
-        g.a.vfmadd231pd256(0, 1, 2)
+        g.a.vfmadd231pd256(dst, 1, 2)
         return
     }
     if op == ir.V_MIN || op == ir.V_MAX {
         let ek = g.u.tys[n.ty].base
         let p = g.pairV(n.a, n.b)
         if ek == ir.TY_F64 {
-            if op == ir.V_MIN { g.a.vminpd256(0, p.a, p.b) } else { g.a.vmaxpd256(0, p.a, p.b) }
+            if op == ir.V_MIN { g.a.vminpd256(dst, p.a, p.b) } else { g.a.vmaxpd256(dst, p.a, p.b) }
         } else if ek == ir.TY_I32 {
-            if op == ir.V_MIN { g.a.vpminsd256(0, p.a, p.b) } else { g.a.vpmaxsd256(0, p.a, p.b) }
+            if op == ir.V_MIN { g.a.vpminsd256(dst, p.a, p.b) } else { g.a.vpmaxsd256(dst, p.a, p.b) }
         } else if ek == ir.TY_U8 {
-            if op == ir.V_MIN { g.a.vpminub256(0, p.a, p.b) } else { g.a.vpmaxub256(0, p.a, p.b) }
+            if op == ir.V_MIN { g.a.vpminub256(dst, p.a, p.b) } else { g.a.vpmaxub256(dst, p.a, p.b) }
         } else {
             g.a.vpcmpgtq256(2, p.a, p.b)
-            if op == ir.V_MIN { g.a.vblendvpd256(0, p.a, p.b, 2) } else { g.a.vblendvpd256(0, p.b, p.a, 2) }
+            if op == ir.V_MIN { g.a.vblendvpd256(dst, p.a, p.b, 2) } else { g.a.vblendvpd256(dst, p.b, p.a, 2) }
         }
         return
     }
     if op == ir.V_SELECT {
         let ek = g.u.tys[n.ty].base
-        g.gen(n.a)
+        let rm = g.fregOf(n.a)
+        let rt = g.fregOf(n.b)
+        let rf = g.fregOf(n.c)
+        if rm >= 0 && rf >= 0 && !g.assignsLocal(n.b, g.u.nodes[n.a].a) && !g.assignsLocal(n.b, g.u.nodes[n.c].a) {
+            if rt >= 0 {
+                g.emitBlendV(dst, rf, rt, rm, ek)
+            } else {
+                g.genVec(n.b, 0)
+                g.emitBlendV(dst, rf, 0, rm, ek)
+            }
+            return
+        }
+        if rt >= 0 && rf >= 0 && !g.assignsLocal(n.a, g.u.nodes[n.b].a) && !g.assignsLocal(n.a, g.u.nodes[n.c].a) {
+            g.genVec(n.a, 0)
+            g.emitBlendV(dst, rf, rt, 0, ek)
+            return
+        }
+        if rm >= 0 && rt >= 0 && !g.assignsLocal(n.c, g.u.nodes[n.a].a) && !g.assignsLocal(n.c, g.u.nodes[n.b].a) {
+            g.genVec(n.c, 0)
+            g.emitBlendV(dst, 0, rt, rm, ek)
+            return
+        }
+        g.genVec(n.a, 0)
         let sm = g.temp(32, 32)
         g.a.vmovdquStore(rbp(sm), 0)
-        g.gen(n.b)
+        g.genVec(n.b, 0)
         let sa = g.temp(32, 32)
         g.a.vmovdquStore(rbp(sa), 0)
-        g.gen(n.c)
+        g.genVec(n.c, 0)
         g.a.vmovdquLoad(1, rbp(sa))
         g.a.vmovdquLoad(2, rbp(sm))
-        if ek == ir.TY_F64 || ek == ir.TY_I64 { g.a.vblendvpd256(0, 0, 1, 2) }
-        else if ek == ir.TY_I32 { g.a.vblendvps256(0, 0, 1, 2) }
-        else { g.a.vpblendvb256(0, 0, 1, 2) }
+        g.emitBlendV(dst, 0, 1, 2, ek)
         return
     }
     if op == ir.V_BITMASK {
         let ek = g.u.tys[g.u.nty(n.a)].base
         let rv = g.fregOf(n.a)
         let reg = if rv >= 0 { rv } else { 0 }
-        if rv < 0 { g.gen(n.a) }
+        if rv < 0 { g.genVec(n.a, 0) }
         if ek == ir.TY_F64 || ek == ir.TY_I64 { g.a.vmovmskpd256(RAX, reg) }
         else if ek == ir.TY_I32 { g.a.vmovmskps256(RAX, reg) }
         else { g.a.vpmovmskb256(RAX, reg) }
@@ -10487,7 +10854,7 @@ fn (g: mut &Gen) genVecOp(e: int) {
     }
     if op == ir.V_SHUFFLE {
         let p = g.pairV(n.a, n.b)
-        g.a.vpshufb256(0, p.a, p.b)
+        g.a.vpshufb256(dst, p.a, p.b)
         return
     }
     if op == ir.V_SHL || op == ir.V_SHR {
@@ -10495,23 +10862,23 @@ fn (g: mut &Gen) genVecOp(e: int) {
         if ek == ir.TY_U8 {
             if g.u.nk(n.b) == ir.E_INT {
                 let k = g.u.nodes[n.b].v
-                g.gen(n.a)
+                g.genVec(n.a, dst)
                 if k == 0 { return }
                 if k < 0 || k >= 8 {
-                    g.a.vpxor256(0, 0, 0)
+                    g.a.vpxor256(dst, dst, dst)
                     return
                 }
                 let mask = if op == ir.V_SHL { (0xff << k) & 0xff } else { 0xff >> k }
-                if op == ir.V_SHL { g.a.vpsllwImm256(0, 0, k) }
-                else { g.a.vpsrlwImm256(0, 0, k) }
+                if op == ir.V_SHL { g.a.vpsllwImm256(dst, dst, k) }
+                else { g.a.vpsrlwImm256(dst, dst, k) }
                 g.a.movRI(RCX, mask)
                 g.a.vmovdXR(1, RCX)
                 g.a.vpbroadcastb(1, 1)
-                g.a.vpand256(0, 0, 1)
+                g.a.vpand256(dst, dst, 1)
                 return
             }
             let s = g.temp(32, 32)
-            g.gen(n.a)
+            g.genVec(n.a, 0)
             g.a.vmovdquStore(rbp(s), 0)
             g.gen(n.b)
             let zeroL = g.a.newLabel()
@@ -10525,34 +10892,34 @@ fn (g: mut &Gen) genVecOp(e: int) {
             else { g.a.shiftCL(x64.SHR, 4, RDX) }
             g.a.vmovdXR(2, RDX)
             g.a.vpbroadcastb(2, 2)
-            g.a.vmovdquLoad(0, rbp(s))
-            if op == ir.V_SHL { g.a.vpsllw256(0, 0, 1) }
-            else { g.a.vpsrlw256(0, 0, 1) }
-            g.a.vpand256(0, 0, 2)
+            g.a.vmovdquLoad(dst, rbp(s))
+            if op == ir.V_SHL { g.a.vpsllw256(dst, dst, 1) }
+            else { g.a.vpsrlw256(dst, dst, 1) }
+            g.a.vpand256(dst, dst, 2)
             g.a.jmp(doneL)
             g.a.bind(zeroL)
-            g.a.vpxor256(0, 0, 0)
+            g.a.vpxor256(dst, dst, dst)
             g.a.bind(doneL)
             return
         }
         let s = g.temp(32, 32)
-        g.gen(n.a)
+        g.genVec(n.a, 0)
         g.a.vmovdquStore(rbp(s), 0)
         g.gen(n.b)
         g.a.vmovqXR(1, RAX)
-        g.a.vmovdquLoad(0, rbp(s))
+        g.a.vmovdquLoad(dst, rbp(s))
         if ek == ir.TY_I64 {
             if op == ir.V_SHL {
-                g.a.vpsllq256(0, 0, 1)
+                g.a.vpsllq256(dst, dst, 1)
             } else {
                 g.a.vpxor256(2, 2, 2)
-                g.a.vpcmpgtq256(2, 2, 0)
-                g.a.vpxor256(0, 0, 2)
-                g.a.vpsrlq256(0, 0, 1)
-                g.a.vpxor256(0, 0, 2)
+                g.a.vpcmpgtq256(2, 2, dst)
+                g.a.vpxor256(dst, dst, 2)
+                g.a.vpsrlq256(dst, dst, 1)
+                g.a.vpxor256(dst, dst, 2)
             }
         } else {
-            if op == ir.V_SHL { g.a.vpslld256(0, 0, 1) } else { g.a.vpsrad256(0, 0, 1) }
+            if op == ir.V_SHL { g.a.vpslld256(dst, dst, 1) } else { g.a.vpsrad256(dst, dst, 1) }
         }
         return
     }

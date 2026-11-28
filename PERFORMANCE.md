@@ -21,7 +21,7 @@ Method: wall times are best of N; instruction counts are user-mode
 |---|---|---|
 | Compile time | Rust | Much faster: about 3.0 times for hello world, about 18 times for nine programs |
 | Microbenchmarks (normal) | Rust, Java, Go | Faster than Rust on twelve of nineteen, level on two (`loop`, `btree`); faster than warmed-up Java on ten of twenty, level on two (`maps`, `nbody`); task switching about 1.8 times Go's speed; 2–31 MB on nineteen of twenty against the JVM's 51 MB–2.39 GB |
-| Microbenchmarks (explicit SIMD) | Rust (`std::arch`), Java (Vector API) | Safe built-in `vector[T]` speeds up Lexell by 1.15–2.82× over scalar; ahead of Rust `unsafe` AVX2 on `sieve_vec` (0.92×) and within 3% on `bitpack_vec` and `dot_vec`; ahead of Java Vector API on `bitpack_vec` (0.60×) and `sieve_vec` (0.86×) at 3–31 MB vs 108–696 MB RSS |
+| Microbenchmarks (explicit SIMD) | Rust (`std::arch`), Java (Vector API) | Safe built-in `vector[T]` speeds up Lexell by 1.07–3.34× over scalar; ahead of Rust `unsafe` AVX2 on `sieve_vec` (0.98×), level on `dot_vec` (1.00×), within 3–4% on `bitpack_vec` & `array_vec` (1.03–1.04×), and 1.21× on `matmul_vec`; ahead of Java Vector API on 3 of 5 (`bitpack_vec` 0.60×, `sieve_vec` 0.92×, `array_vec` 0.99×) at 3–31 MB vs 108–697 MB RSS |
 | Regex | Go, Rust | Faster than Go on all; slower than Rust on six of seven, 4.1 times faster on `(?m)^ERROR .*timeout$` |
 | JSON | Python, jq | 3.3 times faster than Python to parse and 1.6–1.7 times faster to write, slower to query; 2.0 to 3.5 times faster than jq 1.7.1 on every filter |
 | Markdown | cmark | Faster on repository Markdown (`0.97×`) and the spec examples (`0.93×`), slightly slower on the spec text (`1.08×`) |
@@ -175,31 +175,32 @@ checksum.
 
 | program | Lexell (`vector[T]`) | Rust (`std::arch` AVX2) | Lexell / Rust | Java (Vector API, warm) | Lexell / Java | vs scalar Lexell |
 |---|---:|---:|---:|---:|---:|---:|
-| array_vec | 91 ms | 71 ms | 1.29 | 74 ms | 1.23 | 2.82× faster |
-| sieve_vec | 253 ms | 275 ms | 0.92 | 295 ms | 0.86 | 1.15× faster |
-| matmul_vec | 55 ms | 35 ms | 1.56 | 38 ms | 1.44 | 1.58× faster |
-| bitpack_vec | 164 ms | 159 ms | 1.03 | 273 ms | 0.60 | 2.37× faster |
-| dot_vec | 37 ms | 36 ms | 1.03 | 28 ms | 1.31 | - |
+| array_vec | 77 ms | 74 ms | 1.04 | 78 ms | 0.99 | 3.34× faster |
+| sieve_vec | 270 ms | 275 ms | 0.98 | 293 ms | 0.92 | 1.07× faster |
+| matmul_vec | 42 ms | 34 ms | 1.21 | 39 ms | 1.07 | 2.07× faster |
+| bitpack_vec | 163 ms | 159 ms | 1.03 | 271 ms | 0.60 | 2.39× faster |
+| dot_vec | 34 ms | 34 ms | 1.00 | 28 ms | 1.22 | - |
 
 Peak resident memory of the explicit-SIMD runs:
 
 | program | Lexell (`vector[T]`) | Rust (`std::arch` AVX2) | Java (Vector API) |
 |---|---:|---:|---:|
-| array_vec | 9.5 MB | 9.9 MB | 302.9 MB |
-| sieve_vec | 12.0 MB | 12.0 MB | 362.1 MB |
-| matmul_vec | 4.0 MB | 5.8 MB | 109.2 MB |
-| bitpack_vec | 31.2 MB | 28.3 MB | 695.7 MB |
+| array_vec | 9.5 MB | 9.9 MB | 304.2 MB |
+| sieve_vec | 12.0 MB | 11.8 MB | 365.6 MB |
+| matmul_vec | 4.0 MB | 5.7 MB | 109.9 MB |
+| bitpack_vec | 31.2 MB | 28.2 MB | 696.5 MB |
 | dot_vec | 3.0 MB | 3.2 MB | 107.8 MB |
 
-Safe `vector[T]` delivers 1.15× to 2.82× speedups over scalar Lexell (`array` 257 → 91 ms,
-`bitpack` 389 → 164 ms, `matmul` 87 → 55 ms, `sieve` 290 → 253 ms). Against Rust's `unsafe`
-`std::arch::x86_64` intrinsics, Lexell leads on `sieve_vec` (0.92×) and sits within 3% on
-`bitpack_vec` (1.03×) and `dot_vec` (1.03×); on `array_vec` (91 vs 71 ms) and `matmul_vec`
-(55 vs 35 ms), Rust's raw-pointer loops omit per-step bounds checks and LLVM unrolls/schedules the
-loads more aggressively (Lexell's C backend reaches 75 ms and 39 ms on the same `vector[T]` source,
-indicating room for further loop scheduling in `x64gen`). Against Java's warmed-up Vector API,
-Lexell leads on `bitpack_vec` (0.60×) and `sieve_vec` (0.86×) and trails on `array_vec` (1.23×),
-`dot_vec` (1.31×), and `matmul_vec` (1.44×), while using 3–31 MB RSS against the JVM's 108–696 MB.
+Safe `vector[T]` delivers 1.07× to 3.34× speedups over scalar Lexell (`array` 257 → 77 ms,
+`bitpack` 389 → 163 ms, `matmul` 87 → 42 ms, `sieve` 290 → 270 ms), and beats or matches Lexell's
+own C (`gcc -O2`) backend on 4 of 5 workloads (`array_vec` 0.96×, `bitpack_vec` 0.66×, `dot_vec`
+0.98×, `matmul_vec` 1.07×). Against Rust's `unsafe` `std::arch::x86_64` intrinsics, Lexell leads
+on `sieve_vec` (0.98×), matches on `dot_vec` (1.00×), and sits within 3–4% on `bitpack_vec`
+(1.03×) and `array_vec` (1.04×); on `matmul_vec` (42 vs 34 ms, 1.21×), the remaining gap is that
+LLVM inlines `axpy` into the `k` loop across the 800,000 calls while Lexell's inliner keeps `axpy`
+out of line. Against Java's warmed-up Vector API, Lexell leads on `bitpack_vec` (0.60×),
+`sieve_vec` (0.92×), and `array_vec` (0.99×), is within 7% on `matmul_vec` (1.07×), and trails on
+`dot_vec` (1.22×), while using 3–31 MB RSS against the JVM's 108–697 MB.
 
 ## Applications
 
