@@ -1,0 +1,105 @@
+// LexDB-shaped benchmark: columnar bit-packed integer decoding + filter + multiply-sum
+// (mirrors lexdb_cols / lexdb_vec scanning compressed lineitem columns in TPC-H Q1/Q6).
+
+type VI32 = vector[i32]
+
+fn packCol(vals: &[int], bits: int): []byte {
+    let n = len(vals)
+    let totalBits = n * bits
+    var out = array((totalBits + 7) / 8 + 8, byte(0))
+    var bitPos = 0
+    for i in 0..n {
+        let v = vals[i]
+        var b = 0
+        while b < bits {
+            let byteIdx = (bitPos + b) >> 3
+            let bitOff = (bitPos + b) & 7
+            let take = 8 - bitOff
+            let rem = bits - b
+            let k = if take < rem { take } else { rem }
+            let mask = (1 << k) - 1
+            let chunk = (v >> b) & mask
+            out[byteIdx] = byte(int(out[byteIdx]) | (chunk << bitOff))
+            b += k
+        }
+        bitPos += bits
+    }
+    return out
+}
+
+fn unpackBatch(buf: &[byte], startIdx: int, count: int, bits: int, baseVal: int, dst: mut &[i32]) {
+    let mask = (1 << bits) - 1
+    var bitPos = startIdx * bits
+    for i in 0..count {
+        let byteIdx = bitPos >> 3
+        let bitOff = bitPos & 7
+        // Read 4 consecutive bytes little-endian (enough for bits <= 25)
+        let w = int(buf[byteIdx]) |
+            (int(buf[byteIdx + 1]) << 8) |
+            (int(buf[byteIdx + 2]) << 16) |
+            (int(buf[byteIdx + 3]) << 24)
+        dst[i] = i32(baseVal + ((w >> bitOff) & mask))
+        bitPos += bits
+    }
+}
+
+fn main() {
+    let n = 1000000
+    let batch = 1024
+    var rawQty = array(n, 0)
+    var rawDisc = array(n, 0)
+    var rawPrice = array(n, 0)
+    var s = 123456789
+    for i in 0..n {
+        s = ((s *% 6364136223846793005) +% 1442695040888963407) & 4611686018427387903
+        rawQty[i] = (s >> 16) & 63          // 6-bit (0..63), base 1
+        rawDisc[i] = (s >> 24) & 15         // 4-bit (0..15), base 0
+        rawPrice[i] = (s >> 30) & 131071    // 17-bit (0..131071), base 90000
+    }
+    let pQty = packCol(&rawQty, 6)
+    let pDisc = packCol(&rawDisc, 4)
+    let pPrice = packCol(&rawPrice, 17)
+
+    var qty = array(batch, i32(0))
+    var disc = array(batch, i32(0))
+    var price = array(batch, i32(0))
+
+    var total = 0
+    for round in 0..60 {
+        let loDisc = i32(4 + (round & 3))
+        let hiDisc = i32(int(loDisc) + 4)
+        let maxQty = i32(30 + (round & 7))
+        let vLo = VI32.splat(loDisc)
+        let vHi = VI32.splat(hiDisc)
+        let vMaxQ = VI32.splat(maxQty)
+        let vZero = VI32.zero()
+        var pos = 0
+        while pos < n {
+            let cnt = if n - pos < batch { n - pos } else { batch }
+            unpackBatch(&pQty, pos, cnt, 6, 1, mut &qty)
+            unpackBatch(&pDisc, pos, cnt, 4, 0, mut &disc)
+            unpackBatch(&pPrice, pos, cnt, 17, 90000, mut &price)
+            var vAcc = VI32.zero()
+            var i = 0
+            let ds = disc[0..cnt]
+            for vd in VI32.chunks(&ds, mut &i) {
+                let vq = VI32.load(&qty, i)
+                let vp = VI32.load(&price, i)
+                let m = (vd >= vLo) & (vd <= vHi) & (vq < vMaxQ)
+                vAcc = vAcc +% m.select(vp *% vd, vZero)
+            }
+            if i < cnt {
+                let vd = VI32.loadPartial(&ds, i, i32(0))
+                let vq = VI32.loadPartial(&(qty[0..cnt]), i, maxQty)
+                let vp = VI32.loadPartial(&(price[0..cnt]), i, i32(0))
+                let m = (vd >= vLo) & (vd <= vHi) & (vq < vMaxQ)
+                vAcc = vAcc +% m.select(vp *% vd, vZero)
+            }
+            for lane in 0..VI32.lanes {
+                total += int(vAcc.lane(lane))
+            }
+            pos += cnt
+        }
+    }
+    println(total)
+}

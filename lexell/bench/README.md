@@ -153,6 +153,26 @@ output does not depend on the seed.
 The results, with eza and the compiler, are in
 [PERFORMANCE.md](../../PERFORMANCE.md).
 
+## Explicit SIMD microbenchmarks
+
+The twenty programs in `bench.py` are strictly plain, non-vectorized code in
+Lexell, Rust and Java (no explicit `vector[T]`, `std::arch` or
+`jdk.incubator.vector`). Explicit 256-bit AVX2 SIMD kernels live in a separate
+suite so all three languages use their explicit vector APIs side by side:
+
+    python3 lexell/bench/simd_bench.py [-n RUNS] [--only NAME ...] [--opt] [--no-rust] [--no-java]
+
+- **Lexell** (`simd/{array,sieve,matmul,bitpack,dot}_vec.lxl`): built-in,
+  bounds-checked `vector[T]` (no `unsafe`).
+- **Rust** (`rust/src/main.rs`, `*_vec` subcommands): `std::arch::x86_64`
+  AVX2/FMA intrinsics (`unsafe`, since `std::simd` is nightly-only on stable
+  `rustc`).
+- **Java** (`java/SimdBench.java`): OpenJDK 21 `jdk.incubator.vector` Vector API
+  (`--add-modules jdk.incubator.vector`, warmed up).
+
+Every port must print the exact same checksum, and Lexell builds are checked for
+leaks under `LXL_CHECK=1`.
+
 ## Application suite
 
 `python3 lexell/bench/apps.py [-n RUNS] [--only APP ...] [--json] [--json-out FILE]

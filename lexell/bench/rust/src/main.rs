@@ -1154,6 +1154,281 @@ fn bench_enum_eval() {
     println!("{}", total);
 }
 
+// ---------------------------------------------------------------- explicit SIMD (std::arch::x86_64 AVX2/FMA)
+// Separate explicit-SIMD benchmark suite (`bench/simd_bench.py`), comparing
+// Lexell's safe `vector[T]`, Rust's `std::arch::x86_64` AVX2 intrinsics
+// (`std::simd` is nightly-only on stable rustc), and Java's `jdk.incubator.vector`.
+
+#[cfg(target_arch = "x86_64")]
+fn bench_array_vec() {
+    use std::arch::x86_64::*;
+    let n: usize = 1_000_000;
+    let mut a: Vec<i64> = Vec::new();
+    for i in 0..n as i64 {
+        a.push(i);
+    }
+    let mut total: i64 = 0;
+    for r in 0..800i64 {
+        unsafe {
+            let vr = _mm256_set1_epi64x(r);
+            let mut acc = _mm256_setzero_si256();
+            let mut i = 0usize;
+            let ptr = a.as_mut_ptr();
+            while i + 4 <= n {
+                let v = _mm256_add_epi64(_mm256_loadu_si256(ptr.add(i) as *const __m256i), vr);
+                _mm256_storeu_si256(ptr.add(i) as *mut __m256i, v);
+                acc = _mm256_add_epi64(acc, v);
+                i += 4;
+            }
+            let mut lanes = [0i64; 4];
+            _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, acc);
+            total = total.wrapping_add(lanes[0] + lanes[1] + lanes[2] + lanes[3]);
+            while i < n {
+                a[i] = a[i].wrapping_add(r);
+                total = total.wrapping_add(a[i]);
+                i += 1;
+            }
+        }
+    }
+    println!("{}", total);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn bench_sieve_vec() {
+    use std::arch::x86_64::*;
+    let n: usize = 10_000_000;
+    let mut count: i64 = 0;
+    for _round in 0..30 {
+        let mut prime: Vec<u8> = vec![1; n + 1];
+        prime[0] = 0;
+        prime[1] = 0;
+        let mut i = 2usize;
+        while i * i <= n {
+            if prime[i] != 0 {
+                let mut j = i * i;
+                while j <= n {
+                    prime[j] = 0;
+                    j += i;
+                }
+            }
+            i += 1;
+        }
+        count = 0;
+        unsafe {
+            let vzero = _mm256_setzero_si256();
+            let ptr = prime.as_ptr();
+            let m = n + 1;
+            let mut k = 0usize;
+            while k + 32 <= m {
+                let v = _mm256_loadu_si256(ptr.add(k) as *const __m256i);
+                let eq = _mm256_cmpeq_epi8(v, vzero);
+                let mask = !(_mm256_movemask_epi8(eq) as u32);
+                count += mask.count_ones() as i64;
+                k += 32;
+            }
+            while k < m {
+                if prime[k] != 0 {
+                    count += 1;
+                }
+                k += 1;
+            }
+        }
+    }
+    println!("{}", count);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn matmul_axpy_avx2(dst: &mut [f64], src: &[f64], a: f64) {
+    use std::arch::x86_64::*;
+    let n = dst.len().min(src.len());
+    unsafe {
+        let va = _mm256_set1_pd(a);
+        let dp = dst.as_mut_ptr();
+        let sp = src.as_ptr();
+        let mut j = 0usize;
+        while j + 8 <= n {
+            let s0 = _mm256_loadu_pd(sp.add(j));
+            let s1 = _mm256_loadu_pd(sp.add(j + 4));
+            let d0 = _mm256_loadu_pd(dp.add(j));
+            let d1 = _mm256_loadu_pd(dp.add(j + 4));
+            _mm256_storeu_pd(dp.add(j), _mm256_fmadd_pd(va, s0, d0));
+            _mm256_storeu_pd(dp.add(j + 4), _mm256_fmadd_pd(va, s1, d1));
+            j += 8;
+        }
+        while j + 4 <= n {
+            let s0 = _mm256_loadu_pd(sp.add(j));
+            let d0 = _mm256_loadu_pd(dp.add(j));
+            _mm256_storeu_pd(dp.add(j), _mm256_fmadd_pd(va, s0, d0));
+            j += 4;
+        }
+        while j < n {
+            dst[j] = a.mul_add(src[j], dst[j]);
+            j += 1;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn bench_matmul_vec() {
+    let n = black_box(400usize);
+    let a = matmul_matrix(n, 3);
+    let b = matmul_matrix(n, 5);
+    let mut total = 0i64;
+    for r in 0..5 {
+        let mut c = Vec::with_capacity(n);
+        for i in 0..n {
+            let mut row = vec![0.0f64; n];
+            for k in 0..n {
+                matmul_axpy_avx2(&mut row, &b[k], a[i][k]);
+            }
+            c.push(row);
+        }
+        let mut s = 0.0f64;
+        for i in 0..n {
+            for j in 0..n {
+                s += c[i][j] * (((i * n + j) % 13 + r) as f64);
+            }
+        }
+        total += s as i64;
+    }
+    println!("{}", total);
+}
+
+fn unpack_batch_i32(buf: &[u8], start_idx: usize, count: usize, bits: usize, base_val: i64, dst: &mut [i32]) {
+    let mask = (1i64 << bits) - 1;
+    let mut bit_pos = start_idx * bits;
+    for i in 0..count {
+        let byte_idx = bit_pos >> 3;
+        let bit_off = bit_pos & 7;
+        let w = (buf[byte_idx] as i64)
+            | ((buf[byte_idx + 1] as i64) << 8)
+            | ((buf[byte_idx + 2] as i64) << 16)
+            | ((buf[byte_idx + 3] as i64) << 24);
+        dst[i] = (base_val + ((w >> bit_off) & mask)) as i32;
+        bit_pos += bits;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn bench_bitpack_vec() {
+    use std::arch::x86_64::*;
+    let n = black_box(1_000_000usize);
+    let batch = 1024usize;
+    let mut raw_qty = vec![0i64; n];
+    let mut raw_disc = vec![0i64; n];
+    let mut raw_price = vec![0i64; n];
+    let mut s = 123_456_789i64;
+    for i in 0..n {
+        s = (s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407)) & 4611686018427387903;
+        raw_qty[i] = (s >> 16) & 63;
+        raw_disc[i] = (s >> 24) & 15;
+        raw_price[i] = (s >> 30) & 131071;
+    }
+    let p_qty = pack_col(&raw_qty, 6);
+    let p_disc = pack_col(&raw_disc, 4);
+    let p_price = pack_col(&raw_price, 17);
+
+    let mut qty = vec![0i32; batch];
+    let mut disc = vec![0i32; batch];
+    let mut price = vec![0i32; batch];
+
+    let mut total = 0i64;
+    for round in 0..60i64 {
+        let lo_disc = (4 + (round & 3)) as i32;
+        let hi_disc = lo_disc + 4;
+        let max_qty = (30 + (round & 7)) as i32;
+        unsafe {
+            let v_lo = _mm256_set1_epi32(lo_disc);
+            let v_hi = _mm256_set1_epi32(hi_disc);
+            let v_maxq = _mm256_set1_epi32(max_qty);
+            let mut pos = 0usize;
+            while pos < n {
+                let cnt = (n - pos).min(batch);
+                unpack_batch_i32(&p_qty, pos, cnt, 6, 1, &mut qty);
+                unpack_batch_i32(&p_disc, pos, cnt, 4, 0, &mut disc);
+                unpack_batch_i32(&p_price, pos, cnt, 17, 90000, &mut price);
+                let mut v_acc = _mm256_setzero_si256();
+                let dp = disc.as_ptr();
+                let qp = qty.as_ptr();
+                let pp = price.as_ptr();
+                let mut i = 0usize;
+                while i + 8 <= cnt {
+                    let vd = _mm256_loadu_si256(dp.add(i) as *const __m256i);
+                    let vq = _mm256_loadu_si256(qp.add(i) as *const __m256i);
+                    let vp = _mm256_loadu_si256(pp.add(i) as *const __m256i);
+                    let lt_lo = _mm256_cmpgt_epi32(v_lo, vd);
+                    let gt_hi = _mm256_cmpgt_epi32(vd, v_hi);
+                    let lt_q = _mm256_cmpgt_epi32(v_maxq, vq);
+                    let m = _mm256_andnot_si256(_mm256_or_si256(lt_lo, gt_hi), lt_q);
+                    let prod = _mm256_and_si256(_mm256_mullo_epi32(vp, vd), m);
+                    v_acc = _mm256_add_epi32(v_acc, prod);
+                    i += 8;
+                }
+                let mut lanes = [0i32; 8];
+                _mm256_storeu_si256(lanes.as_mut_ptr() as *mut __m256i, v_acc);
+                for &v in &lanes {
+                    total += v as i64;
+                }
+                while i < cnt {
+                    let d = disc[i];
+                    if d >= lo_disc && d <= hi_disc && qty[i] < max_qty {
+                        total += (price[i].wrapping_mul(d)) as i64;
+                    }
+                    i += 1;
+                }
+                pos += cnt;
+            }
+        }
+    }
+    println!("{}", total);
+}
+
+#[cfg(target_arch = "x86_64")]
+fn bench_dot_vec() {
+    use std::arch::x86_64::*;
+    let n = black_box(65536usize);
+    let rounds = 4000usize;
+    let mut a = Vec::with_capacity(n);
+    let mut b = Vec::with_capacity(n);
+    for i in 0..n {
+        a.push(i as f64 * 0.5);
+        b.push(i as f64 * 0.25 + 1.0);
+    }
+    let mut total = 0.0f64;
+    let ap = a.as_ptr();
+    let bp = b.as_ptr();
+    for _ in 0..rounds {
+        unsafe {
+            let mut s0 = _mm256_setzero_pd();
+            let mut s1 = _mm256_setzero_pd();
+            let mut s2 = _mm256_setzero_pd();
+            let mut s3 = _mm256_setzero_pd();
+            let mut i = 0usize;
+            while i + 16 <= n {
+                s0 = _mm256_fmadd_pd(_mm256_loadu_pd(ap.add(i)), _mm256_loadu_pd(bp.add(i)), s0);
+                s1 = _mm256_fmadd_pd(_mm256_loadu_pd(ap.add(i + 4)), _mm256_loadu_pd(bp.add(i + 4)), s1);
+                s2 = _mm256_fmadd_pd(_mm256_loadu_pd(ap.add(i + 8)), _mm256_loadu_pd(bp.add(i + 8)), s2);
+                s3 = _mm256_fmadd_pd(_mm256_loadu_pd(ap.add(i + 12)), _mm256_loadu_pd(bp.add(i + 12)), s3);
+                i += 16;
+            }
+            while i + 4 <= n {
+                s0 = _mm256_fmadd_pd(_mm256_loadu_pd(ap.add(i)), _mm256_loadu_pd(bp.add(i)), s0);
+                i += 4;
+            }
+            let sum_v = _mm256_add_pd(_mm256_add_pd(s0, s1), _mm256_add_pd(s2, s3));
+            let mut lanes = [0.0f64; 4];
+            _mm256_storeu_pd(lanes.as_mut_ptr(), sum_v);
+            let mut acc = (lanes[0] + lanes[1]) + (lanes[2] + lanes[3]);
+            while i < n {
+                acc = a[i].mul_add(b[i], acc);
+                i += 1;
+            }
+            total += acc;
+        }
+    }
+    println!("{:.12e}", total);
+}
+
 fn main() {
     let mut args = env::args().skip(1);
     let bench = args.next().unwrap_or_else(|| {
@@ -1191,6 +1466,16 @@ fn main() {
         "hashagg" => bench_hashagg(),
         "varint_csv" => bench_varint_csv(),
         "enum_eval" => bench_enum_eval(),
+        #[cfg(target_arch = "x86_64")]
+        "array_vec" => bench_array_vec(),
+        #[cfg(target_arch = "x86_64")]
+        "sieve_vec" => bench_sieve_vec(),
+        #[cfg(target_arch = "x86_64")]
+        "matmul_vec" => bench_matmul_vec(),
+        #[cfg(target_arch = "x86_64")]
+        "bitpack_vec" => bench_bitpack_vec(),
+        #[cfg(target_arch = "x86_64")]
+        "dot_vec" => bench_dot_vec(),
         other => {
             eprintln!("dbench: unknown benchmark {other}");
             std::process::exit(2);
