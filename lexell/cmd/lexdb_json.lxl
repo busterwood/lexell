@@ -16,6 +16,7 @@ import "./lexdb_time"
 type Val = lexdb_sql.Val
 type DbErr = lexdb_base.DbErr
 type J = json.Json
+type VB = vector[byte]
 type JK = json.Kind
 
 // Error handling & wrapper constants shared with parser/executor.
@@ -55,30 +56,75 @@ pub fn checkUniqueKeys(s: &str): Result[bool, DbErr] {
 
 fn skipWs(s: &str, pos: mut &int) {
     let n = len(s)
-    while pos < n && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\n' || s[pos] == '\r') { pos += 1 }
+    var p = pos + 0
+    if n - p >= 32 {
+        let vSp = VB.splat(' ')
+        let vTb = VB.splat('\t')
+        let vNl = VB.splat('\n')
+        let vCr = VB.splat('\r')
+        while p + 32 <= n {
+            let v = VB.load(s, p)
+            let ws = (v == vSp) | (v == vTb) | (v == vNl) | (v == vCr)
+            let m = (~ws).bitmask()
+            if m != u64(0) {
+                p += int(m.trailingZeros())
+                pos = p
+                return
+            }
+            p += 32
+        }
+    }
+    while p < n && (s[p] == ' ' || s[p] == '\t' || s[p] == '\n' || s[p] == '\r') { p += 1 }
+    pos = p
 }
 
 fn scanJsonStr(s: &str, pos: mut &int): Result[str, DbErr] {
     let n = len(s)
     if pos >= n || s[pos] != '"' { return Err(e("22P02", "expected JSON string")) }
     let start = pos + 0
-    pos += 1
-    while pos < n {
-        let c = s[pos]
+    var p = pos + 1
+    var hasEsc = false
+    if n - p >= 32 {
+        let vQt = VB.splat('"')
+        let vSl = VB.splat('\\')
+        let vCtl = VB.splat(byte(0x20))
+        while p + 32 <= n {
+            let v = VB.load(s, p)
+            let m = ((v == vQt) | (v == vSl) | (v < vCtl)).bitmask()
+            if m != u64(0) {
+                p += int(m.trailingZeros())
+                break
+            }
+            p += 32
+        }
+    }
+    while p < n {
+        let c = s[p]
         if c == '\\' {
-            pos += 2
+            hasEsc = true
+            p += 2
+            continue
+        }
+        if c < byte(0x20) {
+            hasEsc = true
+            p += 1
             continue
         }
         if c == '"' {
-            pos += 1
-            let raw = s[start..pos].toStr()
+            p += 1
+            pos = p
+            if !hasEsc {
+                return Ok(s[start + 1..p - 1].clone())
+            }
+            let raw = s[start..p].toStr()
             match json.parse(&raw) {
                 Ok(jv) { return Ok(jv.asStr().unwrapOr("")) }
                 Err(er) { return Err(e("22P02", &er.toStr())) }
             }
         }
-        pos += 1
+        p += 1
     }
+    pos = p
     return Err(e("22P02", "unterminated JSON string"))
 }
 

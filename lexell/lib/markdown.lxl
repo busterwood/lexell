@@ -51,6 +51,20 @@ import "markdown_unicode" as uni
 
 type VB = vector[byte]
 
+// Exact 2-table vpshufb nibble LUTs for Markdown inline special bytes:
+// Standard: \n(0a), !(21), &(26), *(2a), <(3c), [(5b), \(5c), ](5d), _(5f), `(60)
+// Smart adds: "(22), '(27), -(2d), .(2e)
+// Distinct high nibbles: 0->bit0, 2->bit1, 3->bit2, 5->bit3, 6->bit4 (0 false positives).
+const MD_HI_LUT = "\x01\x00\x02\x04\x00\x08\x10\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x00\x02\x04\x00\x08\x10\x00\x00\x00\x00\x00\x00\x00\x00\x00"
+const MD_LO_LUT = "\x10\x02\x00\x00\x00\x00\x02\x00\x00\x00\x03\x08\x0c\x08\x00\x08\x10\x02\x00\x00\x00\x00\x02\x00\x00\x00\x03\x08\x0c\x08\x00\x08"
+const MD_SMART_LO_LUT = "\x10\x02\x02\x00\x00\x00\x02\x02\x00\x00\x03\x08\x0c\x0a\x02\x08\x10\x02\x02\x00\x00\x00\x02\x02\x00\x00\x03\x08\x0c\x0a\x02\x08"
+
+// Exact 2-table vpshufb nibble LUT for unsafe href ASCII bytes in 0x21..0x7e:
+// "(22), &(26), '(27) [hi=2:0x01]; <(3c), >(3e) [hi=3:0x02];
+// [(5b), \(5c), ](5d), ^(5e) [hi=5:0x04]; `(60) [hi=6:0x08]; {(7b), |(7c), }(7d) [hi=7:0x10].
+const HREF_HI_LUT = "\x00\x00\x01\x02\x00\x04\x08\x10\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02\x00\x04\x08\x10\x00\x00\x00\x00\x00\x00\x00\x00"
+const HREF_LO_LUT = "\x08\x00\x01\x00\x00\x00\x01\x01\x00\x00\x00\x14\x16\x14\x06\x00\x08\x00\x01\x00\x00\x00\x01\x01\x00\x00\x00\x14\x16\x14\x06\x00"
+
 pub type Kind = value closed {
     Document
     BlockQuote
@@ -1448,23 +1462,24 @@ fn (p: mut &Parser) line(ln: &str) {
 }
 
 // Feeds the whole input: splits it into lines (LF, CRLF or a lone CR end a line).
-fn (p: mut &Parser) feed(src: &str) {
-    var s: str = src.clone()
-    if len(s) >= 3 && s[0] == 0xEF && s[1] == 0xBB && s[2] == 0xBF { s = s[3..].clone() }
-    if strFindByte(s, 0, byte(0)) >= 0 {
-        var b = ""
-        for k in 0..len(s) {
-            if s[k] == 0 { strings.addRune(mut &b, 0xFFFD) } else { b.addByte(s[k]) }
-        }
-        s = b
-    }
-    if p.o.validateUtf8 { s = strings.lossy(&s) }
+fn (p: mut &Parser) feedSlice(s: &str) {
     let n = len(s)
     var a = 0
     var i = 0
+    let vNl = VB.splat('\n')
+    let vCr = VB.splat('\r')
     while i < n {
-        i = strFindAny(s, i, "\r\n")
-        if i < 0 { break }
+        while i + 32 <= n {
+            let v = VB.load(s, i)
+            let m = ((v == vNl) | (v == vCr)).bitmask()
+            if m != u64(0) {
+                i += int(m.trailingZeros())
+                break
+            }
+            i += 32
+        }
+        while i < n && s[i] != '\n' && s[i] != '\r' { i += 1 }
+        if i >= n { break }
         let c = s[i]
         p.line(s[a..i])
         if c == '\r' && i + 1 < n && s[i + 1] == '\n' { i += 1 }
@@ -1474,6 +1489,27 @@ fn (p: mut &Parser) feed(src: &str) {
     if a < n { p.line(s[a..n]) }
     p.inLine = false
     while p.tip >= 0 { p.finalize(p.tip, p.lineNo) }
+}
+
+fn (p: mut &Parser) feed(src: &str) {
+    let hasBom = len(src) >= 3 && src[0] == 0xEF && src[1] == 0xBB && src[2] == 0xBF
+    let start = if hasBom { 3 } else { 0 }
+    let view = src[start..]
+    let hasNul = strFindByte(view, 0, byte(0)) >= 0
+    if !hasNul && !p.o.validateUtf8 {
+        p.feedSlice(view)
+        return
+    }
+    var s: str = view.clone()
+    if hasNul {
+        var b = ""
+        for k in 0..len(s) {
+            if s[k] == 0 { strings.addRune(mut &b, 0xFFFD) } else { b.addByte(s[k]) }
+        }
+        s = b
+    }
+    if p.o.validateUtf8 { s = strings.lossy(&s) }
+    p.feedSlice(&s)
 }
 
 // ------------------------------------------------------------ links: destinations, titles, labels
@@ -1740,35 +1776,34 @@ fn scanCdata(s: &str, i: int): int {
 
 // A raw HTML construct at p.pos == '<': the end, or -1.
 fn (p: mut &Parser) scanHtml(a: int): int {
-    let s = p.subj.clone()
-    let n = len(s)
+    let n = len(p.subj)
     if a + 1 >= n { return -1 }
-    let c = s[a + 1]
-    if c == '/' { return scanCloseTag(&s, a) }
+    let c = p.subj[a + 1]
+    if c == '/' { return scanCloseTag(&p.subj, a) }
     if c == '?' {
         if p.noPi { return -1 }
-        let e = scanPi(&s, a + 2)
+        let e = scanPi(&p.subj, a + 2)
         if e < 0 { p.noPi = true }
         return e
     }
     if c == '!' {
-        if startsCI(&s, a, "<!--") {
+        if startsCI(&p.subj, a, "<!--") {
             if p.noComment { return -1 }
-            if startsCI(&s, a, "<!-->") { return a + 5 }
-            if startsCI(&s, a, "<!--->") { return a + 6 }
-            let e = scanComment(&s, a + 4)
+            if startsCI(&p.subj, a, "<!-->") { return a + 5 }
+            if startsCI(&p.subj, a, "<!--->") { return a + 6 }
+            let e = scanComment(&p.subj, a + 4)
             if e < 0 { p.noComment = true }
             return e
         }
-        if startsCI(&s, a, "<![cdata[") {
+        if startsCI(&p.subj, a, "<![cdata[") {
             if p.noCdata { return -1 }
-            let e = scanCdata(&s, a + 9)
+            let e = scanCdata(&p.subj, a + 9)
             if e < 0 { p.noCdata = true }
             return e
         }
-        if a + 2 < n && isAlpha(s[a + 2]) {
+        if a + 2 < n && isAlpha(p.subj[a + 2]) {
             if p.noDecl { return -1 }
-            let e = strings.indexOf(&s, ">", a + 3)
+            let e = strings.indexOf(&p.subj, ">", a + 3)
             if e < 0 {
                 p.noDecl = true
                 return -1
@@ -1777,7 +1812,7 @@ fn (p: mut &Parser) scanHtml(a: int): int {
         }
         return -1
     }
-    return scanOpenTag(&s, a)
+    return scanOpenTag(&p.subj, a)
 }
 
 // ------------------------------------------------------------ inline parser
@@ -1790,6 +1825,12 @@ fn (p: mut &Parser) textNode(s: &str): int {
 
 fn (p: mut &Parser) addText(blk: int, s: &str) {
     let id = p.textNode(s)
+    p.append(blk, id)
+}
+
+fn (p: mut &Parser) addSubjText(blk: int, a: int, b: int) {
+    let id = p.newNode(Kind.Text)
+    p.d.nodes[id].text = p.subj[a..b].clone()
     p.append(blk, id)
 }
 
@@ -1839,9 +1880,9 @@ fn (p: mut &Parser) parseInline(blk: int) {
         if p.pos + 1 < len(p.subj) && p.subj[p.pos + 1] == '[' {
             p.openBracket(blk, true)
         } else {
-            let piece: str = p.subj[p.pos..p.pos + 1].clone()
-            p.addText(blk, &piece)
-            p.pos += 1
+            let a = p.pos
+            p.pos = a + 1
+            p.addSubjText(blk, a, a + 1)
         }
     } else if c == ']' {
         p.closeBracket(blk)
@@ -1862,16 +1903,30 @@ fn (p: mut &Parser) parseInline(blk: int) {
     } else if p.o.smart && c == '-' {
         p.hyphens(blk)
     } else {
-        // the run of ordinary text: its length and the special-byte
-        // table in locals, so the loop reads them once, not for every byte
+        // Scan run of ordinary text using exact 2-table vpshufb nibble LUT (32 bytes/iter).
         let a = p.pos
         let n = len(p.subj)
-        let sp = &p.special
         var j = a + 1
+        if n - j >= 32 {
+            let v0f = VB.splat(byte(0x0f))
+            let vZero = VB.zero()
+            let vHi = VB.load(&MD_HI_LUT, 0)
+            let vLo = if p.o.smart { VB.load(&MD_SMART_LO_LUT, 0) } else { VB.load(&MD_LO_LUT, 0) }
+            while j + 32 <= n {
+                let v = VB.load(&p.subj, j)
+                let hit = vLo.shuffle(v & v0f) & vHi.shuffle(v >> 4)
+                let eq = (hit == vZero).bitmask()
+                if eq != u64(0xffffffff) {
+                    j += int((eq ^ u64(0xffffffff)).trailingZeros())
+                    break
+                }
+                j += 32
+            }
+        }
+        let sp = &p.special
         while j < n && !sp[int(p.subj[j])] { j += 1 }
         p.pos = j
-        let piece: str = p.subj[a..j].clone()
-        p.addText(blk, &piece)
+        p.addSubjText(blk, a, j)
     }
 }
 
@@ -1937,9 +1992,9 @@ fn (p: mut &Parser) backslash(blk: int) {
         let k = p.newNode(Kind.LineBreak)
         p.append(blk, k)
     } else if p.pos < n && isAsciiPunct(p.subj[p.pos]) {
-        let piece: str = p.subj[p.pos..p.pos + 1].clone()
-        p.addText(blk, &piece)
-        p.pos += 1
+        let a = p.pos
+        p.pos = a + 1
+        p.addSubjText(blk, a, a + 1)
     } else {
         p.addText(blk, "\\")
     }
@@ -2409,16 +2464,50 @@ fn (w: mut &Out) cr() {
 fn (w: mut &Out) escape(s: &str) {
     var a = 0
     let n = len(s)
-    while a < n {
-        let i = strFindAny(s, a, "&<>\"")
-        if i < 0 { break }
-        if i > a { w.b += s[a..i] }
-        let c = s[i]
-        if c == '&' { w.b += "&amp;" }
-        else if c == '<' { w.b += "&lt;" }
-        else if c == '>' { w.b += "&gt;" }
-        else { w.b += "&quot;" }
-        a = i + 1
+    var i = 0
+    if n >= 32 {
+        let vAmp = VB.splat('&')
+        let vLt = VB.splat('<')
+        let vGt = VB.splat('>')
+        let vQt = VB.splat('"')
+        while i < n {
+            while i + 32 <= n {
+                let v = VB.load(s, i)
+                let m = ((v == vAmp) | (v == vLt) | (v == vGt) | (v == vQt)).bitmask()
+                if m != u64(0) {
+                    i += int(m.trailingZeros())
+                    break
+                }
+                i += 32
+            }
+            while i < n {
+                let c = s[i]
+                if c <= '>' && (c == '&' || c == '<' || c == '>' || c == '"') { break }
+                i += 1
+            }
+            if i >= n { break }
+            if i > a { w.b += s[a..i] }
+            let c = s[i]
+            if c == '&' { w.b += "&amp;" }
+            else if c == '<' { w.b += "&lt;" }
+            else if c == '>' { w.b += "&gt;" }
+            else { w.b += "&quot;" }
+            i += 1
+            a = i
+        }
+    } else {
+        while i < n {
+            let c = s[i]
+            if c <= '>' && (c == '&' || c == '<' || c == '>' || c == '"') {
+                if i > a { w.b += s[a..i] }
+                if c == '&' { w.b += "&amp;" }
+                else if c == '<' { w.b += "&lt;" }
+                else if c == '>' { w.b += "&gt;" }
+                else { w.b += "&quot;" }
+                a = i + 1
+            }
+            i += 1
+        }
     }
     if a < n { w.b += s[a..n] }
     if n > 0 { w.atNl = s[n - 1] == '\n' }
@@ -2434,10 +2523,29 @@ fn hrefSafe(c: byte): bool {
 fn (w: mut &Out) escapeHref(s: &str) {
     var a = 0
     let n = len(s)
-    for i in 0..n {
-        let c = s[i]
-        if !hrefSafe(c) {
+    var i = 0
+    if n >= 32 {
+        let v0f = VB.splat(byte(0x0f))
+        let vZero = VB.zero()
+        let vLow = VB.splat(byte(0x21))
+        let vDel = VB.splat(byte(0x7f))
+        let vHi = VB.load(&HREF_HI_LUT, 0)
+        let vLo = VB.load(&HREF_LO_LUT, 0)
+        while i < n {
+            while i + 32 <= n {
+                let v = VB.load(s, i)
+                let bad = (v < vLow) | (v >= vDel) | ((vLo.shuffle(v & v0f) & vHi.shuffle(v >> 4)) != vZero)
+                let m = bad.bitmask()
+                if m != u64(0) {
+                    i += int(m.trailingZeros())
+                    break
+                }
+                i += 32
+            }
+            while i < n && hrefSafe(s[i]) { i += 1 }
+            if i >= n { break }
             if i > a { w.b += s[a..i] }
+            let c = s[i]
             if c == '&' {
                 w.b += "&amp;"
             } else if c == '\'' {
@@ -2448,7 +2556,26 @@ fn (w: mut &Out) escapeHref(s: &str) {
                 w.b.addByte(hex[int(c >> 4)])
                 w.b.addByte(hex[int(c & 15)])
             }
-            a = i + 1
+            i += 1
+            a = i
+        }
+    } else {
+        for j in 0..n {
+            let c = s[j]
+            if !hrefSafe(c) {
+                if j > a { w.b += s[a..j] }
+                if c == '&' {
+                    w.b += "&amp;"
+                } else if c == '\'' {
+                    w.b += "&#x27;"
+                } else {
+                    w.b.addByte('%')
+                    let hex = "0123456789ABCDEF"
+                    w.b.addByte(hex[int(c >> 4)])
+                    w.b.addByte(hex[int(c & 15)])
+                }
+                a = j + 1
+            }
         }
     }
     if a < n { w.b += s[a..n] }
@@ -2542,14 +2669,24 @@ pub fn (d: &Doc) html(o: Options): str {
                     }
                 }
                 Kind.Heading {
-                    let tag = "h" + d.nodes[id].level.toStr()
+                    let lv = d.nodes[id].level
                     if enter {
                         w.cr()
-                        w.put(&("<" + tag))
+                        if lv == 1 { w.put("<h1") }
+                        else if lv == 2 { w.put("<h2") }
+                        else if lv == 3 { w.put("<h3") }
+                        else if lv == 4 { w.put("<h4") }
+                        else if lv == 5 { w.put("<h5") }
+                        else { w.put("<h6") }
                         d.posAttr(mut &w, id, o)
                         w.put(">")
                     } else {
-                        w.put(&("</" + tag + ">\n"))
+                        if lv == 1 { w.put("</h1>\n") }
+                        else if lv == 2 { w.put("</h2>\n") }
+                        else if lv == 3 { w.put("</h3>\n") }
+                        else if lv == 4 { w.put("</h4>\n") }
+                        else if lv == 5 { w.put("</h5>\n") }
+                        else { w.put("</h6>\n") }
                     }
                 }
                 Kind.CodeBlock {

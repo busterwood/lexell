@@ -891,18 +891,66 @@ fn readMap(c: mut &Conn, rest: &str, depth: int, w: Where): Result[Value, Error]
 
 // Makes room after buf[w]: moves unread bytes to the front, or grows the
 // buffer up to MAX_LINE + BUF when it is full of them.
+type VB = vector[byte]
+
+fn copyBytesSimd(dst: mut &[byte], dstOff: int, src: &[byte], srcOff: int, n: int) {
+    var i = 0
+    while i + 32 <= n {
+        VB.load(src, srcOff + i).store(dst, dstOff + i)
+        i += 32
+    }
+    while i < n {
+        dst[dstOff + i] = src[srcOff + i]
+        i += 1
+    }
+}
+
+fn shiftLeftSimd(buf: mut &[byte], srcOff: int, n: int) {
+    var i = 0
+    while i + 32 <= n {
+        VB.load(buf, srcOff + i).store(buf, i)
+        i += 32
+    }
+    while i < n {
+        buf[i] = buf[srcOff + i]
+        i += 1
+    }
+}
+
+fn findCrlfSimd(buf: &[byte], from: int, end: int): int {
+    var i = from
+    let lim = end - 1
+    if lim - i >= 32 {
+        let vCr = VB.splat('\r')
+        while i + 32 <= lim {
+            var m = (VB.load(buf, i) == vCr).bitmask()
+            while m != u64(0) {
+                let tz = int(m.trailingZeros())
+                if buf[i + tz + 1] == '\n' { return i + tz }
+                m = m & (m - u64(1))
+            }
+            i += 32
+        }
+    }
+    while i < lim {
+        if buf[i] == '\r' && buf[i + 1] == '\n' { return i }
+        i += 1
+    }
+    return -1
+}
+
 fn room(c: mut &Conn) {
     if c.w < len(c.buf) { return }
     if c.r > 0 {
         let n = c.w - c.r
-        for i in 0..n { c.buf[i] = c.buf[c.r + i] }
+        shiftLeftSimd(mut &c.buf, c.r, n)
         c.r = 0
         c.w = n
         return
     }
     if len(c.buf) < MAX_LINE + BUF {
         var bigger = array(len(c.buf) * 2, byte(0))
-        for i in 0..c.w { bigger[i] = c.buf[i] }
+        copyBytesSimd(mut &bigger, 0, &c.buf, 0, c.w)
         c.buf = bigger
     }
 }
@@ -922,14 +970,11 @@ fn fill(c: mut &Conn, w: Where): Result[int, Error] {
 fn readLine(c: mut &Conn, w: Where): Result[str, Error] {
     var from = c.r
     while true {
-        var i = from
-        while i + 1 < c.w {
-            if c.buf[i] == '\r' && c.buf[i + 1] == '\n' {
-                let line = strFromBytes(&c.buf[c.r..i])
-                c.r = i + 2
-                return Ok(line)
-            }
-            i += 1
+        let pos = findCrlfSimd(&c.buf, from, c.w)
+        if pos >= 0 {
+            let line = strFromBytes(&c.buf[c.r..pos])
+            c.r = pos + 2
+            return Ok(line)
         }
         if c.w - c.r > MAX_LINE { return Err(fail(Kind.Protocol, "a line over 64 KiB")) }
         let n = try fill(c, w)
@@ -950,7 +995,7 @@ fn readN(c: mut &Conn, n: int, w: Where): Result[str, Error] {
     var out = array(n, byte(0))
     var got = 0
     if have > 0 {
-        for i in 0..have { out[i] = c.buf[c.r + i] }
+        copyBytesSimd(mut &out, 0, &c.buf, c.r, have)
         got = have
         c.r = c.w
     }

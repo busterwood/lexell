@@ -94,20 +94,63 @@ pub fn readLines(path: &str): Result[[]str, IoError] {
 // Standard input up to its end.
 pub fn readStdin(): Result[str, IoError] { return read("/dev/stdin") }
 
+type VB = vector[byte]
+
+fn copyBytesSimd(dst: mut &[byte], dstOff: int, src: &[byte], srcOff: int, n: int) {
+    var i = 0
+    while i + 32 <= n {
+        VB.load(src, srcOff + i).store(dst, dstOff + i)
+        i += 32
+    }
+    while i < n {
+        dst[dstOff + i] = src[srcOff + i]
+        i += 1
+    }
+}
+
+fn findByteSimd(buf: &[byte], from: int, end: int, target: byte): int {
+    var i = from
+    if end - i >= 32 {
+        let vt = VB.splat(target)
+        while i + 32 <= end {
+            let m = (VB.load(buf, i) == vt).bitmask()
+            if m != u64(0) { return i + int(m.trailingZeros()) }
+            i += 32
+        }
+    }
+    while i < end {
+        if buf[i] == target { return i }
+        i += 1
+    }
+    return end
+}
+
 // The lines of s: split at "\n", a "\r" before it dropped, no empty last
 // line after a final "\n".
 pub fn splitLines(s: &str): []str {
     var out: []str = []
+    let n = len(s)
     var start = 0
-    for i in 0..len(s) {
-        if strByte(s, i) == '\n' {
-            var end = i
-            if end > start && strByte(s, end - 1) == '\r' { end -= 1 }
-            append(mut &out, strSlice(s, start, end))
-            start = i + 1
+    var i = 0
+    let vNl = VB.splat('\n')
+    while i < n {
+        while i + 32 <= n {
+            let m = (VB.load(s, i) == vNl).bitmask()
+            if m != u64(0) {
+                i += int(m.trailingZeros())
+                break
+            }
+            i += 32
         }
+        while i < n && strByte(s, i) != '\n' { i += 1 }
+        if i >= n { break }
+        var end = i
+        if end > start && strByte(s, end - 1) == '\r' { end -= 1 }
+        append(mut &out, strSlice(s, start, end))
+        i += 1
+        start = i
     }
-    if start < len(s) { append(mut &out, strSlice(s, start, len(s))) }
+    if start < n { append(mut &out, strSlice(s, start, n)) }
     return out
 }
 
@@ -288,7 +331,7 @@ pub fn (r: mut &Reader) read(dst: mut &[byte]): Result[int, IoError] {
     if r.pos < r.end {
         var k = r.end - r.pos
         if k > n { k = n }
-        for i in 0..k { dst[i] = r.buf[r.pos + i] }
+        copyBytesSimd(dst, 0, &r.buf, r.pos, k)
         r.pos += k
         return Ok(k)
     }
@@ -312,8 +355,7 @@ pub fn (r: mut &Reader) readLine(): Result[Option[str], IoError] {
             if k == 0 { break }
         }
         let from = r.pos
-        var i = from
-        while i < r.end && r.buf[i] != '\n' { i += 1 }
+        let i = findByteSimd(&r.buf, from, r.end, '\n')
         let part = strFromBytes(&r.buf[from..i])
         line = if any { line + part } else { part }
         any = true
@@ -485,7 +527,7 @@ pub type BytesReader = record {
 
 pub fn bytesReader(data: &[byte]): BytesReader {
     var copy: []byte = array(len(data), byte(0))
-    for i in 0..len(data) { copy[i] = data[i] }
+    copyBytesSimd(mut &copy, 0, data, 0, len(data))
     return BytesReader{data: copy, pos: 0}
 }
 
@@ -500,7 +542,7 @@ pub fn (r: mut &BytesReader) read(dst: mut &[byte]): Result[int, IoError] {
     if n == 0 || r.pos >= len(r.data) { return Ok(0) }
     var k = len(r.data) - r.pos
     if k > n { k = n }
-    for i in 0..k { dst[i] = r.data[r.pos + i] }
+    copyBytesSimd(dst, 0, &r.data, r.pos, k)
     r.pos += k
     return Ok(k)
 }
@@ -513,8 +555,12 @@ pub type BytesWriter = record {
 pub fn bytesWriter(): BytesWriter { return BytesWriter{buf: []} }
 
 pub fn (w: mut &BytesWriter) writeBytes(src: &[byte]): Result[int, IoError] {
-    for i in 0..len(src) { append(mut &w.buf, src[i]) }
-    return Ok(len(src))
+    let n = len(src)
+    if n == 0 { return Ok(0) }
+    let off = len(w.buf)
+    bytesGrow(mut &w.buf, off + n)
+    copyBytesSimd(mut &w.buf, off, src, 0, n)
+    return Ok(n)
 }
 
 pub fn (w: mut &BytesWriter) flush(): Result[Unit, IoError] { return Ok(Unit{}) }

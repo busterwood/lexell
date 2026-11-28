@@ -9,6 +9,11 @@ const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789
 
 type VB = vector[byte]
 
+// Exact 2-table vpshufb validation + high-nibble offset LUTs for RFC 4648 base64 decode.
+const B64_HI_LUT = "\x00\x00\x03\x04\x08\x10\x08\x10\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x03\x04\x08\x10\x08\x10\x00\x00\x00\x00\x00\x00\x00\x00"
+const B64_LO_LUT = "\x14\x1c\x1c\x1c\x1c\x1c\x1c\x1c\x1c\x1c\x18\x0a\x08\x08\x08\x09\x14\x1c\x1c\x1c\x1c\x1c\x1c\x1c\x1c\x1c\x18\x0a\x08\x08\x08\x09"
+const B64_OFF_LUT = "\x00\x00\x10\x04\xbf\xbf\xb9\xb9\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x10\x04\xbf\xbf\xb9\xb9\x00\x00\x00\x00\x00\x00\x00\x00"
+
 // Base64 of data: the standard alphabet, padded with "=".
 pub fn encode(data: &str): str {
     let n = len(data)
@@ -104,32 +109,20 @@ pub fn decodeStrict(text: &str): Option[str] {
     var o = 0
     let simdLim = n - 4
     if simdLim >= 32 {
-        let vA = VB.splat('A')
-        let vZ = VB.splat('Z')
-        let va = VB.splat('a')
-        let vz = VB.splat('z')
-        let v0 = VB.splat('0')
-        let v9 = VB.splat('9')
+        let v0f = VB.splat(byte(0x0f))
+        let vZero = VB.zero()
+        let vHiLut = VB.load(&B64_HI_LUT, 0)
+        let vLoLut = VB.load(&B64_LO_LUT, 0)
+        let vOffLut = VB.load(&B64_OFF_LUT, 0)
         let vPlus = VB.splat('+')
-        let vSlash = VB.splat('/')
-        let vOffUp = VB.splat(byte(191))
-        let vOffLo = VB.splat(byte(185))
-        let vOffDg = VB.splat(byte(4))
         let vOffPl = VB.splat(byte(19))
-        let vOffSl = VB.splat(byte(16))
         var tmp: []byte = array(32, byte(0))
         while i + 32 <= simdLim {
             let v = VB.load(text, i)
-            let isUp = (v >= vA) & (v <= vZ)
-            let isLo = (v >= va) & (v <= vz)
-            let isDg = (v >= v0) & (v <= v9)
-            let isPl = v == vPlus
-            let isSl = v == vSlash
-            if !(isUp | isLo | isDg | isPl | isSl).all() { return None }
-            var delta = isUp.select(vOffUp, vOffLo)
-            delta = isDg.select(vOffDg, delta)
-            delta = isPl.select(vOffPl, delta)
-            delta = isSl.select(vOffSl, delta)
+            let hi = v >> 4
+            let valid = vLoLut.shuffle(v & v0f) & vHiLut.shuffle(hi)
+            if (valid == vZero).any() { return None }
+            let delta = (v == vPlus).select(vOffPl, vOffLut.shuffle(hi))
             (v +% delta).store(mut &tmp, 0)
             var k = 0
             while k < 32 {
@@ -184,32 +177,20 @@ pub fn decodeLenient(s: &str): Result[str, str] {
     var i = 0
     var o = 0
     if n >= 32 {
-        let vA = VB.splat('A')
-        let vZ = VB.splat('Z')
-        let va = VB.splat('a')
-        let vz = VB.splat('z')
-        let v0 = VB.splat('0')
-        let v9 = VB.splat('9')
+        let v0f = VB.splat(byte(0x0f))
+        let vZero = VB.zero()
+        let vHiLut = VB.load(&B64_HI_LUT, 0)
+        let vLoLut = VB.load(&B64_LO_LUT, 0)
+        let vOffLut = VB.load(&B64_OFF_LUT, 0)
         let vPlus = VB.splat('+')
-        let vSlash = VB.splat('/')
-        let vOffUp = VB.splat(byte(191))
-        let vOffLo = VB.splat(byte(185))
-        let vOffDg = VB.splat(byte(4))
         let vOffPl = VB.splat(byte(19))
-        let vOffSl = VB.splat(byte(16))
         var tmp: []byte = array(32, byte(0))
         while i + 32 <= n {
             let v = VB.load(s, i)
-            let isUp = (v >= vA) & (v <= vZ)
-            let isLo = (v >= va) & (v <= vz)
-            let isDg = (v >= v0) & (v <= v9)
-            let isPl = v == vPlus
-            let isSl = v == vSlash
-            if !(isUp | isLo | isDg | isPl | isSl).all() { break }
-            var delta = isUp.select(vOffUp, vOffLo)
-            delta = isDg.select(vOffDg, delta)
-            delta = isPl.select(vOffPl, delta)
-            delta = isSl.select(vOffSl, delta)
+            let hi = v >> 4
+            let valid = vLoLut.shuffle(v & v0f) & vHiLut.shuffle(hi)
+            if (valid == vZero).any() { break }
+            let delta = (v == vPlus).select(vOffPl, vOffLut.shuffle(hi))
             (v +% delta).store(mut &tmp, 0)
             var k = 0
             while k < 32 {

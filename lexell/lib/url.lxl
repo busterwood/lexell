@@ -63,6 +63,10 @@ fn fail[T](msg: &str, input: &str): Result[T, Error] { return Err(Error{msg: msg
 
 type VB = vector[byte]
 
+// Exact 2-table vpshufb LUT for RFC 3986 unreserved bytes: A-Z a-z 0-9 - . _ ~
+const URL_UNRES_HI = "\x00\x00\x01\x02\x04\x08\x10\x20\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01\x02\x04\x08\x10\x20\x00\x00\x00\x00\x00\x00\x00\x00"
+const URL_UNRES_LO = "\x2a\x3e\x3e\x3e\x3e\x3e\x3e\x3e\x3e\x3e\x3c\x14\x14\x15\x35\x1c\x2a\x3e\x3e\x3e\x3e\x3e\x3e\x3e\x3e\x3e\x3c\x14\x14\x15\x35\x1c"
+
 fn isAlpha(c: byte): bool { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') }
 
 fn isUnreserved(c: byte): bool {
@@ -542,22 +546,15 @@ pub fn encode(s: &str): str {
 
 fn encodeSimd(s: &str): str {
     let n = len(s)
-    let v20 = VB.splat(byte(0x20))
-    let va = VB.splat('a')
-    let vz = VB.splat('z')
-    let v0 = VB.splat('0')
-    let v9 = VB.splat('9')
-    let vDash = VB.splat('-')
-    let vDot = VB.splat('.')
-    let vUnder = VB.splat('_')
-    let vTilde = VB.splat('~')
+    let v0f = VB.splat(byte(0x0f))
+    let vZero = VB.zero()
+    let vHiLut = VB.load(&URL_UNRES_HI, 0)
+    let vLoLut = VB.load(&URL_UNRES_LO, 0)
     var i = 0
     while i + 32 <= n {
         let v = VB.load(s, i)
-        let f = v | v20
-        let ok = ((f >= va) & (f <= vz)) | ((v >= v0) & (v <= v9)) |
-                 (v == vDash) | (v == vDot) | (v == vUnder) | (v == vTilde)
-        let bad = ok.bitmask() ^ u64(0xffffffff)
+        let ok = vLoLut.shuffle(v & v0f) & vHiLut.shuffle(v >> 4)
+        let bad = (ok == vZero).bitmask()
         if bad == u64(0) {
             i += 32
             continue
@@ -579,10 +576,8 @@ fn encodeSimd(s: &str): str {
         let start = i
         while i + 32 <= n {
             let v = VB.load(s, i)
-            let f = v | v20
-            let ok = ((f >= va) & (f <= vz)) | ((v >= v0) & (v <= v9)) |
-                     (v == vDash) | (v == vDot) | (v == vUnder) | (v == vTilde)
-            let bad = ok.bitmask() ^ u64(0xffffffff)
+            let ok = vLoLut.shuffle(v & v0f) & vHiLut.shuffle(v >> 4)
+            let bad = (ok == vZero).bitmask()
             if bad == u64(0) {
                 i += 32
                 continue

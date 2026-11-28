@@ -76,6 +76,8 @@ import "io"
 import "fs"
 import "fmt"
 
+type VB = vector[byte]
+
 // Cuts an array back to k elements (there is no truncate).
 fn trunc(a: mut &[]int, k: int) {
     while len(a) > k { pop(mut &a) }
@@ -114,7 +116,29 @@ const CUTOFF = 20
 // Compare the two '\n'-terminated lines starting at a and b: unsigned byte
 // order, where a terminator sorts below every byte (a prefix is smaller).
 fn cmpLines(buf: &[byte], a: int, b: int): int {
+    let n = len(buf)
     var k = 0
+    if a + 32 <= n && b + 32 <= n {
+        let vNl = VB.splat('\n')
+        while a + k + 32 <= n && b + k + 32 <= n {
+            let va = VB.load(buf, a + k)
+            let vb = VB.load(buf, b + k)
+            let m = ((va != vb) | (va == vNl)).bitmask()
+            if m != u64(0) {
+                k += int(m.trailingZeros())
+                let ca = buf[a + k]
+                let cb = buf[b + k]
+                if ca != cb {
+                    if ca == '\n' { return -1 }
+                    if cb == '\n' { return 1 }
+                    if ca < cb { return -1 }
+                    return 1
+                }
+                return 0
+            }
+            k += 32
+        }
+    }
     while true {
         let ca = buf[a + k]
         let cb = buf[b + k]
@@ -1250,16 +1274,14 @@ fn lineStarts(buf: &[byte]): []int {
     if m == 0 { return starts }
     append(mut &starts, 0)
     var i = 0
-    while i + 8 <= m {
-        if buf[i] == '\n' { append(mut &starts, i + 1) }
-        if buf[i + 1] == '\n' { append(mut &starts, i + 2) }
-        if buf[i + 2] == '\n' { append(mut &starts, i + 3) }
-        if buf[i + 3] == '\n' { append(mut &starts, i + 4) }
-        if buf[i + 4] == '\n' { append(mut &starts, i + 5) }
-        if buf[i + 5] == '\n' { append(mut &starts, i + 6) }
-        if buf[i + 6] == '\n' { append(mut &starts, i + 7) }
-        if buf[i + 7] == '\n' { append(mut &starts, i + 8) }
-        i += 8
+    let vNl = VB.splat('\n')
+    while i + 32 <= m {
+        var mask = (VB.load(buf, i) == vNl).bitmask()
+        while mask != u64(0) {
+            append(mut &starts, i + int(mask.trailingZeros()) + 1)
+            mask = mask & (mask - u64(1))
+        }
+        i += 32
     }
     while i < m {
         if buf[i] == '\n' { append(mut &starts, i + 1) }
@@ -1670,35 +1692,52 @@ fn putBlock(w: mut &io.Writer, block: &[]byte, used: int): bool {
 fn emit(w: mut &io.Writer, buf: &[byte], kept: &[int]): bool {
     let nb = len(kept)
     if nb == 0 { return true }
+    let blen = len(buf)
     var block: []byte = array(65536, 0)
     var used = 0
+    let vNl = VB.splat('\n')
     var i = 0
     while i < nb {
-        let s = kept[i]
-        var k = s
+        var k = kept[i]
         var done = false
         while !done {
+            while used + 32 <= 65536 && k + 32 <= blen {
+                let v = VB.load(buf, k)
+                let mask = (v == vNl).bitmask()
+                v.store(mut &block, used)
+                if mask == u64(0) {
+                    used += 32
+                    k += 32
+                    continue
+                }
+                let tz = int(mask.trailingZeros())
+                used += tz + 1
+                done = true
+                break
+            }
+            if done { break }
             let room = 65536 - used
             var j = 0
             while j < room {
                 let b = buf[k]
+                block[used + j] = b
+                j += 1
+                k += 1
                 if b == '\n' {
                     done = true
                     break
                 }
-                block[used + j] = b
-                j += 1
-                k += 1
             }
             used += j
             if !done {
-                // the block is full (used == 65536) and the line continues
                 if !putBlock(w, &block, used) { return false }
                 used = 0
             }
         }
-        block[used] = '\n'
-        used += 1
+        if used == 65536 {
+            if !putBlock(w, &block, used) { return false }
+            used = 0
+        }
         i += 1
     }
     if used > 0 {

@@ -16,6 +16,8 @@ import "./lexdb_recur"
 import "./lexdb_oldnew"
 import "./lexdb_annot"
 
+type VB = vector[byte]
+
 // The language model, by name (the parser reads and builds it).
 type TypeName = lexdb_sql.TypeName
 type Val = lexdb_sql.Val
@@ -411,19 +413,31 @@ fn pgCast(e: Expr, t: TypeName): Expr {
 // A quoted string or name, s[i] its opening quote, closed by q (doubled
 // inside: itself); the index after it.
 fn quoted(s: &str, i: int, q: byte, b: mut &str): Result[int, lexdb_base.DbErr] {
+    let n = len(s)
     var j = i + 1
+    var run = j
+    let vQ = VB.splat(q)
     while true {
-        if j >= len(s) { return Err(syntax(if q == '\'' { "unterminated quoted string" } else { "unterminated quoted identifier" })) }
-        if s[j] == q {
-            if j + 1 < len(s) && s[j + 1] == q {
-                b.addByte(q)
-                j += 2
-                continue
+        if n - j >= 32 {
+            while j + 32 <= n {
+                let m = (VB.load(s, j) == vQ).bitmask()
+                if m != u64(0) {
+                    j += int(m.trailingZeros())
+                    break
+                }
+                j += 32
             }
-            return Ok(j + 1)
         }
-        b.addByte(s[j])
-        j += 1
+        while j < n && s[j] != q { j += 1 }
+        if j >= n { return Err(syntax(if q == '\'' { "unterminated quoted string" } else { "unterminated quoted identifier" })) }
+        if j > run { b += s[run..j] }
+        if j + 1 < n && s[j + 1] == q {
+            b.addByte(q)
+            j += 2
+            run = j
+            continue
+        }
+        return Ok(j + 1)
     }
     return Ok(j)
 }
@@ -465,11 +479,38 @@ fn lexInGt(s: &str, dialect: Dialect, ora: bool, initGt: int): Result[[]Tok, lex
             continue
         }
         if c == '-' && i + 1 < n && s[i + 1] == '-' {
+            i += 2
+            if n - i >= 32 {
+                let vNl = VB.splat('\n')
+                while i + 32 <= n {
+                    let m = (VB.load(s, i) == vNl).bitmask()
+                    if m != u64(0) { i += int(m.trailingZeros()); break }
+                    i += 32
+                }
+            }
             while i < n && s[i] != '\n' { i += 1 }
             continue
         }
         if c == '/' && i + 1 < n && s[i + 1] == '*' {
             i += 2
+            if n - i > 32 {
+                let vStar = VB.splat('*')
+                while i + 32 < n {
+                    var m = (VB.load(s, i) == vStar).bitmask()
+                    var found = false
+                    while m != u64(0) {
+                        let tz = int(m.trailingZeros())
+                        if s[i + tz + 1] == '/' {
+                            i += tz
+                            found = true
+                            break
+                        }
+                        m = m & (m - u64(1))
+                    }
+                    if found { break }
+                    i += 32
+                }
+            }
             while i + 1 < n && !(s[i] == '*' && s[i + 1] == '/') { i += 1 }
             i += 2
             continue

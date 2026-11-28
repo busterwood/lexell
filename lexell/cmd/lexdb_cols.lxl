@@ -44,6 +44,8 @@ pub const FIXED: byte = 8           // a row in the fixed layout starts so (lexd
 
 // Place kinds: as lexdb_exec's PK_* (the executor gives its own bytes).
 type VB = vector[byte]
+type VI = vector[int]
+type VI32 = vector[i32]
 
 pub const K_NONE: byte = 0
 pub const K_INT: byte = 1
@@ -234,22 +236,86 @@ fn pack(out: mut &[]byte, vs: &[]int, n: int, base: int, w: int) {
 pub fn unpack(s: &str, d: int, w: int, base: int, from: int, cnt: int, out: mut &[]int, r0: int) {
     if cnt <= 0 { return }
     if w == 0 {
-        for q in 0..cnt { out[r0 + q] = base }
+        var q = 0
+        if cnt >= 4 {
+            let vBase = VI.splat(base)
+            while q + 4 <= cnt {
+                vBase.store(out, r0 + q)
+                q += 4
+            }
+        }
+        while q < cnt { out[r0 + q] = base; q += 1 }
         return
     }
     if w == 8 {
         var o = d + from
-        for q in 0..cnt {
+        var q = 0
+        if cnt >= 4 {
+            let vBase = VI.splat(base)
+            while q + 4 <= cnt {
+                (vBase +% VI.loadU8(s, o)).store(out, r0 + q)
+                o += 4
+                q += 4
+            }
+        }
+        while q < cnt {
             out[r0 + q] = base +% int(s[o])
             o += 1
+            q += 1
         }
         return
     }
     if w == 16 {
         var o = d + 2 * from
-        for q in 0..cnt {
+        var q = 0
+        if cnt >= 4 {
+            let vBase = VI.splat(base)
+            while q + 4 <= cnt {
+                (vBase +% VI.loadU16(s, o)).store(out, r0 + q)
+                o += 8
+                q += 4
+            }
+        }
+        while q < cnt {
             out[r0 + q] = base +% u16At(s, o)
             o += 2
+            q += 1
+        }
+        return
+    }
+    if w == 4 {
+        var q = 0
+        if (from & 1) != 0 {
+            out[r0] = base +% (int(s[d + (from >> 1)]) >> 4)
+            q = 1
+        }
+        var pos = d + ((from + q) >> 1)
+        let slen = len(s)
+        while q + 8 <= cnt && pos + 4 <= slen {
+            let b0 = int(s[pos])
+            let b1 = int(s[pos + 1])
+            let b2 = int(s[pos + 2])
+            let b3 = int(s[pos + 3])
+            out[r0 + q] = base +% (b0 & 15)
+            out[r0 + q + 1] = base +% (b0 >> 4)
+            out[r0 + q + 2] = base +% (b1 & 15)
+            out[r0 + q + 3] = base +% (b1 >> 4)
+            out[r0 + q + 4] = base +% (b2 & 15)
+            out[r0 + q + 5] = base +% (b2 >> 4)
+            out[r0 + q + 6] = base +% (b3 & 15)
+            out[r0 + q + 7] = base +% (b3 >> 4)
+            pos += 4
+            q += 8
+        }
+        while q + 2 <= cnt && pos < slen {
+            let b = int(s[pos])
+            out[r0 + q] = base +% (b & 15)
+            out[r0 + q + 1] = base +% (b >> 4)
+            pos += 1
+            q += 2
+        }
+        if q < cnt {
+            out[r0 + q] = base +% (int(s[pos]) & 15)
         }
         return
     }
@@ -1556,8 +1622,49 @@ pub fn hasNulls(dir: &[]int, p: int): bool { return dir[DIR_HDR + D * p + F_NULL
 // left as they are elsewhere).
 pub fn nullsInto(s: &str, dir: &[]int, p: int, from: int, cnt: int, nul: mut &[]bool, r0: int) {
     let b = dir[DIR_HDR + D * p + F_NULLS]
-    if b < 0 { return }
-    for q in 0..cnt { if bitAt(s, b, from + q) { nul[r0 + q] = true } }
+    if b < 0 || cnt <= 0 { return }
+    var q = 0
+    while q < cnt && ((from + q) & 7) != 0 {
+        if bitAt(s, b, from + q) { nul[r0 + q] = true }
+        q += 1
+    }
+    var bo = b + ((from + q) >> 3)
+    if cnt - q >= 256 {
+        let vZero = VB.zero()
+        while q + 256 <= cnt {
+            var m = (VB.load(s, bo) != vZero).bitmask()
+            while m != u64(0) {
+                let bi = int(m.trailingZeros())
+                var bits = int(s[bo + bi])
+                let rowBase = r0 + q + (bi << 3)
+                while bits != 0 {
+                    let bit = int(u64(bits).trailingZeros())
+                    nul[rowBase + bit] = true
+                    bits = bits & (bits - 1)
+                }
+                m = m & (m - u64(1))
+            }
+            bo += 32
+            q += 256
+        }
+    }
+    while q + 8 <= cnt {
+        var bits = int(s[bo])
+        if bits != 0 {
+            let rowBase = r0 + q
+            while bits != 0 {
+                let bit = int(u64(bits).trailingZeros())
+                nul[rowBase + bit] = true
+                bits = bits & (bits - 1)
+            }
+        }
+        bo += 1
+        q += 8
+    }
+    while q < cnt {
+        if bitAt(s, b, from + q) { nul[r0 + q] = true }
+        q += 1
+    }
 }
 
 pub fn codecOf(dir: &[]int, p: int): int { return dir[DIR_HDR + D * p + F_CODEC] }
@@ -1596,22 +1703,27 @@ pub fn intsInto(s: &str, dir: &[]int, p: int, from: int, cnt: int, out: mut &[]i
         }
     } else if wb == 4 {
         var q = 0
-        while q + 2 <= cnt {
-            let w = strWord(s, o)
-            let u0 = int(w & u64(0xffffffff))
-            let u1 = int(w >> 32)
-            out[r0 + q] = if u0 >= 0x80000000 { u0 - 0x100000000 } else { u0 }
-            out[r0 + q + 1] = if u1 >= 0x80000000 { u1 - 0x100000000 } else { u1 }
-            o += 8
-            q += 2
+        while q + 4 <= cnt {
+            VI.loadI32(s, o).store(out, r0 + q)
+            o += 16
+            q += 4
         }
-        if q < cnt {
+        while q < cnt {
             out[r0 + q] = binary.readI32LEStr(s, o)
+            o += 4
+            q += 1
         }
     } else {
-        for q in 0..cnt {
+        var q = 0
+        while q + 4 <= cnt {
+            VI.loadI16(s, o).store(out, r0 + q)
+            o += 8
+            q += 4
+        }
+        while q < cnt {
             out[r0 + q] = binary.readI16LEStr(s, o)
             o += 2
+            q += 1
         }
     }
 }
@@ -1938,26 +2050,52 @@ pub fn rangeFilter(s: &str, dir: &[]int, p: int, from: int, cnt: int, r0: int, l
         }
     } else if wb == 4 {
         var q = 0
-        while q + 2 <= cnt {
-            let w = strWord(s, o)
-            let u0 = int(w & u64(0xffffffff))
-            let v0 = if u0 >= 0x80000000 { u0 - 0x100000000 } else { u0 }
-            if v0 >= lo && v0 <= hi { append(mut &out, r0 + q) }
-            let u1 = int(w >> 32)
-            let v1 = if u1 >= 0x80000000 { u1 - 0x100000000 } else { u1 }
-            if v1 >= lo && v1 <= hi { append(mut &out, r0 + q + 1) }
-            o += 8
-            q += 2
+        if cnt >= 4 {
+            let vLo = VI.splat(lo)
+            let vHi = VI.splat(hi)
+            while q + 4 <= cnt {
+                let v = VI.loadI32(s, o)
+                var m = ((v >= vLo) & (v <= vHi)).bitmask()
+                while m != u64(0) {
+                    append(mut &out, r0 + q + int(m.trailingZeros()))
+                    m = m & (m - u64(1))
+                }
+                o += 16
+                q += 4
+            }
         }
-        if q < cnt {
+        while q < cnt {
             let v = binary.readI32LEStr(s, o)
             if v >= lo && v <= hi { append(mut &out, r0 + q) }
+            o += 4
+            q += 1
         }
     } else {
-        for q in 0..cnt {
+        if hi < -32768 || lo > 32767 { return out }
+        if lo <= -32768 && hi >= 32767 {
+            for q in 0..cnt { append(mut &out, r0 + q) }
+            return out
+        }
+        var q = 0
+        if cnt >= 8 {
+            let vLo = VI32.splat(i32(if lo < -32768 { -32768 } else { lo }))
+            let vHi = VI32.splat(i32(if hi > 32767 { 32767 } else { hi }))
+            while q + 8 <= cnt {
+                let v = VI32.loadI16(s, o)
+                var m = ((v >= vLo) & (v <= vHi)).bitmask()
+                while m != u64(0) {
+                    append(mut &out, r0 + q + int(m.trailingZeros()))
+                    m = m & (m - u64(1))
+                }
+                o += 16
+                q += 8
+            }
+        }
+        while q < cnt {
             let v = binary.readI16LEStr(s, o)
             if v >= lo && v <= hi { append(mut &out, r0 + q) }
             o += 2
+            q += 1
         }
     }
     return out
@@ -2118,24 +2256,45 @@ pub fn neFilter(s: &str, dir: &[]int, p: int, from: int, cnt: int, r0: int, kv: 
         }
     } else if wb == 4 {
         var q = 0
-        while q + 2 <= cnt {
-            let w = strWord(s, o)
-            let u0 = int(w & u64(0xffffffff))
-            let v0 = if u0 >= 0x80000000 { u0 - 0x100000000 } else { u0 }
-            if v0 != kv { append(mut &out, r0 + q) }
-            let u1 = int(w >> 32)
-            let v1 = if u1 >= 0x80000000 { u1 - 0x100000000 } else { u1 }
-            if v1 != kv { append(mut &out, r0 + q + 1) }
-            o += 8
-            q += 2
+        if cnt >= 4 {
+            let vK = VI.splat(kv)
+            while q + 4 <= cnt {
+                var m = (VI.loadI32(s, o) != vK).bitmask()
+                while m != u64(0) {
+                    append(mut &out, r0 + q + int(m.trailingZeros()))
+                    m = m & (m - u64(1))
+                }
+                o += 16
+                q += 4
+            }
         }
-        if q < cnt {
+        while q < cnt {
             if binary.readI32LEStr(s, o) != kv { append(mut &out, r0 + q) }
+            o += 4
+            q += 1
         }
     } else {
-        for q in 0..cnt {
+        if kv < -32768 || kv > 32767 {
+            for q in 0..cnt { append(mut &out, r0 + q) }
+            return out
+        }
+        var q = 0
+        if cnt >= 8 {
+            let vK = VI32.splat(i32(kv))
+            while q + 8 <= cnt {
+                var m = (VI32.loadI16(s, o) != vK).bitmask()
+                while m != u64(0) {
+                    append(mut &out, r0 + q + int(m.trailingZeros()))
+                    m = m & (m - u64(1))
+                }
+                o += 16
+                q += 8
+            }
+        }
+        while q < cnt {
             if binary.readI16LEStr(s, o) != kv { append(mut &out, r0 + q) }
             o += 2
+            q += 1
         }
     }
     return out
@@ -2320,26 +2479,41 @@ pub fn rangeCount(s: &str, dir: &[]int, p: int, from: int, cnt: int, lo: int, hi
         }
     } else if wb == 4 {
         var q = 0
-        while q + 2 <= cnt {
-            let w = strWord(s, o)
-            let u0 = int(w & u64(0xffffffff))
-            let v0 = if u0 >= 0x80000000 { u0 - 0x100000000 } else { u0 }
-            if v0 >= lo && v0 <= hi { tot += 1 }
-            let u1 = int(w >> 32)
-            let v1 = if u1 >= 0x80000000 { u1 - 0x100000000 } else { u1 }
-            if v1 >= lo && v1 <= hi { tot += 1 }
-            o += 8
-            q += 2
+        if cnt >= 4 {
+            let vLo = VI.splat(lo)
+            let vHi = VI.splat(hi)
+            while q + 4 <= cnt {
+                let v = VI.loadI32(s, o)
+                tot += int(((v >= vLo) & (v <= vHi)).bitmask().countOnes())
+                o += 16
+                q += 4
+            }
         }
-        if q < cnt {
+        while q < cnt {
             let v = binary.readI32LEStr(s, o)
             if v >= lo && v <= hi { tot += 1 }
+            o += 4
+            q += 1
         }
     } else {
-        for q in 0..cnt {
+        if hi < -32768 || lo > 32767 { return 0 }
+        if lo <= -32768 && hi >= 32767 { return cnt }
+        var q = 0
+        if cnt >= 8 {
+            let vLo = VI32.splat(i32(if lo < -32768 { -32768 } else { lo }))
+            let vHi = VI32.splat(i32(if hi > 32767 { 32767 } else { hi }))
+            while q + 8 <= cnt {
+                let v = VI32.loadI16(s, o)
+                tot += int(((v >= vLo) & (v <= vHi)).bitmask().countOnes())
+                o += 16
+                q += 8
+            }
+        }
+        while q < cnt {
             let v = binary.readI16LEStr(s, o)
             if v >= lo && v <= hi { tot += 1 }
             o += 2
+            q += 1
         }
     }
     return tot
@@ -2534,26 +2708,20 @@ pub fn sumIntCols(s: &str, dir: &[]int, p: int, from: int, cnt: int, leafN: int,
         }
         let data = dir[x + F_DATA]
         if w == 8 {
-            // SWAR 8 bytes per step in 16-bit lanes; fold every 255 steps (2040 rows) to prevent u16 overflow
+            // 8-wide vpmovzxbd -> vector[i32] accumulation (flush every 16384 steps: 8*16384*255 = 33M << 2^31)
             var deltaSum = i128(0)
             var o = data + from
             var q = 0
-            let mask16 = u64(0x00ff00ff00ff00ff)
             while q + 8 <= cnt {
-                var accLo = u64(0)
-                var accHi = u64(0)
+                var acc = VI32.zero()
                 var steps = 0
-                while steps < 255 && q + 8 <= cnt {
-                    let word = strWord(s, o)
-                    accLo = accLo +% (word & mask16)
-                    accHi = accHi +% ((word >> 8) & mask16)
+                while steps < 16384 && q + 8 <= cnt {
+                    acc = acc +% VI32.loadU8(s, o)
                     o += 8
                     q += 8
                     steps += 1
                 }
-                let s0 = (accLo & u64(0xffff)) +% ((accLo >> 16) & u64(0xffff)) +% ((accLo >> 32) & u64(0xffff)) +% (accLo >> 48)
-                let s1 = (accHi & u64(0xffff)) +% ((accHi >> 16) & u64(0xffff)) +% ((accHi >> 32) & u64(0xffff)) +% (accHi >> 48)
-                deltaSum += i128(int(s0 +% s1))
+                deltaSum += i128(int(acc.sum()))
             }
             var tail = 0
             while q < cnt {
@@ -2565,32 +2733,20 @@ pub fn sumIntCols(s: &str, dir: &[]int, p: int, from: int, cnt: int, leafN: int,
             return Some(i128(cnt) * i128(base) + deltaSum)
         }
         if w == 16 {
-            // SWAR 4 u16 values per step in 32-bit lanes (no overflow up to 65535 steps = 262k rows)
+            // 8-wide vpmovzxwd -> vector[i32] accumulation (flush every 2048 steps: 8*2048*65535 = 1.07B < 2^31)
             var deltaSum = i128(0)
             var o = data + 2 * from
             var q = 0
-            let mask32 = u64(0x0000ffff0000ffff)
-            var accLo = u64(0)
-            var accHi = u64(0)
-            var steps = 0
-            while q + 4 <= cnt {
-                let word = strWord(s, o)
-                accLo = accLo +% (word & mask32)
-                accHi = accHi +% ((word >> 16) & mask32)
-                o += 8
-                q += 4
-                steps += 1
-                if steps == 65535 {
-                    deltaSum += i128(int(accLo & u64(0xffffffff))) + i128(int(accLo >> 32)) +
-                                i128(int(accHi & u64(0xffffffff))) + i128(int(accHi >> 32))
-                    accLo = u64(0)
-                    accHi = u64(0)
-                    steps = 0
+            while q + 8 <= cnt {
+                var acc = VI32.zero()
+                var steps = 0
+                while steps < 2048 && q + 8 <= cnt {
+                    acc = acc +% VI32.loadU16(s, o)
+                    o += 16
+                    q += 8
+                    steps += 1
                 }
-            }
-            if steps > 0 {
-                deltaSum += i128(int(accLo & u64(0xffffffff))) + i128(int(accLo >> 32)) +
-                            i128(int(accHi & u64(0xffffffff))) + i128(int(accHi >> 32))
+                deltaSum += i128(int(acc.sum()))
             }
             var tail = 0
             while q < cnt {
@@ -2673,21 +2829,39 @@ pub fn sumIntCols(s: &str, dir: &[]int, p: int, from: int, cnt: int, leafN: int,
         }
     } else if wb == 4 {
         var q = 0
-        while q + 2 <= cnt {
-            let word = strWord(s, o)
-            let u0 = int(word & u64(0xffffffff))
-            let u1 = int(word >> 32)
-            let v0 = if u0 >= 0x80000000 { u0 - 0x100000000 } else { u0 }
-            let v1 = if u1 >= 0x80000000 { u1 - 0x100000000 } else { u1 }
-            tot += i128(v0 + v1)
-            o += 8
-            q += 2
+        while q + 4 <= cnt {
+            var acc = VI.zero()
+            var steps = 0
+            while steps < 262144 && q + 4 <= cnt {
+                acc = acc +% VI.loadI32(s, o)
+                o += 16
+                q += 4
+                steps += 1
+            }
+            tot += i128(acc.sum())
         }
-        if q < cnt { tot += i128(binary.readI32LEStr(s, o)) }
+        while q < cnt {
+            tot += i128(binary.readI32LEStr(s, o))
+            o += 4
+            q += 1
+        }
     } else {
-        for q in 0..cnt {
+        var q = 0
+        while q + 8 <= cnt {
+            var acc = VI32.zero()
+            var steps = 0
+            while steps < 4096 && q + 8 <= cnt {
+                acc = acc +% VI32.loadI16(s, o)
+                o += 16
+                q += 8
+                steps += 1
+            }
+            tot += i128(int(acc.sum()))
+        }
+        while q < cnt {
             tot += i128(binary.readI16LEStr(s, o))
             o += 2
+            q += 1
         }
     }
     return Some(tot)
@@ -3050,35 +3224,56 @@ pub fn bloomFilter(s: &str, dir: &[]int, p: int, from: int, cnt: int, r0: int, b
         }
     } else if wb == 4 {
         var q = 0
-        while q + 2 <= cnt {
-            let word = strWord(s, o)
-            let u0 = int(word & u64(0xffffffff))
-            let v0 = if u0 >= 0x80000000 { u0 - 0x100000000 } else { u0 }
-            if v0 >= lo && v0 <= hi {
-                let h = rtBloomHash(v0)
-                let m = rtBloomMask(h)
-                if (words[int((h >> 18) & bmask)] & m) == m { append(mut &out, r0 + q) }
+        if cnt >= 4 {
+            let vLo = VI.splat(lo)
+            let vHi = VI.splat(hi)
+            while q + 4 <= cnt {
+                let v = VI.loadI32(s, o)
+                var mask = ((v >= vLo) & (v <= vHi)).bitmask()
+                while mask != u64(0) {
+                    let tz = int(mask.trailingZeros())
+                    let val = v.lane(tz)
+                    let h = rtBloomHash(val)
+                    let m = rtBloomMask(h)
+                    if (words[int((h >> 18) & bmask)] & m) == m { append(mut &out, r0 + q + tz) }
+                    mask = mask & (mask - u64(1))
+                }
+                o += 16
+                q += 4
             }
-            let u1 = int(word >> 32)
-            let v1 = if u1 >= 0x80000000 { u1 - 0x100000000 } else { u1 }
-            if v1 >= lo && v1 <= hi {
-                let h = rtBloomHash(v1)
-                let m = rtBloomMask(h)
-                if (words[int((h >> 18) & bmask)] & m) == m { append(mut &out, r0 + q + 1) }
-            }
-            o += 8
-            q += 2
         }
-        if q < cnt {
+        while q < cnt {
             let v = binary.readI32LEStr(s, o)
             if v >= lo && v <= hi {
                 let h = rtBloomHash(v)
                 let m = rtBloomMask(h)
                 if (words[int((h >> 18) & bmask)] & m) == m { append(mut &out, r0 + q) }
             }
+            o += 4
+            q += 1
         }
     } else {
-        for q in 0..cnt {
+        if hi < -32768 || lo > 32767 { return out }
+        var q = 0
+        if cnt >= 8 {
+            let vLo = VI32.splat(i32(if lo < -32768 { -32768 } else { lo }))
+            let vHi = VI32.splat(i32(if hi > 32767 { 32767 } else { hi }))
+            while q + 8 <= cnt {
+                let v = VI32.loadI16(s, o)
+                var mask = ((v >= vLo) & (v <= vHi)).bitmask()
+                while mask != u64(0) {
+                    let tz = int(mask.trailingZeros())
+                    let val = int(v.lane(tz))
+                    let h = rtBloomHash(val)
+                    let m = rtBloomMask(h)
+                    if (words[int((h >> 18) & bmask)] & m) == m { append(mut &out, r0 + q + tz) }
+                    mask = mask & (mask - u64(1))
+                }
+                o += 16
+                q += 8
+            }
+        }
+        while q < cnt {
             let v = binary.readI16LEStr(s, o)
             if v >= lo && v <= hi {
                 let h = rtBloomHash(v)
@@ -3086,6 +3281,7 @@ pub fn bloomFilter(s: &str, dir: &[]int, p: int, from: int, cnt: int, r0: int, b
                 if (words[int((h >> 18) & bmask)] & m) == m { append(mut &out, r0 + q) }
             }
             o += 2
+            q += 1
         }
     }
     return out
