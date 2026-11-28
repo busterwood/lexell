@@ -10288,6 +10288,23 @@ fn (g: mut &Gen) genVecOp(e: int) {
         else { g.a.vmovdquLoad(0, x64.mem(RAX, 0)) }
         return
     }
+    if op == ir.V_LOAD_U8 || op == ir.V_LOAD_U16 || op == ir.V_LOAD_I16 || op == ir.V_LOAD_U32 || op == ir.V_LOAD_I32 {
+        let ek = g.u.tys[n.ty].base
+        g.gen(n.a)
+        let m = x64.mem(RAX, 0)
+        if ek == ir.TY_I64 {
+            if op == ir.V_LOAD_U8 { g.a.vpmovzxbqLoad(0, m) }
+            else if op == ir.V_LOAD_U16 { g.a.vpmovzxwqLoad(0, m) }
+            else if op == ir.V_LOAD_I16 { g.a.vpmovsxwqLoad(0, m) }
+            else if op == ir.V_LOAD_U32 { g.a.vpmovzxdqLoad(0, m) }
+            else { g.a.vpmovsxdqLoad(0, m) }
+        } else {
+            if op == ir.V_LOAD_U8 { g.a.vpmovzxbdLoad(0, m) }
+            else if op == ir.V_LOAD_U16 { g.a.vpmovzxwdLoad(0, m) }
+            else { g.a.vpmovsxwdLoad(0, m) }
+        }
+        return
+    }
     if op == ir.V_STORE {
         let ek = g.u.tys[g.u.nty(n.b)].base
         let rv = g.fregOf(n.b)
@@ -10475,6 +10492,49 @@ fn (g: mut &Gen) genVecOp(e: int) {
     }
     if op == ir.V_SHL || op == ir.V_SHR {
         let ek = g.u.tys[n.ty].base
+        if ek == ir.TY_U8 {
+            if g.u.nk(n.b) == ir.E_INT {
+                let k = g.u.nodes[n.b].v
+                g.gen(n.a)
+                if k == 0 { return }
+                if k < 0 || k >= 8 {
+                    g.a.vpxor256(0, 0, 0)
+                    return
+                }
+                let mask = if op == ir.V_SHL { (0xff << k) & 0xff } else { 0xff >> k }
+                if op == ir.V_SHL { g.a.vpsllwImm256(0, 0, k) }
+                else { g.a.vpsrlwImm256(0, 0, k) }
+                g.a.movRI(RCX, mask)
+                g.a.vmovdXR(1, RCX)
+                g.a.vpbroadcastb(1, 1)
+                g.a.vpand256(0, 0, 1)
+                return
+            }
+            let s = g.temp(32, 32)
+            g.gen(n.a)
+            g.a.vmovdquStore(rbp(s), 0)
+            g.gen(n.b)
+            let zeroL = g.a.newLabel()
+            let doneL = g.a.newLabel()
+            g.a.aluI(x64.CMP, 8, RAX, 8)
+            g.a.jcc(x64.CC_AE, zeroL)
+            g.a.vmovqXR(1, RAX)
+            g.a.movRR(8, RCX, RAX)
+            g.a.movRI(RDX, 0xff)
+            if op == ir.V_SHL { g.a.shiftCL(x64.SHL, 4, RDX) }
+            else { g.a.shiftCL(x64.SHR, 4, RDX) }
+            g.a.vmovdXR(2, RDX)
+            g.a.vpbroadcastb(2, 2)
+            g.a.vmovdquLoad(0, rbp(s))
+            if op == ir.V_SHL { g.a.vpsllw256(0, 0, 1) }
+            else { g.a.vpsrlw256(0, 0, 1) }
+            g.a.vpand256(0, 0, 2)
+            g.a.jmp(doneL)
+            g.a.bind(zeroL)
+            g.a.vpxor256(0, 0, 0)
+            g.a.bind(doneL)
+            return
+        }
         let s = g.temp(32, 32)
         g.gen(n.a)
         g.a.vmovdquStore(rbp(s), 0)

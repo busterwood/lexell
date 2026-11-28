@@ -232,6 +232,98 @@ fn testU8() {
     assert(nextJsonSpecial(&s, 39) == -1)
     let s2 = "0123456789abcdef0123456789abcdef\trest"
     assert(nextJsonSpecial(&s2, 0) == 32)
+
+    // byte logical shifts (constant and dynamic counts, plus vpshufb nibble LUT)
+    var sb: []byte = array(32, byte(0))
+    for i in 0..32 { sb[i] = byte((i * 17 + 0xA5) & 0xff) }
+    let vs = VB.load(&sb, 0)
+    let shR4 = vs >> 4
+    let shL4 = vs << 4
+    let shR0 = vs >> 0
+    let shR8 = vs >> 8
+    let shL8 = vs << 8
+    let shRN = vs >> -1
+    var dyn4 = 4
+    var dyn1 = 1
+    var dyn7 = 7
+    var dyn8 = 8
+    var dynNeg = -3
+    let dR4 = vs >> dyn4
+    let dL1 = vs << dyn1
+    let dR7 = vs >> dyn7
+    let dR8 = vs >> dyn8
+    let dRN = vs >> dynNeg
+    for i in 0..32 {
+        let x = int(sb[i])
+        assert(shR4.lane(i) == byte(x >> 4))
+        assert(shL4.lane(i) == byte((x << 4) & 0xff))
+        assert(shR0.lane(i) == sb[i])
+        assert(shR8.lane(i) == byte(0) && shL8.lane(i) == byte(0) && shRN.lane(i) == byte(0))
+        assert(dR4.lane(i) == byte(x >> 4))
+        assert(dL1.lane(i) == byte((x << 1) & 0xff))
+        assert(dR7.lane(i) == byte(x >> 7))
+        assert(dR8.lane(i) == byte(0) && dRN.lane(i) == byte(0))
+    }
+
+    // 2-table nibble LUT with shuffle + >> 4: detect '"' (0x22), '\\' (0x5c), '\n' (0x0a)
+    var loLut: []byte = array(32, byte(0))
+    var hiLut: []byte = array(32, byte(0))
+    for h in 0..2 {
+        let base = h * 16
+        loLut[base + 2] = byte(1)    // 0x22 '"'
+        loLut[base + 12] = byte(2)   // 0x5c '\\'
+        loLut[base + 10] = byte(4)   // 0x0a '\n'
+        hiLut[base + 2] = byte(1)
+        hiLut[base + 5] = byte(2)
+        hiLut[base + 0] = byte(4)
+    }
+    let vLoLut = VB.load(&loLut, 0)
+    let vHiLut = VB.load(&hiLut, 0)
+    let sample = "abc\"def\\ghi\njkl0123456789ABCDEF!"
+    let sv = VB.load(&sample, 0)
+    let cls = vLoLut.shuffle(sv & VB.splat(byte(0x0f))) & vHiLut.shuffle(sv >> 4)
+    let hitMask = (cls != VB.zero()).bitmask()
+    assert(hitMask == ((u64(1) << 3) | (u64(1) << 7) | (u64(1) << 11)))
+}
+
+fn testWideningLoads() {
+    var raw: []byte = [
+        byte(0x01), byte(0x80), byte(0xff), byte(0x7f),
+        byte(0xfe), byte(0xff), byte(0x34), byte(0x12),
+        byte(0x00), byte(0x80), byte(0x01), byte(0x00),
+        byte(0xff), byte(0xff), byte(0xff), byte(0xff),
+        byte(0x78), byte(0x56), byte(0x34), byte(0x12)
+    ]
+    let u8_64 = VI.loadU8(&raw, 0)
+    assert(u8_64.lane(0) == 1 && u8_64.lane(1) == 128 && u8_64.lane(2) == 255 && u8_64.lane(3) == 127)
+
+    let u16_64 = VI.loadU16(&raw, 0)
+    assert(u16_64.lane(0) == 0x8001 && u16_64.lane(1) == 0x7fff && u16_64.lane(2) == 0xfffe && u16_64.lane(3) == 0x1234)
+
+    let i16_64 = VI.loadI16(&raw, 0)
+    assert(i16_64.lane(0) == -32767 && i16_64.lane(1) == 32767 && i16_64.lane(2) == -2 && i16_64.lane(3) == 0x1234)
+
+    let u32_64 = VI.loadU32(&raw, 4)
+    assert(u32_64.lane(0) == 0x1234fffe && u32_64.lane(1) == 0x00018000 && u32_64.lane(2) == 0xffffffff && u32_64.lane(3) == 0x12345678)
+
+    let i32_64 = VI.loadI32(&raw, 4)
+    assert(i32_64.lane(0) == 0x1234fffe && i32_64.lane(1) == 0x00018000 && i32_64.lane(2) == -1 && i32_64.lane(3) == 0x12345678)
+
+    let u8_32 = VI32.loadU8(&raw, 0)
+    assert(u8_32.lane(0) == i32(1) && u8_32.lane(1) == i32(128) && u8_32.lane(2) == i32(255) && u8_32.lane(7) == i32(0x12))
+
+    let u16_32 = VI32.loadU16(&raw, 0)
+    assert(u16_32.lane(0) == i32(0x8001) && u16_32.lane(2) == i32(0xfffe) && u16_32.lane(4) == i32(0x8000) && u16_32.lane(7) == i32(0xffff))
+
+    let i16_32 = VI32.loadI16(&raw, 0)
+    assert(i16_32.lane(0) == i32(-32767) && i16_32.lane(2) == i32(-2) && i16_32.lane(4) == i32(-32768) && i16_32.lane(7) == i32(-1))
+
+    // Also test loading directly from &str
+    let st = "ABCDEFGH01234567"
+    let su = VI.loadU8(&st, 2)
+    assert(su.lane(0) == int('C') && su.lane(1) == int('D') && su.lane(2) == int('E') && su.lane(3) == int('F'))
+    let su32 = VI.loadU32(&st, 0)
+    assert(su32.lane(0) == (int('A') | (int('B') << 8) | (int('C') << 16) | (int('D') << 24)))
 }
 
 fn testBitScans() {
@@ -485,6 +577,7 @@ fn main() {
     testI64()
     testI32()
     testU8()
+    testWideningLoads()
     testBitScans()
     testParMapSimd()
     testChunks()
